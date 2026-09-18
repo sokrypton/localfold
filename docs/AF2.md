@@ -2574,3 +2574,118 @@ arithmetic still points is `opm.project-output` at 41% of ceiling where every
 sibling is 54-65% - 24.31 ms that would be about 16 at its neighbours' rate,
 which is 2% of a block. That is the whole of what is left, and it is a kernel
 rewrite rather than a setting.
+
+## 🔴 ALPHAFOLD 2 IS FIVE MODELS, AND THIS PORT COULD BUILD ONE
+
+ColabFold runs all five and ranks them; this page offered `model_1_ptm` and
+nothing else. Three things were in the way and none of them was the fold.
+
+**1. There was no way to build a second monomer.** The multimer had
+`export_multimer_model.py` and could be built from any of its five checkpoints
+in a second from numpy alone. `model/` came out of
+`capture_alphafold_single_sequence.py` - which runs the official model in a JAX
+environment and intercepts tensors - through `export-web-model.js` over fixture
+files that are not in the repository. So "fold with model_3_ptm" needed a
+machine with jax, haiku and the alphafold package.
+
+`tools/export_monomer_model.py` reads the npz. Its tensor names come from the
+SHIPPED manifest rather than from a counter, which is what makes it checkable:
+rebuilding model_1_ptm from DeepMind's own file and quantising it folds to
+**checksum -1287025, pLDDT 62.646, pTM 0.3163** - the shipped bundle's fold, to
+the digit.
+
+**2. Three of the five have no template embedder at all.** model_3, model_4 and
+model_5 are the template-free models: `template.enabled` is false in their
+config and those 67 tensors are simply not in the checkpoint. This port demanded
+them and died in a gather - "missing
+single_template_embedding/.../query_norm/scale" - which names a tensor rather
+than the fact. `templateWeights` returns null now and both model paths skip the
+stage and its residual. Skipping is not the same as passing a masked template,
+which leaves the embedder's own biases and layer norms in the pair.
+
+🔴 **AND ALL OF A SECTION ABSENT IS A MODEL WHERE SOME OF IT ABSENT IS A BUG.**
+The exporter omits a section the checkpoint does not have and says so; a section
+missing only SOME of its modules still fails. An empty parameter table would be
+the worst of both - `templateWeights` reads it as a table and dies in the gather
+again, which is exactly what the first version did.
+
+**3. Five bundles is half a gigabyte.** At 97 MiB each, offering all five is
+485 MiB a visitor and 97 MiB every time they switch.
+
+### The delta, and the measurement that nearly killed it
+
+The five are one training run continued five ways, so a later model stores as a
+DIFFERENCE. Pairwise relRMS over all 93.2M quantisable weights of the multimer
+set says they are two families rather than one spread:
+
+| | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| **1** | — | 0.087 | 0.243 | 0.242 | 0.243 |
+| **3** | 0.236 | 0.237 | — | 0.176 | 0.094 |
+
+so a delta across the gap is 2.8x the 0.106 the original branch measured between
+models 1 and 2. Read against `quantize_model.py`'s pLDDT table, a 3-bit delta on
+model_3 lands at relRMS 0.0545 - worse than int5 symmetric, which that table
+prices at **-7.8 pLDDT** - and three bits looked unreachable.
+
+🔴 **THAT WAS TRUE AND THE CONCLUSION FROM IT WAS WRONG, BECAUSE A WHOLE-MODEL
+NORM CANNOT SEE WHICH TENSORS IT IS AVERAGING.** Folded instead of normed, 5CAJ
+chain A with a 7907-row alignment and three recycles:
+
+| model_3_ptm | pLDDT | pTM | RMSD | TM |
+|---|---:|---:|---:|---:|
+| from its own bundle | 96.294 | 0.9240 | 1.94 A | 0.9665 |
+| rebuilt from a 3-bit delta | 96.230 | 0.9245 | 1.95 A | 0.9664 |
+
+The difference was the **structure module**. `quantize_model.py` keeps it, the
+geometry tables and the PAE bin edges at float32 because it composes rigid
+transforms across eight iterations and an error in a frame lands in the
+coordinates; the first delta quantised them with everything else. That is
+**-12.7 pLDDT at three bits and -4.9 at four**, and excluding them - 2.02M of
+92.9M weights, carried whole for 8 MiB - takes the same three-bit arm to -0.06.
+The relRMS was not lying; it was being read over a set of tensors that does not
+tolerate noise.
+
+Confirmed on the other two models that have both bundles here:
+
+| 5CAJ chain A | direct | via a 3-bit delta |
+|---|---:|---:|
+| model_2 | 1.891 A / pLDDT 96.182 | 1.897 A / 96.133 |
+| model_3 | 1.940 A / 96.294 | 1.950 A / 96.230 |
+| model_4 | 1.983 A / 96.418 | 1.981 A / 96.437 |
+
+🔴 **AND THE 59-RESIDUE GATE SEQUENCE CANNOT SETTLE THIS.** On it the same
+model_4 delta reads 58.818 against its own bundle's 61.866 - three pLDDT - while
+on a real target the two are within 0.02. The same target puts f16 and int8
+encodings of the IDENTICAL weights 1.6 pLDDT apart (60.102 against 58.468). It
+is a designed 59-mer folded to pLDDT 60; it is a wiring check, not a quality
+one.
+
+So a delta is **43 MiB against a bundle's 97**, five monomer models are 253 MiB
+rather than 485, and a visitor who already has model_1 pays the difference alone.
+
+### What ships
+
+`tools/pack_delta_model.py` writes one, reading the base from the BUNDLE rather
+than re-deriving it - re-quantising the base checkpoint would be a second copy
+of the quantiser, and a one-ulp disagreement would make every delta wrong in a
+way no gate can see. The output is an ordinary bundle in a codec that already
+ships (int3, group 128, asymmetric - ESM-C's) plus a `delta` header listing
+which tensors are added, carried whole, or absent.
+
+`src/bundles/delta-tensor-store.js` reads one. It offers no `tensorSource`, and
+that absence is the interface: a source is "the codes are these bytes" and no
+shard holds this model's codes, so every weight is reconstructed on the host.
+Measured cost **1092 ms against 637** on a 59-residue fold - a fixed ~455 ms -
+against 54 MiB less to download, which is about 2 s on the wire.
+`planBlockUpload(..., { accumulate: true })` is what removes it: the decode adds
+into the resident f16 rather than overwriting it, held by `npm run test:delta`
+to **0 differing of 41,094,464 f16 results** on real parameters, with the
+control that the same plan with the flag OFF must differ.
+
+The page offers the number beside the model row, resolved in `chosenFamily` the
+way the PLM row is, so the weight cache, the download stem and the labels all
+name the model that folded. Models 3, 4 and 5 refuse a template by name rather
+than dropping it, and `build_site.py` removes a number whose bundle has no
+`remote` - the same rule it already applies to a model `<option>`, one control
+further in.

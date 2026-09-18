@@ -1,5 +1,5 @@
 import { parseA3m } from "./a3m.js";
-import { AF3_FAMILIES } from "../bundles/manifests/index.js";
+import { AF3_FAMILIES, MODEL_BUNDLES } from "../bundles/manifests/index.js";
 import { concatenateA3mBlocks, mergeChainA3ms, deduplicateUnpairedAgainstPaired, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "./chains.js";
 
@@ -25,6 +25,15 @@ const CHAIN_MERGES = {
   monomer: mergeUnpairedChainA3ms,
   multimer: mergeChainA3ms,
   ...Object.fromEntries(AF3_FAMILIES.map((family) => [family, mergeRowAlignedChainA3ms])),
+  // 🔴 A DELTA FAMILY MERGES THE WAY ITS BASE DOES, DERIVED RATHER THAN TYPED.
+  // AlphaFold 2's models 2 to 5 ship as a difference on model_1 and run its
+  // graph, so they read an alignment exactly as it does - and writing four more
+  // rows here would be four chances to give one of them the multimer's merge,
+  // which is a block-diagonal alignment fed to a model that wants a plain one.
+  ...Object.fromEntries(Object.entries(MODEL_BUNDLES)
+    .filter(([, bundle]) => bundle.delta !== undefined)
+    .map(([family, bundle]) => [family, bundle.delta.base === "multimer"
+      ? mergeChainA3ms : mergeUnpairedChainA3ms])),
 };
 
 const DEFAULT_API_URL = "https://api.colabfold.com";

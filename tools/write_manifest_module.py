@@ -43,6 +43,34 @@ BUNDLES = {
         "module": "src/bundles/manifests/monomer.js",
         "model": "model_1_ptm",
     },
+    # model_2_ptm as a delta on model_1_ptm - 43 MiB against 97. The module is
+    # the delta's own tensor table; the base's comes from "monomer".
+    "monomer-2": {
+        "export": "model-mono-2-delta",
+        "module": "src/bundles/manifests/monomer-2.js",
+        "model": "model_2_ptm",
+    },
+    # model_3_ptm as a delta on model_1_ptm - 43 MiB against 97. The module is
+    # the delta's own tensor table; the base's comes from "monomer".
+    "monomer-3": {
+        "export": "model-mono-3-delta",
+        "module": "src/bundles/manifests/monomer-3.js",
+        "model": "model_3_ptm",
+    },
+    # model_4_ptm as a delta on model_1_ptm - 43 MiB against 97. The module is
+    # the delta's own tensor table; the base's comes from "monomer".
+    "monomer-4": {
+        "export": "model-mono-4-delta",
+        "module": "src/bundles/manifests/monomer-4.js",
+        "model": "model_4_ptm",
+    },
+    # model_5_ptm as a delta on model_1_ptm - 43 MiB against 97. The module is
+    # the delta's own tensor table; the base's comes from "monomer".
+    "monomer-5": {
+        "export": "model-mono-5-delta",
+        "module": "src/bundles/manifests/monomer-5.js",
+        "model": "model_5_ptm",
+    },
     "multimer": {
         "export": "model-multimer",
         "module": "src/bundles/manifests/multimer.js",

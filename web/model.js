@@ -19,6 +19,7 @@ import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
 import { ScriptTensorStore } from "../src/bundles/script-tensor-store.js";
 import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
+import { DeltaTensorStore } from "../src/bundles/delta-tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { devUseDevice } from "./dev-log.js";
 import { withAbort } from "../src/runtime/abort.js";
@@ -85,7 +86,15 @@ export function openStore(onProgress, family = "monomer") {
       // ...every shard at once; see HttpTensorStore.prefetch. AF2's loaders read
       // the whole bundle too.
       opened.prefetch?.();
-      return opened;
+      // 🔴 A DELTA FAMILY IS HALF A MODEL AND OPENS THE OTHER HALF ITSELF.
+      // AlphaFold 2's five models are one training run continued five ways, so
+      // models 2 to 5 ship as 43 MiB of DIFFERENCE against model_1's 97 rather
+      // than as five whole bundles - and a visitor who has already folded with
+      // model_1 has the base in cache, so switching costs the delta alone. The
+      // base is opened through this same function, which means its store is
+      // SHARED with a plain model_1 fold rather than downloaded twice.
+      if (bundle.delta === undefined) return opened;
+      return new DeltaTensorStore(await openStore(onProgress, bundle.delta.base), opened);
     })();
     stores.set(family, store);
   }
@@ -148,14 +157,19 @@ export function loadModel(variant, onProgress, signal = undefined, family = "mon
   if (variant !== "single" && variant !== "msa") {
     throw new RangeError(`unknown model variant ${variant}: expected "single" or "msa"`);
   }
-  if (family !== "monomer" && family !== "multimer") {
+  // 🔴 A DELTA FAMILY IS ITS BASE'S GRAPH, so the check is on what it reduces
+  // to and not on its name: "monomer-3" runs the monomer's code with model_3's
+  // weights. Everything below reads the store, and DeltaTensorStore has already
+  // made that store look like a whole model.
+  const graph = MODEL_BUNDLES[family]?.delta?.base ?? family;
+  if (graph !== "monomer" && graph !== "multimer") {
     throw new RangeError(`unknown model family ${family}: expected "monomer" or "multimer"`);
   }
   const key = `${family}:${variant}`;
   const cached = loaded.get(key);
   if (cached !== undefined) return withAbort(cached, signal);
   const pending = (async () => {
-    const multimer = family === "multimer";
+    const multimer = graph === "multimer";
     const store = await openStore(onProgress, family);
     const fixture = AlphaFoldFixture.fromStore(store);
     const extraStackWeights = variant === "msa"

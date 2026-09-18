@@ -48,4 +48,30 @@ describe("where a bundle's shards come from", () => {
   it("names a family it does not have", () => {
     expect(() => bundleBaseUrl("nonesuch")).toThrow(/unknown model family/);
   });
+
+  /**
+   * 🔴 `noTemplateEmbedder` IS A CLAIM ABOUT THE WEIGHTS AND THE WEIGHTS CAN
+   * SETTLE IT. AlphaFold 2's models 3, 4 and 5 carry no template embedder, and
+   * the page refuses a template under them on the strength of that flag - so a
+   * flag that disagrees with the bundle is a page that either drops a template
+   * silently or refuses one it could have used. The delta's own manifest lists
+   * every tensor the checkpoint does not have; this holds the two together.
+   */
+  it("flags a template-free model exactly when its bundle has no template tensors", async() => {
+    for (const [family, bundle] of Object.entries(MODEL_BUNDLES)) {
+      if (bundle.delta === undefined) continue;
+      const base = MODEL_BUNDLES[bundle.delta.base];
+      const baseManifest = (await base.load()).MANIFEST;
+      const templateTensors = Object.values(baseManifest.templateEmbedding?.parameters ?? {})
+        .flatMap((leaves) => Object.values(leaves));
+      expect(templateTensors.length > 0).toBe(true);
+      const absent = new Set((await bundle.load()).MANIFEST.delta.absent);
+      const none = templateTensors.every((name) => absent.has(name));
+      const some = templateTensors.some((name) => absent.has(name));
+      // Partly absent is a packing fault, not a model - the reader refuses it
+      // too, and this says so where the bundles are described.
+      expect(some).toBe(none);
+      expect(bundle.noTemplateEmbedder === true).toBe(none);
+    }
+  });
 });

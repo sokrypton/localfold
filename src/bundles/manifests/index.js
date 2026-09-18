@@ -43,6 +43,80 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer.js"),
   },
+  // model_2_ptm as a DELTA on model_1_ptm: 43 MiB rather than 97, and the
+  // same fold - 5CAJ chain A comes out within 0.01 A of the model's own bundle.
+  // See tools/pack_delta_model.py, and src/bundles/delta-tensor-store.js for
+  // what `delta` means to a reader. Not a menu entry: the page offers ONE
+  // AF2-mono and a model NUMBER beside it.
+  "monomer-2": {
+    model: "model_2_ptm",
+    delta: { base: "monomer" },
+    directory: "./model-mono-2-delta/",
+    remote: null,
+    release: "model2-ptm-delta",
+    variable: "LOCALFOLD_INCLUDE_MODEL",
+    load: () => import("./monomer-2.js"),
+  },
+  // model_3_ptm as a DELTA on model_1_ptm: 43 MiB rather than 97, and the
+  // same fold - 5CAJ chain A comes out within 0.01 A of the model's own bundle.
+  // See tools/pack_delta_model.py, and src/bundles/delta-tensor-store.js for
+  // what `delta` means to a reader. Not a menu entry: the page offers ONE
+  // AF2-mono and a model NUMBER beside it.
+  "monomer-3": {
+    model: "model_3_ptm",
+    delta: { base: "monomer" },
+    // 🔴 THIS CHECKPOINT HAS NO TEMPLATE EMBEDDER. AlphaFold 2's models 3, 4
+    // and 5 are the template-free ones - the 67 tensors are not in the file -
+    // so the page refuses a template under them rather than dropping it. The
+    // delta's own manifest says the same thing in `delta.absent`, and
+    // test/model-bundles.test.js holds the two to each other.
+    noTemplateEmbedder: true,
+    directory: "./model-mono-3-delta/",
+    remote: null,
+    release: "model3-ptm-delta",
+    variable: "LOCALFOLD_INCLUDE_MODEL",
+    load: () => import("./monomer-3.js"),
+  },
+  // model_4_ptm as a DELTA on model_1_ptm: 43 MiB rather than 97, and the
+  // same fold - 5CAJ chain A comes out within 0.01 A of the model's own bundle.
+  // See tools/pack_delta_model.py, and src/bundles/delta-tensor-store.js for
+  // what `delta` means to a reader. Not a menu entry: the page offers ONE
+  // AF2-mono and a model NUMBER beside it.
+  "monomer-4": {
+    model: "model_4_ptm",
+    delta: { base: "monomer" },
+    // 🔴 THIS CHECKPOINT HAS NO TEMPLATE EMBEDDER. AlphaFold 2's models 3, 4
+    // and 5 are the template-free ones - the 67 tensors are not in the file -
+    // so the page refuses a template under them rather than dropping it. The
+    // delta's own manifest says the same thing in `delta.absent`, and
+    // test/model-bundles.test.js holds the two to each other.
+    noTemplateEmbedder: true,
+    directory: "./model-mono-4-delta/",
+    remote: null,
+    release: "model4-ptm-delta",
+    variable: "LOCALFOLD_INCLUDE_MODEL",
+    load: () => import("./monomer-4.js"),
+  },
+  // model_5_ptm as a DELTA on model_1_ptm: 43 MiB rather than 97, and the
+  // same fold - 5CAJ chain A comes out within 0.01 A of the model's own bundle.
+  // See tools/pack_delta_model.py, and src/bundles/delta-tensor-store.js for
+  // what `delta` means to a reader. Not a menu entry: the page offers ONE
+  // AF2-mono and a model NUMBER beside it.
+  "monomer-5": {
+    model: "model_5_ptm",
+    delta: { base: "monomer" },
+    // 🔴 THIS CHECKPOINT HAS NO TEMPLATE EMBEDDER. AlphaFold 2's models 3, 4
+    // and 5 are the template-free ones - the 67 tensors are not in the file -
+    // so the page refuses a template under them rather than dropping it. The
+    // delta's own manifest says the same thing in `delta.absent`, and
+    // test/model-bundles.test.js holds the two to each other.
+    noTemplateEmbedder: true,
+    directory: "./model-mono-5-delta/",
+    remote: null,
+    release: "model5-ptm-delta",
+    variable: "LOCALFOLD_INCLUDE_MODEL",
+    load: () => import("./monomer-5.js"),
+  },
   multimer: {
     model: "model_1_multimer_v3",
     directory: "./model-multimer/",

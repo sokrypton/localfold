@@ -48,7 +48,7 @@ import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js
 import { smilesComponent } from "../src/chem/component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel } from "./model.js";
-import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODELS_WITHOUT_CONFIDENCE,
+import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES }
   from "../src/bundles/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
@@ -380,9 +380,22 @@ function reportModelFromUrl(attempt = 0) {
  */
 const chosenFamily = () => {
   const chosen = document.getElementById("model-family")?.value ?? "af3";
-  return SINGLE_SEQUENCE_FAMILIES.includes(chosen)
-    ? (PLM_FAMILIES[plmChoice()] ?? chosen) : chosen;
+  if (SINGLE_SEQUENCE_FAMILIES.includes(chosen)) return PLM_FAMILIES[plmChoice()] ?? chosen;
+  // 🔴 AND AlphaFold 2's MODEL NUMBER RESOLVES HERE FOR THE SAME REASON THE PLM
+  // ROW DOES. AF2 is FIVE models, one training run continued five ways, and
+  // people run all five and compare - so the row shows one AF2-mono and a
+  // number beside it, and the number picks the bundle. Resolving it here is
+  // what keeps the weight cache, the download stem and the labels all naming
+  // the model that actually folded; models 2 to 5 are a 43 MiB delta on
+  // model_1's 97 (see tools/pack_delta_model.py).
+  if (chosen === "monomer") {
+    const number = document.getElementById("af2Model")?.value ?? "1";
+    return number === "1" ? chosen : `${chosen}-${number}`;
+  }
+  return chosen;
 };
+/** The graph a family runs, which for a delta is the graph of its base. */
+const graphOf = (family) => MODEL_BUNDLES[family]?.delta?.base ?? family;
 const isAf3Family = (family) => AF3_FAMILIES.includes(family);
 /**
  * 🔴 "CAN THIS MODEL SEE AN ATOM" IS NOT "IS THIS AN AlphaFold 3 GRAPH", AND
@@ -415,6 +428,14 @@ const MODEL_STEMS = {
   intellifold2: "intellifold2",
   rosettafold3: "rosettafold3",
   monomer: "af2",
+  // 🔴 AND THE MODEL NUMBER IS IN THE STEM, because it is the only place on
+  // screen that says which of AlphaFold 2's five folded this. Two objects
+  // called `af2_1` from model_1 and model_4 is exactly the collision this
+  // table exists to prevent, one axis later.
+  "monomer-2": "af2_model2",
+  "monomer-3": "af2_model3",
+  "monomer-4": "af2_model4",
+  "monomer-5": "af2_model5",
   multimer: "af2_multimer",
   "ef2-fast-600m": "ef2_fast_600m",
   "ef2-fast-300m": "ef2_fast_300m",
@@ -518,14 +539,26 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   // is a different dialect with a different feature set and nothing on this
   // page has ever built one for it - which is exactly the gap that made the
   // monomer's term look supported for a year.
-  if (templateCount > 0 && !isAf3Family(choice) && choice !== "monomer") {
+  if (templateCount > 0 && !isAf3Family(choice) && graphOf(choice) !== "monomer") {
     throw new Error("Templates need AF3, OpenBind-0 or AlphaFold 2 monomer;"
       + ` the model is set to ${choice}`);
+  }
+  // 🔴 AND THREE OF ALPHAFOLD 2's FIVE MODELS HAVE NO TEMPLATE EMBEDDER AT ALL.
+  // model_3, model_4 and model_5 are the template-free ones - `template.enabled`
+  // is false in their config and the 67 tensors are simply not in the
+  // checkpoint - so a template set under one of them would be fetched, aligned
+  // and dropped. Refused by name rather than ignored, which is this file's rule
+  // everywhere else; hiding the row would not be enough, because hiding a
+  // control does not change its value.
+  if (templateCount > 0 && MODEL_BUNDLES[choice]?.noTemplateEmbedder === true) {
+    throw new Error(`${MODEL_BUNDLES[choice].model} has no template embedder -`
+      + " AlphaFold 2's models 3, 4 and 5 are the template-free ones."
+      + " Choose model 1 or 2, or remove the template.");
   }
   // 🔴 AND THE MONOMER'S TERM TAKES EXACTLY ONE. `QueryOnlyTemplateGpu` reads
   // `input.template`, singular - AF3 runs a forward per slot and averages, and
   // this one does not - so a second row would be silently dropped.
-  if (templateCount > 1 && choice === "monomer") {
+  if (templateCount > 1 && graphOf(choice) === "monomer") {
     throw new Error("AlphaFold 2's monomer takes one template;"
       + ` ${templateCount} are set`);
   }
@@ -1658,6 +1691,14 @@ function setFoldButton(state) {
 function syncModelControls() {
   const family = chosenFamily();
   const af3 = isAf3Family(family);
+  // 🔴 THE MODEL NUMBER IS AF2's ALONE, and the test is the ROW's value rather
+  // than the resolved family - `chosenFamily` has already folded the number
+  // into it, so asking the resolved one whether to show the control that
+  // produced it is circular.
+  const af2Node = document.getElementById("af2ModelGroup");
+  if (af2Node !== null) {
+    af2Node.hidden = (document.getElementById("model-family")?.value ?? "") !== "monomer";
+  }
   // 🔴 THE SAMPLER ROW IS SHARED, BECAUSE IT IS THE SAME QUESTION. ESMFold2's
   // structure head is an EDM sampler with a churn factor, exactly as AF3's is,
   // so "flow or diffusion, and how many steps" means the same thing under both
@@ -3707,6 +3748,14 @@ if (familySelect !== null) {
   familySelect.addEventListener("change", () => { syncModelControls(); syncMode(); });
 }
 document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
+// 🔴 AND THE MODEL NUMBER CHANGES THE FAMILY TOO, exactly as the PLM row does -
+// `chosenFamily` folds it into the name, so everything keyed on a family (the
+// weight cache, the download stem, the status line) has to be refreshed here or
+// the page goes on describing the model it was showing before.
+document.getElementById("af2Model")?.addEventListener("change", () => {
+  syncModelControls();
+  syncMode();
+});
 // 🔴 THE PLM ROW CHANGES THE FAMILY, so everything the model row's own listener
 // refreshes has to refresh here too - `chosenFamily()` reads this select, and a
 // control left showing the other checkpoint's options is the same

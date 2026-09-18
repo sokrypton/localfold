@@ -182,6 +182,11 @@ def main():
     parser.add_argument("--model", default="monomer", choices=models,
                         help="the value of the #model-family select, read from index.html: "
                         + ", ".join(models))
+    # 🔴 ALPHAFOLD 2 IS FIVE MODELS AND THE PAGE OFFERS THE NUMBER SEPARATELY.
+    # 2 to 5 load as a delta on model_1, so this is also the only way to drive
+    # that path through the page rather than through a fold tool.
+    parser.add_argument("--af2-model", default="1", choices=["1", "2", "3", "4", "5"],
+                        help="which of AlphaFold 2's five models, for --model monomer")
     parser.add_argument("--recycles", default="1")
     parser.add_argument("--steps", default="4", help="AF3 sampler steps")
     parser.add_argument("--url", default=None,
@@ -500,6 +505,7 @@ def main():
             el.dispatchEvent(new Event('change', { bubbles: true }));
           };
           set('model-family', %s);
+          set('af2Model', %s);
           set('recycles', %s);
           set('af3-count', %s);
           set('msa-mode', %s);
@@ -516,13 +522,15 @@ def main():
           try {
             localStorage.setItem('localfold.modelTerms.alphafold3', 'accepted');
           } catch (e) { /* asked again, which the dialog check covers */ }
-        })()""" % (json.dumps(args.model), json.dumps(args.recycles),
+        })()""" % (json.dumps(args.model), json.dumps(args.af2_model),
+                   json.dumps(args.recycles),
                    json.dumps(args.steps), json.dumps(args.msa_mode),
                    json.dumps(args.plm)))
         time.sleep(0.5)
         print("controls:", cdp.evaluate(ws, """(() => {
           const v = (id) => (document.getElementById(id) || {}).value;
-          return JSON.stringify({ model: v('model-family'), recycles: v('recycles'),
+          return JSON.stringify({ model: v('model-family'), af2Model: v('af2Model'),
+            recycles: v('recycles'),
             msa: v('msa-mode'), plm: v('plm-mode'), af3count: v('af3-count') });
         })()"""))
 

@@ -253,6 +253,27 @@ def unreachable_offers() -> list[str]:
     return sorted(family for family in offered & known if family not in hosted)
 
 
+def unreachable_model_numbers() -> list[str]:
+    """AlphaFold 2 model numbers whose bundle no visitor can fetch.
+
+    🔴 THE SAME TRAP AS `unreachable_offers`, ONE CONTROL FURTHER IN. AF2's five
+    models are picked by a NUMBER beside the model row rather than by five
+    entries in it, and `chosenFamily` resolves "monomer" plus "3" to the family
+    `monomer-3`. So an unpublished delta bundle is not an `<option value=
+    "monomer-3">` anywhere for that check to find - it is an option reading "3",
+    and dropping the family list alone would leave the number on screen and the
+    fold dying on shard zero.
+    """
+    page = (ROOT / "index.html").read_text(encoding="utf-8")
+    block = re.search(r'<select id="af2Model">(.*?)</select>', page, re.DOTALL)
+    if block is None:
+        return []
+    hosted = remote_families()
+    numbers = re.findall(r'<option value="(\d+)"', block.group(1))
+    return [number for number in numbers
+            if number != "1" and f"monomer-{number}" not in hosted]
+
+
 def restricted_terms(module: Path) -> str | None:
     """The restricted licence this bundle's weights carry, if unaccepted.
 
@@ -588,6 +609,29 @@ def build(include_model: bool) -> int:
               " directory this build does not publish.")
         print("  Publish the bundle and re-pin the remote (docs/HOSTING.md) and the"
               " option returns by itself.")
+
+    # ...and the same for AlphaFold 2's model NUMBER, which is a control rather
+    # than a family list and so invisible to the check above.
+    numbers = unreachable_model_numbers()
+    if numbers:
+        page = (OUT / "index.html").read_text(encoding="utf-8")
+        block = re.search(r'<select id="af2Model">(.*?)</select>', page, re.DOTALL)
+        if block is None:
+            print("index.html has no af2Model select to trim", file=sys.stderr)
+            return 1
+        trimmed = block.group(1)
+        for number in numbers:
+            pattern = re.compile(rf'[ \t]*<option value="{number}"[^>]*>[^<]*</option>\n?')
+            trimmed, count = pattern.subn("", trimmed)
+            if count != 1:
+                print(f"expected one af2Model <option> for {number}, matched {count}",
+                      file=sys.stderr)
+                return 1
+        page = page[:block.start(1)] + trimmed + page[block.end(1):]
+        (OUT / "index.html").write_text(page, encoding="utf-8")
+        print(f"dropped AlphaFold 2 model number(s) the site cannot serve: {', '.join(numbers)}")
+        print("  their delta bundles have no `remote`; publish them and re-pin it"
+              " (docs/HOSTING.md) and the numbers return by themselves.")
 
     problems = unresolved_imports(OUT)
     if problems:

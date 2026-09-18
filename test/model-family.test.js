@@ -68,10 +68,22 @@ describe("the AlphaFold 3 families", () => {
     const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
     const variants = app.slice(app.indexOf("const PLM_FAMILIES = {"));
     const table = variants.slice(0, variants.indexOf("};"));
+    // 🔴 AND A THIRD CONTROL NOW, WHICH IS AlphaFold 2's MODEL NUMBER. Its five
+    // models are one training run continued five ways, so the row shows one
+    // AF2-mono and the number beside it picks the bundle - `chosenFamily`
+    // resolves "monomer" plus "3" to the family "monomer-3". Reachable means
+    // the number select actually offers that number, not that the family
+    // exists: a bundle nothing can select is the thing this test is for.
+    const af2Numbers = new Set([...page.matchAll(
+      /<select id="af2Model">([\s\S]*?)<\/select>/g)]
+      .flatMap(([, body]) => [...body.matchAll(/<option value="(\d+)"/g)].map(([, n]) => n)));
     for (const family of FOLDING_FAMILIES) {
       const inRow = new RegExp(`<option value="${family}"`).test(page);
       const inVariants = table.includes(`"${family}"`);
-      assert.ok(inRow || inVariants,
+      const number = /^monomer-(\d+)$/.exec(family);
+      const byNumber = number !== null && af2Numbers.has(number[1])
+        && /`\$\{chosen\}-\$\{number\}`/.test(app);
+      assert.ok(inRow || inVariants || byNumber,
         `${family} is offered by no control in index.html or PLM_FAMILIES`);
     }
   });
