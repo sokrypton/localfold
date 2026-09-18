@@ -104,6 +104,8 @@ def main() -> int:
                         help="the shipped bundle the delta is added to")
     parser.add_argument("--params", type=Path, required=True, help="the target's npz")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--base-family", default="monomer",
+                        help="the registry family the base bundle belongs to")
     parser.add_argument("--bits", type=int, default=3)
     parser.add_argument("--group", type=int, default=128)
     args = parser.parse_args()
@@ -144,6 +146,13 @@ def main() -> int:
         "source": f"delta of {args.params.name} against {args.base}",
         "bundle": {"purpose": "browser-inference", "encoding": "float32-le"},
         "delta": {
+            # 🔴 THE FAMILY, NOT A PATH. A delta is useless without its base and
+            # the base is a bundle the registry already names - so this says
+            # which family to resolve rather than a directory that is right on
+            # one machine. `--base-family` is the escape for a base that is not
+            # in the registry.
+            "baseFamily": args.base_family,
+            "model": args.params.stem.replace("params_", ""),
             "baseModel": base_manifest["bundle"]["model"],
             "addTo": sorted(delta_names),
             "whole": sorted(kept),

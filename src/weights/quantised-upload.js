@@ -45,6 +45,19 @@ const PARAM_STRIDE = 256;
 const LANES = 64;
 
 /**
+ * 🔴 AND IT ADDS AS WELL AS WRITES, WHICH IS HOW A SECOND MODEL IS REACHED FROM
+ * THE FIRST. AlphaFold 2 is five models and a bundle is 97 MiB, so offering all
+ * five is half a gigabyte a visitor. The five are one training run continued
+ * five ways and the difference between two of them stores at three bits where a
+ * model costs eight: 43 MiB a delta, measured free on a fold (5CAJ chain A,
+ * model_3_ptm, 1.95 A against its own bundle's 1.94). With
+ * `{ accumulate: true }` a plan decodes those codes and ADDS them into the
+ * resident f16 weights, so switching models is a dispatch over a buffer that is
+ * already there rather than a second download and a second host decode - and
+ * the float32 expansion this file exists to avoid is avoided for the switch
+ * too. `tools/gpu/check-delta-upload.js` is the gate, on real parameters.
+ * See tools/pack_delta_model.py for what a delta bundle is.
+ *
  * 🔴 THE CODEC IS THE TENSOR'S, NOT THIS FILE'S. This decoded int5 at a group
  * of 32 and nothing else, written into the constants and into the shader's
  * `* 5u` and `& 31u`. ESM-C ships **int3 at a group of 128** - the only bundle
@@ -83,7 +96,7 @@ function codeSpan(first, count, codec) {
            byteLength: (lastGroup - firstGroup) * codec.groupBytes + 1 };
 }
 
-const shaderFor = (codec, destination) => `
+const shaderFor = (codec, destination, accumulate) => `
 // 🔴 FOUR SOURCES A DESTINATION, BECAUSE A PACKED WEIGHT IS NOT ALWAYS A COPY.
 // The contiguous case is "parts = 1": destination element d reads source
 // element "bias0 + d". The reshapes this repository's packers do are all the
@@ -187,14 +200,24 @@ ${destination === "f32" ? `  // 🔴 ONE ELEMENT A WORD, SO THE DESTINATION MAY 
   // bits, which WGSL has no way to do.
   let within = id.x + id.y * 65535u * ${LANES}u;
   if (within >= params.count) { return; }
-  output[params.destWord + params.destStride * within] = bitcast<u32>(value_at(within));`
+  let at = params.destWord + params.destStride * within;
+${accumulate ? "  output[at] = bitcast<u32>(bitcast<f32>(output[at]) + value_at(within));"
+    : "  output[at] = bitcast<u32>(value_at(within));"}`
 : `  let pair = id.x + id.y * 65535u * ${LANES}u;
   let within = pair * 2u;
   if (within >= params.count) { return; }
   let a = value_at(within);
   var b = 0.0;
   if (within + 1u < params.count) { b = value_at(within + 1u); }
-  output[params.destWord + pair] = pack2x16float(vec2<f32>(a, b));`}
+${accumulate ? `  // 🔴 READ, ADD, WRITE - AND ONE LANE STILL OWNS ONE WHOLE WORD, which is
+  // the rule that makes this safe and is the same rule that makes the plain
+  // store safe. A lane owning HALF a word would read it, insert its half and
+  // write it back while the lane holding the other half did the same, and one
+  // of the two updates would be lost - which is the folded-grid race this
+  // repository already paid for once, at a different boundary.
+  let previous = unpack2x16float(output[params.destWord + pair]);
+  output[params.destWord + pair] = pack2x16float(vec2<f32>(a + previous.x, b + previous.y));`
+    : "  output[params.destWord + pair] = pack2x16float(vec2<f32>(a, b));"}`}
 }`;
 
 /**
@@ -214,7 +237,8 @@ ${destination === "f32" ? `  // 🔴 ONE ELEMENT A WORD, SO THE DESTINATION MAY 
  *   cannot be run at all - a store with no `tensorSource`, an int5 tensor with
  *   an unexpected group size, or an odd destination offset.
  */
-export function planBlockUpload(entries, destination = "f16") {
+export function planBlockUpload(entries, destination = "f16", options = {}) {
+  const accumulate = options.accumulate === true;
   const codeChunks = [];
   const scaleChunks = [];
   const zeroChunks = [];
@@ -317,7 +341,7 @@ export function planBlockUpload(entries, destination = "f16") {
                   inner, innerStride, outerStride });
   }
   return { gpu: { codeChunks, scaleChunks, zeroChunks, params, codec, destination,
-                  codeBytes, halfBytes: halfCount * 2 }, host };
+                  codeBytes, halfBytes: halfCount * 2, accumulate }, host };
 }
 
 /**
@@ -326,13 +350,18 @@ export function planBlockUpload(entries, destination = "f16") {
  * The caller owns `destination`; it must be at least the packed size and carry
  * STORAGE usage.
  */
-async function uploadPipeline(device, codec, destination) {
+async function uploadPipeline(device, codec, destination, accumulate = false) {
   let forDevice = PIPELINES.get(device);
   if (forDevice === undefined) {
     forDevice = new Map();
     PIPELINES.set(device, forDevice);
   }
-  const key = `${codec.bits}:${codec.group}:${codec.signed ? "s" : "u"}:${destination}`;
+  // 🔴 THE VARIANT IS IN THE KEY. One promise per device would hand back
+  // whichever shader was compiled first, so a delta dispatch would OVERWRITE
+  // the weights it was meant to add to - a plausible buffer, a wrong model, and
+  // nothing to see.
+  const key = `${codec.bits}:${codec.group}:${codec.signed ? "s" : "u"}:${destination}`
+    + `${accumulate ? ":add" : ""}`;
   const found = forDevice.get(key);
   if (found !== undefined) return found;
   const storage = (binding, type) => ({
@@ -351,7 +380,8 @@ async function uploadPipeline(device, codec, destination) {
     label: `int${codec.bits}-upload`,
     layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
     compute: { module: device.createShaderModule({
-      label: `int${codec.bits}-upload.wgsl`, code: shaderFor(codec, destination) }),
+      label: `int${codec.bits}-upload${accumulate ? "-add" : ""}.wgsl`,
+      code: shaderFor(codec, destination, accumulate) }),
       entryPoint: "main" },
   }).then((pipeline) => {
     const resolved = { pipeline, layout };
@@ -368,8 +398,9 @@ async function uploadPipeline(device, codec, destination) {
 }
 
 /** The pipeline if it is already built, without a microtask. */
-function builtPipeline(device, codec, destination) {
-  const key = `${codec.bits}:${codec.group}:${codec.signed ? "s" : "u"}:${destination}!`;
+function builtPipeline(device, codec, destination, accumulate = false) {
+  const key = `${codec.bits}:${codec.group}:${codec.signed ? "s" : "u"}:${destination}`
+    + `${accumulate ? ":add" : ""}!`;
   return PIPELINES.get(device)?.get(key);
 }
 
@@ -489,8 +520,9 @@ export async function runBlockUpload(device, plan, destination) {
   const startedAt = performance.now();
   const element = plan.destination ?? "f16";
   const pipelineAt = performance.now();
-  const { pipeline, layout } = builtPipeline(device, plan.codec, element)
-    ?? await uploadPipeline(device, plan.codec, element);
+  const add = plan.accumulate === true;
+  const { pipeline, layout } = builtPipeline(device, plan.codec, element, add)
+    ?? await uploadPipeline(device, plan.codec, element, add);
   blockUploadStats.pipelineMs += performance.now() - pipelineAt;
   const staging = [];
   const make = (size, usage) => {

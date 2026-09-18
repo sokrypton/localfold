@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-326 tools. `tools/fixtures/` is data and is not listed.
+327 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (187)
+## `tools/gpu/` - the WebGPU lane (188)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -83,6 +83,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-block-upload.js`** - Does a whole diffusion transformer block decode the same on the GPU?
 - **`check-bundle-device-decode.js`** - A REAL bundle's tensors, decoded on the host and on the device, compared bit for bit.
 - **`check-chiral-gradient.js`** - RoseTTAFold3's chirality gradient: the GPU kernel against the CPU reference.
+- **`check-delta-upload.js`** - Does the SHIPPED uploader ADD a delta to weights that are already resident?
 - **`check-difftx-batched.js`** - Does the batched path compute the same thing S times?
 - **`check-difftx-samples.js`** - Does the sample dimension leave the one-sample path alone?
 - **`check-difftx-splits.js`** - Does every K-split of the diffusion transformer compute the unsplit answer?

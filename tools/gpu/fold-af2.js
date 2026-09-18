@@ -53,6 +53,7 @@ import { featureStats, resetFeatureStats } from "../../src/input/a3m-features.js
 import { chainResidues, identityMap, templateSlotAtom37 }
   from "../../src/af3/featurise/template-input.js";
 import { superpose } from "./superpose.js";
+import { DeltaTensorStore } from "../../src/bundles/delta-tensor-store.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -208,10 +209,41 @@ export async function main(device, args) {
   // bundle this flag likes can still be one the page cannot load (CLAUDE.md
   // has that trap, and it cost 122 MiB of download before a fold).
   const bundleDirectory = option(args, "bundle", "").replace(/\/$/, "");
-  const store = bundleDirectory === ""
+  let store = bundleDirectory === ""
     ? await HttpTensorStore.fromManifest(
       MODEL_BUNDLES[family].directory, await loadManifest(family))
     : await HttpTensorStore.open(`${bundleDirectory}/manifest.json`);
+  // 🔴 A DELTA BUNDLE IS HALF A MODEL AND SAYS SO. Its manifest carries a
+  // `delta` header naming the family it is added to, so this opens that base as
+  // well - see src/bundles/delta-tensor-store.js. `--base=` overrides the
+  // directory for a base that is not the registry's.
+  if (store.manifest.delta !== undefined) {
+    const header = store.manifest.delta;
+    const baseDirectory = option(args, "base", "").replace(/\/$/, "");
+    const base = baseDirectory !== ""
+      ? await HttpTensorStore.open(`${baseDirectory}/manifest.json`)
+      : await HttpTensorStore.fromManifest(MODEL_BUNDLES[header.baseFamily].directory,
+        await loadManifest(header.baseFamily));
+    console.log(`[delta] ${header.model ?? "a delta"} on ${header.baseModel}:`
+      + ` ${header.addTo.length} added, ${header.whole.length} whole,`
+      + ` ${header.absent.length} absent`);
+    store = new DeltaTensorStore(base, store);
+    // 🔴 AND IT HOST-PACKS, BY CONSTRUCTION RATHER THAN BY SURPRISE. With no
+    // `tensorSource` every weight is reconstructed on the host, so the resident
+    // descriptors are built from VALUES and the device weight packer refuses
+    // them - the right refusal, and the reason this says so out loud rather
+    // than leaving a fold looking mysteriously slow. Applying the delta ON the
+    // device (planBlockUpload's `accumulate`, gated by
+    // tools/gpu/check-delta-upload.js) is what removes the cost.
+    console.log("[delta] host weight packing: a reconstructed tensor has no shard");
+    setDeviceTuning(device, { allowHostWeightPacking: true });
+    // 🔴 AND IT HOST-PACKS, BY CONSTRUCTION RATHER THAN BY SURPRISE. A
+    // reconstructed tensor has no shard of its own, so the device weight packer
+    // refuses it - the right refusal, and the reason this says so out loud
+    // rather than leaving a fold looking mysteriously slow. Applying the delta
+    // ON the device (planBlockUpload's `accumulate`, gated by
+    // tools/gpu/check-delta-upload.js) is what removes the cost.
+  }
   // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES. `prefetch` is opt-in
   // because a bench that reads four blocks should not pull the whole manifest -
   // but this tool loads a whole model, so a run without it measures a download
