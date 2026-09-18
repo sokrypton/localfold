@@ -21,8 +21,14 @@ any reordering in the walk renames every tensor. Here each tensor is written
 under the name `src/bundles/manifests/monomer.js` already gives it, so a rebuilt
 model_1_ptm is name-identical to the bundle that ships and the two can be folded
 against each other. That is the gate this exporter is checked by: rebuilt
-model_1 must fold to the SAME checksum as `model/`, which on the A100 is
--1287025.
+model_1, quantised the way the shipped bundle is, must fold to the SAME
+checksum as `model/`.
+
+🔴 AND THAT CHECKSUM MOVED WHEN THE BASE DID. It was **-1287025** while
+`model/` was int8 symmetric block 64 (tools/quantize_model.py) and is
+**-1309830** now that it is int5 asymmetric group 32 (tools/quantize_af3.py,
+73 MiB against 98, measured free on both a single-sequence fold and 5CAJ with
+an alignment). A figure recorded here before 2026-09-18 is the int8 base's.
 
 🔴 AND COVERAGE IS ASSERTED IN BOTH DIRECTIONS. A weight the reference names and
 the npz does not have is a missing tensor; a name written twice is a walk that
@@ -178,6 +184,13 @@ def export(params_path: Path, borrow_dir: Path, out_dir: Path) -> int:
         keep.add(name)
     if "confidencePaeBreaks" in written:
         keep.add("confidencePaeBreaks")
+    # 🔴 AND THE DISTOGRAM HEAD, WHICH IS 33 KB AND IS THE CONTACT MAP. It is
+    # 128x64 plus a bias - not worth a codec at any bit width, and the one head
+    # whose output the page DRAWS rather than reports. test/manifest.test.js
+    # pins it, and caught it missing from this list the first time an AF2
+    # export was packed by the asymmetric quantiser.
+    if head is not None:
+        keep.update(head[leaf] for leaf in ("weights", "bias"))
     manifest["float32Tensors"] = sorted(keep & written)
     writer.close()
     manifest["tensors"] = writer.records

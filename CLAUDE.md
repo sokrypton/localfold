@@ -1322,12 +1322,22 @@ whichever model was mid-fold, and nothing left running. Sweep BETWEEN batches,
 never during one.
 
 🔴 **AND A CHECKSUM DOES NOT TRAVEL BETWEEN MACHINES, SO NEVER HAND ONE ACROSS
-AS A BAR.** The A100 folds `fold-af2.js` at **-1287025** and the M2 at
+AS A BAR.** The A100 folded `fold-af2.js` at **-1287025** and the M2 at
 **-1282976**, over the same code and the same input, because the two resolve
 different attention kernels - `attention:flash-matrix-32-...-4x32` here and
 `attention:flash-registers-32-chunk16` there, the M2 offering `8x8x8` units and
 nothing else against a kernel that declares `<f16, 16, 16>`. Both folds are
 correct.
+
+🔴 **AND BOTH OF THOSE ARE THE int8 BASE'S. AlphaFold 2's TWO BUNDLES ARE int5
+FROM 2026-09-18** - asymmetric group 32 through tools/quantize_af3.py, 73 and 74
+MiB against 98 each - so this A100 now folds the monomer at **-1309830** (pLDDT
+62.924) and the 30,29 multimer at **-393805**. Every AF2 checksum written down
+before that date is the old base's and is not a bar for anything today. The
+switch is free where it was measured: the single-sequence 59-mer 62.924 against
+62.646, 5CAJ with 7907 rows 1.859 A / 95.790 against 1.864 / 95.848, and
+barnase-barstar with a paired alignment ipTM **0.9208 against 0.9254**. See
+docs/AF2.md.
 
 This file already said so, buried in the race section - "these are M2 checksums
 and are NOT comparable with the A100's" - and a checklist written for the M2

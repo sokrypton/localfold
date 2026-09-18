@@ -2801,3 +2801,74 @@ deep-MSA targets is measured on the easy half of what the page does.
 So three bits ships, at 43 MiB, and `--bits 2` stays for anyone who folds with
 an alignment every time and wants the 24. The four are 172 MiB against 388 as
 whole bundles.
+
+## 🔴 BOTH ALPHAFOLD 2 BUNDLES ARE int5 NOW: 98 MiB TO 73, MEASURED FREE
+
+The monomer and the multimer shipped at **int8 symmetric block 64** - the scheme
+tools/quantize_model.py chose in 2024, for the reason its own header gives:
+"byte-aligned, so there is no bit-packing, and the loss is inside the run-to-run
+noise". What it also records is that below six bits a SYMMETRIC scheme falls off
+a cliff (int5 at -7.8 pLDDT) and that a zero point recovers most of it (-1.7),
+and that -1.7 was judged not worth 30 MiB.
+
+Measured again with the quantiser AlphaFold 3 ships - `quantize_af3.py`, int5
+**asymmetric** group 32, the same codec and the same reader - the -1.7 is not
+there:
+
+| monomer | size | 59-mer, no alignment | 5CAJ + 7907 rows |
+|---|---:|---:|---|
+| int8 symmetric (was) | 98 MiB | 62.646 | 1.864 A / 95.848 |
+| **int5 asymmetric** | **73 MiB** | **62.924** | **1.859 A / 95.790** |
+
+| multimer | size | barnase-barstar, paired alignment |
+|---|---:|---|
+| int8 symmetric (was) | 98 MiB | pLDDT 97.39, pTM 0.9348, ipTM 0.9254 |
+| **int5 asymmetric** | **74 MiB** | pLDDT 97.127, pTM 0.9321, **ipTM 0.9208** |
+
+🔴 **AND THE OLD TABLE WAS NOT WRONG, IT WAS A DIFFERENT EXPERIMENT.** That -1.7
+came from quantize_model.py's own hand-rolled zero point and did not keep this
+keep-list; `quantize_af3.py` is the calibrated one, and the exports now DECLARE
+`float32Tensors` so either quantiser protects the same tensors - the structure
+module, the geometry tables and the PAE bin edges.
+
+🔴 **AND IT NEEDED A REAL TARGET IN BOTH CASES.** The monomer's 59-residue gate
+sequence and the multimer's synthetic 30,29 shape both move by 3 pLDDT between
+the two bases, in the direction of the new one, which is neither evidence for
+nor against: they are low-confidence folds where anything moves. What settles it
+is 5CAJ with an alignment and barnase-barstar with a PAIRED one - the second of
+which had to be searched for, because without it both bases read ipTM 0.06-0.08
+and a comparison of two broken folds says nothing.
+
+**Every AF2 signature moved with the bases.** The monomer folds the gate
+sequence at **-1309830** where it read -1287025, and the 30,29 multimer at
+**-393805** where it read 315591. `tools/gate-baseline.json` is re-recorded;
+any AF2 checksum written down before 2026-09-18 is the int8 base's.
+
+**And the four deltas are repacked**, because a delta is against what the device
+HOLDS: model_2 to model_5 now sit on the int5 base and fold the gate sequence at
+63.192 / 59.228 / 62.130 / 66.194.
+
+🔴 **AND `bundle.bytes` IS THE SHARD CACHE'S KEY, WHICH THIS NEARLY LOST.**
+`cacheToken` in src/bundles/http-tensor-store.js is `model-bytes-tensorCount`,
+and `quantize_af3.py` was carrying the SOURCE manifest's bundle block through
+unchanged - so the packed AF2 bundle inherited `encoding: float32-le` and no
+byte count at all, which falls back to 0. Two different exports of one model
+would then share a cache token: a fresh manifest against a cached shard, which
+surfaces as "<file> has an invalid byte length" naming neither half. Three
+separate hours have gone into that message before. The quantiser refreshes the
+block now - encoding, tensor count, shard count and bytes - which is right for
+every bundle it writes and not only this one.
+
+🔴 **AND THE DISTOGRAM HEAD WAS QUANTISED FOR ONE BUILD, WHICH A TEST CAUGHT.**
+It is 128x64 plus a bias - 33 KB, not worth a codec at any width - and it is the
+one head whose output the page DRAWS rather than reports. It was not in the
+keep-list the first time an AF2 export went through the asymmetric quantiser;
+test/manifest.test.js pinned `dtype === "float32"` and failed. The same test's
+rule that both tensors sit in the LAST shard, adjacent, has expired and is
+retired with a note: that was how `add_distogram_head.py` appended the head to
+shards that were already published, and a bundle exported whole has nothing to
+preserve.
+
+**Published** as `af2-monomer-int5/` and `af2-multimer-int5/` beside the four
+`af2-monomer-N/` deltas, pinned at one revision. The int8 directories stay where
+they are, so a commit pinned to them keeps resolving.

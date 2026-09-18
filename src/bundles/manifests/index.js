@@ -38,7 +38,7 @@ export const MODEL_BUNDLES = {
   monomer: {
     model: "model_1_ptm",
     directory: "./model/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/71ece3571b80e6cdb06f3b95f785187171c718da/af2-monomer/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-int5/",
     release: "model1-ptm",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer.js"),
@@ -55,7 +55,7 @@ export const MODEL_BUNDLES = {
     model: "model_2_ptm",
     delta: { base: "monomer" },
     directory: "./model-mono-2-delta/",
-    remote: null,
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-2/",
     release: "model2-ptm-delta",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-2.js"),
@@ -78,7 +78,7 @@ export const MODEL_BUNDLES = {
     // test/model-bundles.test.js holds the two to each other.
     noTemplateEmbedder: true,
     directory: "./model-mono-3-delta/",
-    remote: null,
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-3/",
     release: "model3-ptm-delta",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-3.js"),
@@ -101,7 +101,7 @@ export const MODEL_BUNDLES = {
     // test/model-bundles.test.js holds the two to each other.
     noTemplateEmbedder: true,
     directory: "./model-mono-4-delta/",
-    remote: null,
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-4/",
     release: "model4-ptm-delta",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-4.js"),
@@ -124,7 +124,7 @@ export const MODEL_BUNDLES = {
     // test/model-bundles.test.js holds the two to each other.
     noTemplateEmbedder: true,
     directory: "./model-mono-5-delta/",
-    remote: null,
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-5/",
     release: "model5-ptm-delta",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-5.js"),
@@ -132,7 +132,7 @@ export const MODEL_BUNDLES = {
   multimer: {
     model: "model_1_multimer_v3",
     directory: "./model-multimer/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/71ece3571b80e6cdb06f3b95f785187171c718da/af2-multimer/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-multimer-int5/",
     release: "model1-multimer-v3",
     variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
     load: () => import("./multimer.js"),

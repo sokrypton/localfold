@@ -43,17 +43,28 @@ describe("DEFAULT_MANIFEST", () => {
     // reads float32 from these same shards for the PAE bin edges.
     expect(weights.dtype).toBe("float32");
     expect(bias.dtype).toBe("float32");
-    // ...and both in the last shard, which is what keeps the earlier ones byte
-    // for byte what they were.
-    expect(weights.file).toBe(bias.file);
-    expect(bias.byteOffset).toBe(weights.byteOffset + 128 * 64 * 4);
+    // 🔴 THEY USED TO BE PINNED TO ONE SHARD, ADJACENT, AND THAT RULE HAS
+    // EXPIRED. `add_distogram_head.py` APPENDED the head to shards that were
+    // already published, so putting both in the last one and the bias directly
+    // after the weights is what kept the other 227 MB byte for byte and made
+    // the upload one file. The bundle is exported whole now - int5 asymmetric,
+    // every shard rewritten - so there is nothing to preserve and the packer
+    // lays them wherever the sizes fall. What still matters is that they are
+    // float32, the right shape, and IN the table, which is asserted above:
+    // they are 33 KB and they are the contact map.
+    expect(typeof weights.file).toBe("string");
+    expect(typeof bias.byteOffset).toBe("number");
   });
 
   it("contains all 337 tensor entries with valid shapes and dtypes", () => {
     const tensorKeys = Object.keys(DEFAULT_MANIFEST.tensors);
     expect(tensorKeys.length).toBe(337);
 
-    const validDtypes = new Set(["int8", "float32", "float16"]);
+    // 🔴 int5 IS IN THE LIST BECAUSE THE BUNDLE IS int5 NOW - asymmetric, group
+    // 32, 73 MiB against the int8 export's 98 and measured free on a fold. A
+    // packed dtype carries a zero point as well as a scale, which is what
+    // "asymmetric" means and what int8 symmetric did not have.
+    const validDtypes = new Set(["int8", "int5", "float32", "float16"]);
     for (const [name, tensor] of Object.entries(DEFAULT_MANIFEST.tensors)) {
       expect(typeof tensor.file).toBe("string");
       expect(tensor.file.startsWith("weights-")).toBe(true);
@@ -64,6 +75,11 @@ describe("DEFAULT_MANIFEST", () => {
       if (tensor.dtype === "int8") {
         expect(typeof tensor.scaleOffset).toBe("number");
         expect(tensor.block).toBe(64);
+      }
+      if (tensor.dtype === "int5") {
+        expect(typeof tensor.scaleOffset).toBe("number");
+        expect(typeof tensor.zeroOffset).toBe("number");
+        expect(tensor.block).toBe(32);
       }
     }
   });

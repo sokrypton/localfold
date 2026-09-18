@@ -226,6 +226,20 @@ def export(params_path: Path, monomer_dir: Path, out_dir: Path) -> int:
         "parameters": template,
     }
 
+    # 🔴 THE KEEP-LIST IS DECLARED HERE TOO, for the reason the monomer exporter
+    # declares it: tools/quantize_model.py DERIVES it from the sections and
+    # tools/quantize_af3.py - the asymmetric quantiser a sub-byte codec needs -
+    # only honours an explicit `float32Tensors`. Without it an int5 pack would
+    # round the structure module, which composes rigid transforms across eight
+    # iterations, and the error would land in the coordinates.
+    structural = set()
+    for module, leaves in manifest.get("structureModule", {}).get("parameters", {}).items():
+        structural.update(leaves.values())
+    for name in manifest["residueGeometry"]["tensors"]:
+        structural.add(name)
+    if "confidencePaeBreaks" in writer.records:
+        structural.add("confidencePaeBreaks")
+    manifest["float32Tensors"] = sorted(structural & set(writer.records))
     writer.close()
     manifest["tensors"] = writer.records
     (out_dir / "manifest.json").write_text(json.dumps(manifest))

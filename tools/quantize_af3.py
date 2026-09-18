@@ -274,6 +274,27 @@ def main():
         "scheme": "asymmetric-per-group", "bits": bits, "group": group,
         "scaleDtype": "float16", "zeroDtype": "float16",
     }
+    # 🔴 AND THE BUNDLE BLOCK IS REFRESHED, BECAUSE `bundle.bytes` IS THE SHARD
+    # CACHE'S KEY. `cacheToken` in src/bundles/http-tensor-store.js is
+    # `model-bytes-tensorCount`, and a manifest that carries the SOURCE's byte
+    # count - or none at all, which falls back to 0 - gives two different
+    # exports of one model the same token: a fresh manifest against a cached
+    # shard, which surfaces as "<file> has an invalid byte length" naming
+    # neither half. Three separate hours have gone into that message, and it
+    # was one step from happening again here: the AF2 export this quantiser was
+    # newly pointed at describes its own float32 layout, so the packed bundle
+    # inherited "encoding: float32-le" and NO byte count.
+    written = sorted(out.glob(f"weights-*.int{bits}.bin"))
+    manifest["bundle"] = {
+        **manifest.get("bundle", {}),
+        "purpose": "browser-inference",
+        "encoding": f"int{bits}-le",
+        "encodingNote": (f"int{bits} asymmetric, group {group}, with float16 scales and"
+                         " zero points; the tensors in float32Tensors stay float32"),
+        "tensors": len(manifest["tensors"]),
+        "shards": len(written),
+        "bytes": sum(path.stat().st_size for path in written),
+    }
     (out / "manifest.json").write_text(json.dumps(manifest))
 
     total = kept_bytes + quantised_bytes
