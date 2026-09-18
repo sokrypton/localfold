@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -94,6 +95,7 @@ def held_by_the_device(bundle: Path) -> dict[str, np.ndarray]:
             shards[record["file"]] = (bundle / record["file"]).read_bytes()
         blob = shards[record["file"]]
         count = int(np.prod(record["shape"]))
+        packed = re.fullmatch(r"int([1-9])", record["dtype"])
         if record["dtype"] == "int8":
             codes = np.frombuffer(blob, dtype=np.int8, count=count,
                                   offset=record["byteOffset"]).astype(np.float32)
@@ -101,6 +103,25 @@ def held_by_the_device(bundle: Path) -> dict[str, np.ndarray]:
             scales = np.frombuffer(blob, dtype="<f2", count=groups,
                                    offset=record["scaleOffset"]).astype(np.float32)
             values = codes * np.repeat(scales, record["block"])[:count]
+        elif packed is not None:
+            # 🔴 THE BASE NEED NOT BE int8, AND SAYING SO IS WHY THIS READS THE
+            # BUNDLE RATHER THAN RE-QUANTISING THE CHECKPOINT. AlphaFold 2's
+            # monomer ships int8 symmetric today and int5 ASYMMETRIC is 73 MiB
+            # against 98 at the same fold, so a delta has to be able to sit on
+            # either - and it is only correct if it is subtracted from exactly
+            # what the device will hold.
+            bits, group = int(packed.group(1)), record["block"]
+            raw = np.frombuffer(blob, dtype=np.uint8, offset=record["byteOffset"],
+                                count=(count * bits + 7) // 8)
+            spread = np.unpackbits(raw, bitorder="little")[:count * bits].reshape(count, bits)
+            codes = (spread * (1 << np.arange(bits))).sum(1).astype(np.float32)
+            groups = -(-count // group)
+            scales = np.frombuffer(blob, dtype="<f2", count=groups,
+                                   offset=record["scaleOffset"]).astype(np.float32)
+            zeros = np.frombuffer(blob, dtype="<f2", count=groups,
+                                  offset=record["zeroOffset"]).astype(np.float32)
+            values = (codes * np.repeat(scales, group)[:count]
+                      + np.repeat(zeros, group)[:count])
         else:
             dtype = {"float32": "<f4", "float16": "<f2"}[record["dtype"]]
             values = np.frombuffer(blob, dtype=dtype, count=count,

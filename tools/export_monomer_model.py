@@ -82,6 +82,7 @@ def export(params_path: Path, borrow_dir: Path, out_dir: Path) -> int:
     }
     missing: list[str] = []
     written: set[str] = set()
+    structural: set[str] = set()
 
     def put(name: str, values: np.ndarray) -> str:
         if name in written:
@@ -115,6 +116,8 @@ def export(params_path: Path, borrow_dir: Path, out_dir: Path) -> int:
                     missing.append(f"{section}/{module}//{leaf}")
                     continue
                 entry[leaf] = put(name, source[leaf])
+                if section == "structureModule":
+                    structural.add(name)
             parameters[module] = entry
         manifest[section] = {key: value for key, value in reference[section].items()
                              if key != "parameters"}
@@ -163,6 +166,19 @@ def export(params_path: Path, borrow_dir: Path, out_dir: Path) -> int:
         put(name, values)
     manifest["residueGeometry"] = reference["residueGeometry"]
 
+    # 🔴 THE KEEP-LIST IS DECLARED, SO EITHER QUANTISER CAN READ THIS EXPORT.
+    # tools/quantize_model.py DERIVES it from the sections (structure module,
+    # geometry tables, PAE bin edges); tools/quantize_af3.py - the asymmetric
+    # one, which is what a sub-byte codec needs - only honours an explicit
+    # `float32Tensors`. Writing it here means an AF2 export can be packed either
+    # way rather than only the way it was written for, and the two agree about
+    # which tensors must not be rounded.
+    keep = set(structural)
+    for name in manifest["residueGeometry"]["tensors"]:
+        keep.add(name)
+    if "confidencePaeBreaks" in written:
+        keep.add("confidencePaeBreaks")
+    manifest["float32Tensors"] = sorted(keep & written)
     writer.close()
     manifest["tensors"] = writer.records
     (out_dir / "manifest.json").write_text(json.dumps(manifest))
