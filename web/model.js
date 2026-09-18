@@ -213,6 +213,31 @@ const loaded = new Map();
  * @param {"single"|"msa"} variant which inference path the weights are for
  * @param {(p: {loadedBytes: number, totalBytes: number}) => void} [onProgress]
  */
+/**
+ * Forget one family's weights, so the next fold downloads and decodes them again.
+ *
+ * 🔴 MEASURED, NOT ASSUMED: FIVE MODELS IS 3.4 GB OF JS HEAP. Both caches here
+ * are permanent by design - a visitor who switches model and switches back pays
+ * nothing - and that is right for a page where one model is loaded at a time.
+ * "All 5" loads five in thirteen seconds: measured in the page on a 68-residue
+ * single-sequence fold, the heap goes from 9 MiB to 3412, and Chrome's own
+ * ceiling is about 4 GB. A longer chain would not have run out of GPU, it would
+ * have run out of TAB.
+ *
+ * So a sweep releases each delta once its passes are in hand. The BASE is kept:
+ * every delta is a difference on it, so dropping it would re-download 73 MiB
+ * four times in one run. What is released is a cache entry, not memory anybody
+ * still holds - a store the current fold is reading stays alive through its own
+ * reference, and this only stops the NEXT fold from finding it.
+ *
+ * @param {import("../src/bundles/manifests/index.js").ModelFamily} family
+ */
+export function releaseModel(family) {
+  loaded.delete(`${family}:msa`);
+  loaded.delete(`${family}:single`);
+  stores.delete(family);
+}
+
 export function loadModel(variant, onProgress, signal = undefined, family = "monomer") {
   if (variant !== "single" && variant !== "msa") {
     throw new RangeError(`unknown model variant ${variant}: expected "single" or "msa"`);

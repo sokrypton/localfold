@@ -175,6 +175,23 @@ def page_models():
     return re.findall(r'<option value="([^"]+)"', block)
 
 
+def page_af2_models():
+    """Every value AlphaFold 2's Model # select offers, read from the page.
+
+    🔴 THE SAME RULE AS page_models, ONE CONTROL LATER. This list was typed out
+    as ["1"..."5"] and the page grew an "all" - five models in one run, ranked
+    together - which this tool could then not drive at all: the one gate that
+    touches the control a reader touches could not reach the control's newest
+    value. Derived, it follows the page, including a number `build_site.py`
+    trims because the site cannot serve its bundle.
+    """
+    with open(os.path.join(REPO, "index.html"), encoding="utf-8") as handle:
+        html = handle.read()
+    start = html.index('id="af2Model"')
+    block = html[start:html.index("</select>", start)]
+    return re.findall(r'<option value="([^"]+)"', block)
+
+
 def main():
     models = page_models()
     parser = argparse.ArgumentParser()
@@ -185,8 +202,10 @@ def main():
     # 🔴 ALPHAFOLD 2 IS FIVE MODELS AND THE PAGE OFFERS THE NUMBER SEPARATELY.
     # 2 to 5 load as a delta on model_1, so this is also the only way to drive
     # that path through the page rather than through a fold tool.
-    parser.add_argument("--af2-model", default="1", choices=["1", "2", "3", "4", "5"],
-                        help="which of AlphaFold 2's five models, for --model monomer")
+    parser.add_argument("--af2-model", default="1", choices=page_af2_models(),
+                        help="which of AlphaFold 2's five models, for --model monomer"
+                             " or --model multimer; \"all\" runs every one of them in"
+                             " a single set of frames and ranks across them")
     parser.add_argument("--recycles", default="1")
     parser.add_argument("--steps", default="4", help="AF3 sampler steps")
     parser.add_argument("--url", default=None,

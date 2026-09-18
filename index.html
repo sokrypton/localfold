@@ -236,6 +236,17 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <option value="3">3</option>
                   <option value="4">4</option>
                   <option value="5">5</option>
+                  <!-- 🔴 ALL FIVE IN ONE RUN, AND ONE SET OF FRAMES. AlphaFold's
+                       own pipeline runs the five and RANKS them, so folding one
+                       at a time and reading five status lines is the manual
+                       version of what the model expects. The passes of all five
+                       land on one object - 5 x (recycles + 1) frames on the play
+                       bar - superposed onto the first model's first pass, and
+                       the saved structure is the best pass of the best model.
+                       See af2Sweep; build_site.py trims a number the site
+                       cannot serve and the sweep reads the OPTIONS, so it
+                       follows. -->
+                  <option value="all">All 5</option>
                 </select>
               </div>
 

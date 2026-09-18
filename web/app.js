@@ -47,7 +47,7 @@ import { chainGeometryOf, chainGeometryVerdict } from "../src/af3/chain-geometry
 import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../src/chem/component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
-import { getDevice, loadModel } from "./model.js";
+import { getDevice, loadModel, releaseModel } from "./model.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../src/bundles/manifests/index.js";
@@ -394,12 +394,42 @@ const chosenFamily = () => {
   // embedder and the multimer's five all do.
   if (chosen === "monomer" || chosen === "multimer") {
     const number = document.getElementById("af2Model")?.value ?? "1";
+    // 🔴 "all" RESOLVES TO THE FIRST MODEL OF THE SWEEP, NOT TO A SIXTH FAMILY.
+    // One press of Fold then runs all five, but everything that reads this -
+    // the weight cache, the merge rule, the licence, the download stem - is
+    // asked before any of them has run and has to name a real bundle. The
+    // sweep itself is af2Sweep, and the run renames what it has to (the stem,
+    // the provenance) once it knows which model won.
+    if (number === "all") return chosen;
     return number === "1" ? chosen : `${chosen}-${number}`;
   }
   return chosen;
 };
 /** The graph a family runs, which for a delta is the graph of its base. */
 const graphOf = graphFamily;
+/**
+ * Every AlphaFold 2 family one press of Fold will run, in order.
+ *
+ * One family normally, and all five when the Model # row says "all" - which is
+ * what AlphaFold's own pipeline does, and the reason ColabFold ranks its
+ * outputs rather than returning the last one.
+ *
+ * 🔴 IT READS THE OPTIONS, NOT THE REGISTRY, so that trimming the control
+ * trims the sweep. `build_site.py` DELETES an `<option>` whose delta bundle has
+ * no `remote` - the page would 404 on shard zero otherwise - and a sweep built
+ * from `MODEL_BUNDLES` would have gone on folding the number it had just
+ * removed. The registry still has the last word on whether the name exists.
+ */
+const af2Sweep = (family) => {
+  const row = document.getElementById("model-family")?.value ?? "";
+  if (row !== "monomer" && row !== "multimer") return [family];
+  if ((document.getElementById("af2Model")?.value ?? "1") !== "all") return [family];
+  return [...document.querySelectorAll("#af2Model option")]
+    .map((option) => option.value)
+    .filter((value) => /^[0-9]+$/.test(value))
+    .map((number) => (number === "1" ? row : `${row}-${number}`))
+    .filter((name) => MODEL_BUNDLES[name] !== undefined);
+};
 const isAf3Family = (family) => AF3_FAMILIES.includes(family);
 /**
  * 🔴 "CAN THIS MODEL SEE AN ATOM" IS NOT "IS THIS AN AlphaFold 3 GRAPH", AND
@@ -567,10 +597,18 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   // and dropped. Refused by name rather than ignored, which is this file's rule
   // everywhere else; hiding the row would not be enough, because hiding a
   // control does not change its value.
-  if (templateCount > 0 && MODEL_BUNDLES[choice]?.noTemplateEmbedder === true) {
-    throw new Error(`${MODEL_BUNDLES[choice].model} has no template embedder -`
+  // 🔴 AND THE TEST IS OVER THE WHOLE SWEEP, because "All 5" RUNS models 3, 4
+  // and 5 while resolving to model 1's name. Asked of `choice` alone this
+  // passed, the run started, and the third model of five threw in the middle of
+  // a fold that had already drawn two - which is the worst moment to find out.
+  const templateless = af2Sweep(choice)
+    .filter((name) => MODEL_BUNDLES[name]?.noTemplateEmbedder === true);
+  if (templateCount > 0 && templateless.length > 0) {
+    throw new Error(`${MODEL_BUNDLES[templateless[0]].model} has no template embedder -`
       + " AlphaFold 2's models 3, 4 and 5 are the template-free ones."
-      + " Choose model 1 or 2, or remove the template.");
+      + (templateless.length > 1
+        ? " Choose model 1 or 2 rather than All 5, or remove the template."
+        : " Choose model 1 or 2, or remove the template."));
   }
   // 🔴 AND THE MONOMER'S TERM TAKES EXACTLY ONE. `QueryOnlyTemplateGpu` reads
   // `input.template`, singular - AF3 runs a forward per slot and averages, and
@@ -1175,7 +1213,8 @@ function setColourMode(mode) {
   return true;
 }
 
-async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence }) {
+async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
+                                frameName = "recycle_0" }) {
   const load = window.py2dmolLoadFiles;
   if (typeof load !== "function") {
     throw new Error("this py2Dmol bundle has no py2dmolLoadFiles; it needs the `full` build");
@@ -1240,9 +1279,11 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence 
   if (pae !== undefined || viewerObject !== undefined) {
     const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
     if (frame !== undefined) {
-      frame.name = "recycle_0";
-      frame.label = "recycle_0";
-      frame.title = "recycle_0";
+      // ...and the name is the caller's under a sweep, where frame zero belongs
+      // to model 1 of five rather than to the only fold there is. See appendPass.
+      frame.name = frameName;
+      frame.label = frameName;
+      frame.title = frameName;
       if (confidence !== undefined) frame.confidence = confidence;
       if (pae !== undefined) { frame.pae = pae; frame.pae_n = length; }
     }
@@ -1659,16 +1700,21 @@ function attachContactMap(frame, recycle, weights, length) {
 }
 
 function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStructure = undefined,
-                    weights = undefined) {
+                    weights = undefined, label = undefined) {
   const api = window.py2Dmol;
   if (viewer === undefined || viewerObject === undefined || api?.frameFromText === undefined) return;
   const aligned = alignedToFirstPass(sequence, recycle.structure, firstPassStructure);
   const pdb = predictionToPdb(sequence, aligned, recycle.confidence.plddt, chainLengths);
   const frame = api.frameFromText(pdb);
   const index = recycleIndex ?? (viewer?.objectsData?.[viewerObject]?.frames?.length ?? 1);
-  frame.name = `recycle_${index}`;
-  frame.label = `recycle_${index}`;
-  frame.title = `recycle_${index}`;
+  // 🔴 THE NAME IS THE CALLER'S WHERE THE CALLER KNOWS BETTER. A single fold's
+  // frames are its recycles and `recycle_3` says everything; under "All 5" the
+  // play bar carries five models' passes in one strip, and twenty frames
+  // numbered straight through cannot say which model a reader is looking at.
+  const name = label ?? `recycle_${index}`;
+  frame.name = name;
+  frame.label = name;
+  frame.title = name;
   frame.confidence = recycle.confidence;
   frame.pae = paeMatrix(recycle.confidence.predictedAlignedError, sequence.length);
   frame.pae_n = sequence.length;
@@ -3230,7 +3276,14 @@ async function fold(event) {
     // 🔴 AWAITED, NOT STARTED, and silent on the status line. startModelPreload
     // began this before the alignment and reports itself on the right; see the
     // note in foldWithAf3 for why it no longer writes to the line.
-    const model = await modelLoad;
+    // 🔴 THE SWEEP IS ONE MODEL UNLESS THE ROW SAYS "All 5". AlphaFold 2 is
+    // five models, one training run continued five ways, and AlphaFold's own
+    // pipeline runs all of them and RANKS the results - which is why every pass
+    // of every model here lands on ONE object and one ranking decides what is
+    // saved. `model` is reassigned per model, so it is no longer const, and the
+    // first one is the download that started before the alignment.
+    const sweep = af2Sweep(family);
+    let model = await modelLoad;
     throwIfAborted(signal);
     progress(null);
     const recycles = recycleCount();
@@ -3301,15 +3354,22 @@ async function fold(event) {
       template: af2Template === undefined ? null
         : cheapHash(`${templateSources[0].text}\u0000${templateSources[0].chainId ?? ""}`),
     });
-    const af2Cached = af2Cache?.key === af2Key ? af2Cache : undefined;
+    // 🔴 AND A SWEEP IS NEVER A CONTINUATION. The cache holds ONE model's trunk
+    // under a key naming that model, so resuming a five-model run would replay
+    // model_1's passes and then fold four models on top of them, in an object
+    // rewound to a different fold's frames. A sweep starts from pass zero and
+    // leaves no resumable state behind; see the clear after the loop.
+    const af2Cached = sweep.length === 1 && af2Cache?.key === af2Key ? af2Cache : undefined;
     const resume = af2Cached !== undefined && af2Cached.resumable.recycles < recycles
       ? af2Cached.resumable : undefined;
 
     predictionCount += 1;
     const fastaHeader = entityList.header();
+    // ...and a sweep says so in the file name, because the five models are one
+    // prediction here and the archive is the only place that can say which.
     const baseStem = fastaHeader !== null
       ? safeJobName(fastaHeader)
-      : `${MODEL_STEMS[family] ?? family}_${predictionCount}`;
+      : `${MODEL_STEMS[family] ?? family}${sweep.length > 1 ? "_all5" : ""}_${predictionCount}`;
     // 🔴 uniqueStem READS objectsData; the loop that used to be here read
     // `viewer.objects`, which does not exist on this build.
     const stem = resume === undefined ? uniqueStem(baseStem) : af2Cache.stem;
@@ -3358,163 +3418,233 @@ async function fold(event) {
       viewer = registry[Object.keys(registry)[0]]?.renderer;
       viewerObject = viewer === undefined ? undefined : stem;
     }
-    status(`Folding ${sequence.length} residues${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
-      + ` · ${passes} pass${passes === 1 ? "" : "es"} · ${family}`);
-
-    // ...DRAWN AS EACH PASS LANDS, not collected and drawn at the end. The
-    // first builds the object and the panels; the rest are frames on it.
     let firstPassLanded = undefined;
     let initialLoadPromise = undefined;
-    const onRecycle = (recycle, index) => {
-      if (signal.aborted) return;
-      // 🔴 A PASS DOES NOT WRITE THE STATUS LINE. It used to put its own
-      // number there - "Pass 2 of 4 · Δ 0.41 Å · pLDDT 63.4" - while the
-      // progress callback writes "Folding · 62%" many times a second between
-      // passes. The two alternate, and a line that swaps between two different
-      // sentences is unreadable: it reads as flicker rather than as progress.
-      // The percentage is the only thing there that moves smoothly, so it is
-      // the only thing there. See the same note in web/af3-model.js.
-      //
-      // 🔴 THE NUMBERS ARE NOT LOST, they are in the place that is meant to
-      // hold them: the scores card, which is a panel rather than a line and
-      // can be read at leisure while it updates once a pass.
-      updateScoresCard(recycle.confidence);
-      if (index === 0) {
-        firstPassLanded = alignedToPrevious(sequence, recycle.structure);
-        initialLoadPromise = loadIntoViewer({
-          stem,
-          pdb: predictionToPdb(sequence, firstPassLanded, recycle.confidence.plddt, chainLengths),
-          scores: confidenceJson(sequence, recycle.confidence),
-          a3m: alignment,
-          chainLengths,
-          pae: paeMatrix(recycle.confidence.predictedAlignedError, sequence.length),
-          length: sequence.length,
-          confidence: recycle.confidence,
-        });
-        // ...recycle 0's frame is built by loadIntoViewer rather than by
-        // appendPass, so its contact map has to be attached here or the first
-        // pass is the one frame without one - and it is the frame on screen
-        // while every later pass is still running.
-        void initialLoadPromise.then(() => {
-          const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
-          if (frame !== undefined) {
-            attachContactMap(frame, recycle, model.weights, sequence.length);
-          }
-        });
-      } else {
-        appendPass(sequence, chainLengths, recycle, index, firstPassLanded, model.weights);
-      }
-    };
-    // 🔴 THE UNITS ARE COSTS, NOT COUNTS, and that is what makes a clock
-    // possible. src/af2/model/*.js weight every step by what the cost model says it
-    // costs, so `completed / total` is a fraction of the WORK - and the ratio
-    // of elapsed time to work done is this machine's speed, whatever it is.
-    // RuntimeEstimator holds that reasoning; a plan of one stage is enough for
-    // it, since the weighting has already happened upstream.
-    let runEstimator = null;
-    const runProgress = ({ completed, total, waiting }) => {
-      if (signal.aborted) return;
-      if (waiting) {
-        const bar = element("progress");
-        bar.hidden = false;
-        bar.removeAttribute("value");
-        status("Folding…");
-        return;
-      }
-      runEstimator ??= new RuntimeEstimator({ stages: [{ name: "fold", units: total, count: 1 }] });
-      runEstimator.completedUnits(completed);
-      progress(runEstimator.fraction());
-      // See the note on `say` in web/af3-model.js: the percentage, and nothing
-      // beside it that moves on its own.
-      const percent = Math.min(100, Math.round(100 * runEstimator.fraction()));
-      status(`Folding · ${percent}%`);
-    };
-
-    // 🔴 THE MULTIMER REGIME IS FOUR FACTS, and they travel together. Multimer
-    // runs the outer product mean at the top of each block, works in units of
-    // 20 angstroms rather than 10, reads chain identity - asym, entity and
-    // symmetry - where the monomer reads only a residue index, and RUNS ITS
-    // TEMPLATE EMBEDDER WHETHER OR NOT THERE ARE TEMPLATES.
-    //
-    // That last one is not an option in multimer the way it is in the monomer.
-    // `template.enabled` is False for model_1_ptm and True for
-    // model_1_multimer_v3, and multimer's embedding wrapper adds the template
-    // activation to the pair unconditionally - masking every template off does
-    // not zero it, because it reads the pair through a layer norm and adds a
-    // learned constant. Skipping it put the pair 30% out from the first block
-    // and shattered backbones at high copy counts. Measured against
-    // AlphaFold's own forward on the toy oracle, running it takes the trunk
-    // from 6.4e-2 to 1.3e-2 and CA RMSD from 1.96 A to 1.02 A - and on float32
-    // weights, to 7.9e-7 and 0.000 A.
-    const regime = multimer
-      ? { outerProductMeanFirst: true, positionScale: 20,
-        chainAware: true, chainSequences: chains }
-      : {};
-    // ...?graph=unified runs the MONOMER weights through src/af2/multimer/ instead.
-    // With its switches off that graph reproduces the monomer one bit for bit,
-    // which is the check that the superset is right; a difference is a graph
-    // bug rather than a weights bug.
-    // 🔴 ONE PATH, WHETHER OR NOT THERE IS AN ALIGNMENT. A single sequence is an
-    // alignment of depth one, and it is folded as such.
-    //
-    // There used to be a second driver for it, AlphaFoldQueryOnlyGpu, on the
-    // grounds that the extra-MSA stack has nothing to attend over with one
-    // sequence and can run its pair-only block instead. Measured on this
-    // machine, interleaved over five reps at 59 residues, the specialisation is
-    // 1.12s against 0.59s - it is 1.9x SLOWER than the general path, not faster
-    // - while agreeing with it to 4.9e-5, which is float32 noise.
-    //
-    // So it bought nothing and cost plenty: being a second driver, it drifted
-    // three times. It did not know the multimer regime, it did not receive
-    // chainAware, and options added to one were not added to the other. Each
-    // drift failed silently with a plausible number.
-    // 🔴 AND THE FRAME EVERY PASS IS SUPERPOSED ONTO COMES BACK WITH IT. The
-    // reference is the FIRST pass's landed structure, and a continuation does
-    // not run pass zero - onRecycle receives the absolute index, so its
-    // `index === 0` branch never fires. Without this the fold is right and its
-    // COORDINATES are somewhere else: measured at 0.0007 A RMSD from the fresh
-    // three-recycle structure after superposition, which is float noise, but a
-    // different file for the same prediction.
     if (resume !== undefined) firstPassLanded = af2Cached.firstPassLanded;
-    const prediction = await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
-      .predictA3m(
-        alignmentForDriver, model.weights, model.featureTables,
-        // 🔴 `resumable: true` IS WHAT ASKS FOR THE CONTINUATION STATE, and this
-        // is the only caller that wants it. It is the trunk's MSA and pair
-        // representation copied to the host - 781 MB at 825 residues, 1.26 s of
-        // a 25.7 s fold - and it exists for `af2Cache`, so that raising the
-        // recycle count continues rather than restarts. Every other caller
-        // (the CLI tools, the differential gates, an embedder) folds once and
-        // used to pay for it anyway.
-        { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-        // ...and `pairHost: true` for the distogram contact overlay, which is
-        // the only reader of the host copy of the pair representation.
-        // ...and the template slot, which monomer.js forwards into
-        // QueryOnlyTemplateGpu. `undefined` is a fully masked template, which
-        // is what every fold on this page was before it.
-          resume, resumable: true, pairHost: true, template: af2Template?.slot, ...regime },
-        model.paeBreaks, onRecycle, runProgress);
+    // 🔴 EVERY MODEL'S PASSES IN ONE LIST, RANKED TOGETHER. AlphaFold's own
+    // pipeline folds all five and ranks the outputs, and that is what "All 5"
+    // is: the play bar is the whole sweep, and the structure this page saves is
+    // the best PASS of the best MODEL rather than five separate answers the
+    // reader has to compare by eye. With one model selected the list is one
+    // model's passes and everything below is what it always was.
+    const alignedRecycles = [];
+    let final;
+    // ...the next model's bytes, fetched while this one folds. `openStore`
+    // caches by family and a delta shares its base with model_1, so the four
+    // deltas are 44 MiB each on top of a base that is already here - and the
+    // dial on the right names the model it is fetching, which is how a reader
+    // can tell that the wait is the next download rather than this fold.
+    let ahead = undefined;
+    for (const [modelIndex, foldFamily] of sweep.entries()) {
+      if (modelIndex > 0) {
+        model = await (ahead ?? startModelPreload(foldFamily, signal));
+        throwIfAborted(signal);
+      }
+      ahead = sweep[modelIndex + 1] === undefined
+        ? undefined : startModelPreload(sweep[modelIndex + 1], signal);
 
+      status(`Folding ${sequence.length} residues${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
+        + ` · ${passes} pass${passes === 1 ? "" : "es"} · ${foldFamily}`
+        + (sweep.length === 1 ? "" : ` · model ${modelIndex + 1} of ${sweep.length}`));
+
+      // ...DRAWN AS EACH PASS LANDS, not collected and drawn at the end. The
+      // first builds the object and the panels; the rest are frames on it.
+      //
+      // 🔴 AND `base` IS WHAT MAKES FIVE MODELS ONE SET OF FRAMES. The driver
+      // counts its own passes from zero, so every model after the first would
+      // rebuild the object and overwrite frame 0; offsetting by what is already
+      // on it turns 5 x (recycles + 1) passes into one play bar. It is also what
+      // decides the superposition: only the very first pass of the whole run
+      // becomes `firstPassLanded`, and all the rest are aligned onto it, so the
+      // animation does not jump between models.
+      const base = alignedRecycles.length;
+      // ...captured, because `model` advances to the next one while this model's
+      // contact map is still being attached in a `.then`.
+      const weights = model.weights;
+      const onRecycle = (recycle, index) => {
+        if (signal.aborted) return;
+        // 🔴 A PASS DOES NOT WRITE THE STATUS LINE. It used to put its own
+        // number there - "Pass 2 of 4 · Δ 0.41 Å · pLDDT 63.4" - while the
+        // progress callback writes "Folding · 62%" many times a second between
+        // passes. The two alternate, and a line that swaps between two different
+        // sentences is unreadable: it reads as flicker rather than as progress.
+        // The percentage is the only thing there that moves smoothly, so it is
+        // the only thing there. See the same note in web/af3-model.js.
+        //
+        // 🔴 THE NUMBERS ARE NOT LOST, they are in the place that is meant to
+        // hold them: the scores card, which is a panel rather than a line and
+        // can be read at leisure while it updates once a pass.
+        updateScoresCard(recycle.confidence);
+        if (base + index === 0) {
+          firstPassLanded = alignedToPrevious(sequence, recycle.structure);
+          initialLoadPromise = loadIntoViewer({
+            stem,
+            pdb: predictionToPdb(sequence, firstPassLanded, recycle.confidence.plddt, chainLengths),
+            scores: confidenceJson(sequence, recycle.confidence),
+            a3m: alignment,
+            chainLengths,
+            pae: paeMatrix(recycle.confidence.predictedAlignedError, sequence.length),
+            length: sequence.length,
+            confidence: recycle.confidence,
+            frameName: sweep.length === 1 ? undefined : "model1_recycle_0",
+          });
+          // ...recycle 0's frame is built by loadIntoViewer rather than by
+          // appendPass, so its contact map has to be attached here or the first
+          // pass is the one frame without one - and it is the frame on screen
+          // while every later pass is still running.
+          void initialLoadPromise.then(() => {
+            const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
+            if (frame !== undefined) {
+              attachContactMap(frame, recycle, weights, sequence.length);
+            }
+          });
+        } else {
+          appendPass(sequence, chainLengths, recycle, base + index, firstPassLanded, weights,
+                     sweep.length === 1 ? undefined
+                     : `model${foldFamily.split("-")[1] ?? "1"}_recycle_${index}`);
+        }
+      };
+      // 🔴 THE UNITS ARE COSTS, NOT COUNTS, and that is what makes a clock
+      // possible. src/af2/model/*.js weight every step by what the cost model says it
+      // costs, so `completed / total` is a fraction of the WORK - and the ratio
+      // of elapsed time to work done is this machine's speed, whatever it is.
+      // RuntimeEstimator holds that reasoning; a plan of one stage is enough for
+      // it, since the weighting has already happened upstream.
+      let runEstimator = null;
+      const runProgress = ({ completed, total, waiting }) => {
+        if (signal.aborted) return;
+        if (waiting) {
+          const bar = element("progress");
+          bar.hidden = false;
+          bar.removeAttribute("value");
+          status("Folding…");
+          return;
+        }
+        runEstimator ??= new RuntimeEstimator({ stages: [{ name: "fold", units: total, count: 1 }] });
+        runEstimator.completedUnits(completed);
+        // 🔴 THE BAR IS THE RUN'S, NOT THE MODEL'S. Five models each driving one
+        // bar from 0 to 100 is five bars, and a reader cannot tell the fourth
+        // from the first; the model's own fraction is a fifth of the sweep,
+        // offset by the models already done.
+        const done = (modelIndex + runEstimator.fraction()) / sweep.length;
+        progress(done);
+        // See the note on `say` in web/af3-model.js: the percentage, and nothing
+        // beside it that moves on its own.
+        const percent = Math.min(100, Math.round(100 * done));
+        status(`Folding · ${percent}%`
+          + (sweep.length === 1 ? "" : ` · model ${modelIndex + 1} of ${sweep.length}`));
+      };
+
+      // 🔴 THE MULTIMER REGIME IS FOUR FACTS, and they travel together. Multimer
+      // runs the outer product mean at the top of each block, works in units of
+      // 20 angstroms rather than 10, reads chain identity - asym, entity and
+      // symmetry - where the monomer reads only a residue index, and RUNS ITS
+      // TEMPLATE EMBEDDER WHETHER OR NOT THERE ARE TEMPLATES.
+      //
+      // That last one is not an option in multimer the way it is in the monomer.
+      // `template.enabled` is False for model_1_ptm and True for
+      // model_1_multimer_v3, and multimer's embedding wrapper adds the template
+      // activation to the pair unconditionally - masking every template off does
+      // not zero it, because it reads the pair through a layer norm and adds a
+      // learned constant. Skipping it put the pair 30% out from the first block
+      // and shattered backbones at high copy counts. Measured against
+      // AlphaFold's own forward on the toy oracle, running it takes the trunk
+      // from 6.4e-2 to 1.3e-2 and CA RMSD from 1.96 A to 1.02 A - and on float32
+      // weights, to 7.9e-7 and 0.000 A.
+      const regime = multimer
+        ? { outerProductMeanFirst: true, positionScale: 20,
+          chainAware: true, chainSequences: chains }
+        : {};
+      // ...?graph=unified runs the MONOMER weights through src/af2/multimer/ instead.
+      // With its switches off that graph reproduces the monomer one bit for bit,
+      // which is the check that the superset is right; a difference is a graph
+      // bug rather than a weights bug.
+      // 🔴 ONE PATH, WHETHER OR NOT THERE IS AN ALIGNMENT. A single sequence is an
+      // alignment of depth one, and it is folded as such.
+      //
+      // There used to be a second driver for it, AlphaFoldQueryOnlyGpu, on the
+      // grounds that the extra-MSA stack has nothing to attend over with one
+      // sequence and can run its pair-only block instead. Measured on this
+      // machine, interleaved over five reps at 59 residues, the specialisation is
+      // 1.12s against 0.59s - it is 1.9x SLOWER than the general path, not faster
+      // - while agreeing with it to 4.9e-5, which is float32 noise.
+      //
+      // So it bought nothing and cost plenty: being a second driver, it drifted
+      // three times. It did not know the multimer regime, it did not receive
+      // chainAware, and options added to one were not added to the other. Each
+      // drift failed silently with a plausible number.
+      // 🔴 AND THE FRAME EVERY PASS IS SUPERPOSED ONTO COMES BACK WITH IT. The
+      // reference is the FIRST pass's landed structure, and a continuation does
+      // not run pass zero - onRecycle receives the absolute index, so its
+      // `index === 0` branch never fires. Without this the fold is right and its
+      // COORDINATES are somewhere else: measured at 0.0007 A RMSD from the fresh
+      // three-recycle structure after superposition, which is float noise, but a
+      // different file for the same prediction.
+      const prediction = await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
+        .predictA3m(
+          alignmentForDriver, weights, model.featureTables,
+          // 🔴 `resumable: true` IS WHAT ASKS FOR THE CONTINUATION STATE, and this
+          // is the only caller that wants it. It is the trunk's MSA and pair
+          // representation copied to the host - 781 MB at 825 residues, 1.26 s of
+          // a 25.7 s fold - and it exists for `af2Cache`, so that raising the
+          // recycle count continues rather than restarts. Every other caller
+          // (the CLI tools, the differential gates, an embedder) folds once and
+          // used to pay for it anyway.
+          { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
+          // ...and `pairHost: true` for the distogram contact overlay, which is
+          // the only reader of the host copy of the pair representation.
+          // ...and the template slot, which monomer.js forwards into
+          // QueryOnlyTemplateGpu. `undefined` is a fully masked template, which
+          // is what every fold on this page was before it.
+            resume, resumable: true, pairHost: true, template: af2Template?.slot, ...regime },
+          model.paeBreaks, onRecycle, runProgress);
+
+      // 🔴 THE EARLIER PASSES COME BACK FOR THE ANIMATION. A continuation returns
+      // only the passes it ran, and the play bar is the whole trajectory - so the
+      // cached ones are put back in front of them. `final` is still the last pass
+      // actually computed, which is the one the page lands on.
+      const allRecycles = resume === undefined
+        ? prediction.recycles : [...af2Cached.recycles, ...prediction.recycles];
+      // ...and only a single-model run leaves a continuation behind; see the
+      // note on `af2Cached` above.
+      if (sweep.length === 1) {
+        af2Cache = { key: af2Key, resumable: prediction.resumable, recycles: allRecycles,
+          firstPassLanded, stem };
+      }
+      for (const [i, r] of allRecycles.entries()) {
+        const at = base + i;
+        alignedRecycles.push({
+          structure: at === 0 ? (firstPassLanded ?? r.structure)
+            : alignedToFirstPass(sequence, r.structure, firstPassLanded),
+          confidence: r.confidence,
+          recycleDistance: r.recycleDistance,
+          // 🔴 THE DRIVER'S OWN PASS, KEPT BY REFERENCE. Its contact map is attached
+          // in a setTimeout long after this map runs, so copying the field here
+          // copies `undefined`; holding the object means whatever lands on it later
+          // is visible to anything that reads this afterwards.
+          pass: r,
+          // ...and WHICH MODEL made it, because the best pass of a sweep is one
+          // model's and the file that gets saved has to say whose.
+          family: foldFamily,
+        });
+      }
+      final = prediction.final;
+      // 🔴 AND THIS MODEL'S WEIGHTS GO, OR FIVE OF THEM ARE HELD AT ONCE.
+      // Measured in the page before this line existed: a 68-residue sweep at
+      // one recycle took the JS heap from 9 MiB to 3412, against Chrome's own
+      // ~4 GB ceiling - so the sweep that works on a 68-mer is the one that
+      // kills the TAB on a real protein. The base is kept, because the four
+      // deltas are differences on it; each delta is dropped once its passes are
+      // in hand. A single-model fold keeps its weights exactly as before, which
+      // is what makes switching model and back free.
+      if (sweep.length > 1 && foldFamily !== graphOf(foldFamily)) releaseModel(foldFamily);
+    }
+    // 🔴 A SWEEP CANNOT BE CONTINUED, so it does not leave a key that looks like
+    // one. `af2Cache` still holds whichever single-model fold ran before this,
+    // whose stem names an object this run has replaced.
+    if (sweep.length > 1) af2Cache = undefined;
     progress(null);
-    const final = prediction.final;
-    // 🔴 THE EARLIER PASSES COME BACK FOR THE ANIMATION. A continuation returns
-    // only the passes it ran, and the play bar is the whole trajectory - so the
-    // cached ones are put back in front of them. `final` is still the last pass
-    // actually computed, which is the one the page lands on.
-    const allRecycles = resume === undefined
-      ? prediction.recycles : [...af2Cached.recycles, ...prediction.recycles];
-    af2Cache = { key: af2Key, resumable: prediction.resumable, recycles: allRecycles,
-      firstPassLanded, stem };
-    const alignedRecycles = allRecycles.map((r, i) => ({
-      structure: i === 0 ? (firstPassLanded ?? r.structure) : alignedToFirstPass(sequence, r.structure, firstPassLanded),
-      confidence: r.confidence,
-      recycleDistance: r.recycleDistance,
-      // 🔴 THE DRIVER'S OWN PASS, KEPT BY REFERENCE. Its contact map is attached
-      // in a setTimeout long after this map runs, so copying the field here
-      // copies `undefined`; holding the object means whatever lands on it later
-      // is visible to anything that reads this afterwards.
-      pass: r,
-    }));
+
     const finalLanded = alignedRecycles[alignedRecycles.length - 1].structure;
 
     // 🔴 THE BEST PASS, NOT THE LAST. Recycling is not monotonic - a pass can
@@ -3527,6 +3657,12 @@ async function fold(event) {
     // often converge to the same score to several decimals, and preferring an
     // earlier one on an exact tie would hand back a less converged structure
     // for no gain.
+    //
+    // 🔴 AND UNDER "All 5" THE SAME LINE RANKS ACROSS MODELS, which is the
+    // whole point of running them: the criterion is the one AlphaFold's own
+    // pipeline uses to order five models, applied here to every pass of every
+    // model at once. A tie still keeps the later one, so it prefers a later
+    // model only where nothing separates them.
     // ...and the graph again, because models 2 to 5 of the multimer rank the
     // way model_1 does. See graphFamily.
     const rankOf = (confidence) => (graphOf(family) === "multimer"
@@ -3556,7 +3692,9 @@ async function fold(event) {
       recycles: alignedRecycles,
       bestPass: bestIndex,
       contactSource: best.pass,
-      model: `AlphaFold 2 (${family})`,
+      // ...the model that MADE the saved pass, which under a sweep is whichever
+      // of the five won rather than the one the row resolved to.
+      model: `AlphaFold 2 (${best.family ?? family})`,
       ...foldContext,
     };
     predictions.set(stem, lastPrediction);
@@ -3588,15 +3726,30 @@ async function fold(event) {
     updateScoresCard(best.confidence);
     const took = ((performance.now() - started) / 1000).toFixed(1);
 
-    const converged = allRecycles.length < passes
-      ? ` · converged at ${final.recycleDistance.toFixed(2)} Å after ${allRecycles.length} passes`
+    // 🔴 COUNTED OVER THE WHOLE RUN, because `allRecycles` is one MODEL's and a
+    // sweep has five of them. Reading it here was a ReferenceError waiting for
+    // the first fold that finished.
+    const converged = alignedRecycles.length < passes * sweep.length
+      ? ` · converged at ${final.recycleDistance.toFixed(2)} Å after`
+        + ` ${alignedRecycles.length} pass${alignedRecycles.length === 1 ? "" : "es"}`
       : "";
     const bestIptmText = best.confidence.iptm !== undefined
       ? ` · ipTM ${Number(best.confidence.iptm).toFixed(3)}` : "";
     // ...and said out loud when the two differ, because the play bar is still
     // sitting on the last pass while the download is a different one.
-    const ranked = bestIndex !== alignedRecycles.length - 1
-      ? ` · saved pass ${bestIndex + 1} of ${alignedRecycles.length}` : "";
+    //
+    // 🔴 AND A SWEEP ALWAYS SAYS IT, because "which of the five" is the answer
+    // the reader asked for by pressing it. The pass is numbered within its own
+    // model rather than across the run - pass 14 of 20 is not a number anyone
+    // can act on, and a model that converged early makes the arithmetic wrong
+    // as well as unreadable.
+    const modelNumber = (name) => name?.split("-")[1] ?? "1";
+    const firstOfWinner = alignedRecycles.findIndex((r) => r.family === best.family);
+    const ranked = sweep.length > 1
+      ? ` · best of ${sweep.length} models: model ${modelNumber(best.family)},`
+        + ` pass ${bestIndex - firstOfWinner + 1}`
+      : (bestIndex !== alignedRecycles.length - 1
+        ? ` · saved pass ${bestIndex + 1} of ${alignedRecycles.length}` : "");
     // 🔴 AND SAY SO WHEN THE FOLD IS NOT A CHAIN, WHICH THIS PAGE NEVER DID.
     // Every command-line fold in this repository gates on `chainGeometryVerdict`
     // and the one path a visitor takes did not - the same shape as

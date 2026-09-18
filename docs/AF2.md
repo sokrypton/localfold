@@ -2965,3 +2965,79 @@ monomer graph unless the flag was also typed. The graph comes from the bundle's
 own `delta.baseFamily` now, and `--family=multimer-4` opens the published delta
 through the registry - so the ten AF2 bundles are gate-able by the name a
 visitor picks, not only by a local path.
+
+### "All 5": the five models as one prediction, ranked together
+
+Asked for directly - *"can we add an 'all' button that would run through all 5
+models (maybe download as the previous model is running)"*, then *"when all is
+selected, lets include all as part of the same set of frames (so 5xrecycles),
+and pick best model across all"*.
+
+That is what AlphaFold's own pipeline does: fold every model and RANK the
+outputs. The page now offers `All 5` beside the Model # row for both AF2
+families, and one press produces ONE prediction rather than five:
+
+- every pass of every model lands on one viewer object - `5 x (recycles + 1)`
+  frames on the play bar, named `model3_recycle_1` - superposed onto the very
+  first pass of model 1, so scrubbing does not jump between models;
+- the best-pass search runs over the whole list, so it chooses across MODELS as
+  well as across passes, on the criterion it already used (the multimer score
+  for a complex, mean pLDDT otherwise);
+- the saved structure, the archive and the status line name the model that
+  actually produced the pass: `· best of 5 models: model 3, pass 2`.
+
+Measured in the page, 68 residues, single sequence, one recycle, weights from
+the pinned remote:
+
+| | wall | frames | heap after a forced GC |
+|---|---:|---:|---:|
+| model 1 alone | 1.2 s | 2 | 101 MiB |
+| All 5 | 13.5 s | 10 | **304 MiB** |
+| All 5, holding every model's weights | 13.7 s | 10 | **3409 MiB** |
+
+🔴 **AND THAT LAST ROW IS WHY A SWEEP RELEASES AS IT GOES.** Both weight caches
+in web/model.js are permanent by design - switch model and switch back and
+nothing is re-downloaded - which is right when one model is loaded at a time and
+is 3.4 GB when five are, against Chrome's own ~4 GB ceiling. A 68-residue fold
+would have worked and a real protein would have run out of TAB rather than out
+of GPU. `releaseModel` drops each DELTA once its passes are in hand and keeps
+the BASE, which every delta is a difference on; the two arms above fold
+identically and take the same time, so it costs nothing but a re-download if the
+same model is asked for again.
+
+🔴 **AND `usedJSHeapSize` READ WITHOUT A COLLECTION IS NOT A LIVE SET.** The
+first reading of the released arm was 3412 MiB - indistinguishable from holding
+everything - because five folds leave a great deal of garbage and the number
+counts it. `HeapProfiler.collectGarbage` through CDP, three times, is what makes
+the two arms 304 against 3409. A memory number taken straight after the work
+that made it says nothing.
+
+**The next model downloads while the current one folds.** `startModelPreload`
+for model N+1 is started before model N's `predictA3m` is awaited and the
+promise is taken at the top of the next iteration, so five models cost 13.5 s
+where the downloads alone are ~245 MiB. The dial on the right names the model it
+is fetching ("AlphaFold 2 (model 5) · 43 / 43 MiB"), which is how a reader can
+tell the wait is the next download rather than this fold.
+
+Four things had to be right and each is a trap this file records elsewhere:
+
+- **the template refusal is over the SWEEP, not over the resolved family.**
+  `chosenFamily` answers `monomer` for "all" - everything asked before a fold
+  has to name a real bundle - so asking `MODEL_BUNDLES[choice].noTemplateEmbedder`
+  passed and the run would have died at the third model with two already drawn.
+- **`base` offsets the driver's pass index.** The driver counts its own passes
+  from zero, so without it every model after the first rebuilds the object and
+  overwrites frame 0.
+- **a sweep is never a continuation.** `af2Cache` holds one model's trunk under
+  a key naming that model; it is neither read nor written by a sweep, and is
+  cleared afterwards.
+- **`converged` counted `allRecycles`**, which is one model's list and now lives
+  inside the loop - a `ReferenceError` on the first fold that finished.
+
+`tools/fold-in-page.py --af2-model` takes `all` now, and its choices are READ
+FROM THE PAGE rather than typed: the list was `["1".."5"]`, so the one tool that
+drives the control a reader touches could not reach the control's newest value.
+The same derivation means a number `build_site.py` trims - a delta bundle with
+no `remote` - leaves both the tool and `af2Sweep` alone, because the sweep reads
+the `<option>` list too.
+
