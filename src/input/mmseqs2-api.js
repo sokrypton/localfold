@@ -1,5 +1,5 @@
 import { parseA3m } from "./a3m.js";
-import { AF3_FAMILIES, MODEL_BUNDLES } from "../bundles/manifests/index.js";
+import { AF3_FAMILIES, MODEL_BUNDLES, graphFamily } from "../bundles/manifests/index.js";
 import { concatenateA3mBlocks, mergeChainA3ms, deduplicateUnpairedAgainstPaired, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "./chains.js";
 
@@ -523,7 +523,10 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   // The AF2 MONOMER never gets paired rows whatever the input: it has no chain
   // input at all, so a row spanning two chains would claim their residues
   // coevolved. See CHAIN_MERGES.
-  const wantsPairing = model !== "monomer" && unique.length > 1;
+  //
+  // ...and that is its GRAPH's property, so a delta family resolves first:
+  // `monomer-3` is model_3's weights on model_1's graph. See graphFamily.
+  const wantsPairing = graphFamily(model) !== "monomer" && unique.length > 1;
   let pairedResult;
   if (wantsPairing) {
     pairedResult = await generateMmseqs2PairedMsa(unique, {
@@ -610,12 +613,16 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
  * chains and the model, the decision is testable on its own.
  *
  * @param {{cache: {key: string, raw: object}|undefined, chains: string[],
- *          family: "monomer"|"multimer"|"af3"}} input
+ *          family: import("../bundles/manifests/index.js").ModelFamily}} input
  * @returns {{reuse: "single"|"merge"|false, key: string, needsPairing: boolean}}
  */
 export function planSearchReuse({ cache, chains, family }) {
   const key = JSON.stringify(chains);
-  const needsPairing = family !== "monomer" && new Set(chains).size > 1;
+  // 🔴 THE GRAPH DECIDES, NOT THE NAME. `monomer-3` is a delta on model_1 and
+  // reads an alignment exactly as it does, so it needs no paired block; asking
+  // its name would have re-run the search for one it then must not use. See
+  // graphFamily.
+  const needsPairing = graphFamily(family) !== "monomer" && new Set(chains).size > 1;
   const usable = cache?.key === key
     && (!needsPairing || cache.raw?.pairedA3ms !== undefined);
   if (!usable) return { reuse: false, key, needsPairing };
@@ -653,7 +660,7 @@ export function mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model })
     // The AF2 monomer never takes paired rows, whatever was searched: it has no
     // chain input, so a row spanning two chains would claim their residues
     // coevolved. See CHAIN_MERGES.
-    && model !== "monomer";
+    && graphFamily(model) !== "monomer";
   const paired = !hasPairing ? undefined
     : mergeRowAlignedChainA3ms(sequences.map((sequence) => pairedA3ms.get(sequence)));
 

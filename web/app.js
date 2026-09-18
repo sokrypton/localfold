@@ -49,7 +49,7 @@ import { smilesComponent } from "../src/chem/component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel } from "./model.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
-  SINGLE_SEQUENCE_FAMILIES }
+  SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../src/bundles/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
@@ -399,7 +399,7 @@ const chosenFamily = () => {
   return chosen;
 };
 /** The graph a family runs, which for a delta is the graph of its base. */
-const graphOf = (family) => MODEL_BUNDLES[family]?.delta?.base ?? family;
+const graphOf = graphFamily;
 const isAf3Family = (family) => AF3_FAMILIES.includes(family);
 /**
  * 🔴 "CAN THIS MODEL SEE AN ATOM" IS NOT "IS THIS AN AlphaFold 3 GRAPH", AND
@@ -480,6 +480,15 @@ const MODEL_LABELS = {
   // ...the same folding model against the smaller tower, and its own
   // checkpoint. The label names the tower because that is what differs.
   "ef2-fast-300m": "EF2-fast (300M)",
+  // 🔴 AND THE FIVE AF2 MODELS SAY WHICH ONE IS LOADING, DERIVED RATHER THAN
+  // TYPED. A delta downloads its BASE as well as itself, so the dial reading
+  // "AlphaFold 2 · 73 / 116 MiB" under model 2 is the only place a reader is
+  // told the two halves are one model - and eight typed rows is eight chances
+  // to label model_4's weights model_3. Both AF2 families are "AlphaFold 2";
+  // the number is what the row does not already say.
+  ...Object.fromEntries(Object.entries(MODEL_BUNDLES)
+    .filter(([, bundle]) => ["monomer", "multimer"].includes(bundle.delta?.base))
+    .map(([family]) => [family, `AlphaFold 2 (model ${family.split("-")[1]})`])),
 };
 
 const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
@@ -3234,7 +3243,11 @@ async function fold(event) {
     // is rewound TO depends on it. These four were declared further down, next
     // to the model call that reads them; the key needs them here.
     const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
-    const multimer = family === "multimer";
+    // 🔴 THE GRAPH, NOT THE FAMILY. `multimer-2` is a delta on model_1 and runs
+    // model_1's graph; asking whether its NAME is "multimer" sent it through
+    // the monomer driver, which has no multimer template embedder and died in
+    // QueryOnlyTemplateGpu with no weights. See graphFamily.
+    const multimer = graphOf(family) === "multimer";
     const unified = multimer || new URLSearchParams(location.search).get("graph") === "unified";
     const alignmentForDriver = alignment === null ? `>query\n${sequence}\n` : alignmentForModel;
 
@@ -3514,7 +3527,9 @@ async function fold(event) {
     // often converge to the same score to several decimals, and preferring an
     // earlier one on an exact tie would hand back a less converged structure
     // for no gain.
-    const rankOf = (confidence) => (family === "multimer"
+    // ...and the graph again, because models 2 to 5 of the multimer rank the
+    // way model_1 does. See graphFamily.
+    const rankOf = (confidence) => (graphOf(family) === "multimer"
       ? (confidence?.multimerScore ?? confidence?.iptm ?? Number.NEGATIVE_INFINITY)
       : (confidence?.meanPlddt ?? Number.NEGATIVE_INFINITY));
     let bestIndex = alignedRecycles.length - 1;

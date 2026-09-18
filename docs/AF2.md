@@ -2905,3 +2905,63 @@ and the PAE bin edges: those are residue_constants, identical in every model, so
 the delta carries none and the BASE's copies stand. Listed as absent, the reader
 would have refused a tensor it should have passed straight through - a fold that
 dies in a gather, on a bundle that looks complete.
+
+### 🔴 A DELTA FAMILY IS ITS BASE'S GRAPH, AND FOUR PLACES ASKED ITS NAME
+
+Reported from the page: **"Cannot read properties of undefined (reading
+'embeddingBias') for af2-multi"**, model 2, where model 1 folded fine - after
+downloading 116 MiB.
+
+`web/app.js` decided which driver folds with
+
+```js
+const multimer = family === "multimer";
+```
+
+and `chosenFamily` had already resolved the model row plus the number into
+`multimer-2`, so the test was false and a MULTIMER bundle folded through
+`AlphaFoldMonomerGpu`. That driver's template stage is the query-only residual,
+which `web/model.js` deliberately does not load for a multimer graph
+(`templateWeights = multimer ? undefined : ...`), so `QueryOnlyTemplateGpu`
+was handed `undefined` and died reading `embeddingBias` off it. The message
+names a weight, the fault is a driver, and nothing in between says so.
+
+**It was four sites, and the other three are quieter:**
+
+| where | what it decided | what `monomer-3` or `multimer-2` got |
+|---|---|---|
+| `web/app.js` fold path | which driver | the monomer graph on multimer weights - the crash |
+| `web/app.js` `rankOf` | best pass | a complex ranked by mean pLDDT, not the multimer score |
+| `mmseqs2-api.js` `planSearchReuse` | must the search be paired | `monomer-3` re-running the one request this page makes off the machine |
+| `mmseqs2-api.js` `mergeSearchedChains`/`generateMmseqs2ComplexMsa` | paired rows | **the AF2 monomer handed paired rows** - a silently worse fold |
+
+The last one is the one that would never have been reported: the monomer has no
+chain input, so a paired row claims two chains' residues coevolved. `CHAIN_MERGES`
+had already been derived from the registry for exactly this reason - the comment
+above it says "writing four more rows here would be four chances to give one of
+them the multimer's merge" - and the three tests BESIDE that table still read the
+name.
+
+**The rule, and where it lives.** `graphFamily` in
+`src/bundles/manifests/index.js` resolves a delta to its base. Everything decided
+by the GRAPH goes through it - the driver, the pairing, the ranking; everything
+decided by the WEIGHTS keeps the resolved name - the shard cache key, the
+download stem, the label. `web/model.js`'s `?model=` override is the one test
+that is legitimately on the name and not the graph (it names a path to load
+INSTEAD of a bundle, and pointing it at `monomer-3` would fetch model_1's export
+and call it model_3), so it compares against `DEFAULT_FAMILY` and says so.
+
+Three gates, each watched failing on the shipped code:
+`test/graph-family-resolution.test.js` is structural - no `family === "monomer"`
+in `src/` or `web/`, over the code with the comments stripped, and it asserts it
+can still find one in a string so that stripping cannot quietly empty it - and
+`test/mmseqs2-api.test.js` gained the behaviour half, written over every delta in
+the registry rather than the eight that exist today.
+
+🔴 **AND `tools/gpu/fold-af2.js` HAD THE SAME HOLE FROM THE OTHER END.** Its
+`--bundle=/model-multi-2-delta` reads the manifest beside the shards and its
+`--family` defaults to `monomer`, so the arm that gates a multimer delta ran the
+monomer graph unless the flag was also typed. The graph comes from the bundle's
+own `delta.baseFamily` now, and `--family=multimer-4` opens the published delta
+through the registry - so the ten AF2 bundles are gate-able by the name a
+visitor picks, not only by a local path.

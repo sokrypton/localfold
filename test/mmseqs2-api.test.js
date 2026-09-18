@@ -5,7 +5,7 @@ import {
   searchCacheEntry,
 } from "../src/input/mmseqs2-api.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { AF3_FAMILIES, FOLDING_FAMILIES, SINGLE_SEQUENCE_FAMILIES }
+import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES, SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../src/bundles/manifests/index.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "../src/input/chains.js";
@@ -350,6 +350,29 @@ describe("re-merging a search for another model", () => {
     for (const family of AF3_FAMILIES) expect(rows(family)).toEqual(af3);
   });
 
+  // 🔴 AND A DELTA FAMILY MERGES THE WAY ITS BASE DOES, WHICH IS A RULE ABOUT
+  // THE GRAPH AND NOT ABOUT THE NAME. `monomer-3` is model_3's weights on
+  // model_1's graph, so it reads an alignment exactly as `monomer` does and
+  // must never see a paired row; `multimer-4` must always see one. Written
+  // against every delta in the registry rather than the four that exist today.
+  it("merges every delta family the way its base does", () => {
+    const rows = (model) => parseA3m(mergeSearchedChains(
+      { sequences, chainA3ms, pairedA3ms, model }).a3m).sequences;
+    for (const [family, bundle] of Object.entries(MODEL_BUNDLES)) {
+      if (bundle.delta === undefined) continue;
+      expect(`${family}: ${rows(family)}`).toBe(`${family}: ${rows(graphFamily(family))}`);
+    }
+  });
+
+  it("drops the paired block for every monomer-graph family", () => {
+    for (const [family, bundle] of Object.entries(MODEL_BUNDLES)) {
+      if (graphFamily(family) !== "monomer" || bundle.delta === undefined) continue;
+      const { blocks } = mergeSearchedChains(
+        { sequences, chainA3ms, pairedA3ms, model: family });
+      expect(`${family}: ${blocks.paired}`).toBe(`${family}: null`);
+    }
+  });
+
   it("drops the paired block for the monomer even when one was searched", () => {
     // The AF2 monomer has no chain input, so a row spanning two chains would
     // claim their residues coevolved - see CHAIN_MERGES. A cache filled by an
@@ -410,6 +433,20 @@ describe("reusing a search across folds", () => {
     const cache = complexCache(chains, { paired: false });
     expect(planSearchReuse({ cache, chains, family: "af3" }).needsPairing).toBe(false);
     expect(planSearchReuse({ cache, chains, family: "af3" }).reuse).toBe("merge");
+  });
+
+  // 🔴 THE GRAPH DECIDES WHETHER A SEARCH MUST BE PAIRED. `monomer-3` asking
+  // for a paired block would re-run the one request this page makes off the
+  // machine, for rows its own merge then throws away.
+  it("asks for pairing by the graph a delta family runs, not by its name", () => {
+    const chains = ["AAAA", "CCCC"];
+    const cache = complexCache(chains, { paired: false });
+    for (const [family, bundle] of Object.entries(MODEL_BUNDLES)) {
+      if (bundle.delta === undefined) continue;
+      const monomer = graphFamily(family) === "monomer";
+      expect(`${family}: ${planSearchReuse({ cache, chains, family }).needsPairing}`)
+        .toBe(`${family}: ${!monomer}`);
+    }
   });
 
   it("keeps a one-chain result whole and a complex in parts", () => {

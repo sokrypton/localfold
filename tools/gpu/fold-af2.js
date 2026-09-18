@@ -54,6 +54,7 @@ import { chainResidues, identityMap, templateSlotAtom37 }
   from "../../src/af3/featurise/template-input.js";
 import { superpose } from "./superpose.js";
 import { DeltaTensorStore } from "../../src/bundles/delta-tensor-store.js";
+import { MODEL_BUNDLES, graphFamily } from "../../src/bundles/manifests/index.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -160,9 +161,15 @@ export async function main(device, args) {
   }
   const sequence = option(args, "sequence",
     targetStructure?.sequence ?? DEFAULT_SEQUENCE);
+  // 🔴 ANY AF2 FAMILY, INCLUDING THE EIGHT DELTAS. `--family=multimer-4` opens
+  // model_4's difference and the base it is added to, the way the page does,
+  // so the published bundles are gate-able by the name a visitor picks rather
+  // than only by a local `--bundle=` path.
   const family = option(args, "family", "monomer");
-  if (family !== "monomer" && family !== "multimer") {
-    throw new RangeError(`unknown family ${family}: expected "monomer" or "multimer"`);
+  if (graphFamily(family) !== "monomer" && graphFamily(family) !== "multimer") {
+    throw new RangeError(`unknown family ${family}: expected an AlphaFold 2 family,`
+      + ` one of ${Object.keys(MODEL_BUNDLES)
+        .filter((name) => ["monomer", "multimer"].includes(graphFamily(name))).join(", ")}`);
   }
   const chainLengths = option(args, "chains", "").split(",").filter(Boolean).map(Number);
   const rows = Number(option(args, "rows", "128"));
@@ -201,7 +208,7 @@ export async function main(device, args) {
   // ...the LOCAL bundle, by directory rather than through web/model.js's
   // loadModel: that resolves the monomer family to its remote base, and this
   // machine should not pull 227 MB to run a regression.
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
+  const { loadManifest } = await import("../../src/bundles/manifests/index.js");
   // 🔴 `--bundle=<directory>` READS THE manifest.json BESIDE THE SHARDS, which
   // is the ONLY way to fold a bundle the registry does not name - and AlphaFold
   // 2 ships five models where this repository has published one. It is the
@@ -255,7 +262,14 @@ export async function main(device, args) {
   const loadStart = performance.now();
   // ...the same split web/model.js makes: multimer's embedder runs its template
   // track every recycle, the monomer's is the query-only residual.
-  const multimer = family === "multimer";
+  //
+  // 🔴 AND THE GRAPH COMES FROM THE BUNDLE, NOT FROM `--family`. A delta names
+  // its base in its own header, so `--bundle=/model-multi-2-delta` folds
+  // through the multimer whether or not `--family=multimer` was also typed -
+  // and typing neither used to run MULTIMER WEIGHTS ON THE MONOMER GRAPH,
+  // which is how the page's own bug reached a visitor. See graphFamily.
+  const graph = store.manifest.delta?.baseFamily ?? family;
+  const multimer = graph === "multimer";
   const [embedding, template, templateEmbedding, extraStack, mainStack, structure, confidence,
          geometry, featureTables, paeBreaks] = await Promise.all([
     fixture.embeddingWeights(),
@@ -521,7 +535,8 @@ export async function main(device, args) {
   const round = (value, places = 4) => Number(value.toFixed(places));
   return {
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${length})` : sequence,
-    family, chains, length, rows, extraRows, recycles, seed,
+    family: graph === family ? family : `${family} (${graph} graph)`,
+    chains, length, rows, extraRows, recycles, seed,
     weightLoadMs: loadMs, elapsedMilliseconds: elapsed, repeats,
     // Where "features" in the phase table actually goes; see featureStats.
     featureMilliseconds: Object.fromEntries(Object.entries(featureStats)

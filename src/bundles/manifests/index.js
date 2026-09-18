@@ -484,6 +484,28 @@ export function bundleBaseUrl(family) {
 }
 
 /**
+ * The GRAPH a family runs, which for a delta bundle is its base's.
+ *
+ * 🔴 EVERY `family === "multimer"` IS A BUG ONCE A DELTA SHIPS, and this
+ * function exists because four of them were. AlphaFold 2's models 2 to 5 are a
+ * difference on model_1 and run model_1's graph, so `multimer-2` IS a multimer
+ * everywhere the graph decides something - which driver folds it, whether its
+ * alignment is paired, how its passes are ranked - and is its own family
+ * everywhere the WEIGHTS decide one (the cache key, the download stem, the
+ * label). Asking the resolved name whether it is "multimer" answers the second
+ * question with the first one's test: `multimer-2` folded through the MONOMER
+ * driver, which reached `QueryOnlyTemplateGpu` with no weights at all and died
+ * on "Cannot read properties of undefined (reading 'embeddingBias')" - after
+ * downloading 116 MiB.
+ *
+ * @param {ModelFamily} family
+ * @returns {ModelFamily} the family whose graph runs
+ */
+export function graphFamily(family) {
+  return MODEL_BUNDLES[family]?.delta?.base ?? family;
+}
+
+/**
  * The tensor table for one family.
  * @param {ModelFamily} family
  */

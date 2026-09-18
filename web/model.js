@@ -19,13 +19,16 @@ import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
 import { tensorByteLength } from "../src/weights/dtype.js";
 import { ScriptTensorStore } from "../src/bundles/script-tensor-store.js";
-import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
+import { MODEL_BUNDLES, bundleBaseUrl, graphFamily, loadManifest }
+  from "../src/bundles/manifests/index.js";
 import { DeltaTensorStore } from "../src/bundles/delta-tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { devUseDevice } from "./dev-log.js";
 import { withAbort } from "../src/runtime/abort.js";
 
 const stores = new Map();
+/** What `openStore` loads when no family is named, and the only one `?model=` overrides. */
+const DEFAULT_FAMILY = "monomer";
 
 /**
  * The tensor store for one model family, on whatever this origin can use.
@@ -59,10 +62,14 @@ const stores = new Map();
  *
  * @param {import("../src/bundles/manifests/index.js").ModelFamily} family
  */
-export function openStore(onProgress, family = "monomer") {
+export function openStore(onProgress, family = DEFAULT_FAMILY) {
   const bundle = MODEL_BUNDLES[family];
   if (bundle === undefined) throw new RangeError(`unknown model family ${family}`);
-  const asked = family === "monomer"
+  // 🔴 THE DEFAULT FAMILY, NOT THE MONOMER GRAPH. `?model=` names a path to
+  // load INSTEAD of a bundle, so it belongs to the one family that is asked
+  // for when nobody asked - pointing it at `monomer-3` would fetch model_1's
+  // export and call it model_3. Every other family, delta or not, ignores it.
+  const asked = family === DEFAULT_FAMILY
     ? new URLSearchParams(location.search).get("model") : null;
   const override = asked !== null && (asked.includes("/") || asked.endsWith(".json"))
     ? asked : null;
@@ -214,7 +221,7 @@ export function loadModel(variant, onProgress, signal = undefined, family = "mon
   // to and not on its name: "monomer-3" runs the monomer's code with model_3's
   // weights. Everything below reads the store, and DeltaTensorStore has already
   // made that store look like a whole model.
-  const graph = MODEL_BUNDLES[family]?.delta?.base ?? family;
+  const graph = graphFamily(family);
   if (graph !== "monomer" && graph !== "multimer") {
     throw new RangeError(`unknown model family ${family}: expected "monomer" or "multimer"`);
   }
