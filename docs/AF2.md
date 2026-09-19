@@ -3287,3 +3287,52 @@ at all: `pack2x16float` / `unpack2x16float` are core WGSL, so only f16
 ARITHMETIC needs the extension. The projected tensors are half the bytes for
 every visitor; the precision word in the key is the arithmetic, and it is f32.
 
+### What a COLD visit is made of, and the two levers that are now closed
+
+`fold-in-page.py --model monomer --throttle=8 --recycles=1`, which shapes the
+whole page to the 8 MB/s this machine measures against Hugging Face:
+
+| | |
+|---|---:|
+| whole visit | **13.0 s** |
+| ...of which the fold itself | 1.2 s |
+| ...the bundle at 8 MB/s (73 MiB) | ~9.1 s |
+| ...page, device, compile, decode | ~2.7 s |
+
+So seven tenths of a first AF2 visit is bytes, and the fold is a tenth. That
+makes the bundle the lever, and **both ways of shrinking it are now measured
+shut**:
+
+🔴 **int4 IS NOT SMALLER THAN int5 AT THE GROUP SIZE IT NEEDS.** A scheme costs
+its codes PLUS its metadata: `tools/quantize_af3.py`'s own table has int4 g32
+asym at **5.00 bits a weight**, exactly int5's, and docs/DEVELOPING.md prices
+int4 block 32 at **-10.6 pLDDT** on this model. Same bytes, worse fold. The
+int4-to-int5 gap does not close with GPTQ either (docs/EF2FAST.md).
+
+🔴 **AND THE SHARDS DO NOT COMPRESS.** Quantised codes are near-uniform:
+`model/weights-00.int5.bin` is 9,558,184 bytes raw, **9,229,100 under gzip -6
+(3.4%)** and 9,211,500 under zstd -3 (3.6%). Serving them pre-compressed and
+inflating through `DecompressionStream` would buy a third of a second on a 73
+MiB bundle and cost a decode pass over every shard. Not worth writing.
+
+**What is left is the 2.7 s, and 529 ms of it is a compile queue that could run
+during the download.** `probe-af2-warmup.js`: a first fold is 697 ms against a
+repeat's 168, `pipelineSpanMs` **676** over 73 pipelines with 25 ever in flight
+- so the warm is real and it is already batched. What it is not is EARLY. The
+AF3 path resolves a gate the moment its store is OPEN - the manifest is compiled
+into the page, so every shape is known before a byte arrives - and
+`warmAf3Pipelines` compiles against it while the shards stream
+(`web/af3-model.js:278`, `storeGate(family).resolve(store)`). AF2 warms inside
+the driver at recycle 0, which is after the last shard.
+
+🔴 **AND THE OBSTACLE IS THAT AF2's WARM READS WEIGHTS, NOT SHAPES.**
+`encodeEvoformerBlock` in warm mode derives `cOuter` from
+`weights.mainStack[0].outerProductMean.leftBias.length` and `triangleHidden`
+from `linearAPBias.length` - and a bound weight field is a THUNK, so reading
+`.length` DECODES it, which is this file's own 7x trap one convention later. It
+also performs the resident weight upload, which needs the values. A pre-download
+AF2 warm therefore needs a shapes-only stand-in built from `store.shape(...)`
+plus a residency skip, which is the shape of the change and why it was not made
+blind at the end of a session. The prize is 529 ms of 13.0 s (4%) on this
+machine, and more where compiling is slower than an A100's driver.
+
