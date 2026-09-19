@@ -1,6 +1,8 @@
 import { describe, expect, it } from "./harness.js";
 import { confidenceJson, matrixForViewer, modifiedPositions, predictionToPdb, recyclesToPdb,
   safeJobName, viewerTokens } from "../web/prediction-results.js";
+import { featuriseProtein } from "../src/af3/featurise/featurise.js";
+import { toPdb } from "../src/af3/fold.js";
 
 describe("browser prediction result formatting", () => {
   it("writes only present atom37 coordinates and pLDDT B-factors", () => {
@@ -227,5 +229,70 @@ describe("a token matrix in the viewer's index space", () => {
     const keep = viewerTokens(batch);
     // the phosphoserine is the third residue, so position 2
     expect(modifiedPositions(batch, keep)).toEqual([2]);
+  });
+});
+
+describe("a real batch, featurised, against what the viewer will draw", () => {
+  // A five-atom stand-in for a phosphoserine: a backbone, a side-chain atom
+  // and a leaving OXT, which is what makes the atom count depend on where in
+  // the chain it sits. The featuriser is the authority on the span; this test
+  // exists because every assertion above rests on the SHAPE of one.
+  const MODIFICATION = {
+    code: "SEP",
+    atoms: [
+      { name: "N", element: 7, charge: 0, x: 0, y: 0, z: 0 },
+      { name: "CA", element: 6, charge: 0, x: 1.5, y: 0, z: 0 },
+      { name: "C", element: 6, charge: 0, x: 2.4, y: 0, z: 0 },
+      { name: "O", element: 8, charge: 0, x: 3.0, y: 0, z: 0 },
+      { name: "OG", element: 8, charge: 0, x: 1.5, y: 1.4, z: 0 },
+      { name: "OXT", element: 8, charge: 0, x: 3.6, y: 0, z: 0, leaving: true },
+    ],
+    bonds: [{ from: 0, to: 1, order: 1 }, { from: 1, to: 2, order: 1 },
+            { from: 2, to: 3, order: 2 }, { from: 1, to: 4, order: 1 }],
+  };
+  const SEQUENCE = "GWSTELEKHR";        // ten residues, the modification at 3
+
+  const batchWith = (extra = {}) => featuriseProtein(SEQUENCE, {
+    modifications: [{ chain: 0, position: 3, ...MODIFICATION }], ...extra });
+
+  it("collapses exactly what the atomisation added", () => {
+    const batch = batchWith();
+    // five atoms mid-chain (the OXT leaves), so nine residues plus five tokens
+    expect(batch.tokens).toBe(SEQUENCE.length + 4);
+    expect(viewerTokens(batch).length).toBe(SEQUENCE.length);
+  });
+
+  it("keeps the alpha carbon, which is the atom the writer gives a backbone to", () => {
+    const batch = batchWith();
+    const span = batch.modifiedSpans[0];
+    const kept = viewerTokens(batch).filter(
+      (token) => token >= span.from && token < span.from + span.count);
+    expect(kept.length).toBe(1);
+    expect(span.atoms[kept[0] - span.from].name).toBe("CA");
+  });
+
+  it("writes the whole modification under ONE residue number, which is why it collapses", () => {
+    const batch = batchWith();
+    const positions = new Float32Array(batch.tokens * batch.dense * 3);
+    const pdb = toPdb(batch, positions, undefined);
+    const lines = pdb.split("\n").filter((line) => line.includes(" SEP "));
+    expect(lines.length).toBe(batch.modifiedSpans[0].count);
+    const numbers = new Set(lines.map((line) => line.slice(22, 26)));
+    expect(numbers.size).toBe(1);
+  });
+
+  it("leaves a ligand's atoms as positions of their own", () => {
+    const ligand = { code: "TST", atoms: [
+      { name: "C1", element: 6, charge: 0, x: 0, y: 0, z: 0 },
+      { name: "O1", element: 8, charge: 0, x: 1.4, y: 0, z: 0 }],
+      bonds: [{ from: 0, to: 1, order: 1 }] };
+    const batch = batchWith({ ligands: [ligand] });
+    // nine ordinary residues + five modification tokens + two ligand atoms
+    expect(viewerTokens(batch).length).toBe(SEQUENCE.length + ligand.atoms.length);
+  });
+
+  it("names the modified residue at the position the viewer gives it", () => {
+    const batch = batchWith();
+    expect(modifiedPositions(batch, viewerTokens(batch))).toEqual([2]);
   });
 });
