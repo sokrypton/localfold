@@ -149,6 +149,37 @@ export class QueryOnlyTemplateGpu {
   device;
   constructor(device) { this.device = device; }
 
+  /**
+   * This stage's four pipelines, asked for without running anything.
+   *
+   * 🔴 IT EXISTS TO HAVE BEEN MEASURED, AND THE ANSWER WAS 14.3 ms. `fold-af2`'s
+   * `phases` puts the template stage at **180 ms of a 1042 ms fold at 150
+   * residues and 210 of 3374 at 400** - nearly FLAT in a length its kernels are
+   * quadratic in - which reads exactly like four compiles running alone before
+   * the warm batches the other 73. `probe-template-warm.js` times them:
+   * **14.3 ms cold, 0.2 warm**. The other 165 is not this.
+   *
+   * 🔴 IT IS THE FIRST STAGE, AND A CALLER'S CLOCK CHARGES THE GAP TO THE
+   * EARLIER ONE. CLAUDE.md states that rule for the AF3 head's stage timers and
+   * it applies here unchanged: the template stage runs first, so it absorbs the
+   * process's one-time GPU costs - first allocations, first writeBuffer, first
+   * submit. The proof is already in probe-af2-warmup, where a whole REPEAT fold
+   * is 168 ms, which a stage costing 180 every time could not fit inside.
+   *
+   * Warming it during the download was built and measured on the page: 1.3 s
+   * both ways. Kept as a static because the 14.3 ms is worth knowing and
+   * because the keys belong beside the `run` that uses them; not wired, because
+   * a page change that measures as no change is not an optimisation.
+   */
+  static async warm(execution) {
+    await Promise.all([
+      execution.pipelines.get("template:init", INIT_SHADER),
+      execution.pipelines.get("template:normalize", ATTENTION_NORMALIZE_SHADER),
+      execution.pipelines.get("template:value", VALUE_SHADER),
+      execution.pipelines.get("template:output", OUTPUT_SHADER),
+    ]);
+  }
+
   async run(input) {
     const execution = new WebGpuExecution(this.device);
     try {

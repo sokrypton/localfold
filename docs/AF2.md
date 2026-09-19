@@ -3433,3 +3433,47 @@ in**, and a bench that exists to choose tiles can still name the wrong one.
 The knob stays, default off, with both tables beside it, so that the next person
 to bench this kernel standalone does not rediscover 8x8 and ship it.
 
+### Where a whole FOLD's time goes - and the stage timer that misattributes it
+
+All of the above is one evoformer block. A fold also runs an embedder, a
+template stage, a structure module and two confidence heads, and nobody had
+measured their shares. `fold-af2.js --target=5caj --recycles=1`, 261 residues,
+128 rows, stock flags, reading its own `phases`:
+
+| stage | share |
+|---|---:|
+| **mainStack** | **73.8%** |
+| template | 6.0% |
+| structure | 5.7% |
+| extraStack | 5.0% |
+| warm | 2.5% |
+| confidence | 2.5% |
+| features | 1.9% |
+| embedder | 1.6% |
+
+So the block IS the fold, and a day spent on the block was spent in the right
+place. The structure module and both confidence heads together are 8%.
+
+🔴 **AND THE ONE SURPRISE IN THAT TABLE IS AN ARTEFACT, WHICH IS WORTH MORE THAN
+THE TABLE.** The template stage is 6% of a fold that has NO template - and 180
+ms of a 1042 ms fold at 150 residues (17.5%) against 210 ms of 3374 at 400,
+nearly FLAT in a length its kernels are all quadratic in. That reads exactly
+like a compile queue: the stage runs before the warm that batches the other 73
+pipelines, and it asks for four of its own.
+
+It is not. `tools/gpu/probe-template-warm.js` times those four:
+**14.3 ms cold, 0.2 ms warm.** The other 165 ms is the process's one-time GPU
+cost - first allocations, first `writeBuffer`, first submit - landing on
+whichever stage runs first, which is this one. CLAUDE.md states that rule for
+the AF3 head's stage timers ("a caller's clock attributes the gap between two
+stages to the EARLIER one") and it applies to `phases` here unchanged. The proof
+was already on the table: `probe-af2-warmup.js` measures a whole REPEAT fold at
+**168 ms**, which a stage costing 180 every time cannot fit inside.
+
+**Built and measured before that was understood**: warming the four during the
+download, the way `warmAf3Pipelines` does. The page folds in **1.3 s either
+way**. Reverted - a page change that measures as no change is not an
+optimisation - and `QueryOnlyTemplateGpu.warm` is kept as a documented static
+with the 14.3 ms beside it, so the next reader of that 180 ms does not spend the
+afternoon the same way.
+
