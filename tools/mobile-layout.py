@@ -584,12 +584,17 @@ def main():
         # controls from different questions sharing a line while the two halves
         # of one question were split across two. A line COUNT cannot see that;
         # this is the membership.
+        # 🔴 AND THE PAIRS ARE THE READER'S, NOT THE DOM'S. Asked for directly:
+        # Model with Seed, Recycles with Early Stop, MSA with Max MSA. This
+        # measurement is taken with AlphaFold 3 selected, which hides the AF2
+        # model number AND Early Stop - so Recycles joins line one rather than
+        # stranding itself, which is why it is a third and not a half.
         options = R["rows"]["options"]
-        want = [["modelGroup", "recyclesGroup", "seedGroup"],
+        want = [["modelGroup", "seedGroup", "recyclesGroup"],
                 ["af3ModeGroup", "af3CountGroup"],
                 ["msaModeGroup", "maxMsaGroup"]]
         if options != want:
-            bad.append("%s: the fold options should be Model/Recycles/Seed, then"
+            bad.append("%s: the fold options should be Model/Seed/Recycles, then"
                        " Sampler/Steps, then MSA/Max MSA; got %s" % (name, options))
         for what, m in R["overflowing"].items():
             if m and m["over"] > 1:

@@ -254,33 +254,16 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    `pair += prev_embedding(LayerNorm(recycled pair))`; what was
                    missing was the loop driving it, which is now in
                    src/af3/fold.js. Each recycle is another whole trunk. -->
-              <!-- 🔴 THE REFERENCE'S OWN CONVERGENCE STOP, WHICH THIS PAGE
-                   COULD NOT EXPRESS. AlphaFold's config ships
-                   `recycle_early_stop_tolerance` 0.0 for the monomer and 0.5
-                   for the MULTIMER (alphafold/model/config.py, CONFIG and
-                   CONFIG_MULTIMER; ColabFold's CLI defaults to None and leaves
-                   both alone) - and `recycleTolerance()` has always read a
-                   `#tolerance` element that did not exist, so every fold here
-                   ran every recycle. Measured: a 59-mer with its own 8076-row
-                   alignment stops at 2 passes of 4 at 0.5 A, 1424 ms -> 956,
-                   pLDDT 96.565 -> 96.666; a fold that has NOT settled runs all
-                   four either way. See docs/AF2.md. -->
-              <div class="fetch-option-group" id="toleranceGroup" hidden>
-                <span class="fetch-option-title">Stop early</span>
-                <select id="tolerance">
-                  <!-- 🔴 `never` IS THE SHIPPED DEFAULT AND IT IS A CHOICE, NOT
-                       THE REFERENCE'S. AlphaFold's CONFIG_MULTIMER carries 0.5
-                       and this page declines it for now: the saving is measured
-                       (a converged fold stops at 2 passes of 4, -33%) and the
-                       COST is not - the only deep alignment in the repository
-                       is the 59-mer's and no fixture crystal is 59 residues, so
-                       nothing here can score the structure those two passes
-                       would have produced. Off until something can. -->
-                  <option value="0" selected>never</option>
-                  <option value="reference">reference (0.5 Å for multimer)</option>
-                  <option value="0.1">0.1 Å</option>
-                  <option value="0.5">0.5 Å</option>
-                </select>
+
+              <!-- ...and an id, like every other group here. The narrow layout
+                   puts Model / Recycles / Seed on one line and the pairs below
+                   it on theirs, which means naming them - and a probe that has
+                   to report WHICH controls share a line cannot say
+                   ".fetch-option-group" twice and mean two different rows. -->
+              <div class="fetch-option-group" id="seedGroup">
+                <span class="fetch-option-title">Seed</span>
+                <input type="number" id="random-seed" value="0" min="0" max="2147483647" step="1"
+                  title="Random seed. AF2: MSA subsampling and masking. AF3: the diffusion sampler (Ramp is deterministic and ignores it).">
               </div>
 
               <div class="fetch-option-group" id="recyclesGroup">
@@ -300,16 +283,39 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                 </select>
               </div>
 
-              <!-- ...and an id, like every other group here. The narrow layout
-                   puts Model / Recycles / Seed on one line and the pairs below
-                   it on theirs, which means naming them - and a probe that has
-                   to report WHICH controls share a line cannot say
-                   ".fetch-option-group" twice and mean two different rows. -->
-              <div class="fetch-option-group" id="seedGroup">
-                <span class="fetch-option-title">Seed</span>
-                <input type="number" id="random-seed" value="0" min="0" max="2147483647" step="1"
-                  title="Random seed. AF2: MSA subsampling and masking. AF3: the diffusion sampler (Ramp is deterministic and ignores it).">
+              <!-- 🔴 THE REFERENCE'S OWN CONVERGENCE STOP, WHICH THIS PAGE
+                   COULD NOT EXPRESS. AlphaFold's config ships
+                   `recycle_early_stop_tolerance` 0.0 for the monomer and 0.5
+                   for the MULTIMER (alphafold/model/config.py, CONFIG and
+                   CONFIG_MULTIMER; ColabFold's CLI defaults to None and leaves
+                   both alone) - and `recycleTolerance()` has always read a
+                   `#tolerance` element that did not exist, so every fold here
+                   ran every recycle. Measured: a 59-mer with its own 8076-row
+                   alignment stops at 2 passes of 4 at 0.5 A, 1424 ms -> 956,
+                   pLDDT 96.565 -> 96.666; a fold that has NOT settled runs all
+                   four either way. See docs/AF2.md. -->
+              <div class="fetch-option-group" id="toleranceGroup" hidden>
+                <span class="fetch-option-title">Early Stop</span>
+                <select id="tolerance">
+                  <!-- 🔴 THE NUMBER IS ANGSTROMS, AND 0.1 SHIPS SELECTED -
+                       the conservative end of a measured range. At 0.1 the
+                       converged fold above runs 3 passes of 4 (1424 ms -> 1198,
+                       pLDDT 96.565 -> 96.564, a thousandth) where 0.5 stops it
+                       at 2 and saves a third. A tenth of an angstrom between
+                       consecutive passes is a structure that has stopped
+                       moving, and a fold that has NOT settled is untouched:
+                       5CAJ from a single sequence and the multimer gate run all
+                       four passes at every value and return the identical
+                       checksum. 0.0 is every pass, for anyone who wants it.
+                       🔴 AND THE MULTIMER'S CHECKPOINT ASKS FOR 0.5 and gets
+                       0.1: one control for both models, and the difference is
+                       one more pass on a complex that has already settled. -->
+                  <option value="0">0.0</option>
+                  <option value="0.1" selected>0.1</option>
+                  <option value="0.5">0.5</option>
+                </select>
               </div>
+
 
               <!-- AF3'S OWN, AFTER THE SHARED ONES. web/app.js shows them with
                    the model rather than leaving controls on screen that are

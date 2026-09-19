@@ -947,13 +947,23 @@
      Sampler or Steps, so line two becomes MSA and Max MSA and nothing is
      stranded. Groups that grow rather than merely fit is why `1 1` and not
      `0 0` - a lone MSA select with Max MSA hidden takes the line. */
-  #modelGroup, #recyclesGroup, #seedGroup { flex: 1 1 calc(33.333% - 9px); }
+  /* 🔴 AND THE PAIRS ARE NAMED BY THE READER, NOT BY THE DOM. Asked for
+     directly: Model with Seed, Recycles with Early Stop, MSA with Max MSA. The
+     bases say it - Model, its NUMBER (AlphaFold 2 only) and Seed are thirds, so
+     AF2 fills line one with the three and AF3, which hides the number, grows
+     Model and Seed into a half each. Recycles stays a third and Early Stop is a
+     half: 33 + 50 fits one line and nothing else can follow them, so the pair
+     is the line. AF3 hides Early Stop, and then Recycles joins Model and Seed
+     as the third of line one rather than stranding itself - which is why it is
+     a third and not a half. */
+  #modelGroup, #af2ModelGroup, #recyclesGroup, #seedGroup { flex: 1 1 calc(33.333% - 9px); }
   #af3ModeGroup, #af3CountGroup,
   /* ...and PLM is one of the halves, for the same reason MSA is: it is the
      other half of the line Diffusion starts. Left out, it kept its content
      width while Diffusion grew to fill the rest, so the two controls of one
      question were different sizes on a phone. */
   #plmGroup,
+  #toleranceGroup,
   #msaModeGroup, #maxMsaGroup { flex: 1 1 calc(50% - 7px); }
   #foldOptions > .fetch-option-group + .fetch-option-group,
   #plmGroup,

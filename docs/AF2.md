@@ -3519,19 +3519,24 @@ is within that distance of the one the next pass would have produced. The two
 folds here that do not converge run every pass and return the identical
 checksum.
 
-**What ships**: a `Stop early` control beside Recycles, for AlphaFold 2 only
-(the tolerance has one reader and it is in the AF2 branch), offering `never`,
-`reference`, `0.1` and `0.5`, where `reference` resolves to the checkpoint's own
-value - 0.5 for the multimer graph, 0 for the monomer. The archive records the
-RESOLVED number rather than the word, because "reference" does not say what ran.
-`mobile-layout.py` passes with the row one control wider.
+**What ships**: an `Early Stop` control beside Recycles, for AlphaFold 2 only
+(the tolerance has one reader and it is in the AF2 branch), offering **0.0, 0.1
+and 0.5** angstroms, with **0.1 selected**. The archive records the number under
+`early stop`. `mobile-layout.py` passes with the row one control wider.
 
-🔴 **AND `never` IS SELECTED, SO THE PAGE'S BEHAVIOUR IS UNCHANGED.** The saving
-is measured; the cost is not, for the reason in the next paragraph - no target
-here has both a deep alignment and a crystal - and a third of the passes is not
-something to take on a pLDDT that moved +0.1 on one fold. The reference's own
-0.5 for the multimer is one selection away, and the deviation is now visible
-rather than invisible, which is the half that matters.
+🔴 **0.1 IS THE CONSERVATIVE END OF THE MEASURED RANGE, AND IT IS ON.** It runs
+3 passes of 4 on the converged fold above - 1424 ms to 1198, pLDDT 96.565 to
+96.564 - where 0.5 stops at 2 and saves a third. A tenth of an angstrom between
+consecutive passes is a structure that has stopped moving; the two folds here
+that have NOT settled (5CAJ from a single sequence, the multimer gate) run all
+four passes at every tolerance and return the identical checksum, so the default
+costs them nothing. 0.0 remains for anyone who wants every pass regardless.
+
+🔴 **AND THE MULTIMER'S OWN CHECKPOINT ASKS FOR 0.5, WHICH IT DOES NOT GET.**
+One control for both models is simpler than two, and the difference is one more
+pass on a complex that has already converged. The deviation is deliberate and
+written down rather than accidental and invisible - which is the half that
+matters.
 
 🔴 **AND NO CRYSTAL HERE CAN SCORE THE CONVERGED CASE.** The only deep alignment
 in the repository (`tools/fixtures/test.a3m`) is the 59-mer's, and no fixture

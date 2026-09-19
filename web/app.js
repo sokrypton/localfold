@@ -115,28 +115,24 @@ const recycleCount = () => Number(element("recycles").value) || 0;
 // runs the passes it was asked for. element() throws on a missing id, which is
 // why this reads the DOM defensively rather than assuming the control is there.
 /**
- * How far consecutive passes may move before the fold stops recycling.
+ * How far consecutive passes may move, in angstroms, before recycling stops.
  *
- * 🔴 THE SHIPPED DEFAULT IS `never`, WHICH IS TODAY'S BEHAVIOUR EXACTLY. The
- * saving is measured and the cost is not, so the control exists and the page
- * declines it; see the note in index.html.
+ * 🔴 IT READ AN ELEMENT THAT DID NOT EXIST. The driver has taken a tolerance
+ * since it was written - `shouldStopAfterRecycle` compares consecutive passes'
+ * alpha carbons - and this returned 0 for every fold ever run here because
+ * index.html carried no `#tolerance`. There is one now, and **0.1 is
+ * selected**: a converged fold runs 3 passes of 4 rather than 4, for a
+ * thousandth of a pLDDT, and a fold that has not settled runs all of them.
  *
- * 🔴 `reference` IS A REAL ANSWER AND IT DIFFERS BY MODEL. AlphaFold's own
- * config carries `recycle_early_stop_tolerance` - **0.0 in `CONFIG` and 0.5 in
- * `CONFIG_MULTIMER`** (alphafold/model/config.py) - and ColabFold's
- * `--recycle-early-stop-tolerance` defaults to None, which leaves whichever the
- * checkpoint names. This page read a `#tolerance` element that did not exist,
- * so it ran every recycle for both, which is right for the monomer and is a
- * deviation for the multimer.
- *
- * ...and it is the GRAPH's value, not the family's, because models 2 to 5 of
- * the multimer are model_1's graph. See graphFamily.
+ * 🔴 AND 0.0 IS THE REFERENCE'S ANSWER FOR ONE OF OUR TWO MODELS, NOT BOTH.
+ * AlphaFold's own config carries `recycle_early_stop_tolerance` 0.0 in `CONFIG`
+ * and **0.5 in `CONFIG_MULTIMER`**, and ColabFold's CLI default of None leaves
+ * whichever the checkpoint names. Ours is one control for both, defaulting to
+ * the monomer's: a deliberate deviation for the multimer, because the saving is
+ * measured (a converged fold stops at 2 passes of 4) and the cost is not - no
+ * target here has both a deep alignment and a crystal. See docs/AF2.md.
  */
-const recycleTolerance = () => {
-  const chosen = document.getElementById("tolerance")?.value ?? "reference";
-  if (chosen !== "reference") return Number(chosen) || 0;
-  return graphOf(chosenFamily()) === "multimer" ? 0.5 : 0;
-};
+const recycleTolerance = () => Number(document.getElementById("tolerance")?.value) || 0;
 const randomSeed = () => {
   const input = document.getElementById("random-seed");
   if (input === null || input.value === "") return 0;
@@ -3275,7 +3271,7 @@ async function fold(event) {
         // ...the resolved number, not the word: an archive saying "reference"
         // would not say what ran, and the reference's own answer depends on
         // which model it was.
-        "stop early": recycleTolerance(),
+        "early stop": recycleTolerance(),
         "max msa": maxMsaConfig().requested,
       },
     };

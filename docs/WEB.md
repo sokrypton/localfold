@@ -1237,3 +1237,34 @@ network (the bundles are pinned to a commit, so their URLs are immutable), and
 what is paid again is the DECODE, which the first run paid too. The dial
 animating for a second time is the part that reads as a download.
 
+### The options row pairs by question now: Model+Seed, Recycles+Early Stop, MSA+Max MSA
+
+Asked for directly. The narrow layout already paired by meaning - that is what
+the flex bases in `localfold.css` are for, and `tools/mobile-layout.py` asserts
+the MEMBERSHIP of each line rather than a line count - but the pairs were the
+old ones, and `Early Stop` arrived beside Recycles in the DOM and nowhere in the
+rule. Measured at 390px, every family:
+
+| family | rows |
+|---|---|
+| monomer / multimer | `Model + Model# + Seed` / `Recycles + Early Stop` / `MSA + Max MSA` |
+| af3 | `Model + Seed + Recycles` / `Sampler + Steps` / `MSA + Max MSA` |
+| ef2-fast-600m | `Model + Seed + Recycles` / `Steps + PLM` |
+
+Two changes and no new machinery: the DOM order became Model, Model#, Seed,
+Recycles, Early Stop, ... so that reading order and line order agree, and
+`#af2ModelGroup` joined the thirds while `#toleranceGroup` joined the halves.
+🔴 **RECYCLES STAYS A THIRD AND THAT IS THE LOAD-BEARING PART**: AlphaFold 3
+hides Early Stop, so at a half Recycles would take a line of its own and drag
+Sampler up beside it - splitting Sampler/Steps and MSA/Max MSA across lines,
+which is the exact fault the bases were written to fix. At a third it joins
+Model and Seed instead, and the pairs below it are untouched.
+
+🔴 **AND MOVING TWO BLOCKS OF HTML BY SCRIPT ATE A COMMENT.** The first attempt
+cut each group from a blank-line boundary, which took the `-->` of the comment
+above it and left the comment open - so everything to the next `-->` became
+comment, the seed group vanished from the DOM, and the desktop row "broke across
+2 lines". That looked like a CSS regression and was a mangled document; the
+gate caught it, and the check that would have caught it sooner is one line:
+`<!--` and `-->` counts, and `<div` and `</div>` counts, before writing.
+
