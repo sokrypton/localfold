@@ -404,6 +404,68 @@ and `proteinhunter.html` load `embed`. Syncing only the larger leaves two of
 the three pages on a stale viewer.
 
 
+## A token is not a position, and a modified residue is where they part
+
+🔴 **THE PAE WAS ARRANGED WRONGLY ON ANY FOLD CARRYING A MODIFIED AMINO ACID,
+AND THE NOTE EXPLAINING WHY IT COULD NOT BE WAS ABOUT LIGANDS.** AF3 scores
+TOKENS. A ligand's heavy atoms are one token each AND one position each in the
+viewer, so those two spaces really do agree - which is what `paeSize`'s comment
+says, and it is why the crop that used to be there was removed. A MODIFIED
+residue is the other case: every family but boltz2 atomises it into one token
+per ATOM, while py2Dmol draws it as ONE residue.
+
+Measured end to end, with both real implementations and nothing synthetic
+between them - `featuriseProtein` on `GWSTELEKHR` with a phosphoserine at
+position 3, written out by `toPdb`, loaded into the viewer:
+
+| | |
+|---|---|
+| tokens the featuriser makes | **19** |
+| positions py2Dmol's parser makes | **10**, named GLY,TRP,SEP,THR,... all type P |
+| `viewerTokens(batch).length` | **10** |
+
+So nine rows of that matrix addressed nothing and every residue after the
+modification read somebody else's. `viewerTokens` / `matrixForViewer` in
+`web/prediction-results.js` are the map and the gather, and `onBatch` (added to
+`foldAf3`) is how the LIVE contact map gets the same treatment - it arrives per
+recycle, long before the batch is returned.
+
+🔴 **AND THE RULE IS THE PARSER'S OWN, NOT "IS IT MODIFIED".** py2Dmol keeps a
+residue whole when it carries a BACKBONE - N + CA + C, or C4' + O4' + C1' - and
+draws it at the CA or the C4'. Anything else is a ligand to it. Measured, three
+modifications inside a six-residue chain:
+
+| written as | positions | type |
+|---|---|---|
+| SEP, full backbone | 1 | P |
+| a bare phosphate: P, O1P, O2P, O3P | **4** | L |
+| a ribose-carrying nucleotide | 1 | R |
+
+A rule that collapsed every modified span is three columns wrong on the second
+of those - the same fault pointing the other way - which is what the first
+version of this did.
+
+**AND THE MODIFICATION IS DRAWN NOW.** A cartoon runs the ribbon through a
+phosphoserine's alpha carbon exactly as it runs it through the serine it was
+made from, so the phosphate - the reason the residue is in the job - was
+invisible. Those residues, and no others, get their side chains shown when the
+fold lands. Asked WITH THE OBJECT NAMED, because `positions` index what is
+DRAWN: with two folds merged, residue 3 of this one is residue 3 of the first.
+Measured - two objects merged, `{object, positions: [2]}` lands on owner 8,
+which is that object's offset of 6 plus 2.
+
+🔴 **AND ESMFold2 IS OFFERED MODIFIED RESIDUES AND IS NOT GIVEN THEM.**
+`modelFamily` refuses a modification for AlphaFold 2 by name - "AF2 tokenises
+one residue per letter... folding under it would drop the modification and
+return a confident structure of the unmodified chain" - and ACCEPTS one for
+ESMFold2. `foldWithEsmfold2` then takes `(chains, chainKinds, ligandCodes,
+signal, modelLoad)` and hands `entities: { sequence, chainKinds, ligands }` to
+the featuriser, whose own documented input is
+`{ sequence, chainKinds, ligands, modifications }`. So the exact failure the
+refusal exists to prevent happens on that model instead. **Not fixed**: the
+fold would then atomise too, which needs its batch reaching the page the way
+AF3's now does, and a gate that folds one - which needs a GPU.
+
 ## Saving the session, which is py2Dmol's and not ours
 
 🔴 **py2Dmol ALREADY SERIALISES A SESSION, AND WRITING A SECOND FORMAT WOULD
