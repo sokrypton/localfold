@@ -189,11 +189,23 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         at1.className = "entity-popup-at";
         at1.textContent = "at";
 
+        // 🔴 A TEXT BOX, NOT A NUMBER ONE, BECAUSE THE SPINNER ATE THE NUMBER.
+        // Chrome puts its up/down arrows INSIDE the field and they are not part
+        // of the width you set: measured at `width: 6ch`, the box is 40px with
+        // 12px of padding - 26px of content - and the spinner takes so much
+        // that a three-digit position overflows it (scrollWidth 47 against a
+        // clientWidth of 38, with the text itself only 20px wide). Centred
+        // text in an overflowing box is what "the number is hard to see" is.
+        // `inputMode` still brings up a numeric keypad on a phone, and the
+        // digits-only filter below is what `type=number` was really buying:
+        // min and max never stopped anything, because the page validates the
+        // position properly and says which residue is at it (entities.js).
         const position = document.createElement("input");
-        position.type = "number";
+        position.type = "text";
+        position.inputMode = "numeric";
+        position.autocomplete = "off";
+        position.maxLength = 4;
         position.className = "entity-popup-position";
-        position.min = "1";
-        if (sequence.length > 0) position.max = String(sequence.length);
         position.value = modification.position ? String(modification.position) : "";
         position.setAttribute("aria-label", "Residue position");
 
@@ -230,6 +242,14 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         });
         typed.addEventListener("blur", () => { notify(); draw(); });
         position.addEventListener("input", () => {
+          // ...and nothing but digits reaches the model, which is the one
+          // thing the number input was doing for it.
+          const digits = position.value.replace(/[^0-9]/g, "");
+          if (digits !== position.value) {
+            const at = position.selectionStart;
+            position.value = digits;
+            if (at !== null) position.setSelectionRange(at - 1, at - 1);
+          }
           modification.position = Number.parseInt(position.value, 10);
           residue.textContent = cleanSequence(entity.value)[modification.position - 1] ?? "";
           notify();

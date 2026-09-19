@@ -688,7 +688,10 @@
 .entity-popup-code { flex: 1 1 auto; min-width: 0; }
 .entity-popup-typed { width: 6ch; text-align: center; text-transform: uppercase; }
 .entity-popup-at { font-size: 12px; color: #6b7280; }
-.entity-popup-position { width: 6ch; text-align: center; }
+/* 🔴 SEVEN CHARACTERS FOR FOUR DIGITS, measured. With the spinner gone the
+   box is content again - 26px of it at 6ch - and "1000" is 26.7px wide in
+   this font, so a four-digit position on a long chain clipped by a hair. */
+.entity-popup-position { width: 7ch; text-align: center; }
 /* The residue actually at that position: a wrong number is then visible here
    rather than as a validation message after pressing Fold. */
 .entity-popup-residue {
