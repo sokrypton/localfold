@@ -571,6 +571,34 @@ def main():
               const afterNotAJob = shape();
               const handedNotAJob = handed;
 
+              // \U0001f534 A DROPPED FASTA FILLS THE CHAIN ROWS, AND A DROPPED
+              // a3m DOES NOT. Plain text is the one thing that means different
+              // things at the two doors: the MSA box is a control that says
+              // "this is my ALIGNMENT", and a drop on the page says "this is
+              // what I want to fold". Nothing regressed on that split, because
+              // the page-wide drop did not exist until this session - it went
+              // to py2Dmol - so no reader has ever dropped an a3m here and had
+              // it taken as one.
+              //
+              // \U0001f534 AND THE a3m ARM IS THE ONE THAT MATTERS: without the
+              // guard `entitiesFromText` takes an alignment and makes A ROW PER
+              // SEQUENCE, so a 7907-row search would become 7907 entity rows -
+              // not an error, not a fold, a page that stops responding while it
+              // renders them.
+              const NL = String.fromCharCode(10);
+              const text = (body, name) => [body, name, 'text/plain'];
+              const fasta = await drop([text(
+                ['>chainA', 'ACDEFGHIKLMNPQRSTVWY',
+                 '>chainB', 'MKTAYIAKQRQISFVKSHFS', ''].join(NL),
+                'two.fasta')]);
+              const afterFasta = shape();
+              const many = ['>query', 'ACDEFGHIKL'];
+              for (let row = 0; row < 40; row += 1) {
+                many.push('>hit' + row, 'ACDEFGHIKL');
+              }
+              const a3m = await drop([text(many.join(NL) + NL, 'search.a3m')]);
+              const afterA3m = shape();
+
               // \U0001f534 AND A STRUCTURE IS REFUSED BY NAME, WHICH IS THE
               // PRICE OF ONE READER AND HAS TO BE VISIBLE. Dropping a .pdb
               // used to show it in py2Dmol's viewer and a .pdb beside its PAE
@@ -578,6 +606,13 @@ def main():
               // must come back as a refusal that says what the page does take
               // - never as silence, and never as an alignment of ATOM records,
               // which is what parseA3m makes of a PDB if nothing stops it.
+              // 🔴 COMPARED AGAINST THE ROWS AS THEY ARE NOW, not against the
+              // job's. The FASTA arm above legitimately replaced them, and the
+              // first version of this check still held the structure arm to
+              // `after` - so adding a passing arm above it turned this one red
+              // for a reason that had nothing to do with structures. An arm's
+              // baseline is the state immediately before it.
+              const beforePae = shape();
               const pae = await drop([
                 ['ATOM      1  CA  ALA A   1       0.000   0.000   0.000',
                  'structure.pdb', 'chemical/x-pdb']]);
@@ -588,11 +623,14 @@ def main():
                 before, after, jobStatus,
                 filled: before !== after,
                 claimed: jobStatus.startsWith('job \u00b7'),
-                hintShown: (() => {
-                  const hint = document.getElementById('job-hint');
-                  return hint !== null
-                    && hint.getBoundingClientRect().height > 0;
-                })(),
+                // \U0001f534 THE NAME THE FILE CARRIES REACHES THE BOX, which
+                // replaced a line of prose claiming the page could read a job.
+                // It is the better gate of the two: the hint only asserted
+                // that the page SAID it reads one, where a filled name box is
+                // the page having read one and shown what it found.
+                named: document.getElementById('job-name')?.value ?? 'MISSING',
+                namedRight:
+                  document.getElementById('job-name')?.value === 'TetR_homodimer',
                 overlayAfterDrop, overlayShown,
                 overlayLives: overlayAfterDrop === 'none'
                               && overlayShown === 'flex',
@@ -606,8 +644,14 @@ def main():
                 // stray JSON, not the structure. `handed` staying 0 across all
                 // three is what "one reader" means, and it is the arm that
                 // fails the moment a second one comes back.
+                fasta, afterFasta, a3m, afterA3m,
+                // Two chains in, two rows out; and an alignment stays an
+                // alignment rather than becoming 41 rows.
+                fastaFillsRows: afterFasta === 'protein:20x1,protein:20x1',
+                a3mStaysAlignment: afterA3m === afterFasta
+                                   && /sequences/.test(a3m),
                 structureRefused: pae.includes('looks like a structure')
-                                  && afterPae === after,
+                                  && afterPae === beforePae,
                 nothingHanded: handed === 0,
               });
             })()""" % json.dumps(open(os.path.join(
@@ -1164,16 +1208,15 @@ def main():
             print(f"job archive: {args.job_archive}"
                   f" ({len(base64.b64decode(blob))} bytes)")
 
-            # 🔴 AND THE NAME MUST GO STALE, which is the whole safety of
-            # carrying it. `setChains` - the alignment-query-wins path - and
-            # `set` both replace rows without notifying any edit hook, so the
-            # page keeps the job's name only while the rows still MATCH what
-            # the job put there. Edited, the request must fall back to the
-            # stem: an archive saying "calmodulin_4calcium" over a sequence
-            # somebody retyped describes a different job under a convincing
-            # name, which is worse than one that names nothing.
+            # 🔴 AND THE ARCHIVE SAYS WHAT THE BOX SAYS. The name used to be
+            # state nobody could see - remembered from the file and written
+            # into the request - and keeping it honest took a comparison of the
+            # entity rows against the ones the job created, to guess whether it
+            # still applied. The box replaced all of that, so what is worth
+            # checking is the two ends: the file fills the box, and a fold
+            # takes the box's word, including after somebody edits it.
             if args.job:
-                print("stale name:", cdp.evaluate(ws, """(async () => {
+                print("job name:", cdp.evaluate(ws, """(async () => {
                   const { readZip } = await import('/web/zip.js');
                   const nameIn = async (blob) => {
                     const files = await readZip(
@@ -1191,21 +1234,13 @@ def main():
                     URL.createObjectURL = made;
                     return blobs[0] === undefined ? null : nameIn(blobs[0]);
                   };
+                  const box = document.getElementById('job-name');
+                  const inBox = box === null ? 'MISSING' : box.value;
                   const asFolded = await grab();
-                  // 🔴 EDIT AND RE-FOLD, NOT EDIT AND RE-SAVE. The first
-                  // version of this arm edited a row and pressed Download
-                  // again, and read `goesStale: false` as a bug - it is not:
-                  // `archiveFor` reads the name off the PREDICTION, so an
-                  // archive built later for a fold that already happened
-                  // rightly keeps the name that fold ran under. The staleness
-                  // that matters is a SECOND FOLD on rows the job no longer
-                  // describes, which is the only way the name can end up over
-                  // somebody else's chemistry.
-                  const list = window.__entityList;
-                  const rows = list.read();
-                  const at = rows.findIndex((e) => e.type === 'protein');
-                  rows[at] = { ...rows[at], value: rows[at].value + 'GG' };
-                  list.set(rows);
+
+                  // Renamed by hand and re-folded: the request must follow the
+                  // box, which is the whole reason the box exists.
+                  box.value = 'renamed_by_hand';
                   document.getElementById('predict').click();
                   for (let waited = 0; waited < 120; waited += 1) {
                     await new Promise((done) => setTimeout(done, 1000));
@@ -1213,20 +1248,13 @@ def main():
                       ?.textContent ?? '';
                     if (/pLDDT|Error|error/.test(said)) break;
                   }
-                  const afterRefold = await grab();
+                  const afterRename = await grab();
                   return JSON.stringify({
-                    asFolded, afterRefold,
-                    // The job's name on the fold it describes, the stem on the
-                    // one it does not.
-                    goesStale: asFolded === %s && afterRefold !== null
-                               && afterRefold !== asFolded,
+                    inBox, asFolded, afterRename,
+                    fileFilledTheBox: inBox === asFolded && inBox !== '',
+                    followsTheBox: afterRename === 'renamed_by_hand',
                   });
-                })()""" % json.dumps(
-                    json.loads(open(args.job, encoding="utf-8").read()
-                               ).get("name") if isinstance(json.loads(
-                        open(args.job, encoding="utf-8").read()), dict)
-                    else json.loads(open(args.job, encoding="utf-8").read()
-                                    )[0].get("name")), await_promise=True))
+                })()""", await_promise=True))
 
         if args.download:
             archive = json.loads(cdp.evaluate(ws, """(async () => {

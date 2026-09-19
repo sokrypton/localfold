@@ -1698,3 +1698,95 @@ the name, which reports every archive written before this as
 **What is still dropped, deliberately:** the `description` strings inside a
 chain body. They are free text about the job rather than part of it, nothing in
 the fold reads them, and the server dialect has no field for one.
+
+## The hint became a field, and the dropdown grew a door
+
+The line under the entity rows - *"Drop an AlphaFold 3 job JSON anywhere on this
+page to fill these rows in, then Fold — either dialect..."* - was three clauses
+of prose standing permanently above the thing it described. It is gone, and the
+two things it was trying to say are now controls.
+
+**`Load job JSON…` in the MSA dropdown.** That dropdown was already the only
+door - the file input lives behind "Upload file", which is a control *about
+alignments* - so loading a job meant setting an alignment dial to hand over a
+file that is not an alignment. Now it says so.
+
+🔴 **IT IS AN ACTION IN A LIST OF STATES, AND IT NEVER STAYS SELECTED.** A job
+is not an MSA mode: left selected, `msaMode()` would answer with a value nothing
+maps and the fold would run on it - the same trap as a hidden control keeping
+its old value, which this page has already been bitten by twice. So choosing it
+opens the picker immediately (a label without a door is not a door),
+`msaMode()` answers with the mode it replaced while the picker is open, and
+`applyJob` puts that mode back the moment the file is read. The one exception
+wins over it: a file carrying `unpairedMsa: ""` is asking to fold with **no**
+alignment, so the dial goes to Single Sequence and the status says so -
+restoring the stashed mode over that would run the search the file asked us to
+skip.
+
+**A job-name field above the rows.** Asked for, and it is the better half of
+the deal, because it *deletes* machinery rather than adding it.
+
+🔴 **THE NAME WAS STATE NOBODY COULD SEE.** `applyJob` remembered it and the
+archive wrote it, so a saved job could be called `calmodulin_4calcium` with
+nothing on screen saying so - and keeping that honest took recording the SHAPE
+of the rows the job created and re-checking it at fold time, because `set` and
+`setChains` both `render()` without notifying any edit hook and there was
+nothing to listen to. All of it existed to guess whether a name the reader
+could not see still applied. The field answers it outright: what the box says is
+what gets saved, the reader can see it and change it, and a name that no longer
+fits is *theirs* rather than a stale one this page invented. `loadedJob` and
+`jobShape` are gone.
+
+It names the request only. Every file in the archive is still stemmed `af2_1`,
+because the README describes that layout and the prediction, the viewer object
+and the session all key on it. One consequence worth knowing: re-loading your
+own archive fills the box with that stem, since the request genuinely says the
+job is called `af2_1` - honest, visible, and one edit from whatever you want.
+
+🔴 **AND THE FIELD FOUND A BUG THE MOMENT IT WAS WIRED.** The name push landed
+above `const said = []` in `applyJob` - a temporal dead zone - so the rows and
+the box both filled and the status line read **"Cannot access 'said' before
+initialization"**. The probe caught it on the first run; reading the diff had
+not.
+
+### A dropped FASTA fills the rows, and a dropped a3m does not
+
+The other half of the ask. Plain text is the one thing that means different
+things at the two doors, so `readHandedFile` takes a named parameter rather than
+growing a second copy:
+
+- the **MSA box** is a control that says *this is my alignment*, and always has
+- a **drop on the page** says *this is what I want to fold*, so a FASTA fills
+  the chain rows through `entitiesFromText`
+
+Nothing regressed on that split, and the reason is worth stating: **the
+page-wide drop did not exist until this session** - it went to py2Dmol - so no
+reader has ever dropped an a3m here and had it taken as one.
+
+🔴 **BUT AN a3m HAD TO BE TOLD APART FROM A CHAIN LIST, OR THE PAGE STOPS
+RESPONDING.** `entitiesFromText` makes a row per record, so a 7907-row search
+dropped on the page becomes 7907 entity rows: not an error, not a fold, just a
+page rendering for a very long time. `looksLikeAlignment` asks three things an
+alignment has and a handful of chains does not - an `.a3m` name, lowercase a3m
+insertion columns, or more than eight records - and the status line always says
+which way it went (`2 chains from two.fasta · MSA ▸ Upload file if it was meant
+as an alignment`), so a wrong guess is visible and one click from fixed.
+
+Measured, with both arms falsified:
+
+| | `fastaFillsRows` | `a3mStaysAlignment` | what the a3m became |
+|---|---|---|---|
+| shipped | true | true | `41 sequences · 10 columns` |
+| guard removed | true | **false** | **`protein:10x41`** - the alignment as rows |
+| drop routed as `alignment` | **false** | true | `2 sequences · 20 columns` |
+
+🔴 **AND ADDING A PASSING ARM TURNED ANOTHER ONE RED FOR THE WRONG REASON.** The
+structure arm compared its result against `after` - the job's rows, captured
+near the top - and the FASTA arm above it legitimately replaces them, so
+`structureRefused` went false over something that had nothing to do with
+structures. **An arm's baseline is the state immediately before it**, not a
+snapshot from the top of the probe.
+
+`tools/fold-in-page.py --drop-job` now runs nine arms; `--job` prints
+`job name:` with `fileFilledTheBox` and `followsTheBox`, the second by renaming
+the box by hand and folding again.

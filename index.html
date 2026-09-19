@@ -120,23 +120,26 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    web/entities.js. A nucleotide is ONE token per residue,
                    unlike a ligand or a modified residue. -->
               <div class="entity-list">
+                <!-- 🔴 THE JOB'S NAME, VISIBLE, BECAUSE IT WAS STATE NOBODY
+                     COULD SEE. AlphaFold 3's job files all carry a `name` and
+                     this page read it, remembered it and wrote it into the
+                     saved request without ever showing it - so the archive
+                     could be called `calmodulin_4calcium` with nothing on
+                     screen saying so, and keeping it honest took a comparison
+                     of the entity rows against the ones the job created, to
+                     guess whether the name still applied. A field needs none
+                     of that: what it says is what gets saved, the reader can
+                     see it and change it, and a name that no longer fits is
+                     THEIR name rather than a stale one this page invented.
+                     It names the request only - every file in the archive is
+                     still stemmed `af3_1`, because the README describes that
+                     layout and the prediction, the viewer object and the
+                     session all key on it. -->
+                <input type="text" id="job-name" class="entity-name"
+                  spellcheck="false" aria-label="Job name"
+                  placeholder="Job name — from a loaded JSON, or your own"
+                  title="Written as the job's name in the archive's job_request.json. Filled in when you load an AlphaFold 3 job JSON.">
                 <div id="entity-rows"></div>
-                <!-- 🔴 THE ONE LINE THAT MAKES A BUILT FEATURE REACHABLE. The
-                     page has read an AlphaFold 3 job JSON in both dialects
-                     since web/job-json.js existed, and nine of DeepMind's own
-                     fourteen example jobs load - but the only door was the
-                     alignment upload box, which is hidden until the MSA
-                     dropdown is set to "Upload file", and a JSON dropped on
-                     the page went to py2Dmol and vanished without a word. A
-                     capability nobody can find is a capability nobody has;
-                     see the drop listener in web/app.js. -->
-                <p class="entity-hint" id="job-hint">
-                  Drop an <strong>AlphaFold&nbsp;3 job JSON</strong> anywhere on
-                  this page to fill these rows in, then Fold &mdash; either
-                  dialect (<code>alphafoldserver</code> or
-                  <code>alphafold3</code>). A fold archive or an A3M works the
-                  same way.
-                </p>
               </div>
               <!-- 🔴 NO Options BUTTON. The settings below are always on
                    screen: with three models to choose between, the one control
@@ -391,6 +394,20 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <option value="search" selected>MMseqs2</option>
                   <option value="paste">Paste A3M</option>
                   <option value="upload">Upload file</option>
+                  <!-- 🔴 AN ACTION IN A LIST OF STATES, AND IT NEVER STAYS
+                       SELECTED. The page has read an AlphaFold 3 job JSON
+                       since web/job-json.js existed and the only door was
+                       "Upload file" above, which is a control about
+                       ALIGNMENTS - so loading a job meant setting an
+                       alignment dial to hand over a file that is not an
+                       alignment, and nothing on the page said so. This says
+                       so. But a job is not an MSA mode: leaving it selected
+                       would make `msaMode()` answer with something that is
+                       not an answer, and the fold would run on it. web/app.js
+                       stashes the mode it replaced and puts it back the
+                       moment the file is read - or the job sets its own,
+                       when the file asks for no alignment. -->
+                  <option value="job">Load job JSON…</option>
                 </select>
               </div>
               <div class="fetch-option-group" id="maxMsaGroup">

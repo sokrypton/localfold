@@ -1164,3 +1164,27 @@
   border-radius: 3px;
   padding: 0 3px;
 }
+
+/* 🔴 THE JOB NAME READS AS A TITLE, NOT AS ANOTHER FIELD. It sits above the
+   entity rows and names them, so it is borderless until you touch it - the
+   rows are what the eye should land on, and a third boxed input at the top of
+   the panel competes with them. The same trick py2Dmol uses for its object
+   name. */
+.entity-name {
+  box-sizing: border-box;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  padding: 2px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #374151;
+}
+.entity-name::placeholder { font-weight: 400; color: #9ca3af; }
+.entity-name:hover { border-color: #e5e7eb; }
+.entity-name:focus {
+  border-color: #3b82f6;
+  background: #fff;
+  outline: none;
+}

@@ -61,7 +61,8 @@ import { complexSequenceProblem } from "./sequence.js";
 // 🔴 SHARED WITH proteinhunter.html, which shows the same card against its
 // own play bar. See web/scores-card.js.
 import { updateScoresCard } from "./scores-card.js";
-import { entitiesProblem, expandEntities, templateKind } from "./entities.js";
+import { entitiesFromText, entitiesProblem, expandEntities,
+         templateKind } from "./entities.js";
 import { buildFoldArchive, tokenLayoutFrom, msasFromArchive,
          SINGLE_SEQUENCE_ORIGIN } from "./fold-archive.js";
 import { jobFromJson } from "./job-json.js";
@@ -94,26 +95,17 @@ const entityList = createEntityList(
     msaIsSearch: () => msaMode() === "search" });
 
 /**
- * The AlphaFold 3 job whose rows are on screen, and the rows it put there.
+ * The job's name, as the reader sees it.
  *
- * 🔴 A NAME IS KEPT BY COMPARISON, NOT BY WATCHING FOR EDITS. The first
- * version cleared it from `createEntityList`'s `onChange`, which looked right
- * and was not: `set` and `setChains` both call `render()` and NEITHER
- * notifies, and `setChains` is the alignment-query-wins path - so uploading an
- * A3M whose query is a different protein would have replaced every sequence
- * and kept the name, producing an archive that describes somebody else's fold
- * under "calmodulin_4calcium". Comparing what the job put in the rows against
- * what is in them at fold time needs no such promise and cannot be outrun by
- * the next path that mutates them quietly.
+ * 🔴 THIS USED TO BE A COMPARISON AND THE FIELD REPLACED IT. The name was
+ * invisible state: `applyJob` remembered it, the archive wrote it, and keeping
+ * it honest meant recording the SHAPE of the rows the job created and checking
+ * at fold time that they had not changed - because `set` and `setChains` both
+ * `render()` without notifying any edit hook, so there was nothing to listen
+ * to. All of that existed to guess whether a name the reader could not see
+ * still applied. A field answers it outright: what it says is what is saved.
  */
-let loadedJob;
-
-/** The part of an entity list a job file can describe. */
-const jobShape = (entities) => JSON.stringify((entities ?? []).map((entity) => ({
-  type: entity.type, value: entity.value, copies: entity.copies,
-  modifications: (entity.modifications ?? [])
-    .map((one) => `${one.code}@${one.position}`),
-})));
+const jobName = () => element("job-name").value.trim();
 
 // 🔴 EXPOSED FOR tools/fold-in-page.py, WHICH HAS NO OTHER WAY IN. The rows are
 // built by entity-ui.js and their model is a closure; a harness that wrote into
@@ -679,8 +671,27 @@ const msaMode = () => {
   // could still throw.
   if (SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily())) return "single";
   const chosen = element("msa-mode").value;
+  // 🔴 `job` IS AN ACTION AND NOT A MODE, SO IT NEVER REACHES A FOLD. Selecting
+  // it opens a file picker; it answers here with the mode it replaced, because
+  // a value this function cannot map is a value the fold would run on - the
+  // same trap as a hidden control keeping its old value, one entry above.
+  // `syncMode` puts the real mode back as soon as the file is read, so this
+  // only covers the window in between, and the case where somebody picks it
+  // and folds without choosing a file.
+  if (chosen === "job") return modeBeforeJob === "none" ? "single" : modeBeforeJob;
   return chosen === "none" ? "single" : chosen;
 };
+
+/**
+ * The MSA mode that "Load job JSON…" interrupted, to be put back after.
+ *
+ * 🔴 A JOB CAN SET THIS ITSELF AND THAT WINS. A file carrying `unpairedMsa: ""`
+ * is asking to fold with no alignment - AlphaFold 3 reads an empty string and
+ * an absent field as opposite instructions - so `applyJob` moves the dial to
+ * Single Sequence and says so in the status line. Restoring the stashed mode
+ * over that would silently run the search the file asked us not to run.
+ */
+let modeBeforeJob = "search";
 
 let uploadedA3m = "";
 /**
@@ -3279,11 +3290,10 @@ async function fold(event) {
     // here and the structure exists only inside whichever branch runs.
     foldContext = {
       entities,
-      // 🔴 SETTLED HERE WITH EVERYTHING ELSE, and only if the rows are still
-      // the job's. `setChains` may have just replaced every protein row from
-      // an alignment's own query, which is a change no edit hook sees.
-      jobName: loadedJob !== undefined && loadedJob.shape === jobShape(entities)
-        ? loadedJob.name : undefined,
+      // 🔴 SETTLED HERE WITH EVERYTHING ELSE, so the archive says what the box
+      // said at the moment of folding rather than whatever it says when
+      // somebody presses Download ten minutes later.
+      jobName: jobName() === "" ? undefined : jobName(),
       templates: templateSources,
       msas: archiveMsas(chains, alignment),
       msaOrigin: {
@@ -3991,7 +4001,15 @@ const syncMode = () => {
     if (select !== null) select.disabled = !isMsa;
   }
   element("msa-text").hidden = modeSelect.value !== "paste";
-  element("msa-file").hidden = modeSelect.value !== "upload";
+  // 🔴 ONE FILE INPUT FOR BOTH, AND THE `accept` FOLLOWS THE ASK. The upload
+  // mode takes an alignment, an archive or a job; "Load job JSON…" takes a
+  // job, and narrowing the picker is the whole difference a reader sees
+  // between them. It is the same element because `readHandedFile` is the same
+  // router - two inputs would be two places for the routing to drift.
+  const wantsJob = modeSelect.value === "job";
+  const file = element("msa-file");
+  file.hidden = modeSelect.value !== "upload" && !wantsJob;
+  file.accept = wantsJob ? ".json" : ".a3m,.fasta,.fa,.txt,.zip,.json";
   // ...getElementById rather than element(), which throws on a missing id: the
   // note is index.html's and this file should not require it to exist.
   const note = document.getElementById("privacy-note");
@@ -3999,7 +4017,23 @@ const syncMode = () => {
     note.innerHTML = modeSelect.value === "search" ? PRIVACY_NOTE.search : PRIVACY_NOTE.local;
   }
 };
-modeSelect.addEventListener("change", syncMode);
+// 🔴 THE MODE IT REPLACED IS RECORDED BEFORE THE CHANGE, NOT AFTER. By the time
+// a `change` fires the select already holds the new value, so the only place
+// the old one still exists is here - `modeBeforeJob` is what `msaMode()` answers
+// with while the picker is open and what goes back when the file is read.
+modeSelect.addEventListener("change", () => {
+  if (modeSelect.value === "job") {
+    // ...and opening the picker is the whole point of choosing it. A reader who
+    // picks "Load job JSON…" and then has to find a second control has been
+    // given a label rather than a door.
+    element("msa-file").hidden = false;
+    element("msa-file").accept = ".json";
+    element("msa-file").click();
+  } else {
+    modeBeforeJob = modeSelect.value;
+  }
+  syncMode();
+});
 
 installDevPanel();
 syncMode();
@@ -4059,16 +4093,22 @@ reportModelFromUrl();
  */
 function applyJob(job) {
   entityList.set(job.entities);
-  // 🔴 KEPT SO THE ARCHIVE CAN SAY WHAT THE JOB WAS CALLED. AlphaFold 3's own
-  // examples all carry one - "calmodulin_4calcium", "tetr_dimer_dna" - and the
-  // request this page wrote named the fold instead ("af3_1"), so a job handed
-  // in and saved back came out under a name its author would not recognise.
-  // The file stem stays LocalFold's, because that is what every other member
-  // of the archive is called and renaming those would break the layout the
-  // README describes; this is the `name` FIELD of the request alone.
-  loadedJob = job.name === undefined ? undefined
-    : { name: job.name, shape: jobShape(entityList.read()) };
   const said = [];
+  // 🔴 THE ARCHIVE SHOULD SAY WHAT THE JOB WAS CALLED. AlphaFold 3's own
+  // examples all carry a name - "calmodulin_4calcium", "tetr_dimer_dna" - and
+  // the request this page wrote named the FOLD instead ("af3_1"), so a job
+  // handed in and saved back came out under an identity its author would not
+  // recognise. It fills the box rather than a variable, so the reader can see
+  // it and change it; the file stem stays LocalFold's, because every other
+  // member of the archive is named from it.
+  //
+  // 🔴 ONLY WHEN THE FILE CARRIES ONE. Clearing the box for a job with no
+  // `name` would throw away a name the reader had typed for the fold they are
+  // setting up, which is the one thing here they cannot get back.
+  if (job.name !== undefined) {
+    element("job-name").value = job.name;
+    said.push(`named ${job.name}`);
+  }
   if (job.seed !== undefined) {
     const input = document.getElementById("random-seed");
     if (input !== null && String(job.seed) !== input.value) {
@@ -4080,6 +4120,15 @@ function applyJob(job) {
     modeSelect.value = "none";
     syncMode();
     said.push("MSA off");
+  } else if (modeSelect.value === "job") {
+    // 🔴 THE DIAL GOES BACK, because "Load job JSON…" is a door and not a
+    // setting - left on it, the row would be describing an alignment source
+    // that does not exist for every fold after this one. The branch above wins
+    // where it fires: a file that asks for no alignment has SAID what the dial
+    // should read, and restoring the previous mode over that would run the
+    // search it asked us to skip.
+    modeSelect.value = modeBeforeJob;
+    syncMode();
   }
   const chains = job.entities.reduce(
     (total, entity) => total + (entity.type === "ligand" ? 0 : entity.copies), 0);
@@ -4102,7 +4151,7 @@ function applyJob(job) {
  *
  * Throws; the callers below turn that into the status line.
  */
-async function readHandedFile(bytes) {
+async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
   if (looksLikeZip(bytes)) {
     const files = await readZip(bytes);
     // 🔴 AND THE JOB, NOT ONLY THE ALIGNMENT. The README in this very
@@ -4168,10 +4217,51 @@ async function readHandedFile(bytes) {
       + " - drop an AlphaFold 3 job JSON, a fold archive or an alignment,"
       + " or set a template on the chain's \u22ee menu");
   }
+  // 🔴 PLAIN TEXT MEANS DIFFERENT THINGS AT THE TWO DOORS, AND THAT IS THE ONE
+  // PLACE THEY DIVERGE - so it is a parameter with a name rather than a second
+  // copy of this function. The MSA box is a control that says "this is my
+  // ALIGNMENT" and always has. A drop on the page says "this is what I want to
+  // fold", which is what makes a dropped FASTA fill the chain rows. Nothing
+  // regresses on the split: the page-wide drop did not exist until today - it
+  // went to py2Dmol - so no reader has ever dropped an a3m here and had it
+  // taken as one.
+  if (textIs === "input" && !looksLikeAlignment(text, name)) {
+    const rows = entitiesFromText(text);
+    if (rows.length === 0) throw new Error("no sequence in that file");
+    entityList.set(rows);
+    const chains = rows.reduce((total, row) => total + row.copies, 0);
+    status(`${chains} chain${chains === 1 ? "" : "s"} from ${name || "that file"}`
+      + " · MSA ▸ Upload file if it was meant as an alignment");
+    return;
+  }
   const described = parseA3m(text);
   uploadedA3m = text;
   uploadedMsas = undefined;
   status(`${described.depth} sequences · ${described.length} columns`);
+}
+
+/**
+ * Is this text an ALIGNMENT rather than a list of chains to fold?
+ *
+ * 🔴 IT HAS TO BE ASKED, BECAUSE `entitiesFromText` WOULD TAKE AN a3m AND MAKE
+ * A ROW PER SEQUENCE. A 7907-row alignment dropped on the page would become
+ * 7907 entity rows - not an error, not a fold, just a page that stops
+ * responding while it renders them. The three tests below are each a thing an
+ * alignment HAS and a handful of chains does not, and the status line always
+ * says which way it went, so a wrong guess is visible and one click from
+ * fixed.
+ */
+function looksLikeAlignment(text, name) {
+  // An .a3m says what it is.
+  if (/\.a3m$/i.test(name)) return true;
+  const records = text.split(/^>/m).slice(1);
+  // 🔴 LOWERCASE IS AN a3m INSERTION, which is the format's own marker for a
+  // column that is not in the query - a plain FASTA of chains has none.
+  if (records.some((record) => /[a-z]/.test(
+    record.split(/\r?\n/).slice(1).join("")))) return true;
+  // ...and nobody hand-drops a nine-chain complex, where a search returns
+  // hundreds of rows. A complex that big goes in through the rows or a job.
+  return records.length > 8;
 }
 
 /**
@@ -4182,10 +4272,10 @@ async function readHandedFile(bytes) {
  * one left behind, which would be the wrong alignment reported as the right
  * one.
  */
-function loadHandedFile(file) {
+function loadHandedFile(file, textIs = "alignment") {
   void file.arrayBuffer().then(async (buffer) => {
     try {
-      await readHandedFile(new Uint8Array(buffer));
+      await readHandedFile(new Uint8Array(buffer), { name: file.name, textIs });
     } catch (error) {
       uploadedA3m = "";
       uploadedMsas = undefined;
@@ -4277,10 +4367,14 @@ window.addEventListener("drop", (event) => {
   if (overlay !== null) overlay.style.display = "none";
   const file = [...(event.dataTransfer?.files ?? [])][0];
   if (file === undefined) return;
-  // 🔴 THE SAME ROUTER THE UPLOAD BOX USES, so a job, an archive and an
-  // alignment mean the same thing whichever way they arrive, and a file this
+  // 🔴 THE SAME ROUTER THE UPLOAD BOX USES, so a job, an archive and a
+  // structure mean the same thing whichever way they arrive, and a file this
   // page does not read is refused by name rather than dropped on the floor.
-  loadHandedFile(file);
+  // `input` is the one difference and it is the drop's whole character: a file
+  // let go on the page is WHAT TO FOLD, so a FASTA fills the chain rows, where
+  // the same file chosen in the MSA box is an alignment because that is what
+  // that control is for.
+  loadHandedFile(file, "input");
 }, true);
 
 
