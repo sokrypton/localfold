@@ -1314,3 +1314,134 @@ comment, the seed group vanished from the DOM, and the desktop row "broke across
 gate caught it, and the check that would have caught it sooner is one line:
 `<!--` and `-->` counts, and `<div` and `</div>` counts, before writing.
 
+
+## The job JSON was readable and unreachable, which is the same as unread
+
+Asked by a user: can they upload an AlphaFold 3 style JSON and run it? The
+answer was *yes, and almost nobody could have found out*. Three questions came
+out of it and only the third needed code.
+
+**Is one written correctly?** Yes, gated from both ends. `jobRequestJson`
+writes the server dialect and switches to the open one for the job that dialect
+cannot express - a SMILES ligand, which has no field there at all.
+`test/job-json.test.js` round-trips it, and
+`tools/fold-in-page.py --job-round-trip` folds, **wipes the entity rows**, drops
+the archive back and compares: `same: true`, `seedSame: true`.
+
+**Is one read correctly?** Both dialects, against a corpus that is not ours:
+`test/af3-example-jobs.test.js` runs DeepMind's thirteen `examples/*.json` plus
+the pipeline's kitchen-sink `alphafold_input.json`. **Nine of fourteen load;
+five refuse by name** - three `bondedAtomPairs`, two modified bases. The
+refusals are half the value: every one parses perfectly well as far as the
+sequence, so a lenient reader folds a real structure of the right protein with
+the inhibitor unbonded and calls it the job that was asked for. 🔴 CLAUDE.md
+said **8 of 14 and six refusals** and had been stale since SMILES landed. The
+test asserts the count precisely so that moving a file between the lists is a
+decision somebody makes out loud; the only thing that drifted was the prose.
+
+**Could a reader reach it?** No, and this is the part that was broken.
+
+🔴 **THE ONLY DOOR WAS THE ALIGNMENT UPLOAD BOX, WHICH IS HIDDEN.** `#msa-file`
+is `hidden` unless the MSA dropdown reads "Upload file" (`syncMode`), so loading
+a job meant setting a control about alignments to a value about alignments in
+order to hand over a file that is not an alignment. Nothing on the page said so.
+
+🔴 **AND THE GESTURE A READER ACTUALLY TRIES CAME BACK AS A STRUCTURE ERROR.**
+py2Dmol's `initDragAndDrop` binds the four drag events on `document.body` and
+hands every file to `handleFileUpload`. Measured with our listener disabled,
+dropping `tetr_homodimer.json` on the page gives
+
+```
+Error processing loose files: No structural files (*.cif, *.pdb, *.ent) found.
+```
+
+with every row unchanged. Not silence - worse in one way, because the one error
+a reader sees points at a structure problem in a file that has no structures in
+it and never should have.
+
+### One reader for the gesture, which is the whole fix
+
+The first attempt kept both: claim `.json`, parse it, hand it back to py2Dmol
+when the top level had no `sequences`. That was the wrong trade, and the reason
+is not taste - **every refusal then has to be guessed at twice**, because which
+reader answered depended on how far the other one got. A `.json` with a typo in
+a field name is a job-json refusal; a `.json` that is a py2Dmol session is a
+viewer error; and a reader holding `fold_scores.json` out of our own archive got
+"No valid objects found in state file", which is true of nothing they did.
+
+So **this page owns dragenter, dragover, dragleave and drop**, in the capture
+phase on `window`, and routes every dropped file through `readHandedFile` - the
+same router the alignment upload box uses, so the two entry points cannot
+drift. It reads what the page folds *with*: a job JSON in either dialect, a fold
+archive, an alignment. Anything else is refused by name.
+
+🔴 **ALL FOUR EVENTS, NOT JUST `drop`.** py2Dmol shows its overlay on dragenter
+and counts enters against leaves in a closure this module cannot reach. Taking
+only the drop left that count stuck and the overlay up for ever - an earlier
+version had to undo it with a synthetic empty drop dispatched at the body.
+Taking all four means its counter never moves, and this page drives
+`#global-drop-overlay` itself, off `relatedTarget === null` rather than a depth
+tally: a tally has to be right on every enter and leave or it sticks, which is
+precisely how the overlay got stuck in the first place.
+
+🔴 **AND A STRUCTURE HAD TO BE REFUSED BY NAME, BECAUSE `parseA3m` WOULD TAKE
+IT.** By the time control reaches the last branch an alignment is "any text that
+is not JSON", and a PDB is text. With the guard removed a dropped structure
+comes back as **"A3M sequence data appears before the first FASTA header"** -
+a confusing alignment error for a file that is not an alignment, which is the
+same wrong-message failure one layer down.
+
+**What it costs, said out loud:** dropping a `.pdb` or `.cif` no longer shows it
+in the viewer, and py2Dmol's `paeFromJSON` pairing - a structure and its PAE
+`.json` dropped together - goes with it. Both worked here before (measured:
+`structure, 1 residues, 1/1 PAE matrices paired`). They are the price of one
+reader, and the refusal names what the page does take so nobody is left
+wondering whether the drop registered.
+
+🔴 **`#file-upload` AND `#upload-button` STAY IN index.html, HIDDEN.** Deleting
+them throws inside py2Dmol's `setupEventListeners`, which silently aborts the
+rest of `initializeApp` and takes the MSA panel's wiring with it - index.html
+warns about exactly this beside them. They sit in a panel at `display: none`, so
+nothing reaches them.
+
+### 🔴 Two of the arms first passed on the bug they were written for
+
+`tools/fold-in-page.py --drop-job` - a real `DragEvent` on the body, not the
+file input. That distinction is the point: `--job-round-trip` sets `input.files`
+and fires a `change`, so it exercises job-json.js and nothing whatever about who
+*receives* the file.
+
+| arm | the check that did not work | why it passed anyway | what it asks now |
+|---|---|---|---|
+| the job loads | - | - | rows wiped first, then `filled` and `claimed` |
+| the overlay survives | is it showing at the next `dragenter`? | `flex` either way - with the reset deleted it was **still showing from the drag that was claimed**. The first probe also never fired `dragenter` *before* the drop, so the counter was never dirty at all: half a gesture measures nothing | it must go to `none` when the file is taken *and* come back at the next enter |
+| a stray JSON is ours | does the status look like one of our refusals? | a handler that wrongly claimed one produced ``no `sequences` in that job``, which that check did not recognise | it wraps `window.handleFileUpload` and **counts calls** - 0, always |
+
+Measured, shipped code against each falsification:
+
+| | `filled` | `claimed` | `overlayShown` | `structureRefused` | `nothingHanded` |
+|---|---|---|---|---|---|
+| shipped | true | true | `flex` | true | true |
+| drop listener removed (*the old behaviour*) | **false** | **false** | `flex` | **false** | **false** |
+| only `drop` claimed, not the other three | true | true | **`none`** | true | true |
+| structure guard removed | true | true | `flex` | **false** | true |
+
+Row two is what a reader got before this: `protein:8x1` in, `protein:8x1` out,
+py2Dmol's structure-file error, and a dropped PDB loading into the viewer
+(`structure, 1 residues`).
+
+**And one line of HTML**, under the entity rows, because the drop target being
+the whole page is exactly why nothing on screen implied it existed. A sentence
+rather than a dashed drop zone: a box drawn round part of the page would be a
+lie about where the file may be let go, and a visible affordance that misstates
+itself is worse than an invisible one. The probe asserts it is on screen, since
+a working drop nobody knows about is the same bug one layer up.
+
+🔴 **WHAT IT DELIBERATELY DOES NOT DO IS PICK THE MODEL.** A ligand, a nucleic
+chain or a modified residue needs AF3, and `applyJob`'s own comment says why the
+decision does not belong there: the guard already exists at fold time with a
+message naming the model that is set, and a second reader of the same control is
+the mistake `chosenFamily` was written to end. A reader who drops
+`calmodulin_4calcium.json` under AF2 and presses Fold is told *"Ligands need
+AF3, OpenBind-0 or ESMFold2; the model is set to monomer"* - one more click, and
+never a quietly dropped calcium.

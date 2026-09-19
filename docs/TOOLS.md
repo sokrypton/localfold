@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-329 tools. `tools/fixtures/` is data and is not listed.
+330 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (189)
+## `tools/gpu/` - the WebGPU lane (190)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -189,6 +189,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-staged-gemm-parts.js`** - Where does the staged matrix GEMM's time actually go?
 - **`probe-subgroup-matrix.js`** - Does this device offer WebGPU's subgroup matrix units, and in what shapes?
 - **`probe-submits.js`** - How a fold is SHAPED IN TIME on the host side: submits, the work in each of them, and the places the host stops and waits for the device.
+- **`probe-template-warm.js`** - How much of AlphaFold 2's template stage is compiling its four pipelines?
 - **`probe-token-specialisation.js`** - How much of the pairformer's compile cost is specialisation on the TOKEN COUNT, and how deep the specialisation goes.
 - **`probe-trunk-reuse-after-failure.js`** - Does a fold that FAILS still leave its trunk behind for the retry?
 - **`probe-tuning.js`** - Ask THIS device which of the per-device knobs it wants, and print the `Tuning` object it should get.

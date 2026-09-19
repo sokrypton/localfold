@@ -121,6 +121,22 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    unlike a ligand or a modified residue. -->
               <div class="entity-list">
                 <div id="entity-rows"></div>
+                <!-- 🔴 THE ONE LINE THAT MAKES A BUILT FEATURE REACHABLE. The
+                     page has read an AlphaFold 3 job JSON in both dialects
+                     since web/job-json.js existed, and nine of DeepMind's own
+                     fourteen example jobs load - but the only door was the
+                     alignment upload box, which is hidden until the MSA
+                     dropdown is set to "Upload file", and a JSON dropped on
+                     the page went to py2Dmol and vanished without a word. A
+                     capability nobody can find is a capability nobody has;
+                     see the drop listener in web/app.js. -->
+                <p class="entity-hint" id="job-hint">
+                  Drop an <strong>AlphaFold&nbsp;3 job JSON</strong> anywhere on
+                  this page to fill these rows in, then Fold &mdash; either
+                  dialect (<code>alphafoldserver</code> or
+                  <code>alphafold3</code>). A fold archive or an A3M works the
+                  same way.
+                </p>
               </div>
               <!-- 🔴 NO Options BUTTON. The settings below are always on
                    screen: with three models to choose between, the one control

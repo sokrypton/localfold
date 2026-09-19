@@ -300,6 +300,16 @@ def main():
                              " THE TEST: the rows are still on screen from the"
                              " fold, so 'they match' is true of a page that read"
                              " nothing at all.")
+    parser.add_argument("--drop-job", action="store_true",
+                        help="DROP an AlphaFold 3 job JSON on the page the way"
+                             " a reader would - a real DragEvent on the body,"
+                             " not the file input - and check the rows fill in."
+                             " \U0001f534 THE GESTURE IS THE TEST: the alignment"
+                             " box has read a job since job-json.js existed, and"
+                             " a drop went to py2Dmol and vanished without a"
+                             " word. Also checks that a JSON which is NOT a job"
+                             " is handed back, and that py2Dmol's own drop"
+                             " overlay still works afterwards. Folds nothing.")
     parser.add_argument("--modify", default="",
                         help="a modified residue on the protein entity, as"
                              " CODE@POSITION - e.g. SEP@3, counting from 1."
@@ -418,6 +428,140 @@ def main():
         # VALUE. The entity list upper-cases a CCD code and case is meaning in
         # a SMILES, so the two cannot share a row: `c1ccccc1` is benzene and
         # `C1CCCCC1` is cyclohexane. See web/entities.js.
+        # 🔴 THE DROP, WHICH IS A DIFFERENT PATH FROM THE UPLOAD BOX AND WAS
+        # THE ONE A READER ACTUALLY TRIES. `--job-round-trip` sets
+        # `input.files` and fires a `change`, so it exercises job-json.js and
+        # nothing about who RECEIVES the file; py2Dmol binds `drop` on
+        # document.body and its loose-file branch RETURNS on a .json it could
+        # not load, with no status and no throw, so a job dropped on the page
+        # did nothing at all and said so nowhere. This fires a real DragEvent.
+        if args.drop_job:
+            print("drop job:", cdp.evaluate(ws, """(async () => {
+              const list = window.__entityList;
+              if (!list) return 'no entity list';
+              const overlay = document.getElementById('global-drop-overlay');
+              const say = () =>
+                document.getElementById('status-message')?.textContent ?? '';
+
+              // \U0001f534 COUNTED, NOT INFERRED FROM THE MESSAGE. An earlier
+              // arm asked whether a foreign file's status looked like one of
+              // job-json.js's refusals - and a handler that wrongly claimed it
+              // produced "no `sequences` in that job", which that check did not
+              // recognise, so the arm passed on the bug it was written for.
+              // Wrapping py2Dmol's own entry point answers the real question:
+              // did the file reach it.
+              let handed = 0;
+              const realUpload = window.handleFileUpload;
+              if (typeof realUpload !== 'function') return 'no handleFileUpload';
+              window.handleFileUpload = (e) => { handed += 1; return realUpload(e); };
+
+              // \U0001f534 dragenter FIRST, WHICH IS WHAT A BROWSER DOES AND
+              // WHAT THE FIRST VERSION OF THIS PROBE LEFT OUT. py2Dmol counts
+              // dragenter against dragleave and only its own `drop` listener
+              // zeroes that count - so a drop with no dragenter before it
+              // leaves the count at 0 whether or not this page reset it, and
+              // the overlay arm passed with the reset DELETED. A gesture probe
+              // that skips half the gesture measures nothing.
+              const drop = async (parts) => {
+                const carrier = new DataTransfer();
+                for (const [text, name, type] of parts) {
+                  carrier.items.add(new File([text], name, { type }));
+                }
+                document.body.dispatchEvent(new DragEvent('dragenter',
+                  { bubbles: true, cancelable: true, dataTransfer: carrier }));
+                document.body.dispatchEvent(new DragEvent('drop',
+                  { bubbles: true, cancelable: true, dataTransfer: carrier }));
+                await new Promise((done) => setTimeout(done, 700));
+                return say();
+              };
+              const json = (text, name) => [text, name, 'application/json'];
+              const shape = () => list.read().map(
+                (e) => e.type + ':' + e.value.length + 'x' + e.copies).join(',');
+
+              // \U0001f534 WIPED FIRST, or "the rows are right" is true of a page
+              // that read nothing - the round trip's own lesson, one gesture on.
+              list.set([{ type: 'protein', value: 'AAAAAAAA', copies: 1,
+                          modifications: [] }]);
+              const before = shape();
+              const jobStatus = await drop([json(%s, 'tetr_homodimer.json')]);
+              const after = shape();
+              const handedJob = handed;
+
+              // \U0001f534 py2Dmol'S OVERLAY, WHICH A CLAIMED DROP LEAVES STUCK
+              // ON. Its dragenter shows the overlay and bumps a counter in a
+              // closure; only its own `drop` listener hides it and zeroes the
+              // count - the listener stopPropagation just skipped. AND "is it
+              // showing at the next dragenter" CANNOT SEE THAT: with the reset
+              // deleted it is still showing from the drag that was claimed, so
+              // the answer is 'flex' either way and the check passed on the
+              // bug. What separates them is whether it went AWAY.
+              const overlayAfterDrop = overlay === null ? 'no overlay'
+                : getComputedStyle(overlay).display;
+              document.body.dispatchEvent(new DragEvent('dragenter',
+                { bubbles: true, cancelable: true,
+                  dataTransfer: new DataTransfer() }));
+              await new Promise((done) => setTimeout(done, 100));
+              const overlayShown = overlay === null ? 'no overlay'
+                : getComputedStyle(overlay).display;
+              document.body.dispatchEvent(new DragEvent('drop',
+                { bubbles: true, cancelable: true,
+                  dataTransfer: new DataTransfer() }));
+              await new Promise((done) => setTimeout(done, 100));
+
+              // \U0001f534 A .json THAT IS NOT A JOB IS REFUSED AS A JOB, which
+              // is the whole point of having ONE reader for the extension: it
+              // must not quietly become py2Dmol's problem and come back as
+              // "No valid objects found in state file". Our own archive's
+              // `_scores.json` is the file a reader will actually do this with.
+              const notAJob = await drop([json(
+                JSON.stringify({ plddt: [1, 2, 3] }), 'fold_scores.json')]);
+              const afterNotAJob = shape();
+              const handedNotAJob = handed;
+
+              // \U0001f534 AND A STRUCTURE IS REFUSED BY NAME, WHICH IS THE
+              // PRICE OF ONE READER AND HAS TO BE VISIBLE. Dropping a .pdb
+              // used to show it in py2Dmol's viewer and a .pdb beside its PAE
+              // .json used to pair; this page owns the gesture now, so both
+              // must come back as a refusal that says what the page does take
+              // - never as silence, and never as an alignment of ATOM records,
+              // which is what parseA3m makes of a PDB if nothing stops it.
+              const pae = await drop([
+                ['ATOM      1  CA  ALA A   1       0.000   0.000   0.000',
+                 'structure.pdb', 'chemical/x-pdb']]);
+              const afterPae = shape();
+
+              window.handleFileUpload = realUpload;
+              return JSON.stringify({
+                before, after, jobStatus,
+                filled: before !== after,
+                claimed: jobStatus.startsWith('job \u00b7'),
+                hintShown: (() => {
+                  const hint = document.getElementById('job-hint');
+                  return hint !== null
+                    && hint.getBoundingClientRect().height > 0;
+                })(),
+                overlayAfterDrop, overlayShown,
+                overlayLives: overlayAfterDrop === 'none'
+                              && overlayShown === 'flex',
+                notAJob, afterNotAJob,
+                // Refused BY US, by name, and never handed on.
+                refusedHere: notAJob.includes('sequences')
+                             && afterNotAJob === after
+                             && handedNotAJob === 0,
+                pae, afterPae,
+                // \U0001f534 NOTHING REACHES py2Dmol NOW - not the job, not the
+                // stray JSON, not the structure. `handed` staying 0 across all
+                // three is what "one reader" means, and it is the arm that
+                // fails the moment a second one comes back.
+                structureRefused: pae.includes('looks like a structure')
+                                  && afterPae === after,
+                nothingHanded: handed === 0,
+              });
+            })()""" % json.dumps(open(os.path.join(
+                REPO, "tools/fixtures/af3-jobs/tetr_homodimer.json"),
+                encoding="utf-8").read()), await_promise=True))
+            return
+
         if args.smiles and args.smiles_ui:
             # 🔴 THROUGH THE CONTROLS, WHICH IS THE ONLY PATH THAT SEES A UI
             # BUG. A row is added with the page's own button, its type select

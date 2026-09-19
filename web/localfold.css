@@ -1143,3 +1143,24 @@
   opacity: 0.85;
 }
 #session-restore, #session-forget { flex: 0 0 auto; }
+
+/* 🔴 THE HINT UNDER THE ENTITY ROWS, which is the whole of the job-JSON
+   feature's discoverability. It is a line of text rather than a dashed drop
+   zone because the drop target is the WHOLE PAGE - a box drawn round part of
+   it would be a lie about where the file may be let go, and the one thing
+   worse than an undiscoverable feature is a visible one that says the wrong
+   thing about itself. Sized and coloured like the privacy note, which is the
+   page's other standing line of explanation. */
+.entity-hint {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #6b7280;
+}
+.entity-hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  background: rgba(107, 114, 128, 0.12);
+  border-radius: 3px;
+  padding: 0 3px;
+}

@@ -4053,79 +4053,199 @@ function applyJob(job) {
   return [...said, ...job.notes].join(" · ");
 }
 
-element("msa-file").addEventListener("change", (event) => {
-  const file = event.target.files?.[0];
-  if (file === undefined) return;
-  // 🔴 THE BYTES DECIDE, NOT THE EXTENSION. A fold archive renamed to .a3m is
-  // still an archive and an a3m called .zip is still an alignment, and the
-  // failure of guessing by name is a confusing parse error rather than a
-  // refusal. See looksLikeZip.
+/**
+ * A file somebody handed the page: an alignment, a fold archive, or a JOB.
+ *
+ * 🔴 ONE ROUTER, BECAUSE THE FORMAT IS DECIDED BY THE BYTES AND A SECOND
+ * PLACE TO DECIDE IT IS A SECOND PLACE TO DECIDE IT DIFFERENTLY. This was the
+ * body of the `msa-file` change listener, and the drop target below now reads
+ * the same four kinds through the same branches - a fold archive renamed to
+ * .a3m is still an archive and an a3m called .zip is still an alignment, so
+ * guessing by extension gives a confusing parse error rather than a refusal.
+ * See looksLikeZip. The whole-object rule one section up, applied to a reader.
+ *
+ * Throws; the callers below turn that into the status line.
+ */
+async function readHandedFile(bytes) {
+  if (looksLikeZip(bytes)) {
+    const files = await readZip(bytes);
+    // 🔴 AND THE JOB, NOT ONLY THE ALIGNMENT. The README in this very
+    // archive tells the reader to drop it back "to fold again with exactly
+    // these alignments" - and until now that restored the a3m and nothing
+    // else: the sequence, the ligands, the modifications and the seed all
+    // had to be retyped from the request file by hand. The two belong
+    // together in any case, since an archive's alignment is FOR its own
+    // sequence and attaching it to a different one is the query-wins rule
+    // papering over a mismatch.
+    let loadedJob;
+    const requestName = [...files.keys()].find(
+      (path) => path.endsWith("job_request.json"));
+    if (requestName !== undefined) {
+      // ...a refusal here is reported and does not cost the alignment: an
+      // archive from a newer format still carries usable a3m files.
+      try { loadedJob = applyJob(jobFromJson(files.get(requestName))); }
+      catch (error) { loadedJob = `job not loaded: ${error.message}`; }
+    }
+    const restored = msasFromArchive(files);
+    if (restored.chains === 0 && restored.merged === undefined) {
+      if (loadedJob !== undefined) { status(`archive · ${loadedJob}`); return; }
+      throw new Error("that archive holds no alignments");
+    }
+    const alsoJob = loadedJob === undefined ? "" : ` · ${loadedJob}`;
+    if (restored.chains === 0) {
+      // An archive whose fold was given one merged alignment carries it
+      // back as exactly that, with no split to restore.
+      uploadedMsas = { merged: restored.merged };
+      uploadedA3m = restored.merged;
+      const described = parseA3m(restored.merged);
+      status(`archive · ${described.depth} sequences`
+        + ` · ${described.length} columns${alsoJob}`);
+      return;
+    }
+    uploadedMsas = restored;
+    uploadedA3m = "";
+    const paired = restored.pairedA3ms.size;
+    status(`archive · ${restored.chains} chain${restored.chains === 1 ? "" : "s"}`
+      + `${paired > 0 ? `, ${paired} with paired rows` : ", no paired rows"}`
+      + alsoJob);
+    return;
+  }
+  const text = new TextDecoder().decode(bytes);
+  // 🔴 THE BYTES DECIDE HERE TOO. A job JSON and an a3m are both text, and
+  // parseA3m reads `[{"name": ...` as a record whose sequence is the file -
+  // no error, a "1 sequence" status, and a fold against an alignment made
+  // of punctuation. The first non-space character is what separates them.
+  if (/^\s*[[{]/.test(text)) {
+    status(`job · ${applyJob(jobFromJson(text))}`);
+    return;
+  }
+  // 🔴 A STRUCTURE IS REFUSED BY NAME, BECAUSE parseA3m WOULD TAKE IT. An a3m
+  // is "any text that is not JSON" by the time control reaches here, and a PDB
+  // is text - so a dropped structure became an alignment of ATOM records
+  // rather than an error, which is the silent-wrong-answer shape this file
+  // objects to everywhere else. It matters now that this page owns the drop:
+  // dropping a .pdb used to show it in py2Dmol's viewer, and a reader who
+  // tries that is owed the reason it no longer does.
+  if (/^(ATOM|HETATM|HEADER|MODEL|CRYST1|REMARK|data_|loop_)/m.test(
+        text.slice(0, 4096))) {
+    throw new Error("that looks like a structure, and this page folds sequences"
+      + " - drop an AlphaFold 3 job JSON, a fold archive or an alignment,"
+      + " or set a template on the chain's \u22ee menu");
+  }
+  const described = parseA3m(text);
+  uploadedA3m = text;
+  uploadedMsas = undefined;
+  status(`${described.depth} sequences · ${described.length} columns`);
+}
+
+/**
+ * ...from a file input or a drop, with the refusal going to the status line.
+ *
+ * 🔴 AND A FAILED READ CLEARS THE ALIGNMENT RATHER THAN LEAVING THE LAST ONE
+ * IN PLACE. A file that did not load must not fold with whatever the previous
+ * one left behind, which would be the wrong alignment reported as the right
+ * one.
+ */
+function loadHandedFile(file) {
   void file.arrayBuffer().then(async (buffer) => {
-    const bytes = new Uint8Array(buffer);
     try {
-      if (looksLikeZip(bytes)) {
-        const files = await readZip(bytes);
-        // 🔴 AND THE JOB, NOT ONLY THE ALIGNMENT. The README in this very
-        // archive tells the reader to drop it back "to fold again with exactly
-        // these alignments" - and until now that restored the a3m and nothing
-        // else: the sequence, the ligands, the modifications and the seed all
-        // had to be retyped from the request file by hand. The two belong
-        // together in any case, since an archive's alignment is FOR its own
-        // sequence and attaching it to a different one is the query-wins rule
-        // papering over a mismatch.
-        let loadedJob;
-        const requestName = [...files.keys()].find(
-          (path) => path.endsWith("job_request.json"));
-        if (requestName !== undefined) {
-          // ...a refusal here is reported and does not cost the alignment: an
-          // archive from a newer format still carries usable a3m files.
-          try { loadedJob = applyJob(jobFromJson(files.get(requestName))); }
-          catch (error) { loadedJob = `job not loaded: ${error.message}`; }
-        }
-        const restored = msasFromArchive(files);
-        if (restored.chains === 0 && restored.merged === undefined) {
-          if (loadedJob !== undefined) { status(`archive · ${loadedJob}`); return; }
-          throw new Error("that archive holds no alignments");
-        }
-        const alsoJob = loadedJob === undefined ? "" : ` · ${loadedJob}`;
-        if (restored.chains === 0) {
-          // An archive whose fold was given one merged alignment carries it
-          // back as exactly that, with no split to restore.
-          uploadedMsas = { merged: restored.merged };
-          uploadedA3m = restored.merged;
-          const described = parseA3m(restored.merged);
-          status(`archive · ${described.depth} sequences`
-            + ` · ${described.length} columns${alsoJob}`);
-          return;
-        }
-        uploadedMsas = restored;
-        uploadedA3m = "";
-        const paired = restored.pairedA3ms.size;
-        status(`archive · ${restored.chains} chain${restored.chains === 1 ? "" : "s"}`
-          + `${paired > 0 ? `, ${paired} with paired rows` : ", no paired rows"}`
-          + alsoJob);
-        return;
-      }
-      const text = new TextDecoder().decode(bytes);
-      // 🔴 THE BYTES DECIDE HERE TOO. A job JSON and an a3m are both text, and
-      // parseA3m reads `[{"name": ...` as a record whose sequence is the file -
-      // no error, a "1 sequence" status, and a fold against an alignment made
-      // of punctuation. The first non-space character is what separates them.
-      if (/^\s*[[{]/.test(text)) {
-        status(`job · ${applyJob(jobFromJson(text))}`);
-        return;
-      }
-      const described = parseA3m(text);
-      uploadedA3m = text;
-      uploadedMsas = undefined;
-      status(`${described.depth} sequences · ${described.length} columns`);
+      await readHandedFile(new Uint8Array(buffer));
     } catch (error) {
       uploadedA3m = "";
       uploadedMsas = undefined;
       status(error instanceof Error ? error.message : String(error), true);
     }
   });
+}
+
+element("msa-file").addEventListener("change", (event) => {
+  const file = event.target.files?.[0];
+  if (file !== undefined) loadHandedFile(file);
 });
+
+/**
+ * ...AND FROM A DROP ANYWHERE ON THE PAGE, WHICH THIS PAGE NOW OWNS OUTRIGHT.
+ *
+ * 🔴 py2Dmol OWNED THE DROP, AND A JOB DROPPED ON IT WAS READ AS A BROKEN
+ * STRUCTURE FILE. Its `initDragAndDrop` binds the four drag events on
+ * document.body and hands every file to `handleFileUpload`, which routes .zip
+ * to its own session reader and everything else to `processFiles`. Measured
+ * with this listener disabled, dropping one of AlphaFold 3's own example jobs
+ * on the page gives **"Error processing loose files: No structural files
+ * (*.cif, *.pdb, *.ent) found."** and leaves every row as it was.
+ *
+ * 🔴 AND THE WRONG MESSAGE WAS THE PROBLEM, NOT THE LOSS. The page has had a
+ * reader for that exact file since web/job-json.js existed - nine of
+ * DeepMind's fourteen examples load - and the one error a reader saw sent them
+ * looking for a structure problem in a file that has no structures in it and
+ * never should have. The door that did work was the alignment upload box,
+ * hidden until the MSA dropdown is set to "Upload file". A capability nobody
+ * can find is a capability nobody has.
+ *
+ * 🔴 TWO READERS FOR ONE GESTURE IS THE WHOLE BUG, SO THERE IS NOW ONE. An
+ * earlier version of this listener claimed `.json`, parsed it, and handed it
+ * back to py2Dmol when the top level had no `sequences` - and every refusal
+ * then had to be guessed at twice, because which reader answered depended on
+ * how far the other one got. This page reads what it folds WITH: a job JSON in
+ * either dialect, a fold archive, an alignment. Anything else is refused by
+ * name. `readHandedFile` is the one router and the alignment upload box shares
+ * it, so the two entry points cannot drift.
+ *
+ * 🔴 WHAT THAT COSTS, SAID OUT LOUD: dropping a .pdb or .cif no longer shows
+ * it in the viewer, and py2Dmol's `paeFromJSON` pairing - a structure and its
+ * PAE .json dropped together - is gone with it. Both were reachable here and
+ * both worked. They are the price of one reader, and the refusal names them
+ * rather than leaving a reader wondering whether the drop registered.
+ *
+ * 🔴 AND THE FOUR EVENTS GO TOGETHER, NOT JUST `drop`. py2Dmol shows its
+ * overlay on dragenter and counts enters against leaves in a closure this
+ * module cannot reach; taking only the drop left the count stuck and the
+ * overlay up for ever, which an earlier version had to undo with a synthetic
+ * empty drop. Taking all four means its counter never moves at all, and this
+ * page drives `#global-drop-overlay` itself - the same element, so the visual
+ * is unchanged.
+ *
+ * 🔴 `#file-upload` AND `#upload-button` STAY IN index.html, HIDDEN. Deleting
+ * them throws inside py2Dmol's `setupEventListeners`, which silently aborts
+ * the rest of `initializeApp` and takes the MSA panel's wiring with it - the
+ * warning is in index.html beside them. They are in a panel at
+ * `display: none`, so nothing reaches them.
+ *
+ * Gated by `tools/fold-in-page.py --drop-job`, whose arms were each watched
+ * failing.
+ */
+const DROP_OVERLAY = () => document.getElementById("global-drop-overlay");
+
+for (const kind of ["dragenter", "dragover", "dragleave"]) {
+  window.addEventListener(kind, (event) => {
+    // 🔴 preventDefault IS WHAT MAKES A DROP HAPPEN AT ALL. Without it on
+    // dragover the browser navigates to the file instead, which is the
+    // default this page used to get from py2Dmol's own handler.
+    event.preventDefault();
+    event.stopPropagation();
+    const overlay = DROP_OVERLAY();
+    if (overlay === null) return;
+    // 🔴 COUNTED OFF `relatedTarget`, NOT OFF A DEPTH TALLY. A tally has to be
+    // right on every enter and leave or it sticks - which is exactly how
+    // py2Dmol's overlay got stuck when this page took its drop away. Leaving
+    // the window gives a null relatedTarget, and nothing else has to balance.
+    overlay.style.display =
+      kind === "dragleave" && event.relatedTarget === null ? "none" : "flex";
+  }, true);
+}
+
+window.addEventListener("drop", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  const overlay = DROP_OVERLAY();
+  if (overlay !== null) overlay.style.display = "none";
+  const file = [...(event.dataTransfer?.files ?? [])][0];
+  if (file === undefined) return;
+  // 🔴 THE SAME ROUTER THE UPLOAD BOX USES, so a job, an archive and an
+  // alignment mean the same thing whichever way they arrive, and a file this
+  // page does not read is refused by name rather than dropped on the floor.
+  loadHandedFile(file);
+}, true);
 
 
 // ...THE RAW PREDICTION, downloadable as computed. py2Dmol's own save button
