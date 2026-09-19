@@ -268,8 +268,16 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <div class="fetch-option-group" id="toleranceGroup" hidden>
                 <span class="fetch-option-title">Stop early</span>
                 <select id="tolerance">
-                  <option value="reference" selected>reference</option>
-                  <option value="0">never</option>
+                  <!-- 🔴 `never` IS THE SHIPPED DEFAULT AND IT IS A CHOICE, NOT
+                       THE REFERENCE'S. AlphaFold's CONFIG_MULTIMER carries 0.5
+                       and this page declines it for now: the saving is measured
+                       (a converged fold stops at 2 passes of 4, -33%) and the
+                       COST is not - the only deep alignment in the repository
+                       is the 59-mer's and no fixture crystal is 59 residues, so
+                       nothing here can score the structure those two passes
+                       would have produced. Off until something can. -->
+                  <option value="0" selected>never</option>
+                  <option value="reference">reference (0.5 Å for multimer)</option>
                   <option value="0.1">0.1 Å</option>
                   <option value="0.5">0.5 Å</option>
                 </select>

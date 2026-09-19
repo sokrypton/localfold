@@ -117,6 +117,10 @@ const recycleCount = () => Number(element("recycles").value) || 0;
 /**
  * How far consecutive passes may move before the fold stops recycling.
  *
+ * 🔴 THE SHIPPED DEFAULT IS `never`, WHICH IS TODAY'S BEHAVIOUR EXACTLY. The
+ * saving is measured and the cost is not, so the control exists and the page
+ * declines it; see the note in index.html.
+ *
  * 🔴 `reference` IS A REAL ANSWER AND IT DIFFERS BY MODEL. AlphaFold's own
  * config carries `recycle_early_stop_tolerance` - **0.0 in `CONFIG` and 0.5 in
  * `CONFIG_MULTIMER`** (alphafold/model/config.py) - and ColabFold's

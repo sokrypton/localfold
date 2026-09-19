@@ -3520,11 +3520,18 @@ folds here that do not converge run every pass and return the identical
 checksum.
 
 **What ships**: a `Stop early` control beside Recycles, for AlphaFold 2 only
-(the tolerance has one reader and it is in the AF2 branch), with `reference`
-selected - which resolves to the checkpoint's own value, **0.5 for the multimer
-graph and 0 for the monomer** - plus `never`, `0.1` and `0.5`. The archive
-records the RESOLVED number rather than the word, because "reference" does not
-say what ran. `mobile-layout.py` passes with the row one control wider.
+(the tolerance has one reader and it is in the AF2 branch), offering `never`,
+`reference`, `0.1` and `0.5`, where `reference` resolves to the checkpoint's own
+value - 0.5 for the multimer graph, 0 for the monomer. The archive records the
+RESOLVED number rather than the word, because "reference" does not say what ran.
+`mobile-layout.py` passes with the row one control wider.
+
+🔴 **AND `never` IS SELECTED, SO THE PAGE'S BEHAVIOUR IS UNCHANGED.** The saving
+is measured; the cost is not, for the reason in the next paragraph - no target
+here has both a deep alignment and a crystal - and a third of the passes is not
+something to take on a pLDDT that moved +0.1 on one fold. The reference's own
+0.5 for the multimer is one selection away, and the deviation is now visible
+rather than invisible, which is the half that matters.
 
 🔴 **AND NO CRYSTAL HERE CAN SCORE THE CONVERGED CASE.** The only deep alignment
 in the repository (`tools/fixtures/test.a3m`) is the 59-mer's, and no fixture
