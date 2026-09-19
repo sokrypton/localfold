@@ -3194,3 +3194,50 @@ gate signatures for it. It joins `attentionMatrixPrefetch` (0.05%) and
 upstream's LayerNorm rearrangement (1.3%) on the list of things measured and
 declined with a number. `--tune=fusedPairBias=true` is the arm.
 
+### The priors, swept in the configuration that SHIPS - all six already right
+
+This file's own warning is that "every prior number in these docs was taken with
+the flags on", and that a knob's worth changes with the configuration:
+`linearTallTile` is 1.31x under `LOCALFOLD_STOCK_FLAGS=1` where the `--no-prior`
+split prices it at ZERO, because the matrix kernels replace the vector ones the
+knobs belong to. What nobody had checked is whether the prior's CHOICES are
+still the right ones there - a value fitted where it could not matter is a value
+chosen at random for the device that ships.
+
+Swept with `profile-af2-block.js --sweep=` (interleaved arms, minimum per arm)
+under stock flags, which on this A100 means **no `shader-f16` and no matrix
+units at all** - `probe-kernel.js` picks `attention:flash-registers-32-f32-g4v`:
+
+| knob | prior | 150 residues | 400 residues |
+|---|---|---|---|
+| `linearTallTile` | true | false 11.09, **true 9.31** | false 54.33, **true 47.12** |
+| `attentionGroup` | 4 | 1: 10.62, 2: 10.49, **4: 10.36**, 8: 10.43 | 1: 52.89, 2: 52.23, **4: 51.65**, 8: 52.30 |
+| `opmProjectOutputPairs` | 4 | 1: 11.74, 2: 10.89, **4: 10.56** | 1: 61.80, 2: 54.73, **4: 51.51** |
+| `transitionChunkBytes` | 256 MiB | | 32: 54.93, 128: 52.10, **256: 51.51** |
+| `opmPairBlockBytes` | 256 MiB | | 64: 52.17, **256: 51.58** |
+| `attentionVectorScore` | true | | false 51.58, true 51.71 (noise) |
+
+**Every one of the six is already at its best value for a visitor.** The worths
+differ from the flagged numbers - `opmProjectOutputPairs` is 1.20x between 1 and
+4 here where the 825-residue flagged sweep called it FLAT, and
+`transitionChunkBytes` is 6.6% over the old 32 MiB default - but the choices do
+not, so nothing is mis-set. 🔴 AND THE MODULE DEFAULT IS NOT THE PRIOR'S VALUE:
+`OPM_PROJECT_OUTPUT_PAIRS` is **2**, fitted on an M2 whose 32 KiB of workgroup
+storage makes P = 4 cost occupancy, so an unrecognised NVIDIA part takes the
+Apple answer and pays 6% for it. That is the priors working as designed, and it
+is also the argument for measuring an unrecognised device rather than defaulting
+it.
+
+🔴 **AND THE VISITOR'S GAP AT A PAGE LENGTH IS 1.43x, NOT 1.95x.** The 10767
+against 21000 ms in CLAUDE.md is an 825-residue fold. Measured at 261 residues
+with 128 rows and one recycle, `fold-af2.js --repeat=2`:
+
+| | first fold | warm repeat |
+|---|---:|---:|
+| developer flags | 2246 ms | 1738 ms |
+| stock, what a visitor gets | 3208 ms | **2806 ms** |
+
+1.61x cold and 1.43x warm. The gap narrows because the matrix kernels earn less
+at a length where every dispatch is small - which is the same reason the LN
+fusion above is worth 0.86% at 150 and 0.22% at 825, from the other end.
+
