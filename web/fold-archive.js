@@ -523,7 +523,7 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
  * @returns {Map<string, string>}
  */
 export function buildFoldArchive({
-  stem, model, settings, entities, prediction, msas = {}, templates,
+  stem, jobName, model, settings, entities, prediction, msas = {}, templates,
   msaOrigin, alignmentOmitted = false, perModel,
 }) {
   const name = safeJobName(stem);
@@ -546,8 +546,18 @@ export function buildFoldArchive({
   }
 
   const files = new Map();
+  // 🔴 THE JOB'S OWN NAME WHERE THERE IS ONE, AND THE STEM OTHERWISE. Every
+  // one of AlphaFold 3's example files carries a `name` - "calmodulin_4calcium",
+  // "tetr_dimer_dna" - and this wrote the fold's stem over it, so a job handed
+  // in and saved back came out called "af3_1": the same chemistry under an
+  // identity its author would not recognise, which is the half of "describes
+  // the job that ran" that the entity comparison cannot see. The FILE STEM
+  // stays LocalFold's, because every other member of the archive is named from
+  // it and the README describes that layout; this is the request's `name`
+  // field alone. `jobName` is undefined unless the rows are still the ones the
+  // job put there - see web/app.js.
   files.set(`${name}_job_request.json`, jobRequestJson({
-    name: stem, seed: settings?.seed, entities,
+    name: jobName ?? stem, seed: settings?.seed, entities,
   }));
   files.set(`${name}_model_0.pdb`, pdb);
   // 🔴 AND ONE FILE PER MODEL WHERE FIVE OF THEM FOLDED. "All 5" runs

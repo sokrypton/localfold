@@ -253,6 +253,14 @@ def main():
                         help="hide the tab before reloading, the other save signal")
     parser.add_argument("--session", action="store_true",
                         help="save the session, reload, restore it, read the panels back")
+    parser.add_argument("--job-archive", default="",
+                        help="press Download all and SAVE the zip to this path,"
+                             " so tools/check-job-archive.py can hold it against"
+                             " the input file that produced it. \U0001f534 THE"
+                             " VERIFIER IS A SEPARATE PROCESS ON PURPOSE:"
+                             " --job-round-trip reads the archive back through"
+                             " the same reader that wrote it, so a writer and a"
+                             " reader that share a mistake agree perfectly.")
     parser.add_argument("--download", action="store_true",
                         help="press Download all and report the zip it wrote")
     parser.add_argument("--download-pdb", action="store_true",
@@ -1131,6 +1139,95 @@ def main():
         # read properties of undefined (reading 'length')". The handler catches
         # its own error and writes it to the status line, so a click that
         # produces no blob and a changed status IS the failure.
+        if args.job_archive:
+            blob = cdp.evaluate(ws, """(async () => {
+              const blobs = [];
+              const made = URL.createObjectURL;
+              URL.createObjectURL = (b) => { blobs.push(b); return made.call(URL, b); };
+              document.getElementById('download-all').click();
+              await new Promise((done) => setTimeout(done, 3500));
+              URL.createObjectURL = made;
+              if (blobs[0] === undefined) return '';
+              const bytes = new Uint8Array(await blobs[0].arrayBuffer());
+              let binary = '';
+              for (let at = 0; at < bytes.length; at += 0x8000) {
+                binary += String.fromCharCode.apply(null,
+                  bytes.subarray(at, at + 0x8000));
+              }
+              return btoa(binary);
+            })()""", await_promise=True)
+            if not blob:
+                print("job archive: NO ARCHIVE", file=sys.stderr)
+                return 1
+            with open(args.job_archive, "wb") as handle:
+                handle.write(base64.b64decode(blob))
+            print(f"job archive: {args.job_archive}"
+                  f" ({len(base64.b64decode(blob))} bytes)")
+
+            # 🔴 AND THE NAME MUST GO STALE, which is the whole safety of
+            # carrying it. `setChains` - the alignment-query-wins path - and
+            # `set` both replace rows without notifying any edit hook, so the
+            # page keeps the job's name only while the rows still MATCH what
+            # the job put there. Edited, the request must fall back to the
+            # stem: an archive saying "calmodulin_4calcium" over a sequence
+            # somebody retyped describes a different job under a convincing
+            # name, which is worse than one that names nothing.
+            if args.job:
+                print("stale name:", cdp.evaluate(ws, """(async () => {
+                  const { readZip } = await import('/web/zip.js');
+                  const nameIn = async (blob) => {
+                    const files = await readZip(
+                      new Uint8Array(await blob.arrayBuffer()));
+                    const key = [...files.keys()].find(
+                      (k) => k.endsWith('job_request.json'));
+                    return JSON.parse(files.get(key))[0].name;
+                  };
+                  const grab = async () => {
+                    const blobs = [];
+                    const made = URL.createObjectURL;
+                    URL.createObjectURL = (b) => { blobs.push(b); return made.call(URL, b); };
+                    document.getElementById('download-all').click();
+                    await new Promise((done) => setTimeout(done, 2500));
+                    URL.createObjectURL = made;
+                    return blobs[0] === undefined ? null : nameIn(blobs[0]);
+                  };
+                  const asFolded = await grab();
+                  // 🔴 EDIT AND RE-FOLD, NOT EDIT AND RE-SAVE. The first
+                  // version of this arm edited a row and pressed Download
+                  // again, and read `goesStale: false` as a bug - it is not:
+                  // `archiveFor` reads the name off the PREDICTION, so an
+                  // archive built later for a fold that already happened
+                  // rightly keeps the name that fold ran under. The staleness
+                  // that matters is a SECOND FOLD on rows the job no longer
+                  // describes, which is the only way the name can end up over
+                  // somebody else's chemistry.
+                  const list = window.__entityList;
+                  const rows = list.read();
+                  const at = rows.findIndex((e) => e.type === 'protein');
+                  rows[at] = { ...rows[at], value: rows[at].value + 'GG' };
+                  list.set(rows);
+                  document.getElementById('predict').click();
+                  for (let waited = 0; waited < 120; waited += 1) {
+                    await new Promise((done) => setTimeout(done, 1000));
+                    const said = document.getElementById('status-message')
+                      ?.textContent ?? '';
+                    if (/pLDDT|Error|error/.test(said)) break;
+                  }
+                  const afterRefold = await grab();
+                  return JSON.stringify({
+                    asFolded, afterRefold,
+                    // The job's name on the fold it describes, the stem on the
+                    // one it does not.
+                    goesStale: asFolded === %s && afterRefold !== null
+                               && afterRefold !== asFolded,
+                  });
+                })()""" % json.dumps(
+                    json.loads(open(args.job, encoding="utf-8").read()
+                               ).get("name") if isinstance(json.loads(
+                        open(args.job, encoding="utf-8").read()), dict)
+                    else json.loads(open(args.job, encoding="utf-8").read()
+                                    )[0].get("name")), await_promise=True))
+
         if args.download:
             archive = json.loads(cdp.evaluate(ws, """(async () => {
               // ...the blob is kept and read BACK, because "a zip was written"

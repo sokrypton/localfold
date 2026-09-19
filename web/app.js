@@ -93,6 +93,28 @@ const entityList = createEntityList(
     // page owns the MSA control, so it answers rather than reaching for it.
     msaIsSearch: () => msaMode() === "search" });
 
+/**
+ * The AlphaFold 3 job whose rows are on screen, and the rows it put there.
+ *
+ * 🔴 A NAME IS KEPT BY COMPARISON, NOT BY WATCHING FOR EDITS. The first
+ * version cleared it from `createEntityList`'s `onChange`, which looked right
+ * and was not: `set` and `setChains` both call `render()` and NEITHER
+ * notifies, and `setChains` is the alignment-query-wins path - so uploading an
+ * A3M whose query is a different protein would have replaced every sequence
+ * and kept the name, producing an archive that describes somebody else's fold
+ * under "calmodulin_4calcium". Comparing what the job put in the rows against
+ * what is in them at fold time needs no such promise and cannot be outrun by
+ * the next path that mutates them quietly.
+ */
+let loadedJob;
+
+/** The part of an entity list a job file can describe. */
+const jobShape = (entities) => JSON.stringify((entities ?? []).map((entity) => ({
+  type: entity.type, value: entity.value, copies: entity.copies,
+  modifications: (entity.modifications ?? [])
+    .map((one) => `${one.code}@${one.position}`),
+})));
+
 // 🔴 EXPOSED FOR tools/fold-in-page.py, WHICH HAS NO OTHER WAY IN. The rows are
 // built by entity-ui.js and their model is a closure; a harness that wrote into
 // a row's field would leave that model behind the DOM, and the fold would run
@@ -3257,6 +3279,11 @@ async function fold(event) {
     // here and the structure exists only inside whichever branch runs.
     foldContext = {
       entities,
+      // 🔴 SETTLED HERE WITH EVERYTHING ELSE, and only if the rows are still
+      // the job's. `setChains` may have just replaced every protein row from
+      // an alignment's own query, which is a change no edit hook sees.
+      jobName: loadedJob !== undefined && loadedJob.shape === jobShape(entities)
+        ? loadedJob.name : undefined,
       templates: templateSources,
       msas: archiveMsas(chains, alignment),
       msaOrigin: {
@@ -4032,6 +4059,15 @@ reportModelFromUrl();
  */
 function applyJob(job) {
   entityList.set(job.entities);
+  // 🔴 KEPT SO THE ARCHIVE CAN SAY WHAT THE JOB WAS CALLED. AlphaFold 3's own
+  // examples all carry one - "calmodulin_4calcium", "tetr_dimer_dna" - and the
+  // request this page wrote named the fold instead ("af3_1"), so a job handed
+  // in and saved back came out under a name its author would not recognise.
+  // The file stem stays LocalFold's, because that is what every other member
+  // of the archive is called and renaming those would break the layout the
+  // README describes; this is the `name` FIELD of the request alone.
+  loadedJob = job.name === undefined ? undefined
+    : { name: job.name, shape: jobShape(entityList.read()) };
   const said = [];
   if (job.seed !== undefined) {
     const input = document.getElementById("random-seed");
@@ -4309,6 +4345,11 @@ function archiveFor(pred, { includeAlignment = true } = {}) {
   const holds = includeAlignment && holdsAlignment(pred.msas);
   return buildFoldArchive({
     stem: pred.stem,
+    // 🔴 OFF THE PREDICTION, NOT OFF THE PAGE. The archive can be built long
+    // after the fold - from a restored session, or for an earlier prediction
+    // still in the picker - and reading the live name here would stamp
+    // whatever job is loaded NOW onto a fold that predates it.
+    jobName: pred.jobName,
     model: pred.model ?? "AlphaFold",
     settings: pred.settings,
     entities: pred.entities,

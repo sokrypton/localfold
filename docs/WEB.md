@@ -1599,3 +1599,102 @@ the modified-residue path *resolves the parent through the amino-acid table*, so
 a modified base would be featurised as a modified amino acid and fold to
 something plausible. Making that resolution type-aware is what takes the corpus
 from nine to eleven, and it needs `test:batch` rather than a fold to prove.
+
+## Is what the archive SAVES the job that was handed in? Now checked, and one field was not
+
+"All nine fold" is not "all nine save correctly". The archive is the file a
+reader hands back to reproduce a fold, and the only thing that had ever checked
+it was `fold-in-page.py --job-round-trip` - which reads the archive back through
+`web/job-json.js`, **the module that wrote it**. A writer and a reader that
+share a mistake agree perfectly; that is exactly the shape of the SMILES bug in
+docs/SMILES.md, a benzene written as a CCD code and read back as one,
+round-tripping in silence into cyclohexane.
+
+So `tools/check-job-archive.py` is a separate process that never imports the
+page's reader. It normalises the archive's `_job_request.json` and the
+**original input file** in Python and compares them as meaning rather than text
+- which it has to, because the comparison is cross-dialect: AlphaFold 3's
+examples are the open dialect (`protein: {id: ["A","B"]}`, integer seeds,
+`ccdCodes`, `modificationType`/`basePosition`) and this page writes the server
+one (`proteinChain: {sequence, count}`, string seeds, `ligand`,
+`ptmType`/`ptmPosition`), except a SMILES ligand, which the server dialect
+cannot express and which goes out open.
+
+**Nine of nine match.** Saved with `fold-in-page.py --job-archive=<path>`:
+
+```
+ubiquitin_monomer           tokens  76  chains A          atoms  602  ptm 0.54
+barnase_barstar             tokens 199  chains A,B        atoms 1598  ptm 0.25
+u1a_rna_hairpin             tokens 122  chains A,B        atoms 1256  ptm 0.46
+calmodulin_4calcium         tokens 153  chains A,B,C,D,E  atoms 1178  ptm 0.46
+streptavidin_biotin_smiles  tokens 142  chains A,B        atoms  951  ptm 0.37
+tetr_homodimer              tokens 436  chains A,B        atoms 3442  ptm 0.19
+tetr_dimer_tetracycline     tokens 500  chains A,B,C,D    atoms 3506  ptm 0.19
+erk2_phosphorylated         tokens 385  chains A          atoms 2923  ptm 0.19
+tetr_dimer_dna              tokens 476  chains A,B,C,D    atoms 4264  ptm 0.19
+```
+
+🔴 **AND THE TOKEN COUNTS ARE AlphaFold 3's OWN RULE, CHECKED AGAINST THE SAVED
+PDB'S ATOMS RATHER THAN ASSERTED.** One token per polymer residue, one per atom
+for a ligand or an atomised residue - counted out of each archive's own
+structure file:
+
+| | polymer | hetero atoms in the PDB | tokens |
+|---|---:|---|---:|
+| calmodulin_4calcium | 149 | `CA` x 4 | 149 + 4 = **153** |
+| streptavidin_biotin_smiles | 126 | `LIG` 16 (biotin, built from SMILES) | 126 + 16 = **142** |
+| tetr_dimer_tetracycline | 436 | `TAC` 64 (2 x 32) | 436 + 64 = **500** |
+| erk2_phosphorylated | 360 | `TPO` 11 + `PTR` 16 | 360 - 2 + 27 = **385** |
+| tetr_dimer_dna | 436 | none (DNA is one token a base) | 436 + 40 = **476** |
+| u1a_rna_hairpin | 101 | none | 101 + 21 = **122** |
+
+Beside the request, the verifier holds the rest of the save to the fold: `pae`
+and `contact_probs` square at the token count and in range (a decode with the
+wrong bounds fills the key with plausible nonsense), `token_chain_ids` and
+`token_res_ids` as long as those matrices, **`atom_plddts` one per ATOM/HETATM
+record in the PDB** - the one cross-file check, and the one that would catch a
+ligand counted in one file and not the other - and every ligand code and
+modified-residue code actually present in the structure, which no confidence
+number can see.
+
+### 🔴 The one field that was wrong: the job's own name
+
+Every AlphaFold 3 example carries a `name`, `jobFromJson` reads it, `applyJob`
+**threw it away**, and `buildFoldArchive` wrote the fold's stem in its place. So
+`calmodulin_4calcium.json` came back out of the page as a job called `af3_1`:
+the same chemistry under an identity its author would not recognise. Nothing
+could have caught it - `--job-round-trip` compares entity lists, and a name is
+not an entity.
+
+The name now reaches the request, and **only the request**: the file stem stays
+LocalFold's, because every other member is named from it and the README
+describes that layout.
+
+🔴 **AND THE HARD PART IS MAKING IT GO STALE, WHICH THE FIRST TWO ATTEMPTS GOT
+WRONG IN OPPOSITE DIRECTIONS.** A name kept over rows somebody has since edited
+is worse than no name at all - it describes a different job convincingly.
+
+- **Attempt one** cleared it from `createEntityList`'s `onChange`. That looked
+  right and was not: `set` and `setChains` both call `render()` and **neither
+  notifies**, and `setChains` is the alignment-query-wins path - so uploading an
+  A3M whose query is a different protein would have replaced every sequence and
+  kept the name. It is a **comparison** now: `applyJob` records the shape of the
+  rows it created, and the name travels only while the rows still match. That
+  needs no promise about which mutation paths notify, and cannot be outrun by
+  the next one that does not.
+- **Attempt two** was the probe. It edited a row, pressed Download again and
+  read `goesStale: false` as a bug. It is not: `archiveFor` reads the name off
+  the **prediction**, so an archive built later for a fold that already happened
+  rightly keeps the name that fold ran under. The staleness that matters is a
+  **second fold** on rows the job no longer describes. Re-folding gives
+  `{"asFolded": "calmodulin_4calcium", "afterRefold": "af3_2", "goesStale": true}`.
+
+Gated three ways: `test/fold-archive.test.js` pins the carry, the fallback and
+that the members are *not* renamed (watched failing by restoring `name: stem`);
+`--job-archive` prints the stale-name arm; and `check-job-archive.py` asserts
+the name, which reports every archive written before this as
+`name 'af3_1' saved, 'calmodulin_4calcium' asked`.
+
+**What is still dropped, deliberately:** the `description` strings inside a
+chain body. They are free text about the job rather than part of it, nothing in
+the fold reads them, and the server dialect has no field for one.

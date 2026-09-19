@@ -505,3 +505,45 @@ describe("where a fold's contact map lives", () => {
     }
   });
 });
+
+/**
+ * 🔴 THE JOB'S NAME IS PART OF WHAT WAS HANDED IN, AND IT WAS BEING OVERWRITTEN.
+ * Every one of AlphaFold 3's example files carries one and this archive wrote
+ * the fold's stem over it, so `calmodulin_4calcium.json` came back out of the
+ * page called `af3_1`. The chemistry round-tripped perfectly, which is exactly
+ * why nothing caught it: `--job-round-trip` compares entity lists and a name is
+ * not an entity.
+ */
+describe("the request's name", () => {
+  const entities = [{ type: "protein", value: "ACDEFGHIK", copies: 1,
+                      modifications: [] }];
+  const request = (extra) => JSON.parse(buildFoldArchive({
+    stem: "af3_1", model: "AlphaFold 3", settings: { seed: 7 }, entities,
+    prediction: prediction(), ...extra,
+  }).get("af3_1_job_request.json"))[0];
+
+  it("is the job's own when the rows came from a job", () => {
+    expect(request({ jobName: "calmodulin_4calcium" }).name)
+      .toBe("calmodulin_4calcium");
+  });
+
+  it("falls back to the stem when nothing named the job", () => {
+    expect(request({}).name).toBe("af3_1");
+  });
+
+  /**
+   * 🔴 AND THE STEM STILL NAMES THE FILES. Renaming those would break the
+   * layout the README describes and the `_model_0.pdb` / `_scores.json` pairing
+   * every reader of this archive relies on - so the name reaches the request
+   * and nothing else.
+   */
+  it("does not rename the members", () => {
+    const files = buildFoldArchive({
+      stem: "af3_1", model: "AlphaFold 3", settings: { seed: 7 }, entities,
+      prediction: prediction(), jobName: "calmodulin_4calcium",
+    });
+    expect([...files.keys()].some((name) => name.includes("calmodulin")))
+      .toBe(false);
+    expect(files.has("af3_1_job_request.json")).toBe(true);
+  });
+});
