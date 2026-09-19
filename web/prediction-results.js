@@ -133,7 +133,49 @@ export function recyclesToPdb(sequence, recycles, chainLengths = undefined) {
  * Absent a batch (AlphaFold 2, ESMFold2 without modifications) there is
  * nothing to collapse and the caller passes none: tokens are residues there.
  */
-const RESIDUE_ANCHORS = ["CA", "C1'"];
+// 🔴 WHAT MAKES A RESIDUE ONE POSITION IS THE PARSER'S OWN TEST, AND IT IS
+// NOT "has a name": py2Dmol keeps a residue whole when it carries a backbone
+// - N and CA and C for a protein, C4' and O4' and C1' for a nucleotide - and
+// draws it at that backbone's atom (the CA, or the C4'). Anything else is a
+// LIGAND to it, and a ligand is one position per heavy atom.
+//
+// Measured in the viewer, three modifications inside a six-residue chain:
+// SEP with a full backbone is ONE position of type P; a bare phosphate
+// (P, O1P, O2P, O3P) is FOUR positions of type L; a modified nucleotide
+// carrying a ribose is ONE position of type R. So a rule that collapsed
+// every modified span would be wrong by three on the second of those - the
+// same fault as the one this exists to fix, pointing the other way.
+//
+// What it assumes is that the modification is ATTACHED: the parser also
+// requires the residue to be within bonding distance of its neighbours, and
+// a fold that flung it off the chain would be drawn as a ligand while this
+// still collapsed it. That is a broken fold rather than a shape this can
+// serve, and tools/gpu/probe-modified.js is what measures it.
+const BACKBONES = [
+    { needs: ["N", "CA", "C"], drawnAt: "CA" },
+    { needs: ["C4'", "O4'", "C1'"], drawnAt: "C4'" },
+];
+
+/**
+ * WHICH TOKENS THE VIEWER DRAWS, one per position it makes - and the whole
+ * reason the two index spaces are not the same one.
+ *
+ * 🔴 A MODIFIED RESIDUE IS ONE POSITION AND SEVERAL TOKENS. Every family but
+ * boltz2 ATOMISES one: a phosphoserine is ten tokens carrying one atom each,
+ * and py2Dmol draws it as ONE residue. Measured on a twelve-residue chain
+ * with SEP at position 3: AF3 says 21 tokens, the viewer says 12 positions -
+ * so every residue after the modification was reading somebody else's row,
+ * and nine rows addressed nothing at all. Reported as the PAE being arranged
+ * wrongly on a fold with a modified amino acid.
+ *
+ * 🔴 AND A LIGAND IS THE OPPOSITE, WHICH IS WHY THIS IS NOT A RESIDUE MAP.
+ * A ligand's heavy atoms are one token each AND one position each - the
+ * parser has no backbone to collapse them onto - so they pass through
+ * untouched, and so does a modification that carries no backbone either.
+ *
+ * Absent a batch (AlphaFold 2, ESMFold2 without modifications) there is
+ * nothing to collapse and the caller passes none: tokens are residues there.
+ */
 export function viewerTokens(batch) {
     const tokens = batch?.tokens ?? 0;
     if (!(tokens > 0)) return [];
@@ -141,12 +183,10 @@ export function viewerTokens(batch) {
     for (const span of batch.modifiedSpans ?? []) {
         if (!(span.count > 1)) continue;  // boltz2 keeps it in one token already
         const names = (span.atoms ?? []).map((atom) => atom.name);
-        let at = -1;
-        for (const anchor of RESIDUE_ANCHORS) {
-            at = names.indexOf(anchor);
-            if (at >= 0) break;
-        }
-        const keeps = span.from + (at >= 0 ? at : 0);
+        const backbone = BACKBONES.find(
+            (kind) => kind.needs.every((name) => names.indexOf(name) >= 0));
+        if (backbone === undefined) continue;   // the viewer draws these as atoms
+        const keeps = span.from + names.indexOf(backbone.drawnAt);
         for (let offset = 0; offset < span.count; offset += 1) {
             collapsed.set(span.from + offset, keeps);
         }
@@ -168,16 +208,25 @@ export function viewerTokens(batch) {
  * atom that nothing draws until it is asked for. So the page asks, for these
  * residues and no others: `showSidechains` takes a selector, and this is the
  * `positions` for it.
+ *
+ * A modification the viewer draws as ATOMS rather than as a residue (see
+ * BACKBONES) is left out: its atoms are already on screen, and there is no
+ * side chain to ask for.
  */
 export function modifiedPositions(batch, keep) {
     const at = new Map();
     for (let position = 0; position < keep.length; position += 1) at.set(keep[position], position);
     const positions = [];
     for (const span of batch?.modifiedSpans ?? []) {
+        // ...the one token of it the viewer kept, which exists only where the
+        // span collapsed; a span drawn as atoms has ALL of its tokens here and
+        // is not a side chain to show.
+        const kept = [];
         for (let offset = 0; offset < span.count; offset += 1) {
             const position = at.get(span.from + offset);
-            if (position !== undefined) { positions.push(position); break; }
+            if (position !== undefined) kept.push(position);
         }
+        if (kept.length === 1) positions.push(kept[0]);
     }
     return positions;
 }

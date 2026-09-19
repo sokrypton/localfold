@@ -224,6 +224,34 @@ describe("a token matrix in the viewer's index space", () => {
     expect(() => matrixForViewer(values, [0, 1, 2, 9])).toThrow();
   });
 
+  it("does NOT collapse a modification the viewer draws as atoms", () => {
+    // 🔴 THE HOLE THE FIRST VERSION HAD. A bare phosphate hung on a chain has
+    // no backbone, so py2Dmol classifies it as a LIGAND and makes one position
+    // per atom - measured, four positions of type L inside a six-residue
+    // chain. Collapsing it would be the same misalignment this file exists to
+    // fix, three columns the other way.
+    const atoms = ["P", "O1P", "O2P", "O3P"].map((name) => ({ name }));
+    const batch = { tokens: 9, modifiedSpans: [
+      { from: 2, count: 4, code: "PO4", residue: 2, atoms }] };
+    expect(viewerTokens(batch).length).toBe(9);
+    // ...and nothing to show a side chain for, because its atoms are drawn
+    expect(modifiedPositions(batch, viewerTokens(batch))).toEqual([]);
+  });
+
+  it("draws a modified nucleotide at its C4', which is where the viewer draws it", () => {
+    // The parser's nucleic test is C4' + O4' + C1' and the position it keeps
+    // is the C4' - the same atom its chain-break rule measures. Measured: a
+    // ribose-carrying modification is ONE position of type R.
+    const names = ["P", "O5'", "C5'", "C4'", "O4'", "C3'", "C1'", "N1"];
+    const batch = { tokens: 13, modifiedSpans: [
+      { from: 2, count: names.length, code: "5MC", residue: 2,
+        atoms: names.map((name) => ({ name })) }] };
+    const keep = viewerTokens(batch);
+    expect(keep.length).toBe(6);
+    // token 2 + the index of C4' in the span
+    expect(keep[2]).toBe(2 + names.indexOf("C4'"));
+  });
+
   it("names the modified residues as viewer positions", () => {
     const batch = chainWithSep();
     const keep = viewerTokens(batch);

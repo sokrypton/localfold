@@ -1434,7 +1434,10 @@ function contactMapFor(contactProbs, keep = undefined) {
   // several TOKENS and one POSITION, so a fold carrying one hands the panel a
   // matrix wider than the structure beside it unless it is collapsed. See
   // viewerTokens; with nothing to collapse this is exactly what it was.
-  const rows = keep === undefined || keep.length === n
+  // ...and only where it is WIDER. A matrix narrower than the positions is
+  // not a token space this can read, and collapsing it would throw rather
+  // than say so: it passes through, as it did before there was a map at all.
+  const rows = keep === undefined || keep.length >= n
     ? undefined : matrixForViewer(contactProbs, keep);
   const width = rows === undefined ? n : rows.length;
   const data = new Uint8Array(width * width);
@@ -1505,10 +1508,15 @@ function contactsBig(on) {
  * does not have to undo the first - the viewer is given a new object either
  * way.
  */
-function showModifiedSidechains(renderer, positions) {
+function showModifiedSidechains(renderer, object, positions) {
   if (!(positions?.length > 0) || typeof renderer?.showSidechains !== "function") return;
   try {
-    renderer.showSidechains({ positions });
+    // 🔴 NAMED WITH ITS OBJECT, because `positions` are indices into what is
+    // DRAWN. With two folds merged (the Multi button, a restored session)
+    // that array is both of them and residue 3 of this fold is residue 3 of
+    // the first one - py2Dmol offsets them through `localRangeOf` when the
+    // object is named, and answers the identity when nothing is merged.
+    renderer.showSidechains({ object, positions });
   } catch (cause) {
     console.warn("could not draw the modified residues' side chains", cause);
   }
@@ -2249,10 +2257,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // positions, so the matrix was nine rows too wide and everything after the
   // modification addressed the wrong residue. viewerTokens is the map and
   // these two are the only places that need to know.
-  const paeForViewer = (values, keep) => (keep === undefined || keep.length === paeSize(values)
-    ? paeMatrix(values, paeSize(values)) : matrixForViewer(values, keep));
-  const viewerWidth = (values, keep) => (keep === undefined ? paeSize(values)
-    : Math.min(keep.length, paeSize(values)));
+  const collapses = (values, keep) => keep !== undefined && keep.length < paeSize(values);
+  const paeForViewer = (values, keep) => (collapses(values, keep)
+    ? matrixForViewer(values, keep) : paeMatrix(values, paeSize(values)));
+  const viewerWidth = (values, keep) => (collapses(values, keep)
+    ? keep.length : paeSize(values));
   // 🔴 ONLY WHEN THERE IS A POLYMER TO CHECK. A ligand-only fold has no
   // sequence, and af3SequenceProblem reports an empty one as "Paste a protein
   // sequence first" - which is the right message for an empty box and the wrong
@@ -2684,7 +2693,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     const object = viewer.objects?.find((entry) => entry.name === viewerObject);
     if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
     forcePlddtColours(scored);
-    showModifiedSidechains(viewer, viewerModified);
+    showModifiedSidechains(viewer, viewerObject, viewerModified);
     viewer.render("af3-final");
   }
   updateScoresCard(result.confidence);
