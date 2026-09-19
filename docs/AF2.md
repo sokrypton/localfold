@@ -3477,3 +3477,58 @@ optimisation - and `QueryOnlyTemplateGpu.warm` is kept as a documented static
 with the 14.3 ms beside it, so the next reader of that 180 ms does not spend the
 afternoon the same way.
 
+### The recycle that never stops: the page could not express the reference's own convergence
+
+Seven rounds inside the kernels found nothing; this is one level up and it is
+the first thing all day that makes a fold shorter.
+
+**AlphaFold stops recycling when the structure stops moving, and this page never
+did.** The driver has taken a tolerance since it was written -
+`shouldStopAfterRecycle` compares consecutive passes' alpha carbons - and
+`recycleTolerance()` in web/app.js read a `#tolerance` element **that does not
+exist in index.html**, so it returned 0 for every fold ever run here. No tool
+passed one either: `fold-af2.js` had no `--tolerance` flag, so the arm that
+decides whether a fold needs its last recycle had never been exercised at all.
+
+🔴 **AND 0 IS THE REFERENCE'S ANSWER FOR ONE OF OUR TWO MODELS, NOT BOTH.**
+AlphaFold's own `model/config.py`, as vendored by ColabFold 2.3.13:
+`CONFIG` (monomer) carries `recycle_early_stop_tolerance: 0.0` and
+`CONFIG_MULTIMER` carries **0.5**, with `num_recycle: 20`. ColabFold's
+`--recycle-early-stop-tolerance` defaults to `None`, which leaves whichever the
+checkpoint names. So running 0 everywhere was right for the monomer and a
+DEVIATION for the multimer, of exactly the kind this port takes off the
+checkpoint everywhere else.
+
+Measured with the new `--tolerance`, stock flags, 4 passes requested:
+
+| fold | tolerance | passes | wall | pLDDT |
+|---|---|---:|---:|---:|
+| 59-mer, its own 8076-row alignment | 0 | 4/4 | 1424 ms | 96.565 |
+| | 0.1 | 3/4 | 1198 | 96.564 |
+| | **0.5** | **2/4** | **956 (-33%)** | 96.666 |
+| | 1.0 | 2/4 | 960 | 96.666 |
+| 5CAJ chain A, 255 res, SINGLE SEQUENCE | 0 | 4/4 | 3427 | 33.671 |
+| | 0.5 | 4/4 | 3426 | 33.671 |
+| multimer 30,29, synthetic alignment | 0 | 4/4 | 1591 | 51.216 |
+| | 0.5 | 4/4 | 1398 | 51.216 |
+
+**A third off a converged fold, and nothing at all off one that has not
+settled** - which is the behaviour the criterion promises: the stop fires only
+when consecutive passes agree to within the tolerance, so the structure it keeps
+is within that distance of the one the next pass would have produced. The two
+folds here that do not converge run every pass and return the identical
+checksum.
+
+**What ships**: a `Stop early` control beside Recycles, for AlphaFold 2 only
+(the tolerance has one reader and it is in the AF2 branch), with `reference`
+selected - which resolves to the checkpoint's own value, **0.5 for the multimer
+graph and 0 for the monomer** - plus `never`, `0.1` and `0.5`. The archive
+records the RESOLVED number rather than the word, because "reference" does not
+say what ran. `mobile-layout.py` passes with the row one control wider.
+
+🔴 **AND NO CRYSTAL HERE CAN SCORE THE CONVERGED CASE.** The only deep alignment
+in the repository (`tools/fixtures/test.a3m`) is the 59-mer's, and no fixture
+crystal is 59 residues, so the table above has pLDDT and no RMSD. The bound is
+the criterion itself rather than a measurement, and a target with both an
+alignment and a structure would settle what a third of the passes is worth.
+

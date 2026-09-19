@@ -202,6 +202,13 @@ export async function main(device, args) {
   // anywhere until it is measured here. Monomer graph.
   const halfPair = option(args, "pair-f16", null) !== null;
   const recycles = Number(option(args, "recycles", "0"));
+  // 🔴 THE CONVERGENCE STOP, WHICH NOTHING HERE HAD EVER EXERCISED. The driver
+  // has taken a tolerance since it was written - `shouldStopAfterRecycle`
+  // compares consecutive passes' alpha carbons and stops when they move less
+  // than this many angstroms - and no tool passed one, so the arm that decides
+  // whether a fold needs its last recycle had never been run. ColabFold ships
+  // the same idea as `--recycle-early-stop-tolerance`. 0 keeps every pass.
+  const tolerance = Number(option(args, "tolerance", "0"));
   const seed = Number(option(args, "seed", "0"));
   // 🔴 `--tune=key=value,...`, THE SAME FLAG tools/gpu/fold.js CARRIES, because
   // AF2 had no way to reach a tuning knob at all - and CLAUDE.md's rule is that
@@ -441,6 +448,7 @@ export async function main(device, args) {
     .predictA3m(
       a3m, weights, featureTables,
       { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows, hostFeaturisation,
+        tolerance,
         template: templateSlot,
         // ...the arm for measuring what deduplication is worth; see
         // planA3mFeatures. Default on, matching AlphaFold's make_msa_features.
@@ -563,6 +571,10 @@ export async function main(device, args) {
     family: graph === family ? family : `${family} (${graph} graph)`,
     chains, length, rows, extraRows, recycles, seed,
     weightLoadMs: loadMs, elapsedMilliseconds: elapsed, repeats,
+    // ...and how many of the requested passes actually ran, which is the whole
+    // point of a tolerance and is otherwise invisible.
+    passesRun: prediction.recycles.length,
+    tolerance,
     // Where "features" in the phase table actually goes; see featureStats.
     featureMilliseconds: Object.fromEntries(Object.entries(featureStats)
       .map(([key, value]) => [key, key === "calls" ? value : Math.round(value)])),

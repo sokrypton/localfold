@@ -114,7 +114,25 @@ const recycleCount = () => Number(element("recycles").value) || 0;
 // stopping still works; nothing on the page sets it any more, so every fold
 // runs the passes it was asked for. element() throws on a missing id, which is
 // why this reads the DOM defensively rather than assuming the control is there.
-const recycleTolerance = () => Number(document.getElementById("tolerance")?.value) || 0;
+/**
+ * How far consecutive passes may move before the fold stops recycling.
+ *
+ * 🔴 `reference` IS A REAL ANSWER AND IT DIFFERS BY MODEL. AlphaFold's own
+ * config carries `recycle_early_stop_tolerance` - **0.0 in `CONFIG` and 0.5 in
+ * `CONFIG_MULTIMER`** (alphafold/model/config.py) - and ColabFold's
+ * `--recycle-early-stop-tolerance` defaults to None, which leaves whichever the
+ * checkpoint names. This page read a `#tolerance` element that did not exist,
+ * so it ran every recycle for both, which is right for the monomer and is a
+ * deviation for the multimer.
+ *
+ * ...and it is the GRAPH's value, not the family's, because models 2 to 5 of
+ * the multimer are model_1's graph. See graphFamily.
+ */
+const recycleTolerance = () => {
+  const chosen = document.getElementById("tolerance")?.value ?? "reference";
+  if (chosen !== "reference") return Number(chosen) || 0;
+  return graphOf(chosenFamily()) === "multimer" ? 0.5 : 0;
+};
 const randomSeed = () => {
   const input = document.getElementById("random-seed");
   if (input === null || input.value === "") return 0;
@@ -1759,9 +1777,16 @@ function syncModelControls() {
   // into it, so asking the resolved one whether to show the control that
   // produced it is circular.
   const af2Node = document.getElementById("af2ModelGroup");
+  const af2Row = document.getElementById("model-family")?.value ?? "";
   if (af2Node !== null) {
-    const row = document.getElementById("model-family")?.value ?? "";
-    af2Node.hidden = row !== "monomer" && row !== "multimer";
+    af2Node.hidden = af2Row !== "monomer" && af2Row !== "multimer";
+  }
+  // ...and the convergence stop, which only AlphaFold 2's drivers read. AF3's
+  // recycles run to the count they are given; `recycleTolerance` has one caller
+  // and it is in the AF2 branch.
+  const toleranceNode = document.getElementById("toleranceGroup");
+  if (toleranceNode !== null) {
+    toleranceNode.hidden = af2Row !== "monomer" && af2Row !== "multimer";
   }
   // 🔴 THE SAMPLER ROW IS SHARED, BECAUSE IT IS THE SAME QUESTION. ESMFold2's
   // structure head is an EDM sampler with a churn factor, exactly as AF3's is,
@@ -3243,6 +3268,10 @@ async function fold(event) {
       settings: {
         seed: randomSeed(),
         recycles: recycleCount(),
+        // ...the resolved number, not the word: an archive saying "reference"
+        // would not say what ran, and the reference's own answer depends on
+        // which model it was.
+        "stop early": recycleTolerance(),
         "max msa": maxMsaConfig().requested,
       },
     };
