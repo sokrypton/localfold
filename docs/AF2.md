@@ -3394,3 +3394,42 @@ threw before and folds now (checksum -1308439 -> -1313808, pLDDT 62.924 ->
 visible and tiny), and `audit-knobs.py` will report it as a knob that moves
 shaders instead of as a declared no-op.
 
+### ...and the projection, where the standalone bench names the wrong tile by 1.8x
+
+Same method as the flash kernel, on the second-largest family. Under stock
+flags, `bench-evoformer-linear.js` on the transition's own two shapes, against
+this card's 7158 scalar / 28633 vec4:
+
+| arm | tile | GFLOP/s (first / second) |
+|---|---|---:|
+| **8x8** | 64x64 | **12798 / 11518** |
+| 8x4 | 64x32 | 11518 / 10471 |
+| 12x8 | 96x64 | 11518 / 9599 |
+| 16x8 | 128x64 - `LINEAR_TILE_TALL`, what the prior picks | 9599 / 8281 |
+| 4x4 | 32x32 - `LINEAR_TILE`, the default | 8923 / 8923 |
+| legacy | 16x64 | 5812 / 5812 |
+
+So the projection reaches **45% of the vec4 ceiling** at its best arm against
+the flash kernel's 27% - and the three tiles `chooseLinearTile` can return are
+the three slowest rows. A 1.33x on 11-12% of a block looked like the first
+positive of the day.
+
+🔴 **IN THE BLOCK IT IS 1.8x SLOWER, AND THAT IS THE FINDING.** Added as
+`LINEAR_TILE_SQUARE` behind `linearSquareTile` and swept where it actually runs:
+
+| | block 150 | block 400 | block 825 | `msa-transition.first` |
+|---|---:|---:|---:|---|
+| tall (shipped) | **10.43** | **51.71** | **216.67** | 0.786 / 1.901 |
+| square 64x64 | 11.94 | 57.28 | 234.49 | 1.442 / 3.670 |
+
+In a block the transition runs CHUNKED against a device that is also holding
+the rest of the block, and 64 accumulators a lane spends exactly the occupancy
+that pays for. The fold is bit-identical either way - a tile reorders no sum -
+so this is purely a scheduling answer. docs/AF2.md already carried this shape
+once for `stagedMatrixBlock` ("the block that won the standalone GEMM bench is
+16% off in the trunk"); here it is 1.8x. **A tile is chosen in the stack it runs
+in**, and a bench that exists to choose tiles can still name the wrong one.
+
+The knob stays, default off, with both tables beside it, so that the next person
+to bench this kernel standalone does not rediscover 8x8 and ship it.
+

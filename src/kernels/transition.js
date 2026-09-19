@@ -54,6 +54,55 @@ export const LINEAR_TILE_TALL = Object.freeze({
   lanesX: 16, lanesY: 16, rowsPerLane: 8, columnsPerLane: 4,
 });
 
+/**
+ * 64 rows by 64 columns on 64 lanes - the fastest arm this card measures, and
+ * one the chooser could not reach.
+ *
+ * 🔴 FOUND BY BENCHING THE KERNEL AGAINST THE MACHINE RATHER THAN AGAINST ITS
+ * OWN PAST. `bench-evoformer-linear.js` under stock flags, the configuration a
+ * visitor gets, on the transition's own two shapes:
+ *
+ *     8x8  (64x64, this)   12798 GFLOP/s / 11518      1.238 ms / 1.375
+ *     8x4  (64x32)         11518        / 10471       1.375   / 1.512
+ *     12x8 (96x64)         11518        /  9599       1.375   / 1.650
+ *     16x8 (128x64, TALL)   9599        /  8281       1.650   / 1.912
+ *     4x4  (32x32, the default)  8923   /  8923       1.775   / 1.775
+ *     legacy (16x64)        5812        /  5812       2.725   / 2.725
+ *
+ * The three tiles `chooseLinearTile` could return are the last three rows. The
+ * card's own ceilings are 7158 GFLOP/s scalar f32 and 28633 vec4
+ * (`probe-alu.js`), so the shipped tall tile runs at 34% of vec4 and this one
+ * at 45%.
+ *
+ * 🔴 AND IT IS 64 ACCUMULATORS A LANE, WHICH IS WHY IT IS A KNOB. The tall tile
+ * exists because 64 invocations is two warps of a machine that wants far more
+ * in flight; this one keeps the 64-lane workgroup and doubles what each lane
+ * holds instead, which is the opposite trade and costs registers. An M2 has not
+ * measured it.
+ *
+ * 🔴 AND IN A BLOCK IT LOSES, WHICH IS THE WHOLE POINT OF THIS NOTE. Every
+ * number above is a standalone dispatch of one big shape. Swept inside a real
+ * evoformer block (`profile-af2-block.js --sweep=linearSquareTile=false,true`,
+ * stock flags, interleaved):
+ *
+ *     length 150   block 10.43 -> 11.94 ms    msa-transition.first 0.786 -> 1.442
+ *     length 400   block 51.71 -> 57.28       msa-transition.first 1.901 -> 3.670
+ *     length 825   block 216.67 -> 234.49
+ *
+ * The kernel is nearly 2x SLOWER there where the bench says 1.33x faster,
+ * because in a block the transition runs CHUNKED against a device that is also
+ * holding the rest of the block, and 64 accumulators a lane spends the
+ * occupancy that pays for. docs/AF2.md already records this shape once
+ * (`stagedMatrixBlock`: "the block that won the standalone GEMM bench is 16%
+ * off in the trunk"); this is the same lesson at 1.8x. **A tile is chosen in
+ * the stack it runs in.** The knob stays for the next device, default off, and
+ * the fold is bit-identical either way (checksum -1308439) because a tile
+ * reorders no sum.
+ */
+export const LINEAR_TILE_SQUARE = Object.freeze({
+  lanesX: 8, lanesY: 8, rowsPerLane: 8, columnsPerLane: 8,
+});
+
 export const linearTileRows = (tile = LINEAR_TILE) => tile.lanesY * tile.rowsPerLane;
 export const linearTileColumns = (tile = LINEAR_TILE) => tile.lanesX * tile.columnsPerLane;
 
@@ -78,6 +127,12 @@ export function chooseLinearTile({ rows, columns, device = undefined }) {
   const wide = Math.ceil(rows / linearTileRows(LINEAR_TILE_WIDE))
     * Math.ceil(columns / linearTileColumns(LINEAR_TILE_WIDE));
   if (wide < 512) return LINEAR_TILE;
+  // ...and the square tile before either, where a device asks for it: same
+  // workgroup as the default, four times the accumulators, and the fastest arm
+  // measured on this card. See LINEAR_TILE_SQUARE.
+  if (device !== undefined && deviceTuning(device).linearSquareTile === true) {
+    return LINEAR_TILE_SQUARE;
+  }
   // The tall tile answers the same question the wide one does - what to do
   // when the device is full - and answers it for a device with far more of it.
   return device !== undefined && deviceTuning(device).linearTallTile

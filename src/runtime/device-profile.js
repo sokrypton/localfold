@@ -139,6 +139,13 @@ export const DEFAULT_TUNING = Object.freeze({
   // residues. Fusing the two removes the tensor and a dispatch. Off until it
   // is measured on this card; see createFusedPairBiasShader, and docs/AF2.md
   // for what it is worth.
+  // 🔴 THE 64x64 LINEAR TILE, WHICH THE CHOOSER COULD NOT REACH. Measured on
+  // this card under stock flags it is the fastest arm of eight - 12798 GFLOP/s
+  // against the tall tile's 9599 - and the three tiles chooseLinearTile could
+  // return are the three slowest. Off until it is measured IN A BLOCK, because
+  // a standalone GEMM bench has named the wrong tile here before (see
+  // stagedMatrixBlock, 16% off in the trunk). See LINEAR_TILE_SQUARE.
+  linearSquareTile: false,
   fusedPairBias: false,
   // 🔴 THE FLASH KERNEL'S KEY CHUNK, WHICH WAS A FORMULA AND NEVER A SWEEP.
   // `max(8, floor(512 / (vectors * 2)))` gives 64 keys where the operands are
