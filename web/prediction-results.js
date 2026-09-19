@@ -106,6 +106,62 @@ export function recyclesToPdb(sequence, recycles, chainLengths = undefined) {
 }
 
 /**
+ * The trunk's contact map, as the heatmap panel's byte format.
+ *
+ * 🔴 IT IS A RESHAPE, NOT A COMPUTATION. The distogram head already sums its
+ * bins up to 8 A into P(d <= 8 A) for every pair and the result is already
+ * read back to the host, so this costs one pass over tokens^2 bytes and no
+ * GPU work at all.
+ *
+ * 🔴 AND IT NEEDS NO COLOURS OR BOUNDS FROM HERE. `contact` is a scale the
+ * panel knows - 0 to 1, white to a dark blue - and a map that states its own
+ * would override exactly the thing that makes it read correctly: white is
+ * zero and the ink is the signal, which is the opposite of PAE's reading.
+ * `vmin` and `vmax` are given because the BYTES are encoded against them and
+ * a map that does not say so is trusting two tables to agree.
+ *
+ * 🔴 IT GOES ON FRAME 0, NOT THE LAST ONE. The panel resolves each map by
+ * searching BACKWARD from the frame being drawn, and the contact map is a
+ * property of the trunk rather than of any sampler step - fixed for the whole
+ * fold - so one copy at the start is on screen for every frame. The PAE stays
+ * where it is, on the final frame, because it only exists there.
+ *
+ * 🔴 AND THE SECOND ARGUMENT IS NOT OPTIONAL, because the call that forgot it
+ * is the whole reason this moved here. There are four of these - two on the
+ * AF3 path, one on AF2's distogram, one on ESMFold2's - and exactly ONE is
+ * reached by a fold carrying a modified residue. That one did not collapse,
+ * and the symptom was a **13-wide PAE beside a 22-wide contact map**, measured
+ * on a real fold of GWSTELEKHRSVQ + SEP@3. A default of `undefined` made the
+ * omission silent; asking for the argument makes a new call site state which
+ * space it is in, and a path with nothing to collapse says so by passing
+ * `undefined`.
+ */
+export function contactMapFor(contactProbs, keep) {
+    if (arguments.length < 2) {
+        throw new TypeError("contactMapFor needs the viewer's tokens (or an explicit"
+            + " undefined): a token matrix and a residue picture are not the same width");
+    }
+    const n = Math.round(Math.sqrt(contactProbs.length));
+    if (n * n !== contactProbs.length) return undefined;
+    // 🔴 IN THE VIEWER'S INDEX SPACE, NOT THE MODEL'S. A modified residue is
+    // several TOKENS and one POSITION, so a fold carrying one hands the panel
+    // a matrix wider than the structure beside it unless it is collapsed - and
+    // only where it is WIDER: a matrix narrower than the positions is not a
+    // token space this can read, and it passes through as it always did.
+    const rows = keep === undefined || keep.length >= n
+        ? undefined : matrixForViewer(contactProbs, keep);
+    const width = rows === undefined ? n : rows.length;
+    const data = new Uint8Array(width * width);
+    for (let index = 0; index < data.length; index += 1) {
+        const value = rows === undefined
+            ? contactProbs[index]
+            : rows[Math.floor(index / width)][index % width];
+        data[index] = Math.max(0, Math.min(255, Math.round(value * 255)));
+    }
+    return { data, n: width, vmin: 0, vmax: 1 };
+}
+
+/**
  * WHICH TOKENS THE VIEWER DRAWS, one per position it makes - and the whole
  * reason the two index spaces are not the same one.
  *

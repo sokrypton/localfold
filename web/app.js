@@ -55,8 +55,8 @@ import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
-import { CHAIN_IDS, confidenceJson, matrixForViewer, modifiedPositions, paeMatrix,
-  predictionToPdb, safeJobName, viewerTokens } from "./prediction-results.js";
+import { CHAIN_IDS, confidenceJson, contactMapFor, matrixForViewer, modifiedPositions,
+  paeMatrix, predictionToPdb, safeJobName, viewerTokens } from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
 // 🔴 SHARED WITH proteinhunter.html, which shows the same card against its
 // own play bar. See web/scores-card.js.
@@ -1392,27 +1392,6 @@ setInterval(() => {
 }, 50);
 
 /**
- * The trunk's contact map, as the heatmap panel's byte format.
- *
- * 🔴 IT IS A RESHAPE, NOT A COMPUTATION. The distogram head already sums its
- * bins up to 8 A into P(d <= 8 A) for every pair and the result is already read
- * back to the host, so this costs one pass over tokens^2 bytes and no GPU work
- * at all.
- *
- * 🔴 AND IT NEEDS NO COLOURS OR BOUNDS FROM HERE. `contact` is a scale the
- * panel knows - 0 to 1, white to a dark blue - and a map that states its own
- * would override exactly the thing that makes it read correctly: white is zero
- * and the ink is the signal, which is the opposite of PAE's reading. `vmin`
- * and `vmax` are given because the BYTES are encoded against them and a map
- * that does not say so is trusting two tables to agree.
- *
- * 🔴 IT GOES ON FRAME 0, NOT THE LAST ONE. The panel resolves each map by
- * searching BACKWARD from the frame being drawn, and the contact map is a
- * property of the trunk rather than of any sampler step - fixed for the whole
- * fold - so one copy at the start is on screen for every frame. The PAE stays
- * where it is, on the final frame, because it only exists there.
- */
-/**
  * One chain id per residue, in the ids `predictionToPdb` will use.
  *
  * The heatmap only cares where the id CHANGES, but matching the writer means
@@ -1427,28 +1406,6 @@ function trunkChainIds(chains) {
   return ids;
 }
 
-function contactMapFor(contactProbs, keep = undefined) {
-  const n = Math.round(Math.sqrt(contactProbs.length));
-  if (n * n !== contactProbs.length) return undefined;
-  // 🔴 IN THE VIEWER'S INDEX SPACE, NOT THE MODEL'S. A modified residue is
-  // several TOKENS and one POSITION, so a fold carrying one hands the panel a
-  // matrix wider than the structure beside it unless it is collapsed. See
-  // viewerTokens; with nothing to collapse this is exactly what it was.
-  // ...and only where it is WIDER. A matrix narrower than the positions is
-  // not a token space this can read, and collapsing it would throw rather
-  // than say so: it passes through, as it did before there was a map at all.
-  const rows = keep === undefined || keep.length >= n
-    ? undefined : matrixForViewer(contactProbs, keep);
-  const width = rows === undefined ? n : rows.length;
-  const data = new Uint8Array(width * width);
-  for (let index = 0; index < data.length; index += 1) {
-    const value = rows === undefined
-      ? contactProbs[index]
-      : rows[Math.floor(index / width)][index % width];
-    data[index] = Math.max(0, Math.min(255, Math.round(value * 255)));
-  }
-  return { data, n: width, vmin: 0, vmax: 1 };
-}
 
 /**
  * THE CONTACT MAP IS THE MAIN VIEW WHILE A FOLD RECYCLES, AND THE STRUCTURE
@@ -1874,7 +1831,9 @@ function attachContactMap(frame, recycle, weights, length) {
       const contacts = distogramContactProbabilities(
         recycle.pair, head.halfLogitsWeights, head.halfLogitsBias, length,
         { bins: head.bins, first: head.firstBreak, last: head.lastBreak });
-      const contact = contactMapFor(contacts);
+      // AF2 tokenises one residue per letter - nothing to collapse, and it
+      // refuses a modified residue outright (see modelFamily).
+      const contact = contactMapFor(contacts, undefined);
       if (contact === undefined) return;
       frame.maps = { ...frame.maps, contact };
       // ...and kept, so a rewind can put this frame back without recomputing a
@@ -2651,8 +2610,14 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       } : undefined;
       // ...and frame zero's contact map, which is the finished trunk's: every
       // recycle is over before the sampler emits anything.
+      // 🔴 AND IN THE VIEWER'S INDEX SPACE, like the live one above and the
+      // PAE below it. This was the ONE call of the four that a modified
+      // residue reaches and that did not collapse - so the fold that landed
+      // carried a 13-wide PAE beside a 22-wide contact map, measured on
+      // GWSTELEKHRSVQ + SEP@3. The live map is thrown away the moment frame
+      // zero exists, so this is the one a reader ever looks at.
       const contact = result.contactProbs === undefined
-        ? undefined : contactMapFor(result.contactProbs);
+        ? undefined : contactMapFor(result.contactProbs, viewerKeep);
       if (contact !== undefined) first.maps = { ...first.maps, contact };
     }
     for (const [index, pdb] of timeline.slice(1).entries()) {
@@ -3012,7 +2977,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // held until there is a frame to hang it on, exactly as the AF3 path holds
     // its own.
     onContacts: (contacts, trunkCertainty) => {
-      liveContacts = contactMapFor(contacts);
+      // ESMFold2's fold is never handed modifications (docs/WEB.md), so its
+      // tokens are its residues.
+      liveContacts = contactMapFor(contacts, undefined);
       certainty = trunkCertainty;
       showTrunkContacts(liveContacts, chains);
     },
@@ -3063,7 +3030,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     ? toPdb(result.features.batch, finalDense, bFactors)
     : fittedPdb(result.features.batch, finalDense, reference,
                 slots ?? alphaCarbons(result.features.batch), bFactors));
-  const contactMap = contactMapFor(result.contacts);
+  const contactMap = contactMapFor(result.contacts, undefined);
   // 🔴 THE ESTIMATED pAE IS NOT DRAWN, AND THE REASON IS MEASURED. It orders
   // pairs WITHIN a fold at 0.746 against AlphaFold 3's real PAE - genuinely
   // useful - and ACROSS folds it is INVERTED, at -0.867. Three random sequences

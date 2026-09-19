@@ -1,6 +1,6 @@
 import { describe, expect, it } from "./harness.js";
-import { confidenceJson, matrixForViewer, modifiedPositions, predictionToPdb, recyclesToPdb,
-  safeJobName, viewerTokens } from "../web/prediction-results.js";
+import { confidenceJson, contactMapFor, matrixForViewer, modifiedPositions, predictionToPdb,
+  recyclesToPdb, safeJobName, viewerTokens } from "../web/prediction-results.js";
 import { featuriseProtein } from "../src/af3/featurise/featurise.js";
 import { toPdb } from "../src/af3/fold.js";
 
@@ -317,6 +317,20 @@ describe("a real batch, featurised, against what the viewer will draw", () => {
     const batch = batchWith({ ligands: [ligand] });
     // nine ordinary residues + five modification tokens + two ligand atoms
     expect(viewerTokens(batch).length).toBe(SEQUENCE.length + ligand.atoms.length);
+  });
+
+  it("collapses a contact map the same way, and REFUSES to guess", () => {
+    // 🔴 THE CALL THAT FORGOT THE ARGUMENT IS WHY THIS FUNCTION MOVED HERE.
+    // Four call sites, one of them reached by a modified fold, and it was the
+    // one without a keep: a 13-wide PAE beside a 22-wide contact map on a real
+    // fold. Omitting it throws now rather than quietly passing a token matrix
+    // through.
+    const batch = batchWith();
+    const keep = viewerTokens(batch);
+    const probs = new Float32Array(batch.tokens * batch.tokens).fill(0.25);
+    expect(contactMapFor(probs, keep).n).toBe(SEQUENCE.length);
+    expect(contactMapFor(probs, undefined).n).toBe(batch.tokens);
+    expect(() => contactMapFor(probs)).toThrow();
   });
 
   it("names EVERY modification and nothing else, wherever they sit", () => {
