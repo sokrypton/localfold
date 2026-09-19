@@ -4,7 +4,7 @@ import { ATTENTION_SUBGROUP_SIZE, allowsAttentionSubgroupSize }
 import {
   attentionMatrixGeometry, createAttentionMatrixFlashShader, supportsAttentionMatrix,
 } from "./attention-matrix.js";
-import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable, shapedKnob } from "../runtime/device-profile.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { shaderSource } from "../runtime/shader-source-cache.js";
@@ -1836,6 +1836,9 @@ export function selectAttentionFlashKernel(
     // why it is gated on check-evoformer-attention.js rather than a stopwatch.
     // The M2's answer is the default; see src/runtime/device-profile.js.
     const { attentionGroup: group, attentionVectorScore: vectorScore } = deviceTuning(device);
+    // ...and the key chunk, which the kernel derives from the precision unless
+    // a device names one. See attentionKeyChunk.
+    const keyChunk = shapedKnob(deviceTuning(device).attentionKeyChunk) ?? undefined;
     const inputStorage = storage.input ?? "f32";
     const outputStorage = storage.output ?? "f32";
     // The VALUE follows the other inputs unless a caller separates it. See the
@@ -1848,7 +1851,11 @@ export function selectAttentionFlashKernel(
       // ...and the softmax shape, which is a DEVICE choice - see below. It
       // joins the key only when it differs from the one every device had, so
       // an entry made before this option existed cannot collide.
-      + (group === 1 && !vectorScore ? "" : `-g${group}${vectorScore ? "v" : ""}`);
+      + (group === 1 && !vectorScore ? "" : `-g${group}${vectorScore ? "v" : ""}`)
+      // 🔴 AND THE CHUNK IS IN THE KEY, because it is baked into the source and
+      // into the staged tile's size - two pipelines built from one key and two
+      // chunks is the collision `ComputePipelineCache` refuses by source.
+      + (keyChunk === undefined ? "" : `-k${keyChunk}`);
     return {
       // The suffix appears only when something is packed, so the key a device
       // without this path gets is the one it has always had - and the value's
@@ -1856,7 +1863,7 @@ export function selectAttentionFlashKernel(
       // with an entry made before this option existed.
       cacheKey: registerKey,
       shader: shaderSource(device, registerKey, () => createAttentionRegisterFlashShader(
-        headDim, undefined, { precision, inputStorage, valueStorage, outputStorage,
+        headDim, keyChunk, { precision, inputStorage, valueStorage, outputStorage,
           group, vectorScore })),
       queryTile: 64, variant, packedStorageSupported: true, valueStorage,
     };

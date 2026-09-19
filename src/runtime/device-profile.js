@@ -140,6 +140,13 @@ export const DEFAULT_TUNING = Object.freeze({
   // is measured on this card; see createFusedPairBiasShader, and docs/AF2.md
   // for what it is worth.
   fusedPairBias: false,
+  // 🔴 THE FLASH KERNEL'S KEY CHUNK, WHICH WAS A FORMULA AND NEVER A SWEEP.
+  // `max(8, floor(512 / (vectors * 2)))` gives 64 keys where the operands are
+  // f16 and 32 where they are f32 - it holds the staged tile at 8 KiB either
+  // way, which is a memory rule rather than a measured one. A stock browser on
+  // NVIDIA has no `shader-f16` at all, so the f32 arm is the one a visitor
+  // runs and the one nobody had swept. `null` keeps the formula.
+  attentionKeyChunk: null,
   // One key per softmax rescale, scalar q.k reduction.
   attentionGroup: 1,
   attentionVectorScore: false,

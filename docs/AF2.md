@@ -3241,3 +3241,49 @@ with 128 rows and one recycle, `fold-af2.js --repeat=2`:
 at a length where every dispatch is small - which is the same reason the LN
 fusion above is worth 0.86% at 150 and 0.22% at 825, from the other end.
 
+### The flash kernel's key chunk: a formula, now a knob, and already right
+
+The last unswept geometry on the path a visitor takes.
+`createAttentionRegisterFlashShader` derives its key chunk as
+`max(8, floor(512 / (vectors * 2)))` - 64 keys where the operands are f16 and 32
+where they are f32 - which holds the staged tile at 8 KiB either way. That is a
+MEMORY rule, not a measured one, and no caller ever passed the parameter, so it
+had never been swept in any configuration. `attentionKeyChunk` makes it
+reachable; `null` keeps the formula.
+
+Swept interleaved, both configurations, block milliseconds:
+
+| chunk | stock 150 | stock 400 | dev 150 | dev 400 |
+|---|---:|---:|---:|---:|
+| 8 | 10.56 | 51.84 | 5.81 | 28.39 |
+| 16 | 10.56 | 51.71 | 5.81 | 28.37 |
+| **32 (the f32 formula)** | **10.36** | **51.58** | 5.81 | 28.38 |
+| 64 | 10.56 | 51.58 | 5.81 | 28.36 |
+
+The derived value is the best of the four under stock flags and the dev arm is
+flat, because there the matrix kernel runs instead and the knob reaches nothing.
+So: nothing to win, and one fewer unexamined constant.
+
+🔴 **AND THE CHUNK IS STAGING, NOT ARITHMETIC** - the fold is BIT-IDENTICAL
+across 8, 32 and 64 (checksum -1308439, pLDDT 62.924). That is worth knowing
+because `attentionGroup`, which sits beside it, reassociates the online softmax
+and does move the fold: the rescale count is the GROUP and the chunk is only how
+many keys are staged at once.
+
+🔴 **AND PROVING THE ARM APPLIED TOOK THREE ATTEMPTS, WHICH IS THE REAL LESSON
+OF THIS SESSION.** A bit-identical fold is exactly what a knob that never
+arrived produces, and this session has now produced that shape three times: the
+`--pair-f16` flag that `option()` could not see, the `pack2x16float` round trip
+Tint folded away, and this. `probe-kernel.js` does not parse `--tune` at all, so
+asking it was meaningless; what settled it was `probe-compiles.js`, which lists
+what the fold COMPILED -
+`block:attention:flash-registers-32-f32-storagef16f16-g4v-k64` - and only then
+is an unchanged checksum evidence about the kernel rather than about the
+harness. **Read the compiled key, not the result, when an arm changes nothing.**
+
+🔴 **AND A STOCK BROWSER DOES GET THE PACKED STORAGE.** The compiled key says
+`storagef16f16` with `LOCALFOLD_STOCK_FLAGS=1`, where there is no `shader-f16`
+at all: `pack2x16float` / `unpack2x16float` are core WGSL, so only f16
+ARITHMETIC needs the extension. The projected tensors are half the bytes for
+every visitor; the precision word in the key is the arithmetic, and it is f32.
+
