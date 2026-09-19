@@ -885,6 +885,17 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                                    exactly these alignments.">
                             <i class="fa-solid fa-download"></i><span>All</span>
                         </button>
+                        <!-- ...AND THE VIEWER'S SESSION, py2Dmol's own format:
+                             every object, frame, map, colour, selection and
+                             the camera. It opens on py2dmol.solab.org, where
+                             the same button sits in the page's upper-right
+                             corner, and back here through the upload box. No JS
+                             of ours: the vendored bundle wires any
+                             #saveStateButton to saveViewerState. -->
+                        <button id="saveStateButton" class="btn btn-secondary" type="button"
+                            title="Save everything the viewer is showing as a py2Dmol session (.json): every fold, its frames, maps, colours, selections and the camera. Opens on py2dmol.solab.org.">
+                            <i class="fa-solid fa-floppy-disk"></i><span>Session</span>
+                        </button>
                     </div>
 
                     <!-- Scatter Plot Container (mirrors main viewer sizing; JS sets dimensions) -->

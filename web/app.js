@@ -1438,6 +1438,104 @@ function contactMapFor(contactProbs) {
 }
 
 /**
+ * THE CONTACT MAP IS THE MAIN VIEW WHILE A FOLD RECYCLES, AND THE STRUCTURE
+ * TAKES IT BACK WHEN RECYCLING ENDS.
+ *
+ * The recycles are the model changing its mind about which residues touch, and
+ * the contact map is the picture of that; the structure is a consequence of it,
+ * and for AF3 and ESMFold2 there is no structure at all until the sampler
+ * starts. py2Dmol's two slots take a STANDING choice (`setSlots`), so asking
+ * once at the start is enough - the map takes the big slot the moment it exists
+ * and the structure sits in the small one beside it once IT exists.
+ *
+ * 🔴 HANDED BACK, NOT SET TO `structure`. `null` returns both slots to the
+ * automatic choice, which is structure big whenever there is one - so the end
+ * of a fold looks exactly as a loaded file does, and nothing stays pinned into
+ * the next thing the reader opens.
+ *
+ * 🔴 AND A READER WHO CLICKS A SLOT TAB DURING THE FOLD HAS TAKEN THE LAYOUT
+ * OVER. Their choice is the standing one from then on and is not handed back
+ * for them. Asked of the click rather than of `getSlots()`, which reports what
+ * is SHOWN: when a fold is stopped before any map exists, the structure is shown
+ * big by fallback while the contact map is still what was asked for, and
+ * reading "shown" there would leave the contact map pinned big for good.
+ */
+let contactsHeldBig = false;
+document.addEventListener("click", (event) => {
+  if (event.target?.closest?.(".py2dmol-slot-tab")) contactsHeldBig = false;
+}, true);
+function contactsBig(on) {
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  if (typeof renderer?.setSlots !== "function") return;
+  try {
+    if (on) {
+      renderer.setSlots({ big: "contact", small: "structure" });
+      contactsHeldBig = true;
+    } else if (contactsHeldBig) {
+      contactsHeldBig = false;
+      renderer.setSlots({ big: null, small: null });
+    }
+  } catch (cause) {
+    console.warn("could not arrange the slots", cause);
+  }
+}
+
+/**
+ * A trunk's contact map, shown before there is a structure to hang it on. AF3
+ * and ESMFold2 both finish their recycles before the sampler emits a frame.
+ */
+function showTrunkContacts(liveContacts, chains) {
+  // 🔴 AND STRAIGHT TO THE PANEL WHILE THERE IS NO FRAME TO HANG IT ON.
+  // The trunk finishes every recycle before the sampler emits anything, so
+  // for the longest part of an AF3 fold the viewer holds the blank object
+  // openBlankFold made and the panel has nothing to resolve. Pushing the
+  // map at the renderer shows it evolving through the recycles; the
+  // frame-driven path takes over by itself once frame 0 lands, because
+  // that goes through updateFrame.
+  if (liveContacts === undefined) return;
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  const frames = renderer?.objectsData?.[renderer?.currentObjectName]?.frames;
+  if (renderer?.heatmapRenderer === undefined || (frames?.length ?? 0) > 0) return;
+  try {
+    // 🔴 AND THE CHAIN LAYOUT WITH IT, OR A COMPLEX GETS NO DIVIDER LINES.
+    // The panel rules a line wherever the chain changes and reads the
+    // chains off the RENDERER, which fills them in when a structure is
+    // parsed - so on this path, which exists precisely because there is no
+    // structure yet, `renderer.chains` is empty and _drawChainBoundaries
+    // returns before drawing anything. A complex's contact map came up
+    // unruled for the whole trunk and grew its lines when the sampler's
+    // first frame landed, which reads as the panel changing its mind.
+    //
+    // 🔴 AND WRITTEN EVERY TIME, NOT ONLY WHILE IT IS EMPTY. The guard used
+    // to be `if ((renderer.chains?.length ?? 0) === 0)`, to avoid fighting
+    // the parser - but the parser fills `chains` from the last structure it
+    // PARSED, which on a second fold is the PREVIOUS fold's. So a complex
+    // folded after a monomer, or after a complex with different chain
+    // lengths, drew the old fold's divider lines across the new fold's
+    // contact map for the whole trunk, and they snapped into place when the
+    // sampler's first frame landed.
+    //
+    // There is nothing to fight: this path is only reached when the current
+    // object has NO frames - the line above returns otherwise - so nothing
+    // has parsed a structure for this fold and these ids are the only
+    // authority there is. The parser overwrites them the moment it has one.
+    // 🔴 AND THE VIEWER IS OPENED FOR IT. It is display:none until the first
+    // fold draws something, and on the first fold of a visit that used to be
+    // the sampler's first frame - so the whole trunk's contact maps were
+    // pushed into a panel nobody could see.
+    revealViewer(renderer);
+    renderer.chains = trunkChainIds(chains);
+    renderer.heatmapRenderer.setMaps({ contact: liveContacts });
+    window.Heatmap?.updateVisibility?.(renderer);
+    renderer.render("trunk-contacts");
+  } catch (cause) {
+    console.warn("could not show the trunk's contact map", cause);
+  }
+}
+
+/**
  * The pAE panel's bytes.
  *
  * 🔴 IT IS QUANTISED AGAINST A FIXED 0-32 A, NOT AGAINST ITS OWN RANGE. A PAE
@@ -1567,6 +1665,9 @@ function openBlankFold(stem, keep = []) {
   const registry = window.py2dmol_viewers ?? {};
   const renderer = registry[Object.keys(registry)[0]]?.renderer;
   if (renderer === undefined) return;
+  // Every path that folds opens here, so this is where the contact map is
+  // asked for as the main view. See contactsBig.
+  contactsBig(true);
   try {
     renderer.addObject(stem);
     // 🔴 addObject KEEPS THE FRAMES OF AN OBJECT THAT ALREADY HAS THEM - "only
@@ -2249,7 +2350,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       const index = object.frames.length;
       // ...opened before the frame is added, so the canvas is measured against
       // a container that is actually on screen.
-      if (index === 0) revealViewer(renderer);
+      // ...and the recycles are over, so the structure takes the big slot
+      // back. See contactsBig.
+      if (index === 0) { revealViewer(renderer); contactsBig(false); }
       const frame = api.frameFromText(pdb);
       // ...numbered by the sampler's own count. Every frame in the object is
       // the sampler's now; the trunk draws none.
@@ -2325,48 +2428,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // lands, and the heatmap panel is driven by an object's frames.
     onContacts: (contactProbs) => {
       liveContacts = contactMapFor(contactProbs);
-      // 🔴 AND STRAIGHT TO THE PANEL WHILE THERE IS NO FRAME TO HANG IT ON.
-      // The trunk finishes every recycle before the sampler emits anything, so
-      // for the longest part of an AF3 fold the viewer holds the blank object
-      // openBlankFold made and the panel has nothing to resolve. Pushing the
-      // map at the renderer shows it evolving through the recycles; the
-      // frame-driven path takes over by itself once frame 0 lands, because
-      // that goes through updateFrame.
-      if (liveContacts === undefined) return;
-      const registry = window.py2dmol_viewers ?? {};
-      const renderer = registry[Object.keys(registry)[0]]?.renderer;
-      const frames = renderer?.objectsData?.[renderer?.currentObjectName]?.frames;
-      if (renderer?.heatmapRenderer === undefined || (frames?.length ?? 0) > 0) return;
-      try {
-        // 🔴 AND THE CHAIN LAYOUT WITH IT, OR A COMPLEX GETS NO DIVIDER LINES.
-        // The panel rules a line wherever the chain changes and reads the
-        // chains off the RENDERER, which fills them in when a structure is
-        // parsed - so on this path, which exists precisely because there is no
-        // structure yet, `renderer.chains` is empty and _drawChainBoundaries
-        // returns before drawing anything. A complex's contact map came up
-        // unruled for the whole trunk and grew its lines when the sampler's
-        // first frame landed, which reads as the panel changing its mind.
-        //
-        // 🔴 AND WRITTEN EVERY TIME, NOT ONLY WHILE IT IS EMPTY. The guard used
-        // to be `if ((renderer.chains?.length ?? 0) === 0)`, to avoid fighting
-        // the parser - but the parser fills `chains` from the last structure it
-        // PARSED, which on a second fold is the PREVIOUS fold's. So a complex
-        // folded after a monomer, or after a complex with different chain
-        // lengths, drew the old fold's divider lines across the new fold's
-        // contact map for the whole trunk, and they snapped into place when the
-        // sampler's first frame landed.
-        //
-        // There is nothing to fight: this path is only reached when the current
-        // object has NO frames - the line above returns otherwise - so nothing
-        // has parsed a structure for this fold and these ids are the only
-        // authority there is. The parser overwrites them the moment it has one.
-        renderer.chains = trunkChainIds(chains);
-        renderer.heatmapRenderer.setMaps({ contact: liveContacts });
-        window.Heatmap?.updateVisibility?.(renderer);
-        renderer.render("trunk-contacts");
-      } catch (cause) {
-        console.warn("could not show the trunk's contact map", cause);
-      }
+      showTrunkContacts(liveContacts, chains);
     },
     // 🔴 A STRUCTURE DURING THE TRUNK, REPLACED EACH RECYCLE. There is nothing
     // else to look at for the longest part of an AF3 fold - the sampler has
@@ -2757,7 +2819,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     const object = renderer?.objectsData?.[renderer?.currentObjectName];
     if (renderer === undefined || object === undefined) return;
     try {
-      if (object.frames.length === 0) revealViewer(renderer);
+      if (object.frames.length === 0) { revealViewer(renderer); contactsBig(false); }
       const frame = api.frameFromText(pdb);
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
       if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
@@ -2885,6 +2947,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     onContacts: (contacts, trunkCertainty) => {
       liveContacts = contactMapFor(contacts);
       certainty = trunkCertainty;
+      showTrunkContacts(liveContacts, chains);
     },
     // 🔴 `denoised` AND NOT `coordinates`, AND THE REASON IS THE CAMERA. The
     // sampler's own walk starts as Gaussian noise at sigma 411 and ends at a
@@ -3940,6 +4003,10 @@ async function fold(event) {
     // the fold that did NOT finish, so it is closed here and not on the way out
     // of the success path.
     devEndRun();
+    // ...and the slots handed back, for AF2 - whose recycles ARE its frames,
+    // so the end of the fold is the end of recycling - and for any fold that
+    // stopped or failed before its sampler drew.
+    contactsBig(false);
     if (activeFold === controller) activeFold = undefined;
     setFoldButton("idle");
   }
