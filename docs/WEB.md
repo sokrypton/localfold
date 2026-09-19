@@ -1250,12 +1250,38 @@ sweep pays is the decode, which is what it was always going to pay.
 
 🔴 **AND THE FIRST MEASUREMENT SAID "NO SLOWER" AND WAS NOT WRONG, JUST NARROW.**
 Two sweeps timed 16.0 s and 15.3 s, and that was read as "the refetch is free,
-the dial is cosmetic". It was free of NETWORK - the shards came from the browser
-cache, because the bundles are pinned to a commit and their URLs are immutable -
-but a reader watching 172 MiB count up again has no way to know that, and on a
-machine whose HTTP cache had evicted them it would not have been free at all.
-**A number that says "no slower here" is not an answer to "why is it doing that
-at all".**
+the dial is cosmetic" - but a reader watching 172 MiB count up again has no way
+to know that, and **a number that says "no slower here" is not an answer to
+"why is it doing that at all"**.
+
+🔴 **AND THE REASON GIVEN FOR IT WAS WRONG, WHICH TOOK A `curl -I` TO SEE.**
+That paragraph used to say the shards came back from the browser's HTTP cache
+"because the bundles are pinned to a commit and their URLs are immutable". The
+pinned URL is immutable and it is **`cache-control: no-store`**: Hugging Face
+answers `resolve/<sha>/<file>` with a 302 to a SIGNED CDN url carrying its own
+`Expires` and `Signature`, so the final url differs on every request and the
+HTTP cache can never match it.
+
+What actually serves a repeat is this port's OWN cache, which
+`http-tensor-store.js` has had all along: `#cacheMatch` / `#cachePut` against
+Cache Storage, keyed by the stable manifest-relative url, so the signed
+redirect underneath is irrelevant. Measured on the live site, AF2 monomer:
+
+| | wall | shard requests on the network |
+|---|---:|---:|
+| first visit | 4.0 s | 8 |
+| after a page RELOAD | 4.0 s | **0** |
+
+with a bucket named `localfold-model-model_1_ptm-76465608-337` holding them. So
+the three layers are: the weight tree and store in memory within a session
+(what `releaseModel` now keeps), Cache Storage across reloads, and the network
+once.
+
+🔴 **AND `transferSize` IS ZERO FOR ALL OF THEM, WHICH IS NOT EVIDENCE OF
+ANYTHING.** Hugging Face sends no `Timing-Allow-Origin`, so a cross-origin
+resource-timing entry reports 0 bytes whether it came from the wire or not -
+which is where "40 served from cache, 0.0 MiB over the wire" came from in the
+first place. The COUNT of entries is usable; the bytes are not.
 
 ### The options row pairs by question now: Model+Seed, Recycles+Early Stop, MSA+Max MSA
 
