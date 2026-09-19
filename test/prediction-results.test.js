@@ -319,6 +319,20 @@ describe("a real batch, featurised, against what the viewer will draw", () => {
     expect(viewerTokens(batch).length).toBe(SEQUENCE.length + ligand.atoms.length);
   });
 
+  it("names EVERY modification and nothing else, wherever they sit", () => {
+    // Two of them, one of which is the last residue - where the dictionary's
+    // OXT stays and the span is one atom longer than the same code mid-chain.
+    const batch = featuriseProtein(SEQUENCE, { modifications: [
+      { chain: 0, position: 3, ...MODIFICATION },
+      { chain: 0, position: SEQUENCE.length, ...MODIFICATION }] });
+    const keep = viewerTokens(batch);
+    expect(keep.length).toBe(SEQUENCE.length);
+    expect(modifiedPositions(batch, keep)).toEqual([2, SEQUENCE.length - 1]);
+    // the C-terminal one keeps its OXT, so it is the longer span
+    const counts = batch.modifiedSpans.map((span) => span.count);
+    expect(counts).toEqual([5, 6]);
+  });
+
   it("names the modified residue at the position the viewer gives it", () => {
     const batch = batchWith();
     expect(modifiedPositions(batch, viewerTokens(batch))).toEqual([2]);
