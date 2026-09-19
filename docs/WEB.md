@@ -1790,3 +1790,32 @@ snapshot from the top of the probe.
 `tools/fold-in-page.py --drop-job` now runs nine arms; `--job` prints
 `job name:` with `fileFilledTheBox` and `followsTheBox`, the second by renaming
 the box by hand and folding again.
+
+### The name box got a default, and stopped pretending to be a heading
+
+Two corrections to the field as first built.
+
+**It was styled as a title** - borderless, bold, transparent - which reads as a
+heading rather than something you can type in. It is a field like the others, so
+it looks like one: py2Dmol's own `#fetch-id` idiom (1px `#d1d5db`, 6px radius,
+blue focus ring) at 30px rather than 42, because a full-height box above a 30px
+entity row would be the largest thing in the panel.
+
+**And it had a placeholder where it wanted a value.** A placeholder is a prompt
+to type something; this is a setting with a default, the same as Seed reading
+`0` rather than suggesting one. It now ships `untitled`, so the box always says
+what the archive will be called instead of leaving the reader to learn the
+fallback by unzipping one:
+
+```
+no job loaded   →  af2_1_job_request.json   name: untitled
+ubiquitin_monomer.json loaded  →  name: ubiquitin_monomer
+renamed by hand and re-folded  →  name: renamed_by_hand
+```
+
+🔴 **AND THE STEM FALLBACK IS NOW FOR A CALLER, NOT FOR THE PAGE.**
+`jobName ?? stem` in `buildFoldArchive` used to be what an unnamed fold got.
+With a default in the box every fold from the page arrives named, so what still
+reaches that line without one is a caller that never had a box - a test, or a
+restored session predating the field. The comment there said the old thing and
+now says this one.

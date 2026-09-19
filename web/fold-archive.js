@@ -550,12 +550,15 @@ export function buildFoldArchive({
   // one of AlphaFold 3's example files carries a `name` - "calmodulin_4calcium",
   // "tetr_dimer_dna" - and this wrote the fold's stem over it, so a job handed
   // in and saved back came out called "af3_1": the same chemistry under an
-  // identity its author would not recognise, which is the half of "describes
-  // the job that ran" that the entity comparison cannot see. The FILE STEM
-  // stays LocalFold's, because every other member of the archive is named from
-  // it and the README describes that layout; this is the request's `name`
-  // field alone. `jobName` is undefined unless the rows are still the ones the
-  // job put there - see web/app.js.
+  // identity its author would not recognise, and no comparison of entity lists
+  // can see it. The FILE STEM stays LocalFold's, because every other member of
+  // the archive is named from it and the README describes that layout; this is
+  // the request's `name` field alone.
+  //
+  // 🔴 THE FALLBACK IS FOR A CALLER WITH NOTHING TO SAY, NOT FOR THE PAGE. The
+  // page's name box has a default, so `jobName` arrives set on any fold from
+  // it; what still reaches this line without one is a caller that never had a
+  // box - a test, or a restored session predating the field.
   files.set(`${name}_job_request.json`, jobRequestJson({
     name: jobName ?? stem, seed: settings?.seed, entities,
   }));

@@ -1165,26 +1165,27 @@
   padding: 0 3px;
 }
 
-/* 🔴 THE JOB NAME READS AS A TITLE, NOT AS ANOTHER FIELD. It sits above the
-   entity rows and names them, so it is borderless until you touch it - the
-   rows are what the eye should land on, and a third boxed input at the top of
-   the panel competes with them. The same trick py2Dmol uses for its object
-   name. */
+/* THE JOB NAME, STYLED AS THE PAGE'S OWN TEXT INPUT. It was a borderless
+   title, which read as a heading rather than something you can type in - and
+   it is a field like the others, so it looks like one: py2Dmol's `#fetch-id`
+   idiom at the size the entity rows use, since a 42px box above a 30px row
+   would be the largest thing in the panel. */
 .entity-name {
   box-sizing: border-box;
   width: 100%;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: transparent;
-  padding: 2px 6px;
-  font-size: 12px;
-  font-weight: 600;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 13px;
   color: #374151;
+  transition: all 0.2s;
 }
-.entity-name::placeholder { font-weight: 400; color: #9ca3af; }
-.entity-name:hover { border-color: #e5e7eb; }
+.entity-name::placeholder { color: #9ca3af; }
+.entity-name:hover { border-color: #9ca3af; }
 .entity-name:focus {
   border-color: #3b82f6;
-  background: #fff;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
   outline: none;
 }

@@ -125,20 +125,23 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                      this page read it, remembered it and wrote it into the
                      saved request without ever showing it - so the archive
                      could be called `calmodulin_4calcium` with nothing on
-                     screen saying so, and keeping it honest took a comparison
-                     of the entity rows against the ones the job created, to
-                     guess whether the name still applied. A field needs none
-                     of that: what it says is what gets saved, the reader can
-                     see it and change it, and a name that no longer fits is
-                     THEIR name rather than a stale one this page invented.
-                     It names the request only - every file in the archive is
-                     still stemmed `af3_1`, because the README describes that
+                     screen saying so, and keeping it honest took comparing the
+                     entity rows against the ones the job created, to guess
+                     whether the name still applied. A field needs none of
+                     that: what it says is what gets saved.
+
+                     🔴 A VALUE, NOT A PLACEHOLDER. A placeholder is a prompt
+                     to type something and this is a setting with a default -
+                     the same reason Seed reads 0 rather than suggesting one.
+                     It also means the box always says what the archive will
+                     be called, instead of the reader learning the fallback by
+                     unzipping one. It names the request only: every file is
+                     still stemmed `af2_1`, because the README describes that
                      layout and the prediction, the viewer object and the
                      session all key on it. -->
                 <input type="text" id="job-name" class="entity-name"
-                  spellcheck="false" aria-label="Job name"
-                  placeholder="Job name — from a loaded JSON, or your own"
-                  title="Written as the job's name in the archive's job_request.json. Filled in when you load an AlphaFold 3 job JSON.">
+                  spellcheck="false" aria-label="Job name" value="untitled"
+                  title="The job's name, written into the archive's job_request.json. Replaced when you load an AlphaFold 3 job JSON.">
                 <div id="entity-rows"></div>
               </div>
               <!-- 🔴 NO Options BUTTON. The settings below are always on
