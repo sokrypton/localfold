@@ -235,7 +235,16 @@ const loaded = new Map();
 export function releaseModel(family) {
   loaded.delete(`${family}:msa`);
   loaded.delete(`${family}:single`);
-  stores.delete(family);
+  // 🔴 THE DECODE, NOT THE BYTES. This used to `stores.delete(family)`, which
+  // freed the memory and threw the downloaded shards away with it - so a second
+  // sweep re-fetched four deltas and ran the download dial for something the
+  // browser already had. The float32 arrays are ~8x the int5 codes they came
+  // from, so dropping the decode is nearly all of the saving and none of the
+  // bytes: the store stays, its shards stay, the next read decodes them again.
+  const store = stores.get(family);
+  if (store !== undefined) {
+    void store.then((opened) => opened.releaseDecoded?.()).catch(() => {});
+  }
 }
 
 export function loadModel(variant, onProgress, signal = undefined, family = "monomer") {

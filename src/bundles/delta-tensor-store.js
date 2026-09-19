@@ -78,6 +78,20 @@ export class DeltaTensorStore {
     }
   }
 
+  /**
+   * Drop what this store reconstructed, and tell both halves to do the same.
+   *
+   * A delta's tensors are the most expensive kind here: the base's decode, the
+   * delta's decode, and the float32 sum of the two, all live at once. Keeping
+   * the shards costs 43 MiB and keeping the arrays costs about eight times
+   * that; see HttpTensorStore.releaseDecoded.
+   */
+  releaseDecoded() {
+    this.#cache.clear();
+    this.#base.releaseDecoded?.();
+    this.#delta.releaseDecoded?.();
+  }
+
   #from(name) {
     if (this.#header.absent.has(name)) throw new Error(`missing tensor ${name}`);
     if (this.#header.whole.has(name) || this.#header.addTo.has(name)) return this.#delta;

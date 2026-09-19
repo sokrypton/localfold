@@ -349,6 +349,28 @@ export class HttpTensorStore {
    * It counts towards the progress callback exactly as a whole load does, so a
    * page loading lazily still fills its bar.
    */
+  /**
+   * Drop the DECODED tensors and keep the shard bytes.
+   *
+   * 🔴 THE TWO CACHES ARE NOT THE SAME SIZE AND ONLY ONE OF THEM IS BIG.
+   * `#fileBuffers` holds the shards as downloaded - int5 codes, 43 MiB for a
+   * delta - and `#cache` holds what they decode to, float32, about eight times
+   * that. Measured on the page: five AlphaFold 2 models held at once is
+   * **3409 MiB of JS heap** against Chrome's ~4 GB ceiling, and releasing the
+   * whole store brought it to 302 - but that threw the BYTES away with the
+   * arrays, so the next sweep re-fetched four deltas and the download dial ran
+   * again for something the browser already had.
+   *
+   * This is the half that was worth dropping. The store stays, its shards stay,
+   * and the next read decodes them again: no request, no dial, no network -
+   * see `releaseModel` in web/model.js, which drops the assembled weight tree
+   * at the same time because it holds the same arrays.
+   */
+  releaseDecoded() {
+    this.#cache.clear();
+    this.#openedTensors.clear();
+  }
+
   async open(name) {
     const record = this.manifest.tensors[name];
     if (record === undefined) throw new Error(`missing tensor ${name}`);

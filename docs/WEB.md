@@ -1213,29 +1213,49 @@ is what anyone running all five expects.
 has to learn a second layout for the common case. `test/fold-archive.test.js`
 gates both directions and was watched failing with the loop removed.
 
-### ...and re-running a sweep re-reads the deltas, which costs nothing measurable
+### ...and re-running a sweep refetched four deltas, until it kept the right half
 
-Noticed at the same time: *"when I rerun, it redownloads?"* It does re-read, and
-here is why and what it costs.
+Reported twice: *"when I rerun, it redownloads?"*, then *"models still appear to
+be redownloaded each time I hit fold"*. The second report is the one that found
+the bug, because the first measurement had answered the wrong question.
 
-A sweep releases each delta once its passes are in hand, because holding five
-models is **3.2 GB of JS heap against Chrome's ~4 GB ceiling** - measured, and
-the reason the release exists. 🔴 **AND RELEASING ONLY THE ASSEMBLED WEIGHTS
-DOES NOT WORK**: with the STORE kept the same sweep holds **3248 MiB** against
-302, so the memory is the store's decoded-tensor cache and not the weight tree
-built from it. There is no version of this that keeps the bytes and the heap.
+**A single model was never the problem.** Two folds in one session with model 1,
+counting shard requests through `performance.getEntriesByType("resource")`:
+run one fetches 8, **run two fetches 0**. The weight tree and the store are both
+cached by family and nothing drops them.
 
-What the re-read actually costs, two sweeps in one session:
+**A sweep was.** "All 5" releases each delta once its passes are in hand,
+because five models held at once is **3409 MiB of JS heap** against Chrome's
+~4 GB ceiling. The release was `stores.delete(family)` - and that threw away two
+different things that happen to live in one object:
 
-| | wall |
-|---|---:|
-| first sweep | 16.0 s |
-| second, same session | **15.3 s** |
+| the store holds | size for a delta | wanted |
+|---|---|---|
+| `#fileBuffers`, the shards as downloaded (int5 codes) | 43 MiB | **keep** |
+| `#cache`, what they decode to (float32) | ~8x that | drop |
 
-No slower - the shards come from the browser's HTTP cache rather than the
-network (the bundles are pinned to a commit, so their URLs are immutable), and
-what is paid again is the DECODE, which the first run paid too. The dial
-animating for a second time is the part that reads as a download.
+So the memory came back and the BYTES went with it: the next sweep fetched all
+forty shards again and ran the download dial for something the browser already
+had. `releaseDecoded()` on both stores drops the decode and keeps the shards,
+and `releaseModel` calls it instead of deleting the entry:
+
+| | before | after |
+|---|---:|---:|
+| shard requests on a second sweep | 40 | **0** |
+| JS heap after a sweep | 302 MiB | **300 MiB** |
+
+Identical memory, no refetch, and no dial - `openStore` returns the cached store
+without wiring a progress callback at all, so nothing animates. What the second
+sweep pays is the decode, which is what it was always going to pay.
+
+🔴 **AND THE FIRST MEASUREMENT SAID "NO SLOWER" AND WAS NOT WRONG, JUST NARROW.**
+Two sweeps timed 16.0 s and 15.3 s, and that was read as "the refetch is free,
+the dial is cosmetic". It was free of NETWORK - the shards came from the browser
+cache, because the bundles are pinned to a commit and their URLs are immutable -
+but a reader watching 172 MiB count up again has no way to know that, and on a
+machine whose HTTP cache had evicted them it would not have been free at all.
+**A number that says "no slower here" is not an answer to "why is it doing that
+at all".**
 
 ### The options row pairs by question now: Model+Seed, Recycles+Early Stop, MSA+Max MSA
 
