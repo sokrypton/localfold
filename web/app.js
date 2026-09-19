@@ -55,8 +55,8 @@ import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
-import { CHAIN_IDS, confidenceJson, paeMatrix, predictionToPdb, safeJobName }
-  from "./prediction-results.js";
+import { CHAIN_IDS, confidenceJson, matrixForViewer, modifiedPositions, paeMatrix,
+  predictionToPdb, safeJobName, viewerTokens } from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
 // 🔴 SHARED WITH proteinhunter.html, which shows the same card against its
 // own play bar. See web/scores-card.js.
@@ -1427,14 +1427,24 @@ function trunkChainIds(chains) {
   return ids;
 }
 
-function contactMapFor(contactProbs) {
+function contactMapFor(contactProbs, keep = undefined) {
   const n = Math.round(Math.sqrt(contactProbs.length));
   if (n * n !== contactProbs.length) return undefined;
-  const data = new Uint8Array(n * n);
+  // 🔴 IN THE VIEWER'S INDEX SPACE, NOT THE MODEL'S. A modified residue is
+  // several TOKENS and one POSITION, so a fold carrying one hands the panel a
+  // matrix wider than the structure beside it unless it is collapsed. See
+  // viewerTokens; with nothing to collapse this is exactly what it was.
+  const rows = keep === undefined || keep.length === n
+    ? undefined : matrixForViewer(contactProbs, keep);
+  const width = rows === undefined ? n : rows.length;
+  const data = new Uint8Array(width * width);
   for (let index = 0; index < data.length; index += 1) {
-    data[index] = Math.max(0, Math.min(255, Math.round(contactProbs[index] * 255)));
+    const value = rows === undefined
+      ? contactProbs[index]
+      : rows[Math.floor(index / width)][index % width];
+    data[index] = Math.max(0, Math.min(255, Math.round(value * 255)));
   }
-  return { data, n, vmin: 0, vmax: 1 };
+  return { data, n: width, vmin: 0, vmax: 1 };
 }
 
 /**
@@ -1478,6 +1488,29 @@ function contactsBig(on) {
     }
   } catch (cause) {
     console.warn("could not arrange the slots", cause);
+  }
+}
+
+/**
+ * THE MODIFICATION IS THE POINT OF THE JOB, AND IT IS INVISIBLE BY DEFAULT.
+ *
+ * A cartoon draws a phosphoserine exactly as it draws the serine it was made
+ * from - the ribbon runs through the alpha carbon and the phosphate is a
+ * side-chain atom, and py2Dmol keeps side chains off unless something asks.
+ * So a reader who put SEP at position 3 folds it and sees no evidence that it
+ * arrived. These residues and no others get theirs drawn.
+ *
+ * 🔴 AND IT IS `showSidechains`, WHICH IS RELATIVE. It ADDS to whatever is
+ * out, so a reader who turned some on by hand keeps them, and a second fold
+ * does not have to undo the first - the viewer is given a new object either
+ * way.
+ */
+function showModifiedSidechains(renderer, positions) {
+  if (!(positions?.length > 0) || typeof renderer?.showSidechains !== "function") return;
+  try {
+    renderer.showSidechains({ positions });
+  } catch (cause) {
+    console.warn("could not draw the modified residues' side chains", cause);
   }
 }
 
@@ -2207,6 +2240,19 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // special case it used to have: no residues, and the width is still the
   // width.
   const paeSize = (values) => Math.round(Math.sqrt(values.length));
+  // 🔴 ...EXCEPT WHERE A RESIDUE IS SEVERAL TOKENS, WHICH IS EVERY MODIFIED
+  // AMINO ACID. The note above is right about ligands and wrong about these:
+  // AF3 atomises a modified residue into one token PER ATOM (boltz2 is the
+  // exception) while py2Dmol draws it as ONE position, because toPdb writes
+  // those atoms under one residue number with a backbone among them. Measured
+  // on a twelve-residue chain with SEP at position 3: 21 tokens against 12
+  // positions, so the matrix was nine rows too wide and everything after the
+  // modification addressed the wrong residue. viewerTokens is the map and
+  // these two are the only places that need to know.
+  const paeForViewer = (values, keep) => (keep === undefined || keep.length === paeSize(values)
+    ? paeMatrix(values, paeSize(values)) : matrixForViewer(values, keep));
+  const viewerWidth = (values, keep) => (keep === undefined ? paeSize(values)
+    : Math.min(keep.length, paeSize(values)));
   // 🔴 ONLY WHEN THERE IS A POLYMER TO CHECK. A ligand-only fold has no
   // sequence, and af3SequenceProblem reports an empty one as "Paste a protein
   // sequence first" - which is the right message for an empty box and the wrong
@@ -2386,10 +2432,21 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       console.warn("could not draw a frame", cause);
     }
   };
+  let viewerKeep;
+  let viewerModified = [];
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse,
+    // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes
+    // through it: a modified residue is one POSITION and ten TOKENS, so its
+    // PAE and its contact map are wider than the structure they belong to and
+    // every residue after it reads somebody else's row. Handed over before the
+    // trunk starts, so the live contact map is collapsed the same way.
+    onBatch: (batch) => {
+      viewerKeep = viewerTokens(batch);
+      viewerModified = modifiedPositions(batch, viewerKeep);
+    },
     // 🔴 WHAT PRODUCED THE FILE, BECAUSE THE FILE DID NOT SAY. A saved PDB from
     // this path carried no REMARK at all - no model, nothing about the B-factor
     // column - while the AlphaFold 2 path beside it has always written one and
@@ -2427,7 +2484,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // sampler runs; the viewer has no object until the first denoiser call
     // lands, and the heatmap panel is driven by an object's frames.
     onContacts: (contactProbs) => {
-      liveContacts = contactMapFor(contactProbs);
+      liveContacts = contactMapFor(contactProbs, viewerKeep);
       showTrunkContacts(liveContacts, chains);
     },
     // 🔴 A STRUCTURE DURING THE TRUNK, REPLACED EACH RECYCLE. There is nothing
@@ -2520,7 +2577,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       a3m: alignment,
       chainLengths: chains.map((chain) => chain.length),
       ...(pae === undefined ? {}
-        : { pae: paeMatrix(pae, paeSize(pae)), length: paeSize(pae) }),
+        : { pae: paeForViewer(pae, viewerKeep), length: viewerWidth(pae, viewerKeep) }),
       confidence: result.confidence,
     });
     // 🔴 AND THE PREDICTION IS REGISTERED, WHICH AF3 NEVER DID. The download
@@ -2618,15 +2675,16 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       if (last && scored) {
         // The PAE rides on the frame the page lands on, so scrubbing away and
         // back does not blank a matrix that was on screen a moment earlier.
-        const size = paeSize(result.confidence.predictedAlignedError);
-        frame.pae = paeMatrix(result.confidence.predictedAlignedError, size);
-        frame.pae_n = size;
+        const errors = result.confidence.predictedAlignedError;
+        frame.pae = paeForViewer(errors, viewerKeep);
+        frame.pae_n = viewerWidth(errors, viewerKeep);
       }
       viewer.addFrame(frame, viewerObject);
     }
     const object = viewer.objects?.find((entry) => entry.name === viewerObject);
     if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
     forcePlddtColours(scored);
+    showModifiedSidechains(viewer, viewerModified);
     viewer.render("af3-final");
   }
   updateScoresCard(result.confidence);

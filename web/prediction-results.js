@@ -105,6 +105,111 @@ export function recyclesToPdb(sequence, recycles, chainLengths = undefined) {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * WHICH TOKENS THE VIEWER DRAWS, one per position it makes - and the whole
+ * reason the two index spaces are not the same one.
+ *
+ * 🔴 A MODIFIED RESIDUE IS ONE POSITION AND SEVERAL TOKENS. Every family but
+ * boltz2 ATOMISES one: a phosphoserine is ten tokens carrying one atom each,
+ * and py2Dmol draws it as ONE residue, because `toPdb` writes those atoms
+ * under one residue number with a backbone among them and the parser keeps the
+ * alpha carbon. Measured on a twelve-residue chain with SEP at position 3:
+ * AF3 says 21 tokens, the viewer says 12 positions - so every residue after
+ * the modification was reading somebody else's row, and nine rows addressed
+ * nothing at all. Reported as the PAE being arranged wrongly on a fold with a
+ * modified amino acid.
+ *
+ * 🔴 AND A LIGAND IS THE OPPOSITE, WHICH IS WHY THIS IS NOT A RESIDUE MAP.
+ * A ligand's heavy atoms are one token each AND one position each - the parser
+ * has no backbone to collapse them onto - so they pass through untouched. The
+ * rule is the parser's own: a span that carries a representative atom is a
+ * RESIDUE and collapses to it; anything else is atoms and stays.
+ *
+ * The representative is the alpha carbon for a protein residue and C1' for a
+ * nucleotide, which is the atom py2Dmol keeps; falling back to the span's
+ * first token means a span with neither is still one position rather than an
+ * off-by-n for everything after it.
+ *
+ * Absent a batch (AlphaFold 2, ESMFold2 without modifications) there is
+ * nothing to collapse and the caller passes none: tokens are residues there.
+ */
+const RESIDUE_ANCHORS = ["CA", "C1'"];
+export function viewerTokens(batch) {
+    const tokens = batch?.tokens ?? 0;
+    if (!(tokens > 0)) return [];
+    const collapsed = new Map();          // token -> the one the viewer draws
+    for (const span of batch.modifiedSpans ?? []) {
+        if (!(span.count > 1)) continue;  // boltz2 keeps it in one token already
+        const names = (span.atoms ?? []).map((atom) => atom.name);
+        let at = -1;
+        for (const anchor of RESIDUE_ANCHORS) {
+            at = names.indexOf(anchor);
+            if (at >= 0) break;
+        }
+        const keeps = span.from + (at >= 0 ? at : 0);
+        for (let offset = 0; offset < span.count; offset += 1) {
+            collapsed.set(span.from + offset, keeps);
+        }
+    }
+    const keep = [];
+    for (let token = 0; token < tokens; token += 1) {
+        const draws = collapsed.get(token);
+        if (draws === undefined || draws === token) keep.push(token);
+    }
+    return keep;
+}
+
+/**
+ * WHERE THE MODIFIED RESIDUES ARE, as positions the viewer can address.
+ *
+ * A modification is invisible in a cartoon: the ribbon runs through its alpha
+ * carbon exactly as it runs through the serine it was made from, and the
+ * phosphate - the whole reason the residue is in the job - is a side-chain
+ * atom that nothing draws until it is asked for. So the page asks, for these
+ * residues and no others: `showSidechains` takes a selector, and this is the
+ * `positions` for it.
+ */
+export function modifiedPositions(batch, keep) {
+    const at = new Map();
+    for (let position = 0; position < keep.length; position += 1) at.set(keep[position], position);
+    const positions = [];
+    for (const span of batch?.modifiedSpans ?? []) {
+        for (let offset = 0; offset < span.count; offset += 1) {
+            const position = at.get(span.from + offset);
+            if (position !== undefined) { positions.push(position); break; }
+        }
+    }
+    return positions;
+}
+
+/**
+ * A token-by-token matrix read in the viewer's own index space.
+ *
+ * The rows and columns a modified residue's other atoms contributed are
+ * DROPPED rather than averaged: the value kept is the one at the atom the
+ * viewer draws, which is the residue's own frame - the same reading the
+ * matrix has for every unmodified residue beside it. Averaging would mix the
+ * phosphate's error into the backbone's and make the residue's row mean
+ * something no other row means.
+ */
+export function matrixForViewer(values, keep) {
+    const stride = Math.round(Math.sqrt(values.length));
+    if (stride * stride !== values.length) {
+        throw new RangeError(`a token matrix has ${values.length} entries, which is not square`);
+    }
+    if (keep.length === 0 || keep[keep.length - 1] >= stride) {
+        throw new RangeError(`a ${stride}-wide matrix cannot serve ${keep.length}`
+            + ` positions ending at token ${keep[keep.length - 1]}`);
+    }
+    const rows = [];
+    for (const row of keep) {
+        const out = new Array(keep.length);
+        for (let at = 0; at < keep.length; at += 1) out[at] = values[row * stride + keep[at]];
+        rows.push(out);
+    }
+    return rows;
+}
+
 /** The flat per-pair errors as rows, which is how the format is written. */
 export function paeMatrix(values, length) {
   // 🔴 THE STRIDE IS NOT ALWAYS THE LENGTH. AlphaFold 3 scores TOKENS, and a

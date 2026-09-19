@@ -709,6 +709,13 @@ export async function foldAf3(options) {
       return built.slot;
     }));
 
+  // 🔴 THE BATCH, BEFORE THE FOLD RATHER THAN AFTER IT. It is returned below
+  // too, and that is too late for anything the TRUNK produces: the contact map
+  // arrives per recycle, in TOKEN space, and only the batch says which tokens
+  // the viewer will draw as one residue (see viewerTokens). Handed over here,
+  // the live map is collapsed the same way the final one is.
+  options.onBatch?.(batch);
+
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
     // ...forwarded for probes that move the noise schedule. Unset for a page

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "./harness.js";
-import { confidenceJson, predictionToPdb, recyclesToPdb, safeJobName } from "../web/prediction-results.js";
+import { confidenceJson, matrixForViewer, modifiedPositions, predictionToPdb, recyclesToPdb,
+  safeJobName, viewerTokens } from "../web/prediction-results.js";
 
 describe("browser prediction result formatting", () => {
   it("writes only present atom37 coordinates and pLDDT B-factors", () => {
@@ -156,5 +157,75 @@ describe("TM and interface TM score calculation", () => {
     expect(multimer.ptm).toBeCloseTo(0.314704398591, 12);
     expect(multimer.iptm).toBeCloseTo(0.009639396126, 12);
     expect(multimer.multimerScore).toBeCloseTo(0.070652396619, 12);
+  });
+});
+
+describe("a token matrix in the viewer's index space", () => {
+  // A twelve-residue chain with a ten-atom phosphoserine at position 3, which
+  // is the shape measured against the real viewer: AF3 makes 21 tokens of it
+  // and py2Dmol draws 12 positions.
+  const SEP = ["N", "CA", "C", "O", "CB", "OG", "P", "O1P", "O2P", "O3P"];
+  const chainWithSep = () => ({
+    tokens: 21,
+    modifiedSpans: [{ from: 2, count: SEP.length, code: "SEP", residue: 2,
+                      atoms: SEP.map((name) => ({ name })) }],
+  });
+
+  it("keeps one token per residue and picks the atom the viewer draws", () => {
+    const keep = viewerTokens(chainWithSep());
+    // 0, 1, then the phosphoserine's CA (token 3), then 12..20
+    expect(keep.length).toBe(12);
+    expect(keep.slice(0, 4)).toEqual([0, 1, 3, 12]);
+    expect(keep[11]).toBe(20);
+  });
+
+  it("leaves a fold with nothing atomised exactly as it was", () => {
+    const keep = viewerTokens({ tokens: 5, modifiedSpans: [] });
+    expect(keep).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it("does not collapse a ligand, whose atoms are positions too", () => {
+    // Six heavy atoms of a glycerol after a ten-residue chain: sixteen tokens
+    // and sixteen positions, which is what the viewer already agreed with.
+    const keep = viewerTokens({ tokens: 16, modifiedSpans: [],
+                                ligandSpans: [{ from: 10, count: 6, code: "GOL" }] });
+    expect(keep.length).toBe(16);
+  });
+
+  it("keeps boltz2's one-token modification as one token", () => {
+    const keep = viewerTokens({ tokens: 12, modifiedSpans: [
+      { from: 2, count: 1, code: "SEP", residue: 2, oneToken: true,
+        atoms: SEP.map((name) => ({ name })) }] });
+    expect(keep.length).toBe(12);
+  });
+
+  it("reads the rows and columns the kept tokens name", () => {
+    // value(i, j) = i * 100 + j, so a misread is legible in the number itself
+    const stride = 21;
+    const values = new Float32Array(stride * stride);
+    for (let row = 0; row < stride; row += 1) {
+      for (let col = 0; col < stride; col += 1) values[row * stride + col] = row * 100 + col;
+    }
+    const keep = viewerTokens(chainWithSep());
+    const rows = matrixForViewer(values, keep);
+    expect(rows.length).toBe(12);
+    expect(rows[0].length).toBe(12);
+    // the residue after the modification is token 12, not token 3
+    expect(rows[3][3]).toBe(12 * 100 + 12);
+    // ...and the modification's own row is its ALPHA CARBON's, token 3
+    expect(rows[2][2]).toBe(3 * 100 + 3);
+    expect(rows[2][0]).toBe(3 * 100 + 0);
+  });
+
+  it("refuses a matrix too narrow for the tokens it is asked for", () => {
+    const values = new Float32Array(4 * 4);
+    expect(() => matrixForViewer(values, [0, 1, 2, 9])).toThrow();
+  });
+
+  it("names the modified residues as viewer positions", () => {
+    const batch = chainWithSep();
+    const keep = viewerTokens(batch);
+    // the phosphoserine is the third residue, so position 2
+    expect(modifiedPositions(batch, keep)).toEqual([2]);
   });
 });
