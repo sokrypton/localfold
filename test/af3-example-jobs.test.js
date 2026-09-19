@@ -129,6 +129,17 @@ describe("AlphaFold 3's own example jobs", () => {
    * Bonded chemistry and modified bases are the two gaps that remain, at three
    * and two examples, and that is the argument for which to build next.
    */
+  /**
+   * 🔴 AND "LOADS" IS NOT "FOLDS", WHICH THIS FILE CANNOT CHECK AND SHOULD NOT
+   * IMPLY. Every assertion here is about what a file BECOMES - the entity list,
+   * the seed, the dialect - and no test in the CPU suite has weights. The
+   * second question is answered by `tools/fold-in-page.py --job=<path>`, which
+   * drops the file on the page and presses Fold, and the answer as of
+   * 2026-09-19 is that ALL NINE FOLD: 76 to 476 tokens, ligands from an `id`
+   * list, a biotin built from SMILES, two phosphorylated residues and a
+   * protein/DNA complex, none of them tripping the chain-geometry rule. The
+   * per-file table is in docs/WEB.md.
+   */
   it("folds nine of the fourteen, and says which two gaps cost the rest", () => {
     const loads = Object.values(EXPECTED).filter((one) => one.loads !== undefined);
     const bonded = Object.values(EXPECTED)

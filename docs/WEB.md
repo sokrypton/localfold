@@ -1536,3 +1536,66 @@ the bundle present, and removing it again gives 240 and 23.0. `.md` is excluded
 from the search because `SOURCE.md` names every bundle by definition, and only
 top-level files are considered because `mpnn/kernels.wasm` is loaded from
 JavaScript rather than from a page.
+
+## Do AlphaFold 3's own examples work? Nine of fourteen, and now that is measured
+
+`test/af3-example-jobs.test.js` asserts what each of DeepMind's example jobs
+*becomes* - the entity list, the seed, the dialect - and **never folds one**. So
+"nine of fourteen load" was never a claim that nine of fourteen work, and
+nothing here had asked the second question.
+
+First, the corpus is complete and faithful. Checked against the upstream
+checkout on this box (`~/af3fork/examples/`): **all thirteen are byte-identical**
+to ours, with `alphafold_input.json` the extra kitchen-sink from
+`src/alphafold3/common/test_data/`. Nothing has been added upstream that we
+lack, and nothing here was edited.
+
+`tools/fold-in-page.py --job=<path>` folds one the way a reader would: it drops
+the file on the page, lets `web/job-json.js` fill the entity rows, and presses
+Fold. Nothing in the tool sets a sequence, a ligand or a modification - all of
+that comes out of the file, or the run would be testing this script's reading
+of the format instead of the page's.
+
+**All nine that load, fold.** AF3 int5, single sequence, 2 passes, 4 diffusion
+steps, seed 42 out of each file:
+
+| example | what the file asks for | in | pLDDT |
+|---|---|---:|---:|
+| `ubiquitin_monomer` | protein 76 | 2 s | 61.6 |
+| `barnase_barstar` | protein 110 + protein 89 | 7 s | 39.1 |
+| `u1a_rna_hairpin` | protein 101 + **RNA 21** | 6 s | 60.0 |
+| `calmodulin_4calcium` | protein 149 + **CA x4** | 8 s | 78.5 |
+| `streptavidin_biotin_smiles` | protein 126 + **biotin as SMILES** | 7 s | 45.8 |
+| `tetr_homodimer` | protein 218 **x2** | 16 s | 36.4 |
+| `tetr_dimer_tetracycline` | protein 218 x2 + **TAC x2** | 21 s | 42.5 |
+| `erk2_phosphorylated` | protein 360 + **TPO@185, PTR@187** | 14 s | 31.3 |
+| `tetr_dimer_dna` | protein 218 x2 + **DNA 20 x2**, 476 tokens | 18 s | 36.4 |
+
+🔴 **READ THE STATUS LINE, NOT THE pLDDT.** These are single-sequence folds at
+four diffusion steps - the cheapest setting the page has - so the confidence
+numbers say nothing about quality and are not evidence of anything except that
+a number came out. What is evidence is the *content* of each line, because it
+is built from what the featuriser actually received:
+
+```
+Fetching ligand CA        → 149 residues + CA, CA, CA, CA
+Fetching modified residue TPO, PTR → 360 residues + TPO185, PTR187
+Building LIG from its structure    → 126 residues + OC(=O)CCCC[C@@H]1SC[C...
+                                     476 residues in 4 chains
+```
+
+Four calciums from an `id` LIST, both phosphorylated residues by CCD code, a
+biotin built from SMILES rather than looked up, and a protein/DNA complex at 476
+tokens. And none of the nine appended **"NOT A CHAIN"**, which is the geometry
+rule `src/af3/chain-geometry.js` applies to every fold the page draws.
+
+**The five that refuse are two gaps, both real.** Three carry `bondedAtomPairs`
+(`kras_g12c_sotorasib`, `rnaseb_glycosylated`, and the kitchen-sink
+`alphafold_input`) - covalent chemistry this port does not build. Two are
+modified BASES: `methylated_dna` (8 x 5CM across two strands) and `modified_rna`
+(PSU, 5MC, OMG). That second refusal is not conservatism - `web/entities.js`
+states the mechanism, and it is worth quoting because it is the shape of the fix:
+the modified-residue path *resolves the parent through the amino-acid table*, so
+a modified base would be featurised as a modified amino acid and fold to
+something plausible. Making that resolution type-aware is what takes the corpus
+from nine to eleven, and it needs `test:batch` rather than a fold to prove.

@@ -300,6 +300,17 @@ def main():
                              " THE TEST: the rows are still on screen from the"
                              " fold, so 'they match' is true of a page that read"
                              " nothing at all.")
+    parser.add_argument("--job", default="",
+                        help="fold an AlphaFold 3 job JSON: DROP the file on the"
+                             " page, let it fill the entity rows, and press Fold"
+                             " - so the sequence, the copies, the ligands, the"
+                             " modified residues and the seed all come from the"
+                             " file. \U0001f534 LOADING IS NOT FOLDING:"
+                             " test/af3-example-jobs.test.js asserts what each"
+                             " of DeepMind's examples BECOMES and never folds"
+                             " one, so 'nine of fourteen load' says nothing"
+                             " about whether nine of fourteen work. Implies"
+                             " --model af3 unless one is given.")
     parser.add_argument("--drop-job", action="store_true",
                         help="DROP an AlphaFold 3 job JSON on the page the way"
                              " a reader would - a real DragEvent on the body,"
@@ -333,6 +344,13 @@ def main():
                         help="fold a SECOND time at this recycle count, which is"
                              " what the rewind-and-continue path does")
     args = parser.parse_args()
+    # 🔴 A JOB PICKS ITS OWN MODEL REQUIREMENTS AND THE PAGE DOES NOT PICK FOR
+    # IT - applyJob says why, and the fold-time guard names the model instead.
+    # Every one of AlphaFold 3's examples has a ligand, a nucleic chain or a
+    # modified residue somewhere in the set, so this tool asks for af3 unless
+    # told otherwise rather than reporting that guard as a failure to fold.
+    if args.job and "--model" not in sys.argv:
+        args.model = "af3"
 
     httpd = serve(local_weights=args.url is None and not args.remote_weights)
     proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile", keep=args.keep_profile)
@@ -369,8 +387,35 @@ def main():
         # reads it on `input` - so setting textContent alone leaves the entity
         # empty and Fold does nothing. That still applies to the single-chain
         # path, which is left alone because it is what every existing run uses.
+        # 🔴 THE FILE FILLS THE ROWS, NOT THIS TOOL. Everything below sets a
+        # sequence, a ligand or a modification through the entity list's own
+        # API; a job run must not, or it would be testing this script's idea of
+        # the file rather than the page's. The drop is the page's own gesture
+        # and web/job-json.js is the only thing that reads it.
         chains = [c for c in args.sequence.split(":") if c.strip()]
-        if len(chains) > 1:
+        if args.job:
+            print("job:", cdp.evaluate(ws, """(async () => {
+              const list = window.__entityList;
+              if (!list) return 'no entity list';
+              const carrier = new DataTransfer();
+              carrier.items.add(new File([%s], %s,
+                { type: 'application/json' }));
+              document.body.dispatchEvent(new DragEvent('dragenter',
+                { bubbles: true, cancelable: true, dataTransfer: carrier }));
+              document.body.dispatchEvent(new DragEvent('drop',
+                { bubbles: true, cancelable: true, dataTransfer: carrier }));
+              await new Promise((done) => setTimeout(done, 900));
+              return JSON.stringify({
+                status: document.getElementById('status-message')?.textContent ?? '',
+                rows: list.read().map((e) => e.type + ':'
+                  + (e.type === 'ligand' ? e.value : e.value.length)
+                  + 'x' + e.copies),
+                seed: document.getElementById('random-seed')?.value ?? null,
+              });
+            })()""" % (json.dumps(open(args.job, encoding="utf-8").read()),
+                       json.dumps(os.path.basename(args.job))),
+              await_promise=True))
+        elif len(chains) > 1:
             print("chains:", cdp.evaluate(ws, """(() => {
               const list = window.__entityList;
               if (!list) return 'no entity list';
