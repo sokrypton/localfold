@@ -73,6 +73,37 @@ describe("the fold archive", () => {
     ]);
   });
 
+  // 🔴 FIVE MODELS FOLDED, FIVE STRUCTURES SAVED. "All 5" ranks every model's
+  // passes together and the page keeps ONE - which threw four structures away
+  // that the play bar was still showing, and left the saved one with nothing to
+  // be compared against. ColabFold writes one per model with the rank in the
+  // name; so does this now, ranked by the criterion the page itself used.
+  it("writes one structure per model when a sweep produced them", () => {
+    const files = buildFoldArchive({
+      stem: "fold_test", model: "AlphaFold 2 (monomer-3)", settings: { seed: 0 },
+      entities, prediction: prediction(),
+      perModel: [
+        { rank: 1, family: "monomer-3", number: "3", pdb: "PDB3", scores: { plddt: 3 } },
+        { rank: 2, family: "monomer", number: "1", pdb: "PDB1", scores: { plddt: 1 } },
+      ],
+    });
+    expect(files.get("fold_test_rank_001_model_3.pdb")).toBe("PDB3");
+    expect(files.get("fold_test_rank_002_model_1.pdb")).toBe("PDB1");
+    expect(files.has("fold_test_rank_001_model_3_scores.json")).toBe(true);
+    // ...and the winner is still where a reader of any other archive looks for
+    // it, so nothing that reads these files has to learn a second layout.
+    expect(files.has("fold_test_model_0.pdb")).toBe(true);
+  });
+
+  // ...and a single-model fold is byte for byte the archive it always was.
+  it("writes no per-model files when one model folded", () => {
+    const files = buildFoldArchive({
+      stem: "fold_test", model: "AlphaFold 2", settings: { seed: 0 },
+      entities, prediction: prediction(),
+    });
+    expect([...files.keys()].some((name) => name.includes("_rank_"))).toBe(false);
+  });
+
   // 🔴 A COUNT, NOT REPEATED ENTRIES. expandEntities turns two copies into two
   // chains because that is what the model is handed; the request that produced
   // the job says `count: 2` on one entry, and a file listing the sequence twice

@@ -524,7 +524,7 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
  */
 export function buildFoldArchive({
   stem, model, settings, entities, prediction, msas = {}, templates,
-  msaOrigin, alignmentOmitted = false,
+  msaOrigin, alignmentOmitted = false, perModel,
 }) {
   const name = safeJobName(stem);
   const { confidence, alignedError, pdb, chainLengths } = prediction;
@@ -550,6 +550,26 @@ export function buildFoldArchive({
     name: stem, seed: settings?.seed, entities,
   }));
   files.set(`${name}_model_0.pdb`, pdb);
+  // 🔴 AND ONE FILE PER MODEL WHERE FIVE OF THEM FOLDED. "All 5" runs
+  // AlphaFold 2's five models as one prediction and ranks their passes
+  // together, and an archive carrying only the winner throws four structures
+  // away that the play bar is still showing - there is nothing to compare the
+  // saved one against. ColabFold's convention is one structure per model with
+  // the rank in the name, so that is what this writes, ranked by the criterion
+  // the page itself used: `rank_001` IS `_model_0.pdb`, written again under the
+  // name that says which of the five it was.
+  //
+  // Absent for a single-model fold, which has nothing to rank - so an ordinary
+  // archive is byte for byte what it always was.
+  for (const entry of perModel ?? []) {
+    const rank = String(entry.rank).padStart(3, "0");
+    const base = `${name}_rank_${rank}_model_${entry.number}`;
+    files.set(`${base}.pdb`, entry.pdb);
+    if (entry.scores !== undefined) {
+      files.set(`${base}_scores.json`,
+                typeof entry.scores === "string" ? entry.scores : JSON.stringify(entry.scores, null, 2));
+    }
+  }
   // 🔴 AND THE SUMMARY IS OMITTED WHEN IT WOULD HOLD ONLY CHAIN LETTERS. Every
   // score in it is guarded on the field it needs, so a model with no confidence
   // head produced a file whose entire content was `chain_ids` - 35 copies of

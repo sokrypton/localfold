@@ -1183,3 +1183,57 @@ web/esmfold2-model.js has had the one-stream rule since its own 347 MiB
 download, and this is the second place to need it. They are not shared yet -
 that one must also STOP reporting when the load ends, its tower going on
 streaming through the fold, which nothing here does.
+
+### "All 5" saves five structures now, not one
+
+Asked after the sweep shipped: *"if all 5 models are selected, are we saving the
+best from each model or best over all"*. It was best over ALL - one
+`_model_0.pdb`, the single best pass of the five, with the other four visible on
+the play bar and absent from every file. Five models folded and one structure
+saved is four thrown away, and the one that is kept has nothing to be compared
+against.
+
+The archive now writes, beside the file it always wrote:
+
+```
+fold_all5_1_model_0.pdb                 the winner, where every reader looks
+fold_all5_1_rank_001_model_3.pdb        ...and the same structure named by model
+fold_all5_1_rank_001_model_3_scores.json
+fold_all5_1_rank_002_model_1.pdb
+...                                     one per model, ranked
+```
+
+Ranked by the criterion the page itself used to pick the winner - the multimer
+score for a complex, mean pLDDT otherwise - so `rank_001` IS `_model_0.pdb`
+under a name that says which of the five it was. ColabFold's convention, which
+is what anyone running all five expects.
+
+🔴 **AND A SINGLE-MODEL FOLD IS BYTE FOR BYTE THE ARCHIVE IT ALWAYS WAS.**
+`perModel` is undefined unless a sweep ran, so nothing that reads these files
+has to learn a second layout for the common case. `test/fold-archive.test.js`
+gates both directions and was watched failing with the loop removed.
+
+### ...and re-running a sweep re-reads the deltas, which costs nothing measurable
+
+Noticed at the same time: *"when I rerun, it redownloads?"* It does re-read, and
+here is why and what it costs.
+
+A sweep releases each delta once its passes are in hand, because holding five
+models is **3.2 GB of JS heap against Chrome's ~4 GB ceiling** - measured, and
+the reason the release exists. 🔴 **AND RELEASING ONLY THE ASSEMBLED WEIGHTS
+DOES NOT WORK**: with the STORE kept the same sweep holds **3248 MiB** against
+302, so the memory is the store's decoded-tensor cache and not the weight tree
+built from it. There is no version of this that keeps the bytes and the heap.
+
+What the re-read actually costs, two sweeps in one session:
+
+| | wall |
+|---|---:|
+| first sweep | 16.0 s |
+| second, same session | **15.3 s** |
+
+No slower - the shards come from the browser's HTTP cache rather than the
+network (the bundles are pinned to a commit, so their URLs are immutable), and
+what is paid again is the DECODE, which the first run paid too. The dial
+animating for a second time is the part that reads as a download.
+

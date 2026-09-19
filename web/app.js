@@ -3707,6 +3707,34 @@ async function fold(event) {
         > rankOf(alignedRecycles[bestIndex].confidence)) bestIndex = index;
     }
     const best = alignedRecycles[bestIndex];
+    // 🔴 AND UNDER A SWEEP, THE BEST PASS OF EVERY MODEL - not just of the run.
+    // Five models folded and one structure saved is four thrown away: the
+    // frames are all on the play bar, so the data exists, and an archive that
+    // carries one of them cannot be compared against anything. ColabFold writes
+    // one structure per model, rank-ordered, and that is the convention people
+    // running all five expect. Ranked by the SAME criterion the overall best
+    // uses, so `rank_001` is the file the page itself chose.
+    const perModel = sweep.length === 1 ? undefined : sweep
+      .map((foldFamily) => {
+        let pick;
+        for (const pass of alignedRecycles) {
+          if (pass.family !== foldFamily) continue;
+          if (pick === undefined || rankOf(pass.confidence) >= rankOf(pick.confidence)) pick = pass;
+        }
+        return pick === undefined ? undefined : { family: foldFamily, pass: pick };
+      })
+      .filter((entry) => entry !== undefined)
+      .sort((a, b) => rankOf(b.pass.confidence) - rankOf(a.pass.confidence))
+      .map((entry, rank) => ({
+        rank: rank + 1,
+        family: entry.family,
+        // ...the number a reader picked in the row, which is what names the file.
+        number: entry.family.split("-")[1] ?? "1",
+        confidence: entry.pass.confidence,
+        pdb: predictionToPdb(sequence, entry.pass.structure,
+                             entry.pass.confidence.plddt, chainLengths),
+        scores: confidenceJson(sequence, entry.pass.confidence),
+      }));
     previousFold = {
       sequence,
       structure: finalLanded,
@@ -3725,6 +3753,9 @@ async function fold(event) {
       recycles: alignedRecycles,
       bestPass: bestIndex,
       contactSource: best.pass,
+      // ...every model's own best, ranked, for the archive. Absent for a
+      // single-model fold, which has nothing to rank.
+      perModel,
       // ...the model that MADE the saved pass, which under a sweep is whichever
       // of the five won rather than the one the row resolved to.
       model: `AlphaFold 2 (${best.family ?? family})`,
@@ -4176,6 +4207,9 @@ function archiveFor(pred, { includeAlignment = true } = {}) {
       // "this model has no such control". Defaulting it here silently undid
       // the distinction the archive was taught to make.
       templates: pred.templates,
+      // ...and every model's own best where a sweep produced them. See the
+      // note in buildFoldArchive: one file per model, ranked.
+      perModel: pred.perModel,
       prediction: {
         pdb: pred.pdb,
         chainLengths: pred.chainLengths,
