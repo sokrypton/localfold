@@ -1839,6 +1839,13 @@ export function selectAttentionFlashKernel(
     // ...and the key chunk, which the kernel derives from the precision unless
     // a device names one. See attentionKeyChunk.
     const keyChunk = shapedKnob(deviceTuning(device).attentionKeyChunk) ?? undefined;
+    // 🔴 HOW MANY QUERIES A LANE OWNS, WHICH IS THE REUSE OF THE STAGED KEY.
+    // The staged tile is read once per lane per key whatever the lane does with
+    // it, so a lane holding two queries gets two multiply-adds out of one
+    // workgroup read. Measured here: the kernel runs at 7.6-8.0 TFLOP/s against
+    // a scalar f32 ceiling of 7.2 and a vec4 one of 28.6, which is the shape of
+    // a kernel bound by staged reads rather than by arithmetic.
+    const queriesPerLane = shapedKnob(deviceTuning(device).attentionQueriesPerLane) ?? 1;
     const inputStorage = storage.input ?? "f32";
     const outputStorage = storage.output ?? "f32";
     // The VALUE follows the other inputs unless a caller separates it. See the
@@ -1855,7 +1862,10 @@ export function selectAttentionFlashKernel(
       // 🔴 AND THE CHUNK IS IN THE KEY, because it is baked into the source and
       // into the staged tile's size - two pipelines built from one key and two
       // chunks is the collision `ComputePipelineCache` refuses by source.
-      + (keyChunk === undefined ? "" : `-k${keyChunk}`);
+      + (keyChunk === undefined ? "" : `-k${keyChunk}`)
+      // ...and the query count, which changes the source AND the grid. A key
+      // that named neither is what kept this knob unwired.
+      + (queriesPerLane === 1 ? "" : `-q${queriesPerLane}`);
     return {
       // The suffix appears only when something is packed, so the key a device
       // without this path gets is the one it has always had - and the value's
@@ -1864,8 +1874,11 @@ export function selectAttentionFlashKernel(
       cacheKey: registerKey,
       shader: shaderSource(device, registerKey, () => createAttentionRegisterFlashShader(
         headDim, keyChunk, { precision, inputStorage, valueStorage, outputStorage,
-          group, vectorScore })),
-      queryTile: 64, variant, packedStorageSupported: true, valueStorage,
+          group, vectorScore, queriesPerLane })),
+      // ...and the grid follows the shader: both block files dispatch
+      // `ceil(queries / queryTile)`, so this is the whole of the dispatch half.
+      queryTile: attentionFlashQueriesPerGroup(queriesPerLane),
+      variant, packedStorageSupported: true, valueStorage,
     };
   }
   return {

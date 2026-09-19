@@ -1215,25 +1215,18 @@ export function deviceProfile(device) {
       ...(OVERRIDES.get(device) ?? {}),
     }),
   });
-  // 🔴 A KNOB NOTHING READS MUST REFUSE, NOT BE IGNORED - AND THE REFUSAL GOES
-  // HERE, NOT AT A KERNEL. The first attempt put this in `attention.js` beside
-  // the other two attention knobs, which is where it looks like it belongs and
-  // is a place this A100 never reaches: it resolves the MATRIX flash kernel, so
-  // the register selector's destructure never runs and
-  // `--tune=attentionQueriesPerLane=2` folded to the usual -1287025 with the
-  // guard in place. A guard in an unreached path is not a guard, which is this
-  // repository's own rule about control arms pointed at itself.
+  // 🔴 WIRED NOW, AND THIS IS WHERE THE REFUSAL USED TO BE. The knob was
+  // declared with numbers from three other devices (M2 0.21x, M4 Pro 0.45x,
+  // GB10 1.17-1.42x) and read by nothing, so `deviceProfile` threw on any value
+  // but 1 rather than letting it silently change nothing - the right answer for
+  // a dead knob, and the note is kept because the SHAPE of that mistake
+  // recurred three times in one session afterwards.
   //
-  // Every caller resolves tuning through here, whatever kernel it then picks.
-  const perLane = profile.tuning.attentionQueriesPerLane;
-  if (perLane !== undefined && perLane !== null && perLane !== 1) {
-    throw new RangeError("attentionQueriesPerLane is declared but NOT WIRED:"
-      + " nothing reads it, so setting it would silently change nothing. The"
-      + " kernel parameter it names is real (attention.js's"
-      + " `options.queriesPerLane`) and the knob has numbers - M2 0.21x, M4 Pro"
-      + " 0.45x, GB10 1.17-1.42x - but connecting them needs the pipeline KEY"
-      + " and the DISPATCH too, and `registerKey` names neither.");
-  }
+  // What it needed was the pipeline KEY and the DISPATCH, not just a
+  // destructure: `selectAttentionFlashKernel` now reads it, puts `-q<n>` in the
+  // register key and returns `queryTile: 64 * n`, which is the grid both block
+  // files divide by. The shader has carried `options.queriesPerLane` and
+  // `attentionFlashQueriesPerGroup` all along.
   CACHE.set(device, profile);
   return profile;
 }

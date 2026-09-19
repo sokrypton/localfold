@@ -3336,3 +3336,61 @@ plus a residency skip, which is the shape of the change and why it was not made
 blind at the end of a session. The prize is 529 ms of 13.0 s (4%) on this
 machine, and more where compiling is slower than an A100's driver.
 
+### Our own pass at the biggest kernel: what it achieves, and why it stops there
+
+The borrowed catalogue was exhausted, so: measure the largest kernel family
+against what the machine can do, and follow the diagnosis rather than a list.
+
+**The flash attention is 34.8% of a block at 825 residues and 27.8% at 400, and
+nothing had ever measured its throughput.** `probe-alu.js` under stock flags
+gives this card's own ceilings - **scalar f32 FMA 7158 GFLOP/s, vec2 14317, vec4
+28633**, and workgroup reads 2454 G/s - and `bench-msa-attention.js` at a
+block's shapes gives the kernel:
+
+| shape | ms | GFLOP/s |
+|---|---:|---:|
+| 400 res, 128 rows, 256 channels, 8 heads | 2.75 | **7626** |
+| 400 res, 400 rows, 128 channels, 4 heads | 4.10 | **7992** |
+
+So it runs a little ABOVE the scalar FMA rate and at **27% of the vec4 one**.
+That is not the profile of a kernel short of arithmetic; it is one bound by how
+many times a staged key element is reused, because the staged tile is read once
+per lane per key whatever the lane does with it.
+
+**There is exactly one knob for that, and it was declared and never wired.**
+`attentionQueriesPerLane` had numbers from three other devices - M2 0.21x, M4
+Pro 0.45x, GB10 1.17-1.42x - a real kernel parameter behind it
+(`options.queriesPerLane`, with the `perQuery` unrolling and
+`attentionFlashQueriesPerGroup` already written), and `deviceProfile` THREW on
+any value but 1 rather than let it silently do nothing. What it needed was the
+pipeline KEY and the DISPATCH. Both are wired now: the register key carries
+`-q<n>` and the descriptor returns `queryTile: 64 * n`, which is the grid both
+block files already divide by.
+
+Measured on this card, stock flags, interleaved:
+
+| queries a lane | block 150 | block 400 | `msa-row-attention.flash` 400 |
+|---|---:|---:|---:|
+| **1 (shipped)** | **10.43** | **51.58** | **2.425** |
+| 2 | 11.02 | 54.14 | 2.949 |
+| 4 | 11.67 | 56.82 | 3.342 |
+
+**Ampere behaves like the Apple parts, not like GB10: 0.95x at 400 and 0.90x at
+150.** More queries a lane costs registers and occupancy faster than it saves
+staged reads, on a kernel that is already register-resident. The knob stays at
+1, and this card's number joins the table.
+
+🔴 **SO THE KERNEL IS AT ITS DESIGN'S CEILING, WHICH IS THE USEFUL FINDING.**
+The diagnosis says staged-read reuse; the two levers that address it are the key
+chunk (swept: the derived value is already best) and the queries a lane (swept:
+worse at 2 and 4). Both are now measured on this card, so what is left is a
+different DESIGN - the matrix flash kernel, which is 1.69x here and which no
+visitor can reach without a developer flag. A vector-path AF2 fold on this
+machine is as fast as this port knows how to make it.
+
+🔴 **AND THE KNOB IS LIVE NOW RATHER THAN REFUSED.** `--tune=attentionQueriesPerLane=2`
+threw before and folds now (checksum -1308439 -> -1313808, pLDDT 62.924 ->
+62.926 - the queries are assigned to lanes differently, so the reassociation is
+visible and tiny), and `audit-knobs.py` will report it as a knob that moves
+shaders instead of as a declared no-op.
+
