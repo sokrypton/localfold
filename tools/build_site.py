@@ -436,6 +436,50 @@ def unresolved_imports(root: Path) -> list[str]:
     return sorted(problems)
 
 
+def drop_unreferenced_vendor() -> None:
+    """Leave a vendored bundle out of the site when no shipped page loads it.
+
+    🔴 620 KB WAS PUBLISHED FOR PAGES THAT ARE NOT IN THE SITE.
+    `py2Dmol.embed.min.js` is loaded by single.html and proteinhunter.html, and
+    both are held back - OPTIONAL above, out of the repository and gitignored
+    until the model row they were built against stops moving. `web/` is copied
+    wholesale, so the bundle they need shipped on every deploy regardless, to be
+    fetched by nobody. Pages is capped at a gigabyte (docs/HOSTING.md) and this
+    is the second-largest file on the site.
+
+    🔴 DERIVED, NOT A NAME IN A LIST, for the reason the model registry is: the
+    day single.html comes back its bundle comes back with it, with no edit here
+    and nothing to forget. That is also why this DELETES FROM `dist/` rather
+    than skipping the copy - the rule is about what the site serves, and the
+    checkout keeps its mirror intact so `sync-py2dmol.py --check` still has
+    something to compare and the commit that held those pages out keeps its
+    promise that putting them back is one line.
+
+    Only top-level files are considered, and only against what the site
+    actually serves as CODE: an asset loaded from JavaScript (mpnn/kernels.wasm)
+    lives in a subdirectory, and SOURCE.md names every bundle by definition, so
+    reading the .md would make every file look referenced.
+    """
+    vendor = OUT / "web" / "vendor"
+    if not vendor.is_dir():
+        return
+    served = []
+    for path in OUT.rglob("*"):
+        if path.is_file() and path.suffix in {".html", ".js", ".css"} \
+                and vendor not in path.parents:
+            served.append(path.read_text(encoding="utf-8", errors="ignore"))
+    blob = "\n".join(served)
+    for path in sorted(vendor.iterdir()):
+        if not path.is_file() or path.suffix == ".md":
+            continue
+        if path.name in blob:
+            continue
+        size = path.stat().st_size
+        path.unlink()
+        print(f"   left out {path.name} ({size / 1024:.0f} KiB):"
+              " no page in this site loads it")
+
+
 def build(include_model: bool) -> int:
     if OUT.exists():
         shutil.rmtree(OUT)
@@ -458,6 +502,8 @@ def build(include_model: bool) -> int:
             print(f"missing {name}/", file=sys.stderr)
             return 1
         shutil.copytree(source, OUT / name, ignore=IGNORE)
+
+    drop_unreferenced_vendor()
 
     # 🔴 WHAT THE SITE IS SERVING, ANSWERABLE FROM OUTSIDE IT. "Is it live?"
     # used to be answered by eye - fetch a file, squint at its bytes - and got

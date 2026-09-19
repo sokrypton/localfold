@@ -425,143 +425,64 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                  they are defaults, and a default that is right does not need
                  to be on screen. So they fold behind a button and the row that
                  matters gets the whole width. -->
-            <div class="fetch-panel" style="display: none;">
-                <!-- WHAT TO LOAD, all on one line. The label the ID box used to
-                     carry is the placeholder now: it said the same words, in
-                     the same place, one line further up. -->
-                <div class="fetch-row" id="fetch-input-container">
-                    <input type="text" id="fetch-id"
-                        aria-label="PDB ID (4 characters, optionally +chains) or UniProt ID"
-                        placeholder="e.g., 1A3N, 1a3n_AB or P0A8I3">
-                    <button id="fetch-btn" class="btn btn-primary">Fetch</button>
-                    <button id="upload-button" class="btn btn-secondary">
-                        <i class="fa-solid fa-file-arrow-up"></i>
-                        <span>Upload</span>
-                    </button>
-                    <input type="file" id="file-upload"
-                        accept=".pdb,.cif,.ent,.zip,.json,.cst,.a3m,.fasta,.fa,.fas,.sto,.csv" multiple
-                        class="hidden">
-                    <!-- aria-expanded and aria-controls, because a button that
-                         shows something has to say so to anything not looking
-                         at it. -->
-                    <button id="fetchOptionsButton" class="btn btn-grey" type="button"
-                        aria-expanded="false" aria-controls="fetchOptions"
-                        title="Loading options: frames, alignment, PAE, biounit, ligands">
-                        <span>Options</span>
-                        <span id="fetchOptionsCaret" aria-hidden="true">&#9662;</span>
-                    </button>
-                </div>
+            <!-- 🔴 py2Dmol'S LOADER SETTINGS, NOT A PANEL. This was 138 lines
+                 of py2Dmol's own website chrome at `display: none` - a PDB/
+                 UniProt fetch row, four example buttons, an options disclosure
+                 and seven checkboxes - none of it reachable, because LocalFold
+                 offers prediction and py2Dmol.solab.org offers the viewer. What
+                 is left is the seven elements that are NOT decoration, each of
+                 which was measured against the bundle before it was kept.
 
-                <!-- ONE ROW, which is what the whole width buys. Wired
-                     generically off data-example-value, so adding one needs no
-                     JS - but the row does not wrap any more, so adding a fifth
-                     is now a decision about width rather than a free action. -->
-                <div class="fetch-row fetch-examples">
-                    <span class="fetch-row-label">Examples</span>
-                    <button class="btn btn-success btn-small" data-example-value="6MRR">
-                        <span>6MRR</span>
-                    </button>
-                    <button class="btn btn-success btn-small" data-example-value="Q5VSL9">
-                        <span>Q5VSL9</span>
-                    </button>
-                    <button class="btn btn-success btn-small" data-example-value="1YNE">
-                        <span>1YNE</span>
-                    </button>
-                    <button class="btn btn-success btn-small" data-example-value="1A3N">
-                        <span>1A3N</span>
-                    </button>
-                </div>
+                 🔴 THREE OF THEM ARE READ WITHOUT A GUARD AT STARTUP, so
+                 deleting one throws inside `setupEventListeners` - which
+                 silently aborts the REST of `initializeApp` and takes the MSA
+                 panel's wiring with it. The symptom is not an error; it is a
+                 feature that never wired itself up.
 
-                <!-- ...AND THE OPTIONS, folded away, IN GROUPS. Eight
-                     switches in one flowing row is a list to read rather than
-                     a thing to scan: they answer three different questions,
-                     and which one a switch belongs to is not obvious from its
-                     name (Align chain is about frames, Filter Additives is
-                     about what the file contains). Grouped, each column is one
-                     question, and the two columns you are not asking can be
-                     skipped in a glance. -->
-                <div class="fetch-options" id="fetchOptions" hidden>
-                    <!-- MANY MODELS IN ONE FILE, and what to do with them. -->
-                    <div class="fetch-option-group">
-                        <span class="fetch-option-title">Frames</span>
-                        <div class="upload-toggle-item">
-                            <label class="switch">
-                                <input type="checkbox" id="loadAsFramesCheckbox" checked>
-                                <span class="slider-toggle"></span>
-                            </label>
-                            <label for="loadAsFramesCheckbox" class="upload-toggle-label">Load as Frames</label>
-                        </div>
-                        <div class="upload-toggle-item">
-                            <label class="switch">
-                                <input type="checkbox" id="alignFramesCheckbox" checked>
-                                <span class="slider-toggle"></span>
-                            </label>
-                            <label for="alignFramesCheckbox" class="upload-toggle-label">Align Frames</label>
-                        </div>
-                        <!-- WHICH CHAIN THE FRAMES ARE ALIGNED ON. Blank keeps
-                             the old behaviour - the first chain in the reference
-                             frame - which is right until the first chain is not
-                             the one you care about. Only read when Align Frames
-                             is on, which is why it sits under it. -->
-                        <div class="upload-toggle-item" id="alignChainRow">
-                            <label for="alignChainInput" class="upload-toggle-label"
-                                title="Align the frames on this chain. Blank uses the first chain in the structure.">Align chain</label>
-                            <input type="text" id="alignChainInput" placeholder="auto"
-                                maxlength="4" autocomplete="off" spellcheck="false"
-                                style="width: 64px; height: 26px; font-size: 12px; padding: 0 6px; border: 1px solid #d1d5db; border-radius: 6px;">
-                        </div>
-                    </div>
+                 🔴 AND `#loadAsFramesCheckbox` IS ON OUR OWN FOLD PATH.
+                 `processFiles` - which `window.py2dmolLoadFiles` calls, which
+                 is how web/app.js puts a prediction on screen - reads
+                 `p.checked` with NO guard. Measured by deleting it: the fold
+                 still computes and the status line still reads "Done in 1.2 s
+                 · pLDDT 64.2 · pTM 0.338", and the structure never arrives -
+                 "Error processing af#_#.pdb: Cannot read properties of null
+                 (reading 'checked')". A right answer nobody can see.
 
-                    <!-- WHAT OF THE FILE ENDS UP IN THE PICTURE. All three
-                         change which atoms are there at all, which is a
-                         different question from how they are drawn. -->
-                    <div class="fetch-option-group">
-                        <span class="fetch-option-title">Structure</span>
-                        <div class="upload-toggle-item">
-                            <label class="switch">
-                                <input type="checkbox" id="biounitCheckbox" checked>
-                                <span class="slider-toggle"></span>
-                            </label>
-                            <label for="biounitCheckbox" class="upload-toggle-label">Load Biounit</label>
-                        </div>
-                        <div class="upload-toggle-item">
-                            <label class="switch">
-                                <input type="checkbox" id="loadLigandsCheckbox" checked>
-                                <span class="slider-toggle"></span>
-                            </label>
-                            <label for="loadLigandsCheckbox" class="upload-toggle-label">Load Ligands</label>
-                        </div>
-                        <div class="upload-toggle-item">
-                            <label class="switch">
-                                <input type="checkbox" id="filterAdditivesCheckbox" checked>
-                                <span class="slider-toggle"></span>
-                            </label>
-                            <label for="filterAdditivesCheckbox" class="upload-toggle-label"
-                                title="Leave out buffers, cryoprotectants and counter-ions - what the crystal was grown in rather than what the molecule is">Filter Additives</label>
-                        </div>
-                    </div>
+                 🔴 AND `#fetch-id` IS A FLAG, NOT A BOX - KEPT ON A READING,
+                 WHICH IS WEAKER EVIDENCE AND IS SAID SO ON PURPOSE. The bundle
+                 computes `isIndexHTML = getElementById("fetch-id") !== null &&
+                 getElementById("fetch-uniprot-id") === null` once at load, and
+                 that flag is the only thing gating `initializeMSAIndex()`,
+                 which wires `#msaChainSelect` and `#msa-buttons`. Deleting it
+                 was TRIED and changed nothing observable: a single-chain fold
+                 with a 128-row search is identical either way, because the
+                 chain selector that function fills hides itself below two
+                 chains and LocalFold prints its own "Loaded MSAs" line. So the
+                 falsification is missing, not passed - a two-chain fold is
+                 where it would show. One line to keep, and the cost of being
+                 wrong is an MSA panel that quietly stops wiring itself up.
 
-                    <!-- ...AND WHAT COMES WITH IT. Neither is the structure:
-                         they are other files fetched alongside it, and they
-                         open panels of their own. -->
-                    <div class="fetch-option-group">
-                        <span class="fetch-option-title">Alongside</span>
-                        <div class="upload-toggle-item">
-                            <label class="switch">
-                                <input type="checkbox" id="loadPAECheckbox" checked>
-                                <span class="slider-toggle"></span>
-                            </label>
-                            <label for="loadPAECheckbox" class="upload-toggle-label">Load PAE</label>
-                        </div>
-                        <div class="upload-toggle-item">
-                            <label class="switch">
-                                <input type="checkbox" id="loadMSACheckbox" checked>
-                                <span class="slider-toggle"></span>
-                            </label>
-                            <label for="loadMSACheckbox" class="upload-toggle-label">Load MSA</label>
-                        </div>
-                    </div>
-                </div>
+                 The other two carry their `checked` state because absence and
+                 unchecked are not the same answer: `alignFrames` reads
+                 `!!m && m.checked` and `loadMSA` reads `!!u && u.checked`, so
+                 both default to FALSE when the element is gone and TRUE as
+                 written here. `loadPAECheckbox` reads `!d || d.checked` and so
+                 means the same thing absent - which is why it is not here.
+                 Removed with it and for the same reason: `biounitCheckbox`,
+                 `loadLigandsCheckbox` and `filterAdditivesCheckbox`, whose
+                 values `initializeViewerConfig` hard-codes as defaults anyway,
+                 and `alignChainInput`, read as `?.value || ""`.
+
+                 Do not "tidy" any of this away without re-reading the bundle:
+                 every line here is a measurement. -->
+            <div class="fetch-panel" style="display: none;" aria-hidden="true">
+                <input type="text" id="fetch-id">
+                <button id="fetch-btn" type="button"></button>
+                <button id="upload-button" type="button"></button>
+                <input type="file" id="file-upload">
+                <input type="checkbox" id="loadAsFramesCheckbox" checked>
+                <input type="checkbox" id="alignFramesCheckbox" checked>
+                <input type="checkbox" id="loadMSACheckbox" checked>
             </div>
 
             <!-- STATUS AND PROGRESS ARE ONE BLOCK, AND IT NEVER CHANGES HEIGHT.

@@ -1445,3 +1445,94 @@ the mistake `chosenFamily` was written to end. A reader who drops
 `calmodulin_4calcium.json` under AF2 and presses Fold is told *"Ligands need
 AF3, OpenBind-0 or ESMFold2; the model is set to monomer"* - one more click, and
 never a quietly dropped calcium.
+
+## Purging py2Dmol's website: 138 lines of it were load-bearing
+
+LocalFold offers prediction; py2Dmol.solab.org offers the viewer. So the fetch
+row, the four example buttons, the options disclosure and the seven checkboxes
+that `index.html` carried at `display: none` were py2Dmol's website showing
+through, and none of it was reachable. **Most of it went. Seven elements did
+not, and finding out which is the whole of this entry.**
+
+🔴 **THREE ARE READ WITHOUT A GUARD AT STARTUP.** `setupEventListeners` does
+`getElementById("fetch-btn").addEventListener(...)` and the same for
+`#upload-button` and `#file-upload` - everything else in that function is
+`&&`-guarded, which is why `#drawCheckbox`, `#saveStateButton`,
+`#prevObjectButton` and `#nextObjectButton` have been absent all along with
+nothing to show for it. A throw there aborts the rest of `initializeApp`, and
+the symptom is not an error: it is the MSA panel never wiring itself up.
+
+🔴 **AND `#loadAsFramesCheckbox` IS ON OUR OWN FOLD PATH, WHICH IS THE ONE THAT
+WOULD HAVE HURT.** `processFiles` - reached by `window.py2dmolLoadFiles`, which
+is how `web/app.js` puts a prediction on screen - reads `p.checked` with no
+guard at all. Measured by deleting it:
+
+```
+Folding # residues · # passes · monomer
+Error processing af#_#.pdb: Cannot read properties of null (reading 'checked')
+Done in 1.2 s · pLDDT 64.2 · pTM 0.338
+```
+
+The fold computes, the status line reports a perfectly good pLDDT, and the
+structure never arrives. A hidden checkbox in a panel nobody can see decides
+whether a prediction is displayed.
+
+🔴 **AND ABSENT IS NOT UNCHECKED.** Three of the remaining boxes are read as
+`!!m && m.checked` and two as `!d || d.checked`, so deleting one is *false* in
+the first case and *true* in the second. `alignFramesCheckbox` and
+`loadMSACheckbox` are the first kind and stay, with their `checked` attribute,
+because losing them would silently turn frame alignment and the MSA hand-off
+off. `loadPAECheckbox` is the second kind and means the same thing absent, so it
+went - along with `biounitCheckbox`, `loadLigandsCheckbox` and
+`filterAdditivesCheckbox`, whose values `initializeViewerConfig` hard-codes as
+defaults anyway, and `alignChainInput`, read as `?.value || ""`.
+
+🔴 **AND ONE IS A FLAG RATHER THAN A CONTROL - KEPT ON A READING, WHICH IS
+WEAKER AND IS RECORDED AS SUCH.** The bundle computes, once at load,
+
+```js
+const isIndexHTML = getElementById("fetch-id") !== null
+                 && getElementById("fetch-uniprot-id") === null;
+```
+
+and that is the only thing gating `initializeMSAIndex()`. Deleting `#fetch-id`
+was tried and **changed nothing observable**: a single-chain fold with a search
+is identical either way, because the chain selector that function fills hides
+itself below two chains and LocalFold prints its own "Loaded MSAs" line. So the
+falsification is *missing, not passed*; a two-chain fold is where it would show.
+One line to keep, against an MSA panel that quietly stops wiring itself up.
+
+138 lines to 48, of which 41 are the comment explaining why the other seven are
+still there.
+
+### 620 KB published for pages that are not on the site
+
+`py2Dmol.embed.min.js` is loaded by `single.html` and `proteinhunter.html`, both
+**held back at `b0dc258`** - out of the repository and gitignored until the model
+row they were built against stops moving, with every tool that touches them
+skipping a page it cannot find. `web/` is copied wholesale, so their bundle
+shipped on every deploy to be fetched by nobody: the second-largest file on a
+site Pages caps at a gigabyte.
+
+🔴 **DELETING THE MIRROR WAS THE FIRST ATTEMPT AND IT WAS WRONG.** That commit's
+own promise is that putting those pages back is *one line*, and it kept every
+tool that touches them working for exactly that reason. Removing the vendored
+bundle would have made it one line plus a `sync-py2dmol.py` run against an
+upstream checkout that is not on this machine.
+
+So `build_site.py` derives it instead: after the copy, a top-level file in
+`dist/web/vendor/` that no shipped `.html`, `.js` or `.css` names is removed
+from **`dist/`**, and the build says so.
+
+```
+   left out py2Dmol.embed.min.js (620 KiB): no page in this site loads it
+dist/  240 files, 23.0 MiB
+```
+
+Derived for the reason the model registry is - the day `single.html` returns its
+bundle returns with it, with no edit here and nothing to forget. Verified both
+ways: a stub `single.html` loading that bundle gives **242 files, 23.6 MiB** with
+the bundle present, and removing it again gives 240 and 23.0. `.md` is excluded
+from the search because `SOURCE.md` names every bundle by definition, and only
+top-level files are considered because `mpnn/kernels.wasm` is loaded from
+JavaScript rather than from a page.
