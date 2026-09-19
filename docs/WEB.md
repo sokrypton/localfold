@@ -1819,3 +1819,44 @@ With a default in the box every fold from the page arrives named, so what still
 reaches that line without one is a caller that never had a box - a test, or a
 restored session predating the field. The comment there said the old thing and
 now says this one.
+
+### One name for a fold
+
+The name box named the request and nothing else. A reader could type
+`calmodulin_4calcium`, fold, and get `af3_1` in the object picker, `af3_1.pdb`
+from the download button and `af3_1_*` throughout the archive, with the typed
+name surviving in one field of one file.
+
+`foldStem` resolves one name for everything: **the box, then a pasted FASTA
+header, then the model prefix**. The order is not new - a pasted `>header` has
+named the object since `entityList.header()` existed - but the box now outranks
+it, and all three fold paths go through the one resolver instead of building a
+stem each. `buildFoldArchive` lost its `jobName` parameter: the request's name
+*is* the stem, so they cannot disagree.
+
+`untitled` means unnamed, so an unnamed fold is still `af3_1`. Treating it as a
+name would make every fold `untitled`, `untitled_2`, `untitled_3` in the picker,
+and comparing models is what that picker is for.
+
+🔴 **AND A RENAME HAD TO BE ABLE TO BREAK A CONTINUATION.** Pressing Fold again
+with nothing changed reuses the trunk and rewinds the object it already has -
+so renaming the box and folding did **nothing at all** to the name. `continuedStem`
+opens a new object when the reader has explicitly renamed, and keeps the old one
+otherwise. It cannot compare the *resolved* name: the generated fallback carries
+`predictionCount` and differs every fold, which would abolish the continuation
+for everyone who never names anything.
+
+```
+no name          →  object af2_1              archive af2_1_*        request af2_1
+ubiquitin_monomer.json  →  object ubiquitin_monomer  archive ubiquitin_monomer_*
+renamed, re-folded      →  object renamed_by_hand    archive renamed_by_hand_*
+```
+
+🔴 **AND THE PROBE THAT FOUND THE CONTINUATION HOLE WAS ITSELF RACING.** It
+waited for the status to match `/pLDDT/` - which the *previous* fold's status
+already did - so it fell through immediately, pressed Download while the new
+fold was still running, and archived the old prediction. It reported
+`followsTheBox: false` and looked like the feature was broken. **A fold is
+finished when its object exists**, which is a fact rather than a string. Its
+wait is also sized to `cdp.py`'s 60 s socket timeout, because an evaluate that
+waits longer fails in the harness rather than returning a verdict.

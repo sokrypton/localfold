@@ -107,6 +107,47 @@ const entityList = createEntityList(
  */
 const jobName = () => element("job-name").value.trim();
 
+/** What the name box says when nobody has named anything. */
+const DEFAULT_JOB_NAME = "untitled";
+
+/**
+ * ONE NAME for a fold: the viewer object, every file in the archive, and the
+ * `name` inside its job request.
+ *
+ * 🔴 THEY WERE TWO AND IT SHOWED. A reader could type `calmodulin_4calcium`,
+ * fold, and get `af3_1` in the picker, `af3_1.pdb` from the download button
+ * and `af3_1_*` throughout the archive, with the typed name surviving in one
+ * field of one file. The order - box, then a pasted FASTA header, then the
+ * model - is the rule the paste path already had; what is new is that the box
+ * outranks the header.
+ */
+function explicitName() {
+  const named = jobName();
+  if (named !== "" && named !== DEFAULT_JOB_NAME) return safeJobName(named);
+  const header = entityList.header();
+  return header === null ? null : safeJobName(header);
+}
+
+function foldStem(fallback) {
+  return uniqueStem(explicitName() ?? fallback);
+}
+
+/**
+ * The name for a fold CONTINUING one already on screen.
+ *
+ * 🔴 ONLY AN EXPLICIT RENAME BREAKS A CONTINUATION. Pressing Fold again with
+ * nothing changed reuses the trunk and rewinds the object it has - without
+ * this, renaming the box did nothing at all to the name. It cannot compare the
+ * RESOLVED name, because the generated fallback carries `predictionCount` and
+ * differs every fold, which would open a new object for everyone who never
+ * names anything.
+ */
+function continuedStem(cachedStem) {
+  const explicit = explicitName();
+  return explicit === null || explicit === cachedStem
+    ? cachedStem : uniqueStem(explicit);
+}
+
 // 🔴 EXPOSED FOR tools/fold-in-page.py, WHICH HAS NO OTHER WAY IN. The rows are
 // built by entity-ui.js and their model is a closure; a harness that wrote into
 // a row's field would leave that model behind the DOM, and the fold would run
@@ -2209,10 +2250,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // whole trajectory is the sampler's and it is re-run either way - so the
   // rewind is simply an empty object under the name already on screen.
   const stem = reuse === undefined
-    ? uniqueStem(header !== null
-      ? safeJobName(header)
-      : `${MODEL_STEMS[family] ?? family}_${predictionCount}`)
-    : trunkCache.stem;
+    ? foldStem(`${MODEL_STEMS[family] ?? family}_${predictionCount}`)
+    : continuedStem(trunkCache.stem);
   // ...and the view goes blank first, so the trunk is not spent showing the
   // previous fold. See openBlankFold.
   openBlankFold(stem);
@@ -2736,9 +2775,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   throwIfAborted(signal);
 
   predictionCount += 1;
-  const header = entityList.header();
-  const stem = uniqueStem(header !== null
-    ? safeJobName(header) : `${MODEL_STEMS[chosenFamily()] ?? "ef2_fast"}_${predictionCount}`);
+  const stem = foldStem(
+    `${MODEL_STEMS[chosenFamily()] ?? "ef2_fast"}_${predictionCount}`);
   openBlankFold(stem);
   viewer = undefined;
   viewerObject = undefined;
@@ -3290,10 +3328,10 @@ async function fold(event) {
     // here and the structure exists only inside whichever branch runs.
     foldContext = {
       entities,
-      // 🔴 SETTLED HERE WITH EVERYTHING ELSE, so the archive says what the box
-      // said at the moment of folding rather than whatever it says when
-      // somebody presses Download ten minutes later.
-      jobName: jobName() === "" ? undefined : jobName(),
+      // 🔴 NOT RECORDED HERE AT ALL ANY MORE. The request's `name` is the
+      // fold's `stem`, which `foldStem` has already resolved from this same
+      // box - so `archiveFor` reads `pred.stem` and the two cannot disagree.
+      // Carrying the box separately is what let them.
       templates: templateSources,
       msas: archiveMsas(chains, alignment),
       msaOrigin: {
@@ -3430,15 +3468,15 @@ async function fold(event) {
       ? af2Cached.resumable : undefined;
 
     predictionCount += 1;
-    const fastaHeader = entityList.header();
     // ...and a sweep says so in the file name, because the five models are one
     // prediction here and the archive is the only place that can say which.
-    const baseStem = fastaHeader !== null
-      ? safeJobName(fastaHeader)
-      : `${MODEL_STEMS[family] ?? family}${sweep.length > 1 ? "_all5" : ""}_${predictionCount}`;
     // 🔴 uniqueStem READS objectsData; the loop that used to be here read
-    // `viewer.objects`, which does not exist on this build.
-    const stem = resume === undefined ? uniqueStem(baseStem) : af2Cache.stem;
+    // `viewer.objects`, which does not exist on this build. It is inside
+    // foldStem now, which every fold path shares.
+    const stem = resume === undefined
+      ? foldStem(`${MODEL_STEMS[family] ?? family}`
+        + `${sweep.length > 1 ? "_all5" : ""}_${predictionCount}`)
+      : continuedStem(af2Cache.stem);
 
     // 🔴 A CONTINUATION REWINDS THE OBJECT IT ALREADY HAS; IT DOES NOT OPEN A
     // NEW ONE. Asking for more recycles resumes the cached passes and computes
@@ -4439,11 +4477,6 @@ function archiveFor(pred, { includeAlignment = true } = {}) {
   const holds = includeAlignment && holdsAlignment(pred.msas);
   return buildFoldArchive({
     stem: pred.stem,
-    // 🔴 OFF THE PREDICTION, NOT OFF THE PAGE. The archive can be built long
-    // after the fold - from a restored session, or for an earlier prediction
-    // still in the picker - and reading the live name here would stamp
-    // whatever job is loaded NOW onto a fold that predates it.
-    jobName: pred.jobName,
     model: pred.model ?? "AlphaFold",
     settings: pred.settings,
     entities: pred.entities,

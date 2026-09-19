@@ -4,6 +4,7 @@ import {
   buildFoldArchive, fullDataJson, jobRequestJson, msasFromArchive,
   summaryConfidencesJson, tokenIdentifiers,
 } from "../web/fold-archive.js";
+import { safeJobName } from "../web/prediction-results.js";
 import { readZip, writeZip } from "../web/zip.js";
 import { mergeSearchedChains } from "../src/input/mmseqs2-api.js";
 
@@ -507,43 +508,46 @@ describe("where a fold's contact map lives", () => {
 });
 
 /**
- * 🔴 THE JOB'S NAME IS PART OF WHAT WAS HANDED IN, AND IT WAS BEING OVERWRITTEN.
- * Every one of AlphaFold 3's example files carries one and this archive wrote
- * the fold's stem over it, so `calmodulin_4calcium.json` came back out of the
- * page called `af3_1`. The chemistry round-tripped perfectly, which is exactly
- * why nothing caught it: `--job-round-trip` compares entity lists and a name is
- * not an entity.
+ * 🔴 ONE NAME FOR THE FOLD, AND IT USED TO BE TWO. AlphaFold 3's example files
+ * carry a `name` and this archive wrote the fold's stem over it, so
+ * `calmodulin_4calcium.json` came back out of the page called `af3_1`. The
+ * first fix passed a `jobName` beside the stem, which was half of one: the
+ * viewer object, the .pdb button and every member here still said `af3_1`
+ * while one field of one file said otherwise. `foldStem` in web/app.js now
+ * resolves a single name - the page's name box, then a pasted FASTA header,
+ * then the model - and hands it down as `stem`, so what this file has to
+ * guarantee is only that the request agrees with the members.
  */
 describe("the request's name", () => {
   const entities = [{ type: "protein", value: "ACDEFGHIK", copies: 1,
                       modifications: [] }];
-  const request = (extra) => JSON.parse(buildFoldArchive({
-    stem: "af3_1", model: "AlphaFold 3", settings: { seed: 7 }, entities,
-    prediction: prediction(), ...extra,
-  }).get("af3_1_job_request.json"))[0];
-
-  it("is the job's own when the rows came from a job", () => {
-    expect(request({ jobName: "calmodulin_4calcium" }).name)
-      .toBe("calmodulin_4calcium");
+  const archive = (stem) => buildFoldArchive({
+    stem, model: "AlphaFold 3", settings: { seed: 7 }, entities,
+    prediction: prediction(),
   });
 
-  it("falls back to the stem when nothing named the job", () => {
-    expect(request({}).name).toBe("af3_1");
+  it("is the stem, so the request and the files cannot disagree", () => {
+    for (const stem of ["af3_1", "calmodulin_4calcium"]) {
+      const files = archive(stem);
+      const request = JSON.parse(files.get(`${stem}_job_request.json`))[0];
+      expect(request.name).toBe(stem);
+      expect(files.has(`${stem}_model_0.pdb`)).toBe(true);
+    }
   });
 
   /**
-   * 🔴 AND THE STEM STILL NAMES THE FILES. Renaming those would break the
-   * layout the README describes and the `_model_0.pdb` / `_scores.json` pairing
-   * every reader of this archive relies on - so the name reaches the request
-   * and nothing else.
+   * 🔴 AND THE SANITISING HAPPENS BEFORE THIS FILE SEES IT. `buildFoldArchive`
+   * runs `safeJobName` over the stem for the MEMBER names and writes the stem
+   * itself into the request, so an unsafe stem would put a different string in
+   * each - which cannot arise, because `foldStem` sanitises on the way out and
+   * `safeJobName` is idempotent. Pinned rather than argued: a stem that has
+   * been through it once comes out of both sides the same.
    */
-  it("does not rename the members", () => {
-    const files = buildFoldArchive({
-      stem: "af3_1", model: "AlphaFold 3", settings: { seed: 7 }, entities,
-      prediction: prediction(), jobName: "calmodulin_4calcium",
-    });
-    expect([...files.keys()].some((name) => name.includes("calmodulin")))
-      .toBe(false);
-    expect(files.has("af3_1_job_request.json")).toBe(true);
+  it("needs no second sanitising pass", () => {
+    const stem = safeJobName("my fold/2024");
+    const files = archive(stem);
+    const request = JSON.parse(files.get(`${stem}_job_request.json`))[0];
+    expect(request.name).toBe(stem);
+    expect(safeJobName(stem)).toBe(stem);
   });
 });

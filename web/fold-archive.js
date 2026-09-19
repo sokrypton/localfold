@@ -523,7 +523,7 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
  * @returns {Map<string, string>}
  */
 export function buildFoldArchive({
-  stem, jobName, model, settings, entities, prediction, msas = {}, templates,
+  stem, model, settings, entities, prediction, msas = {}, templates,
   msaOrigin, alignmentOmitted = false, perModel,
 }) {
   const name = safeJobName(stem);
@@ -546,21 +546,17 @@ export function buildFoldArchive({
   }
 
   const files = new Map();
-  // 🔴 THE JOB'S OWN NAME WHERE THERE IS ONE, AND THE STEM OTHERWISE. Every
-  // one of AlphaFold 3's example files carries a `name` - "calmodulin_4calcium",
-  // "tetr_dimer_dna" - and this wrote the fold's stem over it, so a job handed
-  // in and saved back came out called "af3_1": the same chemistry under an
-  // identity its author would not recognise, and no comparison of entity lists
-  // can see it. The FILE STEM stays LocalFold's, because every other member of
-  // the archive is named from it and the README describes that layout; this is
-  // the request's `name` field alone.
-  //
-  // 🔴 THE FALLBACK IS FOR A CALLER WITH NOTHING TO SAY, NOT FOR THE PAGE. The
-  // page's name box has a default, so `jobName` arrives set on any fold from
-  // it; what still reaches this line without one is a caller that never had a
-  // box - a test, or a restored session predating the field.
+  // 🔴 THE REQUEST'S NAME IS THE FOLD'S STEM, AND THEY USED TO BE TWO THINGS.
+  // Every AlphaFold 3 example file carries a `name` - "calmodulin_4calcium",
+  // "tetr_dimer_dna" - and this wrote the stem over it, so a job handed in and
+  // saved back came out called "af3_1". The fix was a `jobName` beside the
+  // stem, and that was half a fix: the object in the picker, the .pdb button
+  // and every member here still said "af3_1" while one field of one file said
+  // otherwise. `foldStem` in web/app.js resolves ONE name from the page's name
+  // box - falling back to a pasted FASTA header, then to the model - and the
+  // stem IS that name, so there is nothing left here to disagree with.
   files.set(`${name}_job_request.json`, jobRequestJson({
-    name: jobName ?? stem, seed: settings?.seed, entities,
+    name: stem, seed: settings?.seed, entities,
   }));
   files.set(`${name}_model_0.pdb`, pdb);
   // 🔴 AND ONE FILE PER MODEL WHERE FIVE OF THEM FOLDED. "All 5" runs

@@ -1238,21 +1238,50 @@ def main():
                   const inBox = box === null ? 'MISSING' : box.value;
                   const asFolded = await grab();
 
-                  // Renamed by hand and re-folded: the request must follow the
-                  // box, which is the whole reason the box exists.
+                  // Renamed by hand and re-folded: the name must follow the
+                  // box everywhere, which is the whole reason the box exists.
+                  //
+                  // \U0001f534 WAIT FOR THE OBJECT, NOT FOR THE STATUS TEXT. The
+                  // first version looped until the status matched /pLDDT/ - and
+                  // the PREVIOUS fold's status already did, so it fell through
+                  // immediately, pressed Download while the new fold was still
+                  // running, and archived the OLD prediction. It read as
+                  // `followsTheBox: false` and looked like the feature was
+                  // broken. A fold is finished when its object exists, which
+                  // is a fact rather than a string.
+                  const objectName = () => {
+                    const reg = window.py2dmol_viewers || {};
+                    return reg[Object.keys(reg)[0]]?.renderer?.currentObjectName;
+                  };
+                  const wasCalled = objectName();
                   box.value = 'renamed_by_hand';
                   document.getElementById('predict').click();
-                  for (let waited = 0; waited < 120; waited += 1) {
+                  // \U0001f534 AND THE BUDGET IS THE SOCKET'S, NOT THE FOLD'S.
+                  // cdp.py sets a 60 s recv timeout, so an evaluate that waits
+                  // 180 s fails as "TimeoutError: timed out" in the HARNESS
+                  // rather than returning a verdict - which reads as a broken
+                  // tool, not a slow fold. 40 s plus two 2.5 s grabs sits
+                  // inside it, and every job this probe is pointed at folds in
+                  // single-digit seconds.
+                  for (let waited = 0; waited < 40; waited += 1) {
                     await new Promise((done) => setTimeout(done, 1000));
                     const said = document.getElementById('status-message')
                       ?.textContent ?? '';
-                    if (/pLDDT|Error|error/.test(said)) break;
+                    if (objectName() !== wasCalled && /pLDDT|Error|error/.test(said)) break;
                   }
                   const afterRename = await grab();
                   return JSON.stringify({
-                    inBox, asFolded, afterRename,
-                    fileFilledTheBox: inBox === asFolded && inBox !== '',
-                    followsTheBox: afterRename === 'renamed_by_hand',
+                    inBox, asFolded, afterRename, wasCalled,
+                    // \U0001f534 AND THE OBJECT IS CHECKED TOO, not only the
+                    // file. They were two identities until foldStem: a reader
+                    // could name a job, fold, and get `af3_1` in the picker
+                    // and on the .pdb button while one field of one file said
+                    // otherwise.
+                    nowCalled: objectName(),
+                    fileFilledTheBox: inBox === asFolded && inBox !== ''
+                                      && wasCalled === inBox,
+                    followsTheBox: afterRename === 'renamed_by_hand'
+                                   && objectName() === 'renamed_by_hand',
                   });
                 })()""", await_promise=True))
 
