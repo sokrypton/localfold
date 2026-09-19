@@ -132,6 +132,14 @@ export const DEFAULT_TUNING = Object.freeze({
   // a descriptor that merely lost its sources on the way through a spread
   // should fail loudly instead. See DeviceWeightRefusal.
   allowHostWeightPacking: null,
+  // 🔴 THE PAIR BIAS OWNS ITS LAYER NORM, WHERE ITS NORMALISED TENSOR HAS ONE
+  // READER. The MSA row attention's bias comes from the pair while the
+  // attention runs over the MSA, so `<label>.pair-normalized` is written by one
+  // dispatch, read by one, and is `L * L * 128` floats - 348 MiB at 825
+  // residues. Fusing the two removes the tensor and a dispatch. Off until it
+  // is measured on this card; see createFusedPairBiasShader, and docs/AF2.md
+  // for what it is worth.
+  fusedPairBias: false,
   // One key per softmax rescale, scalar q.k reduction.
   attentionGroup: 1,
   attentionVectorScore: false,

@@ -3112,3 +3112,85 @@ implementation is 28 dispatches that must each own both halves of a word, and
 assumes four bytes. The accuracy question is answered; the plumbing question is
 not.
 
+### Borrowing FlashPairformer's fused pair bias: it works, and it is worth 0.5%
+
+anthropics/uplifting-biomolecular-modeling is **Apache 2.0** (Copyright 2026
+Anthropic, PBC), so unlike martin-steinegger/alphafold2-webgpu its code may be
+adapted here with attribution rather than only read. Cloned and gone through:
+**36 kits**, one per upstream tool, including `colabfold` (AF2), `esmfold2`,
+`esmc`, `opendde`, `protenix_v2`, `boltz2`, `rosettafold3` - every family this
+port ships.
+
+🔴 **MOST OF THE CATALOGUE IS ALREADY HERE, CHECKED ONE BY ONE RATHER THAN
+ASSUMED**: flash attention with pair bias (`AF_PALLAS_ATTN`, `TRIATT_XLA`,
+`DATTN`), the fused transition holding its widened row off memory (`TTR`,
+`TRANSITION`), device-resident parameters with no host round trip per recycle
+(`DEVICE_RESIDENT`), chunk sizes derived from the device rather than a 16 GB
+default (`SUBBATCH`), identical empty template slots embedded once
+(`TEMPL_DEDUP` - our `repeat` binding says it in those words), step-invariant
+conditioning hoisted out of the sampler loop (`ATOM_COND_HOIST`,
+`HOIST_LOGITS` - `#encoderStatic`, `#conditioningPair`, `pairLogitsCacheBytes`),
+compile caching and a speculative warm. Their Pallas/Triton and cuDNN kernels,
+XLA autotune, multi-GPU row sharding and bf16 tensor-core operands are not
+reachable from a browser at all - and the matrix path they rest on is one **no
+visitor has on either platform**.
+
+What was NOT here is the LayerNorm fused into its consuming GEMM (`ln_proj`,
+`lnl_fused`, and the trimul DESIGN.md's `S_in`/`A'` stages). Sized before
+writing anything, as a share of an AF2 block:
+
+| | LN passes | gates | residual adds | projections | flash | contract |
+|---|---|---|---|---|---|---|
+| 150 res | **10.3%** (12 dispatches) | 2.0% | 0% | 31.8% | 14.7% | 10.3% |
+| 400 res | **8.2%** (13) | 1.7% | 0% | 26.5% | 27.8% | 14.7% |
+| 825 res | **6.9%** (18) | 1.5% | 0% | 22.6% | 34.8% | 17.7% |
+
+So the whole class is a ceiling of 7-10%, the residual adds are already fused
+(0%), and the dispatch floor is 6.4 us (`probe-dispatch.js`), which makes 43
+dispatches at 150 residues about 4.7% of the block - the LN passes are traffic,
+not launches.
+
+**The one site where the fusion is unambiguously right** is the MSA row
+attention: its bias comes from the PAIR while the attention runs over the MSA,
+so `<label>.pair-normalized` is written by one dispatch and read by one. The
+triangle attentions are the opposite - their normalised tensor is the q/k/v
+projection's input too, so fusing the bias there computes the statistics twice
+and materialises the tensor anyway. `createFusedPairBiasShader`, behind
+`fusedPairBias`:
+
+| | unfused (`pair-normalize` + `pair-bias`) | fused |
+|---|---:|---:|
+| 150 residues | 0.109 ms | **0.080** |
+| 400 | 0.487 | **0.368** |
+| 825 | 1.866 | **1.464** |
+| block at 825 | 115.98 | 115.73 (**-0.22%**) |
+| block at 400 | 28.38 | 28.28 (-0.35%) |
+| block at 150 | 5.83 | 5.78 (-0.86%) |
+| peak device bytes at 402 | 2031.3 MiB | **2031.3 MiB** |
+| 5CAJ + its crystal, pLDDT / RMSD | 81.762 / 2.679 A | 81.745 / 2.680 A |
+
+🔴 **AND THE MEMORY SAVING IS ZERO, WHICH WAS THE HALF WORTH HAVING.** The
+tensor it deletes is 81 MiB at 402 residues and 348 at 825, and the peak does
+not move a byte: the allocator pools by SIZE and releases a sub-layer's scratch
+at its own residual write, so the buffer freed here is immediately reused by the
+next tensor of that class. A saving in allocations is not a saving in peak
+wherever a pool is doing its job.
+
+🔴 **AND THE FIRST DESIGN WAS 2.7x SLOWER THAN THE TWO KERNELS IT REPLACED** -
+5.035 ms against 1.866 at 825. It gave each row a WORKGROUP so 64 lanes could
+share the LayerNorm reduction, which costs two tree reductions for the
+statistics and one more per head: about fifty barriers to save one pass over 512
+bytes. The unfused projection is one INVOCATION per row with register
+accumulators and no barrier at all, and the fused kernel had to keep that shape
+- a row is small enough to walk three times out of cache. **Fusion is not free
+just because it removes a dispatch; the shape it forces can cost more than the
+pass it saves.**
+
+**Shipped OFF.** 0.2-0.9% of a block is at or below what this machine drifts
+between runs, it changes the numerics (the statistics are one-pass
+`E[x^2] - E[x]^2`, and the reduction order differs from the separate kernel
+whatever the statistics), and turning it on means re-recording three whole-model
+gate signatures for it. It joins `attentionMatrixPrefetch` (0.05%) and
+upstream's LayerNorm rearrangement (1.3%) on the list of things measured and
+declined with a number. `--tune=fusedPairBias=true` is the arm.
+

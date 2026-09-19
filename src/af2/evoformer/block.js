@@ -6,6 +6,7 @@ import {
   attentionProjectTileRows,
   attentionOutputTileRows,
   createAttentionPairBiasShader,
+  createFusedPairBiasShader,
   selectAttentionProjectKernel,
   selectAttentionOutputKernel,
   createAttentionNormParameters,
@@ -573,7 +574,13 @@ async function encodeAttention(
   const outputMatrixFits = outputMatrix !== false
     && attentionProjectMatrixFits(outputMatrix,
       execution.device.limits?.maxComputeWorkgroupStorageSize ?? 49152);
-  const [normalize, packedNormalize, project, pairProject, outputProject] = await Promise.all([
+  // 🔴 THE FUSION IS FOR A SEPARATE PAIR SOURCE ONLY, and that is the whole of
+  // when it is right: `pairBias.source === "separate"` is exactly the case
+  // where the normalised pair is written for the bias and read by nothing else.
+  const fusedPairBias = deviceTuning(execution.device).fusedPairBias === true
+    && options.pairBias?.source === "separate";
+  const [normalize, packedNormalize, project, pairProject, outputProject, fusedPair]
+    = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
     execution.shaderPipeline(`block:attention:normalize:${normalizedStorage}`,
       () => createAttentionNormalizeShader(normalizedStorage)),
@@ -602,6 +609,17 @@ async function encodeAttention(
           { source: projectedStorage, weight: "f32" }, outputMatrix,
           options.residualTarget !== undefined))
       : execution.pipelines.get(outputKernel.cacheKey, outputKernel.shader),
+    // ...and the fused form, for the one call whose normalised pair has a
+    // single reader. Built only there: everywhere else the tensor is the q/k/v
+    // projection's input too and the fusion would compute it twice. The
+    // CHANNEL COUNT is in the key because the shader stages a row of exactly
+    // that width in workgroup memory.
+    fusedPairBias === false ? undefined
+      : execution.shaderPipeline(
+        `block:attention:pair-bias-fused:${pairBiasStorage}:${options.heads}`
+        + `:${options.pairBias.channels}`,
+        () => createFusedPairBiasShader(
+          pairBiasStorage, options.heads, options.pairBias.channels)),
   ]);
   // 🔴 A WARM STOPS HERE. `execution.warming` means the caller wants this
   // operation's PIPELINES built and nothing encoded - see Execution.warm, and
@@ -664,26 +682,43 @@ async function encodeAttention(
     `${options.label}.normalize`);
 
   let normalizedPair = normalized;
+  let fusedNormParams;
   if (options.pairBias?.source === "separate") {
     if (options.pairSource === undefined) throw new Error("separate attention pair bias requires a GPU source");
-    normalizedPair = execution.allocate(
-      `${options.label}.pair-normalized`, options.queries * options.queries * options.pairBias.channels,
-    );
     const pairNormParams = uniform(execution, `${options.label}.pair-norm-parameters`,
       createAttentionNormParameters(
         options.queries * options.queries, options.pairBias.channels, packedOffsets[9], packedOffsets[10],
         false, 1, options.queries * options.queries, 1e-5,
       ));
-    const pairNormGrid = execution.rowGrid(options.queries * options.queries);
-    execution.dispatch(encoder, normalize, [options.pairSource, weights, pairNormParams, normalizedPair],
-      pairNormGrid[0], pairNormGrid[1], 1, `${options.label}.pair-normalize`);
+    if (fusedPairBias) {
+      // ...no tensor and no dispatch: the bias kernel below reads the pair
+      // itself and takes the statistics in workgroup memory.
+      fusedNormParams = pairNormParams;
+    } else {
+      normalizedPair = execution.allocate(
+        `${options.label}.pair-normalized`, options.queries * options.queries * options.pairBias.channels,
+      );
+      const pairNormGrid = execution.rowGrid(options.queries * options.queries);
+      execution.dispatch(encoder, normalize, [options.pairSource, weights, pairNormParams, normalizedPair],
+        pairNormGrid[0], pairNormGrid[1], 1, `${options.label}.pair-normalize`);
+    }
   }
   const pairBiasElements = options.pairBias === undefined ? 1 : options.heads * options.queries * options.queries;
   const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
   if (options.pairBias !== undefined) {
-    const grid = execution.linearGrid(pairBiasElements);
-    execution.dispatch(encoder, pairProject, [normalizedPair, weights, params, pairBias],
-      grid[0], grid[1], 1, `${options.label}.pair-bias`);
+    if (fusedPairBias) {
+      // One invocation a row, as the unfused projection dispatches - see the
+      // note in createFusedPairBiasShader about the workgroup version that was
+      // 2.7x slower.
+      const grid = execution.linearGrid(options.queries * options.queries);
+      execution.dispatch(encoder, fusedPair,
+        [options.pairSource, weights, params, fusedNormParams, pairBias],
+        grid[0], grid[1], 1, `${options.label}.pair-bias`);
+    } else {
+      const grid = execution.linearGrid(pairBiasElements);
+      execution.dispatch(encoder, pairProject, [normalizedPair, weights, params, pairBias],
+        grid[0], grid[1], 1, `${options.label}.pair-bias`);
+    }
   }
   if (projectMatrixFits) {
     const dispatch = attentionProjectMatrixDispatch(

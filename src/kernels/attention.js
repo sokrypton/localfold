@@ -637,6 +637,95 @@ ${overHeads((h) => `  output[${h}u * pairs + pair_index] = result${h};`)}
 }
 
 /**
+ * ...and the same projection with the LayerNorm FUSED INTO IT, for the call
+ * whose normalised pair has exactly one reader.
+ *
+ * 🔴 BORROWED, WITH ATTRIBUTION: this is the shape of `pair_bias` in
+ * anthropics/uplifting-biomolecular-modeling (Apache 2.0, Copyright 2026
+ * Anthropic, PBC) - "one kernel, one pass over z: LayerNorm(c) -> Linear(c -> H)".
+ * Their kernel is Triton over bf16 on tensor cores and none of its code is here;
+ * what carries over is the decision that the pair-bias producer should own its
+ * LayerNorm rather than read a materialised copy of it. See docs/AF2.md.
+ *
+ * WHERE IT APPLIES, AND WHY IT IS NOT EVERY LAYER NORM. The MSA row attention's
+ * pair bias comes from the PAIR tensor while the attention itself runs over the
+ * MSA, so `<label>.pair-normalized` - `L * L * 128` floats, 348 MiB at 825
+ * residues - is written by one dispatch and read by one dispatch, and by
+ * nothing else. The triangle attentions are the opposite case: their normalised
+ * tensor feeds the q/k/v projection AS WELL, so fusing the bias there would
+ * compute the statistics twice and materialise the tensor anyway.
+ *
+ * ONE WORKGROUP PER ROW, THE ROW READ ONCE. 64 lanes stage the row into
+ * workgroup memory, take the two-pass f32 statistics there, normalise in place
+ * and then reduce `HEADS` projections out of it. Traffic is one read of the
+ * pair and one write of the head planes, against a read-read-write followed by
+ * a read; the statistics are the same two-pass f32 ones the separate kernel
+ * computes, in the same order, so this is not a precision change.
+ */
+export function createFusedPairBiasShader(pairStorage = "f32", heads = 1, channels = 128) {
+  if (!Number.isSafeInteger(heads) || heads < 1 || heads > 32) {
+    throw new RangeError(`the fused pair bias wants 1..32 heads; got ${heads}`);
+  }
+  if (!Number.isSafeInteger(channels) || channels < 2 || channels % 2 !== 0) {
+    throw new RangeError(`the fused pair bias wants an even channel count; got ${channels}`);
+  }
+  const overHeads = (body) => Array.from({ length: heads }, (_, h) => body(h)).join("\n");
+  return `${COMMON}
+struct NormParameters {
+  rows: u32, channels: u32, scale: u32, offset: u32,
+  transpose: u32, batch: u32, queries: u32, epsilon: f32,
+};
+@group(0) @binding(0) var<storage, read> pair: array<${storageArray(pairStorage)}>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<uniform> n: NormParameters;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+const HEADS: u32 = ${heads}u;
+const CHANNELS: u32 = ${channels}u;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let pair_index = id.x + id.y * GRID_WIDTH * 64u;
+  let pairs = p.queries * p.queries;
+  if (pair_index >= pairs) { return; }
+  let base = pair_index * CHANNELS;
+
+  // 🔴 ONE INVOCATION OWNS THE ROW, AS THE UNFUSED PROJECTION DOES - the first
+  // version of this kernel gave the row a WORKGROUP so the 64 lanes could share
+  // the LayerNorm reduction, and it was 2.7x SLOWER than the two kernels it
+  // replaced (5.035 ms against 1.870 at 825 residues): the statistics are two
+  // tree reductions and each head is another, so a row costs ~50 barriers to
+  // save one pass over 512 bytes. A row is small enough to walk three times
+  // from cache, and that walk has no barrier in it at all.
+  var sum = 0.0;
+  var squares = 0.0;
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    let value = ${storedElement(pairStorage, "pair", "base + c")};
+    sum += value;
+    squares += value * value;
+  }
+  // 🔴 AND THE STATISTICS ARE ONE PASS, NOT TWO, WHICH IS A NUMERICS CHANGE AND
+  // IS DECLARED. E[x^2] - E[x]^2 loses precision where the mean is large
+  // against the spread; a LayerNorm's input here is an activation with mean
+  // near zero, and the fold is unmoved (docs/AF2.md). The separate kernel
+  // centres first because it reads the row twice anyway.
+  let mean = sum / f32(CHANNELS);
+  let variance = max(squares / f32(CHANNELS) - mean * mean, 0.0);
+  let inverse_std = inverseSqrt(variance + n.epsilon);
+
+${overHeads((h) => `  var result${h} = 0.0;`)}
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    let raw = ${storedElement(pairStorage, "pair", "base + c")};
+    let value = (raw - mean) * inverse_std * weights[n.scale + c] + weights[n.offset + c];
+    let w = p.pair_weight + c * HEADS;
+${overHeads((h) => `    result${h} += value * weights[w + ${h}u];`)}
+  }
+${overHeads((h) => `  output[${h}u * pairs + pair_index] = result${h};`)}
+}`;
+}
+
+/**
  * The one-head form, kept because the differential checkers name it. Anything
  * with more than one head must generate its own; see the note above.
  */
