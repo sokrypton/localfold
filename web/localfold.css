@@ -1165,27 +1165,3 @@
   padding: 0 3px;
 }
 
-/* THE JOB NAME, STYLED AS THE PAGE'S OWN TEXT INPUT. It was a borderless
-   title, which read as a heading rather than something you can type in - and
-   it is a field like the others, so it looks like one: py2Dmol's `#fetch-id`
-   idiom at the size the entity rows use, since a 42px box above a 30px row
-   would be the largest thing in the panel. */
-.entity-name {
-  box-sizing: border-box;
-  width: 100%;
-  height: 30px;
-  padding: 0 10px;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  background: #fff;
-  font-size: 13px;
-  color: #374151;
-  transition: all 0.2s;
-}
-.entity-name::placeholder { color: #9ca3af; }
-.entity-name:hover { border-color: #9ca3af; }
-.entity-name:focus {
-  border-color: #3b82f6;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-  outline: none;
-}

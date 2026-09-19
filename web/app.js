@@ -95,57 +95,21 @@ const entityList = createEntityList(
     msaIsSearch: () => msaMode() === "search" });
 
 /**
- * The job's name, as the reader sees it.
- *
- * 🔴 THIS USED TO BE A COMPARISON AND THE FIELD REPLACED IT. The name was
- * invisible state: `applyJob` remembered it, the archive wrote it, and keeping
- * it honest meant recording the SHAPE of the rows the job created and checking
- * at fold time that they had not changed - because `set` and `setChains` both
- * `render()` without notifying any edit hook, so there was nothing to listen
- * to. All of that existed to guess whether a name the reader could not see
- * still applied. A field answers it outright: what it says is what is saved.
- */
-const jobName = () => element("job-name").value.trim();
-
-/** What the name box says when nobody has named anything. */
-const DEFAULT_JOB_NAME = "untitled";
-
-/**
  * ONE NAME for a fold: the viewer object, every file in the archive, and the
  * `name` inside its job request.
  *
- * 🔴 THEY WERE TWO AND IT SHOWED. A reader could type `calmodulin_4calcium`,
- * fold, and get `af3_1` in the picker, `af3_1.pdb` from the download button
- * and `af3_1_*` throughout the archive, with the typed name surviving in one
- * field of one file. The order - box, then a pasted FASTA header, then the
- * model - is the rule the paste path already had; what is new is that the box
- * outranks the header.
+ * 🔴 THEY USED TO BE TWO. The archive's request carried the fold's stem while
+ * a loaded job's own `name` was thrown away, so `calmodulin_4calcium.json`
+ * came back out of the page called `af3_1`. A name BOX was built for that and
+ * then removed as not earning its place; what the box was worth keeping is
+ * this - one resolver, used by all three fold paths, so the object in the
+ * picker, the `.pdb` button and every member of the archive cannot drift
+ * apart. A pasted FASTA `>header` names the fold, and the model prefix is the
+ * fallback.
  */
-function explicitName() {
-  const named = jobName();
-  if (named !== "" && named !== DEFAULT_JOB_NAME) return safeJobName(named);
-  const header = entityList.header();
-  return header === null ? null : safeJobName(header);
-}
-
 function foldStem(fallback) {
-  return uniqueStem(explicitName() ?? fallback);
-}
-
-/**
- * The name for a fold CONTINUING one already on screen.
- *
- * 🔴 ONLY AN EXPLICIT RENAME BREAKS A CONTINUATION. Pressing Fold again with
- * nothing changed reuses the trunk and rewinds the object it has - without
- * this, renaming the box did nothing at all to the name. It cannot compare the
- * RESOLVED name, because the generated fallback carries `predictionCount` and
- * differs every fold, which would open a new object for everyone who never
- * names anything.
- */
-function continuedStem(cachedStem) {
-  const explicit = explicitName();
-  return explicit === null || explicit === cachedStem
-    ? cachedStem : uniqueStem(explicit);
+  const header = entityList.header();
+  return uniqueStem(header === null ? fallback : safeJobName(header));
 }
 
 // 🔴 EXPOSED FOR tools/fold-in-page.py, WHICH HAS NO OTHER WAY IN. The rows are
@@ -2251,7 +2215,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // rewind is simply an empty object under the name already on screen.
   const stem = reuse === undefined
     ? foldStem(`${MODEL_STEMS[family] ?? family}_${predictionCount}`)
-    : continuedStem(trunkCache.stem);
+    : trunkCache.stem;
   // ...and the view goes blank first, so the trunk is not spent showing the
   // previous fold. See openBlankFold.
   openBlankFold(stem);
@@ -3476,7 +3440,7 @@ async function fold(event) {
     const stem = resume === undefined
       ? foldStem(`${MODEL_STEMS[family] ?? family}`
         + `${sweep.length > 1 ? "_all5" : ""}_${predictionCount}`)
-      : continuedStem(af2Cache.stem);
+      : af2Cache.stem;
 
     // 🔴 A CONTINUATION REWINDS THE OBJECT IT ALREADY HAS; IT DOES NOT OPEN A
     // NEW ONE. Asking for more recycles resumes the cached passes and computes
@@ -4132,21 +4096,6 @@ reportModelFromUrl();
 function applyJob(job) {
   entityList.set(job.entities);
   const said = [];
-  // 🔴 THE ARCHIVE SHOULD SAY WHAT THE JOB WAS CALLED. AlphaFold 3's own
-  // examples all carry a name - "calmodulin_4calcium", "tetr_dimer_dna" - and
-  // the request this page wrote named the FOLD instead ("af3_1"), so a job
-  // handed in and saved back came out under an identity its author would not
-  // recognise. It fills the box rather than a variable, so the reader can see
-  // it and change it; the file stem stays LocalFold's, because every other
-  // member of the archive is named from it.
-  //
-  // 🔴 ONLY WHEN THE FILE CARRIES ONE. Clearing the box for a job with no
-  // `name` would throw away a name the reader had typed for the fold they are
-  // setting up, which is the one thing here they cannot get back.
-  if (job.name !== undefined) {
-    element("job-name").value = job.name;
-    said.push(`named ${job.name}`);
-  }
   if (job.seed !== undefined) {
     const input = document.getElementById("random-seed");
     if (input !== null && String(job.seed) !== input.value) {

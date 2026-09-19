@@ -623,14 +623,6 @@ def main():
                 before, after, jobStatus,
                 filled: before !== after,
                 claimed: jobStatus.startsWith('job \u00b7'),
-                // \U0001f534 THE NAME THE FILE CARRIES REACHES THE BOX, which
-                // replaced a line of prose claiming the page could read a job.
-                // It is the better gate of the two: the hint only asserted
-                // that the page SAID it reads one, where a filled name box is
-                // the page having read one and shown what it found.
-                named: document.getElementById('job-name')?.value ?? 'MISSING',
-                namedRight:
-                  document.getElementById('job-name')?.value === 'TetR_homodimer',
                 overlayAfterDrop, overlayShown,
                 overlayLives: overlayAfterDrop === 'none'
                               && overlayShown === 'flex',
@@ -1208,82 +1200,6 @@ def main():
             print(f"job archive: {args.job_archive}"
                   f" ({len(base64.b64decode(blob))} bytes)")
 
-            # 🔴 AND THE ARCHIVE SAYS WHAT THE BOX SAYS. The name used to be
-            # state nobody could see - remembered from the file and written
-            # into the request - and keeping it honest took a comparison of the
-            # entity rows against the ones the job created, to guess whether it
-            # still applied. The box replaced all of that, so what is worth
-            # checking is the two ends: the file fills the box, and a fold
-            # takes the box's word, including after somebody edits it.
-            if args.job:
-                print("job name:", cdp.evaluate(ws, """(async () => {
-                  const { readZip } = await import('/web/zip.js');
-                  const nameIn = async (blob) => {
-                    const files = await readZip(
-                      new Uint8Array(await blob.arrayBuffer()));
-                    const key = [...files.keys()].find(
-                      (k) => k.endsWith('job_request.json'));
-                    return JSON.parse(files.get(key))[0].name;
-                  };
-                  const grab = async () => {
-                    const blobs = [];
-                    const made = URL.createObjectURL;
-                    URL.createObjectURL = (b) => { blobs.push(b); return made.call(URL, b); };
-                    document.getElementById('download-all').click();
-                    await new Promise((done) => setTimeout(done, 2500));
-                    URL.createObjectURL = made;
-                    return blobs[0] === undefined ? null : nameIn(blobs[0]);
-                  };
-                  const box = document.getElementById('job-name');
-                  const inBox = box === null ? 'MISSING' : box.value;
-                  const asFolded = await grab();
-
-                  // Renamed by hand and re-folded: the name must follow the
-                  // box everywhere, which is the whole reason the box exists.
-                  //
-                  // \U0001f534 WAIT FOR THE OBJECT, NOT FOR THE STATUS TEXT. The
-                  // first version looped until the status matched /pLDDT/ - and
-                  // the PREVIOUS fold's status already did, so it fell through
-                  // immediately, pressed Download while the new fold was still
-                  // running, and archived the OLD prediction. It read as
-                  // `followsTheBox: false` and looked like the feature was
-                  // broken. A fold is finished when its object exists, which
-                  // is a fact rather than a string.
-                  const objectName = () => {
-                    const reg = window.py2dmol_viewers || {};
-                    return reg[Object.keys(reg)[0]]?.renderer?.currentObjectName;
-                  };
-                  const wasCalled = objectName();
-                  box.value = 'renamed_by_hand';
-                  document.getElementById('predict').click();
-                  // \U0001f534 AND THE BUDGET IS THE SOCKET'S, NOT THE FOLD'S.
-                  // cdp.py sets a 60 s recv timeout, so an evaluate that waits
-                  // 180 s fails as "TimeoutError: timed out" in the HARNESS
-                  // rather than returning a verdict - which reads as a broken
-                  // tool, not a slow fold. 40 s plus two 2.5 s grabs sits
-                  // inside it, and every job this probe is pointed at folds in
-                  // single-digit seconds.
-                  for (let waited = 0; waited < 40; waited += 1) {
-                    await new Promise((done) => setTimeout(done, 1000));
-                    const said = document.getElementById('status-message')
-                      ?.textContent ?? '';
-                    if (objectName() !== wasCalled && /pLDDT|Error|error/.test(said)) break;
-                  }
-                  const afterRename = await grab();
-                  return JSON.stringify({
-                    inBox, asFolded, afterRename, wasCalled,
-                    // \U0001f534 AND THE OBJECT IS CHECKED TOO, not only the
-                    // file. They were two identities until foldStem: a reader
-                    // could name a job, fold, and get `af3_1` in the picker
-                    // and on the .pdb button while one field of one file said
-                    // otherwise.
-                    nowCalled: objectName(),
-                    fileFilledTheBox: inBox === asFolded && inBox !== ''
-                                      && wasCalled === inBox,
-                    followsTheBox: afterRename === 'renamed_by_hand'
-                                   && objectName() === 'renamed_by_hand',
-                  });
-                })()""", await_promise=True))
 
         if args.download:
             archive = json.loads(cdp.evaluate(ws, """(async () => {

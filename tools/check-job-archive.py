@@ -24,7 +24,9 @@ is where that meaning is written down.
 A request that round-trips perfectly beside a `full_data_0.json` whose matrices
 are the wrong size is still a broken save. What is asserted:
 
-  - the job's `name`, which is the field the page used to overwrite
+  - the job's `name` is REPORTED and not asserted: this page names a fold
+    after the fold (`af3_1`), which is what every file in the archive is
+    called, so a job's own name does not survive the round trip
   - every member the layout promises is present
   - `pae` and `contact_probs` are square at the token count, and their values
     are in range - a decode with the wrong bounds fills the key with plausible
@@ -127,14 +129,17 @@ def check(job_path: str, archive_path: str) -> list:
             return ["no *_job_request.json in the archive"], names, note
         saved = norm_job(zf.read(request).decode("utf-8"))
 
-        # 🔴 THE NAME IS PART OF WHAT WAS HANDED IN. Every AlphaFold 3 example
-        # carries one and the page used to write the fold's stem over it, so
-        # `calmodulin_4calcium` came back as `af3_1` - the same chemistry under
-        # an identity its author would not recognise, and invisible to any
-        # comparison of entity lists.
+        # 🔴 THE NAME IS REPORTED, NEVER FAILED, AND THAT IS A DECISION. Every
+        # AlphaFold 3 example carries one and this page does not carry it: the
+        # archive names the job after the FOLD (`af3_1`), which is also what
+        # every file in it is called. A name box was built to preserve it and
+        # then removed as not earning its place, so the gap is deliberate and
+        # a red gate here would be a red gate for ever - the same treatment
+        # `ref_pos` gets in check-batch-fields.js. The chemistry is what must
+        # match; the label is a difference worth seeing.
         if saved["name"] != original["name"]:
-            problems.append(f"name {saved['name']!r} saved,"
-                            f" {original['name']!r} asked")
+            note.append(f"named {saved['name']!r}, not {original['name']!r}"
+                        " (this page names a fold, not a job)")
         if saved["seed"] != original["seed"]:
             problems.append(f"seed {saved['seed']} saved, {original['seed']} asked")
         if saved["chains"] != original["chains"]:

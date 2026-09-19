@@ -1657,43 +1657,41 @@ ligand counted in one file and not the other - and every ligand code and
 modified-residue code actually present in the structure, which no confidence
 number can see.
 
-### 🔴 The one field that was wrong: the job's own name
+### 🔴 The job's own name: built, then removed
 
-Every AlphaFold 3 example carries a `name`, `jobFromJson` reads it, `applyJob`
-**threw it away**, and `buildFoldArchive` wrote the fold's stem in its place. So
-`calmodulin_4calcium.json` came back out of the page as a job called `af3_1`:
-the same chemistry under an identity its author would not recognise. Nothing
-could have caught it - `--job-round-trip` compares entity lists, and a name is
-not an entity.
+Every AlphaFold 3 example carries a `name`, `jobFromJson` reads it, and the
+archive wrote the fold's stem in its place - so `calmodulin_4calcium.json` came
+back out of the page as a job called `af3_1`. Nothing could have caught it:
+`--job-round-trip` compares entity lists, and a name is not an entity.
 
-The name now reaches the request, and **only the request**: the file stem stays
-LocalFold's, because every other member is named from it and the README
-describes that layout.
+It was fixed three ways in turn, and then taken out. The record is here because
+the reasoning is worth more than the code was:
 
-🔴 **AND THE HARD PART IS MAKING IT GO STALE, WHICH THE FIRST TWO ATTEMPTS GOT
-WRONG IN OPPOSITE DIRECTIONS.** A name kept over rows somebody has since edited
-is worse than no name at all - it describes a different job convincingly.
+1. **A `jobName` beside the stem.** Half a fix - the object in the picker, the
+   `.pdb` button and every member of the archive still said `af3_1` while one
+   field of one file said otherwise.
+2. **A visible name box**, which deleted machinery rather than adding it: the
+   name had been state nobody could see, and keeping it honest took recording
+   the SHAPE of the rows the job created and re-checking it at fold time,
+   because `set` and `setChains` both `render()` without notifying any edit
+   hook. The box also had to break a trunk continuation on a rename, or
+   renaming did nothing at all.
+3. **Removed**, as not earning its place.
 
-- **Attempt one** cleared it from `createEntityList`'s `onChange`. That looked
-  right and was not: `set` and `setChains` both call `render()` and **neither
-  notifies**, and `setChains` is the alignment-query-wins path - so uploading an
-  A3M whose query is a different protein would have replaced every sequence and
-  kept the name. It is a **comparison** now: `applyJob` records the shape of the
-  rows it created, and the name travels only while the rows still match. That
-  needs no promise about which mutation paths notify, and cannot be outrun by
-  the next one that does not.
-- **Attempt two** was the probe. It edited a row, pressed Download again and
-  read `goesStale: false` as a bug. It is not: `archiveFor` reads the name off
-  the **prediction**, so an archive built later for a fold that already happened
-  rightly keeps the name that fold ran under. The staleness that matters is a
-  **second fold** on rows the job no longer describes. Re-folding gives
-  `{"asFolded": "calmodulin_4calcium", "afterRefold": "af3_2", "goesStale": true}`.
+🔴 **WHAT SURVIVED IS THE PART WORTH KEEPING: ONE RESOLVER.** There were three
+places that built a stem. `foldStem` is now the only one - a pasted FASTA
+`>header` names the fold, the model prefix is the fallback - so the object, the
+download button and the archive cannot drift apart, and `buildFoldArchive` has
+no `jobName` parameter for them to drift through. `test/model-family.test.js`
+counts the call sites, which is what stops a fourth path naming its object some
+other way.
 
-Gated three ways: `test/fold-archive.test.js` pins the carry, the fallback and
-that the members are *not* renamed (watched failing by restoring `name: stem`);
-`--job-archive` prints the stale-name arm; and `check-job-archive.py` asserts
-the name, which reports every archive written before this as
-`name 'af3_1' saved, 'calmodulin_4calcium' asked`.
+🔴 **AND THE GAP IS NOW REPORTED RATHER THAN ASSERTED.**
+`check-job-archive.py` prints `named 'af3_1', not 'ubiquitin_monomer' (this page
+names a fold, not a job)` beside the token counts, and does not fail on it - the
+same treatment `ref_pos` gets in `check-batch-fields.js`, and for the same
+reason: a deliberate difference held as a failure is a red gate for ever. The
+chemistry is what must match.
 
 **What is still dropped, deliberately:** the `description` strings inside a
 chain body. They are free text about the job rather than part of it, nothing in
@@ -1723,8 +1721,9 @@ alignment, so the dial goes to Single Sequence and the status says so -
 restoring the stashed mode over that would run the search the file asked us to
 skip.
 
-**A job-name field above the rows.** Asked for, and it is the better half of
-the deal, because it *deletes* machinery rather than adding it.
+**A job-name field above the rows** was added here and later removed; see "The
+job's own name: built, then removed" above for what it was for and what
+survived it.
 
 🔴 **THE NAME WAS STATE NOBODY COULD SEE.** `applyJob` remembered it and the
 archive wrote it, so a saved job could be called `calmodulin_4calcium` with
@@ -1791,72 +1790,3 @@ snapshot from the top of the probe.
 `job name:` with `fileFilledTheBox` and `followsTheBox`, the second by renaming
 the box by hand and folding again.
 
-### The name box got a default, and stopped pretending to be a heading
-
-Two corrections to the field as first built.
-
-**It was styled as a title** - borderless, bold, transparent - which reads as a
-heading rather than something you can type in. It is a field like the others, so
-it looks like one: py2Dmol's own `#fetch-id` idiom (1px `#d1d5db`, 6px radius,
-blue focus ring) at 30px rather than 42, because a full-height box above a 30px
-entity row would be the largest thing in the panel.
-
-**And it had a placeholder where it wanted a value.** A placeholder is a prompt
-to type something; this is a setting with a default, the same as Seed reading
-`0` rather than suggesting one. It now ships `untitled`, so the box always says
-what the archive will be called instead of leaving the reader to learn the
-fallback by unzipping one:
-
-```
-no job loaded   →  af2_1_job_request.json   name: untitled
-ubiquitin_monomer.json loaded  →  name: ubiquitin_monomer
-renamed by hand and re-folded  →  name: renamed_by_hand
-```
-
-🔴 **AND THE STEM FALLBACK IS NOW FOR A CALLER, NOT FOR THE PAGE.**
-`jobName ?? stem` in `buildFoldArchive` used to be what an unnamed fold got.
-With a default in the box every fold from the page arrives named, so what still
-reaches that line without one is a caller that never had a box - a test, or a
-restored session predating the field. The comment there said the old thing and
-now says this one.
-
-### One name for a fold
-
-The name box named the request and nothing else. A reader could type
-`calmodulin_4calcium`, fold, and get `af3_1` in the object picker, `af3_1.pdb`
-from the download button and `af3_1_*` throughout the archive, with the typed
-name surviving in one field of one file.
-
-`foldStem` resolves one name for everything: **the box, then a pasted FASTA
-header, then the model prefix**. The order is not new - a pasted `>header` has
-named the object since `entityList.header()` existed - but the box now outranks
-it, and all three fold paths go through the one resolver instead of building a
-stem each. `buildFoldArchive` lost its `jobName` parameter: the request's name
-*is* the stem, so they cannot disagree.
-
-`untitled` means unnamed, so an unnamed fold is still `af3_1`. Treating it as a
-name would make every fold `untitled`, `untitled_2`, `untitled_3` in the picker,
-and comparing models is what that picker is for.
-
-🔴 **AND A RENAME HAD TO BE ABLE TO BREAK A CONTINUATION.** Pressing Fold again
-with nothing changed reuses the trunk and rewinds the object it already has -
-so renaming the box and folding did **nothing at all** to the name. `continuedStem`
-opens a new object when the reader has explicitly renamed, and keeps the old one
-otherwise. It cannot compare the *resolved* name: the generated fallback carries
-`predictionCount` and differs every fold, which would abolish the continuation
-for everyone who never names anything.
-
-```
-no name          →  object af2_1              archive af2_1_*        request af2_1
-ubiquitin_monomer.json  →  object ubiquitin_monomer  archive ubiquitin_monomer_*
-renamed, re-folded      →  object renamed_by_hand    archive renamed_by_hand_*
-```
-
-🔴 **AND THE PROBE THAT FOUND THE CONTINUATION HOLE WAS ITSELF RACING.** It
-waited for the status to match `/pLDDT/` - which the *previous* fold's status
-already did - so it fell through immediately, pressed Download while the new
-fold was still running, and archived the old prediction. It reported
-`followsTheBox: false` and looked like the feature was broken. **A fold is
-finished when its object exists**, which is a fact rather than a string. Its
-wait is also sized to `cdp.py`'s 60 s socket timeout, because an evaluate that
-waits longer fails in the harness rather than returning a verdict.

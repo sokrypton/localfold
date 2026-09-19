@@ -201,37 +201,24 @@ describe("what a fold is called", () => {
    * name box, then a pasted FASTA header, then the model prefix. A typed name
    * beats a generated one; the model is the fallback, never an override.
    */
-  it("resolves one name, box before header before model", () => {
-    const resolver = app.slice(app.indexOf("function explicitName("));
+  /**
+   * 🔴 ONE RESOLVER, USED BY EVERY FOLD PATH. There were three places that
+   * built a stem, and the rule they were meant to share - a pasted FASTA
+   * header names the fold, the model prefix is the fallback - was pinned at
+   * only one of them by matching its source text. `foldStem` is the single
+   * resolver, and the count below is what stops a fourth path naming its
+   * object some other way and the picker drifting from the archive.
+   */
+  it("resolves one name, header before model, on every path", () => {
+    const resolver = app.slice(app.indexOf("function foldStem("));
     const body = resolver.slice(0, resolver.indexOf("\n}"));
-    assert.ok(body.length > 0, "explicitName is not where this test expects");
-    const box = body.indexOf("jobName()");
-    const header = body.indexOf("entityList.header()");
-    assert.ok(box >= 0 && header >= 0, "explicitName reads neither source");
-    assert.ok(box < header,
-              "explicitName must prefer the name box over a pasted header");
-    // ...and the model prefix is only ever the fallback, never an override.
-    assert.match(app, /function foldStem\(fallback\) \{\s*\n\s*return uniqueStem\(explicitName\(\) \?\? fallback\);/);
-    // ...and every fold path goes through it, or one of them names its object
-    // some other way and the picker stops agreeing with the archive.
+    assert.ok(body.includes("entityList.header()"),
+              "foldStem does not read a pasted header");
+    assert.ok(body.includes("uniqueStem("), "foldStem does not uniquify");
+    assert.ok(body.indexOf("header === null ? fallback") > 0,
+              "the model prefix must be the fallback, never an override");
     assert.equal([...app.matchAll(/foldStem\(/g)].length, 4,
       "foldStem should be declared once and called on all three fold paths");
-  });
-
-  // 🔴 ONLY AN EXPLICIT RENAME BREAKS A CONTINUATION. Comparing the RESOLVED
-  // name would abolish it for everyone who never names anything, since the
-  // generated fallback carries predictionCount and differs every fold.
-  it("lets a rename break a continuation, and nothing else", () => {
-    const fn = app.slice(app.indexOf("function continuedStem("));
-    const body = fn.slice(0, fn.indexOf("\n}"));
-    assert.ok(body.includes("explicitName()"),
-              "continuedStem must ask for an EXPLICIT name, not a resolved one");
-    assert.ok(body.includes("cachedStem"),
-              "continuedStem must fall back to the cached stem");
-    // Both reuse paths - AlphaFold 3's trunk cache and AlphaFold 2's - go
-    // through it, or one of them cannot be renamed.
-    assert.equal([...app.matchAll(/continuedStem\(/g)].length, 3,
-      "continuedStem should be declared once and used on both reuse paths");
   });
 });
 
