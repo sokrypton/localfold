@@ -74,6 +74,8 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
+import { colabRole, installColabBridge, remoteCommand, remoteEvents, tapOut }
+  from "./colab-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -772,20 +774,18 @@ let viewerObject;
 // 🔴 A TAP, NOT A SECOND FOLD PATH. When this page is the one a Colab runtime
 // is driving headlessly, the page a reader is looking at is somewhere else -
 // so the status line, the bar and every sampler frame have to travel. They
-// travel as the SAME calls the local fold already makes, recorded here and
-// drained by tools/colab_backend.py; there is no remote-only code path to
-// keep in step with the real one, which is the whole reason the runtime runs
-// this page rather than a port of it.
+// travel as the SAME calls the local fold already makes, handed to
+// web/colab-bridge.js here; there is no remote-only code path to keep in step
+// with the real one, which is the whole reason the runtime runs this page
+// rather than a port of it.
 //
-// `window.__remoteTap` is set by the backend before it presses Fold and is
-// undefined everywhere else, so this is one property read per status write.
+// `tapOut` PUSHES, in the task that made the event - it used to park it in an
+// array for tools/colab_backend.py to collect over CDP every 250 ms, and a
+// busy page answers a debugger when it feels like it: reported as the reader's
+// bar sitting at "embedder · 1%" for a whole fold. Off the runtime it is one
+// property read per status write and nothing else.
 function remoteTap(kind, payload) {
-  const tap = window.__remoteTap;
-  if (tap === undefined) return;
-  tap.push({ kind, payload });
-  // A cap, because a fold nobody is draining must not grow without end: the
-  // client polls three times a second and a frame is a few kilobytes.
-  if (tap.length > 200) tap.splice(0, tap.length - 200);
+  tapOut(kind, payload);
 }
 
 function status(text, isError = false) {
@@ -3270,13 +3270,16 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
  * the token that server requires of every request - it is in the URL because
  * a page cannot be handed a header by whoever framed it.
  *
+ * THE SAME SERVER RUNS A SECOND COPY OF THIS PAGE HEADLESSLY, at
+ * `?role=runtime`, and that is the one that folds. The two talk through
+ * web/colab-bridge.js: this page posts a command, that page pushes what it
+ * says and draws. Neither knows anything about the other's machine.
+ *
  * Absent the parameter this returns null and nothing anywhere changes: the
  * website folds where it always did, in the reader's own browser.
  */
 function remoteBackend() {
-  const asked = new URLSearchParams(location.search);
-  if (asked.get("backend") !== "colab") return null;
-  return { token: asked.get("t") ?? "", at: asked.get("at") ?? "" };
+  return colabRole() === "reader" ? {} : null;
 }
 
 /**
@@ -3292,10 +3295,6 @@ function remoteBackend() {
  */
 async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
                                templates, family, signal }) {
-  const backend = remoteBackend();
-  const where = backend.at || "";
-  const door = (route, extra = "") =>
-    `${where}${route}?t=${encodeURIComponent(backend.token)}${extra}`;
   const entities = entityList.read();
   const request = {
     entities, model: family,
@@ -3308,52 +3307,49 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
     // fold died with "unknown alignment mode". Sending the raw value lets the
     // runtime's page resolve it with the same function this one uses.
     msa: element("msa-mode")?.value ?? "none",
-    // 🔴 THE STREAMED FORM. Without this the runtime answers with the finished
-    // structure and nothing else, which is a page that sits blank for a minute
-    // - no bar, no status, no sampler frames. See tools/colab_backend.py.
-    stream: true,
   };
   const label = MODEL_LABELS[family] ?? family;
   status(`${label} · folding on the runtime…`);
   progress("waiting");
-  const opened = await fetch(door("/fold"), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(request),
-    signal,
-  });
-  if (!opened.ok) {
-    throw new Error(`the runtime answered ${opened.status} ${await opened.text()}`);
-  }
-  const { job, error: refused } = await opened.json();
+  // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
+  // every event of the session, so a reader that started at zero would replay
+  // the last fold's status writes and frames as this one's - and one that
+  // asked after sending could miss the first of this fold's. `n` is where the
+  // stream stands at the instant before the runtime is told anything.
+  let since = (await remoteEvents(0, signal)).n ?? 0;
+  const { error: refused } = await remoteCommand("fold", request);
   if (refused) throw new Error(refused);
 
   // 🔴 AND STOPPING HAS TO REACH THE OTHER MACHINE. The abort signal ends this
   // loop, which on a local fold is the whole of stopping - here it would leave
-  // the runtime folding, its GPU lock held, and the next fold answered 429.
-  const stopThere = () => { fetch(door("/stop"), { method: "POST" }).catch(() => {}); };
+  // the runtime folding, its GPU held, and the next fold refused.
+  const stopThere = () => { remoteCommand("stop", null).catch(() => {}); };
   signal.addEventListener("abort", stopThere, { once: true });
 
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
   const draw = remoteFrameDrawer(stem);
   const framePdbs = [];
-  let since = 0;
   let result;
   for (;;) {
     throwIfAborted(signal);
-    const poll = await fetch(door("/job", `&id=${encodeURIComponent(job)}&since=${since}`),
-                             { signal });
-    if (!poll.ok) throw new Error(`the runtime answered ${poll.status} while folding`);
-    const state = await poll.json();
+    const state = await remoteEvents(since, signal);
+    since = state.n ?? since;
     for (const said of state.events ?? []) {
       // The page's own calls, replayed here: the same status writes, the same
       // bar fractions, the same sampler frames, in the order they happened.
       if (said.kind === "status") status(said.payload);
       else if (said.kind === "progress") progress(said.payload);
       else if (said.kind === "frame") { framePdbs.push(said.payload); draw(said.payload); }
+      // 🔴 AND THE LAG IS RECORDED RATHER THAN ARGUED ABOUT. Each event
+      // carries the runtime page's own clock and the broker's arrival stamp,
+      // so "the fold was slow" and "the feed was slow" are two numbers. It is
+      // what the pulled version could not tell apart.
+      else if (said.kind === "result") { result = said.payload ?? {}; }
+      if (said.at !== undefined && said.got !== undefined) {
+        (window.__remoteLag = window.__remoteLag ?? []).push(said.got - said.at);
+      }
     }
-    since = state.n ?? since;
-    if (state.done) { result = state.result ?? {}; break; }
+    if (result !== undefined) break;
     await new Promise((done) => setTimeout(done, 300));
   }
   if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);
@@ -5321,3 +5317,13 @@ document.addEventListener("visibilitychange", () => {
 });
 
 void offerSession();
+
+/**
+ * 🔴 AND ON A COLAB RUNTIME THIS PAGE IS THE ONE FOLDING, WITH NOBODY LOOKING.
+ * `?role=runtime` is the backend saying so: the bridge then announces itself,
+ * pushes every status write, bar fraction and sampler frame as it happens, and
+ * takes its instructions from the reader's page over the broker. Off that
+ * runtime `installColabBridge` returns immediately and nothing here runs.
+ * See web/colab-bridge.js.
+ */
+installColabBridge();

@@ -2021,15 +2021,12 @@ progress bar, no status line, no sampler frames - every one of which the page
 was drawing perfectly, on the other machine, where nobody could see it.
 
 🔴 **WHAT TRAVELS IS THE PAGE'S OWN CALLS, NOT A SECOND FOLD PATH.**
-`remoteTap(kind, payload)` is three lines called from `status()`, `progress()`
-and both `drawLiveFrame` closures. The backend arms `window.__remoteTap`
-immediately before the click, drains it **in the same CDP round trip the watch
-loop was already making** - a second `evaluate` per 250 ms would double the
-traffic to learn the same thing - and the client replays the events in order:
-`status` → `status()`, `progress` → `progress()`, `frame` → a frame appended to
-the viewer. There is no remote-only rendering path to keep in step with the
-real one, which is the whole reason the runtime runs this page rather than a
-port of it.
+`remoteTap(kind, payload)` is called from `status()`, `progress()` and both
+`drawLiveFrame` closures, and hands each event to `web/colab-bridge.js`. The
+reader's page replays them in order: `status` → `status()`, `progress` →
+`progress()`, `frame` → a frame appended to the viewer. There is no
+remote-only rendering path to keep in step with the real one, which is the
+whole reason the runtime runs this page rather than a port of it.
 
 Measured on a 13-mer, streamed against blocking, same fixture:
 
@@ -2038,17 +2035,65 @@ Measured on a 13-mer, streamed against blocking, same fixture:
 | streamed | 8 distinct | 5 | **22** |
 | blocking (the mutation) | 1 | 1 (indeterminate) | 0 |
 
-🔴 **AND A JOB IS POLLED WITH A WATERMARK, NOT DRAINED.** `POST /fold`
-with `stream: true` answers with a name; `GET /job?id=&since=N` returns the
-events past `N`. The server never removes anything, so an overlapping poll or
-a reload re-applies rather than losing events. The blocking form is kept,
-because the notebook's own fold cell is a Python caller that wants the
-structure.
+🔴 **AND IT WAS STILL NOT LIVE IN COLAB, BECAUSE THE EVENTS WERE PULLED.** The
+backend armed `window.__remoteTap` before the click and collected it by
+evaluating a splice over CDP every 250 ms, in the same round trip as the watch
+loop. Every event therefore travelled only as often as a busy page answered
+the debugger - reported from a real runtime as the bar **sitting at "embedder ·
+1%" for a whole fold**, with the finished structure appearing at the end.
+Measured here against a deliberately busy page: with 300 ms tasks the drain
+interval stretched 250 ms → 600 ms and events aged ~300 ms, which is chunky
+rather than frozen, so the real fold blocks the thread harder than a synthetic
+one - but the shape of the fault is the same and the mechanism is the same.
+
+**THE PAGE PUSHES NOW, IN THE TASK THAT MADE THE EVENT.** `tapOut` posts to
+`/up` immediately, coalescing only while a send is in flight. The page has to
+be running to produce an event at all, so asking it again later can add
+nothing - and the one thing a pull did buy, batching, is what the in-flight
+buffer does anyway.
+
+🔴 **AND THE COMMANDS COME BACK THE SAME WAY - TWO MAILBOXES, ONE BROKER.**
+`tools/colab_backend.py` is a post office: `EVENTS` is what the runtime page
+has said, `COMMANDS` is what readers have asked, both append-only and both
+read by watermark, so an overlapping poll or a reload re-applies rather than
+losing anything. The reader posts `/in {op, payload}` and reads `/down?since=`;
+the runtime page reads `/out?since=` and posts `/up`. `fold`, `stop` and
+`ping` are the ops.
+
+**WHAT LEFT THE BACKEND WITH IT**: the `#predict` click, the status-line word
+list that decided a fold had failed, the download-button readback, the
+`__foldState` watch and the three tap drains - about 180 lines of CDP driving
+a page by imitation. All of it is in `web/colab-bridge.js` now, where setting
+a control is setting a control. **CDP keeps the two jobs only it can do**:
+start the browser, and say what card it got.
 
 🔴 **AND STOPPING HAS TO REACH THE OTHER MACHINE.** Aborting locally ends the
-polling loop and leaves the runtime folding with its GPU lock held, so the
-next fold is answered 429. `POST /stop` clicks `predict` - the same toggle a
-reader would press - so there is no second stop path to drift.
+polling loop and leaves the runtime folding with its GPU held, so the next
+fold is refused. The reader posts `{op: "stop"}` and the runtime page clicks
+`predict` - the same toggle a reader would press - so there is no second stop
+path to drift.
+
+**ONE GPU, ONE FOLD, AND THE REFUSAL IS THE BROKER'S.** A second Fold click on
+a running page is how a fold gets STOPPED, so the page cannot answer "busy" by
+refusing a press: the broker raises a flag when it accepts a `fold` and lowers
+it on the page's own `result`, which is the event that says the fold ended in
+every way a fold can end.
+
+🔴 **AND EVERY EVENT CARRIES TWO CLOCKS.** The page stamps `at` and the broker
+stamps `got` on arrival, so "the fold was slow" and "the feed was slow" are
+two numbers rather than an argument - which is exactly what the pulled version
+could not tell apart, and what cost a session of guessing. The reader keeps
+them in `window.__remoteLag`.
+
+`npm run test:colab` (`tools/check-colab-bridge.py`) is the gate, and it needs
+**no GPU and no weights**: it starts the broker, lets it open the runtime page,
+and drives every route from the reader's side - the announcement, a `ping` that
+comes back as a `pong` (213-414 ms here), both clocks, the watermark's
+idempotence, the 429, and a token refusal on all five routes. Three mutations
+caught: the push removed (the pulled version's behaviour - four arms red), the
+arrival stamp dropped, and the busy refusal removed. What it cannot cover is a
+fold; the fold command is driven with an empty entity list, so the command path
+and the `result` event are real and what comes back is the page's own refusal.
 
 ### 🔴 "A new object with frames" could not see a SECOND fold
 
@@ -2065,7 +2110,8 @@ one), and a status line without a percentage is true *before* the click has
 been acted on. The page states it instead: `window.__foldState = {running,
 since}`, written at the top of `fold()` and in its `finally`, compared against
 a click time taken from **the page's own clock**. Two blocking folds back to
-back now answer in 11.7 s and 1.05 s.
+back now answer in 11.7 s and 1.05 s. That watch lives in `runFold`
+(`web/colab-bridge.js`) now, where both clocks are the same one.
 
 ## The Colab setup minute, measured on a T4 - and the three ways of cutting it that do not work
 

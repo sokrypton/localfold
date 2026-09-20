@@ -78,6 +78,8 @@
     "test:site": "python3 tools/build_site.py",
     "//test:delta": "Does the shipped uploader ADD a delta to weights that are already resident? AlphaFold 2 is five models and a bundle is 97 MiB where a delta is 43; this holds `planBlockUpload(..., { accumulate: true })` to ZERO differing f16 results on real AlphaFold tensors, with two controls - the same plan with the flag off must DIFFER, and the result must land nearer the model the delta names than the base does. Needs the base and delta bundles on disk; see tools/pack_delta_model.py.",
   "test:delta": "node tools/gpu-chrome.mjs tools/gpu/check-delta-upload.js --target=/model-mono-3",
+  "//test:colab": "The Colab bridge's transport, with no GPU and no weights: tools/colab_backend.py brokers between index.html?role=runtime (opened headlessly) and the reader's ?backend=colab, and every route is driven from the reader's side. It starts a Chrome, so it is not in the node lane.",
+    "test:colab": "python3 tools/check-colab-bridge.py",
   "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. \ud83d\udd34 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
     "test:tools": "python3 tools/index-tools.py"
   },
