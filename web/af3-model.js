@@ -561,6 +561,11 @@ export async function foldAf3(options) {
     seed: options.seed ?? 0,
     ligands,
     modifications,
+    // 🔴 AND THE BONDS THE JOB DECLARED - `bondedAtomPairs`. A covalent
+    // inhibitor folded beside its target rather than bonded to it is a
+    // different answer, and this literal is exactly the kind that loses a key.
+    ...(options.bonds === undefined || options.bonds.length === 0
+      ? {} : { bonds: options.bonds }),
     // 🔴 THE BOND MATRIX IS PART OF THE MODEL, NOT OF THE MOLECULE. AF3 sets
     // contact[i][j] from the CCD's bond table alone; the OpenFold3 lineage was
     // trained with both directions set, and a ring ligand folded through the

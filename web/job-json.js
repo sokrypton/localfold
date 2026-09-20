@@ -262,6 +262,20 @@ function checkKeys(body, allowed, where) {
   }
 }
 
+/**
+ * The chain letters an entry declared, in order, or [] for the server dialect.
+ *
+ * 🔴 KEPT ONLY SO `bondedAtomPairs` CAN BE RESOLVED. A letter is not part of
+ * the job otherwise - `expandEntities` numbers chains by position and the
+ * server dialect has no letters at all - so this is carried on the entity and
+ * dropped the moment the bonds are mapped, rather than becoming a second
+ * source of truth about what a chain is called.
+ */
+function idsOf(body) {
+  if (Array.isArray(body.id)) return body.id.map(String);
+  return body.id === undefined ? [] : [String(body.id)];
+}
+
 /** How many copies an entry asks for: a `count`, or the length of an id list. */
 function copiesOf(body, where) {
   if (body.count !== undefined) {
@@ -397,7 +411,7 @@ function readEntry(entry, index, state) {
       } catch (error) {
         refuse(`${where}: \`smiles\` ${error.message}`);
       }
-      return { type: "smiles", value: smiles, copies, modifications: [] };
+      return { type: "smiles", value: smiles, copies, modifications: [], ids: idsOf(body) };
     }
     // 🔴 THE SERVER'S OWN SPELLING CARRIES A `CCD_` PREFIX, WHICH UPSTREAM
     // STRIPS. `Ligand.from_alphafoldserver_dict` does `removeprefix('CCD_')`,
@@ -416,7 +430,7 @@ function readEntry(entry, index, state) {
         + " chain, and this page folds one code per ligand");
     }
     const code = String(list[0]).trim().toUpperCase().replace(/^CCD_/, "");
-    return { type: "ligand", value: code, copies, modifications: [] };
+    return { type: "ligand", value: code, copies, modifications: [], ids: idsOf(body) };
   }
 
   const sequence = body.sequence;
@@ -442,6 +456,7 @@ function readEntry(entry, index, state) {
   readAlignment(body, where, state);
   const template = type === "protein" ? readTemplates(body, where) : undefined;
   return { type, value: sequence.trim().toUpperCase(), copies, modifications,
+           ids: idsOf(body),
            ...(template === undefined ? {} : { template }) };
 }
 
@@ -506,7 +521,7 @@ export function jobFromJson(text) {
     notes.push(`${jobs.length} jobs in the file; loaded the first`);
   }
   const job = jobs[0] ?? {};
-  for (const field of ["bondedAtomPairs", "userCCD", "userCCDPath"]) {
+  for (const field of ["userCCD", "userCCDPath"]) {
     if (job[field] !== undefined && job[field] !== null) {
       refuse(`${field} describes chemistry this page does not build - remove it`
         + " to fold the rest");
@@ -536,6 +551,70 @@ export function jobFromJson(text) {
   entities.sort((left, right) =>
     Number(left.type === "ligand") - Number(right.type === "ligand"));
 
+  // 🔴 THE BONDS A JOB DECLARES, WHICH THREE OF AlphaFold 3's OWN FOURTEEN
+  // EXAMPLES CARRY. `bondedAtomPairs` names each end as
+  // `[chainId, residueNumber, atomName]`, and a chain ID is a LETTER where
+  // this page numbers chains by position - so the letters every entry declared
+  // are mapped here, once, and dropped.
+  //
+  // 🔴 THE NUMBERING MUST MATCH `expandEntities`, which walks the entity list
+  // and puts polymers in `chains` and ligands in `ligandCodes` - two arrays -
+  // so a chain's asymId is its index among POLYMER copies and a ligand's is
+  // `chains.length` plus its index among LIGAND copies. That is also the order
+  // featuriseProtein assigns `asym` in, which is what makes one number enough.
+  const asymOfId = new Map();
+  let polymerChains = 0;
+  for (const entity of entities) {
+    if (entity.type === "ligand" || entity.type === "smiles") continue;
+    for (const id of entity.ids ?? []) asymOfId.set(id, polymerChains++);
+    if ((entity.ids ?? []).length === 0) polymerChains += entity.copies;
+  }
+  let ligandAt = polymerChains;
+  for (const entity of entities) {
+    if (entity.type !== "ligand" && entity.type !== "smiles") continue;
+    for (const id of entity.ids ?? []) asymOfId.set(id, ligandAt++);
+    if ((entity.ids ?? []).length === 0) ligandAt += entity.copies;
+  }
+
+  const bonds = [];
+  for (const [index, pair] of (job.bondedAtomPairs ?? []).entries()) {
+    const where = `bondedAtomPairs[${index}]`;
+    if (!Array.isArray(pair) || pair.length !== 2) {
+      refuse(`${where}: a bond is two atoms`);
+    }
+    const end = (side, which) => {
+      if (!Array.isArray(side) || side.length !== 3) {
+        refuse(`${where} ${which}: an atom is [chain, residue, atom]`);
+      }
+      const [chain, residue, atom] = side;
+      const asym = asymOfId.get(String(chain));
+      if (asym === undefined) {
+        refuse(`${where} ${which}: no chain "${chain}" in this job`
+          + ` (it has ${[...asymOfId.keys()].join(", ") || "none named"})`);
+      }
+      if (!Number.isInteger(residue) || residue < 1) {
+        refuse(`${where} ${which}: residue ${residue} is not a position`);
+      }
+      return { asym, residue, atom: String(atom) };
+    };
+    bonds.push({ from: end(pair[0], "from"), to: end(pair[1], "to") });
+  }
+  // 🔴 A POLYMER-TO-POLYMER BOND REACHES NO MODEL, AND SAYING SO IS THE POINT.
+  // AlphaFold 3 extracts token bonds only where one side is a LIGAND -
+  // `get_polymer_ligand_and_ligand_ligand_bonds` - so a disulfide between two
+  // cysteines is simply absent from `token_bonds` there too. Keeping it would
+  // be inventing a feature the reference does not have; dropping it silently
+  // would be the failure this file exists to avoid.
+  const ligandAsyms = new Set([...asymOfId.entries()]
+    .filter(([, asym]) => asym >= polymerChains).map(([, asym]) => asym));
+  const reaching = bonds.filter((bond) =>
+    ligandAsyms.has(bond.from.asym) || ligandAsyms.has(bond.to.asym));
+  if (reaching.length !== bonds.length) {
+    notes.push(`${bonds.length - reaching.length} of ${bonds.length} bonded pairs`
+      + " join two polymer residues, which AlphaFold 3 does not put in"
+      + " `token_bonds` either - they are not sent to the model");
+  }
+
   const seeds = job.modelSeeds ?? [];
   const list = Array.isArray(seeds) ? seeds : [seeds];
   if (list.length > 1) {
@@ -558,6 +637,9 @@ export function jobFromJson(text) {
   const problem = entitiesProblem(entities);
   if (problem !== null) refuse(problem);
 
+  // ...and the letters go no further: the bonds carry numbers now.
+  for (const entity of entities) delete entity.ids;
   return { name: typeof job.name === "string" ? job.name : undefined,
-           seed, entities, dialect, singleSequence: state.singleSequence, notes };
+           seed, entities, dialect, singleSequence: state.singleSequence, notes,
+           ...(reaching.length === 0 ? {} : { bonds: reaching }) };
 }

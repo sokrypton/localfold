@@ -688,9 +688,66 @@ export function featuriseProtein(sequence, options = {}) {
   // 0.069. The order is in the component's own bond table and has been all
   // along - `parseCcdComponent` returns it - so this is a channel that was
   // parsed, forwarded and never filled.
+  // 🔴 AND THE BONDS A JOB DECLARES, which is `bondedAtomPairs` in AlphaFold 3's
+  // own format and the thing three of its fourteen example jobs are refused
+  // for. An endpoint is addressed by `asymId`, because that is how the batch is
+  // actually indexed and it is one namespace over polymers AND ligands - the
+  // same namespace the file's chain letters are in. Polymer chains take
+  // 0..chains-1 in order and each ligand the next, which is what makes the
+  // caller's letter-to-number map computable.
+  //
+  // 🔴 AND AN ATOM NAME RESOLVES TO A TOKEN, NOT TO AN ATOM. `token_bonds` is
+  // token x token: for a standard residue that is its single token whichever
+  // atom was named, and for a LIGAND or an atomised residue it is the token
+  // carrying that atom. Reading the name as an atom index would put the bond on
+  // whichever token happened to sit there.
+  const tokenOfEndpoint = (endpoint, where) => {
+    const { asym, residue, atom } = endpoint;
+    if (!Number.isInteger(asym) || asym < 0) {
+      throw new Error(`${where}: chain ${asym} is not one this batch has`);
+    }
+    if (asym >= chainLengths.length) {
+      const ligand = ligands[asym - chainLengths.length];
+      const span = ligandSpans[asym - chainLengths.length];
+      if (ligand === undefined) throw new Error(`${where}: no chain ${asym}`);
+      const slot = ligand.atoms.findIndex((one) => one.name === atom);
+      if (slot < 0) {
+        throw new Error(`${where}: ${ligand.code} has no atom ${atom}`);
+      }
+      return span.from + slot;
+    }
+    let global = residue - 1;
+    for (let before = 0; before < asym; before += 1) global += chainLengths[before];
+    if (residue < 1 || global < 0 || global >= residueCount) {
+      throw new Error(`${where}: residue ${residue} is past the end of chain ${asym}`);
+    }
+    const span = modifiedSpans.find((one) => one.residue === global);
+    if (span === undefined) {
+      // A standard residue is one token, and `residueOfToken` is the only map
+      // from a residue back to it that survives atomisation elsewhere.
+      const token = residueOfToken.indexOf(global);
+      if (token < 0) throw new Error(`${where}: residue ${residue} has no token`);
+      return token;
+    }
+    if (span.oneToken === true) return span.from;
+    const slot = span.atoms.findIndex((one) => one.name === atom);
+    if (slot < 0) throw new Error(`${where}: ${span.code} has no atom ${atom}`);
+    return span.from + slot;
+  };
+  const declaredBonds = [];
+  for (const [index, bond] of (options.bonds ?? []).entries()) {
+    const where = `bond ${index + 1}`;
+    declaredBonds.push({
+      from: tokenOfEndpoint(bond.from, `${where} from`),
+      to: tokenOfEndpoint(bond.to, `${where} to`),
+      order: bond.order ?? 1,
+    });
+  }
+
   let bondMatrix;
   let bondOrderMatrix;
-  if (bondedGroups.some((group) => group.bonds.length > 0)) {
+  if (bondedGroups.some((group) => group.bonds.length > 0)
+      || declaredBonds.length > 0) {
     bondMatrix = new Float32Array(tokens * tokens);
     bondOrderMatrix = new Float32Array(tokens * tokens);
     for (const { base, bonds } of bondedGroups) {
@@ -702,6 +759,16 @@ export function featuriseProtein(sequence, options = {}) {
           bondOrderMatrix[(base + bond.to) * tokens + (base + bond.from)] = bond.order ?? 1;
         }
       }
+    }
+    // 🔴 BOTH DIRECTIONS ALWAYS, unlike a component's own bonds. A declared bond
+    // joins two things the featuriser laid out independently, so there is no
+    // "the writer's triangle" to follow - and AF3's own extraction writes the
+    // pair, not one corner of it.
+    for (const bond of declaredBonds) {
+      bondMatrix[bond.from * tokens + bond.to] = 1;
+      bondMatrix[bond.to * tokens + bond.from] = 1;
+      bondOrderMatrix[bond.from * tokens + bond.to] = bond.order;
+      bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
     }
     if (options.atomizedBackboneBonds === true) {
       for (const span of modifiedSpans) {

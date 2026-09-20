@@ -323,6 +323,66 @@ describe("a modified residue reaches ESMFold2", () => {
   });
 });
 
+/**
+ * 🔴 THE BONDS A JOB DECLARES - `bondedAtomPairs`, which three of AlphaFold 3's
+ * own fourteen example jobs carry and which this page refused outright. The
+ * KRAS/sotorasib example is the one that matters: sotorasib IS a covalent
+ * inhibitor, bonded to cysteine 12, and folding it beside its target rather
+ * than attached to it is a different answer. Measured through the page, same
+ * job, same seed, 50 steps: **SG-C25 is 1.62 A with the bond and 6.25 A
+ * without** - a C-S bond is ~1.81.
+ *
+ * 🔴 AN ENDPOINT IS A TOKEN, NOT AN ATOM. `token_bonds` is token x token, so an
+ * atom NAME resolves to the token carrying it - a standard residue's single
+ * token whichever atom was named, a ligand's or an atomised residue's specific
+ * one. Reading the name as an index would bond whatever happened to sit there.
+ */
+describe("a bond a job declares", () => {
+  const glycerol = {
+    code: "GOL",
+    atoms: ["C1", "O1", "C2"].map((name, slot) => ({
+      name, element: name.startsWith("O") ? 8 : 6, charge: 0,
+      x: slot, y: 0, z: 0, componentSlot: slot,
+    })),
+    bonds: [{ from: 0, to: 1, order: 1 }, { from: 1, to: 2, order: 1 }],
+  };
+  const batchWith = (bonds) => featuriseProtein("GWCTE", {
+    chainKinds: ["protein"], ligands: [glycerol], bonds,
+  });
+
+  it("joins a polymer residue to a ligand atom, both ways", () => {
+    const batch = batchWith([
+      { from: { asym: 0, residue: 3, atom: "SG" }, to: { asym: 1, atom: "C2" } },
+    ]);
+    const tokens = batch.tokens;
+    // Residue 3 of GWCTE is the cysteine: one token, index 2. The ligand's
+    // three atoms follow the five polymer tokens, so C2 is token 5 + 2.
+    const cys = 2;
+    const c2 = batch.ligandSpans[0].from + 2;
+    assert.equal(batch.bondMatrix[cys * tokens + c2], 1);
+    assert.equal(batch.bondMatrix[c2 * tokens + cys], 1);
+  });
+
+  it("refuses an atom the component does not have, by name", () => {
+    let message = "(no refusal)";
+    try {
+      batchWith([{ from: { asym: 0, residue: 3, atom: "SG" },
+                   to: { asym: 1, atom: "C99" } }]);
+    } catch (error) { message = error.message; }
+    // 🔴 THIS IS ALSO WHAT PROTECTS AN EDITED ROW. The page holds a job's bonds
+    // by chain POSITION, so editing the entity list can move what sits there -
+    // and resolving by atom NAME means the common case throws rather than
+    // bonding something else.
+    assert.ok(message.includes("no atom C99"), message);
+  });
+
+  it("is forwarded by the batch builder, which lists its fields by hand", () => {
+    // The literal in src/af3/featurise/batch.js is exactly the kind that loses
+    // a key - it is how `modifications` went missing on the ESMFold2 path.
+    assert.ok(readSource("src/af3/featurise/batch.js").includes("bonds: options.bonds"));
+  });
+});
+
 function readSource(relative) {
   return readFileSync(new URL(`../${relative}`, import.meta.url), "utf8");
 }

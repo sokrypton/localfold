@@ -53,9 +53,19 @@ const EXPECTED = {
   "u1a_rna_hairpin.json": { loads: ["protein:101x1", "rna:21x1"] },
   "ubiquitin_monomer.json": { loads: ["protein:76x1"] },
 
+  // 🔴 A COVALENT INHIBITOR, WHICH IS WHAT `bondedAtomPairs` IS FOR. Sotorasib
+  // is bonded to KRAS's cysteine 12 - that bond is the drug - and the job was
+  // refused outright for naming it. It loads now, and the bond is asserted
+  // below rather than just the rows: a job that folds the protein and the
+  // ligand side by side with no bond between them is a different answer.
+  "kras_g12c_sotorasib.json": { loads: ["protein:189x1", "ligand:MOVx1"],
+                                bonds: ["A/12/SG - B/1/C25"] },
   // ...and the four this page does not fold, each naming its own reason.
-  "kras_g12c_sotorasib.json": { refuses: "bondedAtomPairs" },
-  "rnaseb_glycosylated.json": { refuses: "bondedAtomPairs" },
+  // 🔴 THIS ONE MOVED ITS REASON RATHER THAN LOSING IT: it carried
+  // `bondedAtomPairs` AND a five-component glycan in one ligand entry, and
+  // with the bonds read it refuses on the glycan. Five CCD codes in one entry
+  // is one bonded chain, which this page does not build.
+  "rnaseb_glycosylated.json": { refuses: "ccdCodes lists 5 components" },
   "methylated_dna.json": { refuses: "modified bases" },
   "modified_rna.json": { refuses: "modified bases" },
   // 🔴 AND THIS ONE LOADS NOW, WHERE IT USED TO BE A REFUSAL. Biotin arrives
@@ -65,7 +75,9 @@ const EXPECTED = {
   "streptavidin_biotin_smiles.json": { loads: ["protein:126x1", "smiles:1x1"] },
   // ...and the pipeline's own kitchen-sink input, which uses nearly every
   // field the format has at once. It refuses on the first one it hits.
-  "alphafold_input.json": { refuses: "bondedAtomPairs" },
+  // ...and the kitchen sink now refuses on the NEXT thing it asks for, which
+  // the "names the next reason" case below already had to peel it to reach.
+  "alphafold_input.json": { refuses: "unpairedMsa" },
 };
 
 const shape = (entities) => entities.map((entity) =>
@@ -93,6 +105,16 @@ describe("AlphaFold 3's own example jobs", () => {
     it(`loads ${name}`, () => {
       const job = jobFromJson(read(name));
       expect(shape(job.entities)).toEqual(expectation.loads);
+      if (expectation.bonds !== undefined) {
+        // Written as the file writes it - chain letter, residue, atom - rather
+        // than as the asymIds it becomes, so the expectation reads against the
+        // fixture and not against this page's numbering.
+        const letters = ["A", "B", "C", "D", "E"];
+        expect((job.bonds ?? []).map((bond) =>
+          `${letters[bond.from.asym]}/${bond.from.residue}/${bond.from.atom}`
+          + ` - ${letters[bond.to.asym]}/${bond.to.residue}/${bond.to.atom}`))
+          .toEqual(expectation.bonds);
+      }
       // Every example seeds 42, and a seed read as a string would be one.
       expect(job.seed).toBe(42);
       expect(job.dialect).toBe("alphafold3");
@@ -140,15 +162,20 @@ describe("AlphaFold 3's own example jobs", () => {
    * protein/DNA complex, none of them tripping the chain-geometry rule. The
    * per-file table is in docs/WEB.md.
    */
-  it("folds nine of the fourteen, and says which two gaps cost the rest", () => {
+  it("folds ten of the fourteen, and says what the other four want", () => {
     const loads = Object.values(EXPECTED).filter((one) => one.loads !== undefined);
-    const bonded = Object.values(EXPECTED)
-      .filter((one) => one.refuses === "bondedAtomPairs");
     const bases = Object.values(EXPECTED)
       .filter((one) => one.refuses === "modified bases");
-    expect(loads).toHaveLength(9);
-    // ...three, with the kitchen-sink input, which is bonded chemistry too.
-    expect(bonded).toHaveLength(3);
+    // 🔴 TEN, AND IT WAS NINE UNTIL `bondedAtomPairs` LANDED. This count is
+    // asserted so that moving a file between the two lists is a decision
+    // somebody makes out loud - it has caught the prose going stale twice.
+    expect(loads).toHaveLength(10);
     expect(bases).toHaveLength(2);
+    // The remaining two are one each: a five-component glycan in one ligand
+    // entry, and an alignment carried inline.
+    expect(Object.values(EXPECTED).filter((one) =>
+      one.refuses === "ccdCodes lists 5 components")).toHaveLength(1);
+    expect(Object.values(EXPECTED).filter((one) =>
+      one.refuses === "unpairedMsa")).toHaveLength(1);
   });
 });

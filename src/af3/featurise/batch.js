@@ -54,6 +54,11 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
   const batch = featuriseProtein(sequence, {
     ...(options.ligands === undefined ? {} : { ligands: options.ligands }),
     ...(options.modifications === undefined ? {} : { modifications: options.modifications }),
+    // 🔴 THE BONDS A JOB DECLARED. `bondedAtomPairs` in AlphaFold 3's format;
+    // a key absent from this literal is a key thrown away, which is the note
+    // three lines up and the bug that lost `modifications` on the ESMFold2
+    // path. See featurise.js's `tokenOfEndpoint`.
+    ...(options.bonds === undefined ? {} : { bonds: options.bonds }),
     ...(options.symmetriseBonds === undefined
       ? {} : { symmetriseBonds: options.symmetriseBonds }),
     ...(options.chainKinds === undefined ? {} : { chainKinds: options.chainKinds }),

@@ -2313,6 +2313,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // `ACGT` as a protein and then as DNA is two different questions with the
     // same `chains`, and without this the second reuses the first one's trunk.
     chains, chainKinds, ligandCodes, modifications, maxMsaSequences, seed: randomSeed(),
+    // A declared bond changes what is folded, so a trunk cached without one is
+    // not this fold's - the `chainKinds` rule beside it.
+    bonds: jobBonds,
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
@@ -2427,7 +2430,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
-    chainKinds, reuse,
+    chainKinds, reuse, bonds: foldContext.bonds,
     // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes
     // through it: a modified residue is one POSITION and ten TOKENS, so its
     // PAE and its contact map are wider than the structure they belong to and
@@ -3639,6 +3642,7 @@ async function fold(event) {
     // here and the structure exists only inside whichever branch runs.
     foldContext = {
       entities,
+      bonds: jobBonds,
       // 🔴 NOT RECORDED HERE AT ALL ANY MORE. The request's `name` is the
       // fold's `stem`, which `foldStem` has already resolved from this same
       // box - so `archiveFor` reads `pred.stem` and the two cannot disagree.
@@ -4452,8 +4456,24 @@ reportModelFromUrl();
  * a second reader of the same control - the mistake `chosenFamily` was written
  * to end.
  */
+/**
+ * The covalent bonds the loaded job declared, or [].
+ *
+ * 🔴 KEPT BECAUSE WITHOUT THEM THE FOLD IS A DIFFERENT ANSWER, which is what
+ * separates this from the job NAME that was purged: a covalent inhibitor
+ * folded beside its target rather than bonded to it is the wrong structure,
+ * not a mislabelled one. They are indexed by the chain POSITION the job
+ * described, so editing the rows can invalidate them - and the featuriser is
+ * what catches that: it resolves each endpoint by atom NAME and throws
+ * "CYS has no atom SG" rather than bonding whatever now sits there. The
+ * residual is an edit that leaves the same atom at the same position, which
+ * is narrow and loud everywhere else.
+ */
+let jobBonds = [];
+
 function applyJob(job) {
   entityList.set(job.entities);
+  jobBonds = job.bonds ?? [];
   const said = [];
   if (job.seed !== undefined) {
     const input = document.getElementById("random-seed");

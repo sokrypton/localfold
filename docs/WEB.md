@@ -2243,3 +2243,54 @@ the wall-clock was blamed on the runtime. Long work goes **detached**
 (`subprocess.Popen(..., start_new_session=True)` writing timings to a file)
 and is read with cheap polls; the first `exec` against a new session pays
 ~29 s of kernel connection, every later one is ~3 s.
+
+## `bondedAtomPairs`: a covalent inhibitor, bonded
+
+Three of AlphaFold 3's fourteen example jobs were refused for declaring covalent
+bonds, and the KRAS one is why it matters: **sotorasib IS a covalent inhibitor**,
+bonded to cysteine 12. Folding it beside its target rather than attached to it
+is a different answer, and pLDDT will not tell you which you got.
+
+Measured through the page, same job, same seed, 50 steps:
+
+| | SG(CYS 12) - C25(sotorasib) |
+|---|---:|
+| `bondedAtomPairs` as the file declares it | **1.62 A** |
+| the same job with that field deleted | **6.25 A** |
+
+A C-S bond is about 1.81 A. The control is the point: the ligand is genuinely
+attached, not merely nearby.
+
+🔴 **AN ENDPOINT IS ADDRESSED BY `asymId`, WHICH IS ONE NAMESPACE OVER POLYMERS
+AND LIGANDS** - the same namespace the file's chain letters are in. Polymer
+chains take 0..chains-1 in order and each ligand the next, which is exactly what
+`expandEntities` and `featuriseProtein` already do, so one number is enough and
+the reader can compute the letter map itself. The letters are carried on the
+entities only as far as that map and then deleted, rather than becoming a second
+source of truth about what a chain is called.
+
+🔴 **AND AN ATOM NAME RESOLVES TO A TOKEN, NOT TO AN ATOM.** `token_bonds` is
+token x token: for a standard residue that is its single token whichever atom
+was named, and for a ligand or an atomised residue it is the token carrying that
+atom. Reading the name as an index would bond whatever happened to sit there.
+
+🔴 **A POLYMER-TO-POLYMER BOND IS READ AND NOT SENT, AND THE JOB IS TOLD.**
+AlphaFold 3 extracts token bonds only where one side is a LIGAND -
+`get_polymer_ligand_and_ligand_ligand_bonds` - so a disulfide between two
+cysteines is absent from `token_bonds` there too. Keeping it would invent a
+feature the reference does not have; dropping it silently is the failure this
+file exists to avoid, so it becomes a note on the load.
+
+**The corpus goes nine to ten**, and the two that did not move revealed their
+next reason rather than losing one: `rnaseb_glycosylated` asks for a
+five-component glycan in a single ligand entry, and `alphafold_input` carries
+its alignment inline. `modified_rna` and `methylated_dna` are unchanged - that
+is the modified-BASES gap, which is separate.
+
+🔴 **AND THE PAGE HOLDS THESE BONDS BY CHAIN POSITION, WHICH EDITING THE ROWS
+CAN INVALIDATE.** What protects it is that resolution is by atom NAME: change
+the sequence so residue 12 is no longer a cysteine and the featuriser throws
+"no atom SG" rather than bonding whatever now sits there. The residual is an
+edit that leaves the same atom at the same position, which is narrow and loud
+everywhere else. Said here rather than guarded with machinery, after the job
+NAME's own comparison was built and then removed for not earning its place.
