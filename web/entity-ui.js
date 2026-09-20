@@ -705,6 +705,20 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // so it no longer parsed. Both happened the moment the reader clicked
         // away from the box, silently rewriting what they had typed.
         entity.value = value.value.trim();
+      } else if (entity.type === "contact") {
+        // 🔴 TRIMMED AND NOTHING ELSE, FOR THE THIRD TIME AT THIS SEAM. The
+        // `else` below is `cleanSequence`, which keeps only amino-acid letters:
+        // a contact typed as `A12:SG - B1:C25` came back `A:SGB:C` the moment
+        // the reader clicked away - the residue numbers, the spaces and the
+        // hyphen all gone, and what was left still looked like a sequence. It
+        // is the same branch that turned benzene into hexane, and the comment
+        // above it did not stop a third row type walking into it.
+        //
+        // 🔴 AND NOT UPPER-CASED HERE EITHER. `parseContact` upper-cases the
+        // chain letter and the atom name when it reads them, which is where
+        // that belongs; doing it here would also upper-case whatever a reader
+        // is halfway through typing.
+        entity.value = value.value.trim();
       } else {
         entity.value = cleanSequence(value.value);
       }

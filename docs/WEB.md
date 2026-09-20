@@ -2405,6 +2405,29 @@ the trunk key referenced `bonds` in a function that is handed chains and ligands
 and never the rows - `bonds is not defined`, at fold time, in the browser. Both
 are the row type falling into code that predates it.
 
+🔴 **AND THE BOX FILTERED WHAT WAS TYPED INTO IT - THE THIRD ROW TYPE TO WALK
+INTO THE SAME `else`.** The blur handler ends `entity.value =
+cleanSequence(value.value)`, which keeps only amino-acid letters, so a contact
+typed as `A12:SG - B1:C25` came back **`A:SGB:C`** the moment the reader clicked
+away: the residue numbers, the colon's right-hand side, the spaces and the
+hyphen all gone, and what was left still looked like a sequence. It is the
+branch that turned benzene into hexane, with a 🔴 comment directly above it
+about exactly this - and the comment did not stop it happening again.
+
+Reported by a user, because nothing here could see it: `--smiles-ui` exists
+precisely because the entity list's API cannot, and a contact had no equivalent.
+`tools/fold-in-page.py --contact-ui` drives the dropdown, types, and fires the
+BLUR, which is where the handler lives:
+
+```
+typed  A12:SG - B1:C25
+stored A12:SG - B1:C25   kept: true
+```
+
+and with the branch removed, `stored A:SGB:C  kept: false`. It also checks the
+box's `text-transform` is `none`, since borrowing `.entity-value-ligand` would
+uppercase a contact on screen the way it would a SMILES.
+
 **Crosslinks are not done.** af3x's form - a named linker between two residues,
 which expands to the linker as a LIGAND plus two bonds - fits this row exactly
 (`DSSO A53 - C66`), and the parser leaves room for it, but it needs a table of

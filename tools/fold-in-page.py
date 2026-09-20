@@ -279,6 +279,14 @@ def main():
                              " were each on the wire, and how much they"
                              " overlapped. The two used to be strictly"
                              " sequential.")
+    parser.add_argument("--contact-ui", action="store_true",
+                        help="type a CONTACT row through the controls and fire"
+                             " the blur. \U0001f534 SAME REASON AS --smiles-ui,"
+                             " and the same handler: the blur's final `else` is"
+                             " `cleanSequence`, which keeps only amino-acid"
+                             " letters, so `A12:SG - B1:C25` came back"
+                             " `A:SGB:C` the moment the reader clicked away."
+                             " Third row type to walk into that branch.")
     parser.add_argument("--smiles-ui", action="store_true",
                         help="set the SMILES row by DRIVING THE CONTROLS - pick"
                              " the type from the dropdown, type into the box,"
@@ -650,6 +658,53 @@ def main():
                 REPO, "tools/fixtures/af3-jobs/tetr_homodimer.json"),
                 encoding="utf-8").read()), await_promise=True))
             return
+
+        if args.contact_ui:
+            # 🔴 THE BLUR IS THE WHOLE TEST. A contact's text is the only row
+            # value that is neither a sequence nor a code - it has digits, a
+            # colon, spaces and a hyphen, and every one of those is what
+            # `cleanSequence` strips. Setting it through the entity list's API
+            # cannot see that; typing it and clicking away is what a reader
+            # does.
+            print("contact ui:", cdp.evaluate(ws, """(() => {
+              const want = 'A12:SG - B1:C25';
+              document.getElementById('add-entity')?.click();
+              // Re-queried after every mutation, never held: a type change and
+              // a blur both re-render the list, so an element captured before
+              // one is detached afterwards. See the note on --smiles-ui.
+              const last = () => [...document.querySelectorAll('.entity-row')].pop();
+              const setType = (value) => {
+                const select = last().querySelector('.entity-type');
+                select.value = value;
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+              };
+              const typeInto = (text) => {
+                const box = last().querySelector('textarea.entity-value, input.entity-value');
+                box.value = text;
+                box.dispatchEvent(new Event('input', { bubbles: true }));
+                box.dispatchEvent(new Event('blur', { bubbles: true }));
+              };
+              const offered = [...last().querySelector('.entity-type').options]
+                .map((o) => o.value);
+              setType('contact');
+              const label = [...last().querySelector('.entity-type').options]
+                .find((o) => o.value === 'contact')?.textContent;
+              typeInto(want);
+              const box = last()
+                .querySelector('textarea.entity-value, input.entity-value');
+              const stored = window.__entityList.read().pop();
+              return JSON.stringify({
+                offered: offered.includes('contact'), label,
+                tag: box.tagName, placeholder: box.placeholder,
+                // 🔴 UPPERCASING WOULD ALSO BE A FILTER. `.entity-value-ligand`
+                // is `text-transform: uppercase` in CSS, so borrowing that
+                // class would DISPLAY a contact differently from what it holds.
+                transform: getComputedStyle(box).textTransform,
+                typed: want, stored: stored.value,
+                kept: stored.value === want,
+                shownInBox: box.value === want,
+              });
+            })()"""))
 
         if args.smiles and args.smiles_ui:
             # 🔴 THROUGH THE CONTROLS, WHICH IS THE ONLY PATH THAT SEES A UI
