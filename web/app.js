@@ -3223,6 +3223,70 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   progress(null);
 }
 
+/**
+ * WHERE THIS FOLD HAPPENS, AND HOW TO ASK.
+ *
+ * 🔴 THE PAGE IS SERVED BY THE THING THAT FOLDS, so this is SAME-ORIGIN and
+ * there is no CORS question at all: `notebooks/localfold-colab.ipynb` runs
+ * tools/colab_backend.py on the runtime, that server serves this checkout,
+ * and the iframe in the cell loads index.html from it. `?backend=colab` is
+ * the cell saying which of the two machines should do the work, and `t` is
+ * the token that server requires of every request - it is in the URL because
+ * a page cannot be handed a header by whoever framed it.
+ *
+ * Absent the parameter this returns null and nothing anywhere changes: the
+ * website folds where it always did, in the reader's own browser.
+ */
+function remoteBackend() {
+  const asked = new URLSearchParams(location.search);
+  if (asked.get("backend") !== "colab") return null;
+  return { token: asked.get("t") ?? "", at: asked.get("at") ?? "" };
+}
+
+/**
+ * The same job, folded on the runtime, ingested by the same door.
+ *
+ * 🔴 IT COMES BACK AS A FILE AND GOES IN THROUGH `loadIntoViewer`, which is
+ * the path a dropped PDB already takes - so the viewer, the sequence strip,
+ * the heatmap panel and the downloads all behave as they do for a local fold
+ * without knowing one machine from another. What is NOT here yet is the
+ * trajectory: the backend returns the finished structure, so the play bar has
+ * one frame rather than the sampler's walk, and the scores card stays empty
+ * until the service returns its confidence JSON too.
+ */
+async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
+                               templates, family, signal }) {
+  const backend = remoteBackend();
+  const where = backend.at || "";
+  const entities = entityList.read();
+  const request = {
+    entities, model: family,
+    steps: Number(element("af3-count")?.value ?? 25),
+    recycles: Number(element("recycles")?.value ?? 3),
+    msa: msaMode(),
+  };
+  const label = MODEL_LABELS[family] ?? family;
+  status(`${label} · folding on the runtime…`);
+  progress(null);
+  const answer = await fetch(`${where}/fold?t=${encodeURIComponent(backend.token)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request),
+    signal,
+  });
+  if (!answer.ok) {
+    throw new Error(`the runtime answered ${answer.status} ${await answer.text()}`);
+  }
+  const result = await answer.json();
+  if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);
+  const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
+  await loadIntoViewer({ stem, pdb: result.pdb, scores: {} });
+  // ...and the runtime's own summary, which already reads the way this page's
+  // status line does - it is the same code, on the other machine.
+  status(result.status || `${label} · folded on the runtime`);
+  progress(null);
+}
+
 async function fold(event) {
   event?.preventDefault();
   if (activeFold !== undefined) {
@@ -3282,6 +3346,17 @@ async function fold(event) {
     family = await agreeModelTerms(family);
     if (family === null) {
       status("Fold cancelled - no model chosen.");
+      return;
+    }
+    // 🔴 A FOLD THAT HAPPENS SOMEWHERE ELSE LEAVES HERE, BEFORE THE WEIGHTS.
+    // In a Colab cell the page is served BY the runtime that folds, so this
+    // machine has no reason to download half a gigabyte of parameters to
+    // watch. Everything above still runs - the entities are validated, the
+    // model is resolved, the terms are asked - because those are questions
+    // about the JOB, and the job is the same wherever it runs.
+    if (remoteBackend() !== null) {
+      await foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
+                            templates: request.templates ?? [], family, signal });
       return;
     }
     // ...and started, not awaited. The templates and the alignment below are
