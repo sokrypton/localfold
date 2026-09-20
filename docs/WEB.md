@@ -2129,6 +2129,16 @@ four positions**, which is the gate's own four alpha carbons and nothing else.
 The weights stay blocked for the whole run, too: **nothing in this gate may
 ever fold**.
 
+🔴 **AND WHAT THE BROKER DROPS IS NOT DROPPED IN SILENCE.** A session is not
+one fold, so the mailbox is capped at 4,000 events and loses its oldest;
+`from` says where the stream now starts, and a reader behind that point has
+lost events it never applied - frames, mostly, since they are the bulk of it.
+It is recorded (`window.__remoteGap`) and warned about rather than written
+over the status line, because the fold itself is not lost with them: the
+`result` carries the finished structure. Measured in the gate by flooding
+4,100 events past an attached reader: **2,100 noticed as dropped**, and the
+fold that followed still ingested.
+
 🔴 **AND A RUNTIME THAT HAS GONE MUST NOT BE POLLED FOR EVER.** Colab recycles
 a runtime when the notebook is closed or left idle, and the busy flag is raised
 by the BROKER and lowered by the PAGE - so a page that died mid-fold took the

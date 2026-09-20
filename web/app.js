@@ -3348,6 +3348,20 @@ async function followRemoteFold({ since, label, signal }) {
   for (;;) {
     throwIfAborted(signal);
     const state = await remoteEvents(since, signal);
+    // 🔴 THE BROKER DROPS ITS OLDEST EVENTS, AND SAYING NOTHING ABOUT IT IS
+    // THE ONE THING IT MUST NOT DO. A session is not one fold, so the mailbox
+    // is capped; `from` is where the stream now starts, and a reader that has
+    // fallen behind that point has lost what it never applied - frames, most
+    // likely, since they are the bulk of it. The fold is not lost with them
+    // (the result carries the finished structure), so this does not take the
+    // status line away from the runtime's own words: it is recorded, and
+    // `window.__remoteGap` is what a report can be built on.
+    if ((state.from ?? 0) > since) {
+      const lost = state.from - since;
+      window.__remoteGap = (window.__remoteGap ?? 0) + lost;
+      console.warn(`colab bridge: ${lost} event(s) were dropped before this`
+        + " page could apply them - the trajectory will have a gap");
+    }
     since = state.n ?? since;
     // 🔴 IN THE RUNTIME PAGE'S ORDER, NOT THE NETWORK'S. Events are pushed as
     // they happen and several sends can be in flight at once - which is what

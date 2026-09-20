@@ -31,6 +31,9 @@ WHAT IT CHECKS, in the order a session does them:
     runtime page across six seconds of 300 ms blocking tasks, which is what a
     fold does to a main thread. This is the regression guard for the fault the
     bridge was written for;
+  * WHAT THE BROKER DROPS IS NOT DROPPED IN SILENCE: its mailbox is capped,
+    and a reader that has fallen behind the cap is told rather than left with
+    a gap in the trajectory it cannot see;
   * A READER THAT ARRIVES MID-FOLD ATTACHES TO IT rather than sitting idle,
     which is what a reload, a second window or the notebook's link opened
     twice all are;
@@ -549,6 +552,29 @@ try:
                            f" 3 pushed frames at {drew.get('positions')}"
                            " positions, not 4 - the sampler's walk does not"
                            " reach the screen")
+
+            # 🔴 AND WHAT THE BROKER DROPS MUST NOT BE DROPPED IN SILENCE.
+            # A session is not one fold, so the mailbox is capped at 4,000 and
+            # loses its oldest - and a reader that has fallen behind that
+            # point has lost events it never applied. `from` says where the
+            # stream now starts; the flood below is what makes it move.
+            code, before_gap = call("/down?head=1")
+            code, flooded = call("/up", {"events": [
+                {"kind": "status", "payload": "flood %d" % i, "at": 0, "seq": 10000 + i}
+                for i in range(4100)]})
+            gap, deadline = 0, time.time() + 30
+            while time.time() < deadline:
+                gap = cdp.evaluate(late_ws, "window.__remoteGap || 0")
+                if gap > 0:
+                    break
+                time.sleep(0.5)
+            code, after_gap = call("/down?head=1")
+            print(f"  cap: {before_gap.get('n')} -> {after_gap.get('n')} events,"
+                  f" the attached reader noticed {gap} dropped")
+            if gap <= 0:
+                bad.append("the broker dropped its oldest events and the"
+                           " attached reader carried on as though nothing had"
+                           " happened - a gap in the trajectory, in silence")
 
             cdp.evaluate(held, """(async () => {
               const bridge = await import('/web/colab-bridge.js');
