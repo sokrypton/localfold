@@ -15,12 +15,24 @@ The control in every row is the same **171 backbone bonds of the 57 unmodified
 residues in that same structure**, which is what says the fold is worth reading
 at all.
 
-| implementation | checkpoint | control | the SEP |
-|---|---|---:|---:|
-| `esm` 3.4.1, the vendor | ESMFold2-Experimental-Fast-base600M-step1500k + ESM-C 600M | 1.000 | **0.997** |
-| af3-any-model, int8 | the same, via `--model=esmfold2_lm600m` | 0.996 | 1.548 |
-| af3-any-model, fp32 | the same | 0.996 | **1.542** |
-| LocalFold (this port) | the same, WebGPU | 0.999 | **2.349** |
+| implementation | control | the SEP | a glycerol |
+|---|---:|---:|---:|
+| `esm` 3.4.1, the vendor | 1.000 | **1.002** | **0.986** |
+| af3-any-model, fp32 | 0.999 | 1.446 | **1.346** |
+| af3-any-model, int8 | 0.996 | 1.548 | - |
+| LocalFold (this port) | 0.999 | **2.349** | **0.958** |
+
+All on `ESMFold2-Experimental-Fast-base600M-step1500k` + ESM-C 600M, af3-any-model
+through `--model=esmfold2_lm600m`. The glycerol column is a plain CCD ligand in
+the SAME job.
+
+🔴 **AND THAT COLUMN SAYS THE TWO PORTS HAVE DIFFERENT BUGS.** A ligand is
+atomised exactly as a modified residue is - one token per atom, one shared
+reference frame - but it sits in its own chain. af3-any-model misplaces **both**
+(1.446 and 1.346), so its problem is atom placement in general. This port
+misplaces **only the modification** (2.349 against a correct 0.958), so its
+problem is an atomised residue *inside a polymer chain*. **Fixing one will not
+fix the other**, and the earlier version of this file guessed the opposite.
 
 The vendor's worst single bond is 2.6% out. af3-any-model's `CB-OG` is 3.26 Å
 against a 1.417 ideal and its `OG-P` 3.75 against 1.610. This port's `OG-P`
@@ -35,8 +47,8 @@ control holds at 1.00 — a converging sampler moving away from the chemistry.
 ## Reproducing it
 
 ```bash
-# the vendor
-~/venv_ef2/bin/python tools/esmc/probe-esmfold2-modified.py
+# the vendor, with the ligand arm that separates the two bugs
+~/venv_ef2/bin/python tools/esmc/probe-esmfold2-modified.py --ligand=GOL
 
 # af3-any-model, from a clone of sokrypton/alphafold3
 python run_alphafold.py --model=esmfold2_lm600m --use_esm_embeddings \
@@ -69,14 +81,21 @@ Checked against the batch `featuriseForEsmfold2` actually produces:
   0.958 beside the SEP at 2.349, so it is not an atom decoder that cannot place
   a rigid group
 
-## The discriminator that would halve the search
+## The discriminator, run
 
-**Does af3-any-model's esmfold2 misplace a plain CCD LIGAND too, or only an
-atomised residue inside a polymer?** On this port the ligand is fine and the
-modification is not, which is what localises it to the atomised-residue path
-rather than to atom handling in general. If af3-any-model shows the same split,
-the two ports share a cause and it is upstream of both; if its ligand is also
-out, they are two different bugs that happen to land on the same residue.
+**Does af3-any-model's esmfold2 misplace a plain CCD ligand too, or only an
+atomised residue inside a polymer?** Asked because on this port the ligand is
+fine and the modification is not. **It misplaces both** - so the two ports do
+not share a cause, and the table above is two findings rather than one:
+
+- **af3-any-model**: any atomised entity, ligand or residue. The vendor places
+  both, so this is the port.
+- **LocalFold**: atomised residues only. Its ligand path is correct at 0.958,
+  which is the control that localises it.
+
+Each needs its own fix. The af3-any-model side is the wider one and, because
+this port checks itself against af3-any-model for the AF3 lineage, the one whose
+correctness the rest of that comparison rests on.
 
 ## Two traps this cost
 

@@ -65,21 +65,32 @@ def main() -> int:
     parser.add_argument("--esmc", default="esmc-600m")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--ligand", default="",
+                        help="a CCD code to fold BESIDE the modification. \U0001f534"
+                             " THE DISCRIMINATOR: a ligand is atomised the same"
+                             " way, one token per atom, but sits in its own"
+                             " chain - so a port that misplaces both has a"
+                             " general atom problem and one that misplaces only"
+                             " the modification has an atomised-residue-inside-"
+                             "a-polymer problem. They are different bugs.")
     parser.add_argument("--out", default=None, help="write the fold as a PDB")
     arguments = parser.parse_args()
 
     from esm.models.esmfold2 import EsmFold2ExperimentalModel
     from esm.models.esmfold2.processor import ESMFold2InputBuilder
     from esm.utils.structure.input_builder import (
-        Modification, ProteinInput, StructurePredictionInput)
+        LigandInput, Modification, ProteinInput, StructurePredictionInput)
 
     builder = ESMFold2InputBuilder()
     # 🔴 ZERO-INDEXED HERE, ONE-INDEXED ON THE PAGE. `Modification.position` is
     # documented "zero-indexed" in input_builder.py; --at counts the way the
     # page's SEP@3 does, so the conversion happens once, here.
-    request = StructurePredictionInput(sequences=[ProteinInput(
+    chains_in = [ProteinInput(
         id="A", sequence=arguments.sequence,
-        modifications=[Modification(position=arguments.at - 1, ccd=arguments.code)])])
+        modifications=[Modification(position=arguments.at - 1, ccd=arguments.code)])]
+    if arguments.ligand:
+        chains_in.append(LigandInput(id="B", ccd=[arguments.ligand]))
+    request = StructurePredictionInput(sequences=chains_in)
     features, chains = builder.prepare_input(request, seed=arguments.seed,
                                              device=arguments.device)
 
@@ -160,6 +171,20 @@ def main() -> int:
         if got:
             print(f"\nNATIVE {arguments.code:4} mean ratio {sum(got) / len(got):.3f}"
                   f"  over {len(got)} bonds")
+        if arguments.ligand:
+            want = {("C1", "O1"): 1.430, ("C1", "C2"): 1.520, ("C2", "O2"): 1.430,
+                    ("C2", "C3"): 1.520, ("C3", "O3"): 1.430}
+            lig = [tok for tok in tokens if tok.residue_name == arguments.ligand]
+            if lig:
+                start = lig[0].atom_start
+                count = sum(tok.atom_count for tok in lig)
+                lnames = [a[0] for a in get_ligand_ccd_atoms_with_charges(arguments.ligand)]
+                atoms_l = {lnames[i]: tuple(coords[start + i])
+                           for i in range(min(count, len(lnames)))}
+                scored = ratios(atoms_l, want)
+                if scored:
+                    print(f"NATIVE {arguments.ligand:4} mean ratio "
+                          f"{sum(scored) / len(scored):.3f}  over {len(scored)} bonds")
         if control:
             print(f"NATIVE control  mean ratio {sum(control) / len(control):.3f}"
                   f"  over {len(control)} backbone bonds of {len(tokens) - len(modified)}"
