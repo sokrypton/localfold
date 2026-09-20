@@ -65,6 +65,13 @@ def main() -> int:
     parser.add_argument("--esmc", default="esmc-600m")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=0,
+                        help="sampler steps; 0 leaves the checkpoint's own"
+                             " `inference_num_steps` (15). \U0001f534 THE ARM THAT"
+                             " ANSWERS 'is it just too few steps?' - the ports"
+                             " run 11-15 by default, so the vendor has to be"
+                             " asked at the SAME count before its 1.002 means"
+                             " anything.")
     parser.add_argument("--ligand", default="",
                         help="a CCD code to fold BESIDE the modification. \U0001f534"
                              " THE DISCRIMINATOR: a ligand is atomised the same"
@@ -110,8 +117,10 @@ def main() -> int:
     dropped = sorted(k for k in features if k not in accepted)
     if dropped:
         print("not passed to forward:", ", ".join(dropped))
+    extra = {} if arguments.steps <= 0 else {"num_sampling_steps": arguments.steps}
     with torch.no_grad():
-        output = model.forward(**{k: v for k, v in features.items() if k in accepted})
+        output = model.forward(
+            **{k: v for k, v in features.items() if k in accepted}, **extra)
 
     coords = output["sample_atom_coords"][0].float().cpu().numpy()
 

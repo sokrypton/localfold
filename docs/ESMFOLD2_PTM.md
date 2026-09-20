@@ -38,6 +38,38 @@ The vendor's worst single bond is 2.6% out. af3-any-model's `CB-OG` is 3.26 Å
 against a 1.417 ideal and its `OG-P` 3.75 against 1.610. This port's `OG-P`
 reaches 4.25.
 
+🔴 **AND NOT THE STEP COUNT, ASKED PROPERLY.** The checkpoint's own default is
+`inference_num_steps: 15`, so all three rows above were already at ~15 - but
+that is an argument, not a measurement. Swept on the vendor, same job:
+
+| vendor steps | control | SEP | GOL |
+|---:|---:|---:|---:|
+| 11 | **2.155** | 1.290 | 3.653 |
+| 15 | 1.001 | **1.003** | 0.988 |
+| 64 | 1.001 | **1.002** | 0.981 |
+| 138 | 1.001 | **1.000** | 0.984 |
+
+Below 15 the vendor breaks *everything* - its CONTROL goes to 2.155 - and from
+15 up it is flat and correct. So the matched comparison is at 138, where both
+sides are converged:
+
+| at 138 steps | control | the SEP | a glycerol |
+|---|---:|---:|---:|
+| the vendor | 1.001 | **1.000** | 0.984 |
+| LocalFold | 0.999 | **2.349** | 0.958 |
+
+**The controls agree to 0.002 and the phosphoserine differs by 2.35x.** On this
+port more steps make the SEP worse (1.399 → 1.883 → 2.279 at 11 → 45 → 138)
+while the vendor's is flat, which is the opposite of what a step shortage looks
+like.
+
+🔴 **AND OUR 11 STEPS IS NOT THE VENDOR'S 11.** At 11 the vendor's control is
+2.155 and this port's is 0.994 - a fold that is fine where the vendor's has come
+apart - so the two schedules are not the same walk at the same count, and
+`actualSteps` mapping the preset 15 to 11 is not a like-for-like number. It does
+not affect the conclusion, which rests on the matched 138 row, but it is worth
+knowing before anyone compares step counts across the two.
+
 **Not the quantisation**: int8 1.548 against fp32 1.542. **Not one unlucky
 sample**: all five of af3-any-model's samples are 1.474 / 1.542 / 1.715 / 1.771
 / 1.833 with controls 0.996-1.001. **Not the sampler's budget**: on this port,
