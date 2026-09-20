@@ -2294,3 +2294,33 @@ the sequence so residue 12 is no longer a cysteine and the featuriser throws
 edit that leaves the same atom at the same position, which is narrow and loud
 everywhere else. Said here rather than guarded with machinery, after the job
 NAME's own comparison was built and then removed for not earning its place.
+
+### What a remote fold was losing: the end of the trajectory, and everything but coordinates
+
+Two faults, both found by watching one run rather than by a test.
+
+🔴 **THE LAST FRAMES WERE COLLECTED AND THROWN AWAY.** The watch loop drains
+the page's tap as it polls and then BREAKS - so every frame the sampler emitted
+between the final poll and the end of the fold never travelled. It is the END
+of the trajectory that goes, which is the part worth watching. The tap is
+drained after the loop now, **and again after the readback**, because
+`loadIntoViewer` runs at the end of a local fold and the readback WAITS for it:
+the frames it re-adds and the status line it writes are emitted inside that
+wait. Measured on a 109-residue fold with a real MSA search: **25 frames of 25**,
+beside 254 status and 241 progress events.
+
+🔴 **AND THE PAGE WAS HANDED COORDINATES AND NOTHING ELSE.** The readback only
+ever clicked the download button, so `foldOnBackend` called
+`loadIntoViewer({pdb, scores: {}})` - no alignment, no confidence, no scores
+card. A remote fold looked like a structure with the rest of the page switched
+off, which is most of what LocalFold shows about a fold.
+`window.__lastPrediction()` exposes the object the LOCAL path already hands to
+`loadIntoViewer` - a function rather than the value, because it is reassigned
+on every fold and a captured reference hands back the one before - and the
+same fold now returns **2.84 MB of a3m**, a confidence object carrying
+`plddt`, `meanPlddt`, `ptm`, `iptm`, `chainPairIptm` and `chainPtm`, the scores
+JSON and the chains.
+
+**What this costs is the a3m's size**: it rides in the job result as text, and
+a deep search is megabytes. Over the Colab proxy that is a local hop and it has
+not been a problem; it is the first thing to compress if it becomes one.
