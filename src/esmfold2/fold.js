@@ -307,6 +307,11 @@ export async function foldEsmfold2(device, options) {
 
   const features = options.featuresOverride
     ?? featuriseForEsmfold2(options.entities ?? sequence, options.features);
+  // 🔴 THE BATCH, BEFORE THE FOLD RATHER THAN AFTER IT - the same hook the AF3
+  // path has, and for the same reason: the contact map arrives from the trunk
+  // in TOKEN space, and only the batch says which tokens the viewer draws as
+  // one residue. See web/prediction-results.js `viewerTokens`.
+  options.onBatch?.(features.batch ?? features);
   const tokens = features.tokens;
   const atoms = features.atoms;
   const pairs = tokens * tokens;

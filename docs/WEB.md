@@ -454,17 +454,52 @@ DRAWN: with two folds merged, residue 3 of this one is residue 3 of the first.
 Measured - two objects merged, `{object, positions: [2]}` lands on owner 8,
 which is that object's offset of 6 plus 2.
 
-🔴 **AND ESMFold2 IS OFFERED MODIFIED RESIDUES AND IS NOT GIVEN THEM.**
-`modelFamily` refuses a modification for AlphaFold 2 by name - "AF2 tokenises
-one residue per letter... folding under it would drop the modification and
-return a confident structure of the unmodified chain" - and ACCEPTS one for
-ESMFold2. `foldWithEsmfold2` then takes `(chains, chainKinds, ligandCodes,
-signal, modelLoad)` and hands `entities: { sequence, chainKinds, ligands }` to
-the featuriser, whose own documented input is
-`{ sequence, chainKinds, ligands, modifications }`. So the exact failure the
-refusal exists to prevent happens on that model instead. **Not fixed**: the
-fold would then atomise too, which needs its batch reaching the page the way
-AF3's now does, and a gate that folds one - which needs a GPU.
+🔴 **ESMFold2 WAS OFFERED MODIFIED RESIDUES AND NOT GIVEN THEM, AND NOW IT IS -
+WHICH IS HOW WE FOUND THAT IT CANNOT PLACE ONE.** `modelFamily` refuses a
+modification for AlphaFold 2 by name - "AF2 tokenises one residue per
+letter... folding under it would drop the modification and return a confident
+structure of the unmodified chain" - and ACCEPTS one for ESMFold2, whose fold
+call then dropped it: a `SEP@3` job came back `GLY,TRP,SER,...`, status "13
+res", the exact failure that refusal exists to prevent.
+
+It travels now - the component is fetched as a ligand's is, it goes into the
+featuriser's `entities`, into the trunk cache key (a modification changes what
+is folded, so a trunk cached for the plain chain is not this fold's), and the
+batch reaches the page through `onBatch` so this path's contact map is
+collapsed like AF3's. The status line says **13 res + SEP3** and counts
+RESIDUES rather than tokens, which read "22 res" for a thirteen-residue chain
+the moment one was atomised.
+
+🔴 **AND THE RESIDUE COMES OUT BROKEN, WHICH IS WHY NOTHING WAS DRAWN EVEN
+AFTER IT ARRIVED.** py2Dmol builds a side-chain table only from atoms that are
+within bonding distance, so a scattered one has nothing to draw. Measured on
+GWSTELEKHRSVQ + SEP@3, the same job on both models:
+
+| bond (A) | AF3 | EF2-fast | ideal |
+|---|---|---|---|
+| CA(2)-CA(3) | 3.91 | 4.45 | 3.8 |
+| SEP N-CA | 1.45 | 1.37 | 1.46 |
+| SEP CA-C | 1.48 | **1.83** | 1.52 |
+| SEP CB-OG | 1.48 | **2.94** | 1.43 |
+| SEP OG-P | 1.63 | **4.25** | 1.61 |
+
+🔴 **AND `modifiedAsOneToken` IS NOT THE ANSWER HERE, THOUGH IT LOOKS LIKE
+ONE.** It is what fixed exactly this shape for boltz2, and on this fold it
+brings CB-OG to 1.38, CA-C to 1.55 and CA(2)-CA(3) to 3.61 - the side chain
+then draws - while **OG-P stays at 4.07**, so the phosphate is misplaced
+either way. And it contradicts this file's own upstream finding: *"AF3 already
+tokenises ... modified residues at one token per atom, and ESMFold2 uses AF3's
+all-atom representation term for term"*, with OpenFold3's loss docstring
+naming "the first and only atom for anything atomized" as a token's
+representative. One fold against a documented convention is not evidence.
+
+**What is open**, for whoever picks it up: is this the MODEL or this port's
+atomised path? The measurements that would separate them are EF2 on a plain
+CCD ligand (known good - `npm run test:ligand` folds a glycerol) against a
+modified residue in the same job, and the same fold at more sampler steps; and
+the gate for it is `check-modified-path.mjs`'s shape, which needs a GPU. Note
+the fold this was measured on reports certainty 0.45 on a 13-mer, so the model
+is not confident here about anything.
 
 ## Saving the session, which is py2Dmol's and not ours
 

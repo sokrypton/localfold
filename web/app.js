@@ -2792,7 +2792,8 @@ function samplerPreset() {
   return name;
 }
 
-async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad) {
+async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad,
+                                modifications = []) {
   const modelName = MODEL_LABELS[chosenFamily()] ?? "EF2-fast";
   const sequence = chains.join(":");
   status(`${modelName} · loading`);
@@ -2816,6 +2817,20 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       throw new Error(`No chemical component ${entry} at the PDB (${response.status})`);
     }
     ligands.push(parseCcdComponent(await response.text()));
+  }
+  // 🔴 AND A MODIFIED RESIDUE'S COMPONENT FROM THE SAME PLACE, for the reason
+  // web/af3-model.js gives: the featuriser is synchronous, and this is the one
+  // piece of a batch that cannot be computed from the sequence.
+  const modifyWith = [];
+  for (const modification of modifications) {
+    status(`${modelName} · fetching modified residue ${modification.code}`);
+    const response = await fetch(ccdUrl(modification.code), { signal });
+    if (!response.ok) {
+      throw new Error(`No chemical component ${modification.code}`
+        + ` at the PDB (${response.status})`);
+    }
+    modifyWith.push({ chain: modification.chain, position: modification.position,
+                      ...parseCcdComponent(await response.text()) });
   }
   throwIfAborted(signal);
   const loaded = await (modelLoad
@@ -2927,16 +2942,27 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const lmMask = (loaded.shape.lmMaskPct ?? 0);
   const trunkKey = JSON.stringify({
     family: chosenFamily(), chains, chainKinds, ligandCodes,
+    // A modification changes what is folded, so a trunk cached for the plain
+    // chain is not this fold's.
+    modifications: modifications.map((one) => `${one.code}@${one.position}`),
     loops: recycleCount() + 1,
     plm: plmChoice(), languageModel: usesLanguageModel(),
     lmMask, maskSeed: lmMask > 0 ? randomSeed() : null,
   });
   const reuse = esmfold2Trunk?.key === trunkKey ? esmfold2Trunk.reusable : undefined;
+  let viewerKeep;
+  let viewerModified = [];
   const result = await foldEsmfold2(device, {
     reuse,
     wantReusable: true,
     sequence,
-    entities: { sequence, chainKinds, ligands },
+    entities: { sequence, chainKinds, ligands, modifications: modifyWith },
+    // ...and which tokens the viewer will draw, so this path's contact map is
+    // collapsed the way the AF3 one is. See viewerTokens.
+    onBatch: (batch) => {
+      viewerKeep = viewerTokens(batch);
+      viewerModified = modifiedPositions(batch, viewerKeep);
+    },
     // 🔴 THE RECYCLE DIAL DRIVES THIS TRUNK TOO, AND USED NOT TO. Its loop
     // count came from the checkpoint and the control beside it did nothing -
     // the "quietly ignored control" syncModelControls exists to prevent, which
@@ -2977,9 +3003,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // held until there is a frame to hang it on, exactly as the AF3 path holds
     // its own.
     onContacts: (contacts, trunkCertainty) => {
-      // ESMFold2's fold is never handed modifications (docs/WEB.md), so its
-      // tokens are its residues.
-      liveContacts = contactMapFor(contacts, undefined);
+      liveContacts = contactMapFor(contacts, viewerKeep);
       certainty = trunkCertainty;
       showTrunkContacts(liveContacts, chains);
     },
@@ -3030,7 +3054,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     ? toPdb(result.features.batch, finalDense, bFactors)
     : fittedPdb(result.features.batch, finalDense, reference,
                 slots ?? alphaCarbons(result.features.batch), bFactors));
-  const contactMap = contactMapFor(result.contacts, undefined);
+  // 🔴 AND IN THE VIEWER'S SPACE, like the live one above: this is the copy
+  // that lands on frame zero, and it is the one the AF3 path was caught by.
+  const contactMap = contactMapFor(result.contacts, viewerKeep);
   // 🔴 THE ESTIMATED pAE IS NOT DRAWN, AND THE REASON IS MEASURED. It orders
   // pairs WITHIN a fold at 0.746 against AlphaFold 3's real PAE - genuinely
   // useful - and ACROSS folds it is INVERTED, at -0.867. Three random sequences
@@ -3099,6 +3125,15 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // renderer's data and recomputes its colours.
     setColourMode(certainty === undefined ? "chain" : "plddt");
     viewer.setFrame((viewer.objectsData?.[viewerObject]?.frames?.length ?? 1) - 1);
+    // ...and the modification drawn, as on the AF3 path: the ribbon runs
+    // through its alpha carbon exactly as through the residue it replaced.
+    showModifiedSidechains(viewer, viewerObject, viewerModified);
+    // ...and DRAWN: the set is stored on the object and the atoms are
+    // materialised by the next frame, which on the AF3 path is the render
+    // that follows it there. Without this the modification's side chain is
+    // asked for and not shown - measured, the object's set held residue 2
+    // while the drawn array stayed at 13 positions.
+    viewer.render("ef2-final");
   }
 
   lastPrediction = {
@@ -3174,7 +3209,15 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // the PDB carries a REMARK naming the quantity, and the archive's README
   // spells it out. A parenthesis denying something nothing claimed reads as a
   // disclaimer rather than a result.
-  status(`${modelName} · ${result.tokens} res · ${result.steps} steps · ${seconds}s`
+  // 🔴 RESIDUES, NOT TOKENS. They are the same number until a modification
+  // atomises one - and then this line read "22 res" for a thirteen-residue
+  // chain, which is the model's own bookkeeping leaking onto the status bar.
+  // The AF3 path names the modification here too, so this one does.
+  const residueCount = chains.reduce((total, chain) => total + chain.length, 0);
+  const named = modifications.map((one) => `${one.code}${one.position}`);
+  status(`${modelName} · ${residueCount} res`
+    + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
+    + ` · ${result.steps} steps · ${seconds}s`
     + (result.trunkReused ? " (trunk reused)" : "")
     + (mean === undefined ? "" : ` · certainty ${mean.toFixed(2)}`));
   progress(null);
@@ -3419,7 +3462,14 @@ async function fold(event) {
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
     if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
-      await foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad);
+      // 🔴 MODIFICATIONS TRAVEL HERE TOO, AND USED NOT TO. `modelFamily`
+      // refuses one for AlphaFold 2 by name - it would "return a confident
+      // structure of the unmodified chain" - and ACCEPTS one for EF2-fast,
+      // which then folded exactly that: reported as the modified residue not
+      // being displayed, and measured, a SEP@3 job came back GLY,TRP,SER with
+      // no SEP anywhere in it.
+      await foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad,
+                             modifications);
       return;
     }
     if (isAf3Family(family)) {
