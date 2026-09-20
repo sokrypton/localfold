@@ -30,6 +30,18 @@ const MAX_ROWS = 400;
 
 let device;
 let rows = [];
+/**
+ * 🔴 WHOSE MACHINE THIS IS ABOUT, WHICH IS NOT ALWAYS THIS ONE. On a page
+ * folding through a Colab runtime the phases, the memory and the user agent
+ * that matter are the RUNTIME's - this browser draws and nothing else - and a
+ * report headed with the reader's user agent and "device memory: not
+ * measured" describes a machine that did no work. `devOnEntry` is how the
+ * runtime's own log leaves that page and `devAdopt` is how it arrives here;
+ * the page in between is told to stop recording its own.
+ */
+let listener;
+let adopting = false;
+let source;
 let runStartedAt = 0;
 let currentPhase;
 let currentStartedAt = 0;
@@ -61,6 +73,47 @@ function snapshot() {
   }
 }
 
+const emit = (entry) => {
+  if (listener === undefined || adopting) return;
+  try { listener(entry); } catch { /* a report must never break a fold */ }
+};
+
+/** Hear every entry as it is recorded - the door out of this page's log. */
+export function devOnEntry(fn) {
+  listener = fn;
+}
+
+/** ...and the door in. An entry recorded somewhere else, kept verbatim. */
+export function devAdopt(entry) {
+  if (entry === null || typeof entry !== "object") return;
+  adopting = true;
+  try {
+    if (entry.reset !== undefined) {
+      rows = [];
+      runStartedAt = performance.now();
+      currentPhase = undefined;
+      currentStartedAt = runStartedAt;
+      devNote(entry.reset);
+      return;
+    }
+    rows.push(entry);
+    if (rows.length > MAX_ROWS) rows.shift();
+  } finally {
+    adopting = false;
+  }
+}
+
+/**
+ * Name the machine these rows came from, or undefined for this one.
+ *
+ * What it changes is the HEADER: the timings and the memory below it are
+ * whatever was recorded, and saying they are this browser's when they are not
+ * is the whole complaint this answers.
+ */
+export function devSourceIs(label) {
+  source = label;
+}
+
 /** Let the log read this device's memory counters. */
 export function devUseDevice(value) {
   device = value;
@@ -73,6 +126,7 @@ export function devBeginRun(label) {
   currentPhase = undefined;
   currentStartedAt = runStartedAt;
   currentStartPeak = snapshot()?.peakBytes ?? 0;
+  emit({ reset: label });
   devNote(label);
 }
 
@@ -85,7 +139,7 @@ function closePhase(at) {
   // - and that looks like the fold used no memory. How much this phase pushed
   // the high-water mark up is the number that says where the memory went, and
   // it survives the cleanup that follows.
-  rows.push({
+  const row = {
     phase: currentPhase,
     ms: Math.round(at - currentStartedAt),
     atMs: Math.round(currentStartedAt - runStartedAt),
@@ -94,8 +148,10 @@ function closePhase(at) {
       peak: memory.peak,
       rise: megabytes(Math.max(0, memory.peakBytes - currentStartPeak)),
     }),
-  });
+  };
+  rows.push(row);
   if (rows.length > MAX_ROWS) rows.shift();
+  emit(row);
 }
 
 /**
@@ -114,8 +170,10 @@ export function devStatus(text) {
 /** A one-off line that is not a phase - a size, a score, a setting. */
 export function devNote(text) {
   if (text === undefined) return;
-  rows.push({ note: String(text), atMs: Math.round(performance.now() - runStartedAt) });
+  const row = { note: String(text), atMs: Math.round(performance.now() - runStartedAt) };
+  rows.push(row);
   if (rows.length > MAX_ROWS) rows.shift();
+  emit(row);
 }
 
 /** Close the last phase and note the total. Called when a fold ends. */
@@ -128,11 +186,20 @@ export function devEndRun(note) {
 /** The timeline as plain text, for the copy button. */
 export function devReport() {
   const memory = snapshot();
+  const agent = typeof navigator === "object" ? navigator.userAgent : "unknown";
   const lines = [
     `LocalFold timing · ${new Date().toISOString()}`,
-    `user agent: ${typeof navigator === "object" ? navigator.userAgent : "unknown"}`,
-    memory === undefined ? "device memory: not measured"
-      : `device memory: ${memory.resident} MiB held, ${memory.peak} MiB peak`,
+    // 🔴 THE MACHINE THAT FOLDED FIRST, AND THIS ONE SECOND. With a Colab
+    // runtime the rows below were recorded there, on its card, against its
+    // clock; heading them with this browser's user agent is a report about a
+    // machine that did nothing but draw.
+    ...(source === undefined
+      ? [`user agent: ${agent}`]
+      : [`folded on: ${source}`, `shown in: ${agent}`]),
+    source !== undefined
+      ? "device memory: the runtime's, in the rows below"
+      : (memory === undefined ? "device memory: not measured"
+        : `device memory: ${memory.resident} MiB held, ${memory.peak} MiB peak`),
     "",
     "     at        ms   held  +peak    peak   phase",
   ];
@@ -148,7 +215,10 @@ export function devReport() {
   }
   const total = rows.reduce((sum, row) => sum + (row.ms ?? 0), 0);
   lines.push("", `total in phases: ${(total / 1000).toFixed(2)} s`);
-  if (device !== undefined) {
+  // ...and the breakdown below is read off THIS device, so it is left out
+  // where the fold happened on another one rather than shown as a row of
+  // zeros belonging to nothing.
+  if (device !== undefined && source === undefined) {
     try {
       const gpu = memorySnapshot(device);
       lines.push("", "largest tensors on the device now:");

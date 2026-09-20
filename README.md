@@ -69,6 +69,11 @@ in this repository's history are his commits. The two projects diverged on
 and parts of LocalFold (the MMseqs2 search client, the row-chunked transition)
 are ports of work done there since.
 
+The viewer, the sequence strip, the contact-map panel and the session format
+are **[py2Dmol](https://github.com/sokrypton/py2Dmol)**, vendored into
+`web/vendor/`: everything on this page that draws a structure is its code
+running its own way.
+
 Neither project originates the protein-structure prediction method or the model
 parameters. We thank the AlphaFold team at Google DeepMind for developing
 AlphaFold and releasing its source code and parameters. The scientific method

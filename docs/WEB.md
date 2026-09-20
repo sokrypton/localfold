@@ -2221,6 +2221,25 @@ every later request queued behind it, and the gate failed three arms downstream
 in a route that had nothing wrong with it. **A hang reported far from its
 cause**: read the value before taking the lock.
 
+🔴 **AND THE DEV PANEL WAS DESCRIBING THE WRONG MACHINE.** Its rows come from
+a hook in `status()`, and on a reader's page that status line is a REPLAY of
+the runtime's - so the phases were timed against this browser's clock, filed
+under this browser's (empty) device, and headed with this browser's user agent
+and "device memory: not measured". Everything in it was about a machine that
+did nothing but draw. The runtime's own log travels now (`devOnEntry` out,
+`devAdopt` in, one `dev` event kind beside status, progress and frame), the
+reader stops recording its own replay, and the header says **`folded on: the
+Colab runtime · nvidia turing`** over **`shown in: <this browser>`**. The
+device breakdown at the foot is left out rather than printed as a row of zeros
+belonging to nobody. Measured: the runtime's 901 MiB peak is what the panel
+shows.
+
+🔴 **AND THE DEV ROWS ONLY ARRIVE WHILE A FOLD IS BEING FOLLOWED**, which the
+gate learnt by pushing them afterwards and measuring an empty panel. A reader
+consumes events inside `followRemoteFold`; outside one it is following
+nothing. That is right for a fold's own commentary and is worth knowing before
+the next thing is sent that way.
+
 🔴 **AND THE PAGE NOW SAYS WHERE FOLD RUNS.** `?backend=colab` is in the URL
 and the fold happens on a machine the reader cannot see, so a tab left open
 after the notebook was closed looks exactly like a tab that folds here - and

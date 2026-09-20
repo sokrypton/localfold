@@ -31,6 +31,8 @@
  * Absent both, every function here is inert and index.html is what it was.
  */
 
+import { devSourceIs } from "./dev-log.js";
+
 /** The broker is the server this page was served BY, so every route is relative. */
 const door = (route, extra = "") => {
   const token = new URLSearchParams(location.search).get("t") ?? "";
@@ -364,6 +366,7 @@ export async function remoteHead(signal) {
  * reaches over CDP to the browser on the other side.
  */
 function installColabStatus() {
+  devSourceIs("the Colab runtime");
   const head = document.querySelector(".page-head-fold") ?? document.body;
   const badge = document.createElement("div");
   badge.id = "colab-status";
@@ -394,6 +397,9 @@ function installColabStatus() {
       const health = await (await fetch(door("/health"))).json();
       const gpu = health.gpu ?? {};
       card = [gpu.vendor, gpu.architecture].filter(Boolean).join(" ");
+      // ...and the timing report is headed with it, because the rows in it
+      // were recorded on that card and not on this one.
+      if (card !== "") devSourceIs(`the Colab runtime · ${card}`);
     } catch (cause) { /* the pulse below is what matters; this is its name */ }
   };
 

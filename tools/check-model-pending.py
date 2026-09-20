@@ -25,6 +25,14 @@ WHAT IT CHECKS, on a real page with a real result in it:
     comes on - and in Colab mode the PDB button is CLICKED, because a button
     offered over a prediction the runtime never filled looks identical from
     the outside;
+  * THE DEV PANEL DESCRIBES THE MACHINE THAT FOLDED: its rows are the
+    runtime's own, with the runtime's card memory in them, and its header says
+    which machine folded and which one is showing it - where before the
+    phases were timed on the reader's clock and headed with the reader's user
+    agent, about a browser that did nothing but draw;
+  * AND WHERE THE SEQUENCE GOES, which is the footer's one job: the privacy
+    line tracks the alignment mode and names the SERVICE rather than linking a
+    site, and the provenance links are not back in the row beside it;
   * THE PAGE SAYS WHERE FOLD RUNS: a badge naming the runtime and its card,
     its pulse going amber when that runtime stops answering - at the same
     twenty seconds after which a fold in flight gives up, because a badge that
@@ -206,6 +214,20 @@ try:
 
     # THE RESULT, as a fold's own ingestion sees it: the structure AND the
     # prediction behind it, whose `model` is how the page knows whose it is.
+    # 🔴 THE DEV ROWS GO BEFORE THE RESULT, BECAUSE THAT IS WHEN THEY ARRIVE:
+    # a reader consumes events while it is FOLLOWING a fold, and pushed
+    # afterwards it is following nothing. The first version of this arm pushed
+    # them after the result, measured an empty panel, and blamed the feature.
+    # They are the runtime's own log - its card's memory, its clock.
+    cdp.evaluate(runtime_ws, """(async () => {
+      const bridge = await import('/web/colab-bridge.js');
+      bridge.tapOut('dev', { reset: 'fold · af3 · alignment none · 3 recycles' });
+      bridge.tapOut('dev', { phase: 'Trunk', ms: 4120, atMs: 40,
+                             resident: 512.5, peak: 901.25, rise: 388.75 });
+      bridge.tapOut('dev', { phase: 'Folding 8/8', ms: 990, atMs: 4160,
+                             resident: 128.5, peak: 901.25, rise: 0 });
+      return true;
+    })()""")
     cdp.evaluate(runtime_ws, """(async () => {
       const bridge = await import('/web/colab-bridge.js');
       const pdb = %s;
@@ -341,7 +363,41 @@ try:
                    " Colab mode - the button is offered over a prediction the"
                    " runtime did not fill")
 
-    # 6 · THE BADGE: where Fold runs, and whether it is still there.
+    # 6 · THE DEV PANEL IS THE RUNTIME'S, NOT THIS MACHINE'S. Its rows were
+    #     timed on the reader's clock and filed under the reader's (empty)
+    #     device, under a header naming the reader's browser - a report
+    #     about a machine that did nothing but draw.
+    report, deadline = "", time.time() + 30
+    while time.time() < deadline:
+        report = cdp.evaluate(reader_ws, """(() => {
+          const button = document.getElementById('dev-toggle');
+          if (button === null) return '';
+          const panel = document.getElementById('dev-panel');
+          if (panel === null || panel.hidden) button.click();
+          return document.querySelector('#dev-panel pre')?.textContent ?? '';
+        })()""")
+        if "Trunk" in report:
+            break
+        time.sleep(0.5)
+    head = "\n".join(report.split("\n")[:3])
+    print(f"  the dev report is headed:\n    " + head.replace("\n", "\n    "))
+    if "folded on: the Colab runtime" not in report:
+        bad.append("the dev report does not say which machine folded - its"
+                   " header describes the browser that only drew")
+    if "shown in:" not in report:
+        bad.append("the dev report dropped this browser entirely; it names"
+                   " both or it is guessing")
+    if "901.2" not in report and "901.3" not in report:
+        bad.append("the runtime's own memory is not in the report - the rows"
+                   " were recorded here instead of there")
+    if "already running" in report:
+        bad.append("the reader recorded its own replay of the runtime's"
+                   " status line as phases, so the timeline is this browser's")
+    if "device memory: not measured" in report:
+        bad.append("the report still claims this machine's device memory was"
+                   " not measured, which is a statement about the wrong one")
+
+    # 7 · THE BADGE: where Fold runs, and whether it is still there.
     badge = cdp.evaluate(reader_ws, """(() => {
       const box = document.getElementById('colab-status');
       if (box === null) return null;
@@ -375,7 +431,7 @@ try:
         if "isconnect" not in badge["leave"]:
             bad.append("the badge offers no way back to folding here")
 
-    # 7 · ...and it goes amber when the runtime does. Twenty seconds is the
+    # 8 · ...and it goes amber when the runtime does. Twenty seconds is the
     #     fold loop's own bound and the two must agree, so this waits it out.
     runtime_ws.call("Page.navigate", url="about:blank")
     gone, deadline = "", time.time() + 45
@@ -395,7 +451,7 @@ try:
     runtime_ws.call("Page.navigate",
                     url=f"{BASE}/index.html?role=runtime&t={TOKEN}")
 
-    # 8 · Disconnect leaves Colab mode, which is the whole of the way back.
+    # 9 · Disconnect leaves Colab mode, which is the whole of the way back.
     cdp.evaluate(reader_ws, """(() => {
       document.getElementById('colab-status').querySelector('button').click();
       return true;
@@ -412,6 +468,36 @@ try:
                    " still folding on the runtime")
     if after["badge"] != "gone":
         bad.append("the badge is still up on a page that folds here")
+
+    # 10 · WHERE THE SEQUENCE GOES, WHICH IS THE FOOTER'S ONE JOB. The line
+    #      tracks the alignment mode - "everything runs locally" is false the
+    #      moment a search is chosen - and it names the SERVICE rather than
+    #      linking a site, because a link in that line is something to click
+    #      in a sentence whose whole purpose is to state a fact.
+    note = cdp.evaluate(reader_ws, """(() => {
+      const row = document.getElementById('msa-mode');
+      const before = document.getElementById('privacy-note')?.textContent ?? '';
+      row.value = 'search';
+      row.dispatchEvent(new Event('change', { bubbles: true }));
+      const box = document.getElementById('privacy-note');
+      return { local: before, search: box?.textContent ?? '',
+               links: box?.querySelectorAll('a').length ?? 0,
+               forks: document.getElementById('footer-links')?.textContent.trim() ?? '' };
+    })()""")
+    print(f"  the footer says {note['search']!r} with a search chosen,"
+          f" {note['links']} link(s); the links row is {note['forks']!r}")
+    if "MMseqs2 server" not in note["search"]:
+        bad.append(f"the footer says {note['search']!r} with a search chosen,"
+                   " which does not name where the sequence goes")
+    if note["links"] != 0:
+        bad.append("the privacy line carries a link again - it is a statement,"
+                   " not navigation")
+    if "locally" not in note["local"]:
+        bad.append(f"with no alignment the footer says {note['local']!r},"
+                   " which is the weaker claim over the stronger case")
+    if "py2Dmol" in note["forks"] or "alphafold2-webgpu" in note["forks"]:
+        bad.append("the provenance links are back in the footer; they are"
+                   " attribution and they live in the README")
 
     errors = cdp.evaluate(reader_ws, "window.__pageErrors || []")
     if errors:

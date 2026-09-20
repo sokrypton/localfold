@@ -51,7 +51,8 @@ import { getDevice, loadModel, releaseModel } from "./model.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../src/bundles/manifests/index.js";
-import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
+import { devAdopt, devBeginRun, devEndRun, devNote, devOnEntry, devSourceIs, devStatus,
+  devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
@@ -900,7 +901,12 @@ function status(text, isError = false) {
   // is missing still records. It costs one string compare a write, and only a
   // CHANGE of leading segment records a row - the sampler rewriting a
   // percentage several times a second is one phase, not four hundred.
-  devStatus(text);
+  // 🔴 NOT THIS PAGE'S TIMELINE WHEN THE FOLD IS SOMEWHERE ELSE. A reader's
+  // status line is a REPLAY of the runtime's, so recording it here would time
+  // the runtime's phases against this browser's clock and file them under this
+  // browser's (empty) device - the rows that arrive as `dev` events are the
+  // real ones, taken where the work happened.
+  if (colabRole() !== "reader") devStatus(text);
   if (node === null) return;
   node.textContent = text;
   node.classList.toggle("error", isError);
@@ -3481,6 +3487,9 @@ async function followRemoteFold({ since, label, signal }) {
       if (said.kind === "status") status(said.payload);
       else if (said.kind === "progress") progress(said.payload);
       else if (said.kind === "frame") { framePdbs.push(said.payload); draw(said.payload); }
+      // ...and the runtime's own timing rows, recorded on its card against its
+      // clock, rather than a reconstruction of them from over here.
+      else if (said.kind === "dev") devAdopt(said.payload);
       // 🔴 AND THE LAG IS RECORDED RATHER THAN ARGUED ABOUT. Each event
       // carries the runtime page's own clock and the broker's arrival stamp,
       // so "the fold was slow" and "the feed was slow" are two numbers. It is
@@ -4588,11 +4597,13 @@ const modeSelect = element("msa-mode");
 // way, so the accurate claim depends on the mode, and a page that states the
 // stronger one while doing the weaker thing is worse than one that says
 // nothing. Written from here so the two cannot drift apart.
+// 🔴 AND IT NAMES THE SERVICE, NOT A SITE. It linked to colabfold.com, which
+// is a link to click in a line whose whole job is to say where the sequence
+// goes - and the answer is an MMseqs2 server, which is what the reader is
+// being told about. The citation belongs in the README, where it is.
 const PRIVACY_NOTE = {
   search: ['<i class="fa-solid fa-cloud-arrow-up" style="margin-right: 5px; color: #f59e0b;"></i>',
-    "folds locally · MSA via ",
-    '<a href="https://colabfold.com" target="_blank" rel="noopener noreferrer"',
-    ' style="color: #3b82f6; text-decoration: none;">colabfold.com</a>'].join(""),
+    "folds locally · MSA via MMseqs2 server"].join(""),
   local: ['<i class="fa-solid fa-shield-halved" style="margin-right: 5px; color: #10b981;"></i>',
     "everything runs locally"].join(""),
 };
@@ -5535,6 +5546,11 @@ void offerSession();
  * runtime `installColabBridge` returns immediately and nothing here runs.
  * See web/colab-bridge.js.
  */
+// 🔴 AND ON THE RUNTIME, THE DEV LOG IS THE THING WORTH SENDING: it is the one
+// record made where the work happened, with that card's memory in it. One hook,
+// beside the status tap, for the same reason - these are the page's own calls
+// and there is no second reporting path to keep in step.
+if (colabRole() === "runtime") devOnEntry((entry) => remoteTap("dev", entry));
 installColabBridge();
 // ...and if one is already under way on the runtime, follow it from here.
 void attachToRunningFold();
