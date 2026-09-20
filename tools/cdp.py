@@ -111,6 +111,11 @@ LINUX_FLAGS = ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=n
                "--enable-dawn-features=vulkan_enable_f16_on_nvidia"]
 
 
+# 🔴 AND A CALLER MAY ADD TO THEM, because one machine's flags are not every
+# machine's. tools/colab_backend.py runs on a container with NO DISPLAY AT ALL,
+# where Chrome's own documentation adds `--disable-vulkan-surface`; the A100
+# box these flags were written for runs headed, where a surface exists. Passing
+# them per caller keeps the shared list the shared list.
 def chrome_flags():
     # 🔴 macOS KEEPS EXACTLY THE FLAGS IT HAD. That path works and is the one
     # the project's own machine runs; only Linux, which could not launch at
@@ -121,7 +126,7 @@ def chrome_flags():
     return headless + LINUX_FLAGS + ["--enable-unsafe-webgpu", "--disable-gpu-sandbox"]
 
 
-def launch(port, profile, keep=False):
+def launch(port, profile, keep=False, extra_args=()):
     """Start Chrome on `profile`, wiping it first unless `keep`.
 
     🔴 WIPING IT IS WHY EVERY PAGE TIMING HERE IS A FIRST VISIT. A fresh
@@ -134,7 +139,7 @@ def launch(port, profile, keep=False):
     """
     if not keep:
         shutil.rmtree(profile, ignore_errors=True)
-    p = subprocess.Popen([chrome_binary()] + chrome_flags() + [
+    p = subprocess.Popen([chrome_binary()] + chrome_flags() + list(extra_args) + [
         "--user-data-dir=" + profile, "--no-first-run",
         "--hide-scrollbars", "--remote-debugging-port=%d" % port, "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -126,7 +126,14 @@ class Backend:
         # docs/A100.md prices at 1.95x. Headless is opt-in there because the
         # A100 box runs headed; here there is no display at all.
         os.environ.setdefault("LOCALFOLD_HEADLESS", "1")
-        self.proc, self.ws = cdp.launch(self.cdp_port, self.profile)
+        # 🔴 `--disable-vulkan-surface`, WHICH THE SHARED FLAGS DO NOT CARRY.
+        # A surface is a thing you present TO, and this container has no
+        # display: Chrome's own Colab recipe passes it, and without it the
+        # first measured runtime came back on **SwiftShader** - vendor
+        # 'google', architecture 'swiftshader', no shader-f16, a 1 GiB buffer
+        # ceiling - which is the CPU wearing the card's clothes.
+        self.proc, self.ws = cdp.launch(self.cdp_port, self.profile,
+                                        extra_args=["--disable-vulkan-surface"])
         self.ws.call("Page.enable")
         self.ws.call("Runtime.enable")
         self.ws.call("Page.navigate", url=f"http://127.0.0.1:{self.port}/index.html")
