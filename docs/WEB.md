@@ -2191,35 +2191,44 @@ cores. The dependencies say the same thing from the other side:
 `libnvidia-compute-580` is 335 MB and `libnvidia-gpucomp-580` 70 MB, both
 pulled by `libnvidia-gl`, both bigger than the file savings being chased.
 
-🔴 **AND "DOWNLOAD ONLY THE VULKAN PART" DOES NOT WORK, THOUGH THE REASON IS
-NOT THE ONE IT LOOKS LIKE.** The working driver's own memory map names what it
-loads, and it is **`/usr/lib64-nvidia/`** - Colab's own directory, already on
-the image, at **580.82.07, the version the kernel module is**. That looks like
-the whole 44 s being free. It is not: registering it (a line in
-`ld.so.conf.d`, `ldconfig`, and a hand-written `nvidia_icd.json`) takes the
-setup to **11.2 s** and the Vulkan loader then says exactly why it is useless -
+🔴 **AND THE DRIVER IS UNPACKED, NOT INSTALLED: 44.3 s BECOMES 15, AND THE
+WHOLE SETUP IS 22.3 s.** The working driver's own memory map is what found
+it - it loads from **`/usr/lib64-nvidia/`**, Colab's own directory, already on
+the image at **580.82.07, the version the kernel module is**. What Colab does
+NOT ship there is a `libGLX_nvidia` carrying the Vulkan ICD entry point, and
+the loader says so exactly:
 
 ```
 loader_scanned_icd_add: Could not get 'vkCreateInstance' via
 'vk_icdGetInstanceProcAddr' for ICD /usr/lib64-nvidia/libGLX_nvidia.so.0
 ```
 
-That build has **no Vulkan entry point at all**: Colab ships the GLX/EGL
-userspace, not the ICD. So the Vulkan driver must be fetched, and the
-`.deb` must be dpkg-INSTALLED: downloading `libnvidia-gl` + `libnvidia-gpucomp`
-and extracting them (14.6 s) fails the same way, even with an **absolute**
-`library_path` - which was a real bug in the earlier attempts, since a relative
-one resolves through `ld.so` to Colab's non-Vulkan copy - and even though
-`nm -D` confirms the extracted library DOES export `vk_icdGetInstanceProcAddr`.
-It exports the symbol and returns null from it, which is a driver declining to
-initialise.
-🔴 **AND IT IS NOT A VERSION MISMATCH, WHICH WAS THE OBVIOUS SUSPECT.** The
-kernel module is 580.82.07 and **no repository offers it** - the candidates are
-178.04, 173.02, 167.08 - so the apt install mismatches the kernel exactly as
-the extraction does, and only one of them works. Whatever dpkg does for this
-package that `dpkg-deb -x` plus `ldconfig` does not is **unexplained**, and
-three attempts have now ended there. Do not start a fourth without a new idea
-about what that is.
+So one package has to be fetched - and `dpkg-deb -x` it into `/` is **11.5 s
+where apt takes 44.3**, because apt also unpacks `libnvidia-compute` (335 MB)
+and `libnvidia-gpucomp` (70 MB), **which nothing here ever loads**. The ICD and
+layer json come out of the package, so nothing is hand-written.
+
+🔴 **INTO `/`, AND WITH NO `LD_LIBRARY_PATH`, BECAUSE THE WORKING STACK IS
+MIXED.** This is the whole reason three earlier attempts failed and it is not
+obvious: the ICD is the package's 580.178.04 `libGLX_nvidia`, and its
+companions are **Colab's 580.82.07**, resolved by the linker the way a real
+install resolves them. Force the extracted tree onto the library path and every
+library becomes 178.04 - a single consistent version, against an 82.07 kernel -
+and the driver answers `ERROR_INCOMPATIBLE_DRIVER / Found no drivers!`. The
+mismatch is not the bug; it is the configuration that works.
+
+Four attempts, and each failed differently, which is why the order matters:
+
+| attempt | result |
+|---|---|
+| register Colab's own libraries, download nothing (11.2 s) | no Vulkan entry point in that build |
+| extract to `/opt`, point the ICD at it by env | `Could not get vkCreateInstance` |
+| ...with an ABSOLUTE `library_path` and companions extracted | `ERROR_INCOMPATIBLE_DRIVER` |
+| **extract the package into `/`, `ldconfig`, no env** | **nvidia / turing / f16 / subgroup-matrix, device created** |
+
+Measured end to end on a clean T4, the cell's own script then a real fold:
+**setup 22.3 s**, service ready 26.3 s, and 13 residues folded to 25 frames.
+**71.4 -> 36.5 (the Chrome zip) -> 22.3 (the driver unpack).**
 
 **What is left, and it is small**: the clone shares nothing with apt (one is
 git's network, the other dpkg's lock), so it is started first and waited for
