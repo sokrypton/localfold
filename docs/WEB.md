@@ -1930,3 +1930,60 @@ snapshot from the top of the probe.
 `job name:` with `fileFilledTheBox` and `followsTheBox`, the second by renaming
 the box by hand and folding again.
 
+
+## Folding somewhere else, and a page that is not dead while it happens
+
+`tools/colab_backend.py` runs this page in a headless Chrome on a Colab
+runtime and serves it to a reader's browser, which asks it to fold
+(`?backend=colab&t=…`, `remoteBackend`/`foldOnBackend` in `web/app.js`). The
+first version answered `POST /fold` with the finished structure. That is
+correct and it is also **a page that sits blank for the whole fold**: no
+progress bar, no status line, no sampler frames - every one of which the page
+was drawing perfectly, on the other machine, where nobody could see it.
+
+🔴 **WHAT TRAVELS IS THE PAGE'S OWN CALLS, NOT A SECOND FOLD PATH.**
+`remoteTap(kind, payload)` is three lines called from `status()`, `progress()`
+and both `drawLiveFrame` closures. The backend arms `window.__remoteTap`
+immediately before the click, drains it **in the same CDP round trip the watch
+loop was already making** - a second `evaluate` per 250 ms would double the
+traffic to learn the same thing - and the client replays the events in order:
+`status` → `status()`, `progress` → `progress()`, `frame` → a frame appended to
+the viewer. There is no remote-only rendering path to keep in step with the
+real one, which is the whole reason the runtime runs this page rather than a
+port of it.
+
+Measured on a 13-mer, streamed against blocking, same fixture:
+
+| | status lines | bar values | frames arriving DURING |
+|---|---|---|---|
+| streamed | 8 distinct | 5 | **22** |
+| blocking (the mutation) | 1 | 1 (indeterminate) | 0 |
+
+🔴 **AND A JOB IS POLLED WITH A WATERMARK, NOT DRAINED.** `POST /fold`
+with `stream: true` answers with a name; `GET /job?id=&since=N` returns the
+events past `N`. The server never removes anything, so an overlapping poll or
+a reload re-applies rather than losing events. The blocking form is kept,
+because the notebook's own fold cell is a Python caller that wants the
+structure.
+
+🔴 **AND STOPPING HAS TO REACH THE OTHER MACHINE.** Aborting locally ends the
+polling loop and leaves the runtime folding with its GPU lock held, so the
+next fold is answered 429. `POST /stop` clicks `predict` - the same toggle a
+reader would press - so there is no second stop path to drift.
+
+### 🔴 "A new object with frames" could not see a SECOND fold
+
+The watcher waited for an object name that was not on the page before the
+click. That is true of a first fold and **false of every one after it**:
+`openBlankFold` reuses the stem and rewinds it, so after two folds the page
+held one object, `af3_1`. Measured: the second blocking fold timed out after
+120 s while its own status line already read *"AlphaFold 3 · 13 residues · in
+1 s (trunk reused)"* - a fold that had finished in a second, reported as a
+failure.
+
+The button is no good either (it stays enabled throughout - it is how you stop
+one), and a status line without a percentage is true *before* the click has
+been acted on. The page states it instead: `window.__foldState = {running,
+since}`, written at the top of `fold()` and in its `finally`, compared against
+a click time taken from **the page's own clock**. Two blocking folds back to
+back now answer in 11.7 s and 1.05 s.

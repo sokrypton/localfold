@@ -760,7 +760,27 @@ let viewer;
 let viewerObject;
 
 /** py2Dmol's own status line, so folding reports where fetching used to. */
+// 🔴 A TAP, NOT A SECOND FOLD PATH. When this page is the one a Colab runtime
+// is driving headlessly, the page a reader is looking at is somewhere else -
+// so the status line, the bar and every sampler frame have to travel. They
+// travel as the SAME calls the local fold already makes, recorded here and
+// drained by tools/colab_backend.py; there is no remote-only code path to
+// keep in step with the real one, which is the whole reason the runtime runs
+// this page rather than a port of it.
+//
+// `window.__remoteTap` is set by the backend before it presses Fold and is
+// undefined everywhere else, so this is one property read per status write.
+function remoteTap(kind, payload) {
+  const tap = window.__remoteTap;
+  if (tap === undefined) return;
+  tap.push({ kind, payload });
+  // A cap, because a fold nobody is draining must not grow without end: the
+  // client polls three times a second and a frame is a few kilobytes.
+  if (tap.length > 200) tap.splice(0, tap.length - 200);
+}
+
 function status(text, isError = false) {
+  remoteTap("status", text);
   const node = document.getElementById("status-message");
   // 🔴 THE TIMELINE IS FED BEFORE THE EARLY RETURN, so a page whose status line
   // is missing still records. It costs one string compare a write, and only a
@@ -994,6 +1014,7 @@ function startModelPreload(family, signal) {
 }
 
 function progress(fraction) {
+  remoteTap("progress", fraction);
   const bar = element("progress");
   if (fraction === null) {
     bar.dataset.state = "idle";
@@ -2355,6 +2376,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
    */
   let liveSampler = 0;
   const drawLiveFrame = (pdb, kind) => {
+    remoteTap("frame", pdb);
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -2860,6 +2882,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   let colouring = false;
   const framePdbs = [];
   const drawLiveFrame = (pdb) => {
+    remoteTap("frame", pdb);
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -3258,33 +3281,133 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
                                templates, family, signal }) {
   const backend = remoteBackend();
   const where = backend.at || "";
+  const door = (route, extra = "") =>
+    `${where}${route}?t=${encodeURIComponent(backend.token)}${extra}`;
   const entities = entityList.read();
   const request = {
     entities, model: family,
     steps: Number(element("af3-count")?.value ?? 25),
     recycles: Number(element("recycles")?.value ?? 3),
     msa: msaMode(),
+    // 🔴 THE STREAMED FORM. Without this the runtime answers with the finished
+    // structure and nothing else, which is a page that sits blank for a minute
+    // - no bar, no status, no sampler frames. See tools/colab_backend.py.
+    stream: true,
   };
   const label = MODEL_LABELS[family] ?? family;
   status(`${label} · folding on the runtime…`);
-  progress(null);
-  const answer = await fetch(`${where}/fold?t=${encodeURIComponent(backend.token)}`, {
+  progress("waiting");
+  const opened = await fetch(door("/fold"), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(request),
     signal,
   });
-  if (!answer.ok) {
-    throw new Error(`the runtime answered ${answer.status} ${await answer.text()}`);
+  if (!opened.ok) {
+    throw new Error(`the runtime answered ${opened.status} ${await opened.text()}`);
   }
-  const result = await answer.json();
-  if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);
+  const { job, error: refused } = await opened.json();
+  if (refused) throw new Error(refused);
+
+  // 🔴 AND STOPPING HAS TO REACH THE OTHER MACHINE. The abort signal ends this
+  // loop, which on a local fold is the whole of stopping - here it would leave
+  // the runtime folding, its GPU lock held, and the next fold answered 429.
+  const stopThere = () => { fetch(door("/stop"), { method: "POST" }).catch(() => {}); };
+  signal.addEventListener("abort", stopThere, { once: true });
+
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
-  await loadIntoViewer({ stem, pdb: result.pdb, scores: {} });
+  const draw = remoteFrameDrawer(stem);
+  const framePdbs = [];
+  let since = 0;
+  let result;
+  for (;;) {
+    throwIfAborted(signal);
+    const poll = await fetch(door("/job", `&id=${encodeURIComponent(job)}&since=${since}`),
+                             { signal });
+    if (!poll.ok) throw new Error(`the runtime answered ${poll.status} while folding`);
+    const state = await poll.json();
+    for (const said of state.events ?? []) {
+      // The page's own calls, replayed here: the same status writes, the same
+      // bar fractions, the same sampler frames, in the order they happened.
+      if (said.kind === "status") status(said.payload);
+      else if (said.kind === "progress") progress(said.payload);
+      else if (said.kind === "frame") { framePdbs.push(said.payload); draw(said.payload); }
+    }
+    since = state.n ?? since;
+    if (state.done) { result = state.result ?? {}; break; }
+    await new Promise((done) => setTimeout(done, 300));
+  }
+  if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);
+
+  // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
+  // fills the sequence strip, the download buttons and the scores card - the
+  // streamed frames are a picture and not an ingestion. It CLEARS the object's
+  // frames, so the trajectory is put back afterwards, which is exactly the
+  // dance the local sampler path does a few hundred lines above.
+  const registry = window.py2dmol_viewers ?? {};
+  const liveRenderer = registry[Object.keys(registry)[0]]?.renderer;
+  const camera = { ...(liveRenderer?.viewerState ?? {}) };
+  const live = liveRenderer?.objectsData?.[liveRenderer?.currentObjectName];
+  if (live?.frames !== undefined) live.frames.length = 0;
+  await loadIntoViewer({ stem, pdb: framePdbs[0] ?? result.pdb, scores: {} });
+  if (viewer !== undefined && Object.keys(camera).length > 0) {
+    Object.assign(viewer.viewerState, camera);
+    viewer.render?.("localfold.restore-camera");
+  }
+  const api = window.py2Dmol;
+  if (api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
+    const first = viewer.objectsData?.[viewerObject]?.frames?.[0];
+    if (first !== undefined) first.name = first.label = first.title = "sampler_0";
+    for (const [index, text] of [...framePdbs.slice(1, -1), result.pdb].entries()) {
+      try {
+        const frame = api.frameFromText(text);
+        const last = index === framePdbs.length - 2;
+        frame.name = frame.label = frame.title = last ? "final" : `sampler_${index + 1}`;
+        viewer.addFrame(frame, viewerObject);
+      } catch (cause) { console.warn("frame skipped:", cause); }
+    }
+  }
   // ...and the runtime's own summary, which already reads the way this page's
   // status line does - it is the same code, on the other machine.
   status(result.status || `${label} · folded on the runtime`);
   progress(null);
+}
+
+/**
+ * The live frames of a fold happening somewhere else.
+ *
+ * 🔴 IT OPENS THE OBJECT ON THE FIRST FRAME, NOT BEFORE. A blank fold opened
+ * when the request is sent would sit empty for however long the runtime spends
+ * on the trunk - and a fold the runtime REFUSES (429, a second reader) would
+ * leave an empty object on the page with nothing ever arriving in it.
+ */
+function remoteFrameDrawer(stem) {
+  let drawn = 0;
+  let opened = false;
+  let colouring = false;
+  return (pdb) => {
+    const api = window.py2Dmol;
+    if (api?.frameFromText === undefined) return;
+    const registry = window.py2dmol_viewers ?? {};
+    const renderer = registry[Object.keys(registry)[0]]?.renderer;
+    if (renderer === undefined) return;
+    if (!opened) { openBlankFold(stem); opened = true; }
+    const object = renderer.objectsData?.[renderer.currentObjectName];
+    if (object === undefined) return;
+    try {
+      if (object.frames.length === 0) { revealViewer(renderer); contactsBig(false); }
+      const frame = api.frameFromText(pdb);
+      frame.name = frame.label = frame.title = `sampler_${drawn++}`;
+      renderer.addFrame(frame, renderer.currentObjectName);
+      renderer.setFrame(object.frames.length - 1);
+      // The B-factor column of every model this backend drives is a pLDDT, so
+      // the trajectory is watchable in confidence from its first frame - the
+      // same choice the local sampler path makes, and for the same reason.
+      if (!colouring) { colouring = setColourMode("plddt"); orientBestView(renderer); }
+    } catch (cause) {
+      console.warn("live frame skipped:", cause);
+    }
+  };
 }
 
 async function fold(event) {
@@ -3298,6 +3421,15 @@ async function fold(event) {
   const controller = new AbortController();
   const { signal } = controller;
   activeFold = controller;
+  // 🔴 THE PAGE SAYS WHETHER IT IS FOLDING, because everything else is a
+  // proxy. A backend driving this page headlessly used to watch for a NEW
+  // object with frames, which is true of a first fold and FALSE of a second:
+  // a repeat fold reuses the stem, so the watcher waited out its whole timeout
+  // on a fold that had finished in a second (measured - status line
+  // "AlphaFold 3 · 13 residues · in 1 s (trunk reused)", watcher timed out).
+  // The button is no good either: it stays enabled throughout, being how you
+  // stop one. See tools/colab_backend.py.
+  window.__foldState = { running: true, since: Date.now() };
   setFoldButton("running");
   // ...`msaMode()` and not the select, so the dev log records what the fold
   // will actually do rather than what a hidden control still says.
@@ -4158,6 +4290,7 @@ async function fold(event) {
       } else status(error instanceof Error ? error.message : String(error), true);
     }
   } finally {
+    window.__foldState = { running: false, since: Date.now() };
     // ...whatever happened, including a stop. The timeline is most useful about
     // the fold that did NOT finish, so it is closed here and not on the way out
     // of the success path.

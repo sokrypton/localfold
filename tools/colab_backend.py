@@ -57,6 +57,14 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # what makes the queue honest, and the page is kept between jobs because
 # loading it costs seconds and the weights it caches are hundreds of megabytes.
 LOCK = threading.Lock()
+# 🔴 AND A FOLD IS A JOB, NOT A REQUEST THAT TAKES A MINUTE. The first version
+# answered POST /fold with the finished structure, which is correct and is
+# also a page that sits blank for the whole fold: no bar, no status, no
+# sampler frames. A job the client POLLS carries all three while they happen.
+# The blocking form is kept for the notebook cells that use it - `stream` is
+# what asks for the other one.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
 
 ADAPTER_JS = """(async () => {
   if (!navigator.gpu) return { webgpu: false, why: 'no navigator.gpu' };
@@ -158,8 +166,13 @@ class Backend:
         """What the card is - the whole question this backend rests on."""
         return cdp.evaluate(self.ws, ADAPTER_JS)
 
-    def fold(self, request):
-        """One fold, through the page's own controls."""
+    def fold(self, request, job=None):
+        """One fold, through the page's own controls.
+
+        `job`, when given, is filled AS THE FOLD RUNS with what the page said
+        and drew - the same status writes, bar fractions and sampler frames a
+        local fold makes, tapped in web/app.js. See remoteTap there.
+        """
         entities = request.get("entities") or [{
             "type": "protein", "value": request.get("sequence", ""), "copies": 1,
             "modifications": request.get("modifications", []),
@@ -202,14 +215,29 @@ class Backend:
         # `clearAllObjects` is the Clear button's verb and it takes the page
         # with it, measured: the status line went to "Prediction stopped" and
         # then "Paste a sequence and press Fold", and nothing folded at all.
-        # Each fold opens an object of its own (`openBlankFold`), so the NAMES
-        # before the click are the whole of what has to be remembered.
-        before = set(cdp.evaluate(self.ws, """(() => {
-          const reg = window.py2dmol_viewers || {};
-          const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
-          return v ? Object.keys(v.objectsData || {}) : [];
-        })()""") or [])
-        cdp.evaluate(self.ws, "(document.getElementById('predict').click(), true)")
+        #
+        # 🔴 AND IT IS NOT THE OBJECT NAMES EITHER, WHICH IS WHAT THIS USED TO
+        # REMEMBER. "A name that was not here before" is true of a first fold
+        # and false of a second: `openBlankFold` REUSES the stem and rewinds
+        # it, so the page held one object, `af3_1`, after two folds - and the
+        # watcher waited out its whole timeout on a fold whose own status line
+        # already read "AlphaFold 3 · 13 residues · in 1 s (trunk reused)".
+        # The page states it instead (`window.__foldState`, web/app.js), which
+        # is not a proxy for anything.
+        # 🔴 ARMED BEFORE THE CLICK AND NOT BEFORE THE SETUP, or the entity
+        # writes above fill it with their own status lines and the client
+        # replays the last fold's ending as this one's beginning.
+        cdp.evaluate(self.ws, "(window.__remoteTap = [], true)")
+        # 🔴 AND THE CLICK IS TIMED BY THE PAGE'S OWN CLOCK, not this one's:
+        # what the watcher compares against is `__foldState.since`, which the
+        # page writes with its own Date.now(). Two machines' clocks agreeing is
+        # not something to rest a completion test on - and here they are the
+        # same machine only by accident of this backend being local.
+        pressed = cdp.evaluate(self.ws, """(() => {
+          const at = Date.now();
+          document.getElementById('predict').click();
+          return at;
+        })()""")
         # 🔴 AND THE FOLD IS WATCHED BY WHAT IT MAKES, NOT BY THE BUTTON. The
         # first version waited for `predict` to go disabled and then enabled
         # again, which cannot see a fold that takes less time than the poll:
@@ -235,9 +263,19 @@ class Backend:
                 out[name] = (v.objectsData[name].frames || []).length;
               }
               const button = document.getElementById('predict');
+              const fold = window.__foldState || null;
+              // ...and the tap, drained in the SAME round trip the watch was
+              // already making: a second evaluate per 250 ms would double the
+              // CDP traffic to learn the same thing.
+              const tap = window.__remoteTap || [];
               return { objects: out, idle: !!(button && !button.disabled),
+                       folding: fold ? fold.running : null, since: fold ? fold.since : 0,
+                       tap: tap.splice(0, tap.length),
                        status: document.getElementById('status-message')?.textContent ?? '' };
             })()""")
+            if job is not None:
+                job["events"].extend(state.get("tap") or [])
+                job["status"] = state.get("status") or job["status"]
             # 🔴 AND FRAMES ARE NOT AN ENDING. The sampler STREAMS them, so a
             # new object has frames a few hundred milliseconds in - measured,
             # this returned at 807 ms under "Folding 7/25 · 54%" and handed
@@ -248,9 +286,18 @@ class Backend:
             # it: every working state carries one ("Trunk 1/2 · 2%", "Folding
             # 7/25 · 54%", "Language model · 40%") and the summary that
             # replaces it does not.
-            fresh = [name for name, frames in (state.get("objects") or {}).items()
-                     if name not in before and frames]
-            if fresh and "%" not in (state.get("status") or "%"):
+            # 🔴 FINISHED IS THE PAGE SAYING SO, AND NOTHING ELSE. The two
+            # rules this replaces were both proxies and both had a case they
+            # could not see: a NEW object with frames is false for a repeat
+            # fold, which reuses the stem, and a status line without a
+            # percentage is true before the click has been acted on. What is
+            # left of `before` is the one thing it was genuinely good for -
+            # telling this fold's object from the last one's - which the
+            # readback below uses.
+            done = (state.get("folding") is False
+                    and (state.get("since") or 0) > pressed)
+            any_frames = any((state.get("objects") or {}).values())
+            if done and any_frames:
                 break
             if time.time() > deadline:
                 return {"error": "timed out", "status": state.get("status")}
@@ -329,6 +376,24 @@ def serve(port, backend, token, host="127.0.0.1"):
 
         def do_GET(self):
             route = urllib.parse.urlparse(self.path).path
+            if route == "/job":
+                if not self._authorised():
+                    return self._json(403, {"error": "token"})
+                asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                job = JOBS.get(asked.get("id", [""])[0])
+                if job is None:
+                    return self._json(404, {"error": "no such job"})
+                # 🔴 A WATERMARK, NOT A QUEUE THE READER DRAINS. Two polls can
+                # overlap and a client can be re-created by a reload, so the
+                # server never removes anything: `since` is what the caller has
+                # already applied, which makes a repeated poll idempotent.
+                since = int(asked.get("since", ["0"])[0])
+                events = job["events"][since:]
+                return self._json(200, {
+                    "status": job["status"], "done": job["done"],
+                    "events": events, "n": since + len(events),
+                    "result": job["result"] if job["done"] else None,
+                })
             if route == "/health":
                 if not self._authorised():
                     return self._json(403, {"error": "token"})
@@ -338,10 +403,20 @@ def serve(port, backend, token, host="127.0.0.1"):
 
         def do_POST(self):
             route = urllib.parse.urlparse(self.path).path
-            if route != "/fold":
+            if route not in ("/fold", "/stop"):
                 return self._json(404, {"error": "no such route"})
             if not self._authorised():
                 return self._json(403, {"error": "token"})
+            # 🔴 STOPPING IS THE SAME BUTTON. `predict` is a toggle - it is how
+            # a reader stops a fold - so the page needs no stop control of its
+            # own and this cannot drift from what a person would do.
+            if route == "/stop":
+                try:
+                    cdp.evaluate(backend.ws,
+                                 "(document.getElementById('predict').click(), true)")
+                    return self._json(200, {"ok": True})
+                except Exception as cause:                    # noqa: BLE001
+                    return self._json(500, {"error": str(cause)})
             length = int(self.headers.get("Content-Length", "0"))
             try:
                 request = json.loads(self.rfile.read(length) or b"{}")
@@ -349,12 +424,37 @@ def serve(port, backend, token, host="127.0.0.1"):
                 return self._json(400, {"error": f"not JSON: {cause}"})
             if not LOCK.acquire(blocking=False):
                 return self._json(429, {"error": "one GPU, one fold: try again"})
-            try:
-                return self._json(200, backend.fold(request))
-            except Exception as cause:                        # noqa: BLE001
-                return self._json(500, {"error": str(cause)})
-            finally:
-                LOCK.release()
+            # The blocking form, which the notebook's own fold cell uses: the
+            # answer IS the structure.
+            if not request.get("stream"):
+                try:
+                    return self._json(200, backend.fold(request))
+                except Exception as cause:                    # noqa: BLE001
+                    return self._json(500, {"error": str(cause)})
+                finally:
+                    LOCK.release()
+            # ...and the streamed form, which the page uses: the answer is a
+            # name to poll, and the lock is held by the THREAD rather than by
+            # this request - so it is released where the fold ends, in every
+            # way it can end, and not where the POST returns.
+            name = secrets.token_urlsafe(9)
+            job = {"events": [], "status": "", "done": False, "result": None}
+            with JOBS_LOCK:
+                JOBS[name] = job
+                for old_name in list(JOBS)[:-8]:
+                    JOBS.pop(old_name, None)
+
+            def run():
+                try:
+                    job["result"] = backend.fold(request, job)
+                except Exception as cause:                    # noqa: BLE001
+                    job["result"] = {"error": str(cause)}
+                finally:
+                    job["done"] = True
+                    LOCK.release()
+
+            threading.Thread(target=run, daemon=True).start()
+            return self._json(200, {"job": name})
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     # 🔴 LOOPBACK, NOT EVERY INTERFACE. The tunnel client runs on this same
