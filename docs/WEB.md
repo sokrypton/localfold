@@ -2066,3 +2066,66 @@ been acted on. The page states it instead: `window.__foldState = {running,
 since}`, written at the top of `fold()` and in its `finally`, compared against
 a click time taken from **the page's own clock**. Two blocking folds back to
 back now answer in 11.7 s and 1.05 s.
+
+## The Colab setup minute, measured on a T4 - and the three ways of cutting it that do not work
+
+Driven from `colab exec` on a real runtime rather than guessed at. The whole
+setup is **71 s**, and it is dpkg unpacking onto a **2-CPU** box:
+
+| stage | time | share |
+|---|---|---|
+| Chrome `.deb` download, 136 MB | **0.65 s** | 1% |
+| Chrome `dpkg` install | 21.4 s | 30% |
+| **`libnvidia-gl-<major>`** | **44.3 s** | **62%** |
+| `git clone --depth 1` | 5.1 s | 7% |
+
+The download is free - 209 MB/s, it is Google's own network - so **every
+second is archive extraction**, and nothing about the network or the repository
+is worth optimising.
+
+🔴 **AND THERE IS NOTHING ON THE IMAGE TO REUSE.** Taken before anything was
+installed: no browser of any kind (no Chrome, no Chromium, no Playwright
+cache), an EMPTY `/usr/share/vulkan/icd.d`, and no `libGLX_nvidia` in the
+linker cache. What IS there: `libvulkan.so.1` (the loader), `libcuda.so.1`,
+`nvidia-smi`, node v20.19, and a populated apt index. So the nicest hypothesis
+- that the driver's libraries are on disk and only the ICD *file* is missing,
+which would have turned 44 s into writing one JSON - is false.
+
+### Three measured dead ends
+
+- 🔴 **`--force-unsafe-io` IS A NULL RESULT.** dpkg fsyncs every file it
+  writes and this box's disk is slow, so it looks like the answer. Same
+  package, same box, reinstall either way: **18.4 s plain against 16.7 s**,
+  and Chrome **17.1 against 17.6** - the wrong way round. Inside the noise
+  both times.
+- 🔴 **AN EXTRACTED CHROME HAS NO WEBGPU AT ALL.** `dpkg-deb -x` unpacks it in
+  **9.6 s** against 17-21 s through dpkg, and the whole extraction route
+  (driver + Chrome + clone) is **28.6 s against 71.4** - a 60% cut. It needs
+  four small libraries the image lacks (`libatk-1.0`, `libatk-bridge-2.0`,
+  `libatspi`, `libXcomposite`, 7.6 s), after which Chrome starts in 566 ms and
+  `navigator.gpu` is **undefined**: ANGLE fails with *"Extension not supported:
+  VK_KHR_surface"* and the display never initialises.
+  **AND THE ISOLATION SAYS IT IS CHROME, NOT THE DRIVER.** Install
+  `libnvidia-gl` properly (41.9 s) on that same box, keep the extracted
+  Chrome, drop the `VK_ICD_FILENAMES`/`LD_LIBRARY_PATH` overrides so the
+  system's own ICD is used: still `webgpu: false`. So the 44 s half might yet
+  be extractable; the 21 s half is not, and a Chrome that starts twice as fast
+  and folds on nothing is a regression wearing a speedup's clothes.
+- **Skipping what is already present buys nothing on a FIRST run**, which is
+  the run people complain about. The probes are still right for a rerun - a
+  runtime keeps its filesystem between cells - but on a cold T4 the ICD
+  directory is empty and Chrome is absent, so every branch fires.
+
+**What is left, and it is small**: the clone shares nothing with apt (one is
+git's network, the other dpkg's lock), so it is started first and waited for
+last - about 5 s of 71. The honest summary is that ~65 s of this is dpkg
+unpacking half a gigabyte on two cores, and no arrangement of the same
+packages avoids it.
+
+🔴 **AND `colab exec` IS SERIAL AND ITS CLIENT CAN HANG.** A Jupyter kernel
+runs one cell at a time, so a probe whose client hangs blocks every later
+call - three experiments in this session appeared to run and never did, and
+the wall-clock was blamed on the runtime. Long work goes **detached**
+(`subprocess.Popen(..., start_new_session=True)` writing timings to a file)
+and is read with cheap polls; the first `exec` against a new session pays
+~29 s of kernel connection, every later one is ~3 s.
