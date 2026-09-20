@@ -74,8 +74,8 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
-import { colabRole, installColabBridge, remoteCommand, remoteEvents, tapOut }
-  from "./colab-bridge.js";
+import { colabRole, installColabBridge, remoteCommand, remoteEvents, remoteHead,
+  tapOut } from "./colab-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -3316,7 +3316,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // the last fold's status writes and frames as this one's - and one that
   // asked after sending could miss the first of this fold's. `n` is where the
   // stream stands at the instant before the runtime is told anything.
-  let since = (await remoteEvents(0, signal)).n ?? 0;
+  let since = (await remoteHead(signal)).n ?? 0;
   const { error: refused } = await remoteCommand("fold", request);
   if (refused) throw new Error(refused);
 
@@ -3334,7 +3334,13 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
     throwIfAborted(signal);
     const state = await remoteEvents(since, signal);
     since = state.n ?? since;
-    for (const said of state.events ?? []) {
+    // 🔴 IN THE RUNTIME PAGE'S ORDER, NOT THE NETWORK'S. Events are pushed as
+    // they happen and several sends can be in flight at once - which is what
+    // keeps the feed live while that page is busy - so `seq` is the page's own
+    // count and this is where it is put back in order.
+    const batch = [...(state.events ?? [])]
+      .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    for (const said of batch) {
       // The page's own calls, replayed here: the same status writes, the same
       // bar fractions, the same sampler frames, in the order they happened.
       if (said.kind === "status") status(said.payload);
@@ -3350,6 +3356,17 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
       }
     }
     if (result !== undefined) break;
+    // 🔴 AND A RUNTIME THAT HAS GONE MUST NOT BE POLLED FOR EVER. Colab
+    // recycles a runtime when the notebook is closed or left idle, and the
+    // broker's busy flag is raised HERE and lowered by the runtime page - so a
+    // page that has gone takes the flag with it and this loop would wait out
+    // the rest of the session on a fold nobody is doing. `runtimeSeen` is how
+    // long it has been since that page asked for its commands, which it does
+    // three times a second.
+    if ((state.runtimeSeen ?? 0) > 20000) {
+      throw new Error("the runtime stopped answering - its notebook may have"
+        + " been closed or its runtime recycled; run the Colab cell again");
+    }
     await new Promise((done) => setTimeout(done, 300));
   }
   if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);

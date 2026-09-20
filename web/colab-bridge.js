@@ -43,8 +43,14 @@ const ask = async (route, body) => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!answer.ok) throw new Error(`the broker answered ${answer.status}`);
-  return answer.json();
+  // 🔴 A REFUSAL CARRIES ITS REASON. "one GPU, one fold: try again" is the
+  // whole of what a reader needs to know, and `the broker answered 429` is
+  // the same event with the answer taken out of it.
+  const said = await answer.json().catch(() => ({}));
+  if (!answer.ok) {
+    throw new Error(said.error ?? `the broker answered ${answer.status}`);
+  }
+  return said;
 };
 
 export const colabRole = () => {
@@ -58,24 +64,32 @@ export const colabRole = () => {
    that folds: what it says, sent as it says it. */
 
 let pending = [];
-let inFlight = false;
+let seqOut = 0;
 
-async function flush() {
-  if (inFlight || pending.length === 0) return;
-  inFlight = true;
+/**
+ * 🔴 NOT ONE REQUEST AT A TIME, WHICH IS WHERE THE FIRST VERSION OF THIS PUT
+ * THE FAULT BACK. Holding the next batch until the last one RESOLVED needs the
+ * main thread to run the response, and a page in the middle of a fold does not
+ * give it up - so twenty events pushed across six seconds of 300 ms tasks
+ * reached the broker at **p50 3.0 s, worst 5.7 s**, which is the pulled feed's
+ * behaviour wearing a push's clothes. `tools/check-colab-bridge.py` measures
+ * exactly that and holds it under a second.
+ *
+ * A send is STARTED in the task that made the event and nothing waits for its
+ * answer. What that costs is ordering - several requests in flight can arrive
+ * in any order - so every event carries a `seq` and the reader applies each
+ * batch in it.
+ */
+function flush() {
+  if (pending.length === 0) return;
   const batch = pending;
   pending = [];
-  try {
-    await ask("/up", { events: batch });
-  } catch (cause) {
-    // 🔴 A LOST BATCH IS A LOST PICTURE, NOT A LOST FOLD. The fold is running
-    // on this page and its result is read back at the end from what the page
-    // HAS; throwing here would take the fold down to save the commentary.
+  // 🔴 A LOST BATCH IS A LOST PICTURE, NOT A LOST FOLD. The fold is running on
+  // this page and its result is read back at the end from what the page HAS;
+  // throwing here would take the fold down to save the commentary.
+  ask("/up", { events: batch }).catch((cause) => {
     console.warn("colab bridge: an event batch did not send:", cause.message);
-  } finally {
-    inFlight = false;
-    if (pending.length > 0) void flush();
-  }
+  });
 }
 
 /**
@@ -91,8 +105,9 @@ async function flush() {
  */
 export function tapOut(kind, payload) {
   if (colabRole() !== "runtime") return;
-  pending.push({ kind, payload, at: Date.now() });
-  void flush();
+  pending.push({ kind, payload, at: Date.now(), seq: seqOut });
+  seqOut += 1;
+  flush();
 }
 
 /* ------------------------------------------------- ...and what it is told to do */
@@ -101,6 +116,16 @@ const idle = (ms) => new Promise((done) => setTimeout(done, ms));
 
 const statusText = () =>
   document.getElementById("status-message")?.textContent ?? "";
+
+/**
+ * 🔴 THE PAGE SAYS WHEN IT HAS FAILED, AND IT SAYS IT IN A CLASS.
+ * `status(text, true)` marks the line `.error`, which is the same signal a
+ * reader gets - where the word list this replaces ("stopped", "failed",
+ * "refus") was a guess at the page's vocabulary, kept in another file, in
+ * another language.
+ */
+const failed = () =>
+  !!document.getElementById("status-message")?.classList.contains("error");
 
 /** Is a fold running here? The page states it; everything else is a proxy. */
 const folding = () => !!(window.__foldState && window.__foldState.running);
@@ -206,10 +231,18 @@ async function runFold(request) {
   // `loadIntoViewer` clears the object's frames and re-adds them, so the
   // moment after a fold is a settled status line over an EMPTY object and a
   // download button that writes nothing. Ask for the artefact until it exists.
+  // 🔴 AND A FOLD THAT FAILED IS NOT WAITED FOR. The wait below exists for the
+  // window where `loadIntoViewer` has cleared the object's frames and not yet
+  // re-added them, which only happens on the way to a structure; a fold that
+  // died - no weights, no network, a refused allocation - has nothing coming,
+  // and waiting two minutes to say so is two minutes of a reader watching a
+  // bar that has already lost.
+  if (failed()) return { error: statusText(), status: statusText() };
   const until = Date.now() + 120_000;
   for (;;) {
     const out = await readBack();
     if (out.atoms > 0) return out;
+    if (failed()) return { ...out, error: statusText() };
     if (Date.now() > until) return { ...out, error: "the page never produced a structure" };
     await idle(500);
   }
@@ -231,14 +264,22 @@ async function obey(command) {
     return;
   }
   if (op === "fold") {
+    // 🔴 NOT AWAITED, OR NOTHING ELSE IS HEARD UNTIL THE FOLD ENDS - AND
+    // `stop` IS THE COMMAND THAT ONLY MATTERS DURING ONE. The loop below
+    // obeys in order and a fold is minutes long, so awaiting it here left the
+    // reader's Stop sitting in the mailbox until the fold it was meant to
+    // interrupt had finished on its own. A fold is a JOB; the loop goes on
+    // listening while it runs, and the broker refuses a second one.
     tapOut("fold-begin", { at: Date.now() });
-    let out;
-    try {
-      out = await runFold(payload ?? {});
-    } catch (cause) {
-      out = { error: String(cause && cause.message ? cause.message : cause) };
-    }
-    tapOut("result", out);
+    void (async () => {
+      let out;
+      try {
+        out = await runFold(payload ?? {});
+      } catch (cause) {
+        out = { error: String(cause && cause.message ? cause.message : cause) };
+      }
+      tapOut("result", out);
+    })();
     return;
   }
   tapOut("status", `the runtime does not know the command "${op}"`);
@@ -279,6 +320,13 @@ export const remoteCommand = (op, payload) => ask("/in", { op, payload });
 export async function remoteEvents(since, signal) {
   const answer = await fetch(door("/down", `&since=${since}`), { signal });
   if (!answer.ok) throw new Error(`the runtime answered ${answer.status} while folding`);
+  return answer.json();
+}
+
+/** ...and where the stream stands, without being handed it. */
+export async function remoteHead(signal) {
+  const answer = await fetch(door("/down", "&head=1"), { signal });
+  if (!answer.ok) throw new Error(`the runtime answered ${answer.status}`);
   return answer.json();
 }
 

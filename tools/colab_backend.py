@@ -86,6 +86,14 @@ EVENT_CAP = 4000
 # accepted and lowered by the runtime page's own `result`, which is the event
 # that says it has finished in every way a fold can finish.
 FOLDING = {"on": False}
+# 🔴 AND WHEN THE RUNTIME PAGE LAST ASKED FOR ITS COMMANDS, which is the only
+# sign of life there is. A Colab runtime is recycled when the notebook is
+# closed or left idle, and a reader whose fold was mid-flight then polls a
+# broker that will never have another event for it - forever, because
+# `FOLDING` is raised by the broker and lowered by the page, so a page that
+# has gone takes the flag with it. The page's own poll is the heartbeat; no
+# second mechanism and nothing extra on the wire.
+LAST_SEEN = {"at": 0.0}
 
 
 ADAPTER_JS = """(async () => {
@@ -216,6 +224,12 @@ def serve(port, backend, token, host="127.0.0.1"):
             self._cors()
             self.end_headers()
 
+        def _seen(self):
+            """Milliseconds since the runtime page last asked for commands."""
+            with MAIL_LOCK:
+                at = LAST_SEEN["at"]
+            return None if at == 0 else int((time.time() - at) * 1000)
+
         def _since(self):
             asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -232,6 +246,24 @@ def serve(port, backend, token, host="127.0.0.1"):
             # ever removed on read: `since` is what the caller has already
             # applied, which makes a repeated poll idempotent.
             if route == "/down":
+                # 🔴 `head=1` IS THE WATERMARK WITHOUT THE STREAM. A reader
+                # opening a fold needs to know where the stream stands so it
+                # can ignore the last fold's events - and asking for that with
+                # `since=0` hands it every frame of the last fold to throw
+                # away, which on a 25-step sampler is megabytes.
+                asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                if asked.get("head", [""])[0] == "1":
+                    # 🔴 `_seen()` TAKES THE SAME LOCK, AND IT IS NOT
+                    # REENTRANT. Called from inside a `with MAIL_LOCK` this
+                    # deadlocked the whole broker - the first `head=1` request
+                    # never returned AND never released, so every later
+                    # request hung behind it and the gate timed out three arms
+                    # later, in a route that was innocent. Read it first.
+                    seen = self._seen()
+                    with MAIL_LOCK:
+                        head = {"events": [], "n": EVENT_BASE + len(EVENTS),
+                                "folding": FOLDING["on"], "runtimeSeen": seen}
+                    return self._json(200, head)
                 since = self._since()
                 with MAIL_LOCK:
                     first = max(0, since - EVENT_BASE)
@@ -242,10 +274,12 @@ def serve(port, backend, token, host="127.0.0.1"):
                 # different from `since` for a caller that fell behind the cap.
                 return self._json(200, {"events": events, "n": n,
                                         "from": EVENT_BASE + first,
-                                        "folding": folding})
+                                        "folding": folding,
+                                        "runtimeSeen": self._seen()})
             if route == "/out":
                 since = self._since()
                 with MAIL_LOCK:
+                    LAST_SEEN["at"] = time.time()
                     commands = COMMANDS[since:]
                     n = len(COMMANDS)
                 return self._json(200, {"commands": commands, "n": n})
@@ -253,6 +287,7 @@ def serve(port, backend, token, host="127.0.0.1"):
                 with MAIL_LOCK:
                     folding = FOLDING["on"]
                 return self._json(200, {"ok": True, "busy": folding,
+                                        "runtimeSeen": self._seen(),
                                         "gpu": backend.adapter()})
             return super().do_GET()
 
@@ -286,6 +321,15 @@ def serve(port, backend, token, host="127.0.0.1"):
                         event["got"] = got
                         EVENTS.append(event)
                         if event.get("kind") == "result":
+                            FOLDING["on"] = False
+                        # 🔴 AND A PAGE THAT HAS JUST LOADED IS NOT FOLDING.
+                        # The flag is raised when a command is accepted and
+                        # lowered by the page's own `result`, so a runtime
+                        # that died mid-fold - or was reloaded - took the flag
+                        # with it and every later fold was refused 429 for the
+                        # rest of the session. An announcement is that page
+                        # saying it has just started.
+                        if event.get("kind") == "runtime-ready":
                             FOLDING["on"] = False
                     if len(EVENTS) > EVENT_CAP:
                         drop = len(EVENTS) - EVENT_CAP // 2

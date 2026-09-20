@@ -21,6 +21,19 @@ WHAT IT CHECKS, in the order a session does them:
     and nothing is dropped between two polls;
   * one GPU, one fold - a second `fold` while one is running is refused 429,
     and the refusal lifts when the page reports a result;
+  * THE READER'S OWN PAGE does all of that for real: a second browser opens
+    `index.html?backend=colab`, is handed a sequence and clicked, and what it
+    ends up showing must be what the runtime said. The weights are blocked on
+    the runtime page first, so the fold fails in seconds instead of pulling
+    hundreds of megabytes - the transport is what is being measured, and a
+    failure travels the same way a structure does;
+  * THE FEED HOLDS WHILE THE PAGE IS BUSY - twenty events pushed from the
+    runtime page across six seconds of 300 ms blocking tasks, which is what a
+    fold does to a main thread. This is the regression guard for the fault the
+    bridge was written for;
+  * A RUNTIME THAT GOES AWAY IS VISIBLE: the runtime page's own command poll
+    is the heartbeat, and `runtimeSeen` is how a reader tells a recycled Colab
+    runtime from a slow fold rather than polling for the rest of the session;
   * and no route answers anything without the token.
 
 🔴 WHAT IT CANNOT COVER is a fold: no weights on a developer's machine and no
@@ -31,7 +44,6 @@ route a structure would.
 """
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -39,9 +51,19 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cdp                                                   # noqa: E402
+
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 PORT = int(os.environ.get("BRIDGE_PORT", "8791"))
 CDP_PORT = int(os.environ.get("BRIDGE_CDP_PORT", "9391"))
+READER_CDP_PORT = int(os.environ.get("BRIDGE_READER_CDP_PORT", "9392"))
+# 🔴 THE WEIGHTS ARE BLOCKED ON THE RUNTIME PAGE, which is what makes a REAL
+# fold safe to drive from a developer's machine: the fold starts, the page
+# reports that it cannot load the model, and everything that report is made of
+# travels the way a fold's would. Without this the arm downloads hundreds of
+# megabytes from huggingface to prove a transport.
+WEIGHTS = "*huggingface.co*"
 TOKEN = "check-colab-bridge-token"
 BASE = f"http://127.0.0.1:{PORT}"
 
@@ -166,7 +188,240 @@ try:
         bad.append("the runtime is still marked busy after a result -"
                    " every later fold would be refused 429")
 
-    # 6 · and nothing answers without the token.
+    # 6 · THE READER'S OWN PAGE, which no amount of curl can stand in for.
+    #     Everything above drives the wire; this drives web/app.js's
+    #     `foldOnBackend` in a real browser - the half that was REWRITTEN and
+    #     that a wire test would pass with in pieces.
+    print("  opening the reader's page…")
+    runtime_ws = None
+    reader = None
+    try:
+        # The runtime's own browser, joined as a second debugger client, only
+        # to take the weights away. Everything else about that page is left
+        # exactly as the backend set it up.
+        for target in json.load(urllib.request.urlopen(
+                f"http://127.0.0.1:{CDP_PORT}/json/list")):
+            if target.get("type") == "page":
+                runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
+                break
+        runtime_ws.call("Network.enable")
+        runtime_ws.call("Network.setBlockedURLs", urls=[WEIGHTS])
+
+        reader, reader_ws = cdp.launch(READER_CDP_PORT, "/tmp/localfold-bridge-reader")
+        reader_ws.call("Page.enable")
+        reader_ws.call("Runtime.enable")
+        # 🔴 THE COLLECTOR GOES IN BEFORE THE PAGE DOES. A throw inside the
+        # rewritten transport would otherwise be a fold that quietly does
+        # nothing, which is the failure this arm exists to catch.
+        reader_ws.call("Page.addScriptToEvaluateOnNewDocument", source="""
+          window.__pageErrors = [];
+          addEventListener('error', (e) => window.__pageErrors.push(String(e.message)));
+          addEventListener('unhandledrejection',
+            (e) => window.__pageErrors.push('unhandled: ' + String(e.reason)));
+        """)
+        reader_ws.call("Page.navigate", url=(
+            f"http://127.0.0.1:{PORT}/index.html?backend=colab&t={TOKEN}"))
+        cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader's page")
+        # 🔴 THE TERMS DIALOG EATS THE CLICK ON A FRESH PROFILE, and it did:
+        # the first run of this arm reported a page that had been handed a
+        # sequence, had an enabled Fold button, was clicked, and then sat at
+        # "Ready. Paste a sequence and press Fold." with no command sent. The
+        # backend accepts them for the RUNTIME page; the reader's browser is a
+        # different profile and had accepted nothing.
+        cdp.evaluate(reader_ws, """(() => {
+          for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2',
+                             'protenix2', 'intellifold2', 'rosettafold3']) {
+            try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); }
+            catch (cause) { /* nothing to do */ }
+          }
+          return true;
+        })()""")
+        # A sequence and a press, which is all a person does.
+        cdp.evaluate(reader_ws, """(() => {
+          window.__entityList.set([{ type: 'protein',
+            value: 'GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK',
+            copies: 1, modifications: [] }]);
+          document.getElementById('msa-mode').value = 'none';
+          document.getElementById('msa-mode').dispatchEvent(
+            new Event('change', { bubbles: true }));
+          return true;
+        })()""")
+        cdp.wait_for(reader_ws, "!document.getElementById('predict').disabled", 60,
+                     "the reader's fold button")
+        cdp.evaluate(reader_ws, "(document.getElementById('predict').click(), true)")
+
+        # The command reaches the broker... and it is the one this click made,
+        # not the empty fold the arm above sent over curl.
+        asked, deadline = None, time.time() + 30
+        while time.time() < deadline and asked is None:
+            code, said = call("/out?since=0")
+            for command in said.get("commands") or []:
+                if command.get("op") != "fold":
+                    continue
+                if (command.get("payload") or {}).get("entities"):
+                    asked = command
+            time.sleep(0.25)
+        if asked is None:
+            bad.append("pressing Fold on the reader's page put no `fold`"
+                       " command in the broker - foldOnBackend never asked")
+        else:
+            entities = (asked.get("payload") or {}).get("entities") or []
+            print(f"  the reader asked: {asked['op']},"
+                  f" {len(entities)} entity, model {(asked.get('payload') or {}).get('model')}")
+
+        # ...and the runtime's answer reaches the reader's own screen. The
+        # fold cannot succeed with the weights blocked; what is asserted is
+        # that its commentary ARRIVED and was applied, which is the bug.
+        seen, deadline = {}, time.time() + 120
+        while time.time() < deadline:
+            seen = cdp.evaluate(reader_ws, """(() => ({
+              lag: (window.__remoteLag || []).length,
+              worst: Math.max(0, ...(window.__remoteLag || [0])),
+              status: document.getElementById('status-message')?.textContent ?? '',
+              errors: window.__pageErrors || [],
+            }))()""")
+            if seen.get("lag", 0) > 0 and "folding on the runtime" not in seen.get("status", ""):
+                break
+            time.sleep(0.5)
+        print(f"  the reader applied {seen.get('lag')} event(s), worst feed"
+              f" {seen.get('worst')} ms, and reads: {seen.get('status')!r}")
+        if seen.get("lag", 0) == 0:
+            bad.append("the reader's page applied no events at all: the"
+                       " runtime spoke and nothing reached the screen")
+        if "folding on the runtime" in seen.get("status", ""):
+            bad.append("the reader's status line never moved off its own"
+                       " opening line - the runtime's words did not arrive")
+        if seen.get("errors"):
+            bad.append(f"the reader's page threw: {seen['errors'][:2]}")
+    finally:
+        if runtime_ws is not None:
+            try:
+                runtime_ws.call("Network.setBlockedURLs", urls=[])
+            except Exception:                                 # noqa: BLE001
+                pass
+        if reader is not None:
+            reader.kill()
+
+    # 7 · AND THE FEED HOLDS UP WHILE THE PAGE IS BUSY, which is the whole
+    #     complaint. The runtime page is made to block its main thread in
+    #     300 ms chunks - what a fold does to it - with an event pushed before
+    #     each one. Every event must still arrive promptly, because it leaves
+    #     in the task that made it; a collected-and-drained feed cannot, which
+    #     is what "embedder · 1%" looked like from the reader's chair.
+    runtime_ws = None
+    try:
+        for target in json.load(urllib.request.urlopen(
+                f"http://127.0.0.1:{CDP_PORT}/json/list")):
+            if target.get("type") == "page":
+                runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
+                break
+        # 🔴 THE PAGE'S OWN MODULE INSTANCE, not a second copy: an ES module is
+        # cached by URL, so importing it here is the object web/app.js imports.
+        # Anything else would measure a transport nothing uses.
+        code, head = call("/down?head=1")
+        before = head.get("n", 0)
+        cdp.evaluate(runtime_ws, """(async () => {
+          const bridge = await import('/web/colab-bridge.js');
+          const spin = (ms) => { const end = performance.now() + ms;
+                                 while (performance.now() < end); };
+          (async () => {
+            for (let i = 0; i < 20; i += 1) {
+              bridge.tapOut('status', 'load ' + i);
+              spin(300);
+            }
+          })();
+          return true;
+        })()""", await_promise=True)
+        lags, arrived, deadline = [], [], time.time() + 40
+        seen = before
+        while time.time() < deadline and len(lags) < 20:
+            code, said = call(f"/down?since={seen}")
+            seen = said.get("n", seen)
+            for event in said.get("events") or []:
+                if str(event.get("payload", "")).startswith("load "):
+                    lags.append(event["got"] - event["at"])
+                    arrived.append(event.get("seq"))
+            time.sleep(0.2)
+        if len(lags) < 20:
+            bad.append(f"only {len(lags)} of 20 events arrived from a busy"
+                       " page - the feed stops when the fold gets going")
+        else:
+            worst = max(lags)
+            lags.sort()
+            print(f"  busy page (20 events across 6 s of 300 ms tasks):"
+                  f" feed p50 {lags[10]} ms, worst {worst} ms")
+            # A pushed event leaves before the block that follows it, so the
+            # bound is about the send and not about the page's tasks. A second
+            # is twenty times what this measures and still catches a feed that
+            # has gone back to being collected.
+            if worst > 1000:
+                bad.append(f"the worst event took {worst} ms to reach the"
+                           " broker from a busy page - the feed is being"
+                           " collected rather than pushed")
+            # 🔴 AND EVERY ONE OF THEM IS THERE, EXACTLY ONCE. Several sends
+            # are in flight at once, so the broker's order is the network's:
+            # what must hold is that nothing was dropped or doubled, and that
+            # the page's own `seq` is on each one - which is what the reader
+            # sorts by. Arrivals out of order are REPORTED rather than
+            # asserted: on loopback there are usually none, and the sort in
+            # web/app.js is for the Colab proxy, which is not this.
+            if sorted(arrived) != list(range(min(arrived), min(arrived) + 20)):
+                bad.append(f"the 20 events came back as seqs {sorted(arrived)}"
+                           " - one was dropped, doubled, or carries no seq")
+            out_of_order = sum(1 for a, b in zip(arrived, arrived[1:]) if b < a)
+            print(f"  seq: 20 distinct, {out_of_order} arrived out of order")
+    finally:
+        pass
+
+    # 8 · A RUNTIME THAT GOES AWAY IS VISIBLE, which is Colab's ordinary
+    #     ending: the notebook is closed, the runtime is recycled, and a
+    #     reader mid-fold would otherwise poll a broker that can never answer.
+    #     The page's own command poll is the heartbeat.
+    runtime_ws = None
+    try:
+        for target in json.load(urllib.request.urlopen(
+                f"http://127.0.0.1:{CDP_PORT}/json/list")):
+            if target.get("type") == "page":
+                runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
+                break
+        code, said = call("/health")
+        fresh = said.get("runtimeSeen")
+        # Away: a page with no `role` in its URL runs no bridge, so the polls
+        # stop exactly as they would if the runtime had been taken away.
+        runtime_ws.call("Page.navigate", url="about:blank")
+        grew, deadline = 0, time.time() + 20
+        while time.time() < deadline:
+            code, said = call("/health")
+            grew = said.get("runtimeSeen") or 0
+            if grew > 3000:
+                break
+            time.sleep(0.5)
+        # ...and back, which is also the page recovering on its own.
+        runtime_ws.call("Page.navigate", url=(
+            f"http://127.0.0.1:{PORT}/index.html?role=runtime&t={TOKEN}"))
+        back, deadline = None, time.time() + 60
+        while time.time() < deadline:
+            code, said = call("/health")
+            back = said.get("runtimeSeen")
+            if back is not None and back < 2000 and grew > 3000:
+                break
+            time.sleep(0.5)
+        print(f"  heartbeat: {fresh} ms fresh, {grew} ms with the page away,"
+              f" {back} ms once it is back")
+        if fresh is None or fresh > 3000:
+            bad.append(f"a live runtime page reads {fresh} ms since its last"
+                       " command poll - the heartbeat is not beating")
+        if grew <= 3000:
+            bad.append("the heartbeat did not age while the runtime page was"
+                       " away, so a reader cannot tell a dead runtime from a"
+                       " slow fold")
+        if back is None or back > 2000:
+            bad.append(f"the heartbeat did not come back ({back} ms) after the"
+                       " runtime page reloaded - the bridge does not restart")
+    finally:
+        pass
+
+    # 9 · and nothing answers without the token.
     for route, body in (("/down?since=0", None), ("/out?since=0", None),
                         ("/health", None), ("/up", {"events": []}),
                         ("/in", {"op": "ping"})):

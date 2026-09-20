@@ -2047,10 +2047,22 @@ rather than frozen, so the real fold blocks the thread harder than a synthetic
 one - but the shape of the fault is the same and the mechanism is the same.
 
 **THE PAGE PUSHES NOW, IN THE TASK THAT MADE THE EVENT.** `tapOut` posts to
-`/up` immediately, coalescing only while a send is in flight. The page has to
-be running to produce an event at all, so asking it again later can add
-nothing - and the one thing a pull did buy, batching, is what the in-flight
-buffer does anyway.
+`/up` at once. The page has to be running to produce an event at all, so
+asking it again later can add nothing.
+
+🔴 **AND "ONE REQUEST AT A TIME" PUT THE FAULT STRAIGHT BACK, MEASURED.** The
+first version of the push held the next batch until the last one RESOLVED -
+which needs the main thread to run the response, and a page in the middle of a
+fold does not give it up. Twenty events pushed across six seconds of 300 ms
+tasks reached the broker at **p50 3,002 ms, worst 5,702 ms**: a pulled feed
+wearing a push's clothes, and the gate said so on its first run. Started and
+not awaited, the same twenty are **p50 1 ms, worst 2 ms**.
+
+**WHAT THAT COSTS IS ORDERING, AND `seq` IS WHAT PAYS IT.** Several requests in
+flight can arrive in any order, so every event carries the page's own count and
+`foldOnBackend` sorts each polled batch by it before applying. On loopback
+nothing has yet arrived out of order; the sort is for the Colab proxy, which is
+not loopback.
 
 🔴 **AND THE COMMANDS COME BACK THE SAME WAY - TWO MAILBOXES, ONE BROKER.**
 `tools/colab_backend.py` is a post office: `EVENTS` is what the runtime page
@@ -2085,15 +2097,67 @@ two numbers rather than an argument - which is exactly what the pulled version
 could not tell apart, and what cost a session of guessing. The reader keeps
 them in `window.__remoteLag`.
 
+🔴 **AND A COMMAND LOOP THAT AWAITS A FOLD CANNOT HEAR `stop`.** The runtime
+page obeys its commands in order and a fold is minutes long, so awaiting one
+left the reader's Stop sitting in the mailbox until the fold it was meant to
+interrupt had finished by itself. A fold is a job: it is started and not
+awaited, the loop goes on listening, and the broker refuses a second fold.
+
+🔴 **AND A FOLD THAT FAILED IS NOT WAITED FOR.** The readback loop polls for up
+to two minutes because `loadIntoViewer` clears the object's frames before it
+re-adds them - a window on the way to a structure. A fold that died has nothing
+coming, so `runFold` asks the page: `status(text, true)` marks the line
+`.error`, which is the same signal a reader gets, where the word list it
+replaces ("stopped", "failed", "refus") was a guess at the page's vocabulary
+kept in another file in another language.
+
+🔴 **AND A RUNTIME THAT HAS GONE MUST NOT BE POLLED FOR EVER.** Colab recycles
+a runtime when the notebook is closed or left idle, and the busy flag is raised
+by the BROKER and lowered by the PAGE - so a page that died mid-fold took the
+flag with it, leaving the reader polling for the rest of the session and every
+later fold refused 429. The runtime page asks for its commands three times a
+second, and that poll IS the heartbeat: `runtimeSeen` rides on `/down` and
+`/health`, the reader gives up past twenty seconds with words that say what to
+do ("its notebook may have been closed... run the Colab cell again"), and an
+announcement from a freshly loaded page clears the busy flag, because a page
+that has just started is not folding. Measured: **212 ms fresh, 3,341 ms with
+the page away, 135 ms once it is back** - the last number also being the bridge
+restarting by itself on a reload.
+
+🔴 **AND `threading.Lock` IS NOT REENTRANT, WHICH COST THREE INNOCENT ARMS.**
+`_seen()` takes `MAIL_LOCK`, and one branch called it from INSIDE a `with
+MAIL_LOCK` - so the first `head=1` request never returned and never released,
+every later request queued behind it, and the gate failed three arms downstream
+in a route that had nothing wrong with it. **A hang reported far from its
+cause**: read the value before taking the lock.
+
 `npm run test:colab` (`tools/check-colab-bridge.py`) is the gate, and it needs
-**no GPU and no weights**: it starts the broker, lets it open the runtime page,
-and drives every route from the reader's side - the announcement, a `ping` that
-comes back as a `pong` (213-414 ms here), both clocks, the watermark's
-idempotence, the 429, and a token refusal on all five routes. Three mutations
-caught: the push removed (the pulled version's behaviour - four arms red), the
-arrival stamp dropped, and the busy refusal removed. What it cannot cover is a
-fold; the fold command is driven with an empty entity list, so the command path
-and the `result` event are real and what comes back is the page's own refusal.
+**no GPU and no weights**. Over the wire: the announcement, a `ping` answered as
+a `pong` (202-414 ms), both clocks, the watermark's idempotence, the 429, and a
+token refusal on all five routes.
+
+**AND TWO ARMS THAT NEEDED MORE THAN CURL.** The READER'S OWN PAGE is opened in
+a second browser at `?backend=colab`, handed a sequence and clicked - with the
+WEIGHTS BLOCKED on the runtime page (`Network.setBlockedURLs`, `*huggingface.co*`)
+so the fold fails in seconds rather than pulling hundreds of megabytes. The
+command arrives carrying its entity and its model, and the runtime's `Failed to
+fetch` is what the reader's own status line ends up reading, three events
+applied at a worst feed of 2-6 ms. *Its first run failed for a reason worth
+keeping: a fresh profile has accepted no model terms, so the click opened the
+terms dialog and nothing was sent - a page with a sequence, an enabled button
+and a status line still reading "Ready. Paste a sequence and press Fold."* And
+the FEED UNDER LOAD is the regression guard: twenty events from a page blocking
+its thread in 300 ms chunks, bounded at a second, measured at 1-2 ms.
+
+AND THE RUNTIME GOING AWAY is the ninth arm: the runtime page is navigated to
+`about:blank` - a page with no `role` runs no bridge, which is exactly what a
+recycled runtime looks like from here - and the heartbeat must age, then come
+back when it is navigated home.
+
+Four mutations caught: the push removed (the pulled version's behaviour - four
+arms red), the arrival stamp dropped, the busy refusal removed, and the reader's
+command never sent. What it cannot cover is a fold: the model never runs, and
+what comes back is the page's own refusal.
 
 ### 🔴 "A new object with frames" could not see a SECOND fold
 
