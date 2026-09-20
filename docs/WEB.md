@@ -2169,6 +2169,28 @@ still there and is still the floor** - it is the one thing that must go
 through dpkg, and the three ways of extracting it all end at
 `requestAdapter() === null`.
 
+🔴 **AND THE DRIVER IS THE FLOOR BECAUSE WEBGPU ON LINUX IS VULKAN.** Chrome
+reaches the card through Dawn -> Vulkan, and NVIDIA's Vulkan ICD lives inside
+`libGLX_nvidia.so.0` with its `nvidia_icd.json`. A Colab runtime ships the
+kernel module, `nvidia-smi` and `libcuda` - the COMPUTE userspace, which is
+what CUDA uses - and an empty `/usr/share/vulkan/icd.d`. There is no CUDA path
+into WebGPU, so the graphics userspace has to be installed. That is what the
+44 s buys.
+
+🔴 **AND INSTALLING LESS OF IT SAVES NOTHING, MEASURED.** Unpacked the package
+is **447 MB and 83% of it is not Vulkan**: `libnvoptix` + `nvoptix.bin`
+(166 MB) and `libnvidia-rtcore` (105 MB) are ray tracing, `libnvidia-present`
+(66 MB) is presentation, `libnvidia-eglcore` (35 MB) is EGL, `libnvidia-vksc-core`
+is Vulkan SC. Excluded with `dpkg --path-exclude` - and the excludes provably
+applied, those files absent afterwards while `libnvidia-glvkspirv` stayed and
+the adapter still reported **nvidia / turing / f16 / subgroup-matrix** - the
+install took **44.0 s against 44.3**. Not one second.
+**Because dpkg DECOMPRESSES the whole archive either way**; `--path-exclude`
+declines to WRITE what comes out of the stream, and the cost here is xz on two
+cores. The dependencies say the same thing from the other side:
+`libnvidia-compute-580` is 335 MB and `libnvidia-gpucomp-580` 70 MB, both
+pulled by `libnvidia-gl`, both bigger than the file savings being chased.
+
 **What is left, and it is small**: the clone shares nothing with apt (one is
 git's network, the other dpkg's lock), so it is started first and waited for
 last - about 5 s of 71. The honest summary is that ~65 s of this is dpkg
