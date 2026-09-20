@@ -2221,6 +2221,30 @@ every later request queued behind it, and the gate failed three arms downstream
 in a route that had nothing wrong with it. **A hang reported far from its
 cause**: read the value before taking the lock.
 
+🔴 **AND THE PAGE NOW SAYS WHERE FOLD RUNS.** `?backend=colab` is in the URL
+and the fold happens on a machine the reader cannot see, so a tab left open
+after the notebook was closed looks exactly like a tab that folds here - and
+the first news of the difference was a fold that went nowhere. The badge in the
+page head names the runtime **and its card** (`nvidia turing` is the GPU,
+`google swiftshader` is the CPU wearing its clothes, and no fold time tells you
+which), its pulse goes amber when that runtime stops answering - at the SAME
+twenty seconds after which a fold in flight gives up, because a badge that
+still says connected while the fold gives up is the page saying two things at
+once - and **Disconnect** puts the page back to folding here, stopping the
+fold on the runtime first so its GPU is not held. Built rather than marked up,
+so a page that folds locally carries none of it.
+
+**The card's name is asked for until it answers, once.** `/health` reaches over
+CDP to the browser on the other side, so it is not a thing to poll; a single
+attempt at load lost the race often enough that the badge read "Colab runtime"
+with no card at all.
+
+**AND THE DOWNLOADS WORK THERE, MEASURED BY CLICKING THEM.** A remote fold's
+buttons read the prediction the RUNTIME sent (`predJson`, the whole object),
+and a button offered over a prediction nobody filled looks identical from the
+outside - so the gate clicks PDB in Colab mode and counts what comes back:
+**478 bytes, 6 atoms** of the structure the runtime produced.
+
 `npm run test:colab` (`tools/check-colab-bridge.py`) is the gate, and it needs
 **no GPU and no weights**. Over the wire: the announcement, a `ping` answered as
 a `pong` (202-414 ms), both clocks, the watermark's idempotence, the 429, and a

@@ -22,7 +22,14 @@ WHAT IT CHECKS, on a real page with a real result in it:
     model is selected - and the SESSION button all the while, because that one
     is about what the viewer is showing rather than about what was predicted.
     A disabled button says why it is off, and takes its own title back when it
-    comes on.
+    comes on - and in Colab mode the PDB button is CLICKED, because a button
+    offered over a prediction the runtime never filled looks identical from
+    the outside;
+  * THE PAGE SAYS WHERE FOLD RUNS: a badge naming the runtime and its card,
+    its pulse going amber when that runtime stops answering - at the same
+    twenty seconds after which a fold in flight gives up, because a badge that
+    still says connected while the fold gives up is the page saying two things
+    at once - and a Disconnect that puts this page back to folding here.
 
 🔴 THE VEIL IS MEASURED AS PIXELS, not as a class. A class name is set by the
 page and says nothing about whether a stylesheet arrived; `.result-pending`
@@ -308,6 +315,103 @@ try:
     if not af2["marked"]:
         bad.append("the AF2 number row changed the family without veiling -"
                    " chosenFamily reads that select too")
+
+    # 5 · AND THE DOWNLOAD ACTUALLY WRITES SOMETHING, in Colab mode, which is
+    #     the question a flag cannot answer: `download-pdb` reads the
+    #     prediction the RUNTIME sent, and a page that is offering a button
+    #     over an empty prediction looks identical from the outside.
+    set_row(reader_ws, "model-family", "af3")
+    wrote = cdp.evaluate(reader_ws, """(async () => {
+      const blobs = [];
+      const made = URL.createObjectURL;
+      URL.createObjectURL = (b) => { blobs.push(b); return made.call(URL, b); };
+      document.getElementById('download-pdb').click();
+      for (let tick = 0; tick < 40 && blobs.length === 0; tick += 1) {
+        await new Promise((done) => setTimeout(done, 100));
+      }
+      URL.createObjectURL = made;
+      const text = blobs[0] ? await blobs[0].text() : '';
+      return { bytes: text.length,
+               atoms: (text.match(/^ATOM/gm) || []).length };
+    })()""")
+    print(f"  the PDB button wrote {wrote['bytes']} bytes,"
+          f" {wrote['atoms']} atoms")
+    if wrote.get("atoms", 0) < 6:
+        bad.append(f"the PDB download wrote {wrote.get('atoms')} atoms in"
+                   " Colab mode - the button is offered over a prediction the"
+                   " runtime did not fill")
+
+    # 6 · THE BADGE: where Fold runs, and whether it is still there.
+    badge = cdp.evaluate(reader_ws, """(() => {
+      const box = document.getElementById('colab-status');
+      if (box === null) return null;
+      return { state: box.dataset.state ?? '',
+               says: box.querySelector('.colab-said')?.textContent ?? '',
+               dot: getComputedStyle(box.querySelector('.colab-dot')).backgroundColor,
+               leave: box.querySelector('button')?.textContent ?? '' };
+    })()""")
+    print(f"  the badge: {badge}")
+    if badge is None:
+        bad.append("a page folding on a Colab runtime says nowhere that it is")
+    else:
+        if badge["state"] != "live":
+            bad.append(f"the badge reads {badge['state']!r} with the runtime"
+                       " answering three times a second")
+        # 🔴 THE CARD'S NAME IS THE POINT OF THE BADGE, not decoration: 'nvidia
+        # turing' is the GPU and 'google swiftshader' is the CPU wearing its
+        # clothes, and a reader cannot tell a slow fold from a CPU fold without
+        # it. Its VALUE is this machine's, so what is asserted is that one
+        # arrived at all.
+        named = badge["says"].split("·")[-1].strip() if "·" in badge["says"] else ""
+        if named == "":
+            bad.append(f"the badge says {badge['says']!r} and never names the"
+                       " card - a CPU fallback reads exactly like a GPU here")
+        if "Colab" not in badge["says"]:
+            bad.append(f"the badge says {badge['says']!r}, which does not name"
+                       " where the fold is running")
+        if badge["dot"] in ("rgba(0, 0, 0, 0)", "rgb(156, 163, 175)"):
+            bad.append("the badge's pulse has no colour of its own - the"
+                       " stylesheet did not arrive")
+        if "isconnect" not in badge["leave"]:
+            bad.append("the badge offers no way back to folding here")
+
+    # 7 · ...and it goes amber when the runtime does. Twenty seconds is the
+    #     fold loop's own bound and the two must agree, so this waits it out.
+    runtime_ws.call("Page.navigate", url="about:blank")
+    gone, deadline = "", time.time() + 45
+    while time.time() < deadline:
+        gone = cdp.evaluate(reader_ws, """(() => {
+          const box = document.getElementById('colab-status');
+          return (box?.dataset.state ?? '') + '|' +
+                 (box?.querySelector('.colab-said')?.textContent ?? '');
+        })()""")
+        if gone.startswith("gone|"):
+            break
+        time.sleep(1.0)
+    print(f"  with the runtime away: {gone!r}")
+    if not gone.startswith("gone|"):
+        bad.append("the runtime went away and the badge still says it is"
+                   " there - a fold pressed now waits out its own bound")
+    runtime_ws.call("Page.navigate",
+                    url=f"{BASE}/index.html?role=runtime&t={TOKEN}")
+
+    # 8 · Disconnect leaves Colab mode, which is the whole of the way back.
+    cdp.evaluate(reader_ws, """(() => {
+      document.getElementById('colab-status').querySelector('button').click();
+      return true;
+    })()""")
+    time.sleep(2.0)
+    cdp.wait_for(reader_ws, "!!window.__entityList", 60, "the page after leaving")
+    after = cdp.evaluate(reader_ws, """(() => ({
+      url: location.search,
+      badge: document.getElementById('colab-status') === null ? 'gone' : 'still here',
+    }))()""")
+    print(f"  after Disconnect: {after}")
+    if "backend=colab" in after["url"]:
+        bad.append(f"Disconnect left the page on {after['url']!r} - it is"
+                   " still folding on the runtime")
+    if after["badge"] != "gone":
+        bad.append("the badge is still up on a page that folds here")
 
     errors = cdp.evaluate(reader_ws, "window.__pageErrors || []")
     if errors:

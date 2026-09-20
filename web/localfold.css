@@ -1198,3 +1198,32 @@
   font-weight: 500;
   line-height: 1.5;
 }
+
+/* WHERE FOLD RUNS, AND WHETHER IT IS STILL THERE.
+   Only ever on a page opened from the notebook's link (?backend=colab), and
+   built by web/colab-bridge.js rather than marked up, so a page that folds in
+   this browser carries nothing of it. The dot is the pulse: green while the
+   runtime page is collecting its commands, amber once it has stopped - which
+   is the same twenty seconds after which a fold in flight gives up. */
+.colab-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px 3px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: #fff;
+  font-size: 12px;
+  color: #374151;
+  white-space: nowrap;
+}
+.colab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9ca3af;
+  flex: 0 0 auto;
+}
+.colab-status[data-state="live"] .colab-dot { background: #22c55e; }
+.colab-status[data-state="gone"] .colab-dot { background: #f59e0b; }
+.colab-status[data-state="gone"] { border-color: #fcd34d; background: #fffbeb; }

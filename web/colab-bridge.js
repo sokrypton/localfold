@@ -343,8 +343,99 @@ export async function remoteHead(signal) {
   return answer.json();
 }
 
+/* ------------------------------------------- ...and whose GPU this page is using */
+
+/**
+ * SAY THAT THIS PAGE IS FOLDING SOMEWHERE ELSE, AND OFFER THE WAY BACK.
+ *
+ * 🔴 NOTHING ON THE PAGE SAID SO. `?backend=colab` is in the URL and the fold
+ * happens on a machine the reader cannot see - so a tab left open after the
+ * notebook was closed looks exactly like a tab that folds here, and the first
+ * news of the difference is a fold that goes nowhere. The badge is the one
+ * place that answers "where does Fold run" and "is that thing still there".
+ *
+ * 🔴 BUILT, NOT MARKED UP, so index.html carries nothing for a mode it is
+ * usually not in - and so a page served from anywhere gets it. Same rule as
+ * py2Dmol's own tab strip.
+ *
+ * 🔴 AND THE HEARTBEAT IS THE ONE THE FOLD LOOP ALREADY USES: `runtimeSeen`
+ * off `/down?head=1`, which is the runtime page's own command poll and costs
+ * the broker nothing. `/health` is asked ONCE, for the card's name, because it
+ * reaches over CDP to the browser on the other side.
+ */
+function installColabStatus() {
+  const head = document.querySelector(".page-head-fold") ?? document.body;
+  const badge = document.createElement("div");
+  badge.id = "colab-status";
+  badge.className = "colab-status";
+  const dot = document.createElement("span");
+  dot.className = "colab-dot";
+  const said = document.createElement("span");
+  said.className = "colab-said";
+  said.textContent = "Colab runtime";
+  const leave = document.createElement("button");
+  leave.type = "button";
+  leave.className = "btn btn-grey btn-small";
+  leave.textContent = "Disconnect";
+  leave.title = "Fold in this browser again. The runtime keeps running - the"
+    + " notebook's link brings you back.";
+  badge.append(dot, said, leave);
+  head.append(badge);
+
+  // 🔴 ASKED UNTIL IT ANSWERS, AND THEN NOT AGAIN. `/health` reaches over CDP
+  // to the browser on the other side, so it is not a thing to poll - and a
+  // single attempt at load lost the race often enough to matter: the badge
+  // read "Colab runtime" with no card, which is the one word that separates a
+  // T4 from SwiftShader wearing its clothes.
+  let card = "";
+  const nameTheCard = async () => {
+    if (card !== "") return;
+    try {
+      const health = await (await fetch(door("/health"))).json();
+      const gpu = health.gpu ?? {};
+      card = [gpu.vendor, gpu.architecture].filter(Boolean).join(" ");
+    } catch (cause) { /* the pulse below is what matters; this is its name */ }
+  };
+
+  let folding = false;
+  const beat = async () => {
+    try {
+      await nameTheCard();
+      const head2 = await remoteHead();
+      folding = !!head2.folding;
+      // 🔴 TWENTY SECONDS IS THE FOLD LOOP'S OWN BOUND, and the two must agree:
+      // a badge that still says connected while `followRemoteFold` is giving
+      // up is the page telling a reader two things at once.
+      const gone = (head2.runtimeSeen ?? 0) > 20000;
+      badge.dataset.state = gone ? "gone" : "live";
+      said.textContent = gone
+        ? "Colab runtime · not answering"
+        : `Colab runtime${card ? ` · ${card}` : ""}`;
+      leave.textContent = folding ? "Stop & disconnect" : "Disconnect";
+    } catch (cause) {
+      badge.dataset.state = "gone";
+      said.textContent = "Colab runtime · unreachable";
+    }
+  };
+  void beat();
+  setInterval(() => void beat(), 3000);
+
+  leave.addEventListener("click", () => {
+    // 🔴 THE RUNTIME IS TOLD FIRST, because leaving a fold running there holds
+    // its GPU and answers the next reader 429 - the same reason the abort
+    // signal posts `stop` rather than just ending its own loop.
+    const done = () => location.assign(location.pathname);
+    if (!folding) return done();
+    remoteCommand("stop", null).catch(() => {}).then(done, done);
+  });
+}
+
 /** Start whichever half of this page is. Called once, by web/app.js. */
 export function installColabBridge() {
+  if (colabRole() === "reader") {
+    installColabStatus();
+    return;
+  }
   if (colabRole() !== "runtime") return;
   // 🔴 ANNOUNCED, SO THE BACKEND KNOWS THE PAGE IS UP WITHOUT ASKING IT.
   // `tools/colab_backend.py` waits for this rather than polling an internal

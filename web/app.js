@@ -5525,7 +5525,10 @@ document.addEventListener("visibilitychange", () => {
 void offerSession();
 
 /**
- * 🔴 AND ON A COLAB RUNTIME THIS PAGE IS THE ONE FOLDING, WITH NOBODY LOOKING.
+ * 🔴 AND ON A COLAB RUNTIME THIS PAGE IS THE ONE FOLDING, WITH NOBODY LOOKING,
+ * while the page a reader OPENED gets the badge that says so - both halves are
+ * `installColabBridge`, because the one question "which half of this am I" has
+ * one answer and should be asked once.
  * `?role=runtime` is the backend saying so: the bridge then announces itself,
  * pushes every status write, bar fraction and sampler frame as it happens, and
  * takes its instructions from the reader's page over the broker. Off that
