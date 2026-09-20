@@ -106,3 +106,22 @@ natives
 
 # Exported weight bundles: gigabytes of generated tensors, never repository content.
 model-*/
+# 🔴 ...AND A SYMLINK TO ONE IS NOT A DIRECTORY. A trailing slash matches only
+# a real directory, so a checkout that points `model` and `model-af3-int5` at
+# weights living elsewhere - which is how a machine with several checkouts
+# shares 265 MB - left every one of them UNTRACKED and visible. It is
+# tools/deploy.py that says so, by refusing to deploy a dirty tree.
+/model
+model-*
+
+# A working copy of a tool, kept on disk and out of the index. `_fold_film.py`
+# is a shorter copy of fold-in-page.py from an earlier session; docs/TOOLS.md
+# is derived from the tools that exist, so a duplicate under its own name
+# would have to be indexed and explained, and a leading underscore says it is
+# somebody's scratch rather than a tool this repository offers.
+tools/_*.py
+
+# A saved py2Dmol session and the merge scratch beside it: local, and written
+# by using the page rather than by developing it.
+/py2dmol_state_*.json
+/_merge_state.json
