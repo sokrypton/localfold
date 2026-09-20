@@ -3389,6 +3389,24 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
       } catch (cause) { console.warn("frame skipped:", cause); }
     }
   }
+  // 🔴 AND THE DOWNLOAD BUTTONS NEED A PREDICTION, WHICH THIS PAGE NEVER MADE.
+  // `activePrediction()` reads `predictions.get(name)` and falls back to
+  // `lastPrediction` - both written by the LOCAL fold paths - so on a remote
+  // fold the buttons were either a silent no-op or, worse, handed back
+  // whatever this tab had folded BEFORE: the wrong structure, downloaded
+  // without a word. The runtime sends its whole prediction object and it is
+  // registered here under THIS page's stem, which is the name the viewer knows
+  // the object by and therefore the one `activePrediction` looks up.
+  if (result.predJson) {
+    try {
+      const remote = JSON.parse(result.predJson);
+      remote.stem = stem;
+      lastPrediction = remote;
+      predictions.set(stem, remote);
+    } catch (cause) {
+      console.warn("the runtime's prediction did not parse:", cause);
+    }
+  }
   // ...and the runtime's own summary, which already reads the way this page's
   // status line does - it is the same code, on the other machine.
   status(result.status || `${label} · folded on the runtime`);

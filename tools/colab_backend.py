@@ -112,7 +112,19 @@ READBACK_JS = """(async () => {
   // loadIntoViewer. The alignment can be megabytes and the matrices are n^2,
   // so they travel only when they exist.
   const pred = (window.__lastPrediction && window.__lastPrediction()) || {};
+  // 🔴 THE WHOLE OBJECT, AS A STRING, AND NOT FIELD BY FIELD. The archive the
+  // download button writes reads `stem`, `model`, `settings`, `entities`,
+  // `msas`, `msaOrigin`, `confidence`, `chainLengths` and more; naming them
+  // here is the field-by-field rebuild this repository has been bitten by six
+  // times, and the failure is always silent - the button writes a zip with a
+  // piece missing. JSON.stringify with a replacer because CDP returns JSON:
+  // a Float32Array crossing it becomes {"0":...,"1":...}, which every reader
+  // downstream treats as an object with no length.
+  const predJson = JSON.stringify(pred, (key, value) =>
+    (ArrayBuffer.isView(value) && !(value instanceof DataView))
+      ? Array.from(value) : value);
   return {
+    predJson,
     a3m: pred.a3m ?? null,
     confidence: pred.confidence ?? null,
     scores: pred.scores ?? null,
