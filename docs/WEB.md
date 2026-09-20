@@ -2191,6 +2191,36 @@ cores. The dependencies say the same thing from the other side:
 `libnvidia-compute-580` is 335 MB and `libnvidia-gpucomp-580` 70 MB, both
 pulled by `libnvidia-gl`, both bigger than the file savings being chased.
 
+🔴 **AND "DOWNLOAD ONLY THE VULKAN PART" DOES NOT WORK, THOUGH THE REASON IS
+NOT THE ONE IT LOOKS LIKE.** The working driver's own memory map names what it
+loads, and it is **`/usr/lib64-nvidia/`** - Colab's own directory, already on
+the image, at **580.82.07, the version the kernel module is**. That looks like
+the whole 44 s being free. It is not: registering it (a line in
+`ld.so.conf.d`, `ldconfig`, and a hand-written `nvidia_icd.json`) takes the
+setup to **11.2 s** and the Vulkan loader then says exactly why it is useless -
+
+```
+loader_scanned_icd_add: Could not get 'vkCreateInstance' via
+'vk_icdGetInstanceProcAddr' for ICD /usr/lib64-nvidia/libGLX_nvidia.so.0
+```
+
+That build has **no Vulkan entry point at all**: Colab ships the GLX/EGL
+userspace, not the ICD. So the Vulkan driver must be fetched, and the
+`.deb` must be dpkg-INSTALLED: downloading `libnvidia-gl` + `libnvidia-gpucomp`
+and extracting them (14.6 s) fails the same way, even with an **absolute**
+`library_path` - which was a real bug in the earlier attempts, since a relative
+one resolves through `ld.so` to Colab's non-Vulkan copy - and even though
+`nm -D` confirms the extracted library DOES export `vk_icdGetInstanceProcAddr`.
+It exports the symbol and returns null from it, which is a driver declining to
+initialise.
+🔴 **AND IT IS NOT A VERSION MISMATCH, WHICH WAS THE OBVIOUS SUSPECT.** The
+kernel module is 580.82.07 and **no repository offers it** - the candidates are
+178.04, 173.02, 167.08 - so the apt install mismatches the kernel exactly as
+the extraction does, and only one of them works. Whatever dpkg does for this
+package that `dpkg-deb -x` plus `ldconfig` does not is **unexplained**, and
+three attempts have now ended there. Do not start a fourth without a new idea
+about what that is.
+
 **What is left, and it is small**: the clone shares nothing with apt (one is
 git's network, the other dpkg's lock), so it is started first and waited for
 last - about 5 s of 71. The honest summary is that ~65 s of this is dpkg
