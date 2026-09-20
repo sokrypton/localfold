@@ -2049,6 +2049,17 @@ and the remote fold all record what they ingested; the remote one reads the
 runtime's own label through `familyFromLabel`, because an attached reader is
 watching a fold it did not start and its own row may say anything.
 
+🔴 **AND THE DOWNLOAD ROW MAKES THE SAME CLAIM ONE CONTROL ALONG.** Both
+handlers read `activePrediction()` and return in SILENCE when there is none, so
+before the first fold the row offered files that do not exist, and under
+another model it offered the fold the veil is covering. `syncDownloads` is the
+one rule: the structure and the archive follow the FOLD - present, and this
+model's - and **the Session button follows what is DRAWN**, because py2Dmol's
+session is everything the viewer is showing and a dropped file or a restored
+session is as much of that as a fold. A disabled button says why it is off and
+takes its own title back when it comes on, which is what `dataset.title` is
+keeping. The row itself is hidden when nothing at all is available.
+
 `npm run test:pending` (`tools/check-model-pending.py`) is the gate, and it
 **measures the veil as pixels**: a class name is set by the page and says
 nothing about whether a stylesheet arrived, so the structure box is

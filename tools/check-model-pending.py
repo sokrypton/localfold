@@ -16,7 +16,13 @@ WHAT IT CHECKS, on a real page with a real result in it:
     a stale pLDDT reads as a measurement rather than as a leftover;
   * moving it BACK unveils, because the result really is that model's;
   * and the AF2 number row does it too, since `chosenFamily` reads that select
-    as well and a veil hung on one row only is a model switched in silence.
+    as well and a veil hung on one row only is a model switched in silence;
+  * THE DOWNLOAD ROW OFFERS WHAT THERE IS TO DOWNLOAD: nothing before the
+    first fold, the fold's own files once there is one, neither while another
+    model is selected - and the SESSION button all the while, because that one
+    is about what the viewer is showing rather than about what was predicted.
+    A disabled button says why it is off, and takes its own title back when it
+    comes on.
 
 🔴 THE VEIL IS MEASURED AS PIXELS, not as a class. A class name is set by the
 page and says nothing about whether a stylesheet arrived; `.result-pending`
@@ -97,6 +103,21 @@ def veil_of(ws, box_id):
     })()""" % json.dumps(box_id))
 
 
+def downloads_of(ws):
+    """What the row offers, as a reader finds it: on, off, and why."""
+    return cdp.evaluate(ws, """(() => {
+      const row = document.getElementById('downloads');
+      const one = (id) => {
+        const button = document.getElementById(id);
+        return button === null ? null
+          : { off: button.disabled, why: button.getAttribute('title') ?? '' };
+      };
+      return { shown: row === null ? null : getComputedStyle(row).display,
+               pdb: one('download-pdb'), all: one('download-all'),
+               session: one('saveStateButton') };
+    })()""")
+
+
 def set_row(ws, row_id, value):
     cdp.evaluate(ws, """(() => {
       const row = document.getElementById(%s);
@@ -165,6 +186,17 @@ try:
         bad.append("the reader never attached to the held fold, so no result"
                    " could be put in front of it")
 
+    # 0 · BEFORE ANYTHING IS FOLDED, there is nothing to download and the row
+    #     says so. A button that writes nothing is worse than no button: both
+    #     download handlers read `activePrediction()` and return in silence.
+    empty = downloads_of(reader_ws)
+    print(f"  with nothing folded: row {empty['shown']},"
+          f" pdb off={empty['pdb']['off']} session off={empty['session']['off']}")
+    if empty["shown"] != "none":
+        bad.append("the download row is up before anything has been folded")
+    if not empty["pdb"]["off"] or not empty["all"]["off"]:
+        bad.append("the structure downloads are live with no structure to give")
+
     # THE RESULT, as a fold's own ingestion sees it: the structure AND the
     # prediction behind it, whose `model` is how the page knows whose it is.
     cdp.evaluate(runtime_ws, """(async () => {
@@ -195,7 +227,14 @@ try:
         bad.append("no result reached the page, so the rest of this measures"
                    " an empty viewer")
 
-    # 1 · its own model's row: no veil.
+    # 1 · its own model's row: no veil, and the files are there.
+    ready = downloads_of(reader_ws)
+    print(f"  with a fold on screen: row {ready['shown']},"
+          f" pdb off={ready['pdb']['off']} session off={ready['session']['off']}")
+    if ready["shown"] == "none":
+        bad.append("a fold landed and the download row stayed hidden")
+    if ready["pdb"]["off"] or ready["all"]["off"] or ready["session"]["off"]:
+        bad.append("a fold landed and its own downloads are still off")
     rest = veil_of(reader_ws, "canvasContainer")
     before = box_shot(reader_ws)
     print(f"  under AlphaFold 3: marked={rest['marked']} says={rest['says']}")
@@ -224,6 +263,20 @@ try:
                    " a stale pLDDT reads as a measurement")
     if not map_veil["marked"]:
         bad.append("the contact map is not veiled, only the structure")
+    # ...and the files go with the picture, because offering the covered
+    # model's structure is the same claim the veil exists to stop making.
+    veiled = downloads_of(reader_ws)
+    print(f"  under Boltz-2:      pdb off={veiled['pdb']['off']}"
+          f" ({veiled['pdb']['why']!r}) session off={veiled['session']['off']}")
+    if not veiled["pdb"]["off"] or not veiled["all"]["off"]:
+        bad.append("the downloads still offer the other model's fold while"
+                   " its picture is veiled - the same claim, one control along")
+    if "another model" not in (veiled["pdb"]["why"] or ""):
+        bad.append(f"the disabled download says {veiled['pdb']['why']!r},"
+                   " which does not say why it is off")
+    if veiled["session"]["off"]:
+        bad.append("the session download went off with the fold's - it is"
+                   " about what the VIEWER is showing, which has not changed")
     if before == after:
         bad.append("the structure box is pixel-identical before and after the"
                    " switch - nothing was actually drawn over it")
@@ -239,6 +292,13 @@ try:
                    " veil up - the answer on screen is that model's")
     if back["scores"] == "none":
         bad.append("the confidence card did not come back with its own model")
+    restored = downloads_of(reader_ws)
+    if restored["pdb"]["off"] or restored["all"]["off"]:
+        bad.append("the downloads did not come back with the model that made"
+                   " the fold on screen")
+    if restored["pdb"]["why"] != ready["pdb"]["why"]:
+        bad.append(f"the button came back wearing the reason it was off:"
+                   f" {restored['pdb']['why']!r}")
 
     # 4 · the AF2 number row moves the family too.
     set_row(reader_ws, "model-family", "monomer")

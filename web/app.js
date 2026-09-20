@@ -441,9 +441,54 @@ function reportModelFromUrl(attempt = 0) {
  * way out of the veil is the button it names, and a reader who did not mean to
  * change the row is told which row they are now on.
  */
+/** Is what is on screen another model's answer? One question, three readers. */
+const resultIsStale = () => shownFamily !== undefined && shownFamily !== chosenFamily();
+
+/**
+ * THE DOWNLOAD ROW OFFERS WHAT THERE IS TO DOWNLOAD, AND NOTHING ELSE.
+ *
+ * 🔴 A BUTTON THAT WRITES NOTHING IS WORSE THAN NO BUTTON. `download-pdb` and
+ * `download-all` read `activePrediction()` and return silently when there is
+ * none - so before the first fold, and under a model that did not make what is
+ * on screen, the row offered files that either do not exist or belong to the
+ * model the veil is covering. The same claim as the veil, one control along.
+ *
+ * 🔴 AND THE SESSION BUTTON ASKS A DIFFERENT QUESTION, so it gets a different
+ * answer: py2Dmol's session is everything the VIEWER is showing, which a
+ * dropped file and a restored session are as much as a fold - it follows what
+ * is drawn, not what was predicted, and a fold's own downloads follow the fold.
+ */
+function syncDownloads() {
+  const pred = activePrediction();
+  const foldable = !!(pred && pred.pdb) && !resultIsStale();
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  const drawn = Object.keys(renderer?.objectsData ?? {}).length > 0;
+  const offer = (id, on, why) => {
+    const button = document.getElementById(id);
+    if (button === null) return;
+    // The button's own title is kept the first time it is seen, because the
+    // reason it is off has to give way to what it does when it comes back.
+    if (button.dataset.title === undefined) {
+      button.dataset.title = button.getAttribute("title") ?? "";
+    }
+    button.disabled = !on;
+    button.setAttribute("title", on ? button.dataset.title : why);
+  };
+  offer("download-pdb", foldable, resultIsStale()
+    ? "the structure on screen was folded by another model - press Fold"
+    : "nothing has been folded yet");
+  offer("download-all", foldable, resultIsStale()
+    ? "this fold belongs to another model - press Fold"
+    : "nothing has been folded yet");
+  offer("saveStateButton", drawn, "the viewer is empty");
+  const row = document.getElementById("downloads");
+  if (row !== null) row.style.display = (foldable || drawn) ? "flex" : "none";
+}
+
 function syncPendingResult() {
   const family = chosenFamily();
-  const stale = shownFamily !== undefined && shownFamily !== family;
+  const stale = resultIsStale();
   const label = MODEL_LABELS[family] ?? family;
   for (const id of ["canvasContainer", "heatmapContainer"]) {
     const box = document.getElementById(id);
@@ -453,6 +498,9 @@ function syncPendingResult() {
     else delete box.dataset.pending;
   }
   updateScoresCard(stale ? undefined : activePrediction()?.confidence);
+  // ...and the files follow the same rule, because offering the covered
+  // model's structure is the claim the veil exists to stop making.
+  syncDownloads();
 }
 
 /** What is on screen came from `family` - or from nothing nameable. */
@@ -2682,7 +2730,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     };
     predictions.set(stem, lastPrediction);
     resultIsFrom(family);
-    element("downloads").style.display = "flex";
+    syncDownloads();
     void rememberSessionWhenSettled(lastPrediction);
     // ...and the reader keeps the view they had. A reload flies to its own,
     // which after watching a fold reads as the structure jumping at the end.
@@ -3289,7 +3337,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     msas: {},
     templates: undefined,
   };
-  element("downloads").style.display = "flex";
+  syncDownloads();
     void rememberSessionWhenSettled(lastPrediction);
 
   esmfold2Trunk = result.reusable === undefined ? esmfold2Trunk
@@ -4370,7 +4418,7 @@ async function fold(event) {
       });
     }
     // ...shown beside the PAE panel, which appears at the same moment.
-    element("downloads").style.display = "flex";
+    syncDownloads();
     void rememberSessionWhenSettled(lastPrediction);
     // 🔴 THE CARD SCORES WHAT WILL BE SAVED, which is the best pass and not
     // always the last. Showing the last pass's numbers beside a download of the
@@ -5417,7 +5465,7 @@ async function restoreSession() {
     predictions.set(stem, restored);
     lastPrediction = restored;
     // ...and the buttons are shown only when there is something behind them.
-    element("downloads").style.display = restored.pdb === undefined ? "none" : "flex";
+    syncDownloads();
 
     // 🔴 THE MODULE'S OWN HANDLES ARE RE-POINTED. `refreshHeatmap` reads
     // `viewer` and `viewerObject`, which are set when a FOLD loads a structure
@@ -5487,3 +5535,11 @@ void offerSession();
 installColabBridge();
 // ...and if one is already under way on the runtime, follow it from here.
 void attachToRunningFold();
+
+// 🔴 THE DOWNLOAD ROW IS ASKED AT LOAD AND WHENEVER THE VIEWER'S CONTENT MOVES,
+// not only when a fold ends. A structure can arrive without a fold - a dropped
+// file, a restored session - and the Session button belongs to what is DRAWN,
+// so the one event py2Dmol dispatches when frames land is what tells us. That
+// bus is document-scoped, which is what this page has one viewer for.
+syncDownloads();
+document.addEventListener("py2dmol-frame-change", syncDownloads);
