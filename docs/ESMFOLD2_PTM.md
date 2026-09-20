@@ -1,6 +1,7 @@
 # A phosphoserine, three implementations of ESMFold2
 
-🔴 **THIS IS A BRIEF FOR THE af3-any-model SIDE, NOT A FINDING OF OURS.** The
+🔴 **THIS IS A BRIEF FOR THE `sokrypton/alphafold3` SIDE - af3-any-model,
+now merged to `main` - AND NOT A FINDING OF OURS.** The
 vendor's own `esm` package places a modified residue correctly; two independent
 ports of the same checkpoint do not. Same shape as docs/BOLTZ2_PTM.md, and
 found the same way — by running the vendor implementation after the port
@@ -82,11 +83,23 @@ control holds at 1.00 — a converging sampler moving away from the chemistry.
 # the vendor, with the ligand arm that separates the two bugs
 ~/venv_ef2/bin/python tools/esmc/probe-esmfold2-modified.py --ligand=GOL
 
-# af3-any-model, from a clone of sokrypton/alphafold3
+# af3-any-model - which is sokrypton/alphafold3 MAIN now, not a branch
+git clone --depth 1 https://github.com/sokrypton/alphafold3
 python run_alphafold.py --model=esmfold2_lm600m --use_esm_embeddings \
   --norun_data_pipeline --weights_precision=fp32 \
   --json_path=sep_job.json --output_dir=out/
 ```
+
+🔴 **CLONE IT; DO NOT USE THE COPIES ON THIS BOX.** `~/af3fork` and
+`~/af3src/alphafold3-af3-any-model` are non-git SNAPSHOTS and are behind main -
+`run_alphafold.py` differs. Measured here against main at `301cc16`.
+
+🔴 **AND ITS LAUNCHER WANTS ITS OWN PACKAGE VERSION.** A fresh clone run against
+the `alphafold3` installed in a venv dies on `model_registry.AF2_SPECS`; with
+`PYTHONPATH=<clone>/src` it then wants the compiled `cpp` extension and the
+generated `*.pickle` data, which are build products and live only in the
+installed copy. Symlinking those two across the clone is enough for an
+inference run, and is what these numbers were taken through.
 
 🔴 The job JSON needs `"unpairedMsa": ""`, `"pairedMsa": ""` and
 `"templates": []` explicitly, or `validate_fold_input` refuses it with "Protein

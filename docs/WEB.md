@@ -1764,7 +1764,7 @@ JavaScript rather than from a page.
 nothing here had asked the second question.
 
 First, the corpus is complete and faithful. Checked against the upstream
-checkout on this box (`~/af3fork/examples/`): **all thirteen are byte-identical**
+checkout (`sokrypton/alphafold3` main, whose `examples/` this is; re-checked against a fresh clone 2026-09-20, since `~/af3fork` on this box is a non-git snapshot and is behind): **all thirteen are byte-identical**
 to ours, with `alphafold_input.json` the extra kitchen-sink from
 `src/alphafold3/common/test_data/`. Nothing has been added upstream that we
 lack, and nothing here was edited.
