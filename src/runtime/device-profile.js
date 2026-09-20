@@ -970,8 +970,34 @@ const PRIORS = new Map([
   // tokens take a block of ONE" is that card's memory system turning over;
   // here block ONE is the WORST arm at every size measured, so the threshold
   // would be exactly backwards.
+  // 🔴 AND THE GRID ATTENTION WANTS THE MATRIX PATH, WHICH IS 8-12% OF THE
+  // WHOLE TRUNK. `grid.attend` is the largest kernel in an AF3 pairformer
+  // (15.4% at 300 tokens and 512 rows) and this part has the units for it -
+  // the adapter reports `shader-f16` AND
+  // `chromium-experimental-subgroup-matrix`. Measured on the trunk with the
+  // arms ALTERNATED against a baseline, because this card throttles (below):
+  //
+  //     round 1   base 5383.3   matrix 5105.5   base 5713.3    -8.0%
+  //     round 2   base 6173.3   matrix 5633.6   base 6591.7   -11.7%
+  //
+  // `steady.pairformer` agrees independently, -7.3% and -13.7%. The tile is
+  // ampere's 4x32 and was NOT swept here - it is the value that was measured,
+  // not the value that was chosen.
+  //
+  // 🔴 `pairTransitionSplit` IS NOT TAKEN, measured in the same two rounds at
+  // -1.2% and -1.3%, which is this box's noise.
+  //
+  // 🔴 AND A T4 IN COLAB THROTTLES HARD, WHICH IS WHY EVERY ARM HERE IS
+  // MEASURED NEXT TO A BASELINE. Under sustained load it sat at 81 C, **585
+  // MHz against a 1590 MHz boost clock**, 71.3 W against a 70 W limit - and
+  // by the end of an eight-run sweep it was at 360 MHz. The baseline rose
+  // 5383 -> 6592 (+22%) across four minutes of that. A sweep that compares an
+  // arm with a baseline taken ten minutes earlier is measuring the
+  // temperature; nothing in this entry was taken that way.
   ["turing", {
     opmBlockI: 8,
+    gridAttendMatrix: true,
+    gridAttendMatrixTile: "4x32",
   }],
   // Apple M2, 10 cores, macOS 13.2, Chrome 152 - the machine docs/PERF.md is
   // measured on, reporting {vendor: "apple", architecture: "metal-3"}.
