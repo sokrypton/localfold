@@ -61,8 +61,9 @@ LOCK = threading.Lock()
 # answered POST /fold with the finished structure, which is correct and is
 # also a page that sits blank for the whole fold: no bar, no status, no
 # sampler frames. A job the client POLLS carries all three while they happen.
-# The blocking form is kept for the notebook cells that use it - `stream` is
-# what asks for the other one.
+# `stream` is what asks for it, and notebooks/localfold.ipynb's page always
+# does. The blocking form is the one-shot door left for a curl - no shipped
+# caller uses it, and the two notebooks that did were retired.
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -468,8 +469,8 @@ def serve(port, backend, token, host="127.0.0.1"):
                 return self._json(400, {"error": f"not JSON: {cause}"})
             if not LOCK.acquire(blocking=False):
                 return self._json(429, {"error": "one GPU, one fold: try again"})
-            # The blocking form, which the notebook's own fold cell uses: the
-            # answer IS the structure.
+            # The blocking form: the answer IS the structure. Nothing in the
+            # tree asks for it; it is the door a curl has.
             if not request.get("stream"):
                 try:
                     return self._json(200, backend.fold(request))

@@ -3263,9 +3263,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
  * WHERE THIS FOLD HAPPENS, AND HOW TO ASK.
  *
  * 🔴 THE PAGE IS SERVED BY THE THING THAT FOLDS, so this is SAME-ORIGIN and
- * there is no CORS question at all: `notebooks/localfold-colab.ipynb` runs
+ * there is no CORS question at all: `notebooks/localfold.ipynb` runs
  * tools/colab_backend.py on the runtime, that server serves this checkout,
- * and the iframe in the cell loads index.html from it. `?backend=colab` is
+ * and the link that cell prints opens index.html on it. `?backend=colab` is
  * the cell saying which of the two machines should do the work, and `t` is
  * the token that server requires of every request - it is in the URL because
  * a page cannot be handed a header by whoever framed it.

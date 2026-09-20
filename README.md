@@ -5,6 +5,8 @@ machine. No account, no queue, no upload of your sequence to a fold server.
 
 **[localfold.org](https://localfold.org)**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/sokrypton/localfold/blob/main/notebooks/localfold.ipynb)
+
 ## What it does
 
 | Page | What it is for |
