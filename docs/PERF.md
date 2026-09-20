@@ -1435,6 +1435,43 @@ effect has measured nothing. At 308 residues the same test was a 2% wash. The
 kernel bench is GPU-timed and repeats to 3%; wall-clock through a browser, a
 web server and a fold pipeline does not.
 
+### The block of eight is 2.1x on the kernel and ~5% on the stack it lives in
+
+🔴 **AND THE HONEST NUMBER IS THE SECOND ONE.** `bench-opm` measures
+`opm.contract` alone; a trunk runs it beside everything else. Downloading the
+int5 weights onto the runtime (265 MB in **7 s** from HuggingFace) makes
+`bench-trunk --profile` reachable, and at 300 tokens with 512 MSA rows, with
+the unrecognised arm run twice to bracket it:
+
+| | whole | msa-stack | pairformer | gpuTotal |
+|---|---:|---:|---:|---:|
+| without the prior | 6453 | 1240 | 4118 | 5499.8 |
+| **with `opmBlockI: 8`** | 6909 | **1181** | 4345 | 5409.2 |
+| without, run last | 6755 | 1291 | 4300 | 5735.1 |
+
+The `msa-stack` - the only stage the knob touches - falls below the control's
+own 1240-1291 range. **The whole trunk does not move outside the noise**, and
+the reason is arithmetic rather than mysterious: the msa-stack is 19% of this
+trunk and the pairformer is 64%. A 2.1x on one kernel inside a fifth of the
+work cannot be a fold-level 2x, and this file should not be read as claiming
+one. The prior is kept because it is a measured win on its kernel with
+identical numerics and no regression anywhere else - and it grows with MSA
+depth, which is the case the knob is for.
+
+🔴 **AND WALL-CLOCK THROUGH THE BACKEND COULD NOT SEE IT EITHER WAY.** Folding
+the same protein with a real MSA search, three warm runs an arm: without the
+prior 5410 and 4796 ms, with it 5981 and 5944, without it again 5980 and 5417.
+The two unrecognised arms span 4796-5980, so that instrument had no resolution
+to offer - it neither confirms nor refutes the trunk profile, and a reading
+taken from it alone would have been a coin toss reported as a result.
+
+**So the fold-level lever on this device is the pairformer, not the OPM** - 64%
+of the trunk - and the knobs that exist for it (Ampere's triangle entries) all
+LOSE here, individually, per the table above. `grid.attend` is flat across its
+own arms too (chunk16/32/64 at 121.2/120.5/120.4 ms), so the shipped geometry
+is already its best. Whatever is left on a T4 is a new kernel shape rather than
+a value in the existing tables.
+
 **What is still open on this device**: `linearTallTile` is free and might pay
 on kernels this bench does not cover; the tensor-core path is reachable here
 (this adapter reports `shader-f16` AND `chromium-experimental-subgroup-matrix`,
