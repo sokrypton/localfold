@@ -184,6 +184,15 @@ class Backend:
         })()""" % (json.dumps(entities), json.dumps(controls)))
         cdp.wait_for(self.ws, "!document.getElementById('predict').disabled", 120,
                      "the fold button")
+        # 🔴 AND THE PAGE MAY ALREADY BE FOLDING, which the button does not
+        # say (it stays enabled throughout - it is how you stop one). Clicking
+        # on top of a running fold is how the hold above came about: the second
+        # click did nothing, no new object appeared, and the watcher waited.
+        # A percentage in the status line is the page saying it is busy.
+        said = cdp.evaluate(self.ws,
+                            "document.getElementById('status-message')?.textContent ?? ''")
+        if "%" in (said or ""):
+            return {"error": "the runtime is already folding", "status": said}
         # 🔴 THE LAST FOLD IS STILL ON THE PAGE, AND ITS DOWNLOAD BUTTON
         # STILL WORKS - so "a structure exists" is not "this fold made one".
         # Asking for one after pressing Fold answered with the PREVIOUS
@@ -209,7 +218,14 @@ class Backend:
         # that had already finished. The objects were cleared above, so "an
         # object with frames exists" is monotonic, is this fold's, and is true
         # exactly once the fold has produced something.
-        deadline = time.time() + request.get("timeout", 1800)
+        # 🔴 THE HOLD IS BOUNDED, AND NOT BY THE CALLER ALONE. A fold that
+        # never starts - because the page was already folding when the click
+        # landed - leaves this loop waiting out its whole timeout with the
+        # GPU's lock in its hand, and every request behind it answered 429.
+        # Measured: two folds fired back to back left the runtime `busy: true`
+        # for minutes with nothing running. Five minutes is longer than any
+        # fold this backend has been asked for and short enough to forgive.
+        deadline = time.time() + min(request.get("timeout", 300), 1800)
         while True:
             state = cdp.evaluate(self.ws, """(() => {
               const reg = window.py2dmol_viewers || {};
