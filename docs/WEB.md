@@ -2111,6 +2111,24 @@ coming, so `runFold` asks the page: `status(text, true)` marks the line
 replaces ("stopped", "failed", "refus") was a guess at the page's vocabulary
 kept in another file in another language.
 
+🔴 **AND A RELOADED RUNTIME PAGE REPLAYED THE WHOLE SESSION - FOUND BY AN ARM
+WRITTEN FOR SOMETHING ELSE.** The page polled `/out` from zero, so coming back
+from any reload it obeyed every command the notebook had ever sent. The
+heartbeat arm navigates that page away and back, and it came back and re-ran a
+fold from an arm ten minutes earlier: 681 MB of weights fetched and a real
+58-residue fold on a developer's laptop, reported in the gate's own output as
+*"AlphaFold 3 · 58 residues · in 3 s · pLDDT 68.7"*. A page that has just
+loaded is not owed the past, so it starts at the queue's current head
+(`/out?head=1`).
+
+🔴 **AND THAT FOLD MADE A MUTATION PASS.** The frames arm asked for "three or
+more frames", which a 58-residue fold satisfies handsomely - so the mutation
+it was written for (frames collected and never drawn) walked straight through
+it. The assertion names the structure it pushed now: **three frames of exactly
+four positions**, which is the gate's own four alpha carbons and nothing else.
+The weights stay blocked for the whole run, too: **nothing in this gate may
+ever fold**.
+
 🔴 **AND A RUNTIME THAT HAS GONE MUST NOT BE POLLED FOR EVER.** Colab recycles
 a runtime when the notebook is closed or left idle, and the busy flag is raised
 by the BROKER and lowered by the PAGE - so a page that died mid-fold took the
@@ -2165,6 +2183,18 @@ command, and a page that cannot collect its commands never finishes it, which
 makes the state deterministic instead of a race against a real fold's first
 seconds. A page opened then reads *"a fold is already running on the runtime -
 following it"*.
+
+🔴 **AND THAT HELD FOLD IS WHAT FINALLY REACHES THE FRAMES AND THE INGESTION,
+which are the reader's own code at the end of every remote fold and were
+covered by nothing.** With the fold held and a reader attached, three frames
+are pushed from the runtime page through its own `tapOut` - four alpha carbons
+that MOVE between frames, so "the frames arrived" cannot be satisfied by one
+frame drawn three times - and then a `result`. The attached page draws **3 of
+3** and ends reading its status with **4 positions drawn**, which is
+`loadIntoViewer`, the sequence strip and the download buttons having been
+handed a structure. No weights, no card, no fold: the transport carries a
+structure that was written down in the gate. Mutated (frames collected but not
+drawn): 0 of 3.
 
 AND THE RUNTIME GOING AWAY is the ninth arm: the runtime page is navigated to
 `about:blank` - a page with no `role` runs no bridge, which is exactly what a

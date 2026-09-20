@@ -67,6 +67,19 @@ READER_CDP_PORT = int(os.environ.get("BRIDGE_READER_CDP_PORT", "9392"))
 # travels the way a fold's would. Without this the arm downloads hundreds of
 # megabytes from huggingface to prove a transport.
 WEIGHTS = "*huggingface.co*"
+# 🔴 A STRUCTURE SMALL ENOUGH TO WRITE DOWN, because the frame path and the
+# ingestion at the end of a remote fold are the reader's own code and nothing
+# else here reaches them: no weights means no real frames, and a fold is the
+# one thing this gate cannot drive. Four alpha carbons is a structure to
+# py2Dmol - it draws a tube through them - and the third frame moves them, so
+# "the frames arrived" cannot be satisfied by one frame drawn three times.
+def tiny_pdb(shift):
+    rows = []
+    for i in range(4):
+        rows.append(
+            "ATOM  %5d  CA  ALA A%4d    %8.3f%8.3f%8.3f  1.00 50.00           C"
+            % (i + 1, i + 1, 3.8 * i + shift, 0.0, 0.0))
+    return "\n".join(rows) + "\nEND\n"
 TOKEN = "check-colab-bridge-token"
 BASE = f"http://127.0.0.1:{PORT}"
 
@@ -208,6 +221,11 @@ try:
                 runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
                 break
         runtime_ws.call("Network.enable")
+        # 🔴 AND IT STAYS BLOCKED FOR THE REST OF THE RUN. Unblocking at the
+        # end of this arm let a REPLAYED fold command - the reload bug the
+        # heartbeat arm exposed - fetch 681 MB of weights and actually fold,
+        # which then filled the viewer the arms below were reading and made a
+        # mutation pass. Nothing in this gate may ever fold.
         runtime_ws.call("Network.setBlockedURLs", urls=[WEIGHTS])
 
         reader, reader_ws = cdp.launch(READER_CDP_PORT, "/tmp/localfold-bridge-reader")
@@ -297,11 +315,6 @@ try:
         if seen.get("errors"):
             bad.append(f"the reader's page threw: {seen['errors'][:2]}")
     finally:
-        if runtime_ws is not None:
-            try:
-                runtime_ws.call("Network.setBlockedURLs", urls=[])
-            except Exception:                                 # noqa: BLE001
-                pass
         if reader is not None:
             reader.kill()
 
@@ -389,6 +402,12 @@ try:
                 break
         code, said = call("/health")
         fresh = said.get("runtimeSeen")
+        # 🔴 THE WATERMARK IS TAKEN HERE, not carried down from an arm above:
+        # the first version of the replay check counted the READER ARM's own
+        # fold - which happened before this - and reported the fix as broken.
+        # An arm's baseline is the state immediately before it.
+        code, head = call("/down?head=1")
+        since = head.get("n", since)
         # Away: a page with no `role` in its URL runs no bridge, so the polls
         # stop exactly as they would if the runtime had been taken away.
         runtime_ws.call("Page.navigate", url="about:blank")
@@ -411,6 +430,18 @@ try:
             time.sleep(0.5)
         print(f"  heartbeat: {fresh} ms fresh, {grew} ms with the page away,"
               f" {back} ms once it is back")
+        # 🔴 AND A RELOADED PAGE DOES NOT REPLAY THE SESSION. It polled from
+        # zero, so coming back it obeyed every command the notebook had ever
+        # sent: measured here as a fold from an arm ten minutes earlier being
+        # run again, weights and all. What it is owed is what happens NEXT.
+        code, said = call(f"/down?since={since}")
+        since = said.get("n", since)
+        replayed = [e for e in (said.get("events") or [])
+                    if e.get("kind") in ("fold-begin", "result")]
+        if replayed:
+            bad.append(f"the reloaded runtime page replayed {len(replayed)}"
+                       " command event(s) - it starts from zero rather than"
+                       " from where the queue stands")
         if fresh is None or fresh > 3000:
             bad.append(f"a live runtime page reads {fresh} ms since its last"
                        " command poll - the heartbeat is not beating")
@@ -453,6 +484,13 @@ try:
 
         late, late_ws = cdp.launch(READER_CDP_PORT + 1, "/tmp/localfold-bridge-late")
         try:
+            late_ws.call("Page.enable")
+            late_ws.call("Page.addScriptToEvaluateOnNewDocument", source="""
+              window.__pageErrors = [];
+              addEventListener('error', (e) => window.__pageErrors.push(String(e.message)));
+              addEventListener('unhandledrejection',
+                (e) => window.__pageErrors.push('unhandled: ' + String(e.reason)));
+            """)
             late_ws.call("Page.navigate", url=(
                 f"http://127.0.0.1:{PORT}/index.html?backend=colab&t={TOKEN}"))
             cdp.wait_for(late_ws, "!!window.__entityList", 120, "the late reader")
@@ -467,6 +505,83 @@ try:
             if "already running" not in attached:
                 bad.append("a page opened while the runtime was folding sat"
                            " idle - it did not attach to the fold")
+
+            # ...AND WHAT IT DOES WITH WHAT ARRIVES. Frames pushed from the
+            # runtime page must be DRAWN by the reader, and the `result` must
+            # be INGESTED - `loadIntoViewer`, the sequence strip, the download
+            # buttons - which is the reader's own code at the end of every
+            # remote fold and is otherwise reached only by folding.
+            for index in range(3):
+                cdp.evaluate(held, """(async () => {
+                  const bridge = await import('/web/colab-bridge.js');
+                  bridge.tapOut('status', 'sampler %d of 3');
+                  bridge.tapOut('progress', %f);
+                  bridge.tapOut('frame', %s);
+                  return true;
+                })()""" % (index + 1, (index + 1) / 3.0,
+                           json.dumps(tiny_pdb(index * 2.0))))
+                time.sleep(0.4)
+            drew, deadline = {}, time.time() + 30
+            while time.time() < deadline:
+                drew = cdp.evaluate(late_ws, """(() => {
+                  const reg = window.py2dmol_viewers || {};
+                  const r = reg[Object.keys(reg)[0]] &&
+                            reg[Object.keys(reg)[0]].renderer;
+                  const o = r && r.objectsData ? r.objectsData[r.currentObjectName] : null;
+                  return { frames: o && o.frames ? o.frames.length : 0,
+                           positions: o && o.frames && o.frames[0]
+                             ? (o.frames[0].coords || []).length : 0,
+                           status: document.getElementById('status-message')?.textContent ?? '',
+                           errors: window.__pageErrors || [] };
+                })()""")
+                if drew.get("frames", 0) >= 3 and drew.get("positions") == 4:
+                    break
+                time.sleep(0.5)
+            print(f"  it drew {drew.get('frames')} sampler frame(s) of"
+                  f" {drew.get('positions')} positions and reads:"
+                  f" {drew.get('status')!r}")
+            # 🔴 THE POSITION COUNT IS WHAT MAKES THIS ABOUT THE PUSHED
+            # FRAMES. "Three or more frames" was satisfied by a 58-residue
+            # fold that a replayed command had started, so the mutation it was
+            # written for walked straight through it.
+            if drew.get("frames", 0) < 3 or drew.get("positions") != 4:
+                bad.append(f"the attached reader drew {drew.get('frames')} of"
+                           f" 3 pushed frames at {drew.get('positions')}"
+                           " positions, not 4 - the sampler's walk does not"
+                           " reach the screen")
+
+            cdp.evaluate(held, """(async () => {
+              const bridge = await import('/web/colab-bridge.js');
+              bridge.tapOut('result', { pdb: %s, atoms: 4, status: 'folded here',
+                                        scores: {}, predJson: null });
+              return true;
+            })()""" % json.dumps(tiny_pdb(4.0)))
+            ingested, deadline = {}, time.time() + 40
+            while time.time() < deadline:
+                ingested = cdp.evaluate(late_ws, """(() => {
+                  const reg = window.py2dmol_viewers || {};
+                  const r = reg[Object.keys(reg)[0]] &&
+                            reg[Object.keys(reg)[0]].renderer;
+                  const o = r && r.objectsData ? r.objectsData[r.currentObjectName] : null;
+                  return { status: document.getElementById('status-message')?.textContent ?? '',
+                           positions: o && o.frames && o.frames[0]
+                             ? (o.frames[0].coords || []).length : 0,
+                           errors: window.__pageErrors || [] };
+                })()""")
+                if "folded here" in ingested.get("status", ""):
+                    break
+                time.sleep(0.5)
+            print(f"  and ingested it: {ingested.get('status')!r},"
+                  f" {ingested.get('positions')} positions drawn")
+            if "folded here" not in ingested.get("status", ""):
+                bad.append("the runtime's finished fold never landed on the"
+                           " reader's page - `result` is not ingested")
+            if ingested.get("positions", 0) < 4:
+                bad.append(f"the ingested structure has"
+                           f" {ingested.get('positions')} positions, not 4 -"
+                           " loadIntoViewer got something it could not read")
+            if ingested.get("errors"):
+                bad.append(f"the attached reader threw: {ingested['errors'][:2]}")
         finally:
             late.kill()
     finally:
@@ -475,11 +590,13 @@ try:
                 held.call("Network.setBlockedURLs", urls=[])
             except Exception:                                 # noqa: BLE001
                 pass
-    # ...and the held fold is let go, so the session ends idle.
-    result, _, _ = wait_for_event("result", since, 90)
-    if result is None:
-        bad.append("the held fold never finished once its commands were"
-                   " let through again")
+    # The injected `result` above is what ended the held fold, so the broker
+    # must be idle again - which is also the rule that a session can fold
+    # twice.
+    code, after = call("/health")
+    if after.get("busy") is not False:
+        bad.append("the broker is still busy after the fold ended, so every"
+                   " later fold would be refused")
 
     # 10 · and nothing answers without the token.
     for route, body in (("/down?since=0", None), ("/out?since=0", None),

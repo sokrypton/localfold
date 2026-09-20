@@ -294,7 +294,20 @@ async function obey(command) {
  * command arriving 300 ms late is a button pressed 300 ms late.
  */
 async function serveCommands() {
+  // 🔴 FROM WHERE THE QUEUE STANDS NOW, NOT FROM ZERO. This page can be
+  // reloaded - by the backend, by a crash, by anything - and a watermark that
+  // restarts at zero obeys the whole session again: measured, a reloaded
+  // runtime page re-ran a fold from ten minutes earlier, downloaded the
+  // weights for it and reported it as the current one. What was asked before
+  // this page existed was asked of a page that has already answered.
   let since = 0;
+  try {
+    const answer = await fetch(door("/out", "&head=1"));
+    if (answer.ok) since = (await answer.json()).n ?? 0;
+  } catch (cause) {
+    /* the first poll below will simply start at zero, which is the old
+       behaviour and is only wrong for a page that has been reloaded */
+  }
   for (;;) {
     try {
       const answer = await fetch(door("/out", `&since=${since}`));

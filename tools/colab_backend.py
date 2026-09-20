@@ -277,10 +277,19 @@ def serve(port, backend, token, host="127.0.0.1"):
                                         "folding": folding,
                                         "runtimeSeen": self._seen()})
             if route == "/out":
+                # 🔴 `head=1` IS A RUNTIME PAGE SAYING IT HAS JUST STARTED, and
+                # it exists because a reload replayed the SESSION. The page
+                # polled from zero, so every command the notebook had ever
+                # sent was obeyed again - measured: the heartbeat arm navigates
+                # that page away and back, and it came back and re-ran a fold
+                # from ten minutes earlier, 58 residues of it, weights and all.
+                # A page that has just loaded is not owed the past.
+                asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                head = asked.get("head", [""])[0] == "1"
                 since = self._since()
                 with MAIL_LOCK:
                     LAST_SEEN["at"] = time.time()
-                    commands = COMMANDS[since:]
+                    commands = [] if head else COMMANDS[since:]
                     n = len(COMMANDS)
                 return self._json(200, {"commands": commands, "n": n})
             if route == "/health":
