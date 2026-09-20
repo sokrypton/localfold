@@ -76,7 +76,7 @@ import { buildTemplate, describeCoverage, fetchStructure } from "./template-sour
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
 import { colabRole, installColabBridge, remoteCommand, remoteEvents, remoteHead,
-  tapOut } from "./colab-bridge.js";
+  revivePrediction, tapOut } from "./colab-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -2027,12 +2027,44 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
 
 // --- running ---------------------------------------------------------------
 
+/**
+ * NOTHING CAN BE FOLDED FROM THIS PAGE ANY MORE, AND IT SAYS SO.
+ *
+ * 🔴 A PAGE SERVED BY A RUNTIME THAT HAS BEEN STOPPED IS A VIEWER. Its fold
+ * button would reach a service that is gone, and the reader pressed Disconnect
+ * to end it - so what is left is the thing they still want: the structure, the
+ * plots, the downloads of what was already folded. Every control whose only
+ * job is to shape the NEXT fold goes with the button; the viewer, the session
+ * and the files do not.
+ */
+let foldingRetired = false;
+
+const RETIRED_CONTROLS = ["predict", "add-entity", "model-family", "af2Model",
+  "plm-mode", "msa-mode", "af3-mode", "af3-count", "recycles", "max-msa",
+  "random-seed"];
+
+function retireFolding(why) {
+  foldingRetired = true;
+  for (const id of RETIRED_CONTROLS) {
+    const control = document.getElementById(id);
+    if (control === null) continue;
+    control.disabled = true;
+    control.title = why;
+  }
+  // The files stay: "viewing what is already here" is the whole of what this
+  // page is for now, and the prediction it holds is untouched.
+  syncDownloads();
+}
+
 function setFoldButton(state) {
   const button = element("predict");
   const running = state !== "idle";
   button.classList.toggle("btn-primary", !running);
   button.classList.toggle("btn-danger", running);
-  button.disabled = state === "stopping";
+  // 🔴 AND IT STAYS DISABLED ONCE THE SERVICE IS GONE, whatever else asks for
+  // it. Every path that ends a fold comes back through here, and a button
+  // re-enabled by one of them is a page that folds into a stopped runtime.
+  button.disabled = state === "stopping" || foldingRetired;
   button.setAttribute("aria-label", running ? "Stop prediction" : "Start prediction");
   const icon = button.querySelector("i");
   if (icon !== null) icon.className = running ? "fa-solid fa-stop" : "fa-solid fa-cubes";
@@ -3563,7 +3595,7 @@ async function followRemoteFold({ since, label, signal }) {
   // the object by and therefore the one `activePrediction` looks up.
   if (result.predJson) {
     try {
-      const remote = JSON.parse(result.predJson);
+      const remote = revivePrediction(result.predJson);
       remote.stem = stem;
       lastPrediction = remote;
       predictions.set(stem, remote);
@@ -5562,3 +5594,10 @@ void attachToRunningFold();
 // bus is document-scoped, which is what this page has one viewer for.
 syncDownloads();
 document.addEventListener("py2dmol-frame-change", syncDownloads);
+
+// 🔴 THE BRIDGE SAYS WHEN THE RUNTIME HAS BEEN STOPPED, on an event rather
+// than by calling in: web/colab-bridge.js is imported BY this file, so a call
+// the other way would be a cycle. One listener, and the page is a viewer.
+document.addEventListener("localfold-runtime-stopped", (event) => {
+  retireFolding(event.detail?.why ?? "the fold service has been stopped");
+});

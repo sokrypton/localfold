@@ -25,6 +25,10 @@ WHAT IT CHECKS, on a real page with a real result in it:
     comes on - and in Colab mode the PDB button is CLICKED, because a button
     offered over a prediction the runtime never filled looks identical from
     the outside;
+  * A PREDICTION CROSSES WITH ITS TYPES: JSON has no typed arrays, and
+    flattened to plain ones they look right until something slices one -
+    `download-all` died on "values.subarray is not a function" with a perfect
+    structure on screen;
   * THE DEV PANEL DESCRIBES THE MACHINE THAT FOLDED: its rows are the
     runtime's own, with the runtime's card memory in them, and its header says
     which machine folded and which one is showing it - where before the
@@ -37,7 +41,11 @@ WHAT IT CHECKS, on a real page with a real result in it:
     its pulse going amber when that runtime stops answering - at the same
     twenty seconds after which a fold in flight gives up, because a badge that
     still says connected while the fold gives up is the page saying two things
-    at once - and a Disconnect that puts this page back to folding here.
+    at once - and a Disconnect that STOPS the service, because the browser on
+    that machine holds its GPU for as long as it lives. After it the page is a
+    VIEWER: no folding, every control that shapes the next one disabled and
+    saying why, and the structure, plots and downloads it already has still
+    there. It does not RELOAD - the server it was served by is what stopped.
 
 🔴 THE VEIL IS MEASURED AS PIXELS, not as a class. A class name is set by the
 page and says nothing about whether a stylesheet arrived; `.result-pending`
@@ -93,13 +101,21 @@ def tiny_pdb():
 
 
 def box_shot(ws, selector="canvasContainer"):
-    """The structure box as pixels, so the veil is measured where it is drawn."""
+    """The structure box as pixels, so the veil is measured where it is drawn.
+
+    🔴 IN PAGE COORDINATES, PAST THE FOLD. The clip used to be the viewport
+    rectangle with `captureBeyondViewport` off, so anything that made the page
+    head taller - the Colab badge taking its own row on a narrow window - moved
+    the box below the fold and BOTH shots came back identical. The arm then
+    reported that nothing had been drawn over the structure, which was a
+    statement about the camera rather than about the veil.
+    """
     at = cdp.evaluate(ws, """(() => {
       const box = document.getElementById(%s).getBoundingClientRect();
-      return { x: Math.round(box.x), y: Math.round(box.y),
+      return { x: Math.round(box.x + scrollX), y: Math.round(box.y + scrollY),
                w: Math.round(box.width), h: Math.round(box.height) };
     })()""" % json.dumps(selector))
-    shot = ws.call("Page.captureScreenshot", format="png", captureBeyondViewport=False,
+    shot = ws.call("Page.captureScreenshot", format="png", captureBeyondViewport=True,
                    clip={"x": at["x"], "y": at["y"], "width": at["w"],
                          "height": at["h"], "scale": 0.25})
     return base64.b64decode(shot["data"])
@@ -233,8 +249,15 @@ try:
       const pdb = %s;
       bridge.tapOut('result', { pdb, atoms: 6, status: 'AlphaFold 3 · 6 residues',
         scores: {}, confidence: { meanPlddt: 88.1, ptm: 0.71 },
-        predJson: JSON.stringify({ model: 'AlphaFold 3', stem: 'pending_test',
-                                   pdb, confidence: { meanPlddt: 88.1, ptm: 0.71 } }) });
+        predJson: JSON.stringify({ model: 'AlphaFold 3', stem: 'pending_test', pdb,
+          confidence: { meanPlddt: 88.1, ptm: 0.71,
+            // 🔴 THE SHAPE A TYPED ARRAY TRAVELS IN. JSON has none, so the
+            // runtime tags each one with its kind; flattened to a plain array
+            // instead, `download-all` died on "values.subarray is not a
+            // function" while the picture beside it was perfect.
+            plddt: { __typed: 'Float32Array', v: [88.1, 90.2, 71.0, 65.5, 80.0, 92.3] },
+            predictedAlignedError: { __typed: 'Float32Array',
+                                     v: Array.from({ length: 36 }, (unused, i) => i / 4) } } }) });
       return true;
     })()""" % json.dumps(tiny_pdb()))
     got, deadline = {}, time.time() + 60
@@ -363,6 +386,25 @@ try:
                    " Colab mode - the button is offered over a prediction the"
                    " runtime did not fill")
 
+    # 5b · AND ITS TYPED ARRAYS ARE TYPED ARRAYS. A prediction crosses as JSON,
+    #      which has none: flattened to plain arrays they look right until
+    #      something slices one, and `download-all` died on
+    #      "values.subarray is not a function" with the structure on screen.
+    kinds = cdp.evaluate(reader_ws, """(() => {
+      const pred = window.__lastPrediction ? window.__lastPrediction() : null;
+      const c = pred?.confidence ?? {};
+      return { plddt: c.plddt?.constructor?.name ?? 'missing',
+               pae: c.predictedAlignedError?.constructor?.name ?? 'missing',
+               sliceable: typeof c.predictedAlignedError?.subarray === 'function',
+               plddtHead: c.plddt ? Array.from(c.plddt).slice(0, 2) : null };
+    })()""")
+    print(f"  the prediction's arrays: {kinds}")
+    if kinds.get("plddt") != "Float32Array" or kinds.get("pae") != "Float32Array":
+        bad.append(f"the runtime's typed arrays arrived as {kinds.get('plddt')}"
+                   f"/{kinds.get('pae')} - anything that slices one throws")
+    if not kinds.get("sliceable"):
+        bad.append("the PAE cannot be sliced, which is what the download does")
+
     # 6 · THE DEV PANEL IS THE RUNTIME'S, NOT THIS MACHINE'S. Its rows were
     #     timed on the reader's clock and filed under the reader's (empty)
     #     device, under a header naming the reader's browser - a report
@@ -456,18 +498,74 @@ try:
       document.getElementById('colab-status').querySelector('button').click();
       return true;
     })()""")
-    time.sleep(2.0)
-    cdp.wait_for(reader_ws, "!!window.__entityList", 60, "the page after leaving")
-    after = cdp.evaluate(reader_ws, """(() => ({
-      url: location.search,
-      badge: document.getElementById('colab-status') === null ? 'gone' : 'still here',
-    }))()""")
+    # 🔴 THE PAGE MUST NOT RELOAD, because the server it was served BY is what
+    # just stopped - so this waits for the page's STATE to change and then asks
+    # the same document what it has become.
+    after, deadline = {}, time.time() + 40
+    while time.time() < deadline:
+        after = cdp.evaluate(reader_ws, """(() => {
+          const badge = document.getElementById('colab-status');
+          return {
+            url: location.search,
+            badge: badge?.querySelector('.colab-said')?.textContent ?? 'gone',
+            button: badge?.querySelector('button') == null ? 'gone' : 'still here',
+            fold: !!document.getElementById('predict')?.disabled,
+            model: !!document.getElementById('model-family')?.disabled,
+            why: document.getElementById('predict')?.getAttribute('title') ?? '',
+            says: document.getElementById('status-message')?.textContent ?? '',
+            alive: typeof window.__entityList === 'object',
+            downloads: !document.getElementById('download-pdb')?.disabled,
+          };
+        })()""")
+        if after.get("fold"):
+            break
+        time.sleep(0.5)
     print(f"  after Disconnect: {after}")
-    if "backend=colab" in after["url"]:
-        bad.append(f"Disconnect left the page on {after['url']!r} - it is"
-                   " still folding on the runtime")
-    if after["badge"] != "gone":
-        bad.append("the badge is still up on a page that folds here")
+    if "backend=colab" in after.get("url", ""):
+        bad.append(f"Disconnect left the page on {after.get('url')!r}, so it"
+                   " would ask a stopped runtime for the next fold")
+    if not after.get("alive"):
+        bad.append("the page did not survive Disconnect - it reloaded from the"
+                   " server it had just told to stop")
+    if not after.get("fold") or not after.get("model"):
+        bad.append(f"folding is still offered after Disconnect (fold disabled"
+                   f" {after.get('fold')}, model row {after.get('model')}) -"
+                   " the page can only show what it already has")
+    if "notebook" not in (after.get("why") or ""):
+        bad.append(f"the disabled Fold button says {after.get('why')!r}, which"
+                   " does not say why it cannot be pressed")
+    if "stopped" not in after.get("says", ""):
+        bad.append(f"the page says {after.get('says')!r} after Disconnect,"
+                   " which does not tell the reader what just happened")
+    if "stopped" not in (after.get("badge") or ""):
+        bad.append(f"the badge reads {after.get('badge')!r} rather than saying"
+                   " the runtime has stopped")
+    if after.get("button") != "gone":
+        bad.append("the badge still offers Disconnect on a runtime that has"
+                   " already been disconnected")
+    # 🔴 AND WHAT IS ALREADY HERE STAYS, which is the whole of what the page is
+    # for now.
+    if not after.get("downloads"):
+        bad.append("the downloads went with the runtime - the fold that was"
+                   " already made is still this page's to give")
+    # ...and the service really is gone: the GPU is freed when that process and
+    # its browser are, and not before.
+    stopped, deadline = False, time.time() + 30
+    while time.time() < deadline:
+        try:
+            call("/health")
+        except Exception:                                     # noqa: BLE001
+            stopped = True
+            break
+        time.sleep(0.5)
+    print(f"  the fold service still answers: {not stopped};"
+          f" the broker exited: {backend.poll() is not None}")
+    if not stopped:
+        bad.append("the broker is still serving after Disconnect - the"
+                   " runtime's browser is still holding its card")
+    if backend.poll() is None:
+        bad.append("the broker process is still running after Disconnect, so"
+                   " the notebook cell never ends and the GPU stays taken")
 
     # 10 · WHERE THE SEQUENCE GOES, WHICH IS THE FOOTER'S ONE JOB. The line
     #      tracks the alignment mode - "everything runs locally" is false the
@@ -505,10 +603,12 @@ try:
 finally:
     if reader is not None:
         reader.kill()
-    backend.send_signal(signal.SIGINT)
+    # It may already have stopped itself - the Disconnect arm asks it to.
     try:
+        if backend.poll() is None:
+            backend.send_signal(signal.SIGINT)
         backend.wait(timeout=10)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, ProcessLookupError):
         backend.kill()
 
 # 🔴 AND A GATE THAT LEAVES A BROWSER BEHIND IS THE NEXT MEASUREMENT'S PROBLEM.

@@ -95,6 +95,11 @@ FOLDING = {"on": False}
 # has gone takes the flag with it. The page's own poll is the heartbeat; no
 # second mechanism and nothing extra on the wire.
 LAST_SEEN = {"at": 0.0}
+# 🔴 AND A WAY TO END IT FROM THE PAGE. A reader who is done with the runtime
+# wants its GPU back, and the only thing that frees it is this process going
+# away: the browser it started holds the card for as long as it lives. The
+# notebook cell is blocked on the wait below, so setting this ends the cell.
+STOPPING = threading.Event()
 
 
 ADAPTER_JS = """(async () => {
@@ -354,6 +359,17 @@ def serve(port, backend, token, host="127.0.0.1"):
             # the button is a toggle, so the page cannot tell us "busy" by
             # refusing a press.
             op = body.get("op")
+            # 🔴 SHUTDOWN IS THE BROKER'S OWN, NOT THE PAGE'S. Every other op is
+            # forwarded to the runtime page and obeyed there; this one ends the
+            # service - the browser, the GPU it holds and this process - so it
+            # is answered here, after the answer has been written. What it
+            # cannot do is end the Colab RUNTIME: that machine belongs to the
+            # notebook, and only the notebook's own Runtime menu releases it.
+            if op == "shutdown":
+                self._json(200, {"ok": True, "stopping": True})
+                threading.Thread(target=lambda: (time.sleep(0.3),
+                                                 STOPPING.set()), daemon=True).start()
+                return None
             if op not in ("fold", "stop", "ping"):
                 return self._json(400, {"error": f'unknown op "{op}"'})
             with MAIL_LOCK:
@@ -403,8 +419,10 @@ def main():
     # One line, machine-readable, for the notebook cell that prints the handle.
     print("BACKEND " + json.dumps({"token": token, "gpu": backend.adapter()}), flush=True)
     try:
-        while True:
-            time.sleep(3600)
+        # Woken by Ctrl-C, or by a reader pressing Disconnect - see STOPPING.
+        while not STOPPING.wait(timeout=3600):
+            pass
+        print("stopped by the page", flush=True)
     except KeyboardInterrupt:
         pass
     finally:

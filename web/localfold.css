@@ -1227,3 +1227,18 @@
 .colab-status[data-state="live"] .colab-dot { background: #22c55e; }
 .colab-status[data-state="gone"] .colab-dot { background: #f59e0b; }
 .colab-status[data-state="gone"] { border-color: #fcd34d; background: #fffbeb; }
+
+/* ...and it sits BETWEEN the title and the actions, in a slot of its own: the
+   head is `space-between`, so a third child would push Fold and Add entity
+   out of the place a reader has already learnt. The slot takes the leftover
+   width and centres the badge in it, and gives it up entirely when the head
+   wraps on a narrow screen. */
+.colab-status-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+@media (max-width: 948px) {
+  .colab-status-slot { flex: 1 1 100%; justify-content: flex-start; }
+}

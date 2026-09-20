@@ -2221,6 +2221,46 @@ every later request queued behind it, and the gate failed three arms downstream
 in a route that had nothing wrong with it. **A hang reported far from its
 cause**: read the value before taking the lock.
 
+🔴 **AND A PREDICTION CROSSED AS JSON, WHICH HAS NO TYPED ARRAYS.** The
+runtime's whole prediction travels as a string, and the replacer that wrote it
+flattened every `Float32Array` to a plain array - which looks right everywhere
+until something SLICES one: `download-all` reaches `matrixRows`, which cuts the
+PAE with `values.subarray(...)`, and a remote fold's download died on
+*"values.subarray is not a function"* with a perfect structure on the screen
+beside it. The kind travels with the numbers now (`{__typed, v}`) and
+`revivePrediction` puts it back, so what a reader holds after a remote fold is
+what a local one would have held. Measured in the gate as a CONSTRUCTOR NAME,
+not as a length: a plain array of the right numbers passes every other check.
+
+🔴 **AND DISCONNECT WALKED AWAY INSTEAD OF STOPPING ANYTHING.** It dropped the
+parameters and left the runtime folding for nobody - reported as *"disconnect
+doesn't seem to kill the Colab session"*, which it did not: the browser on that
+machine holds the card for as long as it lives. It posts `shutdown` now, which
+is the broker's own op rather than one forwarded to the page: the service stops,
+its browser is terminated, the process exits, and the notebook cell ends. **What
+it cannot do is release the Colab RUNTIME** - that machine belongs to the
+notebook, and only its Runtime menu frees it - and the button's title says so
+rather than implying otherwise.
+
+**AFTER IT, THE PAGE IS A VIEWER.** It does not reload (the server it was
+served by is what just stopped) and it does not quietly start folding here
+instead - the reader ended the service, and a laptop is not the card they were
+using. `retireFolding` disables the Fold button and every control that shapes
+the NEXT fold, each saying why; the viewer, the plots and the downloads of what
+was already folded stay exactly as they are. The badge stops offering
+Disconnect and reads *"Colab runtime · stopped"*.
+
+🔴 **AND THE BADGE SITS IN A SLOT OF ITS OWN, BETWEEN THE TITLE AND THE
+ACTIONS.** Appended to a `space-between` head it was a third child and pushed
+Fold and Add entity out of the place a reader had already learnt. The slot
+takes the leftover width and centres the badge in it; below 948px it takes its
+own row, which is the wrap the head already does. 🔴 **AND THAT EXTRA ROW
+BROKE A PROBE, NOT A PAGE**: the veil's screenshots were viewport rectangles,
+so a taller head put the structure box below the fold and both shots came back
+identical - reported by the arm as "nothing was drawn over it", which was a
+statement about the camera. They are page coordinates with
+`captureBeyondViewport` now.
+
 🔴 **AND THE DEV PANEL WAS DESCRIBING THE WRONG MACHINE.** Its rows come from
 a hook in `status()`, and on a reader's page that status line is a REPLAY of
 the runtime's - so the phases were timed against this browser's clock, filed

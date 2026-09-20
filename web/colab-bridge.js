@@ -150,9 +150,16 @@ async function readBack() {
   URL.createObjectURL = made;
   const pdb = blobs[0] ? await blobs[0].text() : "";
   const pred = (window.__lastPrediction && window.__lastPrediction()) || {};
+  // 🔴 A TYPED ARRAY HAS TO ARRIVE AS ONE. JSON has no typed arrays, so this
+  // used to flatten them to plain arrays - which LOOK right everywhere and
+  // then are not: `download-all` reached `matrixRows`, which slices the PAE
+  // with `values.subarray(...)`, and a remote fold's download died on
+  // "values.subarray is not a function" while the picture beside it was
+  // perfect. The kind travels with the numbers and `revivePrediction` puts it
+  // back, so what the reader holds is what a local fold would have held.
   const predJson = JSON.stringify(pred, (key, value) =>
     (ArrayBuffer.isView(value) && !(value instanceof DataView))
-      ? Array.from(value) : value);
+      ? { __typed: value.constructor.name, v: Array.from(value) } : value);
   return {
     predJson,
     a3m: pred.a3m ?? null,
@@ -328,6 +335,27 @@ async function serveCommands() {
 
 /* ----------------------------------------------------- the reader's two doors */
 
+/**
+ * The runtime's prediction, with its typed arrays back.
+ *
+ * 🔴 THE KINDS ARE NAMED RATHER THAN GUESSED, because guessing is what the
+ * flattened form already did: "an array of numbers" is a Float32Array, a
+ * Uint8Array or nothing in particular depending on which field it is, and
+ * every reader downstream has its own opinion. The writer knows; it says.
+ */
+const TYPED = {
+  Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+  Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array,
+};
+
+export function revivePrediction(json) {
+  return JSON.parse(json, (key, value) => {
+    if (value === null || typeof value !== "object") return value;
+    const kind = TYPED[value.__typed];
+    return (kind !== undefined && Array.isArray(value.v)) ? kind.from(value.v) : value;
+  });
+}
+
 /** Ask the runtime for something. Returns the command's sequence number. */
 export const remoteCommand = (op, payload) => ask("/in", { op, payload });
 
@@ -380,10 +408,28 @@ function installColabStatus() {
   leave.type = "button";
   leave.className = "btn btn-grey btn-small";
   leave.textContent = "Disconnect";
-  leave.title = "Fold in this browser again. The runtime keeps running - the"
-    + " notebook's link brings you back.";
+  // 🔴 IT STOPS THE SERVICE, WHICH IS WHAT FREES THE CARD. Walking away from
+  // the runtime and leaving it folding for nobody is not disconnecting - the
+  // browser on that machine holds the GPU for as long as it lives. What this
+  // CANNOT do is end the Colab runtime itself: that machine belongs to the
+  // notebook, and only its own Runtime menu releases it. The title says so,
+  // because a button that half-does what its name says is worse than one that
+  // says what it does.
+  leave.title = "Stop the fold service on the runtime and free its GPU. This"
+    + " page then folds in your browser. The notebook itself stays open -"
+    + " Runtime > Disconnect and delete runtime releases the machine.";
   badge.append(dot, said, leave);
-  head.append(badge);
+  // 🔴 IN THE MIDDLE, IN ITS OWN SLOT, rather than appended to the head. The
+  // head is `space-between` with a title and the actions, so a third child
+  // pushed Fold and Add entity out of the place a reader had already learnt.
+  // A stretching slot between them takes the leftover width and centres the
+  // badge in it; the buttons do not move.
+  const slot = document.createElement("div");
+  slot.className = "colab-status-slot";
+  slot.append(badge);
+  const actions = head.querySelector(".fold-actions");
+  if (actions === null) head.append(slot);
+  else head.insertBefore(slot, actions);
 
   // 🔴 ASKED UNTIL IT ANSWERS, AND THEN NOT AGAIN. `/health` reaches over CDP
   // to the browser on the other side, so it is not a thing to poll - and a
@@ -426,13 +472,42 @@ function installColabStatus() {
   void beat();
   setInterval(() => void beat(), 3000);
 
-  leave.addEventListener("click", () => {
-    // 🔴 THE RUNTIME IS TOLD FIRST, because leaving a fold running there holds
-    // its GPU and answers the next reader 429 - the same reason the abort
-    // signal posts `stop` rather than just ending its own loop.
-    const done = () => location.assign(location.pathname);
-    if (!folding) return done();
-    remoteCommand("stop", null).catch(() => {}).then(done, done);
+  leave.addEventListener("click", async () => {
+    leave.disabled = true;
+    // 🔴 THE FOLD FIRST, THEN THE SERVICE. Stopping the page mid-fold leaves
+    // the runtime's browser finishing a fold nobody will read.
+    if (folding) await remoteCommand("stop", null).catch(() => {});
+    await remoteCommand("shutdown", null).catch(() => {});
+    // 🔴 AND THIS PAGE DOES NOT RELOAD, because the server it was served BY is
+    // the thing that just stopped. Everything it needs is already here: the
+    // bundle, the viewer, and weights that come from huggingface rather than
+    // from the runtime - so dropping the parameters with `replaceState` is the
+    // whole of coming home. A navigate would have asked a dead server for the
+    // page and got nothing.
+    history.replaceState({}, "", location.pathname);
+    // 🔴 THE PAGE DOES NOT START FOLDING HERE INSTEAD. The reader ended the
+    // service; a page that quietly took the work over would be answering a
+    // question nobody asked, on a laptop that may be nothing like the card
+    // they were using. What is left is what they still want: the structure,
+    // the plots and the downloads of what was already folded.
+    document.dispatchEvent(new CustomEvent("localfold-runtime-stopped", {
+      detail: { why: "the Colab runtime was stopped from this page - open the"
+        + " notebook's link again to fold" },
+    }));
+    badge.dataset.state = "gone";
+    badge.textContent = "";
+    const dot2 = document.createElement("span");
+    dot2.className = "colab-dot";
+    const gone = document.createElement("span");
+    gone.className = "colab-said";
+    gone.textContent = "Colab runtime · stopped";
+    badge.append(dot2, gone);
+    const line = document.getElementById("status-message");
+    if (line !== null) {
+      line.textContent = "The Colab runtime has been stopped and its GPU"
+        + " released. This page is now showing what it already has - the"
+        + " notebook's link starts a new one.";
+    }
   });
 }
 
