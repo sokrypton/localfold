@@ -31,6 +31,9 @@ WHAT IT CHECKS, in the order a session does them:
     runtime page across six seconds of 300 ms blocking tasks, which is what a
     fold does to a main thread. This is the regression guard for the fault the
     bridge was written for;
+  * A READER THAT ARRIVES MID-FOLD ATTACHES TO IT rather than sitting idle,
+    which is what a reload, a second window or the notebook's link opened
+    twice all are;
   * A RUNTIME THAT GOES AWAY IS VISIBLE: the runtime page's own command poll
     is the heartbeat, and `runtimeSeen` is how a reader tells a recycled Colab
     runtime from a slow fold rather than polling for the rest of the session;
@@ -421,7 +424,64 @@ try:
     finally:
         pass
 
-    # 9 · and nothing answers without the token.
+    # 9 · A READER THAT ARRIVES MID-FOLD ATTACHES TO IT. A Colab fold is
+    #     minutes long and the page in front of it is an ordinary tab, so
+    #     "only the page that pressed Fold is watching" is a reader who
+    #     reloads and sees nothing at all.
+    #
+    #     🔴 THE FOLD IS HELD BY TAKING /out AWAY FROM THE RUNTIME PAGE, not
+    #     by folding something slow: the broker raises `folding` when it
+    #     ACCEPTS the command, and a page that cannot collect its commands
+    #     never finishes it. That makes the state deterministic instead of a
+    #     race against a real fold's first seconds.
+    held = None
+    try:
+        for target in json.load(urllib.request.urlopen(
+                f"http://127.0.0.1:{CDP_PORT}/json/list")):
+            if target.get("type") == "page":
+                held = cdp.WS(target["webSocketDebuggerUrl"])
+                break
+        held.call("Network.enable")
+        held.call("Network.setBlockedURLs", urls=["*/out*"])
+        time.sleep(1.0)
+        code, said = call("/in", {"op": "fold", "payload": {
+            "entities": [{"type": "protein", "value": "GWSTELEKHRSVQ", "copies": 1}]}})
+        code, head = call("/down?head=1")
+        if not head.get("folding"):
+            bad.append("the broker does not say it is folding after accepting"
+                       " a fold command, so no reader can attach to one")
+
+        late, late_ws = cdp.launch(READER_CDP_PORT + 1, "/tmp/localfold-bridge-late")
+        try:
+            late_ws.call("Page.navigate", url=(
+                f"http://127.0.0.1:{PORT}/index.html?backend=colab&t={TOKEN}"))
+            cdp.wait_for(late_ws, "!!window.__entityList", 120, "the late reader")
+            attached, deadline = "", time.time() + 30
+            while time.time() < deadline:
+                attached = cdp.evaluate(late_ws,
+                    "document.getElementById('status-message')?.textContent ?? ''")
+                if "already running" in attached:
+                    break
+                time.sleep(0.5)
+            print(f"  a page opened mid-fold reads: {attached!r}")
+            if "already running" not in attached:
+                bad.append("a page opened while the runtime was folding sat"
+                           " idle - it did not attach to the fold")
+        finally:
+            late.kill()
+    finally:
+        if held is not None:
+            try:
+                held.call("Network.setBlockedURLs", urls=[])
+            except Exception:                                 # noqa: BLE001
+                pass
+    # ...and the held fold is let go, so the session ends idle.
+    result, _, _ = wait_for_event("result", since, 90)
+    if result is None:
+        bad.append("the held fold never finished once its commands were"
+                   " let through again")
+
+    # 10 · and nothing answers without the token.
     for route, body in (("/down?since=0", None), ("/out?since=0", None),
                         ("/health", None), ("/up", {"events": []}),
                         ("/in", {"op": "ping"})):

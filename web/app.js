@@ -3326,6 +3326,21 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   const stopThere = () => { remoteCommand("stop", null).catch(() => {}); };
   signal.addEventListener("abort", stopThere, { once: true });
 
+  await followRemoteFold({ since, label, signal });
+}
+
+/**
+ * WATCH A FOLD ON THE RUNTIME AND INGEST WHAT IT PRODUCES.
+ *
+ * 🔴 SEPARATE FROM ASKING FOR ONE, BECAUSE A READER CAN ARRIVE MID-FOLD. A
+ * Colab fold is minutes long and the page in front of it is an ordinary tab:
+ * reloaded, reopened from the notebook's link, opened in a second window. Only
+ * the page that pressed Fold used to be following, so any of those left a
+ * reader looking at an idle page while their own fold ran on - and the result,
+ * when it came, landed in a page nobody was watching. `attachToRunningFold`
+ * below is the other caller, and there is one loop between them.
+ */
+async function followRemoteFold({ since, label, signal }) {
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
   const draw = remoteFrameDrawer(stem);
   const framePdbs = [];
@@ -3431,6 +3446,37 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // status line does - it is the same code, on the other machine.
   status(result.status || `${label} · folded on the runtime`);
   progress(null);
+}
+
+/**
+ * A FOLD THAT WAS ALREADY RUNNING WHEN THIS PAGE OPENED.
+ *
+ * 🔴 THE BROKER KNOWS, AND IT IS ONE QUESTION AT LOAD. `head=1` carries
+ * `folding` - raised when a fold command is accepted, lowered by the runtime
+ * page's own result - so a page that arrives in the middle of one attaches to
+ * it rather than sitting idle while it finishes somewhere else. The watermark
+ * is the CURRENT head, not zero: what is wanted is the rest of this fold, not
+ * a replay of everything the session has said.
+ *
+ * It is deliberately not an abortable job: the reader who opened this page did
+ * not start this fold, so Stop is not theirs to press, and pressing Fold while
+ * one runs is refused by the broker with its own words.
+ */
+async function attachToRunningFold() {
+  if (colabRole() !== "reader") return;
+  try {
+    const head = await remoteHead();
+    if (!head.folding) return;
+    status("a fold is already running on the runtime - following it");
+    progress("waiting");
+    await followRemoteFold({
+      since: head.n ?? 0,
+      label: "the runtime",
+      signal: new AbortController().signal,
+    });
+  } catch (cause) {
+    console.warn("could not attach to the running fold:", cause.message);
+  }
 }
 
 /**
@@ -5344,3 +5390,5 @@ void offerSession();
  * See web/colab-bridge.js.
  */
 installColabBridge();
+// ...and if one is already under way on the runtime, follow it from here.
+void attachToRunningFold();

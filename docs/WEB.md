@@ -2149,6 +2149,23 @@ and a status line still reading "Ready. Paste a sequence and press Fold."* And
 the FEED UNDER LOAD is the regression guard: twenty events from a page blocking
 its thread in 300 ms chunks, bounded at a second, measured at 1-2 ms.
 
+🔴 **AND A READER CAN ARRIVE IN THE MIDDLE OF A FOLD, which only the page that
+pressed Fold used to survive.** A Colab fold is minutes long and the page in
+front of it is an ordinary tab - reloaded, reopened from the notebook's link,
+opened in a second window - and each of those left a reader watching nothing
+while their own fold ran on, with the result landing in a page nobody was
+looking at. `head=1` carries `folding`, so a page that opens during one
+attaches to it from the CURRENT head (the rest of this fold, not a replay of
+the session). `followRemoteFold` is the one loop both callers share, and the
+attached reader deliberately gets no Stop: they did not start it.
+
+**THE ARM HOLDS THE FOLD BY TAKING `/out` AWAY FROM THE RUNTIME PAGE**, rather
+than folding something slow - the broker raises `folding` when it ACCEPTS the
+command, and a page that cannot collect its commands never finishes it, which
+makes the state deterministic instead of a race against a real fold's first
+seconds. A page opened then reads *"a fold is already running on the runtime -
+following it"*.
+
 AND THE RUNTIME GOING AWAY is the ninth arm: the runtime page is navigated to
 `about:blank` - a page with no `role` runs no bridge, which is exactly what a
 recycled runtime looks like from here - and the heartbeat must age, then come
