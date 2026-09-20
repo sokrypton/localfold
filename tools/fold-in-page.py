@@ -759,9 +759,21 @@ def main():
           set('model-family', %s);
           set('af2Model', %s);
           set('recycles', %s);
-          set('af3-count', %s);
           set('msa-mode', %s);
           set('plm-mode', %s);
+          // 🔴 THE STEP COUNT IS SET LAST, AND IT WAS SET FOURTH. `#af3-count`
+          // is REBUILT from the chosen model's own table - `syncAf3Count` - and
+          // a rebuild resets it to that table's preferred value. Setting it
+          // before `model-family`, `msa-mode` or `plm-mode` have fired their
+          // change handlers therefore set a dial that was about to be replaced:
+          // `--steps=4` on AlphaFold 3 folded at **25**, and `--steps=200` on
+          // EF2-fast folded at 15 (11 actual), with `controls:` on the line
+          // below reporting the value the page kept rather than the one asked
+          // for. Every --steps arm taken before this measured the DEFAULT, and
+          // an EF2 step sweep of 15/32/64/200 came back four identical folds -
+          // same certainty, same time, which is what an arm that did not run
+          // looks like.
+          set('af3-count', %s);
           // 🔴 THE TERMS DIALOG WOULD OTHERWISE EAT THE CLICK. AlphaFold 3's
           // parameters are gated behind an acknowledgement, and it opens in
           // front of `predict` - so without this the Fold press opens a modal,
@@ -776,8 +788,8 @@ def main():
           } catch (e) { /* asked again, which the dialog check covers */ }
         })()""" % (json.dumps(args.model), json.dumps(args.af2_model),
                    json.dumps(args.recycles),
-                   json.dumps(args.steps), json.dumps(args.msa_mode),
-                   json.dumps(args.plm)))
+                   json.dumps(args.msa_mode), json.dumps(args.plm),
+                   json.dumps(args.steps)))
         time.sleep(0.5)
         print("controls:", cdp.evaluate(ws, """(() => {
           const v = (id) => (document.getElementById(id) || {}).value;

@@ -266,6 +266,63 @@ describe("a ligand's PAE reaches the viewer", () => {
   });
 });
 
+/**
+ * 🔴 THE SAME DROP, ON ESMFold2, FOUND BY A USER AND NOT BY A GATE. The page's
+ * guard says a modified residue needs "AF3, OpenBind-0 or ESMFold2",
+ * `featuriseForEsmfold2` spreads its request straight into `featuriseProtein`,
+ * and `languageModelInput` groups tokens by `(asymId, residueIndex)` precisely
+ * so an atomised residue's ten tokens collapse into one ESM-C row. The only
+ * thing missing was that `foldWithEsmfold2` did not take `modifications`, and
+ * the entities literal did not name it - so a SEP@3 job folded a plain serine.
+ *
+ * 🔴 AND NOTHING COULD HAVE CAUGHT IT: `npm run test:modified` folds SEP@3
+ * through seven AF3-lineage bundles and not this one, because
+ * `probe-modified.js` opens an AF3 store and calls `foldBatch`. This is the
+ * STRUCTURAL half - the half that matches the actual bug, which was a key
+ * absent from a literal - and it is what stops the regression. A fold gate for
+ * this path is still missing; see docs/WEB.md.
+ *
+ * CLAUDE.md's allow-list trap, fourth time at this seam.
+ */
+describe("a modified residue reaches ESMFold2", () => {
+  const app = readSource("web/app.js");
+  const from = app.indexOf("async function foldWithEsmfold2(");
+  // 🔴 TO THE END OF THE FUNCTION, NOT TO THE FOLD CALL. The entities literal
+  // is an ARGUMENT of `foldEsmfold2(...)`, so a slice that stops at the call
+  // stops just short of the thing this file is about - and the arm reported a
+  // missing key that was two lines further on.
+  const body = app.slice(from, app.indexOf("\nasync function ", from + 10));
+
+  it("is a parameter of the ESMFold2 fold path", () => {
+    assert.ok(app.slice(from, app.indexOf(") {", from)).includes("modifications"));
+  });
+
+  it("is resolved to a component before the synchronous featuriser", () => {
+    // A code is not atoms, and the featuriser cannot await. Passing
+    // `{code, position}` straight through throws "Cannot read properties of
+    // undefined (reading 'map')" inside it - which presents as a HANG, because
+    // the caller then waits out its whole timeout for a fold that never lands.
+    assert.ok(body.includes("parseCcdComponent"), "no component fetch");
+  });
+
+  it("is named in the entities literal the featuriser is handed", () => {
+    const literal = body.slice(body.indexOf("entities: { sequence, chainKinds"));
+    assert.ok(literal.slice(0, 160).includes("modifications"),
+              "the entities literal does not name modifications");
+  });
+
+  /**
+   * 🔴 AND IN THE TRUNK KEY, or a fold WITH the modification reuses the trunk
+   * of one without it - the `chainKinds` note beside it, where folding `ACGT`
+   * as protein and then as DNA reused the first answer.
+   */
+  it("is part of the trunk key", () => {
+    const key = body.slice(body.indexOf("family: chosenFamily(), chains"));
+    assert.ok(key.slice(0, 260).includes("modifications"),
+              "the ESMFold2 trunk key does not name modifications");
+  });
+});
+
 function readSource(relative) {
   return readFileSync(new URL(`../${relative}`, import.meta.url), "utf8");
 }

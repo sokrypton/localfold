@@ -493,7 +493,50 @@ all-atom representation term for term"*, with OpenFold3's loss docstring
 naming "the first and only atom for anything atomized" as a token's
 representative. One fold against a documented convention is not evidence.
 
-**What is open**, for whoever picks it up: is this the MODEL or this port's
+🔴 **ANSWERED, ON THE A100: THE MODEL PLACES A LIGAND'S ATOMS AND NOT AN
+ATOMISED RESIDUE'S.** Both measurements above, run on
+`GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK` (58 residues,
+certainty 0.57 rather than the 13-mer's 0.45), scored as a mean bond ratio
+against the ideals - 1.000 is perfect, CLAUDE.md's band is 0.70-1.30:
+
+| arm | protein control | the SEP | a glycerol |
+|---|---:|---:|---:|
+| SEP, preset 15 (11 steps) | 0.994 | 1.399 | - |
+| SEP, preset 64 (45 steps) | 1.002 | 1.883 | - |
+| SEP, preset 200 (138 steps) | 1.001 | **2.279** | - |
+| GOL alone, 138 steps | 1.003 | - | **0.958** |
+| GOL **and** SEP, 138 steps | 0.999 | **2.349** | **0.958** |
+
+**The ligand arm is the one that decides it.** In ONE fold, at one setting, the
+protein backbone is 0.999, a plain CCD glycerol - atomised the same way, one
+token per atom - is **0.958**, and the phosphoserine is **2.349**. So this is
+not a model that cannot place atoms; it is an atomised residue INSIDE a polymer
+chain specifically.
+
+🔴 **AND MORE STEPS MAKES IT WORSE, WHICH RULES OUT THE SAMPLER'S BUDGET
+OUTRIGHT.** 1.399 -> 1.883 -> 2.279 as the steps go 11 -> 45 -> 138, while the
+control holds at 1.00 and the glycerol at 0.96. A converging sampler moving
+steadily AWAY from the chemistry is a wrong target, not an unfinished walk -
+which is the opposite of what a step sweep usually shows and the opposite of
+what "the model is not confident here" would predict.
+
+🔴 **AND THE FIRST RUN OF THAT SWEEP MEASURED NOTHING**, which is worth more
+than the numbers. Four arms at 15/32/64/200 came back four identical folds -
+same certainty, same 2.0 s, same "11 steps" - because `fold-in-page.py` set
+`#af3-count` FOURTH, before `msa-mode` and `plm-mode` had fired their change
+handlers, and `syncAf3Count` REBUILDS that dial from the chosen model's table
+and resets it to the preferred value. Every `--steps` this tool has ever been
+given went the same way: `--steps=4` on AlphaFold 3 folded at **25**. It is set
+last now, and the `controls:` line it already printed is what shows it took.
+An arm that changes nothing is usually an arm that did not run.
+
+**What is still open**: WHERE in the atomised path. The ligand control says the
+atom encoder and the sampler can place a rigid group; what differs for a
+modification is that its atoms carry a residue's `residueIndex` and share a
+chain with polymer tokens. `modifiedAsOneToken` (above) is the boltz2-shaped
+fix and was measured as a dead end here.
+
+**The original framing**, kept: is this the MODEL or this port's
 atomised path? The measurements that would separate them are EF2 on a plain
 CCD ligand (known good - `npm run test:ligand` folds a glycerol) against a
 modified residue in the same job, and the same fold at more sampler steps; and
