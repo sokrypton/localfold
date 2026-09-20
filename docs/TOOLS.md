@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-333 tools. `tools/fixtures/` is data and is not listed.
+334 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (190)
 
@@ -257,7 +257,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`template_reference.py`** - AF2-multimer's template embedder, in numpy.
 - **`triangle_reference.py`** - AF2's fused triangle multiplication on the toy pair, as a reference.
 
-## `tools/esmc/` - ESM-C and ESMFold2 export (18)
+## `tools/esmc/` - ESM-C and ESMFold2 export (19)
 
 The PyTorch side of the ESMFold2 port: fetching the checkpoint, probing it,
 and turning it into a bundle.
@@ -276,6 +276,7 @@ and turning it into a bundle.
 - **`gptq.py`** - Calibrated weight quantisation: GPTQ and an importance-weighted range search.
 - **`probe-esmc-compression.py`** - How far can ESM-C 600M be compressed before ESMFold2 stops recognising it?
 - **`probe-esmfold2-atom-attention.py`** - Inside ONE atom attention, so a 2.4e-3 residual can be localised.
+- **`probe-esmfold2-modified.py`** - Does NATIVE ESMFold2 place a modified residue, where this port does not?
 - **`probe-esmfold2-structure.py`** - What a compressed ESM-C costs the STRUCTURE, not the pair representation.
 - **`quantisation.py`** - The quantisation schemes, applied to a flat array of weights.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.

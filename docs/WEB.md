@@ -571,7 +571,45 @@ fingerprint: any compact blob of ten atoms matches another compact blob of ten
 atoms to about that, and the backbone superposition above refutes it outright.
 **Match the labels before believing a shape.**
 
-**What is still open**: WHERE in the atomised path. The ligand control says the
+🔴 **ANSWERED OUTRIGHT: IT IS THIS PORT, NOT THE MODEL.** The native checkpoint
+places the phosphoserine perfectly. `tools/esmc/probe-esmfold2-modified.py`
+folds the same 58-mer with the same `SEP@3` through `esm` 3.4.1's own
+`ESMFold2InputBuilder` and `EsmFold2ExperimentalModel`, on the same weights this
+port reads:
+
+| same input, same checkpoint | control | the SEP |
+|---|---:|---:|
+| **native ESMFold2** | 1.000 | **0.997** |
+| this port | 0.999 | **2.349** |
+
+Both controls are the same 171 backbone bonds of the 57 unmodified residues.
+Native's worst SEP bond is 2.6% out; this port's `OG-P` is 2.06-4.25 A against a
+1.610 ideal.
+
+🔴 **AND THE TOKENISATION IS NOT THE DIFFERENCE**, which is worth knowing before
+anyone goes looking there. The reference reports **67 tokens**, the modified
+residue as **10 tokens of one atom each**, all `mol_type` 0 - PROTEIN. This port
+produces 67 tokens, ten atom tokens, `molType` PROTEIN. Its own tokeniser's
+docstring says so: *"Modified residues (from modifications) are atom-tokenized
+(1 token per atom)"*. So the layout agrees, the conformer agrees, the bonds
+agree, and the answer is downstream of all of it.
+
+🔴 **AND "THE BOX WOULD NOT FIT IT" WAS STALE.** docs/EF2FAST.md says the EF2
+oracle needs torch, which "does not fit on this box" - from when the disk was
+down to 2.2 GB. There is **280 GB free**, `~/venv_ef2` has torch 2.7.1+cu126
+with CUDA, and both checkpoints are already on disk (`esmfold2-fast-600m` 654
+MB, `esmc-600m` 2.2 GB). The comparison cost one probe, not a download.
+
+🔴 **AND THE FIRST NATIVE NUMBER WAS 1.101 AND WRONG, BY THE MISTAKE THIS
+SECTION HAD JUST FINISHED WARNING ABOUT.** The atom names came from slicing the
+CCD's list to the first ten - which keeps **OXT**, a leaving atom a mid-chain
+residue drops - so every name after it shifted by one and `OG-P` was measured
+against the phosphorus's neighbour. Read through the reference's own
+`get_ccd_leaving_atoms`, the order is `N,CA,CB,OG,C,O,P,O1P,O2P,O3P` and the
+mean is 0.997. A near-miss number is the dangerous kind: 1.101 would have read
+as "native is imperfect here too" and closed the question the wrong way.
+
+**What is still open**: WHERE in this port's atomised path. The ligand control says the
 atom encoder and the sampler can place a rigid group; what differs for a
 modification is that its atoms carry a residue's `residueIndex` and share a
 chain with polymer tokens. `modifiedAsOneToken` (above) is the boltz2-shaped
