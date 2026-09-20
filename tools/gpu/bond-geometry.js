@@ -114,8 +114,16 @@ export function bondGeometry(pdb, conformers, options = {}) {
   const classes = { mainchain: [], sidechain: [], peptide: [], nucleic: [], ligand: [] };
   const offenders = [];
 
+  // 🔴 THE RATIO IS KEPT BESIDE THE DIFFERENCE, because they answer different
+  // questions and only one of them travels. `rms(seen - ideal)` is an absolute
+  // error in angstroms, which is what a fold's quality is read in; a RATIO is
+  // dimensionless and is what CLAUDE.md's 0.70-1.30 band and every
+  // modified-residue number in these docs are stated in. Deriving one from the
+  // other after the fact needs the bonds, and only the worst five survive.
+  const ratios = { mainchain: [], sidechain: [], peptide: [], nucleic: [], ligand: [] };
   const record = (kind, label, seen, ideal) => {
     classes[kind].push(seen - ideal);
+    if (ideal > 0) ratios[kind].push(seen / ideal);
     offenders.push({ kind, label, seen, ideal, error: Math.abs(seen - ideal) });
   };
 
@@ -189,6 +197,14 @@ export function bondGeometry(pdb, conformers, options = {}) {
     all: { rms: rms([...classes.mainchain, ...classes.sidechain,
                      ...classes.peptide, ...classes.nucleic, ...classes.ligand]),
            bonds: offenders.length },
+    // ...the median ratio per class, which is the form the bands are in. Median
+    // rather than mean, as probe-modified.js takes it: one atom thrown across
+    // the box should not decide whether a residue is the right shape.
+    ratios: Object.fromEntries(Object.entries(ratios).map(([kind, values]) => {
+      if (values.length === 0) return [kind, null];
+      const sorted = [...values].sort((a, b) => a - b);
+      return [kind, Number(sorted[Math.floor(sorted.length / 2)].toFixed(3))];
+    })),
     worst: offenders.slice(0, 5).map((o) => ({
       ...o, seen: Number(o.seen.toFixed(3)), ideal: Number(o.ideal.toFixed(3)),
       error: Number(o.error.toFixed(3)) })),

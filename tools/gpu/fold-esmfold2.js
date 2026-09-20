@@ -32,6 +32,11 @@ import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
 import { toDensePositions } from "../../src/esmfold2/featurise.js";
 import { toPdb } from "../../src/af3/fold.js";
+// 🔴 THE SHARED SCORER, NOT A SECOND COPY. `bondGeometry` reads each residue's
+// bonds from the CCD - stated bonds with orders, not a distance cutoff - and
+// takes a `components` map so a modified residue is scored against its OWN
+// dictionary entry. docs/AF2.md's rule: a fold is not scored against itself.
+import { bondGeometry } from "./bond-geometry.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 import { setMemoryBudget } from "../../src/runtime/device-memory.js";
@@ -151,6 +156,12 @@ export async function main(device, args = []) {
   // RDKit rather than through mmCIF, and takes the ideal conformer for the same
   // reason.
   const ligandCodes = option(args, "ligands", "").split(",").filter((c) => c !== "");
+  // 🔴 CODE@POSITION, 1-BASED, AS THE PAGE COUNTS. `npm run test:modified`
+  // folds a SEP@3 through seven AF3-lineage bundles and could not reach this
+  // one - `probe-modified.js` opens an AF3 store and calls `foldBatch` - which
+  // is why an ESMFold2 fold silently dropped its modification for as long as it
+  // did, and why a USER found that and no gate did.
+  const modifySpec = option(args, "modify", "");
   // 🔴 PRICED AGAINST THE SAMPLER'S OWN SPREAD, NOT AGAINST ZERO. The trunk's
   // two f16 knobs - the transition's staged tiles and the triangle projection's
   // accumulators - are worth 1.09x and 1.17x at 150 tokens, and the question is
@@ -313,10 +324,34 @@ export async function main(device, args = []) {
     return result.single;
   };
 
+  // 🔴 ONE BUILDER FOR THREE CALL SITES. This literal was written out three
+  // times, and a key absent from one of them is a key thrown away on whichever
+  // path took it - which is exactly how `modifications` went missing in
+  // web/app.js. CLAUDE.md's allow-list trap; forward the object.
+  const entitiesFor = () =>
+    (kinds === "" && ligands.length === 0 && modifications.length === 0)
+      ? sequence
+      : { sequence,
+          ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
+          ...(ligands.length === 0 ? {} : { ligands }),
+          ...(modifications.length === 0 ? {} : { modifications }) };
+
   const ligands = [];
   for (const code of ligandCodes) {
     const text = await (await fetch(ccdUrl(code))).text();
     ligands.push(parseCcdComponent(text));
+  }
+  // ...and a modified residue's component from the same place, for the reason
+  // web/af3-model.js gives: the featuriser is synchronous, so a CODE has to
+  // become ATOMS before it is called.
+  const conformers = modifySpec === "" ? null
+    : await (await fetch("/tools/oracle/reference-conformers.json")).json();
+  const modifications = [];
+  for (const piece of modifySpec.split(",").filter((one) => one !== "")) {
+    const [code, position] = piece.split("@");
+    const text = await (await fetch(ccdUrl(code.toUpperCase()))).text();
+    modifications.push({ chain: 0, position: Number(position),
+                         ...parseCcdComponent(text) });
   }
 
   const progress = [];
@@ -328,9 +363,7 @@ export async function main(device, args = []) {
   const result = await foldEsmfold2(device, {
     sequence, allocator, seed, sampler,
     ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
-    entities: (kinds === "" && ligands.length === 0) ? sequence
-      : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
-          ...(ligands.length === 0 ? {} : { ligands }) },
+    entities: entitiesFor(),
     shape: { ...M, loops: recycles + 1 },
     submissionWindow,
     trunk: {
@@ -388,9 +421,7 @@ export async function main(device, args = []) {
     second = await foldEsmfold2(device, {
       sequence, allocator, seed, sampler,
       ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
-      entities: (kinds === "" && ligands.length === 0) ? sequence
-        : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
-            ...(ligands.length === 0 ? {} : { ligands }) },
+      entities: entitiesFor(),
       shape: { ...M, loops: recycles + 1 },
       submissionWindow,
       weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
@@ -406,9 +437,7 @@ export async function main(device, args = []) {
     const other = await foldEsmfold2(device, {
       sequence, allocator, seed, sampler,
       ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
-      entities: (kinds === "" && ligands.length === 0) ? sequence
-        : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
-            ...(ligands.length === 0 ? {} : { ligands }) },
+      entities: entitiesFor(),
       shape: { ...M, loops: recycles + 1 },
       submissionWindow,
       trunk: {
@@ -994,6 +1023,27 @@ export async function main(device, args = []) {
       })(),
       perToken: [...result.certainty].map((v) => Number(v.toFixed(4))),
     },
+    // 🔴 THE TWO NUMBERS `check-modified-path.mjs` READS, in the shape
+    // probe-modified.js already returns them, so the gate needs one extra row
+    // and no second contract. The CONTROL is mandatory and comes from the same
+    // structure: at a low step count every model's unmodified residues are bad
+    // too, and a modified-residue number without one measures nothing.
+    ...(modifications.length === 0 || conformers === null ? {} : (() => {
+      // 🔴 `tools/oracle/reference-conformers.json`, NOT src/'s table. The
+      // scorer wants each atom as `{name, pos}` and the src export is a
+      // different shape - passing it throws inside `idealBonds` on
+      // `atoms[i].pos`. Every other caller of bondGeometry fetches this file.
+      const scored = bondGeometry(pdb, conformers, {
+        components: new Map(modifications.map((one) => [one.code, one])),
+      });
+      return {
+        // A component with no conformer is scored in the `ligand` class, which
+        // is where a modified residue's own dictionary bonds land.
+        modifiedBondRatio: scored.ratios.ligand ?? 0,
+        controlBondRatio: scored.ratios.mainchain ?? 0,
+        modifiedCode: modifications.map((one) => one.code).join(","),
+      };
+    })()),
     contactAgreement: agreement,
     // 🔴 A CHECKSUM OF EVERY ATOM, so an arm that changed the fold says so. A
     // fold tool that prints a pLDDT and a contact count can watch a structure

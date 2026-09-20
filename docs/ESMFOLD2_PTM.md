@@ -208,3 +208,42 @@ labelled 1.892, which reads as "right shape, wrong names — a permutation bug".
 It is not: any compact blob of ten atoms matches another to about that, and a
 backbone superposition refutes it outright (N 0.57, CA 0.80, C 0.74 Å, side
 chain 1.4-4.1). Match the labels before believing a shape.
+
+## The gate that was missing
+
+`npm run test:modified` drove `probe-modified.js` alone, which opens an AF3
+store and calls `foldBatch` - so ESMFold2 was unreachable by the one gate that
+exists to catch exactly this, while the page's guard had always OFFERED modified
+residues for it. That is why a user found this and no gate did.
+
+An entry may carry its own `tool` and `args` now, the way
+`check-template-path.mjs`'s may. `tools/gpu/fold-esmfold2.js` grew `--modify`
+and reports the two numbers the gate already reads, so the gate needed one row
+and no second contract:
+
+```
+ok    alphafold3    modified 0.980   control 1.005   band 0.7-1.3
+ok    protenix2     modified 0.996   control 1.006
+ok    intellifold2  modified 0.978   control 1.004
+ok    openbind0     modified 0.862   control 1.007
+ok    opendde       modified 1.001   control 1.005
+ok    rosettafold3  modified 0.984   control 1.003
+ok    boltz2        modified 0.938   control 0.997
+ok    esmfold2      modified 0.985   control 1.008
+```
+
+Watched failing: with the restype fix reverted the row reads **`FAIL esmfold2
+modified 2.264 control 1.004`** and the gate exits 1.
+
+🔴 **IT FOLDS AT diffusion-200 AND THE OTHERS AT 16**, which is not a
+preference: the vendor breaks below 15 steps - at 11 its own CONTROL is 2.155 -
+so a low count would fail this row for the sampler rather than for the residue,
+and the control assertion would catch it as "the fold has not converged". The
+step count belongs to the model, not to the gate.
+
+🔴 **AND `bondGeometry` RETURNS A RATIO PER CLASS NOW.** It reported `rms(seen -
+ideal)` in angstroms, which is what a fold's quality is read in, while every
+band in these docs - CLAUDE.md's 0.70-1.30, every number in this file - is a
+dimensionless RATIO. Deriving one from the other afterwards needs the bonds and
+only the worst five survived the return. Both are there; neither is computed
+twice.

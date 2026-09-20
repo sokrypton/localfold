@@ -55,6 +55,24 @@ const MODELS = [
   { name: "rosettafold3", bundle: "model-rosettafold3-int5",
     arm: ["--mode=diffusion", "--steps=200"] },
   { name: "boltz2", bundle: "model-boltz2-int5" },
+  // 🔴 ESMFold2 DRIVES ITS OWN TOOL, AND ITS ABSENCE HERE IS WHY A USER FOUND
+  // THE BUG. `probe-modified.js` opens an AF3 store and calls `foldBatch`, so
+  // it cannot reach this model at all - and the page's own guard has always
+  // OFFERED modified residues for ESMFold2. It was never given them:
+  // `foldWithEsmfold2` did not take `modifications` and its entities literal
+  // did not name one, so a SEP@3 folded a plain serine at a confident 0.59 and
+  // nothing anywhere said so. An entry carries its own `tool` and `args` for
+  // this, the way check-template-path.mjs's do.
+  //
+  // 🔴 AND IT MUST BE FOLDED AT 200, NOT THE PAGE'S DEFAULT. The vendor breaks
+  // below 15 steps - at 11 its own CONTROL is 2.155 - so a low count would fail
+  // this gate for the sampler rather than for the residue. See
+  // docs/ESMFOLD2_PTM.md.
+  { name: "esmfold2", bundle: "model-esmfold2-int5",
+    tool: "tools/gpu/fold-esmfold2.js",
+    args: ["--bundle=/model-esmfold2-int5", "--modify=SEP@3",
+           "--sampler=diffusion-200",
+           "--sequence=GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"] },
 ];
 
 const FLOW = ["--mode=flow", "--steps=16"];
@@ -65,9 +83,13 @@ for (const model of MODELS) {
     skipped += 1;
     continue;
   }
-  const run = spawnSync("node", ["tools/gpu-chrome.mjs", "tools/gpu/probe-modified.js",
-    `--model=/${model.bundle}/manifest.json`, "--code=SEP", "--at=3",
-    ...(model.arm ?? FLOW)], { encoding: "utf8", maxBuffer: 1 << 28 });
+  // An entry may bring its own tool and its own arguments; the default is the
+  // AF3-lineage probe, which is what every other row wants.
+  const run = spawnSync("node", ["tools/gpu-chrome.mjs",
+    model.tool ?? "tools/gpu/probe-modified.js",
+    ...(model.args ?? [`--model=/${model.bundle}/manifest.json`, "--code=SEP",
+                       "--at=3", ...(model.arm ?? FLOW)])],
+    { encoding: "utf8", maxBuffer: 1 << 28 });
   const text = (run.stdout ?? "").split("\n").filter((l) => !l.startsWith("[gpu-chrome]")).join("\n");
   const at = text.indexOf("{");
   if (at < 0) {
