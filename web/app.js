@@ -118,6 +118,15 @@ function foldStem(fallback) {
 // on what the model still held. `set` is the same call the paste path makes.
 window.__entityList = entityList;
 
+// 🔴 AND THE FINISHED PREDICTION, FOR THE SAME REASON. A backend driving this
+// page headlessly (tools/colab_backend.py) could read the STRUCTURE out of the
+// download button and nothing else - so a remote fold arrived with no
+// alignment, no confidence and no scores card, which is most of what the page
+// shows about a fold. `lastPrediction` is a module binding; a function rather
+// than the value because it is REASSIGNED on every fold and a captured
+// reference would hand back the one before.
+window.__lastPrediction = () => lastPrediction;
+
 // 🔴 THE ENTITY LIST IS THE INPUT NOW, and everything below it still reads a
 // colon-joined sequence: expandEntities turns copies into repeated chains and
 // hands back exactly the string the textarea used to hold, plus the ligand
@@ -3352,7 +3361,17 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   const camera = { ...(liveRenderer?.viewerState ?? {}) };
   const live = liveRenderer?.objectsData?.[liveRenderer?.currentObjectName];
   if (live?.frames !== undefined) live.frames.length = 0;
-  await loadIntoViewer({ stem, pdb: framePdbs[0] ?? result.pdb, scores: {} });
+  // 🔴 EVERYTHING THE LOCAL PATH INGESTS, NOT JUST THE STRUCTURE. This used to
+  // pass `{pdb, scores: {}}`, so a remote fold came back with no MSA panel, no
+  // PAE plot and an empty scores card - the page looked like it had folded
+  // nothing but coordinates, because it had been given nothing else.
+  await loadIntoViewer({
+    stem, pdb: framePdbs[0] ?? result.pdb,
+    scores: result.scores ?? {},
+    a3m: result.a3m,
+    confidence: result.confidence,
+    length: result.length,
+  });
   if (viewer !== undefined && Object.keys(camera).length > 0) {
     Object.assign(viewer.viewerState, camera);
     viewer.render?.("localfold.restore-camera");

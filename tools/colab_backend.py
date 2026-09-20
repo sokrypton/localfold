@@ -105,7 +105,18 @@ READBACK_JS = """(async () => {
   }
   URL.createObjectURL = made;
   const pdb = blobs[0] ? await blobs[0].text() : '';
+  // 🔴 AND WHAT THE PAGE KNOWS BESIDES THE COORDINATES. A remote fold used to
+  // arrive as a structure and nothing else - no alignment, no confidence, no
+  // scores - because this readback only ever clicked the download button.
+  // `window.__lastPrediction()` is the same object the local path hands to
+  // loadIntoViewer. The alignment can be megabytes and the matrices are n^2,
+  // so they travel only when they exist.
+  const pred = (window.__lastPrediction && window.__lastPrediction()) || {};
   return {
+    a3m: pred.a3m ?? null,
+    confidence: pred.confidence ?? null,
+    scores: pred.scores ?? null,
+    chains: pred.chains ?? null,
     status: document.getElementById('status-message')?.textContent ?? null,
     frames: o && o.frames ? o.frames.length : 0,
     positions: v && v.coords ? v.coords.length : 0,
@@ -317,6 +328,18 @@ class Backend:
                 return {"error": "the fold did not finish",
                         "status": state.get("status")}
             time.sleep(0.25)
+        # 🔴 AND THE TAP IS DRAINED AFTER THE LOOP, OR THE LAST FRAMES NEVER
+        # TRAVEL. The watch loop drains as it polls and then BREAKS - so every
+        # frame the sampler emitted between the final poll and the end of the
+        # fold was collected by the page and thrown away here. Reported as
+        # skipped frames during a remote fold, and it is the END of the
+        # trajectory that goes, which is the part worth watching.
+        if job is not None:
+            tail = cdp.evaluate(self.ws, """(() => {
+              const t = window.__remoteTap || [];
+              return t.splice(0, t.length);
+            })()""")
+            job["events"].extend(tail or [])
         # 🔴 "READY" IS "IT CAN HAND ONE OVER", NOT "THE BUTTON CAME BACK".
         # `loadIntoViewer` CLEARS the object's frames and re-adds them, so the
         # moment after a fold ends is a window with a settled status line, an
@@ -335,6 +358,15 @@ class Backend:
                 out["error"] = "the page never produced a structure"
                 break
             time.sleep(0.5)
+        # ...and once more, because `loadIntoViewer` runs at the END of a local
+        # fold and the readback above WAITS for it: the frames it re-adds, and
+        # the status line it writes, are emitted inside that wait.
+        if job is not None:
+            last = cdp.evaluate(self.ws, """(() => {
+              const t = window.__remoteTap || [];
+              return t.splice(0, t.length);
+            })()""")
+            job["events"].extend(last or [])
         out["ms"] = int((time.time() - started) * 1000)
         return out
 
