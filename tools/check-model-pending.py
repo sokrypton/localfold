@@ -425,6 +425,18 @@ finally:
     except subprocess.TimeoutExpired:
         backend.kill()
 
+# 🔴 AND A GATE THAT LEAVES A BROWSER BEHIND IS THE NEXT MEASUREMENT'S PROBLEM.
+# Counted after a green run: eight Chrome processes still on the runtime's
+# profile, because the broker's own browser outlives the SIGINT that stops it.
+# The broker kills it now; this asks, because the check costs nothing and the
+# symptom - somebody else's browser on the machine - is one the neighbouring
+# suites have been wrong about before.
+left = subprocess.run(["pgrep", "-f", "localfold-pending-runtime"],
+                      capture_output=True, text=True).stdout.split()
+if left:
+    bad.append(f"{len(left)} browser process(es) are still on the runtime's"
+               " profile after the broker stopped")
+
 print()
 for line in bad:
     print("FAIL: " + line)

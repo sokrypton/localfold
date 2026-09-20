@@ -50,6 +50,7 @@ import json
 import os
 import secrets
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -406,6 +407,20 @@ def main():
             time.sleep(3600)
     except KeyboardInterrupt:
         pass
+    finally:
+        # 🔴 THE BROWSER IS THIS PROCESS'S, AND IT DOES NOT DIE WITH IT.
+        # `cdp.launch` starts a headless Chrome that outlives a Ctrl-C and a
+        # SIGINT from a gate - found by counting processes after a green run:
+        # eight of them, on the profile this backend had just stopped using.
+        # In a Colab runtime the container takes them; on a developer's machine
+        # they are the "another browser on the machine" that makes the next
+        # measurement somebody else's.
+        if backend.proc is not None:
+            backend.proc.terminate()
+            try:
+                backend.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                backend.proc.kill()
 
 
 if __name__ == "__main__":
