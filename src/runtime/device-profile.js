@@ -937,6 +937,42 @@ const PRIORS = new Map([
     // the devices that do, and for the day the matrix path is bisected out.
     opmProjectOutputPairs: 4,
   }],
+  // Tesla T4 (Turing, 40 SMs, 48 KiB of workgroup storage), which is what
+  // Colab hands out - so this is the part most people who fold from a notebook
+  // are on. Measured there; see docs/PERF.md.
+  //
+  // 🔴 ONE KNOB, AND THE REST ARE THE DEFAULTS ON PURPOSE. Ampere's entry is
+  // the neighbour this architecture would inherit from if priors were keyed by
+  // vendor, and it is a **40% REGRESSION** here - `bench-triangle` at L=300
+  // goes 127.0 ms to 173.4 - with each of its triangle knobs losing on its own
+  // too. Turing has 64 FP32 lanes per SM against Ampere's 128 and half the
+  // workgroup storage, so its shapes do not transfer, and `16x4` on the kernel
+  // below will not even build here (65536 bytes against a 49152 limit).
+  //
+  // 🔴 WHAT DOES TRANSFER IS NOTHING; WHAT WAS MEASURED IS THIS. The outer
+  // product mean is the trunk's second-largest kernel, and this part wants
+  // FEWER, FATTER workgroups than any device measured before it -
+  // `bench-opm.js --rows=1024`, ms, the shipped block of two against eight:
+  //
+  //     tokens      150     256     300     400
+  //     blockI 1   67.2   231.3   341.7   649.8
+  //     blockI 2   52.4   164.5   208.2   386.4   <- ships
+  //     blockI 4   55.5   111.4   181.1   310.7
+  //     blockI 8   25.2    81.4    95.6   173.8   <- 2.0-2.2x, every size
+  //
+  // It is not a band and it is not a crossover: eight wins from 150 tokens to
+  // 400 and the ordering is monotone in the block. `blockJ` stays 4 - 8x2 is
+  // 280.9 ms and 8x1 is 440.1 against 8x4's 206.6 at 400 tokens - and the cell
+  // chunk stays at its default, where shrinking it is catastrophic (8x4@8 is
+  // 3372.9 ms, 8x4@2 is 13366.7). Every arm agrees numerically (relRms 0).
+  //
+  // 🔴 AND `opmBlockITokens` IS DELIBERATELY ABSENT. Ampere's "above 256
+  // tokens take a block of ONE" is that card's memory system turning over;
+  // here block ONE is the WORST arm at every size measured, so the threshold
+  // would be exactly backwards.
+  ["turing", {
+    opmBlockI: 8,
+  }],
   // Apple M2, 10 cores, macOS 13.2, Chrome 152 - the machine docs/PERF.md is
   // measured on, reporting {vendor: "apple", architecture: "metal-3"}.
   //
