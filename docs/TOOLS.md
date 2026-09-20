@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-331 tools. `tools/fixtures/` is data and is not listed.
+333 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (190)
 
@@ -281,7 +281,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (81)
+## `tools/` - everything else (83)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -323,6 +323,8 @@ go through CDP, and the deploy.
 - **`check-stock-flags.mjs`** - Does every model fold on the browser a VISITOR has?
 - **`check-template-path.mjs`** - Every AF3-lineage model's TEMPLATE actually moves its fold.
 - **`check_remote_bundle.py`** - Is every shard a manifest names actually at the remote, at the right length?
+- **`colab-client.html`** - LocalFold · a fold on somebody else's GPU
+- **`colab_backend.py`** - LocalFold's own fold, on somebody else's GPU, reached over one URL.
 - **`contact-map-dividers.py`** - Does the contact map get its chain divider lines while a fold is running?
 - **`convert_multimer_params.py`** - Normalise AF2 monomer OR multimer parameters onto one graph.
 - **`deploy.py`** - Push, deploy, and prove the site is serving what was pushed.

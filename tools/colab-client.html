@@ -1,0 +1,100 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>LocalFold · a fold on somebody else's GPU</title>
+<!--
+  THE PAGE SIDE OF tools/colab_backend.py, BEFORE IT IS A DROPDOWN.
+
+  Paste the line the notebook prints - `https://…trycloudflare.com#token` -
+  and this asks that runtime what card it has, then folds on it and draws the
+  answer here. It is the whole loop in one file, which is what makes it worth
+  keeping after the dropdown exists: when the real thing stops working, this
+  says which half.
+
+  🔴 THE TOKEN LIVES IN THE FRAGMENT, which is the one part of a URL a browser
+  never sends to a server. The handle can be pasted, logged and screenshotted
+  with less risk than a query string, and it is split off here before anything
+  is fetched.
+-->
+<style>
+  body { font: 14px/1.5 ui-sans-serif, system-ui; margin: 24px; max-width: 980px; }
+  input { width: 100%; box-sizing: border-box; font-family: ui-monospace, Menlo, monospace;
+          font-size: 12px; padding: 7px; }
+  label { display: block; margin: 12px 0 3px; font-weight: 600; }
+  button { padding: 8px 14px; margin: 12px 8px 0 0; font-size: 14px; }
+  #log { white-space: pre-wrap; background: #0b1020; color: #d7e0ff; padding: 12px;
+         border-radius: 8px; min-height: 120px; margin-top: 14px; font-size: 12px; }
+  #viewer { width: 420px; height: 420px; margin-top: 14px; border: 1px solid #e5e7eb;
+            border-radius: 8px; }
+</style>
+<h1>A fold on somebody else's GPU</h1>
+
+<label for="handle">The line the notebook printed</label>
+<input id="handle" placeholder="https://something.trycloudflare.com#token">
+
+<label for="sequence">Sequence</label>
+<input id="sequence" value="GWSTELEKHRSVQ">
+
+<label for="options">Model · steps · recycles</label>
+<input id="options" value="af3 3 1">
+
+<button id="health">What card is it?</button>
+<button id="fold">Fold there</button>
+
+<div id="log"></div>
+<div id="viewer"></div>
+
+<script src="../web/vendor/py2Dmol.embed.min.js"></script>
+<script>
+const log = (line) => { document.getElementById("log").textContent += line + "\n"; };
+const handle = () => {
+  const raw = document.getElementById("handle").value.trim();
+  const cut = raw.indexOf("#");
+  if (cut < 0) throw new Error("the line carries its token after a #");
+  return { url: raw.slice(0, cut).replace(/\/$/, ""), token: raw.slice(cut + 1) };
+};
+
+document.getElementById("health").addEventListener("click", async () => {
+  try {
+    const { url, token } = handle();
+    const started = performance.now();
+    const answer = await fetch(`${url}/health`, { headers: { "X-LocalFold-Token": token } });
+    const said = await answer.json();
+    log(`health ${answer.status} in ${Math.round(performance.now() - started)} ms`);
+    log(JSON.stringify(said.gpu, null, 1));
+    // 🔴 THE ONE LINE WORTH READING BEFORE ANY FOLD. An adapter that says
+    // SwiftShader is the CPU pretending, and every number after it is a
+    // measurement of a fallback.
+    const name = JSON.stringify(said.gpu).toLowerCase();
+    if (name.includes("swiftshader") || name.includes("llvmpipe")) {
+      log("🔴 that is a software renderer, not the card");
+    }
+  } catch (cause) { log("health failed: " + cause.message); }
+});
+
+document.getElementById("fold").addEventListener("click", async () => {
+  try {
+    const { url, token } = handle();
+    const [model, steps, recycles] = document.getElementById("options").value.split(/\s+/);
+    const body = {
+      sequence: document.getElementById("sequence").value.trim(),
+      model: model || "af3",
+      steps: Number(steps || 8), recycles: Number(recycles || 3),
+    };
+    log(`folding ${body.sequence.length} residues on ${body.model}…`);
+    const started = performance.now();
+    const answer = await fetch(`${url}/fold`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-LocalFold-Token": token },
+      body: JSON.stringify(body),
+    });
+    const said = await answer.json();
+    if (said.error) { log("the runtime said: " + said.error + " · " + (said.status || "")); return; }
+    log(`${said.status}`);
+    log(`${said.atoms} atoms, ${said.frames} frames, ${said.ms} ms there,`
+        + ` ${Math.round(performance.now() - started)} ms door to door`);
+    // ...and drawn with the same viewer the page uses, from the PDB text that
+    // came back, so what is on screen is the file and not a summary of it.
+    py2Dmol.show(document.getElementById("viewer"), said.pdb, { controls: false });
+  } catch (cause) { log("fold failed: " + cause.message); }
+});
+</script>
