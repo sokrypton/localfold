@@ -2098,19 +2098,53 @@ which would have turned 44 s into writing one JSON - is false.
   package, same box, reinstall either way: **18.4 s plain against 16.7 s**,
   and Chrome **17.1 against 17.6** - the wrong way round. Inside the noise
   both times.
-- 🔴 **AN EXTRACTED CHROME HAS NO WEBGPU AT ALL.** `dpkg-deb -x` unpacks it in
-  **9.6 s** against 17-21 s through dpkg, and the whole extraction route
-  (driver + Chrome + clone) is **28.6 s against 71.4** - a 60% cut. It needs
-  four small libraries the image lacks (`libatk-1.0`, `libatk-bridge-2.0`,
-  `libatspi`, `libXcomposite`, 7.6 s), after which Chrome starts in 566 ms and
-  `navigator.gpu` is **undefined**: ANGLE fails with *"Extension not supported:
-  VK_KHR_surface"* and the display never initialises.
-  **AND THE ISOLATION SAYS IT IS CHROME, NOT THE DRIVER.** Install
-  `libnvidia-gl` properly (41.9 s) on that same box, keep the extracted
-  Chrome, drop the `VK_ICD_FILENAMES`/`LD_LIBRARY_PATH` overrides so the
-  system's own ICD is used: still `webgpu: false`. So the 44 s half might yet
-  be extractable; the 21 s half is not, and a Chrome that starts twice as fast
-  and folds on nothing is a regression wearing a speedup's clothes.
+- 🔴 **"AN EXTRACTED CHROME HAS NO WEBGPU" WAS MY PROBE, NOT THE PACKAGING -
+  AND THE CONTROL IS WHAT SAID SO.** `dpkg-deb -x` unpacks Chrome in **9.6 s**
+  against 17-21 s through dpkg (it needs four small libraries the image lacks:
+  `libatk-1.0`, `libatk-bridge-2.0`, `libatspi`, `libXcomposite`, 7.6 s), and
+  the adapter check then reported `navigator.gpu` **undefined**. I wrote that
+  up as extraction breaking WebGPU, with an isolation to match. Both were
+  wrong: running the SAME check with **both halves properly apt-installed**
+  also reported `webgpu: false`, which is the configuration that has been
+  folding on Colab all along.
+  **`about:blank` IS NOT A SECURE CONTEXT.** `cdp.launch` leaves the browser
+  on it, `navigator.gpu` does not exist off a secure origin, and every
+  "webgpu: false" in this section was that. Navigate to a served page first
+  and the same browser answers **nvidia / turing / shader-f16** with
+  `isSecureContext: true`. The two readings, one page apart, same process:
+
+  | page | answer |
+  |---|---|
+  | `about:blank` | `{webgpu: false, secure: false}` |
+  | `http://127.0.0.1:8799/index.html` | `{vendor: nvidia, architecture: turing, f16: true}` |
+
+  🔴 **A PROBE THAT CANNOT SAY YES CANNOT SAY NO.** Three experiments were
+  scored against it and one of them was committed as a finding. The rule this
+  file keeps relearning, in its sharpest form yet: **an instrument needs a
+  positive control before its negatives mean anything** - here, one known-good
+  configuration answering `nvidia` would have caught it before the first
+  conclusion was drawn.
+
+- 🔴 **AND WITH A SOUND PROBE, EXTRACTING THE DRIVER IS REJECTED ON ITS
+  MERITS.** Re-run against a served page, the timing half is real: the driver
+  downloaded and unpacked by hand takes **13.6 s and hides entirely underneath
+  Chrome's dpkg**, because it never touches the dpkg lock - **36.8 s total
+  against 71.4**. The GPU half fails, three ways, each measured:
+
+  | the extracted driver, reached by | adapter |
+  |---|---|
+  | `VK_ICD_FILENAMES` + `LD_LIBRARY_PATH` | `null` |
+  | copied into `/usr/lib` + `/usr/share/vulkan/icd.d`, `ldconfig` (3.7 s) | `null` |
+  | ...plus `libnvidia-gpucomp` and `libnvidia-compute` extracted too, `ldd` clean | `null` |
+
+  `apt-get download` fetches ONE package, and `libGLX_nvidia.so.0` needs
+  `libnvidia-gpucomp.so` from another - which `ldd` named exactly, and
+  supplying it changed nothing. `webgpu: true` throughout, so the browser and
+  the probe are fine; it is `requestAdapter()` that returns nothing. Whatever
+  else `dpkg` does for this driver, a file copy does not reproduce it.
+  **So the 44 s is not avoidable by unpacking it differently**, and the ~35 s
+  version of this setup does not fold.
+
 - **Skipping what is already present buys nothing on a FIRST run**, which is
   the run people complain about. The probes are still right for a rerun - a
   runtime keeps its filesystem between cells - but on a cold T4 the ICD
