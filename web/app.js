@@ -426,6 +426,41 @@ function reportModelFromUrl(attempt = 0) {
  * cache, the download stem, the labels) has to see the resolved one or two
  * bundles get mistaken for each other. See PLM_FAMILIES.
  */
+/**
+ * PUT A PENDING VEIL OVER ANOTHER MODEL'S ANSWER, or take it off again.
+ *
+ * 🔴 OPAQUE, OVER THE RESULT BOXES, AND NOT A CLEAR. The structure and the map
+ * are not deleted - switch the row back and they are there, because they really
+ * are that model's answer - but while another model is selected they are not
+ * the answer to the question the page is now asking, and a dimmed structure is
+ * still a structure to look at. The numbers go, because a stale pLDDT reads as
+ * a measurement rather than as a leftover, which is the rule `updateScoresCard`
+ * already follows at the start of every fold.
+ *
+ * 🔴 AND IT NAMES THE MODEL THE PAGE IS SET TO, not the one being covered: the
+ * way out of the veil is the button it names, and a reader who did not mean to
+ * change the row is told which row they are now on.
+ */
+function syncPendingResult() {
+  const family = chosenFamily();
+  const stale = shownFamily !== undefined && shownFamily !== family;
+  const label = MODEL_LABELS[family] ?? family;
+  for (const id of ["canvasContainer", "heatmapContainer"]) {
+    const box = document.getElementById(id);
+    if (box === null) continue;
+    box.classList.toggle("result-pending", stale);
+    if (stale) box.dataset.pending = `${label} · pending — press Fold`;
+    else delete box.dataset.pending;
+  }
+  updateScoresCard(stale ? undefined : activePrediction()?.confidence);
+}
+
+/** What is on screen came from `family` - or from nothing nameable. */
+function resultIsFrom(family) {
+  shownFamily = family;
+  syncPendingResult();
+}
+
 const chosenFamily = () => {
   const chosen = document.getElementById("model-family")?.value ?? "af3";
   if (SINGLE_SEQUENCE_FAMILIES.includes(chosen)) return PLM_FAMILIES[plmChoice()] ?? chosen;
@@ -528,6 +563,28 @@ const MODEL_STEMS = {
 };
 
 /** What to call each model while its weights download. */
+/**
+ * WHICH MODEL'S ANSWER IS ON SCREEN, AND WHETHER IT IS STILL THE CHOSEN ONE.
+ *
+ * 🔴 A RESULT OUTLIVES THE ROW THAT MADE IT, AND NOTHING SAID SO. Switching the
+ * model row left the previous model's structure, plots and confidence numbers
+ * exactly where they were, under the new model's name - and every one of those
+ * looks the same whichever row is selected, so there is no way to read the
+ * picture and see that it is the other model's. Reported as wanting the viewers
+ * to say PENDING instead of the previous result.
+ *
+ * `undefined` is "nothing here came from a fold on this page" - a dropped file,
+ * a restored session - and nothing is claimed about it, because the claim would
+ * be the fault by another route. A family is what one of the three fold paths
+ * ingested; `null` is a result whose model could not be named, which is stale
+ * against every row.
+ */
+let shownFamily;
+
+/** The family a prediction's own label names, where the label is one we write. */
+const familyFromLabel = (label) => Object.keys(MODEL_LABELS)
+  .find((family) => MODEL_LABELS[family] === label);
+
 const MODEL_LABELS = {
   af3: "AlphaFold 3",
   // Upstream's own name for this release. See src/af3/dialect.js for why the
@@ -2624,6 +2681,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       ...foldContext,
     };
     predictions.set(stem, lastPrediction);
+    resultIsFrom(family);
     element("downloads").style.display = "flex";
     void rememberSessionWhenSettled(lastPrediction);
     // ...and the reader keeps the view they had. A reload flies to its own,
@@ -3452,6 +3510,11 @@ async function followRemoteFold({ since, label, signal }) {
       remote.stem = stem;
       lastPrediction = remote;
       predictions.set(stem, remote);
+      // 🔴 THE RUNTIME'S OWN LABEL, because this page did not choose it. An
+      // attached reader is watching a fold somebody else started, and its own
+      // model row may say anything; `familyFromLabel` answers undefined for a
+      // label we do not write, and undefined claims nothing.
+      resultIsFrom(familyFromLabel(remote.model));
     } catch (cause) {
       console.warn("the runtime's prediction did not parse:", cause);
     }
@@ -3550,6 +3613,11 @@ async function fold(event) {
   // The button is no good either: it stays enabled throughout, being how you
   // stop one. See tools/colab_backend.py.
   window.__foldState = { running: true, since: Date.now() };
+  // 🔴 AND THE VEIL COMES OFF WHEN THE FOLD STARTS, not when it lands: from
+  // here on the page IS answering the question the row asks, and the previous
+  // structure underneath is the same "never blank between folds" the scores
+  // card's own clear is written against.
+  resultIsFrom(undefined);
   setFoldButton("running");
   // ...`msaMode()` and not the select, so the dev log records what the fold
   // will actually do rather than what a hidden control still says.
@@ -4279,6 +4347,10 @@ async function fold(event) {
       ...foldContext,
     };
     predictions.set(stem, lastPrediction);
+    // ...and it is the WINNER's family, not the row's: a sweep folds five and
+    // the one on screen is whichever won, which is the same reason the model
+    // field above says so.
+    resultIsFrom(best.family ?? family);
     // 🔴 A SAFETY NET, because the failure it catches is invisible. onRecycle is
     // optional the whole way down, so a model path that accepts the callback and
     // never calls it would produce a finished fold, a "Done" status and an empty
@@ -4532,7 +4604,14 @@ syncMode();
 // in that order: the second reads the visibility the first just set.
 const familySelect = document.getElementById("model-family");
 if (familySelect !== null) {
-  familySelect.addEventListener("change", () => { syncModelControls(); syncMode(); });
+  // 🔴 AND ALL THREE ROWS THAT MOVE THE FAMILY HAVE TO SAY SO. `chosenFamily`
+  // reads this select, the AF2 number and the PLM row, so a veil hung on only
+  // the first would leave the other two switching models in silence - the same
+  // "everything keyed on a family has to be refreshed here" the comments below
+  // already make about the controls.
+  familySelect.addEventListener("change", () => {
+    syncModelControls(); syncMode(); syncPendingResult();
+  });
 }
 document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
 // 🔴 AND THE MODEL NUMBER CHANGES THE FAMILY TOO, exactly as the PLM row does -
@@ -4542,6 +4621,7 @@ document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
 document.getElementById("af2Model")?.addEventListener("change", () => {
   syncModelControls();
   syncMode();
+  syncPendingResult();
 });
 // 🔴 THE PLM ROW CHANGES THE FAMILY, so everything the model row's own listener
 // refreshes has to refresh here too - `chosenFamily()` reads this select, and a
@@ -4550,6 +4630,7 @@ document.getElementById("af2Model")?.addEventListener("change", () => {
 document.getElementById("plm-mode")?.addEventListener("change", () => {
   syncModelControls();
   syncAf3Count();
+  syncPendingResult();
 });
 // 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
 // row after syncMode() has already read it above, so the controls have to be

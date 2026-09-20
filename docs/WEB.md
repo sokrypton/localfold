@@ -2010,6 +2010,57 @@ snapshot from the top of the probe.
 the box by hand and folding again.
 
 
+## A result belongs to the model that made it
+
+🔴 **SWITCHING THE MODEL ROW LEFT THE PREVIOUS MODEL'S ANSWER ON SCREEN, UNDER
+THE NEW MODEL'S NAME.** The structure, the contact map and the confidence card
+look exactly the same whichever row is selected above them, so there is nothing
+in the picture that says it is the other model's - a reader compares AlphaFold 3
+with Boltz-2 by switching the row, and what they read until they press Fold is
+the first model's fold with the second model's label over it. Reported as
+wanting the viewers to say PENDING instead of the previous result.
+
+`shownFamily` is which model's answer is on screen and `syncPendingResult` is
+the rule. **What it does is a VEIL, not a clear**: the structure and the map
+are still there - switch the row back and they return, because they really are
+that model's answer - but while another model is selected they are covered by
+an opaque panel naming the model the page is now set to, *"Boltz-2 · pending —
+press Fold"*. A dimmed structure is still a structure to look at, which is why
+the panel is opaque rather than a tint. **The numbers go rather than being
+veiled**, which is the rule `updateScoresCard(undefined)` already follows at
+the start of every fold: a stale pLDDT reads as a measurement.
+
+🔴 **`undefined` CLAIMS NOTHING, AND THAT IS A STATE.** A dropped file and a
+restored session did not come from a fold on this page, so nothing is said
+about them - claiming they match the row would be the same fault by another
+route, and claiming they do NOT would put a veil over a session the moment it
+was restored. A family is what one of the three fold paths ingested; `null` is
+a result whose model could not be named, and that is stale against every row.
+
+🔴 **AND ALL THREE ROWS THAT MOVE THE FAMILY HAVE TO SAY SO.** `chosenFamily`
+reads the model select, the AF2 number and the PLM row - the file already
+carries that warning twice about the CONTROLS - so a veil hung on the first
+alone would leave the other two switching models in silence. Measured: the AF2
+number row veils and names *"AlphaFold 2 (model 3)"*.
+
+**IT IS PATH-INDEPENDENT, WHICH IS WHAT MAKES IT TRUE IN BOTH MODES.** The
+local fold, the AF2 sweep (which records the WINNER's family, not the row's)
+and the remote fold all record what they ingested; the remote one reads the
+runtime's own label through `familyFromLabel`, because an attached reader is
+watching a fold it did not start and its own row may say anything.
+
+`npm run test:pending` (`tools/check-model-pending.py`) is the gate, and it
+**measures the veil as pixels**: a class name is set by the page and says
+nothing about whether a stylesheet arrived, so the structure box is
+screenshotted before and after the switch, the `::after` is asked for its
+content and its paint, and the card for its display. To get a prediction onto
+a page without weights it borrows `tools/colab_backend.py` as a FIXTURE - the
+held fold of `check-colab-bridge.py`, with a `result` whose `predJson` names
+its model - which is the only way this machine can put a real ingestion on
+screen. Two mutations: the model row changing in silence (six arms red) and
+the veil's rule removed from the stylesheet (the drawn-mark arms red, the
+class arm green, which is exactly why the pixels are measured).
+
 ## Folding somewhere else, and a page that is not dead while it happens
 
 `tools/colab_backend.py` runs this page in a headless Chrome on a Colab
