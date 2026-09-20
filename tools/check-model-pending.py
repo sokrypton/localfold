@@ -10,6 +10,10 @@ wanting the viewers to show PENDING instead of the previous result.
 
 WHAT IT CHECKS, on a real page with a real result in it:
 
+  * NONE OF IT REACHES AN ORDINARY PAGE: no badge, no retired controls, no
+    "folded on:" in the dev report and no download row, on the page that folds
+    in the reader's own browser - every rule here is conditioned on
+    `?backend=colab` and this is what says so;
   * a result ingested under AlphaFold 3 is NOT veiled while that row is set;
   * moving the row to another model veils the structure box and the map box,
     names the model the page is now set to, and takes the scores card away -
@@ -203,6 +207,44 @@ try:
       window.__pageErrors = [];
       addEventListener('error', (e) => window.__pageErrors.push(String(e.message)));
     """)
+    # 🔴 FIRST, THE ORDINARY PAGE - the one this all has to stay out of. Every
+    # rule below is conditioned on `?backend=colab`, and a badge, a disabled
+    # Fold button or a "folded on:" header appearing on localfold.org would be
+    # today's work leaking onto the page that folds in your own browser.
+    reader_ws.call("Page.navigate", url=f"{BASE}/index.html")
+    cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the plain page")
+    plain = cdp.evaluate(reader_ws, """(() => {
+      const button = document.getElementById('dev-toggle');
+      if (button !== null) button.click();
+      return {
+        badge: document.getElementById('colab-status') === null ? 'none' : 'there',
+        fold: !!document.getElementById('predict')?.disabled,
+        model: !!document.getElementById('model-family')?.disabled,
+        downloads: getComputedStyle(document.getElementById('downloads')).display,
+        note: document.getElementById('privacy-note')?.textContent ?? '',
+        dev: document.querySelector('#dev-panel pre')?.textContent ?? '',
+        errors: window.__pageErrors || [],
+      };
+    })()""")
+    print(f"  the ordinary page: badge {plain['badge']}, fold disabled"
+          f" {plain['fold']}, downloads {plain['downloads']},"
+          f" note {plain['note']!r}")
+    if plain["badge"] != "none":
+        bad.append("a page that folds in this browser is wearing the Colab"
+                   " badge")
+    if plain["fold"] or plain["model"]:
+        bad.append("the ordinary page came up with folding retired - the"
+                   " runtime rules reached a page with no runtime")
+    if plain["downloads"] != "none":
+        bad.append("the download row is up on a page that has folded nothing")
+    if "locally" not in plain["note"]:
+        bad.append(f"the footer says {plain['note']!r} on a page at rest")
+    if "folded on:" in plain["dev"]:
+        bad.append("the dev report claims another machine folded on a page"
+                   " that has no runtime")
+    if plain["errors"]:
+        bad.append(f"the ordinary page threw: {plain['errors'][:2]}")
+
     reader_ws.call("Page.navigate",
                    url=f"{BASE}/index.html?backend=colab&t={TOKEN}")
     cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader's page")

@@ -2289,9 +2289,10 @@ page head names the runtime **and its card** (`nvidia turing` is the GPU,
 which), its pulse goes amber when that runtime stops answering - at the SAME
 twenty seconds after which a fold in flight gives up, because a badge that
 still says connected while the fold gives up is the page saying two things at
-once - and **Disconnect** puts the page back to folding here, stopping the
-fold on the runtime first so its GPU is not held. Built rather than marked up,
-so a page that folds locally carries none of it.
+once - and **Disconnect** stops the service and leaves the page a viewer (see
+above; this sentence used to say it "puts the page back to folding here",
+which it no longer does and which was not what was wanted). Built rather than
+marked up, so a page that folds locally carries none of it.
 
 **The card's name is asked for until it answers, once.** `/health` reaches over
 CDP to the browser on the other side, so it is not a thing to poll; a single
