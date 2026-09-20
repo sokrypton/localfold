@@ -1386,3 +1386,59 @@ is worth most of a morning if the first number is believed. Use `--repeats`.
   bind groups another 18-48. The command building is free relative to the fold.
 - **Uploads by label are not the cost.** The largest is `expand.projection` at
   29 ms for 55 MiB; everything else is under 8.
+
+## A T4 is an unrecognised GPU, and Ampere's prior makes it worse
+
+Colab hands out Tesla T4s, so this is the device most people who run LocalFold
+from a notebook are actually on - and `PRIORS` has `ampere` and `metal-3` and
+nothing else, so a Turing part takes `DEFAULT_TUNING`, which is one M2's
+answers. The section above prices an unrecognised GPU at up to 1.53x and says
+nothing in this repository could measure it. These are the first Turing
+numbers.
+
+The obvious move is to give `turing` Ampere's entry - same vendor, adjacent
+architecture. **Measured, that is a 40% regression** on the trunk's biggest
+kernel. `tools/gpu/bench-triangle.js --lengths=300`, on a Colab T4, with the
+unrecognised arm run twice to bracket it:
+
+| | f32 | f16 |
+|---|---:|---:|
+| unrecognised (what ships today) | 127.0 ms | 122.4 ms |
+| **ampere's prior** | **173.4** | **142.4** |
+| unrecognised again, run last | 120.3 | 104.1 |
+
+🔴 **AND EVERY KNOB LOSES ON ITS OWN, so it is not one bad entry in a good
+package.** `--tune-json` applies them one at a time; baseline bracketed by a
+control that spans 3%:
+
+| | f32 | f16 | |
+|---|---:|---:|---|
+| baseline (M2 defaults) | 123.4 | 104.7 | |
+| baseline, run last | 120.1 | 105.2 | the control |
+| `triangleProjectMatrix: true` | 146.0 | 135.0 | +19% / +29% |
+| `stagedMatrixPrefetch: true` | 147.1 | 147.8 | +20% / +41% |
+| `stagedMatrixBlock: 64x128x16x1x8` | 140.6 | 124.5 | +15% / +19% |
+| `linearTallTile: true` | 118.5 | 105.4 | inside the control |
+
+Turing has **64 FP32 lanes per SM against Ampere's 128** and a different
+shared-memory budget, so the workgroup shapes Ampere wants are the wrong shape
+here. **The conclusion is to add no `turing` entry**: the M2 defaults are the
+best of everything tried on this kernel, and a prior copied from a neighbour
+would have shipped a regression to every Colab user.
+
+🔴 **AND THE WHOLE-FOLD MEASUREMENT SAID THE OPPOSITE, WITH ITS OWN CONTROL
+DISPROVING IT.** Folding a 154-residue protein through `tools/colab_backend.py`
+reported Ampere's prior **19% FASTER** (3826/3644 ms against 3147/3043) - and
+the same unrecognised configuration re-run at the end of that session came back
+at 4063/3998/4021, a **31% drift**. An A/B whose control moves further than its
+effect has measured nothing. At 308 residues the same test was a 2% wash. The
+kernel bench is GPU-timed and repeats to 3%; wall-clock through a browser, a
+web server and a fold pipeline does not.
+
+**What is still open on this device**: `linearTallTile` is free and might pay
+on kernels this bench does not cover; the tensor-core path is reachable here
+(this adapter reports `shader-f16` AND `chromium-experimental-subgroup-matrix`,
+both true) and has never been swept on Turing; and the triangle kernel runs at
+**0.19-0.24 effective TFLOP/s** on a part rated ~8 f32, which is a ceiling
+question rather than a knob question and wants the same figure from the M2 and
+the A100 beside it before anything is concluded from it.
