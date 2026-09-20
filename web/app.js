@@ -3300,7 +3300,13 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
     entities, model: family,
     steps: Number(element("af3-count")?.value ?? 25),
     recycles: Number(element("recycles")?.value ?? 3),
-    msa: msaMode(),
+    // 🔴 THE CONTROL'S OWN VALUE, NOT THE RESOLVED MODE. `msaMode()` maps
+    // "none" to "single" for the code below it; the runtime sets its page's
+    // `msa-mode` SELECT from this, and a select silently refuses a value it
+    // has no option for - so "single" left the control empty there and the
+    // fold died with "unknown alignment mode". Sending the raw value lets the
+    // runtime's page resolve it with the same function this one uses.
+    msa: element("msa-mode")?.value ?? "none",
     // 🔴 THE STREAMED FORM. Without this the runtime answers with the finished
     // structure and nothing else, which is a page that sits blank for a minute
     // - no bar, no status, no sampler frames. See tools/colab_backend.py.
