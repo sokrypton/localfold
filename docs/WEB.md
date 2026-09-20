@@ -2324,3 +2324,36 @@ JSON and the chains.
 **What this costs is the a3m's size**: it rides in the job result as text, and
 a deep search is megabytes. Over the Colab proxy that is a local hop and it has
 not been a problem; it is the first thing to compress if it becomes one.
+
+### The download buttons, and a select that refused the mode it was given
+
+🔴 **THE BUTTONS HAD NOTHING TO DOWNLOAD, AND FAILED TOWARDS THE WRONG
+ANSWER.** `activePrediction()` reads `predictions.get(name)` and falls back to
+`lastPrediction`, both written by the LOCAL fold paths - so after a remote fold
+Download PDB was a silent no-op, or worse handed back whatever that tab had
+folded BEFORE: the wrong structure, saved without a word. The runtime now sends
+its prediction WHOLE, as a JSON string, and the client registers it under this
+page's stem, which is the name the viewer knows the object by and therefore the
+one `activePrediction` looks up.
+
+**Whole, not field by field**, because the archive reads `stem`, `model`,
+`settings`, `entities`, `msas`, `msaOrigin`, `confidence` and `chainLengths` -
+naming them at the readback is the rebuild this repository has been bitten by
+six times, and the failure is a zip with a piece missing. The replacer turns
+typed arrays into arrays because a `Float32Array` crossing CDP's JSON becomes
+`{"0":...}`, which every reader downstream sees as an object with no length.
+Measured: **231,651 characters**, carrying every one of those fields.
+
+🔴 **AND A SELECT SILENTLY REFUSES A VALUE IT HAS NO OPTION FOR.** `msaMode()`
+maps the control's `none` to `single` for the code below it, and the remote
+path was sending that RESOLVED mode - which the runtime then wrote into its own
+`msa-mode` SELECT, whose options are `none`, `paste`, `search` and `upload`.
+The assignment left the control EMPTY, and the fold threw *"unknown alignment
+mode"* before any work began. **A reader folding with the default Single
+Sequence setting hit this every time**; Search happened to work, which is why
+the streaming test passed and this did not surface until a fold was driven
+through the page rather than through curl. The raw control value travels now
+and the runtime resolves it with the same function.
+
+*Found by asking the page what it was showing - `status-message` said it in
+words - rather than by reading the bridge code, which looked right.*
