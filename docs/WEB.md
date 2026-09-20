@@ -2150,6 +2150,25 @@ which would have turned 44 s into writing one JSON - is false.
   runtime keeps its filesystem between cells - but on a cold T4 the ICD
   directory is empty and Chrome is absent, so every branch fires.
 
+🔴 **AND THE ANSWER WAS A ZIP, NOT A LIGHTER BROWSER.** Chrome for Testing
+ships the same binaries as a plain archive, so the 21.4 s dpkg becomes
+**1.8 s of download and 11 s of unzip** - and `chrome-headless-shell`, which
+is the half this backend uses, is **261 MB against 393**. Both report
+**nvidia / turing / shader-f16** through a served page: a zip is not a lesser
+browser, it is the same browser without a package manager. What a `.deb`
+brought as dependencies has to be asked for once - `ldd` named exactly four
+(`libatk-1.0`, `libatk-bridge-2.0`, `libatspi`, `libXcomposite`) - and they
+join the driver's apt call, which now runs UNDERNEATH the unzip instead of
+after a dpkg.
+
+Measured end to end on a clean T4, the cell's own script followed by a real
+fold: **setup 36.5 s against 71.4**, service ready at 40.5 s, adapter
+`nvidia / turing` with `shaderF16` and `subgroupMatrix` both true, and 13
+residues folded to 25 frames and 110 atoms. **The 44 s driver install is
+still there and is still the floor** - it is the one thing that must go
+through dpkg, and the three ways of extracting it all end at
+`requestAdapter() === null`.
+
 **What is left, and it is small**: the clone shares nothing with apt (one is
 git's network, the other dpkg's lock), so it is started first and waited for
 last - about 5 s of 71. The honest summary is that ~65 s of this is dpkg
