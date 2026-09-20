@@ -130,6 +130,16 @@ def main() -> int:
     # and no bond needs measuring to see it.
     tokens = [token for chain in chains for token in chain.tokens]
     modified = [t for t in tokens if t.residue_name == arguments.code]
+    # 🔴 THE RESTYPE AN ATOMISED RESIDUE'S TOKENS CARRY, which is the thing
+    # sokrypton/alphafold3's 96d1958 fixed on its side: "an atomised residue is
+    # UNKNOWN to esmfold2, not its parent". Printed beside a plain residue's so
+    # the two are comparable at a glance.
+    plain = [tok for tok in tokens if tok.residue_name not in (arguments.code,
+                                                               arguments.ligand)]
+    print(f"res_type: {arguments.code} tokens "
+          f"{sorted({tok.res_type for tok in modified})}, "
+          f"a plain {plain[0].residue_name} {plain[0].res_type}, "
+          f"input_id {sorted({tok.input_id for tok in modified})}")
     print(f"tokens {len(tokens)}, {arguments.code} tokens {len(modified)}, "
           f"atom_count {[t.atom_count for t in modified]}, "
           f"mol_type {sorted({t.mol_type for t in modified})}")

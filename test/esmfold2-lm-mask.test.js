@@ -9,7 +9,7 @@
 // different model, with nothing in the shapes to say so.
 import { describe, expect, it } from "./harness.js";
 import {
-  ESM_BOS, ESM_EOS, ESM_MASK, ESM_PAD, maskLanguageModelInput,
+  ESM_BOS, ESM_EOS, ESM_MASK, ESM_PAD, featuriseForEsmfold2, maskLanguageModelInput,
 } from "../src/esmfold2/featurise.js";
 import { uniforms } from "../src/esmfold2/sampler-reference.js";
 
@@ -67,5 +67,73 @@ describe("the language model's input masking", () => {
     expect(run(3) === run(4)).toBe(false);
     // ...and seed 0 is its own stream, which xorshift's fixed point once ate.
     expect(run(0) === run(1)).toBe(false);
+  });
+});
+
+/**
+ * 🔴 AN ATOMISED RESIDUE IS UNKNOWN TO ESMFold2, NOT ITS PARENT - AND THE PORT
+ * TOLD IT OTHERWISE. AF3 gives every atom token of a modified residue the
+ * PARENT restype, so a phosphoserine's ten tokens all said SER: the model was
+ * handed ten single atoms labelled as ten serines. Folded, the SEP came out at
+ * a mean bond ratio of **2.349** against a 0.999 control in the same structure,
+ * with `OG-P` at 2.06-4.25 A against a 1.610 ideal; the vendor `esm` package
+ * reads 0.997 on the identical job, and this port now reads **0.994**.
+ *
+ * 🔴 THE TWO NUMBERS ARE THE VENDOR'S OWN, read off its atomised branch rather
+ * than guessed: `TokenInfo(res_type=PROTEIN_UNK_RES_TYPE, input_id=DNA_RNA_LIGAND_INPUT_ID)`
+ * - 22 and 24.
+ *
+ * 🔴 AND 24 IS NOT WHAT THE RESTYPE TABLE WOULD GIVE, which is the subtle half.
+ * `AATYPE_TO_ESM_ID` maps the unknown restype to `<unk>` (3) deliberately: an
+ * `X` in a sequence is a residue nobody identified, and the tower was trained
+ * to see `<unk>` there. An atomised residue is a row of single ATOMS and the
+ * tower sees a ligand's token. Two unknowns, two ids - so the fix cannot be a
+ * single lookup and the note on that table stays true of its own case.
+ *
+ * Found by comparing against the vendor after a user reported the fold; the
+ * same cause and the same fix as sokrypton/alphafold3's `96d1958` on its side.
+ * See docs/ESMFOLD2_PTM.md.
+ */
+describe("an atomised residue's restype and language-model id", () => {
+  const PROTEIN_UNK_RES_TYPE = 22;
+  const DNA_RNA_LIGAND_INPUT_ID = 24;
+
+  // A three-atom stand-in, so this needs no network and no dictionary: what is
+  // under test is which LABEL the atom tokens carry, not the chemistry.
+  const modification = {
+    code: "XYZ", chain: 0, position: 2,
+    atoms: [0, 1, 2].map((slot) => ({
+      name: ["N", "CA", "C"][slot], element: 6, charge: 0,
+      x: slot, y: 0, z: 0, componentSlot: slot,
+    })),
+    bonds: [{ from: 0, to: 1, order: 1 }, { from: 1, to: 2, order: 1 }],
+  };
+  const features = () => featuriseForEsmfold2({
+    sequence: "GWSTE", chainKinds: ["protein"], ligands: [],
+    modifications: [modification],
+  });
+
+  it("labels every atom token UNKNOWN, not the parent residue", () => {
+    const f = features();
+    // residue 2 of GWSTE is W, atomised into three tokens at 1..3.
+    for (const token of [1, 2, 3]) {
+      expect(f.residueType[token]).toBe(PROTEIN_UNK_RES_TYPE);
+    }
+  });
+
+  it("gives them the LIGAND language-model id, not `<unk>`", () => {
+    const f = features();
+    for (const token of [1, 2, 3]) {
+      expect(f.inputIds[token]).toBe(DNA_RNA_LIGAND_INPUT_ID);
+    }
+  });
+
+  it("leaves every unmodified residue alone", () => {
+    const f = features();
+    // G before it and S, T, E after: real restypes, real ESM ids. Asserted as
+    // the whole row rather than token by token, because "not 22" would pass on
+    // a row that had gone wrong some other way.
+    expect([...f.residueType]).toEqual([9, 22, 22, 22, 17, 18, 8]);
+    expect([...f.inputIds]).toEqual([6, 24, 24, 24, 8, 11, 9]);
   });
 });

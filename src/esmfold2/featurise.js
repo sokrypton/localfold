@@ -204,13 +204,40 @@ export function featuriseForEsmfold2(input, options = {}) {
   const aatype = new Float32Array(tokens * AATYPE_CLASSES);
   const residueType = new Int32Array(tokens);
   const inputIds = new Int32Array(tokens);
+  // 🔴 AN ATOMISED RESIDUE IS UNKNOWN TO ESMFold2, NOT ITS PARENT. AF3 gives
+  // every one of a modified residue's atom tokens the PARENT restype - a
+  // phosphoserine's ten all say SER - and this passed that straight through, so
+  // the model was told that ten single atoms are ten serines. Measured against
+  // `esm` 3.4.1's own builder on the same job: it reports `res_type` 22
+  // (PROTEIN_UNK) and `input_id` 24 for those tokens where this wrote 17 (SER).
+  // Same finding, and the same fix, as sokrypton/alphafold3's 96d1958 on its
+  // own side; see docs/ESMFOLD2_PTM.md.
+  //
+  // 🔴 AND ITS LANGUAGE-MODEL ID IS THE LIGAND'S, NOT `<unk>`. The vendor's
+  // atomised branch is explicit - `res_type=PROTEIN_UNK_RES_TYPE,
+  // input_id=DNA_RNA_LIGAND_INPUT_ID` - so 22 and 24. Routing it through
+  // `AATYPE_TO_ESM_ID` instead gives 3, because that table maps the unknown
+  // RESTYPE to `<unk>` on purpose: an `X` written in a sequence is a residue
+  // nobody has identified, and the tower was trained to see `<unk>` there. An
+  // atomised residue is not that - it is a row of single atoms, and the tower
+  // sees what it sees for a ligand. Two unknowns, two tokens, and the note on
+  // AATYPE_TO_ESM_ID is right about its own case.
+  const atomisedResidue = new Uint8Array(tokens);
+  for (const span of batch.modifiedSpans ?? []) {
+    // A one-token modified residue is a RESIDUE and keeps its restype; only the
+    // atomised form is a row of single atoms. See `modifiedAsOneToken`.
+    if (span.oneToken === true) continue;
+    for (let token = span.from; token < span.from + span.count; token += 1) {
+      atomisedResidue[token] = 1;
+    }
+  }
   for (let token = 0; token < tokens; token += 1) {
-    const code = molType[token] === MOL_NONPOLYMER
+    const code = molType[token] === MOL_NONPOLYMER || atomisedResidue[token]
       ? UNKNOWN_AATYPE
       : (AF3_TO_ESMFOLD2_AATYPE[batch.aatype[token]] ?? UNKNOWN_AATYPE);
     residueType[token] = code;
     aatype[token * AATYPE_CLASSES + code] = 1;
-    inputIds[token] = molType[token] === MOL_PROTEIN
+    inputIds[token] = molType[token] === MOL_PROTEIN && !atomisedResidue[token]
       ? AATYPE_TO_ESM_ID[code] : ESM_NON_PROTEIN;
   }
 

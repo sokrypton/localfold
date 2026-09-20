@@ -19,15 +19,45 @@ at all.
 | implementation | control | the SEP | a glycerol |
 |---|---:|---:|---:|
 | `esm` 3.4.1, the vendor | 1.000 | **1.002** | **0.986** |
-| af3-any-model, fp32 | 0.999 | 1.446 | **1.346** |
-| af3-any-model, int8 | 0.996 | 1.548 | - |
-| LocalFold (this port) | 0.999 | **2.349** | **0.958** |
+| sokrypton/alphafold3, before | 0.999 | 1.446 | 1.346 |
+| **sokrypton/alphafold3, after `7df8d97`** | 1.002 | **0.991** | **0.991** |
+| LocalFold, before | 0.999 | 2.349 | 0.958 |
+| **LocalFold, after** | 1.005 | **0.994** | 0.974 |
+
+🔴 **BOTH ARE FIXED, AND THE CAUSES WERE NOT THE SAME ONE.** sokrypton's side
+took three (`7df8d97`): a ref-pos table that rewrote the six atoms a SER has and
+left the phosphate on its CCD frame, an unsymmetrised token-bond matrix that
+left the glycerol half-bonded, and the restype below. This port had only the
+last of them - its conformer was already exact and it already symmetrised - and
+its glycerol was correct throughout, which is why its ligand column never
+moved.
 
 All on `ESMFold2-Experimental-Fast-base600M-step1500k` + ESM-C 600M, af3-any-model
 through `--model=esmfold2_lm600m`. The glycerol column is a plain CCD ligand in
 the SAME job.
 
-🔴 **AND THAT COLUMN SAYS THE TWO PORTS HAVE DIFFERENT BUGS.** A ligand is
+### The cause, on this port: an atomised residue is UNKNOWN, not its parent
+
+AF3 gives every atom token of a modified residue the **parent's** restype, so a
+phosphoserine's ten tokens all said SER and `featuriseForEsmfold2` passed that
+through: the model was handed ten single atoms labelled as ten serines. The
+vendor's own atomised branch is explicit -
+`TokenInfo(res_type=PROTEIN_UNK_RES_TYPE, input_id=DNA_RNA_LIGAND_INPUT_ID)` -
+so **22 and 24**, where this port wrote 17 (SER) and its ESM id.
+
+🔴 **AND 24 IS NOT WHAT THE RESTYPE TABLE GIVES, WHICH IS THE SUBTLE HALF.**
+`AATYPE_TO_ESM_ID` maps the unknown restype to `<unk>` (3) *deliberately*: an
+`X` written in a sequence is a residue nobody has identified and the tower was
+trained to see `<unk>` there. An atomised residue is not that - it is a row of
+single ATOMS, and the tower sees what it sees for a ligand. Two unknowns, two
+tokens; the fix cannot be one lookup, and the note on that table stays true of
+its own case.
+
+Gated in `test/esmfold2-lm-mask.test.js` - both fields, and the whole row
+asserted rather than "not 22", since a row that went wrong some other way would
+pass that. Watched failing with the bug restored.
+
+🔴 **AND THE LIGAND COLUMN IS WHY THE TWO PORTS NEEDED DIFFERENT FIXES.** A ligand is
 atomised exactly as a modified residue is - one token per atom, one shared
 reference frame - but it sits in its own chain. af3-any-model misplaces **both**
 (1.446 and 1.346), so its problem is atom placement in general. This port
