@@ -53,6 +53,25 @@ single ATOMS, and the tower sees what it sees for a ligand. Two unknowns, two
 tokens; the fix cannot be one lookup, and the note on that table stays true of
 its own case.
 
+🔴 **AND THE SECOND HALF OF SOKRYPTON'S BOND FIX APPLIED AFTER ALL.** This port
+already symmetrised, so the block counts matched - but the peptide bonds tying
+the atomised residue to its chain NEIGHBOURS were missing here too. Counted
+against `esm` 3.4.1's own featuriser on a SEP + glycerol job:
+
+| | vendor | this port, before | after |
+|---|---:|---:|---:|
+| inside the SEP block | 18 | 18 | 18 |
+| inside the glycerol | 10 | 10 | 10 |
+| SEP to its neighbours | 2 | **0** | **2** |
+
+`atomizedBackboneBonds` existed and was rf3's alone. The fold barely moves on it
+- SEP 0.994 → 0.989, the junction CA-CA 3.73/3.67 → 3.67/3.80 against a 3.8
+ideal, one sample each, which is noise - and it is taken because the **feature
+now matches**, not because the number did. AF3 extracts inter-residue bonds only
+where one side is a LIGAND chain, so a residue atomised inside a polymer loses
+its backbone bond to each neighbour; `featurise.js` already called that "a
+ligand floating beside the chain as far as the pair track is concerned".
+
 Gated in `test/esmfold2-lm-mask.test.js` - both fields, and the whole row
 asserted rather than "not 22", since a row that went wrong some other way would
 pass that. Watched failing with the bug restored.

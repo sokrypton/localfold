@@ -135,6 +135,19 @@ export function featuriseForEsmfold2(input, options = {}) {
     // `bonds[i, j] = bonds[j, i] = 1` for every edge; AF3's featuriser writes
     // one triangle unless asked, because stock AF3 wants one.
     symmetriseBonds: true,
+    // 🔴 AND THE PEPTIDE BONDS AT AN ATOMISED RESIDUE, which AF3 drops. It
+    // extracts inter-residue bonds only where one side is a LIGAND chain, so a
+    // residue atomised INSIDE a polymer keeps its own CCD bonds and loses the
+    // backbone bond to each neighbour - "a ligand floating beside the chain as
+    // far as the pair track is concerned", as featurise.js puts it. Counted
+    // against `esm` 3.4.1's own featuriser on a SEP + glycerol job: inside the
+    // SEP block 18 against 18 and inside the glycerol 10 against 10 (this port
+    // already symmetrises), but SEP-to-its-neighbours **0 against 2**. It
+    // matters more here than anywhere else because ESMFold2's atom attention
+    // has no pair bias - this matrix is its only statement that two atom
+    // tokens are bonded. The fold barely moves on it; the feature matching is
+    // the point.
+    atomizedBackboneBonds: true,
   });
   const tokens = batch.tokens;
   const dense = batch.dense;

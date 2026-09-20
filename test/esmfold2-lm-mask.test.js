@@ -128,6 +128,35 @@ describe("an atomised residue's restype and language-model id", () => {
     }
   });
 
+  /**
+   * 🔴 AND THE PEPTIDE BONDS AT THE JUNCTION, which AF3 drops. It extracts
+   * inter-residue bonds only where one side is a LIGAND chain, so a residue
+   * atomised inside a polymer keeps its own CCD bonds and loses the backbone
+   * bond to each neighbour. Counted against `esm` 3.4.1's own featuriser on a
+   * SEP + glycerol job: inside the SEP block 18 against 18, inside the
+   * glycerol 10 against 10 - this port already symmetrises - but
+   * SEP-to-neighbours **0 against 2**. It matters more for this model than for
+   * the AF3 lineage because ESMFold2's atom attention has no pair bias, so
+   * this matrix is its only statement that two atom tokens are bonded.
+   *
+   * The fold barely moves on it (SEP 0.994 -> 0.989 at 138 steps, one sample
+   * each, which is noise) - it is here because the feature now MATCHES, not
+   * because the number did.
+   */
+  it("bonds the atomised residue to its chain neighbours", () => {
+    const f = features();
+    const tokens = f.tokens;
+    let across = 0;
+    for (let token = 1; token <= 3; token += 1) {
+      for (let other = 0; other < tokens; other += 1) {
+        if (other >= 1 && other <= 3) continue;
+        if (f.tokenBonds[token * tokens + other]
+            || f.tokenBonds[other * tokens + token]) across += 1;
+      }
+    }
+    expect(across).toBe(2);
+  });
+
   it("leaves every unmodified residue alone", () => {
     const f = features();
     // G before it and S, T, E after: real restypes, real ESM ids. Asserted as
