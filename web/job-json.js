@@ -48,7 +48,7 @@
  * error names the field, because "unsupported job" sends the reader looking.
  */
 import { parseSmiles } from "../src/chem/smiles.js";
-import { NUCLEIC_TYPES, entitiesProblem } from "./entities.js";
+import { NUCLEIC_TYPES, entitiesProblem, parseContact } from "./entities.js";
 
 /**
  * The request that produced this fold, in the server's own dialect.
@@ -63,7 +63,12 @@ export function jobRequestJson({ name, seed, entities }) {
   // server dialect has no SMILES field, so a job with one is written open.
   // Everything else still writes the server dialect, which is what the
   // archive's justification rests on and what every existing fixture expects.
-  if ((entities ?? []).some((entity) => entity.type === "smiles"
+  // 🔴 A CONTACT FORCES THE OPEN DIALECT TOO, for the same reason a SMILES
+  // ligand does: the server's has no field for it. `bondedAtomPairs` is an
+  // open-dialect key, so a job carrying one cannot be written in the other
+  // without dropping the bond - and a covalent inhibitor saved unbonded is the
+  // archive describing a different fold.
+  if ((entities ?? []).some((entity) => (entity.type === "smiles" || entity.type === "contact")
     && (entity.value ?? "").trim() !== "")) {
     return openDialectJson({ name, seed, entities });
   }
@@ -71,6 +76,8 @@ export function jobRequestJson({ name, seed, entities }) {
   for (const entity of entities ?? []) {
     const value = (entity.value ?? "").trim();
     if (value === "") continue;
+    // A contact is a BOND, not a chain; it is written as `bondedAtomPairs`.
+    if (entity.type === "contact") continue;
     const count = Math.max(1, Number(entity.copies) || 1);
     if (entity.type === "protein") {
       // 🔴 A MODIFIED RESIDUE IS PART OF THE JOB, NOT A RENDERING OF IT. The
@@ -140,6 +147,8 @@ function openDialectJson({ name, seed, entities }) {
   for (const entity of entities ?? []) {
     const value = (entity.value ?? "").trim();
     if (value === "") continue;
+    // A contact is a BOND, not a chain; it is written as `bondedAtomPairs`.
+    if (entity.type === "contact") continue;
     const id = idsFor(Math.max(1, Number(entity.copies) || 1));
     if (entity.type === "protein") {
       const modifications = (entity.modifications ?? [])
@@ -160,11 +169,25 @@ function openDialectJson({ name, seed, entities }) {
       sequences.push({ ligand: { id, ccdCodes: [value.toUpperCase()] } });
     }
   }
+  // 🔴 THE BONDS, AS `[chain, residue, atom]` PAIRS - and the chain letters
+  // have to be the ones `idsFor` just handed out, or the file names chains that
+  // are not in it. They agree because both walk the entity list in order and
+  // the reader sorts polymers before ligands, which is the same order
+  // `expandEntities` numbers them in.
+  const bondedAtomPairs = [];
+  for (const entity of entities ?? []) {
+    if (entity.type !== "contact") continue;
+    const parsed = parseContact(entity.value);
+    if (parsed === null) continue;
+    const side = (end) => [end.chain, end.residue, end.atom ?? ""];
+    bondedAtomPairs.push([side(parsed.from), side(parsed.to)]);
+  }
   return `${JSON.stringify([{
     name,
     // 🔴 INTEGERS HERE WHERE THE SERVER DIALECT WANTS STRINGS.
     modelSeeds: [Number(seed ?? 0)],
     sequences,
+    ...(bondedAtomPairs.length === 0 ? {} : { bondedAtomPairs }),
     // 🔴 AND THE DIALECT IS NAMED EXPLICITLY, THOUGH THE HEADER ABOVE SAYS THE
     // OPEN ONE HAS NO `dialect` KEY. Upstream's rule - which `checkVersion`
     // implements - is that a job carries BOTH `dialect` and `version` or
@@ -595,7 +618,7 @@ export function jobFromJson(text) {
       if (!Number.isInteger(residue) || residue < 1) {
         refuse(`${where} ${which}: residue ${residue} is not a position`);
       }
-      return { asym, residue, atom: String(atom) };
+      return { asym, residue, atom: String(atom) };  // asym only sorts ligands
     };
     bonds.push({ from: end(pair[0], "from"), to: end(pair[1], "to") });
   }
@@ -637,9 +660,25 @@ export function jobFromJson(text) {
   const problem = entitiesProblem(entities);
   if (problem !== null) refuse(problem);
 
-  // ...and the letters go no further: the bonds carry numbers now.
+  // 🔴 A BOND BECOMES A ROW, NOT A HIDDEN FIELD. The first version returned
+  // `bonds` beside the entities and the page kept them in a variable - state
+  // nobody could see, which is what the job NAME was built and then removed
+  // for. A `contact` row sits in the list with the chains it names, so it is
+  // visible, editable and deleted when the reader deletes it, and
+  // `expandEntities` resolves the letters at fold time.
+  //
+  // Written with the letters the FILE used, which is what the reader will
+  // recognise; `asymOfId` above was only ever needed to know which of them are
+  // ligands.
+  const letterOf = new Map([...asymOfId.entries()].map(([id, asym]) => [asym, id]));
+  for (const bond of reaching) {
+    const side = (end) => `${letterOf.get(end.asym) ?? "?"}${end.residue}`
+      + (end.atom === undefined || end.atom === "" ? "" : `:${end.atom}`);
+    entities.push({ type: "contact", value: `${side(bond.from)} - ${side(bond.to)}`,
+                    copies: 1, modifications: [] });
+  }
+  // ...and the letters go no further.
   for (const entity of entities) delete entity.ids;
   return { name: typeof job.name === "string" ? job.name : undefined,
-           seed, entities, dialect, singleSequence: state.singleSequence, notes,
-           ...(reaching.length === 0 ? {} : { bonds: reaching }) };
+           seed, entities, dialect, singleSequence: state.singleSequence, notes };
 }

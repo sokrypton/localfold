@@ -35,12 +35,61 @@ import { cleanSequence, nucleicProblem, sequenceProblem } from "./sequence.js";
  * no way to sniff which a row holds, since `C` is a valid SMILES and `CCO`
  * looks like a three-letter code, so the row says.
  */
-export const ENTITY_TYPES = ["protein", "dna", "rna", "ligand", "smiles"];
+export const ENTITY_TYPES = ["protein", "dna", "rna", "ligand", "smiles",
+                            "contact"];
+
+/**
+ * The row types that become a CHAIN. A `contact` does not - it describes a bond
+ * between two chains that already exist.
+ *
+ * 🔴 ASKED AS ONE QUESTION, BECAUSE THE ALTERNATIVE IS A LIST PER CALL SITE.
+ * `expandEntities` is `if polymer ... else if smiles ... else LIGAND`, so a row
+ * type it has not heard of becomes a ligand - silently, with a chain in the
+ * fold that nobody asked for. That is the same shape as `setChains` deleting a
+ * SMILES row by keeping only `type === "ligand"`, which this file already
+ * records. Every place that means "is this a chain" asks here.
+ */
+export const CHAIN_TYPES = ["protein", "dna", "rna", "ligand", "smiles"];
+
+/** Does this row become a chain in the fold? */
+export const isChainEntity = (entity) => CHAIN_TYPES.includes(entity.type);
+
+/**
+ * A contact row's text, parsed - or null if it is not one.
+ *
+ * The spec is written the way a reader would say it out loud:
+ *
+ *     A12:SG - B1:C25      a covalent bond between two named atoms
+ *     A12 - B30            the same, letting each side default its atom
+ *
+ * 🔴 CHAINS ARE LETTERS, AS THEY ARE EVERYWHERE THE READER LOOKS - the viewer,
+ * the PDB, and AlphaFold 3's own `bondedAtomPairs`. They are resolved against
+ * the chain ORDER at expand time, so a contact written before the chain it
+ * names is still valid; what it cannot survive is the chains being reordered
+ * underneath it, which is why the row sits with them rather than in a second
+ * list somewhere else.
+ */
+export function parseContact(value) {
+  const text = String(value ?? "").trim();
+  if (text === "") return null;
+  const sides = text.split("-");
+  if (sides.length !== 2) return null;
+  const end = (side) => {
+    const match = /^\s*([A-Za-z]+)\s*(\d+)\s*(?::\s*([A-Za-z0-9']+)\s*)?$/.exec(side);
+    if (match === null) return null;
+    return { chain: match[1].toUpperCase(), residue: Number(match[2]),
+             atom: match[3] === undefined ? null : match[3].toUpperCase() };
+  };
+  const from = end(sides[0]);
+  const to = end(sides[1]);
+  if (from === null || to === null) return null;
+  return { from, to };
+}
 
 /** How they are labelled, in the order the menu offers them. */
 export const ENTITY_LABELS = {
   protein: "Protein", dna: "DNA", rna: "RNA", ligand: "Ligand (CCD)",
-  smiles: "Ligand (SMILES)",
+  smiles: "Ligand (SMILES)", contact: "Contact (bond)",
 };
 
 /**
@@ -281,6 +330,17 @@ export function modificationProblem(modification, sequence) {
  */
 export function entityProblem(entity) {
   if (!ENTITY_TYPES.includes(entity.type)) return `Unknown entity type ${entity.type}`;
+  if (entity.type === "contact") {
+    const parsed = parseContact(entity.value);
+    if (parsed === null) {
+      return "A contact is two residues, as A12:SG - B1:C25 (the atoms optional)";
+    }
+    if (parsed.from.chain === parsed.to.chain
+        && parsed.from.residue === parsed.to.residue) {
+      return "A contact joins two different residues";
+    }
+    return null;
+  }
   if (!Number.isInteger(entity.copies) || entity.copies < 1) {
     return "Copies must be a whole number, at least 1";
   }
@@ -409,6 +469,9 @@ export function expandEntities(entities) {
   /** Which name each distinct SMILES was given; see `ligandName`. */
   const smilesCodes = new Map();
   for (const entity of entities) {
+    // 🔴 A CONTACT IS NOT A CHAIN, and the `else` below would make it a LIGAND.
+    // Handled after the loop, once the chains it names exist.
+    if (entity.type === "contact") continue;
     for (let copy = 0; copy < entity.copies; copy += 1) {
       if (POLYMER_TYPES.includes(entity.type)) {
         for (const modification of entity.modifications ?? []) {
@@ -452,8 +515,34 @@ export function expandEntities(entities) {
       } else ligandCodes.push(entity.value.trim().toUpperCase());
     }
   }
+  // 🔴 THE CONTACTS LAST, ONCE EVERY CHAIN THEY NAME EXISTS. A letter is
+  // resolved against the order the fold will actually see: the polymer chains
+  // in `chains`, then each ligand - which is the order `featuriseProtein`
+  // assigns `asymId` in, so one number reaches the featuriser and no second
+  // convention is invented on the way.
+  const bonds = [];
+  for (const entity of entities) {
+    if (entity.type !== "contact") continue;
+    const parsed = parseContact(entity.value);
+    if (parsed === null) continue;
+    const asymOf = (letter) => {
+      const at = letter.split("").reduce(
+        (total, character) => total * 26 + (character.charCodeAt(0) - 64), 0) - 1;
+      return at;
+    };
+    const end = (side) => ({
+      asym: asymOf(side.chain), residue: side.residue,
+      // 🔴 AN ABSENT ATOM IS NOT AN ERROR HERE. `token_bonds` is token x token,
+      // so for a standard residue the atom decides nothing - the residue has
+      // one token whichever atom is named. It matters only for a ligand or an
+      // atomised residue, and featuriseProtein refuses by NAME when it does.
+      ...(side.atom === null ? {} : { atom: side.atom }),
+    });
+    bonds.push({ from: end(parsed.from), to: end(parsed.to) });
+  }
   return {
     chains, chainKinds, ligandCodes, modifications, templates,
+    ...(bonds.length === 0 ? {} : { bonds }),
     sequence: chains.join(":"),
   };
 }

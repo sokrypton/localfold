@@ -2357,3 +2357,55 @@ and the runtime resolves it with the same function.
 
 *Found by asking the page what it was showing - `status-message` said it in
 words - rather than by reading the bridge code, which looked right.*
+## `contact`: a bond as a ROW, not as hidden state
+
+`bondedAtomPairs` landed first as a job-level field the page kept in a variable
+- set when a job loaded, invisible thereafter, and silently invalidated by any
+edit to the chains it named. That is precisely what the job NAME was built and
+then removed for, and the same objection applies harder here, because a bond
+that has quietly stopped applying changes the STRUCTURE rather than a label.
+
+A `contact` row sits in the entity list beside the chains it names:
+
+```
+Protein          GWCTELEKH...
+Ligand (CCD)     MOV
+Contact (bond)   A12:SG - B1:C25
+```
+
+Visible, editable, and deleted when the reader deletes it. The spec reads the
+way somebody would say it: chain letter, residue number, and an atom after a
+colon. **The atoms are optional** - `token_bonds` is token x token, so for a
+standard residue the atom decides nothing; it matters only for a ligand or an
+atomised residue, and `featuriseProtein` refuses by NAME when it does.
+
+Folded from the row, on AlphaFold 3's own KRAS/sotorasib example:
+
+| | SG(CYS 12) - C25 |
+|---|---:|
+| the contact row | **1.62 A** |
+| the same job, bond deleted | **6.25 A** |
+
+and the archive writes it back as `bondedAtomPairs` in the open dialect - which
+it must, because the server dialect has no field for one, the same reason a
+SMILES ligand forces that branch.
+
+🔴 **A CONTACT IS NOT A CHAIN, AND `expandEntities` WOULD HAVE MADE IT A
+LIGAND.** That loop is `if polymer ... else if smiles ... else LIGAND`, so a row
+type it has not heard of becomes a ligand - silently, with a chain in the fold
+nobody asked for. It is the same shape as `setChains` deleting a SMILES row by
+keeping only `type === "ligand"`, which this file already records. `CHAIN_TYPES`
+and `isChainEntity` are where that question is asked now, and the gate for it
+asserts a contact adds neither a chain nor a ligand.
+
+🔴 **AND IT COST TWO OF EXACTLY THAT MISTAKE ON THE WAY IN.** The status line
+read **"2 chains + 1 ligand"** for a protein, a ligand and the bond between
+them, because `applyJob` counted every row that was not a ligand as a chain. And
+the trunk key referenced `bonds` in a function that is handed chains and ligands
+and never the rows - `bonds is not defined`, at fold time, in the browser. Both
+are the row type falling into code that predates it.
+
+**Crosslinks are not done.** af3x's form - a named linker between two residues,
+which expands to the linker as a LIGAND plus two bonds - fits this row exactly
+(`DSSO A53 - C66`), and the parser leaves room for it, but it needs a table of
+linker codes and the atoms each attaches by. That is the next piece.

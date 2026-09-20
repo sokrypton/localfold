@@ -58,8 +58,13 @@ const EXPECTED = {
   // refused outright for naming it. It loads now, and the bond is asserted
   // below rather than just the rows: a job that folds the protein and the
   // ligand side by side with no bond between them is a different answer.
-  "kras_g12c_sotorasib.json": { loads: ["protein:189x1", "ligand:MOVx1"],
-                                bonds: ["A/12/SG - B/1/C25"] },
+  // 🔴 AND THE BOND IS A ROW, NOT A HIDDEN FIELD. `bondedAtomPairs` becomes a
+  // `contact` entity beside the protein and the ligand, so it is visible in the
+  // list, editable, and deleted when the reader deletes it - where the first
+  // version kept it in a page variable nobody could see, which is what the job
+  // NAME was built and then removed for.
+  "kras_g12c_sotorasib.json": { loads: ["protein:189x1", "ligand:MOVx1",
+                                        "contact:A12:SG - B1:C25x1"] },
   // ...and the four this page does not fold, each naming its own reason.
   // 🔴 THIS ONE MOVED ITS REASON RATHER THAN LOSING IT: it carried
   // `bondedAtomPairs` AND a five-component glycan in one ligand entry, and
@@ -82,8 +87,9 @@ const EXPECTED = {
 
 const shape = (entities) => entities.map((entity) =>
   // A SMILES row is summarised by its ATOM COUNT rather than its text, which
-  // would make the expectation above a second copy of the input string.
-  `${entity.type}:${entity.type === "ligand" ? entity.value
+  // would make the expectation above a second copy of the input string. A
+  // CONTACT is shown whole, because its text is the whole of what it says.
+  `${entity.type}:${entity.type === "ligand" || entity.type === "contact" ? entity.value
     : entity.type === "smiles" ? 1 : entity.value.length}`
   + `x${entity.copies}`);
 
@@ -105,16 +111,6 @@ describe("AlphaFold 3's own example jobs", () => {
     it(`loads ${name}`, () => {
       const job = jobFromJson(read(name));
       expect(shape(job.entities)).toEqual(expectation.loads);
-      if (expectation.bonds !== undefined) {
-        // Written as the file writes it - chain letter, residue, atom - rather
-        // than as the asymIds it becomes, so the expectation reads against the
-        // fixture and not against this page's numbering.
-        const letters = ["A", "B", "C", "D", "E"];
-        expect((job.bonds ?? []).map((bond) =>
-          `${letters[bond.from.asym]}/${bond.from.residue}/${bond.from.atom}`
-          + ` - ${letters[bond.to.asym]}/${bond.to.residue}/${bond.to.atom}`))
-          .toEqual(expectation.bonds);
-      }
       // Every example seeds 42, and a seed read as a string would be one.
       expect(job.seed).toBe(42);
       expect(job.dialect).toBe("alphafold3");

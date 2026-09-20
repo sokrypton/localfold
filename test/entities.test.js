@@ -8,8 +8,7 @@
  */
 import { describe, expect, it } from "./harness.js";
 import {
-  entitiesFromText, entitiesProblem, entityProblem, expandEntities, newEntity,
-  templateAsked, templateKind, templateProblem,
+  entitiesFromText, entitiesProblem, entityProblem, expandEntities, newEntity, parseContact, templateAsked, templateKind, templateProblem,
 } from "../web/entities.js";
 
 const protein = (value, copies = 1) => ({ type: "protein", value, copies });
@@ -320,5 +319,71 @@ describe("mixed ligands in one job", () => {
     ]);
     // The CCD code is upper-cased and stays a string; the SMILES is neither.
     expect(ligandCodes).toEqual([{ smiles: "c1ccccc1", code: "LIG" }, "ATP"]);
+  });
+});
+
+/**
+ * 🔴 A `contact` ROW IS A BOND, AND THE POINT IS THAT IT IS A ROW. AlphaFold 3's
+ * `bondedAtomPairs` was read into a page variable first - state nobody could
+ * see, invalidated by any edit to the chains it named, which is exactly what
+ * the job NAME was built and then removed for. A contact sits in the entity
+ * list with those chains: visible, editable, and gone when the reader deletes
+ * it.
+ *
+ * Measured end to end on AlphaFold 3's own KRAS/sotorasib example, which
+ * declares the covalent bond to cysteine 12: SG-C25 is **1.62 A** folded from
+ * the row and **6.25 A** with the bond removed. See docs/WEB.md.
+ */
+describe("a contact row", () => {
+  const contact = (value) => ({ type: "contact", value, copies: 1, modifications: [] });
+
+  it("reads chains, residues and optional atoms", () => {
+    expect(parseContact("A12:SG - B1:C25")).toEqual({
+      from: { chain: "A", residue: 12, atom: "SG" },
+      to: { chain: "B", residue: 1, atom: "C25" },
+    });
+    expect(parseContact("A12 - B30")).toEqual({
+      from: { chain: "A", residue: 12, atom: null },
+      to: { chain: "B", residue: 30, atom: null },
+    });
+  });
+
+  it("refuses what is not a contact, by message", () => {
+    expect(entityProblem(contact("nonsense"))).toMatch(/two residues/);
+    expect(entityProblem(contact("A12 - A12"))).toMatch(/two different residues/);
+    expect(entityProblem(contact("A12:SG - B1:C25"))).toBe(null);
+  });
+
+  /**
+   * 🔴 IT IS NOT A CHAIN, AND `expandEntities` WOULD HAVE MADE IT A LIGAND.
+   * That loop is `if polymer ... else if smiles ... else LIGAND`, so a row type
+   * it has not heard of becomes a ligand - silently, with a chain in the fold
+   * nobody asked for. The same shape as `setChains` deleting a SMILES row by
+   * keeping only `type === "ligand"`.
+   */
+  it("adds no chain and no ligand", () => {
+    const out = expandEntities([
+      { type: "protein", value: "GWCTELEKH", copies: 1, modifications: [] },
+      contact("A3:SG - A7:SG"),
+    ]);
+    expect(out.chains).toHaveLength(1);
+    expect(out.ligandCodes).toHaveLength(0);
+  });
+
+  /**
+   * 🔴 THE LETTERS RESOLVE AGAINST THE ORDER THE FOLD SEES: polymer chains
+   * first, then each ligand, which is how `featuriseProtein` assigns `asymId`.
+   * One number reaches the featuriser and no second convention is invented.
+   */
+  it("resolves its letters to the fold's own chain numbering", () => {
+    const out = expandEntities([
+      { type: "protein", value: "GWCTELEKH", copies: 1, modifications: [] },
+      { type: "ligand", value: "GOL", copies: 1, modifications: [] },
+      contact("A3:SG - B1:C1"),
+    ]);
+    expect(out.bonds).toEqual([{
+      from: { asym: 0, residue: 3, atom: "SG" },
+      to: { asym: 1, residue: 1, atom: "C1" },
+    }]);
   });
 });

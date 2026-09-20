@@ -602,7 +602,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       mirror.setAttribute("aria-hidden", "true");
     }
 
-    const oneLine = entity.type === "ligand" || entity.type === "smiles";
+    // 🔴 A CONTACT IS ONE LINE TOO. It is a short spec, not a sequence, and a
+    // textarea would give a bond three rows of empty box in the middle of the
+    // list.
+    const oneLine = entity.type === "ligand" || entity.type === "smiles"
+      || entity.type === "contact";
     const value = oneLine
       ? document.createElement("input")
       : document.createElement("textarea");
@@ -612,6 +616,14 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       value.type = "text";
       value.placeholder = "CCD code, e.g. HEM";
       value.setAttribute("aria-label", "Ligand CCD code");
+    } else if (entity.type === "contact") {
+      // 🔴 A BOND BETWEEN TWO RESIDUES, WRITTEN AS A READER WOULD SAY IT.
+      // Chains are the letters the viewer and the PDB use; the atoms are
+      // optional, because `token_bonds` is token x token and a standard
+      // residue has one token whichever atom is named. See parseContact.
+      value.type = "text";
+      value.placeholder = "A12:SG - B1:C25";
+      value.setAttribute("aria-label", "Contact between two residues");
     } else if (entity.type === "smiles") {
       // 🔴 ITS OWN CLASS, BECAUSE `.entity-value-ligand` IS UPPERCASED IN CSS.
       // Borrowing the ligand's styling would DISPLAY a SMILES upper case -

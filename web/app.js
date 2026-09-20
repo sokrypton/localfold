@@ -61,7 +61,7 @@ import { complexSequenceProblem } from "./sequence.js";
 // 🔴 SHARED WITH proteinhunter.html, which shows the same card against its
 // own play bar. See web/scores-card.js.
 import { updateScoresCard } from "./scores-card.js";
-import { entitiesFromText, entitiesProblem, expandEntities,
+import { entitiesFromText, entitiesProblem, expandEntities, POLYMER_TYPES,
          templateKind } from "./entities.js";
 import { buildFoldArchive, tokenLayoutFrom, msasFromArchive,
          SINGLE_SEQUENCE_ORIGIN } from "./fold-archive.js";
@@ -2323,8 +2323,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // same `chains`, and without this the second reuses the first one's trunk.
     chains, chainKinds, ligandCodes, modifications, maxMsaSequences, seed: randomSeed(),
     // A declared bond changes what is folded, so a trunk cached without one is
-    // not this fold's - the `chainKinds` rule beside it.
-    bonds: jobBonds,
+    // not this fold's - the `chainKinds` rule beside it. Off `foldContext`,
+    // because this function is handed chains and ligands and never the rows.
+    bonds: foldContext.bonds ?? [],
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
@@ -3505,6 +3506,13 @@ async function fold(event) {
     let chainKinds = request.chainKinds ?? chains.map(() => "protein");
     const ligandCodes = request.ligandCodes;
     const modifications = request.modifications ?? [];
+    // 🔴 THE BONDS COME OFF THE ROWS, NOT OUT OF A VARIABLE. They were held in
+    // `jobBonds`, set when a job loaded and invisible thereafter - the same
+    // shape as the job NAME that was built and then removed for being state
+    // nobody could see. A `contact` row sits in the entity list with the chains
+    // it names, so editing the rows edits the bonds, and `expandEntities`
+    // resolves the letters against the chain order the fold will actually see.
+    const bonds = request.bonds ?? [];
     // 🔴 DECIDED BEFORE ANY NETWORK WORK, because the download starts here.
     // Nothing below changes it: the only reassignment of `chainKinds` is the
     // pasted-A3M branch, which runs only where `nucleicCount` is already zero
@@ -3685,7 +3693,7 @@ async function fold(event) {
     // here and the structure exists only inside whichever branch runs.
     foldContext = {
       entities,
-      bonds: jobBonds,
+      bonds,
       // 🔴 NOT RECORDED HERE AT ALL ANY MORE. The request's `name` is the
       // fold's `stem`, which `foldStem` has already resolved from this same
       // box - so `archiveFor` reads `pred.stem` and the two cannot disagree.
@@ -4499,24 +4507,9 @@ reportModelFromUrl();
  * a second reader of the same control - the mistake `chosenFamily` was written
  * to end.
  */
-/**
- * The covalent bonds the loaded job declared, or [].
- *
- * 🔴 KEPT BECAUSE WITHOUT THEM THE FOLD IS A DIFFERENT ANSWER, which is what
- * separates this from the job NAME that was purged: a covalent inhibitor
- * folded beside its target rather than bonded to it is the wrong structure,
- * not a mislabelled one. They are indexed by the chain POSITION the job
- * described, so editing the rows can invalidate them - and the featuriser is
- * what catches that: it resolves each endpoint by atom NAME and throws
- * "CYS has no atom SG" rather than bonding whatever now sits there. The
- * residual is an edit that leaves the same atom at the same position, which
- * is narrow and loud everywhere else.
- */
-let jobBonds = [];
 
 function applyJob(job) {
   entityList.set(job.entities);
-  jobBonds = job.bonds ?? [];
   const said = [];
   if (job.seed !== undefined) {
     const input = document.getElementById("random-seed");
@@ -4539,8 +4532,11 @@ function applyJob(job) {
     modeSelect.value = modeBeforeJob;
     syncMode();
   }
-  const chains = job.entities.reduce(
-    (total, entity) => total + (entity.type === "ligand" ? 0 : entity.copies), 0);
+  // 🔴 CHAINS, NOT ROWS. A contact row is a bond between two chains and a
+  // ligand is not a chain either, so counting rows reported "2 chains + 1
+  // ligand" for a protein, a ligand and the bond between them.
+  const chains = job.entities.reduce((total, entity) =>
+    total + (POLYMER_TYPES.includes(entity.type) ? entity.copies : 0), 0);
   const ligands = job.entities.filter((entity) => entity.type === "ligand").length;
   said.unshift(`${chains} chain${chains === 1 ? "" : "s"}`
     + (ligands === 0 ? "" : ` + ${ligands} ligand${ligands === 1 ? "" : "s"}`));
