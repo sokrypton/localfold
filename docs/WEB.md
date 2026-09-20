@@ -530,6 +530,47 @@ given went the same way: `--steps=4` on AlphaFold 3 folded at **25**. It is set
 last now, and the `controls:` line it already printed is what shows it took.
 An arm that changes nothing is usually an arm that did not run.
 
+🔴 **AND THE FEATURISATION IS RULED OUT, WHICH IS MOST OF THE SEARCH SPACE.**
+Four checks, on the batch `featuriseForEsmfold2` actually produces for
+`GWSTELEKH` + GOL + SEP@3:
+
+| asked | answer |
+|---|---|
+| is the SEP's reference conformer right? | **exact** - N-CA 1.469, CA-CB 1.529, CB-OG 1.428, OG-P 1.609, P-O1P 1.480 |
+| do its ten atoms share one `refSpaceUid`? | yes (uid 2), as the glycerol's six share uid 9 |
+| are its bonds in the matrix, and does the model read them? | yes - `modifiedSpans` is in `bondedGroups`, and `tokenBonds` is uploaded and multiplied by `featuriser/tokenBonds` in the trunk |
+| is `molType` right for an atomised residue? | **PROTEIN, and that is correct** |
+
+That last one looked like the bug and is not. `molType` is built from
+`ligandSpans` alone, so a modification's ten atom tokens come back PROTEIN -
+which is exactly the shape of the bug the comment above that loop records being
+fixed *for ligands*. But the reference derives `is_protein` from the **chain
+type** (`features.py`: `all_tokens.chain_type == PROTEIN_CHAIN`), not from
+whether a token was atomised, so a modified residue inside a polypeptide is
+protein by construction. And `molType` reaches only the distogram's contact
+classes here, never the structure decoder.
+
+🔴 **WHAT THE COORDINATES SAY: THE BACKBONE LANDS AND THE SIDE CHAIN DOES NOT.**
+Superposing the predicted SEP onto its ideal conformer on N, CA, C, O alone:
+
+```
+N   -> N   0.57 A      C   -> C   0.74 A
+CA  -> CA  0.80 A      CB  -> 2.09 A from CA
+                       OG, P, O1P, O2P, O3P: 1.4 - 4.1 A from any ideal position
+```
+
+A ligand in the same fold is all "side chain" and is placed correctly, so this
+is not the atom decoder being unable to place a rigid group; it is this residue's
+side chain specifically.
+
+🔴 **AND ONE CONCLUSION HERE WAS WRONG FOR TEN MINUTES, WHICH IS WORTH THE
+SPACE.** Comparing the 45 intra-residue distances SORTED, labels ignored, gives
+rms 0.592 A against the labelled 1.892 - which reads as "right shape, wrong
+names: a permutation bug". It is not. A sorted-distance distribution is a weak
+fingerprint: any compact blob of ten atoms matches another compact blob of ten
+atoms to about that, and the backbone superposition above refutes it outright.
+**Match the labels before believing a shape.**
+
 **What is still open**: WHERE in the atomised path. The ligand control says the
 atom encoder and the sampler can place a rigid group; what differs for a
 modification is that its atoms carry a residue's `residueIndex` and share a
