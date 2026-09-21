@@ -3539,9 +3539,25 @@ async function followRemoteFold({ since, label, signal }) {
     // the rest of the session on a fold nobody is doing. `runtimeSeen` is how
     // long it has been since that page asked for its commands, which it does
     // three times a second.
-    if ((state.runtimeSeen ?? 0) > 20000) {
+    // 🔴 A BUSY PAGE IS NOT A DEAD RUNTIME, AND THE FIRST VERSION OF THIS
+    // COULD NOT TELL THEM APART. The heartbeat is the runtime page's own
+    // command poll, which STOPS while that page holds its main thread -
+    // measured at 6.2 s from six seconds of deliberate long tasks, and a real
+    // fold (shader compilation, a big upload) can hold it longer. Giving up
+    // on silence alone would abort a fold that was working. `browserAlive` is
+    // the DevTools endpoint answering, which is the browser PROCESS rather
+    // than the page: gone means gone.
+    const quiet = state.runtimeSeen ?? 0;
+    if (quiet > 20000 && state.browserAlive === false) {
       throw new Error("the runtime stopped answering - its notebook may have"
         + " been closed or its runtime recycled; run the Colab cell again");
+    }
+    // ...and a page that is alive but silent for five minutes is a fold that
+    // has hung rather than one that is thinking. Long, because the cost of
+    // being wrong here is abandoning a fold somebody waited for.
+    if (quiet > 300000) {
+      throw new Error("the runtime's page has not spoken for five minutes -"
+        + " its fold may have hung; run the Colab cell again");
     }
     await new Promise((done) => setTimeout(done, 300));
   }

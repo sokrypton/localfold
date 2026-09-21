@@ -470,7 +470,9 @@ function installColabStatus() {
       // 🔴 TWENTY SECONDS IS THE FOLD LOOP'S OWN BOUND, and the two must agree:
       // a badge that still says connected while `followRemoteFold` is giving
       // up is the page telling a reader two things at once.
-      const gone = (head2.runtimeSeen ?? 0) > 20000;
+      // The badge asks the same question the fold loop does: silence alone is
+      // a page that is busy, and the browser being gone is a runtime that is.
+      const gone = (head2.runtimeSeen ?? 0) > 20000 && head2.browserAlive === false;
       badge.dataset.state = gone ? "gone" : "live";
       said.textContent = gone
         ? "Colab runtime · not answering"
@@ -520,8 +522,15 @@ function installColabStatus() {
       line.textContent = (releases
         ? "The Colab runtime has been released - the machine is handed back"
           + " and the notebook is disconnected."
-        : "The fold service on the runtime has been stopped and its GPU"
-          + " freed.")
+        // 🔴 AND WHERE IT CANNOT BE HANDED BACK, SAY WHAT IS LEFT TO DO.
+        // Reported as "hitting disconnect did not disconnect the runtime" -
+        // which is true of a runtime started before this existed, and of any
+        // host that is not Colab. A line that stops at "the service is
+        // stopped" leaves a reader thinking the machine went with it.
+        : "The fold service has been stopped and its GPU freed. This runtime"
+          + " cannot hand its machine back - if it is a Colab one, run the"
+          + " notebook's cell again to pick this up, or use Runtime >"
+          + " Disconnect and delete runtime.")
         + " This page is now showing what it already has; the notebook's link"
         + " starts a new one.";
     }

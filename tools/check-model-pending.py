@@ -547,9 +547,29 @@ try:
         if "isconnect" not in badge["leave"]:
             bad.append("the badge offers no way back to folding here")
 
-    # 8 · ...and it goes amber when the runtime does. Twenty seconds is the
-    #     fold loop's own bound and the two must agree, so this waits it out.
+    # 8 · A QUIET PAGE IS NOT A DEAD RUNTIME, AND THE BADGE KNOWS. The page's
+    #     poll stops while it holds its main thread - which is what folding
+    #     does - so the badge must NOT go amber for that; what turns it amber
+    #     is the browser itself going, which is the runtime going.
     runtime_ws.call("Page.navigate", url="about:blank")
+    time.sleep(8.0)
+    quiet = cdp.evaluate(reader_ws, """(() => {
+      const box = document.getElementById('colab-status');
+      return (box?.dataset.state ?? '') + '|' +
+             (box?.querySelector('.colab-said')?.textContent ?? '');
+    })()""")
+    print(f"  with the page quiet but the browser alive: {quiet!r}")
+    if quiet.startswith("gone|"):
+        bad.append("the badge went amber for a page that had merely stopped"
+                   " polling - a fold holds that thread, and a reader would"
+                   " be told their working runtime had died")
+    runtime_ws.call("Page.navigate",
+                    url=f"{BASE}/index.html?role=runtime&t={TOKEN}")
+    time.sleep(2.0)
+
+    # ...and now the runtime really goes.
+    subprocess.run(["pkill", "-f", "Google Chrome.*localfold-pending-runtime"],
+                   check=False)
     gone, deadline = "", time.time() + 45
     while time.time() < deadline:
         gone = cdp.evaluate(reader_ws, """(() => {
@@ -560,12 +580,11 @@ try:
         if gone.startswith("gone|"):
             break
         time.sleep(1.0)
-    print(f"  with the runtime away: {gone!r}")
+    print(f"  with the runtime gone: {gone!r}")
     if not gone.startswith("gone|"):
-        bad.append("the runtime went away and the badge still says it is"
+        bad.append("the runtime's browser went and the badge still says it is"
                    " there - a fold pressed now waits out its own bound")
-    runtime_ws.call("Page.navigate",
-                    url=f"{BASE}/index.html?role=runtime&t={TOKEN}")
+
 
     # 9 · Disconnect leaves Colab mode, which is the whole of the way back.
     cdp.evaluate(reader_ws, """(() => {

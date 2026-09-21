@@ -2257,6 +2257,25 @@ page asks `/health` which half it is: "release this Colab machine" against
 "stop the fold service", *"Colab runtime · released"* against *"· stopped"*.
 A button that promised a release either way would be wrong half the time.
 
+🔴 **AND IT DID NOT WORK ON A REAL RUNTIME, REPORTED AS "hitting disconnect
+did not disconnect the runtime".** The likeliest reason is the plainest one -
+that runtime was started before any of this existed, since the cell clones
+`main` when it runs - but two things are now belt and braces for it. The
+notebook passes `TBE_RUNTIME_ADDR` to the service EXPLICITLY rather than
+hoping it is inherited, and the KERNEL watches for the service ending and
+calls `google.colab.runtime.unassign()` itself: that is the one place the
+address is certainly set and colabtools is certainly importable, and a second
+unassign on a machine already handed back is a no-op. Where even that is
+refused it falls back to `google.colab.kernel.disconnect()` - what `unassign`
+itself ends with - and a machine nobody is connected to is reclaimed on idle.
+
+🔴 **WHAT IS NOT DONE IS CLICKING COLAB'S RUNTIME MENU FROM A CELL.** It is
+the obvious-looking third way, and this repository has already measured why
+it cannot work: an output frame is a DIFFERENT ORIGIN from the notebook page,
+so reaching `parent.document` for `#runtime-menu-button` raises SecurityError
+- the same wall that sent the library over BroadcastChannel rather than
+through `parent`. Shipping it would be a button that silently does nothing.
+
 **THE GATE STANDS A STUB IN FOR COLAB'S RUNTIME SERVICE** - a socket that
 records what it is asked - and hands the broker its address, which is the
 only difference between that run and one in a notebook. It sees exactly one

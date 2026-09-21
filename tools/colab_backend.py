@@ -155,6 +155,28 @@ class Backend:
         self.token = token
         self.proc = None
         self.ws = None
+        self._adapter = None
+
+    def alive(self):
+        """Is the BROWSER still there - which is not "is the page answering".
+
+        🔴 A BUSY PAGE STOPS POLLING, AND THAT IS NOT A DEAD RUNTIME. The
+        heartbeat is the page's own `/out` poll, so a fold that holds the main
+        thread - shader compilation, a long upload - stops it: measured at
+        **6.2 s** of silence from six seconds of deliberate 300 ms tasks, and
+        a real fold can hold it longer. A reader that gave up on that alone
+        would abort a fold that was working. The DevTools endpoint is served
+        by the browser PROCESS rather than by the page, so it answers while
+        the page is blocked and stops answering when the runtime is gone -
+        which is the difference the reader actually needs.
+        """
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{self.cdp_port}/json/version",
+                    timeout=2) as answer:
+                return answer.status == 200
+        except Exception:                                     # noqa: BLE001
+            return False
 
     def start(self):
         # cdp.py already carries the Linux flags this needs - Vulkan, the
@@ -196,8 +218,22 @@ class Backend:
         return self
 
     def adapter(self):
-        """What the card is - the whole question this backend rests on."""
-        return cdp.evaluate(self.ws, ADAPTER_JS)
+        """What the card is - the whole question this backend rests on.
+
+        🔴 ASKED ONCE AND REMEMBERED, AND NEVER ALLOWED TO THROW. It is read
+        over CDP from the page, so with the browser gone `/health` died
+        mid-response - "Remote end closed connection without response" - and
+        a reader trying to find out WHETHER the runtime was still there got
+        an error that looked like the broker had gone too. The card does not
+        change while the browser lives, so one answer is the answer.
+        """
+        if self._adapter is not None:
+            return self._adapter
+        try:
+            self._adapter = cdp.evaluate(self.ws, ADAPTER_JS)
+        except Exception as cause:                            # noqa: BLE001
+            return {"webgpu": None, "why": f"the page did not answer: {cause}"}
+        return self._adapter
 
     def wait_for_bridge(self, seconds=60):
         """...and that the page can REACH us, which is the other half.
@@ -259,6 +295,16 @@ def serve(port, backend, token, host="127.0.0.1"):
                 at = LAST_SEEN["at"]
             return None if at == 0 else int((time.time() - at) * 1000)
 
+        def _alive(self, seen):
+            """Whether the BROWSER answers - asked only when the page is quiet.
+
+            None while the page is answering, because then the question is
+            already settled and the check costs a request.
+            """
+            if seen is not None and seen < 5000:
+                return None
+            return backend.alive()
+
         def _since(self):
             asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -289,9 +335,11 @@ def serve(port, backend, token, host="127.0.0.1"):
                     # request hung behind it and the gate timed out three arms
                     # later, in a route that was innocent. Read it first.
                     seen = self._seen()
+                    alive = self._alive(seen)
                     with MAIL_LOCK:
                         head = {"events": [], "n": EVENT_BASE + len(EVENTS),
-                                "folding": FOLDING["on"], "runtimeSeen": seen}
+                                "folding": FOLDING["on"], "runtimeSeen": seen,
+                                "browserAlive": alive}
                     return self._json(200, head)
                 since = self._since()
                 with MAIL_LOCK:
@@ -301,10 +349,12 @@ def serve(port, backend, token, host="127.0.0.1"):
                     folding = FOLDING["on"]
                 # `from` says where the answer actually starts, which is only
                 # different from `since` for a caller that fell behind the cap.
+                seen = self._seen()
                 return self._json(200, {"events": events, "n": n,
                                         "from": EVENT_BASE + first,
                                         "folding": folding,
-                                        "runtimeSeen": self._seen()})
+                                        "runtimeSeen": seen,
+                                        "browserAlive": self._alive(seen)})
             if route == "/out":
                 # 🔴 `head=1` IS A RUNTIME PAGE SAYING IT HAS JUST STARTED, and
                 # it exists because a reload replayed the SESSION. The page
@@ -324,8 +374,10 @@ def serve(port, backend, token, host="127.0.0.1"):
             if route == "/health":
                 with MAIL_LOCK:
                     folding = FOLDING["on"]
+                seen = self._seen()
                 return self._json(200, {"ok": True, "busy": folding,
-                                        "runtimeSeen": self._seen(),
+                                        "runtimeSeen": seen,
+                                        "browserAlive": self._alive(seen),
                                         # ...so the page can say whether
                                         # Disconnect releases the MACHINE or
                                         # only stops the service on it.

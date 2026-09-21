@@ -37,9 +37,13 @@ WHAT IT CHECKS, in the order a session does them:
   * A READER THAT ARRIVES MID-FOLD ATTACHES TO IT rather than sitting idle,
     which is what a reload, a second window or the notebook's link opened
     twice all are;
-  * A RUNTIME THAT GOES AWAY IS VISIBLE: the runtime page's own command poll
-    is the heartbeat, and `runtimeSeen` is how a reader tells a recycled Colab
-    runtime from a slow fold rather than polling for the rest of the session;
+  * A RUNTIME THAT GOES AWAY IS VISIBLE, AND A BUSY ONE IS NOT MISTAKEN FOR
+    IT: the runtime page's own command poll is the heartbeat, and it STOPS
+    while that page holds its main thread - which is what a fold does - so
+    silence alone would abort a fold that was working. `browserAlive`, the
+    DevTools endpoint the browser PROCESS serves, is what separates them, and
+    both states are driven here: the page navigated away (quiet, still alive)
+    and the browser killed (gone);
   * and no route answers anything without the token.
 
 🔴 WHAT IT CANNOT COVER is a fold: no weights on a developer's machine and no
@@ -392,10 +396,12 @@ try:
     finally:
         pass
 
-    # 8 · A RUNTIME THAT GOES AWAY IS VISIBLE, which is Colab's ordinary
-    #     ending: the notebook is closed, the runtime is recycled, and a
-    #     reader mid-fold would otherwise poll a broker that can never answer.
-    #     The page's own command poll is the heartbeat.
+    # 8 · A RUNTIME THAT GOES AWAY IS VISIBLE - AND A BUSY ONE IS NOT MISTAKEN
+    #     FOR IT. Colab's ordinary ending is the notebook being closed or the
+    #     runtime recycled, and a reader mid-fold would otherwise poll a
+    #     broker that can never answer. The page's own command poll is the
+    #     heartbeat; the DevTools endpoint, served by the browser PROCESS, is
+    #     what separates "this page is busy" from "this machine is gone".
     runtime_ws = None
     try:
         for target in json.load(urllib.request.urlopen(
@@ -403,40 +409,66 @@ try:
             if target.get("type") == "page":
                 runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
                 break
+        # 🔴 AFTER A SETTLE, because the arm above deliberately blocks that
+        # page's main thread for six seconds and its poll stops with it. The
+        # first version read the heartbeat straight afterwards and reported
+        # 6.2 s of silence as a heartbeat that was not beating - the arm
+        # measuring the arm before it.
+        time.sleep(1.5)
         code, said = call("/health")
         fresh = said.get("runtimeSeen")
-        # 🔴 THE WATERMARK IS TAKEN HERE, not carried down from an arm above:
-        # the first version of the replay check counted the READER ARM's own
-        # fold - which happened before this - and reported the fix as broken.
-        # An arm's baseline is the state immediately before it.
+        if fresh is None or fresh > 3000:
+            bad.append(f"a live runtime page reads {fresh} ms since its last"
+                       " command poll - the heartbeat is not beating")
+        if said.get("browserAlive") not in (None, True):
+            bad.append(f"the browser reads {said.get('browserAlive')!r} while"
+                       " its page is answering")
+
+        # 🔴 THE BASELINE IS TAKEN HERE, not carried down from an arm above:
+        # the replay check below counted folds from earlier arms and reported
+        # the fix as broken. An arm's baseline is the state immediately
+        # before it - this file's own rule, relearned twice now.
         code, head = call("/down?head=1")
         since = head.get("n", since)
-        # Away: a page with no `role` in its URL runs no bridge, so the polls
-        # stop exactly as they would if the runtime had been taken away.
+
+        # (a) THE PAGE STOPS ANSWERING AND THE BROWSER DOES NOT. A page with
+        #     no `role` runs no bridge, which is what a page busy in a fold
+        #     looks like from here - and a reader must NOT give up on it.
         runtime_ws.call("Page.navigate", url="about:blank")
-        grew, deadline = 0, time.time() + 20
+        quiet, alive, deadline = 0, None, time.time() + 20
         while time.time() < deadline:
             code, said = call("/health")
-            grew = said.get("runtimeSeen") or 0
-            if grew > 3000:
+            quiet, alive = said.get("runtimeSeen") or 0, said.get("browserAlive")
+            if quiet > 6000:
                 break
             time.sleep(0.5)
-        # ...and back, which is also the page recovering on its own.
+        print(f"  page quiet: {quiet} ms, browser alive: {alive}")
+        if quiet <= 6000:
+            bad.append("the heartbeat did not age while the page was away, so"
+                       " a reader cannot tell a dead runtime from a slow fold")
+        if alive is not True:
+            bad.append(f"the browser reads {alive!r} while it is running - a"
+                       " reader would abandon a fold whose page is merely"
+                       " busy, which is what a fold looks like")
+
+        # ...and back, which is also the bridge restarting by itself.
         runtime_ws.call("Page.navigate", url=(
             f"http://127.0.0.1:{PORT}/index.html?role=runtime&t={TOKEN}"))
         back, deadline = None, time.time() + 60
         while time.time() < deadline:
             code, said = call("/health")
             back = said.get("runtimeSeen")
-            if back is not None and back < 2000 and grew > 3000:
+            if back is not None and back < 2000:
                 break
             time.sleep(0.5)
-        print(f"  heartbeat: {fresh} ms fresh, {grew} ms with the page away,"
-              f" {back} ms once it is back")
+        print(f"  heartbeat: {fresh} ms fresh, {back} ms once the page is back")
+        if back is None or back > 2000:
+            bad.append(f"the heartbeat did not come back ({back} ms) after the"
+                       " runtime page reloaded - the bridge does not restart")
         # 🔴 AND A RELOADED PAGE DOES NOT REPLAY THE SESSION. It polled from
         # zero, so coming back it obeyed every command the notebook had ever
-        # sent: measured here as a fold from an arm ten minutes earlier being
-        # run again, weights and all. What it is owed is what happens NEXT.
+        # sent: measured as a fold from an arm ten minutes earlier being run
+        # again, weights and all.
         code, said = call(f"/down?since={since}")
         since = said.get("n", since)
         replayed = [e for e in (said.get("events") or [])
@@ -445,18 +477,10 @@ try:
             bad.append(f"the reloaded runtime page replayed {len(replayed)}"
                        " command event(s) - it starts from zero rather than"
                        " from where the queue stands")
-        if fresh is None or fresh > 3000:
-            bad.append(f"a live runtime page reads {fresh} ms since its last"
-                       " command poll - the heartbeat is not beating")
-        if grew <= 3000:
-            bad.append("the heartbeat did not age while the runtime page was"
-                       " away, so a reader cannot tell a dead runtime from a"
-                       " slow fold")
-        if back is None or back > 2000:
-            bad.append(f"the heartbeat did not come back ({back} ms) after the"
-                       " runtime page reloaded - the bridge does not restart")
+
     finally:
         pass
+
 
     # 9 · A READER THAT ARRIVES MID-FOLD ATTACHES TO IT. A Colab fold is
     #     minutes long and the page in front of it is an ordinary tab, so
@@ -624,7 +648,33 @@ try:
         bad.append("the broker is still busy after the fold ended, so every"
                    " later fold would be refused")
 
-    # 10 · and nothing answers without the token.
+    # 10 · THE BROWSER GOES, WHICH IS THE RUNTIME GOING. This is the state
+    #     a reader gives up on, and the only one.
+    # 🔴 THE BROWSER ONLY. `pkill -f localfold-bridge-check` also matches the
+    # BROKER, whose own command line carries that profile in `--profile` - so
+    # the first version killed the post office as well and the next request
+    # died on "connection refused", which is a different fault wearing this
+    # one's clothes.
+    subprocess.run(["pkill", "-f", "Google Chrome.*localfold-bridge-check"],
+                   check=False)
+    dead, deadline = None, time.time() + 30
+    while time.time() < deadline:
+        try:
+            code, said = call("/health")
+        except Exception as cause:                            # noqa: BLE001
+            bad.append(f"the broker went with the browser ({cause}) - the"
+                       " post office is not the thing being killed here")
+            break
+        dead = said.get("browserAlive")
+        if dead is False:
+            break
+        time.sleep(0.5)
+    print(f"  with the browser gone: browserAlive {dead}")
+    if dead is not False:
+        bad.append(f"the browser reads {dead!r} after it was killed - a"
+                   " reader cannot tell a gone runtime from a busy one")
+
+    # 11 · and nothing answers without the token.
     for route, body in (("/down?since=0", None), ("/out?since=0", None),
                         ("/health", None), ("/up", {"events": []}),
                         ("/in", {"op": "ping"})):
