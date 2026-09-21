@@ -2751,6 +2751,53 @@ above; the third of his names,
 `chromium-experimental-subgroup-matrix`, is a FEATURE rather than a toggle,
 exposed by `allow_unsafe_apis`, which is already passed.
 
+## The last asymmetry: ESMFold2's and AF2's orchestration still live in the page
+
+Every prediction assembly is now `(result, about)` in a module of its own -
+`predictionFromAf3`, `predictionFromEsmfold2`, `predictionFromAf2` - so a
+runtime with no page builds the object the page builds rather than a second
+version of it. What is NOT symmetrical is the layer above: AF3 has `foldAf3`
+in web/af3-model.js and the other two have their orchestration inside
+web/app.js, which is why tools/colab_runtime.mjs folds seven families and
+refuses the rest by name.
+
+**The seam is mapped, and it is not where the line count suggests.**
+`foldWithEsmfold2` is 383 lines and the compute and the display INTERLEAVE -
+so it is surgery, not a slice:
+
+| lines | what |
+|---|---|
+| 2912-2963 | ligands, modifications, weights, device - compute |
+| 2965-2970 | stem, `openBlankFold`, viewer reset - PAGE |
+| 2972-3013 | `drawLiveFrame` - one `remoteTap` and forty lines of viewer - PAGE |
+| 3016-3068 | reference, slots, REMARK, trunk key - compute |
+| 3071-3153 | the `foldEsmfold2` call - compute, with page callbacks inside it |
+| 3154-3175 | certainty, b-factors, the final PDB - compute |
+| 3188-3253 | loading it into the viewer - PAGE |
+| 3258-3291 | the assembly (already lifted), downloads, status - PAGE |
+
+**What the extracted `foldEsmfold2Job(options)` has to take**, because these
+are read from CONTROLS today and a process has none: `chosenFamily`,
+`recycleCount`, `plmChoice`, `usesLanguageModel`, `randomSeed`,
+`samplerPreset` - the last five all appear in the TRUNK KEY, so a wrong one
+silently reuses the wrong trunk. Plus the callbacks `foldAf3` already has:
+`onStatus`, `onProgress`, `onFrame`, `onContacts`, and `onBatch`, which is
+how the page keeps `viewerTokens` without the compute knowing what a viewer
+is.
+
+🔴 **AND IT CANNOT BE VERIFIED ON THIS REPOSITORY'S OWN MACHINE.** The node
+lane catches structure and nothing else; the page path needs a browser with a
+GPU and the node path needs Dawn, whose prebuilt binary wants a newer macOS
+than this Mac runs. So the honest gate is a Colab box running BOTH - the page
+through `--runtime chrome` and the process through `--runtime node` - folding
+one sequence and comparing the predictions field for field, which is the
+no-op proof the two assembly lifts already passed. Budget a session for it.
+
+AF2 is the same job with a home already waiting (web/af2-model.js) and one
+extra trap: tools/gpu/fold-af2.js looks like the orchestration and is not -
+it returns a bench report, timings and checksums, with no pdb and no
+per-residue arrays.
+
 ## `bondedAtomPairs`: a covalent inhibitor, bonded
 
 Three of AlphaFold 3's fourteen example jobs were refused for declaring covalent
