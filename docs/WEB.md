@@ -2625,6 +2625,132 @@ the wall-clock was blamed on the runtime. Long work goes **detached**
 and is read with cheap polls; the first `exec` against a new session pays
 ~29 s of kernel connection, every later one is ~3 s.
 
+## Is Dawn a faster way onto the card than Chrome? Yes, by 9 s - and that is not the question
+
+`node-webgpu` is Chrome's own WebGPU implementation (Dawn) as an npm package,
+so the suggestion was to install that instead of `chrome-headless-shell`.
+Measured on **cold T4s, counterbalanced** - whichever arm runs second is
+advantaged, because the shared `libvulkan1` has warmed apt by then, so the
+order was run both ways on two fresh machines:
+
+| cold T4 | Chrome | Dawn |
+|---|---:|---:|
+| order dawn -> chrome | 15.4 s | **6.7 s** |
+| order chrome -> dawn | 16.7 s | **6.9 s** |
+
+Chrome is wget 6.4-7.2 s, unzip 2.9-3.5, and **6.0 s of four X11 libraries
+that exist only for it**; Dawn is wget node 0.2-0.3, untar 3.6-3.8, and
+`npm i webgpu` 2.6-3.0. Both arms were verified rather than timed blind -
+Chrome reports its version, Dawn returns an `nvidia turing` adapter with
+`f16=true`. **2.4x, saving ~9.3 s.** Neither arm is charged for the shared
+prerequisites, which are the larger number anyway: the NVIDIA ICD unpack is
+**16 s** and both paths need it.
+
+🔴 **AND IT NEEDS NODE 24, WHICH IS MOST OF WHAT IT INSTALLS.** The model
+scales are float16, so the runtime needs `Float16Array` - absent on node 20
+(Colab's own) and on 22.14, present on 24.8.0. The Dawn arm above therefore
+includes a 29 MB node download; `npm i webgpu` alone is under 3 s.
+
+🔴 **AND THE RUNTIME'S BROWSER IS NOT AN ADAPTER, WHICH IS WHY THIS IS NOT
+TAKEN.** The headless Chrome on the runtime is *running the application* -
+`index.html?role=runtime`, the entity list, `#predict`, `window.__foldState`,
+the MSA fetch, and the frames `tapOut` pushes to the reader. Under node there
+is no page: `tools/gpu/fold.js main()` is a CLI fold, so the whole driver half
+would have to be written again, and the runtime would then exercise a
+different fold path from the one every visitor runs. Nine seconds does not
+buy that.
+
+**Where Dawn IS the answer is where only the card was ever wanted** - the
+benches in `tools/gpu/`, CI on a Linux box - and that door already exists as
+`createNodeDevice` in `src/node.js`. It is now proven end to end rather than
+at the feature list: a real AF3 fold on a T4, **7.5 s**, mean pLDDT 70.1,
+backbone N-CA 1.45 / CA-C 1.54 / CA-CA 3.86 A, radius of gyration 10.9 A.
+
+🔴 **AND THE THING ACTUALLY WORTH 40 s IS NOT THE INSTALL AT ALL.** The link
+is printed only after the whole setup AND `Backend.start()` - launch Chrome,
+navigate, `wait_for("!!window.__entityList")`, read the adapter. Nothing on
+the reader's first screen needs the GPU: the page is served by the Python
+broker, and the runtime half need only exist by the time someone presses
+Fold. Printing the link once the clone is up and warming the browser
+underneath is worth the entire setup, not a tenth of it.
+
+🔴 **AND IT WAS BUILT, GATED AND TAKEN BACK OUT.** All of it worked: the
+broker printed its handle before starting the browser (0.1 s against 0.8 s
+locally, and on a runtime the whole install), the cell cloned synchronously
+and installed the rest detached, the badge grew a third `warming` state, and
+`/in` answered 503 to a Fold pressed in the window before the page's first
+poll - which it must, because `serveCommands` starts at the head watermark so
+a RELOADED runtime does not replay the session, and anything written before
+that first poll is skipped rather than queued. Five assertions, each shown to
+fail against the old order.
+
+It came out because **the setup is not long enough to be worth it**. Measured
+cold on a T4: the shared prerequisites are `libvulkan1` at 2.2 s and the
+NVIDIA ICD unpack at **15.9 s**, which neither a browser nor Dawn avoids, and
+the browser is 15.4-16.7 s on top - so about 34 s, and roughly 25 with Dawn.
+Every step checks the disk first, so a re-run is near zero. Against that, the
+deferral is a third state in the badge, a refusal path, a readiness marker and
+an adapter that can be asked before there is a page to ask - machinery whose
+whole return is the first launch of a session.
+
+**What it needs if it comes back**: the marker, not the binary. `google-chrome`
+exists the moment the unzip finishes, and a Chrome started before the ICD
+lands comes up on SwiftShader - the CPU wearing the card's clothes, which
+folds and looks exactly like success. Reverted in the commit after this one;
+`git revert` it to get the lot back.
+
+### f16 on a T4: 1.52x, and the same structure to the digit
+
+The A100 table above prices `shader-f16` at **1.74x** on a whole fold. The
+same measurement on a T4, through Dawn in node, with and without
+`vulkan_enable_f16_on_nvidia`:
+
+| | f16 off | f16 on |
+|---|---:|---:|
+| whole fold, 58 residues | 11.4 s | **7.5 s** |
+| mean pLDDT | 70.1 | 70.1 |
+| backbone CA-CA | 3.86 A | 3.86 A |
+
+**1.52x, and the structure is identical.** The Colab path does get this:
+`cdp.py`'s `LINUX_FLAGS` carry the toggle and `colab_backend.py` launches
+through it. (An earlier note in that file priced f16 at 1.95x; that number
+belongs to `keepTrunkWeights` and has been corrected.)
+
+### `timestamp_quantization` was destroying every small kernel's measurement
+
+Dawn rounds `timestamp-query` results so a page cannot use the GPU clock as a
+fine timer. The grid is **65536 ns** - not the 100 us usually quoted. Measured
+on a T4, 64 dispatches of a ~10.5 us compute pass:
+
+| | gcd of deltas | distinct values | range |
+|---|---:|---:|---|
+| quantised (the default) | 65536 ns | **2 of 64**, 63 of them ZERO | 0 - 65536 |
+| `disable-dawn-features=timestamp_quantization` | 32 ns | 21 of 64 | 10240 - 13600 ns |
+
+So every kernel in `tools/gpu/` faster than ~65 us has been swept against
+noise. `tools/gpu-chrome.mjs` and `createNodeDevice` pass the flag now, beside
+the `--enable-precise-memory-info` that exists because `performance.memory`
+rounds to 100 KiB - the same fault, one instrument along. It is deliberately
+**not** gated on `LOCALFOLD_STOCK_FLAGS`: it changes no capability, only the
+resolution of a clock a visitor never reads.
+
+### `disable_robustness` is a null result here, so it is not taken
+
+Suggested with the two above. Six alternated arms on a T4 (the card throttles,
+so every arm sits next to a baseline), minimum of three each:
+
+| | trunk | diffusion | whole fold |
+|---|---:|---:|---:|
+| baseline | 1.0 s | 2.9 s | 7.3 s |
+| `disable_robustness` | 1.1 s | 2.9 s | 7.3 s |
+
+Nothing, at every phase. What it would cost is real - an out-of-bounds access
+stops being clamped and becomes corruption or a hang - so a toggle that buys
+no measurable time does not go in. Reported by Milot, along with the two
+above; the third of his names,
+`chromium-experimental-subgroup-matrix`, is a FEATURE rather than a toggle,
+exposed by `allow_unsafe_apis`, which is already passed.
+
 ## `bondedAtomPairs`: a covalent inhibitor, bonded
 
 Three of AlphaFold 3's fourteen example jobs were refused for declaring covalent

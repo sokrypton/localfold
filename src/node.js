@@ -25,7 +25,27 @@ import { requestAlphaFoldDevice } from "./runtime/device.js";
 export const DAWN_TOGGLES = ["vulkan_enable_f16_on_nvidia", "allow_unsafe_apis"];
 
 /**
- * @param {{toggles?: string[], adapter?: string, powerPreference?: GPUPowerPreference}} [options]
+ * Toggles to turn OFF, which is a second flag: `disable-dawn-features=`.
+ *
+ * 🔴 `timestamp_quantization` IS ON BY DEFAULT AND IT DESTROYS A SMALL
+ * KERNEL'S MEASUREMENT. It rounds every `timestamp-query` result to a grid so
+ * that a page cannot use the GPU clock as a fine timer - and the grid is
+ * **65536 ns**, not the 100 us usually quoted. Measured on a T4, 64 dispatches
+ * of a ~10.5 us compute pass:
+ *
+ *     quantised     gcd 65536 ns   2 distinct values of 64   63 of them ZERO
+ *     unquantised   gcd 32 ns     21 distinct values of 64   10240-13600 ns
+ *
+ * So anything under ~65 us reads as 0 or as one whole tick, and a sweep over
+ * such a kernel compares noise with noise. Every tool in `tools/gpu/` that
+ * asks for `timestamp-query` wants this off; nothing that merely FOLDS does.
+ * Reported by Milot.
+ */
+export const DAWN_DISABLE = ["timestamp_quantization"];
+
+/**
+ * @param {{toggles?: string[], disable?: string[], adapter?: string,
+ *   powerPreference?: GPUPowerPreference}} [options]
  * @returns {Promise<{device: GPUDevice, adapter: GPUAdapter, gpu: unknown}>}
  */
 export async function createNodeDevice(options = {}) {
@@ -45,8 +65,10 @@ export async function createNodeDevice(options = {}) {
   }
   Object.assign(globalThis, binding.globals);
   const toggles = options.toggles ?? DAWN_TOGGLES;
+  const disable = options.disable ?? DAWN_DISABLE;
   const flags = [
     ...(toggles.length === 0 ? [] : [`enable-dawn-features=${toggles.join(",")}`]),
+    ...(disable.length === 0 ? [] : [`disable-dawn-features=${disable.join(",")}`]),
     ...(options.adapter === undefined ? [] : [`adapter=${options.adapter}`]),
   ];
   const gpu = binding.create(flags);

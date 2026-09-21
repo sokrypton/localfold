@@ -343,6 +343,17 @@ async function main() {
     // ...and a collection has to be requestable, or a heap reading counts
     // whatever garbage has not been swept yet and cannot see a cache dropped.
     "--js-flags=--expose-gc",
+    // 🔴 AND THE GPU CLOCK IS ROUNDED THE SAME WAY, HARDER. Dawn quantises
+    // every `timestamp-query` result so a page cannot use it as a fine timer,
+    // and the grid is 65536 ns - not the 100 us usually quoted. Measured on a
+    // T4, 64 dispatches of a ~10.5 us compute pass: quantised, the gcd of the
+    // deltas is 65536 and 63 of the 64 read ZERO; unquantised the gcd is 32 ns
+    // and they spread 10240-13600. So every kernel in tools/gpu/ faster than
+    // ~65 us was being swept against noise. Unlike the two flags above this
+    // changes no CAPABILITY - it is the resolution of the clock we read, not
+    // anything the GPU does - so it is not gated on STOCK_FLAGS: a visitor's
+    // timestamps are quantised and a visitor takes none. Reported by Milot.
+    "--disable-dawn-features=timestamp_quantization",
     "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
     `http://127.0.0.1:${port}/__runner`,
   ], { stdio: ["ignore", "ignore", "pipe"] });
