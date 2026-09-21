@@ -60,9 +60,24 @@ verification without the control would have read as "dawn broke openbind0".
 The page's other gates, on the branch: `--drop-job` eight arms true,
 `--contact-ui` `kept: true`, `--job-round-trip` `same`/`seedSame` true, and
 AlphaFold 3's KRAS/sotorasib job folded from its rows at 189 residues + MOV.
-`npm test` 1273, `test:site`. `mobile-layout.py` reports its one standing
-failure - the desktop resize handle, bisected on main to the py2Dmol vendor bump
-`72d1bcc` and not this branch's.
+`npm test` 1273, `test:site`, and `mobile-layout.py` is green again - see below.
+
+🔴 **THE LAYOUT GATE WAS RED FOR A MECHANISM CHANGE, NOT A BROKEN PAGE.** It
+asserted that `#canvasContainer .resize-handle` is NOT hidden at desktop, as a
+guard that the narrow-only rule had not leaked. py2Dmol's slot layout (vendor
+bump `72d1bcc`, on main) moved the resize onto the slot **body** - `resize:
+both`, with its own `::-webkit-resizer` hidden - and hides the old handle at
+EVERY width through a stylesheet **its JavaScript injects**:
+`.py2dmol-slot-body .resize-handle { display: none !important }`. That is in
+neither `.css` file, which is why grepping for it found nothing; the engine's
+own `CSS.getMatchedStylesForNode` named it in one call.
+
+Measured at 1200px: the slot body is `resize: both`, so a reader could drag the
+corner the whole time. The vendored files are not ours to edit, so the fix was
+never to put the handle back - the gate asks for the **capability** now
+(resizable on a desktop, not on a phone), which is what a reader needs and
+survives upstream moving the corner again. Watched failing by pinning
+`resize: none !important` at the vendor's own specificity.
 
 🔴 **AND `docs/TOOLS.md` WAS STALE ON THE BRANCH**: `colab_runtime.mjs` is a new
 tool and the census is gated, so `npm run test:tools` was red here. Regenerated.

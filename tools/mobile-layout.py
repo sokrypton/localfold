@@ -189,6 +189,14 @@ MEASURE = r"""(() => {
 
   const rh = document.querySelector('#canvasContainer .resize-handle');
   R.resizeHandle = rh ? getComputedStyle(rh).display : 'absent';
+  // 🔴 AND WHETHER THE BOX CAN BE DRAGGED AT ALL, which is what the handle was
+  // standing in for. py2Dmol's slot layout moved the resize off
+  // `#canvasContainer` onto the slot BODY - `resize: both`, its own
+  // `::-webkit-resizer` hidden - and hides the old handle at every width with a
+  // stylesheet its JS injects. Asserting on the handle stopped describing
+  // whether a reader can resize anything; this does.
+  const slotBody = document.querySelector('.py2dmol-slot--big > .py2dmol-slot-body');
+  R.canResize = slotBody ? getComputedStyle(slotBody).resize : 'no slot body';
 
   // ...and the panel column, which is 340px of fixed card beside a 600px
   // canvas: on a phone it has to become the page's width like everything else.
@@ -617,6 +625,13 @@ def main():
             bad.append("%s: the canvas resize handle is showing (display: %s). It is"
                        " revealed on :hover, which a touch screen has not got, and the"
                        " box is resize:none here anyway" % (name, R["resizeHandle"]))
+        # 🔴 AND THE BOX ITSELF MUST NOT BE DRAGGABLE HERE. A drag corner on a
+        # touch screen is a target nobody can hit and a gesture that fights the
+        # scroll, which is the same argument the hidden handle rests on.
+        if R["canResize"] not in ("none", "no slot body"):
+            bad.append("%s: the canvas box is resize:%s - draggable on a touch"
+                       " screen, where the handle is correctly hidden"
+                       % (name, R["canResize"]))
         play = R["rows"]["play"]
         if play and len(play) != 1:
             bad.append("%s: the play bar broke across %d lines: %s"
@@ -684,9 +699,21 @@ def main():
                    " 1px border)" % D["content"])
     if D["titleOverlap"]:
         bad.append("the desktop title and the fold actions overlap")
-    if D["resizeHandle"] == "none":
-        bad.append("the desktop canvas resize handle was hidden too - that rule is"
-                   " meant to be narrow-only")
+    # 🔴 THE CAPABILITY, NOT THE ELEMENT - AND IT USED TO BE THE OTHER WAY. This
+    # asserted that `#canvasContainer .resize-handle` is NOT hidden at desktop,
+    # as a guard that the narrow-only rule had not leaked. py2Dmol's slot layout
+    # then moved the resize onto the slot BODY (`resize: both`, own
+    # `::-webkit-resizer` hidden) and hid the old handle at EVERY width through
+    # a stylesheet its JS injects - `.py2dmol-slot-body .resize-handle
+    # { display: none !important }` - so the gate went red for a mechanism
+    # change while a reader could still drag the corner. Measured at 1200px:
+    # slot body `resize: both`. The vendored files are not ours to edit, so the
+    # fix was never to put the handle back: what a reader needs is that the box
+    # resizes on a desktop and does not on a phone, and which element carries
+    # that corner is upstream's business and will move again.
+    if D["canResize"] == "none":
+        bad.append("the desktop canvas box is resize:none - a reader cannot drag it"
+                   " at all, whichever element is meant to carry the corner")
     if D["rows"]["options"] is not None and len(D["rows"]["options"]) != 1:
         bad.append("the desktop fold options broke across %d lines - they are one row"
                    " there and the narrow grouping must not reach them"
