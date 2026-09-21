@@ -49,7 +49,7 @@ import { smilesComponent } from "../src/chem/component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel, releaseModel } from "./model.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
-  SINGLE_SEQUENCE_FAMILIES, graphFamily }
+  SINGLE_SEQUENCE_FAMILIES, graphFamily, MODEL_LABELS }
   from "../src/bundles/manifests/index.js";
 import { devAdopt, devBeginRun, devEndRun, devNote, devOnEntry, devSourceIs, devStatus,
   devUseDevice } from "./dev-log.js";
@@ -634,46 +634,6 @@ let shownFamily;
 const familyFromLabel = (label) => Object.keys(MODEL_LABELS)
   .find((family) => MODEL_LABELS[family] === label);
 
-const MODEL_LABELS = {
-  af3: "AlphaFold 3",
-  // Upstream's own name for this release. See src/af3/dialect.js for why the
-  // number is not decoration.
-  openbind0: "OpenBind-0",
-  opendde: "OpenDDE",
-  // Upstream's own names, for the reason OpenBind-0 keeps its number: the
-  // release is what the weights are, and a shortened label would name a family
-  // that has more than one member.
-  boltz2: "Boltz-2",
-  protenix2: "Protenix-v2",
-  intellifold2: "IntelliFold-2",
-  rosettafold3: "RoseTTAFold3",
-  monomer: "AlphaFold 2",
-  multimer: "AlphaFold 2",
-  // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE FAMILY'S. `ESMFold2` alone read as
-  // ESM's released ESMFold2-Fast, which folds from ESM-C 6B and is a different
-  // and better model; this is an experimental one sized to fit a browser.
-  //
-  // 🔴 AND THE SIZE IS NOT IN THE LABEL, BECAUSE THE PLM ROW SAYS IT. "600M"
-  // names the TOWER, not the folding model - which is 171 M in every published
-  // variant - so carrying it in the model name said the wrong thing twice over
-  // once a row appeared naming the language model outright. The family id keeps
-  // it (`ef2-fast-600m` is the checkpoint `base600M-step1500k`), because a
-  // 300M sibling would be a DIFFERENT fold bundle rather than a tower swap: its
-  // shim is trained for 30 layers x 960 against this one's 36 x 1152.
-  "ef2-fast-600m": "EF2-fast",
-  // ...the same folding model against the smaller tower, and its own
-  // checkpoint. The label names the tower because that is what differs.
-  "ef2-fast-300m": "EF2-fast (300M)",
-  // 🔴 AND THE FIVE AF2 MODELS SAY WHICH ONE IS LOADING, DERIVED RATHER THAN
-  // TYPED. A delta downloads its BASE as well as itself, so the dial reading
-  // "AlphaFold 2 · 73 / 116 MiB" under model 2 is the only place a reader is
-  // told the two halves are one model - and eight typed rows is eight chances
-  // to label model_4's weights model_3. Both AF2 families are "AlphaFold 2";
-  // the number is what the row does not already say.
-  ...Object.fromEntries(Object.entries(MODEL_BUNDLES)
-    .filter(([, bundle]) => ["monomer", "multimer"].includes(bundle.delta?.base))
-    .map(([family]) => [family, `AlphaFold 2 (model ${family.split("-")[1]})`])),
-};
 
 const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
                      templateCount = 0) => {

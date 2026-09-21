@@ -399,7 +399,16 @@ export const toPoints = (positions, count) => Array.from(
  * they are computed and there is no last one yet.
  */
 export function fittedPdb(batch, positions, reference, slots, plddt, options = {}) {
-  const api = window.py2Dmol;
+  // 🔴 `window` IS A REFERENCE ERROR WHERE THERE IS NO PAGE, NOT A MISSING
+  // PROPERTY. The branch below already copes with the viewer library being
+  // absent - it returns the unfitted frame - but naming `window` bare throws
+  // before it can, so the Colab runtime's fold died here with "window is not
+  // defined" after a complete trunk. `options.superpose` lets a caller that
+  // HAS a superposition hand it over; nothing in the page passes it, so the
+  // page keeps reading the global exactly as it did.
+  const api = options.superpose !== undefined
+    ? { superpose: options.superpose }
+    : globalThis.window?.py2Dmol;
   const count = batch.tokens * batch.dense;
   if (api?.superpose === undefined || reference === null) {
     return toPdb(batch, positions, plddt, options);
