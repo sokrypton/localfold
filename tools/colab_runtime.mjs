@@ -186,11 +186,31 @@ async function runFold(request) {
   // exist but neither is reachable from here: ESMFold2's orchestration lives
   // in web/app.js as a page function, and tools/gpu/fold-af2.js returns a
   // BENCH REPORT - timings and checksums - rather than a prediction.
-  const known = [...AF3_FAMILIES, ...SINGLE_SEQUENCE_FAMILIES];
+  // 🔴 EF2-fast IS WIRED AND DOES NOT WORK HERE, SO IT IS OPT-IN. Measured on
+  // a Colab T4, twice: through the runtime the shard fetch dies with
+  // "weights-00.int5.bin ... 0 bytes arrived ... after three attempts", and
+  // the same job with a 300 ms poll beside it aborts natively -
+  // `std::system_error: Invalid argument`, a core dump, no JavaScript error.
+  // What is NOT the cause, each eliminated by measurement: the loader (it
+  // succeeds standalone, with and without the 224 MiB tower), the
+  // `timestamp_quantization` flag (both arms load), `navigator.gpu` being
+  // unset by createNodeDevice (both arms load), and createNodeDevice itself
+  // (one core dump that did not reproduce). The job alone did not finish in
+  // 500 s either, on a two-CPU box with 11 GiB free.
+  //
+  // A family the runtime ACCEPTS and then fails on is worse than one it
+  // refuses with a reason - the rule this project applies to controls. So the
+  // default is the graph that is proven on a T4, and EF2-fast needs
+  // `--allow-esmfold2` from somebody who is debugging it.
+  const esmfold2Allowed = process.argv.includes("--allow-esmfold2");
+  const known = [...AF3_FAMILIES, ...(esmfold2Allowed ? SINGLE_SEQUENCE_FAMILIES : [])];
   if (!known.includes(family)) {
     return {
       error: `this runtime folds ${known.join(", ")};`
-        + ` ${family} needs a browser - start the service with --runtime chrome`,
+        + ` ${family} needs a browser - start the service with --runtime chrome`
+        + (SINGLE_SEQUENCE_FAMILIES.includes(family)
+          ? " (EF2-fast is wired here but aborts on a Colab T4;"
+            + " --allow-esmfold2 to work on it)" : ""),
       status: lastStatus,
     };
   }
