@@ -287,11 +287,15 @@ describe("a ligand's PAE reaches the viewer", () => {
 describe("a modified residue reaches ESMFold2", () => {
   const app = readSource("web/app.js");
   const from = app.indexOf("async function foldWithEsmfold2(");
-  // 🔴 TO THE END OF THE FUNCTION, NOT TO THE FOLD CALL. The entities literal
-  // is an ARGUMENT of `foldEsmfold2(...)`, so a slice that stops at the call
-  // stops just short of the thing this file is about - and the arm reported a
-  // missing key that was two lines further on.
-  const body = app.slice(from, app.indexOf("\nasync function ", from + 10));
+  // 🔴 AND THE FOLD ITSELF IS NOT IN THE PAGE ANY MORE. The compute moved to
+  // `foldEsmfold2Job` in web/esmfold2-model.js, the arrangement AF3 already
+  // had - so three of these four arms were scanning the wrapper for code that
+  // had left it, and failed. What stayed in web/app.js is the SIGNATURE, which
+  // is what the first arm is about; the component fetch, the entities literal
+  // and the trunk key are all in the job now.
+  const job = readSource("web/esmfold2-model.js");
+  const at = job.indexOf("export async function foldEsmfold2Job(");
+  const body = job.slice(at);
 
   it("is a parameter of the ESMFold2 fold path", () => {
     assert.ok(app.slice(from, app.indexOf(") {", from)).includes("modifications"));
@@ -317,7 +321,9 @@ describe("a modified residue reaches ESMFold2", () => {
    * as protein and then as DNA reused the first answer.
    */
   it("is part of the trunk key", () => {
-    const key = body.slice(body.indexOf("family: chosenFamily(), chains"));
+    // The controls became options when the fold left the page; the KEY is
+    // still one literal, and it is still the thing that must name them.
+    const key = body.slice(body.indexOf("const trunkKey = JSON.stringify({"));
     assert.ok(key.slice(0, 260).includes("modifications"),
               "the ESMFold2 trunk key does not name modifications");
   });

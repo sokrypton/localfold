@@ -22,6 +22,14 @@
  * else's server for no reason.
  */
 import { tokenLayoutFrom } from "./fold-archive.js";
+import { alphaCarbons, fittedPdb, toPoints } from "./af3-model.js";
+import { toPdb } from "../src/af3/fold.js";
+import { foldEsmfold2 } from "../src/esmfold2/fold.js";
+import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js";
+import { throwIfAborted } from "../src/runtime/abort.js";
+import { GpuBufferAllocator } from "../src/runtime/allocator.js";
+import { smilesComponent } from "../src/chem/component.js";
+import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
 import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
 import { readTensor } from "../src/weights/dtype.js";
 import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
@@ -431,4 +439,250 @@ export function predictionFromEsmfold2(result, about) {
     msas: {},
     templates: undefined,
   };
+}
+
+/**
+ * One ESMFold2 fold, end to end, with no page in it.
+ *
+ * 🔴 THE THIRD GRAPH GETS THE ARRANGEMENT THE OTHER TWO HAVE. `foldAf3` is
+ * this for the AlphaFold 3 graph; this was 383 lines inside `foldWithEsmfold2`
+ * in web/app.js, with the compute and the display INTERLEAVED in four
+ * alternating bands - so a runtime with no page could not fold this
+ * checkpoint at all, and tools/colab_runtime.mjs refused it by name.
+ *
+ * What stays with the caller is everything that needs a document: the viewer,
+ * the status line, the download panel, the trunk CACHE. What comes here is
+ * the work.
+ *
+ * 🔴 AND THE FIVE CONTROLS IN THE TRUNK KEY ARE OPTIONS NOW, WHICH IS THE
+ * PART THAT COULD HAVE GONE WRONG QUIETLY. `chosenFamily`, `recycleCount`,
+ * `plmChoice`, `usesLanguageModel` and `randomSeed` all feed `trunkKey`, and
+ * a trunk reused against the wrong key is not an error - it is a fold that
+ * answers with somebody else's trunk. The key is computed HERE, from those
+ * options, and the caller is asked `reuseFor(key)` rather than being trusted
+ * to rebuild the same key beside its cache.
+ *
+ * @param {{chains: string[], chainKinds: string[], ligandCodes?: Array,
+ *   modifications?: Array, signal: AbortSignal, device: GPUDevice,
+ *   modelLoad?: Promise<object>, family: string, modelName: string,
+ *   languageModel: boolean, plm: string, loops: number, sampler: string,
+ *   seed: number, reuseFor?: (key: string) => object|undefined,
+ *   onStatus?: (text: string) => void, onProgress?: (n: number) => void,
+ *   onFrame?: (pdb: string, certainty: unknown) => void,
+ *   onContacts?: (contacts: unknown, certainty: unknown) => void,
+ *   onBatch?: (batch: object) => void}} options
+ */
+export async function foldEsmfold2Job(options) {
+  const { chains, chainKinds, signal, device, modelLoad, family, modelName,
+          languageModel, plm, loops, sampler, seed } = options;
+  const ligandCodes = options.ligandCodes ?? [];
+  const modifications = options.modifications ?? [];
+  const onStatus = (text) => options.onStatus?.(text);
+  const framePdbs = [];
+  const sequence = chains.join(":");
+  onStatus(`${modelName} · loading`);
+  // ...the long name is for the download dial, where provenance matters; the
+  // status line uses the short one, because it is written many times a fold.
+  // 🔴 THE LIGAND DICTIONARY IS FETCHED, NOT BUNDLED, exactly as on the AF3
+  // path - and from the same place, because these are the same components. A
+  // fold touches only the codes its ligands name and the PDB serves each as one
+  // small mmCIF; the 21 polymer components stay baked.
+  const ligands = [];
+  for (const entry of ligandCodes) {
+    // A structure rather than a code; see the note in web/af3-model.js.
+    if (typeof entry !== "string") {
+      onStatus(`${modelName} · building ${entry.code ?? "ligand"}`);
+      ligands.push(await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
+      continue;
+    }
+    onStatus(`${modelName} · fetching ligand ${entry}`);
+    const response = await fetch(ccdUrl(entry), { signal });
+    if (!response.ok) {
+      throw new Error(`No chemical component ${entry} at the PDB (${response.status})`);
+    }
+    ligands.push(parseCcdComponent(await response.text()));
+  }
+  // 🔴 AND A MODIFIED RESIDUE'S COMPONENT FROM THE SAME PLACE, for the reason
+  // web/af3-model.js gives: the featuriser is synchronous, and this is the one
+  // piece of a batch that cannot be computed from the sequence.
+  const modifyWith = [];
+  for (const modification of modifications) {
+    onStatus(`${modelName} · fetching modified residue ${modification.code}`);
+    const response = await fetch(ccdUrl(modification.code), { signal });
+    if (!response.ok) {
+      throw new Error(`No chemical component ${modification.code}`
+        + ` at the PDB (${response.status})`);
+    }
+    modifyWith.push({ chain: modification.chain, position: modification.position,
+                      ...parseCcdComponent(await response.text()) });
+  }
+  throwIfAborted(signal);
+  const loaded = await (modelLoad
+    ?? loadEsmfold2Weights(undefined, { languageModel, family }));
+  // 🔴 ASKED AGAIN HERE, BECAUSE THE PRELOAD DECIDED IT EARLIER AND THE MEMO
+  // OUTLIVES BOTH. `startModelPreload` skips the tower's 223.6 MiB when the
+  // entities hold no protein or the PLM row says none - and either can have
+  // changed since, or the promise can have been built for a previous fold that
+  // did not want it. Idempotent, and it is a head start rather than a
+  // correctness fix: the store serves the blocks on demand either way.
+  if (languageModel) loaded.language.prefetch?.();
+  throwIfAborted(signal);
+  throwIfAborted(signal);
+
+  // `centreRandomAugmentation` draws a fresh rotation and translation of the
+  // whole system at the top of each step - it is how the sampler is equivariant
+  // and the model was trained with it in the loop - so consecutive frames differ
+  // by a rigid motion far larger than anything the denoiser did, and unfitted
+  // playback is a protein tumbling. AF3's path has fitted its trajectory since
+  // it had one; this is the same function, not a second one.
+  //
+  // 🔴 AND TO THE FIRST FRAME, NOT THE LAST, because the frames are drawn as
+  // they are computed and there is no last one yet.
+  let reference = null;
+  let slots;
+  // 🔴 THE COLOUR IS THE DISTOGRAM'S CERTAINTY, NOT A pLDDT, AND THE PDB SAYS
+  // SO IN A REMARK. This checkpoint has no confidence head - 820 tensors and
+  // not one named confidence, plddt, pae or pde - so what goes in the B-factor
+  // is an ORDERING with nothing to calibrate a number against. It is written
+  // there because that is the only column a viewer can colour from, and a
+  // downloaded file that carried an uncommented pLDDT-shaped column would be
+  // read as one. See CERTAINTY in src/esmfold2/distogram-webgpu.js for the
+  // sweep that chose its three constants.
+  let certainty;
+  let lastFrameCertainty;
+  const REMARK = "REMARK   1 B-FACTOR IS DISTOGRAM CERTAINTY (0-100), NOT pLDDT."
+    + "\nREMARK   1 THIS ESMFOLD2 CHECKPOINT HAS NO CONFIDENCE HEAD.";
+  const withRemark = (pdb) => `${REMARK}\n${pdb}`;
+
+  const started = performance.now();
+  // 🔴 THE SAME CACHE AlphaFold 3's PATH HAS, AND FOR THE SAME REASON: the trunk
+  // is the fold, so changing only the sampler should cost only the sampler. The
+  // key is what the TRUNK depends on and nothing else - the checkpoint, the
+  // chains and their kinds, the ligands, the pass count, and which language
+  // model, since "none" and ESM-C 600M share a family and produce different
+  // pairs. The seed is in it only when masking is on, because that is the only
+  // way the seed reaches the trunk: `lm_mask_pct` is zero in this checkpoint, so
+  // asking for a different SAMPLE reuses the trunk here where AF3 re-runs it.
+  // 🔴 AND THE MASK IS IN IT, WITH THE SEED BEHIND IT. `lm_mask_pct` replaces a
+  // fraction of the residues with the mask token BEFORE the tower runs, drawn
+  // from the seed - so with masking on, two seeds are two different trunk
+  // inputs and a key without them hands the second fold the first one's pair.
+  // This checkpoint sets the fraction to 0, so the seed never reaches the trunk
+  // and changing it reuses; but the config class documents single-sequence
+  // checkpoints as setting 0.1, so a future bundle turns this on by existing
+  // and the key has to be right before that rather than after.
+  const lmMask = (loaded.shape.lmMaskPct ?? 0);
+  const trunkKey = JSON.stringify({
+    family, chains, chainKinds, ligandCodes,
+    // A modification changes what is folded, so a trunk cached for the plain
+    // chain is not this fold's.
+    modifications: modifications.map((one) => `${one.code}@${one.position}`),
+    loops,
+    plm, languageModel,
+    lmMask, maskSeed: lmMask > 0 ? seed : null,
+  });
+  const reuse = options.reuseFor?.(trunkKey);
+
+  const result = await foldEsmfold2(device, {
+    reuse,
+    wantReusable: true,
+    sequence,
+    entities: { sequence, chainKinds, ligands, modifications: modifyWith },
+    // ...and which tokens the viewer will draw, so this path's contact map is
+    // collapsed the way the AF3 one is. See viewerTokens.
+    onBatch: (batch) => options.onBatch?.(batch),
+    // 🔴 THE RECYCLE DIAL DRIVES THIS TRUNK TOO, AND USED NOT TO. Its loop
+    // count came from the checkpoint and the control beside it did nothing -
+    // the "quietly ignored control" syncModelControls exists to prevent, which
+    // is why the MSA row is hidden here rather than left on screen. The mapping
+    // is exact: upstream runs `range(num_loops + 1)` and this checkpoint's
+    // `num_loops` is 3, which is the dial's own default, so the default fold is
+    // the same four passes it always was.
+    shape: { ...loaded.shape, loops },
+    weights: loaded.weights,
+    tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
+                               loaded.shape.pairChannels),
+    sampler,
+    seed,
+    // 🔴 THIS MODEL'S "SINGLE SEQUENCE". Without ESM-C it has no evolutionary
+    // information at all - measured on a 76-mer, the fold moves 10.96 A, the
+    // distogram predicts NO long-range contact, and the certainty falls from
+    // 0.95 to 0.42, which is the confidence estimate correctly reporting that
+    // the answer is worthless.
+    languageModel,
+    // ...and how big it is, so the bar's language band is this tower's and not
+    // the one the constants were fitted against.
+    languageModelMiB: loaded.language.megabytes,
+    // 🔴 EACH FRAME GETS ITS OWN COLOUR, WHICH NEEDS THE DISTOGRAM RESIDENT.
+    // The trunk's own certainty is fixed for a fold, so every frame would wear
+    // the same one - and the interesting thing about a trajectory is watching
+    // it become confident. Scoring each frame against the distogram costs the
+    // logits staying on the device, 46 MiB at 300 tokens, released with the
+    // last frame.
+    frameCertainty: true,
+    // 🔴 THE LINE AND THE BAR ARE TWO CALLBACKS NOW, AS AF3's ARE. One phase
+    // word plus a percentage on the line; the fraction drives the bar. The
+    // first version wrote a stage name per stage, and a two-millisecond recycle
+    // between two multi-second trunk passes made it flicker.
+    onStatus: (text) => { if (!signal.aborted) onStatus(`${modelName} · ${text}`); },
+    onProgress: (fraction) => { if (!signal.aborted) options.onProgress?.(fraction); },
+    // 🔴 THE CONTACT MAP EXISTS BEFORE ANY STRUCTURE DOES, because the
+    // distogram head runs off the trunk and the sampler has not started. It is
+    // held until there is a frame to hang it on, exactly as the AF3 path holds
+    // its own.
+    onContacts: (contacts, trunkCertainty) => {
+      certainty = trunkCertainty;
+      options.onContacts?.(contacts, trunkCertainty);
+    },
+    // 🔴 `denoised` AND NOT `coordinates`, AND THE REASON IS THE CAMERA. The
+    // sampler's own walk starts as Gaussian noise at sigma 411 and ends at a
+    // protein, so no fixed camera holds both and the early frames are not a
+    // picture of anything. `denoised` is the model's predicted structure at each
+    // call - EDM preconditioning included, so at a large noise level it is
+    // almost all network - and is protein-sized in every frame. AF3's path
+    // records the same finding, measured: a radius of gyration of 1896 A at
+    // step 4 against 11.1 at the end.
+    onStep: ({ denoised, features, certainty: frameCertainty }) => {
+      if (signal.aborted) return;
+      const dense = toDensePositions(features, denoised);
+      if (slots === undefined) slots = alphaCarbons(features.batch);
+      if (reference === null) {
+        reference = toPoints(dense, features.batch.tokens * features.batch.dense);
+      }
+      // ...this frame's OWN agreement with the distogram, so an early frame
+      // that has not converged is coloured as one rather than wearing the
+      // finished structure's confidence. The trunk's mode-based certainty is
+      // the fallback, and it is the same quantity measured a different way -
+      // the two scored a tie on the sweep.
+      const shown = frameCertainty ?? certainty;
+      const pdb = withRemark(fittedPdb(features.batch, dense, reference, slots,
+        shown === undefined ? null : spreadOverAtoms(features, shown, 100)));
+      framePdbs.push(pdb);
+      options.onFrame?.(pdb, shown);
+      lastFrameCertainty = shown;
+    },
+  });
+
+  throwIfAborted(signal);
+
+  // 🔴 THE ANSWER IS FITTED ONTO THE SAME REFERENCE AS THE TRAJECTORY, or the
+  // last frame of the play bar jumps by a rigid motion the fold did not make.
+  // It is still `result.coordinates` - the sampler's own answer, not the last
+  // denoiser call - and at the bottom of the schedule the two agree to a
+  // fraction of an angstrom anyway.
+  // 🔴 THE FINISHED STRUCTURE KEEPS THE LAST FRAME'S SCORE, not the trunk's.
+  // The two are the same quantity read two ways, but the play bar would step
+  // from a per-frame colour to a different one on its last frame, which reads
+  // as the fold changing its mind at the end.
+  certainty = lastFrameCertainty ?? result.certainty ?? certainty;
+  const bFactors = certainty === undefined
+    ? null : spreadOverAtoms(result.features, certainty, 100);
+  const finalDense = toDensePositions(result.features, result.coordinates);
+  const pdb = withRemark(reference === null
+    ? toPdb(result.features.batch, finalDense, bFactors)
+    : fittedPdb(result.features.batch, finalDense, reference,
+                slots ?? alphaCarbons(result.features.batch), bFactors));
+
+  return { result, pdb, framePdbs, certainty, trunkKey,
+           seconds: (performance.now() - started) / 1000 };
 }
