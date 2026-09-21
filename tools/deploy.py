@@ -89,15 +89,43 @@ def report_live(site_url: str) -> int:
               " Either the site predates the build stamp, or nothing is deployed.")
         return 1
     print(f"live: {build['commit'][:8]}  built {build.get('builtAt', 'at an unknown time')}")
+    # 🔴 AGAINST THE DEPLOY BRANCH, NOT AGAINST `HEAD`. The workflow runs on
+    # `main` alone, so `main` is the only thing "behind" can mean - and this
+    # read `HEAD`, so run from any other branch it compared the live site with
+    # work that will never deploy. Measured: seconds after a successful deploy,
+    # from a feature branch 22 commits along, it printed "which is 22 commit(s)
+    # behind this checkout's ffc6179" about a site that was exactly current.
+    # A verifier that reports a good deploy as stale is worse than none: the
+    # next step after reading it is to deploy again.
     try:
-        head = run(["git", "rev-parse", "HEAD"])
-        if build["commit"] == head:
-            print("       ...which is this checkout's HEAD.")
+        run(["git", "fetch", "-q", "origin", BRANCH])
+    except subprocess.CalledProcessError:
+        pass                    # offline; the ref below may then be stale
+    deploys, named = None, None
+    for ref in (f"origin/{BRANCH}", BRANCH):
+        try:
+            deploys, named = run(["git", "rev-parse", ref]), ref
+            break
+        except subprocess.CalledProcessError:
+            continue
+    if deploys is None:
+        return 0                # no such branch here; the live line is the answer
+    try:
+        if build["commit"] == deploys:
+            print(f"       ...which is {named}. Nothing is waiting to deploy.")
         else:
-            behind = run(["git", "rev-list", "--count", f"{build['commit']}..HEAD"])
-            print(f"       ...which is {behind} commit(s) behind this checkout's {head[:8]}.")
+            behind = run(["git", "rev-list", "--count", f"{build['commit']}..{deploys}"])
+            print(f"       ...which is {behind} commit(s) behind"
+                  f" {named} ({deploys[:8]}).")
     except subprocess.CalledProcessError:
         pass                    # the live commit may not exist locally
+    # ...and where the reader is standing, because a branch that does not
+    # deploy is the likeliest reason for asking and the likeliest thing to
+    # forget. See CLAUDE.md: the workflow is `branches: [main]`.
+    here = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    if here != BRANCH:
+        print(f"       (this checkout is on {here}, which does not deploy;"
+              f" the workflow runs on {BRANCH} alone.)")
     return 0
 
 
