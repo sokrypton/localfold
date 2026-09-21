@@ -552,10 +552,24 @@ def main():
     parser.add_argument("--token", default=None,
                         help="the shared secret; one is generated when absent")
     parser.add_argument("--profile", default="/tmp/localfold-backend")
-    parser.add_argument("--runtime", choices=("node", "chrome"), default="node",
-                        help="node folds in a process over Dawn (the default,"
-                             " and no browser at all); chrome opens"
-                             " index.html?role=runtime headlessly")
+    # 🔴 chrome IS THE DEFAULT BECAUSE IT IS THE ONE THAT FOLDS EVERYTHING.
+    # node was the default for exactly as long as nobody asked it for a second
+    # chain: it re-implements the fold path in 380 lines rather than driving
+    # the page, and measured on a T4 it folds ONE PROTEIN CHAIN - copies,
+    # multi-chain, ligands, SMILES and contacts all refused on the colon its
+    # own `chains.join(":")` puts in front of `af3SequenceProblem`, a DNA chain
+    # folded as a PEPTIDE because `chainKinds` is never passed, no alignment
+    # ever searched for, and AlphaFold 2 refused by name. chrome calls
+    # `entityList.set` on a real page and presses `#predict`, so it inherits
+    # every one of those for free. Switch back per fold, not per site, and see
+    # the capability table in docs/DAWN.md before making node the default
+    # again.
+    parser.add_argument("--runtime", choices=("node", "chrome"), default="chrome",
+                        help="chrome opens index.html?role=runtime headlessly"
+                             " (the default, and the only one that folds"
+                             " ligands, complexes, alignments and AF2); node"
+                             " folds in this process over Dawn with no browser"
+                             " at all, one protein chain only")
     parser.add_argument("--host", default="127.0.0.1",
                         help="what to bind; the tunnel reaches loopback")
     arguments = parser.parse_args()

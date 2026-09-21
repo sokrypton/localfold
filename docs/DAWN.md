@@ -29,8 +29,10 @@ node`, driven from the reader's side over HTTP.
   losing ~1,000 lines did not break the page's fold path.
 - **AlphaFold 2 in the runtime.** Refused by name. Its compute/display split is
   designed and not written; the seam is in `web/af2-model.js`.
-- **The notebook end to end on a fresh runtime.** Its pieces were exercised; the
-  cell as a cell was not.
+- ~~**The notebook end to end on a fresh runtime.**~~ **RUN, on a fresh Colab
+  T4, and it found a bug that fired on every WARM re-run.** See below.
+- 🔴 **AND THE QUESTION NOBODY HAD ASKED IS THE ANSWER: the node runtime folds
+  ONE PROTEIN CHAIN and nothing else.** Measured, not read. See below.
 
 ## The page still folds: ten families on an A100
 
@@ -180,3 +182,177 @@ containing a model.
 Dawn - this repository's own Mac is one, where the prebuilt `dawn.node` wants a
 newer macOS than it runs. **Nothing on this branch is reachable from the local
 test lanes**, which is why every number above names the box it came from.
+
+## 🔴 WHAT THE NODE RUNTIME ACTUALLY PORTS: ONE PROTEIN CHAIN
+
+Asked as "is every part of the website available through the Colab backend",
+and answered by driving the broker's own `/in` and `/down` on a T4 rather than
+by reading the source. Every row is a fold that happened: AF3 int5, 58-mer,
+4 steps, one recycle, seed 42, against a `baseline` arm of the same.
+
+| what the reader asks for | through `--runtime node` | evidence |
+|---|---|---|
+| one protein chain | **folds** | 472 atoms, 58 CA, pLDDT 44.97, 4 frames |
+| the same, `seed: 7` | honoured | coordinates differ from baseline |
+| **two copies of it** | **REFUSED** | `: is not an amino acid code` |
+| **two different chains** | **REFUSED** | same |
+| **any ligand** (`CA`, `TAC`) | **REFUSED** | same |
+| **a SMILES ligand** | **REFUSED** | `:, 1 are not amino acid codes` |
+| **a contact row** | **REFUSED** | `:, 1, 2,  , -, B are not ...` |
+| an RNA chain | refused, wrong reason | `U is not an amino acid code` |
+| **a DNA chain** | 🔴 **FOLDS AS A PEPTIDE** | `ACGT...` -> **ALA CYS GLY THR**, 111 atoms |
+| the MSA mode the page sends | **ignored** | byte-identical to baseline |
+| a template | **ignored** | byte-identical to baseline |
+| the sampler (`af3-mode`) | **ignored** | byte-identical to baseline |
+| AlphaFold 2 monomer / multimer | refused BY NAME | its own message, correctly |
+| ESMFold2 | folds | 11 frames, no confidence object |
+
+🔴 **THE REFUSALS ARE ALL ONE LINE, AND IT IS THE GUARD ITSELF.**
+`runFold` builds `sequence = chains.join(":")` over EVERY entity and hands that
+to `af3SequenceProblem`, whose alphabet is the twenty amino acids - so the
+colon refuses every multi-entity job before the ligand or the bond is ever
+reached. The page's own guard, two files away, is
+`chains.filter((_, i) => chainKinds[i] === "protein").join("")` with a comment
+saying exactly why both halves are there: a ligand-only fold has no sequence,
+and `T` is correct for the row it is in. The runtime has the same call with
+neither half.
+
+🔴 **AND THE DNA ROW IS THE DANGEROUS ONE, BECAUSE IT SUCCEEDS.** `chainKinds`
+is never passed, so `ACGTACGTACGTACGTACGT` is read as Ala-Cys-Gly-Thr and comes
+back as a 20-residue protein with a plausible confidence. This is CLAUDE.md's
+own documented trap - `ACGT` is a valid protein AND a valid DNA chain - landing
+where nothing was watching for it.
+
+🔴 **THE RUNTIME IS NOT THE ONLY HALF AT FAULT: `foldOnBackend` SENDS FIVE
+FIELDS.** It builds `{entities, model, steps, recycles, msa}` and drops
+`templates` - which it accepts as a parameter and never forwards - along with
+the sampler, the seed, `max-msa`, the PLM row and the AF2 model picker. The
+runtime, meanwhile, reads `request.alignment`, which no page ever sends: an
+alignment passed by hand moves the same fold **44.965 -> 51.262 pLDDT** and
+comes back in `prediction.a3m`, so the plumbing works and nothing fills it.
+**Every Colab fold through the node runtime is a single-sequence fold**, whatever
+the MSA dropdown says, and the reader is never told.
+
+What is NOT at fault, checked rather than assumed: the result shape. `wireResult`
+serialises the whole prediction into `predJson` - `model`, `stem`,
+`chainLengths`, `seed`, `recycles`, `tokens`, `contactSource`, the nine
+confidence fields - and `revivePrediction` registers it under the reader's own
+stem, so provenance, the archive and the download buttons are whole. A first
+reading of this called `context` and `settings` missing; they are spread into
+the top level by `predictionFromAf3`, and the probe was wrong rather than the
+runtime.
+
+🔴 **AND THE CONTROL SAYS WHICH HALF OF THIS IS THIS BRANCH'S. IT IS THE BIG
+HALF.** `git diff origin/main..dawn` over the Colab surface:
+`web/colab-bridge.js` is **IDENTICAL**, `foldOnBackend` in web/app.js is
+**identical in the part that matters** - the same five-field request, the same
+`templates` parameter accepted and never forwarded - `tools/colab_runtime.mjs`
+is **new**, and `colab_backend.py` on main **has no `--runtime` flag at all**:
+chrome was the only path there. So:
+
+| | on `main` | on `dawn`, default `--runtime node` |
+|---|---|---|
+| multi-chain, copies, ligands, SMILES, contacts | the page's own `expandEntities` | **refused on the colon** |
+| a DNA chain | the page's own `chainKinds` | **folded as a peptide** |
+| the MSA search | the runtime page runs it off `msa-mode` | **never happens** |
+| AlphaFold 2 | the runtime page folds it | **refused by name** |
+| templates, sampler, seed, `max-msa`, PLM | **already dropped** | already dropped |
+
+**The last row is the only one that predates this branch**, and it is the mild
+one: the reader silently gets the runtime page's defaults. Everything above it
+is a capability the headless-Chrome runtime had because it DELEGATED to the
+real page, and that the node runtime lost because it re-implements the fold
+path in 380 lines. Making node the default shipped that loss.
+
+🔴 **AND THE DOCUMENTED FALLBACK MAY NOT EXIST ON A BOX THIS NOTEBOOK SET UP.**
+The section below says "`--runtime chrome` still works and is the fallback",
+and the same commit removed the browser from SETUP - "the four X11 libraries
+were a zipped Chrome's alone, 6.0 s of apt for a browser that is no longer
+installed". Whether Colab's own image carries one is UNMEASURED: the probe for
+it lost its VM to the keep-alive fault below before it ran.
+
+🔴 **AND `--runtime chrome` IS THE WORKAROUND FOR ALL OF THE BIG ONES,
+MEASURED ON THE SAME CARD.** It sets four controls on a real page -
+`model-family`, `recycles`, `af3-count`, `msa-mode` - and calls
+`window.__entityList.set(entities)`, so the page's own `expandEntities` runs.
+Same T4, same 58-mer, AF3 at 4 steps, the arms node refused:
+
+| | `--runtime node` | `--runtime chrome` |
+|---|---|---|
+| one protein chain | 472 atoms | 472 atoms, 22 s |
+| two copies | **refused** | **944 atoms, chains A and B**, 20 s |
+| protein + `CA` x4 | **refused** | **476 atoms, HETATM 4, chains A-E**, 14 s |
+| a DNA chain | **ALA CYS GLY THR** | **DA DC DG DT**, 411 atoms, 14 s |
+| an MMseqs2 search | never happens | **21,577 rows, 128 used, pLDDT 91.0** (ubiquitin) |
+| AlphaFold 2 monomer | refused by name | **601 atoms**, `AlphaFold 2 (monomer)`, pTM 0.355 |
+| AlphaFold 2 multimer | refused by name | **1202 atoms, chains A and B**, ipTM 0.098 |
+
+🔴 **AND THE SEARCH ARM TOOK TWO TRIES TO READ, BOTH TIMES THE PROBE'S FAULT.**
+First it was sent `msa: "mmseqs2"` and came back `unknown alignment mode` - the
+select's values are `none`, `search`, `paste`, `upload` and `mmseqs2` is the
+LABEL, which web/colab-bridge.js's own comment warns about one line above where
+it sets the control. Then with `search` it folded and the status line read
+**"single sequence"** - which looked like the search being dropped and is
+`singleSequenceIfOnlyQuery` working correctly, because the 58-mer under test was
+SYNTHETIC and has no homologs. Ubiquitin is what settles it. **A capability
+probe needs an input the capability can act on.**
+
+It still drops the template, the sampler, the seed, `max-msa` and the PLM row -
+`foldOnBackend` never sends them and this runtime never sets them - so the
+reader silently gets the runtime page's defaults for those five. That part
+predates this branch.
+
+🔴 **AND THE COLD SETUP IS 42.9 s WITH A BROWSER AGAINST ~25 s WITHOUT**,
+measured here, which is the whole price of the default going back. A warm
+re-run is under a second either way now that the `wait` bug below is fixed.
+The adapter through Chrome reads `nvidia / turing`, `shaderF16 true`,
+`subgroupMatrix true`, `maxBufferSize` **4 GiB** - where the same card through
+Dawn in node reports **1 TiB**, which is worth knowing before any ceiling is
+derived from one of them.
+
+🔴 **AND A PROBE THAT SENT `msa: "mmseqs2"` GOT `unknown alignment mode` AND
+THAT WAS THE PROBE.** The select's values are `none`, `search`, `paste`,
+`upload`; `mmseqs2` is the LABEL. web/colab-bridge.js's own comment warns that
+a select silently refuses a value it has no option for, one line above where it
+sets this one.
+
+## The notebook, run as a cell on a fresh T4
+
+🔴 **THE SETUP FAILED ON EVERY WARM RE-RUN, WHICH IS THE CASE ITS OWN HEADER
+CALLS "NEARLY FREE".** `wait $small_libs` with `small_libs` unset is a bare
+`wait`, which reaps EVERY background job including the clone; the later
+`wait $repo_clone` then returns **127** on a pid that is no longer a child, and
+`set -e` ends the script with the last `say` unprinted and the `2>/dev/null`
+swallowing the reason. A cold box sets `small_libs` and passes; a warm box -
+`need_icd=0 need_loader=0`, which is every second run - does not. The notebook's
+own failure message is "run this cell again", which is the one thing that could
+not work. Reproduced in five lines on the VM, fixed with an `if`, and the warm
+setup now completes in **0.93 s** with the backend and `colab_runtime.mjs` both
+up and the adapter reading `nvidia / turing / tesla-t4`, `shaderF16 true`,
+`subgroupMatrix true`.
+
+🔴 **AND THE CELL CANNOT BE FINISHED HEADLESSLY, WHICH IS A PROPERTY OF COLAB
+AND NOT A BUG.** It ends at `eval_js('google.colab.kernel.proxyPort(...)')`,
+which waits on a reply from the notebook FRONTEND; under `colab exec` there is
+no frontend and the call blocks for ever in
+`google.colab._message.read_reply_from_input`. Everything before it - setup,
+service, runtime, adapter, token - is verified. Worse, that stuck thread
+POISONS THE KERNEL: it holds the input queue, so every later `colab exec` dies
+with `TimeoutError: Timeout waiting for output` and the session looks wedged.
+Run the cell up to the display block when driving headlessly, and
+`colab url -s <name>` for the genuine end-to-end.
+
+## Reaching a Colab box from the A100
+
+`uv tool install google-colab-cli --with "jupyter-kernel-client==0.15.0"`, then
+`colab --auth=adc new -s <name> --gpu T4`. 🔴 **THE PIN IS NOT OPTIONAL**:
+colab-cli 0.6.0 calls `jupyter_kernel_client.KernelClient`, which 1.0.2 renamed
+to `JupyterKernelClient`, and unpinned every `colab exec` dies on the rename
+while `colab new` still prints `Session READY` - so a dependency fault reads as
+a session fault. Auth is the ADC from `gcloud auth application-default login`;
+the bundled `colab skill` says the `colaboratory` scope is mandatory.
+🔴 **AND ITS ABSENCE DOES NOT SHOW AT ALLOCATION.** A T4 minted without it
+allocated, folded and served for twenty minutes, then `colab log` read
+`KEEP: stopped reason=consecutive_4xx_errors ... 404 .../keep-alive/` and the
+session was terminated under the work. `colab sessions` says only that the VM
+is gone; `colab log -s <name>` is what names the cause.
