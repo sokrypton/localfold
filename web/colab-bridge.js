@@ -437,12 +437,24 @@ function installColabStatus() {
   // read "Colab runtime" with no card, which is the one word that separates a
   // T4 from SwiftShader wearing its clothes.
   let card = "";
+  let releases = false;
   const nameTheCard = async () => {
     if (card !== "") return;
     try {
       const health = await (await fetch(door("/health"))).json();
       const gpu = health.gpu ?? {};
       card = [gpu.vendor, gpu.architecture].filter(Boolean).join(" ");
+      // 🔴 AND WHETHER DISCONNECT RELEASES THE MACHINE OR ONLY STOPS THE
+      // SERVICE ON IT. On Colab it is both; on a runtime somebody is hosting
+      // by hand there is no machine to hand back, and a button that promises
+      // one either way is wrong half the time.
+      releases = health.colabRuntime === true;
+      leave.title = releases
+        ? "Stop folding here and release this Colab machine: the service"
+          + " stops, its GPU is freed and the runtime is unassigned. This page"
+          + " keeps what it has already folded."
+        : "Stop the fold service on the runtime and free its GPU. This page"
+          + " keeps what it has already folded.";
       // ...and the timing report is headed with it, because the rows in it
       // were recorded on that card and not on this one.
       if (card !== "") devSourceIs(`the Colab runtime · ${card}`);
@@ -500,13 +512,18 @@ function installColabStatus() {
     dot2.className = "colab-dot";
     const gone = document.createElement("span");
     gone.className = "colab-said";
-    gone.textContent = "Colab runtime · stopped";
+    gone.textContent = releases ? "Colab runtime · released"
+    : "Colab runtime · stopped";
     badge.append(dot2, gone);
     const line = document.getElementById("status-message");
     if (line !== null) {
-      line.textContent = "The Colab runtime has been stopped and its GPU"
-        + " released. This page is now showing what it already has - the"
-        + " notebook's link starts a new one.";
+      line.textContent = (releases
+        ? "The Colab runtime has been released - the machine is handed back"
+          + " and the notebook is disconnected."
+        : "The fold service on the runtime has been stopped and its GPU"
+          + " freed.")
+        + " This page is now showing what it already has; the notebook's link"
+        + " starts a new one.";
     }
   });
 }

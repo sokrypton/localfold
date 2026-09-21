@@ -55,6 +55,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cdp                                                   # noqa: E402
@@ -100,6 +101,28 @@ LAST_SEEN = {"at": 0.0}
 # away: the browser it started holds the card for as long as it lives. The
 # notebook cell is blocked on the wait below, so setting this ends the cell.
 STOPPING = threading.Event()
+# 🔴 AND THE MACHINE ITSELF CAN BE RELEASED, WHICH IS NOT THE SAME THING.
+# Stopping this service frees the CARD; the Colab VM stays assigned until the
+# notebook lets it go, and a reader who pressed Disconnect meant the session.
+# `google.colab.runtime.unassign()` is that, and reading its source is what
+# made it reachable from here: it is a POST to a plain HTTP address in the
+# environment (`TBE_RUNTIME_ADDR`), not a call over the kernel's channel - so
+# a subprocess of the cell can do it, which is what this is.
+RUNTIME_ADDR = os.environ.get("TBE_RUNTIME_ADDR")
+
+
+def unassign_runtime():
+    """Hand the Colab machine back. False where there is no machine to hand."""
+    if not RUNTIME_ADDR:
+        return False
+    try:
+        request = urllib.request.Request(f"http://{RUNTIME_ADDR}/unassign",
+                                         data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=10) as answer:
+            return answer.status == 200
+    except Exception as cause:                                # noqa: BLE001
+        print(f"the runtime refused to unassign: {cause}", flush=True)
+        return False
 
 
 ADAPTER_JS = """(async () => {
@@ -303,6 +326,10 @@ def serve(port, backend, token, host="127.0.0.1"):
                     folding = FOLDING["on"]
                 return self._json(200, {"ok": True, "busy": folding,
                                         "runtimeSeen": self._seen(),
+                                        # ...so the page can say whether
+                                        # Disconnect releases the MACHINE or
+                                        # only stops the service on it.
+                                        "colabRuntime": bool(RUNTIME_ADDR),
                                         "gpu": backend.adapter()})
             return super().do_GET()
 
@@ -366,7 +393,8 @@ def serve(port, backend, token, host="127.0.0.1"):
             # cannot do is end the Colab RUNTIME: that machine belongs to the
             # notebook, and only the notebook's own Runtime menu releases it.
             if op == "shutdown":
-                self._json(200, {"ok": True, "stopping": True})
+                self._json(200, {"ok": True, "stopping": True,
+                                 "unassign": bool(RUNTIME_ADDR)})
                 threading.Thread(target=lambda: (time.sleep(0.3),
                                                  STOPPING.set()), daemon=True).start()
                 return None
@@ -407,7 +435,10 @@ def main():
     backend = Backend(arguments.port, arguments.cdp_port, arguments.profile, token)
     httpd = serve(arguments.port, backend, token, arguments.host)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    print(f"serving {REPO} on {arguments.host}:{arguments.port}", flush=True)
+    print(f"serving {REPO} on {arguments.host}:{arguments.port}"
+          + (" · Disconnect will release this Colab machine" if RUNTIME_ADDR
+             else " · no Colab runtime here, Disconnect stops the service"),
+          flush=True)
     # 🔴 THE SERVER FIRST, THE PAGE SECOND. The page announces itself to /up
     # the moment it loads, so a browser started before the socket is listening
     # announces into a refused connection and the wait below times out on a
@@ -439,6 +470,11 @@ def main():
                 backend.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 backend.proc.kill()
+        # 🔴 THE BROWSER FIRST, THE MACHINE SECOND. Unassigning pulls the VM
+        # out from under this process, so anything that has to happen on the
+        # way out has to have happened already.
+        if STOPPING.is_set() and unassign_runtime():
+            print("the Colab runtime has been unassigned", flush=True)
 
 
 if __name__ == "__main__":

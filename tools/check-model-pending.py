@@ -45,7 +45,9 @@ WHAT IT CHECKS, on a real page with a real result in it:
     its pulse going amber when that runtime stops answering - at the same
     twenty seconds after which a fold in flight gives up, because a badge that
     still says connected while the fold gives up is the page saying two things
-    at once - and a Disconnect that STOPS the service, because the browser on
+    at once - and a Disconnect that RELEASES THE MACHINE (`unassign` is a POST
+    to Colab's own runtime service, which this stands a stub in for) and stops
+    the service on it, because the browser on
     that machine holds its GPU for as long as it lives. After it the page is a
     VIEWER: no folding, every control that shapes the next one disabled and
     saying why, and the structure, plots and downloads it already has still
@@ -63,11 +65,14 @@ real one, which is the only way this machine can put a prediction on screen.
 See tools/check-colab-bridge.py, whose arms this borrows.
 """
 import base64
+import http.server
 import json
 import os
 import signal
+import socketserver
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -83,6 +88,30 @@ TOKEN = "check-model-pending-token"
 BASE = f"http://127.0.0.1:{PORT}"
 
 bad = []
+
+# 🔴 A STAND-IN FOR COLAB'S RUNTIME SERVICE, which is how the machine gets
+# handed back for real. `google.colab.runtime.unassign()` is a POST to
+# `http://$TBE_RUNTIME_ADDR/unassign` - a plain HTTP address in the
+# environment, not a call over the kernel's channel - so the broker can make
+# it itself, and so this can watch it happen with no Colab runtime anywhere.
+UNASSIGN_PORT = int(os.environ.get("PENDING_UNASSIGN_PORT", "8794"))
+UNASSIGNED = []
+
+
+class _Runtime(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):                                        # noqa: N802
+        UNASSIGNED.append(self.path)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+socketserver.TCPServer.allow_reuse_address = True
+_runtime_stub = socketserver.TCPServer(("127.0.0.1", UNASSIGN_PORT), _Runtime)
+threading.Thread(target=_runtime_stub.serve_forever, daemon=True).start()
 
 
 def call(route, body=None):
@@ -168,7 +197,10 @@ backend = subprocess.Popen(
     [sys.executable, "tools/colab_backend.py", "--port", str(PORT),
      "--cdp-port", str(CDP_PORT), "--token", TOKEN,
      "--profile", "/tmp/localfold-pending-runtime"],
-    cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    # ...and it is told it is on a Colab machine, which is the only difference
+    # between this run and one in a notebook.
+    env={**os.environ, "TBE_RUNTIME_ADDR": f"127.0.0.1:{UNASSIGN_PORT}"})
 reader = None
 try:
     ready, deadline = False, time.time() + 180
@@ -576,12 +608,12 @@ try:
     if "notebook" not in (after.get("why") or ""):
         bad.append(f"the disabled Fold button says {after.get('why')!r}, which"
                    " does not say why it cannot be pressed")
-    if "stopped" not in after.get("says", ""):
-        bad.append(f"the page says {after.get('says')!r} after Disconnect,"
-                   " which does not tell the reader what just happened")
-    if "stopped" not in (after.get("badge") or ""):
+    if "released" not in after.get("says", ""):
+        bad.append(f"the page says {after.get('says')!r} after Disconnect on a"
+                   " runtime that CAN be handed back - it should say so")
+    if "released" not in (after.get("badge") or ""):
         bad.append(f"the badge reads {after.get('badge')!r} rather than saying"
-                   " the runtime has stopped")
+                   " the machine was released")
     if after.get("button") != "gone":
         bad.append("the badge still offers Disconnect on a runtime that has"
                    " already been disconnected")
@@ -608,6 +640,17 @@ try:
     if backend.poll() is None:
         bad.append("the broker process is still running after Disconnect, so"
                    " the notebook cell never ends and the GPU stays taken")
+    # 🔴 AND THE MACHINE IS HANDED BACK, which is what "disconnect" means to
+    # somebody paying for a runtime. Stopping the service frees the card; this
+    # frees the VM, and it is a different call to a different address.
+    for _ in range(20):
+        if UNASSIGNED:
+            break
+        time.sleep(0.5)
+    print(f"  Colab's runtime service was asked: {UNASSIGNED}")
+    if UNASSIGNED != ["/unassign"]:
+        bad.append(f"Colab's runtime service was asked {UNASSIGNED} - the"
+                   " machine is still assigned and still being paid for")
 
     # 10 · WHERE THE SEQUENCE GOES, WHICH IS THE FOOTER'S ONE JOB. The line
     #      tracks the alignment mode - "everything runs locally" is false the
@@ -643,6 +686,7 @@ try:
     if errors:
         bad.append(f"the page threw: {errors[:2]}")
 finally:
+    _runtime_stub.shutdown()
     if reader is not None:
         reader.kill()
     # It may already have stopped itself - the Disconnect arm asks it to.
