@@ -48,6 +48,7 @@ import hmac
 import http.server
 import json
 import os
+import shutil
 import secrets
 import socketserver
 import subprocess
@@ -61,6 +62,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cdp                                                   # noqa: E402
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+# The process that folds when there is no browser; see tools/colab_runtime.mjs.
+RUNTIME_JS = os.path.join(REPO, "tools", "colab_runtime.mjs")
 
 # 🔴 TWO MAILBOXES AND ONE SEQUENCE EACH, WHICH IS THE WHOLE BROKER. `EVENTS`
 # is what the runtime page has said - status writes, bar fractions, sampler
@@ -148,11 +151,21 @@ ADAPTER_JS = """(async () => {
 class Backend:
     """The headless Chrome this serves from, started once."""
 
-    def __init__(self, port, cdp_port, profile, token):
+    def __init__(self, port, cdp_port, profile, token, kind="node"):
         self.port = port
         self.cdp_port = cdp_port
         self.profile = profile
         self.token = token
+        # 🔴 "node" FOLDS IN A PROCESS, "chrome" IN A PAGE. The runtime used to
+        # be a headless Chrome opening index.html?role=runtime and driving its
+        # own controls, which is 261 MB of browser and four X11 libraries for
+        # something that wanted a GPU and never wanted a document:
+        # tools/colab_runtime.mjs calls the same `foldAf3` the page calls, over
+        # Dawn. Chrome stays reachable because it is what the gate has always
+        # driven and what a machine with no working Dawn build falls back to -
+        # this repository's own Mac is one, where the prebuilt dawn.node wants
+        # a newer macOS than it runs.
+        self.kind = kind
         self.proc = None
         self.ws = None
         self._adapter = None
@@ -170,6 +183,13 @@ class Backend:
         the page is blocked and stops answering when the runtime is gone -
         which is the difference the reader actually needs.
         """
+        # With no browser there is no DevTools endpoint to ask, and the
+        # question is the same one: is the thing that folds still there. A
+        # process that has exited answers immediately and cannot be confused
+        # by a busy main thread, which is the whole point of not using the
+        # heartbeat for this.
+        if self.kind == "node":
+            return self.proc is not None and self.proc.poll() is None
         try:
             with urllib.request.urlopen(
                     f"http://127.0.0.1:{self.cdp_port}/json/version",
@@ -178,7 +198,54 @@ class Backend:
         except Exception:                                     # noqa: BLE001
             return False
 
+    def _start_node(self):
+        """Fold in a process, over Dawn, with no browser at all.
+
+        🔴 THE ADAPTER COMES BACK ON A LINE, NOT OVER CDP. `Backend.adapter()`
+        used to `cdp.evaluate` the question at the page; there is no page, so
+        the runtime prints one `ADAPTER {...}` line as it starts and this
+        reads it. Everything after that is the ordinary bridge - the runtime
+        pushes to /up and polls /out exactly as the page did, which is what
+        makes this a change of WHO folds rather than of how the two halves
+        talk.
+        """
+        self.proc = subprocess.Popen(
+            [shutil.which("node") or "node", str(RUNTIME_JS),
+             "--port", str(self.port), "--token", self.token],
+            cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1)
+
+        def read_lines(stream):
+            for line in iter(stream.readline, ""):
+                if line.startswith("ADAPTER "):
+                    try:
+                        self._adapter = json.loads(line[len("ADAPTER "):])
+                    except ValueError:
+                        pass
+                    continue
+                # The runtime's own words, kept: a fold that fails there is
+                # read here, in the notebook's log, where a reader looks.
+                if line.strip():
+                    print("  runtime: " + line.rstrip(), flush=True)
+
+        threading.Thread(target=read_lines, args=(self.proc.stdout,),
+                         daemon=True).start()
+        # Bounded: Dawn takes a second or two, and a runtime that never
+        # reports is a runtime whose first fold would fail anyway.
+        for _ in range(240):
+            if self._adapter is not None or self.proc.poll() is not None:
+                break
+            time.sleep(0.25)
+        if self._adapter is None:
+            raise RuntimeError(
+                "the node runtime never reported an adapter"
+                + ("" if self.proc.poll() is None
+                   else f" (it exited with {self.proc.returncode})"))
+        return self
+
     def start(self):
+        if self.kind == "node":
+            return self._start_node()
         # cdp.py already carries the Linux flags this needs - Vulkan, the
         # sandbox off (a runtime is root in a container), and the f16 feature
         # docs/A100.md prices at 1.74x on a whole fold, and 0.60x peak
@@ -230,6 +297,10 @@ class Backend:
         """
         if self._adapter is not None:
             return self._adapter
+        if self.kind == "node":
+            # Not cached: the runtime reports it on the way up, so an absent
+            # answer means it has not got there yet rather than never will.
+            return {"webgpu": None, "why": "the runtime has not reported yet"}
         try:
             self._adapter = cdp.evaluate(self.ws, ADAPTER_JS)
         except Exception as cause:                            # noqa: BLE001
@@ -480,12 +551,17 @@ def main():
     parser.add_argument("--token", default=None,
                         help="the shared secret; one is generated when absent")
     parser.add_argument("--profile", default="/tmp/localfold-backend")
+    parser.add_argument("--runtime", choices=("node", "chrome"), default="node",
+                        help="node folds in a process over Dawn (the default,"
+                             " and no browser at all); chrome opens"
+                             " index.html?role=runtime headlessly")
     parser.add_argument("--host", default="127.0.0.1",
                         help="what to bind; the tunnel reaches loopback")
     arguments = parser.parse_args()
 
     token = arguments.token or secrets.token_urlsafe(24)
-    backend = Backend(arguments.port, arguments.cdp_port, arguments.profile, token)
+    backend = Backend(arguments.port, arguments.cdp_port, arguments.profile,
+                      token, arguments.runtime)
     httpd = serve(arguments.port, backend, token, arguments.host)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {REPO} on {arguments.host}:{arguments.port}"

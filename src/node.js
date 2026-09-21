@@ -21,6 +21,18 @@
  */
 import { requestAlphaFoldDevice } from "./runtime/device.js";
 
+/**
+ * 🔴 AND THE BUILD IS PINNED: 0.4.0, NOT LATEST. webgpu 0.6.0's Dawn aborts
+ * an AlphaFold 3 fold on a Colab T4 - the trunk completes and the process
+ * dies of SIGABRT as diffusion starts. Nothing reaches JavaScript: an
+ * `onuncapturederror` handler and a `device.lost` handler installed before
+ * the work both stay silent, so it is a native abort rather than a WebGPU
+ * error. 0.4.0 folds the same sequence on the same machine to pLDDT 70.1 with
+ * backbone 1.45/1.54/3.86 A. Measured both ways in one session; the version
+ * is the only thing that differed.
+ */
+export const DAWN_VERSION = "0.4.0";
+
 /** Dawn's own names. `vulkan_enable_f16_on_nvidia` is inert off Vulkan. */
 export const DAWN_TOGGLES = ["vulkan_enable_f16_on_nvidia", "allow_unsafe_apis"];
 
@@ -58,7 +70,7 @@ export async function createNodeDevice(options = {}) {
     // wants 2.34. A box with an older libc needs the older package.
     throw new Error(
       "localfold/node needs the optional `webgpu` package (Dawn's node binding): "
-      + "`npm i webgpu`. If it installs and then fails to load, its prebuilt "
+      + "`npm i webgpu@0.4.0`. If it installs and then fails to load, its prebuilt "
       + "binary wants a newer GLIBC than this machine has - try `npm i webgpu@0.4.0`. "
       + `The loader said: ${String(cause?.message ?? cause).split("\n")[0]}`,
     );
