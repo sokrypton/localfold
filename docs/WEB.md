@@ -2257,6 +2257,35 @@ page asks `/health` which half it is: "release this Colab machine" against
 "stop the fold service", *"Colab runtime · released"* against *"· stopped"*.
 A button that promised a release either way would be wrong half the time.
 
+🔴 **AND THEN IT DID WORK, AND THE CONSOLE FILLED UP ANYWAY.** Reported from
+the real thing: `GET /down?t=&head=1 403 (Forbidden)`, then 500 after 500.
+Two faults, both the page's. `door()` re-read the token from `location.search`
+on every call and Disconnect had just CLEARED that with `replaceState` - so
+every later request asked with `t=` empty; the URL is where a token ARRIVES,
+not where it lives, and it is captured once at load now. And the badge's pulse
+ran on for the life of the tab, knocking three times a second at a service
+that was shutting down. It stops when it is told (Disconnect) and after three
+failures in a row (a runtime that went without telling anyone).
+
+**IT KEEPS BEATING WHILE SOMETHING ANSWERS, THOUGH** - the first version of
+that arm asserted the opposite and was wrong. With the broker up and only the
+runtime's page gone, the badge must go on checking, because that is how it
+would notice the page coming back. Silence belongs to the case where nobody
+is behind the door. Measured: `8 -> 11` beats while answered, `11 -> 11 -> 11`
+across twenty-eight seconds after Disconnect.
+
+🔴 **AND THE INSTRUMENT FOR THAT TOOK THREE GOES, WHICH IS THE PART WORTH
+KEEPING.** Resource timings see nothing: a request to a server that has gone
+is a network ERROR and Chrome files no entry, so the count read zero while a
+console filled. A wrapper on `window.fetch` installed over CDP read zero as
+well, while the badge was visibly updating - it sees the page's own `fetch`
+calls in an isolated probe (3 in ten seconds) and not the module's here, and I
+did not chase why. What cannot be wrong about whether the pulse is running is
+the pulse counting itself: `window.__colabBeats`, which a reader can also read
+in their own console. **And the arm now proves it can see a beat before it
+believes a silence** - it read 0 before the runtime was even killed, which
+would have passed against an instrument that saw nothing at all.
+
 🔴 **AND IT DID NOT WORK ON A REAL RUNTIME, REPORTED AS "hitting disconnect
 did not disconnect the runtime".** The likeliest reason is the plainest one -
 that runtime was started before any of this existed, since the cell clones

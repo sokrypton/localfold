@@ -567,6 +567,26 @@ try:
                     url=f"{BASE}/index.html?role=runtime&t={TOKEN}")
     time.sleep(2.0)
 
+    # 🔴 EVERY ASK IS COUNTED FROM HERE, at the page's own `fetch`. A request
+    # to a server that has gone is a network ERROR and Chrome files no
+    # resource-timing entry for one, so counting them the other way reported
+    # zero while a console filled with 403s and 500s - which is what a reader
+    # actually sees.
+    beats0 = cdp.evaluate(reader_ws, "window.__colabBeats ?? 0")
+
+    # 🔴 AND THE COUNTER IS PROVED TO SEE THE PULSE BEFORE ITS SILENCE IS
+    # BELIEVED. The first version asserted only that the count stopped
+    # growing, and it read 0 before the runtime was even killed - so it would
+    # have passed against a wrapper that saw nothing at all, which is this
+    # file's own "a probe that cannot say yes cannot say no".
+    time.sleep(7.0)
+    beating = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)") - beats0
+    print(f"  the badge polled {beating} time(s) in seven seconds")
+    if beating == 0:
+        bad.append("the counter cannot see the badge's own polling, so"
+                   " whatever it says about the silence afterwards is worth"
+                   " nothing")
+
     # ...and now the runtime really goes.
     subprocess.run(["pkill", "-f", "Google Chrome.*localfold-pending-runtime"],
                    check=False)
@@ -584,10 +604,39 @@ try:
     if not gone.startswith("gone|"):
         bad.append("the runtime's browser went and the badge still says it is"
                    " there - a fold pressed now waits out its own bound")
+    # 🔴 AND IT KEEPS BEATING WHILE THERE IS SOMETHING TO ASK. The broker is
+    # still answering here - only the page on it died - so the badge must go
+    # on checking, which is how it would recover if that page came back. The
+    # first version of this arm asserted the OPPOSITE and was wrong: silence
+    # belongs to the case where nobody is behind the door, which is what the
+    # Disconnect arm below measures.
+    first = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
+    time.sleep(10.0)
+    second = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
+    print(f"  the badge's pulse with the broker still up: {first} -> {second}")
+    if second == first:
+        bad.append("the badge stopped checking while the broker was still"
+                   " answering - a runtime page that came back would never"
+                   " be noticed")
 
 
     # 9 · Disconnect leaves Colab mode, which is the whole of the way back.
+    # 🔴 COUNTED AT THE PAGE'S OWN `fetch`, NOT IN RESOURCE TIMINGS. A request
+    # to a server that has gone produces a network ERROR, and Chrome files no
+    # resource entry for one - so the first version of this counted zero with
+    # the pulse deliberately left running, and would have called a broken fix
+    # fixed. What is wanted is the ASKING, which is this side of the wire.
     cdp.evaluate(reader_ws, """(() => {
+      window.__asked = [];
+      const real = window.fetch;
+      window.fetch = (...args) => {
+        const url = String(args[0]);
+        if (window.__counting && /\/(down|out|up|in|health)\b/.test(url)) {
+          window.__asked.push(url.replace(location.origin, ''));
+        }
+        return real.apply(window, args);
+      };
+      window.__counting = true;
       document.getElementById('colab-status').querySelector('button').click();
       return true;
     })()""")
@@ -659,6 +708,32 @@ try:
     if backend.poll() is None:
         bad.append("the broker process is still running after Disconnect, so"
                    " the notebook cell never ends and the GPU stays taken")
+    # 🔴 AND THE PAGE STOPS KNOCKING, which is what a reader sees when it does
+    # not. Reported from a real runtime: a console full of
+    # `GET /down?t=&head=1 403` and then 500 after 500, because the badge's
+    # pulse ran on for the life of the tab and `door()` re-read the token from
+    # a URL Disconnect had just cleared. Requests are counted from the
+    # browser's own resource timings, after the click.
+    # 🔴 AND NOW THERE IS NOBODY BEHIND THE DOOR, SO THE KNOCKING STOPS. This
+    # is the state a reader reported: a console full of
+    # `GET /down?t=&head=1 403` and then 500 after 500, because the pulse ran
+    # on for the life of the tab. Three samples: a few beats may be in flight
+    # or spent finding out, and then it must be still.
+    beats_a = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
+    time.sleep(16.0)
+    beats_b = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
+    time.sleep(12.0)
+    beats_c = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
+    print(f"  the pulse after Disconnect: {beats_a} -> {beats_b} -> {beats_c}")
+    if beats_c != beats_b:
+        bad.append(f"the page is still beating after Disconnect"
+                   f" ({beats_b} -> {beats_c}) - the service is gone and every"
+                   " one of those is an error in a console somebody is"
+                   " reading to find out whether Disconnect worked")
+    if beats_b - beats_a > 4:
+        bad.append(f"the page beat {beats_b - beats_a} times before giving up"
+                   " - it is meant to stop on being told, not only on failing")
+
     # 🔴 AND THE MACHINE IS HANDED BACK, which is what "disconnect" means to
     # somebody paying for a runtime. Stopping the service frees the card; this
     # frees the VM, and it is a different call to a different address.

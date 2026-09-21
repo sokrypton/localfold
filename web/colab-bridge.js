@@ -33,11 +33,19 @@
 
 import { devSourceIs } from "./dev-log.js";
 
-/** The broker is the server this page was served BY, so every route is relative. */
-const door = (route, extra = "") => {
-  const token = new URLSearchParams(location.search).get("t") ?? "";
-  return `${route}?t=${encodeURIComponent(token)}${extra}`;
-};
+/**
+ * The broker is the server this page was served BY, so every route is relative.
+ *
+ * 🔴 THE TOKEN IS TAKEN ONCE, AT LOAD, NOT READ PER REQUEST. Disconnect drops
+ * the query string with `replaceState` - the page is no longer a reader - and
+ * a `door()` that re-read `location.search` then asked with `t=` empty:
+ * reported from a real runtime as a console full of
+ * `GET /down?t=&head=1 403 (Forbidden)`. The URL is where the token ARRIVES;
+ * it is not where it lives.
+ */
+const TOKEN = new URLSearchParams(location.search).get("t") ?? "";
+const door = (route, extra = "") =>
+  `${route}?t=${encodeURIComponent(TOKEN)}${extra}`;
 
 const ask = async (route, body) => {
   const answer = await fetch(door(route), {
@@ -462,7 +470,21 @@ function installColabStatus() {
   };
 
   let folding = false;
+  let beating = 0;
+  // 🔴 AND THE PULSE STOPS WHEN THERE IS NOTHING LEFT TO ASK. The badge polled
+  // every three seconds for the life of the tab, so after Disconnect it went
+  // on knocking at a service that was shutting down - 403, then 500 after
+  // 500, in a console a reader was reading to find out whether Disconnect had
+  // worked. Two ways to stop: being told (below), and a handful of failures
+  // in a row, which is the runtime having gone without being told.
+  let misses = 0;
   const beat = async () => {
+    // 🔴 COUNTED WHERE IT HAPPENS. A wrapper on `window.fetch` was the
+    // obvious way to watch this from outside and it measured ZERO while the
+    // badge was visibly updating - so what a gate (or a reader in the
+    // console) can read is the pulse's own count, which cannot be wrong
+    // about whether the pulse is running.
+    window.__colabBeats = (window.__colabBeats ?? 0) + 1;
     try {
       await nameTheCard();
       const head2 = await remoteHead();
@@ -481,10 +503,17 @@ function installColabStatus() {
     } catch (cause) {
       badge.dataset.state = "gone";
       said.textContent = "Colab runtime · unreachable";
+      misses += 1;
+      if (misses >= 3) stopBeating();
     }
   };
+
+  const stopBeating = () => {
+    if (beating !== 0) clearInterval(beating);
+    beating = 0;
+  };
   void beat();
-  setInterval(() => void beat(), 3000);
+  beating = setInterval(() => void beat(), 3000);
 
   leave.addEventListener("click", async () => {
     leave.disabled = true;
@@ -498,6 +527,10 @@ function installColabStatus() {
     // from the runtime - so dropping the parameters with `replaceState` is the
     // whole of coming home. A navigate would have asked a dead server for the
     // page and got nothing.
+    // 🔴 THE PULSE FIRST, THEN THE URL. Both orders leave the same page, and
+    // only this one leaves a quiet console: the service is on its way down
+    // and there is nothing left to ask it.
+    stopBeating();
     history.replaceState({}, "", location.pathname);
     // 🔴 THE PAGE DOES NOT START FOLDING HERE INSTEAD. The reader ended the
     // service; a page that quietly took the work over would be answering a
