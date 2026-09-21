@@ -23,13 +23,49 @@ node`, driven from the reader's side over HTTP.
 
 ## What is NOT verified, stated rather than implied
 
-- **The page's own fold path after the extractions.** `web/app.js` lost ~1,000
-  lines; the node lane is green but nothing in it folds. The gate is a GPU box
-  running `--runtime chrome`, one sequence per family.
+- ~~**The page's own fold path after the extractions.**~~ **VERIFIED on the
+  A100**, one sequence per family through `tools/fold-in-page.py`, which drives
+  the page's own controls. Nine of ten fold; see the table below. `web/app.js`
+  losing ~1,000 lines did not break the page's fold path.
 - **AlphaFold 2 in the runtime.** Refused by name. Its compute/display split is
   designed and not written; the seam is in `web/af2-model.js`.
 - **The notebook end to end on a fresh runtime.** Its pieces were exercised; the
   cell as a cell was not.
+
+## The page still folds: ten families on an A100
+
+Asked because the branch says it was not asked. `tools/fold-in-page.py --model
+<family>`, one 58-mer each, one recycle, four steps - the page's own controls,
+not an API:
+
+| family | |
+|---|---|
+| af3 | 58 residues · 2 s · pLDDT 67.5 |
+| opendde | 58 residues · 6 s · pLDDT 87.2 |
+| boltz2 | 58 residues · 4 s · pLDDT 66.2 |
+| protenix2 | 58 residues · 4 s · pLDDT 61.4 |
+| intellifold2 | 58 residues · 5 s · pLDDT 53.0 |
+| rosettafold3 | 58 residues · 4 s · pLDDT 72.1 |
+| monomer | 1.2 s · pLDDT 64.2 · pTM 0.338 |
+| multimer (26:31) | 3.5 s · pLDDT 63.9 · pTM 0.394 · ipTM 0.207 |
+| ef2-fast-600m | 58 res · 11 steps · 1.9 s · certainty 0.59 |
+| **openbind0** | **fails** - `failed to load tensor .../single_transition/transition2/weights: 404` |
+
+🔴 **AND openbind0 FAILS ON `main` TOO, WHICH IS THE ONLY REASON IT IS NOT A
+REGRESSION.** The same command on `20b065d` gives the same class of failure at a
+different tensor (`.../transformerk_projection/weights: 404`), so the bundle
+this box can reach is incomplete and the extraction is not implicated. A branch
+verification without the control would have read as "dawn broke openbind0".
+
+The page's other gates, on the branch: `--drop-job` eight arms true,
+`--contact-ui` `kept: true`, `--job-round-trip` `same`/`seedSame` true, and
+AlphaFold 3's KRAS/sotorasib job folded from its rows at 189 residues + MOV.
+`npm test` 1273, `test:site`. `mobile-layout.py` reports its one standing
+failure - the desktop resize handle, bisected on main to the py2Dmol vendor bump
+`72d1bcc` and not this branch's.
+
+🔴 **AND `docs/TOOLS.md` WAS STALE ON THE BRANCH**: `colab_runtime.mjs` is a new
+tool and the census is gated, so `npm run test:tools` was red here. Regenerated.
 
 ## Three findings worth keeping
 
