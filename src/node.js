@@ -22,14 +22,30 @@
 import { requestAlphaFoldDevice } from "./runtime/device.js";
 
 /**
- * 🔴 AND THE BUILD IS PINNED: 0.4.0, NOT LATEST. webgpu 0.6.0's Dawn aborts
- * an AlphaFold 3 fold on a Colab T4 - the trunk completes and the process
- * dies of SIGABRT as diffusion starts. Nothing reaches JavaScript: an
+ * 🔴 AND THE BUILD IS PINNED: 0.4.0, NOT LATEST, BECAUSE 0.6.0's f16 PATH
+ * ABORTS. On a Colab T4 webgpu 0.6.0 completes the trunk and the process dies
+ * of SIGABRT in the sampler. Nothing reaches JavaScript - an
  * `onuncapturederror` handler and a `device.lost` handler installed before
- * the work both stay silent, so it is a native abort rather than a WebGPU
- * error. 0.4.0 folds the same sequence on the same machine to pLDDT 70.1 with
- * backbone 1.45/1.54/3.86 A. Measured both ways in one session; the version
- * is the only thing that differed.
+ * the work both stay silent - so it is a native abort, not a WebGPU error.
+ *
+ * Four arms on one machine name the cause, and it is not what it looked like:
+ *
+ *     f16 + matrix   diffusion   ABORT      trunk 7.9 s
+ *     f16            diffusion   ABORT      trunk 1.1 s
+ *     f16            FLOW        ABORT      trunk 1.5 s
+ *     no f16         diffusion   COMPLETE   pLDDT 70.1, backbone 1.45/1.54/3.86
+ *
+ * So it is neither the subgroup-matrix path nor the diffusion sampler - flow
+ * aborts too - it is `vulkan_enable_f16_on_nvidia`. Which is consistent with
+ * Dawn refusing f16 on NVIDIA by default pending a CTS investigation
+ * (crbug.com/42251215): the toggle lifts a block that 0.6.0 appears to have
+ * regressed. 0.4.0 with the same toggle folds correctly.
+ *
+ * 🔴 AND DROPPING f16 IS A REAL FALLBACK, NOT A LAST RESORT: pass
+ * `{toggles: ["allow_unsafe_apis"]}`. It costs what f16 buys - peak device
+ * memory 590 MiB against 360, and the sampler 7.2 s against 2.8 - and it
+ * folds. Worth reaching for before a version pin if a future Dawn does this
+ * again.
  */
 export const DAWN_VERSION = "0.4.0";
 
