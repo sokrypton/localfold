@@ -499,10 +499,40 @@ describe("where a fold's contact map lives", () => {
     // Each `lastPrediction = {` block, to its closing brace - at whatever
     // indent, since AF2's sits one scope deeper than AF3's and a pattern
     // pinned to two spaces silently checks two of the three paths.
-    const blocks = [...app.matchAll(/lastPrediction = \{\n([\s\S]*?)\n\s*\};/g)];
-    expect(blocks.length).toBe(3);
-    for (const [, body] of blocks) {
-      expect(body).toContain("contactSource");
+    //
+    // 🔴 AND ONE OF THE THREE IS A CALL NOW, NOT A LITERAL. AF3's assembly
+    // moved to `predictionFromAf3` in web/af3-model.js so the Colab runtime,
+    // which folds in node with no page, builds the same object rather than a
+    // second one - see the note there. A count of literals would have gone
+    // from 3 to 2 and read as a path having LOST the field, which is the
+    // opposite of what happened. The question is unchanged: every path that
+    // stores a prediction sets `contactSource`. Where a path delegates, the
+    // function it delegates to is what must carry it.
+    const model = readFileSync(
+      new URL("../web/af3-model.js", import.meta.url), "utf8");
+    // 🔴 AND IT ASKS FOR THE FIELD, NOT FOR THE WORD. `toContain` was
+    // satisfied by the COMMENT beside the field - two lines above it say
+    // "...why `contactSource` is one field on every path" - so deleting the
+    // property and leaving the prose passed. Measured: the mutation that
+    // drops it from the shared assembly was green until this changed. The
+    // comments come off first and the test is for an assignment.
+    const code = (text) => text
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^[ \t]*\/\/.*$/gm, "");
+    const sets = (body) => /\bcontactSource\s*:/.test(code(body));
+
+    const literals = [...app.matchAll(/lastPrediction = \{\n([\s\S]*?)\n\s*\};/g)];
+    const delegated = [...app.matchAll(/lastPrediction = (\w+)\(/g)].map((m) => m[1]);
+    expect(literals.length + delegated.length).toBe(3);
+    for (const [, body] of literals) {
+      expect(sets(body)).toBe(true);
+    }
+    for (const name of delegated) {
+      // The delegate must EXIST and must set it - a name that resolves to
+      // nothing would pass a scan of the whole file.
+      const at = model.indexOf(`export function ${name}(`);
+      expect(at).toBeGreaterThan(-1);
+      expect(sets(model.slice(at, model.indexOf("\n}", at)))).toBe(true);
     }
   });
 });

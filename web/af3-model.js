@@ -28,6 +28,8 @@ import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
 import { AF3_FAMILIES, bundleBaseUrl, loadManifest }
   from "../src/bundles/manifests/index.js";
 import { throwIfAborted } from "../src/runtime/abort.js";
+import { confidenceJson } from "./prediction-results.js";
+import { tokenLayoutFrom } from "./fold-archive.js";
 import { buildTemplate } from "./template-source.js";
 import { yieldToBrowser } from "../src/runtime/yield.js";
 import { af3Plan, af3TrunkStageSpans, RuntimeEstimator }
@@ -481,6 +483,63 @@ const TRUNK_SPANS = af3TrunkStageSpans();
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
+/**
+ * A fold's RESULT turned into the prediction every surface reads.
+ *
+ * ONE ASSEMBLY, BECAUSE A SECOND ONE SILENTLY DROPS A FIELD. This was written
+ * out inside `foldWithAf3` in web/app.js, which is a page function - so the
+ * Colab runtime, which folds in node over Dawn with no page at all, had no way
+ * to produce one but to write the object again. This repository has six
+ * records of what that costs: `normalizeConfig` dropping `gpu`, viewer.py's
+ * `light_frame` dropping `align`, the static loader dropping `position_atoms`,
+ * session.js dropping `maps` and `pae_n`. Each was a field-by-field rebuild
+ * that forgot a key, and each failed in silence.
+ *
+ * It takes a plain object and returns one: no DOM, no viewer, no downloads.
+ * That is what makes it importable from a process.
+ *
+ * @param {object} result what `foldAf3` returned
+ * @param {{chains: string[], alignment: string|null, modelName: string,
+ *          stem: string, scored: boolean, context?: object}} about
+ */
+export function predictionFromAf3(result, about) {
+  const { chains, alignment, modelName, stem, scored } = about;
+  return {
+    stem,
+    // THE FINAL STRUCTURE ONLY, NOT THE TRAJECTORY. Saving every sampler step
+    // wrote a file whose MODEL 1 was the FIRST step - measured at a CA-CA of
+    // 2.63 A against the final 3.87 - so anything that opens the first model,
+    // which is most things, showed a collapsed structure with backbone that
+    // does not join up. The trajectory is on screen in the play bar, where it
+    // can be watched; what gets saved is the answer.
+    pdb: result.pdb,
+    // ...the contacts travel WITH the confidence, because everything that
+    // reads one reads the other: the scores file, the archive's full_data,
+    // and the heatmap all want the same token-by-token matrices.
+    // ...and with no confidence head, the contacts travel ALONE - which is
+    // what EF2-fast's archive does, and why `contactSource` is one field on
+    // every path rather than a copy inside the confidence object.
+    confidence: scored
+      ? { ...result.confidence, contactProbs: result.contactProbs } : undefined,
+    scores: scored ? confidenceJson(chains.join(""),
+      { ...result.confidence, contactProbs: result.contactProbs }) : undefined,
+    a3m: alignment,
+    chains,
+    chainLengths: chains.map((chain) => chain.length),
+    // ...the same one field, so the archive has one thing to read. The
+    // confidence object keeps its own copy because the scores card and the
+    // heatmap take the whole object; this is the archive's single door.
+    contactSource: { contactProbs: result.contactProbs },
+    model: modelName,
+    // ...AF3 needs this for exactly the same reason, and nothing had ever set
+    // it: a fold with a ligand or a modified residue has more tokens than
+    // residues, so the archive's own fallback refused it.
+    tokens: result.batch === undefined ? undefined
+      : tokenLayoutFrom(result.batch.asymId, result.batch.residueIndex),
+    ...(about.context ?? {}),
+  };
+}
+
 export async function foldAf3(options) {
   const { sequence, mode, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
   // 🔴 THE SLOTS ARE BUILT HERE, AFTER FEATURISATION, AND NOT BY THE CALLER.

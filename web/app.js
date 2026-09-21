@@ -37,7 +37,7 @@ import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
   samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
-  loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
+  loadAf3Weights, toPoints, warmAf3Pipelines, predictionFromAf3 } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
@@ -2732,40 +2732,15 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // what the model actually computed, and the panel holding those buttons
     // stayed hidden. The trajectory goes in as one model per sampler call,
     // which is the AF3 analogue of one model per recycle.
-    lastPrediction = {
-      stem,
-      // 🔴 THE FINAL STRUCTURE ONLY, NOT THE TRAJECTORY. Saving every sampler
-      // step wrote a file whose MODEL 1 was the FIRST step - measured at a
-      // CA-CA of 2.63 A against the final 3.87 - so anything that opens the
-      // first model, which is most things, showed a collapsed structure with
-      // backbone that does not join up. The trajectory is on screen in the play
-      // bar, where it can be watched; what gets saved is the answer.
-      pdb: result.pdb,
-      // ...the contacts travel WITH the confidence, because everything that
-      // reads one reads the other: the scores file, the archive's full_data,
-      // and the heatmap all want the same token-by-token matrices.
-      // ...and with no confidence head, the contacts travel ALONE - which is
-      // what EF2-fast's archive does, and why `contactSource` is one field on
-      // every path rather than a copy inside the confidence object.
-      confidence: scored
-        ? { ...result.confidence, contactProbs: result.contactProbs } : undefined,
-      scores: scored ? confidenceJson(chains.join(""),
-        { ...result.confidence, contactProbs: result.contactProbs }) : undefined,
-      a3m: alignment,
-      chains,
-      chainLengths: chains.map((chain) => chain.length),
-      // ...the same one field, so the archive has one thing to read. The
-      // confidence object keeps its own copy because the scores card and the
-      // heatmap take the whole object; this is the archive's single door.
-      contactSource: { contactProbs: result.contactProbs },
-      model: modelName,
-      // ...AF3 needs this for exactly the same reason, and nothing had ever set
-      // it: a fold with a ligand or a modified residue has more tokens than
-      // residues, so the archive's own fallback refused it.
-      tokens: result.batch === undefined ? undefined
-        : tokenLayoutFrom(result.batch.asymId, result.batch.residueIndex),
-      ...foldContext,
-    };
+    // 🔴 ONE ASSEMBLY, IN web/af3-model.js, BESIDE THE FOLD THAT PRODUCED
+    // `result`. It was written out here, which meant the Colab runtime -
+    // which folds in node with no page - had to build the same twenty fields
+    // a second time, and this project has six records of what a second
+    // field-by-field build costs. Moving it did not make the object simpler;
+    // it made there be one of it.
+    lastPrediction = predictionFromAf3(result, {
+      chains, alignment, modelName, stem, scored, context: foldContext,
+    });
     predictions.set(stem, lastPrediction);
     resultIsFrom(family);
     syncDownloads();
