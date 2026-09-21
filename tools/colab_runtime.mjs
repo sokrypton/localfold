@@ -32,7 +32,7 @@ import { predictionFromAf3 } from "../web/af3-model.js";
 // viewer here; `superposeApi` is the same Kabsch this repository already
 // folds AF2 with, in the shape that function expects.
 import { superposeApi } from "./gpu/superpose.js";
-import { MODEL_LABELS } from "../src/bundles/manifests/index.js";
+import { MODEL_LABELS, AF3_FAMILIES } from "../src/bundles/manifests/index.js";
 
 const option = (name, fallback) => {
   const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
@@ -150,6 +150,21 @@ async function runFold(request) {
   if (problem) return { error: problem, status: lastStatus };
 
   const family = request.model ?? "af3";
+  // 🔴 REFUSED BY NAME, NOT BY LEAKING AN EXCEPTION. This runtime folds the
+  // AlphaFold 3 GRAPH - `foldAf3` and nothing else - and asked for AlphaFold 2
+  // it used to fail deep inside `loadAf3Weights` with "monomer is not an
+  // AlphaFold 3-graph family", which reads to a reader as a broken runtime
+  // rather than as a runtime that does not do that yet. The other two drivers
+  // exist but neither is reachable from here: ESMFold2's orchestration lives
+  // in web/app.js as a page function, and tools/gpu/fold-af2.js returns a
+  // BENCH REPORT - timings and checksums - rather than a prediction.
+  if (!AF3_FAMILIES.includes(family)) {
+    return {
+      error: `this runtime folds the AlphaFold 3 graph (${AF3_FAMILIES.join(", ")});`
+        + ` ${family} needs a browser - start the service with --runtime chrome`,
+      status: lastStatus,
+    };
+  }
   const modelName = MODEL_LABELS?.[family] ?? family;
   const mode = samplerModeFor?.(family) ?? "diffusion";
   folding = true;
