@@ -25,6 +25,13 @@ import { createNodeDevice } from "../src/node.js";
 import { foldAf3, loadAf3Weights, af3SequenceProblem, samplerModeFor, AF3_COUNTS }
   from "../web/af3-model.js";
 import { predictionFromAf3 } from "../web/af3-model.js";
+// 🔴 WITHOUT THIS THE STREAMED TRAJECTORY TUMBLES. AF3's sampler
+// re-augments the whole system every step, so consecutive frames differ
+// by a rigid motion far larger than the denoiser's - `fittedPdb` fits
+// them, and it asks a viewer library for the superposition. There is no
+// viewer here; `superposeApi` is the same Kabsch this repository already
+// folds AF2 with, in the shape that function expects.
+import { superposeApi } from "./gpu/superpose.js";
 import { MODEL_LABELS } from "../src/bundles/manifests/index.js";
 
 const option = (name, fallback) => {
@@ -185,6 +192,7 @@ async function runFold(request) {
       // The live feed. `foldAf3` hands a PDB per sampler call, which is what
       // the reader's play bar fills from.
       onFrame: (pdb) => tapOut("frame", pdb),
+      superpose: superposeApi,
     });
     const scored = out.confidence !== undefined;
     const prediction = predictionFromAf3(out, {

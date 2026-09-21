@@ -176,3 +176,28 @@ export function chainAssignments(sequences, options = {}) {
   }
   return assignments;
 }
+
+/**
+ * The same fit, in the shape `fittedPdb` asks a viewer library for.
+ *
+ * 🔴 TWO CONVENTIONS FOR ONE KABSCH, AND THE ADAPTER IS WHERE THEY MEET.
+ * py2Dmol publishes `superpose(mobile, reference, {from, to})` - index arrays
+ * naming the points the fit is COMPUTED from, with the transform applied to
+ * every point of `mobile` - and `superpose` above pairs by position and hands
+ * back a `place`. A runtime with no page has no py2Dmol, so without this a
+ * streamed AlphaFold 3 trajectory TUMBLES: the sampler re-augments the whole
+ * system every step, and unfitted frames differ by a rigid motion far larger
+ * than anything the denoiser did.
+ *
+ * @param {number[][]} mobile every point of the frame being placed
+ * @param {number[][]} reference the frame it is placed onto
+ * @param {{from?: number[], to?: number[]}} [slots] which points to fit on
+ */
+export function superposeApi(mobile, reference, slots = {}) {
+  const from = slots.from ?? mobile.map((_, index) => index);
+  const to = slots.to ?? reference.map((_, index) => index);
+  // Paired by position, so the two subsets must be the same length - which is
+  // what `fittedPdb` passes, the same slot list for both.
+  const { place } = superpose(from.map((i) => mobile[i]), to.map((i) => reference[i]));
+  return mobile.map((point) => place(point));
+}

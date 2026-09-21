@@ -912,7 +912,8 @@ export async function foldAf3(options) {
       if (reference === null) reference = toPoints(denoised, batch.tokens * batch.dense);
       trajectory.push(Float32Array.from(denoised));
       options.onFrame?.(
-        fittedPdb(batch, denoised, reference, slots, null), shown);
+        fittedPdb(batch, denoised, reference, slots, null,
+          { superpose: options.superpose }), shown);
       shown += 1;
       reached(plan().samplerStart + plan().callUnits * step);
       // ...the sampler used to run its OWN clock here, from its own elapsed
@@ -948,7 +949,8 @@ export async function foldAf3(options) {
   // final one, which used to be appended straight from the sampler and made
   // the animation jump on its last frame.
   const framePdbs = trajectory.map(
-    (positions) => fittedPdb(batch, positions, reference, slots, null));
+    (positions) => fittedPdb(batch, positions, reference, slots, null,
+                             { superpose: options.superpose }));
   // ...and the finished structure keeps the REAL pLDDT, which is the one
   // number here that is a claim about the prediction rather than a colour.
   // 🔴 THE HEADER GOES ON THE FILE THAT GETS SAVED, AND ON NOTHING ELSE. The
@@ -964,7 +966,8 @@ export async function foldAf3(options) {
   // the mislabelling EF2-fast's own REMARK exists to prevent.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots,
                              result.scores?.plddt ?? null,
-                             { remark: [...(options.remark ?? []),
+                             { superpose: options.superpose,
+                               remark: [...(options.remark ?? []),
                                         ...(result.scores?.plddt === undefined
                                           ? [] : ["B-FACTOR IS pLDDT (0-100)."])] });
 
