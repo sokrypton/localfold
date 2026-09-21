@@ -41,6 +41,15 @@ import { requestAlphaFoldDevice } from "./runtime/device.js";
  * (crbug.com/42251215): the toggle lifts a block that 0.6.0 appears to have
  * regressed. 0.4.0 with the same toggle folds correctly.
  *
+ * 🔴 AND THE "MATRIX IS 7x SLOWER" READING WAS 0.6.0's BROKEN f16 TALKING.
+ * On 0.4.0, alternated on the same machine, the trunk is 1.3 s with the
+ * subgroup-matrix path and 1.0/0.9 s without - 30-40%, not seven times, and
+ * every arm folds to pLDDT 70.1. So it is NOT evidence against
+ * device-profile.js's `turing` prior: that was measured at 300 tokens, where
+ * `grid.attend` is 15.4% of the pairformer, and this is 58 residues, where
+ * the setup plausibly outweighs the win. A size effect, not a wrong table.
+ * Do not touch that prior on the strength of a 58-mer.
+ *
  * 🔴 AND DROPPING f16 IS A REAL FALLBACK, NOT A LAST RESORT: pass
  * `{toggles: ["allow_unsafe_apis"]}`. It costs what f16 buys - peak device
  * memory 590 MiB against 360, and the sampler 7.2 s against 2.8 - and it
