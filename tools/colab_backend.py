@@ -181,8 +181,9 @@ class Backend:
     def start(self):
         # cdp.py already carries the Linux flags this needs - Vulkan, the
         # sandbox off (a runtime is root in a container), and the f16 feature
-        # docs/A100.md prices at 1.95x. Headless is opt-in there because the
-        # A100 box runs headed; here there is no display at all.
+        # docs/A100.md prices at 1.74x on a whole fold, and 0.60x peak
+        # memory. Headless is opt-in there because the A100 box runs headed;
+        # here there is no display at all.
         os.environ.setdefault("LOCALFOLD_HEADLESS", "1")
         # 🔴 `--disable-vulkan-surface`, WHICH THE SHARED FLAGS DO NOT CARRY.
         # A surface is a thing you present TO, and this container has no

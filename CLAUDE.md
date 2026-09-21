@@ -1599,6 +1599,7 @@ because the numbers are the point - a claim here without one is a guess.
 | `docs/AF2.md` | the multimer and monomer template terms and the three dialects they are, the end-to-end fold gate, the four differential gates, and the alignment prep |
 | `docs/PERF.md` | this device's ceilings, where the memory goes in each model, what f16 is worth **where**, the pair-scratch and aliasing work, and upstream's optimisations tried here |
 | `docs/A100.md` | the same kernels on an **A100**: how to get a real WebGPU adapter on Linux/NVIDIA at all, what this repository's M2-measured conclusions do here, and the four that invert |
+| `docs/DAWN.md` | folding in a PROCESS over Dawn instead of a headless Chrome: tried on the `dawn` branch, measured, and **not taken** - what it ports is one protein chain, and a DNA chain came back as a peptide. Also the three findings worth keeping from it: `webgpu@0.6.0`'s f16 aborting the sampler, the 65536 ns `timestamp_quantization` grid that flattened every small kernel's measurement, and a 300 ms poll starving a weight download on two CPUs |
 | `docs/WEB.md` | the page: mobile layout, the template source menu, the download dial, the archive round trip, and the viewer |
 | `docs/OPENDDE.md` | the OpenDDE port, and the place to START on it: two token spaces, its own confidence head, the gates it must hold, and what is open |
 | `docs/HOSTING.md` | the weights are on Hugging Face, not Pages: how a bundle names its remote, and why a bundle wants more shards than connections |

@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-335 tools. `tools/fixtures/` is data and is not listed.
+336 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (190)
+## `tools/gpu/` - the WebGPU lane (191)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -35,6 +35,7 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-head.js`** - Where one denoiser call's time goes.
 - **`bench-jaxjs-matmul.js`** - jax-js's WebGPU matmul at the shapes this repository's kernels run.
 - **`bench-msa-attention.js`** - The flash attention kernel alone, at several key-chunk sizes, in one process.
+- **`bench-normsplit.js`** - diffusionNormSplit, on and off, ALTERNATING IN ONE PROCESS.
 - **`bench-opm.js`** - The outer product mean's contraction alone, at several (i, j) blocks.
 - **`bench-relative-encoding.js`** - Is the gather actually faster than the dense projection?
 - **`bench-row-normalize.js`** - Row LayerNorm, three arrangements, at the shapes an AF2 block normalises.
