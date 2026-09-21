@@ -2237,10 +2237,30 @@ parameters and left the runtime folding for nobody - reported as *"disconnect
 doesn't seem to kill the Colab session"*, which it did not: the browser on that
 machine holds the card for as long as it lives. It posts `shutdown` now, which
 is the broker's own op rather than one forwarded to the page: the service stops,
-its browser is terminated, the process exits, and the notebook cell ends. **What
-it cannot do is release the Colab RUNTIME** - that machine belongs to the
-notebook, and only its Runtime menu frees it - and the button's title says so
-rather than implying otherwise.
+is the broker's own op rather than one forwarded to the page: the service
+stops, its browser is terminated, the process exits, and the notebook cell
+ends.
+
+🔴 **AND IT HANDS THE MACHINE BACK TOO, WHICH I FIRST WROTE DOWN HERE AS
+IMPOSSIBLE.** "That machine belongs to the notebook, and only its Runtime
+menu frees it" was wrong, and colabtools' own source settles it:
+`google.colab.runtime.unassign()` is a **POST to
+`http://$TBE_RUNTIME_ADDR/unassign`** - a plain HTTP address in the
+environment rather than a call over the kernel's comm channel - so any
+process on the runtime can make it, this broker included. The ORDER is
+load-bearing: the browser first, the unassign last, because unassigning
+pulls the machine out from under anything that has not happened yet.
+
+**AND WHERE THERE IS NO MACHINE TO HAND BACK IT SAYS SO.**
+`TBE_RUNTIME_ADDR` is absent anywhere that is not a Colab runtime, so the
+page asks `/health` which half it is: "release this Colab machine" against
+"stop the fold service", *"Colab runtime · released"* against *"· stopped"*.
+A button that promised a release either way would be wrong half the time.
+
+**THE GATE STANDS A STUB IN FOR COLAB'S RUNTIME SERVICE** - a socket that
+records what it is asked - and hands the broker its address, which is the
+only difference between that run and one in a notebook. It sees exactly one
+request, `POST /unassign`.
 
 **AFTER IT, THE PAGE IS A VIEWER.** It does not reload (the server it was
 served by is what just stopped) and it does not quietly start folding here
