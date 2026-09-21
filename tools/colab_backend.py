@@ -211,7 +211,8 @@ class Backend:
         """
         self.proc = subprocess.Popen(
             [shutil.which("node") or "node", str(RUNTIME_JS),
-             "--port", str(self.port), "--token", self.token],
+             "--port", str(self.port), "--token", self.token,
+             ],
             cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1)
 
