@@ -32,7 +32,9 @@ import { predictionFromAf3 } from "../web/af3-model.js";
 // viewer here; `superposeApi` is the same Kabsch this repository already
 // folds AF2 with, in the shape that function expects.
 import { superposeApi } from "./gpu/superpose.js";
-import { MODEL_LABELS, AF3_FAMILIES } from "../src/bundles/manifests/index.js";
+import { MODEL_LABELS, AF3_FAMILIES, SINGLE_SEQUENCE_FAMILIES }
+  from "../src/bundles/manifests/index.js";
+import { foldEsmfold2Job, predictionFromEsmfold2 } from "../web/esmfold2-model.js";
 
 const option = (name, fallback) => {
   const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
@@ -127,6 +129,32 @@ async function weightsFor(family, onProgress) {
   return weightsByFamily.get(family);
 }
 
+/**
+ * What travels back to the reader, for any graph.
+ *
+ * 🔴 A TYPED ARRAY HAS TO ARRIVE AS ONE. JSON has none, so a plain stringify
+ * flattens them - and they LOOK right everywhere until `matrixRows` slices a
+ * PAE with `values.subarray(...)` and a download dies while the picture beside
+ * it is perfect. The kind travels with the numbers; `revivePrediction` on the
+ * reader's side puts it back.
+ */
+function wireResult(prediction, pdb, chains) {
+  const predJson = JSON.stringify(prediction, (key, value) =>
+    (ArrayBuffer.isView(value) && !(value instanceof DataView))
+      ? { __typed: value.constructor.name, v: Array.from(value) } : value);
+  return {
+    predJson,
+    a3m: prediction.a3m ?? null,
+    confidence: prediction.confidence ?? null,
+    scores: prediction.scores ?? null,
+    chains: prediction.chains ?? null,
+    length: chains.join("").length,
+    status: lastStatus,
+    pdb,
+    atoms: (pdb.match(/^ATOM|^HETATM/gm) || []).length,
+  };
+}
+
 async function runFold(request) {
   if (folding) return { error: "the runtime is already folding", status: lastStatus };
 
@@ -158,9 +186,10 @@ async function runFold(request) {
   // exist but neither is reachable from here: ESMFold2's orchestration lives
   // in web/app.js as a page function, and tools/gpu/fold-af2.js returns a
   // BENCH REPORT - timings and checksums - rather than a prediction.
-  if (!AF3_FAMILIES.includes(family)) {
+  const known = [...AF3_FAMILIES, ...SINGLE_SEQUENCE_FAMILIES];
+  if (!known.includes(family)) {
     return {
-      error: `this runtime folds the AlphaFold 3 graph (${AF3_FAMILIES.join(", ")});`
+      error: `this runtime folds ${known.join(", ")};`
         + ` ${family} needs a browser - start the service with --runtime chrome`,
       status: lastStatus,
     };
@@ -184,6 +213,38 @@ async function runFold(request) {
   }, ceiling);
   tapOut("fold-begin", { at: Date.now(), family, residues: chains.join("").length });
   try {
+    // 🔴 THE SECOND GRAPH, THROUGH THE SAME DOOR IT USES IN THE PAGE. EF2-fast
+    // folds from the sequence alone - no alignment, no templates - and has no
+    // confidence head, so its prediction is a different SHAPE and is built by
+    // its own assembly. What is the same is the arrangement: a job that takes
+    // callbacks, and an assembly that takes `(result, about)`.
+    if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
+      const out = await foldEsmfold2Job({
+        chains, chainKinds: chains.map(() => "protein"),
+        signal: abort.signal, device, family, modelName,
+        // Every one of these reads a control in the page. Here they are the
+        // request's, with the checkpoint's own preferences as defaults.
+        languageModel: request.languageModel !== false,
+        plm: request.plm ?? "esmc-600m",
+        loops: Number(request.recycles ?? 0) + 1,
+        sampler: request.sampler ?? "balanced",
+        seed: Number(request.seed ?? 0),
+        onStatus: status,
+        onProgress: (fraction) => tapOut("progress", fraction),
+        onFrame: (pdb) => tapOut("frame", pdb),
+      });
+      const prediction = predictionFromEsmfold2(out.result, {
+        chains, stem: request.stem ?? family, pdb: out.pdb, modelName,
+        certainty: out.certainty,
+        context: { seed: Number(request.seed ?? 0) },
+        settings: { "trunk passes": Number(request.recycles ?? 0) + 1,
+                    "language model": request.plm ?? "esmc-600m",
+                    sampler: request.sampler ?? "balanced" },
+      });
+      status(`${modelName} · ${chains.join("").length} residues`);
+      return wireResult(prediction, out.pdb, chains);
+    }
+
     status(`Loading ${modelName}`);
     // The download is most of a cold fold, so its progress is the reader's
     // only sign of life until the trunk starts.
@@ -222,20 +283,7 @@ async function runFold(request) {
     // slices the PAE with `values.subarray(...)`, which a reader then dies on
     // while the picture beside it is perfect. `revivePrediction` on the other
     // side puts the kind back; this is the encoder that matches it.
-    const predJson = JSON.stringify(prediction, (key, value) =>
-      (ArrayBuffer.isView(value) && !(value instanceof DataView))
-        ? { __typed: value.constructor.name, v: Array.from(value) } : value);
-    return {
-      predJson,
-      a3m: prediction.a3m ?? null,
-      confidence: prediction.confidence ?? null,
-      scores: prediction.scores ?? null,
-      chains: prediction.chains ?? null,
-      length: chains.join("").length,
-      status: lastStatus,
-      pdb: out.pdb,
-      atoms: (out.pdb.match(/^ATOM|^HETATM/gm) || []).length,
-    };
+    return wireResult(prediction, out.pdb, chains);
   } catch (cause) {
     const message = String(cause?.message ?? cause);
     status(`Fold failed: ${message}`);
