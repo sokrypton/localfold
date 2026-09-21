@@ -21,6 +21,7 @@
  * ignored, because a search that runs and is discarded is a minute of somebody
  * else's server for no reason.
  */
+import { tokenLayoutFrom } from "./fold-archive.js";
 import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
 import { readTensor } from "../src/weights/dtype.js";
 import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
@@ -324,5 +325,110 @@ export function languageModelRunner(device, allocator, loaded, pairChannels) {
       residualScale: loaded.language.manifest.residualScale ?? 1,
     }, loaded.language.block, loaded.language.shared, { sequenceId, onBlock });
     return result.single;
+  };
+}
+
+/** Per-chain means, ignoring tokens with no value. */
+export function meanByChain(asymId, values) {
+  if (values === undefined) return undefined;
+  const chains = [...new Set(asymId)].sort((a, b) => a - b);
+  return chains.map((chain) => {
+    let sum = 0, seen = 0;
+    for (let token = 0; token < asymId.length; token += 1) {
+      if (asymId[token] !== chain || !(values[token] >= 0)) continue;
+      sum += values[token];
+      seen += 1;
+    }
+    return seen === 0 ? null : Math.round((sum / seen) * 100) / 100;
+  });
+}
+
+/**
+ * A fold's RESULT turned into the prediction every surface reads.
+ *
+ * 🔴 ONE ASSEMBLY PER GRAPH, AND THE SAME SHAPE FOR EACH. `predictionFromAf3`
+ * in web/af3-model.js is the other one, and they take the same two arguments
+ * for the same reason: a runtime that folds WITHOUT a page has to produce
+ * exactly what the page produces, and a second field-by-field rebuild is how
+ * this project has lost `gpu`, `align`, `position_atoms`, `maps` and `pae_n`,
+ * each in silence.
+ *
+ * What differs between the two is the MODEL, not the convention: this
+ * checkpoint has no confidence head, so there is no `confidence` object at
+ * all, its pAE is estimated rather than predicted and travels under its own
+ * name, and its settings are its own - it reads neither the recycle dial nor
+ * the MSA depth. Those three are the whole of the difference and each is
+ * commented where it sits.
+ *
+ * 🔴 AND `settings` IS PASSED IN, BECAUSE THREE OF ITS FIELDS ARE CONTROLS.
+ * `recycleCount()`, `plmLabel()` and `samplerPreset()` read the page; a
+ * process has none, so the caller states them.
+ *
+ * @param {object} result what the ESMFold2 fold returned
+ * @param {{chains: string[], stem: string, pdb: string, modelName: string,
+ *          certainty?: ArrayLike<number>, settings: object, context?: object}} about
+ */
+export function predictionFromEsmfold2(result, about) {
+  const { chains, stem, pdb, modelName, certainty } = about;
+  const foldContext = about.context ?? {};
+  return {
+    stem, pdb, chains,
+    chainLengths: chains.map((chain) => chain.length),
+    // 🔴 NO `confidence`, AND THAT IS THE HONEST SHAPE. Everything that reads a
+    // prediction's confidence - the scores card, the archive's summary, the PAE
+    // panel - asks for fields this checkpoint has no head to compute. An object
+    // carrying zeros would be read as the model's opinion.
+    // 🔴 ONE FIELD FOR THE CONTACT MAP, WHATEVER PRODUCED IT. See the note on
+    // `contactSource` at the download button: this used to be `contacts` here,
+    // `confidence.contactProbs` on the AF3 path and `contactSource` on AF2's,
+    // and the archive knew about two of the three - so the model whose contact
+    // map is its ONLY score wrote an archive without one while the panel on
+    // screen showed it.
+    contactSource: { contactProbs: result.contacts },
+    // 🔴 AND THE pAE, WHICH IS NOT A `confidence` FIELD AND MUST NOT BECOME
+    // ONE. It is estimated from the distogram rather than predicted by a head -
+    // see src/esmfold2/aligned-error.js - so putting it under `confidence`
+    // would let every reader that tests for that object conclude this
+    // checkpoint has one, and start looking for the pLDDT and pTM beside it.
+    // It is its own field, named for what it is.
+    alignedError: result.alignedError,
+    // 🔴 WITHIN EACH CHAIN AND ACROSS IT, KEPT APART. The certainty a residue
+    // wears is about its own chain; the interface is a different question and
+    // averaging them gives a number that answers neither. Measured on a
+    // two-chain fold: 0.712 within, 0.370 across, 0.630 mixed.
+    chainCertainty: meanByChain(result.features.asymId, certainty),
+    chainInterfaceCertainty: meanByChain(result.features.asymId,
+                                         result.interfaceCertainty),
+    model: modelName,
+    // 🔴 THE TOKEN LAYOUT, because a ligand is one token per heavy atom and the
+    // archive cannot infer that from the chain lengths - it refuses to guess
+    // and throws. See tokenIdentifiers.
+    tokens: tokenLayoutFrom(result.features.asymId, result.features.residueIndex),
+    // ...and the entities and the templates, which the archive's job request is
+    // made of. Without these "Download all" wrote a request naming no
+    // sequences.
+    ...foldContext,
+    // 🔴 THIS MODEL'S OWN SETTINGS, OVER THE SHARED DIALS'. `foldContext` is
+    // built before the branch and carries the recycle count and the MSA depth
+    // that AF2 and AF3 read - and this model reads NEITHER: it folds from the
+    // sequence alone, which is why the page hides its MSA row, and its trunk
+    // loops a number of times the checkpoint fixes rather than the dial. The
+    // archive said `recycles: 1` and `max msa: 128` for a fold that used one
+    // value of neither.
+    settings: {
+      seed: foldContext.settings?.seed,
+      // Stated by the caller: the first three read page controls, and a
+      // process has none. `diffusion steps` is the fold's own answer, so it
+      // is taken from the result rather than asked for.
+      ...(about.settings ?? {}),
+      "diffusion steps": result.steps,
+    },
+    // ...and no alignment or template line, rather than "none", which reads as
+    // a choice. This model takes neither: `grep -rn template` over ESMFold2's
+    // whole upstream package returns nothing, and `z_init` has five terms with
+    // none of them one.
+    msaOrigin: undefined,
+    msas: {},
+    templates: undefined,
   };
 }

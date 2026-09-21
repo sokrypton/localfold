@@ -508,8 +508,12 @@ describe("where a fold's contact map lives", () => {
     // opposite of what happened. The question is unchanged: every path that
     // stores a prediction sets `contactSource`. Where a path delegates, the
     // function it delegates to is what must carry it.
-    const model = readFileSync(
-      new URL("../web/af3-model.js", import.meta.url), "utf8");
+    // 🔴 THREE GRAPHS, THREE MODULES, ONE CONVENTION - so the delegate is
+    // looked for in all of them rather than in the one that happened to be
+    // extracted first. web/af3-model.js, web/esmfold2-model.js and
+    // web/af2-model.js each hold their graph's `predictionFrom*`.
+    const models = ["af3-model.js", "esmfold2-model.js", "af2-model.js"]
+      .map((name) => readFileSync(new URL(`../web/${name}`, import.meta.url), "utf8"));
     // 🔴 AND IT ASKS FOR THE FIELD, NOT FOR THE WORD. `toContain` was
     // satisfied by the COMMENT beside the field - two lines above it say
     // "...why `contactSource` is one field on every path" - so deleting the
@@ -530,9 +534,11 @@ describe("where a fold's contact map lives", () => {
     for (const name of delegated) {
       // The delegate must EXIST and must set it - a name that resolves to
       // nothing would pass a scan of the whole file.
-      const at = model.indexOf(`export function ${name}(`);
-      expect(at).toBeGreaterThan(-1);
-      expect(sets(model.slice(at, model.indexOf("\n}", at)))).toBe(true);
+      const source = models.find((text) =>
+        text.includes(`export function ${name}(`));
+      expect(source === undefined ? `no module exports ${name}` : name).toBe(name);
+      const at = source.indexOf(`export function ${name}(`);
+      expect(sets(source.slice(at, source.indexOf("\n}", at)))).toBe(true);
     }
   });
 });

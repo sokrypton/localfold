@@ -39,7 +39,7 @@ import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMIL
   samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints, warmAf3Pipelines, predictionFromAf3 } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
-  loadEsmfold2Weights } from "./esmfold2-model.js";
+  loadEsmfold2Weights, predictionFromEsmfold2 } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
 import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js";
 import { toPdb } from "../src/af3/fold.js";
@@ -54,6 +54,7 @@ import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDEN
 import { devAdopt, devBeginRun, devEndRun, devNote, devOnEntry, devSourceIs, devStatus,
   devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
+import { predictionFromAf2 } from "./af2-model.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
 import { CHAIN_IDS, confidenceJson, contactMapFor, matrixForViewer, modifiedPositions,
@@ -3251,65 +3252,17 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     viewer.render("ef2-final");
   }
 
-  lastPrediction = {
-    stem, pdb, chains,
-    chainLengths: chains.map((chain) => chain.length),
-    // 🔴 NO `confidence`, AND THAT IS THE HONEST SHAPE. Everything that reads a
-    // prediction's confidence - the scores card, the archive's summary, the PAE
-    // panel - asks for fields this checkpoint has no head to compute. An object
-    // carrying zeros would be read as the model's opinion.
-    // 🔴 ONE FIELD FOR THE CONTACT MAP, WHATEVER PRODUCED IT. See the note on
-    // `contactSource` at the download button: this used to be `contacts` here,
-    // `confidence.contactProbs` on the AF3 path and `contactSource` on AF2's,
-    // and the archive knew about two of the three - so the model whose contact
-    // map is its ONLY score wrote an archive without one while the panel on
-    // screen showed it.
-    contactSource: { contactProbs: result.contacts },
-    // 🔴 AND THE pAE, WHICH IS NOT A `confidence` FIELD AND MUST NOT BECOME
-    // ONE. It is estimated from the distogram rather than predicted by a head -
-    // see src/esmfold2/aligned-error.js - so putting it under `confidence`
-    // would let every reader that tests for that object conclude this
-    // checkpoint has one, and start looking for the pLDDT and pTM beside it.
-    // It is its own field, named for what it is.
-    alignedError: result.alignedError,
-    // 🔴 WITHIN EACH CHAIN AND ACROSS IT, KEPT APART. The certainty a residue
-    // wears is about its own chain; the interface is a different question and
-    // averaging them gives a number that answers neither. Measured on a
-    // two-chain fold: 0.712 within, 0.370 across, 0.630 mixed.
-    chainCertainty: meanByChain(result.features.asymId, certainty),
-    chainInterfaceCertainty: meanByChain(result.features.asymId,
-                                         result.interfaceCertainty),
-    model: modelName,
-    // 🔴 THE TOKEN LAYOUT, because a ligand is one token per heavy atom and the
-    // archive cannot infer that from the chain lengths - it refuses to guess
-    // and throws. See tokenIdentifiers.
-    tokens: tokenLayoutFrom(result.features.asymId, result.features.residueIndex),
-    // ...and the entities and the templates, which the archive's job request is
-    // made of. Without these "Download all" wrote a request naming no
-    // sequences.
-    ...foldContext,
-    // 🔴 THIS MODEL'S OWN SETTINGS, OVER THE SHARED DIALS'. `foldContext` is
-    // built before the branch and carries the recycle count and the MSA depth
-    // that AF2 and AF3 read - and this model reads NEITHER: it folds from the
-    // sequence alone, which is why the page hides its MSA row, and its trunk
-    // loops a number of times the checkpoint fixes rather than the dial. The
-    // archive said `recycles: 1` and `max msa: 128` for a fold that used one
-    // value of neither.
+  // The one assembly for this graph, in web/esmfold2-model.js beside the
+  // fold - the same arrangement `predictionFromAf3` has, so a runtime with no
+  // page builds the same object rather than a second version of it.
+  lastPrediction = predictionFromEsmfold2(result, {
+    chains, stem, pdb, modelName, certainty, context: foldContext,
     settings: {
-      seed: foldContext.settings?.seed,
       "trunk passes": recycleCount() + 1,
       "language model": plmLabel(),
       sampler: samplerPreset(),
-      "diffusion steps": result.steps,
     },
-    // ...and no alignment or template line, rather than "none", which reads as
-    // a choice. This model takes neither: `grep -rn template` over ESMFold2's
-    // whole upstream package returns nothing, and `z_init` has five terms with
-    // none of them one.
-    msaOrigin: undefined,
-    msas: {},
-    templates: undefined,
-  };
+  });
   syncDownloads();
     void rememberSessionWhenSettled(lastPrediction);
 
@@ -4364,28 +4317,13 @@ async function fold(event) {
       sequence,
       structure: finalLanded,
     };
-    lastPrediction = {
-      stem,
-      // The BEST pass, and its own scores with it - a structure from one pass
-      // beside another pass's pLDDT would be a file that describes nothing that
-      // was ever computed.
-      pdb: predictionToPdb(sequence, best.structure, best.confidence.plddt, chainLengths),
-      confidence: best.confidence,
-      scores: confidenceJson(sequence, best.confidence),
-      a3m: alignment,
-      chains,
-      chainLengths,
-      recycles: alignedRecycles,
-      bestPass: bestIndex,
-      contactSource: best.pass,
-      // ...every model's own best, ranked, for the archive. Absent for a
-      // single-model fold, which has nothing to rank.
-      perModel,
-      // ...the model that MADE the saved pass, which under a sweep is whichever
-      // of the five won rather than the one the row resolved to.
-      model: `AlphaFold 2 (${best.family ?? family})`,
-      ...foldContext,
-    };
+    // The one assembly for this graph, in web/af2-model.js - the same
+    // `(result, about)` shape as the other two, so nothing has to rebuild it.
+    lastPrediction = predictionFromAf2(best, {
+      sequence, chains, chainLengths, alignment, stem, family,
+      recycles: alignedRecycles, bestPass: bestIndex, perModel,
+      context: foldContext,
+    });
     predictions.set(stem, lastPrediction);
     // ...and it is the WINNER's family, not the row's: a sweep folds five and
     // the one on screen is whichever won, which is the same reason the model
