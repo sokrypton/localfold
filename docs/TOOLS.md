@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-335 tools. `tools/fixtures/` is data and is not listed.
+337 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (190)
+## `tools/gpu/` - the WebGPU lane (191)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -108,6 +108,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-opendde-confidence.js`** - OpenDDE's per-pair confidence readouts: the GPU against the host reference.
 - **`check-opendde-encoder-oracle.js`** - OpenDDE's target-feat ATOM ENCODER, module by module, against af3-any-model.
 - **`check-opendde-expander.js`** - OpenDDE's structural-token expansion, end to end on real weights.
+- **`check-opendde-structural.js`** - OpenDDE's structural expander and refiner, against af3-any-model's own.
 - **`check-opm-paths.js`** - The outer product mean's two paths, on ONE input, compared against each other.
 - **`check-pipeline-key-collisions.js`** - Do two models' trunks collide in ONE pipeline cache - the page's case?
 - **`check-protenix2-empty-template.js`** - protenix2's template term as the TRUNK builds it: four EMPTY slots, 68 tokens.
@@ -209,7 +210,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (42)
+## `tools/oracle/` - the reference side (43)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -236,6 +237,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_af3_denoise.py`** - Dump one denoise step: its inputs and af3-any-model's output.
 - **`dump_af3_denoise_stages.py`** - The SAME denoise step as dump_af3_denoise.py, with af3-any-model's own intermediates recorded alongside the answer.
 - **`dump_af3_opendde_confidence.py`** - af3-any-model's OpenDDE ConfidenceHead, inputs and outputs.
+- **`dump_af3_opendde_structural.py`** - af3-any-model's OpenDDE structural expander and refiner, inputs and outputs.
 - **`dump_af3_params_digest.py`** - A digest of every tensor af3-any-model would load, for a bundle to be held to.
 - **`dump_af3_real_denoise.py`** - Dump one denoise step from a REAL fold: real trunk conditioning, real structure.
 - **`dump_af3_scopes.py`** - Every haiku scope's OUTPUT in one denoise step, as a summary plus (optionally) the tensor itself.

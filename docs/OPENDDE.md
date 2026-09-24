@@ -1007,3 +1007,79 @@ shift cancels there, which is exactly why nothing caught it. Aligned anyway.
 Nothing shipped moved: opendde's 6MRR fold is byte-identical either way, pLDDT
 92.03958276090722, RMSD 1.518, TM 0.9304, because a single-chain protein has a
 constant `asymId` where it had a constant 0.
+
+## The structural stage has an oracle now, and the PAE was never wrong
+
+Asked because the PAE panel "looks more like a PDE matrix" under OpenDDE. It is
+not, and the impression is the MODEL's rather than this port's: measured against
+a real native fold of 6MRR, **native OpenDDE's own PAE has mean 4.13 A and max
+16.3** where AlphaFold 3 on the same page reads **9.73 and 22.4**. Switching
+model collapses the panel toward the diagonal because OpenDDE's predicted
+aligned error genuinely is that flat.
+
+| against native, 6MRR, matched settings | corr | relRMS |
+|---|---:|---:|
+| our f32 PAE vs native PAE | **0.99998** | **0.0035** |
+| our int5 PAE vs native PAE (the bundle that ships) | 0.99943 | 0.0253 |
+| our f32 PAE vs native **PDE** | 0.731 | 1.303 |
+| native's own sample floor | - | 0.00085 |
+
+The symmetry signature says the same thing without any reference: PAE asymmetry
+**0.239** against native's 0.229, PDE asymmetry **exactly 0** on both sides.
+int5's 2.5% is the quantisation and nothing else - per-residue pLDDT lands at
+the same 2.5% from the same bundle.
+
+🔴 **AND THE 9.9% THIS STARTED FROM WAS THE PROBE: `num_recycles` 10 AGAINST 0.**
+`fold_check` takes the model config's defaults unless `RECYCLES` and `STEPS` are
+set in the environment, and OpenDDE's are **10 recycles and 200 diffusion
+steps**; the port was folding at 0 and 16. So an 11-pass fold was being compared
+with a one-pass fold, and the gap was read as a defect for as long as it took to
+build an oracle that ruled out everything else. `RECYCLES=0 STEPS=16` takes it
+to 0.0035. **Match the settings before believing a residual** - and the tell was
+available all along, in that native's five samples agreed with each other to
+0.0025 while differing from ours by 0.10.
+
+### What the hunt did leave behind
+
+`tools/oracle/dump_af3_opendde_structural.py` and
+`tools/gpu/check-opendde-structural.js`: **the first numeric gate this stage has
+ever had.** `check-opendde-expander.js` says so in its own header - "THERE IS NO
+ORACLE FOR THIS, SO WHAT IS CHECKED IS CONSERVATION AND SHAPE" - so the expander
+and the four-block refiner were gated on invariants that hold by construction
+and on nothing else. Driven with the REFERENCE's own residue embeddings, so a
+difference is this stage's and not the trunk's:
+
+| stage | f32 | int5 |
+|---|---:|---:|
+| `expander.targetFeat` | **0** | 0.0351 |
+| `expander.single` | 4.5e-08 | 2.25e-4 |
+| `refiner.block0.single` | 1.33e-05 | 2.09e-3 |
+| `refiner.block1.single` | 2.63e-05 | 6.18e-3 |
+| `refiner.block2.single` | 6.19e-05 | 1.91e-2 |
+| `refiner.block3.single` | 5.99e-05 | 1.83e-2 |
+
+It **bisects the refiner by depth** - 1, 2, 3 then 4 blocks, the trick
+`--msa-blocks` plays on the trunk - so a future defect lands on a block rather
+than on "somewhere in four". It throws rather than reporting, and was watched
+failing at `--bound=1e-5`. The f32 column is four blocks of accumulation, which
+is what 6e-5 is; the int5 column is this bundle's quantisation, and is the
+number to compare a shipped fold against.
+
+🔴 **TWO TRAPS IT COST, BOTH ALREADY IN CLAUDE.md.** The head's arguments are
+TRACERS inside `mapping.sharded_map` and the refiner is
+`hk.experimental.layer_stack`, so `np.asarray` raises
+`TracerArrayConversionError` and `hk.intercept_methods` sees nothing - every tap
+in the dumper is a `jax.debug.callback`, and the per-block names come from the
+order the callbacks FIRE, because `layer_stack` traces its body once and a
+trace-time counter reaches 1.
+
+🔴 **AND THE BLOB IN `~/af3_ported` IS A 2026-09-09 CONVERSION, WHICH IS STALE.**
+`opendde` joined `PADDED_SINGLE_COND` on 2026-09-10 - the vendor's single
+conditioning normalises over 833 channels, not AF3's 831 - so the reference now
+refuses that blob with a LayerNorm shape mismatch. **The shipped bundles are
+fine**: both `model-opendde-full-f32` and `model-opendde-int5` carry
+`single_cond_initial_norm/scale` at 833. It is the archive that needs
+re-converting, and until it is, the dumper splices the two tensors out of
+LocalFold's own bundle. Measured, the convention is worth relRMS **0.0021** on
+the PAE - nothing - but a comparison that moves two things is not a comparison.
+
