@@ -23,7 +23,8 @@
  */
 import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/af2/multimer/model.js";
-import { foldsAsSingleSequence, parseA3m } from "../src/input/a3m.js";
+import { blankChainColumns, foldsAsSingleSequence, parseA3m }
+  from "../src/input/a3m.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
 // AND more than one chain, so a first fold never reaches it - and stopping a
@@ -1298,12 +1299,47 @@ function singleSequenceIfOnlyQuery(text, chains, where, extra = {}) {
 }
 
 async function alignmentText(chains, signal, family, wantsMsa = []) {
+  // 🔴 "THIS CHAIN FOLDS FROM ITS SEQUENCE ALONE" HAS NO CONDITIONS ON IT.
+  // That is what the entity popup says, and it was honoured on the SEARCH
+  // path only - where every chain has its own a3m and blanking one is a
+  // substitution. A pasted or uploaded alignment is ONE text over the
+  // concatenated chains, so the setting did nothing at all there: an existing
+  // job with an alignment in the box folded with it however the entity rows
+  // were set. Reported exactly that way.
+  //
+  // Two answers, because they are two different statements. With EVERY chain
+  // turned off there is no alignment left to give the model and this is the
+  // single-sequence path by another name. With SOME off, the text keeps its
+  // shape and those chains lose their rows' residues - see blankChainColumns.
+  const chainOff = chains.map((_, index) => wantsMsa[index] === false);
+  const allOff = chains.length > 0 && chainOff.every(Boolean);
+  // ONE EXIT FOR THE TEXT THE READER SUPPLIED, so a third way of supplying
+  // one cannot forget the setting the way these two did.
+  const fromText = (text, label) => {
+    if (allOff) return null;
+    // 🔴 AND THE SPANS ARE ONLY KNOWABLE WHEN THE QUERY IS THE ONE IN THE
+    // BOX. A pasted alignment's own first record WINS over the sequence box -
+    // deliberately, so a reader can paste an alignment and fold what it
+    // describes (see singleSequenceIfOnlyQuery) - and the chain spans here
+    // are measured off the BOX. Where the two differ there is nothing to
+    // measure against, so blanking would gap arbitrary columns of somebody
+    // else's alignment. It says so and folds what was pasted.
+    const mismatch = chainOff.some(Boolean)
+      && parseA3m(text).query !== chains.join("");
+    if (mismatch) {
+      status(`${label} is for a different sequence - folding it as it is,`
+        + " with every chain's alignment");
+      return singleSequenceIfOnlyQuery(text, chains, label) ?? text;
+    }
+    const kept = blankChainColumns(text, chains, chainOff);
+    return singleSequenceIfOnlyQuery(kept, chains, label) ?? kept;
+  };
   switch (msaMode()) {
     case "single": return null;
     case "paste": {
       const text = element("msa-text").value.trim();
       if (text.length === 0) throw new Error("Paste an A3M, or switch the alignment back to none");
-      return singleSequenceIfOnlyQuery(text, chains, "The pasted alignment") ?? text;
+      return fromText(text, "The pasted alignment");
     }
     case "upload": {
       // 🔴 AN ARCHIVE RESTORES THE BLOCKS; A BARE a3m NEVER HAD THEM. This is
@@ -1314,11 +1350,19 @@ async function alignmentText(chains, signal, family, wantsMsa = []) {
       // meaning - one text, recorded as the unpaired block - because that is
       // genuinely all it says.
       if (uploadedMsas?.chains > 0) {
+        if (allOff) return null;
+        // ...per chain here rather than on the merged text, because an
+        // archive HAS the per-chain alignments: the same substitution the
+        // search path makes, one step earlier. A chain that is off is folded
+        // against its own query row and pairs with nothing.
+        const queryOnly = (sequence) => `>101\n${sequence}\n`;
         const merged = mergeSearchedChains({
           sequences: chains,
-          chainA3ms: uploadedMsas.chainA3ms,
+          chainA3ms: uploadedMsas.chainA3ms.map((a3m, index) =>
+            (chainOff[index] ? queryOnly(chains[index]) : a3m)),
           pairedA3ms: new Map(chains.map((chain, index) =>
-            [chain, uploadedMsas.pairedA3ms.get(index)])),
+            [chain, chainOff[index] ? queryOnly(chain)
+              : uploadedMsas.pairedA3ms.get(index)])),
           model: family,
         });
         if (uploadedMsas.chains !== chains.length) {
@@ -1331,7 +1375,7 @@ async function alignmentText(chains, signal, family, wantsMsa = []) {
           ?? { text: merged.a3m, blocks: merged.blocks };
       }
       if (uploadedA3m.length === 0) throw new Error("Choose an A3M file, or switch the alignment back to none");
-      return singleSequenceIfOnlyQuery(uploadedA3m, chains, "The uploaded alignment") ?? uploadedA3m;
+      return fromText(uploadedA3m, "The uploaded alignment");
     }
     case "search": {
       // 🔴 THE ONE REQUEST THIS PAGE MAKES OFF THE MACHINE. Everything else runs

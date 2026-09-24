@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "./harness.js";
-import { parseA3m } from "../src/input/a3m.js";
+import { blankChainColumns, parseA3m } from "../src/input/a3m.js";
 
 describe("A3M parser", () => {
   it("parses the uploaded homolog-rich alignment", async() => {
@@ -56,5 +56,38 @@ describe("A3M parser", () => {
     // ...including one past the code table's end, which is a separate branch.
     expect(() => parseA3m(">query\nACDE\n>bad\nAC\u00c5E\n"))
       .toThrow(/invalid residue/);
+  });
+});
+
+describe("an alignment with one chain's columns blanked", () => {
+  // 🔴 THE PER-CHAIN "NO ALIGNMENT" REACHED THE SEARCH PATH ONLY. Each
+  // searched chain has its own a3m, so turning one off there is a
+  // substitution; a pasted or uploaded alignment is ONE text over the
+  // concatenated chains and the setting did nothing at all - an existing job
+  // with an alignment in the box folded with it however the entity rows were
+  // set. Reported that way.
+  const chains = ["AAAA", "CCCC"];
+  const a3m = [">q", "AAAACCCC", ">h1", "AAAAccGGGG", ">h2", "WWWWYYYY"].join("\n");
+
+  it("gaps the chain that is off and leaves the other alone", () => {
+    const out = blankChainColumns(a3m, chains, [false, true]).split("\n");
+    expect(out[1]).toBe("AAAACCCC");            // the query stands: it is what the chain IS
+    expect(out[3]).toBe("AAAA----");
+    expect(out[5]).toBe("WWWW----");
+  });
+
+  it("counts columns on the uppercase and the dashes, never the insertions", () => {
+    // 🔴 AN INSERTION IS NOT A COLUMN. `cc` sits before column 4, which is
+    // the SECOND chain's first - so blanking the FIRST chain keeps it, and
+    // counting it as a column would slide the span and blank the wrong
+    // residues on every row that has an insertion in it.
+    const out = blankChainColumns(a3m, chains, [true, false]).split("\n");
+    expect(out[3]).toBe("----ccGGGG");
+    expect(out[5]).toBe("----YYYY");
+  });
+
+  it("is the identity when every chain wants its alignment", () => {
+    expect(blankChainColumns(a3m, chains, [false, false])).toBe(a3m);
+    expect(blankChainColumns(a3m, chains, [])).toBe(a3m);
   });
 });
