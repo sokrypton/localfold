@@ -97,6 +97,42 @@ MEASURE = """(() => {
              focused: document.activeElement === after,
              sameNode: after === box,
              value: after === null ? null : after.value });
+  // 🔴 AND DO THE PER-CHAIN SETTINGS SURVIVE THE FOLD PATH. `setChains` is
+  // the alignment-query-wins step - it runs on every fold of a single-chain
+  // job that has an alignment - and it rebuilt every protein row as
+  // `{type, value, copies}`, throwing away the alignment override, the
+  // template and the modifications, which live nowhere else. The setting
+  // vanished from the row before the fold finished and the NEXT fold had
+  // nothing to honour, so it folded with the alignment it had been told not
+  // to use. Reported as both halves of that.
+  //
+  // Driven through `setChains` rather than through a fold: the destructive
+  // step is this one, and a fold needs weights and a GPU.
+  {
+    if (popup() === null) document.querySelector('.entity-options').click();
+    const msa = popup()?.querySelector('.entity-msa-kind');
+    if (msa === null || msa === undefined) {
+      out.push({ kind: 'survives', set: null, kept: null, sameSequence: false });
+      return JSON.stringify(out);
+    }
+    msa.value = 'none';
+    msa.dispatchEvent(new Event('change', { bubbles: true }));
+    const before = window.__entityList.read()[0];
+    window.__entityList.setChains([before.value]);
+    const after = window.__entityList.read()[0];
+    out.push({ kind: 'survives', set: before.msa ?? null, kept: after.msa ?? null,
+               sameSequence: before.value === after.value });
+    // ...and a genuinely different query gets a BARE row, because those
+    // settings belonged to the chain being replaced.
+    window.__entityList.setChains(['MKVLAAGIVGLNLGGK']);
+    const replaced = window.__entityList.read()[0];
+    out.push({ kind: 'replaced', msa: replaced.msa ?? null,
+               value: replaced.value });
+    // ...and the fixture put back for the checks below, which need the
+    // popup open on a row that still exists: `render()` replaced the one
+    // this function captured.
+    window.__entityList.set([before]);
+  }
   return JSON.stringify(out);
 })()"""
 
@@ -118,8 +154,11 @@ def main() -> int:
             return 1
         typing = [row for row in measured if row.get("kind") == "typing"]
         menus = [row for row in measured if row.get("kind") == "menus"]
+        survives = [row for row in measured if row.get("kind") == "survives"]
+        replaced = [row for row in measured if row.get("kind") == "replaced"]
         measured = [row for row in measured
-                    if row.get("kind") not in ("typing", "menus")]
+                    if row.get("kind") not in ("typing", "menus",
+                                               "survives", "replaced")]
         heights = [row["height"] for row in measured]
         widths = [row["width"] for row in measured]
         for row in measured:
@@ -131,6 +170,11 @@ def main() -> int:
         for row in menus:
             print(f"  menus    template {row['template']}")
             print(f"           alignment {row['alignment']}")
+        for row in survives:
+            print(f"  setChains  set {row['set']!r} -> kept {row['kept']!r}"
+                  f"   (same sequence: {row['sameSequence']})")
+        for row in replaced:
+            print(f"  a different query: msa {row['msa']!r}")
         spread = max(heights) - min(heights)
         print(f"height spread {spread}px, width spread {max(widths) - min(widths)}px")
         # 🔴 A FEW PIXELS IS A FONT, NOT A JUMP. The bar is that changing the
@@ -156,6 +200,20 @@ def main() -> int:
                       f" shape: {two} against {one} - they are the same kind"
                       " of control and the popup reads as one only if they"
                       " look it")
+                failed = True
+        for row in survives:
+            if row["set"] != "none":
+                print("FAIL: the alignment menu did not record the setting")
+                failed = True
+            elif row["kept"] != "none":
+                print("FAIL: setChains threw away the chain's alignment"
+                      " setting - the row is rebuilt on every fold that has"
+                      " an alignment, so the next fold has nothing to honour")
+                failed = True
+        for row in replaced:
+            if row["msa"] is not None:
+                print("FAIL: a row for a DIFFERENT sequence kept the old"
+                      " chain's setting")
                 failed = True
         if failed:
             return 1

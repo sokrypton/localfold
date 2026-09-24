@@ -926,8 +926,26 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       const proteins = [];
       for (const chain of chains) {
         const existing = proteins.find((row) => row.value === chain);
-        if (existing === undefined) proteins.push({ type: "protein", value: chain, copies: 1 });
-        else existing.copies += 1;
+        if (existing !== undefined) { existing.copies += 1; continue; }
+        // 🔴 AND THE ROW KEEPS WHAT IT ALREADY SAID ABOUT THIS CHAIN. This
+        // rebuilt every protein row as `{type, value, copies}`, which threw
+        // away the per-chain settings that live nowhere else - the
+        // ALIGNMENT override, the template, the modifications - and it runs
+        // on every fold of a single-chain job that has an alignment at all.
+        // So: turn a chain's alignment off, press Fold, and the setting was
+        // gone from the row before the fold finished; press Fold again and
+        // there was nothing left to honour, which is why it folded with the
+        // alignment. Reported as both halves of exactly that.
+        //
+        // Carried by SEQUENCE, which is what makes it safe: where the
+        // alignment's query really is a different protein there is no row
+        // with that value and the new one is bare, which is right - those
+        // settings belonged to the chain that is being replaced.
+        const had = entities.find(
+          (entity) => entity.type === "protein" && entity.value === chain);
+        proteins.push(had === undefined
+          ? { type: "protein", value: chain, copies: 1 }
+          : { ...had, copies: 1 });
       }
       entities = [...proteins, ...ligands];
       render();

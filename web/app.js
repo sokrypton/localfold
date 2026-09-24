@@ -31,7 +31,8 @@ import { blankChainColumns, foldsAsSingleSequence, parseA3m }
 // fold partway is one of the few ways to get a filled cache and then fold
 // again. test/module-references.test.js now looks for the whole class.
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
-  planSearchReuse, searchCacheEntry } from "../src/input/mmseqs2-api.js";
+  expandSearchedChains, planSearchReuse, searchCacheEntry }
+  from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
@@ -1382,7 +1383,8 @@ async function alignmentText(chains, signal, family, wantsMsa = []) {
       // against weights already on disk. The sequence is sent to the public
       // ColabFold MMseqs2 server, so it is a mode the reader picks rather than
       // a default they discover afterwards.
-      const query = chains.join("");
+      // ...validated over EVERY chain, because every one of them is being
+      // folded. What is SEARCHED for is a subset; see `searchChains`.
       const problem = complexSequenceProblem(chains.join(":"));
       if (problem !== null) throw new Error(problem);
       // 🔴 MULTIMER PAIRS, THE MONOMER STAYS BLOCK-DIAGONAL, and neither is a
@@ -1425,27 +1427,38 @@ async function alignmentText(chains, signal, family, wantsMsa = []) {
       // sequence on row 0 and gaps under it - the model's own representation,
       // not an approximation of one.
       //
-      // 🔴 AND THE SEARCH STILL RUNS FOR IT, WHICH IS WORTH SAYING. Skipping
-      // it would change what is asked of the server and therefore what the
-      // PAIRING is computed over - row s means one organism across the
-      // chains, and dropping a chain from the request is a different question
-      // from ignoring its answer. The cost is one search this fold does not
-      // use; the benefit is that turning the row off cannot change the other
-      // chains' alignments. It also means flipping it back needs no new
-      // search, because the cache holds the whole thing.
+      // 🔴 AND THE SEARCH DOES NOT RUN FOR IT. It used to: the chain was
+      // searched for and its answer thrown away afterwards, on the reasoning
+      // that dropping it from the request changes what the PAIRING is
+      // computed over and so changes the OTHER chains' alignments. That is
+      // true and it is the wrong trade, for two reasons the note it replaces
+      // did not weigh.
+      //
+      // The sequence still went to the public ColabFold server. "No
+      // alignment for this chain" is a reasonable way to say "do not send
+      // this one anywhere", and it did not mean that.
+      //
+      // And pairing picks species present in two or more chains, so keeping
+      // a chain whose alignment is about to be discarded biases which
+      // organisms are paired for the chains that kept theirs. The alignments
+      // it preserved were identical to a fold nobody asked for.
+      //
+      // What it costs: flipping the row back needs a new search, because the
+      // cache now holds what was asked for rather than everything. Reported
+      // as mmseqs2 searching for both chains when only one wanted it.
       const blankMsa = (index) => (wantsMsa[index] === false);
       const someOff = chains.some((_, index) => blankMsa(index));
       const queryOnlyA3m = (sequence) => `>101\n${sequence}\n`;
-      const withoutTheirs = (chainA3ms, pairedA3ms) => ({
-        chainA3ms: chainA3ms.map((a3m, index) =>
-          (blankMsa(index) ? queryOnlyA3m(chains[index]) : a3m)),
-        pairedA3ms: pairedA3ms === undefined ? pairedA3ms
-          : new Map(chains.map((sequence, index) => [sequence,
-            blankMsa(index) ? queryOnlyA3m(sequence) : pairedA3ms.get(sequence)])
-            .filter(([, a3m]) => a3m !== undefined)),
-      });
 
-      const plan = planSearchReuse({ cache: searchCache, chains, family });
+      // WHAT IS ACTUALLY SEARCHED FOR, and therefore what is cached and what
+      // the template hits are numbered in: the chains that asked for an
+      // alignment, in their own order. Everything below maps back.
+      const searchChains = someOff
+        ? chains.filter((_, index) => !blankMsa(index)) : chains;
+      // ...and with none of them asking, nothing is sent at all. This is the
+      // single-sequence path, which every consumer already handles.
+      if (searchChains.length === 0) return null;
+      const plan = planSearchReuse({ cache: searchCache, chains: searchChains, family });
       let searched;
       if (plan.reuse === "single") {
         searched = searchCache.raw.single;
@@ -1453,7 +1466,7 @@ async function alignmentText(chains, signal, family, wantsMsa = []) {
       } else if (plan.reuse === "merge") {
         const { chainA3ms, pairedA3ms, depth, templateHits } = searchCache.raw;
         const merged = mergeSearchedChains({
-          sequences: chains, chainA3ms, pairedA3ms, model: family,
+          sequences: searchChains, chainA3ms, pairedA3ms, model: family,
         });
         // ...and the hits with them. `mergeSearchedChains` re-merges the
         // ALIGNMENTS and knows nothing about templates, so without this a
@@ -1462,24 +1475,43 @@ async function alignmentText(chains, signal, family, wantsMsa = []) {
         searched = { ...merged, depth, templateHits };
         status(`MSA reused · ${depth} sequences`);
       } else {
-        searched = chains.length === 1
-          ? await generateMmseqs2Msa(query, searchOptions)
-          : await generateMmseqs2ComplexMsa(chains, searchOptions);
+        searched = searchChains.length === 1
+          ? await generateMmseqs2Msa(searchChains[0], searchOptions)
+          : await generateMmseqs2ComplexMsa(searchChains, searchOptions);
         status(`MSA search found ${searched.depth} sequences`);
-        searchCache = { key: plan.key, raw: searchCacheEntry({ chains, searched }) };
+        searchCache = { key: plan.key,
+                        raw: searchCacheEntry({ chains: searchChains, searched }) };
       }
-      // ...and the chains that asked for none get theirs taken off, which
-      // means re-merging: the search merged every chain it was given.
-      if (someOff && searchCache?.raw?.chainA3ms !== undefined) {
-        const { chainA3ms, pairedA3ms, depth, templateHits } = searchCache.raw;
-        const kept = withoutTheirs(chainA3ms, pairedA3ms);
+      // ...and the chains that asked for none are put back, as query-only
+      // blocks, in the FOLD's order. What came back covers `searchChains`
+      // alone; everything downstream counts chains the way the entity rows
+      // do, so this is the one place the two numberings meet.
+      if (someOff) {
+        // The parts, from whichever shape holds them: a one-chain search
+        // keeps its result whole (`single`), a complex keeps the per-chain
+        // blocks, and a reused merge has already been turned back into text.
+        const raw = searchCache?.raw ?? {};
+        const parts = searchChains.length === 1
+          ? [raw.single?.a3m ?? searched.a3m]
+          : (raw.chainA3ms ?? searched.chainA3ms);
+        // ...and the two numberings meet in ONE tested function, not here.
+        const { chainA3ms, pairedA3ms, templateHits } = expandSearchedChains({
+          chains,
+          off: chains.map((_, index) => blankMsa(index)),
+          parts,
+          pairedA3ms: searchChains.length === 1
+            ? undefined : (raw.pairedA3ms ?? searched.pairedA3ms),
+          templateHits: raw.templateHits ?? searched.templateHits,
+        });
         searched = { ...searched,
-                     ...mergeSearchedChains({ sequences: chains, ...kept,
-                                              model: family }),
-                     depth, templateHits };
-        const off = chains.filter((_, index) => blankMsa(index)).length;
-        status(`MSA search · ${off} chain${off === 1 ? "" : "s"} folded from`
-               + " its query alone");
+                     ...mergeSearchedChains({ sequences: chains, chainA3ms,
+                                              pairedA3ms, model: family }),
+                     depth: searched.depth,
+                     templateHits };
+        const off = chains.length - searchChains.length;
+        status(`MSA search · ${searchChains.length} chain`
+               + `${searchChains.length === 1 ? "" : "s"} searched, ${off}`
+               + ` folded from ${off === 1 ? "its" : "their"} query alone`);
       }
       // 🔴 THE BLOCKS COME BACK APART, AND AF3 NEEDS THEM THAT WAY. `text` is
       // the paired rows stacked above the unpaired ones, which is what the
@@ -4211,16 +4243,42 @@ async function fold(event) {
     // nothing and is told so - single sequence has no hits, and folding
     // silently without the template someone asked for is the failure this
     // whole path is trying to avoid.
-    const hits = typeof alignmentResult === "string"
+    const searchHits = typeof alignmentResult === "string"
       ? undefined : alignmentResult?.templateHits;
+    // 🔴 THE HITS COUNT PROTEIN CHAINS; A TEMPLATE NAMES A FOLD CHAIN. The
+    // search is handed `proteinChains` and its hits come back numbered in
+    // THAT list, while `template.chain` is the index `expandEntities` gave
+    // it - which counts every polymer, DNA and RNA among them. The two agree
+    // only while every polymer is a protein, so a job with a nucleic chain
+    // BEFORE a protein one read its automatic template off the wrong chain,
+    // or off none. Both numberings exist here and nowhere else, so this is
+    // where they meet.
+    const proteinAt = [];
+    chainKinds.forEach((kind, index) => {
+      if (kind === "protein") proteinAt.push(index);
+    });
+    const hits = searchHits === undefined ? undefined : new Map(
+      [...searchHits].map(([at, found]) => [proteinAt[at] ?? at, found]));
     for (const template of templateSources) {
       if (template.auto !== true) continue;
       const best = (hits?.get(template.chain) ?? [])[0];
       if (best === undefined) {
+        // 🔴 AND TWO SETTINGS FROM THE SAME PANEL CAN CONTRADICT EACH
+        // OTHER. "A template from the MSA search" and "no alignment for
+        // this chain" are both set on the ⋮ menu, and since the search now
+        // covers only the chains that asked for one, the first cannot be
+        // answered for a chain that took the second. Saying "the search
+        // found no template" there would be false - it was never searched
+        // for - and the reader would go looking for a homolog that exists.
         throw new Error(hits === undefined
           ? "Automatic templates need an MSA search: set the MSA to search, or"
             + " name a structure instead."
-          : `The search found no template for chain ${template.chain + 1}.`);
+          : chainMsa[template.chain] === false
+            ? `Chain ${template.chain + 1} asks for a template from the MSA`
+              + " search and for no alignment, and it is not searched for at"
+              + " all - so there are no hits to take one from. Give it an"
+              + " alignment, or name a structure."
+            : `The search found no template for chain ${template.chain + 1}.`);
       }
       status(`Fetching template ${best.target}`);
       const structures = await fetchMmseqs2Templates([best.target], { signal });

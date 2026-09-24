@@ -194,8 +194,9 @@ describe("deduplicating the unpaired block against the paired one", () => {
  * "no alignment for this chain". Nothing in the merge knows the feature
  * exists.
  *
- * The fold path builds these blocks (web/app.js, `withoutTheirs`); what is
- * pinned here is the property it relies on.
+ * The fold path builds these blocks (web/app.js, where the searched chains
+ * are expanded back to the fold's own order); what is pinned here is the
+ * property it relies on.
  */
 describe("a chain folded from its query alone, beside one that is aligned", () => {
   const rowsOf = (text) => text.trim().split("\n").filter((_, i) => i % 2 === 1);

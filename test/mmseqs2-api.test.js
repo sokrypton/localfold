@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "./harness.js";
 import {
+  expandSearchedChains,
   extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa,
   generateMmseqs2PairedMsa, mergeSearchedChains, planSearchReuse, readTarFiles,
   searchCacheEntry,
 } from "../src/input/mmseqs2-api.js";
-import { parseA3m } from "../src/input/a3m.js";
+import { foldsAsSingleSequence, parseA3m } from "../src/input/a3m.js";
 import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES, SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../src/bundles/manifests/index.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
@@ -450,11 +451,38 @@ describe("reusing a search across folds", () => {
   });
 
   it("keeps a one-chain result whole and a complex in parts", () => {
+    // 🔴 THE TWO SHAPES ARE WHY A MONOMER IGNORED "NO ALIGNMENT" FOR A
+    // WHILE. web/app.js takes a chain's alignment off by substituting a
+    // query-only block among the per-chain ones and re-merging, and it asked
+    // `searchCache.raw.chainA3ms !== undefined` first - which is FALSE for
+    // every one-chain job, because that shape keeps the result whole under
+    // `single`. So the commonest job there is skipped the opt-out without a
+    // word and folded with the alignment it had been told not to use.
+    //
+    // Pinned here rather than in the fold path because this is the fact that
+    // misleads: anything reaching for `chainA3ms` is reaching for a field a
+    // monomer's cache entry does not have.
     const searched = { depth: 7, chainA3ms: new Map(), pairedA3ms: new Map(), text: "x" };
-    expect(Object.keys(searchCacheEntry({ chains: ["AAAA"], searched })).sort())
-      .toEqual(["depth", "single", "templateHits"]);
+    const one = searchCacheEntry({ chains: ["AAAA"], searched });
+    expect(Object.keys(one).sort()).toEqual(["depth", "single", "templateHits"]);
+    expect(one.chainA3ms).toBe(undefined);
     expect(Object.keys(searchCacheEntry({ chains: ["AAAA", "CCCC"], searched })).sort())
       .toEqual(["chainA3ms", "depth", "pairedA3ms", "templateHits"]);
+  });
+
+  it("merges a single chain that wants no alignment into its query alone", () => {
+    // ...which is what the fold path builds for that chain, and what makes
+    // the result fold as a single sequence: the query on row 0 and nothing
+    // under it. `singleSequenceIfOnlyQuery` then routes it to the path the
+    // "Single Sequence" mode already uses, template hits and all.
+    const sequence = "GWSTELEKHREELKEFLKKEG";
+    const merged = mergeSearchedChains({
+      sequences: [sequence],
+      chainA3ms: [`>101\n${sequence}\n`],
+      pairedA3ms: undefined,
+      model: "af3",
+    });
+    expect(foldsAsSingleSequence(merged.a3m, sequence)).toBe(true);
   });
 
   it("carries the template hits into the cache, for a complex as for a chain", () => {
@@ -469,5 +497,61 @@ describe("reusing a search across folds", () => {
                        text: "x", templateHits: hits };
     expect(searchCacheEntry({ chains: ["AAAA"], searched }).templateHits).toBe(hits);
     expect(searchCacheEntry({ chains: ["AAAA", "CCCC"], searched }).templateHits).toBe(hits);
+  });
+});
+
+describe("a search over some of the chains, put back in the fold's order", () => {
+  // 🔴 A CHAIN WITH NO ALIGNMENT IS NOT SEARCHED FOR, so what comes back
+  // covers the KEPT chains in their own order while everything downstream
+  // counts chains the way the entity rows do. Every array involved is the
+  // right TYPE either way, so getting this wrong is silent: a chain quietly
+  // reads somebody else's alignment, or somebody else's template.
+  const A = "AAAA", B = "CCCC", C = "DDDD";
+
+  it("puts a query-only block where the chain asked for none", () => {
+    const out = expandSearchedChains({
+      chains: [A, B, C], off: [false, true, false],
+      parts: [">101\nAAAA\n>h\nAAAE\n", ">101\nDDDD\n>h\nDDDE\n"],
+    });
+    expect(out.chainA3ms[0]).toBe(">101\nAAAA\n>h\nAAAE\n");
+    expect(out.chainA3ms[1]).toBe(">101\nCCCC\n");        // its query alone
+    expect(out.chainA3ms[2]).toBe(">101\nDDDD\n>h\nDDDE\n");
+  });
+
+  it("renumbers the template hits from the request into the fold", () => {
+    // The request was [A, C]; hit 1 is C, which is chain 2 of the fold.
+    const hits = new Map([[0, [{ target: "1abc_A" }]], [1, [{ target: "2xyz_B" }]]]);
+    const out = expandSearchedChains({
+      chains: [A, B, C], off: [false, true, false],
+      parts: [">101\nAAAA\n", ">101\nDDDD\n"], templateHits: hits,
+    });
+    expect(out.templateHits.get(0)[0].target).toBe("1abc_A");
+    expect(out.templateHits.get(2)[0].target).toBe("2xyz_B");
+    expect(out.templateHits.has(1)).toBe(false);           // never searched for
+  });
+
+  it("keeps the paired block for a sequence any copy of which is aligned", () => {
+    // 🔴 THE PAIRED BLOCK IS PER SEQUENCE. Two chains that are the same
+    // protein share one entry, so writing both into a Map lets whichever
+    // comes last decide for both - and with one copy off, that silently
+    // took the alignment away from the copy that wanted it.
+    const paired = new Map([[A, ">101\nAAAA\n>h\nAAAE\n"]]);
+    const out = expandSearchedChains({
+      chains: [A, A], off: [false, true],
+      parts: [">101\nAAAA\n>h\nAAAE\n"], pairedA3ms: paired,
+    });
+    expect(out.pairedA3ms.get(A)).toBe(">101\nAAAA\n>h\nAAAE\n");
+    // ...and gone when every chain carrying it asked for none.
+    const none = expandSearchedChains({
+      chains: [A, A, B], off: [true, true, false],
+      parts: [">101\nCCCC\n"], pairedA3ms: new Map([[A, "x"], [B, "y"]]),
+    });
+    expect(none.pairedA3ms.get(A)).toBe(">101\nAAAA\n");
+  });
+
+  it("refuses a result that does not cover the chains that were kept", () => {
+    expect(() => expandSearchedChains({
+      chains: [A, B], off: [false, false], parts: [">101\nAAAA\n"],
+    })).toThrow(/covers 1 chains and 2 were kept/);
   });
 });
