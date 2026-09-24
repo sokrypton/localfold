@@ -1291,6 +1291,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
       coordinates, seqMask: structural.structural.seqMask,
       atomToToken, atomToSlot, atomCount: n * dense,
       extraPairBias: structural.attentionBias,
+      // 🔴 THE TOKEN COUNT pTM IS REPORTED OVER, which is the RESIDUE tokens
+      // and not this head's structural ones: d0 is a function of how many
+      // tokens the score covers, and the two part company the moment a ligand
+      // or a modified residue expands the structural set. Passing it is what
+      // turns the head's PAE distribution into a tm-adjusted PAE - see the
+      // note at the return below.
+      tmTokens: tokens,
     }, weights.openddeConfidence, weights.trunk.dialect);
 
     // Per-atom scores, scattered onto the residue layout.
@@ -1305,6 +1312,16 @@ export async function foldBatch(device, batch, weights, options = {}) {
     for (let i = 0; i < tokens; i += 1) {
       for (let j = 0; j < tokens; j += 1) pae[i * tokens + j] = raw.pae[rep[i] * n + rep[j]];
     }
+    // ...and the TM-adjusted PAE through the same gather, because pTM is
+    // reduced over the residue tokens the rest of the pipeline reports.
+    const tmAdjusted = raw.tm === undefined ? undefined : new Float32Array(tokens * tokens);
+    if (tmAdjusted !== undefined) {
+      for (let i = 0; i < tokens; i += 1) {
+        for (let j = 0; j < tokens; j += 1) {
+          tmAdjusted[i * tokens + j] = raw.tm[rep[i] * n + rep[j]];
+        }
+      }
+    }
     // 🔴 A DIAGNOSTIC, because a confidence that does not move with the
     // structure is a confidence that is not reading it.
     let span = 0;
@@ -1314,7 +1331,17 @@ export async function foldBatch(device, batch, weights, options = {}) {
       live += 1;
       span = Math.max(span, Math.abs(coordinates[token * 3]));
     }
-    return { plddt, pae, tmAdjusted: undefined, opendde: raw,
+    // 🔴 AND pTM IS NOT ABSENT ANY MORE. It was, on the reading that OpenDDE's
+    // head "emits pLDDT, PAE, PDE and experimentally-resolved and nothing
+    // else" - true of the head's OUTPUTS and beside the point: pTM is the
+    // arithmetic AlphaFold 3 applies to a PAE DISTRIBUTION, and OpenDDE's is
+    // on the same 64 bins over [0, 32]. Upstream (sokrypton/alphafold3) makes
+    // exactly this call - `confidence_head.tmscore_adjusted_pae` is module
+    // level and says why: "OpenDDE has its own confidence head whose outputs
+    // still have to reach the same pTM/ipTM the rest of the pipeline reports".
+    // What was missing here was the DISTRIBUTION: the readout kept the
+    // expectation and dropped the logits, so there was nothing left to adjust.
+    return { plddt, pae, tmAdjusted, opendde: raw,
              coordinateCheck: { live, tokens: n, span: Number(span.toFixed(3)) } };
   };
 
@@ -1377,11 +1404,16 @@ export async function foldBatch(device, batch, weights, options = {}) {
     }
     meanPlddt = total / atoms;
 
-    // 🔴 pTM NEEDS A TM TERM, AND NOT EVERY HEAD WRITES ONE. AlphaFold 3's
-    // confidence head emits one alongside the PAE; OpenDDE's emits pLDDT, PAE,
-    // PDE and experimentally-resolved and nothing else - so pTM and ipTM are
-    // ABSENT there rather than derived from the PAE, which would be a
-    // different quantity wearing pTM's name.
+    // 🔴 pTM NEEDS THE PAE DISTRIBUTION, AND A HEAD THAT KEEPS ONLY ITS MEAN
+    // CANNOT GIVE ONE. AlphaFold 3's head emits a tm-adjusted PAE beside the
+    // expectation; OpenDDE's emits pLDDT, PAE, PDE and experimentally-resolved
+    // - and its PAE is a distribution over the same 64 bins, so the same
+    // arithmetic applies to it. It was read here as "no pTM for OpenDDE",
+    // which was the wrong conclusion from the right observation: what was
+    // missing was not the quantity but the LOGITS, which the readout threw
+    // away. They are reduced to a tm term in the readout now (see
+    // `tmTokens` above), and the only head left without one is a model with
+    // no confidence head at all - where `scores` itself is absent.
     const asymId = batch.asymId;
     const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
     if (scores.tmAdjusted !== undefined) {

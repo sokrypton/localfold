@@ -220,6 +220,45 @@ describe("what a fold is called", () => {
     assert.equal([...app.matchAll(/foldStem\(/g)].length, 4,
       "foldStem should be declared once and called on all three fold paths");
   });
+
+  /**
+   * 🔴 A NEW FOLD MUST NOT OPEN AN OBJECT IT DID NOT MAKE. `openBlankFold`
+   * REWINDS the object it opens, so a stem that collides with something
+   * else on screen empties that instead. A restored session is very often
+   * the same job under the same name, so folding after restoring it
+   * destroyed the restored fold: nothing removed it, it was overwritten,
+   * which is worse - the name and the picker entry stay and the frames are
+   * gone. Reported twice.
+   *
+   * 🔴 AND THAT NOW INCLUDES OUR OWN PREVIOUS FOLD. It used to be taken out
+   * of the set - reusing it was the whole of one fold at a time - and folds
+   * accumulate now, each its own object in the picker, so a name on the page
+   * is taken whoever put it there. Reported as "starting new prediction
+   * deletes the previous prediction/object".
+   *
+   * The SHIPPED function is evaluated here rather than described, with the
+   * registry stubbed, because the rule is three lines of arithmetic and a
+   * text scan of them says nothing about what they answer.
+   */
+  it("keeps a new fold off every object already on the page", () => {
+    const src = app.slice(app.indexOf("function uniqueStem("));
+    const body = src.slice(0, src.indexOf("\n}") + 2);
+    const resolve = (objects, ours) => {
+      const objectsData = Object.fromEntries(objects.map((n) => [n, {}]));
+      const stub = { py2dmol_viewers: { one: { renderer: { objectsData } } } };
+      // eslint-disable-next-line no-new-func
+      return new Function("window", "lastFoldStem",
+                          `${body}\nreturn uniqueStem;`)(stub, ours)("design_a");
+    };
+    // a restored fold of the same job is NOT ours to open
+    assert.equal(resolve(["design_a"], undefined), "design_a_2");
+    // ...and NEITHER IS OUR OWN, now that a fold keeps its object
+    assert.equal(resolve(["design_a"], "design_a"), "design_a_2");
+    // ...so a third fold of the same job steps past both
+    assert.equal(resolve(["design_a", "design_a_2"], "design_a"), "design_a_3");
+    // ...and an empty page needs no suffix at all
+    assert.equal(resolve([], undefined), "design_a");
+  });
 });
 
 describe("the trunk cache", () => {

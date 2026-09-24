@@ -1,12 +1,24 @@
-"""A result belongs to the model that made it, and the viewers say so.
+"""One fold at a time, and a model row that starts a new session.
 
     python3 tools/check-model-pending.py
 
 🔴 SWITCHING THE MODEL ROW USED TO LEAVE THE PREVIOUS MODEL'S ANSWER ON SCREEN
 under the new model's name. The structure, the contact map and the confidence
 numbers look exactly the same whichever row is selected above them, so there
-is nothing in the picture that says it is the other model's - reported as
-wanting the viewers to show PENDING instead of the previous result.
+is nothing in the picture that says it is the other model's.
+
+🔴 IT WAS ANSWERED WITH A COVER FIRST, AND THAT WAS THE WRONG SHAPE OF ANSWER.
+A "pending" panel went over the result, with a rule for when it lifted and a
+list of which parts it hid - and it hid two boxes while the play strip, the
+MSA and the session download went on describing the fold underneath, so the
+page said pending and looked finished. Pressing Fold dropped it, handing the
+old result straight back for the whole of the trunk. Every one of those is a
+question that only exists because something stale was being kept.
+
+WHAT THE PAGE DOES NOW: every fold is its own object, listed in the picker,
+and every panel reads the object being edited. There is nothing to cover, mark
+or lift, and nothing to throw away either: the model row chooses what the next
+fold uses and says nothing about what is on screen.
 
 WHAT IT CHECKS, on a real page with a real result in it:
 
@@ -14,13 +26,11 @@ WHAT IT CHECKS, on a real page with a real result in it:
     "folded on:" in the dev report and no download row, on the page that folds
     in the reader's own browser - every rule here is conditioned on
     `?backend=colab` and this is what says so;
-  * a result ingested under AlphaFold 3 is NOT veiled while that row is set;
-  * moving the row to another model veils the structure box and the map box,
-    names the model the page is now set to, and takes the scores card away -
-    a stale pLDDT reads as a measurement rather than as a leftover;
-  * moving it BACK unveils, because the result really is that model's;
-  * and the AF2 number row does it too, since `chosenFamily` reads that select
-    as well and a veil hung on one row only is a model switched in silence;
+  * a result that lands is ON SCREEN, and the first fold makes one object;
+  * moving the model row changes NOTHING on screen - the fold, its panels and
+    its downloads stay, because the row says what to fold next and the panels
+    describe the object being edited;
+  * and moving it back changes nothing either;
   * THE DOWNLOAD ROW OFFERS WHAT THERE IS TO DOWNLOAD: nothing before the
     first fold, the fold's own files once there is one, neither while another
     model is selected - and the SESSION button all the while, because that one
@@ -53,10 +63,10 @@ WHAT IT CHECKS, on a real page with a real result in it:
     saying why, and the structure, plots and downloads it already has still
     there. It does not RELOAD - the server it was served by is what stopped.
 
-🔴 THE VEIL IS MEASURED AS PIXELS, not as a class. A class name is set by the
-page and says nothing about whether a stylesheet arrived; `.result-pending`
-with no rule behind it is a viewer that still shows the wrong model's answer.
-The structure box is screenshotted before and after.
+🔴 AND IT IS MEASURED AS WHAT A READER SEES - computed `display`, the objects
+in the renderer and the frames in them - rather than as a class or a flag. The
+cover that came before this was measured as a class first, which says a page
+set an attribute and nothing about whether a stylesheet arrived.
 
 🔴 AND THE RESULT GETS ONTO THE PAGE THROUGH tools/colab_backend.py, WHICH IS A
 FIXTURE HERE AND NOT THE SUBJECT. A fold needs weights and a card; the broker
@@ -154,17 +164,34 @@ def box_shot(ws, selector="canvasContainer"):
     return base64.b64decode(shot["data"])
 
 
-def veil_of(ws, box_id):
+def page_of(ws):
+    """Is the page showing a fold, or is it empty the way a fresh one is?
+
+    🔴 THERE WAS A COVER, AND NOW THERE IS NOTHING TO COVER. Moving the model
+    row used to leave the previous model's answer on screen, so it was veiled
+    - and the simpler answer is that a row move starts a new session, which
+    is an EMPTY page. So what this asks is what a reader sees: is the viewer
+    up, is there a structure in it, is the download row offering anything,
+    is the scores card there.
+    """
     return cdp.evaluate(ws, """(() => {
-      const box = document.getElementById(%s);
-      if (box === null) return null;
-      const after = getComputedStyle(box, '::after');
-      return { marked: box.classList.contains('result-pending'),
-               says: after.content,
-               paint: after.backgroundColor,
-               scores: getComputedStyle(
-                 document.getElementById('predictionScoresBox')).display };
-    })()""" % json.dumps(box_id))
+      const shown = (id) => {
+        const el = document.getElementById(id);
+        return el === null ? 'absent' : getComputedStyle(el).display;
+      };
+      const reg = window.py2dmol_viewers || {};
+      const r = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+      const objects = Object.keys(r && r.objectsData ? r.objectsData : {});
+      const drawn = objects.reduce((total, name) =>
+        total + ((r.objectsData[name].frames || []).length), 0);
+      return { viewer: shown('viewer-container'),
+               strip: shown('sequence-viewer-container'),
+               msa: shown('msa-buttons'),
+               downloads: shown('downloads'),
+               scores: shown('predictionScoresBox'),
+               objects: objects.length,
+               frames: drawn };
+    })()""")
 
 
 def downloads_of(ws):
@@ -323,7 +350,19 @@ try:
       const pdb = %s;
       bridge.tapOut('result', { pdb, atoms: 6, status: 'AlphaFold 3 · 6 residues',
         scores: {}, confidence: { meanPlddt: 88.1, ptm: 0.71 },
-        predJson: JSON.stringify({ model: 'AlphaFold 3', stem: 'pending_test', pdb,
+        // 🔴 THE LABEL IS A LIE HERE, DELIBERATELY, AND THAT IS THE TEST.
+        // The reader used to recover "whose result is this" by reverse-lookup
+        // of `model` in MODEL_LABELS - a map that is neither total nor
+        // one-to-one, so the AF2 path's own `AlphaFold 2 (monomer-3)` (the
+        // table says `AlphaFold 2 (model 3)`) resolved to undefined and NO
+        // AF2 FOLD EVER VEILED in Colab mode. It reads `family` now. With
+        // the two disagreeing, legs 1 and 2 below tell the readings apart:
+        // by family this is AlphaFold 3's, so it is bare under AF3 and
+        // covered under Boltz-2 - and by label it would be exactly the other
+        // way round. Every other leg is unaffected, because every one of
+        // them is about the family.
+        predJson: JSON.stringify({ model: 'Boltz-2', family: 'af3',
+          stem: 'pending_test', pdb,
           confidence: { meanPlddt: 88.1, ptm: 0.71,
             // 🔴 THE SHAPE A TYPED ARRAY TRAVELS IN. JSON has none, so the
             // runtime tags each one with its kind; flattened to a plain array
@@ -361,79 +400,40 @@ try:
         bad.append("a fold landed and the download row stayed hidden")
     if ready["pdb"]["off"] or ready["all"]["off"] or ready["session"]["off"]:
         bad.append("a fold landed and its own downloads are still off")
-    rest = veil_of(reader_ws, "canvasContainer")
-    before = box_shot(reader_ws)
-    print(f"  under AlphaFold 3: marked={rest['marked']} says={rest['says']}")
-    if rest["marked"]:
-        bad.append("the result is veiled under the very model that made it")
+    here = page_of(reader_ws)
+    print(f"  a fold on screen: viewer={here['viewer']} objects={here['objects']}"
+          f" frames={here['frames']} scores={here['scores']}")
+    if here["viewer"] == "none" or here["frames"] == 0:
+        bad.append(f"the fold that just landed is not on screen: {here}")
+    if here["objects"] != 1:
+        bad.append(f"the page holds {here['objects']} objects - one fold at a"
+                   " time is the whole of this page's model, and py2Dmol's"
+                   " picker is hidden on the strength of it")
 
-    # 2 · another model: veiled, named, and the numbers gone.
-    set_row(reader_ws, "model-family", "boltz2")
-    moved = veil_of(reader_ws, "canvasContainer")
-    map_veil = veil_of(reader_ws, "heatmapContainer")
-    after = box_shot(reader_ws)
-    print(f"  under Boltz-2:      marked={moved['marked']} says={moved['says']}"
-          f" paint={moved['paint']} scores={moved['scores']}")
-    if not moved["marked"]:
-        bad.append("switching the model left the previous model's result"
-                   " unmarked - the viewers claim it as this model's")
-    if "Boltz-2" not in (moved["says"] or ""):
-        bad.append(f"the veil says {moved['says']!r}, which does not name the"
-                   " model the page is now set to")
-    if moved["paint"] in ("rgba(0, 0, 0, 0)", "transparent"):
-        bad.append("the veil has no paint of its own, so the structure it is"
-                   " meant to cover shows through - the stylesheet did not"
-                   " arrive, whatever the class says")
-    if moved["scores"] != "none":
-        bad.append("the confidence card is still up under another model -"
-                   " a stale pLDDT reads as a measurement")
-    if not map_veil["marked"]:
-        bad.append("the contact map is not veiled, only the structure")
-    # ...and the files go with the picture, because offering the covered
-    # model's structure is the same claim the veil exists to stop making.
-    veiled = downloads_of(reader_ws)
-    print(f"  under Boltz-2:      pdb off={veiled['pdb']['off']}"
-          f" ({veiled['pdb']['why']!r}) session off={veiled['session']['off']}")
-    if not veiled["pdb"]["off"] or not veiled["all"]["off"]:
-        bad.append("the downloads still offer the other model's fold while"
-                   " its picture is veiled - the same claim, one control along")
-    if "another model" not in (veiled["pdb"]["why"] or ""):
-        bad.append(f"the disabled download says {veiled['pdb']['why']!r},"
-                   " which does not say why it is off")
-    if veiled["session"]["off"]:
-        bad.append("the session download went off with the fold's - it is"
-                   " about what the VIEWER is showing, which has not changed")
-    if before == after:
-        bad.append("the structure box is pixel-identical before and after the"
-                   " switch - nothing was actually drawn over it")
-    else:
-        print(f"  the box redrew: {len(before)} -> {len(after)} bytes of png")
-
-    # 3 · back again: the result really is AlphaFold 3's.
-    set_row(reader_ws, "model-family", "af3")
-    back = veil_of(reader_ws, "canvasContainer")
-    print(f"  back to AlphaFold 3: marked={back['marked']} scores={back['scores']}")
-    if back["marked"]:
-        bad.append("switching back to the model that made the result left the"
-                   " veil up - the answer on screen is that model's")
-    if back["scores"] == "none":
-        bad.append("the confidence card did not come back with its own model")
-    restored = downloads_of(reader_ws)
-    if restored["pdb"]["off"] or restored["all"]["off"]:
-        bad.append("the downloads did not come back with the model that made"
-                   " the fold on screen")
-    if restored["pdb"]["why"] != ready["pdb"]["why"]:
-        bad.append(f"the button came back wearing the reason it was off:"
-                   f" {restored['pdb']['why']!r}")
-
-    # 4 · the AF2 number row moves the family too.
-    set_row(reader_ws, "model-family", "monomer")
-    set_row(reader_ws, "af2Model", "3")
-    af2 = veil_of(reader_ws, "canvasContainer")
-    print(f"  under AlphaFold 2 model 3: marked={af2['marked']} says={af2['says']}")
-    if not af2["marked"]:
-        bad.append("the AF2 number row changed the family without veiling -"
-                   " chosenFamily reads that select too")
+    # ...and a session written from it WHILE IT IS STILL HERE, for the
+    # restore-then-fold leg further down. It cannot write its own: by the
+    # time it runs, the model-switch leg has emptied the page, and
+    # `buildViewerState` of an empty viewer is a session with no objects in
+    # it - measured, the restore then put nothing on screen and the leg
+    # passed having asked nothing.
+    sessionWritten = cdp.evaluate(reader_ws, """(async () => {
+      const store = await import('/web/fold-session.js');
+      const state = window.buildViewerState?.();
+      if (!state) return 'no buildViewerState';
+      state.localfold = { stem: 'restored_fold', model: 'AlphaFold 3',
+                          family: 'af3', savedAt: Date.now(),
+                          sequence: 'GWSTELEKHRSVQ' };
+      // ...under the name a reader would see it by, which is also the name
+      // that must survive the fold below.
+      for (const o of state.objects || []) o.name = 'restored_fold';
+      if (state.viewer_state) state.viewer_state.current_object_name = 'restored_fold';
+      await store.saveSession(state);
+      return 'saved';
+    })()""")
+    print(f"  a session was written: {sessionWritten}")
+    if sessionWritten != "saved":
+        bad.append(f"could not write a session to restore ({sessionWritten}),"
+                   " so the restore-then-fold leg was never driven")
 
     # 5 · AND THE DOWNLOAD ACTUALLY WRITES SOMETHING, in Colab mode, which is
     #     the question a flag cannot answer: `download-pdb` reads the
@@ -512,6 +512,240 @@ try:
     if "device memory: not measured" in report:
         bad.append("the report still claims this machine's device memory was"
                    " not measured, which is a statement about the wrong one")
+
+    # 6b · 🔴 MOVING THE MODEL ROW STARTS A NEW SESSION, WHICH IS AN EMPTY
+    #      PAGE. It used to leave the previous model's structure, map, scores
+    #      and downloads on screen under the new model's name; then it veiled
+    #      them; then a switch EMPTIED the page - one fold at a time, each its
+    #      own session. Reported first as "switching models looks finished",
+    #      then as a cover that showed a play button, an MSA and a session
+    #      download through it.
+    #
+    #      🔴 AND NOW IT CHANGES NOTHING AT ALL, which is the third answer and
+    #      the one that needed no mechanism. Folds accumulate - every fold is
+    #      its own object in the picker - and every panel reads
+    #      `activePrediction()`, keyed by the object being edited: the scores
+    #      card and the downloads describe what you are LOOKING at, the row
+    #      describes what you are about to MAKE. Reported as "starting new
+    #      prediction deletes the previous prediction/object".
+    set_row(reader_ws, "model-family", "boltz2")
+    time.sleep(1.0)
+    kept = page_of(reader_ws)
+    print(f"  after switching to Boltz-2: viewer={kept['viewer']}"
+          f" objects={kept['objects']} frames={kept['frames']}"
+          f" downloads={kept['downloads']} scores={kept['scores']}")
+    if kept["objects"] != 1 or kept["frames"] == 0:
+        bad.append(f"switching the model took the fold away:"
+                   f" {kept['objects']} object(s), {kept['frames']} frame(s)"
+                   " - the row says what to fold NEXT and nothing about what"
+                   " is on screen")
+    for part in ("viewer", "downloads"):
+        if kept[part] in ("none", "absent"):
+            bad.append(f"the {part} went away on a model switch ({kept[part]})"
+                       " - a fold keeps its object and its panels")
+    live_downloads = downloads_of(reader_ws)
+    if live_downloads["pdb"]["off"] or live_downloads["all"]["off"]:
+        bad.append("the downloads went off on a model switch - they describe"
+                   " the fold on screen, which is still there")
+
+    # ...and back, which must also change nothing.
+    set_row(reader_ws, "model-family", "af3")
+    time.sleep(1.0)
+    still = page_of(reader_ws)
+    print(f"  ...and back to AlphaFold 3: objects={still['objects']}"
+          f" frames={still['frames']}")
+    if still["objects"] != kept["objects"] or still["frames"] != kept["frames"]:
+        bad.append(f"moving the row back changed the page: {kept} -> {still}")
+
+    # 🔴 AND NOTHING ELSE A READER TOUCHES TAKES THE RESULT AWAY EITHER.
+    #      Asked for in one line: "the results from previous run should not
+    #      disappear until user hits fold". Setting up the next run is
+    #      typing in a sequence and moving five controls, and every one of
+    #      them used to be a `change` event on a page that cleared itself -
+    #      the model row was the loud one, and the rest are the same shape.
+    #      What may change the picture is pressing Fold.
+    before_edits = page_of(reader_ws)
+    edits = [("recycles", "3"), ("random-seed", "7"), ("msa-mode", "none"),
+             ("af3-mode", "diffusion")]
+    for row_id, value in edits:
+        # ...a SELECT takes only a value it has; a number box takes any.
+        kind = cdp.evaluate(reader_ws,
+            "(() => { const r = document.getElementById(%s);"
+            " return r === null ? 'absent'"
+            "   : (r.options ? ([...r.options].some((o) => o.value === %s)"
+            "     ? 'has' : 'no') : 'input'); })()"
+            % (json.dumps(row_id), json.dumps(value)))
+        if kind in ("has", "input"):
+            set_row(reader_ws, row_id, value)
+    # ...and the sequence itself, through the row's own input event.
+    cdp.evaluate(reader_ws, """(() => {
+      const box = document.querySelector('.entity-sequence, #sequence, textarea');
+      if (box === null) return false;
+      box.value = 'GWSTELEKHRSVQMD';
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()""")
+    time.sleep(1.0)
+    after_edits = page_of(reader_ws)
+    print(f"  after editing the inputs: objects={after_edits['objects']}"
+          f" frames={after_edits['frames']} downloads={after_edits['downloads']}"
+          f" scores={after_edits['scores']}")
+    for field in ("objects", "frames", "viewer", "downloads", "scores"):
+        if after_edits[field] != before_edits[field]:
+            bad.append(f"editing the inputs changed {field}:"
+                       f" {before_edits[field]} -> {after_edits[field]}."
+                       " Setting up the next run is not running it")
+
+    # 6c · 🔴 A RESTORED FOLD SURVIVES THE NEXT FOLD, WHICH IS THE WHOLE
+    #      POINT OF RESTORING IT BESIDE. Reported three times - "past object
+    #      still lost in object list" - and reasoned about twice before it
+    #      was ever DRIVEN. The sequence is restore, then fold, and what a
+    #      reader looks at is the picker.
+    #
+    #      🔴 THE SESSION IS WRITTEN THROUGH THE STORE'S OWN DOOR, because
+    #      the Colab reader never writes one: `rememberSessionWhenSettled`
+    #      is called by the three LOCAL fold paths and the reader takes a
+    #      finished prediction instead. The first version of this waited 40
+    #      seconds for a session row that could never appear.
+    picker = lambda: cdp.evaluate(reader_ws,
+        "[...(document.getElementById('objectSelect')?.options ?? [])]"
+        ".map((o) => o.value)")
+    # 🔴 AND A SKIP IS LOUD. This was `if wrote == "saved"`, and leg 5 above
+    # assigns `wrote` too - the bytes its download button produced - so the
+    # test was False, the whole leg was skipped in silence, and the run came
+    # back green having asked nothing. The name is its own now and the else
+    # says so.
+    if sessionWritten != "saved":
+        bad.append("the restore-then-fold leg did not run at all")
+    else:
+        reader_ws.call("Page.navigate",
+                       url=f"{BASE}/index.html?backend=colab&t={TOKEN}")
+        cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader, for the restore")
+        offered, deadline2 = False, time.time() + 30
+        while time.time() < deadline2:
+            offered = bool(cdp.evaluate(reader_ws,
+                "!document.getElementById('session')?.hidden"))
+            if offered:
+                break
+            time.sleep(0.5)
+        print(f"  the session is offered: {offered}")
+        if not offered:
+            bad.append("the saved session is not offered on a fresh page")
+        else:
+            cdp.evaluate(reader_ws,
+                         "document.getElementById('session-restore').click(), 1")
+            two, deadline2 = [], time.time() + 40
+            while time.time() < deadline2:
+                two = picker() or []
+                if two:
+                    break
+                time.sleep(0.5)
+            print(f"  restored: {two}")
+            if not two:
+                bad.append("restoring put nothing in the object list")
+            else:
+                # 🔴 AND THE MODEL ROW MOVES FIRST, WHICH IS THE REPORT.
+                # "run AlphaFold 3, close the window, reopen, restore - it is
+                # listed - run Boltz-2, and the AlphaFold 3 object
+                # disappears." It was not the fold that took it: choosing
+                # which model to run NEXT called startNewSession, which
+                # cleared every object. A new session ends the fold THIS PAGE
+                # made, and after a reopen there is none - the one object on
+                # screen is the reader's.
+                set_row(reader_ws, "model-family", "boltz2")
+                time.sleep(1.5)
+                kept = picker() or []
+                print(f"  ...after switching to Boltz-2: {kept}")
+                gone = [name for name in two if name not in kept]
+                if gone:
+                    bad.append(f"choosing another model took {gone} out of"
+                               f" the object list - {two} became {kept}. A"
+                               " restored fold is the reader's; a new session"
+                               " ends the one this page folded")
+                # ...and now FOLD, which is where it was going missing. The
+                # reader's own button, and a frame from the runtime, which is
+                # what takes openBlankFold through remoteFrameDrawer.
+                cdp.evaluate(reader_ws,
+                             "document.getElementById('predict').click(), 1")
+                running = False
+                for _ in range(40):
+                    running = bool(cdp.evaluate(reader_ws,
+                        "!!window.__foldState?.running"))
+                    if running:
+                        break
+                    time.sleep(0.5)
+                print(f"  a fold is running: {running}")
+                if not running:
+                    bad.append("the reader did not start a fold, so the"
+                               " object list below was never asked the"
+                               " question this leg exists for")
+                cdp.evaluate(runtime_ws, """(async () => {
+                  const bridge = await import('/web/colab-bridge.js');
+                  bridge.tapOut('frame', %s);
+                  return true;
+                })()""" % json.dumps(tiny_pdb()))
+                after, deadline2 = two, time.time() + 40
+                while time.time() < deadline2:
+                    after = picker() or []
+                    if len(after) > len(two):
+                        break
+                    time.sleep(0.5)
+                print(f"  ...then folded: {two} -> {after}")
+                lost = [name for name in two if name not in after]
+                if lost:
+                    bad.append(f"the fold took {lost} out of the object list -"
+                               f" {two} became {after}. A fold recycles its"
+                               " OWN object; anything restored was asked for"
+                               " by hand and stays")
+                # ...and the fold is left in flight deliberately: the
+                # block below navigates, which discards it, where pressing
+                # Stop leaves "Stopping prediction…" on the status line for
+                # leg 9 to read.
+
+    # ...and PUT ONE BACK, because the legs below need a fold on screen and
+    # the two above have just spent it: leg 9 asks whether a page whose
+    # runtime has gone can still hand over the fold it already made, and on
+    # an empty page that question has no subject. Measured - without this it
+    # reported "the downloads went with the runtime" against a page that had
+    # nothing to give. The path is the fixture's own: raise `folding` on the
+    # broker, open the reader again so it attaches, push the result.
+    call("/in", {"op": "fold", "payload": {
+        "entities": [{"type": "protein", "value": "GWSTELEKHRSVQ", "copies": 1}]}})
+    reader_ws.call("Page.navigate",
+                   url=f"{BASE}/index.html?backend=colab&t={TOKEN}")
+    cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader, again")
+    again, deadline2 = "", time.time() + 30
+    while time.time() < deadline2:
+        again = cdp.evaluate(reader_ws,
+            "document.getElementById('status-message')?.textContent ?? ''")
+        if "already running" in again:
+            break
+        time.sleep(0.5)
+    cdp.evaluate(runtime_ws, """(async () => {
+      const bridge = await import('/web/colab-bridge.js');
+      const pdb = %s;
+      bridge.tapOut('result', { pdb, atoms: 6, status: 'AlphaFold 3 · 6 residues',
+        scores: {}, confidence: { meanPlddt: 88.1, ptm: 0.71 },
+        predJson: JSON.stringify({ model: 'AlphaFold 3', family: 'af3',
+          stem: 'pending_test', pdb,
+          confidence: { meanPlddt: 88.1, ptm: 0.71,
+            plddt: { __typed: 'Float32Array', v: [88.1, 90.2, 71.0, 65.5, 80.0, 92.3] },
+            predictedAlignedError: { __typed: 'Float32Array',
+                                     v: Array.from({ length: 36 }, (unused, i) => i / 4) } } }) });
+      return true;
+    })()""" % json.dumps(tiny_pdb()))
+    reland, deadline2 = {}, time.time() + 60
+    while time.time() < deadline2:
+        reland = page_of(reader_ws)
+        if reland.get("frames", 0) > 0:
+            break
+        time.sleep(0.5)
+    print(f"  a fold is back on screen: objects={reland.get('objects')}"
+          f" frames={reland.get('frames')}")
+    if reland.get("frames", 0) == 0:
+        bad.append("the second result never landed, so every leg below is"
+                   " about an empty page rather than about a fold")
 
     # 7 · THE BADGE: where Fold runs, and whether it is still there.
     badge = cdp.evaluate(reader_ws, """(() => {

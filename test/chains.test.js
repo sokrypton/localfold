@@ -1,7 +1,8 @@
 import { describe, expect, it } from "./harness.js";
 import {
   chainIdentity, deduplicateUnpairedAgainstPaired,
-  mergeChainA3ms, mergeUnpairedChainA3ms, residueIndexWithChainBreaks,
+  mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms,
+  residueIndexWithChainBreaks,
   splitComplexA3mByChain,
   validatedChainLengths,
 } from "../src/input/chains.js";
@@ -182,5 +183,36 @@ describe("deduplicating the unpaired block against the paired one", () => {
     const unpaired = ">query\nACDE\n>u1\nAC-E\n";
     expect(deduplicateUnpairedAgainstPaired(unpaired, null)).toBe(unpaired);
     expect(deduplicateUnpairedAgainstPaired(unpaired, undefined)).toBe(unpaired);
+  });
+});
+
+/**
+ * A CHAIN WITH ITS ALIGNMENT TURNED OFF IS A QUERY-ONLY BLOCK, and this is
+ * why that representation was chosen over anything the merge would have had
+ * to learn: it already pads a short chain with gaps, so the result is the
+ * real sequence on row 0 and gaps under it - which is what AlphaFold reads as
+ * "no alignment for this chain". Nothing in the merge knows the feature
+ * exists.
+ *
+ * The fold path builds these blocks (web/app.js, `withoutTheirs`); what is
+ * pinned here is the property it relies on.
+ */
+describe("a chain folded from its query alone, beside one that is aligned", () => {
+  const rowsOf = (text) => text.trim().split("\n").filter((_, i) => i % 2 === 1);
+
+  it("keeps its own sequence on the query row and gaps below it", () => {
+    const aligned = ">101\nGWSTELEK\n>h1\nGWSTELEA\n>h2\nGWSTELEC\n";
+    const queryOnly = ">101\nPIAQIHIL\n";
+    const rows = rowsOf(mergeRowAlignedChainA3ms([aligned, queryOnly]));
+    expect(rows).toEqual([
+      "GWSTELEKPIAQIHIL",
+      "GWSTELEA--------",
+      "GWSTELEC--------",
+    ]);
+  });
+
+  it("is the whole alignment when every chain is turned off", () => {
+    const rows = rowsOf(mergeRowAlignedChainA3ms([">101\nGWST\n", ">101\nPIAQ\n"]));
+    expect(rows).toEqual(["GWSTPIAQ"]);
   });
 });

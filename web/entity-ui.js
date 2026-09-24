@@ -16,8 +16,8 @@
  * not, and update the model in place instead.
  */
 import { COMMON_IONS, COMMON_LIGANDS, COMMON_MODIFICATIONS, ENTITY_LABELS, ENTITY_TYPES,
-  MENU_CODES, POLYMER_TYPES, TEMPLATE_KINDS, entitiesFromText, entityProblem, newEntity,
-  templateAsked, templateKind } from "./entities.js";
+  MENU_CODES, MSA_KINDS, POLYMER_TYPES, TEMPLATE_KINDS, entitiesFromText, entityProblem,
+  newEntity, templateAsked, templateKind } from "./entities.js";
 import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.js";
 
 /**
@@ -55,12 +55,16 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     // modifications. A template changes what is folded exactly as much as a
     // modified residue does, and a closed popup hides both.
     const templated = templateAsked(entity.template);
-    const total = count + (templated ? 1 : 0);
+    // ...and an alignment turned OFF, which changes what is folded as much as
+    // either: the chain goes to the model with its query row alone.
+    const noMsa = entity.type === "protein" && entity.msa === "none";
+    const total = count + (templated ? 1 : 0) + (noMsa ? 1 : 0);
     if (total > 0) badge.dataset.count = String(total);
     else delete badge.dataset.count;
     const said = [];
     if (count > 0) said.push(`${count} modified residue${count === 1 ? "" : "s"}`);
     if (templated) said.push("a template");
+    if (noMsa) said.push("no alignment");
     // 🔴 AND THE ONE COMBINATION THAT CANNOT FOLD, ON THE CLOSED BUTTON. An
     // automatic template with the MSA not set to search has nothing to draw a
     // hit from, and the popup that says so is shut. The only way anyone found
@@ -317,6 +321,63 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       // children WRAPS rather than overflowing, so it read as "the desktop
       // entity row broke across 2 lines".
       if (entity.type === "protein") {
+        // 🔴 WHETHER THIS CHAIN GETS AN ALIGNMENT, which is the same kind of
+        // thing as the template below it: set on ONE chain, changes what is
+        // folded, invisible on the row - so it lives behind the same button
+        // and is counted by the same badge.
+        //
+        // Off means the chain is folded from its query row alone while the
+        // rest of the complex keeps theirs. The page's own MSA dial still
+        // decides what happens for the chains that DO want one; this cannot
+        // turn an alignment on where the job has none, and says so.
+        const msaSection = document.createElement("div");
+        msaSection.className = "entity-popup-section entity-popup-section-msa";
+        const msaHeading = document.createElement("div");
+        msaHeading.className = "entity-popup-title";
+        msaHeading.textContent = "Alignment";
+        msaSection.append(msaHeading);
+        const msaMenu = document.createElement("select");
+        msaMenu.className = "entity-msa-kind";
+        msaMenu.setAttribute("aria-label", "Alignment for this chain");
+        for (const [value, label] of MSA_KINDS) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          msaMenu.append(option);
+        }
+        msaMenu.value = entity.msa === "none" ? "none" : "search";
+        // ...and ONE LINE under it, in the template's own shape: the menu
+        // says what is chosen and this says what it means for the fold.
+        // Neither explains the job's own MSA dial, which is a control the
+        // reader can see for themselves.
+        const msaNote = document.createElement("p");
+        msaNote.className = "entity-popup-empty entity-msa-status";
+        const sayMsa = () => {
+          msaNote.textContent = msaMenu.value === "none"
+            ? "This chain folds from its sequence alone."
+            : "This chain uses the alignment the job has.";
+        };
+        sayMsa();
+        msaMenu.addEventListener("change", () => {
+          // ...stored only when it is the unusual answer, so an entity that
+          // says nothing still means "give me one" - which is what every job
+          // written before this row existed says.
+          if (msaMenu.value === "none") entity.msa = "none";
+          else delete entity.msa;
+          // ...the line under it follows, without rebuilding the popup: the
+          // template's source box redraws on every keystroke and that is
+          // what costs it the caret, so nothing here rebuilds either.
+          sayMsa();
+          refreshBadge();
+          notify();
+        });
+        const msaLine = document.createElement("div");
+        msaLine.className = "entity-popup-row";
+        msaLine.append(msaMenu);
+        msaSection.append(msaLine);
+        msaSection.append(msaNote);
+        popup.append(msaSection);
+
         entity.template ??= { source: "" };
         const template = entity.template;
         const section = document.createElement("div");

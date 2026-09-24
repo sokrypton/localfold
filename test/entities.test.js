@@ -50,7 +50,11 @@ describe("entity validation", () => {
     // polymer loop, which does not run when there are no residues.
     expect(entitiesProblem([ligand("HEM")])).toBe(null);
     expect(expandEntities([ligand("HEM")])).toEqual({
-      chains: [], chainKinds: [], ligandCodes: ["HEM"], modifications: [],
+      chains: [], chainKinds: [],
+      // ...and no chain wanting an alignment, for the same reason it takes
+      // no template: there is no polymer here to align.
+      chainMsa: [],
+      ligandCodes: ["HEM"], modifications: [],
       // ...a ligand takes no template: AF3's own Template is one protein
       // chain, and a ligand has no residues to map onto.
       templates: [],
@@ -113,6 +117,40 @@ describe("expanding entities for the fold pipeline", () => {
 
   it("throws rather than expanding something invalid", () => {
     expect(() => expandEntities([protein("")])).toThrow(/protein sequence/);
+  });
+});
+
+describe("an alignment turned off for one chain", () => {
+  /**
+   * 🔴 PER CHAIN, AND THE COPIES INHERIT IT. `chainMsa` sits beside
+   * `chainKinds` in chain order because that is the only thing that says
+   * which block belongs to which chain - the fold path filters it to the
+   * protein chains and hands the mask to the search, which gives an
+   * unwanted chain its query row alone.
+   */
+  it("marks the chains that asked for one, in chain order", () => {
+    const out = expandEntities([
+      { type: "protein", value: "GWSTELEKHRSVQ", copies: 2, modifications: [] },
+      { type: "protein", value: "PIAQIHILEGRSD", copies: 1, msa: "none",
+        modifications: [] },
+      { type: "ligand", value: "HEM", copies: 1, modifications: [] },
+    ]);
+    expect(out.chainMsa).toEqual([true, true, false]);
+  });
+
+  it("says yes for an entity that says nothing, which is every older job", () => {
+    const out = expandEntities([
+      { type: "protein", value: "GWSTELEKHRSVQ", copies: 1, modifications: [] },
+    ]);
+    expect(out.chainMsa).toEqual([true]);
+  });
+
+  it("never asks for one for a chain that is not protein", () => {
+    const out = expandEntities([
+      { type: "dna", value: "ACGTACGT", copies: 1, modifications: [] },
+      { type: "protein", value: "GWSTELEKHRSVQ", copies: 1, modifications: [] },
+    ]);
+    expect(out.chainMsa).toEqual([false, true]);
   });
 });
 

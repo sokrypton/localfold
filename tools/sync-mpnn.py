@@ -15,8 +15,14 @@ serving path to fetch it, so the modules have to live under src/.
 that gets edited in place and then silently diverges. So this tool exists
 instead of a one-off `cp`: it stamps the upstream commit into
 src/design/mpnn/SOURCE.md, and `--check` re-runs the copy into a scratch
-directory and diffs, which is what test/mpnn-vendored.test.js asks for. Edit
-upstream and re-sync; never edit the mirror.
+directory and diffs. Edit upstream and re-sync; never edit the mirror.
+
+🔴 AND NOTHING RUNS `--check` FOR YOU ANY MORE. It was a node test
+(test/mpnn-vendored.test.js), and it was removed - asked for - because it
+fails on a machine whose ../mpnn has moved on, which is every machine that
+works on that repository too: the suite went red for a drift that says
+nothing about THIS tree. Run it by hand before trusting the mirror, and
+after any change upstream.
 
 🔴 THE CLOSURE, NOT THE DIRECTORY. Five of the fifteen upstream modules
 (c6d, potts, search, trmrf, trmrfaccel) implement the Potts and trMRF features,
@@ -93,8 +99,10 @@ def source_note(source: Path, commit: str, names: list[str]) -> str:
         "",
         "🔴 **DO NOT EDIT THESE FILES.** They are a mirror. Change them",
         "upstream and re-run `python3 tools/sync-mpnn.py`;",
-        "`test/mpnn-vendored.test.js` fails if the mirror and the upstream",
-        "checkout disagree.",
+        "`python3 tools/sync-mpnn.py --check` says whether the mirror and the",
+        "upstream checkout disagree. Nothing runs it for you: it was a node",
+        "test and that went red whenever ../mpnn moved on, which says nothing",
+        "about this tree.",
         "",
         f"- upstream: `{source}`",
         f"- commit: `{commit}`",

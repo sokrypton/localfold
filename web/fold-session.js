@@ -90,7 +90,7 @@ function open() {
  * and the frames do not carry.
  */
 export function jobMeta({ stem, model, prediction, sequence, settings, entities,
-                          msaOrigin, msas, savedAt = Date.now() }) {
+                          msaOrigin, msas, inputs, savedAt = Date.now() }) {
   const chainLengths = prediction?.chainLengths ?? [];
   const confidence = prediction?.confidence;
   return {
@@ -100,6 +100,13 @@ export function jobMeta({ stem, model, prediction, sequence, settings, entities,
     sequence,
     settings,
     entities,
+    // 🔴 THE FORM, SO A RESTORED FOLD CAN BE CONTINUED FROM RATHER THAN ONLY
+    // LOOKED AT. `settings` above is the archive's prose - "trunk passes",
+    // and the numbers the fold RESOLVED - and `entities` is the job's shape
+    // rather than the page's controls. This is what the controls held, so
+    // pressing Fold after a restore does what pressing it before the reload
+    // would have done. See formInputs/applyInputs in web/app.js.
+    inputs,
     msaOrigin,
     // 🔴 THE ALIGNMENT TRAVELS NOW, AND IT USED NOT TO. It was left out because
     // it is 96.8% of a fold archive - 3.0 MB of ubiquitin's 3.1 MB - and that

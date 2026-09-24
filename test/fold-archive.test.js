@@ -496,10 +496,17 @@ describe("where a fold's contact map lives", () => {
   });
 
   it("is set by every path that stores a prediction", () => {
-    // Each `lastPrediction = {` block, to its closing brace - at whatever
-    // indent, since AF2's sits one scope deeper than AF3's and a pattern
-    // pinned to two spaces silently checks two of the three paths.
-    const blocks = [...app.matchAll(/lastPrediction = \{\n([\s\S]*?)\n\s*\};/g)];
+    // Each prediction literal, to its closing brace - at whatever indent,
+    // since AF2's sits one scope deeper than AF3's and a pattern pinned to
+    // two spaces silently checks two of the three paths.
+    //
+    // 🔴 THE THREE GO THROUGH ONE FUNNEL NOW, and this is anchored on it.
+    // They used to be three `lastPrediction = {` assignments, of which
+    // ESMFold2's did only that - no `predictions.set`, no downloads sync -
+    // so the page's download row went on describing the fold before it.
+    // `recordPrediction` is the one door; a path that does not go through it
+    // is not counted here, which is the point.
+    const blocks = [...app.matchAll(/recordPrediction\(\{\n([\s\S]*?)\n\s*\}, /g)];
     expect(blocks.length).toBe(3);
     for (const [, body] of blocks) {
       expect(body).toContain("contactSource");

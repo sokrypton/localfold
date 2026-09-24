@@ -66,6 +66,25 @@ MEASURE = """(() => {
   // every keystroke, which would destroy the input it is typing into: the
   // symptom is a field that takes one character and loses focus, and the
   // measurement is whether the box still holds the caret after an input event.
+  // 🔴 AND THE TWO MENUS ARE THE SAME CONTROL, MEASURED AS SUCH. The
+  // alignment's is the same kind of choice as the template's - one setting,
+  // one chain, what gets folded - and it shipped with a class no rule named,
+  // so it was a browser-default select beside a styled one. "The same style"
+  // is a claim about pixels, so it is read off the page rather than asserted
+  // in a comment.
+  {
+    const template = popup().querySelector('.entity-template-kind');
+    const alignment = popup().querySelector('.entity-msa-kind');
+    const styleOf = (el) => {
+      if (el === null) return null;
+      const s = getComputedStyle(el);
+      const box = el.getBoundingClientRect();
+      return { h: Math.round(box.height), w: Math.round(box.width),
+               font: s.fontSize, pad: s.paddingLeft };
+    };
+    out.push({ kind: 'menus', template: styleOf(template),
+               alignment: styleOf(alignment) });
+  }
   const select = popup().querySelector('.entity-template-kind');
   select.value = 'pdb';
   select.dispatchEvent(new Event('change', { bubbles: true }));
@@ -98,7 +117,9 @@ def main() -> int:
             print("could not measure:", measured.get("error"))
             return 1
         typing = [row for row in measured if row.get("kind") == "typing"]
-        measured = [row for row in measured if row.get("kind") != "typing"]
+        menus = [row for row in measured if row.get("kind") == "menus"]
+        measured = [row for row in measured
+                    if row.get("kind") not in ("typing", "menus")]
         heights = [row["height"] for row in measured]
         widths = [row["width"] for row in measured]
         for row in measured:
@@ -107,6 +128,9 @@ def main() -> int:
         for row in typing:
             print(f"  typing   keeps the caret: {row['focused']}"
                   f"   same input node: {row['sameNode']}   value {row['value']!r}")
+        for row in menus:
+            print(f"  menus    template {row['template']}")
+            print(f"           alignment {row['alignment']}")
         spread = max(heights) - min(heights)
         print(f"height spread {spread}px, width spread {max(widths) - min(widths)}px")
         # 🔴 A FEW PIXELS IS A FONT, NOT A JUMP. The bar is that changing the
@@ -120,6 +144,18 @@ def main() -> int:
         for row in typing:
             if not row["focused"]:
                 print("FAIL: the source box loses the caret as it is typed into")
+                failed = True
+        for row in menus:
+            one, two = row["template"], row["alignment"]
+            if one is None or two is None:
+                print(f"FAIL: a menu is missing from the popup: {row}")
+                failed = True
+            elif (one["h"], one["w"], one["font"], one["pad"]) != \
+                 (two["h"], two["w"], two["font"], two["pad"]):
+                print(f"FAIL: the alignment menu is not the template menu's"
+                      f" shape: {two} against {one} - they are the same kind"
+                      " of control and the popup reads as one only if they"
+                      " look it")
                 failed = True
         if failed:
             return 1

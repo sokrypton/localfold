@@ -23,6 +23,7 @@
  * softmax against bin CENTRES.
  */
 import { layerNorm, linear } from "../trunk/pairformer-reference.js";
+import { tmAdjustedPae } from "./ptm-reference.js";
 import { Af3PairformerStackGpu } from "../trunk/pairformer-block-webgpu.js";
 import { openddeAtomReadouts, openddePairInit, openddePairReadouts }
   from "./opendde-confidence-webgpu.js";
@@ -180,9 +181,10 @@ export async function openddeConfidence(device, input, weights, dialect, options
   // half "the cheap half". `--host-readouts` is what
   // check-opendde-confidence.js compares against.
   const pairReadouts = options.hostReadouts === true
-    ? hostPairReadouts(refined.pair, tokens, c, weights)
+    ? hostPairReadouts(refined.pair, tokens, c, weights, input.tmTokens)
     : await openddePairReadouts(device, { pairBuffer: built.allocation.buffer,
-                                          tokens, channels: c }, weights);
+                                          tokens, channels: c,
+                                          tmTokens: input.tmTokens }, weights);
   built?.release();
 
   // pLDDT and resolved: per ATOM, against the matrix its dense SLOT names.
@@ -201,17 +203,21 @@ export async function openddeConfidence(device, input, weights, dialect, options
   // 🔴 THE REDUCTIONS ARE OpenDDE's OWN BINS. pLDDT is 50 bins over [0, 1] and
   // is scaled by 100; PAE and PDE are 64 over [0, 32]. Reading any of them on
   // AlphaFold 3's grid gives a number in the right range and the wrong place.
-  const { pae, pde } = pairReadouts;
+  const { pae, pde, tm } = pairReadouts;
   const { plddt, resolved } = atomReadouts;
 
-  return { plddt, pae, pde, resolved };
+  // 🔴 AND THE TM-ADJUSTED PAE WHERE THE CALLER ASKED FOR ONE, which is what
+  // pTM and ipTM are reduced from. It is absent rather than zero when nobody
+  // passed a token count: a pTM of 0 is a confident failure, and "this head
+  // reports none" is a different statement.
+  return { plddt, pae, pde, resolved, ...(tm === undefined ? {} : { tm }) };
 }
 
 /**
  * The PAE and PDE readouts on the host: what the GPU pair readouts replaced,
  * kept as the reference check-opendde-confidence.js holds them to.
  */
-export function hostPairReadouts(pair, tokens, c, weights) {
+export function hostPairReadouts(pair, tokens, c, weights, tmTokens) {
   const pairs = tokens * tokens;
   const paeLogits = linear(
     layerNorm(pair, pairs, c, weights.paeLnScale, weights.paeLnOffset),
@@ -228,10 +234,43 @@ export function hostPairReadouts(pair, tokens, c, weights) {
   const pdeLogits = linear(
     layerNorm(symmetric, pairs, c, weights.pdeLnScale, weights.pdeLnOffset),
     pairs, c, weights.pdeBins, weights.pde);
+  // 🔴 AND NEITHER EXPECTATION IS MASKED, WHICH RESTS ON THIS PIPELINE NOT
+  // PADDING. The reference multiplies `full_pae` and `full_pde` by
+  // `seq_mask[:, None] * seq_mask[None, :]` (model.py), and `featurise.js`
+  // writes `seqMask[token] = 1` on every one of the `tokens` it sizes the
+  // arrays from - four branches, no gaps - so that mask is all ones and the
+  // product is the identity. A bucketed or padded token axis would make this
+  // wrong here AND make `tmTokens` (which is the mask's SUM in the reference)
+  // wrong at every call site.
   return {
     pae: expectedFromLogits(paeLogits, pairs, weights.paeBins, 0, 32),
     pde: expectedFromLogits(pdeLogits, pairs, weights.pdeBins, 0, 32),
+    // ...and the TM-adjusted PAE, which is the head's own arithmetic over the
+    // same logits - see the shader. `tmAdjustedPae` is AlphaFold 3's, written
+    // out once and applied to whichever head produced the distribution.
+    ...(tmTokens === undefined ? {} : { tm: tmAdjustedPae(
+      paeLogits, tokens, binCentresFor(weights.paeBins, 0, 32),
+      tmTokenCounts(tokens, tmTokens)) }),
   };
+}
+
+/** The bin centres a readout reduces over, as the host path already assumes. */
+function binCentresFor(bins, minBin, maxBin) {
+  const width = (maxBin - minBin) / bins;
+  return Float32Array.from({ length: bins },
+    (unused, bin) => minBin + width * (bin + 0.5));
+}
+
+/**
+ * 🔴 d0 IS THE CALLER'S, NOT THIS HEAD'S TOKEN COUNT. `tmAdjustedPae` takes a
+ * per-pair token count because AlphaFold 3's INTERFACE form varies it by the
+ * two chains; the GLOBAL form - the one pTM, ipTM and the per-chain breakdown
+ * all read - is one number, and it is the count pTM is REPORTED over. That is
+ * the residue tokens, which is not this head's structural count the moment a
+ * ligand or a modified residue expands it.
+ */
+function tmTokenCounts(tokens, tmTokens) {
+  return new Float32Array(tokens * tokens).fill(tmTokens);
 }
 
 /**

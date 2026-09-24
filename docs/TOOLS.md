@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-336 tools. `tools/fixtures/` is data and is not listed.
+337 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (191)
 
@@ -283,7 +283,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (84)
+## `tools/` - everything else (85)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -314,7 +314,7 @@ go through CDP, and the deploy.
 - **`check-esmfold2-trunk.js`** - Does LocalFold's pairformer arithmetic compute ESMFold2's trunk?
 - **`check-job-archive.py`** - Does a fold archive describe the AlphaFold 3 job that was handed in?
 - **`check-ligand-path.mjs`** - Every AF3-lineage model folds a LIGAND, and its bonds are the right length.
-- **`check-model-pending.py`** - A result belongs to the model that made it, and the viewers say so.
+- **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
@@ -346,6 +346,7 @@ go through CDP, and the deploy.
 - **`export_multimer_model.py`** - Write a LocalFold float32 model directory from AF2-multimer parameters.
 - **`export_openfold_triangle.py`** - Export an OpenFold TriangleMultiplicationOutgoing differential-test bundle.
 - **`export_residue_geometry.py`** - Export AlphaFold residue geometry lookup tables into a fixture manifest.
+- **`fold-clears-msa.py`** - Pressing Fold must take the PREVIOUS job's alignment off the page.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the CPU: features in, a structure out.
 - **`fold-in-page.py`** - Drive a REAL fold in the real page, and report what the frames carry.
 - **`gate-folds.mjs`** - The folds every whole-model gate runs, and how a gate reads one of them.

@@ -24,12 +24,33 @@
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
+import { tmPerBinFor, tmScoreD0 } from "../../heads/tm-score.js";
 
 const GRID_WIDTH = 32_768;
 const LANES = 64;
 
-export function createReadoutShader({ tokens, channels, bins, minBin, maxBin, symmetrise }) {
+export function createReadoutShader({ tokens, channels, bins, minBin, maxBin,
+                                     symmetrise, tmTokens }) {
   const rows = tokens * tokens;
+  // 🔴 THE TM TERM RIDES ON THE SAME SOFTMAX, because pTM needs the whole PAE
+  // DISTRIBUTION and this shader is the only place it exists - the readout
+  // keeps the expectation and the logits are gone. AlphaFold 3's own head
+  // emits a tm-adjusted PAE beside the expectation and ours does the same
+  // (src/af3/confidence/confidence-webgpu.js); OpenDDE's head does not, so
+  // pTM and ipTM were simply absent for it. They are not a different quantity
+  // derived from the PAE: the arithmetic IS the head's, applied to whichever
+  // head's distribution - which is why upstream's `tmscore_adjusted_pae` is a
+  // module-level function and says so in its docstring.
+  //
+  // d0 IS BAKED, as it is there and for the same reason: it is a function of
+  // the token count alone, and the whole shader is already specialised on the
+  // token count. The count is the one pTM is REPORTED over - the residue
+  // tokens - which is not this head's structural token count when a ligand or
+  // a modification expands it, so it is passed in rather than derived here.
+  const tmPerBin = tmTokens === undefined ? null
+    : tmPerBinFor(Array.from({ length: bins },
+      (unused, bin) => minBin + ((maxBin - minBin) / bins) * (bin + 0.5)),
+    tmScoreD0(tmTokens));
   return `
 const TOKENS: u32 = ${tokens}u;
 const ROWS: u32 = ${rows}u;
@@ -46,6 +67,8 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(2) var<storage, read> offset: array<f32>;
 @group(0) @binding(3) var<storage, read> projection: array<f32>;
 @group(0) @binding(4) var<storage, read_write> expected: array<f32>;
+${tmPerBin === null ? "" : `@group(0) @binding(5) var<storage, read_write> tm: array<f32>;
+const TM_PER_BIN = array<f32, ${bins}>(${Array.from(tmPerBin).join(", ")});`}
 
 var<workgroup> reduce: array<f32, LANES>;
 
@@ -114,6 +137,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   var lane_total = 0.0;
   var lane_weighted = 0.0;
+${tmPerBin === null ? "" : "  var lane_tm = 0.0;"}
   for (var b = lane; b < BINS; b += LANES) {
     var logit = 0.0;
     for (var c = 0u; c < CHANNELS; c += 1u) {
@@ -123,10 +147,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let value = exp(logit - peak);
     lane_total += value;
     lane_weighted += value * (MIN_BIN + BIN_WIDTH * (f32(b) + 0.5));
+${tmPerBin === null ? "" : "    lane_tm += value * TM_PER_BIN[b];"}
   }
   let denominator = total_of(lane, lane_total);
   workgroupBarrier();
   let numerator = total_of(lane, lane_weighted);
+${tmPerBin === null ? "" : `  workgroupBarrier();
+  let tm_total = total_of(lane, lane_tm);
+  if (lane == 0u) { tm[row] = tm_total / denominator; }`}
   if (lane == 0u) { expected[row] = numerator / denominator; }
 }`;
 }
@@ -398,18 +426,23 @@ export async function openddePairReadouts(device, input, weights) {
   const rows = tokens * tokens;
   const pipelines = pipelineCacheForDevice(device);
   const allocator = new GpuBufferAllocator(device);
+  // 🔴 AND THE PAE ARM CARRIES THE TM TERM, when the caller says which token
+  // count pTM is reported over. See createReadoutShader.
+  const tmTokens = input.tmTokens;
   const arms = [
-    { name: "pae", symmetrise: false, bins: weights.paeBins,
+    { name: "pae", symmetrise: false, bins: weights.paeBins, tm: tmTokens !== undefined,
       scale: weights.paeLnScale, offset: weights.paeLnOffset, projection: weights.pae },
-    { name: "pde", symmetrise: true, bins: weights.pdeBins,
+    { name: "pde", symmetrise: true, bins: weights.pdeBins, tm: false,
       scale: weights.pdeLnScale, offset: weights.pdeLnOffset, projection: weights.pde },
   ];
   const compiled = [];
   for (const arm of arms) {
     compiled.push(await pipelines.get(
-      `opendde-conf-readout:${tokens}:${channels}:${arm.bins}:${arm.symmetrise}`,
+      `opendde-conf-readout:${tokens}:${channels}:${arm.bins}:${arm.symmetrise}`
+      + `:${arm.tm ? tmTokens : "no-tm"}`,
       createReadoutShader({ tokens, channels, bins: arm.bins,
-                            minBin: 0, maxBin: 32, symmetrise: arm.symmetrise })));
+                            minBin: 0, maxBin: 32, symmetrise: arm.symmetrise,
+                            tmTokens: arm.tm ? tmTokens : undefined })));
   }
 
   const storage = GPUBufferUsage.STORAGE;
@@ -427,6 +460,11 @@ export async function openddePairReadouts(device, input, weights) {
     const readbacks = arms.map((arm) => keep(allocator.allocate(
       `opendde-conf.rb-${arm.name}`, rows * 4,
       GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
+    const tmOut = tmTokens === undefined ? null : keep(allocator.allocate(
+      "opendde-conf.tm", rows * 4, storage | GPUBufferUsage.COPY_SRC));
+    const tmBack = tmTokens === undefined ? null : keep(allocator.allocate(
+      "opendde-conf.rb-tm", rows * 4,
+      GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
     device.pushErrorScope("validation");
     const encoder = device.createCommandEncoder({ label: "opendde-confidence-readouts" });
@@ -435,7 +473,8 @@ export async function openddePairReadouts(device, input, weights) {
         resident(`opendde-conf.${arm.name}-scale`, () => arm.scale),
         resident(`opendde-conf.${arm.name}-offset`, () => arm.offset),
         resident(`opendde-conf.${arm.name}-projection`, () => arm.projection),
-        outputs[index]];
+        outputs[index],
+        ...(arm.tm ? [tmOut] : [])];
       const pass = encoder.beginComputePass({ label: `opendde-conf.${arm.name}` });
       pass.setPipeline(compiled[index]);
       pass.setBindGroup(0, device.createBindGroup({
@@ -447,6 +486,7 @@ export async function openddePairReadouts(device, input, weights) {
       pass.dispatchWorkgroups(Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
       pass.end();
       encoder.copyBufferToBuffer(outputs[index].buffer, 0, readbacks[index].buffer, 0, rows * 4);
+      if (arm.tm) encoder.copyBufferToBuffer(tmOut.buffer, 0, tmBack.buffer, 0, rows * 4);
     });
     device.queue.submit([encoder.finish()]);
     const error = await device.popErrorScope();
@@ -457,7 +497,8 @@ export async function openddePairReadouts(device, input, weights) {
       allocation.buffer.unmap();
       return copy;
     };
-    return { pae: await read(readbacks[0]), pde: await read(readbacks[1]) };
+    return { pae: await read(readbacks[0]), pde: await read(readbacks[1]),
+             ...(tmBack === null ? {} : { tm: await read(tmBack) }) };
   } finally {
     for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
   }
