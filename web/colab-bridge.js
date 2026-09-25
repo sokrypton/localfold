@@ -205,7 +205,25 @@ async function runFold(request) {
     return { error: "nothing to fold: the request carried no sequence",
              status: statusText() };
   }
-  window.__entityList?.set(entities);
+  // 🔴 THE PAGE'S OWN RESTORE PATH, NOT A SECOND ONE. This set four controls
+  // by hand and fired a `change` on each, which is a third idea of what a fold
+  // is made of beside the form and the saved session - and it was the stalest:
+  // the reader's sampler, seed, MSA depth, language model, AF2 model number
+  // and early stop never arrived, because nothing here named them.
+  // `window.__foldInputs.apply` is what a restored session goes through, so
+  // a control added to `FOLD_CONTROLS` lands here with no edit.
+  //
+  // 🔴 AND IT ASSIGNS WITHOUT DISPATCHING `change`, WHICH IS WHY IT IS THE
+  // RIGHT ONE. Those listeners bring the other controls into agreement and
+  // some of them EMPTY the page; firing one per control raced the next
+  // assignment. It calls the three syncs directly instead, in the listeners'
+  // own order, and fills the rebuilt selects afterwards.
+  //
+  // 🔴 AND A SHORT REQUEST STILL WORKS, which is not a fallback but the
+  // documented shape: `{op: "fold", payload: {sequence: "..."}}` is what a
+  // person types and what tools/check-colab-bridge.py sends. These four are
+  // DEFAULTS under whatever the reader's form supplied, so a full request
+  // overrides every one of them and a bare one folds as it always did.
   const controls = {
     "model-family": request.model ?? "af3",
     recycles: String(request.recycles ?? 3),
@@ -215,13 +233,13 @@ async function runFold(request) {
     // it left the control empty and the fold died with "unknown alignment
     // mode". What travels is what the reader's select said.
     "msa-mode": request.msa ?? "none",
+    ...(request.controls ?? {}),
   };
-  for (const [id, value] of Object.entries(controls)) {
-    const control = document.getElementById(id);
-    if (control === null) continue;
-    control.value = value;
-    control.dispatchEvent(new Event("change", { bubbles: true }));
+  if (window.__foldInputs?.apply === undefined) {
+    return { error: "this runtime's page cannot take a form (no __foldInputs)",
+             status: statusText() };
   }
+  window.__foldInputs.apply({ entities, controls });
   // The button comes up when the page has wired it and the entity list reads
   // as foldable; a minute is longer than either has ever taken and short
   // enough that a request the page will never accept says so.

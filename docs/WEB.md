@@ -2986,6 +2986,51 @@ and the runtime resolves it with the same function.
 
 *Found by asking the page what it was showing - `status-message` said it in
 words - rather than by reading the bridge code, which looked right.*
+### A remote fold ran the runtime's settings, not the reader's
+
+`foldOnBackend` named five fields by hand - `entities`, `model`, `steps`,
+`recycles`, `msa` - and a fold is made of **eleven controls**. Everything else
+was dropped in silence: the sampler, the seed, the MSA depth, the language
+model, which of AlphaFold 2's five, and AF2's early stop. A reader who chose
+Flow, seed 7 and a non-default step count got the runtime's defaults with
+nothing on either screen saying so. Measured by putting the old code back under
+the new arm, which reads the runtime's own form: **asked 32 steps and folded 25,
+asked seed 7 and folded 0, asked flow and folded DIFFUSION** - a different
+sampler, silently.
+
+This is CLAUDE.md's allow-list trap at a third seam (`predictA3m` dropping
+`pairHost`, the multimer dropping its whole regime), and the answer is the same:
+forward the object. `main` had meanwhile built exactly the right one for session
+restore - `formInputs()` returns `{entities, controls}` over `FOLD_CONTROLS`,
+"what a fold IS" - so the bridge sends that and the runtime puts it on through
+`applyInputs`, the same function a restored session goes through. A control
+added to `FOLD_CONTROLS` now travels with no edit at either end.
+
+🔴 **AND THE APPLY DROPPED THE STEP COUNT, WHICH BROKE SESSION RESTORE TOO.**
+`applyInputs` assigned the controls and then called its three syncs, and
+`syncAf3Count` ends `select.value = String(preferred)` unconditionally - so the
+count was written and overwritten one line later. That line is RIGHT on a model
+or sampler change, where the old count may not be in the new table at all
+(af3 offers 25/50/100/200 in diffusion and prefers 25; flow is a different
+table preferring 16), so the fix is not to weaken it: `applyInputs` puts the
+controls on **twice**, once to set the drivers the syncs read and once to fill
+the selects the syncs rebuilt. Falsified by removing the second pass - a form
+saved at 32 comes back 16.
+
+🔴 **AND THE READER'S FORM MUST BE ONE THE PAGE COULD PRODUCE, OR THE ARM
+ASSERTS AGAINST AN IMPOSSIBLE STATE.** The first version set `af3-mode: flow`
+and `af3-count: 200` by hand; 200 is in the diffusion table and not the flow
+one, so it is legitimately dropped on arrival and the arm failed against
+correct behaviour. It drives the sampler through its own change handler and
+then picks a count from what that leaves.
+
+🔴 **AND `RETIRED_CONTROLS` WAS A HAND-COPY OF THE SAME LIST AND HAD DRIFTED.**
+`tolerance` - AF2's early stop, whose only job is to shape the next fold -
+stayed enabled on a page whose runtime had been stopped. It is derived from
+`FOLD_CONTROLS` now, less `msa-text`: the alignment box is the one fold input
+that is also something to READ, and a disabled textarea cannot be selected in
+every browser, so taking it away would destroy what a reader came back for.
+
 ## `contact`: a bond as a ROW, not as hidden state
 
 `bondedAtomPairs` landed first as a job-level field the page kept in a variable

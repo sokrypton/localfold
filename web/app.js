@@ -945,19 +945,46 @@ function applyInputs(inputs) {
       console.warn("could not put the sequence rows back", cause);
     }
   }
-  for (const [id, value] of Object.entries(inputs.controls ?? {})) {
-    const element_ = document.getElementById(id);
-    if (element_ === null || value === undefined) continue;
-    if (element_.type === "checkbox") { element_.checked = !!value; continue; }
-    if (element_.tagName === "SELECT"
-        && ![...element_.options].some((option) => option.value === value)) continue;
-    element_.value = value;
-  }
+  const put = () => {
+    for (const [id, value] of Object.entries(inputs.controls ?? {})) {
+      const element_ = document.getElementById(id);
+      if (element_ === null || value === undefined) continue;
+      if (element_.type === "checkbox") { element_.checked = !!value; continue; }
+      if (element_.tagName === "SELECT"
+          && ![...element_.options].some((option) => option.value === value)) continue;
+      element_.value = value;
+    }
+  };
+  // 🔴 TWICE, BECAUSE THE SYNCS REBUILD THE SELECTS THEY DEPEND ON. The first
+  // pass sets the DRIVERS - the model row, the sampler - which is what the
+  // three syncs below read; the syncs then replace the option sets of the
+  // controls that hang off them; the second pass fills those, now that the
+  // options they need exist.
+  //
+  // 🔴 AND WITHOUT IT A RESTORED FOLD SILENTLY CHANGED ITS STEP COUNT.
+  // `syncAf3Count` ends `select.value = String(preferred)` - unconditionally,
+  // which is RIGHT on a model or sampler change, where the old count may not
+  // be in the new table at all - so a single pass assigned af3-count and then
+  // overwrote it one line later. Measured on the page: af3 offers 25/50/100/200
+  // and prefers 25, so every restored fold came back as 25 whatever it ran at.
+  // Fixing it inside `syncAf3Count` would have kept a count across a model
+  // switch, which is the opposite of what that line is for.
+  put();
   syncModelControls();
   syncMode();
   syncAf3Count();
+  put();
   return true;
 }
+
+// 🔴 EXPOSED FOR THE COLAB BRIDGE, WHICH CANNOT IMPORT THIS FILE. web/app.js
+// imports web/colab-bridge.js, so the call the other way would be a cycle -
+// the same reason the runtime-stopped notice travels as a DOM event. The
+// runtime's page needs exactly these two: `read` is what the reader sends
+// when Fold is pressed on the other machine, `apply` is how this page puts
+// that form on before pressing its own button. Sharing them is what stops the
+// bridge growing a second, staler idea of what a fold is made of.
+window.__foldInputs = { read: formInputs, apply: applyInputs };
 
 /** The last prediction, kept so it can be downloaded as it was computed. */
 let lastPrediction;
@@ -2443,9 +2470,20 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
  */
 let foldingRetired = false;
 
-const RETIRED_CONTROLS = ["predict", "add-entity", "model-family", "af2Model",
-  "plm-mode", "msa-mode", "af3-mode", "af3-count", "recycles", "max-msa",
-  "random-seed"];
+// 🔴 DERIVED FROM `FOLD_CONTROLS`, NOT COPIED FROM IT. This was a hand-written
+// list of the same controls and had already drifted: `tolerance` - AF2's early
+// stop, whose only job is to shape the next fold - stayed enabled on a page
+// that can no longer fold one. A control added to the form is retired here now
+// without anyone remembering to, which is this repository's allow-list trap
+// closed at one more seam.
+//
+// 🔴 EXCEPT THE ALIGNMENT BOX, the one fold input that is also something to
+// READ. A reader whose runtime has gone may still want the alignment they
+// pasted, and a disabled textarea cannot be selected in every browser - so
+// taking it away would destroy the thing they came back for. It shapes nothing
+// while Fold is gone.
+const RETIRED_CONTROLS = ["predict", "add-entity",
+  ...FOLD_CONTROLS.filter((id) => id !== "msa-text")];
 
 function retireFolding(why) {
   foldingRetired = true;
@@ -3861,19 +3899,27 @@ function remoteBackend() {
  */
 async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
                                templates, family, signal }) {
-  const entities = entityList.read();
-  const request = {
-    entities, model: family,
-    steps: Number(element("af3-count")?.value ?? 25),
-    recycles: Number(element("recycles")?.value ?? 3),
-    // 🔴 THE CONTROL'S OWN VALUE, NOT THE RESOLVED MODE. `msaMode()` maps
-    // "none" to "single" for the code below it; the runtime sets its page's
-    // `msa-mode` SELECT from this, and a select silently refuses a value it
-    // has no option for - so "single" left the control empty there and the
-    // fold died with "unknown alignment mode". Sending the raw value lets the
-    // runtime's page resolve it with the same function this one uses.
-    msa: element("msa-mode")?.value ?? "none",
-  };
+  // 🔴 THE WHOLE FORM, THROUGH THE FUNCTION THE SESSION ALREADY USES. This
+  // named five fields by hand - entities, model, steps, recycles, msa - and a
+  // fold is made of eleven controls, so everything else was DROPPED in
+  // silence: the sampler, the seed, the MSA depth, the language model, which
+  // of AlphaFold 2's five, and AF2's early stop. A reader who picked Flow, a
+  // seed and 200 steps got the runtime's defaults and no line saying so.
+  //
+  // `formInputs()` is the same snapshot a saved session carries, so the two
+  // cannot drift and a control added to `FOLD_CONTROLS` travels without an
+  // edit here. This is the allow-list trap CLAUDE.md records at two other
+  // seams - `predictA3m` dropping `pairHost`, the multimer dropping its whole
+  // regime - and the answer is the same one: forward the object.
+  //
+  // 🔴 THE CONTROLS' OWN VALUES, NOT THE RESOLVED ONES. `msaMode()` maps
+  // "none" to "single" for the code below it; the runtime puts these back into
+  // the SELECTS, and a select silently refuses a value it has no option for -
+  // so "single" left the control empty there and the fold died with "unknown
+  // alignment mode". Raw values let the runtime's page resolve them with the
+  // same functions this one uses.
+  const { entities, controls } = formInputs();
+  const request = { entities, controls };
   const label = MODEL_LABELS[family] ?? family;
   status(`${label} · folding on the runtime…`);
   progress("waiting");

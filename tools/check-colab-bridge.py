@@ -264,16 +264,31 @@ try:
           }
           return true;
         })()""")
-        # A sequence and a press, which is all a person does.
-        cdp.evaluate(reader_ws, """(() => {
+        # A sequence and a press, which is all a person does - plus a form that
+        # is NOT the defaults in every control that has a choice, because the
+        # question below is whether a reader's settings reach the other machine.
+        #
+        # 🔴 THE SAMPLER GOES THROUGH ITS OWN CHANGE HANDLER AND THE COUNT IS
+        # PICKED FROM WHAT THAT LEAVES. Assigning both by hand builds a form the
+        # page itself could never produce - the count select is REBUILT per
+        # sampler, so a count from the other table is legitimately dropped on
+        # arrival and the arm would be asserting against an impossible state.
+        chosen = cdp.evaluate(reader_ws, """(() => {
+          const g = (id) => document.getElementById(id);
           window.__entityList.set([{ type: 'protein',
             value: 'GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK',
             copies: 1, modifications: [] }]);
-          document.getElementById('msa-mode').value = 'none';
-          document.getElementById('msa-mode').dispatchEvent(
-            new Event('change', { bubbles: true }));
-          return true;
+          for (const [id, value] of [['msa-mode', 'none'], ['af3-mode', 'flow']]) {
+            g(id).value = value;
+            g(id).dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          const counts = [...g('af3-count').options].map((o) => o.value);
+          const count = counts.find((v) => v !== g('af3-count').value) ?? counts[0];
+          const want = { 'af3-count': count, 'recycles': '1', 'random-seed': '7' };
+          for (const [id, value] of Object.entries(want)) g(id).value = value;
+          return { ...want, 'af3-mode': 'flow', 'msa-mode': 'none' };
         })()""")
+        print(f"  the reader's form: {chosen}")
         cdp.wait_for(reader_ws, "!document.getElementById('predict').disabled", 60,
                      "the reader's fold button")
         cdp.evaluate(reader_ws, "(document.getElementById('predict').click(), true)")
@@ -293,9 +308,50 @@ try:
             bad.append("pressing Fold on the reader's page put no `fold`"
                        " command in the broker - foldOnBackend never asked")
         else:
-            entities = (asked.get("payload") or {}).get("entities") or []
-            print(f"  the reader asked: {asked['op']},"
-                  f" {len(entities)} entity, model {(asked.get('payload') or {}).get('model')}")
+            payload = asked.get("payload") or {}
+            entities = payload.get("entities") or []
+            sent = payload.get("controls") or {}
+            print(f"  the reader asked: {asked['op']}, {len(entities)} entity,"
+                  f" {len(sent)} control(s), model {sent.get('model-family')}")
+            # 🔴 EVERY CONTROL THE READER SET, NOT THE FIVE SOMEBODY LISTED.
+            # `foldOnBackend` named entities, model, steps, recycles and msa by
+            # hand and a fold is made of eleven controls, so the sampler, the
+            # seed, the MSA depth, the language model, the AF2 model number and
+            # AF2's early stop were DROPPED in silence - a reader who chose Flow
+            # and a seed got the runtime's defaults with nothing saying so.
+            missing = {k: v for k, v in chosen.items() if sent.get(k) != v}
+            if missing:
+                arrived = {k: sent.get(k) for k in chosen}
+                bad.append(f"the reader's form did not travel: wanted {chosen},"
+                           f" the command carried {arrived}")
+
+            # ...AND IT IS PUT ON THE RUNTIME'S OWN FORM. Travelling is half of
+            # it: the runtime applies these to the page it folds with, and the
+            # select that holds the diffusion count is REBUILT by the sampler
+            # sync that runs during the apply - so a single-pass apply assigns
+            # the count and then overwrites it with the model's preferred one,
+            # and the fold runs at a step count nobody asked for. Read off the
+            # page that folds, which is the only place that can say.
+            landed, deadline = {}, time.time() + 60
+            while time.time() < deadline:
+                landed = cdp.evaluate(runtime_ws, """(() => {
+                  const g = (id) => document.getElementById(id);
+                  const out = {};
+                  for (const id of ['af3-count', 'af3-mode', 'recycles',
+                                    'random-seed', 'msa-mode']) {
+                    out[id] = g(id)?.value;
+                  }
+                  return out;
+                })()""") or {}
+                if all(landed.get(k) == v for k, v in chosen.items()):
+                    break
+                time.sleep(0.5)
+            print(f"  the runtime's form: {landed}")
+            wrong = {k: (v, landed.get(k)) for k, v in chosen.items()
+                     if landed.get(k) != v}
+            if wrong:
+                bad.append("the runtime folded with a different form than the"
+                           f" reader asked for (asked, got): {wrong}")
 
         # ...and the runtime's answer reaches the reader's own screen. The
         # fold cannot succeed with the weights blocked; what is asserted is
