@@ -129,9 +129,20 @@ const TRANSITION = ["inputLayerNormScale", "inputLayerNormOffset",
   "transition1", "transition2"];
 
 /** One trunk block, in the shapes src/af3/trunk/pair-track-gpu.js wants. */
-export async function trunkBlockWeights(read, layer) {
+/**
+ * One pair-only block, from `blocks/<layer>/...` or any other prefix.
+ *
+ * 🔴 THE PREFIX IS A PARAMETER BECAUSE THE CONFIDENCE HEAD'S FOUR BLOCKS ARE
+ * THIS BLOCK. Measured against Synthyra's checkpoint before the head was
+ * exported: `confidence_head.folding_trunk.blocks.*` carries the same 18
+ * tensors under the same names at the same shapes as
+ * `folding_trunk.blocks.*` - so the head needs no second reader, no second
+ * kernel and no second layout note. It defaults to the trunk's own prefix, so
+ * every existing caller is unchanged.
+ */
+export async function trunkBlockWeights(read, layer, prefix = "blocks") {
   const group = (name, leaves) =>
-    gather(read, leaves.map((leaf) => [leaf, `blocks/${layer}/${name}/${leaf}`]));
+    gather(read, leaves.map((leaf) => [leaf, `${prefix}/${layer}/${name}/${leaf}`]));
   const [outgoing, incoming, transition] = await Promise.all([
     group("triangleMultiplicationOutgoing", TRIANGLE),
     group("triangleMultiplicationIncoming", TRIANGLE),
@@ -142,6 +153,51 @@ export async function trunkBlockWeights(read, layer) {
     triangleMultiplicationIncoming: incoming,
     pairTransition: transition,
   };
+}
+
+/**
+ * Synthyra's confidence head: four pair-only blocks and seventeen tensors.
+ *
+ * 🔴 THE CHECKPOINT WE SHIP HAS NONE OF THIS UNLESS IT WAS EXPORTED WITH ONE.
+ * biohub's ESMFold2 is `confidence_head.enabled: false` with zero confidence
+ * tensors, which is what `src/esmfold2/aligned-error.js` exists for. A bundle
+ * built by `tools/export_esmfold2_trunk.py --confidence` carries a head; one
+ * built without still does not, so this returns `null` rather than throwing
+ * and the caller keeps the certainty estimate.
+ *
+ * 🔴 AND THE BLOCKS ARE PAIR-ONLY, WHICH IS THE ONE PLACE THIS PARTS COMPANY
+ * WITH OpenDDE'S HEAD. No single track crosses them; the single is made at the
+ * very end by `poolingAttention`/`poolingOutput` out of the finished pair. A
+ * port that carried a single through the four blocks would be a different
+ * head that runs.
+ */
+export async function confidenceHeadWeights(read, manifest) {
+  const meta = manifest?.confidence;
+  if (meta === undefined || meta === null) return null;
+  const blocks = [];
+  for (let layer = 0; layer < meta.blocks; layer += 1) {
+    blocks.push(await trunkBlockWeights(read, layer, "confidence/blocks"));
+  }
+  const flat = await gather(read, [
+    ["sInputsNormScale", "confidence/sInputsNorm/scale"],
+    ["sInputsNormOffset", "confidence/sInputsNorm/offset"],
+    ["zNormScale", "confidence/zNorm/scale"],
+    ["zNormOffset", "confidence/zNorm/offset"],
+    ["plddtNormScale", "confidence/plddtNorm/scale"],
+    ["plddtNormOffset", "confidence/plddtNorm/offset"],
+    ["sToZ", "confidence/sToZ"],
+    ["sToZTranspose", "confidence/sToZTranspose"],
+    ["sToZProdIn1", "confidence/sToZProdIn1"],
+    ["sToZProdIn2", "confidence/sToZProdIn2"],
+    ["sToZProdOut", "confidence/sToZProdOut"],
+    ["distanceEmbedding", "confidence/distanceEmbedding"],
+    ["boundaries", "confidence/boundaries"],
+    ["poolingAttention", "confidence/poolingAttention"],
+    ["poolingOutput", "confidence/poolingOutput"],
+    ["plddtWeight", "confidence/plddtWeight"],
+    ["pae", "confidence/pae"],
+  ]);
+  return { ...flat, blocks, ...meta };
 }
 
 export async function featuriserWeights(read) {
