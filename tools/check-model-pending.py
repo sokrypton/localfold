@@ -822,7 +822,20 @@ try:
                    " nothing")
 
     # ...and now the runtime really goes.
-    subprocess.run(["pkill", "-f", "Google Chrome.*localfold-pending-runtime"],
+    # 🔴 THE PROFILE, NOT THE BINARY'S NAME. This read "Google Chrome.*" - the
+    # macOS path - so on Linux, where the binary is `google-chrome` or
+    # `chromium`, it matched NOTHING: the runtime's browser was never killed,
+    # the badge was correctly still live, and the arm failed for the one reason
+    # it cannot detect. Same shape as fold-in-page.py's macOS Chrome path.
+    #
+    # 🔴 AND IT MUST NOT MATCH THE BROKER, which this arm needs ALIVE - the
+    # whole question is whether the badge notices a dead runtime while the
+    # service answers. The browser carries `--user-data-dir=<profile>` (cdp.py)
+    # and the broker carries `--profile <path>`, so the `=` is what separates
+    # them. The bare profile name matches both, and matches any shell whose
+    # command line happens to contain it, which is this repository's oldest
+    # pkill trap.
+    subprocess.run(["pkill", "-f", "user-data-dir=/tmp/localfold-pending-runtime"],
                    check=False)
     gone, deadline = "", time.time() + 45
     while time.time() < deadline:
@@ -1031,7 +1044,9 @@ finally:
 # The broker kills it now; this asks, because the check costs nothing and the
 # symptom - somebody else's browser on the machine - is one the neighbouring
 # suites have been wrong about before.
-left = subprocess.run(["pgrep", "-f", "localfold-pending-runtime"],
+# ...by the profile the BROWSER was given, for the reason the kill above gives:
+# the bare name also matches the broker and any shell that mentions it.
+left = subprocess.run(["pgrep", "-f", "user-data-dir=/tmp/localfold-pending-runtime"],
                       capture_output=True, text=True).stdout.split()
 if left:
     bad.append(f"{len(left)} browser process(es) are still on the runtime's"
