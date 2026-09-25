@@ -142,6 +142,20 @@ export async function main(device, args) {
     repAtom: Int32Array.from(stage("in.distogram_atom_idx")),
     atomToToken: Int32Array.from(stage("in.atom_to_token")),
     tokenMask: stage("in.token_attention_mask"), atomMask: stage("in.atom_attention_mask"),
+    // 🔴 A REAL pairBias, NOT ZEROS. Their head adds the relative-position and
+    // token-bonds encodings to the normalised pair, and this port carries them
+    // as one addend; zeros here would run both arms past a term neither
+    // exercised, which is exactly how the omission survived in the first place
+    // (see docs/EF2FAST.md). Seeded, so the two arms see the same tensor.
+    pairBias: (() => {
+      const out = new Float32Array(tokens * tokens * weights.pairChannels);
+      let state = 0x9e3779b9;
+      for (let i = 0; i < out.length; i += 1) {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        out[i] = ((state >>> 8) / 0x1000000 - 0.5) * 0.5;
+      }
+      return out;
+    })(),
   };
 
   const host = esmfold2Confidence(inputs, weights);
@@ -167,6 +181,7 @@ export async function main(device, args) {
   const started = performance.now();
   const initial = await esmfold2ConfidencePairInit(device, {
     tokens, pair: inputs.pair, rows, cols, left, right, repCoordinates,
+    pairBias: inputs.pairBias,
   }, weights, { allocator });
 
   const pairMask = new Float32Array(tokens * tokens);

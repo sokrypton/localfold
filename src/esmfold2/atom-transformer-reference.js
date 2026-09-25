@@ -445,7 +445,12 @@ export function scatterMean(values, atomToToken, mask, atoms, tokens, channels) 
  */
 export function inputsEmbedder(features, shape, weights) {
   const { atoms, tokens, channels, heads, blocks, hidden, tokenChannels } = shape;
-  const halfWindow = (shape.windowSize ?? 128) >> 1;
+  // 🔴 DENSE UNLESS A CALLER ASKS FOR A WINDOW. The reference's
+  // `SWA3DRoPEAttention` defaults to ATOM_ATTENTION_DENSE and nothing on its
+  // fold path sets it otherwise, so `swa_window_size: 128` is in the config and
+  // unused - a window of 128 was this port's own reading. See docs/EF2FAST.md;
+  // it cost 2.5 pLDDT. A window wider than the molecule IS dense.
+  const halfWindow = (shape.windowSize ?? atoms * 2) >> 1;
   const mask = features.mask;
   const embedded = linear(
     atomFeatures(features, atoms), atoms, ATOM_FEATURES, channels, weights.atomLinear);
@@ -520,7 +525,12 @@ export function inputsEmbedder(features, shape, weights) {
  */
 export function atomDecoder(tokenAct, skip, conditioning, rope, features, shape, weights) {
   const { atoms, tokens, channels, heads, blocks, hidden, tokenChannels } = shape;
-  const halfWindow = (shape.windowSize ?? 128) >> 1;
+  // 🔴 DENSE UNLESS A CALLER ASKS FOR A WINDOW. The reference's
+  // `SWA3DRoPEAttention` defaults to ATOM_ATTENTION_DENSE and nothing on its
+  // fold path sets it otherwise, so `swa_window_size: 128` is in the config and
+  // unused - a window of 128 was this port's own reading. See docs/EF2FAST.md;
+  // it cost 2.5 pLDDT. A window wider than the molecule IS dense.
+  const halfWindow = (shape.windowSize ?? atoms * 2) >> 1;
   const mask = features.mask;
   const perToken = linear(tokenAct, tokens, tokenChannels, channels, weights.tokenToAtom);
   const state0 = new Float32Array(atoms * channels);

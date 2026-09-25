@@ -3578,3 +3578,50 @@ loops `for (const block of weights)`, so a smaller `shape.blocks` changes what
 is COMPILED and not what is RUN. Found by asking for 0 blocks and getting the
 full stack's answer back, which is an oracle arm that cannot bisect while
 looking as though it does.
+
+#### FIXED: the atom attention is dense, and the kernel can afford it
+
+Two changes, in that order, because the second is impossible without the first.
+
+**One: `attend` walks the keys in fixed chunks with an online softmax.** It held
+`logits: array<f32, heads * window>` in workgroup memory, so a dense window was
+`4 * atoms` floats - 57 KB at 3584 atoms against this card's 48 KiB, refused
+outright at 472 residues, and over Metal's 32 KiB even at 236. It now keeps a
+running peak and sum per head, rescales both when a chunk raises the peak, and
+holds `heads * 256` logits whatever the protein's length: **5.5 KB, flat**. The
+peak's sentinel is a finite -3.0e38 rather than -inf, because the first chunk's
+rescale computes `exp(peak - newPeak)` and -inf minus -inf is NaN. The only
+runtime-bound loop is the outer one over chunks; every loop inside it has a
+constant trip count, which is CLAUDE.md's 4.3x rule observed rather than
+rediscovered.
+
+🔴 **AND IT REPRODUCES THE WINDOWED PATH EXACTLY**, which is the only reason to
+believe the rewrite before changing what it computes: 85.675 / 0.814972 and
+atomChecksum **693370**, identical to the kernel it replaced.
+
+**Two: the window is gone.** `window` now covers every atom in the inputs
+embedder and in the diffusion atom stacks, and `atom-transformer-reference.js`
+defaults to the same, so the CPU reference and the GPU agree on what the model
+is. `--atom-windowed=1` restores the old behaviour for comparison.
+
+| 59 residues | tokenAct vs native | pLDDT | pTM | PAE mean |
+|---|---:|---:|---:|---:|
+| windowed | 2.64e-1 | 85.67 | 0.8150 | 4.810 |
+| **dense (now the default)** | **2.07e-2** | **88.21** | **0.8178** | 3.909 |
+| native | — | 89.15 | 0.8304 | 3.787 |
+
+On the page, on the int5 bundle that ships: **pLDDT 87.3, pTM 0.806**, up from
+84.7. The head still reads **1.15e-5** against Synthyra's own on a real trunk,
+and 472 residues folds dense in 14 s where it would not build at all before.
+
+🔴 **AND THE GPU CONFIDENCE CHECKER WAS PASSING A TERM IT NEVER SUPPLIED.** It
+builds its own inputs, so the new `pairBias` throw caught it immediately - the
+right outcome, and the reason the loader throws rather than zeroing. It now
+passes a SEEDED RANDOM bias to both arms rather than zeros, because zeros would
+run both sides past a term neither exercised, which is how the omission
+survived in the first place. Worst stage 8.89e-4 against a 2e-3 bound.
+
+🔴 **AND A TOOL OVERFLOWED ITS OWN STACK AT LENGTH.** `Math.min(...c.pae)`
+passes every element as an ARGUMENT, so a 472-residue fold's 222,784 of them
+raise "Maximum call stack size exceeded" from a line that looks like
+arithmetic. It had only ever run on 59-token folds. Reduced instead.

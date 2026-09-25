@@ -361,7 +361,7 @@ export async function foldEsmfold2(device, options) {
     // `ESMFold2AtomEncoder`/`Decoder` both hold a `SWA3DRoPEAttention` whose
     // `_atom_attention` is DENSE until something sets it otherwise, and the
     // fold path never does - so these are dense too, not windowed.
-    window: options.atomDense === true ? (1 << 24) : shape.atomWindow,
+    window: options.atomWindowed === true ? shape.atomWindow : (1 << 24),
     attentionPrecision: options.attentionPrecision ?? "bf16",
   };
   // The catch is only so a compile that fails before anything awaits it is not
@@ -497,8 +497,11 @@ export async function foldEsmfold2(device, options) {
       // and its forward takes the windowed branch only when something calls
       // `set_atom_attention("windowed")` - which nothing on the fold path does.
       // `swa_window_size` is in the config and unused by the shipped model. A
-      // window covering every atom IS dense, so this needs no second kernel.
-      window: options.atomDense === true ? atoms * 2 : shape.atomWindow,
+      // window covering every atom IS dense, so this needs no second kernel -
+      // only an `attend` that does not hold the whole window in workgroup
+      // memory, which is why the chunked online softmax landed first.
+      // `--atom-windowed=1` restores the old behaviour for comparison.
+      window: options.atomWindowed === true ? shape.atomWindow : atoms * 2,
       precision: options.attentionPrecision ?? "bf16",
     };
     let embedderConditioning;

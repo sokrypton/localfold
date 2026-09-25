@@ -389,7 +389,7 @@ export async function main(device, args = []) {
     // inputs embedder runs under `torch.amp.autocast(bfloat16)` on CUDA and in
     // f32 without it, so a comparison against a CPU reference is comparing two
     // precisions unless this says which. See docs/EF2FAST.md.
-    ...(option(args, "atom-dense", "") === "" ? {} : { atomDense: true }),
+    ...(option(args, "atom-windowed", "") === "" ? {} : { atomWindowed: true }),
     ...(option(args, "atom-blocks", "") === ""
       ? {} : { atomBlocks: Number(option(args, "atom-blocks", "")) }),
     ...(option(args, "attention-precision", "") === ""
@@ -935,6 +935,12 @@ export async function main(device, args = []) {
     confidence: result.confidence === undefined ? undefined : (() => {
       const c = result.confidence;
       const mean = (v) => v.reduce((a, b) => a + b, 0) / v.length;
+      // 🔴 NOT `Math.min(...v)`. A spread passes every element as an ARGUMENT,
+      // so the PAE of a 472-residue fold - 222,784 of them - overflows the
+      // call stack with "Maximum call stack size exceeded" from a line that
+      // looks like arithmetic. It only ever ran on 59-token folds before.
+      const least = (v) => v.reduce((a, b) => (b < a ? b : a), Infinity);
+      const most = (v) => v.reduce((a, b) => (b > a ? b : a), -Infinity);
       const n = Math.round(Math.sqrt(c.pae.length));
       let asym = 0;
       for (let i = 0; i < n; i += 1) {
@@ -942,12 +948,12 @@ export async function main(device, args = []) {
       }
       return {
         meanPlddt: Number((mean(c.plddt) * 100).toFixed(3)),
-        minPlddt: Number((Math.min(...c.plddt) * 100).toFixed(2)),
-        maxPlddt: Number((Math.max(...c.plddt) * 100).toFixed(2)),
+        minPlddt: Number((least(c.plddt) * 100).toFixed(2)),
+        maxPlddt: Number((most(c.plddt) * 100).toFixed(2)),
         complexPlddt: Number((c.complexPlddt * 100).toFixed(3)),
         paeMean: Number(mean(c.pae).toFixed(4)),
-        paeMin: Number(Math.min(...c.pae).toFixed(3)),
-        paeMax: Number(Math.max(...c.pae).toFixed(3)),
+        paeMin: Number(least(c.pae).toFixed(3)),
+        paeMax: Number(most(c.pae).toFixed(3)),
         paeAsymmetry: Number((asym / c.pae.length / mean(c.pae)).toFixed(6)),
         ptm: c.ptm === undefined ? undefined : Number(c.ptm.toFixed(6)),
         iptm: c.iptm === undefined ? undefined : Number(c.iptm.toFixed(6)),

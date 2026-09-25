@@ -264,7 +264,20 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  */
 export function createSwaAttendShader({ atoms, channels, heads, window }) {
   const headDim = channels / heads;
-  const blocks = window / 32;
+  // 🔴 THE KEYS ARE WALKED IN FIXED CHUNKS WITH AN ONLINE SOFTMAX, so workgroup
+  // memory does not scale with the window. It used to hold `heads * window`
+  // logits, which is fine for a 129-key slide and impossible for a dense one:
+  // 3584 atoms is 57 KB against this card's 48 KiB and Metal's 32 KiB, and the
+  // pipeline was refused outright. The reference's atom attention is DENSE -
+  // `SWA3DRoPEAttention` defaults to ATOM_ATTENTION_DENSE and nothing ever sets
+  // it otherwise - so the window had to stop being a memory bound before it
+  // could stop being a model difference. At CHUNK 256 and 4 heads this is
+  // 5.5 KB whatever the protein's length.
+  const CHUNK = 256;
+  const scale = (1 / Math.sqrt(headDim)).toFixed(10);
+  // A finite sentinel, not -inf: the first chunk's rescale computes
+  // `exp(peak - newPeak)` and -inf minus -inf is NaN.
+  const FLOOR = "-3.0e38";
   return `
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> key: array<f32>;
@@ -274,9 +287,11 @@ export function createSwaAttendShader({ atoms, channels, heads, window }) {
 @group(0) @binding(5) var<storage, read> gate: array<f32>;
 @group(0) @binding(6) var<storage, read_write> output: array<f32>;
 
-var<workgroup> logits: array<f32, ${heads * window}>;
+var<workgroup> logits: array<f32, ${heads * CHUNK}>;
+var<workgroup> live: array<f32, ${CHUNK}>;
 var<workgroup> reduce: array<f32, ${channels}>;
-var<workgroup> live: array<f32, ${window}>;
+var<workgroup> headPeak: array<f32, ${heads}>;
+var<workgroup> headSum: array<f32, ${heads}>;
 
 @compute @workgroup_size(${channels})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -289,71 +304,93 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let end = u32(bounds[atom * 2u + 1u]);
   let count = end - start;
   let mine = valid[atom];
+  let q_base = (atom * ${heads}u + head) * ${headDim}u;
 
-  // Which keys are allowed at all: the diagonal always, otherwise both live.
-  for (var slot = local.x; slot < ${window}u; slot += ${channels}u) {
-    let j = start + slot;
-    var allowed = 0.0;
-    if (slot < count) {
-      allowed = select(mine * valid[j], 1.0, j == atom);
-    }
-    live[slot] = allowed;
+  if (local.x < ${heads}u) {
+    headPeak[local.x] = ${FLOOR};
+    headSum[local.x] = 0.0;
   }
   workgroupBarrier();
 
-  // Logits, a key block of 32 across every head at a time.
-  let q_base = (atom * ${heads}u + head) * ${headDim}u;
-  for (var block = 0u; block < ${blocks}u; block += 1u) {
-    let slot = block * 32u + d % 32u;
-    // ...every head's lanes cover 32 keys; the rest of the head's lanes idle.
-    if (d < 32u && slot < ${window}u) {
+  var context = 0.0;
+  // 🔴 THE ONLY RUNTIME-BOUND LOOP IN THE KERNEL, and deliberately the outer
+  // one: CLAUDE.md records a 4.3x cost for a runtime bound in a HOT loop, and
+  // every loop inside this one has a constant trip count.
+  for (var base = 0u; base < count; base += ${CHUNK}u) {
+    // Which keys of this chunk are allowed: the diagonal always, else both live.
+    for (var slot = local.x; slot < ${CHUNK}u; slot += ${channels}u) {
+      let at = base + slot;
+      var allowed = 0.0;
+      if (at < count) {
+        let j = start + at;
+        allowed = select(mine * valid[j], 1.0, j == atom);
+      }
+      live[slot] = allowed;
+    }
+    workgroupBarrier();
+
+    for (var slot = d; slot < ${CHUNK}u; slot += ${headDim}u) {
       var total = 0.0;
       if (live[slot] != 0.0) {
-        let k_base = ((start + slot) * ${heads}u + head) * ${headDim}u;
+        let k_base = ((start + base + slot) * ${heads}u + head) * ${headDim}u;
         for (var e = 0u; e < ${headDim}u; e += 1u) {
           total += query[q_base + e] * key[k_base + e];
         }
       }
-      logits[head * ${window}u + slot] = total * ${(1 / Math.sqrt(headDim)).toFixed(10)};
+      logits[head * ${CHUNK}u + slot] = total * ${scale};
     }
-  }
-  workgroupBarrier();
+    workgroupBarrier();
 
-  // Softmax per head, over its own slice.
-  var largest = -3.0e38;
-  for (var slot = d; slot < ${window}u; slot += ${headDim}u) {
-    if (live[slot] != 0.0) { largest = max(largest, logits[head * ${window}u + slot]); }
-  }
-  reduce[local.x] = largest;
-  workgroupBarrier();
-  for (var stride = ${headDim / 2}u; stride > 0u; stride >>= 1u) {
-    if (d < stride) { reduce[local.x] = max(reduce[local.x], reduce[local.x + stride]); }
+    // This chunk's largest logit, per head.
+    var largest = ${FLOOR};
+    for (var slot = d; slot < ${CHUNK}u; slot += ${headDim}u) {
+      if (live[slot] != 0.0) { largest = max(largest, logits[head * ${CHUNK}u + slot]); }
+    }
+    reduce[local.x] = largest;
+    workgroupBarrier();
+    for (var stride = ${headDim / 2}u; stride > 0u; stride >>= 1u) {
+      if (d < stride) { reduce[local.x] = max(reduce[local.x], reduce[local.x + stride]); }
+      workgroupBarrier();
+    }
+    let chunkPeak = reduce[head * ${headDim}u];
+    let wasPeak = headPeak[head];
+    let peak = max(wasPeak, chunkPeak);
+    // What the running total and the running context are worth against the new
+    // peak. Both are zero on the first chunk, so an exp() of the sentinel is
+    // harmless as well as finite.
+    let rescale = exp(wasPeak - peak);
+    workgroupBarrier();
+
+    var total = 0.0;
+    for (var slot = d; slot < ${CHUNK}u; slot += ${headDim}u) {
+      let weight = select(0.0, exp(logits[head * ${CHUNK}u + slot] - peak), live[slot] != 0.0);
+      logits[head * ${CHUNK}u + slot] = weight;
+      total += weight;
+    }
+    reduce[local.x] = total;
+    workgroupBarrier();
+    for (var stride = ${headDim / 2}u; stride > 0u; stride >>= 1u) {
+      if (d < stride) { reduce[local.x] += reduce[local.x + stride]; }
+      workgroupBarrier();
+    }
+    let chunkSum = reduce[head * ${headDim}u];
+    workgroupBarrier();
+    if (d == 0u) {
+      headSum[head] = headSum[head] * rescale + chunkSum;
+      headPeak[head] = peak;
+    }
+
+    // ...and this chunk's weighted values, onto the rescaled running context.
+    context = context * rescale;
+    for (var slot = 0u; slot < ${CHUNK}u; slot += 1u) {
+      let weight = logits[head * ${CHUNK}u + slot];
+      if (weight == 0.0) { continue; }
+      context += weight * value[((start + base + slot) * ${heads}u + head) * ${headDim}u + d];
+    }
     workgroupBarrier();
   }
-  let peak = reduce[head * ${headDim}u];
-  workgroupBarrier();
-  var total = 0.0;
-  for (var slot = d; slot < ${window}u; slot += ${headDim}u) {
-    let weight = select(0.0, exp(logits[head * ${window}u + slot] - peak), live[slot] != 0.0);
-    logits[head * ${window}u + slot] = weight;
-    total += weight;
-  }
-  reduce[local.x] = total;
-  workgroupBarrier();
-  for (var stride = ${headDim / 2}u; stride > 0u; stride >>= 1u) {
-    if (d < stride) { reduce[local.x] += reduce[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let sum = max(reduce[head * ${headDim}u], 1.0e-30);
-  workgroupBarrier();
 
-  // The weighted sum: one read a key a lane, adjacent lanes adjacent addresses.
-  var context = 0.0;
-  for (var slot = 0u; slot < count; slot += 1u) {
-    let weight = logits[head * ${window}u + slot];
-    if (weight == 0.0) { continue; }
-    context += weight * value[((start + slot) * ${heads}u + head) * ${headDim}u + d];
-  }
+  let sum = max(headSum[head], 1.0e-30);
   let at = atom * ${channels}u + local.x;
   let g = gate[at];
   output[at] = (context / sum) * mine / (1.0 + exp(-g));
