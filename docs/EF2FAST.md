@@ -3289,3 +3289,68 @@ for the roughness to be tested and fail - after the distance-map collapse and
 the doubled skip. Each one was plausible enough to have been written up as the
 cause. What survives is the reading the training recipe supports: a shallow
 head, 780 updates, and an objective whose every term is pointwise or global.
+
+### FOUND: the confidence head is missing `relative_position_encoding`
+
+Asked to run their code on one sequence and save the PAE. Doing that found the
+bug, and the three refuted hypotheses above were all looking in the wrong place.
+
+`PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK`, 59 residues,
+3 loops, seed 42, our float32 head bundle against Synthyra's own model:
+
+| | native | ours |
+|---|---:|---:|
+| **CA-RMSD between the two folds** | — | **0.358 A** |
+| mean pLDDT | **89.15** | 75.32 |
+| pTM | **0.8304** | 0.7437 |
+| PAE mean | 3.787 | 5.495 |
+| PAE roughness | **0.162** | 0.390 |
+| PAE lag-1 autocorrelation | **0.977** | 0.873 |
+
+🔴 **THE STRUCTURE IS THE SAME FOLD AND THE CONFIDENCE IS NOT.** 0.358 A over 59
+residues is agreement; 13.8 pLDDT and 0.087 pTM is not. That decomposition is
+what names the fault: nothing upstream of the head is wrong.
+
+🔴 **AND THE HEAD TAKES TWO OPTIONAL TENSORS THAT DEFAULT TO `None`.**
+
+```python
+relative_position_encoding: Tensor | None = None,
+token_bonds_encoding: Tensor | None = None,
+...
+if relative_position_encoding is not None:
+    z_base = z_base + relative_position_encoding
+if token_bonds_encoding is not None:
+    z_base = z_base + token_bonds_encoding
+```
+
+Native passes `relative_position_encoding` - captured off its own forward
+pre-hook at `(1, 59, 59, 256)` - and this port passes neither. There is no
+error and no shape complaint: the term is simply absent from `z_base`, which is
+what a `None` default buys.
+
+🔴 **AND IT EXPLAINS THE TEXTURE, WHICH IS WHY IT IS THE ANSWER AND NOT JUST A
+DEFECT.** A relative-position encoding is a smooth function of sequence
+separation - the same |i - j| prior every pair track in this repository carries.
+Removing it takes the smooth part out of the pair the PAE head reads and leaves
+the high-frequency remainder, which is exactly a correct mean and sd with a
+collapsed lag-1 autocorrelation. The roughness was the missing term, seen from
+the other end.
+
+🔴 **AND NO ORACLE HERE COULD HAVE CAUGHT IT, FOR THE REASON THIS FILE KEEPS
+RECORDING.** `dump_esmfold2_confidence.py` and
+`check_esmfold2_confidence_real.py` both call their head with the argument list
+THIS PORT passes, so both sides omitted the same tensor and agreed to 1.4e-7 and
+1.4e-4 respectively. **An oracle that builds its own call cannot see an argument
+neither side supplies.** The only thing that could was running their PIPELINE,
+which chooses the arguments itself - and that is why an end-to-end native run is
+worth the transformers-5.13 venv it costs.
+
+The tensor already exists on our side: `diffusion-webgpu.js` takes `relPos`,
+"the same relative-position encoding z_init used, on device", because the
+diffusion conditioning needs it. The fix is to pass it to the confidence head
+and add it to the pair init in the host reference and the WGSL alike, then
+re-run this comparison. `token_bonds_encoding` is the second, and matters for a
+ligand or a bonded pair rather than for a plain chain.
+
+Saved: `oracle-dumps/esmfold2-native-pae-59.json` (their PAE, pLDDT, pTM for
+this sequence) and `esmfold2-native-ca-59.json` (their CA coordinates).
