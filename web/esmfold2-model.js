@@ -8,12 +8,14 @@
  * folding model, which is why the ESM-C manifest carries both names and why
  * `loadEsmfold2Weights` checks them rather than trusting the pairing.
  *
- * 🔴 AND IT HAS NO CONFIDENCE HEAD. `confidence_head.enabled` is false in this
- * checkpoint and there are ZERO `confidence_head.*` tensors in it - so there is
- * no pLDDT, no PAE, no pTM and no ipTM, and none of them is computed and hidden.
- * What the trunk does produce is a DISTOGRAM, and the contact map from it is
- * what the heatmap panel is given. A page that filled a pLDDT column with a
- * constant would be inventing the model's opinion of its own answer.
+ * 🔴 AND ITS CONFIDENCE HEAD IS SOMEBODY ELSE'S. `confidence_head.enabled` is
+ * false in biohub's checkpoint and there are ZERO `confidence_head.*` tensors
+ * in it, which is why this page reported no pLDDT for as long as that was the
+ * only checkpoint. Synthyra trained one against the same FROZEN trunk and
+ * published it separately, so the bundle carries the two from two sources and
+ * the fold reports a real pLDDT, PAE, pTM and ipTM. The trunk's distogram is
+ * still what the contact map comes from; what is gone is the certainty that
+ * used to stand in for a confidence, which was an ordering rather than a score.
  *
  * 🔴 AND NO ALIGNMENT AND NO TEMPLATE. `disable_msa_features` is true, the MSA
  * encoder is disabled, and `grep -rn template` over the whole upstream package
@@ -25,8 +27,8 @@ import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
 import { readTensor } from "../src/weights/dtype.js";
 import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
 import {
-  atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
-  trunkBlockWeights,
+  atomDecoderWeights, atomEncoderWeights, confidenceHeadWeights, denoiserWeights,
+  featuriserWeights, trunkBlockWeights,
 } from "../src/esmfold2/weights.js";
 import { SHIM_PAIR_TENSORS } from "../src/esmfold2/language-pair-webgpu.js";
 import { EsmcTowerGpu } from "../src/esmc/tower-webgpu.js";
@@ -223,6 +225,20 @@ export function loadEsmfold2Weights(onProgress,
     for (let layer = 0; layer < M.blocks; layer += 1) {
       trunkBlocks.push(await trunkBlockWeights(read, layer));
     }
+    // 🔴 THE HEAD IS REQUIRED, AND A BUNDLE WITHOUT ONE IS REFUSED BY NAME.
+    // biohub's checkpoint carries no `confidence_head.*` tensors; Synthyra
+    // trained one on the same frozen trunk and this page shows its pLDDT, PAE
+    // and pTM rather than an estimate. There is deliberately NO fallback to the
+    // distogram's certainty: a page that silently swapped a real confidence for
+    // a derived one would put two different quantities under one label, and the
+    // estimate it replaced was measured to INVERT across folds - better on a
+    // fold that failed. A bundle exported before the head existed says so here
+    // rather than folding and showing something else.
+    const confidence = await confidenceHeadWeights(read, foldManifest);
+    if (confidence === null) {
+      throw new Error(`${family}'s bundle carries no confidence head; re-export it`
+        + " with tools/export_esmfold2_trunk.py --confidence");
+    }
 
     // 🔴 THE SHIM'S SINGLE HALF IS LOADED EVEN THOUGH THE TOWER COMPUTES IT.
     // A non-protein token never reaches the tower and its hidden state is ZERO
@@ -241,6 +257,7 @@ export function loadEsmfold2Weights(onProgress,
     return {
       shape: { ...M, loops: (M.loops ?? 3) + 1 },
       weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
+      confidenceWeights: confidence,
       language: {
         manifest: towerManifest.languageModel,
         // ...what the language band in src/esmfold2/cost.js is priced on, taken

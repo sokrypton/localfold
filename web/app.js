@@ -3068,7 +3068,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       // very end. That is both halves of what was reported: no best view on the
       // first frame, and a different angle on the last.
       if (!colouring) {
-        colouring = setColourMode(certainty === undefined ? "chain" : "plddt");
+        colouring = setColourMode("plddt");
         orientBestView(renderer);
       }
     } catch (error) {
@@ -3088,19 +3088,22 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // they are computed and there is no last one yet.
   let reference = null;
   let slots;
-  // 🔴 THE COLOUR IS THE DISTOGRAM'S CERTAINTY, NOT A pLDDT, AND THE PDB SAYS
-  // SO IN A REMARK. This checkpoint has no confidence head - 820 tensors and
-  // not one named confidence, plddt, pae or pde - so what goes in the B-factor
-  // is an ORDERING with nothing to calibrate a number against. It is written
-  // there because that is the only column a viewer can colour from, and a
-  // downloaded file that carried an uncommented pLDDT-shaped column would be
-  // read as one. See CERTAINTY in src/esmfold2/distogram-webgpu.js for the
-  // sweep that chose its three constants.
-  let certainty;
-  let lastFrameCertainty;
-  const REMARK = "REMARK   1 B-FACTOR IS DISTOGRAM CERTAINTY (0-100), NOT pLDDT."
-    + "\nREMARK   1 THIS ESMFOLD2 CHECKPOINT HAS NO CONFIDENCE HEAD.";
-  const withRemark = (pdb) => `${REMARK}\n${pdb}`;
+  // 🔴 THE B-FACTOR IS A REAL pLDDT NOW, AND THE REMARK HAD TO CHANGE WITH IT.
+  // It read "B-FACTOR IS DISTOGRAM CERTAINTY (0-100), NOT pLDDT" and "THIS
+  // ESMFOLD2 CHECKPOINT HAS NO CONFIDENCE HEAD" for as long as both were true.
+  // Synthyra trained one on this frozen trunk, so every downloaded file that
+  // kept those two lines would now deny its own column - and a file is read
+  // long after the page that wrote it, by somebody who cannot check.
+  //
+  // 🔴 AND THE SAMPLER FRAMES GET A DIFFERENT ONE, because they have no
+  // confidence at all: the head reads the FINISHED coordinates and runs once,
+  // so a frame's column is empty rather than early. One remark for both would
+  // have to be wrong about one of them.
+  const PROVENANCE = `REMARK   1 ${modelName} PREDICTION BY LOCALFOLD (https://localfold.org)`;
+  const FINAL_REMARK = `${PROVENANCE}\nREMARK   1 B-FACTOR IS pLDDT (0-100).`;
+  const FRAME_REMARK = `${PROVENANCE}\nREMARK   1 SAMPLER FRAME: B-FACTOR IS UNSET, NOT A CONFIDENCE.`;
+  const withRemark = (pdb) => `${FINAL_REMARK}\n${pdb}`;
+  const withFrameRemark = (pdb) => `${FRAME_REMARK}\n${pdb}`;
 
   const started = performance.now();
   // 🔴 THE SAME CACHE AlphaFold 3's PATH HAS, AND FOR THE SAME REASON: the trunk
@@ -3152,6 +3155,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // the same four passes it always was.
     shape: { ...loaded.shape, loops: recycleCount() + 1 },
     weights: loaded.weights,
+    confidenceWeights: loaded.confidenceWeights,
     tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
                                loaded.shape.pairChannels),
     sampler: samplerPreset(),
@@ -3165,13 +3169,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // ...and how big it is, so the bar's language band is this tower's and not
     // the one the constants were fitted against.
     languageModelMiB: loaded.language.megabytes,
-    // 🔴 EACH FRAME GETS ITS OWN COLOUR, WHICH NEEDS THE DISTOGRAM RESIDENT.
-    // The trunk's own certainty is fixed for a fold, so every frame would wear
-    // the same one - and the interesting thing about a trajectory is watching
-    // it become confident. Scoring each frame against the distogram costs the
-    // logits staying on the device, 46 MiB at 300 tokens, released with the
-    // last frame.
-    frameCertainty: true,
+    // 🔴 NO `frameCertainty`, AND DROPPING IT GIVES BACK 46 MiB AT 300 TOKENS.
+    // It kept the distogram's logits resident so every sampler frame could be
+    // scored and coloured; the head reads the finished coordinates, so the
+    // frames have no confidence to wear and the logits were being retained for
+    // a colour nothing draws.
     // 🔴 THE LINE AND THE BAR ARE TWO CALLBACKS NOW, AS AF3's ARE. One phase
     // word plus a percentage on the line; the fraction drives the bar. The
     // first version wrote a stage name per stage, and a two-millisecond recycle
@@ -3184,7 +3186,6 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // its own.
     onContacts: (contacts, trunkCertainty) => {
       liveContacts = contactMapFor(contacts, viewerKeep);
-      certainty = trunkCertainty;
       showTrunkContacts(liveContacts, chains);
     },
     // 🔴 `denoised` AND NOT `coordinates`, AND THE REASON IS THE CAMERA. The
@@ -3195,7 +3196,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // almost all network - and is protein-sized in every frame. AF3's path
     // records the same finding, measured: a radius of gyration of 1896 A at
     // step 4 against 11.1 at the end.
-    onStep: ({ denoised, features, certainty: frameCertainty }) => {
+    onStep: ({ denoised, features }) => {
       if (signal.aborted) return;
       const dense = toDensePositions(features, denoised);
       if (slots === undefined) slots = alphaCarbons(features.batch);
@@ -3207,12 +3208,16 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       // finished structure's confidence. The trunk's mode-based certainty is
       // the fallback, and it is the same quantity measured a different way -
       // the two scored a tie on the sweep.
-      const shown = frameCertainty ?? certainty;
-      const pdb = withRemark(fittedPdb(features.batch, dense, reference, slots,
-        shown === undefined ? null : spreadOverAtoms(features, shown, 100)));
+      // 🔴 THE LIVE FRAMES CARRY NO CONFIDENCE, AND THAT IS THE COST OF HAVING
+      // A REAL ONE. The head reads the FINISHED coordinates, so it runs once at
+      // the end; there is nothing to colour a sampler step by. The distogram's
+      // certainty used to fill that gap and is gone - it is a different
+      // quantity under the same palette, and it was measured to INVERT across
+      // folds. A chain-coloured walk that ends in a real pLDDT says what is
+      // known when it is known.
+      const pdb = withFrameRemark(fittedPdb(features.batch, dense, reference, slots, null));
       framePdbs.push(pdb);
       drawLiveFrame(pdb);
-      lastFrameCertainty = shown;
     },
   });
   throwIfAborted(signal);
@@ -3226,9 +3231,26 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // The two are the same quantity read two ways, but the play bar would step
   // from a per-frame colour to a different one on its last frame, which reads
   // as the fold changing its mind at the end.
-  certainty = lastFrameCertainty ?? result.certainty ?? certainty;
-  const bFactors = certainty === undefined
-    ? null : spreadOverAtoms(result.features, certainty, 100);
+  // 🔴 THE HEAD'S OWN pLDDT, ON 0-100 LIKE EVERY OTHER MODEL'S. Synthyra's
+  // returns [0, 1] - `_categorical_mean(plddt_logits, 0.0, 1.0)` - and every
+  // surface here, the palette included, reads a percentage.
+  const plddt = Float32Array.from(result.confidence.plddt, (value) => value * 100);
+  const bFactors = spreadOverAtoms(result.features, plddt, 1);
+
+  // 🔴 A `confidence` OBJECT AT LAST, AND IT IS THE SHAPE EVERY OTHER MODEL
+  // WRITES. This used to be deliberately absent - "an object carrying zeros
+  // would be read as the model's opinion" - because the checkpoint had no head.
+  // It has one now, so the scores card, the archive's summary and the PAE panel
+  // all read the same fields here as they do for AlphaFold 3.
+  const confidence = {
+    plddt, meanPlddt: plddt.reduce((a, b) => a + b, 0) / plddt.length,
+    predictedAlignedError: result.confidence.pae,
+    ptm: result.confidence.ptm,
+    // ...NaN where there is no interface, which is how this page already spells
+    // "not applicable" for a monomer's ipTM; see confidenceJson.
+    iptm: chains.length > 1 ? result.confidence.iptm : Number.NaN,
+    contactProbs: result.contacts,
+  };
   const finalDense = toDensePositions(result.features, result.coordinates);
   const pdb = withRemark(reference === null
     ? toPdb(result.features.batch, finalDense, bFactors)
@@ -3249,7 +3271,13 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // measured and not shipped. `src/esmfold2/aligned-error.js` and
   // `tools/pae-transfer.py` keep the estimator and the numbers; nothing draws
   // it until the inversion is fixed.
-  const paeMap = undefined;
+  // 🔴 AND THE PAE IS DRAWN NOW, because it is predicted rather than estimated.
+  // What used to be here was `src/esmfold2/aligned-error.js`, withheld with its
+  // numbers: it ordered pairs WITHIN a fold at 0.746 against AlphaFold 3's real
+  // PAE and INVERTED across folds at -0.867, so a failed fold scored better
+  // than a good one. This is the head's own, on the same 0-32 scale as
+  // everyone's.
+  const paeMap = paeMapFor(result.confidence.pae);
   // 🔴 THE CAMERA IS SAVED ACROSS THE RELOAD, OR THE VIEW JUMPS AT THE END.
   // `loadIntoViewer` ingests a FILE, and py2Dmol orients the camera when it
   // parses one - so the trajectory the reader has been watching, and possibly
@@ -3263,7 +3291,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const camera = { ...(liveRenderer?.viewerState ?? {}) };
   const live = liveRenderer?.objectsData?.[liveRenderer?.currentObjectName];
   if (live?.frames !== undefined) live.frames.length = 0;
-  await loadIntoViewer({ stem, pdb: framePdbs[0] ?? pdb, scores: {} });
+  await loadIntoViewer({ stem, pdb: framePdbs[0] ?? pdb,
+                         scores: confidenceJson(sequence, confidence), confidence });
   if (viewer !== undefined && Object.keys(camera).length > 0) {
     Object.assign(viewer.viewerState, camera);
     viewer.render?.("localfold.restore-camera");
@@ -3295,15 +3324,15 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       if (Object.keys(maps).length > 0) frame.maps = maps;
       viewer.addFrame(frame, viewerObject);
     }
-    // 🔴 THE pLDDT PALETTE ON A NUMBER THAT IS NOT A pLDDT, DELIBERATELY. It is
-    // the right palette for a 0-100 confidence-like scale and every reader of
-    // this page already knows how to read it; what must not happen is the WORD
-    // appearing anywhere, which is why the status line names the quantity and
-    // the file carries a REMARK. With no certainty at all it falls back to
-    // chain colours rather than colouring a zero B-factor as no confidence.
+    // 🔴 THE pLDDT PALETTE ON AN ACTUAL pLDDT, WHICH IT WAS NOT. This note used
+    // to say the opposite - the palette was right for a 0-100 confidence-like
+    // scale and the WORD had to appear nowhere - because the B-factor held the
+    // distogram's certainty. The head supplies the real thing, so the palette,
+    // the status line and the file's REMARK all name one quantity, and the
+    // chain-colour fallback is gone with the estimate that needed it.
     // ...again at the end, because loadIntoViewer's own ingestion resets the
     // renderer's data and recomputes its colours.
-    setColourMode(certainty === undefined ? "chain" : "plddt");
+    setColourMode("plddt");
     viewer.setFrame((viewer.objectsData?.[viewerObject]?.frames?.length ?? 1) - 1);
     // ...and the modification drawn, as on the AF3 path: the ribbon runs
     // through its alpha carbon exactly as through the residue it replaced.
@@ -3317,12 +3346,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   }
 
   lastPrediction = {
-    stem, pdb, chains,
+    stem, pdb, chains, confidence,
+    scores: confidenceJson(sequence, confidence),
     chainLengths: chains.map((chain) => chain.length),
-    // 🔴 NO `confidence`, AND THAT IS THE HONEST SHAPE. Everything that reads a
-    // prediction's confidence - the scores card, the archive's summary, the PAE
-    // panel - asks for fields this checkpoint has no head to compute. An object
-    // carrying zeros would be read as the model's opinion.
     // 🔴 ONE FIELD FOR THE CONTACT MAP, WHATEVER PRODUCED IT. See the note on
     // `contactSource` at the download button: this used to be `contacts` here,
     // `confidence.contactProbs` on the AF3 path and `contactSource` on AF2's,
@@ -3330,20 +3356,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // map is its ONLY score wrote an archive without one while the panel on
     // screen showed it.
     contactSource: { contactProbs: result.contacts },
-    // 🔴 AND THE pAE, WHICH IS NOT A `confidence` FIELD AND MUST NOT BECOME
-    // ONE. It is estimated from the distogram rather than predicted by a head -
-    // see src/esmfold2/aligned-error.js - so putting it under `confidence`
-    // would let every reader that tests for that object conclude this
-    // checkpoint has one, and start looking for the pLDDT and pTM beside it.
-    // It is its own field, named for what it is.
-    alignedError: result.alignedError,
-    // 🔴 WITHIN EACH CHAIN AND ACROSS IT, KEPT APART. The certainty a residue
-    // wears is about its own chain; the interface is a different question and
-    // averaging them gives a number that answers neither. Measured on a
-    // two-chain fold: 0.712 within, 0.370 across, 0.630 mixed.
-    chainCertainty: meanByChain(result.features.asymId, certainty),
-    chainInterfaceCertainty: meanByChain(result.features.asymId,
-                                         result.interfaceCertainty),
+    // 🔴 PER CHAIN, OFF THE REAL pLDDT NOW. This was `chainCertainty` from the
+    // distogram, kept apart from an interface number for the reason that note
+    // gave; the head answers both directly, so the estimate and its companion
+    // are gone rather than sitting beside a quantity that supersedes them.
+    chainPlddt: meanByChain(result.features.asymId, plddt),
     model: modelName,
     // 🔴 THE TOKEN LAYOUT, because a ligand is one token per heavy atom and the
     // archive cannot infer that from the chain lengths - it refuses to guess
@@ -3381,14 +3398,14 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   esmfold2Trunk = result.reusable === undefined ? esmfold2Trunk
     : { key: trunkKey, reusable: result.reusable };
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
-  const mean = certainty === undefined ? undefined
-    : [...certainty].reduce((total, value) => total + value, 0) / certainty.length;
-  // 🔴 THE WORD "certainty" IS THE DISCLAIMER NOW. "(not pLDDT)" was here to
-  // stop a number under a pLDDT palette being read as one - but the line never
-  // says pLDDT, the model row's tooltip says the model reports no confidence,
-  // the PDB carries a REMARK naming the quantity, and the archive's README
-  // spells it out. A parenthesis denying something nothing claimed reads as a
-  // disclaimer rather than a result.
+  const mean = confidence.meanPlddt;
+  // 🔴 IT SAYS pLDDT NOW, AND THAT IS A CHANGE OF FACT AND NOT OF WORDING.
+  // This line read "certainty" for as long as the checkpoint had no confidence
+  // head, with a note here explaining that the word WAS the disclaimer. The
+  // head is real, its pLDDT is the same 0-100 quantity every other model on
+  // this page reports, and calling it anything else would now be the misleading
+  // choice. The pTM sits beside it, and the ipTM only where there is an
+  // interface to have one.
   // 🔴 RESIDUES, NOT TOKENS. They are the same number until a modification
   // atomises one - and then this line read "22 res" for a thirteen-residue
   // chain, which is the model's own bookkeeping leaking onto the status bar.
@@ -3399,7 +3416,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
     + ` · ${result.steps} steps · ${seconds}s`
     + (result.trunkReused ? " (trunk reused)" : "")
-    + (mean === undefined ? "" : ` · certainty ${mean.toFixed(2)}`));
+    + ` · pLDDT ${mean.toFixed(1)}`
+    + (Number.isFinite(confidence.ptm) ? ` · pTM ${confidence.ptm.toFixed(3)}` : "")
+    + (Number.isFinite(confidence.iptm) ? ` · ipTM ${confidence.iptm.toFixed(3)}` : ""));
   progress(null);
 }
 
@@ -5130,9 +5149,9 @@ function archiveFor(pred, { includeAlignment = true } = {}) {
         // `paeMap` in the EF2-fast path, and aligned-error.js.
         confidence: {
           ...pred.confidence,
-          // ...a model with no confidence head still has these two.
-          chainCertainty: pred.chainCertainty,
-          chainInterfaceCertainty: pred.chainInterfaceCertainty,
+          // ...per chain, which the confidence object itself does not carry:
+          // `meanByChain` needs the token-to-chain map and the fold has it.
+          chainPlddt: pred.chainPlddt,
           // 🔴 RESOLVED HERE, NOT WHEN THE FOLD FINISHED. AlphaFold 2 computes
           // its contact map in a setTimeout - the distogram head costs 131 ms
           // at 128 residues and is deliberately off the fold's critical path -
@@ -5485,9 +5504,11 @@ async function restoreSession() {
         : { contactProbs: recovered.contactProbs }),
       // 🔴 AND pLDDT IS ATTACHED ONLY WHERE THERE IS ONE. `fullDataJson` picks
       // `atom_plddts` over `atom_certainty` on exactly this field's presence,
-      // so handing it EF2-fast's B-factors - which are a distogram certainty,
-      // under a REMARK saying so - would label them as the model's pLDDT in
-      // the one file a reader is most likely to parse.
+      // so a B-factor column that is not a pLDDT must not arrive here. Every
+      // model on this page has a confidence head today - EF2-fast was the last
+      // without one and was the example this note used to give - so the guard
+      // is the rule rather than a live case, and it stays because the rule is
+      // what stops the next headless checkpoint labelling its column.
       ...(scored && recovered.plddt !== undefined ? { plddt: recovered.plddt } : {}),
     };
 

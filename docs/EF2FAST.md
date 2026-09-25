@@ -3121,3 +3121,59 @@ reached the stack: the triangle's projection is on f16 MATRIX units chosen from
 device tuning, which no precision flag reaches. Turning them off is WORSE -
 `--tune=triangleProjectMatrix=false` reads 2.72e-3.
 
+
+### The page, and the four surfaces that had been shaped around not having one
+
+Wiring it in is not one field. Every surface here had been built to be honest
+about a missing confidence, so each carried a claim that became false the moment
+the head landed - and a claim in a downloaded file outlives the page that wrote
+it. The status line, the B-factor column, the PAE panel and the archive all
+changed together, and so did the notes explaining why they used to be as they
+were.
+
+| surface | before | now |
+|---|---|---|
+| status line | `· certainty 0.53` | `· pLDDT 52.9 · pTM 0.434`, and ipTM only where there is an interface |
+| B-factor | the distogram's certainty, 0-100 | the head's pLDDT - measured on the page, final frame **35.3 to 63.9** over 466 atoms |
+| PAE panel | `const paeMap = undefined` | drawn, 58 x 58, `map1 keys ["pae","contact"]` |
+| archive | `atom_certainty`, `chain_certainty`, no `pae`, a README paragraph saying there is no head | `atom_plddts`, `chain_plddt: [52.87]`, `pae`, `ptm`, `chain_pair_pae_min` |
+| colour | `setColourMode(certainty === undefined ? "chain" : "plddt")` | `"plddt"`, unconditionally |
+
+🔴 **NO FALLBACK, ON PURPOSE: A BUNDLE WITHOUT A HEAD IS REFUSED BY NAME.**
+`confidenceHeadWeights` returning `null` was written as a graceful degradation
+back to the certainty and that is exactly wrong here. The estimate and the
+pLDDT are different quantities, and the estimate was measured to **INVERT
+across folds** (-0.867 against AlphaFold 3's PAE - a failed fold scoring better
+than a good one), so a page that silently swapped one for the other would put
+the worse number under the better name with nothing on screen to say which
+arrived. `web/esmfold2-model.js` throws and names the re-export.
+
+🔴 **AND THE REMARK WAS A LIE FOR ONE COMMIT.** The PDB carried
+`B-FACTOR IS DISTOGRAM CERTAINTY (0-100), NOT pLDDT` and
+`THIS ESMFOLD2 CHECKPOINT HAS NO CONFIDENCE HEAD` - correct for as long as both
+were true, and left in place while the column underneath it became a real
+pLDDT. A file is read long after the page that wrote it, by somebody who cannot
+check. It now writes provenance plus `B-FACTOR IS pLDDT (0-100).`
+
+🔴 **AND THE SAMPLER FRAMES GET A DIFFERENT REMARK, BECAUSE THEY HAVE NO
+CONFIDENCE AT ALL.** The head reads the FINISHED coordinates and runs once, so
+there is nothing to colour a trajectory by; measured on the page, every
+`sampler_*` frame is `min 0.0 max 0.0` and only `final` carries pLDDT. That is
+the same shape AF3's path has always had - its `diffusion_*` frames are 0.0 too
+- so the trajectory is chain-coloured and ends in a real score. One remark for
+both would have to be wrong about one of them.
+
+🔴 **AND DROPPING `frameCertainty` GIVES BACK 46 MiB AT 300 TOKENS.** It kept
+the distogram's logits resident purely so each frame could be scored and
+coloured. Nothing reads that now, and a retained tensor feeding a colour nobody
+draws is invisible in every gate here.
+
+🔴 **THE `certainty` PLUMBING IS DELETED RATHER THAN LEFT UNREAD**, in five
+files - `chainCertainty` and `chainInterfaceCertainty` off the prediction,
+`atom_certainty`'s producer, the `!scored` README paragraph's only caller, the
+model-row tooltip and the `<option>` comment in index.html. What is KEPT is the
+archive's presence-driven branches (`scored`, `estimated_aligned_error`): no
+model on this page is headless today, so they are the rule rather than a live
+case, and the rule is what stops the next headless checkpoint labelling its
+column `atom_plddts`. `src/esmfold2/aligned-error.js` stays too, with its
+numbers - it is the record of a measured, declined estimator.

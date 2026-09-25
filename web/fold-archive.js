@@ -152,9 +152,10 @@ export function fullDataJson({ confidence, alignedError, pdb, tokenChainIds, tok
   // clear, so an independent walk over the sequence counts different atoms.
   const atoms = coordinateAtoms(pdb);
   // 🔴 THE B-FACTOR IS NOT ALWAYS A pLDDT, AND THE KEY MUST NOT SAY IT IS. A
-  // model with no confidence head writes something else in that column -
-  // EF2-fast writes the distogram certainty, under a REMARK naming it - and
+  // model with no confidence head writes something else in that column, and
   // `atom_plddts` would hand a reader the model's opinion where it has none.
+  // EF2-fast was the example until Synthyra trained a head for it; no model on
+  // this page is headless now, and the branch is kept as the rule.
   // Same rule as `has_clash`: a field we do not compute is omitted, not
   // guessed. The presence of a pLDDT vector is what says which this is.
   const scored = confidence.plddt !== undefined;
@@ -322,14 +323,13 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
     summary.chain_pair_max_contact = chainPairMaxContact(
       confidence.contactProbs, tokenChainIds, tokenResIds, chains);
   }
-  // ...and the per-chain certainty, for a model that has no pTM to report. The
-  // two are kept apart for AF3's own reason: a chain can be folded well and
-  // docked badly, and one mean over both says neither.
-  if (confidence.chainCertainty !== undefined) {
-    summary.chain_certainty = confidence.chainCertainty;
-  }
-  if (confidence.chainInterfaceCertainty !== undefined && chains.length > 1) {
-    summary.chain_interface_certainty = confidence.chainInterfaceCertainty;
+  // ...and the per-chain pLDDT, which the server does not write and a reader of
+  // a multi-chain fold wants: a chain can be folded well and docked badly, and
+  // the whole-structure mean says neither. This replaced `chain_certainty` and
+  // `chain_interface_certainty`, which existed only for a model with no
+  // confidence head to report a pTM - there is no longer one on this page.
+  if (confidence.chainPlddt !== undefined) {
+    summary.chain_plddt = confidence.chainPlddt;
   }
   const chainPtm = perChain(confidence.chainPtm);
   const chainIptm = perChain(confidence.chainIptm);

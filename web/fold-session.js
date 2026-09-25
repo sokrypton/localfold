@@ -77,11 +77,12 @@ function open() {
 /**
  * The job behind a session: what py2Dmol's state does not know.
  *
- * 🔴 pLDDT IS ABSENT, NOT ZERO, FOR A MODEL WITH NO CONFIDENCE HEAD. EF2-fast
- * stores no `confidence` object at all - on purpose, since an object of zeros
- * reads as the model's opinion - so this is `undefined` there and the line
- * renders without a score. Writing 0 is the mistake the archive was taught not
- * to make in its B-factor column.
+ * 🔴 pLDDT IS ABSENT, NOT ZERO, FOR A MODEL WITH NO CONFIDENCE HEAD - and the
+ * example this note used to give, EF2-fast, has one now, so the case is
+ * OpenDDE's confidence rather than a missing object. The rule is unchanged: a
+ * model that cannot say stores no `confidence` at all, since an object of zeros
+ * reads as the model's opinion, and this renders without a score. Writing 0 is
+ * the mistake the archive was taught not to make in its B-factor column.
  *
  * 🔴 AND THE CONFIDENCE MATRICES ARE NOT COPIED HERE. The PAE and the contact
  * map are already on the frames py2Dmol saves, which is where the panels read
