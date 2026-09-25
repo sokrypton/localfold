@@ -388,9 +388,10 @@ one field and waiting out the timeout. A 108-residue two-chain fold with
 10,839 hits) sat at "Trunk · 1%" for twenty minutes and did not finish** - not
 diagnosed, but it is the shape to avoid in a quick loop.
 
-🔴 **py2Dmol IS A MIRROR NOW, WITH A COMMIT ON IT.** The four vendored files -
-`py2Dmol.app.css`, `py2Dmol.align.js`, `py2Dmol.embed.min.js`,
-`py2Dmol.full.min.js` - had been copied by hand and nothing recorded from
+🔴 **py2Dmol IS A MIRROR NOW, WITH A COMMIT ON IT.** The vendored files -
+`py2Dmol.app.css`, `py2Dmol.align.js`, `py2Dmol.full.min.js` (and
+`py2Dmol.embed.min.js`, until nothing loaded it) - had been copied by hand and
+nothing recorded from
 where, so "is this current?" could only be answered by diffing 800 KB of
 minified JavaScript against a build. `python3 tools/sync-py2dmol.py` runs
 upstream's own `tools/bundle.py build`, copies the four, and stamps the commit
@@ -1725,6 +1726,10 @@ One line to keep, against an MSA panel that quietly stops wiring itself up.
 still there.
 
 ### 620 KB published for pages that are not on the site
+
+**Since resolved at the source: the bundle is no longer vendored at all.** The
+derivation below still stands and still guards anything else that falls out of
+use; what follows is why it was written.
 
 `py2Dmol.embed.min.js` is loaded by `single.html` and `proteinhunter.html`, both
 **held back at `b0dc258`** - out of the repository and gitignored until the model

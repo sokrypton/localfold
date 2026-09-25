@@ -69,3 +69,58 @@ export function shouldStopAfterRecycle(recycle, distance, tolerance) {
   }
   return recycle > 0 && checkedTolerance > 0 && distance < checkedTolerance;
 }
+
+/**
+ * What a press of Fold has to compute, given what is already in memory.
+ *
+ * 🔴 THREE ANSWERS, AND TWO OF THEM USED TO BE ONE. The page cached a
+ * finished AlphaFold 2 run so that raising the recycle count could CONTINUE
+ * it, and the test was `cached.recycles < recycles` - so asking for MORE
+ * resumed, and asking for the SAME or FEWER fell through to a full fold from
+ * pass zero. That fold cannot differ: everything that could change its answer
+ * is in the cache key, the seed included, so it is minutes spent arriving
+ * back where the page already was. Reported as re-running a prediction that
+ * had already run.
+ *
+ *   "fresh"  - nothing usable in memory; run every pass.
+ *   "resume" - the state is short of what was asked for; run the rest.
+ *   "replay" - the passes are already here; run nothing.
+ *
+ * 🔴 AND FEWER PASSES IS A REPLAY, NOT A FRESH FOLD. The first N passes of a
+ * longer run ARE the N-recycle fold, pass for pass, because each is computed
+ * from the one before it.
+ *
+ * The KEY is the caller's: it names the sequence, the chain lengths, the MSA
+ * depths, the seed, the tolerance, the alignment, the template and the family
+ * - which carries the model NUMBER, so model_1's state can never be handed to
+ * model_3, nor a monomer's to a multimer.
+ *
+ * @param {{key: string, recycles: object[]}} [cache] the last finished run
+ * @param {string} key what this fold would be cached under
+ * @param {number} passes recycles + 1, the passes being asked for
+ * @param {number} recycles what the control says
+ * @returns {{plan: "fresh"|"resume"|"replay", passes: number}} `passes` is
+ *   how many this press must actually compute
+ */
+export function planRecycleReuse({ cache, key, passes, recycles }) {
+  const held = (cache !== undefined && cache !== null && cache.key === key)
+    ? (cache.recycles ?? []) : [];
+  if (held.length === 0) return { plan: "fresh", passes };
+  if (held.length >= passes) return { plan: "replay", passes: 0 };
+  // 🔴 AND A RUN THAT CONVERGED IS COMPLETE AT EVERY COUNT, WHICH THE
+  // LENGTH TEST ABOVE CANNOT SEE. Convergence means the run STOPPED SHORT of
+  // what it was asked for, so `held.length` is always below `passes` and every
+  // press fell through to the resume below - recomputing passes the first run
+  // had deliberately declined to compute, on the commonest fold there is.
+  // It cannot come out differently: the key pins the sequence, the seed, the
+  // tolerance and the alignment, so passes 1..N are the same passes, and the
+  // stop test at N reads N and N-1 alone. Asking for MORE recycles therefore
+  // converges at the same pass - which is why this ignores `recycles` rather
+  // than comparing it.
+  if (cache.converged === true) return { plan: "replay", passes: 0 };
+  // ...and a resume runs what is missing. `resumable.recycles` counts the
+  // passes the STATE describes, which is what the driver starts from.
+  const from = cache.resumable?.recycles;
+  if (typeof from !== "number" || !(from < recycles)) return { plan: "fresh", passes };
+  return { plan: "resume", passes: passes - held.length };
+}

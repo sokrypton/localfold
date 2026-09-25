@@ -204,7 +204,7 @@ Nothing is written to disk and no `File` is manufactured. Extensions decide what
 
 `single.html` is the teaching version and is still LocalFold's own standalone page: one sequence, no alignment, click a residue in the structure to mutate it and re-fold, with the change morphed into the picture. It is next to move onto the same application.
 
-That split is why there are two vendored py2Dmol bundles. `index.html` loads `web/vendor/py2Dmol.full.min.js` (the `full` target: the website, the panels, *and* the embed API, since the morph needs `framesFromText`); `single.html` still loads `py2Dmol.embed.min.js`. Both are vendored rather than fetched from a CDN, so the pages draw with no network access. Confidence colouring is a single `setColor("plddt")` against py2Dmol's own AlphaFold ramp, read out of the B-factor column the PDB writer already fills.
+`index.html` loads `web/vendor/py2Dmol.full.min.js` (the `full` target: the website, the panels, *and* the embed API, since the morph needs `framesFromText`), vendored rather than fetched from a CDN so the page draws with no network access. `single.html` used to load the smaller `py2Dmol.embed.min.js`; that bundle is **no longer vendored**, because the page is held back and nothing in the tree loads it - `tools/sync-py2dmol.py` says in one line how to bring it back with the page. Confidence colouring is a single `setColor("plddt")` against py2Dmol's own AlphaFold ramp, read out of the B-factor column the PDB writer already fills.
 
 `dev.html` is a kernel diagnostic and is not part of either page.
 

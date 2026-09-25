@@ -25,6 +25,7 @@ import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/af2/multimer/model.js";
 import { blankChainColumns, foldsAsSingleSequence, parseA3m }
   from "../src/input/a3m.js";
+import { planRecycleReuse } from "../src/af2/model/recycle-convergence.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
 // AND more than one chain, so a first fold never reaches it - and stopping a
@@ -1660,6 +1661,11 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
   const registry = window.py2dmol_viewers ?? {};
   viewer = registry[Object.keys(registry)[0]]?.renderer;
   viewerObject = viewer?.currentObjectName;
+  // ...and a structure has landed, so it takes the big slot back. This is
+  // AlphaFold 2's first pass - the ingestion path rather than the frame one -
+  // and it said nothing, which is why every AF2 fold recycled with its
+  // structure in the SMALL slot. See foldIsShowing.
+  foldIsShowing(viewer);
   // 🔴 pLDDT ONLY WHERE THERE IS A pLDDT. `loadIntoViewer` is handed `scores`
   // exactly when the model has a confidence head, and painting the pLDDT ramp
   // over an absent B-factor makes every residue the colour of NO CONFIDENCE -
@@ -1903,8 +1909,22 @@ function showTrunkContacts(liveContacts, chains) {
     // the sampler's first frame - so the whole trunk's contact maps were
     // pushed into a panel nobody could see.
     revealViewer(renderer);
-    renderer.chains = trunkChainIds(chains);
-    renderer.heatmapRenderer.setMaps({ contact: liveContacts });
+    const ids = trunkChainIds(chains);
+    renderer.chains = ids;
+    // 🔴 AND THE MAP CARRIES THEM, so the panel does not have to guess whose
+    // they are. It ruled its boundaries off `renderer.chains`, which belongs
+    // to whatever is DRAWN - during a fold that is the PREVIOUS job, because
+    // this one's object is still empty - and py2Dmol's guard compared
+    // LENGTHS, which cannot tell "this array describes this matrix" from
+    // "this array is the same size". Change the copy count or the sequence
+    // length so the totals coincide and the last job's boundaries were ruled
+    // across this picture. Reported as chain lines from previous jobs
+    // bleeding through during transitions. A map that states its own layout
+    // cannot be wrong about it.
+    renderer.heatmapRenderer.setMaps({
+      contact: { data: liveContacts.data ?? liveContacts, n: liveContacts.n,
+                 vmin: liveContacts.vmin, vmax: liveContacts.vmax, chains: ids },
+    });
     window.Heatmap?.updateVisibility?.(renderer);
     renderer.render("trunk-contacts");
   } catch (cause) {
@@ -1972,6 +1992,36 @@ function alignedToFirstPass(sequence, structure, firstPassStructure) {
  * The per-pass PAE rides on the frame, which is where py2Dmol looks for it
  * (`frame.pae` / `frame.pae_n`), so scrubbing the bar moves the matrix too.
  */
+/**
+ * A FOLD HAS PUT A STRUCTURE ON SCREEN: show it, and give it the big slot.
+ *
+ * 🔴 TWO THINGS THAT BELONG TOGETHER WERE WRITTEN OUT AT THREE SITES AND
+ * GATED ON `frames.length === 0`, AND THE PATHS THAT MISS THAT GATE ARE THE
+ * ONES A READER NOTICED. `openBlankFold` gives the contact map the big slot
+ * because an AF3 trunk has one before it has a structure; the structure takes
+ * it back when the first frame lands. But:
+ *
+ *   * AlphaFold 2's first pass goes through `loadIntoViewer`, which called
+ *     NEITHER - so every AF2 fold recycled with its structure in the small
+ *     slot, the contact map big beside it. Reported exactly that way.
+ *   * and a CONTINUATION never reaches pass zero at all: `openBlankFold`
+ *     seeds the object with the cached recycles, so `frames.length` is never
+ *     0 and no site fired. With the page clearing itself on Fold, that left
+ *     it BLANK until the run finished - reported as the screen going blank
+ *     instead of continuing from the recycle of interest.
+ *
+ * So it is one funnel, asked at every site that draws a frame rather than at
+ * the ones that happen to draw the FIRST. Both halves are idempotent -
+ * `revealViewer` returns on a visible container and `contactsBig(false)` only
+ * acts while the map is holding the slot - so calling it per frame costs a
+ * style read and settles the question for every path at once.
+ */
+function foldIsShowing(renderer) {
+  if (renderer === undefined || renderer === null) return;
+  revealViewer(renderer);
+  contactsBig(false);
+}
+
 /**
  * Show the viewer, for a fold that has a structure before it has a file.
  *
@@ -2368,6 +2418,10 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
   frame.pae_n = sequence.length;
   frame.align = true;
   viewer.addFrame(frame, viewerObject);
+  // ...and this is a fold drawing, which on a CONTINUATION is the only thing
+  // that ever says so: pass zero - the one `loadIntoViewer` and every
+  // `frames.length === 0` site key on - belongs to the run being resumed.
+  foldIsShowing(viewer);
   attachContactMap(frame, recycle, weights, sequence.length);
   // ...and jump to it, so the newest pass is the one being looked at.
   const object = viewer.objects?.find((entry) => entry.name === viewerObject);
@@ -2894,7 +2948,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // a container that is actually on screen.
       // ...and the recycles are over, so the structure takes the big slot
       // back. See contactsBig.
-      if (index === 0) { revealViewer(renderer); contactsBig(false); }
+      foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       // ...numbered by the sampler's own count. Every frame in the object is
       // the sampler's now; the trunk draws none.
@@ -3396,7 +3450,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     const object = renderer?.objectsData?.[renderer?.currentObjectName];
     if (renderer === undefined || object === undefined) return;
     try {
-      if (object.frames.length === 0) { revealViewer(renderer); contactsBig(false); }
+      foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
       if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
@@ -4029,7 +4083,7 @@ function remoteFrameDrawer(stem) {
     const object = renderer.objectsData?.[renderer.currentObjectName];
     if (object === undefined) return;
     try {
-      if (object.frames.length === 0) { revealViewer(renderer); contactsBig(false); }
+      foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
       renderer.addFrame(frame, renderer.currentObjectName);
@@ -4064,6 +4118,8 @@ async function fold(event) {
   // The button is no good either: it stays enabled throughout, being how you
   // stop one. See tools/colab_backend.py.
   window.__foldState = { running: true, since: Date.now() };
+  // Whether this press computed anything; see the AF2 replay.
+  let foldWasReplayed = false;
   setFoldButton("running");
   // ...`msaMode()` and not the select, so the dev log records what the fold
   // will actually do rather than what a hidden control still says.
@@ -4470,8 +4526,28 @@ async function fold(event) {
     // rewound to a different fold's frames. A sweep starts from pass zero and
     // leaves no resumable state behind; see the clear after the loop.
     const af2Cached = sweep.length === 1 && af2Cache?.key === af2Key ? af2Cache : undefined;
-    const resume = af2Cached !== undefined && af2Cached.resumable.recycles < recycles
-      ? af2Cached.resumable : undefined;
+    // ...and what this press has to compute, which is a decision with three
+    // answers and a home of its own: see planRecycleReuse.
+    const plan = planRecycleReuse({ cache: af2Cached, key: af2Key, passes, recycles });
+    const resume = plan.plan === "resume" ? af2Cached.resumable : undefined;
+    // 🔴 AND WHAT IS ALREADY IN MEMORY IS NEVER RECOMPUTED. The resume above
+    // only fires when MORE passes are asked for; pressing Fold again at the
+    // same count, or at fewer, fell through to a full fold from pass zero -
+    // and the answer cannot differ, because everything that could change it
+    // is in `af2Key`: the sequence, the chain lengths, the MSA depths, the
+    // SEED, the tolerance, the family, and hashes of the alignment and the
+    // template. A reader who wants a different sample changes the seed, which
+    // changes the key. So an identical key with enough passes already in hand
+    // is minutes spent to arrive back where the page already was.
+    //
+    // Replaying covers FEWER passes too: the first N of a longer run are that
+    // N-recycle fold, pass for pass, because each one is computed from the
+    // one before it.
+    const cachedPasses = af2Cached?.recycles ?? [];
+    const replay = plan.plan === "replay";
+    // ...and the status line says so at the end, because a fold that takes no
+    // time reads as one that did not happen.
+    if (replay) foldWasReplayed = true;
 
     predictionCount += 1;
     // ...and a sweep says so in the file name, because the five models are one
@@ -4479,7 +4555,11 @@ async function fold(event) {
     // 🔴 uniqueStem READS objectsData; the loop that used to be here read
     // `viewer.objects`, which does not exist on this build. It is inside
     // foldStem now, which every fold path shares.
-    const stem = resume === undefined
+    // 🔴 AND A REPLAY REWINDS THE OBJECT IT ALREADY HAS, for the reason a
+    // continuation does: nothing was computed, so a fresh stem would put a
+    // SECOND object in the picker holding the same frames as the first, named
+    // as though it were another prediction.
+    const stem = (resume === undefined && !replay)
       ? foldStem(`${MODEL_STEMS[family] ?? family}`
         + `${sweep.length > 1 ? "_all5" : ""}_${predictionCount}`)
       : af2Cache.stem;
@@ -4495,7 +4575,11 @@ async function fold(event) {
     // Keeping the NAME is what makes it a rewind rather than a copy: the
     // alignment, the MSA panel and everything else py2Dmol hangs off an object
     // stay attached, and only the frames are replayed.
-    const kept = resume === undefined ? [] : af2Cached.recycles.map((pass, index) => ({
+    // ...and a replay seeds the object with exactly the passes that were
+    // asked for, where a continuation seeds it with everything it had.
+    const seeded = replay ? cachedPasses.slice(0, passes)
+      : (resume === undefined ? [] : af2Cached.recycles);
+    const kept = seeded.map((pass, index) => ({
       pdb: predictionToPdb(sequence, index === 0
         ? (af2Cached.firstPassLanded ?? pass.structure)
         : alignedToFirstPass(sequence, pass.structure, af2Cached.firstPassLanded),
@@ -4527,10 +4611,20 @@ async function fold(event) {
       const registry = window.py2dmol_viewers ?? {};
       viewer = registry[Object.keys(registry)[0]]?.renderer;
       viewerObject = viewer === undefined ? undefined : stem;
+      // 🔴 AND THE PAGE IS SHOWN NOW, because these frames are already the
+      // answer. A REPLAY calls neither `loadIntoViewer` nor `appendPass` -
+      // there is nothing to load and nothing to append - and the safety net
+      // at the end of the fold only draws when `viewer` is undefined, which
+      // it is not. So without this the page stayed BLANK after Fold hid it:
+      // the continuation's bug, reintroduced by the path that skips the work.
+      foldIsShowing(viewer);
     }
     let firstPassLanded = undefined;
     let initialLoadPromise = undefined;
-    if (resume !== undefined) firstPassLanded = af2Cached.firstPassLanded;
+    // ...and a replay is the same: every pass after the first is aligned to
+    // the first one that landed, so the frames sit on each other rather than
+    // tumbling. Kept from the run these passes came from.
+    if (resume !== undefined || replay) firstPassLanded = af2Cached.firstPassLanded;
     // 🔴 EVERY MODEL'S PASSES IN ONE LIST, RANKED TOGETHER. AlphaFold's own
     // pipeline folds all five and ranks the outputs, and that is what "All 5"
     // is: the play bar is the whole sweep, and the structure this page saves is
@@ -4690,7 +4784,14 @@ async function fold(event) {
       // COORDINATES are somewhere else: measured at 0.0007 A RMSD from the fresh
       // three-recycle structure after superposition, which is float noise, but a
       // different file for the same prediction.
-      const prediction = await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
+      // 🔴 NOTHING TO COMPUTE IS NOTHING TO COMPUTE. With the key matched and
+      // enough passes already in hand, the model is not run at all: the
+      // passes are the answer, the cache keeps whatever LONGER run it came
+      // from, and the page lands on them through the same path a finished
+      // fold does. `prediction` stays undefined, so everything below reads
+      // `allRecycles` and `final` instead - which is what it read anyway.
+      const prediction = replay ? undefined
+        : await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
         .predictA3m(
           alignmentForDriver, weights, model.featureTables,
           // 🔴 `resumable: true` IS WHAT ASKS FOR THE CONTINUATION STATE, and this
@@ -4713,13 +4814,25 @@ async function fold(event) {
       // only the passes it ran, and the play bar is the whole trajectory - so the
       // cached ones are put back in front of them. `final` is still the last pass
       // actually computed, which is the one the page lands on.
-      const allRecycles = resume === undefined
-        ? prediction.recycles : [...af2Cached.recycles, ...prediction.recycles];
+      const allRecycles = replay ? seeded
+        : (resume === undefined
+          ? prediction.recycles : [...af2Cached.recycles, ...prediction.recycles]);
       // ...and only a single-model run leaves a continuation behind; see the
       // note on `af2Cached` above.
-      if (sweep.length === 1) {
+      //
+      // 🔴 A REPLAY LEAVES THE CACHE ALONE, and that is not an oversight: it
+      // may hold MORE passes than were asked for this time, and overwriting
+      // it with the shorter list would throw away work the next Fold could
+      // have replayed. Nothing was computed, so there is nothing to record.
+      if (sweep.length === 1 && !replay) {
+        // 🔴 `converged` IS WHAT MAKES THE NEXT PRESS A REPLAY. A run that
+        // stopped early holds FEWER passes than were asked for, so the planner's
+        // "enough in hand" test can never fire for it; without this flag the
+        // commonest fold there is recomputed itself on every press. Derived
+        // exactly as the status line below derives it, from the same two
+        // numbers, because two answers to that question is how they disagree.
         af2Cache = { key: af2Key, resumable: prediction.resumable, recycles: allRecycles,
-          firstPassLanded, stem };
+          converged: allRecycles.length < passes, firstPassLanded, stem };
       }
       for (const [i, r] of allRecycles.entries()) {
         const at = base + i;
@@ -4738,7 +4851,7 @@ async function fold(event) {
           family: foldFamily,
         });
       }
-      final = prediction.final;
+      final = replay ? allRecycles[allRecycles.length - 1] : prediction.final;
       // 🔴 AND THIS MODEL'S WEIGHTS GO, OR FIVE OF THEM ARE HELD AT ONCE.
       // Measured in the page before this line existed: a 68-residue sweep at
       // one recycle took the JS heap from 9 MiB to 3412, against Chrome's own
@@ -4945,7 +5058,8 @@ async function fold(event) {
       templateText = ` · template ${source.source ?? ""}`
         + ` ${af2Template.coverage.residues}/${af2Template.coverage.of}`;
     }
-    status(`Done in ${took} s · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
+    status(`${foldWasReplayed ? "Already folded · shown from memory"
+      : `Done in ${took} s`} · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
       + ` · pTM ${best.confidence.ptm.toFixed(3)}${bestIptmText}${ranked}${converged}`
       + templateText + broken);
   } catch (error) {

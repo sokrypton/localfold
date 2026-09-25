@@ -16,17 +16,25 @@ nobody declared gets edited in place and silently diverges. Before this tool the
 vendored bundles named no upstream commit, so "is this current?" could only be
 answered by diffing 800 KB of minified JavaScript against a build.
 
-🔴 AND TWO OF THE FOUR ARE BUILT, NOT COPIED. `py2Dmol.embed.min.js` and
-`py2Dmol.full.min.js` are bundles that upstream's own `tools/bundle.py build`
-writes into `py2Dmol/resources/bundles/`; the other two are source files that
-ship as they are. So this runs the upstream build first rather than trusting
-whatever happens to be sitting in that directory, which may be from any commit
-or from none.
+🔴 AND ONE OF THE THREE IS BUILT, NOT COPIED. `py2Dmol.full.min.js` is a
+bundle that upstream's own `tools/bundle.py build` writes into
+`py2Dmol/resources/bundles/`; the other two are source files that ship as they
+are. So this runs the upstream build first rather than trusting whatever
+happens to be sitting in that directory, which may be from any commit or from
+none.
 
-🔴 AND `full` AND `embed` ARE BOTH NEEDED, which is easy to get wrong because
-one is nearly a superset. index.html loads `full` (the website plus the embed
-API); single.html and proteinhunter.html load `embed`. Syncing only the larger
-one leaves the two smaller pages on a stale viewer.
+🔴 AND `embed` IS NOT VENDORED, BECAUSE NOTHING LOADS IT. It is for
+`single.html` and `proteinhunter.html`, both held back at `b0dc258` and absent
+from this tree - so syncing it wrote 655 KB into git on every update for a file
+`build_site.py` then deliberately dropped from `dist/`. Vendoring is a cost
+paid in history, which is permanent, and the deploy already proved nobody
+fetches it.
+
+**Putting it back is one line**: an entry here and one in LOADED_BY, which is a
+better place for that promise to live than a stale mirror - a page restored
+tomorrow gets a bundle built from upstream today rather than whatever this
+directory last happened to hold. `build_site.py`'s "no page loads it" rule
+stays where it is and still covers anything else that falls out of use.
 """
 import argparse
 import hashlib
@@ -43,15 +51,13 @@ VENDOR = ROOT / "web" / "vendor"
 FILES = {
     "py2Dmol.app.css": ("src/app/style.css", False),
     "py2Dmol.align.js": ("src/align/align.js", False),
-    "py2Dmol.embed.min.js": ("py2Dmol/resources/bundles/py2Dmol.embed.min.js", True),
     "py2Dmol.full.min.js": ("py2Dmol/resources/bundles/py2Dmol.full.min.js", True),
 }
 
 # Which page loads which, so SOURCE.md says why each file is here.
 LOADED_BY = {
-    "py2Dmol.app.css": "index.html, single.html, proteinhunter.html",
+    "py2Dmol.app.css": "index.html",
     "py2Dmol.align.js": "index.html (TM-align; upstream cannot bundle it)",
-    "py2Dmol.embed.min.js": "single.html, proteinhunter.html",
     "py2Dmol.full.min.js": "index.html",
 }
 

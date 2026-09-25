@@ -2026,13 +2026,36 @@ def main():
 
             print("  before any switch      %s" % onScreen())
             names = json.loads(second)["objects"]
-            # 🔴 BOTH FOLDS ARE STILL THERE. This used to be ONE - a fold
-            # recycled the object before it, each fold its own session -
-            # and the reader asked for the opposite: "starting new
-            # prediction deletes the previous prediction/object".
-            if len(names) < 2:
+            # 🔴 BOTH FOLDS ARE STILL THERE - WHEN THE SECOND ONE IS A FOLD.
+            # This used to be ONE - a fold recycled the object before it, each
+            # fold its own session - and the reader asked for the opposite:
+            # "starting new prediction deletes the previous prediction/object".
+            #
+            # 🔴 BUT A SECOND PRESS OF THE SAME JOB IS NOT A SECOND
+            # PREDICTION, and this asked for one anyway. Raising the recycle
+            # count CONTINUES the fold, and the page rewinds the object it
+            # already has rather than stranding the resumed passes on the old
+            # one ("A CONTINUATION REWINDS THE OBJECT IT ALREADY HAS"); pressing
+            # Fold again unchanged REPLAYS what is in memory and computes
+            # nothing at all. Both leave one object, correctly, and this printed
+            # FAIL for both - measured on `--recycles 3 --then-recycles 6` and
+            # on a converged repeat, neither of which had anything to do with
+            # the rule it was guarding.
+            #
+            # A new object is owed when the second press is a different JOB -
+            # another sequence or another model. That is what these two flags
+            # say, and nothing else here changes the answer: the seed, the
+            # depths and the tolerance are all fixed for the run.
+            wants_new_object = (args.then_sequence is not None
+                                or args.then_model is not None)
+            if wants_new_object and len(names) < 2:
                 print("FAIL: the second fold left %r - a fold keeps its own"
                       " object and the one before it stays" % (names,))
+            elif not wants_new_object and len(names) != 1:
+                print("FAIL: pressing Fold again on the SAME job left %r - a"
+                      " continuation and a replay both rewind the object they"
+                      " already have, so a second one is a fold that was not"
+                      " asked for" % (names,))
             seen = {}
             for name in names:
                 # THE PICKER ITSELF, not `_switchToObject`: the control
