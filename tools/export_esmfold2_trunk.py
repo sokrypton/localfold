@@ -32,12 +32,54 @@ from esmfold2_trunk_weights import trunk_block              # noqa: E402
 from export_esmc_model import ShardWriter                   # noqa: E402
 
 
+# 🔴 FOUR OF THE HEAD'S 93 TENSORS ARE DEAD, AND EXPORTING THEM WOULD SAY THE
+# PORT NEEDS THEM. `s_norm`, `s_inputs_to_single` and `s_input_to_s` are built
+# in `ConfidenceHead.__init__` and never reached in `forward` - counted in
+# their own runtime source, one mention each and no call - so the live head is
+# 89 tensors. A reader who saw them in the manifest would go looking for where
+# the single track enters, and it does not: the single comes out of
+# `row_attention_pooling` at the END, and the four blocks are pair-only.
+HEAD_UNUSED = ('s_norm.weight', 's_norm.bias',
+               's_inputs_to_single.weight', 's_input_to_s.weight')
+
+
+def open_head(path):
+    """name -> array for the confidence head, with any `confidence_head.` off."""
+    path = pathlib.Path(path)
+    if path.suffix == '.npz':
+        loaded = np.load(path)
+        raw = {name: loaded[name] for name in loaded.files}
+    else:
+        source = SafeTensors(path)
+        raw = {name: np.asarray(source[name]) for name in source.keys()
+               if name.startswith('confidence_head.')}
+    out = {}
+    for name, array in raw.items():
+        out[name[len('confidence_head.'):] if name.startswith('confidence_head.')
+            else name] = array
+    if not out:
+        raise SystemExit('%s carries no confidence_head tensors' % path)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--esmfold2', default='esmfold2-fast-600m')
     parser.add_argument('--out', default='model-esmfold2-trunk-f32')
     parser.add_argument('--heads', type=int, default=8,
                         help="the zeroed attention's head count, from the config")
+    # 🔴 THE HEAD IS SOMEBODY ELSE'S CHECKPOINT, AND THE TRUNK UNDER IT IS OURS
+    # BYTE FOR BYTE. biohub ships ESMFold2 with `confidence_head.enabled:
+    # false` and zero confidence tensors; Synthyra froze that trunk and trained
+    # a head on top (780 updates, MIT). Measured before this was written:
+    # Synthyra/ESMFold2-600's 913 tensors are biohub's 820 - same names, same
+    # shapes, 7 of 7 sampled byte-identical including the largest - plus 93
+    # confidence tensors. So a head is an ADDITION to the bundle we already
+    # publish and never a re-export of the trunk.
+    parser.add_argument('--confidence', default='',
+                        help='a Synthyra checkpoint (.safetensors) or an .npz '
+                             'carrying its confidence_head.* tensors; absent '
+                             'means no head, which is what biohub ships')
     arguments = parser.parse_args()
 
     source = SafeTensors(ROOT / arguments.esmfold2 / 'model.safetensors')
@@ -228,8 +270,84 @@ def main():
                            ('ffn.w_up', 'ffnUp'), ('ffn.w_down', 'ffnDown')):
             writer.add('atom/blocks/%d/%s' % (layer, name),
                        transposed('%s.%s.weight' % (at, leaf)))
-    writer.close()
 
+    # ── the confidence head, when one was asked for ──────────────────────────
+    confidence_meta = None
+    if arguments.confidence:
+        head = open_head(arguments.confidence)
+        missing = [n for n in HEAD_UNUSED if n not in head]
+        if missing:
+            raise SystemExit('this head is not the shape this exporter reads: '
+                             'missing %s' % ', '.join(missing))
+        # 🔴 ITS FOUR BLOCKS ARE THE TRUNK'S BLOCK, EXACTLY - 18 tensors, the
+        # same names, the same shapes, verified against this checkpoint's own
+        # `folding_trunk.blocks.0.*` before a line of this was written. So they
+        # go through `trunk_block` unchanged and the GPU runs the kernel it
+        # already runs 24 of. The head's stack is PAIR-ONLY, which is the one
+        # place it parts company with OpenDDE's: no single track crosses the
+        # blocks, and `row_attention_pooling` makes one at the end.
+        head_blocks = len({name.split('.')[2] for name in head
+                           if name.startswith('folding_trunk.blocks.')})
+        for layer in range(head_blocks):
+            for group, values in trunk_block(head.__getitem__, layer, channels,
+                                             arguments.heads).items():
+                if not isinstance(values, dict) or group == 'pairAttention':
+                    continue
+                for leaf, array in values.items():
+                    writer.add('confidence/blocks/%d/%s/%s' % (layer, group, leaf), array)
+        vector = lambda name: np.asarray(head[name], np.float32)
+        matrix = lambda name: np.ascontiguousarray(np.asarray(head[name], np.float32).T)
+        for leaf, name in (('s_inputs_norm', 'sInputsNorm'), ('z_norm', 'zNorm'),
+                           ('plddt_ln', 'plddtNorm')):
+            writer.add('confidence/%s/scale' % name, vector('%s.weight' % leaf))
+            writer.add('confidence/%s/offset' % name, vector('%s.bias' % leaf))
+        for leaf, name in (('s_to_z', 'sToZ'), ('s_to_z_transpose', 'sToZTranspose'),
+                           ('s_to_z_prod_in1', 'sToZProdIn1'),
+                           ('s_to_z_prod_in2', 'sToZProdIn2'),
+                           ('s_to_z_prod_out', 'sToZProdOut'),
+                           ('pae_head', 'pae'),
+                           ('row_attention_pooling.attn_proj', 'poolingAttention'),
+                           ('row_attention_pooling.out_proj', 'poolingOutput')):
+            writer.add('confidence/%s' % name, matrix('%s.weight' % leaf))
+        # 🔴 THE DISTANCE EMBEDDING IS A GATHER, NOT A PROJECTION, so its rows
+        # stay as they are: `nn.Embedding(128, 256)` indexed by the bucket a
+        # predicted rep-atom distance falls in. Transposing it - which is what
+        # every other matrix here wants - would silently make it a matmul
+        # against the wrong axis, and `boundaries` beside it is the 127 edges
+        # of linspace(2, 52), the same grid src/esmfold2/distogram-webgpu.js
+        # already borrowed from this head while the head was absent.
+        writer.add('confidence/distanceEmbedding', vector('dist_bin_pairwise_embed.weight')
+                   if head['dist_bin_pairwise_embed.weight'].ndim == 1 else
+                   np.ascontiguousarray(np.asarray(
+                       head['dist_bin_pairwise_embed.weight'], np.float32)))
+        writer.add('confidence/boundaries', vector('boundaries'))
+        # ...and the pLDDT einsum's table, kept whole: it is indexed by the
+        # atom's slot WITHIN its token, so it is three-dimensional on purpose.
+        writer.add('confidence/plddtWeight', np.ascontiguousarray(
+            np.asarray(head['plddt_weight'], np.float32)))
+        confidence_meta = {
+            'source': pathlib.Path(arguments.confidence).name,
+            'blocks': head_blocks,
+            'pairChannels': int(channels),
+            'singleChannels': int(head['plddt_ln.weight'].shape[0]),
+            'singleInputs': int(head['s_inputs_norm.weight'].shape[0]),
+            'distogramBins': int(head['dist_bin_pairwise_embed.weight'].shape[0]),
+            'minDist': 2.0, 'maxDist': 52.0,
+            'paeBins': int(head['pae_head.weight'].shape[0]),
+            'plddtBins': int(head['plddt_weight'].shape[2]),
+            'maxAtomsPerToken': int(head['plddt_weight'].shape[0]),
+            # Stated, because a reader who counts 93 against 89 should find the
+            # answer here rather than in a diff.
+            'unusedInCheckpoint': list(HEAD_UNUSED),
+            'pairOnlyBlocks': True, 'hasPde': False,
+        }
+
+    # 🔴 CLOSED AFTER THE LAST `add`, WHICH IS NOT WHERE IT USED TO BE. The
+    # writer flushes its part-filled final shard in `close()`, so a section
+    # added below the old call wrote records naming `weights-15.f32.bin` and
+    # never produced the file - a manifest that is complete, a bundle that
+    # 404s on its last shard, and nothing that says so until a page fetches it.
+    writer.close()
     parameters = sum(int(np.prod(r['shape'])) for r in writer.records.values())
     manifest = {
         'formatVersion': 1,
@@ -278,6 +396,7 @@ def main():
         # are read inside `cos(2 * pi * (t * w + b))` - so an error in them is
         # an error in a PHASE, which does not shrink with the weight. 512
         # numbers.
+        **({} if not arguments.confidence else {'confidence': confidence_meta}),
         'float32Tensors': sorted(
             [name for name, record in writer.records.items() if len(record['shape']) == 1]
             + ['diffusion/fourier/weights', 'diffusion/fourier/offsets']),
