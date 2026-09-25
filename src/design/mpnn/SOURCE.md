@@ -2,8 +2,10 @@
 
 🔴 **DO NOT EDIT THESE FILES.** They are a mirror. Change them
 upstream and re-run `python3 tools/sync-mpnn.py`;
-`test/mpnn-vendored.test.js` fails if the mirror and the upstream
-checkout disagree.
+`python3 tools/sync-mpnn.py --check` says whether the mirror and the
+upstream checkout disagree. Nothing runs it for you: it was a node
+test and that went red whenever ../mpnn moved on, which says nothing
+about this tree.
 
 - upstream: `/Users/mini/Documents/GitHub/mpnn/mpnn`
 - commit: `a80942f053a9f35327fc97a6aa25765bbb9fd3e0`

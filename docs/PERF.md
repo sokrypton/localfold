@@ -1387,6 +1387,96 @@ is worth most of a morning if the first number is believed. Use `--repeats`.
 - **Uploads by label are not the cost.** The largest is `expand.projection` at
   29 ms for 55 MiB; everything else is under 8.
 
+## The AF3 diffusion prior is not a T4's missing speedup: four are derived, the fifth is worth nothing
+
+On an A100 the diffusion geometry is **2650 ms of a 4517 ms sampler** -
+`diffusionSplitK` 1792, `diffusionTokenTile` 1103, `diffusionBatchedGates` 700,
+`diffusionNormSplit` 526, `atomRowTile` 316 - and `PRIORS` names none of them
+for `turing`, so the obvious reading is that every Colab user is leaving that
+on the table. **They are not, and this is the third time in one session that a
+`null` default turned out to mean DECIDE AT RUNTIME rather than OFF.** Asked of
+a real T4 (`measuredWidth` 512):
+
+| knob | A100 | what a T4 actually gets |
+|---|---:|---|
+| `diffusionSplitK` | 1792 ms | `derivedSplitRule` answers **null** - the unsplit dispatch is already wider than the device, so splitting cannot pay. Ampere's `crossover: 512` is a much wider card's number |
+| `diffusionTokenTile` | 1103 | `derivedTokenTile` answers **1** |
+| `diffusionBatchedGates` | 700 | `batchedGatesAffordable` answers **true** |
+| `atomRowTile` | 316 | `outputRowTileFor(queryRows, workgroupTarget)` |
+| `diffusionNormSplit` | 526 | **nothing - no derivation exists** |
+
+`src/runtime/device.js` fires the occupancy measurement whenever
+`diffusionSplitK` is null, and `deviceDerivationsAllowed` excludes only Apple,
+so an NVIDIA card with no prior derives all four. That leaves ONE candidate,
+and `tools/gpu/bench-normsplit.js` measures it at nothing: **-0.5% / +0.9% /
++0.4%** on the median at 68 / 256 / 512 tokens, with the minimum agreeing
+within a point at every size.
+
+🔴 **AND THE FIRST THREE ATTEMPTS TO MEASURE IT WERE ALL INSTRUMENT, NOT
+KNOB.** Each is a lesson this file already contains, met again:
+
+- **Across launches, on a Colab box, nothing under ~40% is visible.** Four
+  arms bracketed by a baseline read 224 / 207 / 164 / **149** - the control
+  drifting 34%, more than any effect in the table. Six counterbalanced rounds
+  with an IDENTICAL-CODE control arm put that control 8.3% from its own
+  baseline on the minimum and 17.6% on the median, the two statistics
+  disagreeing about its size. `tools/gpu/bench-ab.js` has carried the rule in
+  its header since it was written: two numbers from two invocations are not
+  comparable here. **Alternate the arms inside one process.**
+- **A fresh weights object per call defeats the weight cache.** The first
+  interleaved version spread `{...base, normSplit}` at every call and measured
+  **368 ms** where the ordinary bench reports 40 at the same size: the upload,
+  every time, with the compute-side knob buried under it. One object per arm,
+  built once.
+- **Two warm-up calls are not the ramp.** With both pipelines compiled, the
+  first four timed rounds still read 50.3 / 37.0 / 31.2 / 26.1 ms against a
+  settled 20 - so a median over nine rounds was mostly warm-up and moved the
+  answer by six points. Eight discarded calls, alternating.
+
+Settled, the arms repeat to under 1% (99.5 / 100.6 against 99.8 / 101.5 at 256
+tokens), which is the resolution this question needed and never had.
+
+## 🔴 A bench on a display-less box measured the CPU, and looked entirely reasonable
+
+`tools/gpu-chrome.mjs` did not pass `--disable-vulkan-surface`. A surface is a
+thing you present TO and a Colab container has no display, so Vulkan never came
+up and Chrome fell back to **SwiftShader** - which answers `requestAdapter`
+perfectly happily. `tools/cdp.py` has carried the flag for
+`tools/colab_backend.py` since that file was written, and its own note says why
+the shared list does not: the A100 box these flags were written on runs HEADED,
+where a surface exists. So the PAGE was always on the GPU and the BENCH
+LAUNCHER was not, on any box with no display.
+
+| on one Colab T4, same box, minutes apart | without the flag | with it |
+|---|---|---|
+| adapter | `google / swiftshader` | `nvidia / turing` |
+| `shader-f16` | absent | present |
+| subgroup-matrix configs | 0 | 10 |
+| `measureDeviceOccupancy` | **92 s**, width **4** | 26 ms, width **512** |
+
+🔴 **THE OCCUPANCY CURVE IS THE TELL AND IT IS UNMISTAKABLE.** 4 / 8 / 64 / 512
+/ 2048 / 8192 workgroups took **29.7 / 57.7 / 455.8 / 3709 / 17133 / 70983 ms** -
+exactly linear in the work from the first step, which is a device with no
+parallelism at all. A real T4 is FLAT to 512 (2.4 / 2.5 / 2.5 / 2.5 / 3.6 /
+12.3). Every width-derived knob then answers for a device four workgroups wide:
+`derivedSplitRule`, `derivedTokenTile` and `outputRowTileFor` are all driven by
+that number, so the arm is not merely slow, it is a different configuration.
+
+**What it cost, and what saves the earlier numbers.** The 92 s is per launch, so
+every arm looked hung and two rounds of harness debugging went into a flag. The
+Turing section below is NOT affected: it reports the adapter offering
+`shader-f16` AND `chromium-experimental-subgroup-matrix`, and SwiftShader offers
+neither, so those runs had the card. Nor is any user's fold - the notebook folds
+through `colab_backend.py`.
+
+**It is refused now, not warned about.** `gpu-chrome` exits 2 on a software
+adapter unless `--allow-software` is passed, and names both usual causes (no
+surface flag; a `libGLX_nvidia` whose version does not match `nvidia-smi`'s
+kernel driver - this box shipped 580.178.04 against a 580.82.07 kernel). The
+adapter line was always printed; a line of print one row above a plausible
+benchmark is not a guard, which is this repository's own rule about fallbacks
+that swap in different hardware.
+
 ## A T4 is an unrecognised GPU, and Ampere's prior makes it worse
 
 Colab hands out Tesla T4s, so this is the device most people who run LocalFold

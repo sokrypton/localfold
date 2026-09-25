@@ -673,6 +673,7 @@
 .entity-popup-typed,
 .entity-popup-position,
 .entity-template-kind,
+.entity-msa-kind,
 .entity-template-source,
 .entity-template-chain,
 .entity-template-file {
@@ -1042,6 +1043,10 @@
    28px to 30 to match the rest of the popup. */
 .entity-popup-section-template { min-height: 92px; }
 .entity-template-kind { flex: 1 1 auto; min-width: 0; }
+/* ...and the alignment's menu is the same control, so it takes the same rule.
+   Without this it was a browser-default select beside a styled one: shorter,
+   a different font, and sized to its longest option rather than to the row. */
+.entity-msa-kind { flex: 1 1 auto; min-width: 0; }
 .entity-template-source { flex: 1 1 auto; min-width: 0; }
 /* The file input carries its own button, so it needs room to shrink rather
    than a width - `min-width: 0` is what lets a flex child go below its
@@ -1169,35 +1174,14 @@
 }
 
 
-/* WHAT IS ON SCREEN BELONGS TO THE MODEL THAT MADE IT.
-   🔴 A RESULT LEFT UNDER A MODEL THAT DID NOT MAKE IT IS A CLAIM, and it is
-   the one this page is least able to correct: the structure, the plots and the
-   confidence numbers look exactly the same whichever row is selected above
-   them, so switching AlphaFold 3 to Boltz-2 and reading the picture is reading
-   the wrong model's answer with the right model's name over it. The veil is
-   OPAQUE rather than a tint for that reason - a dimmed structure is still a
-   structure to look at - and it says which model the page is now set to, so
-   the way out of it is the button it names. */
-.result-pending {
-  position: relative;
-}
-.result-pending::after {
-  content: attr(data-pending);
-  position: absolute;
-  inset: 0;
-  z-index: 6;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  padding: 0 14px;
-  border-radius: inherit;
-  background: #f9f9f9;
-  color: #6b7280;
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1.5;
-}
+/* 🔴 THERE WAS A `.result-pending` COVER HERE, AND IT IS GONE. A model
+   switch used to leave the previous model's structure, map, scores and
+   downloads on screen under the new model's name, so they were veiled - an
+   opaque panel over the result region, a rule for when it lifted, and a
+   list of which parts it covered. One fold at a time, each its own session,
+   means a switch starts a NEW session and the page is simply empty: there
+   is nothing stale to cover and no state to describe. See startNewSession
+   in web/app.js. */
 
 /* WHERE FOLD RUNS, AND WHETHER IT IS STILL THERE.
    Only ever on a page opened from the notebook's link (?backend=colab), and

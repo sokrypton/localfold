@@ -235,6 +235,21 @@ export function newEntity(type = "protein") {
  * file the user has on disk, and the hits the MSA search already found - which
  * were a checkbox sitting beside a text field that it silently overrode.
  */
+/**
+ * Whether one chain gets an alignment, in menu order.
+ *
+ * 🔴 WRITTEN LIKE TEMPLATE_KINDS BECAUSE IT IS THE SAME KIND OF CHOICE: one
+ * setting, on one chain, that changes what is folded. Two words each and the
+ * same "No ..." for the off case, so the two menus in the popup read as a
+ * pair rather than as one control and one sentence - the first version said
+ * "As the job does (search)" and "None - fold from the query alone", which
+ * explained itself at the cost of looking like something else.
+ */
+export const MSA_KINDS = [
+  ["search", "The job's alignment"],
+  ["none", "No alignment"],
+];
+
 export const TEMPLATE_KINDS = [
   ["none", "No template"],
   ["pdb", "PDB entry"],
@@ -465,6 +480,8 @@ export function expandEntities(entities) {
   // chain in the colon-joined sequence, so it is built in the same loop that
   // builds them and can never drift from it.
   const chainKinds = [];
+  /** Which chains asked for an alignment. See the push below. */
+  const chainMsa = [];
   const templates = [];
   /** Which name each distinct SMILES was given; see `ligandName`. */
   const smilesCodes = new Map();
@@ -482,6 +499,13 @@ export function expandEntities(entities) {
           });
         }
         chainKinds.push(entity.type);
+        // 🔴 PER CHAIN, IN CHAIN ORDER, like chainKinds above it. Whether a
+        // protein gets an alignment is the entity's choice and the copies
+        // inherit it, because two copies of one sequence are one search.
+        // `undefined` on an entity means yes: every job written before this
+        // asked for one, and a missing field must not quietly fold a chain
+        // single-sequence.
+        chainMsa.push(entity.type !== "protein" ? false : entity.msa !== "none");
         // 🔴 THE TEMPLATE IS RECORDED PER CHAIN, NOT PER ENTITY, for the same
         // reason the modifications are: copies are expanded, so two copies of a
         // templated chain are two chains each carrying it, and the embedder
@@ -541,7 +565,7 @@ export function expandEntities(entities) {
     bonds.push({ from: end(parsed.from), to: end(parsed.to) });
   }
   return {
-    chains, chainKinds, ligandCodes, modifications, templates,
+    chains, chainKinds, chainMsa, ligandCodes, modifications, templates,
     ...(bonds.length === 0 ? {} : { bonds }),
     sequence: chains.join(":"),
   };

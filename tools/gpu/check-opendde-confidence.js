@@ -67,12 +67,28 @@ export async function main(device, args) {
   // fixture would let a symmetric mistake survive at one size.
   for (const tokens of (option(args, "n", "17,40")).split(",").map(Number)) {
     const pair = deterministic(tokens * tokens * channels, 909 + tokens);
-    const expected = hostPairReadouts(pair, tokens, channels, weights);
-    const actual = await openddePairReadouts(device, { pair, tokens, channels }, weights);
+    // 🔴 AND THE TM TERM, which pTM and ipTM are reduced from. The head keeps
+    // the PAE's expectation and drops its logits, so this is the only place
+    // the distribution exists - and it is what OpenDDE had no pTM for until
+    // the readout began to carry it. The token count is the caller's, because
+    // d0 belongs to the score's own token set and not to this fixture's.
+    const tmTokens = tokens;
+    const expected = hostPairReadouts(pair, tokens, channels, weights, tmTokens);
+    const actual = await openddePairReadouts(
+      device, { pair, tokens, channels, tmTokens }, weights);
     const arm = {
       pae: relativeRms(actual.pae, expected.pae),
       pde: relativeRms(actual.pde, expected.pde),
+      tm: relativeRms(actual.tm, expected.tm),
     };
+    // ...and it is a TM term rather than a copy of the PAE: the adjustment is
+    // a probability-weighted 1/(1 + d^2/d0^2), so it lives in [0, 1] where the
+    // PAE is in Angstrom over [0, 32]. A readout that wrote the expectation
+    // into both buffers would pass the comparison above.
+    const inUnit = expected.tm.every((value) => value >= 0 && value <= 1);
+    const spread = relativeRms(expected.tm, expected.pae);
+    if (!inUnit) throw new Error("the host's TM term is not a probability");
+    if (!(spread > 1e-3)) throw new Error("the TM term is the PAE by another name");
     // 🔴 AND THE TWO ARMS MUST DIFFER, because PDE is PAE on the symmetrised
     // pair and a kernel that ignored `symmetrise` would pass both against a
     // reference that... also ignored it. They are computed independently here,
@@ -80,8 +96,9 @@ export async function main(device, args) {
     arm.separation = relativeRms(expected.pde, expected.pae);
     results[tokens] = arm;
     console.log(`${tokens} tokens\tpae ${arm.pae.toExponential(2)}`
-      + `\tpde ${arm.pde.toExponential(2)}\tpae-vs-pde ${arm.separation.toExponential(2)}`);
-    for (const name of ["pae", "pde"]) {
+      + `\tpde ${arm.pde.toExponential(2)}\ttm ${arm.tm.toExponential(2)}`
+      + `\tpae-vs-pde ${arm.separation.toExponential(2)}`);
+    for (const name of ["pae", "pde", "tm"]) {
       if (!(arm[name] <= 1e-5)) {
         const bad = (values) => {
           let count = 0;

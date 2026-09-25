@@ -332,8 +332,10 @@ export function loadAf3Weights(onProgress, family = "af3") {
       // the structural-token expander and the four-block refiner; and its
       // confidence head is its own design on its own distance grid, so
       // `confidenceWeights` REFUSES this bundle rather than loading a partial
-      // one. The fold returns no pLDDT and no PAE, which the page already
-      // handles for EF2-fast.
+      // one - `openddeConfidenceWeights` below is what loads it instead, and
+      // the fold reports the same pLDDT, PAE, pTM and ipTM every other family
+      // does. (This note used to say the fold returned no pLDDT and no PAE,
+      // which was the state before `openddeScores` existed.)
       const structural = trunk.dialect.structuralTokens;
       const built = {
         trunk,

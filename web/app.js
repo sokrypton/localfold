@@ -23,14 +23,17 @@
  */
 import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/af2/multimer/model.js";
-import { foldsAsSingleSequence, parseA3m } from "../src/input/a3m.js";
+import { blankChainColumns, foldsAsSingleSequence, parseA3m }
+  from "../src/input/a3m.js";
+import { planRecycleReuse } from "../src/af2/model/recycle-convergence.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
 // AND more than one chain, so a first fold never reaches it - and stopping a
 // fold partway is one of the few ways to get a filled cache and then fold
 // again. test/module-references.test.js now looks for the whole class.
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
-  planSearchReuse, searchCacheEntry } from "../src/input/mmseqs2-api.js";
+  expandSearchedChains, planSearchReuse, searchCacheEntry }
+  from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
@@ -428,22 +431,25 @@ function reportModelFromUrl(attempt = 0) {
  * bundles get mistaken for each other. See PLM_FAMILIES.
  */
 /**
- * PUT A PENDING VEIL OVER ANOTHER MODEL'S ANSWER, or take it off again.
+ * 🔴 AND MOVING THE MODEL ROW NOW CHANGES NOTHING ON SCREEN.
  *
- * 🔴 OPAQUE, OVER THE RESULT BOXES, AND NOT A CLEAR. The structure and the map
- * are not deleted - switch the row back and they are there, because they really
- * are that model's answer - but while another model is selected they are not
- * the answer to the question the page is now asking, and a dimmed structure is
- * still a structure to look at. The numbers go, because a stale pLDDT reads as
- * a measurement rather than as a leftover, which is the rule `updateScoresCard`
- * already follows at the start of every fold.
+ * There was a COVER over the previous model's result, and then there was
+ * `startNewSession`, which emptied the page instead: one fold at a time, each
+ * its own session, so moving the row was starting a new one. Both existed to
+ * answer the same question - is what I am looking at this model's? - and both
+ * are gone, because the page no longer has one answer to give.
  *
- * 🔴 AND IT NAMES THE MODEL THE PAGE IS SET TO, not the one being covered: the
- * way out of the veil is the button it names, and a reader who did not mean to
- * change the row is told which row they are now on.
+ * Every fold keeps its own object and every panel reads `activePrediction()`,
+ * which is keyed by the object being edited: the scores card, the heatmap and
+ * the two download buttons describe the fold you are LOOKING at, and the model
+ * row describes the fold you are about to MAKE. Those are different questions
+ * and they now have different controls, so a switch has nothing to clear.
+ *
+ * What went with the cover: `shownFamily`, `foldingFamily`, `resultIsFrom`,
+ * `resultIsStale`, `syncPendingResult`, `RESULT_REGION`, `firstFrameIsOurs`
+ * and `.result-pending` in web/localfold.css. What went with the session:
+ * `startNewSession` itself.
  */
-/** Is what is on screen another model's answer? One question, three readers. */
-const resultIsStale = () => shownFamily !== undefined && shownFamily !== chosenFamily();
 
 /**
  * THE DOWNLOAD ROW OFFERS WHAT THERE IS TO DOWNLOAD, AND NOTHING ELSE.
@@ -461,7 +467,7 @@ const resultIsStale = () => shownFamily !== undefined && shownFamily !== chosenF
  */
 function syncDownloads() {
   const pred = activePrediction();
-  const foldable = !!(pred && pred.pdb) && !resultIsStale();
+  const foldable = !!(pred && pred.pdb);
   const registry = window.py2dmol_viewers ?? {};
   const renderer = registry[Object.keys(registry)[0]]?.renderer;
   const drawn = Object.keys(renderer?.objectsData ?? {}).length > 0;
@@ -476,38 +482,52 @@ function syncDownloads() {
     button.disabled = !on;
     button.setAttribute("title", on ? button.dataset.title : why);
   };
-  offer("download-pdb", foldable, resultIsStale()
-    ? "the structure on screen was folded by another model - press Fold"
-    : "nothing has been folded yet");
-  offer("download-all", foldable, resultIsStale()
-    ? "this fold belongs to another model - press Fold"
-    : "nothing has been folded yet");
+  // ...and the only reason left is the only one there can be: a model switch
+  // empties the page, so there is never a fold on screen that these would
+  // offer the wrong files for.
+  offer("download-pdb", foldable, "nothing has been folded yet");
+  offer("download-all", foldable, "nothing has been folded yet");
   offer("saveStateButton", drawn, "the viewer is empty");
   const row = document.getElementById("downloads");
   if (row !== null) row.style.display = (foldable || drawn) ? "flex" : "none";
 }
 
-function syncPendingResult() {
-  const family = chosenFamily();
-  const stale = resultIsStale();
-  const label = MODEL_LABELS[family] ?? family;
-  for (const id of ["canvasContainer", "heatmapContainer"]) {
-    const box = document.getElementById(id);
-    if (box === null) continue;
-    box.classList.toggle("result-pending", stale);
-    if (stale) box.dataset.pending = `${label} · pending — press Fold`;
-    else delete box.dataset.pending;
-  }
-  updateScoresCard(stale ? undefined : activePrediction()?.confidence);
-  // ...and the files follow the same rule, because offering the covered
-  // model's structure is the claim the veil exists to stop making.
+/**
+ * A FINISHED PREDICTION, IN ONE PLACE.
+ *
+ * 🔴 THREE PATHS BUILT ONE AND ONLY TWO REGISTERED IT. Recording a result is
+ * three things - it is the last one, it is filed under its stem, and the
+ * downloads follow - and `foldWithEsmfold2` did the first only, so an
+ * ESMFold2 fold left the download row describing the fold before it. A
+ * funnel rather than a third copy of the lines: a path can no longer do half
+ * of it.
+ *
+ * 🔴 AND THE FAMILY TRAVELS ON THE PREDICTION, as an id rather than as
+ * prose. The archive, the session's `localfold` block and the Colab reader
+ * all want to know which model made a result, and the only thing written in
+ * one used to be the LABEL - `AlphaFold 2 (monomer-3)` from this page's AF2
+ * path, where MODEL_LABELS says `AlphaFold 2 (model 3)`, with both AF2
+ * families sharing the bare string `AlphaFold 2`. Reading a name back to
+ * find an identity is a lookup that is neither total nor one-to-one.
+ */
+function recordPrediction(prediction, family) {
+  // The family still travels ON the prediction: the archive, the session's
+  // `localfold` block and the Colab reader all read it, and a label is a
+  // thing to read rather than an identifier - see the note above.
+  prediction.family = family;
+  // 🔴 AND THIS IS WHERE THE PAGE CLAIMS THE OBJECT AS ITS OWN, which is
+  // what lets a fold and a new session recycle it and leave the reader's
+  // restored folds alone. `openBlankFold` sets it too, at the START of a
+  // local fold - but the Colab reader never opens one: a finished result
+  // arrives with no frames, `loadIntoViewer` makes the object, and nothing
+  // said it was ours. So a model switch there cleared nothing and the
+  // result sat on under the new model's name. A restore deliberately does
+  // NOT come through here.
+  lastFoldStem = prediction.stem ?? lastFoldStem;
+  lastPrediction = prediction;
+  if (prediction.stem !== undefined) predictions.set(prediction.stem, prediction);
   syncDownloads();
-}
-
-/** What is on screen came from `family` - or from nothing nameable. */
-function resultIsFrom(family) {
-  shownFamily = family;
-  syncPendingResult();
+  return prediction;
 }
 
 const chosenFamily = () => {
@@ -628,7 +648,7 @@ const MODEL_STEMS = {
  * ingested; `null` is a result whose model could not be named, which is stale
  * against every row.
  */
-let shownFamily;
+
 
 /** The family a prediction's own label names, where the label is one we write. */
 const familyFromLabel = (label) => Object.keys(MODEL_LABELS)
@@ -866,8 +886,89 @@ function archiveMsas(chains, alignment) {
  */
 let foldContext = {};
 
+/**
+ * EVERYTHING THE FORM NEEDS TO MAKE THIS FOLD AGAIN, AS THE CONTROLS HOLD IT.
+ *
+ * 🔴 A SESSION PUT THE PICTURE BACK AND LEFT THE PAGE SET TO SOMETHING ELSE.
+ * Restoring loaded py2Dmol's viewer state and the prediction behind it - so
+ * the structure, the maps and the downloads all came back - and touched no
+ * control: the sequence box still held whatever was in it, the model row
+ * still named whatever was chosen, the dials were the dials. Pressing Fold
+ * after a restore therefore folded the CURRENT form, which on a fresh page
+ * is the default sequence. A restored fold could be looked at and not
+ * continued from. Reported as: after a restore, Fold should behave as it
+ * would if the reader had redone every step up to that point.
+ *
+ * 🔴 ONE LIST, READ AND WRITTEN BY THE TWO FUNCTIONS UNDER IT. What a fold
+ * IS lives in these controls plus the entity rows, and the saved `settings`
+ * block cannot stand in for them: it is written for the ARCHIVE, in prose a
+ * reader wants ("trunk passes", "diffusion steps"), it differs per model
+ * path, and half of it is what the fold RESOLVED rather than what was asked
+ * for. Reading a form back out of a report is how the two drift.
+ */
+const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
+                       "msa-text", "max-msa", "recycles", "tolerance",
+                       "af3-mode", "af3-count", "random-seed"];
+
+/** What the form says now, in one object the session can carry. */
+function formInputs() {
+  const controls = {};
+  for (const id of FOLD_CONTROLS) {
+    const element_ = document.getElementById(id);
+    if (element_ !== null) {
+      controls[id] = element_.type === "checkbox" ? element_.checked : element_.value;
+    }
+  }
+  return { entities: entityList.read(), controls };
+}
+
+/**
+ * ...and put it back. Returns whether it had anything to put.
+ *
+ * 🔴 WITHOUT `change` EVENTS. Those listeners exist to bring the other
+ * controls into agreement with the row, and they used to empty the page as
+ * well - so dispatching one here would have thrown away the fold this is
+ * being called to restore. The syncs are called directly instead, in the
+ * listeners' own order, which is also one fewer thing to keep in step.
+ *
+ * 🔴 AND A SELECT ONLY TAKES A VALUE IT HAS. Assigning an unknown one leaves
+ * a select EMPTY rather than throwing, which is a control that says nothing
+ * and folds as whatever the code reads out of "" - so an option that is no
+ * longer offered (a model this build dropped) leaves that row alone.
+ */
+function applyInputs(inputs) {
+  if (inputs === undefined || inputs === null) return false;
+  if (Array.isArray(inputs.entities) && inputs.entities.length > 0) {
+    try {
+      entityList.set(inputs.entities);
+    } catch (cause) {
+      console.warn("could not put the sequence rows back", cause);
+    }
+  }
+  for (const [id, value] of Object.entries(inputs.controls ?? {})) {
+    const element_ = document.getElementById(id);
+    if (element_ === null || value === undefined) continue;
+    if (element_.type === "checkbox") { element_.checked = !!value; continue; }
+    if (element_.tagName === "SELECT"
+        && ![...element_.options].some((option) => option.value === value)) continue;
+    element_.value = value;
+  }
+  syncModelControls();
+  syncMode();
+  syncAf3Count();
+  return true;
+}
+
 /** The last prediction, kept so it can be downloaded as it was computed. */
 let lastPrediction;
+
+/**
+ * The object THIS PAGE'S FOLDING made, so the next fold can recycle it and
+ * leave everything else alone. Undefined until the first fold: before that
+ * there is nothing of ours on screen, and whatever is there was restored or
+ * dropped by the reader.
+ */
+let lastFoldStem;
 
 /** The one fold owned by the page; pressing the same button aborts it. */
 let activeFold;
@@ -1199,13 +1300,48 @@ function singleSequenceIfOnlyQuery(text, chains, where, extra = {}) {
   return { text: null, blocks: null, ...extra };
 }
 
-async function alignmentText(chains, signal, family) {
+async function alignmentText(chains, signal, family, wantsMsa = []) {
+  // 🔴 "THIS CHAIN FOLDS FROM ITS SEQUENCE ALONE" HAS NO CONDITIONS ON IT.
+  // That is what the entity popup says, and it was honoured on the SEARCH
+  // path only - where every chain has its own a3m and blanking one is a
+  // substitution. A pasted or uploaded alignment is ONE text over the
+  // concatenated chains, so the setting did nothing at all there: an existing
+  // job with an alignment in the box folded with it however the entity rows
+  // were set. Reported exactly that way.
+  //
+  // Two answers, because they are two different statements. With EVERY chain
+  // turned off there is no alignment left to give the model and this is the
+  // single-sequence path by another name. With SOME off, the text keeps its
+  // shape and those chains lose their rows' residues - see blankChainColumns.
+  const chainOff = chains.map((_, index) => wantsMsa[index] === false);
+  const allOff = chains.length > 0 && chainOff.every(Boolean);
+  // ONE EXIT FOR THE TEXT THE READER SUPPLIED, so a third way of supplying
+  // one cannot forget the setting the way these two did.
+  const fromText = (text, label) => {
+    if (allOff) return null;
+    // 🔴 AND THE SPANS ARE ONLY KNOWABLE WHEN THE QUERY IS THE ONE IN THE
+    // BOX. A pasted alignment's own first record WINS over the sequence box -
+    // deliberately, so a reader can paste an alignment and fold what it
+    // describes (see singleSequenceIfOnlyQuery) - and the chain spans here
+    // are measured off the BOX. Where the two differ there is nothing to
+    // measure against, so blanking would gap arbitrary columns of somebody
+    // else's alignment. It says so and folds what was pasted.
+    const mismatch = chainOff.some(Boolean)
+      && parseA3m(text).query !== chains.join("");
+    if (mismatch) {
+      status(`${label} is for a different sequence - folding it as it is,`
+        + " with every chain's alignment");
+      return singleSequenceIfOnlyQuery(text, chains, label) ?? text;
+    }
+    const kept = blankChainColumns(text, chains, chainOff);
+    return singleSequenceIfOnlyQuery(kept, chains, label) ?? kept;
+  };
   switch (msaMode()) {
     case "single": return null;
     case "paste": {
       const text = element("msa-text").value.trim();
       if (text.length === 0) throw new Error("Paste an A3M, or switch the alignment back to none");
-      return singleSequenceIfOnlyQuery(text, chains, "The pasted alignment") ?? text;
+      return fromText(text, "The pasted alignment");
     }
     case "upload": {
       // 🔴 AN ARCHIVE RESTORES THE BLOCKS; A BARE a3m NEVER HAD THEM. This is
@@ -1216,11 +1352,19 @@ async function alignmentText(chains, signal, family) {
       // meaning - one text, recorded as the unpaired block - because that is
       // genuinely all it says.
       if (uploadedMsas?.chains > 0) {
+        if (allOff) return null;
+        // ...per chain here rather than on the merged text, because an
+        // archive HAS the per-chain alignments: the same substitution the
+        // search path makes, one step earlier. A chain that is off is folded
+        // against its own query row and pairs with nothing.
+        const queryOnly = (sequence) => `>101\n${sequence}\n`;
         const merged = mergeSearchedChains({
           sequences: chains,
-          chainA3ms: uploadedMsas.chainA3ms,
+          chainA3ms: uploadedMsas.chainA3ms.map((a3m, index) =>
+            (chainOff[index] ? queryOnly(chains[index]) : a3m)),
           pairedA3ms: new Map(chains.map((chain, index) =>
-            [chain, uploadedMsas.pairedA3ms.get(index)])),
+            [chain, chainOff[index] ? queryOnly(chain)
+              : uploadedMsas.pairedA3ms.get(index)])),
           model: family,
         });
         if (uploadedMsas.chains !== chains.length) {
@@ -1233,14 +1377,15 @@ async function alignmentText(chains, signal, family) {
           ?? { text: merged.a3m, blocks: merged.blocks };
       }
       if (uploadedA3m.length === 0) throw new Error("Choose an A3M file, or switch the alignment back to none");
-      return singleSequenceIfOnlyQuery(uploadedA3m, chains, "The uploaded alignment") ?? uploadedA3m;
+      return fromText(uploadedA3m, "The uploaded alignment");
     }
     case "search": {
       // 🔴 THE ONE REQUEST THIS PAGE MAKES OFF THE MACHINE. Everything else runs
       // against weights already on disk. The sequence is sent to the public
       // ColabFold MMseqs2 server, so it is a mode the reader picks rather than
       // a default they discover afterwards.
-      const query = chains.join("");
+      // ...validated over EVERY chain, because every one of them is being
+      // folded. What is SEARCHED for is a subset; see `searchChains`.
       const problem = complexSequenceProblem(chains.join(":"));
       if (problem !== null) throw new Error(problem);
       // 🔴 MULTIMER PAIRS, THE MONOMER STAYS BLOCK-DIAGONAL, and neither is a
@@ -1276,7 +1421,45 @@ async function alignmentText(chains, signal, family) {
       // a monomer search has no paired block to re-merge from; the cache is
       // then not usable and the search runs. Reusing it anyway would silently
       // fold a complex with no paired rows.
-      const plan = planSearchReuse({ cache: searchCache, chains, family });
+      // 🔴 A CHAIN WITH ITS MSA OFF IS SEARCHED FOR AND THEN GIVEN ITS QUERY
+      // ROW ALONE, which is what AlphaFold reads as "no alignment for this
+      // chain". The merge already pads a short chain with gaps
+      // (mergeRowAlignedChainA3ms), so a query-only block lands as the real
+      // sequence on row 0 and gaps under it - the model's own representation,
+      // not an approximation of one.
+      //
+      // 🔴 AND THE SEARCH DOES NOT RUN FOR IT. It used to: the chain was
+      // searched for and its answer thrown away afterwards, on the reasoning
+      // that dropping it from the request changes what the PAIRING is
+      // computed over and so changes the OTHER chains' alignments. That is
+      // true and it is the wrong trade, for two reasons the note it replaces
+      // did not weigh.
+      //
+      // The sequence still went to the public ColabFold server. "No
+      // alignment for this chain" is a reasonable way to say "do not send
+      // this one anywhere", and it did not mean that.
+      //
+      // And pairing picks species present in two or more chains, so keeping
+      // a chain whose alignment is about to be discarded biases which
+      // organisms are paired for the chains that kept theirs. The alignments
+      // it preserved were identical to a fold nobody asked for.
+      //
+      // What it costs: flipping the row back needs a new search, because the
+      // cache now holds what was asked for rather than everything. Reported
+      // as mmseqs2 searching for both chains when only one wanted it.
+      const blankMsa = (index) => (wantsMsa[index] === false);
+      const someOff = chains.some((_, index) => blankMsa(index));
+      const queryOnlyA3m = (sequence) => `>101\n${sequence}\n`;
+
+      // WHAT IS ACTUALLY SEARCHED FOR, and therefore what is cached and what
+      // the template hits are numbered in: the chains that asked for an
+      // alignment, in their own order. Everything below maps back.
+      const searchChains = someOff
+        ? chains.filter((_, index) => !blankMsa(index)) : chains;
+      // ...and with none of them asking, nothing is sent at all. This is the
+      // single-sequence path, which every consumer already handles.
+      if (searchChains.length === 0) return null;
+      const plan = planSearchReuse({ cache: searchCache, chains: searchChains, family });
       let searched;
       if (plan.reuse === "single") {
         searched = searchCache.raw.single;
@@ -1284,7 +1467,7 @@ async function alignmentText(chains, signal, family) {
       } else if (plan.reuse === "merge") {
         const { chainA3ms, pairedA3ms, depth, templateHits } = searchCache.raw;
         const merged = mergeSearchedChains({
-          sequences: chains, chainA3ms, pairedA3ms, model: family,
+          sequences: searchChains, chainA3ms, pairedA3ms, model: family,
         });
         // ...and the hits with them. `mergeSearchedChains` re-merges the
         // ALIGNMENTS and knows nothing about templates, so without this a
@@ -1293,11 +1476,43 @@ async function alignmentText(chains, signal, family) {
         searched = { ...merged, depth, templateHits };
         status(`MSA reused · ${depth} sequences`);
       } else {
-        searched = chains.length === 1
-          ? await generateMmseqs2Msa(query, searchOptions)
-          : await generateMmseqs2ComplexMsa(chains, searchOptions);
+        searched = searchChains.length === 1
+          ? await generateMmseqs2Msa(searchChains[0], searchOptions)
+          : await generateMmseqs2ComplexMsa(searchChains, searchOptions);
         status(`MSA search found ${searched.depth} sequences`);
-        searchCache = { key: plan.key, raw: searchCacheEntry({ chains, searched }) };
+        searchCache = { key: plan.key,
+                        raw: searchCacheEntry({ chains: searchChains, searched }) };
+      }
+      // ...and the chains that asked for none are put back, as query-only
+      // blocks, in the FOLD's order. What came back covers `searchChains`
+      // alone; everything downstream counts chains the way the entity rows
+      // do, so this is the one place the two numberings meet.
+      if (someOff) {
+        // The parts, from whichever shape holds them: a one-chain search
+        // keeps its result whole (`single`), a complex keeps the per-chain
+        // blocks, and a reused merge has already been turned back into text.
+        const raw = searchCache?.raw ?? {};
+        const parts = searchChains.length === 1
+          ? [raw.single?.a3m ?? searched.a3m]
+          : (raw.chainA3ms ?? searched.chainA3ms);
+        // ...and the two numberings meet in ONE tested function, not here.
+        const { chainA3ms, pairedA3ms, templateHits } = expandSearchedChains({
+          chains,
+          off: chains.map((_, index) => blankMsa(index)),
+          parts,
+          pairedA3ms: searchChains.length === 1
+            ? undefined : (raw.pairedA3ms ?? searched.pairedA3ms),
+          templateHits: raw.templateHits ?? searched.templateHits,
+        });
+        searched = { ...searched,
+                     ...mergeSearchedChains({ sequences: chains, chainA3ms,
+                                              pairedA3ms, model: family }),
+                     depth: searched.depth,
+                     templateHits };
+        const off = chains.length - searchChains.length;
+        status(`MSA search · ${searchChains.length} chain`
+               + `${searchChains.length === 1 ? "" : "s"} searched, ${off}`
+               + ` folded from ${off === 1 ? "its" : "their"} query alone`);
       }
       // 🔴 THE BLOCKS COME BACK APART, AND AF3 NEEDS THEM THAT WAY. `text` is
       // the paired rows stacked above the unpaired ones, which is what the
@@ -1446,6 +1661,11 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
   const registry = window.py2dmol_viewers ?? {};
   viewer = registry[Object.keys(registry)[0]]?.renderer;
   viewerObject = viewer?.currentObjectName;
+  // ...and a structure has landed, so it takes the big slot back. This is
+  // AlphaFold 2's first pass - the ingestion path rather than the frame one -
+  // and it said nothing, which is why every AF2 fold recycled with its
+  // structure in the SMALL slot. See foldIsShowing.
+  foldIsShowing(viewer);
   // 🔴 pLDDT ONLY WHERE THERE IS A pLDDT. `loadIntoViewer` is handed `scores`
   // exactly when the model has a confidence head, and painting the pLDDT ramp
   // over an absent B-factor makes every residue the colour of NO CONFIDENCE -
@@ -1488,12 +1708,19 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
   return stats;
 }
 
+let lastReportedObject;
 let lastReportedFrameIdx = -1;
 
 function getActiveFrameConfidence(frameIndex) {
   try {
     if (!viewer) return null;
-    const objName = viewerObject ?? viewer.currentObjectName;
+    // 🔴 THE OBJECT BEING EDITED, NOT THE ONE THIS PAGE LAST FOLDED.
+    // `viewerObject` is pinned to the running fold's object - which is right
+    // for the frames being APPENDED to it - and the card describes what is
+    // on SCREEN. With folds accumulating those are different objects the
+    // moment a reader picks another one, and the card went on reporting the
+    // last fold's numbers over somebody else's structure.
+    const objName = viewer.currentObjectName ?? viewerObject;
     const obj = viewer.objects?.find((entry) => entry.name === objName);
     const objData = viewer.objectsData?.[objName];
     const frames = objData?.frames ?? obj?.frames;
@@ -1501,9 +1728,21 @@ function getActiveFrameConfidence(frameIndex) {
       ? frameIndex
       : (obj?.currentFrame ?? objData?.currentFrame ?? viewer.currentFrame ?? 0);
     const targetFrame = frames?.[idx];
-    const pred = (objName ? predictions.get(objName) : null) ?? lastPrediction;
-    const conf = targetFrame?.confidence ?? pred?.recycles?.[idx]?.confidence;
-    return { confidence: conf, index: idx };
+    const pred = objName ? predictions.get(objName) : null;
+    // ...and the FOLD'S own numbers where the frame's are not the card's.
+    // 🔴 PRESENT IS NOT THE SAME AS SCORED. A sampler frame carries a
+    // `confidence` of its own - the per-atom pLDDT the ribbon is coloured
+    // from - with no meanPlddt and no pTM in it, and the card renders a
+    // missing number as "-". So taking the frame's whenever it exists blanked
+    // every cell the moment a reader picked another fold, on a page that had
+    // just shown pLDDT 74.7. What the card wants is a SUMMARY, and the fold's
+    // own is the one to fall back to.
+    const scored = (c) => !!c && (c.meanPlddt !== undefined || c.ptm !== undefined);
+    const frameConf = targetFrame?.confidence;
+    const predConf = pred?.recycles?.[idx]?.confidence ?? pred?.confidence;
+    const conf = scored(frameConf) ? frameConf
+      : (scored(predConf) ? predConf : frameConf);
+    return { confidence: conf, index: idx, object: objName };
   } catch (err) {
     return null;
   }
@@ -1513,8 +1752,9 @@ function syncScoresCardToActiveFrame(frameIndex) {
   const result = getActiveFrameConfidence(frameIndex);
   if (result && result.confidence) {
     lastReportedFrameIdx = result.index;
+    lastReportedObject = result.object;
     // and an estimated pLDDT has to say that it is one.
-updateScoresCard(result.confidence);
+    updateScoresCard(result.confidence);
   }
 }
 
@@ -1522,11 +1762,15 @@ updateScoresCard(result.confidence);
 setInterval(() => {
   try {
     if (!viewer) return;
-    const objName = viewerObject ?? viewer.currentObjectName;
+    const objName = viewer.currentObjectName ?? viewerObject;
     const obj = viewer.objects?.find((entry) => entry.name === objName);
     const objData = viewer.objectsData?.[objName];
     const idx = obj?.currentFrame ?? objData?.currentFrame ?? viewer.currentFrame;
-    if (idx !== undefined && idx !== lastReportedFrameIdx) {
+    // ...and the OBJECT is half of what the card is describing. Two folds can
+    // be on the same frame index, so watching the index alone left the card
+    // on the fold you had just switched away from.
+    if (idx !== undefined
+        && (idx !== lastReportedFrameIdx || objName !== lastReportedObject)) {
       syncScoresCardToActiveFrame(idx);
     }
   } catch (e) {}
@@ -1665,8 +1909,22 @@ function showTrunkContacts(liveContacts, chains) {
     // the sampler's first frame - so the whole trunk's contact maps were
     // pushed into a panel nobody could see.
     revealViewer(renderer);
-    renderer.chains = trunkChainIds(chains);
-    renderer.heatmapRenderer.setMaps({ contact: liveContacts });
+    const ids = trunkChainIds(chains);
+    renderer.chains = ids;
+    // 🔴 AND THE MAP CARRIES THEM, so the panel does not have to guess whose
+    // they are. It ruled its boundaries off `renderer.chains`, which belongs
+    // to whatever is DRAWN - during a fold that is the PREVIOUS job, because
+    // this one's object is still empty - and py2Dmol's guard compared
+    // LENGTHS, which cannot tell "this array describes this matrix" from
+    // "this array is the same size". Change the copy count or the sequence
+    // length so the totals coincide and the last job's boundaries were ruled
+    // across this picture. Reported as chain lines from previous jobs
+    // bleeding through during transitions. A map that states its own layout
+    // cannot be wrong about it.
+    renderer.heatmapRenderer.setMaps({
+      contact: { data: liveContacts.data ?? liveContacts, n: liveContacts.n,
+                 vmin: liveContacts.vmin, vmax: liveContacts.vmax, chains: ids },
+    });
     window.Heatmap?.updateVisibility?.(renderer);
     renderer.render("trunk-contacts");
   } catch (cause) {
@@ -1735,6 +1993,36 @@ function alignedToFirstPass(sequence, structure, firstPassStructure) {
  * (`frame.pae` / `frame.pae_n`), so scrubbing the bar moves the matrix too.
  */
 /**
+ * A FOLD HAS PUT A STRUCTURE ON SCREEN: show it, and give it the big slot.
+ *
+ * 🔴 TWO THINGS THAT BELONG TOGETHER WERE WRITTEN OUT AT THREE SITES AND
+ * GATED ON `frames.length === 0`, AND THE PATHS THAT MISS THAT GATE ARE THE
+ * ONES A READER NOTICED. `openBlankFold` gives the contact map the big slot
+ * because an AF3 trunk has one before it has a structure; the structure takes
+ * it back when the first frame lands. But:
+ *
+ *   * AlphaFold 2's first pass goes through `loadIntoViewer`, which called
+ *     NEITHER - so every AF2 fold recycled with its structure in the small
+ *     slot, the contact map big beside it. Reported exactly that way.
+ *   * and a CONTINUATION never reaches pass zero at all: `openBlankFold`
+ *     seeds the object with the cached recycles, so `frames.length` is never
+ *     0 and no site fired. With the page clearing itself on Fold, that left
+ *     it BLANK until the run finished - reported as the screen going blank
+ *     instead of continuing from the recycle of interest.
+ *
+ * So it is one funnel, asked at every site that draws a frame rather than at
+ * the ones that happen to draw the FIRST. Both halves are idempotent -
+ * `revealViewer` returns on a visible container and `contactsBig(false)` only
+ * acts while the map is holding the slot - so calling it per frame costs a
+ * style read and settles the question for every path at once.
+ */
+function foldIsShowing(renderer) {
+  if (renderer === undefined || renderer === null) return;
+  revealViewer(renderer);
+  contactsBig(false);
+}
+
+/**
  * Show the viewer, for a fold that has a structure before it has a file.
  *
  * 🔴 THE CONTAINER STARTS `display: none` AND ONLY THE FILE-LOAD PATH OPENS
@@ -1761,6 +2049,78 @@ function revealViewer(renderer) {
 }
 
 /**
+ * EVERYTHING BELOW THE STATUS LINE, WHILE A FOLD IS WAITED FOR.
+ *
+ * 🔴 A RESULT ON SCREEN WHILE ANOTHER FOLD RUNS IS THE LAST ONE'S, and the
+ * page says nothing to that effect: the structure, the strip, the alignment,
+ * the scores and the two download buttons all look exactly as they did when
+ * they were the answer. Asked for in one line - "while waiting for fold, the
+ * previous results should disappear (everything below status menu)" - and it
+ * is the other half of the rule above it: setting the next run up changes
+ * nothing, and PRESSING FOLD clears the page.
+ *
+ * The objects are NOT touched. Folds accumulate and the picker still lists
+ * every one of them; what goes is the SIGHT of the last result while there
+ * is nothing to say about this one. `revealViewer` brings it all back, and
+ * it is already called the moment this fold has something to draw - the
+ * trunk's contact map, which is the earliest thing there is.
+ */
+function hideResults() {
+  for (const id of ["viewer-container", "sequence-viewer-container",
+                    "msa-buttons"]) {
+    const box = document.getElementById(id);
+    if (box !== null) box.style.display = "none";
+  }
+  msaCanvases("none");
+}
+
+/**
+ * 🔴 THE ALIGNMENT IS NOT INSIDE `#msa-buttons`. That box holds the HEADER -
+ * the mode menu, the filters, the chain picker - and `panels/msa.js` appends
+ * every `.msa-canvas` to `viewEl.parentElement`, so the drawn alignment is its
+ * SIBLING. Hiding the box therefore took the controls away and left the
+ * picture: reported as the previous object's MSA still displaying after
+ * pressing Fold. It went unnoticed because `openBlankFold` calls
+ * `MSA.clear()`, which REMOVES the canvases - so the leftover only shows in
+ * the window before the trunk runs, which on a complex is the search, the
+ * weights and a minute of looking at another job's alignment.
+ *
+ * Hidden rather than cleared, because a fold that is stopped before it draws
+ * has to put this back (see restoreResults) and a cleared one comes back as a
+ * header row over nothing. The class is py2Dmol's own interface here, the way
+ * the DOM ids above are.
+ */
+function msaCanvases(display) {
+  for (const box of document.querySelectorAll(".msa-canvas")) {
+    box.style.display = display;
+  }
+}
+
+/**
+ * ...and put them back where a fold ended with nothing to show.
+ *
+ * 🔴 A STOPPED FOLD MUST NOT LEAVE A BLANK PAGE. The reveal above happens
+ * when the new fold DRAWS, so a fold that fails, is stopped, or is refused
+ * before it draws anything would leave the reader looking at nothing with
+ * every previous fold still in the viewer. There is nothing to put back on a
+ * page that never had a result, which is what the object count answers.
+ */
+function restoreResults() {
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  if (!renderer || !Object.keys(renderer.objectsData ?? {}).length) return;
+  revealViewer(renderer);
+  try { window.updateMSAContainerVisibility?.(); } catch { /* optional panel */ }
+  // ...and the alignment itself, which is not in that box - see msaCanvases.
+  // Only where the panel came back: an object with no MSA leaves the header
+  // hidden, and its canvases have been removed rather than hidden anyway.
+  if (document.getElementById("msa-buttons")?.style.display !== "none") {
+    msaCanvases("block");
+  }
+  syncDownloads();
+}
+
+/**
  * A name no object and no earlier prediction is already using.
  *
  * 🔴 IT READS objectsData, NOT `viewer.objects`, WHICH DOES NOT EXIST. The AF2
@@ -1768,13 +2128,32 @@ function revealViewer(renderer) {
  * undefined on this build - so its uniquifying loop only ever consulted
  * `predictions` and would have collided with any object loaded another way.
  */
+/**
+ * THE JOB'S OWN NAME, UNLESS SOMETHING ELSE ON SCREEN HAS IT.
+ *
+ * 🔴 RETURNING THE BARE NAME DESTROYED A RESTORED FOLD. The suffix used to
+ * avoid every name in the viewer, and with one fold at a time that looked
+ * like dead weight. But `openBlankFold` REWINDS the object it opens - that
+ * is how it recycles our own - and a restored session is very often the same
+ * job under the same name, so folding after restoring it opened the
+ * RESTORED object and emptied it. Nothing removed it; it was overwritten,
+ * which is worse: the name and the picker entry stay and the frames are
+ * gone. Reported as: past results are lost, past objects cleared during a
+ * new fold.
+ *
+ * 🔴 AND OUR OWN PREVIOUS FOLD IS A CLASH TOO, NOW THAT FOLDS ACCUMULATE.
+ * It was taken out of the set - reusing it was the whole of one fold at a
+ * time - and with every fold keeping its own object, a name already on the
+ * page is taken whoever put it there. So a second fold of the same job is
+ * `design_a_2` beside `design_a` rather than on top of it.
+ */
 function uniqueStem(base) {
   const registry = window.py2dmol_viewers ?? {};
   const renderer = registry[Object.keys(registry)[0]]?.renderer;
   const taken = new Set(Object.keys(renderer?.objectsData ?? {}));
-  if (!taken.has(base) && !predictions.has(base)) return base;
+  if (!taken.has(base)) return base;
   let suffix = 2;
-  while (taken.has(`${base}_${suffix}`) || predictions.has(`${base}_${suffix}`)) suffix += 1;
+  while (taken.has(`${base}_${suffix}`)) suffix += 1;
   return `${base}_${suffix}`;
 }
 
@@ -1789,11 +2168,21 @@ function uniqueStem(base) {
  * Nothing marks it stale, and the scores card and the heatmap panel are
  * showing the old numbers too, so all three agree and all three are wrong.
  *
- * 🔴 IT ADDS AN OBJECT RATHER THAN CLEARING THEM ALL. clearAllObjects() would
- * also drop a previous prediction someone is comparing against - py2Dmol holds
- * several and the page's own `predictions` map expects them to survive. With
- * `shownObjects` at its resting state only the CURRENT object draws, so
- * switching to an empty one blanks the view and keeps the rest.
+ * 🔴 AND IT DROPS THE FOLD BEFORE IT. This used to ADD an object and keep
+ * every earlier one, so py2Dmol's picker could switch between runs and the
+ * page's `predictions` map held them all - comparison by accumulation. That
+ * is the thing this page is no longer trying to be: ONE FOLD AT A TIME, each
+ * its own saved session, and two folds side by side are two browser tabs.
+ * Asked for: "dont allow for multiobjects, each fold would be a seperate
+ * session".
+ *
+ * What it buys is that every "which one is this about?" on the page stops
+ * being a question. The scores card, the heatmap panel, both download
+ * buttons and the cover all describe `lastPrediction`, and with one object
+ * there is nothing else they COULD describe - where before each was a
+ * separate promise to keep in step, and the cover was the third of them to
+ * be found broken. The picker goes with it, without being touched: py2Dmol
+ * hides that row by itself once there is one object to pick.
  *
  * 🔴 AND IT RUNS BEFORE THE HANDLES ARE DROPPED, because `viewer` is about to
  * become undefined - that is what stops the score-card poll refilling from
@@ -1808,6 +2197,17 @@ function openBlankFold(stem, keep = []) {
   // asked for as the main view. See contactsBig.
   contactsBig(true);
   try {
+    // 🔴 AND THE FOLD BEFORE IT STAYS. This removed it - one fold at a time,
+    // each its own session - and the reader asked for the opposite: every
+    // fold is its own object, listed in the picker, and you switch between
+    // them. Reported as "starting new prediction deletes the previous
+    // prediction/object". What made one-at-a-time defensible was that the
+    // page could only describe ONE result; every panel reads
+    // `activePrediction()` now, which is keyed by the object being edited,
+    // so the scores card, the heatmap and the two download buttons follow
+    // whichever fold you are looking at and nothing has to be thrown away to
+    // keep them honest.
+    lastFoldStem = stem;
     renderer.addObject(stem);
     // 🔴 addObject KEEPS THE FRAMES OF AN OBJECT THAT ALREADY HAS THEM - "only
     // clear if it has no frames", which is right for a data refresh and wrong
@@ -2018,6 +2418,10 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
   frame.pae_n = sequence.length;
   frame.align = true;
   viewer.addFrame(frame, viewerObject);
+  // ...and this is a fold drawing, which on a CONTINUATION is the only thing
+  // that ever says so: pass zero - the one `loadIntoViewer` and every
+  // `frames.length === 0` site key on - belongs to the run being resumed.
+  foldIsShowing(viewer);
   attachContactMap(frame, recycle, weights, sequence.length);
   // ...and jump to it, so the newest pass is the one being looked at.
   const object = viewer.objects?.find((entry) => entry.name === viewerObject);
@@ -2544,7 +2948,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // a container that is actually on screen.
       // ...and the recycles are over, so the structure takes the big slot
       // back. See contactsBig.
-      if (index === 0) { revealViewer(renderer); contactsBig(false); }
+      foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       // ...numbered by the sampler's own count. Every frame in the object is
       // the sampler's now; the trunk draws none.
@@ -2732,7 +3136,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // what the model actually computed, and the panel holding those buttons
     // stayed hidden. The trajectory goes in as one model per sampler call,
     // which is the AF3 analogue of one model per recycle.
-    lastPrediction = {
+    recordPrediction({
       stem,
       // 🔴 THE FINAL STRUCTURE ONLY, NOT THE TRAJECTORY. Saving every sampler
       // step wrote a file whose MODEL 1 was the FIRST step - measured at a
@@ -2765,10 +3169,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       tokens: result.batch === undefined ? undefined
         : tokenLayoutFrom(result.batch.asymId, result.batch.residueIndex),
       ...foldContext,
-    };
-    predictions.set(stem, lastPrediction);
-    resultIsFrom(family);
-    syncDownloads();
+    }, family);
     void rememberSessionWhenSettled(lastPrediction);
     // ...and the reader keeps the view they had. A reload flies to its own,
     // which after watching a fold reads as the structure jumping at the end.
@@ -2973,7 +3374,10 @@ function samplerPreset() {
 
 async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad,
                                 modifications = []) {
-  const modelName = MODEL_LABELS[chosenFamily()] ?? "EF2-fast";
+  // ...read ONCE, at the top, because the row can move while a fold runs and
+  // the name and the family have to describe the same model.
+  const family = chosenFamily();
+  const modelName = MODEL_LABELS[family] ?? "EF2-fast";
   const sequence = chains.join(":");
   status(`${modelName} · loading`);
   // ...the long name is for the download dial, where provenance matters; the
@@ -3046,7 +3450,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     const object = renderer?.objectsData?.[renderer?.currentObjectName];
     if (renderer === undefined || object === undefined) return;
     try {
-      if (object.frames.length === 0) { revealViewer(renderer); contactsBig(false); }
+      foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
       if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
@@ -3345,7 +3749,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     viewer.render("ef2-final");
   }
 
-  lastPrediction = {
+  recordPrediction({
     stem, pdb, chains, confidence,
     scores: confidenceJson(sequence, confidence),
     chainLengths: chains.map((chain) => chain.length),
@@ -3391,9 +3795,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     msaOrigin: undefined,
     msas: {},
     templates: undefined,
-  };
-  syncDownloads();
-    void rememberSessionWhenSettled(lastPrediction);
+  }, family);
+  void rememberSessionWhenSettled(lastPrediction);
 
   esmfold2Trunk = result.reusable === undefined ? esmfold2Trunk
     : { key: trunkKey, reusable: result.reusable };
@@ -3632,13 +4035,10 @@ async function followRemoteFold({ since, label, signal }) {
     try {
       const remote = revivePrediction(result.predJson);
       remote.stem = stem;
-      lastPrediction = remote;
-      predictions.set(stem, remote);
-      // 🔴 THE RUNTIME'S OWN LABEL, because this page did not choose it. An
-      // attached reader is watching a fold somebody else started, and its own
-      // model row may say anything; `familyFromLabel` answers undefined for a
-      // label we do not write, and undefined claims nothing.
-      resultIsFrom(familyFromLabel(remote.model));
+      // ...through the one funnel, so this path records what every other
+      // one does: the last prediction, the map entry, the downloads, and
+      // the page's claim on the object (see recordPrediction).
+      recordPrediction(remote, remote.family ?? familyFromLabel(remote.model));
     } catch (cause) {
       console.warn("the runtime's prediction did not parse:", cause);
     }
@@ -3702,7 +4102,7 @@ function remoteFrameDrawer(stem) {
     const object = renderer.objectsData?.[renderer.currentObjectName];
     if (object === undefined) return;
     try {
-      if (object.frames.length === 0) { revealViewer(renderer); contactsBig(false); }
+      foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
       renderer.addFrame(frame, renderer.currentObjectName);
@@ -3737,11 +4137,8 @@ async function fold(event) {
   // The button is no good either: it stays enabled throughout, being how you
   // stop one. See tools/colab_backend.py.
   window.__foldState = { running: true, since: Date.now() };
-  // 🔴 AND THE VEIL COMES OFF WHEN THE FOLD STARTS, not when it lands: from
-  // here on the page IS answering the question the row asks, and the previous
-  // structure underneath is the same "never blank between folds" the scores
-  // card's own clear is written against.
-  resultIsFrom(undefined);
+  // Whether this press computed anything; see the AF2 replay.
+  let foldWasReplayed = false;
   setFoldButton("running");
   // ...`msaMode()` and not the select, so the dev log records what the fold
   // will actually do rather than what a hidden control still says.
@@ -3755,6 +4152,8 @@ async function fold(event) {
   // is still the last thing that WAS predicted, and the page is never blank
   // between folds.
   updateScoresCard(undefined);
+  // ...and the rest of the last result with it - see hideResults.
+  hideResults();
   try {
     const entities = entityList.read();
     const enteredProblem = entitiesProblem(entities);
@@ -3766,9 +4165,13 @@ async function fold(event) {
     }
     const request = enteredProblem === null
       ? expandEntities(entities)
-      : { chains: [], chainKinds: [], ligandCodes: [], modifications: [], templates: [] };
+      : { chains: [], chainKinds: [], chainMsa: [], ligandCodes: [],
+          modifications: [], templates: [] };
     let chains = request.chains;
     let chainKinds = request.chainKinds ?? chains.map(() => "protein");
+    // ...and which chains asked for an alignment, in chain order. Absent
+    // means all of them, which is every job written before the row existed.
+    const chainMsa = request.chainMsa ?? chains.map(() => true);
     const ligandCodes = request.ligandCodes;
     const modifications = request.modifications ?? [];
     // 🔴 THE BONDS COME OFF THE ROWS, NOT OUT OF A VARIABLE. They were held in
@@ -3873,6 +4276,13 @@ async function fold(event) {
     // protein database as a four-residue peptide and align whatever came back
     // over the wrong chain.
     const proteinChains = chains.filter((_, index) => chainKinds[index] === "protein");
+    // 🔴 AND WHICH OF THEM ASKED FOR AN ALIGNMENT, in the same order, because
+    // that is the only thing that says which block belongs to which chain.
+    // Off `chainMsa`, which expandEntities builds in chain order beside
+    // `chainKinds` - a protein with its MSA set to none is folded with its
+    // query row alone while the rest of the complex keeps theirs.
+    const proteinWantsMsa = chainMsa
+      .filter((_, index) => chainKinds[index] === "protein");
     // 🔴 SAID OUT LOUD, BECAUSE THE ALTERNATIVE IS A SILENT DIFFERENCE. With
     // the MSA set to Search, a job that is part DNA gets an alignment for its
     // protein chains and none for the rest - which is what AF3 does for DNA and
@@ -3893,7 +4303,7 @@ async function fold(event) {
     // that is already complete. A DNA-only fold is the same case: there is no
     // protein to search with, and no RNA database here to search instead.
     const alignmentResult = proteinChains.length === 0
-      ? null : await alignmentText(proteinChains, signal, family);
+      ? null : await alignmentText(proteinChains, signal, family, proteinWantsMsa);
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
     // A pasted or uploaded A3M is one text and cannot be split into blocks; it
@@ -3908,16 +4318,42 @@ async function fold(event) {
     // nothing and is told so - single sequence has no hits, and folding
     // silently without the template someone asked for is the failure this
     // whole path is trying to avoid.
-    const hits = typeof alignmentResult === "string"
+    const searchHits = typeof alignmentResult === "string"
       ? undefined : alignmentResult?.templateHits;
+    // 🔴 THE HITS COUNT PROTEIN CHAINS; A TEMPLATE NAMES A FOLD CHAIN. The
+    // search is handed `proteinChains` and its hits come back numbered in
+    // THAT list, while `template.chain` is the index `expandEntities` gave
+    // it - which counts every polymer, DNA and RNA among them. The two agree
+    // only while every polymer is a protein, so a job with a nucleic chain
+    // BEFORE a protein one read its automatic template off the wrong chain,
+    // or off none. Both numberings exist here and nowhere else, so this is
+    // where they meet.
+    const proteinAt = [];
+    chainKinds.forEach((kind, index) => {
+      if (kind === "protein") proteinAt.push(index);
+    });
+    const hits = searchHits === undefined ? undefined : new Map(
+      [...searchHits].map(([at, found]) => [proteinAt[at] ?? at, found]));
     for (const template of templateSources) {
       if (template.auto !== true) continue;
       const best = (hits?.get(template.chain) ?? [])[0];
       if (best === undefined) {
+        // 🔴 AND TWO SETTINGS FROM THE SAME PANEL CAN CONTRADICT EACH
+        // OTHER. "A template from the MSA search" and "no alignment for
+        // this chain" are both set on the ⋮ menu, and since the search now
+        // covers only the chains that asked for one, the first cannot be
+        // answered for a chain that took the second. Saying "the search
+        // found no template" there would be false - it was never searched
+        // for - and the reader would go looking for a homolog that exists.
         throw new Error(hits === undefined
           ? "Automatic templates need an MSA search: set the MSA to search, or"
             + " name a structure instead."
-          : `The search found no template for chain ${template.chain + 1}.`);
+          : chainMsa[template.chain] === false
+            ? `Chain ${template.chain + 1} asks for a template from the MSA`
+              + " search and for no alignment, and it is not searched for at"
+              + " all - so there are no hits to take one from. Give it an"
+              + " alignment, or name a structure."
+            : `The search found no template for chain ${template.chain + 1}.`);
       }
       status(`Fetching template ${best.target}`);
       const structures = await fetchMmseqs2Templates([best.target], { signal });
@@ -3959,6 +4395,13 @@ async function fold(event) {
     foldContext = {
       entities,
       bonds,
+      // 🔴 THE FORM AS IT IS RIGHT NOW, which is what makes a restored fold
+      // continuable: it rides into every prediction through the spread of
+      // this object and into the session through jobMeta. Read HERE, at the
+      // start, rather than when the session is written - a fold takes a
+      // minute and the boxes can be edited while it runs, and what the
+      // session should put back is what produced this answer.
+      inputs: formInputs(),
       // 🔴 NOT RECORDED HERE AT ALL ANY MORE. The request's `name` is the
       // fold's `stem`, which `foldStem` has already resolved from this same
       // box - so `archiveFor` reads `pred.stem` and the two cannot disagree.
@@ -4102,8 +4545,28 @@ async function fold(event) {
     // rewound to a different fold's frames. A sweep starts from pass zero and
     // leaves no resumable state behind; see the clear after the loop.
     const af2Cached = sweep.length === 1 && af2Cache?.key === af2Key ? af2Cache : undefined;
-    const resume = af2Cached !== undefined && af2Cached.resumable.recycles < recycles
-      ? af2Cached.resumable : undefined;
+    // ...and what this press has to compute, which is a decision with three
+    // answers and a home of its own: see planRecycleReuse.
+    const plan = planRecycleReuse({ cache: af2Cached, key: af2Key, passes, recycles });
+    const resume = plan.plan === "resume" ? af2Cached.resumable : undefined;
+    // 🔴 AND WHAT IS ALREADY IN MEMORY IS NEVER RECOMPUTED. The resume above
+    // only fires when MORE passes are asked for; pressing Fold again at the
+    // same count, or at fewer, fell through to a full fold from pass zero -
+    // and the answer cannot differ, because everything that could change it
+    // is in `af2Key`: the sequence, the chain lengths, the MSA depths, the
+    // SEED, the tolerance, the family, and hashes of the alignment and the
+    // template. A reader who wants a different sample changes the seed, which
+    // changes the key. So an identical key with enough passes already in hand
+    // is minutes spent to arrive back where the page already was.
+    //
+    // Replaying covers FEWER passes too: the first N of a longer run are that
+    // N-recycle fold, pass for pass, because each one is computed from the
+    // one before it.
+    const cachedPasses = af2Cached?.recycles ?? [];
+    const replay = plan.plan === "replay";
+    // ...and the status line says so at the end, because a fold that takes no
+    // time reads as one that did not happen.
+    if (replay) foldWasReplayed = true;
 
     predictionCount += 1;
     // ...and a sweep says so in the file name, because the five models are one
@@ -4111,7 +4574,11 @@ async function fold(event) {
     // 🔴 uniqueStem READS objectsData; the loop that used to be here read
     // `viewer.objects`, which does not exist on this build. It is inside
     // foldStem now, which every fold path shares.
-    const stem = resume === undefined
+    // 🔴 AND A REPLAY REWINDS THE OBJECT IT ALREADY HAS, for the reason a
+    // continuation does: nothing was computed, so a fresh stem would put a
+    // SECOND object in the picker holding the same frames as the first, named
+    // as though it were another prediction.
+    const stem = (resume === undefined && !replay)
       ? foldStem(`${MODEL_STEMS[family] ?? family}`
         + `${sweep.length > 1 ? "_all5" : ""}_${predictionCount}`)
       : af2Cache.stem;
@@ -4127,7 +4594,11 @@ async function fold(event) {
     // Keeping the NAME is what makes it a rewind rather than a copy: the
     // alignment, the MSA panel and everything else py2Dmol hangs off an object
     // stay attached, and only the frames are replayed.
-    const kept = resume === undefined ? [] : af2Cached.recycles.map((pass, index) => ({
+    // ...and a replay seeds the object with exactly the passes that were
+    // asked for, where a continuation seeds it with everything it had.
+    const seeded = replay ? cachedPasses.slice(0, passes)
+      : (resume === undefined ? [] : af2Cached.recycles);
+    const kept = seeded.map((pass, index) => ({
       pdb: predictionToPdb(sequence, index === 0
         ? (af2Cached.firstPassLanded ?? pass.structure)
         : alignedToFirstPass(sequence, pass.structure, af2Cached.firstPassLanded),
@@ -4159,10 +4630,20 @@ async function fold(event) {
       const registry = window.py2dmol_viewers ?? {};
       viewer = registry[Object.keys(registry)[0]]?.renderer;
       viewerObject = viewer === undefined ? undefined : stem;
+      // 🔴 AND THE PAGE IS SHOWN NOW, because these frames are already the
+      // answer. A REPLAY calls neither `loadIntoViewer` nor `appendPass` -
+      // there is nothing to load and nothing to append - and the safety net
+      // at the end of the fold only draws when `viewer` is undefined, which
+      // it is not. So without this the page stayed BLANK after Fold hid it:
+      // the continuation's bug, reintroduced by the path that skips the work.
+      foldIsShowing(viewer);
     }
     let firstPassLanded = undefined;
     let initialLoadPromise = undefined;
-    if (resume !== undefined) firstPassLanded = af2Cached.firstPassLanded;
+    // ...and a replay is the same: every pass after the first is aligned to
+    // the first one that landed, so the frames sit on each other rather than
+    // tumbling. Kept from the run these passes came from.
+    if (resume !== undefined || replay) firstPassLanded = af2Cached.firstPassLanded;
     // 🔴 EVERY MODEL'S PASSES IN ONE LIST, RANKED TOGETHER. AlphaFold's own
     // pipeline folds all five and ranks the outputs, and that is what "All 5"
     // is: the play bar is the whole sweep, and the structure this page saves is
@@ -4322,7 +4803,14 @@ async function fold(event) {
       // COORDINATES are somewhere else: measured at 0.0007 A RMSD from the fresh
       // three-recycle structure after superposition, which is float noise, but a
       // different file for the same prediction.
-      const prediction = await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
+      // 🔴 NOTHING TO COMPUTE IS NOTHING TO COMPUTE. With the key matched and
+      // enough passes already in hand, the model is not run at all: the
+      // passes are the answer, the cache keeps whatever LONGER run it came
+      // from, and the page lands on them through the same path a finished
+      // fold does. `prediction` stays undefined, so everything below reads
+      // `allRecycles` and `final` instead - which is what it read anyway.
+      const prediction = replay ? undefined
+        : await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
         .predictA3m(
           alignmentForDriver, weights, model.featureTables,
           // 🔴 `resumable: true` IS WHAT ASKS FOR THE CONTINUATION STATE, and this
@@ -4345,13 +4833,25 @@ async function fold(event) {
       // only the passes it ran, and the play bar is the whole trajectory - so the
       // cached ones are put back in front of them. `final` is still the last pass
       // actually computed, which is the one the page lands on.
-      const allRecycles = resume === undefined
-        ? prediction.recycles : [...af2Cached.recycles, ...prediction.recycles];
+      const allRecycles = replay ? seeded
+        : (resume === undefined
+          ? prediction.recycles : [...af2Cached.recycles, ...prediction.recycles]);
       // ...and only a single-model run leaves a continuation behind; see the
       // note on `af2Cached` above.
-      if (sweep.length === 1) {
+      //
+      // 🔴 A REPLAY LEAVES THE CACHE ALONE, and that is not an oversight: it
+      // may hold MORE passes than were asked for this time, and overwriting
+      // it with the shorter list would throw away work the next Fold could
+      // have replayed. Nothing was computed, so there is nothing to record.
+      if (sweep.length === 1 && !replay) {
+        // 🔴 `converged` IS WHAT MAKES THE NEXT PRESS A REPLAY. A run that
+        // stopped early holds FEWER passes than were asked for, so the planner's
+        // "enough in hand" test can never fire for it; without this flag the
+        // commonest fold there is recomputed itself on every press. Derived
+        // exactly as the status line below derives it, from the same two
+        // numbers, because two answers to that question is how they disagree.
         af2Cache = { key: af2Key, resumable: prediction.resumable, recycles: allRecycles,
-          firstPassLanded, stem };
+          converged: allRecycles.length < passes, firstPassLanded, stem };
       }
       for (const [i, r] of allRecycles.entries()) {
         const at = base + i;
@@ -4370,7 +4870,7 @@ async function fold(event) {
           family: foldFamily,
         });
       }
-      final = prediction.final;
+      final = replay ? allRecycles[allRecycles.length - 1] : prediction.final;
       // 🔴 AND THIS MODEL'S WEIGHTS GO, OR FIVE OF THEM ARE HELD AT ONCE.
       // Measured in the page before this line existed: a 68-residue sweep at
       // one recycle took the JS heap from 9 MiB to 3412, against Chrome's own
@@ -4448,7 +4948,10 @@ async function fold(event) {
       sequence,
       structure: finalLanded,
     };
-    lastPrediction = {
+    // ...and the family recorded is the WINNER's, not the row's: a sweep
+    // folds five and the one on screen is whichever won, which is the same
+    // reason the `model` field below says so.
+    recordPrediction({
       stem,
       // The BEST pass, and its own scores with it - a structure from one pass
       // beside another pass's pLDDT would be a file that describes nothing that
@@ -4469,12 +4972,7 @@ async function fold(event) {
       // of the five won rather than the one the row resolved to.
       model: `AlphaFold 2 (${best.family ?? family})`,
       ...foldContext,
-    };
-    predictions.set(stem, lastPrediction);
-    // ...and it is the WINNER's family, not the row's: a sweep folds five and
-    // the one on screen is whichever won, which is the same reason the model
-    // field above says so.
-    resultIsFrom(best.family ?? family);
+    }, best.family ?? family);
     // 🔴 A SAFETY NET, because the failure it catches is invisible. onRecycle is
     // optional the whole way down, so a model path that accepts the callback and
     // never calls it would produce a finished fold, a "Done" status and an empty
@@ -4579,7 +5077,8 @@ async function fold(event) {
       templateText = ` · template ${source.source ?? ""}`
         + ` ${af2Template.coverage.residues}/${af2Template.coverage.of}`;
     }
-    status(`Done in ${took} s · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
+    status(`${foldWasReplayed ? "Already folded · shown from memory"
+      : `Done in ${took} s`} · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
       + ` · pTM ${best.confidence.ptm.toFixed(3)}${bestIptmText}${ranked}${converged}`
       + templateText + broken);
   } catch (error) {
@@ -4623,6 +5122,9 @@ async function fold(event) {
     // so the end of the fold is the end of recycling - and for any fold that
     // stopped or failed before its sampler drew.
     contactsBig(false);
+    // ...and what was on screen before, where this fold never drew: a stop or
+    // a failure must not leave the page blank with every fold still in it.
+    restoreResults();
     if (activeFold === controller) activeFold = undefined;
     setFoldButton("idle");
   }
@@ -4736,7 +5238,7 @@ if (familySelect !== null) {
   // "everything keyed on a family has to be refreshed here" the comments below
   // already make about the controls.
   familySelect.addEventListener("change", () => {
-    syncModelControls(); syncMode(); syncPendingResult();
+    syncModelControls(); syncMode();
   });
 }
 document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
@@ -4747,7 +5249,6 @@ document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
 document.getElementById("af2Model")?.addEventListener("change", () => {
   syncModelControls();
   syncMode();
-  syncPendingResult();
 });
 // 🔴 THE PLM ROW CHANGES THE FAMILY, so everything the model row's own listener
 // refreshes has to refresh here too - `chosenFamily()` reads this select, and a
@@ -4756,7 +5257,6 @@ document.getElementById("af2Model")?.addEventListener("change", () => {
 document.getElementById("plm-mode")?.addEventListener("change", () => {
   syncModelControls();
   syncAf3Count();
-  syncPendingResult();
 });
 // 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
 // row after syncMode() has already read it above, so the controls have to be
@@ -5261,6 +5761,10 @@ async function rememberSession(pred) {
       sequence: (pred.chains ?? []).join(":"),
       settings: pred.settings,
       entities: pred.entities,
+      // ...and the form that made it, read at the moment the fold STARTED
+      // (foldContext) so that editing the boxes while it runs does not
+      // rewrite what this fold was.
+      inputs: pred.inputs,
       msaOrigin: pred.msaOrigin,
       // 🔴 THE ALIGNMENT, so a restored fold can be REPRODUCED rather than only
       // looked at. See the note in web/fold-session.js for why it is affordable
@@ -5268,6 +5772,10 @@ async function rememberSession(pred) {
       msas: pred.msas,
     });
     state.localfold.framesAtSave = held;
+    // ...and HOW MANY FOLDS this session will put back, which is what the
+    // offer row describes. Counted from the state rather than from our own
+    // bookkeeping: what a restore brings back is exactly what py2Dmol saved.
+    state.localfold.folds = (state.objects ?? []).length || 1;
     let saved = await saveSession(state);
     // 🔴 THE ALIGNMENT IS DROPPED AND THE SESSION IS SAVED AGAIN, rather than
     // the whole session being lost to one deep MSA. Everything else in the
@@ -5332,6 +5840,13 @@ async function offerSession() {
   const residues = `${meta.residues} residue${meta.residues === 1 ? "" : "s"}`;
   const plddt = meta.confidence?.meanPlddt;
   const score = plddt === undefined ? "" : ` · pLDDT ${plddt.toFixed(1)}`;
+  // 🔴 THE ROW DESCRIBES THE SESSION, AND A SESSION IS EVERY FOLD ON SCREEN.
+  // py2Dmol's `buildViewerState` saves every object, and folds accumulate now
+  // - so the line named the LAST fold's model, size, ligands and pLDDT while
+  // the button would put three folds back, two of them nothing to do with any
+  // of those numbers. Asked for: less verbose, because the restore can include
+  // runs unrelated to the last one.
+  const folds = Number(meta.folds) || 1;
   // 🔴 THE LIGAND AND THE MODIFICATION ARE NAMED, for the reason the status
   // line names them: neither changes the residue COUNT, so a phosphorylated
   // fold and its parent produce the same row and the offer describes the wrong
@@ -5350,9 +5865,21 @@ async function offerSession() {
     : ` + ${extras.length > 3 ? `${extras.slice(0, 3).join(", ")} +${extras.length - 3}`
       : extras.join(", ")}`;
   // 🔴 textContent, NEVER innerHTML: the sequence is user input.
+  // ...and the detail goes to the TOOLTIP rather than off the page: with one
+  // fold it is still the thing a reader recognises the session by, and the
+  // ligand and the modification are in it for the reason the status line
+  // names them - neither changes the residue count, so a phosphorylated fold
+  // and its parent read the same without them.
+  const summary = folds > 1
+    ? `${folds} folds`
+    : `${meta.model} · ${residues}${named}`;
   element("session-text").textContent =
-    `Last fold: ${meta.model} · ${residues}${named}${score} · ${agoLabel(meta.savedAt)}`;
-  element("session-text").title = meta.sequence ?? "";
+    `Last session · ${summary} · ${agoLabel(meta.savedAt)}`;
+  element("session-text").title = [
+    folds > 1 ? `${folds} folds, last: ${meta.model}` : meta.model,
+    `${residues}${named}${score}`,
+    meta.sequence ?? "",
+  ].filter((part) => part !== "").join(" · ");
   row.hidden = false;
 }
 
@@ -5455,7 +5982,23 @@ async function restoreSession() {
     // the last one. This is the reader that has always handled a dropped
     // `.py2dmol.json`, and it puts back every frame, the camera, the colour
     // mode, the style, the side chains, the PAE and every heatmap.
-    await globalThis.loadViewerState(state);
+    // 🔴 BESIDE THE FOLD ON SCREEN, NOT OVER IT. `loadViewerState` clears
+    // every object by default, so restoring a past session threw away the
+    // fold the reader was looking at - they had one thing, asked to see
+    // another, and ended up with one thing again. Asked for: the previous
+    // session should appear as a previous OBJECT.
+    //
+    // 🔴 AND THIS IS THE ONE PLACE THAT ACCUMULATES, WHICH IS THE WHOLE RULE.
+    // Folding replaces (openBlankFold clears first): a new fold is a new
+    // session and the page does not silently fill up. Restoring ADDS,
+    // because it is the only act where a reader has said, in as many words,
+    // that they want an old fold back while keeping what they have. py2Dmol
+    // shows its object picker the moment there are two, so the way between
+    // them arrives with the second one.
+    const beside = Object.keys(
+      (window.py2dmol_viewers?.[Object.keys(window.py2dmol_viewers ?? {})[0]]
+        ?.renderer?.objectsData) ?? {}).length > 0;
+    await globalThis.loadViewerState(state, { append: beside });
 
     // 🔴 AND WAITED FOR, NOT SLEPT ON. `loadViewerState` resolves BEFORE it is
     // finished: its last act is a `setTimeout(..., 100)` that picks the current
@@ -5542,8 +6085,36 @@ async function restoreSession() {
       contactSource: { contactProbs: savedConfidence?.contactProbs },
       restored: true,
     };
-    predictions.set(stem, restored);
+    // 🔴 UNDER THE NAME THE RENDERER GAVE IT, which an append can change: a
+    // session whose object is called `fold` landing beside a `fold` already
+    // here comes in as `fold_2`. `activePrediction` looks this map up by the
+    // object being edited, so filing it under the session's own stem would
+    // leave the downloads reading the fallback - the right files today and
+    // the wrong ones the moment the picker moves.
+    const landedAs = renderer?.currentObjectName ?? stem;
+    predictions.set(landedAs, restored);
+    restored.stem = landedAs;
     lastPrediction = restored;
+
+    // 🔴 AND THE FORM COMES BACK WITH IT, so the page is where it was rather
+    // than showing one fold while set up for another. A restore used to put
+    // the picture back and touch no control: pressing Fold then folded
+    // whatever was in the boxes, which on a fresh page is the default
+    // sequence - a fold you could look at and not continue from.
+    const putBack = applyInputs(meta?.inputs);
+
+    // ...and for a session written before the form travelled, the model row
+    // alone, which is the half that would otherwise be visibly wrong: a row
+    // reading AlphaFold 3 over a restored Boltz-2 structure. Nothing else in
+    // an old record says what the controls held.
+    const wasFrom = restored.family ?? meta?.family;
+    const row = document.getElementById("model-family");
+    if (!putBack && row !== null && typeof wasFrom === "string"
+        && [...row.options].some((option) => option.value === wasFrom)) {
+      row.value = wasFrom;
+      syncModelControls();
+      syncMode();
+    }
     // ...and the buttons are shown only when there is something behind them.
     syncDownloads();
 

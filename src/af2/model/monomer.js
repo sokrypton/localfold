@@ -227,12 +227,34 @@ export class AlphaFoldMonomerGpu {
       // writeBuffer of the same. WebGPU zero-initialises a new buffer, so the
       // whole thing is one allocation the driver already had to do.
       const zeros = (label, elements) => execution.allocate(label, elements);
+      // 🔴 AND THE TWO THE RESUMABLE STATE IS READ OUT OF MUST BE COPYABLE,
+      // WHICH THEY WERE NOT. `createReadback` copies from the buffer it is
+      // handed, `upload` defaults to STORAGE and `allocate` to STORAGE, and
+      // neither includes COPY_SRC - so the readback failed validation with
+      // "usage doesn't include BufferUsage::CopySrc".
+      //
+      // It needed an EARLY STOP to reach, which is why it survived: the loop
+      // reassigns `previousMsa` to the evoformer's own output - a buffer the
+      // stack made copyable - and the `break` on convergence USED TO jump
+      // over that line, leaving the buffer made HERE as the one read back.
+      // Continuing an already-converged fold stops on its first new pass and
+      // hit it every time; reported from af2-monomer, three recycles then six.
+      //
+      // The break moved below those assignments (see the note at the foot of
+      // the loop - the real fault there was a USE AFTER RELEASE, of which the
+      // usage error was one symptom), so the readback no longer reaches these
+      // buffers on that path at all. They keep COPY_SRC anyway: whether a
+      // buffer can be copied out of is a property of the buffer, not a bet on
+      // which line a loop exits from.
+      const carried = (label, elements) => execution.allocate(
+        label, elements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const carry = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
       let previousMsa = resume?.msa === undefined
-        ? zeros("monomer.recycle-msa-zero", length * 256)
-        : execution.upload("monomer.recycle-msa", resume.msa);
+        ? carried("monomer.recycle-msa-zero", length * 256)
+        : execution.upload("monomer.recycle-msa", resume.msa, carry);
       let previousPair = resume?.pair === undefined
-        ? zeros("monomer.recycle-pair-zero", length * length * 128)
-        : execution.upload("monomer.recycle-pair", resume.pair);
+        ? carried("monomer.recycle-pair-zero", length * length * 128)
+        : execution.upload("monomer.recycle-pair", resume.pair, carry);
       let previousPositions = resume?.atom37 === undefined
         ? zeros("monomer.recycle-positions-zero", length * 37 * 3)
         : execution.upload("monomer.recycle-positions", resume.atom37);
@@ -417,11 +439,31 @@ export class AlphaFoldMonomerGpu {
         results.push(recycleResult);
         onRecycle?.(recycleResult, recycle);
         throwIfAborted(signal);
-        if (shouldStopAfterRecycle(recycle, recycleDistance, tolerance)) break;
+        // 🔴 THE STATE IS THE PASS THAT JUST RAN, AND THE BREAK USED TO JUMP
+        // OVER THESE. They sat BELOW the early-stop `break`, so a converged
+        // run left `previousMsa`/`previousPair` pointing at the pass BEFORE
+        // its last while `resumable.recycles` counted the last.
+        //
+        // 🔴 AND THOSE BUFFERS HAD ALREADY BEEN RELEASED. The release at the
+        // top of this loop hands them back the moment the embedding has read
+        // them - so what the resumable readback copied from was not merely
+        // one pass stale, it was a buffer this fold no longer owned.
+        // `noteRelease` pools by `${byteLength}:${usage}` and hands the
+        // buffer to the next allocation that matches, so with pooling on the
+        // saved state could be ANOTHER TENSOR'S BYTES, and with pooling off
+        // the buffer is destroyed and the copy fails validation - which is
+        // the "usage doesn't include CopySrc" this was reported as.
+        //
+        // Above the break, the state always describes `results`'s last entry
+        // and is a buffer still owned. It moves nothing else: these four are
+        // read only by the NEXT pass, and on the last one there is none - so
+        // the fold's own answer is unchanged, which is what makes this safe
+        // to move rather than a different computation.
         previousMsa = embedding.msa;
         previousPair = embedding.pairWithoutTemplates;
         previousPositions = execution.upload(`monomer.recycle-positions-${recycle}`, structure.atom37);
         previousAtom37 = structure.atom37;
+        if (shouldStopAfterRecycle(recycle, recycleDistance, tolerance)) break;
       }
       // The state the next continuation needs. Read back BEFORE the finally
       // releases the allocator, and only these two: atom37 is already on the
@@ -437,15 +479,33 @@ export class AlphaFoldMonomerGpu {
       const stateStart = performance.now();
       let resumable = { atom37: previousAtom37, recycles: firstRecycle + results.length - 1 };
       if (recycleOptions.resumable === true) {
-        const stateEncoder = encode("recycle-state");
-        const msaReadback = execution.createReadback("state.msa", previousMsa, stateEncoder);
-        const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
-        await submit(stateEncoder, "recycle state readback");
-        resumable = {
-          ...resumable,
-          msa: await execution.mapFloat32(msaReadback),
-          pair: await execution.mapFloat32(pairReadback),
-        };
+        // 🔴 AND FAILING TO SAVE THE STATE IS NOT A FAILED FOLD. This threw,
+        // and the throw came out of `run` - so the page never reached the
+        // line that records the prediction, the answer it had just computed
+        // was discarded, and the NEXT fold had no cache to resume from and
+        // recomputed every recycle. Reported as both halves of that: a
+        // readback error, and then a continuation that re-predicts the
+        // recycles it already had.
+        //
+        // The structure is finished by the time this runs. Whether it can
+        // also be CONTINUED from is a separate promise, and the honest way
+        // to break it is to come back without `msa`/`pair` - which the
+        // resume path already reads as "start this state from zeros" - and
+        // say so, rather than to lose the fold.
+        try {
+          const stateEncoder = encode("recycle-state");
+          const msaReadback = execution.createReadback("state.msa", previousMsa, stateEncoder);
+          const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
+          await submit(stateEncoder, "recycle state readback");
+          resumable = {
+            ...resumable,
+            msa: await execution.mapFloat32(msaReadback),
+            pair: await execution.mapFloat32(pairReadback),
+          };
+        } catch (cause) {
+          console.warn("this fold cannot be continued from: its recycle state"
+            + " could not be read back", cause);
+        }
       }
       stageMilliseconds.resumable = performance.now() - stateStart;
       return {

@@ -8,6 +8,7 @@
  * byte is written - the row, and the three states the README can be in - and
  * those are the ones that were wrong when this was written.
  */
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "./harness.js";
 import { jobMeta } from "../web/fold-session.js";
 import { buildFoldArchive } from "../web/fold-archive.js";
@@ -227,5 +228,50 @@ describe("what the README says about an alignment", () => {
       expect(hasMsas).toBe(false);
       expect(files.get("README.md").includes("`msas/` holds")).toBe(false);
     }
+  });
+});
+
+/**
+ * 🔴 A RESTORED FOLD HAS TO BE CONTINUABLE, NOT ONLY LOOKABLE-AT. The session
+ * put the picture back and touched no control, so pressing Fold after a
+ * restore folded whatever was in the boxes - on a fresh page, the default
+ * sequence. What travels now is the FORM: `formInputs` reads it, `applyInputs`
+ * writes it, and `jobMeta` carries it between them.
+ *
+ * Neither function can be called here (they need a DOM), so what is checked is
+ * the thing that silently rots: the two ends naming the same controls, and
+ * those controls existing in the page at all. A typo in one id is a dial that
+ * comes back wrong with nothing thrown.
+ */
+describe("the form a session puts back", () => {
+  const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+  const page = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+  const listed = [...app.slice(app.indexOf("const FOLD_CONTROLS = ["))
+    .slice(0, app.slice(app.indexOf("const FOLD_CONTROLS = [")).indexOf("];"))
+    .matchAll(/"([^"]+)"/g)].map(([, id]) => id);
+
+  it("names controls the page actually has", () => {
+    expect(listed.length > 0).toBe(true);
+    for (const id of listed) {
+      expect(`${id} in index.html: ${page.includes(`id="${id}"`)}`)
+        .toBe(`${id} in index.html: true`);
+    }
+  });
+
+  it("is carried by jobMeta, so the two ends meet", () => {
+    const inputs = { entities: [{ type: "protein", value: "GG", copies: 1 }],
+                     controls: { "model-family": "boltz2", recycles: "3" } };
+    const meta = jobMeta({ stem: "s", model: "Boltz-2",
+                           prediction: prediction([2]), inputs });
+    expect(meta.inputs).toEqual(inputs);
+  });
+
+  it("survives a JSON round trip, which is how it is stored", () => {
+    const inputs = { entities: [{ type: "protein", value: "GG", copies: 2 }],
+                     controls: { "msa-mode": "search", "random-seed": "7" } };
+    const meta = JSON.parse(JSON.stringify(
+      jobMeta({ stem: "s", model: "AlphaFold 3",
+                prediction: prediction([2]), inputs })));
+    expect(meta.inputs).toEqual(inputs);
   });
 });

@@ -154,3 +154,64 @@ export function foundOnlyTheQuery(a3mText) {
 export function foldsAsSingleSequence(a3mText, sequence) {
   return foundOnlyTheQuery(a3mText) && parseA3m(a3mText).query === sequence;
 }
+
+/**
+ * The same alignment with some chains' columns emptied.
+ *
+ * 🔴 A PER-CHAIN "NO ALIGNMENT" HAS TO REACH A PASTED ONE TOO. The entity
+ * popup says "This chain folds from its sequence alone" with no conditions on
+ * it, and `alignmentText` honoured it on the SEARCH path only - where each
+ * chain has its own a3m and blanking one is a substitution. A pasted or
+ * uploaded alignment is ONE text whose columns are the concatenated protein
+ * chains, so the same promise there means editing the text: every row but the
+ * query loses its residues over that chain's span.
+ *
+ * 🔴 AND AN INSERTION IS NOT A COLUMN. An a3m's lowercase letters are
+ * insertions relative to the query and consume no column, so a blanked span
+ * has to drop the insertions that fall INSIDE it as well as gap the columns -
+ * count columns on the uppercase and the dashes alone, or the spans slide
+ * along every row that has an insertion in it and the blanking lands on the
+ * wrong chain.
+ *
+ * The query row is left exactly as it is: it is what the chain IS, and the
+ * model reads its own sequence from it.
+ *
+ * @param {string} a3mText the alignment, query first
+ * @param {string[]} chains the protein chains, in the order the query
+ *   concatenates them
+ * @param {boolean[]} off `true` for a chain whose alignment is to be dropped
+ * @returns {string} the alignment, or the input unchanged when nothing is off
+ */
+export function blankChainColumns(a3mText, chains, off) {
+  if (!Array.isArray(off) || !off.some(Boolean)) return a3mText;
+  const spans = [];
+  let at = 0;
+  for (let index = 0; index < chains.length; index += 1) {
+    const end = at + chains[index].length;
+    if (off[index] === true) spans.push([at, end]);
+    at = end;
+  }
+  if (spans.length === 0) return a3mText;
+  const blanked = (column) => spans.some(([from, to]) => column >= from && column < to);
+  const rewrite = (row) => {
+    let column = 0;
+    let out = "";
+    for (const character of row) {
+      if (character >= "a" && character <= "z") {
+        // an insertion: it belongs to the column it sits before
+        if (!blanked(column)) out += character;
+        continue;
+      }
+      out += blanked(column) ? "-" : character;
+      column += 1;
+    }
+    return out;
+  };
+  const lines = a3mText.split("\n");
+  let seen = 0;
+  return lines.map((line) => {
+    if (line.startsWith(">") || line.trim().length === 0) return line;
+    seen += 1;
+    return seen === 1 ? line : rewrite(line);      // ...the query stands
+  }).join("\n");
+}

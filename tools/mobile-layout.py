@@ -310,7 +310,7 @@ def measure(ws, w, h, shot=None):
       if (row === null) return 0;
       row.hidden = false;
       document.getElementById('session-text').textContent =
-        'Last fold: AlphaFold 2 (multimer) · 1284 residues · pLDDT 71.2 · 3h ago';
+        'Last session · AlphaFold 2 (multimer) · 1284 residues · 3h ago';
       return 1;
     })()""", False)
     evaluate(ws, "window.__asked = %d" % w, False)

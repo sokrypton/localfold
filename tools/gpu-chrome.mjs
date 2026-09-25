@@ -123,6 +123,20 @@ const STOCK_FLAGS = process.env.LOCALFOLD_STOCK_FLAGS === "1";
 const PLATFORM_FLAGS = process.platform === "linux"
   ? ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native",
      "--ignore-gpu-blocklist", "--no-sandbox",
+     // 🔴 WITHOUT THIS A DISPLAY-LESS BOX BENCHES THE CPU AND SAYS SO ONLY IN
+     // ONE LINE OF ADAPTER PRINT. A surface is a thing you present TO, and a
+     // Colab container has no display - so Vulkan init fails and Chrome falls
+     // back to SwiftShader: `google / swiftshader`, and an occupancy sweep
+     // that reads 4 workgroups because the times are exactly linear in the
+     // work. tools/colab_backend.py has passed it since it was written; this
+     // launcher did not, because the A100 box it was written for runs HEADED.
+     //
+     // ON NO DISPLAY, NOT ON LINUX, because that is the actual condition and
+     // the A100 box cannot be reached from here to check that the flag is
+     // harmless with a surface present. (tools/cdp.py keys its own
+     // headed/headless choice on LOCALFOLD_HEADLESS, not on DISPLAY - it is
+     // told which it is; this launcher has to look.)
+     ...(process.env.DISPLAY ? [] : ["--disable-vulkan-surface"]),
      ...(STOCK_FLAGS ? [] : ["--enable-dawn-features=vulkan_enable_f16_on_nvidia"])]
   : [];
 const TYPES = {
@@ -343,6 +357,17 @@ async function main() {
     // ...and a collection has to be requestable, or a heap reading counts
     // whatever garbage has not been swept yet and cannot see a cache dropped.
     "--js-flags=--expose-gc",
+    // 🔴 AND THE GPU CLOCK IS ROUNDED THE SAME WAY, HARDER. Dawn quantises
+    // every `timestamp-query` result so a page cannot use it as a fine timer,
+    // and the grid is 65536 ns - not the 100 us usually quoted. Measured on a
+    // T4, 64 dispatches of a ~10.5 us compute pass: quantised, the gcd of the
+    // deltas is 65536 and 63 of the 64 read ZERO; unquantised the gcd is 32 ns
+    // and they spread 10240-13600. So every kernel in tools/gpu/ faster than
+    // ~65 us was being swept against noise. Unlike the two flags above this
+    // changes no CAPABILITY - it is the resolution of the clock we read, not
+    // anything the GPU does - so it is not gated on STOCK_FLAGS: a visitor's
+    // timestamps are quantised and a visitor takes none. Reported by Milot.
+    "--disable-dawn-features=timestamp_quantization",
     "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
     `http://127.0.0.1:${port}/__runner`,
   ], { stdio: ["ignore", "ignore", "pipe"] });
@@ -413,6 +438,26 @@ async function main() {
     const { vendor, architecture, description } = result.adapter;
     console.log(`[gpu-chrome] adapter: ${[vendor, architecture, description]
       .filter((part) => part !== undefined && part !== "").join(" / ") || "unidentified"}`);
+  }
+  // A SOFTWARE ADAPTER IS NOT A SLOW GPU, IT IS A DIFFERENT MACHINE, AND THE
+  // LINE ABOVE IS TOO QUIET TO SAY SO. A display-less box that cannot bring
+  // Vulkan up falls back to SwiftShader and every bench then reports the CPU:
+  // plausible-looking milliseconds, no shader-f16, no matrix units, and an
+  // occupancy sweep that reads 4 workgroups because the times are exactly
+  // linear in the work. That cost a session before the flag above was found.
+  // Refused by default rather than warned about - a warning scrolls past, and
+  // the repo's own rule is that a fallback swapping in different hardware
+  // hides the bug. --allow-software is for measuring SwiftShader deliberately.
+  const software = result.adapter?.vendor === "google"
+    || result.adapter?.architecture === "swiftshader";
+  if (software && !args.includes("--allow-software")) {
+    console.error("[gpu-chrome] refusing to bench a SOFTWARE adapter ("
+      + [result.adapter?.vendor, result.adapter?.architecture].filter(Boolean).join(" / ")
+      + "). On Linux this is usually Vulkan failing to start: a container with no"
+      + " display needs --disable-vulkan-surface, and a mismatch between the"
+      + " kernel driver (nvidia-smi) and libGLX_nvidia will do it too."
+      + " Pass --allow-software to measure this on purpose.");
+    process.exit(2);
   }
   for (const line of result.logs ?? []) console.log(line);
   if (!result.ok) {

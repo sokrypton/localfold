@@ -192,6 +192,40 @@ def page_af2_models():
     return re.findall(r'<option value="([^"]+)"', block)
 
 
+
+def waiting_page(ws):
+    """What is on screen while a fold is being waited for.
+
+    🔴 EVERYTHING BELOW THE STATUS LINE GOES WHEN FOLD IS PRESSED. Asked for
+    in one line - "while waiting for fold, the previous results should
+    disappear (everything below status menu)" - and it has to be read at once:
+    the trunk's contact map reveals the viewer again the moment this fold has
+    something of its own to draw, so a sample half a second late measures the
+    NEW result rather than the absence of the old one.
+    """
+    import json as _json
+    return _json.loads(cdp.evaluate(ws, """(() => {
+      const how = (id) => {
+        const b = document.getElementById(id);
+        return b === null ? 'absent' : getComputedStyle(b).display;
+      };
+      return JSON.stringify({viewer: how('viewer-container'),
+                             strip: how('sequence-viewer-container'),
+                             msa: how('msa-buttons')});
+    })()"""))
+
+
+def report_waiting(ws, label="while waiting"):
+    state = waiting_page(ws)
+    print("  %-22s %s" % (label, state))
+    for part in ("viewer", "strip", "msa"):
+        if state[part] not in ("none", "absent"):
+            print("FAIL: the %s is still up (%s) while a fold is being waited"
+                  " for - everything below the status line goes when Fold is"
+                  " pressed" % (part, state[part]))
+    return state
+
+
 def main():
     models = page_models()
     parser = argparse.ArgumentParser()
@@ -247,6 +281,14 @@ def main():
     parser.add_argument("--remote-weights", action="store_true",
                         help="fetch the AF3 bundle from its pinned remote"
                              " (~150 MB) instead of ./model-af3-int5/")
+    parser.add_argument("--tab-trace", action="store_true",
+                        help="record every state the first slot's tab row"
+                             " passes through, from rAF")
+    parser.add_argument("--trunk-lines", action="store_true",
+                        help="sample the heatmap while the FIRST fold is still"
+                             " in its trunk: the chain boundary lines there"
+                             " come from the chain array, because the object"
+                             " the fold opened has no coordinates yet")
     parser.add_argument("--dev-report", action="store_true",
                         help="open the footer's dev panel and print what it says")
     parser.add_argument("--session-hidden", action="store_true",
@@ -359,6 +401,13 @@ def main():
     parser.add_argument("--then-recycles", default=None,
                         help="fold a SECOND time at this recycle count, which is"
                              " what the rewind-and-continue path does")
+    parser.add_argument("--then-model", default=None,
+                        help="fold a SECOND time with this model, reporting the"
+                             " objects, the picker and the frames at each step")
+    parser.add_argument("--then-back-to", default=None,
+                        help="after the second fold, move the model row to this"
+                             " one WITHOUT folding - what a reader does when"
+                             " comparing two models")
     args = parser.parse_args()
     # 🔴 A JOB PICKS ITS OWN MODEL REQUIREMENTS AND THE PAGE DOES NOT PICK FOR
     # IT - applyJob says why, and the fold-time guard names the model instead.
@@ -908,6 +957,66 @@ def main():
         # caused from what the page had already fetched. See --timeline.
         cdp.evaluate(ws, "window.__foldClickedAt = performance.now();"
                          " document.getElementById('predict').click()")
+        # 🔴 EVERY STATE THE BIG SLOT'S TAB ROW PASSES THROUGH, recorded from
+        # rAF rather than sampled: the row is hidden where the structure has
+        # landed and its maps have not, which is a frame or two, and a poll at
+        # 100 ms walks straight past it. Reported as the tabs disappearing and
+        # coming back with all three.
+        if args.tab_trace:
+            cdp.evaluate(ws, """(() => {
+              window.__tabTrace = [];
+              const tick = () => {
+                const row = document.querySelector('.py2dmol-slot--1 .py2dmol-slot-tabs');
+                const state = row === null ? 'absent'
+                  : (row.hidden ? 'HIDDEN' : [...row.children]
+                      .map((b) => b.textContent
+                        + (b.getAttribute('aria-selected') === 'true' ? '*' : ''))
+                      .join('|'));
+                const reg = window.py2dmol_viewers || {};
+                const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+                const obj = v && v.objectsData ? v.objectsData[v.currentObjectName] : null;
+                const keys = (window.Heatmap && window.Heatmap.mapKeysOf && obj)
+                  ? window.Heatmap.mapKeysOf(obj).join(',') : '';
+                const why = v ? [v.currentObjectName,
+                  'coords' + (v.coords ? v.coords.length : 0),
+                  'frames' + (obj && obj.frames ? obj.frames.length : 0),
+                  'maps[' + keys + ']',
+                  v._batchLoading ? 'batch' : ''].join(' ') : 'no viewer';
+                const last = window.__tabTrace[window.__tabTrace.length - 1];
+                if (!last || last.state !== state || last.why !== why) {
+                  window.__tabTrace.push({ at: Math.round(performance.now()), state, why });
+                }
+                window.__tabRaf = requestAnimationFrame(tick);
+              };
+              tick();
+              return true;
+            })()""")
+        # 🔴 THE TRUNK'S OWN CONTACT MAP, WHILE THERE IS NO STRUCTURE YET.
+        # The page writes the folded sequence's chain ids onto the renderer and
+        # the object it opened is still empty, so the boundary lines come from
+        # the ARRAY - asking the DRAWING took them off every intermediate map.
+        # Reported as losing the lines between chains during intermediate
+        # contact map views. Sampled here because it is over the moment the
+        # sampler's first frame lands.
+        if args.trunk_lines:
+            for _ in range(10):
+                print("trunk  :", cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]].renderer;
+              const hm = v.heatmapRenderer;
+              const c = hm && hm.canvas;
+              if (!c || !c.width) return 'no canvas';
+              const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+              let dark = 0;
+              for (let i = 0; i < d.length; i += 4) {
+                if (d[i] < 90 && d[i + 1] < 90 && d[i + 2] < 90) dark += 1;
+              }
+              return JSON.stringify({dark, chains: v.chains ? v.chains.length : 0,
+                base: v._baseCount ? v._baseCount() : -1,
+                N: hm ? (hm.residues || hm.n) : 0,
+                coords: v.coords ? v.coords.length : 0});
+            })()"""))
+                time.sleep(0.35)
         cdp.wait_for(ws, """(() => {
           const s = document.getElementById('status-message');
           const text = s ? s.textContent : '';
@@ -916,6 +1025,10 @@ def main():
         })()""", timeout=args.timeout, what="the fold to finish",
                      progress=STATUS_LINE)
         time.sleep(1.5)
+        if args.tab_trace:
+            cdp.evaluate(ws, "cancelAnimationFrame(window.__tabRaf), 1")
+            for row in json.loads(cdp.evaluate(ws, "JSON.stringify(window.__tabTrace || [])")):
+                print("  tabs %8d ms  %-26s %s" % (row["at"], row["state"], row.get("why", "")))
 
         # 🔴 THE OVERLAP IS MEASURED, NOT ASSERTED. The weights and the MSA
         # search were serialised - the download ran inside the fold, which runs
@@ -1693,6 +1806,64 @@ def main():
                 text: document.getElementById('session-text')?.textContent ?? '' });
             })()""", await_promise=True))
 
+        # 🔴 A SECOND FOLD BY ANOTHER MODEL, AND THEN THE ROW MOVED BACK.
+        # Reported as: predict af3, predict openbind0, switch to af3 and see
+        # one frame, no play bar, coloured all red. What this prints is the
+        # state at each step, which is what separates "the object is gone"
+        # from "the object is there and drawn wrong". Nothing else here can
+        # reach that state - `--then-sequence` refolds with the same model.
+        if args.then_model is not None:
+            WATCH = (
+                "(() => {"
+                "  const reg = window.py2dmol_viewers || {};"
+                "  const r = reg[Object.keys(reg)[0]].renderer;"
+                "  const o = r.objectsData[r.currentObjectName] || {};"
+                "  const frame = (o.frames || [])[r.currentFrame] || {};"
+                "  const plddt = Array.from(frame.plddts || []);"
+                "  const strip = document.getElementById('controlsContainer');"
+                "  return JSON.stringify({"
+                "    objects: Object.keys(r.objectsData).map((n) =>"
+                "      n + ':' + ((r.objectsData[n].frames || []).length) + 'f'),"
+                "    picker: [...(document.getElementById('objectSelect')"
+                "      ? document.getElementById('objectSelect').options : [])]"
+                "      .map((x) => x.value),"
+                "    current: r.currentObjectName, at: r.currentFrame,"
+                "    colour: r.colorMode,"
+                "    plddtHead: plddt.slice(0, 3),"
+                "    allZero: plddt.length > 0 && plddt.every((v) => v === 0),"
+                "    play: strip === null ? 'absent' : getComputedStyle(strip).display,"
+                "    status: (document.getElementById('status-message') || {}).textContent"
+                "  });"
+                "})()")
+
+            def snapshot(when):
+                print("  %-22s %s" % (when, cdp.evaluate(ws, WATCH)))
+
+            def move_row(to):
+                cdp.evaluate(ws, "(() => { const row ="
+                             " document.getElementById('model-family');"
+                             " row.value = %s;"
+                             " row.dispatchEvent(new Event('change', { bubbles: true }));"
+                             " })()" % json.dumps(to))
+                time.sleep(1.5)
+
+            snapshot("after fold 1")
+            move_row(args.then_model)
+            snapshot("row moved to 2nd")
+            cdp.evaluate(ws, "document.getElementById('predict').click()")
+            time.sleep(0.25)
+            report_waiting(ws)
+            cdp.wait_for(ws, """(() => {
+              const s = document.getElementById('status-message');
+              const text = s ? s.textContent : '';
+              return /done|complete|finished|s\\b/i.test(text)
+                && document.getElementById('downloads').style.display !== 'none';
+            })()""", args.timeout, "the second fold")
+            snapshot("after fold 2")
+            if args.then_back_to is not None:
+                move_row(args.then_back_to)
+                snapshot("row back to 1st")
+
         if args.then_recycles is not None or args.then_sequence is not None:
             if args.then_sequence is not None:
                 cdp.evaluate(ws, """(() => {
@@ -1711,6 +1882,33 @@ def main():
               }
               document.getElementById('predict').click();
             })()""" % (json.dumps(args.then_recycles), json.dumps(args.then_recycles)))
+            time.sleep(0.25)
+            report_waiting(ws)
+            # 🔴 AND THE CHAIN LINES, which are the trunk map's own: the
+            # page writes the folded sequence's chain ids onto the renderer
+            # while the object it opened is still empty, so the boundaries
+            # come from the ARRAY and not from any drawn structure. Reported
+            # as losing the lines between chains during intermediate contact
+            # map views.
+            for _ in range(8):
+                print("lines  :", cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]].renderer;
+              const hm = v.heatmapRenderer;
+              const c = hm && hm.canvas;
+              if (!c || !c.width) return 'no canvas';
+              const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+              // the lines are 2px of rgba(0,0,0,0.5) over a ramp: count the
+              // pixels much darker than their own row's median-ish neighbour
+              let dark = 0;
+              for (let i = 0; i < d.length; i += 4) {
+                if (d[i] < 90 && d[i + 1] < 90 && d[i + 2] < 90) dark += 1;
+              }
+              return JSON.stringify({dark, chains: v.chains ? v.chains.length : 0,
+                base: v._baseCount ? v._baseCount() : -1,
+                N: hm.residues || hm.n, coords: v.coords ? v.coords.length : 0});
+            })()"""))
+                time.sleep(0.4)
             # 🔴 THE PANEL IS SAMPLED WHILE THE NEW FOLD IS STILL IN ITS TRUNK.
             # A map left over from the PREVIOUS fold is invisible afterwards -
             # by then the new one has replaced it - so the only moment it can
@@ -1754,6 +1952,198 @@ def main():
               });
             })()""")
             print("2nd    :", second)
+
+            # 🔴 AND THE PANELS FOLLOW THE OBJECT YOU PICK, which is what
+            # makes folds accumulating honest: with one fold at a time the
+            # page had one result to describe, and with several the scores
+            # card, the heatmap and the two download buttons have to answer
+            # for the fold being LOOKED at. They read `activePrediction()`,
+            # keyed by the object being edited, so the picker is the control.
+            def onScreen():
+                return json.loads(cdp.evaluate(ws, """(() => {
+                  const reg = window.py2dmol_viewers || {};
+                  const v = reg[Object.keys(reg)[0]].renderer;
+                  const off = (id) => {
+                    const b = document.getElementById(id);
+                    return b === null ? 'absent' : (b.disabled ? 'off' : 'on');
+                  };
+                  const card = document.getElementById('predictionScoresBox');
+                  return JSON.stringify({
+                    object: v.currentObjectName,
+                    residues: v.coords ? v.coords.length : 0,
+                    scores: card ? (card.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 60) : null,
+                    // ...and the panels py2Dmol owns, which follow the picker
+                    // through its own handleObjectChange: the map is the
+                    // object's and the MSA section is shown only for an
+                    // object that has one.
+                    map: v.heatmapRenderer ? (v.heatmapRenderer.residues
+                      || v.heatmapRenderer.n || 0) : 'absent',
+                    // ...and what the reader SEES, because a page with slots
+                    // has more than one panel object and the one hanging off
+                    // the renderer need not be the one on screen.
+                    // EVERY PANEL IN THE POOL, with the one a reader can
+                    // see marked: with slots the page's own panel is often
+                    // PARKED, and a parked panel decodes nothing - so reading
+                    // `renderer.heatmapRenderer` alone reports a canvas
+                    // nobody is looking at.
+                    pool: (v._heatmapPool || []).map((e) => {
+                      const c = e.hm && e.hm.canvas;
+                      const box = c && c.parentElement;
+                      const vis = box ? getComputedStyle(box).display : 'no box';
+                      let ink = 'none';
+                      if (c && c.width) {
+                        const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+                        let h = 0;
+                        for (let i = 0; i < d.length; i += 97 * 4) {
+                          h = (h * 31 + d[i] + d[i + 1] * 3 + d[i + 2] * 7) | 0;
+                        }
+                        ink = String(h);
+                      }
+                      return {key: e.key || (e.hm && e.hm.mapKey), n: e.hm && e.hm.residues,
+                              parked: !!(e.hm && e.hm.parked), box: vis, ink};
+                    }),
+                    msa: (document.getElementById('msa-buttons') || {}).style
+                      ? getComputedStyle(document.getElementById('msa-buttons')).display
+                      : 'absent',
+                    pdb: off('download-pdb'), all: off('download-all')});
+                })()"""))
+            # 🔴 AND THE SAVED SESSION KNOWS HOW MANY FOLDS IT WILL PUT
+            # BACK. The offer row used to describe the LAST fold - its model,
+            # its size, its ligands, its pLDDT - while the button restores
+            # every object py2Dmol saved, which is now every fold on screen.
+            meta = json.loads(cdp.evaluate(ws, """(async () => {
+              const { readSessionMeta } = await import('/web/fold-session.js');
+              const m = await readSessionMeta();
+              return JSON.stringify({folds: m ? m.folds : null,
+                                     stem: m ? m.stem : null});
+            })()""", await_promise=True))
+            print("  saved session          %s" % meta)
+            if meta.get("folds") != len(json.loads(second)["objects"]):
+                print("FAIL: the saved session says %r folds where the page has"
+                      " %d - the offer row describes what the button will put"
+                      " back" % (meta.get("folds"),
+                                 len(json.loads(second)["objects"])))
+
+            print("  before any switch      %s" % onScreen())
+            names = json.loads(second)["objects"]
+            # 🔴 BOTH FOLDS ARE STILL THERE - WHEN THE SECOND ONE IS A FOLD.
+            # This used to be ONE - a fold recycled the object before it, each
+            # fold its own session - and the reader asked for the opposite:
+            # "starting new prediction deletes the previous prediction/object".
+            #
+            # 🔴 BUT A SECOND PRESS OF THE SAME JOB IS NOT A SECOND
+            # PREDICTION, and this asked for one anyway. Raising the recycle
+            # count CONTINUES the fold, and the page rewinds the object it
+            # already has rather than stranding the resumed passes on the old
+            # one ("A CONTINUATION REWINDS THE OBJECT IT ALREADY HAS"); pressing
+            # Fold again unchanged REPLAYS what is in memory and computes
+            # nothing at all. Both leave one object, correctly, and this printed
+            # FAIL for both - measured on `--recycles 3 --then-recycles 6` and
+            # on a converged repeat, neither of which had anything to do with
+            # the rule it was guarding.
+            #
+            # A new object is owed when the second press is a different JOB -
+            # another sequence or another model. That is what these two flags
+            # say, and nothing else here changes the answer: the seed, the
+            # depths and the tolerance are all fixed for the run.
+            wants_new_object = (args.then_sequence is not None
+                                or args.then_model is not None)
+            if wants_new_object and len(names) < 2:
+                print("FAIL: the second fold left %r - a fold keeps its own"
+                      " object and the one before it stays" % (names,))
+            elif not wants_new_object and len(names) != 1:
+                print("FAIL: pressing Fold again on the SAME job left %r - a"
+                      " continuation and a replay both rewind the object they"
+                      " already have, so a second one is a fold that was not"
+                      " asked for" % (names,))
+            seen = {}
+            for name in names:
+                # THE PICKER ITSELF, not `_switchToObject`: the control
+                # carries the panels' own listeners, and calling the renderer's
+                # method straight left the drawn array on the object before it
+                # - both folds read 61 residues, which is one structure twice.
+                cdp.evaluate(ws, """(() => {
+                  const sel = document.getElementById('objectSelect');
+                  if (sel === null) return false;
+                  sel.value = %s;
+                  sel.dispatchEvent(new Event('change', { bubbles: true }));
+                  return true;
+                })()""" % json.dumps(name))
+                time.sleep(1.2)
+                # ...and with the MAP brought up, because a parked panel
+                # holds its maps and decodes them on unpark: reading a parked
+                # one says nothing about what a reader sees when they click
+                # the tab.
+                cdp.evaluate(ws, """(() => {
+                  const tabs = [...document.querySelectorAll('.py2dmol-slot button')];
+                  const t = tabs.find((b) => (b.dataset.view || '').startsWith('map:'));
+                  if (!t) return false;
+                  t.click();
+                  return true;
+                })()""")
+                time.sleep(1.2)
+                state = onScreen()
+                seen[name] = state
+                print("  on %-22s %s" % (name, state))
+            # ...and every panel describes the fold you are LOOKING at, which
+            # is what makes them accumulating honest: the structure, the card
+            # and the two download buttons all follow the picker. The two
+            # folds here differ in length by construction.
+            if len(seen) == 2:
+                a, b = (seen[n] for n in names)
+                if a["residues"] == b["residues"]:
+                    print("FAIL: the drawn structure did not change with the"
+                          " picker: %s" % (seen,))
+                if a["scores"] == b["scores"]:
+                    print("FAIL: the scores card reads %r for both folds - it"
+                          " describes the object being edited" % (a["scores"],))
+                mapA = (a["pool"] or [{}])[0].get("n")
+                mapB = (b["pool"] or [{}])[0].get("n")
+                if mapA == mapB:
+                    print("FAIL: the map panel reads %r for both folds - it is"
+                          " the object's, and these two differ in length"
+                          % (mapA,))
+                for name, state in seen.items():
+                    if state["pdb"] != "on" or state["all"] != "on":
+                        print("FAIL: the downloads are off while %s is on"
+                              " screen: %s" % (name, state))
+            # 🔴 AND A FOLD THAT IS STOPPED GIVES THE PAGE BACK. The hide
+            # happens when Fold is pressed and the reveal happens when the
+            # fold DRAWS, so a stop between the two would leave a blank page
+            # with every fold still in the viewer.
+            #
+            # 🔴 ON A SEQUENCE NOTHING HAS FOLDED YET, or the leg cannot see
+            # its own subject: a cached trunk draws within a frame of the
+            # click, the page is revealed legitimately, and removing the
+            # restore changes nothing. Measured - the mutation walked through.
+            cdp.evaluate(ws, """(() => {
+              const field = document.querySelector('.entity-field [contenteditable],'
+                + ' .entity-field textarea, .entity-field input');
+              const seq = 'MKVLATNDGWQEHIYRLSPDGKLVTAFEQNGRVIDSWQAHK';
+              if ('value' in field && field.tagName !== 'DIV') field.value = seq;
+              else field.textContent = seq;
+              field.dispatchEvent(new Event('input', { bubbles: true }));
+            })()""")
+            time.sleep(0.4)
+            cdp.evaluate(ws, "document.getElementById('predict').click()")
+            time.sleep(0.25)
+            during = waiting_page(ws)
+            print("  %-22s %s" % ("stopped: while waiting", during))
+            cdp.evaluate(ws, "document.getElementById('predict').click()")
+            for _ in range(40):
+                if cdp.evaluate(ws, "!window.__foldState?.running"):
+                    break
+                time.sleep(0.25)
+            time.sleep(0.8)
+            back = waiting_page(ws)
+            print("  %-22s %s" % ("after a stopped fold", back))
+            if during["viewer"] != "none":
+                print("FAIL: the stop leg never saw a blank page (%s), so it"
+                      " is not measuring the restore" % (during,))
+            if back["viewer"] == "none" or back["strip"] == "none":
+                print("FAIL: a stopped fold left the page blank: %s - the"
+                      " results it hid are still there and nothing drew" % (back,))
+
             camera_after = cdp.evaluate(ws, """(() => {
               const reg = window.py2dmol_viewers || {};
               const v = reg[Object.keys(reg)[0]].renderer;

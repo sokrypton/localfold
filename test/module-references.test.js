@@ -124,7 +124,9 @@ function stripCommentsAndStrings(source) {
  * next `python3 tools/sync-mpnn.py`. And its exports would otherwise join
  * `projectExports`, so common names it ships (`linear`, `softmax`,
  * `layerNorm`) would start being looked for in every unrelated file.
- * test/mpnn-vendored.test.js is what holds that directory to anything.
+ * `python3 tools/sync-mpnn.py --check` is what holds that directory to
+ * anything, and it is run by hand: the node test that ran it was removed
+ * because a drifted ../mpnn is not a fault in this tree.
  */
 const VENDORED = join("src", "design", "mpnn");
 

@@ -686,3 +686,63 @@ export function mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model })
   };
 }
 
+
+/**
+ * A search over SOME of the chains, put back into the fold's own order.
+ *
+ * 🔴 TWO NUMBERINGS MEET HERE, AND NOWHERE ELSE. A chain whose alignment is
+ * turned off is not searched for at all, so what comes back covers the KEPT
+ * chains in their own order while everything downstream - the merge, the
+ * templates, the featuriser - counts chains the way the entity rows do. Doing
+ * this at the call site put the crossing inside a DOM-bound function where
+ * nothing could test it; the fault it is guarding against is silent, because
+ * every array involved is the right TYPE and only the contents are somebody
+ * else's.
+ *
+ * @param {object} input
+ * @param {string[]} input.chains every chain of the fold, in its order
+ * @param {boolean[]} input.off `true` for a chain that asked for no alignment
+ * @param {string[]} input.parts one a3m per SEARCHED chain, in searched order
+ * @param {Map<string, string>} [input.pairedA3ms] the paired blocks, by sequence
+ * @param {Map<number, object[]>} [input.templateHits] hits, by SEARCHED index
+ * @returns {{chainA3ms: string[], pairedA3ms: (Map|undefined),
+ *            templateHits: Map<number, object[]>}} all three in fold order
+ */
+export function expandSearchedChains({ chains, off, parts, pairedA3ms, templateHits }) {
+  const kept = chains.filter((_, index) => off[index] !== true);
+  if (!Array.isArray(parts) || parts.length !== kept.length) {
+    throw new RangeError(`the search covers ${parts?.length} chains`
+      + ` and ${kept.length} were kept`);
+  }
+  const queryOnly = (sequence) => `>101\n${sequence}\n`;
+  let taken = 0;
+  const chainA3ms = chains.map((sequence, index) =>
+    (off[index] === true ? queryOnly(sequence) : parts[taken++]));
+  // 🔴 THE PAIRED BLOCK IS PER SEQUENCE, NOT PER CHAIN, so two chains that
+  // are the same protein share one entry - and if one is off and the other
+  // is not, writing both into a Map lets whichever comes LAST decide for
+  // both. A sequence is blanked only when EVERY chain carrying it asked for
+  // none; where they disagree the aligned one wins, which loses nothing. The
+  // per-chain unpaired blocks above are an array and stay exact.
+  const allOffFor = (sequence) => chains.every(
+    (other, index) => other !== sequence || off[index] === true);
+  const paired = pairedA3ms === undefined ? undefined
+    : new Map(chains.map((sequence) => [sequence,
+      allOffFor(sequence) ? queryOnly(sequence) : pairedA3ms.get(sequence)])
+      .filter(([, a3m]) => a3m !== undefined));
+  // 🔴 AND THE HITS ARE NUMBERED IN THE REQUEST'S OWN SPACE.
+  // `extractMmseqs2TemplateHits` reads the server's `101`, `102` and
+  // subtracts - so with a chain left out of the request, hit 1 is the SECOND
+  // CHAIN THAT WAS SEARCHED and not the second chain of the fold. Passing
+  // that map on unchanged gives a chain somebody else's template, silently,
+  // and only on a job with an alignment turned off.
+  const hits = new Map();
+  let at = 0;
+  chains.forEach((_, index) => {
+    if (off[index] === true) return;
+    const found = templateHits?.get(at);
+    at += 1;
+    if (found !== undefined) hits.set(index, found);
+  });
+  return { chainA3ms, pairedA3ms: paired, templateHits: hits };
+}
