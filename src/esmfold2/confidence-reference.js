@@ -158,6 +158,15 @@ export function esmfold2Confidence(inputs, weights) {
                            weights.sInputsNormScale, weights.sInputsNormOffset);
   let pair = layerNorm(inputs.pair, tokens * tokens, dPair,
                        weights.zNormScale, weights.zNormOffset);
+  // 🔴 THE RELATIVE-POSITION ENCODING, AFTER THE NORM AND NOT BEFORE. Their
+  // forward is `z_base = self.z_norm(z)` and then `if
+  // relative_position_encoding is not None: z_base = z_base + ...`, so it is
+  // added to the NORMALISED pair. It is a keyword defaulting to None, which is
+  // why leaving it out was silent; docs/EF2FAST.md has what that cost.
+  if (inputs.relPos === undefined) {
+    throw new Error("esmfold2Confidence: relPos is required (see docs/EF2FAST.md)");
+  }
+  for (let index = 0; index < pair.length; index += 1) pair[index] += inputs.relPos[index];
 
   const rows = linear(single, tokens, dInputs, dPair, weights.sToZ);
   const columns = linear(single, tokens, dInputs, dPair, weights.sToZTranspose);

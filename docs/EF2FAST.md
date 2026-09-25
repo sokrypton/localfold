@@ -3354,3 +3354,48 @@ ligand or a bonded pair rather than for a plain chain.
 
 Saved: `oracle-dumps/esmfold2-native-pae-59.json` (their PAE, pLDDT, pTM for
 this sequence) and `esmfold2-native-ca-59.json` (their CA coordinates).
+
+#### Fixed, and what it was worth
+
+`relPos` is passed to the head now, added to the NORMALISED pair as their
+forward does, in the host reference and in the pair-init kernel alike. Same
+sequence, same seed, our float32 head bundle against their model:
+
+| | pLDDT | pTM | PAE mean | roughness | lag-1 |
+|---|---:|---:|---:|---:|---:|
+| native | 89.15 | 0.8304 | 3.787 | **0.1616** | **0.9766** |
+| **ours, fixed** | **85.67** | **0.8150** | 4.810 | **0.1822** | **0.9655** |
+| ours, before | 75.32 | 0.7437 | 5.495 | 0.3902 | 0.8734 |
+
+**+10.3 pLDDT, +0.071 pTM, and the texture closes**: roughness 0.390 -> 0.182
+against native's 0.162, autocorrelation 0.873 -> 0.966 against 0.977. The
+"sparse and detailed" reading was the missing smooth positional term, seen from
+the other end. On the page, on the int5 bundle that ships: **pLDDT 84.7, pTM
+0.812**.
+
+🔴 **AND THE CHECKER CAN FAIL NOW, WHICH IT COULD NOT BEFORE.**
+`check_esmfold2_confidence_real.py` passes `relative_position_encoding` to their
+head, so the argument is under test rather than absent from both sides. With it
+the head reads **2.35e-5 on pLDDT and 1.75e-4 on PAE** - the port was always
+exact, on an input list that was always short.
+
+🔴 **THE SECOND OPTIONAL ARGUMENT IS ALL ZEROS HERE, WHICH IS WHY ONLY ONE TERM
+MATTERED.** Captured off native's own pre-hook: `relative_position_encoding` is
+dense with absmax **12.97**, and `token_bonds_encoding` is **absmax 0.0, 0%
+nonzero** on a plain chain. It is not passed yet and costs nothing on a
+polymer; a ligand or a declared bond is where it would, and that is the next
+thing to wire.
+
+🔴 **THE RESIDUAL 3.5 pLDDT IS THE STRUCTURE, NOT THE HEAD.** The head reads
+coordinates, our sampler ran 64 steps against their 50, and the two folds are
+0.358 A apart - so a small confidence difference is expected and the head
+comparison above is what isolates it.
+
+**What this cost to find, recorded because the shape repeats:** three structural
+hypotheses were tested and refuted first - a distance-map collapse, the doubled
+outer skip, and a wrong representative atom - and all three were reasonable.
+None of the port's own oracles could have found it, because every one of them
+builds its own call from the argument list THIS PORT passes. What found it was
+running THEIR pipeline end to end, which chooses its own arguments, and then
+diffing the two folds rather than the two heads: the structures agreed to
+0.358 A while the confidences did not, and that gap is what named the stage.

@@ -62,6 +62,12 @@ inputs = {
     "atom_attention_mask": torch.tensor(np.asarray(i["atomMask"]), dtype=torch.long).unsqueeze(0),
     "asym_id": torch.tensor(np.asarray(i["asymId"]), dtype=torch.long).unsqueeze(0),
     "mol_type": torch.zeros(1, n, dtype=torch.long),
+    # 🔴 THE ARGUMENT THAT WAS MISSING ON BOTH SIDES. Their head takes this as
+    # a keyword defaulting to None and adds it only when it is not None, so
+    # while neither side passed it the two agreed perfectly and both were
+    # wrong. An oracle that builds its own call cannot see an argument neither
+    # side supplies; passing it is what makes this checker able to fail.
+    "relative_position_encoding": t(i["relPos"], (1, n, n, -1)),
 }
 with torch.no_grad():
     out = head(**inputs)

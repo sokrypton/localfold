@@ -768,8 +768,31 @@ export async function foldEsmfold2(device, options) {
     // ...and the relative-position encoding comes back, into the buffer that
     // becomes the pair conditioning. The table and its weights are what were
     // kept through the trunk in its place; see where it is first built.
-    relPos = keep(allocator.allocate("esmfold2.rel-pos", pairs * channels * 4, storage));
+    // ...COPY_SRC, because the confidence head's copy is taken off this buffer
+    // below and the conditioning overwrites it immediately after.
+    relPos = keep(allocator.allocate("esmfold2.rel-pos", pairs * channels * 4,
+                                     storage | GPUBufferUsage.COPY_SRC));
     await buildRelativePositions();
+    // 🔴 AND THE CONFIDENCE HEAD'S COPY IS TAKEN HERE, IN THE ONE WINDOW IT
+    // EXISTS. Their head adds this to the NORMALISED pair, and it is the term
+    // this port omitted entirely - an optional argument defaulting to None on
+    // their side, so nothing objected. It has to be read back now: the next
+    // call writes the pair conditioning straight into this buffer, and the
+    // table that would let it be rebuilt is released three lines down.
+    // Measured absent: 13.8 pLDDT and a PAE 2.4x rougher. See docs/EF2FAST.md.
+    const confidenceRelPos = options.confidenceWeights == null ? undefined
+      : await (async () => {
+        const back = allocator.allocate("esmfold2.confidence-relpos",
+          pairs * channels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+        const encoder = device.createCommandEncoder({ label: "esmfold2.confidence-relpos" });
+        encoder.copyBufferToBuffer(relPos.buffer, 0, back.buffer, 0, pairs * channels * 4);
+        device.queue.submit([encoder.finish()]);
+        await back.buffer.mapAsync(GPUMapMode.READ);
+        const copy = new Float32Array(back.buffer.getMappedRange().slice(0));
+        back.buffer.unmap();
+        back.release();
+        return copy;
+      })();
     for (const allocation of [relBins, relWeights]) {
       allocation.release();
       held.splice(held.indexOf(allocation), 1);
@@ -855,6 +878,7 @@ export async function foldEsmfold2(device, options) {
         atomToToken: features.atomToToken,
         atomMask: features.mask,
         tokenMask: new Float32Array(tokens).fill(1),
+        relPos: confidenceRelPos,
         // 🔴 WITHOUT THIS EVERY COMPLEX REPORTS ipTM 0.000. ipTM is the same
         // expectation as pTM taken over the pairs whose `asymId` DIFFER, and
         // the reference defaulted a missing one to `new Int32Array(tokens)` -
@@ -875,6 +899,7 @@ export async function foldEsmfold2(device, options) {
           tokens, atoms, pair: confidencePair, sInputs, coordinates: x,
           repAtom: rep, atomToToken: features.atomToToken,
           atomMask: features.mask, asymId: features.asymId,
+          relPos: confidenceRelPos,
         } };
       }
     }

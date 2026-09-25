@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-342 tools. `tools/fixtures/` is data and is not listed.
+343 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (193)
 
@@ -212,7 +212,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (44)
+## `tools/oracle/` - the reference side (45)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -233,6 +233,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`check_af3_template.js`** - Check the template embedder against AF3, on a protein with NO templates.
 - **`check_af3_template_geometry.js`** - Check the template embedder against AF3 with a REAL TEMPLATE in slot 0.
 - **`check_af3_trunk.js`** - Run AF3's whole trunk and compare the pair, the single and the distogram.
+- **`check_esmfold2_confidence_real.py`** - Synthyra's ConfidenceHead on OUR REAL trunk output, not on seeded normals.
 - **`dump_af3_atom.py`** - Dump AF3's atom-cross-attention LAYOUT, so the four atom checkers have an oracle.
 - **`dump_af3_batch.py`** - Dump a model's FEATURISED BATCH, so tools/gpu/fold.js can fold that model.
 - **`dump_af3_confidence.py`** - af3-any-model's own ConfidenceHead, inputs and outputs, for a model.
