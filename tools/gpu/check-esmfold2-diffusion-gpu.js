@@ -127,7 +127,11 @@ export async function main(device, args = []) {
         tokenChannels: M.tokenChannels2, tokenHeads: M.tokenHeads,
         multiplier: M.transitionMultiplier, sigmaData: M.sigmaData,
         atomChannels: M.atomChannels, atomHeads: M.atomHeads, atomBlocks: M.atomBlocks,
-        atomHidden: M.atomChannels * 2, window: M.atomWindow,
+        // 🔴 THE WINDOW IS AN ARM, because the reference's atom attention is
+        // DENSE by default and this port's window was its own reading. See
+        // docs/EF2FAST.md; `--window=` is how the two are told apart here.
+        atomHidden: M.atomChannels * 2,
+        window: Number(option(args, "window", String(M.atomWindow))),
         attentionPrecision: precision,
       },
       weights, features, sInputs: value("s_inputs"), pair, relPos,

@@ -3599,10 +3599,28 @@ rediscovered.
 believe the rewrite before changing what it computes: 85.675 / 0.814972 and
 atomChecksum **693370**, identical to the kernel it replaced.
 
-**Two: the window is gone.** `window` now covers every atom in the inputs
-embedder and in the diffusion atom stacks, and `atom-transformer-reference.js`
-defaults to the same, so the CPU reference and the GPU agree on what the model
-is. `--atom-windowed=1` restores the old behaviour for comparison.
+**Two: the window is gone from the INPUTS EMBEDDER - and only there.**
+`atom-transformer-reference.js` defaults to dense too, so the CPU reference and
+the GPU agree on what the model is. `--atom-windowed=1` restores the old
+behaviour for comparison.
+
+🔴 **AND THE DIFFUSION ATOM STACKS KEEP THEIR WINDOW, WHICH READING THE
+REFERENCE GOT WRONG.** Every `SWA3DRoPEAttention` in fastplms defaults to
+ATOM_ATTENTION_DENSE and nothing sets it otherwise, so the obvious inference was
+that the denoiser's atom encoder and decoder are dense as well, and they were
+changed with the embedder. `check-esmfold2-diffusion-gpu.js` - which holds the
+denoiser to ESMFold2's OWN dump, from the `esm` package rather than from
+fastplms - says otherwise:
+
+| denoiser atom attention | relRMS against the dump |
+|---|---:|
+| **windowed (128)** | **1.43e-4** |
+| dense | 3.46e-3, over the bf16 bound |
+
+24x worse. So the two stages differ, the inference from one reference did not
+carry to the other, and the oracle for a stage beats an argument about it. The
+fold is unmoved either way - 88.206 against 88.211 - which is exactly why only
+the oracle could tell. `--window=` on that checker is the arm.
 
 | 59 residues | tokenAct vs native | pLDDT | pTM | PAE mean |
 |---|---:|---:|---:|---:|

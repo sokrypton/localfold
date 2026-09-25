@@ -357,11 +357,14 @@ export async function foldEsmfold2(device, options) {
     multiplier: shape.transitionMultiplier, sigmaData: settings.sigmaData,
     atomChannels: shape.atomChannels, atomHeads: shape.atomHeads,
     atomBlocks: shape.atomBlocks, atomHidden: shape.atomChannels * 2,
-    // 🔴 THE DIFFUSION ATOM STACKS SHARE THE ENCODER CLASS AND SO ITS DEFAULT.
-    // `ESMFold2AtomEncoder`/`Decoder` both hold a `SWA3DRoPEAttention` whose
-    // `_atom_attention` is DENSE until something sets it otherwise, and the
-    // fold path never does - so these are dense too, not windowed.
-    window: options.atomWindowed === true ? shape.atomWindow : (1 << 24),
+    // 🔴 THE DIFFUSION ATOM STACKS ARE WINDOWED AND THE INPUTS EMBEDDER IS NOT,
+    // which is not a guess: `check-esmfold2-diffusion-gpu.js` holds the
+    // denoiser to ESMFold2's own dump and reads **1.43e-4 windowed against
+    // 3.46e-3 dense** - 24x worse, over the bf16 bound. Reasoning from
+    // fastplms, where every `SWA3DRoPEAttention` defaults to
+    // ATOM_ATTENTION_DENSE, said both should be dense; the oracle for this
+    // stage says otherwise and the oracle wins. See docs/EF2FAST.md.
+    window: shape.atomWindow,
     attentionPrecision: options.attentionPrecision ?? "bf16",
   };
   // The catch is only so a compile that fails before anything awaits it is not
