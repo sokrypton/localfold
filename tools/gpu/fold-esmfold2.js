@@ -970,10 +970,19 @@ export async function main(device, args = []) {
             atomToToken: Array.from(c.inputs.atomToToken),
             atomMask: Array.from(c.inputs.atomMask),
             asymId: Array.from(c.inputs.asymId),
-            pairBias: Array.from(c.inputs.pairBias, (v) => Number(v.toFixed(5))),
-            ...Object.fromEntries(["refPos", "refCharge", "refElement",
-              "refAtomNameChars", "refSpaceUid", "aatype", "profile",
-              "deletionMean", "atomConditioning", "atomActivation", "zInit"].map((k) => [k, Array.from(c.inputs[k])])),
+            // 🔴 THE BISECT TENSORS ARE OPT-IN, because three pair-sized arrays
+            // do not fit in a JSON string: at 195 tokens each is 9.7M floats and
+            // the runner dies with "Invalid string length" - V8's limit, hit by
+            // the DUMP rather than by the fold. `=all` asks for them; `=1`
+            // carries what the head reads, and the encoding is rebuildable
+            // exactly from their own `rel_pos` (verified at 0.000e+00).
+            ...(option(args, "confidence-inputs", "") !== "all" ? {} : {
+              pairBias: Array.from(c.inputs.pairBias, (v) => Number(v.toFixed(5))),
+              ...Object.fromEntries(["refPos", "refCharge", "refElement",
+                "refAtomNameChars", "refSpaceUid", "aatype", "profile",
+                "deletionMean", "atomConditioning", "atomActivation", "zInit"]
+                .map((k) => [k, Array.from(c.inputs[k])])),
+            }),
           },
         }),
       };

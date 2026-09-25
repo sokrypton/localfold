@@ -3781,3 +3781,50 @@ chosen on structure was paying for itself in a score that did not exist yet.
 of confidence accuracy measured on ONE sequence. That is a product decision and
 it wants a sweep over targets first; `model-esmc-600m-int4` and `-int5` are
 built and sitting beside the int3 for whoever runs it.
+
+### The trunk's f32 arm was not an f32 arm
+
+`check-esmfold2-trunk-gpu.js` ran here for the first time once its dump was
+built, and failed: **8.37e-4 against its own 2e-4 bound on all four loops**,
+with f32 no better than f16 - the signature of a residual that is not numerical.
+Its own header records the author measuring **f32:f32 at 1.10e-6**.
+
+The bisect, in order:
+
+| step | reading |
+|---|---:|
+| this tree's CPU reference, same dump | **6.8e-7 - 7.5e-7** - so the DUMP is good |
+| GPU against the CPU reference, 1 block | 2.67e-5 |
+| ... 2 blocks | 4.37e-5 |
+| ... 4 blocks | 8.00e-5 |
+| ... 24 blocks | 8.37e-4 - linear, so no single bad block |
+| `check-triangle`, `check-evoformer-transition` f32 arms | pass; the transition's is **2.18e-7** |
+| the whole stack with `--default-tuning` | **1.48e-6** |
+
+🔴 **SO IT IS TWO PERFORMANCE KNOBS, AND THE PRECISION REQUEST CANNOT REACH
+EITHER.** `stagedPrecision` and `accumulatePrecision` name two arithmetics; the
+device layer enables two more that change the sum and answer to neither -
+`triangleProjectMatrix`, which puts the projection on f16 MATRIX units, and
+`pairTransitionSplit`, which reorders the transition's reduction. Measured
+singly: triangle matrix off is 7.42e-4, transition split off is 4.16e-4, **both
+off is 1.49e-6**. The arm labelled `f32:f32` had never been f32 on a machine
+with matrix units.
+
+This is CLAUDE.md's rule about `--f16=off` and the matrix pair kernels, at a
+second seam: **a control arm that cannot vary the thing under test is not a
+control**, and the author's 1.10e-6 was taken on a part that has no matrix units
+to enable. Nothing was wrong with the trunk.
+
+Fixed by making the f32 arm pin those two knobs through `setDeviceTuning` - on
+the DEVICE, because that is where they are resolved and why a `settings` key for
+them does nothing. The `default` arm deliberately does not: it is the shipped
+configuration, knobs and all, held to the looser bound its own rounding implies.
+Two arms, two questions. The gate now reads **f32 1.48e-6 / default 2.25e-3, 0
+failures**.
+
+🔴 **AND `--bisect=N` IS NEW AND IS WHAT LOCALISED IT.** The dump can only say
+that a 24-block loop disagrees; it cannot say where. `--bisect=N` runs N blocks
+on the GPU and N on this tree's CPU reference from the same start, so a defect
+that accumulates per block and one that lives in a single kernel look different.
+Here it showed a clean linear accumulation, which is what sent the search to the
+knobs rather than to a kernel.

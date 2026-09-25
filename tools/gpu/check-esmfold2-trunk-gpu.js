@@ -28,7 +28,9 @@
 // would be paying to say something this checker says for free.
 import { readTensor } from "../../src/weights/dtype.js";
 import { Esmfold2TrunkGpu } from "../../src/esmfold2/trunk-webgpu.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { transition, triangleMultiplication }
+  from "../../src/af3/trunk/pairformer-reference.js";
+import { deviceProfile, setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const TRIANGLE = ["leftNormInputScale", "leftNormInputOffset", "centerNormScale",
   "centerNormOffset", "outputProjection", "gatingLinear", "projection", "gate"];
@@ -157,6 +159,41 @@ export async function main(device, args = []) {
   // was taken. That is why this is a constant and not a feature.
   const pairMask = new Float32Array(n * n).fill(1);
 
+  // 🔴 THE BISECT ARM: GPU AGAINST THIS TREE'S OWN CPU REFERENCE, BLOCK BY
+  // BLOCK. The dump can only say the 24-block loop disagrees; it cannot say
+  // where. `--bisect=N` runs N blocks on both and compares, so a defect that
+  // accumulates per block and one that lives in a single kernel look different.
+  // Built when the f32 arm read 8.4e-4 against the CPU path's 7e-7 on the same
+  // dump - the oracle said the GPU was wrong and nothing could say what part.
+  const bisect = Number(option(args, "bisect", "0"));
+  if (bisect > 0) {
+    const start = Float32Array.from(dump.intoLoop[Object.keys(dump.intoLoop)[0]]);
+    let host = Float32Array.from(start);
+    for (let layer = 0; layer < bisect; layer += 1) {
+      const add = (delta) => { for (let i = 0; i < host.length; i += 1) host[i] += delta[i]; };
+      add(triangleMultiplication(host, pairMask, n, channels, "outgoing",
+        blocks[layer].triangleMultiplicationOutgoing));
+      add(triangleMultiplication(host, pairMask, n, channels, "incoming",
+        blocks[layer].triangleMultiplicationIncoming));
+      add(transition(host, n * n, channels, blocks[layer].pairTransition));
+    }
+    const ran = await new Esmfold2TrunkGpu(device,
+      { stagedPrecision: "f32", accumulatePrecision: "f32" })
+      .run({ pair: Float32Array.from(start), pairMask }, blocks.slice(0, bisect),
+           { n, channels });
+    // ...`run` returns a record, and its `pair` is the tensor. Reading the
+    // record itself as an array gives NaN, which is `relative-rms.js`'s own
+    // warning one file over: an unguarded score over a non-array.
+    const gpu = ran.pair;
+    let err = 0, total = 0;
+    for (let i = 0; i < host.length; i += 1) {
+      const d = gpu[i] - host[i]; err += d * d; total += host[i] * host[i];
+    }
+    return { bisect, blocks: bisect, ran: `${ran.precision.staged}:${ran.precision.accumulate}`,
+             relRms: Math.sqrt(err / total),
+             message: `${bisect} block(s): GPU against this tree's CPU reference` };
+  }
+
   const arms = [];
   let failures = 0;
   const keys = Object.keys(dump.intoLoop);
@@ -187,10 +224,34 @@ export async function main(device, args = []) {
       ? Number(option(args, "f16-accumulate-bound", "4e-3"))
       : (ran.staged === "f32" && ran.accumulate === "f32")
         ? bound : Number(option(args, "f16-bound", "1e-3")));
+    // 🔴 THE f32 ARM HAS TO TURN OFF THE KNOBS ITS PRECISION REQUEST CANNOT
+    // REACH, OR IT IS NOT AN f32 ARM. `stagedPrecision`/`accumulatePrecision`
+    // name two arithmetics; the device layer enables two more that change the
+    // sum and answer to neither - `triangleProjectMatrix`, which puts the
+    // projection on f16 MATRIX units, and `pairTransitionSplit`, which
+    // reorders the transition's reduction. On this A100 the arm labelled
+    // f32:f32 read **8.37e-4** against its own 2e-4 bound while the CPU
+    // reference read 7e-7 on the same dump, and f32 was no better than f16 -
+    // the signature of a control that cannot vary what it is testing. With
+    // both off it is **1.49e-6**, which is the figure this bound was set from
+    // on a machine that has no matrix units to enable.
+    //
+    // The `default` arm deliberately does NOT do this: it is the shipped
+    // configuration, knobs and all, and is held to the looser bound its own
+    // rounding implies. Two arms, two questions.
     const settings = {
       ...(weightPrecision === "" ? {} : { weightPrecision }),
       ...(staged === undefined ? {} : { stagedPrecision: staged, accumulatePrecision: accumulate }),
+
     };
+    // ...and the knobs are set on the DEVICE, not on the stack: they are
+    // resolved from the device profile, which is why a `settings` key for them
+    // does nothing and why the precision request cannot reach them.
+    const pinned = staged === "f32" && accumulate === "f32";
+    if (pinned) {
+      setDeviceTuning(device, { ...deviceProfile(device).tuning,
+                                triangleProjectMatrix: false, pairTransitionSplit: false });
+    }
     const stack = new Esmfold2TrunkGpu(device, settings);
     for (const key of keys) {
       const pair = Float32Array.from(dump.intoLoop[key]);
