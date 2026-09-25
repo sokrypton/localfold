@@ -3177,3 +3177,77 @@ model on this page is headless today, so they are the rule rather than a live
 case, and the rule is what stops the next headless checkpoint labelling its
 column `atom_plddts`. `src/esmfold2/aligned-error.js` stays too, with its
 numbers - it is the record of a measured, declined estimator.
+
+### Why the PAE map looks "sparse and detailed", and what their own numbers say
+
+Reported from the page: the PAE matrix "looks more sparse and detailed compared
+to normal PAE matrices from other software", with the suspicion of a training
+or loss bug. The observation is real and measurable. Same 58-mer, same page,
+read out of each archive's `full_data`:
+
+| model | mean | sd | **roughness** | **lag-1 autocorr** |
+|---|---:|---:|---:|---:|
+| af3 | 9.89 | 5.06 | 0.193 | 0.964 |
+| boltz2 | 9.82 | 5.37 | 0.179 | 0.973 |
+| opendde | 4.80 | 2.72 | 0.391 | 0.830 |
+| **ef2-fast** | 9.84 | 5.19 | **0.681** | **0.659** |
+
+`roughness` is the mean absolute neighbour difference over the matrix's own
+standard deviation. EF2's mean and spread are AlphaFold 3's to within 1%, so
+this is not a scale or a bin problem: the map is **3.5x rougher** and far less
+spatially correlated. That is exactly what "sparse and detailed" describes.
+
+🔴 **THE LOSS IS NOT THE BUG, AND IT WAS THE FIRST THING CHECKED.** `tm_loss`
+in their shipped `esmfold2_predicted_aligned_error.py` buckets a SQUARED error
+against SQUARED boundaries - `torch.linspace(0, 31, n_bins - 1).square()` - and
+takes an ordinary masked cross-entropy. That is openfold's and AlphaFold 2's
+convention exactly. Their inference centres (0.25 ... 31.75) are openfold's
+`bin_centers` convention too, and the experimental head's own
+`_categorical_mean(logits, 0.0, 32.0)` lands on the same 64 values. Nothing is
+off by a bin.
+
+🔴 **AND TWO STRUCTURAL HYPOTHESES WERE TESTED AND BOTH REFUTED**, which is the
+part worth recording, because both were plausible enough to write up as causes.
+
+**One: that the PAE had collapsed into a distance map.** The head adds a
+DISCRETE 128-bin embedding of predicted rep-atom distances
+(`dist_bin_pairwise_embed`) immediately before its trunk, which would make a
+quantised-looking map. Measured on one target, how much of each model's PAE the
+discrete distance bin explains: opendde R^2 **0.772**, af3 **0.596**, boltz2
+**0.543**, ef2 **0.408**. EF2's PAE is the LEAST distance-explained of the four,
+so it is the opposite of a distance map.
+
+**Two: that the head double-counts its input.** `PairUpdateBlock` is internally
+residual, so `FoldingTrunk(pair)` already returns `pair + updates`, and the head
+then computes `pair = pair + self.folding_trunk(pair)` - that is
+**`2*pair + updates`**, which is real and is worth knowing. Ablated by running
+their module twice on one real trunk output, once as shipped and once with the
+double count cancelled: roughness **0.702 shipped against 0.742 cancelled**. It
+gets slightly ROUGHER without it. The doubled skip is not the cause.
+
+🔴 **WHAT THE CAUSE LOOKS LIKE IS IN THEIR OWN EVALUATION, AND THEY PUBLISH IT.**
+The recipe is at `github.com/Synthyra/FastPLMs/docs/confidence_training.md` with
+W&B runs. The objective is "pLDDT cross-entropy plus PAE cross-entropy plus 0.5
+times the within-target ranking loss" over **780 updates**. Two things follow:
+
+- **Nothing in that objective constrains the MAP.** A per-pair cross-entropy is
+  computed independently at each (i, j), so a predictor can be well calibrated
+  pointwise and still be spatially incoherent - which is precisely a low lag-1
+  autocorrelation with a correct mean and sd. Their headline metrics are all
+  pointwise or global: pLDDT-lDDT Spearman, pTM-TM, ipTM-DockQ, per-pair PAE
+  cross-entropy, calibration error. **None of them can see the 2D structure of
+  the PAE**, so nothing in their evaluation would have caught this.
+- **And the 600M's within-target discrimination is at chance**, in their own
+  table: pLDDT ranking accuracy **0.50962**, ipTM/DockQ ranking accuracy
+  **0.50993**, top-1 selection regret **0.01946** against a random-selection
+  regret of **0.02029**. The 300M is better on all three (0.585, 0.572). A head
+  that is globally calibrated but cannot rank two samples of one target is what
+  a noisy per-pair predictor looks like from the other end.
+
+So: not a loss bug, and not this port - our head matches theirs to 1.4e-4 on a
+real trunk. It is a shallow head (4 pair-only blocks) trained briefly against an
+objective with no spatial term, and the roughness is the visible consequence.
+The honest summary for a reader is that EF2-fast's pLDDT and pTM are good
+(Spearman 0.85 and 0.86 against lDDT and TM-score) and its PAE MAP should be
+read as a per-pair estimate rather than as the smooth domain picture AlphaFold's
+PAE gives.
