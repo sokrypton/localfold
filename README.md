@@ -74,6 +74,31 @@ are **[py2Dmol](https://github.com/sokrypton/py2Dmol)**, vendored into
 `web/vendor/`: everything on this page that draws a structure is its code
 running its own way.
 
+The models beyond AlphaFold 2 reach the browser through
+**[sokrypton/alphafold3](https://github.com/sokrypton/alphafold3)**, a fork of
+DeepMind's AlphaFold 3 that runs sixteen prediction models on one JAX/Haiku
+substrate. It is what this port is derived from and checked against: the model
+conventions come from introspecting its `model_config.py`, and the reference
+oracles under `tools/oracle/` are dumped from a checkout of it, so every parity
+number in `docs/` is a comparison against that code. Its own README credits the
+people below under "Running other models through this code", and so do we —
+LocalFold has their work in it at one remove:
+
+- **Marielle Russo** ([@maraxen](https://github.com/maraxen)) — plegadx, an
+  Equinox/JAX re-implementation of RoseTTAFold3, Boltz, chai-1, IntelliFold and
+  AlphaFold 3; the chai-1 diffusion modules and sampler validation.
+- **ChoongHwanLee**
+  ([@chlee19990109-cloud](https://github.com/chlee19990109-cloud)) — the
+  independent Protenix-to-AlphaFold 3 port for ColabFold, the padded-key
+  attention mask, and the discipline of verifying that every tensor a
+  checkpoint carries is actually consumed.
+- **juliabuhmann** ([@juliabuhmann](https://github.com/juliabuhmann)) — the
+  OpenBind port, and identifying the checkpoint differences between OpenFold3
+  release versions.
+- **Milot Mirdita** ([@milot-mirdita](https://github.com/milot-mirdita)) —
+  ColabFold and the MMseqs2 API this page searches against, the MSA server
+  adaptation and the device-portability guidance.
+
 Neither project originates the protein-structure prediction method or the model
 parameters. We thank the AlphaFold team at Google DeepMind for developing
 AlphaFold and releasing its source code and parameters. The scientific method
