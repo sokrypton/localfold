@@ -79,7 +79,7 @@ const EPSILON: f32 = 1.0e-5;
 // NOT. Their forward norms z and then adds this only when it is not None - an
 // optional argument defaulting to None, so omitting it is silent. See
 // docs/EF2FAST.md: 13.8 pLDDT and a PAE 2.4x rougher than theirs on one fold.
-@group(0) @binding(7) var<storage, read> relpos: array<f32>;
+@group(0) @binding(7) var<storage, read> pairbias: array<f32>;
 
 var<workgroup> reduce: array<f32, LANES>;
 
@@ -128,7 +128,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var c = lane; c < CHANNELS; c += LANES) {
     let normed = (pair[row * CHANNELS + c] - mean) * inverse
       * constants[SCALE_AT + c] + constants[OFFSET_AT + c];
-    out[row * CHANNELS + c] = normed + relpos[row * CHANNELS + c]
+    out[row * CHANNELS + c] = normed + pairbias[row * CHANNELS + c]
       + rows[i * CHANNELS + c] + cols[j * CHANNELS + c]
       + extra[row * CHANNELS + c] + embedding[bucket * CHANNELS + c];
   }
@@ -334,18 +334,18 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
     constants.set(weights.zNormOffset, channels);
     constants.set(weights.boundaries, channels * 2);
     constants.set(input.repCoordinates, channels * 2 + weights.boundaries.length);
-    // 🔴 `relPos` IS REQUIRED, NOT OPTIONAL. Their head takes it as a keyword
+    // 🔴 `pairBias` IS REQUIRED, NOT OPTIONAL. Their head takes it as a keyword
     // that defaults to None and adds it only when it is not None, so a caller
     // that forgets it gets a quietly worse answer and no error - which is
     // exactly what happened here. A zero buffer would reproduce that silence,
     // so this refuses instead.
-    if (input.relPos === undefined) {
-      throw new Error("ef2 confidence: relPos is required (see docs/EF2FAST.md)");
+    if (input.pairBias === undefined) {
+      throw new Error("ef2 confidence: pairBias is required (see docs/EF2FAST.md)");
     }
     pass.setBindGroup(0, bind(init, [
       pair, up("constants", constants), up("rows", input.rows), up("cols", input.cols),
       projected, up("embedding", weights.distanceEmbedding), out,
-      up("relpos", input.relPos)]));
+      up("pairbias", input.pairBias)]));
     pass.dispatchWorkgroups(Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
     pass.end();
     const readback = keep(allocator.allocate("ef2-conf.rb-init", pairs * channels * 4,
@@ -483,7 +483,7 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
 
   const initial = await esmfold2ConfidencePairInit(device, {
     tokens, pair: input.pair, pairBuffer: input.pairBuffer,
-    rows, cols, left, right, repCoordinates, relPos: input.relPos,
+    rows, cols, left, right, repCoordinates, pairBias: input.pairBias,
   }, weights, { allocator });
 
   const pairMask = new Float32Array(tokens * tokens);

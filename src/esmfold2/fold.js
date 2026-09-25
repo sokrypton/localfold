@@ -793,6 +793,42 @@ export async function foldEsmfold2(device, options) {
         back.release();
         return copy;
       })();
+    // 🔴 AND THE BOND ENCODING GOES INTO THE SAME ARRAY, because their head
+    // adds BOTH to the normalised pair - `if relative_position_encoding is not
+    // None` and `if token_bonds_encoding is not None`, one after the other -
+    // and a sum of two addends is one addend. Folding them here keeps the
+    // pair-init kernel at eight bindings, which is exactly the WebGPU floor;
+    // a ninth would refuse to create its pipeline on a conforming minimum
+    // device, which is what npm run test:spec-floor exists to catch.
+    //
+    // 🔴 IT IS ZERO ON A PLAIN CHAIN AND NOT ON A LIGAND. Measured off their
+    // own forward pre-hook: `token_bonds_encoding` is absmax 0.0 over a 59-mer
+    // where the relative encoding is 12.97, so this changes no protein fold -
+    // and a ligand or a declared bond is exactly where leaving it out would
+    // have been the same silent defect a second time.
+    if (confidenceRelPos !== undefined) {
+      const bondTerm = allocator.allocate("esmfold2.confidence-bonds",
+        pairs * channels * 4, storage | GPUBufferUsage.COPY_SRC);
+      const values = allocator.upload("esmfold2.confidence-bond-values",
+        features.tokenBonds, storage);
+      const table = allocator.upload("w.esmfold2.confidence-bond-weights",
+        weights.featuriser.tokenBonds, storage);
+      await submit("esmfold2.confidence-bonds", [
+        ["bonds", bond, [values, table, bondTerm], ...elementwise(pairs * channels)],
+      ]);
+      const back = allocator.allocate("esmfold2.confidence-bonds-rb",
+        pairs * channels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      const encoder = device.createCommandEncoder({ label: "esmfold2.confidence-bonds" });
+      encoder.copyBufferToBuffer(bondTerm.buffer, 0, back.buffer, 0, pairs * channels * 4);
+      device.queue.submit([encoder.finish()]);
+      await back.buffer.mapAsync(GPUMapMode.READ);
+      const added = new Float32Array(back.buffer.getMappedRange());
+      for (let index = 0; index < confidenceRelPos.length; index += 1) {
+        confidenceRelPos[index] += added[index];
+      }
+      back.buffer.unmap();
+      for (const allocation of [back, bondTerm, values, table]) allocation.release();
+    }
     for (const allocation of [relBins, relWeights]) {
       allocation.release();
       held.splice(held.indexOf(allocation), 1);
@@ -878,7 +914,7 @@ export async function foldEsmfold2(device, options) {
         atomToToken: features.atomToToken,
         atomMask: features.mask,
         tokenMask: new Float32Array(tokens).fill(1),
-        relPos: confidenceRelPos,
+        pairBias: confidenceRelPos,
         // 🔴 WITHOUT THIS EVERY COMPLEX REPORTS ipTM 0.000. ipTM is the same
         // expectation as pTM taken over the pairs whose `asymId` DIFFER, and
         // the reference defaulted a missing one to `new Int32Array(tokens)` -
@@ -899,7 +935,7 @@ export async function foldEsmfold2(device, options) {
           tokens, atoms, pair: confidencePair, sInputs, coordinates: x,
           repAtom: rep, atomToToken: features.atomToToken,
           atomMask: features.mask, asymId: features.asymId,
-          relPos: confidenceRelPos,
+          pairBias: confidenceRelPos,
         } };
       }
     }

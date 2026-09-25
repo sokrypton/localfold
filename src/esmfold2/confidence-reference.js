@@ -163,10 +163,10 @@ export function esmfold2Confidence(inputs, weights) {
   // relative_position_encoding is not None: z_base = z_base + ...`, so it is
   // added to the NORMALISED pair. It is a keyword defaulting to None, which is
   // why leaving it out was silent; docs/EF2FAST.md has what that cost.
-  if (inputs.relPos === undefined) {
-    throw new Error("esmfold2Confidence: relPos is required (see docs/EF2FAST.md)");
+  if (inputs.pairBias === undefined) {
+    throw new Error("esmfold2Confidence: pairBias is required (see docs/EF2FAST.md)");
   }
-  for (let index = 0; index < pair.length; index += 1) pair[index] += inputs.relPos[index];
+  for (let index = 0; index < pair.length; index += 1) pair[index] += inputs.pairBias[index];
 
   const rows = linear(single, tokens, dInputs, dPair, weights.sToZ);
   const columns = linear(single, tokens, dInputs, dPair, weights.sToZTranspose);

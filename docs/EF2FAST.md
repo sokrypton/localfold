@@ -3380,11 +3380,22 @@ the head reads **2.35e-5 on pLDDT and 1.75e-4 on PAE** - the port was always
 exact, on an input list that was always short.
 
 🔴 **THE SECOND OPTIONAL ARGUMENT IS ALL ZEROS HERE, WHICH IS WHY ONLY ONE TERM
-MATTERED.** Captured off native's own pre-hook: `relative_position_encoding` is
-dense with absmax **12.97**, and `token_bonds_encoding` is **absmax 0.0, 0%
-nonzero** on a plain chain. It is not passed yet and costs nothing on a
-polymer; a ligand or a declared bond is where it would, and that is the next
-thing to wire.
+MATTERED - AND IT IS WIRED NOW ANYWAY.** Captured off native's own pre-hook:
+`relative_position_encoding` is dense with absmax **12.97**, and
+`token_bonds_encoding` is **absmax 0.0, 0% nonzero** on a plain chain. Both go
+to the head now, summed into ONE input (`pairBias`) rather than two, because
+their forward adds both to the same normalised pair and a sum of two addends is
+one addend - which also keeps the pair-init kernel at **eight** storage
+bindings, exactly the WebGPU floor, where a ninth would refuse to create its
+pipeline on a conforming minimum device.
+
+Measured: a 59-residue protein reads **85.675 / 0.814972** with the bond term
+and without it, byte for byte, which is what absmax 0.0 predicts and is the
+only reason to believe the change is inert where it should be. A GOL fold runs
+and scores (pLDDT 69.4), and the head still reads 2.35e-5 against theirs. It
+also folds under `LOCALFOLD_PORTABLE_LIMITS=1`, which is the arm that would
+catch the ninth binding - **no standing gate covers EF2 there**, since
+`check-portable-limits.mjs` folds the six AF3-lineage models only.
 
 🔴 **THE RESIDUAL 3.5 pLDDT IS THE STRUCTURE, NOT THE HEAD.** The head reads
 coordinates, our sampler ran 64 steps against their 50, and the two folds are

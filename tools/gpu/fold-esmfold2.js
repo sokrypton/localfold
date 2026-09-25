@@ -955,7 +955,7 @@ export async function main(device, args = []) {
             atomToToken: Array.from(c.inputs.atomToToken),
             atomMask: Array.from(c.inputs.atomMask),
             asymId: Array.from(c.inputs.asymId),
-            relPos: Array.from(c.inputs.relPos, (v) => Number(v.toFixed(5))),
+            pairBias: Array.from(c.inputs.pairBias, (v) => Number(v.toFixed(5))),
           },
         }),
       };

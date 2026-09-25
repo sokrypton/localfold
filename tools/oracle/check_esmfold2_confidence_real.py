@@ -67,7 +67,7 @@ inputs = {
     # while neither side passed it the two agreed perfectly and both were
     # wrong. An oracle that builds its own call cannot see an argument neither
     # side supplies; passing it is what makes this checker able to fail.
-    "relative_position_encoding": t(i["relPos"], (1, n, n, -1)),
+    "relative_position_encoding": t(i["pairBias"], (1, n, n, -1)),
 }
 with torch.no_grad():
     out = head(**inputs)
