@@ -353,7 +353,7 @@ export const MODEL_BUNDLES = {
   "ef2-fast-600m": {
     model: "esmfold2-trunk",
     directory: "./model-esmfold2-int5/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/71ece3571b80e6cdb06f3b95f785187171c718da/ef2-fast-600m-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/7f265c212f303a9ad57aff2e122cb8bf607eefab/ef2-fast-600m-int5/",
     release: "esmfold2-int5",
     variable: "LOCALFOLD_INCLUDE_ESMFOLD2_MODEL",
     companion: "esmc",
@@ -372,7 +372,7 @@ export const MODEL_BUNDLES = {
   "ef2-fast-300m": {
     model: "esmfold2-trunk",
     directory: "./model-ef2-fast-300m-int5/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/71ece3571b80e6cdb06f3b95f785187171c718da/ef2-fast-300m-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/7f265c212f303a9ad57aff2e122cb8bf607eefab/ef2-fast-300m-int5/",
     release: "ef2-fast-300m-int5",
     variable: "LOCALFOLD_INCLUDE_ESMFOLD2_MODEL",
     companion: "esmc-300m",
