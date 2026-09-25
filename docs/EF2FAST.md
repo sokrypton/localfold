@@ -3513,3 +3513,68 @@ dumps - `fold-esmfold2.js --confidence-inputs=1` now carries `refPos`,
 `refCharge`, `refElement`, `refAtomNameChars`, `refSpaceUid`, `aatype`,
 `profile` and `deletionMean` for exactly this. Their encoder also returns its
 intermediates, so the next step is per-block rather than end-to-end.
+
+#### FOUND: the atom attention should be DENSE, and ours is windowed
+
+Bisected from the head backwards, on one sequence, against their own modules:
+
+| stage | ours vs theirs |
+|---|---:|
+| `c` - atom features, projection, LayerNorm | **7.5e-8** |
+| `q` - after the 3 atom-transformer blocks | 1.76e-1 |
+| the blocks' DELTA, `q - c` | relRMS 0.98, **corr 0.43**, magnitude 0.77 |
+| the FIRST block alone | already diverged: corr **0.36** |
+
+Everything inside a block then checked and matched: adaLN is RMSNorm without
+affine, its six chunks are `shift, scale, gate` per half in that order,
+`qk_norm` is `F.rms_norm` over the head width, the SwiGLU hidden size rounds to
+`((2 * (128//3) * 2) + 255)//256*256 = 256` as ours does and takes `silu(first)
+* second`, the window is +/-64 on both sides, the RoPE has the same 2 spatial
+pairs per axis at base 20 and 10 uid pairs at base 10000.
+
+🔴 **THE DIFFERENCE IS THAT THEIRS DOES NOT USE THE WINDOW AT ALL.**
+`SWA3DRoPEAttention.__init__` sets `self._atom_attention = ATOM_ATTENTION_DENSE`,
+and its forward reads
+
+```python
+if self._atom_attention == ATOM_ATTENTION_WINDOWED:
+    out = self._windowed_attention(q, k, v, attention_params)
+else:
+    attn = F.softmax(torch.matmul(q_t, k_t.transpose(-2, -1)) * self.scale, dim=-1)
+    out = torch.matmul(attn, v_t)
+```
+
+Nothing on the fold path calls `set_atom_attention("windowed")` - there is no
+such call anywhere in `fastplms` - so **`swa_window_size: 128` is in the config
+and unused by the shipped model**, and every atom attends to every atom. This
+port windows, for every model and every length.
+
+Measured, 59 residues, our float32 head bundle:
+
+| | tokenAct vs native | pLDDT | pTM | PAE mean |
+|---|---:|---:|---:|---:|
+| windowed (shipped) | 2.64e-1 | 85.67 | 0.8150 | 4.810 |
+| **dense** | **2.07e-2** | **88.21** | **0.8178** | 3.910 |
+| native | — | 89.15 | 0.8304 | 3.787 |
+
+2.07e-2 is exactly what THEIR encoder scores on OUR features, so with dense
+attention our encoder agrees with theirs and the whole remaining residual is the
+`ref_pos` conformer floor. **+2.5 pLDDT.**
+
+🔴 **AND IT IS NOT THE DEFAULT YET, BECAUSE THE KERNEL CANNOT AFFORD IT.**
+`attend` holds `logits: array<f32, heads * window>` in WORKGROUP memory, so a
+dense window is `4 * atoms` floats: 3584 atoms is 57 KB against this A100's
+48 KiB limit, and the pipeline is refused outright at 472 residues
+(`esmfold2-atom:3584:128:4:256:3584:bf16:attend`). Even the 236-residue case
+that passes here - about 30 KB - would be refused on Metal's 32 KiB. So dense
+needs the `attend` kernel to loop over KEY CHUNKS with an online softmax, the
+flash-attention structure the AF3 side already uses, after which the window
+goes away entirely and this becomes unconditional.
+
+`--atom-dense=1` on `fold-esmfold2.js` is the arm; the default is unchanged and
+still windowed. `--atom-blocks=N` truncates the stack for bisecting, and
+🔴 **truncating it means slicing the WEIGHTS, not the shape** - `encodeAtomStack`
+loops `for (const block of weights)`, so a smaller `shape.blocks` changes what
+is COMPILED and not what is RUN. Found by asking for 0 blocks and getting the
+full stack's answer back, which is an oracle arm that cannot bisect while
+looking as though it does.

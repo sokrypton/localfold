@@ -385,6 +385,15 @@ export async function main(device, args = []) {
     // 🔴 THE HEAD'S INPUTS, FOR check-esmfold2-confidence-real.py. Only when
     // asked: the pair is tokens^2 x 256 floats and this returns it as JSON.
     returnConfidenceInputs: option(args, "confidence-inputs", "") !== "",
+    // 🔴 THE ATOM TRANSFORMER'S ARITHMETIC, WHICH DEFAULTS TO bf16. Their
+    // inputs embedder runs under `torch.amp.autocast(bfloat16)` on CUDA and in
+    // f32 without it, so a comparison against a CPU reference is comparing two
+    // precisions unless this says which. See docs/EF2FAST.md.
+    ...(option(args, "atom-dense", "") === "" ? {} : { atomDense: true }),
+    ...(option(args, "atom-blocks", "") === ""
+      ? {} : { atomBlocks: Number(option(args, "atom-blocks", "")) }),
+    ...(option(args, "attention-precision", "") === ""
+      ? {} : { attentionPrecision: option(args, "attention-precision", "") }),
     tower: runTower,
     distogramLogits: contactSweep,
     // ...measured and not drawn; see src/esmfold2/aligned-error.js.
@@ -958,7 +967,7 @@ export async function main(device, args = []) {
             pairBias: Array.from(c.inputs.pairBias, (v) => Number(v.toFixed(5))),
             ...Object.fromEntries(["refPos", "refCharge", "refElement",
               "refAtomNameChars", "refSpaceUid", "aatype", "profile",
-              "deletionMean"].map((k) => [k, Array.from(c.inputs[k])])),
+              "deletionMean", "atomConditioning", "atomActivation"].map((k) => [k, Array.from(c.inputs[k])])),
           },
         }),
       };

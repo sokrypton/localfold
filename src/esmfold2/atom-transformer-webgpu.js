@@ -612,7 +612,7 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
     const conditioning = keep(allocator.upload("esmfold2.embed.c-base",
       context.atomConditioning, storage | GPUBufferUsage.COPY_SRC));
     const activation = keep(allocator.allocate("esmfold2.embed.act",
-      atoms * channels * 4, storage | GPUBufferUsage.COPY_DST));
+      atoms * channels * 4, storage | (context.capture === undefined ? 0 : GPUBufferUsage.COPY_SRC) | GPUBufferUsage.COPY_DST));
     // 🔴 THE ACTIVATION STARTS AT THE CONDITIONING ITSELF, not at zero:
     // `atom_stack(c0, c0)` passes the same tensor as the running activation and
     // as the conditioning, and only the first is updated.
@@ -667,10 +667,26 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
       tokens * tokenChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
     encoder.copyBufferToBuffer(tokenAct.buffer, 0, readback.buffer, 0,
                                tokens * tokenChannels * 4);
+    // 🔴 THE STACK'S OWN OUTPUT, FOR THE ORACLE ARM. `capture` is how the
+    // encoder is bisected against Synthyra's: their atom encoder returns `q`
+    // beside `a`, so comparing the two separates the transformer blocks from
+    // the projection and the pooling that follow them. Off unless asked.
+    const capture = context.capture;
+    const grab = capture === undefined ? undefined : keep(allocator.allocate(
+      "esmfold2.embed.activation-rb", atoms * channels * 4,
+      GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+    if (grab !== undefined) {
+      encoder.copyBufferToBuffer(activation.buffer, 0, grab.buffer, 0, atoms * channels * 4);
+    }
     device.queue.submit([encoder.finish()]);
     await readback.buffer.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(readback.buffer.getMappedRange().slice(0));
     readback.buffer.unmap();
+    if (grab !== undefined) {
+      await grab.buffer.mapAsync(GPUMapMode.READ);
+      capture.activation = new Float32Array(grab.buffer.getMappedRange().slice(0));
+      grab.buffer.unmap();
+    }
     return out;
   } finally {
     for (let at = held.length - 1; at >= 0; at -= 1) held[at].release();

@@ -357,7 +357,12 @@ export async function foldEsmfold2(device, options) {
     multiplier: shape.transitionMultiplier, sigmaData: settings.sigmaData,
     atomChannels: shape.atomChannels, atomHeads: shape.atomHeads,
     atomBlocks: shape.atomBlocks, atomHidden: shape.atomChannels * 2,
-    window: shape.atomWindow, attentionPrecision: options.attentionPrecision ?? "bf16",
+    // 🔴 THE DIFFUSION ATOM STACKS SHARE THE ENCODER CLASS AND SO ITS DEFAULT.
+    // `ESMFold2AtomEncoder`/`Decoder` both hold a `SWA3DRoPEAttention` whose
+    // `_atom_attention` is DENSE until something sets it otherwise, and the
+    // fold path never does - so these are dense too, not windowed.
+    window: options.atomDense === true ? (1 << 24) : shape.atomWindow,
+    attentionPrecision: options.attentionPrecision ?? "bf16",
   };
   // The catch is only so a compile that fails before anything awaits it is not
   // an unhandled rejection; the real failure still arrives at `prepare`.
@@ -481,19 +486,45 @@ export async function foldEsmfold2(device, options) {
     // ---- the inputs embedder, whose pooled output is most of `s_inputs`.
     const atomShape = {
       atoms, tokens, channels: shape.atomChannels, heads: shape.atomHeads,
-      blocks: shape.atomBlocks, hidden: shape.atomChannels * 2,
-      tokenChannels: shape.tokenChannels, window: shape.atomWindow,
+      // 🔴 OVERRIDABLE FOR THE ORACLE ARM ONLY. Their atom transformer can be
+      // truncated to k blocks from python; this is the same knob on this side,
+      // so the two can be compared one block at a time. Never set in a fold.
+      blocks: options.atomBlocks ?? shape.atomBlocks,
+      hidden: shape.atomChannels * 2,
+      tokenChannels: shape.tokenChannels,
+      // 🔴 THE REFERENCE'S ATOM ATTENTION IS DENSE BY DEFAULT, NOT WINDOWED.
+      // `SWA3DRoPEAttention.__init__` sets `_atom_attention = ATOM_ATTENTION_DENSE`
+      // and its forward takes the windowed branch only when something calls
+      // `set_atom_attention("windowed")` - which nothing on the fold path does.
+      // `swa_window_size` is in the config and unused by the shipped model. A
+      // window covering every atom IS dense, so this needs no second kernel.
+      window: options.atomDense === true ? atoms * 2 : shape.atomWindow,
       precision: options.attentionPrecision ?? "bf16",
     };
+    let embedderConditioning;
+    let embedderCapture;
     const rope = buildRope(features.refPos, features.refSpaceUid, atoms,
                            shape.atomChannels / shape.atomHeads);
     const sInputs = reuse !== undefined ? reuse.sInputs
       : await mark("inputs embedder", async () => {
+      const conditioning = atomConditioning(features, atoms, shape.atomChannels,
+                                            weights.inputsEmbedder);
+      // ...kept for the oracle arm: this is their `c_base`, the atom encoder's
+      // first stage, and comparing it separates the projection from the blocks.
+      embedderConditioning = conditioning;
+      // 🔴 TRUNCATING THE STACK MEANS TRUNCATING THE WEIGHTS, NOT THE SHAPE.
+      // `encodeAtomStack` loops `for (const block of weights)`, so a smaller
+      // `shape.blocks` changes what is COMPILED and not what is RUN - which is
+      // how an oracle arm can look like it is bisecting while every run is the
+      // full stack. Found by asking for 0 blocks and getting the same answer.
+      const embedderWeights = options.atomBlocks === undefined
+        ? weights.inputsEmbedder
+        : { ...weights.inputsEmbedder,
+            blocks: weights.inputsEmbedder.blocks.slice(0, options.atomBlocks) };
       const tokenAct = await runInputsEmbedder(
-        { device, allocator, cache, rope,
-          atomConditioning: atomConditioning(features, atoms, shape.atomChannels,
-                                             weights.inputsEmbedder) },
-        { features, shape: atomShape, weights: weights.inputsEmbedder });
+        { device, allocator, cache, rope, atomConditioning: conditioning,
+          capture: options.returnConfidenceInputs === true ? (embedderCapture = {}) : undefined },
+        { features, shape: atomShape, weights: embedderWeights });
       return assembleSingleInputs(tokenAct, features, tokens, shape.tokenChannels,
                                   features.aatype.length / tokens, shape.singleInputs);
     });
@@ -947,6 +978,8 @@ export async function foldEsmfold2(device, options) {
           refSpaceUid: features.refSpaceUid,
           aatype: features.aatype, profile: features.profile,
           deletionMean: features.deletionMean,
+          atomConditioning: embedderConditioning,
+          atomActivation: embedderCapture?.activation,
         } };
       }
     }
