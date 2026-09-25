@@ -1284,6 +1284,38 @@ export async function foldBatch(device, batch, weights, options = {}) {
         atomToSlot[token * dense + slot] = slot;
       }
     }
+    // 🔴 THE HEAD'S REAL INPUTS, FOR THE ARM ITS ORACLE CANNOT BE.
+    // `dump_af3_opendde_confidence.py` SYNTHESISES the atom layout and feeds
+    // seeded normals for z and s_inputs - its own header says so - so the head
+    // is gated on its arithmetic and never on a real trunk's pair. That is the
+    // same shape of gap that hid ESMFold2's missing
+    // `relative_position_encoding` behind a 1e-7 agreement; see docs/EF2FAST.md.
+    // Only when asked: the pair alone is tokens^2 x 384 floats.
+    let confidenceInputs;
+    if (options.returnConfidenceInputs === true) {
+      // ...the head's own width, which is where it reads it from too. The
+      // allocation does not carry an element count.
+      const channels = weights.openddeConfidence.pairChannels;
+      const back = device.createBuffer({ label: "opendde.confidence-pair-rb",
+        size: n * n * channels * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const encoder = device.createCommandEncoder({ label: "opendde.confidence-pair" });
+      encoder.copyBufferToBuffer(structural.headInput.refinedPair.buffer, 0,
+                                 back, 0, n * n * channels * 4);
+      device.queue.submit([encoder.finish()]);
+      await back.mapAsync(GPUMapMode.READ);
+      confidenceInputs = {
+        tokens: n, channels, dense,
+        pair: new Float32Array(back.getMappedRange().slice(0)),
+        singleInputs: structural.headInput.targetFeat,
+        single: structural.headInput.trunkSingle,
+        coordinates, seqMask: structural.structural.seqMask,
+        atomToToken, atomToSlot, extraPairBias: structural.attentionBias,
+        tmTokens: tokens,
+      };
+      back.unmap();
+      back.destroy();
+    }
     const raw = await openddeConfidence(device, {
       tokens: n, singleInputs: structural.headInput.targetFeat,
       single: structural.headInput.trunkSingle,
@@ -1299,6 +1331,12 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // note at the return below.
       tmTokens: tokens,
     }, weights.openddeConfidence, weights.trunk.dialect);
+    // ...and our own answer beside the inputs, so the comparison needs nothing
+    // else: the arm is "their head on our pair" against "our head on our pair".
+    if (confidenceInputs !== undefined) {
+      confidenceInputs.oursPae = raw.pae;
+      confidenceInputs.oursPlddt = raw.plddt;
+    }
 
     // Per-atom scores, scattered onto the residue layout.
     const plddt = new Float32Array(tokens * dense);
@@ -1341,7 +1379,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // still have to reach the same pTM/ipTM the rest of the pipeline reports".
     // What was missing here was the DISTRIBUTION: the readout kept the
     // expectation and dropped the logits, so there was nothing left to adjust.
-    return { plddt, pae, tmAdjusted, opendde: raw,
+    return { plddt, pae, tmAdjusted, opendde: raw, confidenceInputs,
              coordinateCheck: { live, tokens: n, span: Number(span.toFixed(3)) } };
   };
 

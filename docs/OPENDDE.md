@@ -1156,3 +1156,58 @@ RATHER THAN ASSUMING.** `dump_af3_opendde_confidence.py` synthesises
 says so - so its `full_pae` is 68x68 with the structural space equal to the
 residue one. The head is exact and the oracle is silent about the layout around
 it; the batch gate is what covers that half.
+
+## Its PAE is grainy, and so is the reference's
+
+Reported after ESMFold2's grain turned out to be a missing
+`relative_position_encoding`: OpenDDE's PAE looks rough the same way, on a
+single chain. It measures rough - **roughness 0.391, lag-1 0.830** against
+AlphaFold 3's 0.193 / 0.964 - and it is not a defect.
+
+🔴 **THEIR OWN HEAD, FED OUR REAL TRUNK PAIR, IS EQUALLY GRAINY**: PAE mean
+4.483, **roughness 0.4305**, lag-1 0.7538, against our 0.391 after the gather to
+residue tokens. The reference reproduces the texture, so there is nothing to
+repair. That is the difference from ESMFold2, where native produced a SMOOTH
+map and ours did not.
+
+`tools/oracle/check_opendde_confidence_real.py` is what says so, with
+`fold-opendde.js --confidence-inputs=1`. It is the arm
+`dump_af3_opendde_confidence.py` states it cannot be: that dump SYNTHESISES the
+atom layout and feeds seeded normals, so the head was gated on its arithmetic
+and never on a real trunk's pair.
+
+🔴 **AND THE EXISTING ORACLE NEVER PASSED `extra_pair_bias` AT ALL.** It is the
+head's eighth argument and defaults to `None`; the dump omits it and a fold
+supplies one, so neither side had ever exercised it - the precise shape of the
+gap that hid ESMFold2's missing encoding behind a 1e-7 agreement. The new arm
+passes it. Our head against theirs on the same real inputs: **PAE relRMS
+6.13e-3, max|d| 0.127, pLDDT 1.45e-3** - looser than the synthetic arm's
+8.46e-7 and expected to be, since a real pair has orders more dynamic range
+than seeded normals and this is f32 on a GPU against f64 in JAX.
+
+Two hypotheses tested and refuted on the way:
+
+- **discrete distance bins.** The head adds a BINNED distance one-hot straight
+  into `z`, which would quantise the map. Adjacent pairs crossing a bin edge do
+  jump 1.54x more - but that is the distance having moved further, and once
+  |dD| is held fixed the effect is 1.29 / 0.94 / 0.78 across three bands with
+  AlphaFold 3 scored against the same fictitious bins at 0.96 / 1.13 / 1.00.
+- **a missing argument.** All eight of the head's inputs are passed.
+
+What is left is architectural: a **4-block** confidence head smooths less than
+AlphaFold 3's deeper one, and OpenDDE's PAE is the most distance-explained of
+the four models (R^2 0.772) because it adds two distance embeddings directly.
+
+🔴 **AND ITS HEAD RUNS ON 130 STRUCTURAL TOKENS FOR A 68-RESIDUE PROTEIN**, so
+the `residueRepToken` gather is live even on plain 6MRR - this file's own
+earlier claim that it is the identity there was wrong. `test:batch` compares
+those integers against `structbook/residue_rep_token` exactly, which is what
+makes the gather safe.
+
+🔴 **TWO ENVIRONMENT TRAPS IN THE NEW CHECKER.** Only the oracle HARNESS goes on
+`sys.path`, never the checkout's `src`: `alphafold3.cpp` is a compiled extension
+and a source tree shadows the installed package, dying on
+`No module named 'alphafold3.cpp'`. And `fold_check` needs the checkout ROOT
+too, for the `converters` package it re-exports `parse_ca` from. `AF3_SRC`
+points at a fresh clone; `~/alphafold3`, which the older dumpers hard-code,
+does not exist on this box.

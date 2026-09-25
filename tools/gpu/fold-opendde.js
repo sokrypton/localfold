@@ -348,6 +348,10 @@ export async function main(device, args) {
     // criterion; 0 is off. See src/af3/feature-convergence.js.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     mode: option(args, "mode", "diffusion"),
+    // 🔴 THE CONFIDENCE HEAD'S REAL INPUTS, for the arm its oracle cannot be:
+    // dump_af3_opendde_confidence.py synthesises the atom layout and feeds
+    // seeded normals, so the head has never seen a real trunk's pair here.
+    returnConfidenceInputs: option(args, "confidence-inputs", "") !== "",
     // 🔴 THE MSA DEPTH THE MODEL WAS CONFIGURED WITH, WHICH IS NOT 1024 FOR
     // EVERY FAMILY. `foldBatch` caps at `options.numMsa ?? 1024`; the
     // reference's OpenDDE config says num_msa 1280, so a deep alignment reaches
@@ -606,6 +610,11 @@ export async function main(device, args) {
                sd: Number(sd.toFixed(3)) };
     })(),
     coordinateCheck: fold.scores?.coordinateCheck,
+    ...(fold.scores?.confidenceInputs === undefined ? {} : {
+      confidenceInputs: Object.fromEntries(Object.entries(fold.scores.confidenceInputs)
+        .map(([k, v]) => [k, ArrayBuffer.isView(v)
+          ? Array.from(v, (x) => (Number.isInteger(x) ? x : Number(x.toFixed(5)))) : v])),
+    }),
     peakMiB: Number((memorySnapshot(device).peakBytes / 2 ** 20).toFixed(1)),
     peakRows: memorySnapshot(device).peakByLabel.slice(0, 6)
       .map((r) => ({ label: r.label, MiB: Number((r.bytes / 2 ** 20).toFixed(1)),
