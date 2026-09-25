@@ -655,7 +655,16 @@ try:
     # the first version killed the post office as well and the next request
     # died on "connection refused", which is a different fault wearing this
     # one's clothes.
-    subprocess.run(["pkill", "-f", "Google Chrome.*localfold-bridge-check"],
+    #
+    # 🔴 AND THE BINARY'S NAME IS NOT THE WAY TO SEPARATE THEM. This read
+    # "Google Chrome.*" - the macOS path - so on Linux, where the binary is
+    # `google-chrome` or `chromium`, it matched NOTHING: the browser lived,
+    # `browserAlive` stayed None, and the arm failed saying a reader cannot
+    # tell a gone runtime from a busy one. It could; nothing had gone. What
+    # separates the two on BOTH platforms is the flag - the browser is given
+    # `--user-data-dir=<profile>` by cdp.launch and the broker takes
+    # `--profile <path>` - so the `=` does the work the binary name was doing.
+    subprocess.run(["pkill", "-f", "user-data-dir=/tmp/localfold-bridge-check"],
                    check=False)
     dead, deadline = None, time.time() + 30
     while time.time() < deadline:
