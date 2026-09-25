@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-339 tools. `tools/fixtures/` is data and is not listed.
+340 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (191)
+## `tools/gpu/` - the WebGPU lane (192)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -90,6 +90,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-esmc-block.js`** - Does src/esmc/block-webgpu.js compute an ESM-C block?
 - **`check-esmc-tower.js`** - Does src/esmc/tower-webgpu.js compute ESM-C's 36 blocks and ESMFold2's mix?
 - **`check-esmfold2-atom-stack.js`** - Does the sliding-window atom transformer compute what its reference does?
+- **`check-esmfold2-confidence-gpu.js`** - ESMFold2's confidence head on the device, against the host reference.
 - **`check-esmfold2-diffusion-gpu.js`** - Does src/esmfold2/diffusion-webgpu.js compute ESMFold2's whole denoise step?
 - **`check-esmfold2-trunk-gpu.js`** - Does src/esmfold2/trunk-webgpu.js compute ESMFold2's folding trunk?
 - **`check-esmfold2-trunk-pack.js`** - Does the ESMFold2 trunk's DEVICE-decoded pair track compute the host one's answer?

@@ -157,6 +157,7 @@ export function esmfold2Confidence(inputs, weights) {
     }
   }
   // See the note at the top: the stack's answer is ADDED to its own input.
+  const initial = Float32Array.from(pair);
   let stack = Float32Array.from(pair);
   const add = (delta) => {
     for (let index = 0; index < stack.length; index += 1) stack[index] += delta[index];
@@ -222,7 +223,7 @@ export function esmfold2Confidence(inputs, weights) {
   const paeLogits = linear(pair, tokens * tokens, dPair, paeBins, weights.pae);
   const pae = categoricalMean(paeLogits, tokens * tokens, paeBins, 0, 32);
 
-  return { pair, single: pooled, distances, plddtLogits, plddtPerAtom, plddt, plddtCa,
+  return { initial, pair, single: pooled, distances, plddtLogits, plddtPerAtom, plddt, plddtCa,
            complexPlddt: weighted / (total + 1e-8), paeLogits, pae };
 }
 
