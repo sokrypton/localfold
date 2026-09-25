@@ -1275,6 +1275,27 @@ still running, which in a `for` loop stalls every arm behind it. `pkill -9 -f
 "gpu-chrome-"` matches the temporary profile directory and nothing else - not
 the browser you are using. A batch of checkers should carry one between arms.
 
+🔴 **AND A `pkill -f` PATTERN MATCHES EVERY PROCESS THAT MERELY MENTIONS
+IT, INCLUDING THE SHELL ABOUT TO READ THE RESULT.** Exit 144 with no output,
+four times now. The newest direction is the one that is not obvious: a gate
+whose own code runs `pkill -f <pattern>` will kill the shell that started it if
+that shell's COMMAND LINE contains the pattern - which it does whenever the
+patch that writes the pattern and the run that exercises it are sent as one
+command. **Run a gate that greps for a string from a shell that does not name
+it.** The same rule is why `pgrep -f localfold-pending-runtime` returned this
+session's own bash.
+
+🔴 **AND A KILL PATTERN NAMING A BINARY IS A macOS PATTERN.** Two standing
+gates killed their runtime with `pkill -f "Google Chrome.*<profile>"`, which on
+Linux - where the binary is `google-chrome` or `chromium` - matches NOTHING, so
+the browser lived and both gates failed saying the PAGE had not noticed it die.
+The page had nothing to notice. `test:pending` and `test:colab` were red on this
+box for that reason alone, on `main`, with the badge logic correct throughout.
+What separates a browser from the broker on both platforms is the FLAG, not the
+name: cdp.launch gives the browser `--user-data-dir=<profile>` where the broker
+takes `--profile <path>`, so the `=` is the discriminator. A kill that cannot
+kill is a gate asserting against its own missing instrument.
+
 🔴 **AND THE PAGE AND THE CLI BUILT THE BATCH BY HAND, EACH DROPPING SOMETHING
 THE OTHER PASSED.** `web/af3-model.js` and `tools/gpu/fold.js` both called
 `af3MsaFromA3m` and then `featuriseProtein`, and the CLI passed no
