@@ -3684,3 +3684,55 @@ survived in the first place. Worst stage 8.89e-4 against a 2e-3 bound.
 passes every element as an ARGUMENT, so a 472-residue fold's 222,784 of them
 raise "Maximum call stack size exceeded" from a line that looks like
 arithmetic. It had only ever run on 59-token folds. Reduced instead.
+
+### The two-chain path has no defect of its own, and the inter-chain grain is the model's
+
+Reported: the inter-chain PAE of two copies still looks grainy while the intra
+block now looks right. Measured, two copies of the 59-mer, against native:
+
+| block | ours mean | native mean | **ours roughness** | **native roughness** |
+|---|---:|---:|---:|---:|
+| intra | 6.129 | 5.012 | 0.1410 | **0.1433** |
+| inter | 11.177 | 9.790 | 0.2968 | **0.2912** |
+
+🔴 **NATIVE'S INTER BLOCK IS EQUALLY GRAINY** - within 2% on both blocks. The
+inter block is intrinsically twice as rough as the intra one in their model as
+much as in this port, which is what an under-determined relative placement
+looks like pair by pair. Nothing is missing.
+
+Everything the two-chain path could have got wrong was then checked, because a
+single chain cannot see any of it - the same blind spot that hid
+`relative_position_encoding` and ipTM:
+
+| | two chains, ours vs native |
+|---|---:|
+| the confidence head, on our inputs | **1.88e-5** pLDDT, 1.76e-4 PAE, ipTM 0.718197 vs 0.718200 |
+| `pairBias`, intra block | 1.88e-6 |
+| `pairBias`, **inter** block | **1.83e-6** |
+| `asymId` | identical |
+| featuriser's own `s_inputs` channels | exact |
+| `tokenAct` | 2.26e-2, the same as one chain's 2.07e-2 |
+| the LM input: ids and `sequence_id` | the same construction - `[BOS] c1 [EOS][BOS] c2 [EOS]`, and their `sequence_id = (ids == 0).cumsum(-1) - 1` increments at each BOS exactly as our per-chain id does |
+
+🔴 **AND THE STRUCTURE IS 2.67 A OFF PER CHAIN WHERE ONE CHAIN IS 0.358 A - BUT
+THE DOCKING IS RIGHT.** Centroid separation 11.89 A against 11.87, closest
+approach 4.29 against 4.33. It is each copy's own fold that moves, not their
+placement. Native's own seed-to-seed spread on the same two-chain system is
+**0.516 / 0.475 A**, so 2.67 A is 5x its noise and real.
+
+🔴 **AND IT IS STILL NOT A TWO-CHAIN DEFECT.** `z_init` - the trunk's input -
+is **8.48e-2 on one chain and 8.36e-2 on two**, and the two-chain figure is
+uniform across the blocks (intra 8.40e-2, inter 8.32e-2). The same input
+difference, one chain or two. What differs is what the system does with it: the
+trunk amplifies 8.4e-2 to 1.62e-1 on one chain and 2.72e-1 on two, and the fold
+moves 0.358 A against 2.67 A. A two-copy system with no real interface is
+simply more sensitive to its input than a monomer is - and being insensitive to
+the SEED, as native's 0.5 A shows, is not the same as being insensitive to the
+INPUT.
+
+So there is one number left and it is not new: **`z_init` at 8.4e-2**, of which
+`tokenAct` at ~2e-2 is the measured conformer floor and `relPos` is exact. The
+untested summand is the LANGUAGE-MODEL PAIR, which no oracle here has ever
+compared - `--confidence-inputs=1` now returns `zInit`, `atomConditioning` and
+`atomActivation` so the next person can bisect z_init's four addends the way
+the atom encoder was bisected.

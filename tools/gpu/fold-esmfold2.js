@@ -973,7 +973,7 @@ export async function main(device, args = []) {
             pairBias: Array.from(c.inputs.pairBias, (v) => Number(v.toFixed(5))),
             ...Object.fromEntries(["refPos", "refCharge", "refElement",
               "refAtomNameChars", "refSpaceUid", "aatype", "profile",
-              "deletionMean", "atomConditioning", "atomActivation"].map((k) => [k, Array.from(c.inputs[k])])),
+              "deletionMean", "atomConditioning", "atomActivation", "zInit"].map((k) => [k, Array.from(c.inputs[k])])),
           },
         }),
       };

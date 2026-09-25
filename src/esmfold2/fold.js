@@ -509,6 +509,7 @@ export async function foldEsmfold2(device, options) {
     };
     let embedderConditioning;
     let embedderCapture;
+    let embedderZInit;
     const rope = buildRope(features.refPos, features.refSpaceUid, atoms,
                            shape.atomChannels / shape.atomHeads);
     const sInputs = reuse !== undefined ? reuse.sInputs
@@ -574,7 +575,8 @@ export async function foldEsmfold2(device, options) {
     const buildRelativePositions = () => submit("esmfold2.rel-pos", [
       ["rel-pos", relative, [relBins, relWeights, relPos], ...elementwise(pairs * channels)],
     ]);
-    const zInit = keep(allocator.allocate("esmfold2.z-init", pairs * channels * 4, storage));
+    const zInit = keep(allocator.allocate("esmfold2.z-init", pairs * channels * 4,
+      storage | (options.returnConfidenceInputs === true ? GPUBufferUsage.COPY_SRC : 0)));
     const pair = keep(allocator.allocate("esmfold2.pair", pairs * channels * 4,
       storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST));
     await mark("z_init", async () => {
@@ -605,6 +607,21 @@ export async function foldEsmfold2(device, options) {
       relPos.release();
       held.splice(held.indexOf(relPos), 1);
     });
+
+    // ...and the trunk's INPUT, for the oracle arm: comparing z_init separates a
+    // trunk that diverges from a trunk that is fed something different. Only
+    // when asked; it is `tokens^2 x 256` floats.
+    if (options.returnConfidenceInputs === true) {
+      const back = allocator.allocate("esmfold2.z-init-rb", pairs * channels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      const encoder = device.createCommandEncoder({ label: "esmfold2.z-init-rb" });
+      encoder.copyBufferToBuffer(zInit.buffer, 0, back.buffer, 0, pairs * channels * 4);
+      device.queue.submit([encoder.finish()]);
+      await back.buffer.mapAsync(GPUMapMode.READ);
+      embedderZInit = new Float32Array(back.buffer.getMappedRange().slice(0));
+      back.buffer.unmap();
+      back.release();
+    }
 
     advance(plan.embedder);
 
@@ -985,6 +1002,7 @@ export async function foldEsmfold2(device, options) {
           aatype: features.aatype, profile: features.profile,
           deletionMean: features.deletionMean,
           atomConditioning: embedderConditioning,
+          zInit: embedderZInit,
           atomActivation: embedderCapture?.activation,
         } };
       }
