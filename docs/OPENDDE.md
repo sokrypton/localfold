@@ -1083,3 +1083,76 @@ re-converting, and until it is, the dumper splices the two tensors out of
 LocalFold's own bundle. Measured, the convention is worth relRMS **0.0021** on
 the PAE - nothing - but a comparison that moves two things is not a comparison.
 
+
+## Why OpenDDE's PAE looks unlike the others', measured
+
+Reported twice from the page: the PAE panel "looks the most different from
+other models", and "looks more like a PDE matrix". Both readings are about the
+PICTURE, so the picture is what had to be measured. The same 58-mer, single
+sequence, folded through the page by each model and read out of the archive's
+`full_data`:
+
+| model | mean PAE | max | off-diagonal sd | **asymmetry** | mean pLDDT | pTM |
+|---|---:|---:|---:|---:|---:|---:|
+| **opendde** | **4.735** | 16.85 | 2.724 | **0.2296** | **87.2** | **0.69** |
+| af3 | 9.735 | 22.44 | 5.063 | 0.2215 | 67.46 | 0.37 |
+| boltz2 | 9.657 | 23.92 | 5.366 | 0.2713 | 66.17 | 0.46 |
+| ef2-fast | 9.742 | 27.01 | 5.187 | 0.4264 | 52.87 | 0.43 |
+
+`asymmetry` is `sum|A - Aᵀ| / sum A`, which is the direct test of the second
+reading: a PDE is symmetric by construction, so a PAE that had become one would
+read ~0.
+
+🔴 **IT IS NOT A PDE. OpenDDE's 0.2296 is AlphaFold 3's 0.2215.** The two are
+as asymmetric as each other, and boltz2 is MORE symmetric than either. The
+"looks like a PDE" reading is not reproduced by the one statistic that can
+settle it.
+
+🔴 **WHAT IS REAL IS THE RANGE, AND IT IS THE MODEL BEING CONFIDENT.** OpenDDE's
+PAE averages 4.7 where every other model is 9.7, tops out at 17 against 22-27,
+and has half their spread - so on the shared 0-32 scale every panel uses it
+renders washed out, low-contrast, uniformly confident. That is what "different"
+is seeing. It is consistent with the other two numbers from the same fold rather
+than at odds with them: **pLDDT 87.2 against 67.5 and pTM 0.69 against 0.37**,
+the most confident model of the four by a wide margin, at zero disordered
+fraction. A model twice as confident reporting half the aligned error is the
+three scores agreeing, not a defect.
+
+The scale is deliberately NOT autoscaled per fold: 0-32 is the AF3 server's own
+and is what makes two models' panels comparable. Autoscaling would make
+OpenDDE's picture look like everyone else's by destroying the only thing that
+distinguishes them.
+
+### What was checked to get there, since two of the three steps had no gate
+
+The head's ARITHMETIC was already oracle-exact (`full_pae` 8.46e-7 on the A100,
+9.11e-7 on the M2). The other two steps were not obviously covered, and the
+suspicion was specifically that OpenDDE's second token space had leaked into
+the picture - its confidence head runs on the STRUCTURAL tokens, and a panel
+drawing 130 subtokens for 68 residues would look exactly "weird".
+
+- **It does not leak.** `fold.js` reduces to residue tokens before anything
+  draws: `pae[i*n+j] = raw.pae[rep[i]*n + rep[j]]`.
+- **And that reduction is the reference's own.** af3-any-model's
+  `_structural_to_residue` does `jnp.take(jnp.take(arr, rep, 1), rep, 2)` with
+  `rep = book['residue_rep_token']` - the same gather. Its docstring is honest
+  that this is **a CHOICE and not a reconstruction**: "A residue has several
+  structural subtokens and PAE is a token-PAIR quantity, so we read it at the
+  residue's representative subtoken (its first). Nothing reconstructs a
+  per-residue PAE from several subtoken rows." The reference gathers the LOGITS
+  and takes the bin expectation after, where this port takes the expectation
+  first and gathers after - identical, because the expectation is elementwise
+  per pair and commutes with a selection of rows and columns.
+- **And `rep` itself is compared to the reference's**, which was the part that
+  looked ungated: `check-batch-fields.js` maps `residueRepToken` to
+  `structbook/residue_rep_token`, and `npm run test:batch` covers opendde on
+  **two** targets - 109 fields, EXACT on both - the second being the GOL+SEP3
+  one where the two token spaces actually diverge. On plain 6MRR `rep` is the
+  identity and proves nothing, which is why the second target is what matters.
+
+🔴 **AND THE HEAD'S ORACLE CANNOT SEE ANY OF THAT, WHICH IS WORTH KNOWING
+RATHER THAN ASSUMING.** `dump_af3_opendde_confidence.py` synthesises
+`atom_to_token_idx`/`atom_to_tokatom_idx` at a fixed slot count - its own header
+says so - so its `full_pae` is 68x68 with the structural space equal to the
+residue one. The head is exact and the oracle is silent about the layout around
+it; the batch gate is what covers that half.
