@@ -124,6 +124,7 @@ const inputs = {
   repAtom: Int32Array.from(stage("in.distogram_atom_idx")),
   atomToToken: Int32Array.from(stage("in.atom_to_token")),
   tokenMask: stage("in.token_attention_mask"),
+  asymId: Int32Array.from(stage("in.asym_id")),
   atomMask: stage("in.atom_attention_mask"),
 };
 
@@ -138,6 +139,8 @@ const arms = [
   ["out.plddt_ca", got.plddtCa],
   ["out.pae_logits", got.paeLogits],
   ["out.pae", got.pae],
+  ["out.ptm", Float32Array.of(got.ptm)],
+  ["out.iptm", Float32Array.of(got.iptm)],
 ];
 let failures = 0;
 const results = [];

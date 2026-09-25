@@ -26,7 +26,7 @@
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { Esmfold2TrunkGpu } from "./trunk-webgpu.js";
-import { categoricalMean } from "./confidence-reference.js";
+import { categoricalMean, tmScores } from "./confidence-reference.js";
 import { layerNorm, linear } from "../af3/trunk/pairformer-reference.js";
 
 const GRID_WIDTH = 32_768;
@@ -530,6 +530,9 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
     total += input.atomMask[atom];
   }
   const pae = categoricalMean(readouts.paeLogits, tokens * tokens, weights.paeBins, 0, 32);
+  const asymId = input.asymId ?? new Int32Array(tokens);
+  const tm = tmScores(readouts.paeLogits, input.tokenMask, asymId, tokens, weights.paeBins);
   return { plddt, plddtPerAtom, plddtCa, complexPlddt: weighted / (total + 1e-8),
-           pae, paeLogits: readouts.paeLogits, single: readouts.single };
+           pae, paeLogits: readouts.paeLogits, single: readouts.single,
+           ptm: tm.ptm, iptm: tm.iptm };
 }

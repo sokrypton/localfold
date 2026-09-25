@@ -73,6 +73,12 @@ def main() -> int:
     parser.add_argument('--pdb', default=str(ROOT / 'tools' / 'fixtures' / '6mrr-crystal.pdb'))
     parser.add_argument('--tokens', type=int, default=0, help='0 means every residue in the PDB')
     parser.add_argument('--seed', type=int, default=0)
+    # 🔴 WITHOUT THIS THE ipTM ARM CANNOT FAIL. A monomer has no inter-chain
+    # pair, so their `iptm` is 0 and any port returning 0 agrees with it - a
+    # gate that passes by having nothing to compare. `--split N` puts tokens
+    # from N on a second `asym_id`, which is the only thing ipTM reads.
+    parser.add_argument('--split', type=int, default=0,
+                        help='first token of a second chain; 0 means one chain')
     parser.add_argument('--out', default=str(ROOT / 'oracle-dumps' /
                                              'esmfold2-confidence-600.json'))
     arguments = parser.parse_args()
@@ -124,7 +130,8 @@ def main() -> int:
         'token_attention_mask': torch.ones(1, tokens, dtype=torch.long),
         'atom_to_token': torch.tensor(atom_to_token).unsqueeze(0),
         'atom_attention_mask': torch.ones(1, atoms_total, dtype=torch.long),
-        'asym_id': torch.zeros(1, tokens, dtype=torch.long),
+        'asym_id': (torch.arange(tokens) >= arguments.split).long().unsqueeze(0)
+                   if arguments.split else torch.zeros(1, tokens, dtype=torch.long),
         'mol_type': torch.zeros(1, tokens, dtype=torch.long),
     }
     with torch.no_grad():
@@ -149,6 +156,7 @@ def main() -> int:
     target.write_text(json.dumps({
         'model': 'esmfold2-confidence', 'tokens': tokens, 'atoms': atoms_total,
         'pdb': pathlib.Path(arguments.pdb).name, 'seed': arguments.seed,
+        'split': arguments.split,
         'dPair': d_pair, 'dSingle': config.d_single, 'dInputs': d_inputs,
         'stages': stages}))
     print('wrote %s (%.1f MiB)' % (target, target.stat().st_size / 2 ** 20))

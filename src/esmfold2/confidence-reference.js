@@ -54,6 +54,61 @@ export function categoricalMean(logits, rows, bins, start, end) {
   return out;
 }
 
+
+/**
+ * pTM and ipTM off the PAE logits, their formula.
+ *
+ * 🔴 `d0` IS COMPUTED FROM THE LIVE TOKEN COUNT AND CLAMPED AT 19, and it is
+ * the whole scale of the answer: `1.24 * (max(n, 19) - 15)^(1/3) - 1.8`, so a
+ * caller that passed the padded length instead would return a confidently
+ * wrong number on every short chain. The row expectation is MAXIMISED over i,
+ * not averaged - pTM is the best alignment frame, not the mean one.
+ *
+ * ipTM uses the same expectation over the pairs whose `asymId` DIFFER, so a
+ * monomer's is zero by construction rather than by a special case.
+ */
+export function tmScores(paeLogits, tokenMask, asymId, tokens, bins) {
+  const width = 32 / bins;
+  let live = 0;
+  for (let token = 0; token < tokens; token += 1) live += tokenMask[token] > 0.5 ? 1 : 0;
+  const d0 = 1.24 * Math.cbrt(Math.max(live, 19) - 15) - 1.8;
+  const perBin = new Float32Array(bins);
+  for (let bin = 0; bin < bins; bin += 1) {
+    const centre = width * (bin + 0.5);
+    perBin[bin] = 1 / (1 + (centre / d0) ** 2);
+  }
+  let ptm = -Infinity;
+  let iptm = -Infinity;
+  for (let i = 0; i < tokens; i += 1) {
+    let sum = 0;
+    let count = 0;
+    let interSum = 0;
+    let interCount = 0;
+    for (let j = 0; j < tokens; j += 1) {
+      const at = (i * tokens + j) * bins;
+      let top = -Infinity;
+      for (let bin = 0; bin < bins; bin += 1) top = Math.max(top, paeLogits[at + bin]);
+      let total = 0;
+      let weighted = 0;
+      for (let bin = 0; bin < bins; bin += 1) {
+        const weight = Math.exp(paeLogits[at + bin] - top);
+        total += weight;
+        weighted += weight * perBin[bin];
+      }
+      const expected = weighted / total;
+      const pair = (tokenMask[i] > 0.5 ? 1 : 0) * (tokenMask[j] > 0.5 ? 1 : 0);
+      sum += expected * pair;
+      count += pair;
+      const inter = pair * (asymId[i] !== asymId[j] ? 1 : 0);
+      interSum += expected * inter;
+      interCount += inter;
+    }
+    ptm = Math.max(ptm, sum / (count + 1e-8));
+    iptm = Math.max(iptm, interSum / (interCount + 1e-8));
+  }
+  return { ptm, iptm };
+}
+
 /** Row-attention pooling: a scalar per pair, a masked softmax along j, then 256 -> 384. */
 export function singleFromPair(pair, tokenMask, tokens, pairChannels, singleChannels, weights) {
   const scores = linear(pair, tokens * tokens, pairChannels, 1, weights.poolingAttention);
@@ -223,7 +278,9 @@ export function esmfold2Confidence(inputs, weights) {
   const paeLogits = linear(pair, tokens * tokens, dPair, paeBins, weights.pae);
   const pae = categoricalMean(paeLogits, tokens * tokens, paeBins, 0, 32);
 
-  return { initial, pair, single: pooled, distances, plddtLogits, plddtPerAtom, plddt, plddtCa,
+  const asymId = inputs.asymId ?? new Int32Array(tokens);
+  const tm = tmScores(paeLogits, inputs.tokenMask, asymId, tokens, paeBins);
+  return { initial, pair, single: pooled, distances, ptm: tm.ptm, iptm: tm.iptm, plddtLogits, plddtPerAtom, plddt, plddtCa,
            complexPlddt: weighted / (total + 1e-8), paeLogits, pae };
 }
 

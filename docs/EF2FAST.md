@@ -3060,6 +3060,7 @@ the file, 300M 4/4). Nobody re-downloads a trunk and no structure changes.
 | host reference vs THEIR module | 2.4e-7 to 8.7e-7 on six arms, both checkpoints |
 | device vs host | pair init **1.85e-7**; after the blocks 8.4e-4, which is the trunk stack's own f16 |
 | on a real fold | pLDDT 57.6, PAE mean 7.64 **max 25.64**, asymmetry **0.479** |
+| pTM / ipTM | 3.3e-7 and **5.6e-7**, the second on a two-chain dump |
 
 The last row is the one the oracle could not give: its `z` is seeded normals, so
 its PAE sits at 16.1 - what a uniform 64-bin softmax over [0,32] returns. On a
@@ -3077,6 +3078,15 @@ Measured on the same target, against the f32 oracle:
 
 Today's shipped `ef2-fast-600m` is 123 MiB, so the head is +5 MiB quantised or
 +28 MiB exact.
+
+And what that 5% is worth on a real fold, which is the number to judge it by:
+
+| | pLDDT | PAE mean | PAE max |
+|---|---:|---:|---:|
+| head f32 | 57.61 | 7.64 | 25.64 |
+| head int5 | 55.71 | 7.60 | 25.14 |
+
+Two points of pLDDT and half a percent of PAE. int5 is what ships.
 
 🔴 **AND THE THREE TENSORS THAT LOOK LIKE THE CULPRITS ARE NOT.** The guess was
 the 128-row `distanceEmbedding` lookup, the `[23, 384, 50]` pLDDT einsum and the
@@ -3098,6 +3108,12 @@ the other way round and passed throughout while the fold died three files away.
 
 🔴 **THE FIRST KERNEL BOUND TEN STORAGE BUFFERS** against WebGPU's floor of 8;
 this A100 offers 16 and would have shipped it.
+
+🔴 **AND THE ipTM ARM COULD NOT FAIL UNTIL THE DUMP HAD TWO CHAINS.** A monomer
+has no inter-chain pair, so their `iptm` is 0 and any port returning 0 agrees
+with it perfectly - which is what the first run of that arm did. `--split N`
+puts the tokens from N on a second `asym_id`; ipTM then reads 0.266, the port
+matches at 5.6e-7, and counting every pair as inter-chain fails it at 2.35e-2.
 
 🔴 **AND THE PRECISION ARMS MOVE NOTHING ON THE BLOCKS.** `--staged=f32
 --accumulate=f32` is byte-identical at 8.37e-4 with `precision` confirming both
