@@ -3410,3 +3410,53 @@ builds its own call from the argument list THIS PORT passes. What found it was
 running THEIR pipeline end to end, which chooses its own arguments, and then
 diffing the two folds rather than the two heads: the structures agreed to
 0.358 A while the confidences did not, and that gap is what named the stage.
+
+#### The remaining 3.5 pLDDT is the INPUTS EMBEDDER, not the sampler
+
+With `pairBias` wired the fold reads 85.67 against native's 89.15, and the
+guess written down at the time - that the residual was the sampler, 64 steps
+against 50, the two folds 0.358 A apart - is **wrong**. Their head on OUR
+inputs gives 85.676 and on THEIR OWN inputs gives 89.15, so the whole residual
+is in what the head is handed. Both sets were captured, so they can be diffed
+rather than argued about. 59 tokens, 448 atoms on both sides:
+
+| input | relRMS, ours against native |
+|---|---:|
+| `relative_position_encoding` (our `pairBias`) | **1.9e-6** |
+| `distogram_atom_idx`, `atom_to_token`, `asym_id` | **identical** |
+| `z`, the trunk pair | 1.96e-1 |
+| `s_inputs` | 2.59e-1 |
+
+🔴 **AND `s_inputs` SPLITS CLEANLY DOWN ITS OWN LAYOUT.** It is
+`assembleSingleInputs`: 384 channels of `tokenAct`, then the aatype one-hot,
+the profile and the deletion mean. Per 64-channel block:
+
+| channels | ours abs mean | native abs mean | relRMS |
+|---|---:|---:|---:|
+| 0-63 | 0.06914 | 0.07058 | 5.5e-2 |
+| 64-127 | 0.06895 | 0.06317 | 1.1e-1 |
+| 128-191 | 0.01718 | 0.01719 | 8.4e-2 |
+| 192-255 | 0.00581 | 0.00742 | 4.1e-1 |
+| 256-319 | 0.00983 | 0.03141 | **9.2e-1** |
+| 320-383 | 0.00510 | 0.01430 | **8.6e-1** |
+| **384-450** | — | — | **0.0, exact** |
+
+The FEATURISER's own 67 channels are exact to the bit. Everything wrong is in
+the 384 that `runInputsEmbedder` produces - overall relRMS 0.264, correlation
+0.964, and our magnitude **0.86** of theirs and falling to a third of it in the
+top two blocks. That is the atom encoder, and it involves no language model, so
+the ESM-C tower and its int3 quantisation are both ruled out by construction
+(and separately by measurement: the f32 tower moves the fold 0.8 pLDDT).
+
+🔴 **AND THIS IS WHY THE STAGE WAS NEVER CAUGHT: ITS ORACLE HAS NEVER RUN
+HERE.** `check-esmfold2-trunk-gpu.js` wants `oracle-dumps/esmfold2-trunk-*.json`
+and this file has recorded for months that the dump "needs torch, which does not
+fit on this box". That is no longer true - `~/venv_ef2_t5` runs their model end
+to end, which is how every number above was taken - so the embedder and trunk
+dumps can finally be made and those two checkers can finally run. That is the
+next thing to do, and it is now cheap.
+
+A correlation of 0.964 with a 0.86 magnitude ratio is the shape of a missing or
+under-weighted additive term rather than a wrong layout - a wrong layout does
+not correlate at 0.96 - so the place to look is what the atom encoder adds into
+its token pooling, not how it indexes.
