@@ -382,6 +382,9 @@ export async function main(device, args = []) {
     },
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     confidenceWeights,
+    // 🔴 THE HEAD'S INPUTS, FOR check-esmfold2-confidence-real.py. Only when
+    // asked: the pair is tokens^2 x 256 floats and this returns it as JSON.
+    returnConfidenceInputs: option(args, "confidence-inputs", "") !== "",
     tower: runTower,
     distogramLogits: contactSweep,
     // ...measured and not drawn; see src/esmfold2/aligned-error.js.
@@ -937,6 +940,23 @@ export async function main(device, args = []) {
         paeMin: Number(Math.min(...c.pae).toFixed(3)),
         paeMax: Number(Math.max(...c.pae).toFixed(3)),
         paeAsymmetry: Number((asym / c.pae.length / mean(c.pae)).toFixed(6)),
+        ptm: c.ptm === undefined ? undefined : Number(c.ptm.toFixed(6)),
+        iptm: c.iptm === undefined ? undefined : Number(c.iptm.toFixed(6)),
+        // ...the arrays themselves only when the oracle arm asked for them.
+        ...(c.inputs === undefined ? {} : {
+          plddt: Array.from(c.plddt, (v) => Number(v.toFixed(6))),
+          paeAll: Array.from(c.pae, (v) => Number(v.toFixed(4))),
+          inputs: {
+            tokens: c.inputs.tokens, atoms: c.inputs.atoms,
+            pair: Array.from(c.inputs.pair, (v) => Number(v.toFixed(5))),
+            sInputs: Array.from(c.inputs.sInputs, (v) => Number(v.toFixed(5))),
+            coordinates: Array.from(c.inputs.coordinates, (v) => Number(v.toFixed(4))),
+            repAtom: Array.from(c.inputs.repAtom),
+            atomToToken: Array.from(c.inputs.atomToToken),
+            atomMask: Array.from(c.inputs.atomMask),
+            asymId: Array.from(c.inputs.asymId),
+          },
+        }),
       };
     })(),
     sequence, sampler, seed, trunkPrecision, trunkWeights, repeats,

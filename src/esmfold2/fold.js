@@ -865,6 +865,18 @@ export async function foldEsmfold2(device, options) {
         // every fold this head was gated on.
         asymId: features.asymId,
       }, options.confidenceWeights, { allocator });
+      // 🔴 THE HEAD'S OWN INPUTS, FOR THE ARM THAT RUNS SYNTHYRA'S MODULE ON A
+      // REAL TRUNK. `dump_esmfold2_confidence.py` gates the head's ARITHMETIC
+      // on seeded normals - its own header says a run on a real trunk's pair is
+      // a second arm "that wants our own fold to dump one" - so this is that
+      // dump. Off unless asked: the pair alone is tokens^2 x 256 floats.
+      if (options.returnConfidenceInputs === true) {
+        confidence = { ...confidence, inputs: {
+          tokens, atoms, pair: confidencePair, sInputs, coordinates: x,
+          repAtom: rep, atomToToken: features.atomToToken,
+          atomMask: features.mask, asymId: features.asymId,
+        } };
+      }
     }
 
     const memory = allocator.snapshot();
