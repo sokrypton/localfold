@@ -3736,3 +3736,48 @@ untested summand is the LANGUAGE-MODEL PAIR, which no oracle here has ever
 compared - `--confidence-inputs=1` now returns `zInit`, `atomConditioning` and
 `atomActivation` so the next person can bisect z_init's four addends the way
 the atom encoder was bisected.
+
+### FOUND: the last of the gap is the ESM-C tower's int3, not the conformer
+
+`z_init` has four addends and every one is now measured. Their own
+`z_init_1`/`z_init_2` applied to each side's `s_inputs`, their captured
+`relative_position_encoding` and `token_bonds_encoding`, and the LANGUAGE PAIR
+recovered as what is left - so it is measured rather than assumed:
+
+| addend of `z_init` | \|ours\| | \|native\| | relRMS | share of \|z_init\| |
+|---|---:|---:|---:|---:|
+| `s_inputs` projections | 2.167 | 2.173 | **4.12e-3** | 0.59 |
+| `relPos + bonds` | 1.069 | 1.069 | **1.88e-6** | 0.29 |
+| **language pair** | 1.945 | 1.976 | **2.81e-1** | 0.54 |
+| z_init | 3.607 | 3.667 | 8.48e-2 | — |
+
+🔴 **AND IT IS THE TOWER'S QUANTISATION.** ESM-C ships int3 at group 128 here.
+Swept, everything else held:
+
+| ESM-C tower | size | language pair | z_init | pLDDT | pTM | CA-RMSD vs native |
+|---|---:|---:|---:|---:|---:|---:|
+| **int3 (shipped)** | 224 MiB | 2.81e-1 | 8.48e-2 | 88.206 | 0.8178 | 0.336 A |
+| int4 | 293 MiB | 1.44e-1 | 4.38e-2 | 88.722 | 0.8243 | 0.443 A |
+| int5 | 361 MiB | 1.06e-1 | 3.26e-2 | **89.055** | 0.8283 | 0.407 A |
+| float32 | 2.2 GiB | 9.31e-2 | 2.90e-2 | 89.087 | 0.8290 | 0.393 A |
+| native | — | — | — | 89.150 | 0.8304 | — |
+
+With a float32 tower this port is **0.06 pLDDT and 0.0014 pTM from native**, and
+int5 captures all but 0.03 of that for a sixth of the bytes.
+
+🔴 **RETRACTED: "0.94 pLDDT of it is the `ref_pos` conformer floor".** It is
+not. The conformer difference is real and is worth ~2e-2 on `tokenAct`, but the
+distance to native was the TOWER, and a float32 tower closes it without
+touching the conformer. The floor was assumed from the one difference that had
+been measured rather than from the one that had not.
+
+🔴 **AND THE STRUCTURE CANNOT SEE ANY OF IT: 0.336 / 0.443 / 0.407 / 0.393 A,
+with no ordering.** That is why int3 was the right call when it was made -
+docs record it "landing on float32's median crystal" - and why the cost was
+invisible: **there was no confidence head to charge it to**. A compression
+chosen on structure was paying for itself in a score that did not exist yet.
+
+**Not changed.** int3 -> int5 is +137 MiB on a 346 MiB family, for +0.85 pLDDT
+of confidence accuracy measured on ONE sequence. That is a product decision and
+it wants a sweep over targets first; `model-esmc-600m-int4` and `-int5` are
+built and sitting beside the int3 for whoever runs it.
