@@ -25,6 +25,9 @@
  */
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { Esmfold2TrunkGpu } from "./trunk-webgpu.js";
+import { categoricalMean } from "./confidence-reference.js";
+import { layerNorm, linear } from "../af3/trunk/pairformer-reference.js";
 
 const GRID_WIDTH = 32_768;
 const LANES = 64;
@@ -123,6 +126,43 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     out[row * CHANNELS + c] = normed + rows[i * CHANNELS + c] + cols[j * CHANNELS + c]
       + extra[row * CHANNELS + c] + embedding[bucket * CHANNELS + c];
   }
+}`;
+}
+
+/**
+ * `out[i, j, o] = sum_c left[i, c] * right[j, c] * weight[c, o]`.
+ *
+ * 🔴 THE RANK-1 PRODUCT IS NEVER MATERIALISED. Their line reads
+ * `s_to_z_prod_out(in1[:, :, None, :] * in2[:, None, :, :])`, which as written
+ * is a `tokens^2 x 256` intermediate - 92 MiB at 300 tokens, on the host, for
+ * a tensor every element of which is read exactly once. Contracting it inside
+ * the projection costs nothing extra: the two operands are `tokens x 256`.
+ */
+export function createRankOneProjectShader({ tokens, channels, outChannels }) {
+  return `
+const TOKENS: u32 = ${tokens}u;
+const CHANNELS: u32 = ${channels}u;
+const OUT: u32 = ${outChannels}u;
+const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
+
+@group(0) @binding(0) var<storage, read> left: array<f32>;
+@group(0) @binding(1) var<storage, read> right: array<f32>;
+@group(0) @binding(2) var<storage, read> weight: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= TOKENS * TOKENS * OUT) { return; }
+  let row = slot / OUT;
+  let o = slot % OUT;
+  let i = row / TOKENS;
+  let j = row % TOKENS;
+  var sum = 0.0;
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    sum += left[i * CHANNELS + c] * right[j * CHANNELS + c] * weight[c * OUT + o];
+  }
+  out[slot] = sum;
 }`;
 }
 
@@ -243,16 +283,24 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
   const keep = (a) => { allocations.push(a); return a; };
   try {
     const project = await pipelines.get(
-      `ef2-conf-project:${pairs}:${channels}:${channels}`,
-      createProjectRowsShader({ rows: pairs, inChannels: channels, outChannels: channels }));
+      `ef2-conf-rank1:${tokens}:${channels}:${channels}`,
+      createRankOneProjectShader({ tokens, channels, outChannels: channels }));
     const init = await pipelines.get(
       `ef2-conf-pair-init:${tokens}:${channels}:${weights.boundaries.length}`,
       createPairInitShader({ tokens, channels, edges: weights.boundaries.length }));
 
-    const product = keep(allocator.upload("ef2-conf.product", input.product, storage()));
+    const left = keep(allocator.upload("ef2-conf.left", input.left, storage()));
+    const right = keep(allocator.upload("ef2-conf.right", input.right, storage()));
     const projected = keep(allocator.allocate("ef2-conf.projected", pairs * channels * 4,
                                               storage()));
-    const pair = keep(allocator.upload("ef2-conf.pair", input.pair, storage()));
+    // 🔴 THE CALLER'S BUFFER WHEN IT HAS ONE. In a real fold the trunk's pair
+    // never leaves the device - `fold.js` holds it as an allocation - so
+    // uploading a host copy would be a readback and an upload of
+    // `tokens^2 x 256` for a tensor already sitting where it is needed. The
+    // checker passes a Float32Array because its pair comes out of a dump.
+    const pair = input.pairBuffer !== undefined
+      ? { buffer: input.pairBuffer }
+      : keep(allocator.upload("ef2-conf.pair", input.pair, storage()));
     const out = keep(allocator.allocate("ef2-conf.init", pairs * channels * 4,
                                         storage() | GPUBufferUsage.COPY_SRC));
     const up = (name, values) => keep(allocator.upload(`ef2-conf.${name}`, values, storage()));
@@ -267,7 +315,8 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
     const encoder = device.createCommandEncoder({ label: "ef2-confidence-pair-init" });
     let pass = encoder.beginComputePass({ label: "ef2-conf.project" });
     pass.setPipeline(project);
-    pass.setBindGroup(0, bind(project, [product, up("prodOut", weights.sToZProdOut), projected]));
+    pass.setBindGroup(0, bind(project,
+      [left, right, up("prodOut", weights.sToZProdOut), projected]));
     const cells = pairs * channels;
     pass.dispatchWorkgroups(Math.min(Math.ceil(cells / 64), GRID_WIDTH),
                             Math.ceil(Math.ceil(cells / 64) / GRID_WIDTH));
@@ -386,4 +435,101 @@ export async function esmfold2ConfidenceReadouts(device, input, weights, options
   } finally {
     for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
   }
+}
+
+/**
+ * The whole head for a fold: pair in, confidence out.
+ *
+ * 🔴 THE PER-TOKEN AND PER-ATOM HALVES STAY ON THE HOST ON PURPOSE. A head
+ * runs once a fold, not once a sampler step, and the four projections of
+ * `s_inputs` are `tokens x 451`, the pLDDT einsum `atoms x 384 x 50` and both
+ * categorical means are elementwise - tens of milliseconds where the pair-shaped
+ * work is seconds. What had to move is everything shaped `tokens^2 x 256`.
+ */
+export async function esmfold2ConfidenceFold(device, input, weights, options = {}) {
+  const { tokens, atoms } = input;
+  const dPair = weights.pairChannels;
+  const dSingle = weights.singleChannels;
+  const dInputs = weights.singleInputs;
+  const allocator = options.allocator ?? new GpuBufferAllocator(device);
+
+  const normed = layerNorm(input.sInputs, tokens, dInputs,
+                           weights.sInputsNormScale, weights.sInputsNormOffset);
+  const rows = linear(normed, tokens, dInputs, dPair, weights.sToZ);
+  const cols = linear(normed, tokens, dInputs, dPair, weights.sToZTranspose);
+  const left = linear(normed, tokens, dInputs, dPair, weights.sToZProdIn1);
+  const right = linear(normed, tokens, dInputs, dPair, weights.sToZProdIn2);
+  const repCoordinates = new Float32Array(tokens * 3);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      repCoordinates[token * 3 + axis] = input.coordinates[input.repAtom[token] * 3 + axis];
+    }
+  }
+
+  const initial = await esmfold2ConfidencePairInit(device, {
+    tokens, pair: input.pair, pairBuffer: input.pairBuffer,
+    rows, cols, left, right, repCoordinates,
+  }, weights, { allocator });
+
+  const pairMask = new Float32Array(tokens * tokens);
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      pairMask[i * tokens + j] = input.tokenMask[i] * input.tokenMask[j];
+    }
+  }
+  const stack = await new Esmfold2TrunkGpu(device, { allocator }).run(
+    { pair: Float32Array.from(initial), pairMask }, weights.blocks,
+    { n: tokens, channels: dPair });
+  // See confidence-reference.js: their line adds the stack's input a second time.
+  const finished = Float32Array.from(stack.pair);
+  for (let index = 0; index < finished.length; index += 1) finished[index] += initial[index];
+
+  const readouts = await esmfold2ConfidenceReadouts(device, {
+    tokens, pair: finished, tokenMask: input.tokenMask,
+  }, weights, { allocator });
+
+  const slots = weights.maxAtomsPerToken;
+  const bins = weights.plddtBins;
+  const gathered = new Float32Array(atoms * dSingle);
+  for (let atom = 0; atom < atoms; atom += 1) {
+    const from = input.atomToToken[atom] * dSingle;
+    for (let c = 0; c < dSingle; c += 1) gathered[atom * dSingle + c] = readouts.single[from + c];
+  }
+  const normedAtoms = layerNorm(gathered, atoms, dSingle,
+                                weights.plddtNormScale, weights.plddtNormOffset);
+  const plddtLogits = new Float32Array(atoms * bins);
+  let slot = 0;
+  for (let atom = 0; atom < atoms; atom += 1) {
+    if (atom > 0 && input.atomToToken[atom] !== input.atomToToken[atom - 1]) slot = 0;
+    const table = Math.min(slot, slots - 1) * dSingle * bins;
+    for (let bin = 0; bin < bins; bin += 1) {
+      let sum = 0;
+      for (let c = 0; c < dSingle; c += 1) {
+        sum += normedAtoms[atom * dSingle + c] * weights.plddtWeight[table + c * bins + bin];
+      }
+      plddtLogits[atom * bins + bin] = sum;
+    }
+    slot += 1;
+  }
+  const plddtPerAtom = categoricalMean(plddtLogits, atoms, bins, 0, 1);
+  const sum = new Float32Array(tokens);
+  const count = new Float32Array(tokens);
+  for (let atom = 0; atom < atoms; atom += 1) {
+    const token = input.atomToToken[atom];
+    sum[token] += plddtPerAtom[atom] * input.atomMask[atom];
+    count[token] += input.atomMask[atom];
+  }
+  const plddt = new Float32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) plddt[token] = sum[token] / Math.max(count[token], 1e-6);
+  const plddtCa = new Float32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) plddtCa[token] = plddtPerAtom[input.repAtom[token]];
+  let weighted = 0;
+  let total = 0;
+  for (let atom = 0; atom < atoms; atom += 1) {
+    weighted += plddtPerAtom[atom] * input.atomMask[atom];
+    total += input.atomMask[atom];
+  }
+  const pae = categoricalMean(readouts.paeLogits, tokens * tokens, weights.paeBins, 0, 32);
+  return { plddt, plddtPerAtom, plddtCa, complexPlddt: weighted / (total + 1e-8),
+           pae, paeLogits: readouts.paeLogits, single: readouts.single };
 }

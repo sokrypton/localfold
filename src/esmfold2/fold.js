@@ -33,6 +33,7 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { yieldToBrowser } from "../runtime/yield.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { Esmfold2TrunkGpu } from "./trunk-webgpu.js";
+import { esmfold2ConfidenceFold } from "./confidence-webgpu.js";
 import { Esmfold2DenoiserGpu, atomConditioning } from "./diffusion-webgpu.js";
 import { buildRope } from "./atom-transformer-reference.js";
 import { runInputsEmbedder } from "./atom-transformer-webgpu.js";
@@ -699,6 +700,27 @@ export async function foldEsmfold2(device, options) {
       })(),
     };
 
+    // 🔴 THE CONFIDENCE HEAD READS THE TRUNK'S PAIR AND THE SAMPLER'S
+    // COORDINATES, and those two do not exist at the same moment. The pair's
+    // allocation is gone by the time the structure is - binding it at the end
+    // submits against a destroyed buffer, which is the allocator doing its job
+    // - so the head's copy is taken HERE, beside the `wantReusable` one above
+    // and by the same route. It costs `tokens^2 x 256` of traffic once a fold,
+    // and only when the bundle carries a head at all.
+    const confidencePair = options.confidenceWeights == null ? undefined
+      : await (async () => {
+        const back = allocator.allocate("esmfold2.confidence-pair", pairs * channels * 4,
+          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+        const encoder = device.createCommandEncoder({ label: "esmfold2.confidence-pair" });
+        encoder.copyBufferToBuffer(pair.buffer, 0, back.buffer, 0, pairs * channels * 4);
+        device.queue.submit([encoder.finish()]);
+        await back.buffer.mapAsync(GPUMapMode.READ);
+        const copy = new Float32Array(back.buffer.getMappedRange().slice(0));
+        back.buffer.unmap();
+        back.release();
+        return copy;
+      })();
+
     // ---- the distogram, which is the trunk's one output besides the pair.
     // 🔴 IT RUNS BEFORE THE DIFFUSION MODULE ALLOCATES, not after the fold.
     // Its symmetrised copy of the pair is another 92 MiB at 300 tokens, and the
@@ -815,6 +837,27 @@ export async function foldEsmfold2(device, options) {
       await options.onStep?.({ step, total: levels.length, coordinates: x,
                                denoised, features, certainty: frameCertainty });
     }
+    // 🔴 THE HEAD RUNS BEFORE THE RELEASES, because it BINDS the trunk's own
+    // pair rather than a copy of it. Placed after them it submitted against a
+    // destroyed buffer - "[Buffer \"esmfold2.pair\"] used in submit while
+    // destroyed" - which is the allocator doing exactly what it should.
+    // 🔴 A REAL CONFIDENCE HEAD WHERE THE BUNDLE CARRIES ONE, and the certainty
+    // estimate where it does not. biohub's ESMFold2 has `confidence_head.enabled:
+    // false` and zero confidence tensors, which is what `alignedError` above
+    // exists for; Synthyra froze that trunk and trained a head on it, and a
+    // bundle exported with `--confidence` carries it. Both are returned, so a
+    // caller can prefer the real one and nothing that read the estimate breaks.
+    let confidence;
+    if (options.confidenceWeights != null) {
+      const rep = representativeAtoms(features, tokens);
+      confidence = await esmfold2ConfidenceFold(device, {
+        tokens, atoms, sInputs, pair: confidencePair, coordinates: x, repAtom: rep,
+        atomToToken: features.atomToToken,
+        atomMask: features.mask,
+        tokenMask: new Float32Array(tokens).fill(1),
+      }, options.confidenceWeights, { allocator });
+    }
+
     const memory = allocator.snapshot();
     denoiser.release();
     // ...the retained distogram is 46 MiB at 300 tokens and nothing reads it
@@ -846,7 +889,7 @@ export async function foldEsmfold2(device, options) {
 
     return {
       coordinates: x, features, sequence, tokens, atoms, sInputs, contacts, certainty,
-      interfaceCertainty, alignedError, reusable,
+      interfaceCertainty, alignedError, confidence, reusable,
       // ...so a caller can tell a fold that ran the trunk from one that did not.
       trunkReused: reuse !== undefined,
       lmMask: { fraction: maskFraction, masked: maskedTokens, of: lm.ids.length },

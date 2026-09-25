@@ -197,7 +197,13 @@ export async function confidenceHeadWeights(read, manifest) {
     ["plddtWeight", "confidence/plddtWeight"],
     ["pae", "confidence/pae"],
   ]);
-  return { ...flat, blocks, ...meta };
+  // 🔴 THE METADATA SPREADS FIRST, BECAUSE IT HAS A `blocks` OF ITS OWN. The
+  // manifest's `confidence.blocks` is the COUNT and this one is the array, so
+  // `{...flat, blocks, ...meta}` quietly replaced four blocks of weights with
+  // the integer 4 - and the checker, which happened to spread the other way
+  // round, passed throughout. The fold died in `compilePairTrack` reading
+  // `pairTransition` of undefined, three files from the cause.
+  return { ...meta, ...flat, blocks };
 }
 
 export async function featuriserWeights(read) {

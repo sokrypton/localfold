@@ -26,6 +26,7 @@ import { foldEsmfold2, SAMPLER_PRESETS } from "../../src/esmfold2/fold.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
+  confidenceHeadWeights,
 } from "../../src/esmfold2/weights.js";
 import { SHIM_PAIR_TENSORS } from "../../src/esmfold2/language-pair-webgpu.js";
 import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
@@ -272,6 +273,12 @@ export async function main(device, args = []) {
   for (let layer = 0; layer < M.blocks; layer += 1) {
     trunkBlocks.push(await trunkBlockWeights(fold.read, layer));
   }
+  // 🔴 ABSENT IS NOT AN ERROR. A bundle exported without `--confidence` is what
+  // biohub ships and what every EF2 number in these docs was taken on; the head
+  // is an addition, so this returns null and the fold keeps `alignedError`.
+  const confidenceWeights = await confidenceHeadWeights(fold.read, manifest);
+  {
+  }
   const trunkBlockMs = Math.round(performance.now() - trunkBlocksAt);
 
   // 🔴 THE TOWER STREAMS ITS BLOCKS AND THIS MUST NOT DEFEAT THAT. Reading all
@@ -374,6 +381,7 @@ export async function main(device, args = []) {
       }),
     },
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
+    confidenceWeights,
     tower: runTower,
     distogramLogits: contactSweep,
     // ...measured and not drawn; see src/esmfold2/aligned-error.js.
@@ -912,6 +920,25 @@ export async function main(device, args = []) {
   }
 
   return {
+    confidence: result.confidence === undefined ? undefined : (() => {
+      const c = result.confidence;
+      const mean = (v) => v.reduce((a, b) => a + b, 0) / v.length;
+      const n = Math.round(Math.sqrt(c.pae.length));
+      let asym = 0;
+      for (let i = 0; i < n; i += 1) {
+        for (let j = 0; j < n; j += 1) asym += Math.abs(c.pae[i * n + j] - c.pae[j * n + i]);
+      }
+      return {
+        meanPlddt: Number((mean(c.plddt) * 100).toFixed(3)),
+        minPlddt: Number((Math.min(...c.plddt) * 100).toFixed(2)),
+        maxPlddt: Number((Math.max(...c.plddt) * 100).toFixed(2)),
+        complexPlddt: Number((c.complexPlddt * 100).toFixed(3)),
+        paeMean: Number(mean(c.pae).toFixed(4)),
+        paeMin: Number(Math.min(...c.pae).toFixed(3)),
+        paeMax: Number(Math.max(...c.pae).toFixed(3)),
+        paeAsymmetry: Number((asym / c.pae.length / mean(c.pae)).toFixed(6)),
+      };
+    })(),
     sequence, sampler, seed, trunkPrecision, trunkWeights, repeats,
     contactSweep: sweep, certaintyByChain,
     lmMask: result.lmMask,

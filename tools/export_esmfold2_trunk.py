@@ -355,7 +355,13 @@ def main():
         'model': {'name': 'esmfold2-trunk', 'recycles': 0},
         'bundle': {'purpose': 'browser-inference', 'model': 'esmfold2-trunk',
                    'encoding': 'float32-le'},
-        'trunk': {'source': arguments.esmfold2, 'blocks': layers,
+        # 🔴 THE BASENAME, NOT THE PATH THE CALLER TYPED. `fold-esmfold2.js`
+        # matches this against the ESM-C shim's own model name - the shim is per
+        # model - so an export run as `--esmfold2 ../ef2/esmfold2-fast-600m`
+        # recorded a source no shim could ever equal and the bundle refused to
+        # fold with "the shim is per model", naming neither the path nor the
+        # cause.
+        'trunk': {'source': pathlib.Path(arguments.esmfold2).name, 'blocks': layers,
                   'pairChannels': int(channels), 'zeroedAttentionHeads': arguments.heads,
                   # 🔴 THE LAYOUT, IN THE ARTEFACT. A bundle that outlives a
                   # change to its exporter decodes cleanly into the wrong thing -

@@ -156,15 +156,6 @@ export async function main(device, args) {
   const cols = linear(normed, tokens, dInputs, dPair, weights.sToZTranspose);
   const left = linear(normed, tokens, dInputs, dPair, weights.sToZProdIn1);
   const right = linear(normed, tokens, dInputs, dPair, weights.sToZProdIn2);
-  const product = new Float32Array(tokens * tokens * dPair);
-  for (let i = 0; i < tokens; i += 1) {
-    for (let j = 0; j < tokens; j += 1) {
-      const into = (i * tokens + j) * dPair;
-      for (let c = 0; c < dPair; c += 1) {
-        product[into + c] = left[i * dPair + c] * right[j * dPair + c];
-      }
-    }
-  }
   const repCoordinates = new Float32Array(tokens * 3);
   for (let token = 0; token < tokens; token += 1) {
     for (let axis = 0; axis < 3; axis += 1) {
@@ -175,7 +166,7 @@ export async function main(device, args) {
   const allocator = new GpuBufferAllocator(device);
   const started = performance.now();
   const initial = await esmfold2ConfidencePairInit(device, {
-    tokens, pair: inputs.pair, rows, cols, product, repCoordinates,
+    tokens, pair: inputs.pair, rows, cols, left, right, repCoordinates,
   }, weights, { allocator });
 
   const pairMask = new Float32Array(tokens * tokens);
