@@ -3251,3 +3251,41 @@ The honest summary for a reader is that EF2-fast's pLDDT and pTM are good
 (Spearman 0.85 and 0.86 against lDDT and TM-score) and its PAE MAP should be
 read as a per-pair estimate rather than as the smooth domain picture AlphaFold's
 PAE gives.
+
+#### Three: that the representative atom is the wrong atom. It is not.
+
+The sharpest of the three, because the head's whole geometric input is
+`gather_rep_atom_coords(x_pred, distogram_atom_idx)` - one atom per token - so
+an index landing on N, or on a neighbour's atom, would scramble the distance
+embedding per residue and produce exactly a speckled map.
+
+🔴 **AND THE HEAD-AGAINST-HEAD COMPARISON IS STRUCTURALLY BLIND TO IT**, which
+is why it had to be checked separately. `check_esmfold2_confidence_real.py`
+feeds OUR `repAtom` to THEIR module, so a wrong index would be wrong on both
+sides and the two would agree to 1.4e-4 exactly as they do. Agreement between
+two runs over one input says nothing about the input. It is CLAUDE.md's "both
+sides read the same wrong tensor" at a seam nobody had pointed it at.
+
+Checked against the fold's own arrays, on ubiquitin's 40 residues:
+
+| | |
+|---|---|
+| rule, theirs | `names.get("CB", names.get("CA", fallback))` |
+| rule, ours | `beta >= 0 ? beta : alpha` - the same, and nucleic C4/C2 the same |
+| rep atoms whose `atomToToken` is not their own token | **0 of 40** |
+| rep atoms that are masked out | **0** |
+| consecutive rep-atom distance | median **5.43 A** (4.56-5.91) |
+| consecutive FIRST-atom distance, for contrast | 2.84 A |
+| offset of the rep within its token | **4** for 38 tokens, **1** for 2 |
+
+5.43 A is the CB-CB signature for consecutive residues; CA-CA would be 3.8 and
+the first atom (N) gives 2.84. And the two tokens taking offset 1 - the CA slot
+- are positions **9 and 34**, which are exactly the two GLYCINES in
+`MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQ`, the only residues with no CB. A
+mapping that is wrong does not land on the glycines.
+
+So the geometric input is right, and that is the third structural explanation
+for the roughness to be tested and fail - after the distance-map collapse and
+the doubled skip. Each one was plausible enough to have been written up as the
+cause. What survives is the reading the training recipe supports: a shallow
+head, 780 updates, and an objective whose every term is pointwise or global.
