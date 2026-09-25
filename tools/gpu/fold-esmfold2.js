@@ -956,6 +956,9 @@ export async function main(device, args = []) {
             atomMask: Array.from(c.inputs.atomMask),
             asymId: Array.from(c.inputs.asymId),
             pairBias: Array.from(c.inputs.pairBias, (v) => Number(v.toFixed(5))),
+            ...Object.fromEntries(["refPos", "refCharge", "refElement",
+              "refAtomNameChars", "refSpaceUid", "aatype", "profile",
+              "deletionMean"].map((k) => [k, Array.from(c.inputs[k])])),
           },
         }),
       };

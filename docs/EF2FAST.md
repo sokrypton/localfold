@@ -3460,3 +3460,56 @@ A correlation of 0.964 with a 0.86 magnitude ratio is the shape of a missing or
 under-weighted additive term rather than a wrong layout - a wrong layout does
 not correlate at 0.96 - so the place to look is what the atom encoder adds into
 its token pooling, not how it indexes.
+
+#### And it is the ATOM ENCODER itself, not the conformer
+
+The obvious reading of the block table above is `ref_pos`: this port draws its
+own conformer per residue instance, `check-esmfold2-featurise.js` says in its
+own header that this is the one feature that cannot match, and `ref_pos` feeds
+the atom encoder directly. That reading is wrong, and one run separates it.
+
+Their `InputsEmbedder` was run on OUR features - our `ref_pos`, our charges,
+our elements and name chars as the one-hots it wants, our atom-to-token map:
+
+| comparison, tokenAct channels 0-383 | relRMS |
+|---|---:|
+| ours vs **their encoder on OUR features** | **2.62e-1** |
+| ours vs native | 2.64e-1 |
+| **their encoder on our features** vs native | **2.07e-2** |
+
+🔴 **THEIR ENCODER ON OUR FEATURES IS WITHIN 2% OF NATIVE.** So everything this
+port feeds the encoder - the conformer included - is worth about 2e-2, and our
+own encoder is 2.6e-1 away on inputs that are byte for byte the ones their
+encoder just consumed. The conformer is not the explanation; `runInputsEmbedder`
+is wrong.
+
+🔴 **AND THE SEED BAND SAYS THE GAP IS REAL.** Native folds this sequence at
+pLDDT **89.15 / 89.18 / 89.18 / 89.17** over seeds 42, 1, 7 and 13, pTM 0.8302
+to 0.8304 - a band of 0.03. Our 85.67 is a hundred times that away, so there is
+nothing stochastic about it.
+
+What is now known, from the head backwards:
+
+| stage | status |
+|---|---|
+| confidence head arithmetic | exact, 2.35e-5 on pLDDT against their module |
+| `pairBias` (rel-pos + token bonds) | exact, 1.9e-6 |
+| `distogram_atom_idx`, `atom_to_token`, `asym_id` | identical |
+| featuriser's own s_inputs channels (384-450) | exact to the bit |
+| everything the atom encoder is FED, conformer included | ~2e-2 |
+| **`runInputsEmbedder`, channels 0-383** | **2.6e-1 - the open defect** |
+| trunk pair `z`, downstream of it | 1.96e-1 |
+
+The signature to hunt with: correlation 0.964 and a magnitude ratio of 0.86
+overall, falling to about a third of native's in channels 256-383 while
+0-127 are within 5-11%. A wrong layout does not correlate at 0.96, and a
+uniformly wrong projection does not spare the first 128 channels - so the thing
+to look for is a term that grows across the encoder's blocks, or a pooling that
+loses weight the deeper into the token representation it goes.
+
+🔴 **AND THE ORACLE FOR THIS STAGE CAN BE BUILT NOW.** `~/venv_ef2_t5` runs
+their model, and `emb = m.inputs_embedder` is callable on arrays this port
+dumps - `fold-esmfold2.js --confidence-inputs=1` now carries `refPos`,
+`refCharge`, `refElement`, `refAtomNameChars`, `refSpaceUid`, `aatype`,
+`profile` and `deletionMean` for exactly this. Their encoder also returns its
+intermediates, so the next step is per-block rather than end-to-end.

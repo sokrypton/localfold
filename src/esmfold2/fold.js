@@ -936,6 +936,17 @@ export async function foldEsmfold2(device, options) {
           repAtom: rep, atomToToken: features.atomToToken,
           atomMask: features.mask, asymId: features.asymId,
           pairBias: confidenceRelPos,
+          // ...and the ATOM ENCODER's own inputs, so their InputsEmbedder can
+          // be run on ours and the encoder separated from what it is fed. The
+          // featuriser's own channels already match to the bit; `ref_pos` is
+          // the one feature that cannot, because each side draws its own
+          // conformer per residue instance.
+          refPos: features.refPos, refCharge: features.refCharge,
+          refElement: features.refElement,
+          refAtomNameChars: features.refAtomNameChars,
+          refSpaceUid: features.refSpaceUid,
+          aatype: features.aatype, profile: features.profile,
+          deletionMean: features.deletionMean,
         } };
       }
     }
