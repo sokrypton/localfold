@@ -855,6 +855,15 @@ export async function foldEsmfold2(device, options) {
         atomToToken: features.atomToToken,
         atomMask: features.mask,
         tokenMask: new Float32Array(tokens).fill(1),
+        // 🔴 WITHOUT THIS EVERY COMPLEX REPORTS ipTM 0.000. ipTM is the same
+        // expectation as pTM taken over the pairs whose `asymId` DIFFER, and
+        // the reference defaulted a missing one to `new Int32Array(tokens)` -
+        // one chain - so no pair was ever inter-chain and the score was
+        // structurally zero rather than unknown. Measured on two copies of a
+        // 58-mer: 0.000 before, and the page showed it as the model's opinion
+        // of its own interface. Single-chain folds cannot see this, which is
+        // every fold this head was gated on.
+        asymId: features.asymId,
       }, options.confidenceWeights, { allocator });
     }
 

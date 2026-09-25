@@ -3733,8 +3733,17 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const camera = { ...(liveRenderer?.viewerState ?? {}) };
   const live = liveRenderer?.objectsData?.[liveRenderer?.currentObjectName];
   if (live?.frames !== undefined) live.frames.length = 0;
+  // 🔴 `chains.join("")` AND NOT `sequence`, WHICH CARRIES THE SEPARATOR. The
+  // only thing confidenceJson reads off this is `.length`, as the crop passed
+  // to paeMatrix - and `sequence` is `chains.join(":")`, so two copies of a
+  // 58-mer claimed 117 residues against a 116-wide matrix and the fold died
+  // with "predicted aligned error is 116 wide for 117 residues". Reported by a
+  // user; every gate here folded ONE chain, where there is no separator to
+  // count and the two spellings are the same string. The AF3 path beside this
+  // one has always joined with "".
+  const scoreSequence = chains.join("");
   await loadIntoViewer({ stem, pdb: framePdbs[0] ?? pdb,
-                         scores: confidenceJson(sequence, confidence), confidence });
+                         scores: confidenceJson(scoreSequence, confidence), confidence });
   if (viewer !== undefined && Object.keys(camera).length > 0) {
     Object.assign(viewer.viewerState, camera);
     viewer.render?.("localfold.restore-camera");
@@ -3789,7 +3798,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
 
   recordPrediction({
     stem, pdb, chains, confidence,
-    scores: confidenceJson(sequence, confidence),
+    scores: confidenceJson(scoreSequence, confidence),
     chainLengths: chains.map((chain) => chain.length),
     // 🔴 ONE FIELD FOR THE CONTACT MAP, WHATEVER PRODUCED IT. See the note on
     // `contactSource` at the download button: this used to be `contacts` here,
