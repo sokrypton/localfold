@@ -169,10 +169,28 @@ def main():
                         help="force the shard count; sized on the PACKED bytes "
                              "either way. Not a multiple of 8 leaves a ragged round.")
     parser.add_argument("--group", type=int, default=GROUP)
+    parser.add_argument("--prefix-bits", action="append", default=[], metavar="PREFIX=BITS",
+                        help="hold tensors whose name starts with PREFIX at BITS "
+                             "(1..7, or 32 for float32); repeatable")
     arguments = parser.parse_args()
     bits, group = arguments.bits, arguments.group
     if not 1 <= bits <= 7:
         raise SystemExit("--bits must be 1..7; eight and above are not packed")
+    # 🔴 A SECTION CAN BE HELD AT A DIFFERENT WIDTH, which is the trade
+    # tools/quantize_model.py already makes for AlphaFold 2's STRUCTURE MODULE:
+    # a small part of a bundle where the error lands hardest, kept wide while
+    # everything around it is squeezed. ESMFold2's confidence head is the same
+    # shape of problem - 4.2% of the bytes, and int5 on it costs 2.0 pLDDT and
+    # 0.082 pTM (docs/EF2FAST.md). `32` means float32.
+    prefix_bits = []
+    for spec in arguments.prefix_bits:
+        prefix, _, width = spec.partition("=")
+        if not prefix or not width.isdigit():
+            raise SystemExit(f"--prefix-bits wants PREFIX=BITS, not {spec!r}")
+        width = int(width)
+        if width != 32 and not 1 <= width <= 7:
+            raise SystemExit(f"--prefix-bits {prefix}: {width} is not 1..7 or 32")
+        prefix_bits.append((prefix, width))
 
     source = ROOT / arguments.source
     out = ROOT / arguments.out
@@ -221,7 +239,10 @@ def main():
             values = np.frombuffer(blob, dtype="<f4", count=count, offset=start)
             source_bytes += count * 4
             name = next(n for n, r in tensors.items() if r is record)
-            if KEEP_FLOAT32.search(name) or name in named_float32:
+            # ...the first matching prefix wins, so the order they were given in
+            # is the order they are read in.
+            here = next((w for prefix, w in prefix_bits if name.startswith(prefix)), bits)
+            if KEEP_FLOAT32.search(name) or name in named_float32 or here == 32:
                 payload = np.ascontiguousarray(values, dtype="<f4").tobytes()
                 record["dtype"] = "float32"
                 record.pop("block", None)
@@ -230,10 +251,10 @@ def main():
                 kept += 1
                 kept_bytes += len(payload)
             else:
-                codes, scales, zeros = quantise(values, group, bits)
-                packed = pack(codes, bits).tobytes() + b"\x00"
+                codes, scales, zeros = quantise(values, group, here)
+                packed = pack(codes, here).tobytes() + b"\x00"
                 scale_pad = (-len(packed)) % 4
-                record["dtype"] = f"int{bits}"
+                record["dtype"] = f"int{here}"
                 record["block"] = group
                 # ...offsets WITHIN the payload; the shard offset is added below,
                 # once packing has decided where this payload starts.

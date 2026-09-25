@@ -3411,6 +3411,47 @@ running THEIR pipeline end to end, which chooses its own arguments, and then
 diffing the two folds rather than the two heads: the structures agreed to
 0.358 A while the confidences did not, and that gap is what named the stage.
 
+#### RETRACTED: int5 does NOT cost the confidence head 2 pLDDT
+
+The section above concluded that "the port is exact and the whole residual is
+int5 on the head... 2.0 pLDDT and 0.082 pTM", from 56.215 on the int5 bundle
+against 58.205 on the float32 one. **That comparison changed the whole bundle
+and blamed one part of it** - the trunk, the embedder and the head all moved
+precision together - which is this repository's own rule about a residual taken
+on a quantised bundle, applied to itself and failed.
+
+`tools/quantize_af3.py --prefix-bits confidence=N` holds one section at its own
+width, so the head can now be varied with everything else held at int5. Same
+sequence, same seed, after the relative-position and dense-attention fixes:
+
+| bundle | pLDDT | pTM | PAE mean | size |
+|---|---:|---:|---:|---:|
+| **shipped: trunk int5, head int5** | **88.061** | 0.8152 | 4.037 | 129 MiB |
+| trunk int5, head 7-bit | 87.764 | 0.8113 | 4.134 | 129.6 MiB |
+| trunk int5, head float32 | 87.700 | 0.8097 | 4.160 | 150.8 MiB |
+| everything float32 | 88.206 | 0.8178 | 3.914 | 679 MiB |
+| native | 89.150 | 0.8304 | 3.787 | — |
+
+🔴 **RAISING THE HEAD'S PRECISION MAKES IT SLIGHTLY WORSE, AND NOT MONOTONE** -
+5 bits beats 7 beats 32, over a spread of 0.36 pLDDT, which is the shape of
+noise rather than of a trade. The head is not the lever, and the 21 MiB a
+float32 head costs buys nothing. **The shipped bundle is left alone.**
+
+🔴 **AND THE WHOLE OF QUANTISATION IS NOW 0.145 pLDDT**, int5 88.061 against
+float32 88.206, where before today's two fixes the same axis looked like 2.0.
+A model that is missing a term is more sensitive to everything else; the cost
+of int5 was being paid by a head reading a pair with no positional encoding in
+it. Fix the model and the quantisation stops mattering.
+
+So the remaining distance to native is **0.94 pLDDT of it the `ref_pos`
+conformer floor** - each side draws its own conformer per residue instance,
+worth ~2e-2 on `tokenAct` and not a defect - and 0.145 of quantisation.
+
+`--prefix-bits` stays: it is the instrument that settled this, it is the trade
+`quantize_model.py` already makes for AlphaFold 2's structure module, and a
+negative result measured is worth more than an untested option.
+
+
 #### The remaining 3.5 pLDDT is the INPUTS EMBEDDER, not the sampler
 
 With `pairBias` wired the fold reads 85.67 against native's 89.15, and the
