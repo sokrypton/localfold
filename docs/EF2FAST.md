@@ -3038,3 +3038,70 @@ monomer at 227 MB. So the 600M pair at int5 is about twice the AF3 bundle and
 the 6B is out of reach by an order of magnitude at any precision - which is what
 makes the 600M line the interesting one and the reason the question was asked
 about it.
+
+## The confidence head this checkpoint never had
+
+biohub ships ESMFold2 with `confidence_head.enabled: false` and zero confidence
+tensors, which is what the certainty estimate and `src/esmfold2/aligned-error.js`
+above exist for. Synthyra froze that trunk and trained a head on it - 780
+updates, 18.1 h, MIT with redistribution allowed - for the 300M and the 600M
+both. It is ported, gated and wired; nothing is published.
+
+🔴 **THE TRUNK UNDER IT IS OURS BYTE FOR BYTE, WHICH IS WHY THIS IS AN ADDITION
+AND NOT A RE-EXPORT.** Per model, their 913 tensors are biohub's 820 - zero
+name differences, zero shape differences - plus 93 confidence tensors, and
+sampled shared tensors are byte-identical (600M 7/7 including the largest in
+the file, 300M 4/4). Nobody re-downloads a trunk and no structure changes.
+
+| | |
+|---|---|
+| head | 4 pair-only blocks, pair 256 / single 384, PAE 64 bins over [0,32], pLDDT 50 over [0,1] |
+| its blocks | the TRUNK's block - 18 tensors, same names, same shapes - so `trunk_block` and the existing GPU kernel both apply |
+| host reference vs THEIR module | 2.4e-7 to 8.7e-7 on six arms, both checkpoints |
+| device vs host | pair init **1.85e-7**; after the blocks 8.4e-4, which is the trunk stack's own f16 |
+| on a real fold | pLDDT 57.6, PAE mean 7.64 **max 25.64**, asymmetry **0.479** |
+
+The last row is the one the oracle could not give: its `z` is seeded normals, so
+its PAE sits at 16.1 - what a uniform 64-bin softmax over [0,32] returns. On a
+real trunk the head discriminates, and 0.479 sits with af3 0.510, boltz2 0.537
+and protenix2 0.590.
+
+### What int5 costs it, and the choice that is left
+
+Measured on the same target, against the f32 oracle:
+
+| head precision | bundle | PAE | pLDDT |
+|---|---:|---:|---:|
+| int5 throughout | **127.8 MiB** | 5.18e-2 | 4.31e-2 |
+| head f32, trunk int5 | **150.8 MiB** | **3.38e-7** | **2.38e-7** |
+
+Today's shipped `ef2-fast-600m` is 123 MiB, so the head is +5 MiB quantised or
++28 MiB exact.
+
+🔴 **AND THE THREE TENSORS THAT LOOK LIKE THE CULPRITS ARE NOT.** The guess was
+the 128-row `distanceEmbedding` lookup, the `[23, 384, 50]` pLDDT einsum and the
+PAE projection - a gather and two tables, exactly the shapes group-32 int5
+mangles. Keeping ALL THREE at float32 moves the PAE from 5.180e-2 to
+**5.154e-2** and costs 1.5 MiB. The error is spread across the four blocks'
+weights and there is no cheap tensor to rescue.
+
+### Traps this cost, each measured
+
+🔴 **`pair + folding_trunk(pair)` ADDS THE INPUT TWICE.** Their `FoldingTrunk`
+returns the UPDATED pair - the blocks' residuals are already inside it - and the
+head adds it again on top. Read as an ordinary residual the PAE moves **8.4e-2**:
+a confidence matrix that looks entirely reasonable and is wrong.
+
+🔴 **`{...flat, blocks, ...meta}` REPLACED THE BLOCKS WITH THE INTEGER 4**,
+because the manifest's `confidence.blocks` is the count. The GPU checker spread
+the other way round and passed throughout while the fold died three files away.
+
+🔴 **THE FIRST KERNEL BOUND TEN STORAGE BUFFERS** against WebGPU's floor of 8;
+this A100 offers 16 and would have shipped it.
+
+🔴 **AND THE PRECISION ARMS MOVE NOTHING ON THE BLOCKS.** `--staged=f32
+--accumulate=f32` is byte-identical at 8.37e-4 with `precision` confirming both
+reached the stack: the triangle's projection is on f16 MATRIX units chosen from
+device tuning, which no precision flag reaches. Turning them off is WORSE -
+`--tune=triangleProjectMatrix=false` reads 2.72e-3.
+
