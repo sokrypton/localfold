@@ -1092,6 +1092,14 @@ const PRIORS = new Map([
     // Bit-identical (the arithmetic is untouched). A user who folds once saves
     // 3-5 s; one who folds five times comes out even.
     runtimeLoopBounds: "tiered",
+    // 🔴 AND AF2's FLASH ATTENTION OFF THE MATRIX UNITS, FOR THE SAME REASON:
+    // its three variants (heads of 8, 16 and 32) are ~1.25 s of driver compile
+    // EACH on this card, 3.8 of AF2's 9.7 s of compile, for a warm kernel that
+    // is level at 59 residues and ~9% faster at 255. Driver cache cleared,
+    // fold-af2 at 59: first run 11.7 / 8.4 s -> 4.4 / 5.5, repeats 0.44-0.49 s
+    // either way; at 255 repeats 4.2 -> 4.6 s. Turning off EVERY AF2 matrix
+    // knob saves 1-2 s more cold and costs 60-70% warm, so only this one goes.
+    attentionMatrix: false,
   }],
   // Apple M2, 10 cores, macOS 13.2, Chrome 152 - the machine docs/PERF.md is
   // measured on, reporting {vendor: "apple", architecture: "metal-3"}.
