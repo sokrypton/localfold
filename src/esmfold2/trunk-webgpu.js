@@ -42,7 +42,8 @@ import { stagedMatrixBlock } from "../kernels/matrix-linear.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { residencyAllowed } from "../runtime/device-memory.js";
 import {
-  allocateTransitionSplit, packTransitionWeights, TRANSITION_SPLIT_MIN_CHANNELS,
+  allocateTransitionSplit, packTransitionWeights, splitTransitionConfig,
+  TRANSITION_SPLIT_MIN_CHANNELS,
   TRANSITION_ORDER,
 } from "../af3/trunk/transition-webgpu.js";
 import {
@@ -218,13 +219,18 @@ export class Esmfold2TrunkGpu {
           tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block,
           ...narrowed }
       : false;
-    const pairTransitionSplit = tuning.pairTransitionSplit === true && splitConfig !== null
-      && channels >= (tuning.pairTransitionSplitMinChannels
-        ?? TRANSITION_SPLIT_MIN_CHANNELS)
-      ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,
-          tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block,
-          ...narrowed }
-      : false;
+    // 🔴 AND WITHOUT MATRIX UNITS, THE VECTOR SPLIT - the same rule the AF3
+    // pair track takes from splitTransitionConfig, and the reason: no stock
+    // browser has matrix units, so this was the fused kernel for every visitor.
+    const pairTransitionSplit = splitConfig === null
+      ? splitTransitionConfig(this.device, channels)
+      : tuning.pairTransitionSplit === true
+        && channels >= (tuning.pairTransitionSplitMinChannels
+          ?? TRANSITION_SPLIT_MIN_CHANNELS)
+        ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,
+            tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block,
+            ...narrowed }
+        : false;
     const pipelines = await compilePairTrack(this.pipelines, {
       n, sample: blocks[0], epsilon, variance, base, channels,
       // The grid attention is what needs a dialect; without it there is no
