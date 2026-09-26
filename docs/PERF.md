@@ -915,9 +915,12 @@ new pipeline request, one at a time. T4, driver cache cleared per run,
 | AF2 59, whole run (ms) | 5992 | 6324 |
 | ESMFold2, whole run (s) | 4.65 | 4.58 |
 
-The later folds are slower because back-to-back folds arrive before ~13 s of
-upgrades have finished; a visitor who looks at the first result before folding
-again gets the unrolled kernels. That trade is chosen for the single cold run,
+The later folds are slower because the upgrades are still compiling: ~55
+kernels have loops worth unrolling, and the unrolled ones are exactly the slow
+compiles, so the queue takes most of a minute. Taking the most-requested kernel
+first (`6e5a5cd`) did not shorten it - eight back-to-back folds after a cold
+first fold of 9.4 / 7.9 / 6.6 s all stayed at 1.8-2.3 s. A visitor who reads the
+first result for a minute before folding again gets the unrolled kernels. That trade is chosen for the single cold run,
 which is most of what a free user does. A token-count-independent shader set is
 still the only thing that would make a second LENGTH free.
 
