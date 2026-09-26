@@ -83,6 +83,9 @@ const FUSED_ORDER = [
   "outputLayerNormScale", "outputLayerNormOffset", "outputLinear",
 ];
 
+/** Pair rows a `template.embed` workgroup stages; the dispatch divides by it. */
+const TEMPLATE_EMBED_ROWS = 4;
+
 /**
  * The fused embedder's 108 feature columns for ONE slot.
  *
@@ -289,6 +292,67 @@ const W_OUT: u32 = ${offsets.outputLinear ?? 0}u;
   }
   variance /= f32(${count});`;
 
+  // 🔴 A WORKGROUP OF EMBED_ROWS PAIR ROWS, NOT A THREAD A ROW. A thread a row
+  // read its row of the query pair from global memory with a stride of
+  // QUERY_CHANNELS floats between lanes - every lane its own cache line - and
+  // recomputed each normalised value once per output channel: 14 ms a slot at
+  // OpenDDE's 384 channels and 255 tokens. Staged, a row is read once and
+  // coalesced, normalised once, and each lane owns output channels. The row's
+  // statistics are the same sequential sums and every normalised value the same
+  // expression, and each output sums over c in the same order, so the answer is
+  // bit-identical.
+  const EMBED_ROWS = TEMPLATE_EMBED_ROWS;
+  const embedPrelude = `
+const EMBED_ROWS: u32 = ${EMBED_ROWS}u;
+var<workgroup> normalized_rows: array<f32, ${EMBED_ROWS * queryChannels}>;
+fn stage_rows(first: u32, lane: u32) {
+  for (var at = lane; at < EMBED_ROWS * QUERY_CHANNELS; at += 64u) {
+    let row = first + at / QUERY_CHANNELS;
+    normalized_rows[at] = select(0.0, pair[min(row, PAIRS - 1u) * QUERY_CHANNELS
+                                          + at % QUERY_CHANNELS], row < PAIRS);
+  }
+  workgroupBarrier();
+  var mean = 0.0;
+  var inverse_std = 0.0;
+  if (lane < EMBED_ROWS) {
+    let base = lane * QUERY_CHANNELS;
+    var total = 0.0;
+    var squares = 0.0;
+    for (var c = 0u; c < QUERY_CHANNELS; c += 1u) {
+      let value = normalized_rows[base + c];
+      total += value;
+      squares += value * value;
+    }
+    mean = total / f32(QUERY_CHANNELS);
+    ${varianceCode("QUERY_CHANNELS", "normalized_rows[base + c]")}
+    inverse_std = inverseSqrt(variance + EPSILON);
+    row_mean[lane] = mean;
+    row_inverse_std[lane] = inverse_std;
+  }
+  workgroupBarrier();
+  for (var at = lane; at < EMBED_ROWS * QUERY_CHANNELS; at += 64u) {
+    let r = at / QUERY_CHANNELS;
+    let c = at % QUERY_CHANNELS;
+    normalized_rows[at] = (normalized_rows[at] - row_mean[r]) * row_inverse_std[r]
+      * weights[W_QUERY_SCALE + c] + weights[W_QUERY_OFFSET + c];
+  }
+  workgroupBarrier();
+}
+var<workgroup> row_mean: array<f32, ${EMBED_ROWS}>;
+var<workgroup> row_inverse_std: array<f32, ${EMBED_ROWS}>;
+`;
+  // Each lane's projection of the staged rows onto output channel e, one
+  // accumulator a row, summed over c in ascending order.
+  const projectRows = (weight) => `
+    var values: array<f32, ${EMBED_ROWS}>;
+    for (var r = 0u; r < EMBED_ROWS; r += 1u) { values[r] = 0.0; }
+    for (var c = 0u; c < QUERY_CHANNELS; c += 1u) {
+      let w = weights[${weight} + c * CHANNELS + e];
+      for (var r = 0u; r < EMBED_ROWS; r += 1u) {
+        values[r] += normalized_rows[r * QUERY_CHANNELS + c] * w;
+      }
+    }`;
+
   // The query pair representation, normalised and projected to 64, plus the
   // template aatype along each axis. An empty slot carries type 0, so those two
   // contribute ROW 0 of each weight rather than nothing.
@@ -301,59 +365,48 @@ const W_OUT: u32 = ${offsets.outputLinear ?? 0}u;
 // distogram bin is stored PLUS ONE, so 0 is "no bin" - which is what both an
 // empty slot and a pair closer than 3.25 A have. One pipeline serves both.
 @group(0) @binding(4) var<storage, read> geometry: array<f32>;
-
+${embedPrelude}
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
-  let i = row / TOKENS;
-  let j = row % TOKENS;
-  let base = row * QUERY_CHANNELS;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) lane: u32) {
+  let first = (group.x + group.y * GRID_WIDTH) * EMBED_ROWS;
+  if (first >= PAIRS) { return; }
+  stage_rows(first, lane);
+  for (var e = lane; e < CHANNELS; e += 64u) {
+${projectRows("W_EMBED8")}
+    for (var r = 0u; r < EMBED_ROWS; r += 1u) {
+      let row = first + r;
+      if (row >= PAIRS) { break; }
+      let i = row / TOKENS;
+      let j = row % TOKENS;
+      var value = values[r];
+      // 🔴 FEATURE 2 VARIES ALONG j AND FEATURE 3 ALONG i. AF3 writes them as
+      // aatype[None, :, :] and aatype[:, None, :]; swapping them transposes a
+      // term that nothing downstream complains about.
+      let code_row = aatype[j];
+      let code_column = aatype[i];
+      if (code_row >= 0 && u32(code_row) < RESTYPES) {
+        value += weights[W_EMBED2 + u32(code_row) * CHANNELS + e];
+      }
+      if (code_column >= 0 && u32(code_column) < RESTYPES) {
+        value += weights[W_EMBED3 + u32(code_column) * CHANNELS + e];
+      }
 
-  var total = 0.0;
-  var squares = 0.0;
-  for (var c = 0u; c < QUERY_CHANNELS; c += 1u) {
-    let value = pair[base + c];
-    total += value;
-    squares += value * value;
-  }
-  let mean = total / f32(QUERY_CHANNELS);
-  ${varianceCode("QUERY_CHANNELS", "pair[base + c]")}
-  let inverse_std = inverseSqrt(variance + EPSILON);
+      // Features 0, 1, 4, 5, 6 and 7: the template geometry, computed on the
+      // host and packed by packTemplateGeometry.
+      let g = row * GEOMETRY_STRIDE;
+      let bin = u32(geometry[g]);
+      if (bin > 0u) {
+        value += weights[W_EMBED0 + (bin - 1u) * CHANNELS + e];
+      }
+      value += geometry[g + 1u] * weights[W_EMBED1 + e];
+      value += geometry[g + 2u] * weights[W_EMBED4 + e];
+      value += geometry[g + 3u] * weights[W_EMBED5 + e];
+      value += geometry[g + 4u] * weights[W_EMBED6 + e];
+      value += geometry[g + 5u] * weights[W_EMBED7 + e];
 
-  // 🔴 FEATURE 2 VARIES ALONG j AND FEATURE 3 ALONG i. AF3 writes them as
-  // aatype[None, :, :] and aatype[:, None, :]; swapping them transposes a term
-  // that nothing downstream complains about.
-  let code_row = aatype[j];
-  let code_column = aatype[i];
-  for (var e = 0u; e < CHANNELS; e += 1u) {
-    var value = 0.0;
-    for (var c = 0u; c < QUERY_CHANNELS; c += 1u) {
-      let normalized = (pair[base + c] - mean) * inverse_std * weights[W_QUERY_SCALE + c]
-        + weights[W_QUERY_OFFSET + c];
-      value += normalized * weights[W_EMBED8 + c * CHANNELS + e];
+      act[row * CHANNELS + e] = value;
     }
-    if (code_row >= 0 && u32(code_row) < RESTYPES) {
-      value += weights[W_EMBED2 + u32(code_row) * CHANNELS + e];
-    }
-    if (code_column >= 0 && u32(code_column) < RESTYPES) {
-      value += weights[W_EMBED3 + u32(code_column) * CHANNELS + e];
-    }
-
-    // Features 0, 1, 4, 5, 6 and 7: the template geometry, computed on the
-    // host and packed by packTemplateGeometry.
-    let g = row * GEOMETRY_STRIDE;
-    let bin = u32(geometry[g]);
-    if (bin > 0u) {
-      value += weights[W_EMBED0 + (bin - 1u) * CHANNELS + e];
-    }
-    value += geometry[g + 1u] * weights[W_EMBED1 + e];
-    value += geometry[g + 2u] * weights[W_EMBED4 + e];
-    value += geometry[g + 3u] * weights[W_EMBED5 + e];
-    value += geometry[g + 4u] * weights[W_EMBED6 + e];
-    value += geometry[g + 5u] * weights[W_EMBED7 + e];
-
-    act[row * CHANNELS + e] = value;
   }
 }`;
 
@@ -453,37 +506,26 @@ const W_A_PROJECTION: u32 = ${offsets.aProjection ?? 0}u;
 @group(0) @binding(1) var<storage, read> features: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> act: array<f32>;
-
+${embedPrelude}
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
-  let base = row * QUERY_CHANNELS;
-  let feature_base = row * FEATURE_WIDTH;
-
-  var total = 0.0;
-  var squares = 0.0;
-  for (var c = 0u; c < QUERY_CHANNELS; c += 1u) {
-    let value = pair[base + c];
-    total += value;
-    squares += value * value;
-  }
-  let mean = total / f32(QUERY_CHANNELS);
-  ${varianceCode("QUERY_CHANNELS", "pair[base + c]")}
-  let inverse_std = inverseSqrt(variance + EPSILON);
-
-  for (var e = 0u; e < CHANNELS; e += 1u) {
-    var value = 0.0;
-    for (var c = 0u; c < QUERY_CHANNELS; c += 1u) {
-      let normalized = (pair[base + c] - mean) * inverse_std * weights[W_QUERY_SCALE + c]
-        + weights[W_QUERY_OFFSET + c];
-      value += normalized * weights[W_Z_PROJECTION + c * CHANNELS + e];
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) lane: u32) {
+  let first = (group.x + group.y * GRID_WIDTH) * EMBED_ROWS;
+  if (first >= PAIRS) { return; }
+  stage_rows(first, lane);
+  for (var e = lane; e < CHANNELS; e += 64u) {
+${projectRows("W_Z_PROJECTION")}
+    for (var r = 0u; r < EMBED_ROWS; r += 1u) {
+      let row = first + r;
+      if (row >= PAIRS) { break; }
+      let feature_base = row * FEATURE_WIDTH;
+      var value = values[r];
+      for (var c = 0u; c < FEATURE_WIDTH; c += 1u) {
+        let f = features[feature_base + c];
+        if (f != 0.0) { value += f * weights[W_A_PROJECTION + c * CHANNELS + e]; }
+      }
+      act[row * CHANNELS + e] = value;
     }
-    for (var c = 0u; c < FEATURE_WIDTH; c += 1u) {
-      let f = features[feature_base + c];
-      if (f != 0.0) { value += f * weights[W_A_PROJECTION + c * CHANNELS + e]; }
-    }
-    act[row * CHANNELS + e] = value;
   }
 }`;
 
@@ -877,6 +919,8 @@ export class Af3TemplateEmbedderGpu {
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const linear = spread(Math.ceil(pairs / 64));
+      // A workgroup of EMBED_ROWS pair rows; see createTemplateShaders.
+      const perEmbed = spread(Math.ceil(pairs / TEMPLATE_EMBED_ROWS));
 
       // 🔴 THE BLOCK WEIGHTS ARE PACKED AND UPLOADED ONCE, OUTSIDE THE SLOT
       // LOOP. Every slot runs the SAME two pairformer blocks, so packing them
@@ -932,7 +976,7 @@ export class Af3TemplateEmbedderGpu {
             fused
               ? [pair, slotBuffers[slot].features, weightBuffer, act]
               : [pair, slotBuffers[slot].aatype, weightBuffer, act,
-                 slotBuffers[slot].geometry], linear[0], linear[1]);
+                 slotBuffers[slot].geometry], perEmbed[0], perEmbed[1]);
         if (outerResidual) {
           encoder.copyBufferToBuffer(act.buffer, 0, beforeStack.buffer, 0,
                                      pairs * CHANNELS * 4);
