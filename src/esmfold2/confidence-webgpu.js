@@ -200,6 +200,38 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 /**
+ * The per-atom pLDDT logits: each atom reads the weight table of its slot
+ * within its token. `table[atom]` is that slot, already clamped to the last
+ * table, so this is a plain dot product a thread.
+ */
+export function createPlddtLogitsShader({ atoms, channels, bins }) {
+  return `
+const ATOMS: u32 = ${atoms}u;
+const CHANNELS: u32 = ${channels}u;
+const BINS: u32 = ${bins}u;
+const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
+
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> table: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= ATOMS * BINS) { return; }
+  let atom = slot / BINS;
+  let bin = slot % BINS;
+  let base = table[atom] * CHANNELS * BINS;
+  var sum = 0.0;
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    sum += source[atom * CHANNELS + c] * weight[base + c * BINS + bin];
+  }
+  out[slot] = sum;
+}`;
+}
+
+/**
  * Row-attention pooling: a masked softmax over j, then the weighted sum.
  *
  * 🔴 THE MASK IS A BIAS AND NOT A ZEROED WEIGHT, which is their line: a padded
@@ -296,8 +328,38 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
       `ef2-conf-pair-init:${tokens}:${channels}:${weights.boundaries.length}`,
       createPairInitShader({ tokens, channels, edges: weights.boundaries.length }));
 
-    const left = keep(allocator.upload("ef2-conf.left", input.left, storage()));
-    const right = keep(allocator.upload("ef2-conf.right", input.right, storage()));
+    // 🔴 THE FOUR s -> z PROJECTIONS ON THE DEVICE when the fold hands over the
+    // normalised single inputs. They were four JavaScript matmuls - `tokens x
+    // 451 -> 256` each, ~180 ms at 255 tokens with the GPU idle - uploaded
+    // here straight after. Same weights, same k order, accumulated in f32
+    // where JavaScript accumulated in f64.
+    const projected4 = input.normed === undefined ? undefined : await (async () => {
+      const inChannels = weights.singleInputs;
+      const shader = await pipelines.get(`ef2-conf-project:${tokens}:${inChannels}:${channels}`,
+        createProjectRowsShader({ rows: tokens, inChannels, outChannels: channels }));
+      const source = keep(allocator.upload("ef2-conf.s-inputs-normed", input.normed, storage()));
+      const outputs = {};
+      const encoder = device.createCommandEncoder({ label: "ef2-conf.s-to-z" });
+      for (const [name, matrix] of [["rows", weights.sToZ], ["cols", weights.sToZTranspose],
+                                    ["left", weights.sToZProdIn1], ["right", weights.sToZProdIn2]]) {
+        outputs[name] = keep(allocator.allocate(`ef2-conf.${name}`, tokens * channels * 4, storage()));
+        const pass = encoder.beginComputePass({ label: `ef2-conf.s-to-z.${name}` });
+        pass.setPipeline(shader);
+        pass.setBindGroup(0, device.createBindGroup({
+          layout: shader.getBindGroupLayout(0),
+          entries: [source, keep(allocator.upload(`ef2-conf.w-${name}`, matrix, storage())),
+                    outputs[name]].map((allocation, binding) => ({
+            binding, resource: { buffer: allocation.buffer } })),
+        }));
+        const groups = Math.ceil(tokens * channels / 64);
+        pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+        pass.end();
+      }
+      device.queue.submit([encoder.finish()]);
+      return outputs;
+    })();
+    const left = projected4?.left ?? keep(allocator.upload("ef2-conf.left", input.left, storage()));
+    const right = projected4?.right ?? keep(allocator.upload("ef2-conf.right", input.right, storage()));
     const projected = keep(allocator.allocate("ef2-conf.projected", pairs * channels * 4,
                                               storage()));
     // 🔴 THE CALLER'S BUFFER WHEN IT HAS ONE. In a real fold the trunk's pair
@@ -344,7 +406,8 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
       throw new Error("ef2 confidence: pairBias is required (see docs/EF2FAST.md)");
     }
     pass.setBindGroup(0, bind(init, [
-      pair, up("constants", constants), up("rows", input.rows), up("cols", input.cols),
+      pair, up("constants", constants), projected4?.rows ?? up("rows", input.rows),
+      projected4?.cols ?? up("cols", input.cols),
       projected, up("embedding", weights.distanceEmbedding), out,
       up("pairbias", input.pairBias)]));
     pass.dispatchWorkgroups(Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
@@ -481,10 +544,7 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
 
   const normed = layerNorm(input.sInputs, tokens, dInputs,
                            weights.sInputsNormScale, weights.sInputsNormOffset);
-  const rows = linear(normed, tokens, dInputs, dPair, weights.sToZ);
-  const cols = linear(normed, tokens, dInputs, dPair, weights.sToZTranspose);
-  const left = linear(normed, tokens, dInputs, dPair, weights.sToZProdIn1);
-  const right = linear(normed, tokens, dInputs, dPair, weights.sToZProdIn2);
+  // The four s -> z projections run on the device, inside the pair init.
   const repCoordinates = new Float32Array(tokens * 3);
   for (let token = 0; token < tokens; token += 1) {
     for (let axis = 0; axis < 3; axis += 1) {
@@ -494,7 +554,7 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
 
   const initial = await esmfold2ConfidencePairInit(device, {
     tokens, pair: input.pair, pairBuffer: input.pairBuffer,
-    rows, cols, left, right, repCoordinates, pairBias: input.pairBias,
+    normed, repCoordinates, pairBias: input.pairBias,
   }, weights, { allocator, keepOnDevice: true });
 
   // 🔴 PAIR INIT -> BLOCKS -> READOUTS ON THE DEVICE. Each stage handed the
@@ -557,20 +617,55 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
   }
   const normedAtoms = layerNorm(gathered, atoms, dSingle,
                                 weights.plddtNormScale, weights.plddtNormOffset);
-  const plddtLogits = new Float32Array(atoms * bins);
+  // 🔴 ON THE DEVICE: `atoms x 384 x 50` multiply-adds were a JavaScript
+  // triple loop, ~88 ms at 255 tokens. The slot each atom reads its table from
+  // is decided here exactly as that loop decided it.
+  const table = new Uint32Array(atoms);
   let slot = 0;
   for (let atom = 0; atom < atoms; atom += 1) {
     if (atom > 0 && input.atomToToken[atom] !== input.atomToToken[atom - 1]) slot = 0;
-    const table = Math.min(slot, slots - 1) * dSingle * bins;
-    for (let bin = 0; bin < bins; bin += 1) {
-      let sum = 0;
-      for (let c = 0; c < dSingle; c += 1) {
-        sum += normedAtoms[atom * dSingle + c] * weights.plddtWeight[table + c * bins + bin];
-      }
-      plddtLogits[atom * bins + bin] = sum;
-    }
+    table[atom] = Math.min(slot, slots - 1);
     slot += 1;
   }
+  const plddtLogits = await (async () => {
+    const shader = await pipelineCacheForDevice(device).get(
+      `ef2-conf-plddt:${atoms}:${dSingle}:${bins}`,
+      createPlddtLogitsShader({ atoms, channels: dSingle, bins }));
+    const held = [
+      allocator.upload("ef2-conf.plddt-source", normedAtoms, storage()),
+      allocator.upload("ef2-conf.plddt-weight", weights.plddtWeight, storage()),
+      allocator.upload("ef2-conf.plddt-table", table, storage()),
+      allocator.allocate("ef2-conf.plddt-logits", atoms * bins * 4,
+                         storage() | GPUBufferUsage.COPY_SRC),
+      allocator.allocate("ef2-conf.plddt-readback", atoms * bins * 4,
+                         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+    ];
+    try {
+      const [source, weight, tableBuffer, out, readback] = held;
+      device.pushErrorScope("validation");
+      const encoder = device.createCommandEncoder({ label: "ef2-conf.plddt" });
+      const pass = encoder.beginComputePass({ label: "ef2-conf.plddt" });
+      pass.setPipeline(shader);
+      pass.setBindGroup(0, device.createBindGroup({
+        layout: shader.getBindGroupLayout(0),
+        entries: [source, weight, tableBuffer, out].map((allocation, binding) => ({
+          binding, resource: { buffer: allocation.buffer } })),
+      }));
+      const groups = Math.ceil(atoms * bins / 64);
+      pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+      pass.end();
+      encoder.copyBufferToBuffer(out.buffer, 0, readback.buffer, 0, atoms * bins * 4);
+      device.queue.submit([encoder.finish()]);
+      const error = await device.popErrorScope();
+      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      await readback.buffer.mapAsync(GPUMapMode.READ);
+      const copy = new Float32Array(readback.buffer.getMappedRange().slice(0));
+      readback.buffer.unmap();
+      return copy;
+    } finally {
+      for (const allocation of held) allocation.release();
+    }
+  })();
   const plddtPerAtom = categoricalMean(plddtLogits, atoms, bins, 0, 1);
   const sum = new Float32Array(tokens);
   const count = new Float32Array(tokens);
