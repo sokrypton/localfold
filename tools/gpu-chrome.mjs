@@ -210,6 +210,14 @@ try {
   // one knob is worth without having to spell an object on a command line.
   // NOTE: no backticks anywhere in this comment - it is inside the runner
   // page's template literal and one would end it, which it just did.
+  // --prior=NAME answers with another architecture's prior, for a GPU none
+  // was measured on. NOTE: no backticks in this comment either.
+  const priorAs = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--prior="));
+  if (priorAs !== undefined) {
+    const { useDevicePrior } = await import("/src/runtime/device-profile.js");
+    useDevicePrior(device, priorAs.slice("--prior=".length));
+    console.log("[gpu-chrome] answering with the " + priorAs.slice("--prior=".length) + " prior");
+  }
   const priorArg = ${JSON.stringify(moduleArgs)}.find((a) => a === "--no-prior" || a.startsWith("--no-prior="));
   if (priorArg !== undefined) {
     const { ignoreDevicePrior, deviceTuning: deviceTuningOf }

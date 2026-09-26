@@ -1355,6 +1355,23 @@ export function ignoreDeviceCapabilities(device) {
   return device;
 }
 
+/** Which architecture's prior a device answers with instead of its own. */
+const PRIOR_AS = new WeakMap();
+
+/**
+ * Answer with another architecture's prior - a GPU nothing has measured, asked
+ * whether the nearest measured one's settings suit it. `--prior=` on any GPU
+ * tool reaches it; see tools/gpu-chrome.mjs.
+ */
+export function useDevicePrior(device, architecture) {
+  if (!PRIORS.has(architecture)) {
+    throw new Error(`no prior named ${architecture}; known: ${[...PRIORS.keys()].join(", ")}`);
+  }
+  PRIOR_AS.set(device, architecture);
+  CACHE.delete(device);
+  return device;
+}
+
 export function deviceProfile(device) {
   const cached = CACHE.get(device);
   if (cached !== undefined) return cached;
@@ -1365,7 +1382,7 @@ export function deviceProfile(device) {
   // CPU at a thousandth of the speed.
   const software = vendor === "google" || architecture === "swiftshader"
     || architecture === "software" || vendor === "mesa";
-  const measured = PRIORS.get(architecture) ?? VENDOR_PRIORS.get(vendor) ?? {};
+  const measured = PRIORS.get(PRIOR_AS.get(device) ?? architecture) ?? VENDOR_PRIORS.get(vendor) ?? {};
   const capability = CAPABILITY_REFUSED.has(device)
     ? {} : matrixCapabilityTuning(device, matrixConfigs);
   const kept = KEPT.get(device);
