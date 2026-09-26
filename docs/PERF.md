@@ -642,6 +642,23 @@ arrays; fused into one pass a row with the same operations in the same order it
 is **0 of 1,069,760 floats different** (Object.is) and 32.5 -> 12.8 ms at 255
 tokens in node.
 
+🔴 **AND FOUR MORE KERNELS WERE A THREAD A ROW OVER A WIDE ROW**, found by
+listing every pass under 2,500 workgroups at more than 0.25 ms. Each is now
+four rows staged a workgroup (or, for the MSA logits, one normalisation shared
+by every head), and each keeps its sums in the same order - bit-identical on
+every model folded, alignment included:
+
+| kernel | model, stock flags, 255 tokens | before | after |
+|---|---|---:|---:|
+| `template.output` | IntelliFold-2, a trunk pass | 62.8 ms | **1.7** |
+| `msa.attention-weights` (now logits + softmax) | IntelliFold-2, four MSA blocks | 15.4 | **2.7** |
+| `opm.project` | IntelliFold-2, four MSA blocks, 128 rows | 10.8 | **0.9** |
+| AF2 `opm.contract` (vector GEMM, above) | a block | 1.60 | **1.22** |
+
+`pair-logits` and `grid.bias` are the same shape at ~1% of an IntelliFold-2
+fold and were left: they already normalise each row once, and what is left is
+uncoalesced reads.
+
 What is left under stock flags is mostly arithmetic: the pair track's f32
 kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,
 `tri.project` 14, the vector split 13-15, `tri.project-out` ~12, `grid.attend`
