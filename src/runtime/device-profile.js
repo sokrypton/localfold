@@ -1100,6 +1100,12 @@ const PRIORS = new Map([
     // either way; at 255 repeats 4.2 -> 4.6 s. Turning off EVERY AF2 matrix
     // knob saves 1-2 s more cold and costs 60-70% warm, so only this one goes.
     attentionMatrix: false,
+    // AF3's triangle projection on the T4's matrix units at 128 channels, which
+    // the width rule declines below 192: a warm trunk pass at 255 tokens 2179 ->
+    // 1909 ms and 2236 -> 1981 interleaved, a 5CAJ fold 7.73-7.98 -> 7.52-7.63 s,
+    // 6MRR pLDDT 85.718 -> 85.726 with the backbone unchanged (docs/PERF.md).
+    triangleProjectMatrix: true,
+    triangleProjectMatrixMinChannels: 128,
   }],
   // Apple M2, 10 cores, macOS 13.2, Chrome 152 - the machine docs/PERF.md is
   // measured on, reporting {vendor: "apple", architecture: "metal-3"}.

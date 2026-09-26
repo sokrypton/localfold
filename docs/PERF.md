@@ -929,6 +929,15 @@ a cap of one the first fold is 8.7-10.8 s, at two 6.7-8.5, unlimited 6.6-7.2
 (five rounds each, interleaved, driver cache cleared). The fold overlaps the
 compiles with its weight download, which a queue gives up.
 
+🔴 **THE TRIANGLE PROJECTION ON THE T4's MATRIX UNITS PAYS AT AF3's 128
+CHANNELS**, which `TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS` (192, calibrated on an
+A100) declines. `bench-trunk.js --tokens=255 --profile`, two rounds interleaved:
+a trunk pass 2179 -> 1909 and 2236 -> 1981 ms, `tri.contract` halving with it. A
+whole 5CAJ fold is 7.73-7.98 -> 7.52-7.63 s; 6MRR's pLDDT moves 85.718 -> 85.726
+with N-CA/CA-C/CA-CA medians unchanged to 1e-4. The turing prior sets it. Swept
+beside it and not taken: the pair-transition split at 128 channels (3-4% of the
+trunk) and the matrix grid projection (`grid.project` -10%, ~1% of the trunk).
+
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
 The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by
