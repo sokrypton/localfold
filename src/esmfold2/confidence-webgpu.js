@@ -26,6 +26,7 @@
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { Esmfold2TrunkGpu } from "./trunk-webgpu.js";
+import { createAddShader } from "../runtime/execution.js";
 import { categoricalMean, tmScores } from "./confidence-reference.js";
 import { layerNorm, linear } from "../af3/trunk/pairformer-reference.js";
 
@@ -348,6 +349,15 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
       up("pairbias", input.pairBias)]));
     pass.dispatchWorkgroups(Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
     pass.end();
+    // 🔴 ON THE DEVICE WHEN THE FOLD ASKS, because its only reader is the
+    // block stack - which took it back as a host array to upload again.
+    if (options.keepOnDevice === true) {
+      device.queue.submit([encoder.finish()]);
+      const error = await device.popErrorScope();
+      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      allocations.splice(allocations.indexOf(out), 1);
+      return out;
+    }
     const readback = keep(allocator.allocate("ef2-conf.rb-init", pairs * channels * 4,
                                              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
     encoder.copyBufferToBuffer(out.buffer, 0, readback.buffer, 0, pairs * channels * 4);
@@ -388,7 +398,8 @@ export async function esmfold2ConfidenceReadouts(device, input, weights, options
                                      createPoolShader({ tokens, channels }));
 
     const up = (name, values) => keep(allocator.upload(`ef2-conf.${name}`, values, storage()));
-    const pair = up("finished", input.pair);
+    const pair = input.pairBuffer !== undefined ? { buffer: input.pairBuffer }
+      : up("finished", input.pair);
     const scores = keep(allocator.allocate("ef2-conf.scores", pairs * 4, storage()));
     const pooled = keep(allocator.allocate("ef2-conf.pooled", tokens * channels * 4, storage()));
     const singleOut = keep(allocator.allocate("ef2-conf.single", tokens * single * 4,
@@ -484,24 +495,58 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
   const initial = await esmfold2ConfidencePairInit(device, {
     tokens, pair: input.pair, pairBuffer: input.pairBuffer,
     rows, cols, left, right, repCoordinates, pairBias: input.pairBias,
-  }, weights, { allocator });
+  }, weights, { allocator, keepOnDevice: true });
 
+  // 🔴 PAIR INIT -> BLOCKS -> READOUTS ON THE DEVICE. Each stage handed the
+  // next a host array: the initial pair read back, copied and uploaded to the
+  // blocks, their output read back and copied, the residual added on the host,
+  // and the sum uploaded to the readouts - ~0.9 s of a ~1.5 s head at 255
+  // tokens, around ~0.1 s of block arithmetic. The same kernels and the same
+  // f32 add, now on the device.
   const pairMask = new Float32Array(tokens * tokens);
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) {
       pairMask[i * tokens + j] = input.tokenMask[i] * input.tokenMask[j];
     }
   }
-  const stack = await new Esmfold2TrunkGpu(device, { allocator }).run(
-    { pair: Float32Array.from(initial), pairMask }, weights.blocks,
-    { n: tokens, channels: dPair });
-  // See confidence-reference.js: their line adds the stack's input a second time.
-  const finished = Float32Array.from(stack.pair);
-  for (let index = 0; index < finished.length; index += 1) finished[index] += initial[index];
-
-  const readouts = await esmfold2ConfidenceReadouts(device, {
-    tokens, pair: finished, tokenMask: input.tokenMask,
-  }, weights, { allocator });
+  const elements = tokens * tokens * dPair;
+  // See confidence-reference.js: their line adds the stack's input a second
+  // time - `pair = pair + folding_trunk(pair)` - so the blocks run on a COPY
+  // of the initial pair and the initial pair is added back.
+  const stackPair = allocator.allocate("ef2-conf.stack-pair", elements * 4,
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+  let readouts;
+  try {
+    const copy = device.createCommandEncoder({ label: "ef2-conf.stack-copy" });
+    copy.copyBufferToBuffer(initial.buffer, 0, stackPair.buffer, 0, elements * 4);
+    device.queue.submit([copy.finish()]);
+    await new Esmfold2TrunkGpu(device, { allocator }).run(
+      { buffer: stackPair, pairMask }, weights.blocks,
+      { n: tokens, channels: dPair, readback: false });
+    const add = await pipelineCacheForDevice(device).get(`ef2-conf-add:${elements}`,
+                                                         createAddShader(elements));
+    device.pushErrorScope("validation");
+    const encoder = device.createCommandEncoder({ label: "ef2-conf.residual" });
+    const pass = encoder.beginComputePass({ label: "ef2-conf.residual" });
+    pass.setPipeline(add);
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: add.getBindGroupLayout(0),
+      entries: [stackPair, initial].map((allocation, binding) => ({
+        binding, resource: { buffer: allocation.buffer } })),
+    }));
+    const groups = Math.ceil(elements / 64);
+    pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    const error = await device.popErrorScope();
+    if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+    readouts = await esmfold2ConfidenceReadouts(device, {
+      tokens, pairBuffer: stackPair.buffer, tokenMask: input.tokenMask,
+    }, weights, { allocator });
+  } finally {
+    stackPair.release();
+    initial.release();
+  }
 
   const slots = weights.maxAtomsPerToken;
   const bins = weights.plddtBins;
