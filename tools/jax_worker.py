@@ -173,6 +173,12 @@ class Worker:
         os.makedirs(work)
         spec = json.loads(job["job"])
         search = controls.get("msa-mode", "none") == "search"
+        # 🔴 NO TEMPLATE SEARCH EITHER WAY: the MMseqs2 fill supplies alignments
+        # only, and a protein chain with neither templates nor an empty list is
+        # refused ("Protein chain 1 is missing Templates").
+        for entry in spec.get("sequences", []):
+            if "protein" in entry:
+                entry["protein"].setdefault("templates", [])
         if not search:
             # ...a single-sequence fold, stated in the job the way AlphaFold 3's
             # JSON states one: an empty alignment and no templates, rather than
