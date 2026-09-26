@@ -14,6 +14,10 @@ asks. Four routes carry that, all of them token-checked:
     POST /up                the runtime page pushes what it says and draws
     GET  /down?since=N      the reader receives it
 
+With `--jax-dir`, a fold whose payload says `backend: "jax"` is not forwarded
+to the page: tools/jax_worker.py runs it with af3-any-model and its events land
+in the same mailbox, so the reader follows either one with the same code.
+
 🔴 THE POINT IS THAT THERE IS NO SECOND IMPLEMENTATION. The fold that runs
 here is web/app.js's own, in a real browser, from this checkout - the same
 code a visitor's laptop runs, on a card the laptop does not have. A Python
@@ -88,6 +92,8 @@ EVENT_CAP = 4000
 # accepted and lowered by the runtime page's own `result`, which is the event
 # that says it has finished in every way a fold can finish.
 FOLDING = {"on": False}
+# ...and whether the fold running is the JAX worker's, which is who a Stop is for.
+JAX_FOLDING = {"on": False}
 # 🔴 AND WHEN THE RUNTIME PAGE LAST ASKED FOR ITS COMMANDS, which is the only
 # sign of life there is. A Colab runtime is recycled when the notebook is
 # closed or left idle, and a reader whose fold was mid-flight then polls a
@@ -255,7 +261,81 @@ class Backend:
             time.sleep(0.25)
         return False
 
-def serve(port, backend, token, host="127.0.0.1"):
+def push_event(event):
+    """One event into the mailbox, as `/up` would put it there."""
+    global EVENT_BASE
+    event["got"] = int(time.time() * 1000)
+    with MAIL_LOCK:
+        EVENTS.append(event)
+        if event.get("kind") == "result":
+            FOLDING["on"] = False
+            JAX_FOLDING["on"] = False
+        if len(EVENTS) > EVENT_CAP:
+            drop = len(EVENTS) - EVENT_CAP // 2
+            del EVENTS[:drop]
+            EVENT_BASE += drop
+
+
+class JaxWorker:
+    """tools/jax_worker.py, started on the first JAX fold and kept for the next.
+
+    🔴 ITS LINES ARE EVENTS, ITS SEQ IS ITS OWN. The worker prints one bridge
+    event per line; they are numbered here, as the page numbers its own, so
+    the reader's sort-by-seq holds for them too. One fold runs at a time, so
+    the two numberings never interleave.
+    """
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.proc = None
+        self.seq = 0
+        self.lock = threading.Lock()
+
+    def _start(self):
+        self.proc = subprocess.Popen(
+            [sys.executable, os.path.join(REPO, "tools", "jax_worker.py")],
+            cwd=self.directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, bufsize=1)
+        threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("kind") == "jax-ready":
+                continue
+            with self.lock:
+                event["seq"] = self.seq
+                self.seq += 1
+            push_event(event)
+        # ...a worker that died mid-fold must still end the fold.
+        with MAIL_LOCK:
+            folding = FOLDING["on"]
+        if folding and proc is self.proc:
+            push_event({"kind": "result", "seq": self.seq, "at": int(time.time() * 1000),
+                        "payload": {"error": "the JAX worker exited"}})
+
+    def fold(self, payload):
+        with self.lock:
+            if self.proc is None or self.proc.poll() is not None:
+                self._start()
+            self.proc.stdin.write(json.dumps(payload) + "\n")
+            self.proc.stdin.flush()
+
+    def stop(self):
+        """JAX cannot be interrupted mid-computation: the worker goes, and the
+        next JAX fold starts a new one (and recompiles)."""
+        with self.lock:
+            proc, self.proc = self.proc, None
+        if proc is not None:
+            proc.kill()
+        push_event({"kind": "result", "seq": self.seq, "at": int(time.time() * 1000),
+                    "payload": {"error": "stopped"}})
+
+
+def serve(port, backend, token, host="127.0.0.1", jax=None):
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=REPO, **kw)
@@ -383,6 +463,7 @@ def serve(port, backend, token, host="127.0.0.1"):
                                         # Disconnect releases the MACHINE or
                                         # only stops the service on it.
                                         "colabRuntime": bool(RUNTIME_ADDR),
+                                        "backends": ["webgpu"] + (["jax"] if jax else []),
                                         "gpu": backend.adapter()})
             return super().do_GET()
 
@@ -453,6 +534,21 @@ def serve(port, backend, token, host="127.0.0.1"):
                 return None
             if op not in ("fold", "stop", "ping"):
                 return self._json(400, {"error": f'unknown op "{op}"'})
+            payload = body.get("payload") or {}
+            if op == "fold" and payload.get("backend") == "jax":
+                if jax is None:
+                    return self._json(400, {"error": "this runtime has no JAX backend"})
+                with MAIL_LOCK:
+                    if FOLDING["on"]:
+                        return self._json(429, {"error": "one GPU, one fold: try again"})
+                    FOLDING["on"] = True
+                    JAX_FOLDING["on"] = True
+                jax.fold(payload)
+                return self._json(200, {"ok": True, "backend": "jax"})
+            if op == "stop" and JAX_FOLDING["on"] and jax is not None:
+                JAX_FOLDING["on"] = False
+                jax.stop()
+                return self._json(200, {"ok": True, "backend": "jax"})
             with MAIL_LOCK:
                 if op == "fold" and FOLDING["on"]:
                     return self._json(429, {"error": "one GPU, one fold: try again"})
@@ -482,11 +578,14 @@ def main():
     parser.add_argument("--profile", default="/tmp/localfold-backend")
     parser.add_argument("--host", default="127.0.0.1",
                         help="what to bind; the tunnel reaches loopback")
+    parser.add_argument("--jax-dir", default=None,
+                        help="the ColabFold2 install directory: offers the JAX backend")
     arguments = parser.parse_args()
 
     token = arguments.token or secrets.token_urlsafe(24)
     backend = Backend(arguments.port, arguments.cdp_port, arguments.profile, token)
-    httpd = serve(arguments.port, backend, token, arguments.host)
+    jax = JaxWorker(arguments.jax_dir) if arguments.jax_dir else None
+    httpd = serve(arguments.port, backend, token, arguments.host, jax)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {REPO} on {arguments.host}:{arguments.port}"
           + (" · Disconnect will release this Colab machine" if RUNTIME_ADDR
@@ -517,6 +616,8 @@ def main():
         # In a Colab runtime the container takes them; on a developer's machine
         # they are the "another browser on the machine" that makes the next
         # measurement somebody else's.
+        if jax is not None and jax.proc is not None:
+            jax.proc.kill()
         if backend.proc is not None:
             backend.proc.terminate()
             try:

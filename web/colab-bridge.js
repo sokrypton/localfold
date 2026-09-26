@@ -382,6 +382,15 @@ export function revivePrediction(json) {
   });
 }
 
+/**
+ * Which implementation folds on the runtime: this page's WebGPU fold, run by
+ * the runtime's headless copy of it, or af3-any-model on JAX (the reference,
+ * and the only one that reaches a TPU). The badge offers the choice when the
+ * runtime was started with a JAX backend; see tools/jax_worker.py.
+ */
+let backendChoice = "webgpu";
+export const remoteBackendChoice = () => backendChoice;
+
 /** Ask the runtime for something. Returns the command's sequence number. */
 export const remoteCommand = (op, payload) => ask("/in", { op, payload });
 
@@ -475,6 +484,32 @@ function installColabStatus() {
       // by hand there is no machine to hand back, and a button that promises
       // one either way is wrong half the time.
       releases = health.colabRuntime === true;
+      // 🔴 THE CHOICE APPEARS ONLY WHERE IT EXISTS. A runtime started without
+      // `--jax-dir` has one backend, and a select with one option is a control
+      // that pretends there is something to decide.
+      if ((health.backends ?? []).includes("jax") && !badge.querySelector("select")) {
+        const pick = document.createElement("select");
+        pick.className = "colab-backend";
+        pick.title = "WebGPU: this page's own fold, on the runtime's GPU - fast to"
+          + " start. JAX: af3-any-model, the reference implementation - a minute of"
+          + " compile on its first fold, and the one that runs on a TPU.";
+        for (const [value, text] of [["webgpu", "WebGPU"], ["jax", "JAX"]]) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = text;
+          pick.append(option);
+        }
+        try { pick.value = localStorage.getItem("localfold.colabBackend") ?? "webgpu"; }
+        catch (cause) { /* no storage: the default */ }
+        if (pick.value === "") pick.value = "webgpu";
+        backendChoice = pick.value;
+        pick.addEventListener("change", () => {
+          backendChoice = pick.value;
+          try { localStorage.setItem("localfold.colabBackend", pick.value); }
+          catch (cause) { /* remembered for this page only */ }
+        });
+        badge.insertBefore(pick, leave);
+      }
       leave.title = releases
         ? "Stop folding here and release this Colab machine: the service"
           + " stops, its GPU is freed and the runtime is unassigned. This page"

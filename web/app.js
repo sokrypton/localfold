@@ -69,7 +69,7 @@ import { entitiesFromText, entitiesProblem, expandEntities, POLYMER_TYPES,
          templateKind } from "./entities.js";
 import { buildFoldArchive, tokenLayoutFrom, msasFromArchive,
          SINGLE_SEQUENCE_ORIGIN } from "./fold-archive.js";
-import { jobFromJson } from "./job-json.js";
+import { jobFromJson, jobInputJson } from "./job-json.js";
 import {
   clearSession, jobMeta, readSession, readSessionMeta, saveSession,
 } from "./fold-session.js";
@@ -78,8 +78,8 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
-import { colabRole, installColabBridge, remoteCommand, remoteEvents, remoteHead,
-  revivePrediction, tapOut } from "./colab-bridge.js";
+import { colabRole, installColabBridge, remoteBackendChoice, remoteCommand, remoteEvents,
+  remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -3930,7 +3930,15 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   const { entities, controls } = formInputs();
   const request = { entities, controls };
   const label = MODEL_LABELS[family] ?? family;
-  status(`${label} · folding on the runtime…`);
+  // 🔴 A JAX FOLD IS HANDED THE JOB AS AlphaFold 3 JSON, written by the same
+  // module that writes the archive's request - so the entity conversion is
+  // this page's and not re-implemented in Python. See tools/jax_worker.py.
+  if (remoteBackendChoice() === "jax") {
+    request.backend = "jax";
+    request.job = jobInputJson({ name: safeJobName(entityList.header() ?? "fold"),
+      seed: Number(controls["random-seed"]) || 1, entities });
+  }
+  status(`${label} · folding on the runtime${request.backend === "jax" ? " with JAX" : ""}…`);
   progress("waiting");
   // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
   // every event of the session, so a reader that started at zero would replay

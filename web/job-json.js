@@ -120,6 +120,17 @@ export function jobRequestJson({ name, seed, entities }) {
 }
 
 /**
+ * The job as AlphaFold 3's own open-source JSON, which is what run_alphafold.py
+ * and the JAX backend read (tools/jax_worker.py) - the server dialect's reader
+ * there takes version 1 only, and this page writes 3.
+ */
+export function jobInputJson({ name, seed, entities }) {
+  // ...as ONE object: a JSON list is how that reader recognises the SERVER
+  // dialect, so the archive's `[{...}]` is refused there as a malformed one.
+  return `${JSON.stringify(JSON.parse(openDialectJson({ name, seed, entities }))[0], null, 2)}\n`;
+}
+
+/**
  * The same job in the open-source dialect, for a fold the server's cannot hold.
  *
  * 🔴 COPIES ARE AN `id` LIST HERE, NOT A `count`, and the ids must be unique
