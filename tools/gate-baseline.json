@@ -12,7 +12,7 @@
       "rosettafold3": "\"meanPlddt\": 81.53424395815864"
     },
     "portable": {
-      "AF2": "\"checksum\": -1309830",
+      "AF2": "\"checksum\": -1315603",
       "AF3": "\"meanPlddt\": 85.83318174009955",
       "OpenDDE": "\"meanPlddt\": 92.03958163111882",
       "ESMFold2": "\"meanPlddt\": 73.342",

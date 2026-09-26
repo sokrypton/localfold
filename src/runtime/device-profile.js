@@ -389,7 +389,15 @@ export const DEFAULT_TUNING = Object.freeze({
   gridAttendMatrix: null,
   esmfold2TokenRowTile: null,
   esmcRowTile: null,
-  runtimeLoopBounds: null,
+  // 🔴 TIERED ON EVERY DEVICE, because a first fold is mostly driver compile on
+  // every NVIDIA part measured and most visitors fold once. Colab, driver cache
+  // cleared, AF3 68 residues first fold / AF2 whole run, seconds: T4 14 -> 8.6
+  // and 11.7 -> 4.4 (with the flash attention below), L4 3.7 -> 2.56 and 3.8 ->
+  // 2.45, A100 4.07 -> 2.5 and 3.9 -> 2.4, G4 (Blackwell) at 255 residues 2.76 ->
+  // 1.77 and 2.09 -> 1.55. Bit-identical; the cost is a few slower folds while
+  // the unrolled kernels compile behind them. Benchmarks run it off - see
+  // tools/gpu-chrome.mjs.
+  runtimeLoopBounds: "tiered",
   // Its geometry, "subgroupsXkeys"; null takes GRID_ATTEND_MATRIX_DEFAULT_TILE.
   gridAttendMatrixTile: null,
   // 🔴 THE PAIR TRANSITION AS THREE PASSES INSTEAD OF ONE, ON THE MATRIX UNITS.
@@ -645,7 +653,10 @@ const PRIORS = new Map([
     // softmax per key and the workgroup bytes per lane, and it MOVED when the
     // softmax got cheaper - 6x16 before the hoists, 4x32 after. Re-sweep it
     // before trusting it on another part; see src/kernels/attention-matrix.js.
-    attentionMatrix: true,
+    // 🔴 AND IT SHIPS OFF: a Colab A100 pays for it on a first fold (AF2's whole
+    // run 3.9 -> 2.4 s without it, repeats level), and most visitors fold once.
+    // `--tune=attentionMatrix=true` is the warm arm.
+    attentionMatrix: false,
     attentionMatrixTile: "4x32",
     // 🔴 THE TRANSITION CHUNK, RE-SWEPT AT 825 RESIDUES. TRANSITION_CHUNK_TARGET_BYTES
     // is 32 MiB and its knee was measured on a 59-residue fold as a MEMORY
@@ -1187,11 +1198,8 @@ const PRIORS = new Map([
 // upgrade queue runs a quarter of the CPU's threads wide, three here) and
 // AF2's flash attention off the matrix units, which halves AF2's cold run as
 // it did on the T4.
-PRIORS.set("lovelace", {
-  ...PRIORS.get("ampere"),
-  runtimeLoopBounds: "tiered",
-  attentionMatrix: false,
-});
+// Those two are the defaults for every device now, so this is ampere's.
+PRIORS.set("lovelace", PRIORS.get("ampere"));
 
 // NVIDIA RTX PRO 6000 Blackwell (Colab "G4", 48 vCPUs), 2026-09-26, two rounds
 // interleaved, driver cache cleared, seconds:
@@ -1329,7 +1337,10 @@ export function matrixCapabilityTuning(device, matrixConfigs = []) {
   if (!matrixConfigs.some((c) => c.componentType === "f16")) return {};
   return {
     matrixLinear: true,
-    attentionMatrix: true,
+    // Not the flash attention: its three variants cost more driver compile on a
+    // first fold than they save warm, on all four Colab NVIDIA parts measured
+    // (see runtimeLoopBounds in DEFAULT_TUNING and the turing prior).
+    attentionMatrix: false,
     attentionProjectMatrix: true,
     opmMatrixContract: true,
     stagedMatrixPrefetch: true,

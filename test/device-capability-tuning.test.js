@@ -16,7 +16,10 @@ test("a device with the units, shader-f16 and an f16 configuration gets the matr
   const tuning = matrixCapabilityTuning(
     device("chromium-experimental-subgroup-matrix", "shader-f16"), [f16Config]);
   assert.deepEqual(Object.keys(tuning).sort(), EXPECTED);
-  assert.ok(Object.values(tuning).every((value) => value === true));
+  // ...all but the flash attention, which it turns OFF: its compile outweighs
+  // its warm gain on a first fold, measured on four Colab NVIDIA parts.
+  assert.equal(tuning.attentionMatrix, false);
+  assert.ok(Object.entries(tuning).every(([key, value]) => key === "attentionMatrix" || value === true));
 });
 
 test("no subgroup-matrix feature means no capability tuning at all", () => {

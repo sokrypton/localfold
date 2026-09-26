@@ -212,6 +212,16 @@ try {
   // page's template literal and one would end it, which it just did.
   // --prior=NAME answers with another architecture's prior, for a GPU none
   // was measured on. NOTE: no backticks in this comment either.
+  // 🔴 A BENCHMARK MEASURES STEADY STATE, SO IT GETS THE UNROLLED KERNELS.
+  // Tiered loop bounds are every device's default and hand a first request the
+  // slow-to-run, quick-to-compile kernel; a bench-* or profile-* tool's few
+  // passes would time that instead. Named with --tune or --tune-json, it wins.
+  if (/[/](bench|profile)-[^/]*$/.test(${JSON.stringify(modulePath)})
+      && !${JSON.stringify(moduleArgs)}.some((a) => a.includes("runtimeLoopBounds"))) {
+    const { setDeviceTuning } = await import("/src/runtime/device-profile.js");
+    setDeviceTuning(device, { runtimeLoopBounds: false });
+    console.log("[gpu-chrome] runtimeLoopBounds off for a benchmark");
+  }
   const priorAs = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--prior="));
   if (priorAs !== undefined) {
     const { useDevicePrior } = await import("/src/runtime/device-profile.js");

@@ -1009,7 +1009,22 @@ The G4 (RTX PRO 6000 Blackwell, 48 vCPUs, `architecture: "blackwell"`) has the
 same shape at half the times - ampere's settings win warm (AF3 68 0.30 s a fold
 against 0.49; 255 0.85 against 1.18), the tiered compile wins AF3 255's first
 fold (1.77 s against 2.76) and AF2's cold run (1.55 against 2.09) - so it takes
-the lovelace prior. The table is in src/runtime/device-profile.js. Colab also offered an A100 (the ampere prior's
+the lovelace prior. The table is in src/runtime/device-profile.js.
+
+🔴 **AND THEN IT BECAME EVERY DEVICE'S DEFAULT.** A Colab A100 (the ampere
+prior's own architecture, 12 vCPUs) shows the same trade: AF3 68 first fold
+4.05-4.09 -> 2.48-2.59 s, AF3 255 5.0-5.4 -> 3.8, AF2's whole run 3.9 -> 2.4,
+with later folds 0.53-0.57 -> 0.99-1.08 until the upgrades land. Four NVIDIA
+parts, one answer, so `runtimeLoopBounds: "tiered"` is in DEFAULT_TUNING and
+AF2's flash attention is off in the capability layer and the ampere prior;
+lovelace and blackwell are ampere's prior again. Bench and profile tools run
+tiered OFF (gpu-chrome.mjs), because a few passes would time the first-build
+kernels; `--tune-json={"runtimeLoopBounds":"tiered"}` puts it back.
+`test:portable`'s AF2 signature moved -1309830 -> -1315603 on the A100, which
+is the flash-attention kernel and nothing else (the Colab A100 gave the same
+pair with the knob on and off); the other seven and all of `test:stock` and
+`test:spec-floor` are unchanged. An M2 inherits the default too and has not
+measured it. Colab also offered an A100 (the ampere prior's
 own architecture) and a G4; H100 was refused on Pro, and neither was measured.
 
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight

@@ -65,9 +65,11 @@ Measured on Colab T4s and one L4 (docs/PERF.md, "A Colab T4" and "A Colab L4"):
   kernel's first pipeline compiles with opaque loop bounds and is GENERIC over
   its u32 constants (read from a uniform in bind group 1), so a new protein
   length reuses it; the specific, unrolled kernel compiles behind the fold.
-  Bit-identical everywhere checked. **Not active on an M2** - `metal-3` does not
-  set it. Whether Apple's compiler is slow enough on a first fold to want it is
-  a question for `--tune-json={"runtimeLoopBounds":"tiered"}` on the page.
+  Bit-identical everywhere checked. 🔴 **IT IS EVERY DEVICE'S DEFAULT NOW, SO
+  AN M2 RUNS IT** - measured only on NVIDIA. Its control arm is
+  `--tune-json={"runtimeLoopBounds":false}`; compare a first fold and the next
+  few on the page, and if Apple's compiler is fast enough that it only costs,
+  `metal-3` should set it false.
 - a `lovelace` prior (ampere's settings + tiered + `attentionMatrix: false`).
 - `gpu-chrome.mjs --prior=NAME` answers with another architecture's prior.
 - `tools/gpu/fold.js` now applies `--tune` BEFORE its pipeline warm; earlier
