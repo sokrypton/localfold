@@ -57,6 +57,25 @@ against the same on `main`, and `--keep-profile` for the second-visit number.
 CLAUDE.md's round-three notes say an M2's first AF2 fold WAS its compile queue,
 so Apple's compiler may make these matter more, not less.
 
+### 2b. Since the handoff: Colab GPUs, and what does NOT reach an M2
+
+Measured on Colab T4s and one L4 (docs/PERF.md, "A Colab T4" and "A Colab L4"):
+
+- `runtimeLoopBounds: "tiered"` (turing and lovelace priors only): each
+  kernel's first pipeline compiles with opaque loop bounds and is GENERIC over
+  its u32 constants (read from a uniform in bind group 1), so a new protein
+  length reuses it; the specific, unrolled kernel compiles behind the fold.
+  Bit-identical everywhere checked. **Not active on an M2** - `metal-3` does not
+  set it. Whether Apple's compiler is slow enough on a first fold to want it is
+  a question for `--tune-json={"runtimeLoopBounds":"tiered"}` on the page.
+- a `lovelace` prior (ampere's settings + tiered + `attentionMatrix: false`).
+- `gpu-chrome.mjs --prior=NAME` answers with another architecture's prior.
+- `tools/gpu/fold.js` now applies `--tune` BEFORE its pipeline warm; earlier
+  `--tune` arms that changed a kernel warmed the prior's kernels first.
+- Tried on the T4 and not taken: the triangle projection on the matrix units
+  (a cold fold pays more than a warm one saves), capping concurrent compiles,
+  a tiled distogram (its 900 ms was the stage timer absorbing queued work).
+
 ### 3. Correctness to re-check where the backend CLAMPS
 
 Metal clamps an out-of-range write where Vulkan discards it (the 160-residue
