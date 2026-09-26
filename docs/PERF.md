@@ -659,6 +659,16 @@ every model folded, alignment included:
 fold and were left: they already normalise each row once, and what is left is
 uncoalesced reads.
 
+🔴 **DEAD END: THE DIFFUSION TRANSFORMER'S ATTENTION, SEVERAL QUERIES A
+WORKGROUP.** Its value step runs on 48 of 256 lanes, each walking all 255 keys
+in turn, so five queries of one head per workgroup fill it (240 lanes) and share
+the key staging and the barriers - bit-identical, since each query keeps its
+lane layout and its sum order. `attend` 7.37 -> 6.55 ms a denoiser call at 255
+tokens (2: 6.99, 3: 6.96, 4: 6.64) and ~20 ms of a 3.46 s fold, for ~130 lines
+of shader. Staging the values as well, to shorten each lane's chain of global
+loads, was WORSE (8.75). The chain is what binds it, and shortening it means
+splitting the key sum across lanes, which changes its order. Not taken.
+
 ## Memory: what a large fold holds, and what it no longer does
 
 🔴 **FIVE CHANGES, ALL BIT-IDENTICAL, AND THE ONE THAT IS NOT FREE IS SIZE-GATED.**
