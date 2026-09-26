@@ -899,6 +899,18 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                         </button>
                     </div>
 
+                    <!-- 🔴 THE CONFIDENCE TRACE'S BOX, WHICH IS HALF OF TURNING IT
+                         ON. py2Dmol's panel finds its own DOM and does nothing
+                         at all until this exists - so the call in web/app.js's
+                         revealViewer is inert without it, silently, because a
+                         panel with no container returns null rather than
+                         throwing. The other half is the vendored bundle: the
+                         panel has to BE in it. Both or neither.
+                         Every structure on this page is a prediction, which is
+                         why we ask for a plot py2Dmol's own site does not
+                         offer - there a B-factor column would be titled pLDDT. -->
+                    <div id="plddtContainer" class="container-box" style="display: none;"></div>
+
                     <!-- Scatter Plot Container (mirrors main viewer sizing; JS sets dimensions) -->
                     <div id="scatterContainer" class="container-box" style="display: none; position: relative;">
                         <canvas id="scatterCanvas" style="cursor: pointer;"></canvas>
