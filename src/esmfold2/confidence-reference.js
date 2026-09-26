@@ -109,6 +109,66 @@ export function tmScores(paeLogits, tokenMask, asymId, tokens, bins) {
   return { ptm, iptm };
 }
 
+/**
+ * The expected PAE AND pTM/ipTM in one pass over the logits.
+ *
+ * 🔴 `categoricalMean` and `tmScores` each take the SAME softmax of every
+ * pair's bins - the same `Math.exp(logit - top)`, 64 of them for each of
+ * `tokens^2` pairs - so a fold computed ~8.3M exps where 4.2M give identical
+ * values: ~140 ms of host time at 255 tokens. This computes each weight once
+ * and accumulates the three sums exactly as the two functions do, in the same
+ * order, so both answers are bit-identical to theirs. Those two stay, because
+ * the reference and its checkers call them separately.
+ */
+export function paeAndTmScores(paeLogits, tokenMask, asymId, tokens, bins) {
+  const width = 32 / bins;
+  const pae = new Float32Array(tokens * tokens);
+  let live = 0;
+  for (let token = 0; token < tokens; token += 1) live += tokenMask[token] > 0.5 ? 1 : 0;
+  const d0 = 1.24 * Math.cbrt(Math.max(live, 19) - 15) - 1.8;
+  const perBin = new Float32Array(bins);
+  const centres = new Float64Array(bins);
+  for (let bin = 0; bin < bins; bin += 1) {
+    const centre = width * (bin + 0.5);
+    perBin[bin] = 1 / (1 + (centre / d0) ** 2);
+    centres[bin] = 0 + width * (bin + 0.5);
+  }
+  let ptm = -Infinity;
+  let iptm = -Infinity;
+  for (let i = 0; i < tokens; i += 1) {
+    let sum = 0;
+    let count = 0;
+    let interSum = 0;
+    let interCount = 0;
+    for (let j = 0; j < tokens; j += 1) {
+      const row = i * tokens + j;
+      const at = row * bins;
+      let top = -Infinity;
+      for (let bin = 0; bin < bins; bin += 1) top = Math.max(top, paeLogits[at + bin]);
+      let total = 0;
+      let mean = 0;
+      let weighted = 0;
+      for (let bin = 0; bin < bins; bin += 1) {
+        const weight = Math.exp(paeLogits[at + bin] - top);
+        total += weight;
+        mean += weight * centres[bin];
+        weighted += weight * perBin[bin];
+      }
+      pae[row] = mean / total;
+      const expected = weighted / total;
+      const pair = (tokenMask[i] > 0.5 ? 1 : 0) * (tokenMask[j] > 0.5 ? 1 : 0);
+      sum += expected * pair;
+      count += pair;
+      const inter = pair * (asymId[i] !== asymId[j] ? 1 : 0);
+      interSum += expected * inter;
+      interCount += inter;
+    }
+    ptm = Math.max(ptm, sum / (count + 1e-8));
+    iptm = Math.max(iptm, interSum / (interCount + 1e-8));
+  }
+  return { pae, ptm, iptm };
+}
+
 /** Row-attention pooling: a scalar per pair, a masked softmax along j, then 256 -> 384. */
 export function singleFromPair(pair, tokenMask, tokens, pairChannels, singleChannels, weights) {
   const scores = linear(pair, tokens * tokens, pairChannels, 1, weights.poolingAttention);

@@ -100,6 +100,31 @@ export function layerNorm(input, rows, channels, scale, offset) {
 export function linear(input, rows, inChannels, outChannels, weights, bias = null,
                        transposed = false) {
   const output = new Float32Array(rows * outChannels);
+  // 🔴 THE (in, out) LAYOUT WALKS ITS WEIGHTS ROW BY ROW, NOT COLUMN BY COLUMN.
+  // The loop below read `weights[c * outChannels + out]` innermost - a stride
+  // of outChannels floats a step, one cache line per multiply - and it is on
+  // the fold's own path (ESMFold2's confidence head, AF3's per-atom
+  // conditioning). This order touches the weights contiguously and gives each
+  // output an f64 accumulator summed over `c` in the SAME ascending order the
+  // column loop used, so every output is the same f64 sum rounded once: the
+  // result is bit-identical, not merely close.
+  if (!transposed) {
+    const accumulator = new Float64Array(outChannels);
+    for (let row = 0; row < rows; row += 1) {
+      const inputBase = row * inChannels;
+      if (bias === null) accumulator.fill(0);
+      else for (let out = 0; out < outChannels; out += 1) accumulator[out] = bias[out];
+      for (let c = 0; c < inChannels; c += 1) {
+        const value = input[inputBase + c];
+        const weightBase = c * outChannels;
+        for (let out = 0; out < outChannels; out += 1) {
+          accumulator[out] += value * weights[weightBase + out];
+        }
+      }
+      output.set(accumulator, row * outChannels);
+    }
+    return output;
+  }
   for (let row = 0; row < rows; row += 1) {
     const inputBase = row * inChannels;
     const outputBase = row * outChannels;
