@@ -29,6 +29,8 @@ import {
   MOL_DNA, MOL_RNA,
 } from "./featurise.js";
 import { EsmcTowerGpu } from "../esmc/tower-webgpu.js";
+import { createAddShader } from "../runtime/execution.js";
+import { memoryBudgetBytes } from "../runtime/device-memory.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { yieldToBrowser } from "../runtime/yield.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -765,7 +767,28 @@ export async function foldEsmfold2(device, options) {
     // - so the head's copy is taken HERE, beside the `wantReusable` one above
     // and by the same route. It costs `tokens^2 x 256` of traffic once a fold,
     // and only when the bundle carries a head at all.
-    const confidencePair = options.confidenceWeights == null ? undefined
+    // 🔴 A DEVICE COPY, NOT A HOST ONE, unless the caller wants the head's
+    // inputs back as arrays or a memory ceiling cannot spare it. The head binds
+    // it; a host copy was a 64 MiB readback at 255 tokens followed by the same
+    // upload - with the relative encoding's, 3.96 -> 3.56 s a warm fold. Both
+    // copies live through the sampler, +127 MiB of peak at 255 tokens, so a
+    // device WITH a ceiling takes them only while they are a sixth of it (the
+    // page sets none; on unified memory a host copy costs the same RAM).
+    const budget = memoryBudgetBytes(device);
+    const deviceConfidence = options.confidenceWeights != null
+      && options.returnConfidenceInputs !== true
+      && (budget == null || 2 * pairs * channels * 4 * 6 < budget);
+    const deviceCopy = (label, source) => {
+      const copy = allocator.allocate(label, pairs * channels * 4,
+                                      storage | GPUBufferUsage.COPY_DST);
+      const encoder = device.createCommandEncoder({ label });
+      encoder.copyBufferToBuffer(source.buffer, 0, copy.buffer, 0, pairs * channels * 4);
+      device.queue.submit([encoder.finish()]);
+      return copy;
+    };
+    const confidencePairOnDevice = deviceConfidence
+      ? deviceCopy("esmfold2.confidence-pair", pair) : undefined;
+    const confidencePair = options.confidenceWeights == null || deviceConfidence ? undefined
       : await (async () => {
         const back = allocator.allocate("esmfold2.confidence-pair", pairs * channels * 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
@@ -838,7 +861,9 @@ export async function foldEsmfold2(device, options) {
     // call writes the pair conditioning straight into this buffer, and the
     // table that would let it be rebuilt is released three lines down.
     // Measured absent: 13.8 pLDDT and a PAE 2.4x rougher. See docs/EF2FAST.md.
-    const confidenceRelPos = options.confidenceWeights == null ? undefined
+    const confidenceRelPosOnDevice = deviceConfidence
+      ? deviceCopy("esmfold2.confidence-relpos", relPos) : undefined;
+    const confidenceRelPos = options.confidenceWeights == null || deviceConfidence ? undefined
       : await (async () => {
         const back = allocator.allocate("esmfold2.confidence-relpos",
           pairs * channels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
@@ -864,6 +889,24 @@ export async function foldEsmfold2(device, options) {
     // where the relative encoding is 12.97, so this changes no protein fold -
     // and a ligand or a declared bond is exactly where leaving it out would
     // have been the same silent defect a second time.
+    if (confidenceRelPosOnDevice !== undefined) {
+      // The same two steps on the device: the product stored, then added -
+      // never fused into one multiply-add, so it is the host's f32 sum.
+      const bondTerm = allocator.allocate("esmfold2.confidence-bonds",
+        pairs * channels * 4, storage);
+      const values = allocator.upload("esmfold2.confidence-bond-values",
+        features.tokenBonds, storage);
+      const table = allocator.upload("w.esmfold2.confidence-bond-weights",
+        weights.featuriser.tokenBonds, storage);
+      const addBonds = await cache.get(`ef2-conf-add:${pairs * channels}`,
+                                       createAddShader(pairs * channels));
+      await submit("esmfold2.confidence-bonds", [
+        ["bonds", bond, [values, table, bondTerm], ...elementwise(pairs * channels)],
+        ["bonds-add", addBonds, [confidenceRelPosOnDevice, bondTerm],
+         ...elementwise(pairs * channels)],
+      ], false);
+      for (const allocation of [bondTerm, values, table]) allocation.release();
+    }
     if (confidenceRelPos !== undefined) {
       const bondTerm = allocator.allocate("esmfold2.confidence-bonds",
         pairs * channels * 4, storage | GPUBufferUsage.COPY_SRC);
@@ -969,10 +1012,11 @@ export async function foldEsmfold2(device, options) {
       const rep = representativeAtoms(features, tokens);
       confidence = await esmfold2ConfidenceFold(device, {
         tokens, atoms, sInputs, pair: confidencePair, coordinates: x, repAtom: rep,
+        pairBuffer: confidencePairOnDevice?.buffer,
         atomToToken: features.atomToToken,
         atomMask: features.mask,
         tokenMask: new Float32Array(tokens).fill(1),
-        pairBias: confidenceRelPos,
+        pairBias: confidenceRelPos, pairBiasBuffer: confidenceRelPosOnDevice?.buffer,
         // 🔴 WITHOUT THIS EVERY COMPLEX REPORTS ipTM 0.000. ipTM is the same
         // expectation as pTM taken over the pairs whose `asymId` DIFFER, and
         // the reference defaulted a missing one to `new Int32Array(tokens)` -
@@ -983,6 +1027,8 @@ export async function foldEsmfold2(device, options) {
         // every fold this head was gated on.
         asymId: features.asymId,
       }, options.confidenceWeights, { allocator });
+      confidencePairOnDevice?.release();
+      confidenceRelPosOnDevice?.release();
       // 🔴 THE HEAD'S OWN INPUTS, FOR THE ARM THAT RUNS SYNTHYRA'S MODULE ON A
       // REAL TRUNK. `dump_esmfold2_confidence.py` gates the head's ARITHMETIC
       // on seeded normals - its own header says a run on a real trunk's pair is

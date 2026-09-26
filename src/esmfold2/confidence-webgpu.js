@@ -402,14 +402,15 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
     // that forgets it gets a quietly worse answer and no error - which is
     // exactly what happened here. A zero buffer would reproduce that silence,
     // so this refuses instead.
-    if (input.pairBias === undefined) {
+    if (input.pairBias === undefined && input.pairBiasBuffer === undefined) {
       throw new Error("ef2 confidence: pairBias is required (see docs/EF2FAST.md)");
     }
     pass.setBindGroup(0, bind(init, [
       pair, up("constants", constants), projected4?.rows ?? up("rows", input.rows),
       projected4?.cols ?? up("cols", input.cols),
       projected, up("embedding", weights.distanceEmbedding), out,
-      up("pairbias", input.pairBias)]));
+      input.pairBiasBuffer !== undefined ? { buffer: input.pairBiasBuffer }
+        : up("pairbias", input.pairBias)]));
     pass.dispatchWorkgroups(Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
     pass.end();
     // 🔴 ON THE DEVICE WHEN THE FOLD ASKS, because its only reader is the
@@ -554,7 +555,7 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
 
   const initial = await esmfold2ConfidencePairInit(device, {
     tokens, pair: input.pair, pairBuffer: input.pairBuffer,
-    normed, repCoordinates, pairBias: input.pairBias,
+    normed, repCoordinates, pairBias: input.pairBias, pairBiasBuffer: input.pairBiasBuffer,
   }, weights, { allocator, keepOnDevice: true });
 
   // 🔴 PAIR INIT -> BLOCKS -> READOUTS ON THE DEVICE. Each stage handed the
