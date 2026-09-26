@@ -265,7 +265,8 @@ export class Af3MsaStackGpu {
       for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-msa.scratch${index}`,
-          storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index]), storage)));
+          pipelines.pairScratchBytes(index,
+  storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index])), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-msa.bias", gridHeads * pairs * 4, storage));

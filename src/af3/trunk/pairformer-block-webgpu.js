@@ -604,7 +604,8 @@ export class Af3PairformerStackGpu {
       for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-block.scratch${index}`,
-          storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index]), storage)));
+          pipelines.pairScratchBytes(index,
+  storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index])), storage)));
       }
       // Uploaded once for the stack, not per block: it is the same tensor for
       // all four of the refiner's blocks.

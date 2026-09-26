@@ -58,7 +58,7 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { storageBytes } from "../runtime/storage.js";
 import {
-  pairScratchCount, UNPACKED_PAIR_SCRATCH,
+  UNPACKED_PAIR_SCRATCH,
   compilePairTrack, encodePairTrack, packPairTrackWeights,
 } from "../af3/trunk/pair-track-gpu.js";
 
@@ -263,10 +263,11 @@ export class Esmfold2TrunkGpu {
       const scratch = [];
       // ...four of them without the grid attention, not five; see
       // pairScratchCount in src/af3/trunk/pair-track-gpu.js.
-      for (let index = 0; index < pairScratchCount(gridAttention); index += 1) {
+      for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `esmfold2-trunk.scratch${index}`,
-          storageBytes(pairs * channels, UNPACKED_PAIR_SCRATCH[index]), storage)));
+          pipelines.pairScratchBytes(index,
+            storageBytes(pairs * channels, UNPACKED_PAIR_SCRATCH[index])), storage)));
       }
       // ...and the split transition's two intermediates, sized for one chunk of
       // rows. The widened one is 369 MiB at 300 tokens unchunked, which is the

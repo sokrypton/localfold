@@ -900,7 +900,8 @@ export class Af3TemplateEmbedderGpu {
       for (let index = 0; index < trackPipelines.pairScratchCount; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-template.scratch${index}`,
-          storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index]), storage)));
+          trackPipelines.pairScratchBytes(index,
+  storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index])), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-template.bias", gridHeads * pairs * 4, storage));

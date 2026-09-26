@@ -438,11 +438,20 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   // running the whole five-kernel update and not only the two.
   const columnOf = packAB
     ? `local.x * ${columnsPerThread}u + column` : `local.x + column * 8u`;
+  // 🔴 A GROUP OF CHANNELS AT A TIME, WHEN THE CALLER ASKS. a[h] and b[h] are
+  // read only by channel h's contraction, so the projection and the
+  // contraction can walk the channels in groups with a and b held for one group:
+  // a uniform `chunk` = (first channel, channel count) makes projectAB read the
+  // GLOBAL channel's weights and store a/b at the LOCAL one, and the
+  // contraction read local and write the global channel of its output. Off,
+  // the text is unchanged. Plain (unpacked) a/b only.
+  const channelChunked = shape.channelChunked === true && !packAB;
+  const H_END = channelChunked ? "min(CH, chunk.x + chunk.y)" : "CH";
   const plainStore = `    for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let h = h0 + ${columnOf};
-      if (h >= CH) { continue; }
+      if (h >= ${H_END}) { continue; }
       let cell = vec4<f32>(acc[r * ${columnsPerThread}u + column]);
-      let index = h * PAIRS + row;
+      let index = ${channelChunked ? "(h - chunk.x)" : "h"} * PAIRS + row;
       a[index] = pair_mask * cell.x * logistic(cell.y);
       b[index] = pair_mask * cell.z * logistic(cell.w);
     }`;
@@ -468,6 +477,7 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> a: array<${storageArray(abStorage)}>;
 @group(0) @binding(4) var<storage, read_write> b: array<${storageArray(abStorage)}>;
+${channelChunked ? "@group(0) @binding(5) var<uniform> chunk: vec4<u32>;" : ""}
 
 var<workgroup> tile_source: array<${projectRowVector}, 64>;
 // 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. a, b and their two gates are four
@@ -495,14 +505,14 @@ fn main(
   // With a single z slice this is exactly group.y, so a caller that has not
   // been taught to fold is unchanged.
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
-  let h0 = group.x * TILE_COLUMNS;
+  let h0 = ${channelChunked ? "chunk.x + " : ""}group.x * TILE_COLUMNS;
   let tile_index = local.y * 8u + local.x;
   // Each cell accumulates (a, a's gate, b, b's gate).
   var acc: array<${accVector}, ${rowsPerThread * columnsPerThread}>;
   for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
     let h = h0 + ${columnOf};
     var bias = ${accVector}(0.0);
-    if (h < CH) {
+    if (h < ${H_END}) {
       bias = ${accVector}(
         ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h]`))).join(",\n        ")});
     }
@@ -525,7 +535,7 @@ fn main(
       let h = h0 + ${columnOf};
       let slot = local.y * TILE_COLUMNS + ${columnOf};
       var packed = ${accVector}(0.0);
-      if (h < CH && weight_c < CZ) {
+      if (h < ${H_END} && weight_c < CZ) {
         let weight_index = h * CZ + weight_c;
         packed = ${accVector}(
           ${MATRICES.map(([, name]) =>
@@ -622,6 +632,7 @@ const CONTRACT_COLUMNS: u32 = ${CONTRACT_TILE.columns}u;
 @group(0) @binding(0) var<storage, read> a: array<${storageArray(abStorage)}>;
 @group(0) @binding(1) var<storage, read> b: array<${storageArray(abStorage)}>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+${channelChunked ? "@group(0) @binding(3) var<uniform> chunk: vec4<u32>;" : ""}
 
 // a's rows an invocation owns, and b's columns, each packed into one vector.
 var<workgroup> tile_a: array<${contractRowVector}, 64>;
@@ -674,7 +685,7 @@ fn main(
     let row = sum[r];
     ${overContractColumns((c) => `{
         let j = j0 + ${c}u * 8u;
-        if (j < L) { output[h * PAIRS + i * L + j] = ${contractColumnAt("row", c)}; }
+        if (j < L) { output[${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i * L + j] = ${contractColumnAt("row", c)}; }
       }`)}
   }
 }`;

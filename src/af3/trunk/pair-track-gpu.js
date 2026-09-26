@@ -76,22 +76,28 @@ function gridChunkWorthIt(n, channels, attention) {
   return n * n * width * 4 >= GRID_CHUNK_MIN_BYTES;
 }
 const GRID_CHUNKS = new WeakMap();
-function gridChunkUniforms(device, n) {
+function gridChunkUniforms(device, n, parts = 3) {
+  return chunkUniforms(device, `grid:${n}:${parts}`, n, Math.ceil(n / parts));
+}
+/** The triangle's channel groups, each with its (first channel, count) uniform. */
+function channelChunkUniforms(device, channels, groupChannels) {
+  return chunkUniforms(device, `channels:${channels}:${groupChannels}`, channels, groupChannels);
+}
+function chunkUniforms(device, key, n, rows) {
   let byLength = GRID_CHUNKS.get(device);
   if (byLength === undefined) GRID_CHUNKS.set(device, byLength = new Map());
-  let chunks = byLength.get(n);
+  let chunks = byLength.get(key);
   if (chunks === undefined) {
-    const rows = Math.ceil(n / 3);
     chunks = [];
     for (let from = 0; from < n; from += rows) {
       const count = Math.min(rows, n - from);
-      const uniform = device.createBuffer({ label: `grid-chunk-${n}-${from}`, size: 16,
+      const uniform = device.createBuffer({ label: `chunk-${key}-${from}`, size: 16,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       device.queue.writeBuffer(uniform, 0, new Uint32Array([from, count, 0, 0]));
       chunks.push({ from, count, uniform: { buffer: uniform } });
     }
     chunks.rows = rows;
-    byLength.set(n, chunks);
+    byLength.set(key, chunks);
   }
   return chunks;
 }
@@ -224,6 +230,18 @@ export async function compilePairTrack(cache, options) {
   const projectMatrix = options.triangleProjectMatrix !== undefined
     && options.triangleProjectMatrix !== false && !abPacked
     ? options.triangleProjectMatrix : false;
+  // 🔴 AND THE TRIANGLE A QUARTER OF ITS CHANNELS AT A TIME, which is one more
+  // pair-sized tensor. a[h] and b[h] are read only by channel h's contraction,
+  // so projectAB and the contraction walk the channels in quarters with a and b
+  // held for one quarter in a small fourth buffer; the contraction's output and
+  // the normalised hidden stay whole, and the grid - which needs its chunks
+  // somewhere - runs over quarters of its rows packed into those two. Three
+  // pair-sized tensors and a small one, where there were four. Same gate as the
+  // grid's chunking; vector projection and contraction over f32 scratch only.
+  const compact = options.channelChunked !== false && projectMatrix === false
+    && scratchStorage.every((storage) => storage === "f32") && n >= 9
+    && (gridChunked || !gridAttention)
+    && gridChunkWorthIt(n, channels, sample.pairAttention1);
   const abLayout = projectMatrix === false ? "blocked" : "interleaved";
   // ...and the output projection's two matrices, which the same knob moves and
   // which need a transpose rather than an interleave. See project-matrix.js.
@@ -255,7 +273,8 @@ export async function compilePairTrack(cache, options) {
     // of this track's updates do that now; see the note in
     // src/af3/trunk/transition-webgpu.js for what the add pass was costing.
     const { projectTile, contractTile, normalizeRows, projectGridWidth, ...sources } = createTriangleShaders(
-      shape, "f32", triangleOffsets, epsilon, direction, variance,
+      compact ? { ...shape, channelChunked: true } : shape,
+      "f32", triangleOffsets, epsilon, direction, variance,
       // 🔴 THE PROJECTION TILE IS THE CALLER'S, because it is an occupancy
       // choice and this file cannot see the device. undefined keeps
       // src/kernels/triangle/shaders.js's default, which is every device but ampere.
@@ -311,7 +330,7 @@ export async function compilePairTrack(cache, options) {
                   // ...and the 1/L, which is a `const`-free difference INSIDE
                   // normalize-hidden's source: two dialects sharing a base
                   // would otherwise collide on it.
-                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}`
+                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:cc${compact}`
                   // ...and the tile each vector kernel was generated at.
                   + `:pt${projectTile.rows}x${projectTile.columns}x${projectTile.outColumns ?? "-"}`
                   + `:${name}`,
@@ -547,7 +566,28 @@ export async function compilePairTrack(cache, options) {
   // grid attention runs at a time. Callers allocate `pairScratchCount`.
   pipelines.pairScratchCount = gridAttention && !gridChunked
     ? PAIR_SCRATCH_COUNT : PAIR_SCRATCH_COUNT - 1;
-  pipelines.gridChunks = gridChunked ? gridChunkUniforms(cache.device, n) : undefined;
+  pipelines.gridChunks = gridChunked
+    ? gridChunkUniforms(cache.device, n, compact ? 4 : 3) : undefined;
+  // Where the grid's five chunk tensors live: [scratch index, slot]. Thirds
+  // pack two to a buffer over scratch[1..3]; in compact mode scratch[3] is the
+  // small a/b buffer, so quarters pack three into scratch[1] and two into
+  // scratch[2] (3 * ceil(n / 4) <= n for n >= 9).
+  pipelines.gridSlots = compact
+    ? [[1, 0], [1, 1], [1, 2], [2, 0], [2, 1]]
+    : [[1, 0], [1, 1], [2, 0], [2, 1], [3, 0]];
+  pipelines.compact = compact;
+  if (compact) {
+    const pairs = n * n;
+    const groupChannels = Math.ceil(channels / 4);
+    const abBytes = groupChannels * pairs * 4;
+    // b after a, on a 256-byte boundary so it can be bound at its offset.
+    pipelines.abOffset = Math.ceil(abBytes / 256) * 256;
+    pipelines.channelChunks = channelChunkUniforms(cache.device, channels, groupChannels);
+    pipelines.abBytes = abBytes;
+  }
+  /** Bytes of scratch[index] given a full pair-sized tensor's bytes. */
+  pipelines.pairScratchBytes = (index, fullBytes) => (compact && index === 3
+    ? pipelines.abOffset + pipelines.abBytes : fullBytes);
   return pipelines;
 }
 
@@ -763,6 +803,32 @@ export function encodePairTrack(context) {
     // ...the vector row tile, which `tri.project-out` still uses whichever
     // kernel does the projection: only projectAB moves to the units.
     const perProjectTile = spreadTriangle(ceil(pairs, pipelines.projectTile.rows));
+    if (pipelines.compact) {
+      // 🔴 A QUARTER OF THE CHANNELS AT A TIME - see `compact` in
+      // compilePairTrack. a and b for one group live in scratch[3], the
+      // contraction writes its group's channels of the whole output in
+      // scratch[2], and the normalised hidden goes to scratch[1].
+      const abSlot = (offset, count) => ({
+        buffer: scratch[3].buffer,
+        byteOffset: (scratch[3].byteOffset ?? 0) + offset,
+        byteSize: count * pairs * 4,
+      });
+      for (const group of pipelines.channelChunks) {
+        const a = abSlot(0, group.count);
+        const b = abSlot(pipelines.abOffset, group.count);
+        run("tri.project", p("projectAB"), [scratch[0], pairMask, w, a, b, group.uniform],
+            ceil(group.count, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
+        run("tri.contract", p("contract"), [a, b, scratch[2], group.uniform],
+            ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows),
+            group.count);
+      }
+      run("tri.normalize-hidden", p("normalizeHidden"), [scratch[2], w, scratch[1]],
+          perNormalizeTile[0], perNormalizeTile[1]);
+      run("tri.project-out", p("projectOutput"), [scratch[0], scratch[1], w, pair],
+          ceil(channels, pipelines.projectTile.outColumns ?? pipelines.projectTile.columns),
+          perProjectTile[0], perProjectTile[1]);
+      continue;
+    }
     if (pipelines.projectMatrix !== undefined) {
       // 🔴 THE SAME THREE BUFFERS, A DIFFERENT KERNEL. Source, `a` and `b` are
       // the pair-sized scratch the vector kernel used; only the weight LAYOUT
@@ -840,11 +906,8 @@ export function encodePairTrack(context) {
         byteSize: count * n * width * 4,
       });
       for (const chunk of pipelines.gridChunks) {
-        const q = part(scratch[1], 0, chunk.count);
-        const k = part(scratch[1], 1, chunk.count);
-        const v = part(scratch[2], 0, chunk.count);
-        const gate = part(scratch[2], 1, chunk.count);
-        const gathered = part(scratch[3], 0, chunk.count);
+        const [q, k, v, gate, gathered] = pipelines.gridSlots
+          .map(([index, slot]) => part(scratch[index], slot, chunk.count));
         const chunkPairs = chunk.count * n;
         const perTile = spread(ceil(chunkPairs, pipelines.gridTiles.projectRows));
         run("grid.project", p("project"), [scratch[0], w, q, k, v, gate, chunk.uniform],
