@@ -934,7 +934,10 @@ CHANNELS**, which `TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS` (192, calibrated on an
 A100) declines. `bench-trunk.js --tokens=255 --profile`, two rounds interleaved:
 a trunk pass 2179 -> 1909 and 2236 -> 1981 ms, `tri.contract` halving with it. A
 whole 5CAJ fold is 7.73-7.98 -> 7.52-7.63 s; 6MRR's pLDDT moves 85.718 -> 85.726
-with N-CA/CA-C/CA-CA medians unchanged to 1e-4. The turing prior sets it. Swept
+with N-CA/CA-C/CA-CA medians unchanged to 1e-4. 🔴 **AND THE TURING PRIOR
+DOES NOT SET IT, BECAUSE A COLD FOLD PAYS MORE THAN A WARM ONE SAVES**: its
+matrix kernels are slow to compile, and a first 68-residue fold with the driver
+cache cleared was 9.74 / 10.50 s with it against 9.58 / 7.83 without. Swept
 beside it and not taken: the pair-transition split at 128 channels (3-4% of the
 trunk) and the matrix grid projection (`grid.project` -10%, ~1% of the trunk).
 
