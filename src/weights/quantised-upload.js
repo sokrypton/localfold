@@ -525,8 +525,61 @@ function releaseStaging(device, held) {
   }
 }
 
+/**
+ * 🔴 A DECODE CAN BE RECORDED AND REPLAYED. While `captureBlockUpload` names a
+ * destination, runBlockUpload keeps that decode's codes, scales, zeros and
+ * uniforms in dedicated buffers instead of pooled staging and hands back a
+ * recording; `replayBlockUpload` re-runs it into any buffer of the same size
+ * with no host work at all. This is how streamed weights keep their int5
+ * CODES resident - about a fifth of the decoded bytes - and decode a block only
+ * when it runs. See setStreamedWeights in src/runtime/resident.js.
+ */
+// Keyed by destination, because fills run concurrently (they await inside).
+const captures = new Map();
+export function captureBlockUpload(destination) {
+  captures.set(destination, []);
+  return () => {
+    const recordings = captures.get(destination);
+    captures.delete(destination);
+    return recordings;
+  };
+}
+
+export function replayBlockUpload(device, recording, destination) {
+  let bindGroup = recording.bindGroups.get(destination);
+  if (bindGroup === undefined) {
+    bindGroup = device.createBindGroup({
+      layout: recording.layout,
+      entries: [
+        { binding: 0, resource: { buffer: recording.codes } },
+        { binding: 1, resource: { buffer: recording.scales } },
+        { binding: 2, resource: { buffer: recording.zeros } },
+        { binding: 3, resource: { buffer: destination } },
+        { binding: 4, resource: { buffer: recording.uniforms, size: PARAM_STRIDE } },
+      ],
+    });
+    recording.bindGroups.set(destination, bindGroup);
+  }
+  const encoder = device.createCommandEncoder({ label: "int5-replay" });
+  const pass = encoder.beginComputePass({ label: "int5-replay" });
+  pass.setPipeline(recording.pipeline);
+  recording.dispatches.forEach(([x, y], index) => {
+    pass.setBindGroup(0, bindGroup, [index * PARAM_STRIDE]);
+    pass.dispatchWorkgroups(x, y);
+  });
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+}
+
+/** Give back what a recording holds. */
+export function releaseRecording(recording) {
+  for (const buffer of recording.owned) buffer.destroy();
+}
+
 export async function runBlockUpload(device, plan, destination) {
   if (plan.params.length === 0) return () => {};
+  const captured = captures.get(destination);
+  const recording = captured !== undefined;
   const startedAt = performance.now();
   const element = plan.destination ?? "f16";
   const pipelineAt = performance.now();
@@ -535,7 +588,15 @@ export async function runBlockUpload(device, plan, destination) {
     ?? await uploadPipeline(device, plan.codec, element, add);
   blockUploadStats.pipelineMs += performance.now() - pipelineAt;
   const staging = [];
+  const owned = [];
   const make = (size, usage) => {
+    if (recording) {
+      // Accounted by the caller that asked for the recording; see resident.js.
+      const bytes = Math.max(16, Math.ceil(size / 4) * 4);
+      const buffer = device.createBuffer({ label: "int5-codes", size: bytes, usage });
+      owned.push(buffer);
+      return buffer;
+    }
     const held = acquireStaging(device, size, usage);
     staging.push(held);
     return held.buffer;
@@ -616,12 +677,18 @@ export async function runBlockUpload(device, plan, destination) {
   const encoder = device.createCommandEncoder({ label: "int5-upload" });
   const pass = encoder.beginComputePass({ label: "int5-upload" });
   pass.setPipeline(pipeline);
+  const dispatches = [];
   plan.params.forEach((entry, index) => {
     pass.setBindGroup(0, bindGroup, [index * PARAM_STRIDE]);
     const slots = element === "f32" ? entry.count : Math.ceil(entry.count / 2);
     const groups = Math.ceil(slots / LANES);
+    dispatches.push([Math.min(groups, 65535), Math.ceil(groups / 65535)]);
     pass.dispatchWorkgroups(Math.min(groups, 65535), Math.ceil(groups / 65535));
   });
+  if (recording) {
+    captured.push({ pipeline, layout, codes, scales, zeros, uniforms, dispatches, owned,
+                    bindGroups: new Map([[destination, bindGroup]]) });
+  }
   pass.end();
   const commands = encoder.finish();
   blockUploadStats.encodeMs += performance.now() - encodeAt;
@@ -633,5 +700,5 @@ export async function runBlockUpload(device, plan, destination) {
   blockUploadStats.submits += 1;
   blockUploadStats.buffers += staging.length;
   blockUploadStats.totalMs += performance.now() - startedAt;
-  return () => releaseStaging(device, staging);
+  return recording ? () => {} : () => releaseStaging(device, staging);
 }

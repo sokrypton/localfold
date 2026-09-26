@@ -18,6 +18,8 @@
  * they are created directly and never released.
  */
 import { noteAllocation, noteDestroy } from "./device-memory.js";
+import { captureBlockUpload, releaseRecording, replayBlockUpload }
+  from "../weights/quantised-upload.js";
 
 /**
  * What `pack()` has cost on this page: the HOST packers behind every resident
@@ -54,6 +56,14 @@ const transientByDevice = new WeakMap();
 export function setStreamedWeights(device, prefix) {
   if (prefix === null || prefix === undefined) {
     streamedPrefix.delete(device);
+    const recordings = recordingsByDevice.get(device);
+    if (recordings !== undefined) {
+      for (const decode of recordings.all) {
+        for (const owned of decode.owned) noteDestroy(device, owned.size, "int5-codes");
+        releaseRecording(decode);
+      }
+      recordingsByDevice.set(device, freshRecordings());
+    }
     const transients = transientByDevice.get(device);
     if (transients !== undefined) {
       for (const ring of transients.values()) {
@@ -68,6 +78,38 @@ export function setStreamedWeights(device, prefix) {
     return;
   }
   streamedPrefix.set(device, prefix);
+  if (!recordingsByDevice.has(device)) recordingsByDevice.set(device, freshRecordings());
+  installWriteCapture(device);
+}
+
+const recordingsByDevice = new WeakMap();
+function freshRecordings() {
+  return { byKey: new WeakMap(), all: [], hostCaptures: currentCaptures };
+}
+// One map of buffer -> recorded writes, read by the one wrapper a device gets.
+const currentCaptures = new Map();
+const wrappedQueues = new WeakSet();
+function installWriteCapture(device) {
+  const queue = device.queue;
+  if (wrappedQueues.has(queue)) return;
+  wrappedQueues.add(queue);
+  const original = queue.writeBuffer.bind(queue);
+  queue.writeBuffer = (target, offset, data, dataOffset, size) => {
+    const writes = currentCaptures.get(target);
+    if (writes !== undefined) {
+      const view = ArrayBuffer.isView(data);
+      const unit = view ? data.BYTES_PER_ELEMENT : 1;
+      const start = (view ? data.byteOffset : 0) + (dataOffset ?? 0) * unit;
+      const total = view ? data.byteLength : data.byteLength;
+      const length = size !== undefined ? size * unit
+        : total - (dataOffset ?? 0) * unit;
+      const bytes = new Uint8Array(view ? data.buffer : data, start, length).slice();
+      writes.push({ offset, bytes });
+    }
+    return dataOffset === undefined ? original(target, offset, data)
+      : size === undefined ? original(target, offset, data, dataOffset)
+        : original(target, offset, data, dataOffset, size);
+  };
 }
 
 /**
@@ -134,7 +176,36 @@ export async function residentWeightBufferFilled(device, key, label, byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
       ring.buffers[index] = buffer;
     }
-    await fill(buffer);
+    // 🔴 THE FIRST FILL IS RECORDED AND EVERY LATER ONE REPLAYED. Recorded: the
+    // int5 decodes (their codes kept on the device) and any host writes into
+    // the buffer; replayed: the same, into whichever ring buffer this call got,
+    // with no upload. So a pass costs a decode dispatch a tensor, not the codes'
+    // bytes over the bus again.
+    const recordings = recordingsByDevice.get(device);
+    let byLabel = recordings.byKey.get(key);
+    if (byLabel === undefined) recordings.byKey.set(key, byLabel = new Map());
+    const recordingSlot = variant === "" ? label : `${label}\u0000${variant}`;
+    const recorded = byLabel.get(recordingSlot);
+    if (recorded !== undefined) {
+      for (const write of recorded.writes) device.queue.writeBuffer(buffer, write.offset, write.bytes);
+      for (const decode of recorded.decodes) replayBlockUpload(device, decode, buffer);
+      return buffer;
+    }
+    const writes = [];
+    recordings.hostCaptures.set(buffer, writes);
+    const stop = captureBlockUpload(buffer);
+    let decodes;
+    try {
+      await fill(buffer);
+    } finally {
+      decodes = stop();
+      recordings.hostCaptures.delete(buffer);
+    }
+    byLabel.set(recordingSlot, { writes, decodes });
+    recordings.all.push(...decodes);
+    for (const decode of decodes) {
+      for (const owned of decode.owned) noteAllocation(device, "int5-codes", owned.size);
+    }
     return buffer;
   }
   const slotOf = (forKey) => forKey.get(variant === "" ? label : `${label}\u0000${variant}`);
