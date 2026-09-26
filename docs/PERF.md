@@ -890,11 +890,36 @@ one at a time on the T4 (~85 ms each; the NVIDIA driver caches them in
 `~/.cache/nvidia/GLCache`, which is why only the VM's first run shows it), and
 the 2-vCPU VM gets little from compiling them concurrently. Nearly every shader
 bakes the token count, so a 70-residue fold after a 68-residue one is 16.6 s
-cold again. Measured and ruled out: loop unrolling (a 447-iteration constant
-loop compiles in 35-40 ms against 15 with a runtime bound). What is left:
-34 of the 151 differ only in constants (`const BLOCK`, `const ELEMENTS`) and
-could be one pipeline each (~3 s), and a token-count-independent shader set is
-the only thing that would make a second length free.
+cold again. De-duplicating the 34 that differ only in unused constants bought
+nothing: Tint strips the dead constants and the driver cache already dedupes
+identical SPIR-V.
+
+🔴 **WHAT DOES PAY IS COMPILING WITHOUT UNROLLING FIRST - "TIERED" LOOP
+BOUNDS, THE TURING PRIOR.** The NVIDIA compiler unrolls every loop whose bound
+is a constant; `withRuntimeLoopBounds` in src/runtime/pipeline-cache.js makes
+each `i < CONST` bound opaque (`+ (arrayLength(&x) >> 31u)`, always zero), which
+compiles about 12x faster and runs up to 1.5x slower. `runtimeLoopBounds:
+"tiered"` hands out that kernel first and compiles the unrolled one behind it,
+swapping it in on a later request. 🔴 **THE UPGRADES MUST WAIT FOR A QUIET
+SPELL**: started beside the fold they took one of the VM's two cores and
+ESMFold2's first run went 4.5 -> 6.7 s, so they now start only after 2 s with no
+new pipeline request, one at a time. T4, driver cache cleared per run,
+`c944041`, `runtimeLoopBounds=false` against tiered:
+
+| | off | tiered |
+|---|---:|---:|
+| AF3 68, first fold (two rounds) | 12.2, 11.5 | **9.6, 6.6** |
+| AF3 68, folds 2-4 | 1.23-1.72 | 1.93-2.28 |
+| AF3 255, first fold | 20.6 | **15.7** |
+| AF3 255, folds 2-3 | 7.5, 7.4 | 9.9, 8.1 |
+| AF2 59, whole run (ms) | 5992 | 6324 |
+| ESMFold2, whole run (s) | 4.65 | 4.58 |
+
+The later folds are slower because back-to-back folds arrive before ~13 s of
+upgrades have finished; a visitor who looks at the first result before folding
+again gets the unrolled kernels. That trade is chosen for the single cold run,
+which is most of what a free user does. A token-count-independent shader set is
+still the only thing that would make a second LENGTH free.
 
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
