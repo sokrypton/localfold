@@ -985,6 +985,27 @@ where it cost ~5. What still compiles per length: attention kernels with a
 `--tune`, so a `--tune` arm that changes a kernel warmed the prior's kernels;
 it applies `--tune` first now (`--tune-json` never had the problem).
 
+### A Colab L4 had no prior; it has one now
+
+Colab Pro's step up from the T4 is an L4 (Ada, `architecture: "lovelace"`, 12
+vCPUs), which took DEFAULT_TUNING. `--prior=NAME` (gpu-chrome) answers with
+another architecture's prior, so both measured priors were tried on it; two
+rounds interleaved, driver cache cleared, seconds:
+
+| L4 | default | ampere | turing | ampere + tiered + AF2 flash off the units |
+|---|---:|---:|---:|---:|
+| AF3 68, first fold | 3.7 | 4.0-4.2 | 2.5 | **2.56** |
+| AF3 68, later folds | 0.61 | 0.59-0.65 | 1.1-1.2 | 1.06 -> 0.67 by fold 8 |
+| AF3 255, later folds | 3.3-3.4 | **2.9-3.0** | 4.5-4.9 | 3.97, 3.75, then 2.97 |
+| AF2, whole run | 3.7-3.9 | 3.85-3.9 | 1.9 | **2.43-2.47** |
+| ESMFold2, repeats | 0.80 | **0.62-0.64** | 0.90 | 0.62-0.64 |
+
+The `lovelace` prior is the last column. The tiered upgrade queue now runs a
+quarter of the CPU's threads wide (one on a T4's two vCPUs, as measured there;
+three on the L4's twelve), without which the later folds sat on the slow
+kernels for most of a minute. Colab also offered an A100 (the ampere prior's
+own architecture) and a G4; H100 was refused on Pro, and neither was measured.
+
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
 The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by

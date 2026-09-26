@@ -215,12 +215,19 @@ export class ComputePipelineCache {
 
   #lastMiss = 0;
   #pendingUpgrades = [];
-  #draining = false;
+  #draining = 0;
 
-  /** Compile the queued unrolled kernels one at a time, each after a quiet spell. */
+  /**
+   * Compile the queued unrolled kernels after a quiet spell, a quarter of the
+   * CPU's threads at a time: one on a Colab T4's two vCPUs, which is what
+   * measured best there, and three on an L4's twelve, where one at a time left
+   * the next folds on the slow kernels for most of a minute.
+   */
   async #drainUpgrades() {
-    if (this.#draining) return;
-    this.#draining = true;
+    const threads = globalThis.navigator?.hardwareConcurrency ?? 2;
+    if (this.#draining >= Math.max(1, Math.floor(threads / 4))) return;
+    this.#draining += 1;
+    if (this.#pendingUpgrades.length > 1) this.#drainUpgrades();
     try {
       while (this.#pendingUpgrades.length > 0) {
         const quiet = UPGRADE_QUIET_MS - (performance.now() - this.#lastMiss);
@@ -243,7 +250,7 @@ export class ComputePipelineCache {
         } catch { /* the opaque kernel stays; it computes the same thing */ }
       }
     } finally {
-      this.#draining = false;
+      this.#draining -= 1;
     }
   }
 

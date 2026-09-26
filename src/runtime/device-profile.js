@@ -1171,6 +1171,28 @@ const PRIORS = new Map([
   }],
 ], );
 
+// NVIDIA L4 (Ada, "lovelace"), a Colab Pro runtime with 12 vCPUs and the two
+// developer flags, 2026-09-26. Nothing measured it before, so it took
+// DEFAULT_TUNING. Two rounds interleaved, driver cache cleared, seconds:
+//
+//                          default   ampere prior   ampere + the two below
+//   AF3 68, first fold     3.7       4.0-4.2        2.56
+//   AF3 68, folds 2-8      0.61      0.59-0.65      1.06 -> 0.67 as upgrades land
+//   AF3 255, first fold    6.0       6.1-6.3        5.35
+//   AF3 255, later folds   3.3-3.4   2.9-3.0        3.97, 3.75, then 2.97-3.0
+//   AF2, whole run         3.7-3.9   3.85-3.9       2.43-2.47 (repeats +5%)
+//   ESMFold2, repeats      0.80      0.62-0.64      0.62-0.64
+//
+// So the ampere prior's warm settings, plus the T4's tiered loop bounds (the
+// upgrade queue runs a quarter of the CPU's threads wide, three here) and
+// AF2's flash attention off the matrix units, which halves AF2's cold run as
+// it did on the T4.
+PRIORS.set("lovelace", {
+  ...PRIORS.get("ampere"),
+  runtimeLoopBounds: "tiered",
+  attentionMatrix: false,
+});
+
 const VENDOR_PRIORS = new Map([
   // 🔴 NOTHING FOR "apple" ON PURPOSE. Its measurements ARE the defaults above,
   // and an entry that restated them would be a second place for them to drift.
