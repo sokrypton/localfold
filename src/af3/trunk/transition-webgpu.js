@@ -652,11 +652,22 @@ export class Af3TransitionGpu {
  * Same bindings and uniform as `createStagedMatrixShader`'s transition use -
  * `[source, weights, MatmulParameters, output]`, dispatched `(columns / BN,
  * rows / BM)` - so the encoder in pair-track-gpu.js is shared. A workgroup owns
- * a 64 x 64 block on 256 lanes (WebGPU's guaranteed maximum), 4 x 4 each,
- * strided by 16 so a warp's reads of the staged weight panel are consecutive;
- * 8 KiB of workgroup memory, under the 16 KiB floor. f32 accumulation in k
- * order. `sourceGate` applies the SwiGLU as the operand is staged, exactly
- * where the matrix path applies it, so the hidden activation never exists.
+ * a 64 x 64 block on 256 lanes (WebGPU's guaranteed maximum), 4 x 4 each; 8.4
+ * KiB of workgroup memory, under the 16 KiB floor. f32 accumulation in k order.
+ * `sourceGate` applies the SwiGLU as the operand is staged, exactly where the
+ * matrix path applies it, so the hidden activation never exists.
+ *
+ * 🔴 A LANE OWNS FOUR ADJACENT COLUMNS, AND THE SOURCE PANEL IS PADDED - worth
+ * 1.17-1.29x on both passes, bit-identical. The first version strided a lane's
+ * columns by 16, so every operand read was a scalar, and staged the source
+ * panel k-major at a stride of 64 words: the sixteen lanes writing one row's
+ * sixteen k landed in ONE bank. Adjacent columns make the weight panel a vec4
+ * read; a stride of 68 spreads the store. Measured on an A100 under stock flags
+ * at 65,025 rows (ms, wide / down): 384 channels 12.4 / 7.6 -> 10.5 / 6.0, 512
+ * 13.2 / 8.4 -> 11.4 / 6.5, 256 at 40,000 rows 3.6 / 2.5 -> 3.0 / 1.9. Without
+ * the padding the gain is gone (12.7 / 7.1). Tried and slower: 64 x 128 and 128
+ * x 64 (4 x 8 a lane), 128 x 128 (8 x 8), the source panel as vec4. A 32-deep
+ * step is 2-5% faster and 16.9 KiB, over the floor.
  */
 export const VECTOR_GEMM_BLOCK = Object.freeze({ rows: 64, columns: 64, inner: 16 });
 /**
@@ -692,24 +703,14 @@ function splitNormalizeRows(device, channels) {
   const limit = device.limits.maxComputeWorkgroupStorageSize;
   return [8, 4, 2].find((rows) => splitNormalizeBytes(channels, rows) <= limit);
 }
-/**
- * The widening pass's block: twice as many columns, because its output is
- * eight times the channel width and a wider block reuses each staged source
- * row across more of it. Swept on an A100 under stock flags (IntelliFold-2, 255
- * tokens, pair-transition ms per trunk pass): `wide` 969 at 64 x 64 -> 859 at
- * 64 x 128, while `down` - `channels` columns, so fewer workgroups to begin
- * with - goes 598 -> 672 and keeps 64 x 64. Taller blocks and a 32-deep inner
- * step were slower for both. Which lane owns which output changes; the order
- * each output sums over k does not, so the answer is bit-identical.
- */
-export const VECTOR_GEMM_WIDE_BLOCK = Object.freeze({ rows: 64, columns: 128, inner: 16 });
 function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecision,
-                                  residual = false, sourceGate = null,
-                                  block = VECTOR_GEMM_BLOCK }) {
-  const { rows: BM, columns: BN, inner: BK } = block;
-  // A 16 x 16 lane grid; each lane owns TM rows and TN columns, strided by 16.
+                                  residual = false, sourceGate = null }) {
+  const { rows: BM, columns: BN, inner: BK } = VECTOR_GEMM_BLOCK;
+  // A 16 x 16 lane grid; each lane owns TM adjacent rows and TN adjacent columns.
   const TM = BM / 16;
   const TN = BN / 16;
+  // The source panel's stride: four words past the block, see above.
+  const AS = BM + 4;
   const half = [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
   const load = sourceGate === null
     ? "f32(source[row * parameters.inner + k])"
@@ -718,22 +719,26 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   const multiply = [];
   const stores = [];
   const reads = [];
-  for (let i = 0; i < TM; i += 1) reads.push(`      let a_${i} = a_tile[k * BM + ty + ${16 * i}u];`);
-  for (let j = 0; j < TN; j += 1) reads.push(`      let b_${j} = b_tile[k * BN + tx + ${16 * j}u];`);
+  for (let i = 0; i < TM; i += 1) reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * ${TM}u + ${i}u];`);
+  for (let j = 0; j < TN / 4; j += 1) reads.push(`      let b_${j} = b_tile[k * ${BN / 4}u + tx * ${TN / 4}u + ${j}u];`);
   for (let i = 0; i < TM; i += 1) {
-    for (let j = 0; j < TN; j += 1) {
-      accumulators.push(`  var acc_${i}_${j} = 0.0;`);
+    for (let j = 0; j < TN / 4; j += 1) {
+      accumulators.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
       multiply.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
-      stores.push(`  {
-    let row = row_origin + ty + ${16 * i}u;
-    let column = column_origin + tx + ${16 * j}u;
+      for (let c = 0; c < 4; c += 1) {
+        const value = `acc_${i}_${j}.${"xyzw"[c]}`;
+        stores.push(`  {
+    let row = row_origin + ty * ${TM}u + ${i}u;
+    let column = column_origin + tx * ${TN}u + ${4 * j + c}u;
     if (row < parameters.rows) {
       output[row * parameters.columns + column] ${residual
-        ? `+= acc_${i}_${j};` : `= ${outputPrecision}(acc_${i}_${j});`}
+        ? `+= ${value};` : `= ${outputPrecision}(${value});`}
     }
   }`);
+      }
     }
   }
+  const weight = (offset) => `f32(weights[base${offset}])`;
   return `${half ? "enable f16;\n" : ""}struct MatmulParameters {
   rows: u32, inner: u32, columns: u32, weight_offset: u32,
   bias_offset: u32, activation: u32, padding: vec2<u32>,
@@ -745,8 +750,8 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
 const BM: u32 = ${BM}u;
 const BN: u32 = ${BN}u;
 const BK: u32 = ${BK}u;
-var<workgroup> a_tile: array<f32, ${BM * BK}>;
-var<workgroup> b_tile: array<f32, ${BK * BN}>;
+var<workgroup> a_tile: array<f32, ${AS * BK}>;
+var<workgroup> b_tile: array<vec4<f32>, ${BK * BN / 4}>;
 ${sourceGate === null ? "" : `fn swish(value: f32) -> f32 { return value / (1.0 + exp(-value)); }
 fn gated(at: u32) -> f32 {
   return swish(f32(source[at])) * f32(source[at + ${sourceGate.offset}u]);
@@ -768,12 +773,13 @@ ${accumulators.join("\n")}
       let row = row_origin + m;
       var value = 0.0;
       if (row < parameters.rows) { value = ${load}; }
-      a_tile[(e % BK) * BM + m] = value;
+      a_tile[(e % BK) * ${AS}u + m] = value;
     }
-    for (var e = li; e < BK * BN; e += 256u) {
-      let k = k0 + e / BN;
-      b_tile[e] = f32(weights[parameters.weight_offset + k * parameters.columns
-                              + column_origin + e % BN]);
+    for (var e = li; e < BK * BN / 4u; e += 256u) {
+      let k = k0 + e / ${BN / 4}u;
+      let base = parameters.weight_offset + k * parameters.columns + column_origin
+        + (e % ${BN / 4}u) * 4u;
+      b_tile[e] = vec4<f32>(${weight("")}, ${weight(" + 1u")}, ${weight(" + 2u")}, ${weight(" + 3u")});
     }
     workgroupBarrier();
     for (var k = 0u; k < BK; k += 1u) {
@@ -942,8 +948,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     return {
       normalize,
       wide: createVectorGemmShader({ sourcePrecision: normalizedStorage, weightPrecision,
-                                     outputPrecision: wideStorage,
-                                     block: VECTOR_GEMM_WIDE_BLOCK }),
+                                     outputPrecision: wideStorage }),
       down: createVectorGemmShader({ sourcePrecision: wideStorage, weightPrecision,
                                      outputPrecision: "f32", residual: true,
                                      sourceGate: { stride: wide, offset: intermediate } }),
@@ -951,8 +956,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       geometry: null,
       storage: normalizedStorage,
       tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: VECTOR_GEMM_BLOCK.rows,
-               blockColumns: VECTOR_GEMM_BLOCK.columns,
-               wideColumns: VECTOR_GEMM_WIDE_BLOCK.columns },
+               blockColumns: VECTOR_GEMM_BLOCK.columns },
     };
   }
   const geometry = { ...SPLIT_TRANSITION_GEOMETRY, ...matrix };

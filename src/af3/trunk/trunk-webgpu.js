@@ -106,15 +106,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let j = row % TOKENS;
   let transposed = j * TOKENS + i;
 
-  var largest = -3.0e38;
+  // 🔴 CHANNELS OUTER, BINS INNER. The bins-outer order re-read the pair row
+  // and its transpose once per BIN - 96 x 384 x 2 loads a pair on OpenDDE,
+  // 1.2 s of a 255-token trunk pass. Each bin still sums over c in ascending
+  // order from zero, so every logit is the same f32 sum: bit-identical.
   var values: array<f32, ${bins}>;
-  for (var b = 0u; b < BINS; b += 1u) {
-    var total = 0.0;
-    for (var c = 0u; c < CHANNELS; c += 1u) {
-      // ...one half plus its own transpose.
-      total += (pair[row * CHANNELS + c] + pair[transposed * CHANNELS + c])
-        * weights[W_HALF + c * BINS + b];
+  for (var b = 0u; b < BINS; b += 1u) { values[b] = 0.0; }
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    // ...one half plus its own transpose.
+    let summed = pair[row * CHANNELS + c] + pair[transposed * CHANNELS + c];
+    for (var b = 0u; b < BINS; b += 1u) {
+      values[b] += summed * weights[W_HALF + c * BINS + b];
     }
+  }
+  var largest = -3.0e38;
+  for (var b = 0u; b < BINS; b += 1u) {
+    var total = values[b];
 ${biasOffset >= 0 ? `    total += 2.0 * weights[${biasOffset}u + b];\n` : ""}\
     values[b] = total;
     logits[row * BINS + b] = total;

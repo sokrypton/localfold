@@ -536,6 +536,38 @@ the host; a tolerance still reads every pass. Byte-identical on all seven
 models; trunk reuse still hands its trunk to a retry. AF3 int5, stock flags,
 255 tokens: warm fold 4.00-4.12 -> **3.66-3.74 s**.
 
+### The second night: a vector GEMM that owns adjacent columns, and a distogram read 96 times
+
+🔴 **THE VECTOR SPLIT'S GEMM PUT SIXTEEN LANES ON ONE BANK.** It staged the
+source panel k-major at a stride of 64 words, so the sixteen lanes writing one
+row's sixteen k all hit the same bank, and a lane's four columns were strided
+by 16, so every operand read was a scalar. A lane now owns four ADJACENT
+columns (one vec4 weight read), and the panel's stride is 68. Each output still
+sums over k in order from zero, so it is **bit-identical** - 0 differing against
+the old kernel, and the same pLDDT to every digit on OpenDDE, IntelliFold-2,
+protenix2 and ESMFold2 at 255. Isolated, A100 stock flags, 65,025 rows, ms wide
+/ down: 384 channels 12.4 / 7.6 -> **10.5 / 6.0**, 512 13.2 / 8.4 -> 11.4 / 6.5.
+Without the padding it is 12.7 / 7.1. Tried and slower: 4 x 8 and 8 x 4 a lane,
+8 x 8 on a 128 x 128 block, the source panel as vec4. A 32-deep step is 2-5%
+faster at 16.9 KiB, over the floor, so not taken. The widening pass's 64 x 128
+block goes: with this layout 64 x 64 wins both.
+
+🔴 **THE DISTOGRAM HEAD RE-READ THE PAIR ONCE PER BIN.** Bins outer, channels
+inner: 96 x 384 x 2 loads a pair on OpenDDE. Channels outer with an accumulator
+a bin sums in the same order - **0 differing of 6.3 M** - and is 35.8 -> 2.2 ms
+at 255 tokens (8.7 -> 2.2 for AF3's 128 x 64). 🔴 The trunk's `distogram` stage
+reads ~1.2 s on OpenDDE and that is NOT this kernel: the pairformer defers its
+last window's wait (`deferReadback`), so its GPU work lands in whichever stage
+waits next.
+
+And OpenDDE's confidence `s1`/`s2`, two host matmuls of 495 x 449 -> 384 at 255
+residues, run on the device (19123 -> 18842 ms warm, f32 against f64
+accumulation: pLDDT moves in the 11th digit; oracle PAE 8.56e-7, PDE 1.12e-6).
+
+Warm 255-residue folds, stock flags, against the table above's last column:
+OpenDDE 19.12 -> **17.87 s**, IntelliFold-2 26.42 -> **24.92**, protenix2 9.03 ->
+**8.6**, ESMFold2 4.57 -> **3.99** (with the confidence-head commit before it).
+
 ## The split pair transition, for a device with no matrix units
 
 🔴 **NO MATRIX UNITS MEANT NO SPLIT, AND NO VISITOR HAS MATRIX UNITS.** The
