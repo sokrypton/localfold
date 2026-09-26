@@ -369,22 +369,23 @@ export async function residentGridOnDevice(device, options) {
 export async function residentPairTrackOnDevice(device, block, options) {
   const { channels, pairWeightPrecision, abLayout = "blocked", resident = true } = options;
   if (!resident) return { buffers: {}, want: { triangles: true, grids: true } };
-  // 🔴 THE VARIANT IS THE PRECISION AND NOT THE LAYOUT, which is the same hole
-  // the host packer has: two runs in ONE process with `triangleProjectMatrix`
-  // set differently would share a buffer packed for the other kernel. Both are
-  // safe today because the layout comes from a device-profile knob that is
-  // fixed for a process, and every arm this repository measures is its own
-  // process. A caller that changed the knob mid-process would get a finite,
-  // plausible tensor - so if that ever becomes possible, the layout belongs in
-  // the variant on both paths at once.
+  // 🔴 THE VARIANT NAMES THE LAYOUT AS WELL AS THE PRECISION, because a
+  // streamed label shares a ring of buffers across every block of that label
+  // and size - see setStreamedWeights - and this fill leaves the layout's
+  // zero regions unwritten. The pairformer packs its triangles interleaved for
+  // the matrix projection and the MSA stack blocked, so under the developer
+  // flags a ring buffer the pairformer had filled reached the MSA stack with
+  // data where its zeros should be: boltz2's 5CAJ self-template 0.837 -> 1.623
+  // A. The host packer's cache is per block and never shares, so it keeps the
+  // precision alone.
   const [outgoing, incoming] = await Promise.all([
     residentTriangleOnDevice(device, {
       triangle: block.triangleMultiplicationOutgoing, channels, abLayout,
-      label: "w.tri.out", variant: pairWeightPrecision,
+      label: "w.tri.out", variant: `${pairWeightPrecision}:${abLayout}`,
       destination: pairWeightPrecision === "f16" ? "f16" : "f32" }),
     residentTriangleOnDevice(device, {
       triangle: block.triangleMultiplicationIncoming, channels, abLayout,
-      label: "w.tri.in", variant: pairWeightPrecision,
+      label: "w.tri.in", variant: `${pairWeightPrecision}:${abLayout}`,
       destination: pairWeightPrecision === "f16" ? "f16" : "f32" }),
   ]);
   const [grid1, grid2] = await Promise.all([

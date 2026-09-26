@@ -45,8 +45,10 @@ import { structuralBatch, structuralLayout, structuralToResidue }
   from "./featurise/structural-tokens.js";
 import { Af3DiffusionConditioningGpu } from "./diffusion/diffusion-conditioning-webgpu.js";
 import { openddeConfidence } from "./confidence/opendde-confidence.js";
-import { releaseResidentWeights, releaseStreamedWeights, setStreamedWeights }
-  from "../runtime/resident.js";
+import {
+  isStreamed, pauseStreamedWeights, releaseResidentWeights, releaseStreamedWeights,
+  setStreamedWeights,
+} from "../runtime/resident.js";
 import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
   from "../runtime/device-memory.js";
 import { deviceTuning } from "../runtime/device-profile.js";
@@ -697,7 +699,12 @@ export async function foldBatch(device, batch, weights, options = {}) {
     held.releaseAll();
     throw error;
   } finally {
-    setStreamedWeights(device, null);
+    // A large fold's stream ends with it; a small fold's codes stay for the
+    // next fold - see foldHolding - but the stream itself pauses, because
+    // ESMFold2's labels share the `w.` prefix and its fills run concurrently
+    // (its adaLN pack died in a shared ring: "decodes is not iterable").
+    if (held.streamsWholeFold) setStreamedWeights(device, null);
+    else pauseStreamedWeights(device);
   }
 }
 
@@ -741,6 +748,18 @@ async function foldHolding(device, batch, weights, options, held) {
     const prefixes = ["w.", "difftx."];
     for (const prefix of prefixes) releaseResidentWeights(device, prefix);
     setStreamedWeights(device, prefixes);
+    held.streamsWholeFold = true;
+  } else if (deviceTuning(device).streamTrunkWeights !== false && !isStreamed(device, "w.")) {
+    // 🔴 AND A SMALL FOLD STREAMS ITS TRUNK'S, AND KEEPS THE CODES BETWEEN
+    // FOLDS. Replayed from codes held on the device, the trunk's decodes are a
+    // fused dispatch a block riding the block's own submit, and measured free:
+    // AF3 5CAJ-255 warm 1.84 s either way, peak 1980 -> 1530 MiB. The codes are
+    // an int5 fifth of the decoded f32, so holding them between folds costs
+    // ~90 MiB where the decoded weights held 570. The sampler's weights stay
+    // decoded here: streaming them too reached 1072 MiB for +4% on a warm fold.
+    // `streamTrunkWeights: false` keeps them decoded.
+    releaseResidentWeights(device, "w.");
+    setStreamedWeights(device, ["w."]);
   }
   const { tokens, dense } = batch;
   const stage = (name, detail = {}) => options.onStage?.(name, detail);

@@ -676,6 +676,23 @@ of shader. Staging the values as well, to shorten each lane's chain of global
 loads, was WORSE (8.75). The chain is what binds it, and shortening it means
 splitting the key sum across lanes, which changes its order. Not taken.
 
+🔴 **AF3's OUTER PRODUCT MEAN AS TWO GEMMs: `opm.contract` 195.9 -> 46.6 ms.**
+The fused kernel had each lane walk every sequence for its cells, a chain of
+2 x SEQUENCES dependent loads, and at 1024 MSA rows it was the trunk's largest
+kernel. The operands are AF2's layout exactly (`left[s][i][c]`), so AF2's vector
+contraction builds a `[pair][cell]` intermediate for a block of whole rows of i
+(16 MiB), and `createAf3OpmVectorOutputShader` projects it with AF3's own
+epilogue - bias first, cells ascending, DIVIDED by `1e-3 + count` (boltz2's
+bias-after-norm too). **Bit-exact on all six models folded with an alignment**
+(`diff-fold-coords.py` against `--tune=opmVectorContract=false`, 448/448 atoms,
+and OpenDDE through fold-opendde.js). AF3 int5, 255 tokens, 1024 rows, stock
+flags: trunk GPU 762.9 -> 631.3 ms, a steady pass 936 -> 803, +17 MiB. A 64 MiB
+intermediate is another 1.5% for 48 MiB and was not taken.
+🔴 Tried after it and reverted: staging `grid.attend`'s bias in workgroup
+memory (108 -> 137 ms - the per-lane bias rows are cache-resident already), and
+a flash-style softmax with one maximum per 32-key chunk (108 -> 99 ms, 1% of a
+pass, and not bit-identical).
+
 ## Memory: what a large fold holds, and what it no longer does
 
 🔴 **FIVE CHANGES, ALL BIT-IDENTICAL, AND THE ONE THAT IS NOT FREE IS SIZE-GATED.**
@@ -720,6 +737,47 @@ What is left under stock flags is mostly arithmetic: the pair track's f32
 kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,
 `tri.project` 14, the vector split 13-15, `tri.project-out` ~12, `grid.attend`
 and `tri.contract` ~9), and OpenDDE's trunk at 255 is 86% GPU-busy.
+
+### A small fold streams its trunk weights too, and keeps the codes
+
+🔴 **FREE AT 255 TOKENS ONCE THE REPLAY WAS ONE DISPATCH A BLOCK.** Streaming a
+small AF3 fold's weights cost +20% warm when it was first tried, and none of it
+was the decode's arithmetic:
+- every replayed decode was its own `queue.submit` (~800 a fold) - now they
+  queue and ride at the head of the next submit;
+- every TENSOR was its own dispatch (~12,000 a fold), each behind a barrier
+  because all of them write one buffer - now one dispatch replays a whole
+  recording, a workgroup per 512 slots of one tensor (`int5-replay` 132 -> 88
+  ms GPU a fold);
+- and the codes were dropped at the end of every fold and re-uploaded by the
+  next. A small fold now keeps them (`streamTrunkWeights`), an int5 fifth of
+  the decoded weights.
+
+AF3 5CAJ-255, stock flags, warm fold / peak: decoded **1.84 s / 1980 MiB**,
+trunk streamed **1.84 s / 1530**, trunk and sampler streamed 1.93 s / 1072 (not
+taken: +4%). OpenDDE 59 residues with an alignment **2889 -> 1708 MiB**, 931 ->
+955 ms. Bit-exact on af3, boltz2, rf3, protenix2 and OpenDDE. 🔴 What the decode
+still costs is not its instructions: `value_at`'s dynamic vector index selected
+instead, one word read instead
+of two bytes, 256 lanes, longer runs - all moved `int5-replay` by nothing.
+Forcing every tensor down the contiguous path (a wrong answer, for timing) was
+67 ms, so transposes are ~22 and the rest is a floor this kernel shape has.
+
+🔴 **AND A STREAMED RING IS SHARED, SO A FILL THAT SKIPS ITS ZEROS MUST NAME
+ITS LAYOUT.** Bit-exact under stock flags, this moved boltz2's 5CAJ
+self-template 0.837 -> 1.623 A under the developer flags, and bisecting by
+label put all of it on `w.tri`: the pairformer packs its triangles interleaved
+for the matrix projection and the MSA stack blocked, both fills leave their
+layout's zero regions unwritten, and one ring buffer served both. The layout is
+in the triangle's variant now, and 0.837 comes back to the digit.
+
+**ESMFold2's ESM-C tower keeps its codes too.** Its resident blocks were ~890
+MiB of decoded halves; a kept block now holds its recorded int3 decode and
+replays each matrix into one persistent buffer a name (a fresh buffer a block
+was +113 ms of creates and zero-fills - this allocator destroys on release).
+59 residues, stock flags, repeat fold / peak: **0.84 s / 1798 MiB -> 0.88 s /
+957**, same fold. The +40 ms is 144 decodes on the loop's critical path, since
+the tower waits for each block.
 
 ## The split pair transition, for a device with no matrix units
 

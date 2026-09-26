@@ -271,6 +271,9 @@ export const DEFAULT_TUNING = Object.freeze({
   // ...and streams its trunk weights from their codes inside the fold; `false`
   // keeps them decoded for the fold's passes. See setStreamedWeights.
   largeFoldStreamsWeights: null,
+  // ...and a small fold streams its trunk's, keeping the codes between folds;
+  // false keeps them decoded. See foldHolding.
+  streamTrunkWeights: null,
   // 🔴 HOW MANY PAIRFORMER BLOCKS GO OUT BEFORE THE HOST WAITS. Each wait is a
   // full pipeline drain; the window exists to bound the queue and let an abort
   // land, not because the memory needs it. 16 is measured - but it was measured

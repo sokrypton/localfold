@@ -31,7 +31,9 @@ import {
 import { float32ToFloat16Array } from "../weights/float16.js";
 import { halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { planBlockUpload, runBlockUpload } from "../weights/quantised-upload.js";
+import {
+  captureBlockUpload, planBlockUpload, releaseRecording, replayBlockUpload, runBlockUpload,
+} from "../weights/quantised-upload.js";
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
   createLinearShader, createPrepareShader, createSwigluShader, linearGrid,
@@ -184,6 +186,22 @@ async function decodeIntoOnDevice(device, source, elements, destination) {
   // thing this loop is written to avoid. See src/af3/weights/device-weights.js.
   void device.queue.onSubmittedWorkDone().then(release);
   return true;
+}
+
+const REPLAY_TARGETS = new WeakMap();
+/** The buffer a kept block's matrix is replayed into; see uploadNarrow. */
+function replayTarget(device, name, bytes) {
+  let forDevice = REPLAY_TARGETS.get(device);
+  if (forDevice === undefined) REPLAY_TARGETS.set(device, forDevice = new Map());
+  const key = `${name}:${bytes}`;
+  let buffer = forDevice.get(key);
+  if (buffer === undefined) {
+    noteAllocation(device, `esmc.${name}.replay`, bytes);
+    buffer = device.createBuffer({ label: `esmc.${name}.replay`, size: bytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    forDevice.set(key, buffer);
+  }
+  return buffer;
 }
 
 /** How many elements a manifest record holds. */
@@ -499,32 +517,60 @@ export class EsmcTowerGpu {
         // so the branch is a guard rather than a path.
         const sources = residualScale === 1 ? weights?.sources : undefined;
         const uploadNarrow = async (name, leaf, make) => {
-          if (store !== undefined && store[name] !== undefined) return store[name];
+          // 🔴 RESIDENT MEANS THE CODES, NOT THE HALVES. A kept block holds its
+          // recorded decode - int3 codes on the device - and replays it into a
+          // pooled buffer each fold: ~170 MiB held across 36 blocks where the
+          // decoded halves were ~890, for one decode dispatch a matrix a fold.
+          // Replayed into ONE buffer a matrix, kept for the device's lifetime:
+          // the loop waits for each block before the next, and this allocator
+          // destroys on release, so a fresh buffer a block was 144 creates and
+          // zero-fills a fold - +113 ms at 59 residues.
+          const kept = store?.[name];
+          if (kept?.recording !== undefined) {
+            const buffer = replayTarget(this.device, name, kept.bytes);
+            replayBlockUpload(this.device, kept.recording, buffer);
+            return { buffer };
+          }
+          if (kept !== undefined) return kept;
           const source = sources?.[leaf];
           if (source !== undefined) {
             const elements = elementsOf(source.record);
             const bytes = Math.ceil(elements / 2) * 4;
-            // The resident path owns its buffer for the model's lifetime; the
-            // streaming one hands it to the pool, as `upload` does.
             if (store !== undefined) {
+              const allocation = this.allocator.allocate(
+                `esmc.b${layer}.${name}`, bytes, storage | GPUBufferUsage.COPY_DST);
+              const stop = captureBlockUpload(allocation.buffer);
+              let decoded;
+              let recordings;
               try {
-                noteAllocation(this.device, `esmc.${name}`, bytes);
-              } catch (error) {
-                if (!(error instanceof GpuMemoryBudgetError)) throw error;
-                noteResidencyRefused(this.device);
-                resident.delete(layer);
+                decoded = await decodeIntoOnDevice(this.device, source, elements,
+                                                   allocation.buffer);
+              } finally {
+                recordings = stop();
+              }
+              if (!decoded) {
+                allocation.release();
                 return upload(name, make);
               }
-              const buffer = this.device.createBuffer({
-                label: `esmc.${name}`, size: bytes,
-                usage: storage | GPUBufferUsage.COPY_DST });
-              if (await decodeIntoOnDevice(this.device, source, elements, buffer)) {
-                store[name] = { buffer };
-                return store[name];
+              perBlock.push(allocation);
+              const codeBytes = recordings.flatMap((r) => r.owned)
+                .reduce((total, buffer) => total + buffer.size, 0);
+              try {
+                noteAllocation(this.device, "esmc.codes", codeBytes);
+              } catch (error) {
+                // Over the ceiling: this fold has its matrix; later folds decode
+                // from the host again, as streaming always did.
+                if (!(error instanceof GpuMemoryBudgetError)) throw error;
+                noteResidencyRefused(this.device);
+                for (const recording of recordings) releaseRecording(recording);
+                resident.delete(layer);
+                return allocation;
               }
-              buffer.destroy();
-              noteDestroy(this.device, bytes, `esmc.${name}`);
-              return upload(name, make);
+              if (recordings.length !== 1) {
+                throw new Error(`esmc.${name}: ${recordings.length} recorded decodes, expected 1`);
+              }
+              store[name] = { recording: recordings[0], bytes };
+              return allocation;
             }
             const allocation = this.allocator.allocate(
               `esmc.b${layer}.${name}`, bytes, storage | GPUBufferUsage.COPY_DST);

@@ -28,21 +28,19 @@
  * is wrong in a way nothing can see.
  */
 /**
- * 🔴 NOT THROUGH ComputePipelineCache, BECAUSE THIS ONE NEEDS AN EXPLICIT
- * LAYOUT. `layout: "auto"` cannot know that the uniform is addressed with a
- * dynamic offset - it infers `hasDynamicOffset: false` and the encoder then
- * refuses the offset with "the number of dynamic offsets (1) does not match the
- * number of dynamic buffers (0)". The dynamic offset is what lets forty tensors
- * share one bind group and one buffer, so the layout is written out.
+ * Not through ComputePipelineCache: the layout is written out, so a replay can
+ * bind a recording's buffers to the pipeline the first fill compiled.
  */
 const PIPELINES = new WeakMap();
 
 import { packedBits } from "./dtype.js";
 
-/** The uniform stride a Params array needs; WebGPU wants 256 for a dynamic offset. */
+/** One tensor's row in the parameter table, in bytes. */
 const PARAM_STRIDE = 256;
 
 const LANES = 64;
+/** Slots one decode workgroup owns; see the kernel's `main`. */
+const REPLAY_RUN = 512;
 
 /**
  * 🔴 AND IT ADDS AS WELL AS WRITES, WHICH IS HOW A SECOND MODEL IS REACHED FROM
@@ -125,24 +123,30 @@ struct Params {
   outerStride: u32,
   destStride: u32,
   partRun: u32,          // how many destination elements a part owns in a row
+  // [0].x is the tensor's first workgroup; row 0's [0].y is the total.
+  padding: array<vec4<u32>, 10>,
 };
 
 @group(0) @binding(0) var<storage, read> codes: array<u32>;
 @group(0) @binding(1) var<storage, read> scales: array<u32>;
 @group(0) @binding(2) var<storage, read> zeros: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output: array<u32>;
-@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read> table: array<Params>;
 
-fn byte_at(index: u32) -> u32 {
-  return (codes[index >> 2u] >> ((index & 3u) * 8u)) & 255u;
+// 🔴 SELECTED, NOT SUBSCRIPTED: unpack2x16float(w)[index & 1u] is a dynamic
+// vector index, which CLAUDE.md prices at 4x in a hot loop.
+fn scale_at(index: u32) -> f32 {
+  let pair = unpack2x16float(scales[index >> 1u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+fn zero_at(index: u32) -> f32 {
+  let pair = unpack2x16float(zeros[index >> 1u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
 }
 
-fn scale_at(index: u32) -> f32 { return unpack2x16float(scales[index >> 1u])[index & 1u]; }
-fn zero_at(index: u32) -> f32 { return unpack2x16float(zeros[index >> 1u])[index & 1u]; }
-
 /** One element of this destination run, counted from its first. */
-fn value_at(within: u32) -> f32 {
-  // 🔴 SELECTED, NOT SUBSCRIPTED. "params.codeBase[part]" is a dynamic index
+fn value_at(p: Params, within: u32) -> f32 {
+  // 🔴 SELECTED, NOT SUBSCRIPTED. "p.codeBase[part]" is a dynamic index
   // into a vector, which WGSL puts in addressable memory - see CLAUDE.md, where
   // that costs 4x in a hot loop. Four parts is three selects.
   // 🔴 A PART OWNS A RUN, NOT AN ELEMENT. With partRun 1 the parts alternate
@@ -152,35 +156,38 @@ fn value_at(within: u32) -> f32 {
   // wants the second: its gate and its shift are one buffer so the kernel reads
   // them in one dispatch, and building that on the host is 54 MiB of copy and
   // narrowing a fold.
-  let part = select(0u, (within / params.partRun) % params.parts, params.parts > 1u);
-  var codeBase = params.codeBase.x;
-  var scaleBase = params.scaleBase.x;
-  var bias = params.bias.x;
-  var groupBase = params.groupBase.x;
+  let part = select(0u, (within / p.partRun) % p.parts, p.parts > 1u);
+  var codeBase = p.codeBase.x;
+  var scaleBase = p.scaleBase.x;
+  var bias = p.bias.x;
+  var groupBase = p.groupBase.x;
   if (part == 1u) {
-    codeBase = params.codeBase.y; scaleBase = params.scaleBase.y;
-    bias = params.bias.y; groupBase = params.groupBase.y;
+    codeBase = p.codeBase.y; scaleBase = p.scaleBase.y;
+    bias = p.bias.y; groupBase = p.groupBase.y;
   } else if (part == 2u) {
-    codeBase = params.codeBase.z; scaleBase = params.scaleBase.z;
-    bias = params.bias.z; groupBase = params.groupBase.z;
+    codeBase = p.codeBase.z; scaleBase = p.scaleBase.z;
+    bias = p.bias.z; groupBase = p.groupBase.z;
   } else if (part == 3u) {
-    codeBase = params.codeBase.w; scaleBase = params.scaleBase.w;
-    bias = params.bias.w; groupBase = params.groupBase.w;
+    codeBase = p.codeBase.w; scaleBase = p.scaleBase.w;
+    bias = p.bias.w; groupBase = p.groupBase.w;
   }
-  let d2 = (within / (params.partRun * params.parts)) * params.partRun
-    + (within % params.partRun);
-  let absolute = bias + (d2 / params.inner) * params.outerStride
-    + (d2 % params.inner) * params.innerStride;
+  let d2 = (within / (p.partRun * p.parts)) * p.partRun
+    + (within % p.partRun);
+  let absolute = bias + (d2 / p.inner) * p.outerStride
+    + (d2 % p.inner) * p.innerStride;
   let group = absolute / GROUP;
   let table = scaleBase + (group - groupBase);
   let scale = scale_at(table);
 ${codec.signed ? "" : "  let zero = zero_at(table);"}
   let bit = (absolute % GROUP) * ${codec.bits}u;
-  let at = codeBase + (group - groupBase) * GROUP_BYTES + (bit >> 3u);
-  // 🔴 TWO BYTES ARE ALWAYS ENOUGH: a code starts at bit offset 0-7 and is at
-  // most eight bits wide, so it ends by bit 15. Any width up to eight is safe.
-  let pair = byte_at(at) | (byte_at(at + 1u) << 8u);
-  let code = (pair >> (bit & 7u)) & ${(1 << codec.bits) - 1}u;
+  // The code's first bit in the whole code buffer, read as one word or two:
+  // a code is at most eight bits wide, so it crosses at most one word boundary.
+  let start = (codeBase + (group - groupBase) * GROUP_BYTES) * 8u + bit;
+  let word = start >> 5u;
+  let shift = start & 31u;
+  var bits = codes[word] >> shift;
+  if (shift > ${32 - codec.bits}u) { bits = bits | (codes[word + 1u] << (32u - shift)); }
+  let code = bits & ${(1 << codec.bits) - 1}u;
 ${codec.signed
   ? `  // Two's complement in eight bits, and no zero point: see codecOf.
   return f32(i32(code << 24u) >> 24u) * scale;`
@@ -190,25 +197,50 @@ ${codec.signed
 const GROUP: u32 = ${codec.group}u;
 const GROUP_BYTES: u32 = ${codec.groupBytes}u;
 
+// 🔴 EVERY TENSOR OF A PLAN IN ONE DISPATCH. One dispatch a tensor put a
+// barrier between each - they all write the destination - and a streamed fold
+// replays twelve thousand tensors: int5-replay was 132 ms of GPU a fold, and is
+// 88. Each workgroup owns REPLAY_RUN consecutive slots of one tensor and finds
+// which by a binary search over the tensors' first workgroups, once.
+const REPLAY_RUN: u32 = ${REPLAY_RUN}u;
 @compute @workgroup_size(${LANES})
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let wg = group.x + group.y * 65535u;
+  if (wg >= table[0].padding[0].y) { return; }
+  var low = 0u;
+  var high = arrayLength(&table) - 1u;
+  while (low < high) {
+    let middle = (low + high + 1u) / 2u;
+    if (table[middle].padding[0].x <= wg) { low = middle; } else { high = middle - 1u; }
+  }
+  let params = table[low];
+  let slots = ${destination === "f32" ? "params.count" : "(params.count + 1u) / 2u"};
+  let first = (wg - params.padding[0].x) * REPLAY_RUN;
+  for (var k = 0u; k < REPLAY_RUN; k += ${LANES}u) {
+    let slot = first + k + lid.x;
+    if (slot < slots) { element(params, slot); }
+  }
+}
+
+fn element(params: Params, slot: u32) {
 ${destination === "f32" ? `  // 🔴 ONE ELEMENT A WORD, SO THE DESTINATION MAY STRIDE. An f32 element IS a
   // word, so writing every fourth one races nobody - which is what lets grid
   // attention's four interleaved projections be four dispatches instead of one
   // mapping they cannot share. The f16 path below cannot do this: two elements
   // share a word and a strided write would be a read-modify-write of sixteen
   // bits, which WGSL has no way to do.
-  let within = id.x + id.y * 65535u * ${LANES}u;
+  let within = slot;
   if (within >= params.count) { return; }
   let at = params.destWord + params.destStride * within;
-${accumulate ? "  output[at] = bitcast<u32>(bitcast<f32>(output[at]) + value_at(within));"
-    : "  output[at] = bitcast<u32>(value_at(within));"}`
-: `  let pair = id.x + id.y * 65535u * ${LANES}u;
+${accumulate ? "  output[at] = bitcast<u32>(bitcast<f32>(output[at]) + value_at(params, within));"
+    : "  output[at] = bitcast<u32>(value_at(params, within));"}`
+: `  let pair = slot;
   let within = pair * 2u;
   if (within >= params.count) { return; }
-  let a = value_at(within);
+  let a = value_at(params, within);
   var b = 0.0;
-  if (within + 1u < params.count) { b = value_at(within + 1u); }
+  if (within + 1u < params.count) { b = value_at(params, within + 1u); }
 ${accumulate ? `  // 🔴 READ, ADD, WRITE - AND ONE LANE STILL OWNS ONE WHOLE WORD, which is
   // the rule that makes this safe and is the same rule that makes the plain
   // store safe. A lane owning HALF a word would read it, insert its half and
@@ -350,6 +382,8 @@ export function planBlockUpload(entries, destination = "f16", options = {}) {
                   destStride: entry.destStride ?? 1, partRun,
                   inner, innerStride, outerStride });
   }
+  // The shader addresses codes by BIT in a u32; see value_at.
+  if (codeBytes >= 2 ** 29) throw new RangeError(`${codeBytes} bytes of codes in one plan`);
   return { gpu: { codeChunks, scaleChunks, zeroChunks, params, codec, destination,
                   codeBytes, halfBytes: halfCount * 2, accumulate }, host };
 }
@@ -383,7 +417,7 @@ async function uploadPipeline(device, codec, destination, accumulate = false) {
       storage(0, "read-only-storage"), storage(1, "read-only-storage"),
       storage(2, "read-only-storage"), storage(3, "storage"),
       { binding: 4, visibility: GPUShaderStage.COMPUTE,
-        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: PARAM_STRIDE } },
+        buffer: { type: "read-only-storage" } },
     ],
   });
   const built = device.createComputePipelineAsync({
@@ -546,29 +580,55 @@ export function captureBlockUpload(destination) {
 }
 
 export function replayBlockUpload(device, recording, destination) {
+  // Compiled by the fill that recorded this, so it is already a value.
+  const { pipeline, layout } = builtPipeline(device, recording.codec, recording.element,
+                                             recording.add);
   let bindGroup = recording.bindGroups.get(destination);
   if (bindGroup === undefined) {
     bindGroup = device.createBindGroup({
-      layout: recording.layout,
+      layout,
       entries: [
         { binding: 0, resource: { buffer: recording.codes } },
         { binding: 1, resource: { buffer: recording.scales } },
         { binding: 2, resource: { buffer: recording.zeros } },
         { binding: 3, resource: { buffer: destination } },
-        { binding: 4, resource: { buffer: recording.uniforms, size: PARAM_STRIDE } },
+        { binding: 4, resource: { buffer: recording.uniforms, size: recording.tableBytes } },
       ],
     });
     recording.bindGroups.set(destination, bindGroup);
   }
-  const encoder = device.createCommandEncoder({ label: "int5-replay" });
-  const pass = encoder.beginComputePass({ label: "int5-replay" });
-  pass.setPipeline(recording.pipeline);
-  recording.dispatches.forEach(([x, y], index) => {
-    pass.setBindGroup(0, bindGroup, [index * PARAM_STRIDE]);
-    pass.dispatchWorkgroups(x, y);
-  });
-  pass.end();
-  device.queue.submit([encoder.finish()]);
+  // 🔴 DEFERRED TO THE NEXT SUBMIT, NOT SUBMITTED HERE. A streamed fold
+  // replays ~1750 decodes, and one submit each was +10% of a warm 255-token
+  // AF3 fold in driver round trips. Whatever reads this buffer is submitted
+  // after this call, so the decode rides at the head of that submit, in one
+  // pass with every other decode pending. The queue's own order still puts it
+  // after every writeBuffer made before it.
+  pendingReplays(device).push({ recording, bindGroup, pipeline });
+}
+
+
+const pendingByQueue = new WeakMap();
+function pendingReplays(device) {
+  const queue = device.queue;
+  let pending = pendingByQueue.get(queue);
+  if (pending !== undefined) return pending;
+  pending = [];
+  pendingByQueue.set(queue, pending);
+  const submit = queue.submit.bind(queue);
+  queue.submit = (commandBuffers) => {
+    if (pending.length === 0) return submit(commandBuffers);
+    const encoder = device.createCommandEncoder({ label: "int5-replay" });
+    const pass = encoder.beginComputePass({ label: "int5-replay" });
+    for (const { recording, bindGroup, pipeline } of pending.splice(0)) {
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      const groups = recording.replayGroups;
+      pass.dispatchWorkgroups(Math.min(groups, 65535), Math.ceil(groups / 65535));
+    }
+    pass.end();
+    return submit([encoder.finish(), ...commandBuffers]);
+  };
+  return pending;
 }
 
 /** Give back what a recording holds. */
@@ -638,8 +698,9 @@ export async function runBlockUpload(device, plan, destination) {
 
   const uniformAt = performance.now();
   const uniforms = make(PARAM_STRIDE * plan.params.length,
-                        GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+                        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
   const table = new Uint32Array(PARAM_STRIDE / 4 * plan.params.length);
+  let replayGroups = 0;
   plan.params.forEach((entry, index) => {
     const at = index * (PARAM_STRIDE / 4);
     // Four vec4s, then the six scalars; see the Params struct in shaderFor.
@@ -658,7 +719,11 @@ export async function runBlockUpload(device, plan, destination) {
     table[at + 21] = entry.outerStride;
     table[at + 22] = entry.destStride ?? 1;
     table[at + 23] = entry.partRun ?? 1;
+    table[at + 24] = replayGroups;
+    replayGroups += Math.ceil((element === "f32" ? entry.count : Math.ceil(entry.count / 2))
+                              / REPLAY_RUN);
   });
+  table[25] = replayGroups;
   device.queue.writeBuffer(uniforms, 0, table);
 
   const bindGroup = device.createBindGroup({
@@ -668,7 +733,9 @@ export async function runBlockUpload(device, plan, destination) {
       { binding: 1, resource: { buffer: scales } },
       { binding: 2, resource: { buffer: zeros } },
       { binding: 3, resource: { buffer: destination } },
-      { binding: 4, resource: { buffer: uniforms, size: PARAM_STRIDE } },
+      // ...exactly the table, because a pooled buffer may be longer and the
+      // kernel's search runs to arrayLength.
+      { binding: 4, resource: { buffer: uniforms, size: PARAM_STRIDE * plan.params.length } },
     ],
   });
 
@@ -677,17 +744,12 @@ export async function runBlockUpload(device, plan, destination) {
   const encoder = device.createCommandEncoder({ label: "int5-upload" });
   const pass = encoder.beginComputePass({ label: "int5-upload" });
   pass.setPipeline(pipeline);
-  const dispatches = [];
-  plan.params.forEach((entry, index) => {
-    pass.setBindGroup(0, bindGroup, [index * PARAM_STRIDE]);
-    const slots = element === "f32" ? entry.count : Math.ceil(entry.count / 2);
-    const groups = Math.ceil(slots / LANES);
-    dispatches.push([Math.min(groups, 65535), Math.ceil(groups / 65535)]);
-    pass.dispatchWorkgroups(Math.min(groups, 65535), Math.ceil(groups / 65535));
-  });
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.min(replayGroups, 65535), Math.ceil(replayGroups / 65535));
   if (recording) {
-    captured.push({ pipeline, layout, codes, scales, zeros, uniforms, dispatches, owned,
-                    bindGroups: new Map([[destination, bindGroup]]) });
+    captured.push({ codec: plan.codec, element, add, codes, scales, zeros, uniforms,
+                    owned, replayGroups, tableBytes: PARAM_STRIDE * plan.params.length,
+                    bindGroups: new Map() });
   }
   pass.end();
   const commands = encoder.finish();

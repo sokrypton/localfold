@@ -93,6 +93,15 @@ export function releaseStreamedWeights(device, prefix) {
   }
 }
 
+/**
+ * Stop streaming without giving anything back: the recorded codes stay for the
+ * next setStreamedWeights of the same prefix. A fold ends with this, because
+ * another family's labels share the `w.` prefix and must not stream.
+ */
+export function pauseStreamedWeights(device) {
+  streamedPrefix.delete(device);
+}
+
 /** Whether `label` is streamed on this device right now - see setStreamedWeights. */
 export function isStreamed(device, label) {
   const streamed = streamedPrefix.get(device);
@@ -194,6 +203,9 @@ export async function residentWeightBufferFilled(device, key, label, byteLength,
   // before fetching the next, and the queue orders the next fill after it.
   const streamed = streamedPrefix.get(device);
   if (streamed !== undefined && streamed.some((prefix) => label.startsWith(prefix))) {
+    // 🔴 AND A RING BUFFER IS NOT ZEROED BETWEEN TENSORS: every tensor of
+    // this label, variant and size shares it, so a fill that leaves regions
+    // unwritten must name its layout in the variant (see the triangle's).
     // 🔴 A SMALL RING A LABEL, NOT ONE BUFFER: a block may hold two tensors
     // under one label - both grid attentions are `w.grid` - and one shared
     // buffer let the second fill overwrite the first before the block ran
