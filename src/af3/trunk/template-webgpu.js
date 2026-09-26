@@ -466,21 +466,42 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
-  let base = row * CHANNELS;
+// 🔴 FOUR PAIR ROWS A WORKGROUP AND A LANE AN OUTPUT, NOT A THREAD A ROW.
+// A thread a row walked every output channel over its own row - 1017
+// workgroups at 255 tokens, strided reads, and 62.8 ms a trunk pass at
+// IntelliFold-2's 512 channels, ~34 GFLOP/s. Staged, the scaled rows are read
+// once and each lane sums its channel over c in the same order from zero, so
+// the answer is bit-identical. Same shape as template.embed above.
+const OUT_ROWS: u32 = ${TEMPLATE_EMBED_ROWS}u;
+var<workgroup> scaled_rows: array<f32, ${TEMPLATE_EMBED_ROWS * CHANNELS}>;
 
-  for (var f = 0u; f < QUERY_CHANNELS; f += 1u) {
-    var value = 0.0;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) lane: u32) {
+  let first = (group.x + group.y * GRID_WIDTH) * OUT_ROWS;
+  if (first >= PAIRS) { return; }
+  for (var at = lane; at < OUT_ROWS * CHANNELS; at += 64u) {
+    let row = first + at / CHANNELS;
+    // ...relu BEFORE the projection, so the module can only add along a
+    // non-negative combination of output_linear's directions.
+    scaled_rows[at] = select(0.0,
+      max(summed[min(row, PAIRS - 1u) * CHANNELS + at % CHANNELS] * TEMPLATE_SCALE, 0.0),
+      row < PAIRS);
+  }
+  workgroupBarrier();
+  for (var f = lane; f < QUERY_CHANNELS; f += 64u) {
+    var values: array<f32, ${TEMPLATE_EMBED_ROWS}>;
+    for (var r = 0u; r < OUT_ROWS; r += 1u) { values[r] = 0.0; }
     for (var c = 0u; c < CHANNELS; c += 1u) {
-      // ...relu BEFORE the projection, so the module can only add along a
-      // non-negative combination of output_linear's directions.
-      let scaled = max(summed[base + c] * TEMPLATE_SCALE, 0.0);
-      value += scaled * weights[W_OUT + c * QUERY_CHANNELS + f];
+      let w = weights[W_OUT + c * QUERY_CHANNELS + f];
+      for (var r = 0u; r < OUT_ROWS; r += 1u) {
+        values[r] += scaled_rows[r * CHANNELS + c] * w;
+      }
     }
-    output[row * QUERY_CHANNELS + f] = value;
+    for (var r = 0u; r < OUT_ROWS; r += 1u) {
+      let row = first + r;
+      if (row < PAIRS) { output[row * QUERY_CHANNELS + f] = values[r]; }
+    }
   }
 }`;
 
@@ -1045,7 +1066,8 @@ export class Af3TemplateEmbedderGpu {
           binding, resource: { buffer: allocation.buffer },
         })),
       }));
-      pass.dispatchWorkgroups(linear[0], linear[1]);
+      // Four pair rows a workgroup; see the shader.
+      pass.dispatchWorkgroups(perEmbed[0], perEmbed[1]);
       pass.end();
       if (pairBuffer !== undefined) {
         // z += template(z), the add the trunk did on the host.
