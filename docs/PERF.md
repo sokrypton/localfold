@@ -779,6 +779,24 @@ was +113 ms of creates and zero-fills - this allocator destroys on release).
 957**, same fold. The +40 ms is 144 decodes on the loop's critical path, since
 the tower waits for each block.
 
+### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
+
+The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by
+256 columns, so a token-sized projection at 768 or 1152 channels ran 15 to 60
+workgroups a pass on a card that holds thousands. Each output sums k in the same
+order at any row tile, so two rows is more workgroups for the same bits - pLDDT
+identical to every digit at every length below, `test:stock` and
+`test:spec-floor` signatures unchanged. Stock flags, A100, warm fold:
+
+| | 59 residues | 255 | 510 |
+|---|---:|---:|---:|
+| sampler, tile 8 -> 2 (`esmfold2TokenRowTile`) | 499 -> 309 ms | 618 -> 437 | 845 -> 679 |
+| language model, tile 8 -> 2 (`esmcRowTile`) | 145 -> 114 | 163 -> 128 | |
+| whole fold | 0.88 -> 0.65 s | 3.30 -> 3.08 | |
+
+Tile 1 is the same as 2 and 4 is between. ESMFold2's trunk is not this class:
+its `tri.project` runs at ~90% of f32 peak and the wide transition at ~70%.
+
 ## The split pair transition, for a device with no matrix units
 
 🔴 **NO MATRIX UNITS MEANT NO SPLIT, AND NO VISITOR HAS MATRIX UNITS.** The

@@ -387,6 +387,8 @@ export const DEFAULT_TUNING = Object.freeze({
   // because the geometry that suits one is 5-6% wrong for the other. See
   // src/af3/trunk/grid-attention-matrix.js.
   gridAttendMatrix: null,
+  esmfold2TokenRowTile: null,
+  esmcRowTile: null,
   // Its geometry, "subgroupsXkeys"; null takes GRID_ATTEND_MATRIX_DEFAULT_TILE.
   gridAttendMatrixTile: null,
   // 🔴 THE PAIR TRANSITION AS THREE PASSES INSTEAD OF ONE, ON THE MATRIX UNITS.

@@ -28,7 +28,7 @@
  * once for a fold and shared by every sampler step. Uploading it beats teaching
  * a kernel to build a one-hot it will immediately contract away.
  */
-import { halfPrecisionAvailable } from "../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader,
          createSwigluShader, linearGrid, swigluGrid } from "../esmc/block-webgpu.js";
 import { float32ToFloat16Array } from "../weights/float16.js";
@@ -488,6 +488,19 @@ function pipelineKeyOf(shape) {
           shape.attentionPrecision].join(":");
 }
 
+/**
+ * 🔴 THE TOKEN TRANSFORMER'S ROW TILE IS TWO, NOT THE LINEAR'S EIGHT. Its
+ * projections are tokens x 768 and ran 15 to 60 workgroups a pass at a tile of
+ * eight rows. Each output still sums k in order at any tile, so a smaller one
+ * is more workgroups for the same bits. Stock flags, A100, sampler of a warm
+ * fold at tiles 8 / 4 / 2 / 1: 59 residues 499 / 427 / 309 / 310 ms, 255
+ * residues 618 / 555 / 437 / 435, 510 residues 845 / - / 679 / -.
+ * `esmfold2TokenRowTile` overrides.
+ */
+function tokenRowTile(device, tokens) {
+  return deviceTuning(device).esmfold2TokenRowTile ?? 2;
+}
+
 export class Esmfold2DenoiserGpu {
   constructor(device, allocator, pipelineCache, options = {}) {
     this.device = device;
@@ -617,8 +630,10 @@ export class Esmfold2DenoiserGpu {
     // its own bound agrees with itself the moment the default moves; one that
     // reads what the stack RAN does not. See check-esmfold2-diffusion-gpu.js.
     this.weightPrecision = weightPrecision;
+    const rowTile = tokenRowTile(this.device, tokens);
     const key = `esmfold2-diff:${tokens}:${atoms}:${pairChannels}:${tokenChannels}:`
-      + `${tokenHeads}:${multiplier}:${atomChannels}:${atomHeads}:${window}:${weightPrecision}`;
+      + `${tokenHeads}:${multiplier}:${atomChannels}:${atomHeads}:${window}:${weightPrecision}`
+      + `:rt${rowTile}`;
     const get = (name, code) => this.cache.get(`${key}:${name}`, code);
     const hidden = tokenChannels * multiplier;
 
@@ -637,19 +652,19 @@ export class Esmfold2DenoiserGpu {
       // reads a norm, a bias or an atom stack's tensor and stays f32.
       wide: get("wide",
         createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden },
-                           false, weightPrecision)),
+                           false, weightPrecision, false, rowTile)),
       square: get("square",
         createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels },
-                           false, weightPrecision)),
+                           false, weightPrecision, false, rowTile)),
       squareResidual: get("square-residual",
         createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels },
-                           true, weightPrecision)),
+                           true, weightPrecision, false, rowTile)),
       narrow: get("narrow",
         createLinearShader({ rows: tokens, inner: hidden, outer: tokenChannels },
-                           false, weightPrecision)),
+                           false, weightPrecision, false, rowTile)),
       swishWide: get("swish-wide",
         createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden * 2 },
-                           false, weightPrecision)),
+                           false, weightPrecision, false, rowTile)),
       gatedSingle: get("gated-single", createGatedProductShader(tokens * hidden)),
       addSingle: get("add-single", createAddShader(tokens * tokenChannels)),
       adaptive: get("adaptive",
@@ -789,6 +804,8 @@ export class Esmfold2DenoiserGpu {
     const pairs = tokens * tokens;
     const hidden = tokenChannels * multiplier;
     const storage = GPUBufferUsage.STORAGE;
+    // The same rule the pipelines were compiled with; see tokenRowTile.
+    const rowTile = tokenRowTile(this.device, tokens);
     this.weights = weights;
 
     // ---- what the host computes once, because it is a gather or one row.
@@ -1198,13 +1215,13 @@ export class Esmfold2DenoiserGpu {
       record("esmfold2.diff.s-norm", pipelines.normOffset,
              [b.single, block.normScale, block.normOffset, b.sNorm], ...perRow(tokens));
       record("esmfold2.diff.s-a", pipelines.wide, [b.sNorm, block.aProjection, b.wideA],
-             ...linearGrid(tokens, hidden));
+             ...linearGrid(tokens, hidden, rowTile));
       record("esmfold2.diff.s-b", pipelines.wide, [b.sNorm, block.bProjection, b.wideB],
-             ...linearGrid(tokens, hidden));
+             ...linearGrid(tokens, hidden, rowTile));
       record("esmfold2.diff.s-gate", pipelines.gatedSingle, [b.wideA, b.wideB, b.wideG],
              ...elementwise(tokens * hidden));
       record("esmfold2.diff.s-out", pipelines.narrow, [b.wideG, block.outProjection, b.delta],
-             ...linearGrid(tokens, tokenChannels));
+             ...linearGrid(tokens, tokenChannels, rowTile));
       record("esmfold2.diff.s-add", pipelines.addSingle, [b.single, b.delta],
              ...elementwise(tokens * tokenChannels));
     }
@@ -1230,7 +1247,7 @@ export class Esmfold2DenoiserGpu {
     record("esmfold2.diff.step-norm", pipelines.normOffset,
            [b.single, w.stepNormScale, w.stepNormOffset, b.sNorm], ...perRow(tokens));
     record("esmfold2.diff.step-project", pipelines.squareResidual,
-           [b.sNorm, w.singleToToken, b.tokenAct, b.act], ...linearGrid(tokens, tokenChannels));
+           [b.sNorm, w.singleToToken, b.tokenAct, b.act], ...linearGrid(tokens, tokenChannels, rowTile));
 
     for (let index = 0; index < tokenBlocks.length; index += 1) {
       const block = tokenBlocks[index];
@@ -1241,27 +1258,27 @@ export class Esmfold2DenoiserGpu {
              [b.single, attention.adaln.singleScale, b.normSingle], ...perRow(tokens));
       record("esmfold2.diff.attn-gate-shift", pipelines.wide,
              [b.normSingle, attention.adaln.gateShift, b.gateShift],
-             ...linearGrid(tokens, tokenChannels * 2));
+             ...linearGrid(tokens, tokenChannels * 2, rowTile));
       record("esmfold2.diff.attn-adaln", pipelines.adaptive,
              [b.normAct, b.gateShift, attention.adaln.gateBias, b.modulated],
              ...elementwise(tokens * tokenChannels));
       record("esmfold2.diff.attn-query", pipelines.square,
-             [b.modulated, attention.queryWeights, b.query], ...linearGrid(tokens, tokenChannels));
+             [b.modulated, attention.queryWeights, b.query], ...linearGrid(tokens, tokenChannels, rowTile));
       record("esmfold2.diff.attn-query-bias", pipelines.broadcastAdd,
              [attention.queryBias, b.query], ...elementwise(tokens * tokenChannels));
       record("esmfold2.diff.attn-kv", pipelines.wide,
-             [b.modulated, attention.kvWeights, b.kv], ...linearGrid(tokens, tokenChannels * 2));
+             [b.modulated, attention.kvWeights, b.kv], ...linearGrid(tokens, tokenChannels * 2, rowTile));
       record("esmfold2.diff.attn-gate", pipelines.square,
-             [b.modulated, attention.gateWeights, b.gate], ...linearGrid(tokens, tokenChannels));
+             [b.modulated, attention.gateWeights, b.gate], ...linearGrid(tokens, tokenChannels, rowTile));
       record("esmfold2.diff.attend", pipelines.attention,
              [b.query, b.kv, b.bias[index], b.context],
              ...perRow(tokens * tokenHeads));
       record("esmfold2.diff.attn-context-gate", pipelines.sigmoidGate,
              [b.context, b.gate, b.gatedContext], ...elementwise(tokens * tokenChannels));
       record("esmfold2.diff.attn-out", pipelines.square,
-             [b.gatedContext, attention.outWeights, b.delta], ...linearGrid(tokens, tokenChannels));
+             [b.gatedContext, attention.outWeights, b.delta], ...linearGrid(tokens, tokenChannels, rowTile));
       record("esmfold2.diff.attn-out-gate", pipelines.square,
-             [b.single, attention.outGateWeights, b.outGate], ...linearGrid(tokens, tokenChannels));
+             [b.single, attention.outGateWeights, b.outGate], ...linearGrid(tokens, tokenChannels, rowTile));
       record("esmfold2.diff.attn-add", pipelines.gatedAdd,
              [b.delta, b.outGate, attention.outGateBias, b.act],
              ...elementwise(tokens * tokenChannels));
@@ -1273,16 +1290,16 @@ export class Esmfold2DenoiserGpu {
              [b.single, transition.adaln.singleScale, b.normSingle], ...perRow(tokens));
       record("esmfold2.diff.ffn-gate-shift", pipelines.wide,
              [b.normSingle, transition.adaln.gateShift, b.gateShift],
-             ...linearGrid(tokens, tokenChannels * 2));
+             ...linearGrid(tokens, tokenChannels * 2, rowTile));
       record("esmfold2.diff.ffn-adaln", pipelines.adaptive,
              [b.normAct, b.gateShift, transition.adaln.gateBias, b.modulated],
              ...elementwise(tokens * tokenChannels));
       record("esmfold2.diff.ffn-swiglu", pipelines.swiglu,
              [b.modulated, transition.swishWeights, b.wideG], ...swigluGrid(tokens, hidden));
       record("esmfold2.diff.ffn-out", pipelines.narrow,
-             [b.wideG, transition.outWeights, b.delta], ...linearGrid(tokens, tokenChannels));
+             [b.wideG, transition.outWeights, b.delta], ...linearGrid(tokens, tokenChannels, rowTile));
       record("esmfold2.diff.ffn-out-gate", pipelines.square,
-             [b.single, transition.outGateWeights, b.outGate], ...linearGrid(tokens, tokenChannels));
+             [b.single, transition.outGateWeights, b.outGate], ...linearGrid(tokens, tokenChannels, rowTile));
       record("esmfold2.diff.ffn-add", pipelines.gatedAdd,
              [b.delta, b.outGate, transition.outGateBias, b.act],
              ...elementwise(tokens * tokenChannels));

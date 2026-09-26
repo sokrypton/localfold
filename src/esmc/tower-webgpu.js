@@ -29,7 +29,7 @@ import {
   noteResidencyRefused, residencyAllowed,
 } from "../runtime/device-memory.js";
 import { float32ToFloat16Array } from "../weights/float16.js";
-import { halfPrecisionAvailable } from "../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   captureBlockUpload, planBlockUpload, releaseRecording, replayBlockUpload, runBlockUpload,
@@ -276,14 +276,18 @@ export class EsmcTowerGpu {
     const keepPersistent = (allocation) => { persistent.push(allocation); return allocation; };
 
     const pipeline = (name, source) => this.pipelines.get(name, source);
+    // 🔴 THE LINEARS' ROW TILE IS TWO: at eight a 61-token fold ran ~40
+    // workgroups a pass. Each output sums k in order at any tile, so this is
+    // more workgroups for the same bits. `esmcRowTile` overrides.
+    const rowTile = deviceTuning(this.device).esmcRowTile ?? 2;
     const [normPipeline, qkvPipeline, preparePipeline, attentionPipeline,
       outPipeline, swigluPipeline, downPipeline, mixPipeline,
       finalNormPipeline, singlePipeline] = await Promise.all([
       pipeline(`esmc-ln:${rows}:${model}:${epsilon}`,
         createLayerNormShader({ rows, channels: model }, true, epsilon)),
-      pipeline(`esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}`,
+      pipeline(`esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:rt${rowTile}`,
         createLinearShader({ rows, inner: model, outer: 3 * model }, false,
-          weightPrecision)),
+          weightPrecision, false, rowTile)),
       pipeline(`esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
         createPrepareShader({ rows, model, heads }, epsilon, ropeBase)),
       // 🔴 CHAIN-AWARE IS PART OF THE CACHE KEY, NOT JUST OF THE BINDINGS. The
@@ -292,20 +296,20 @@ export class EsmcTowerGpu {
       // monomer's pipeline and quietly let the chains attend to each other.
       pipeline(`esmc-attend:${rows}:${model}:${heads}:${sequenceId === undefined ? "flat" : "chains"}`,
         createAttentionShader({ rows, model, heads }, QUERY_TILE, sequenceId !== undefined)),
-      pipeline(`esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}`,
+      pipeline(`esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:rt${rowTile}`,
         createLinearShader({ rows, inner: model, outer: model }, true,
-          weightPrecision)),
+          weightPrecision, false, rowTile)),
       pipeline(`esmc-swiglu:${rows}:${model}:${ffn}:${weightPrecision}`,
         createSwigluShader({ rows, model, ffn }, weightPrecision)),
-      pipeline(`esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}`,
+      pipeline(`esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:rt${rowTile}`,
         createLinearShader({ rows, inner: ffn, outer: model }, true,
-          weightPrecision)),
+          weightPrecision, false, rowTile)),
       pipeline(`esmc-mix:${rows}:${model}:${pair}:${epsilon}`,
         createMixShader({ rows, model, pair }, epsilon)),
       pipeline(`esmc-ln-nooffset:${rows}:${model}:${epsilon}`,
         createLayerNormShader({ rows, channels: model }, false, epsilon)),
-      pipeline(`esmc-linear:${rows}:${pair}:${pair}:0`,
-        createLinearShader({ rows, inner: pair, outer: pair }, false)),
+      pipeline(`esmc-linear:${rows}:${pair}:${pair}:0:rt${rowTile}`,
+        createLinearShader({ rows, inner: pair, outer: pair }, false, "f32", false, rowTile)),
     ]);
 
     const captured = new Map();
@@ -352,7 +356,7 @@ export class EsmcTowerGpu {
       const dispatchLinear = (pass, built, bindings, outer) => {
         pass.setPipeline(built);
         pass.setBindGroup(0, bind(built, bindings));
-        const [x, y] = linearGrid(rows, outer);
+        const [x, y] = linearGrid(rows, outer, rowTile);
         pass.dispatchWorkgroups(x, y);
       };
 
