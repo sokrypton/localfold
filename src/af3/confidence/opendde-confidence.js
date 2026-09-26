@@ -153,8 +153,8 @@ export async function openddeConfidence(device, input, weights, dialect, options
   const onHost = options.hostReadouts === true;
   const built = onHost ? undefined : await openddePairInit(device, {
     tokens, channels: c, pair: input.pair, pairBuffer: input.pairBuffer,
-    s1: linear(input.singleInputs, tokens, weights.singleInputChannels, c, weights.s1),
-    s2: linear(input.singleInputs, tokens, weights.singleInputChannels, c, weights.s2),
+    // s1 and s2 are projected on the device; see openddePairInit.
+    singleInputs: input.singleInputs, singleInputChannels: weights.singleInputChannels,
     coordinates: input.coordinates, binStart: BIN_START, binStep: BIN_STEP,
   }, weights, stack.allocator);
   const pair = onHost
