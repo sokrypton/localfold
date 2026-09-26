@@ -38,105 +38,67 @@ import { linear } from "../trunk/pairformer-reference.js";
 export function perAtomConditioning(reference, tokens, dense, weights, dialect) {
   const channels = weights.channels;
   const rows = tokens * dense;
-
-  const act = linear(reference.positions, rows, 3, channels, weights.embedRefPos);
-
-  const add = (contribution) => {
-    for (let index = 0; index < act.length; index += 1) act[index] += contribution[index];
-  };
-
-  // 🔴 ...and boltz2's single bias over the whole concatenation, added once.
-  // Its features go through ONE Linear where AF3 sums five bias-free ones, so
-  // this term has no per-feature home: it is a constant vector on every atom.
-  if (weights.embedAtomFeaturesBias != null) {
-    const bias = weights.embedAtomFeaturesBias;
-    for (let index = 0; index < rows; index += 1) {
-      for (let c = 0; c < channels; c += 1) act[index * channels + c] += bias[c];
-    }
-  }
-
-  const maskColumn = new Float32Array(rows);
-  for (let index = 0; index < rows; index += 1) maskColumn[index] = reference.mask[index];
-  add(linear(maskColumn, rows, 1, channels, weights.embedRefMask));
-
-  // ...the element as a one-hot over the periodic table, which is why the
-  // weight is 128 rows: an atomic number indexes it directly.
+  // 🔴 ONE PASS A ROW, THE SAME FLOATS. This was seven passes over
+  // `rows x channels` - a `linear` for the position, the mask and the charge,
+  // each allocating its own array, and an `add` for each - which is 46 ms of
+  // host time a fold at 255 tokens, run twice (the target-feat encoder and the
+  // diffusion head). Every element below sees the same operations in the same
+  // order and is rounded to f32 at the same points the separate passes rounded
+  // it, so the result is bit-identical:
   //
-  // 🔴 AND "INDEXES IT DIRECTLY" IS THE IMPLEMENTATION, NOT JUST THE READING.
-  // Building the one-hot and multiplying by it is rows * 128 * channels
-  // multiply-adds of which all but rows * channels are by zero. Adding the row
-  // the one-hot selects is the SAME FLOAT: `linear` accumulates from zero over
-  // ascending columns, so the sum is a run of exact zeros around one term.
-  // This and the atom name below are 384 of this function's 389 input columns
-  // and were 99% of its arithmetic - 72 ms at 59 tokens, 220 at 150, 343 at
-  // 300, once per fold, all of it spent multiplying by zero.
-  for (let index = 0; index < rows; index += 1) {
-    const atomicNumber = reference.element[index];
-    if (atomicNumber < 0 || atomicNumber >= 128) continue;
-    const weightBase = atomicNumber * channels;
-    const actBase = index * channels;
-    for (let c = 0; c < channels; c += 1) {
-      act[actBase + c] += weights.embedRefElement[weightBase + c];
-    }
-  }
-
-  // 🔴 arcsinh, NOT the charge. See the note at the top: identical at zero, so
-  // no protein-only check can catch this.
-  const charge = new Float32Array(rows);
-  // 🔴 AlphaFold 3 SQUASHES THE CHARGE AND boltz2 DOES NOT. `asinh` is a
-  // compression - it barely moves a charge of 0 or 1 and pulls in the tails -
-  // so on a protein, where almost every formal charge is zero, the two agree
-  // almost everywhere and differ just enough to be invisible in a fold and
-  // plain in a denoise step. RAW_REF_CHARGE covers boltz2, chai1, rosettafold3
-  // and the ESMFold2 family.
+  //   - the position is `linear`'s float64 dot product from zero over
+  //     ascending columns, rounded once;
+  //   - boltz2's single bias over the whole concatenation, added once;
+  //   - the mask and the charge are one-column `linear`s, so each is
+  //     `fround(0 + x * w)` added to the running value;
+  //   - the element is a one-hot over the periodic table, so an atomic number
+  //     indexes its row directly (adding the selected row IS the matmul's float:
+  //     every other term is an exact zero);
+  //   - 🔴 arcsinh of the charge, NOT the charge, for AlphaFold 3 - identical at
+  //     zero, so no protein-only check can see it - and the raw charge for
+  //     RAW_REF_CHARGE dialects (boltz2, chai1, rosettafold3, ESMFold2);
+  //   - the atom NAME, four characters each a 64-way one-hot of ASCII minus 32,
+  //     summed in CHARACTER order in a float64 and rounded once BEFORE it reaches
+  //     the running value, because the matmul committed `act + (a+b+c+d)` and
+  //     `(((act+a)+b)+c)+d` differed in 169,390 of 696,512 floats;
+  //   - and masked last, so an absent atom contributes nothing downstream even
+  //     though four of the five embeddings above are non-zero for it.
+  const fround = Math.fround;
   const raw = dialect?.rawRefCharge === true;
-  for (let index = 0; index < rows; index += 1) {
-    charge[index] = raw ? reference.charge[index] : Math.asinh(reference.charge[index]);
-  }
-  add(linear(charge, rows, 1, channels, weights.embedRefCharge));
-
-  // ...the atom's NAME, as four characters, each a 64-way one-hot of its ASCII
-  // code minus 32, flattened to 256 columns. "CA" is padded, so the trailing
-  // slots are the one-hot of character 0 rather than nothing at all.
-  //
-  // Four one-hots, so four gathered rows summed - and summed in CHARACTER
-  // order, which is ascending column order, because that is the order the
-  // matmul added them in and floating-point addition does not commute.
-  //
-  // 🔴 THE FOUR ROWS ARE SUMMED BEFORE THEY REACH `act`, AND THAT IS NOT
-  // TIDINESS. The matmul form accumulated a row's whole dot product from zero and
-  // `add` then committed it in one step, so `act + (a+b+c+d)` is what it
-  // computed; adding the four to `act` in turn is `(((act+a)+b)+c)+d`, which
-  // floating-point addition does not promise is the same number. Measured
-  // across four shapes it differed in 169,390 of 696,512 floats by up to
-  // 4.8e-7 - physically nothing, but this file is the reference the GPU
-  // kernels are checked against, and a reference that moves under them is a
-  // tolerance nobody chose. Summed first, every float is identical.
-  // 🔴 AND IT IS A Float64Array, WHICH IS THE SECOND HALF OF THE SAME POINT.
-  // `linear` accumulates a dot product in a JS number - float64 - and rounds
-  // ONCE, when it stores the result. A Float32Array scratch rounds after every
-  // addition instead, and that alone left 12,641 floats differing by up to
-  // 1.2e-7. Accumulate wide, round where the matmul rounded.
+  const pos = weights.embedRefPos;
+  const maskWeight = weights.embedRefMask;
+  const chargeWeight = weights.embedRefCharge;
+  const elementWeight = weights.embedRefElement;
+  const nameWeight = weights.embedRefAtomName;
+  const bias = weights.embedAtomFeaturesBias ?? null;
+  const act = new Float32Array(rows * channels);
   const nameSum = new Float64Array(channels);
   for (let index = 0; index < rows; index += 1) {
+    const p0 = reference.positions[index * 3];
+    const p1 = reference.positions[index * 3 + 1];
+    const p2 = reference.positions[index * 3 + 2];
+    const mask = fround(reference.mask[index]);
+    const charge = fround(raw ? reference.charge[index] : Math.asinh(reference.charge[index]));
+    const atomicNumber = reference.element[index];
+    const elementBase = atomicNumber >= 0 && atomicNumber < 128 ? atomicNumber * channels : -1;
     nameSum.fill(0);
     for (let character = 0; character < 4; character += 1) {
       const code = reference.atomNameChars[index * 4 + character];
       if (code < 0 || code >= 64) continue;
       const weightBase = (character * 64 + code) * channels;
-      for (let c = 0; c < channels; c += 1) {
-        nameSum[c] += weights.embedRefAtomName[weightBase + c];
-      }
+      for (let c = 0; c < channels; c += 1) nameSum[c] += nameWeight[weightBase + c];
     }
-    const actBase = index * channels;
-    for (let c = 0; c < channels; c += 1) act[actBase + c] += Math.fround(nameSum[c]);
-  }
-
-  // ...and masked last, so an absent atom contributes nothing downstream even
-  // though four of the five embeddings above are non-zero for it.
-  for (let index = 0; index < rows; index += 1) {
     const keep = reference.mask[index];
-    for (let c = 0; c < channels; c += 1) act[index * channels + c] *= keep;
+    const actBase = index * channels;
+    for (let c = 0; c < channels; c += 1) {
+      let value = fround(((0 + p0 * pos[c]) + p1 * pos[channels + c]) + p2 * pos[2 * channels + c]);
+      if (bias !== null) value = fround(value + bias[c]);
+      value = fround(value + fround(0 + mask * maskWeight[c]));
+      if (elementBase >= 0) value = fround(value + elementWeight[elementBase + c]);
+      value = fround(value + fround(0 + charge * chargeWeight[c]));
+      value = fround(value + fround(nameSum[c]));
+      act[actBase + c] = value * keep;
+    }
   }
   return act;
 }

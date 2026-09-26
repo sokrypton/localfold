@@ -629,6 +629,19 @@ re-read both residues' slices, and as a GEMM over rows (i, a) and columns (j, b)
 whole rows of `i` - it is 1.60 -> 1.22 ms, bit-identical including at odd MSA
 depths (37 and 33 rows). Block **20.22 ms**, warm fold **1.23 s**.
 
+🔴 **DEAD ENDS ON `grid.attend`, BOTH MEASURED IN THE TRUNK** (AF3 int5, 255
+tokens, stock flags, 10 blocks profiled): four keys a group with one rescale -
+1.25 exps a key instead of 2, 10 accumulator operations instead of 16, not
+bit-identical - moved it **31.0 -> 28.6 ms**; two queries a lane, halving the
+staged k/v reads per multiply-add and bit-identical, moved it **30.9 -> 30.5**.
+So neither the arithmetic nor the shared-memory reads bind it; both reverted.
+
+`perAtomConditioning` (host, run twice a fold - the target-feat encoder and the
+diffusion head) was seven passes over `rows x channels` and three temporary
+arrays; fused into one pass a row with the same operations in the same order it
+is **0 of 1,069,760 floats different** (Object.is) and 32.5 -> 12.8 ms at 255
+tokens in node.
+
 What is left under stock flags is mostly arithmetic: the pair track's f32
 kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,
 `tri.project` 14, the vector split 13-15, `tri.project-out` ~12, `grid.attend`
