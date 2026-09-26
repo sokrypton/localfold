@@ -2065,6 +2065,16 @@ function foldIsShowing(renderer) {
  * never draws.
  */
 function revealViewer(renderer) {
+  // 🔴 THE CONFIDENCE TRACE IS ASKED FOR HERE, BECAUSE ONLY WE KNOW IT IS ONE.
+  // py2Dmol reads a B-FACTOR column into `plddts` for every structure there
+  // is, so its own page deliberately does not offer the plot - a graph titled
+  // pLDDT over a crystal structure is a label that is simply wrong. Every
+  // structure on THIS page is a prediction, so the ambiguity does not exist
+  // here and the panel is switched on. `initialize` is idempotent, which is
+  // what lets this sit on a function that runs per fold rather than once.
+  try {
+    if (window.Plddt && renderer) window.Plddt.initialize(renderer);
+  } catch { /* a missing panel is a lost tab, not a lost fold */ }
   const container = document.getElementById("viewer-container");
   if (container === null || getComputedStyle(container).display !== "none") return;
   container.style.display = "flex";
