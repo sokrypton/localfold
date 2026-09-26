@@ -922,7 +922,12 @@ first (`6e5a5cd`) did not shorten it - eight back-to-back folds after a cold
 first fold of 9.4 / 7.9 / 6.6 s all stayed at 1.8-2.3 s. A visitor who reads the
 first result for a minute before folding again gets the unrolled kernels. That trade is chosen for the single cold run,
 which is most of what a free user does. A token-count-independent shader set is
-still the only thing that would make a second LENGTH free.
+still the only thing that would make a second LENGTH free. 🔴 **AND CAPPING
+HOW MANY COMPILE AT ONCE DOES NOT HELP**, although a cold fold's compiler is
+busy 6.8 s where the same 118 opaque kernels compile in 4.9 s one at a time: at
+a cap of one the first fold is 8.7-10.8 s, at two 6.7-8.5, unlimited 6.6-7.2
+(five rounds each, interleaved, driver cache cleared). The fold overlaps the
+compiles with its weight download, which a queue gives up.
 
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
