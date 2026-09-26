@@ -264,6 +264,10 @@ export const DEFAULT_TUNING = Object.freeze({
   //
   // null is the shipped rule: give them back every fold.
   keepSamplerWeights: null,
+  // 🔴 A fold whose largest pair tensor is 128 MiB or more releases both sets of
+  // weights whatever the two above say; null means it does, `false` opts out.
+  // See foldHolding in src/af3/fold.js.
+  largeFoldReleasesWeights: null,
   // 🔴 HOW MANY PAIRFORMER BLOCKS GO OUT BEFORE THE HOST WAITS. Each wait is a
   // full pipeline drain; the window exists to bound the queue and let an abort
   // land, not because the memory needs it. 16 is measured - but it was measured

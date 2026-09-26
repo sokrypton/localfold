@@ -25,6 +25,7 @@
  * see the loop below - and default to none, which is what the oracle dumps
  * were made with.
  */
+import { GRID_CHUNK_MIN_BYTES } from "./trunk/pair-track-gpu.js";
 import { ELEMENT_SYMBOLS } from "./featurise/ccd-component.js";
 import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
   from "./feature-convergence.js";
@@ -698,6 +699,21 @@ export async function foldBatch(device, batch, weights, options = {}) {
 
 async function foldHolding(device, batch, weights, options, held) {
   const steps = options.steps ?? 200;
+  // 🔴 A LARGE FOLD GIVES ITS WEIGHTS BACK, WHATEVER THE DEVICE'S PRIOR SAYS.
+  // Keeping the decoded trunk and sampler weights between folds is a fixed
+  // upload saved - and a fixed amount of memory held through the stages where
+  // a fold peaks. At 255 residues it held OpenDDE's peak at 4432 MiB against
+  // 2349 released (+2.7% on a warm fold) and AF3's at 1980 against 1358 (+9.5%).
+  // Memory pressure grows with the fold and the upload does not, so a fold
+  // whose largest pair tensor is 128 MiB or more releases; a small fold keeps
+  // them as its device prior says. `largeFoldReleasesWeights: false` opts out.
+  const largestTokens = weights.trunk?.dialect?.structuralTokens === true
+    ? Math.max(batch.tokens, structuralLayout(batch).tokens) : batch.tokens;
+  const largeFold = deviceTuning(device).largeFoldReleasesWeights !== false
+    && largestTokens * largestTokens * (weights.trunk?.embedder?.pairChannels ?? 128) * 4
+      >= GRID_CHUNK_MIN_BYTES;
+  const keepWeights = (knob) => !largeFold && (deviceTuning(device)[knob]
+    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) === true;
   const { tokens, dense } = batch;
   const stage = (name, detail = {}) => options.onStage?.(name, detail);
 
@@ -1178,8 +1194,7 @@ async function foldHolding(device, batch, weights, options, held) {
   // tools/gpu/profile.js saw 144 ms of a 1300 ms fold and the rest looked like
   // nothing. `keepTrunkWeights` is a per-device prior, null everywhere the
   // trade has not been measured.
-  if ((deviceTuning(device).keepTrunkWeights
-    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) !== true) releaseResidentWeights(device, "w.");
+  if (!keepWeights("keepTrunkWeights")) releaseResidentWeights(device, "w.");
 
   // 🔴 OpenDDE RE-TOKENISES BETWEEN THE TRUNK AND THE DIFFUSION, AND THIS IS
   // WHERE. Every other model here folds one token space end to end; OpenDDE
@@ -1313,8 +1328,7 @@ async function foldHolding(device, batch, weights, options, held) {
   // them on the queue rather than in any compute pass. `keepSamplerWeights` is
   // the same shape of prior as `keepTrunkWeights` and null for the same reason.
   // ...and where no prior says, the budget does; see keepResidentAffordable.
-  if ((deviceTuning(device).keepSamplerWeights
-    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) !== true) {
+  if (!keepWeights("keepSamplerWeights")) {
     releaseResidentWeights(device, "difftx.");
     // ...and the diffusion conditioning's, which are resident for the same
     // reason and dead at the same moment.
@@ -1540,8 +1554,7 @@ async function foldHolding(device, batch, weights, options, held) {
   // second fold began with 52 blocks' weights on the device where the first
   // began with 48. They are the same prefix and the same policy: the trunk's
   // are given back every fold, so these are too.
-  if ((deviceTuning(device).keepTrunkWeights
-    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) !== true) releaseResidentWeights(device, "w.");
+  if (!keepWeights("keepTrunkWeights")) releaseResidentWeights(device, "w.");
 
   // 🔴 EVERYTHING BELOW IS THE CONFIDENCE HEAD'S, SO IT IS ABSENT WHERE THE
   // HEAD IS. A model without one returns no pLDDT, no pTM and no per-chain
