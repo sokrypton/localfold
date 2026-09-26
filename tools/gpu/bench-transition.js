@@ -119,6 +119,10 @@ export async function main(device, args) {
         (whole, open_) => `${open_ ?? ""}f16(slot)${open_ ? ")" : ""}`],
     t2: [/let w = weights\[W_T2 \+ \(chunk0 \+ slot\) \* CHANNELS \+ c\];/,
          "let w = f32(slot) * 1e-6;"],
+    // "n" empties the LayerNorm's per-row barrier trees - the upper bound on
+    // what subgroup reductions could take back.
+    n: [/for \(var stride = WORKGROUP \/ 2u; stride > 0u; stride >>= 1u\) \{/g,
+        "for (var stride = 0u; stride > 0u; stride >>= 1u) {"],
   };
   // ...the fused arms; `split` is a different shape of arm and is built below.
   for (const spec of arms_spec.filter((a) => !["split", "vsplit"].includes(a.split("@")[0]))) {

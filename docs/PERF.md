@@ -2161,3 +2161,17 @@ move the dispatch too. A fold with the prior on failed the chain-geometry gate
 it has **no correctness check at all** - synthetic weights, time only. CLAUDE.md's
 "a dispatch dividing by eight under a shader tiling by four, reported as a 30%
 speedup", once more. Check a new arm through `fold.js` before believing a bench.
+
+🔴 **AND THE TRUNK, AT 255 TOKENS x 1024 ROWS, THE SAME STORY.** A steady pass is
+~6.2 s; pair-transition 16%, grid.attend 16%, grid.project 11%, opm.contract 9%,
+the triangle kernels ~23%. Three more arms, none taken:
+
+| arm | kernel | whole pass |
+|---|---|---|
+| LayerNorm barrier trees emptied in the pair transition (`bench-transition.js 8:128:n`, an upper bound for subgroup reductions) | 24.8 -> 23.6 ms (-5%) | - |
+| f16 pair weights (`--pair-weights=f16`); the transition itself 18.6 -> 16.4 | - | 6042-6245 -> 5962-5966 ms, flat at 58 tokens |
+| the OPM vector GEMM reading A's four rows as one vec4 (5 -> 2 shared reads a k step) | 567 -> 532 ms | unmoved (6202/6338 against 6208/6457) |
+
+The pair transition already runs its f16-staged arm (18.5 ms a call in the
+profile against 18.6 in the bench), so the precision lever it has left is the
+weights, which docs/AF3.md declined on accuracy and which buys 1-4% here.
