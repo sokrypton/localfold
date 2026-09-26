@@ -1250,3 +1250,37 @@ CA(i+1)), median 3.78, min 1.35, max 5.11.
 above - the reference's own PAE is equally grainy at 0.4305 - the remaining
 explanation is architectural: four blocks and two distance embeddings added
 straight to `z`.
+
+## 🔴 THE HEAD IS EXACT ON A REAL PAIR TOO: 6.13e-3 WAS THE int5 BUNDLE
+
+`check_opendde_confidence_real.py` read **6.13e-3** on the PAE, and that was
+read here as slack loose enough to hide a defect - the last place a PAE fault
+could still be. It is not slack. It is the quantisation of the confidence
+head's own weights, and this file already carries the rule that would have said
+so: a residual taken on a quantised bundle is not comparable with one taken on
+a float32 one.
+
+Same code, same real trunk pair, same fold, the two bundles on this box:
+
+| bundle | PAE relRMS | pLDDT relRMS | max abs |
+|---|---:|---:|---:|
+| `model-opendde-int5` | 6.13e-03 | 1.45e-03 | 0.1271 |
+| `model-opendde-full-f32` | **5.41e-07** | **1.24e-07** | **0.0000** |
+
+Four orders, and 5.41e-7 is where the head's SYNTHETIC oracle already sat
+(8.46e-7). So the head computes af3-any-model's answer on a real pair as well
+as on seeded normals, and int5 costs it 0.13 of a PAE angstrom at the worst
+pair - which is the same order as the 0.145 pLDDT the int5 arm was separately
+measured to cost.
+
+🔴 **AND THE GRAIN IS UNMOVED BY THE BUNDLE**, which is the other half: their
+head on our f32 pair reads roughness **0.4356** against int5's 0.4305 and
+lag-1 0.7470 against 0.7538. So the grain is not quantisation, not our port and
+not the representative atoms - it is four blocks and two distance embeddings
+added straight to `z`, as the composition arm said.
+
+🔴 **THE BUNDLE NOW TRAVELS WITH THE DUMP.** `fold-opendde.js
+--confidence-inputs=1` writes the manifest into `confidenceInputs.bundle` and
+the oracle PRINTS it, because nothing in that file could previously say which
+bundle produced the tensors it was scoring - and the one number it emits means
+opposite things on the two. An unlabelled residual is not a measurement.

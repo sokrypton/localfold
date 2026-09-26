@@ -51,7 +51,12 @@ seq_mask = arr("seqMask", (n,))
 bias = arr("extraPairBias", (n, n))
 width = s_inputs.shape[-1]
 c_s = s.shape[-1]
+# 🔴 SAY WHICH BUNDLE, OR THE RESIDUAL CANNOT BE READ. This head is 6.13e-3
+# against af3-any-model on int5 and 5.41e-7 on float32 - the same code, the
+# same real pair - so a number quoted without its bundle is not a measurement.
+bundle = inputs.get("bundle", "UNSTATED - re-run the fold, it carries it now")
 print(f"  tokens {n}  c_z {c_z}  c_s {c_s}  target_feat {width}  atoms {a2t.size}")
+print(f"  bundle {bundle}")
 
 # ...the harness's own setup, which is where the config and the weight
 # directory come from; `_fold_setup` returns both and does it once.

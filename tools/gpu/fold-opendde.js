@@ -611,9 +611,15 @@ export async function main(device, args) {
     })(),
     coordinateCheck: fold.scores?.coordinateCheck,
     ...(fold.scores?.confidenceInputs === undefined ? {} : {
-      confidenceInputs: Object.fromEntries(Object.entries(fold.scores.confidenceInputs)
-        .map(([k, v]) => [k, ArrayBuffer.isView(v)
-          ? Array.from(v, (x) => (Number.isInteger(x) ? x : Number(x.toFixed(5)))) : v])),
+      // 🔴 THE BUNDLE TRAVELS WITH THE INPUTS. A residual taken on a quantised
+      // bundle is not comparable with one taken on a float32 one, and the
+      // oracle that reads this file cannot tell which it was handed: the head
+      // reads 6.13e-3 against af3-any-model on int5 and 5.41e-7 on f32, and
+      // the int5 number was read once as slack that might hide a defect.
+      confidenceInputs: Object.fromEntries([["bundle", manifest]].concat(
+        Object.entries(fold.scores.confidenceInputs)
+          .map(([k, v]) => [k, ArrayBuffer.isView(v)
+            ? Array.from(v, (x) => (Number.isInteger(x) ? x : Number(x.toFixed(5)))) : v]))),
     }),
     peakMiB: Number((memorySnapshot(device).peakBytes / 2 ** 20).toFixed(1)),
     peakRows: memorySnapshot(device).peakByLabel.slice(0, 6)
