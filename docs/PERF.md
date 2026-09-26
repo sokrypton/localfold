@@ -471,6 +471,25 @@ trunk and head work above). **Read `hostPack` under `LOCALFOLD_STOCK_FLAGS=1`
 before believing it is 12 ms** - the row in CLAUDE.md that says so was measured
 behind the flag that provides f16.
 
+🔴 **AND ON COLAB'S T4 THE SAME SERIES IS WORTH LESS, WHICH WAS PREDICTED.**
+The Colab runtime passes both developer flags, so its T4 has `shader-f16` and
+subgroup matrices and the f32 packing fix above never applied there. Measured on
+a T4 through the Colab CLI, `8d6bb47` against `e5c02ba`, interleaved: a trunk
+pass **317-377 -> 229-266 ms** at 68 tokens and **3775-3893 -> 3354-3584** at
+255; a page-default fold at 255 tokens 31.6 -> 21.2 s first and 21.9 -> 19.3
+warm (one run each on a two-CPU VM). The T4's GPU is ~5x slower than the A100's,
+so the round trips removed are a smaller share of each pass. At 68 tokens the
+whole-fold timings were inside that VM's noise and are not claimed.
+
+🔴 **AND THE T4 IS NOT DETERMINISTIC AT 68 TOKENS, ON THE ORIGINAL CODE.** The
+same 68-token fold (the 59-residue alignment, 25 steps, 3 recycles) returned two
+different PDBs across runs of `8d6bb47` - sha256 `e5f2e0f9...` and `9ff98f83...`,
+pLDDT identical to six digits - and the new code returned the same two. At 255
+tokens both commits agreed byte for byte, and the A100 has never shown it in
+either configuration. By this repository's own rule a run-to-run difference is a
+memory bug - a race or a read of memory nobody wrote - and not precision; the
+M2's was a missing bounds check. Not chased yet.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The
