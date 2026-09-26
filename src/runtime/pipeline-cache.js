@@ -194,8 +194,16 @@ export function withRuntimeLoopBounds(code) {
   const binding = /var<storage,\s*[a-z_]+>\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*array<[^,>]+>\s*;/.exec(code);
   if (binding === null) return code;
   const zero = `(arrayLength(&${binding[1]}) >> 31u)`;
-  return code.replace(/for \(var (\w+) = 0u; \1 < ([A-Z][A-Z0-9_]*); \1 \+= 1u\)/g,
-    (_, name, bound) => `for (var ${name} = 0u; ${name} < ${bound} + ${zero}; ${name} += 1u)`);
+  // ...every loop whose bound is a constant, lane-strided ones included: that
+  // is 4.2 s of an AF3 fold's compile on the T4 where only the `= 0u; += 1u`
+  // form was 6.9 (and all of them constant, ~13).
+  // Only a bound declared u32: `i32 + u32` would not compile, and a shader
+  // that fails to build fails the fold.
+  const unsigned = new Set([...code.matchAll(
+    /\bconst\s+([A-Z][A-Z0-9_]*)\s*(?::\s*u32\s*=|=\s*\d+u\s*;)/g)].map((m) => m[1]));
+  return code.replace(/for \(([^;]*); (\w+) < ([A-Z][A-Z0-9_]*);/g,
+    (whole, init, name, bound) => (unsigned.has(bound)
+      ? `for (${init}; ${name} < ${bound} + ${zero};` : whole));
 }
 
 export function stripUnusedConstants(code) {
