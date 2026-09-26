@@ -335,40 +335,58 @@ export class Af3TrunkGpu {
       // wait. onBlock is reported under its own name rather than through
       // `options`, which is passed to every sub-stack and would otherwise fire
       // for the template's blocks too.
+      // 🔴 THE HEAD IS PREPARED BEFORE THE PAIRFORMER RUNS, because nothing it
+      // packs depends on the pair's values - so its host work (weights, contact
+      // bins, uploads) happens while the GPU is still busy rather than after
+      // the pass has drained.
+      const head = await this.#prepareDistogram(input.pairMask, tokens,
+                                                weights.distogram, input.contactClasses);
+      owned.push(...head.allocations);
       const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, this.options).run(
         { pairMask: input.pairMask, seqMask: input.seqMask, tokens },
         weights.pairformerBlocks, dialect, {
           ...options,
           pairBuffer: pair.buffer, singleBuffer: embedded.singleAllocation.buffer,
+          deferReadback: true, validation,
           onBlock: (index) => options.onPairformerBlock?.(index,
                                                           weights.pairformerBlocks.length),
           // ...and the one that says the device GOT there, which is what a status
           // line should show. See the note in pairformer-block-webgpu.js.
           onBlockDone: (completed, total) => options.onPairformerBlockDone?.(completed, total),
         }));
-      // Every stage before this one is on the queue ahead of the pairformer's
-      // readback, which has now completed, so these resolve without waiting.
-      await validation.settle();
-
       // The pairformer's own encode/wait split, carried out so a bench can report
       // where the stack's wall time went without re-instrumenting it.
       this.lastPairformerSplit = pairformer.split;
-      seam("tap.trunk_out_pair", pairformer.pair);
 
-      const head = await stage("distogram",
-        () => this.#distogram(pair, input.pairMask, tokens,
-                              weights.distogram, input.contactClasses));
+      // 🔴 ONE SUBMIT AND ONE DRAIN TO END THE PASS: the head's dispatch, then
+      // the pair, single, logits and contacts copied out together. It used to
+      // be the pairformer's readback, then the head's host work, then the
+      // head's own readback - two drains with the GPU idle between them.
+      const singleElements = tokens * weights.embedder.singleChannels;
+      const out = await stage("distogram", () => head.run(pair, embedded.singleAllocation,
+                                                          pairElements, singleElements));
+      // Every scope collected above was submitted ahead of that readback, which
+      // has completed, so these resolve without waiting.
+      await validation.settle();
+      seam("tap.trunk_out_pair", out.pair);
 
       return {
-        pair: pairformer.pair, single: pairformer.single,
-        ...head, binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings,
+        pair: out.pair, single: out.single,
+        logits: out.logits, contactProbs: out.contactProbs,
+        binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings,
       };
     } finally {
       for (const allocation of owned) allocation.release();
     }
   }
 
-  async #distogram(pairAllocation, pairMask, tokens, weights, contactClasses) {
+  /**
+   * Everything the distogram head needs that does not depend on the pair's
+   * values: its pipeline, packed weights, contact bins and output buffers.
+   * `run` encodes the head over the trunk's pair and reads the pair, single,
+   * logits and contacts back in ONE submit. The allocations are the caller's.
+   */
+  async #prepareDistogram(pairMask, tokens, weights, contactClasses) {
     const pairs = tokens * tokens;
     // 🔴 THE HEAD'S THREE NUMBERS ARE THE TENSOR'S. `half_logits` is
     // [pairChannels, bins], so AlphaFold 3's 128x64 and OpenDDE's 384x96 are
@@ -388,66 +406,72 @@ export class Af3TrunkGpu {
       `af3-distogram:${tokens}:${channels}:${bins}:${biasOffset}`,
       createDistogramShader(tokens, channels, 0, { bins, biasOffset }));
 
+    // 🔴 REQUIRED, NOT DEFAULTED. A caller with no classes would silently get
+    // 8 A everywhere back, which is the convention this exists to correct -
+    // and the failure would be a plausible contact map.
+    if (contactClasses === undefined || contactClasses.length !== tokens) {
+      throw new Error("the distogram head needs contactClasses, one per token");
+    }
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
-    try {
-      // The trunk's pair, still on the device; the caller owns it.
-      const pairBuffer = pairAllocation;
-      const maskBuffer = keep(this.allocator.upload("af3-disto.mask", pairMask, storage));
-      // 🔴 REQUIRED, NOT DEFAULTED. A caller with no classes would silently get
-      // 8 A everywhere back, which is the convention this exists to correct -
-      // and the failure would be a plausible contact map.
-      if (contactClasses === undefined || contactClasses.length !== tokens) {
-        throw new Error("the distogram head needs contactClasses, one per token");
-      }
-      // 🔴 THE EDGES ARE THIS HEAD'S, NOT THE DEFAULT'S. `af3ContactBins` turns
-      // a per-pair angstrom threshold into a COUNT of bins, so handing it
-      // AlphaFold 3's 64-bin grid for OpenDDE's 96-bin head returns a count
-      // against the wrong ruler - and a count is what the shader compares, so
-      // nothing would be out of range and the contact map would simply be
-      // wrong. Same shape of mistake as the AF2 manifests that carried 2 and 22
-      // where the head's breaks are 2.3125 and 21.6875.
-      const binsBuffer = keep(this.allocator.upload("af3-disto.contact-bins",
-        af3ContactBins(contactClasses, tokens, binEdges(bins)), storage));
-      const weightBuffer = keep(this.allocator.upload("af3-disto.weights", packed, storage));
-      const logits = keep(this.allocator.allocate("af3-disto.logits", pairs * bins * 4,
-        storage | GPUBufferUsage.COPY_SRC));
-      const contact = keep(this.allocator.allocate("af3-disto.contact", pairs * 4,
-        storage | GPUBufferUsage.COPY_SRC));
-      const readLogits = keep(this.allocator.allocate("af3-disto.rb-logits",
-        pairs * bins * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
-      const readContact = keep(this.allocator.allocate("af3-disto.rb-contact",
-        pairs * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+    const maskBuffer = keep(this.allocator.upload("af3-disto.mask", pairMask, storage));
+    // 🔴 THE EDGES ARE THIS HEAD'S, NOT THE DEFAULT'S. `af3ContactBins` turns
+    // a per-pair angstrom threshold into a COUNT of bins, so handing it
+    // AlphaFold 3's 64-bin grid for OpenDDE's 96-bin head returns a count
+    // against the wrong ruler - and a count is what the shader compares, so
+    // nothing would be out of range and the contact map would simply be
+    // wrong. Same shape of mistake as the AF2 manifests that carried 2 and 22
+    // where the head's breaks are 2.3125 and 21.6875.
+    const binsBuffer = keep(this.allocator.upload("af3-disto.contact-bins",
+      af3ContactBins(contactClasses, tokens, binEdges(bins)), storage));
+    const weightBuffer = keep(this.allocator.upload("af3-disto.weights", packed, storage));
+    const logits = keep(this.allocator.allocate("af3-disto.logits", pairs * bins * 4,
+      storage | GPUBufferUsage.COPY_SRC));
+    const contact = keep(this.allocator.allocate("af3-disto.contact", pairs * 4,
+      storage | GPUBufferUsage.COPY_SRC));
 
+    const run = async (pairAllocation, singleAllocation, pairElements, singleElements) => {
+      const mapRead = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
+      const readback = [
+        [logits, pairs * bins], [contact, pairs],
+        [pairAllocation, pairElements], [singleAllocation, singleElements],
+      ].map(([source, elements]) => ({
+        source, bytes: elements * 4,
+        target: this.allocator.allocate("af3-disto.readback", elements * 4, mapRead),
+      }));
+      try {
       this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-distogram" });
       const pass = encoder.beginComputePass({ label: "af3-distogram" });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
-        entries: [pairBuffer, maskBuffer, weightBuffer, binsBuffer,
+        entries: [pairAllocation, maskBuffer, weightBuffer, binsBuffer,
                   logits, contact].map(
           (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
       }));
       const groups = Math.ceil(pairs / 64);
       pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       pass.end();
-      encoder.copyBufferToBuffer(logits.buffer, 0, readLogits.buffer, 0, pairs * bins * 4);
-      encoder.copyBufferToBuffer(contact.buffer, 0, readContact.buffer, 0, pairs * 4);
+      for (const { source, target, bytes } of readback) {
+        encoder.copyBufferToBuffer(source.buffer, 0, target.buffer, 0, bytes);
+      }
       this.device.queue.submit([encoder.finish()]);
-      const error = await this.device.popErrorScope();
+      const scope = this.device.popErrorScope();
+      await Promise.all(readback.map(({ target }) => target.buffer.mapAsync(GPUMapMode.READ)));
+      const error = await scope;
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
-
-      const read = async (allocation) => {
-        await allocation.buffer.mapAsync(GPUMapMode.READ);
-        const copy = new Float32Array(allocation.buffer.getMappedRange().slice(0));
-        allocation.buffer.unmap();
+      const [outLogits, contactProbs, outPair, outSingle] = readback.map(({ target }) => {
+        const copy = new Float32Array(target.buffer.getMappedRange().slice(0));
+        target.buffer.unmap();
         return copy;
-      };
-      return { logits: await read(readLogits), contactProbs: await read(readContact) };
-    } finally {
-      for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
-    }
+      });
+      return { logits: outLogits, contactProbs, pair: outPair, single: outSingle };
+      } finally {
+        for (const { target } of readback) target.release();
+      }
+    };
+    return { run, allocations };
   }
 }

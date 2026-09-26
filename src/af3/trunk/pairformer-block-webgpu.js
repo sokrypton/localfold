@@ -638,7 +638,18 @@ export class Af3PairformerStackGpu {
       // waits are cheap insurance against an unbounded queue.
       const submissionWindow = options.submissionWindow
         ?? shapedKnob(deviceTuning(this.device).pairformerSubmissionWindow) ?? 16;
-      const validation = new DeferredValidation(this.device, "AF3 pairformer stack");
+      // 🔴 THE CALLER READS BACK, WHEN IT SAYS SO. The trunk reads this stack's
+      // pair and single in the same submit as the distogram, so a pass ends in
+      // ONE drain instead of this stack's and then the head's. On that path the
+      // last block does not wait, validation is the caller's to settle, and
+      // nothing is read back here - the buffers are the caller's already.
+      const deferReadback = options.deferReadback === true;
+      if (deferReadback && (options.pairBuffer === undefined
+        || options.singleBuffer === undefined || options.validation === undefined)) {
+        throw new Error("deferReadback needs pairBuffer, singleBuffer and validation");
+      }
+      const validation = deferReadback ? options.validation
+        : new DeferredValidation(this.device, "AF3 pairformer stack");
       const start = performance.now();
       // 🔴 WHERE THE STACK'S WALL TIME ACTUALLY GOES, REPORTED RATHER THAN
       // GUESSED. This was needed to settle whether the trunk is compute bound:
@@ -685,7 +696,9 @@ export class Af3PairformerStackGpu {
           void this.device.queue.onSubmittedWorkDone()
             .then(() => options.onBlockDone(submitted, blocks.length));
         }
-        if ((index + 1) % submissionWindow === 0 || index === blocks.length - 1) {
+        const last = index === blocks.length - 1;
+        if (((index + 1) % submissionWindow === 0 && !(last && deferReadback))
+          || (last && !deferReadback)) {
           const waitStart = performance.now();
           await this.device.queue.onSubmittedWorkDone();
           waitMilliseconds += performance.now() - waitStart;
@@ -696,7 +709,7 @@ export class Af3PairformerStackGpu {
         // the caller hand control back to the event loop for a frame.
         await options.onBlock?.(index);
       }
-      await validation.settle();
+      if (!deferReadback) await validation.settle();
 
       // 🔴 THE READBACKS ARE ALLOCATED AFTER THE SCRATCH IS GONE, NOT BEFORE
       // THE LOOP. They are written once, here, by a copy this stack has
@@ -708,6 +721,19 @@ export class Af3PairformerStackGpu {
       // the peak move.
       for (const allocation of [...scratch, ...singleScratch, biasBuffer, pairLogits]) {
         allocation.release();
+      }
+      // Released on queue ordering on the deferred path, as every block's
+      // weights already are; the caller's readback is the drain.
+      if (deferReadback) {
+        return {
+          elapsedMilliseconds: performance.now() - start,
+          split: {
+            encodeMilliseconds: Number(encodeMilliseconds.toFixed(1)),
+            waitMilliseconds: Number(waitMilliseconds.toFixed(1)),
+            releaseMilliseconds: Number(releaseMilliseconds.toFixed(1)),
+          },
+          memory: this.allocator.snapshot(),
+        };
       }
       // 🔴 THE PAIR MAY STAY WHERE IT IS. Every reader of this stack's pair on
       // the structural-token path is a GPU stage - the diffusion conditioning

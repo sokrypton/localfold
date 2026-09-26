@@ -426,6 +426,16 @@ nothing waits for them, and their GPU work lands in the pairformer's wait. Only
 `whole` is a cost. Not measured on an M2, whose unified memory never paid the
 bus half of this.
 
+🔴 **AND A PASS ENDED IN TWO DRAINS, NOW ONE.** The pairformer read back its
+pair and single, THEN the distogram packed its weights and contact bins,
+submitted, and read back again. The head is prepared before the pairformer runs
+(nothing it packs depends on the pair's values), the pairformer takes
+`deferReadback` - no final window wait, no settle, no readback - and the pass
+closes with one submit copying the logits, contacts, pair and single out
+together. Byte-identical on all seven models and on both seam oracles.
+Interleaved against the parent, three rounds, no overlap: **113-115 -> 107 ms**
+at 68 tokens and **703-714 -> 676-680** at 255.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The
