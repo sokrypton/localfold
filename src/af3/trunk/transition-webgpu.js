@@ -706,6 +706,10 @@ function splitNormalizeRows(device, channels) {
 function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecision,
                                   residual = false, sourceGate = null }) {
   const { rows: BM, columns: BN, inner: BK } = VECTOR_GEMM_BLOCK;
+  // 🔴 NO GUARD ON k OR ON THE COLUMNS, ONLY ON THE ROWS. The inner extent must
+  // divide by BK and the columns by BN; `createTransitionSplitShaders` refuses a
+  // width that does not (`channels % 64`), and the transition's two extents are
+  // `channels` and `channels * factor`. A new caller must make the same check.
   // A 16 x 16 lane grid; each lane owns TM adjacent rows and TN adjacent columns.
   const TM = BM / 16;
   const TN = BN / 16;

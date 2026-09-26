@@ -449,7 +449,7 @@ export function normalFrom(seed) {
  * coordinates are mapped back the moment the sampler returns.
  */
 async function expandToStructuralTokens(device, batch, trunk, targetFeat, weights, stage,
-                                        trunkPairAllocation) {
+                                        trunkPairAllocation, held) {
   const layout = structuralLayout(batch);
   const structuralFeatures = structuralPairFeatures(layout, batch.asymId);
   const structural = structuralBatch(batch, layout);
@@ -463,7 +463,8 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
               pairBuffer: trunkPairAllocation?.buffer },
     expander, structuralFeatures, batch.tokens, { keepPair: true });
   // The expander has read it (its readback of the single has completed).
-  trunkPairAllocation?.release();
+  held.drop(trunkPairAllocation);
+  held.hold(expanded.pairAllocation);
 
   // A subtoken's target_feat is its parent's plus a role embedding - the same
   // rule the expander applies to the single, on the other representation.
@@ -532,6 +533,10 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
     label: "opendde.pair-cond", size: pairConditioningBytes,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
+  const pairConditioningHeld = held.hold({ release: () => {
+    noteDestroy(device, pairConditioningBytes, "opendde.pair-cond");
+    pairConditioningBuffer.destroy();
+  } });
   const pairConditioning = (await new Af3DiffusionConditioningGpu(device).run({
       tokens: n, trunkSingle: refined.single,
       trunkPairBuffer: expanded.pairAllocation.buffer,
@@ -562,10 +567,7 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
       // must release it.
       trunkPair: undefined, refinedPair: expanded.pairAllocation,
       pairConditioning,
-      releasePairConditioning: () => {
-        noteDestroy(device, pairConditioningBytes, "opendde.pair-cond");
-        pairConditioningBuffer.destroy();
-      },
+      releasePairConditioning: () => held.drop(pairConditioningHeld),
     },
   };
 }
@@ -658,7 +660,43 @@ export async function warmTrunkPipelines(device, store, tokens, options = {}) {
     .warm({ tokens }, [sample], af3Dialect(store), run);
 }
 
+/**
+ * 🔴 THE BUFFERS A FOLD HOLDS ACROSS STAGES, AND WHAT GOES BACK IF IT THROWS.
+ * The recycle loop keeps a pass's pair and single for the next one, OpenDDE
+ * keeps the trunk's last pair for its expander, its refined pair for the
+ * confidence head and its pair conditioning for the sampler - all device
+ * buffers, released at the stage that last reads them. A fold that failed in
+ * between released none of them, and the documented way a fold fails midway is
+ * the memory ceiling refusing the sampler - after which the page retries with
+ * the saved trunk, on a device still holding ~480 MB of the last attempt at
+ * 255 residues. `drop` releases only what is held, so a buffer released on the
+ * normal path is never released twice.
+ */
+function heldBuffers() {
+  const held = new Set();
+  return {
+    hold(allocation) { if (allocation) held.add(allocation); return allocation; },
+    drop(allocation) { if (allocation && held.delete(allocation)) allocation.release(); },
+    releaseAll() {
+      for (const allocation of [...held]) {
+        held.delete(allocation);
+        try { allocation.release(); } catch { /* the fold's own error is the one to report */ }
+      }
+    },
+  };
+}
+
 export async function foldBatch(device, batch, weights, options = {}) {
+  const held = heldBuffers();
+  try {
+    return await foldHolding(device, batch, weights, options, held);
+  } catch (error) {
+    held.releaseAll();
+    throw error;
+  }
+}
+
+async function foldHolding(device, batch, weights, options, held) {
   const steps = options.steps ?? 200;
   const { tokens, dense } = batch;
   const stage = (name, detail = {}) => options.onStage?.(name, detail);
@@ -1054,13 +1092,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // passes that DO compare, so the first pass is reported as 1 - everything
     // changed - rather than measured.
     // The pass before is released now that this one has read it.
-    recycledFrom?.pair.release();
-    recycledFrom?.single.release();
+    held.drop(recycledFrom?.pair);
+    held.drop(recycledFrom?.single);
     previousBuffers = lastPass ? undefined
-      : { pair: trunk.pairAllocation, single: trunk.singleAllocation };
+      : { pair: held.hold(trunk.pairAllocation), single: held.hold(trunk.singleAllocation) };
     if (lastPass && keepFinalPair) {
       trunk.singleAllocation.release();
-      finalPair = trunk.pairAllocation;
+      finalPair = held.hold(trunk.pairAllocation);
     }
     const comparable = hasPrevious && previousPair !== undefined && trunk.pair !== undefined
       && previousPair.length === trunk.pair.length
@@ -1102,8 +1140,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // Stopping early leaves this pass's kept buffers with nothing to feed -
       // except OpenDDE's pair, which its expander reads.
       if (keepFinalPair) finalPair = previousBuffers?.pair;
-      else previousBuffers?.pair.release();
-      previousBuffers?.single.release();
+      else held.drop(previousBuffers?.pair);
+      held.drop(previousBuffers?.single);
       previousBuffers = undefined;
       await stage("recycle-converged", { pass, passes: recycles + 1 });
       break;
@@ -1156,7 +1194,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // draws. A separate driver would have to reproduce all of it.
   const structural = weights.trunk.dialect.structuralTokens
     ? await expandToStructuralTokens(device, batch, trunk, targetFeat, weights, stage,
-                                     finalPair)
+                                     finalPair, held)
     : undefined;
   const headInput = structural === undefined
     ? { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair }
@@ -1347,12 +1385,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // The refined pair goes back once the confidence head's pair init has read
   // it - see `releasePairInput` in opendde-confidence.js - or here, whichever
   // comes first; the head is not the only path that reaches the release.
-  let refinedReleased = structural === undefined;
-  const releaseRefinedPair = () => {
-    if (refinedReleased) return;
-    refinedReleased = true;
-    structural.headInput.refinedPair.release();
-  };
+  const releaseRefinedPair = () => held.drop(structural?.headInput.refinedPair);
   const openddeScores = async () => {
     const layout = structural.layout;
     const n = layout.tokens;
