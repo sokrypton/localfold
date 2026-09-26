@@ -99,8 +99,7 @@ test("AlphaFold 3's short schedule is its own and nobody else's", async (t) => {
     assert.equal(diffusionScheduleFor("af3", "diffusion", 25), undefined);
     assert.equal(diffusionScheduleFor("af3", "diffusion", 200), undefined);
     assert.equal(diffusionScheduleFor("af3", "flow", 16), undefined);
-    for (const family of ["boltz2", "protenix2", "openbind0",
-                          "rosettafold3", "opendde"]) {
+    for (const family of ["boltz2", "rosettafold3", "opendde"]) {
       assert.equal(diffusionScheduleFor(family, "diffusion", 20), undefined, family);
     }
     assert.equal(countsForFamily("boltz2"), AF3_COUNTS);
@@ -112,6 +111,21 @@ test("AlphaFold 3's short schedule is its own and nobody else's", async (t) => {
     assert.equal(countsForFamily("intellifold2"), ALPHAFOLD3_COUNTS);
   });
 
+  await t.test("a job with a ligand starts lower where the family measured it", async () => {
+    const { SHORT_SCHEDULES } = await import("../web/af3-model.js");
+    assert.deepEqual(diffusionScheduleFor("af3", "diffusion", 20, { hasLigand: true }),
+                     { sigmaMax: 40 });
+    assert.deepEqual(diffusionScheduleFor("protenix2", "diffusion", 20), { sigmaMax: 80 });
+    assert.deepEqual(diffusionScheduleFor("protenix2", "diffusion", 20, { hasLigand: true }),
+                     { sigmaMax: 40 });
+    assert.deepEqual(diffusionScheduleFor("intellifold2", "diffusion", 20, { hasLigand: true }),
+                     { sigmaMax: 80 });
+    for (const [family, starts] of Object.entries(SHORT_SCHEDULES)) {
+      assert.ok(starts.protein > 0 && starts.ligand > 0, family);
+      assert.equal(countsForFamily(family), ALPHAFOLD3_COUNTS, family);
+    }
+  });
+
   // 🔴 ONE READING OF THE TABLE. The dial and the fold each chose a table by
   // family, and a second family-specific table is exactly where two copies of
   // that choice would disagree - the dial offering 20 and the fold defaulting
@@ -121,5 +135,8 @@ test("AlphaFold 3's short schedule is its own and nobody else's", async (t) => {
     assert.equal((app.match(/countsForFamily\(/g) ?? []).length, 2);
     assert.ok(!/[^_]AF3_COUNTS\[|OPENDDE_COUNTS\[/.test(app));
     assert.ok(/schedule: diffusionScheduleFor\(/.test(app));
+    // ...and it says whether the job has a ligand, or every job gets the
+    // protein start and the ligand arm is dead code.
+    assert.ok(/hasLigand: ligandCodes\.length > 0 \|\| modifications\.length > 0/.test(app));
   });
 });

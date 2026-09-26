@@ -6508,3 +6508,30 @@ is the best glycerol on AF3 and protenix2 and the worst fold placement. So a
 schedule that depends on whether the job HAS a ligand - which the page knows
 before the fold - is the next thing to measure, with `--ligands=` over a real
 set rather than three molecules.
+
+### 🔴 ...and the start depends on whether the job has a ligand
+
+Ten CCD ligands (GOL EDO ATP ADP BTN SAM PLP HEM NAD FAD) x four seeds,
+`bench-sampler-geometry.js --ligands=`, mean ligand bond rms (median, count
+over 0.15 A of 40):
+
+| family | own 25 | sigma 80 / 20 | sigma 40 / 20 |
+|---|---|---|---|
+| af3 | 0.064 (0.048, 2) | 0.061 (0.047, 2) | **0.051** (0.047, 0) |
+| protenix2 | 0.084 (0.055, 4) | 0.086 (0.059, 6) | **0.075** (0.056, 4) |
+| openbind0 | 0.100 (0.067, 7) | 0.117 (0.072, 9) | **0.080** (0.058, 3) |
+| intellifold2 | 0.153 (0.120, 18) | **0.139** (0.077, 15) | 0.167 (0.084, 14) |
+
+The high-noise calls place a chain and the low-noise calls settle a small
+molecule, so at the same twenty calls the start should follow the job:
+`SHORT_SCHEDULES` in web/af3-model.js names a protein start and a ligand start
+per family (80/40 for af3, protenix2 and openbind0; 80/80 for intellifold2),
+and the page passes `hasLigand` for a ligand or a modified residue. That brings
+protenix2 and openbind0 in: sigma 80 improves their plain folds (above) and
+sigma 40 beats their own twenty-five on ligands.
+
+🔴 **THE FOUR "NOT A CHAIN" ROWS IN EVERY ARM ARE THE BENCH, NOT THE FOLD.**
+S-adenosylmethionine carries an atom named CA, and the bench's backbone check
+collects every CA in the PDB - so the SAM row reads as broken at a CA-CA of
+3.83 A in all three arms. Filter the ligand's residue before trusting that
+column.

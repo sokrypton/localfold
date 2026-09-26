@@ -231,12 +231,37 @@ export const OPENDDE_COUNTS = {
  *   opendde       its own sixteen already; twelve from 80 is level on RMSD and
  *                 the bond bench cannot run it.                        NOT TAKEN
  */
-export const SHORT_SCHEDULE_FAMILIES = Object.freeze(["af3", "intellifold2"]);
+/**
+ * 🔴 AND WHERE THE TWENTY CALLS START DEPENDS ON WHAT IS BEING FOLDED. The
+ * high-noise calls PLACE a chain and the low-noise ones SETTLE a small
+ * molecule, so a job with a ligand or a modified residue wants the start lower.
+ * Mean ligand bond rms over ten CCD ligands (GOL EDO ATP ADP BTN SAM PLP HEM
+ * NAD FAD) x four seeds, bench-sampler-geometry.js --ligands=:
+ *
+ *   family         own 25   sigma 80/20   sigma 40/20
+ *   af3            0.064      0.061         0.051
+ *   protenix2      0.084      0.086         0.075
+ *   openbind0      0.100      0.117         0.080
+ *   intellifold2   0.153      0.139         0.167
+ *
+ * and on plain proteins sigma 80 places the chain best (6MRR, protenix2 1.236
+ * -> 0.846, openbind0 1.706 -> 1.546) where sigma 40 costs it (af3 0.640 ->
+ * 0.707). So each family names two starts. A family not listed keeps its own
+ * schedule and its own twenty-five - see the table above for why boltz2,
+ * rosettafold3 and opendde are not here.
+ */
+export const SHORT_SCHEDULES = Object.freeze({
+  af3: Object.freeze({ protein: 80, ligand: 40 }),
+  intellifold2: Object.freeze({ protein: 80, ligand: 80 }),
+  protenix2: Object.freeze({ protein: 80, ligand: 40 }),
+  openbind0: Object.freeze({ protein: 80, ligand: 40 }),
+});
+export const SHORT_SCHEDULE_FAMILIES = Object.freeze(Object.keys(SHORT_SCHEDULES));
 export const ALPHAFOLD3_COUNTS = Object.freeze({
   ...AF3_COUNTS,
   diffusion: { label: "Diffusion", values: [20, 25, 50, 100, 200], preferred: 20 },
 });
-/** The schedule AlphaFold 3 takes below the model's own twenty-five steps. */
+/** Below this many steps a listed family takes its short schedule. */
 export const ALPHAFOLD3_SHORT_SCHEDULE = Object.freeze({ below: 25, sigmaMax: 80 });
 
 /** The step dial for a family - one reading, for the dial and the fold alike. */
@@ -249,10 +274,11 @@ export function countsForFamily(family) {
  * The sampler schedule a page fold passes, or undefined for the model's own.
  * See ALPHAFOLD3_COUNTS.
  */
-export function diffusionScheduleFor(family, mode, steps) {
-  if (!SHORT_SCHEDULE_FAMILIES.includes(family) || mode !== "diffusion") return undefined;
+export function diffusionScheduleFor(family, mode, steps, { hasLigand = false } = {}) {
+  const starts = SHORT_SCHEDULES[family];
+  if (starts === undefined || mode !== "diffusion") return undefined;
   if (!(steps < ALPHAFOLD3_SHORT_SCHEDULE.below)) return undefined;
-  return { sigmaMax: ALPHAFOLD3_SHORT_SCHEDULE.sigmaMax };
+  return { sigmaMax: hasLigand ? starts.ligand : starts.protein };
 }
 
 /**

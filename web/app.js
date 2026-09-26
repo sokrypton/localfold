@@ -3036,7 +3036,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     sequence, mode, calls, recycles, weights, device, signal,
     // AlphaFold 3's short schedule below its own twenty-five steps; see
     // ALPHAFOLD3_COUNTS in web/af3-model.js.
-    schedule: diffusionScheduleFor(chosenFamily(), mode, calls),
+    // ...and lower where the job carries a ligand or a modified residue,
+    // which the low-noise calls settle; see SHORT_SCHEDULES.
+    schedule: diffusionScheduleFor(family, mode, calls,
+      { hasLigand: ligandCodes.length > 0 || modifications.length > 0 }),
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds,
     // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes
