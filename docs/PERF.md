@@ -455,6 +455,22 @@ ipTM on all seven models; `check-af3-confidence.js` and the confidence oracle
 | 255 | 266-269 | **89-91** |
 | 400 | 600-616 | **213-215** |
 
+🔴 **AND WITHOUT `shader-f16` THE FIRST FOLD PACKED 920 MiB OF WEIGHTS ON THE
+CPU.** `residentBlockOnDevice` and the zero-gate packer in
+diffusion-transformer-webgpu.js each returned undefined unless the precision
+was f16 - the same refusal the pair track had until its fix, one stack later -
+so on a device with no `shader-f16`, which is every stock Chrome on NVIDIA, the
+diffusion transformer's weights fell back to the host SILENTLY: `hostPack`
+1965 ms, 1593 of it `difftx.block.resident` (756 MiB) and 363 `difftx.zerogate`
+(162 MiB), against **10 ms** for the same fold with the developer flags. The
+decoder has taken an f32 destination all along; both now pass one. Byte-
+identical on all seven models. First fold, 59 residues with an alignment, stock
+flags: af3 3.97 -> 1.77 s, boltz2 5.22 -> 2.09, protenix2 4.43 -> 2.11, rf3
+4.00 -> 1.82, if2 6.84 -> 4.28, opendde 5.91 -> 3.26 (both columns include the
+trunk and head work above). **Read `hostPack` under `LOCALFOLD_STOCK_FLAGS=1`
+before believing it is 12 ms** - the row in CLAUDE.md that says so was measured
+behind the flag that provides f16.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The

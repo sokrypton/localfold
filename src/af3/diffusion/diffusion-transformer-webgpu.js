@@ -137,12 +137,20 @@ function residentBlockBuffer(device, block, pack, variant = "") {
  * machinery is in src/af3/weights/device-weights.js, because the trunk's packers have
  * the same shape and the same problem.
  */
+// 🔴 AND IN f32 TOO - THE PAIR TRACK'S BUG, ONE STACK LATER. This returned
+// undefined for anything but f16, so a device WITHOUT `shader-f16` - every
+// stock Chrome on NVIDIA - packed all twenty-four blocks on the host: 1593 ms
+// and 756 MiB of a first fold, plus 363 ms for the zero gates below, against
+// 10 ms in total with the developer flags. The decoder has taken an f32
+// destination all along (see src/af3/weights/device-weights.js); only this
+// wrapper refused it. Nothing a gate here runs could see it, because every
+// harness passes the flag that provides f16.
 function residentBlockOnDevice(device, block, precision) {
-  if (precision !== "f16") return Promise.resolve(undefined);
   return residentPackedOnDevice(device, {
     key: block, label: "difftx.block.resident",
     order: txBlockOrder(txHasUpGate(block), txHasKqNorm(block)),
     weights: block, variant: precision,
+    destination: precision === "f16" ? "f16" : "f32",
   });
 }
 
@@ -2811,12 +2819,14 @@ export class Af3DiffusionTransformerGpu {
       // twelve gate tensors, so the decoder takes it whole; what it needed was
       // an order entry that can name its OWN holder, since this is one buffer
       // over twenty-four SOURCES maps. See src/af3/weights/device-weights.js.
-      const zeroGateOnDevice = batchedGates && weightPrecision === "f16"
+      // ...in either precision; see residentBlockOnDevice.
+      const zeroGateOnDevice = batchedGates
         ? await residentPackedOnDevice(this.device, {
             key: weights, label: "difftx.zerogate.resident", variant: weightPrecision,
             order: allBlocks.flatMap((block) =>
               ZERO_GATE_ORDER.map((name) => ({ name, weights: block }))),
             weights: allBlocks[0],
+            destination: weightPrecision === "f16" ? "f16" : "f32",
           })
         : undefined;
       const zeroGateWeights = batchedGates
