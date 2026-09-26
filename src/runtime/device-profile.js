@@ -1193,6 +1193,23 @@ PRIORS.set("lovelace", {
   attentionMatrix: false,
 });
 
+// NVIDIA RTX PRO 6000 Blackwell (Colab "G4", 48 vCPUs), 2026-09-26, two rounds
+// interleaved, driver cache cleared, seconds:
+//
+//                          default   ampere   lovelace   turing
+//   AF3 68, first fold     1.97      2.25     2.2        2.05
+//   AF3 68, later folds    0.33      0.30     0.49       0.61
+//   AF3 255, first fold    2.54      2.76     1.77       2.05
+//   AF3 255, later folds   0.95      0.85     1.18       1.49
+//   AF2, whole run         2.05      2.09     1.55       1.31
+//   ESMFold2, repeats      0.57      0.46     0.46       0.71
+//
+// The same shape as the L4 at half the times: ampere's settings win warm, the
+// tiered compile wins a first fold at 255 residues by a second and AF2's cold
+// run by half a second, and costs ~0.2 s a fold until its upgrades land. A
+// single cold run is what most visitors make, so it takes the L4's prior.
+PRIORS.set("blackwell", PRIORS.get("lovelace"));
+
 const VENDOR_PRIORS = new Map([
   // 🔴 NOTHING FOR "apple" ON PURPOSE. Its measurements ARE the defaults above,
   // and an entry that restated them would be a second place for them to drift.

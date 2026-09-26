@@ -1003,7 +1003,13 @@ rounds interleaved, driver cache cleared, seconds:
 The `lovelace` prior is the last column. The tiered upgrade queue now runs a
 quarter of the CPU's threads wide (one on a T4's two vCPUs, as measured there;
 three on the L4's twelve), without which the later folds sat on the slow
-kernels for most of a minute. Colab also offered an A100 (the ampere prior's
+kernels for most of a minute.
+
+The G4 (RTX PRO 6000 Blackwell, 48 vCPUs, `architecture: "blackwell"`) has the
+same shape at half the times - ampere's settings win warm (AF3 68 0.30 s a fold
+against 0.49; 255 0.85 against 1.18), the tiered compile wins AF3 255's first
+fold (1.77 s against 2.76) and AF2's cold run (1.55 against 2.09) - so it takes
+the lovelace prior. The table is in src/runtime/device-profile.js. Colab also offered an A100 (the ampere prior's
 own architecture) and a G4; H100 was refused on Pro, and neither was measured.
 
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
