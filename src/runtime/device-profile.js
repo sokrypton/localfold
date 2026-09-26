@@ -1040,10 +1040,42 @@ const PRIORS = new Map([
   // 5383 -> 6592 (+22%) across four minutes of that. A sweep that compares an
   // arm with a baseline taken ten minutes earlier is measuring the
   // temperature; nothing in this entry was taken that way.
+  //
+  // 🔴 AND THE THREE KNOBS THE MEASURED WIDTH DERIVES, PINNED, BECAUSE ON A
+  // COLAB T4 THAT MEASUREMENT IS A COIN TOSS. Logged at the diffusion
+  // transformer's compile across six identical runs of bench-head at 255
+  // tokens, the width read 2048, 512, 2048, 8, 4, 512 - the card idles at 585
+  // MHz and boosts under load, and the probe times six dispatches while the
+  // fold's own compiles and uploads share the device - and the denoiser call
+  // came out 132, 192, 132, 158, 158, 198 ms. Two of the three derived knobs
+  // moved it:
+  //
+  //   diffusionSplitK  width 2048 -> 8 splits (fast); 512 -> no split, qkvg
+  //                    30 ms against 8, ffw-wide 30 against 10
+  //   atomRowTile      bench-head, ms of atom stack a call, two rounds:
+  //                        tile      1      2      4      8
+  //                        255 tok  16.0   19.5   47.0   22.4
+  //                        510 tok  30.7   38.4   93.1   42.4
+  //
+  // A CORRECT width would not help either: a T4's ~640 workgroups say "no
+  // split" at 255 tokens, and that is the 192 ms arm - these GEMMs stream their
+  // weights and want the extra workgroups for latency, not to fill the SMs.
   ["turing", {
     opmBlockI: 8,
     gridAttendMatrix: true,
     gridAttendMatrixTile: "4x32",
+    // Split rules at tile 4, bench-head GPU ms a denoiser call, two rounds
+    // each, 255 / 68 tokens: splits 16 171/140 and 34/36, splits 8 166/135 and
+    // 27/31, splits 4 131/170 and 27/30; tile 2 at splits 8 is 187 and 39. The
+    // K-split and tile carry it (qkvg 8 ms against 30); the out/attn splits
+    // and the whole-call totals are inside this card's run-to-run spread.
+    diffusionSplitK: { splits: 8, tile: 4, crossover: 512, outSplits: 4,
+                       attnSplits: 4, attnTile: 2, normSplits: 4 },
+    atomRowTile: { below: 1, atOrAbove: 1, crossover: 1 << 30 },
+    // ...and the third, which moves nothing measurable (tiles 1/2/4, with the
+    // two above pinned: 126.6/128.6/131.1 ms at 255 tokens, 28-30 at 68) - so
+    // pinned for the determinism alone, at the arm that was never worst.
+    diffusionTokenTile: { below: 1, atOrAbove: 1, crossover: 1 << 30 },
   }],
   // Apple M2, 10 cores, macOS 13.2, Chrome 152 - the machine docs/PERF.md is
   // measured on, reporting {vendor: "apple", architecture: "metal-3"}.
