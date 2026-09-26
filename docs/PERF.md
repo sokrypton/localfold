@@ -852,6 +852,50 @@ Of the ~1.1 s that only a cold fold pays, the shader cache is worth ~340 ms (a
   weights beside the pairformer. Page, cold: trunk pass 1 705 -> 501-547 ms,
   first sampler step at 2090-2129 ms after the click against ~2250.
 
+## A Colab T4, which is what a free user folds on
+
+Measured through the Colab CLI (`colab new --gpu T4`, the notebook's own setup,
+bundles fetched from their pinned Hugging Face revisions). 🔴 **THE COLAB
+RUNTIME'S CHROME IS OURS, SO IT HAS BOTH DEVELOPER FLAGS** (`tools/cdp.py`):
+a free user gets `shader-f16` AND the T4's subgroup matrices, unlike a visitor's
+own browser. Every number here is that configuration, `main` against
+`opus-55-opt`, interleaved.
+
+| fold, seconds | `main` | branch |
+|---|---:|---:|
+| AF3 68 residues, warm | 1.42-1.86 | **1.25-1.31** |
+| AF3 255, warm | 8.45-9.72 | **7.26-7.93** |
+| AF3 68, first fold on a fresh VM (driver cache cleared) | 16.9-17.1 | **14.3-14.6** |
+| AF2 59, whole first run | 11.5 | **1.7** |
+| ESMFold2 255, warm, same work | 15.2-15.7 | 15.3-15.7 once the row tile went back to 8 |
+
+🔴 **THE T4's DERIVED DIFFUSION GEOMETRY WAS A COIN TOSS.** The occupancy probe
+feeding `diffusionSplitK`, `atomRowTile` and `diffusionTokenTile` read 2048,
+512, 2048, 8, 4, 512 workgroups across six identical runs (logged at the
+transformer's compile), and the denoiser call at 255 tokens came out 132 to 198
+ms with it. A clock warm-up and a third round did not steady it (4 to 2048
+again, fold weights loading beside it). The turing prior now pins all three -
+measured values and tables in `src/runtime/device-profile.js` - and the call
+holds at 126-133 ms. A CORRECT width would not have helped: ~640 workgroups
+says "no split" at 255 tokens and that was the slow arm; these GEMMs stream
+weights and want the workgroups for latency.
+
+🔴 **ESMFold2's ROW TILE OF TWO WAS AN A100 WIN AND A T4 LOSS** (language model
+211 -> 290 ms at 255 residues): a smaller tile re-reads the weights per row tile,
+which a 4 MB L2 at 320 GB/s pays for. It is the ampere prior's now.
+
+🔴 **A FIRST FOLD ON A FRESH COLAB VM IS ~13 s OF SHADER COMPILATION, AND A NEW
+LENGTH PAYS IT AGAIN.** 151 pipelines for a 68-residue AF3 fold compile in 12.85 s
+one at a time on the T4 (~85 ms each; the NVIDIA driver caches them in
+`~/.cache/nvidia/GLCache`, which is why only the VM's first run shows it), and
+the 2-vCPU VM gets little from compiling them concurrently. Nearly every shader
+bakes the token count, so a 70-residue fold after a 68-residue one is 16.6 s
+cold again. Measured and ruled out: loop unrolling (a 447-iteration constant
+loop compiles in 35-40 ms against 15 with a runtime bound). What is left:
+34 of the 151 differ only in constants (`const BLOCK`, `const ELEMENTS`) and
+could be one pipeline each (~3 s), and a token-count-independent shader set is
+the only thing that would make a second length free.
+
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
 The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by
