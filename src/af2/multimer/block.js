@@ -50,6 +50,7 @@ import {
   outerProductMeanTileCapacity,
   createOuterProductMeanProjectOutputShader,
   createOuterProductMeanVectorOutputShader, OPM_VECTOR_OUTPUT_BLOCK,
+  createOuterProductMeanVectorContractShader,
   OUTER_PRODUCT_MEAN_SCALE_SHADER,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
@@ -534,6 +535,7 @@ async function encodeOuterProductMean(
   const contractPrecision = opmContractPrecision(execution.device);
   // ...the output projection as a vector GEMM where the device asks for one;
   // see the same choice in src/af2/evoformer/block.js.
+  const vectorContract = outerFirst && deviceTuning(execution.device).opmVectorContract === true;
   const vectorOutput = outerFirst && deviceTuning(execution.device).opmVectorOutput === true
     && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
@@ -543,8 +545,11 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
-    execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
-      createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
+    vectorContract
+      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}`,
+        createOuterProductMeanVectorContractShader(input.cOuter))
+      : execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
+        createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
     vectorOutput
       ? execution.pipelines.get(
         `block:opm:project-output-vector:${residualTarget !== undefined}`,
@@ -577,7 +582,9 @@ async function encodeOuterProductMean(
   // fast path run at 825 residues on a device that cannot bind its 2.79 GB.
   const pairBlocks = outerFirstPairBlocks(
     descriptor, outerFirstLimitBytes(execution.device),
-    deviceTuning(execution.device).opmPairBlockBytes);
+    deviceTuning(execution.device).opmPairBlockBytes,
+    // ...whole rows of `i` for the vector GEMM, which indexes them.
+    vectorContract ? input.length : 1);
   const intermediateElements = outerFirst
     ? pairBlocks[0][1] * input.cOuter * input.cOuter
     : tileCapacity * input.length * input.cOuter * input.cZ;
@@ -609,10 +616,20 @@ async function encodeOuterProductMean(
     for (const [offset, count] of pairBlocks) {
       const blk = uniform(execution, `opm.pair-block-${offset}`,
         new Uint32Array([offset, count, 0, 0]));
-      // ...both are one workgroup per PAIR; see outer-product-mean.js.
-      const pairGrid = execution.linearGrid(count * 64);
-      execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate, blk],
-        pairGrid[0], pairGrid[1], 1, "opm.contract");
+      if (vectorContract) {
+        const blockRows = (count / input.length) * input.cOuter;
+        const columns = input.length * input.cOuter;
+        const vectorParams = uniform(execution, `opm.vector-contract-${offset}`,
+          new Uint32Array([blockRows, input.sequences, columns,
+            (offset / input.length) * input.cOuter, 0, 0, input.length, 0]));
+        execution.dispatch(encoder, contractPipeline, [left, right, vectorParams, intermediate],
+          Math.ceil(columns / 64), Math.ceil(blockRows / 64), 1, "opm.contract");
+      } else {
+        // ...both are one workgroup per PAIR; see outer-product-mean.js.
+        const pairGrid = execution.linearGrid(count * 64);
+        execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate, blk],
+          pairGrid[0], pairGrid[1], 1, "opm.contract");
+      }
       if (vectorOutput) {
         const vectorOutputParams = uniform(execution, `opm.vector-out-${offset}`,
           new Uint32Array([count, input.cOuter * input.cOuter, input.cZ,

@@ -37,6 +37,7 @@ import {
   OUTER_PRODUCT_MEAN_SCALE_SHADER,
   createOuterProductMeanMatrixOutputShader,
   createOuterProductMeanVectorOutputShader, OPM_VECTOR_OUTPUT_BLOCK,
+  createOuterProductMeanVectorContractShader,
   opmMatrixContract,
   createOuterProductMeanMatrixContractShader,
   createOuterProductMeanProjectShader,
@@ -863,6 +864,10 @@ async function encodeOuterProductMean(
   // 🔴 AND WITHOUT MATRIX UNITS, A VECTOR GEMM WHERE THE DEVICE ASKS FOR ONE -
   // bit-identical to the pair-blocked kernel; see
   // createOuterProductMeanVectorOutputShader. Same bindings as the matrix one.
+  // ...and the contraction likewise, over whole rows of `i` - see
+  // createOuterProductMeanVectorContractShader.
+  const vectorContract = matrixContract === null && outerFirst
+    && deviceTuning(execution.device).opmVectorContract === true;
   const vectorOutput = matrixOutput === null && outerFirst
     && deviceTuning(execution.device).opmVectorOutput === true
     && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
@@ -877,7 +882,10 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     execution.pipelines.get("block:opm:scale", OUTER_PRODUCT_MEAN_SCALE_SHADER),
-    matrixContract === null
+    vectorContract
+      ? execution.shaderPipeline(`block:opm:contract-vector:${input.cOuter}`,
+        () => createOuterProductMeanVectorContractShader(input.cOuter))
+      : matrixContract === null
       ? execution.shaderPipeline(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         () => createOuterProductMeanContractShader(input.cOuter, contractPrecision))
       : execution.shaderPipeline(
@@ -942,7 +950,8 @@ async function encodeOuterProductMean(
   const pairBlocks = outerFirstPairBlocks(
     descriptor, outerFirstLimitBytes(execution.device),
     deviceTuning(execution.device).opmPairBlockBytes,
-    matrixContract === null ? 1 : input.length * residueMultiple);
+    matrixContract === null ? (vectorContract ? input.length : 1)
+      : input.length * residueMultiple);
   const intermediateElements = outerFirst
     ? pairBlocks[0][1] * input.cOuter * input.cOuter
     : tileCapacity * input.length * input.cOuter * input.cZ;
@@ -976,7 +985,15 @@ async function encodeOuterProductMean(
     for (const [offset, count] of pairBlocks) {
       const blk = uniform(execution, `opm.pair-block-${offset}`,
         new Uint32Array([offset, count, 0, 0]));
-      if (matrixContract === null) {
+      if (vectorContract) {
+        const blockRows = (count / input.length) * input.cOuter;
+        const columns = input.length * input.cOuter;
+        const vectorParams = uniform(execution, `opm.vector-contract-${offset}`,
+          new Uint32Array([blockRows, input.sequences, columns,
+            (offset / input.length) * input.cOuter, 0, 0, input.length, 0]));
+        execution.dispatch(encoder, contractPipeline, [left, right, vectorParams, intermediate],
+          Math.ceil(columns / 64), Math.ceil(blockRows / 64), 1, "opm.contract");
+      } else if (matrixContract === null) {
         // ...both are one workgroup per PAIR; see outer-product-mean.js.
         const pairGrid = execution.linearGrid(count * 64);
         execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate, blk],

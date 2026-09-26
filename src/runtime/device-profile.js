@@ -300,6 +300,8 @@ export const DEFAULT_TUNING = Object.freeze({
   // units, null meaning the pair-blocked kernel. Bit-identical either way; see
   // createOuterProductMeanVectorOutputShader.
   opmVectorOutput: null,
+  // ...and its sequence contraction; see createOuterProductMeanVectorContractShader.
+  opmVectorContract: null,
   // 🔴 HOW MANY THREADS A TRANSITION SHOULD AIM TO HAVE IN FLIGHT. The
   // transition's dispatch is rows-only, so a short track cannot fill a large
   // device at any tile; the workgroup WIDTH is the only axis left. null keeps
@@ -746,6 +748,7 @@ const PRIORS = new Map([
     // 1.912 -> 1.375 ms, bitwise identical (bench-attention-project.js).
     attentionProjectRowsPerLane: 8,
     opmVectorOutput: true,
+    opmVectorContract: true,
     diffusionAttendSubgroups: true,
     diffusionAttendStageKeys: true,
     // Swept in situ at 68 tokens as a whole denoiser step, repeated to

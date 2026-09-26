@@ -623,6 +623,11 @@ whole 1024 x 128 weight matrix for them, ~8.5 GB of L2 traffic a block, and as a
 the old kernel's arithmetic exactly) it is 2.06 -> 1.32 ms. Block 22.67 ->
 **20.72 ms**, warm fold 1.37 -> **1.25 s**. Re-swept and left alone:
 `opmProjectOutputPairs` (4 still best under stock: 2 is 3.38 ms, 8 is 2.25).
+Then its contraction the same way (`opmVectorContract`): one workgroup a PAIR
+re-read both residues' slices, and as a GEMM over rows (i, a) and columns (j, b)
+- both operands already K-major in the vector projection's layout, blocks cut on
+whole rows of `i` - it is 1.60 -> 1.22 ms, bit-identical including at odd MSA
+depths (37 and 33 rows). Block **20.22 ms**, warm fold **1.23 s**.
 
 What is left under stock flags is mostly arithmetic: the pair track's f32
 kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,

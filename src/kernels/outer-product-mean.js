@@ -1170,6 +1170,96 @@ ${stores.join("\n")}
 /** The vector output GEMM's block, which its dispatch divides by. */
 export const OPM_VECTOR_OUTPUT_BLOCK = Object.freeze({ rows: 64, columns: 64 });
 
+/**
+ * The sequence contraction as a register-tiled VECTOR GEMM over a pair block.
+ *
+ * 🔴 ONE WORKGROUP A PAIR RE-READ ITS TWO SLICES FOR EVERY PAIR. The kernel
+ * above stages `left[., i, :]` and `right[., j, :]` per pair, so each residue's
+ * slice is read L times over: 1.60 ms at 255 residues x 128 rows, ~5.3 TMAC/s.
+ * As a GEMM - rows (i, a), columns (j, b), inner the sequences - a staged
+ * 64-wide panel serves 64 outputs. Both operands are already K-major in the
+ * layout the vector projection writes (`left[(s * L + i) * C + a]`), so the
+ * panels stage coalesced with no transpose.
+ *
+ * 🔴 AND IT SUMS EACH CELL OVER THE SEQUENCES IN ASCENDING ORDER FROM ZERO,
+ * `acc += l[a] * r[b]` in f32, as the kernel above does: bit-identical.
+ *
+ * Uniform: rows = (block's residues) x C, inner = sequences, columns = L x C,
+ * `weight_offset` = the block's first residue x C, `padding.x` = L. The store
+ * writes the pair-major intermediate the output projection reads.
+ */
+export function createOuterProductMeanVectorContractShader(cOuter) {
+  const BM = 64, BN = 64, BK = 16, AS = BM + 4;
+  const acc = [], reads = [], mul = [], stores = [];
+  for (let i = 0; i < 4; i += 1) {
+    reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * 4u + ${i}u];`);
+    acc.push(`  var acc_${i} = vec4<f32>(0.0);`);
+    mul.push(`      acc_${i} += a_${i} * b;`);
+    stores.push(`  {
+    let row = row_origin + ty * 4u + ${i}u;
+    if (row < parameters.rows && column < parameters.columns) {
+      let local_pair = (row / ${cOuter}u) * parameters.padding.x + column / ${cOuter}u;
+      let at = local_pair * ${cOuter * cOuter}u + (row % ${cOuter}u) * ${cOuter}u
+        + column % ${cOuter}u;
+${[0, 1, 2, 3].map((c) => `      outer[at + ${c}u] = acc_${i}.${"xyzw"[c]};`).join("\n")}
+    }
+  }`);
+  }
+  return `struct MatmulParameters {
+  rows: u32, inner: u32, columns: u32, weight_offset: u32,
+  bias_offset: u32, activation: u32, padding: vec2<u32>,
+};
+@group(0) @binding(0) var<storage, read> left: array<f32>;
+@group(0) @binding(1) var<storage, read> right: array<f32>;
+@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
+@group(0) @binding(3) var<storage, read_write> outer: array<f32>;
+var<workgroup> a_tile: array<f32, ${AS * BK}>;
+var<workgroup> b_tile: array<vec4<f32>, ${BK * BN / 4}>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+  let row_origin = group.y * ${BM}u;
+  let column_origin = group.x * ${BN}u;
+  let tx = li % 16u;
+  let ty = li / 16u;
+  let column = column_origin + tx * 4u;
+  // Both operands are [sequence][residue * C + channel]; a row of the GEMM is
+  // one of the block's residues' channels, a column one of any residue's.
+  let stride = parameters.columns;
+${acc.join("\n")}
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
+    for (var e = li; e < ${BM * BK}u; e += 256u) {
+      let k = k0 + e / ${BM}u;
+      let m = e % ${BM}u;
+      let row = row_origin + m;
+      var value = 0.0;
+      if (row < parameters.rows && k < parameters.inner) {
+        value = left[k * stride + parameters.weight_offset + row];
+      }
+      a_tile[(e / ${BM}u) * ${AS}u + m] = value;
+    }
+    for (var e = li; e < ${BK * BN / 4}u; e += 256u) {
+      let k = k0 + e / ${BN / 4}u;
+      let c = column_origin + (e % ${BN / 4}u) * 4u;
+      var value = vec4<f32>(0.0);
+      if (k < parameters.inner && c < parameters.columns) {
+        let base = k * stride + c;
+        value = vec4<f32>(right[base], right[base + 1u], right[base + 2u], right[base + 3u]);
+      }
+      b_tile[e] = value;
+    }
+    workgroupBarrier();
+    for (var k = 0u; k < ${BK}u; k += 1u) {
+      let b = b_tile[k * ${BN / 4}u + tx];
+${reads.join("\n")}
+${mul.join("\n")}
+    }
+    workgroupBarrier();
+  }
+${stores.join("\n")}
+}`;
+}
+
 export function createOuterProductMeanMatrixContractShader(cOuter, geometry) {
   return createStagedMatrixShader({
     ...geometry,
