@@ -423,7 +423,11 @@ export async function foldEsmfold2(device, options) {
   const held = [];
   const keep = (allocation) => { held.push(allocation); return allocation; };
 
-  const submit = async (label, passes) => {
+  // 🔴 `wait` DEFAULTS TO A DRAIN, AND THE RECYCLE'S ROW CHUNKS DO NOT WANT
+  // ONE: they write disjoint rows of the pair and the trunk after them is
+  // queue-ordered behind them, so waiting on each was 32 drains a fold at 255
+  // tokens around small passes.
+  const submit = async (label, passes, wait = true) => {
     const encoder = device.createCommandEncoder({ label });
     for (const [name, pipeline, buffers, x, y] of passes) {
       const pass = encoder.beginComputePass({ label: name });
@@ -441,7 +445,7 @@ export async function foldEsmfold2(device, options) {
       pass.end();
     }
     device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
+    if (wait) await device.queue.onSubmittedWorkDone();
   };
 
   try {
@@ -684,7 +688,7 @@ export async function foldEsmfold2(device, options) {
                 ["project", project, [recycleScratch, recycleWeights,
                                       slice(zInit, start, rows), slice(pair, start, rows)],
                  ...linearGrid(rows, channels)],
-              ]);
+              ], false);
               continue;
             }
             await submit("esmfold2.recycle", [
@@ -693,7 +697,7 @@ export async function foldEsmfold2(device, options) {
               ["project", recycleProject, [recycleScratch, recycleWeights,
                                            slice(zInit, start, rows), slice(pair, start, rows)],
                ...linearGrid(rows, channels)],
-            ]);
+            ], false);
           }
         });
         await mark(`trunk ${loop}`, () => trunk.run(
