@@ -1077,6 +1077,21 @@ const PRIORS = new Map([
     // two above pinned: 126.6/128.6/131.1 ms at 255 tokens, 28-30 at 68) - so
     // pinned for the determinism alone, at the arm that was never worst.
     diffusionTokenTile: { below: 1, atOrAbove: 1, crossover: 1 << 30 },
+    // 🔴 A FRESH COLAB VM'S FIRST FOLD IS MOSTLY THE DRIVER COMPILING, AND
+    // CONSTANT LOOP BOUNDS ARE WHAT IT SPENDS THAT ON: NVIDIA's compiler
+    // unrolls them. "tiered" compiles every kernel with opaque bounds first and
+    // the unrolled one behind it (see withRuntimeLoopBounds in
+    // pipeline-cache.js). AF3 on this T4, driver cache cleared, s:
+    //
+    //                          first fold      folds 2..5
+    //   68 residues   off      14.0 / 13.7     1.2 each
+    //                 tiered    8.6 / 11.2     2.4, 2.4, 2.0, 2.0 (-> 1.4)
+    //   255 residues  off      22.5            7.6, 7.5
+    //                 tiered   18.2            7.9, 7.8
+    //
+    // Bit-identical (the arithmetic is untouched). A user who folds once saves
+    // 3-5 s; one who folds five times comes out even.
+    runtimeLoopBounds: "tiered",
   }],
   // Apple M2, 10 cores, macOS 13.2, Chrome 152 - the machine docs/PERF.md is
   // measured on, reporting {vendor: "apple", architecture: "metal-3"}.
