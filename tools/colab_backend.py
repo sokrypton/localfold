@@ -292,8 +292,11 @@ class JaxWorker:
         self.lock = threading.Lock()
 
     def _start(self):
+        # LOCALFOLD_JAX_WORKER stands a stub in for the real worker, which is
+        # how tools/check-colab-bridge.py tests this path with no GPU and no JAX.
+        worker = os.environ.get("LOCALFOLD_JAX_WORKER") or os.path.join(REPO, "tools", "jax_worker.py")
         self.proc = subprocess.Popen(
-            [sys.executable, os.path.join(REPO, "tools", "jax_worker.py")],
+            [sys.executable, worker],
             cwd=self.directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             text=True, bufsize=1)
         threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()

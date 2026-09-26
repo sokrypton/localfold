@@ -57,6 +57,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -124,12 +125,35 @@ def wait_for_event(kind, since=0, seconds=30):
     return None, since, seen
 
 
+# 🔴 THE JAX BACKEND'S PATH, WITH A STUB WORKER. No JAX and no card here, so a
+# twenty-line stand-in speaks tools/jax_worker.py's protocol - one job a line
+# in, one event a line out - and what is tested is the broker's half: that a
+# `backend: "jax"` fold goes to the worker and not to the page, that its events
+# reach /down numbered and stamped, that one fold still means one, and that
+# Stop ends a fold JAX cannot interrupt by ending the worker.
+JAX_DIR = tempfile.mkdtemp(prefix="localfold-jax-check-")
+STUB = os.path.join(JAX_DIR, "stub_worker.py")
+with open(STUB, "w") as handle:
+    handle.write('''import json, sys, time
+say = lambda kind, payload: print(json.dumps({"kind": kind, "payload": payload, "at": int(time.time() * 1000)}), flush=True)
+say("jax-ready", {})
+for line in sys.stdin:
+    job = json.loads(line)
+    say("status", "stub on JAX")
+    say("progress", 0.5)
+    say("frame", "ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00 90.00           C\\nEND\\n")
+    if job.get("hang"):
+        time.sleep(120)
+    say("result", {"pdb": "END\\n", "scores": {"mean_plddt": 90.0}, "status": "stub done"})
+''')
+
 print(f"starting the broker on {PORT} (a headless Chrome comes with it)…")
 backend = subprocess.Popen(
     [sys.executable, "tools/colab_backend.py", "--port", str(PORT),
      "--cdp-port", str(CDP_PORT), "--token", TOKEN,
-     "--profile", "/tmp/localfold-bridge-check"],
-    cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+     "--profile", "/tmp/localfold-bridge-check", "--jax-dir", JAX_DIR],
+    cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    env=dict(os.environ, LOCALFOLD_JAX_WORKER=STUB))
 try:
     ready, adapter = False, None
     deadline = time.time() + 180
@@ -738,6 +762,38 @@ try:
     if dead is not False:
         bad.append(f"the browser reads {dead!r} after it was killed - a"
                    " reader cannot tell a gone runtime from a busy one")
+
+    # 10b · the JAX backend: routed to the worker, numbered, one at a time,
+    # and stoppable.
+    code, health = call("/health")
+    if "jax" not in (health.get("backends") or []):
+        bad.append(f"/health lists {health.get('backends')} with --jax-dir given")
+    _, head = call("/down?head=1")
+    code, said = call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}"}})
+    result, since_jax, seen = wait_for_event("result", head.get("n", 0), 30)
+    kinds = [event.get("kind") for event in seen]
+    seqs = [event.get("seq") for event in seen]
+    print(f"  jax fold: {code} -> {kinds}, seq {seqs}")
+    if result is None or (result.get("payload") or {}).get("status") != "stub done":
+        bad.append(f"a JAX fold did not come back through the worker: {kinds}")
+    if seqs != sorted(seqs) or any(event.get("got") is None for event in seen):
+        bad.append("the worker's events are not numbered in order and stamped on arrival")
+    call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}", "hang": True}})
+    wait_for_event("frame", since_jax, 30)
+    code, refused = call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}"}})
+    if code != 429:
+        bad.append(f"a second JAX fold during one answered {code}, not 429")
+    call("/in", {"op": "stop"})
+    stopped, since_jax, _ = wait_for_event("result", since_jax, 15)
+    _, head = call("/down?head=1")
+    print(f"  jax stop: {(stopped or {}).get('payload')}, folding {head.get('folding')}")
+    if (stopped or {}).get("payload", {}).get("error") != "stopped" or head.get("folding"):
+        bad.append("Stop did not end a JAX fold: the worker has to go, and the flag with it")
+    code, said = call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}"}})
+    again, since_jax, _ = wait_for_event("result", since_jax, 30)
+    if again is None or (again.get("payload") or {}).get("status") != "stub done":
+        bad.append("the JAX fold after a Stop did not run - the worker was not restarted")
+    print("  and the next JAX fold runs on a new worker")
 
     # 11 · and nothing answers without the token.
     for route, body in (("/down?since=0", None), ("/out?since=0", None),
