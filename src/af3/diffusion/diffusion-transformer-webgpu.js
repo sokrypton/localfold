@@ -892,7 +892,7 @@ ${batchedGates
     // normKSplits of them - so the split kernel leaves the scale unbiased and
     // this sums the parts and then adds it.
     {
-      let stride = ${rows}u * C;
+      let stride = ${ROWS} * C;
       for (var part = 0u; part < ${normKSplits}u; part = part + 1u) {
         ${overTile((t) => `{
           let token = base_token + ${t}u;
@@ -919,7 +919,7 @@ ${mode === "split"
   ? `    ${overTile((t) => `{
       let token = base_token + ${t}u;
       if (token < ${ROWS}) {
-        let stride = ${rows}u * C;
+        let stride = ${ROWS} * C;
         let at = (group.z * 2u) * stride + token * C + c;
         partials[at] = scale${group(t)}${lane(t)};
         partials[at + stride] = shift${group(t)}${lane(t)};
@@ -1032,8 +1032,8 @@ ${stageChunk}
     if (token < ${ROWS}) {
       let index = token * WIDTH + out;
 ${kSplits > 1
-    ? `      let slot = (group.z * 4u) * ${rows}u * WIDTH + index;
-      let stride = ${rows}u * WIDTH;
+    ? `      let slot = (group.z * 4u) * ${ROWS} * WIDTH + index;
+      let stride = ${ROWS} * WIDTH;
       partials[slot] = q${group(t)}${lane(t)};
       partials[slot + stride] = k${group(t)}${lane(t)};
       partials[slot + stride * 2u] = v${group(t)}${lane(t)};
@@ -1241,7 +1241,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   ${overGroups((g) => `var projected${g} = ${tileLanes}(0.0);`)}
 ${mode === "reduce"
   ? `  {
-    let stride = ${rows}u * C;
+    let stride = ${ROWS} * C;
     ${overTile((t) => `{
       let token = base_token + ${t}u;
       if (token < ${ROWS}) {
@@ -1274,7 +1274,7 @@ ${mode === "reduce"
 ${mode === "split" ? `  ${overTile((t) => `{
     let token = base_token + ${t}u;
     if (token < ${ROWS}) {
-      partials[group.z * ${rows}u * C + token * C + c] = projected${group(t)}${lane(t)};
+      partials[group.z * ${ROWS} * C + token * C + c] = projected${group(t)}${lane(t)};
     }
   }`)}` : ""}
 ${mode === "split" ? "" : `${batchedGates ? `  // 🔴 ALREADY COMPUTED, FOR EVERY BLOCK, IN ONE DISPATCH. This used to stage
@@ -1575,7 +1575,7 @@ ${kSplits > 1
     let token = base_token + ${t}u;
     if (token < ${ROWS}) {
       let index = token * INTERMEDIATE + i;
-      let stride = ${rows}u * INTERMEDIATE;
+      let stride = ${ROWS} * INTERMEDIATE;
       let slot = (group.z * ${upGate ? 3 : 2}u) * stride + index;
       partials[slot] = gate_acc${group(t)}${lane(t)};
       partials[slot + stride] = value_acc${group(t)}${lane(t)};
@@ -1601,8 +1601,8 @@ ${kSplits > 1
 @compute @workgroup_size(${lanes})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let index = gid.x + gid.y * GRID_WIDTH * ${lanes}u;
-  if (index >= ${rows}u * INTERMEDIATE) { return; }
-  let stride = ${rows}u * INTERMEDIATE;
+  if (index >= ${ROWS} * INTERMEDIATE) { return; }
+  let stride = ${ROWS} * INTERMEDIATE;
   var g = 0.0;
   var v = 0.0;
   ${upGate ? "var u = 0.0;" : ""}
@@ -1718,7 +1718,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
 ${mode === "reduce"
   ? `  {
-    let stride = ${rows}u * C;
+    let stride = ${ROWS} * C;
     ${overOutTile((t) => `{
       let token = base_token + ${t}u;
       if (token < ${ROWS}) {
@@ -1755,7 +1755,7 @@ ${mode === "reduce"
 ${mode === "split" ? `  ${overOutTile((t) => `{
     let token = base_token + ${t}u;
     if (token < ${ROWS}) {
-      partials[group.z * ${rows}u * C + token * C + c] = acc${outGroup(t)}${outLane(t)};
+      partials[group.z * ${ROWS} * C + token * C + c] = acc${outGroup(t)}${outLane(t)};
     }
   }`)}
 ` : ""}
@@ -1900,8 +1900,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @compute @workgroup_size(${lanes})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let index = gid.x + gid.y * GRID_WIDTH * ${lanes}u;
-  if (index >= ${rows}u * WIDTH) { return; }
-  let stride = ${rows}u * WIDTH;
+  if (index >= ${ROWS} * WIDTH) { return; }
+  let stride = ${ROWS} * WIDTH;
   var sq = 0.0;
   var sk = 0.0;
   var sv = 0.0;

@@ -23,7 +23,7 @@ export const EXTENSION_FEATURES = [
 ];
 
 export const pipelineCacheStats = {
-  hits: 0, misses: 0, shared: 0, hitSourceBytes: 0, byKey: new Map(),
+  hits: 0, misses: 0, shared: 0, generic: 0, hitSourceBytes: 0, byKey: new Map(),
 };
 
 /** How long the cache must go without a new pipeline before upgrading one. */
@@ -140,7 +140,8 @@ export class ComputePipelineCache {
         + "A stock Chrome has neither shader-f16 nor the subgroup matrix units on "
         + "NVIDIA; see docs/A100.md.");
     }
-    const pipeline = this.device.createComputePipelineAsync({
+    const generic = mode === "tiered" ? this.#lengthGeneric(key, stripped, entryPoint) : null;
+    const pipeline = generic ?? this.device.createComputePipelineAsync({
         label: key,
         layout: "auto",
         compute: {
@@ -161,11 +162,55 @@ export class ComputePipelineCache {
     // cores from it - ESMFold2's first fold went 4.5 -> 6.7 s - so they wait
     // for a quiet spell with no new request (see #drainUpgrades).
     this.#lastMiss = performance.now();
-    if (mode === "tiered" && opaque !== stripped) {
+    if (mode === "tiered" && (opaque !== stripped || generic !== null)) {
       this.#pendingUpgrades.push({ key, target, code: stripped, entryPoint, pipeline });
       this.#drainUpgrades();
     }
     return pipeline;
+  }
+
+  /**
+   * 🔴 A NEW PROTEIN LENGTH RECOMPILED EVERY KERNEL, BECAUSE EVERY KERNEL BAKES
+   * THE LENGTH IN. A Colab T4 spends ~5 s of a fold compiling them, and a
+   * second protein of another length paid it again. Most of those kernels
+   * differ between two lengths only in `const NAME: u32 = <n>u;` lines (77 of
+   * AF3's 104 at 68 and 70 residues), so the cache groups kernels by their
+   * text with those values blanked, and the second time it meets one at new
+   * values it compiles ONE generic kernel that reads the differing constants
+   * from a uniform in bind group 1. Every later length reuses it with its own
+   * values - no compile - while the length-specific kernel compiles behind the
+   * fold as a tiered upgrade, exactly as the unrolled one does.
+   *
+   * It is the same arithmetic in the same order: only integers that were
+   * compile-time constants become uniforms, and a kernel that uses one where
+   * WGSL needs a constant (an array size, a workgroup size, another constant)
+   * is refused and compiled length-specific as before.
+   */
+  #bySkeleton = new Map();
+
+  #lengthGeneric(key, stripped, entryPoint) {
+    const plan = lengthPlan(stripped);
+    if (plan.generic.length === 0) return null;
+    const { skeleton, values } = lengthSkeleton(stripped, plan);
+    const groupKey = `${entryPoint}\u0000${skeleton}`;
+    let generic = this.#bySkeleton.get(groupKey);
+    if (generic === undefined) {
+      const source = genericLengthSource(stripped, plan);
+      generic = source === null ? null : this.device.createComputePipelineAsync({
+        label: `${key}.generic`, layout: "auto",
+        compute: {
+          module: this.device.createShaderModule({ label: `${key}.generic.wgsl`,
+            code: this.runtimeLoopBounds === false ? source : withRuntimeLoopBounds(source) }),
+          entryPoint,
+        },
+      });
+      this.#bySkeleton.set(groupKey, generic);
+    } else {
+      pipelineCacheStats.generic += 1;
+    }
+    if (generic === null) return null;
+    return generic.then((pipeline) => withLengthValues(this.device, pipeline,
+      plan.generic.map((name) => Number(values.get(name)))));
   }
 
   #lastMiss = 0;
@@ -240,6 +285,154 @@ export function withRuntimeLoopBounds(code) {
   return code.replace(/for \(([^;]*); (\w+) < ([A-Z][A-Z0-9_]*);/g,
     (whole, init, name, bound) => (unsigned.has(bound)
       ? `for (${init}; ${name} < ${bound} + ${zero};` : whole));
+}
+
+/** A module-scope `const NAME[: type] = <expression>;` on one line. */
+const MODULE_CONSTANT = /^const\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*([a-z0-9<>]+)\s*)?=\s*([^;]+?)\s*;\s*$/;
+const U32_LITERAL = /^(\d+)u$/;
+
+/**
+ * Which of a kernel's module constants can be read at run time instead: every
+ * `const NAME[: u32] = <n>u;` that code reads, unless it (or a constant derived
+ * from it) sits where WGSL needs a constant - an array size, a workgroup size,
+ * an override, or a constant this does not inline. `derived` are the module
+ * constants computed from those, which are inlined as their expressions.
+ * Exported for its test.
+ */
+export function lengthPlan(code) {
+  const lines = code.split("\n");
+  const uncommented = lines.map((line) => line.replace(/\/\/.*$/, ""));
+  const text = uncommented.join("\n");
+  const uses = (name) => (text.match(new RegExp(`\\b${name}\\b`, "g")) ?? []).length;
+  const declared = new Map();
+  for (const [index, line] of uncommented.entries()) {
+    const match = MODULE_CONSTANT.exec(line);
+    if (match !== null) declared.set(match[1], { index, type: match[2], rhs: match[3] });
+  }
+  const refersTo = (rhs, names) => [...names].some((name) => new RegExp(`\\b${name}\\b`).test(rhs));
+  let generic = new Set([...declared].filter(([name, d]) => U32_LITERAL.test(d.rhs)
+    && (d.type === undefined || d.type === "u32") && uses(name) > 1).map(([name]) => name));
+  for (;;) {
+    // ...the module constants computed from them, transitively.
+    const derived = new Set();
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const [name, d] of declared) {
+        if (generic.has(name) || derived.has(name)) continue;
+        if (refersTo(d.rhs, generic) || refersTo(d.rhs, derived)) { derived.add(name); grew = true; }
+      }
+    }
+    const moving = new Set([...generic, ...derived]);
+    // ...integers only: a float the compiler folds is not bit-for-bit the one
+    // computed at run time, and this must be the same arithmetic.
+    const floating = [...derived].filter((name) => {
+      const { type, rhs } = declared.get(name);
+      return (type !== undefined && type !== "u32" && type !== "i32") || /\d\.\d|\bf32\b|\bf16\b|sqrt|exp|log/.test(rhs);
+    });
+    const bad = [...floating, ...[...moving].filter((name) => uncommented.some((line, index) => {
+      if (declared.get(name)?.index === index || !new RegExp(`\\b${name}\\b`).test(line)) return false;
+      if (MODULE_CONSTANT.test(line)) return false;
+      return /^\s*(const|override)\b/.test(line)
+        || new RegExp(`array<[^;]*\\b${name}\\b`).test(line)
+        || new RegExp(`workgroup_size\\([^)]*\\b${name}\\b`).test(line)
+        // ...and not into a float: `x / f32(C)` folds to an exact constant,
+        // and a GPU's run-time division is not exact.
+        || new RegExp(`\\bf(32|16)\\([^;]*\\b${name}\\b`).test(line);
+    }))];
+    if (bad.length === 0) return { generic: [...generic], derived: [...derived] };
+    // A refused name takes back every literal it is computed from.
+    const back = new Set(bad);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const name of back) {
+        const rhs = declared.get(name)?.rhs ?? "";
+        for (const other of generic) {
+          if (!back.has(other) && new RegExp(`\\b${other}\\b`).test(rhs)) { back.add(other); grew = true; }
+        }
+      }
+    }
+    const next = new Set([...generic].filter((name) => !back.has(name)));
+    if (next.size === generic.size) return { generic: [], derived: [] };
+    generic = next;
+  }
+}
+
+/**
+ * The kernel's text with the plan's constants blanked, and their values - the
+ * key two kernels share a generic pipeline under. Exported for its test.
+ */
+export function lengthSkeleton(code, plan = lengthPlan(code)) {
+  const values = new Map();
+  const moving = new Set(plan.generic);
+  const skeleton = code.split("\n").map((line) => {
+    const match = MODULE_CONSTANT.exec(line);
+    if (match === null || !moving.has(match[1])) return line;
+    values.set(match[1], U32_LITERAL.exec(match[3])[1]);
+    return `const ${match[1]}: u32 = ?;`;
+  }).join("\n");
+  return { skeleton, values };
+}
+
+/**
+ * The kernel with the plan's constants read from `localfold_lengths` in bind
+ * group 1, and the ones derived from them inlined. Exported for its test.
+ */
+export function genericLengthSource(code, plan = lengthPlan(code)) {
+  if (plan.generic.length === 0 || /@group\(\s*1\s*\)/.test(code)) return null;
+  const at = new Map(plan.generic.map((name, index) => [name, index]));
+  const derived = new Map();
+  let lines = code.split("\n").filter((line) => {
+    const match = MODULE_CONSTANT.exec(line);
+    if (match === null) return true;
+    if (plan.derived.includes(match[1])) {
+      derived.set(match[1], match[2] === undefined ? `(${match[3]})` : `${match[2]}(${match[3]})`);
+      return false;
+    }
+    return !at.has(match[1]);
+  });
+  let body = lines.join("\n");
+  // ...derived constants as their expressions, until none is left.
+  for (let round = 0; round < 16 && derived.size > 0; round += 1) {
+    const before = body;
+    body = body.replace(new RegExp(`\\b(${[...derived.keys()].join("|")})\\b`, "g"),
+      (name) => derived.get(name));
+    if (body === before) break;
+  }
+  body = body.replace(new RegExp(`\\b(${plan.generic.join("|")})\\b`, "g"),
+    (name) => `localfold_lengths[${at.get(name) >> 2}].${"xyzw"[at.get(name) & 3]}`);
+  return `${body}\n@group(1) @binding(0) var<uniform> localfold_lengths: `
+    + `array<vec4<u32>, ${Math.ceil(plan.generic.length / 4)}>;\n`;
+}
+
+/** Which bind group 1 a generic pipeline handed out under one key needs. */
+const LENGTH_VALUES = new WeakMap();
+
+/**
+ * A stand-in for `pipeline` that carries these values: `setPipeline` (patched
+ * below) sets the real pipeline and its bind group 1. It answers
+ * `getBindGroupLayout` and `label`, which is all a caller asks of a pipeline.
+ */
+function withLengthValues(device, pipeline, numbers) {
+  const buffer = device.createBuffer({ label: `${pipeline.label}.lengths`,
+    size: 16 * Math.ceil(numbers.length / 4), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const words = new Uint32Array(buffer.size / 4);
+  words.set(numbers);
+  device.queue.writeBuffer(buffer, 0, words);
+  const group = device.createBindGroup({ label: `${pipeline.label}.lengths`,
+    layout: pipeline.getBindGroupLayout(1), entries: [{ binding: 0, resource: { buffer } }] });
+  const standIn = { label: pipeline.label, getBindGroupLayout: (index) => pipeline.getBindGroupLayout(index) };
+  LENGTH_VALUES.set(standIn, { pipeline, group });
+  return standIn;
+}
+
+if (typeof GPUComputePassEncoder !== "undefined") {
+  const setPipeline = GPUComputePassEncoder.prototype.setPipeline;
+  GPUComputePassEncoder.prototype.setPipeline = function setLengthPipeline(pipeline) {
+    const lengths = LENGTH_VALUES.get(pipeline);
+    if (lengths === undefined) return setPipeline.call(this, pipeline);
+    setPipeline.call(this, lengths.pipeline);
+    this.setBindGroup(1, lengths.group);
+  };
 }
 
 export function stripUnusedConstants(code) {

@@ -75,3 +75,33 @@ test("the pipeline cache compiles a shader without the constants it never reads"
   // Two kernels differing only in an unused constant become one text.
   assert.equal(stripUnusedConstants(source.replace("68u", "70u")), stripped);
 });
+
+test("a kernel's length constants become uniforms only where WGSL allows it", async () => {
+  const { lengthPlan, lengthSkeleton, genericLengthSource } = await import("../src/runtime/pipeline-cache.js");
+  const at = (tokens) => [
+    "const L: u32 = " + tokens + "u;",
+    "const C: u32 = 128u;",
+    "const PAIRS: u32 = L * L;",
+    "const WG: u32 = 64u;",
+    "const N: u32 = 16u;",
+    "var<workgroup> tile: array<f32, WG>;",
+    "@group(0) @binding(0) var<storage, read_write> x: array<f32>;",
+    "@compute @workgroup_size(WG) fn main(@builtin(global_invocation_id) id: vec3<u32>) {",
+    "  if (id.x >= PAIRS) { return; }",
+    "  x[id.x % C] = x[id.x] / f32(N);",
+    "}",
+  ].join("\n");
+  const plan = lengthPlan(at(68));
+  // WG sizes an array and the workgroup, N reaches a float: both stay constant.
+  assert.deepEqual(plan, { generic: ["L", "C"], derived: ["PAIRS"] });
+  assert.equal(lengthSkeleton(at(68)).skeleton, lengthSkeleton(at(70)).skeleton);
+  assert.deepEqual([...lengthSkeleton(at(70)).values], [["L", "70"], ["C", "128"]]);
+  const generic = genericLengthSource(at(70));
+  assert.match(generic, /id\.x >= u32\(localfold_lengths\[0\]\.x \* localfold_lengths\[0\]\.x\)/);
+  assert.match(generic, /x\[id\.x % localfold_lengths\[0\]\.y\]/);
+  assert.match(generic, /const WG: u32 = 64u;/);
+  assert.match(generic, /f32\(N\)/);
+  assert.doesNotMatch(generic, /const (L|C|PAIRS)\b/);
+  // A kernel already using group 1 is left alone.
+  assert.equal(genericLengthSource(`${at(68)}\n@group(1) @binding(0) var<storage> y: array<f32>;`), null);
+});

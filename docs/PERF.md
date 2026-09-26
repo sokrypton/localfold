@@ -948,6 +948,43 @@ resolves is read by AF2's or the shared kernels, not by AF3's. Swept
 beside it and not taken: the pair-transition split at 128 channels (3-4% of the
 trunk) and the matrix grid projection (`grid.project` -10%, ~1% of the trunk).
 
+🔴 **A NEW PROTEIN LENGTH NO LONGER RECOMPILES EVERY KERNEL** (tiered devices,
+i.e. the turing prior). Nearly every kernel bakes the token count in as
+`const L: u32 = <n>u;`, so each new length was ~100 driver compiles. The cache
+now builds each kernel's first pipeline GENERIC: every module `u32` constant
+that code reads only in expressions is read from a uniform in bind group 1
+instead (`lengthPlan` in src/runtime/pipeline-cache.js; constants derived from
+them are inlined), and kernels whose text is otherwise identical share that
+pipeline at any length. The length-specific kernel still compiles behind the
+fold as the tiered upgrade. Refused, and compiled per length as before: a
+constant that sizes an array or a workgroup, feeds another constant the
+planner does not inline, or reaches a float (`x / f32(C)` folds exactly; a
+run-time division is not exact) - which is what keeps every fold BIT-IDENTICAL
+(pLDDT and gyration to the last digit at 68/70/74 residues, AF2's checksum,
+ESMFold2's atom checksum, OpenDDE's pLDDT, `test:cache` clean with tiered
+forced). The diffusion transformer's `${rows}u` literals became `${ROWS}`
+(`TOKENS` at one sample) so its kernels qualify; `check-difftx-samples.js`
+still reads identical.
+
+AF3, A100, tiered forced, four lengths in one process: 97 / 4 / 4 / 4 compiles,
+against ~100 each before. A Colab T4, driver cache cleared, one browser, the
+first fold at each length (three rounds):
+
+| residues | before | after |
+|---|---:|---:|
+| 68 (fresh VM) | 11.5-11.6 s | 9.0-10.7 |
+| 90 | 7.6-8.8 | **3.6-3.7** |
+| 120 | 8.6-10.0 | 6.2-7.0 |
+| 150 | 9.7-10.1 | 6.6-6.7 |
+
+A repeat at 120 is 4.4 s, so a new length now costs ~1 s over a warm fold
+where it cost ~5. What still compiles per length: attention kernels with a
+`var<workgroup> logits: array<f32, L>`, the single attention's split count
+(it moves with length), and the confidence head's per-length TM table.
+🔴 `tools/gpu/fold.js` used to start its pipeline warm BEFORE applying
+`--tune`, so a `--tune` arm that changes a kernel warmed the prior's kernels;
+it applies `--tune` first now (`--tune-json` never had the problem).
+
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
 The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by

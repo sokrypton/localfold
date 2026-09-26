@@ -389,6 +389,26 @@ export async function main(device, args) {
   const depths = trunkDepths(store);
   const blocks = blocksOption === "" ? depths.pairformerBlocks : Number(blocksOption);
   console.log(`trunk ${blocks} pairformer blocks, ${depths.msaBlocks} MSA blocks`);
+  // 🔴 APPLIED BEFORE THE WARM BELOW, which compiles under whatever tuning is
+  // in force when it starts: after it, a `--tune` arm that changes a kernel
+  // warmed the prior's kernels and folded with its own.
+  const tune = option(args, "tune", "");
+  if (tune !== "") {
+    const forced = {};
+    for (const pair of tune.split(",").filter(Boolean)) {
+      const at = pair.indexOf("=");
+      if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+      const key = pair.slice(0, at);
+      const raw = pair.slice(at + 1);
+      if (!(key in DEFAULT_TUNING)) {
+        throw new Error(`--tune names ${key}, which is not a tuning knob. `
+          + `Known: ${Object.keys(DEFAULT_TUNING).sort().join(", ")}`);
+      }
+      try { forced[key] = JSON.parse(raw); } catch { forced[key] = raw; }
+    }
+    setDeviceTuning(device, forced);
+    console.log(`tuning forced: ${JSON.stringify(forced)}`);
+  }
   // 🔴 THE PAIRFORMER'S SHADERS, WHILE THE SHARDS ARE STILL ARRIVING. A fold's
   // compilation is 0.80 s of AF3's 2.47 and 1.23 of OpenDDE's 2.93, the
   // compiler pool is saturated while it runs, and the weight load in front of
@@ -587,23 +607,6 @@ export async function main(device, args) {
       }
       return result;
     };
-  }
-  const tune = option(args, "tune", "");
-  if (tune !== "") {
-    const forced = {};
-    for (const pair of tune.split(",").filter(Boolean)) {
-      const at = pair.indexOf("=");
-      if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
-      const key = pair.slice(0, at);
-      const raw = pair.slice(at + 1);
-      if (!(key in DEFAULT_TUNING)) {
-        throw new Error(`--tune names ${key}, which is not a tuning knob. `
-          + `Known: ${Object.keys(DEFAULT_TUNING).sort().join(", ")}`);
-      }
-      try { forced[key] = JSON.parse(raw); } catch { forced[key] = raw; }
-    }
-    setDeviceTuning(device, forced);
-    console.log(`tuning forced: ${JSON.stringify(forced)}`);
   }
   const keepWeights = option(args, "keep-weights", null);
   if (keepWeights === "off") setDeviceTuning(device, { keepTrunkWeights: null });
