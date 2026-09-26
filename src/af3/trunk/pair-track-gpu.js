@@ -415,12 +415,18 @@ export async function compilePairTrack(cache, options) {
       transitionOffsets, epsilon, variance,
       { weightPrecision, matrix });
     // The caller must not have asked for a geometry this device cannot stage.
-    const bytes = stagedMatrixStorage({ ...split.geometry, ...matrix });
+    // (The vector split's GEMM stages a fixed 8 KiB, under WebGPU's floor.)
+    const bytes = split.geometry === null ? 0
+      : stagedMatrixStorage({ ...split.geometry, ...matrix });
     if (bytes > (options.maxComputeWorkgroupStorageSize ?? 49152)) {
       throw new RangeError(`a split transition stages ${bytes} B, over the limit`);
     }
     pipelines.transitionSplit = {
       tiles: split.tiles,
+      // ...and what its scratch is stored in, which the ALLOCATION must match:
+      // a buffer half the bytes of what a shader expects is not something
+      // WebGPU can catch.
+      storage: split.storage,
       chunkRows: transitionSplitChunkRows(pairs, channels, transitionFactor, {
         // 🔴 THE KNOB WAS PLUMBED IN AND NEVER READ. `pairTransitionChunkBytes`
         // is put into these options by pairformer-block-webgpu.js and by

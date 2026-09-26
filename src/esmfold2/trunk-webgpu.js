@@ -267,6 +267,7 @@ export class Esmfold2TrunkGpu {
         : allocateTransitionSplit(this.allocator, {
           rows: pairs, channels, factor: transitionFactor,
           chunkRows: pipelines.transitionSplit.chunkRows,
+          precision: pipelines.transitionSplit.storage,
           offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
           label: "esmfold2-trunk.transition",
         }, keep);

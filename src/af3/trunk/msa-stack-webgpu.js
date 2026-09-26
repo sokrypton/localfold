@@ -164,6 +164,7 @@ export class Af3MsaStackGpu {
         rows: n * n, channels: pairChannels,
         factor: sample.pairTransition.transition2.length / (pairChannels * pairChannels),
         chunkRows: pipelines.transitionSplit.chunkRows,
+        precision: pipelines.transitionSplit.storage,
         offsets: packTransitionWeights(sample.pairTransition).offsets,
         label: "af3-msa.transition",
       }, keep);

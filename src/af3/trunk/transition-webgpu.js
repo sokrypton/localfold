@@ -636,14 +636,157 @@ export class Af3TransitionGpu {
  * @param {object} offsets from packTransitionWeights
  * @param {{normalizedStorage?, wideStorage?, geometry?, weightPrecision?, matrix?}} [options]
  */
+/**
+ * A register-tiled VECTOR GEMM for the split transition's two projections, for
+ * a device with no subgroup matrices - which is every visitor's browser.
+ *
+ * 🔴 WITHOUT MATRIX UNITS THE SPLIT DID NOT EXIST AT ALL, and the fused kernel
+ * it replaces is the WIDTH-HOSTILE one: it holds the widened row in workgroup
+ * memory, so its row tile halves as the channels double. Measured on an A100
+ * under stock flags, OpenDDE's 384-channel pair transition was 291 ms of a
+ * 558 ms trunk pass at 68 tokens - ~3 TFLOPS on a kernel AF3's 128 channels
+ * runs at ~15 - because `splitTransitionConfig` answered "no matrix units, no
+ * split". The split's three-pass shape does not need matrix units; only its
+ * GEMM did.
+ *
+ * Same bindings and uniform as `createStagedMatrixShader`'s transition use -
+ * `[source, weights, MatmulParameters, output]`, dispatched `(columns / BN,
+ * rows / BM)` - so the encoder in pair-track-gpu.js is shared. A workgroup owns
+ * a 64 x 64 block on 256 lanes (WebGPU's guaranteed maximum), 4 x 4 each,
+ * strided by 16 so a warp's reads of the staged weight panel are consecutive;
+ * 8 KiB of workgroup memory, under the 16 KiB floor. f32 accumulation in k
+ * order. `sourceGate` applies the SwiGLU as the operand is staged, exactly
+ * where the matrix path applies it, so the hidden activation never exists.
+ */
+export const VECTOR_GEMM_BLOCK = Object.freeze({ rows: 64, columns: 64, inner: 16 });
+/**
+ * Where the VECTOR split starts to pay, which is not where the matrix one does.
+ * Measured on an A100 under stock flags, pair-transition GPU ms per trunk pass,
+ * fused against vector split:
+ *
+ *     channels  model          68 tokens        255 tokens
+ *          128  AlphaFold 3        -           91.3 -> 148.9  (loses)
+ *          256  protenix2      56.7 -> 46.8     597 -> 519
+ *          384  OpenDDE         291 -> 98            -
+ *          512  IntelliFold-2   639 -> 160     8395 -> 1601
+ *
+ * The matrix split's 128-channel threshold comes from the ampere prior and was
+ * measured on matrix units; without them the fused kernel still wins at 128.
+ */
+export const VECTOR_SPLIT_MIN_CHANNELS = 192;
+
+/**
+ * The workgroup storage the split's NORMALIZE kernel stages: `rows` whole rows
+ * of f32, plus its reduction scratch.
+ *
+ * 🔴 THE CHOOSER PRICED THE GEMM AND NOT THIS, AND AT 512 CHANNELS THIS IS THE
+ * ONE OVER THE FLOOR. Eight rows of IntelliFold-2's 512 channels is 16384 bytes
+ * before the scratch - 16736 in all, against the 16384 WebGPU guarantees - so a
+ * conforming minimum device refused the pipeline, matrix units or not. Fewer
+ * rows fit; eight stays wherever it already did, so those kernels are unchanged.
+ */
+export function splitNormalizeBytes(channels, rows = 8) {
+  return (rows * channels + 64 + 3 * rows) * 4;
+}
+function splitNormalizeRows(device, channels) {
+  const limit = device.limits.maxComputeWorkgroupStorageSize;
+  return [8, 4, 2].find((rows) => splitNormalizeBytes(channels, rows) <= limit);
+}
+function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecision,
+                                  residual = false, sourceGate = null }) {
+  const { rows: BM, columns: BN, inner: BK } = VECTOR_GEMM_BLOCK;
+  const half = [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
+  const load = sourceGate === null
+    ? "f32(source[row * parameters.inner + k])"
+    : `gated(row * ${sourceGate.stride}u + k)`;
+  const accumulators = [];
+  const multiply = [];
+  const stores = [];
+  for (let i = 0; i < 4; i += 1) {
+    for (let j = 0; j < 4; j += 1) {
+      accumulators.push(`  var acc_${i}_${j} = 0.0;`);
+      multiply.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
+      stores.push(`  {
+    let row = row_origin + ty + ${16 * i}u;
+    let column = column_origin + tx + ${16 * j}u;
+    if (row < parameters.rows) {
+      output[row * parameters.columns + column] ${residual
+        ? `+= acc_${i}_${j};` : `= ${outputPrecision}(acc_${i}_${j});`}
+    }
+  }`);
+    }
+  }
+  return `${half ? "enable f16;\n" : ""}struct MatmulParameters {
+  rows: u32, inner: u32, columns: u32, weight_offset: u32,
+  bias_offset: u32, activation: u32, padding: vec2<u32>,
+};
+@group(0) @binding(0) var<storage, read> source: array<${sourcePrecision}>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
+@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
+@group(0) @binding(3) var<storage, read_write> output: array<${outputPrecision}>;
+const BM: u32 = ${BM}u;
+const BN: u32 = ${BN}u;
+const BK: u32 = ${BK}u;
+var<workgroup> a_tile: array<f32, ${BM * BK}>;
+var<workgroup> b_tile: array<f32, ${BK * BN}>;
+${sourceGate === null ? "" : `fn swish(value: f32) -> f32 { return value / (1.0 + exp(-value)); }
+fn gated(at: u32) -> f32 {
+  return swish(f32(source[at])) * f32(source[at + ${sourceGate.offset}u]);
+}`}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+  let row_origin = group.y * BM;
+  let column_origin = group.x * BN;
+  let tx = li % 16u;
+  let ty = li / 16u;
+${accumulators.join("\n")}
+  for (var k0 = 0u; k0 < parameters.inner; k0 += BK) {
+    // The source panel, k-major so a row's four reads broadcast; a zero past
+    // the last row so the tail block computes nothing it stores.
+    for (var e = li; e < BM * BK; e += 256u) {
+      let m = e / BK;
+      let k = k0 + e % BK;
+      let row = row_origin + m;
+      var value = 0.0;
+      if (row < parameters.rows) { value = ${load}; }
+      a_tile[(e % BK) * BM + m] = value;
+    }
+    for (var e = li; e < BK * BN; e += 256u) {
+      let k = k0 + e / BN;
+      b_tile[e] = f32(weights[parameters.weight_offset + k * parameters.columns
+                              + column_origin + e % BN]);
+    }
+    workgroupBarrier();
+    for (var k = 0u; k < BK; k += 1u) {
+      let a_0 = a_tile[k * BM + ty];
+      let a_1 = a_tile[k * BM + ty + 16u];
+      let a_2 = a_tile[k * BM + ty + 32u];
+      let a_3 = a_tile[k * BM + ty + 48u];
+      let b_0 = b_tile[k * BN + tx];
+      let b_1 = b_tile[k * BN + tx + 16u];
+      let b_2 = b_tile[k * BN + tx + 32u];
+      let b_3 = b_tile[k * BN + tx + 48u];
+${multiply.join("\n")}
+    }
+    workgroupBarrier();
+  }
+${stores.join("\n")}
+}`;
+}
+
 export function createTransitionSplitShaders(shape, offsets, epsilon, variance, options = {}) {
   const { rows, channels, factor } = shape;
   const intermediate = channels * factor;
   const wide = intermediate * 2;
-  const normalizedStorage = options.normalizedStorage ?? "f16";
-  const wideStorage = options.wideStorage ?? "f16";
-  const weightPrecision = options.weightPrecision ?? "f32";
   const matrix = options.matrix ?? {};
+  // 🔴 THE VECTOR SPLIT STORES ITS TWO SCRATCH TENSORS IN WHAT THE DEVICE HAS.
+  // The matrix path always has f16, because matrix units imply it; a device
+  // without them may lack `shader-f16` too, and then both are f32.
+  const vector = matrix.vector === true;
+  const normalizedStorage = options.normalizedStorage ?? (vector ? matrix.storage : "f16");
+  const wideStorage = options.wideStorage ?? (vector ? matrix.storage : "f16");
+  const weightPrecision = options.weightPrecision ?? "f32";
   // 🔴 THE VEC4 STAGING NEEDS EVERY EXTENT IT FORMS AN OFFSET FROM DIVISIBLE BY
   // FOUR, AND THAT INCLUDES THE GATE'S. A vec4 read at element i returns
   // i & ~3 upward, so an odd stride shifts the value half against the gate.
@@ -654,7 +797,9 @@ export function createTransitionSplitShaders(shape, offsets, epsilon, variance, 
   // see a whole row, so this is the one part of the fused kernel that has to
   // come out whole. It is cheap: `tri.normalize` is 1.5% of an ESMFold2 trunk
   // at the same shape and this is the same kernel.
-  const NORMALIZE_ROWS = 8;
+  // 🔴 ROWS A WORKGROUP STAGES: eight unless the chooser priced that over the
+  // device's workgroup storage - see splitNormalizeBytes.
+  const NORMALIZE_ROWS = matrix.normalizeRows ?? 8;
   const LANES = 64;
   const LANES_PER_ROW = LANES / NORMALIZE_ROWS;
   const w = (expression) => (weightPrecision === "f16" ? `f32(${expression})` : expression);
@@ -778,6 +923,25 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
+  if (vector) {
+    if (channels % VECTOR_GEMM_BLOCK.columns !== 0 || channels % VECTOR_GEMM_BLOCK.inner !== 0) {
+      throw new RangeError(`the vector split transition wants channels divisible by `
+        + `${VECTOR_GEMM_BLOCK.columns}; got ${channels}`);
+    }
+    return {
+      normalize,
+      wide: createVectorGemmShader({ sourcePrecision: normalizedStorage, weightPrecision,
+                                     outputPrecision: wideStorage }),
+      down: createVectorGemmShader({ sourcePrecision: wideStorage, weightPrecision,
+                                     outputPrecision: "f32", residual: true,
+                                     sourceGate: { stride: wide, offset: intermediate } }),
+      shape: { rows, channels, intermediate, wide },
+      geometry: null,
+      storage: normalizedStorage,
+      tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: VECTOR_GEMM_BLOCK.rows,
+               blockColumns: VECTOR_GEMM_BLOCK.columns },
+    };
+  }
   const geometry = { ...SPLIT_TRANSITION_GEOMETRY, ...matrix };
   // The right operand is read out of the weight buffer without staging where
   // the geometry asks and the shape allows - see directWeightsAllowed. The two
@@ -802,6 +966,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }),
     shape: { rows, channels, intermediate, wide },
     geometry,
+    storage: normalizedStorage,
     tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: geometry.blockRows,
              blockColumns: geometry.blockColumns },
   };
@@ -953,7 +1118,18 @@ export function splitTransitionConfig(device, channels) {
     return false;
   }
   const config = deviceMatrixConfig(device, { element: "f16" });
-  if (config === null) return false;
+  // 🔴 NO MATRIX UNITS IS NOT NO SPLIT. It used to be, so every stock browser -
+  // none of which exposes subgroup matrices - ran the fused kernel at every
+  // width. The vector GEMM above takes the split's two projections instead,
+  // storing its scratch in f16 only where the device has `shader-f16`.
+  const normalizeRows = splitNormalizeRows(device, channels);
+  if (normalizeRows === undefined) return false;
+  const rows = normalizeRows === 8 ? {} : { normalizeRows };
+  if (config === null) {
+    if (channels < VECTOR_SPLIT_MIN_CHANNELS) return false;
+    if (channels % VECTOR_GEMM_BLOCK.columns !== 0) return false;
+    return { vector: true, storage: device.features.has("shader-f16") ? "f16" : "f32", ...rows };
+  }
   const answer = {
     result: tuning.stagedMatrixResult ?? config.resultComponentType,
     contractResult: config.resultComponentType,
@@ -973,5 +1149,5 @@ export function splitTransitionConfig(device, channels) {
   // for a caller that names a geometry by hand.
   const bytes = stagedMatrixStorage({ ...SPLIT_TRANSITION_GEOMETRY, ...answer });
   if (bytes > device.limits.maxComputeWorkgroupStorageSize) return false;
-  return answer;
+  return { ...answer, ...rows };
 }

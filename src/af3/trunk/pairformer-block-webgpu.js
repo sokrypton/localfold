@@ -583,6 +583,7 @@ export class Af3PairformerStackGpu {
           rows: n * n, channels: pairChannels,
           factor: blocks[0].pairTransition.transition2.length / (pairChannels * pairChannels),
           chunkRows: pipelines.transitionSplit.chunkRows,
+          precision: pipelines.transitionSplit.storage,
           offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
           label: "af3-block.transition",
         }, keep);

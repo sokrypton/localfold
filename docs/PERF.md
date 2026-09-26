@@ -504,6 +504,47 @@ the host; a tolerance still reads every pass. Byte-identical on all seven
 models; trunk reuse still hands its trunk to a retry. AF3 int5, stock flags,
 255 tokens: warm fold 4.00-4.12 -> **3.66-3.74 s**.
 
+## The split pair transition, for a device with no matrix units
+
+🔴 **NO MATRIX UNITS MEANT NO SPLIT, AND NO VISITOR HAS MATRIX UNITS.** The
+split transition (normalise, widen, contract-with-the-gate) was built only on
+the staged matrix GEMM, so `splitTransitionConfig` answered `false` wherever
+`deviceMatrixConfig` was null - every stock browser, NVIDIA and Apple alike -
+and the wide models ran the FUSED kernel, whose row tile halves as the channels
+double. OpenDDE's 384-channel transition was **291 ms of a 558 ms** trunk pass
+at 68 tokens, ~3 TFLOPS on the kernel AF3's 128 channels runs at ~15.
+
+`createVectorGemmShader` in transition-webgpu.js is a register-tiled vector
+GEMM for exactly the split's two projections: 64 x 64 blocks on 256 lanes, 4 x 4
+a lane, 8 KiB of workgroup memory, f32 accumulation, the SwiGLU applied as
+`down` stages its operand - the same bindings and uniform as the matrix GEMM, so
+the encoder is shared. Scratch is f16 where the device has `shader-f16` and f32
+where it does not. Pair-transition GPU ms per trunk pass, A100, stock flags:
+
+| channels | model | 68 tokens | 255 tokens |
+|---:|---|---:|---:|
+| 128 | AlphaFold 3 | - | 91.3 -> 148.9 (loses) |
+| 256 | protenix2 | 56.7 -> 46.8 | 597 -> 519 |
+| 384 | OpenDDE | 291 -> 98 | - |
+| 512 | IntelliFold-2 | 639 -> 160 | **8395 -> 1601** |
+
+So `VECTOR_SPLIT_MIN_CHANNELS` is 192: the four 128-channel models stay on the
+fused kernel and are byte-identical. IntelliFold-2's trunk pass at 255 tokens
+goes **12.9 s -> 6.7 s**. Accuracy is the fused kernel's: OpenDDE's trunk
+against af3-any-model on the f32 bundle reads `trunk_out_pair` **1.57e-6 fused
+and 1.59e-6 split**; IntelliFold-2's oracle is identical on both trees;
+test:template's 5CAJ figures match to three decimals; pLDDT moves in the
+seventh decimal (test:stock re-recorded for those three). With the developer
+flags nothing changes - the matrix split is untouched, byte for byte.
+
+🔴 **AND ITS NORMALISE WAS OVER THE 16 KiB FLOOR AT 512 CHANNELS, WHICH THE
+CHOOSER NEVER PRICED.** Eight staged rows of 512 f32 is 16736 bytes with the
+scratch. `splitNormalizeBytes` prices it now and stages four (or two) rows where
+eight do not fit; eight stays wherever it already fitted. 🔴 **AND AF2 FAILS THE
+FLOOR UNDER STOCK FLAGS ON THE OLD CODE TOO** - `block:opm:project-output-
+residual` stages 17424 bytes without f16 - which test:spec-floor cannot see,
+because it runs with the flags on. Not fixed here.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The
