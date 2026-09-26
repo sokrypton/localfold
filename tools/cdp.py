@@ -123,6 +123,12 @@ def chrome_flags():
     if not sys.platform.startswith("linux"):
         return ["--headless=new"]
     headless = ["--headless=new"] if os.environ.get("LOCALFOLD_HEADLESS") == "1" else []
+    # 🔴 LOCALFOLD_STOCK_FLAGS=1 DROPS THE TWO DEVELOPER FLAGS, as gpu-chrome.mjs
+    # does: a visitor's Chrome has neither, so a page timing with them is a
+    # configuration nobody runs.
+    if os.environ.get("LOCALFOLD_STOCK_FLAGS") == "1":
+        return headless + [f for f in LINUX_FLAGS if "vulkan_enable_f16" not in f] \
+            + ["--disable-gpu-sandbox"]
     return headless + LINUX_FLAGS + ["--enable-unsafe-webgpu", "--disable-gpu-sandbox"]
 
 

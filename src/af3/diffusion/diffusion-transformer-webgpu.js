@@ -2227,7 +2227,40 @@ export class Af3DiffusionTransformerGpu {
    * There is nothing to overlap it with at that point - the trunk is over.
    */
   async warm(tokens, weights) {
-    await this.#compile(tokens, weights);
+    const { weightPrecision, batchedGates } = await this.#compile(tokens, weights);
+    // 🔴 AND THE RESIDENT WEIGHTS, WHICH A FOLD'S WARM RUNS BESIDE THE TRUNK.
+    // The note above was written when this ran after it; a fold now calls warm
+    // as its trunk starts, and the trunk leaves the host idle, so the 24
+    // blocks' decode (and the zero gates') come off the first denoiser call -
+    // the same calls, into the same caches, that #runBlocks makes. A budget
+    // refusal here is left to the run, which knows how to restart.
+    if (!this.residentWeights || isStreamed(this.device, "difftx.block.resident")) return;
+    try {
+      const allBlocks = weights.superBlocks.flatMap((group) => group.blocks);
+      if (batchedGates) {
+        const onDevice = await residentPackedOnDevice(this.device, {
+          key: weights, label: "difftx.zerogate.resident", variant: weightPrecision,
+          order: allBlocks.flatMap((block) =>
+            ZERO_GATE_ORDER.map((name) => ({ name, weights: block }))),
+          weights: allBlocks[0],
+          destination: weightPrecision === "f16" ? "f16" : "f32",
+        });
+        if (onDevice === undefined) {
+          residentWeightBuffer(this.device, weights, "difftx.zerogate.resident",
+            () => packZeroGateWeights(allBlocks, weightPrecision), weightPrecision);
+        }
+      }
+      for (const block of allBlocks) {
+        const onDevice = await residentBlockOnDevice(this.device, block, weightPrecision);
+        if (onDevice === undefined) {
+          residentBlockBuffer(this.device, block, () => packBlockWeights(block, weightPrecision),
+            weightPrecision);
+        }
+        releaseWeights(block);
+      }
+    } catch (error) {
+      if (!(error instanceof GpuMemoryBudgetError)) throw error;
+    }
   }
 
   /**

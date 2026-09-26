@@ -796,6 +796,38 @@ the tower waits for each block.
 - **ESMFold2's SwiGLU at a smaller row tile** (it stays at 4): tile 2 is
   slower, 309 -> 331 ms of sampler at 59 residues, and tile 1 only equals 4.
 
+### A single cold run, which is what most visitors make
+
+`LOCALFOLD_STOCK_FLAGS=1` now reaches `tools/fold-in-page.py` too (tools/cdp.py
+drops the same two flags gpu-chrome.mjs does). The page, AF3 int5, 58
+residues, weights from the local server, dev report phases after the click:
+
+| phase | cold | warm equivalent |
+|---|---:|---:|
+| weights (loopback) | ~1000 ms | - |
+| Trunk 1/2 | 471 | 139 (pass 2) |
+| first denoiser call ("Folding") | 464 | ~19 |
+| step 1 / step 2 (page draws the first frames) | 185 / 84 | ~19 |
+| last step (confidence head) | 187 | - |
+
+Of the ~1.1 s that only a cold fold pays, the shader cache is worth ~340 ms (a
+`--keep-profile` second visit, weights phase subtracted). What was tried:
+- **The transformer's resident weights filled inside `warm`**, which a fold
+  calls as its trunk starts: taken, the first call 464 -> 210 ms, but trunk 1
+  grows 471 -> 705 because the fill competes with a cold trunk rather than
+  hiding behind it - net ~20 ms. Kept, because it is where the work belongs.
+- **The int5 upload by `mappedAtCreation`** (straight into the code buffer, or
+  into a MAP_WRITE staging buffer copied on the device): 24 blocks' fill is
+  185 ms of host time, 109 of it writeBuffer at 1.65 GB/s, and neither route
+  beat it - creating and unmapping fresh mapped memory costs what the call did.
+  Not taken; the section above on the weight upload already said so.
+- **What would move a cold run by seconds is the DOWNLOAD** - 265 MiB for AF3,
+  started only when Fold is pressed (and after the model-terms dialog) - and
+  both levers are decisions rather than kernels: start it on intent (a pasted
+  sequence), or re-shard so the trunk's tensors arrive first and the trunk
+  runs while the diffusion shards are still on the wire (today every shard but
+  the first two mixes trunk, sampler and confidence tensors).
+
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
 The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by
