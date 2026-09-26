@@ -571,6 +571,7 @@ function releaseStaging(device, held) {
 // Keyed by destination, because fills run concurrently (they await inside).
 const captures = new Map();
 export function captureBlockUpload(destination) {
+  if (captures.has(destination)) throw new Error(`two captures into ${destination.label} at once`);
   captures.set(destination, []);
   return () => {
     const recordings = captures.get(destination);
@@ -607,15 +608,20 @@ export function replayBlockUpload(device, recording, destination) {
 }
 
 
+// 🔴 THE WRAPPER IS CHECKED ON EVERY CALL, NOT INSTALLED ONCE. A tool that
+// wraps queue.submit and later restores its own original (probe-submits.js does
+// per repeat) takes this wrapper with it, and the replays then queue for ever:
+// every streamed buffer kept a previous key's bytes and a second store's fold
+// read pLDDT 5.3. So a replaced wrapper is put back.
 const pendingByQueue = new WeakMap();
 function pendingReplays(device) {
   const queue = device.queue;
-  let pending = pendingByQueue.get(queue);
-  if (pending !== undefined) return pending;
-  pending = [];
-  pendingByQueue.set(queue, pending);
+  let state = pendingByQueue.get(queue);
+  if (state === undefined) pendingByQueue.set(queue, state = { pending: [], wrapper: null });
+  if (queue.submit === state.wrapper) return state.pending;
+  const pending = state.pending;
   const submit = queue.submit.bind(queue);
-  queue.submit = (commandBuffers) => {
+  state.wrapper = queue.submit = (commandBuffers) => {
     if (pending.length === 0) return submit(commandBuffers);
     const encoder = device.createCommandEncoder({ label: "int5-replay" });
     const pass = encoder.beginComputePass({ label: "int5-replay" });

@@ -143,13 +143,14 @@ function freshRecordings() {
 }
 // One map of buffer -> recorded writes, read by the one wrapper a device gets.
 const currentCaptures = new Map();
-const wrappedQueues = new WeakSet();
+// Checked on every install and not once, for the reason pendingReplays gives
+// in src/weights/quantised-upload.js: a tool may restore the original.
+const wrappedQueues = new WeakMap();
 function installWriteCapture(device) {
   const queue = device.queue;
-  if (wrappedQueues.has(queue)) return;
-  wrappedQueues.add(queue);
+  if (queue.writeBuffer === wrappedQueues.get(queue)) return;
   const original = queue.writeBuffer.bind(queue);
-  queue.writeBuffer = (target, offset, data, dataOffset, size) => {
+  const wrapper = (target, offset, data, dataOffset, size) => {
     const writes = currentCaptures.get(target);
     if (writes !== undefined) {
       const view = ArrayBuffer.isView(data);
@@ -165,6 +166,8 @@ function installWriteCapture(device) {
       : size === undefined ? original(target, offset, data, dataOffset)
         : original(target, offset, data, dataOffset, size);
   };
+  wrappedQueues.set(queue, wrapper);
+  queue.writeBuffer = wrapper;
 }
 
 /**
@@ -250,6 +253,7 @@ export async function residentWeightBufferFilled(device, key, label, byteLength,
       return buffer;
     }
     const writes = [];
+    installWriteCapture(device);
     recordings.hostCaptures.set(buffer, writes);
     const stop = captureBlockUpload(buffer);
     let decodes;
