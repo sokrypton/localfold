@@ -528,7 +528,7 @@ async function encodeOuterProductMean(
   // note in outer-product-mean.js. Worth 6.8x on a block at 400 residues.
   const outerFirst = useOuterFirstContraction(
     descriptor, outerFirstLimitBytes(execution.device));
-  const outputPairs = opmProjectOutputPairs(execution.device);
+  const outputPairs = opmProjectOutputPairs(execution.device, input.cOuter);
   const contractPrecision = opmContractPrecision(execution.device);
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
     contractPipeline, projectOutputPipeline] = await Promise.all([

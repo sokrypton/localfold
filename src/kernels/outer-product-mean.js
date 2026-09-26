@@ -724,8 +724,21 @@ export function opmContractPrecision(device) {
   return halfPrecisionAvailable(device) ? "f16" : "f32";
 }
 
-export function opmProjectOutputPairs(device) {
-  return shapedKnob(deviceTuning(device).opmProjectOutputPairs) ?? OPM_PROJECT_OUTPUT_PAIRS;
+export function opmProjectOutputPairs(device, cOuter = 32) {
+  const wanted = shapedKnob(deviceTuning(device).opmProjectOutputPairs) ?? OPM_PROJECT_OUTPUT_PAIRS;
+  // 🔴 PRICED AGAINST THE DEVICE, because the ampere prior's 4 stages 17,424
+  // bytes at c_outer 32 and WebGPU guarantees 16,384: a conforming minimum
+  // device without matrix units could not create AF2's pipeline at all. The
+  // largest count at or below the wanted one that fits; where the wanted one
+  // fits - every device measured - nothing changes.
+  const limit = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+  const bytes = (pairs) => (cOuter * cOuter * pairs + 64 * pairs + pairs) * 4;
+  const fits = [8, 4, 2, 1].find((pairs) => pairs <= wanted && bytes(pairs) <= limit);
+  if (fits === undefined) {
+    throw new RangeError(`the OPM output projection does not fit ${limit} bytes of `
+      + `workgroup storage even at one pair (c_outer ${cOuter})`);
+  }
+  return fits;
 }
 
 /**
@@ -1166,9 +1179,9 @@ export class OuterProductMeanGpu {
       this.pipelines.get("opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
       this.pipelines.get(`opm:contract:${input.cOuter}:${contractPrecision}`,
         createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
-      this.pipelines.get(`opm:project-output:${input.cOuter}:${opmProjectOutputPairs(this.device)}`,
+      this.pipelines.get(`opm:project-output:${input.cOuter}:${opmProjectOutputPairs(this.device, input.cOuter)}`,
         createOuterProductMeanProjectOutputShader(
-          input.cOuter, false, opmProjectOutputPairs(this.device))),
+          input.cOuter, false, opmProjectOutputPairs(this.device, input.cOuter))),
     ]);
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
@@ -1248,7 +1261,7 @@ export class OuterProductMeanGpu {
           // the path check-evoformer-opm.js drives, so its grid has to agree
           // with the block encoders' or the gate would test a dispatch no fold
           // uses.
-          const outputGroups = Math.ceil(count / opmProjectOutputPairs(this.device));
+          const outputGroups = Math.ceil(count / opmProjectOutputPairs(this.device, input.cOuter));
           const projectOutputGrid = [
             Math.min(outputGroups, GRID_WIDTH), Math.ceil(outputGroups / GRID_WIDTH)];
           pass(projectOutputPipeline,

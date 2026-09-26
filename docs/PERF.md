@@ -653,7 +653,12 @@ scratch. `splitNormalizeBytes` prices it now and stages four (or two) rows where
 eight do not fit; eight stays wherever it already fitted. 🔴 **AND AF2 FAILS THE
 FLOOR UNDER STOCK FLAGS ON THE OLD CODE TOO** - `block:opm:project-output-
 residual` stages 17424 bytes without f16 - which test:spec-floor cannot see,
-because it runs with the flags on. Not fixed here.
+because it runs with the flags on. 🔴 **FIXED**: `opmProjectOutputPairs` takes
+the largest pair count at or below the prior's that fits the device's workgroup
+storage (2 at the floor, where the prior's 4 does not fit). Stock flags at the
+floor, the monomer went from "total use of workgroup storage (17424 bytes) is
+larger than the maximum allowed (16384 bytes)" to checksum -1308439 - the same
+as without the ceiling - and the multimer folds at -394634 both ways.
 
 🔴 **THE DIFFUSION HEAD'S FIRST STEP OF A FOLD READ ITS PAIR CONDITIONING BACK
 AND UPLOADED IT TWICE.** The encoder's and the transformer's per-fold caches
