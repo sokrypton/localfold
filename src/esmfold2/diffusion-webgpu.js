@@ -554,7 +554,13 @@ export class Esmfold2DenoiserGpu {
   }
 
   /** Encode and submit a list of passes right now, outside the recorded step. */
-  async #now(label, passes) {
+  // 🔴 `wait` IS FOR A CALLER THAT IS ABOUT TO RELEASE WHAT THESE READ. A row
+  // chunk of the pair conditioning and a chunk of one block's bias do not need
+  // the chunk before them to have FINISHED - the queue orders them - and
+  // waiting on each was ~105 drains a fold at 255 tokens (8 conditioning
+  // chunks, 12 blocks x 8 bias chunks), each around a sliver of work. The
+  // loops pass `false` and drain once, before the release that needs it.
+  async #now(label, passes, wait = true) {
     const encoder = this.device.createCommandEncoder({ label });
     for (const [name, pipeline, buffers, x, y] of passes) {
       const pass = encoder.beginComputePass({ label: name });
@@ -564,7 +570,7 @@ export class Esmfold2DenoiserGpu {
       pass.end();
     }
     this.device.queue.submit([encoder.finish()]);
-    await this.device.queue.onSubmittedWorkDone();
+    if (wait) await this.device.queue.onSubmittedWorkDone();
   }
 
   #record(label, pipeline, buffers, x, y = 1) {
@@ -1084,8 +1090,11 @@ export class Esmfold2DenoiserGpu {
         passes.push(["z-add", p.add, [outCond, scratchD],
                      ...elementwise(rows * pairChannels)]);
       }
-      await this.#now("esmfold2.diff.pair-conditioning", passes);
+      await this.#now("esmfold2.diff.pair-conditioning", passes, false);
     }
+    // One drain for the whole loop: the trunk's pair and the scratch are
+    // released next, and this allocator destroys on release.
+    await this.device.queue.onSubmittedWorkDone();
     // ...and the trunk's pair is finished with; see `releasePair`.
     releasePair?.();
     // 🔴 THE WIDENED SCRATCH GOES BACK BEFORE THE BIASES ARE ALLOCATED, NOT
@@ -1116,9 +1125,10 @@ export class Esmfold2DenoiserGpu {
           ["bias-project", p.bias,
            [scratchNorm, projection, slice(b.bias[index], start, rows, tokenHeads)],
            ...linearGrid(rows, tokenHeads)],
-        ]);
+        ], false);
       }
     }
+    await this.device.queue.onSubmittedWorkDone();
     scratchNorm.release();
     this.allocations.splice(this.allocations.indexOf(scratchNorm), 1);
 
