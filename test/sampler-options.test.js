@@ -99,13 +99,17 @@ test("AlphaFold 3's short schedule is its own and nobody else's", async (t) => {
     assert.equal(diffusionScheduleFor("af3", "diffusion", 25), undefined);
     assert.equal(diffusionScheduleFor("af3", "diffusion", 200), undefined);
     assert.equal(diffusionScheduleFor("af3", "flow", 16), undefined);
-    for (const family of ["boltz2", "protenix2", "openbind0", "intellifold2",
+    for (const family of ["boltz2", "protenix2", "openbind0",
                           "rosettafold3", "opendde"]) {
       assert.equal(diffusionScheduleFor(family, "diffusion", 20), undefined, family);
     }
     assert.equal(countsForFamily("boltz2"), AF3_COUNTS);
     assert.equal(countsForFamily("opendde"), OPENDDE_COUNTS);
     assert.equal(countsForFamily("af3"), ALPHAFOLD3_COUNTS);
+    // ...and IntelliFold-2, the second checkpoint it was measured on and won.
+    assert.deepEqual(diffusionScheduleFor("intellifold2", "diffusion", 20),
+                     { sigmaMax: ALPHAFOLD3_SHORT_SCHEDULE.sigmaMax });
+    assert.equal(countsForFamily("intellifold2"), ALPHAFOLD3_COUNTS);
   });
 
   // 🔴 ONE READING OF THE TABLE. The dial and the fold each chose a table by

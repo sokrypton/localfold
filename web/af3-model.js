@@ -215,9 +215,23 @@ export const OPENDDE_COUNTS = {
  * A lower start trades the fold for bonds - 40 is the best bond geometry here
  * and 0.08 A worse on 6MRR - because the high-noise calls place the chain.
  *
- * 🔴 AlphaFold 3 ONLY, because it is the only checkpoint this was measured on;
- * boltz2 already has a schedule of its own (rho 8) and the rest are unmeasured.
+ * 🔴 PER CHECKPOINT, BECAUSE IT DOES NOT TRANSFER. The same study against each
+ * family's own twenty-five (eight seeds of bonds, four of CA-RMSD):
+ *
+ *   intellifold2  1QYS 1.223 -> 1.027, 6MRR level; bad folds 14 -> 9, glycerol
+ *                 0.120 -> 0.052, SEP 0.202 -> 0.094.                 TAKEN
+ *   protenix2     6MRR 1.236 -> 0.846, 1QYS 0.936 -> 0.892; glycerol 0.097 ->
+ *                 0.118.                     held for a ligand sweep
+ *   openbind0     6MRR 1.706 -> 1.546, 1QYS 0.957 -> 0.876; glycerol 0.117 ->
+ *                 0.174.                     held for a ligand sweep
+ *   boltz2        level on folds, glycerol 0.032 -> 0.051. NOT TAKEN: its own
+ *                 schedule (rho 8) already puts its calls low.
+ *   rosettafold3  level on folds, glycerol 0.095 -> 0.409, and 1QYS seed 3 is NOT
+ *                 A CHAIN (a CA-CA of 8.29 A at pLDDT 80.15).         NOT TAKEN
+ *   opendde       its own sixteen already; twelve from 80 is level on RMSD and
+ *                 the bond bench cannot run it.                        NOT TAKEN
  */
+export const SHORT_SCHEDULE_FAMILIES = Object.freeze(["af3", "intellifold2"]);
 export const ALPHAFOLD3_COUNTS = Object.freeze({
   ...AF3_COUNTS,
   diffusion: { label: "Diffusion", values: [20, 25, 50, 100, 200], preferred: 20 },
@@ -228,7 +242,7 @@ export const ALPHAFOLD3_SHORT_SCHEDULE = Object.freeze({ below: 25, sigmaMax: 80
 /** The step dial for a family - one reading, for the dial and the fold alike. */
 export function countsForFamily(family) {
   return family === "opendde" ? OPENDDE_COUNTS
-    : family === "af3" ? ALPHAFOLD3_COUNTS : AF3_COUNTS;
+    : SHORT_SCHEDULE_FAMILIES.includes(family) ? ALPHAFOLD3_COUNTS : AF3_COUNTS;
 }
 
 /**
@@ -236,7 +250,7 @@ export function countsForFamily(family) {
  * See ALPHAFOLD3_COUNTS.
  */
 export function diffusionScheduleFor(family, mode, steps) {
-  if (family !== "af3" || mode !== "diffusion") return undefined;
+  if (!SHORT_SCHEDULE_FAMILIES.includes(family) || mode !== "diffusion") return undefined;
   if (!(steps < ALPHAFOLD3_SHORT_SCHEDULE.below)) return undefined;
   return { sigmaMax: ALPHAFOLD3_SHORT_SCHEDULE.sigmaMax };
 }
