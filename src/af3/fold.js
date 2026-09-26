@@ -25,7 +25,8 @@
  * see the loop below - and default to none, which is what the oracle dumps
  * were made with.
  */
-import { GRID_CHUNK_MIN_BYTES } from "./trunk/pair-track-gpu.js";
+/** A fold whose largest pair tensor is this size or more releases its weights. */
+const WEIGHT_RELEASE_MIN_BYTES = 64 * 1024 * 1024;
 import { ELEMENT_SYMBOLS } from "./featurise/ccd-component.js";
 import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
   from "./feature-convergence.js";
@@ -705,13 +706,16 @@ async function foldHolding(device, batch, weights, options, held) {
   // a fold peaks. At 255 residues it held OpenDDE's peak at 4432 MiB against
   // 2349 released (+2.7% on a warm fold) and AF3's at 1980 against 1358 (+9.5%).
   // Memory pressure grows with the fold and the upload does not, so a fold
-  // whose largest pair tensor is 128 MiB or more releases; a small fold keeps
+  // whose largest pair tensor is 64 MiB or more releases; a small fold keeps
   // them as its device prior says. `largeFoldReleasesWeights: false` opts out.
   const largestTokens = weights.trunk?.dialect?.structuralTokens === true
     ? Math.max(batch.tokens, structuralLayout(batch).tokens) : batch.tokens;
+  // 🔴 64 MiB, NOT THE CHUNKING'S 128: the trade differs. IntelliFold-2 at 255
+  // residues (127 MiB a pair tensor) was 4458 MiB held against 3343 released,
+  // for +3% on a warm fold (23.65 -> 24.37 s).
   const largeFold = deviceTuning(device).largeFoldReleasesWeights !== false
     && largestTokens * largestTokens * (weights.trunk?.embedder?.pairChannels ?? 128) * 4
-      >= GRID_CHUNK_MIN_BYTES;
+      >= WEIGHT_RELEASE_MIN_BYTES;
   const keepWeights = (knob) => !largeFold && (deviceTuning(device)[knob]
     ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) === true;
   const { tokens, dense } = batch;

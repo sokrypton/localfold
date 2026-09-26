@@ -264,7 +264,7 @@ export const DEFAULT_TUNING = Object.freeze({
   //
   // null is the shipped rule: give them back every fold.
   keepSamplerWeights: null,
-  // 🔴 A fold whose largest pair tensor is 128 MiB or more releases both sets of
+  // 🔴 A fold whose largest pair tensor is 64 MiB or more releases both sets of
   // weights whatever the two above say; null means it does, `false` opts out.
   // See foldHolding in src/af3/fold.js.
   largeFoldReleasesWeights: null,
