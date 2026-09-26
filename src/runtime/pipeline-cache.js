@@ -1,3 +1,4 @@
+import { deviceTuning } from "./device-profile.js";
 /**
  * What the pipeline cache was handed and threw away.
  *
@@ -58,6 +59,11 @@ export class ComputePipelineCache {
     this.device = device;
   }
 
+  /** Whether sources compile with opaque loop bounds; see withRuntimeLoopBounds. */
+  get runtimeLoopBounds() {
+    return deviceTuning(this.device).runtimeLoopBounds === true;
+  }
+
   get(key, code, entryPoint = "main") {
     const cached = this.#pipelines.get(key);
     if (cached !== undefined) {
@@ -93,7 +99,8 @@ export class ComputePipelineCache {
     // another but for such a line. On a fresh Colab T4 a pipeline is ~85 ms of
     // driver compile on a user's first fold. The collision check above still
     // compares what the caller passed.
-    const compiled = stripUnusedConstants(code);
+    const stripped = stripUnusedConstants(code);
+    const compiled = this.runtimeLoopBounds ? withRuntimeLoopBounds(stripped) : stripped;
     const content = `${entryPoint}\u0000${compiled}`;
     const shared = this.#byContent.get(content);
     if (shared !== undefined) {
@@ -150,6 +157,26 @@ export class ComputePipelineCache {
  * touched, and a name mentioned anywhere - a comment included - is kept, so the
  * rule errs towards keeping a line. Exported for its test.
  */
+/**
+ * 🔴 CONSTANT-BOUND LOOPS, GIVEN A BOUND THE DRIVER CANNOT FOLD. A loop like
+ * `for (var c = 0u; c < C; c += 1u)` over a `const C` is unrolled by NVIDIA's
+ * compiler, and a kernel with a dozen of them - the atom encoder's `output` -
+ * took 800-1029 ms to compile on a Colab T4 against 66-93 ms with the bound
+ * made opaque. This adds `arrayLength(&<first runtime-sized storage array>)
+ * >> 31u` to each such bound: zero for any buffer under 8 GiB, uniform, and not
+ * known when the shader is compiled. The arithmetic is untouched. Opt-in per
+ * device (`runtimeLoopBounds`), because an unrolled hot loop can also be the
+ * faster one at run time. Exported for its test.
+ */
+export function withRuntimeLoopBounds(code) {
+  if (typeof code !== "string") return code;
+  const binding = /var<storage,\s*[a-z_]+>\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*array<[^,>]+>\s*;/.exec(code);
+  if (binding === null) return code;
+  const zero = `(arrayLength(&${binding[1]}) >> 31u)`;
+  return code.replace(/for \(var (\w+) = 0u; \1 < ([A-Z][A-Z0-9_]*); \1 \+= 1u\)/g,
+    (_, name, bound) => `for (var ${name} = 0u; ${name} < ${bound} + ${zero}; ${name} += 1u)`);
+}
+
 export function stripUnusedConstants(code) {
   if (typeof code !== "string" || !code.includes("const ")) return code;
   let lines = code.split("\n");

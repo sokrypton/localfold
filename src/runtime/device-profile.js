@@ -389,6 +389,7 @@ export const DEFAULT_TUNING = Object.freeze({
   gridAttendMatrix: null,
   esmfold2TokenRowTile: null,
   esmcRowTile: null,
+  runtimeLoopBounds: null,
   // Its geometry, "subgroupsXkeys"; null takes GRID_ATTEND_MATRIX_DEFAULT_TILE.
   gridAttendMatrixTile: null,
   // 🔴 THE PAIR TRANSITION AS THREE PASSES INSTEAD OF ONE, ON THE MATRIX UNITS.
