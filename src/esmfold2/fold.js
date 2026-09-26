@@ -786,7 +786,7 @@ export async function foldEsmfold2(device, options) {
       device.queue.submit([encoder.finish()]);
       return copy;
     };
-    const confidencePairOnDevice = deviceConfidence
+    let confidencePairOnDevice = deviceConfidence
       ? deviceCopy("esmfold2.confidence-pair", pair) : undefined;
     const confidencePair = options.confidenceWeights == null || deviceConfidence ? undefined
       : await (async () => {
@@ -861,8 +861,15 @@ export async function foldEsmfold2(device, options) {
     // call writes the pair conditioning straight into this buffer, and the
     // table that would let it be rebuilt is released three lines down.
     // Measured absent: 13.8 pLDDT and a PAE 2.4x rougher. See docs/EF2FAST.md.
-    const confidenceRelPosOnDevice = deviceConfidence
+    let confidenceRelPosOnDevice = deviceConfidence
       ? deviceCopy("esmfold2.confidence-relpos", relPos) : undefined;
+    // Once, from whichever comes first: the head after its pair init, or here.
+    const releaseConfidenceCopies = () => {
+      confidencePairOnDevice?.release();
+      confidenceRelPosOnDevice?.release();
+      confidencePairOnDevice = undefined;
+      confidenceRelPosOnDevice = undefined;
+    };
     const confidenceRelPos = options.confidenceWeights == null || deviceConfidence ? undefined
       : await (async () => {
         const back = allocator.allocate("esmfold2.confidence-relpos",
@@ -1017,6 +1024,7 @@ export async function foldEsmfold2(device, options) {
         atomMask: features.mask,
         tokenMask: new Float32Array(tokens).fill(1),
         pairBias: confidenceRelPos, pairBiasBuffer: confidenceRelPosOnDevice?.buffer,
+        releaseInputs: releaseConfidenceCopies,
         // 🔴 WITHOUT THIS EVERY COMPLEX REPORTS ipTM 0.000. ipTM is the same
         // expectation as pTM taken over the pairs whose `asymId` DIFFER, and
         // the reference defaulted a missing one to `new Int32Array(tokens)` -
@@ -1027,8 +1035,7 @@ export async function foldEsmfold2(device, options) {
         // every fold this head was gated on.
         asymId: features.asymId,
       }, options.confidenceWeights, { allocator });
-      confidencePairOnDevice?.release();
-      confidenceRelPosOnDevice?.release();
+      releaseConfidenceCopies();
       // 🔴 THE HEAD'S OWN INPUTS, FOR THE ARM THAT RUNS SYNTHYRA'S MODULE ON A
       // REAL TRUNK. `dump_esmfold2_confidence.py` gates the head's ARITHMETIC
       // on seeded normals - its own header says a run on a real trunk's pair is

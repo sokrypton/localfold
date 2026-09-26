@@ -557,6 +557,12 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
     tokens, pair: input.pair, pairBuffer: input.pairBuffer,
     normed, repCoordinates, pairBias: input.pairBias, pairBiasBuffer: input.pairBiasBuffer,
   }, weights, { allocator, keepOnDevice: true });
+  // 🔴 THE HEAD'S TWO PAIR-SIZED INPUTS ARE DEAD ONCE THE PAIR INIT HAS BEEN
+  // SUBMITTED: the blocks run on its output. Handing them back here rather than
+  // after the head takes 2 x tokens^2 x 256 floats off the fold's peak, which is
+  // this head's block stack - 492 MiB at 502 tokens. Submitted work keeps what
+  // it binds.
+  input.releaseInputs?.();
 
   // 🔴 PAIR INIT -> BLOCKS -> READOUTS ON THE DEVICE. Each stage handed the
   // next a host array: the initial pair read back, copied and uploaded to the
