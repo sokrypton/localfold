@@ -692,9 +692,24 @@ function splitNormalizeRows(device, channels) {
   const limit = device.limits.maxComputeWorkgroupStorageSize;
   return [8, 4, 2].find((rows) => splitNormalizeBytes(channels, rows) <= limit);
 }
+/**
+ * The widening pass's block: twice as many columns, because its output is
+ * eight times the channel width and a wider block reuses each staged source
+ * row across more of it. Swept on an A100 under stock flags (IntelliFold-2, 255
+ * tokens, pair-transition ms per trunk pass): `wide` 969 at 64 x 64 -> 859 at
+ * 64 x 128, while `down` - `channels` columns, so fewer workgroups to begin
+ * with - goes 598 -> 672 and keeps 64 x 64. Taller blocks and a 32-deep inner
+ * step were slower for both. Which lane owns which output changes; the order
+ * each output sums over k does not, so the answer is bit-identical.
+ */
+export const VECTOR_GEMM_WIDE_BLOCK = Object.freeze({ rows: 64, columns: 128, inner: 16 });
 function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecision,
-                                  residual = false, sourceGate = null }) {
-  const { rows: BM, columns: BN, inner: BK } = VECTOR_GEMM_BLOCK;
+                                  residual = false, sourceGate = null,
+                                  block = VECTOR_GEMM_BLOCK }) {
+  const { rows: BM, columns: BN, inner: BK } = block;
+  // A 16 x 16 lane grid; each lane owns TM rows and TN columns, strided by 16.
+  const TM = BM / 16;
+  const TN = BN / 16;
   const half = [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
   const load = sourceGate === null
     ? "f32(source[row * parameters.inner + k])"
@@ -702,8 +717,11 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
   const accumulators = [];
   const multiply = [];
   const stores = [];
-  for (let i = 0; i < 4; i += 1) {
-    for (let j = 0; j < 4; j += 1) {
+  const reads = [];
+  for (let i = 0; i < TM; i += 1) reads.push(`      let a_${i} = a_tile[k * BM + ty + ${16 * i}u];`);
+  for (let j = 0; j < TN; j += 1) reads.push(`      let b_${j} = b_tile[k * BN + tx + ${16 * j}u];`);
+  for (let i = 0; i < TM; i += 1) {
+    for (let j = 0; j < TN; j += 1) {
       accumulators.push(`  var acc_${i}_${j} = 0.0;`);
       multiply.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
       stores.push(`  {
@@ -742,8 +760,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let ty = li / 16u;
 ${accumulators.join("\n")}
   for (var k0 = 0u; k0 < parameters.inner; k0 += BK) {
-    // The source panel, k-major so a row's four reads broadcast; a zero past
-    // the last row so the tail block computes nothing it stores.
+    // The source panel, k-major so a row's reads broadcast; a zero past the
+    // last row so the tail block computes nothing it stores.
     for (var e = li; e < BM * BK; e += 256u) {
       let m = e / BK;
       let k = k0 + e % BK;
@@ -759,14 +777,7 @@ ${accumulators.join("\n")}
     }
     workgroupBarrier();
     for (var k = 0u; k < BK; k += 1u) {
-      let a_0 = a_tile[k * BM + ty];
-      let a_1 = a_tile[k * BM + ty + 16u];
-      let a_2 = a_tile[k * BM + ty + 32u];
-      let a_3 = a_tile[k * BM + ty + 48u];
-      let b_0 = b_tile[k * BN + tx];
-      let b_1 = b_tile[k * BN + tx + 16u];
-      let b_2 = b_tile[k * BN + tx + 32u];
-      let b_3 = b_tile[k * BN + tx + 48u];
+${reads.join("\n")}
 ${multiply.join("\n")}
     }
     workgroupBarrier();
@@ -931,7 +942,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     return {
       normalize,
       wide: createVectorGemmShader({ sourcePrecision: normalizedStorage, weightPrecision,
-                                     outputPrecision: wideStorage }),
+                                     outputPrecision: wideStorage,
+                                     block: VECTOR_GEMM_WIDE_BLOCK }),
       down: createVectorGemmShader({ sourcePrecision: wideStorage, weightPrecision,
                                      outputPrecision: "f32", residual: true,
                                      sourceGate: { stride: wide, offset: intermediate } }),
@@ -939,7 +951,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       geometry: null,
       storage: normalizedStorage,
       tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: VECTOR_GEMM_BLOCK.rows,
-               blockColumns: VECTOR_GEMM_BLOCK.columns },
+               blockColumns: VECTOR_GEMM_BLOCK.columns,
+               wideColumns: VECTOR_GEMM_WIDE_BLOCK.columns },
     };
   }
   const geometry = { ...SPLIT_TRANSITION_GEOMETRY, ...matrix };

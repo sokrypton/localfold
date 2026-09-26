@@ -829,7 +829,9 @@ export function encodePairTrack(context) {
           perNormalize[0], perNormalize[1]);
       run("pair-transition.wide", p("wide"),
           [scratchSplit.normalized, weights.transition, parameters.wide, scratchSplit.wide],
-          Math.ceil(split.intermediate * 2 / split.tiles.blockColumns),
+          // The widening pass may block wider than the contraction; see
+          // VECTOR_GEMM_WIDE_BLOCK. The matrix split states one width.
+          Math.ceil(split.intermediate * 2 / (split.tiles.wideColumns ?? split.tiles.blockColumns)),
           Math.ceil(count / split.tiles.blockRows));
       // ...residual, straight into the pair, which is what the fused kernel does.
       run("pair-transition.down", p("down"),
