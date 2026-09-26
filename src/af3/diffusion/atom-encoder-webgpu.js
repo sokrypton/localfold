@@ -1660,15 +1660,12 @@ export class Af3AtomEncoderGpu {
       compiling.push(this.pipelines.get(`${base}:${name}`, source)
         .then((pipeline) => { compiled[name] = pipeline; }));
     }
-    // 🔴 ONE attend PIPELINE PER BLOCK. All three blocks' head biases live in
-    // one buffer, and the block index selects a slice - baked in, because the
-    // pipeline cache takes no override constants.
-    compiled.attend = [];
-    for (let index = 0; index < weights.blocks.length; index += 1) {
-      const at = index;
-      compiling.push(this.pipelines.get(`${base}:attend:${at}`, sources.attendFor(at))
-        .then((pipeline) => { compiled.attend[at] = pipeline; }));
-    }
+    // 🔴 ONE attend PIPELINE FOR EVERY BLOCK. All three blocks' head biases
+    // live in one buffer; each block BINDS its slice at an offset rather than
+    // baking its index into a pipeline of its own, because on a fresh Colab T4
+    // every pipeline is ~85 ms of driver compile on a user's first fold.
+    compiling.push(this.pipelines.get(`${base}:attend`, sources.attendFor(0))
+      .then((pipeline) => { compiled.attend = pipeline; }));
     await Promise.all(compiling);
 
     const storage = GPUBufferUsage.STORAGE;
@@ -2005,7 +2002,9 @@ export class Af3AtomEncoderGpu {
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
-          entries: buffers.map((a, binding) => ({ binding, resource: { buffer: a.buffer } })),
+          entries: buffers.map((a, binding) => ({ binding, resource: a.byteSize === undefined
+            ? { buffer: a.buffer }
+            : { buffer: a.buffer, offset: a.byteOffset, size: a.byteSize } })),
         }));
         pass.dispatchWorkgroups(x, y);
         pass.end();
@@ -2093,10 +2092,16 @@ export class Af3AtomEncoderGpu {
           const kqRows = spread(queryRows + keyRows);
           run(`kq-norm-${index}`, compiled.kqNorm, [q, k, w], kqRows[0], kqRows[1]);
         }
-        // The per-block slice of the logits.
+        // The per-block slice of the logits, bound at its offset.
         const slots = spread(queryRows * heads);
-        run(`attend-${index}`, compiled.attend[index],
-            [q, k, v, logits, queriesMask, keysMask, gathered], slots[0], slots[1]);
+        const sliceBytes = subsets * heads * queries * keys * 4;
+        if (sliceBytes % this.device.limits.minStorageBufferOffsetAlignment !== 0) {
+          throw new Error(`atom pair-logit slice of ${sliceBytes} B is not bindable at an offset`);
+        }
+        run(`attend-${index}`, compiled.attend,
+            [q, k, v, { buffer: logits.buffer, byteOffset: (logits.byteOffset ?? 0) + index * sliceBytes,
+                        byteSize: sliceBytes },
+             queriesMask, keysMask, gathered], slots[0], slots[1]);
         run(`output-${index}`, compiled.output,
             [gathered, gate, queriesCond, w, act], perOutput[0], perOutput[1]);
       }

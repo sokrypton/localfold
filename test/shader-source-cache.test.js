@@ -58,3 +58,20 @@ test("a set is built once and verified as a whole", () => {
     setShaderSourceVerification(before);
   }
 });
+
+test("the pipeline cache compiles a shader without the constants it never reads", async () => {
+  const { stripUnusedConstants } = await import("../src/runtime/pipeline-cache.js");
+  const source = [
+    "const TOKENS: u32 = 68u;",
+    "const WIDE: u32 = TOKENS * 2u;",
+    "const USED: u32 = 3u;",
+    "const NOTED: u32 = 5u; // a trailing comment keeps the line",
+    "@compute @workgroup_size(64) fn main() { let x = USED; }",
+  ].join("\n");
+  const stripped = stripUnusedConstants(source);
+  // TOKENS is read only by WIDE, which is read by nothing: both go.
+  assert.ok(!stripped.includes("TOKENS") && !stripped.includes("WIDE"));
+  assert.ok(stripped.includes("const USED") && stripped.includes("NOTED"));
+  // Two kernels differing only in an unused constant become one text.
+  assert.equal(stripUnusedConstants(source.replace("68u", "70u")), stripped);
+});

@@ -86,7 +86,15 @@ export class ComputePipelineCache {
       }
       return cached.pipeline;
     }
-    const content = `${entryPoint}\u0000${code}`;
+    // 🔴 COMPILED WITHOUT ITS UNUSED CONSTANTS, SO TWO KERNELS THAT DIFFER
+    // ONLY IN ONE THEY DO NOT READ ARE ONE PIPELINE. Most factories emit a
+    // shared preamble - token count, widths, weight offsets - and a kernel
+    // reads a few of them; 27 of an AF3 fold's 151 pipelines were copies of
+    // another but for such a line. On a fresh Colab T4 a pipeline is ~85 ms of
+    // driver compile on a user's first fold. The collision check above still
+    // compares what the caller passed.
+    const compiled = stripUnusedConstants(code);
+    const content = `${entryPoint}\u0000${compiled}`;
     const shared = this.#byContent.get(content);
     if (shared !== undefined) {
       pipelineCacheStats.shared += 1;
@@ -121,7 +129,7 @@ export class ComputePipelineCache {
         label: key,
         layout: "auto",
         compute: {
-          module: this.device.createShaderModule({ label: `${key}.wgsl`, code }),
+          module: this.device.createShaderModule({ label: `${key}.wgsl`, code: compiled }),
           entryPoint,
         },
       });
@@ -132,6 +140,30 @@ export class ComputePipelineCache {
 
   get size() {
     return this.#pipelines.size;
+  }
+}
+
+/**
+ * WGSL with every `const NAME ... = ...;` line whose name appears nowhere else
+ * removed, repeated until none is left (a constant read only by another unused
+ * one goes in the second round). Only whole single-line declarations are
+ * touched, and a name mentioned anywhere - a comment included - is kept, so the
+ * rule errs towards keeping a line. Exported for its test.
+ */
+export function stripUnusedConstants(code) {
+  if (typeof code !== "string" || !code.includes("const ")) return code;
+  let lines = code.split("\n");
+  for (;;) {
+    const counts = new Map();
+    for (const name of lines.join("\n").match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) ?? []) {
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    const kept = lines.filter((line) => {
+      const match = /^\s*const\s+([A-Za-z_][A-Za-z0-9_]*)\s*(:[^=;]*)?=[^;]*;\s*$/.exec(line);
+      return match === null || counts.get(match[1]) !== 1;
+    });
+    if (kept.length === lines.length) return kept.join("\n");
+    lines = kept;
   }
 }
 

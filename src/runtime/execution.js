@@ -69,16 +69,23 @@ const MAX_WORKGROUPS_PER_DIMENSION = 65_535;
  * measured question - see docs/AF2.md on the 28-label tie, where windowing the
  * add alone moved the ceiling by zero.
  */
-export function createAddShader(elements) {
+// 🔴 THE COUNT IS THE BINDINGS', NOT A CONSTANT, SO EVERY SIZE IS ONE
+// PIPELINE. Baked, an AF3 fold compiled five of these (pair, single, MSA,
+// template pair, conditioning) - and on a fresh Colab T4 every pipeline is ~85
+// ms of driver compile on a user's first fold. The pipeline cache indexes by
+// source, so identical text is one compile whatever key a caller asks under.
+// Every caller binds either a whole tensor that owns its buffer or a slice at
+// an offset with its size, so the shorter binding is exactly the tensor; the
+// `elements` argument stays for the callers' keys.
+export function createAddShader(_elements) {
   return `
-const ELEMENTS: u32 = ${elements}u;
 const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 @group(0) @binding(0) var<storage, read_write> accumulator: array<f32>;
 @group(0) @binding(1) var<storage, read> delta: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= ELEMENTS) { return; }
+  if (index >= min(arrayLength(&accumulator), arrayLength(&delta))) { return; }
   accumulator[index] = accumulator[index] + delta[index];
 }`;
 }
