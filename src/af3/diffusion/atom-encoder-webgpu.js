@@ -1747,6 +1747,7 @@ export class Af3AtomEncoderGpu {
       uploaded.add(label);
       return { buffer };
     };
+    const onDevice = (value) => typeof GPUBuffer !== "undefined" && value?.buffer instanceof GPUBuffer;
     const ints = (source) => Int32Array.from(source, (v) => Number(v));
     const floats = (source) => Float32Array.from(source, (v) => Number(v));
 
@@ -1774,9 +1775,14 @@ export class Af3AtomEncoderGpu {
       const trunkSingleCond = input.trunkSingleCond === null
         ? zeros("atom.trunk-single", tokens * weights.trunkSingleChannels * 4)
         : persistentUpload("atom.trunk-single", () => input.trunkSingleCond);
+      // ...and a pair conditioning the head kept ON THE DEVICE is bound as it
+      // is: its contents are the fold's, and a new fold drops this cache.
+      // 🔴 `instanceof GPUBuffer`, NOT `.buffer !== undefined`: a Float32Array
+      // HAS a `.buffer` - its ArrayBuffer - and OpenDDE hands a host array here.
       const trunkPairCond = input.trunkPairCond === null
         ? zeros("atom.trunk-pair", tokens * tokens * weights.trunkPairChannels * 4)
-        : persistentUpload("atom.trunk-pair", () => input.trunkPairCond);
+        : onDevice(input.trunkPairCond) ? { buffer: input.trunkPairCond.buffer }
+          : persistentUpload("atom.trunk-pair", () => input.trunkPairCond);
       // 🔴 THE ONE INPUT THAT MOVES. Everything else this encoder reads is the
       // molecule or the trunk; the noisy coordinates are the step.
       const positions = up("atom.positions", input.tokenAtomsAct);

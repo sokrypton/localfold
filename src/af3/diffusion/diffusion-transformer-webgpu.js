@@ -2649,8 +2649,12 @@ export class Af3DiffusionTransformerGpu {
         };
       }
       const normalized = { buffer: this.#pairNorm.buffer };
-      const pairBuffer = buildPairNorm
-        ? keep(this.allocator.upload("difftx.pair", pairCond, storage)) : undefined;
+      // A pair conditioning already on the device is bound, not uploaded.
+      // (`instanceof`, because a Float32Array has a `.buffer` too.)
+      const pairBuffer = !buildPairNorm ? undefined
+        : typeof GPUBuffer !== "undefined" && pairCond?.buffer instanceof GPUBuffer
+          ? { buffer: pairCond.buffer }
+          : keep(this.allocator.upload("difftx.pair", pairCond, storage));
       const pairScale = buildPairNorm
         ? keep(this.allocator.upload("difftx.pair-scale",
                                      weights.pairInputLayerNormScale, storage))

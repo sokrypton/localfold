@@ -248,6 +248,14 @@ export class Af3DiffusionHeadGpu {
   /** The last trunk's pair conditioning, which no noise level changes. */
   #conditioningPair;
 
+  /**
+   * ...and the device buffer it lives in, when this head computed it. The
+   * first call of a fold used to read it back so the caches below could key on
+   * a host array; they key on this buffer's handle now, and it is never read
+   * back. Replaced by the next fold's first call, destroyed in dispose().
+   */
+  #pairConditioningBuffer;
+
   /** ...and the atom encoder's outputs that depend on it rather than on sigma. */
   #encoderStatic;
 
@@ -325,6 +333,7 @@ export class Af3DiffusionHeadGpu {
     // an out-of-memory that is an accounting error. It also inflates
     // `peakBytes`, which is the figure anyone tuning memory reads.
     this.#releasePersistent();
+    this.#releasePairConditioning();
     this.#encoderStatic = undefined;
     this.#conditioningPair = undefined;
     this.#transformer?.dispose();
@@ -359,6 +368,14 @@ export class Af3DiffusionHeadGpu {
    * runs at the end of a fold and the cache invalidation runs when a new trunk
    * arrives mid-page; both destroyed the same buffers and neither noted it.
    */
+  #releasePairConditioning() {
+    const buffer = this.#pairConditioningBuffer;
+    if (buffer === undefined) return;
+    noteDestroy(this.device, buffer.size, "head.pair-cond");
+    buffer.destroy();
+    this.#pairConditioningBuffer = undefined;
+  }
+
   #releasePersistent() {
     for (const set of [this.#encoderBuffers, this.#decoderBuffers]) {
       for (const buffer of Object.values(set)) {
@@ -670,6 +687,19 @@ export class Af3DiffusionHeadGpu {
     const conditioner = chained
       ? (this.#conditioner ??= new Af3DiffusionConditioningGpu(this.device, { pool: true }))
       : new Af3DiffusionConditioningGpu(this.device);
+    // The pair conditioning's home on the device, on a fold's first call -
+    // unless the caller supplied its own (OpenDDE), which stays a host array.
+    let pairOutput;
+    if (cachedPair === undefined && input.pairConditioning === undefined) {
+      const bytes = tokens * tokens * weights.conditioning.pairChannels * 4;
+      this.#releasePairConditioning();
+      noteAllocation(this.device, "head.pair-cond", bytes);
+      this.#pairConditioningBuffer = this.device.createBuffer({
+        label: "head.pair-cond", size: bytes,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+      pairOutput = this.#pairConditioningBuffer;
+    }
     const cond = await stage("conditioning", () =>
       conditioner.run({
         tokens, trunkSingle: input.trunkSingle, trunkPair: input.trunkPair,
@@ -677,6 +707,7 @@ export class Af3DiffusionHeadGpu {
         features: input.features, dialect: input.dialect,
       }, weights.conditioning, {
         reusePair: cachedPair,
+        ...(pairOutput !== undefined ? { outputs: { pair: pairOutput } } : {}),
         ...(chained ? { outputs: { single: chain.condSingle }, validation: deferred } : {}),
       }));
     if (cachedPair === undefined) {

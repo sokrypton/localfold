@@ -545,6 +545,20 @@ FLOOR UNDER STOCK FLAGS ON THE OLD CODE TOO** - `block:opm:project-output-
 residual` stages 17424 bytes without f16 - which test:spec-floor cannot see,
 because it runs with the flags on. Not fixed here.
 
+🔴 **THE DIFFUSION HEAD'S FIRST STEP OF A FOLD READ ITS PAIR CONDITIONING BACK
+AND UPLOADED IT TWICE.** The encoder's and the transformer's per-fold caches
+were keyed on the host ARRAY the conditioning returned, so the first call
+drained the device to copy `tokens^2 x 128` floats back (32 MiB at 255 tokens),
+then the transformer uploaded it for its pair norm and the encoder for its
+static build. The conditioning takes `outputs.pair` now and the head keeps that
+buffer for the fold; both caches key on its handle and bind it. Same values,
+so bit-identical on all seven models. First step at 255 tokens, AF3, stock
+flags: conditioning 77.9 -> ~47.5 ms, atom-encoder 85.3 -> ~69.6, transformer
+62.3 -> 34-48 - about 75 ms a fold. 🔴 **AND `x.buffer !== undefined` IS NOT
+"x IS ON THE DEVICE"**: a Float32Array has a `.buffer` too, and OpenDDE hands
+the head a host array, so the first version bound an ArrayBuffer and died. The
+test is `instanceof GPUBuffer`.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The

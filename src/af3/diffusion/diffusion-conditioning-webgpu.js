@@ -850,8 +850,15 @@ export class Af3DiffusionConditioningGpu {
       const noise = up("cond.noise", embedded);
       const noiseWeights = resident("cond.noise-weights", () => noisePacked.data);
 
-      const pair = onlyIfNew(() => keep(this.allocator.allocate("cond.pair",
-        pairs * pairChannels * 4, storage | GPUBufferUsage.COPY_SRC)));
+      // 🔴 AND THE PAIR, WHEN THE CALLER OFFERS A BUFFER FOR IT. The first call
+      // of a fold computes the pair conditioning and read it back so the head
+      // could key its caches on the host array - 32 MiB at 255 tokens, a drain,
+      // and then the transformer and the encoder uploaded it straight back. The
+      // head now keeps it on the device and keys on the buffer instead.
+      const outPair = reusePair === undefined ? options.outputs?.pair : undefined;
+      const pair = onlyIfNew(() => (outPair !== undefined ? { buffer: outPair }
+        : keep(this.allocator.allocate("cond.pair",
+          pairs * pairChannels * 4, storage | GPUBufferUsage.COPY_SRC))));
       // 🔴 THE CALLER'S BUFFER WHEN IT OFFERS ONE, AND NO READBACK THEN. The
       // single track is the only thing here that moves with the noise level,
       // and the diffusion head's next two stages both read it - so a sampler
@@ -867,8 +874,9 @@ export class Af3DiffusionConditioningGpu {
         pairs * pairChannels * 4, storage)));
       const singleScratch = keep(this.allocator.allocate("cond.single-scratch",
         tokens * seqChannels * 4, storage));
-      const readPair = onlyIfNew(() => keep(this.allocator.allocate("cond.rb-pair",
-        pairs * pairChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
+      const readPair = outPair !== undefined ? undefined
+        : onlyIfNew(() => keep(this.allocator.allocate("cond.rb-pair",
+          pairs * pairChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
       const readSingle = outSingle !== undefined ? undefined
         : keep(this.allocator.allocate("cond.rb-single", tokens * seqChannels * 4,
             GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
@@ -946,7 +954,7 @@ export class Af3DiffusionConditioningGpu {
         run(`single-add-${index}`, compiled.addSingle, [single, singleScratch],
             singleAdd[0], singleAdd[1]);
       }
-      if (reusePair === undefined) {
+      if (reusePair === undefined && readPair !== undefined) {
         encoder.copyBufferToBuffer(pair.buffer, 0, readPair.buffer, 0, pairs * pairChannels * 4);
       }
       if (outSingle === undefined) {
@@ -979,7 +987,8 @@ export class Af3DiffusionConditioningGpu {
         return copy;
       };
       return {
-        pair: reusePair ?? await read(readPair), single: await read(readSingle),
+        pair: reusePair ?? (outPair !== undefined ? pair : await read(readPair)),
+        single: await read(readSingle),
         elapsedMilliseconds: performance.now() - start,
         memory: this.allocator.snapshot(),
       };
