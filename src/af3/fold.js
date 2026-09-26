@@ -1011,7 +1011,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // recycling - so the expectation over its bins is a predicted distance
     // matrix for free, and its RMS change is the quantity AF2 stops on. See
     // src/af3/feature-convergence.js.
-    const distances = trunk.logits === undefined ? undefined
+    // 🔴 ONLY WHEN SOMETHING READS IT. The expectation is a softmax over every
+    // pair's bins - `tokens^2 x 64` exps - and it cost 84-88 ms a pass at 255
+    // tokens, all of it host time with the GPU idle between recycles: ~350 ms
+    // of a 4.7 s fold, for a number nothing acts on unless a tolerance is set.
+    // The page sets none; a probe asks with `recycleDistances`.
+    const wantDistances = featureTolerance > 0 || options.recycleDistances === true;
+    const distances = trunk.logits === undefined || !wantDistances ? undefined
       : expectedDistances(trunk.logits, trunk.binEdges);
     recycleDeltas.push({
       pass,

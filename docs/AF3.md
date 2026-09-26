@@ -3490,7 +3490,14 @@ already holds `previousPair` and `previousSingle` as HOST arrays, because the
 pairformer reads them back each pass. No kernel, no readback, no device memory.
 
 `recycleDeltas` reports it per pass and `--recycle-tolerance` acts on it, **0 and
-off by default**. On the 68-token default input:
+off by default**.
+
+🔴 **AND THE ANGSTROM COLUMN IS OPT-IN NOW: `--recycle-distances`.** "It costs
+nothing" held for the pair and single deltas (12 ms a pass at 255 tokens) and
+not for `expectedDistances`, a softmax over every pair's 64 bins: **84-88 ms a
+pass**, host time with the GPU idle, ~350 ms of a 4.7 s page-default fold for a
+number nothing reads unless a tolerance is set. A tolerance above zero still
+computes it; the page sets none. On the 68-token default input:
 
 | pass | pair | single |
 |---:|---:|---:|

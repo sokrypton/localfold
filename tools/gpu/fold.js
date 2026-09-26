@@ -725,6 +725,9 @@ export async function main(device, args) {
     // src/af3/feature-convergence.js and docs/AF3.md for what has actually
     // been measured, which is two inputs' worth and not a corpus.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
+    // The angstrom metric costs a softmax over every pair's bins each pass,
+    // so it is computed only when asked; a tolerance above zero asks for it.
+    recycleDistances: args.includes("--recycle-distances"),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     // The trunk's intermediate seams, compared as they are produced.
