@@ -4,11 +4,11 @@
     "stock": {
       "AF2": "\"checksum\": -1308439",
       "AF3": "\"meanPlddt\": 85.8348190958907",
-      "OpenDDE": "\"meanPlddt\": 92.03821239404978",
-      "ESMFold2": "\"meanPlddt\": 53.835",
+      "OpenDDE": "\"meanPlddt\": 92.0382126864656",
+      "ESMFold2": "\"meanPlddt\": 53.833",
       "boltz2": "\"meanPlddt\": 96.45960561240592",
-      "protenix2": "\"meanPlddt\": 84.65288596867684",
-      "intellifold2": "\"meanPlddt\": 83.22311292185626",
+      "protenix2": "\"meanPlddt\": 84.6528856629694",
+      "intellifold2": "\"meanPlddt\": 83.22311307497674",
       "rosettafold3": "\"meanPlddt\": 81.53424395815864"
     },
     "portable": {

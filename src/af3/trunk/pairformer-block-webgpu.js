@@ -446,8 +446,8 @@ export class Af3PairformerStackGpu {
       // 128 gets 1.13x and OpenDDE's 384 gets 3.71x from the same knob, because
       // the fused kernel's row tile halves as the widened row grows. See
       // src/af3/trunk/transition-webgpu.js.
-      pairTransitionSplit: pairMatrixKernels
-        && splitTransitionConfig(this.device, pairChannels),
+      pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
+        { f32Only: !pairMatrixKernels }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
       // ...and the triangle projection, which has no width rule because it
       // costs no memory. See src/kernels/triangle/project-matrix.js.

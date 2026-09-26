@@ -1111,13 +1111,19 @@ export const SPLIT_TRANSITION_GEOMETRY = Object.freeze({
   subgroupRows: 2, subgroupColumns: 4,
 });
 
-export function splitTransitionConfig(device, channels) {
+// 🔴 `f32Only` IS FOR A STACK PINNED TO f32 - the confidence heads, which pin
+// `pairMatrixKernels: false` because the MATRIX kernels are f16 and move pLDDT
+// and PAE by thousands of times their envelope. That pin also turned the split
+// off, so a 384- or 512-channel head ran the fused kernel the split beats 3.7x.
+// The vector split with f32 scratch is f32 arithmetic throughout - the same
+// class as the fused kernel, only reordered - so a pinned stack takes it.
+export function splitTransitionConfig(device, channels, { f32Only = false } = {}) {
   const tuning = deviceTuning(device);
   if (tuning.pairTransitionSplit !== true) return false;
   if (channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
     return false;
   }
-  const config = deviceMatrixConfig(device, { element: "f16" });
+  const config = f32Only ? null : deviceMatrixConfig(device, { element: "f16" });
   // 🔴 NO MATRIX UNITS IS NOT NO SPLIT. It used to be, so every stock browser -
   // none of which exposes subgroup matrices - ran the fused kernel at every
   // width. The vector GEMM above takes the split's two projections instead,
@@ -1128,7 +1134,8 @@ export function splitTransitionConfig(device, channels) {
   if (config === null) {
     if (channels < VECTOR_SPLIT_MIN_CHANNELS) return false;
     if (channels % VECTOR_GEMM_BLOCK.columns !== 0) return false;
-    return { vector: true, storage: device.features.has("shader-f16") ? "f16" : "f32", ...rows };
+    return { vector: true,
+             storage: !f32Only && device.features.has("shader-f16") ? "f16" : "f32", ...rows };
   }
   const answer = {
     result: tuning.stagedMatrixResult ?? config.resultComponentType,

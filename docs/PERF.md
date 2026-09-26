@@ -559,6 +559,18 @@ flags: conditioning 77.9 -> ~47.5 ms, atom-encoder 85.3 -> ~69.6, transformer
 the head a host array, so the first version bound an ArrayBuffer and died. The
 test is `instanceof GPUBuffer`.
 
+🔴 **AND THE CONFIDENCE HEADS' PIN SWITCHED THE SPLIT OFF WITH THE MATRIX
+KERNELS.** The heads pin `pairMatrixKernels: false` because the matrix kernels
+are f16 and move pLDDT and PAE by thousands of times their envelope - and the
+same flag gated the split transition, so OpenDDE's 384-channel head and
+IntelliFold-2's 512-channel one ran the fused kernel. `splitTransitionConfig`'s
+`f32Only` gives a pinned stack the VECTOR split with f32 scratch, which is f32
+arithmetic throughout. OpenDDE's confidence oracle on the f32 bundle, before ->
+after: pLDDT 1.13e-7 -> 1.11e-7, PAE 8.46e-7 -> 8.93e-7, PDE 9.73e-7 ->
+9.92e-7; protenix2's unchanged at 1.31e-7 / 2.02e-7 / 1.99e-7. The 128-channel
+heads are below the width threshold and byte-identical. OpenDDE at 255 residues:
+the confidence stage 2295 -> 1651 ms, warm fold 20.09 -> 19.44 s.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The

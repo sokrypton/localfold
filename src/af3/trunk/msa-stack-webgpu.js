@@ -148,8 +148,8 @@ export class Af3MsaStackGpu {
       // an AF3 trunk's `pair-transition` passes are this stack's, and at
       // OpenDDE's 384 channels the fused kernel loses to the split by 3.71x -
       // the whole reason the pairformer takes it. Same width rule, same knob.
-      pairTransitionSplit: pairMatrixKernels
-        && splitTransitionConfig(this.device, pairChannels),
+      pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
+        { f32Only: !pairMatrixKernels }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
