@@ -28,7 +28,8 @@ import { Af3EmbedderGpu } from "./embedder-webgpu.js";
 import { Af3MsaStackGpu } from "./msa-stack-webgpu.js";
 import { Af3PairformerStackGpu } from "./pairformer-block-webgpu.js";
 import { Af3TemplateEmbedderGpu } from "./template-webgpu.js";
-import { GRID_WIDTH, PAIR_CHANNELS } from "./pair-track-gpu.js";
+import { GRID_WIDTH, PAIR_CHANNELS, createAddShader } from "./pair-track-gpu.js";
+import { DeferredValidation } from "../../runtime/validation.js";
 import { af3ContactBins } from "../featurise/contact-classes.js";
 
 /**
@@ -179,125 +180,195 @@ export class Af3TrunkGpu {
     // these match.
     const seam = (name, value) => options.onSeam?.(name, value);
 
-    const embedded = await stage("embedder",
-      () => new Af3EmbedderGpu(this.device).run(input, weights.embedder, options));
-    seam("tap.z_init_generic", embedded.pair);
-    // 🔴 A SNAPSHOT, because the template stage adds INTO this same array. The
-    // difference `pair - embedded.pair` taken afterwards is the array minus
-    // itself - it read rms 0.0000 - and the seam above only works because the
-    // comparator consumes it before the mutation.
-    const zInitSnapshot = options.onSeam === undefined ? null : embedded.pair.slice();
-    seam("tap.trunk_in_single", embedded.single);
-
-    // 🔴 ON THE PART-BUILT PAIR - see the note at the top.
-    // 🔴 THE FOUR PINS AlphaFold 3's CONFIDENCE HEAD CARRIES, AND FOR THE SAME
-    // REASON: this stage is 1.7% of a trunk and its output is added to z, so it
-    // is paid for once and inherited by all 48 pairformer blocks. boltz2's
-    // fused embedder reads 5.11e-4 against its own CPU reference with the
-    // shipped precision and **9.11e-7** with these - three orders - and
-    // measured interleaved at 256 tokens the stage is 8.0 ms either way against
-    // a 468 ms trunk, four runs, no arm above 8.1. Correctness that costs
-    // nothing measurable is not a trade.
+    // 🔴 THE PAIR, MSA AND SINGLE STAY ON THE DEVICE BETWEEN STAGES. Each stage
+    // used to take a host array, upload it, compute, and read it back - and a
+    // readback is a DRAIN, so every stage boundary stopped the GPU, crossed the
+    // bus twice with the pair (32 MiB at 255 tokens, 82 at 400) and started it
+    // again. Measured at 255 tokens under stock flags: a pass was 1050 ms of
+    // wall for 587 of GPU, the embedder, template, MSA stack and distogram
+    // doing ~80 ms of GPU work in ~420 ms of wall. The arithmetic is untouched
+    // - the same kernels, the same f32 adds, now on the device - so this path
+    // is held to BIT-IDENTICAL output. Validation is collected rather than
+    // awaited per stage, because in Dawn an awaited `popErrorScope` resolves
+    // when the submitted work does, which is a drain by another name; it is
+    // settled once, at the readback that already synchronises.
     //
-    // 🔴 AND `--f16=off` AND `--tune=` CANNOT REACH THEM. The pins go through
-    // the CONSTRUCTOR; three `--tune` arms read an identical 5.11e-4 and said
-    // only that they had not run. See docs/AF3.md.
-    const template = await stage("template", () => new Af3TemplateEmbedderGpu(this.device, {
-      ...this.options,
-      stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32",
-      pairMatrixKernels: false,
-    }).run(
-      { pair: embedded.pair, pairMask: input.pairMask, tokens,
-        templates: input.templates ?? 4,
-        // Absent, every slot is empty - which is what a de novo fold has, and
-        // is still a quarter of what enters the MSA stack.
-        slots: input.templateSlots,
-        // 🔴 THE CHAIN IDS, NOT A MASK. AF3 masks the template's geometry
-        // ACROSS chains - two chains' templates were never in one coordinate
-        // frame - and the embedder derives that per slot. Passing nothing used
-        // to mean "assume one chain", which on a two-chain fold scored relRMS
-        // 1.09 against AF3.
-        asymId: input.asymId,
-        multichainMask2d: input.multichainMask2d },
-      weights.template, dialect, options));
-    // 🔴 THE TEMPLATE TERM IS ADDED INTO THE EMBEDDER'S PAIR, NOT INTO A COPY
-    // OF IT. Nothing reads `embedded.pair` after this line - the template
-    // above was its only other reader - and at 200 tokens the copy was a
-    // 19.5 MiB host allocation per RECYCLE, thrown away immediately. Measured
-    // on the pair alone: 7.1 ms for `Float32Array.from` plus the add, 4.4 for
-    // the add in place.
-    const pair = embedded.pair;
-    for (let index = 0; index < pair.length; index += 1) pair[index] += template.output[index];
-    seam("tap.z_after_template", pair);
-    // ...and the template module's OWN output, which is what the reference
-    // traces as `evoformer/template_embedding`. `z_after_template` is
-    // `z_init + term`, so with an exact z_init the two say the same thing -
-    // but only the difference can be compared against the module's scope, and
-    // a term that is 4e-3 wrong inside a sum that is 3.9e-3 wrong is worth
-    // stating as itself.
-    if (options.onSeam !== undefined) {
-      const term = new Float32Array(pair.length);
-      for (let i = 0; i < term.length; i += 1) term[i] = pair[i] - zInitSnapshot[i];
-      seam("tap.template_term", term);
-    }
-
-    // 🔴 THE MSA EMBEDDING, BEFORE THE STACK TOUCHES IT. `z_after_msa` is the
-    // only MSA seam there was, so a wrong FEATURE and a wrong STACK were the
-    // same number. The reference records `evoformer/msa_activations` at exactly
-    // this point.
-    seam("tap.msa_activations", embedded.msa);
-    const msa = await stage("msa-stack", () => new Af3MsaStackGpu(this.device, this.options).run(
-      { pair, msa: embedded.msa, pairMask: input.pairMask, msaMask: input.msaMask,
-        tokens, sequences: input.sequences },
-      weights.msaBlocks, dialect,
-      { ...options, stopAfterOpm: options.stopAfterOpm === true }));
-
-    // 🔴 boltz2 ADDS THE PRE-MSA PAIR BACK. See `msaDoubleAddPair` in
-    // dialect.js: its MSAModule returns the updated z and its caller adds z to
-    // that, so what reaches the pairformer is `2 * z_in + delta`.
-    if (dialect.msaDoubleAddPair === true) {
-      for (let index = 0; index < msa.pair.length; index += 1) msa.pair[index] += pair[index];
-    }
-    // ...and the MSA tensor the stack produced, which the reference taps as
-    // `msa_block_msa_act`. With one block it is that block's updated MSA, and
-    // it is what separates a wrong MSA update from a wrong outer product.
-    seam("tap.msa_block_msa_act", msa.msa);
-    seam("tap.z_after_msa", msa.pair);
-
-    // 🔴 THE ONLY STAGE WORTH A PROGRESS BAR. The pairformer is 48 blocks and
-    // the bulk of the trunk; the other four stages are each a fraction of it,
-    // so a bar that only moved between stages would sit still for most of the
-    // wait. onBlock is reported under its own name rather than through
-    // `options`, which is passed to every sub-stack and would otherwise fire
-    // for the template's blocks too.
-    const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, this.options).run(
-      { pair: msa.pair, single: embedded.single, pairMask: input.pairMask,
-        seqMask: input.seqMask, tokens },
-      weights.pairformerBlocks, dialect, {
-        ...options,
-        onBlock: (index) => options.onPairformerBlock?.(index,
-                                                        weights.pairformerBlocks.length),
-        // ...and the one that says the device GOT there, which is what a status
-        // line should show. See the note in pairformer-block-webgpu.js.
-        onBlockDone: (completed, total) => options.onPairformerBlockDone?.(completed, total),
-      }));
-
-    // The pairformer's own encode/wait split, carried out so a bench can report
-    // where the stack's wall time went without re-instrumenting it.
-    this.lastPairformerSplit = pairformer.split;
-    seam("tap.trunk_out_pair", pairformer.pair);
-
-    const head = await stage("distogram",
-      () => this.#distogram(pairformer.pair, input.pairMask, tokens,
-                            weights.distogram, input.contactClasses));
-
-    return {
-      pair: pairformer.pair, single: pairformer.single, msa: msa.msa,
-      ...head, binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings,
+    // 🔴 AND THE SEAMS READ BACK ONLY WHEN A CHECKER ASKS, from these same
+    // buffers - so the oracle compares the path the page runs, not a second
+    // host path kept alive beside it.
+    const validation = new DeferredValidation(this.device, "AF3 trunk");
+    const read = async (allocation, elements) => {
+      const staging = this.allocator.allocate("af3-trunk.seam-readback", elements * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      try {
+        const encoder = this.device.createCommandEncoder({ label: "af3-trunk.seam" });
+        encoder.copyBufferToBuffer(allocation.buffer, 0, staging.buffer, 0, elements * 4);
+        this.device.queue.submit([encoder.finish()]);
+        await staging.buffer.mapAsync(GPUMapMode.READ);
+        const copy = new Float32Array(staging.buffer.getMappedRange().slice(0));
+        staging.buffer.unmap();
+        return copy;
+      } finally {
+        staging.release();
+      }
     };
+    const readSeam = async (name, allocation, elements) => {
+      if (options.onSeam === undefined) return undefined;
+      const value = await read(allocation, elements);
+      seam(name, value);
+      return value;
+    };
+    const pairChannels = weights.embedder.pairChannels;
+    const pairElements = pairs * pairChannels;
+
+    const embedded = await stage("embedder",
+      () => new Af3EmbedderGpu(this.device).run(input, weights.embedder,
+                                                { ...options, keepOnDevice: true, validation }));
+    const owned = [embedded.pairAllocation, embedded.msaAllocation, embedded.singleAllocation];
+    try {
+      const pair = embedded.pairAllocation;
+      // 🔴 A SNAPSHOT, because the template stage adds INTO this same buffer.
+      // The difference taken afterwards against the live pair would be the
+      // tensor minus itself - it read rms 0.0000 once, on the host path.
+      const zInitSnapshot = await readSeam("tap.z_init_generic", pair, pairElements);
+      await readSeam("tap.trunk_in_single", embedded.singleAllocation,
+                     tokens * weights.embedder.singleChannels);
+
+      // 🔴 ON THE PART-BUILT PAIR - see the note at the top.
+      // 🔴 THE FOUR PINS AlphaFold 3's CONFIDENCE HEAD CARRIES, AND FOR THE SAME
+      // REASON: this stage is 1.7% of a trunk and its output is added to z, so it
+      // is paid for once and inherited by all 48 pairformer blocks. boltz2's
+      // fused embedder reads 5.11e-4 against its own CPU reference with the
+      // shipped precision and **9.11e-7** with these - three orders - and
+      // measured interleaved at 256 tokens the stage is 8.0 ms either way against
+      // a 468 ms trunk, four runs, no arm above 8.1. Correctness that costs
+      // nothing measurable is not a trade.
+      //
+      // 🔴 AND `--f16=off` AND `--tune=` CANNOT REACH THEM. The pins go through
+      // the CONSTRUCTOR; three `--tune` arms read an identical 5.11e-4 and said
+      // only that they had not run. See docs/AF3.md.
+      await stage("template", () => new Af3TemplateEmbedderGpu(this.device, {
+        ...this.options,
+        stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32",
+        pairMatrixKernels: false,
+      }).run(
+        { pairMask: input.pairMask, tokens,
+          templates: input.templates ?? 4,
+          // Absent, every slot is empty - which is what a de novo fold has, and
+          // is still a quarter of what enters the MSA stack.
+          slots: input.templateSlots,
+          // 🔴 THE CHAIN IDS, NOT A MASK. AF3 masks the template's geometry
+          // ACROSS chains - two chains' templates were never in one coordinate
+          // frame - and the embedder derives that per slot. Passing nothing used
+          // to mean "assume one chain", which on a two-chain fold scored relRMS
+          // 1.09 against AF3.
+          asymId: input.asymId,
+          multichainMask2d: input.multichainMask2d },
+        // 🔴 THE TEMPLATE TERM IS ADDED INTO THE EMBEDDER'S PAIR, on the device
+        // now: `pairBuffer` is read as z and updated in place as z + term.
+        weights.template, dialect, { ...options, pairBuffer: pair.buffer, validation }));
+      const afterTemplate = await readSeam("tap.z_after_template", pair, pairElements);
+      // ...and the template module's OWN output, which is what the reference
+      // traces as `evoformer/template_embedding`. `z_after_template` is
+      // `z_init + term`, so with an exact z_init the two say the same thing -
+      // but only the difference can be compared against the module's scope, and
+      // a term that is 4e-3 wrong inside a sum that is 3.9e-3 wrong is worth
+      // stating as itself.
+      if (options.onSeam !== undefined) {
+        const term = new Float32Array(pairElements);
+        for (let i = 0; i < term.length; i += 1) term[i] = afterTemplate[i] - zInitSnapshot[i];
+        seam("tap.template_term", term);
+      }
+
+      // 🔴 THE MSA EMBEDDING, BEFORE THE STACK TOUCHES IT. `z_after_msa` is the
+      // only MSA seam there was, so a wrong FEATURE and a wrong STACK were the
+      // same number. The reference records `evoformer/msa_activations` at exactly
+      // this point.
+      const msaElements = input.sequences * tokens * weights.embedder.msaChannels;
+      await readSeam("tap.msa_activations", embedded.msaAllocation, msaElements);
+
+      // 🔴 boltz2 ADDS THE PRE-MSA PAIR BACK. See `msaDoubleAddPair` in
+      // dialect.js: its MSAModule returns the updated z and its caller adds z to
+      // that, so what reaches the pairformer is `2 * z_in + delta`. The stack
+      // updates the pair IN PLACE now, so z_in is copied aside first.
+      const doubleAdd = dialect.msaDoubleAddPair === true;
+      const preMsa = doubleAdd ? this.allocator.allocate("af3-trunk.pre-msa-pair",
+        pairElements * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST) : undefined;
+      if (preMsa !== undefined) owned.push(preMsa);
+      if (doubleAdd) {
+        const encoder = this.device.createCommandEncoder({ label: "af3-trunk.pre-msa-copy" });
+        encoder.copyBufferToBuffer(pair.buffer, 0, preMsa.buffer, 0, pairElements * 4);
+        this.device.queue.submit([encoder.finish()]);
+      }
+      await stage("msa-stack", () => new Af3MsaStackGpu(this.device, this.options).run(
+        { pairMask: input.pairMask, msaMask: input.msaMask, tokens, sequences: input.sequences },
+        weights.msaBlocks, dialect,
+        { ...options, stopAfterOpm: options.stopAfterOpm === true,
+          pairBuffer: pair.buffer, msaBuffer: embedded.msaAllocation.buffer, validation }));
+      if (doubleAdd) {
+        const add = await this.pipelines.get(`af3-trunk:add:${pairElements}`,
+                                             createAddShader(pairElements));
+        validation.begin();
+        const encoder = this.device.createCommandEncoder({ label: "af3-trunk.msa-double-add" });
+        const pass = encoder.beginComputePass({ label: "trunk.msa-double-add" });
+        pass.setPipeline(add);
+        pass.setBindGroup(0, this.device.createBindGroup({
+          layout: add.getBindGroupLayout(0),
+          entries: [pair, preMsa].map((allocation, binding) => ({
+            binding, resource: { buffer: allocation.buffer } })),
+        }));
+        const groups = Math.ceil(pairElements / 64);
+        pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+        pass.end();
+        this.device.queue.submit([encoder.finish()]);
+        validation.end("msa double add");
+      }
+      // ...and the MSA tensor the stack produced, which the reference taps as
+      // `msa_block_msa_act`. With one block it is that block's updated MSA, and
+      // it is what separates a wrong MSA update from a wrong outer product.
+      await readSeam("tap.msa_block_msa_act", embedded.msaAllocation, msaElements);
+      await readSeam("tap.z_after_msa", pair, pairElements);
+
+      // 🔴 THE ONLY STAGE WORTH A PROGRESS BAR. The pairformer is 48 blocks and
+      // the bulk of the trunk; the other four stages are each a fraction of it,
+      // so a bar that only moved between stages would sit still for most of the
+      // wait. onBlock is reported under its own name rather than through
+      // `options`, which is passed to every sub-stack and would otherwise fire
+      // for the template's blocks too.
+      const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, this.options).run(
+        { pairMask: input.pairMask, seqMask: input.seqMask, tokens },
+        weights.pairformerBlocks, dialect, {
+          ...options,
+          pairBuffer: pair.buffer, singleBuffer: embedded.singleAllocation.buffer,
+          onBlock: (index) => options.onPairformerBlock?.(index,
+                                                          weights.pairformerBlocks.length),
+          // ...and the one that says the device GOT there, which is what a status
+          // line should show. See the note in pairformer-block-webgpu.js.
+          onBlockDone: (completed, total) => options.onPairformerBlockDone?.(completed, total),
+        }));
+      // Every stage before this one is on the queue ahead of the pairformer's
+      // readback, which has now completed, so these resolve without waiting.
+      await validation.settle();
+
+      // The pairformer's own encode/wait split, carried out so a bench can report
+      // where the stack's wall time went without re-instrumenting it.
+      this.lastPairformerSplit = pairformer.split;
+      seam("tap.trunk_out_pair", pairformer.pair);
+
+      const head = await stage("distogram",
+        () => this.#distogram(pair, input.pairMask, tokens,
+                              weights.distogram, input.contactClasses));
+
+      return {
+        pair: pairformer.pair, single: pairformer.single,
+        ...head, binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings,
+      };
+    } finally {
+      for (const allocation of owned) allocation.release();
+    }
   }
 
-  async #distogram(pair, pairMask, tokens, weights, contactClasses) {
+  async #distogram(pairAllocation, pairMask, tokens, weights, contactClasses) {
     const pairs = tokens * tokens;
     // 🔴 THE HEAD'S THREE NUMBERS ARE THE TENSOR'S. `half_logits` is
     // [pairChannels, bins], so AlphaFold 3's 128x64 and OpenDDE's 384x96 are
@@ -321,7 +392,8 @@ export class Af3TrunkGpu {
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     try {
-      const pairBuffer = keep(this.allocator.upload("af3-disto.pair", pair, storage));
+      // The trunk's pair, still on the device; the caller owns it.
+      const pairBuffer = pairAllocation;
       const maskBuffer = keep(this.allocator.upload("af3-disto.mask", pairMask, storage));
       // 🔴 REQUIRED, NOT DEFAULTED. A caller with no classes would silently get
       // 8 A everywhere back, which is the convention this exists to correct -

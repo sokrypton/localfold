@@ -41,8 +41,8 @@ import { residencyAllowed } from "../../runtime/device-memory.js";
 import { storageBytes } from "../../runtime/storage.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import {
-  GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, encodePairTrack,
-  packPairTrackWeights,
+  GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, createAddShader,
+  encodePairTrack, packPairTrackWeights,
 } from "./pair-track-gpu.js";
 import { residentPairTrackOnDevice } from "../weights/pair-track-device-weights.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
@@ -563,9 +563,21 @@ export class Af3TemplateEmbedderGpu {
     const base = `af3-template:${tokens}:${queryChannels}:${templates}:${epsilon}`
       + `:${variance}:${dialect.swapTransposedBias}:c${CHANNELS}`
       + `:${fused ? `fused${featureWidth}` : ""}${outerResidual ? ":or" : ""}`;
+    // 🔴 THE TRUNK'S PAIR, UPDATED IN PLACE, WHEN IT HANDS ONE OVER - the
+    // pairformer's `pairBuffer` convention. The term is added on the device
+    // (the same f32 add the trunk used to do on the host) and nothing is read
+    // back, so the stage needs no drain and costs no bus crossing.
+    const pairBuffer = options.pairBuffer;
+    if (pairBuffer !== undefined && options.validation === undefined) {
+      throw new Error("pairBuffer needs options.validation: nothing here awaits the scope");
+    }
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
+    }
+    if (pairBuffer !== undefined) {
+      compiled.addPair = await this.pipelines.get(
+        `af3-template:add-pair:${pairs * queryChannels}`, createAddShader(pairs * queryChannels));
     }
     // The template stack: the shared pair track at the stack's own width.
     // ...one variable for the shader and the packing; see the note in
@@ -599,7 +611,8 @@ export class Af3TemplateEmbedderGpu {
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     try {
-      const pair = keep(this.allocator.upload("af3-template.pair", input.pair, storage));
+      const pair = pairBuffer !== undefined ? { buffer: pairBuffer }
+        : keep(this.allocator.upload("af3-template.pair", input.pair, storage));
       const pairMask = keep(this.allocator.upload("af3-template.mask", input.pairMask, storage));
       const weightBuffer = keep(this.allocator.upload("af3-template.weights", packed.data, storage));
       // 🔴 ONE BUFFER PER SLOT, AND REUSING ONE IS THE BUG THAT LOOKS LIKE A
@@ -847,7 +860,8 @@ export class Af3TemplateEmbedderGpu {
         return allocation;
       };
 
-      this.device.pushErrorScope("validation");
+      if (pairBuffer !== undefined) options.validation.begin();
+      else this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-template" });
       const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
         const pass = encoder.beginComputePass({ label });
@@ -944,8 +958,17 @@ export class Af3TemplateEmbedderGpu {
       }
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
-      const error = await this.device.popErrorScope();
-      await this.device.queue.onSubmittedWorkDone();
+      // 🔴 NO DRAIN ON THE DEVICE PATH. Releasing after a submit is safe on
+      // queue ordering - the pairformer has released its per-block weights
+      // that way for as long as it has pipelined - and the drain existed only
+      // to hold the device still for a readback this path never takes.
+      let error = null;
+      if (pairBuffer !== undefined) {
+        options.validation.end("template");
+      } else {
+        error = await this.device.popErrorScope();
+        await this.device.queue.onSubmittedWorkDone();
+      }
       for (let index = blockAllocations.length - 1; index >= 0; index -= 1) {
         blockAllocations[index].release();
       }
@@ -961,10 +984,11 @@ export class Af3TemplateEmbedderGpu {
 
       const output = keep(this.allocator.allocate(
         "af3-template.output", pairs * queryChannels * 4, storage | GPUBufferUsage.COPY_SRC));
-      const readback = keep(this.allocator.allocate(
+      const readback = pairBuffer !== undefined ? undefined : keep(this.allocator.allocate(
         "af3-template.readback", pairs * queryChannels * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
-      this.device.pushErrorScope("validation");
+      if (pairBuffer !== undefined) options.validation.begin();
+      else this.device.pushErrorScope("validation");
       const finish = this.device.createCommandEncoder({ label: "af3-template-output" });
       const pass = finish.beginComputePass({ label: "template.output" });
       pass.setPipeline(compiled.output);
@@ -976,6 +1000,24 @@ export class Af3TemplateEmbedderGpu {
       }));
       pass.dispatchWorkgroups(linear[0], linear[1]);
       pass.end();
+      if (pairBuffer !== undefined) {
+        // z += template(z), the add the trunk did on the host.
+        const add = finish.beginComputePass({ label: "template.add-pair" });
+        add.setPipeline(compiled.addPair);
+        add.setBindGroup(0, this.device.createBindGroup({
+          layout: compiled.addPair.getBindGroupLayout(0),
+          entries: [pair, output].map((allocation, binding) => ({
+            binding, resource: { buffer: allocation.buffer },
+          })),
+        }));
+        // ELEMENTWISE over pairs x channels, not `linear`, which is per PAIR.
+        const addGrid = spread(Math.ceil(pairs * queryChannels / 64));
+        add.dispatchWorkgroups(addGrid[0], addGrid[1]);
+        add.end();
+        this.device.queue.submit([finish.finish()]);
+        options.validation.end("template output");
+        return { elapsedMilliseconds: performance.now() - start, memory: this.allocator.snapshot() };
+      }
       finish.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairs * queryChannels * 4);
       this.device.queue.submit([finish.finish()]);
       const outputError = await this.device.popErrorScope();

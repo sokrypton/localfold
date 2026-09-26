@@ -394,6 +394,38 @@ Caching the transformer's bind groups and scratch tensors bought nothing
 measurable against that - the stage sat at 45-46 ms either way - so the next
 thing there is chaining the stages ON THE DEVICE, not another cache.
 
+🔴 **THE AF3 TRUNK HAD THE SAME HABIT, AND IT WAS 44% OF A PASS.** Five stages
+- embedder, template, MSA stack, pairformer, distogram - each took the pair as
+a Float32Array, uploaded it, computed and read it back, and a readback is a
+drain. At 255 tokens under stock flags a trunk pass was 1050 ms of wall for 587
+of GPU; the four small stages did ~80 ms of GPU work in ~420 ms of wall. Two
+more drains hid beside the readbacks: the MSA stack waited on the device after
+EVERY block to release weights (the pairformer stopped doing that long ago), and
+an awaited `popErrorScope` in Dawn resolves when the submitted work does, so
+each stage's validation check was a drain too.
+
+The pair, MSA and single now stay on the device from the embedder to the
+distogram (`keepOnDevice` / `pairBuffer` / `msaBuffer` / `singleBuffer`, the
+pairformer's existing convention), the template term and boltz2's double add
+are device adds, and validation is collected and settled once. Same kernels,
+same f32 adds, so it is held to BIT-IDENTICAL output: all seven AF3-lineage
+models give the same PDB byte for byte against the parent commit, the trunk
+seam oracle reads identically on both trees, and the peak is unchanged to the
+byte. Stock flags, AF3 int5, `bench-trunk.js --msa=128 --passes=4`:
+
+| tokens | pass before | after |
+|---:|---:|---:|
+| 68 | 184 ms | **114** |
+| 255 | 1040 | **692** |
+| 400 | 2631 | **1841** |
+
+A page-default fold (25 steps, 3 recycles) at 255 tokens: first 11.45 -> 7.59
+s, warm 5.84-6.04 -> 4.58-4.66. 🔴 **AND THE PER-STAGE TIMES STOP MEANING THE
+STAGE'S COST**: the embedder, template and MSA stack now read 2-9 ms because
+nothing waits for them, and their GPU work lands in the pairformer's wait. Only
+`whole` is a cost. Not measured on an M2, whose unified memory never paid the
+bus half of this.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The

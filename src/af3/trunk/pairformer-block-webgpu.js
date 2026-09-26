@@ -347,8 +347,13 @@ export class Af3PairformerStackGpu {
       && state.pair.length !== pairs * pairChannels) {
       throw new Error(`pair has ${state.pair.length} elements; expected ${pairs * pairChannels}`);
     }
-    if (!this.compilingOnly && state.single.length !== n * singleChannels) {
-      throw new Error(`single has ${state.single.length} elements; expected ${n * singleChannels}`);
+    // 🔴 THE TRUNK'S SINGLE, ON THE DEVICE, when it hands one over - the same
+    // convention as `pairBuffer`, so the embedder's output reaches this stack
+    // without a readback and an upload. Checked by its bytes instead.
+    const singleElements = options.singleBuffer !== undefined
+      ? options.singleBuffer.size / 4 : state.single?.length;
+    if (!this.compilingOnly && singleElements !== n * singleChannels) {
+      throw new Error(`single has ${singleElements} elements; expected ${n * singleChannels}`);
     }
 
     const heads = blocks[0].singleAttention.heads;
@@ -547,7 +552,9 @@ export class Af3PairformerStackGpu {
         ? { buffer: options.pairBuffer }
         : keep(this.allocator.upload("af3-block.pair", state.pair,
                                      storage | GPUBufferUsage.COPY_SRC));
-      const single = keep(this.allocator.upload("af3-block.single", state.single, storage | GPUBufferUsage.COPY_SRC));
+      const single = options.singleBuffer !== undefined ? { buffer: options.singleBuffer }
+        : keep(this.allocator.upload("af3-block.single", state.single,
+                                     storage | GPUBufferUsage.COPY_SRC));
       const pairMask = keep(this.allocator.upload("af3-block.pair-mask", state.pairMask, storage));
       const seqMask = keep(this.allocator.upload("af3-block.seq-mask", state.seqMask, storage));
 

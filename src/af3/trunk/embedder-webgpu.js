@@ -580,7 +580,15 @@ export class Af3EmbedderGpu {
         "af3-embed.msa", rows * msaChannels * 4, storage | GPUBufferUsage.COPY_SRC));
       const single = keep(this.allocator.allocate(
         "af3-embed.single", tokens * singleChannels * 4, storage | GPUBufferUsage.COPY_SRC));
-      const readback = {
+      // 🔴 ON THE DEVICE WHEN THE TRUNK ASKS, because every reader of these
+      // three is a GPU stage. Read back, each was a drain and a bus crossing
+      // between stages whose own GPU work is a few milliseconds - see the note
+      // on `keepOnDevice` in trunk-webgpu.js for what that cost a pass.
+      const keepOnDevice = options.keepOnDevice === true;
+      if (keepOnDevice && options.validation === undefined) {
+        throw new Error("keepOnDevice needs options.validation: nothing here awaits the scope");
+      }
+      const readback = keepOnDevice ? undefined : {
         pair: keep(this.allocator.allocate("af3-embed.rb-pair", pairs * pairChannels * 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
         msa: keep(this.allocator.allocate("af3-embed.rb-msa", rows * msaChannels * 4,
@@ -589,7 +597,8 @@ export class Af3EmbedderGpu {
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
       };
 
-      this.device.pushErrorScope("validation");
+      if (options.validation !== undefined) options.validation.begin();
+      else this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-embedder" });
       const run = (label, pipeline, buffers, x, y = 1) => {
         const pass = encoder.beginComputePass({ label });
@@ -630,6 +639,19 @@ export class Af3EmbedderGpu {
       run("embed.assemble-single", compiled.assembleSingle,
           [targetFeat, previousSingle, weightBuffer, single], tokens);
 
+      if (keepOnDevice) {
+        const start = performance.now();
+        this.device.queue.submit([encoder.finish()]);
+        options.validation.end("embedder");
+        // Handed to the caller, who releases them; taken out of this list so
+        // the `finally` below does not destroy what it just gave away.
+        for (const owned of [pair, msa, single]) allocations.splice(allocations.indexOf(owned), 1);
+        return {
+          pairAllocation: pair, msaAllocation: msa, singleAllocation: single,
+          elapsedMilliseconds: performance.now() - start,
+          memory: this.allocator.snapshot(),
+        };
+      }
       encoder.copyBufferToBuffer(pair.buffer, 0, readback.pair.buffer, 0, pairs * pairChannels * 4);
       encoder.copyBufferToBuffer(msa.buffer, 0, readback.msa.buffer, 0, rows * msaChannels * 4);
       encoder.copyBufferToBuffer(single.buffer, 0, readback.single.buffer, 0,

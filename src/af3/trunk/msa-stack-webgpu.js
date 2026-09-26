@@ -96,11 +96,16 @@ export class Af3MsaStackGpu {
     if (dialect?.swapTransposedBias === undefined) {
       throw new Error("dialect.swapTransposedBias has no default");
     }
-    if (state.msa.length !== rows * msaChannels) {
-      throw new Error(`msa has ${state.msa.length} elements; expected ${rows * msaChannels}`);
+    // The same two checks on whichever form the tensor arrives in: a host
+    // array's length, or a device buffer's bytes.
+    const elements = (array, buffer) => (buffer !== undefined ? buffer.size / 4 : array.length);
+    const msaElements = elements(state.msa, options.msaBuffer);
+    const pairElements = elements(state.pair, options.pairBuffer);
+    if (msaElements !== rows * msaChannels) {
+      throw new Error(`msa has ${msaElements} elements; expected ${rows * msaChannels}`);
     }
-    if (state.pair.length !== pairs * pairChannels) {
-      throw new Error(`pair has ${state.pair.length} elements; expected ${pairs * pairChannels}`);
+    if (pairElements !== pairs * pairChannels) {
+      throw new Error(`pair has ${pairElements} elements; expected ${pairs * pairChannels}`);
     }
 
     const sample = blocks[0];
@@ -231,11 +236,21 @@ export class Af3MsaStackGpu {
     into("addMsa", `${base}:add-msa`, createAddShader(rows * msaChannels));
     await Promise.all(compiling);
 
+    // 🔴 THE TRUNK'S OWN BUFFERS, UPDATED IN PLACE, WHEN IT HANDS THEM OVER -
+    // the pairformer's `pairBuffer` convention, for the pair AND the MSA. On
+    // that path nothing is read back and no block waits for the device, so the
+    // stack pipelines like the pairformer does; see trunk-webgpu.js.
+    const onDevice = options.pairBuffer !== undefined;
+    if (onDevice && (options.msaBuffer === undefined || options.validation === undefined)) {
+      throw new Error("pairBuffer needs msaBuffer and validation beside it");
+    }
     try {
-      const pair = keep(this.allocator.upload("af3-msa.pair", state.pair,
-                                              storage | GPUBufferUsage.COPY_SRC));
-      const msa = keep(this.allocator.upload("af3-msa.msa", state.msa,
-                                             storage | GPUBufferUsage.COPY_SRC));
+      const pair = onDevice ? { buffer: options.pairBuffer }
+        : keep(this.allocator.upload("af3-msa.pair", state.pair,
+                                     storage | GPUBufferUsage.COPY_SRC));
+      const msa = onDevice ? { buffer: options.msaBuffer }
+        : keep(this.allocator.upload("af3-msa.msa", state.msa,
+                                     storage | GPUBufferUsage.COPY_SRC));
       const pairMask = keep(this.allocator.upload("af3-msa.pair-mask", state.pairMask, storage));
       const msaMask = keep(this.allocator.upload("af3-msa.msa-mask", state.msaMask, storage));
 
@@ -278,9 +293,17 @@ export class Af3MsaStackGpu {
           pairChannels, msaUpdateBeforeOuterProduct, pairWeightPrecision,
           pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
           left, right, opmCounts, keyMask, attention, msaScratch, gridProjectMatrix,
-          transitionSplit,
+          transitionSplit, validation: onDevice ? options.validation : undefined,
         });
         options.onBlock?.(index);
+      }
+      if (onDevice) {
+        // Released on queue ordering, as the pairformer releases its own.
+        for (const allocation of [...scratch, ...msaScratch, biasBuffer, attention]) {
+          allocation.release();
+        }
+        return { elapsedMilliseconds: performance.now() - start,
+                 memory: this.allocator.snapshot() };
       }
 
       // 🔴 THE READBACKS COME AFTER THE SCRATCH GOES, NOT BEFORE THE LOOP.
@@ -389,7 +412,8 @@ export class Af3MsaStackGpu {
     const msaTransitionWeights = resident("w.msa-transition", block,
       () => packTransitionWeights(block.msaTransition).data);
 
-    this.device.pushErrorScope("validation");
+    if (context.validation !== undefined) context.validation.begin();
+    else this.device.pushErrorScope("validation");
     const encoder = this.device.createCommandEncoder({ label: "af3-msa-block" });
     const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
       const pass = encoder.beginComputePass({ label });
@@ -496,6 +520,17 @@ export class Af3MsaStackGpu {
     });
 
     this.device.queue.submit([encoder.finish()]);
+    // 🔴 A DRAIN PER BLOCK ONLY ON THE HOST PATH. Releasing the block's weights
+    // after the submit is safe on queue ordering - the pairformer has done it
+    // for as long as it has pipelined - and on the device path there is no
+    // readback for the drain to protect.
+    if (context.validation !== undefined) {
+      context.validation.end("msa block");
+      for (let index = blockAllocations.length - 1; index >= 0; index -= 1) {
+        blockAllocations[index].release();
+      }
+      return;
+    }
     const error = await this.device.popErrorScope();
     await this.device.queue.onSubmittedWorkDone();
     for (let index = blockAllocations.length - 1; index >= 0; index -= 1) {
