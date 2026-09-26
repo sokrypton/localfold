@@ -30,7 +30,7 @@
  */
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader,
-         createSwigluShader, linearGrid, swigluGrid } from "../esmc/block-webgpu.js";
+         createSwigluShader, linearGrid, ROW_TILE, swigluGrid } from "../esmc/block-webgpu.js";
 import { float32ToFloat16Array } from "../weights/float16.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { residentTensorOnDevice, residentPairOnDevice, elementsOf }
@@ -489,16 +489,17 @@ function pipelineKeyOf(shape) {
 }
 
 /**
- * 🔴 THE TOKEN TRANSFORMER'S ROW TILE IS TWO, NOT THE LINEAR'S EIGHT. Its
+ * 🔴 THE TOKEN TRANSFORMER'S ROW TILE IS TWO ON THE AMPERE PRIOR, NOT THE LINEAR'S EIGHT. Its
  * projections are tokens x 768 and ran 15 to 60 workgroups a pass at a tile of
  * eight rows. Each output still sums k in order at any tile, so a smaller one
  * is more workgroups for the same bits. Stock flags, A100, sampler of a warm
  * fold at tiles 8 / 4 / 2 / 1: 59 residues 499 / 427 / 309 / 310 ms, 255
  * residues 618 / 555 / 437 / 435, 510 residues 845 / - / 679 / -.
- * `esmfold2TokenRowTile` overrides.
+ * A T4 goes the other way (its 4 MB L2 pays for every weight re-read), so
+ * every other device keeps eight. `esmfold2TokenRowTile` is the knob.
  */
 function tokenRowTile(device, tokens) {
-  return deviceTuning(device).esmfold2TokenRowTile ?? 2;
+  return deviceTuning(device).esmfold2TokenRowTile ?? ROW_TILE;
 }
 
 export class Esmfold2DenoiserGpu {

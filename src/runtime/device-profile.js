@@ -759,6 +759,14 @@ const PRIORS = new Map([
     // 384 channels and 0.56 -> 0.44 at 128, relRMS 0 (bench-triangle-project.js
     // --arms=32x32@32x32,32x64@32x32).
     triangleProjectOutColumns: 64,
+    // 🔴 THE LINEARS' ROW TILE OF TWO IS THIS CARD'S, NOT A DEFAULT. A smaller
+    // tile re-reads the weights once per row tile, which a 40 MB L2 at 1.5
+    // TB/s absorbs (ESMFold2's sampler 618 -> 437 ms at 255 residues here) and
+    // a T4's 4 MB at 320 GB/s does not: there the same change cost its
+    // language model 211 -> 290 ms and its sampler ~60 ms at 255. Elsewhere
+    // the tile stays the shared linear's eight.
+    esmfold2TokenRowTile: 2,
+    esmcRowTile: 2,
     // AF2's f32 attention projection at 8 rows a lane, stock flags, 128 x 255:
     // 1.912 -> 1.375 ms, bitwise identical (bench-attention-project.js).
     attentionProjectRowsPerLane: 8,

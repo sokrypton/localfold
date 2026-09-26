@@ -37,7 +37,7 @@ import {
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
   createLinearShader, createPrepareShader, createSwigluShader, linearGrid,
-  swigluGrid, QUERY_TILE,
+  ROW_TILE, swigluGrid, QUERY_TILE,
 } from "./block-webgpu.js";
 
 /**
@@ -276,10 +276,11 @@ export class EsmcTowerGpu {
     const keepPersistent = (allocation) => { persistent.push(allocation); return allocation; };
 
     const pipeline = (name, source) => this.pipelines.get(name, source);
-    // 🔴 THE LINEARS' ROW TILE IS TWO: at eight a 61-token fold ran ~40
-    // workgroups a pass. Each output sums k in order at any tile, so this is
-    // more workgroups for the same bits. `esmcRowTile` overrides.
-    const rowTile = deviceTuning(this.device).esmcRowTile ?? 2;
+    // 🔴 THE LINEARS' ROW TILE: the ampere prior takes two (at eight a
+    // 61-token fold ran ~40 workgroups a pass there), every other device the
+    // shared eight - a smaller tile re-reads the weights per row tile, which a
+    // T4 pays for. Each output sums k in order at any tile. See device-profile.js.
+    const rowTile = deviceTuning(this.device).esmcRowTile ?? ROW_TILE;
     const [normPipeline, qkvPipeline, preparePipeline, attentionPipeline,
       outPipeline, swigluPipeline, downPipeline, mixPipeline,
       finalNormPipeline, singlePipeline] = await Promise.all([
