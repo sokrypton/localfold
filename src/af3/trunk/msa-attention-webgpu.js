@@ -116,12 +116,53 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   key_mask[token] = largest;
 }`;
 
-  // The attention weights, from the pair alone. One workgroup per (head, i).
-  const attentionWeights = `${common}
+  // 🔴 THE LOGITS FOR EVERY HEAD FROM ONE NORMALISATION OF THE ROW. The softmax
+  // below is one workgroup a (head, i), and it used to compute its own logits -
+  // so every pair row (i, j) was layer-normed and read HEADS times over, each
+  // lane walking its own C_Z-float row: ~3 ms a pass at 384-512 channels. One
+  // thread a pair now normalises once and writes all HEADS logits, masked,
+  // into `attention`, which the softmax then reads in place. Each logit is the
+  // same expression summed in the same order, so this is bit-identical.
+  const attentionLogits = `${common}
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> key_mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> attention: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let pair_index = id.x + id.y * GRID_WIDTH * 64u;
+  if (pair_index >= TOKENS * TOKENS) { return; }
+  let i = pair_index / TOKENS;
+  let j = pair_index % TOKENS;
+  let base = pair_index * C_Z;
+  var total = 0.0;
+  var squares = 0.0;
+  for (var c = 0u; c < C_Z; c += 1u) {
+    let value = pair[base + c];
+    total += value;
+    squares += value * value;
+  }
+  let mean = total / f32(C_Z);
+  ${varianceCode("C_Z", "pair[base + c]")}
+  let inverse_std = inverseSqrt(variance + EPSILON);
+  var logit: array<f32, ${heads}>;
+  for (var head = 0u; head < HEADS; head += 1u) { logit[head] = 0.0; }
+  for (var c = 0u; c < C_Z; c += 1u) {
+    let value = (pair[base + c] - mean) * inverse_std * weights[W_PAIR_SCALE + c]
+      + weights[W_PAIR_OFFSET + c];
+    for (var head = 0u; head < HEADS; head += 1u) {
+      logit[head] += value * weights[W_PAIR_LOGITS + c * HEADS + head];
+    }
+  }
+  for (var head = 0u; head < HEADS; head += 1u) {
+    attention[(head * TOKENS + i) * TOKENS + j] = logit[head] + 1.0e9 * (key_mask[j] - 1.0);
+  }
+}`;
+
+  // ...and the softmax over j, one workgroup per (head, i), on those logits.
+  const attentionWeights = `${common}
+@group(0) @binding(0) var<storage, read_write> attention: array<f32>;
 
 var<workgroup> logits: array<f32, ${tokens}>;
 var<workgroup> reduce: array<f32, 64>;
@@ -131,29 +172,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let slot = group.x + group.y * GRID_WIDTH;
   if (slot >= HEADS * TOKENS) { return; }
-  let head = slot / TOKENS;
-  let i = slot % TOKENS;
   let local = local_id.x;
 
   for (var j = local; j < TOKENS; j += 64u) {
-    let base = (i * TOKENS + j) * C_Z;
-    var total = 0.0;
-    var squares = 0.0;
-    for (var c = 0u; c < C_Z; c += 1u) {
-      let value = pair[base + c];
-      total += value;
-      squares += value * value;
-    }
-    let mean = total / f32(C_Z);
-    ${varianceCode("C_Z", "pair[base + c]")}
-    let inverse_std = inverseSqrt(variance + EPSILON);
-    var logit = 0.0;
-    for (var c = 0u; c < C_Z; c += 1u) {
-      let value = (pair[base + c] - mean) * inverse_std * weights[W_PAIR_SCALE + c]
-        + weights[W_PAIR_OFFSET + c];
-      logit += value * weights[W_PAIR_LOGITS + c * HEADS + head];
-    }
-    logits[j] = logit + 1.0e9 * (key_mask[j] - 1.0);
+    logits[j] = attention[slot * TOKENS + j];
   }
   workgroupBarrier();
 
@@ -308,7 +330,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { keyMask, attentionWeights, project, average };
+  return { keyMask, attentionLogits, attentionWeights, project, average };
 }
 
 export class Af3MsaAttentionGpu {
@@ -388,9 +410,12 @@ export class Af3MsaAttentionGpu {
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
 
       run("msa.key-mask", compiled.keyMask, [maskBuffer, keyMask], Math.ceil(tokens / 64));
+      const logitGroups = spread(Math.ceil(tokens * tokens / 64));
+      run("msa.attention-logits", compiled.attentionLogits,
+          [pairBuffer, keyMask, weightBuffer, attention], logitGroups[0], logitGroups[1]);
       const weightGroups = spread(heads * tokens);
       run("msa.attention-weights", compiled.attentionWeights,
-          [pairBuffer, keyMask, weightBuffer, attention], weightGroups[0], weightGroups[1]);
+          [attention], weightGroups[0], weightGroups[1]);
       const perRow = spread(rows);
       // ...one workgroup a row now; see the note on the kernel.
       run("msa.project", compiled.project, [msaBuffer, weightBuffer, values, gate],

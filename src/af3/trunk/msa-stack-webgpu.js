@@ -469,9 +469,12 @@ export class Af3MsaStackGpu {
     const updateMsa = () => {
       const addMsaGroups = spread(ceil(rows * msaChannels, 64));
       run("msa.key-mask", pipelines["msa:keyMask"], [msaMask, keyMask], ceil(n, 64));
+      const logitGroups = spread(ceil(n * n, 64));
+      run("msa.attention-logits", pipelines["msa:attentionLogits"],
+          [pair, keyMask, attentionWeights, attention], logitGroups[0], logitGroups[1]);
       const weightGroups = spread(msaHeads * n);
       run("msa.attention-weights", pipelines["msa:attentionWeights"],
-          [pair, keyMask, attentionWeights, attention], weightGroups[0], weightGroups[1]);
+          [attention], weightGroups[0], weightGroups[1]);
       const perRow = spread(rows);
       // ...one workgroup a row now; see the note on the kernel.
       run("msa.project", pipelines["msa:project"],
