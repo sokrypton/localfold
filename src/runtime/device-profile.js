@@ -268,6 +268,9 @@ export const DEFAULT_TUNING = Object.freeze({
   // weights whatever the two above say; null means it does, `false` opts out.
   // See foldHolding in src/af3/fold.js.
   largeFoldReleasesWeights: null,
+  // ...and streams its trunk weights from their codes inside the fold; `false`
+  // keeps them decoded for the fold's passes. See setStreamedWeights.
+  largeFoldStreamsWeights: null,
   // 🔴 HOW MANY PAIRFORMER BLOCKS GO OUT BEFORE THE HOST WAITS. Each wait is a
   // full pipeline drain; the window exists to bound the queue and let an abort
   // land, not because the memory needs it. 16 is measured - but it was measured

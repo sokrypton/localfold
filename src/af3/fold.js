@@ -45,7 +45,7 @@ import { structuralBatch, structuralLayout, structuralToResidue }
   from "./featurise/structural-tokens.js";
 import { Af3DiffusionConditioningGpu } from "./diffusion/diffusion-conditioning-webgpu.js";
 import { openddeConfidence } from "./confidence/opendde-confidence.js";
-import { releaseResidentWeights } from "../runtime/resident.js";
+import { releaseResidentWeights, setStreamedWeights } from "../runtime/resident.js";
 import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
   from "../runtime/device-memory.js";
 import { deviceTuning } from "../runtime/device-profile.js";
@@ -695,6 +695,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
   } catch (error) {
     held.releaseAll();
     throw error;
+  } finally {
+    setStreamedWeights(device, null);
   }
 }
 
@@ -718,6 +720,20 @@ async function foldHolding(device, batch, weights, options, held) {
       >= WEIGHT_RELEASE_MIN_BYTES;
   const keepWeights = (knob) => !largeFold && (deviceTuning(device)[knob]
     ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) === true;
+  // 🔴 AND A LARGE FOLD STREAMS ITS TRUNK WEIGHTS INSIDE THE FOLD TOO. Kept for
+  // the four passes, the trunk's decoded `w.` weights were 2.35 GB of
+  // IntelliFold-2's 3.34 GB peak at 255 residues; streamed, each block's int5
+  // codes are uploaded and decoded on the device when the block runs, and the
+  // stack holds one block's worth. Whatever an earlier, smaller fold left
+  // cached goes first, or the fold would hold both. foldBatch turns it off.
+  // ...and only where the trunk runs at the fold's largest token count. OpenDDE
+  // re-tokenises into MORE tokens after the trunk, so its peak is the sampler's
+  // and streaming there cost +2.4% for 5 MiB (2349 -> 2344).
+  if (largeFold && largestTokens === batch.tokens
+    && deviceTuning(device).largeFoldStreamsWeights !== false) {
+    releaseResidentWeights(device, "w.");
+    setStreamedWeights(device, "w.");
+  }
   const { tokens, dense } = batch;
   const stage = (name, detail = {}) => options.onStage?.(name, detail);
 

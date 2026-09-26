@@ -39,6 +39,38 @@ const byDevice = new WeakMap();
 const heldByDevice = new WeakMap();
 
 /**
+ * 🔴 STREAMED WEIGHTS: KEEP THE CODES' SOURCE, NOT THE DECODED TENSOR. With a
+ * prefix set, every device-decoded resident buffer whose label starts with it
+ * is re-decoded into a transient buffer on each call instead of being cached -
+ * so a stack holds one block's worth of that label rather than all of them.
+ * The trunk's `w.` weights are read four times a fold; decoded and kept, they
+ * are 2.35 GB of IntelliFold-2's peak at 255 residues. `null` turns it off and
+ * gives the transient buffers back. See foldHolding in src/af3/fold.js.
+ */
+const streamedPrefix = new WeakMap();
+/** Buffers in each label's ring: more than any block holds under one label. */
+const STREAM_RING = 3;
+const transientByDevice = new WeakMap();
+export function setStreamedWeights(device, prefix) {
+  if (prefix === null || prefix === undefined) {
+    streamedPrefix.delete(device);
+    const transients = transientByDevice.get(device);
+    if (transients !== undefined) {
+      for (const ring of transients.values()) {
+        for (const buffer of ring.buffers) {
+          if (buffer === undefined) continue;
+          noteDestroy(device, buffer.size, `${buffer.label}`);
+          buffer.destroy();
+        }
+      }
+      transientByDevice.delete(device);
+    }
+    return;
+  }
+  streamedPrefix.set(device, prefix);
+}
+
+/**
  * @param {GPUDevice} device
  * @param {object} key      the weight object this data belongs to
  * @param {string} label    names the buffer, and separates two uses of one key
@@ -67,6 +99,44 @@ const heldByDevice = new WeakMap();
  */
 export async function residentWeightBufferFilled(device, key, label, byteLength, fill,
                                                  variant = "") {
+  // 🔴 A STREAMED LABEL IS REFILLED EVERY CALL INTO ONE TRANSIENT BUFFER. See
+  // setStreamedWeights: the decoded tensor is not kept, the codes are uploaded
+  // and decoded on the device each time a block asks. Safe to share one buffer
+  // a label because a stack fetches a block's weights, encodes and submits it
+  // before fetching the next, and the queue orders the next fill after it.
+  const streamed = streamedPrefix.get(device);
+  if (streamed !== undefined && label.startsWith(streamed)) {
+    // 🔴 A SMALL RING A LABEL, NOT ONE BUFFER: a block may hold two tensors
+    // under one label - both grid attentions are `w.grid` - and one shared
+    // buffer let the second fill overwrite the first before the block ran
+    // (IntelliFold-2's pLDDT moved 34.78 -> 33.97). Each weight object takes the
+    // next slot on first sight and keeps it, so same-label tensors of a block
+    // are in different buffers and a pass finds them where the last one did.
+    const size = Math.ceil(byteLength / 4) * 4;
+    let transients = transientByDevice.get(device);
+    if (transients === undefined) transientByDevice.set(device, transients = new Map());
+    const ringKey = `${label}\u0000${variant}\u0000${size}`;
+    let ring = transients.get(ringKey);
+    if (ring === undefined) {
+      ring = { buffers: [], next: 0, slotOf: new WeakMap() };
+      transients.set(ringKey, ring);
+    }
+    let index = ring.slotOf.get(key);
+    if (index === undefined) {
+      index = ring.next % STREAM_RING;
+      ring.next += 1;
+      ring.slotOf.set(key, index);
+    }
+    let buffer = ring.buffers[index];
+    if (buffer === undefined) {
+      noteAllocation(device, `${label}.stream`, size);
+      buffer = device.createBuffer({ label: `${label}.stream`, size,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      ring.buffers[index] = buffer;
+    }
+    await fill(buffer);
+    return buffer;
+  }
   const slotOf = (forKey) => forKey.get(variant === "" ? label : `${label}\u0000${variant}`);
   let forDevice = byDevice.get(device);
   if (forDevice === undefined) {
