@@ -44,7 +44,8 @@ import { structuralBatch, structuralLayout, structuralToResidue }
 import { Af3DiffusionConditioningGpu } from "./diffusion/diffusion-conditioning-webgpu.js";
 import { openddeConfidence } from "./confidence/opendde-confidence.js";
 import { releaseResidentWeights } from "../runtime/resident.js";
-import { memoryBudgetBytes, residencyAllowed } from "../runtime/device-memory.js";
+import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
+  from "../runtime/device-memory.js";
 import { deviceTuning } from "../runtime/device-profile.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../heads/tm-score.js";
@@ -447,7 +448,8 @@ export function normalFrom(seed) {
  * gather, mask and conditioning the head reads is the structural batch's. The
  * coordinates are mapped back the moment the sampler returns.
  */
-async function expandToStructuralTokens(device, batch, trunk, targetFeat, weights, stage) {
+async function expandToStructuralTokens(device, batch, trunk, targetFeat, weights, stage,
+                                        trunkPairAllocation) {
   const layout = structuralLayout(batch);
   const structuralFeatures = structuralPairFeatures(layout, batch.asymId);
   const structural = structuralBatch(batch, layout);
@@ -457,8 +459,11 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
   // ...and its pair goes straight into the refiner below without a round trip;
   // see the note on `keepPair` in structural-expander-webgpu.js.
   const expanded = await new Af3StructuralExpanderGpu(device).run(
-    layout, { single: trunk.single, pair: trunk.pair, targetFeat, asymId: batch.asymId },
+    layout, { single: trunk.single, pair: trunk.pair, targetFeat, asymId: batch.asymId,
+              pairBuffer: trunkPairAllocation?.buffer },
     expander, structuralFeatures, batch.tokens, { keepPair: true });
+  // The expander has read it (its readback of the single has completed).
+  trunkPairAllocation?.release();
 
   // A subtoken's target_feat is its parent's plus a role embedding - the same
   // rule the expander applies to the single, on the other representation.
@@ -517,12 +522,22 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
   // the raw 139. It ran anyway, on a 256-row projection indexed as 267, and the
   // checker that should have said so had `PAIR_CHANNELS = 128` typed into it -
   // so both sides of its comparison were NaN and `NaN > bound` is false.
+  // 🔴 AND ITS OUTPUT STAYS ON THE DEVICE TOO. Read back, it was
+  // `tokens^2 x 128` floats - 125 MB at 495 structural tokens - uploaded again
+  // by the transformer on the sampler's first step. Both readers bind a
+  // `{ buffer }`; the fold releases it with the refined pair.
+  const pairConditioningBytes = n * n * weights.diffusion.conditioning.pairChannels * 4;
+  noteAllocation(device, "opendde.pair-cond", pairConditioningBytes);
+  const pairConditioningBuffer = device.createBuffer({
+    label: "opendde.pair-cond", size: pairConditioningBytes,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
   const pairConditioning = (await new Af3DiffusionConditioningGpu(device).run({
       tokens: n, trunkSingle: refined.single,
       trunkPairBuffer: expanded.pairAllocation.buffer,
       targetFeat: structuralTargetFeat, noiseLevel: 1, features: structural.features,
       dialect: weights.diffusion.dialect,
-    }, weights.diffusion.conditioning)).pair;
+    }, weights.diffusion.conditioning, { outputs: { pair: pairConditioningBuffer } })).pair;
 
   return {
     layout, structural, attentionBias,
@@ -547,6 +562,10 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
       // must release it.
       trunkPair: undefined, refinedPair: expanded.pairAllocation,
       pairConditioning,
+      releasePairConditioning: () => {
+        noteDestroy(device, pairConditioningBytes, "opendde.pair-cond");
+        pairConditioningBuffer.destroy();
+      },
     },
   };
 }
@@ -910,6 +929,12 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // did. A tolerance, or a caller asking for `recycleDeltas`, reads every pass
   // as before, because both compare host arrays.
   let previousBuffers;
+  // 🔴 OpenDDE'S EXPANDER READS THE LAST PASS'S PAIR, SO THAT PASS KEEPS IT ON
+  // THE DEVICE. The host array is still read back - a retry resumes from it -
+  // but the expander binds this instead of uploading `tokens^2 x 384` again.
+  // Only this loop sets it, never a resumed trunk, whose allocation is gone.
+  const keepFinalPair = weights.trunk.dialect.structuralTokens === true;
+  let finalPair;
   const readEveryPass = (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true
     || options.recycleDistances === true;
   void trunkPairChannels; void trunkSingleChannels;
@@ -989,7 +1014,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // ../heads/contact-threshold.js.
       contactClasses: af3ContactClasses(batch, tokens),
     }, weights.trunk, weights.trunk.dialect, {
-      keepOutputs: !lastPass,
+      keepOutputs: !lastPass || keepFinalPair,
       readback: { pair: readAll, single: readAll,
                   logits: readAll || featureTolerance > 0 || options.recycleDistances === true },
       onStage: (name, ms) => stage("trunk", { name, ms }),
@@ -1033,6 +1058,10 @@ export async function foldBatch(device, batch, weights, options = {}) {
     recycledFrom?.single.release();
     previousBuffers = lastPass ? undefined
       : { pair: trunk.pairAllocation, single: trunk.singleAllocation };
+    if (lastPass && keepFinalPair) {
+      trunk.singleAllocation.release();
+      finalPair = trunk.pairAllocation;
+    }
     const comparable = hasPrevious && previousPair !== undefined && trunk.pair !== undefined
       && previousPair.length === trunk.pair.length
       && previousSingle.length === trunk.single.length;
@@ -1070,8 +1099,10 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // compute_tol takes over a structure. What the right number is has been
     // measured on two inputs and not on a corpus - see docs/AF3.md.
     if (shouldStopRecycling(recycleDeltas, featureTolerance)) {
-      // Stopping early leaves this pass's kept buffers with nothing to feed.
-      previousBuffers?.pair.release();
+      // Stopping early leaves this pass's kept buffers with nothing to feed -
+      // except OpenDDE's pair, which its expander reads.
+      if (keepFinalPair) finalPair = previousBuffers?.pair;
+      else previousBuffers?.pair.release();
       previousBuffers?.single.release();
       previousBuffers = undefined;
       await stage("recycle-converged", { pass, passes: recycles + 1 });
@@ -1124,7 +1155,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // stage callbacks the page's progress bar reads, and the PDB the viewer
   // draws. A separate driver would have to reproduce all of it.
   const structural = weights.trunk.dialect.structuralTokens
-    ? await expandToStructuralTokens(device, batch, trunk, targetFeat, weights, stage)
+    ? await expandToStructuralTokens(device, batch, trunk, targetFeat, weights, stage,
+                                     finalPair)
     : undefined;
   const headInput = structural === undefined
     ? { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair }
@@ -1451,6 +1483,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // this is the one point at which nothing can still read it. At 384 structural
   // tokens it is 216 MiB.
   structural?.headInput.refinedPair.release();
+  structural?.headInput.releasePairConditioning();
 
   // The confidence head reads the sample back.
   const beta = batch.tokenAtomsToPseudoBeta;

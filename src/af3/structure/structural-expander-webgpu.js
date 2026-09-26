@@ -231,7 +231,9 @@ export class Af3StructuralExpanderGpu {
       tables.set(weights.nextBbChainEmbedding, 6 * channels);
       tables.set(weights.rolePairTypeEmbedding, 8 * channels);
       const embeddingBuffer = up("expand.embeddings", tables);
-      const pairIn = up("expand.pair-in", embeddings.pair);
+      // The trunk's last pair when the caller still holds it on the device.
+      const pairIn = embeddings.pairBuffer !== undefined ? { buffer: embeddings.pairBuffer }
+        : up("expand.pair-in", embeddings.pair);
       const pairOut = keep(this.allocator.allocate(
         "expand.pair-out", tokens * tokens * channels * 4,
         storage | GPUBufferUsage.COPY_SRC));
