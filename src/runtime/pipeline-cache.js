@@ -94,6 +94,7 @@ export class ComputePipelineCache {
             + ` against ${JSON.stringify((now[at] ?? "").trim().slice(0, 90))}`;
         throw new Error(`WebGPU pipeline cache key collision for ${key} - ${detail}`);
       }
+      cached.target.requests += 1;
       return cached.target.upgraded ?? cached.target.pipeline;
     }
     // 🔴 COMPILED WITHOUT ITS UNUSED CONSTANTS, SO TWO KERNELS THAT DIFFER
@@ -112,6 +113,7 @@ export class ComputePipelineCache {
     if (shared !== undefined) {
       pipelineCacheStats.shared += 1;
       this.#pipelines.set(key, { code, entryPoint, target: shared });
+      shared.requests += 1;
       return shared.upgraded ?? shared.pipeline;
     }
     pipelineCacheStats.misses += 1;
@@ -146,7 +148,7 @@ export class ComputePipelineCache {
           entryPoint,
         },
       });
-    const target = { pipeline };
+    const target = { pipeline, requests: 1 };
     this.#pipelines.set(key, { code, entryPoint, target });
     this.#byContent.set(content, target);
     // 🔴 TIERED: THE UNROLLED KERNEL FOLLOWS, ONE AT A TIME, BEHIND THE FOLD.
@@ -178,7 +180,13 @@ export class ComputePipelineCache {
       while (this.#pendingUpgrades.length > 0) {
         const quiet = UPGRADE_QUIET_MS - (performance.now() - this.#lastMiss);
         if (quiet > 0) { await new Promise((resolve) => setTimeout(resolve, quiet)); continue; }
-        const { key, target, code, entryPoint, pipeline } = this.#pendingUpgrades.shift();
+        // The most-requested kernel first: a stack asks again per dispatch, so
+        // the count is how hot it is, and the hot ones are the warm fold's time.
+        let pick = 0;
+        this.#pendingUpgrades.forEach((entry, at) => {
+          if (entry.target.requests > this.#pendingUpgrades[pick].target.requests) pick = at;
+        });
+        const { key, target, code, entryPoint, pipeline } = this.#pendingUpgrades.splice(pick, 1)[0];
         try {
           await pipeline;
           const unrolled = await this.device.createComputePipelineAsync({
