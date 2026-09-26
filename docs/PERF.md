@@ -568,6 +568,52 @@ Warm 255-residue folds, stock flags, against the table above's last column:
 OpenDDE 19.12 -> **17.87 s**, IntelliFold-2 26.42 -> **24.92**, protenix2 9.03 ->
 **8.6**, ESMFold2 4.57 -> **3.99** (with the confidence-head commit before it).
 
+🔴 **THREE KERNELS RAN A THREAD A ROW OF SOMETHING LARGE**, found by reading
+`groupsPerPass` off `--profile-batched`. `embed.project-tokens` and
+`embed.project-single-init` were a thread a TOKEN - 4 workgroups at 255 tokens,
+12 and 5 ms a trunk pass at OpenDDE's 384 x 384 - and are a thread an output
+channel now (0.1 ms). `template.embed` was a thread a pair row reading its row
+of the 384-wide pair at a 384-float stride and recomputing each normalised
+value once per output channel: **14.3 -> 0.64 ms a slot**, four rows staged a
+workgroup. All three sum in the same order and are bit-identical.
+
+🔴 **AND THE HANDOFFS AROUND THE SAMPLER STILL WENT THROUGH THE HOST.** OpenDDE's
+expander uploaded the trunk pair the trunk had just read back (100 MB at 255
+residues), and its diffusion conditioning read its pair back (125 MB at 495
+structural tokens) for the transformer to upload on the first step. ESMFold2's
+confidence head read back the trunk pair and the relative encoding (64 MiB
+each) to upload them, and added the bond term on the host. All are device
+buffers now - OpenDDE 17.81 -> 17.37 s warm, ESMFold2 3.96 -> 3.56 - and the
+cost is peak memory: +121 MiB and +127 MiB at 255, pair-sized and so quadratic,
+which is why ESMFold2 keeps the host copies where a memory ceiling cannot spare
+them (the page sets none).
+
+🔴 **THE TRIANGLE'S OUTPUT PROJECTION WANTED ITS OWN TILE.** Its accumulator is
+a vec2 where the input projection's is a vec4, so at the same 32 x 32 tile it
+held half the registers: at 32 x 64 it is 4.34 -> 3.26 ms at 384 channels and
+0.56 -> 0.44 at 128, bit-identical, where the input projection gets slower.
+`triangleProjectOutColumns` (ampere prior, 64), and ONLY where the kernel
+accumulates in f32: with f16 accumulators it is no faster and rounds
+differently (relRMS 2.13e-3 against f32, where 32 x 32 is 1.70e-3), which moved
+all six AF3-lineage signatures at the spec floor - the one gate arm that runs
+this kernel with `shader-f16` - until it was confined. The template stack and
+ESMFold2's trunk had never read `trianglePairProjectTile` at all and ran the
+32 x 16 default; they take both now. 🔴 The first cut left the vec2 accumulator
+array sized by the INPUT tile - WGSL clamps an out-of-range index into the
+array, so it compiled, ran and returned a wrong tensor, and the chain-geometry
+gate is what refused the fold (CA median 6.7 A).
+
+Warm 255-residue folds at the end of the night, stock flags: AF3 3.64 -> **3.5
+s**, IntelliFold-2 26.42 -> **24.0**, OpenDDE 19.12 -> **16.88**, protenix2 9.03 ->
+**8.6**, ESMFold2 4.57 -> **3.33**. Every change is bit-identical except the two
+that move f64 host accumulation to f32 on the device (OpenDDE's s1/s2 and
+ESMFold2's head projections, both at 1e-8 of pLDDT).
+
+What is left under stock flags is mostly arithmetic: the pair track's f32
+kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,
+`tri.project` 14, the vector split 13-15, `tri.project-out` ~12, `grid.attend`
+and `tri.contract` ~9), and OpenDDE's trunk at 255 is 86% GPU-busy.
+
 ## The split pair transition, for a device with no matrix units
 
 🔴 **NO MATRIX UNITS MEANT NO SPLIT, AND NO VISITOR HAS MATRIX UNITS.** The

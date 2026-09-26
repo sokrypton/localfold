@@ -289,7 +289,8 @@ export const DEFAULT_TUNING = Object.freeze({
   // 🔴 THE TRIANGLE'S OUTPUT PROJECTION'S COLUMN TILE, null meaning the input
   // projection's. Its accumulator is a vec2 where the input's is a vec4, so it
   // wants twice the columns at the same register cost. AF3's pair track reads
-  // it; AF2's does not. See src/kernels/triangle/shaders.js.
+  // it, and only where that kernel accumulates in f32 - see compilePairTrack;
+  // AF2's does not. See src/kernels/triangle/shaders.js.
   triangleProjectOutColumns: null,
   // 🔴 HOW MANY THREADS A TRANSITION SHOULD AIM TO HAVE IN FLIGHT. The
   // transition's dispatch is rows-only, so a short track cannot fill a large

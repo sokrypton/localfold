@@ -137,6 +137,8 @@ export async function compilePairTrack(cache, options) {
   // tri.project WAS 13% of the trunk's GPU time before this and is 10% after,
   // which is the point rather than a correction.
   const accumulatePrecision = options.accumulatePrecision ?? "f32";
+  const outColumns = accumulatePrecision === "f32"
+    ? options.triangleProjectOutColumns ?? undefined : undefined;
   const shape = {
     length: n, cZ: channels, cHidden: channels, weightPrecision, accumulatePrecision,
     // 🔴 THE DEVICE'S OWN LIMIT, because the staged LayerNorm's row tile is
@@ -206,12 +208,17 @@ export async function compilePairTrack(cache, options) {
       // 🔴 THE PROJECTION TILE IS THE CALLER'S, because it is an occupancy
       // choice and this file cannot see the device. undefined keeps
       // src/kernels/triangle/shaders.js's default, which is every device but ampere.
-      // ...and the output kernel's own column tile, where the device sets one.
-      options.triangleProjectTile === undefined && options.triangleProjectOutColumns == null
+      // ...and the output kernel's own column tile, where the device sets one
+      // AND the kernel accumulates in f32. 🔴 With f16 accumulators it is no
+      // faster (0.438 ms both ways at 128 channels) and it ROUNDS differently -
+      // relRMS 2.13e-3 against f32 where 32 x 32 is 1.70e-3 - which moved
+      // every AF3-lineage signature at the spec floor, the one arm that runs
+      // this kernel with shader-f16. A stock NVIDIA browser has no f16 and is
+      // where it pays.
+      options.triangleProjectTile === undefined && outColumns === undefined
         ? undefined
         : { ...(options.triangleProjectTile ?? PROJECT_TILE_DEFAULT),
-            ...(options.triangleProjectOutColumns == null
-              ? {} : { outColumns: options.triangleProjectOutColumns }) },
+            ...(outColumns === undefined ? {} : { outColumns }) },
       true,
       undefined,
       // 🔴 THE NORMALISED HIDDEN GOES BACK INTO `a`, WHICH IS DEAD BY THEN.
