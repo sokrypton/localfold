@@ -394,6 +394,38 @@ Caching the transformer's bind groups and scratch tensors bought nothing
 measurable against that - the stage sat at 45-46 ms either way - so the next
 thing there is chaining the stages ON THE DEVICE, not another cache.
 
+## The 2026-09-26 speed pass, before and after
+
+Every row is a page-default fold under `LOCALFOLD_STOCK_FLAGS=1` on the A100 -
+what an NVIDIA visitor's browser gets - original `8d6bb47` against the pass's
+last commit, in clean worktrees, two folds each (first, then warm). AF3-lineage
+models: 25 diffusion steps, 3 recycles; OpenDDE 16 steps. "59" is the
+59-residue fixture alignment; "255" is 5CAJ chain A from its sequence alone.
+pLDDT is identical to three decimals in every row, and the AF3 row, boltz2 and
+rosettafold3 are byte-identical folds.
+
+| model | size | first fold | warm fold | warm speedup |
+|---|---:|---:|---:|---:|
+| AlphaFold 3 | 59 | 4.27 -> 1.94 s | 1.46 -> 1.11 s | 1.32x |
+| AlphaFold 3 | 255 | 8.77 -> 4.50 | 6.03 -> 3.64 | **1.66x** |
+| boltz2 | 59 | 5.65 -> 2.37 | 1.72 -> 1.23 | 1.40x |
+| boltz2 | 255 | 13.47 -> 5.76 | 7.17 -> 4.73 | 1.52x |
+| protenix2 | 59 | 5.17 -> 2.55 | 2.26 -> 1.68 | 1.35x |
+| protenix2 | 255 | 17.56 -> 10.04 | 13.53 -> 9.03 | 1.50x |
+| rosettafold3 | 59 | 4.39 -> 2.04 | 1.48 -> 1.07 | 1.38x |
+| IntelliFold-2 | 59 | 9.49 -> 4.56 | 6.32 -> 3.38 | 1.87x |
+| IntelliFold-2 | 255 | 63.88 -> 27.66 | 60.37 -> 26.42 | **2.29x** |
+| OpenDDE | 59 | 7.55 -> 3.46 | 4.30 -> 2.45 | 1.76x |
+| OpenDDE | 255 | 38.62 -> 20.39 | 34.96 -> 19.12 | **1.83x** |
+| ESMFold2 (with its head) | 255 | 6.26 -> 5.14 | 5.50 -> 4.57 | 1.20x |
+| AF2 monomer | 255 | 1.76 -> 1.73 | 1.37 -> 1.36 | (untouched) |
+
+rosettafold3 at 255 from a single sequence is refused by the geometry gate on
+BOTH commits, so it has no row. The first-fold column gains most on the AF3
+lineage because of the f32 weight-decode fix below (~2 s a first fold without
+`shader-f16`), which a flagged or Apple device never paid. On Colab's T4 (flags
+on) the same series measured 1.1-1.3x a trunk pass; see below.
+
 🔴 **THE AF3 TRUNK HAD THE SAME HABIT, AND IT WAS 44% OF A PASS.** Five stages
 - embedder, template, MSA stack, pairformer, distogram - each took the pair as
 a Float32Array, uploaded it, computed and read it back, and a readback is a
