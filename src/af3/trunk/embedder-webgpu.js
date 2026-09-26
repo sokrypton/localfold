@@ -161,13 +161,21 @@ const PAIR_SOURCE_WIDTH: u32 = ${pairSourceWidth}u;
 @group(0) @binding(4) var<storage, read_write> msa_from_target: array<f32>;
 @group(0) @binding(5) var<storage, read> pair_source: array<f32>;
 
+// 🔴 ONE THREAD AN OUTPUT CHANNEL, NOT ONE A TOKEN. A thread a token walked
+// every channel in turn - 255 threads at 255 tokens, 4 workgroups on a card
+// that holds thousands - and at OpenDDE's 384 x 384 that was 12 ms a trunk pass.
+// Each output still sums over f in ascending order, so it is bit-identical.
+const OUTPUTS: u32 = ${Math.max(pairChannels, msaChannels)}u;
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let token = id.x;
-  if (token >= TOKENS) { return; }
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= TOKENS * OUTPUTS) { return; }
+  let token = slot / OUTPUTS;
+  let c = slot % OUTPUTS;
   let base = token * FEATURE_WIDTH;
   let pair_base = token * PAIR_SOURCE_WIDTH;
-  for (var c = 0u; c < C_Z; c += 1u) {
+  if (c < C_Z) {
     var left_total = 0.0;
     var right_total = 0.0;
     for (var f = 0u; f < PAIR_SOURCE_WIDTH; f += 1u) {
@@ -178,7 +186,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     left[token * C_Z + c] = left_total;
     right[token * C_Z + c] = right_total;
   }
-  for (var c = 0u; c < C_M; c += 1u) {
+  if (c < C_M) {
     var total = 0.0;
     for (var f = 0u; f < FEATURE_WIDTH; f += 1u) {
       total += target_feat[base + f] * weights[W_MSA_TARGET + f * C_M + c];
@@ -198,17 +206,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> single_init: array<f32>;
 
+// One thread an output, as projectTokens.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let token = id.x;
-  if (token >= TOKENS) { return; }
-  for (var c = 0u; c < C_S; c += 1u) {
-    var value = 0.0;
-    for (var f = 0u; f < FEATURE_WIDTH; f += 1u) {
-      value += target_feat[token * FEATURE_WIDTH + f] * weights[W_SINGLE + f * C_S + c];
-    }
-    single_init[token * C_S + c] = value;
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= TOKENS * C_S) { return; }
+  let token = slot / C_S;
+  let c = slot % C_S;
+  var value = 0.0;
+  for (var f = 0u; f < FEATURE_WIDTH; f += 1u) {
+    value += target_feat[token * FEATURE_WIDTH + f] * weights[W_SINGLE + f * C_S + c];
   }
+  single_init[token * C_S + c] = value;
 }`;
 
   // One workgroup per token pair: left_i + right_j + the relative encoding's
@@ -639,12 +648,13 @@ export class Af3EmbedderGpu {
         const singleInit = keep(this.allocator.allocate(
           "af3-embed.single-init", tokens * singleChannels * 4, storage));
         run("embed.project-single-init", compiled.projectSingleInit,
-            [targetFeat, weightBuffer, singleInit], Math.ceil(tokens / 64));
+            [targetFeat, weightBuffer, singleInit],
+            ...spread(Math.ceil(tokens * singleChannels / 64)));
         pairSource = singleInit;
       }
       run("embed.project-tokens", compiled.projectTokens,
           [targetFeat, weightBuffer, left, right, msaFromTarget, pairSource],
-          Math.ceil(tokens / 64));
+          ...spread(Math.ceil(tokens * Math.max(pairChannels, msaChannels) / 64)));
       const perPair = spread(pairs);
       run("embed.assemble-pair", compiled.assemblePair,
           [left, right, previousPair, features, weightBuffer, bondMatrix, pair],
