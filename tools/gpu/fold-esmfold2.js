@@ -468,6 +468,11 @@ export async function main(device, args = []) {
         }),
       },
       weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
+      // 🔴 AND THE CONFIDENCE HEAD, WHICH THE PAGE RUNS ON EVERY FOLD. This
+      // literal named everything the first fold passes except this, so every
+      // "warm" figure it printed left out a stage that is ~1.3 s at 255 tokens -
+      // the allow-list trap, measured on the tool instead of the page.
+      confidenceWeights,
       tower: runTower,
       languageModel: !noPlm,
       lmMaskFraction: lmMask,
