@@ -120,7 +120,14 @@ const LINUX_HEADLESS = process.env.LOCALFOLD_HEADLESS === "1";
 // ask what a visitor actually gets rather than what this box can be made to do.
 // tools/cdp.py carries the same two flags, so the PAGE numbers are no different.
 const STOCK_FLAGS = process.env.LOCALFOLD_STOCK_FLAGS === "1";
-const PLATFORM_FLAGS = process.platform === "linux"
+// LOCALFOLD_SWIFTSHADER=1 asks for WebGPU on the CPU on purpose - a machine
+// with no GPU driver, such as a Colab TPU VM. Chrome gives WebGPU SwiftShader
+// only when told to; pair it with --allow-software.
+const SWIFTSHADER = process.env.LOCALFOLD_SWIFTSHADER === "1";
+const PLATFORM_FLAGS = SWIFTSHADER
+  ? ["--no-sandbox", "--use-webgpu-adapter=swiftshader", "--enable-unsafe-swiftshader",
+     "--use-angle=swiftshader"]
+  : process.platform === "linux"
   ? ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native",
      "--ignore-gpu-blocklist", "--no-sandbox",
      // 🔴 WITHOUT THIS A DISPLAY-LESS BOX BENCHES THE CPU AND SAYS SO ONLY IN

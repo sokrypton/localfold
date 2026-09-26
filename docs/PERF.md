@@ -1024,7 +1024,15 @@ kernels; `--tune-json={"runtimeLoopBounds":"tiered"}` puts it back.
 is the flash-attention kernel and nothing else (the Colab A100 gave the same
 pair with the knob on and off); the other seven and all of `test:stock` and
 `test:spec-floor` are unchanged. An M2 inherits the default too and has not
-measured it. Colab also offered an A100 (the ampere prior's
+measured it.
+
+🔴 **A COLAB TPU CANNOT RUN LOCALFOLD.** WebGPU reaches hardware only through a
+Vulkan/Metal/D3D12 driver and a TPU has none, so Chrome on a TPU VM gives
+WebGPU nothing but SwiftShader - the VM's 24 host CPU cores, with the TPU idle.
+`LOCALFOLD_SWIFTSHADER=1` (gpu-chrome.mjs, with `--allow-software`) asks for
+exactly that: Chrome's GPU process sat at ~13 cores for 15 minutes and had not
+finished `probe-tuning.js`, let alone a fold. Using a TPU means a JAX backend,
+not a faster WebGPU. Colab also offered an A100 (the ampere prior's
 own architecture) and a G4; H100 was refused on Pro, and neither was measured.
 
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
