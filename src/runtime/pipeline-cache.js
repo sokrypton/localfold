@@ -61,7 +61,8 @@ export class ComputePipelineCache {
 
   /** Whether sources compile with opaque loop bounds; see withRuntimeLoopBounds. */
   get runtimeLoopBounds() {
-    return deviceTuning(this.device).runtimeLoopBounds === true;
+    const value = deviceTuning(this.device).runtimeLoopBounds;
+    return value === true || value === "tiered" ? value : false;
   }
 
   get(key, code, entryPoint = "main") {
@@ -90,7 +91,7 @@ export class ComputePipelineCache {
             + ` against ${JSON.stringify((now[at] ?? "").trim().slice(0, 90))}`;
         throw new Error(`WebGPU pipeline cache key collision for ${key} - ${detail}`);
       }
-      return cached.pipeline;
+      return cached.target.upgraded ?? cached.target.pipeline;
     }
     // 🔴 COMPILED WITHOUT ITS UNUSED CONSTANTS, SO TWO KERNELS THAT DIFFER
     // ONLY IN ONE THEY DO NOT READ ARE ONE PIPELINE. Most factories emit a
@@ -100,13 +101,15 @@ export class ComputePipelineCache {
     // driver compile on a user's first fold. The collision check above still
     // compares what the caller passed.
     const stripped = stripUnusedConstants(code);
-    const compiled = this.runtimeLoopBounds ? withRuntimeLoopBounds(stripped) : stripped;
-    const content = `${entryPoint}\u0000${compiled}`;
+    const mode = this.runtimeLoopBounds;
+    const opaque = mode === false ? stripped : withRuntimeLoopBounds(stripped);
+    const compiled = opaque;
+    const content = `${entryPoint}\u0000${stripped}`;
     const shared = this.#byContent.get(content);
     if (shared !== undefined) {
       pipelineCacheStats.shared += 1;
-      this.#pipelines.set(key, { code, entryPoint, pipeline: shared });
-      return shared;
+      this.#pipelines.set(key, { code, entryPoint, target: shared });
+      return shared.upgraded ?? shared.pipeline;
     }
     pipelineCacheStats.misses += 1;
     // 🔴 A SHADER THAT ASKS FOR f16 ON A DEVICE WITHOUT IT FAILS AS A WGSL PARSE
@@ -140,10 +143,28 @@ export class ComputePipelineCache {
           entryPoint,
         },
       });
-    this.#pipelines.set(key, { code, entryPoint, pipeline });
-    this.#byContent.set(content, pipeline);
+    const target = { pipeline };
+    this.#pipelines.set(key, { code, entryPoint, target });
+    this.#byContent.set(content, target);
+    // 🔴 TIERED: THE UNROLLED KERNEL FOLLOWS, ONE AT A TIME, BEHIND THE FOLD.
+    // The opaque-bound variant compiles ~12x faster and runs up to 1.5x slower
+    // (a T4's warm AF3 fold at 68 residues, 1.2 -> 1.9 s), so a first fold takes
+    // it and the constant-bound one compiles in the background, serially so it
+    // holds one of a Colab VM's two cores; a later `get` returns it once ready.
+    if (mode === "tiered" && opaque !== stripped) {
+      this.#upgrades = this.#upgrades
+        .then(() => pipeline)
+        .then(() => this.device.createComputePipelineAsync({
+          label: `${key}.unrolled`, layout: "auto",
+          compute: { module: this.device.createShaderModule({ label: `${key}.unrolled.wgsl`,
+            code: stripped }), entryPoint },
+        }))
+        .then((unrolled) => { target.upgraded = Promise.resolve(unrolled); }, () => {});
+    }
     return pipeline;
   }
+
+  #upgrades = Promise.resolve();
 
   get size() {
     return this.#pipelines.size;
