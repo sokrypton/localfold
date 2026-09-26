@@ -26,6 +26,9 @@ export const pipelineCacheStats = {
   hits: 0, misses: 0, shared: 0, hitSourceBytes: 0, byKey: new Map(),
 };
 
+/** How long the cache must go without a new pipeline before upgrading one. */
+const UPGRADE_QUIET_MS = 2000;
+
 export class ComputePipelineCache {
   device;
   #pipelines = new Map
@@ -151,20 +154,45 @@ export class ComputePipelineCache {
     // (a T4's warm AF3 fold at 68 residues, 1.2 -> 1.9 s), so a first fold takes
     // it and the constant-bound one compiles in the background, serially so it
     // holds one of a Colab VM's two cores; a later `get` returns it once ready.
+    // 🔴 AND ONLY ONCE THE FOLD HAS STOPPED ASKING FOR PIPELINES. Started
+    // beside the first fold, the unrolled compiles took one of a Colab VM's two
+    // cores from it - ESMFold2's first fold went 4.5 -> 6.7 s - so they wait
+    // for a quiet spell with no new request (see #drainUpgrades).
+    this.#lastMiss = performance.now();
     if (mode === "tiered" && opaque !== stripped) {
-      this.#upgrades = this.#upgrades
-        .then(() => pipeline)
-        .then(() => this.device.createComputePipelineAsync({
-          label: `${key}.unrolled`, layout: "auto",
-          compute: { module: this.device.createShaderModule({ label: `${key}.unrolled.wgsl`,
-            code: stripped }), entryPoint },
-        }))
-        .then((unrolled) => { target.upgraded = Promise.resolve(unrolled); }, () => {});
+      this.#pendingUpgrades.push({ key, target, code: stripped, entryPoint, pipeline });
+      this.#drainUpgrades();
     }
     return pipeline;
   }
 
-  #upgrades = Promise.resolve();
+  #lastMiss = 0;
+  #pendingUpgrades = [];
+  #draining = false;
+
+  /** Compile the queued unrolled kernels one at a time, each after a quiet spell. */
+  async #drainUpgrades() {
+    if (this.#draining) return;
+    this.#draining = true;
+    try {
+      while (this.#pendingUpgrades.length > 0) {
+        const quiet = UPGRADE_QUIET_MS - (performance.now() - this.#lastMiss);
+        if (quiet > 0) { await new Promise((resolve) => setTimeout(resolve, quiet)); continue; }
+        const { key, target, code, entryPoint, pipeline } = this.#pendingUpgrades.shift();
+        try {
+          await pipeline;
+          const unrolled = await this.device.createComputePipelineAsync({
+            label: `${key}.unrolled`, layout: "auto",
+            compute: { module: this.device.createShaderModule({ label: `${key}.unrolled.wgsl`,
+              code }), entryPoint },
+          });
+          target.upgraded = Promise.resolve(unrolled);
+        } catch { /* the opaque kernel stays; it computes the same thing */ }
+      }
+    } finally {
+      this.#draining = false;
+    }
+  }
 
   get size() {
     return this.#pipelines.size;
