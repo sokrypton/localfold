@@ -29,8 +29,10 @@ import {
 import { residentPairTrackOnDevice } from "../weights/pair-track-device-weights.js";
 import { residentPackedOnDevice } from "../weights/device-weights.js";
 import {
-  createOuterProductMeanShaders, OPM_PROJECT_ROWS, packOuterProductMeanWeights,
+  af3OpmVectorBlockPairs, createAf3OpmVectorOutputShader, createOuterProductMeanShaders,
+  OPM_PROJECT_ROWS, packOuterProductMeanWeights,
 } from "./outer-product-mean-webgpu.js";
+import { createOuterProductMeanVectorContractShader } from "../../kernels/outer-product-mean.js";
 import { createMsaAttentionShaders, msaAttentionKeyPart, packMsaAttentionWeights } from "./msa-attention-webgpu.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
@@ -38,6 +40,9 @@ import {
   allocateTransitionSplit, createTransitionShader, packTransitionWeights,
   splitTransitionConfig, transitionRowTile, TRANSITION_ORDER,
 } from "./transition-webgpu.js";
+
+// The two-GEMM outer product's intermediate cap; see af3OpmVectorBlockPairs.
+const OPM_VECTOR_BYTES = 16 * 1024 * 1024;
 
 export class Af3MsaStackGpu {
   constructor(device, options = {}) {
@@ -200,8 +205,23 @@ export class Af3MsaStackGpu {
                        ...(opmBlockI == null ? {} : { blockI: opmBlockI }),
                        ...(opmTuning.opmCellChunk == null
                          ? {} : { cellChunk: opmTuning.opmCellChunk }) };
+    const opmOffsets = packOuterProductMeanWeights(sample.outerProductMean).offsets;
     const { blockI, blockJ, blocksPerRow, ...opmSources } = createOuterProductMeanShaders(
-      opmShape, packOuterProductMeanWeights(sample.outerProductMean).offsets, epsilon, variance);
+      opmShape, opmOffsets, epsilon, variance);
+    // 🔴 THE CONTRACTION AS TWO GEMMs where the widths allow it; see
+    // createAf3OpmVectorOutputShader. The output GEMM tiles C_Z by 64 and the
+    // cells by 16 with no tail, so a width that does not divide keeps the
+    // fused kernel. `opmVectorContract: false` is the control arm, the same
+    // knob AF2's contraction answers to.
+    const useOpmVector = opmTuning.opmVectorContract !== false
+      && pairChannels % 64 === 0 && (outerChannels * outerChannels) % 16 === 0
+      && outerChannels % 4 === 0;
+    if (useOpmVector) {
+      into("opmVecContract", `af3-opm-vec-contract:${outerChannels}`,
+           createOuterProductMeanVectorContractShader(outerChannels));
+      into("opmVecOutput", `af3-opm-vec-output:ban${opmShape.opmBiasAfterNorm}`,
+           createAf3OpmVectorOutputShader({ biasAfterNorm: opmShape.opmBiasAfterNorm }));
+    }
     // ...the contraction's dispatch is one workgroup per (i, j) block of token
     // pairs; see the note on its kernel.
     pipelines.opmBlocks = Math.ceil(n / blockI) * blocksPerRow;
@@ -275,6 +295,30 @@ export class Af3MsaStackGpu {
       // ...the outer product's denominator, computed once per pass rather than
       // carried through its contraction; see outer-product-mean-webgpu.js.
       const opmCounts = keep(this.allocator.allocate("af3-msa.opm-counts", pairs * 4, storage));
+      // ...and the two-GEMM contraction's [pair][cell] intermediate, a block of
+      // whole rows of i at a time, with one pair of uniforms per block.
+      let opmVector;
+      if (useOpmVector) {
+        const cells = outerChannels * outerChannels;
+        const blockPairs = af3OpmVectorBlockPairs(n, outerChannels, OPM_VECTOR_BYTES);
+        const blockRows = blockPairs / n;
+        const intermediate = keep(this.allocator.allocate(
+          "af3-msa.opm-outer", blockPairs * cells * 4, storage));
+        const steps = [];
+        for (let i0 = 0; i0 < n; i0 += blockRows) {
+          const count = Math.min(blockRows, n - i0);
+          steps.push({
+            count,
+            contract: keep(this.allocator.upload(`af3-msa.opm-p-contract-${i0}`,
+              new Uint32Array([count * outerChannels, sequences, n * outerChannels,
+                               i0 * outerChannels, 0, 0, n, 0]), GPUBufferUsage.UNIFORM)),
+            output: keep(this.allocator.upload(`af3-msa.opm-p-output-${i0}`,
+              new Uint32Array([count * n, cells, pairChannels, opmOffsets.outputW,
+                               opmOffsets.outputB, 0, i0 * n, 0]), GPUBufferUsage.UNIFORM)),
+          });
+        }
+        opmVector = { intermediate, steps };
+      }
       const keyMask = keep(this.allocator.allocate("af3-msa.key-mask", n * 4, storage));
       const attention = keep(this.allocator.allocate(
         "af3-msa.attention", msaHeads * pairs * 4, storage));
@@ -293,9 +337,9 @@ export class Af3MsaStackGpu {
           // whole blocks plus the fourth's first half.
           stopAfterOpm: options.stopAfterOpm === true && index === blocks.length - 1,
           block: blocks[index], n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads,
-          pairChannels, msaUpdateBeforeOuterProduct, pairWeightPrecision,
+          pairChannels, outerChannels, msaUpdateBeforeOuterProduct, pairWeightPrecision,
           pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
-          left, right, opmCounts, keyMask, attention, msaScratch, gridProjectMatrix,
+          left, right, opmCounts, opmVector, keyMask, attention, msaScratch, gridProjectMatrix,
           transitionSplit, validation: onDevice ? options.validation : undefined,
         });
         options.onBlock?.(index);
@@ -350,7 +394,7 @@ export class Af3MsaStackGpu {
     const { block, n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads } = context;
     const { pairChannels } = context;
     const { pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer } = context;
-    const { left, right, opmCounts, keyMask, attention, msaScratch } = context;
+    const { left, right, opmCounts, opmVector, keyMask, attention, msaScratch } = context;
     const { gridProjectMatrix, transitionSplit } = context;
 
     const blockAllocations = [];
@@ -458,9 +502,21 @@ export class Af3MsaStackGpu {
       const countGroups = spread(ceil(pairs, 64));
       run("opm.counts", pipelines["opm:counts"], [msaMask, opmCounts],
           countGroups[0], countGroups[1]);
-      const perBlock = spread(pipelines.opmBlocks);
-      run("opm.contract", pipelines["opm:contract"],
-          [left, right, opmCounts, opmWeights, scratch[0]], perBlock[0], perBlock[1]);
+      if (opmVector !== undefined) {
+        const { intermediate, steps } = opmVector;
+        for (const step of steps) {
+          run("opm.contract", pipelines.opmVecContract,
+              [left, right, step.contract, intermediate],
+              ceil(n * context.outerChannels, 64), ceil(step.count * context.outerChannels, 64));
+          run("opm.output", pipelines.opmVecOutput,
+              [intermediate, opmWeights, step.output, scratch[0], opmCounts],
+              ceil(pairChannels, 64), ceil(step.count * n, 64));
+        }
+      } else {
+        const perBlock = spread(pipelines.opmBlocks);
+        run("opm.contract", pipelines["opm:contract"],
+            [left, right, opmCounts, opmWeights, scratch[0]], perBlock[0], perBlock[1]);
+      }
       const addPairGroups = spread(ceil(pairs * pairChannels, 64));
       run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
     };
