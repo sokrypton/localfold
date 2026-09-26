@@ -86,7 +86,9 @@ export async function main(device, args) {
   const gpu = await new Af3ConfidenceHeadGpu(
     device, { stagedPrecision, weightPrecision, accumulatePrecision })
     .run(input, weights, DIALECT,
-    { variance: option(args, "variance", "fast") });
+    // The embedded pair and the stack's output stay on the device in a fold;
+    // this checker compares them, so it asks for them back.
+    { variance: option(args, "variance", "fast"), returnRepresentations: true });
 
   // 🔴 THE FOUR CONFIDENCE PAIRFORMER BLOCKS ARE THE SAME CHAOTIC STACK the
   // trunk runs 48 of, so the heads downstream of them inherit its conditioning.

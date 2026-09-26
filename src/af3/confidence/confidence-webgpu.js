@@ -32,6 +32,7 @@ import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { Af3PairformerStackGpu } from "../trunk/pairformer-block-webgpu.js";
 import { GRID_WIDTH } from "../trunk/pair-track-gpu.js";
+import { DeferredValidation } from "../../runtime/validation.js";
 
 /** The same values as a Float32Array, without copying one that already is. */
 const asFloats = (values) =>
@@ -998,6 +999,21 @@ export class Af3ConfidenceHeadGpu {
     // boltz2 rebuilds the SINGLE as well as the pair; undefined elsewhere, and
     // the stack is then fed the trunk's own.
     let embeddedSingle;
+    // 🔴 THE HEAD'S THREE STAGES SHARE DEVICE BUFFERS, as the trunk's do. The
+    // embed pass, the four-block stack and the heads each took the pair as a
+    // host array - read back, uploaded, read back, uploaded - and every
+    // readback is a drain: measured at 255 tokens under stock flags, the head
+    // was 282-326 ms of wall for ~43 ms of GPU. The embedded pair and single
+    // now go to the stack as buffers and the stack's to the heads, and the only
+    // readback is the heads' outputs. `returnRepresentations` reads the
+    // intermediates back too, from the same buffers, for the checker that
+    // compares them - so it sees the path the fold runs.
+    const representations = options.returnRepresentations === true;
+    const validation = new DeferredValidation(this.device, "AF3 confidence head");
+    // The stack's inputs, owned here and released at the end of `run`.
+    const owned = [];
+    let stackPair;
+    let stackSingle;
     try {
       // 🔴 COPIED ONLY IF IT IS NOT ALREADY THE RIGHT ARRAY. `upload` writes
       // through queue.writeBuffer and does not mutate what it is given, so a
@@ -1010,10 +1026,11 @@ export class Af3ConfidenceHeadGpu {
       const pseudoBeta = keep(this.allocator.upload("af3-conf.beta", input.pseudoBeta, storage));
       const maskBuffer = keep(this.allocator.upload("af3-conf.mask", pairMask, storage));
       const embedWeights = keep(this.allocator.upload("af3-conf.embed-w", embedPacked.data, storage));
-      const readback = keep(this.allocator.allocate("af3-conf.rb-pair", pairs * pairChannels * 4,
+      const readback = !representations ? undefined : keep(this.allocator.allocate(
+        "af3-conf.rb-pair", pairs * pairChannels * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
-      this.device.pushErrorScope("validation");
+      validation.begin();
       // ...one per TOKEN, not one per pair; see the note on the kernel.
       const left = keep(this.allocator.allocate(
         "af3-conf.left", tokens * pairChannels * 4, storage));
@@ -1048,7 +1065,7 @@ export class Af3ConfidenceHeadGpu {
         const rebuiltPair = keep(this.allocator.allocate(
           "af3-conf.re-pair", pairs * pairChannels * 4,
           storage | GPUBufferUsage.COPY_SRC));
-        const singleReadback = keep(this.allocator.allocate(
+        const singleReadback = !representations ? undefined : keep(this.allocator.allocate(
           "af3-conf.rb-single", tokens * singleChannels * 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
         const tokenPass = encoder.beginComputePass({ label: "reembed-project" });
@@ -1071,19 +1088,28 @@ export class Af3ConfidenceHeadGpu {
         pairPass.dispatchWorkgroups(
           Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
         pairPass.end();
-        encoder.copyBufferToBuffer(rebuiltPair.buffer, 0, readback.buffer, 0,
-                                   pairs * pairChannels * 4);
-        encoder.copyBufferToBuffer(rebuiltSingle.buffer, 0, singleReadback.buffer, 0,
-                                   tokens * singleChannels * 4);
+        if (representations) {
+          encoder.copyBufferToBuffer(rebuiltPair.buffer, 0, readback.buffer, 0,
+                                     pairs * pairChannels * 4);
+          encoder.copyBufferToBuffer(rebuiltSingle.buffer, 0, singleReadback.buffer, 0,
+                                     tokens * singleChannels * 4);
+        }
         this.device.queue.submit([encoder.finish()]);
-        const failure = await this.device.popErrorScope();
-        if (failure !== null) throw new Error(`WebGPU validation failed: ${failure.message}`);
-        await readback.buffer.mapAsync(GPUMapMode.READ);
-        embeddedPair = new Float32Array(readback.buffer.getMappedRange().slice(0));
-        readback.buffer.unmap();
-        await singleReadback.buffer.mapAsync(GPUMapMode.READ);
-        embeddedSingle = new Float32Array(singleReadback.buffer.getMappedRange().slice(0));
-        singleReadback.buffer.unmap();
+        validation.end("confidence re-embed");
+        if (representations) {
+          await readback.buffer.mapAsync(GPUMapMode.READ);
+          embeddedPair = new Float32Array(readback.buffer.getMappedRange().slice(0));
+          readback.buffer.unmap();
+          await singleReadback.buffer.mapAsync(GPUMapMode.READ);
+          embeddedSingle = new Float32Array(singleReadback.buffer.getMappedRange().slice(0));
+          singleReadback.buffer.unmap();
+        }
+        for (const kept of [rebuiltPair, rebuiltSingle]) {
+          allocations.splice(allocations.indexOf(kept), 1);
+          owned.push(kept);
+        }
+        stackPair = rebuiltPair;
+        stackSingle = rebuiltSingle;
       } else {
       const project = encoder.beginComputePass({ label: "embed-project" });
       project.setPipeline(compiled.embedProject);
@@ -1106,37 +1132,64 @@ export class Af3ConfidenceHeadGpu {
       const groups = Math.ceil(pairs / 64);
       pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       pass.end();
-      encoder.copyBufferToBuffer(pair.buffer, 0, readback.buffer, 0, pairs * pairChannels * 4);
-      this.device.queue.submit([encoder.finish()]);
-      const error = await this.device.popErrorScope();
-      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
-      await readback.buffer.mapAsync(GPUMapMode.READ);
-      embeddedPair = new Float32Array(readback.buffer.getMappedRange().slice(0));
-      readback.buffer.unmap();
+      if (representations) {
+        encoder.copyBufferToBuffer(pair.buffer, 0, readback.buffer, 0, pairs * pairChannels * 4);
       }
+      this.device.queue.submit([encoder.finish()]);
+      validation.end("confidence embed");
+      if (representations) {
+        await readback.buffer.mapAsync(GPUMapMode.READ);
+        embeddedPair = new Float32Array(readback.buffer.getMappedRange().slice(0));
+        readback.buffer.unmap();
+      }
+      allocations.splice(allocations.indexOf(pair), 1);
+      owned.push(pair);
+      stackPair = pair;
+      }
+      if (stackSingle === undefined) {
+        // Every model but boltz2 feeds the stack the trunk's own single.
+        stackSingle = this.allocator.upload("af3-conf.stack-single",
+          normalisedTrunkSingle(input, weights, tokens), storage | GPUBufferUsage.COPY_SRC);
+        owned.push(stackSingle);
+      }
+    } catch (error) {
+      for (const allocation of owned) allocation.release();
+      throw error;
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
     }
 
-    // The four confidence pairformer blocks: the same stack the trunk runs.
-    const stack = await new Af3PairformerStackGpu(this.device, this.options).run(
-      { pair: embeddedPair,
-        single: embeddedSingle ?? normalisedTrunkSingle(input, weights, tokens),
-        pairMask, seqMask, tokens }, weights.blocks, dialect, options);
-
-    return { ...(await this.#heads(stack, pairMask, input, weights, headPacked, compiled)),
-             pair: stack.pair, single: stack.single, embeddedPair };
+    try {
+      // The four confidence pairformer blocks: the same stack the trunk runs,
+      // updating the embedded pair and single in place.
+      await new Af3PairformerStackGpu(this.device, this.options).run(
+        { pairMask, seqMask, tokens }, weights.blocks, dialect,
+        { ...options, pairBuffer: stackPair.buffer, singleBuffer: stackSingle.buffer,
+          deferReadback: true, validation });
+      const out = await this.#heads(stackPair, stackSingle, pairMask, input, weights,
+                                    headPacked, compiled, representations);
+      // Everything above was submitted ahead of the heads' readback, which has
+      // completed, so these resolve without waiting.
+      await validation.settle();
+      const { pair: outPair, single: outSingle, ...heads } = out;
+      return { ...heads,
+               ...(representations ? { pair: outPair, single: outSingle, embeddedPair } : {}) };
+    } finally {
+      for (const allocation of owned) allocation.release();
+    }
   }
 
-  async #heads(stack, pairMask, input, weights, headPacked, compiled) {
+  async #heads(pairAllocation, singleAllocation, pairMask, input, weights, headPacked, compiled,
+                representations) {
     const { tokens, dense } = input;
     const pairs = tokens * tokens;
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     try {
-      const pair = keep(this.allocator.upload("af3-conf.h-pair", stack.pair, storage));
-      const single = keep(this.allocator.upload("af3-conf.h-single", stack.single, storage));
+      // The stack's pair and single, still on the device; the caller owns them.
+      const pair = pairAllocation;
+      const single = singleAllocation;
       const maskBuffer = keep(this.allocator.upload("af3-conf.h-mask", pairMask, storage));
       const weightBuffer = keep(this.allocator.upload("af3-conf.h-w", headPacked.data, storage));
       const pde = keep(this.allocator.allocate("af3-conf.pde", pairs * 4,
@@ -1153,7 +1206,10 @@ export class Af3ConfidenceHeadGpu {
       for (const [name, source, bytes] of [["pde", pde, pairs * 4], ["pae", pae, pairs * 4],
         ["tmAdjusted", tmAdjusted, pairs * 4],
         ["plddt", plddt, tokens * dense * 4],
-        ["resolved", resolved, tokens * dense * 2 * 4]]) {
+        ["resolved", resolved, tokens * dense * 2 * 4],
+        // ...and the stack's own output, only for the checker that compares it.
+        ...(representations ? [["pair", pair, pairs * weights.pairChannels * 4],
+                               ["single", single, tokens * weights.singleChannels * 4]] : [])]) {
         readbacks[name] = { allocation: keep(this.allocator.allocate(`af3-conf.rb-${name}`, bytes,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)), source, bytes };
       }
@@ -1202,8 +1258,9 @@ export class Af3ConfidenceHeadGpu {
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
 
       const output = {};
-      for (const [name, { allocation }] of Object.entries(readbacks)) {
-        await allocation.buffer.mapAsync(GPUMapMode.READ);
+      const entries = Object.entries(readbacks);
+      await Promise.all(entries.map(([, { allocation }]) => allocation.buffer.mapAsync(GPUMapMode.READ)));
+      for (const [name, { allocation }] of entries) {
         output[name] = new Float32Array(allocation.buffer.getMappedRange().slice(0));
         allocation.buffer.unmap();
       }

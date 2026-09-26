@@ -436,6 +436,25 @@ together. Byte-identical on all seven models and on both seam oracles.
 Interleaved against the parent, three rounds, no overlap: **113-115 -> 107 ms**
 at 68 tokens and **703-714 -> 676-680** at 255.
 
+🔴 **AND THE CONFIDENCE HEAD WAS THE SAME SHAPE, AND WORSE IN PROPORTION.**
+Embed, a four-block stack and the heads handed the pair along as host arrays -
+the trunk's pair uploaded, the embedded pair read back and uploaded, the stack's
+read back and uploaded - so at 255 tokens the head was 282-326 ms of wall for
+~43 ms of GPU inside a fold. The embedded pair and single now reach the stack
+as buffers (`deferReadback`), the heads read the stack's buffers, and the only
+readback is the heads' outputs. `returnRepresentations` reads the embedded pair
+and the stack's output back from those same buffers, for
+`check-af3-confidence.js`, the one reader. Byte-identical PDB, pLDDT, pTM and
+ipTM on all seven models; `check-af3-confidence.js` and the confidence oracle
+(af3, boltz2's re-embedding head) identical on both trees.
+`bench-confidence.js --calls=7`, stock flags, three interleaved rounds:
+
+| tokens | head before | after |
+|---:|---:|---:|
+| 68 | 68-70 ms | **41-42** |
+| 255 | 266-269 | **89-91** |
+| 400 | 600-616 | **213-215** |
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The
