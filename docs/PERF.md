@@ -635,6 +635,10 @@ tokens, stock flags, 10 blocks profiled): four keys a group with one rescale -
 bit-identical - moved it **31.0 -> 28.6 ms**; two queries a lane, halving the
 staged k/v reads per multiply-add and bit-identical, moved it **30.9 -> 30.5**.
 So neither the arithmetic nor the shared-memory reads bind it; both reverted.
+A third: staging each key chunk's BIAS block coalesced (each lane is a
+different query, so the per-key bias reads are N floats apart across a warp)
+made it 35.1 -> 40.7 ms - each lane walks its own bias row, so the lines are
+reused from cache anyway, and the 8 KiB tile costs occupancy. Reverted.
 
 `perAtomConditioning` (host, run twice a fold - the target-feat encoder and the
 diffusion head) was seven passes over `rows x channels` and three temporary
