@@ -246,8 +246,17 @@ export async function residentWeightBufferFilled(device, key, label, byteLength,
     let byLabel = recordings.byKey.get(key);
     if (byLabel === undefined) recordings.byKey.set(key, byLabel = new Map());
     const recordingSlot = variant === "" ? label : `${label}\u0000${variant}`;
+    // 🔴 A RELEASED RECORDING IS A MISS, NOT A HIT. releaseStreamedWeights
+    // destroys a prefix's codes at the end of a fold and cannot remove them from
+    // `byKey`, a WeakMap it cannot walk - so the next fold, streaming again,
+    // found the entry and replayed destroyed buffers: "[Buffer "int5-codes"]
+    // used in submit while destroyed", and the fold never finished. Every device
+    // without `keepTrunkWeights` releases, which is every device but an A100's
+    // prior; measured on an M2 as `fold.js --folds=2` dying in fold 2.
     const recorded = byLabel.get(recordingSlot);
-    if (recorded !== undefined) {
+    if (recorded !== undefined && recorded.decodes.some((decode) => decode.released)) {
+      byLabel.delete(recordingSlot);
+    } else if (recorded !== undefined) {
       for (const write of recorded.writes) device.queue.writeBuffer(buffer, write.offset, write.bytes);
       for (const decode of recorded.decodes) replayBlockUpload(device, decode, buffer);
       return buffer;

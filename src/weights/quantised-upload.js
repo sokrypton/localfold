@@ -637,9 +637,13 @@ function pendingReplays(device) {
   return pending;
 }
 
-/** Give back what a recording holds. */
+/**
+ * Give back what a recording holds - and say so on the recording, because a
+ * caller's cache may still name it (see residentWeightBufferFilled).
+ */
 export function releaseRecording(recording) {
   for (const buffer of recording.owned) buffer.destroy();
+  recording.released = true;
 }
 
 export async function runBlockUpload(device, plan, destination) {
