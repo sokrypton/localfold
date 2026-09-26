@@ -502,7 +502,8 @@ function installColabStatus() {
         // 🔴 WHERE WebGPU HAS NO CARD, JAX IS THE DEFAULT. A TPU runtime (or any
         // without a GPU driver) gives WebGPU SwiftShader - the CPU, minutes a
         // fold - and the TPU sits idle; only JAX reaches it.
-        const software = gpu.vendor === "google" || /swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
+        const software = gpu.webgpu === false || gpu.vendor === "google"
+          || /swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
         try { pick.value = localStorage.getItem("localfold.colabBackend") ?? (software ? "jax" : "webgpu"); }
         catch (cause) { pick.value = software ? "jax" : "webgpu"; }
         if (pick.value === "") pick.value = "webgpu";
