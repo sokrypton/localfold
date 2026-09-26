@@ -1211,3 +1211,42 @@ and a source tree shadows the installed package, dying on
 too, for the `converters` package it re-exports `parse_ca` from. `AF3_SRC`
 points at a fresh clone; `~/alphafold3`, which the older dumpers hard-code,
 does not exist on this box.
+
+## 🔴 IT IS NOT THE ATOMS: THE STRUCTURAL PSEUDO-BETA GATHER IS EXACT
+
+"Maybe we are just using the wrong atoms" was the last unverified input in the
+PAE chain, and it was a fair suspicion: **every arm that scored this head fed it
+OUR coordinates**, so a head that agrees with af3-any-model's at 6.13e-3 agrees
+about whatever atoms it was handed. That is the same blind spot that hid
+ESMFold2's missing `relative_position_encoding` for a day.
+
+`struct/token_atoms_to_pseudo_beta` is what picks them, it is IN the dump, and
+**nothing compared it.** `GATHERS` in `tools/check-batch-fields.js` carries the
+RESIDUE-space `token_atoms_to_pseudo_beta`; the structural-space twin sat beside
+it untouched - and could not even be reported as unmapped, because every
+`struct/*` key is marked seen wholesale by the loop that dispatches to
+`compareStructural`. A blanket coverage mark is a coverage hole.
+
+Compared now, and **130/130 live indices and masks match exactly**, on both
+targets. Watched failing at 130/160 and 144/160 with the index shifted by one.
+
+What the indices actually name, read out of the batch:
+
+| subtoken role | dense slot | atom | count |
+|---|---:|---|---:|
+| 1 (backbone) | 1 | **CA** | 68 |
+| 2 (link) | 0 | **N** | 62 |
+
+so a 68-residue protein's 130 subtokens are CA(res 0), then CA/N per residue
+after it. 🔴 **AND THE INDICES RUN TO 3096, PAST THE 1632 ATOMS OF THE RESIDUE
+GRID** - they address the STRUCTURAL dense grid, 130 x 24. `fold.js` gathers
+them out of `sampled`, which is the pre-`structuralToResidue` buffer and so is
+in that same space; gathering from `positions` one line later would have read
+out of range for 62 of the 130. The geometry confirms the space is right:
+consecutive rep distances alternate ~1.46 A (N-CA) and ~4.9 A (N(i) to
+CA(i+1)), median 3.78, min 1.35, max 5.11.
+
+**So the PAE grain is not a wrong atom.** Together with the composition arm
+above - the reference's own PAE is equally grainy at 0.4305 - the remaining
+explanation is architectural: four blocks and two distance embeddings added
+straight to `z`.

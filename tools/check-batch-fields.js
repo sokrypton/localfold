@@ -379,6 +379,9 @@ for (const target of Object.keys(TARGETS)) {
   // wrong every stage after it is wrong on a shipped model.
   const structural = Object.keys(dump.inputs)
     .filter((k) => k.startsWith("struct/") || k.startsWith("structbook/"));
+  // 🔴 EVERY `struct/*` KEY IS MARKED SEEN WHOLESALE, so the UNMAPPED check
+  // below cannot see a structural field nothing compares - which is how
+  // `struct/token_atoms_to_pseudo_beta` sat in the dump uncompared.
   for (const k of structural) seen.add(k);
   if (structural.length > 0) {
     const found = compareStructural(dump, batch);
@@ -499,6 +502,35 @@ function compareStructural(dump, batch) {
     if (differ === 0) continue;
     const line = `${theirs}: ${differ}/${mine.length} worst ${worst.toPrecision(3)}`;
     (theirs === "struct/ref_pos" ? floor : bad).push(line);
+  }
+
+  // 🔴 THE STRUCTURAL PSEUDO-BETA GATHER, WHICH NOTHING COMPARED. `GATHERS`
+  // above carries `token_atoms_to_pseudo_beta` - the RESIDUE-space one - and
+  // the structural-space twin sits in the dump beside it, uncompared. It is
+  // the ONE geometric input OpenDDE's confidence head takes: the head adds a
+  // binned AND a raw embedding of the distances between these atoms, so a
+  // gather that picked the wrong atom would move the PAE and nothing here
+  // would object. Same shape as the atom-key window, which was wrong in four
+  // of seven models because no gate asked.
+  {
+    const idx = flat(dump.inputs["struct/token_atoms_to_pseudo_beta:gather_idxs"]).map(Number);
+    const msk = flat(dump.inputs["struct/token_atoms_to_pseudo_beta:gather_mask"]).map(Number);
+    const mine = structural.tokenAtomsToPseudoBeta;
+    // Never a silent skip: a dump that carries the field and a port that does
+    // not build it is the finding, not a reason to compare nothing.
+    if (idx.length > 0 && mine === undefined) {
+      bad.push("struct/token_atoms_to_pseudo_beta: this port does not build it");
+    } else if (idx.length > 0) {
+      let differ = 0;
+      for (let at = 0; at < idx.length && at < mine.indices.length; at += 1) {
+        const live = msk[at] > 0.5;
+        if (live !== (Number(mine.mask[at]) > 0.5)) { differ += 1; continue; }
+        if (live && Number(mine.indices[at]) !== idx[at]) differ += 1;
+      }
+      if (differ > 0) {
+        bad.push(`struct/token_atoms_to_pseudo_beta: ${differ}/${idx.length} differ`);
+      }
+    }
   }
 
   // ref_space_uid as a PARTITION - see the note above.
