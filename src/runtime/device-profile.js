@@ -296,11 +296,14 @@ export const DEFAULT_TUNING = Object.freeze({
   // 🔴 AF2's f32 q/k/v/gate projection's rows a lane, null meaning 4 - an M2's
   // register budget. See selectAttentionProjectKernel.
   attentionProjectRowsPerLane: null,
-  // 🔴 AF2's OPM output projection as a vector GEMM where there are no matrix
-  // units, null meaning the pair-blocked kernel. Bit-identical either way; see
-  // createOuterProductMeanVectorOutputShader.
+  // 🔴 AF2's OPM output projection and sequence contraction as vector GEMMs
+  // where there are no matrix units - null meaning YES, `false` the old
+  // per-pair kernels. Bit-identical either way, and on by default because what
+  // they remove (each workgroup re-reading the whole weight matrix, or each
+  // residue's slice L times) costs on any device: as an unrecognised GPU on an
+  // A100, AF2 at 255 residues 1.60 -> 1.49 s. See
+  // createOuterProductMeanVectorOutputShader / ...VectorContractShader.
   opmVectorOutput: null,
-  // ...and its sequence contraction; see createOuterProductMeanVectorContractShader.
   opmVectorContract: null,
   // 🔴 HOW MANY THREADS A TRANSITION SHOULD AIM TO HAVE IN FLIGHT. The
   // transition's dispatch is rows-only, so a short track cannot fill a large
@@ -747,8 +750,6 @@ const PRIORS = new Map([
     // AF2's f32 attention projection at 8 rows a lane, stock flags, 128 x 255:
     // 1.912 -> 1.375 ms, bitwise identical (bench-attention-project.js).
     attentionProjectRowsPerLane: 8,
-    opmVectorOutput: true,
-    opmVectorContract: true,
     diffusionAttendSubgroups: true,
     diffusionAttendStageKeys: true,
     // Swept in situ at 68 tokens as a whole denoiser step, repeated to

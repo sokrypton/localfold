@@ -867,9 +867,9 @@ async function encodeOuterProductMean(
   // ...and the contraction likewise, over whole rows of `i` - see
   // createOuterProductMeanVectorContractShader.
   const vectorContract = matrixContract === null && outerFirst
-    && deviceTuning(execution.device).opmVectorContract === true;
+    && deviceTuning(execution.device).opmVectorContract !== false;
   const vectorOutput = matrixOutput === null && outerFirst
-    && deviceTuning(execution.device).opmVectorOutput === true
+    && deviceTuning(execution.device).opmVectorOutput !== false
     && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
     scalePipeline, contractPipeline, projectOutputPipeline] = await Promise.all([

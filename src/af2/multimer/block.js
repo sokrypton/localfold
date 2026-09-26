@@ -535,8 +535,8 @@ async function encodeOuterProductMean(
   const contractPrecision = opmContractPrecision(execution.device);
   // ...the output projection as a vector GEMM where the device asks for one;
   // see the same choice in src/af2/evoformer/block.js.
-  const vectorContract = outerFirst && deviceTuning(execution.device).opmVectorContract === true;
-  const vectorOutput = outerFirst && deviceTuning(execution.device).opmVectorOutput === true
+  const vectorContract = outerFirst && deviceTuning(execution.device).opmVectorContract !== false;
+  const vectorOutput = outerFirst && deviceTuning(execution.device).opmVectorOutput !== false
     && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
     contractPipeline, projectOutputPipeline, scalePipeline] = await Promise.all([
