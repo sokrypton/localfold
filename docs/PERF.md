@@ -939,7 +939,12 @@ DOES NOT SET IT, BECAUSE A COLD FOLD PAYS MORE THAN A WARM ONE SAVES**: its
 matrix kernels are slow to compile. A first 68-residue fold with the driver
 cache cleared, six rounds interleaved: 7.5-11.1 s (median 9.5) with it against
 6.7-8.6 (median 8.2) without. 🔴 A T4's cold fold scatters by 1.5x in one arm
-(7.0 and 10.8 s back to back), so two rounds decide nothing here. Swept
+(7.0 and 10.8 s back to back), so two rounds decide nothing here.
+`gridAttendMatrix`, which the turing prior DOES set, is the same trade and is
+kept: off, the cold 68-residue fold's median is 7.0 s against 7.8 (six rounds),
+but the prior's own measurement is 8-12% of a 300-token trunk with 512 rows,
+which a single fold of that size wins back. Every other matrix knob a T4
+resolves is read by AF2's or the shared kernels, not by AF3's. Swept
 beside it and not taken: the pair-transition split at 128 channels (3-4% of the
 trunk) and the matrix grid projection (`grid.project` -10%, ~1% of the trunk).
 
