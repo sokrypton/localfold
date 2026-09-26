@@ -1140,11 +1140,20 @@ export const SPLIT_TRANSITION_GEOMETRY = Object.freeze({
 // class as the fused kernel, only reordered - so a pinned stack takes it.
 export function splitTransitionConfig(device, channels, { f32Only = false } = {}) {
   const tuning = deviceTuning(device);
-  if (tuning.pairTransitionSplit !== true) return false;
+  // 🔴 THE PRIOR DECIDES THE MATRIX SPLIT AND THE WIDTH DECIDES THE VECTOR ONE.
+  // Both used to need `pairTransitionSplit: true`, which only the ampere prior
+  // sets - so an Apple part, a T4, and every GPU with no prior ran the fused
+  // kernel on IntelliFold-2's and OpenDDE's wide pair tracks, the kernel whose
+  // row tile halves as the channels double. That is a property of the fused
+  // kernel on every device, not of an A100, so from VECTOR_SPLIT_MIN_CHANNELS
+  // up the vector split is the default unless a device says `false`. The
+  // matrix split is still the prior's to choose: it was measured per device.
+  if (tuning.pairTransitionSplit === false) return false;
   if (channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
     return false;
   }
-  const config = f32Only ? null : deviceMatrixConfig(device, { element: "f16" });
+  const config = f32Only || tuning.pairTransitionSplit !== true ? null
+    : deviceMatrixConfig(device, { element: "f16" });
   // 🔴 NO MATRIX UNITS IS NOT NO SPLIT. It used to be, so every stock browser -
   // none of which exposes subgroup matrices - ran the fused kernel at every
   // width. The vector GEMM above takes the split's two projections instead,
