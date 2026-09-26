@@ -45,7 +45,8 @@ import { structuralBatch, structuralLayout, structuralToResidue }
   from "./featurise/structural-tokens.js";
 import { Af3DiffusionConditioningGpu } from "./diffusion/diffusion-conditioning-webgpu.js";
 import { openddeConfidence } from "./confidence/opendde-confidence.js";
-import { releaseResidentWeights, setStreamedWeights } from "../runtime/resident.js";
+import { releaseResidentWeights, releaseStreamedWeights, setStreamedWeights }
+  from "../runtime/resident.js";
 import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
   from "../runtime/device-memory.js";
 import { deviceTuning } from "../runtime/device-profile.js";
@@ -729,10 +730,17 @@ async function foldHolding(device, batch, weights, options, held) {
   // ...and only where the trunk runs at the fold's largest token count. OpenDDE
   // re-tokenises into MORE tokens after the trunk, so its peak is the sampler's
   // and streaming there cost +2.4% for 5 MiB (2349 -> 2344).
-  if (largeFold && largestTokens === batch.tokens
-    && deviceTuning(device).largeFoldStreamsWeights !== false) {
-    releaseResidentWeights(device, "w.");
-    setStreamedWeights(device, "w.");
+  // 🔴 AND THE SAMPLER'S TOO, WHICH IS WHERE OpenDDE PEAKS: its diffusion
+  // transformer's 24 blocks are 793 MB decoded (f32 without shader-f16), read
+  // once a step. Replayed from codes, a step costs 24 decode dispatches.
+  if (largeFold && deviceTuning(device).largeFoldStreamsWeights !== false) {
+    // Both, for every large fold: replayed from codes, the trunk's streaming
+    // costs a decode dispatch a tensor (IntelliFold-2 24.32 s unstreamed, 24.29
+    // streamed), so OpenDDE - whose trunk was excluded while streaming re-sent
+    // the codes each pass - takes it too now that its peak is the trunk's.
+    const prefixes = ["w.", "difftx."];
+    for (const prefix of prefixes) releaseResidentWeights(device, prefix);
+    setStreamedWeights(device, prefixes);
   }
   const { tokens, dense } = batch;
   const stage = (name, detail = {}) => options.onStage?.(name, detail);
@@ -1214,7 +1222,11 @@ async function foldHolding(device, batch, weights, options, held) {
   // tools/gpu/profile.js saw 144 ms of a 1300 ms fold and the rest looked like
   // nothing. `keepTrunkWeights` is a per-device prior, null everywhere the
   // trade has not been measured.
-  if (!keepWeights("keepTrunkWeights")) releaseResidentWeights(device, "w.");
+  if (!keepWeights("keepTrunkWeights")) {
+    releaseResidentWeights(device, "w.");
+    // ...and the trunk's streamed codes, which the next peak would carry.
+    releaseStreamedWeights(device, "w.");
+  }
 
   // 🔴 OpenDDE RE-TOKENISES BETWEEN THE TRUNK AND THE DIFFUSION, AND THIS IS
   // WHERE. Every other model here folds one token space end to end; OpenDDE
@@ -1350,6 +1362,7 @@ async function foldHolding(device, batch, weights, options, held) {
   // ...and where no prior says, the budget does; see keepResidentAffordable.
   if (!keepWeights("keepSamplerWeights")) {
     releaseResidentWeights(device, "difftx.");
+    releaseStreamedWeights(device, "difftx.");
     // ...and the diffusion conditioning's, which are resident for the same
     // reason and dead at the same moment.
     releaseResidentWeights(device, "cond.");

@@ -43,7 +43,7 @@ import { noteAllocation, noteDestroy } from "../../runtime/device-memory.js";
 import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed,
   memoryBudgetBytes, memoryTotals }
   from "../../runtime/device-memory.js";
-import { releaseResidentWeights, residentWeightBuffer } from "../../runtime/resident.js";
+import { isStreamed, releaseResidentWeights, residentWeightBuffer } from "../../runtime/resident.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { DeferredValidation } from "../../runtime/validation.js";
 import { releaseWeights } from "../weights/weights.js";
@@ -3159,7 +3159,13 @@ export class Af3DiffusionTransformerGpu {
         // than the 630 of residency it was called in to avoid. Four blocks at a
         // time bounds that at a super-block, which is the whole point of
         // falling back. Resident runs are untouched and still submit once.
-        if (!this.residentWeights) flush(`super-block ${groupIndex}`);
+        // 🔴 AND PER SUPER-BLOCK WHEN THE BLOCKS ARE STREAMED: a streamed label's
+        // buffers are a ring of four, refilled when a block asks, so no more
+        // than a super-block of them may be in flight before a submit. See
+        // setStreamedWeights in src/runtime/resident.js.
+        if (!this.residentWeights || isStreamed(this.device, "difftx.block.resident")) {
+          flush(`super-block ${groupIndex}`);
+        }
       }
       endPass();
       // ...and the readback rides the same submit, when there is one.

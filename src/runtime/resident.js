@@ -50,9 +50,55 @@ const heldByDevice = new WeakMap();
  * gives the transient buffers back. See foldHolding in src/af3/fold.js.
  */
 const streamedPrefix = new WeakMap();
-/** Buffers in each label's ring: more than any block holds under one label. */
-const STREAM_RING = 3;
+/**
+ * Buffers in each label's ring: more than any one submit holds under a label.
+ * The pairformer holds two (both grid attentions are `w.grid`); the diffusion
+ * transformer submits a super-block of four blocks at once.
+ */
+const STREAM_RING = 4;
 const transientByDevice = new WeakMap();
+/**
+ * Stop streaming one prefix early and give back its rings and codes - for a
+ * stage that is over while the fold goes on, which is where the next peak is.
+ */
+export function releaseStreamedWeights(device, prefix) {
+  const streamed = streamedPrefix.get(device);
+  if (streamed === undefined) return;
+  const rest = streamed.filter((entry) => entry !== prefix);
+  if (rest.length === 0) streamedPrefix.delete(device);
+  else streamedPrefix.set(device, rest);
+  const transients = transientByDevice.get(device);
+  if (transients !== undefined) {
+    for (const [ringKey, ring] of [...transients]) {
+      if (!ringKey.startsWith(prefix)) continue;
+      for (const buffer of ring.buffers) {
+        if (buffer === undefined) continue;
+        noteDestroy(device, buffer.size, `${buffer.label}`);
+        buffer.destroy();
+      }
+      transients.delete(ringKey);
+    }
+  }
+  const recordings = recordingsByDevice.get(device);
+  if (recordings !== undefined) {
+    const keep = [];
+    for (const decode of recordings.all) {
+      if (!decode.label.startsWith(prefix)) { keep.push(decode); continue; }
+      for (const owned of decode.owned) noteDestroy(device, owned.size, "int5-codes");
+      releaseRecording(decode);
+    }
+    recordings.all = keep;
+    // The per-key map cannot be walked; a later fill of this prefix records
+    // again because the prefix is no longer streamed and the cache path runs.
+  }
+}
+
+/** Whether `label` is streamed on this device right now - see setStreamedWeights. */
+export function isStreamed(device, label) {
+  const streamed = streamedPrefix.get(device);
+  return streamed !== undefined && streamed.some((prefix) => label.startsWith(prefix));
+}
+
 export function setStreamedWeights(device, prefix) {
   if (prefix === null || prefix === undefined) {
     streamedPrefix.delete(device);
@@ -77,7 +123,7 @@ export function setStreamedWeights(device, prefix) {
     }
     return;
   }
-  streamedPrefix.set(device, prefix);
+  streamedPrefix.set(device, Array.isArray(prefix) ? prefix : [prefix]);
   if (!recordingsByDevice.has(device)) recordingsByDevice.set(device, freshRecordings());
   installWriteCapture(device);
 }
@@ -147,7 +193,7 @@ export async function residentWeightBufferFilled(device, key, label, byteLength,
   // a label because a stack fetches a block's weights, encodes and submits it
   // before fetching the next, and the queue orders the next fill after it.
   const streamed = streamedPrefix.get(device);
-  if (streamed !== undefined && label.startsWith(streamed)) {
+  if (streamed !== undefined && streamed.some((prefix) => label.startsWith(prefix))) {
     // 🔴 A SMALL RING A LABEL, NOT ONE BUFFER: a block may hold two tensors
     // under one label - both grid attentions are `w.grid` - and one shared
     // buffer let the second fill overwrite the first before the block ran
@@ -202,6 +248,7 @@ export async function residentWeightBufferFilled(device, key, label, byteLength,
       recordings.hostCaptures.delete(buffer);
     }
     byLabel.set(recordingSlot, { writes, decodes });
+    for (const decode of decodes) decode.label = label;
     recordings.all.push(...decodes);
     for (const decode of decodes) {
       for (const owned of decode.owned) noteAllocation(device, "int5-codes", owned.size);
