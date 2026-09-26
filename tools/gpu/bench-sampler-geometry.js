@@ -103,6 +103,17 @@ export async function main(device, args) {
     // against rather than only against the other sampler.
     ARMS.push(["diffusion", 200]);
   }
+  // `--schedule-arms=name:steps:key=value+key=value,...` adds diffusion arms
+  // with their own EDM schedule - sigmaMax, rho, gamma0, stepScale, anything
+  // `noiseLevels` and the step take - under a name of their own.
+  const scheduleArms = option(args, "schedule-arms", "").split(",").filter(Boolean)
+    .map((spec) => {
+      const [name, steps, pairs = ""] = spec.split(":");
+      const schedule = Object.fromEntries(pairs.split("+").filter(Boolean)
+        .map((pair) => pair.split("=")).map(([k, v]) => [k, Number(v)]));
+      return ["diffusion", Number(steps), schedule, name];
+    });
+  for (const arm of scheduleArms) ARMS.push(arm);
   const store = await openAf3Store(
     option(args, "model", "/model-af3-int5/manifest.json"));
   const conformers = await (await fetch("/tools/oracle/reference-conformers.json")).json();
@@ -149,15 +160,16 @@ export async function main(device, args) {
       ...(target.ptms ? { modifications: target.ptms.map(([code, at]) =>
         ({ chain: 0, position: at, ...components.get(code) })) } : {}),
     });
-    for (const [mode, steps] of ARMS) {
-      if (armsWanted.length > 0 && !armsWanted.includes(`${mode}${steps}`)) continue;
+    for (const [mode, steps, schedule, armName] of ARMS) {
+      const arm = armName ?? `${mode}${steps}`;
+      if (armsWanted.length > 0 && !armsWanted.includes(arm)) continue;
       if (mode === "flow" && noFlow) {
-        rows.push({ target: target.name, arm: `${mode}${steps}`, skipped: "noFlowSampler" });
+        rows.push({ target: target.name, arm, skipped: "noFlowSampler" });
         continue;
       }
       for (const seed of seeds) {
         const result = await foldBatch(device, batch, weights,
-          { mode, steps, recycles: 0, seed });
+          { mode, steps, recycles: 0, seed, ...(schedule ? { schedule } : {}) });
         const pdb = toPdb(batch, result.positions);
         const scored = bondGeometry(pdb, conformers, { components });
         // 🔴 `chainGeometryOf` TAKES SPACINGS, NOT A PDB - it is the shared rule
@@ -171,7 +183,7 @@ export async function main(device, args) {
         const chain = chainGeometryOf(spacings);
         const verdict = chainGeometryVerdict(chain);
         rows.push({
-          target: target.name, arm: `${mode}${steps}`, seed,
+          target: target.name, arm, seed,
           plddt: Number((result.meanPlddt ?? 0).toFixed(2)),
           mainchain: round(scored.mainchain.rms), sidechain: round(scored.sidechain.rms),
           peptide: round(scored.peptide.rms), nucleic: round(scored.nucleic.rms),

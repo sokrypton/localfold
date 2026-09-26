@@ -38,7 +38,8 @@ import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
-import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
+import { OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
+  countsForFamily, diffusionScheduleFor,
   samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
@@ -2654,8 +2655,8 @@ function syncAf3Count() {
   const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
   // ...and OpenDDE's own, because more steps make its fold worse; see
   // OPENDDE_COUNTS for the two targets and nine folds that say so.
-  const table = ef2 ? ESMFOLD2_COUNTS
-    : chosenFamily() === "opendde" ? OPENDDE_COUNTS : AF3_COUNTS;
+  // ...and AlphaFold 3's, whose short schedule is its own; see ALPHAFOLD3_COUNTS.
+  const table = ef2 ? ESMFOLD2_COUNTS : countsForFamily(chosenFamily());
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : mode]
     ?? table.flow ?? table.diffusion;
   const title = document.getElementById("af3-count-label");
@@ -2865,13 +2866,12 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // value: the shared `#af3-mode` select still reads "flow" behind a hidden
   // row, which is the trap docs/EF2FAST.md records for that model an hour
   // after hiding its own.
-  const opendde = chosenFamily() === "opendde";
   // 🔴 FORCED FOR rosettafold3 TOO, and for a worse reason than OpenDDE's - see
   // `samplerModeFor`. Hiding the row does not change the select's value, which
   // is the trap the comment above records.
   const mode = samplerModeFor(chosenFamily(),
     document.getElementById("af3-mode")?.value ?? "diffusion");
-  const counts = opendde ? OPENDDE_COUNTS : AF3_COUNTS;
+  const counts = countsForFamily(chosenFamily());
   // 🔴 THE SAME FALLBACK AS `syncAf3Count`, AND IT WAS MISSING HERE. That
   // function reads `table[mode] ?? table.flow ?? table.diffusion`; this one
   // subscripted the table and took `.preferred` off whatever came back, so a
@@ -3034,6 +3034,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let viewerModified = [];
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
+    // AlphaFold 3's short schedule below its own twenty-five steps; see
+    // ALPHAFOLD3_COUNTS in web/af3-model.js.
+    schedule: diffusionScheduleFor(chosenFamily(), mode, calls),
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds,
     // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes
