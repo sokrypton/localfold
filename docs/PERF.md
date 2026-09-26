@@ -609,6 +609,21 @@ s**, IntelliFold-2 26.42 -> **24.0**, OpenDDE 19.12 -> **16.88**, protenix2 9.03
 that move f64 host accumulation to f32 on the device (OpenDDE's s1/s2 and
 ESMFold2's head projections, both at 1e-8 of pLDDT).
 
+🔴 **AND AF2, WHICH THE FIRST PASS NEVER TOUCHED.** Profiled one block at 255
+residues and 128 rows under stock flags: 22.67 ms, every kernel at 4-7 TMAC/s.
+Three changes, all bit-identical (monomer checksum 8703532 at 5CAJ-255,
+multimer -394634, the stock and portable gate signatures unmoved):
+`attentionProjectRowsPerLane: 8` - the q/k/v/gate projection's tile was an M2's
+register budget, and here 8 rows a lane is 1.912 -> 1.375 ms
+(bench-attention-project.js); `triangleProjectOutColumns` reaching AF2's
+triangle too (0.498 -> 0.426 ms each); and `opmVectorOutput` - the outer
+product mean's output projection carried four pairs a workgroup and re-read the
+whole 1024 x 128 weight matrix for them, ~8.5 GB of L2 traffic a block, and as a
+64 x 64 vector GEMM (bias-first, cells ascending, scaled at the result, which is
+the old kernel's arithmetic exactly) it is 2.06 -> 1.32 ms. Block 22.67 ->
+**20.72 ms**, warm fold 1.37 -> **1.25 s**. Re-swept and left alone:
+`opmProjectOutputPairs` (4 still best under stock: 2 is 3.38 ms, 8 is 2.25).
+
 What is left under stock flags is mostly arithmetic: the pair track's f32
 kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,
 `tri.project` 14, the vector split 13-15, `tri.project-out` ~12, `grid.attend`

@@ -289,9 +289,17 @@ export const DEFAULT_TUNING = Object.freeze({
   // 🔴 THE TRIANGLE'S OUTPUT PROJECTION'S COLUMN TILE, null meaning the input
   // projection's. Its accumulator is a vec2 where the input's is a vec4, so it
   // wants twice the columns at the same register cost. AF3's pair track reads
-  // it, and only where that kernel accumulates in f32 - see compilePairTrack;
-  // AF2's does not. See src/kernels/triangle/shaders.js.
+  // it where that kernel accumulates in f32 - see compilePairTrack - and so do
+  // AF2's two blocks, whose triangle always does. See
+  // src/kernels/triangle/shaders.js.
   triangleProjectOutColumns: null,
+  // 🔴 AF2's f32 q/k/v/gate projection's rows a lane, null meaning 4 - an M2's
+  // register budget. See selectAttentionProjectKernel.
+  attentionProjectRowsPerLane: null,
+  // 🔴 AF2's OPM output projection as a vector GEMM where there are no matrix
+  // units, null meaning the pair-blocked kernel. Bit-identical either way; see
+  // createOuterProductMeanVectorOutputShader.
+  opmVectorOutput: null,
   // 🔴 HOW MANY THREADS A TRANSITION SHOULD AIM TO HAVE IN FLIGHT. The
   // transition's dispatch is rows-only, so a short track cannot fill a large
   // device at any tile; the workgroup WIDTH is the only axis left. null keeps
@@ -734,6 +742,10 @@ const PRIORS = new Map([
     // 384 channels and 0.56 -> 0.44 at 128, relRMS 0 (bench-triangle-project.js
     // --arms=32x32@32x32,32x64@32x32).
     triangleProjectOutColumns: 64,
+    // AF2's f32 attention projection at 8 rows a lane, stock flags, 128 x 255:
+    // 1.912 -> 1.375 ms, bitwise identical (bench-attention-project.js).
+    attentionProjectRowsPerLane: 8,
+    opmVectorOutput: true,
     diffusionAttendSubgroups: true,
     diffusionAttendStageKeys: true,
     // Swept in situ at 68 tokens as a whole denoiser step, repeated to

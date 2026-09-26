@@ -49,6 +49,8 @@ import {
   createOuterProductMeanContractShader,
   outerProductMeanTileCapacity,
   createOuterProductMeanProjectOutputShader,
+  createOuterProductMeanVectorOutputShader, OPM_VECTOR_OUTPUT_BLOCK,
+  OUTER_PRODUCT_MEAN_SCALE_SHADER,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
   opmProjectOutputPairs,
@@ -84,7 +86,7 @@ import {
   createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
 } from "../evoformer/block.js";
 import { deviceTuning } from "../../runtime/device-profile.js";
-import { LINEAR_GRID_WIDTH, createTriangleShaders } from "../../kernels/triangle/shaders.js";
+import { LINEAR_GRID_WIDTH, PROJECT_TILE, createTriangleShaders } from "../../kernels/triangle/shaders.js";
 import { shaderSourceSet } from "../../runtime/shader-source-cache.js";
 import {
   createTriangleContractMatrixShader, createTriangleProjectMatrixShader,
@@ -530,8 +532,12 @@ async function encodeOuterProductMean(
     descriptor, outerFirstLimitBytes(execution.device));
   const outputPairs = opmProjectOutputPairs(execution.device, input.cOuter);
   const contractPrecision = opmContractPrecision(execution.device);
+  // ...the output projection as a vector GEMM where the device asks for one;
+  // see the same choice in src/af2/evoformer/block.js.
+  const vectorOutput = outerFirst && deviceTuning(execution.device).opmVectorOutput === true
+    && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
-    contractPipeline, projectOutputPipeline] = await Promise.all([
+    contractPipeline, projectOutputPipeline, scalePipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
     execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
@@ -539,13 +545,20 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
       createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
-    execution.pipelines.get(
-      outerFirst && residualTarget !== undefined
-        ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
-        : `block:opm:project-output:${input.cOuter}:${outputPairs}`,
-      createOuterProductMeanProjectOutputShader(
-        input.cOuter, outerFirst && residualTarget !== undefined, outputPairs),
-    ),
+    vectorOutput
+      ? execution.pipelines.get(
+        `block:opm:project-output-vector:${residualTarget !== undefined}`,
+        createOuterProductMeanVectorOutputShader(residualTarget !== undefined))
+      : execution.pipelines.get(
+        outerFirst && residualTarget !== undefined
+          ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
+          : `block:opm:project-output:${input.cOuter}:${outputPairs}`,
+        createOuterProductMeanProjectOutputShader(
+          input.cOuter, outerFirst && residualTarget !== undefined, outputPairs),
+      ),
+    vectorOutput
+      ? execution.pipelines.get("block:opm:scale", OUTER_PRODUCT_MEAN_SCALE_SHADER)
+      : undefined,
   ]);
   // 🔴 A WARM STOPS HERE. `execution.warming` means the caller wants this
   // operation's PIPELINES built and nothing encoded - see Execution.warm.
@@ -586,6 +599,13 @@ async function encodeOuterProductMean(
     "opm.project");
   const outputGrid = execution.linearGrid(pairElements);
   if (outerFirst) {
+    const scale = vectorOutput
+      ? execution.allocate("opm.scale", input.length * input.length) : undefined;
+    if (scale !== undefined) {
+      const scaleGrid = execution.linearGrid(input.length * input.length);
+      execution.dispatch(encoder, scalePipeline, [msaMask, params, scale],
+        scaleGrid[0], scaleGrid[1], 1, "opm.scale");
+    }
     for (const [offset, count] of pairBlocks) {
       const blk = uniform(execution, `opm.pair-block-${offset}`,
         new Uint32Array([offset, count, 0, 0]));
@@ -593,6 +613,16 @@ async function encodeOuterProductMean(
       const pairGrid = execution.linearGrid(count * 64);
       execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate, blk],
         pairGrid[0], pairGrid[1], 1, "opm.contract");
+      if (vectorOutput) {
+        const vectorOutputParams = uniform(execution, `opm.vector-out-${offset}`,
+          new Uint32Array([count, input.cOuter * input.cOuter, input.cZ,
+            packedOffsets[6], packedOffsets[7], 0, offset, 0]));
+        execution.dispatch(encoder, projectOutputPipeline,
+          [intermediate, weights, vectorOutputParams, output, scale],
+          input.cZ / OPM_VECTOR_OUTPUT_BLOCK.columns,
+          Math.ceil(count / OPM_VECTOR_OUTPUT_BLOCK.rows), 1, "opm.project-output");
+        continue;
+      }
       // ...its OWN grid, because it carries several pairs a workgroup where the
       // contraction carries one; they shared `pairGrid` when both were one.
       const projectOutputGrid = execution.linearGrid(
@@ -660,7 +690,13 @@ async function encodeTriangleMultiplication(
   // was taking src/kernels/triangle/shaders.js's default on every device while the
   // pairformer beside it took Ampere's 32x32. `undefined` keeps that default,
   // so a device with no prior is unchanged.
-  const projectTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
+  // ...and the output kernel's own column tile, where the device sets one -
+  // this triangle always accumulates in f32, where it is bit-identical. See
+  // src/kernels/triangle/shaders.js.
+  const requestedTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
+  const outColumns = deviceTuning(execution.device).triangleProjectOutColumns ?? null;
+  const projectTile = outColumns === null ? requestedTile
+    : { ...(requestedTile ?? PROJECT_TILE), outColumns };
   const sourceKey = `multimer:triangle:${direction}:${JSON.stringify(shape)}`
     + `:${JSON.stringify(projectTile ?? null)}:${JSON.stringify(packedOffsets)}`;
   const shaders = shaderSourceSet(execution.device, sourceKey, () => createTriangleShaders(
@@ -674,7 +710,8 @@ async function encodeTriangleMultiplication(
     () => createTriangleShaders(
       shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
-    + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`;
+    + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`
+    + `x${shaders.projectTile.outColumns ?? "-"}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
   const outMatrixSources = matrixFits
     ? shaderSourceSet(execution.device,
@@ -797,7 +834,7 @@ async function encodeTriangleMultiplication(
       out.x, out.y, 1, `triangle.${direction}.output`);
   } else {
     execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
-      Math.ceil(input.cZ / shaders.projectTile.columns),
+      Math.ceil(input.cZ / (shaders.projectTile.outColumns ?? shaders.projectTile.columns)),
       projectRows[0], projectRows[1],
       `triangle.${direction}.output`);
   }

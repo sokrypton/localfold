@@ -552,7 +552,14 @@ export function selectAttentionProjectKernel(
   if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
     throw new Error("the f16 attention projection requires the shader-f16 feature");
   }
-  const tile = precision === "f16" ? ATTENTION_PROJECT_TILE_F16 : ATTENTION_PROJECT_TILE;
+  // 🔴 THE f32 TILE'S ROWS ARE THE DEVICE'S, because the sweep in the note on
+  // createAttentionProjectShader was an M2's register budget. On an A100 under
+  // stock flags, AF2's 128 x 255 x 256 projection: 4x2 1.912 ms, 8x2 1.375,
+  // 8x3 1.512, 8x1 1.513, 8x4 1.650 - bitwise identical. null keeps 4.
+  const rowsPerLane = deviceTuning(device)?.attentionProjectRowsPerLane ?? null;
+  const tile = precision === "f16" ? ATTENTION_PROJECT_TILE_F16
+    : rowsPerLane === null ? ATTENTION_PROJECT_TILE
+      : { ...ATTENTION_PROJECT_TILE, rowsPerLane };
   const cacheKey = `block:attention:project:${precision}:${sourceStorage}${outputStorage}`
     + (valueStorage === outputStorage ? "" : `-value${valueStorage}`)
     + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`;
@@ -569,7 +576,7 @@ export function selectAttentionProjectKernel(
     // the shader will read out of it.
     cacheKey,
     shader: precision === "f16" || sourceStorage !== "f32" || outputStorage !== "f32"
-      || valueStorage !== outputStorage
+      || valueStorage !== outputStorage || tile !== ATTENTION_PROJECT_TILE
       ? shaderSource(device, cacheKey, () => createAttentionProjectShader(
         tile, precision, "f32", sourceStorage, outputStorage, valueStorage))
       : ATTENTION_PROJECT_SHADER,

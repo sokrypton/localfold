@@ -1082,6 +1082,94 @@ export function createOuterProductMeanMatrixOutputShader(geometry, residual) {
   });
 }
 
+/**
+ * The output projection as a register-tiled VECTOR GEMM, for a device with no
+ * matrix units - every stock browser.
+ *
+ * 🔴 THE PAIR-BLOCKED KERNEL RE-READ THE WHOLE WEIGHT MATRIX PER FOUR PAIRS.
+ * `createOuterProductMeanProjectOutputShader` carries P pairs a workgroup and
+ * sweeps `c_outer^2 x c_z` weights for them, so at 255 residues its 16,257
+ * workgroups read 8.5 GB of weights a block out of L2: 2.06 ms, ~4 TMAC/s. As
+ * a GEMM over the block's pairs a staged weight panel serves 64 rows. Same
+ * bindings and uniform as the matrix kernel - `[intermediate, weights,
+ * MatmulParameters, output, scale]`, the pair offset in `padding.x` - so the
+ * caller's matrix branch drives it unchanged.
+ *
+ * 🔴 AND IT IS THE VECTOR KERNEL'S ARITHMETIC, NOT THE MATRIX ONE'S: each
+ * accumulator STARTS at the bias, sums the cells in ascending order, and is
+ * scaled at the result - so the answer is bit-identical to the pair-blocked
+ * kernel. (The count behind the scale is a sum of 0/1 products, an exact
+ * integer in any order.) A 64 x 64 block on 256 lanes, 4 x 4 adjacent outputs
+ * a lane, the source panel padded to a stride of 68 - the layout of the split
+ * transition's vector GEMM in src/af3/trunk/transition-webgpu.js.
+ */
+export function createOuterProductMeanVectorOutputShader(residual) {
+  const BM = 64, BN = 64, BK = 16, AS = BM + 4;
+  const acc = [], reads = [], mul = [], stores = [];
+  for (let i = 0; i < 4; i += 1) {
+    reads.push(`      let a_${i} = a_tile[k * ${AS}u + ty * 4u + ${i}u];`);
+    acc.push(`  var acc_${i} = bias;`);
+    mul.push(`      acc_${i} += a_${i} * b;`);
+    stores.push(`  {
+    let row = row_origin + ty * 4u + ${i}u;
+    if (row < parameters.rows) {
+      let pair = parameters.padding.x + row;
+      let scaled = acc_${i} * scale[pair];
+      let at = pair * parameters.columns + column;
+${[0, 1, 2, 3].map((c) => `      output[at + ${c}u] ${residual ? "+=" : "="} scaled.${"xyzw"[c]};`).join("\n")}
+    }
+  }`);
+  }
+  return `struct MatmulParameters {
+  rows: u32, inner: u32, columns: u32, weight_offset: u32,
+  bias_offset: u32, activation: u32, padding: vec2<u32>,
+};
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read> scale: array<f32>;
+var<workgroup> a_tile: array<f32, ${AS * BK}>;
+var<workgroup> b_tile: array<vec4<f32>, ${BK * BN / 4}>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+  let row_origin = group.y * ${BM}u;
+  let column_origin = group.x * ${BN}u;
+  let tx = li % 16u;
+  let ty = li / 16u;
+  let column = column_origin + tx * 4u;
+  let b0 = parameters.bias_offset + column;
+  let bias = vec4<f32>(weights[b0], weights[b0 + 1u], weights[b0 + 2u], weights[b0 + 3u]);
+${acc.join("\n")}
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
+    for (var e = li; e < ${BM * BK}u; e += 256u) {
+      let m = e / ${BK}u;
+      let row = row_origin + m;
+      var value = 0.0;
+      if (row < parameters.rows) { value = source[row * parameters.inner + k0 + e % ${BK}u]; }
+      a_tile[(e % ${BK}u) * ${AS}u + m] = value;
+    }
+    for (var e = li; e < ${BK * BN / 4}u; e += 256u) {
+      let base = parameters.weight_offset + (k0 + e / ${BN / 4}u) * parameters.columns
+        + column_origin + (e % ${BN / 4}u) * 4u;
+      b_tile[e] = vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u],
+                            weights[base + 3u]);
+    }
+    workgroupBarrier();
+    for (var k = 0u; k < ${BK}u; k += 1u) {
+      let b = b_tile[k * ${BN / 4}u + tx];
+${reads.join("\n")}
+${mul.join("\n")}
+    }
+    workgroupBarrier();
+  }
+${stores.join("\n")}
+}`;
+}
+/** The vector output GEMM's block, which its dispatch divides by. */
+export const OPM_VECTOR_OUTPUT_BLOCK = Object.freeze({ rows: 64, columns: 64 });
+
 export function createOuterProductMeanMatrixContractShader(cOuter, geometry) {
   return createStagedMatrixShader({
     ...geometry,

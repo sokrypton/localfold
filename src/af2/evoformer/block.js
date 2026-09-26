@@ -36,6 +36,7 @@ import {
   opmProjectOutputPairs,
   OUTER_PRODUCT_MEAN_SCALE_SHADER,
   createOuterProductMeanMatrixOutputShader,
+  createOuterProductMeanVectorOutputShader, OPM_VECTOR_OUTPUT_BLOCK,
   opmMatrixContract,
   createOuterProductMeanMatrixContractShader,
   createOuterProductMeanProjectShader,
@@ -66,7 +67,7 @@ import {
 import { SOURCES } from "../../bundles/alphafold-fixture.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
 import { deviceTuning } from "../../runtime/device-profile.js";
-import { createTriangleShaders, LINEAR_GRID_WIDTH } from "../../kernels/triangle/shaders.js";
+import { createTriangleShaders, LINEAR_GRID_WIDTH, PROJECT_TILE } from "../../kernels/triangle/shaders.js";
 import {
   createTriangleContractMatrixShader, createTriangleProjectMatrixShader,
   createTriangleProjectOutMatrixShaders, triangleContractMatrixDispatch,
@@ -859,6 +860,12 @@ async function encodeOuterProductMean(
   // its own; they are one geometry and two independent kernels.
   const matrixOutput = deviceTuning(execution.device).opmMatrixOutput === false
     ? null : matrixContract;
+  // 🔴 AND WITHOUT MATRIX UNITS, A VECTOR GEMM WHERE THE DEVICE ASKS FOR ONE -
+  // bit-identical to the pair-blocked kernel; see
+  // createOuterProductMeanVectorOutputShader. Same bindings as the matrix one.
+  const vectorOutput = matrixOutput === null && outerFirst
+    && deviceTuning(execution.device).opmVectorOutput === true
+    && input.cZ % OPM_VECTOR_OUTPUT_BLOCK.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
     scalePipeline, contractPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
@@ -877,7 +884,11 @@ async function encodeOuterProductMean(
         `block:opm:contract-matrix:${input.cOuter}:${matrixContract.blockRows}`
           + `x${matrixContract.blockColumns}x${matrixContract.blockInner}`,
         () => createOuterProductMeanMatrixContractShader(input.cOuter, matrixContract)),
-    matrixOutput === null
+    vectorOutput
+      ? execution.shaderPipeline(
+        `block:opm:project-output-vector:${residualTarget !== undefined}`,
+        () => createOuterProductMeanVectorOutputShader(residualTarget !== undefined))
+      : matrixOutput === null
       ? execution.shaderPipeline(
         outerFirst && residualTarget !== undefined
           ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
@@ -955,7 +966,7 @@ async function encodeOuterProductMean(
   if (outerFirst) {
     // ...the denominator once for every pair, where project-output used to
     // compute it per workgroup; see OUTER_PRODUCT_MEAN_SCALE_SHADER.
-    const scale = matrixOutput === null ? undefined
+    const scale = matrixOutput === null && !vectorOutput ? undefined
       : execution.allocate("opm.scale", input.length * input.length);
     if (scale !== undefined) {
       const scaleGrid = execution.linearGrid(input.length * input.length);
@@ -987,7 +998,15 @@ async function encodeOuterProductMean(
           Math.ceil(columns / matrixContract.blockColumns),
           Math.ceil(blockRows / matrixContract.blockRows), 1, "opm.contract");
       }
-      if (matrixOutput === null) {
+      if (vectorOutput) {
+        const vectorOutputParams = uniform(execution, `opm.vector-out-${offset}`,
+          new Uint32Array([count, input.cOuter * input.cOuter, input.cZ,
+            packedOffsets[6], packedOffsets[7], 0, offset, 0]));
+        execution.dispatch(encoder, projectOutputPipeline,
+          [intermediate, weights, vectorOutputParams, output, scale],
+          input.cZ / OPM_VECTOR_OUTPUT_BLOCK.columns,
+          Math.ceil(count / OPM_VECTOR_OUTPUT_BLOCK.rows), 1, "opm.project-output");
+      } else if (matrixOutput === null) {
         // ...its OWN grid, because it carries several pairs a workgroup where
         // the contraction carries one; they shared `pairGrid` when both were one.
         const projectOutputGrid = execution.linearGrid(
@@ -1077,7 +1096,13 @@ async function encodeTriangleMultiplication(
   // was taking src/kernels/triangle/shaders.js's default on every device while the
   // pairformer beside it took Ampere's 32x32. `undefined` keeps that default,
   // so a device with no prior is unchanged.
-  const projectTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
+  // ...and the output kernel's own column tile, where the device sets one -
+  // this triangle always accumulates in f32, where it is bit-identical. See
+  // src/kernels/triangle/shaders.js.
+  const requestedTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
+  const outColumns = deviceTuning(execution.device).triangleProjectOutColumns ?? null;
+  const projectTile = outColumns === null ? requestedTile
+    : { ...(requestedTile ?? PROJECT_TILE), outColumns };
   // 🔴 SEVEN SOURCES, TWICE, ONCE A BLOCK A RECYCLE. `encodeTriangleMultiplication`
   // runs twice a block and 48 blocks a recycle, and regenerated every one of
   // these strings each time for a pipeline that already existed. The shape, the
@@ -1097,7 +1122,8 @@ async function encodeTriangleMultiplication(
     () => createTriangleShaders(
       shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
-    + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`;
+    + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`
+    + `x${shaders.projectTile.outColumns ?? "-"}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
   const outMatrixSources = matrixFits
     ? shaderSourceSet(execution.device,
@@ -1241,7 +1267,7 @@ async function encodeTriangleMultiplication(
       out.x, out.y, 1, `triangle.${direction}.output`);
   } else {
     execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
-      Math.ceil(input.cZ / shaders.projectTile.columns),
+      Math.ceil(input.cZ / (shaders.projectTile.outColumns ?? shaders.projectTile.columns)),
       projectRows[0], projectRows[1],
       `triangle.${direction}.output`);
   }
