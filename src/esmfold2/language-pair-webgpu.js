@@ -18,6 +18,7 @@
  */
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, linearGrid }
   from "../esmc/block-webgpu.js";
+import { settleAll } from "../runtime/pipeline-cache.js";
 
 /** How many pair rows the shim builds at once. */
 export const SHIM_CHUNK = 8192;
@@ -102,19 +103,19 @@ export async function encodeLanguagePair(context, { tokens, channels, single, we
   const heights = [...new Set([height, pairs % height].filter((h) => h > 0))];
   const pipelines = {};
   for (const rows of heights) {
-    pipelines[rows] = {
-      join: await cache.get(`${key}:join:${rows}`,
+    pipelines[rows] = await settleAll({
+      join: cache.get(`${key}:join:${rows}`,
         createOuterJoinShader({ tokens, channels, rows })),
-      first: await cache.get(`${key}:mlp1:${rows}`,
+      first: cache.get(`${key}:mlp1:${rows}`,
         createLinearShader({ rows, inner: channels * 2, outer: channels }, false)),
-      gelu: await cache.get(`${key}:gelu:${rows}`,
+      gelu: cache.get(`${key}:gelu:${rows}`,
         createBiasGeluShader({ rows, channels })),
-      second: await cache.get(`${key}:mlp2:${rows}`,
+      second: cache.get(`${key}:mlp2:${rows}`,
         createLinearShader({ rows, inner: channels, outer: channels }, false)),
-      bias: await cache.get(`${key}:bias:${rows}`, createBiasShader({ rows, channels })),
-      norm: await cache.get(`${key}:norm:${rows}`,
+      bias: cache.get(`${key}:bias:${rows}`, createBiasShader({ rows, channels })),
+      norm: cache.get(`${key}:norm:${rows}`,
         createLayerNormShader({ rows, channels }, true, 1e-5)),
-    };
+    });
   }
 
   const singleBuffer = allocator.upload("esmfold2.shim.single", single, storage);

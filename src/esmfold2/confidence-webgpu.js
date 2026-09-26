@@ -321,12 +321,13 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
   const allocations = [];
   const keep = (a) => { allocations.push(a); return a; };
   try {
-    const project = await pipelines.get(
-      `ef2-conf-rank1:${tokens}:${channels}:${channels}`,
-      createRankOneProjectShader({ tokens, channels, outChannels: channels }));
-    const init = await pipelines.get(
-      `ef2-conf-pair-init:${tokens}:${channels}:${weights.boundaries.length}`,
-      createPairInitShader({ tokens, channels, edges: weights.boundaries.length }));
+    // Asked for together, so they compile in parallel; see settleAll.
+    const [project, init] = await Promise.all([
+      pipelines.get(`ef2-conf-rank1:${tokens}:${channels}:${channels}`,
+        createRankOneProjectShader({ tokens, channels, outChannels: channels })),
+      pipelines.get(`ef2-conf-pair-init:${tokens}:${channels}:${weights.boundaries.length}`,
+        createPairInitShader({ tokens, channels, edges: weights.boundaries.length })),
+    ]);
 
     // 🔴 THE FOUR s -> z PROJECTIONS ON THE DEVICE when the fold hands over the
     // normalised single inputs. They were four JavaScript matmuls - `tokens x
@@ -449,17 +450,16 @@ export async function esmfold2ConfidenceReadouts(device, input, weights, options
   const allocations = [];
   const keep = (a) => { allocations.push(a); return a; };
   try {
-    const scoreProject = await pipelines.get(
-      `ef2-conf-project:${pairs}:${channels}:1`,
-      createProjectRowsShader({ rows: pairs, inChannels: channels, outChannels: 1 }));
-    const paeProject = await pipelines.get(
-      `ef2-conf-project:${pairs}:${channels}:${paeBins}`,
-      createProjectRowsShader({ rows: pairs, inChannels: channels, outChannels: paeBins }));
-    const outProject = await pipelines.get(
-      `ef2-conf-project:${tokens}:${channels}:${single}`,
-      createProjectRowsShader({ rows: tokens, inChannels: channels, outChannels: single }));
-    const pool = await pipelines.get(`ef2-conf-pool:${tokens}:${channels}`,
-                                     createPoolShader({ tokens, channels }));
+    const [scoreProject, paeProject, outProject, pool] = await Promise.all([
+      pipelines.get(`ef2-conf-project:${pairs}:${channels}:1`,
+        createProjectRowsShader({ rows: pairs, inChannels: channels, outChannels: 1 })),
+      pipelines.get(`ef2-conf-project:${pairs}:${channels}:${paeBins}`,
+        createProjectRowsShader({ rows: pairs, inChannels: channels, outChannels: paeBins })),
+      pipelines.get(`ef2-conf-project:${tokens}:${channels}:${single}`,
+        createProjectRowsShader({ rows: tokens, inChannels: channels, outChannels: single })),
+      pipelines.get(`ef2-conf-pool:${tokens}:${channels}`,
+        createPoolShader({ tokens, channels })),
+    ]);
 
     const up = (name, values) => keep(allocator.upload(`ef2-conf.${name}`, values, storage()));
     const pair = input.pairBuffer !== undefined ? { buffer: input.pairBuffer }

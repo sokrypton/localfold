@@ -152,3 +152,15 @@ export function pipelineCacheForDevice(device) {
   }
   return cache;
 }
+
+/**
+ * An object of pipeline promises, awaited together: `{ a: cache.get(...), b:
+ * cache.get(...) }` -> `{ a, b }`. Asking for every pipeline before awaiting any
+ * is what lets the browser compile them in parallel; awaiting each as it is
+ * asked for puts every compile of a stage on a cold fold's path, one after
+ * another.
+ */
+export async function settleAll(promises) {
+  return Object.fromEntries(await Promise.all(Object.entries(promises)
+    .map(async ([name, promise]) => [name, await promise])));
+}

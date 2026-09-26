@@ -369,10 +369,10 @@ export class Af3MsaAttentionGpu {
     // same statement in one place, so the stack cannot drift from it again.
     const key = `af3-msa-attn:${sequences}:${tokens}:${msaChannels}:${pairChannels}`
       + `:${msaAttentionKeyPart(full)}:${epsilon}:${variance}`;
-    const compiled = {};
-    for (const [name, source] of Object.entries(sources)) {
-      compiled[name] = await this.pipelines.get(`${key}:${name}`, source);
-    }
+    // Compiled together, not one after another: the browser builds them in
+    // parallel, and a serial loop put every one of them on a cold fold's path.
+    const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
+      async ([name, source]) => [name, await this.pipelines.get(`${key}:${name}`, source)])));
 
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];

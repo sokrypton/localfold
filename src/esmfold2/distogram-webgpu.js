@@ -19,6 +19,7 @@
  * reported distance would not be.
  */
 import { GRID_WIDTH, LANES, createLinearShader, linearGrid } from "../esmc/block-webgpu.js";
+import { settleAll } from "../runtime/pipeline-cache.js";
 import { MOL_NONPOLYMER, MOL_PROTEIN } from "./featurise.js";
 import {
   CLASS_AMINO, CLASS_LIGAND, CLASS_NUCLEIC, CLASS_PROTEIN, PSEUDO_BETA_RESIDUES,
@@ -565,7 +566,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
   const height = Math.min(chunk, pairs);
   const heights = [...new Set([height, pairs % height].filter((h) => h > 0))];
   const key = `esmfold2-disto:${tokens}:${channels}:${bins}`;
-  const symmetrise = await cache.get(`${key}:sym`,
+  const symmetriseCompiling = cache.get(`${key}:sym`,
     createSymmetriseShader({ tokens, channels }));
   // 🔴 THE CERTAINTY RIDES ON THE SAME PROJECTION. Its per-pair pass reads the
   // logits chunk the contact pass has just been handed, so the distogram is
@@ -581,7 +582,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
                        ligand: binOf(PARTNER_ANGSTROMS.ligand) };
   const certaintyPair = {};
   for (const rows of heights) {
-    certaintyPair[rows] = await cache.get(`${key}:certain:${rows}`,
+    certaintyPair[rows] = cache.get(`${key}:certain:${rows}`,
       createCertaintyPairShader({ pairs: rows, bins }, span));
   }
   // 🔴 THE RULE'S CONSTANTS ARE IN THE KEY, THOUGH THEY ARE CONSTANTS TODAY. A
@@ -590,7 +591,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
   // a plausible number from the previous setting, not an error.
   const certaintyKey = `${key}:certain-token:${tokens}:${CERTAINTY.separation}`
     + `:${cutoffBins.protein}:${cutoffBins.nucleic}:${cutoffBins.ligand}`;
-  const certaintyPass = await cache.get(certaintyKey,
+  const certaintyCompiling = cache.get(certaintyKey,
     createCertaintyShader({ tokens, separation: CERTAINTY.separation, cutoffBins }));
   const project = {};
   const contact = {};
@@ -600,14 +601,20 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
   // distogram is still projected exactly once.
   const moments = {};
   for (const rows of heights) {
-    project[rows] = await cache.get(`${key}:project:${rows}`,
+    project[rows] = cache.get(`${key}:project:${rows}`,
       createLinearShader({ rows, inner: channels, outer: bins }, false));
-    contact[rows] = await cache.get(`${key}:contact:${rows}`,
+    contact[rows] = cache.get(`${key}:contact:${rows}`,
       createContactShader({ pairs: rows, bins }));
     if (wantMoments) {
-      moments[rows] = await cache.get(`${key}:moments:${rows}`,
+      moments[rows] = cache.get(`${key}:moments:${rows}`,
         createMomentsShader({ pairs: rows, bins }));
     }
+  }
+  // Every pipeline above is asked for before any is awaited; see settleAll.
+  const [symmetrise, certaintyPass] = await Promise.all([symmetriseCompiling,
+                                                         certaintyCompiling]);
+  for (const table of [certaintyPair, project, contact, moments]) {
+    Object.assign(table, await settleAll(table));
   }
 
   const held = [];
@@ -818,10 +825,11 @@ async function framesScorer(context) {
   const { cutoffBins, logits, biasBuffer, modes, mass, certainty, readCertainty,
           partnerBuffer, interfaceCertainty, bondBuffer } = context;
   const storage = GPUBufferUsage.STORAGE;
-  const observed = await cache.get(`${key}:observed:${tokens}`,
-    createObservedMassShader({ tokens, bins }, span));
-  const aggregate = await cache.get(context.certaintyKey,
-    createCertaintyShader({ tokens, separation: CERTAINTY.separation, cutoffBins }));
+  const [observed, aggregate] = await Promise.all([
+    cache.get(`${key}:observed:${tokens}`, createObservedMassShader({ tokens, bins }, span)),
+    cache.get(context.certaintyKey,
+      createCertaintyShader({ tokens, separation: CERTAINTY.separation, cutoffBins })),
+  ]);
   const positions = allocator.allocate("esmfold2.disto.frame-positions",
     Math.max(16, tokens * 3 * 4), storage | GPUBufferUsage.COPY_DST);
   const elementwise = (elements) => {

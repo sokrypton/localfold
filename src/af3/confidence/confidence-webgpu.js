@@ -987,10 +987,10 @@ export class Af3ConfidenceHeadGpu {
       + `:re${reembedding}:hn${headPacked.offsets.logitsLnScale !== undefined}`
       + `:sh${headPacked.offsets.interHalfDistanceLogits !== undefined}`
       + `:ps${shape.preSymmetrisedPde}:cd${shape.confidenceCaDgram}`;
-    const compiled = {};
-    for (const [name, source] of Object.entries(sources)) {
-      compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
-    }
+    // Compiled together, not one after another: the browser builds them in
+    // parallel, and a serial loop put every one of them on a cold fold's path.
+    const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
+      async ([name, source]) => [name, await this.pipelines.get(`${base}:${name}`, source)])));
 
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];

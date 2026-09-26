@@ -348,13 +348,11 @@ export async function openddeAtomReadouts(device, input, weights) {
       table: weights.resolvedWeight, factor: 1 },
   ];
   const slots = weights.denseSlots;
-  const compiled = [];
-  for (const arm of arms) {
-    compiled.push(await pipelines.get(
-      `opendde-conf-atom:${atoms}:${channels}:${arm.bins}:${slots}:${arm.scoreBins}`,
-      createAtomReadoutShader({ atoms, channels, bins: arm.bins, slots,
-                                scoreBins: arm.scoreBins })));
-  }
+  // Asked for together, so they compile in parallel; see settleAll.
+  const compiled = await Promise.all(arms.map((arm) => pipelines.get(
+    `opendde-conf-atom:${atoms}:${channels}:${arm.bins}:${slots}:${arm.scoreBins}`,
+    createAtomReadoutShader({ atoms, channels, bins: arm.bins, slots,
+                              scoreBins: arm.scoreBins }))));
 
   // One buffer, token indices then slot indices, so the kernel takes one
   // binding for what is two per-atom tables.
@@ -435,15 +433,12 @@ export async function openddePairReadouts(device, input, weights) {
     { name: "pde", symmetrise: true, bins: weights.pdeBins, tm: false,
       scale: weights.pdeLnScale, offset: weights.pdeLnOffset, projection: weights.pde },
   ];
-  const compiled = [];
-  for (const arm of arms) {
-    compiled.push(await pipelines.get(
-      `opendde-conf-readout:${tokens}:${channels}:${arm.bins}:${arm.symmetrise}`
-      + `:${arm.tm ? tmTokens : "no-tm"}`,
-      createReadoutShader({ tokens, channels, bins: arm.bins,
-                            minBin: 0, maxBin: 32, symmetrise: arm.symmetrise,
-                            tmTokens: arm.tm ? tmTokens : undefined })));
-  }
+  const compiled = await Promise.all(arms.map((arm) => pipelines.get(
+    `opendde-conf-readout:${tokens}:${channels}:${arm.bins}:${arm.symmetrise}`
+    + `:${arm.tm ? tmTokens : "no-tm"}`,
+    createReadoutShader({ tokens, channels, bins: arm.bins,
+                          minBin: 0, maxBin: 32, symmetrise: arm.symmetrise,
+                          tmTokens: arm.tm ? tmTokens : undefined }))));
 
   const storage = GPUBufferUsage.STORAGE;
   const allocations = [];

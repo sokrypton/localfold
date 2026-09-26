@@ -529,10 +529,10 @@ export class Af3EmbedderGpu {
       + `:bt${hasBondTypes(weights)}:mw${shape.msaFeatureWidth}`
       // ...and the paired column's VALUE, which is a term in the source.
       + `:pq${shape.msaPairedQueryRow}`;
-    const compiled = {};
-    for (const [name, source] of Object.entries(sources)) {
-      compiled[name] = await this.pipelines.get(`${key}:${name}`, source);
-    }
+    // Compiled together, not one after another: the browser builds them in
+    // parallel, and a serial loop put every one of them on a cold fold's path.
+    const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
+      async ([name, source]) => [name, await this.pipelines.get(`${key}:${name}`, source)])));
 
     // The five integer feature rows, packed in the order the shader indexes.
     const featureData = new Int32Array(5 * tokens);

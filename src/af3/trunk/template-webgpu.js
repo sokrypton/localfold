@@ -635,10 +635,10 @@ export class Af3TemplateEmbedderGpu {
     if (pairBuffer !== undefined && options.validation === undefined) {
       throw new Error("pairBuffer needs options.validation: nothing here awaits the scope");
     }
-    const compiled = {};
-    for (const [name, source] of Object.entries(sources)) {
-      compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
-    }
+    // Compiled together, not one after another: the browser builds them in
+    // parallel, and a serial loop put every one of them on a cold fold's path.
+    const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
+      async ([name, source]) => [name, await this.pipelines.get(`${base}:${name}`, source)])));
     if (pairBuffer !== undefined) {
       compiled.addPair = await this.pipelines.get(
         `af3-template:add-pair:${pairs * queryChannels}`, createAddShader(pairs * queryChannels));

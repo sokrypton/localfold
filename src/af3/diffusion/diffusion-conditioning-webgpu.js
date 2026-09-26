@@ -37,7 +37,7 @@
  */
 import { createAddShader } from "../../runtime/execution.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
-import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
+import { pipelineCacheForDevice, settleAll } from "../../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
 import { deviceTuning } from "../../runtime/device-profile.js";
 import { singleCondPadding, singleCondPaddingWgsl } from "../dialect.js";
@@ -700,20 +700,23 @@ export class Af3DiffusionConditioningGpu {
       + `:${noiseChannels}:${padding.join(",")}:${split ? trunkPairChannels : 0}`
       + `:${projectedRelpos ? `pr${trunkPairChannels}` : ""}`
       + `:ts${trunkSingleChannels}${singleBias ? ":sb" : ""}`;
-    const compiled = {
+    // Every pipeline here is ASKED FOR before any is awaited, so the browser
+    // builds them together; awaited one by one they were ten serial compiles
+    // on a cold denoiser call.
+    const compiling = {
       pairInitial: reusePair !== undefined ? undefined
-        : await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
-      singleInitial: await this.pipelines.get(`${base}:single-initial`, sources.singleInitial),
+        : this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
+      singleInitial: this.pipelines.get(`${base}:single-initial`, sources.singleInitial),
       addPair: reusePair !== undefined ? undefined
-        : await this.pipelines.get(`${base}:add-pair`, createAddShader(pairs * pairChannels)),
-      addSingle: await this.pipelines.get(`${base}:add-single`,
+        : this.pipelines.get(`${base}:add-pair`, createAddShader(pairs * pairChannels)),
+      addSingle: this.pipelines.get(`${base}:add-single`,
         createAddShader(tokens * seqChannels)),
     };
     // The four unconditioned transitions: the trunk's shader, two-pass variance.
     const transitionPipelines = { pair: [], single: [] };
     for (let index = 0; index < 2; index += 1) {
       transitionPipelines.pair.push(reusePair !== undefined ? undefined
-        : await this.pipelines.get(`${base}:pair-transition:${index}`,
+        : this.pipelines.get(`${base}:pair-transition:${index}`,
             createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2 },
                                    prepared.pairTransitions[index].offsets, 1e-5, "two-pass")));
       // 🔴 THE SINGLE TRANSITION IS `tokens` ROWS AND THE KERNEL DISPATCHES
@@ -732,12 +735,15 @@ export class Af3DiffusionConditioningGpu {
         deviceTuning(this.device).transitionThreadTarget, undefined, seqChannels * 2,
         // ...and never wider than this device will run. See transitionWidth.
         this.device.limits.maxComputeWorkgroupSizeX);
-      transitionPipelines.single.push(await this.pipelines.get(
+      transitionPipelines.single.push(this.pipelines.get(
         `${base}:single-transition:${index}:w${singleWidth_}`,
         createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2,
                                  width: singleWidth_ },
                                prepared.singleTransitions[index].offsets, 1e-5, "two-pass")));
     }
+    const compiled = await settleAll(compiling);
+    transitionPipelines.pair = await Promise.all(transitionPipelines.pair);
+    transitionPipelines.single = await Promise.all(transitionPipelines.single);
     return { shape, base, compiled, transitionPipelines };
   }
 
