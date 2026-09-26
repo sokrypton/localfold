@@ -488,8 +488,15 @@ export async function embedderWeights(store) {
   };
 }
 
-export async function templateWeights(store, dialect = undefined) {
-  const T = (name) => store.tensor(name);
+export async function templateWeights(store, dialect = undefined, options = {}) {
+  // 🔴 `shapesOnly`: zeros of each tensor's manifest shape and stand-in blocks,
+  // so the template embedder's pipelines can compile before its shards have
+  // arrived - see `bind` and warmTrunkPipelines.
+  const shapesOnly = options.shapesOnly === true;
+  const T = shapesOnly
+    ? async (name) => new Float32Array(dims(store, name).reduce((a, b) => a * b, 1))
+    : (name) => store.tensor(name);
+  const bound = (fields) => bind(store, fields, { shapesOnly });
   // 🔴 TWO TEMPLATE EMBEDDERS, AND THE DIALECT PICKS. AF3 and OpenDDE sum NINE
   // separate feature projections (`template_pair_embedding_0..8`); protenix2
   // and boltz2 concatenate the features and apply ONE (`a_proj`), with the
@@ -524,8 +531,8 @@ export async function templateWeights(store, dialect = undefined) {
     const [channels] = dims(store, `${TEMPLATE}/v_norm/scale`);
     return {
       fused: true, queryChannels, featureWidth, channels,
-      blocks: [await bind(store, pairTrack(store, TEMPLATE_FUSED_STACK, 0)),
-               await bind(store, pairTrack(store, TEMPLATE_FUSED_STACK, 1))],
+      blocks: [await bound(pairTrack(store, TEMPLATE_FUSED_STACK, 0)),
+               await bound(pairTrack(store, TEMPLATE_FUSED_STACK, 1))],
       // v = z_proj(z_norm(z)) + a_proj(a_tij)
       queryEmbeddingNormScale: await T(`${TEMPLATE}/z_norm/scale`),
       queryEmbeddingNormOffset: await T(`${TEMPLATE}/z_norm/offset`),
@@ -542,8 +549,8 @@ export async function templateWeights(store, dialect = undefined) {
   // the trunk's 4 of 32, and OpenDDE's is 2 of 32 against the trunk's 12 of 32.
   // Both come out at 64 channels and neither number is derivable from the
   // other, so `pairTrack` reads them off `pair_attention1/q_projection`.
-  const blocks = [await bind(store, pairTrack(store, TEMPLATE_STACK, 0)),
-                  await bind(store, pairTrack(store, TEMPLATE_STACK, 1))];
+  const blocks = [await bound(pairTrack(store, TEMPLATE_STACK, 0)),
+                  await bound(pairTrack(store, TEMPLATE_STACK, 1))];
   // 🔴 AND THE QUERY WIDTH IS THE TRUNK PAIR'S, NOT THE STACK'S. The embedder
   // reads the trunk's pair representation, normalises it and projects it DOWN
   // into the stack - so `queryChannels` is 128 here and 384 under OpenDDE,

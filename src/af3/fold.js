@@ -37,7 +37,8 @@ import { Af3AtomEncoderGpu } from "./diffusion/atom-encoder-webgpu.js";
 import { Af3TrunkGpu } from "./trunk/trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence/confidence-webgpu.js";
 import { Af3PairformerStackGpu } from "./trunk/pairformer-block-webgpu.js";
-import { af3Dialect, pairformerBlockWeights } from "./weights/weights.js";
+import { af3Dialect, pairformerBlockWeights, templateWeights } from "./weights/weights.js";
+import { Af3TemplateEmbedderGpu } from "./trunk/template-webgpu.js";
 import { Af3StructuralExpanderGpu } from "./structure/structural-expander-webgpu.js";
 import { structuralAttentionBias, structuralPairFeatures }
   from "./structure/structural-expander-reference.js";
@@ -661,8 +662,22 @@ export async function warmTrunkPipelines(device, store, tokens, options = {}) {
   // weights rather than off a width.
   const resolved = "pairWeightPrecision" in stack ? stack
     : { ...stack, pairWeightPrecision: defaultPairWeightPrecision(sample.pairChannels) };
-  await new Af3PairformerStackGpu(device, resolved)
-    .warm({ tokens }, [sample], af3Dialect(store), run);
+  // 🔴 AND THE TEMPLATE EMBEDDER, THE LARGEST OF THE TRUNK'S OTHER STAGES AND
+  // THE ONLY ONE WHOSE KEYS DO NOT NAME THE ALIGNMENT'S DEPTH - which is not
+  // known while the shards are still arriving. Built as the trunk builds it
+  // (its four f32 pins, four slots), `compileOnly`. Trunk warms only: a root
+  // names another stack.
+  const template = root === undefined
+    ? templateWeights(store, af3Dialect(store), { shapesOnly: true }).then((weights) =>
+      new Af3TemplateEmbedderGpu(device, {
+        stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32",
+        pairMatrixKernels: false,
+      }).run({ tokens, templates: 4 }, weights, af3Dialect(store), { compileOnly: true }))
+    : undefined;
+  await Promise.all([
+    new Af3PairformerStackGpu(device, resolved).warm({ tokens }, [sample], af3Dialect(store), run),
+    template,
+  ]);
 }
 
 /**

@@ -840,6 +840,11 @@ Of the ~1.1 s that only a cold fold pays, the shader cache is worth ~340 ms (a
   anything allocated - as the fold starts, beside the target features: 1.33 ->
   1.27-1.29 s, still 137 pipelines (a mismatched warm would add some) and the
   same pLDDT to every digit.
+- **And the template embedder during the download.** It is the largest of those
+  three and the only one whose keys do not name the alignment's depth, so the
+  page's store-open warm (`warmTrunkPipelines`) compiles it from shapes-only
+  weights beside the pairformer. Page, cold: trunk pass 1 705 -> 501-547 ms,
+  first sampler step at 2090-2129 ms after the click against ~2250.
 
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
