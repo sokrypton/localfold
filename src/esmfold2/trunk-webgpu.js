@@ -36,7 +36,7 @@
  * about itself twice.
  */
 import {
-  deviceMatrixConfig, deviceTuning, halfPrecisionAvailable,
+  deviceMatrixConfig, deviceTuning, halfPrecisionAvailable, shapedKnob,
 } from "../runtime/device-profile.js";
 import { stagedMatrixBlock } from "../kernels/matrix-linear.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
@@ -233,6 +233,8 @@ export class Esmfold2TrunkGpu {
         : false;
     const pipelines = await compilePairTrack(this.pipelines, {
       n, sample: blocks[0], epsilon, variance, base, channels,
+      triangleProjectTile: shapedKnob(tuning.trianglePairProjectTile),
+      triangleProjectOutColumns: tuning.triangleProjectOutColumns,
       // The grid attention is what needs a dialect; without it there is no
       // transposed bias to have a convention about.
       dialect: { swapTransposedBias: false },

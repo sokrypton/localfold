@@ -286,6 +286,11 @@ export const DEFAULT_TUNING = Object.freeze({
   // is traffic. Which direction a tile wants to move is a question about
   // whether the dispatch already fills the device, not about the device.
   trianglePairProjectTile: null,
+  // 🔴 THE TRIANGLE'S OUTPUT PROJECTION'S COLUMN TILE, null meaning the input
+  // projection's. Its accumulator is a vec2 where the input's is a vec4, so it
+  // wants twice the columns at the same register cost. AF3's pair track reads
+  // it; AF2's does not. See src/kernels/triangle/shaders.js.
+  triangleProjectOutColumns: null,
   // 🔴 HOW MANY THREADS A TRANSITION SHOULD AIM TO HAVE IN FLIGHT. The
   // transition's dispatch is rows-only, so a short track cannot fill a large
   // device at any tile; the workgroup WIDTH is the only axis left. null keeps
@@ -724,6 +729,10 @@ const PRIORS = new Map([
     diffusionTokenTile: { below: 1, atOrAbove: 2, crossover: 175 },
     singleProjectOutLanes: 256,
     trianglePairProjectTile: { rows: 32, columns: 32 },
+    // `tri.project-out` at 32 x 64, stock flags, 255 tokens: 4.34 -> 3.26 ms at
+    // 384 channels and 0.56 -> 0.44 at 128, relRMS 0 (bench-triangle-project.js
+    // --arms=32x32@32x32,32x64@32x32).
+    triangleProjectOutColumns: 64,
     diffusionAttendSubgroups: true,
     diffusionAttendStageKeys: true,
     // Swept in situ at 68 tokens as a whole denoiser step, repeated to

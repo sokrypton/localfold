@@ -19,7 +19,8 @@
  * deltas against a common input to be summed at the end. Batching them that way
  * is a natural-looking optimisation and a different function.
  */
-import { LINEAR_GRID_WIDTH, createTriangleShaders } from "../../kernels/triangle/shaders.js";
+import { LINEAR_GRID_WIDTH, PROJECT_TILE as PROJECT_TILE_DEFAULT, createTriangleShaders }
+  from "../../kernels/triangle/shaders.js";
 import { packWeights as packTriangleWeights } from "../../kernels/triangle/weights.js";
 import { af3TriangleWeights } from "./triangle-webgpu.js";
 import { stagedMatrixStorage } from "../../kernels/matrix-linear.js";
@@ -205,7 +206,13 @@ export async function compilePairTrack(cache, options) {
       // 🔴 THE PROJECTION TILE IS THE CALLER'S, because it is an occupancy
       // choice and this file cannot see the device. undefined keeps
       // src/kernels/triangle/shaders.js's default, which is every device but ampere.
-      options.triangleProjectTile ?? undefined, true,
+      // ...and the output kernel's own column tile, where the device sets one.
+      options.triangleProjectTile === undefined && options.triangleProjectOutColumns == null
+        ? undefined
+        : { ...(options.triangleProjectTile ?? PROJECT_TILE_DEFAULT),
+            ...(options.triangleProjectOutColumns == null
+              ? {} : { outColumns: options.triangleProjectOutColumns }) },
+      true,
       undefined,
       // 🔴 THE NORMALISED HIDDEN GOES BACK INTO `a`, WHICH IS DEAD BY THEN.
       // `tri.contract` is the last pass that reads scratch[1] and scratch[2],
@@ -246,7 +253,10 @@ export async function compilePairTrack(cache, options) {
                   // ...and the 1/L, which is a `const`-free difference INSIDE
                   // normalize-hidden's source: two dialects sharing a base
                   // would otherwise collide on it.
-                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:${name}`,
+                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}`
+                  // ...and the tile each vector kernel was generated at.
+                  + `:pt${projectTile.rows}x${projectTile.columns}x${projectTile.outColumns ?? "-"}`
+                  + `:${name}`,
                   source);
     }
     if (projectMatrix !== false) {
@@ -736,7 +746,8 @@ export function encodePairTrack(context) {
           [scratch[1], w, uniform.outProject, pair, scratch[2]], out.x, out.y);
     } else {
       run("tri.project-out", p("projectOutput"), [scratch[0], scratch[1], w, pair],
-          ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
+          ceil(channels, pipelines.projectTile.outColumns ?? pipelines.projectTile.columns),
+          perProjectTile[0], perProjectTile[1]);
     }
   }
 

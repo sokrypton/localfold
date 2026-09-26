@@ -83,7 +83,7 @@ function varianceCode(variance, count, at) {
  * what once had the shaders tiling by four under a dispatch dividing by eight -
  * half the work silently skipped, reported as a 30% speedup.
  */
-const PROJECT_TILE = { rows: 32, columns: 16 };
+export const PROJECT_TILE = { rows: 32, columns: 16 };
 
 /**
  * The same idea for the contraction, and it does NOT peak where the projection
@@ -694,9 +694,21 @@ ${stagedLayerNorm("CH", (row, channel) => divideByLength
                     : `source[${channel} * PAIRS + ${row}]`,
                   "LAYERNORMOUTWEIGHT", "LAYERNORMOUTBIAS", "channel", hiddenStorage)}`;
 
+  // 🔴 THE OUTPUT PROJECTION MAY TAKE A WIDER TILE THAN THE INPUT ONE, because
+  // its accumulator is a vec2 where projectAB's is a vec4: at the same tile it
+  // holds half the registers and does half the multiply-adds a staged read.
+  // `outColumns` on the tile says so; absent, it is the input tile's. Measured
+  // on an A100 under stock flags at 255 tokens: 32 x 64 against 32 x 32 is
+  // 4.34 -> 3.26 ms at 384 channels and 0.56 -> 0.44 at 128, bit-identical,
+  // where projectAB is slower at 32 x 64 (5.43 -> 6.10).
+  const OUT_TILE_COLUMNS = projectTile.outColumns ?? PROJECT_TILE_COLUMNS;
+  if (OUT_TILE_COLUMNS % 8 !== 0) {
+    throw new Error(`projectTile outColumns ${OUT_TILE_COLUMNS} is not a multiple of 8`);
+  }
+  const outColumnsPerThread = OUT_TILE_COLUMNS / 8;
   const projectOutput = `${common}
 const TILE_ROWS: u32 = ${PROJECT_TILE_ROWS}u;
-const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
+const TILE_COLUMNS: u32 = ${OUT_TILE_COLUMNS}u;
 
 @group(0) @binding(0) var<storage, read> z: array<${storageArray(normalizedStorage)}>;
 @group(0) @binding(1) var<storage, read> x: array<${storageArray(hiddenStorage)}>;
@@ -714,7 +726,7 @@ var<workgroup> tile_z: array<${outRowVector}, 64>;
 // k to buy sixteen products - 0.73 useful operations an instruction, against
 // projectAB's 2.9 on the same shape, and it showed: 672 GFLOP/s where the
 // projection that feeds it runs at 977.
-var<workgroup> tile_weight: array<${outVector2}, ${columnsPerThread * 64}>;
+var<workgroup> tile_weight: array<${outVector2}, ${outColumnsPerThread * 64}>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
@@ -737,8 +749,8 @@ fn main(
   // ...the projection contracts over CH and the gate over CZ, on the same
   // output channel, so one accumulator a cell carries both: x is the
   // projection, y the gate.
-  var acc: array<${outVector2}, ${rowsPerThread * columnsPerThread}>;
-  for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
+  var acc: array<${outVector2}, ${rowsPerThread * outColumnsPerThread}>;
+  for (var column = 0u; column < ${outColumnsPerThread}u; column += 1u) {
     let out_channel = channel0 + column * 8u;
     var bias = ${outVector2}(0.0);
     if (out_channel < CZ) {
@@ -747,7 +759,7 @@ fn main(
         ${accNarrow(readWeight("weights[W_LINEARGBIAS + out_channel]"))});
     }
     for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-      acc[r * ${columnsPerThread}u + column] = bias;
+      acc[r * ${outColumnsPerThread}u + column] = bias;
     }
   }
   for (var k0 = 0u; k0 < max(CH, CZ); k0 += 8u) {
@@ -766,7 +778,7 @@ fn main(
       }`)}
     tile_x[tile_index] = staged_x;
     tile_z[tile_index] = staged_z;
-    for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
+    for (var column = 0u; column < ${outColumnsPerThread}u; column += 1u) {
       let out_channel = channel0 + column * 8u;
       let slot = local.y * TILE_COLUMNS + local.x + column * 8u;
       var projection_w = 0.0;
@@ -786,9 +798,9 @@ fn main(
       // ...paired once a row, outside the column loop, because the pairing
       // depends on the row and the weight does not.
       ${overRows((r) => `let xz${r} = ${outVector2}(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
-      for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
+      for (var column = 0u; column < ${outColumnsPerThread}u; column += 1u) {
         let packed = tile_weight[k * TILE_COLUMNS + local.x + column * 8u];
-        ${overRows((r) => `acc[${r}u * ${columnsPerThread}u + column] += xz${r} * packed;`)}
+        ${overRows((r) => `acc[${r}u * ${outColumnsPerThread}u + column] += xz${r} * packed;`)}
       }
     }
     workgroupBarrier();
@@ -796,10 +808,10 @@ fn main(
   for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
     let row = row0 + r * 8u;
     if (row >= PAIRS) { continue; }
-    for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
+    for (var column = 0u; column < ${outColumnsPerThread}u; column += 1u) {
       let out_channel = channel0 + column * 8u;
       if (out_channel >= CZ) { continue; }
-      let cell = vec2<f32>(acc[r * ${columnsPerThread}u + column]);
+      let cell = vec2<f32>(acc[r * ${outColumnsPerThread}u + column]);
       output[row * CZ + out_channel] ${residual ? "+=" : "="} cell.x * logistic(cell.y);
     }
   }

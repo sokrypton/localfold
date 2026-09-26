@@ -437,6 +437,7 @@ export class Af3PairformerStackGpu {
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
+      triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
       // 🔴 THE HEAD WIDTH IS THIS BUNDLE'S, NOT AF3's. OpenDDE runs this same
       // pairformer at its own widths, and a geometry the device cannot hold at
       // one of them resolves to false rather than throwing.

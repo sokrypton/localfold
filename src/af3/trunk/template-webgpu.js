@@ -35,6 +35,7 @@
  * factor-2 transition; see src/af3/trunk/pair-track-gpu.js.
  */
 import { templateTransitionFactor } from "./template-reference.js";
+import { deviceTuning, shapedKnob } from "../../runtime/device-profile.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
 import { residencyAllowed } from "../../runtime/device-memory.js";
@@ -626,6 +627,8 @@ export class Af3TemplateEmbedderGpu {
     // msa-stack-webgpu.js for what their disagreeing costs.
     const pairWeightPrecision = options.pairWeightPrecision ?? "f32";
     const trackPipelines = await compilePairTrack(this.pipelines, {
+      triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
+      triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
       scratchStorage: UNPACKED_PAIR_SCRATCH,
       // ...derived, not 2: boltz2's template transition is a factor of 4. See
       // templateTransitionFactor in template-reference.js.
