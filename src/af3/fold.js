@@ -1291,6 +1291,10 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const positions = structural === undefined ? sampled
     : structuralToResidue(sampled, structural.layout, tokens, dense);
 
+  // 🔴 OpenDDE's PAIR CONDITIONING GOES BACK HERE, not after the confidence
+  // head: the sampler was its only reader, and the head's four blocks at the
+  // structural token count are where this fold's device memory peaks.
+  structural?.headInput.releasePairConditioning();
   stage("sample-done", { tokens });
   const confidenceFor = async () => {
     // 🔴 RoseTTAFold3's CONFIDENCE HEAD READS THE TOKEN-CENTRE CA, NOT THE
@@ -1340,6 +1344,15 @@ export async function foldBatch(device, batch, weights, options = {}) {
    * and `residueRepToken` picks the subtoken that stands for a residue in the
    * per-pair matrices - its FIRST, which is the one carrying the backbone role.
    */
+  // The refined pair goes back once the confidence head's pair init has read
+  // it - see `releasePairInput` in opendde-confidence.js - or here, whichever
+  // comes first; the head is not the only path that reaches the release.
+  let refinedReleased = structural === undefined;
+  const releaseRefinedPair = () => {
+    if (refinedReleased) return;
+    refinedReleased = true;
+    structural.headInput.refinedPair.release();
+  };
   const openddeScores = async () => {
     const layout = structural.layout;
     const n = layout.tokens;
@@ -1396,6 +1409,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
       tokens: n, singleInputs: structural.headInput.targetFeat,
       single: structural.headInput.trunkSingle,
       pairBuffer: structural.headInput.refinedPair.buffer,
+      releasePairInput: releaseRefinedPair,
       coordinates, seqMask: structural.structural.seqMask,
       atomToToken, atomToSlot, atomCount: n * dense,
       extraPairBias: structural.attentionBias,
@@ -1482,8 +1496,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // is the confidence head's last input and the head runs after the sampler, so
   // this is the one point at which nothing can still read it. At 384 structural
   // tokens it is 216 MiB.
-  structural?.headInput.refinedPair.release();
-  structural?.headInput.releasePairConditioning();
+  releaseRefinedPair();
 
   // The confidence head reads the sample back.
   const beta = batch.tokenAtomsToPseudoBeta;

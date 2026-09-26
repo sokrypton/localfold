@@ -157,6 +157,12 @@ export async function openddeConfidence(device, input, weights, dialect, options
     singleInputs: input.singleInputs, singleInputChannels: weights.singleInputChannels,
     coordinates: input.coordinates, binStart: BIN_START, binStep: BIN_STEP,
   }, weights, stack.allocator);
+  // 🔴 THE HEAD'S INPUT PAIR IS DEAD ONCE THE PAIR INIT HAS BEEN SUBMITTED: the
+  // blocks run on the init's own buffer. Handing it back here rather than after
+  // the head takes `tokens^2 x 384` floats off the fold's peak - 359 MiB at 495
+  // structural tokens - which is this head, four blocks at the structural
+  // token count. Submitted work keeps what it binds.
+  if (built !== undefined) input.releasePairInput?.();
   const pair = onHost
     ? confidencePairInit(input.pair, input.singleInputs, input.coordinates, tokens, weights)
     : new Float32Array(0);
