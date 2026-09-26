@@ -897,7 +897,7 @@ export class Af3TemplateEmbedderGpu {
       const attentionWidth = Math.max(CHANNELS,
         gridHeads * (weights.blocks[0]?.pairAttention1?.dimension ?? 0));
       const scratch = [];
-      for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
+      for (let index = 0; index < trackPipelines.pairScratchCount; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-template.scratch${index}`,
           storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index]), storage)));
@@ -934,8 +934,14 @@ export class Af3TemplateEmbedderGpu {
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
+          // byteOffset and byteSize honoured, as the other stacks do: the grid
+          // attention's chunks are slices of the scratch.
           entries: buffers.map((allocation, binding) => ({
-            binding, resource: { buffer: allocation.buffer },
+            binding,
+            resource: allocation.byteOffset === undefined
+              ? { buffer: allocation.buffer }
+              : { buffer: allocation.buffer,
+                  offset: allocation.byteOffset, size: allocation.byteSize },
           })),
         }));
         pass.dispatchWorkgroups(x, y, z);

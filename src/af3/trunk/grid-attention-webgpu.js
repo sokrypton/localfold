@@ -278,6 +278,16 @@ export function createGridAttentionShaders(
   // ...and whether project-out adds into its target instead of overwriting it;
   // see the note in src/af3/trunk/transition-webgpu.js for why that removes a pass.
   const residual = shape.residual ?? false;
+  // 🔴 CHUNKED OVER ATTENTION ROWS, WHEN THE CALLER ASKS. q, k, v and the gate
+  // of row r are read only by row r's attention, so they need not exist for
+  // every row at once: a uniform `chunk` = (first row, row count) makes the
+  // projection, the attention and the output projection work on those rows,
+  // with q/k/v/gate/gathered indexed LOCALLY and the normalised input, the
+  // mask and the destination indexed GLOBALLY. Off, the text is unchanged.
+  const chunked = shape.chunked === true;
+  const LIVE = chunked ? "live_pairs" : "PAIRS";
+  const chunkBinding = (binding) => (chunked
+    ? `@group(0) @binding(${binding}) var<uniform> chunk: vec4<u32>;` : "");
   // 🔴 THE PACKED STORE WANTS A NARROWER ROW TILE, AND THAT IS MEASURED. The
   // pair-owning form holds twice the accumulators, so the tile that is fastest
   // in f32 is past the register budget once packed. `project` in ms at 272
@@ -519,6 +529,7 @@ const WG: u32 = ${projectWorkgroup}u;
 @group(0) @binding(3) var<storage, read_write> k: array<${storageArray(store4.k)}>;
 @group(0) @binding(4) var<storage, read_write> v: array<${storageArray(store4.v)}>;
 @group(0) @binding(5) var<storage, read_write> gate: array<${storageArray(store4.gate)}>;
+${chunkBinding(6)}
 
 // ROWS rows of activations, shared by every output channel in the workgroup.
 //
@@ -556,7 +567,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let tile = group.x + group.y * GRID_WIDTH;
   let first = tile * ROWS;
-  if (first >= PAIRS) { return; }
+${chunked ? "  let live_pairs = chunk.y * N;\n" : ""}\
+  if (first >= ${LIVE}) { return; }
   let local = local_id.x;
 
   for (var r = 0u; r < ROWS; r += 1u) {
@@ -564,10 +576,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // 🔴 THE TAIL IS ZEROED, NOT SKIPPED. PAIRS is rarely a multiple of ROWS,
     // and a thread that reads uninitialised workgroup memory for the last tile
     // would write NaN into q, k, v and the gate for real rows in the same tile.
-    let source = select(0u, ${sourceRow.replace("row", "row")}, row < PAIRS);
+    let source = select(0u, ${chunked
+      ? sourceRow.replace(/row/g, "(chunk.x * N + row)") : sourceRow}, row < ${LIVE});
     for (var c = local; c < CHANNELS; c += WG) {
       act[r * CHANNELS + c] = select(
-        0.0, ${storedElement(normalizedStorage, "normalized", "source * CHANNELS + c")}, row < PAIRS);
+        0.0, ${storedElement(normalizedStorage, "normalized", "source * CHANNELS + c")}, row < ${LIVE});
     }
   }
   workgroupBarrier();
@@ -597,7 +610,7 @@ ${overRows((r) => {
       ? `    ${name}[word${r}] = pack2x16float(vec2<f32>(lo${r}.${lane}, hi${r}.${lane}));`
       : `    ${name}[word${r} * 2u] = lo${r}.${lane};\n`
         + `    ${name}[word${r} * 2u + 1u] = hi${r}.${lane};`);
-    return `  if (first + ${r}u < PAIRS) {
+    return `  if (first + ${r}u < ${LIVE}) {
     // A packed pair shares one word and this lane owns both halves of it; an
     // unpacked one is the same two values written where they always were,
     // since word * 2 is the channel c0 this lane owns.
@@ -617,7 +630,7 @@ ${overRows((r) => `  var acc${r} = vec4<f32>(0.0);`)}
 ${overRows((r) => `    acc${r} += act[${r}u * CHANNELS + c] * w;`)}
   }
 
-${overRows((r) => `  if (first + ${r}u < PAIRS) {
+${overRows((r) => `  if (first + ${r}u < ${LIVE}) {
     let index${r} = (first + ${r}u) * WIDTH + out;
     q[index${r}] = acc${r}.x;
     k[index${r}] = acc${r}.y;
@@ -685,7 +698,7 @@ ${overRows((r) => `  if (first + ${r}u < PAIRS) {
   const readK = (t) => (staged ? widen(`k_tile[slot * HD4 + ${t}u]`) : vec4Of("k", `k_base + ${t}u`));
   const readV = (t) => (staged ? widen(`v_tile[slot * HD4 + ${t}u]`) : vec4Of("v", `k_base + ${t}u`));
   const body = `
-${staged ? "" : "    let k_base = ((row * N + j) * HEADS + head) * HD4;"}
+${staged ? "" : `    let k_base = ((${chunked ? "local_row" : "row"} * N + j) * HEADS + head) * HD4;`}
     var score = 0.0;
 ${unroll((t) => `    score += dot(qv${t}, ${readK(t)});`)}
     // The KEY's mask, transposed with the activation.
@@ -744,7 +757,7 @@ ${unroll((t) => `    acc${t} = acc${t} * previous + weight * ${readV(t)};`)}`}`;
     workgroupBarrier();
     for (var index = local; index < ${keyChunk}u * HD4; index += 64u) {
       let j = min(j0 + index / HD4, N - 1u);
-      let source = ((row * N + j) * HEADS + head) * HD4 + index % HD4;
+      let source = ((${chunked ? "local_row" : "row"} * N + j) * HEADS + head) * HD4 + index % HD4;
       k_tile[index] = ${tileType}(${vec4Of("k", "source")});
       v_tile[index] = ${tileType}(${vec4Of("v", "source")});
     }
@@ -766,6 +779,7 @@ ${body}
 @group(0) @binding(3) var<storage, read> bias: array<f32>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read_write> gathered: array<${packGathered ? "vec2<u32>" : "vec4<f32>"}>;
+${chunkBinding(6)}
 ${packGathered ? `
 fn store4(v: vec4<f32>) -> vec2<u32> {
   return vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
@@ -787,7 +801,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // has to SEE that row and head are workgroup-uniform: a barrier inside a
   // branch on a global id is rejected, and this kernel's staging loop has two.
   let i = group.x * 64u + local_id.x;
-  let row = group.y;
+${chunked ? `  let local_row = group.y;
+  if (local_row >= chunk.y) { return; }
+  let row = chunk.x + local_row;` : "  let row = group.y;"}
   let head = group.z;
   // 🔴 row AND head ARE WORKGROUP-UNIFORM AND i IS NOT, which is why only the
   // first two are a return. A lane past the end still has to reach every
@@ -798,7 +814,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // vec4 units: WIDTH and DIMENSION are both multiples of four, so a head's
   // slice starts on a vector boundary.
-  let q_base = ((row * N + select(0u, i, live)) * HEADS + head) * HD4;
+  let q_base = ((${chunked ? "local_row" : "row"} * N + select(0u, i, live)) * HEADS + head) * HD4;
 ${unroll((t) => `  let qv${t} = ${vec4Of("q", `q_base + ${t}u`)};`)}
 ${unroll((t) => `  var acc${t} = vec4<f32>(0.0);`)}
   var running_max = -3.0e38;
@@ -823,6 +839,7 @@ const OUT_ROWS: u32 = ${OUT_ROWS}u;
 @group(0) @binding(1) var<storage, read> gate: array<${storageArray(store4.gate)}>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+${chunkBinding(4)}
 
 // OUT_ROWS gated rows, so one read of the output matrix serves all of them.
 var<workgroup> gated: array<f32, ${width} * ${OUT_ROWS}>;
@@ -839,7 +856,8 @@ var<workgroup> gated: array<f32, ${width} * ${OUT_ROWS}>;
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let first = (group.x + group.y * GRID_WIDTH) * OUT_ROWS;
-  if (first >= PAIRS) { return; }
+${chunked ? "  let live_pairs = chunk.y * N;\n" : ""}\
+  if (first >= ${LIVE}) { return; }
   let local = local_id.x;
 
   // 🔴 THE TAIL IS ZEROED, NOT SKIPPED, for the reason the projection kernel
@@ -848,10 +866,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var r = 0u; r < OUT_ROWS; r += 1u) {
     let row = first + r;
     for (var w = local; w < WIDTH; w += ${projectLanesFor(width)}u) {
-      let index = select(0u, row * WIDTH + w, row < PAIRS);
+      let index = select(0u, row * WIDTH + w, row < ${LIVE});
       gated[r * ${width}u + w] =
         select(0.0, ${storedElement(gatheredStorage, "gathered", "index")}
-          * logistic(${storedElement(store4.gate, "gate", "index")}), row < PAIRS);
+          * logistic(${storedElement(store4.gate, "gate", "index")}), row < ${LIVE});
     }
   }
   workgroupBarrier();
@@ -868,8 +886,8 @@ ${offsets.outputProjectionBias === undefined ? "" : `    // rosettafold3's outpu
     // the destination, so a residual write adds it once and not once per
     // accumulation. See the note on OPTIONAL_GRID.
 ${overOutRows((r) => `    sum${r} += weights[W_OUT_BIAS + c];`)}`}
-${overOutRows((r) => `    if (first + ${r}u < PAIRS) {
-      let row${r} = first + ${r}u;
+${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
+      let row${r} = ${chunked ? "chunk.x * N + " : ""}first + ${r}u;
       let destination${r} = ${transpose ? `(row${r} % N) * N + row${r} / N` : `row${r}`};
       output[destination${r} * CHANNELS + c] ${residual ? "+=" : "="} sum${r};
     }`)}

@@ -63,6 +63,39 @@ export { createAddShader };
  * @param {object} options `sample` is any one block's weights, read only for
  *   its shapes and packing offsets.
  */
+/**
+ * The grid attention's row chunks for a track of `n` rows: thirds, so that two
+ * chunks of a tensor fit in one pair-sized scratch buffer (2 * ceil(n / 3) <= n
+ * for n >= 3), each with its `(first row, row count)` uniform. Cached per
+ * device and length, because the uniforms are sixteen bytes that never change.
+ */
+/** A pair tensor this size or larger is worth chunking the grid attention for. */
+export const GRID_CHUNK_MIN_BYTES = 128 * 1024 * 1024;
+function gridChunkWorthIt(n, channels, attention) {
+  const width = Math.max(channels, (attention?.heads ?? 0) * (attention?.dimension ?? 0));
+  return n * n * width * 4 >= GRID_CHUNK_MIN_BYTES;
+}
+const GRID_CHUNKS = new WeakMap();
+function gridChunkUniforms(device, n) {
+  let byLength = GRID_CHUNKS.get(device);
+  if (byLength === undefined) GRID_CHUNKS.set(device, byLength = new Map());
+  let chunks = byLength.get(n);
+  if (chunks === undefined) {
+    const rows = Math.ceil(n / 3);
+    chunks = [];
+    for (let from = 0; from < n; from += rows) {
+      const count = Math.min(rows, n - from);
+      const uniform = device.createBuffer({ label: `grid-chunk-${n}-${from}`, size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(uniform, 0, new Uint32Array([from, count, 0, 0]));
+      chunks.push({ from, count, uniform: { buffer: uniform } });
+    }
+    chunks.rows = rows;
+    byLength.set(n, chunks);
+  }
+  return chunks;
+}
+
 export async function compilePairTrack(cache, options) {
   const { n, sample, epsilon, variance, dialect, base } = options;
   // 🔴 THE SCRATCH LAYOUT IS THIS STACK'S, NOT THE MODULE'S. See
@@ -162,6 +195,24 @@ export async function compilePairTrack(cache, options) {
   // run 24 times a loop, four loops, to add zero. The zeroed arm stays as the
   // thing this is checked bit-identical against; see check-esmfold2-trunk-gpu.js.
   const gridAttention = options.gridAttention ?? true;
+  // 🔴 THE GRID ATTENTION RUNS A THIRD OF ITS ROWS AT A TIME WHERE IT CAN, and
+  // that is worth a whole pair-sized tensor. q, k, v and the gate were four
+  // live pair-sized tensors, which is the ONLY reason a track held five: the
+  // triangle's longest overlap is four. Row r's attention reads only row r's
+  // q, k and v, so the grid runs over thirds of its rows with all five of its
+  // chunk tensors packed into scratch[1..3] - dead by then - and the track
+  // holds four. Vector kernels over f32 scratch only; the matrix projection and
+  // attend keep the whole-tensor layout. `gridChunked: false` is the control.
+  const gridChunked = gridAttention && options.gridChunked !== false
+    && !(options.attendMatrix ?? false)
+    && (options.gridProjectMatrix === undefined || options.gridProjectMatrix === false)
+    && scratchStorage.every((storage) => storage === "f32") && n >= 3
+    // 🔴 ONLY WHERE A PAIR TENSOR IS WORTH SAVING. Three chunks triple the grid's
+    // dispatches: AF3 at 255 tokens (33 MiB a tensor, and a peak that is not in
+    // the trunk at all) folded 2.5% slower for nothing, where IntelliFold-2 at
+    // 255 (133 MiB) was 1% slower for 127 MiB and OpenDDE's refiner (376 MiB)
+    // 0% for 359 MiB.
+    && gridChunkWorthIt(n, channels, sample.pairAttention1);
   // 🔴 THE TRIANGLE PROJECTION ON THE MATRIX UNITS, WHICH IS THE LARGEST KERNEL
   // LEFT IN AN ESMFold2 TRUNK: 130.6 ms of 494 once the transition is split.
   // It needs no new memory - its source and both its outputs are pair-sized
@@ -318,6 +369,7 @@ export async function compilePairTrack(cache, options) {
         // the geometry is swept per kernel and never inherited. See
         // src/af3/trunk/grid-attention-matrix.js.
         attendMatrix: options.attendMatrix ?? false,
+        chunked: gridChunked,
         // 🔴 THE DEVICE'S OWN LIMIT, because `grid.normalize`'s row tile stages
         // `rows * channels` floats and IntelliFold-2's 512 channels put the
         // shipped eight-row tile at 16,960 bytes against WebGPU's guaranteed
@@ -334,6 +386,7 @@ export async function compilePairTrack(cache, options) {
       { q: scratchStorage[1], k: scratchStorage[2],
         v: scratchStorage[3], gate: scratchStorage[4] });
     pipelines.gridTiles = tiles;
+    pipelines.gridWidth = attention.heads * attention.dimension;
     // 🔴 THE PROJECTION ON THE UNITS, off unless the caller asks. It is the
     // biggest pass in an OpenDDE trunk - 386 ms of 1876 at 256 tokens - and its
     // weights are ALREADY interleaved [k][4w + role] for the vector kernel's
@@ -396,6 +449,7 @@ export async function compilePairTrack(cache, options) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
                   + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}`
+                  + `:ch${gridChunked}`
                   // ...and every row tile, which the device's storage limit
                   // now chooses. They are baked into the source AND divide the
                   // dispatch, which is the collision this file records twice.
@@ -489,6 +543,11 @@ export async function compilePairTrack(cache, options) {
   // write the pair representation itself. See msa-stack-webgpu.js's "opm.add".
   compileInto("addPair", `${base}:add-pair`, createAddShader(pairs * channels));
   await Promise.all(pending);
+  // How many pair-sized scratch tensors this track needs, and the rows the
+  // grid attention runs at a time. Callers allocate `pairScratchCount`.
+  pipelines.pairScratchCount = gridAttention && !gridChunked
+    ? PAIR_SCRATCH_COUNT : PAIR_SCRATCH_COUNT - 1;
+  pipelines.gridChunks = gridChunked ? gridChunkUniforms(cache.device, n) : undefined;
   return pipelines;
 }
 
@@ -766,6 +825,38 @@ export function encodePairTrack(context) {
     const perNormalize = spread(ceil(pairs, pipelines.gridTiles.normalizeRows));
     run("grid.normalize", p("normalize"), [pair, w, scratch[0]], perNormalize[0], perNormalize[1]);
     run("grid.bias", p("bias"), [scratch[0], w, biasBuffer], linear[0], linear[1]);
+    if (pipelines.gridChunks !== undefined) {
+      // 🔴 A THIRD OF THE ATTENTION'S ROWS AT A TIME - see gridChunked in
+      // compilePairTrack. The five chunk tensors live in scratch[1..3], which
+      // the triangle is finished with: q and k in the first, v and the gate in
+      // the second, the attention's output in the third. The normalised input
+      // stays whole in scratch[0], so a later chunk still reads rows an
+      // earlier one has written past.
+      const width = pipelines.gridWidth;
+      const chunkBytes = pipelines.gridChunks.rows * n * width * 4;
+      const part = (allocation, index, count) => ({
+        buffer: allocation.buffer,
+        byteOffset: (allocation.byteOffset ?? 0) + index * chunkBytes,
+        byteSize: count * n * width * 4,
+      });
+      for (const chunk of pipelines.gridChunks) {
+        const q = part(scratch[1], 0, chunk.count);
+        const k = part(scratch[1], 1, chunk.count);
+        const v = part(scratch[2], 0, chunk.count);
+        const gate = part(scratch[2], 1, chunk.count);
+        const gathered = part(scratch[3], 0, chunk.count);
+        const chunkPairs = chunk.count * n;
+        const perTile = spread(ceil(chunkPairs, pipelines.gridTiles.projectRows));
+        run("grid.project", p("project"), [scratch[0], w, q, k, v, gate, chunk.uniform],
+            perTile[0], perTile[1]);
+        run("grid.attend", p("attend"), [q, k, v, biasBuffer, pairMask, gathered, chunk.uniform],
+            ceil(n, pipelines.gridTiles.attendRows), chunk.count, gridHeads);
+        const perOutTile = spread(ceil(chunkPairs, pipelines.gridTiles.projectOutRows));
+        run("grid.project-out", p("project_out"), [gathered, gate, w, pair, chunk.uniform],
+            perOutTile[0], perOutTile[1]);
+      }
+      continue;
+    }
     const perOutTile = spread(ceil(pairs, pipelines.gridTiles.projectOutRows));
     // One workgroup per tile of pair rows - see the kernel.
     const perTile = spread(ceil(pairs, pipelines.gridTiles.projectRows));
