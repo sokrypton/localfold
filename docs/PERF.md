@@ -779,6 +779,23 @@ was +113 ms of creates and zero-fills - this allocator destroys on release).
 957**, same fold. The +40 ms is 144 decodes on the loop's critical path, since
 the tower waits for each block.
 
+🔴 **DEAD ENDS FROM THE SAME NIGHT, SO NOBODY RETRIES THEM.**
+- **The diffusion transformer's weights as packed halves without shader-f16**
+  (`array<u32>` read through `unpack2x16float`, the f16 path's own buffer):
+  AF3 5CAJ-255 peak 1530 -> 1071 MiB, but +3% warm and stock numerics move
+  (pLDDT 27.354 -> 27.356). Streaming the sampler's weights reaches 1072 MiB
+  for +4% and is bit-identical, so this buys nothing.
+- **The int5 decode kernel itself.** A replay of one diffusion block (8.26 M
+  elements, 13 tensors) is 0.12 ms: ~70 G elements/s, ~280 GB/s written, a
+  fifth of the card. Most of those tensors are TRANSPOSES, so either the reads
+  or the writes scatter and every element pays four runtime divides; forcing
+  them all contiguous (a wrong answer, for timing) is only 95 G/s. Runs of
+  64 / 128 / 512 / 1024 slots a workgroup: 49 / 61 / 70 / 69 G/s. A tiled
+  transpose is what would move it, and it is only worth building if the
+  sampler's weights are ever streamed by default.
+- **ESMFold2's SwiGLU at a smaller row tile** (it stays at 4): tile 2 is
+  slower, 309 -> 331 ms of sampler at 59 residues, and tile 1 only equals 4.
+
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
 The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by
