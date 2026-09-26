@@ -571,6 +571,17 @@ after: pLDDT 1.13e-7 -> 1.11e-7, PAE 8.46e-7 -> 8.93e-7, PDE 9.73e-7 ->
 heads are below the width threshold and byte-identical. OpenDDE at 255 residues:
 the confidence stage 2295 -> 1651 ms, warm fold 20.09 -> 19.44 s.
 
+🔴 **DEAD END: THE TRIANGLE OUTPUT PROJECTION AS THE SPLIT'S VECTOR GEMM.**
+`tri.project-out` runs ~9.7 TFLOPS where the projections beside it reach ~15,
+so it was rebuilt on the vector-GEMM shape - 64 x 64 blocks, 256 lanes, 4 x 4
+a lane, a projection and a gate accumulator a cell, 16 KiB of staging. It was
+SLOWER everywhere, stock flags: AF3 at 255 tokens 52.3 -> 57.1 ms a pass,
+OpenDDE at 68 38.1 -> 44.1, IntelliFold-2 at 255 575 -> 625. The existing
+kernel multiplies the projection and its gate as one packed vec2, which is
+more useful work an instruction than two scalar accumulators, and four staged
+tiles halve the occupancy the two-tile transition GEMM gets. Reverted; a faster
+version would keep the vec2 pairing and stage less.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The
