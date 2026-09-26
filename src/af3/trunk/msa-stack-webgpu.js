@@ -29,7 +29,7 @@ import {
 import { residentPairTrackOnDevice } from "../weights/pair-track-device-weights.js";
 import { residentPackedOnDevice } from "../weights/device-weights.js";
 import {
-  createOuterProductMeanShaders, packOuterProductMeanWeights,
+  createOuterProductMeanShaders, OPM_PROJECT_ROWS, packOuterProductMeanWeights,
 } from "./outer-product-mean-webgpu.js";
 import { createMsaAttentionShaders, msaAttentionKeyPart, packMsaAttentionWeights } from "./msa-attention-webgpu.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
@@ -451,7 +451,7 @@ export class Af3MsaStackGpu {
     // produce a plausible representation, so nothing but this flag distinguishes
     // them - and the difference compounds over every block of every pass.
     const outerProduct = () => {
-      const rowGroups = spread(ceil(rows, 64));
+      const rowGroups = spread(ceil(rows, OPM_PROJECT_ROWS));
       run("opm.project", pipelines["opm:project"],
           [msa, msaMask, opmWeights, left, right], rowGroups[0], rowGroups[1]);
       const countGroups = spread(ceil(pairs, 64));

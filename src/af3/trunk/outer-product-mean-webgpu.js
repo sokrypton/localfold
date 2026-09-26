@@ -111,6 +111,9 @@ export function packOuterProductMeanWeights(weights) {
     { label: "outer product mean", order: ORDER, optional: OPTIONAL });
 }
 
+/** MSA rows an `opm.project` workgroup stages; its dispatch divides by it. */
+export const OPM_PROJECT_ROWS = 4;
+
 export function createOuterProductMeanShaders(shape, offsets, epsilon, variance) {
   // 🔴 boltz2 DIVIDES BEFORE IT ADDS THE BIAS, AND CLAMPS RATHER THAN NUDGES:
   // `product @ W / max(count, 1) + b` against AF3's `(product @ W + b) /
@@ -152,47 +155,82 @@ const W_RIGHT_BIAS: u32 = ${offsets.rightProjectionBias}u;`}
 @group(0) @binding(3) var<storage, read_write> left: array<f32>;
 @group(0) @binding(4) var<storage, read_write> right: array<f32>;
 
+// 🔴 FOUR ROWS A WORKGROUP, NORMALISED ONCE, AND A LANE AN OUTPUT CHANNEL. A
+// thread a row recomputed every normalised value once per output channel -
+// C_OUTER times over - and walked its own row at a C_M stride: 0.7-2.7 ms a
+// call for ~134 M multiply-adds at 128 rows. The row statistics are the same
+// sequential sums, each normalised value the same expression, and each output
+// the same sum over c from zero, so this is bit-identical.
+const PROJECT_ROWS: u32 = ${OPM_PROJECT_ROWS}u;
+var<workgroup> normalized_rows: array<f32, ${OPM_PROJECT_ROWS * msaChannels}>;
+var<workgroup> row_mean: array<f32, ${OPM_PROJECT_ROWS}>;
+var<workgroup> row_inverse_std: array<f32, ${OPM_PROJECT_ROWS}>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= ROWS) { return; }
-  let base = row * C_M;
-  var total = 0.0;
-  var squares = 0.0;
-  for (var c = 0u; c < C_M; c += 1u) {
-    let value = msa[base + c];
-    total += value;
-    squares += value * value;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) lane: u32) {
+  let first = (group.x + group.y * GRID_WIDTH) * PROJECT_ROWS;
+  if (first >= ROWS) { return; }
+  for (var at = lane; at < PROJECT_ROWS * C_M; at += 64u) {
+    let row = first + at / C_M;
+    normalized_rows[at] = select(0.0, msa[min(row, ROWS - 1u) * C_M + at % C_M], row < ROWS);
   }
-  let mean = total / f32(C_M);
-  ${variance === "fast"
-    ? "let variance = squares / f32(C_M) - mean * mean;"
-    : `var variance = 0.0;
-  for (var c = 0u; c < C_M; c += 1u) {
-    let d = msa[base + c] - mean;
-    variance += d * d;
-  }
-  variance /= f32(C_M);`}
-  let inverse_std = inverseSqrt(variance + EPSILON);
-  let keep = msa_mask[row];
-  for (var o = 0u; o < C_OUTER; o += 1u) {
-    var left_total = 0.0;
-    var right_total = 0.0;
+  workgroupBarrier();
+  if (lane < PROJECT_ROWS) {
+    let base = lane * C_M;
+    var total = 0.0;
+    var squares = 0.0;
     for (var c = 0u; c < C_M; c += 1u) {
-      let value = (msa[base + c] - mean) * inverse_std * weights[W_SCALE + c]
-        + weights[W_OFFSET + c];
-      left_total += value * weights[W_LEFT + c * C_OUTER + o];
-      right_total += value * weights[W_RIGHT + c * C_OUTER + o];
+      let value = normalized_rows[base + c];
+      total += value;
+      squares += value * value;
     }
-${offsets.leftProjectionBias === undefined ? "" : `    // rosettafold3's biased projections. BEFORE the mask, because the
-    // reference is `+"`mask * Linear(act)`"+` - a masked row still contributes
-    // nothing, and an unmasked one gains the two cross terms of the bilinear
-    // product. See the note in weights.js.
-    left_total += weights[W_LEFT_BIAS + o];
-    right_total += weights[W_RIGHT_BIAS + o];`}
-    // ...masked here, after the projection, on both sides.
-    left[row * C_OUTER + o] = keep * left_total;
-    right[row * C_OUTER + o] = keep * right_total;
+    let mean = total / f32(C_M);
+    ${variance === "fast"
+      ? "let variance = squares / f32(C_M) - mean * mean;"
+      : `var variance = 0.0;
+    for (var c = 0u; c < C_M; c += 1u) {
+      let d = normalized_rows[base + c] - mean;
+      variance += d * d;
+    }
+    variance /= f32(C_M);`}
+    row_mean[lane] = mean;
+    row_inverse_std[lane] = inverseSqrt(variance + EPSILON);
+  }
+  workgroupBarrier();
+  for (var at = lane; at < PROJECT_ROWS * C_M; at += 64u) {
+    let r = at / C_M;
+    let c = at % C_M;
+    normalized_rows[at] = (normalized_rows[at] - row_mean[r]) * row_inverse_std[r]
+      * weights[W_SCALE + c] + weights[W_OFFSET + c];
+  }
+  workgroupBarrier();
+  for (var e = lane; e < 2u * C_OUTER; e += 64u) {
+    let right_side = e >= C_OUTER;
+    let o = e % C_OUTER;
+    let w_base = select(W_LEFT, W_RIGHT, right_side);
+    var totals: array<f32, ${OPM_PROJECT_ROWS}>;
+    for (var r = 0u; r < PROJECT_ROWS; r += 1u) { totals[r] = 0.0; }
+    for (var c = 0u; c < C_M; c += 1u) {
+      let w = weights[w_base + c * C_OUTER + o];
+      for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
+        totals[r] += normalized_rows[r * C_M + c] * w;
+      }
+    }
+    for (var r = 0u; r < PROJECT_ROWS; r += 1u) {
+      let row = first + r;
+      if (row >= ROWS) { break; }
+      var total = totals[r];
+${offsets.leftProjectionBias === undefined ? "" : `      // rosettafold3's biased projections. BEFORE the mask, because the
+      // reference is `+"`mask * Linear(act)`"+` - a masked row still contributes
+      // nothing, and an unmasked one gains the two cross terms of the bilinear
+      // product. See the note in weights.js.
+      total += weights[select(W_LEFT_BIAS, W_RIGHT_BIAS, right_side) + o];`}
+      // ...masked here, after the projection, on both sides.
+      let keep = msa_mask[row];
+      if (right_side) { right[row * C_OUTER + o] = keep * total; }
+      else { left[row * C_OUTER + o] = keep * total; }
+    }
   }
 }`;
 
@@ -442,7 +480,7 @@ export class Af3OuterProductMeanGpu {
         pass.end();
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
-      const projectGroups = spread(Math.ceil(rows / 64));
+      const projectGroups = spread(Math.ceil(rows / OPM_PROJECT_ROWS));
       run("opm.project", project, [msaBuffer, maskBuffer, weightBuffer, left, right],
           projectGroups[0], projectGroups[1]);
       const countGroups = spread(Math.ceil(tokens * tokens / 64));
