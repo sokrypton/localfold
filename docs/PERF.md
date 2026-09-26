@@ -828,6 +828,19 @@ Of the ~1.1 s that only a cold fold pays, the shader cache is worth ~340 ms (a
   runs while the diffusion shards are still on the wire (today every shard but
   the first two mixes trunk, sampler and confidence tensors).
 
+🔴 **AND THE COMPILES WERE SERIAL IN TWO PLACES, BOTH TAKEN.**
+- **Inside a stage.** Five AF3 stages and four ESMFold2/OpenDDE heads awaited
+  each pipeline as they asked for it (`compiled[name] = await get(...)` in a
+  loop), so the embedder's five were 69 ms busy for 69 ms summed. Asked for
+  together (`settleAll`): AF3 6MRR first fold 1.36-1.41 -> 1.33 s, ESMFold2
+  1.32-1.33 -> 1.30-1.31.
+- **Between stages.** The embedder, template embedder and MSA stack each
+  compiled when the trunk reached it. `Af3TrunkGpu.warm` runs the three with
+  `compileOnly` - the same keys, returning before any input is read or
+  anything allocated - as the fold starts, beside the target features: 1.33 ->
+  1.27-1.29 s, still 137 pipelines (a mismatched warm would add some) and the
+  same pLDDT to every digit.
+
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
 The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by

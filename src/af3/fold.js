@@ -778,6 +778,43 @@ async function foldHolding(device, batch, weights, options, held) {
   // handed; a stale one produces a structure for a different sequence, with a
   // confidence head that agrees with it. web/app.js keys the cache on
   // everything the trunk reads.
+  // 🔴 THE PRECISION KNOBS TRAVEL WITH THE FOLD so a bench can measure both
+  // arms without editing a source file - which is the only way to compare them
+  // on a machine that drifts up to 3.2x between processes. Omitted, every one
+  // defaults to what the device supports; see docs/AF3.md's memory section.
+  const precision = {
+    stagedPrecision: options.stagedPrecision,
+    weightPrecision: options.weightPrecision,
+    // 🔴 THE RESIDENT PAIR WEIGHTS ARE f16 WHERE THE PAIR TRACK IS WIDE, AND
+    // THE RULE IS THE MEASUREMENT. These buffers are read one scalar at a time,
+    // so halving them buys no bandwidth - what it buys is the peak, and the
+    // peak is only made of them when the track is wide, because they go as the
+    // SQUARE of the channel count:
+    //
+    //   OpenDDE, 384 channels   1198.3 -> 873.5 MiB  (-27%)  15.9 -> 15.9 s
+    //   AlphaFold 3, 128         476.0 ->  476.0     (  0%)
+    //
+    // AlphaFold 3 does not move because its peak is the diffusion transformer's
+    // 378 MiB of resident weights, not the trunk's - so there is nothing to buy
+    // and it is not made to pay: at f16 its fold shifts (mean pLDDT
+    // 72.19283791929007 -> 72.17922675038298), which is well inside a seed's
+    // spread and still a change for no gain.
+    //
+    // 🔴 AND IT IS A WIDTH TEST RATHER THAN A MODEL NAME, so a future bundle
+    // collects it by being wide rather than by being listed. See
+    // WIDE_PAIR_TRACK for what the threshold is and is not.
+    pairWeightPrecision: options.pairWeightPrecision
+      ?? defaultPairWeightPrecision(weights.trunk.embedder.pairChannels),
+    accumulatePrecision: options.accumulatePrecision,
+  };
+  // 🔴 THE TRUNK'S STAGES START COMPILING NOW, BESIDE THE TARGET FEATURES.
+  // Each compiled when the trunk reached it, one after another; see
+  // Af3TrunkGpu.warm. Only where a trunk will actually run.
+  if (options.reuse?.trunk === undefined) {
+    new Af3TrunkGpu(device, precision).warm(
+      { tokens, sequences: batch.sequences, templates: options.templates ?? 4 },
+      weights.trunk, weights.trunk.dialect).catch(() => {});
+  }
   const reused = options.reuse;
   let targetFeat = reused?.targetFeat;
   if (targetFeat === undefined) {
@@ -841,35 +878,6 @@ async function foldHolding(device, batch, weights, options, held) {
   // trunk is a cached recycle state, and going from three recycles to five runs
   // two passes rather than six. Asking for FEWER is not a continuation and the
   // caller must not offer the cache for it; nothing here can undo a pass.
-  // 🔴 THE PRECISION KNOBS TRAVEL WITH THE FOLD so a bench can measure both
-  // arms without editing a source file - which is the only way to compare them
-  // on a machine that drifts up to 3.2x between processes. Omitted, every one
-  // defaults to what the device supports; see docs/AF3.md's memory section.
-  const precision = {
-    stagedPrecision: options.stagedPrecision,
-    weightPrecision: options.weightPrecision,
-    // 🔴 THE RESIDENT PAIR WEIGHTS ARE f16 WHERE THE PAIR TRACK IS WIDE, AND
-    // THE RULE IS THE MEASUREMENT. These buffers are read one scalar at a time,
-    // so halving them buys no bandwidth - what it buys is the peak, and the
-    // peak is only made of them when the track is wide, because they go as the
-    // SQUARE of the channel count:
-    //
-    //   OpenDDE, 384 channels   1198.3 -> 873.5 MiB  (-27%)  15.9 -> 15.9 s
-    //   AlphaFold 3, 128         476.0 ->  476.0     (  0%)
-    //
-    // AlphaFold 3 does not move because its peak is the diffusion transformer's
-    // 378 MiB of resident weights, not the trunk's - so there is nothing to buy
-    // and it is not made to pay: at f16 its fold shifts (mean pLDDT
-    // 72.19283791929007 -> 72.17922675038298), which is well inside a seed's
-    // spread and still a change for no gain.
-    //
-    // 🔴 AND IT IS A WIDTH TEST RATHER THAN A MODEL NAME, so a future bundle
-    // collects it by being wide rather than by being listed. See
-    // WIDE_PAIR_TRACK for what the threshold is and is not.
-    pairWeightPrecision: options.pairWeightPrecision
-      ?? defaultPairWeightPrecision(weights.trunk.embedder.pairChannels),
-    accumulatePrecision: options.accumulatePrecision,
-  };
   // 🔴 A WIDE PAIR TRACK DOES NOT KEEP ITS BLOCK WEIGHTS RESIDENT, AND THE
   // TRADE IS THE SAME ONE THE f16 RULE ABOVE PRICES. Residency exists so a
   // SECOND pass does not re-upload 48 blocks; what it costs is holding all of

@@ -158,6 +158,30 @@ export class Af3TrunkGpu {
    * @param {{onStage?: (name: string, elapsed: number) => void,
    *          onPairformerBlock?: (index: number, total: number) => void}} options
    */
+  /**
+   * 🔴 THE EMBEDDER, TEMPLATE AND MSA STACKS' PIPELINES, ASKED FOR TOGETHER
+   * BEFORE THE TRUNK RUNS. Each stage compiled when the trunk reached it, one
+   * after another, on a cold fold's path - the template's pair track alone is
+   * ~280 ms of busy compiler at 68 tokens. Same stages, same options as `run`,
+   * `compileOnly`, so the run finds every one in the cache. Not awaited by the
+   * caller; a warm cannot give a wrong answer, only waste.
+   */
+  async warm(shape, weights, dialect, options = {}) {
+    const { tokens, sequences } = shape;
+    await Promise.all([
+      new Af3EmbedderGpu(this.device).run({ tokens, sequences }, weights.embedder,
+        { ...options, compileOnly: true }),
+      new Af3TemplateEmbedderGpu(this.device, {
+        ...this.options,
+        stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32",
+        pairMatrixKernels: false,
+      }).run({ tokens, templates: shape.templates ?? 4 }, weights.template, dialect,
+        { ...options, compileOnly: true }),
+      new Af3MsaStackGpu(this.device, this.options).run({ tokens, sequences },
+        weights.msaBlocks, dialect, { ...options, compileOnly: true }),
+    ]);
+  }
+
   async run(input, weights, dialect, options = {}) {
     const tokens = input.tokens;
     const pairs = tokens * tokens;

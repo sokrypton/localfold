@@ -495,11 +495,14 @@ export class Af3EmbedderGpu {
     const rows = sequences * tokens;
     const epsilon = options.epsilon ?? 1e-5;
     const variance = options.variance ?? "fast";
-    if (input.targetFeat.length !== tokens * featureWidth) {
+    // 🔴 `compileOnly` BUILDS THE PIPELINES AND RETURNS, for Af3TrunkGpu.warm:
+    // no input is read, nothing is allocated.
+    const compileOnly = options.compileOnly === true;
+    if (!compileOnly && input.targetFeat.length !== tokens * featureWidth) {
       throw new Error(`targetFeat has ${input.targetFeat.length} elements; `
         + `expected ${tokens * featureWidth}`);
     }
-    if (input.bondMatrix !== undefined && input.bondMatrix.length !== pairs) {
+    if (!compileOnly && input.bondMatrix !== undefined && input.bondMatrix.length !== pairs) {
       throw new Error(`bondMatrix has ${input.bondMatrix.length} elements; `
         + `expected ${pairs}`);
     }
@@ -533,6 +536,7 @@ export class Af3EmbedderGpu {
     // parallel, and a serial loop put every one of them on a cold fold's path.
     const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
       async ([name, source]) => [name, await this.pipelines.get(`${key}:${name}`, source)])));
+    if (compileOnly) return undefined;
 
     // The five integer feature rows, packed in the order the shader indexes.
     const featureData = new Int32Array(5 * tokens);

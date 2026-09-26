@@ -104,8 +104,12 @@ export class Af3MsaStackGpu {
     // The same two checks on whichever form the tensor arrives in: a host
     // array's length, or a device buffer's bytes.
     const elements = (array, buffer) => (buffer !== undefined ? buffer.size / 4 : array.length);
-    const msaElements = elements(state.msa, options.msaBuffer);
-    const pairElements = elements(state.pair, options.pairBuffer);
+    // 🔴 `compileOnly` BUILDS THE PIPELINES AND RETURNS, for Af3TrunkGpu.warm:
+    // no input is read, nothing is allocated.
+    const compileOnly = options.compileOnly === true;
+    const msaElements = compileOnly ? rows * msaChannels : elements(state.msa, options.msaBuffer);
+    const pairElements = compileOnly ? pairs * pairChannels
+      : elements(state.pair, options.pairBuffer);
     if (msaElements !== rows * msaChannels) {
       throw new Error(`msa has ${msaElements} elements; expected ${rows * msaChannels}`);
     }
@@ -161,12 +165,12 @@ export class Af3MsaStackGpu {
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
       minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
     });
-    const gridProjectMatrix = pipelines.gridProjectMatrix === undefined ? undefined
-      : allocateGridProjectMatrix(this.allocator, {
+    const gridProjectMatrix = pipelines.gridProjectMatrix === undefined || compileOnly
+      ? undefined : allocateGridProjectMatrix(this.allocator, {
         ...pipelines.gridProjectMatrix, label: "af3-msa.grid-project",
       }, keep);
-    const transitionSplit = pipelines.transitionSplit === undefined ? undefined
-      : allocateTransitionSplit(this.allocator, {
+    const transitionSplit = pipelines.transitionSplit === undefined || compileOnly
+      ? undefined : allocateTransitionSplit(this.allocator, {
         rows: n * n, channels: pairChannels,
         factor: sample.pairTransition.transition2.length / (pairChannels * pairChannels),
         chunkRows: pipelines.transitionSplit.chunkRows,
@@ -257,6 +261,7 @@ export class Af3MsaStackGpu {
                              epsilon, variance));
     into("addMsa", `${base}:add-msa`, createAddShader(rows * msaChannels));
     await Promise.all(compiling);
+    if (compileOnly) return undefined;
 
     // 🔴 THE TRUNK'S OWN BUFFERS, UPDATED IN PLACE, WHEN IT HANDS THEM OVER -
     // the pairformer's `pairBuffer` convention, for the pair AND the MSA. On

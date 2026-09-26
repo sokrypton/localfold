@@ -40,7 +40,7 @@ import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
 import { residencyAllowed } from "../../runtime/device-memory.js";
 import { storageBytes } from "../../runtime/storage.js";
-import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
+import { pipelineCacheForDevice, settleAll } from "../../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, createAddShader,
   encodePairTrack, packPairTrackWeights,
@@ -632,22 +632,26 @@ export class Af3TemplateEmbedderGpu {
     // (the same f32 add the trunk used to do on the host) and nothing is read
     // back, so the stage needs no drain and costs no bus crossing.
     const pairBuffer = options.pairBuffer;
-    if (pairBuffer !== undefined && options.validation === undefined) {
+    // 🔴 `compileOnly` BUILDS THE PIPELINES AND RETURNS, for Af3TrunkGpu.warm,
+    // as the trunk runs it: with a pair buffer, so the add is compiled too.
+    const compileOnly = options.compileOnly === true;
+    if (!compileOnly && pairBuffer !== undefined && options.validation === undefined) {
       throw new Error("pairBuffer needs options.validation: nothing here awaits the scope");
     }
     // Compiled together, not one after another: the browser builds them in
     // parallel, and a serial loop put every one of them on a cold fold's path.
-    const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
-      async ([name, source]) => [name, await this.pipelines.get(`${base}:${name}`, source)])));
-    if (pairBuffer !== undefined) {
-      compiled.addPair = await this.pipelines.get(
+    // ...and the three groups below are asked for together too.
+    const compiling = Object.fromEntries(Object.entries(sources).map(
+      ([name, source]) => [name, this.pipelines.get(`${base}:${name}`, source)]));
+    if (pairBuffer !== undefined || compileOnly) {
+      compiling.addPair = this.pipelines.get(
         `af3-template:add-pair:${pairs * queryChannels}`, createAddShader(pairs * queryChannels));
     }
     // The template stack: the shared pair track at the stack's own width.
     // ...one variable for the shader and the packing; see the note in
     // msa-stack-webgpu.js for what their disagreeing costs.
     const pairWeightPrecision = options.pairWeightPrecision ?? "f32";
-    const trackPipelines = await compilePairTrack(this.pipelines, {
+    const trackCompiling = compilePairTrack(this.pipelines, {
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
       scratchStorage: UNPACKED_PAIR_SCRATCH,
@@ -667,6 +671,8 @@ export class Af3TemplateEmbedderGpu {
         && gridProjectMatrixConfig(this.device),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
     });
+    const [compiled, trackPipelines] = await Promise.all([settleAll(compiling), trackCompiling]);
+    if (compileOnly) return undefined;
     const gridProjectMatrix = trackPipelines.gridProjectMatrix === undefined ? undefined
       : allocateGridProjectMatrix(this.allocator, {
         ...trackPipelines.gridProjectMatrix, label: "af3-template.grid-project",
