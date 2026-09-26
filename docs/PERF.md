@@ -795,6 +795,12 @@ the tower waits for each block.
   sampler's weights are ever streamed by default.
 - **ESMFold2's SwiGLU at a smaller row tile** (it stays at 4): tile 2 is
   slower, 309 -> 331 ms of sampler at 59 residues, and tile 1 only equals 4.
+- **The pairformer's single transition as the vector split** (the pair
+  track's two GEMMs, 64 rows a workgroup, residual added in place): SLOWER,
+  AF3 trunk 12.7 -> 21.3 ms of single transition at 68 tokens and 13.3 -> 21.1
+  at 255, and not bit-identical (20 of 574 atoms at 0.001 A). With `n` rows the
+  GEMMs launch 12-96 workgroups; the fused kernel's per-row weight reads come
+  out of L2, so the "one workgroup a row" starvation is not the cost it looks.
 
 ### A single cold run, which is what most visitors make
 
