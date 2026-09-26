@@ -639,6 +639,9 @@ A third: staging each key chunk's BIAS block coalesced (each lane is a
 different query, so the per-key bias reads are N floats apart across a warp)
 made it 35.1 -> 40.7 ms - each lane walks its own bias row, so the lines are
 reused from cache anyway, and the 8 KiB tile costs occupancy. Reverted.
+And `tri.contract` as the split transition's 256-lane 64 x 64 vector GEMM
+(bit-identical, k ascending) was no faster than the 8 x 8 kernel: AF3 at 255
+10.34 -> 10.74 ms over six blocks, IntelliFold-2 39.1 -> 38.2. Reverted.
 
 `perAtomConditioning` (host, run twice a fold - the target-feat encoder and the
 diffusion head) was seven passes over `rows x channels` and three temporary
