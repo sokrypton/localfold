@@ -386,8 +386,9 @@ export async function buildTargetFeat(batch, weights, device) {
         // Zeroed, so the three terms this encoder does not have contribute
         // nothing - see the note on those weights in diffusion-weights.js.
         tokenAtomsAct: new Float32Array(atoms * 3),
-        trunkSingleCond: new Float32Array(batch.tokens * 384),
-        trunkPairCond: new Float32Array(batch.tokens * batch.tokens * 128),
+        // No trunk yet: the encoder zeroes both on the device.
+        trunkSingleCond: null,
+        trunkPairCond: null,
       }, weights.encoder);
 
   return targetFeatures({

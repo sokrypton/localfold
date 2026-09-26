@@ -93,8 +93,9 @@ export async function main(device, args) {
     tokensToKeys: batch.tokensToKeys,
     // The three the conditioning encoder does not have - see the note above.
     tokenAtomsAct: new Float32Array(atoms * 3),
-    trunkSingleCond: new Float32Array(tokens * 384),
-    trunkPairCond: new Float32Array(tokens * tokens * 128),
+    // What a fold passes: no trunk, zeroed on the device.
+    trunkSingleCond: null,
+    trunkPairCond: null,
   }, asDiffusionShapedWeights(weights.encoder));
   const gpuMs = performance.now() - gpuStarted;
 

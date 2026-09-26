@@ -1755,9 +1755,28 @@ export class Af3AtomEncoderGpu {
       const atomMask = persistentUpload("atom.mask", () => floats(input.atomMask));
       const pairWeights = { buffer: residentWeightBuffer(this.device, weights,
         "atom.pair-weights", () => pairPacked.data) };
-      const trunkSingleCond = persistentUpload("atom.trunk-single",
-        () => input.trunkSingleCond);
-      const trunkPairCond = persistentUpload("atom.trunk-pair", () => input.trunkPairCond);
+      // 🔴 `null` IS "NO TRUNK", ZEROED ON THE DEVICE. The input embedder's
+      // pass has no trunk to condition on and fed this a host array of zeros -
+      // `tokens^2 x 128` of them, 33 MiB at 255 tokens, allocated and written
+      // across the bus every fold (39 ms of upload alone). A cleared buffer is
+      // the same zeros, so the output is bit-identical; and it is sized from
+      // the weights' own widths, which the literal 128 was only by agreement.
+      const zeros = (label, bytes) => {
+        if (staticCache !== undefined) {
+          throw new Error(`${label}: null means no trunk, which a cached encoder never has`);
+        }
+        const allocation = alloc(label, bytes, GPUBufferUsage.COPY_DST);
+        const clear = this.device.createCommandEncoder({ label: `${label}.clear` });
+        clear.clearBuffer(allocation.buffer);
+        this.device.queue.submit([clear.finish()]);
+        return allocation;
+      };
+      const trunkSingleCond = input.trunkSingleCond === null
+        ? zeros("atom.trunk-single", tokens * weights.trunkSingleChannels * 4)
+        : persistentUpload("atom.trunk-single", () => input.trunkSingleCond);
+      const trunkPairCond = input.trunkPairCond === null
+        ? zeros("atom.trunk-pair", tokens * tokens * weights.trunkPairChannels * 4)
+        : persistentUpload("atom.trunk-pair", () => input.trunkPairCond);
       // 🔴 THE ONE INPUT THAT MOVES. Everything else this encoder reads is the
       // molecule or the trunk; the noisy coordinates are the step.
       const positions = up("atom.positions", input.tokenAtomsAct);
