@@ -363,17 +363,35 @@ export class Af3TrunkGpu {
       // be the pairformer's readback, then the head's host work, then the
       // head's own readback - two drains with the GPU idle between them.
       const singleElements = tokens * weights.embedder.singleChannels;
+      // 🔴 WHAT TO READ BACK IS THE CALLER'S TO SAY, AND BETWEEN RECYCLES THE
+      // ANSWER IS "THE CONTACT MAP". The fold's loop feeds this pass's pair and
+      // single to the next pass's embedder, so reading them back only to upload
+      // them again was a drain's worth of bus traffic per pass - 32 MiB each way
+      // at 255 tokens, plus 16 MiB of logits nobody reads until the last pass.
+      // Everything is read by default, which is what every other caller wants.
+      const readback = { pair: true, single: true, logits: true, ...options.readback };
+      // The trunk_out_pair seam is a host array, so a checker asking for seams gets it.
+      if (options.onSeam !== undefined) readback.pair = true;
       const out = await stage("distogram", () => head.run(pair, embedded.singleAllocation,
-                                                          pairElements, singleElements));
+                                                          pairElements, singleElements, readback));
       // Every scope collected above was submitted ahead of that readback, which
       // has completed, so these resolve without waiting.
       await validation.settle();
       seam("tap.trunk_out_pair", out.pair);
 
+      // ...and the pair and single themselves, for a caller that recycles them
+      // on the device. It owns them and releases them.
+      const kept = options.keepOutputs === true
+        ? { pairAllocation: embedded.pairAllocation, singleAllocation: embedded.singleAllocation }
+        : {};
+      if (options.keepOutputs === true) {
+        owned.splice(owned.indexOf(embedded.pairAllocation), 1);
+        owned.splice(owned.indexOf(embedded.singleAllocation), 1);
+      }
       return {
         pair: out.pair, single: out.single,
         logits: out.logits, contactProbs: out.contactProbs,
-        binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings,
+        binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings, ...kept,
       };
     } finally {
       for (const allocation of owned) allocation.release();
@@ -431,13 +449,14 @@ export class Af3TrunkGpu {
     const contact = keep(this.allocator.allocate("af3-disto.contact", pairs * 4,
       storage | GPUBufferUsage.COPY_SRC));
 
-    const run = async (pairAllocation, singleAllocation, pairElements, singleElements) => {
+    const run = async (pairAllocation, singleAllocation, pairElements, singleElements, wanted) => {
       const mapRead = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
       const readback = [
-        [logits, pairs * bins], [contact, pairs],
-        [pairAllocation, pairElements], [singleAllocation, singleElements],
-      ].map(([source, elements]) => ({
-        source, bytes: elements * 4,
+        ["logits", logits, pairs * bins, wanted.logits], ["contactProbs", contact, pairs, true],
+        ["pair", pairAllocation, pairElements, wanted.pair],
+        ["single", singleAllocation, singleElements, wanted.single],
+      ].filter(([, , , want]) => want).map(([name, source, elements]) => ({
+        name, source, bytes: elements * 4,
         target: this.allocator.allocate("af3-disto.readback", elements * 4, mapRead),
       }));
       try {
@@ -462,12 +481,12 @@ export class Af3TrunkGpu {
       await Promise.all(readback.map(({ target }) => target.buffer.mapAsync(GPUMapMode.READ)));
       const error = await scope;
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
-      const [outLogits, contactProbs, outPair, outSingle] = readback.map(({ target }) => {
-        const copy = new Float32Array(target.buffer.getMappedRange().slice(0));
+      const result = {};
+      for (const { name, target } of readback) {
+        result[name] = new Float32Array(target.buffer.getMappedRange().slice(0));
         target.buffer.unmap();
-        return copy;
-      });
-      return { logits: outLogits, contactProbs, pair: outPair, single: outSingle };
+      }
+      return result;
       } finally {
         for (const { target } of readback) target.release();
       }

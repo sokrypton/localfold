@@ -728,6 +728,8 @@ export async function main(device, args) {
     // The angstrom metric costs a softmax over every pair's bins each pass,
     // so it is computed only when asked; a tolerance above zero asks for it.
     recycleDistances: args.includes("--recycle-distances"),
+    // ...and the pair/single deltas, which need every pass read back to the host.
+    recycleDeltas: args.includes("--recycle-deltas"),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     // The trunk's intermediate seams, compared as they are produced.

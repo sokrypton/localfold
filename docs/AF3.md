@@ -3497,7 +3497,10 @@ nothing" held for the pair and single deltas (12 ms a pass at 255 tokens) and
 not for `expectedDistances`, a softmax over every pair's 64 bins: **84-88 ms a
 pass**, host time with the GPU idle, ~350 ms of a 4.7 s page-default fold for a
 number nothing reads unless a tolerance is set. A tolerance above zero still
-computes it; the page sets none. On the 68-token default input:
+computes it; the page sets none. **And the pair and single deltas are opt-in too
+(`--recycle-deltas`)**: between recycles the pair stays on the device now, so a
+pass has host arrays to compare only when something asks for every pass to be
+read back - a tolerance, this flag or `--recycle-distances`. On the 68-token default input:
 
 | pass | pair | single |
 |---:|---:|---:|

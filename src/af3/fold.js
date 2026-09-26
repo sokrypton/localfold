@@ -896,10 +896,23 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const trunkPairChannels = weights.trunk.embedder?.pairChannels ?? 128;
   const trunkSingleChannels = weights.trunk.embedder?.singleChannels ?? 384;
   let trunk = reusedTrunk;
-  let previousPair = trunk?.pair
-    ?? new Float32Array(tokens * tokens * trunkPairChannels);
-  let previousSingle = trunk?.single
-    ?? new Float32Array(tokens * trunkSingleChannels);
+  // 🔴 A RESUMED TRUNK BRINGS HOST ARRAYS; A FRESH FOLD BRINGS NOTHING, and the
+  // embedder zeroes pass one's "previous" on the device rather than being
+  // handed 33 MiB of host zeros to upload (at 255 tokens).
+  let previousPair = trunk?.pair;
+  let previousSingle = trunk?.single;
+  // 🔴 AND BETWEEN RECYCLES THE PAIR AND SINGLE STAY ON THE DEVICE. Every pass
+  // read both back and the next uploaded them again - with the logits, ~80 MiB
+  // over the bus and a drain per pass at 255 tokens - while the only thing a
+  // page reads per pass is the contact map. The LAST pass still reads
+  // everything back, so the sampler, the confidence head, OpenDDE's
+  // re-tokenisation and a resumed trunk all get the host arrays they always
+  // did. A tolerance, or a caller asking for `recycleDeltas`, reads every pass
+  // as before, because both compare host arrays.
+  let previousBuffers;
+  const readEveryPass = (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true
+    || options.recycleDistances === true;
+  void trunkPairChannels; void trunkSingleChannels;
   const firstPass = reused === undefined ? 0 : reused.recycles + 1;
   /** Per pass: how far the single and pair moved from the pass before it. */
   const recycleDeltas = [];
@@ -927,8 +940,15 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // (44.5 -> 62.6 pLDDT on a 146-residue chain) and the status line honestly
     // reports the depth that was featurised. What never happened is the MSA
     // stack seeing more than the query, which is most of what an MSA is for.
+    const lastPass = pass === recycles;
+    const readAll = lastPass || readEveryPass;
+    const recycledFrom = previousBuffers;
     trunk = await trunkGpu.run({
       tokens, sequences: batch.sequences,
+      ...(recycledFrom === undefined ? {} : {
+        previousPairBuffer: recycledFrom.pair.buffer,
+        previousSingleBuffer: recycledFrom.single.buffer,
+      }),
       // 🔴 FOUR, TYPED IN - and a padded slot count is a FEATURISER's, not a
       // constant. Under `templateMeanOverAllSlots` this number is the divisor,
       // so it decides the term's magnitude and not just how much work is done.
@@ -969,6 +989,9 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // ../heads/contact-threshold.js.
       contactClasses: af3ContactClasses(batch, tokens),
     }, weights.trunk, weights.trunk.dialect, {
+      keepOutputs: !lastPass,
+      readback: { pair: readAll, single: readAll,
+                  logits: readAll || featureTolerance > 0 || options.recycleDistances === true },
       onStage: (name, ms) => stage("trunk", { name, ms }),
       // The trunk's own seams, for a caller holding the reference's taps.
       ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
@@ -1005,7 +1028,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // strict comparison raises. That strictness is worth keeping for the
     // passes that DO compare, so the first pass is reported as 1 - everything
     // changed - rather than measured.
-    const comparable = hasPrevious && previousPair.length === trunk.pair.length
+    // The pass before is released now that this one has read it.
+    recycledFrom?.pair.release();
+    recycledFrom?.single.release();
+    previousBuffers = lastPass ? undefined
+      : { pair: trunk.pairAllocation, single: trunk.singleAllocation };
+    const comparable = hasPrevious && previousPair !== undefined && trunk.pair !== undefined
+      && previousPair.length === trunk.pair.length
       && previousSingle.length === trunk.single.length;
     // 🔴 AND THE DISTOGRAM, WHICH IS THE ONE IN ANGSTROMS. Every pass computes
     // one already - the contact map is shown while the trunk is still
@@ -1020,7 +1049,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
     const wantDistances = featureTolerance > 0 || options.recycleDistances === true;
     const distances = trunk.logits === undefined || !wantDistances ? undefined
       : expectedDistances(trunk.logits, trunk.binEdges);
-    recycleDeltas.push({
+    // 🔴 ONLY WHEN EVERY PASS WAS READ BACK - a tolerance, `recycleDeltas` or
+    // `recycleDistances`. Otherwise only the last pass has host arrays and it
+    // has no host previous to compare against, so nothing is reported rather
+    // than a made-up 1.
+    if (readEveryPass) recycleDeltas.push({
       pass,
       pair: comparable ? relativeChange(previousPair, trunk.pair) : 1,
       single: comparable ? relativeChange(previousSingle, trunk.single) : 1,
@@ -1037,6 +1070,10 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // compute_tol takes over a structure. What the right number is has been
     // measured on two inputs and not on a corpus - see docs/AF3.md.
     if (shouldStopRecycling(recycleDeltas, featureTolerance)) {
+      // Stopping early leaves this pass's kept buffers with nothing to feed.
+      previousBuffers?.pair.release();
+      previousBuffers?.single.release();
+      previousBuffers = undefined;
       await stage("recycle-converged", { pass, passes: recycles + 1 });
       break;
     }

@@ -545,9 +545,25 @@ export class Af3EmbedderGpu {
         Int32Array.from(input.msaRows), storage));
       const deletions = keep(this.allocator.upload("af3-embed.deletions",
         Float32Array.from(input.deletionMatrix), storage));
-      // 🔴 ALWAYS PRESENT, even on pass one - see the note at the top.
-      const previousPair = keep(this.allocator.upload("af3-embed.previous-pair",
-        input.previousPair ?? new Float32Array(pairs * pairChannels), storage));
+      // 🔴 ALWAYS PRESENT, even on pass one - see the note at the top. And in
+      // one of three forms: the previous pass's buffer, still on the device
+      // (the fold's recycle loop); a host array (a resumed trunk, or a caller
+      // that has one); or nothing, meaning pass one's zeros - cleared on the
+      // device rather than allocated on the host and uploaded, which at 255
+      // tokens was a 33 MiB array and 30 ms. The same zeros, so bit-identical.
+      const zeroed = (label, bytes) => {
+        const allocation = keep(this.allocator.allocate(label, bytes,
+                                                        storage | GPUBufferUsage.COPY_DST));
+        const clear = this.device.createCommandEncoder({ label: `${label}.clear` });
+        clear.clearBuffer(allocation.buffer);
+        this.device.queue.submit([clear.finish()]);
+        return allocation;
+      };
+      const recycled = (buffer, array, label, bytes) => (buffer !== undefined ? { buffer }
+        : array !== undefined ? keep(this.allocator.upload(label, array, storage))
+          : zeroed(label, bytes));
+      const previousPair = recycled(input.previousPairBuffer, input.previousPair,
+        "af3-embed.previous-pair", pairs * pairChannels * 4);
       // 🔴 ALWAYS BOUND, LIKE THE RECYCLED PAIR ABOVE. A fold with no ligand
       // has an all-zero contact matrix, and against a bias-free Linear that
       // adds exactly zero - so there is nothing to gain from a branch and one
@@ -567,8 +583,8 @@ export class Af3EmbedderGpu {
         if (input.bondOrderMatrix !== undefined) packed.set(input.bondOrderMatrix, pairs);
         return packed;
       })(), storage));
-      const previousSingle = keep(this.allocator.upload("af3-embed.previous-single",
-        input.previousSingle ?? new Float32Array(tokens * singleChannels), storage));
+      const previousSingle = recycled(input.previousSingleBuffer, input.previousSingle,
+        "af3-embed.previous-single", tokens * singleChannels * 4);
 
       const left = keep(this.allocator.allocate("af3-embed.left", tokens * pairChannels * 4, storage));
       const right = keep(this.allocator.allocate("af3-embed.right", tokens * pairChannels * 4, storage));

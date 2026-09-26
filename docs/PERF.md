@@ -490,6 +490,20 @@ either configuration. By this repository's own rule a run-to-run difference is a
 memory bug - a race or a read of memory nobody wrote - and not precision; the
 M2's was a missing bounds check. Not chased yet.
 
+🔴 **AND BETWEEN RECYCLES THE PAIR NOW STAYS ON THE DEVICE TOO.** Each pass
+read its pair, single and logits back and the next uploaded the pair again as
+its "previous" - ~80 MiB over the bus and a drain per pass at 255 tokens, for a
+page that reads only the contact map per pass. The trunk takes
+`previousPairBuffer`/`previousSingleBuffer` and a `readback` selection and can
+keep its outputs (`keepOutputs`); the fold reads the contact map per pass and
+everything on the LAST pass, so every consumer after the loop gets the host
+arrays it always did. Pass one's zero "previous" is cleared on the device
+instead of a 33 MiB host upload. `recycleDeltas` becomes opt-in like the
+distances (`--recycle-deltas`), because comparing passes needs every pass on
+the host; a tolerance still reads every pass. Byte-identical on all seven
+models; trunk reuse still hands its trunk to a retry. AF3 int5, stock flags,
+255 tokens: warm fold 4.00-4.12 -> **3.66-3.74 s**.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The
