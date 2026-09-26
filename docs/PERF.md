@@ -659,6 +659,46 @@ every model folded, alignment included:
 fold and were left: they already normalise each row once, and what is left is
 uncoalesced reads.
 
+## Memory: what a large fold holds, and what it no longer does
+
+🔴 **FIVE CHANGES, ALL BIT-IDENTICAL, AND THE ONE THAT IS NOT FREE IS SIZE-GATED.**
+Peaks, stock flags, A100:
+
+| fold | before | after |
+|---|---:|---:|
+| OpenDDE, 5CAJ 255 (495 structural tokens) | 5440 MiB | **2349** |
+| AF3, 757 residues | 3724 | **3304** |
+| ESMFold2, 502 residues | 2647 | **2031** |
+| AF3, 5CAJ 255 (a small fold) | 1980 | 1980 (unchanged, same speed) |
+
+- **Buffers released when their last reader has run, not at the end.**
+  OpenDDE's refined pair after the confidence head's pair init has copied it
+  and its diffusion pair conditioning at sample-done (5440 -> 4970);
+  ESMFold2's confidence input copies after that head's pair init (-492 MiB at
+  502). Submitted work keeps what it binds, so a release after the submit is
+  safe; the rule is never to release what an UNSUBMITTED encoder names.
+- **The grid attention a third of its rows at a time** (`gridChunked`): q, k, v
+  and the gate were the only reason a pair track held five pair-sized
+  tensors. Row r's attention reads only row r's q/k/v, so its chunk tensors
+  pack into scratch the triangle is done with, under a (first row, count)
+  uniform. Four tensors.
+- **The triangle a quarter of its channels at a time** (`compact`): a[h] and b[h]
+  are read only by channel h's contraction, so projectAB and the contraction
+  walk channel groups with a and b held for one group in a small fourth
+  buffer, and the grid takes quarters of its rows. Three tensors and a small
+  one.
+- **A large fold releases its resident weights** whatever the device prior
+  says: keeping them is a fixed upload saved for a fixed amount of memory
+  held through the peak, and memory pressure grows with the fold. OpenDDE
+  4432 -> 2349 MiB for +2.7% warm.
+
+All three size-dependent choices share one gate, a largest pair tensor of 128
+MiB (`GRID_CHUNK_MIN_BYTES`), because below it they cost time and save nothing
+that matters: chunking AF3's grid at 255 tokens was 2.5% slower with the peak
+unchanged, and releasing its weights +9.5%. 🔴 And the host path for
+ESMFold2's confidence inputs was measured and rejected: the same -492 MiB at
+502 for +1.7 s, where releasing the device copies early costs nothing.
+
 What is left under stock flags is mostly arithmetic: the pair track's f32
 kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,
 `tri.project` 14, the vector split 13-15, `tri.project-out` ~12, `grid.attend`
