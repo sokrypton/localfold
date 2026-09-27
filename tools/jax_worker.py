@@ -233,15 +233,22 @@ def align(query, target):
     return dict(sorted(pairs.items()))
 
 
-def pdb_to_cif(pdb, name):
-    """A PDB file's ATOM/HETATM records as the smallest mmCIF alphafold3 reads."""
+def pdb_to_cif(pdb, name, chain=None):
+    """A PDB file's ATOM/HETATM records as the smallest mmCIF alphafold3 reads.
+
+    🔴 ONE CONFORMATION: a crystal's alternate locations (5CAJ has fourteen)
+    come through as duplicate atoms, which alphafold3's parser refused ("cannot
+    assign 6 input values to the 2 output values"). The first location is kept,
+    as the page's own reader keeps it.
+    """
     lines = [f"data_{name}", "#",
              "_pdbx_audit_revision_history.revision_date 1970-01-01", "#",
              "loop_"]
     fields = ["group_PDB", "id", "type_symbol", "label_atom_id", "label_alt_id",
               "label_comp_id", "label_asym_id", "label_entity_id", "label_seq_id",
               "pdbx_PDB_ins_code", "Cartn_x", "Cartn_y", "Cartn_z", "occupancy",
-              "B_iso_or_equiv", "auth_seq_id", "auth_asym_id", "pdbx_PDB_model_num"]
+              "B_iso_or_equiv", "auth_seq_id", "auth_comp_id", "auth_asym_id",
+              "auth_atom_id", "pdbx_PDB_model_num"]
     lines += [f"_atom_site.{field}" for field in fields]
     serial = 0
     for record in pdb.splitlines():
@@ -249,16 +256,25 @@ def pdb_to_cif(pdb, name):
             break
         if not record.startswith(("ATOM", "HETATM")):
             continue
+        if record[16] not in (" ", "A"):
+            continue
+        # ...and one chain's POLYMER: a crystal's waters and ligands under the
+        # same chain letter are further entities, which this minimal file cannot
+        # describe and the parser refuses. MSE is the one HETATM that is chain.
+        this = record[21].strip() or "A"
+        chain = chain or this
+        if this != chain or (record.startswith("HETATM") and record[17:20] != "MSE"):
+            continue
         serial += 1
-        chain = record[21].strip() or "A"
         element = record[76:78].strip() or record[12:16].strip()[0]
         lines.append(" ".join([
             record[:6].strip(), str(serial), element, record[12:16].strip(),
-            record[16].strip() or ".", record[17:20].strip(), chain, "1",
+            ".", record[17:20].strip(), chain, "1",
             record[22:26].strip(), record[26].strip() or "?",
             record[30:38].strip(), record[38:46].strip(), record[46:54].strip(),
             record[54:60].strip() or "1.0", record[60:66].strip() or "0.0",
-            record[22:26].strip(), chain, "1"]))
+            record[22:26].strip(), record[17:20].strip(), chain,
+            record[12:16].strip(), "1"]))
     return "\n".join(lines) + "\n#\n"
 
 
@@ -284,7 +300,7 @@ def template_entry(template, query):
         text = template.get("text") or ""
         chain = source
         name = "upload"
-        cif = text if ("_atom_site." in text) else pdb_to_cif(text, name)
+        cif = text if ("_atom_site." in text) else pdb_to_cif(text, name, chain or None)
     else:
         raise Refused(f"the JAX backend does not know the template source {kind!r}")
     struc = structure.from_mmcif(cif, fix_mse_residues=True, fix_arginines=True,
@@ -453,7 +469,9 @@ class Worker:
             template = entity.get("template") or {}
             if template.get("kind", "none") == "none":
                 continue
-            emit("status", f"{model} on JAX · fetching template {template.get('source') or 'upload'}")
+            named = (template.get("filename") or "the uploaded structure") if template.get("kind") == "upload" \
+                else template.get("source")
+            emit("status", f"{model} on JAX · template {named}")
             entry, covered = template_entry(template, protein["sequence"])
             protein["templates"] = [entry]
             emit("status", f"{model} on JAX · template covers {covered} of"

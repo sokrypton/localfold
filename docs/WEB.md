@@ -3132,12 +3132,20 @@ download and the saved session behave as they do for a local fold.
 
 What reaches it from the page: the model (resolved - the PLM row's ESMFold2
 size, AF2's model number, which the page folds into the family name as
-`monomer-2`), recycles, steps, MSA depth, seed, and the MSA row - none, search
+`monomer-2`), recycles, steps, MSA depth, seed, the MSA row - none, search
 (the worker asks the ColabFold MMseqs2 server itself), paste, or an upload,
-which travels with the job. What is REFUSED with a message rather than
-approximated: a template, the Flow sampler (JAX samples by diffusion), one
-alignment for several protein chains, and AlphaFold 3 without DeepMind's
-parameters on the runtime.
+which travels with the job; a merged alignment over several chains is split by
+chain length as the page splits one - and a TEMPLATE: a PDB entry or an
+AlphaFold DB model is fetched as mmCIF by the worker, an uploaded file is used
+as it is (a PDB file is converted to the smallest mmCIF alphafold3 reads, one
+chain's polymer, first alternate location), the chain is cut out and globally
+aligned to its query, and it goes in as AlphaFold 3's own template input. AF2's
+monomer takes one through its models 1 and 2. AlphaFold 3's parameters are
+fetched on its first JAX fold - after the page's own terms dialog, which gates
+sending one at all. What is REFUSED with a message rather than approximated: the
+Flow sampler (JAX samples by diffusion), a template "from the MSA search", AF2
+models 3-5 with a template (they have no template embedder), and a template on
+AF2 multimer or ESMFold2.
 
 🔴 Three things that cost a run each:
 - **The library prints to stdout**, so events have a private copy of fd 1 and
@@ -3169,7 +3177,7 @@ the MSA row, Fold, then the scores card and the archive download read back:
 | opendde | folded, pLDDT 91.6, final frame only - see `NO_LIVE` in the worker |
 | ESMFold2 600M / 300M | folded, 11 frames each |
 | AF2 monomer (model 2) / multimer (2 chains) | folded, a frame a recycle (the first AF2 fold 350 s, most of it the parameter download) |
-| AlphaFold 3 without DeepMind's parameters, Flow, a template | refused, with the reason on the status line |
+| AlphaFold 3 without DeepMind's parameters, Flow, a template | refused, with the reason on the status line (superseded: see below) |
 | a WebGPU fold from the same page, then JAX again | both folded - the selector switches per fold |
 
 🔴 opendde has no live frames on JAX because af3-any-model's stepwise path
@@ -3178,3 +3186,22 @@ KeyError 'init' in staged.py; stepwise diffusion: a (68, 24) mask against
 (160, 24, 3) positions in `random_augmentation`), while `run_alphafold.py
 --model=opendde` folds the same job. That is the upstream's to fix; the worker
 folds it plain and says so.
+
+### ...and the refusals it no longer needs (an L4, 2026-09-27)
+
+| case | result |
+|---|---|
+| 5CAJ chain A, openbind0, no template | CA-RMSD 19.47 A, pLDDT 36.8 - the control |
+| ...with the PDB entry 5CAJ_A | **0.47 A**, pLDDT 94.5 |
+| ...with the crystal uploaded as a file | **0.47 A**, pLDDT 94.5 |
+| ...AF2 monomer model 1, uploaded crystal | **0.19 A**, pLDDT 97.7 |
+| ...AF2 model 3 with a template | refused by the page: no template embedder |
+| 1BRS A:D, one pasted alignment over both chains | split by chain, folded |
+| AlphaFold 3 on a runtime without its parameters | fetched (973 MiB in ~50 s), then folded |
+
+🔴 The uploaded file failed twice before it parsed, both in the PDB-to-mmCIF
+step and both invisible to the PDB-entry path (RCSB's own mmCIF is complete):
+5CAJ's alternate locations came through as duplicate atoms, and its waters and
+ligands sat under the protein's chain letter as extra entities the minimal file
+could not describe - "cannot assign 6 input values to the 2 output values" in
+the parser's chain bookkeeping both times.
