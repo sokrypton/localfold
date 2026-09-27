@@ -3174,14 +3174,15 @@ the MSA row, Fold, then the scores card and the archive download read back:
 |---|---|
 | openbind0: single sequence / search / paste / + GOL / + SEP@3 | folded, 25 frames, card and archive (the MSA cases carry `msas/`) |
 | boltz2, protenix2, intellifold2, rosettafold3 | folded, 25 frames each (a model's first fold 56-60 s, compile included) |
-| opendde | folded, pLDDT 91.6, final frame only - see `NO_LIVE` in the worker |
+| opendde | folded, pLDDT 91.6, final frame only (live frames since sokrypton/alphafold3@0a533eb - see below) |
 | ESMFold2 600M / 300M | folded, 11 frames each |
 | AF2 monomer (model 2) / multimer (2 chains) | folded, a frame a recycle (the first AF2 fold 350 s, most of it the parameter download) |
 | AlphaFold 3 without DeepMind's parameters, Flow, a template | refused, with the reason on the status line (superseded: see below) |
 | a WebGPU fold from the same page, then JAX again | both folded - the selector switches per fold |
 
-🔴 opendde has no live frames on JAX because af3-any-model's stepwise path
-fails on a structural-token model through its own CLI too (`--stepwise_recycles`:
+🔴 (SUPERSEDED - fixed upstream in sokrypton/alphafold3@0a533eb, see the next
+section.) opendde had no live frames on JAX because af3-any-model's stepwise
+path failed on a structural-token model through its own CLI too (`--stepwise_recycles`:
 KeyError 'init' in staged.py; stepwise diffusion: a (68, 24) mask against
 (160, 24, 3) positions in `random_augmentation`), while `run_alphafold.py
 --model=opendde` folds the same job. That is the upstream's to fix; the worker
@@ -3205,3 +3206,29 @@ step and both invisible to the PDB-entry path (RCSB's own mmCIF is complete):
 ligands sat under the protein's chain letter as extra entities the minimal file
 could not describe - "cannot assign 6 input values to the 2 output values" in
 the parser's chain bookkeeping both times.
+
+### A third pass: the search's templates, a merged MSA panel, and two upstream fixes (an L4, 2026-09-27)
+
+| case | result |
+|---|---|
+| opendde, live | **16 frames**, pLDDT 82.7 - with the upstream fix below |
+| 5CAJ chain A, MSA search + "template from the MSA search" | **0.40 A**, pLDDT 94.2 - the search's best pdb70 hit |
+| ...the same template kind with no search | refused: it needs one |
+| 1BRS A:D, search | folded, pLDDT 93.8; the MSA panel gets ONE merged alignment (19,660 rows: the paired rows side by side, then each chain's own with gaps over the other) |
+
+The page offers WebGPU disabled, with the reason, on a runtime whose WebGPU has
+no adapter at all (a TPU) - a fold there would fail rather than crawl.
+
+**Fixed in sokrypton/alphafold3's `colab` branch (0a533eb)**, which the
+notebook's install overlays, so a new runtime has them:
+- `staged_fold` turns on `eval.stepwise` itself: `--stepwise_recycles` never set
+  it and died at `st['init']` with KeyError 'init' on EVERY model.
+- The `denoise` stage returned early with the residue batch and trunk
+  embeddings, so a structural-token model could not run live (the (68, 24)
+  mask against (160, 24, 3) positions). It rebuilds the struct/ batch now, and
+  `diff_cond` hands back the expander and refiner's embeddings as
+  `denoise_carry` for every step.
+- `fill_missing_msas(template_hits={})` returns the pdb70 hits the unpaired
+  job's tar already carries, and `fetch_template(name)` a hit's mmCIF from
+  ColabFold's template endpoint - which is what the worker uses, rather than
+  reading the tar on its way through the library.
