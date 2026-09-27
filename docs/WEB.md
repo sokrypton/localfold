@@ -3156,3 +3156,25 @@ parameters on the runtime.
 Measured through the real reader page (openbind0, 68 residues): a T4 31-99 s
 for a model's first fold (compile) and 4 s after; an L4 130 s then ~1 s; a
 Colab TPU v5e 44 s cold, pLDDT 84.9, every frame streamed to the reader.
+
+### Every model through the JAX backend, on the reader's page (an L4, 2026-09-27)
+
+Driven through `index.html?backend=colab` in a real browser - the model row,
+the MSA row, Fold, then the scores card and the archive download read back:
+
+| case | result |
+|---|---|
+| openbind0: single sequence / search / paste / + GOL / + SEP@3 | folded, 25 frames, card and archive (the MSA cases carry `msas/`) |
+| boltz2, protenix2, intellifold2, rosettafold3 | folded, 25 frames each (a model's first fold 56-60 s, compile included) |
+| opendde | folded, pLDDT 91.6, final frame only - see `NO_LIVE` in the worker |
+| ESMFold2 600M / 300M | folded, 11 frames each |
+| AF2 monomer (model 2) / multimer (2 chains) | folded, a frame a recycle (the first AF2 fold 350 s, most of it the parameter download) |
+| AlphaFold 3 without DeepMind's parameters, Flow, a template | refused, with the reason on the status line |
+| a WebGPU fold from the same page, then JAX again | both folded - the selector switches per fold |
+
+🔴 opendde has no live frames on JAX because af3-any-model's stepwise path
+fails on a structural-token model through its own CLI too (`--stepwise_recycles`:
+KeyError 'init' in staged.py; stepwise diffusion: a (68, 24) mask against
+(160, 24, 3) positions in `random_augmentation`), while `run_alphafold.py
+--model=opendde` folds the same job. That is the upstream's to fix; the worker
+folds it plain and says so.
