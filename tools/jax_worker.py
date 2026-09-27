@@ -57,13 +57,7 @@ def emit(kind, payload):
 
 
 AF2_NAMES = {"af2_ptm": "model_{}_ptm", "af2_multimer": "model_{}_multimer_v3"}
-# 🔴 FOLDED WITHOUT LIVE FRAMES: af3-any-model's stepwise path fails on a
-# structural-token model - `--stepwise_recycles` dies with KeyError 'init' in
-# staged.py, and stepwise diffusion with a (68, 24) mask against (160, 24, 3)
-# positions in random_augmentation - while its plain path folds the same job
-# (run_alphafold.py --model=opendde, 109 s on an L4). Measured 2026-09-27 on the
-# colab branch; the status line says so rather than leaving the bar still.
-NO_LIVE = {"opendde"}
+
 AF2_DIR = "af2_params"
 
 
@@ -284,10 +278,10 @@ def template_entry(template, query):
     from alphafold3 import structure
     kind = template.get("kind")
     source = (template.get("source") or "").strip()
-    if kind == "search":
-        raise Refused("templates from the MSA search are not wired to the JAX backend yet -"
-                      " name a PDB entry or upload one, or fold with WebGPU")
-    if kind == "pdb":
+    if kind == "mmcif":
+        # ...a structure already in hand: the MSA search's best hit.
+        cif, chain, name = template["text"], template.get("chain") or "", template.get("name", "hit")
+    elif kind == "pdb":
         entry, _, chain = source.replace(":", "_").partition("_")
         cif = fetch_text(f"{RCSB}/{entry.upper()}.cif")
         name = entry.upper()
@@ -361,7 +355,7 @@ class Worker:
         device = self.jax.local_devices()[0]
         self.flags.FLAGS.model = model
         self.flags.FLAGS.use_esm_embeddings = model.startswith("esmfold2")
-        self.flags.FLAGS.stepwise_recycles = model not in NO_LIVE
+        self.flags.FLAGS.stepwise_recycles = True
         if model in AF2_NAMES:
             from alphafold3.af2 import inference as af2_inference
             from alphafold3.model import model_registry
@@ -382,7 +376,7 @@ class Worker:
                 config.heads.diffusion.eval.steps = settings["steps"]
             if settings["msa"] and hasattr(config, "evoformer"):
                 config.evoformer.num_msa = settings["msa"]
-            config.heads.diffusion.eval.stepwise = model not in NO_LIVE
+            config.heads.diffusion.eval.stepwise = True
             if model == "alphafold3":
                 directory = "af3_native_weights"
                 if not glob.glob(f"{directory}/*.bin.zst"):
@@ -465,9 +459,14 @@ class Worker:
         proteins = [entry["protein"] for entry in spec.get("sequences", []) if "protein" in entry]
         rows = [entity for entity in job.get("entities", [])
                 if entity.get("type") == "protein" and (entity.get("value") or "").strip()]
+        searched = [protein for entity, protein in zip(rows, proteins)
+                    if (entity.get("template") or {}).get("kind") == "search"]
+        if searched and mode != "search":
+            raise Refused("a template from the MSA search needs an MSA search: set the MSA"
+                          " to search, or name a structure instead")
         for entity, protein in zip(rows, proteins):
             template = entity.get("template") or {}
-            if template.get("kind", "none") == "none":
+            if template.get("kind", "none") in ("none", "search"):
                 continue
             named = (template.get("filename") or "the uploaded structure") if template.get("kind") == "upload" \
                 else template.get("source")
@@ -483,7 +482,32 @@ class Worker:
         if mode == "search":
             emit("status", f"{model} on JAX · searching the ColabFold MMseqs2 server")
             from alphafold3.data import msa_server
-            fold_input = msa_server.fill_missing_msas(fold_input)
+            hits = {}
+            fold_input = msa_server.fill_missing_msas(fold_input, template_hits=hits)
+            if searched:
+                # 🔴 THE BEST HIT, AS THE PAGE TAKES IT - one template a chain,
+                # from the search that produced the alignment. The chains are
+                # rebuilt with it rather than edited, and the job re-read.
+                for protein in searched:
+                    best = (hits.get(protein["sequence"]) or [None])[0]
+                    if best is None:
+                        raise Refused(f"the search found no template for {protein['sequence'][:12]}…")
+                    emit("status", f"{model} on JAX · template {best} from the search")
+                    entry, covered = template_entry(
+                        {"kind": "mmcif", "text": msa_server.fetch_template(best),
+                         "chain": best.split("_")[1],
+                         "name": best}, protein["sequence"])
+                    protein["templates"] = [entry]
+                    emit("status", f"{model} on JAX · template {best} covers {covered} of"
+                                   f" {len(protein['sequence'])} residues")
+                # The filled alignments go into the job with the templates.
+                for chain, protein in zip([c for c in fold_input.chains
+                                           if isinstance(c, folding_input.ProteinChain)], proteins):
+                    protein["unpairedMsa"] = chain.unpaired_msa or ""
+                    protein["pairedMsa"] = chain.paired_msa or ""
+                with open(path, "w") as handle:
+                    json.dump(spec, handle)
+                fold_input = next(iter(folding_input.load_fold_inputs_from_path(path)))
         emit("status", f"{model} on JAX · loading weights and compiling")
         runner, config = self.runner(model, settings)
         batch = [None]
@@ -528,11 +552,7 @@ class Worker:
                 if batch[0] is None:
                     batch[0] = LF.as_batch(featurised)
                 return original(featurised, *args, **kwargs)
-            if model in NO_LIVE:
-                emit("status", f"{model} on JAX · folding (this model has no live frames on"
-                               " JAX - the structure arrives at the end)")
-            else:
-                self.RA._FRAME_CALLBACK[0] = on_frame
+            self.RA._FRAME_CALLBACK[0] = on_frame
         runner.run_inference = run_inference
         started = time.time()
         try:
@@ -620,13 +640,34 @@ class Worker:
                 unpaired.append(chain.unpaired_msa or "")
                 paired.append(chain.paired_msa or "")
         msas = {"unpaired": unpaired, "paired": paired} if any(unpaired) else {}
+        # ...and ONE alignment for the page's MSA panel, which reads the chains
+        # end to end (see loadIntoViewer): the paired rows side by side, then
+        # each chain's unpaired rows with gaps over the others.
+        a3m = None
+        if len(unpaired) == 1 and unpaired[0]:
+            a3m = unpaired[0]
+        elif len(unpaired) > 1 and any(unpaired):
+            proteins_only = [c.sequence for c in fold_input.chains
+                             if isinstance(c, folding_input.ProteinChain)]
+            rows = lambda text: [line for line in text.splitlines() if line and not line.startswith(">")]
+            blocks = [">101", "".join(proteins_only)]
+            paired_rows = [rows(text) for text in paired]
+            depth = min((len(r) for r in paired_rows), default=0)
+            for at in range(1, depth):
+                blocks += [f">paired_{at}", "".join(r[at] for r in paired_rows)]
+            for index, text in enumerate(unpaired):
+                before = "-" * sum(len(q) for q in proteins_only[:index])
+                after = "-" * sum(len(q) for q in proteins_only[index + 1:])
+                for at, row in enumerate(rows(text)[1:], start=1):
+                    blocks += [f">chain{index + 1}_{at}", before + row + after]
+            a3m = "\n".join(blocks) + "\n"
         mean = confidence["meanPlddt"]
         return {
             "jax": True, "model": model, "family": job_family,
             "pdb": cif_to_pdb(cif), "confidence": confidence,
             "tokens": {"chainIds": chain_ids, "resIds": res_ids},
             "chains": chains, "msas": msas,
-            "a3m": unpaired[0] if len(unpaired) == 1 and unpaired[0] else None,
+            "a3m": a3m,
             "atoms": len(atoms),
             "status": f"{model} on JAX ({self.device}) · done in {seconds:.0f} s"
                       f" · pLDDT {mean:.1f}",

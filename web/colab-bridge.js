@@ -497,6 +497,13 @@ function installColabStatus() {
           const option = document.createElement("option");
           option.value = value;
           option.textContent = text;
+          // 🔴 NO ADAPTER AT ALL IS NOT A SLOW CARD - a fold there fails. Offered
+          // disabled, with the reason, rather than hidden: the reader should see
+          // why their usual backend is not available on this runtime.
+          if (value === "webgpu" && gpu.webgpu === false) {
+            option.disabled = true;
+            option.textContent = "WebGPU (no GPU on this runtime)";
+          }
           pick.append(option);
         }
         // 🔴 WHERE WebGPU HAS NO CARD, JAX IS THE DEFAULT. A TPU runtime (or any
@@ -506,6 +513,7 @@ function installColabStatus() {
           || /swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
         try { pick.value = localStorage.getItem("localfold.colabBackend") ?? (software ? "jax" : "webgpu"); }
         catch (cause) { pick.value = software ? "jax" : "webgpu"; }
+        if (gpu.webgpu === false) pick.value = "jax";
         if (pick.value === "") pick.value = "webgpu";
         backendChoice = pick.value;
         pick.addEventListener("change", () => {
