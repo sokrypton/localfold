@@ -394,7 +394,8 @@ def main():
                              " `auto` to use what the MSA search finds, or"
                              " pdb:ID / afdb:ID to name the database outright,"
                              " or upload:PATH[@CHAIN] for a local structure."
-                             " Goes to the network either way.")
+                             " Goes to the network either way. `;` gives one"
+                             " a protein chain, in order.")
     parser.add_argument("--then-sequence", default=None,
                         help="fold a SECOND time on this sequence, which is a"
                              " fresh fold rather than a continuation")
@@ -846,12 +847,14 @@ def main():
               const list = window.__entityList;
               if (!list) return 'no entity list';
               const entities = list.read();
-              const protein = entities.find((e) => e.type === 'protein');
-              if (!protein) return 'no protein entity';
-              protein.template = %s;
+              // `;` separates one template a protein chain, in order.
+              const templates = %s;
+              const proteins = entities.filter((e) => e.type === 'protein');
+              if (proteins.length < templates.length) return 'fewer protein entities than templates';
+              templates.forEach((template, at) => { proteins[at].template = template; });
               list.set(entities);
-              return JSON.stringify(list.read().map((e) => e.template || null));
-            })()""" % json.dumps(template_entry(args.template))))
+              return JSON.stringify(list.read().map((e) => e.template ? e.template.kind : null));
+            })()""" % json.dumps([template_entry(t) for t in args.template.split(";")])))
 
         cdp.evaluate(ws, """(() => {
           const set = (id, value) => {

@@ -445,9 +445,6 @@ class Worker:
                      and (entity.get("template") or {}).get("kind", "none") != "none"]
         if templated and single_sequence:
             raise Refused("ESMFold2 takes no template")
-        if templated and model == "af2_multimer":
-            raise Refused("AlphaFold 2 multimer's template term is not wired - fold the"
-                          " monomer, or drop the template")
         depth = str(controls.get("max-msa") or "512:1024").split(":")[0]
         settings = {"recycles": int(controls.get("recycles") or 0),
                     "steps": int(controls.get("af3-count") or 0),
@@ -455,7 +452,9 @@ class Worker:
                     "af2_model": int(controls.get("af2Model") or 1),
                     "flow": sampler == "flow",
                     "templates": bool(templated)}
-        if templated and af2 and settings["af2_model"] not in (1, 2):
+        # All five multimer models carry the multimer template embedder; only
+        # the monomer's 3, 4 and 5 are template-free.
+        if templated and model == "af2_ptm" and settings["af2_model"] not in (1, 2):
             raise Refused("AlphaFold 2's models 3, 4 and 5 have no template embedder -"
                           " pick model 1 or 2, or drop the template")
         emit("status", f"{model} on JAX ({self.device}) · reading the job")

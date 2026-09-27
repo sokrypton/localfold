@@ -75,7 +75,7 @@ import {
 } from "./fold-session.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
-import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
+import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
 import { colabRole, installColabBridge, remoteBackendChoice, remoteCommand, remoteEvents,
@@ -755,13 +755,13 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   //
   // 🔴 AND AlphaFold 2's MONOMER IS NOT IN THAT CLASS ANY MORE. Its term was
   // always there and oracle-checked; the driver simply never forwarded the
-  // slot, so this refusal was right for the wrong reason. The MULTIMER stays
-  // refused here: it forwards a template in its own driver, but its embedder
-  // is a different dialect with a different feature set and nothing on this
-  // page has ever built one for it - which is exactly the gap that made the
-  // monomer's term look supported for a year.
-  if (templateCount > 0 && !isAf3Family(choice) && graphOf(choice) !== "monomer") {
-    throw new Error("Templates need AF3, OpenBind-0 or AlphaFold 2 monomer;"
+  // slot, so this refusal was right for the wrong reason. Nor is the MULTIMER:
+  // its embedder is a different dialect, and the page builds its slot too -
+  // one atom37 slot over the complex, each chain at its offset (see the AF2
+  // branch of the fold). 1BRS A:D with a self-template: 16.68 -> 0.78 A.
+  if (templateCount > 0 && !isAf3Family(choice) && graphOf(choice) !== "monomer"
+      && graphOf(choice) !== "multimer") {
+    throw new Error("Templates need an AF3-lineage model or AlphaFold 2;"
       + ` the model is set to ${choice}`);
   }
   // 🔴 AND THREE OF ALPHAFOLD 2's FIVE MODELS HAVE NO TEMPLATE EMBEDDER AT ALL.
@@ -4384,7 +4384,7 @@ async function fold(event) {
     // this used to say "AF3 only: AF2's drivers take a template through a
     // different path and nothing on this page builds one for them yet", and
     // the reason was that monomer.js never forwarded the slot. It does now.
-    // The MULTIMER is still refused upstream, in chosenFamily's guard.
+    // And for the MULTIMER, one slot over the complex.
     const templateSources = [];
     for (const template of request.templates ?? []) {
       const kind = templateKind(template);
@@ -4648,27 +4648,38 @@ async function fold(event) {
     // See test/template-atom37-layout.test.js.
     let af2Template;
     if (templateSources.length > 0) {
-      // 🔴 REFUSED RATHER THAN DROPPED. `?graph=unified` runs the MULTIMER's
-      // graph over a monomer, and that embedder is a different dialect nothing
-      // here builds a slot for - so folding on would quietly ignore it, which
-      // is the failure this whole path exists to avoid.
-      if (unified) {
-        // ...and it names which of the two it is, because a session restored
-        // from a job that set both reaches here without passing chosenFamily's
-        // guard, and "drop ?graph=unified" is not advice a multimer can take.
-        throw new Error(multimer
-          ? "AlphaFold 2 multimer's template embedder is a different dialect"
-            + " and this page does not build a slot for it"
-          : "the unified graph has no monomer template embedder;"
-            + " drop ?graph=unified to fold with a template");
+      // 🔴 REFUSED RATHER THAN DROPPED. `?graph=unified` over a MONOMER family
+      // runs the multimer's graph with the monomer's weights, which have no
+      // multimer template embedder - so folding on would quietly ignore it.
+      if (unified && !multimer) {
+        throw new Error("the unified graph has no monomer template embedder;"
+          + " drop ?graph=unified to fold with a template");
       }
-      const source = templateSources[0];
-      status(`Aligning template ${source.source ?? ""}`);
-      af2Template = buildTemplate({
-        text: source.text, chain: source.chainId, query: sequence,
-        tokens: sequence.length, minConfidence: source.minConfidence ?? 0,
-        layout: "atom37",
-      });
+      // 🔴 THE MULTIMER TAKES ONE atom37 SLOT OVER THE WHOLE COMPLEX, each
+      // templated chain written at its own residue offset and the rest left as
+      // gap - which is what AlphaFold's multimer pipeline builds too, one
+      // template per chain concatenated along the residue axis. asymId masks
+      // what crosses chains, so two chains templated from two files never
+      // claim to know their relative placement. The monomer is one chain at
+      // offset zero, so it is the same loop.
+      const offsets = chainLengths.map((_, at) => chainLengths.slice(0, at).reduce((a, b) => a + b, 0));
+      const seen = new Set();
+      const built = [];
+      for (const source of templateSources) {
+        const at = multimer ? source.chain ?? 0 : 0;
+        if (seen.has(at)) {
+          throw new Error(`AlphaFold 2 takes one template a chain; chain ${at + 1} has two`);
+        }
+        seen.add(at);
+        status(`Aligning template ${source.source ?? ""}`);
+        built.push(buildTemplate({
+          text: source.text, chain: source.chainId,
+          query: multimer ? chains[at] : sequence, offset: multimer ? offsets[at] : 0,
+          tokens: sequence.length, minConfidence: source.minConfidence ?? 0,
+          layout: "atom37",
+        }));
+      }
+      af2Template = built.length === 1 ? built[0] : mergeAtom37Templates(built, sequence.length);
       throwIfAborted(signal);
     }
 
@@ -4682,7 +4693,8 @@ async function fold(event) {
       // ...the SOURCE rather than the slot: the slot is megabytes of float and
       // the text plus the chain is what decides every one of them.
       template: af2Template === undefined ? null
-        : cheapHash(`${templateSources[0].text}\u0000${templateSources[0].chainId ?? ""}`),
+        : cheapHash(templateSources.map((source) =>
+          `${source.chain ?? ""}\u0000${source.text}\u0000${source.chainId ?? ""}`).join("\u0001")),
     });
     // 🔴 AND A SWEEP IS NEVER A CONTINUATION. The cache holds ONE model's trunk
     // under a key naming that model, so resuming a five-model run would replay
@@ -5215,12 +5227,14 @@ async function fold(event) {
     // the only thing on screen that says one arrived.
     let templateText = "";
     if (af2Template !== undefined) {
-      const source = templateSources[0];
-      if (source.origin !== undefined) {
-        source.origin.status = describeCoverage(af2Template.coverage);
-      }
-      templateText = ` · template ${source.source ?? ""}`
-        + ` ${af2Template.coverage.residues}/${af2Template.coverage.of}`;
+      // One entry a templated chain; the monomer is the one-part case.
+      const parts = af2Template.parts ?? [af2Template];
+      parts.forEach((part, index) => {
+        const source = templateSources[index];
+        if (source.origin !== undefined) source.origin.status = describeCoverage(part.coverage);
+        templateText += ` · template ${source.source ?? ""}`
+          + ` ${part.coverage.residues}/${part.coverage.of}`;
+      });
     }
     status(`${foldWasReplayed ? "Already folded · shown from memory"
       : `Done in ${took} s`} · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`

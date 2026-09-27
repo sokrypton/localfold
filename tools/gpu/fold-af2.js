@@ -136,6 +136,19 @@ function summariseStages(marks, started) {
   }));
 }
 
+// One chain, or a comma list of them read in order and concatenated - the
+// residue axis a multimer folds over.
+function complexResidues(text, spec) {
+  const names = spec === undefined ? [undefined] : spec.split(",");
+  if (names.length === 1) return chainResidues(text, names[0]);
+  const parts = names.map((name) => chainResidues(text, name));
+  return {
+    residues: parts.flatMap((part) => part.residues),
+    sequence: parts.map((part) => part.sequence).join(""),
+    chainLengths: parts.map((part) => part.residues.length),
+  };
+}
+
 export async function main(device, args) {
   // 🔴 A CEILING, SO THE RESIDENCY FALLBACK CAN BE MADE TO FIRE. AF2 keeps its
   // block weights on the device now - 280 MiB of a 387 MiB fold at 59 residues
@@ -171,7 +184,7 @@ export async function main(device, args) {
   let targetStructure;
   if (targetName !== "") {
     const text = await (await fetch(`/tools/fixtures/${targetName}-crystal.pdb`)).text();
-    targetStructure = chainResidues(text, targetChain);
+    targetStructure = complexResidues(text, targetChain);
   }
   const sequence = option(args, "sequence",
     targetStructure?.sequence ?? DEFAULT_SEQUENCE);
@@ -185,7 +198,9 @@ export async function main(device, args) {
       + ` one of ${Object.keys(MODEL_BUNDLES)
         .filter((name) => ["monomer", "multimer"].includes(graphFamily(name))).join(", ")}`);
   }
-  const chainLengths = option(args, "chains", "").split(",").filter(Boolean).map(Number);
+  // `--chain=A,D` on a target names a complex, whose chain lengths it states.
+  const chainLengths = option(args, "chains", targetStructure?.chainLengths?.length > 1
+    ? targetStructure.chainLengths.join(",") : "").split(",").filter(Boolean).map(Number);
   const rows = Number(option(args, "rows", "128"));
   // 🔴 AF2's TWO STACKS HAVE TWO DEPTHS AND THIS TOOL CONFLATED THEM. The
   // monomer runs an EXTRA-MSA stack and then the main evoformer, and AlphaFold's
@@ -398,7 +413,9 @@ export async function main(device, args) {
   if (templateSpec !== "") {
     const [path, wantedChain] = templateSpec.split(":");
     const text = await (await fetch(path.startsWith("/") ? path : `/${path}`)).text();
-    const structure = chainResidues(text, wantedChain);
+    // `path:A,D` concatenates chains, which is a multimer's template: one
+    // atom37 slot over the whole complex, with asymId masking what crosses.
+    const structure = complexResidues(text, wantedChain);
     if (structure.residues.length === 0) {
       throw new Error(`--template=${templateSpec} resolved no residues`);
     }

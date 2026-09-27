@@ -24,7 +24,7 @@
  */
 import { alignPositions } from "./align.js";
 import {
-  chainResidues, filterByConfidence, identityMap, templateSlot, templateSlotAtom37,
+  GAP_AATYPE, chainResidues, filterByConfidence, identityMap, templateSlot, templateSlotAtom37,
 } from "../src/af3/featurise/template-input.js";
 import { ONE_LETTER } from "../src/af3/fold.js";
 import { parseCIFAtoms } from "../src/design/mpnn/pdb.js";
@@ -278,4 +278,38 @@ export function describeCoverage(coverage) {
   // that still produces a template.
   if (coverage.aligned) parts.push("aligned to the sequence you typed");
   return parts.join(" · ");
+}
+
+/**
+ * AlphaFold 2 multimer's one template slot, from per-chain atom37 slots that
+ * `buildTemplate` wrote at each chain's offset over the same token axis.
+ *
+ * The chains are disjoint by construction, so a token is taken from whichever
+ * slot covers it; the rest stay gap and masked, as each slot already is.
+ *
+ * @param {{slot: object, coverage: object}[]} built
+ * @param {number} tokens
+ */
+export function mergeAtom37Templates(built, tokens) {
+  const slots = 37;
+  const aatype = new Int32Array(tokens).fill(GAP_AATYPE);
+  const atomPositions = new Float32Array(tokens * slots * 3);
+  const atomMask = new Float32Array(tokens * slots);
+  for (const { slot } of built) {
+    for (let token = 0; token < tokens; token += 1) {
+      if (slot.aatype[token] === GAP_AATYPE) continue;
+      if (aatype[token] !== GAP_AATYPE) throw new Error(`two templates cover token ${token}`);
+      aatype[token] = slot.aatype[token];
+      atomMask.set(slot.atomMask.subarray(token * slots, (token + 1) * slots), token * slots);
+      atomPositions.set(slot.atomPositions.subarray(token * slots * 3, (token + 1) * slots * 3),
+                        token * slots * 3);
+    }
+  }
+  const covered = built.reduce((sum, part) => sum + part.slot.covered, 0);
+  const atoms = built.reduce((sum, part) => sum + part.slot.atoms, 0);
+  return {
+    slot: { aatype, atomPositions, atomMask, covered, atoms, spanChains: false },
+    coverage: { residues: covered, of: tokens, atoms },
+    parts: built,
+  };
 }
