@@ -3106,3 +3106,53 @@ uppercase a contact on screen the way it would a SMILES.
 which expands to the linker as a LIGAND plus two bonds - fits this row exactly
 (`DSSO A53 - C66`), and the parser leaves room for it, but it needs a table of
 linker codes and the atoms each attaches by. That is the next piece.
+## A second backend on the Colab runtime: JAX (af3-any-model), and the TPU it reaches
+
+The notebook's `jax_backend` box installs ColabFold2's JAX implementation beside
+LocalFold's own - by running ColabFold2's OWN install cell headless into
+`/content/jax` (it owns the CUDA and TPU pins), not a copy of it - and starts
+the service with `--jax-dir`. The reader's Colab badge then offers **WebGPU /
+JAX**. WebGPU is this page's fold on the runtime's card; JAX is
+`sokrypton/alphafold3` (af3-any-model), the implementation the port is checked
+against, and the only one a TPU runtime can run: WebGPU reaches hardware only
+through a Vulkan/Metal/D3D12 driver, and a TPU has none.
+
+**The seam is the bridge, not the fold.** `tools/jax_worker.py` is one
+long-lived process (a model is minutes of compile, so its weights and JAX's
+compile cache are kept) that takes a job a line on stdin and prints the bridge's
+own events on stdout - `status`, `progress`, `frame`, `result` - so the reader
+follows a JAX fold with the loop that follows a WebGPU one. The job is the
+page's own AlphaFold 3 JSON (`jobInputJson`, the open dialect, as ONE object:
+that reader takes a list to mean the server dialect, and takes the server
+dialect only at version 1), so the entity conversion is not re-implemented in
+Python. The result is AF3's own per-token pLDDT, PAE, contact probabilities,
+token layout and the alignment used; the reader builds its prediction from them
+(`jaxPrediction` in web/app.js) and records it, so the scores card, the archive
+download and the saved session behave as they do for a local fold.
+
+What reaches it from the page: the model (resolved - the PLM row's ESMFold2
+size, AF2's model number, which the page folds into the family name as
+`monomer-2`), recycles, steps, MSA depth, seed, and the MSA row - none, search
+(the worker asks the ColabFold MMseqs2 server itself), paste, or an upload,
+which travels with the job. What is REFUSED with a message rather than
+approximated: a template, the Flow sampler (JAX samples by diffusion), one
+alignment for several protein chains, and AlphaFold 3 without DeepMind's
+parameters on the runtime.
+
+🔴 Three things that cost a run each:
+- **The library prints to stdout**, so events have a private copy of fd 1 and
+  fd 1 itself goes to stderr - and that copy does not survive `exec`: the
+  worker re-execs itself when a job names a ligand code it has not fetched
+  (the CCD tables are read at import), and until fd 1 was put back on the pipe
+  first, the restarted worker folded on, printing its events to stderr, while
+  the broker saw the pipe close.
+- **A protein chain must carry `templates: []`** even when the alignment is
+  searched: the MMseqs2 fill supplies alignments only.
+- **Stop kills the worker** - JAX cannot be interrupted mid-computation - and
+  the next JAX fold starts a new one and recompiles. `test:colab` holds that
+  with a stub worker (`LOCALFOLD_JAX_WORKER`), watched failing with the kill
+  removed.
+
+Measured through the real reader page (openbind0, 68 residues): a T4 31-99 s
+for a model's first fold (compile) and 4 s after; an L4 130 s then ~1 s; a
+Colab TPU v5e 44 s cold, pLDDT 84.9, every frame streamed to the reader.
