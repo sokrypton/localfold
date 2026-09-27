@@ -3949,7 +3949,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
       request.msas = uploadedMsas?.chains > 0
         ? { unpaired: uploadedMsas.chainA3ms,
             paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index) ?? "") }
-        : { merged: uploadedMsas?.merged ?? document.getElementById("msa-text")?.value ?? "" };
+        : { merged: uploadedMsas?.merged ?? uploadedA3m };
     }
   }
   status(`${label} · folding on the runtime${request.backend === "jax" ? " with JAX" : ""}…`);
