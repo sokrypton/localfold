@@ -3232,3 +3232,27 @@ notebook's install overlays, so a new runtime has them:
   job's tar already carries, and `fetch_template(name)` a hit's mmCIF from
   ColabFold's template endpoint - which is what the worker uses, rather than
   reading the tar on its way through the library.
+
+### A fourth pass: Flow on JAX, and a compile cache that outlives the runtime (an L4, 2026-09-27)
+
+The page's **Flow** sampler runs on the JAX backend now: sokrypton/alphafold3
+gained the same walk (31bb0bf - `SampleConfig.flow`: one draw at sigma_max 10,
+then the prediction replaces the state, no augmentation and no noise), and the
+worker sets it from the sampler row. rosettafold3 refuses it with the page's own
+reason (`noFlowSampler`). 6MRR, CA-RMSD to the crystal:
+
+| | diffusion (JAX) | flow (JAX) | flow (WebGPU) |
+|---|---:|---:|---:|
+| openbind0 | 1.72 A | 1.74 A | 1.82 A |
+| boltz2 | 0.57 A | 0.54 A | - |
+
+The notebook's `jax_cache_to_drive` box mounts Drive and points the worker's
+compile cache there (`LOCALFOLD_JAX_CACHE`), which is ColabFold2's own
+`persist_cache_to_drive` for the same reason: a model's first fold is a minute
+or two of compile, and a new runtime starts without the cache. Not measured
+here - the mount needs an interactive Drive consent.
+
+What the JAX backend now refuses: templates on AF2's multimer and ESMFold2
+(WebGPU refuses them too), AF2 models 3-5 with a template, rosettafold3 with
+Flow. Nothing else. A TPU re-run of this pass could not be allocated (two
+allocation timeouts); the previous pass's TPU run folded end to end.
