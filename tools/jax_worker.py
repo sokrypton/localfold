@@ -153,6 +153,160 @@ class Refused(Exception):
     """A job this backend does not run, said as such rather than approximated."""
 
 
+AF3_WEIGHTS_URL = "https://storage.googleapis.com/alphafold3/af3.bin.zst"
+RCSB = "https://files.rcsb.org/download"
+AFDB_API = "https://alphafold.ebi.ac.uk/api/prediction"
+
+
+def fetch_text(url):
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=60) as answer:
+        return answer.read().decode()
+
+
+def split_merged(a3m, lengths):
+    """One A3M over several chains, as one A3M a chain.
+
+    The page's merged alignment runs the protein chains end to end in the
+    query row; an uppercase letter or `-` is a column, a lowercase letter an
+    insertion kept with the column before it. A row that has only gaps over a
+    chain says nothing about it and is left out of that chain's alignment.
+    """
+    bounds = [sum(lengths[:i]) for i in range(len(lengths) + 1)]
+    out = [[] for _ in lengths]
+    header = None
+    for line in a3m.splitlines():
+        if line.startswith(">"):
+            header = line
+            continue
+        if header is None or not line.strip():
+            continue
+        pieces = ["" for _ in lengths]
+        column = 0
+        for char in line.strip():
+            if char.islower():
+                chain = max(0, next(i for i in range(len(lengths)) if column <= bounds[i + 1]) )
+                pieces[min(chain, len(lengths) - 1)] += char
+                continue
+            chain = next((i for i in range(len(lengths)) if column < bounds[i + 1]), None)
+            if chain is None:
+                break
+            pieces[chain] += char
+            column += 1
+        for chain, piece in enumerate(pieces):
+            if any(c.isupper() for c in piece) or not out[chain]:
+                out[chain].append(f"{header}\n{piece}")
+        header = None
+    return ["\n".join(rows) + "\n" for rows in out]
+
+
+def align(query, target):
+    """A global alignment, 0-based query index -> target index, identity-scored,
+    aligned mismatches included (they are template residues all the same).
+
+    The page lines a template up with its chain the same way (web/align.js):
+    a construct with a tag shifts every residue, and pairing index for index
+    across the shift would swing the whole template.
+    """
+    n, m = len(query), len(target)
+    gap = -2
+    score = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        score[i][0] = i * gap
+    for j in range(1, m + 1):
+        score[0][j] = j * gap
+    for i in range(1, n + 1):
+        row, previous = score[i], score[i - 1]
+        qi = query[i - 1]
+        for j in range(1, m + 1):
+            row[j] = max(previous[j - 1] + (2 if qi == target[j - 1] else -1),
+                         previous[j] + gap, row[j - 1] + gap)
+    pairs, i, j = {}, n, m
+    while i > 0 and j > 0:
+        if score[i][j] == score[i - 1][j - 1] + (2 if query[i - 1] == target[j - 1] else -1):
+            pairs[i - 1] = j - 1
+            i, j = i - 1, j - 1
+        elif score[i][j] == score[i - 1][j] + gap:
+            i -= 1
+        else:
+            j -= 1
+    return dict(sorted(pairs.items()))
+
+
+def pdb_to_cif(pdb, name):
+    """A PDB file's ATOM/HETATM records as the smallest mmCIF alphafold3 reads."""
+    lines = [f"data_{name}", "#",
+             "_pdbx_audit_revision_history.revision_date 1970-01-01", "#",
+             "loop_"]
+    fields = ["group_PDB", "id", "type_symbol", "label_atom_id", "label_alt_id",
+              "label_comp_id", "label_asym_id", "label_entity_id", "label_seq_id",
+              "pdbx_PDB_ins_code", "Cartn_x", "Cartn_y", "Cartn_z", "occupancy",
+              "B_iso_or_equiv", "auth_seq_id", "auth_asym_id", "pdbx_PDB_model_num"]
+    lines += [f"_atom_site.{field}" for field in fields]
+    serial = 0
+    for record in pdb.splitlines():
+        if record.startswith("ENDMDL"):
+            break
+        if not record.startswith(("ATOM", "HETATM")):
+            continue
+        serial += 1
+        chain = record[21].strip() or "A"
+        element = record[76:78].strip() or record[12:16].strip()[0]
+        lines.append(" ".join([
+            record[:6].strip(), str(serial), element, record[12:16].strip(),
+            record[16].strip() or ".", record[17:20].strip(), chain, "1",
+            record[22:26].strip(), record[26].strip() or "?",
+            record[30:38].strip(), record[38:46].strip(), record[46:54].strip(),
+            record[54:60].strip() or "1.0", record[60:66].strip() or "0.0",
+            record[22:26].strip(), chain, "1"]))
+    return "\n".join(lines) + "\n#\n"
+
+
+def template_entry(template, query):
+    """One of the page's template rows as AlphaFold 3's own template input."""
+    import datetime
+    from alphafold3 import structure
+    kind = template.get("kind")
+    source = (template.get("source") or "").strip()
+    if kind == "search":
+        raise Refused("templates from the MSA search are not wired to the JAX backend yet -"
+                      " name a PDB entry or upload one, or fold with WebGPU")
+    if kind == "pdb":
+        entry, _, chain = source.replace(":", "_").partition("_")
+        cif = fetch_text(f"{RCSB}/{entry.upper()}.cif")
+        name = entry.upper()
+    elif kind == "afdb":
+        entry, _, chain = source.replace(":", "_").partition("_")
+        listing = json.loads(fetch_text(f"{AFDB_API}/{entry.upper()}"))
+        cif = fetch_text(listing[0]["cifUrl"])
+        name = entry.upper()
+    elif kind == "upload":
+        text = template.get("text") or ""
+        chain = source
+        name = "upload"
+        cif = text if ("_atom_site." in text) else pdb_to_cif(text, name)
+    else:
+        raise Refused(f"the JAX backend does not know the template source {kind!r}")
+    struc = structure.from_mmcif(cif, fix_mse_residues=True, fix_arginines=True,
+                                 include_bonds=False, include_water=False)
+    chains = list(struc.polymer_auth_asym_id_to_label_asym_id())
+    if not chains:
+        raise Refused(f"the template {name} has no polymer chain")
+    chain = chain or chains[0]
+    if chain not in chains:
+        raise Refused(f"the template {name} has no chain {chain} (it has {', '.join(chains)})")
+    struc = struc.filter(chain_auth_asym_id=chain)
+    if struc.release_date is None or struc.name is None:
+        struc = struc.copy_and_update_globals(
+            name=struc.name or name, release_date=struc.release_date or datetime.date(1970, 1, 1))
+    label = struc.polymer_auth_asym_id_to_label_asym_id()[chain]
+    mapping = align(query, struc.chain_single_letter_sequence()[label])
+    if not mapping:
+        raise Refused(f"the template {name}_{chain} shares no residue with its chain")
+    return {"mmcif": struc.to_mmcif(), "queryIndices": list(mapping),
+            "templateIndices": list(mapping.values())}, len(mapping)
+
+
 class Worker:
     """Imports once, keeps one model's runner, folds a job at a time."""
 
@@ -201,7 +355,7 @@ class Worker:
                 num_recycles=settings["recycles"] or 3,
                 num_msa=settings["msa"], num_extra_msa=settings["msa"] * 2,
                 model_names=[AF2_NAMES[model].format(settings["af2_model"])],
-                use_templates=False)
+                use_templates=settings["templates"])
             config = None
         else:
             extra = {"num_recycles": settings["recycles"]} if settings["recycles"] else {}
@@ -216,15 +370,35 @@ class Worker:
             if model == "alphafold3":
                 directory = "af3_native_weights"
                 if not glob.glob(f"{directory}/*.bin.zst"):
-                    raise Refused(
-                        "AlphaFold 3's parameters are not on this runtime - they come"
-                        " from DeepMind under their own terms. Run ColabFold2's install"
-                        " cell with model = alphafold3, or pick another model")
+                    # 🔴 FETCHED HERE, AFTER THE PAGE'S OWN TERMS DIALOG. The reader
+                    # cannot send an AlphaFold 3 fold without accepting DeepMind's
+                    # terms (agreeModelTerms in web/app.js); this is the same file
+                    # ColabFold2's install cell fetches for model = alphafold3.
+                    self.download_af3(directory)
             else:
                 directory = weights.ensure_weights(model, None, precision="int8")
             built = self.RA.ModelRunner(config=config, device=device, model_dir=directory)
         self.runners = {key: (built, config)}
         return built, config
+
+    @staticmethod
+    def download_af3(directory):
+        import urllib.request
+        os.makedirs(directory, exist_ok=True)
+        partial = os.path.join(directory, "af3.bin.zst.part")
+        with urllib.request.urlopen(AF3_WEIGHTS_URL, timeout=60) as answer, open(partial, "wb") as out:
+            total = int(answer.headers.get("Content-Length") or 0)
+            done, said = 0, 0
+            while chunk := answer.read(1 << 22):
+                out.write(chunk)
+                done += len(chunk)
+                if done - said > (64 << 20):
+                    said = done
+                    emit("status", "downloading AlphaFold 3's parameters"
+                                   f" · {done >> 20} of {total >> 20} MiB")
+        if done < 1_000_000:
+            raise RuntimeError("the AlphaFold 3 download is incomplete")
+        os.replace(partial, os.path.join(directory, "af3.bin.zst"))
 
     def fold(self, job):
         import numpy as np
@@ -247,15 +421,23 @@ class Worker:
         if not af2 and controls.get("af3-mode", "diffusion") != "diffusion":
             raise Refused("the JAX backend samples with diffusion only - set the sampler"
                           " to Diffusion, or fold with WebGPU for Flow")
-        if any((entity.get("template") or {}).get("kind", "none") != "none"
-               for entity in job.get("entities", [])):
-            raise Refused("templates are not wired to the JAX backend yet - remove the"
-                          " template, or fold with WebGPU")
+        templated = [entity for entity in job.get("entities", [])
+                     if entity.get("type") == "protein"
+                     and (entity.get("template") or {}).get("kind", "none") != "none"]
+        if templated and single_sequence:
+            raise Refused("ESMFold2 takes no template")
+        if templated and model == "af2_multimer":
+            raise Refused("AlphaFold 2 multimer's template term is not wired - fold the"
+                          " monomer, or drop the template")
         depth = str(controls.get("max-msa") or "512:1024").split(":")[0]
         settings = {"recycles": int(controls.get("recycles") or 0),
                     "steps": int(controls.get("af3-count") or 0),
                     "msa": int(depth) if depth.isdigit() else 512,
-                    "af2_model": int(controls.get("af2Model") or 1)}
+                    "af2_model": int(controls.get("af2Model") or 1),
+                    "templates": bool(templated)}
+        if templated and af2 and settings["af2_model"] not in (1, 2):
+            raise Refused("AlphaFold 2's models 3, 4 and 5 have no template embedder -"
+                          " pick model 1 or 2, or drop the template")
         emit("status", f"{model} on JAX ({self.device}) · reading the job")
         work = os.path.abspath("jax_jobs")
         shutil.rmtree(work, ignore_errors=True)
@@ -263,6 +445,19 @@ class Worker:
         spec = json.loads(job["job"])
         mode = "none" if single_sequence else controls.get("msa-mode", "none")
         self.apply_alignment(spec, mode, controls, job.get("msas"))
+        # ...and each protein row's template, onto the protein entry it wrote.
+        proteins = [entry["protein"] for entry in spec.get("sequences", []) if "protein" in entry]
+        rows = [entity for entity in job.get("entities", [])
+                if entity.get("type") == "protein" and (entity.get("value") or "").strip()]
+        for entity, protein in zip(rows, proteins):
+            template = entity.get("template") or {}
+            if template.get("kind", "none") == "none":
+                continue
+            emit("status", f"{model} on JAX · fetching template {template.get('source') or 'upload'}")
+            entry, covered = template_entry(template, protein["sequence"])
+            protein["templates"] = [entry]
+            emit("status", f"{model} on JAX · template covers {covered} of"
+                           f" {len(protein['sequence'])} residues")
         path = os.path.join(work, "job.json")
         with open(path, "w") as handle:
             json.dump(spec, handle)
@@ -359,11 +554,9 @@ class Worker:
         for rna in rnas:
             rna.setdefault("unpairedMsa", "")
         if msas.get("merged"):
-            if len(proteins) != 1:
-                raise Refused("one alignment for several protein chains cannot be split"
-                              " for the JAX backend - upload per-chain alignments, search,"
-                              " or fold with WebGPU")
-            proteins[0].update(unpairedMsa=msas["merged"], pairedMsa="")
+            pieces = split_merged(msas["merged"], [len(p["sequence"]) for p in proteins])
+            for protein, piece in zip(proteins, pieces):
+                protein.update(unpairedMsa=piece, pairedMsa="")
             return
         unpaired = msas.get("unpaired") or []
         paired = msas.get("paired") or []
