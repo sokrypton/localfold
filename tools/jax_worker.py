@@ -224,6 +224,13 @@ class Worker:
         import live_frames as LF
         controls = job.get("controls", {})
         family = job.get("family") or controls.get("model-family", "af3")
+        # 🔴 AF2's FAMILY CARRIES ITS MODEL NUMBER: the page resolves the
+        # number box into the name - `monomer-2`, `multimer-5` - because it is
+        # which of five bundles loads. It is which of five parameter sets here.
+        base, _, number = family.partition("-")
+        if base in ("monomer", "multimer") and number.isdigit():
+            family = base
+            controls = {**controls, "af2Model": number}
         model = MODELS.get(family)
         if model is None:
             raise Refused(f"the JAX backend does not know the model {family!r}")
@@ -310,7 +317,8 @@ class Worker:
         finally:
             self.RA._FRAME_CALLBACK[0] = None
             runner.run_inference = original
-        return self.collect(work, model, time.time() - started, fold_input)
+        return self.collect(work, model, time.time() - started, fold_input,
+                            job.get("family") or controls.get("model-family"))
 
     @staticmethod
     def apply_alignment(spec, mode, controls, msas):
@@ -353,7 +361,7 @@ class Worker:
             protein.update(unpairedMsa=unpaired[index] if index < len(unpaired) else "",
                            pairedMsa=(paired[index] if index < len(paired) else "") or "")
 
-    def collect(self, work, model, seconds, fold_input):
+    def collect(self, work, model, seconds, fold_input, job_family=None):
         """The top-ranked sample, as the page's own prediction fields."""
         from alphafold3.common import folding_input
         cif_path = sorted(glob.glob(f"{work}/**/*_model.cif", recursive=True), key=len)[0]
@@ -391,7 +399,7 @@ class Worker:
         msas = {"unpaired": unpaired, "paired": paired} if any(unpaired) else {}
         mean = confidence["meanPlddt"]
         return {
-            "jax": True, "model": model,
+            "jax": True, "model": model, "family": job_family,
             "pdb": cif_to_pdb(cif), "confidence": confidence,
             "tokens": {"chainIds": chain_ids, "resIds": res_ids},
             "chains": chains, "msas": msas,
@@ -471,6 +479,12 @@ def main():
                     handle.write(line)
                 os.environ["LOCALFOLD_JAX_CODES"] = json.dumps(sorted(codes | fetched))
                 emit("status", f"restarting JAX for {', '.join(sorted(codes - fetched))}")
+                # 🔴 fd 1 BACK ON THE PIPE FIRST. This process pointed it at
+                # stderr and keeps events on a private copy, which does not
+                # survive exec - so the new process would write its events to
+                # stderr and the broker would see the pipe close.
+                OUT.flush()
+                os.dup2(OUT.fileno(), 1)
                 os.execv(sys.executable, [sys.executable, os.path.abspath(__file__),
                                           "--pending", path])
             if worker is None:

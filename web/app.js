@@ -4156,7 +4156,8 @@ function jaxPrediction(result, stem, label) {
   };
   const chains = result.chains ?? [];
   const { entities, controls } = formInputs();
-  const family = controls["model-family"] === "ef2" ? chosenFamily() : (controls["model-family"] ?? "af3");
+  // ...the family the worker folded, which the request named RESOLVED.
+  const family = result.family ?? chosenFamily();
   const mode = controls["msa-mode"] ?? "none";
   return {
     stem,
