@@ -377,6 +377,8 @@ class Worker:
             if settings["msa"] and hasattr(config, "evoformer"):
                 config.evoformer.num_msa = settings["msa"]
             config.heads.diffusion.eval.stepwise = True
+            # LocalFold's Flow, which sokrypton/alphafold3's sampler carries too.
+            config.heads.diffusion.eval.flow = settings["flow"]
             if model == "alphafold3":
                 directory = "af3_native_weights"
                 if not glob.glob(f"{directory}/*.bin.zst"):
@@ -428,9 +430,16 @@ class Worker:
             raise Refused(f"the JAX backend does not know the model {family!r}")
         af2 = model in AF2_NAMES
         single_sequence = model.startswith("esmfold2")
-        if not af2 and controls.get("af3-mode", "diffusion") != "diffusion":
-            raise Refused("the JAX backend samples with diffusion only - set the sampler"
-                          " to Diffusion, or fold with WebGPU for Flow")
+        sampler = controls.get("af3-mode", "diffusion")
+        if af2 or single_sequence:
+            sampler = "diffusion"   # the row is hidden for these; their own samplers run
+        if sampler not in ("diffusion", "flow"):
+            raise Refused(f"the JAX backend does not know the sampler {sampler!r}")
+        if sampler == "flow" and model == "rosettafold3":
+            # ...the page's own rule: its walk collapses the backbone while pLDDT
+            # reads as if nothing were wrong (noFlowSampler, src/af3/dialect.js).
+            raise Refused("rosettafold3 has no working flow sampler - set the sampler to"
+                          " Diffusion")
         templated = [entity for entity in job.get("entities", [])
                      if entity.get("type") == "protein"
                      and (entity.get("template") or {}).get("kind", "none") != "none"]
@@ -444,6 +453,7 @@ class Worker:
                     "steps": int(controls.get("af3-count") or 0),
                     "msa": int(depth) if depth.isdigit() else 512,
                     "af2_model": int(controls.get("af2Model") or 1),
+                    "flow": sampler == "flow",
                     "templates": bool(templated)}
         if templated and af2 and settings["af2_model"] not in (1, 2):
             raise Refused("AlphaFold 2's models 3, 4 and 5 have no template embedder -"
