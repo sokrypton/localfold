@@ -4150,6 +4150,10 @@ function jaxPrediction(result, stem, label) {
   const given = result.confidence ?? {};
   const confidence = {
     ...given,
+    // 🔴 NaN, NOT ABSENT, FOR A FOLD WITH NO INTERFACE - which is what the AF3
+    // path records and what the scores card reads as "-". Absent, the card kept
+    // the LAST fold's ipTM: a monomer after a complex read "ipTM 0.51".
+    iptm: given.iptm ?? Number.NaN,
     plddt: floats(given.plddt),
     predictedAlignedError: floats(given.predictedAlignedError),
     contactProbs: floats(given.contactProbs),

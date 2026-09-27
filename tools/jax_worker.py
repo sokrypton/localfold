@@ -57,6 +57,13 @@ def emit(kind, payload):
 
 
 AF2_NAMES = {"af2_ptm": "model_{}_ptm", "af2_multimer": "model_{}_multimer_v3"}
+# 🔴 FOLDED WITHOUT LIVE FRAMES: af3-any-model's stepwise path fails on a
+# structural-token model - `--stepwise_recycles` dies with KeyError 'init' in
+# staged.py, and stepwise diffusion with a (68, 24) mask against (160, 24, 3)
+# positions in random_augmentation - while its plain path folds the same job
+# (run_alphafold.py --model=opendde, 109 s on an L4). Measured 2026-09-27 on the
+# colab branch; the status line says so rather than leaving the bar still.
+NO_LIVE = {"opendde"}
 AF2_DIR = "af2_params"
 
 
@@ -184,6 +191,7 @@ class Worker:
         device = self.jax.local_devices()[0]
         self.flags.FLAGS.model = model
         self.flags.FLAGS.use_esm_embeddings = model.startswith("esmfold2")
+        self.flags.FLAGS.stepwise_recycles = model not in NO_LIVE
         if model in AF2_NAMES:
             from alphafold3.af2 import inference as af2_inference
             from alphafold3.model import model_registry
@@ -204,7 +212,7 @@ class Worker:
                 config.heads.diffusion.eval.steps = settings["steps"]
             if settings["msa"] and hasattr(config, "evoformer"):
                 config.evoformer.num_msa = settings["msa"]
-            config.heads.diffusion.eval.stepwise = True
+            config.heads.diffusion.eval.stepwise = model not in NO_LIVE
             if model == "alphafold3":
                 directory = "af3_native_weights"
                 if not glob.glob(f"{directory}/*.bin.zst"):
@@ -307,7 +315,11 @@ class Worker:
                 if batch[0] is None:
                     batch[0] = LF.as_batch(featurised)
                 return original(featurised, *args, **kwargs)
-            self.RA._FRAME_CALLBACK[0] = on_frame
+            if model in NO_LIVE:
+                emit("status", f"{model} on JAX · folding (this model has no live frames on"
+                               " JAX - the structure arrives at the end)")
+            else:
+                self.RA._FRAME_CALLBACK[0] = on_frame
         runner.run_inference = run_inference
         started = time.time()
         try:
