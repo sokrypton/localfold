@@ -3935,8 +3935,22 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // this page's and not re-implemented in Python. See tools/jax_worker.py.
   if (remoteBackendChoice() === "jax") {
     request.backend = "jax";
+    // ...the RESOLVED model, which is not the row's value where a second row
+    // picks it: the PLM row turns "ef2" into the 600M or 300M checkpoint.
+    request.family = family;
     request.job = jobInputJson({ name: safeJobName(entityList.header() ?? "fold"),
       seed: Number(controls["random-seed"]) || 1, entities });
+    // ...and an uploaded alignment travels with the job, because the worker is
+    // on the other machine and the file is on this one. A pasted one is in
+    // `controls["msa-text"]` already; a searched one the worker fetches itself.
+    // An archive holds one alignment a chain and a Map of paired ones, which
+    // JSON cannot carry; a bare a3m is the text in the box.
+    if (msaMode() === "upload") {
+      request.msas = uploadedMsas?.chains > 0
+        ? { unpaired: uploadedMsas.chainA3ms,
+            paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index) ?? "") }
+        : { merged: uploadedMsas?.merged ?? document.getElementById("msa-text")?.value ?? "" };
+    }
   }
   status(`${label} · folding on the runtime${request.backend === "jax" ? " with JAX" : ""}…`);
   progress("waiting");
@@ -4048,6 +4062,14 @@ async function followRemoteFold({ since, label, signal }) {
   }
   if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);
 
+  // 🔴 A JAX FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
+  // PREDICTION - there is no copy of this page on the other side to build one.
+  // So it is built here, in the shape the AF3 path records (typed arrays, a
+  // token layout, the context the archive and the session read), and it goes
+  // through the same doors: loadIntoViewer for the picture, recordPrediction
+  // for the downloads, the scores card and the saved session.
+  const jax = result.jax === true ? jaxPrediction(result, stem, label) : null;
+
   // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
   // fills the sequence strip, the download buttons and the scores card - the
   // streamed frames are a picture and not an ingestion. It CLEARS the object's
@@ -4064,9 +4086,9 @@ async function followRemoteFold({ since, label, signal }) {
   // nothing but coordinates, because it had been given nothing else.
   await loadIntoViewer({
     stem, pdb: framePdbs[0] ?? result.pdb,
-    scores: result.scores ?? {},
-    a3m: result.a3m,
-    confidence: result.confidence,
+    scores: jax?.scores ?? result.scores ?? {},
+    a3m: result.a3m ?? undefined,
+    confidence: jax?.confidence ?? result.confidence,
     length: result.length,
   });
   if (viewer !== undefined && Object.keys(camera).length > 0) {
@@ -4094,7 +4116,10 @@ async function followRemoteFold({ since, label, signal }) {
   // without a word. The runtime sends its whole prediction object and it is
   // registered here under THIS page's stem, which is the name the viewer knows
   // the object by and therefore the one `activePrediction` looks up.
-  if (result.predJson) {
+  if (jax !== null) {
+    recordPrediction(jax, jax.family);
+    void rememberSessionWhenSettled(lastPrediction);
+  } else if (result.predJson) {
     try {
       const remote = revivePrediction(result.predJson);
       remote.stem = stem;
@@ -4110,6 +4135,58 @@ async function followRemoteFold({ since, label, signal }) {
   // status line does - it is the same code, on the other machine.
   status(result.status || `${label} · folded on the runtime`);
   progress(null);
+}
+
+/**
+ * A JAX fold's result as this page's own prediction.
+ *
+ * The worker (tools/jax_worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
+ * contact probabilities, its token layout and the alignment it used; the rest
+ * - the entities, the settings, the form - is this page's, taken now, because
+ * the reader's form is what asked for this fold.
+ */
+function jaxPrediction(result, stem, label) {
+  const floats = (values) => (values == null ? undefined : Float32Array.from(values));
+  const given = result.confidence ?? {};
+  const confidence = {
+    ...given,
+    plddt: floats(given.plddt),
+    predictedAlignedError: floats(given.predictedAlignedError),
+    contactProbs: floats(given.contactProbs),
+  };
+  const chains = result.chains ?? [];
+  const { entities, controls } = formInputs();
+  const family = controls["model-family"] === "ef2" ? chosenFamily() : (controls["model-family"] ?? "af3");
+  const mode = controls["msa-mode"] ?? "none";
+  return {
+    stem,
+    pdb: result.pdb,
+    confidence,
+    scores: confidenceJson(chains.join(""), confidence),
+    a3m: result.a3m ?? undefined,
+    chains,
+    chainLengths: chains.map((chain) => chain.length),
+    contactSource: { contactProbs: confidence.contactProbs },
+    tokens: result.tokens,
+    model: `${label} (JAX)`,
+    family,
+    entities,
+    inputs: { entities, controls },
+    templates: [],
+    msas: result.msas ?? {},
+    msaOrigin: {
+      none: SINGLE_SEQUENCE_ORIGIN,
+      search: "MMseqs2 search at api.colabfold.com (by the JAX backend)",
+      paste: "pasted by hand",
+      upload: "uploaded a3m",
+    }[mode] ?? mode,
+    settings: {
+      backend: `JAX (${result.model})`,
+      seed: Number(controls["random-seed"]) || 1,
+      recycles: Number(controls.recycles) || undefined,
+      "max msa": controls["max-msa"],
+    },
+  };
 }
 
 /**

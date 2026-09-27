@@ -35,7 +35,7 @@ MODELS = {
     "af3": "alphafold3", "openbind0": "openbind0", "opendde": "opendde",
     "boltz2": "boltz2", "protenix2": "protenix2", "intellifold2": "intellifold2",
     "rosettafold3": "rosettafold3", "monomer": "af2_ptm", "multimer": "af2_multimer",
-    "ef2-fast-600m": "esmfold2_lm600m",
+    "ef2-fast-600m": "esmfold2_lm600m", "ef2-fast-300m": "esmfold2_lm300m",
 }
 CACHE_DIR = os.environ.get("LOCALFOLD_JAX_CACHE", "/tmp/af3_cache")
 # run_alphafold.py and live_frames.py are what the ColabFold2 install cell
@@ -56,13 +56,12 @@ def emit(kind, payload):
     OUT.flush()
 
 
-def cif_to_pdb(cif):
-    """The atom_site loop of one mmCIF model as PDB ATOM/HETATM records.
+AF2_NAMES = {"af2_ptm": "model_{}_ptm", "af2_multimer": "model_{}_multimer_v3"}
+AF2_DIR = "af2_params"
 
-    The page ingests PDB (py2Dmol and every download path read it), and the
-    B-factor column carries the atom's pLDDT, which is what the viewer colours
-    by. Only the fields a PDB record has are kept.
-    """
+
+def cif_atoms(cif):
+    """The atom_site loop of one mmCIF model, one dict an atom."""
     lines = cif.splitlines()
     fields, rows, at = [], [], 0
     while at < len(lines):
@@ -76,39 +75,79 @@ def cif_to_pdb(cif):
             break
         at += 1
     col = {name: index for index, name in enumerate(fields)}
-    get = lambda row, *names: next((row[col[n]] for n in names if n in col), "")
+
+    def get(row, *names):
+        return next((row[col[n]] for n in names if n in col and row[col[n]] != "?"), "")
+    atoms = []
+    for row in rows:
+        seq = get(row, "label_seq_id")
+        atoms.append({
+            "group": get(row, "group_PDB") or "ATOM",
+            "name": get(row, "label_atom_id", "auth_atom_id").strip('"'),
+            "element": get(row, "type_symbol"),
+            "comp": get(row, "label_comp_id", "auth_comp_id"),
+            "chain": get(row, "label_asym_id", "auth_asym_id"),
+            "authChain": get(row, "auth_asym_id", "label_asym_id"),
+            "seq": seq if seq not in ("", ".") else get(row, "auth_seq_id"),
+            "authSeq": get(row, "auth_seq_id", "label_seq_id"),
+            "xyz": (float(get(row, "Cartn_x")), float(get(row, "Cartn_y")),
+                    float(get(row, "Cartn_z"))),
+            "b": float(get(row, "B_iso_or_equiv") or 0.0),
+        })
+    return atoms
+
+
+def cif_to_pdb(cif):
+    """One mmCIF model as PDB ATOM/HETATM records.
+
+    The page ingests PDB (py2Dmol and every download path read it), and the
+    B-factor column carries the atom's pLDDT, which is what the viewer colours
+    by. Only the fields a PDB record has are kept.
+    """
     out = []
-    for serial, row in enumerate(rows, start=1):
-        name = get(row, "label_atom_id", "auth_atom_id").strip('"')
-        element = get(row, "type_symbol")
+    for serial, atom in enumerate(cif_atoms(cif), start=1):
+        name, element = atom["name"], atom["element"]
         padded = name if len(name) == 4 or len(element) == 2 else f" {name}"
         out.append("%-6s%5d %-4s %3s %1s%4s    %8.3f%8.3f%8.3f%6.2f%6.2f          %2s" % (
-            get(row, "group_PDB") or "ATOM", serial % 100000, padded[:4],
-            get(row, "label_comp_id", "auth_comp_id")[:3],
-            get(row, "auth_asym_id", "label_asym_id")[:1],
-            get(row, "auth_seq_id", "label_seq_id"),
-            float(get(row, "Cartn_x")), float(get(row, "Cartn_y")), float(get(row, "Cartn_z")),
-            1.0, float(get(row, "B_iso_or_equiv") or 0.0), element[:2]))
+            atom["group"], serial % 100000, padded[:4], atom["comp"][:3],
+            atom["authChain"][:1], atom["authSeq"][-4:], *atom["xyz"], 1.0, atom["b"],
+            element[:2]))
     return "\n".join(out) + "\nEND\n"
 
 
-def residue_plddt(pdb):
-    """Per residue, in structure order: the mean of its atoms' pLDDTs."""
-    order, sums = [], {}
-    for line in pdb.splitlines():
-        if not line.startswith(("ATOM", "HETATM")):
-            continue
-        key = (line[21], line[22:26], line[17:20])
-        if key not in sums:
-            order.append(key)
-            sums[key] = [0.0, 0]
-        sums[key][0] += float(line[60:66])
-        sums[key][1] += 1
-    return [round(sums[k][0] / sums[k][1], 2) for k in order]
+def token_plddt(atoms, token_chain_ids, token_res_ids):
+    """One pLDDT a TOKEN, which is what AlphaFold 3 scores and the page draws.
+
+    AF3's own files give pLDDT per atom and the token layout, not a per-token
+    pLDDT. A residue that is one token takes its atoms' mean; a ligand or an
+    atomised residue is one token an atom and takes each atom's own. Keyed on
+    (chain, residue) in the order the tokens name them.
+    """
+    groups = {}
+    for atom in atoms:
+        groups.setdefault((atom["chain"], str(atom["seq"])), []).append(atom["b"])
+    counts = {}
+    for chain, res in zip(token_chain_ids, token_res_ids):
+        counts[(chain, str(res))] = counts.get((chain, str(res)), 0) + 1
+    seen, out = {}, []
+    for chain, res in zip(token_chain_ids, token_res_ids):
+        key = (chain, str(res))
+        values = groups.get(key, [0.0])
+        index = seen.get(key, 0)
+        seen[key] = index + 1
+        if counts[key] == len(values) and counts[key] > 1:
+            out.append(values[index])
+        else:
+            out.append(sum(values) / len(values))
+    return [round(v, 2) for v in out]
+
+
+class Refused(Exception):
+    """A job this backend does not run, said as such rather than approximated."""
 
 
 class Worker:
-    """Imports once, builds a runner per model and settings, folds per job."""
+    """Imports once, keeps one model's runner, folds a job at a time."""
 
     def __init__(self):
         from absl import flags
@@ -125,7 +164,8 @@ class Worker:
         if flags_now:
             os.environ["XLA_FLAGS"] = flags_now
         if not flags.FLAGS.is_parsed():
-            flags.FLAGS(["run_alphafold.py", "--norun_data_pipeline", f"--cache_dir={CACHE_DIR}"])
+            flags.FLAGS(["run_alphafold.py", "--norun_data_pipeline",
+                         f"--cache_dir={CACHE_DIR}"])
         flags.FLAGS.flash_attention_implementation = self.flash
         flags.FLAGS.stepwise_recycles = True
         flags.FLAGS.force_output_dir = True
@@ -134,98 +174,134 @@ class Worker:
         self.runners = {}
         self.device = str(jax.local_devices()[0].device_kind)
 
-    def runner(self, model, recycles, steps, samples):
-        key = (model, recycles, steps, samples)
+    def runner(self, model, settings):
+        """One model's runner at a time: two models' weights do not share a T4."""
+        key = (model, tuple(sorted(settings.items())))
         if key in self.runners:
             return self.runners[key]
+        self.runners = {}
         from alphafold3.model import weights
+        device = self.jax.local_devices()[0]
         self.flags.FLAGS.model = model
-        extra = {"num_recycles": recycles} if recycles else {}
-        config = self.RA.make_model_config(
-            model_name=model, num_diffusion_samples=samples,
-            flash_attention_implementation=self.flash, **extra)
-        if steps:
-            config.heads.diffusion.eval.steps = steps
-        config.heads.diffusion.eval.stepwise = True
-        precision = "fp32" if model == "alphafold3" else "int8"
-        directory = "af3_native_weights" if model == "alphafold3" else weights.default_dir(model, precision)
-        if model != "alphafold3":
-            weights.ensure_weights(model, None, precision=precision)
-        built = self.RA.ModelRunner(config=config, device=self.jax.local_devices()[0],
-                                    model_dir=directory)
-        self.runners = {key: (built, config)}      # one model's weights on the card at a time
+        self.flags.FLAGS.use_esm_embeddings = model.startswith("esmfold2")
+        if model in AF2_NAMES:
+            from alphafold3.af2 import inference as af2_inference
+            from alphafold3.model import model_registry
+            weights.ensure_af2_params(AF2_DIR)
+            built = af2_inference.AF2ModelRunner(
+                model_registry.get(model), device=device, model_dir=AF2_DIR,
+                num_recycles=settings["recycles"] or 3,
+                num_msa=settings["msa"], num_extra_msa=settings["msa"] * 2,
+                model_names=[AF2_NAMES[model].format(settings["af2_model"])],
+                use_templates=False)
+            config = None
+        else:
+            extra = {"num_recycles": settings["recycles"]} if settings["recycles"] else {}
+            config = self.RA.make_model_config(
+                model_name=model, num_diffusion_samples=1,
+                flash_attention_implementation=self.flash, **extra)
+            if settings["steps"]:
+                config.heads.diffusion.eval.steps = settings["steps"]
+            if settings["msa"] and hasattr(config, "evoformer"):
+                config.evoformer.num_msa = settings["msa"]
+            config.heads.diffusion.eval.stepwise = True
+            if model == "alphafold3":
+                directory = "af3_native_weights"
+                if not glob.glob(f"{directory}/*.bin.zst"):
+                    raise Refused(
+                        "AlphaFold 3's parameters are not on this runtime - they come"
+                        " from DeepMind under their own terms. Run ColabFold2's install"
+                        " cell with model = alphafold3, or pick another model")
+            else:
+                directory = weights.ensure_weights(model, None, precision="int8")
+            built = self.RA.ModelRunner(config=config, device=device, model_dir=directory)
+        self.runners = {key: (built, config)}
         return built, config
 
     def fold(self, job):
         import numpy as np
         from alphafold3.common import folding_input
         import live_frames as LF
-        family = job.get("controls", {}).get("model-family", "af3")
-        model = MODELS.get(family)
-        if model is None or model.startswith(("af2_", "esmfold2")):
-            raise ValueError(f"the JAX backend does not fold {family} yet")
         controls = job.get("controls", {})
-        recycles = int(controls.get("recycles") or 0)
-        steps = int(controls.get("af3-count") or 0)
+        family = job.get("family") or controls.get("model-family", "af3")
+        model = MODELS.get(family)
+        if model is None:
+            raise Refused(f"the JAX backend does not know the model {family!r}")
+        af2 = model in AF2_NAMES
+        single_sequence = model.startswith("esmfold2")
+        if not af2 and controls.get("af3-mode", "diffusion") != "diffusion":
+            raise Refused("the JAX backend samples with diffusion only - set the sampler"
+                          " to Diffusion, or fold with WebGPU for Flow")
+        if any((entity.get("template") or {}).get("kind", "none") != "none"
+               for entity in job.get("entities", [])):
+            raise Refused("templates are not wired to the JAX backend yet - remove the"
+                          " template, or fold with WebGPU")
+        depth = str(controls.get("max-msa") or "512:1024").split(":")[0]
+        settings = {"recycles": int(controls.get("recycles") or 0),
+                    "steps": int(controls.get("af3-count") or 0),
+                    "msa": int(depth) if depth.isdigit() else 512,
+                    "af2_model": int(controls.get("af2Model") or 1)}
         emit("status", f"{model} on JAX ({self.device}) · reading the job")
         work = os.path.abspath("jax_jobs")
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
         spec = json.loads(job["job"])
-        search = controls.get("msa-mode", "none") == "search"
-        # 🔴 NO TEMPLATE SEARCH EITHER WAY: the MMseqs2 fill supplies alignments
-        # only, and a protein chain with neither templates nor an empty list is
-        # refused ("Protein chain 1 is missing Templates").
-        for entry in spec.get("sequences", []):
-            if "protein" in entry:
-                entry["protein"].setdefault("templates", [])
-        if not search:
-            # ...a single-sequence fold, stated in the job the way AlphaFold 3's
-            # JSON states one: an empty alignment and no templates, rather than
-            # left for a data pipeline that is not run.
-            for entry in spec.get("sequences", []):
-                for kind, body in entry.items():
-                    if kind == "protein":
-                        body.update(unpairedMsa="", pairedMsa="", templates=[])
-                    elif kind == "rna":
-                        body.update(unpairedMsa="")
+        mode = "none" if single_sequence else controls.get("msa-mode", "none")
+        self.apply_alignment(spec, mode, controls, job.get("msas"))
         path = os.path.join(work, "job.json")
         with open(path, "w") as handle:
             json.dump(spec, handle)
         fold_input = next(iter(folding_input.load_fold_inputs_from_path(path)))
-        if search:
+        if mode == "search":
             emit("status", f"{model} on JAX · searching the ColabFold MMseqs2 server")
             from alphafold3.data import msa_server
             fold_input = msa_server.fill_missing_msas(fold_input)
         emit("status", f"{model} on JAX · loading weights and compiling")
-        runner, config = self.runner(model, recycles, steps, 1)
-        passes = int(config.num_recycles) + 1
-        steps = int(config.heads.diffusion.eval.steps)
+        runner, config = self.runner(model, settings)
         batch = [None]
         original = runner.run_inference
+        passes = ((settings["recycles"] or 3) + 1) if af2 else int(config.num_recycles) + 1
+        steps = 0 if af2 else int(config.heads.diffusion.eval.steps)
 
-        def run_inference(featurised, *args, **kwargs):
-            if batch[0] is None:
-                batch[0] = LF.as_batch(featurised)
-            return original(featurised, *args, **kwargs)
-        runner.run_inference = run_inference
+        def frame(positions):
+            emit("frame", cif_to_pdb(LF.frame_cif(np.asarray(positions), batch[0])))
 
-        # 🔴 THE BAR BY PHASE, NOT BY COUNTING CALLBACKS: the first fold of a
-        # model reports its trunk passes twice (compile, then run), and a count
-        # ran the bar past 100%. A trunk pass is a third of it, a denoise step
-        # the rest.
-        def on_frame(kind, index, data):
-            if kind == "recycle":
-                emit("progress", 0.3 * (index + 1) / passes)
-                emit("status", f"{model} on JAX · trunk pass {index + 1}/{passes}")
-            elif kind == "diffusion":
-                emit("progress", 0.3 + 0.7 * (index + 1) / steps)
-                emit("status", f"{model} on JAX · diffusion {index + 1}/{steps}")
+        if af2:
+            from alphafold3.af2.output import atom37_to_token_atoms
+
+            def on_recycle(index, out):
+                emit("progress", min(1.0, (index + 1) / passes))
+                emit("status", f"{model} on JAX · recycle {index + 1}/{passes}")
                 if batch[0] is not None:
-                    positions = np.asarray(data[0] if getattr(data, "ndim", 0) == 4 else data)
-                    emit("frame", cif_to_pdb(LF.frame_cif(positions, batch[0])))
+                    atom37 = np.asarray(out["structure_module"]["final_atom_positions"])
+                    frame(atom37_to_token_atoms(atom37, batch[0])[0])
 
-        self.RA._FRAME_CALLBACK[0] = on_frame
+            def run_inference(featurised, *args, **kwargs):
+                if batch[0] is None:
+                    batch[0] = LF.as_batch(featurised)
+                kwargs.setdefault("on_recycle", on_recycle)
+                return original(featurised, *args, **kwargs)
+        else:
+            # 🔴 THE BAR BY PHASE, NOT BY COUNTING CALLBACKS: the first fold of a
+            # model reports its trunk passes twice (compile, then run), and a
+            # count ran the bar past 100%. A trunk pass is a third of it, a
+            # denoise step the rest.
+            def on_frame(kind, index, data):
+                if kind == "recycle":
+                    emit("progress", 0.3 * (index + 1) / passes)
+                    emit("status", f"{model} on JAX · trunk pass {index + 1}/{passes}")
+                elif kind == "diffusion":
+                    emit("progress", 0.3 + 0.7 * (index + 1) / steps)
+                    emit("status", f"{model} on JAX · diffusion {index + 1}/{steps}")
+                    if batch[0] is not None:
+                        frame(data[0] if getattr(data, "ndim", 0) == 4 else data)
+
+            def run_inference(featurised, *args, **kwargs):
+                if batch[0] is None:
+                    batch[0] = LF.as_batch(featurised)
+                return original(featurised, *args, **kwargs)
+            self.RA._FRAME_CALLBACK[0] = on_frame
+        runner.run_inference = run_inference
         started = time.time()
         try:
             self.RA.process_fold_input(fold_input=fold_input, data_pipeline_config=None,
@@ -234,32 +310,96 @@ class Worker:
         finally:
             self.RA._FRAME_CALLBACK[0] = None
             runner.run_inference = original
-        sequence = "".join(body.get("sequence", "") for entry in spec.get("sequences", [])
-                           for kind, body in entry.items() if kind in ("protein", "dna", "rna")
-                           for _ in (body.get("id") if isinstance(body.get("id"), list) else [0]))
-        return self.collect(work, model, time.time() - started, sequence)
+        return self.collect(work, model, time.time() - started, fold_input)
 
-    def collect(self, work, model, seconds, sequence=""):
-        """The top-ranked sample, as the page's result."""
-        cif = sorted(glob.glob(f"{work}/**/*_model.cif", recursive=True), key=len)[0]
-        stem = cif[:-len("_model.cif")]
+    @staticmethod
+    def apply_alignment(spec, mode, controls, msas):
+        """What the page's MSA row asked for, stated in the job's own fields.
+
+        🔴 A PROTEIN CHAIN ALWAYS CARRIES `templates: []`: the MMseqs2 fill
+        supplies alignments only, and a chain with neither templates nor an
+        empty list is refused ("Protein chain 1 is missing Templates").
+        """
+        proteins = [entry["protein"] for entry in spec.get("sequences", []) if "protein" in entry]
+        rnas = [entry["rna"] for entry in spec.get("sequences", []) if "rna" in entry]
+        for protein in proteins:
+            protein.setdefault("templates", [])
+        if mode == "search":
+            return
+        if mode == "none":
+            # ...a single-sequence fold, the way AlphaFold 3's JSON states one.
+            for protein in proteins:
+                protein.update(unpairedMsa="", pairedMsa="")
+            for rna in rnas:
+                rna.update(unpairedMsa="")
+            return
+        if mode == "paste":
+            msas = {"merged": controls.get("msa-text") or ""}
+        msas = msas or {}
+        for rna in rnas:
+            rna.setdefault("unpairedMsa", "")
+        if msas.get("merged"):
+            if len(proteins) != 1:
+                raise Refused("one alignment for several protein chains cannot be split"
+                              " for the JAX backend - upload per-chain alignments, search,"
+                              " or fold with WebGPU")
+            proteins[0].update(unpairedMsa=msas["merged"], pairedMsa="")
+            return
+        unpaired = msas.get("unpaired") or []
+        paired = msas.get("paired") or []
+        if not any(unpaired):
+            raise Refused(f"the MSA mode is {mode!r} but no alignment came with the job")
+        for index, protein in enumerate(proteins):
+            protein.update(unpairedMsa=unpaired[index] if index < len(unpaired) else "",
+                           pairedMsa=(paired[index] if index < len(paired) else "") or "")
+
+    def collect(self, work, model, seconds, fold_input):
+        """The top-ranked sample, as the page's own prediction fields."""
+        from alphafold3.common import folding_input
+        cif_path = sorted(glob.glob(f"{work}/**/*_model.cif", recursive=True), key=len)[0]
+        stem = cif_path[:-len("_model.cif")]
         confidences = json.load(open(f"{stem}_confidences.json"))
         summary = json.load(open(f"{stem}_summary_confidences.json"))
-        pdb = cif_to_pdb(open(cif).read())
-        plddt = residue_plddt(pdb)
-        pae = confidences.get("pae")
-        scores = {"sequence": sequence, "plddt": plddt,
-                  "mean_plddt": round(sum(plddt) / max(1, len(plddt)), 2),
-                  "ptm": summary.get("ptm")}
+        cif = open(cif_path).read()
+        atoms = cif_atoms(cif)
+        chain_ids = confidences.get("token_chain_ids") or []
+        res_ids = confidences.get("token_res_ids") or []
+        plddt = token_plddt(atoms, chain_ids, res_ids)
+
+        def flat(matrix):
+            return None if matrix is None else [round(float(v), 2) for row in matrix for v in row]
+        confidence = {
+            "plddt": plddt,
+            "meanPlddt": round(sum(plddt) / max(1, len(plddt)), 2),
+            "ptm": summary.get("ptm"),
+            "predictedAlignedError": flat(confidences.get("pae")),
+            "contactProbs": flat(confidences.get("contact_probs")),
+        }
         if summary.get("iptm") is not None:
-            scores["iptm"] = summary["iptm"]
-        if pae is not None and len(pae) == len(plddt):
-            scores["pae"] = pae
-        mean = scores["mean_plddt"]
-        return {"pdb": pdb, "scores": scores, "length": len(plddt),
-                "atoms": pdb.count("\nATOM") + pdb.count("\nHETATM") + int(pdb.startswith(("ATOM", "HETATM"))),
-                "status": f"{model} on JAX ({self.device}) · done in {seconds:.0f} s"
-                          f" · pLDDT {mean:.1f}"}
+            confidence["iptm"] = summary["iptm"]
+        # ...what the fold was actually given, per polymer chain in order - the
+        # page's `chains`, and its archive's `msas/`.
+        chains, unpaired, paired = [], [], []
+        for chain in fold_input.chains:
+            sequence = getattr(chain, "sequence", None)
+            if sequence is None:
+                continue
+            chains.append(sequence)
+            if isinstance(chain, folding_input.ProteinChain):
+                unpaired.append(chain.unpaired_msa or "")
+                paired.append(chain.paired_msa or "")
+        msas = {"unpaired": unpaired, "paired": paired} if any(unpaired) else {}
+        mean = confidence["meanPlddt"]
+        return {
+            "jax": True, "model": model,
+            "pdb": cif_to_pdb(cif), "confidence": confidence,
+            "tokens": {"chainIds": chain_ids, "resIds": res_ids},
+            "chains": chains, "msas": msas,
+            "a3m": unpaired[0] if len(unpaired) == 1 and unpaired[0] else None,
+            "atoms": len(atoms),
+            "status": f"{model} on JAX ({self.device}) · done in {seconds:.0f} s"
+                      f" · pLDDT {mean:.1f}",
+        }
 
 
 def codes_in(job_json):
@@ -342,7 +482,8 @@ def main():
             emit("result", worker.fold(job))
         except Exception as cause:                            # noqa: BLE001
             traceback.print_exc(file=sys.stderr)
-            emit("result", {"error": f"{type(cause).__name__}: {cause}"})
+            said = str(cause) if isinstance(cause, Refused) else f"{type(cause).__name__}: {cause}"
+            emit("result", {"error": said})
 
 
 if __name__ == "__main__":
