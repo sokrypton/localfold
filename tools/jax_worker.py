@@ -485,9 +485,13 @@ class Worker:
             if entity.get("type") in ("protein", "dna", "rna") and (entity.get("value") or "").strip():
                 first_chain[id(entity)] = at
                 at += int(entity.get("copies") or 1)
-        used = []
+        used, named = [], []
 
-        def record(entity, found):
+        def record(entity, found, covered, of):
+            # ...and the coverage once an entity, for the final status line -
+            # the WebGPU fold ends on it, and a template that arrived is
+            # otherwise indistinguishable from one that did not.
+            named.append(f" · template {found['source']} {covered}/{of}")
             for copy in range(int(entity.get("copies") or 1)):
                 used.append({**found, "chain": first_chain[id(entity)] + copy})
 
@@ -500,7 +504,7 @@ class Worker:
             emit("status", f"{model} on JAX · template {named}")
             entry, covered, found = template_entry(template, protein["sequence"])
             protein["templates"] = [entry]
-            record(entity, found)
+            record(entity, found, covered, len(protein["sequence"]))
             emit("status", f"{model} on JAX · template covers {covered} of"
                            f" {len(protein['sequence'])} residues")
         path = os.path.join(work, "job.json")
@@ -528,7 +532,7 @@ class Worker:
                          "chain": best.split("_")[1],
                          "name": best}, protein["sequence"])
                     protein["templates"] = [entry]
-                    record(entity, found)
+                    record(entity, found, covered, len(protein["sequence"]))
                     emit("status", f"{model} on JAX · template {best} covers {covered} of"
                                    f" {len(protein['sequence'])} residues")
                 # The filled alignments go into the job with the templates.
@@ -596,6 +600,7 @@ class Worker:
         result = self.collect(work, model, time.time() - started, fold_input,
                               job.get("family") or controls.get("model-family"))
         result["templates"] = used
+        result["status"] += "".join(named)
         return result
 
     @staticmethod
