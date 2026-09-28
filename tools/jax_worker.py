@@ -485,13 +485,13 @@ class Worker:
             if entity.get("type") in ("protein", "dna", "rna") and (entity.get("value") or "").strip():
                 first_chain[id(entity)] = at
                 at += int(entity.get("copies") or 1)
-        used, named = [], []
+        used, coverage = [], []
 
         def record(entity, found, covered, of):
             # ...and the coverage once an entity, for the final status line -
             # the WebGPU fold ends on it, and a template that arrived is
             # otherwise indistinguishable from one that did not.
-            named.append(f" · template {found['source']} {covered}/{of}")
+            coverage.append(f" · template {found['source']} {covered}/{of}")
             for copy in range(int(entity.get("copies") or 1)):
                 used.append({**found, "chain": first_chain[id(entity)] + copy})
 
@@ -600,7 +600,7 @@ class Worker:
         result = self.collect(work, model, time.time() - started, fold_input,
                               job.get("family") or controls.get("model-family"))
         result["templates"] = used
-        result["status"] += "".join(named)
+        result["status"] += "".join(coverage)
         return result
 
     @staticmethod
