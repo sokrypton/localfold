@@ -4176,7 +4176,10 @@ function jaxPrediction(result, stem, label) {
     family,
     entities,
     inputs: { entities, controls },
-    templates: [],
+    // ...the structures the worker used, one a fold chain, in the shape the
+    // archive writes - so a saved JAX fold reloads with its templates rather
+    // than as a search, and its README does not say "templates: none".
+    templates: result.templates ?? [],
     msas: result.msas ?? {},
     msaOrigin: {
       none: SINGLE_SEQUENCE_ORIGIN,

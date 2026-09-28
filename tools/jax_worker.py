@@ -313,8 +313,13 @@ def template_entry(template, query):
     mapping = align(query, struc.chain_single_letter_sequence()[label])
     if not mapping:
         raise Refused(f"the template {name}_{chain} shares no residue with its chain")
-    return {"mmcif": struc.to_mmcif(), "queryIndices": list(mapping),
-            "templateIndices": list(mapping.values())}, len(mapping)
+    entry = {"mmcif": struc.to_mmcif(), "queryIndices": list(mapping),
+             "templateIndices": list(mapping.values())}
+    # ...and what the page's archive records, so a saved JAX fold reloads with
+    # the structure it used rather than as a search: one chain, named.
+    entry_used = {"text": entry["mmcif"], "chainId": chain, "source": name if name != "upload"
+                  else template.get("filename") or "the uploaded structure"}
+    return entry, len(mapping), entry_used
 
 
 class Worker:
@@ -473,6 +478,19 @@ class Worker:
         if searched and mode != "search":
             raise Refused("a template from the MSA search needs an MSA search: set the MSA"
                           " to search, or name a structure instead")
+        # A fold chain is a polymer COPY, numbered over every polymer row - the
+        # page's own numbering, which its archive writes templates under.
+        first_chain, at = {}, 0
+        for entity in job.get("entities", []):
+            if entity.get("type") in ("protein", "dna", "rna") and (entity.get("value") or "").strip():
+                first_chain[id(entity)] = at
+                at += int(entity.get("copies") or 1)
+        used = []
+
+        def record(entity, found):
+            for copy in range(int(entity.get("copies") or 1)):
+                used.append({**found, "chain": first_chain[id(entity)] + copy})
+
         for entity, protein in zip(rows, proteins):
             template = entity.get("template") or {}
             if template.get("kind", "none") in ("none", "search"):
@@ -480,8 +498,9 @@ class Worker:
             named = (template.get("filename") or "the uploaded structure") if template.get("kind") == "upload" \
                 else template.get("source")
             emit("status", f"{model} on JAX · template {named}")
-            entry, covered = template_entry(template, protein["sequence"])
+            entry, covered, found = template_entry(template, protein["sequence"])
             protein["templates"] = [entry]
+            record(entity, found)
             emit("status", f"{model} on JAX · template covers {covered} of"
                            f" {len(protein['sequence'])} residues")
         path = os.path.join(work, "job.json")
@@ -497,16 +516,19 @@ class Worker:
                 # 🔴 THE BEST HIT, AS THE PAGE TAKES IT - one template a chain,
                 # from the search that produced the alignment. The chains are
                 # rebuilt with it rather than edited, and the job re-read.
-                for protein in searched:
+                searched_rows = [entity for entity in rows
+                                 if (entity.get("template") or {}).get("kind") == "search"]
+                for entity, protein in zip(searched_rows, searched):
                     best = (hits.get(protein["sequence"]) or [None])[0]
                     if best is None:
                         raise Refused(f"the search found no template for {protein['sequence'][:12]}…")
                     emit("status", f"{model} on JAX · template {best} from the search")
-                    entry, covered = template_entry(
+                    entry, covered, found = template_entry(
                         {"kind": "mmcif", "text": msa_server.fetch_template(best),
                          "chain": best.split("_")[1],
                          "name": best}, protein["sequence"])
                     protein["templates"] = [entry]
+                    record(entity, found)
                     emit("status", f"{model} on JAX · template {best} covers {covered} of"
                                    f" {len(protein['sequence'])} residues")
                 # The filled alignments go into the job with the templates.
@@ -571,8 +593,10 @@ class Worker:
         finally:
             self.RA._FRAME_CALLBACK[0] = None
             runner.run_inference = original
-        return self.collect(work, model, time.time() - started, fold_input,
-                            job.get("family") or controls.get("model-family"))
+        result = self.collect(work, model, time.time() - started, fold_input,
+                              job.get("family") or controls.get("model-family"))
+        result["templates"] = used
+        return result
 
     @staticmethod
     def apply_alignment(spec, mode, controls, msas):
