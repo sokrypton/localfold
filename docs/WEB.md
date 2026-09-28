@@ -3294,3 +3294,27 @@ At matched recycles the two backends agree on confidence to the second
 decimal. One chain templated lifts that chain and leaves the interface unknown
 (ipTM 0.09-0.12), which is the right answer rather than a failure. The
 multimer arm is in `npm run test:template` now (0.782 against 16.679).
+
+### The second pass: search templates on a complex, the deltas, a homodimer
+
+🔴 **A TEMPLATE "FROM THE MSA SEARCH" FAILED ON EVERY COMPLEX, FOR EVERY
+MODEL.** `generateMmseqs2ComplexMsa` ran one search per chain, each returning
+its pdb70 hits, and its return dropped them all - so with the MSA set to
+Search the page said "Automatic templates need an MSA search". Single chains
+were never affected, which is why nothing saw it. It returns `templateHits` by
+chain now (`test/mmseqs2-api.test.js`, watched failing without the fix). 1BRS
+through the page, both chains `auto`: the multimer takes 6pqk_A and 1brs_D,
+pLDDT 97.4 / ipTM **0.929**; AlphaFold 3 the same two, pLDDT 96.2.
+
+The rest of the pass confirmed rather than changed:
+
+| | no template | templated |
+|---|---|---|
+| WebGPU multimer-2 / -3 / -5 (deltas), 1BRS, 3 recycles | 15.2 / 14.2 / 12.9 A | 0.61 / 0.79 / 0.51 A |
+| WebGPU page, 1TIM A:B homodimer, both copies | pLDDT 39.1, ipTM 0.11 | pLDDT 91.4, ipTM 0.84 |
+| JAX through the reader page (L4), 1BRS, 3 recycles | 15.83 A | upload 0.34 A · search+auto 0.40 A (search alone 0.57) |
+
+The delta bundles carry the multimer template embedder, so "All 5" folds with
+the template on every model. A homodimer's copies each get the entity's
+template (entities.js expands copies into chains), which is AlphaFold's own
+behaviour. The saved job and the archive were already per-chain.
