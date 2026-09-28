@@ -3364,3 +3364,26 @@ L4, through the reader page:
 The second row is also the first JAX run of a templated entity with copies: the
 AF3 JSON writes one protein entry with two ids and one template, and both
 copies take it.
+
+### The fifth pass: the TPU, and the search on JAX
+
+The final code on a **TPU v5e** (the first TPU allocation in three tries),
+through the reader page:
+
+| | fold | archive dropped back |
+|---|---|---|
+| multimer, 1BRS, uploads A and D | 0.34 A, pLDDT 94.8, 34 s | `upload@A`, `upload@D` |
+| multimer, 1BRS, both chains from the search | 0.40 A, pLDDT 97.6 | `upload@A:6pqk_A`, `upload@D:1brs_D` |
+| openbind0, 1BRS, both chains from the search | 0.51 A, pLDDT 95.2 | the same two |
+
+So a search-picked template now saves as the structure the search chose and
+reloads as that structure, on both lineages. The install pins jax to 0.11.1 for
+tokamax on a TPU and needs nothing else.
+
+A JAX fold's final status names each template and its coverage now
+(`· template 1brs-crystal.pdb 108/108 · template … 87/87`), as the WebGPU fold's
+always has: it was reported mid-run and then overwritten by "done", so a
+template that arrived looked like one that did not. 🔴 Its first version
+crashed every templated fold - the new list was called `named`, which the loop
+beside it already uses for a template's display name - and only the TPU run
+caught it, because `test:colab`'s stub worker never reaches `fold()`.
