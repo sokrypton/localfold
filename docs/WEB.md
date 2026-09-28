@@ -3318,3 +3318,29 @@ The delta bundles carry the multimer template embedder, so "All 5" folds with
 the template on every model. A homodimer's copies each get the entity's
 template (entities.js expands copies into chains), which is AlphaFold's own
 behaviour. The saved job and the archive were already per-chain.
+
+### The third pass: the archive, the probe, the cache
+
+🔴 **A SAVED FOLD'S TEMPLATES CAME BACK AS A SEARCH, ON EVERY MODEL.** The
+request in the archive can only say `useStructureTemplate: true`, which the
+reader rightly turns into "from the MSA search" - so a fold of 1BRS against
+its own crystal, dropped back on the page, asked the MMseqs2 server for
+templates nobody had chosen. The structures were in the archive all along
+(`templates/…_template_hit_N_chains_x.pdb`), but their names give the FOLD
+chain and not the structure's, and barstar is chain D of 1brs. The archive now
+writes `templates/<name>_templates.json` beside them - file, fold chain,
+structure chain, source - and `templatesFromArchive` puts each back on its row
+as an upload. `--job-round-trip` on the templated multimer: before
+`upload, upload`, after `upload, upload`, `same: true` (it read
+`search, search` before). An archive without the index, like the AF3
+server's, restores none, as it did.
+
+`fold-in-page.py` stops on a status line with the `error` class and exits 1
+with the message: the automatic-template failure above had it sit out a
+900 s timeout on a line that already said why. The same failure now ends in
+2.4 s.
+
+`npm run test:cache` gains a templated monomer arm, because the monomer's
+template kernels compile only with a slot. The multimer's embedder runs every
+recycle, so the existing multimer arm covers it. Clean in both orders, and
+also clean with templated monomer and templated multimer in one process.

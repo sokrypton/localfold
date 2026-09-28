@@ -67,7 +67,7 @@ import { complexSequenceProblem } from "./sequence.js";
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesFromText, entitiesProblem, expandEntities, POLYMER_TYPES,
          templateKind } from "./entities.js";
-import { buildFoldArchive, tokenLayoutFrom, msasFromArchive,
+import { buildFoldArchive, tokenLayoutFrom, msasFromArchive, templatesFromArchive,
          SINGLE_SEQUENCE_ORIGIN } from "./fold-archive.js";
 import { jobFromJson, jobInputJson } from "./job-json.js";
 import {
@@ -5513,6 +5513,28 @@ async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
       // archive from a newer format still carries usable a3m files.
       try { loadedJob = applyJob(jobFromJson(files.get(requestName))); }
       catch (error) { loadedJob = `job not loaded: ${error.message}`; }
+    }
+    // 🔴 AND THE TEMPLATES, AS THE STRUCTURES THAT WERE USED. The request
+    // says only `useStructureTemplate: true`, which reads back as "from the
+    // search" - so an uploaded crystal came back as a search nobody asked for.
+    // The archive carries the files and an index naming each one's chain.
+    const usedTemplates = templatesFromArchive(files);
+    if (usedTemplates.length > 0 && typeof loadedJob === "string"
+        && !loadedJob.startsWith("job not loaded")) {
+      const rows = entityList.read();
+      // A fold chain is a polymer COPY, so the rows are walked counting copies.
+      const rowOfChain = [];
+      rows.forEach((row, at) => {
+        if (POLYMER_TYPES.includes(row.type)) for (let c = 0; c < row.copies; c += 1) rowOfChain.push(at);
+      });
+      for (const used of usedTemplates) {
+        const row = rows[rowOfChain[used.chain]];
+        if (row?.type !== "protein") continue;
+        row.template = { kind: "upload", text: used.text, filename: used.filename,
+                         source: used.structureChain ?? "" };
+      }
+      entityList.set(rows);
+      loadedJob += ` · ${usedTemplates.length} template${usedTemplates.length === 1 ? "" : "s"}`;
     }
     const restored = msasFromArchive(files);
     if (restored.chains === 0 && restored.merged === undefined) {

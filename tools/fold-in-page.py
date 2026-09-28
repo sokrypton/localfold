@@ -1020,13 +1020,21 @@ def main():
                 coords: v.coords ? v.coords.length : 0});
             })()"""))
                 time.sleep(0.35)
+        # 🔴 A FOLD THAT FAILED IS FINISHED TOO. Waiting only for success sat
+        # out the whole timeout on a status line that already said why - fifteen
+        # minutes, once, on "Automatic templates need an MSA search".
         cdp.wait_for(ws, """(() => {
           const s = document.getElementById('status-message');
           const text = s ? s.textContent : '';
+          if (s && s.classList.contains('error')) return true;
           return /done|complete|finished|s\\b/i.test(text)
             && document.getElementById('downloads').style.display !== 'none';
         })()""", timeout=args.timeout, what="the fold to finish",
                      progress=STATUS_LINE)
+        failed = cdp.evaluate(ws, """(() => { const s = document.getElementById('status-message');
+          return s && s.classList.contains('error') ? s.textContent : ''; })()""")
+        if failed:
+            raise SystemExit(f"the fold failed: {failed}")
         time.sleep(1.5)
         if args.tab_trace:
             cdp.evaluate(ws, "cancelAnimationFrame(window.__tabRaf), 1")
