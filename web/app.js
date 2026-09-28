@@ -759,8 +759,7 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   // its embedder is a different dialect, and the page builds its slot too -
   // one atom37 slot over the complex, each chain at its offset (see the AF2
   // branch of the fold). 1BRS A:D with a self-template: 16.68 -> 0.78 A.
-  if (templateCount > 0 && !isAf3Family(choice) && graphOf(choice) !== "monomer"
-      && graphOf(choice) !== "multimer") {
+  if (templateCount > 0 && !isAf3Family(choice) && !["monomer", "multimer"].includes(graphOf(choice))) {
     throw new Error("Templates need an AF3-lineage model or AlphaFold 2;"
       + ` the model is set to ${choice}`);
   }
