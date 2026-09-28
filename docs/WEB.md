@@ -3344,3 +3344,23 @@ with the message: the automatic-template failure above had it sit out a
 template kernels compile only with a slot. The multimer's embedder runs every
 recycle, so the existing multimer arm covers it. Clean in both orders, and
 also clean with templated monomer and templated multimer in one process.
+
+### The fourth pass: a JAX fold's templates reach its archive
+
+🔴 **A FOLD ON THE JAX BACKEND SAVED `templates: none` WHATEVER IT USED.**
+`jaxPrediction` wrote `templates: []`, because the structures are fetched and
+aligned on the RUNTIME, not by the page - so the archive the third pass taught
+to carry templates had nothing to carry, its README said none, and a dropped
+archive refolded without them. The worker now returns the structure each fold
+chain used (`{chain, text, chainId, source}`, one entry a copy, numbered over
+the polymer rows the way the page numbers them), and the page records it.
+L4, through the reader page:
+
+| | fold | archive dropped back |
+|---|---|---|
+| 1BRS A:D, uploads A and D | 0.34 A | `archive · 2 chains · 2 templates`, rows `upload@A`, `upload@D` |
+| 1TIM, ONE entity with copies 2, upload A | **1.01 A**, pLDDT 94.1 | one row, copies 2, `upload@A` |
+
+The second row is also the first JAX run of a templated entity with copies: the
+AF3 JSON writes one protein entry with two ids and one template, and both
+copies take it.
