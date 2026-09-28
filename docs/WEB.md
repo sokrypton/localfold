@@ -3252,7 +3252,45 @@ compile cache there (`LOCALFOLD_JAX_CACHE`), which is ColabFold2's own
 or two of compile, and a new runtime starts without the cache. Not measured
 here - the mount needs an interactive Drive consent.
 
-What the JAX backend now refuses: templates on AF2's multimer and ESMFold2
-(WebGPU refuses them too), AF2 models 3-5 with a template, rosettafold3 with
+What the JAX backend now refuses: templates on ESMFold2 (WebGPU refuses them
+too; the AF2 multimer's were refused here and are taken now - see below), AF2 models 3-5 with a template, rosettafold3 with
 Flow. Nothing else. A TPU re-run of this pass could not be allocated (two
 allocation timeouts); the previous pass's TPU run folded end to end.
+
+## AlphaFold 2 multimer templates, on both backends
+
+The multimer was refused a template everywhere, on the grounds that its
+embedder is a different dialect and nothing built a slot for it. The embedder
+was always there - src/af2/multimer/template.js takes an atom37 slot over the
+WHOLE complex plus `asymId`, and model.js forwarded it every recycle - so what
+was missing was the slot:
+
+- **the page** builds one atom37 slot over the complex: each templated chain
+  through `buildTemplate` at its own residue offset, the rest gap, merged by
+  `mergeAtom37Templates` (web/template-source.js). That is AlphaFold's own
+  multimer layout - one template per chain along the residue axis - and
+  `asymId` keeps two files from claiming a relative placement. One template a
+  chain; a second on the same chain is refused.
+- **fold-af2.js** takes `--chain=A,D` on a target (the chain lengths come with
+  it) and `--template=path:A,D`.
+- **JAX** needed nothing upstream: af3-any-model's `from_af3_batch` already
+  turns the AF3 batch's per-chain templates into multimer `template_*`
+  features, with the alphabet measured for `af2_multimer`, and all five
+  multimer checkpoints keep their template weights. The worker's refusal was
+  the whole gap, and the monomer's "models 3-5 have no template embedder"
+  refusal no longer catches the multimer.
+
+1BRS A:D (barnase-barstar), crystal self-template, single sequence:
+
+| | recycles | no template | both chains | barnase only |
+|---|---:|---|---|---|
+| WebGPU, `fold-af2.js` | 0 | 16.679 A | 0.782 A | - |
+| WebGPU, `fold-af2.js` | 3 | - | **0.474 A**, pLDDT 94.98, pTM 0.888, ipTM **0.868** | - |
+| WebGPU, the page (`fold-in-page.py`) | 1 | pLDDT 38.5, ipTM 0.08 | pLDDT 89.6, ipTM 0.58 | pLDDT 64.7, ipTM 0.12 |
+| JAX, L4, model 1 | 3 | 15.98 A, ipTM 0.07 | **0.34 A**, pLDDT 94.9, pTM 0.890, ipTM **0.87** | 11.22 A, pLDDT 67.5 |
+| JAX, L4, model 3 | 3 | - | 0.43 A, pLDDT 95.8, ipTM 0.89 | - |
+
+At matched recycles the two backends agree on confidence to the second
+decimal. One chain templated lifts that chain and leaves the interface unknown
+(ipTM 0.09-0.12), which is the right answer rather than a failure. The
+multimer arm is in `npm run test:template` now (0.782 against 16.679).
