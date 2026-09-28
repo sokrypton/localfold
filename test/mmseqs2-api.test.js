@@ -144,6 +144,8 @@ describe("MMseqs2 API", () => {
       "uniref.a3m": `>101\n${query}\n>u1\n${hit}\n`
         + (only === undefined ? "" : `>u2\n${only}\n`) + "\0",
       "bfd.mgnify30.metaeuk30.smag30.a3m": `>101\n${query}\n\0`,
+      // A one-chain job's template hit is query 101, whichever chain it is.
+      "pdb70.m8": `101\t${query === "ACDE" ? "1abc_A" : "2xyz_B"}\t0.9\t4\t0\t0\t1\t4\t1\t4\t1e-5\t50\n`,
     });
     const posted = [];
     let downloads = 0;
@@ -171,6 +173,10 @@ describe("MMseqs2 API", () => {
     expect(posted.filter((p) => p.href.endsWith("ticket/pair")).length).toBe(1);
     expect(posted.find((p) => p.href.endsWith("ticket/pair")).mode).toBe("pairgreedy");
     expect(result.pairedDepth).toBe(2);
+    // 🔴 THE TEMPLATE HITS SURVIVE THE MERGE, BY CHAIN - they were dropped,
+    // and every complex's automatic template failed as "not a search".
+    expect(result.templateHits.get(0)[0].target).toBe("1abc_A");
+    expect(result.templateHits.get(1)[0].target).toBe("2xyz_B");
 
     const rows = parseA3m(result.a3m).sequences;
     expect(rows[0]).toBe("ACDEWYWY");
