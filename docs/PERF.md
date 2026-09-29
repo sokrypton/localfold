@@ -2317,10 +2317,13 @@ the A100 beside it before anything is concluded from it.
 The head-to-head (docs/WEB.md) had a T4 at 180 s cold for IntelliFold-2 at 261
 residues and protenix2 at 58 s warm. Two causes, found without a T4:
 
-1. **Most of the T4's WebGPU time at 261 was the bridge**, not the fold: those
-   cells ran before the readback stopped sending a 158 MiB event, on a VM with
-   two vCPUs to serialise and parse it (the earlier measurement above is AF3
-   255 at 7.3-7.9 s warm where the head-to-head read 24).
+1. **NOT the bridge, which was the first guess and is wrong.** Those cells ran
+   before the readback stopped sending a 158 MiB event, but the T4's own status
+   lines say what the FOLD took, and at 261 residues it is nearly all of it:
+   AF3 22 s of 24, boltz2 29 of 32, protenix2 55 of 58, IntelliFold-2 177 of
+   180. The old bridge pinned to two cores here costs 2-3 s. Against this A100
+   the fold is 5.5x slower for AF3, 6x boltz2, 8x protenix2 and **11x
+   IntelliFold-2** - the widest pair track, and the outlier.
 2. **The wide models lost three kernels a T4 has the units for.** On this A100
    with `--prior=turing`, IntelliFold-2 (512-channel pair) slowed 54% against
    its own prior where AF3 slowed 11%. Bisecting the ampere prior's 41 knobs
