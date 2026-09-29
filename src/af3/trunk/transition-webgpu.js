@@ -1140,7 +1140,8 @@ export const SPLIT_TRANSITION_GEOMETRY = Object.freeze({
 // class as the fused kernel, only reordered - so a pinned stack takes it.
 export function splitTransitionConfig(device, channels, { f32Only = false } = {}) {
   const tuning = deviceTuning(device);
-  // 🔴 THE PRIOR DECIDES THE MATRIX SPLIT AND THE WIDTH DECIDES THE VECTOR ONE.
+  // 🔴 THE WIDTH DECIDES BOTH SPLITS; A PRIOR MAY ONLY REFUSE. (It read "the
+  // prior decides the matrix split", which left a T4 on the vector one.)
   // Both used to need `pairTransitionSplit: true`, which only the ampere prior
   // sets - so an Apple part, a T4, and every GPU with no prior ran the fused
   // kernel on IntelliFold-2's and OpenDDE's wide pair tracks, the kernel whose
@@ -1152,7 +1153,10 @@ export function splitTransitionConfig(device, channels, { f32Only = false } = {}
   if (channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
     return false;
   }
-  const config = f32Only || tuning.pairTransitionSplit !== true ? null
+  // ...and the MATRIX split too, now, unless a prior refused it: past the
+  // width rule above it was the ampere prior's alone, so a T4 with matrix
+  // units ran IntelliFold-2's transition on the vector split.
+  const config = f32Only || tuning.pairTransitionSplit === false ? null
     : deviceMatrixConfig(device, { element: "f16" });
   // 🔴 NO MATRIX UNITS IS NOT NO SPLIT. It used to be, so every stock browser -
   // none of which exposes subgroup matrices - ran the fused kernel at every

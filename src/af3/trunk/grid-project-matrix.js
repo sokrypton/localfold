@@ -195,6 +195,9 @@ export function allocateGridProjectMatrix(allocator, shape, keep = (a) => a) {
   };
 }
 
+/** The pair width from which the matrix grid projection is the default. */
+export const GRID_PROJECT_MATRIX_MIN_CHANNELS = 192;
+
 /**
  * This device's answer for this kernel: a geometry, or false.
  *
@@ -205,19 +208,33 @@ export function allocateGridProjectMatrix(allocator, shape, keep = (a) => a) {
  * reads as "the knob is worth less than it is". `resolveGridAttendMatrix` is
  * the same shape for the same reason.
  *
- * There is no width rule: this costs no memory, and the layout it reads is the
- * one the vector kernel's pack already writes.
+ * It costs no memory, and the layout it reads is the one the vector kernel's
+ * pack already writes; the width rule is about when it is worth a compile.
  */
-export function gridProjectMatrixConfig(device) {
-  if (deviceTuning(device).gridProjectMatrix !== true) return false;
+export function gridProjectMatrixConfig(device, channels = 0) {
+  // 🔴 A PRIOR DECIDES; WITH NONE, THE WIDTH DOES. Only the ampere prior set
+  // this, so a T4 - and every GPU with matrix units and no prior - ran
+  // IntelliFold-2's and OpenDDE's wide pair tracks on the vector projection
+  // (see the triangle's and the transition's rules, which are the same shape).
+  const knob = deviceTuning(device).gridProjectMatrix;
+  if (knob === false) return false;
+  if (knob !== true && !(channels >= GRID_PROJECT_MATRIX_MIN_CHANNELS)) return false;
   const config = deviceMatrixConfig(device, { element: "f16" });
   if (config === null) return false;
   const tuning = deviceTuning(device);
-  return {
+  const answer = {
     result: tuning.stagedMatrixResult ?? config.resultComponentType,
     matrixElement: config.componentType,
     tile: { M: config.M, N: config.N, K: config.K },
     prefetch: tuning.stagedMatrixPrefetch === true,
     directWeights: tuning.stagedMatrixDirectWeights === true,
   };
+  // 🔴 PRICED, AS THE TRIANGLE'S AND THE TRANSITION'S CHOOSERS ARE. It stages
+  // 32 KiB, and a device at WebGPU's guaranteed 16 KiB could not create the
+  // pipeline - unseen while only the ampere prior (on 48 KiB parts) chose it,
+  // and the first thing the width rule's T4 arm hit at the spec floor.
+  if (!gridProjectMatrixFits({ tile: answer.tile, result: answer.result,
+                               directWeights: answer.directWeights },
+                             device.limits?.maxComputeWorkgroupStorageSize ?? 16384)) return false;
+  return answer;
 }

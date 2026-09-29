@@ -2311,3 +2311,45 @@ both true) and has never been swept on Turing; and the triangle kernel runs at
 **0.19-0.24 effective TFLOP/s** on a part rated ~8 f32, which is a ceiling
 question rather than a knob question and wants the same figure from the M2 and
 the A100 beside it before anything is concluded from it.
+
+## The T4's wide models ran the vector kernels: three matrix choices were the ampere prior's alone
+
+The head-to-head (docs/WEB.md) had a T4 at 180 s cold for IntelliFold-2 at 261
+residues and protenix2 at 58 s warm. Two causes, found without a T4:
+
+1. **Most of the T4's WebGPU time at 261 was the bridge**, not the fold: those
+   cells ran before the readback stopped sending a 158 MiB event, on a VM with
+   two vCPUs to serialise and parse it (the earlier measurement above is AF3
+   255 at 7.3-7.9 s warm where the head-to-head read 24).
+2. **The wide models lost three kernels a T4 has the units for.** On this A100
+   with `--prior=turing`, IntelliFold-2 (512-channel pair) slowed 54% against
+   its own prior where AF3 slowed 11%. Bisecting the ampere prior's 41 knobs
+   (`--no-prior=<group>`) put it on `pairTransitionSplit` (the MATRIX split),
+   `triangleProjectMatrix` and `gridProjectMatrix`: each was `true` only in the
+   ampere prior, so a T4 - and every GPU with matrix units and no prior - ran
+   them on the vector path at every width. The width rules were already
+   written (192 channels, `TRANSITION_SPLIT_MIN_CHANNELS`,
+   `TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS`); they now DECIDE when no prior has,
+   and a prior may only refuse. AF3-width models (128) are untouched, so the
+   turing prior's own T4 measurements stand.
+
+| A100 under `--prior=turing`, 5CAJ 261 | before | after |
+|---|---:|---:|
+| IntelliFold-2, first / warm | 12.4 / 8.88 s | **7.7 / 6.07** |
+| OpenDDE, a fold | 11.15 s | **8.12** |
+| AF3, warm | 2.02 s | 2.04 |
+| boltz2, warm | 2.66 s | 2.64 |
+
+pLDDT identical to the last digit against this card's own prior (IntelliFold-2
+83.453, OpenDDE 92.04 on 6MRR), which has always taken these kernels.
+🔴 **AND THE GRID PROJECTION NOW PRICES ITS FIT**: it stages 32 KiB, and the
+width rule's first spec-floor run could not create it at WebGPU's guaranteed 16
+KiB - unseen while only a 48 KiB part chose it. `gridProjectMatrixConfig`
+declines like the triangle's and the transition's choosers. (The turing
+prior's `opmBlockI: 8` has the same shape - 32 KiB on the OPM contraction for a
+512-channel pair at 16 KiB - and no real device has both; noted, not changed.)
+
+🔴 **NOT YET MEASURED ON A T4**: every number here is this A100 answering with
+the T4's prior. The matrix kernels compile slower on a first fold, which is why
+the turing prior declined the triangle's at 128 channels; at 384-512 channels
+the warm saving is several times larger, but the cold trade wants a T4 run.

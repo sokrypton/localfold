@@ -79,7 +79,9 @@ function matrixTile(device) {
  * kernel changes nothing" rather than as "the flag did nothing".
  */
 function projectMatrixConfig(device, channels) {
-  if (deviceTuning(device).triangleProjectMatrix !== true) return false;
+  // A prior decides; with none, the width rule below does (see
+  // gridProjectMatrixConfig).
+  if (deviceTuning(device).triangleProjectMatrix === false) return false;
   if (channels < (deviceTuning(device).triangleProjectMatrixMinChannels
     ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)) return false;
   const tile = matrixTile(device) ?? false;
@@ -454,9 +456,8 @@ export class Af3PairformerStackGpu {
       // costs no memory. See src/kernels/triangle/project-matrix.js.
       triangleProjectMatrix: pairMatrixKernels
         && projectMatrixConfig(this.device, pairChannels),
-      // ...and grid attention's projection, which has no width rule: it costs
-      // no memory and reads the layout the vector kernel already packs.
-      gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device),
+      // ...and grid attention's projection, by the same width rule.
+      gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device, pairChannels),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
       minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
