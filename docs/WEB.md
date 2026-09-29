@@ -3437,3 +3437,38 @@ this backend. With the argument passed: **600M 1.47 A** - the WebGPU port's
 number to the hundredth - and 300M 1.71 (its structure happened not to move on
 a designed 68-mer; its pLDDT did, 89.2 -> 85.6). `test:jax` now folds 6MRR on
 the 600M with a 3 A bar, and fails at 15.44 A with the argument removed.
+
+### The eighth pass: the worker against af3-any-model's own CLI, family by family
+
+"It arrived" is what the ESMFold2 bug hid behind, so this pass holds every
+family's JAX fold to af3-any-model's `run_alphafold.py` on the same job (6MRR,
+single sequence, seed 1), on the A100:
+
+| model | CLI | worker | CLI vs worker |
+|---|---:|---:|---:|
+| openbind0 | 1.60 A | 1.84 A | 0.66 A |
+| boltz2 | 0.46 | 0.53 | 0.23 |
+| protenix2 | 1.33 | 1.50 | 0.61 |
+| intellifold2 | 1.58 | 1.61 | 0.24 |
+| rosettafold3 | 1.78 | 1.61 | 0.82 |
+| opendde | 1.54 | 0.72 | 1.29 |
+| alphafold3 | 0.73 | 0.79 | 0.37 |
+| esmfold2 600M | 1.52 | 1.47 | 0.18 |
+| esmfold2 300M | 1.72 | 1.71 | 0.10 |
+
+All at the CLI's quality, and not identical - which is DOCUMENTED rather than
+a defect: the worker runs `--stepwise_recycles` (the live frames need it) and
+that flag's own help says "NOT bit-identical to the fused path: each pass gets
+an independently split PRNG key". Against the CLI run WITH that flag the worker
+agrees to **0.032 A** (opendde), **0.037** (rosettafold3), **0.074** (openbind0)
+- so the worker configures nothing differently from the reference.
+
+And chemistry, which neither number above sees:
+- **GOL** beside 6MRR, bond rms: openbind0 0.062, boltz2 0.019, protenix2 0.033,
+  intellifold2 0.040, rosettafold3 0.097, opendde 0.018, af3 0.025, esmfold2
+  0.038 - WebGPU's `test:ligand` range. `test:jax`'s ligand case now asserts
+  the bonds (0.15 A rms) instead of the residue name.
+- **SEP@3**, mean bond ratio: af3 1.023, openbind0 0.958, boltz2 **0.994**,
+  protenix2 0.991, intellifold2 0.995, rosettafold3 0.998, opendde 0.997,
+  esmfold2 1.013. The 0.994 closes docs/BOLTZ2_PTM.md: af3-any-model's boltz2
+  inflated a phosphoserine 2.7x when that brief was written, and no longer does.

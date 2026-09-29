@@ -26,7 +26,8 @@ WHAT IT CHECKS, each against 1BRS (barnase-barstar) and its own crystal:
     archive saves and a dropped archive restores;
   - an AF3-lineage template fold (openbind0), < 1.5 A;
   - a ligand job after those, which is the worker's `execv` restart path (a
-    new CCD code cannot be added to a running process), and
+    new CCD code cannot be added to a running process), its GOL bonds held
+    to 0.15 A rms, and
   - rosettafold3 refusing Flow, which must be a refusal and not a fold, and
   - ESMFold2 600M folding 6MRR (< 3 A), which it cannot without its language
     model - the worker once set the flag and not the argument that decides it.
@@ -63,6 +64,21 @@ def rmsd(a, b):
     d = np.sign(np.linalg.det(u @ vt))
     r = u @ np.diag([1, 1, d]) @ vt
     return float(np.sqrt(((a @ r - b) ** 2).sum(1).mean()))
+
+
+def glycerol_problem(pdb):
+    """GOL's five bonds, as `test:ligand` asserts them on WebGPU: present, and
+    within 0.15 A rms of the dictionary - arriving is not the same as holding."""
+    atoms = {line[12:16].strip(): np.array([float(line[30:38]), float(line[38:46]),
+                                            float(line[46:54])])
+             for line in pdb.splitlines() if line.startswith("HETATM") and line[17:20] == "GOL"}
+    bonds = [("C1", "O1", 1.43), ("C1", "C2", 1.52), ("C2", "O2", 1.43), ("C2", "C3", 1.52),
+             ("C3", "O3", 1.43)]
+    if any(a not in atoms or b not in atoms for a, b, _ in bonds):
+        return f"GOL atoms {sorted(atoms)}"
+    error = np.sqrt(np.mean([(np.linalg.norm(atoms[a] - atoms[b]) - ideal) ** 2
+                             for a, b, ideal in bonds]))
+    return None if error < 0.15 else f"GOL bond rms {error:.3f} A"
 
 
 def main():
@@ -120,7 +136,7 @@ def main():
         ("openbind0, A and D templated", job, rows(upload("A"), upload("D")), openbind,
          lambda r, d: None if d < 1.5 else f"{d:.2f} A with its own crystal"),
         ("openbind0 + GOL (restart)", with_ligand, rows(ligand=True), openbind,
-         lambda r, d: None if "GOL" in r["pdb"] else "no GOL in the structure"),
+         lambda r, d: glycerol_problem(r["pdb"])),
         ("rosettafold3 with Flow", job, rows(), {**openbind, "model-family": "rosettafold3",
                                                  "af3-mode": "flow"}, None),
         # 🔴 ESMFold2 IS ITS LANGUAGE MODEL. The worker set the flag and not

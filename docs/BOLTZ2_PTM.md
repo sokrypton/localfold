@@ -122,3 +122,13 @@ LocalFold pins this rather than papering over it: `npm run test:modified`
 carries `boltz2` as an expected failure with these numbers as its evidence, and
 reports `FIXED` — telling the reader to delete the entry rather than widen it —
 the moment it comes good. So the fix will be noticed on the next run.
+
+## 2026-09-29: fixed upstream, as measured through the JAX backend
+
+Re-measured through LocalFold's JAX worker (sokrypton/alphafold3 `colab`
+branch over the `alphafold3-colabfold` 3.1.11 wheel, on the A100), SEP at
+position 3 of 6MRR, single sequence, one sample: af3-any-model's **boltz2 reads
+a mean bond ratio of 0.994** (worst 1.010) - in line with genuine Boltz-2's
+0.986-1.011 - where this brief was written against 2.705. The other six
+AF3-lineage families read 0.958-1.023 on the same job. So the reference's
+boltz2 no longer inflates a modified residue; this brief is history.
