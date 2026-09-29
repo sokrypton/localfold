@@ -3503,3 +3503,54 @@ second pass; 0 is every pass), and says so the same way:
 | multimer, templated 1BRS, 0.5 | - | **2 passes**, 0.37 A (0.34 with all 4) |
 
 `test:jax` has the multimer case now, and fails with the stop disabled.
+
+## WebGPU against JAX, head to head - and the eight defects it found
+
+Asked for as the baseline for an automatic backend choice: every model, both
+backends, every GPU the Colab plan reaches, timed from the reader's click to the
+result in the page, COLD (fresh browser profile, empty weight and compile
+caches) and WARM (again, another seed so WebGPU cannot replay its cached
+answer), on 6MRR (68 residues) and 5CAJ chain A (261), single sequence. Every
+fold is scored against its crystal, because a fast wrong fold is not a win.
+The harness is a reader page driving `tools/colab_backend.py`, exactly as a
+Colab user's page does. The first pass mostly measured defects, so these came
+first:
+
+1. **WebGPU kept every model it had folded.** Residency is kept between folds
+   so the same model's next fold skips its packing, and it was kept across a
+   CHANGE of model too: 677 -> 1281 -> 2171 -> 2874 MiB live, and the fourth
+   model died in WebGPU validation. `releaseAllWeights` on a change of family;
+   `npm run test:switch` folds ten models in one page and holds live bytes
+   under 2 GiB (6151 MiB with the release removed).
+2. **JAX preallocated 75% of the card** under the page's own WebGPU Chrome:
+   out of memory on one side, a lost device on the other. The worker sets
+   `XLA_PYTHON_CLIENT_PREALLOCATE=false`.
+3. **JAX kept every model it had folded too** - 1.6 GB in use after one model,
+   16 GB after eleven - through a JAX trace that `weakref.finalize`'s registry
+   keeps alive, holding the parameters as constants. `jax.clear_caches()` and
+   `gc` do not reach it. The worker now restarts on a change of model.
+4. **...and restarting by `os.execv` never let go of a TPU**: exec keeps the
+   process and its descriptors, libtpu kept the device, and every fold after
+   the first on a v5e died "Unable to initialize backend 'tpu'". `jax_worker.py`
+   is now a supervisor (no JAX) that relays to a worker CHILD and starts a fresh
+   one when needed; the child dies with its parent. A switch costs ~3 s of
+   process start and takes its executables from the on-disk compile cache.
+5. **AF2 compiled its network twice** in af3-any-model: the recycles ran
+   through `jax.checkpoint(one_pass)` and the final pass through `one_pass`, so
+   the first fold that reached the final pass paid a second compile - 11 s on
+   an A100, skipped by any fold that stopped early on convergence. Prediction
+   takes no gradient (sokrypton/alphafold3 colab f9c11cb): 12.1 s -> 0.8 s.
+6. **A remote AF2 fold at 255 residues died on "Invalid string length"**: every
+   recycle carried its pair representation and PAE logits, ~1 GB as JSON. The
+   bridge keeps model intermediates on the runtime, and the page drops each
+   recycle's host pair once its contact map is built (26 MB).
+7. **...and still took 15 s to arrive**, because the readback sent the
+   confidences a second time, outside the filtered prediction, where a typed
+   array stringifies as an object with a key per element - 130 MiB of a
+   158 MiB event. Gone, and typed arrays travel as base64 bytes (which keeps
+   NaN, turned into null before): "Done" to the reader having it, 15.5 s ->
+   0.6-0.9 s.
+8. **The JAX worker's weight cache on this box was September's** -
+   af3-any-model takes any blob already in `~/.cache/alphafold3/weights` - so
+   the local install runs on its own `AF3_WEIGHTS_DIR`. (A Colab runtime starts
+   empty; this was never a user's problem.)
