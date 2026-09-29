@@ -631,6 +631,10 @@ class Worker:
         result = self.collect(work, model, time.time() - started, fold_input,
                               job.get("family") or controls.get("model-family"))
         result["templates"] = used
+        # What the device holds after this fold, as JAX counts it - nvidia-smi
+        # sees the allocator's pool, which only grows.
+        stats = self.jax.local_devices()[0].memory_stats() or {}
+        result["deviceBytesInUse"] = stats.get("bytes_in_use")
         result["status"] += "".join(coverage)
         if converged[0] is not None:
             # ...worded as the WebGPU fold words it.
@@ -800,6 +804,7 @@ def main():
     worker = None
     emit("jax-ready", {"at": int(time.time() * 1000)})
     lines = iter(sys.stdin)
+    folded_family = None
     while True:
         line = pending if pending is not None else next(lines, None)
         pending = None
@@ -810,12 +815,23 @@ def main():
         try:
             job = json.loads(line)
             codes = set(codes_in(job["job"]))
-            if worker is not None and not codes <= fetched:
+            family = job.get("family") or job.get("controls", {}).get("model-family")
+            # 🔴 A CHANGE OF MODEL IS A NEW PROCESS. Dropping the last runner
+            # does not free its weights: a JAX trace kept alive through
+            # weakref.finalize's registry holds them as constants, so every
+            # model folded stayed on the device - 1.6 GB in use after one, 16 GB
+            # after eleven, and OpenDDE, ESMFold2 and the multimer ran out of
+            # memory on a 40 GB A100. jax.clear_caches() and gc do not reach
+            # it; exec does. The new process takes its executables from the
+            # on-disk compile cache, which is what a change of model costs.
+            switched = worker is not None and family != folded_family
+            if worker is not None and (not codes <= fetched or switched):
                 path = os.path.abspath("jax_pending.json")
                 with open(path, "w") as handle:
                     handle.write(line)
                 os.environ["LOCALFOLD_JAX_CODES"] = json.dumps(sorted(codes | fetched))
-                emit("status", f"restarting JAX for {', '.join(sorted(codes - fetched))}")
+                emit("status", f"restarting JAX for {', '.join(sorted(codes - fetched))}"
+                     if not codes <= fetched else f"restarting JAX for {family}")
                 # 🔴 fd 1 BACK ON THE PIPE FIRST. This process pointed it at
                 # stderr and keeps events on a private copy, which does not
                 # survive exec - so the new process would write its events to
@@ -825,11 +841,18 @@ def main():
                 os.execv(sys.executable, [sys.executable, os.path.abspath(__file__),
                                           "--pending", path])
             if worker is None:
-                emit("status", "fetching chemical definitions")
                 fetched |= codes
-                fetch_ccd(sorted(fetched))
+                # ...and a restart for a MODEL, not a code, finds the tables it
+                # needs already written: rewriting them was a subprocess that
+                # imports alphafold3, on every switch.
+                written = set(json.loads(os.environ.get("LOCALFOLD_JAX_CCD_WRITTEN", "null")) or [])
+                if not (written and fetched <= written):
+                    emit("status", "fetching chemical definitions")
+                    fetch_ccd(sorted(fetched))
+                    os.environ["LOCALFOLD_JAX_CCD_WRITTEN"] = json.dumps(sorted(fetched))
                 emit("status", "starting JAX")
                 worker = Worker()
+            folded_family = family
             emit("result", worker.fold(job))
         except Exception as cause:                            # noqa: BLE001
             traceback.print_exc(file=sys.stderr)
