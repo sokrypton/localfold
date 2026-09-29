@@ -3554,3 +3554,65 @@ first:
    af3-any-model takes any blob already in `~/.cache/alphafold3/weights` - so
    the local install runs on its own `AF3_WEIGHTS_DIR`. (A Colab runtime starts
    empty; this was never a user's problem.)
+
+### The numbers, after the fixes
+
+Cold / warm seconds from the click to the result in the page; '!' marks a fold
+more than 4 A from its crystal, which on 5CAJ is every model on both backends -
+it does not fold from a single sequence, and the two backends agree about that.
+T4 is 57 of 80 cells and the TPU has none: Colab ended every session and
+stopped allocating partway through the rerun. The A100 is this box, run through
+the same broker and reader page.
+
+### 6mrr: cold / warm seconds, WebGPU vs JAX ('!' = RMSD >= 4 A)
+
+| model | a100-local WebGPU | a100-local JAX | t4 WebGPU | t4 JAX | l4 WebGPU | l4 JAX | g4 WebGPU | g4 JAX |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| openbind0 | 6 / 2 | 82 / 2 | 23 / 6 | 117 / 4 | 5 / 3 | 139 / 2 | 2 / 2 | 51 / 2 |
+| af3 | 6 / 2 | 69 / 2 | 15 / 5 | 110 / 4 | 4 / 2 | 71 / 2 | 2 / 2 | 28 / 2 |
+| boltz2 | 6 / 2 | 89 / 2 | 17 / 8 | 113 / 6 | 4 / 3 | 68 / 2 | 2 / 2 | 33 / 2 |
+| protenix2 | 5 / 2 | 70 / 2 | 16 / 7 | 108 / 6 | 4 / 3 | 67 / 2 | 2 / 2 | 30 / 2 |
+| intellifold2 | 8 / 4 | 99 / 2 | 51 / 14 | 129 / 16 | 7 / 4 | 68 / 3 | 3 / 2 | 34 / 2 |
+| rosettafold3 | 4 / 2 | 64 / 2 | 18 / 5 | 102 / 5 | 4 / 2 | 67 / 2 | 2 / 2 | 32 / 2 |
+| opendde | 10 / 4 | 96 / 2 | 42 / 12 | 134 / 13 | 6 / 4 | 88 / 3 | 2 / 2 | 36 / 2 |
+| ef2-fast-600m | 6 / 2 | 92 / 2 | 23 / 2 | 76 / 4 | 4 / 2 | 47 / 2 | 2 / 2 | 26 / 2 |
+| monomer | 4 / 2 | 67 / 2 | 11 / 7 | 304 / 3 | 4 / 2 | 102 / 2 | 2 / 2 | 48 / 2 |
+| multimer | 4 / 2 | 37 / 2 | 12 / 3 | 70 / 4 | 2 / 2 | 46 / 2 | 2 / 2 | 17 / 2 |
+
+### 5caj: cold / warm seconds, WebGPU vs JAX ('!' = RMSD >= 4 A)
+
+| model | a100-local WebGPU | a100-local JAX | t4 WebGPU | t4 JAX | l4 WebGPU | l4 JAX | g4 WebGPU | g4 JAX |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| openbind0 | 7! / 6! | 104! / 6! | 36! / 23! | 147! / 35! | 10! / 9! | 74! / 9! | 4! / 3! | 30! / 2! |
+| af3 | 6! / 6! | 82! / 5! | 26! / 24! | 143! / 34! | 9! / 9! | 74! / 9! | 3! / 2! | 30! / 2! |
+| boltz2 | 6! / 6! | 104! / 6! | 33! / 32! | 155! / 47! | 11! / 10! | 82! / 12! | 4! / 3! | 32! / 3! |
+| protenix2 | 10! / 9! | 89! / 6! | 58! / 58! | 180! / 73! | 16! / 15! | 82! / 17! | 4! / 4! | 32! / 4! |
+| intellifold2 | 18! / 17! | 106! / 12! | 180! /  |  | 37! / 36! | 96! / 35! | 8! / 8! | 34! / 6! |
+| rosettafold3 | 6! / 6! | 73! / 6! |  |  | 9! / 10! | 79! / 10! | 3! / 2! | 31! / 2! |
+| opendde | 14! / 13! | 105! / 120! |  |  | 30! / 27! | 110! / 35! | 7! / 6! | 36! / 6! |
+| ef2-fast-600m | 124 / 3 | 99 / 4 |  |  | 8 / 4 | 43 / 6 | 2 / 2 | 18 / 2 |
+| monomer | 23! / 8! | 63! / 6! |  |  | 14! / 14! | 45! / 12! | 4! / 4! | 27! / 4! |
+| multimer | 4! / 6! | 65! / 6! |  |  | 8! / 9! | 50! / 11! | 2! / 2! | 31! / 4! |
+
+Setup, once per machine (the notebook's own cell): Chrome/Vulkan **5.4 s (G4),
+9.1 (L4), 20.6 (T4)**; the JAX install on top of it **25.2, 34.4, 36.7**, and
+76.7 on a TPU v5e (where jax is re-pinned for tokamax).
+
+**For an automatic choice, WebGPU wins where it can run.** Cold - the one fold
+most visitors make - it is 2-58 s against JAX's 17-304 s, which is almost all
+XLA compile, before the install is counted. Warm, the two tie at 68 residues and
+mostly at 261: G4 and L4 even, the T4 FASTER on WebGPU (23-58 s against 34-73),
+and only the A100's widest models faster on JAX (IntelliFold-2 12 s against 17,
+protenix2 6 against 9). So the rule is the one the page already follows - WebGPU
+wherever there is a real adapter, JAX where there is none (a TPU, or SwiftShader)
+- and an automatic switch to JAX would pay 30-150 s of compile to win a few
+seconds a fold, for a reader folding the same large model repeatedly on an A100.
+
+Two A100 cells read ~120 s where the fold itself had finished in 3-9 s (OpenDDE
+warm on JAX, EF2-fast cold on WebGPU at 261). Re-run back to back they read
+10.5 s and 8.0 s: a transient on the network or the box, not the backends.
+
+What this makes the next targets: WebGPU on a T4 at the wide pair tracks
+(IntelliFold-2 180 s cold at 261 residues, protenix2 58 s even warm), and JAX's
+cold compile, which the notebook's Drive compile cache already takes off a
+RETURNING reader.
