@@ -2353,7 +2353,24 @@ prior's `opmBlockI: 8` had the same shape - 32 KiB on the OPM contraction at
 16 KiB - and now halves until it fits (`createOuterProductMeanShaders` takes the
 device's limit); no real device has both, but the choosers are all priced now.
 
-🔴 **NOT YET MEASURED ON A T4**: every number here is this A100 answering with
-the T4's prior. The matrix kernels compile slower on a first fold, which is why
-the turing prior declined the triangle's at 128 channels; at 384-512 channels
-the warm saving is several times larger, but the cold trade wants a T4 run.
+**MEASURED ON A T4 SINCE**, through the reader page and the bridge exactly as a
+Colab user folds: one VM, the code before this change against after it and
+after it again, a fresh browser profile and the NVIDIA shader cache cleared per
+arm, seconds cold / warm:
+
+| T4 | before | after | after, again |
+|---|---:|---:|---:|
+| IntelliFold-2, 261 | 165.6 / 161.5 | **98.7 / 96.9** | 98.7 / 95.6 |
+| OpenDDE, 261 | 117.0 / 108.9 | **80.4 / 70.2** | 76.1 / 70.3 |
+| protenix2, 261 | 55.8 / 54.5 | **40.3 / 37.4** | 42.4 / 38.9 |
+| AF3, 261 (128 channels, the control) | 25.7 / 24.3 | 34.3 / 23.5 | 27.8 / 24.1 |
+| IntelliFold-2, 68 | 54.0 / 13.7 | 58.3 / 8.6 | 54.8 / 9.2 |
+| OpenDDE, 68 | 41.4 / 10.1 | 46.9 / 8.6 | 45.5 / 9.1 |
+
+A third to two fifths off the wide models at 261 residues, cold and warm alike;
+AF3 unmoved warm. The cold price the turing prior was built to avoid shows at 68
+residues and is small - OpenDDE 41 -> 45-47 s, IntelliFold-2 within its own
+scatter - against 30-65 s saved on a fold of 261. 🔴 **AND protenix2 GAINS
+TOO**, which the A100 proxy did not predict (5% there): its trunk pair is 128
+but not every track it runs is, so the width rules reach part of it. The proxy
+found the defect; only the T4 could price it.
