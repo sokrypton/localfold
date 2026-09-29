@@ -51,6 +51,7 @@ import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js
 import { smilesComponent } from "../src/chem/component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel, releaseModel } from "./model.js";
+import { releaseAllWeights } from "../src/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../src/bundles/manifests/index.js";
@@ -905,6 +906,10 @@ let foldContext = {};
  * path, and half of it is what the fold RESOLVED rather than what was asked
  * for. Reading a form back out of a report is how the two drift.
  */
+// The family the page last folded, so a change of model can release the last
+// one's resident weights - see the fold's first lines.
+let lastFoldedFamily;
+
 const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
                        "msa-text", "max-msa", "recycles", "tolerance",
                        "af3-mode", "af3-count", "random-seed"];
@@ -2411,6 +2416,10 @@ function attachContactMap(frame, recycle, weights, length) {
       // a lossy thing to put in a results file - the archive writes the same
       // numbers AlphaFold 3 does, so it wants what the head produced.
       recycle.contactProbs = contacts;
+      // ...and the pair it came from goes: it is L^2 x 128 floats a recycle
+      // (35 MB at 255 residues), read by nothing after this, and it rode into
+      // every saved session and every remote readback.
+      recycle.pair = undefined;
       refreshHeatmap();
       // 🔴 AND THE SAVED COPY IS REWRITTEN, because it was written before this
       // arrived. AF2's contact map is the panel its archive is worth keeping
@@ -4360,6 +4369,14 @@ async function fold(event) {
                             templates: request.templates ?? [], family, signal });
       return;
     }
+    // 🔴 A DIFFERENT MODEL LETS THE LAST ONE'S GPU WEIGHTS GO. Residency is
+    // kept between folds so the same model's next fold skips its packing, and
+    // it was kept across a CHANGE of model too - four models in one page and
+    // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
+    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
+      releaseAllWeights(await getDevice());
+    }
+    lastFoldedFamily = family;
     // ...and started, not awaited. The templates and the alignment below are
     // network work of their own; this runs beside them.
     const modelLoad = startModelPreload(family, signal);

@@ -38,6 +38,12 @@ MODELS = {
     "ef2-fast-600m": "esmfold2_lm600m", "ef2-fast-300m": "esmfold2_lm300m",
 }
 CACHE_DIR = os.environ.get("LOCALFOLD_JAX_CACHE", "/tmp/af3_cache")
+# 🔴 THE GPU IS SHARED, SO JAX MUST NOT TAKE THREE QUARTERS OF IT UP FRONT.
+# XLA preallocates 75% of device memory at its first import; on a Colab runtime
+# the page's own WebGPU Chrome is on the same card, and a head-to-head run had
+# each starving the other - JAX out of memory on OpenDDE and ESMFold2, WebGPU's
+# device lost on an L4. On demand, both fit.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 # run_alphafold.py and live_frames.py are what the ColabFold2 install cell
 # leaves in its working directory, which is where this is started.
 sys.path.insert(0, os.getcwd())

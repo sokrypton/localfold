@@ -386,6 +386,25 @@ export function releaseResidentWeights(device, prefix) {
 }
 
 /**
+ * Every weight this device holds for folds to come - resident buffers, streamed
+ * rings and the int5 codes behind them - given back at once.
+ *
+ * 🔴 FOR A CHANGE OF MODEL. Residency is kept between folds on purpose, so the
+ * next fold of the SAME model skips its packing; but it is keyed on the weight
+ * objects, and the page keeps every family's store it has loaded, so nothing
+ * ever let a PREVIOUS model's residency go. A reader who folded four models in
+ * one page held all four: 677, 1281, 2171, 2874 MiB, and the fourth fold died
+ * in validation. The next fold of any model re-packs, which is what a first
+ * fold of it costs anyway.
+ *
+ * @returns {number} bytes reclaimed by the resident half
+ */
+export function releaseAllWeights(device) {
+  setStreamedWeights(device, null);
+  return releaseResidentWeights(device);
+}
+
+/**
  * A packed weight buffer AND the offsets that came with it, packed once.
  *
  * 🔴 THE OFFSETS ARE WHY A RESIDENT PACK IS NOT JUST A RESIDENT UPLOAD. Every

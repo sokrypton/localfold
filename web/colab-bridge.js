@@ -137,6 +137,10 @@ const statusText = () =>
 const failed = () =>
   !!document.getElementById("status-message")?.classList.contains("error");
 
+/** Prediction fields a reader never reads: see readBack. */
+const RUNTIME_ONLY = new Set(["pair", "paeLogits", "lddtLogits", "finalRepresentation",
+                              "msaFirstRow"]);
+
 /** Is a fold running here? The page states it; everything else is a proxy. */
 const folding = () => !!(window.__foldState && window.__foldState.running);
 
@@ -165,9 +169,16 @@ async function readBack() {
   // "values.subarray is not a function" while the picture beside it was
   // perfect. The kind travels with the numbers and `revivePrediction` puts it
   // back, so what the reader holds is what a local fold would have held.
+  // 🔴 AND THE MODEL'S INTERMEDIATES STAY HERE. Each AF2 recycle carries its
+  // pair representation (L^2 x 128) and the PAE and lDDT LOGITS the finished
+  // numbers were read from; at 255 residues the prediction was 1 GB as JSON
+  // and every fold died on "Invalid string length" with the structure drawn.
+  // Nothing on the reader reads them - the archive writes the confidences, and
+  // the contact map was computed here from the pair - so they are not sent.
   const predJson = JSON.stringify(pred, (key, value) =>
-    (ArrayBuffer.isView(value) && !(value instanceof DataView))
-      ? { __typed: value.constructor.name, v: Array.from(value) } : value);
+    RUNTIME_ONLY.has(key) ? undefined
+      : (ArrayBuffer.isView(value) && !(value instanceof DataView))
+        ? { __typed: value.constructor.name, v: Array.from(value) } : value);
   return {
     predJson,
     a3m: pred.a3m ?? null,
