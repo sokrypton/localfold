@@ -9,7 +9,7 @@ drives tools/jax_worker.py itself, over its own stdin/stdout protocol, against
 af3-any-model installed here exactly as the notebook installs it on Colab:
 
     uv venv --python 3.13 ~/.venv-lfjax
-    VIRTUAL_ENV=~/.venv-lfjax uv pip install pip "jax[cuda12]==0.11.1" dm-tree
+    VIRTUAL_ENV=~/.venv-lfjax uv pip install pip "jax[cuda12]==0.11.1" dm-tree requests
     mkdir ~/lfjax && cd ~/lfjax && PATH=~/.venv-lfjax/bin:$PATH \\
       AF3_NB_OVERRIDES='{"model": "af2_multimer"}' python <ColabFold2's install cell>
 
@@ -27,7 +27,9 @@ WHAT IT CHECKS, each against 1BRS (barnase-barstar) and its own crystal:
   - an AF3-lineage template fold (openbind0), < 1.5 A;
   - a ligand job after those, which is the worker's `execv` restart path (a
     new CCD code cannot be added to a running process), and
-  - rosettafold3 refusing Flow, which must be a refusal and not a fold.
+  - rosettafold3 refusing Flow, which must be a refusal and not a fold, and
+  - ESMFold2 600M folding 6MRR (< 3 A), which it cannot without its language
+    model - the worker once set the flag and not the argument that decides it.
 About five minutes on an A100, most of it compiling.
 """
 import argparse
@@ -94,10 +96,18 @@ def main():
             out.append({"type": "ligand", "value": "GOL", "copies": 1})
         return out
 
+    # 6MRR for ESMFold2: a 68-residue designed protein, one chain.
+    mrr_text = open(os.path.join(ROOT, "tools/fixtures/6mrr-crystal.pdb")).read()
+    mrr, mrr_sequence = alpha_carbons(mrr_text, "A")
+    mrr_job = json.dumps({"name": "gate", "modelSeeds": [1], "dialect": "alphafold3", "version": 2,
+                          "sequences": [{"protein": {"id": "A", "sequence": mrr_sequence["A"]}}]})
+    mrr_rows = [{"type": "protein", "value": mrr_sequence["A"], "copies": 1}]
+
     multimer = {"model-family": "multimer", "msa-mode": "none", "recycles": "3", "af2Model": "1"}
     openbind = {"model-family": "openbind0", "msa-mode": "none", "af3-mode": "diffusion"}
     cases = [
-        # name, job, entities, controls, check(result, rmsd) -> problem or None
+        # name, job, entities, controls, check(result, rmsd) -> problem or None;
+        # scored against 1BRS unless the case names another crystal (a 6th item)
         ("multimer, no template", job, rows(), multimer,
          lambda r, d: None if d > 10 else f"{d:.2f} A without a template - the control must be far"),
         ("multimer, A and D templated", job, rows(upload("A"), upload("D")), multimer,
@@ -113,14 +123,27 @@ def main():
          lambda r, d: None if "GOL" in r["pdb"] else "no GOL in the structure"),
         ("rosettafold3 with Flow", job, rows(), {**openbind, "model-family": "rosettafold3",
                                                  "af3-mode": "flow"}, None),
+        # 🔴 ESMFold2 IS ITS LANGUAGE MODEL. The worker set the flag and not
+        # process_fold_input's `use_esm` argument, so the tower never ran: 6MRR
+        # at 15.81 A on the 600M, where the CLI and the WebGPU port give ~1.5.
+        ("esmfold2 600M, 6MRR", mrr_job, mrr_rows,
+         {"model-family": "ef2-fast-600m", "plm-mode": "esmc-600m", "msa-mode": "none",
+          "af3-mode": "diffusion"},
+         lambda r, d: None if d < 3 else f"{d:.2f} A - is the language model reaching it?", mrr),
     ]
 
+    # 🔴 ITS OWN WEIGHT CACHE, as fresh as a Colab VM's. af3-any-model takes any
+    # blob already in ~/.cache/alphafold3/weights, and this box had September's
+    # there: boltz2, protenix2, rosettafold3, opendde and esmfold2 all died on
+    # parameters the published checkpoints have since renamed, where a Colab
+    # runtime - which starts empty - folded all five.
+    env = {**os.environ, "AF3_WEIGHTS_DIR": os.path.join(args.jax_dir, "weights")}
     worker = subprocess.Popen([args.python, os.path.join(ROOT, "tools/jax_worker.py")],
                               cwd=args.jax_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, text=True)
+                              stderr=subprocess.DEVNULL, text=True, env=env)
     failures = 0
     try:
-        for name, spec, entities, controls, check in cases:
+        for name, spec, entities, controls, check, *truth in cases:
             worker.stdin.write(json.dumps({"job": spec, "entities": entities,
                                            "family": controls["model-family"],
                                            "controls": controls}) + "\n")
@@ -144,7 +167,7 @@ def main():
                 problem, shown = result["error"][:160], ""
             else:
                 predicted, _ = alpha_carbons(result["pdb"], "AB")
-                distance = rmsd(predicted, crystal)
+                distance = rmsd(predicted, truth[0] if truth else crystal)
                 problem = check(result, distance)
                 shown = f"{distance:6.2f} A  pLDDT {result['confidence']['meanPlddt']:.1f}"
             failures += problem is not None

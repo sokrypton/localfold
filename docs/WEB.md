@@ -3409,3 +3409,31 @@ the structure chain) and name on the status line, openbind0 templated
 (0.50 A), a GOL job after those (the worker's `execv` restart), and
 rosettafold3 refusing Flow. With the clash put back it fails on exactly the two
 templated folds with `'str' object has no attribute 'append'`.
+
+### The seventh pass: every family through the page, locally - and ESMFold2 without its language model
+
+With the worker local, the whole reader-page suite runs here: the broker
+(`tools/colab_backend.py --jax-dir ~/lfjax`, started from the venv's Python)
+and a reader page, every family end to end. **16 of 16** and the template
+suite **7 of 7** - after one thing about this box:
+
+- af3-any-model takes ANY blob already in `~/.cache/alphafold3/weights`, and
+  this machine had checkpoints from 4 September there. boltz2, protenix2,
+  rosettafold3, opendde and esmfold2-600M died on parameters the published
+  checkpoints have since renamed (`single_cond_initial_norm/scale` at 831 wide,
+  `boltz2_cyclic_conditioning` missing). A Colab runtime starts empty, which is
+  why every Colab run folded them. `AF3_WEIGHTS_DIR=~/lfjax/weights` gives the
+  local install a cache of its own; nothing is deleted.
+
+🔴 **EVERY ESMFold2 FOLD ON THE JAX BACKEND RAN WITHOUT ITS LANGUAGE MODEL.**
+The suite checks that a fold ARRIVES - frames, a card, an archive - and ESMFold2
+600M arrived at pLDDT 56 where 300M read 85, which is what gave it away. Scored
+against 6MRR's crystal: **15.81 A**. af3-any-model's own CLI folds the same job
+to 1.52 A (int8) / 1.56 (fp32), and the WebGPU port to 1.47. The worker set
+`FLAGS.use_esm_embeddings`, which is what `main()` reads to decide the matter;
+`process_fold_input` takes `use_esm` as an ARGUMENT, defaults it to False, and
+never looks at the flag. So the ESM-C tower never ran for any ESMFold2 fold on
+this backend. With the argument passed: **600M 1.47 A** - the WebGPU port's
+number to the hundredth - and 300M 1.71 (its structure happened not to move on
+a designed 68-mer; its pLDDT did, 89.2 -> 85.6). `test:jax` now folds 6MRR on
+the 600M with a 3 A bar, and fails at 15.44 A with the argument removed.

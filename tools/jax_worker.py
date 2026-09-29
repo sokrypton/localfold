@@ -591,9 +591,15 @@ class Worker:
         runner.run_inference = run_inference
         started = time.time()
         try:
+            # 🔴 `use_esm` IS AN ARGUMENT HERE, NOT THE FLAG. The flag above is
+            # what main() reads to decide this; process_fold_input defaults it
+            # to False and never looks at the flag - so every ESMFold2 fold on
+            # this backend ran WITHOUT its language model: 6MRR at 15.81 A on
+            # the 600M where the CLI and the WebGPU port both give ~1.5.
             self.RA.process_fold_input(fold_input=fold_input, data_pipeline_config=None,
                                        model_runner=runner, output_dir=work, buckets=None,
-                                       force_output_dir=True)
+                                       force_output_dir=True,
+                                       use_esm=model.startswith("esmfold2"))
         finally:
             self.RA._FRAME_CALLBACK[0] = None
             runner.run_inference = original
