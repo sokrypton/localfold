@@ -4092,11 +4092,22 @@ async function followRemoteFold({ since, label, signal }) {
   // pass `{pdb, scores: {}}`, so a remote fold came back with no MSA panel, no
   // PAE plot and an empty scores card - the page looked like it had folded
   // nothing but coordinates, because it had been given nothing else.
+  // The runtime's prediction, revived BEFORE the viewer is loaded: its
+  // confidences are the ones the viewer draws (the readback no longer sends a
+  // second, untyped copy - see readBack in web/colab-bridge.js).
+  let remote = null;
+  if (jax === null && result.predJson) {
+    try {
+      remote = revivePrediction(result.predJson);
+    } catch (cause) {
+      console.warn("the runtime's prediction did not parse:", cause);
+    }
+  }
   await loadIntoViewer({
     stem, pdb: framePdbs[0] ?? result.pdb,
     scores: jax?.scores ?? result.scores ?? {},
     a3m: result.a3m ?? undefined,
-    confidence: jax?.confidence ?? result.confidence,
+    confidence: jax?.confidence ?? remote?.confidence ?? result.confidence,
     length: result.length,
   });
   if (viewer !== undefined && Object.keys(camera).length > 0) {
@@ -4127,17 +4138,12 @@ async function followRemoteFold({ since, label, signal }) {
   if (jax !== null) {
     recordPrediction(jax, jax.family);
     void rememberSessionWhenSettled(lastPrediction);
-  } else if (result.predJson) {
-    try {
-      const remote = revivePrediction(result.predJson);
-      remote.stem = stem;
-      // ...through the one funnel, so this path records what every other
-      // one does: the last prediction, the map entry, the downloads, and
-      // the page's claim on the object (see recordPrediction).
-      recordPrediction(remote, remote.family ?? familyFromLabel(remote.model));
-    } catch (cause) {
-      console.warn("the runtime's prediction did not parse:", cause);
-    }
+  } else if (remote !== null) {
+    remote.stem = stem;
+    // ...through the one funnel, so this path records what every other
+    // one does: the last prediction, the map entry, the downloads, and
+    // the page's claim on the object (see recordPrediction).
+    recordPrediction(remote, remote.family ?? familyFromLabel(remote.model));
   }
   // ...and the runtime's own summary, which already reads the way this page's
   // status line does - it is the same code, on the other machine.

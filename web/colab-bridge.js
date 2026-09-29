@@ -175,14 +175,22 @@ async function readBack() {
   // and every fold died on "Invalid string length" with the structure drawn.
   // Nothing on the reader reads them - the archive writes the confidences, and
   // the contact map was computed here from the pair - so they are not sent.
+  // ...and a typed array travels as its BYTES, base64: a float as JSON text
+  // is 10-18 characters and 5.3 as base64, and the broker and the reader each
+  // parse what is sent.
   const predJson = JSON.stringify(pred, (key, value) =>
     RUNTIME_ONLY.has(key) ? undefined
       : (ArrayBuffer.isView(value) && !(value instanceof DataView))
-        ? { __typed: value.constructor.name, v: Array.from(value) } : value);
+        ? { __typed: value.constructor.name, b64: bytesToBase64(value) } : value);
   return {
     predJson,
     a3m: pred.a3m ?? null,
-    confidence: pred.confidence ?? null,
+    // 🔴 NOT A SECOND COPY OF THE CONFIDENCES. They are in `predJson`, filtered
+    // and typed; sent again here they went through a plain stringify, where a
+    // typed array becomes an object with a key per element and the PAE
+    // LOGITS rode along - 130 MiB of a 158 MiB event for one AF2 fold at 261
+    // residues, and fifteen seconds between "Done" and the reader seeing it.
+    confidence: null,
     scores: pred.scores ?? null,
     chains: pred.chains ?? null,
     length: pred.length ?? null,
@@ -389,8 +397,31 @@ export function revivePrediction(json) {
   return JSON.parse(json, (key, value) => {
     if (value === null || typeof value !== "object") return value;
     const kind = TYPED[value.__typed];
-    return (kind !== undefined && Array.isArray(value.v)) ? kind.from(value.v) : value;
+    if (kind === undefined) return value;
+    if (typeof value.b64 === "string") {
+      const bytes = base64ToBytes(value.b64);
+      return new kind(bytes.buffer, bytes.byteOffset, bytes.byteLength / kind.BYTES_PER_ELEMENT);
+    }
+    return Array.isArray(value.v) ? kind.from(value.v) : value;
   });
+}
+
+/** A typed array's bytes as base64, in chunks: `apply` has an argument limit. */
+export function bytesToBase64(view) {
+  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  let binary = "";
+  for (let at = 0; at < bytes.length; at += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(at, at + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/** ...and back, into a fresh buffer aligned for any element type. */
+export function base64ToBytes(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let at = 0; at < binary.length; at += 1) bytes[at] = binary.charCodeAt(at);
+  return bytes;
 }
 
 /**
