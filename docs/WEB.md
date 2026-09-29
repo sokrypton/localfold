@@ -3616,3 +3616,25 @@ What this makes the next targets: WebGPU on a T4 at the wide pair tracks
 (IntelliFold-2 180 s cold at 261 residues, protenix2 58 s even warm), and JAX's
 cold compile, which the notebook's Drive compile cache already takes off a
 RETURNING reader.
+
+### AF2 with early stop off, so both backends run every pass
+
+The AF2 rows above ran the page's default recycle tolerance (0.1 A), so two
+backends could stop after different pass counts by rounding alone. With
+`tolerance: 0` both run all four (the JAX status line no longer reads
+"converged"; WebGPU's "saved pass N of 4" is its RANKING of four passes that all
+ran). A100, cold / warm seconds, empty caches:
+
+| AF2, 4 passes | WebGPU | JAX |
+|---|---:|---:|
+| monomer, 68 | 4.0 / 2.5 | 70.2 / 2.0 |
+| multimer, 68 | 4.0 / 2.5 | 37.6 / 2.0 |
+| monomer, 261 | 9.0 / 8.5 | 63.2 / 6.5 |
+| multimer, 261 | 4.5 / 4.5 | 67.7 / 6.5 |
+
+Same picture: WebGPU wins cold by 8-16x, JAX wins warm by 0.5 s at 68 and by
+2 s for the monomer at 261, and WebGPU's multimer is faster warm at 261. The
+benchmark sets `tolerance: 0` from now on. The one step-count difference left
+is ESMFold2's (11 denoiser steps on WebGPU, which follows the vendor's
+`max_inference_sigma` cap, against af3-any-model's 15), which favours WebGPU by
+about a quarter of that model's sampler.
