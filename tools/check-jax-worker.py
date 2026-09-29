@@ -24,6 +24,7 @@ WHAT IT CHECKS, each against 1BRS (barnase-barstar) and its own crystal:
   - that the result carries the templates it used, one per fold chain with
     the structure chain, and names them on the status line - what the page's
     archive saves and a dropped archive restores;
+  - the page's recycle tolerance stopping a settled fold early, as WebGPU's does;
   - an AF3-lineage template fold (openbind0), < 1.5 A;
   - a ligand job after those, which is the worker's `execv` restart path (a
     new CCD code cannot be added to a running process), its GOL bonds held
@@ -133,6 +134,12 @@ def main():
                        != [(0, "A"), (1, "D")] else
                        "the status line names no template" if r["status"].count("template") != 2
                        else None)),
+        # 🔴 THE PAGE'S EARLY STOP, WHICH THIS BACKEND ONCE IGNORED: the settled
+        # templated complex stops after 2 of 4 passes at 0.5, as WebGPU does.
+        ("multimer, tolerance 0.5", job, rows(upload("A"), upload("D")),
+         {**multimer, "tolerance": "0.5"},
+         lambda r, d: None if "converged at" in r["status"] and d < 1.5
+         else f"no early stop: {r['status'][-80:]}"),
         ("openbind0, A and D templated", job, rows(upload("A"), upload("D")), openbind,
          lambda r, d: None if d < 1.5 else f"{d:.2f} A with its own crystal"),
         ("openbind0 + GOL (restart)", with_ligand, rows(ligand=True), openbind,

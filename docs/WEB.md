@@ -3472,3 +3472,34 @@ And chemistry, which neither number above sees:
   protenix2 0.991, intellifold2 0.995, rosettafold3 0.998, opendde 0.997,
   esmfold2 1.013. The 0.994 closes docs/BOLTZ2_PTM.md: af3-any-model's boltz2
   inflated a phosphoserine 2.7x when that brief was written, and no longer does.
+
+### The ninth pass: every control reaches the JAX fold - and one did not
+
+The ESMFold2 bug was a setting that never reached the model, so this pass
+asked it of every control the page sends (`FOLD_CONTROLS`), against a baseline
+fold of the same job on the A100:
+
+| control | changes the fold? |
+|---|---|
+| seed (job `modelSeeds`) | yes, 0.609 A; the same seed reproduces to 0.000 |
+| steps (`af3-count`) | yes (4 steps is 489 A - the page offers 25 and up, 16 for OpenDDE) |
+| recycles | yes, 0.524 A |
+| sampler, MSA mode, MSA depth, AF2 model | yes (earlier passes) |
+| **tolerance** | **no - never read** |
+
+🔴 **THE PAGE'S RECYCLE EARLY STOP WAS SENT WITH EVERY AF2 FOLD AND IGNORED.**
+JAX ran every pass where WebGPU stopped on a settled structure. af3-any-model's
+AF2 recycle loop is Python and already calls `on_recycle` after each pass, so
+the change upstream is small: **`on_recycle` may return True to end recycling
+there**, that pass becoming the answer (sokrypton/alphafold3 `colab` d6d3357;
+the notebook's own callback returns None, so nothing else changes). The worker
+measures with the same metric WebGPU uses - ColabFold's `compute_tol`, the RMS
+change of every C-alpha pair distance - under the same rule (not before the
+second pass; 0 is every pass), and says so the same way:
+
+| | WebGPU | JAX |
+|---|---|---|
+| monomer, 6MRR, tolerance 0.1 | 3 passes of 4 | **3 passes**, `converged at 0.10 Å after 3 passes`, pLDDT 85.12 (85.07 with all 4) |
+| multimer, templated 1BRS, 0.5 | - | **2 passes**, 0.37 A (0.34 with all 4) |
+
+`test:jax` has the multimer case now, and fails with the stop disabled.

@@ -546,6 +546,7 @@ class Worker:
         emit("status", f"{model} on JAX · loading weights and compiling")
         runner, config = self.runner(model, settings)
         batch = [None]
+        converged = [None]
         original = runner.run_inference
         passes = ((settings["recycles"] or 3) + 1) if af2 else int(config.num_recycles) + 1
         steps = 0 if af2 else int(config.heads.diffusion.eval.steps)
@@ -556,12 +557,30 @@ class Worker:
         if af2:
             from alphafold3.af2.output import atom37_to_token_atoms
 
+            from alphafold3.af2.common.confidence import compute_tol
+            # 🔴 THE PAGE'S EARLY STOP, WHICH THIS BACKEND IGNORED. `tolerance`
+            # was sent with every AF2 fold and read by nothing here, so JAX ran
+            # every pass where WebGPU stopped on a settled structure. Same
+            # metric (ColabFold's compute_tol - the RMS change of all C-alpha
+            # pair distances), same rule (not before the second pass, and 0
+            # means every pass), and af3-any-model's loop ends when this
+            # returns True.
+            tolerance = float(controls.get("tolerance") or 0)
+            previous = [None]
+
             def on_recycle(index, out):
                 emit("progress", min(1.0, (index + 1) / passes))
                 emit("status", f"{model} on JAX · recycle {index + 1}/{passes}")
+                atom37 = np.asarray(out["structure_module"]["final_atom_positions"])
                 if batch[0] is not None:
-                    atom37 = np.asarray(out["structure_module"]["final_atom_positions"])
                     frame(atom37_to_token_atoms(atom37, batch[0])[0])
+                distance = None if previous[0] is None else float(
+                    compute_tol(previous[0], atom37, np.ones(atom37.shape[0])))
+                previous[0] = atom37
+                if index > 0 and tolerance > 0 and distance is not None and distance < tolerance:
+                    converged[0] = (distance, index + 1)
+                    return True
+                return False
 
             def run_inference(featurised, *args, **kwargs):
                 if batch[0] is None:
@@ -607,6 +626,10 @@ class Worker:
                               job.get("family") or controls.get("model-family"))
         result["templates"] = used
         result["status"] += "".join(coverage)
+        if converged[0] is not None:
+            # ...worded as the WebGPU fold words it.
+            distance, ran = converged[0]
+            result["status"] += f" · converged at {distance:.2f} Å after {ran} passes"
         return result
 
     @staticmethod
