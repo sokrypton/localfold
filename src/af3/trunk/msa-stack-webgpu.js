@@ -207,6 +207,8 @@ export class Af3MsaStackGpu {
                        // in outer-product-mean-webgpu.js.
                        opmBiasAfterNorm: dialect.opmBiasAfterNorm === true,
                        ...(opmBlockI == null ? {} : { blockI: opmBlockI }),
+                       maxComputeWorkgroupStorageSize:
+                         this.device.limits?.maxComputeWorkgroupStorageSize,
                        ...(opmTuning.opmCellChunk == null
                          ? {} : { cellChunk: opmTuning.opmCellChunk }) };
     const opmOffsets = packOuterProductMeanWeights(sample.outerProductMean).offsets;

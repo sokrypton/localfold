@@ -2348,9 +2348,10 @@ pLDDT identical to the last digit against this card's own prior (IntelliFold-2
 🔴 **AND THE GRID PROJECTION NOW PRICES ITS FIT**: it stages 32 KiB, and the
 width rule's first spec-floor run could not create it at WebGPU's guaranteed 16
 KiB - unseen while only a 48 KiB part chose it. `gridProjectMatrixConfig`
-declines like the triangle's and the transition's choosers. (The turing
-prior's `opmBlockI: 8` has the same shape - 32 KiB on the OPM contraction for a
-512-channel pair at 16 KiB - and no real device has both; noted, not changed.)
+declines like the triangle's and the transition's choosers. The turing
+prior's `opmBlockI: 8` had the same shape - 32 KiB on the OPM contraction at
+16 KiB - and now halves until it fits (`createOuterProductMeanShaders` takes the
+device's limit); no real device has both, but the choosers are all priced now.
 
 🔴 **NOT YET MEASURED ON A T4**: every number here is this A100 answering with
 the T4's prior. The matrix kernels compile slower on a first fold, which is why
