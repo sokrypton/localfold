@@ -26,6 +26,7 @@ import glob
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -792,72 +793,112 @@ def fetch_ccd(codes):
                            f" {done.stderr[-400:]}")
 
 
-def main():
-    # 🔴 A JOB NAMING A NEW LIGAND RESTARTS THIS PROCESS WITH THAT JOB PENDING.
-    # The CCD tables are read at import, so a code first seen after the import
-    # cannot be added in place; `os.execv` keeps stdin and stdout, so the broker
-    # sees one worker that took a little longer.
-    pending = None
-    if len(sys.argv) > 2 and sys.argv[1] == "--pending":
-        pending = open(sys.argv[2]).read()
+def child_loop():
+    """The worker proper: imports JAX once, folds a job a line.
+
+    It never restarts itself - see supervise, which starts a fresh one when a
+    job needs different chemistry tables or a different model.
+    """
     fetched = set(json.loads(os.environ.get("LOCALFOLD_JAX_CODES", "null")) or [])
+    written = set(json.loads(os.environ.get("LOCALFOLD_JAX_CCD_WRITTEN", "null")) or [])
     worker = None
-    emit("jax-ready", {"at": int(time.time() * 1000)})
-    lines = iter(sys.stdin)
-    folded_family = None
-    while True:
-        line = pending if pending is not None else next(lines, None)
-        pending = None
-        if line is None:
-            break
+    for line in sys.stdin:
         if not line.strip():
             continue
         try:
             job = json.loads(line)
-            codes = set(codes_in(job["job"]))
-            family = job.get("family") or job.get("controls", {}).get("model-family")
-            # 🔴 A CHANGE OF MODEL IS A NEW PROCESS. Dropping the last runner
-            # does not free its weights: a JAX trace kept alive through
-            # weakref.finalize's registry holds them as constants, so every
-            # model folded stayed on the device - 1.6 GB in use after one, 16 GB
-            # after eleven, and OpenDDE, ESMFold2 and the multimer ran out of
-            # memory on a 40 GB A100. jax.clear_caches() and gc do not reach
-            # it; exec does. The new process takes its executables from the
-            # on-disk compile cache, which is what a change of model costs.
-            switched = worker is not None and family != folded_family
-            if worker is not None and (not codes <= fetched or switched):
-                path = os.path.abspath("jax_pending.json")
-                with open(path, "w") as handle:
-                    handle.write(line)
-                os.environ["LOCALFOLD_JAX_CODES"] = json.dumps(sorted(codes | fetched))
-                emit("status", f"restarting JAX for {', '.join(sorted(codes - fetched))}"
-                     if not codes <= fetched else f"restarting JAX for {family}")
-                # 🔴 fd 1 BACK ON THE PIPE FIRST. This process pointed it at
-                # stderr and keeps events on a private copy, which does not
-                # survive exec - so the new process would write its events to
-                # stderr and the broker would see the pipe close.
-                OUT.flush()
-                os.dup2(OUT.fileno(), 1)
-                os.execv(sys.executable, [sys.executable, os.path.abspath(__file__),
-                                          "--pending", path])
             if worker is None:
-                fetched |= codes
+                fetched |= set(codes_in(job["job"]))
                 # ...and a restart for a MODEL, not a code, finds the tables it
-                # needs already written: rewriting them was a subprocess that
-                # imports alphafold3, on every switch.
-                written = set(json.loads(os.environ.get("LOCALFOLD_JAX_CCD_WRITTEN", "null")) or [])
+                # needs already written.
                 if not (written and fetched <= written):
                     emit("status", "fetching chemical definitions")
                     fetch_ccd(sorted(fetched))
-                    os.environ["LOCALFOLD_JAX_CCD_WRITTEN"] = json.dumps(sorted(fetched))
                 emit("status", "starting JAX")
                 worker = Worker()
-            folded_family = family
             emit("result", worker.fold(job))
         except Exception as cause:                            # noqa: BLE001
             traceback.print_exc(file=sys.stderr)
             said = str(cause) if isinstance(cause, Refused) else f"{type(cause).__name__}: {cause}"
             emit("result", {"error": said})
+
+
+def die_with_parent():
+    """Linux: the child gets SIGKILL when the supervisor goes, however it goes -
+    so stopping a fold (which kills the supervisor) cannot orphan a process
+    holding the device."""
+    import ctypes
+    import signal
+    ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
+
+
+def supervise():
+    """Relays jobs to a worker process and starts a NEW one when it must.
+
+    🔴 A NEW LIGAND CODE OR A NEW MODEL IS A NEW PROCESS, AND NOT BY EXEC.
+    The CCD tables are read at import, so a code first seen later cannot be
+    added in place; and dropping a model's runner does not free its weights -
+    a JAX trace kept alive through weakref.finalize's registry holds them as
+    constants, so every model folded stayed on the device: 1.6 GB in use after
+    one, 16 GB after eleven, and OpenDDE, ESMFold2 and the multimer ran out of
+    memory on a 40 GB A100 (jax.clear_caches() and gc do not reach it). This
+    used `os.execv`, which frees a GPU and NOT a TPU: exec keeps the process
+    and its descriptors, libtpu still held the device, and every fold after
+    the first on a TPU v5e died with "Unable to initialize backend 'tpu'". A
+    child that EXITS gives both back. It takes its executables from the
+    on-disk compile cache, which is what a change of model costs anyway.
+    """
+    emit("jax-ready", {"at": int(time.time() * 1000)})
+    child, fetched, written, loaded = None, set(), set(), None
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            job = json.loads(line)
+            codes = set(codes_in(job["job"]))
+        except Exception as cause:                            # noqa: BLE001
+            emit("result", {"error": f"{type(cause).__name__}: {cause}"})
+            continue
+        family = job.get("family") or job.get("controls", {}).get("model-family")
+        if child is not None and (not codes <= fetched or family != loaded):
+            emit("status", f"restarting JAX for {', '.join(sorted(codes - fetched))}"
+                 if not codes <= fetched else f"restarting JAX for {family}")
+            child.stdin.close()
+            try:
+                child.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            written, child = set(fetched), None
+        if child is None:
+            fetched |= codes
+            env = {**os.environ, "LOCALFOLD_JAX_CHILD": "1",
+                   "LOCALFOLD_JAX_CODES": json.dumps(sorted(fetched)),
+                   "LOCALFOLD_JAX_CCD_WRITTEN": json.dumps(sorted(written))}
+            child = subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                     bufsize=1, env=env, preexec_fn=die_with_parent)
+        loaded = family
+        child.stdin.write(line if line.endswith("\n") else line + "\n")
+        child.stdin.flush()
+        for out in child.stdout:
+            OUT.write(out)
+            OUT.flush()
+            try:
+                if json.loads(out).get("kind") == "result":
+                    break
+            except ValueError:
+                pass
+        else:
+            emit("result", {"error": "the JAX worker exited"})
+            child = None
+
+
+def main():
+    if os.environ.get("LOCALFOLD_JAX_CHILD") == "1":
+        child_loop()
+    else:
+        supervise()
 
 
 if __name__ == "__main__":
