@@ -82,6 +82,7 @@
     "test:pending": "python3 tools/check-model-pending.py",
   "//test:colab": "The Colab bridge's transport, with no GPU and no weights: tools/colab_backend.py brokers between index.html?role=runtime (opened headlessly) and the reader's ?backend=colab, and every route is driven from the reader's side. It starts a Chrome, so it is not in the node lane.",
     "test:colab": "python3 tools/check-colab-bridge.py",
+    "test:jax": "python3 tools/check-jax-worker.py",
   "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. \ud83d\udd34 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
     "test:tools": "python3 tools/index-tools.py"
   },

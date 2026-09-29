@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-345 tools. `tools/fixtures/` is data and is not listed.
+346 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (193)
 
@@ -289,7 +289,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (87)
+## `tools/` - everything else (88)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -319,6 +319,7 @@ go through CDP, and the deploy.
 - **`check-esmfold2-modules.js`** - One module of ESMFold2's trunk at a time, against its own recorded answer.
 - **`check-esmfold2-sampler.js`** - ESMFold2's EDM sampler, in the parts a port can actually be held to.
 - **`check-esmfold2-trunk.js`** - Does LocalFold's pairformer arithmetic compute ESMFold2's trunk?
+- **`check-jax-worker.py`** - The JAX backend's worker, folding for real on this machine's GPU.
 - **`check-job-archive.py`** - Does a fold archive describe the AlphaFold 3 job that was handed in?
 - **`check-ligand-path.mjs`** - Every AF3-lineage model folds a LIGAND, and its bonds are the right length.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.

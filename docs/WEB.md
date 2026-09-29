@@ -3387,3 +3387,25 @@ template that arrived looked like one that did not. 🔴 Its first version
 crashed every templated fold - the new list was called `named`, which the loop
 beside it already uses for a template's display name - and only the TPU run
 caught it, because `test:colab`'s stub worker never reaches `fold()`.
+
+### The sixth pass: the JAX worker folds on this machine, as a gate
+
+Every JAX check so far needed a Colab VM, because the only local exercise of the
+worker - `test:colab` - uses a STUB that never reaches `Worker.fold`. That is
+how a name clash in the fifth pass's template bookkeeping crashed every
+templated JAX fold until a TPU run caught it.
+
+af3-any-model installs on this A100 exactly as on Colab: a Python 3.13 venv
+with `jax[cuda12]==0.11.1` and `dm-tree` (preinstalled on the Colab image), then
+ColabFold2's own install cell run in `~/lfjax` (57 s). The
+`alphafold3-colabfold` wheel is manylinux 2.28, so this box's glibc 2.35 takes
+it - unlike Dawn's node binding. And it folds to the digit what the L4 and the
+TPU folded: 1BRS multimer 15.78 A bare and **0.34 A**, ipTM 0.87, templated.
+
+`npm run test:jax` (`tools/check-jax-worker.py`) is the gate: the worker over
+its own stdin protocol, five cases in about three minutes - the multimer's two
+template arms, the templates the result must carry (one per fold chain, with
+the structure chain) and name on the status line, openbind0 templated
+(0.50 A), a GOL job after those (the worker's `execv` restart), and
+rosettafold3 refusing Flow. With the clash put back it fails on exactly the two
+templated folds with `'str' object has no attribute 'append'`.
