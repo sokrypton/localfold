@@ -2538,3 +2538,14 @@ confidence head upload it again. Keeping it on the device is worth ~0.2 s of a
 touches the trunk cache, the confidence head and rf3's host global norm. The
 other ~745 ms charged to that stage is not the readback: the stage clock also
 absorbs pairformer work still on the GPU.
+
+**And it does not cost the cold start.** `fold.js --folds=N`'s "first fold"
+cannot judge a prior's compile cost - bench tools run the tiered compile off and
+the driver's shader cache survives between arms - so the page was measured
+instead: Colab T4, the reader folds the moment it picks the model, driver cache,
+profile and weight cache cleared before every arm, two rounds. AF3 at 68
+residues 17.6 / 14.9 s old against 15.0 / 16.4 new; AF2 15.5 / 12.2 against
+15.6 / 18.2 - inside this card's spread both ways. A brand-new VM's very first
+fold read 21.7 s for AF3 (Chrome's first start and a cold path to Hugging Face
+included); 60 s after picking the model the page folds AF3 in 6.1 s and AF2 in
+4.0.
