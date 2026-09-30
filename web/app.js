@@ -959,20 +959,56 @@ let warmingFold = null;
 let warmSuperseded = false;
 window.__warmModel = (family, tokens) => {
   const signal = new AbortController().signal;
-  void startModelPreload(family, signal).catch(() => {});
-  if (!isAf3Family(family)) return;
-  void getDevice().then((device) => warmAf3Pipelines(family, tokens, device)).catch(() => {});
+  const preload = startModelPreload(family, signal);
+  void preload.catch(() => {});
+  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(family);
+  const af2 = !ef2 && !isAf3Family(family);
+  if (!ef2) void getDevice().then((device) => warmAf3Pipelines(family, tokens, device)).catch(() => {});
   const length = Number.isSafeInteger(tokens) && tokens >= 16 && tokens <= 1000 ? tokens : 64;
   warmSuperseded = false;
   const previous = warmingFold ?? Promise.resolve();
   warmingFold = previous.then(async () => {
     const device = await getDevice();
-    const weights = await loadAf3Weights(() => {}, family);
+    const weights = ef2 || af2 ? await preload : await loadAf3Weights(() => {}, family);
     if (warmSuperseded) return;
     // ...as a fold of this family would: the last one's weights go first.
     if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) releaseAllWeights(device);
     lastFoldedFamily = family;
     const residues = "ACDEFGHIKLMNPQRSTVWY".repeat(Math.ceil(length / 20)).slice(0, length);
+    if (af2) {
+      // ...and AlphaFold 2's, the multimer over two chains so its chain-aware
+      // regime is what compiles.
+      const model = weights;
+      const multimer = graphOf(family) === "multimer";
+      const chains = multimer
+        ? [residues.slice(0, length >> 1), residues.slice(length >> 1)] : [residues];
+      const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
+      await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device).predictA3m(
+        `>query\n${chains.join("")}\n`, model.weights, model.featureTables,
+        { recycles: 1, randomSeed: 1, maxMsaSequences, maxExtraSequences, tolerance: 0, signal,
+          chainLengths: chains.map((chain) => chain.length),
+          ...(multimer ? { outerProductMeanFirst: true, positionScale: 20, chainAware: true,
+                           chainSequences: chains } : {}) },
+        model.paeBreaks, () => {}, () => {});
+      return;
+    }
+    if (ef2) {
+      // ...and ESMFold2's, through the same entry point its fold takes, with
+      // the tower it builds: the language model, trunk, sampler and head all
+      // compile on the dummy.
+      const loaded = weights;
+      await foldEsmfold2(device, {
+        sequence: residues,
+        entities: { sequence: residues, chainKinds: ["protein"], ligands: [], modifications: [] },
+        shape: { ...loaded.shape, loops: 2 },
+        weights: loaded.weights, confidenceWeights: loaded.confidenceWeights,
+        tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
+                                   loaded.shape.pairChannels),
+        sampler: samplerPreset(), seed: 1, languageModel: usesLanguageModel(family),
+        languageModelMiB: loaded.language?.megabytes,
+      });
+      return;
+    }
     await foldAf3({
       // ...ONE recycle, not none: a pass that reads the last pass's pair and
       // single compiles kernels a first pass does not, and the reader's fold
