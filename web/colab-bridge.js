@@ -310,6 +310,12 @@ async function obey(command) {
     tapOut("pong", { at: Date.now(), folding: folding(), status: statusText() });
     return;
   }
+  if (op === "warm") {
+    // The reader has picked a model: start its weights and pipelines here,
+    // unless a fold is already using the GPU. See warmRemoteModel in app.js.
+    if (!folding()) window.__warmModel?.(payload?.family, payload?.tokens);
+    return;
+  }
   if (op === "stop") {
     // 🔴 STOPPING IS THE SAME BUTTON. `predict` is a toggle - it is how a
     // reader stops a fold - so there is no second control to keep in step.
@@ -433,6 +439,16 @@ export function base64ToBytes(text) {
 let backendChoice = "webgpu";
 export const remoteBackendChoice = () => backendChoice;
 
+// 🔴 WHETHER THE RUNTIME HAS A REAL GPU IS NOT KNOWN UNTIL /health ANSWERS, and
+// the choice above says "webgpu" until then - so anything that acts on it early
+// (the model warm-up) waits for this. A TPU runtime's WebGPU is SwiftShader: a
+// warm-up there downloads weights and compiles on the CPU beside JAX.
+let runtimeWebgpu = null;
+const readyListeners = [];
+export const remoteWebgpuReal = () => runtimeWebgpu === true;
+export function onRemoteReady(listener) { readyListeners.push(listener); }
+const announceReady = () => { for (const listener of readyListeners) listener(); };
+
 /** Ask the runtime for something. Returns the command's sequence number. */
 export const remoteCommand = (op, payload) => ask("/in", { op, payload });
 
@@ -529,6 +545,8 @@ function installColabStatus() {
       // 🔴 THE CHOICE APPEARS ONLY WHERE IT EXISTS. A runtime started without
       // `--jax-dir` has one backend, and a select with one option is a control
       // that pretends there is something to decide.
+      runtimeWebgpu = gpu.webgpu !== false && gpu.vendor !== "google"
+        && !/swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
       if ((health.backends ?? []).includes("jax") && !badge.querySelector("select")) {
         const pick = document.createElement("select");
         pick.className = "colab-backend";
@@ -560,6 +578,7 @@ function installColabStatus() {
         backendChoice = pick.value;
         pick.addEventListener("change", () => {
           backendChoice = pick.value;
+          announceReady();
           try { localStorage.setItem("localfold.colabBackend", pick.value); }
           catch (cause) { /* remembered for this page only */ }
         });
@@ -574,6 +593,7 @@ function installColabStatus() {
       // ...and the timing report is headed with it, because the rows in it
       // were recorded on that card and not on this one.
       if (card !== "") devSourceIs(`the Colab runtime · ${card}`);
+      announceReady();
     } catch (cause) { /* the pulse below is what matters; this is its name */ }
   };
 

@@ -79,7 +79,8 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
-import { colabRole, installColabBridge, remoteBackendChoice, remoteCommand, remoteEvents,
+import { colabRole, installColabBridge, onRemoteReady, remoteBackendChoice, remoteCommand,
+  remoteEvents, remoteWebgpuReal,
   remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
@@ -909,6 +910,40 @@ let foldContext = {};
 // The family the page last folded, so a change of model can release the last
 // one's resident weights - see the fold's first lines.
 let lastFoldedFamily;
+
+/**
+ * 🔴 A COLAB RUNTIME SITS IDLE WHILE THE READER CHOOSES, AND A T4's COLD FOLD
+ * IS NEARLY ALL WAITING. Measured on one (68 residues, empty caches): the
+ * compiler busy 16.5 s of AF3's 22.5, 43.8 of OpenDDE's 50.5, 63.9 of
+ * IntelliFold-2's 73.6 - whose 612 MB also took 57 s to arrive. So the reader
+ * tells the runtime which model it has picked, the moment it picks it, and the
+ * runtime starts that model's download and pipeline compiles while the
+ * sequence is still being typed. The loaders keep their promises, so the fold
+ * takes what is already under way. WebGPU only: a JAX fold starts its own
+ * worker. See `warmModel`, which is what the runtime runs.
+ */
+let warmedRemotely;
+function warmRemoteModel(family) {
+  if (remoteBackend() === null || remoteBackendChoice() !== "webgpu" || !remoteWebgpuReal()) return;
+  if (family === warmedRemotely) return;
+  warmedRemotely = family;
+  const tokens = entityList.read().reduce((sum, entity) =>
+    sum + (POLYMER_TYPES.includes(entity.type) ? String(entity.value ?? "").length * entity.copies : 0), 0);
+  void remoteCommand("warm", { family, tokens: tokens || 100 }).catch(() => {});
+}
+
+// ...and once the runtime has said what GPU it has, or the reader switches to
+// WebGPU, the model already chosen is warmed.
+onRemoteReady(() => { try { warmRemoteModel(chosenFamily()); } catch (cause) { /* nothing chosen yet */ } });
+
+/** The runtime's half: start `family`'s download and compiles, fold nothing. */
+window.__warmModel = (family, tokens) => {
+  const signal = new AbortController().signal;
+  void startModelPreload(family, signal).catch(() => {});
+  if (isAf3Family(family)) {
+    void getDevice().then((device) => warmAf3Pipelines(family, tokens, device)).catch(() => {});
+  }
+};
 
 const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
                        "msa-text", "max-msa", "recycles", "tolerance",
@@ -2534,6 +2569,7 @@ function setFoldButton(state) {
 function syncModelControls() {
   const family = chosenFamily();
   const af3 = isAf3Family(family);
+  warmRemoteModel(family);
   // 🔴 THE MODEL NUMBER IS AF2's ALONE, and the test is the ROW's value rather
   // than the resolved family - `chosenFamily` has already folded the number
   // into it, so asking the resolved one whether to show the control that

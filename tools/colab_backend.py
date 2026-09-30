@@ -9,7 +9,7 @@ which folds - and the one a reader opens, `index.html?backend=colab`, which
 asks. Four routes carry that, all of them token-checked:
 
     GET  /health            what the card is, and whether a fold is running
-    POST /in                the reader asks: {op: "fold"|"stop"|"ping", payload}
+    POST /in                the reader asks: {op: "fold"|"stop"|"ping"|"warm", payload}
     GET  /out?since=N       the runtime page collects what has been asked
     POST /up                the runtime page pushes what it says and draws
     GET  /down?since=N      the reader receives it
@@ -535,7 +535,7 @@ def serve(port, backend, token, host="127.0.0.1", jax=None):
                 threading.Thread(target=lambda: (time.sleep(0.3),
                                                  STOPPING.set()), daemon=True).start()
                 return None
-            if op not in ("fold", "stop", "ping"):
+            if op not in ("fold", "stop", "ping", "warm"):
                 return self._json(400, {"error": f'unknown op "{op}"'})
             payload = body.get("payload") or {}
             if op == "fold" and payload.get("backend") == "jax":
