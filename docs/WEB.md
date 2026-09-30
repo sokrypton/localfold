@@ -3649,3 +3649,26 @@ a GOL job that needs new chemistry, rosettafold3's Flow refusal and ESMFold2 600
 (1.47 A). Every one after the first is a job the exec-based restart killed on a
 TPU with "Unable to initialize backend 'tpu'"; the supervisor starts a fresh
 child and the TPU is released with the old one.
+
+### The T4's missing cells, and AF2 with early stop off on it
+
+Filled in on one Colab T4 (same harness, cold / warm seconds). With the width
+rules, WebGPU's wide models at 261 residues are 99 / 97 s (IntelliFold-2) and
+80 / 70 (OpenDDE):
+
+| T4 | WebGPU | JAX |
+|---|---:|---:|
+| IntelliFold-2, 68 | 58.3 / 8.6 | 129.9 / 13.5 |
+| IntelliFold-2, 261 | **98.7 / 96.9** | 289.7 / 185.2 |
+| OpenDDE, 68 | 46.9 / 8.6 | 128.2 / 10.6 |
+| OpenDDE, 261 | **80.4 / 70.2** | **out of memory** |
+| AF2 monomer, 68, 4 passes | 12.6 / 5.7 | 168.3 / 3.5 |
+| AF2 multimer, 68, 4 passes | 6.0 / 2.5 | 66.9 / 3.5 |
+| AF2 monomer, 261, 4 passes | 26.0 / 26.6 | 80.0 / 25.6 |
+| AF2 multimer, 261, 4 passes | 19.3 / 18.2 | 92.5 / 27.8 |
+
+On a T4 WebGPU is ahead warm as well as cold on the wide models - IntelliFold-2
+nearly 2x at 261 - and **OpenDDE at 261 does not fit JAX on the 16 GB card at
+all** (RESOURCE_EXHAUSTED in a fresh worker process, so not the old leak), where
+WebGPU folds it in 70 s. AF2 warm is a tie at 261 for the monomer and WebGPU's
+for the multimer; JAX leads warm only at 68 residues, by 2 s.
