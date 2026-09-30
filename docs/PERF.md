@@ -2502,3 +2502,18 @@ The AF3 gap between 60 s and 150 s is the tiered upgrades still compiling one
 at a time on two vCPUs. Letting them take every thread while nothing folds was
 tried (`setUpgradeBoost`) and reverted: three arms read 5.5 / 7.1 / 8.5 s, which
 is the T4's own scatter and no evidence either way. Not taken without a result.
+
+### The T4 prior: ampere's knobs under turing's (2026-09-30)
+
+The turing prior set four knobs and left the rest at DEFAULT_TUNING, on the
+strength of a standalone triangle bench where ampere's entry regressed 40%. A
+whole fold disagrees. Colab T4, two rounds interleaved, 255 residues, seconds:
+AF3 warm 11.5-13.0 -> **10.7-10.9**, first fold 17.1-20.9 -> **14.5-15.8**, AF2
+monomer 15.2-16.3 -> **12.0-12.1**, IntelliFold-2 warm 35.5 -> **33.4**, against
+ampere's entry alone at 11.2-11.4 / 15.4-15.9 / 12.0 / 33.8. So turing is now
+ampere's entry with turing's measured settings on top and `opmBlockITokens`
+cleared (see device-profile.js). The same T4 profile found the AF3 trunk's
+distogram stage at 918 ms of a 3.1 s pass with a 5.7 ms kernel - the readback,
+not the head - which is what the logits change addressed; the pair and single
+read back for the conditioning and confidence heads are the rest of it, and
+taking them off the host touches the trunk cache and rf3's host global norm.
