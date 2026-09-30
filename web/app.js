@@ -3054,6 +3054,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let liveSampler = 0;
   const drawLiveFrame = (pdb, kind) => {
     remoteTap("frame", pdb);
+    // 🔴 A COLAB RUNTIME PUSHES ITS FRAMES AND DRAWS NONE. Nobody looks at
+    // that page - the reader draws what it is sent - and on a T4's two vCPUs
+    // parsing and rendering every sampler step competed with the fold itself.
+    // The finished structure still loads into it, which its download needs.
+    if (colabRole() === "runtime") return;
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -3561,6 +3566,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const framePdbs = [];
   const drawLiveFrame = (pdb) => {
     remoteTap("frame", pdb);
+    // 🔴 A COLAB RUNTIME PUSHES ITS FRAMES AND DRAWS NONE. Nobody looks at
+    // that page - the reader draws what it is sent - and on a T4's two vCPUs
+    // parsing and rendering every sampler step competed with the fold itself.
+    // The finished structure still loads into it, which its download needs.
+    if (colabRole() === "runtime") return;
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
