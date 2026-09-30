@@ -139,6 +139,7 @@ export class HttpTensorStore {
   #loadedBytes = 0;
   #loadedTensors = 0;
   #shardCache;
+  #reportedAt = 0;
   #shardQuery = "";
   /** How many bytes the last short read got, so the error can say. */
   #lastStreamBytes = 0;
@@ -509,22 +510,29 @@ export class HttpTensorStore {
     let arrived;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const response = await fetchWithRetry(url, `tensor ${tensorName}`);
-      // The cache copy is taken BEFORE the body is read, because a Response
-      // body can only be consumed once and the clone has to be made while it is
-      // intact. Storing it is best-effort: over quota the put throws and the
-      // load carries on, one slow page instead of a broken one.
-      void this.#cachePut(url, response.clone());
+      // 🔴 THE CACHE COPY IS WRITTEN FROM THE FINISHED BUFFER, NOT TEED OFF THE
+      // STREAM. A `response.clone()` put beside the read ties the download to
+      // the disk: on a Colab T4 (two vCPUs) IntelliFold-2's 612 MB took 33.6 s
+      // with the tee against 26.4 without, where curl on the same VM fetches
+      // it in 6.8. Storing after the read also means a torn stream can never
+      // land in the cache. Best-effort still: over quota the put throws and
+      // the load carries on.
       if (response.body === null) {
         const buffer = await response.arrayBuffer();
         if (buffer.byteLength === expectedLength) {
           this.#loadedBytes += buffer.byteLength;
           this.#reportProgress();
+          void this.#cachePut(url, new Response(buffer));
           return buffer;
         }
         arrived = buffer.byteLength;
       } else {
         const bytes = await this.#readStream(response, file, expectedLength);
-        if (bytes !== undefined) return bytes;
+        if (bytes !== undefined) {
+          void this.#cachePut(url, new Response(bytes, {
+            headers: { "content-length": String(bytes.byteLength) } }));
+          return bytes;
+        }
         arrived = this.#lastStreamBytes;
       }
       // 🔴 AND THE CACHE COPY GOES WITH IT. The clone above was stored while the
@@ -560,8 +568,15 @@ export class HttpTensorStore {
         output.set(value, offset);
         offset += value.byteLength;
         this.#loadedBytes += value.byteLength;
-        this.#reportProgress();
+        // ...reported at most every 100 ms: a 612 MB bundle is thousands of
+        // network chunks, and each report redraws the page's download dial.
+        const now = performance.now();
+        if (now - this.#reportedAt >= 100) {
+          this.#reportedAt = now;
+          this.#reportProgress();
+        }
       }
+      this.#reportProgress();
     } catch {
       offset = -1;                                   // a torn cache entry reads as a failure
     }
