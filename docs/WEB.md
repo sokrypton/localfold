@@ -3672,3 +3672,70 @@ nearly 2x at 261 - and **OpenDDE at 261 does not fit JAX on the 16 GB card at
 all** (RESOURCE_EXHAUSTED in a fresh worker process, so not the old leak), where
 WebGPU folds it in 70 s. AF2 warm is a tie at 261 for the monomer and WebGPU's
 for the multimer; JAX leads warm only at 68 residues, by 2 s.
+
+### A Colab A100 against this A100, and what the difference was (2026-09-30)
+
+Same card on both (A100-SXM4-40GB), same commit, same harness
+(`bench_h2h.py`, WebGPU only, fresh profile and empty caches, reader page ->
+broker -> runtime page), every model at 6MRR (68) and 5CAJ (261). All 160 folds
+give the same structure to 0.01 A on both machines, so only time differs.
+Click-to-done seconds, cold / warm, before and after the fix below:
+
+| 261 residues | this A100 before | Colab before | this A100 after | Colab after |
+|---|---:|---:|---:|---:|
+| AF2 monomer | 10.5 / 9.0 | 12.5 / 11.6 | 6.5 / 5.0 | 7.1 / **5.6** |
+| AF3 | 5.0 / 4.5 | 6.0 / 5.5 | 5.0 / 4.6 | 5.6 / 5.0 |
+| IntelliFold-2 | 24.6 / 16.1 | 29.3 / 19.1 | 24.6 / 16.0 | 29.2 / 19.3 |
+| OpenDDE | 24.1 / 12.6 | 26.8 / 15.5 | 21.6 / 12.1 | 26.6 / 14.5 |
+| ESMFold2 | 5.1 / 3.0 | 6.1 / 4.1 | 5.5 / 3.0 | 6.5 / 4.1 |
+
+At 68 residues every model is within 0.5 s warm on both, which is the
+harness's polling resolution. The first Colab session's first fold took 61 s
+(8.0 on the second session) and its OpenDDE and Boltz-2 68-residue colds were
+23 and 12 s (11.0 and 5.5 on the second): VM and network variance, not the port.
+
+🔴 **THE GPU WAS NEVER THE DIFFERENCE, AND EACH CANDIDATE WAS MEASURED OUT:**
+- clocks: 1410 MHz under load on Colab with no throttle reason, and
+  `nvidia-smi -lgc 1410,1410` there changes nothing (IntelliFold-2 19.1 s both
+  ways); releasing this box's lock changes nothing either (15.9 against 16.1);
+- the device: `probe-alu.js` within 6% everywhere (f32 FMA 14.0 against 14.9
+  TFLOP/s, vec4 f16 110 against 115, streamed reads 145 against 145),
+  `probe-dispatch.js` within 10%;
+- the browser build: Colab's Chrome 153 headless shell run HERE gives this
+  box's times (IntelliFold-2 16.1, OpenDDE 12.1, monomer 7.6 warm);
+- the fold itself: `fold-af2.js --target=5caj --repeat=3` is 1.02 / 1.00 s on
+  Colab against 1.005 / 1.002 here, an AF2 block's GPU time 15.7 against 15.0 ms.
+
+What differs is the HOST: a 2.2 GHz Xeon (12 vCPUs) against an EPYC 7J13 (30).
+The same Chrome binary runs a typed-array JavaScript loop in **485 ms there and
+237 here** (map work 1.2x). So a fold slows on Colab in proportion to its
+host-side JavaScript, and the page had one fold that was mostly that.
+
+🔴 **AF2's CONTACT MAP WAS HALF OF AN AF2 FOLD ON THE PAGE.** Every pass,
+`web/app.js` asked for the pair representation back (`pairHost`, `L^2 * 128`
+floats, 35 MB at 261) and ran the distogram head over it in JavaScript
+(`L^2 * 128 * 64` multiply-adds) in a `setTimeout` on the main thread - between
+the fold's own steps, so it delayed them rather than overlapping. With it
+switched off the page's AF2 fold at 255 residues was **2.6 s against 6.0**, the
+fold tool's own 2.5 at those settings. It is on the device now
+(`src/heads/distogram-webgpu.js`, monomer.js's `contacts` option): `L * L`
+probabilities come back, `probe-af2-contacts.js` holds them to the host function
+every pass (5-7e-7 at 58 residues, 1.0e-6 at 255; a kernel reading the forward
+pair twice fails at 0.14), and `fold-in-page.py --model monomer` still puts a
+contact map on every frame. The Colab gap for AF2 went from 2.6 s to 0.6.
+
+**What is left** is the GPU-bound families' host work at 2x the cost: 10-20%
+warm at 261 (IntelliFold-2 16.0 against 19.3 s). Profiled here, IntelliFold-2's
+warm fold is 3.1 s of JavaScript in 13.7, most of it re-packing trunk weights -
+which is deliberate: at 255 residues the fold is past
+`WEIGHT_RELEASE_MIN_BYTES`, so it streams its trunk weights and gives them back
+(4458 MiB held against 3343 released, +3% on this box). On Colab that trade
+costs about twice as much time and the same memory.
+
+🔴 **AND A NEW COLAB IMAGE BROKE THE NOTEBOOK'S SETUP ON THE WAY.** Two A100
+sessions today (driver 580.178) ended the setup before Chrome was in place:
+the driver step's `ldconfig` ran while the background `apt-get install` ran
+dpkg's own, the two collided on `/etc/ld.so.cache~` ("Renaming ... failed"),
+and `set -e` stopped the script. The runtime then had no browser and the
+reader's page timed out with nothing folded. The notebook now runs one
+`ldconfig`, after the apt job is waited for; the next fresh A100 set up in 10 s.
