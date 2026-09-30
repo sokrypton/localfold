@@ -209,7 +209,8 @@ class Backend:
         # one. web/colab-bridge.js reads both out of its own URL.
         self.ws.call("Page.navigate", url=(
             f"http://127.0.0.1:{self.port}/index.html"
-            f"?role=runtime&weights=proxy&t={urllib.parse.quote(self.token)}"))
+            f"?role=runtime{'' if os.environ.get('LOCALFOLD_WEIGHT_PROXY') == '0' else '&weights=proxy'}"
+            f"&t={urllib.parse.quote(self.token)}"))
         cdp.wait_for(self.ws, "!!window.__entityList", 180, "the page")
         # 🔴 THE TERMS DIALOG WOULD OTHERWISE EAT THE CLICK. AlphaFold 3's
         # parameters are gated behind an acknowledgement that opens in FRONT of
