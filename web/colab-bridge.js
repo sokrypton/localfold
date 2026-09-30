@@ -117,8 +117,22 @@ export function tapOut(kind, payload) {
   if (colabRole() !== "runtime") return;
   pending.push({ kind, payload, at: Date.now(), seq: seqOut });
   seqOut += 1;
-  flush();
+  // ...and sent at the END OF THIS TASK, not per event. A microtask runs
+  // before the task yields, so the rule above holds (the send starts in the
+  // task that made it), but a sampler step's status, bar and frame go as ONE
+  // request instead of three - on a T4's two vCPUs a fold's fetches were
+  // 547 ms of its main thread.
+  // 🔴 BUT NEVER LATER THAN 50 ms INSIDE ONE LONG TASK: a microtask waits for
+  // the task to end, and a page busy in one synchronous stretch held events
+  // for its whole length (test:colab measured 6 s). Past 50 ms the batch goes
+  // now, from the task that made it.
+  if (Date.now() - pending[0].at >= 50) { flush(); return; }
+  if (!flushQueued) {
+    flushQueued = true;
+    queueMicrotask(() => { flushQueued = false; flush(); });
+  }
 }
+let flushQueued = false;
 
 /* ------------------------------------------------- ...and what it is told to do */
 

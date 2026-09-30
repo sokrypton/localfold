@@ -950,7 +950,7 @@ onRemoteReady(() => { try { warmRemoteModel(chosenFamily()); } catch (cause) { /
  * conditioning and the confidence head have no compile-only path, and on a T4
  * they were the 6 s between a warmed first fold (12.1 s) and a warm one (6.2).
  * A real fold of a dummy sequence at the reader's length - two sampler steps,
- * no recycles - compiles every stage exactly as the fold will, and leaves this
+ * one recycle - compiles every stage exactly as the fold will, and leaves this
  * model's weights resident for it. The fold waits for it (see `warmingFold`).
  */
 let warmingFold = null;
@@ -974,7 +974,10 @@ window.__warmModel = (family, tokens) => {
     lastFoldedFamily = family;
     const residues = "ACDEFGHIKLMNPQRSTVWY".repeat(Math.ceil(length / 20)).slice(0, length);
     await foldAf3({
-      sequence: residues, mode: "diffusion", calls: 2, recycles: 0, seed: 1, weights, device,
+      // ...ONE recycle, not none: a pass that reads the last pass's pair and
+      // single compiles kernels a first pass does not, and the reader's fold
+      // has recycles.
+      sequence: residues, mode: "diffusion", calls: 2, recycles: 1, seed: 1, weights, device,
       signal, chainKinds: ["protein"], onStatus: () => {}, onProgress: () => {},
     });
   }).catch((cause) => console.warn("warm-up fold:", cause));
