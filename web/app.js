@@ -936,13 +936,43 @@ function warmRemoteModel(family) {
 // WebGPU, the model already chosen is warmed.
 onRemoteReady(() => { try { warmRemoteModel(chosenFamily()); } catch (cause) { /* nothing chosen yet */ } });
 
-/** The runtime's half: start `family`'s download and compiles, fold nothing. */
+/**
+ * The runtime's half: start `family`'s download and compiles.
+ *
+ * 🔴 AND THEN A THROWAWAY FOLD, BECAUSE THE TRUNK WARM LEFT A THIRD OF THE
+ * COMPILE. `warmAf3Pipelines` builds the pairformer and the template embedder
+ * from the manifest's shapes; the sampler, the atom encoder and decoder, the
+ * conditioning and the confidence head have no compile-only path, and on a T4
+ * they were the 6 s between a warmed first fold (12.1 s) and a warm one (6.2).
+ * A real fold of a dummy sequence at the reader's length - two sampler steps,
+ * no recycles - compiles every stage exactly as the fold will, and leaves this
+ * model's weights resident for it. The fold waits for it (see `warmingFold`).
+ */
+let warmingFold = null;
+// Set by a real fold: a warm-up that has not yet reached its dummy fold skips it
+// rather than make the reader's fold wait behind it.
+let warmSuperseded = false;
 window.__warmModel = (family, tokens) => {
   const signal = new AbortController().signal;
   void startModelPreload(family, signal).catch(() => {});
-  if (isAf3Family(family)) {
-    void getDevice().then((device) => warmAf3Pipelines(family, tokens, device)).catch(() => {});
-  }
+  if (!isAf3Family(family)) return;
+  void getDevice().then((device) => warmAf3Pipelines(family, tokens, device)).catch(() => {});
+  const length = Number.isSafeInteger(tokens) && tokens >= 16 && tokens <= 1000 ? tokens : 64;
+  warmSuperseded = false;
+  const previous = warmingFold ?? Promise.resolve();
+  warmingFold = previous.then(async () => {
+    const device = await getDevice();
+    const weights = await loadAf3Weights(() => {}, family);
+    if (warmSuperseded) return;
+    // ...as a fold of this family would: the last one's weights go first.
+    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) releaseAllWeights(device);
+    lastFoldedFamily = family;
+    const residues = "ACDEFGHIKLMNPQRSTVWY".repeat(Math.ceil(length / 20)).slice(0, length);
+    await foldAf3({
+      sequence: residues, mode: "diffusion", calls: 2, recycles: 0, seed: 1, weights, device,
+      signal, chainKinds: ["protein"], onStatus: () => {}, onProgress: () => {},
+    });
+  }).catch((cause) => console.warn("warm-up fold:", cause));
 };
 
 const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
@@ -4415,6 +4445,10 @@ async function fold(event) {
     // kept between folds so the same model's next fold skips its packing, and
     // it was kept across a CHANGE of model too - four models in one page and
     // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
+    // ...and a warm-up fold still running is waited for, not raced: it is
+    // compiling what this fold needs and holds the GPU (see __warmModel).
+    warmSuperseded = true;
+    if (warmingFold !== null) await warmingFold;
     if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
       releaseAllWeights(await getDevice());
     }
