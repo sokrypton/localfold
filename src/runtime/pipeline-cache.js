@@ -216,19 +216,6 @@ export class ComputePipelineCache {
   #lastMiss = 0;
   #pendingUpgrades = [];
   #draining = 0;
-  #boost = false;
-
-  /**
-   * 🔴 EVERY THREAD FOR THE UPGRADES WHILE NOTHING IS FOLDING. A quarter of
-   * the threads is right beside a fold, and on a T4's two vCPUs it is one - so
-   * after a Colab runtime's warm-up the unrolled kernels were still compiling
-   * a minute later (AF3 folded 60 s after choosing: 7.0 s; 150 s: 5.4). The
-   * page raises this when its warm-up is done and lowers it when a fold starts.
-   */
-  setUpgradeBoost(on) {
-    this.#boost = on === true;
-    if (this.#boost) this.#drainUpgrades();
-  }
 
   /**
    * Compile the queued unrolled kernels after a quiet spell, a quarter of the
@@ -238,8 +225,7 @@ export class ComputePipelineCache {
    */
   async #drainUpgrades() {
     const threads = globalThis.navigator?.hardwareConcurrency ?? 2;
-    const limit = this.#boost ? threads : Math.max(1, Math.floor(threads / 4));
-    if (this.#draining >= limit) return;
+    if (this.#draining >= Math.max(1, Math.floor(threads / 4))) return;
     this.#draining += 1;
     if (this.#pendingUpgrades.length > 1) this.#drainUpgrades();
     try {
