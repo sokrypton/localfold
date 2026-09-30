@@ -2484,3 +2484,21 @@ compile. T4, 68 residues:
 IntelliFold-2 folded at once is Hugging Face's to decide: 28.9 s before its
 fold began on one run, 6.5 on another, through the same proxy. What is left
 after a warm-up is the first real fold's ~5 s against 3.2-3.5 for later ones.
+
+### Every family warms, and what the upgrades are worth
+
+The warm-up covers ESMFold2 and AlphaFold 2 now - a throwaway fold through each
+family's own entry point (`foldEsmfold2`; `AlphaFoldMonomerGpu` /
+`AlphaFoldUnifiedGpu` with the multimer's regime over two chains). T4, 68
+residues, fold at once against 60 s after choosing:
+
+| T4 | at once | after 60 s |
+|---|---:|---:|
+| ESMFold2 600M | 28.7 s | **5.6** |
+| AF2 monomer | 21.9 s | **3.4** |
+| AF3 | 13.0 s | 6.4-7.0 (5.4 after 150 s) |
+
+The AF3 gap between 60 s and 150 s is the tiered upgrades still compiling one
+at a time on two vCPUs. Letting them take every thread while nothing folds was
+tried (`setUpgradeBoost`) and reverted: three arms read 5.5 / 7.1 / 8.5 s, which
+is the T4's own scatter and no evidence either way. Not taken without a result.
