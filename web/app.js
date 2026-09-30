@@ -1820,7 +1820,14 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
       return res;
     };
     const origRender = viewer.render ? viewer.render.bind(viewer) : null;
-    if (origRender) {
+    // 🔴 A COLAB RUNTIME DRAWS NOTHING, the finished structure included. Its
+    // live frames already stop at `remoteTap` (drawLiveFrame); this is the
+    // rest - 60-140 ms of canvas a fold on an A100 box, on a page no one sees,
+    // on a CPU that also has the fold to run. The frames are still built, so
+    // anything that reads the viewer's objects reads what it always did.
+    if (origRender && colabRole() === "runtime") {
+      viewer.render = () => {};
+    } else if (origRender) {
       viewer.render = function(...args) {
         const res = origRender(...args);
         syncScoresCardToActiveFrame();
@@ -6025,7 +6032,7 @@ element("download-all").addEventListener("click", async () => {
  * where it arrives.
  */
 async function rememberSessionWhenSettled(pred) {
-  if (!pred?.pdb) return;
+  if (!pred?.pdb || colabRole() === "runtime") return;   // see rememberSession
   const registry = window.py2dmol_viewers ?? {};
   const renderer = registry[Object.keys(registry)[0]]?.renderer;
   const count = () => renderer?.objectsData?.[pred.stem]?.frames?.length ?? 0;
@@ -6047,6 +6054,11 @@ async function rememberSessionWhenSettled(pred) {
 
 async function rememberSession(pred) {
   if (!pred?.pdb) return;
+  // 🔴 NOT ON A COLAB RUNTIME. Nobody reloads that page to get a fold back -
+  // the reader's own page saves what it was sent - and the save is the whole
+  // viewer session stringified and gzipped: 94-229 ms of main thread after each
+  // fold on an A100 box, twice that on a runtime's CPU, in the way of the next.
+  if (colabRole() === "runtime") return;
   try {
     // 🔴 py2Dmol BUILDS THIS, NOT US. `buildViewerState` is what its own Save
     // button writes, so the session carries every frame - the whole sampler
