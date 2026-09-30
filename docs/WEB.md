@@ -3638,3 +3638,14 @@ benchmark sets `tolerance: 0` from now on. The one step-count difference left
 is ESMFold2's (11 denoiser steps on WebGPU, which follows the vendor's
 `max_inference_sigma` cap, against af3-any-model's 15), which favours WebGPU by
 about a quarter of that model's sampler.
+
+### The supervisor worker on a TPU v5e
+
+`npm run test:jax` on a Colab TPU v5e (`python3 tools/check-jax-worker.py
+--python $(command -v python3) --jax-dir /content/jax`, after the notebook's own
+setup: 21 s, JAX install 81 s): **all seven cases pass** - the multimer's two
+template arms (16.28 -> 0.34 A), the early stop, a switch to openbind0 (0.49 A),
+a GOL job that needs new chemistry, rosettafold3's Flow refusal and ESMFold2 600M
+(1.47 A). Every one after the first is a job the exec-based restart killed on a
+TPU with "Unable to initialize backend 'tpu'"; the supervisor starts a fresh
+child and the TPU is released with the old one.
