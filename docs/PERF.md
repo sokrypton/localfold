@@ -2457,3 +2457,30 @@ every local broker after them attached to the OLD browser - old page, old
 modules from its HTTP cache - instead of starting its own. The proxy "did
 nothing" until the port was checked. A broker's `cdp.launch` cannot tell a
 browser it started from one it found; kill by profile, and check the port.
+
+### The runtime page's own overhead on a T4
+
+A warm AF3 fold at 68 residues on the T4 is **3.8 s through `fold.js`** (4 passes,
+25 steps) and **3.2-3.5 s folded directly in the runtime page**, so the page is
+not the slow part once it is warm. A JavaScript profile of the runtime during a
+fold (CDP `Profiler`, 0.5 ms sampling) put 547 ms in `fetch` - every status, bar
+fraction and sampler frame was its own POST to the broker - and time in drawing
+each frame into a viewer nobody looks at. Two changes:
+
+- **the runtime pushes its live frames and draws none**; the finished structure
+  still loads, which its download button reads;
+- **the bridge sends a task's events as one request**, by microtask, and a batch
+  older than 50 ms goes at once (a long synchronous stretch must not hold the
+  feed - `test:colab`'s busy-page arm failed at 6 s with the microtask alone).
+
+The warm-up dummy also takes one recycle now, so a recycled pass's kernels
+compile. T4, 68 residues:
+
+| | at once | after 60 s |
+|---|---:|---:|
+| AF3 | **13.0 s** (32.3 at the start of these passes) | **6.4** |
+| IntelliFold-2 | 18.7-40.8 (network) | **8.9** (67 at the start) |
+
+IntelliFold-2 folded at once is Hugging Face's to decide: 28.9 s before its
+fold began on one run, 6.5 on another, through the same proxy. What is left
+after a warm-up is the first real fold's ~5 s against 3.2-3.5 for later ones.
