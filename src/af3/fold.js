@@ -146,11 +146,40 @@ export function atomName(nameChars, slot) {
  * not ask for would change what every one of them parses.
  */
 export function toPdb(batch, positions, plddt, options = {}) {
-  const { tokens, dense, sequence } = batch;
+  // 🔴 ONE TEMPLATE A BATCH, BECAUSE A TRAJECTORY IS 25 FILES OF THE SAME
+  // RECORDS. Everything in an ATOM line but the coordinates and the B-factor -
+  // serial, name, residue, chain, element, TER, CONECT - is fixed by the batch,
+  // and it was rebuilt for every frame: 26 PDBs after each AF3 fold, ~100 ms at
+  // 255 residues on the critical path, doubled on a Colab runtime's CPU.
+  const { records, conect } = pdbTemplate(batch);
   const lines = [];
   // ...first, before any coordinate record: a reader that stops at the first
   // ATOM never sees anything written after one, and most readers do.
   for (const text of options.remark ?? []) lines.push(`REMARK   1 ${text}`);
+  for (const record of records) {
+    if (record === "TER") { lines.push("TER"); continue; }
+    const { slot, head, tail } = record;
+    const confidence = plddt ? plddt[slot] : 0;
+    lines.push(head
+      + positions[slot * 3].toFixed(3).padStart(8)
+      + positions[slot * 3 + 1].toFixed(3).padStart(8)
+      + positions[slot * 3 + 2].toFixed(3).padStart(8)
+      + "  1.00" + confidence.toFixed(2).padStart(6) + tail);
+  }
+  for (const line of conect) lines.push(line);
+  lines.push("END");
+  return lines.join("\n");
+}
+
+const PDB_TEMPLATES = new WeakMap();
+
+/** The position-free part of `toPdb`'s output for a batch, built once. */
+function pdbTemplate(batch) {
+  const cached = PDB_TEMPLATES.get(batch);
+  if (cached !== undefined) return cached;
+  const { tokens, dense, sequence } = batch;
+  const records = [];
+  const conect = [];
   let serial = 1;
   // 🔴 ONE LETTER PER CHAIN, NOT "A" FOR EVERYTHING. A complex written as one
   // chain is a single 126-residue protein as far as any viewer or scoring tool
@@ -207,8 +236,7 @@ export function toPdb(batch, positions, plddt, options = {}) {
       if (!batch.predDenseAtomMask[slot]) continue;
       if (ligandCode !== undefined && atom === 0) serialOfToken.set(token, serial);
       const name = atomName(batch.displayAtomNameChars ?? batch.refAtomNameChars, slot);
-      const confidence = plddt ? plddt[slot] : 0;
-      lines.push(
+      records.push({ slot, head:
         (ligandCode === undefined ? "ATOM  " : "HETATM")
         + String(serial).padStart(5) + " "
         + (name.length < 4 ? ` ${name}`.padEnd(4) : name.slice(0, 4)) + " "
@@ -220,17 +248,13 @@ export function toPdb(batch, positions, plddt, options = {}) {
         // chain by a residue, which against a helical protein reads as a 3.7 A
         // RMSD and a TM-score of 0.37 - a plausible "wrong fold" rather than an
         // obvious bug. The real number was 0.69 A.
-        + String(batch.features.residueIndex[token]).padStart(4) + "    "
-        + positions[slot * 3].toFixed(3).padStart(8)
-        + positions[slot * 3 + 1].toFixed(3).padStart(8)
-        + positions[slot * 3 + 2].toFixed(3).padStart(8)
-        + "  1.00" + confidence.toFixed(2).padStart(6) + "          "
-        + elementSymbol(batch.refElement[slot]).padStart(2));
+        + String(batch.features.residueIndex[token]).padStart(4) + "    ",
+      tail: "          " + elementSymbol(batch.refElement[slot]).padStart(2) });
       serial += 1;
     }
     if (batch.asymId !== undefined && token + 1 < tokens
         && batch.asymId[token + 1] !== batch.asymId[token]) {
-      lines.push("TER");
+      records.push("TER");
     }
   }
   // 🔴 CONECT, OR THE LIGAND IS A BAG OF ATOMS. A viewer handed no bonds
@@ -265,11 +289,12 @@ export function toPdb(batch, positions, plddt, options = {}) {
     for (let start = 0; start < bonded.length; start += 4) {
       let line = "CONECT" + String(atom).padStart(5);
       for (const other of bonded.slice(start, start + 4)) line += String(other).padStart(5);
-      lines.push(line);
+      conect.push(line);
     }
   }
-  lines.push("END");
-  return lines.join("\n");
+  const template = { records, conect };
+  PDB_TEMPLATES.set(batch, template);
+  return template;
 }
 
 /**
