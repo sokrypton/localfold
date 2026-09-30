@@ -3739,3 +3739,21 @@ dpkg's own, the two collided on `/etc/ld.so.cache~` ("Renaming ... failed"),
 and `set -e` stopped the script. The runtime then had no browser and the
 reader's page timed out with nothing folded. The notebook now runs one
 `ldconfig`, after the apt job is waited for; the next fresh A100 set up in 10 s.
+
+**The next pass, profiling each family's page JavaScript over the fold alone**
+(`Profiler` started at the click; an earlier window that opened before it
+charged the previous fold's session save to this one). Three more host costs,
+none of them a wall-clock win on this box because each overlapped GPU time the
+fold was waiting on anyway - they are worth taking because a Colab runtime pays
+them at twice the price:
+- the pairformer asked `packTransitionWeights(block).offsets` and
+  `packSingleAttentionWeights(block).offsets` on EVERY run, which decoded and
+  concatenated the tensors to read a running sum of lengths - ten call sites of
+  that shape. `packNamedWeights` now takes lengths from the SOURCES thunks and
+  builds `data` only when read: AF3's warm fold 1085 -> 894 ms of JavaScript,
+  `readTensorRange` 223 -> 6. `test:stock` 8 of 8 signatures unchanged;
+- the AF2 multimer read its pair back every pass (35 MB at 261) for a structure
+  module and confidence heads that take a device tensor - 3.4 -> 3.2 s, same
+  checksum. Its bundle has no distogram head, so it has never had a contact map;
+- `toPdb` rebuilt the same records for each of a trajectory's 26 frames:
+  cached per batch, byte-identical, 77-88 -> 47-54 ms.
