@@ -2374,3 +2374,38 @@ scatter - against 30-65 s saved on a fold of 261. 🔴 **AND protenix2 GAINS
 TOO**, which the A100 proxy did not predict (5% there): its trunk pair is 128
 but not every track it runs is, so the width rules reach part of it. The proxy
 found the defect; only the T4 could price it.
+
+## A T4's cold fold is waiting, so the runtime starts while the reader is choosing
+
+Measured on a Colab T4, through the page with its weights from Hugging Face, 68
+residues, a fresh profile and the NVIDIA shader cache cleared per model
+(`createComputePipeline` intervals unioned, shard timings from the resource
+table):
+
+| cold | wall | weights arrived | pipelines | compiler busy |
+|---|---:|---:|---:|---:|
+| AF3 | 22.5 s | 9.5 s | 124 | 16.5 s |
+| protenix2 | 27.7 | 8.0 | 144 | 23.7 |
+| OpenDDE | 50.5 | 21.0 | 186 | 43.8 |
+| IntelliFold-2 | 73.6 | **57.2** | 182 | **63.9** |
+
+So the compiler is busy for three quarters of the wall or more, and
+IntelliFold-2's 612 MB take nearly as long again at ~10 MB/s. None of it
+depends on the SEQUENCE - only on the model - and a Colab runtime sat idle while
+the reader chose one and typed. The reader now sends `warm` when the model
+changes (web/app.js `warmRemoteModel`; only after `/health` says the runtime has
+a real GPU, so a TPU's SwiftShader is never asked), and the runtime starts that
+model's weights and its trunk's pipelines (`window.__warmModel`); the loaders
+keep their promises, so the fold takes what is under way. Same T4, fold pressed
+at once against 60 s after choosing:
+
+| T4, cold, 68 residues | at once | after 60 s |
+|---|---:|---:|
+| IntelliFold-2 | 67.0 s | **14.9** |
+| OpenDDE | 78.5 | **12.5** |
+| AF3 | 32.3 | **12.1** |
+
+pLDDT identical in each pair. On the A100 the same is 9.2 -> 6.1 s. What is left
+is the fold itself and the stages the warm does not reach (the sampler and the
+confidence head compile at the fold); a reader who presses Fold within a few
+seconds of choosing gets a partial head start.
