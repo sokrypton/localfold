@@ -48,6 +48,8 @@ the page a reader might point at a runtime from their own laptop, and an
 allow-list of origins cannot be written for a URL that changes every session.
 """
 import argparse
+import urllib.error
+import urllib.request
 import hmac
 import http.server
 import json
@@ -64,6 +66,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cdp                                                   # noqa: E402
 
+WEIGHT_CACHE = os.environ.get("LOCALFOLD_WEIGHT_CACHE", "/tmp/localfold-weight-cache")
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # 🔴 TWO MAILBOXES AND ONE SEQUENCE EACH, WHICH IS THE WHOLE BROKER. `EVENTS`
@@ -206,7 +209,7 @@ class Backend:
         # one. web/colab-bridge.js reads both out of its own URL.
         self.ws.call("Page.navigate", url=(
             f"http://127.0.0.1:{self.port}/index.html"
-            f"?role=runtime&t={urllib.parse.quote(self.token)}"))
+            f"?role=runtime&weights=proxy&t={urllib.parse.quote(self.token)}"))
         cdp.wait_for(self.ws, "!!window.__entityList", 180, "the page")
         # 🔴 THE TERMS DIALOG WOULD OTHERWISE EAT THE CLICK. AlphaFold 3's
         # parameters are gated behind an acknowledgement that opens in FRONT of
@@ -396,8 +399,67 @@ def serve(port, backend, token, host="127.0.0.1", jax=None):
             except ValueError:
                 return 0
 
+        # 🔴 THE RUNTIME PAGE'S WEIGHTS COME THROUGH HERE. Headless Chrome on a
+        # Colab T4 (two vCPUs) fetched IntelliFold-2's 641 MB from Hugging Face
+        # at 29 MB/s - 22 s, and 55 s beside a fold's compiles - where curl on
+        # the same VM takes 6.8 s and Chrome reads the same files over loopback
+        # in 6.6. Its network stack is what the two cores cannot feed. So this
+        # fetches upstream in Python, streams the bytes to the page as they
+        # arrive and keeps a copy on disk for the next request; the page asks
+        # here only when the broker told it to (`weights=proxy`), and only for
+        # huggingface.co - see bundleBaseUrl in src/bundles/manifests/index.js.
+        def _weights_proxy(self, rest):
+            import hashlib
+            import shutil
+            cache = os.path.join(WEIGHT_CACHE, hashlib.sha256(rest.encode()).hexdigest())
+            if os.path.exists(cache):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(os.path.getsize(cache)))
+                self.end_headers()
+                with open(cache, "rb") as source:
+                    shutil.copyfileobj(source, self.wfile, 1 << 20)
+                return None
+            upstream = "https://huggingface.co/" + rest
+            try:
+                response = urllib.request.urlopen(
+                    urllib.request.Request(upstream, headers={"User-Agent": "localfold-broker"}),
+                    timeout=60)
+            except urllib.error.HTTPError as error:
+                return self._json(error.code, {"error": f"upstream {error.code} for {rest}"})
+            except OSError as error:
+                return self._json(502, {"error": f"upstream unreachable: {error}"})
+            os.makedirs(WEIGHT_CACHE, exist_ok=True)
+            partial = f"{cache}.{threading.get_ident()}.part"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            length = response.headers.get("Content-Length")
+            if length is not None:
+                self.send_header("Content-Length", length)
+            self.end_headers()
+            wrote = 0
+            with open(partial, "wb") as copy:
+                while True:
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    copy.write(chunk)
+                    wrote += len(chunk)
+                    try:
+                        self.wfile.write(chunk)
+                    except OSError:
+                        break
+            # ...kept only when whole, so a torn download is fetched again.
+            if length is not None and wrote == int(length):
+                os.replace(partial, cache)
+            else:
+                os.remove(partial)
+            return None
+
         def do_GET(self):
             route = urllib.parse.urlparse(self.path).path
+            if route.startswith("/hf/"):
+                return self._weights_proxy(route[len("/hf/"):])
             if route in ("/down", "/out", "/health") and not self._authorised():
                 return self._json(403, {"error": "token"})
             # 🔴 A WATERMARK, NOT A QUEUE THE READER DRAINS. Two polls can

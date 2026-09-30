@@ -82,6 +82,11 @@ import { RuntimeEstimator } from "../src/runtime/cost-model.js";
 import { colabRole, installColabBridge, onRemoteReady, remoteBackendChoice, remoteCommand,
   remoteEvents, remoteWebgpuReal,
   remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
+// A runtime page the Colab broker opened reads its weights through the broker;
+// see bundleBaseUrl in src/bundles/manifests/index.js.
+if (new URLSearchParams(location.search).get("weights") === "proxy") {
+  globalThis.__localfoldWeightsProxy = "/hf/";
+}
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
