@@ -2517,3 +2517,24 @@ distogram stage at 918 ms of a 3.1 s pass with a 5.7 ms kernel - the readback,
 not the head - which is what the logits change addressed; the pair and single
 read back for the conditioning and confidence heads are the rest of it, and
 taking them off the host touches the trunk cache and rf3's host global norm.
+
+**And the new prior's trunk knobs, each flipped on a T4** (bench-trunk, 255
+tokens, every arm beside its own baseline, AF3 two rounds, IntelliFold-2 one):
+none of the six should move. Trunk pass, ms, baseline -> arm:
+`triangleProjectMatrix` off AF3 1497 -> 1756 and 1607 -> 1918, IntelliFold-2
+14164 -> 20077; `gridProjectMatrix` off 1522 -> 1651, 14124 -> 17333;
+`gridAttendMatrix` off 1431 -> 1620; `pairTransitionSplit` off 1469 -> 1635 and,
+for IntelliFold-2's 512-channel pair, **14135 -> 65576 (4.6x)**;
+`stagedMatrixPrefetch` and `transitionThreadTarget` inside the noise.
+
+**The pair round trip, split by `bench-trunk.js --readback=contacts`** (reads
+back the contact map alone, as a fold's non-final passes do; timing only, the
+next pass recycles zeros). IntelliFold-2 at 255 tokens on this A100, two rounds:
+the distogram stage 880 -> 745 ms and the next pass's embedder 126 -> 5 ms, so
+reading the 133 MB pair back and uploading it again is ~260 ms a pass that does
+it - and a fold does it once, on the last pass, where the conditioning and the
+confidence head upload it again. Keeping it on the device is worth ~0.2 s of a
+13 s warm fold here, estimated 0.5-1 s of 33 on a T4; not taken, since it
+touches the trunk cache, the confidence head and rf3's host global norm. The
+other ~745 ms charged to that stage is not the readback: the stage clock also
+absorbs pairformer work still on the GPU.

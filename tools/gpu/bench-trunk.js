@@ -61,6 +61,7 @@ export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "59"));
   const rows = Number(option(args, "msa", "32"));
   const passes = Number(option(args, "passes", "3"));
+  const contactsOnly = option(args, "readback", "all") === "contacts";
   // 🔴 THE BUNDLE'S OWN DEPTH, NOT AlphaFold 3'S. Defaulting to 48 measures a
   // 48-block PREFIX of boltz2's 64-block trunk - a timing for a stack no fold
   // runs - and says nothing about it. `--blocks=N` is still the short arm.
@@ -134,9 +135,17 @@ export async function main(device, args) {
       // and no trunk timing for either model could be taken at all. Same fault
       // docs/PARITY.md records across the checkers: a tool pinned to one
       // model's constants cannot measure a second.
-    }, weights.trunk, af3Dialect(store), { onStage: (name, ms) => { timings[name] = Math.round(ms); } });
-    previousPair = trunk.pair;
-    previousSingle = trunk.single;
+    }, weights.trunk, af3Dialect(store), {
+      onStage: (name, ms) => { timings[name] = Math.round(ms); },
+      // `--readback=contacts` reads back the contact map alone, as a fold's
+      // non-final passes do, so the distogram stage's cost can be split into
+      // its readback and the rest. TIMING ONLY: the next pass recycles zeros.
+      ...(contactsOnly ? { readback: { pair: false, single: false, logits: false } } : {}),
+    });
+    if (!contactsOnly) {
+      previousPair = trunk.pair;
+      previousSingle = trunk.single;
+    }
     perPass.push({ pass, whole: Math.round(performance.now() - started), ...timings });
     // ...the last pass only, so pipeline compilation is not in the numbers.
     if (profile !== null && pass < passes - 1) profile.reset();
