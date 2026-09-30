@@ -3757,3 +3757,15 @@ them at twice the price:
   checksum. Its bundle has no distogram head, so it has never had a contact map;
 - `toPdb` rebuilt the same records for each of a trajectory's 26 frames:
   cached per batch, byte-identical, 77-88 -> 47-54 ms.
+
+**And the reader does none of the work - measured, then made a gate.** A reader
+page (`?backend=colab`) instrumented for WebGPU and weight traffic, folding
+through a runtime: AF3, AF3 with a SMILES ligand, AF2 monomer and multimer,
+ESMFold2, OpenDDE, and AF3 on 5CAJ with a 128-row search and an uploaded
+template (255/255). Across all of them and a 20 s idle after load the reader
+**never requested a WebGPU adapter, created no pipeline, buffer or submit, and
+fetched no weight file**; its JavaScript was 50-490 ms a fold, and 0.9-1.8 s
+with an alignment, all of it py2Dmol drawing the structure and the MSA.
+`test:colab`'s reader arm now asserts it (adapter requests and `.bin` /
+huggingface / `/hf/` fetches both zero), and fails on a reader made to ask for
+an adapter and one shard.

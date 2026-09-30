@@ -270,6 +270,16 @@ try:
           addEventListener('error', (e) => window.__pageErrors.push(String(e.message)));
           addEventListener('unhandledrejection',
             (e) => window.__pageErrors.push('unhandled: ' + String(e.reason)));
+          // 🔴 AND WHETHER THE READER DID ANY MODEL WORK ITSELF. A fold that
+          // runs somewhere else must not ask this browser for a GPU or pull a
+          // weight shard - the whole point of the Colab mode, and invisible
+          // from the fold's own result, which arrives either way.
+          window.__readerGpu = 0;
+          if (navigator.gpu) {
+            const ask = navigator.gpu.requestAdapter.bind(navigator.gpu);
+            navigator.gpu.requestAdapter = (...a) => { window.__readerGpu += 1; return ask(...a); };
+          }
+          try { performance.setResourceTimingBufferSize(100000); } catch {}
         """)
         reader_ws.call("Page.navigate", url=(
             f"http://127.0.0.1:{PORT}/index.html?backend=colab&t={TOKEN}"))
@@ -401,6 +411,16 @@ try:
                        " opening line - the runtime's words did not arrive")
         if seen.get("errors"):
             bad.append(f"the reader's page threw: {seen['errors'][:2]}")
+        work = cdp.evaluate(reader_ws, """(() => ({
+          gpu: window.__readerGpu,
+          shards: performance.getEntriesByType('resource').map((r) => r.name)
+            .filter((name) => /huggingface\\.co|\\/hf\\/|\\.bin(\\?|$)/.test(name)),
+        }))()""")
+        print(f"  the reader itself: {work['gpu']} WebGPU adapter request(s),"
+              f" {len(work['shards'])} weight file(s)")
+        if work["gpu"] or work["shards"]:
+            bad.append(f"the reader did model work of its own: {work['gpu']} adapter"
+                       f" request(s), weight files {work['shards'][:3]}")
     finally:
         if reader is not None:
             reader.kill()
