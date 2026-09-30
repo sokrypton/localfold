@@ -4,6 +4,7 @@ import {
   encodeEvoformerBlock, encodeExtraMsaBlock,
 } from "../evoformer/block.js";
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
+import { encodeContactProbabilities } from "../../heads/distogram-webgpu.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
 import { af2Plan, planTotal } from "../../runtime/cost-model.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../../runtime/abort.js";
@@ -400,14 +401,26 @@ export class AlphaFoldMonomerGpu {
           ? execution.createReadback(
             `monomer.pair-readback-${recycle}`, embedding.pairWithoutTemplates, readbackEncoder)
           : undefined;
+        // 🔴 AND THE PAGE'S CONTACT MAP IS COMPUTED HERE, NOT FROM THAT COPY.
+        // It used to take `pairHost` and run the distogram head in JavaScript
+        // on the main thread - 3.4 s of a 6.0 s fold at 261 residues. `contacts`
+        // is the distogram head; `L * L` probabilities come back instead of
+        // `L * L * 128` floats. See src/heads/distogram-webgpu.js.
+        const contactTensor = recycleOptions.contacts === undefined ? undefined
+          : await encodeContactProbabilities(execution, readbackEncoder,
+            embedding.pairWithoutTemplates, recycleOptions.contacts, length);
+        const contactReadback = contactTensor === undefined ? undefined
+          : execution.createReadback(`monomer.contact-readback-${recycle}`, contactTensor, readbackEncoder);
         await submit(readbackEncoder, `readback recycle ${recycle}`);
-        const [msaFirstRow, pair] = await withAbort(Promise.all([
+        const [msaFirstRow, pair, contactProbs] = await withAbort(Promise.all([
           execution.mapFloat32(msaFirstRowTensor),
           pairReadback === undefined ? undefined : execution.mapFloat32(pairReadback),
+          contactReadback === undefined ? undefined : execution.mapFloat32(contactReadback),
         ]), signal);
         throwIfAborted(signal);
         releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
         if (pairReadback !== undefined) releaseTensor(pairReadback);
+        if (contactReadback !== undefined) { releaseTensor(contactReadback); releaseTensor(contactTensor); }
 
         stageMilliseconds.trunkReadback += performance.now() - phaseStart;
         phaseStart = performance.now();
@@ -433,7 +446,7 @@ export class AlphaFoldMonomerGpu {
         const recycleDistance = recycleConvergenceDistance(
           previousAtom37, structure.atom37, features.seqMask,
         );
-        const recycleResult = { msaFirstRow, pair, structure, confidence,
+        const recycleResult = { msaFirstRow, pair, contactProbs, structure, confidence,
           recycleDistance,
           elapsedMilliseconds: performance.now() - recycleStart };
         results.push(recycleResult);

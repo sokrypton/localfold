@@ -35,7 +35,6 @@ import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
   expandSearchedChains, planSearchReuse, searchCacheEntry }
   from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
-import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
@@ -2504,41 +2503,27 @@ function meanByChain(asymId, values) {
   });
 }
 
-function attachContactMap(frame, recycle, weights, length) {
-  if (weights?.distogram === undefined || recycle.pair === undefined) return;
-  setTimeout(() => {
-    try {
-      const head = weights.distogram;
-      const contacts = distogramContactProbabilities(
-        recycle.pair, head.halfLogitsWeights, head.halfLogitsBias, length,
-        { bins: head.bins, first: head.firstBreak, last: head.lastBreak });
-      // AF2 tokenises one residue per letter - nothing to collapse, and it
-      // refuses a modified residue outright (see modelFamily).
-      const contact = contactMapFor(contacts, undefined);
-      if (contact === undefined) return;
-      frame.maps = { ...frame.maps, contact };
-      // ...and kept, so a rewind can put this frame back without recomputing a
-      // head that costs 131 ms at 128 residues and 712 at 300.
-      recycle.contactMap = contact;
-      // 🔴 AND THE PROBABILITIES THEMSELVES, NOT ONLY THE BYTES. `contactMapFor`
-      // quantises to 0-255 for the heatmap, which is all the panel needs and is
-      // a lossy thing to put in a results file - the archive writes the same
-      // numbers AlphaFold 3 does, so it wants what the head produced.
-      recycle.contactProbs = contacts;
-      // ...and the pair it came from goes: it is L^2 x 128 floats a recycle
-      // (35 MB at 255 residues), read by nothing after this, and it rode into
-      // every saved session and every remote readback.
-      recycle.pair = undefined;
-      refreshHeatmap();
-      // 🔴 AND THE SAVED COPY IS REWRITTEN, because it was written before this
-      // arrived. AF2's contact map is the panel its archive is worth keeping
-      // for, and the fold was already saved without it by the time this runs.
-      // One record, so this replaces rather than adds.
-      if (lastPrediction?.contactSource === recycle) void rememberSession(lastPrediction);
-    } catch (cause) {
-      console.warn("contact map unavailable for this pass", cause);
-    }
-  }, 0);
+function attachContactMap(frame, recycle) {
+  // The probabilities come from the device (monomer.js's `contacts` option,
+  // src/heads/distogram-webgpu.js). 🔴 THEY WERE COMPUTED HERE, in JavaScript,
+  // from a host copy of the pair representation - on the main thread between
+  // the fold's own steps, which made it 3.4 s of a 6.0 s AF2 fold at 261
+  // residues and more on a slower CPU. A pass without them (the multimer, a
+  // pass restored from a session saved before) has no contact map, as before.
+  const contacts = recycle.contactProbs;
+  if (contacts === undefined) return;
+  // AF2 tokenises one residue per letter - nothing to collapse, and it
+  // refuses a modified residue outright (see modelFamily).
+  const contact = contactMapFor(contacts, undefined);
+  if (contact === undefined) return;
+  frame.maps = { ...frame.maps, contact };
+  // ...and kept, so a rewind can put this frame back without recomputing it.
+  recycle.contactMap = contact;
+  refreshHeatmap();
+  // 🔴 AND THE SAVED COPY IS REWRITTEN, because it was written before this
+  // frame existed. AF2's contact map is the panel its archive is worth keeping
+  // for. One record, so this replaces rather than adds.
+  if (lastPrediction?.contactSource === recycle) void rememberSession(lastPrediction);
 }
 
 function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStructure = undefined,
@@ -2566,7 +2551,7 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
   // that ever says so: pass zero - the one `loadIntoViewer` and every
   // `frames.length === 0` site key on - belongs to the run being resumed.
   foldIsShowing(viewer);
-  attachContactMap(frame, recycle, weights, sequence.length);
+  attachContactMap(frame, recycle);
   // ...and jump to it, so the newest pass is the one being looked at.
   const object = viewer.objects?.find((entry) => entry.name === viewerObject);
   if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
@@ -5024,7 +5009,7 @@ async function fold(event) {
           void initialLoadPromise.then(() => {
             const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
             if (frame !== undefined) {
-              attachContactMap(frame, recycle, weights, sequence.length);
+              attachContactMap(frame, recycle);
             }
           });
         } else {
@@ -5127,12 +5112,12 @@ async function fold(event) {
           // (the CLI tools, the differential gates, an embedder) folds once and
           // used to pay for it anyway.
           { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-          // ...and `pairHost: true` for the distogram contact overlay, which is
-          // the only reader of the host copy of the pair representation.
+          // ...and `contacts`, the distogram head, for the contact overlay:
+          // monomer.js computes it on the device and returns the probabilities.
           // ...and the template slot, which monomer.js forwards into
           // QueryOnlyTemplateGpu. `undefined` is a fully masked template, which
           // is what every fold on this page was before it.
-            resume, resumable: true, pairHost: true, template: af2Template?.slot, ...regime },
+            resume, resumable: true, contacts: weights.distogram, template: af2Template?.slot, ...regime },
           model.paeBreaks, onRecycle, runProgress);
 
       // 🔴 THE EARLIER PASSES COME BACK FOR THE ANIMATION. A continuation returns
@@ -5982,21 +5967,12 @@ function archiveFor(pred, { includeAlignment = true } = {}) {
           // ...per chain, which the confidence object itself does not carry:
           // `meanByChain` needs the token-to-chain map and the fold has it.
           chainPlddt: pred.chainPlddt,
-          // 🔴 RESOLVED HERE, NOT WHEN THE FOLD FINISHED. AlphaFold 2 computes
-          // its contact map in a setTimeout - the distogram head costs 131 ms
-          // at 128 residues and is deliberately off the fold's critical path -
-          // so at the moment the prediction was stored it does not exist yet.
-          // By the time anyone presses this it does. `contactSource` is the
-          // pass the saved structure came from, which is not always the last.
-          // 🔴 ONE FIELD, AND IT IS A REFERENCE RATHER THAN A COPY. The three
-          // models produce this at three different MOMENTS - AF3 with the
-          // trunk, EF2-fast with the trunk and no confidence object to put it
-          // in, AF2 in a setTimeout off the saved pass, because its distogram
-          // head costs 131 ms at 128 residues and is deliberately off the
-          // fold's critical path. So `contactSource` holds the OBJECT that
-          // carries them, which for AF2 is still filling in when the
-          // prediction is stored and is filled by the time anyone presses
-          // this. It was three fields and the archive knew two of them.
+          // `contactSource` is the pass the saved structure came from, which
+          // is not always the last. 🔴 ONE FIELD, AND IT IS A REFERENCE RATHER
+          // THAN A COPY: the three models produce contact probabilities at
+          // different moments (AF3 and EF2-fast with the trunk, AF2 with each
+          // pass, on the device), so it holds the OBJECT that carries them. It
+          // was three fields and the archive knew two of them.
           contactProbs: pred.contactSource?.contactProbs,
         },
       },
