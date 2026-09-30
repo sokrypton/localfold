@@ -52,6 +52,7 @@ import { smilesComponent } from "../src/chem/component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel, releaseModel } from "./model.js";
 import { releaseAllWeights } from "../src/runtime/resident.js";
+import { pipelineCacheForDevice } from "../src/runtime/pipeline-cache.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../src/bundles/manifests/index.js";
@@ -1016,6 +1017,10 @@ window.__warmModel = (family, tokens) => {
       sequence: residues, mode: "diffusion", calls: 2, recycles: 1, seed: 1, weights, device,
       signal, chainKinds: ["protein"], onStatus: () => {}, onProgress: () => {},
     });
+  }).then(async () => {
+    // ...and with nothing folding, the unrolled upgrades take every thread. A
+    // real fold waits for this chain and then lowers it (see the fold's start).
+    pipelineCacheForDevice(await getDevice()).setUpgradeBoost(true);
   }).catch((cause) => console.warn("warm-up fold:", cause));
 };
 
@@ -4503,6 +4508,7 @@ async function fold(event) {
     // compiling what this fold needs and holds the GPU (see __warmModel).
     warmSuperseded = true;
     if (warmingFold !== null) await warmingFold;
+    pipelineCacheForDevice(await getDevice()).setUpgradeBoost(false);
     if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
       releaseAllWeights(await getDevice());
     }
