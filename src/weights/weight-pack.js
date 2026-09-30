@@ -31,6 +31,29 @@
  * and the transition and diffusion blocks write f16.
  */
 import { concatenateAs, writeInto } from "./float16.js";
+import { SOURCES } from "./weight-sources.js";
+
+/**
+ * How many elements `name` holds - asked of the THUNK when there is one.
+ *
+ * 🔴 READING `weights[name].length` DECODES THE TENSOR. A bound field is a
+ * getter over int5 codes, so an offset table - a running sum of lengths - was
+ * decoding every tensor it summed: the pairformer asked for
+ * `packTransitionWeights(block).offsets` on every run and paid ~160 ms of a
+ * warm 255-residue AlphaFold 3 fold to read a dozen numbers (the diffusion
+ * side's `blockWeightOffsets` had already learnt this). The thunk records the
+ * range it will read, and that is the length.
+ */
+export function weightLength(weights, name) {
+  const count = weights?.[SOURCES]?.[name]?.count;
+  return Number.isInteger(count) ? count : weights[name]?.length;
+}
+
+/** Is `name` present - again asked of the thunk, since the getter decodes. */
+function present(weights, name) {
+  const sources = weights?.[SOURCES];
+  return sources !== undefined && name in sources ? sources[name] != null : weights[name] != null;
+}
 
 /**
  * @param {object} weights            the named tensors
@@ -48,7 +71,7 @@ export function packNamedWeights(weights, options) {
   const { label, order, optional = [], sizeOf, write, precision = "f32",
           composed = new Set() } = options;
   // 🔴 ONE LIST. See the note above; this line is the whole point of the file.
-  const packing = [...order, ...optional.filter((name) => weights[name] != null)];
+  const packing = [...order, ...optional.filter((name) => present(weights, name))];
   for (const name of packing) {
     // 🔴 A COMPOSED SLOT HAS NO TENSOR OF ITS OWN. Grid attention's
     // `qkvgProjection` is four projections interleaved into one region, so it
@@ -56,19 +79,37 @@ export function packNamedWeights(weights, options) {
     // hook owns it and validates its parts. Without this the presence check
     // rejects a perfectly good pack, which is how it first failed here.
     if (composed.has(name)) continue;
-    if (weights[name] === undefined) throw new Error(`${label} missing ${name}`);
+    if (!present(weights, name)) throw new Error(`${label} missing ${name}`);
   }
   const offsets = {};
+  const lengths = {};
   let total = 0;
   for (const name of packing) {
     offsets[name] = total;
-    total += sizeOf === undefined ? weights[name].length : sizeOf(name);
+    lengths[name] = sizeOf === undefined ? weightLength(weights, name) : sizeOf(name);
+    total += lengths[name];
   }
-  const data = concatenateAs(precision, total, (target) => {
-    for (const name of packing) {
-      if (write === undefined) writeInto(target, weights[name], offsets[name]);
-      else write(target, name, offsets[name]);
-    }
-  });
-  return { data, offsets, packing };
+  // 🔴 THE BYTES ARE BUILT WHEN SOMETHING READS THEM, AND NOT BEFORE. Half the
+  // callers want `.offsets` for a shader and nothing else; building `data` for
+  // them decoded and concatenated every tensor to throw it away.
+  let data;
+  return {
+    offsets, packing,
+    get data() {
+      data ??= concatenateAs(precision, total, (target) => {
+        for (const name of packing) {
+          if (write !== undefined) { write(target, name, offsets[name]); continue; }
+          const values = weights[name];
+          // ...and the lengths the offsets were summed from are held to the
+          // tensors, since they came from the thunks rather than from these.
+          if (values.length !== lengths[name]) {
+            throw new Error(`${label}: ${name} holds ${values.length} elements where its offsets`
+              + ` assumed ${lengths[name]}`);
+          }
+          writeInto(target, values, offsets[name]);
+        }
+      });
+      return data;
+    },
+  };
 }

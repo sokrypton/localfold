@@ -17,6 +17,7 @@
  * sequence's own mask would be per-sequence softmaxes - a different operation
  * and a much more expensive one.
  */
+import { packNamedWeights } from "../../weights/weight-pack.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 
@@ -28,16 +29,7 @@ const ORDER = [
 ];
 
 export function packMsaAttentionWeights(weights) {
-  const offsets = {};
-  let total = 0;
-  for (const name of ORDER) {
-    if (weights[name] === undefined) throw new Error(`msa attention missing ${name}`);
-    offsets[name] = total;
-    total += weights[name].length;
-  }
-  const data = new Float32Array(total);
-  for (const name of ORDER) data.set(weights[name], offsets[name]);
-  return { data, offsets };
+  return packNamedWeights(weights, { label: "msa attention", order: ORDER });
 }
 
 /**

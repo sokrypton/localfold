@@ -1,4 +1,4 @@
-import { concatenateAs, writeInto } from "../../weights/float16.js";
+import { packNamedWeights } from "../../weights/weight-pack.js";
 /**
  * AF3's single-track attention, biased by the pair representation.
  *
@@ -39,17 +39,7 @@ const ORDER = SINGLE_ATTENTION_ORDER;
  *   same word or it reads half the values at twice the stride.
  */
 export function packSingleAttentionWeights(weights, precision = "f32") {
-  const offsets = {};
-  let total = 0;
-  for (const name of ORDER) {
-    if (weights[name] === undefined) throw new Error(`single attention weights missing ${name}`);
-    offsets[name] = total;
-    total += weights[name].length;
-  }
-  const data = concatenateAs(precision, total, (target) => {
-    for (const name of ORDER) writeInto(target, weights[name], offsets[name]);
-  });
-  return { data, offsets };
+  return packNamedWeights(weights, { label: "single attention weights", order: ORDER, precision });
 }
 
 /**
