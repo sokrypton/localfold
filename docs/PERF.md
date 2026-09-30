@@ -2409,3 +2409,51 @@ pLDDT identical in each pair. On the A100 the same is 9.2 -> 6.1 s. What is left
 is the fold itself and the stages the warm does not reach (the sampler and the
 confidence head compile at the fold); a reader who presses Fold within a few
 seconds of choosing gets a partial head start.
+
+### ...and then the runtime also folds a throwaway, and fetches its weights itself
+
+Two more steps on the same T4, and one dead end.
+
+**The warm-up now folds a dummy.** `warmAf3Pipelines` compiles the trunk from
+the manifest's shapes, but the sampler, the atom encoder and decoder, the
+conditioning and the confidence head have no compile-only path, so a warmed
+first fold still paid them. Once the weights are in, the runtime now folds a
+dummy sequence at the reader's length (two sampler steps, no recycles) through
+`foldAf3`: every pipeline compiled and the weights resident. A real fold waits
+for a dummy already running and supersedes one not yet started. AF3 after 60 s
+of choosing: **12.1 -> 6.6 s**, which is a warm fold.
+
+**The runtime's weights come through the broker.** The T4 VM downloads
+IntelliFold-2's 641 MB from Hugging Face in **6.8 s with parallel curl**, but
+its headless Chrome fetched them at 29 MB/s (22 s alone, 55 s beside a fold's
+compiles) - the network stack is what two vCPUs cannot feed, since Chrome reads
+the same files over loopback in 6.6 s. The broker now serves `/hf/<path>`:
+Python fetches upstream, streams to the page and keeps a disk copy
+(`_weights_proxy`), and `bundleBaseUrl` rewrites Hugging Face URLs to it only
+on a page the broker opened with `weights=proxy`. IntelliFold-2 folded at once
+with the proxy: 18.7 and 23.0 s; without, 44.7 and then 21.2 - Hugging Face's
+CDN is fast once it has the files, so the proxy removes the worst case more
+than it moves the median. The loader also stopped teeing each download into
+Cache Storage (the copy is written from the finished buffer) and reports
+progress at most every 100 ms.
+
+T4, 68 residues, from the start of this pass:
+
+| | at once, before | at once, now | after 60 s, now |
+|---|---:|---:|---:|
+| AF3 | 32.3 s | 16.3 | **6.6** |
+| IntelliFold-2 | 73.9 s | ~19-23 | 13.0 |
+
+🔴 **THE DRIVER'S SHADER CACHE IS NOT A LEVER, AND ONE RUN SAID IT WAS.** A
+fresh browser profile with NVIDIA's `~/.cache/nvidia/GLCache` kept read AF3
+23.5 -> 12.4 s once; repeated, 20.3 -> 20.2 with the cache populated. A T4's
+cold fold scatters by 1.5x (above), and one pair is inside it. Shipping or
+persisting that cache is not pursued. (`__GL_SHADER_DISK_CACHE_PATH` does not
+redirect it for Chrome's Vulkan either.)
+
+🔴 **AND A DAY OF LOCAL BRIDGE NUMBERS WERE A STALE BROWSER'S.** Two headless
+Chromes from a pinned-core experiment kept debugging port 9333 for a day, and
+every local broker after them attached to the OLD browser - old page, old
+modules from its HTTP cache - instead of starting its own. The proxy "did
+nothing" until the port was checked. A broker's `cdp.launch` cannot tell a
+browser it started from one it found; kill by profile, and check the port.
