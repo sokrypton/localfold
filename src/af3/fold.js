@@ -1164,8 +1164,13 @@ async function foldHolding(device, batch, weights, options, held) {
       contactClasses: af3ContactClasses(batch, tokens),
     }, weights.trunk, weights.trunk.dialect, {
       keepOutputs: !lastPass || keepFinalPair,
+      // 🔴 THE LOGITS ONLY WHERE SOMETHING READS THEM: the distance diagnostics,
+      // or a caller that says so (`trunkLogits`). They were read on every last
+      // pass - `L^2 * 64` floats, 16.6 MB at 255 tokens and 256 MB at 1000 -
+      // for a fold that uses the contact map computed beside them.
       readback: { pair: readAll, single: readAll,
-                  logits: readAll || featureTolerance > 0 || options.recycleDistances === true },
+                  logits: options.trunkLogits === true || featureTolerance > 0
+                    || options.recycleDistances === true },
       onStage: (name, ms) => stage("trunk", { name, ms }),
       // The trunk's own seams, for a caller holding the reference's taps.
       ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
