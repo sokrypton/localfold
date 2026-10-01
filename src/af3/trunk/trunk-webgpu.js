@@ -186,6 +186,15 @@ export class Af3TrunkGpu {
     const tokens = input.tokens;
     const pairs = tokens * tokens;
     const timings = {};
+    // 🔴 ONE POOL FOR THE TWO STACKS' PAIR SCRATCH, SO THEY SHARE IT. The MSA
+    // stack and the pairformer each allocated five pair-sized scratch buffers
+    // and destroyed them when done - and the driver returns a destroyed
+    // buffer's memory only on a later device tick, so on the card the two sets
+    // overlapped: IntelliFold-2 at 512 residues peaked at 7.6 GB by nvidia-smi
+    // with 4.0 GB live, which is what ran a T4 out of memory at 768. Released
+    // into this pool, the MSA stack's scratch is the pairformer's; destroyed
+    // once, when the pass is done and drained.
+    const scratchAllocator = new GpuBufferAllocator(this.device, true);
     // 🔴 ANNOUNCED BEFORE IT RUNS, NOT ONLY AFTER IT FINISHES. `onStage` fires
     // with a duration, so it can only ever mark a stage that is over - and on a
     // large protein the MSA stack alone is seconds, which the page spent
@@ -334,7 +343,7 @@ export class Af3TrunkGpu {
       await stage("msa-stack", () => new Af3MsaStackGpu(this.device, this.options).run(
         { pairMask: input.pairMask, msaMask: input.msaMask, tokens, sequences: input.sequences },
         weights.msaBlocks, dialect,
-        { ...options, stopAfterOpm: options.stopAfterOpm === true,
+        { ...options, stopAfterOpm: options.stopAfterOpm === true, scratchAllocator,
           pairBuffer: pair.buffer, msaBuffer: embedded.msaAllocation.buffer, validation }));
       if (doubleAdd) {
         const add = await this.pipelines.get(`af3-trunk:add:${pairElements}`,
@@ -376,7 +385,7 @@ export class Af3TrunkGpu {
       const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, this.options).run(
         { pairMask: input.pairMask, seqMask: input.seqMask, tokens },
         weights.pairformerBlocks, dialect, {
-          ...options,
+          ...options, scratchAllocator,
           pairBuffer: pair.buffer, singleBuffer: embedded.singleAllocation.buffer,
           deferReadback: true, validation,
           onBlock: (index) => options.onPairformerBlock?.(index,
@@ -425,6 +434,7 @@ export class Af3TrunkGpu {
         binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings, ...kept,
       };
     } finally {
+      scratchAllocator.destroyPooled();
       for (const allocation of owned) allocation.release();
     }
   }

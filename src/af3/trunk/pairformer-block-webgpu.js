@@ -603,7 +603,7 @@ export class Af3PairformerStackGpu {
         gridHeads * (blocks[0]?.pairAttention1?.dimension ?? 0));
       const scratch = [];
       for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
-        scratch.push(keep(this.allocator.allocate(
+        scratch.push(keep((options.scratchAllocator ?? this.allocator).allocate(
           `af3-block.scratch${index}`,
           pipelines.pairScratchBytes(index,
   storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index])), storage)));

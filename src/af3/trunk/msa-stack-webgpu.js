@@ -290,7 +290,7 @@ export class Af3MsaStackGpu {
       // catch.
       const scratch = [];
       for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
-        scratch.push(keep(this.allocator.allocate(
+        scratch.push(keep((options.scratchAllocator ?? this.allocator).allocate(
           `af3-msa.scratch${index}`,
           pipelines.pairScratchBytes(index,
   storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index])), storage)));
