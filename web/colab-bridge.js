@@ -288,12 +288,24 @@ async function runFold(request) {
   // agreeing is not something to rest a completion test on.
   const pressed = Date.now();
   button.click();
-  const deadline = Date.now() + Math.min((request.timeout ?? 300) * 1000, 1800_000);
+  // 🔴 THIRTY MINUTES UNLESS ASKED, NOT FIVE. The reader sends no timeout,
+  // and five minutes ended IntelliFold-2 at 512 residues on a Colab T4 at 73%
+  // of its last trunk pass - legitimately slow, streaming its weights under the
+  // memory budget - while the reader watched the bar move. The reader already
+  // has a stop button and gives up on a runtime that stops answering; this is
+  // only the backstop for a page that hangs.
+  // 🔴 AND A FOLD THAT RUNS OUT OF TIME IS STOPPED, not left running behind
+  // its own error: it held the GPU and the next request was refused as
+  // "already folding".
+  const deadline = Date.now() + Math.min((request.timeout ?? 1800) * 1000, 1800_000);
   for (;;) {
     await idle(250);
     const state = window.__foldState ?? null;
     if (state !== null && state.running === false && state.since > pressed) break;
-    if (Date.now() > deadline) return { error: "timed out", status: statusText() };
+    if (Date.now() > deadline) {
+      if (folding()) button.click();
+      return { error: "timed out", status: statusText() };
+    }
   }
   // 🔴 "READY" IS "IT CAN HAND ONE OVER", NOT "THE FOLD ENDED".
   // `loadIntoViewer` clears the object's frames and re-adds them, so the
