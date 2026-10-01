@@ -200,7 +200,12 @@ class Backend:
         # first measured runtime came back on **SwiftShader** - vendor
         # 'google', architecture 'swiftshader', no shader-f16, a 1 GiB buffer
         # ceiling - which is the CPU wearing the card's clothes.
+        # `LOCALFOLD_KEEP_PROFILE=1` starts on the profile as it was left -
+        # its HTTP and shader caches included - instead of a wiped one, so a
+        # session that restores a saved profile pays what a returning visitor
+        # does rather than a first visit.
         self.proc, self.ws = cdp.launch(self.cdp_port, self.profile,
+                                        keep=os.environ.get("LOCALFOLD_KEEP_PROFILE") == "1",
                                         extra_args=["--disable-vulkan-surface"])
         self.ws.call("Page.enable")
         self.ws.call("Runtime.enable")
