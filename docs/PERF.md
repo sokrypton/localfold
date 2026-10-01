@@ -2579,3 +2579,16 @@ the "restored nothing" arm on the same machine minutes later, with every cache
 of ours cleared in both. What a fresh VM pays is first-launch and network
 warm-up below this repository - the OS page cache, the CDN path to Hugging Face
 - not shader compilation.
+
+**And the tiles under it, swept on a T4 and left alone.** The turing entry says
+its grid-attention tile "was NOT swept here"; neither were the staged GEMM block
+or the triangle projection's tiles, all of them ampere's. bench-trunk, AF3 at
+255 tokens, each arm beside its own baseline, two rounds, trunk-pass change:
+grid-attend tile 2x16 +4.4/+7.3%, 2x32 -1.8/+2.4, 4x16 +3.4/+2.7, 6x16 -0.4/+1.1;
+staged block 64x64x16x1x4 +1.3/-1.2, 128x64x16x2x4 -3.0/+1.2, 32x128x16x1x8
+-4.3/-2.3, 64x128x32x1x8 +1.9/-1.8, 128x128x16x2x8 +4.2/+0.4; triangle pair
+tile 32x16 -4.0/0.0, 16x32 +4.7/-0.5; triangle output columns 32 0.0/-1.4, 128
+-5.0/-1.4. The baseline drifted 2212 -> 2606 ms across the session as the card
+heated, and nothing clears that by both rounds' agreement and size together:
+the two that lean the same way twice (32x128x16x1x8, columns 128) do so by 2-5%,
+inside this card's spread. A plateau, so ampere's tiles stay.
