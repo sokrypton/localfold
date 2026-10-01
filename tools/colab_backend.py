@@ -67,6 +67,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cdp                                                   # noqa: E402
 
 WEIGHT_CACHE = os.environ.get("LOCALFOLD_WEIGHT_CACHE", "/tmp/localfold-weight-cache")
+def gpu_total_mib():
+    """The first GPU's total memory in MiB, from the driver, or None."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        return int(out[0]) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 # What may cache: the weight shards, as tools/serve.py names them.
 CACHEABLE = (".bin", ".safetensors", ".zst", ".gz")
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -214,9 +224,13 @@ class Backend:
         # 🔴 `role=runtime` IS THE PAGE BEING TOLD WHICH HALF IT IS, and the
         # token rides beside it because every route this page calls checks
         # one. web/colab-bridge.js reads both out of its own URL.
+        # ...and how much memory its GPU has, which no browser API reports.
+        # The page budgets from it on a runtime; see getDevice in web/model.js.
+        vram = gpu_total_mib()
         self.ws.call("Page.navigate", url=(
             f"http://127.0.0.1:{self.port}/index.html"
             f"?role=runtime{'' if os.environ.get('LOCALFOLD_WEIGHT_PROXY') == '0' else '&weights=proxy'}"
+            f"{'' if vram is None else f'&vram={vram}'}"
             f"&t={urllib.parse.quote(self.token)}"))
         cdp.wait_for(self.ws, "!!window.__entityList", 180, "the page")
         # 🔴 THE TERMS DIALOG WOULD OTHERWISE EAT THE CLICK. AlphaFold 3's
