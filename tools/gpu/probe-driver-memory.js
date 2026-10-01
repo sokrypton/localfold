@@ -57,15 +57,26 @@ export async function main(device, args) {
   await device.queue.onSubmittedWorkDone();
   await sleep(2000); mark("released");
 
-  // (d) the same, but with the queue kept busy afterwards: Dawn frees a
-  // destroyed buffer's memory on a device tick, and ticks follow queue work.
+  // (d) how LITTLE queue activity frees it: re-create the churn, then one
+  // empty submit and its wait, then one more, then ten.
   const busy = device.createBuffer({ size: 1048576, usage: GPUBufferUsage.COPY_DST });
-  for (let n = 0; n < 200; n += 1) {
-    device.queue.writeBuffer(busy, 0, piece.subarray(0, 1024));
-    device.queue.submit([device.createCommandEncoder().finish()]);
+  const tick = async (n) => {
+    for (let k = 0; k < n; k += 1) {
+      device.queue.submit([device.createCommandEncoder().finish()]);
+      await device.queue.onSubmittedWorkDone();
+    }
+  };
+  await tick(10); await sleep(1500); mark("baseline-after-ticks");
+  for (let round = 0; round < 6; round += 1) {
+    const scratch = device.createBuffer({ size: 512 * 1048576, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(scratch, 0, piece.subarray(0, 1048576));
     await device.queue.onSubmittedWorkDone();
-    await sleep(10);
+    scratch.destroy();
   }
-  mark("after-busy-queue");
+  await sleep(1500); mark("churned-again");
+  await tick(1); await sleep(1500); mark("after-1-tick");
+  await tick(1); await sleep(1500); mark("after-2-ticks");
+  await tick(10); await sleep(1500); mark("after-12-ticks");
+  void busy;
   return { mib, marks };
 }

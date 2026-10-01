@@ -22,7 +22,7 @@
  * against a run that takes tens of seconds. That is not worth the plumbing, and
  * the stage boundary is where a caller wants to be able to look anyway.
  */
-import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { GpuBufferAllocator, settleReleasedMemory } from "../../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { Af3EmbedderGpu } from "./embedder-webgpu.js";
 import { Af3MsaStackGpu } from "./msa-stack-webgpu.js";
@@ -307,6 +307,9 @@ export class Af3TrunkGpu {
         // 🔴 THE TEMPLATE TERM IS ADDED INTO THE EMBEDDER'S PAIR, on the device
         // now: `pairBuffer` is read as z and updated in place as z + term.
         weights.template, dialect, { ...options, pairBuffer: pair.buffer, validation }));
+      // ...and its working set given back to the driver before the MSA stack
+      // asks for five pair-sized buffers of its own: see settleReleasedMemory.
+      await settleReleasedMemory(this.device);
       const afterTemplate = await readSeam("tap.z_after_template", pair, pairElements);
       // ...and the template module's OWN output, which is what the reference
       // traces as `evoformer/template_embedding`. `z_after_template` is
@@ -436,6 +439,8 @@ export class Af3TrunkGpu {
     } finally {
       scratchAllocator.destroyPooled();
       for (const allocation of owned) allocation.release();
+      // ...and handed back before the next pass allocates its own.
+      await settleReleasedMemory(this.device);
     }
   }
 
