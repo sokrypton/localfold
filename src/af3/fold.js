@@ -760,6 +760,27 @@ async function foldHolding(device, batch, weights, options, held) {
   // them as its device prior says. `largeFoldReleasesWeights: false` opts out.
   const largestTokens = weights.trunk?.dialect?.structuralTokens === true
     ? Math.max(batch.tokens, structuralLayout(batch).tokens) : batch.tokens;
+  // 🔴 AND A FOLD WHOSE PAIR CANNOT BE BOUND IS REFUSED HERE, NOT TEN MINUTES
+  // IN. Every pair-sized dispatch binds `tokens^2 x pairChannels` floats, and
+  // a binding is capped at maxStorageBufferBindingSize - 2 GiB on NVIDIA,
+  // whatever memory the card has - so the ceiling is sqrt(limit / (channels x
+  // 4)) tokens: 2047 for AF3, 1023 for IntelliFold-2's 512-channel pair, and
+  // for OpenDDE, which expands each residue into subtokens, about 590
+  // residues. Past it a fold ran for minutes and died on "uncaptured: Binding
+  // size (3465222144) of [Buffer "expand.pair-out"] is larger than the
+  // maximum storage buffer binding size" (OpenDDE at 768 residues).
+  const pairChannelsForCeiling = weights.trunk?.embedder?.pairChannels ?? 128;
+  const ceilingTokens = Math.floor(Math.sqrt(
+    device.limits.maxStorageBufferBindingSize / (pairChannelsForCeiling * 4)));
+  if (largestTokens > ceilingTokens) {
+    const expanded = largestTokens > batch.tokens
+      ? ` (${batch.tokens} tokens, expanded to ${largestTokens} by this model)` : "";
+    throw new Error(`This job is too large for this GPU: its pair representation is`
+      + ` ${largestTokens} tokens${expanded} and this model can bind at most`
+      + ` ${ceilingTokens} here (${pairChannelsForCeiling} channels against a`
+      + ` ${Math.floor(device.limits.maxStorageBufferBindingSize / 1048576)} MiB binding limit).`
+      + " Try a shorter sequence or a model with a narrower pair.");
+  }
   // 🔴 64 MiB, NOT THE CHUNKING'S 128: the trade differs. IntelliFold-2 at 255
   // residues (127 MiB a pair tensor) was 4458 MiB held against 3343 released,
   // for +3% on a warm fold (23.65 -> 24.37 s).
