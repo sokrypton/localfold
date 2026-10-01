@@ -143,6 +143,20 @@ def launch(port, profile, keep=False, extra_args=()):
     nothing here has ever measured what a RETURNING user pays, and Chrome
     caches compiled pipelines on disk.
     """
+    # 🔴 A PORT THAT ALREADY ANSWERS IS ANOTHER BROWSER, AND CONNECTING TO IT
+    # IS A SILENT WRONG ANSWER. The Chrome started below cannot bind a taken
+    # port and exits, and the poll after it then finds the OLD browser's page
+    # and returns it: a broker restarted on a fresh profile drove a runtime
+    # left over from an earlier run, whose page re-loaded last session's
+    # modules from its own HTTP cache - every measurement through it tested
+    # code that was no longer on disk. Refused, naming the port.
+    try:
+        urllib.request.urlopen("http://127.0.0.1:%d/json/version" % port, timeout=1)
+    except Exception:
+        pass
+    else:
+        raise RuntimeError("port %d already has a browser on it - a Chrome left over from"
+                           " an earlier run; stop it before starting another" % port)
     if not keep:
         shutil.rmtree(profile, ignore_errors=True)
     p = subprocess.Popen([chrome_binary()] + chrome_flags() + list(extra_args) + [

@@ -3809,3 +3809,15 @@ this change read the old sizes exactly. The reader's browser is the user's own
 and caches the same way, so a returning reader could hold a bridge that cannot
 read the new wire format. Everything but weight shards is `no-store` now, as
 tools/serve.py does.
+
+🔴 **AND `cdp.launch` NOW REFUSES A PORT THAT ALREADY ANSWERS.** The rest of
+that stale module was this: a Chrome left on the broker's debugging port from an
+earlier run survived a cleanup that never named its profile, the new Chrome
+could not bind the port and exited, and `launch`'s poll found the OLD browser
+and returned it - so the restarted broker drove a page that re-loaded modules
+from its own cache, holding 3.6 GB of device memory besides. The page-level
+re-checks of the pair change were re-run on verified code (the trunk-reused and
+continued paths fold; IntelliFold-2 at 261 residues 15.6 s warm through the page,
+so the earlier "15.3" was the stale runtime and the page gain sits inside the
+noise; the fold-tool numbers were always fresh). Colab VMs and every
+`gpu-chrome.mjs` run start their own browser and were never affected.
