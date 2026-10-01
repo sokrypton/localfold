@@ -4187,7 +4187,12 @@ async function followRemoteFold({ since, label, signal }) {
     }
     await new Promise((done) => setTimeout(done, 300));
   }
-  if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);
+  // ...and the runtime's status line beside its error only where it adds
+  // something: a page that failed usually says the same thing twice.
+  if (result.error) {
+    throw new Error(result.status && !result.status.includes(result.error)
+      && !result.error.includes(result.status) ? `${result.error} · ${result.status}` : result.error);
+  }
 
   // 🔴 A JAX FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
   // PREDICTION - there is no copy of this page on the other side to build one.
@@ -5410,7 +5415,13 @@ async function fold(event) {
       // paging and reports nothing: without it the failure is not an error
       // message, it is a machine that stops responding. That is what the title
       // on the button says, in those words.
-      if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
+      // ...but not on a Colab runtime: there the ceiling is the GPU's own
+      // memory, lifting it only trades the message for the driver's
+      // out-of-memory, and the button would be on a page nobody can click.
+      if (error instanceof GpuMemoryBudgetError && colabRole() === "runtime") {
+        status(`${describeBudget(error)} That is more than this runtime's GPU holds -`
+          + " try a shorter sequence or a smaller model.", true);
+      } else if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
         statusWithAction(
           describeBudget(error),
           "Fold anyway",
