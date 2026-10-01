@@ -1037,6 +1037,11 @@ export class Af3ConfidenceHeadGpu {
         const copy = this.device.createCommandEncoder({ label: "af3-conf.pair-copy" });
         copy.copyBufferToBuffer(input.pairBuffer, 0, pair.buffer, 0, pairBytes);
         this.device.queue.submit([copy.finish()]);
+        // ...and the source handed back the moment the copy is queued: this
+        // head never reads it again, and held to the end of the fold it was a
+        // dead `tokens^2 x channels` through the head's four blocks - where the
+        // fold peaks. The queue orders a destroy after the copy that read it.
+        input.releasePairBuffer?.();
       }
       const targetFeat = keep(this.allocator.upload("af3-conf.target", input.targetFeat, storage));
       const pseudoBeta = keep(this.allocator.upload("af3-conf.beta", input.pseudoBeta, storage));

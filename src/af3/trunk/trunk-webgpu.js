@@ -397,6 +397,14 @@ export class Af3TrunkGpu {
           // line should show. See the note in pairformer-block-webgpu.js.
           onBlockDone: (completed, total) => options.onPairformerBlockDone?.(completed, total),
         }));
+      // 🔴 THE SCRATCH IS DONE WITH ONCE THE PAIRFORMER IS, SO IT GOES NOW. The
+      // pool lived to the end of the pass, which put five pair-sized buffers
+      // beside the distogram's readback of the pair: IntelliFold-2 at 896
+      // residues was refused on a T4-sized budget for `af3-disto.readback`
+      // (1568 MiB) with 7.8 GB of finished scratch still held. Queue order
+      // keeps the destroy behind the blocks still in flight.
+      scratchAllocator.destroyPooled();
+      await settleReleasedMemory(this.device);
       // The pairformer's own encode/wait split, carried out so a bench can report
       // where the stack's wall time went without re-instrumenting it.
       this.lastPairformerSplit = pairformer.split;

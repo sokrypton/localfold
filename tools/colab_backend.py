@@ -226,7 +226,9 @@ class Backend:
         # one. web/colab-bridge.js reads both out of its own URL.
         # ...and how much memory its GPU has, which no browser API reports.
         # The page budgets from it on a runtime; see getDevice in web/model.js.
-        vram = gpu_total_mib()
+        # `LOCALFOLD_VRAM_MIB` stands in for the driver's answer, so a big card
+        # can be made to budget like a small one (a T4 is 15360).
+        vram = int(os.environ.get("LOCALFOLD_VRAM_MIB") or 0) or gpu_total_mib()
         self.ws.call("Page.navigate", url=(
             f"http://127.0.0.1:{self.port}/index.html"
             f"?role=runtime{'' if os.environ.get('LOCALFOLD_WEIGHT_PROXY') == '0' else '&weights=proxy'}"

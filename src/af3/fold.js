@@ -1505,7 +1505,13 @@ async function foldHolding(device, batch, weights, options, held) {
       tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
       // ...the trunk's own pair, copied on the device rather than uploaded
       // again. Not on OpenDDE's path: its expander has already released it.
-      ...(finalPair === undefined || structural !== undefined ? {} : { pairBuffer: finalPair.buffer }),
+      ...(finalPair === undefined || structural !== undefined ? {} : {
+        pairBuffer: finalPair.buffer,
+        // 🔴 RELEASED AS SOON AS THE HEAD HAS COPIED IT, NOT AT THE FOLD'S END.
+        // Held through the confidence blocks it was 1.6 GB at 896 residues of
+        // IntelliFold-2, which a Colab T4 refused 22 minutes in.
+        releasePairBuffer: () => { held.drop(finalPair); finalPair = undefined; },
+      }),
       // 🔴 boltz2's HEAD REBUILDS z, so it needs what the EMBEDDER needed:
       // relative positions, the bond matrix and its orders. AF3's reads none of
       // them and the field is simply absent there.
