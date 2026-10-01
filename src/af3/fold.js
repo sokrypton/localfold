@@ -1196,6 +1196,8 @@ async function foldHolding(device, batch, weights, options, held) {
                   logits: options.trunkLogits === true || featureTolerance > 0
                     || options.recycleDistances === true },
       onStage: (name, ms) => stage("trunk", { name, ms }),
+      // ...and the previous pass's buffers, once the embedder has read them.
+      onEmbedded: () => { held.drop(recycledFrom?.pair); held.drop(recycledFrom?.single); },
       // The trunk's own seams, for a caller holding the reference's taps.
       ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
       // ...the MSA stack's first-half stop point, for bisecting one block

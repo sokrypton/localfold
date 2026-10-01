@@ -265,6 +265,12 @@ export class Af3TrunkGpu {
       () => new Af3EmbedderGpu(this.device).run(input, weights.embedder,
                                                 { ...options, keepOnDevice: true, validation }));
     const owned = [embedded.pairAllocation, embedded.msaAllocation, embedded.singleAllocation];
+    // 🔴 THE PREVIOUS PASS'S PAIR AND SINGLE ARE READ BY THE EMBEDDER AND
+    // NOTHING ELSE, so the caller may let them go now rather than when this
+    // pass returns. Held to the end, every recycled pass carried SEVEN
+    // pair-sized buffers (the old pair, the new one, five scratch) where the
+    // first carried six. The queue orders a destroy behind the embedder's reads.
+    options.onEmbedded?.();
     try {
       const pair = embedded.pairAllocation;
       // 🔴 A SNAPSHOT, because the template stage adds INTO this same buffer.
@@ -498,22 +504,31 @@ export class Af3TrunkGpu {
     const binsBuffer = keep(this.allocator.upload("af3-disto.contact-bins",
       af3ContactBins(contactClasses, tokens, binEdges(bins)), storage));
     const weightBuffer = keep(this.allocator.upload("af3-disto.weights", packed, storage));
-    const logits = keep(this.allocator.allocate("af3-disto.logits", pairs * bins * 4,
-      storage | GPUBufferUsage.COPY_SRC));
-    const contact = keep(this.allocator.allocate("af3-disto.contact", pairs * 4,
-      storage | GPUBufferUsage.COPY_SRC));
 
     const run = async (pairAllocation, singleAllocation, pairElements, singleElements, wanted) => {
+      // 🔴 ALLOCATED HERE, WHEN THE HEAD RUNS, NOT WHEN IT IS PREPARED. The
+      // head is prepared before the pairformer, and its logits are `pairs x
+      // bins` floats - 977 MiB at 2000 tokens - which stood beside the stacks'
+      // scratch for the whole pass: AF3 at 2000 residues was refused on a
+      // T4-sized budget for exactly this buffer. By now the scratch is gone.
+      // Released by this function, below - the trunk copied `allocations` when
+      // the head was prepared, before these existed.
+      const logits = this.allocator.allocate("af3-disto.logits", pairs * bins * 4,
+        storage | GPUBufferUsage.COPY_SRC);
+      const contact = this.allocator.allocate("af3-disto.contact", pairs * 4,
+        storage | GPUBufferUsage.COPY_SRC);
       const mapRead = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
-      const readback = [
+      const readback = [];
+      try {
+      for (const [name, source, elements, want] of [
         ["logits", logits, pairs * bins, wanted.logits], ["contactProbs", contact, pairs, true],
         ["pair", pairAllocation, pairElements, wanted.pair],
         ["single", singleAllocation, singleElements, wanted.single],
-      ].filter(([, , , want]) => want).map(([name, source, elements]) => ({
-        name, source, bytes: elements * 4,
-        target: this.allocator.allocate("af3-disto.readback", elements * 4, mapRead),
-      }));
-      try {
+      ]) {
+        if (!want) continue;
+        readback.push({ name, source, bytes: elements * 4,
+          target: this.allocator.allocate("af3-disto.readback", elements * 4, mapRead) });
+      }
       this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-distogram" });
       const pass = encoder.beginComputePass({ label: "af3-distogram" });
@@ -543,6 +558,8 @@ export class Af3TrunkGpu {
       return result;
       } finally {
         for (const { target } of readback) target.release();
+        logits.release();
+        contact.release();
       }
     };
     return { run, allocations };
