@@ -2558,3 +2558,24 @@ RoseTTAFold3 12.4-14.1 -> 11.2-11.6, Boltz-2 13.9-16.2 -> 13.5-14.0, Protenix-v2
 fold passed its tool's chain check; ESMFold2's pLDDT reads 65.16 (old) and 65.70
 (new) on the T4 against 65.28 on this A100 under either prior, which is the
 kernel choice moving a stochastic sampler, not a different answer.
+
+### Keeping a T4 runtime's shader caches between sessions: measured, not worth it
+
+A returning Colab user starts on a new VM with no NVIDIA driver cache and no
+Chrome profile, so the question was whether saving both (to Drive, as the
+notebook already does for JAX's compile cache) would take the first fold down.
+Measured on one T4 by folding cold, saving `~/.cache/nvidia/GLCache` (5.5 MB)
+and the runtime's profile (`LOCALFOLD_KEEP_PROFILE=1` on the broker keeps it),
+then restoring each into a cleared machine, weights always re-downloaded. AF3
+at 68 residues, folded the moment the model is picked, two rounds: restored
+nothing 12.2 / 21.8 s, driver cache 16.1 / 20.5, profile 14.7 / 23.0, both
+13.5 / 15.8; AF2 7.3-13.2 across every arm. The rounds disagree by more than the
+arms do (the card heats between them), and the profile is **696 MB** - 338 MB of
+`DawnWebGPUCache` and 344 MB of service-worker cache - to move through Drive
+every session for no measurable win. Not built.
+
+The number that did stand out is the VM's FIRST fold: 23.0 s against 12.2 for
+the "restored nothing" arm on the same machine minutes later, with every cache
+of ours cleared in both. What a fresh VM pays is first-launch and network
+warm-up below this repository - the OS page cache, the CDN path to Hugging Face
+- not shader compilation.
