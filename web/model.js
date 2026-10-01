@@ -173,14 +173,14 @@ export function getDevice() {
     // that asks for too much should fail loudly and does; a page that asks for
     // too much takes the machine down with it, so this is where the ceiling is
     // set. `null` takes the guess in device-memory.js from navigator.deviceMemory.
-    // ...except on a Colab runtime, whose broker asked the driver: there the
-    // ceiling is 90% of the GPU's own memory (`vram`, MiB), not a third of
-    // host RAM, which on a T4 refused folds a 16 GiB card holds.
-    const asked = new URLSearchParams(location.search);
-    const vram = asked.get("role") === "runtime" ? Number(asked.get("vram")) : NaN;
-    const device = await requestAlphaFoldDevice(adapter, {
-      memoryBudgetBytes: vram > 0 ? Math.round(vram * 1048576 * 0.9) : null,
-    });
+    // 🔴 NOT FROM THE GPU'S OWN SIZE, EVEN WHERE IT CAN BE KNOWN. Budgeting 90%
+    // of a Colab runtime's card (the broker asking nvidia-smi) was tried: on
+    // a T4 IntelliFold-2 at 768 residues then ran past the card - this budget
+    // counts the buffers this port creates, not the driver's and Dawn's own -
+    // lost the device, and every fold after it on that runtime failed at once.
+    // The host-RAM guess refused that fold cleanly instead. Kept as a guess
+    // until the accounting is calibrated against what the card really holds.
+    const device = await requestAlphaFoldDevice(adapter, { memoryBudgetBytes: null });
     // ...so the footer's timing panel can read this device's memory counters.
     // It reads them; it does not install anything on the device.
     devUseDevice(device);

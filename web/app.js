@@ -5415,11 +5415,11 @@ async function fold(event) {
       // paging and reports nothing: without it the failure is not an error
       // message, it is a machine that stops responding. That is what the title
       // on the button says, in those words.
-      // ...but not on a Colab runtime: there the ceiling is the GPU's own
-      // memory, lifting it only trades the message for the driver's
-      // out-of-memory, and the button would be on a page nobody can click.
+      // ...but not on a Colab runtime: its button would be on a page nobody can
+      // click, and lifting the ceiling there was measured to lose the device -
+      // a T4 ran past its memory and every later fold on that runtime failed.
       if (error instanceof GpuMemoryBudgetError && colabRole() === "runtime") {
-        status(`${describeBudget(error)} That is more than this runtime's GPU holds -`
+        status(`${describeBudget(error)} Too large for this runtime -`
           + " try a shorter sequence or a smaller model.", true);
       } else if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
         statusWithAction(
