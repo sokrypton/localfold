@@ -3830,3 +3830,33 @@ least), a trajectory frame 4-5x - for ~0.1 s of CPU per 5 MB result on this box
 and roughly twice that on a Colab VM. On a 10-50 Mbit/s link that is 0.5-2.5 s
 a fold back; on a fast one it is about even. Whether Colab's proxy already
 compressed was not measured; a response already marked gzip passes through it.
+
+### Large proteins on a Colab T4: what the reader sees
+
+Random sequences on a T4 through the fold tool (no budget): AF3 folds 512 /
+768 / 1024 residues (53 / 115 / 225 s, peaks 1.1 / 2.2 / 3.7 GB); IntelliFold-2
+and OpenDDE fold 512 and fail at 768 - IntelliFold-2 on Vulkan's
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`, reported only as an uncaptured error.
+
+Through the page the budget catches it first, and a reader sees one sentence:
+"Needs 5857 MiB, over this device's 5461 MiB limit. Too large for this runtime
+- try a shorter sequence or a smaller model." It used to read twice, joined,
+ending in a "Fold anyway" relayed as text from a page nobody can click.
+
+🔴 **BUDGETING FROM THE GPU'S OWN SIZE WAS TRIED AND REVERTED.** The limit is a
+third of host RAM (navigator.deviceMemory, capped at 8 GiB), 5461 MiB against
+a 16 GiB card, so passing the card's size from nvidia-smi and budgeting 90% of
+it looked like a free win. It let IntelliFold-2 at 768 proceed, ran past the
+card at 16% of the trunk - the budget counts the buffers this port creates, not
+the driver's and Dawn's own - and LOST THE DEVICE, after which every fold on
+that runtime failed in seconds, a 512-residue one included. The host-RAM guess
+refuses that fold cleanly. Calibrating the accounting against what the card
+really holds is what would let it go; until then it stays.
+
+🔴 **AND A REMOTE FOLD HAD FIVE MINUTES.** The runtime waited `request.timeout
+?? 300` seconds and the reader sends none, so IntelliFold-2 at 512 residues was
+cut off at 73% of its last trunk pass - and left running, so the next fold was
+refused as "already folding". Thirty minutes now (the existing cap), and a fold
+that runs out is stopped. It finishes in **385 s** through the page where the
+fold tool, unbudgeted, takes 153: the budget makes it stream its weights, which
+is the price of the limit above.
