@@ -2592,3 +2592,22 @@ tile 32x16 -4.0/0.0, 16x32 +4.7/-0.5; triangle output columns 32 0.0/-1.4, 128
 heated, and nothing clears that by both rounds' agreement and size together:
 the two that lean the same way twice (32x128x16x1x8, columns 128) do so by 2-5%,
 inside this card's spread. A plateau, so ampere's tiles stay.
+
+### The trunk's last pair stays on the device for the heads that read it
+
+Every AF3-lineage fold read its last pass's pair back to the host (kept: a retry
+and a re-sampled fold resume from it) and then uploaded it TWICE more, once for
+the diffusion conditioning and once for the confidence head - `tokens^2 x
+pairChannels` floats each, 133 MB apiece for IntelliFold-2 at 255 tokens. The
+last pass now keeps its pair allocation for every model, as OpenDDE's already
+did for its expander: the conditioning binds it (it only reads), and the
+confidence head copies it on the device (it updates its pair in place).
+RoseTTAFold3's host global norm keeps its upload; a resumed or re-sampled trunk
+has no device pair and uploads from the host as before - checked on the page:
+fresh, "(trunk reused)" and "(1 more recycle)" all fold.
+
+Warm folds at 255 residues on this A100, interleaved: IntelliFold-2 6.27-6.33 ->
+**6.03-6.12 s**, AF3 2.42-2.52 -> 2.40-2.48. Peak device memory unchanged - 1605.5
+MiB and 897.8 MiB both ways, because the peak is in the trunk and not the
+sampler. Every pLDDT identical to the last digit; test:stock 8 of 8, ligand,
+modified, template, portable, spec-floor and cache all pass.

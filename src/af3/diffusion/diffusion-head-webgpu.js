@@ -703,6 +703,9 @@ export class Af3DiffusionHeadGpu {
     const cond = await stage("conditioning", () =>
       conditioner.run({
         tokens, trunkSingle: input.trunkSingle, trunkPair: input.trunkPair,
+        // ...bound from the trunk's own buffer when the fold still holds it,
+        // rather than uploaded again from the host copy. Read only.
+        ...(input.trunkPairBuffer === undefined ? {} : { trunkPairBuffer: input.trunkPairBuffer }),
         targetFeat: input.targetFeat, noiseLevel: input.noiseLevel,
         features: input.features, dialect: input.dialect,
       }, weights.conditioning, {

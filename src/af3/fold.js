@@ -1078,11 +1078,14 @@ async function foldHolding(device, batch, weights, options, held) {
   // did. A tolerance, or a caller asking for `recycleDeltas`, reads every pass
   // as before, because both compare host arrays.
   let previousBuffers;
-  // 🔴 OpenDDE'S EXPANDER READS THE LAST PASS'S PAIR, SO THAT PASS KEEPS IT ON
-  // THE DEVICE. The host array is still read back - a retry resumes from it -
-  // but the expander binds this instead of uploading `tokens^2 x 384` again.
-  // Only this loop sets it, never a resumed trunk, whose allocation is gone.
-  const keepFinalPair = weights.trunk.dialect.structuralTokens === true;
+  // 🔴 THE LAST PASS'S PAIR STAYS ON THE DEVICE, FOR EVERY MODEL. OpenDDE's
+  // expander binds it, and so do the diffusion conditioning and the confidence
+  // head, which used to upload `tokens^2 x pairChannels` from the host copy
+  // each - 133 MB apiece for IntelliFold-2 at 255 tokens. The host array is
+  // still read back: a retry and a re-sampled fold resume from it. Only this
+  // loop sets it, never a resumed trunk, whose allocation is gone - and then
+  // both consumers upload from the host as they always did.
+  const keepFinalPair = true;
   let finalPair;
   const readEveryPass = (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true
     || options.recycleDistances === true;
@@ -1316,7 +1319,8 @@ async function foldHolding(device, batch, weights, options, held) {
                                      finalPair, held)
     : undefined;
   const headInput = structural === undefined
-    ? { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair }
+    ? { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair,
+        ...(finalPair === undefined ? {} : { trunkPairBuffer: finalPair.buffer }) }
     : structural.headInput;
 
   // 🔴 TWO WAYS TO TURN THE TRUNK INTO COORDINATES, AND THEY ARE NOT THE SAME
@@ -1478,6 +1482,9 @@ async function foldHolding(device, batch, weights, options, held) {
     }
     return new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
       tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
+      // ...the trunk's own pair, copied on the device rather than uploaded
+      // again. Not on OpenDDE's path: its expander has already released it.
+      ...(finalPair === undefined || structural !== undefined ? {} : { pairBuffer: finalPair.buffer }),
       // 🔴 boltz2's HEAD REBUILDS z, so it needs what the EMBEDDER needed:
       // relative positions, the bond matrix and its orders. AF3's reads none of
       // them and the field is simply absent there.

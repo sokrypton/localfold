@@ -1020,8 +1020,24 @@ export class Af3ConfidenceHeadGpu {
       // Float32Array can go straight in - and at 300 tokens this copy was 43.9
       // MiB of host allocation for nothing. The fallback stays because a
       // checker may hand this a plain array.
-      const pair = keep(this.allocator.upload("af3-conf.pair", asFloats(input.pair),
-        storage | GPUBufferUsage.COPY_SRC));
+      // 🔴 AND NOT UPLOADED AT ALL WHEN THE FOLD STILL HOLDS THE TRUNK'S PAIR
+      // ON THE DEVICE: copied there, which is a GPU-side copy rather than
+      // `pairs x channels` floats crossing the bus again. A copy and not the
+      // buffer itself, because the embed and the four blocks update this pair
+      // in place. RoseTTAFold3's global norm rewrites the HOST pair above, so
+      // that path keeps uploading what it normalised.
+      const pairBytes = pairs * pairChannels * 4;
+      const fromDevice = input.pairBuffer !== undefined && dialect?.confidenceGlobalNorm !== true;
+      const pair = keep(fromDevice
+        ? this.allocator.allocate("af3-conf.pair", pairBytes,
+          storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST)
+        : this.allocator.upload("af3-conf.pair", asFloats(input.pair),
+          storage | GPUBufferUsage.COPY_SRC));
+      if (fromDevice) {
+        const copy = this.device.createCommandEncoder({ label: "af3-conf.pair-copy" });
+        copy.copyBufferToBuffer(input.pairBuffer, 0, pair.buffer, 0, pairBytes);
+        this.device.queue.submit([copy.finish()]);
+      }
       const targetFeat = keep(this.allocator.upload("af3-conf.target", input.targetFeat, storage));
       const pseudoBeta = keep(this.allocator.upload("af3-conf.beta", input.pseudoBeta, storage));
       const maskBuffer = keep(this.allocator.upload("af3-conf.mask", pairMask, storage));
