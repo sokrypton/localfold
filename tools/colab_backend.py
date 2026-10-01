@@ -382,8 +382,21 @@ def serve(port, backend, token, host="127.0.0.1", jax=None):
 
         def _json(self, code, payload):
             body = json.dumps(payload).encode()
+            # 🔴 COMPRESSED, BECAUSE ON COLAB THIS CROSSES THE INTERNET. A
+            # finished fold's result is ~5 MB of JSON (AF3 at 255 residues) and
+            # a trajectory frame a PDB's worth of text; gzip takes them 2.5x
+            # and 4-5x at its fastest level, ~0.1 s for a result here. Only
+            # where the client asked (a browser always does; urllib does not)
+            # and only for a body worth it - the 300 ms polls between events
+            # are a few hundred bytes.
+            gzipped = len(body) > 65536 and "gzip" in self.headers.get("Accept-Encoding", "")
+            if gzipped:
+                import gzip
+                body = gzip.compress(body, compresslevel=1)
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            if gzipped:
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(body)))
             self._cors()
             self.end_headers()

@@ -3821,3 +3821,12 @@ continued paths fold; IntelliFold-2 at 261 residues 15.6 s warm through the page
 so the earlier "15.3" was the stale runtime and the page gain sits inside the
 noise; the fold-tool numbers were always fresh). Colab VMs and every
 `gpu-chrome.mjs` run start their own browser and were never affected.
+
+**...and gzipped on the way.** The broker compresses a JSON response over 64
+KiB when the client asks for gzip (a browser always does; urllib, and so every
+gate, does not), at the fastest level. Measured on a session of folds here: the
+events go 45.5 MB -> 17.8 MB (2.6x) - a result 2.5x (its base64 compresses
+least), a trajectory frame 4-5x - for ~0.1 s of CPU per 5 MB result on this box
+and roughly twice that on a Colab VM. On a 10-50 Mbit/s link that is 0.5-2.5 s
+a fold back; on a fast one it is about even. Whether Colab's proxy already
+compressed was not measured; a response already marked gzip passes through it.
