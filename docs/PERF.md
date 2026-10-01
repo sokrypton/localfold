@@ -2549,3 +2549,12 @@ residues 17.6 / 14.9 s old against 15.0 / 16.4 new; AF2 15.5 / 12.2 against
 fold read 21.7 s for AF3 (Chrome's first start and a cold path to Hugging Face
 included); 60 s after picking the model the page folds AF3 in 6.1 s and AF2 in
 4.0.
+
+**And the other six families on the same T4, old prior -> new** (two rounds
+interleaved, 255 residues, warm folds, seconds): ESMFold2 **18.0-18.3 -> 7.5-7.6**
+(its trunk 3.8 -> 1.3 s a recycle), AF2 multimer 16.7-17.3 -> 13.0-13.3,
+RoseTTAFold3 12.4-14.1 -> 11.2-11.6, Boltz-2 13.9-16.2 -> 13.5-14.0, Protenix-v2
+15.5-17.1 -> 15.5-15.8, OpenDDE 69.8 -> 67.4-67.7. No family got slower. Every
+fold passed its tool's chain check; ESMFold2's pLDDT reads 65.16 (old) and 65.70
+(new) on the T4 against 65.28 on this A100 under either prior, which is the
+kernel choice moving a stochastic sampler, not a different answer.
