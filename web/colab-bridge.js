@@ -192,10 +192,7 @@ async function readBack() {
   // ...and a typed array travels as its BYTES, base64: a float as JSON text
   // is 10-18 characters and 5.3 as base64, and the broker and the reader each
   // parse what is sent.
-  const predJson = JSON.stringify(pred, (key, value) =>
-    RUNTIME_ONLY.has(key) ? undefined
-      : (ArrayBuffer.isView(value) && !(value instanceof DataView))
-        ? { __typed: value.constructor.name, b64: bytesToBase64(value) } : value);
+  const predJson = encodePrediction(pred);
   return {
     predJson,
     a3m: pred.a3m ?? null,
@@ -205,7 +202,10 @@ async function readBack() {
     // LOGITS rode along - 130 MiB of a 158 MiB event for one AF2 fold at 261
     // residues, and fifteen seconds between "Done" and the reader seeing it.
     confidence: null,
-    scores: pred.scores ?? null,
+    // 🔴 AND NOT A SECOND COPY OF THE SCORES EITHER: they are `pred.scores`,
+    // inside `predJson`, and the reader takes them from there. Sent twice they
+    // were 7.3 of an AF3 fold's 8.8 MB at 255 residues, over the internet.
+    scores: null,
     chains: pred.chains ?? null,
     length: pred.length ?? null,
     status: statusText(),
@@ -413,16 +413,60 @@ const TYPED = {
   Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array,
 };
 
-export function revivePrediction(json) {
-  return JSON.parse(json, (key, value) => {
-    if (value === null || typeof value !== "object") return value;
-    const kind = TYPED[value.__typed];
-    if (kind === undefined) return value;
-    if (typeof value.b64 === "string") {
-      const bytes = base64ToBytes(value.b64);
-      return new kind(bytes.buffer, bytes.byteOffset, bytes.byteLength / kind.BYTES_PER_ELEMENT);
+/**
+ * The prediction as the string the bridge carries.
+ *
+ * 🔴 SHARED OBJECTS ARE SENT ONCE. JSON has no references, so every object
+ * the prediction reaches twice was written out twice: an AF2 pass holds its
+ * structure and confidences in its wrapper AND in its `pass`, and
+ * `contactSource` is one of those passes again - 10 MB for an AF2 fold at 255
+ * residues, two thirds of it repeats. The first appearance carries `__id`; a
+ * later one is `{__ref: id}`, which `revivePrediction` puts back as the SAME
+ * object, as the runtime held it. Typed arrays travel as their bytes, and the
+ * model's intermediates (RUNTIME_ONLY) not at all.
+ */
+export function encodePrediction(pred) {
+  const ids = new Map();
+  return JSON.stringify(pred, (key, value) => {
+    if (RUNTIME_ONLY.has(key)) return undefined;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    const seen = ids.get(value);
+    if (seen !== undefined) return { __ref: seen };
+    const id = ids.size;
+    ids.set(value, id);
+    if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+      return { __typed: value.constructor.name, b64: bytesToBase64(value), __id: id };
     }
-    return Array.isArray(value.v) ? kind.from(value.v) : value;
+    return { __id: id, ...value };
+  });
+}
+
+/**
+ * ...and back. `JSON.parse` revives children before parents and siblings in
+ * order, so an object's first appearance is complete before any later
+ * `{__ref}` to it is reached - one pass resolves them.
+ */
+export function revivePrediction(json) {
+  const byId = new Map();
+  return JSON.parse(json, (key, value) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    if (value.__ref !== undefined && Object.keys(value).length === 1) {
+      if (!byId.has(value.__ref)) throw new Error(`prediction reference ${value.__ref} before its object`);
+      return byId.get(value.__ref);
+    }
+    const id = value.__id;
+    let revived = value;
+    const kind = TYPED[value.__typed];
+    if (kind !== undefined && typeof value.b64 === "string") {
+      const bytes = base64ToBytes(value.b64);
+      revived = new kind(bytes.buffer, bytes.byteOffset, bytes.byteLength / kind.BYTES_PER_ELEMENT);
+    } else if (kind !== undefined && Array.isArray(value.v)) {
+      revived = kind.from(value.v);
+    } else if (id !== undefined) {
+      delete value.__id;
+    }
+    if (id !== undefined) byId.set(id, revived);
+    return revived;
   });
 }
 

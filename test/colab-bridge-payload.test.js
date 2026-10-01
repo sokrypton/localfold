@@ -39,3 +39,35 @@ describe("a typed array across the bridge", () => {
     expect(Array.from(revivePrediction('{"a":{"__typed":"Uint8Array","v":[7,8]}}').a)).toEqual([7, 8]);
   });
 });
+
+describe("shared objects across the bridge", () => {
+  it("are sent once and come back as the same object", async () => {
+    globalThis.location ??= { search: "", href: "http://localhost/", origin: "http://localhost" };
+    globalThis.window ??= globalThis;
+    globalThis.document ??= { getElementById: () => null, addEventListener() {}, querySelector: () => null };
+    const { encodePrediction, revivePrediction } = await import("../web/colab-bridge.js");
+    // An AF2 prediction's shape: each pass wraps its own result, and
+    // contactSource is one of those results again.
+    const structure = { atom37: new Float32Array(3000).fill(1.25) };
+    const confidence = { plddt: new Float32Array([90, 80]), predictedAlignedError: new Float32Array(400) };
+    const pass = { structure, confidence, contactProbs: new Float32Array(400).fill(0.5), pair: new Float32Array(9) };
+    const pred = { recycles: [{ structure, confidence, pass }], contactSource: pass, scores: { plddt: [90, 80] } };
+    const json = encodePrediction(pred);
+    const back = revivePrediction(json);
+    expect(back.contactSource).toBe(back.recycles[0].pass);
+    expect(back.recycles[0].structure).toBe(back.recycles[0].pass.structure);
+    expect(back.recycles[0].pass.confidence.plddt).toBe(back.recycles[0].confidence.plddt);
+    expect(back.recycles[0].structure.atom37.constructor.name).toBe("Float32Array");
+    expect(back.recycles[0].structure.atom37[2999]).toBe(1.25);
+    expect(back.contactSource.pair).toBe(undefined);        // RUNTIME_ONLY still stays home
+    expect("__id" in back.recycles[0]).toBe(false);
+    // ...and the repeats cost a reference, not a copy: against the same
+    // prediction with every shared object written out each time, which is
+    // what a plain stringify did.
+    const { bytesToBase64 } = await import("../web/colab-bridge.js");
+    const copies = JSON.stringify(pred, (key, value) => key === "pair" ? undefined
+      : ArrayBuffer.isView(value) ? { __typed: value.constructor.name, b64: bytesToBase64(value) } : value);
+    expect(json.length * 2 < copies.length).toBe(true);
+    expect((json.match(/"__ref"/g) ?? []).length).toBe(3);   // pass.structure, pass.confidence, contactSource
+  });
+});

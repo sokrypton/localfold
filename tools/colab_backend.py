@@ -67,6 +67,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cdp                                                   # noqa: E402
 
 WEIGHT_CACHE = os.environ.get("LOCALFOLD_WEIGHT_CACHE", "/tmp/localfold-weight-cache")
+# What may cache: the weight shards, as tools/serve.py names them.
+CACHEABLE = (".bin", ".safetensors", ".zst", ".gz")
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # 🔴 TWO MAILBOXES AND ONE SEQUENCE EACH, WHICH IS THE WHOLE BROKER. `EVENTS`
@@ -351,6 +353,23 @@ def serve(port, backend, token, host="127.0.0.1", jax=None):
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=REPO, **kw)
+
+        # 🔴 NO-STORE ON THE PAGE'S OWN FILES, as tools/serve.py sends and for
+        # the reason CLAUDE.md gives: SimpleHTTPRequestHandler sends no cache
+        # headers, so Chrome caches every ES module heuristically. Both browsers
+        # this serves keep a profile - the reader's is the user's own, and the
+        # runtime's survives under LOCALFOLD_KEEP_PROFILE or a wipe that races
+        # Chrome's exit - and a page holding last week's colab-bridge.js
+        # talking to a runtime on this week's is a fold that fails on the
+        # wire format. Measured: the runtime page ran a stale bridge module
+        # while this server was serving the new one. Weight shards are
+        # content-addressed (their URLs pin a commit) and cache for a year.
+        def end_headers(self):
+            if self.path.split("?")[0].endswith(CACHEABLE):
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            else:
+                self.send_header("Cache-Control", "no-store, must-revalidate")
+            super().end_headers()
 
         def log_message(self, *a):
             pass

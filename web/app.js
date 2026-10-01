@@ -4224,7 +4224,7 @@ async function followRemoteFold({ since, label, signal }) {
   }
   await loadIntoViewer({
     stem, pdb: framePdbs[0] ?? result.pdb,
-    scores: jax?.scores ?? result.scores ?? {},
+    scores: jax?.scores ?? remote?.scores ?? result.scores ?? {},
     a3m: result.a3m ?? undefined,
     confidence: jax?.confidence ?? remote?.confidence ?? result.confidence,
     length: result.length,

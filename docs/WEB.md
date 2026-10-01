@@ -3780,3 +3780,32 @@ page connected, where the local page runs nothing of AF3's until
 Checked against a broker: a fresh reader sends no warm, and after accepting,
 choosing AF3 sends one. The cost is that a first-time AF3 reader's first fold is
 unwarmed; a returning one is warmed on connect as before.
+
+### What a remote fold sends back, halved
+
+The reader is quick once a result arrives (0.05-0.1 s to load it), but the
+result was large, and on Colab it crosses the internet: **8.8 MB** for an AF3
+fold at 255 residues, 8.9 for ESMFold2, 12.0 for AF2. Most of it was repeats.
+`scores` went twice (top level and inside `predJson`) - 7.3 of AF3's 8.8 MB -
+and JSON has no references, so every object the prediction reaches twice was
+written twice: an AF2 pass holds its structure and confidences in its wrapper
+AND in `pass`, and `contactSource` is one of those passes again.
+`encodePrediction` (web/colab-bridge.js) now writes a repeated object or typed
+array as `{__ref}` to its first appearance and `revivePrediction` relinks it,
+so the reader holds the same shared objects the runtime did; the reader takes
+`scores` from the prediction. **4.80 / 4.85 / 6.95 MB.** Checked end to end: a
+remote AF2 and AF3 fold's "download all" archive still carries `pae`,
+`contact_probs` and `atom_plddts` (AF2's from `contactSource`, a reference now),
+and test:colab, test:pending and the bridge payload test (which asserts the
+identities come back) pass.
+
+🔴 **AND THE BROKER NOW SENDS `Cache-Control: no-store`, BECAUSE THE RUNTIME
+PAGE RAN A STALE MODULE WHILE MEASURING THIS.** The broker served the repo
+through `SimpleHTTPRequestHandler`, which sends no cache headers - CLAUDE.md's
+`python3 -m http.server` trap - and a runtime whose profile survived (a wipe
+that raced Chrome's exit; `LOCALFOLD_KEEP_PROFILE`) imported last session's
+`colab-bridge.js` while the server held the new one: the first measurement of
+this change read the old sizes exactly. The reader's browser is the user's own
+and caches the same way, so a returning reader could hold a bridge that cannot
+read the new wire format. Everything but weight shards is `no-store` now, as
+tools/serve.py does.
