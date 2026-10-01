@@ -3769,3 +3769,14 @@ with an alignment, all of it py2Dmol drawing the structure and the MSA.
 `test:colab`'s reader arm now asserts it (adapter requests and `.bin` /
 huggingface / `/hf/` fetches both zero), and fails on a reader made to ask for
 an adapter and one shard.
+
+🔴 **AND THE COLAB WARM-UP NO LONGER RUNS AlphaFold 3 BEFORE ITS TERMS ARE
+ACCEPTED.** The reader asks its runtime to warm whichever model is selected, and
+the runtime's warm-up is a real fold of a dummy sequence - so a reader who had
+never seen the licence dialog had AF3 running on their runtime the moment the
+page connected, where the local page runs nothing of AF3's until
+`agreeModelTerms` has been answered. `warmRemoteModel` skips `af3` until
+`termsAccepted()`; every other model, OpenBind-0 included, warms as before.
+Checked against a broker: a fresh reader sends no warm, and after accepting,
+choosing AF3 sends one. The cost is that a first-time AF3 reader's first fold is
+unwarmed; a returning one is warmed on connect as before.

@@ -929,6 +929,13 @@ let lastFoldedFamily;
 let warmedRemotely;
 function warmRemoteModel(family) {
   if (remoteBackend() === null || remoteBackendChoice() !== "webgpu" || !remoteWebgpuReal()) return;
+  // 🔴 NOT AlphaFold 3 BEFORE ITS TERMS ARE ACCEPTED. The warm-up runs a real
+  // fold of a dummy sequence, and this page runs nothing of AF3's until the
+  // reader has agreed to DeepMind's parameter terms (agreeModelTerms) - a
+  // runtime warming it ahead of that would be the one place it did. A reader
+  // who accepted before is warmed as soon as they connect; one accepting now
+  // folds on the next click, and the fold's own path compiles what it needs.
+  if (family === "af3" && !termsAccepted()) return;
   if (family === warmedRemotely) return;
   warmedRemotely = family;
   const tokens = entityList.read().reduce((sum, entity) =>
