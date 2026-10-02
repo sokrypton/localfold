@@ -204,13 +204,15 @@ add("batch", batch);
 // four); parts joined by "+" share ONE slot, as AF3 puts each chain's k-th template in slot k -
 // e.g. 1brs.pdb:A@0+1brs.pdb:D@1 - and that merged slot may speak across the chains it covers
 // (--no-span-chains masks the cross-chain block). Each part is built by the page's own
-// buildTemplate, the geometry features by the reference's templateGeometry.
+// buildTemplate.
 const templateSpecs = option("template", "").split(",").filter(Boolean);
-if (templateSpecs.length > 4) throw new Error("at most four template slots");
+const TEMPLATES = 4;                    // the padded slot count every family folds with
+if (templateSpecs.length > TEMPLATES) throw new Error("at most four template slots");
+const { templateGeometry, multichainMaskFor, coverageOf } =
+  await import(`${repo}/src/af3/featurise/template-features.js`);
+const slots = [];                       // {slot, mask}
 if (templateSpecs.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);
-  const { templateGeometry, multichainMaskFor, coverageOf } =
-    await import(`${repo}/src/af3/featurise/template-features.js`);
   const { mergeTemplateSlots } = await import(`${repo}/src/af3/featurise/template-input.js`);
   const chains = sequence.split(":");
   // which token each chain's residue occupies (a modified residue or ligand shifts them)
@@ -235,16 +237,64 @@ if (templateSpecs.length > 0) {
     });
     const slot = parts.length === 1 ? parts[0] : mergeTemplateSlots(parts);
     const spanChains = parts.length > 1 && !args.includes("--no-span-chains");
-    const mask = multichainMaskFor(batch.asymId, batch.tokens,
-                                   { coverage: coverageOf(slot, batch.tokens), spanChains });
-    const g = templateGeometry(slot, mask, batch.tokens);
-    add(`template.${k}.aatype`, Int32Array.from(slot.aatype));
-    add(`template.${k}.distogram`, Float32Array.from(g.distogram));
-    add(`template.${k}.pseudoBetaMask2d`, g.pseudoBetaMask2d);
-    add(`template.${k}.unitVector`, g.unitVector);
-    add(`template.${k}.backboneMask2d`, g.backboneMask2d);
+    slots.push({ slot, mask: multichainMaskFor(batch.asymId, batch.tokens,
+                                               { coverage: coverageOf(slot, batch.tokens), spanChains }) });
   });
-  add("template.count", templateSpecs.length);
+}
+// The template embedder's PASSES, built as the page's trunk builds them (template-webgpu.js): each
+// a repeat weight and either - the fused embedder (protenix2, boltz2, rf3) - its feature columns,
+// or - the nine-projection one - an aatype and, for a real template, its geometry. Empty slots
+// fold into one or two passes (an empty slot carries the GAP restype in one slot under protenix's
+// featuriser and 0 elsewhere), rf3 averages every present template's features into one pass, and
+// boltz2 weighs an empty slot zero.
+{
+  const fused = dialect.fusedTemplateLayout != null || dialect.boltz2TemplateFeatures === true
+    || dialect.rosettafold3TemplateFeatures === true;
+  const width = dialect.boltz2TemplateFeatures ? 109 : dialect.rosettafold3TemplateFeatures ? 66
+    : dialect.fusedTemplateLayout ? dialect.fusedTemplateLayout.distogramBins + 1 + 2 * dialect.fusedTemplateLayout.restypes + 4 : 0;
+  const { fusedTemplateFeatures } = fused ? await import(`${repo}/src/af3/trunk/template-webgpu.js`) : {};
+  const passes = [];
+  if (dialect.templateFeatureMeanOnePass === true) {
+    const present = slots.filter(({ slot }) => Array.prototype.some.call(slot.atomMask, (v) => v > 0));
+    let features = fusedTemplateFeatures(undefined, batch.tokens, width, dialect, undefined, false);
+    if (present.length > 0) {
+      features = fusedTemplateFeatures(present[0].slot, batch.tokens, width, dialect, present[0].mask, false);
+      for (const more of present.slice(1)) {
+        const f = fusedTemplateFeatures(more.slot, batch.tokens, width, dialect, more.mask, false);
+        for (let i = 0; i < features.length; i += 1) features[i] += f[i];
+      }
+      for (let i = 0; i < features.length; i += 1) features[i] /= present.length;
+    }
+    passes.push({ repeat: TEMPLATES, features, aatype: new Int32Array(batch.tokens) });
+  } else {
+    for (const { slot, mask } of slots) passes.push({ repeat: 1, slot, mask });
+    const empty = TEMPLATES - slots.length, gap = dialect.emptyTemplateAatype ?? null;
+    if (empty > 0 && gap !== null) {
+      passes.push({ repeat: 1, emptyAatype: gap });
+      if (empty > 1) passes.push({ repeat: empty - 1, emptyAatype: 0 });
+    } else if (empty > 0) passes.push({ repeat: empty, emptyAatype: 0 });
+  }
+  passes.forEach((pass, k) => {
+    const real = pass.slot !== undefined;
+    const covered = !(dialect.templateVisibilityByCoverage === true && !real && pass.features === undefined);
+    add(`template.${k}.repeat`, covered ? pass.repeat : 0);
+    add(`template.${k}.aatype`, real ? Int32Array.from(pass.slot.aatype)
+      : (pass.aatype ?? new Int32Array(batch.tokens).fill(pass.emptyAatype ?? 0)));
+    if (fused) {
+      add(`template.${k}.features`, pass.features ?? fusedTemplateFeatures(real ? pass.slot : undefined, batch.tokens,
+        width, dialect, real ? pass.mask : undefined, (pass.emptyAatype ?? 0) !== 0));
+    } else if (real) {
+      const g = templateGeometry(pass.slot, pass.mask, batch.tokens);
+      add(`template.${k}.distogram`, Float32Array.from(g.distogram));
+      add(`template.${k}.pseudoBetaMask2d`, g.pseudoBetaMask2d);
+      add(`template.${k}.unitVector`, g.unitVector);
+      add(`template.${k}.backboneMask2d`, g.backboneMask2d);
+    }
+  });
+  add("template.passes", passes.length);
+  add("template.templates", TEMPLATES);
+  add("template.featureWidth", width);
+  add("template.outerResidual", dialect.templateStackOuterResidual === true);
 }
 // The PDB's records as the page writes them (src/af3/fold.js toPdb: chains, HETATM ligands under
 // their codes, modified residues, CONECT), with each atom's dense slot as its x coordinate so the

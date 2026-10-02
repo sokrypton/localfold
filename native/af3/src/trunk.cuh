@@ -158,57 +158,72 @@ __global__ void templateGeometryK(float* act, const float* dgram, const float* p
   v += pb[p] * W1[c] + uv[p * 3] * W4[c] + uv[p * 3 + 1] * W5[c] + uv[p * 3 + 2] * W6[c] + bb[p] * W7[c];
   act[t] += v;
 }
-// The template slots: every slot's input is the query term plus its aatype's one-hot projected
-// along each axis, plus - for a real template (`template.<k>.*` from the exporter) - its geometry.
-// The empty slots (restype 0, no geometry) are identical, so one is computed and counted for all.
+// The template embedding, over the exporter's passes (built as the page's trunk builds them):
+// each pass's input is the query term plus - nine-projection embedder - its aatype one-hot
+// projected along each axis and, for a real template, its geometry, or - the fused embedder
+// (protenix2, boltz2, rf3) - its feature columns projected; then the stack's blocks (wrapped in a
+// residual under boltz2), the output LayerNorm, summed with the pass's repeat weight; the sum
+// divided by every slot, relu, projected.
+__global__ void addScaledK(float* y, const float* x, float s, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] += s * x[i];
+}
 template <class T>
 void templateEmbedding(Trunk& t, float* out) {
   int n = t.n, Cq = t.C; size_t pairs = (size_t)n * n;
   const std::string P = "trunk.template.";
-  int Ct = (int)M.meta(P + "channels"), templates = 4;
-  int real = M.has("template.count") ? (int)M.meta("template.count") : 0;
-  if (M.flag(P + "fused")) { fprintf(stderr, "fused template embedder: not ported yet\n"); exit(1); }
+  int Ct = (int)M.meta(P + "channels");
+  bool fused = M.flag(P + "fused");
+  int passes = (int)M.meta("template.passes"), templates = (int)M.meta("template.templates");
+  int width = (int)M.meta("template.featureWidth");
+  bool outer = M.flag("template.outerResidual");
+  if (fused && lenW(P + "aProjection") != (size_t)width * Ct) {
+    fprintf(stderr, "template features are %d wide, the projection takes %zu\n", width, lenW(P + "aProjection") / Ct); exit(1);
+  }
   T* ln = scratch<T>("tmpl.ln", pairs * Cq);
   layerNorm2<float, T>(t.pair, ln, pairs, Cq, P + "queryEmbeddingNormScale", P + "queryEmbeddingNormOffset");
   float* query = scratch<float>("tmpl.query", pairs * Ct);
-  linear<T, float>(ln, query, pairs, Cq, Ct, P + "templatePairEmbedding8");
+  linear<T, float>(ln, query, pairs, Cq, Ct, P + (fused ? "zProjection" : "templatePairEmbedding8"));
   float* act = scratch<float>("tmpl.act", pairs * Ct);
+  float* before = outer ? scratch<float>("tmpl.before", pairs * Ct) : nullptr;
   float* normed = scratch<float>("tmpl.normed", pairs * Ct);
   float* summed = scratch<float>("tmpl.summed", pairs * Ct);
   CK(cudaMemsetAsync(summed, 0, pairs * Ct * 4, STREAM));
   float* oh = scratch<float>("tmpl.onehot", (size_t)n * 31);
   float* row = scratch<float>("tmpl.row", (size_t)n * Ct); float* col = scratch<float>("tmpl.col", (size_t)n * Ct);
   int nb = 0; while (M.has(P + "blocks." + std::to_string(nb) + ".pairTransition.transition1")) ++nb;
-  for (int slot = 0; slot <= real && slot < templates; ++slot) {
-    bool empty = slot == real;                    // the last pass: one empty slot, for all of them
-    std::string S = "template." + std::to_string(slot) + ".";
+  for (int k = 0; k < passes; ++k) {
+    std::string S = "template." + std::to_string(k) + ".";
+    float repeat = (float)M.meta(S + "repeat");
+    if (repeat == 0.f) continue;                // a slot weighed zero (boltz2's empty ones)
     CK(cudaMemcpyAsync(act, query, pairs * Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
-    std::vector<float> onehot((size_t)n * 31, 0.f);
-    const int* aatype = empty ? nullptr : M.i(S + "aatype");
-    for (int i = 0; i < n; ++i) {
-      int code = empty ? 0 : aatype[i];
-      if (code >= 0 && code < 31) onehot[(size_t)i * 31 + code] = 1.f;
+    if (fused) {
+      linear<float, float>(Fdev(S + "features"), act, pairs, width, Ct, P + "aProjection", false, 1.f);
+    } else {
+      std::vector<float> onehot((size_t)n * 31, 0.f);
+      const int* aatype = M.i(S + "aatype");
+      for (int i = 0; i < n; ++i) if (aatype[i] >= 0 && aatype[i] < 31) onehot[(size_t)i * 31 + aatype[i]] = 1.f;
+      CK(cudaMemcpy(oh, onehot.data(), onehot.size() * 4, cudaMemcpyHostToDevice));
+      linear<float, float>(oh, row, n, 31, Ct, P + "templatePairEmbedding2");
+      linear<float, float>(oh, col, n, 31, Ct, P + "templatePairEmbedding3");
+      addRowColumnK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, row, col, n, Ct);
+      if (M.has(S + "distogram")) {
+        int bins = (int)(lenW(P + "templatePairEmbedding0") / Ct);
+        if (M.len(S + "distogram") != pairs * bins) { fprintf(stderr, "%sdistogram is not %zu x %d\n", S.c_str(), pairs, bins); exit(1); }
+        templateGeometryK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, Fdev(S + "distogram"), Fdev(S + "pseudoBetaMask2d"),
+          Fdev(S + "unitVector"), Fdev(S + "backboneMask2d"), W(P + "templatePairEmbedding0"), W(P + "templatePairEmbedding1"),
+          W(P + "templatePairEmbedding4"), W(P + "templatePairEmbedding5"), W(P + "templatePairEmbedding6"),
+          W(P + "templatePairEmbedding7"), pairs, Ct, bins);
+      }
     }
-    CK(cudaMemcpy(oh, onehot.data(), onehot.size() * 4, cudaMemcpyHostToDevice));
-    linear<float, float>(oh, row, n, 31, Ct, P + "templatePairEmbedding2");
-    linear<float, float>(oh, col, n, 31, Ct, P + "templatePairEmbedding3");
-    addRowColumnK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, row, col, n, Ct);
-    if (!empty) {
-      int bins = (int)(lenW(P + "templatePairEmbedding0") / Ct);
-      if (M.len(S + "distogram") != pairs * bins) { fprintf(stderr, "%sdistogram is not %zu x %d\n", S.c_str(), pairs, bins); exit(1); }
-      templateGeometryK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, Fdev(S + "distogram"), Fdev(S + "pseudoBetaMask2d"),
-        Fdev(S + "unitVector"), Fdev(S + "backboneMask2d"), W(P + "templatePairEmbedding0"), W(P + "templatePairEmbedding1"),
-        W(P + "templatePairEmbedding4"), W(P + "templatePairEmbedding5"), W(P + "templatePairEmbedding6"),
-        W(P + "templatePairEmbedding7"), pairs, Ct, bins);
-    }
-    for (int k = 0; k < nb; ++k) {
-      std::string B = P + "blocks." + std::to_string(k);
+    if (outer) CK(cudaMemcpyAsync(before, act, pairs * Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
+    for (int b = 0; b < nb; ++b) {
+      std::string B = P + "blocks." + std::to_string(b);
       int factor = (int)(lenW(B + ".pairTransition.transition1") / ((size_t)Ct * Ct * 2));
       pairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor);
     }
+    if (outer) addK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, before, pairs * Ct);
     layerNorm2<float, float>(act, normed, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");
-    for (int s = 0; s < (empty ? templates - real : 1); ++s)
-      addK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, normed, pairs * Ct);
+    addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, normed, repeat, pairs * Ct);
   }
   // divided by every slot (not the real ones), relu, projected
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);

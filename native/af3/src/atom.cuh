@@ -178,6 +178,7 @@ inline AtomShape atomShape() {
 // every denoiser step: the adaptive LayerNorms' scales and shifts and both zero-init gates.
 struct AtomBlockCache {
   float *qScale, *qShift, *kScale, *kShift, *zg, *ffwScale, *ffwShift, *tg, *pairLogits;
+  bool chained = false;     // the keys' adaptive LN reads the normalised queries (OpenDDE, protenix2)
 };
 // scale = LN_s(cond) W + b and shift = LN_s(cond) W' for one adaptive LayerNorm
 inline void adaCond(const float* cond, size_t rows, int C, int condC, const std::string& w, float* scale, float* shift) {
@@ -205,7 +206,7 @@ inline AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond,
   linear<float, float>(qCond, c.tg, qRows, C, C, B + ".ffwAdaptiveZeroCondWeights");
   addBiasRowsK<<<blocks(qRows * C), 256, 0, STREAM>>>(c.tg, W(B + ".ffwAdaptiveZeroCondBias"), qRows, C);
   c.pairLogits = pairLogits;
-  if (M.flag(B + ".chainedAtomLayerNorm")) { fprintf(stderr, "chained atom LayerNorm: not ported\n"); exit(1); }
+  c.chained = M.flag(B + ".chainedAtomLayerNorm");
   if (hasW(B + ".ffwAToB")) { fprintf(stderr, "ffwAToB: not ported\n"); exit(1); }
   return c;
 }
@@ -443,11 +444,19 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
   int Wd = heads * D;
   if (st.noResidual) { fprintf(stderr, "%s: the no-residual atom block is not ported\n", B.c_str()); exit(1); }
   T* xq = scratch<T>("ab.xq", qRows * C);
-  adaLn<T>(act, bc.qScale, bc.qShift, xq, qRows, C, q1);
   // keys and values projected once per atom, then gathered into the subsets' key windows (a
   // masked window slot is zero, as the LayerNorm of its zero row was)
   T* xk = scratch<T>("ab.xk", qRows * C);
-  adaLn<T>(act, bc.kScale, bc.kShift, xk, qRows, C, q1);
+  if (bc.chained) {         // xk = adaLN_k(adaLN_q(x)): the queries normalised in f32 first
+    float* xqF = scratch<float>("ab.xqF", qRows * C);
+    adaLn<float>(act, bc.qScale, bc.qShift, xqF, qRows, C, q1);
+    if constexpr (std::is_same_v<T, half>) toHalfK<<<blocks(qRows * C), 256, 0, STREAM>>>(xqF, xq, qRows * C);
+    else CK(cudaMemcpyAsync(xq, xqF, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    adaLn<T>(xqF, bc.kScale, bc.kShift, xk, qRows, C, q1);
+  } else {
+    adaLn<T>(act, bc.qScale, bc.qShift, xq, qRows, C, q1);
+    adaLn<T>(act, bc.kScale, bc.kShift, xk, qRows, C, q1);
+  }
   T* qg = scratch<T>("ab.qg", qRows * 2 * Wd); T* kvAtom = scratch<T>("ab.kvAtom", qRows * 2 * Wd);
   T* kv = scratch<T>("ab.kv", kRows * 2 * Wd);
   linear<T, T>(xq, qg, qRows, C, 2 * Wd, pairedWeight(B + ".qProjection", B + ".gatingQuery", C, Wd));
@@ -547,13 +556,26 @@ __global__ void aggregateK(const float* tokenAtoms, const float* atomMask, float
 // blocks * heads, then laid out per block.
 inline std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size_t pairRows, int Cp, int nblocks,
                                           int heads, const AtomShape& sh) {
-  if (M.flag(P + ".pairNormPerBlock")) { fprintf(stderr, "per-block atom pair norm: not ported\n"); exit(1); }
+  std::vector<float*> out;
+  size_t per = (size_t)sh.subsets * heads * sh.queries * sh.keys;
   float* pn = scratch<float>("apl.pn", pairRows * Cp);
+  if (M.flag(P + ".pairNormPerBlock")) {
+    // per block its own LayerNorm scale and its own projection to `heads` (OpenDDE, protenix2) -
+    // the mean and variance are the pair's either way; the difference is which weights a block reads
+    float* flat = scratch<float>("apl.flat", pairRows * heads);
+    for (int b = 0; b < nblocks; ++b) {
+      std::string k = std::to_string(b);
+      layerNormSlow(pair, pn, pairRows, Cp, W(P + ".pairInputLayerNormScales." + k), nullptr);
+      linear<float, float>(pn, flat, pairRows, Cp, heads, P + ".pairLogitsProjections." + k);
+      float* pl = scratch<float>(P + ".pl" + k, per);
+      atomLogitsLayoutK<<<blocks(per), 256, 0, STREAM>>>(flat, pl, 0, 1, sh.subsets, heads, sh.queries, sh.keys);
+      out.push_back(pl);
+    }
+    return out;
+  }
   layerNormSlow(pair, pn, pairRows, Cp, W(P + ".pairInputLayerNormScale"), nullptr);
   float* flat = scratch<float>("apl.flat", pairRows * nblocks * heads);
   linear<float, float>(pn, flat, pairRows, Cp, nblocks * heads, P + ".pairLogitsProjection");
-  std::vector<float*> out;
-  size_t per = (size_t)sh.subsets * heads * sh.queries * sh.keys;
   for (int b = 0; b < nblocks; ++b) {
     float* pl = scratch<float>(P + ".pl" + std::to_string(b), per);
     atomLogitsLayoutK<<<blocks(per), 256, 0, STREAM>>>(flat, pl, b, nblocks, sh.subsets, heads, sh.queries, sh.keys);

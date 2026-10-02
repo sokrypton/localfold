@@ -91,21 +91,40 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
   int Czt = (int)M.meta(P + ".trunkPairChannels"), Cst = (int)M.meta(P + ".trunkSingleChannels");
   int F = (int)M.meta(P + ".targetFeatWidth"), rel = (int)M.meta(P + ".relativeWidth");
   size_t pairs = (size_t)n * n;
-  if (hasW(P + ".zTrunkProjection") || hasW(P + ".relpeProjection")) {
-    fprintf(stderr, "split/projected relpos conditioning: not ported\n"); exit(1);
-  }
   if (!DCACHE.ready) {
-    int width = Czt + rel;
+    // [trunk pair | relative one-hot] under AF3; the relative encoding projected to the pair width
+    // first under some (relpeProjection); and the trunk pair LayerNormed and projected too, both
+    // halves Cz wide (zTrunkProjection - OpenDDE, protenix2): three ways into one LayerNorm
+    bool split = hasW(P + ".zTrunkProjection"), relpe = !split && hasW(P + ".relpeProjection");
+    int width = split ? 2 * Cz : relpe ? Czt + Cz : Czt + rel;
     // the pair features, normalised and projected in row chunks (whole, they were 9.3 GB at 2088)
-    size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / width));
+    size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / std::max(width, rel + Czt)));
     float* f2 = scratch<float>("dc.f2", per * width);
     float* f2n = scratch<float>("dc.f2n", per * width);
     DCACHE.pair = scratch<float>("dc.pair", pairs * Cz);
     for (size_t p0 = 0; p0 < pairs; p0 += per) {
       size_t r = std::min(per, pairs - p0);
-      pairFeaturesK<<<blocks(r * width), 256, 0, STREAM>>>(trunkPair, Idev("batch.features.residueIndex"),
-        Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), Idev("batch.features.entityId"),
-        Idev("batch.features.symId"), f2, n, Czt, 32, 2, p0, r);
+      auto features = [&](float* outRows, int trunkWidth) {
+        pairFeaturesK<<<blocks(r * (trunkWidth + rel)), 256, 0, STREAM>>>(trunkPair, Idev("batch.features.residueIndex"),
+          Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), Idev("batch.features.entityId"),
+          Idev("batch.features.symId"), outRows, n, trunkWidth, 32, 2, p0, r);
+      };
+      if (!split && !relpe) features(f2, Czt);
+      else {
+        float* relRows = scratch<float>("dc.rel", per * rel);
+        features(relRows, 0);                              // the one-hot alone
+        float* relProj = scratch<float>("dc.relProj", per * Cz);
+        linear<float, float>(relRows, relProj, r, rel, Cz, P + ".relpeProjection");
+        const float* first = trunkPair + p0 * Czt; int firstWidth = Czt;
+        if (split) {
+          float* tln = scratch<float>("dc.tln", per * Czt);
+          layerNormSlow(trunkPair + p0 * Czt, tln, r, Czt, W(P + ".zTrunkNormScale"), Wopt(P + ".zTrunkNormOffset"));
+          float* tproj = scratch<float>("dc.tproj", per * Cz);
+          linear<float, float>(tln, tproj, r, Czt, Cz, P + ".zTrunkProjection");
+          first = tproj; firstWidth = Cz;
+        }
+        concatK<<<blocks(r * width), 256, 0, STREAM>>>(first, firstWidth, relProj, Cz, f2, (int)r);
+      }
       layerNormSlow(f2, f2n, r, width, W(P + ".pairCondInitialNormScale"), Wopt(P + ".pairCondInitialNormOffset"));
       linear<float, float>(f2n, DCACHE.pair + p0 * Cz, r, width, Cz, P + ".pairCondInitialProjection");
     }
@@ -458,7 +477,10 @@ inline void prepareTransformer(const float* pairCond, int n) {
   const std::string T = "diffusion.transformer";
   int C = (int)M.meta(T + ".channels"), Cc = (int)M.meta(T + ".condChannels"), Cz = (int)M.meta(T + ".pairChannels");
   int heads = (int)M.meta(T + ".heads"), perSuper = (int)M.meta(T + ".blocksPerSuperBlock");
-  if (M.flag(T + ".pairNormPerBlock") || M.flag(T + ".noResidual")) { fprintf(stderr, "transformer dialect: not ported\n"); exit(1); }
+  // a per-block pair LayerNorm (OpenDDE, protenix2) arrives folded into AF3's layout - its scales
+  // inside the per-block projections, the shared scale all ones - so it needs nothing here
+  if (M.flag(T + ".noResidual")) { fprintf(stderr, "transformer without its residual (rf3): not ported\n"); exit(1); }
+  if (hasW(T + ".superBlocks.0.blocks.0.queryLayerNormScale")) { fprintf(stderr, "transformer q/k LayerNorm (rf3): not ported\n"); exit(1); }
   TransformerCache& tc = TCACHE;
   size_t pairs = (size_t)n * n;
   std::vector<std::string> names;

@@ -5,9 +5,10 @@
 #include "atom.cuh"
 
 // pair[i][j] += left[j] + right[i] + W_dgram[bin(|b_i - b_j|^2)] * mask
+// (Wdist: protenix2's second, unbinned distance term - a bias-free projection of the raw distance)
 __global__ void confidencePairInitK(float* pair, const float* left, const float* right, const float* beta,
                                     const float* pairMask, const float* Wd, int n, int C, int bins,
-                                    float dmin, float dmax) {
+                                    float dmin, float dmax, const float* Wdist) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * n * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
@@ -19,6 +20,7 @@ __global__ void confidencePairInitK(float* pair, const float* left, const float*
     double lower = lo * lo, upper = b + 1 < bins ? hi * hi : 1e8;
     if (sq > lower && sq < upper) { v += Wd[(size_t)b * C + c] * pairMask[ij]; break; }
   }
+  if (Wdist) v += sqrtf(sq + 1e-10f) * Wdist[c];
   pair[t] += v;
 }
 // expectation over bins of softmax(logits) . centres, optionally symmetrised (logits[ij] + logits[ji])
@@ -39,6 +41,9 @@ __global__ void expectationK(const float* logits, float* out, const float* mask,
 }
 
 inline bool CONF_HALF = false;   // the head's four pairformer blocks in f16
+__global__ void clampK(float* x, float limit, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = fminf(limit, fmaxf(-limit, x[i]));
+}
 struct ConfidenceOut { std::vector<float> plddt, pae, pde; double meanPlddt, ptm, iptm; };
 
 inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
@@ -47,10 +52,10 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   int C = (int)M.meta(P + ".pairChannels"), Cs = (int)M.meta(P + ".singleChannels"), F = (int)M.meta(P + ".targetFeatWidth");
   int dense = (int)M.meta("batch.dense");
   for (const char* f : {"trunk.dialect.confidenceGlobalNorm", "trunk.dialect.reembedConfidencePair",
-                        "trunk.dialect.confidenceCaDgram", "trunk.dialect.preSymmetrisedPde"})
+                        "trunk.dialect.confidenceCaDgram"})
     if (M.flag(f)) { fprintf(stderr, "%s: not ported\n", f); exit(1); }
-  if (hasW(P + ".distanceFeatProject") || hasW(P + ".inputSingleNormScale") || hasW(P + ".interHalfDistanceLogits")) {
-    fprintf(stderr, "confidence head variant: not ported\n"); exit(1);
+  if (hasW(P + ".interHalfDistanceLogits") || !hasW(P + ".logitsLnScale")) {
+    fprintf(stderr, "confidence head variant (split heads / no head LayerNorm): not ported\n"); exit(1);
   }
   size_t pairs = (size_t)n * n;
   float* pair = scratch<float>("conf.pair", pairs * C);
@@ -62,7 +67,14 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   linear<float, float>(targetFeat, right, n, F, C, P + ".rightTargetFeatProject");
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
   confidencePairInitK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, pseudoBeta, pairMask,
-    W(P + ".distogramFeatProject"), n, C, bins, 3.25f, 50.75f);
+    W(P + ".distogramFeatProject"), n, C, bins, 3.25f, 50.75f, Wopt(P + ".distanceFeatProject"));
+  if (hasW(P + ".inputSingleNormScale")) {
+    // the trunk single clamped to +-512 and LayerNormed before any use (protenix2)
+    clampK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, 512.f, (size_t)n * Cs);
+    float* sn = scratch<float>("conf.singleNorm", (size_t)n * Cs);
+    layerNorm2<float, float>(single, sn, n, Cs, P + ".inputSingleNormScale", P + ".inputSingleNormOffset");
+    CK(cudaMemcpyAsync(single, sn, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+  }
   int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
   bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
   for (int k = 0; k < nb; ++k)
@@ -78,9 +90,17 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   float* logits = scratch<float>("conf.logits", pairs * NB);
   ConfidenceOut out;
   float* pde = scratch<float>("conf.pde", pairs); float* pae = scratch<float>("conf.pae", pairs);
-  layerNorm2<float, float>(pair, ln, pairs, C, P + ".logitsLnScale", P + ".logitsLnOffset");
+  bool preSym = M.flag("trunk.dialect.preSymmetrisedPde");
+  if (preSym) {
+    // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2); AF3 adds the transpose after
+    float* sym = scratch<float>("conf.sym", pairs * C);
+    symmetriseK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, sym, n, C);
+    layerNorm2<float, float>(sym, ln, pairs, C, P + ".logitsLnScale", P + ".logitsLnOffset");
+  } else {
+    layerNorm2<float, float>(pair, ln, pairs, C, P + ".logitsLnScale", P + ".logitsLnOffset");
+  }
   linear<float, float>(ln, logits, pairs, C, NB, P + ".leftHalfDistanceLogits");
-  expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pde, pairMask, pairs, NB, dCentres, n, 1.f);
+  expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pde, pairMask, pairs, NB, dCentres, preSym ? 0 : n, 1.f);
   layerNorm2<float, float>(pair, ln, pairs, C, P + ".paeLogitsLnScale", P + ".paeLogitsLnOffset");
   linear<float, float>(ln, logits, pairs, C, NB, P + ".paeLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pae, pairMask, pairs, NB, dCentres, 0, 1.f);
