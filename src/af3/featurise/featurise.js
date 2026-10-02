@@ -849,11 +849,22 @@ export function featuriseProtein(sequence, options = {}) {
           bondOrderMatrix[a * tokens + b] = 1;
           bondOrderMatrix[b * tokens + a] = 1;
         };
-        // The neighbouring residue's token is the one adjacent to the span,
-        // which holds while the neighbour is not itself atomised - the case
-        // this port has a reference dump for.
-        if (nitrogen >= 0 && sameChain(span.residue - 1)) link(span.from - 1, span.from + nitrogen);
-        if (carbon >= 0 && sameChain(span.residue + 1)) link(span.from + carbon, span.from + span.count);
+        // The neighbouring residue's token is the one adjacent to the span - while that neighbour is
+        // one token. 🔴 AN ATOMISED NEIGHBOUR IS MANY: the token before this span is then the previous
+        // residue's LAST ATOM (a 5' 6OG's OP3), and the link from it was a bond the reference does not
+        // have. Its own forward link is the bond (O3' to this residue's P), so the backward one is
+        // skipped, and a forward link into an atomised residue lands on its own P (or N). AF3's
+        // kitchen-sink DNA, 6OG at 1 and 6MA at 2, against rf3's batch: 67-70 both ways, not 69-70.
+        const spanOf = (residue) => modifiedSpans.find((other) => other.residue === residue);
+        if (nitrogen >= 0 && sameChain(span.residue - 1) && spanOf(span.residue - 1) === undefined) {
+          link(span.from - 1, span.from + nitrogen);
+        }
+        if (carbon >= 0 && sameChain(span.residue + 1)) {
+          const next = spanOf(span.residue + 1);
+          const into = next === undefined ? 0
+            : next.atoms.findIndex((atom) => atom.name === (nucleic ? "P" : "N"));
+          if (into >= 0) link(span.from + carbon, span.from + span.count + into);
+        }
       }
     }
     bondMatrix[0] = 0;
@@ -951,6 +962,13 @@ export function featuriseProtein(sequence, options = {}) {
   // columns and rows 2 and 3 read 21. Gapping every row but the query is the
   // natural reading and is one row short, which is a row the model reads as the
   // chain being absent from its own alignment.
+  // ...and rosettafold3's atomised token is unknown in EVERY row, a gap's included: its reference
+  // profile is 1.0 at restype 20 for a hydroxyproline and for a P1L whose alignment row is a gap
+  // (AF3's kitchen-sink job, against rf3's batch) - where reading the A3M gave P, or half gap
+  const unknownEverywhere = new Uint8Array(tokens);
+  if (options.atomizedUnknownMsa === true) {
+    for (const span of modifiedSpans) unknownEverywhere.fill(1, span.from, span.from + span.count);
+  }
   const nucleicRow = unpairedFromRow();
   for (let row = 0; row < extra.length; row += 1) {
     const base = (row + 1) * tokens;
@@ -963,7 +981,8 @@ export function featuriseProtein(sequence, options = {}) {
         msa[base + token] = nucleicHere === "own" ? aatype[token] : MSA_GAP;
         continue;
       }
-      msa[base + token] = column < 0 ? MSA_GAP : (extra[row][column] ?? MSA_GAP);
+      msa[base + token] = unknownEverywhere[token] ? queryRow[token]
+        : column < 0 ? MSA_GAP : (extra[row][column] ?? MSA_GAP);
       if (deletions !== undefined) {
         deletionMatrix[base + token] = column < 0 ? 0 : (deletions[column] ?? 0);
       }
@@ -1009,7 +1028,8 @@ export function featuriseProtein(sequence, options = {}) {
       // profile puts a ligand token's whole weight on the gap - measured on its kitchen-sink job,
       // 1.0 at restype 21 for every ligand token - where returning nothing left it all zeros
       if (column < 0) return MSA_GAP;
-      return profileRows[row] === undefined ? -1 : profileRows[row][column];
+      if (profileRows[row] === undefined) return -1;
+      return unknownEverywhere[token] ? queryRow[token] : profileRows[row][column];
     };
   const deletionAt = profileRows === null
     ? (row, token) => deletionMatrix[(unpairedFrom + row) * tokens + token]
@@ -1029,7 +1049,8 @@ export function featuriseProtein(sequence, options = {}) {
   // is averaged over 3. A chain's depth is its last row with a residue in any of its columns.
   const depthOfChain = new Map();
   for (let token = 0; token < polymerTokens; token += 1) {
-    if (ownProfile(token) || msaColumnOfToken[token] < 0) continue;
+    // (an rf3 atomised token reads unknown in every row, which says nothing about the chain's depth)
+    if (ownProfile(token) || msaColumnOfToken[token] < 0 || unknownEverywhere[token]) continue;
     const chain = chainOfResidue[residueOfToken[token]];
     let deepest = depthOfChain.get(chain) ?? 1;
     for (let row = profileDepth - 1; row >= deepest; row -= 1) {
