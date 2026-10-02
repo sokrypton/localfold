@@ -5,3 +5,7 @@ data*/
 *.o
 /af3
 weights/
+/af3prof
+/af3t
+*.pdb
+*_confidences.json
