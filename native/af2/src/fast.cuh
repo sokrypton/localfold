@@ -76,7 +76,31 @@ inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t ro
   LtPlan& p = it->second;
   if (bias) CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
   const float one = 1.f;
+  // AF2_GEMM_TIMES: every call timed by events, summed by shape and printed at exit (an analysis aid:
+  // the events serialise nothing but cost a little)
+  struct Timed { std::tuple<size_t, int, int, bool, int> key; cudaEvent_t a, b; };
+  static std::vector<Timed>* timed = nullptr;
+  static bool timing = getenv("AF2_GEMM_TIMES") != nullptr;
+  cudaEvent_t ea = nullptr, eb = nullptr;
+  if (timing) {
+    if (!timed) {
+      timed = new std::vector<Timed>;
+      atexit([] {
+        std::map<std::tuple<size_t, int, int, bool, int>, std::pair<double, int>> sum;
+        for (auto& t : *timed) { float ms; cudaEventElapsedTime(&ms, t.a, t.b); auto& s = sum[t.key]; s.first += ms; s.second++; }
+        std::vector<std::pair<double, std::tuple<size_t, int, int, bool, int>>> order;
+        for (auto& [k, v] : sum) order.push_back({v.first, k});
+        std::sort(order.rbegin(), order.rend());
+        for (auto& [ms, k] : order) {
+          auto [r, i, o, h, e] = k; double tf = 2.0 * r * i * o * sum[k].second / (ms * 1e-3) / 1e12;
+          fprintf(stderr, "  %8.2f ms %5d x  %7zu x %5d x %5d  f16out %d epi %d  %6.1f TFLOP/s\n", ms, sum[k].second, r, i, o, h, e, tf);
+        }
+      });
+    }
+    cudaEventCreate(&ea); cudaEventCreate(&eb); cudaEventRecord(ea, STREAM);
+  }
   CB(cublasLtMatmul(LT, p.op, &one, Wt, p.a, X, p.b, &beta, Y, p.c, Y, p.c, &p.algo, nullptr, 0, STREAM));
+  if (timing) { cudaEventRecord(eb, STREAM); timed->push_back({std::make_tuple(rows, in, out, yHalf, epi), ea, eb}); }
 }
 // a weight slice's f16 copy: haiku name, stacked block (or -1)
 inline const half* PH(const std::string& name, int block = -1) {
@@ -237,7 +261,10 @@ inline TriW triWeights(const std::string& T, int blk, int C) {
 }
 // pg [pairs, 5C] (projection | gate | output gate) -> a, b [C][pairs] f16 = proj * mask * sigmoid(gate),
 // a the projection's first C columns; 32 rows x 32 channels a block through shared memory
-__global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, size_t pairs, int C) {
+// a and b channel-major, each plane [Lp][Lp] (Lp a multiple of 8, the pad zero): the batched
+// contraction then runs on aligned tensor-core tiles - at L odd it fell to cutlass's align1 kernels
+// (sm75's), 82 of a 5CAJ fold's 1700 ms
+__global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, size_t pairs, int C, int L, int Lp) {
   __shared__ float A[32][33], B[32][33];
   size_t r0 = (size_t)blockIdx.x * 32; int c0 = blockIdx.y * 32;
   int tx = threadIdx.x, ty = threadIdx.y;
@@ -254,17 +281,21 @@ __global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, s
   __syncthreads();
   for (int cy = ty; cy < 32; cy += 8) {
     size_t r = r0 + tx; int c = c0 + cy;
-    if (r < pairs) { a[(size_t)c * pairs + r] = __float2half(A[tx][cy]); b[(size_t)c * pairs + r] = __float2half(B[tx][cy]); }
+    if (r < pairs) {
+      size_t at = (size_t)c * Lp * Lp + (r / L) * Lp + r % L;
+      a[at] = __float2half(A[tx][cy]); b[at] = __float2half(B[tx][cy]);
+    }
   }
 }
 // prod [C][pairs] f32 -> LN over C -> [pairs, C] f16; 32 rows a block, staged through shared memory
-__global__ void centerNormTK(const float* prod, half* out, size_t pairs, int C, const float* scale, const float* offset) {
+__global__ void centerNormTK(const float* prod, half* out, size_t pairs, int C, const float* scale, const float* offset,
+                             int L, int Lp) {      // prod [C][Lp][Lp]
   extern __shared__ float tile[];               // [C][33]
   size_t r0 = (size_t)blockIdx.x * 32;
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
   for (int c = warp; c < C; c += nw) {
     size_t r = r0 + lane;
-    tile[c * 33 + lane] = r < pairs ? prod[(size_t)c * pairs + r] : 0.f;
+    tile[c * 33 + lane] = r < pairs ? prod[(size_t)c * Lp * Lp + (r / L) * Lp + r % L] : 0.f;
   }
   __syncthreads();
   for (int row = warp; row < 32; row += nw) {

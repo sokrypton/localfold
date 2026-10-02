@@ -417,19 +417,27 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     layerNormH(pair, xn, pairs, C, T + "/left_norm_input", blk);
     half* pg = scratch<half>("ftri.pg", pairs * 5 * C);
     ltGemm(xn, w.w5, pg, true, pairs, C, 5 * C, w.b5, false, 0.f);
-    half* a = scratch<half>("ftri.a", pairs * C); half* b = scratch<half>("ftri.b", pairs * C);
-    triGateTK<<<dim3((unsigned)((pairs + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, pairMask, a, b, pairs, C);
-    float* prod = scratch<float>("ftri.prod", pairs * C);
+    // planes [Lp][Lp], the pad rows and columns zero (written once: nothing else writes them)
+    int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+    half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
+    static half* zeroed = nullptr; static size_t zeroedBytes = 0;
+    if (Lp != L && (a != zeroed || plane * C * 2 > zeroedBytes)) {
+      CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
+      zeroed = a; zeroedBytes = plane * C * 2;
+    }
+    triGateTK<<<dim3((unsigned)((pairs + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, pairMask, a, b, pairs, C, L, Lp);
+    float* prod = scratch<float>("ftri.prod", plane * C);
     const float one = 1.f, zero = 0.f;
+    // every extent Lp: the pad's zeros add nothing to a sum, and the pad's outputs are never read
     if (outgoing)
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, L, L, L, &one, b, CUDA_R_16F, L, pairs, a, CUDA_R_16F, L,
-                                    pairs, &zero, prod, CUDA_R_32F, L, pairs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16F, Lp, plane, a, CUDA_R_16F, Lp,
+                                    plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     else
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, L, &one, a, CUDA_R_16F, L, pairs, b, CUDA_R_16F, L,
-                                    pairs, &zero, prod, CUDA_R_32F, L, pairs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16F, Lp, plane, b, CUDA_R_16F, Lp,
+                                    plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     half* cn = scratch<half>("ftri.cn", pairs * C);
     centerNormTK<<<(unsigned)((pairs + 31) / 32), 256, (size_t)C * 33 * 4, STREAM>>>(prod, cn, pairs, C,
-      P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk));
+      P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk), L, Lp);
     float* out = scratch<float>("ftri.out", pairs * C);
     ltGemm(cn, w.out, out, false, pairs, C, C, P(T + "/output_projection/bias", blk), false, 0.f);
     gateMulAddHK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, out, pg, pairs, C);

@@ -30,7 +30,10 @@ SEQ_6MRR = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE
 # RMSD may move 0.05 A or 1% of itself, whichever is more: the no-template arms are unfolded answers
 # (17-22 A), whose RMSD swings a twentieth of an angstrom with an f16 path's rounding; pLDDT 0.5 points
 TOL_RMSD, TOL_RMSD_REL, TOL_PLDDT = 0.05, 0.01, 0.5
-ORACLE_BOUND = {"f32": 1e-4, "fast": 1e-2}
+# atoms, and the Evoformer's pair (the seam a kernel change reaches first): on an unconverged fold
+# (1BRS from its sequences, pLDDT 36) the structure module turns a 3e-4 change in its input into
+# 4e-3 in its atoms, so atoms alone cannot tell a reordered sum from a defect there
+ORACLE_BOUND = {"f32": (1e-4, 1e-4), "fast": (2e-2, 5e-3)}   # (f32 pair: the template torsions are 1.2e-5)
 MULTIMER = "model_1_multimer_v3"
 
 
@@ -106,9 +109,10 @@ def run_oracle(data, passes, weights, fast):
     p = subprocess.run(cmd, capture_output=True, text=True)
     text = p.stdout + p.stderr
     worst = [float(v) for v in re.findall(r"atom37 positions\s+relRMS ([\d.e+-]+)", text)]
-    if p.returncode or not worst:
+    pair = [float(v) for v in re.findall(r"evoformer pair\s+relRMS ([\d.e+-]+)", text)]
+    if p.returncode or not worst or not pair:
         return None, text.strip().splitlines()[-1] if text.strip() else f"exit {p.returncode}"
-    return max(worst), None
+    return (max(worst), max(pair)), None
 
 
 def main():
@@ -141,10 +145,11 @@ def main():
                 worst, error = run_oracle(data, passes, weights, fast)
                 if error:
                     print(f"{name + ' ' + arm:24s} FAILED: {error}"); failed += 1; continue
-                ok = worst <= ORACLE_BOUND[arm]
+                (atoms, pair), (atomBound, pairBound) = worst, ORACLE_BOUND[arm]
+                ok = atoms <= atomBound and pair <= pairBound
                 failed += not ok
-                print(f"{name + ' ' + arm:24s} atoms relRMS {worst:.2e} (bound {ORACLE_BOUND[arm]:.0e}, {passes} pass"
-                      f"{'es' if passes > 1 else ''})  {'ok' if ok else 'FAILED'}", flush=True)
+                print(f"{name + ' ' + arm:24s} atoms {atoms:.2e} (bound {atomBound:.0e})  pair {pair:.2e} (bound "
+                      f"{pairBound:.0e})  {passes} pass{'es' if passes > 1 else ''}  {'ok' if ok else 'FAILED'}", flush=True)
     if write:
         json.dump(base, open(BASELINE, "w"), indent=1, sort_keys=True)
         print(f"wrote {BASELINE}")

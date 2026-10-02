@@ -105,7 +105,10 @@ Six folds, scored against the deposited structure with native/af3/score.py:
 | 5CAJ with its 7907-row alignment | 1.827 A | 96.07 |
 
 Both arms of each template case are run, because a template proves itself only by moving the
-fold. The gate also checks every local `data-*/` that has an `oracle/`, in both precisions. Those
+fold. The gate also checks every local `data-*/` that has an `oracle/`, in both precisions, on the atoms
+and on the Evoformer's pair: an unconverged fold's structure module amplifies (1BRS from its
+sequences turns 3e-4 at its input into 9e-3 on its atoms), so the pair is the seam that separates
+a reordered sum from a defect. Those
 directories are gitignored and built by hand:
 
 ```
