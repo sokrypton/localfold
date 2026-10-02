@@ -85,18 +85,17 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's
   // mean over the pairs it selects (ipTM: other chains only). src/heads/tm-score.js.
   {
-    std::vector<float> pl = download(logits, pairs * NB), seq = download(seqMask, n);
+    std::vector<float> seq = download(seqMask, n);
     const int* asym = M.i("batch.asymId");
     int real = 0; for (float v : seq) real += v > 0;
     double d0 = 1.24 * std::cbrt(std::max(real, 19) - 15.0) - 1.8;
-    std::vector<double> perBin(NB), term(pairs);
-    for (int b = 0; b < NB; ++b) perBin[b] = 1 / (1 + (double)centres[b] * centres[b] / (d0 * d0));
-    for (size_t p2 = 0; p2 < pairs; ++p2) {
-      double mx = -1e30, tot = 0, acc = 0;
-      for (int b = 0; b < NB; ++b) mx = std::max(mx, (double)pl[p2 * NB + b]);
-      for (int b = 0; b < NB; ++b) { double e = std::exp(pl[p2 * NB + b] - mx); tot += e; acc += e * perBin[b]; }
-      term[p2] = acc / tot;
-    }
+    std::vector<float> perBin(NB);
+    for (int b = 0; b < NB; ++b) perBin[b] = (float)(1 / (1 + (double)centres[b] * centres[b] / (d0 * d0)));
+    float* dPerBin = upload(perBin.data(), NB);
+    float* dTerm = scratch<float>("conf.tmTerm", pairs);
+    expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, dTerm, nullptr, pairs, NB, dPerBin, 0, 1.f);
+    std::vector<float> term = download(dTerm, pairs);
+    CK(cudaFree(dPerBin));
     auto reduce = [&](bool interOnly) {
       double best = -1e30; bool any = false;
       for (int i = 0; i < n; ++i) {
