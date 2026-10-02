@@ -329,6 +329,11 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
 - **The next block's weights prefetched into L2** while the current block runs: the 68-row GEMMs
   are not bandwidth-bound at all - the same GEMM with its weights hot in L2 is 8.9 against 9.4 us
   cold, and 8.1 us for N = 768 either way.
+- **The grid attention skipping its padding**: at 261 tokens a row's last 64-query block holds 5
+  real queries and its last 64-key tile 5 real keys. Warps whose queries are all past the end
+  computing nothing (they still load and wait): 0.190 against 0.191 ms at 261, 6.97 against 6.89
+  at 1044. Adding the key tail (groups of keys wholly past the end skipping their products, inside
+  the unrolled loops): 0.206 and 8.2 ms - the branches cost the kernel more than the work saved.
 - **The denoiser's token attention at mid sizes, three ways** (261 tokens: 80 blocks of 64
   queries, 11.4 us for 0.21 GFLOP; the kernel costs ~3.6 us plus ~1.6 us a 64-key tile): the keys
   split over blocks with a merge kernel (flash-decoding) - 15.7 / 21.9 / 27.6 us against 11.4 /
