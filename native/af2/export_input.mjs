@@ -95,6 +95,7 @@ if (templateSpecs.length > 0) {
   int("t/aatype", aat); flt("t/positions", pos); flt("t/mask", msk);
   entries.push(["m", "meta/templates", templateSpecs.length]);
 }
+entries.push(["m", "meta/model", weightsDir.replace(/\/+$/, "").split("/").pop().replace(/^weights-/, "")]);
 entries.push(["m", "meta/tokens", L]);
 entries.push(["m", "meta/msa_rows", first.msaSequences]);
 entries.push(["m", "meta/extra_rows", first.extraSequences]);

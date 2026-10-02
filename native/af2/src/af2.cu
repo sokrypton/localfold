@@ -84,8 +84,10 @@ int main(int argc, char** argv) {
   int templates = (int)M.meta("meta/templates", 0);
   bool multimer = M.flag("meta/multimer");
   bool monomerTemplates = !multimer && templates > 0 && M.has("w/evoformer/template_embedding/attention/query_w");
-  if (!multimer && templates > 0 && !monomerTemplates)
-    printf("(this checkpoint has no template embedder - models 3 to 5 are template-free; the template is not used)\n");
+  if (!multimer && templates > 0 && !monomerTemplates) {
+    fprintf(stderr, "this checkpoint has no template embedder (models 3 to 5 are template-free): fold without --template\n");
+    return 1;
+  }
   if (multimer || monomerTemplates) t.T = templates;   // a template's single features become MSA rows
   int passes = (int)M.meta("meta/passes");
   if (recycles >= 0) passes = std::min(passes, recycles + 1);
@@ -228,12 +230,13 @@ int main(int argc, char** argv) {
   std::vector<int> aatype(L), ri(L);
   CK(cudaMemcpy(aatype.data(), Idev("aatype"), L * 4, cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(ri.data(), Idev("residue_index"), L * 4, cudaMemcpyDeviceToHost));
+  int firstAsym = *std::min_element(asym.begin(), asym.end());
   const float* mask37 = M.f("c/atom37_mask");
   FILE* f = fopen(out.c_str(), "w");
   int serial = 1;
   for (int i = 0; i < L; ++i) {
     int aa = std::min(std::max(aatype[i], 0), 19);
-    char chain = (char)('A' + std::min(asym[i] > 0 ? asym[i] - 1 : 0, 25));
+    char chain = (char)('A' + std::min(asym[i] - firstAsym, 25));     // asym ids count from the first chain's
     for (int a = 0; a < 37; ++a) {
       if (mask37[aa * 37 + a] == 0) continue;
       const float* p = &pos[((size_t)i * 37 + a) * 3];

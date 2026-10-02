@@ -1,0 +1,32 @@
+{
+ "1brs-multimer": {
+  "plddt": 37.0,
+  "ptm": "0.1790",
+  "rmsd": 17.456
+ },
+ "1brs-multimer-template": {
+  "plddt": 94.94,
+  "ptm": "0.8926",
+  "rmsd": 0.287
+ },
+ "5caj-msa": {
+  "plddt": 96.07,
+  "ptm": "0.9149",
+  "rmsd": 1.827
+ },
+ "5caj-seq": {
+  "plddt": 31.93,
+  "ptm": "0.2146",
+  "rmsd": 21.736
+ },
+ "5caj-template": {
+  "plddt": 97.39,
+  "ptm": "0.9266",
+  "rmsd": 0.205
+ },
+ "6mrr": {
+  "plddt": 85.17,
+  "ptm": "0.6075",
+  "rmsd": 1.882
+ }
+}
