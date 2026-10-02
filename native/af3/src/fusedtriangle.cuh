@@ -246,6 +246,110 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
   }
 }
 
+// triOutK as a PERSISTENT kernel: each block keeps the output projection in shared memory for
+// every tile it takes and prefetches its next product tile while it computes the current one
+// (the one-shot kernel loaded 32 KB of weights and its tile, then computed, at two blocks an SM)
+template <int C, int WARPS, class TP>
+__global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
+    const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
+    float* __restrict__ pair, int n, int np, size_t cs) {
+  const size_t pp = (size_t)np * np;
+  constexpr int PV = 16 / sizeof(TP);
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + PV, LDX = C + 8, LDW = C + 8, KS = C / 16, NT = C / 8;
+  extern __shared__ __align__(16) unsigned char smem[];
+  half* Ws = (half*)smem;                                           // [C][LDW]
+  half* Xs = Ws + C * LDW;                                          // [R][LDX]
+  TP* Pst = (TP*)(Xs + R * LDX);                                    // two stages of [C][LDP]
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  const size_t tiles = (pp + R - 1) / R;
+#pragma unroll
+  for (int t0_ = 0; t0_ < C * (C / 8); t0_ += NTH) {
+    int t = t0_ + (int)threadIdx.x, k = t / (C / 8), c = (t % (C / 8)) * 8;
+    cpAsync16(Ws + k * LDW + c, Wout + (size_t)k * C + c, true);
+  }
+  auto issue = [&](size_t tile, int st) {
+    TP* Ps = Pst + st * C * LDP;
+    size_t row0 = tile * R;
+#pragma unroll
+    for (int t0_ = 0; t0_ < C * (R / PV); t0_ += NTH) {
+      int t = t0_ + (int)threadIdx.x, c = t / (R / PV), r = (t % (R / PV)) * PV;
+      size_t row = row0 + r;
+      cpAsync16(Ps + c * LDP + r, prod + (size_t)c * cs + (row < cs ? row : 0), row < cs);
+    }
+    asm volatile("cp.async.commit_group;");
+  };
+  size_t tile = blockIdx.x;
+  if (tile < tiles) issue(tile, 0); else asm volatile("cp.async.commit_group;");
+  for (int it = 0; tile < tiles; ++it, tile += gridDim.x) {
+    int st = it & 1;
+    size_t next = tile + gridDim.x;
+    if (next < tiles) { issue(next, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
+    else asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+    const TP* Ps = Pst + st * C * LDP;
+    // the center norm, a THREAD a row: the tile is channel-major, so a warp reading one row across
+    // its channels hit four-way bank conflicts; a thread per row reads 32 consecutive rows a warp,
+    // and writes its row in 16-byte pieces (rows 272 bytes apart cover all 32 banks)
+    for (int r = threadIdx.x; r < R; r += NTH) {
+      float s = 0.f;
+#pragma unroll 8
+      for (int c = 0; c < C; ++c) s += (float)Ps[c * LDP + r];
+      float mean = s / C, q = 0.f;
+#pragma unroll 8
+      for (int c = 0; c < C; ++c) { float d = (float)Ps[c * LDP + r] - mean; q += d * d; }
+      float inv = rsqrtf(q / C + 1e-5f);
+#pragma unroll
+      for (int c0 = 0; c0 < C; c0 += 8) {
+        uint32_t w[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          int c = c0 + 2 * e;
+          w[e] = pack2(((float)Ps[c * LDP + r] - mean) * inv * cnScale[c] + cnOffset[c],
+                       ((float)Ps[(c + 1) * LDP + r] - mean) * inv * cnScale[c + 1] + cnOffset[c + 1]);
+        }
+        *reinterpret_cast<uint4*>(Xs + r * LDX + c0) = make_uint4(w[0], w[1], w[2], w[3]);
+      }
+    }
+    __syncthreads();
+    uint32_t xa[KS][4];
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+    float acc[NT][4] = {};
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {
+#pragma unroll
+      for (int et = 0; et < NT; et += 2) {
+        uint32_t f[4];
+        ldsm4t(f, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + (et + (lane >> 4)) * 8);
+        mma16816(acc[et], xa[ks], f[0], f[1]);
+        mma16816(acc[et + 1], xa[ks], f[2], f[3]);
+      }
+    }
+    size_t r0 = tile * R + warp * 16 + g, r1 = r0 + 8;
+    auto pairOf = [&](size_t q) -> size_t {
+      if (q >= pp) return SIZE_MAX;
+      unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
+      return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
+    };
+    size_t p0 = pairOf(r0), p1 = pairOf(r1);
+#pragma unroll
+    for (int et = 0; et < NT; ++et) {
+      int c = et * 8 + tig * 2;
+      if (p0 != SIZE_MAX) {
+        float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r0 * C + c));
+        float2* p = (float2*)(pair + p0 * C + c); float2 v = *p;
+        v.x += acc[et][0] * sigm(gt.x); v.y += acc[et][1] * sigm(gt.y); *p = v;
+      }
+      if (p1 != SIZE_MAX) {
+        float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r1 * C + c));
+        float2* p = (float2*)(pair + p1 * C + c); float2 v = *p;
+        v.x += acc[et][2] * sigm(gt.x); v.y += acc[et][3] * sigm(gt.y); *p = v;
+      }
+    }
+    __syncthreads();                                                 // Xs and this stage are reused
+  }
+}
+
 inline bool FUSED_TRIANGLE = true;
 constexpr int TI_WARPS = 16, TO_WARPS = 8;
 template <class TA>
@@ -260,10 +364,26 @@ void triIn128(const float* pair, const float* mask, const std::string& pre, cons
     pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
     a, b, t2, n, np, cs);
 }
+inline bool TRI_OUT_PERSISTENT = true;
 template <class TP>
 void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * TO_WARPS;
   size_t pp = (size_t)np * np;
+  if (TRI_OUT_PERSISTENT) {
+    size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)2 * C * (R + 16 / sizeof(TP)) * sizeof(TP);
+    static int grid = 0;
+    if (!grid) {
+      CK(cudaFuncSetAttribute(triOutPK<C, TO_WARPS, TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+      int perSm = 0, sms = 0;
+      CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, triOutPK<C, TO_WARPS, TP>, 32 * TO_WARPS, smem));
+      CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+      grid = std::max(1, perSm) * sms;
+    }
+    size_t tiles = (pp + R - 1) / R;
+    triOutPK<C, TO_WARPS, TP><<<(unsigned)std::min<size_t>(grid, tiles), 32 * TO_WARPS, smem, STREAM>>>(
+      prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np, cs);
+    return;
+  }
   size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 16 / sizeof(TP)) * sizeof(TP);
   static bool attr = false;
   if (!attr) { CK(cudaFuncSetAttribute(triOutK<C, TO_WARPS, TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
