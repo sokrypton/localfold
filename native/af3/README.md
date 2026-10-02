@@ -290,6 +290,13 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
   the consumers' extra reads; the same, pipelined - no faster; no split, every block streaming its
   columns' weights over the whole K - 15 against 9 us, each block re-reading all of X from L2.
   cuBLAS's own tiling and split-K searches (781 configurations) found nothing faster either.
+- **A fourth skinny GEMM: split over K across the WARPS of one block**, each warp double-buffering
+  its own K slice, the partials summed in shared memory (no second kernel, no cross-block
+  reduction): slower than cuBLAS at every tiling swept - 11-25 us against 7.9 for 68 x 768 x 3072,
+  7.2 against 6.7 for N = 768 - and slower the more blocks it has: every block reads all of X.
+- **The next block's weights prefetched into L2** while the current block runs: the 68-row GEMMs
+  are not bandwidth-bound at all - the same GEMM with its weights hot in L2 is 8.9 against 9.4 us
+  cold, and 8.1 us for N = 768 either way.
 - **The outer product mean's product straight into the output GEMM's layout** (a strided-batched
   GEMM over query tokens, the output weight's rows permuted to match): its m = 32 tiling ran
   0.84 ms a call against 0.5 for the GEMM and permute it replaced.
