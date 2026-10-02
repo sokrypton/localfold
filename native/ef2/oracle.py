@@ -10,6 +10,7 @@ model on the CPU with its own ESM-C (biohub/ESMC-600M-1500000, loaded in float32
   o/lm_hidden      [T, 37, 1152]  the 37 hidden states the shim mixes, per token
   o/lm_z           [T, T, 256]    the language model's pair term
   o/s_inputs       [T, 451]       the inputs embedder's output
+  o/atom/linear, norm, block<i>, toToken   [A, ...] inside it
   o/z_init_1 o/z_init_2 o/rel_pos o/token_bonds   the other four terms of z_init
   o/loop<k>/in o/loop<k>/out      the trunk's pair into and out of each of its num_loops + 1 passes
   o/distogram      [T, T, 128]
@@ -128,6 +129,12 @@ def main():
         hooks.append(module.register_forward_hook(hook))
     on(model.language_model, "o/lm_z")
     on(model.inputs_embedder, "o/s_inputs")
+    enc = model.inputs_embedder.atom_attention_encoder
+    on(enc.atom_linear, "o/atom/linear")
+    on(enc.atom_norm, "o/atom/norm")
+    for i, block in enumerate(enc.atom_transformer.blocks):
+        on(block, f"o/atom/block{i}")
+    on(enc.atom_to_token_linear, "o/atom/toToken")
     for n in ("z_init_1", "z_init_2", "rel_pos", "token_bonds"):
         on(getattr(model, n), "o/" + n)
     loops = []

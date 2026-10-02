@@ -4,6 +4,8 @@
 //
 //   ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]
 #include "esmc.cuh"
+#include "atoms.cuh"
+#include "trunk.cuh"
 
 __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, int T, int states, int k, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -20,6 +22,8 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
+    else if (!strcmp(argv[i], "--atom-f32")) ATOM_BF16 = false;
+    else if (!strncmp(argv[i], "--inputs-window=", 16)) INPUTS_HALF_WINDOW = atoi(argv[i] + 16) / 2;   // 128: biohub's
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (weights.empty()) { fprintf(stderr, "--weights=<dir> (native/ef2/export_weights.mjs)\n"); return 1; }
@@ -56,5 +60,23 @@ int main(int argc, char** argv) {
     }
     checkOracle("lm pair", lmZ, (size_t)T * T * e.pair, "o/lm_z");
   }
+  int A = (int)M.meta("meta/atoms"), Si = (int)M.meta("meta/singleInputs");
+  float* sInputs = dalloc((size_t)T * Si);
+  t0 = std::chrono::steady_clock::now();
+  inputsEmbedder(T, A, sInputs, Si, check);
+  CK(cudaStreamSynchronize(STREAM));
+  printf("inputs embedder %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  if (check) checkOracle("s_inputs", sInputs, (size_t)T * Si, "o/s_inputs");
+  int C = e.pair;
+  float* zi = dalloc((size_t)T * T * C); float* z = dalloc((size_t)T * T * C);
+  zInit(T, C, sInputs, Si, lmZ, zi, check);
+  t0 = std::chrono::steady_clock::now();
+  foldingTrunk(T, C, zi, z, 4, check);
+  CK(cudaStreamSynchronize(STREAM));
+  printf("trunk %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  float* dg = dalloc((size_t)T * T * (int)M.meta("meta/distogramBins"));
+  distogram(z, T, C, dg);
+  if (check) checkOracle("distogram", dg, (size_t)T * T * (int)M.meta("meta/distogramBins"), "o/distogram");
+  if (getenv("EF2_DUMP")) { auto h = download(sInputs, (size_t)T * Si); FILE* f = fopen(getenv("EF2_DUMP"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f); }
   return 0;
 }

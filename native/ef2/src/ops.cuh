@@ -58,6 +58,13 @@ inline void layerNorm(const float* x, float* y, size_t rows, int C, const float*
 __device__ __forceinline__ float siluF(float x) { return x / (1.f + expf(-x)); }
 __device__ __forceinline__ float geluF(float x) { return 0.5f * x * (1.f + erff(x * 0.70710678118654752f)); }
 
+__global__ void swigluK(const float* h, float* g, size_t rows, int F) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * F) return;
+  size_t r = t / F; int c = (int)(t % F);
+  g[t] = siluF(h[r * 2 * F + c]) * h[r * 2 * F + F + c];
+}
+
 // ---------------------------------------------------------------- checks
 inline double checkOracle(const char* label, const float* d, size_t n, const std::string& oracle) {
   if (!M.has(oracle)) { printf("  %-30s (no oracle %s)\n", label, oracle.c_str()); return -1; }

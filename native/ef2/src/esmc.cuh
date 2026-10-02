@@ -63,12 +63,6 @@ __global__ void softmaxSeqK(float* S, const int* seq, int rows, float scale) {
   float inv = 1.f / red[0];
   for (int j = threadIdx.x; j < rows; j += blockDim.x) s[j] *= inv;
 }
-__global__ void swigluK(const float* h, float* g, size_t rows, int F) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * F) return;
-  size_t r = t / F; int c = (int)(t % F);
-  g[t] = siluF(h[r * 2 * F + c]) * h[r * 2 * F + F + c];
-}
 
 struct Esmc { int rows, model, heads, ffn, layers, pair; };
 

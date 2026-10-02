@@ -1,0 +1,260 @@
+// ESMFold2's sliding-window atom transformer with 3D RoPE (src/esmfold2/atom-transformer-reference.js
+// is the reading): the inputs embedder, and the stacks the diffusion module's atom encoder and
+// decoder reuse.
+//
+//   c0 = LN(atomFeatures @ linear);  q = c0 (+ coords @ coordsLinear in the diffusion's encoder)
+//   3 x adaLN-Zero block, conditioned on c0 throughout:
+//       mod = silu(c0) @ adaln -> shift_a scale_a gate_a shift_f scale_f gate_f
+//       q  += gate_a * SWA(rms(q) (1 + scale_a) + shift_a)
+//       q  += gate_f * swiglu(rms(q) (1 + scale_f) + shift_f)
+//   SWA: qkv; q, k rms-normed PER HEAD then rotated; q, k, v narrowed to bfloat16 (the module casts
+//   whatever the model's dtype); keys within halfWindow in rank among VALID atoms, the diagonal always;
+//   out = (ctx * live * sigmoid(input @ attnGate)) @ attnOut
+//   Every rms is affine-free with torch's eps (float32 epsilon, 1.19e-7).
+#pragma once
+#include "ops.cuh"
+
+constexpr int ATOM_FEATURES = 3 + 1 + 1 + 128 + 4 * 64;   // 389
+constexpr float RMS_EPS = 1.1920928955078125e-7f;
+// the module narrows q, k, v to bfloat16 whatever the model's dtype; false is the control arm, held to
+// an oracle written with oracle.py --float32-attention (the rope table stays bfloat16 either way)
+inline bool ATOM_BF16 = true;
+
+__device__ __forceinline__ float bf16Round(float v) {      // round to nearest even, back to float
+  unsigned w = __float_as_uint(v);
+  w = (w + 0x7fffu + ((w >> 16) & 1u)) & 0xffff0000u;
+  return __uint_as_float(w);
+}
+
+__global__ void atomFeaturesK(const float* pos, const float* charge, const float* mask, const int* element,
+                              const int* nameChars, float* out, int A) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * ATOM_FEATURES) return;
+  int atom = (int)(t / ATOM_FEATURES), f = (int)(t % ATOM_FEATURES);
+  bool live = mask[atom] != 0.f;
+  float v = 0.f;
+  if (f < 3) v = pos[atom * 3 + f];
+  else if (f == 3) v = charge[atom];
+  else if (f == 4) v = mask[atom];
+  else if (f < 5 + 128) v = live && element[atom] == f - 5 ? 1.f : 0.f;
+  else { int i = (f - 133) / 64, ch = (f - 133) % 64; v = live && nameChars[atom * 4 + i] == ch ? 1.f : 0.f; }
+  out[t] = v;
+}
+// the rotary table [A, 16]: x's two pairs (base 20), y's, z's, then the space uid's ten (base 10000);
+// spacing 1 / base^(i/n); stored in bfloat16 as the model stores it
+__global__ void ropeTableK(const float* pos, const int* uid, float* cosT, float* sinT, int A) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= A * 16) return;
+  int atom = t / 16, at = t % 16;
+  double angle;
+  if (at < 6) { int axis = at / 2, i = at % 2; angle = (double)pos[atom * 3 + axis] * (1.0 / pow(20.0, i / 2.0)); }
+  else { int i = at - 6; angle = (double)uid[atom] * (1.0 / pow(10000.0, i / 10.0)); }
+  cosT[t] = bf16Round((float)cos(angle));
+  sinT[t] = bf16Round((float)sin(angle));
+}
+__global__ void rankK(const float* mask, int* rank, int A) {      // inclusive scan, one thread (A small)
+  if (blockIdx.x || threadIdx.x) return;
+  int seen = 0;
+  for (int a = 0; a < A; ++a) { seen += mask[a] != 0.f; rank[a] = seen - 1; }
+}
+__global__ void siluK(const float* x, float* y, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = siluF(x[t]);
+}
+// rms(x) * (1 + mod[scale]) + mod[shift], a warp a row (C = 128)
+__global__ void rmsModulateK(const float* x, const float* mod, float* y, int rows, int C, int shift, int scale) {
+  int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* xr = x + (size_t)row * C;
+  float s = 0;
+  for (int c = lane; c < C; c += 32) s += xr[c] * xr[c];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float inv = rsqrtf(s / C + RMS_EPS);
+  const float* m = mod + (size_t)row * 6 * C;
+  for (int c = lane; c < C; c += 32) y[(size_t)row * C + c] = xr[c] * inv * (1.f + m[scale * C + c]) + m[shift * C + c];
+}
+// q and k (heads of 32, inside the packed [A, 3C] qkv): rms per head, rotate, narrow to bfloat16; v narrowed
+__global__ void qkvPrepareK(float* qkv, const float* cosT, const float* sinT, int A, int C, int heads, bool bf16) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x;      // one thread per (atom, part, head)
+  if (t >= A * 3 * heads) return;
+  int head = t % heads, part = (t / heads) % 3, atom = t / (3 * heads);
+  float* p = qkv + (size_t)atom * 3 * C + part * C + head * 32;
+  if (part == 2) { if (bf16) for (int d = 0; d < 32; ++d) p[d] = bf16Round(p[d]); return; }
+  float s = 0;
+  for (int d = 0; d < 32; ++d) s += p[d] * p[d];
+  float inv = rsqrtf(s / 32 + RMS_EPS);
+  float v[32];
+  for (int d = 0; d < 32; ++d) v[d] = p[d] * inv;
+  for (int i = 0; i < 16; ++i) {
+    float c = cosT[atom * 16 + i], sn = sinT[atom * 16 + i], a = v[i], b = v[16 + i];
+    float lo = a * c - b * sn, hi = b * c + a * sn;
+    p[i] = bf16 ? bf16Round(lo) : lo;
+    p[16 + i] = bf16 ? bf16Round(hi) : hi;
+  }
+}
+// scores [heads, A, A] -> masked softmax: key j allowed for query i if i == j, or both valid and their
+// ranks within halfWindow
+__global__ void swaSoftmaxK(float* S, const float* mask, const int* rank, int A, int halfWindow, float scale) {
+  size_t row = blockIdx.x;
+  int i = (int)(row % A);
+  float* s = S + row * A;
+  __shared__ float red[32];
+  float m = -INFINITY;
+  for (int j = threadIdx.x; j < A; j += blockDim.x) {
+    bool ok = i == j || (mask[i] != 0.f && mask[j] != 0.f && abs(rank[i] - rank[j]) <= halfWindow);
+    float v = ok ? s[j] * scale : -INFINITY;
+    s[j] = v; m = fmaxf(m, v);
+  }
+  for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = m;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : -INFINITY;
+    for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(~0u, v, o));
+    if (threadIdx.x == 0) red[0] = v;
+  }
+  __syncthreads();
+  m = red[0];
+  __syncthreads();
+  float sum = 0;
+  for (int j = threadIdx.x; j < A; j += blockDim.x) { float e = s[j] == -INFINITY ? 0.f : expf(s[j] - m); s[j] = e; sum += e; }
+  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = sum;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.f;
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    if (threadIdx.x == 0) red[0] = v;
+  }
+  __syncthreads();
+  float inv = 1.f / red[0];
+  for (int j = threadIdx.x; j < A; j += blockDim.x) s[j] *= inv;
+}
+__global__ void gateLiveK(float* ctx, const float* gate, const float* mask, size_t A, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= A * C) return;
+  ctx[t] *= (mask[t / C] != 0.f ? 1.f : 0.f) / (1.f + expf(-gate[t]));
+}
+__global__ void gatedAddK(float* x, const float* mod, const float* d, int A, int C, int which) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * C) return;
+  size_t a = t / C; int c = (int)(t % C);
+  x[t] += mod[a * 6 * C + which * C + c] * d[t];
+}
+
+struct AtomCtx { int A, C, heads, hidden; const float* mask; const int* rank; const float* cosT; const float* sinT; };
+
+inline void dumpOnce(const char* name, const float* d, size_t n) {
+  static std::set<std::string> done;
+  const char* dir = getenv("EF2_DUMPDIR");
+  if (!dir || done.count(name)) return;
+  done.insert(name);
+  auto h = download(d, n); FILE* f = fopen((std::string(dir) + "/" + name + ".bin").c_str(), "wb");
+  fwrite(h.data(), 4, h.size(), f); fclose(f);
+}
+inline void swaBlock(const AtomCtx& a, float* x, const float* cond, const std::string& B, int halfWindow) {
+  size_t A = a.A; int C = a.C;
+  float* sc = scratch<float>("atom.silu", A * C); float* mod = scratch<float>("atom.mod", A * 6 * C);
+  siluK<<<blocks(A * C), 256, 0, STREAM>>>(cond, sc, A * C);
+  gemm(sc, F(B + "adaln"), mod, A, C, 6 * C);
+  float* xm = scratch<float>("atom.xm", A * C);
+  rmsModulateK<<<(unsigned)((A + 7) / 8), 256, 0, STREAM>>>(x, mod, xm, (int)A, C, 0, 1);
+  float* qkv = scratch<float>("atom.qkv", A * 3 * C);
+  gemm(xm, F(B + "qkv"), qkv, A, C, 3 * C);
+  dumpOnce("mod", mod, A * 6 * C); dumpOnce("xm", xm, A * C); dumpOnce("qkv_raw", qkv, A * 3 * C);
+  qkvPrepareK<<<blocks(A * 3 * a.heads, 128), 128, 0, STREAM>>>(qkv, a.cosT, a.sinT, (int)A, C, a.heads, ATOM_BF16);
+  dumpOnce("qkv", qkv, A * 3 * C); dumpOnce("cos", a.cosT, A * 16);
+  float* S = scratch<float>("atom.scores", (size_t)a.heads * A * A);
+  float* ctx = scratch<float>("atom.ctx", A * C);
+  const float one = 1.f, zero = 0.f;
+  CB(cublasSgemmStridedBatched(H, CUBLAS_OP_T, CUBLAS_OP_N, (int)A, (int)A, 32, &one, qkv + C, 3 * C, 32, qkv, 3 * C, 32,
+                               &zero, S, (int)A, (long long)A * A, a.heads));
+  swaSoftmaxK<<<(unsigned)(a.heads * A), 256, 0, STREAM>>>(S, a.mask, a.rank, (int)A, halfWindow, 1.f / sqrtf(32.f));
+  CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 32, (int)A, (int)A, &one, qkv + 2 * C, 3 * C, 32, S, (int)A,
+                               (long long)A * A, &zero, ctx, C, 32, a.heads));
+  float* gate = scratch<float>("atom.gate", A * C);
+  gemm(xm, F(B + "attnGate"), gate, A, C, C);
+  dumpOnce("ctx", ctx, A * C);
+  gateLiveK<<<blocks(A * C), 256, 0, STREAM>>>(ctx, gate, a.mask, A, C);
+  float* att = scratch<float>("atom.att", A * C);
+  gemm(ctx, F(B + "attnOut"), att, A, C, C);
+  gatedAddK<<<blocks(A * C), 256, 0, STREAM>>>(x, mod, att, (int)A, C, 2);
+  rmsModulateK<<<(unsigned)((A + 7) / 8), 256, 0, STREAM>>>(x, mod, xm, (int)A, C, 3, 4);
+  float* h = scratch<float>("atom.h", A * 2 * a.hidden); float* g = scratch<float>("atom.g", A * a.hidden);
+  gemm(xm, F(B + "ffnUp"), h, A, C, 2 * a.hidden);
+  swigluK<<<blocks(A * a.hidden), 256, 0, STREAM>>>(h, g, A, a.hidden);
+  gemm(g, F(B + "ffnDown"), att, A, a.hidden, C);
+  gatedAddK<<<blocks(A * C), 256, 0, STREAM>>>(x, mod, att, (int)A, C, 5);
+}
+inline void swaStack(const AtomCtx& a, float* x, const float* cond, const std::string& prefix, int blocksN, int halfWindow) {
+  for (int b = 0; b < blocksN; ++b) swaBlock(a, x, cond, prefix + "/blocks/" + std::to_string(b) + "/", halfWindow);
+}
+
+__global__ void reluK(float* x, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) x[t] = fmaxf(x[t], 0.f);
+}
+// mean over each token's atoms, weighted by the mask, into s_inputs' first C columns (row stride ld)
+__global__ void scatterMeanK(const float* v, const int* atomToToken, const float* mask, float* out, int A, int T,
+                             int C, int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // one thread per (token, channel)
+  if (t >= (size_t)T * C) return;
+  int token = (int)(t / C), c = (int)(t % C);
+  float s = 0, w = 0;
+  for (int a = 0; a < A; ++a) {
+    if (mask[a] == 0.f || atomToToken[a] != token) continue;
+    s += v[(size_t)a * C + c] * mask[a]; w += mask[a];
+  }
+  out[(size_t)token * ld + c] = s / fmaxf(w, 1e-9f);
+}
+__global__ void tailInputsK(const float* aatype, const float* profile, const float* delMean, float* out, int T, int C,
+                            int K, int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)T * (2 * K + 1)) return;
+  int token = (int)(t / (2 * K + 1)), f = (int)(t % (2 * K + 1));
+  float v = f < K ? aatype[token * K + f] : f < 2 * K ? profile[token * K + f - K] : delMean[token];
+  out[(size_t)token * ld + C + f] = v;
+}
+
+// the atom side of an input, built once: features -> c0, the rope table, ranks
+struct Atoms { AtomCtx ctx; float* c0; };
+inline Atoms prepareAtoms(int A, const std::string& prefix) {
+  Atoms at{};
+  int C = (int)M.meta("meta/atomChannels");
+  at.ctx.A = A; at.ctx.C = C; at.ctx.heads = (int)M.meta("meta/atomHeads");
+  at.ctx.hidden = (int)dimOf("f/" + prefix + "/blocks/0/ffnDown", 0);
+  at.ctx.mask = W("atom_mask");
+  int* rank = dallocT<int>(A); rankK<<<1, 1, 0, STREAM>>>(at.ctx.mask, rank, A); at.ctx.rank = rank;
+  float* cosT = dalloc((size_t)A * 16); float* sinT = dalloc((size_t)A * 16);
+  ropeTableK<<<blocks((size_t)A * 16), 256, 0, STREAM>>>(W("ref_pos"), Idev("ref_space_uid"), cosT, sinT, A);
+  at.ctx.cosT = cosT; at.ctx.sinT = sinT;
+  float* feat = scratch<float>("atom.features", (size_t)A * ATOM_FEATURES);
+  atomFeaturesK<<<blocks((size_t)A * ATOM_FEATURES), 256, 0, STREAM>>>(W("ref_pos"), W("ref_charge"), at.ctx.mask,
+    Idev("ref_element"), Idev("ref_atom_name_chars"), feat, A);
+  at.c0 = dalloc((size_t)A * C);
+  gemm(feat, F(prefix + "/linear"), at.c0, A, ATOM_FEATURES, C);
+  layerNorm(at.c0, at.c0, A, C, F(prefix + "/norm/scale"), F(prefix + "/norm/offset"));
+  return at;
+}
+
+// the inputs embedder: s_inputs [T, 451] = [pool(relu(stack(c0) @ toToken)) | aatype | profile | deletion mean]
+// halfWindow: dense (1 << 30) is the page's reading (Synthyra's fastplms never windows this stage);
+// 64 is biohub's esm package, which windows every atom stack - see docs/EF2FAST.md
+inline int INPUTS_HALF_WINDOW = 1 << 30;
+inline void inputsEmbedder(int T, int A, float* sInputs, int sWidth, bool check = false) {
+  Atoms at = prepareAtoms(A, "atom");
+  if (check) checkOracle("atom norm (c0)", at.c0, (size_t)A * at.ctx.C, "o/atom/norm");
+  int C = at.ctx.C, Ct = (int)dimOf("f/atom/toToken", 1), K = (int)M.meta("meta/classes");
+  float* x = scratch<float>("embed.x", (size_t)A * C);
+  CK(cudaMemcpyAsync(x, at.c0, (size_t)A * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  for (int b = 0; b < (int)M.meta("meta/atomBlocks"); ++b) {
+    swaBlock(at.ctx, x, at.c0, "atom/blocks/" + std::to_string(b) + "/", INPUTS_HALF_WINDOW);
+    if (check) checkOracle(("atom block " + std::to_string(b)).c_str(), x, (size_t)A * C, "o/atom/block" + std::to_string(b));
+  }
+  float* tok = scratch<float>("embed.tok", (size_t)A * Ct);
+  gemm(x, F("atom/toToken"), tok, A, C, Ct);
+  reluK<<<blocks((size_t)A * Ct), 256, 0, STREAM>>>(tok, (size_t)A * Ct);
+  scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, Idev("atom_to_token"), at.ctx.mask, sInputs, A, T, Ct, sWidth);
+  tailInputsK<<<blocks((size_t)T * (2 * K + 1)), 256, 0, STREAM>>>(W("aatype"), W("profile"), W("deletion_mean"), sInputs,
+                                                                 T, Ct, K, sWidth);
+}
