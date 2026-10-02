@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 0, folds = 1;
   uint64_t seed = 42; std::string out = "fold.pdb";
   for (int i = 2; i < argc; ++i) {
-    if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = true;
+    if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = true;
     else if (!strcmp(argv[i], "--stages")) STAGES = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
@@ -156,6 +156,11 @@ int main(int argc, char** argv) {
       perToken[k] = (float)(s2 / std::max(c2, 1.0));
     }
     writePdb(out, x, perToken.data());
+    if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
+      FILE* pf = fopen(pp, "wb");
+      fwrite(conf.pae.data(), 4, conf.pae.size(), pf); fwrite(conf.pde.data(), 4, conf.pde.size(), pf);
+      fwrite(conf.plddt.data(), 4, conf.plddt.size(), pf); fclose(pf);
+    }
     if (STAGES) {
       double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
       for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);

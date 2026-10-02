@@ -38,6 +38,7 @@ __global__ void expectationK(const float* logits, float* out, const float* mask,
   out[r] = weighted / total * scale * (mask ? mask[r] : 1.f);
 }
 
+inline bool CONF_HALF = false;   // the head's four pairformer blocks in f16
 struct ConfidenceOut { std::vector<float> plddt, pae, pde; double meanPlddt, ptm, iptm; };
 
 inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
@@ -65,7 +66,8 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
   bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
   for (int k = 0; k < nb; ++k)
-    pairformerBlockAt<float>(pair, single, pairMask, seqMask, n, C, Cs, P + ".blocks." + std::to_string(k), swap, divide);
+    if (CONF_HALF) pairformerBlockAt<half>(pair, single, pairMask, seqMask, n, C, Cs, P + ".blocks." + std::to_string(k), swap, divide);
+    else pairformerBlockAt<float>(pair, single, pairMask, seqMask, n, C, Cs, P + ".blocks." + std::to_string(k), swap, divide);
   // the error bins: 64 of them up to 31 A, the last one step past the second-to-last
   const int NB = 64; double step = 31.0 / (NB - 2);
   std::vector<float> centres(NB);
