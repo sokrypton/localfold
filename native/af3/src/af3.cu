@@ -5,6 +5,7 @@
 // Reads <data-dir>/model.{idx,bin} (export-model.mjs). Without --fast it runs the precise
 // path (f32 throughout) and checks every seam the oracle recorded; with --fast the f16 path.
 #include "trunk.cuh"
+#include "atom.cuh"
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
@@ -23,9 +24,16 @@ int main(int argc, char** argv) {
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          (int)M.meta("batch.tokens"));
 
-  // Phase A: the trunk from AF3's own target_feat, every seam against AF3's own tensors.
-  const float* targetFeat = M.f("oracle.trunk.stages.target_feat");
-  Trunk t = makeTrunk(targetFeat, msaCap);
+  // target_feat from the batch: per-atom conditioning and the atom cross-attention encoder.
+  int tokens = (int)M.meta("batch.tokens");
+  float* tfDev = buildTargetFeat();
+  check("target_feat", tfDev, (size_t)tokens * 447, "oracle.trunk.stages.target_feat");
+  std::vector<float> targetFeat = download(tfDev, (size_t)tokens * 447);
+  bool oracleTargetFeat = false;
+  for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
+  if (oracleTargetFeat)
+    targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * 447);
+  Trunk t = makeTrunk(targetFeat.data(), msaCap);
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
