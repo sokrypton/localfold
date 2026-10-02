@@ -81,6 +81,7 @@ said, no token bucketing, the same MSA rows), steady-state calls:
 | 5CAJ, 261 tokens, 512 rows, 1 pass | 2.76 s | **0.73 s** | 3.8x |
 | 5CAJ, 4 passes (3 recycles) | 3.47 s | **1.13 s** | 3.1x |
 | 5CAJ, 1 pass, 5 samples | 5.00 s | **1.57 s** | 3.2x |
+| 5CAJ x 4, 1044 tokens, no MSA, 1 pass | 11.1 s | **4.11 s** | 2.7x |
 
 and JAX's first call carries ~60 s of compilation where the native first fold is within 15% of
 a warm one.
