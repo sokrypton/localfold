@@ -242,6 +242,23 @@ __global__ void adaLn2K(const float* x, const float* s1, const float* h1, const 
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
   const float* xr = x + row * C;
+  if (C == 128) {           // a float4 a lane, every load issued at once (few blocks: latency is the cost)
+    size_t k = (row % period) * C + lane * 4;
+    float4 v = *(const float4*)(xr + lane * 4), a = *(const float4*)(s1 + k), b = *(const float4*)(h1 + k),
+           c2 = *(const float4*)(s2 + k), d = *(const float4*)(h2 + k);
+    float sum = v.x + v.y + v.z + v.w;
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    float mean = sum / C, q = (v.x - mean) * (v.x - mean) + (v.y - mean) * (v.y - mean) + (v.z - mean) * (v.z - mean) + (v.w - mean) * (v.w - mean);
+    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
+    float inv = 1.f / sqrtf(q / C + 1e-5f);
+    float n[4] = { (v.x - mean) * inv, (v.y - mean) * inv, (v.z - mean) * inv, (v.w - mean) * inv };
+    float as[4] = { a.x, a.y, a.z, a.w }, bs[4] = { b.x, b.y, b.z, b.w }, cs[4] = { c2.x, c2.y, c2.z, c2.w }, ds[4] = { d.x, d.y, d.z, d.w };
+    for (int e = 0; e < 4; ++e) {
+      o1[row * C + lane * 4 + e] = fromF<TO>(sigm(as[e]) * n[e] + bs[e]);
+      o2[row * C + lane * 4 + e] = fromF<TO>(sigm(cs[e]) * n[e] + ds[e]);
+    }
+    return;
+  }
   float s = 0;
   for (int c = lane; c < C; c += 32) s += xr[c];
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
@@ -295,6 +312,22 @@ __global__ void gatedAddAdaLnRowsK(float* act, const float* y, const float* gate
   float* a = act + row * C;
   float s = 0;
   size_t pr = (row % period) * C;
+  if (C == 128) {           // a float4 a lane, every load issued at once (few blocks: latency is the cost)
+    int c0 = lane * 4;
+    float4 x = *(const float4*)(a + c0), yy = *(const float4*)(y + row * C + c0), g = *(const float4*)(gate + pr + c0),
+           sc = *(const float4*)(scale + pr + c0), sh = *(const float4*)(shift + pr + c0);
+    x.x += yy.x * sigm(g.x); x.y += yy.y * sigm(g.y); x.z += yy.z * sigm(g.z); x.w += yy.w * sigm(g.w);
+    *(float4*)(a + c0) = x;
+    float sum = x.x + x.y + x.z + x.w;
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    float mean = sum / C, q = (x.x - mean) * (x.x - mean) + (x.y - mean) * (x.y - mean) + (x.z - mean) * (x.z - mean) + (x.w - mean) * (x.w - mean);
+    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
+    float inv = 1.f / sqrtf(q / C + 1e-5f);
+    TO* o = out + row * C + c0;
+    o[0] = fromF<TO>(sigm(sc.x) * ((x.x - mean) * inv) + sh.x); o[1] = fromF<TO>(sigm(sc.y) * ((x.y - mean) * inv) + sh.y);
+    o[2] = fromF<TO>(sigm(sc.z) * ((x.z - mean) * inv) + sh.z); o[3] = fromF<TO>(sigm(sc.w) * ((x.w - mean) * inv) + sh.w);
+    return;
+  }
   for (int c = lane; c < C; c += 32) { float v = a[c] + y[row * C + c] * sigm(gate[pr + c]); a[c] = v; s += v; }
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   __syncwarp();
