@@ -285,21 +285,42 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
     size_t next = tile + gridDim.x;
     if (next < tiles) { issue(next, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
     else asm volatile("cp.async.wait_group 0;");
+    // the epilogue's operands, loaded now so the norm and the GEMM cover their latency (one block
+    // an SM: nothing else would)
+    size_t r0 = tile * R + warp * 16 + g, r1 = r0 + 8;
+    auto pairOf = [&](size_t q) -> size_t {
+      if (q >= pp) return SIZE_MAX;
+      unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
+      return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
+    };
+    size_t p0 = pairOf(r0), p1 = pairOf(r1);
+    float2 pv[NT][2]; half2 gv[NT][2];
+#pragma unroll
+    for (int et = 0; et < NT; ++et) {
+      int c = et * 8 + tig * 2;
+      if (p0 != SIZE_MAX) { pv[et][0] = *(const float2*)(pair + p0 * C + c); gv[et][0] = *reinterpret_cast<const half2*>(t2 + r0 * C + c); }
+      if (p1 != SIZE_MAX) { pv[et][1] = *(const float2*)(pair + p1 * C + c); gv[et][1] = *reinterpret_cast<const half2*>(t2 + r1 * C + c); }
+    }
     __syncthreads();
     const TP* Ps = Pst + st * C * LDP;
     // the center norm, a THREAD a row: the tile is channel-major, so a warp reading one row across
     // its channels hit four-way bank conflicts; a thread per row reads 32 consecutive rows a warp,
     // and writes its row in 16-byte pieces (rows 272 bytes apart cover all 32 banks)
-    for (int r = threadIdx.x; r < R; r += NTH) {
+    // (two adjacent lanes a row, each over half the channels: R rows are half the block's threads)
+    static_assert(2 * R == NTH, "a row is two threads");
+    {
+      int r = threadIdx.x >> 1, cb = (threadIdx.x & 1) * (C / 2);
       float s = 0.f;
 #pragma unroll 8
-      for (int c = 0; c < C; ++c) s += (float)Ps[c * LDP + r];
+      for (int c = cb; c < cb + C / 2; ++c) s += (float)Ps[c * LDP + r];
+      s += __shfl_xor_sync(~0u, s, 1);
       float mean = s / C, q = 0.f;
 #pragma unroll 8
-      for (int c = 0; c < C; ++c) { float d = (float)Ps[c * LDP + r] - mean; q += d * d; }
+      for (int c = cb; c < cb + C / 2; ++c) { float d = (float)Ps[c * LDP + r] - mean; q += d * d; }
+      q += __shfl_xor_sync(~0u, q, 1);
       float inv = rsqrtf(q / C + 1e-5f);
 #pragma unroll
-      for (int c0 = 0; c0 < C; c0 += 8) {
+      for (int c0 = cb; c0 < cb + C / 2; c0 += 8) {
         uint32_t w[4];
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
@@ -325,25 +346,16 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
         mma16816(acc[et + 1], xa[ks], f[2], f[3]);
       }
     }
-    size_t r0 = tile * R + warp * 16 + g, r1 = r0 + 8;
-    auto pairOf = [&](size_t q) -> size_t {
-      if (q >= pp) return SIZE_MAX;
-      unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
-      return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
-    };
-    size_t p0 = pairOf(r0), p1 = pairOf(r1);
 #pragma unroll
     for (int et = 0; et < NT; ++et) {
       int c = et * 8 + tig * 2;
       if (p0 != SIZE_MAX) {
-        float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r0 * C + c));
-        float2* p = (float2*)(pair + p0 * C + c); float2 v = *p;
-        v.x += acc[et][0] * sigm(gt.x); v.y += acc[et][1] * sigm(gt.y); *p = v;
+        float2 gt = __half22float2(gv[et][0]), v = pv[et][0];
+        v.x += acc[et][0] * sigm(gt.x); v.y += acc[et][1] * sigm(gt.y); *(float2*)(pair + p0 * C + c) = v;
       }
       if (p1 != SIZE_MAX) {
-        float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r1 * C + c));
-        float2* p = (float2*)(pair + p1 * C + c); float2 v = *p;
-        v.x += acc[et][2] * sigm(gt.x); v.y += acc[et][3] * sigm(gt.y); *p = v;
+        float2 gt = __half22float2(gv[et][1]), v = pv[et][1];
+        v.x += acc[et][2] * sigm(gt.x); v.y += acc[et][3] * sigm(gt.y); *(float2*)(pair + p1 * C + c) = v;
       }
     }
     __syncthreads();                                                 // Xs and this stage are reused
