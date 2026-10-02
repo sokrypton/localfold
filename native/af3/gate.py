@@ -49,6 +49,11 @@ def cases():
         fold = ["--steps=16"] if model == "opendde" else []
         out.append((f"{model}-6mrr", model, [f"--sequence={SEQ_6MRR}"], fold,
                     [os.path.join(FIX, "6mrr-crystal.pdb")]))
+    # the paths a plain protein never reaches: a ligand and an atomised modified residue, and a DNA
+    # duplex - scored on bond geometry too (bonds.mjs: rms against CCD ideals, A)
+    out.append(("af3-6mrr-gol-sep3", "af3", [f"--sequence={SEQ_6MRR}", "--ligands=GOL", "--modify=SEP@3"], [],
+                [os.path.join(FIX, "6mrr-crystal.pdb"), "A"], "GOL,SEP"))
+    out.append(("af3-dna-duplex", "af3", ["--sequence=GCGATCGATCGC:GCGATCGATCGC", "--kinds=dna,dna"], [], None, "DA,DC,DG,DT"))
     seq = chain_sequence(crystal_5caj, "A")
     out.append(("af3-5caj-template", "af3", [f"--sequence={seq}", f"--template={crystal_5caj}:A"], [],
                 [crystal_5caj, "A"]))
@@ -60,7 +65,7 @@ def cases():
     return out
 
 
-def run(name, model, inputs, fold, ref):
+def run(name, model, inputs, fold, ref, codes=None):
     os.makedirs(TMP, exist_ok=True)
     pdb = os.path.join(TMP, name + ".pdb")
     if os.path.exists(pdb):
@@ -71,11 +76,19 @@ def run(name, model, inputs, fold, ref):
     m = re.search(r"mean pLDDT ([\d.]+)\s+pTM ([\d.nan]+)", text)
     if p.returncode or not m or not os.path.exists(pdb):
         return {"error": text.strip().splitlines()[-1] if text.strip() else f"exit {p.returncode}"}
-    s = subprocess.run([sys.executable, os.path.join(HERE, "score.py"), pdb, *ref], capture_output=True, text=True)
-    r = re.search(r"CA RMSD ([\d.]+) A", s.stdout)
+    r = None
+    if ref:
+        s = subprocess.run([sys.executable, os.path.join(HERE, "score.py"), pdb, *ref], capture_output=True, text=True)
+        r = re.search(r"CA RMSD ([\d.]+) A", s.stdout)
     timing = re.search(r"total ([\d.]+) ms", text)
-    return {"rmsd": float(r.group(1)) if r else None, "plddt": float(m.group(1)), "ptm": m.group(2),
-            "ms": float(timing.group(1)) if timing else None}
+    got = {"rmsd": float(r.group(1)) if r else None, "plddt": float(m.group(1)), "ptm": m.group(2),
+           "ms": float(timing.group(1)) if timing else None}
+    if codes is not None:
+        b = subprocess.run(["node", os.path.join(HERE, "bonds.mjs"), pdb, codes], capture_output=True, text=True).stdout
+        for cls in ("ligand", "nucleic"):
+            v = re.search(cls + r" ([\d.]+)", b)
+            if v: got[cls] = float(v.group(1))
+    return got
 
 
 def main():
@@ -83,22 +96,28 @@ def main():
     only = next((a.split("=", 1)[1].split(",") for a in sys.argv if a.startswith("--only=")), None)
     base = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
     failed = 0
-    for name, model, inputs, fold, ref in cases():
+    for case in cases():
+        name, model, inputs, fold, ref = case[:5]
+        codes = case[5] if len(case) > 5 else None
         if only and model not in only and name not in only:
             continue
-        got = run(name, model, inputs, fold, ref)
+        got = run(name, model, inputs, fold, ref, codes)
         want = base.get(name)
         verdict = "recorded" if write else "NEW (no baseline)"
         if "error" in got:
             verdict, failed = "FAILED: " + got["error"], failed + 1
         elif want and not write:
-            dr, dp = abs(got["rmsd"] - want["rmsd"]), abs(got["plddt"] - want["plddt"])
-            ok = dr <= TOL_RMSD and dp <= TOL_PLDDT
-            verdict = ("ok" if ok else "MOVED") + f" (baseline {want['rmsd']:.3f} A, pLDDT {want['plddt']:.2f})"
+            ok = abs(got["plddt"] - want["plddt"]) <= TOL_PLDDT
+            if want.get("rmsd") is not None: ok = ok and got["rmsd"] is not None and abs(got["rmsd"] - want["rmsd"]) <= TOL_RMSD
+            for cls in ("ligand", "nucleic"):     # bond rms may move 0.01 A
+                if cls in want: ok = ok and cls in got and abs(got[cls] - want[cls]) <= 0.01
+            verdict = ("ok" if ok else "MOVED") + f" (baseline {json.dumps(want)})"
             failed += not ok
         if write and "error" not in got:
-            base[name] = {k: got[k] for k in ("rmsd", "plddt", "ptm")}
-        line = (f"{name:22s} " + (f"RMSD {got['rmsd']:.3f} A  pLDDT {got['plddt']:6.2f}  pTM {got['ptm']:>6s}  "
+            base[name] = {k: got[k] for k in ("rmsd", "plddt", "ptm", "ligand", "nucleic") if k in got}
+        extra = "".join(f"{cls} {got[cls]:.3f}  " for cls in ("ligand", "nucleic") if cls in got)
+        rmsd = f"RMSD {got['rmsd']:.3f} A  " if got.get("rmsd") is not None else "RMSD   -      "
+        line = (f"{name:22s} " + (f"{rmsd}pLDDT {got['plddt']:6.2f}  pTM {got['ptm']:>6s}  {extra}"
                                    f"{got['ms']:7.1f} ms  " if "error" not in got else "") + verdict)
         print(line, flush=True)
     if write:

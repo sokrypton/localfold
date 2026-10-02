@@ -14,6 +14,18 @@
   "ptm": "0.7667",
   "rmsd": 0.515
  },
+ "af3-6mrr-gol-sep3": {
+  "ligand": 0.034,
+  "plddt": 89.52,
+  "ptm": "0.8205",
+  "rmsd": 1.546
+ },
+ "af3-dna-duplex": {
+  "nucleic": 0.039,
+  "plddt": 93.08,
+  "ptm": "0.2087",
+  "rmsd": null
+ },
  "boltz2-6mrr": {
   "plddt": 96.91,
   "ptm": "0.8086",
