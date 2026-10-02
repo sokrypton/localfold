@@ -31,40 +31,45 @@ inline cublasHandle_t H;
 inline cudaStream_t STREAM = cudaStreamPerThread;
 
 // ---------------------------------------------------------------- the exported model
-struct Entry { char kind; size_t offset, length; double value; };
+struct Entry { char kind; size_t offset, length; double value; int seg; };
+// model.idx/model.bin pairs, mapped: the input's directory and (af3 --weights=DIR) the weights'
+struct Segment { const float* data; size_t bytes; float* device; };
 struct Model {
   std::map<std::string, Entry> index;
-  const float* data = nullptr;           // model.bin, mapped; int32 entries are stored as their bits
-  size_t bytes = 0;
-  float* device = nullptr;               // the whole file on the device, uploaded on first use
+  std::vector<Segment> segs;
   void load(const std::string& dir) {
     std::ifstream idx(dir + "/model.idx");
     if (!idx) { fprintf(stderr, "no %s/model.idx\n", dir.c_str()); exit(1); }
+    int seg = (int)segs.size();
     std::string line;
     while (std::getline(idx, line)) {
       std::istringstream in(line); char kind; std::string name; in >> kind >> name;
-      Entry e{kind, 0, 0, 0};
+      Entry e{kind, 0, 0, 0, seg};
       if (kind == 'm') in >> e.value; else in >> e.offset >> e.length;
+      if (index.count(name)) { fprintf(stderr, "%s is in two model directories\n", name.c_str()); exit(1); }
       index[name] = e;
     }
     // mapped, not read: a 1.4 GB read into a host vector was 1.7 s of every run
     int fd = open((dir + "/model.bin").c_str(), O_RDONLY);
     if (fd < 0) { fprintf(stderr, "no %s/model.bin\n", dir.c_str()); exit(1); }
-    struct stat st; fstat(fd, &st); bytes = (size_t)st.st_size;
+    struct stat st; fstat(fd, &st);
+    size_t bytes = (size_t)st.st_size;
     void* p = mmap(nullptr, std::max<size_t>(bytes, 1), PROT_READ, MAP_PRIVATE, fd, 0);
     if (p == MAP_FAILED) { fprintf(stderr, "cannot map %s/model.bin\n", dir.c_str()); exit(1); }
     close(fd);
-    data = (const float*)p;
+    segs.push_back({(const float*)p, bytes, nullptr});
   }
-  // the device copy of an entry: one allocation and one copy for the whole file
+  // the device copy of an entry: one allocation and one copy per file
   const float* dev(const std::string& k) {
-    if (!device) {
-      if (cudaMalloc(&device, std::max<size_t>(bytes, 4)) != cudaSuccess ||
-          cudaMemcpy(device, data, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        fprintf(stderr, "cannot put model.bin (%zu bytes) on the device\n", bytes); exit(1);
+    const Entry& e = at(k);
+    Segment& s = segs[e.seg];
+    if (!s.device) {
+      if (cudaMalloc(&s.device, std::max<size_t>(s.bytes, 4)) != cudaSuccess ||
+          cudaMemcpy(s.device, s.data, s.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
       }
     }
-    return device + at(k).offset;
+    return s.device + e.offset;
   }
   bool has(const std::string& k) const { return index.count(k) > 0; }
   const Entry& at(const std::string& k) const {
@@ -75,8 +80,8 @@ struct Model {
   double meta(const std::string& k) const { return at(k).value; }
   double meta(const std::string& k, double fallback) const { return has(k) ? at(k).value : fallback; }
   bool flag(const std::string& k) const { return has(k) && at(k).value != 0; }
-  const float* f(const std::string& k) const { return data + at(k).offset; }
-  const int* i(const std::string& k) const { return (const int*)(data + at(k).offset); }
+  const float* f(const std::string& k) const { const Entry& e = at(k); return segs[e.seg].data + e.offset; }
+  const int* i(const std::string& k) const { return (const int*)f(k); }
   size_t len(const std::string& k) const { return at(k).length; }
 };
 inline Model M;

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# The native AlphaFold 3 in one command:
+#
+#   native/af3/fold <out.pdb> <input flags> [-- <fold flags>]
+#   native/af3/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json -- --samples=5
+#   native/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=5caj.a3m --template=5caj.pdb:A
+#
+# Input flags go to export-model.mjs (--sequence, --a3m, --paired-a3m, --job, --ligands, --smiles,
+# --modify, --kinds, --template, --bundle); fold flags to ./af3 (--samples, --recycles, --steps,
+# --seed, ...), which runs --fold --fast. Builds ./af3 if it is missing, exports the weights once
+# (to native/af3/weights) and each input to a temporary directory.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[ $# -ge 1 ] || { sed -n '2,13p' "$0"; exit 1; }
+out="$1"; shift
+inputs=(); foldflags=()
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--" ]; then shift; foldflags=("$@"); break; fi
+  inputs+=("$1"); shift
+done
+if [ ! -x "$here/af3" ]; then
+  (cd "$here" && nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu \
+     -lcublas -lcupti -o af3)
+fi
+node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")
+[ -f "$here/weights/model.idx" ] || "${node[@]}" "$here/weights" --weights-only
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+"${node[@]}" "$tmp" --no-weights "${inputs[@]}"
+"$here/af3" "$tmp" --weights="$here/weights" --fold --fast --out="$out" "${foldflags[@]}"

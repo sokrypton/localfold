@@ -8,19 +8,24 @@ A3M), with pLDDT, PAE, PDE and pTM.
 ## Build and run
 
 ```
+native/af3/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json -- --samples=5
+native/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
+```
+
+`fold` builds `af3` if it is missing, exports the weights once (`native/af3/weights`, from the
+bundle on disk - no server), featurises the input with the repository's own featuriser into a
+temporary directory (0.2 s) and folds it (`--fold --fast`); everything after `--` goes to `af3`.
+A job JSON to a PDB is about 2.4 s of wall clock. By hand:
+
+```
 cd native/af3
 nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcupti -o af3
-
-python3 ../../tools/serve.py 8791 &        # the exporter reads the bundle over HTTP
-# a sequence (chains joined by ":") and optionally an alignment, featurised by the repo's own
-# af3BatchFromA3m; or, with no --sequence, AF3's own 6MRR batch plus every oracle to check against
-node --js-float16array --max-old-space-size=24000 export-model.mjs data-5caj \
-  --sequence=<SEQ> --a3m=../../oracle-dumps/5caj-a.a3m
-node --js-float16array --max-old-space-size=24000 export-model.mjs data          # oracle checks
-
+node --js-float16array --max-old-space-size=24000 export-model.mjs weights --weights-only
+node --js-float16array export-model.mjs in --no-weights --sequence=<SEQ> [--a3m=...]
+./af3 in --weights=weights --fold --fast --out=fold.pdb
+python3 score.py fold.pdb ../../tools/fixtures/5caj-crystal.pdb A
+node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + every oracle
 ./af3 data                                   # f32 path, every stage against AF3
-./af3 data-5caj --fold --fast --out=5caj.pdb # fold: PDB with pLDDT in the B-factor column
-python3 score.py 5caj.pdb ../../tools/fixtures/5caj-crystal.pdb A
 ```
 
 `--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--samples=N`

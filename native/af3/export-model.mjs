@@ -21,7 +21,18 @@ const args = process.argv.slice(2);
 const out = args.find((a) => !a.startsWith("--")) ?? `${repo}/native/af3/data`;
 const option = (name, fallback) =>
   args.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback;
-const bundle = option("bundle", "http://127.0.0.1:8791/model-af3-full-f32/manifest.json");
+// the bundle: a URL, or a path on disk (the default - no server needed: fetch reads file:// here)
+const bundleArg = option("bundle", `${repo}/model-af3-full-f32/manifest.json`);
+const bundle = /^https?:/.test(bundleArg) ? bundleArg : new URL(`file://${bundleArg.startsWith("/") ? "" : process.cwd() + "/"}${bundleArg}`).href;
+{
+  const networkFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const href = typeof url === "string" ? url : url.url ?? String(url);
+    if (!href.startsWith("file:")) return networkFetch(url, init);
+    const bytes = readFileSync(new URL(href));
+    return new Response(bytes, { status: 200, headers: { "content-length": String(bytes.length) } });
+  };
+}
 const batchPath = option("batch", `${repo}/oracle-dumps/af3-batch-alphafold3-6mrr.json`);
 const oracles = (option("oracles", option("sequence", "") === "" && option("job", "") === "" ? "trunk,denoise,realdenoise,confidence" : ""))
   .split(",").filter(Boolean);
@@ -63,15 +74,28 @@ const add = (name, value) => {
   }
 };
 
-const store = await openAf3Store(bundle);
-const depths = trunkDepths(store);
-const trunk = await trunkWeights(store, depths.pairformerBlocks, depths.msaBlocks);
-add("trunk", trunk);
-add("diffusion", await diffusionWeights(store));
-add("confidence", await confidenceWeights(store));
-add("targetFeat", await targetFeatureWeights(store));
-add("atomReference", await atomReference(store));
+// --weights-only writes the weights alone (once, for every input: `af3 <batch dir> --weights=<dir>`);
+// --no-weights writes the input alone (the dialect then comes from the bundle's manifest)
+const weightsOnly = args.includes("--weights-only"), noWeights = args.includes("--no-weights");
+let dialect;
+if (noWeights) {
+  const { dialectFor } = await import(`${repo}/src/af3/dialect.js`);
+  const manifest = JSON.parse(Buffer.from(await (await fetch(bundle)).arrayBuffer()).toString("utf8"));
+  dialect = dialectFor(manifest?.model?.name);
+} else {
+  const store = await openAf3Store(bundle);
+  const depths = trunkDepths(store);
+  const trunk = await trunkWeights(store, depths.pairformerBlocks, depths.msaBlocks);
+  dialect = trunk.dialect;
+  add("trunk", trunk);
+  add("diffusion", await diffusionWeights(store));
+  add("confidence", await confidenceWeights(store));
+  add("targetFeat", await targetFeatureWeights(store));
+  add("atomReference", await atomReference(store));
+}
 
+let batch = null;
+if (!weightsOnly) {
 // The batch: featurised here from --sequence (chains joined by ":") and an optional --a3m,
 // through the same function the page and fold.js use; or from an AlphaFold 3 job JSON (--job),
 // read by the page's own reader (web/job-json.js, web/entities.js); otherwise read from an AF3
@@ -118,7 +142,6 @@ if (option("job", "") !== "") {
     + ` ${jobRequest.ligandCodes.length} ligands, ${jobRequest.modifications.length} modifications,`
     + ` ${(jobRequest.bonds ?? []).length} bonds${job.seed === undefined ? "" : `, seed ${job.seed}`}`);
 }
-let batch;
 if (sequence !== "") {
   const { af3BatchFromA3m } = await import(`${repo}/src/af3/featurise/batch.js`);
   const { featuriserDialect } = await import(`${repo}/src/af3/dialect.js`);
@@ -164,7 +187,7 @@ if (sequence !== "") {
   batch = af3BatchFromA3m(sequence, alignment, {
     maxSequences: Number(option("max-msa", "512")),
     seed: Number(option("seed", "20260831")),
-    ...featuriserDialect(trunk.dialect),
+    ...featuriserDialect(dialect),
     ...(ligands.length === 0 ? {} : { ligands }),
     ...(modifications.length === 0 ? {} : { modifications }),
     ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
@@ -256,6 +279,7 @@ for (const which of oracles) {
   walk("", oracle);
 }
 
+}
 let offset = 0;
 const lines = [];
 for (const [kind, name, value] of entries) {
@@ -269,4 +293,4 @@ for (const [kind, , value] of entries) {
 }
 closeSync(fd);
 writeFileSync(`${out}/model.idx`, lines.join("\n") + "\n");
-console.log(`${entries.length} entries, ${(offset * 4 / 1048576).toFixed(0)} MiB, tokens ${batch.tokens}`);
+console.log(`${entries.length} entries, ${(offset * 4 / 1048576).toFixed(0)} MiB` + (batch ? `, tokens ${batch.tokens}` : " (weights only)"));

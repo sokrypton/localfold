@@ -15,7 +15,7 @@
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
-  uint64_t seed = 42; std::string out = "fold.pdb";
+  uint64_t seed = 42; std::string out = "fold.pdb", weightsDir;
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
     else if (!strcmp(argv[i], "--no-tf32")) F32_TF32 = false;
@@ -32,9 +32,11 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
+    else if (!strncmp(argv[i], "--weights=", 10)) weightsDir = argv[i] + 10;
   }
   auto t0 = std::chrono::steady_clock::now();
   M.load(argv[1]); DATA_DIR = argv[1];
+  if (!weightsDir.empty()) M.load(weightsDir);      // the weights exported once (--weights-only)
   { const float* sm = M.f("batch.seqMask"); size_t k = M.len("batch.seqMask"); MASK_ALL_ONES = true;
     for (size_t i = 0; i < k; ++i) if (!(sm[i] > 0)) MASK_ALL_ONES = false; }
   bool seedGiven = false;

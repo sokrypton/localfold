@@ -4,3 +4,4 @@ data*/
 /pairformer16
 *.o
 /af3
+weights/
