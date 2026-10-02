@@ -612,8 +612,11 @@ export function jobFromJson(text) {
   // order and the featuriser appends ligand tokens after every polymer token.
   // A file listing its ligand first is perfectly legal and would otherwise
   // claim a chain index the polymers still use.
-  entities.sort((left, right) =>
-    Number(left.type === "ligand") - Number(right.type === "ligand"));
+  // 🔴 AND A SMILES LIGAND IS A LIGAND: keyed on `ligand` alone the sort moved
+  // AF3's kitchen-sink SMILES (its last entry, chain Z) ahead of every CCD
+  // ligand, where AlphaFold 3 keeps the file's order.
+  const isLigand = (entity) => entity.type === "ligand" || entity.type === "smiles";
+  entities.sort((left, right) => Number(isLigand(left)) - Number(isLigand(right)));
 
   // 🔴 THE BONDS A JOB DECLARES, WHICH THREE OF AlphaFold 3's OWN FOURTEEN
   // EXAMPLES CARRY. `bondedAtomPairs` names each end as

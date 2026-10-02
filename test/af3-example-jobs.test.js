@@ -92,9 +92,10 @@ const EXPECTED = {
   // field the format has at once - the last to load, once an alignment carried
   // INLINE could be held (per chain copy, `job.alignments`). Its seed is 10.
   "alphafold_input.json": {
-    loads: ["protein:10x1", "protein:7x1", "dna:7x1", "dna:7x1", "rna:4x1", "smiles:1x1",
-            "ligand:ATPx1", "ligand:HEMx2", "ligand:MGx2", "ligand:NAG,FUCx1", "ligand:NAx3",
-            "contact:A1:CA - H1:CHAx1", "contact:L1:O6 - L2:C1x1"],
+    // (the SMILES ligand last, as the file lists it and AF3 orders it)
+    loads: ["protein:10x1", "protein:7x1", "dna:7x1", "dna:7x1", "rna:4x1",
+            "ligand:ATPx1", "ligand:HEMx2", "ligand:MGx2", "ligand:NAG,FUCx1", "ligand:NAx3", "smiles:1x1",
+            "contact:A1:CA - G1:CHAx1", "contact:K1:O6 - K2:C1x1"],
     seed: 10, alignedChains: 2,
   },
 };
