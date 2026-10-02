@@ -592,6 +592,11 @@ export function featuriseProtein(sequence, options = {}) {
   // independent ones, and giving each its own uid tells the atom encoder they
   // may not be compared, which is the opposite of true.
   let asym = chainLengths.length;
+  // 🔴 A LIGAND'S ENTITY FOLLOWS THE POLYMER ENTITIES, NOT THE POLYMER CHAINS. AF3 numbers distinct
+  // entities in chain order, so a homodimer's two copies are entity 1 and its ligand entity 2 -
+  // counting chains gave the ligand 3 (AF3's tetr_dimer_tetracycline example, against AF3's batch)
+  let polymerEntities = 0;
+  if (identity !== null) for (const e of identity.entityId) polymerEntities = Math.max(polymerEntities, e + 1);
   // Keyed on what the ligand IS, not on what it is called; see below.
   const entityOfLigand = new Map();
   const copiesOfEntity = new Map();
@@ -657,7 +662,7 @@ export function featuriseProtein(sequence, options = {}) {
       // `asym` is already one past the last polymer chain, and AF3 counts from
       // one, so the two cancel: no further +1 here.
       asymId[token] = asym;
-      entityId[token] = chains.length + entity + 1;
+      entityId[token] = polymerEntities + entity + 1;
       symId[token] = copy;
       seqMask[token] = 1;
 

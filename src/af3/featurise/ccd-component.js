@@ -147,11 +147,28 @@ export function parseCcdComponent(text) {
   // stays an error.
   const monatomic = atomLoop.rows.filter(
     (row) => !["H", "D"].includes((at(row, "type_symbol") ?? "").toUpperCase())).length === 1;
-  const coordinate = (row, axis) => {
-    for (const column of [`pdbx_model_Cartn_${axis}_ideal`, `model_Cartn_${axis}`]) {
-      const parsed = Number.parseFloat(at(row, column));
-      if (Number.isFinite(parsed)) return parsed;
+  // 🔴 AND ONE FRAME FOR THE WHOLE COMPONENT. AF3 takes the model coordinates for EVERY atom when any
+  // ideal one is "?" (features.py's '?' in pos) - mixing ideal and model atoms puts two frames in
+  // one conformer - and they are a CRYSTAL frame, TAC's 20-35 A from the origin, where AF3 itself
+  // feeds an RDKit conformer about it and `ref_pos` is an atom feature as well as an offset. So
+  // model coordinates are centred on their heavy atoms (AF3's tetracycline example: worst
+  // ref_pos 46.8 A against its batch before).
+  const heavy = atomLoop.rows.filter(
+    (row) => !["H", "D"].includes((at(row, "type_symbol") ?? "").toUpperCase()));
+  const ideal = heavy.every((row) => ["x", "y", "z"].every(
+    (axis) => Number.isFinite(Number.parseFloat(at(row, `pdbx_model_Cartn_${axis}_ideal`)))));
+  const modelCentre = { x: 0, y: 0, z: 0 };
+  if (!ideal && !monatomic) {
+    for (const axis of ["x", "y", "z"]) {
+      let sum = 0;
+      for (const row of heavy) sum += Number.parseFloat(at(row, `model_Cartn_${axis}`));
+      modelCentre[axis] = sum / heavy.length;
     }
+  }
+  const coordinate = (row, axis) => {
+    const column = ideal ? `pdbx_model_Cartn_${axis}_ideal` : `model_Cartn_${axis}`;
+    const parsed = Number.parseFloat(at(row, column));
+    if (Number.isFinite(parsed)) return ideal ? parsed : Math.round((parsed - modelCentre[axis]) * 1000) / 1000;
     if (monatomic) return 0;
     throw new Error(`${code} has no usable ${axis} coordinate`);
   };

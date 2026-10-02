@@ -94,6 +94,16 @@ def main():
         from alphafold3.constants import decoded_ccd
         text = "\n".join(open(path).read() for path in arguments.user_ccd)
         decoded_ccd.get_ccd = functools.partial(decoded_ccd.get_ccd, user_ccd=text)
+    # run_alphafold.py passes --max_template_date (2021-09-30) as ref_max_modified_date; the harness
+    # passes nothing, and a component whose ideal coordinates are "?" (TAC) then crashes comparing a
+    # date with None - so AF3's default is supplied
+    import datetime
+    from alphafold3.model import features as _features
+    _positions = _features._get_reference_positions_from_ccd_cif
+    def _with_cutoff(ccd_cif, ref_max_modified_date, logging_name):
+        return _positions(ccd_cif=ccd_cif, logging_name=logging_name,
+                          ref_max_modified_date=ref_max_modified_date or datetime.date(2021, 9, 30))
+    _features._get_reference_positions_from_ccd_cif = _with_cutoff
     from fold_check import _fold_setup
     from alphafold3.model import feat_batch
 
