@@ -297,9 +297,12 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
   stage (10.5 against 8.0 ms: the shared memory halves the blocks an SM holds), or interleaving
   two key fragments' MMAs (the registers). What did pay: no mask when every token is real (3-7%).
 
-- **The trunk pass as a CUDA graph** (a pass is ~1000 launches): 88.8 -> 80.5 ms for four passes
-  at 68 tokens and 469 -> 458 at 261 once warm, but the capture costs ~5 ms and a scratch buffer
-  that a later phase grows forces another, so a single fold - the usual run - came out slower.
+- **The trunk pass as a CUDA graph, everywhere** (a pass is ~1000 launches): capturing and
+  instantiating costs ~15 ms against ~2 ms saved per replayed pass at 68 tokens, so a single fold
+  at the page's 3 recycles came out slower there (105.8 -> 114.8 ms). TAKEN where it pays: the
+  recycle passes replay one graph captured from the second pass when there are at least 7 recycles
+  (AlphaFold 3's 10: 68-token trunk 231 -> 226 ms cold, 197 -> 176 warm) or 200 tokens (261: 494
+  -> 489 cold); the output is byte-identical.
 - **Larger blocks for the fused pair transition** (16 warps, halving its weight reads from L2):
   219 against 199 ms at 1044 tokens. Stripping it, neither the residual (-23 ms) nor the second
   GEMM (-27) dominates.

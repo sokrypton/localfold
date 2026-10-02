@@ -265,13 +265,31 @@ int main(int argc, char** argv) {
     bool profiling = profile && fi + 1 == folds;      // the last (warm) fold
     if (profiling) prof::start();
     auto f0 = clock();
-    for (int pass = 0; pass <= recycles; ++pass) {
-      if (pass > 0) {
-        CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
-        CK(cudaMemcpyAsync(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
-      }
+    // A recycle pass is ~1000 launches with identical shapes and pointers, so from the second pass on
+    // it replays as one CUDA graph, captured from that pass (the first has sized every scratch buffer)
+    auto recyclePass = [&]() {
+      CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      CK(cudaMemcpyAsync(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
       if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
+    };
+    cudaGraphExec_t trunkGraph = nullptr;
+    for (int pass = 0; pass <= recycles; ++pass) {
+      if (pass == 0) { if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none); continue; }
+      // (capturing and instantiating costs ~15 ms and a replayed pass saves ~2 ms at 68 tokens, more
+      // as the launches grow: a first fold breaks even at 7 recycles there - AF3's 10 gain 6 ms - and
+      // at 3 from ~200 tokens, so the graph is taken where it measured a gain)
+      if (!GRAPHS || STAGES || !(recycles >= 7 || t.n >= 200)) { recyclePass(); continue; }
+      if (!trunkGraph) {
+        cudaGraph_t g;
+        CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+        recyclePass();
+        CK(cudaStreamEndCapture(STREAM, &g));
+        CK(cudaGraphInstantiate(&trunkGraph, g, 0));
+        CK(cudaGraphDestroy(g));
+      }
+      CK(cudaGraphLaunch(trunkGraph, STREAM));
     }
+    if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below
