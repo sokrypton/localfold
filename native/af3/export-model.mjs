@@ -113,6 +113,38 @@ if (sequence !== "") {
   batch = batchFromDump(JSON.parse(readFileSync(batchPath, "utf8")));
 }
 add("batch", batch);
+// --template=<pdb or cif>:<chain>[@<query chain index>], comma-separated, one slot each (at most
+// four): built by the page's own buildTemplate, and the geometry features (distogram, pseudo-beta
+// mask, unit vectors, backbone mask) by the reference's templateGeometry.
+const templateSpecs = option("template", "").split(",").filter(Boolean);
+if (templateSpecs.length > 4) throw new Error("at most four template slots");
+if (templateSpecs.length > 0) {
+  const { buildTemplate } = await import(`${repo}/web/template-source.js`);
+  const { templateGeometry, multichainMaskFor, coverageOf } =
+    await import(`${repo}/src/af3/featurise/template-features.js`);
+  const chains = sequence.split(":");
+  templateSpecs.forEach((spec, k) => {
+    const [where, target = "0"] = spec.split("@");
+    const cut = where.lastIndexOf(":");
+    const path = where.slice(0, cut), chain = where.slice(cut + 1);
+    const index = Number(target);
+    const offset = Array.from(batch.asymId).indexOf(index + 1);
+    const built = buildTemplate({ text: readFileSync(path, "utf8"), chain, query: chains[index],
+                                  tokens: batch.tokens, offset, minConfidence: 0 });
+    const slot = built.slot;
+    const mask = multichainMaskFor(batch.asymId, batch.tokens,
+                                   { coverage: coverageOf(slot, batch.tokens), spanChains: false });
+    const g = templateGeometry(slot, mask, batch.tokens);
+    add(`template.${k}.aatype`, Int32Array.from(slot.aatype));
+    add(`template.${k}.distogram`, Float32Array.from(g.distogram));
+    add(`template.${k}.pseudoBetaMask2d`, g.pseudoBetaMask2d);
+    add(`template.${k}.unitVector`, g.unitVector);
+    add(`template.${k}.backboneMask2d`, g.backboneMask2d);
+    console.log(`template ${k}: ${path} chain ${chain} -> query chain ${index},`
+      + ` ${built.coverage.residues}/${built.coverage.of} residues`);
+  });
+  add("template.count", templateSpecs.length);
+}
 // The PDB's records as the page writes them (src/af3/fold.js toPdb: chains, HETATM ligands under
 // their codes, modified residues, CONECT), with each atom's dense slot as its x coordinate so the
 // native writer knows which coordinates go where.

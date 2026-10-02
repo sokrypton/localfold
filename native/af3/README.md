@@ -90,9 +90,17 @@ HETATM ligands under their codes, modified residues, CONECT, per-atom pLDDT. 6MR
 rms (A): GOL ligand **0.020**, SEP **0.051**, a DNA duplex's nucleic bonds **0.040**; protein
 mainchain 0.033-0.034 throughout.
 
+## Templates
+
+`--template=<pdb or cif>:<chain>[@<query chain>]` (comma-separated, up to four slots) builds each
+slot with the page's own `buildTemplate` and its geometry with the reference's `templateGeometry`;
+the trunk adds the distogram, masks and unit vectors per real slot and counts the empty ones.
+5CAJ from its sequence alone: 21.75 A, pLDDT 29.2; with its own crystal as a template **0.200 A**,
+pLDDT 94.7 (WebGPU AlphaFold 3: 0.281).
+
 ## Not ported yet
 
-Real templates (empty slots only), the other dialects (OpenDDE, boltz2, protenix2, IntelliFold-2,
+The other dialects (OpenDDE, boltz2, protenix2, IntelliFold-2,
 RoseTTAFold3 - each raises a named "not ported" error).
 
 ## Tried and not taken
