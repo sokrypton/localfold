@@ -67,10 +67,10 @@ port gives pLDDT 94.5, pTM 0.938 on the same inputs.
 
 | target | WebGPU first / warm (0 recycles) | native first / warm, 0 recycles | native warm, 3 recycles |
 |---|---|---|---|
-| 6MRR, 68 tokens | 5.1 s / 2.4 s | 0.57 s / **0.40 s** | 0.47 s |
-| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 0.88 s / **0.69 s** | 1.07 s |
-| 5CAJ x 2, 522 tokens, 512 rows | | 1.50 s / 1.31 s | 2.71 s |
-| 5CAJ x 4, 1044 tokens, no MSA | | 3.99 s / 3.84 s | 10.6 s |
+| 6MRR, 68 tokens | 5.1 s / 2.4 s | 0.57 s / **0.40 s** | 0.46 s |
+| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 0.88 s / **0.67 s** | 1.02 s |
+| 5CAJ x 2, 522 tokens, 512 rows | | 1.42 s / 1.25 s | 2.57 s |
+| 5CAJ x 4, 1044 tokens, no MSA | | 3.69 s / 3.54 s | 9.67 s |
 
 WebGPU with the developer flags (`fold.js --folds=2`); a stock-Chrome NVIDIA visitor gets
 about half its speed. A whole process - mapping model.bin, the CUDA context, target_feat, the
