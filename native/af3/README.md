@@ -33,6 +33,10 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + ev
 
 `--out=x.pdb`, or `--out=x.cif` for mmCIF as AlphaFold 3 writes it (entities, polymer sequences
 and chains declared, so AF3's own reader and gemmi both load it; the pLDDT in B_iso_or_equiv).
+`--af3-defaults` runs AlphaFold 3's own settings - 10 recycles (11 trunk passes) and 5 samples, as
+`run_alphafold.py` does - where the command sets neither; the plain defaults are the page's (3
+recycles, 1 sample). Warm, with them: 6MRR 0.73 s (trunk 197 ms, five samples' diffusion 489),
+261 tokens 2.69 s (1.20 + 1.20).
 `--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--seeds=a,b,c`
 (every seed, as AF3 runs a job's modelSeeds - a job's list is used when no seed is given; one trunk
 serves them all, its features not depending on the seed, and every (seed, sample) goes through the

@@ -18,6 +18,9 @@
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
+  // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
+  // 5 diffusion samples - where the command does not set them; the plain defaults are the page's
+  bool af3Defaults = false;
   uint64_t seed = 42; std::string out = "fold.pdb", weightsDir, seedsArg;
   bool waitInput = false;   // start up (CUDA, the weights on the device) while the input is still being exported
   std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
@@ -36,6 +39,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
+    else if (!strcmp(argv[i], "--af3-defaults")) af3Defaults = true;
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
     else if (!strncmp(argv[i], "--seeds=", 8)) seedsArg = argv[i] + 8;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
@@ -59,6 +63,15 @@ int main(int argc, char** argv) {
   if (!weightsDir.empty()) M.load(weightsDir);      // the weights exported once (--weights-only)
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;
+  if (af3Defaults) {
+    bool setR = false, setS = false;
+    for (int i = 2; i < argc; ++i) {
+      setR |= !strncmp(argv[i], "--recycles=", 11);
+      setS |= !strncmp(argv[i], "--samples=", 10);
+    }
+    if (!setR) recycles = 10;
+    if (!setS) samples = 5;
+  }
   const uint64_t seedArg = seed;
   const std::string seedsArg0 = seedsArg;
   std::vector<uint64_t> seedList;
