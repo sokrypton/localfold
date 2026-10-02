@@ -23,6 +23,10 @@
  * the stage boundary is where a caller wants to be able to look anyway.
  */
 import { GpuBufferAllocator, settleReleasedMemory } from "../../runtime/allocator.js";
+import { memoryTotals } from "../../runtime/device-memory.js";
+
+/** The largest tensor the distogram head reads back through one mapping. */
+const READBACK_PIECE_BYTES = 256 * 1048576;
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { Af3EmbedderGpu } from "./embedder-webgpu.js";
 import { Af3MsaStackGpu } from "./msa-stack-webgpu.js";
@@ -349,7 +353,21 @@ export class Af3TrunkGpu {
         encoder.copyBufferToBuffer(pair.buffer, 0, preMsa.buffer, 0, pairElements * 4);
         this.device.queue.submit([encoder.finish()]);
       }
-      await stage("msa-stack", () => new Af3MsaStackGpu(this.device, this.options).run(
+      // 🔴 FIVE PAIR-SIZED SCRATCH BUFFERS OR THREE AND A QUARTER, AND THE
+      // BUDGET DECIDES. The matrix-unit kernels need the whole-tensor layout
+      // (five), the vector ones run the grid by row chunks and the triangle by
+      // channel quarters (see `compact` in pair-track-gpu.js). IntelliFold-2 at
+      // 1000 residues peaked at 12.65 GB in this stage with 9.8 GB of it that
+      // scratch, where nothing after the trunk passes 7.4 GB - so where the
+      // whole layout would not fit, both stacks (they share one pool) take the
+      // lean one instead of refusing the fold. A device with no budget, or room
+      // to spare, keeps the matrix kernels.
+      const { residentBytes, budgetBytes } = memoryTotals(this.device);
+      const leanPair = options.leanPair ?? (budgetBytes != null
+        && residentBytes + 5 * pairElements * 4 + 512 * 1048576 > budgetBytes);
+      const trackOptions = leanPair ? { ...this.options, pairMatrixKernels: false } : this.options;
+      this.lastLeanPair = leanPair;
+      await stage("msa-stack", () => new Af3MsaStackGpu(this.device, trackOptions).run(
         { pairMask: input.pairMask, msaMask: input.msaMask, tokens, sequences: input.sequences },
         weights.msaBlocks, dialect,
         { ...options, stopAfterOpm: options.stopAfterOpm === true, scratchAllocator,
@@ -391,7 +409,7 @@ export class Af3TrunkGpu {
       const head = await this.#prepareDistogram(input.pairMask, tokens,
                                                 weights.distogram, input.contactClasses);
       owned.push(...head.allocations);
-      const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, this.options).run(
+      const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, trackOptions).run(
         { pairMask: input.pairMask, seqMask: input.seqMask, tokens },
         weights.pairformerBlocks, dialect, {
           ...options, scratchAllocator,
@@ -526,6 +544,10 @@ export class Af3TrunkGpu {
         ["single", singleAllocation, singleElements, wanted.single],
       ]) {
         if (!want) continue;
+        if (elements * 4 > READBACK_PIECE_BYTES) {
+          readback.push({ name, source, bytes: elements * 4, target: undefined });
+          continue;
+        }
         readback.push({ name, source, bytes: elements * 4,
           target: this.allocator.allocate("af3-disto.readback", elements * 4, mapRead) });
       }
@@ -542,22 +564,48 @@ export class Af3TrunkGpu {
       const groups = Math.ceil(pairs / 64);
       pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       pass.end();
-      for (const { source, target, bytes } of readback) {
+      const whole = readback.filter(({ target }) => target !== undefined);
+      for (const { source, target, bytes } of whole) {
         encoder.copyBufferToBuffer(source.buffer, 0, target.buffer, 0, bytes);
       }
       this.device.queue.submit([encoder.finish()]);
       const scope = this.device.popErrorScope();
-      await Promise.all(readback.map(({ target }) => target.buffer.mapAsync(GPUMapMode.READ)));
+      await Promise.all(whole.map(({ target }) => target.buffer.mapAsync(GPUMapMode.READ)));
       const error = await scope;
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
       const result = {};
-      for (const { name, target } of readback) {
+      for (const { name, target } of whole) {
         result[name] = new Float32Array(target.buffer.getMappedRange().slice(0));
         target.buffer.unmap();
       }
+      // 🔴 A LARGE TENSOR COMES BACK IN PIECES THROUGH ONE STAGING BUFFER.
+      // AlphaFold 3's pair at 2047 tokens is 2 GiB, and a mappable buffer that
+      // size failed in the driver ("Failed to allocate memory for buffer
+      // mapping") after the whole trunk had run - on a card with gigabytes
+      // free. The host array is the same; only the staging is cut up.
+      for (const { name, source, bytes, target } of readback) {
+        if (target !== undefined) continue;
+        const out = new Float32Array(bytes / 4);
+        const staging = this.allocator.allocate("af3-disto.readback-piece",
+          READBACK_PIECE_BYTES, mapRead);
+        try {
+          for (let offset = 0; offset < bytes; offset += READBACK_PIECE_BYTES) {
+            const size = Math.min(READBACK_PIECE_BYTES, bytes - offset);
+            const copy = this.device.createCommandEncoder({ label: "af3-disto.readback-piece" });
+            copy.copyBufferToBuffer(source.buffer, offset, staging.buffer, 0, size);
+            this.device.queue.submit([copy.finish()]);
+            await staging.buffer.mapAsync(GPUMapMode.READ, 0, size);
+            out.set(new Float32Array(staging.buffer.getMappedRange(0, size)), offset / 4);
+            staging.buffer.unmap();
+          }
+        } finally {
+          staging.release();
+        }
+        result[name] = out;
+      }
       return result;
       } finally {
-        for (const { target } of readback) target.release();
+        for (const { target } of readback) target?.release();
         logits.release();
         contact.release();
       }

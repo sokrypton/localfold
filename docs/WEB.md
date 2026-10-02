@@ -3906,3 +3906,62 @@ and a fold past it is now refused in seconds with the numbers, where OpenDDE at
 768 residues used to run ten minutes into "uncaptured: Binding size (3465222144)
 ...". Going past THAT needs the pair bound in windows or stored in f16 across
 the ~28 kernels that bind it whole (docs/AF2.md's binding-ceiling notes).
+
+### Past the T4's memory to the binding ceiling: a lean pair layout, a retry that double-ran blocks, and a host copy that cannot exist
+
+**Both models now fold to their binding ceiling under a T4's budget** (measured
+on this A100 with `--budget=12288`, which is 80% of a T4; random sequences,
+two diffusion steps, so the pLDDTs are not quality):
+
+| model | before | now | peak |
+|---|---|---|---|
+| IntelliFold-2 | 896 (1000 refused) | **1023** - the 2 GiB binding ceiling | 10.2 GB |
+| AlphaFold 3 | 1800 (2000 refused) | **2047** - the 2 GiB binding ceiling | 9.7 GB |
+
+Three changes, found in this order:
+
+1. **The trunk's scratch was five pair-sized buffers whenever the matrix-unit
+   kernels were on.** `probe-live-buffers.js` on IntelliFold-2 at 1000
+   residues: 12.65 GB peak, 9.8 GB of it `af3-msa.scratch0-4`, and nothing
+   after the trunk above 7.4 GB. The vector kernels already have a layout
+   that needs three and a quarter (the grid by row chunks, the triangle by
+   channel quarters - `compact` in pair-track-gpu.js), but the matrix
+   projections and attend need whole tensors, so it was never taken where
+   they run (developer flags, and the Colab runtime). The trunk now takes
+   the lean layout for both stacks (they share one pool) when
+   `resident + 5 pair + 512 MiB` would cross the budget: **12.65 -> 9.8 GB at
+   1000 residues**, pLDDT 33.2662 against 33.2670. It costs the matrix units:
+   the pairformer is **94 s at 1023 against 40 s at 1000** on the A100. A
+   device with no budget, or room, is unchanged - `test:stock` 8 of 8.
+   `fold.js --lean-pair=on|off` forces either.
+
+2. 🔴 **THE PAIRFORMER'S RESIDENCY RETRY APPLIED BLOCKS TWICE.** When the
+   budget refuses a resident weight partway through the stack, `run()`
+   abandons it and starts again uploading per block - from block 0. But the
+   trunk hands the stack its own pair and single (`pairBuffer`), updated in
+   place, so the blocks already submitted ran a second time. **IntelliFold-2
+   at 1000 residues gave pLDDT 78.7 under a 12 GB budget and 33.3 without
+   one**, no error anywhere; at 68 tokens the two were identical because
+   nothing was refused. A block submits only once fully encoded, so the
+   retry now resumes at the refused block: **33.266156422049974 both ways,
+   bit-identical.** The diffusion transformer's retry had the same shape (the
+   chained `head.act` is updated per super-block); its activation is a few
+   MiB, so it is copied aside before the call when a refusal is possible and
+   put back before the retry. Any T4 fold large enough to lose residency
+   mid-stack before this was affected - including the 1800/896 rows in the
+   section above, which were taken before the fix.
+
+3. **AlphaFold 3 at 2047 died after the trunk, twice, on the HOST copy of
+   the pair.** It is 2 GiB: first "Failed to allocate memory for buffer
+   mapping" on the readback, then, read back in 256 MiB pieces, "RangeError:
+   Array buffer allocation failed" on the Float32Array itself. Nothing
+   needed it - the sampler and the confidence head bind the trunk's device
+   copy - so past 1 GiB (`HOST_PAIR_MAX_BYTES` in fold.js; AF3 past 1448
+   tokens, IntelliFold-2 past 724) it is not made, unless RoseTTAFold3's
+   confidence global norm, OpenDDE's expander, the recycle diagnostics or an
+   oracle asks. Such a trunk is not offered for resumption (`reusable` is
+   undefined), since resuming uploads it. The piecewise readback stays for
+   the cases that still read one.
+
+Past this, every NVIDIA card stops at the binding ceiling, and that needs the
+pair bound in windows or stored narrower across the kernels that bind it whole.

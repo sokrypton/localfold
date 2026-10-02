@@ -27,6 +27,8 @@
  */
 /** A fold whose largest pair tensor is this size or more releases its weights. */
 const WEIGHT_RELEASE_MIN_BYTES = 64 * 1024 * 1024;
+/** The largest trunk pair copied to the host when nothing needs it there. */
+const HOST_PAIR_MAX_BYTES = 1024 * 1024 * 1024;
 import { ELEMENT_SYMBOLS } from "./featurise/ccd-component.js";
 import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
   from "./feature-convergence.js";
@@ -1108,6 +1110,20 @@ async function foldHolding(device, batch, weights, options, held) {
   // both consumers upload from the host as they always did.
   const keepFinalPair = true;
   let finalPair;
+  // 🔴 AND PAST A GIGABYTE THE HOST COPY IS NOT MADE AT ALL, unless something
+  // can only read a host array. AlphaFold 3's pair at 2047 tokens is 2 GiB:
+  // the browser refused the mappable buffer for it ("Failed to allocate memory
+  // for buffer mapping") and then the Float32Array itself ("Array buffer
+  // allocation failed"), each after a whole trunk had run - and the sampler
+  // and the confidence head bind the device copy anyway. What does need the
+  // host array: RoseTTAFold3's confidence global norm, OpenDDE's expander,
+  // the recycle diagnostics and the oracle's seams. A trunk without it is not
+  // offered for resumption, since resuming uploads it.
+  const hostPairWanted = tokens * tokens * trunkPairChannels * 4 <= HOST_PAIR_MAX_BYTES
+    || weights.trunk.dialect.structuralTokens === true
+    || weights.trunk.dialect.confidenceGlobalNorm === true
+    || (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true
+    || options.recycleDistances === true || options.onSeam !== undefined;
   const readEveryPass = (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true
     || options.recycleDistances === true;
   void trunkPairChannels; void trunkSingleChannels;
@@ -1192,7 +1208,7 @@ async function foldHolding(device, batch, weights, options, held) {
       // or a caller that says so (`trunkLogits`). They were read on every last
       // pass - `L^2 * 64` floats, 16.6 MB at 255 tokens and 256 MB at 1000 -
       // for a fold that uses the contact map computed beside them.
-      readback: { pair: readAll, single: readAll,
+      readback: { pair: readAll && hostPairWanted, single: readAll,
                   logits: options.trunkLogits === true || featureTolerance > 0
                     || options.recycleDistances === true },
       onStage: (name, ms) => stage("trunk", { name, ms }),
@@ -1203,6 +1219,9 @@ async function foldHolding(device, batch, weights, options, held) {
       // ...the MSA stack's first-half stop point, for bisecting one block
       // against the oracle. See src/af3/trunk/msa-stack-webgpu.js.
       ...(options.stopAfterOpm === true ? { stopAfterOpm: true } : {}),
+      // ...and the pair track's scratch layout, which the budget decides unless
+      // a caller forces it (the control arm; see trunk-webgpu.js).
+      ...(options.leanPair === undefined ? {} : { leanPair: options.leanPair }),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
       // Four of the trunk's five stages report nothing while they run, and on a
       // large protein each is seconds. See af3TrunkStageSpans.
@@ -1302,7 +1321,8 @@ async function foldHolding(device, batch, weights, options, held) {
   // retrying re-ran every pass of work that had already succeeded. The loop
   // above has finished by here, so this carries all the recycles that were
   // asked for.
-  stage("trunk-done", { trunk, reusable: { trunk, targetFeat, recycles } });
+  stage("trunk-done", { trunk,
+    reusable: trunk.pair === undefined ? undefined : { trunk, targetFeat, recycles } });
 
   // 🔴 AND THE PAIRFORMER'S WEIGHTS GO BACK HERE, for the same reason the
   // diffusion transformer's go back below: the stage that can read them is
@@ -1778,7 +1798,7 @@ async function foldHolding(device, batch, weights, options, held) {
     chainPtm, chainIptm,
     // What a caller hands back to skip the trunk next time. Returned even when
     // it was reused, so the cache survives a chain of re-samples.
-    reusable: { trunk, targetFeat, recycles },
+    reusable: trunk.pair === undefined ? undefined : { trunk, targetFeat, recycles },
     meanPlddt, atoms, scores,
     // Per RESIDUE, from the alpha carbon - which is what pLDDT means when it is
     // shown on a cartoon, and what a per-residue check has to compare against.

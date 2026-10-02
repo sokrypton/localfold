@@ -733,6 +733,10 @@ export async function main(device, args) {
     recycleDistances: args.includes("--recycle-distances"),
     // ...and the pair/single deltas, which need every pass read back to the host.
     recycleDeltas: args.includes("--recycle-deltas"),
+    // The pair track's scratch layout: `on` forces the lean one (vector
+    // kernels, three and a quarter pair-sized buffers), `off` the matrix one;
+    // omitted, the device's budget decides. See trunk-webgpu.js.
+    leanPair: { on: true, off: false }[option(args, "lean-pair", "")],
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     // The trunk's intermediate seams, compared as they are produced.

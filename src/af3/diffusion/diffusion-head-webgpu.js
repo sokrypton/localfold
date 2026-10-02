@@ -646,7 +646,7 @@ export class Af3DiffusionHeadGpu {
     // handed in, exactly as the cache below hands back the one this module
     // computed. Nothing else changes: from here on it IS the pair conditioning.
     const cachedPair = input.pairConditioning ?? (
-      this.#conditioningPair?.trunkPair === input.trunkPair
+      this.#conditioningPair?.trunkPair === (input.trunkPair ?? input.trunkPairBuffer)
         && this.#conditioningPair?.tokens === tokens
         ? this.#conditioningPair.pair : undefined);
 
@@ -719,7 +719,10 @@ export class Af3DiffusionHeadGpu {
       this.#encoderStatic = undefined;
       this.#releasePersistent();
     }
-    this.#conditioningPair = { trunkPair: input.trunkPair, tokens, pair: cond.pair };
+    // Keyed on the host array, or on the trunk's device buffer when a pair too
+    // large for the host never got one (see HOST_PAIR_MAX_BYTES in fold.js).
+    this.#conditioningPair = { trunkPair: input.trunkPair ?? input.trunkPairBuffer,
+                               tokens, pair: cond.pair };
 
     // 🔴 MASKED AND RESCALED - see the note at the top.
     const scaled = new Float32Array(tokens * dense * 3);
