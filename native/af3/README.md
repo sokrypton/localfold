@@ -14,8 +14,12 @@ native/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
 
 `--search` gets the protein chains' alignments from the ColabFold MMseqs2 server - the page's own
 client and merge, the paired block included for a complex - instead of an A3M: barnase-barstar
-folds to 0.647 A (ipTM 0.93) from its two sequences, against 16.7 A without, the search 4.0 s. It
-sends the sequences to api.colabfold.com, so it is a flag, never a default.
+folds to 0.647 A (ipTM 0.93) from its two sequences, against 16.7 A without, the search 4.0 s.
+`--search-templates` adds the templates from the same search: each protein chain's best four hits,
+fetched as mmCIF and aligned by the page's `buildTemplate`, every chain's k-th in slot k as AF3
+does (5CAJ: its own chain B found, 1.864 A with the alignment - a crystal template beside a deep
+alignment moves this target little: chain A by hand gives 1.836, and 0.289 without the alignment).
+Both send the sequences to api.colabfold.com, so they are flags, never defaults.
 
 `fold` builds `af3` if it is missing, exports the weights once (`native/af3/weights`, from the
 bundle on disk - no server), featurises the input with the repository's own featuriser into a

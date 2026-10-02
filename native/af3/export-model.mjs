@@ -142,6 +142,7 @@ if (!weightsOnly) {
 // batch dump.
 let sequence = option("sequence", "");
 let jobRequest = null;
+let searchedHits = null, searchedProteinAt = null;   // --search's template hits, by protein chain
 let jobUserCcd = null;                  // the job's own component definitions (userCCD), mmCIF
 if (option("job", "") !== "") {
   if (sequence !== "") throw new Error("--job and --sequence both name the input");
@@ -216,7 +217,7 @@ if (sequence !== "") {
   // --search: the protein chains' alignments from the ColabFold MMseqs2 server, through the page's
   // own client and merge (src/input/mmseqs2-api.js) - AF3's data pipeline step, as the page runs it;
   // it sends the sequences to api.colabfold.com, so it is asked for, never assumed
-  if (args.includes("--search")) {
+  if (args.includes("--search") || args.includes("--search-templates")) {
     if (alignment !== null) throw new Error("--search and an alignment both name the MSA");
     const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import(`${repo}/src/input/mmseqs2-api.js`);
     const allChains = sequence.split(":");
@@ -227,10 +228,15 @@ if (sequence !== "") {
     if (proteins.length === 0) throw new Error("--search: no protein chain to search for");
     const t0 = performance.now();
     if (proteins.length === 1) {
-      alignment = (await generateMmseqs2Msa(proteins[0], {})).a3m;
+      const searched = await generateMmseqs2Msa(proteins[0], {});
+      alignment = searched.a3m;
+      searchedHits = searched.templateHits;
     } else {
-      alignment = (await generateMmseqs2ComplexMsa(proteins, { model: "af3" })).blocks;
+      const searched = await generateMmseqs2ComplexMsa(proteins, { model: "af3" });
+      alignment = searched.blocks;
+      searchedHits = searched.templateHits;
     }
+    searchedProteinAt = allKinds.flatMap((kind, i) => (kind === "protein" ? [i] : []));
     console.log(`search: ${proteins.length} protein chain(s) from api.colabfold.com in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
   }
   // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna
@@ -359,16 +365,43 @@ if (templateSpecs.length > 0) {
                                                { coverage: coverageOf(slot, batch.tokens), spanChains }) });
   });
 }
-// ...and a job's own templates (it used to ignore them, folding with none and saying nothing): each
-// chain's uploaded template, built by the page's buildTemplate (its queryIndices / templateIndices
-// mapping when the job gives one), all chains' in ONE slot as AF3 puts every chain's first template
-// in slot 0, the cross-chain block masked (AF3's template embedder pairs residues of one chain only).
-// A template SEARCH (useStructureTemplate) is refused: there is no search here.
+// Template slots built from structures this run was handed rather than given on the command line:
+// a job's own templates and --search-templates' hits. Each part by the page's buildTemplate, every
+// chain's k-th in slot k as AF3 puts them, the cross-chain block masked (AF3's template embedder pairs
+// residues of one chain only).
+const extraSlotParts = [];               // [slot k][part] = {text, chainId, chain, mapping}
+// ...a job's own templates (it used to ignore them, folding with none and saying nothing) - their
+// queryIndices / templateIndices mapping when the job gives one; a template SEARCH (useStructureTemplate)
+// in a job is refused: --search-templates is how this exporter searches
 if ((jobRequest?.templates ?? []).length > 0) {
   if (templateSpecs.length > 0) throw new Error("the job carries its templates; --template would replace them");
   const search = jobRequest.templates.find((t) => t.kind !== "upload");
-  if (search) throw new Error(`chain ${search.chain}: the job asks for a template search, which this exporter does not run`
-    + " - give the structure with --template=<file>:<chain>@<query chain>");
+  if (search) throw new Error(`chain ${search.chain}: the job asks for a template search - run with --search-templates,`
+    + " or give the structure with --template=<file>:<chain>@<query chain>");
+  extraSlotParts.push(jobRequest.templates.map((t) => ({ text: t.text, chainId: t.chainId, chain: t.chain,
+                                                          mapping: t.mapping, label: "job template" })));
+}
+// ...--search-templates: each protein chain's best four hits from the same MMseqs2 search, fetched
+// from the server as the page fetches its one
+if (args.includes("--search-templates")) {
+  if (templateSpecs.length > 0 || extraSlotParts.length > 0) throw new Error("--search-templates and other templates both name the slots");
+  const { fetchMmseqs2Templates } = await import(`${repo}/src/input/mmseqs2-api.js`);
+  const perChain = [...(searchedHits ?? new Map())].map(([at, found]) => [searchedProteinAt[at] ?? at, found.slice(0, TEMPLATES)]);
+  const structures = await fetchMmseqs2Templates(perChain.flatMap(([, found]) => found.map((hit) => hit.target)));
+  for (let k = 0; k < TEMPLATES; k += 1) {
+    const parts = [];
+    for (const [chain, found] of perChain) {
+      const hit = found[k];
+      if (hit === undefined) continue;
+      const text = structures.get(hit.id);
+      if (text === undefined) throw new Error(`no structure came back for ${hit.target}`);
+      parts.push({ text, chainId: hit.chain, chain, label: `search hit ${hit.target}` });
+    }
+    if (parts.length > 0) extraSlotParts.push(parts);
+  }
+  if (extraSlotParts.length === 0) console.log("search: no template hits");
+}
+if (extraSlotParts.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);
   const { mergeTemplateSlots } = await import(`${repo}/src/af3/featurise/template-input.js`);
   const chains = sequence.split(":");
@@ -378,19 +411,21 @@ if ((jobRequest?.templates ?? []).length > 0) {
   });
   const residuesOfChain = [];
   Array.from(batch.chainOfResidue).forEach((chain, residue) => (residuesOfChain[chain] ??= []).push(residue));
-  const parts = jobRequest.templates.map((t) => {
-    const built = buildTemplate({
-      text: t.text, chain: t.chainId, query: chains[t.chain], tokens: batch.tokens, minConfidence: 0,
-      ...(t.mapping === undefined ? {} : { mapping: t.mapping }),
-      tokenOf: (residue) => tokenOfResidue[(residuesOfChain[t.chain] ?? [])[residue] ?? -1] ?? -1,
+  extraSlotParts.forEach((partsOfSlot, k) => {
+    const parts = partsOfSlot.map((t) => {
+      const built = buildTemplate({
+        text: t.text, chain: t.chainId, query: chains[t.chain], tokens: batch.tokens, minConfidence: 0,
+        ...(t.mapping === undefined ? {} : { mapping: t.mapping }),
+        tokenOf: (residue) => tokenOfResidue[(residuesOfChain[t.chain] ?? [])[residue] ?? -1] ?? -1,
+      });
+      console.log(`template ${k}: ${t.label} -> query chain ${t.chain}, ${built.coverage.residues}/${built.coverage.of} residues`
+        + (t.mapping ? " (the job's mapping)" : ""));
+      return built.slot;
     });
-    console.log(`job template -> query chain ${t.chain}: ${built.coverage.residues}/${built.coverage.of} residues`
-      + (t.mapping ? " (the job's mapping)" : ""));
-    return built.slot;
+    const slot = parts.length === 1 ? parts[0] : mergeTemplateSlots(parts);
+    slots.push({ slot, mask: multichainMaskFor(batch.asymId, batch.tokens,
+                                               { coverage: coverageOf(slot, batch.tokens), spanChains: false }) });
   });
-  const slot = parts.length === 1 ? parts[0] : mergeTemplateSlots(parts);
-  slots.push({ slot, mask: multichainMaskFor(batch.asymId, batch.tokens,
-                                             { coverage: coverageOf(slot, batch.tokens), spanChains: false }) });
 }
 // rf3's chirality term reads the stereocentres - four dense atom slots and an ideal improper
 // dihedral each - as the page's fold does (src/af3/fold.js)
