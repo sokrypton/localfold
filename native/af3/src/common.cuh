@@ -96,7 +96,8 @@ inline void unreadWeights() {
   for (auto& [name, e] : M.index) {
     if (e.kind == 'm' || M.touched.count(name)) continue;
     if (name.rfind("trunk.", 0) && name.rfind("diffusion.", 0) && name.rfind("confidence.", 0) &&
-        name.rfind("targetFeat.", 0) && name.rfind("atomReference.", 0)) continue;
+        name.rfind("targetFeat.", 0) && name.rfind("atomReference.", 0) && name.rfind("expander.", 0) &&
+        name.rfind("refiner.", 0) && name.rfind("ddeConfidence.", 0)) continue;
     std::string f; bool digit = false;
     for (char c : name) { if (isdigit((unsigned char)c)) { if (!digit) f += 'N'; digit = true; } else { f += c; digit = false; } }
     ++families[f];
@@ -202,11 +203,11 @@ inline const half* Wh(const std::string& k) {
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(f, h, n);
   return WH[k] = h;
 }
+inline std::map<std::string, int*> IDEV;
 inline const int* Idev(const std::string& k) {
-  static std::map<std::string, int*> cache;
-  auto it = cache.find(k);
-  if (it != cache.end()) return it->second;
-  return cache[k] = (int*)M.dev(k);
+  auto it = IDEV.find(k);
+  if (it != IDEV.end()) return it->second;
+  return IDEV[k] = (int*)M.dev(k);
 }
 inline const float* Fdev(const std::string& k) {     // non-weight float inputs (batch fields)
   return W(k);

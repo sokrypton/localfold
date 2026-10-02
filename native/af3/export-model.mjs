@@ -37,7 +37,7 @@ const bundle = /^https?:/.test(bundleArg) ? bundleArg : new URL(`file://${bundle
 // af3-oracle-{trunk,denoise,confidence}-<name>.json) - with its bundle (--bundle)
 const oracleModel = option("oracle-model", "alphafold3");
 const batchPath = option("batch", `${repo}/oracle-dumps/af3-batch-${oracleModel}-6mrr.json`);
-const oracles = (option("oracles", option("sequence", "") === "" && option("job", "") === "" ? "trunk,denoise,stages,realdenoise,confidence" : ""))
+const oracles = (option("oracles", option("sequence", "") === "" && option("job", "") === "" ? "trunk,denoise,stages,structural,realdenoise,confidence" : ""))
   .split(",").filter(Boolean);
 
 const { openAf3Store, trunkWeights, trunkDepths, confidenceWeights } =
@@ -92,7 +92,16 @@ if (noWeights) {
   dialect = trunk.dialect;
   add("trunk", trunk);
   add("diffusion", await diffusionWeights(store));
-  add("confidence", await confidenceWeights(store));
+  if (trunk.dialect.structuralTokens) {
+    // OpenDDE: the structural-token expander, its refiner and its own confidence head
+    const { structuralExpanderWeights, structuralRefinerWeights, openddeConfidenceWeights } =
+      await import(`${repo}/src/af3/weights/weights.js`);
+    add("expander", await structuralExpanderWeights(store));
+    add("refiner", { blocks: await structuralRefinerWeights(store) });
+    add("ddeConfidence", await openddeConfidenceWeights(store));
+  } else {
+    add("confidence", await confidenceWeights(store));
+  }
   add("targetFeat", await targetFeatureWeights(store));
   add("atomReference", await atomReference(store));
 }
@@ -200,6 +209,27 @@ if (sequence !== "") {
   batch = batchFromDump(JSON.parse(readFileSync(batchPath, "utf8")));
 }
 add("batch", batch);
+// OpenDDE's second token space: after the trunk each standard residue becomes a backbone and a
+// sidechain token, and the diffusion and its confidence head run on those (src/af3/fold.js)
+if (dialect.structuralTokens) {
+  const { structuralLayout, structuralBatch } = await import(`${repo}/src/af3/featurise/structural-tokens.js`);
+  const { structuralPairFeatures } = await import(`${repo}/src/af3/structure/structural-expander-reference.js`);
+  const layout = structuralLayout(batch);
+  const sb = structuralBatch(batch, layout);
+  const features = structuralPairFeatures(layout, batch.asymId);
+  const keep = ["tokens", "dense", "subsets", "atomCount", "shape", "aatype", "residueIndex", "tokenIndex", "asymId",
+    "entityId", "symId", "seqMask", "refPos", "refMask", "refElement", "refCharge", "refAtomNameChars", "refSpaceUid",
+    "predDenseAtomMask", "bondMatrix", "residueOfToken", "tokenAtomsToQueries", "queriesToTokenAtoms", "queriesToKeys",
+    "tokensToQueries", "tokensToKeys", "tokenAtomsToPseudoBeta", "features"];
+  add("sbatch", Object.fromEntries(keep.map((k) => [k, sb[k]])));
+  add("structural.parent", Int32Array.from(layout.parent));
+  add("structural.role", Int32Array.from(layout.role));
+  add("structural.residueAtomGather", Int32Array.from(layout.residueAtomGather));
+  add("structural.residueRepToken", Int32Array.from(layout.residueRepToken));
+  for (const k of ["sameParent", "twin", "prevBackbone", "nextBackbone", "rolePairType"]) {
+    add(`structural.${k}`, Int32Array.from(features[k]));
+  }
+}
 // --template=<pdb or cif>:<chain>[@<query chain index>], comma-separated, one slot each (at most
 // four); parts joined by "+" share ONE slot, as AF3 puts each chain's k-th template in slot k -
 // e.g. 1brs.pdb:A@0+1brs.pdb:D@1 - and that merged slot may speak across the chains it covers

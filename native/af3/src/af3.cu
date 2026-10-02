@@ -9,6 +9,7 @@
 #include "diffusion.cuh"
 #include "sampler.cuh"
 #include "confidence.cuh"
+#include "structural.cuh"
 #include "benchops.cuh"
 #include "profile.cuh"
 
@@ -85,7 +86,28 @@ int main(int argc, char** argv) {
   }
 
   // The confidence head on AF3's own inputs, against AF3's own outputs.
-  if (M.has("oracle.confidence.stages.out.full_pae") && !getenv("SKIP_CONFIDENCE_ORACLE")) {
+  if (M.has("oracle.confidence.stages.out.full_pae") && M.flag("trunk.dialect.structuralTokens")
+      && !getenv("SKIP_CONFIDENCE_ORACLE")) {
+    // OpenDDE's own head, on the dump's own (synthesised) inputs - token-agnostic, no extra bias
+    const std::string I = "oracle.confidence.stages.in.";
+    int n = (int)M.meta("oracle.confidence.tokens"), dense = (int)M.meta("oracle.confidence.slots");
+    float* pair = upload(M.f(I + "pair"), M.len(I + "pair"));
+    float* single = upload(M.f(I + "single"), M.len(I + "single"));
+    float* tf = upload(M.f(I + "targetFeat"), M.len(I + "targetFeat"));
+    std::vector<float> hc(M.f(I + "coordinates"), M.f(I + "coordinates") + M.len(I + "coordinates"));
+    float* coords = upload(hc.data(), hc.size());
+    std::vector<float> seq(M.f(I + "seqMask"), M.f(I + "seqMask") + n), pm((size_t)n * n);
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) pm[(size_t)i * n + j] = seq[i] * seq[j];
+    float* seqm = upload(seq.data(), n); float* pairm = upload(pm.data(), pm.size());
+    DdeConfidence c = ddeConfidence(pair, single, tf, coords, seqm, pairm, nullptr, n, dense, n);
+    auto cmp = [&](const char* label, const std::vector<float>& mine, const std::string& o) {
+      if (!M.has(o) || M.len(o) != mine.size()) { printf("  %-24s (no oracle)\n", label); return; }
+      printf("  %-24s relRMS %.3e\n", label, relRms(mine.data(), M.f(o), mine.size()));
+    };
+    cmp("confidence pLDDT", c.plddt, "oracle.confidence.stages.out.predicted_lddt");
+    cmp("confidence PAE", c.pae, "oracle.confidence.stages.out.full_pae");
+    cmp("confidence PDE", c.pde, "oracle.confidence.stages.out.full_pde");
+  } else if (M.has("oracle.confidence.stages.out.full_pae") && !getenv("SKIP_CONFIDENCE_ORACLE")) {
     int n = (int)M.meta("batch.tokens");
     const std::string I = "oracle.confidence.stages.in.";
     float* pair = upload(M.f(I + "pair"), M.len(I + "pair"));
@@ -113,6 +135,18 @@ int main(int argc, char** argv) {
     }
     cmp("confidence PAE", c.pae, "oracle.confidence.stages.out.full_pae");
     cmp("confidence PDE", c.pde, "oracle.confidence.stages.out.full_pde");
+  }
+
+  // OpenDDE's expander and refiner on the structural oracle's own residue-level inputs
+  if (M.has("oracle.structural.stages.in.single") && M.flag("trunk.dialect.structuralTokens")) {
+    const std::string I = "oracle.structural.stages.in.";
+    int nRes = (int)M.meta(I + "single.shape0");
+    float* single = upload(M.f(I + "single"), M.len(I + "single"));
+    float* pair = upload(M.f(I + "pair"), M.len(I + "pair"));
+    float* tf = upload(M.f(I + "targetFeat"), M.len(I + "targetFeat"));
+    printf("structural stage on the oracle's inputs:\n");
+    Structural s = expandStructural(single, pair, tf, nRes, false);
+    for (float* p : {s.single, s.pair, s.targetFeat, s.bias, s.seqMask, s.pairMask, single, pair, tf}) CK(cudaFree(p));
   }
 
   // target_feat from the batch: per-atom conditioning and the atom cross-attention encoder.
@@ -157,12 +191,23 @@ int main(int argc, char** argv) {
       for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);
       STAGE_MS.clear();
     }
+    // OpenDDE: the expander and refiner, then everything after runs on the structural tokens
+    bool structural = M.flag("trunk.dialect.structuralTokens");
+    Structural st;
+    const float *dS = t.single, *dP = t.pair, *dTf = t.targetFeat, *dSeq = t.seqMask;
+    int nD = t.n;
+    std::vector<int> resAsym(M.i("batch.asymId"), M.i("batch.asymId") + t.n);
+    if (structural) {
+      st = expandStructural(t.single, t.pair, t.targetFeat, t.n, fast);
+      swapBatch();
+      dS = st.single; dP = st.pair; dTf = st.targetFeat; dSeq = st.seqMask; nD = st.n;
+    }
     int dense = (int)M.meta("batch.dense");
-    std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)t.n * dense);
+    std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)nD * dense);
     // a large input gives each phase the whole card (a pair over 1 GB: about 1450 tokens)
     bool tight = pairs * t.C * 4 > ((size_t)1 << 30);
     if (tight) releaseScratch();
-    DiffusionFold df = prepareDiffusion(t.single, t.pair, t.targetFeat, t.seqMask, t.n);
+    DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
     // --samples=N: N diffusion samples off one trunk (AF3 runs five), each through the confidence
     // head and ranked by AF3's ranking score without its disorder and clash terms - 0.8 ipTM +
     // 0.2 pTM, or pTM for one chain. The samples run as one batch through the denoiser, sample k
@@ -181,18 +226,61 @@ int main(int argc, char** argv) {
     diffMs = ms(s0, clock());
     if (tight) releaseScratch();
     size_t atoms3 = mask.size() * 3;
+    // the confidence head reads the pseudo-beta of the token space it runs in
+    std::vector<int> pbIdx(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
+    std::vector<float> pbMask(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
+    if (structural) swapBatch();     // back to the residues, for the confidence's layout and the structure
     for (int k = 0; k < samples; ++k) {
       std::vector<float> xk(xs.begin() + k * atoms3, xs.begin() + (k + 1) * atoms3);
       auto s1 = clock();
       // pseudo-beta off the structure, then the confidence head
-      std::vector<float> beta((size_t)t.n * 3);
-      const int* pbIdx = M.i("batch.tokenAtomsToPseudoBeta.indices"); const float* pbMask = M.f("batch.tokenAtomsToPseudoBeta.mask");
+      std::vector<float> beta((size_t)nD * 3);
       // rf3's head reads the token-centre CA (dense slot 1), not the pseudo-beta
       bool ca = M.flag("trunk.dialect.confidenceCaDgram");
-      for (int r = 0; r < t.n; ++r) for (int a = 0; a < 3; ++a)
+      for (int r = 0; r < nD; ++r) for (int a = 0; a < 3; ++a)
         beta[r * 3 + a] = ca ? xk[((size_t)r * dense + 1) * 3 + a] : pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
       float* dBeta = upload(beta.data(), beta.size());
-      ConfidenceOut ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
+      ConfidenceOut ck;
+      if (structural) {
+        // OpenDDE's own head on the structural tokens, mapped back: atoms through residueAtomGather,
+        // pairs through each residue's representative (backbone) subtoken
+        DdeConfidence dc = ddeConfidence(st.pair, st.single, st.targetFeat, dBeta, st.seqMask, st.pairMask, st.bias,
+                                         nD, dense, t.n);
+        const int* gather = M.i("structural.residueAtomGather"); const int* rep = M.i("structural.residueRepToken");
+        std::vector<float> xr((size_t)t.n * dense * 3, 0.f);
+        ck.plddt.assign((size_t)t.n * dense, 0.f);
+        for (size_t a = 0; a < (size_t)t.n * dense; ++a) {
+          if (gather[a] < 0) continue;
+          for (int d = 0; d < 3; ++d) xr[a * 3 + d] = xk[(size_t)gather[a] * 3 + d];
+          ck.plddt[a] = dc.plddt[gather[a]];
+        }
+        xk = std::move(xr);
+        ck.pae.resize((size_t)t.n * t.n); ck.pde.resize((size_t)t.n * t.n);
+        std::vector<float> term((size_t)t.n * t.n);
+        for (int i = 0; i < t.n; ++i) for (int j = 0; j < t.n; ++j) {
+          size_t from = (size_t)rep[i] * nD + rep[j], to = (size_t)i * t.n + j;
+          ck.pae[to] = dc.pae[from]; ck.pde[to] = dc.pde[from]; term[to] = dc.tmTerm[from];
+        }
+        auto reduce = [&](bool interOnly) {
+          double bestTm = -1e30; bool any = false;
+          for (int i = 0; i < t.n; ++i) {
+            double tot = 0; int cnt = 0;
+            for (int j = 0; j < t.n; ++j) {
+              if (interOnly && resAsym[i] == resAsym[j]) continue;
+              tot += term[(size_t)i * t.n + j]; ++cnt;
+            }
+            if (cnt) { any = true; bestTm = std::max(bestTm, tot / cnt); }
+          }
+          return any ? bestTm : NAN;
+        };
+        ck.ptm = reduce(false); ck.iptm = reduce(true);
+        const float* am = M.f("batch.refMask");
+        double sum = 0, count = 0;
+        for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
+        ck.meanPlddt = sum / std::max(count, 1.0);
+      } else {
+        ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
+      }
       CK(cudaFree(dBeta));
       confMs += ms(s1, clock());
       double score = std::isnan(ck.iptm) ? ck.ptm : 0.8 * ck.iptm + 0.2 * ck.ptm;
@@ -206,6 +294,9 @@ int main(int argc, char** argv) {
       }
       if (!std::isfinite(score)) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", k, score); exit(1); }
       if (score > bestScore) { bestScore = score; best = k; conf = std::move(ck); x = std::move(xk); }
+    }
+    if (structural) {
+      for (float* p : {st.single, st.pair, st.targetFeat, st.bias, st.seqMask, st.pairMask}) CK(cudaFree(p));
     }
     auto f2 = clock();
     auto f3 = f2;

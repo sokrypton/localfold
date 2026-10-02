@@ -115,8 +115,15 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   const std::string E = "trunk.embedder.";
   float* left = scratch<float>("emb.left", (size_t)n * C);
   float* right = scratch<float>("emb.right", (size_t)n * C);
-  linear<float, float>(t.targetFeat, left, n, t.F, C, E + "leftSingle");
-  linear<float, float>(t.targetFeat, right, n, t.F, C, E + "rightSingle");
+  // the pair from target_feat (AF3), or from s_init = target_feat's single projection (OpenDDE)
+  const float* pairSource = t.targetFeat; int sourceWidth = t.F;
+  if (M.flag("trunk.dialect.pairInitFromSingle")) {
+    float* sInit = scratch<float>("emb.sInit", (size_t)n * t.Cs);
+    linear<float, float>(t.targetFeat, sInit, n, t.F, t.Cs, E + "singleActivations");
+    pairSource = sInit; sourceWidth = t.Cs;
+  }
+  linear<float, float>(pairSource, left, n, sourceWidth, C, E + "leftSingle");
+  linear<float, float>(pairSource, right, n, sourceWidth, C, E + "rightSingle");
   outerSumK<<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C);
   onSeam("z_before_prev", t.pair, pairs * C);
   // the recycled pair: LayerNorm then projection, which is NOT zero on the first pass
@@ -480,9 +487,14 @@ __global__ void gateK(T* o, const T* qkvg, int n, int Wd) {
   size_t i = t / Wd; int c = (int)(t % Wd);
   o[t] = fromF<T>(toF(o[t]) * sigm(toF(qkvg[i * 4 * Wd + 3 * Wd + c])));
 }
+// OpenDDE's refiner and confidence blocks add one precomputed [i][j] bias to every head's logits
+__global__ void addBiasHeadsK(float* pl, const float* bias, size_t pairs, int heads) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < pairs * heads) pl[t] += bias[t % pairs];
+}
 template <class T>
 void singleTrack(float* single, const float* pair, const float* seqMask, int n, int C, int Cs,
-                 const std::string& B) {
+                 const std::string& B, const float* extraBias = nullptr) {
   size_t pairs = (size_t)n * n;
   std::string A = B + ".singleAttention";
   int heads = (int)M.meta(A + ".heads"), d = (int)M.meta(A + ".dimension"), Wd = heads * d;
@@ -505,6 +517,7 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
     }
     logitsLayoutK<<<blocks(pairs * heads), 256, 0, STREAM>>>(flat, pl, pairs, heads);
   }
+  if (extraBias) addBiasHeadsK<<<blocks(pairs * heads), 256, 0, STREAM>>>(pl, extraBias, pairs, heads);
   T* nrm = scratch<T>("st.nrm", (size_t)n * Cs);
   T* qkvg = scratch<T>("st.qkvg", (size_t)n * 4 * Wd);
   layerNorm2<float, T>(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
@@ -529,9 +542,9 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
 
 template <class T>
 void pairformerBlockAt(float* pair, float* single, const float* pairMask, const float* seqMask, int n, int C,
-                       int Cs, const std::string& B, bool swap, bool divide) {
+                       int Cs, const std::string& B, bool swap, bool divide, const float* extraBias = nullptr) {
   pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4);
-  singleTrack<T>(single, pair, seqMask, n, C, Cs, B); stage("single");
+  singleTrack<T>(single, pair, seqMask, n, C, Cs, B, extraBias); stage("single");
 }
 template <class T>
 void pairformerBlock(Trunk& t, int k) {

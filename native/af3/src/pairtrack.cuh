@@ -246,7 +246,11 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
 #include "fusedtransition.cuh"
 template <class T>
 void transition(float* x, size_t rows, int C, int factor, const std::string& pre) {
-  int I = C * factor;
+  // the width is the weight's (OpenDDE's refiner is factor 2 where its trunk is 4)
+  (void)factor;
+  size_t w1 = lenW(pre + ".transition1");
+  if (w1 % (2 * (size_t)C)) { fprintf(stderr, "%s.transition1 has %zu elements, not C %d x 2I\n", pre.c_str(), w1, C); exit(1); }
+  int I = (int)(w1 / (2 * (size_t)C));
   if constexpr (std::is_same_v<T, half>) if (fusedTransition(x, rows, C, I, pre)) return;
   size_t rowsPer = std::max<size_t>(1, CHUNK / (2 * I));
   T* xn = scratch<T>("tr.x", std::min(rowsPer, rows) * C);
