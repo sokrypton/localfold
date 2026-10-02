@@ -46,7 +46,7 @@ inline void benchOps(int n) {
   time("T2 GEMM 768->768", [&] { linear<half, float>(o, att, n, Wd, C, B + ".Transition2"); });
   time("add gated", [&] { addGatedStridedK<<<blocks((size_t)n * C), 256, 0, STREAM>>>(act, att, g, 2 * C, n, C); });
   time("ffw1 GEMM 768->3072", [&] { linear<half, half>(x, wide, n, C, 2 * I, B + ".ffwTransition1"); });
-  time("swiglu", [&] { swigluK<half><<<blocks((size_t)n * I), 256, 0, STREAM>>>(wide, gated, n, I); });
+  time("swiglu", [&] { swiglu<half>(wide, gated, n, I); });
   time("ffw2 GEMM 1536->768", [&] { linear<half, float>(gated, att, n, I, C, B + ".ffwTransition2"); });
   time("empty kernel", [&] { addK<<<1, 32, 0, STREAM>>>(att, att, 0); });
 }

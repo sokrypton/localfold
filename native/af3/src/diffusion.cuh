@@ -531,7 +531,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     linear<T, float>(o, att, n, Wd, C, B + ".Transition2");
     gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, n, C);
     linear<T, T>(tn, wide, n, C, 2 * I, B + ".ffwTransition1");
-    swigluK<T><<<blocks((size_t)n * I), 256, 0, STREAM>>>(wide, gated, n, I);
+    swiglu<T>(wide, gated, n, I);
     linear<T, float>(gated, proj, n, I, C, B + ".ffwTransition2");
   }
   // the last block's transition residual

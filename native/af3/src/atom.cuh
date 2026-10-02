@@ -455,7 +455,7 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
   T* wide = scratch<T>("ab.wide", qRows * 2 * I);
   T* gated = scratch<T>("ab.gated", qRows * I);
   linear<T, T>(tn, wide, qRows, C, 2 * I, B + ".ffwTransition1");
-  swigluK<T><<<blocks(qRows * I), 256, 0, STREAM>>>(wide, gated, qRows, I);
+  swiglu<T>(wide, gated, qRows, I);
   float* projected = scratch<float>("ab.projected", qRows * C);
   linear<T, float>(gated, projected, qRows, I, C, B + ".ffwTransition2");
   addSigmoidGatedK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, projected, bc.tg, qRows * C);

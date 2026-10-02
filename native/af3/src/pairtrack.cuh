@@ -39,11 +39,32 @@ __global__ void gatedAddK(float* pair, const float* proj, const float* gate, siz
 }
 template <class T>
 __global__ void swigluK(const T* wide, T* gated, size_t rows, int I) {
+  if constexpr (std::is_same_v<T, half>) {
+    if (I % 8 == 0) {                 // eight halves (16 bytes) a thread
+      size_t t = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+      if (t >= rows * I) return;
+      size_t r = t / I; int i = (int)(t % I);
+      uint4 a = *(const uint4*)(wide + r * 2 * I + i), b = *(const uint4*)(wide + r * 2 * I + I + i), o;
+      const half2* a2 = (const half2*)&a; const half2* b2 = (const half2*)&b; half2* o2 = (half2*)&o;
+      for (int k = 0; k < 4; ++k) {
+        float2 g = __half22float2(a2[k]), v = __half22float2(b2[k]);
+        o2[k] = __floats2half2_rn(g.x * sigm(g.x) * v.x, g.y * sigm(g.y) * v.y);
+      }
+      *(uint4*)(gated + t) = o;
+      return;
+    }
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * I) return;
   size_t r = t / I; int i = (int)(t % I);
   float g = toF(wide[r * 2 * I + i]);
   gated[t] = fromF<T>(g * sigm(g) * toF(wide[r * 2 * I + I + i]));
+}
+// the launch: an eighth of the threads for the vector path
+template <class T>
+void swiglu(const T* wide, T* gated, size_t rows, int I) {
+  size_t work = std::is_same_v<T, half> && I % 8 == 0 ? rows * I / 8 : rows * I;
+  swigluK<T><<<blocks(work), 256, 0, STREAM>>>(wide, gated, rows, I);
 }
 __global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -191,7 +212,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
     size_t r = std::min(rowsPer, rows - r0);
     layerNorm2<float, T>(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
     linear<T, T>(xn, wide, r, C, 2 * I, pre + ".transition1");
-    swigluK<T><<<blocks(r * I), 256, 0, STREAM>>>(wide, gated, r, I);
+    swiglu<T>(wide, gated, r, I);
     linear<T, float>(gated, x + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
   }
 }
