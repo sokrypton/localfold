@@ -58,7 +58,7 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wpg,
     const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np,
     size_t cs) {
-  // rows are the PADDED pair space (np x np, np a multiple of 32, which is what the contraction's
+  // rows are the PADDED pair space (np x np, np a multiple of 8, which is what the contraction's
   // GEMM wants); a padding row maps to no pair and writes zeros
   const size_t pp = (size_t)np * np;
   auto pairOf = [&](size_t q) -> size_t {

@@ -304,6 +304,7 @@ unroll) against 36 tensor-core MMAs. Compile-time trip counts and 32-bit offsets
 starting value, f16x2 exponentials straight into the P fragments, P's row sums as one more MMA,
 and a tree for the row maxima: 8.07 -> 7.47 ms at 1044 tokens (`--bench-grid=1044`).
 
-The triangle contraction runs in a padded np x np space (np a multiple of 32): cuBLAS's GEMM is
-twice as fast on a multiple of 32 (1044: 5.4 against 2.7 ms the pair of them).
+The triangle contraction runs in a padded np x np space (np a multiple of 8): cuBLAS's GEMM is
+twice as fast on an aligned size (1044: 5.4 against 2.7 ms the pair of them). A multiple of 32 was
+the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2 rows against 72^2).
 

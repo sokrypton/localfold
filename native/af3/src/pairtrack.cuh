@@ -160,16 +160,18 @@ __global__ void centerNormK(const float* prod, TO* out, size_t r0, size_t rows, 
 inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
 inline bool FUSED_GRID = true;
 inline bool TRI_BF16 = true;
-inline int TRI_PAD = 32;          // the triangle's padded size is a multiple of this (0: none)
+inline int TRI_PAD = 8;           // the triangle's padded size is a multiple of this (0: none)
 #include "fusedtriangle.cuh"
 
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
               bool divideByLength) {
   size_t pairs = (size_t)n * n;
-  // a, b and their product live in a PADDED np x np space per channel, np a multiple of 32, the
-  // padding zero: the contraction is unchanged and cuBLAS's GEMM runs twice as fast on a multiple
-  // of 32 (1044: 5.4 against 2.7 ms the pair of them; 522 the same)
+  // a, b and their product live in a PADDED np x np space per channel, np a multiple of 8, the
+  // padding zero: the contraction is unchanged and cuBLAS's GEMM runs twice as fast on an aligned
+  // size (1044: 5.4 against 2.7 ms the pair of them; 522 the same). A multiple of 8 is enough for
+  // the GEMM, and 32 padded the fused kernels' rows too (68 tokens: 96^2 against 72^2): trunk
+  // 76.6 -> 72.3 ms at 68 tokens, 442 -> 438 at 261, 1617 -> 1606 at 522, flat at 150 and 1044
   int np = TRI_PAD ? (n + TRI_PAD - 1) / TRI_PAD * TRI_PAD : n;
   size_t cs = (size_t)np * np;
   std::string pg = projectionGate(pre, C);
