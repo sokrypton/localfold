@@ -35,7 +35,7 @@ inline cudaStream_t STREAM = cudaStreamPerThread;
 // ---------------------------------------------------------------- the exported model
 struct Entry { char kind; size_t offset, length; double value; int seg; };
 // model.idx/model.bin pairs, mapped: the input's directory and (af3 --weights=DIR) the weights'
-struct Segment { const float* data; size_t bytes; float* device; };
+struct Segment { const float* data; size_t bytes; float* device; void* halfMirror = nullptr; };
 struct Model {
   std::map<std::string, Entry> index;
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
@@ -72,6 +72,7 @@ struct Model {
     }
     Segment& s = segs[seg];
     if (s.device) { cudaDeviceSynchronize(); cudaFree(s.device); s.device = nullptr; }
+    if (s.halfMirror) { cudaFree(s.halfMirror); s.halfMirror = nullptr; }
     if (s.data) { munmap((void*)s.data, std::max<size_t>(s.bytes, 1)); s.data = nullptr; }
     return names;
   }
@@ -242,9 +243,51 @@ inline std::string concatColumns(const std::string& key, int C, const std::vecto
   deviceWeight(key, d, (size_t)C * total);
   return key;
 }
+inline std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirror (freed with it)
+// a whole file's f16 copy, made once - the first f16 read of any of its weights converts every
+// float tensor in it in ONE launch (it was ~800 allocations and conversions, one a weight, in the
+// first fold); each tensor starts on 16 bytes, as its own allocation did, for the vector loads
+inline std::map<std::string, half*> WH_AT;
+__global__ void convertTableK(const float* src, half* dst, const size_t* from, const size_t* to, const size_t* len) {
+  size_t e = blockIdx.y, n = len[e];
+  const float* f = src + from[e]; half* h = dst + to[e];
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) h[i] = __float2half(f[i]);
+}
+inline const half* segmentHalf(const std::string& k) {
+  const Entry& e0 = M.at(k);
+  Segment& s = M.segs[e0.seg];
+  M.dev(k);
+  if (!s.halfMirror) {
+    std::vector<size_t> from, to, len; std::vector<std::string> names; size_t total = 0;
+    for (auto& [name, e] : M.index) {
+      if (e.seg != e0.seg || e.kind != 't') continue;
+      from.push_back(e.offset); to.push_back(total); len.push_back(e.length); names.push_back(name);
+      total += (e.length + 7) / 8 * 8;
+    }
+    CK(cudaMalloc(&s.halfMirror, std::max<size_t>(total, 1) * 2));
+    size_t* table; CK(cudaMalloc(&table, from.size() * 3 * sizeof(size_t)));
+    CK(cudaMemcpy(table, from.data(), from.size() * sizeof(size_t), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(table + from.size(), to.data(), to.size() * sizeof(size_t), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(table + 2 * from.size(), len.data(), len.size() * sizeof(size_t), cudaMemcpyHostToDevice));
+    for (size_t first = 0; first < from.size(); first += 65535) {
+      unsigned count = (unsigned)std::min<size_t>(65535, from.size() - first);
+      convertTableK<<<dim3(8, count), 256, 0, STREAM>>>(s.device, (half*)s.halfMirror, table + first,
+                                                       table + from.size() + first, table + 2 * from.size() + first);
+    }
+    CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(table));
+    for (size_t i = 0; i < names.size(); ++i) WH_AT[names[i]] = (half*)s.halfMirror + to[i];
+  }
+  auto it = WH_AT.find(k);
+  if (it == WH_AT.end()) { fprintf(stderr, "%s is not a float tensor of its file\n", k.c_str()); exit(1); }
+  return it->second;
+}
 inline const half* Wh(const std::string& k) {
   auto it = WH.find(k);
   if (it != WH.end()) return it->second;
+  if (M.has(k) && (!WF.count(k) || WF[k] == M.dev(k))) {     // a file's entry, not one built here
+    WLEN[k] = M.len(k); WH_MIRROR.insert(k);
+    return WH[k] = const_cast<half*>(segmentHalf(k));
+  }
   const float* f = W(k); size_t n = WLEN[k];
   half* h = dallocT<half>(n);
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(f, h, n);
@@ -260,8 +303,8 @@ inline const int* Idev(const std::string& k) {
 inline void forgetEntries(const std::vector<std::string>& names) {
   for (auto& k : names) {
     auto h = WH.find(k);
-    if (h != WH.end()) { cudaFree(h->second); WH.erase(h); }
-    WF.erase(k); WLEN.erase(k); IDEV.erase(k);
+    if (h != WH.end()) { if (!WH_MIRROR.erase(k)) cudaFree(h->second); WH.erase(h); }
+    WF.erase(k); WLEN.erase(k); IDEV.erase(k); WH_AT.erase(k);
   }
 }
 inline const float* Fdev(const std::string& k) {     // non-weight float inputs (batch fields)
