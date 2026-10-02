@@ -106,21 +106,49 @@ Against the crystals neither wins everywhere:
 
 ## `--fast`
 
-- **f16 trunk.** The trunk and the head's four blocks run cuBLASLt f16 GEMMs and native/af3's fused
-  triangle input (`triInK`), instantiated at 256 channels.
-- **Contraction.** The triangle contraction runs on zero-padded f16 planes, with a channel-major centre
-  norm after it.
-- **TF32.** Every other GEMM uses TF32.
-- **Rejected:** native/af3's fused transition at 256 channels is slower (504 against 466 ms of trunk:
-  255 registers, four warps an SM). A CUDA graph of the trunk's passes measured nothing.
+**The 256-channel pair track, on fused kernels of its own** (`src/fused256.cuh`). native/af3's fused kernels hold
+a whole 128-wide tile or weight on the chip; at 256 channels that is 255 registers a thread
+or more shared memory than a block gets. Its fused transition measured slower (504 against
+466 ms), so these stream instead:
+
+| kernel | does | 261 tokens, 4 passes |
+|---|---|---:|
+| `triIn256K` | LN, projection and gate, the interleaved a/b split into padded planes, the gating linear | 89 ms (native/af3's `triInK` at 256: 110) |
+| `triangleOutK` | the centre norm, the output projection (weight streamed 32 columns at a time), the gate and the residual | 79 ms (unfused: ~100) |
+| `transitionUpK` | LN, the [gate, value] widening and SwiGLU: the 2I-wide rows never leave the chip | 93 ms (unfused: ~100) |
+
+What made them pay, each measured:
+- **Fragments, not staging buffers.** `triangleOutK` builds its MMA fragments straight from the
+  channel-major product tile and normalises them on the way, so there is no f16 row buffer.
+- **Shared memory recycled.** The weight stages reuse the memory of rows already loaded into
+  registers, so two blocks fit an SM: `triIn256K` 110 → 89 ms.
+- **Coalesced epilogue.** `triangleOutK` stages its output chunk and writes 16 bytes a thread:
+  145 → 83 ms.
+- **But not always.** The same staging in `transitionUpK` cost it an SM's second block and was
+  slower (93 → 112 ms), so it was taken out.
+
+The tiles leave a small pair track's device idle, so the fused path starts at 80 tokens:
+
+| warm trunk, 4 passes | 68 tokens | 92 | 195 | 261 | 476 |
+|---|---:|---:|---:|---:|---:|
+| cuBLASLt | **43.2 ms** | 71.5 | 201 | 368 | 1131 |
+| fused | 52.7 | **58.3** | **190** | **320** | **953** |
+
+`--no-fused256` is the cuBLASLt arm. Its accuracy is the same: trunk 7.4e-4 against the
+float32-attention oracle, against 8.2e-4 unfused.
+
+Elsewhere:
+- The contraction runs on zero-padded f16 planes.
+- Every other GEMM uses TF32.
+- A CUDA graph of the trunk's passes measured nothing.
 
 | A100, warm | 6MRR (68 tokens) | 5CAJ (261) |
 |---|---:|---:|
 | language model | 12 ms | 54 ms |
-| trunk, 4 passes | 43 ms | 453 ms |
+| trunk, 4 passes | 43 ms | 320 ms |
 | sampler, 11 steps | 55 ms | 145 ms |
 | confidence | 5 ms | 68 ms |
-| sequence to PDB (`fold`, cold process) | 1.15 s | 2.1 s |
+| sequence to PDB (`fold`, cold process) | 1.15 s | 1.97 s |
 
 ## Gate
 

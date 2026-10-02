@@ -9,7 +9,7 @@
 // bundle carries it in AF3's shapes: a triangle's projection and gate interleave a and b per channel,
 // the transition's widening is [gate | value].
 #pragma once
-#include "fast.cuh"
+#include "fused256.cuh"
 
 // relative position bins (residue 66, token 66, same entity 1, chain 6 = 139), one-hot rows summed
 __global__ void relPosK(const int* ri, const int* asym, const int* sym, const int* ent, const int* ti,
@@ -118,8 +118,44 @@ inline void pairTransition(float* pair, int L, int C, const std::string& Tn) {
     gemm(g, F(Tn + "transition2"), pair + r0 * C, r, I, C, 1.f);
   }
 }
+// the 256-channel block on the fused kernels (fused256.cuh): triInK -> the f16 contraction -> triangleOutK,
+// and transitionUpK -> the second GEMM (cuBLASLt, the residual as beta)
+inline void triangle256(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+  int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+  half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
+  half* t2 = scratch<half>("ftri.t2", plane * C);
+  triIn256<8>(pair, mask, Tn, a, b, t2, L, Lp, plane);
+  float* prod = scratch<float>("ftri.prod", plane * C);
+  const float one = 1.f, zero = 0.f;
+  if (outgoing)
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16F, Lp, plane, a, CUDA_R_16F, Lp,
+                                  plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  else
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16F, Lp, plane, b, CUDA_R_16F, Lp,
+                                  plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp);
+}
+inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
+  int I = (int)dimOf("f/" + Tn + "transition2", 0);
+  size_t chunk = std::max<size_t>(64, ((size_t)64 << 20) / (2 * (size_t)I)) / 64 * 64;
+  half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
+  for (size_t r0 = 0; r0 < P; r0 += chunk) {
+    size_t r = std::min(chunk, P - r0);
+    transitionUp<8>(pair + r0 * C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), Fh(Tn + "transition1"), g, r, I);
+    ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
+  }
+}
 inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b) {
   std::string B = prefix + "/" + std::to_string(b) + "/";
+  // the fused kernels' 64-128-pair tiles leave a small pair track's device idle: measured, warm, trunk of
+  // 4 passes - 68 tokens 43.2 ms unfused against 52.7 fused; 92: 71.5 / 58.3; 195: 201 / 190;
+  // 261: 368 / 320; 476: 1131 / 953
+  if (FAST && FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS) {
+    triangle256(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
+    triangle256(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+    transition256(pair, (size_t)L * L, C, B + "pairTransition/");
+    return;
+  }
   if (FAST) {
     triangleFast(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
     triangleFast(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
