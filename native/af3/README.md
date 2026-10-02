@@ -123,4 +123,10 @@ RoseTTAFold3 - each raises a named "not ported" error).
   reduction (each `LDG` waited on the last).
 - **cuBLASLt with per-shape autotuning** (time every heuristic candidate, keep the fastest):
   no change on either fold - cuBLAS's default pick was already the fastest candidate.
+- **The trunk's grid attention with two 16-query tiles a warp** (each K/V fragment feeding two
+  MMAs, 128-query blocks on 4 warps): 63 against 65.5 TFLOP/s at 1044 tokens, 32.6 against 38.3 at
+  261. The kernel is occupancy-bound at 128 registers and four blocks an SM; the variant needs 217.
+  Stripping it piece by piece at 1044 tokens: no pair bias 0.86 ms of 1.09, no bias and no exp
+  0.81, no PV either 0.75 - the floor is reloading each row's keys and values once per 64-query
+  block, not the arithmetic.
 

@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
   }
   auto t0 = std::chrono::steady_clock::now();
   M.load(argv[1]); DATA_DIR = argv[1];
+  if (getenv("FLASH_WARPS")) FLASH_WARPS_OVERRIDE = atoi(getenv("FLASH_WARPS"));   // experiments
   if (profile) prof::init();
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
