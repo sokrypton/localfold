@@ -53,10 +53,23 @@ inline std::vector<ScoreAtom> pdbAtoms(std::istream& in, std::vector<float>* coo
   }
   return out;
 }
+// A chain's label from its asymId (1-based), A ... Z, AA, AB ... - the confidence files' and AF3's
+inline std::string chainLabel(int asym) {
+  std::string s;
+  for (int at = asym - 1; at >= 0; at = at / 26 - 1) s.insert(s.begin(), (char)('A' + at % 26));
+  return s;
+}
 inline std::vector<ScoreAtom> scoreAtoms(const std::string& dataDir) {
   std::vector<ScoreAtom> out;
   std::ifstream tf(dataDir + "/template.pdb");
-  if (tf) return pdbAtoms(tf, nullptr);
+  if (tf) {
+    // 🔴 THE CHAIN FROM THE BATCH, NOT THE PDB's ONE CHARACTER: past 62 chains (26 before) the PDB
+    // wraps, and two chains sharing a letter were scored - and written to the mmCIF - as one
+    out = pdbAtoms(tf, nullptr);
+    const int* asym = M.i("batch.asymId"); int dense = (int)M.meta("batch.dense");
+    for (auto& a : out) a.chain = chainLabel(asym[a.slot / dense]);
+    return out;
+  }
   static const char* RES[20] = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
                                 "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"};
   int n = (int)M.meta("batch.tokens"), dense = (int)M.meta("batch.dense");
@@ -70,7 +83,7 @@ inline std::vector<ScoreAtom> scoreAtoms(const std::string& dataDir) {
     a.slot = i; a.het = false; a.icode = ' ';
     for (int c = 0; c < 4; ++c) { int ch = names[i * 4 + c]; if (ch > 0) a.name += (char)(ch + 32); }
     a.res = aatype[t] >= 0 && aatype[t] < 20 ? RES[aatype[t]] : "UNK";
-    a.chain = std::string(1, (char)('A' + (chain[t] - 1) % 26)); a.seq = resIdx[t];
+    a.chain = chainLabel(chain[t]); a.seq = resIdx[t];
     a.element = elem[i] == 1 ? "H" : "C";
     out.push_back(a);
   }
@@ -307,12 +320,27 @@ inline int scorePdbMain(const std::string& path) {
 inline std::vector<size_t> writeCif(const std::string& path, const std::vector<float>& x, const float* bfactors) {
   std::vector<ScoreAtom> atoms = scoreAtoms(DATA_DIR);
   std::vector<ScoreChain> chains = scoreChains(atoms);
+  // one ENTITY per distinct chain (its residue names in order), as mmCIF means it and AF3's own
+  // writer does: copies of one sequence share it (one entity a chain also broke AF3's reader past
+  // ten entities - it paired chain A with another entity's sequence)
+  std::vector<int> entityOf(chains.size());
+  std::vector<size_t> firstOfEntity;
+  {
+    std::map<std::string, int> byContent;
+    for (size_t c = 0; c < chains.size(); ++c) {
+      std::string key = chains[c].polymer ? "P" : "L";
+      for (auto& r : chains[c].residues) key += " " + atoms[r.atoms[0]].res;
+      auto it = byContent.find(key);
+      if (it == byContent.end()) { it = byContent.emplace(key, (int)firstOfEntity.size() + 1).first; firstOfEntity.push_back(c); }
+      entityOf[c] = it->second;
+    }
+  }
   std::vector<size_t> order;
   std::string name = path.substr(path.find_last_of('/') + 1);
   name = name.substr(0, name.find_last_of('.'));
   FILE* f = fopen(path.c_str(), "w");
   fprintf(f, "data_%s\n#\n_entry.id %s\n#\nloop_\n_entity.id\n_entity.type\n", name.c_str(), name.c_str());
-  for (size_t c = 0; c < chains.size(); ++c) fprintf(f, "%zu %s\n", c + 1, chains[c].polymer ? "polymer" : "non-polymer");
+  for (size_t e = 0; e < firstOfEntity.size(); ++e) fprintf(f, "%zu %s\n", e + 1, chains[firstOfEntity[e]].polymer ? "polymer" : "non-polymer");
   // the polymers' types and sequences, and the chains' entities (what AF3's own reader requires)
   auto dnaRes = [](const std::string& r) { return r == "DA" || r == "DC" || r == "DG" || r == "DT"; };
   auto polyType = [&](const ScoreChain& c) {
@@ -321,17 +349,19 @@ inline std::vector<size_t> writeCif(const std::string& path, const std::vector<f
     return "polyribonucleotide";
   };
   fprintf(f, "#\nloop_\n_entity_poly.entity_id\n_entity_poly.type\n");
-  for (size_t c = 0; c < chains.size(); ++c) if (chains[c].polymer) fprintf(f, "%zu %s\n", c + 1, polyType(chains[c]));
+  for (size_t e = 0; e < firstOfEntity.size(); ++e)
+    if (chains[firstOfEntity[e]].polymer) fprintf(f, "%zu %s\n", e + 1, polyType(chains[firstOfEntity[e]]));
   fprintf(f, "#\nloop_\n_entity_poly_seq.entity_id\n_entity_poly_seq.num\n_entity_poly_seq.mon_id\n_entity_poly_seq.hetero\n");
-  for (size_t c = 0; c < chains.size(); ++c) {
-    if (!chains[c].polymer) continue;
-    for (auto& r : chains[c].residues) {
+  for (size_t e = 0; e < firstOfEntity.size(); ++e) {
+    const ScoreChain& chain = chains[firstOfEntity[e]];
+    if (!chain.polymer) continue;
+    for (auto& r : chain.residues) {
       const ScoreAtom& a = atoms[r.atoms[0]];
-      fprintf(f, "%zu %d %s n\n", c + 1, a.seq, a.res.c_str());
+      fprintf(f, "%zu %d %s n\n", e + 1, a.seq, a.res.c_str());
     }
   }
   fprintf(f, "#\nloop_\n_struct_asym.id\n_struct_asym.entity_id\n");
-  for (size_t c = 0; c < chains.size(); ++c) fprintf(f, "%s %zu\n", chains[c].id.c_str(), c + 1);
+  for (size_t c = 0; c < chains.size(); ++c) fprintf(f, "%s %d\n", chains[c].id.c_str(), entityOf[c]);
   fprintf(f, "#\nloop_\n_atom_site.group_PDB\n_atom_site.id\n_atom_site.type_symbol\n_atom_site.label_atom_id\n"
              "_atom_site.label_alt_id\n_atom_site.label_comp_id\n_atom_site.label_asym_id\n_atom_site.label_entity_id\n"
              "_atom_site.label_seq_id\n_atom_site.pdbx_PDB_ins_code\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n"
@@ -346,8 +376,8 @@ inline std::vector<size_t> writeCif(const std::string& path, const std::vector<f
         std::string el = a.element.empty() ? a.name.substr(0, 1) : a.element;
         std::string atomId = a.name.find('\'') != std::string::npos ? "\"" + a.name + "\"" : a.name;
         std::string seq = chains[c].polymer ? std::to_string(a.seq) : ".";
-        fprintf(f, "%s %zu %s %s . %s %s %zu %s %s %.3f %.3f %.3f 1.00 %.2f %d %s 1\n", a.het ? "HETATM" : "ATOM", serial++,
-                el.c_str(), atomId.c_str(), a.res.c_str(), a.chain.c_str(), c + 1, seq.c_str(),
+        fprintf(f, "%s %zu %s %s . %s %s %d %s %s %.3f %.3f %.3f 1.00 %.2f %d %s 1\n", a.het ? "HETATM" : "ATOM", serial++,
+                el.c_str(), atomId.c_str(), a.res.c_str(), a.chain.c_str(), entityOf[c], seq.c_str(),
                 a.icode == ' ' ? "?" : std::string(1, a.icode).c_str(), x[a.slot * 3], x[a.slot * 3 + 1], x[a.slot * 3 + 2],
                 bfactors ? bfactors[a.slot] : 0.0, a.seq, a.chain.c_str());
       }

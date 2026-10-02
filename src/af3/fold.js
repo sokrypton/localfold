@@ -187,9 +187,14 @@ function pdbTemplate(batch) {
   // chain is a single 126-residue protein as far as any viewer or scoring tool
   // is concerned, with a peptide bond implied across an interface that has
   // none.
+  // 🔴 SIXTY-TWO, NOT TWENTY-SIX: a PDB chain is one character, and the 27th chain of a large
+  // complex wrapped back onto A and was MERGED with it in every reader. Upper case, then lower case,
+  // then digits - the convention viewers accept - before the format runs out (an mmCIF names them
+  // all; native/af3 writes one with --out=*.cif).
+  const CHAIN_CHARACTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const chainLetter = (token) => {
     const asym = batch.asymId === undefined ? 1 : batch.asymId[token];
-    return "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[(asym - 1) % 26];
+    return CHAIN_CHARACTERS[(asym - 1) % CHAIN_CHARACTERS.length];
   };
   // 🔴 A LIGAND IS HETATM, AND IT HAS A NAME. `sequence` covers the polymers,
   // so a ligand token indexed into it is undefined and used to be written as a
