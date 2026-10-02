@@ -8,6 +8,7 @@
 #include "trunk.cuh"
 #include "sampler.cuh"
 #include "confidence.cuh"
+#include "../../af3/src/profile.cuh"
 
 __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, int T, int states, int k, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -18,14 +19,16 @@ __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, 
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
-  std::string weights, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false;
+  std::string weights, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strcmp(argv[i], "--atom-f32")) ATOM_BF16 = false;
-    else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
+    else if (!strcmp(argv[i], "--wait-input")) waitInput = true;
+    else if (!strcmp(argv[i], "--profile")) profile = true;
+    else if (!strcmp(argv[i], "--no-fused")) FUSED = false;     // start up while the input is still being exported
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
     else if (!strncmp(argv[i], "--steps=", 8)) sampler.steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--inputs-window=", 16)) {           // 128: biohub's (the default); 0: dense
@@ -91,7 +94,9 @@ int main(int argc, char** argv) {
   float* zi = dalloc((size_t)T * T * C); float* z = dalloc((size_t)T * T * C);
   zInit(T, C, sInputs, Si, lmZ, zi, check);
   t0 = std::chrono::steady_clock::now();
+  if (profile) { prof::init(); prof::start(); }
   foldingTrunk(T, C, zi, z, 4, check);
+  if (profile) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   CK(cudaStreamSynchronize(STREAM));
   printf("trunk %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   float* dg = dalloc((size_t)T * T * (int)M.meta("meta/distogramBins"));

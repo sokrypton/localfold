@@ -9,7 +9,7 @@
 // bundle carries it in AF3's shapes: a triangle's projection and gate interleave a and b per channel,
 // the transition's widening is [gate | value].
 #pragma once
-#include "ops.cuh"
+#include "fast.cuh"
 
 // relative position bins (residue 66, token 66, same entity 1, chain 6 = 139), one-hot rows summed
 __global__ void relPosK(const int* ri, const int* asym, const int* sym, const int* ent, const int* ti,
@@ -120,6 +120,12 @@ inline void pairTransition(float* pair, int L, int C, const std::string& Tn) {
 }
 inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b) {
   std::string B = prefix + "/" + std::to_string(b) + "/";
+  if (FAST) {
+    triangleFast(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
+    triangleFast(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+    transitionFast(pair, (size_t)L * L, C, B + "pairTransition/");
+    return;
+  }
   triangle(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
   triangle(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
   pairTransition(pair, L, C, B + "pairTransition/");
@@ -138,8 +144,28 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
     gemm(xn, F("recycle/projection"), z, P, C, C);
     addK<<<blocks(P * C), 256, 0, STREAM>>>(z, zInitP, P * C);
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " in").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/in");
-    for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
+    // the 24 blocks are the same launches on the same buffers every pass: the first pass runs them (and
+    // makes every scratch buffer, plan and weight copy), the rest replay one CUDA graph of them
+    static cudaGraphExec_t graph = nullptr;
+    if (loop == 0 || check || !FAST) {
+      for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
+    } else {
+      if (!graph) {
+        cudaGraph_t g;
+        CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+        for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
+        CK(cudaStreamEndCapture(STREAM, &g));
+        CK(cudaGraphInstantiate(&graph, g, 0));
+        CK(cudaGraphDestroy(g));
+      }
+      CK(cudaGraphLaunch(graph, STREAM));
+    }
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " out").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/out");
+    if (getenv("EF2_PASS_TIMES")) {
+      static auto t0 = std::chrono::steady_clock::now();
+      CK(cudaStreamSynchronize(STREAM));
+      printf("    pass %d done at %.1f ms\n", loop, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
   }
 }
 
