@@ -163,7 +163,7 @@ Elsewhere:
 | language model | 10 ms | 15 ms |
 | trunk, 4 passes | 43 ms | 320 ms |
 | sampler, 11 steps | 28 ms | 48 ms |
-| confidence | 5 ms | 68 ms |
+| confidence | 4 ms | 18 ms |
 | sequence to PDB (`fold`, cold process) | 1.15 s | 1.97 s |
 
 ## Memory

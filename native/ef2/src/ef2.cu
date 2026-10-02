@@ -117,7 +117,9 @@ static int foldInput(const Opts& o, bool warm) {
   CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr;
   releaseScratch();
   t0 = std::chrono::steady_clock::now();
-  bool profTrunk = profile && !getenv("EF2_PROFILE_SAMPLER");
+  // --profile times one stage's kernels: EF2_PROFILE=trunk (the default), sampler or confidence
+  std::string profStage = getenv("EF2_PROFILE") ? getenv("EF2_PROFILE") : "trunk";
+  bool profTrunk = profile && profStage == "trunk";
   if (profTrunk) { prof::init(); prof::start(); }
   foldingTrunk(T, C, zi, z, 4, check);
   if (profTrunk) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
@@ -147,7 +149,7 @@ static int foldInput(const Opts& o, bool warm) {
   }
   t0 = std::chrono::steady_clock::now();
   int stepsRun = 0;
-  bool profSampler = profile && getenv("EF2_PROFILE_SAMPLER");
+  bool profSampler = profile && profStage == "sampler";
   if (profSampler) { prof::init(); prof::start(); }
   std::vector<float> coords = sample(dn, sampler, seed, &stepsRun);
   if (profSampler) { CK(cudaStreamSynchronize(STREAM)); prof::stop(30); }
@@ -164,7 +166,10 @@ static int foldInput(const Opts& o, bool warm) {
   }
   t0 = std::chrono::steady_clock::now();
   float* xd = upload(coords.data(), (size_t)A * 3);
+  bool profConf = profile && profStage == "confidence";
+  if (profConf) { prof::init(); prof::start(); }
   Confidence conf = confidenceHead(T, A, z, sInputs, Si, xd, false);
+  if (profConf) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   mem("confidence");
   say("confidence %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   std::vector<float> bf(A);

@@ -76,6 +76,38 @@ __global__ void plddtAtomK(const float* s, const int* slot, const float* table, 
   }
 }
 
+// PAE and the pTM terms from the logits, a thread a pair: pae = sum p_b centre_b, tm = sum p_b / (1 + (centre_b / d0)^2);
+// then a block a row: the row's mean tm over every column and over the other chains' columns (double)
+__global__ void paeK(const float* logits, float* pae, float* tm, size_t P, int bins, double width, double d0) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= P) return;
+  const float* lg = logits + ij * bins;
+  float mx = -INFINITY;
+  for (int b = 0; b < bins; ++b) mx = fmaxf(mx, lg[b]);
+  double tot = 0, mean = 0, t = 0;
+  for (int b = 0; b < bins; ++b) {
+    double w = exp((double)lg[b] - mx), centre = width * (b + 0.5), r = centre / d0;
+    tot += w; mean += w * centre; t += w / (1 + r * r);
+  }
+  pae[ij] = (float)(mean / tot); tm[ij] = (float)(t / tot);
+}
+__global__ void tmRowsK(const float* tm, const int* asym, double* rows, int T) {   // rows [T][2]: mean, inter-chain mean
+  int i = blockIdx.x;
+  __shared__ double s[2][256], c[256];
+  double sum = 0, isum = 0, icnt = 0;
+  for (int j = threadIdx.x; j < T; j += blockDim.x) {
+    double v = tm[(size_t)i * T + j]; sum += v;
+    if (asym[i] != asym[j]) { isum += v; icnt += 1; }
+  }
+  s[0][threadIdx.x] = sum; s[1][threadIdx.x] = isum; c[threadIdx.x] = icnt;
+  __syncthreads();
+  for (int o = blockDim.x / 2; o; o >>= 1) {
+    if (threadIdx.x < o) { s[0][threadIdx.x] += s[0][threadIdx.x + o]; s[1][threadIdx.x] += s[1][threadIdx.x + o]; c[threadIdx.x] += c[threadIdx.x + o]; }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { rows[2 * i] = s[0][0] / (T + 1e-8); rows[2 * i + 1] = s[1][0] / (c[0] + 1e-8); }
+}
+
 struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; double ptm, iptm, meanPlddt; };
 
 inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice,
@@ -133,7 +165,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   gemm(z, F("confidence/pae"), paeL, P, C, pb);
   Confidence out;
   out.plddtAtom = download(pa, A);
-  std::vector<float> mask_ = download(W("atom_mask"), A), logits = download(paeL, P * pb);
+  std::vector<float> mask_ = download(W("atom_mask"), A);
   std::vector<int> asym(T); CK(cudaMemcpy(asym.data(), Idev("asym_id"), T * 4, cudaMemcpyDeviceToHost));
   out.plddtToken.assign(T, 0.f);
   std::vector<float> cnt(T, 0.f);
@@ -144,27 +176,18 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   }
   for (int t = 0; t < T; ++t) out.plddtToken[t] /= std::max(cnt[t], 1e-6f);
   out.meanPlddt = wsum / (wtot + 1e-8);
-  // PAE and pTM / ipTM
+  // PAE and pTM / ipTM, on the device (the logits were 17 MB to download at 261 tokens and 4.4 M
+  // exponentials on the host: 50 of the head's 62 ms)
   double width = 32.0 / pb, d0 = 1.24 * cbrt(std::max(T, 19) - 15.0) - 1.8;
-  out.pae.assign(P, 0.f);
+  float* paeD = scratch<float>("cf.paeOut", P); float* tmD = scratch<float>("cf.tm", P);
+  double* rowsD = scratch<double>("cf.tmRows", (size_t)2 * T);
+  paeK<<<blocks(P), 256, 0, STREAM>>>(paeL, paeD, tmD, P, pb, width, d0);
+  tmRowsK<<<T, 256, 0, STREAM>>>(tmD, Idev("asym_id"), rowsD, T);
+  out.pae = download(paeD, P);
+  std::vector<double> rows(2 * T);
+  CK(cudaMemcpy(rows.data(), rowsD, rows.size() * 8, cudaMemcpyDeviceToHost));
   double ptm = -1e30, iptm = -1e30;
-  for (int i = 0; i < T; ++i) {
-    double sum = 0, count = 0, isum = 0, icount = 0;
-    for (int j = 0; j < T; ++j) {
-      const float* lg = &logits[((size_t)i * T + j) * pb];
-      double mx = -1e30; for (int b = 0; b < pb; ++b) mx = std::max(mx, (double)lg[b]);
-      double tot = 0, mean = 0, tm = 0;
-      for (int b = 0; b < pb; ++b) {
-        double w = exp(lg[b] - mx), centre = width * (b + 0.5);
-        tot += w; mean += w * centre; tm += w / (1 + (centre / d0) * (centre / d0));
-      }
-      out.pae[(size_t)i * T + j] = (float)(mean / tot);
-      sum += tm / tot; count += 1;
-      if (asym[i] != asym[j]) { isum += tm / tot; icount += 1; }
-    }
-    ptm = std::max(ptm, sum / (count + 1e-8));
-    iptm = std::max(iptm, isum / (icount + 1e-8));
-  }
+  for (int i = 0; i < T; ++i) { ptm = std::max(ptm, rows[2 * i]); iptm = std::max(iptm, rows[2 * i + 1]); }
   out.ptm = ptm; out.iptm = iptm;
   if (check) {
     checkOracle("confidence pLDDT per atom", pa, A, "o/conf/plddt_per_atom");
