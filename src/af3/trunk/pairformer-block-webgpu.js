@@ -276,6 +276,7 @@ export class Af3PairformerStackGpu {
    * The budget already knows the answer; this asks it.
    */
   async run(state, blocks, dialect, options = {}) {
+    this.#reachedBlock = 0;
     try {
       return await this.#runStack(state, blocks, dialect, options);
     } catch (error) {
@@ -287,9 +288,21 @@ export class Af3PairformerStackGpu {
       this.degradedTo = `uploading weights per pass (${(reclaimed / (1024 * 1024)).toFixed(0)}`
         + ` MiB reclaimed): ${error.message}`;
       options.onStatus?.(this.degradedTo);
-      return await this.#runStack(state, blocks, dialect, options);
+      // 🔴 FROM THE BLOCK THAT WAS REFUSED, WHEN THE PAIR IS THE CALLER'S. The
+      // trunk hands its own buffers over (`pairBuffer`) and every block updates
+      // them in place, so starting again at block 0 applied the blocks already
+      // run TWICE: IntelliFold-2 at 1000 residues on a T4-sized budget gave
+      // pLDDT 78.7 where the same fold with room gave 33.3, no error anywhere.
+      // A block submits only once it is fully encoded, so the refused one never
+      // reached the queue and the ones before it did, exactly once each. A
+      // stack that uploaded its own copy of the state starts over as before.
+      const from = options.pairBuffer === undefined ? 0 : this.#reachedBlock;
+      return await this.#runStack(state, blocks, dialect, { ...options, firstBlock: from });
     }
   }
+
+  /** The block being encoded when a run was abandoned; see run(). */
+  #reachedBlock = 0;
 
   /**
    * Compile this stack's pipelines and encode nothing.
@@ -665,7 +678,8 @@ export class Af3PairformerStackGpu {
       let encodeMilliseconds = 0;
       let waitMilliseconds = 0;
       let releaseMilliseconds = 0;
-      for (let index = 0; index < blocks.length; index += 1) {
+      for (let index = options.firstBlock ?? 0; index < blocks.length; index += 1) {
+        this.#reachedBlock = index;
         const pending = [];
         validation.begin();
         const encodeStart = performance.now();
