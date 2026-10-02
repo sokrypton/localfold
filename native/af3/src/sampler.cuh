@@ -17,83 +17,91 @@ inline double noiseSchedule(double t, double sigmaData = 16, double sigmaMin = 0
 }
 
 // AF3's sampler, every step on the device: each step centres the real atoms, rotates by a random
-// rotation, translates by a unit normal, injects noise and takes the Euler step. The host draws the identical random sequence up
-// front (the start, then per step the augmentation's nine deviates and the injected noise), so
-// the only host work per step is enqueueing it - no synchronisation until the end.
+// rotation, translates by a unit normal, injects noise and takes the Euler step. The host draws
+// the identical random sequence up front (the start, then per step the augmentation's nine
+// deviates and the injected noise), so the only host work per step is enqueueing it - no
+// synchronisation until the end. `ns` samples run as one batch through the denoiser (NS), sample k
+// on its own stream seeded `seed + k` - the sequence a single-sample run with that seed draws.
 __global__ void centroidK(const float* x, const float* mask, size_t atoms, float* c) {
   __shared__ float s[4][256];
+  const float* xs = x + (size_t)blockIdx.x * atoms * 3;         // one block a sample
   float a[4] = {0, 0, 0, 0};
   for (size_t i = threadIdx.x; i < atoms; i += blockDim.x)
-    if (mask[i]) { a[0] += x[i * 3]; a[1] += x[i * 3 + 1]; a[2] += x[i * 3 + 2]; a[3] += 1; }
+    if (mask[i]) { a[0] += xs[i * 3]; a[1] += xs[i * 3 + 1]; a[2] += xs[i * 3 + 2]; a[3] += 1; }
   for (int k = 0; k < 4; ++k) s[k][threadIdx.x] = a[k];
   __syncthreads();
   for (int w = blockDim.x / 2; w > 0; w >>= 1) {
     if (threadIdx.x < w) for (int k = 0; k < 4; ++k) s[k][threadIdx.x] += s[k][threadIdx.x + w];
     __syncthreads();
   }
-  if (threadIdx.x < 3) c[threadIdx.x] = s[threadIdx.x][0] / (s[3][0] + 1e-6f);
+  if (threadIdx.x < 3) c[blockIdx.x * 3 + threadIdx.x] = s[threadIdx.x][0] / (s[3][0] + 1e-6f);
 }
-// rot = e0, e1, e2 (rows) and the translation; noisy = augmented x + injected * noise
+// rot = e0, e1, e2 (rows) and the translation, 12 a sample; noisy = augmented x + injected * noise
 __global__ void augmentNoiseK(float* x, float* noisy, const float* mask, const float* c, const float* rot,
-                              const float* noise, float injected, size_t atoms) {
+                              const float* noise, float injected, size_t atoms, size_t total) {
   size_t a = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (a >= atoms) return;
-  float p[3] = {x[a * 3] - c[0], x[a * 3 + 1] - c[1], x[a * 3 + 2] - c[2]};
-  for (int k = 0; k < 3; ++k) {
-    float v = mask[a] ? p[0] * rot[k] + p[1] * rot[3 + k] + p[2] * rot[6 + k] + rot[9 + k] : 0.f;
-    x[a * 3 + k] = v;
-    noisy[a * 3 + k] = v + injected * noise[a * 3 + k];
+  if (a >= total) return;
+  size_t k = a / atoms; const float* r = rot + k * 12; const float* ck = c + k * 3;
+  float p[3] = {x[a * 3] - ck[0], x[a * 3 + 1] - ck[1], x[a * 3 + 2] - ck[2]};
+  bool live = mask[a % atoms] != 0;
+  for (int d = 0; d < 3; ++d) {
+    float v = live ? p[0] * r[d] + p[1] * r[3 + d] + p[2] * r[6 + d] + r[9 + d] : 0.f;
+    x[a * 3 + d] = v;
+    noisy[a * 3 + d] = v + injected * noise[a * 3 + d];
   }
 }
 __global__ void eulerK(float* x, const float* noisy, const float* denoised, float scale, size_t n3) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
 }
+// Returns every sample's positions, sample-major [ns][atoms][3].
 inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<float>& mask,
-                                       const std::function<const float*(const float*, float, const float*)>& denoiseFn,
-                                       double gamma0 = 0.8, double gammaMin = 1.0, double noiseScale = 1.003,
-                                       double stepScale = 1.5) {
-  size_t atoms = mask.size(), n3 = atoms * 3;
-  Normal normal(seed);
+                                 const std::function<const float*(const float*, float, const float*)>& denoiseFn,
+                                 int ns = 1, double gamma0 = 0.8, double gammaMin = 1.0, double noiseScale = 1.003,
+                                 double stepScale = 1.5) {
+  size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
   std::vector<double> levels(steps + 1);
   for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps);
-  std::vector<float> x(n3), rot((size_t)steps * 12), noise((size_t)steps * n3), tHats(steps);
-  for (auto& v : x) v = (float)(normal() * levels[0]);
-  for (int s = 0; s < steps; ++s) {
-    double v0[3] = {normal(), normal(), normal()}, v1[3] = {normal(), normal(), normal()};
-    auto norm = [](const double* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
-    double e0[3], e1[3], e2[3], s0 = 1 / std::max(1e-10, norm(v0));
-    for (int k = 0; k < 3; ++k) e0[k] = v0[k] * s0;
-    double dot = v1[0] * e0[0] + v1[1] * e0[1] + v1[2] * e0[2], w[3];
-    for (int k = 0; k < 3; ++k) w[k] = v1[k] - e0[k] * dot;
-    double s1 = 1 / std::max(1e-10, norm(w));
-    for (int k = 0; k < 3; ++k) e1[k] = w[k] * s1;
-    e2[0] = e0[1] * e1[2] - e0[2] * e1[1]; e2[1] = e0[2] * e1[0] - e0[0] * e1[2]; e2[2] = e0[0] * e1[1] - e0[1] * e1[0];
-    float* r = &rot[(size_t)s * 12];
-    for (int k = 0; k < 3; ++k) { r[k] = (float)e0[k]; r[3 + k] = (float)e1[k]; r[6 + k] = (float)e2[k]; }
-    for (int k = 0; k < 3; ++k) r[9 + k] = (float)normal();
-    for (size_t i = 0; i < n3; ++i) noise[(size_t)s * n3 + i] = (float)normal();
+  std::vector<float> x(all3), rot((size_t)steps * ns * 12), noise((size_t)steps * all3), tHats(steps);
+  for (int k = 0; k < ns; ++k) {
+    Normal normal(seed + k);
+    for (size_t i = 0; i < n3; ++i) x[k * n3 + i] = (float)(normal() * levels[0]);
+    for (int s = 0; s < steps; ++s) {
+      double v0[3] = {normal(), normal(), normal()}, v1[3] = {normal(), normal(), normal()};
+      auto norm = [](const double* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+      double e0[3], e1[3], e2[3], s0 = 1 / std::max(1e-10, norm(v0));
+      for (int d = 0; d < 3; ++d) e0[d] = v0[d] * s0;
+      double dot = v1[0] * e0[0] + v1[1] * e0[1] + v1[2] * e0[2], w[3];
+      for (int d = 0; d < 3; ++d) w[d] = v1[d] - e0[d] * dot;
+      double s1 = 1 / std::max(1e-10, norm(w));
+      for (int d = 0; d < 3; ++d) e1[d] = w[d] * s1;
+      e2[0] = e0[1] * e1[2] - e0[2] * e1[1]; e2[1] = e0[2] * e1[0] - e0[0] * e1[2]; e2[2] = e0[0] * e1[1] - e0[1] * e1[0];
+      float* r = &rot[((size_t)s * ns + k) * 12];
+      for (int d = 0; d < 3; ++d) { r[d] = (float)e0[d]; r[3 + d] = (float)e1[d]; r[6 + d] = (float)e2[d]; }
+      for (int d = 0; d < 3; ++d) r[9 + d] = (float)normal();
+      for (size_t i = 0; i < n3; ++i) noise[(size_t)s * all3 + k * n3 + i] = (float)normal();
+    }
   }
-  float* dX = upload(x.data(), n3); float* dRot = upload(rot.data(), rot.size());
+  float* dX = upload(x.data(), all3); float* dRot = upload(rot.data(), rot.size());
   float* dNoise = upload(noise.data(), noise.size()); float* dMask = upload(mask.data(), atoms);
-  float* dNoisy = scratch<float>("sample.noisy", n3); float* dC = scratch<float>("sample.centroid", 3);
+  float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
   for (int s = 0; s < steps; ++s) {
     double previous = levels[s], level = levels[s + 1];
-    double tHat = previous * (1 + (level > gammaMin ? gamma0 : 0));
-    tHats[s] = (float)tHat;
+    tHats[s] = (float)(previous * (1 + (level > gammaMin ? gamma0 : 0)));
   }
   float* dLevels = upload(tHats.data(), steps);
   for (int step = 1; step <= steps; ++step) {
     double previous = levels[step - 1], level = levels[step], tHat = tHats[step - 1];
     double injected = noiseScale * std::sqrt(std::max(0.0, tHat * tHat - previous * previous));
-    centroidK<<<1, 256, 0, STREAM>>>(dX, dMask, atoms, dC);
-    augmentNoiseK<<<blocks(atoms), 256, 0, STREAM>>>(dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * 12,
-                                                    dNoise + (size_t)(step - 1) * n3, (float)injected, atoms);
+    centroidK<<<ns, 256, 0, STREAM>>>(dX, dMask, atoms, dC);
+    augmentNoiseK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * ns * 12,
+                                                         dNoise + (size_t)(step - 1) * all3, (float)injected, atoms,
+                                                         atoms * ns);
     const float* d = denoiseFn(dNoisy, (float)tHat, dLevels + step - 1);
     if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
-    eulerK<<<blocks(n3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)(stepScale * (level - tHat) / tHat), n3);
+    eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)(stepScale * (level - tHat) / tHat), all3);
   }
-  std::vector<float> out = download(dX, n3);
+  std::vector<float> out = download(dX, all3);
   for (float* p : {dX, dRot, dNoise, dMask, dLevels}) CK(cudaFree(p));
   return out;
 }

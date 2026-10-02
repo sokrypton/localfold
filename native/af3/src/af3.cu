@@ -142,16 +142,23 @@ int main(int argc, char** argv) {
     DiffusionFold df = prepareDiffusion(t.single, t.pair, t.targetFeat, t.seqMask, t.n);
     // --samples=N: N diffusion samples off one trunk (AF3 runs five), each through the confidence
     // head and ranked by AF3's ranking score without its disorder and clash terms - 0.8 ipTM +
-    // 0.2 pTM, or pTM for one chain. Sample k is seeded `seed + k`; the best is written to --out
+    // 0.2 pTM, or pTM for one chain. The samples run as one batch through the denoiser, sample k
+    // seeded `seed + k` (what a one-sample run with that seed draws); the best is written to --out
     // and every one to <out>_sample<k>.pdb.
     double diffMs = 0, confMs = 0, bestScore = -1e30; int best = 0;
     ConfidenceOut conf;
     std::vector<float> x;
+    // the samples as one batch through the denoiser
+    auto s0 = clock();
+    NS = samples;
+    std::vector<float> xs = sample(steps, seed, mask, [&](const float* noisy, float tHat, const float* dLevel) {
+      return (const float*)denoiseStep(df, noisy, tHat, dLevel);
+    }, samples);
+    NS = 1;
+    diffMs = ms(s0, clock());
+    size_t atoms3 = mask.size() * 3;
     for (int k = 0; k < samples; ++k) {
-      auto s0 = clock();
-      std::vector<float> xk = sample(steps, seed + k, mask, [&](const float* noisy, float tHat, const float* dLevel) {
-        return (const float*)denoiseStep(df, noisy, tHat, dLevel);
-      });
+      std::vector<float> xk(xs.begin() + k * atoms3, xs.begin() + (k + 1) * atoms3);
       auto s1 = clock();
       // pseudo-beta off the structure, then the confidence head
       std::vector<float> beta((size_t)t.n * 3);
@@ -160,8 +167,7 @@ int main(int argc, char** argv) {
       float* dBeta = upload(beta.data(), beta.size());
       ConfidenceOut ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
       CK(cudaFree(dBeta));
-      auto s2 = clock();
-      diffMs += ms(s0, s1); confMs += ms(s1, s2);
+      confMs += ms(s1, clock());
       double score = std::isnan(ck.iptm) ? ck.ptm : 0.8 * ck.iptm + 0.2 * ck.ptm;
       if (samples > 1) {
         std::string path = out.size() > 4 && out.substr(out.size() - 4) == ".pdb"

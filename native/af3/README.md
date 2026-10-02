@@ -26,7 +26,12 @@ python3 score.py 5caj.pdb ../../tools/fixtures/5caj-crystal.pdb A
 `--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--samples=N`
 (N diffusion samples off one trunk, AF3 runs five: each scored by the confidence head and ranked by
 0.8 ipTM + 0.2 pTM - pTM for one chain; AF3's disorder and clash terms are not computed - the best
-written to `--out`, all to `<out>_sample<k>.pdb`),
+written to `--out`, all to `<out>_sample<k>.pdb`). The samples run as ONE batch through the
+denoiser - the transformer's GEMMs at 5x the rows, the samples as the flash kernel's batch, what
+they share (conditioning, masks, biases) read once - and sample k draws exactly what a one-sample
+run seeded `seed + k` draws, so its structure is the same: 5CAJ's five read 1.989 / 2.023 / 1.961 /
+1.996 / 2.018 A batched and one at a time. Five samples' diffusion: **1.96 s against 3.61 s** in
+sequence (one sample 0.69 s),
 `--fast` (f16 trunk and denoiser transformer), `--stages` (per-stage profile),
 `--no-graphs`. `pairformer.cu` is the earlier one-file pairformer prototype and benchmark.
 
