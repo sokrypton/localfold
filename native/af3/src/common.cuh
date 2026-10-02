@@ -1,6 +1,7 @@
 // Shared infrastructure: the exported model file, device weights, scratch, cuBLAS.
 #pragma once
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>

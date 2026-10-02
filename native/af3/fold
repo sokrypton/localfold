@@ -42,7 +42,7 @@ done
 weights="$here/weights"; [ "$model" = af3 ] || weights="$here/weights-$model"
 if [ ! -x "$here/af3" ]; then
   (cd "$here" && nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu \
-     -lcublas -lcupti -o af3)
+     -lcublas -lcublasLt -lcupti -o af3)
 fi
 node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")
 [ -f "$weights/model.idx" ] || "${node[@]}" "$weights" --weights-only --bundle="$bundle"

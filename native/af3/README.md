@@ -39,7 +39,7 @@ its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 
 ```
 cd native/af3
-nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcupti -o af3
+nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -o af3
 node --js-float16array --max-old-space-size=24000 export-model.mjs weights --weights-only
 node --js-float16array export-model.mjs in --no-weights --sequence=<SEQ> [--a3m=...]
 ./af3 in --weights=weights --fold --fast --out=fold.pdb

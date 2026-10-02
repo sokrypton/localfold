@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
     else if (!strcmp(argv[i], "--no-tf32")) F32_TF32 = false;
     else if (!strcmp(argv[i], "--no-tri-bf16")) TRI_BF16 = false;
+    else if (!strcmp(argv[i], "--no-tri-lt")) TRI_LT_TILE = false;
     else if (!strcmp(argv[i], "--stages")) STAGES = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
