@@ -2,8 +2,16 @@
 
 A native CUDA/cuBLAS AlphaFold 3, transcribed stage by stage from this repository's CPU
 references under `src/af3/` (the specification) and checked against af3-any-model's own
-oracle dumps in `oracle-dumps/`. Proteins fold end to end from a sequence (and optionally an
-A3M), with pLDDT, PAE, PDE and pTM.
+oracle dumps in `oracle-dumps/`, for all seven AF3-lineage families (AlphaFold 3, Protenix-2,
+Boltz-2, IntelliFold-2, RoseTTAFold3, OpenBind-0, OpenDDE). It takes what AlphaFold 3 takes - an
+AF3 job JSON in either dialect (all fourteen of AF3's example jobs fold), or a sequence with
+alignments - proteins, DNA, RNA, CCD and SMILES ligands, glycans, ions, modified residues and
+bases, covalent bonds, templates, several seeds and samples, its own `userCCD` - and, with
+`--search`, fetches the alignments and templates itself. It writes what AF3 writes: the structure
+(PDB or mmCIF), pLDDT, PAE, PDE, contact probabilities, pTM/ipTM and their per-chain forms,
+`has_clash`, `fraction_disordered` and the ranking score (exact against AF3's own functions), the
+ranking CSV, and on request the embeddings and the distogram. 6MRR folds in 0.45 s warm, a
+1044-token complex in 8.4 s; `--af3-defaults` runs AF3's own 10 recycles and 5 samples.
 
 ## Build and run
 
