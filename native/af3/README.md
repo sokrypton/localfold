@@ -76,16 +76,28 @@ the WebGPU trunk's pairformer.
 
 ## What made it fast
 
-Trunk: cached scratch; tensor cores, FP16 end to end with f32 residuals (LayerNorms write 16-bit
-directly); the grid attention as a FlashAttention-2 kernel on `mma.sync` (S, P, O in registers,
-cp.async double buffering, ldmatrix, log2-domain scores; head widths 16 and 32); fused q/k/v/gate
-and projection/gate GEMMs; residual adds folded into GEMMs (beta = 1).
+Trunk: tensor cores, FP16 end to end with f32 residuals; the pair track's row-wise work as fused
+kernels - each a warp's 16 rows held as MMA fragments in registers, weights streamed through
+shared memory - so the wide intermediates never reach HBM: the triangle multiplication's input
+side (LN, projection, gate, the output gate's logits; a and b written channel-major), its output
+side (center norm, output projection, gated residual) around one cuBLAS batched contraction; the
+pair transition (LN, both GEMMs, SwiGLU, residual); grid attention's input (LN, q/k/v/gate and the
+pair bias in one pass, the column direction reading its rows transposed in place) and the column
+direction's output projection; the single track's pair logits. The grid attention itself is a
+FlashAttention-2 kernel on `mma.sync` (S, P, O in registers, cp.async double buffering, ldmatrix,
+log2-domain scores) - occupancy-bound at ~65 TFLOP/s, see below. The MSA stack in f16 too.
 
 Diffusion: everything derived from the conditioning computed once per fold (atom pair
 conditioning and pair logits, every block's adaptive-LayerNorm scales/shifts and zero-init gates,
-the transformer's 24 pair-logit sets); the transformer's 144 conditioning projections as two
-GEMMs per step with each block's LayerNorm scale folded into its weights; the whole step replayed
-as a CUDA graph; the transformer in FP16.
+the transformer's 24 pair-logit sets as f16 flash biases); the transformer's 144 conditioning
+projections as two GEMMs per step with each block's LayerNorm scale folded into its weights
+(folded on the device); the whole step replayed as a CUDA graph; the sampler on the device, its
+Gaussians a counter-based hash computed where they are used; the atom blocks' keys and values
+projected once per atom and gathered; a split-over-keys flash kernel for the transformer's few
+blocks at small n; `--samples` batched through the whole denoiser.
+
+Start-up: model.bin mapped and copied to the device in one transfer; every fused weight
+concatenated on the device. A first fold is within 5-15% of a warm one.
 
 ## Ligands, modified residues, nucleic acids
 
