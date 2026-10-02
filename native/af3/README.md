@@ -100,7 +100,9 @@ node ... export-model.mjs data-job --job=../../tools/fixtures/af3-jobs/kras_g12c
 
 `--job` reads an AlphaFold 3 job JSON (either dialect) with the page's own reader
 (`web/job-json.js`, `web/entities.js`): chains and their kinds, CCD and SMILES ligands, modified
-residues, `bondedAtomPairs`, and the first model seed (the native run's default `--seed`). Seven of
+residues, `bondedAtomPairs`, and the first model seed (the native run's default `--seed`) - and,
+unlike the page, the `unpairedMsa` / `pairedMsa` AF3's data pipeline writes into the job, which
+become the alignment (5CAJ with 200 inline rows: 2.02 A, pLDDT 94.2). Seven of
 AF3's examples fold single-sequence: ubiquitin, calmodulin + 4 Ca, KRAS G12C + covalent sotorasib
 (SG-C25 1.53 A - bonded), ERK2 with two phosphorylations, streptavidin + SMILES biotin, the TetR
 dimer on DNA (476 tokens), U1A on an RNA hairpin.

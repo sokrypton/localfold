@@ -82,10 +82,37 @@ if (option("job", "") !== "") {
   if (sequence !== "") throw new Error("--job and --sequence both name the input");
   const { jobFromJson } = await import(`${repo}/web/job-json.js`);
   const { expandEntities } = await import(`${repo}/web/entities.js`);
-  const job = jobFromJson(readFileSync(option("job", ""), "utf8"));
+  // AlphaFold 3's data pipeline writes its alignments INTO the job (unpairedMsa / pairedMsa per
+  // chain); the page's reader refuses them, so they are lifted out here, per chain copy in the
+  // order expandEntities numbers chains (polymers in file order), and used as the alignment.
+  const raw = JSON.parse(readFileSync(option("job", ""), "utf8"));
+  const jobs = Array.isArray(raw) ? raw : [raw];
+  const inlineMsa = { unpaired: [], paired: [] };
+  for (const entry of jobs[0]?.sequences ?? []) {
+    const [kind, body] = Object.entries(entry)[0] ?? [];
+    if (!["protein", "rna", "dna"].includes(kind) || body === undefined) continue;
+    const copies = Array.isArray(body.id) ? body.id.length : 1;
+    for (let c = 0; c < copies; c += 1) {
+      inlineMsa.unpaired.push(body.unpairedMsa || null);
+      inlineMsa.paired.push(body.pairedMsa || null);
+    }
+    delete body.unpairedMsa; delete body.pairedMsa;
+    for (const field of ["unpairedMsaPath", "pairedMsaPath"]) {
+      if (body[field] !== undefined) throw new Error(`${field}: give the alignment inline or with --a3m`);
+    }
+  }
+  const job = jobFromJson(JSON.stringify(raw));
   for (const note of job.notes) console.log(`job: ${note}`);
   jobRequest = expandEntities(job.entities);
   sequence = jobRequest.sequence;
+  if (inlineMsa.unpaired.some(Boolean) || inlineMsa.paired.some(Boolean)) {
+    const { mergeRowAlignedChainA3ms } = await import(`${repo}/src/input/chains.js`);
+    const fill = (list) => list.map((text, i) => text ?? `>query\n${jobRequest.chains[i]}\n`);
+    const merged = (list) => (list.some(Boolean) ? (list.length === 1 ? fill(list)[0] : mergeRowAlignedChainA3ms(fill(list))) : null);
+    jobRequest.alignment = { unpaired: merged(inlineMsa.unpaired), paired: merged(inlineMsa.paired) };
+    console.log(`job: inline alignments for ${inlineMsa.unpaired.filter(Boolean).length} chains (unpaired),`
+      + ` ${inlineMsa.paired.filter(Boolean).length} (paired)`);
+  }
   if (job.seed !== undefined) entries.push(["m", "job.seed", job.seed]);
   console.log(`job ${job.name ?? "(unnamed)"}: ${jobRequest.chains.length} chains (${jobRequest.chainKinds.join(", ")}),`
     + ` ${jobRequest.ligandCodes.length} ligands, ${jobRequest.modifications.length} modifications,`
@@ -101,8 +128,9 @@ if (sequence !== "") {
   const texts = (spec) => (spec === "" ? null : spec.split(",").map((path) => readFileSync(path.trim(), "utf8")));
   const merge = (list) => (list === null ? null : (list.length === 1 ? list[0] : mergeRowAlignedChainA3ms(list)));
   const unpaired = texts(option("a3m", "")), paired = texts(option("paired-a3m", ""));
-  const alignment = unpaired === null && paired === null ? null
-    : (paired === null && unpaired.length === 1 ? unpaired[0] : { paired: merge(paired), unpaired: merge(unpaired) });
+  if (jobRequest?.alignment && (unpaired || paired)) throw new Error("the job carries its alignments; --a3m would replace them");
+  const alignment = jobRequest?.alignment ?? (unpaired === null && paired === null ? null
+    : (paired === null && unpaired.length === 1 ? unpaired[0] : { paired: merge(paired), unpaired: merge(unpaired) }));
   // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna
   // (one per ":"-chain), --modify=SEP@3[@chain] (the position as tools/gpu/probe-modified.js takes it, chain index from 0)
   const { ccdUrl, parseCcdComponent } = await import(`${repo}/src/af3/featurise/ccd-component.js`);
