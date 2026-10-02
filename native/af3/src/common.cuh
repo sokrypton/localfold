@@ -17,6 +17,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <tuple>
 #include <sstream>
 #include <thread>
 #include <string>

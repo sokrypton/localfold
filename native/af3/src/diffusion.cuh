@@ -229,6 +229,19 @@ __global__ void layerNormPlainK(const float* in, TO* out, size_t rows, int C) {
   for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>((x[c] - mean) * inv);
 }
 // [LN0(x) | 1] and [x | 1], rows of C+1: the inputs of the two conditioning GEMMs
+// cuBLAS's kernel choice moves with the ROW count, not just the shape: 68 rows computed as 80 run the
+// N = 768 projections 6.7 -> 5.1 us, 261 as 272 the N = 3072 ones 14.6 -> 12.1, and a multiple of 16
+// was neutral at every other size measured (150, 522, 1044) - so the transformer's GEMMs run on the
+// row count rounded up to 16 (a fixed rule, not a timed one: the kernel picked must not depend on a
+// run's timing, or neither would the output). The padding rows compute values nobody reads.
+inline size_t padRows16(size_t M) { return (M + 15) / 16 * 16; }
+// a scratch buffer's padding rows zeroed when first seen (finite values in, finite out)
+inline void zeroOnce(void* p, size_t bytes) {
+  static std::map<void*, size_t> seen;
+  auto it = seen.find(p);
+  if (it != seen.end() && it->second >= bytes) return;
+  CK(cudaMemsetAsync(p, 0, bytes, STREAM)); seen[p] = bytes;
+}
 inline bool PRE_ADA = false;                  // the transformer's conditioning GEMMs are precomputed
 inline size_t PRE_ADA_BUDGET = (size_t)4 << 30;
 template <class TO>
@@ -608,17 +621,21 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     for (int k = 0; k < NS; ++k) CK(cudaMemcpyAsync(mr + (size_t)k * n, mask, n * 4, cudaMemcpyDeviceToDevice, STREAM));
     maskRows = mr;
   }
-  T* x = scratch<T>("dt.x", rows * C);
-  T* qkvg = scratch<T>("dt.qkvg", (rows + 128) * 4 * Wd);
+  size_t prows = std::is_same_v<T, half> ? padRows16(rows) : rows;   // the fast path's GEMM rows
+  T* x = scratch<T>("dt.x", prows * C);
+  T* qkvg = scratch<T>("dt.qkvg", (prows + 128) * 4 * Wd);
   float* logits = scratch<float>("dt.logits", (size_t)heads * pairs);
   T* P = scratch<T>("dt.P", (size_t)heads * pairs);
-  T* o = scratch<T>("dt.o", rows * Wd);
-  T* att = scratch<T>("dt.att", rows * C);
-  T* tn = scratch<T>("dt.tn", rows * C);
+  T* o = scratch<T>("dt.o", prows * Wd);
+  T* att = scratch<T>("dt.att", prows * C);
+  T* tn = scratch<T>("dt.tn", prows * C);
   int I = C * factor;
-  T* wide = scratch<T>("dt.wide", rows * 3 * I);
-  T* gated = scratch<T>("dt.gated", rows * I);
-  T* proj = scratch<T>("dt.proj", rows * C);
+  T* wide = scratch<T>("dt.wide", prows * 3 * I);
+  T* gated = scratch<T>("dt.gated", prows * I);
+  T* proj = scratch<T>("dt.proj", prows * C);
+  zeroOnce(x, prows * C * sizeof(T)); zeroOnce(o, prows * Wd * sizeof(T));
+  zeroOnce(tn, prows * C * sizeof(T)); zeroOnce(gated, prows * I * sizeof(T));
+
   // rf3's block wiring: the transition reads the block's INPUT (both still add to act)
   bool noResidual = M.flag(Tn + ".noResidual");
   float* pre = noResidual ? scratch<float>("dt.pre", rows * C) : nullptr;
@@ -631,7 +648,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     const T* zPrev = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C + C : nullptr;
     gatedAddAdaLn<T>(act, b > 0 ? proj : nullptr, zPrev, ldr, g, g + C, ldn, x, (int)rows, C, n);
     if (noResidual) CK(cudaMemcpyAsync(pre, act, rows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-    linear<T, T>(x, qkvg, rows, C, 4 * Wd, qkvgWeight(B, C, Wd, false));
+    { std::string wq = qkvgWeight(B, C, Wd, false); linear<T, T>(x, qkvg, prows, C, 4 * Wd, wq); }
     bool kqNorm = hasW(B + ".queryLayerNormScale");
     if (kqNorm) {
       addQBiasTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), (int)rows, Wd);
@@ -655,7 +672,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       }
       gateTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(o, qkvg, (int)rows, Wd);
     }
-    linear<T, T>(o, att, rows, Wd, C, B + ".Transition2");
+    linear<T, T>(o, att, prows, Wd, C, B + ".Transition2");
     if (noResidual) {
       gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, (T*)nullptr, (int)rows, C, n);
       gatedAddAdaLn<T>(pre, (const T*)nullptr, (const T*)nullptr, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
@@ -663,9 +680,9 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
     }
     bool up; std::string w1 = upGatedTransition1(B, C, I, up);
-    linear<T, T>(tn, wide, rows, C, up ? 3 * I : 2 * I, w1);
+    linear<T, T>(tn, wide, prows, C, up ? 3 * I : 2 * I, w1);
     swiglu<T>(wide, gated, rows, I, up);
-    linear<T, T>(gated, proj, rows, I, C, B + ".ffwTransition2");
+    linear<T, T>(gated, proj, prows, I, C, B + ".ffwTransition2");
   }
   // the last block's transition residual
   addGatedStridedK<T><<<blocks(rows * C), 256, 0, STREAM>>>(act, proj, gRaw + (size_t)(tc.nblocks - 1) * 2 * C + C, ldr,
