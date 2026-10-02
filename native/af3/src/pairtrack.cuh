@@ -203,9 +203,11 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
 }
 
 // ---------------------------------------------------------------- transition
+#include "fusedtransition.cuh"
 template <class T>
 void transition(float* x, size_t rows, int C, int factor, const std::string& pre) {
   int I = C * factor;
+  if constexpr (std::is_same_v<T, half>) if (fusedTransition(x, rows, C, I, pre)) return;
   size_t rowsPer = std::max<size_t>(1, CHUNK / (2 * I));
   T* xn = scratch<T>("tr.x", std::min(rowsPer, rows) * C);
   T* wide = scratch<T>("tr.wide", std::min(rowsPer, rows) * 2 * I);
