@@ -352,17 +352,34 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
 
 inline bool FUSED_TRIANGLE = true;
 constexpr int TI_WARPS = 16, TO_WARPS = 8;
-template <class TA>
-void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
-              TA* a, TA* b, half* t2, int n, int np, size_t cs) {
-  constexpr int C = 128, R = 16 * TI_WARPS;
+// rows a block, by size: a small input in the large tiles left most of the device idle (68 tokens:
+// 36 blocks of 256 rows on 108 SMs); the warps are the largest that still give two blocks an SM
+inline size_t MIN_BLOCKS = 54;      // swept: 68 tokens 89.3 -> 75.8 ms of trunk at 54, 150 tokens flat (108 and 216 slower there)
+inline int warpsFor(size_t rows, std::initializer_list<int> options) {
+  int last = 0;
+  for (int w : options) { last = w; if ((rows + 16 * w - 1) / (16 * w) >= MIN_BLOCKS) return w; }
+  return last;
+}
+template <class TA, int WARPS>
+void triInAt(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
+             TA* a, TA* b, half* t2, int n, int np, size_t cs) {
+  constexpr int C = 128, R = 16 * WARPS;
   size_t pp = (size_t)np * np;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * 16 * (R + 8) * 2 + 2 * tiStage(C);
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(triInK<C, TI_WARPS, TA>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-  triInK<C, TI_WARPS, TA><<<(unsigned)((pp + R - 1) / R), 32 * TI_WARPS, smem, STREAM>>>(
+  if (!attr) { CK(cudaFuncSetAttribute(triInK<C, WARPS, TA>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  triInK<C, WARPS, TA><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
     a, b, t2, n, np, cs);
+}
+template <class TA>
+void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
+              TA* a, TA* b, half* t2, int n, int np, size_t cs) {
+  switch (warpsFor((size_t)np * np, {TI_WARPS, 8, 4})) {
+    case 4: triInAt<TA, 4>(pair, mask, pre, pg, a, b, t2, n, np, cs); break;
+    case 8: triInAt<TA, 8>(pair, mask, pre, pg, a, b, t2, n, np, cs); break;
+    default: triInAt<TA, TI_WARPS>(pair, mask, pre, pg, a, b, t2, n, np, cs);
+  }
 }
 inline bool TRI_OUT_PERSISTENT = true;
 template <class TP>
@@ -586,21 +603,38 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
   }
 }
 constexpr int GI_WARPS = 8, GO_WARPS = 8;
-inline void gridIn128(const float* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
-                      size_t rows, bool tr, const half* Wb = nullptr, half* bias = nullptr, int heads = 0,
-                      int stride = 0, bool swap = false) {
-  constexpr int C = 128, NQ = 512, R = 16 * GI_WARPS;
+template <int WARPS>
+void gridInAt(const float* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
+              size_t rows, bool tr, const half* Wb, half* bias, int heads, int stride, bool swap) {
+  constexpr int C = 128, NQ = 512, R = 16 * WARPS;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * C * (64 + 8) * 2 + (size_t)C * 24 * 2;
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(gridInK<C, NQ, GI_WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-  gridInK<C, NQ, GI_WARPS><<<(unsigned)((rows + R - 1) / R), 32 * GI_WARPS, smem, STREAM>>>(
+  if (!attr) { CK(cudaFuncSetAttribute(gridInK<C, NQ, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  gridInK<C, NQ, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wq), out, n, q0, rows, tr, Wb, bias, heads, stride,
     swap);
 }
-inline void gridOut128(const half* gathered, const std::string& w, float* pair, int n, size_t q0, size_t rows, bool tr) {
-  constexpr int C = 128, WD = 128, R = 16 * GO_WARPS;
+inline void gridIn128(const float* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
+                      size_t rows, bool tr, const half* Wb = nullptr, half* bias = nullptr, int heads = 0,
+                      int stride = 0, bool swap = false) {
+  switch (warpsFor(rows, {GI_WARPS, 4, 2})) {
+    case 2: gridInAt<2>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
+    case 4: gridInAt<4>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
+    default: gridInAt<GI_WARPS>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap);
+  }
+}
+template <int WARPS>
+void gridOutAt(const half* gathered, const std::string& w, float* pair, int n, size_t q0, size_t rows, bool tr) {
+  constexpr int C = 128, WD = 128, R = 16 * WARPS;
   size_t smem = (size_t)WD * (C + 8) * 2 + (size_t)R * (WD + 8) * 2;
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(gridOutK<C, WD, GO_WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-  gridOutK<C, WD, GO_WARPS><<<(unsigned)((rows + R - 1) / R), 32 * GO_WARPS, smem, STREAM>>>(gathered, Wh(w), pair, n, q0, rows, tr);
+  if (!attr) { CK(cudaFuncSetAttribute(gridOutK<C, WD, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  gridOutK<C, WD, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wh(w), pair, n, q0, rows, tr);
+}
+inline void gridOut128(const half* gathered, const std::string& w, float* pair, int n, size_t q0, size_t rows, bool tr) {
+  switch (warpsFor(rows, {GO_WARPS, 4, 2})) {
+    case 2: gridOutAt<2>(gathered, w, pair, n, q0, rows, tr); break;
+    case 4: gridOutAt<4>(gathered, w, pair, n, q0, rows, tr); break;
+    default: gridOutAt<GO_WARPS>(gathered, w, pair, n, q0, rows, tr);
+  }
 }

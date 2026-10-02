@@ -57,6 +57,7 @@ int main(int argc, char** argv) {
   if (getenv("FLASH_WARPS")) FLASH_WARPS_OVERRIDE = atoi(getenv("FLASH_WARPS"));   // experiments
   if (getenv("FT_WARPS")) FT_WARPS = atoi(getenv("FT_WARPS"));
   if (getenv("TRI_PAD")) TRI_PAD = atoi(getenv("TRI_PAD"));
+  if (getenv("MIN_BLOCKS")) MIN_BLOCKS = strtoull(getenv("MIN_BLOCKS"), nullptr, 10);
   if (getenv("TRI_OUT_PERSISTENT")) TRI_OUT_PERSISTENT = atoi(getenv("TRI_OUT_PERSISTENT"));
   if (profile) prof::init();
   CB(cublasCreate(&H));

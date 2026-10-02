@@ -115,8 +115,9 @@ void fusedTransitionAt(float* x, size_t rows, int C, int I, const std::string& p
 // x += transition(x) for C = 128, f16 weights; false if the shape is not this kernel's
 inline bool fusedTransition(float* x, size_t rows, int C, int I, const std::string& pre) {
   if (!FUSED_TRANSITION || C != 128 || I % FT_NC) return false;
-  if (FT_WARPS == 4) fusedTransitionAt<4>(x, rows, C, I, pre);
-  else if (FT_WARPS == 16) fusedTransitionAt<16>(x, rows, C, I, pre);
+  int warps = FT_WARPS == 8 && (rows + 127) / 128 < MIN_BLOCKS ? 4 : FT_WARPS;   // a small input: more, smaller blocks
+  if (warps == 4) fusedTransitionAt<4>(x, rows, C, I, pre);
+  else if (warps == 16) fusedTransitionAt<16>(x, rows, C, I, pre);
   else fusedTransitionAt<8>(x, rows, C, I, pre);
   return true;
 }
