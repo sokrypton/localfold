@@ -23,7 +23,7 @@ const option = (name, fallback) =>
   args.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback;
 const bundle = option("bundle", "http://127.0.0.1:8791/model-af3-full-f32/manifest.json");
 const batchPath = option("batch", `${repo}/oracle-dumps/af3-batch-alphafold3-6mrr.json`);
-const oracles = (option("oracles", option("sequence", "") === "" ? "trunk,denoise,realdenoise,confidence" : ""))
+const oracles = (option("oracles", option("sequence", "") === "" && option("job", "") === "" ? "trunk,denoise,realdenoise,confidence" : ""))
   .split(",").filter(Boolean);
 
 const { openAf3Store, trunkWeights, trunkDepths, confidenceWeights } =
@@ -73,8 +73,24 @@ add("targetFeat", await targetFeatureWeights(store));
 add("atomReference", await atomReference(store));
 
 // The batch: featurised here from --sequence (chains joined by ":") and an optional --a3m,
-// through the same function the page and fold.js use; otherwise read from an AF3 batch dump.
-const sequence = option("sequence", "");
+// through the same function the page and fold.js use; or from an AlphaFold 3 job JSON (--job),
+// read by the page's own reader (web/job-json.js, web/entities.js); otherwise read from an AF3
+// batch dump.
+let sequence = option("sequence", "");
+let jobRequest = null;
+if (option("job", "") !== "") {
+  if (sequence !== "") throw new Error("--job and --sequence both name the input");
+  const { jobFromJson } = await import(`${repo}/web/job-json.js`);
+  const { expandEntities } = await import(`${repo}/web/entities.js`);
+  const job = jobFromJson(readFileSync(option("job", ""), "utf8"));
+  for (const note of job.notes) console.log(`job: ${note}`);
+  jobRequest = expandEntities(job.entities);
+  sequence = jobRequest.sequence;
+  if (job.seed !== undefined) entries.push(["m", "job.seed", job.seed]);
+  console.log(`job ${job.name ?? "(unnamed)"}: ${jobRequest.chains.length} chains (${jobRequest.chainKinds.join(", ")}),`
+    + ` ${jobRequest.ligandCodes.length} ligands, ${jobRequest.modifications.length} modifications,`
+    + ` ${(jobRequest.bonds ?? []).length} bonds${job.seed === undefined ? "" : `, seed ${job.seed}`}`);
+}
 let batch;
 if (sequence !== "") {
   const { af3BatchFromA3m } = await import(`${repo}/src/af3/featurise/batch.js`);
@@ -97,16 +113,26 @@ if (sequence !== "") {
     return parseCcdComponent(await response.text());
   };
   const ligands = [];
+  const modifications = [];
+  let kinds = option("kinds", "");
+  if (jobRequest !== null) {           // the page's own resolution (web/af3-model.js)
+    for (const entry of jobRequest.ligandCodes) {
+      ligands.push(typeof entry === "string" ? await ccd(entry)
+        : await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
+    }
+    for (const m of jobRequest.modifications) {
+      modifications.push({ chain: m.chain, position: m.position, ...(await ccd(m.code)) });
+    }
+    kinds = jobRequest.chainKinds.join(",");
+  }
   for (const code of option("ligands", "").split(",").filter(Boolean)) ligands.push(await ccd(code));
   const smiles = option("smiles", "").split("|").filter(Boolean);
   const smilesNames = nameSmilesLigands(smiles);
   for (let i = 0; i < smiles.length; i += 1) ligands.push(await smilesComponent(smiles[i], { code: smilesNames[i] }));
-  const modifications = [];
   for (const spec of option("modify", "").split(",").filter(Boolean)) {
     const [code, at, chain] = spec.split("@");
     modifications.push({ chain: Number(chain ?? 0), position: Number(at), ...(await ccd(code)) });
   }
-  const kinds = option("kinds", "");
   batch = af3BatchFromA3m(sequence, alignment, {
     maxSequences: Number(option("max-msa", "512")),
     seed: Number(option("seed", "20260831")),
@@ -114,6 +140,7 @@ if (sequence !== "") {
     ...(ligands.length === 0 ? {} : { ligands }),
     ...(modifications.length === 0 ? {} : { modifications }),
     ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
+    ...(jobRequest?.bonds === undefined ? {} : { bonds: jobRequest.bonds }),
   }).batch;
 } else {
   batch = batchFromDump(JSON.parse(readFileSync(batchPath, "utf8")));

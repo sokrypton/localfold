@@ -95,7 +95,15 @@ node ... export-model.mjs data-dna --sequence=<SEQ>:GCGATCGC:GCGATCGC --kinds=pr
 node ... export-model.mjs data-smi --sequence=<SEQ> --smiles='OCC(O)CO'
 node ... export-model.mjs data-ab --sequence=<A>:<B> --a3m=a.a3m,b.a3m [--paired-a3m=pa.a3m,pb.a3m]
 node bonds.mjs fold.pdb GOL        # bond lengths by class, ideals from the CCD
+node ... export-model.mjs data-job --job=../../tools/fixtures/af3-jobs/kras_g12c_sotorasib.json
 ```
+
+`--job` reads an AlphaFold 3 job JSON (either dialect) with the page's own reader
+(`web/job-json.js`, `web/entities.js`): chains and their kinds, CCD and SMILES ligands, modified
+residues, `bondedAtomPairs`, and the first model seed (the native run's default `--seed`). Seven of
+AF3's examples fold single-sequence: ubiquitin, calmodulin + 4 Ca, KRAS G12C + covalent sotorasib
+(SG-C25 1.53 A - bonded), ERK2 with two phosphorylations, streptavidin + SMILES biotin, the TetR
+dimer on DNA (476 tokens), U1A on an RNA hairpin.
 
 The featuriser is the repository's own; the trunk adds the bond embedding (one column, bias-free).
 The PDB is written through the page's own `toPdb` records (exported as `template.pdb`): chains,
