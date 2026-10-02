@@ -1,6 +1,10 @@
 // Shared infrastructure: the exported model file, device weights, scratch, cuBLAS.
 #pragma once
 #include <cublas_v2.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -30,7 +34,9 @@ inline cudaStream_t STREAM = cudaStreamPerThread;
 struct Entry { char kind; size_t offset, length; double value; };
 struct Model {
   std::map<std::string, Entry> index;
-  std::vector<float> data;               // int32 entries are stored as their bits
+  const float* data = nullptr;           // model.bin, mapped; int32 entries are stored as their bits
+  size_t bytes = 0;
+  float* device = nullptr;               // the whole file on the device, uploaded on first use
   void load(const std::string& dir) {
     std::ifstream idx(dir + "/model.idx");
     if (!idx) { fprintf(stderr, "no %s/model.idx\n", dir.c_str()); exit(1); }
@@ -41,10 +47,24 @@ struct Model {
       if (kind == 'm') in >> e.value; else in >> e.offset >> e.length;
       index[name] = e;
     }
-    std::ifstream bin(dir + "/model.bin", std::ios::binary | std::ios::ate);
-    size_t bytes = bin.tellg(); bin.seekg(0);
-    data.resize(bytes / 4);
-    bin.read((char*)data.data(), bytes);
+    // mapped, not read: a 1.4 GB read into a host vector was 1.7 s of every run
+    int fd = open((dir + "/model.bin").c_str(), O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "no %s/model.bin\n", dir.c_str()); exit(1); }
+    struct stat st; fstat(fd, &st); bytes = (size_t)st.st_size;
+    void* p = mmap(nullptr, std::max<size_t>(bytes, 1), PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) { fprintf(stderr, "cannot map %s/model.bin\n", dir.c_str()); exit(1); }
+    close(fd);
+    data = (const float*)p;
+  }
+  // the device copy of an entry: one allocation and one copy for the whole file
+  const float* dev(const std::string& k) {
+    if (!device) {
+      if (cudaMalloc(&device, std::max<size_t>(bytes, 4)) != cudaSuccess ||
+          cudaMemcpy(device, data, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        fprintf(stderr, "cannot put model.bin (%zu bytes) on the device\n", bytes); exit(1);
+      }
+    }
+    return device + at(k).offset;
   }
   bool has(const std::string& k) const { return index.count(k) > 0; }
   const Entry& at(const std::string& k) const {
@@ -55,8 +75,8 @@ struct Model {
   double meta(const std::string& k) const { return at(k).value; }
   double meta(const std::string& k, double fallback) const { return has(k) ? at(k).value : fallback; }
   bool flag(const std::string& k) const { return has(k) && at(k).value != 0; }
-  const float* f(const std::string& k) const { return data.data() + at(k).offset; }
-  const int* i(const std::string& k) const { return (const int*)(data.data() + at(k).offset); }
+  const float* f(const std::string& k) const { return data + at(k).offset; }
+  const int* i(const std::string& k) const { return (const int*)(data + at(k).offset); }
   size_t len(const std::string& k) const { return at(k).length; }
 };
 inline Model M;
@@ -94,11 +114,9 @@ inline size_t lenW(const std::string& k) { return SYNTH.count(k) ? SYNTH[k].size
 inline const float* W(const std::string& k) {
   auto it = WF.find(k);
   if (it != WF.end()) return it->second;
-  const float* host; size_t n;
-  if (SYNTH.count(k)) { host = SYNTH[k].data(); n = SYNTH[k].size(); }
-  else { host = M.f(k); n = M.len(k); }
-  WLEN[k] = n;
-  return WF[k] = upload(host, n);
+  if (SYNTH.count(k)) { WLEN[k] = SYNTH[k].size(); return WF[k] = upload(SYNTH[k].data(), SYNTH[k].size()); }
+  WLEN[k] = M.len(k);
+  return WF[k] = const_cast<float*>(M.dev(k));
 }
 inline const half* Wh(const std::string& k) {
   auto it = WH.find(k);
@@ -112,7 +130,7 @@ inline const int* Idev(const std::string& k) {
   static std::map<std::string, int*> cache;
   auto it = cache.find(k);
   if (it != cache.end()) return it->second;
-  return cache[k] = upload(M.i(k), M.len(k));
+  return cache[k] = (int*)M.dev(k);
 }
 inline const float* Fdev(const std::string& k) {     // non-weight float inputs (batch fields)
   return W(k);
