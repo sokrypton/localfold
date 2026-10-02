@@ -164,6 +164,14 @@ Parts joined by `+` share one slot, as AF3 puts each chain's k-th template in sl
 `score.py <pred> <ref> A,D` scores a complex: one superposition over all chains, each chain also
 alone, residues paired by aligning the sequences (a numbering gap in the reference shifts nothing).
 
+## Many inputs
+
+`native/af3/fold --batch=<file>` folds every line of `<file>` (`<out.pdb> <input flags>`) in one
+`af3` process (`af3 dir1,dir2,... --out=a.pdb,b.pdb` underneath): the weights load once and every
+fold after the first skips CUDA's start-up, the weight upload and the first fold's warm-up -
+three folds in 3.1 s where three commands take 5.1. Each input's outputs are byte-identical to
+folding it alone.
+
 ## The gate
 
 `python3 native/af3/gate.py` folds 6MRR from its sequence through all seven models, plus 5CAJ and

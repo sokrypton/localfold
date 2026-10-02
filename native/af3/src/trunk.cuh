@@ -86,6 +86,13 @@ inline Trunk makeTrunk(const float* targetFeatHost, int msaCap) {
   return t;
 }
 
+inline void freeTrunk(Trunk& t) {
+  for (void* p : {(void*)t.pair, (void*)t.single, (void*)t.msa, (void*)t.targetFeat, (void*)t.pairMask, (void*)t.seqMask,
+                  (void*)t.msaMask, (void*)t.prevPair, (void*)t.prevSingle, (void*)t.msaRows, (void*)t.deletion})
+    if (p) CK(cudaFree(p));
+  t = Trunk{};
+}
+
 template <class T> void templateEmbedding(Trunk& t, float* pairOut);
 __global__ void bondEmbedK(float* pair, const float* bonds, const float* w, size_t pairs, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

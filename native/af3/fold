@@ -9,14 +9,20 @@
 # --model=<name> picks the bundle (model-<name>-full-f32, -f32 or -int5, in that order; default
 # af3) and keeps its exported weights in native/af3/weights-<name>.
 #
+#   native/af3/fold --batch=<file> [--model=<name>] [-- <fold flags>]
+# folds every line of <file> - "<out.pdb> <input flags>" - in ONE af3 process: the weights load
+# once and every fold after the first runs warm (6MRR: 1.7 s a command, ~0.5 s a batch line).
+#
 # Input flags go to export-model.mjs (--sequence, --a3m, --paired-a3m, --job, --ligands, --smiles,
 # --modify, --kinds, --template, --bundle); fold flags to ./af3 (--samples, --recycles, --steps,
 # --seed, ...), which runs --fold --fast. Builds ./af3 if it is missing, exports the weights once
 # (to native/af3/weights) and each input to a temporary directory.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-[ $# -ge 1 ] || { sed -n '2,13p' "$0"; exit 1; }
-out="$1"; shift
+[ $# -ge 1 ] || { sed -n '2,17p' "$0"; exit 1; }
+batch=""
+case "$1" in --batch=*) batch="${1#--batch=}"; out="" ;; *) out="$1" ;; esac
+shift
 inputs=(); foldflags=(); model=af3
 while [ $# -gt 0 ]; do
   if [ "$1" = "--" ]; then shift; foldflags=("$@"); break; fi
@@ -37,5 +43,19 @@ fi
 node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")
 [ -f "$weights/model.idx" ] || "${node[@]}" "$weights" --weights-only --bundle="$bundle"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-"${node[@]}" "$tmp" --no-weights --bundle="$bundle" "${inputs[@]}"
-"$here/af3" "$tmp" --weights="$weights" --fold --fast --out="$out" "${foldflags[@]}"
+if [ -z "$batch" ]; then
+  "${node[@]}" "$tmp" --no-weights --bundle="$bundle" "${inputs[@]}"
+  "$here/af3" "$tmp" --weights="$weights" --fold --fast --out="$out" "${foldflags[@]}"
+  exit
+fi
+dirs=(); outs=(); k=0
+while read -r line; do
+  [ -z "$line" ] && continue
+  case "$line" in \#*) continue ;; esac
+  eval "set -- $line"
+  dir="$tmp/$k"; k=$((k + 1))
+  "${node[@]}" "$dir" --no-weights --bundle="$bundle" "${@:2}" "${inputs[@]}"
+  dirs+=("$dir"); outs+=("$1")
+done < "$batch"
+[ ${#dirs[@]} -gt 0 ] || { echo "no inputs in $batch" >&2; exit 1; }
+"$here/af3" "$(IFS=,; echo "${dirs[*]}")" --weights="$weights" --fold --fast --out="$(IFS=,; echo "${outs[*]}")" "${foldflags[@]}"

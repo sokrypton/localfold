@@ -37,13 +37,21 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--weights=", 10)) weightsDir = argv[i] + 10;
   }
   auto t0 = std::chrono::steady_clock::now();
-  M.load(argv[1]); DATA_DIR = argv[1];
+  // a batch: `af3 dir1,dir2,... --out=a.pdb,b.pdb` folds each input in this one process, the weights
+  // loaded once and every kernel, weight copy and cuBLAS plan warm after the first
+  auto splitList = [](const std::string& text) {
+    std::vector<std::string> parts; std::string part; std::istringstream in(text);
+    while (std::getline(in, part, ',')) if (!part.empty()) parts.push_back(part);
+    return parts;
+  };
+  std::vector<std::string> inputs = splitList(argv[1]), outs = splitList(out);
+  if (inputs.size() > 1 && outs.size() != inputs.size()) {
+    fprintf(stderr, "%zu inputs and %zu --out paths: a batch names one output per input\n", inputs.size(), outs.size()); return 1;
+  }
   if (!weightsDir.empty()) M.load(weightsDir);      // the weights exported once (--weights-only)
-  { const float* sm = M.f("batch.seqMask"); size_t k = M.len("batch.seqMask"); MASK_ALL_ONES = true;
-    for (size_t i = 0; i < k; ++i) if (!(sm[i] > 0)) MASK_ALL_ONES = false; }
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;
-  if (!seedGiven && M.has("job.seed")) seed = (uint64_t)M.meta("job.seed");   // the job's own modelSeeds[0]
+  const uint64_t seedArg = seed;
   if (getenv("FLASH_WARPS")) FLASH_WARPS_OVERRIDE = atoi(getenv("FLASH_WARPS"));   // experiments
   if (getenv("FT_WARPS")) FT_WARPS = atoi(getenv("FT_WARPS"));
   if (getenv("TRI_PAD")) TRI_PAD = atoi(getenv("TRI_PAD"));
@@ -51,6 +59,13 @@ int main(int argc, char** argv) {
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
   { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
+  Trunk t{};
+  auto runInput = [&](size_t which) -> int {
+  M.load(inputs[which]); DATA_DIR = inputs[which];
+  if (inputs.size() > 1) out = outs[which];
+  { const float* sm = M.f("batch.seqMask"); size_t k = M.len("batch.seqMask"); MASK_ALL_ONES = true;
+    for (size_t i = 0; i < k; ++i) if (!(sm[i] > 0)) MASK_ALL_ONES = false; }
+  seed = !seedGiven && M.has("job.seed") ? (uint64_t)M.meta("job.seed") : seedArg;   // the job's own modelSeeds[0]
   printf("loaded %zu entries in %.1f s; %d tokens\n", M.index.size(),
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          (int)M.meta("batch.tokens"));
@@ -163,7 +178,7 @@ int main(int argc, char** argv) {
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
   if (oracleTargetFeat)
     targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
-  Trunk t = makeTrunk(targetFeat.data(), msaCap);
+  t = makeTrunk(targetFeat.data(), msaCap);
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
   for (int fi = 0; doFold && fi < folds; ++fi) {
@@ -318,7 +333,8 @@ int main(int argc, char** argv) {
     printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d), confidence %.1f ms, total %.1f ms\n",
            fi + 1, ms(f0, f1), recycles + 1, diffMs, steps, samples, confMs, ms(f0, f3));
     if (profiling) prof::stop(40);
-    if (fi == 0) unreadWeights();
+    if (fi == 0 && which == 0) unreadWeights();
+    if (df.graph) CK(cudaGraphExecDestroy(df.graph));
     if (fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
@@ -340,6 +356,19 @@ int main(int argc, char** argv) {
   if (STAGES) {
     double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
     for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v / std::max(1, repeat - 1), 100 * v / total);
+  }
+  return 0;
+  };
+  for (size_t which = 0; which < inputs.size(); ++which) {
+    int seg = (int)M.segs.size();
+    int code = runInput(which);
+    if (code) return code;
+    if (which + 1 < inputs.size()) {       // the next input reads its own fields afresh
+      CK(cudaDeviceSynchronize());
+      freeTrunk(t);
+      CHIRALITY = Chirality{};
+      forgetEntries(M.unload(seg));
+    }
   }
   return 0;
 }

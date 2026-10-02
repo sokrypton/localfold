@@ -61,6 +61,19 @@ struct Model {
     close(fd);
     segs.push_back({(const float*)p, bytes, nullptr});
   }
+  // drop a directory's entries, its mapping and its device copy (one input of a batch, done);
+  // returns the names it held so the caches keyed on them can be cleared too
+  std::vector<std::string> unload(int seg) {
+    std::vector<std::string> names;
+    for (auto it = index.begin(); it != index.end();) {
+      if (it->second.seg == seg) { names.push_back(it->first); touched.erase(it->first); it = index.erase(it); }
+      else ++it;
+    }
+    Segment& s = segs[seg];
+    if (s.device) { cudaDeviceSynchronize(); cudaFree(s.device); s.device = nullptr; }
+    if (s.data) { munmap((void*)s.data, std::max<size_t>(s.bytes, 1)); s.data = nullptr; }
+    return names;
+  }
   // the device copy of an entry: one allocation and one copy per file
   const float* dev(const std::string& k) {
     const Entry& e = at(k);
@@ -208,6 +221,14 @@ inline const int* Idev(const std::string& k) {
   auto it = IDEV.find(k);
   if (it != IDEV.end()) return it->second;
   return IDEV[k] = (int*)M.dev(k);
+}
+// an unloaded input's device views and f16 copies, so the next input's fields are read afresh
+inline void forgetEntries(const std::vector<std::string>& names) {
+  for (auto& k : names) {
+    auto h = WH.find(k);
+    if (h != WH.end()) { cudaFree(h->second); WH.erase(h); }
+    WF.erase(k); WLEN.erase(k); IDEV.erase(k);
+  }
 }
 inline const float* Fdev(const std::string& k) {     // non-weight float inputs (batch fields)
   return W(k);

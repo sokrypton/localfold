@@ -704,11 +704,14 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   float* qUid = scratch<float>("enc.qUid", qRows); float* kUid = scratch<float>("enc.kUid", kRows);
   convert(t2q, Fdev("batch.refPos"), qPos, 3);
   convert(q2k, qPos, kPos, 3);
-  static float* uidF = nullptr;
-  if (!uidF) {
+  // the batch's own uids, every time: a process-wide cache handed OpenDDE's structural-token
+  // diffusion the RESIDUE batch's (the target_feat encoder ran first), the wrong length and order
+  float* uidF = scratch<float>("enc.uid", M.len("batch.refSpaceUid"));
+  {
     std::vector<float> u(M.len("batch.refSpaceUid"));
     for (size_t i = 0; i < u.size(); ++i) u[i] = (float)M.i("batch.refSpaceUid")[i];
-    uidF = upload(u.data(), u.size());
+    CK(cudaMemcpyAsync(uidF, u.data(), u.size() * 4, cudaMemcpyHostToDevice, STREAM));
+    CK(cudaStreamSynchronize(STREAM));     // u is a host temporary
   }
   convert(t2q, uidF, qUid, 1);
   convert(q2k, qUid, kUid, 1);
@@ -776,8 +779,9 @@ __global__ void chiralGradK(const float* positions, const int* centers, const fl
   for (int a = 0; a < 3; ++a) grads[t * 3 + a] = (float)g[a];
 }
 struct Chirality { int *centers, *offsets, *entries; float* angles; size_t atoms; };
+inline Chirality CHIRALITY{};                               // reset with each input of a batch
 inline const Chirality& chirality(size_t atoms) {           // the inverted index, once per input
-  static Chirality c{};
+  Chirality& c = CHIRALITY;
   if (!c.centers) {
     int count = (int)M.meta("chiral.count");
     const int* centers = M.i("chiral.centers");
