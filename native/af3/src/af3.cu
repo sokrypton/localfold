@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 0, folds = 1;
   uint64_t seed = 42; std::string out = "fold.pdb";
   for (int i = 2; i < argc; ++i) {
-    if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = true;
+    if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = true;
     else if (!strcmp(argv[i], "--stages")) STAGES = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
@@ -42,10 +42,12 @@ int main(int argc, char** argv) {
 
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-ops=", 12)) { benchOps(atoi(argv[i] + 12)); return 0; }
   // One denoiser call on AF3's own inputs, against AF3's own output.
-  if (M.has("oracle.denoise.output")) {
+  for (const char* which : {"denoise", "realdenoise"}) {
+    std::string O = std::string("oracle.") + which + ".";
+    if (!M.has(O + "output")) continue;
     int n = (int)M.meta("batch.tokens");
     for (const char* g : {"token_atoms_to_queries", "queries_to_keys", "queries_to_token_atoms", "tokens_to_queries", "tokens_to_keys"}) {
-      std::string o = std::string("oracle.denoise.inputs.") + g + ":gather_idxs";
+      std::string o = O + "inputs." + g + ":gather_idxs";
       std::string mine = std::string(g) == "token_atoms_to_queries" ? "batch.tokenAtomsToQueries.indices"
         : std::string(g) == "queries_to_keys" ? "batch.queriesToKeys.indices"
         : std::string(g) == "queries_to_token_atoms" ? "batch.queriesToTokenAtoms.indices"
@@ -55,17 +57,17 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < len; ++i) diff += (int)M.f(o)[i] != M.i(mine)[i];
       printf("  gather %-24s %zu of %zu differ from the batch\n", g, diff, len);
     }
-    float* single = upload(M.f("oracle.denoise.inputs.single"), M.len("oracle.denoise.inputs.single"));
-    float* pair = upload(M.f("oracle.denoise.inputs.pair"), M.len("oracle.denoise.inputs.pair"));
-    float* sIn = upload(M.f("oracle.denoise.inputs.sInputs"), M.len("oracle.denoise.inputs.sInputs"));
-    float* pos = upload(M.f("oracle.denoise.inputs.posNoisy"), M.len("oracle.denoise.inputs.posNoisy"));
-    float* seqm = upload(M.f("oracle.denoise.inputs.seq_mask"), n);
-    float noise = (float)M.meta("oracle.denoise.noise");
+    float* single = upload(M.f(O + "inputs.single"), M.len(O + "inputs.single"));
+    float* pair = upload(M.f(O + "inputs.pair"), M.len(O + "inputs.pair"));
+    float* sIn = upload(M.f(O + "inputs.sInputs"), M.len(O + "inputs.sInputs"));
+    float* pos = upload(M.f(O + "inputs.posNoisy"), M.len(O + "inputs.posNoisy"));
+    float* seqm = upload(M.f(O + "inputs.seq_mask"), n);
+    float noise = (float)M.meta(O + "noise");
     auto s0 = std::chrono::steady_clock::now();
     float* out = denoise(single, pair, sIn, seqm, pos, noise);
     CK(cudaDeviceSynchronize());
     printf("denoise (sigma %.3f) %.1f ms\n", noise, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count());
-    check("denoised", out, M.len("oracle.denoise.output"), "oracle.denoise.output");
+    check(which, out, M.len(O + "output"), O + "output");
     DCACHE.ready = false;
   }
 

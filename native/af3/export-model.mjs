@@ -23,7 +23,7 @@ const option = (name, fallback) =>
   args.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback;
 const bundle = option("bundle", "http://127.0.0.1:8791/model-af3-full-f32/manifest.json");
 const batchPath = option("batch", `${repo}/oracle-dumps/af3-batch-alphafold3-6mrr.json`);
-const oracles = (option("oracles", option("sequence", "") === "" ? "trunk,denoise,confidence" : ""))
+const oracles = (option("oracles", option("sequence", "") === "" ? "trunk,denoise,realdenoise,confidence" : ""))
   .split(",").filter(Boolean);
 
 const { openAf3Store, trunkWeights, trunkDepths, confidenceWeights } =
@@ -93,7 +93,10 @@ add("batch", batch);
 // The oracle's own z_init/target_feat etc., by stage.
 const flat = (record) => Float32Array.from(Array.isArray(record.data) ? record.data.flat(Infinity) : record.data);
 for (const which of oracles) {
-  const path = `${repo}/oracle-dumps/af3-oracle-${which}-alphafold3.json`;
+  // realdenoise: a real fold's trunk conditioning and structure, re-noised (sigma 2) - the
+  // denoise oracle's own inputs are random and cannot judge a 16-bit path.
+  const path = which === "realdenoise" ? `${repo}/oracle-dumps/af3-real-denoise-alphafold3-n2.0.json`
+    : `${repo}/oracle-dumps/af3-oracle-${which}-alphafold3.json`;
   let oracle;
   try { oracle = JSON.parse(readFileSync(path, "utf8")); } catch { continue; }
   const walk = (prefix, object) => {
