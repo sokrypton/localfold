@@ -319,6 +319,39 @@ if (templateSpecs.length > 0) {
                                                { coverage: coverageOf(slot, batch.tokens), spanChains }) });
   });
 }
+// ...and a job's own templates (it used to ignore them, folding with none and saying nothing): each
+// chain's uploaded template, built by the page's buildTemplate (its queryIndices / templateIndices
+// mapping when the job gives one), all chains' in ONE slot as AF3 puts every chain's first template
+// in slot 0, the cross-chain block masked (AF3's template embedder pairs residues of one chain only).
+// A template SEARCH (useStructureTemplate) is refused: there is no search here.
+if ((jobRequest?.templates ?? []).length > 0) {
+  if (templateSpecs.length > 0) throw new Error("the job carries its templates; --template would replace them");
+  const search = jobRequest.templates.find((t) => t.kind !== "upload");
+  if (search) throw new Error(`chain ${search.chain}: the job asks for a template search, which this exporter does not run`
+    + " - give the structure with --template=<file>:<chain>@<query chain>");
+  const { buildTemplate } = await import(`${repo}/web/template-source.js`);
+  const { mergeTemplateSlots } = await import(`${repo}/src/af3/featurise/template-input.js`);
+  const chains = sequence.split(":");
+  const tokenOfResidue = new Int32Array(batch.chainOfResidue.length).fill(-1);
+  batch.residueOfToken.forEach((residue, token) => {
+    if (residue >= 0 && tokenOfResidue[residue] === -1) tokenOfResidue[residue] = token;
+  });
+  const residuesOfChain = [];
+  Array.from(batch.chainOfResidue).forEach((chain, residue) => (residuesOfChain[chain] ??= []).push(residue));
+  const parts = jobRequest.templates.map((t) => {
+    const built = buildTemplate({
+      text: t.text, chain: t.chainId, query: chains[t.chain], tokens: batch.tokens, minConfidence: 0,
+      ...(t.mapping === undefined ? {} : { mapping: t.mapping }),
+      tokenOf: (residue) => tokenOfResidue[(residuesOfChain[t.chain] ?? [])[residue] ?? -1] ?? -1,
+    });
+    console.log(`job template -> query chain ${t.chain}: ${built.coverage.residues}/${built.coverage.of} residues`
+      + (t.mapping ? " (the job's mapping)" : ""));
+    return built.slot;
+  });
+  const slot = parts.length === 1 ? parts[0] : mergeTemplateSlots(parts);
+  slots.push({ slot, mask: multichainMaskFor(batch.asymId, batch.tokens,
+                                             { coverage: coverageOf(slot, batch.tokens), spanChains: false }) });
+}
 // rf3's chirality term reads the stereocentres - four dense atom slots and an ideal improper
 // dihedral each - as the page's fold does (src/af3/fold.js)
 if (dialect.chiralCentres === true) {

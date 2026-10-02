@@ -715,6 +715,7 @@ export async function foldAf3(options) {
       tokens: batch.tokens,
       minConfidence: template.minConfidence ?? 0,
       spanChains: template.spanChains === true,
+      ...(template.mapping === undefined ? {} : { mapping: template.mapping }),
       tokenOf: (residue) => tokenOfResidue[(residuesOfChain[template.chain] ?? [])[residue]
         ?? -1] ?? -1,
     })).map((built) => {

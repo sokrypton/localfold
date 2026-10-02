@@ -280,6 +280,13 @@ describe("a SMILES ligand survives the archive", () => {
     expect(after).toEqual(before);
   });
 
+  it("reads a template's explicit residue mapping, and refuses a lopsided one", () => {
+    const job = (template) => open([{ protein: { id: "A", sequence: "ACDEFGHIK", templates: [template] } }]);
+    const read = jobFromJson(job({ mmcif: "data_T\n_atom_site.id 1", queryIndices: [0, 1, 2], templateIndices: [3, 4, 5] }));
+    expect(read.entities[0].template.mapping).toEqual([[0, 3], [1, 4], [2, 5]]);
+    expect(refusal(job({ mmcif: "data_T", queryIndices: [0, 1], templateIndices: [0] }))).toContain("one length");
+  });
+
   it("keeps a ligand of several components as one chain", () => {
     // the server's `ligand` holds one code, so a glycan forces the open dialect's ccdCodes list
     const { before, after } = roundTrip([

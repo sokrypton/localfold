@@ -4835,6 +4835,7 @@ async function fold(event) {
           query: multimer ? chains[at] : sequence, offset: multimer ? offsets[at] : 0,
           tokens: sequence.length, minConfidence: source.minConfidence ?? 0,
           layout: "atom37",
+          ...(source.mapping === undefined ? {} : { mapping: source.mapping }),
         }));
       }
       af2Template = built.length === 1 ? built[0] : mergeAtom37Templates(built, sequence.length);

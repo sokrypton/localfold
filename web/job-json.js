@@ -395,18 +395,29 @@ function readTemplates(body, where) {
       + " cannot read - inline the mmCIF or pick a template on the row");
   }
   checkKeys(template, TEMPLATE_KEYS, `${where} template`);
-  for (const field of ["queryIndices", "templateIndices"]) {
-    if (template[field] !== undefined && template[field] !== null) {
-      refuse(`${where}: ${field} sets the template's residue mapping, and this`
-        + " page computes its own - the fold would use a different alignment"
-        + " than the file asks for");
+  // 🔴 AN EXPLICIT RESIDUE MAPPING IS THE JOB'S, AND IS USED AS GIVEN: queryIndices[k] (into the
+  // query) pairs with templateIndices[k] (into the template chain's residues, in file order), both
+  // from 0 - in place of the alignment this page would otherwise compute, which could pair the
+  // residues differently from what the file asks for.
+  const hasQuery = template.queryIndices !== undefined && template.queryIndices !== null;
+  const hasTemplate = template.templateIndices !== undefined && template.templateIndices !== null;
+  let mapping;
+  if (hasQuery || hasTemplate) {
+    const q = template.queryIndices, t = template.templateIndices;
+    if (!Array.isArray(q) || !Array.isArray(t) || q.length !== t.length) {
+      refuse(`${where}: queryIndices and templateIndices are two lists of one length`);
     }
+    if (![...q, ...t].every((v) => Number.isInteger(v) && v >= 0)) {
+      refuse(`${where}: queryIndices and templateIndices hold whole numbers from 0`);
+    }
+    mapping = q.map((query, k) => [query, t[k]]);
   }
   const mmcif = template.mmcif;
   if (typeof mmcif !== "string" || mmcif.trim() === "") {
     refuse(`${where}: a template with no mmcif in it`);
   }
-  return { kind: "upload", text: mmcif, filename: "template.cif", source: "" };
+  return { kind: "upload", text: mmcif, filename: "template.cif", source: "",
+           ...(mapping === undefined ? {} : { mapping }) };
 }
 
 /** One `sequences` entry, as an entity. */

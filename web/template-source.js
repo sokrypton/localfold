@@ -144,6 +144,23 @@ export function mapToQuery(structure, query) {
   return { map, sequence: query, identical: false };
 }
 
+// [queryIndex, templateIndex] pairs from 0, the template's counted over its chain's residues in file
+// order; an index past either end is the job's mistake and is refused, not dropped
+function explicitMap(mapping, structure, query) {
+  const map = new Map();
+  for (const [queryIndex, templateIndex] of mapping) {
+    if (query !== "" && queryIndex >= query.length) {
+      throw new Error(`template mapping: query index ${queryIndex} is past the ${query.length}-residue chain`);
+    }
+    if (templateIndex >= structure.residues.length) {
+      throw new Error(`template mapping: template index ${templateIndex} is past its`
+        + ` ${structure.residues.length} residues`);
+    }
+    map.set(queryIndex, templateIndex);
+  }
+  return { map, sequence: query || structure.sequence, identical: false };
+}
+
 /**
  * A template slot for one chain, from a fetched or dropped structure.
  *
@@ -164,6 +181,8 @@ export function mapToQuery(structure, query) {
  *   is a line of code, but a number from 0 to 100 is a modelling choice the
  *   dropdown cannot explain in the space it has, and nothing on screen said
  *   what the default had done. A caller that wants it passes it.
+ * @param {[number, number][]} [options.mapping] query to template residue pairs (from 0), as a job's
+ *   queryIndices / templateIndices give them, in place of the alignment
  * @param {boolean} [options.spanChains]
  * @param {"dense"|"atom37"} [options.layout] which slot layout to build.
  *   🔴 THE TWO ARE NOT INTERCHANGEABLE AND NEITHER THROWS ON THE OTHER.
@@ -188,7 +207,10 @@ export function buildTemplate(options) {
       ? "that structure has no protein chain this can read"
       : `that structure has no chain ${options.chain}`);
   }
-  const { map, sequence, identical } = mapToQuery(structure, options.query ?? "");
+  // an explicit mapping (a job's queryIndices / templateIndices) in place of the alignment
+  const { map, sequence, identical } = options.mapping
+    ? explicitMap(options.mapping, structure, options.query ?? "")
+    : mapToQuery(structure, options.query ?? "");
   const kept = filterByConfidence(map, structure, options.minConfidence ?? 0,
                                   (residue) => residue.confidence);
   const chainLength = (options.query ?? "").length || structure.residues.length;
