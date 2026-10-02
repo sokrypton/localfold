@@ -143,6 +143,7 @@ if (!weightsOnly) {
 let sequence = option("sequence", "");
 let jobRequest = null;
 let searchedHits = null, searchedProteinAt = null;   // --search's template hits, by protein chain
+const jobTemplates = [];                // [slot k] -> the job's k-th template of each chain
 let jobUserCcd = null;                  // the job's own component definitions (userCCD), mmCIF
 if (option("job", "") !== "") {
   if (sequence !== "") throw new Error("--job and --sequence both name the input");
@@ -154,6 +155,10 @@ if (option("job", "") !== "") {
   const raw = JSON.parse(readFileSync(option("job", ""), "utf8"));
   const jobs = Array.isArray(raw) ? raw : [raw];
   const inlineMsa = { unpaired: [], paired: [] };
+  // ...and the TEMPLATES likewise, every one of them: AF3's data pipeline writes up to twenty a chain
+  // into the job and folds the first four, chain i's k-th in slot k, where the page's reader takes one
+  // a chain - so they are lifted out here, per chain copy, and built below (jobTemplates)
+  let polymerCopy = 0;
   for (const entry of jobs[0]?.sequences ?? []) {
     const [kind, body] = Object.entries(entry)[0] ?? [];
     if (!["protein", "rna", "dna"].includes(kind) || body === undefined) continue;
@@ -161,7 +166,18 @@ if (option("job", "") !== "") {
     for (let c = 0; c < copies; c += 1) {
       inlineMsa.unpaired.push(body.unpairedMsa || null);
       inlineMsa.paired.push(body.pairedMsa || null);
+      for (const [k, t] of (Array.isArray(body.templates) ? body.templates : []).slice(0, 4).entries()) {
+        if (typeof t.mmcif !== "string") throw new Error(`template ${k} of chain ${polymerCopy}: give the mmCIF inline`);
+        const q = t.queryIndices, ti = t.templateIndices;
+        if ((q === undefined) !== (ti === undefined) || (q && (q.length !== ti.length))) {
+          throw new Error(`template ${k} of chain ${polymerCopy}: queryIndices and templateIndices are two lists of one length`);
+        }
+        (jobTemplates[k] ??= []).push({ text: t.mmcif, chain: polymerCopy, label: `job template ${k}`,
+                                        ...(q === undefined ? {} : { mapping: q.map((v, i) => [v, ti[i]]) }) });
+      }
+      polymerCopy += 1;
     }
+    delete body.templates;
     delete body.unpairedMsa; delete body.pairedMsa;
     for (const field of ["unpairedMsaPath", "pairedMsaPath"]) {
       if (body[field] !== undefined) throw new Error(`${field}: give the alignment inline or with --a3m`);
@@ -370,16 +386,18 @@ if (templateSpecs.length > 0) {
 // chain's k-th in slot k as AF3 puts them, the cross-chain block masked (AF3's template embedder pairs
 // residues of one chain only).
 const extraSlotParts = [];               // [slot k][part] = {text, chainId, chain, mapping}
-// ...a job's own templates (it used to ignore them, folding with none and saying nothing) - their
-// queryIndices / templateIndices mapping when the job gives one; a template SEARCH (useStructureTemplate)
-// in a job is refused: --search-templates is how this exporter searches
-if ((jobRequest?.templates ?? []).length > 0) {
+// ...a job's own templates (they were ignored, then one a chain): every chain's k-th in slot k, up to
+// four, each with its queryIndices / templateIndices mapping when the job gives one
+if (jobTemplates.length > 0) {
   if (templateSpecs.length > 0) throw new Error("the job carries its templates; --template would replace them");
+  for (const parts of jobTemplates) extraSlotParts.push(parts);
+}
+// (a job asking for a template SEARCH - the server dialect's useStructureTemplate - is refused: there is
+// no search unless --search-templates asks for one)
+if ((jobRequest?.templates ?? []).some((t) => t.kind !== "upload") && !args.includes("--search-templates")) {
   const search = jobRequest.templates.find((t) => t.kind !== "upload");
-  if (search) throw new Error(`chain ${search.chain}: the job asks for a template search - run with --search-templates,`
+  throw new Error(`chain ${search.chain}: the job asks for a template search - run with --search-templates,`
     + " or give the structure with --template=<file>:<chain>@<query chain>");
-  extraSlotParts.push(jobRequest.templates.map((t) => ({ text: t.text, chainId: t.chainId, chain: t.chain,
-                                                          mapping: t.mapping, label: "job template" })));
 }
 // ...--search-templates: each protein chain's best four hits from the same MMseqs2 search, fetched
 // from the server as the page fetches its one

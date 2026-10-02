@@ -184,8 +184,9 @@ node ... export-model.mjs data-job --job=../../tools/fixtures/af3-jobs/kras_g12c
 residues AND modified bases (a base's parent through its chain's alphabet and the component's CCD
 parent), a ligand of several components as one chain (a glycan: `ccdCodes` [NAG, NAG, BMA, MAN,
 MAN], a residue each), `bondedAtomPairs` (one direction, the job's, covalent - as AF3 lists and
-codes them), every model seed (`--seeds`), the job's own templates (their
-`queryIndices`/`templateIndices` mapping when given; a template search is refused), its `userCCD`
+codes them), every model seed (`--seeds`), the job's own templates - up to four a chain as AF3's
+data pipeline writes them, chain i's k-th in slot k, with their `queryIndices`/`templateIndices`
+mapping when given (a job asking for a template search wants `--search-templates`) - its `userCCD`
 components (resolved before the RCSB) - and, unlike the page, the `unpairedMsa` / `pairedMsa`
 AF3's data pipeline writes into the job, which become the alignment, an RNA chain's in RNA's
 alphabet (5CAJ with 200 inline rows: 2.02 A, pLDDT 94.2). Each of these is exact against AF3's own
