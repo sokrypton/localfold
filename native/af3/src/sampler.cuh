@@ -124,7 +124,9 @@ inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<flo
 // The PDB: through the exporter's template.pdb when there is one (the page's own records, the
 // slot in the x column), else one residue per token named here. `bfactors` per atom slot.
 inline std::string DATA_DIR;
-inline void writePdb(const std::string& path, const std::vector<float>& x, const float* bfactors = nullptr) {
+// Returns the dense slot of every ATOM/HETATM record, in file order.
+inline std::vector<size_t> writePdb(const std::string& path, const std::vector<float>& x, const float* bfactors = nullptr) {
+  std::vector<size_t> order;
   std::ifstream tf(DATA_DIR + "/template.pdb");
   if (tf) {
     FILE* f = fopen(path.c_str(), "w");
@@ -132,6 +134,7 @@ inline void writePdb(const std::string& path, const std::vector<float>& x, const
     while (std::getline(tf, line)) {
       if (line.size() >= 66 && (!line.compare(0, 4, "ATOM") || !line.compare(0, 6, "HETATM"))) {
         size_t slot = (size_t)std::lround(std::stod(line.substr(30, 8)));
+        order.push_back(slot);
         char coords[64];
         snprintf(coords, sizeof coords, "%8.3f%8.3f%8.3f%6.2f%6.2f", x[slot * 3], x[slot * 3 + 1], x[slot * 3 + 2],
                  1.0, bfactors ? bfactors[slot] : 0.0);
@@ -140,7 +143,7 @@ inline void writePdb(const std::string& path, const std::vector<float>& x, const
       fprintf(f, "%s\n", line.c_str());
     }
     fclose(f);
-    return;
+    return order;
   }
   static const char* RES[20] = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
                                 "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"};
@@ -155,6 +158,7 @@ inline void writePdb(const std::string& path, const std::vector<float>& x, const
   for (int t = 0; t < n; ++t) for (int a = 0; a < dense; ++a) {
     size_t i = (size_t)t * dense + a;
     if (!mask[i]) continue;
+    order.push_back(i);
     char name[5] = {0};
     for (int k = 0; k < 4; ++k) { int c = names[i * 4 + k]; name[k] = c > 0 ? (char)(c + 32) : 0; }
     int z = elem[i]; const char* el = z >= 0 && z < 18 ? ELEM[z] : "X";
@@ -164,5 +168,40 @@ inline void writePdb(const std::string& path, const std::vector<float>& x, const
             resIdx[t], x[i * 3], x[i * 3 + 1], x[i * 3 + 2], 1.0, bfactors ? bfactors[i] : 0.0, el);
   }
   fprintf(f, "END\n");
+  fclose(f);
+  return order;
+}
+
+// AlphaFold 3's confidence files beside a structure: <stem>_confidences.json (atom_plddts in the
+// PDB's atom order, pae, token_chain_ids, token_res_ids) and <stem>_summary_confidences.json
+// (ptm, iptm, ranking_score - the score without AF3's disorder and clash terms).
+inline void writeConfidences(const std::string& pdbPath, const std::vector<size_t>& order, const std::vector<float>& plddt,
+                             const std::vector<float>& pae, int n, double ptm, double iptm, double ranking) {
+  std::string stem = pdbPath.size() > 4 && pdbPath.substr(pdbPath.size() - 4) == ".pdb"
+    ? pdbPath.substr(0, pdbPath.size() - 4) : pdbPath;
+  const int* asym = M.i("batch.asymId"); const int* res = M.i("batch.residueIndex");
+  auto chainId = [](int a) {
+    std::string id; for (a = a - 1; ; a = a / 26 - 1) { id.insert(id.begin(), (char)('A' + a % 26)); if (a < 26) break; }
+    return id;
+  };
+  FILE* f = fopen((stem + "_confidences.json").c_str(), "w");
+  fprintf(f, "{\"atom_plddts\": [");
+  for (size_t k = 0; k < order.size(); ++k) fprintf(f, "%s%.2f", k ? ", " : "", plddt[order[k]]);
+  fprintf(f, "],\n \"pae\": [");
+  for (int i = 0; i < n; ++i) {
+    fprintf(f, "%s[", i ? ",\n  " : "");
+    for (int j = 0; j < n; ++j) fprintf(f, "%s%.2f", j ? ", " : "", pae[(size_t)i * n + j]);
+    fprintf(f, "]");
+  }
+  fprintf(f, "],\n \"token_chain_ids\": [");
+  for (int i = 0; i < n; ++i) fprintf(f, "%s\"%s\"", i ? ", " : "", chainId(asym[i]).c_str());
+  fprintf(f, "],\n \"token_res_ids\": [");
+  for (int i = 0; i < n; ++i) fprintf(f, "%s%d", i ? ", " : "", res[i]);
+  fprintf(f, "]}\n");
+  fclose(f);
+  f = fopen((stem + "_summary_confidences.json").c_str(), "w");
+  fprintf(f, "{\"ptm\": %.4f, \"iptm\": ", ptm);
+  if (std::isnan(iptm)) fprintf(f, "null"); else fprintf(f, "%.4f", iptm);
+  fprintf(f, ", \"ranking_score\": %.4f}\n", ranking);
   fclose(f);
 }

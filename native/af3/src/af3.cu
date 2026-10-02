@@ -194,7 +194,8 @@ int main(int argc, char** argv) {
       if (samples > 1) {
         std::string path = out.size() > 4 && out.substr(out.size() - 4) == ".pdb"
           ? out.substr(0, out.size() - 4) + "_sample" + std::to_string(k) + ".pdb" : out + "_sample" + std::to_string(k);
-        writePdb(path, xk, ck.plddt.data());
+        auto order = writePdb(path, xk, ck.plddt.data());
+        if (path != "/dev/null") writeConfidences(path, order, ck.plddt, ck.pae, t.n, ck.ptm, ck.iptm, score);
         printf("  sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", k, ck.meanPlddt, ck.ptm,
                ck.iptm, score, path.c_str());
       }
@@ -203,7 +204,8 @@ int main(int argc, char** argv) {
     }
     auto f2 = clock();
     auto f3 = f2;
-    writePdb(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
+    auto order = writePdb(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
+    if (out != "/dev/null") writeConfidences(out, order, conf.plddt, conf.pae, t.n, conf.ptm, conf.iptm, bestScore);
     if (samples > 1) printf("  best: sample %d\n", best);
     if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
       FILE* pf = fopen(pp, "wb");

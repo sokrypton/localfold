@@ -31,7 +31,9 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + ev
 `--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--samples=N`
 (N diffusion samples off one trunk, AF3 runs five: each scored by the confidence head and ranked by
 0.8 ipTM + 0.2 pTM - pTM for one chain; AF3's disorder and clash terms are not computed - the best
-written to `--out`, all to `<out>_sample<k>.pdb`). The samples run as ONE batch through the
+written to `--out`, all to `<out>_sample<k>.pdb`). Beside every structure, AlphaFold 3's
+`<stem>_confidences.json` (atom_plddts in the PDB's atom order, pae, token_chain_ids,
+token_res_ids) and `<stem>_summary_confidences.json` (ptm, iptm, ranking_score). The samples run as ONE batch through the
 denoiser - the transformer's GEMMs at 5x the rows, the samples as the flash kernel's batch, what
 they share (conditioning, masks, biases) read once - and sample k draws exactly what a one-sample
 run seeded `seed + k` draws, so its structure is the same: 5CAJ's five read 1.989 / 2.023 / 1.961 /
