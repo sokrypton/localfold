@@ -137,4 +137,8 @@ RoseTTAFold3 - each raises a named "not ported" error).
   Stripping it piece by piece at 1044 tokens: no pair bias 0.86 ms of 1.09, no bias and no exp
   0.81, no PV either 0.75 - the floor is reloading each row's keys and values once per 64-query
   block, not the arithmetic.
+- **Grid attention blocks that share the pair-bias tile across rows** (the bias is the same for
+  every row of the grid, and per row it is half of the kernel's L2 traffic): exact, and slower in
+  every geometry - 10.7 / 14.8 / 12.3 / 16.8 ms against the plain kernel's 8.8 at 1044 tokens for
+  1, 2, 4 rows of 4 warps and 4 rows of 2. Not L2 bandwidth, then.
 
