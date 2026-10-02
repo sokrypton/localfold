@@ -416,12 +416,14 @@ void flashGrid(const T* qkvg, const T* bias, int stride, const float* mask, T* o
     if (D == 32) flashGridHalfLaunch<32>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else if (D == 48) flashGridHalfLaunch<48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else if (D == 16) flashGridHalfLaunch<16>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
+    else if (D == 64) flashGridHalfLaunch<64>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else { fprintf(stderr, "flashGrid: no f16 kernel for head width %d\n", D); exit(1); }
   } else {
     dim3 g((n + 63) / 64, (unsigned)(rows * heads));
     if (D == 32) flashGridF32<32><<<g, 64, 0, STREAM>>>(qkvg, bias, stride, mask, out, n, heads, r0, tr, scale);
     else if (D == 16) flashGridF32<16><<<g, 64, 0, STREAM>>>(qkvg, bias, stride, mask, out, n, heads, r0, tr, scale);
     else if (D == 24) flashGridF32<24><<<g, 64, 0, STREAM>>>(qkvg, bias, stride, mask, out, n, heads, r0, tr, scale);
+    else if (D == 64) flashGridF32<64><<<g, 64, 0, STREAM>>>(qkvg, bias, stride, mask, out, n, heads, r0, tr, scale);
     else { fprintf(stderr, "flashGrid: no f32 kernel for head width %d\n", D); exit(1); }
   }
 }

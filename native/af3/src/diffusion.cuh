@@ -659,8 +659,11 @@ inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const De
   addSkipMaskK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, enc.skip, enc.qMask, qRows, C, q1);
   AtomStep st{ gatherOf("batch.queriesToKeys"), enc.qMask, enc.kMask, M.flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
                M.flag(Dd + ".blocks.0.diffusionNoResidual") };
-  for (size_t b = 0; b < d.blocks.size(); ++b)
+  bool maskPerBlock = M.flag(Dd + ".blocks.0.maskAtomActPerBlock");
+  for (size_t b = 0; b < d.blocks.size(); ++b) {
+    if (maskPerBlock) scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, enc.qMask, qRows, C, q1);
     crossAttentionBlock(act, st, d.blocks[b], sh, C, d.heads, d.D, Dd + ".blocks." + std::to_string(b));
+  }
   scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, enc.qMask, qRows, C, q1);
   float* ln = scratch<float>("dec.ln", qRows * C);
   layerNormSlow(act, ln, qRows, C, W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"));

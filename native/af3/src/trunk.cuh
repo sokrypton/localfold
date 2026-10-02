@@ -173,6 +173,9 @@ void templateEmbedding(Trunk& t, float* out) {
   const std::string P = "trunk.template.";
   int Ct = (int)M.meta(P + "channels");
   bool fused = M.flag(P + "fused");
+  if (!M.has("template.passes")) {
+    fprintf(stderr, "this input was exported before template passes: export it again with export-model.mjs\n"); exit(1);
+  }
   int passes = (int)M.meta("template.passes"), templates = (int)M.meta("template.templates");
   int width = (int)M.meta("template.featureWidth");
   bool outer = M.flag("template.outerResidual");

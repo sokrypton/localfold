@@ -675,7 +675,6 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   linear<float, float>(h1, o.pair, pairRows, Cp, Cp, E + ".pairMlp3", false, 1.f);
   int nblocks = 0; while (M.has(E + ".blocks." + std::to_string(nblocks) + ".qProjection")) ++nblocks;
   std::vector<float*> logits = atomPairLogits(E, o.pair, pairRows, Cp, nblocks, o.heads, sh);
-  if (M.flag(E + ".blocks.0.maskAtomActPerBlock")) { fprintf(stderr, "per-block atom masking: not ported\n"); exit(1); }
   for (int b = 0; b < nblocks; ++b)
     o.blocks.push_back(prepareAtomBlock(E + ".blocks." + std::to_string(b), o.qCond, qRows, C, logits[b]));
   o.keyMasked = M.flag(E + ".blocks.0.keyMaskedAtomAttention");
@@ -690,6 +689,7 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
   size_t atoms = (size_t)sh.tokens * sh.dense, q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS;
   Gather t2q = gatherOf("batch.tokenAtomsToQueries"), q2t = gatherOf("batch.queriesToTokenAtoms");
   float* act = scratch<float>(E + ".act", qRows * C);
+  bool maskPerBlock = M.flag(E + ".blocks.0.maskAtomActPerBlock");   // padded atom rows zeroed before every block
   for (int k = 0; k < NS; ++k)
     CK(cudaMemcpyAsync(act + k * q1 * C, o.qCond, q1 * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   if (atomPositions) {
@@ -701,8 +701,10 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
     addK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, positional, qRows * C);
   }
   AtomStep st{ gatherOf("batch.queriesToKeys"), o.qMask, o.kMask, o.keyMasked, o.noResidual };
-  for (size_t b = 0; b < o.blocks.size(); ++b)
+  for (size_t b = 0; b < o.blocks.size(); ++b) {
+    if (maskPerBlock) scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, o.qMask, qRows, C, q1);
     crossAttentionBlock(act, st, o.blocks[b], sh, C, o.heads, o.D, E + ".blocks." + std::to_string(b));
+  }
   scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, o.qMask, qRows, C, q1);
   o.skip = act;
   float* projected = scratch<float>("enc.aggr", qRows * o.perToken);

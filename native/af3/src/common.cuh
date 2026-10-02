@@ -251,6 +251,11 @@ inline bool STAGES = false;
 inline std::map<std::string, double> STAGE_MS;
 inline void stage(const char* name) {
   static auto last = std::chrono::steady_clock::now();
+  // a launch that never ran (too much shared memory, a bad grid) reports nothing by itself: ask at
+  // every stage boundary, which costs no synchronisation (IntelliFold-2's centre norm was silently
+  // skipped this way)
+  cudaError_t launch = cudaGetLastError();
+  if (launch != cudaSuccess) { fprintf(stderr, "CUDA %s before stage %s\n", cudaGetErrorString(launch), name ? name : "(start)"); exit(1); }
   if (!STAGES) return;
   CK(cudaStreamSynchronize(STREAM));
   auto now = std::chrono::steady_clock::now();

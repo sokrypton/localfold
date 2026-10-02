@@ -211,6 +211,13 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   T* t2 = scratch<T>("tri.t2", std::min(rowsPer, pairs) * C);
   for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
     size_t rows = std::min(rowsPer, pairs - r0);
+    {   // C * 33 floats of shared memory: past the 48 KB default from C = 373 (IntelliFold-2's 512)
+      static int granted = 0;
+      if (C * 33 * 4 > granted) {
+        CK(cudaFuncSetAttribute(centerNormK<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, C * 33 * 4));
+        granted = C * 33 * 4;
+      }
+    }
     centerNormK<T><<<(unsigned)((rows + 31) / 32), dim3(32, 8), C * 33 * 4, STREAM>>>(prod, centred, r0,
       rows, C, cs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
     linear<T, T>(centred, t1, rows, C, C, pre + ".outputProjection");
