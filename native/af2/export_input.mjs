@@ -4,6 +4,7 @@
 //
 //   node native/af2/export_input.mjs <out dir> --sequence=<SEQ> [--a3m=<path>] [--recycles=3]
 //        [--max-msa=512] [--max-extra=1024] [--seed=0] [--weights=native/af2/weights-model_1_ptm]
+//        [--search] [--template=<pdb>[:chain[+chain]],...]
 //
 // Entries:  i aatype, residue_index, asym_id, entity_id, sym_id   t seq_mask      (per residue)
 //           t f<k>/msa_feat [N, L, 49], f<k>/msa_mask [N, L]                       (pass k)
@@ -48,10 +49,27 @@ closeSync(binFd);
 const sequence = option("sequence", "").trim().toUpperCase();
 const a3mPath = option("a3m", "");
 if (sequence === "" && a3mPath === "") throw new Error("--sequence or --a3m names the input");
+if (args.includes("--search") && sequence === "") throw new Error("--search needs --sequence");
 // chains joined by ":" fold as a complex: the feature builder's chain-aware path (per-chain residue
 // numbering, asym/entity/sym ids), what the page passes a multimer
 const chains = sequence.split(":").filter(Boolean);
-const a3m = a3mPath === "" ? `>query\n${chains.join("")}\n` : readFileSync(a3mPath, "utf8");
+// --search: the alignment from the ColabFold MMseqs2 server through the page's own client and merge
+// (src/input/mmseqs2-api.js): one chain's search, or a complex's - each distinct chain searched, the
+// paired block for distinct ones, and the merge the WEIGHTS read ("multimer": dense within an entity,
+// block-diagonal between; "monomer": block-diagonal throughout). It sends the sequences to
+// api.colabfold.com, so it is asked for, never assumed
+let a3m;
+if (args.includes("--search")) {
+  if (a3mPath !== "") throw new Error("--search and --a3m both name the alignment");
+  const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import("../../src/input/mmseqs2-api.js");
+  const multimer = readFileSync(`${weightsDir}/model.idx`, "utf8").includes("m meta/multimer 1");
+  const t0 = performance.now();
+  a3m = chains.length === 1 ? (await generateMmseqs2Msa(chains[0], {})).a3m
+    : (await generateMmseqs2ComplexMsa(chains, { model: multimer ? "multimer" : "monomer" })).a3m;
+  console.log(`search: ${chains.length} chain(s) from api.colabfold.com in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+} else {
+  a3m = a3mPath === "" ? `>query\n${chains.join("")}\n` : readFileSync(a3mPath, "utf8");
+}
 const featureOptions = {
   ...(chains.length > 1 ? { chainAware: true, chainLengths: chains.map((c) => c.length), chainSequences: chains } : {}),
   recycles: Number(option("recycles", "3")),

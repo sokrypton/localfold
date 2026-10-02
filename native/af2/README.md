@@ -19,7 +19,16 @@ native/af2/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
 native/af2/fold 5caj.pdb --sequence=<SEQ> --template=tools/fixtures/5caj-crystal.pdb:A
 native/af2/fold 1brs.pdb --sequence=<A>:<D> --model=model_1_multimer_v3 \
     --template=tools/fixtures/1brs-crystal.pdb:A+D
+native/af2/fold 1brs.pdb --sequence=<A>:<D> --model=model_1_multimer_v3 --search
 ```
+
+`--search` gets the alignment from the ColabFold MMseqs2 server through the page's own client
+(src/input/mmseqs2-api.js). For a complex, each distinct chain is searched, the paired block is
+added for distinct chains, and the merge follows the weights' regime: dense within an entity and
+block-diagonal between entities for the multimer, block-diagonal throughout for a monomer.
+Barnase-barstar from its two sequences folds to **0.584 A, ipTM 0.92**, against 17.4 A without an
+alignment, and the search takes 3.5 s of a 5.7 s command. It sends the sequences to
+api.colabfold.com, so it is a flag, never a default.
 
 `--model` names a DeepMind parameter set (`model_1_ptm` .. `model_5_ptm`,
 `model_1_multimer_v3` ..). The first use exports its weights from `~/lfjax/af2_params` through the

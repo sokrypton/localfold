@@ -8,8 +8,8 @@
 #
 # --model names a DeepMind parameter set (model_1_ptm .. model_5_ptm, model_1_multimer_v3 ..); its
 # weights are exported once (native/af2/export_weights.py, af3-any-model's conversion) into
-# native/af2/weights-<model>. Input flags (--sequence, --a3m, --template, --recycles, --max-msa,
-# --max-extra, --seed) go to export_input.mjs; flags after -- go to ./af2, which runs --fast.
+# native/af2/weights-<model>. Input flags (--sequence, --a3m, --search, --template, --recycles,
+# --max-msa, --max-extra, --seed) go to export_input.mjs; flags after -- go to ./af2, which runs --fast.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { sed -n '2,14p' "$0"; exit 1; }
@@ -45,6 +45,7 @@ done
 seq="${seq//:/}"
 [ -n "$seq" ] || [ -z "$a3m" ] || seq="$(grep -v '^>' "$a3m" | head -1 | tr -d 'a-z\r\n-')"
 depth=1; [ -z "$a3m" ] || depth=$(grep -c '^>' "$a3m")
+for a in "${inputs[@]}"; do [ "$a" != "--search" ] || depth=$(( maxmsa + maxextra )); done   # (a search is usually deep)
 n=$(( depth < maxmsa ? depth : maxmsa )); e=$(( depth - n )); e=$(( e > maxextra ? maxextra : e )); e=$(( e < 1 ? 1 : e ))
 exec 3< <("$here/af2" "$tmp" --weights="$weights" --fast --out="$out" --wait-input --warm="${#seq},$n,$e,$templates" \
           "${flags[@]}"; echo "af2: exit $?")
