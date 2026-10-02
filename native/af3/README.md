@@ -79,3 +79,16 @@ as a CUDA graph; the transformer in FP16.
 Ligands and bonds, modified residues, nucleic acids (the featuriser handles them; the trunk's
 bond embedding does not), real templates (empty slots only), the other dialects (OpenDDE,
 boltz2, protenix2, IntelliFold-2, RoseTTAFold3 - each raises a named "not ported" error).
+
+## Tried and not taken
+
+- **A split-K "skinny" GEMM for the denoiser's few-row projections** (68 rows x 768 x 3072, where
+  cuBLAS reads 4.7 MB of weights in 9 us against a ~3.5 us bandwidth floor). Correct to 5e-7, and
+  its main loop plus partial writes ran in 6 us - but the cross-slice reduction (last block of a
+  tile sums the slices, deterministic) put it at 11-25 us for every split target swept, slower than
+  cuBLAS at every shape. Two traps on the way: a dynamically bounded loop over the accumulator array
+  put 192 bytes of it in local memory, and predicated loads into one register serialised the
+  reduction (each `LDG` waited on the last).
+- **cuBLASLt with per-shape autotuning** (time every heuristic candidate, keep the fastest):
+  no change on either fold - cuBLAS's default pick was already the fastest candidate.
+

@@ -562,7 +562,7 @@ inline DecoderCache prepareDecoder(const EncoderOut& enc) {
   int nblocks = 0; while (M.has(Dd + ".blocks." + std::to_string(nblocks) + ".qProjection")) ++nblocks;
   std::vector<float*> logits = atomPairLogits(Dd, enc.pair, qRows * sh.keys, Cp, nblocks, d.heads, sh);
   for (int b = 0; b < nblocks; ++b)
-    d.blocks.push_back(prepareAtomBlock(Dd + ".blocks." + std::to_string(b), enc.qCond, enc.kCond, qRows, kRows, d.C, logits[b]));
+    d.blocks.push_back(prepareAtomBlock(Dd + ".blocks." + std::to_string(b), enc.qCond, qRows, d.C, logits[b]));
   return d;
 }
 inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const DecoderCache& d) {

@@ -179,16 +179,18 @@ inline void adaCond(const float* cond, size_t rows, int C, int condC, const std:
   addBiasRowsK<<<blocks(rows * C), 256, 0, STREAM>>>(scale, W(w + "SingleCondScaleBias"), rows, C);
   linear<float, float>(cn, shift, rows, condC, C, w + "SingleCondBias");
 }
-inline AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, const float* kCond, size_t qRows,
-                                       size_t kRows, int C, float* pairLogits) {
+// The key side's scale and shift are per ATOM (a key row is a gathered query row), so they are
+// computed over the query rows and the block gathers the projected keys and values instead.
+inline AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t qRows, int C,
+                                       float* pairLogits) {
   AtomBlockCache c{};
   auto a = [&](const std::string& tag, size_t n) { return scratch<float>(B + tag, n); };
   c.qScale = a(".qs", qRows * C); c.qShift = a(".qh", qRows * C);
-  c.kScale = a(".ks", kRows * C); c.kShift = a(".kh", kRows * C);
+  c.kScale = a(".ks", qRows * C); c.kShift = a(".kh", qRows * C);
   c.ffwScale = a(".fs", qRows * C); c.ffwShift = a(".fh", qRows * C);
   c.zg = a(".zg", qRows * C); c.tg = a(".tg", qRows * C);
   adaCond(qCond, qRows, C, C, B + ".q", c.qScale, c.qShift);
-  adaCond(kCond, kRows, C, C, B + ".k", c.kScale, c.kShift);
+  adaCond(qCond, qRows, C, C, B + ".k", c.kScale, c.kShift);
   adaCond(qCond, qRows, C, C, B + ".ffw", c.ffwScale, c.ffwShift);
   linear<float, float>(qCond, c.zg, qRows, C, C, B + ".AdaptiveZeroCondWeights");
   addBiasRowsK<<<blocks(qRows * C), 256, 0, STREAM>>>(c.zg, W(B + ".AdaptiveZeroCondBias"), qRows, C);
@@ -416,6 +418,15 @@ __global__ void __launch_bounds__(64) atomAttentionMMA(const half* qg, const flo
   }
 }
 
+// out[r] = mask[r] ? in[idx[r]] : 0, rows of `chunks` 16-byte pieces
+template <class T>
+__global__ void gatherRowsK(const T* in, const int* idx, const float* mask, T* out, size_t rows, int chunks) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * chunks) return;
+  size_t r = t / chunks; int c = (int)(t % chunks);
+  uint4 v = mask[r] != 0 ? reinterpret_cast<const uint4*>(in)[(size_t)idx[r] * chunks + c] : make_uint4(0, 0, 0, 0);
+  reinterpret_cast<uint4*>(out)[t] = v;
+}
 // One block of the cross-attention transformer, in place on act [queryRows][C], from the block's cache.
 // T is the GEMM inputs' type (f16 on the fast path); the residual stream stays f32.
 template <class T>
@@ -426,12 +437,16 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
   if (st.noResidual) { fprintf(stderr, "%s: the no-residual atom block is not ported\n", B.c_str()); exit(1); }
   T* xq = scratch<T>("ab.xq", qRows * C);
   adaLn<T>(act, bc.qScale, bc.qShift, xq, qRows, C);
-  T* xk = scratch<T>("ab.xk", kRows * C);
-  gatherAdaLnK<T><<<(unsigned)((kRows + 7) / 8), 256, 0, STREAM>>>(act, st.queriesToKeys.idx, st.queriesToKeys.mask,
-                                                                   bc.kScale, bc.kShift, xk, kRows, C);
-  T* qg = scratch<T>("ab.qg", qRows * 2 * Wd); T* kv = scratch<T>("ab.kv", kRows * 2 * Wd);
+  // keys and values projected once per atom, then gathered into the subsets' key windows (a
+  // masked window slot is zero, as the LayerNorm of its zero row was)
+  T* xk = scratch<T>("ab.xk", qRows * C);
+  adaLn<T>(act, bc.kScale, bc.kShift, xk, qRows, C);
+  T* qg = scratch<T>("ab.qg", qRows * 2 * Wd); T* kvAtom = scratch<T>("ab.kvAtom", qRows * 2 * Wd);
+  T* kv = scratch<T>("ab.kv", kRows * 2 * Wd);
   linear<T, T>(xq, qg, qRows, C, 2 * Wd, pairedWeight(B + ".qProjection", B + ".gatingQuery", C, Wd));
-  linear<T, T>(xk, kv, kRows, C, 2 * Wd, pairedWeight(B + ".kProjection", B + ".vProjection", C, Wd));
+  linear<T, T>(xk, kvAtom, qRows, C, 2 * Wd, pairedWeight(B + ".kProjection", B + ".vProjection", C, Wd));
+  gatherRowsK<T><<<blocks(kRows * (2 * Wd * sizeof(T) / 16)), 256, 0, STREAM>>>(kvAtom, st.queriesToKeys.idx,
+    st.queriesToKeys.mask, kv, kRows, 2 * Wd * sizeof(T) / 16);
   T* gathered = scratch<T>("ab.gathered", qRows * Wd);
   int warps = 8;
   size_t smem = ((size_t)sh.keys * (D + 1) * 2 + (size_t)warps * sh.keys + (size_t)warps * D) * 4;
@@ -626,7 +641,7 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   std::vector<float*> logits = atomPairLogits(E, o.pair, pairRows, Cp, nblocks, o.heads, sh);
   if (M.flag(E + ".blocks.0.maskAtomActPerBlock")) { fprintf(stderr, "per-block atom masking: not ported\n"); exit(1); }
   for (int b = 0; b < nblocks; ++b)
-    o.blocks.push_back(prepareAtomBlock(E + ".blocks." + std::to_string(b), o.qCond, o.kCond, qRows, kRows, C, logits[b]));
+    o.blocks.push_back(prepareAtomBlock(E + ".blocks." + std::to_string(b), o.qCond, qRows, C, logits[b]));
   o.keyMasked = M.flag(E + ".blocks.0.keyMaskedAtomAttention");
   o.noResidual = M.flag(E + ".blocks.0.diffusionNoResidual");
   return o;
