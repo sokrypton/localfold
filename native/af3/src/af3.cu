@@ -4,6 +4,7 @@
 //
 // Reads <data-dir>/model.{idx,bin} (export-model.mjs). Without --fast it runs the precise
 // path (f32 throughout) and checks every seam the oracle recorded; with --fast the f16 path.
+#include <dirent.h>
 #include "trunk.cuh"
 #include "atom.cuh"
 #include "diffusion.cuh"
@@ -18,6 +19,7 @@ int main(int argc, char** argv) {
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
   uint64_t seed = 42; std::string out = "fold.pdb", weightsDir;
   bool waitInput = false;   // start up (CUDA, the weights on the device) while the input is still being exported
+  std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
     else if (!strcmp(argv[i], "--no-tf32")) F32_TF32 = false;
@@ -37,6 +39,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strncmp(argv[i], "--weights=", 10)) weightsDir = argv[i] + 10;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;
+    else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;
   }
   auto t0 = std::chrono::steady_clock::now();
   // a batch: `af3 dir1,dir2,... --out=a.pdb,b.pdb` folds each input in this one process, the weights
@@ -373,7 +376,7 @@ int main(int argc, char** argv) {
     printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d), confidence %.1f ms, total %.1f ms\n",
            fi + 1, ms(f0, f1), recycles + 1, diffMs, steps, samples, confMs, ms(f0, f3));
     if (profiling) prof::stop(40);
-    if (fi == 0 && which == 0) unreadWeights();
+    if (fi == 0 && which == 0 && serveDir.empty()) unreadWeights();
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
     if (fi + 1 == folds) return 0;
   }
@@ -402,6 +405,54 @@ int main(int argc, char** argv) {
   // --detach-output: the last line is "af3: done" and stdout closes, so a caller reading it to its
   // end can return while the driver releases this process's device memory (0.25 s, the rest of the
   // exit); native/af3/fold does
+  if (!serveDir.empty()) {
+    // a job is DIR/<id>.job (renamed into place): its first line the input's directory, then one
+    // flag a line (--out, --samples, --steps, --recycles, --seed); its output goes to <id>.log and
+    // its exit status to <id>.done. A job reading "quit" stops the server.
+    const int steps0 = steps, recycles0 = recycles, samples0 = samples, folds0 = folds;
+    printf("af3: serving %s\n", serveDir.c_str()); fflush(stdout);
+    for (;;) {
+      std::string id;
+      if (DIR* d = opendir(serveDir.c_str())) {
+        std::vector<std::string> jobs;
+        while (dirent* e = readdir(d)) {
+          std::string name = e->d_name;
+          if (name.size() > 4 && name.substr(name.size() - 4) == ".job") jobs.push_back(name.substr(0, name.size() - 4));
+        }
+        closedir(d);
+        if (!jobs.empty()) { std::sort(jobs.begin(), jobs.end()); id = jobs[0]; }
+      }
+      if (id.empty()) { usleep(2000); continue; }
+      std::string base = serveDir + "/" + id;
+      std::ifstream job(base + ".job");
+      std::string input, line; std::getline(job, input);
+      std::vector<std::string> flags; while (std::getline(job, line)) if (!line.empty()) flags.push_back(line);
+      job.close(); unlink((base + ".job").c_str());
+      if (input == "quit") { printf("af3: stopped\n"); return 0; }
+      steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb";
+      bool jobSeed = false; seed = seedArg;
+      for (auto& f : flags) {
+        if (!f.compare(0, 6, "--out=")) out = f.substr(6);
+        else if (!f.compare(0, 10, "--samples=")) samples = atoi(f.c_str() + 10);
+        else if (!f.compare(0, 8, "--steps=")) steps = atoi(f.c_str() + 8);
+        else if (!f.compare(0, 11, "--recycles=")) recycles = atoi(f.c_str() + 11);
+        else if (!f.compare(0, 7, "--seed=")) { seed = strtoull(f.c_str() + 7, nullptr, 10); jobSeed = true; }
+      }
+      seedGiven = jobSeed;
+      fflush(stdout);
+      int saved = dup(1), log = open((base + ".log").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      dup2(log, 1); close(log);
+      inputs = {input}; outs = {out};
+      int seg = (int)M.segs.size();
+      int code = runInput(0);
+      fflush(stdout); dup2(saved, 1); close(saved);
+      CK(cudaDeviceSynchronize());
+      freeTrunk(t); CHIRALITY = Chirality{};
+      forgetEntries(M.unload(seg));
+      FILE* df = fopen((base + ".done.tmp").c_str(), "w"); fprintf(df, "%d\n", code); fclose(df);
+      rename((base + ".done.tmp").c_str(), (base + ".done").c_str());
+    }
+  }
   bool detach = false;
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--detach-output")) detach = true;
   for (size_t which = 0; which < inputs.size(); ++which) {

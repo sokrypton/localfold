@@ -183,6 +183,14 @@ filled by three threads (77 against 170 ms), and every weight's f16 copy is made
 a command, of which the fold is
 0.64.
 
+## A resident af3
+
+`native/af3/fold --serve` starts one `af3` (`--serve=DIR`) that keeps the weights on the device and
+every kernel and cuBLAS plan warm; until `native/af3/fold --stop`, every ordinary `fold` command
+for that model exports its input and hands it to the server as a job (per-job `--samples`,
+`--steps`, `--recycles`, `--seed`) - 6MRR 0.70 s a command, against 1.00 s starting `af3` each
+time. The outputs are byte-identical either way.
+
 ## The gate
 
 `python3 native/af3/gate.py` folds 6MRR from its sequence through all seven models, plus 5CAJ and

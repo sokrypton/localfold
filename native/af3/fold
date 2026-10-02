@@ -9,6 +9,10 @@
 # --model=<name> picks the bundle (model-<name>-full-f32, -f32 or -int5, in that order; default
 # af3) and keeps its exported weights in native/af3/weights-<name>.
 #
+#   native/af3/fold --serve [--model=<name>]     then any number of ordinary fold commands, then
+#   native/af3/fold --stop  [--model=<name>]
+# keeps one af3 resident with the weights on the device and warm: each fold command then pays only
+# the export and a warm fold (6MRR: 0.65 s rather than 1.0)
 #   native/af3/fold --batch=<file> [--model=<name>] [-- <fold flags>]
 # folds every line of <file> - "<out.pdb> <input flags>" - in ONE af3 process: the weights load
 # once and every fold after the first runs warm (6MRR: 1.7 s a command, ~0.5 s a batch line).
@@ -20,8 +24,8 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { sed -n '2,17p' "$0"; exit 1; }
-batch=""
-case "$1" in --batch=*) batch="${1#--batch=}"; out="" ;; *) out="$1" ;; esac
+batch=""; serve=""
+case "$1" in --batch=*) batch="${1#--batch=}"; out="" ;; --serve|--stop) serve="$1"; out="" ;; *) out="$1" ;; esac
 shift
 inputs=(); foldflags=(); model=af3
 while [ $# -gt 0 ]; do
@@ -42,6 +46,38 @@ if [ ! -x "$here/af3" ]; then
 fi
 node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")
 [ -f "$weights/model.idx" ] || "${node[@]}" "$weights" --weights-only --bundle="$bundle"
+serve_dir="/tmp/af3-serve-$model-$(id -u)"
+server_up() { [ -f "$serve_dir/pid" ] && kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null; }
+if [ "$serve" = --serve ]; then
+  server_up && { echo "already serving $model ($serve_dir)"; exit 0; }
+  mkdir -p "$serve_dir"; rm -f "$serve_dir"/*.job "$serve_dir"/*.done
+  nohup "$here/af3" - --serve="$serve_dir" --weights="$weights" --fold --fast "${foldflags[@]}" > "$serve_dir/server.log" 2>&1 &
+  echo $! > "$serve_dir/pid"
+  until grep -q "af3: serving" "$serve_dir/server.log" 2>/dev/null; do
+    kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null || { cat "$serve_dir/server.log" >&2; exit 1; }
+    sleep 0.05
+  done
+  echo "serving $model ($serve_dir)"; exit 0
+fi
+if [ "$serve" = --stop ]; then
+  server_up || { echo "no $model server"; exit 0; }
+  echo quit > "$serve_dir/quit.tmp" && mv "$serve_dir/quit.tmp" "$serve_dir/~quit.job"
+  while server_up; do sleep 0.05; done
+  echo "stopped $model"; exit 0
+fi
+if [ -z "$batch" ] && server_up; then   # a resident af3: export, hand it the job, wait for it
+  id="$(date +%s%N)-$$"; in="$serve_dir/in-$id"
+  trap 'rm -rf "$in" "$serve_dir/$id".*' EXIT
+  "${node[@]}" "$in" --no-weights --bundle="$bundle" "${inputs[@]}" || exit 1
+  { echo "$in"; echo "--out=$out"; for f in "${foldflags[@]}"; do echo "$f"; done; } > "$serve_dir/$id.tmp"
+  mv "$serve_dir/$id.tmp" "$serve_dir/$id.job"
+  until [ -f "$serve_dir/$id.done" ]; do
+    server_up || { cat "$serve_dir/$id.log" 2>/dev/null; echo "the $model server stopped (its log: $serve_dir/server.log)" >&2; exit 1; }
+    sleep 0.005
+  done
+  cat "$serve_dir/$id.log"
+  exit "$(cat "$serve_dir/$id.done")"
+fi
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # af3 with its output read to the end: on success its last line is "af3: done" and it closes
 # stdout, so this returns while the driver is still releasing its device memory (a quarter second);
