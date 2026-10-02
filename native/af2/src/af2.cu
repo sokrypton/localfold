@@ -8,6 +8,7 @@
 // against it stage by stage.
 #include "templates.cuh"
 #include "structure.cuh"
+#include "../../af3/src/profile.cuh"
 
 static const char* RESTYPE3[21] = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU",
                                    "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK"};
@@ -59,12 +60,14 @@ __global__ void symmetriseK(const float* half_, float* out, int L, int B) {
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
-  std::string weights, oracle, out = "fold.pdb"; int recycles = -1;
+  std::string weights, oracle, out = "fold.pdb"; int recycles = -1; bool profile = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
+    else if (!strcmp(argv[i], "--profile")) profile = true;
+    else if (!strcmp(argv[i], "--fast")) FAST = true;
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (weights.empty()) { fprintf(stderr, "--weights=<dir> (native/af2/export_weights.py)\n"); return 1; }
@@ -72,7 +75,9 @@ int main(int argc, char** argv) {
   M.load(weights); M.load(argv[1]);
   if (!oracle.empty()) M.load(oracle);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
-  CB(cublasSetMathMode(H, CUBLAS_PEDANTIC_MATH));     // float32 means float32 on this path
+  bool tf32 = FAST && !getenv("AF2_NO_TF32");
+  if (getenv("AF2_NO_FLASH")) FAST = false;
+  CB(cublasSetMathMode(H, tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));   // float32 means float32 unless --fast
   Trunk t{};
   t.L = (int)M.meta("meta/tokens"); t.N = (int)M.meta("meta/msa_rows"); t.E = (int)M.meta("meta/extra_rows");
   t.opmFirst = M.flag("meta/opm_first");
@@ -92,10 +97,11 @@ int main(int argc, char** argv) {
   int mainBlocks = (int)dimW("evoformer/evoformer_iteration/msa_transition/transition1/weights", 0);
   StructureOut so{};
   float* plddtLogits = nullptr; float* paeLogits = nullptr;
+  if (profile) { prof::init(); prof::start(); }
   auto tf = std::chrono::steady_clock::now();
-  for (int pass = 0; pass < passes; ++pass) {
-    bool check = pass == 0 && !oracle.empty();
-    embed(t, pass, prevRow, prevPair, prevPos);
+  // everything after the embedder: the same launches on the same buffers every pass, so from pass 1
+  // on it is captured once as a CUDA graph and replayed (a pass is ~6000 launches)
+  auto rest = [&](bool check, int pass) {
     if (M.flag("meta/multimer")) templateEmbedding(t.pair, t.pairMask, L);
     if (check) {
       printf("pass 0 against the reference:\n");
@@ -158,9 +164,39 @@ int main(int argc, char** argv) {
       symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
       checkOracle("distogram logits", dg, pairs * 64, "o/full/distogram_logits");
     }
+  };
+  cudaGraphExec_t graph = nullptr;
+  // capturing costs about half a replayed pass and a replay saves a few percent of one (59 residues:
+  // 100 against 107 ms), so only a long recycle run gains - as native/af3's trunk graph rule
+  bool graphs = !getenv("AF2_NO_GRAPHS") && oracle.empty() && (passes >= 8 || getenv("AF2_GRAPHS"));
+  for (int pass = 0; pass < passes; ++pass) {
+    bool check = pass == 0 && !oracle.empty();
+    embed(t, pass, prevRow, prevPair, prevPos);
+    if (!graphs || pass == 0) {
+      rest(check, pass);
+      if (getenv("AF2_PASS_TIMES")) {
+        CK(cudaStreamSynchronize(STREAM));
+        printf("  pass %d done at %.1f ms\n", pass, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
+      }
+      continue;
+    }
+    if (!graph) {
+      cudaGraph_t g;
+      CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+      rest(false, pass);
+      CK(cudaStreamEndCapture(STREAM, &g));
+      CK(cudaGraphInstantiate(&graph, g, 0));
+      CK(cudaGraphDestroy(g));
+    }
+    CK(cudaGraphLaunch(graph, STREAM));
+    if (getenv("AF2_PASS_TIMES")) {
+      CK(cudaStreamSynchronize(STREAM));
+      printf("  pass %d done at %.1f ms\n", pass, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
+    }
   }
   CK(cudaStreamSynchronize(STREAM));
   double foldMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
+  if (profile) prof::stop(30);
   std::vector<float> pl = download(plddtLogits, (size_t)L * 50);
   std::vector<float> centres(50); for (int b = 0; b < 50; ++b) centres[b] = (b + 0.5f) * 2.f;
   std::vector<float> plddt = expectation(pl, L, 50, centres);

@@ -1,7 +1,7 @@
 // The input embedder and the Evoformer block - af3-any-model's AF2 multimer graph
 // (alphafold3/af2/model/modules.py: EmbeddingsAndEvoformer, EvoformerIteration), float32.
 #pragma once
-#include "ops.cuh"
+#include "fast.cuh"
 
 struct Trunk {
   int L, N, E;                  // residues, MSA rows, extra MSA rows
@@ -12,6 +12,8 @@ struct Trunk {
   const float* extraMask;       // [E, L]
   float* pairMask;              // [L, L]
   bool opmFirst;
+  // all ones (no padding, no absent row): the flash kernel then skips the mask altogether
+  bool msaOnes = false, extraOnes = false, pairOnes = false;
 };
 
 // ---------------------------------------------------------------- the embedder
@@ -112,8 +114,16 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
   extraFeatK<<<blocks(erows * 25), 256, 0, STREAM>>>(Idev(f + "extra_msa"), W(f + "extra_has_deletion"),
                                                       W(f + "extra_deletion_value"), ef, erows);
   linearB(ef, E + "extra_msa_activations", -1, t.extra, erows, 25, 64);
-  t.msaMask = W(f + "msa_mask");
-  t.extraMask = W(f + "extra_msa_mask");
+  // the masks into fixed buffers: the stacks after this are replayed as one CUDA graph from pass 1 on,
+  // and a graph's pointers do not change between passes
+  float* mm = scratch<float>("emb.msaMask", (size_t)N * L); float* em = scratch<float>("emb.extraMask", erows);
+  CK(cudaMemcpyAsync(mm, W(f + "msa_mask"), (size_t)N * L * 4, cudaMemcpyDeviceToDevice, STREAM));
+  CK(cudaMemcpyAsync(em, W(f + "extra_msa_mask"), erows * 4, cudaMemcpyDeviceToDevice, STREAM));
+  t.msaMask = mm; t.extraMask = em;
+  auto ones = [](const float* h, size_t n) { for (size_t i = 0; i < n; ++i) if (h[i] != 1.f) return false; return true; };
+  t.msaOnes = ones(M.f(f + "msa_mask"), (size_t)N * L);
+  t.extraOnes = ones(M.f(f + "extra_msa_mask"), erows);
+  t.pairOnes = ones(M.f("seq_mask"), L);
   pairMaskK<<<blocks(pairs), 256, 0, STREAM>>>(W("seq_mask"), t.pairMask, L);
 }
 
@@ -134,6 +144,62 @@ inline void gatedAttention(const float* xn, int Bt, int n, int C, const std::str
   gemm(o, P(A + "/output_w", blk), out, rows, Wd, C);
   addBiasK<<<blocks(rows * C), 256, 0, STREAM>>>(out, P(A + "/output_b", blk), rows, C);
 }
+// [pairs, H] f32 pair-bias projection (+ 1e9 (mask - 1) when a mask is given) -> [H, L, stride] f16 in
+// the flash kernel's log2 units
+__global__ void biasFromProjK(const float* proj, const float* pairMask, half* out, int L, int H, int stride) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)L * L * H) return;
+  int h = (int)(t % H); size_t ij = t / H; int i = (int)(ij / L), j = (int)(ij % L);
+  float v = proj[t] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
+  out[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
+}
+inline const half* zeroBias(int H, int n, int stride) {        // a bias-free attention's bias, once
+  static half* z = nullptr; static size_t have = 0;
+  size_t need = (size_t)H * n * stride;
+  if (need > have) {
+    if (z) CK(cudaFree(z));
+    z = dallocT<half>(need); CK(cudaMemset(z, 0, need * 2)); have = need;
+  }
+  return z;
+}
+// --fast: from the normalised input xn (f16): one q/k/v/gate GEMM straight into the flash kernel's
+// layout -> flash attention -> the output projection with its bias, added into `residual` (transposed
+// back first when `transposedBack`, xn being [n, Bt] of the residual's [Bt, n])
+inline void attentionCore(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const float* keyMask,
+                          const half* bias, float* residual, bool transposedBack) {
+  size_t rows = (size_t)Bt * n;
+  AttnW w = attnWeights(A, blk, C);
+  int Wp = w.H * w.Dp, stride = (n + 7) / 8 * 8;
+  half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
+  ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
+  if (!bias) bias = zeroBias(w.H, n, stride);
+  half* o = scratch<half>("fatt.o", rows * Wp);
+  flashGrid<half>(qkvg, bias, stride, keyMask, o, n, w.H, w.Dp, 0, Bt, false, 1.f / sqrtf((float)w.D));
+  if (!transposedBack) {
+    ltGemm(o, w.out, residual, false, rows, Wp, C, P(A + "/output_b", blk), false, 1.f);
+  } else {
+    float* tmp = scratch<float>("fatt.tmp", rows * C);
+    ltGemm(o, w.out, tmp, false, rows, Wp, C, P(A + "/output_b", blk), false, 0.f);
+    swapAddK<<<blocks(rows * C), 256, 0, STREAM>>>(residual, tmp, Bt, n, C);
+  }
+}
+// the pair bias, --fast: LN(pair) in f16 -> [pairs, H] -> the flash layout
+inline const half* pairBiasFast(const half* pn, int L, int H, const float* w, const float* pairMask) {
+  size_t pairs = (size_t)L * L; int stride = (L + 7) / 8 * 8;
+  float* proj = scratch<float>("fbias.proj", pairs * H);
+  static std::map<const float*, half*> wh;
+  auto it = wh.find(w);
+  if (it == wh.end()) {
+    half* h = dallocT<half>((size_t)128 * H);
+    toHalfK<<<blocks((size_t)128 * H), 256, 0, STREAM>>>(w, h, (size_t)128 * H);
+    it = wh.emplace(w, h).first;
+  }
+  ltGemm(pn, it->second, proj, false, pairs, 128, H, nullptr, false, 0.f);
+  half* bias = scratch<half>("fbias.bias", (size_t)H * L * stride);
+  biasFromProjK<<<blocks(pairs * H), 256, 0, STREAM>>>(proj, pairMask, bias, L, H, stride);
+  return bias;
+}
+
 // pair bias [H, L, L] = LN(pair) W (+ 1e9 (pairMask - 1) for the MSA rows)
 __global__ void pairBiasK(const float* proj, const float* pairMask, float* bias, int L, int H) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -146,6 +212,16 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
                             const float* msaMask) {
   int L = t.L; size_t pairs = (size_t)L * L, rows = (size_t)rowsN * L;
   std::string R = S + "msa_row_attention_with_pair_bias";
+  if (FAST) {
+    half* pn = scratch<half>("frow.pn", pairs * 128);
+    layerNormH(t.pair, pn, pairs, 128, R + "/feat_2d_norm", blk);
+    const half* bias = pairBiasFast(pn, L, H, P(R + "/feat_2d_weights", blk), t.pairOnes ? nullptr : t.pairMask);
+    half* xn = scratch<half>("frow.xn", rows * C);
+    layerNormH(msa, xn, rows, C, R + "/query_norm", blk);
+    bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
+    attentionCore(xn, rowsN, L, C, R + "/attention", blk, ones ? nullptr : msaMask, bias, msa, false);
+    return;
+  }
   float* pn = scratch<float>("row.pn", pairs * 128);
   layerNorm(t.pair, pn, pairs, 128, R + "/feat_2d_norm", blk);
   float* proj = scratch<float>("row.proj", pairs * H);
@@ -166,6 +242,12 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
   float* mt = scratch<float>("col.mask", rows);
   swap01(msa, tr, rowsN, L, C);                 // [L, N, C]
   swap01(msaMask, mt, rowsN, L, 1);
+  if (FAST) {
+    half* xn = scratch<half>("fcol.xn", rows * C);
+    layerNormH(tr, xn, rows, C, A + "/query_norm", blk);
+    attentionCore(xn, L, rowsN, C, A + "/attention", blk, t.msaOnes ? nullptr : mt, nullptr, msa, true);
+    return;
+  }
   layerNorm(tr, xn, rows, C, A + "/query_norm", blk);
   float* out = scratch<float>("col.out", rows * C);
   gatedAttention(xn, L, rowsN, C, A + "/attention", blk, H, D, mt, nullptr, out);
@@ -205,6 +287,13 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
   float* xn = scratch<float>("tr.xn", rows * C);
   float* mid = scratch<float>("tr.mid", rows * I);
   float* out = scratch<float>("tr.out", rows * C);
+  if (FAST) {
+    half* xh = scratch<half>("ftr.xn", rows * C); half* mh = scratch<half>("ftr.mid", rows * I);
+    layerNormH(x, xh, rows, C, T + "/input_layer_norm", blk);
+    ltGemm(xh, PH(T + "/transition1/weights", blk), mh, true, rows, C, I, P(T + "/transition1/bias", blk), true, 0.f);
+    ltGemm(mh, PH(T + "/transition2/weights", blk), x, false, rows, I, C, P(T + "/transition2/bias", blk), false, 1.f);
+    return;
+  }
   layerNorm(x, xn, rows, C, T + "/input_layer_norm", blk);
   linearB(xn, T + "/transition1", blk, mid, rows, C, I, true);
   linearB(mid, T + "/transition2", blk, out, rows, I, C);
@@ -214,6 +303,35 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
                              const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
+  if (FAST) {
+    half* xn = scratch<half>("fopm.xn", rows * C);
+    layerNormH(msa, xn, rows, C, Op + "/layer_norm_input", blk);
+    half* lt = scratch<half>("fopm.left", rows * O); half* rt = scratch<half>("fopm.right", rows * O);
+    ltGemm(xn, PH(Op + "/left_projection/weights", blk), lt, true, rows, C, O, P(Op + "/left_projection/bias", blk), false, 0.f);
+    ltGemm(xn, PH(Op + "/right_projection/weights", blk), rt, true, rows, C, O, P(Op + "/right_projection/bias", blk), false, 0.f);
+    bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
+    if (!ones) {
+      scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(lt, msaMask, rows, O);
+      scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(rt, msaMask, rows, O);
+    }
+    float* norm = scratch<float>("opm.norm", (size_t)L * L);
+    const float one = 1.f, zero = 0.f;
+    CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
+    size_t per = (size_t)L * O * O;
+    int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
+    half* Pm = scratch<half>("fopm.P", (size_t)Bi * per);
+    half* X = scratch<half>("fopm.X", (size_t)Bi * per);
+    float* Y = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
+    for (int i0 = 0; i0 < L; i0 += Bi) {
+      int bi = std::min(Bi, L - i0);
+      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &one, rt, CUDA_R_16F, L * O, lt + (size_t)i0 * O,
+                      CUDA_R_16F, L * O, &zero, Pm, CUDA_R_16F, L * O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      opmPermuteHK<<<blocks((size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
+      ltGemm(X, PH(Op + "/output_w", blk), Y, false, (size_t)bi * L, O * O, 128, nullptr, false, 0.f);
+      opmAddK2<<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128);
+    }
+    return;
+  }
   float* xn = scratch<float>("opm.xn", rows * C);
   layerNorm(msa, xn, rows, C, Op + "/layer_norm_input", blk);
   float* lt = scratch<float>("opm.left", rows * O); float* rt = scratch<float>("opm.right", rows * O);
@@ -260,6 +378,30 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
                                    bool outgoing) {
   size_t pairs = (size_t)L * L;
   std::string T = S + (outgoing ? "triangle_multiplication_outgoing" : "triangle_multiplication_incoming");
+  if (FAST) {
+    TriW w = triWeights(T, blk, C);
+    half* xn = scratch<half>("ftri.xn", pairs * C);
+    layerNormH(pair, xn, pairs, C, T + "/left_norm_input", blk);
+    half* pg = scratch<half>("ftri.pg", pairs * 5 * C);
+    ltGemm(xn, w.w5, pg, true, pairs, C, 5 * C, w.b5, false, 0.f);
+    half* a = scratch<half>("ftri.a", pairs * C); half* b = scratch<half>("ftri.b", pairs * C);
+    triGateTK<<<dim3((unsigned)((pairs + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, pairMask, a, b, pairs, C);
+    float* prod = scratch<float>("ftri.prod", pairs * C);
+    const float one = 1.f, zero = 0.f;
+    if (outgoing)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, L, L, L, &one, b, CUDA_R_16F, L, pairs, a, CUDA_R_16F, L,
+                                    pairs, &zero, prod, CUDA_R_32F, L, pairs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    else
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, L, &one, a, CUDA_R_16F, L, pairs, b, CUDA_R_16F, L,
+                                    pairs, &zero, prod, CUDA_R_32F, L, pairs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    half* cn = scratch<half>("ftri.cn", pairs * C);
+    centerNormTK<<<(unsigned)((pairs + 31) / 32), 256, (size_t)C * 33 * 4, STREAM>>>(prod, cn, pairs, C,
+      P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk));
+    float* out = scratch<float>("ftri.out", pairs * C);
+    ltGemm(cn, w.out, out, false, pairs, C, C, P(T + "/output_projection/bias", blk), false, 0.f);
+    gateMulAddHK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, out, pg, pairs, C);
+    return;
+  }
   float* xn = scratch<float>("tri.xn", pairs * C);
   layerNorm(pair, xn, pairs, C, T + "/left_norm_input", blk);
   float* proj = scratch<float>("tri.proj", pairs * 2 * C); float* gate = scratch<float>("tri.gate", pairs * 2 * C);
@@ -288,13 +430,20 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   gateMulAddK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, out, g, pairs * C);
 }
 inline void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
-                              bool starting) {
+                              bool starting, bool pairOnes = false) {
   size_t pairs = (size_t)L * L;
   std::string A = S + (starting ? "triangle_attention_starting_node" : "triangle_attention_ending_node");
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3);
   const float* x = pair; const float* mask = pairMask;
   float* tr = scratch<float>("tatt.tr", pairs * C); float* mt = scratch<float>("tatt.mask", pairs);
-  if (!starting) { swap01(pair, tr, L, L, C); swap01(pairMask, mt, L, L, 1); x = tr; mask = mt; }
+  if (!starting) { swap01(pair, tr, L, L, C); if (!FAST || !pairOnes) swap01(pairMask, mt, L, L, 1); x = tr; mask = mt; }
+  if (FAST) {
+    half* xn = scratch<half>("ftatt.xn", pairs * C);
+    layerNormH(x, xn, pairs, C, A + "/query_norm", blk);
+    const half* bias = pairBiasFast(xn, L, H, P(A + "/feat_2d_weights", blk), nullptr);
+    attentionCore(xn, L, L, C, A + "/attention", blk, pairOnes ? nullptr : mask, bias, pair, !starting);
+    return;
+  }
   float* xn = scratch<float>("tatt.xn", pairs * C);
   layerNorm(x, xn, pairs, C, A + "/query_norm", blk);
   float* proj = scratch<float>("tatt.proj", pairs * H);
@@ -323,7 +472,7 @@ inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
   if (!t.opmFirst) outerProductMean(t, S, blk, msa, rowsN, C, mask);
   triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, true);
   triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, false);
-  triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, true);
-  triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, false);
+  triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, true, t.pairOnes);
+  triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, false, t.pairOnes);
   transition(t.pair, (size_t)t.L * t.L, 128, S + "pair_transition", blk);
 }

@@ -194,7 +194,7 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   linearB(act2d, I + "attention_2d", -1, b2d, pairs, C2, Hh);    // the same every iteration (shared weights)
   float* pw = scratch<float>("sm.pw", Hh);
   softplusScaleK<<<1, 32, 0, STREAM>>>(P(I + "trainable_point_weights"), pw, Hh, sqrtf(1.f / (Pq * 9.f / 2.f)));
-  float* rig = dalloc((size_t)L * 12);
+  float* rig = scratch<float>("sm.rigid", (size_t)L * 12);
   identityRigidK<<<blocks(L), 256, 0, STREAM>>>(rig, L);
   float* qs = scratch<float>("sm.qs", (size_t)L * Hh * Cs); float* ks = scratch<float>("sm.ks", (size_t)L * Hh * Cs);
   float* vs = scratch<float>("sm.vs", (size_t)L * Hh * Cs);
@@ -259,7 +259,8 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   reluCopyK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(sc, sb, (size_t)L * 128);
   float* un = scratch<float>("sm.un", (size_t)L * 14);
   linearB(sb, R + "unnormalized_angles", -1, un, L, 128, 14);
-  StructureOut o{act, rig, dalloc((size_t)L * 37 * 3), dalloc((size_t)L * 14 * 3), dalloc((size_t)L * 14)};
+  StructureOut o{act, rig, scratch<float>("sm.pos37", (size_t)L * 37 * 3), scratch<float>("sm.pos14", (size_t)L * 14 * 3),
+                 scratch<float>("sm.angles", (size_t)L * 14)};
   sidechainAtomsK<<<blocks(L, 128), 128, 0, STREAM>>>(un, rig, positionScale, Idev("aatype"), W("c/rigid_group_default_frame"),
                                                  Idev("c/atom14_to_rigid_group"), W("c/atom14_rigid_group_positions"),
                                                  W("c/atom14_mask"), Idev("c/atom37_to_atom14"), W("c/atom37_mask"),

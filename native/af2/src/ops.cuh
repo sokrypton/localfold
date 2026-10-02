@@ -3,6 +3,11 @@
 // file, device weights, scratch, cuBLAS - is native/af3's.
 #pragma once
 #include "../../af3/src/common.cuh"
+#include "../../af3/src/flash.cuh"
+
+// --fast: TF32 GEMMs and the f16 tensor-core flash attention (native/af3/src/flash.cuh) where a head
+// is 16 or 32 wide; residual streams and everything else stay f32
+inline bool FAST = false;
 
 // ---------------------------------------------------------------- weights
 // A haiku parameter, "w/<module>/<param>"; `block` picks one slice of a layer-stacked one.
@@ -117,8 +122,41 @@ __global__ void attentionK(const float* q, const float* k, const float* v, const
     }
   }
 }
+// q, k, v, g [rows, W] f32 -> qkvg [rows][4W] f16 (the flash kernel's layout, roles in that order)
+__global__ void packQkvgK(const float* q, const float* k, const float* v, const float* g, half* out, size_t rows, int W) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * W) return;
+  size_t r = t / W; int w = (int)(t % W);
+  half* o = out + r * 4 * W;
+  o[w] = __float2half(q[t]); o[W + w] = __float2half(k[t]); o[2 * W + w] = __float2half(v[t]); o[3 * W + w] = __float2half(g[t]);
+}
+// pair bias [H, n, n] f32 -> [H, n, stride] f16 times log2(e), as the flash kernel takes it (it scores in
+// the log2 domain: Q carries scale * log2e, the bias log2e), -1e9 masks held to f16's range
+__global__ void biasToHalfK(const float* b, half* out, int H, int n, int stride) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)H * n * n) return;
+  size_t hq = t / n; int j = (int)(t % n);
+  out[hq * stride + j] = __float2half(fmaxf(b[t] * LOG2E, -6e4f));     // the kernel scores in log2 units
+}
+__global__ void halfToFloatK(const half* x, float* y, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = __half2float(x[t]);
+}
 inline void attention(int D, const float* q, const float* k, const float* v, const float* g, const float* keyMask,
                       const float* pairBias, float* out, int Bt, int n, int H) {
+  if (FAST && (D == 16 || D == 32)) {
+    size_t rows = (size_t)Bt * n; int W = H * D;
+    half* qkvg = scratch<half>("fa.qkvg", (rows + 128) * 4 * W);
+    packQkvgK<<<blocks(rows * W), 256, 0, STREAM>>>(q, k, v, g, qkvg, rows, W);
+    int stride = (n + 7) / 8 * 8;
+    half* bias = scratch<half>("fa.bias", (size_t)H * n * stride);
+    if (pairBias) biasToHalfK<<<blocks((size_t)H * n * n), 256, 0, STREAM>>>(pairBias, bias, H, n, stride);
+    else CK(cudaMemsetAsync(bias, 0, (size_t)H * n * stride * 2, STREAM));
+    half* o = scratch<half>("fa.out", rows * W);
+    flashGrid<half>(qkvg, bias, stride, keyMask, o, n, H, D, 0, Bt, false, 1.f / sqrtf((float)D));
+    halfToFloatK<<<blocks(rows * W), 256, 0, STREAM>>>(o, out, rows * W);
+    return;
+  }
   size_t warps = (size_t)Bt * n * H;
   unsigned grid = (unsigned)((warps + 7) / 8);
   float scale = 1.f / sqrtf((float)D);
