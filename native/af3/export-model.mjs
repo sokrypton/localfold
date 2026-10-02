@@ -211,8 +211,28 @@ if (sequence !== "") {
   const merge = (list) => (list === null ? null : (list.length === 1 ? list[0] : mergeRowAlignedChainA3ms(list)));
   const unpaired = texts(option("a3m", "")), paired = texts(option("paired-a3m", ""));
   if (jobRequest?.alignment && (unpaired || paired)) throw new Error("the job carries its alignments; --a3m would replace them");
-  const alignment = jobRequest?.alignment ?? (unpaired === null && paired === null ? null
+  let alignment = jobRequest?.alignment ?? (unpaired === null && paired === null ? null
     : (paired === null && unpaired.length === 1 ? unpaired[0] : { paired: merge(paired), unpaired: merge(unpaired) }));
+  // --search: the protein chains' alignments from the ColabFold MMseqs2 server, through the page's
+  // own client and merge (src/input/mmseqs2-api.js) - AF3's data pipeline step, as the page runs it;
+  // it sends the sequences to api.colabfold.com, so it is asked for, never assumed
+  if (args.includes("--search")) {
+    if (alignment !== null) throw new Error("--search and an alignment both name the MSA");
+    const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import(`${repo}/src/input/mmseqs2-api.js`);
+    const allChains = sequence.split(":");
+    const allKinds = jobRequest?.chainKinds ?? (option("kinds", "") === "" ? allChains.map(() => "protein") : option("kinds", "").split(","));
+    // (the protein chains only, in order: without nucleic coverage the featuriser maps the alignment's
+    // columns onto the protein residues and skips the nucleic ones, wherever they sit)
+    const proteins = allChains.filter((_, i) => allKinds[i] === "protein");
+    if (proteins.length === 0) throw new Error("--search: no protein chain to search for");
+    const t0 = performance.now();
+    if (proteins.length === 1) {
+      alignment = (await generateMmseqs2Msa(proteins[0], {})).a3m;
+    } else {
+      alignment = (await generateMmseqs2ComplexMsa(proteins, { model: "af3" })).blocks;
+    }
+    console.log(`search: ${proteins.length} protein chain(s) from api.colabfold.com in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  }
   // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna
   // (one per ":"-chain), --modify=SEP@3[@chain] (the position as tools/gpu/probe-modified.js takes it, chain index from 0)
   const { ccdUrl, parseCcdComponent, ligandChain } = await import(`${repo}/src/af3/featurise/ccd-component.js`);

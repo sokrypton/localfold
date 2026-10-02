@@ -12,6 +12,11 @@ native/af3/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json 
 native/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
 ```
 
+`--search` gets the protein chains' alignments from the ColabFold MMseqs2 server - the page's own
+client and merge, the paired block included for a complex - instead of an A3M: barnase-barstar
+folds to 0.647 A (ipTM 0.93) from its two sequences, against 16.7 A without, the search 4.0 s. It
+sends the sequences to api.colabfold.com, so it is a flag, never a default.
+
 `fold` builds `af3` if it is missing, exports the weights once (`native/af3/weights`, from the
 bundle on disk - no server), featurises the input with the repository's own featuriser into a
 temporary directory (0.2 s, while `af3` starts) and folds it (`--fold --fast`); everything after
