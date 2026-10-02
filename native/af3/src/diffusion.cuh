@@ -707,6 +707,31 @@ __global__ void broadcastSkipK(const float* proj, const int* idx, const float* g
   float v = gmask[gq] != 0 ? proj[((size_t)idx[gq] / dense + k * tokens) * C + c] : 0.f;
   act[t] = (v + skip[t]) * qMask[gq];
 }
+// upd[row] = LN(act[row] * qMask) W, W (C, 3): scaleByRowK, layerNormSlowK and linear in one pass
+__global__ void maskLnProject3K(const float* act, const float* qMask, size_t q1, size_t rows, int C,
+                                const float* scale, const float* offset, const float* Wp, float* upd) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* x = act + row * C;
+  float m = qMask[row % q1];
+  float s = 0;
+  for (int c = lane; c < C; c += 32) s += x[c] * m;
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, v = 0;
+  for (int c = lane; c < C; c += 32) { float d = x[c] * m - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = 1.f / sqrtf(v / C + 1e-5f);
+  float y0 = 0, y1 = 0, y2 = 0;
+  for (int c = lane; c < C; c += 32) {
+    float l = (x[c] * m - mean) * inv * scale[c] + (offset ? offset[c] : 0.f);
+    y0 += l * Wp[c * 3]; y1 += l * Wp[c * 3 + 1]; y2 += l * Wp[c * 3 + 2];
+  }
+  for (int o = 16; o; o >>= 1) {
+    y0 += __shfl_xor_sync(~0u, y0, o); y1 += __shfl_xor_sync(~0u, y1, o); y2 += __shfl_xor_sync(~0u, y2, o);
+  }
+  if (lane == 0) { upd[row * 3] = y0; upd[row * 3 + 1] = y1; upd[row * 3 + 2] = y2; }
+}
 __global__ void addSkipMaskK(float* act, const float* skip, const float* mask, size_t rows, int C, size_t period) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) act[t] = (act[t] + skip[t]) * mask[(t / C) % period];
@@ -745,11 +770,12 @@ inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const De
     if (maskPerBlock) scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, enc.qMask, qRows, C, q1);
     crossAttentionBlock(act, st, d.blocks[b], sh, C, d.heads, d.D, Dd + ".blocks." + std::to_string(b));
   }
-  scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, enc.qMask, qRows, C, q1);
-  float* ln = scratch<float>("dec.ln", qRows * C);
-  layerNormSlow(act, ln, qRows, C, W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"));
+  // the query mask, the LayerNorm and the three-column projection, a warp a row: as a cuBLAS GEMM
+  // with N = 3 the projection read the normalised rows at a fraction of the bandwidth
   float* upd = scratch<float>("dec.upd", qRows * 3);
-  linear<float, float>(ln, upd, qRows, C, 3, Dd + ".atomFeaturesToPositionUpdate");
+  if (lenW(Dd + ".atomFeaturesToPositionUpdate") != (size_t)C * 3) { fprintf(stderr, "decoder: position update is not C x 3\n"); exit(1); }
+  maskLnProject3K<<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, enc.qMask, q1, qRows, C,
+    W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd);
   float* out = scratch<float>("dec.out", atoms * NS * 3);
   convert(q2t, upd, out, 3, q1, NS);
   return out;

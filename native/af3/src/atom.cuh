@@ -650,6 +650,20 @@ __global__ void atomLogitsLayoutK(const float* flat, float* out, int block, int 
 // (over `rows` token rows of every sample, the mask read per sample's token: row % tokens)
 // aggregateK over convert(q2t, ...)'s output, without materialising it: the same sum in the same
 // order (a query the gather masks reads as 0, which the ReLU keeps 0)
+// act[q] = qStart[q] + qMask[q] * (positions gathered to q) W, W (3, C)
+__global__ void encoderStartK(const float* qStart, const float* pos, const int* idx, const float* gmask, const float* Wp,
+                              const float* qMask, float* act, size_t rows, int C, size_t q1, size_t atoms) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * C) return;
+  size_t q = t / C; int c = (int)(t % C);
+  size_t gq = q % q1, k = q / q1;
+  float v = 0.f;
+  if (gmask[gq] != 0) {
+    const float* p = pos + ((size_t)idx[gq] + k * atoms) * 3;
+    v = p[0] * Wp[c] + p[1] * Wp[C + c] + p[2] * Wp[2 * C + c];
+  }
+  act[t] = qStart[gq * C + c] + v * qMask[gq];
+}
 __global__ void aggregateGatherK(const float* projected, const int* idx, const float* gmask, const float* atomMask,
                                  float* out, size_t rows, int tokens, int dense, int Cp, size_t q1) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -888,14 +902,23 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
   Gather t2q = gatherOf("batch.tokenAtomsToQueries"), q2t = gatherOf("batch.queriesToTokenAtoms");
   float* act = scratch<float>(E + ".act", qRows * C);
   bool maskPerBlock = M.flag(E + ".blocks.0.maskAtomActPerBlock");   // padded atom rows zeroed before every block
-  for (int k = 0; k < NS; ++k)
-    CK(cudaMemcpyAsync(act + k * q1 * C, o.qStart, q1 * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-  if (atomPositions) {
+  bool chiral = atomPositions && hasW(E + ".atomChiralToFeatures");
+  if (atomPositions && !chiral) {
+    // the start, the positions gathered to queries, their three-row projection, the query mask and
+    // the add, in one pass (a K = 3 GEMM wrote its whole output at a fraction of the bandwidth)
+    if (lenW(E + ".atomPositionsToFeatures") != (size_t)3 * C) { fprintf(stderr, "encoder: positions projection is not 3 x C\n"); exit(1); }
+    encoderStartK<<<blocks(qRows * C), 256, 0, STREAM>>>(o.qStart, atomPositions, t2q.idx, t2q.mask,
+      W(E + ".atomPositionsToFeatures"), o.qMask, act, qRows, C, q1, atoms);
+  } else {
+    for (int k = 0; k < NS; ++k)
+      CK(cudaMemcpyAsync(act + k * q1 * C, o.qStart, q1 * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  }
+  if (chiral) {
     float* gp = scratch<float>("enc.gp", qRows * 3);
     convert(t2q, atomPositions, gp, 3, atoms, NS);
     float* positional = scratch<float>("enc.positional", qRows * C);
     linear<float, float>(gp, positional, qRows, 3, C, E + ".atomPositionsToFeatures");
-    if (hasW(E + ".atomChiralToFeatures")) {
+    {
       // rf3's chirality term: the gradient's projection added beside the positions'
       if (!M.has("chiral.centers")) { fprintf(stderr, "this bundle reads chirality centres the input lacks: export it again\n"); exit(1); }
       const Chirality& ch = chirality(atoms);
