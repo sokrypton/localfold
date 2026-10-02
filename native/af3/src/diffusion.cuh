@@ -7,13 +7,14 @@
 constexpr float SIGMA_DATA = 16.f;
 
 // features2d = [trunk pair (Cz) | relative one-hot (139)] per pair; one-hot built in place
+// (pair rows p0 .. p0 + rows; out holds just those rows)
 __global__ void pairFeaturesK(const float* trunkPair, const int* residueIndex, const int* tokenIndex,
                               const int* asymId, const int* entityId, const int* symId, float* out, int n,
-                              int Cz, int maxIdx, int maxChain) {
+                              int Cz, int maxIdx, int maxChain, size_t p0, size_t rows) {
   int rel = (2 * maxIdx + 2) * 2 + 1 + (2 * maxChain + 2), width = Cz + rel;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * width) return;
-  int c = (int)(t % width); size_t ij = t / width; int i = (int)(ij / n), j = (int)(ij % n);
+  if (t >= rows * width) return;
+  int c = (int)(t % width); size_t ij = p0 + t / width; int i = (int)(ij / n), j = (int)(ij % n);
   if (c < Cz) { out[t] = trunkPair[ij * Cz + c]; return; }
   int k = c - Cz, positionBins = 2 * maxIdx + 2;
   auto clamp = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
@@ -37,17 +38,23 @@ __global__ void addVectorK(float* x, const float* v, size_t rows, int C) {
 }
 
 // The plain gated transition used by the conditioning: LN (scale, offset), SwiGLU, project.
+// (in row chunks: at 2088 tokens the pair's wide intermediate alone was 8.9 GB)
 inline void plainTransition(float* x, size_t rows, int C, int factor, const std::string& P) {
   int I = C * factor;
-  float* xn = scratch<float>("pt.xn", rows * C);
-  float* wide = scratch<float>("pt.wide", rows * 2 * I);
-  float* gated = scratch<float>("pt.gated", rows * I);
-  layerNormSlow(x, xn, rows, C, W(P + ".ffwLayerNormScale"), Wopt(P + ".ffwLayerNormOffset"));
-  linear<float, float>(xn, wide, rows, C, 2 * I, P + ".ffwTransition1");
-  swigluK<float><<<blocks(rows * I), 256, 0, STREAM>>>(wide, gated, rows, I);
-  linear<float, float>(gated, x, rows, I, C, P + ".ffwTransition2", false, 1.f);
+  size_t per = std::max<size_t>(1, std::min(rows, CHUNK / (2 * I)));
+  float* xn = scratch<float>("pt.xn", per * C);
+  float* wide = scratch<float>("pt.wide", per * 2 * I);
+  float* gated = scratch<float>("pt.gated", per * I);
+  for (size_t r0 = 0; r0 < rows; r0 += per) {
+    size_t r = std::min(per, rows - r0);
+    layerNormSlow(x + r0 * C, xn, r, C, W(P + ".ffwLayerNormScale"), Wopt(P + ".ffwLayerNormOffset"));
+    linear<float, float>(xn, wide, r, C, 2 * I, P + ".ffwTransition1");
+    swigluK<float><<<blocks(r * I), 256, 0, STREAM>>>(wide, gated, r, I);
+    linear<float, float>(gated, x + r0 * C, r, I, C, P + ".ffwTransition2", false, 1.f);
+  }
 }
 
+inline bool DIFF_HALF = false;     // the denoiser's transformer in f16 (set by --fast)
 struct Conditioning { float *single, *pair; };
 // Everything in the conditioning but the noise term is the same at every step; the pair is
 // computed once and the single's noise-free part kept, so a step adds one projection.
@@ -80,21 +87,26 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
   if (M.flag("trunk.dialect.padSingleCondUnknownDna")) { fprintf(stderr, "padded single cond: not ported\n"); exit(1); }
   if (!DCACHE.ready) {
     int width = Czt + rel;
-    float* f2 = scratch<float>("dc.f2", pairs * width);
-    pairFeaturesK<<<blocks(pairs * width), 256, 0, STREAM>>>(trunkPair, Idev("batch.features.residueIndex"),
-      Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), Idev("batch.features.entityId"),
-      Idev("batch.features.symId"), f2, n, Czt, 32, 2);
-    float* f2n = scratch<float>("dc.f2n", pairs * width);
-    layerNormSlow(f2, f2n, pairs, width, W(P + ".pairCondInitialNormScale"), Wopt(P + ".pairCondInitialNormOffset"));
-    DCACHE.pair = dalloc(pairs * Cz);
-    linear<float, float>(f2n, DCACHE.pair, pairs, width, Cz, P + ".pairCondInitialProjection");
+    // the pair features, normalised and projected in row chunks (whole, they were 9.3 GB at 2088)
+    size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / width));
+    float* f2 = scratch<float>("dc.f2", per * width);
+    float* f2n = scratch<float>("dc.f2n", per * width);
+    DCACHE.pair = scratch<float>("dc.pair", pairs * Cz);
+    for (size_t p0 = 0; p0 < pairs; p0 += per) {
+      size_t r = std::min(per, pairs - p0);
+      pairFeaturesK<<<blocks(r * width), 256, 0, STREAM>>>(trunkPair, Idev("batch.features.residueIndex"),
+        Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), Idev("batch.features.entityId"),
+        Idev("batch.features.symId"), f2, n, Czt, 32, 2, p0, r);
+      layerNormSlow(f2, f2n, r, width, W(P + ".pairCondInitialNormScale"), Wopt(P + ".pairCondInitialNormOffset"));
+      linear<float, float>(f2n, DCACHE.pair + p0 * Cz, r, width, Cz, P + ".pairCondInitialProjection");
+    }
     for (int k = 0; k < 2; ++k) plainTransition(DCACHE.pair, pairs, Cz, 2, P + ".pairTransitions." + std::to_string(k));
     int sw = Cst + F;
     float* f1 = scratch<float>("dc.f1", (size_t)n * sw);
     concatK<<<blocks((size_t)n * sw), 256, 0, STREAM>>>(trunkSingle, Cst, targetFeat, F, f1, n);
     float* f1n = scratch<float>("dc.f1n", (size_t)n * sw);
     layerNormSlow(f1, f1n, n, sw, W(P + ".singleCondInitialNormScale"), Wopt(P + ".singleCondInitialNormOffset"));
-    DCACHE.singleBase = dalloc((size_t)n * Cs);
+    DCACHE.singleBase = scratch<float>("dc.singleBase", (size_t)n * Cs);
     linear<float, float>(f1n, DCACHE.singleBase, n, sw, Cs, P + ".singleCondInitialProjection");
     if (hasW(P + ".singleCondInitialProjectionBias"))
       addVectorK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(DCACHE.singleBase, W(P + ".singleCondInitialProjectionBias"), n, Cs);
@@ -391,13 +403,6 @@ __global__ void addBroadcastK(float* x, const float* v, size_t n, size_t total) 
 //   cond' = LN0(cond) (no affine) -> [attn scale | attn shift | ffw scale | ffw shift] per block,
 //   the per-block LayerNorm scale folded into the weights (LN_s(x) W = LN0(x) diag(s) W);
 //   cond -> [attn zero gate | ffw zero gate] per block.
-// [h][i][j] f32 -> [h][i][stride] f16 * log2(e), zeros past n
-__global__ void padBiasK(const float* in, half* out, int n, int stride, int heads) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)heads * n * stride) return;
-  int j = (int)(t % stride); size_t hi = t / stride;
-  out[t] = __float2half(j < n ? in[hi * n + j] * LOG2E : 0.f);
-}
 // out[k][c] = scale[k] * W[k][c] and out[k][C + c] = scale[k] * Wshift[k][c], rows ld apart
 __global__ void foldCondK(float* out, size_t ld, const float* scale, const float* w, const float* wshift, int Cc, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -405,6 +410,13 @@ __global__ void foldCondK(float* out, size_t ld, const float* scale, const float
   int k = (int)(t / C), c = (int)(t % C);
   out[k * ld + c] = scale[k] * w[t];
   out[k * ld + C + c] = scale[k] * wshift[t];
+}
+// flat [(i, j)][blocks * heads] -> block b's [h][i][stride] f16, log2(e)-scaled, zeros past n
+__global__ void flatToBiasHalfK(const float* flat, half* out, int block, int nblocks, int heads, int n, int stride) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)heads * n * stride) return;
+  int j = (int)(t % stride); size_t rest = t / stride; int i = (int)(rest % n), h = (int)(rest / n);
+  out[t] = __float2half(j < n ? flat[((size_t)i * n + j) * nblocks * heads + block * heads + h] * LOG2E : 0.f);
 }
 struct TransformerCache {
   bool ready = false; int n = 0, nblocks = 0;
@@ -462,20 +474,24 @@ inline void prepareTransformer(const float* pairCond, int n) {
   float* pn = scratch<float>("dt.pn", pairs * Cz);
   layerNormSlow(pairCond, pn, pairs, Cz, W(T + ".pairInputLayerNormScale"), nullptr);
   float* flat = scratch<float>("dt.flat", pairs * perSuper * heads);
-  tc.pairLogits.resize(tc.nblocks);
+  // per block: the f32 [h][i][j] logits for the precise path, or (f16 path) only the flash
+  // kernel's form - f16, scaled by log2(e), rows padded to 8 - which is half the bytes and all the
+  // f16 path reads (the f32 set was 6.7 GB at 2088 tokens)
+  tc.stride = (n + 7) / 8 * 8;
+  tc.pairLogits.assign(tc.nblocks, nullptr);
+  tc.biasHalf.assign(tc.nblocks, nullptr);
   for (int b = 0; b < tc.nblocks; ++b) {
     if (b % perSuper == 0)
       linear<float, float>(pn, flat, pairs, Cz, perSuper * heads,
                            T + ".superBlocks." + std::to_string(b / perSuper) + ".pairLogitsProjection");
-    tc.pairLogits[b] = scratch<float>("dt.pl" + std::to_string(b), (size_t)heads * pairs);
-    atomLogitsLayoutK<<<blocks((size_t)heads * pairs), 256, 0, STREAM>>>(flat, tc.pairLogits[b], b % perSuper, perSuper, 1, heads, n, n);
-  }
-  // the flash kernel's form of the same logits: f16, scaled by log2(e), rows padded to 8
-  tc.stride = (n + 7) / 8 * 8;
-  tc.biasHalf.resize(tc.nblocks);
-  for (int b = 0; b < tc.nblocks; ++b) {
-    tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b), (size_t)heads * n * tc.stride);
-    padBiasK<<<blocks((size_t)heads * n * tc.stride), 256, 0, STREAM>>>(tc.pairLogits[b], tc.biasHalf[b], n, tc.stride, heads);
+    if (DIFF_HALF) {
+      tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b), (size_t)heads * n * tc.stride);
+      flatToBiasHalfK<<<blocks((size_t)heads * n * tc.stride), 256, 0, STREAM>>>(flat, tc.biasHalf[b], b % perSuper,
+                                                                              perSuper, heads, n, tc.stride);
+    } else {
+      tc.pairLogits[b] = scratch<float>("dt.pl" + std::to_string(b), (size_t)heads * pairs);
+      atomLogitsLayoutK<<<blocks((size_t)heads * pairs), 256, 0, STREAM>>>(flat, tc.pairLogits[b], b % perSuper, perSuper, 1, heads, n, n);
+    }
   }
   tc.n = n; tc.ready = true;
 }
@@ -553,7 +569,6 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   addGatedStridedK<<<blocks(rows * C), 256, 0, STREAM>>>(act, proj, gRaw + (size_t)(tc.nblocks - 1) * 2 * C + C, ldr,
                                                          rows, C, n);
 }
-inline bool DIFF_HALF = false;     // the denoiser's transformer in f16 (set by --fast)
 
 // ---------------------------------------------------------------- the decoder
 __global__ void broadcastTokensK(const float* proj, float* perAtom, int tokens, int dense, int C) {

@@ -150,6 +150,9 @@ int main(int argc, char** argv) {
     }
     int dense = (int)M.meta("batch.dense");
     std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)t.n * dense);
+    // a large input gives each phase the whole card (a pair over 1 GB: about 1450 tokens)
+    bool tight = pairs * t.C * 4 > ((size_t)1 << 30);
+    if (tight) releaseScratch();
     DiffusionFold df = prepareDiffusion(t.single, t.pair, t.targetFeat, t.seqMask, t.n);
     // --samples=N: N diffusion samples off one trunk (AF3 runs five), each through the confidence
     // head and ranked by AF3's ranking score without its disorder and clash terms - 0.8 ipTM +
@@ -167,6 +170,7 @@ int main(int argc, char** argv) {
     }, samples);
     NS = 1;
     diffMs = ms(s0, clock());
+    if (tight) releaseScratch();
     size_t atoms3 = mask.size() * 3;
     for (int k = 0; k < samples; ++k) {
       std::vector<float> xk(xs.begin() + k * atoms3, xs.begin() + (k + 1) * atoms3);

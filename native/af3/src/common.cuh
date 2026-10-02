@@ -88,12 +88,28 @@ template <class T> T* upload(const T* h, size_t n) {
   T* p = dallocT<T>(n); CK(cudaMemcpy(p, h, n * sizeof(T), cudaMemcpyHostToDevice)); return p;
 }
 // Named scratch, kept for the process and grown when asked for more.
+inline std::map<std::string, std::pair<void*, size_t>> SCRATCH;
+// Every scratch buffer given back: between the trunk, the denoiser and the confidence head of a
+// large input, so each phase has the whole card (every phase asks for its buffers again).
+inline void releaseScratch() {
+  CK(cudaDeviceSynchronize());
+  for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFree(slot.first)); slot = {nullptr, 0}; }
+}
 template <class T> T* scratch(const std::string& name, size_t n) {
-  static std::map<std::string, std::pair<void*, size_t>> slots;
-  auto& [p, have] = slots[name];
+  auto& [p, have] = SCRATCH[name];
   if (have < n * sizeof(T)) {
     if (p) CK(cudaFree(p));
-    CK(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)));
+    if (cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)) != cudaSuccess) {
+      size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
+      size_t freeB, totalB; cudaMemGetInfo(&freeB, &totalB);
+      fprintf(stderr, "out of device memory: scratch %s wants %.2f GB; scratch holds %.2f GB, %.2f of %.2f GB free\n",
+              name.c_str(), n * sizeof(T) / 1e9, held / 1e9, freeB / 1e9, totalB / 1e9);
+      std::vector<std::pair<size_t, std::string>> big;
+      for (auto& [k, v] : SCRATCH) big.push_back({v.second, k});
+      std::sort(big.rbegin(), big.rend());
+      for (size_t i = 0; i < big.size() && i < 12; ++i) fprintf(stderr, "  %8.2f GB  %s\n", big[i].first / 1e9, big[i].second.c_str());
+      exit(1);
+    }
     have = n * sizeof(T);
   }
   return (T*)p;
