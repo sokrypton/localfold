@@ -43,19 +43,29 @@ __global__ void initialNoiseK(float* x, size_t n3, const uint64_t* seeds, float 
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < total) x[i] = scale * gaussian(seeds[i / n3], 0, i % n3);
 }
-__global__ void centroidK(const float* x, const float* mask, size_t atoms, float* c) {
-  __shared__ float s[4][256];
+// one block of 1024 a sample (256 left a 1044-token fold's 25k atoms at 85 us a step), a fixed
+// reduction order so the centre is the same every run
+__global__ void __launch_bounds__(1024) centroidK(const float* x, const float* mask, size_t atoms, float* c) {
+  __shared__ float s[4][32];
   const float* xs = x + (size_t)blockIdx.x * atoms * 3;         // one block a sample
   float a[4] = {0, 0, 0, 0};
   for (size_t i = threadIdx.x; i < atoms; i += blockDim.x)
     if (mask[i]) { a[0] += xs[i * 3]; a[1] += xs[i * 3 + 1]; a[2] += xs[i * 3 + 2]; a[3] += 1; }
-  for (int k = 0; k < 4; ++k) s[k][threadIdx.x] = a[k];
-  __syncthreads();
-  for (int w = blockDim.x / 2; w > 0; w >>= 1) {
-    if (threadIdx.x < w) for (int k = 0; k < 4; ++k) s[k][threadIdx.x] += s[k][threadIdx.x + w];
-    __syncthreads();
+  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int k = 0; k < 4; ++k) {
+    for (int o = 16; o; o >>= 1) a[k] += __shfl_xor_sync(~0u, a[k], o);
+    if (lane == 0) s[k][warp] = a[k];
   }
-  if (threadIdx.x < 3) c[blockIdx.x * 3 + threadIdx.x] = s[threadIdx.x][0] / (s[3][0] + 1e-6f);
+  __syncthreads();
+  if (warp == 0) {
+    int nw = blockDim.x >> 5;
+    for (int k = 0; k < 4; ++k) {
+      float v = lane < nw ? s[k][lane] : 0.f;
+      for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+      a[k] = v;
+    }
+    if (lane < 3) c[blockIdx.x * 3 + lane] = (lane == 0 ? a[0] : lane == 1 ? a[1] : a[2]) / (a[3] + 1e-6f);
+  }
 }
 // rot = e0, e1, e2 (rows) and the translation, 12 a sample; noisy = augmented x + injected * noise
 __global__ void augmentNoiseK(float* x, float* noisy, const float* mask, const float* c, const float* rot,
@@ -125,7 +135,7 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   for (int step = 1; step <= steps; ++step) {
     double previous = levels[step - 1], level = levels[step], tHat = tHats[step - 1];
     double injected = noiseScale * std::sqrt(std::max(0.0, tHat * tHat - previous * previous));
-    centroidK<<<ns, 256, 0, STREAM>>>(dX, dMask, atoms, dC);
+    centroidK<<<ns, 1024, 0, STREAM>>>(dX, dMask, atoms, dC);
     augmentNoiseK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * ns * 12,
                                                          dSeeds, (uint32_t)step, (float)injected, atoms, atoms * ns);
     const float* d = denoiseFn(dNoisy, (float)tHat, dLevels + step - 1);
