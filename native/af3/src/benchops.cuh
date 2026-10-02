@@ -2,7 +2,9 @@
 // launches with CUDA events, so the per-op cost includes the launch gap but no host sync.
 #pragma once
 #include "diffusion.cuh"
-inline void benchOps(int n) {
+inline void benchOps(int nTok, int S = 1) {
+  // --bench-ops=N or NxS: S samples as the attention's rows, every GEMM over N*S rows
+  int n = nTok * S;
   const std::string Tn = "diffusion.transformer";
   int C = (int)M.meta(Tn + ".channels"), Cc = (int)M.meta(Tn + ".condChannels");
   int heads = (int)M.meta(Tn + ".heads"), D = (int)M.meta(Tn + ".dimension"), Wd = heads * D, I = C * 2;
@@ -38,7 +40,7 @@ inline void benchOps(int n) {
     CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(gr));
     printf("  %-22s %7.2f us\n", name, best * 1000 / 200);
   };
-  printf("one transformer block's operations at %d tokens:\n", n);
+  printf("one transformer block's operations at %d tokens x %d samples:\n", nTok, S);
   float* yb = dalloc((size_t)n * C); CK(cudaMemset(yb, 0, (size_t)n * C * 4));
   time("gatedAddAdaLn block/row", [&] { gatedAddAdaLnK<half><<<n, 256, C * 4, STREAM>>>(act, yb, g, 4 * C, g, g + C, 4 * C, x, C, n); });
   time("gatedAddAdaLn vec/row", [&] { gatedAddAdaLnVecK<half, float><<<n, C / 4, 0, STREAM>>>(act, yb, g, 4 * C, g, g + C, 4 * C, x, C, n); });
@@ -49,14 +51,20 @@ inline void benchOps(int n) {
   for (int wv : {0, 1, 2, 4, 8}) {
     FLASH_WARPS_OVERRIDE = wv;
     std::string label = "flash attention w" + std::to_string(wv);
-    time(label.c_str(), [&] { flashGrid<half>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, D, 0, 1, false, 0.1f); });
+    time(label.c_str(), [&] { flashGrid<half>(qkvg, bias, (nTok + 7) / 8 * 8, mask, o, nTok, heads, D, 0, S, false, 0.1f); });
   }
   FLASH_WARPS_OVERRIDE = 0;
-  time("flash split 2", [&] { flashSplitHalfAt<48, 2>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
-  time("flash split 4", [&] { flashSplitHalfAt<48, 4>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
-  time("flash split 8", [&] { flashSplitHalfAt<48, 8>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
-  time("flash split 4 nomask", [&] { flashSplitHalfAt<48, 4>(qkvg, bias, (n + 7) / 8 * 8, nullptr, o, n, heads, 0, 1, false, 0.1f, nullptr); });
-  time("flash split 8 nomask", [&] { flashSplitHalfAt<48, 8>(qkvg, bias, (n + 7) / 8 * 8, nullptr, o, n, heads, 0, 1, false, 0.1f, nullptr); });
+  int st8 = (nTok + 7) / 8 * 8;
+  time("flash w4 bk48 nomask", [&] { flashGridHalfAt<48, 4, 48>(qkvg, bias, st8, nullptr, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash w4 bk32 nomask", [&] { flashGridHalfAt<48, 4, 32>(qkvg, bias, st8, nullptr, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash w4 bk64 nomask", [&] { flashGridHalfAt<48, 4, 64>(qkvg, bias, st8, nullptr, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash w8 bk48 nomask", [&] { flashGridHalfAt<48, 8, 48>(qkvg, bias, st8, nullptr, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash w8 bk32 nomask", [&] { flashGridHalfAt<48, 8, 32>(qkvg, bias, st8, nullptr, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash split 2", [&] { flashSplitHalfAt<48, 2>(qkvg, bias, (nTok + 7) / 8 * 8, mask, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash split 4", [&] { flashSplitHalfAt<48, 4>(qkvg, bias, (nTok + 7) / 8 * 8, mask, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash split 8", [&] { flashSplitHalfAt<48, 8>(qkvg, bias, (nTok + 7) / 8 * 8, mask, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash split 4 nomask", [&] { flashSplitHalfAt<48, 4>(qkvg, bias, (nTok + 7) / 8 * 8, nullptr, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
+  time("flash split 8 nomask", [&] { flashSplitHalfAt<48, 8>(qkvg, bias, (nTok + 7) / 8 * 8, nullptr, o, nTok, heads, 0, S, false, 0.1f, nullptr); });
   time("T2 GEMM 768->768", [&] { linear<half, float>(o, att, n, Wd, C, B + ".Transition2"); });
   time("add gated", [&] { addGatedStridedK<float><<<blocks((size_t)n * C), 256, 0, STREAM>>>(act, att, g, 2 * C, n, C, n); });
   time("ffw1 GEMM 768->3072", [&] { linear<half, half>(x, wide, n, C, 2 * I, B + ".ffwTransition1"); });
@@ -78,6 +86,9 @@ inline void benchGrid(int n) {
   std::vector<std::pair<std::string, std::function<void()>>> arms = {
     {"grid w4", [&] { flashGridHalfAt<32, 4>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w8", [&] { flashGridHalfAt<32, 8>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
+    {"grid w4 bk32", [&] { flashGridHalfAt<32, 4, 32>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
+    {"grid w4 bk48", [&] { flashGridHalfAt<32, 4, 48>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
+    {"grid w4 bk96", [&] { flashGridHalfAt<32, 4, 96>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
   };
   std::vector<std::vector<float>> t(arms.size());
   cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);

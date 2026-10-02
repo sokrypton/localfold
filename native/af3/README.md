@@ -162,7 +162,8 @@ projections as two GEMMs per step with each block's LayerNorm scale folded into 
 (folded on the device); the whole step replayed as a CUDA graph; the sampler on the device, its
 Gaussians a counter-based hash computed where they are used; the atom blocks' keys and values
 projected once per atom and gathered; a split-over-keys flash kernel for the transformer's few
-blocks at small n; `--samples` batched through the whole denoiser.
+blocks at small n, and 48-key tiles for its 48-wide heads (four blocks an SM rather than three: 261
+tokens x 5 samples' diffusion 1202 -> 1154 ms); `--samples` batched through the whole denoiser.
 
 Start-up: model.bin mapped and copied to the device in one transfer; every fused weight
 concatenated on the device. A first fold is within 5-15% of a warm one.

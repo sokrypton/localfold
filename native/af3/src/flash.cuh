@@ -42,8 +42,8 @@ __device__ __forceinline__ void ldsm4t(uint32_t* r, const void* p) {
 }
 
 constexpr int FA_BK = 64;
-template <int D, int WARPS> __host__ __device__ constexpr size_t faStage() {
-  return (size_t)2 * FA_BK * (D + 8) * 2 + (size_t)(16 * WARPS) * (FA_BK + 8) * 2 + FA_BK * 4;
+template <int D, int WARPS, int BK = FA_BK> __host__ __device__ constexpr size_t faStage() {
+  return (size_t)2 * BK * (D + 8) * 2 + (size_t)(16 * WARPS) * (BK + 8) * 2 + BK * 4;
 }
 
 // mask[r * n + j] (rows) or mask[j * n + r] (columns): the KEY's mask, the pair mask
@@ -54,12 +54,13 @@ __device__ __forceinline__ uint32_t ex2h2(uint32_t x) {
   uint32_t y; asm("ex2.approx.f16x2 %0, %1;" : "=r"(y) : "r"(x)); return y;
 }
 constexpr uint32_t ONES_H2 = 0x3C003C00u;      // half2(1, 1)
-template <int D, int WARPS, bool MASKED = true>
+template <int D, int WARPS, bool MASKED = true, int BK = FA_BK>
 __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, const float* __restrict__ mask, half* __restrict__ out, int n, int heads, size_t r0, bool tr, float scale,
     const float* qBias) {
-  constexpr int BQ = 16 * WARPS, BK = FA_BK, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
-  constexpr size_t STAGE = faStage<D, WARPS>();
+  constexpr int BQ = 16 * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
+  static_assert(BK % 16 == 0, "a key tile is whole k16 steps of the PV product");
+  constexpr size_t STAGE = faStage<D, WARPS, BK>();
   extern __shared__ __align__(16) unsigned char smem[];
   auto Kst = [&](int s) { return (half*)(smem + s * STAGE); };
   auto Vst = [&](int s) { return Kst(s) + BK * LDK; };
@@ -172,10 +173,11 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
     float r0m[BK / 8], r1m[BK / 8];
 #pragma unroll
     for (int nt = 0; nt < BK / 8; ++nt) { r0m[nt] = fmaxf(sv[nt][0], sv[nt][1]); r1m[nt] = fmaxf(sv[nt][2], sv[nt][3]); }
+    // (folding the ends together, so a tile of 6 n8 columns reduces as well as one of 8)
 #pragma unroll
-    for (int w = BK / 16; w >= 1; w >>= 1)
+    for (int cnt = BK / 8; cnt > 1; cnt = (cnt + 1) / 2)
 #pragma unroll
-      for (int nt = 0; nt < w; ++nt) { r0m[nt] = fmaxf(r0m[nt], r0m[nt + w]); r1m[nt] = fmaxf(r1m[nt], r1m[nt + w]); }
+      for (int nt = 0; nt < cnt / 2; ++nt) { r0m[nt] = fmaxf(r0m[nt], r0m[cnt - 1 - nt]); r1m[nt] = fmaxf(r1m[nt], r1m[cnt - 1 - nt]); }
     float t0 = r0m[0], t1 = r1m[0];
     t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
     t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
@@ -415,27 +417,27 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
   }
 }
 
-template <int D, int WARPS, bool MASKED> void setFlashSmem() {
+template <int D, int WARPS, bool MASKED, int BK = FA_BK> void setFlashSmem() {
   static bool done = false;
   if (!done) {
-    CK(cudaFuncSetAttribute(flashGridHalf<D, WARPS, MASKED>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)(2 * faStage<D, WARPS>())));
+    CK(cudaFuncSetAttribute(flashGridHalf<D, WARPS, MASKED, BK>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            (int)(2 * faStage<D, WARPS, BK>())));
     done = true;
   }
 }
 inline int FLASH_WARPS_OVERRIDE = 0;
 inline bool FLASH_SPLIT = true;
-template <int D, int WARPS>
+template <int D, int WARPS, int BK = FA_BK>
 void flashGridHalfAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
                      int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias) {
   dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
   if (mask) {                    // a null mask: every key real (see MASKED)
-    setFlashSmem<D, WARPS, true>();
-    flashGridHalf<D, WARPS, true><<<grid, 32 * WARPS, 2 * faStage<D, WARPS>(), STREAM>>>(
+    setFlashSmem<D, WARPS, true, BK>();
+    flashGridHalf<D, WARPS, true, BK><<<grid, 32 * WARPS, 2 * faStage<D, WARPS, BK>(), STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
   } else {
-    setFlashSmem<D, WARPS, false>();
-    flashGridHalf<D, WARPS, false><<<grid, 32 * WARPS, 2 * faStage<D, WARPS>(), STREAM>>>(
+    setFlashSmem<D, WARPS, false, BK>();
+    flashGridHalf<D, WARPS, false, BK><<<grid, 32 * WARPS, 2 * faStage<D, WARPS, BK>(), STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
   }
 }
@@ -461,9 +463,13 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
     flashSplitHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     return;
   }
+  // the denoiser's 48-wide heads in 48-key tiles: with 64 a 4-warp block takes 47.6 KB of shared
+  // memory and three fit an SM where the registers allow four - 23.1 against 32.8 us at 261 tokens
+  // and five samples, 44.0 against 45.9 at 400, level at 150 and one sample
+  constexpr int BK = D == 48 ? 48 : FA_BK;
   switch (warps) {
-    case 8: flashGridHalfAt<D, 8>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
-    case 4: flashGridHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
+    case 8: flashGridHalfAt<D, 8, BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
+    case 4: flashGridHalfAt<D, 4, BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
     case 2: flashGridHalfAt<D, 2>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
     default: flashGridHalfAt<D, 1>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
   }
