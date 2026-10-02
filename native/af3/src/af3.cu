@@ -15,11 +15,12 @@ int main(int argc, char** argv) {
   bool fast = false, doFold = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 0;
   uint64_t seed = 42; std::string out = "fold.pdb";
   for (int i = 2; i < argc; ++i) {
-    if (!strcmp(argv[i], "--fast")) fast = true;
+    if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = true;
     else if (!strcmp(argv[i], "--stages")) STAGES = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
     else if (!strcmp(argv[i], "--fold")) doFold = true;
+    else if (!strcmp(argv[i], "--no-graphs")) GRAPHS = false;
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
@@ -29,6 +30,7 @@ int main(int argc, char** argv) {
   M.load(argv[1]);
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
+  { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
   printf("loaded %zu entries in %.1f s; %d tokens\n", M.index.size(),
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          (int)M.meta("batch.tokens"));
@@ -121,9 +123,9 @@ int main(int argc, char** argv) {
     auto f1 = clock();
     int dense = (int)M.meta("batch.dense");
     std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)t.n * dense);
-    DCACHE.ready = false;
+    DiffusionFold df = prepareDiffusion(t.single, t.pair, t.targetFeat, t.seqMask, t.n);
     std::vector<float> x = sample(steps, seed, mask, [&](const float* noisy, float tHat) {
-      return (const float*)denoise(t.single, t.pair, t.targetFeat, t.seqMask, noisy, tHat);
+      return (const float*)denoiseStep(df, noisy, tHat);
     });
     auto f2 = clock();
     // pseudo-beta off the structure, then the confidence head
@@ -140,6 +142,10 @@ int main(int argc, char** argv) {
       perToken[k] = (float)(s2 / std::max(c2, 1.0));
     }
     writePdb(out, x, perToken.data());
+    if (STAGES) {
+      double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
+      for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);
+    }
     printf("confidence %.1f ms: mean pLDDT %.2f  pTM %.4f  ipTM %.4f\n", ms(f2, f3), conf.meanPlddt, conf.ptm, conf.iptm);
     printf("fold: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps), wrote %s\n", ms(f0, f1), recycles + 1,
            ms(f1, f2), steps, out.c_str());

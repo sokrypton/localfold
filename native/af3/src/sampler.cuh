@@ -61,6 +61,7 @@ inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<flo
     for (size_t i = 0; i < x.size(); ++i) noisy[i] = (float)(x[i] + injected * normal());
     CK(cudaMemcpyAsync(dNoisy, noisy.data(), noisy.size() * 4, cudaMemcpyHostToDevice, STREAM));
     const float* d = denoiseFn(dNoisy, (float)tHat);
+    if (step == 1) STAGE_MS.clear();    // the first call uploads weights and allocates; not a profile
     CK(cudaMemcpyAsync(denoised.data(), d, denoised.size() * 4, cudaMemcpyDeviceToHost, STREAM));
     CK(cudaStreamSynchronize(STREAM));
     double delta = level - tHat;
