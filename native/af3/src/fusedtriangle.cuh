@@ -217,3 +217,70 @@ inline void triOut128(const float* prod, const std::string& pre, const half* t2,
   triOutK<C, TO_WARPS><<<(unsigned)((pairs + R - 1) / R), 32 * TO_WARPS, smem, STREAM>>>(
     prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, pairs, cs);
 }
+
+// out[h][row] = (LN(x[row]) W)[h] for a projection to few heads (N a multiple of 8, W (C, N)):
+// the single track's pair logits, the pair read once and written head-major (the layout the
+// softmax reads) through shared memory.
+template <int C, int N, int WARPS>
+__global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__ x, const float* __restrict__ lnScale,
+    const float* __restrict__ lnOffset, const half* __restrict__ Wp, float* __restrict__ out, size_t rows) {
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = N + 8, KS = C / 16, LDO = R + 4;
+  extern __shared__ __align__(16) unsigned char smem[];
+  half* Xs = (half*)smem; half* Ws = Xs + R * LDX; float* Os = (float*)(Ws + C * LDW);
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  size_t row0 = (size_t)blockIdx.x * R;
+  for (int t = threadIdx.x; t < C * (N / 8); t += NTH) {
+    int k = t / (N / 8), c = (t % (N / 8)) * 8;
+    cpAsync16(Ws + k * LDW + c, Wp + (size_t)k * N + c, true);
+  }
+  asm volatile("cp.async.commit_group;");
+  for (int r = warp; r < R; r += WARPS) {
+    size_t row = row0 + r;
+    float v[C / 32]; float s = 0.f;
+    for (int k = 0; k < C / 32; ++k) { v[k] = row < rows ? x[row * C + lane + 32 * k] : 0.f; s += v[k]; }
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s / C, q = 0.f;
+    for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; q += d * d; }
+    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
+    float inv = rsqrtf(q / C + 1e-5f);
+    for (int k = 0; k < C / 32; ++k) {
+      int c = lane + 32 * k;
+      Xs[r * LDX + c] = __float2half((v[k] - mean) * inv * lnScale[c] + lnOffset[c]);
+    }
+  }
+  asm volatile("cp.async.wait_group 0;");
+  __syncthreads();
+  float acc[N / 8][4] = {};
+#pragma unroll
+  for (int ks = 0; ks < KS; ++ks) {
+    uint32_t xa[4];
+    ldsm4(xa, Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+#pragma unroll
+    for (int n2 = 0; n2 < N / 16; ++n2) {
+      uint32_t f[4];
+      ldsm4t(f, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + n2 * 16 + (lane >> 4) * 8);
+      mma16816(acc[2 * n2], xa, f[0], f[1]); mma16816(acc[2 * n2 + 1], xa, f[2], f[3]);
+    }
+  }
+  int lr0 = warp * 16 + g, lr1 = lr0 + 8;
+#pragma unroll
+  for (int nt = 0; nt < N / 8; ++nt) {
+    int h = nt * 8 + tig * 2;
+    Os[h * LDO + lr0] = acc[nt][0]; Os[(h + 1) * LDO + lr0] = acc[nt][1];
+    Os[h * LDO + lr1] = acc[nt][2]; Os[(h + 1) * LDO + lr1] = acc[nt][3];
+  }
+  __syncthreads();
+  for (int t = threadIdx.x; t < N * R; t += NTH) {
+    int h = t / R, r = t % R;
+    if (row0 + r < rows) out[(size_t)h * rows + row0 + r] = Os[h * LDO + r];
+  }
+}
+template <int N>
+inline void lnHeads128(const float* x, const std::string& scale, const std::string& offset, const std::string& w,
+                       float* out, size_t rows) {
+  constexpr int C = 128, WARPS = 8, R = 16 * WARPS;
+  size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * (N + 8) * 2 + (size_t)N * (R + 4) * 4;
+  static bool attr = false;
+  if (!attr) { CK(cudaFuncSetAttribute(lnHeadsK<C, N, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  lnHeadsK<C, N, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, W(scale), W(offset), Wh(w), out, rows);
+}

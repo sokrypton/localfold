@@ -436,15 +436,25 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   size_t pairs = (size_t)n * n;
   std::string A = B + ".singleAttention";
   int heads = (int)M.meta(A + ".heads"), d = (int)M.meta(A + ".dimension"), Wd = heads * d;
-  float* flat = scratch<float>("st.flat", pairs * heads); float* pl = scratch<float>("st.pl", pairs * heads);
-  size_t rowsPer = std::max<size_t>(1, CHUNK / C);
-  T* ln = scratch<T>("st.ln", std::min(rowsPer, pairs) * C);
-  for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
-    size_t r = std::min(rowsPer, pairs - r0);
-    layerNorm2<float, T>(pair + r0 * C, ln, r, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
-    linear<T, float>(ln, flat + r0 * heads, r, C, heads, B + ".singlePairLogitsProjection");
+  float* pl = scratch<float>("st.pl", pairs * heads);
+  bool fused = false;
+  if constexpr (std::is_same_v<T, half>)
+    if (C == 128 && heads == 16) {     // one kernel: LN, the projection, the head-major layout
+      lnHeads128<16>(pair, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset",
+                     B + ".singlePairLogitsProjection", pl, pairs);
+      fused = true;
+    }
+  if (!fused) {
+    float* flat = scratch<float>("st.flat", pairs * heads);
+    size_t rowsPer = std::max<size_t>(1, CHUNK / C);
+    T* ln = scratch<T>("st.ln", std::min(rowsPer, pairs) * C);
+    for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
+      size_t r = std::min(rowsPer, pairs - r0);
+      layerNorm2<float, T>(pair + r0 * C, ln, r, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
+      linear<T, float>(ln, flat + r0 * heads, r, C, heads, B + ".singlePairLogitsProjection");
+    }
+    logitsLayoutK<<<blocks(pairs * heads), 256, 0, STREAM>>>(flat, pl, pairs, heads);
   }
-  logitsLayoutK<<<blocks(pairs * heads), 256, 0, STREAM>>>(flat, pl, pairs, heads);
   T* nrm = scratch<T>("st.nrm", (size_t)n * Cs);
   T* qkvg = scratch<T>("st.qkvg", (size_t)n * 4 * Wd);
   layerNorm2<float, T>(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
