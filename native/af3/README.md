@@ -175,6 +175,7 @@ oracles) folds the other checkpoints the page offers, through the same dialect f
 | protenix2 | trunk_out_pair 1.0e-6, denoise 1.5e-6, PAE 2.4e-7 | 0.453 A | 0.136 A |
 | IntelliFold-2 (int5 bundle) | trunk_out_pair 4.5e-2 (the quantisation; z_after_msa 9.1e-3) | 1.551 A | 0.296 A |
 | RoseTTAFold3 (int5 bundle) | trunk_out_pair 4.85e-2 (WebGPU on the same bundle 4.90e-2) | 1.621 A, bonds 0.050 A | |
+| boltz2 | trunk_out_pair 4.5e-7, PAE 4.5e-7; denoise 2.5e-2 (see below) | 0.466 A on its reference batch (WebGPU 0.507); 2.96 A single-sequence (WebGPU 4.56) | 0.347 A |
 
 Ported for them: the padded single conditioning, per-block atom pair norm, chained atom
 LayerNorms, split pair conditioning, per-block atom masking, the fused template embedder (passes
@@ -183,7 +184,16 @@ residual, rf3's one averaged pass), protenix2's confidence head (raw-distance te
 single, PDE symmetrised before its projection), head width 64; for rf3 the pre-trunk query, q/k
 LayerNorms in the transformer and the atom blocks, the no-residual block wiring, 35-wide MSA
 features, biased outer-product projections, the chirality gradient term, and its confidence head
-(whole-tensor masked norms, the CA distogram).
+(whole-tensor masked norms, the CA distogram); for boltz2 the up-gated conditioned transitions,
+its 384-wide target_feat (the atom encoder plus six summed projections), the bond-order and
+contact-conditioning z-init terms, the MSA update before the outer product and the pre-MSA pair
+added back, the re-embedding confidence head with split intra/inter-chain heads and no head
+LayerNorms, and its own EDM constants.
+
+boltz2's denoise reads 2.5e-2 because its token transformer amplifies its input ~2.2e4x: the seams
+before it are 1.2e-6 (`transformer.act`), and the transformer fed the oracle's own input reads
+9.4e-4 (`TX_ORACLE_IN=1`; the WebGPU f32 path's whole step is 3.5e-3). The seams are compared
+whenever a stage oracle (`oracle-dumps/af3-oracle-stages-<model>.json`) was exported.
 
 After a first fold `af3` lists every weight family it never read; for these models the list is
 only what should be there (heads not computed, alternative per-block forms, absent bonds and
@@ -191,9 +201,8 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
 
 ## Not ported yet
 
-boltz2 (the atom-only target_feat, its z-init bond-order terms, re-embedding confidence head,
-MSA conventions, transition up-gates and sampler constants) and OpenDDE (the structural token
-expansion) - each raises a named "not ported" error.
+OpenDDE (the structural token expansion, its refiner and its own confidence head) - it raises a
+named "not ported" error.
 
 ## Tried and not taken
 
