@@ -15,7 +15,9 @@ native/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
 `fold` builds `af3` if it is missing, exports the weights once (`native/af3/weights`, from the
 bundle on disk - no server), featurises the input with the repository's own featuriser into a
 temporary directory (0.2 s, while `af3` starts) and folds it (`--fold --fast`); everything after
-`--` goes to `af3`. A job JSON to a PDB is 1.5 s of wall clock (KRAS with sotorasib), 6MRR from
+`--` goes to `af3`. An alignment keeps a seeded 1024 of its rows, AF3's own `num_msa`
+(`--max-msa=N` to change it: 512 is 3.6% less trunk on 5CAJ's 7907-row search, pLDDT 95.08
+against 95.20). A job JSON to a PDB is 1.5 s of wall clock (KRAS with sotorasib), 6MRR from
 its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 
 ```

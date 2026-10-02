@@ -255,7 +255,7 @@ if (sequence !== "") {
     modifications.push({ chain: Number(chain ?? 0), position: Number(at), ...(await ccd(code)) });
   }
   batch = af3BatchFromA3m(sequence, alignment, {
-    maxSequences: Number(option("max-msa", "512")),
+    maxSequences: Number(option("max-msa", "1024")),     // AF3's num_msa (evoformer.py), and af3's --msa cap
     ...(jobRequest?.msaColumnKinds === undefined ? {} : { msaColumnKinds: jobRequest.msaColumnKinds }),
     seed: Number(option("seed", "20260831")),
     ...featuriserDialect(dialect),

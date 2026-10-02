@@ -5,9 +5,9 @@
   "rmsd": 0.5
  },
  "af3-5caj-msa": {
-  "plddt": 95.09,
-  "ptm": "0.9430",
-  "rmsd": 1.934
+  "plddt": 95.2,
+  "ptm": "0.9460",
+  "rmsd": 1.892
  },
  "af3-5caj-template": {
   "plddt": 95.11,
