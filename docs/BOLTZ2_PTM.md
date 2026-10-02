@@ -157,8 +157,15 @@ residue (`native/af3/bonds.mjs`):
   int8 weights in `~/lfjax/weights`, HY3 given as `userCCD` because the pip CCD lacks it) reads
   **0.994 / 0.907 / 0.703 Å** over three samples - the same tearing. So LocalFold's boltz2 is
   faithful to its reference here, and the question is the one the SEP case asked: does GENUINE
-  Boltz-2 place a 3-hydroxyproline? Not measured - `boltz` is not installed on this box. If it does,
-  this is a second defect in af3-any-model's boltz2 port, and the SEP fix above did not cover it.
+  Boltz-2 place a 3-hydroxyproline? 🔴 **NO - MEASURED 2026-10-02, AND IT IS THE MODEL.** Boltz 2.2.1
+  installed on the A100 (`~/venv_boltz`, torch 2.7.1+cu126 - the default wheel is built for a newer
+  CUDA than this driver's 12.8 and dies in `_cuda_init`), the same 68-mer with HY3 at 4, single
+  sequence, three samples, `--no_kernels`: HY3 bond rms **1.312 / 1.169 / 1.010 Å** over its 8 bonds,
+  the ring collapsed (C3, C4 and C5 within 0.4 Å of each other), while the same run's SEP@3 control is
+  **0.121 / 0.113 / 0.046 Å** and every protein class is 0.008-0.051. So af3-any-model's boltz2 (0.70-0.99)
+  and this port's (0.897) inherit it from Boltz-2 itself; there is no port defect to find here, and
+  boltz2 should not be expected to hold a hydroxyproline together. Scored with `native/af3/bonds.mjs`
+  on gemmi's PDB of each mmCIF.
 
 **And the modified BASES the same way, with the batch exact.** After boltz2's batch was made exact
 on modified bases too (`--target=dna-5cm|rna-mods`, four conventions fixed - the profile at the
