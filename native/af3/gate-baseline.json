@@ -1,0 +1,47 @@
+{
+ "af3-1brs-template": {
+  "plddt": 94.74,
+  "ptm": "0.9365",
+  "rmsd": 0.5
+ },
+ "af3-5caj-template": {
+  "plddt": 95.11,
+  "ptm": "0.9525",
+  "rmsd": 0.143
+ },
+ "af3-6mrr": {
+  "plddt": 87.57,
+  "ptm": "0.7667",
+  "rmsd": 0.515
+ },
+ "boltz2-6mrr": {
+  "plddt": 96.91,
+  "ptm": "0.8086",
+  "rmsd": 0.46
+ },
+ "intellifold2-6mrr": {
+  "plddt": 84.82,
+  "ptm": "0.6955",
+  "rmsd": 1.551
+ },
+ "openbind0-6mrr": {
+  "plddt": 84.98,
+  "ptm": "0.8186",
+  "rmsd": 1.709
+ },
+ "opendde-6mrr": {
+  "plddt": 91.84,
+  "ptm": "0.7789",
+  "rmsd": 1.499
+ },
+ "protenix2-6mrr": {
+  "plddt": 87.48,
+  "ptm": "0.8790",
+  "rmsd": 0.454
+ },
+ "rosettafold3-6mrr": {
+  "plddt": 82.3,
+  "ptm": "0.8169",
+  "rmsd": 1.622
+ }
+}

@@ -164,6 +164,14 @@ Parts joined by `+` share one slot, as AF3 puts each chain's k-th template in sl
 `score.py <pred> <ref> A,D` scores a complex: one superposition over all chains, each chain also
 alone, residues paired by aligning the sequences (a numbering gap in the reference shifts nothing).
 
+## The gate
+
+`python3 native/af3/gate.py` folds 6MRR from its sequence through all seven models, plus 5CAJ and
+barnase-barstar with their crystals as templates, scores each against the deposited structure and
+holds RMSD and mean pLDDT to `gate-baseline.json` (0.05 A, 0.5 points; `--write` re-records,
+`--only=` takes models or case names). Run it after any kernel change; it takes about three
+minutes once every model's weights are exported. The baseline is this A100's.
+
 ## Other AF3-lineage models
 
 `--model=<name>` on `fold` (or `--bundle=` on the exporter, `--oracle-model=<name>` for its own
