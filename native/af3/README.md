@@ -67,10 +67,10 @@ port gives pLDDT 94.5, pTM 0.938 on the same inputs.
 
 | target | WebGPU first / warm (0 recycles) | native first / warm, 0 recycles | native warm, 3 recycles |
 |---|---|---|---|
-| 6MRR, 68 tokens | 5.1 s / 2.4 s | 0.49 s / **0.41 s** | 0.48 s |
-| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 0.85 s / **0.73 s** | 1.14 s |
-| 5CAJ x 2, 522 tokens, 512 rows | | 1.50 s / 1.41 s | 2.95 s |
-| 5CAJ x 4, 1044 tokens, no MSA | | 4.17 s / 4.11 s | 11.4 s |
+| 6MRR, 68 tokens | 5.1 s / 2.4 s | 0.57 s / **0.40 s** | 0.47 s |
+| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 0.88 s / **0.69 s** | 1.07 s |
+| 5CAJ x 2, 522 tokens, 512 rows | | 1.50 s / 1.31 s | 2.71 s |
+| 5CAJ x 4, 1044 tokens, no MSA | | 3.99 s / 3.84 s | 10.6 s |
 
 WebGPU with the developer flags (`fold.js --folds=2`); a stock-Chrome NVIDIA visitor gets
 about half its speed. A whole process - mapping model.bin, the CUDA context, target_feat, the
@@ -84,11 +84,11 @@ said, no token bucketing, the same MSA rows), steady-state calls:
 
 | 200 steps | JAX AF3 | native `--fast` | |
 |---|---|---|---|
-| 6MRR, 68 tokens, 1 pass | 1.67 s | **0.41 s** | 4.1x |
-| 5CAJ, 261 tokens, 512 rows, 1 pass | 2.76 s | **0.73 s** | 3.8x |
-| 5CAJ, 4 passes (3 recycles) | 3.47 s | **1.13 s** | 3.1x |
+| 6MRR, 68 tokens, 1 pass | 1.67 s | **0.40 s** | 4.2x |
+| 5CAJ, 261 tokens, 512 rows, 1 pass | 2.76 s | **0.69 s** | 4.0x |
+| 5CAJ, 4 passes (3 recycles) | 3.47 s | **1.07 s** | 3.2x |
 | 5CAJ, 1 pass, 5 samples | 5.00 s | **1.57 s** | 3.2x |
-| 5CAJ x 4, 1044 tokens, no MSA, 1 pass | 11.1 s | **4.11 s** | 2.7x |
+| 5CAJ x 4, 1044 tokens, no MSA, 1 pass | 11.1 s | **3.84 s** | 2.9x |
 
 and JAX's first call carries ~60 s of compilation where the native first fold is within 15% of
 a warm one.
