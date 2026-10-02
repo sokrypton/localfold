@@ -6,30 +6,40 @@
 
 // pair[i][j] += left[j] + right[i] + W_dgram[bin(|b_i - b_j|^2)] * mask
 // (Wdist: protenix2's second, unbinned distance term - a bias-free projection of the raw distance)
-__global__ void confidencePairInitK(float* pair, const float* left, const float* right, const float* beta,
-                                    const float* pairMask, const float* Wd, int n, int C, int bins,
-                                    float dmin, float dmax, const float* Wdist, bool caBins) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+// the distogram bin of each pair (-1: none) and its squared distance, once a pair rather than once a
+// channel (a 39-step double-precision search per element was 24 ms of a 1044-token fold)
+__global__ void confidenceBinK(const float* beta, int n, int bins, float dmin, float dmax, bool caBins, int* binOut,
+                               float* sqOut) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= (size_t)n * n) return;
+  int i = (int)(ij / n), j = (int)(ij % n);
   float sq = 0;
   for (int k = 0; k < 3; ++k) { float d = beta[i * 3 + k] - beta[j * 3 + k]; sq += d * d; }
-  float v = left[(size_t)j * C + c] + right[(size_t)i * C + c];
+  int bin = -1;
   if (caBins) {
     // rf3's: the bin is how many of `bins - 1` evenly spaced bounds the (real, +1e-10) distance is past
     double distance = sqrt((double)sq + 1e-10);
-    int bin = 0;
+    bin = 0;
     for (int at = 0; at < bins - 1; ++at) if (distance > dmin + at * ((double)(dmax - dmin) / (bins - 1))) ++bin;
-    v += Wd[(size_t)bin * C + c] * pairMask[ij];
-    pair[t] += v;
-    return;
+  } else {
+    for (int b = 0; b < bins; ++b) {
+      double lo = dmin + (double)(dmax - dmin) * b / (bins - 1), hi = dmin + (double)(dmax - dmin) * (b + 1) / (bins - 1);
+      double lower = lo * lo, upper = b + 1 < bins ? hi * hi : 1e8;
+      if (sq > lower && sq < upper) { bin = b; break; }
+    }
   }
-  for (int b = 0; b < bins; ++b) {
-    double lo = dmin + (double)(dmax - dmin) * b / (bins - 1), hi = dmin + (double)(dmax - dmin) * (b + 1) / (bins - 1);
-    double lower = lo * lo, upper = b + 1 < bins ? hi * hi : 1e8;
-    if (sq > lower && sq < upper) { v += Wd[(size_t)b * C + c] * pairMask[ij]; break; }
-  }
-  if (Wdist) v += sqrtf(sq + 1e-10f) * Wdist[c];
+  binOut[ij] = bin; sqOut[ij] = sq;
+}
+__global__ void confidencePairInitK(float* pair, const float* left, const float* right, const int* binOf,
+                                    const float* sqOf, const float* pairMask, const float* Wd, int n, int C,
+                                    const float* Wdist, bool caBins) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n * C) return;
+  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+  float v = left[(size_t)j * C + c] + right[(size_t)i * C + c];
+  int bin = binOf[ij];
+  if (bin >= 0) v += Wd[(size_t)bin * C + c] * pairMask[ij];
+  if (!caBins && Wdist) v += sqrtf(sqOf[ij] + 1e-10f) * Wdist[c];
   pair[t] += v;
 }
 // expectation over bins of softmax(logits) . centres, optionally symmetrised (logits[ij] + logits[ji])
@@ -191,8 +201,10 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   linear<float, float>(targetFeat, left, n, F, C, P + ".leftTargetFeatProject");
   linear<float, float>(targetFeat, right, n, F, C, P + ".rightTargetFeatProject");
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
-  confidencePairInitK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, pseudoBeta, pairMask,
-    W(P + ".distogramFeatProject"), n, C, bins, 3.25f, 50.75f, Wopt(P + ".distanceFeatProject"), caDgram);
+  int* binOf = scratch<int>("conf.bin", pairs); float* sqOf = scratch<float>("conf.sq", pairs);
+  confidenceBinK<<<blocks(pairs), 256, 0, STREAM>>>(pseudoBeta, n, bins, 3.25f, 50.75f, caDgram, binOf, sqOf);
+  confidencePairInitK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, binOf, sqOf, pairMask,
+    W(P + ".distogramFeatProject"), n, C, Wopt(P + ".distanceFeatProject"), caDgram);
   if (bins != (caDgram ? 40 : 39)) { fprintf(stderr, "confidence distogram has %d bins\n", bins); exit(1); }
   if (hasW(P + ".inputSingleNormScale")) {
     // the trunk single clamped to +-512 and LayerNormed before any use (protenix2)
