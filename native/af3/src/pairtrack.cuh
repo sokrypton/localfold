@@ -222,14 +222,14 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
 // ---------------------------------------------------------------- grid attention kernels
 #include "flash.cuh"
 
+// act[r][j] = norm[j][r] for the column direction, 16 bytes a thread (C * elem a multiple of 16)
 __global__ void gatherTransposedK(const void* normV, void* actV, int n, int C, size_t r0, size_t R,
                                   int elem) {
+  int chunks = C * elem / 16;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= R * n * C) return;
-  int c = (int)(t % C); size_t rest = t / C; size_t j = rest % n; size_t r = r0 + rest / n;
-  size_t from = (j * n + r) * C + c;
-  if (elem == 4) ((float*)actV)[t] = ((const float*)normV)[from];
-  else ((half*)actV)[t] = ((const half*)normV)[from];
+  if (t >= R * n * chunks) return;
+  int c = (int)(t % chunks); size_t rest = t / chunks; size_t j = rest % n; size_t r = r0 + rest / n;
+  reinterpret_cast<uint4*>(actV)[t] = reinterpret_cast<const uint4*>(normV)[(j * n + r) * chunks + c];
 }
 // bias[h][i][stride] (j padded to a multiple of 8, zeros past n), scaled by `scale`
 template <class TB>
@@ -242,12 +242,17 @@ __global__ void biasLayoutK(const float* raw, TB* bias, int n, int stride, int h
   float v = j < n ? scale * raw[(swap ? ((size_t)j * n + i) : ((size_t)i * n + j)) * heads + h] : 0.f;
   bias[t] = fromF<TB>(v);
 }
+// pair[(r, j) or (j, r)] += out[r][j], four channels a thread (C a multiple of 4)
 __global__ void addGridK(float* pair, const float* out, int n, int C, size_t r0, size_t R, bool tr) {
+  int c4 = C / 4;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= R * n * C) return;
-  int c = (int)(t % C); size_t rest = t / C; size_t j = rest % n; size_t r = r0 + rest / n;
+  if (t >= R * n * c4) return;
+  int c = (int)(t % c4); size_t rest = t / c4; size_t j = rest % n; size_t r = r0 + rest / n;
   size_t to = tr ? (j * n + r) : (r * n + j);
-  pair[to * C + c] += out[t];
+  float4* p = reinterpret_cast<float4*>(pair) + to * c4 + c;
+  float4 v = *p, o = reinterpret_cast<const float4*>(out)[t];
+  v.x += o.x; v.y += o.y; v.z += o.z; v.w += o.w;
+  *p = v;
 }
 __global__ void addGateBiasK(float* qkvg, const float* bias, size_t rows, int Wd) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -281,7 +286,8 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     const T* act = norm + r0 * n * C;
     if (tr) {
       T* g = scratch<T>("grid.act", prs * C);
-      gatherTransposedK<<<blocks(prs * C), 256, 0, STREAM>>>(norm, g, n, C, r0, rows, sizeof(T));
+      if (C * sizeof(T) % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
+      gatherTransposedK<<<blocks(prs * C * sizeof(T) / 16), 256, 0, STREAM>>>(norm, g, n, C, r0, rows, sizeof(T));
       act = g;
     }
     T* qkvgOut = scratch<T>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
@@ -296,7 +302,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     float* o = scratch<float>("grid.out", prs * C);
     linear<T, float>(gathered, o, prs, Wd, C, pre + ".outputProjection");
     if (outBias) addBiasK<<<blocks(prs * C), 256, 0, STREAM>>>(o, outBias, prs, C);
-    addGridK<<<blocks(prs * C), 256, 0, STREAM>>>(pair, o, n, C, r0, rows, tr);
+    addGridK<<<blocks(prs * C / 4), 256, 0, STREAM>>>(pair, o, n, C, r0, rows, tr);
   }
 }
 
