@@ -264,7 +264,9 @@ inline TriW triWeights(const std::string& T, int blk, int C) {
 // a and b channel-major, each plane [Lp][Lp] (Lp a multiple of 8, the pad zero): the batched
 // contraction then runs on aligned tensor-core tiles - at L odd it fell to cutlass's align1 kernels
 // (sm75's), 82 of a 5CAJ fold's 1700 ms
-__global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, size_t pairs, int C, int L, int Lp) {
+// pg holds rows p0 .. p0 + pairs of the projection (a chunk of them); mask and the planes are whole
+__global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, size_t pairs, int C, int L, int Lp,
+                          size_t p0 = 0) {
   __shared__ float A[32][33], B[32][33];
   size_t r0 = (size_t)blockIdx.x * 32; int c0 = blockIdx.y * 32;
   int tx = threadIdx.x, ty = threadIdx.y;
@@ -272,7 +274,7 @@ __global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, s
     size_t r = r0 + ry; int c = c0 + tx;
     float va = 0, vb = 0;
     if (r < pairs) {
-      const half* p = pg + r * 5 * C; float m = mask[r];
+      const half* p = pg + r * 5 * C; float m = mask[p0 + r];
       va = __half2float(p[c]) * m / (1.f + __expf(-__half2float(p[2 * C + c])));
       vb = __half2float(p[C + c]) * m / (1.f + __expf(-__half2float(p[3 * C + c])));
     }
@@ -282,7 +284,7 @@ __global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, s
   for (int cy = ty; cy < 32; cy += 8) {
     size_t r = r0 + tx; int c = c0 + cy;
     if (r < pairs) {
-      size_t at = (size_t)c * Lp * Lp + (r / L) * Lp + r % L;
+      size_t at = (size_t)c * Lp * Lp + ((p0 + r) / L) * Lp + (p0 + r) % L;
       a[at] = __float2half(A[tx][cy]); b[at] = __float2half(B[tx][cy]);
     }
   }
@@ -312,11 +314,12 @@ __global__ void centerNormTK(const float* prod, half* out, size_t pairs, int C, 
   }
 }
 // pair += out * sigmoid(gate), the gate the [pairs, 5C] block's last C columns
-__global__ void gateMulAddHK(float* pair, const float* out, const half* pg, size_t pairs, int C) {
+// pair += out * sigmoid(gate), the gate's rows ld apart
+__global__ void gateMulAddHK(float* pair, const float* out, const half* gate, size_t pairs, int C, int ld) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= pairs * C) return;
   size_t r = t / C; int c = (int)(t % C);
-  pair[t] += out[t] / (1.f + __expf(-__half2float(pg[r * 5 * C + 4 * C + c])));
+  pair[t] += out[t] / (1.f + __expf(-__half2float(gate[r * ld + c])));
 }
 
 // ---------------------------------------------------------------- outer product mean, --fast

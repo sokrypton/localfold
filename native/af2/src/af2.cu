@@ -180,7 +180,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       checkOracle("evoformer pair", t.pair, pairs * 128, "o/full/pair");
       checkOracle("single", single, (size_t)L * 384, "o/full/single");
     }
-    mark("evoformer"); so = structureModule(single, t.pair, L, positionScale);
+    mark("evoformer"); memReport("evoformer"); so = structureModule(single, t.pair, L, positionScale);
     if (check) {
       checkOracle("structure act", so.act, (size_t)L * 384, "o/full/structure_act");
       checkOracle("angles", so.angles, (size_t)L * 14, "o/full/angles");

@@ -95,6 +95,22 @@ On the A100, 5CAJ (261 residues, 512 + 1024 rows):
 
 6MRR from its sequence: 1.2 s of wall clock a command, 324 ms of it the fold.
 
+## Memory
+
+Peak device memory, `--fast`: 783 residues from a single sequence **9.0 → 5.7 GB**; 5CAJ with
+512 + 1024 alignment rows 4.5 → 3.5 GB. No slower either way.
+- The transitions run in ~128 MB row chunks. The whole widened tensor was 1.26 GB of the pair track
+  at 783 residues.
+- The transition's f32 buffers are allocated only on the f32 path. Under `--fast` they were made and
+  never touched: 1.9 GB at 783.
+- The triangle multiplication's five projections are made in row chunks. a and b go to their
+  planes and only the output gate is kept whole (`[pairs, 5C]` was 0.78 GB). The centre norm reuses
+  the input norm's buffer.
+
+The chunked GEMMs round differently. A converged fold is unmoved (5CAJ 0.000 Å). An unfolded one,
+783 residues at pLDDT 34, lands somewhere else, 31.6 Å away, with pLDDT and pTM the same to four digits.
+`LOCALFOLD_MEM=1` prints what is in use after the Evoformer.
+
 ## Gate
 
 ```

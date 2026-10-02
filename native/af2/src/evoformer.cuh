@@ -267,7 +267,7 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     attentionCoreAcross(xn, L, rowsN, C, A + "/attention", blk, nullptr, msa);
     return;
   }
-  float* tr = scratch<float>("col.tr", rows * C); float* xn = scratch<float>("col.xn", rows * C);
+  float* tr = scratch<float>("col.tr", rows * C);
   float* mt = scratch<float>("col.mask", rows);
   swap01(msa, tr, rowsN, L, C);                 // [L, N, C]
   swap01(msaMask, mt, rowsN, L, 1);
@@ -277,6 +277,7 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
     attentionCore(xn, L, rowsN, C, A + "/attention", blk, t.msaOnes ? nullptr : mt, nullptr, msa, true);
     return;
   }
+  float* xn = scratch<float>("col.xn", rows * C);
   layerNorm(tr, xn, rows, C, A + "/query_norm", blk);
   float* out = scratch<float>("col.out", rows * C);
   gatedAttention(xn, L, rowsN, C, A + "/attention", blk, H, D, mt, nullptr, out);
@@ -313,20 +314,26 @@ inline void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, fl
 }
 inline void transition(float* x, size_t rows, int C, const std::string& T, int blk) {
   int I = (int)dimW(T + "/transition1/weights", blk < 0 ? 1 : 2);     // 4C in the stacks, 2C in the template's
+  if (FAST) {
+    // in row chunks of ~128 MB of the widened rows (the whole widened tensor was 1.26 GB of a pair track
+    // at 783 residues; a chunk of 2^15+ rows keeps the GEMMs as fast)
+    size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)(I + 8))));
+    half* xh = scratch<half>("ftr.xn", chunk * C);
+    half* mh = augmentedInput("ftr.mid" + std::to_string(I), chunk, I);     // [rows, I+8], a 1 at column I
+    const half* w2 = augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C);
+    for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+      size_t r = std::min(chunk, rows - r0);
+      layerNormH(x + r0 * C, xh, r, C, T + "/input_layer_norm", blk);
+      ltGemm(xh, PH(T + "/transition1/weights", blk), mh, true, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8);
+      // the second layer's bias carried by the product (its epilogue with a residual add ran as a second
+      // kernel over the whole MSA): the 1 at column I picks up the bias row of the augmented weight
+      ltGemm(mh, w2, x + r0 * C, false, r, I + 8, C, nullptr, false, 1.f);
+    }
+    return;
+  }
   float* xn = scratch<float>("tr.xn", rows * C);
   float* mid = scratch<float>("tr.mid", rows * I);
   float* out = scratch<float>("tr.out", rows * C);
-  if (FAST) {
-    half* xh = scratch<half>("ftr.xn", rows * C);
-    half* mh = augmentedInput("ftr.mid" + std::to_string(I), rows, I);     // [rows, I+8], a 1 at column I
-    layerNormH(x, xh, rows, C, T + "/input_layer_norm", blk);
-    ltGemm(xh, PH(T + "/transition1/weights", blk), mh, true, rows, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8);
-    // the second layer's bias carried by the product (its epilogue with a residual add ran as a second
-    // kernel over the whole MSA): the 1 at column I picks up the bias row of the augmented weight
-    ltGemm(mh, augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C), x, false, rows, I + 8,
-           C, nullptr, false, 1.f);
-    return;
-  }
   layerNorm(x, xn, rows, C, T + "/input_layer_norm", blk);
   linearB(xn, T + "/transition1", blk, mid, rows, C, I, true);
   linearB(mid, T + "/transition2", blk, out, rows, I, C);
@@ -415,8 +422,6 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     TriW w = triWeights(T, blk, C);
     half* xn = scratch<half>("ftri.xn", pairs * C);
     layerNormH(pair, xn, pairs, C, T + "/left_norm_input", blk);
-    half* pg = scratch<half>("ftri.pg", pairs * 5 * C);
-    ltGemm(xn, w.w5, pg, true, pairs, C, 5 * C, w.b5, false, 0.f);
     // planes [Lp][Lp], the pad rows and columns zero (written once: nothing else writes them)
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
@@ -425,7 +430,17 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
       zeroed = a; zeroedBytes = plane * C * 2;
     }
-    triGateTK<<<dim3((unsigned)((pairs + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, pairMask, a, b, pairs, C, L, Lp);
+    // the five projections in row chunks of ~128 MB (whole, [pairs, 5C] was 0.78 GB at 783 residues):
+    // a and b gated into their planes, the output gate kept [pairs, C] for the end
+    size_t chunk = std::min(pairs, std::max<size_t>(32768, ((size_t)128 << 20) / (10 * (size_t)C)));
+    half* pg = scratch<half>("ftri.pg", chunk * 5 * C);
+    half* og = scratch<half>("ftri.og", pairs * C);
+    for (size_t p0 = 0; p0 < pairs; p0 += chunk) {
+      size_t r = std::min(chunk, pairs - p0);
+      ltGemm(xn + p0 * C, w.w5, pg, true, r, C, 5 * C, w.b5, false, 0.f);
+      triGateTK<<<dim3((unsigned)((r + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, pairMask, a, b, r, C, L, Lp, p0);
+      CK(cudaMemcpy2DAsync(og + p0 * C, C * 2, pg + 4 * C, 5 * C * 2, C * 2, r, cudaMemcpyDeviceToDevice, STREAM));
+    }
     float* prod = scratch<float>("ftri.prod", plane * C);
     const float one = 1.f, zero = 0.f;
     // every extent Lp: the pad's zeros add nothing to a sum, and the pad's outputs are never read
@@ -435,12 +450,12 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     else
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16F, Lp, plane, b, CUDA_R_16F, Lp,
                                     plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    half* cn = scratch<half>("ftri.cn", pairs * C);
+    half* cn = xn;                // (the normalised input is spent)
     centerNormTK<<<(unsigned)((pairs + 31) / 32), 256, (size_t)C * 33 * 4, STREAM>>>(prod, cn, pairs, C,
       P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk), L, Lp);
     float* out = scratch<float>("ftri.out", pairs * C);
     ltGemm(cn, w.out, out, false, pairs, C, C, P(T + "/output_projection/bias", blk), false, 0.f);
-    gateMulAddHK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, out, pg, pairs, C);
+    gateMulAddHK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, out, og, pairs, C, C);
     return;
   }
   float* xn = scratch<float>("tri.xn", pairs * C);
@@ -483,7 +498,8 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
     return;
   }
   const float* x = pair; const float* mask = pairMask;
-  float* tr = scratch<float>("tatt.tr", pairs * C); float* mt = scratch<float>("tatt.mask", pairs);
+  float* tr = starting ? nullptr : scratch<float>("tatt.tr", pairs * C);
+  float* mt = starting ? nullptr : scratch<float>("tatt.mask", pairs);
   if (!starting) { swap01(pair, tr, L, L, C); if (!FAST || !pairOnes) swap01(pairMask, mt, L, L, 1); x = tr; mask = mt; }
   if (FAST) {
     half* xn = scratch<half>("ftatt.xn", pairs * C);
