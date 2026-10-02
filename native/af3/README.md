@@ -257,6 +257,15 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
   219 against 199 ms at 1044 tokens. Stripping it, neither the residual (-23 ms) nor the second
   GEMM (-27) dominates.
 
+- **Two 16-row tiles a warp in the triangle's input kernel** (each weight fragment feeding two
+  MMAs, half the shared-memory reads): 8 warps of 32 rows lost to 16 of 16 - 252 against 230 ms at
+  1044 tokens; 16 warps of 32 rows do not fit in shared memory.
+- **The atom blocks' transition fused** (the pair transition's kernel with the adaptive LayerNorm's
+  output read in and a gated residual): slower at every size - 400 against 371 ms of diffusion at
+  68 tokens, 1314 against 1300 at 1044 - few rows make few blocks, and cuBLAS's three launches win.
+- **cuBLAS split-K by batching the K slices** for the denoiser's N = 768 projections: 1-4 us a
+  block, less than the consumers' extra reads would cost.
+
 ## What the grid attention's time was
 
 Without a profiler on this box, by counting SASS: the kernel issued ~800 integer instructions a
