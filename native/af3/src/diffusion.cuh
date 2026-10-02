@@ -398,6 +398,14 @@ __global__ void padBiasK(const float* in, half* out, int n, int stride, int head
   int j = (int)(t % stride); size_t hi = t / stride;
   out[t] = __float2half(j < n ? in[hi * n + j] * LOG2E : 0.f);
 }
+// out[k][c] = scale[k] * W[k][c] and out[k][C + c] = scale[k] * Wshift[k][c], rows ld apart
+__global__ void foldCondK(float* out, size_t ld, const float* scale, const float* w, const float* wshift, int Cc, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)Cc * C) return;
+  int k = (int)(t / C), c = (int)(t % C);
+  out[k * ld + c] = scale[k] * w[t];
+  out[k * ld + C + c] = scale[k] * wshift[t];
+}
 struct TransformerCache {
   bool ready = false; int n = 0, nblocks = 0;
   std::vector<float*> pairLogits;      // [h][i][j] per block
@@ -420,41 +428,35 @@ inline void prepareTransformer(const float* pairCond, int n) {
     for (int k = 0; k < perSuper; ++k) names.push_back(T + ".superBlocks." + std::to_string(sb) + ".blocks." + std::to_string(k));
   tc.nblocks = (int)names.size();
   if (tc.wNorm.empty()) {
-    // the folded weights, once per process
-    std::vector<float> wn((size_t)Cc * tc.nblocks * 4 * C), wr((size_t)Cc * tc.nblocks * 2 * C);
-    std::vector<float> bn((size_t)tc.nblocks * 4 * C, 0.f), br((size_t)tc.nblocks * 2 * C, 0.f);
+    // the folded weights, once per process, built on the device from its copy of the weights (on
+    // the host this was 250 ms of every first fold): rows are the conditioning's Cc channels, then
+    // the biases (the GEMM's input carries a column of ones - the add after it was 60 us a step at
+    // 261 tokens), then zero rows up to a multiple of 8 so the f16 GEMM's leading dimension stays
+    // aligned (K = 385 put cuBLAS on a slow kernel and the whole step got slower)
+    int Ca = (Cc + 1 + 7) / 8 * 8;
     size_t ldn = (size_t)tc.nblocks * 4 * C, ldr = (size_t)tc.nblocks * 2 * C;
+    float* wn = dalloc((size_t)Ca * ldn); float* wr = dalloc((size_t)Ca * ldr);
+    CK(cudaMemsetAsync(wn, 0, (size_t)Ca * ldn * 4, STREAM)); CK(cudaMemsetAsync(wr, 0, (size_t)Ca * ldr * 4, STREAM));
     for (int b = 0; b < tc.nblocks; ++b) {
       const std::string& B = names[b];
-      auto fold = [&](const std::string& prefix, int slot) {
-        const float* sc = M.f(B + prefix + "SingleCondLayerNormScale");
-        const float* ws = M.f(B + prefix + "SingleCondScaleWeights"); const float* wh = M.f(B + prefix + "SingleCondBias");
-        const float* bs = M.f(B + prefix + "SingleCondScaleBias");
-        for (int k = 0; k < Cc; ++k) for (int c = 0; c < C; ++c) {
-          wn[k * ldn + (size_t)b * 4 * C + slot * C + c] = sc[k] * ws[(size_t)k * C + c];
-          wn[k * ldn + (size_t)b * 4 * C + (slot + 1) * C + c] = sc[k] * wh[(size_t)k * C + c];
-        }
-        for (int c = 0; c < C; ++c) bn[(size_t)b * 4 * C + slot * C + c] = bs[c];
-      };
-      fold(".", 0); fold(".ffw", 2);
-      auto gate = [&](const std::string& prefix, int slot) {
-        const float* w = M.f(B + prefix + "AdaptiveZeroCondWeights"); const float* bb = M.f(B + prefix + "AdaptiveZeroCondBias");
-        for (int k = 0; k < Cc; ++k) for (int c = 0; c < C; ++c) wr[k * ldr + (size_t)b * 2 * C + slot * C + c] = w[(size_t)k * C + c];
-        for (int c = 0; c < C; ++c) br[(size_t)b * 2 * C + slot * C + c] = bb[c];
-      };
-      gate(".", 0); gate(".ffw", 1);
+      for (int slot = 0; slot < 2; ++slot) {
+        std::string pre = B + (slot ? ".ffw" : ".");
+        // [scale | shift] for this block's (slot 0) attention or (slot 1) transition LN, the LN
+        // scale folded in; the scale's bias in the bias row
+        foldCondK<<<blocks((size_t)Cc * C), 256, 0, STREAM>>>(wn + (size_t)b * 4 * C + slot * 2 * C, ldn,
+          W(pre + "SingleCondLayerNormScale"), W(pre + "SingleCondScaleWeights"), W(pre + "SingleCondBias"), Cc, C);
+        CK(cudaMemcpyAsync(wn + (size_t)Cc * ldn + (size_t)b * 4 * C + slot * 2 * C, W(pre + "SingleCondScaleBias"),
+                           C * 4, cudaMemcpyDeviceToDevice, STREAM));
+        // the zero-init gate: raw weights and its bias
+        CK(cudaMemcpy2DAsync(wr + (size_t)b * 2 * C + slot * C, ldr * 4, W(pre + "AdaptiveZeroCondWeights"), C * 4,
+                             C * 4, Cc, cudaMemcpyDeviceToDevice, STREAM));
+        CK(cudaMemcpyAsync(wr + (size_t)Cc * ldr + (size_t)b * 2 * C + slot * C, W(pre + "AdaptiveZeroCondBias"),
+                           C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      }
       if (hasW(B + ".ffwAToB")) { fprintf(stderr, "ffwAToB: not ported\n"); exit(1); }
     }
-    // the biases as one more input row: the GEMM's input carries a column of ones, so the add
-    // after it (60 us a step at 261 tokens) is part of the product
-    wn.insert(wn.end(), bn.begin(), bn.end()); wr.insert(wr.end(), br.begin(), br.end());
-    // ...and zero rows up to a multiple of 8, so the f16 GEMM's leading dimension stays aligned
-    // (K = 385 put cuBLAS on a slow kernel and the whole step got slower)
-    for (int r = Cc + 1; r < (Cc + 1 + 7) / 8 * 8; ++r) {
-      wn.insert(wn.end(), ldn, 0.f); wr.insert(wr.end(), ldr, 0.f);
-    }
     tc.wNorm = T + ".condNorm~"; tc.wRaw = T + ".condRaw~";
-    SYNTH[tc.wNorm] = std::move(wn); SYNTH[tc.wRaw] = std::move(wr);
+    deviceWeight(tc.wNorm, wn, (size_t)Ca * ldn); deviceWeight(tc.wRaw, wr, (size_t)Ca * ldr);
   }
   // the pair logits of every block, from the (fold-constant) pair conditioning
   float* pn = scratch<float>("dt.pn", pairs * Cz);

@@ -109,8 +109,14 @@ inline std::map<std::string, float*> WF;
 inline std::map<std::string, half*> WH;
 inline std::map<std::string, size_t> WLEN;
 inline std::map<std::string, std::vector<float>> SYNTH;   // host tensors built here (fused weights)
-inline bool hasW(const std::string& k) { return SYNTH.count(k) || M.has(k); }
-inline size_t lenW(const std::string& k) { return SYNTH.count(k) ? SYNTH[k].size() : M.len(k); }
+// a weight built on the device (the folded conditioning projections), under a name W() serves
+inline void deviceWeight(const std::string& k, float* p, size_t n);
+inline bool hasW(const std::string& k) { return SYNTH.count(k) || M.has(k) || WLEN.count(k); }
+inline size_t lenW(const std::string& k) {
+  if (SYNTH.count(k)) return SYNTH[k].size();
+  auto it = WLEN.find(k);
+  return it != WLEN.end() && !M.has(k) ? it->second : M.len(k);
+}
 inline const float* W(const std::string& k) {
   auto it = WF.find(k);
   if (it != WF.end()) return it->second;
@@ -118,6 +124,7 @@ inline const float* W(const std::string& k) {
   WLEN[k] = M.len(k);
   return WF[k] = const_cast<float*>(M.dev(k));
 }
+inline void deviceWeight(const std::string& k, float* p, size_t n) { WF[k] = p; WLEN[k] = n; }
 inline const half* Wh(const std::string& k) {
   auto it = WH.find(k);
   if (it != WH.end()) return it->second;
