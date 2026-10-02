@@ -40,30 +40,48 @@ inline void transitionLayer(float* x, size_t rows, int C, const std::string& B) 
     gemm(a, F(B + "outProjection"), x + r0 * C, r, Hd, C, 1.f);
   }
 }
-__global__ void fourierK(const float* w, const float* b, float t, float* out, int n) {
+// the noise level's scalars, on the device so one captured step serves every level:
+// [0] t_noise = log(t / sigma) / 4, [1] 1 / sqrt(t^2 + sigma^2), [2] sigma^2 / (sigma^2 + t^2) (keep),
+// [3] sigma t / sqrt(sigma^2 + t^2) (take)
+struct NoiseLevel { float v[4]; };
+inline NoiseLevel noiseLevel(float t, float sigma) {
+  float s2 = sigma * sigma, t2 = t * t;
+  return {{0.25f * logf(fmaxf(t / sigma, 1e-20f)), 1.f / sqrtf(t2 + s2), s2 / (s2 + t2), sigma * t / sqrtf(s2 + t2)}};
+}
+__global__ void fourierK(const float* w, const float* b, const float* level, float* out, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = cosf(2.f * 3.14159265358979323846f * (t * w[i] + b[i]));
+  if (i < n) out[i] = cosf(2.f * 3.14159265358979323846f * (level[0] * w[i] + b[i]));
 }
 __global__ void addRowK(float* x, const float* row, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) x[t] += row[t % C];
 }
-__global__ void coordsInputK(const float* x, float scale, float* out, int A) {   // [A, 6] = [x / denom | 0]
+__global__ void coordsInputK(const float* x, const float* level, float* out, int A) {   // [A, 6] = [x / denom | 0]
   int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= A * 6) return;
   int a = t / 6, k = t % 6;
-  out[t] = k < 3 ? x[a * 3 + k] * scale : 0.f;
+  out[t] = k < 3 ? x[a * 3 + k] * level[1] : 0.f;
 }
 // adaLN: sigmoid(LN(s; scale) @ gate + gateBias) * LN(a) + LN(s; scale) @ shift
-__global__ void adaCombineK(const float* an, const float* g, const float* gb, const float* sh, float* out, size_t T, int C) {
+// (g and sh rows ld apart)
+__global__ void adaCombineK(const float* an, const float* g, const float* gb, const float* sh, float* out, size_t T, int C,
+                            int ld) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= T * C) return;
-  out[t] = an[t] / (1.f + expf(-(g[t] + gb[t % C]))) + sh[t];
+  size_t gi = (t / C) * ld + t % C;
+  out[t] = an[t] / (1.f + expf(-(g[gi] + gb[t % C]))) + sh[gi];
 }
-__global__ void sigmoidMulK(float* x, const float* g, const float* gb, size_t T, int C) {   // x *= sigmoid(g (+ gb))
+__global__ void sigmoidMulK(float* x, const float* g, const float* gb, size_t T, int C, int ld) {   // x *= sigmoid(g (+ gb))
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= T * C) return;
-  x[t] *= 1.f / (1.f + expf(-(g[t] + (gb ? gb[t % C] : 0.f))));
+  x[t] *= 1.f / (1.f + expf(-(g[(t / C) * ld + t % C] + (gb ? gb[t % C] : 0.f))));
+}
+// out[j] = x * scale[j] for each of n scales, [n, rows, C]
+__global__ void scaleCopiesK(const float* x, const float* scales, float* out, size_t rows, int C, int n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * rows * C) return;
+  size_t per = rows * C; int j = (int)(t / per); size_t r = t % per;
+  out[t] = x[r] * scales[(size_t)j * C + r % C];
 }
 // scores [H, T, T] + bias [H, T, T], softmax per row
 __global__ void biasSoftmaxK(float* S, const float* bias, int T, float scale) {
@@ -108,9 +126,9 @@ __global__ void gatherTokensK(const float* perToken, const int* atomToToken, con
   int token = mask[a] != 0.f ? atomToToken[a] : 0;
   q[t] += perToken[(size_t)token * C + c];
 }
-__global__ void edmCombineK(const float* xNoisy, const float* r, float* out, float keep, float take, int n) {
+__global__ void edmCombineK(const float* xNoisy, const float* r, float* out, const float* level, int n) {
   int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) out[t] = keep * xNoisy[t] + take * r[t];
+  if (t < n) out[t] = level[2] * xNoisy[t] + level[3] * r[t];
 }
 
 struct Denoiser {
@@ -120,6 +138,11 @@ struct Denoiser {
   float* pair;                    // the conditioning's pair, [P, Cz]
   std::vector<float*> biases;     // per token block, [H, T, T]
   const float* sInputs;
+  // every token block's projections of the single alone, one batched GEMM a step: entry e of G [T, 72 Ct]
+  // (columns e Ct..): 4b+0..3 block b's attention gate, shift, transition gate, shift (from LN(single)
+  // scaled by that adaLN's singleScale: snScaled [2 blocks, T, Ct]); 48+2b, 48+2b+1 its two out gates
+  float* single; float* snScaled; float* G; float* scales; const void** ptrs; int entries;
+  float* level;                   // NoiseLevel on the device
 };
 
 inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* relPos, const float* sInputs, bool check) {
@@ -146,40 +169,71 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* rel
     d.biases.push_back(bias);
   }
   d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
+  int Ct = d.Ct, nb = d.tokenBlocks;
+  d.entries = 6 * nb;
+  d.single = dalloc((size_t)T * Ct); d.snScaled = dalloc((size_t)2 * nb * T * Ct);
+  d.G = dalloc((size_t)T * d.entries * Ct); d.scales = dalloc((size_t)2 * nb * Ct);
+  std::vector<const void*> w(d.entries), x(d.entries), y(d.entries);
+  for (int b = 0; b < nb; ++b) {
+    std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
+    const char* part[2] = {"attention/", "transition/"};
+    for (int k = 0; k < 2; ++k) {
+      std::string P = B + part[k];
+      CK(cudaMemcpyAsync(d.scales + (size_t)(2 * b + k) * Ct, F(P + "adaln/singleScale"), Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
+      const float* in = d.snScaled + (size_t)(2 * b + k) * T * Ct;
+      w[4 * b + 2 * k] = F(P + "adaln/gateWeights"); x[4 * b + 2 * k] = in;
+      w[4 * b + 2 * k + 1] = F(P + "adaln/shiftWeights"); x[4 * b + 2 * k + 1] = in;
+      w[4 * nb + 2 * b + k] = F(P + "outGateWeights"); x[4 * nb + 2 * b + k] = d.single;
+    }
+  }
+  for (int e = 0; e < d.entries; ++e) y[e] = d.G + (size_t)e * Ct;
+  std::vector<const void*> all(w); all.insert(all.end(), x.begin(), x.end()); all.insert(all.end(), y.begin(), y.end());
+  d.ptrs = (const void**)upload((const uintptr_t*)all.data(), all.size());
+  d.level = dalloc(4);
   return d;
 }
 
 // single [T, Ct] at noise level t
-inline void conditioningSingle(const Denoiser& d, float t, float* single) {
+inline void conditioningSingle(const Denoiser& d, float* single) {
   int T = d.T, Ct = d.Ct;
   float* sn = scratch<float>("dc.sn", (size_t)T * d.Si);
   layerNorm(d.sInputs, sn, T, d.Si, F("diffusion/sInputNorm/scale"), F("diffusion/sInputNorm/offset"));
   gemm(sn, F("diffusion/sProjection"), single, T, d.Si, Ct);
   int nf = (int)M.len("f/diffusion/fourier/weights");
   float* four = scratch<float>("dc.fourier", nf); float* noise = scratch<float>("dc.noise", Ct);
-  float tNoise = 0.25f * logf(fmaxf(t / d.sigma, 1e-20f));
-  fourierK<<<blocks(nf), 256, 0, STREAM>>>(F("diffusion/fourier/weights"), F("diffusion/fourier/offsets"), tNoise, four, nf);
+  fourierK<<<blocks(nf), 256, 0, STREAM>>>(F("diffusion/fourier/weights"), F("diffusion/fourier/offsets"), d.level, four, nf);
   layerNorm(four, four, 1, nf, F("diffusion/noiseNorm/scale"), F("diffusion/noiseNorm/offset"));
   gemm(four, F("diffusion/noiseProjection"), noise, 1, nf, Ct);
   addRowK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(single, noise, T, Ct);
   for (int l = 0; l < 2; ++l) transitionLayer(single, T, Ct, "diffusion/sTransitions/" + std::to_string(l) + "/");
 }
 
-inline void adaLN(const float* a, const float* single, float* out, int T, int C, const std::string& B) {
-  float* an = scratch<float>("ada.an", (size_t)T * C); float* sn = scratch<float>("ada.sn", (size_t)T * C);
-  float* g = scratch<float>("ada.g", (size_t)T * C); float* sh = scratch<float>("ada.sh", (size_t)T * C);
+// the single's projections for every token block, one batched GEMM
+inline void singleProjections(const Denoiser& d) {
+  int T = d.T, C = d.Ct, n = 2 * d.tokenBlocks;
+  float* sn = scratch<float>("dn.sn0", (size_t)T * C);
+  layerNorm(d.single, sn, T, C, nullptr, nullptr);
+  scaleCopiesK<<<blocks((size_t)n * T * C), 256, 0, STREAM>>>(sn, d.scales, d.snScaled, T, C, n);
+  const float one = 1.f, zero = 0.f;
+  cublasComputeType_t ct = GEMM16 ? CUBLAS_COMPUTE_32F_FAST_16F : FAST ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+  CB(cublasGemmBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, T, C, &one, d.ptrs, CUDA_R_32F, C, d.ptrs + d.entries,
+                         CUDA_R_32F, C, &zero, (void* const*)(d.ptrs + 2 * d.entries), CUDA_R_32F, d.entries * C,
+                         d.entries, ct, FAST ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
+}
+// adaLN: sigmoid(LN(s; scale) @ gate + gateBias) * LN(a) + LN(s; scale) @ shift, the projections from G
+inline void adaLN(const Denoiser& d, const float* a, float* out, int e, const std::string& B) {
+  int T = d.T, C = d.Ct, ld = d.entries * C;
+  float* an = scratch<float>("ada.an", (size_t)T * C);
   layerNorm(a, an, T, C, nullptr, nullptr);
-  layerNorm(single, sn, T, C, F(B + "singleScale"), nullptr);
-  gemm(sn, F(B + "gateWeights"), g, T, C, C);
-  gemm(sn, F(B + "shiftWeights"), sh, T, C, C);
-  adaCombineK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(an, g, F(B + "gateBias"), sh, out, T, C);
+  adaCombineK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(an, d.G + (size_t)e * C, F(B + "gateBias"),
+                                                        d.G + (size_t)(e + 1) * C, out, T, C, ld);
 }
 
-inline void tokenBlock(const Denoiser& d, float* a, const float* single, int b) {
-  int T = d.T, C = d.Ct, Hh = d.heads, D = C / Hh;
+inline void tokenBlock(const Denoiser& d, float* a, int b) {
+  int T = d.T, C = d.Ct, Hh = d.heads, D = C / Hh, ld = d.entries * C, nb = d.tokenBlocks;
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
   float* x = scratch<float>("tb.x", (size_t)T * C);
-  adaLN(a, single, x, T, C, B + "attention/adaln/");
+  adaLN(d, a, x, 4 * b, B + "attention/adaln/");
   float* q = scratch<float>("tb.q", (size_t)T * C); float* kv = scratch<float>("tb.kv", (size_t)T * 2 * C);
   float* gt = scratch<float>("tb.gate", (size_t)T * C);
   gemm(x, F(B + "attention/queryWeights"), q, T, C, C);
@@ -193,33 +247,35 @@ inline void tokenBlock(const Denoiser& d, float* a, const float* single, int b) 
   biasSoftmaxK<<<(unsigned)(Hh * T), 256, 0, STREAM>>>(S, d.biases[b], T, 1.f / sqrtf((float)D));
   CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, D, T, T, &one, kv + C, 2 * C, D, S, T, (long long)T * T,
                                &zero, ctx, C, D, Hh));
-  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C);
-  float* o = scratch<float>("tb.o", (size_t)T * C); float* og = scratch<float>("tb.og", (size_t)T * C);
+  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C, C);
+  float* o = scratch<float>("tb.o", (size_t)T * C);
   gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
-  gemm(single, F(B + "attention/outGateWeights"), og, T, C, C);
-  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, og, F(B + "attention/outGateBias"), T, C);
+  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), T, C, ld);
   addK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, (size_t)T * C);
   // the conditioned transition
-  adaLN(a, single, x, T, C, B + "transition/adaln/");
+  adaLN(d, a, x, 4 * b + 2, B + "transition/adaln/");
   int Hd = (int)dimOf("f/" + B + "transition/outWeights", 0);
   float* w = scratch<float>("tb.wide", (size_t)T * 2 * Hd); float* g = scratch<float>("tb.gated", (size_t)T * Hd);
   gemm(x, F(B + "transition/swishWeights"), w, T, C, 2 * Hd);
   swigluK<<<blocks((size_t)T * Hd), 256, 0, STREAM>>>(w, g, T, Hd);
   gemm(g, F(B + "transition/outWeights"), o, T, Hd, C);
-  gemm(single, F(B + "transition/outGateWeights"), og, T, C, C);
-  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, og, F(B + "transition/outGateBias"), T, C);
+  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
   addK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, (size_t)T * C);
 }
 
-// one denoiser call: x_noisy [A, 3] at t -> x_denoised [A, 3]
-inline void denoise(const Denoiser& d, const float* xNoisy, float t, float* xDenoised, bool check = false) {
+// one denoiser call: x_noisy [A, 3] at the noise level in d.level -> x_denoised [A, 3]; nothing here
+// reads the host, so the sampler captures it once and replays it at every level
+inline bool SAMPLER16 = true;     // --fast: the denoiser's GEMMs on f16 tensor cores (--no-sampler16: TF32)
+inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoised, bool check = false) {
+  struct Restore { bool was = GEMM16; ~Restore() { GEMM16 = was; } } restore;
+  GEMM16 = FAST && SAMPLER16;
   int T = d.T, A = d.A, Ct = d.Ct; const AtomCtx& ac = d.atoms.ctx; int Ca = ac.C;
-  float* single = scratch<float>("dn.single", (size_t)T * Ct);
-  conditioningSingle(d, t, single);
+  float* single = d.single;
+  conditioningSingle(d, single);
+  singleProjections(d);
   if (check) checkOracle("diffusion conditioning single", single, (size_t)T * Ct, "o/cond/single");
-  float denom = sqrtf(t * t + d.sigma * d.sigma);
   float* r6 = scratch<float>("dn.r6", (size_t)A * 6);
-  coordsInputK<<<blocks((size_t)A * 6), 256, 0, STREAM>>>(xNoisy, 1.f / denom, r6, A);
+  coordsInputK<<<blocks((size_t)A * 6), 256, 0, STREAM>>>(xNoisy, d.level, r6, A);
   float* q = scratch<float>("dn.q", (size_t)A * Ca);
   gemm(r6, F("diffusionAtomEncoder/coordsLinear"), q, A, 6, Ca);
   addK<<<blocks((size_t)A * Ca), 256, 0, STREAM>>>(q, d.atoms.c0, (size_t)A * Ca);
@@ -228,12 +284,12 @@ inline void denoise(const Denoiser& d, const float* xNoisy, float t, float* xDen
   gemm(q, F("diffusionAtomEncoder/toToken"), tok, A, Ca, Ct);
   reluK<<<blocks((size_t)A * Ct), 256, 0, STREAM>>>(tok, (size_t)A * Ct);
   float* a = scratch<float>("dn.a", (size_t)T * Ct);
-  scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, Idev("atom_to_token"), ac.mask, a, A, T, Ct, Ct);
+  scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, ac.tokenStart, ac.tokenAtoms, ac.mask, a, T, Ct, Ct);
   float* sn = scratch<float>("dn.sn", (size_t)T * Ct); float* st = scratch<float>("dn.st", (size_t)T * Ct);
   layerNorm(single, sn, T, Ct, F("diffusion/stepNorm/scale"), F("diffusion/stepNorm/offset"));
   gemm(sn, F("diffusion/singleToToken"), st, T, Ct, Ct);
   addK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(a, st, (size_t)T * Ct);
-  for (int b = 0; b < d.tokenBlocks; ++b) tokenBlock(d, a, single, b);
+  for (int b = 0; b < d.tokenBlocks; ++b) tokenBlock(d, a, b);
   layerNorm(a, a, T, Ct, F("diffusion/tokenNorm/scale"), F("diffusion/tokenNorm/offset"));
   // the decoder: q (the encoder's output, the skip) + the tokens gathered back
   float* pt = scratch<float>("dn.pt", (size_t)T * Ca);
@@ -243,6 +299,13 @@ inline void denoise(const Denoiser& d, const float* xNoisy, float t, float* xDen
   layerNorm(q, q, A, Ca, F("diffusionAtomDecoder/norm/scale"), F("diffusionAtomDecoder/norm/offset"));
   float* r = scratch<float>("dn.r", (size_t)A * 3);
   gemm(q, F("diffusionAtomDecoder/outputLinear"), r, A, Ca, 3);
-  float s2 = d.sigma * d.sigma, t2 = t * t;
-  edmCombineK<<<blocks((size_t)A * 3), 256, 0, STREAM>>>(xNoisy, r, xDenoised, s2 / (s2 + t2), d.sigma * t / sqrtf(s2 + t2), A * 3);
+  edmCombineK<<<blocks((size_t)A * 3), 256, 0, STREAM>>>(xNoisy, r, xDenoised, d.level, A * 3);
+}
+inline void setLevel(const Denoiser& d, float t) {
+  NoiseLevel lv = noiseLevel(t, d.sigma);
+  CK(cudaMemcpyAsync(d.level, lv.v, sizeof lv.v, cudaMemcpyHostToDevice, STREAM));
+}
+inline void denoise(const Denoiser& d, const float* xNoisy, float t, float* xDenoised, bool check = false) {
+  setLevel(d, t);
+  denoiseAtLevel(d, xNoisy, xDenoised, check);
 }

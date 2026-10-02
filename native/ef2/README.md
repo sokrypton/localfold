@@ -137,6 +137,22 @@ The tiles leave a small pair track's device idle, so the fused path starts at 80
 `--no-fused256` is the cuBLASLt arm. Its accuracy is the same: trunk 7.4e-4 against the
 float32-attention oracle, against 8.2e-4 unfused.
 
+**The sampler** (warm, 6MRR / 5CAJ: 55 / 145 ms before, 28 / 48 after; the fold byte-identical
+across the graph and warm-up arms, the denoiser 3.3e-4 against the oracle under `--fast`):
+- **The atom attention is windowed, not masked.** It built `[heads, A, A]` scores and masked all but
+  ±64 ranks; `swaWindowK` takes 16 consecutive valid queries and their whole window in one
+  shared-memory tile, four queries a warp. 7.6 → 3.7 ms at 261 tokens, and the A² buffer is gone.
+- **Every projection of the single alone is one batched GEMM a step**: the 12 blocks' adaLN gates
+  and shifts (from one LN of the single, scaled per block) and their out gates, 72 GEMMs.
+- **The denoiser's GEMMs run on f16 tensor cores** (`--no-sampler16`: TF32), at 68 tokens no faster,
+  at 261 a third.
+- **One step is captured as a CUDA graph and replayed** (`--no-sampler-graph`): the noise level's
+  scalars live on the device, so the graph serves every level.
+- **The pooling walks each token's atoms**, not every atom for every token (5.8 ms at 261).
+- **Every weight starts on 16 bytes on the device** (native/af3's loader lays the file out so, for
+  all three ports): cuBLAS was choosing its align1 kernels for most of them, and a batched GEMM,
+  which cannot see its pointers, faulted. That alone took the sampler from 54 to 32 ms on 6MRR.
+
 Elsewhere:
 - The contraction runs on zero-padded f16 planes.
 - Every other GEMM uses TF32.
@@ -144,9 +160,9 @@ Elsewhere:
 
 | A100, warm | 6MRR (68 tokens) | 5CAJ (261) |
 |---|---:|---:|
-| language model | 12 ms | 54 ms |
+| language model | 10 ms | 15 ms |
 | trunk, 4 passes | 43 ms | 320 ms |
-| sampler, 11 steps | 55 ms | 145 ms |
+| sampler, 11 steps | 28 ms | 48 ms |
 | confidence | 5 ms | 68 ms |
 | sequence to PDB (`fold`, cold process) | 1.15 s | 1.97 s |
 

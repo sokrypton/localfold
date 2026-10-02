@@ -5,6 +5,9 @@
 #include "../../af3/src/common.cuh"
 
 inline bool FAST = false;
+// the GEMMs' f16 tensor-core arm (inputs rounded to f16 inside cuBLAS, f32 accumulation): the sampler
+// sets it under --fast, where every other GEMM takes TF32
+inline bool GEMM16 = false;
 
 // ---------------------------------------------------------------- weights
 // "f/<bundle name>" (the folding bundle) or "c/<bundle name>" (ESM-C); dims from "#k"
@@ -17,6 +20,12 @@ inline const float* Cw(const std::string& name) { return W("c/" + name); }
 inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f,
                  int ldx = 0, int ldy = 0) {
   const float one = 1.f;
+  if (GEMM16) {
+    CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_32F, out, X, CUDA_R_32F,
+                    ldx ? ldx : in, &beta, Y, CUDA_R_32F, ldy ? ldy : out, CUBLAS_COMPUTE_32F_FAST_16F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    return;
+  }
   CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, out, X, ldx ? ldx : in, &beta, Y,
                  ldy ? ldy : out));
 }

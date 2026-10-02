@@ -35,9 +35,14 @@ inline cublasHandle_t H;
 inline cudaStream_t STREAM = cudaStreamPerThread;
 
 // ---------------------------------------------------------------- the exported model
-struct Entry { char kind; size_t offset, length; double value; int seg; };
+struct Entry { char kind; size_t offset, length; double value; int seg; size_t devOffset = 0; };
 // model.idx/model.bin pairs, mapped: the input's directory and (af3 --weights=DIR) the weights'
-struct Segment { const float* data; size_t bytes; float* device; void* halfMirror = nullptr; };
+// On the device every tensor starts on 16 bytes (devOffset), wherever the file packed it: cuBLAS's
+// vector-load kernels need it (align1 kernels otherwise, and a batched GEMM, which cannot see its
+// pointers, faults). runs: the file's byte ranges and where each lands, in file order.
+struct Run { size_t src, dst, bytes; };
+struct Segment { const float* data; size_t bytes; float* device; void* halfMirror = nullptr;
+                 size_t deviceBytes = 0; std::vector<Run> runs; };
 struct Model {
   std::map<std::string, Entry> index;
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
@@ -62,7 +67,26 @@ struct Model {
     void* p = mmap(nullptr, std::max<size_t>(bytes, 1), PROT_READ, MAP_PRIVATE, fd, 0);
     if (p == MAP_FAILED) { fprintf(stderr, "cannot map %s/model.bin\n", dir.c_str()); exit(1); }
     close(fd);
-    segs.push_back({(const float*)p, bytes, nullptr});
+    Segment sg{(const float*)p, bytes, nullptr};
+    std::vector<Entry*> ts;
+    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') ts.push_back(&e);
+    std::sort(ts.begin(), ts.end(), [](const Entry* a, const Entry* b) { return a->offset < b->offset; });
+    size_t at = 0, end = 0;          // a tensor sharing (or overlapping) the last one's range keeps its place in it
+    for (Entry* e : ts) {
+      if (!sg.runs.empty() && e->offset < end) {
+        const Run& r = sg.runs.back();
+        e->devOffset = (r.dst + (e->offset * 4 - r.src)) / 4;
+        if (e->offset + e->length > end) { fprintf(stderr, "%s/model.bin: overlapping tensors\n", dir.c_str()); exit(1); }
+        continue;
+      }
+      at = (at + 3) / 4 * 4;
+      e->devOffset = at;
+      sg.runs.push_back({e->offset * 4, at * 4, e->length * 4});
+      at += e->length; end = e->offset + e->length;
+      if (end * 4 > bytes) { fprintf(stderr, "%s/model.bin is shorter than its index\n", dir.c_str()); exit(1); }
+    }
+    sg.deviceBytes = at * 4;
+    segs.push_back(sg);
   }
   // drop a directory's entries, its mapping and its device copy (one input of a batch, done);
   // returns the names it held so the caches keyed on them can be cleared too
@@ -86,7 +110,11 @@ struct Model {
   // copying each 8 MB piece while the last one's DMA runs - 77 against 170 ms for the 1.47 GB of
   // weights from pageable memory (the pinning costs 19 of it, a larger piece costs more)
   static bool copyUp(Segment& s) {
-    if (s.bytes < ((size_t)64 << 20)) return cudaMemcpy(s.device, s.data, s.bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (s.bytes < ((size_t)64 << 20)) {
+      for (const Run& r : s.runs)
+        if (cudaMemcpy((char*)s.device + r.dst, (const char*)s.data + r.src, r.bytes, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+      return true;
+    }
     const size_t CH = (size_t)8 << 20; const int NB = 3, THREADS = 3;
     char* stage[NB]; cudaEvent_t ev[NB]; cudaStream_t st;
     if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess) return false;
@@ -94,6 +122,7 @@ struct Model {
       if (cudaHostAlloc(&stage[b], CH, cudaHostAllocDefault) != cudaSuccess ||
           cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming) != cudaSuccess) return false;
     const char* src = (const char*)s.data; char* dst = (char*)s.device;
+    size_t run = 0;
     for (size_t off = 0, i = 0; off < s.bytes; off += CH, ++i) {
       int b = (int)(i % NB);
       if (i >= (size_t)NB && cudaEventSynchronize(ev[b]) != cudaSuccess) return false;
@@ -104,8 +133,15 @@ struct Model {
         pool.emplace_back([=] { memcpy(stage[b] + lo, src + off + lo, std::min(per, n - lo)); });
       }
       for (auto& th : pool) th.join();
-      if (cudaMemcpyAsync(dst + off, stage[b], n, cudaMemcpyHostToDevice, st) != cudaSuccess ||
-          cudaEventRecord(ev[b], st) != cudaSuccess) return false;
+      // every run's part inside this piece, to where it lands
+      while (run < s.runs.size() && s.runs[run].src + s.runs[run].bytes <= off) ++run;
+      for (size_t k = run; k < s.runs.size() && s.runs[k].src < off + n; ++k) {
+        const Run& r = s.runs[k];
+        size_t lo = std::max(r.src, off), hi = std::min(r.src + r.bytes, off + n);
+        if (cudaMemcpyAsync(dst + r.dst + (lo - r.src), stage[b] + (lo - off), hi - lo, cudaMemcpyHostToDevice, st) != cudaSuccess)
+          return false;
+      }
+      if (cudaEventRecord(ev[b], st) != cudaSuccess) return false;
     }
     bool ok = cudaStreamSynchronize(st) == cudaSuccess;
     for (int b = 0; b < NB; ++b) { cudaFreeHost(stage[b]); cudaEventDestroy(ev[b]); }
@@ -118,11 +154,11 @@ struct Model {
     touched.insert(k);
     Segment& s = segs[e.seg];
     if (!s.device) {
-      if (cudaMalloc(&s.device, std::max<size_t>(s.bytes, 4)) != cudaSuccess || !copyUp(s)) {
+      if (cudaMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s)) {
         fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
       }
     }
-    return s.device + e.offset;
+    return s.device + e.devOffset;
   }
   bool has(const std::string& k) const { return index.count(k) > 0; }
   const Entry& at(const std::string& k) const {
@@ -263,7 +299,7 @@ inline const half* segmentHalf(const std::string& k) {
     std::vector<size_t> from, to, len; std::vector<std::string> names; size_t total = 0;
     for (auto& [name, e] : M.index) {
       if (e.seg != e0.seg || e.kind != 't') continue;
-      from.push_back(e.offset); to.push_back(total); len.push_back(e.length); names.push_back(name);
+      from.push_back(e.devOffset); to.push_back(total); len.push_back(e.length); names.push_back(name);
       total += (e.length + 7) / 8 * 8;
     }
     CK(cudaMalloc(&s.halfMirror, std::max<size_t>(total, 1) * 2));

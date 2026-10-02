@@ -107,9 +107,10 @@ static int foldInput(const Opts& o, bool warm) {
   float* zi = dalloc((size_t)T * T * C); float* z = dalloc((size_t)T * T * C);
   zInit(T, C, sInputs, Si, lmZ, zi, check);
   t0 = std::chrono::steady_clock::now();
-  if (profile) { prof::init(); prof::start(); }
+  bool profTrunk = profile && !getenv("EF2_PROFILE_SAMPLER");
+  if (profTrunk) { prof::init(); prof::start(); }
   foldingTrunk(T, C, zi, z, 4, check);
-  if (profile) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
+  if (profTrunk) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   CK(cudaStreamSynchronize(STREAM));
   say("trunk %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   float* dg = dalloc((size_t)T * T * (int)M.meta("meta/distogramBins"));
@@ -130,7 +131,10 @@ static int foldInput(const Opts& o, bool warm) {
   }
   t0 = std::chrono::steady_clock::now();
   int stepsRun = 0;
+  bool profSampler = profile && getenv("EF2_PROFILE_SAMPLER");
+  if (profSampler) { prof::init(); prof::start(); }
   std::vector<float> coords = sample(dn, sampler, seed, &stepsRun);
+  if (profSampler) { CK(cudaStreamSynchronize(STREAM)); prof::stop(30); }
   say("sampler %.1f ms (%d steps)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stepsRun);
   if (!M.has("f/confidence/pae")) {
     fprintf(stderr, "the weights carry no confidence head: export them from model-esmfold2-conf-f32 (see native/ef2/README.md)\n");
@@ -165,6 +169,8 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
+    else if (!strcmp(argv[i], "--no-sampler16")) SAMPLER16 = false;
+    else if (!strcmp(argv[i], "--no-sampler-graph")) SAMPLER_GRAPH = false;
     else if (!strcmp(argv[i], "--atom-f32")) ATOM_BF16 = false;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;    // T,A: fold a synthetic input of that size meanwhile
@@ -183,6 +189,7 @@ int main(int argc, char** argv) {
   auto tStart = std::chrono::steady_clock::now();
   M.load(weights);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
+  { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
   M.upload(0);
   Opts o{argv[1], oracle, out, seed, sampler, profile};
   if (!warmShape.empty()) {

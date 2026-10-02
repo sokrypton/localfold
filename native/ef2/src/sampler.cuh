@@ -98,6 +98,7 @@ inline void rigidAlign(std::vector<float>& x, const std::vector<float>& target, 
   }
 }
 
+inline bool SAMPLER_GRAPH = true;    // --no-sampler-graph: every step launched as it is
 // the whole sampler; returns the final coordinates [A, 3] on the host
 inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t seed, int* stepsRun = nullptr) {
   int A = d.A;
@@ -109,6 +110,7 @@ inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, ui
   for (auto& v : x) v = (float)(sched[0] * N(rng));
   float* dx = dalloc((size_t)A * 3); float* dd = dalloc((size_t)A * 3);
   int steps = (int)sched.size() - 1;
+  cudaGraphExec_t graph = nullptr;
   for (int i = 0; i < steps; ++i) {
     double sigma = sched[i], next = sched[i + 1], gamma = next > s.gammaMin ? s.gamma0 : 0;
     // centre, a uniform random rotation (a normalised Gaussian quaternion), a N(0, 1) translation
@@ -130,13 +132,28 @@ inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, ui
     double eps = s.noiseScale * sqrt(std::max(t * t - sigma * sigma, 0.0));
     for (auto& v : x) v += (float)(eps * N(rng));
     CK(cudaMemcpyAsync(dx, x.data(), (size_t)A * 12, cudaMemcpyHostToDevice, STREAM));
-    denoise(d, dx, (float)t, dd);
+    setLevel(d, (float)t);
+    // the first step runs as it is (every scratch buffer and cuBLAS plan made), the second is captured
+    // and every later one replays it: ~350 launches a step become one
+    if (i == 0 || !SAMPLER_GRAPH) denoiseAtLevel(d, dx, dd);
+    else {
+      if (!graph) {
+        cudaGraph_t g;
+        CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+        denoiseAtLevel(d, dx, dd);
+        CK(cudaStreamEndCapture(STREAM, &g));
+        CK(cudaGraphInstantiate(&graph, g, 0));
+        CK(cudaGraphDestroy(g));
+      }
+      CK(cudaGraphLaunch(graph, STREAM));
+    }
     CK(cudaMemcpyAsync(xd.data(), dd, (size_t)A * 12, cudaMemcpyDeviceToHost, STREAM));
     CK(cudaStreamSynchronize(STREAM));
     rigidAlign(x, xd, mask, A);
     double f = s.stepScale * (next - t) / t;
     for (int k = 0; k < A * 3; ++k) x[k] = (float)(x[k] + f * (x[k] - xd[k]));
   }
+  if (graph) CK(cudaGraphExecDestroy(graph));
   CK(cudaFree(dx)); CK(cudaFree(dd));
   if (stepsRun) *stepsRun = steps;
   return x;
