@@ -209,6 +209,8 @@ int main(int argc, char** argv) {
       for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);
       STAGE_MS.clear();
     }
+    // the distogram's contact probabilities, for the confidences file (off the residue batch)
+    std::vector<float> contact = contactProbabilities(t);
     // OpenDDE: the expander and refiner, then everything after runs on the structural tokens
     bool structural = M.flag("trunk.dialect.structuralTokens");
     Structural st;
@@ -292,6 +294,7 @@ int main(int argc, char** argv) {
           return any ? bestTm : NAN;
         };
         ck.ptm = reduce(false); ck.iptm = reduce(true);
+        ck.tmTerm = term;
         const float* am = M.f("batch.refMask");
         double sum = 0, count = 0;
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
@@ -306,7 +309,8 @@ int main(int argc, char** argv) {
         std::string path = out.size() > 4 && out.substr(out.size() - 4) == ".pdb"
           ? out.substr(0, out.size() - 4) + "_sample" + std::to_string(k) + ".pdb" : out + "_sample" + std::to_string(k);
         auto order = writePdb(path, xk, ck.plddt.data());
-        if (path != "/dev/null") writeConfidences(path, order, ck.plddt, ck.pae, t.n, ck.ptm, ck.iptm, score);
+        if (path != "/dev/null") writeConfidences(path, order, t.n, dense, ck.plddt, ck.pae, ck.tmTerm, contact, ck.ptm, ck.iptm,
+                                                  score, ck.meanPlddt);
         printf("  sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", k, ck.meanPlddt, ck.ptm,
                ck.iptm, score, path.c_str());
       }
@@ -319,7 +323,8 @@ int main(int argc, char** argv) {
     auto f2 = clock();
     auto f3 = f2;
     auto order = writePdb(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
-    if (out != "/dev/null") writeConfidences(out, order, conf.plddt, conf.pae, t.n, conf.ptm, conf.iptm, bestScore);
+    if (out != "/dev/null") writeConfidences(out, order, t.n, dense, conf.plddt, conf.pae, conf.tmTerm, contact, conf.ptm,
+                                             conf.iptm, bestScore, conf.meanPlddt);
     if (samples > 1) printf("  best: sample %d\n", best);
     if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
       FILE* pf = fopen(pp, "wb");

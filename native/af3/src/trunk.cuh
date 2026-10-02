@@ -575,7 +575,34 @@ inline void distogram(Trunk& t, float* logits) {
   size_t pairs = (size_t)t.n * t.n;
   float* half_ = scratch<float>("disto.half", pairs * bins);
   linear<float, float>(t.pair, half_, pairs, t.C, bins, "trunk.distogram.halfLogits");
+  // a trained bias (OpenDDE, boltz2, ...) is in each half, so twice in the symmetrised logit -
+  // what those checkpoints were trained with (src/af3/trunk/trunk-webgpu.js)
+  if (hasW("trunk.distogram.halfLogitsBias"))
+    addBiasK<<<blocks(pairs * bins), 256, 0, STREAM>>>(half_, W("trunk.distogram.halfLogitsBias"), pairs, bins);
   symmetriseK<<<blocks(pairs * bins), 256, 0, STREAM>>>(half_, logits, t.n, bins);
+}
+// P(distance under the pair's contact threshold): the softmax mass of the first contactBins[ij]
+// bins (src/af3/featurise/contact-classes.js), masked
+__global__ void contactProbsK(const float* logits, const int* contactBins, const float* pairMask, float* out,
+                              size_t pairs, int bins) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= pairs) return;
+  const float* l = logits + ij * bins;
+  float mx = -INFINITY;
+  for (int b = 0; b < bins; ++b) mx = fmaxf(mx, l[b]);
+  float total = 0.f, contact = 0.f;
+  for (int b = 0; b < bins; ++b) { float p = expf(l[b] - mx); total += p; if (b < contactBins[ij]) contact += p; }
+  out[ij] = pairMask[ij] * contact / total;
+}
+inline std::vector<float> contactProbabilities(Trunk& t) {
+  if (!M.has("batch.contactBins")) return {};
+  int bins = (int)M.meta("trunk.distogram.bins");
+  size_t pairs = (size_t)t.n * t.n;
+  float* logits = scratch<float>("disto.logits", pairs * bins);
+  distogram(t, logits);
+  float* out = scratch<float>("disto.contact", pairs);
+  contactProbsK<<<blocks(pairs), 256, 0, STREAM>>>(logits, Idev("batch.contactBins"), t.pairMask, out, pairs, bins);
+  return download(out, pairs);
 }
 
 // The whole trunk pass. `onSeam(name, ptr, n)` sees the oracle's seams.

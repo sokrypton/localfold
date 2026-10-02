@@ -161,7 +161,7 @@ inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, co
     linear<float, float>(prod, pair + (size_t)i0 * n * C, (size_t)r * n, C, C, R + "sToZProdOut", false, 1.f);
   }
 }
-struct ConfidenceOut { std::vector<float> plddt, pae, pde; double meanPlddt, ptm, iptm; };
+struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
 
 inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
                                     const float* pseudoBeta, const float* seqMask, const float* pairMask, int n) {
@@ -273,6 +273,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
       return any ? best : NAN;
     };
     out.ptm = reduce(false); out.iptm = reduce(true);
+    out.tmTerm = std::move(term);
   }
   const int PB = 50;
   std::vector<float> pc(PB);

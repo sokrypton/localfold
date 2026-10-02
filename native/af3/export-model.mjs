@@ -209,6 +209,15 @@ if (sequence !== "") {
   batch = batchFromDump(JSON.parse(readFileSync(batchPath, "utf8")));
 }
 add("batch", batch);
+// the distogram's contact bins per token pair (src/af3/featurise/contact-classes.js), as the page
+// reads contact_probs off the distogram: the bin count is the bundle's
+{
+  const { af3ContactClasses, af3ContactBins } = await import(`${repo}/src/af3/featurise/contact-classes.js`);
+  const { binEdges } = await import(`${repo}/src/af3/trunk/trunk-webgpu.js`);
+  const manifest = JSON.parse(Buffer.from(await (await fetch(bundle)).arrayBuffer()).toString("utf8"));
+  const shape = manifest?.tensors?.["diffuser/distogram_head/half_logits/weights"]?.shape;
+  if (shape) add("batch.contactBins", af3ContactBins(af3ContactClasses(batch, batch.tokens), batch.tokens, binEdges(shape[1])));
+}
 // OpenDDE's second token space: after the trunk each standard residue becomes a backbone and a
 // sidechain token, and the diffusion and its confidence head run on those (src/af3/fold.js)
 if (dialect.structuralTokens) {

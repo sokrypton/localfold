@@ -182,33 +182,145 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
 // AlphaFold 3's confidence files beside a structure: <stem>_confidences.json (atom_plddts in the
 // PDB's atom order, pae, token_chain_ids, token_res_ids) and <stem>_summary_confidences.json
 // (ptm, iptm, ranking_score - the score without AF3's disorder and clash terms).
-inline void writeConfidences(const std::string& pdbPath, const std::vector<size_t>& order, const std::vector<float>& plddt,
-                             const std::vector<float>& pae, int n, double ptm, double iptm, double ranking) {
+// <stem>_confidences.json and <stem>_summary_confidences.json, as the page's archive writes them
+// (web/fold-archive.js): the per-atom pLDDTs in the PDB's atom order, the distogram's contact
+// probabilities, the PAE; and the scalar scores with their per-chain and per-chain-pair forms, the
+// TM ones reduced from the head's per-pair TM term (src/heads/tm-score.js)
+inline void writeConfidences(const std::string& pdbPath, const std::vector<size_t>& order, int n, int dense,
+                             const std::vector<float>& plddt, const std::vector<float>& pae,
+                             const std::vector<float>& tmTerm, const std::vector<float>& contact,
+                             double ptm, double iptm, double ranking, double meanPlddt) {
   std::string stem = pdbPath.size() > 4 && pdbPath.substr(pdbPath.size() - 4) == ".pdb"
     ? pdbPath.substr(0, pdbPath.size() - 4) : pdbPath;
   const int* asym = M.i("batch.asymId"); const int* res = M.i("batch.residueIndex");
+  const float* seq = M.f("batch.seqMask");
   auto chainId = [](int a) {
     std::string id; for (a = a - 1; ; a = a / 26 - 1) { id.insert(id.begin(), (char)('A' + a % 26)); if (a < 26) break; }
     return id;
   };
-  FILE* f = fopen((stem + "_confidences.json").c_str(), "w");
-  fprintf(f, "{\"atom_plddts\": [");
-  for (size_t k = 0; k < order.size(); ++k) fprintf(f, "%s%.2f", k ? ", " : "", plddt[order[k]]);
-  fprintf(f, "],\n \"pae\": [");
-  for (int i = 0; i < n; ++i) {
-    fprintf(f, "%s[", i ? ",\n  " : "");
-    for (int j = 0; j < n; ++j) fprintf(f, "%s%.2f", j ? ", " : "", pae[(size_t)i * n + j]);
+  auto matrix = [&](FILE* f, const std::vector<float>& m) {
+    fprintf(f, "[");
+    for (int i = 0; i < n; ++i) {
+      fprintf(f, "%s[", i ? ",\n  " : "");
+      for (int j = 0; j < n; ++j) fprintf(f, "%s%.2f", j ? ", " : "", m[(size_t)i * n + j]);
+      fprintf(f, "]");
+    }
     fprintf(f, "]");
-  }
-  fprintf(f, "],\n \"token_chain_ids\": [");
+  };
+  FILE* f = fopen((stem + "_confidences.json").c_str(), "w");
+  fprintf(f, "{\"atom_chain_ids\": [");
+  for (size_t k = 0; k < order.size(); ++k) fprintf(f, "%s\"%s\"", k ? ", " : "", chainId(asym[order[k] / dense]).c_str());
+  fprintf(f, "],\n \"atom_plddts\": [");
+  for (size_t k = 0; k < order.size(); ++k) fprintf(f, "%s%.2f", k ? ", " : "", plddt[order[k]]);
+  fprintf(f, "],\n");
+  if (!contact.empty()) { fprintf(f, " \"contact_probs\": "); matrix(f, contact); fprintf(f, ",\n"); }
+  fprintf(f, " \"pae\": "); matrix(f, pae);
+  fprintf(f, ",\n \"token_chain_ids\": [");
   for (int i = 0; i < n; ++i) fprintf(f, "%s\"%s\"", i ? ", " : "", chainId(asym[i]).c_str());
   fprintf(f, "],\n \"token_res_ids\": [");
   for (int i = 0; i < n; ++i) fprintf(f, "%s%d", i ? ", " : "", res[i]);
   fprintf(f, "]}\n");
   fclose(f);
+
+  // the chains, by asym id in token order
+  std::vector<int> chains;
+  for (int i = 0; i < n; ++i) if (seq[i] > 0 && std::find(chains.begin(), chains.end(), asym[i]) == chains.end()) chains.push_back(asym[i]);
+  std::sort(chains.begin(), chains.end());
+  int nc = (int)chains.size();
+  // max over anchors of the mean over the selected pairs (NaN when nothing is selected)
+  auto reduce = [&](const std::function<bool(int, int)>& selects) {
+    double best = -1e30; bool any = false;
+    for (int i = 0; i < n; ++i) {
+      double total = 0; int count = 0;
+      for (int j = 0; j < n; ++j) {
+        if (!(seq[i] > 0 && seq[j] > 0) || !selects(i, j)) continue;
+        total += tmTerm[(size_t)i * n + j]; ++count;
+      }
+      if (count) { any = true; best = std::max(best, total / count); }
+    }
+    return any ? best : NAN;
+  };
+  auto num = [](FILE* f, double v) { if (std::isfinite(v)) fprintf(f, "%.2f", v); else fprintf(f, "null"); };
+  std::vector<double> chainPtm(nc, NAN), chainIptm(nc, NAN);
+  for (int a = 0; a < nc; ++a) {
+    int c = chains[a];
+    chainPtm[a] = reduce([&](int i, int j) { return asym[i] == c && asym[j] == c; });
+    chainIptm[a] = reduce([&](int i, int j) { return (asym[i] == c) != (asym[j] == c); });
+  }
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
-  fprintf(f, "{\"ptm\": %.4f, \"iptm\": ", ptm);
-  if (std::isnan(iptm)) fprintf(f, "null"); else fprintf(f, "%.4f", iptm);
-  fprintf(f, ", \"ranking_score\": %.4f}\n", ranking);
+  fprintf(f, "{\n  \"chain_ids\": [");
+  for (int i = 0; i < n; ++i) fprintf(f, "%s\"%s\"", i ? ", " : "", chainId(asym[i]).c_str());
+  fprintf(f, "],\n");
+  if (!tmTerm.empty()) {
+    fprintf(f, "  \"chain_pair_iptm\": [");
+    for (int a = 0; a < nc; ++a) {
+      fprintf(f, "%s[", a ? ", " : "");
+      for (int b = 0; b < nc; ++b) {
+        if (b) fprintf(f, ", ");
+        if (a == b) { num(f, chainPtm[a]); continue; }        // the diagonal is the chain's own pTM
+        int ca = chains[a], cb = chains[b];
+        num(f, reduce([&](int i, int j) { return (asym[i] == ca && asym[j] == cb) || (asym[i] == cb && asym[j] == ca); }));
+      }
+      fprintf(f, "]");
+    }
+    fprintf(f, "],\n");
+  }
+  if (!contact.empty()) {      // the strongest predicted contact within and between chains, sequence neighbours out
+    std::vector<double> mx((size_t)nc * nc, -1);
+    for (int i = 0; i < n; ++i) for (int j = i + 1; j < n; ++j) {
+      int a = (int)(std::find(chains.begin(), chains.end(), asym[i]) - chains.begin());
+      int b = (int)(std::find(chains.begin(), chains.end(), asym[j]) - chains.begin());
+      if (a >= nc || b >= nc || (a == b && std::abs(res[i] - res[j]) <= 6)) continue;
+      double v = contact[(size_t)i * n + j];
+      if (v > mx[(size_t)a * nc + b]) mx[(size_t)a * nc + b] = mx[(size_t)b * nc + a] = v;
+    }
+    fprintf(f, "  \"chain_pair_max_contact\": [");
+    for (int a = 0; a < nc; ++a) {
+      fprintf(f, "%s[", a ? ", " : "");
+      for (int b = 0; b < nc; ++b) { if (b) fprintf(f, ", "); num(f, mx[(size_t)a * nc + b] < 0 ? NAN : mx[(size_t)a * nc + b]); }
+      fprintf(f, "]");
+    }
+    fprintf(f, "],\n");
+  }
+  {   // mean atom pLDDT per chain, and the fraction of atoms under 50, over the structure's atoms
+    std::vector<double> sum(nc, 0), cnt(nc, 0); size_t disordered = 0;
+    for (size_t k = 0; k < order.size(); ++k) {
+      int a = (int)(std::find(chains.begin(), chains.end(), asym[order[k] / dense]) - chains.begin());
+      float v = plddt[order[k]];
+      if (a < nc) { sum[a] += v; cnt[a] += 1; }
+      disordered += v < 50;
+    }
+    fprintf(f, "  \"chain_plddt\": [");
+    for (int a = 0; a < nc; ++a) { if (a) fprintf(f, ", "); num(f, cnt[a] ? sum[a] / cnt[a] : NAN); }
+    fprintf(f, "],\n");
+    if (!tmTerm.empty()) {
+      fprintf(f, "  \"chain_ptm\": [");
+      for (int a = 0; a < nc; ++a) { if (a) fprintf(f, ", "); num(f, chainPtm[a]); }
+      fprintf(f, "],\n");
+      if (nc > 1) {
+        fprintf(f, "  \"chain_iptm\": [");
+        for (int a = 0; a < nc; ++a) { if (a) fprintf(f, ", "); num(f, chainIptm[a]); }
+        fprintf(f, "],\n");
+      }
+    }
+    // the minimum PAE over ordered pairs, row in one chain and column in the other
+    std::vector<double> mn((size_t)nc * nc, INFINITY);
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) {
+      int a = (int)(std::find(chains.begin(), chains.end(), asym[i]) - chains.begin());
+      int b = (int)(std::find(chains.begin(), chains.end(), asym[j]) - chains.begin());
+      if (a < nc && b < nc) mn[(size_t)a * nc + b] = std::min(mn[(size_t)a * nc + b], (double)pae[(size_t)i * n + j]);
+    }
+    fprintf(f, "  \"chain_pair_pae_min\": [");
+    for (int a = 0; a < nc; ++a) {
+      fprintf(f, "%s[", a ? ", " : "");
+      for (int b = 0; b < nc; ++b) { if (b) fprintf(f, ", "); num(f, mn[(size_t)a * nc + b]); }
+      fprintf(f, "]");
+    }
+    fprintf(f, "],\n");
+    if (std::isfinite(iptm)) fprintf(f, "  \"iptm\": %.2f,\n", iptm);
+    fprintf(f, "  \"ptm\": %.2f,\n  \"ranking_score\": %.2f,\n", ptm, ranking);
+    fprintf(f, "  \"fraction_disordered\": %.2f,\n  \"mean_plddt\": %.2f\n}\n",
+            order.empty() ? 0.0 : (double)disordered / order.size(), meanPlddt);
+  }
   fclose(f);
 }
