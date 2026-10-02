@@ -142,6 +142,7 @@ if (!weightsOnly) {
 // batch dump.
 let sequence = option("sequence", "");
 let jobRequest = null;
+let jobUserCcd = null;                  // the job's own component definitions (userCCD), mmCIF
 if (option("job", "") !== "") {
   if (sequence !== "") throw new Error("--job and --sequence both name the input");
   const { jobFromJson } = await import(`${repo}/web/job-json.js`);
@@ -178,6 +179,7 @@ if (option("job", "") !== "") {
     seeds.forEach((s, i) => entries.push(["m", `job.seeds.${i}`, s]));
   }
   jobRequest = expandEntities(job.entities);
+  jobUserCcd = job.userCcd ?? null;
   sequence = jobRequest.sequence;
   if (inlineMsa.unpaired.some(Boolean) || inlineMsa.paired.some(Boolean)) {
     const { mergeRowAlignedChainA3ms } = await import(`${repo}/src/input/chains.js`);
@@ -215,7 +217,17 @@ if (sequence !== "") {
   // (one per ":"-chain), --modify=SEP@3[@chain] (the position as tools/gpu/probe-modified.js takes it, chain index from 0)
   const { ccdUrl, parseCcdComponent, ligandChain } = await import(`${repo}/src/af3/featurise/ccd-component.js`);
   const { nameSmilesLigands, smilesComponent } = await import(`${repo}/src/chem/component.js`);
+  // a job's own userCCD first (each data_ block one component), then the RCSB
+  const userComponents = new Map();
+  if (jobUserCcd) {
+    for (const block of jobUserCcd.split(/^(?=data_)/m).filter((b) => b.trim().startsWith("data_"))) {
+      const component = parseCcdComponent(block);
+      userComponents.set(component.code.toUpperCase(), component);
+    }
+    console.log(`job: userCCD defines ${[...userComponents.keys()].join(", ")}`);
+  }
   const ccd = async (code) => {
+    if (userComponents.has(code.toUpperCase())) return userComponents.get(code.toUpperCase());
     const response = await fetch(ccdUrl(code));
     if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
     return parseCcdComponent(await response.text());

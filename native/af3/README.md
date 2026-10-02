@@ -154,12 +154,20 @@ node ... export-model.mjs data-job --job=../../tools/fixtures/af3-jobs/kras_g12c
 
 `--job` reads an AlphaFold 3 job JSON (either dialect) with the page's own reader
 (`web/job-json.js`, `web/entities.js`): chains and their kinds, CCD and SMILES ligands, modified
-residues, `bondedAtomPairs`, and the first model seed (the native run's default `--seed`) - and,
-unlike the page, the `unpairedMsa` / `pairedMsa` AF3's data pipeline writes into the job, which
-become the alignment (5CAJ with 200 inline rows: 2.02 A, pLDDT 94.2). Seven of
-AF3's examples fold single-sequence: ubiquitin, calmodulin + 4 Ca, KRAS G12C + covalent sotorasib
-(SG-C25 1.53 A - bonded), ERK2 with two phosphorylations, streptavidin + SMILES biotin, the TetR
-dimer on DNA (476 tokens), U1A on an RNA hairpin.
+residues AND modified bases (a base's parent through its chain's alphabet and the component's CCD
+parent), a ligand of several components as one chain (a glycan: `ccdCodes` [NAG, NAG, BMA, MAN,
+MAN], a residue each), `bondedAtomPairs` (one direction, the job's, covalent - as AF3 lists and
+codes them), every model seed (`--seeds`), the job's own templates (their
+`queryIndices`/`templateIndices` mapping when given; a template search is refused), its `userCCD`
+components (resolved before the RCSB) - and, unlike the page, the `unpairedMsa` / `pairedMsa`
+AF3's data pipeline writes into the job, which become the alignment, an RNA chain's in RNA's
+alphabet (5CAJ with 200 inline rows: 2.02 A, pLDDT 94.2). Each of these is exact against AF3's own
+featurised batch (`tools/check-batch-fields.js`, targets dna-5cm, rna-mods, glycan, rna-msa,
+prot-rna-msa). All fourteen of AF3's example jobs fold, its kitchen-sink `alphafold_input.json`
+(every field the format has at once) included: ubiquitin, calmodulin + 4 Ca, KRAS G12C + covalent
+sotorasib (SG-C25 1.53 A - bonded), ERK2 with two phosphorylations, streptavidin + SMILES biotin,
+the TetR dimer on DNA (476 tokens), U1A on an RNA hairpin, methylated DNA (pLDDT 94.2), a modified
+tRNA fragment, glycosylated RNase B (Asn34 ND2-C1 1.42 A).
 
 The featuriser is the repository's own; the trunk adds the bond embedding (one column, bias-free).
 The PDB is written through the page's own `toPdb` records (exported as `template.pdb`): chains,

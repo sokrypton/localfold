@@ -280,6 +280,13 @@ describe("a SMILES ligand survives the archive", () => {
     expect(after).toEqual(before);
   });
 
+  it("hands a job's own chemistry (userCCD) to the caller rather than refusing it", () => {
+    // the native exporter resolves ligand codes against it; the page refuses it in applyJob
+    const job = jobFromJson(server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
+                                   { userCCD: "data_LIG\n_chem_comp.id LIG" }));
+    expect(job.userCcd).toContain("data_LIG");
+  });
+
   it("reads a template's explicit residue mapping, and refuses a lopsided one", () => {
     const job = (template) => open([{ protein: { id: "A", sequence: "ACDEFGHIK", templates: [template] } }]);
     const read = jobFromJson(job({ mmcif: "data_T\n_atom_site.id 1", queryIndices: [0, 1, 2], templateIndices: [3, 4, 5] }));
@@ -341,8 +348,8 @@ describe("what it refuses, and what it names", () => {
     ["bondedAtomPairs",
      server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
             { bondedAtomPairs: [[["A", 1, "CA"], ["B", 1, "CA"]]] })],
-    ["userCCD", server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
-                       { userCCD: "data_LIG" })],
+    ["userCCDPath", server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
+                           { userCCDPath: "/tmp/ccd.cif" })],
     // 🔴 `smiles` IS ACCEPTED NOW AND THE REFUSAL MOVED TO THE AMBIGUOUS CASE.
     // A ligand naming itself both ways cannot be resolved: see web/job-json.js.
     ["names itself twice", open([{ ligand: { id: "B", smiles: "CCO",

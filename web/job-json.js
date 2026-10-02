@@ -580,11 +580,16 @@ export function jobFromJson(text) {
     notes.push(`${jobs.length} jobs in the file; loaded the first`);
   }
   const job = jobs[0] ?? {};
-  for (const field of ["userCCD", "userCCDPath"]) {
-    if (job[field] !== undefined && job[field] !== null) {
-      refuse(`${field} describes chemistry this page does not build - remove it`
-        + " to fold the rest");
-    }
+  // `userCCD` (components the job defines itself, as mmCIF) is RETURNED, not refused here: the
+  // native exporter resolves ligand codes against it before the RCSB, and the page - which would
+  // have to hold the chemistry as state nobody can see - refuses it where it applies a job.
+  // A path to a file beside the JSON is still refused: nothing here can read it.
+  if (job.userCCDPath !== undefined && job.userCCDPath !== null) {
+    refuse("userCCDPath points at a file beside the JSON, which this reader cannot open"
+      + " - inline it as userCCD");
+  }
+  if (job.userCCD !== undefined && job.userCCD !== null && typeof job.userCCD !== "string") {
+    refuse("userCCD is mmCIF text");
   }
   // 🔴 ABSENT MEANS THE SERVER'S, WHICH IS UPSTREAM'S RULE AND NOT AN OBVIOUS
   // ONE: a job with neither `dialect` nor `version` is read by folding_input.py
@@ -725,5 +730,6 @@ export function jobFromJson(text) {
   // ...and the letters go no further.
   for (const entity of entities) delete entity.ids;
   return { name: typeof job.name === "string" ? job.name : undefined,
-           seed, entities, dialect, singleSequence: state.singleSequence, notes };
+           seed, entities, dialect, singleSequence: state.singleSequence, notes,
+           ...(typeof job.userCCD === "string" && job.userCCD.trim() !== "" ? { userCcd: job.userCCD } : {}) };
 }
