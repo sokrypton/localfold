@@ -14,7 +14,7 @@
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
-  bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1;   // 3 recycles: the page's default
+  bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
   uint64_t seed = 42; std::string out = "fold.pdb";
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = true;
@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
+    else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
   }
@@ -139,18 +140,42 @@ int main(int argc, char** argv) {
     int dense = (int)M.meta("batch.dense");
     std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)t.n * dense);
     DiffusionFold df = prepareDiffusion(t.single, t.pair, t.targetFeat, t.seqMask, t.n);
-    std::vector<float> x = sample(steps, seed, mask, [&](const float* noisy, float tHat, const float* dLevel) {
-      return (const float*)denoiseStep(df, noisy, tHat, dLevel);
-    });
+    // --samples=N: N diffusion samples off one trunk (AF3 runs five), each through the confidence
+    // head and ranked by AF3's ranking score without its disorder and clash terms - 0.8 ipTM +
+    // 0.2 pTM, or pTM for one chain. Sample k is seeded `seed + k`; the best is written to --out
+    // and every one to <out>_sample<k>.pdb.
+    double diffMs = 0, confMs = 0, bestScore = -1e30; int best = 0;
+    ConfidenceOut conf;
+    std::vector<float> x;
+    for (int k = 0; k < samples; ++k) {
+      auto s0 = clock();
+      std::vector<float> xk = sample(steps, seed + k, mask, [&](const float* noisy, float tHat, const float* dLevel) {
+        return (const float*)denoiseStep(df, noisy, tHat, dLevel);
+      });
+      auto s1 = clock();
+      // pseudo-beta off the structure, then the confidence head
+      std::vector<float> beta((size_t)t.n * 3);
+      const int* pbIdx = M.i("batch.tokenAtomsToPseudoBeta.indices"); const float* pbMask = M.f("batch.tokenAtomsToPseudoBeta.mask");
+      for (int r = 0; r < t.n; ++r) for (int a = 0; a < 3; ++a) beta[r * 3 + a] = pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
+      float* dBeta = upload(beta.data(), beta.size());
+      ConfidenceOut ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
+      CK(cudaFree(dBeta));
+      auto s2 = clock();
+      diffMs += ms(s0, s1); confMs += ms(s1, s2);
+      double score = std::isnan(ck.iptm) ? ck.ptm : 0.8 * ck.iptm + 0.2 * ck.ptm;
+      if (samples > 1) {
+        std::string path = out.size() > 4 && out.substr(out.size() - 4) == ".pdb"
+          ? out.substr(0, out.size() - 4) + "_sample" + std::to_string(k) + ".pdb" : out + "_sample" + std::to_string(k);
+        writePdb(path, xk, ck.plddt.data());
+        printf("  sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", k, ck.meanPlddt, ck.ptm,
+               ck.iptm, score, path.c_str());
+      }
+      if (score > bestScore) { bestScore = score; best = k; conf = std::move(ck); x = std::move(xk); }
+    }
     auto f2 = clock();
-    // pseudo-beta off the structure, then the confidence head
-    std::vector<float> beta((size_t)t.n * 3);
-    const int* pbIdx = M.i("batch.tokenAtomsToPseudoBeta.indices"); const float* pbMask = M.f("batch.tokenAtomsToPseudoBeta.mask");
-    for (int k = 0; k < t.n; ++k) for (int a = 0; a < 3; ++a) beta[k * 3 + a] = pbMask[k] ? x[(size_t)pbIdx[k] * 3 + a] : 0.f;
-    float* dBeta = upload(beta.data(), beta.size());
-    ConfidenceOut conf = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
-    auto f3 = clock();
+    auto f3 = f2;
     writePdb(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
+    if (samples > 1) printf("  best: sample %d\n", best);
     if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
       FILE* pf = fopen(pp, "wb");
       fwrite(conf.pae.data(), 4, conf.pae.size(), pf); fwrite(conf.pde.data(), 4, conf.pde.size(), pf);
@@ -161,8 +186,8 @@ int main(int argc, char** argv) {
       for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);
     }
     printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", conf.meanPlddt, conf.ptm, conf.iptm, out.c_str());
-    printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps), confidence %.1f ms, total %.1f ms\n", fi + 1,
-           ms(f0, f1), recycles + 1, ms(f1, f2), steps, ms(f2, f3), ms(f0, f3));
+    printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d), confidence %.1f ms, total %.1f ms\n",
+           fi + 1, ms(f0, f1), recycles + 1, diffMs, steps, samples, confMs, ms(f0, f3));
     if (profiling) prof::stop(40);
     if (fi + 1 == folds) return 0;
   }

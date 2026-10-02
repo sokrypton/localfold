@@ -554,7 +554,7 @@ inline DecoderCache prepareDecoder(const EncoderOut& enc) {
   d.C = (int)M.meta(Dd + ".channels"); int Cp = (int)M.meta(Dd + ".pairChannels");
   d.heads = (int)M.meta(Dd + ".heads"); d.D = (int)M.meta(Dd + ".dimension");
   d.perToken = (int)M.meta(Dd + ".perTokenChannels");
-  size_t qRows = (size_t)sh.subsets * sh.queries, kRows = (size_t)sh.subsets * sh.keys;
+  size_t qRows = (size_t)sh.subsets * sh.queries;
   int nblocks = 0; while (M.has(Dd + ".blocks." + std::to_string(nblocks) + ".qProjection")) ++nblocks;
   std::vector<float*> logits = atomPairLogits(Dd, enc.pair, qRows * sh.keys, Cp, nblocks, d.heads, sh);
   for (int b = 0; b < nblocks; ++b)

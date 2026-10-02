@@ -23,7 +23,10 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data         
 python3 score.py 5caj.pdb ../../tools/fixtures/5caj-crystal.pdb A
 ```
 
-`--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats),
+`--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--samples=N`
+(N diffusion samples off one trunk, AF3 runs five: each scored by the confidence head and ranked by
+0.8 ipTM + 0.2 pTM - pTM for one chain; AF3's disorder and clash terms are not computed - the best
+written to `--out`, all to `<out>_sample<k>.pdb`),
 `--fast` (f16 trunk and denoiser transformer), `--stages` (per-stage profile),
 `--no-graphs`. `pairformer.cu` is the earlier one-file pairformer prototype and benchmark.
 
