@@ -71,6 +71,17 @@ export class GpuBufferAllocator {
       throw new RangeError(`invalid allocation size ${requestedBytes} for ${label}`);
     }
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
+    // 🔴 A POOLED STORAGE BUFFER CARRIES BOTH COPY FLAGS, so one size is one
+    // key. The key is size AND usage, and AlphaFold 2's graph asks for the
+    // same pair size as STORAGE, STORAGE|COPY_SRC and STORAGE|COPY_DST in
+    // different places - three pools that could never serve each other, each
+    // holding pair-sized buffers nothing was using. Extra usage flags are legal
+    // and cost nothing; a mapped buffer keeps its own (MAP_READ pairs with
+    // COPY_DST alone).
+    const mapped = GPUBufferUsage.MAP_READ | GPUBufferUsage.MAP_WRITE;
+    if (this.#pooling && (usage & GPUBufferUsage.STORAGE) !== 0 && (usage & mapped) === 0) {
+      usage |= GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+    }
     const key = `${byteLength}:${usage}`;
     const pooled = poolingDisabled ? undefined : this.#pool.get(key);
     let buffer = pooled?.pop();

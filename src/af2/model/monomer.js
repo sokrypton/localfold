@@ -6,6 +6,7 @@ import {
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { encodeContactProbabilities } from "../../heads/distogram-webgpu.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
+import { settleReleasedMemory } from "../../runtime/allocator.js";
 import { af2Plan, planTotal } from "../../runtime/cost-model.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../../runtime/abort.js";
 import { DeferredValidation } from "../../runtime/validation.js";
@@ -209,6 +210,12 @@ export class AlphaFoldMonomerGpu {
         useTemplateUnitVector: recycleOptions.useTemplateUnitVector,
       }), signal);
       }
+      // 🔴 AND THE STAGE'S MEMORY ACTUALLY RETURNED BEFORE THE STACKS ASK FOR
+      // THEIRS. Dawn frees a destroyed buffer only on a device tick: at 1600
+      // residues the template stage freed 11 GB and the Evoformer allocated
+      // 15 GB before one, and the driver read 26 GB against 16.4 live. One
+      // empty submit and its wait; see settleReleasedMemory.
+      await settleReleasedMemory(this.device);
       stageMilliseconds.template = performance.now() - phaseStart;
       phaseStart = performance.now();
       throwIfAborted(signal);

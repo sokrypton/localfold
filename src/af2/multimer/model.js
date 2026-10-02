@@ -15,6 +15,7 @@ import {
 } from "./block.js";
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
+import { settleReleasedMemory } from "../../runtime/allocator.js";
 import { af2Plan, planTotal } from "../../runtime/cost-model.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../../runtime/abort.js";
 import { DeferredValidation } from "../../runtime/validation.js";
@@ -129,6 +130,8 @@ export class AlphaFoldUnifiedGpu {
         length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
       }), signal)
       : undefined;
+    // ...and its memory returned before the stacks allocate; see monomer.js.
+    if (template !== undefined) await settleReleasedMemory(this.device);
     throwIfAborted(signal);
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
