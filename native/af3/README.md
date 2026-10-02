@@ -174,19 +174,26 @@ oracles) folds the other checkpoints the page offers, through the same dialect f
 | OpenBind-0 | trunk_out_pair 5.4e-7, PAE 4.2e-6 | 1.71 A | |
 | protenix2 | trunk_out_pair 1.0e-6, denoise 1.5e-6, PAE 2.4e-7 | 0.453 A | 0.136 A |
 | IntelliFold-2 (int5 bundle) | trunk_out_pair 4.5e-2 (the quantisation; z_after_msa 9.1e-3) | 1.551 A | 0.296 A |
+| RoseTTAFold3 (int5 bundle) | trunk_out_pair 4.85e-2 (WebGPU on the same bundle 4.90e-2) | 1.621 A, bonds 0.050 A | |
 
 Ported for them: the padded single conditioning, per-block atom pair norm, chained atom
 LayerNorms, split pair conditioning, per-block atom masking, the fused template embedder (passes
 built by the exporter as the page's trunk builds them - empty-slot gap, coverage weights, outer
 residual, rf3's one averaged pass), protenix2's confidence head (raw-distance term, normalised
-single, PDE symmetrised before its projection), head width 64.
+single, PDE symmetrised before its projection), head width 64; for rf3 the pre-trunk query, q/k
+LayerNorms in the transformer and the atom blocks, the no-residual block wiring, 35-wide MSA
+features, biased outer-product projections, the chirality gradient term, and its confidence head
+(whole-tensor masked norms, the CA distogram).
+
+After a first fold `af3` lists every weight family it never read; for these models the list is
+only what should be there (heads not computed, alternative per-block forms, absent bonds and
+template geometry) - rf3's atom-block q/k norms and chirality term were found by it.
 
 ## Not ported yet
 
-boltz2 (the atom-only target_feat, the pre-trunk query, its z-init bond-order terms, re-embedding
-confidence head, MSA conventions, transition up-gates and sampler constants), RoseTTAFold3 (the
-transformer's q/k norm and no-residual wiring, its confidence head) and OpenDDE (the structural
-token expansion) - each raises a named "not ported" error.
+boltz2 (the atom-only target_feat, its z-init bond-order terms, re-embedding confidence head,
+MSA conventions, transition up-gates and sampler constants) and OpenDDE (the structural token
+expansion) - each raises a named "not ported" error.
 
 ## Tried and not taken
 
