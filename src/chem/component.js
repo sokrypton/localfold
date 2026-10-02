@@ -133,8 +133,13 @@ export async function smilesComponent(smiles, options = {}) {
     // an aromatic ring's bonds AROMATIC (4) - what a CCD component's pdbx_aromatic_flag gives and
     // AF3's bond-order feature takes - not their Kekule 1s and 2s, so a SMILES ligand and its
     // dictionary twin hand the model the same bond orders
+    // ...and a RING-CLOSURE bond from the atom that closes the ring to the one that opened it, as
+    // RDKit creates it (C1CC1: (0,1) (1,2) (2,0)) and so as AlphaFold 3's SMILES path lists it - the
+    // direction is a feature for a model that does not symmetrise its bonds (AF3's kitchen-sink job:
+    // its SMILES ligand's three ring bonds came out reversed against the reference's batch)
     bonds: graph.bonds.map((bond) => ({
-      from: bond.from, to: bond.to, order: bond.aromatic ? 4 : Math.round(bond.order),
+      from: bond.ring ? bond.to : bond.from, to: bond.ring ? bond.from : bond.to,
+      order: bond.aromatic ? 4 : Math.round(bond.order),
     })),
     smiles,
     conformerError: best.error,

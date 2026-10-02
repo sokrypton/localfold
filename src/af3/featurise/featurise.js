@@ -1000,7 +1000,10 @@ export function featuriseProtein(sequence, options = {}) {
     ? (row, token) => msa[(unpairedFrom + row) * tokens + token]
     : (row, token) => {
       const column = msaColumnOfToken[token];
-      if (column < 0) return -1;
+      // a token with no column (a ligand's) is a gap in every row, as `msa` holds it above: AF3's
+      // profile puts a ligand token's whole weight on the gap - measured on its kitchen-sink job,
+      // 1.0 at restype 21 for every ligand token - where returning nothing left it all zeros
+      if (column < 0) return MSA_GAP;
       return profileRows[row] === undefined ? -1 : profileRows[row][column];
     };
   const deletionAt = profileRows === null

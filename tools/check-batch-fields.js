@@ -168,6 +168,18 @@ const TARGETS = {
     extra: () => ({ chainKinds: ["rna"],
                     modifications: [{ chain: 0, position: 1, ...ccd("2MG") }, { chain: 0, position: 4, ...ccd("5MC") }] }),
   },
+  // AlphaFold 3's KITCHEN-SINK example (tools/fixtures/af3-jobs/alphafold_input.json) as the page
+  // and the native exporter read it - jobFromJson, expandEntities, mergeJobAlignments, the SMILES
+  // built here - against AF3's own featurisation of the same file (dump_af3_batch.py --job, the
+  // twelve components it lacks as --user-ccd): two proteins with PTMs, two DNA and an RNA chain with
+  // modified bases, inline alignments over protein and RNA, ten ligand chains (a two-component
+  // glycan, a SMILES), and its bonds
+  "kitchen-sink": {
+    suffix: "-kitchen-sink",
+    alignment: () => KITCHEN.alignment,
+    extra: () => KITCHEN.options,
+    smilesCodes: () => KITCHEN.smilesCodes,
+  },
   "rna-mods": {
     suffix: "-rna-mods",
     extra: () => ({
@@ -253,6 +265,33 @@ const verbose = args.includes("--verbose");
 // nobody has watched fail is a gate that may be comparing nothing. See the
 // bottom of this file for the run that proves it.
 const falsify = (args.find((a) => a.startsWith("--falsify=")) ?? "").slice(10);
+// the kitchen sink's inputs, built once (a SMILES conformer is async)
+const KITCHEN = await (async () => {
+  const { jobFromJson } = await import("../web/job-json.js");
+  const { expandEntities } = await import("../web/entities.js");
+  const { mergeJobAlignments } = await import("../src/input/chains.js");
+  const { smilesComponent } = await import("../src/chem/component.js");
+  const job = jobFromJson(fixture("af3-jobs/alphafold_input.json"));
+  const request = expandEntities(job.entities);
+  const merged = mergeJobAlignments(job.alignments, request.chains, request.chainKinds);
+  const ligands = [];
+  const smilesCodes = request.ligandCodes.filter((entry) => entry?.smiles !== undefined)
+    .map((entry) => entry.code ?? "LIG");
+  for (const entry of request.ligandCodes) {
+    ligands.push(typeof entry === "string" ? ccd(entry)
+      : entry.codes ? ligandChain(entry.codes.map(ccd))
+      : await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
+  }
+  return {
+    smilesCodes,
+    alignment: merged.alignment,
+    options: {
+      chainKinds: request.chainKinds, msaColumnKinds: merged.msaColumnKinds, ligands,
+      modifications: request.modifications.map((m) => ({ chain: m.chain, position: m.position, ...ccd(m.code) })),
+      ...(request.bonds === undefined ? {} : { bonds: request.bonds }),
+    },
+  };
+})();
 const onlyTarget = (args.find((a) => a.startsWith("--target=")) ?? "").slice(9);
 
 /** The dump for one (model, target), or null when it has not been generated. */
@@ -438,6 +477,18 @@ for (const target of Object.keys(TARGETS)) {
     const msk = flat(dump.inputs["tokens_to_ligand_ligand_bonds:gather_mask"]).map(Number);
     const orders = flat(dump.inputs.ligand_ligand_bond_order).map(Number);
     let orderDiff = 0;
+    // 🔴 A SMILES LIGAND'S BOND ORDERS ARE A REPORTED DEVIATION, NOT A FAILURE. The reference
+    // looks a bond's order up in the component's CCD entry, and a SMILES-only ligand has none:
+    // `_ccd_bond_orders` returns an empty mapping and every bond reads OTHER (0) - its own docstring
+    // says so. This port carries the molecule's real orders, which is what genuine Boltz-2 (the one
+    // model that reads the feature) featurises from RDKit; the reference's 0 is a gap in its lookup.
+    const smilesTokens = new Set();
+    for (const span of batch.ligandSpans ?? []) {
+      if ((TARGETS[target].smilesCodes?.() ?? []).includes(span.code)) {
+        for (let t = span.from; t < span.from + span.count; t += 1) smilesTokens.add(t);
+      }
+    }
+    let smilesOrders = 0;
     if (orders.length > 0 && batch.bondOrderMatrix !== undefined) {
       seen.add("ligand_ligand_bond_order");
       for (let k = 0; k * 2 + 1 < idx.length; k += 1) {
@@ -445,7 +496,13 @@ for (const target of Object.keys(TARGETS)) {
         const a = idx[k * 2];
         const b = idx[k * 2 + 1];
         if (a === b) continue;
-        if (batch.bondOrderMatrix[a * batch.tokens + b] !== orders[k]) orderDiff += 1;
+        if (batch.bondOrderMatrix[a * batch.tokens + b] !== orders[k]) {
+          if (orders[k] === 0 && smilesTokens.has(a) && smilesTokens.has(b)) smilesOrders += 1;
+          else orderDiff += 1;
+        }
+      }
+      if (smilesOrders !== 0) {
+        floor.push(`ligand_ligand_bond_order: ${smilesOrders} SMILES-ligand pairs the reference has as OTHER (no CCD entry to read) and this port as the molecule's own orders`);
       }
       if (orderDiff !== 0) {
         bad.push(`ligand_ligand_bond_order: ${orderDiff} pairs with the wrong order`);

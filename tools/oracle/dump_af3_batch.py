@@ -77,6 +77,9 @@ def main():
                         help="modified bases or residues as CODE@POSITION[,...] (1-based)")
     # components the installed dictionary lacks (af3-any-model's pip install carries a minimal one,
     # without SEP or any modified base), as mmCIF text - what AF3's userCCD field takes
+    # an AlphaFold 3 job file, featurised as AF3 reads it (folding_input.Input.from_json): its chains,
+    # their inline alignments and templates, its bonds and its first seed - replaces every chain flag
+    parser.add_argument("--job", default=None)
     parser.add_argument("--user-ccd", default=None, action="append",
                         help="a component's CCD mmCIF file to add to the dictionary (repeatable)")
     arguments = parser.parse_args()
@@ -95,7 +98,28 @@ def main():
     from alphafold3.model import feat_batch
 
     chains = None
-    if arguments.chains is not None:
+    job_bonds, job_seed = None, 0
+    if arguments.job is not None:
+        from alphafold3.common import folding_input
+        fold_input = folding_input.Input.from_json(open(arguments.job).read())
+        # a field the file leaves out is "search for it" to AF3's data pipeline, which this does not
+        # run; the page and the native fold read it as none, so it is given as none here too
+        def filled(chain):
+            if isinstance(chain, folding_input.ProteinChain):
+                return folding_input.ProteinChain(
+                    id=chain.id, sequence=chain.sequence, ptms=chain.ptms,
+                    paired_msa=chain.paired_msa if chain.paired_msa is not None else "",
+                    unpaired_msa=chain.unpaired_msa if chain.unpaired_msa is not None else "",
+                    templates=chain.templates if chain.templates is not None else [])
+            if isinstance(chain, folding_input.RnaChain) and chain.unpaired_msa is None:
+                return folding_input.RnaChain(id=chain.id, sequence=chain.sequence,
+                                              modifications=chain.modifications, unpaired_msa="")
+            return chain
+        chains = [filled(chain) for chain in fold_input.chains]
+        job_bonds = fold_input.bonded_atom_pairs
+        job_seed = fold_input.rng_seeds[0]
+        arguments.sequence = ":".join(getattr(c, "sequence", "") for c in chains if hasattr(c, "sequence"))
+    elif arguments.chains is not None:
         from alphafold3.common import folding_input
         chains = []
         for k, spec in enumerate(arguments.chains.split(",")):
@@ -153,8 +177,10 @@ def main():
                 chain, residue, atom = end.split(":")
                 ends.append((chain, int(residue), atom))
             bonds.append(tuple(ends))
+    if job_bonds:
+        bonds = (bonds or []) + [tuple(tuple(end) for end in pair) for pair in job_bonds]
     batch, _cfg, _dir = _fold_setup(arguments.model, arguments.sequence, chains=chains,
-                                    bonded_atom_pairs=bonds)
+                                    bonded_atom_pairs=bonds, seed=job_seed)
     features = feat_batch.Batch.from_data_dict(batch)
     inputs = {}
     for name, value in arrays(batch):

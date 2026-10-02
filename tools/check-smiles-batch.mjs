@@ -180,6 +180,33 @@ for (const { code, smiles, namesDiffer } of CASES) {
       // field decides is asserted and agrees".
       && !/\/ligandSpans\[\d+\]\/bonds\[/.test(line));
 
+    // 🔴 EXCEPT A RING BOND WRITTEN THE OTHER WAY ROUND, WHICH THE REFERENCE DOES TOO. A SMILES
+    // ring-closure bond runs from the atom that closes the ring to the one that opened it - RDKit
+    // creates it so, and AlphaFold 3's SMILES path lists it so: its own BEN batch has (17,12) from
+    // the SMILES and (12,17) from the CCD. For a model that does not symmetrise its bonds that is
+    // a different matrix in the reference as well, so a difference made ENTIRELY of exact reversals
+    // (each entry's mirror set on the other side, at the same order) is reported, not failed.
+    const reversedOnly = (() => {
+      const a = fromCode.batch.bondMatrix, b = fromSmiles.batch.bondMatrix;
+      const oa = fromCode.batch.bondOrderMatrix, ob = fromSmiles.batch.bondOrderMatrix;
+      const n = fromCode.batch.tokens;
+      if (a === undefined || b === undefined || a.length !== b.length) return false;
+      let any = false;
+      for (let i = 0; i < n; i += 1) {
+        for (let j = 0; j < n; j += 1) {
+          const k = i * n + j, m = j * n + i;
+          if (a[k] === b[k] && (oa?.[k] ?? 0) === (ob?.[k] ?? 0)) continue;
+          any = true;
+          if (!(a[k] === b[m] && b[k] === a[m] && (oa?.[k] ?? 0) === (ob?.[m] ?? 0))) return false;
+        }
+      }
+      return any;
+    })();
+    if (reversedOnly) {
+      for (let at = real.length - 1; at >= 0; at -= 1) {
+        if (/^\/bond(Order)?Matrix:/.test(real[at])) real.splice(at, 1);
+      }
+    }
     // ...and that claim is only safe while those two really are compared.
     for (const field of ["bondMatrix", "bondOrderMatrix"]) {
       if (fromCode.batch[field] === undefined) {
