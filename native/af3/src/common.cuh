@@ -108,23 +108,50 @@ inline unsigned blocks(size_t n, int t = 256) { return (unsigned)((n + t - 1) / 
 inline std::map<std::string, float*> WF;
 inline std::map<std::string, half*> WH;
 inline std::map<std::string, size_t> WLEN;
-inline std::map<std::string, std::vector<float>> SYNTH;   // host tensors built here (fused weights)
 // a weight built on the device (the folded conditioning projections), under a name W() serves
 inline void deviceWeight(const std::string& k, float* p, size_t n);
-inline bool hasW(const std::string& k) { return SYNTH.count(k) || M.has(k) || WLEN.count(k); }
+inline bool hasW(const std::string& k) { return M.has(k) || WLEN.count(k); }
 inline size_t lenW(const std::string& k) {
-  if (SYNTH.count(k)) return SYNTH[k].size();
   auto it = WLEN.find(k);
   return it != WLEN.end() && !M.has(k) ? it->second : M.len(k);
 }
 inline const float* W(const std::string& k) {
   auto it = WF.find(k);
   if (it != WF.end()) return it->second;
-  if (SYNTH.count(k)) { WLEN[k] = SYNTH[k].size(); return WF[k] = upload(SYNTH[k].data(), SYNTH[k].size()); }
   WLEN[k] = M.len(k);
   return WF[k] = const_cast<float*>(M.dev(k));
 }
 inline void deviceWeight(const std::string& k, float* p, size_t n) { WF[k] = p; WLEN[k] = n; }
+// A weight concatenated along its output columns, on the device from its copies of the parts:
+// each part (C, width) row-major (in, out), or stored (width, C) if `transposed`; a part with no
+// name is zero columns. Returns `key`, under which W()/Wh() serve the (C, sum of widths) result.
+struct Part { std::string name; int width; bool transposed; };
+__global__ void transposeIntoK(const float* src, float* dst, int C, int width, size_t ld) {   // dst[c][o] = src[o][c]
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)C * width) return;
+  int c = (int)(t / width), o = (int)(t % width);
+  dst[c * ld + o] = src[(size_t)o * C + c];
+}
+inline std::string concatColumns(const std::string& key, int C, const std::vector<Part>& parts) {
+  if (WF.count(key)) return key;
+  size_t total = 0; for (auto& p : parts) total += p.width;
+  float* d = dalloc((size_t)C * total);
+  size_t off = 0;
+  for (auto& p : parts) {
+    if (p.name.empty()) {
+      CK(cudaMemset2DAsync(d + off, total * 4, 0, p.width * 4, C, STREAM));
+    } else {
+      if (lenW(p.name) != (size_t)C * p.width) {
+        fprintf(stderr, "%s has %zu elements, not %d x %d\n", p.name.c_str(), lenW(p.name), C, p.width); exit(1);
+      }
+      if (p.transposed) transposeIntoK<<<blocks((size_t)C * p.width), 256, 0, STREAM>>>(W(p.name), d + off, C, p.width, total);
+      else CK(cudaMemcpy2DAsync(d + off, total * 4, W(p.name), p.width * 4, p.width * 4, C, cudaMemcpyDeviceToDevice, STREAM));
+    }
+    off += p.width;
+  }
+  deviceWeight(key, d, (size_t)C * total);
+  return key;
+}
 inline const half* Wh(const std::string& k) {
   auto it = WH.find(k);
   if (it != WH.end()) return it->second;

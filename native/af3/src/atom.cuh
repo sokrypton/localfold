@@ -242,16 +242,7 @@ struct AtomStep {
 };
 // [a | b] as one (C, 2W) matrix, both stored (in, out)
 inline std::string pairedWeight(const std::string& a, const std::string& b, int C, int Wd) {
-  std::string k = a + "|" + b + "~";
-  if (SYNTH.count(k)) return k;
-  std::vector<float> cat((size_t)C * 2 * Wd);
-  const float* pa = M.f(a); const float* pb = M.f(b);
-  for (int c = 0; c < C; ++c) for (int o = 0; o < Wd; ++o) {
-    cat[(size_t)c * 2 * Wd + o] = pa[(size_t)c * Wd + o];
-    cat[(size_t)c * 2 * Wd + Wd + o] = pb[(size_t)c * Wd + o];
-  }
-  SYNTH[k] = std::move(cat);
-  return k;
+  return concatColumns(a + "|" + b + "~", C, {{a, Wd, false}, {b, Wd, false}});
 }
 // a key row gathered from the queries (zero where masked), then its adaptive LN; warp per row
 template <class TO>

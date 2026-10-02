@@ -75,32 +75,13 @@ __global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
 // ---------------------------------------------------------------- fused weights
 // The triangle's projection and gate as one (C, 4C) matrix: [projection (2C) | gate (2C)].
 inline std::string projectionGate(const std::string& pre, int C) {
-  std::string k = pre + ".projectionGate~";
-  if (SYNTH.count(k)) return k;
-  const float* p = M.f(pre + ".projection"); const float* g = M.f(pre + ".gate");
-  std::vector<float> cat((size_t)C * 4 * C);
-  for (int c = 0; c < C; ++c) for (int o = 0; o < 2 * C; ++o) {
-    cat[(size_t)c * 4 * C + o] = p[(size_t)c * 2 * C + o];
-    cat[(size_t)c * 4 * C + 2 * C + o] = g[(size_t)c * 2 * C + o];
-  }
-  SYNTH[k] = std::move(cat);
-  return k;
+  return concatColumns(pre + ".projectionGate~", C, {{pre + ".projection", 2 * C, false}, {pre + ".gate", 2 * C, false}});
 }
 // q, k, v and the gate as one (C, 4W) matrix. The grid attention stores q, k and the gate
 // (out, in) and v (in, out); `transposedQkg` says whether that holds.
 inline std::string qkvgWeight(const std::string& pre, int C, int Wd, bool transposedQkg) {
-  std::string k = pre + ".qkvg~";
-  if (SYNTH.count(k)) return k;
-  std::vector<float> cat((size_t)C * 4 * Wd);
-  const char* roles[4] = {".qProjection", ".kProjection", ".vProjection", ".gatingQuery"};
-  for (int role = 0; role < 4; ++role) {
-    bool tr = transposedQkg && role != 2;
-    const float* src = M.f(pre + roles[role]);
-    for (int c = 0; c < C; ++c) for (int o = 0; o < Wd; ++o)
-      cat[(size_t)c * 4 * Wd + role * Wd + o] = tr ? src[(size_t)o * C + c] : src[(size_t)c * Wd + o];
-  }
-  SYNTH[k] = std::move(cat);
-  return k;
+  return concatColumns(pre + ".qkvg~", C, {{pre + ".qProjection", Wd, transposedQkg}, {pre + ".kProjection", Wd, transposedQkg},
+                                          {pre + ".vProjection", Wd, false}, {pre + ".gatingQuery", Wd, transposedQkg}});
 }
 
 // ---------------------------------------------------------------- triangle multiplication
@@ -273,13 +254,7 @@ __global__ void biasLayoutHeadMajorK(const float* raw, TB* bias, int n, int stri
 }
 // a (C, k) weight zero-padded to (C, kp) columns
 inline std::string paddedColumns(const std::string& w, int C, int k, int kp) {
-  std::string key = w + "~pad" + std::to_string(kp);
-  if (SYNTH.count(key)) return key;
-  std::vector<float> out((size_t)C * kp, 0.f);
-  const float* src = M.f(w);
-  for (int c = 0; c < C; ++c) for (int o = 0; o < k; ++o) out[(size_t)c * kp + o] = src[(size_t)c * k + o];
-  SYNTH[key] = std::move(out);
-  return key;
+  return concatColumns(w + "~pad" + std::to_string(kp), C, {{w, k, false}, {"", kp - k, false}});
 }
 // pair[(r, j) or (j, r)] += out[r][j], four channels a thread (C a multiple of 4)
 __global__ void addGridK(float* pair, const float* out, int n, int C, size_t r0, size_t R, bool tr) {
