@@ -404,7 +404,8 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     linear<T, T>(act, qkvgOut, prs, C, 4 * Wd, qkvg);
     if (gateBias) addGateBiasK<T><<<blocks(prs * Wd), 256, 0, STREAM>>>(qkvgOut, gateBias, prs, Wd);
     T* gathered = scratch<T>("grid.gathered", prs * Wd);
-    flashGrid<T>(qkvgOut, bias, stride, mask, gathered, n, heads, D, r0, rows, tr, scale);
+    flashGrid<T>(qkvgOut, bias, stride, MASK_ALL_ONES && std::is_same_v<T, half> ? nullptr : mask, gathered, n, heads, D,
+                 r0, rows, tr, scale);       // (no mask when every token is real: the unmasked kernel)
     if (!tr && !outBias) {
       linear<T, float>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
       continue;
