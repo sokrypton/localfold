@@ -173,7 +173,8 @@ each input folds as soon as its export lands - three folds in 2.4 s where three 
 Each input's outputs are byte-identical to folding it alone. A single `fold` command starts `af3`
 before the export too (`--wait-input`), so the CUDA context and the weight upload overlap it, and
 returns once the outputs are written rather than after the driver has released the process's
-device memory (`--detach-output`: a quarter second): 6MRR is 1.20 s a command, of which the fold is
+device memory (`--detach-output`: a quarter second), and the weights go up through pinned buffers
+filled by three threads (77 against 170 ms): 6MRR is 1.08 s a command, of which the fold is
 0.64.
 
 ## The gate
