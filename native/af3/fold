@@ -4,6 +4,10 @@
 #   native/af3/fold <out.pdb> <input flags> [-- <fold flags>]
 #   native/af3/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json -- --samples=5
 #   native/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=5caj.a3m --template=5caj.pdb:A
+#   native/af3/fold 6mrr.pdb --model=protenix2 --sequence=<SEQ>
+#
+# --model=<name> picks the bundle (model-<name>-full-f32, -f32 or -int5, in that order; default
+# af3) and keeps its exported weights in native/af3/weights-<name>.
 #
 # Input flags go to export-model.mjs (--sequence, --a3m, --paired-a3m, --job, --ligands, --smiles,
 # --modify, --kinds, --template, --bundle); fold flags to ./af3 (--samples, --recycles, --steps,
@@ -13,17 +17,25 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { sed -n '2,13p' "$0"; exit 1; }
 out="$1"; shift
-inputs=(); foldflags=()
+inputs=(); foldflags=(); model=af3
 while [ $# -gt 0 ]; do
   if [ "$1" = "--" ]; then shift; foldflags=("$@"); break; fi
-  inputs+=("$1"); shift
+  case "$1" in --model=*) model="${1#--model=}" ;; *) inputs+=("$1") ;; esac
+  shift
 done
+repo="$(cd "$here/../.." && pwd)"
+bundle=""
+for suffix in full-f32 f32 int5; do
+  [ -f "$repo/model-$model-$suffix/manifest.json" ] && { bundle="$repo/model-$model-$suffix/manifest.json"; break; }
+done
+[ -n "$bundle" ] || { echo "no bundle for model $model under $repo" >&2; exit 1; }
+weights="$here/weights"; [ "$model" = af3 ] || weights="$here/weights-$model"
 if [ ! -x "$here/af3" ]; then
   (cd "$here" && nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu \
      -lcublas -lcupti -o af3)
 fi
 node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")
-[ -f "$here/weights/model.idx" ] || "${node[@]}" "$here/weights" --weights-only
+[ -f "$weights/model.idx" ] || "${node[@]}" "$weights" --weights-only --bundle="$bundle"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-"${node[@]}" "$tmp" --no-weights "${inputs[@]}"
-"$here/af3" "$tmp" --weights="$here/weights" --fold --fast --out="$out" "${foldflags[@]}"
+"${node[@]}" "$tmp" --no-weights --bundle="$bundle" "${inputs[@]}"
+"$here/af3" "$tmp" --weights="$weights" --fold --fast --out="$out" "${foldflags[@]}"

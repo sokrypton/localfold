@@ -9,3 +9,4 @@ weights/
 /af3t
 *.pdb
 *_confidences.json
+weights-*/

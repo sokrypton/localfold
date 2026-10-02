@@ -164,10 +164,29 @@ Parts joined by `+` share one slot, as AF3 puts each chain's k-th template in sl
 `score.py <pred> <ref> A,D` scores a complex: one superposition over all chains, each chain also
 alone, residues paired by aligning the sequences (a numbering gap in the reference shifts nothing).
 
+## Other AF3-lineage models
+
+`--model=<name>` on `fold` (or `--bundle=` on the exporter, `--oracle-model=<name>` for its own
+oracles) folds the other checkpoints the page offers, through the same dialect flags:
+
+| model | against its own af3-any-model oracles | 6MRR from its sequence | 5CAJ + its crystal |
+|---|---|---|---|
+| OpenBind-0 | trunk_out_pair 5.4e-7, PAE 4.2e-6 | 1.71 A | |
+| protenix2 | trunk_out_pair 1.0e-6, denoise 1.5e-6, PAE 2.4e-7 | 0.453 A | 0.136 A |
+| IntelliFold-2 (int5 bundle) | trunk_out_pair 4.5e-2 (the quantisation; z_after_msa 9.1e-3) | 1.551 A | 0.296 A |
+
+Ported for them: the padded single conditioning, per-block atom pair norm, chained atom
+LayerNorms, split pair conditioning, per-block atom masking, the fused template embedder (passes
+built by the exporter as the page's trunk builds them - empty-slot gap, coverage weights, outer
+residual, rf3's one averaged pass), protenix2's confidence head (raw-distance term, normalised
+single, PDE symmetrised before its projection), head width 64.
+
 ## Not ported yet
 
-The other dialects (OpenDDE, boltz2, protenix2, IntelliFold-2,
-RoseTTAFold3 - each raises a named "not ported" error).
+boltz2 (the atom-only target_feat, the pre-trunk query, its z-init bond-order terms, re-embedding
+confidence head, MSA conventions, transition up-gates and sampler constants), RoseTTAFold3 (the
+transformer's q/k norm and no-residual wiring, its confidence head) and OpenDDE (the structural
+token expansion) - each raises a named "not ported" error.
 
 ## Tried and not taken
 
