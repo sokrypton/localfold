@@ -25,6 +25,13 @@
   "ptm": "0.8205",
   "rmsd": 1.546
  },
+ "af3-dna-5cm": {
+  "ligand": 0.045,
+  "nucleic": 0.04,
+  "plddt": 94.19,
+  "ptm": "0.8159",
+  "rmsd": null
+ },
  "af3-dna-duplex": {
   "nucleic": 0.039,
   "plddt": 93.08,

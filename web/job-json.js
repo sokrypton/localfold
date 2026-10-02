@@ -474,8 +474,8 @@ function readEntry(entry, index, state) {
   const modifications = [];
   for (const modification of body.modifications ?? []) {
     // The open-source dialect names a base modification differently from a
-    // protein one, and this page refuses both on a nucleic chain anyway - so
-    // the field is read either way and entitiesProblem gives the message.
+    // protein one (modificationType / basePosition), so the field is read
+    // either way.
     const code = ptmCode(modification.ptmType ?? modification.modificationType,
                          where);
     const position = Number(modification.ptmPosition ?? modification.basePosition);
@@ -483,9 +483,6 @@ function readEntry(entry, index, state) {
       refuse(`${where}: modification ${code} has no whole-number position`);
     }
     modifications.push({ code, position });
-  }
-  if (NUCLEIC_TYPES.includes(type) && modifications.length > 0) {
-    refuse(`${where}: modified bases are not supported yet`);
   }
   readAlignment(body, where, state);
   const template = type === "protein" ? readTemplates(body, where) : undefined;

@@ -41,7 +41,7 @@
  * create, and each would need its own CCD entries.
  */
 import { conformerFor, aatypeFor } from "./reference-conformers.js";
-import { polymerResidue, ELEMENT_SYMBOLS } from "./ccd-component.js";
+import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
 import { chainIdentity, residueIndexPerChain } from "../../input/chains.js";
@@ -252,6 +252,10 @@ export function featuriseProtein(sequence, options = {}) {
   // them. Absent, every chain is protein, which is what every caller before
   // nucleic acids meant.
   const chainKinds = chains.map((_, index) => options.chainKinds?.[index] ?? "protein");
+  // A modified residue's PARENT restype, through the alphabet of its chain's kind: a modified base
+  // (5CM on a DNA C) is a DC, which the amino-acid table would read as a cysteine
+  const parentAatype = (kind, code) => (kind === "protein"
+    ? aatypeFor(code) : (nucleicAatypeFor(kind, code) ?? UNK_AATYPE));
   const modificationOf = new Map();
   for (const modification of options.modifications ?? []) {
     modificationOf.set(`${modification.chain}:${modification.position}`, modification);
@@ -268,10 +272,13 @@ export function featuriseProtein(sequence, options = {}) {
       // OXT it loses on forming a peptide bond: ten atoms in the middle of a
       // chain and eleven at the C-terminus, which is what AF3 counts. See
       // polymerResidue.
-      const modification = asked === null
-        ? null : polymerResidue(asked, at === chain.length - 1);
+      // (a nucleotide's terminal atom is the 5' OP3, at the chain's first residue)
+      const protein = chainKinds[chainIndex] === "protein";
+      const modification = asked === null ? null
+        : polymerResidue(asked, protein ? at === chain.length - 1 : at === 0, protein ? "OXT" : "OP3");
       residues.push({
-        code: chain[at],
+        // a modified residue's letter is its dictionary parent's (see parseCcdComponent)
+        code: (modification !== null && parentLetter(modification.parent, chainKinds[chainIndex])) || chain[at],
         kind: chainKinds[chainIndex],
         // 🔴 THE TERMINAL RULE IS AT THE OTHER END FOR A NUCLEOTIDE. A protein
         // residue takes its extra atom (OXT) at the chain's LAST residue; a
@@ -476,7 +483,7 @@ export function featuriseProtein(sequence, options = {}) {
                            residue, atoms: modification.atoms,
                            bonds: modification.bonds, oneToken: true });
       aatype[token] = options.atomizedUnknownRestype === true
-        ? UNK_AATYPE : aatypeFor(code);
+        ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
       asymId[token] = asym;
@@ -512,8 +519,9 @@ export function featuriseProtein(sequence, options = {}) {
         return found === undefined ? -1
           : (found.componentSlot ?? modification.atoms.indexOf(found));
       };
-      const betaAt = slotOfName("CB");
-      const alphaAt = slotOfName("CA");
+      // (a nucleotide's representative is C4 for a purine parent, C2 for a pyrimidine, as AF3's)
+      const betaAt = kind === "protein" ? slotOfName("CB") : slotOfName("AG".includes(code) ? "C4" : "C2");
+      const alphaAt = kind === "protein" ? slotOfName("CA") : -1;
       pseudoBetaSlot[token] = betaAt >= 0 ? betaAt : (alphaAt >= 0 ? alphaAt : 0);
       for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
       token += 1;
@@ -534,7 +542,7 @@ export function featuriseProtein(sequence, options = {}) {
       // phosphoserine's tokens, 15 -> 20, and it carries into `profile`, which
       // is a one-hot over the same alphabet.
       aatype[token] = options.atomizedUnknownRestype === true
-        ? UNK_AATYPE : aatypeFor(code);
+        ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
       asymId[token] = asym;
@@ -862,7 +870,7 @@ export function featuriseProtein(sequence, options = {}) {
   if (options.atomizedUnknownRestype === true
       && options.atomizedUnknownMsa !== true) {
     for (const span of modifiedSpans) {
-      const parent = aatypeFor(residues[span.residue].code);
+      const parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
       for (let at = 0; at < span.count; at += 1) queryRow[span.from + at] = parent;
     }
   }

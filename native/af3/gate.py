@@ -54,6 +54,9 @@ def cases():
     out.append(("af3-6mrr-gol-sep3", "af3", [f"--sequence={SEQ_6MRR}", "--ligands=GOL", "--modify=SEP@3"], [],
                 [os.path.join(FIX, "6mrr-crystal.pdb"), "A"], "GOL,SEP"))
     out.append(("af3-dna-duplex", "af3", ["--sequence=GCGATCGATCGC:GCGATCGATCGC", "--kinds=dna,dna"], [], None, "DA,DC,DG,DT"))
+    # modified bases: AlphaFold 3's own methylated-DNA example (5CM at four CpG sites, both strands)
+    out.append(("af3-dna-5cm", "af3", [f"--job={os.path.join(FIX, 'af3-jobs', 'methylated_dna.json')}"], [], None,
+                "DA,DC,DG,DT,5CM"))
     seq = chain_sequence(crystal_5caj, "A")
     a3m = os.path.join(REPO, "oracle-dumps", "5caj-a.a3m")
     if os.path.exists(a3m):     # the MSA stack at depth (512 of its 7907 rows)

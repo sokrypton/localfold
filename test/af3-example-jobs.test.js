@@ -71,8 +71,12 @@ const EXPECTED = {
   // with the bonds read it refuses on the glycan. Five CCD codes in one entry
   // is one bonded chain, which this page does not build.
   "rnaseb_glycosylated.json": { refuses: "ccdCodes lists 5 components" },
-  "methylated_dna.json": { refuses: "modified bases" },
-  "modified_rna.json": { refuses: "modified bases" },
+  // 🔴 MODIFIED BASES LOAD NOW: the featuriser takes a base's parent from its
+  // chain's alphabet and the CCD (AF3's own batch is matched field for field on
+  // both - tools/check-batch-fields.js, dna-5cm and rna-mods).
+  "methylated_dna.json": { loads: ["dna:20x1", "dna:20x1"],
+                           modifications: ["5CM@5", "5CM@9", "5CM@13", "5CM@17"] },
+  "modified_rna.json": { loads: ["rna:25x1"], modifications: ["PSU@13", "5MC@18", "OMG@4"] },
   // 🔴 AND THIS ONE LOADS NOW, WHERE IT USED TO BE A REFUSAL. Biotin arrives
   // as a structure rather than a code and src/chem/ builds it a component; see
   // docs/SMILES.md. It is kept in the corpus precisely because it is the one
@@ -144,8 +148,7 @@ describe("AlphaFold 3's own example jobs", () => {
    * streptavidin/biotin job moved from the refusal list to the loading one and
    * this line went red until somebody said so out loud.
    *
-   * Bonded chemistry and modified bases are the two gaps that remain, at three
-   * and two examples, and that is the argument for which to build next.
+   * A five-component glycan and an inline alignment are the two gaps that remain.
    */
   /**
    * 🔴 AND "LOADS" IS NOT "FOLDS", WHICH THIS FILE CANNOT CHECK AND SHOULD NOT
@@ -158,15 +161,13 @@ describe("AlphaFold 3's own example jobs", () => {
    * protein/DNA complex, none of them tripping the chain-geometry rule. The
    * per-file table is in docs/WEB.md.
    */
-  it("folds ten of the fourteen, and says what the other four want", () => {
+  it("folds twelve of the fourteen, and says what the other two want", () => {
     const loads = Object.values(EXPECTED).filter((one) => one.loads !== undefined);
-    const bases = Object.values(EXPECTED)
-      .filter((one) => one.refuses === "modified bases");
-    // 🔴 TEN, AND IT WAS NINE UNTIL `bondedAtomPairs` LANDED. This count is
-    // asserted so that moving a file between the two lists is a decision
-    // somebody makes out loud - it has caught the prose going stale twice.
-    expect(loads).toHaveLength(10);
-    expect(bases).toHaveLength(2);
+    // 🔴 TWELVE: NINE UNTIL `bondedAtomPairs` LANDED, TEN UNTIL MODIFIED BASES
+    // DID. This count is asserted so that moving a file between the two lists
+    // is a decision somebody makes out loud - it has caught the prose going
+    // stale twice.
+    expect(loads).toHaveLength(12);
     // The remaining two are one each: a five-component glycan in one ligand
     // entry, and an alignment carried inline.
     expect(Object.values(EXPECTED).filter((one) =>

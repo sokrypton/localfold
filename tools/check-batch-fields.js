@@ -104,6 +104,27 @@ const TARGETS = {
       ligands: [ccd("GOL")],
     }),
   },
+  // a modified BASE: 20 nucleotides of DNA with 5-methylcytosine at 5 and 9 - each atomised into 20
+  // tokens with the PARENT's restype (DC, not the cysteine the amino-acid table reads), its OP3 gone
+  // mid-chain. Dumped by dump_af3_batch.py --kind dna --mods 5CM@5,5CM@9 --user-ccd 5CM.cif
+  // (af3-any-model's pip install carries a CCD without any modified base).
+  "dna-5cm": {
+    suffix: "-dna-5cm",
+    extra: () => ({
+      chainKinds: ["dna"],
+      modifications: [{ chain: 0, position: 5, ...ccd("5CM") }, { chain: 0, position: 9, ...ccd("5CM") }],
+    }),
+  },
+  // and RNA's: AlphaFold 3's modified_rna example - 2'-O-methylguanosine, pseudouridine (a C-glycoside,
+  // its base joined by a carbon) and 5-methylcytidine (--kind rna --mods OMG@4,PSU@13,5MC@18)
+  "rna-mods": {
+    suffix: "-rna-mods",
+    extra: () => ({
+      chainKinds: ["rna"],
+      modifications: [{ chain: 0, position: 4, ...ccd("OMG") }, { chain: 0, position: 13, ...ccd("PSU") },
+                      { chain: 0, position: 18, ...ccd("5MC") }],
+    }),
+  },
 };
 
 // theirs -> how to get ours. A gather is three fields and is handled below.

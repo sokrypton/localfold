@@ -64,6 +64,14 @@ def main():
                         help="CCD code of a ligand chain to add, e.g. GOL")
     parser.add_argument("--ptm", default=None,
                         help="modified residue as CODE@POSITION, e.g. SEP@3 (1-based)")
+    # a nucleic chain and its modified bases: `--kind dna --mods 5CM@5,5CM@9`
+    parser.add_argument("--kind", default="protein", choices=["protein", "dna", "rna"])
+    parser.add_argument("--mods", default=None,
+                        help="modified bases or residues as CODE@POSITION[,...] (1-based)")
+    # components the installed dictionary lacks (af3-any-model's pip install carries a minimal one,
+    # without SEP or any modified base), as mmCIF text - what AF3's userCCD field takes
+    parser.add_argument("--user-ccd", default=None, action="append",
+                        help="a component's CCD mmCIF file to add to the dictionary (repeatable)")
     arguments = parser.parse_args()
     for entry in (os.path.join(arguments.reference, "src"), arguments.reference,
                   os.path.join(arguments.reference, "dev", "oracles")):
@@ -71,11 +79,34 @@ def main():
             sys.path.insert(0, entry)
 
     import numpy as np
+    if arguments.user_ccd:
+        import functools
+        from alphafold3.constants import decoded_ccd
+        text = "\n".join(open(path).read() for path in arguments.user_ccd)
+        decoded_ccd.get_ccd = functools.partial(decoded_ccd.get_ccd, user_ccd=text)
     from fold_check import _fold_setup
     from alphafold3.model import feat_batch
 
     chains = None
-    if arguments.ligand is not None or arguments.ptm is not None:
+    if arguments.kind != "protein" or arguments.mods is not None:
+        from alphafold3.common import folding_input
+        mods = []
+        for spec in (arguments.mods or "").split(","):
+            if spec:
+                code, _, position = spec.partition("@")
+                mods.append((code.strip().upper(), int(position)))
+        if arguments.kind == "protein":
+            chain = folding_input.ProteinChain(id="A", sequence=arguments.sequence, ptms=mods,
+                                               unpaired_msa="", paired_msa="", templates=[])
+        elif arguments.kind == "dna":
+            chain = folding_input.DnaChain(id="A", sequence=arguments.sequence, modifications=mods)
+        else:
+            chain = folding_input.RnaChain(id="A", sequence=arguments.sequence, modifications=mods,
+                                           unpaired_msa="")
+        chains = [chain]
+        if arguments.ligand is not None:
+            chains.append(folding_input.Ligand(id="B", ccd_ids=[arguments.ligand.strip().upper()]))
+    elif arguments.ligand is not None or arguments.ptm is not None:
         from alphafold3.common import folding_input
         # `ptms` is a sequence of (CODE, 1-based position) tuples and a ligand
         # is `folding_input.Ligand`, not a "LigandChain" - checked against the
@@ -124,6 +155,10 @@ def main():
         suffix += "-%s" % arguments.ligand.strip().lower()
     if arguments.ptm is not None:
         suffix += "-%s" % arguments.ptm.strip().lower().replace("@", "")
+    if arguments.kind != "protein":
+        suffix += "-" + arguments.kind
+    if arguments.mods is not None:
+        suffix += "-" + arguments.mods.strip().lower().replace("@", "").replace(",", "-")
     out = arguments.out or "/tmp/af3-batch-%s%s.json" % (arguments.model, suffix)
     with open(out, "w") as handle:
         json.dump({"model": arguments.model, "sequence": arguments.sequence,

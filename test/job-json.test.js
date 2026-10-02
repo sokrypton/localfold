@@ -334,8 +334,9 @@ describe("what it refuses, and what it names", () => {
     ["mmcifPath", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
       templates: [{ mmcifPath: "/tmp/t.cif" }] } }])],
     ["not a chain kind", open([{ peptide: { id: "A", sequence: "ACDE" } }])],
-    ["modified bases", open([{ dna: { id: "A", sequence: "ACGTACGT",
-      modifications: [{ modificationType: "6MA", basePosition: 1 }] } }])],
+    // (a modified BASE loads now; a modified amino acid on a base does not)
+    ["modified amino acid", open([{ dna: { id: "A", sequence: "ACGTACGT",
+      modifications: [{ modificationType: "SEP", basePosition: 1 }] } }])],
     ["no `sequences`", JSON.stringify({ name: "j", modelSeeds: [1] })],
     ["not JSON", "ACDEFGHIK"],
   ];

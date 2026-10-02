@@ -130,8 +130,11 @@ export async function smilesComponent(smiles, options = {}) {
   return {
     code,
     atoms,
+    // an aromatic ring's bonds AROMATIC (4) - what a CCD component's pdbx_aromatic_flag gives and
+    // AF3's bond-order feature takes - not their Kekule 1s and 2s, so a SMILES ligand and its
+    // dictionary twin hand the model the same bond orders
     bonds: graph.bonds.map((bond) => ({
-      from: bond.from, to: bond.to, order: Math.round(bond.order),
+      from: bond.from, to: bond.to, order: bond.aromatic ? 4 : Math.round(bond.order),
     })),
     smiles,
     conformerError: best.error,
