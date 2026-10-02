@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -36,6 +37,7 @@ struct Entry { char kind; size_t offset, length; double value; int seg; };
 struct Segment { const float* data; size_t bytes; float* device; };
 struct Model {
   std::map<std::string, Entry> index;
+  mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
   std::vector<Segment> segs;
   void load(const std::string& dir) {
     std::ifstream idx(dir + "/model.idx");
@@ -62,6 +64,7 @@ struct Model {
   // the device copy of an entry: one allocation and one copy per file
   const float* dev(const std::string& k) {
     const Entry& e = at(k);
+    touched.insert(k);
     Segment& s = segs[e.seg];
     if (!s.device) {
       if (cudaMalloc(&s.device, std::max<size_t>(s.bytes, 4)) != cudaSuccess ||
@@ -80,11 +83,29 @@ struct Model {
   double meta(const std::string& k) const { return at(k).value; }
   double meta(const std::string& k, double fallback) const { return has(k) ? at(k).value : fallback; }
   bool flag(const std::string& k) const { return has(k) && at(k).value != 0; }
-  const float* f(const std::string& k) const { const Entry& e = at(k); return segs[e.seg].data + e.offset; }
+  const float* f(const std::string& k) const { const Entry& e = at(k); touched.insert(k); return segs[e.seg].data + e.offset; }
   const int* i(const std::string& k) const { return (const int*)f(k); }
   size_t len(const std::string& k) const { return at(k).length; }
 };
 inline Model M;
+// The weight tensors a fold never read, digits collapsed: a convention the checkpoint carries and
+// this port does not apply shows up here instead of as a quietly wrong structure (rf3's atom q/k
+// norms were found this way, after the fact).
+inline void unreadWeights() {
+  std::map<std::string, int> families;
+  for (auto& [name, e] : M.index) {
+    if (e.kind == 'm' || M.touched.count(name)) continue;
+    if (name.rfind("trunk.", 0) && name.rfind("diffusion.", 0) && name.rfind("confidence.", 0) &&
+        name.rfind("targetFeat.", 0) && name.rfind("atomReference.", 0)) continue;
+    std::string f; bool digit = false;
+    for (char c : name) { if (isdigit((unsigned char)c)) { if (!digit) f += 'N'; digit = true; } else { f += c; digit = false; } }
+    ++families[f];
+  }
+  if (families.empty()) return;
+  printf("weights never read (%zu families):", families.size());
+  for (auto& [f, k] : families) printf(" %s(%d)", f.c_str(), k);
+  printf("\n");
+}
 
 // ---------------------------------------------------------------- device memory
 inline float* dalloc(size_t n) { float* p; CK(cudaMalloc(&p, std::max<size_t>(n, 1) * 4)); return p; }

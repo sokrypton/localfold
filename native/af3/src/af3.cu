@@ -224,6 +224,7 @@ int main(int argc, char** argv) {
     printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d), confidence %.1f ms, total %.1f ms\n",
            fi + 1, ms(f0, f1), recycles + 1, diffMs, steps, samples, confMs, ms(f0, f3));
     if (profiling) prof::stop(40);
+    if (fi == 0) unreadWeights();
     if (fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {

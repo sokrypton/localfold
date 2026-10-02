@@ -734,6 +734,63 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   o.noResidual = M.flag(E + ".blocks.0.diffusionNoResidual");
   return o;
 }
+// rf3's chirality signal: per atom, d/dx of sum over its centres of (improper dihedral - ideal)^2,
+// a central difference in double over each of the atom's (centre, corner) entries - an inverted
+// index built once, so each atom sums its own terms (deterministic, no atomics). Transcribed from
+// src/af3/diffusion/chiral-gradient.js.
+__device__ double improperDihedral(const double* a, const double* b, const double* c, const double* d) {
+  const double eps = 1e-6;
+  double b0[3], b1[3], b2[3];
+  for (int k = 0; k < 3; ++k) { b0[k] = a[k] - b[k]; b1[k] = c[k] - b[k]; b2[k] = d[k] - c[k]; }
+  double length = sqrt(b1[0] * b1[0] + b1[1] * b1[1] + b1[2] * b1[2]) + eps;
+  double n[3] = {b1[0] / length, b1[1] / length, b1[2] / length};
+  double pb0 = b0[0] * n[0] + b0[1] * n[1] + b0[2] * n[2], pb2 = b2[0] * n[0] + b2[1] * n[1] + b2[2] * n[2];
+  double v[3], w[3];
+  for (int k = 0; k < 3; ++k) { v[k] = b0[k] - pb0 * n[k]; w[k] = b2[k] - pb2 * n[k]; }
+  double cr[3] = {n[1] * v[2] - n[2] * v[1], n[2] * v[0] - n[0] * v[2], n[0] * v[1] - n[1] * v[0]};
+  return atan2(cr[0] * w[0] + cr[1] * w[1] + cr[2] * w[2] + eps, v[0] * w[0] + v[1] * w[1] + v[2] * w[2] + eps);
+}
+__global__ void chiralGradK(const float* positions, const int* centers, const float* angles, const int* offsets,
+                            const int* entries, float* grads, size_t atoms, int ns) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= atoms * ns) return;
+  size_t k = t / atoms, atom = t % atoms;
+  const float* x = positions + k * atoms * 3;
+  double g[3] = {0, 0, 0};
+  const double step = 1e-4;
+  for (int e = offsets[atom]; e < offsets[atom + 1]; ++e) {
+    int centre = entries[e] >> 2, corner = entries[e] & 3;
+    double ideal = angles[centre];
+    if (ideal == 0) continue;
+    double p[4][3];
+    for (int q = 0; q < 4; ++q) for (int a = 0; a < 3; ++a) p[q][a] = x[(size_t)centers[centre * 4 + q] * 3 + a];
+    for (int a = 0; a < 3; ++a) {
+      double keep = p[corner][a];
+      p[corner][a] = keep + step; double up = improperDihedral(p[0], p[1], p[2], p[3]) - ideal;
+      p[corner][a] = keep - step; double down = improperDihedral(p[0], p[1], p[2], p[3]) - ideal;
+      p[corner][a] = keep;
+      double derivative = (up * up - down * down) / (2 * step);
+      if (isfinite(derivative)) g[a] += derivative;
+    }
+  }
+  for (int a = 0; a < 3; ++a) grads[t * 3 + a] = (float)g[a];
+}
+struct Chirality { int *centers, *offsets, *entries; float* angles; size_t atoms; };
+inline const Chirality& chirality(size_t atoms) {           // the inverted index, once per input
+  static Chirality c{};
+  if (!c.centers) {
+    int count = (int)M.meta("chiral.count");
+    const int* centers = M.i("chiral.centers");
+    std::vector<int> offsets(atoms + 1, 0), entries((size_t)count * 4);
+    for (int i = 0; i < count * 4; ++i) offsets[centers[i] + 1]++;
+    for (size_t a = 0; a < atoms; ++a) offsets[a + 1] += offsets[a];
+    std::vector<int> fill(offsets.begin(), offsets.end() - 1);
+    for (int i = 0; i < count * 4; ++i) entries[fill[centers[i]]++] = i;   // (centre << 2) | corner
+    c = { const_cast<int*>(Idev("chiral.centers")), upload(offsets.data(), offsets.size()), upload(entries.data(), entries.size()),
+          const_cast<float*>(Fdev("chiral.angles")), atoms };
+  }
+  return c;
+}
 // The encoder's per-step part: the activation from (scaled) positions, the blocks, the
 // per-token aggregation. Fills o.skip and o.tokenAct.
 inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions) {
@@ -750,6 +807,17 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
     convert(t2q, atomPositions, gp, 3, atoms, NS);
     float* positional = scratch<float>("enc.positional", qRows * C);
     linear<float, float>(gp, positional, qRows, 3, C, E + ".atomPositionsToFeatures");
+    if (hasW(E + ".atomChiralToFeatures")) {
+      // rf3's chirality term: the gradient's projection added beside the positions'
+      if (!M.has("chiral.centers")) { fprintf(stderr, "this bundle reads chirality centres the input lacks: export it again\n"); exit(1); }
+      const Chirality& ch = chirality(atoms);
+      float* grads = scratch<float>("enc.chiralGrads", atoms * NS * 3);
+      chiralGradK<<<blocks(atoms * NS), 128, 0, STREAM>>>(atomPositions, ch.centers, ch.angles, ch.offsets, ch.entries,
+                                                         grads, atoms, NS);
+      float* gc = scratch<float>("enc.gc", qRows * 3);
+      convert(t2q, grads, gc, 3, atoms, NS);
+      linear<float, float>(gc, positional, qRows, 3, C, E + ".atomChiralToFeatures", false, 1.f);
+    }
     scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(positional, o.qMask, qRows, C, q1);
     addK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, positional, qRows * C);
   }

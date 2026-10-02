@@ -241,6 +241,15 @@ if (templateSpecs.length > 0) {
                                                { coverage: coverageOf(slot, batch.tokens), spanChains }) });
   });
 }
+// rf3's chirality term reads the stereocentres - four dense atom slots and an ideal improper
+// dihedral each - as the page's fold does (src/af3/fold.js)
+if (dialect.chiralCentres === true) {
+  const { chiralCentres } = await import(`${repo}/src/af3/featurise/template-features.js`);
+  const chirals = chiralCentres(batch.aatype, batch.predDenseAtomMask, batch.tokens, batch.dense);
+  add("chiral.centers", Int32Array.from(chirals.centers));
+  add("chiral.angles", Float32Array.from(chirals.angles));
+  add("chiral.count", chirals.count);
+}
 // The template embedder's PASSES, built as the page's trunk builds them (template-webgpu.js): each
 // a repeat weight and either - the fused embedder (protenix2, boltz2, rf3) - its feature columns,
 // or - the nine-projection one - an aatype and, for a real template, its geometry. Empty slots
