@@ -144,13 +144,26 @@ export function mapToQuery(structure, query) {
   return { map, sequence: query, identical: false };
 }
 
-// [queryIndex, templateIndex] pairs from 0, the template's counted over its chain's residues in file
-// order; an index past either end is the job's mistake and is refused, not dropped
+// [queryIndex, templateIndex] pairs from 0. 🔴 A TEMPLATE INDEX COUNTS THE CHAIN'S FULL SEQUENCE, as AF3
+// reads it - its label_seq_id less one, unresolved residues included - not the residues the file has
+// coordinates for: a template with a disordered loop would otherwise pair every residue after it with
+// the wrong one. A residue the index names but the file does not resolve has nothing to give and is
+// left out; a file with no label_seq_id (a PDB) counts its residues in order. An index past either end
+// is the job's mistake and is refused.
 function explicitMap(mapping, structure, query) {
+  const byLabel = new Map();
+  structure.residues.forEach((residue, at) => {
+    if (Number.isInteger(residue.labelSeq)) byLabel.set(residue.labelSeq - 1, at);
+  });
+  const labelled = byLabel.size > 0;
   const map = new Map();
   for (const [queryIndex, templateIndex] of mapping) {
     if (query !== "" && queryIndex >= query.length) {
       throw new Error(`template mapping: query index ${queryIndex} is past the ${query.length}-residue chain`);
+    }
+    if (labelled) {
+      if (byLabel.has(templateIndex)) map.set(queryIndex, byLabel.get(templateIndex));
+      continue;
     }
     if (templateIndex >= structure.residues.length) {
       throw new Error(`template mapping: template index ${templateIndex} is past its`
@@ -269,6 +282,7 @@ export function residuesFromCif(text, chain) {
     if (!byNumber.has(number)) {
       const residue = {
         number,
+        labelSeq: atom.labelSeq,
         code: ONE_LETTER[atom.resName] ?? (atom.resName === "MSE" ? "M" : "X"),
         atoms: new Map(),
         // An experimental structure states no per-residue confidence, and a
