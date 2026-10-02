@@ -367,12 +367,14 @@ __global__ void __launch_bounds__(64) atomAttentionMMA(const half* qg, const flo
   __shared__ __align__(16) half Vs[KEYS * LD];
   int s = blockIdx.x, h = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const int Wd = heads * D, W2 = 2 * Wd;
+  // every load issued before anything waits (a block is two warps and few blocks run: each round
+  // trip was exposed): K and V asynchronously, then Q, the gates, and S's starting value - the pair
+  // logits and the mask - while they land
   for (int t = threadIdx.x; t < KEYS * (D / 8) * 2; t += 64) {
     int which = t / (KEYS * (D / 8)), u = t % (KEYS * (D / 8)), key = u / (D / 8), c = (u % (D / 8)) * 8;
-    const half* src = kv + ((size_t)s * KEYS + key) * W2 + which * Wd + h * D + c;
-    *reinterpret_cast<uint4*>((which ? Vs : Ks) + key * LD + c) = *reinterpret_cast<const uint4*>(src);
+    cpAsync16((which ? Vs : Ks) + key * LD + c, kv + ((size_t)s * KEYS + key) * W2 + which * Wd + h * D + c, true);
   }
-  __syncthreads();
+  asm volatile("cp.async.commit_group;");
   int q0 = warp * 16, r0 = q0 + g, r1 = r0 + 8;
   size_t i0 = (size_t)s * queries + r0, i1 = (size_t)s * queries + r1;
   float qs = scale * LOG2E;
@@ -385,19 +387,17 @@ __global__ void __launch_bounds__(64) atomAttentionMMA(const half* qg, const flo
     int e = ks * 16 + tig * 2;
     qa[ks][0] = q2(i0, e); qa[ks][1] = q2(i1, e); qa[ks][2] = q2(i0, e + 8); qa[ks][3] = q2(i1, e + 8);
   }
-  float sv[KEYS / 8][4];
-  for (int nt = 0; nt < KEYS / 8; ++nt) {
-    uint32_t kb[4];
-    ldsm4(kb, Ks + (nt * 8 + (lane & 7)) * LD + (lane >> 3) * 8);
-    sv[nt][0] = sv[nt][1] = sv[nt][2] = sv[nt][3] = 0.f;
-    mma16816(sv[nt], qa[0], kb[0], kb[1]);
-    mma16816(sv[nt], qa[1], kb[2], kb[3]);
+  half2 ga[D / 8], gb[D / 8];
+  for (int et = 0; et < D / 8; ++et) {
+    int e = et * 8 + tig * 2;
+    ga[et] = *reinterpret_cast<const half2*>(qg + i0 * W2 + Wd + h * D + e);
+    gb[et] = *reinterpret_cast<const half2*>(qg + i1 * W2 + Wd + h * D + e);
   }
   int ss = s % subsets;                     // the subset within its sample: masks and logits are shared
   const float* pl0 = pairLogits + (((size_t)ss * heads + h) * queries + r0) * KEYS;
   const float* pl1 = pairLogits + (((size_t)ss * heads + h) * queries + r1) * KEYS;
   float qm0 = qMask[(size_t)ss * queries + r0], qm1 = qMask[(size_t)ss * queries + r1];
-  float m0 = -INFINITY, m1 = -INFINITY;
+  float sv[KEYS / 8][4];
   for (int nt = 0; nt < KEYS / 8; ++nt) {
     int key = nt * 8 + tig * 2;
     float2 b0 = *reinterpret_cast<const float2*>(pl0 + key), b1 = *reinterpret_cast<const float2*>(pl1 + key);
@@ -405,8 +405,17 @@ __global__ void __launch_bounds__(64) atomAttentionMMA(const half* qg, const flo
     auto mb = [&](float qm, float km) {
       return keyMasked ? -1e9f * ((1.f - qm) + (1.f - km)) : 1e9f * (qm - 1.f) * (km - 1.f);
     };
-    sv[nt][0] += (b0.x + mb(qm0, km0)) * LOG2E; sv[nt][1] += (b0.y + mb(qm0, km1)) * LOG2E;
-    sv[nt][2] += (b1.x + mb(qm1, km0)) * LOG2E; sv[nt][3] += (b1.y + mb(qm1, km1)) * LOG2E;
+    sv[nt][0] = (b0.x + mb(qm0, km0)) * LOG2E; sv[nt][1] = (b0.y + mb(qm0, km1)) * LOG2E;
+    sv[nt][2] = (b1.x + mb(qm1, km0)) * LOG2E; sv[nt][3] = (b1.y + mb(qm1, km1)) * LOG2E;
+  }
+  asm volatile("cp.async.wait_group 0;");
+  __syncthreads();
+  float m0 = -INFINITY, m1 = -INFINITY;
+  for (int nt = 0; nt < KEYS / 8; ++nt) {
+    uint32_t kb[4];
+    ldsm4(kb, Ks + (nt * 8 + (lane & 7)) * LD + (lane >> 3) * 8);
+    mma16816(sv[nt], qa[0], kb[0], kb[1]);
+    mma16816(sv[nt], qa[1], kb[2], kb[3]);
     m0 = fmaxf(m0, fmaxf(sv[nt][0], sv[nt][1])); m1 = fmaxf(m1, fmaxf(sv[nt][2], sv[nt][3]));
   }
   m0 = fmaxf(m0, __shfl_xor_sync(~0u, m0, 1)); m0 = fmaxf(m0, __shfl_xor_sync(~0u, m0, 2));
@@ -432,12 +441,9 @@ __global__ void __launch_bounds__(64) atomAttentionMMA(const half* qg, const flo
   }
   for (int et = 0; et < D / 8; ++et) {
     int e = et * 8 + tig * 2;
-    const half* g0 = qg + i0 * W2 + Wd + h * D + e; const half* g1 = qg + i1 * W2 + Wd + h * D + e;
-    half* o0 = out + i0 * Wd + h * D + e; half* o1 = out + i1 * Wd + h * D + e;
-    o0[0] = __float2half(o[et][0] / l0 * sigm(__half2float(g0[0])));
-    o0[1] = __float2half(o[et][1] / l0 * sigm(__half2float(g0[1])));
-    o1[0] = __float2half(o[et][2] / l1 * sigm(__half2float(g1[0])));
-    o1[1] = __float2half(o[et][3] / l1 * sigm(__half2float(g1[1])));
+    float2 fa = __half22float2(ga[et]), fb = __half22float2(gb[et]);
+    *reinterpret_cast<half2*>(out + i0 * Wd + h * D + e) = __floats2half2_rn(o[et][0] / l0 * sigm(fa.x), o[et][1] / l0 * sigm(fa.y));
+    *reinterpret_cast<half2*>(out + i1 * Wd + h * D + e) = __floats2half2_rn(o[et][2] / l1 * sigm(fb.x), o[et][3] / l1 * sigm(fb.y));
   }
 }
 
