@@ -265,15 +265,16 @@ const verbose = args.includes("--verbose");
 // nobody has watched fail is a gate that may be comparing nothing. See the
 // bottom of this file for the run that proves it.
 const falsify = (args.find((a) => a.startsWith("--falsify=")) ?? "").slice(10);
-// the kitchen sink's inputs, built once (a SMILES conformer is async)
-const KITCHEN = await (async () => {
+// a job file's inputs as the page and the native exporter read it (a SMILES conformer is async)
+async function jobInputs(file) {
   const { jobFromJson } = await import("../web/job-json.js");
   const { expandEntities } = await import("../web/entities.js");
   const { mergeJobAlignments } = await import("../src/input/chains.js");
   const { smilesComponent } = await import("../src/chem/component.js");
-  const job = jobFromJson(fixture("af3-jobs/alphafold_input.json"));
+  const job = jobFromJson(fixture(file));
   const request = expandEntities(job.entities);
-  const merged = mergeJobAlignments(job.alignments, request.chains, request.chainKinds);
+  const merged = job.alignments === undefined ? null
+    : mergeJobAlignments(job.alignments, request.chains, request.chainKinds);
   const ligands = [];
   const smilesCodes = request.ligandCodes.filter((entry) => entry?.smiles !== undefined)
     .map((entry) => entry.code ?? "LIG");
@@ -284,14 +285,27 @@ const KITCHEN = await (async () => {
   }
   return {
     smilesCodes,
-    alignment: merged.alignment,
+    alignment: merged?.alignment ?? null,
     options: {
-      chainKinds: request.chainKinds, msaColumnKinds: merged.msaColumnKinds, ligands,
+      chainKinds: request.chainKinds, ligands,
+      ...(merged === null ? {} : { msaColumnKinds: merged.msaColumnKinds }),
       modifications: request.modifications.map((m) => ({ chain: m.chain, position: m.position, ...ccd(m.code) })),
       ...(request.bonds === undefined ? {} : { bonds: request.bonds }),
     },
   };
-})();
+}
+const KITCHEN = await jobInputs("af3-jobs/alphafold_input.json");
+// ...and every other AlphaFold 3 example job, each against AF3's own featurisation of the file
+// (dump_af3_batch.py --job ... --out oracle-dumps/af3-batch-alphafold3-6mrr-job-<name>.json):
+// their chain ids already sort in this port's order, so no relabelling
+const JOB_NAMES = ["barnase_barstar", "calmodulin_4calcium", "erk2_phosphorylated", "kras_g12c_sotorasib",
+  "methylated_dna", "modified_rna", "rnaseb_glycosylated", "streptavidin_biotin_smiles", "tetr_dimer_dna",
+  "tetr_dimer_tetracycline", "tetr_homodimer", "u1a_rna_hairpin", "ubiquitin_monomer"];
+for (const name of JOB_NAMES) {
+  const inputs = await jobInputs(`af3-jobs/${name}.json`);
+  TARGETS[`job:${name}`] = { suffix: `-job-${name}`, alignment: () => inputs.alignment,
+                             extra: () => inputs.options, smilesCodes: () => inputs.smilesCodes };
+}
 const onlyTarget = (args.find((a) => a.startsWith("--target=")) ?? "").slice(9);
 
 /** The dump for one (model, target), or null when it has not been generated. */

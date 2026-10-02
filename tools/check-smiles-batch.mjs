@@ -46,8 +46,9 @@ const SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYT
 const CASES = [
   { code: "GOL", smiles: "C(O)C(O)CO" },                      // C1 O1 C2 O2 C3 O3
   { code: "EDO", smiles: "C(O)CO" },                          // C1 O1 C2 O2
-  { code: "URE", smiles: "C(=O)(N)N" },                       // C O N1 N2
-  // ...and two whose dictionary names this port cannot reproduce.
+  // ...and three whose dictionary names a SMILES does not reproduce - URE's lone C and O are
+  // C1 and O1 by AlphaFold 3's rule for a molecule with no names (every atom numbered)
+  { code: "URE", smiles: "C(=O)(N)N", namesDiffer: true },    // C O N1 N2
   { code: "ACE", smiles: "C(=O)C", namesDiffer: true },       // C O CH3
   { code: "BEN", smiles: "c1(ccccc1)C(=N)N", namesDiffer: true },  // C1..C6 C N1 N2
 ];
@@ -55,9 +56,11 @@ const CASES = [
 /**
  * 🔴 AN ATOM NAME IS A MODEL INPUT AND A SMILES HAS NO RIGHT ANSWER FOR IT.
  * `refAtomNameChars` carries the atom's name into the features, and this port
- * names a built component element-plus-counter - C1, C2, O1 - which is the
- * dictionary's own convention for many entries and not for all of them: ACE
- * calls its methyl `CH3` and BEN calls its seventh carbon plain `C`. For a
+ * names a built component element-plus-counter - C1, C2, O1, every atom
+ * numbered, which is AlphaFold 3's own rule for a SMILES ligand
+ * (assign_atom_names_from_graph) - and the dictionary's convention for many
+ * entries and not for all of them: ACE calls its methyl `CH3`, BEN its seventh
+ * carbon plain `C`, URE its lone carbon and oxygen `C` and `O`. For a
  * ligand that has no CCD entry, which is the whole point of the SMILES path,
  * there is no dictionary name to match and any consistent scheme is as good as
  * another. For one that DOES have an entry, folding it by code rather than by

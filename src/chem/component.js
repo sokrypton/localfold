@@ -169,20 +169,19 @@ const round = (value) => Math.round(value * 1000) / 1000;
  * `component.js`'s caller rather than silently renamed.
  */
 function nameAtoms(atoms, graph) {
+  // AlphaFold 3's own rule for a molecule with no dictionary names
+  // (rdkit_utils.assign_atom_names_from_graph): the element in upper case and its
+  // count so far - C1, C2, ..., CL1 - every atom numbered, a lone sulfur S1 and
+  // not S. The names are a model input (ref_atom_name_chars), so the dictionary's
+  // habit of leaving a lone atom unnumbered read one character apart on AF3's
+  // streptavidin/biotin job.
   const counts = new Map();
   atoms.forEach((atom, index) => {
-    const symbol = ELEMENT_SYMBOLS[graph.atoms[index].element - 1] ?? "X";
+    const symbol = (ELEMENT_SYMBOLS[graph.atoms[index].element - 1] ?? "X").toUpperCase();
     const next = (counts.get(symbol) ?? 0) + 1;
     counts.set(symbol, next);
-    // A component with ONE carbon calls it C, not C1, which is what the
-    // dictionary does for a monatomic ion and for a lone substituent.
     atom.name = `${symbol}${next}`;
   });
-  for (const [symbol, total] of counts) {
-    if (total !== 1) continue;
-    const only = atoms.find((atom) => atom.name === `${symbol}1`);
-    if (only !== undefined) only.name = symbol;
-  }
 }
 
 /**
