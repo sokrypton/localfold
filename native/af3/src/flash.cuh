@@ -454,7 +454,10 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // too few blocks to fill the device: split each 16 queries' keys over four warps instead.
   // Measured at 16 heads, D 48: 9.3 against 14.7 us at 68 tokens, 13.4/19.5 at 192, and worse
   // from 256 (22.8/21.5), where the merge outweighs the parallelism.
-  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && n <= 192 && rows * heads * ((n + 63) / 64) < 4 * 108) {
+  // ...and ONE row only: with the samples as rows (--samples=5) the grid kernel has the blocks it
+  // lacked, and the split loses at every size measured - 11.1 against 8.2 us at 68 tokens and five
+  // rows, 27.0 against 13.4 at 150, 15.7 against 8.8 at 192 and two rows (a tie at 68 and two)
+  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && rows == 1 && n <= 192 && heads * ((n + 63) / 64) < 4 * 108) {
     flashSplitHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     return;
   }
