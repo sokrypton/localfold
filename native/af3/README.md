@@ -176,6 +176,7 @@ oracles) folds the other checkpoints the page offers, through the same dialect f
 | IntelliFold-2 (int5 bundle) | trunk_out_pair 4.5e-2 (the quantisation; z_after_msa 9.1e-3) | 1.551 A | 0.296 A |
 | RoseTTAFold3 (int5 bundle) | trunk_out_pair 4.85e-2 (WebGPU on the same bundle 4.90e-2) | 1.621 A, bonds 0.050 A | |
 | boltz2 | trunk_out_pair 4.5e-7, PAE 4.5e-7; denoise 2.5e-2 (see below) | 0.466 A on its reference batch (WebGPU 0.507); 2.96 A single-sequence (WebGPU 4.56) | 0.347 A |
+| OpenDDE | trunk_out_pair 9.6e-7, expander 5.2e-9, refiner 1.8e-7, denoise 1.1e-6, PAE 1.8e-6 | 0.485 A on its reference batch (0.679 at the page's 16 steps) | 0.127 A |
 
 Ported for them: the padded single conditioning, per-block atom pair norm, chained atom
 LayerNorms, split pair conditioning, per-block atom masking, the fused template embedder (passes
@@ -188,7 +189,11 @@ features, biased outer-product projections, the chirality gradient term, and its
 its 384-wide target_feat (the atom encoder plus six summed projections), the bond-order and
 contact-conditioning z-init terms, the MSA update before the outer product and the pre-MSA pair
 added back, the re-embedding confidence head with split intra/inter-chain heads and no head
-LayerNorms, and its own EDM constants.
+LayerNorms, and its own EDM constants; for OpenDDE its second token space - the expander (49
+role-pair projections, one GEMM per matrix over the pairs sorted by it), the four-block refiner
+with the expander's bias on every single-attention head, the diffusion on the structural batch
+(the exporter writes it as `sbatch.*` and `af3` swaps it in for `batch.*` after the trunk), and
+its own confidence head, mapped back onto residues through the layout's gathers.
 
 boltz2's denoise reads 2.5e-2 because its token transformer amplifies its input ~2.2e4x: the seams
 before it are 1.2e-6 (`transformer.act`), and the transformer fed the oracle's own input reads
@@ -198,11 +203,6 @@ whenever a stage oracle (`oracle-dumps/af3-oracle-stages-<model>.json`) was expo
 After a first fold `af3` lists every weight family it never read; for these models the list is
 only what should be there (heads not computed, alternative per-block forms, absent bonds and
 template geometry) - rf3's atom-block q/k norms and chirality term were found by it.
-
-## Not ported yet
-
-OpenDDE (the structural token expansion, its refiner and its own confidence head) - it raises a
-named "not ported" error.
 
 ## Tried and not taken
 
