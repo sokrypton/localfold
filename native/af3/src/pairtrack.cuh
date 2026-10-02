@@ -158,17 +158,40 @@ __global__ void centerNormK(const float* prod, TO* out, size_t r0, size_t rows, 
 }
 
 inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
+#include "fusedtriangle.cuh"
 
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
               bool divideByLength) {
   size_t pairs = (size_t)n * n;
-  T* norm = scratch<T>("tri.norm", pairs * C);
-  T* a = scratch<T>("tri.a", pairs * C);
-  T* b = scratch<T>("tri.b", pairs * C);
+  // the channel-major arrays' channel stride, padded to 8 elements so a channel's start is
+  // 16-byte aligned whatever n is (261^2 is odd)
+  size_t cs = (pairs + 7) / 8 * 8;
+  T* a = scratch<T>("tri.a", cs * C);
+  T* b = scratch<T>("tri.b", cs * C);
   // f32: in f16 the contraction (a sum over n of products) overflows - 5CAJ's went to inf
-  float* prod = scratch<float>("tri.prod", pairs * C);
+  float* prod = scratch<float>("tri.prod", cs * C);
   std::string pg = projectionGate(pre, C);
+  float alpha = divideByLength ? 1.f / n : 1.f, zero = 0.f;
+  auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  auto contract = [&]() {         // one n x n GEMM per channel: outgoing P = A B^T, incoming P = B^T A
+    if (outgoing)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &alpha, b, cudaType<T>(), n,
+        cs, a, cudaType<T>(), n, cs, &zero, prod, CUDA_R_32F, n, cs, C, CUBLAS_COMPUTE_32F, algo));
+    else
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, n, n, n, &alpha, a, cudaType<T>(), n,
+        cs, b, cudaType<T>(), n, cs, &zero, prod, CUDA_R_32F, n, cs, C, CUBLAS_COMPUTE_32F, algo));
+  };
+  if constexpr (std::is_same_v<T, half>) {
+    if (FUSED_TRIANGLE && C == 128) {           // three kernels: see fusedtriangle.cuh
+      half* t2 = scratch<half>("tri.t2whole", pairs * C);
+      triIn128(pair, mask, pre, pg, a, b, t2, pairs, cs);
+      contract();
+      triOut128(prod, pre, t2, pair, pairs, cs);
+      return;
+    }
+  }
+  T* norm = scratch<T>("tri.norm", pairs * C);
   size_t rowsPer = std::max<size_t>(1, CHUNK / (4 * C));
   T* pgOut = scratch<T>("tri.pg", rowsPer * 4 * C);
   for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
@@ -177,17 +200,9 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
                          pre + ".leftNormInputOffset");
     linear<T, T>(norm + r0 * C, pgOut, rows, C, 4 * C, pg);
     triGateK<T><<<dim3((unsigned)((rows + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(
-      pgOut, mask, a, b, r0, rows, C, pairs);
+      pgOut, mask, a, b, r0, rows, C, cs);
   }
-  // one n x n GEMM per channel: outgoing P = A B^T, incoming P = B^T A
-  float alpha = divideByLength ? 1.f / n : 1.f, zero = 0.f;
-  auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-  if (outgoing)
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &alpha, b, cudaType<T>(), n,
-      pairs, a, cudaType<T>(), n, pairs, &zero, prod, CUDA_R_32F, n, pairs, C, CUBLAS_COMPUTE_32F, algo));
-  else
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, n, n, n, &alpha, a, cudaType<T>(), n,
-      pairs, b, cudaType<T>(), n, pairs, &zero, prod, CUDA_R_32F, n, pairs, C, CUBLAS_COMPUTE_32F, algo));
+  contract();
   rowsPer = std::max<size_t>(1, CHUNK / C);
   T* centred = scratch<T>("tri.centred", std::min(rowsPer, pairs) * C);
   T* t1 = scratch<T>("tri.t1", std::min(rowsPer, pairs) * C);
@@ -195,7 +210,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
     size_t rows = std::min(rowsPer, pairs - r0);
     centerNormK<T><<<(unsigned)((rows + 31) / 32), dim3(32, 8), C * 33 * 4, STREAM>>>(prod, centred, r0,
-      rows, C, pairs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
+      rows, C, cs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
     linear<T, T>(centred, t1, rows, C, C, pre + ".outputProjection");
     linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
     gatedAddK<T><<<blocks(rows * C), 256, 0, STREAM>>>(pair + r0 * C, t1, t2, rows * C);
