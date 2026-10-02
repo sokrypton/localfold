@@ -6,13 +6,24 @@
 // ---------------------------------------------------------------- cuBLASLt, row-major
 // Y[rows, out] (f32 or f16) = X[rows, in] (f16) W[in, out] (f16) (+ bias[out] f32) (ReLU) (+ beta Y)
 inline cublasLtHandle_t LT = nullptr;
+// weights re-laid for --fast (one set a block) live for the process: carved out of 64 MiB chunks rather
+// than a cudaMalloc each - hundreds of them, each a host round trip, were most of a first pass's warm-up
+template <class T> T* wpool(size_t n) {
+  static char* chunk = nullptr; static size_t used = 0, have = 0;
+  size_t bytes = (n * sizeof(T) + 255) / 256 * 256;
+  if (used + bytes > have) {
+    have = std::max<size_t>(bytes, (size_t)64 << 20);
+    CK(cudaMalloc(&chunk, have)); used = 0;
+  }
+  T* p = (T*)(chunk + used); used += bytes; return p;
+}
 struct LtPlan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; bool ok; };
 inline const void* biasFor(const float* bias, int n, bool asHalf) {
   if (!bias || !asHalf) return bias;
   static std::map<const float*, half*> copies;
   auto it = copies.find(bias);
   if (it != copies.end()) return it->second;
-  half* h = dallocT<half>(n);
+  half* h = wpool<half>(n);
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(bias, h, n);
   return copies[bias] = h;
 }
@@ -112,12 +123,12 @@ inline AttnW attnWeights(const std::string& A, int blk, int C) {
   int H = (int)dimW(A + "/query_w", blk < 0 ? 1 : 2), D = (int)dimW(A + "/query_w", blk < 0 ? 2 : 3);
   int Dp = D < 16 ? 16 : D;
   AttnW w{}; w.H = H; w.D = D; w.Dp = Dp;
-  half* qk = dallocT<half>((size_t)C * 4 * H * Dp);
+  half* qk = wpool<half>((size_t)C * 4 * H * Dp);
   packQkvgWeightK<<<blocks((size_t)C * 4 * H * Dp), 256, 0, STREAM>>>(P(A + "/query_w", blk), P(A + "/key_w", blk),
     P(A + "/value_w", blk), P(A + "/gating_w", blk), qk, C, H, D, Dp);
-  float* gb = dalloc(4 * H * Dp);
+  float* gb = wpool<float>(4 * H * Dp);
   packGateBiasK<<<blocks(4 * H * Dp), 256, 0, STREAM>>>(P(A + "/gating_b", blk), gb, H, D, Dp);
-  half* ow = dallocT<half>((size_t)H * Dp * C);
+  half* ow = wpool<half>((size_t)H * Dp * C);
   packOutputWeightK<<<blocks((size_t)H * Dp * C), 256, 0, STREAM>>>(P(A + "/output_w", blk), ow, C, H, D, Dp);
   w.qkvg = qk; w.qkvgBias = gb; w.out = ow;
   return cache[{A, blk}] = w;
@@ -139,8 +150,51 @@ __global__ void layerNormTK(const float* x, TO* y, size_t rows, int C, const flo
   float inv = rsqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) y[row * C + c] = (TO)((xr[c] - mean) * inv * scale[c] + offset[c]);
 }
+// the same at a width known at compile time: the row read once into registers, 16-byte (or 8-byte)
+// loads, a warp a row; VEC floats a lane per step, C / (32 VEC) steps
+template <int C>
+__global__ void layerNormVK(const float* __restrict__ x, half* __restrict__ y, size_t rows, const float* __restrict__ scale,
+                            const float* __restrict__ offset) {
+  constexpr int VEC = C >= 128 ? 4 : C / 32, STEPS = C / (32 * VEC);
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* xr = x + row * C;
+  float v[STEPS][VEC];
+  float s = 0;
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) {
+    int c = (k * 32 + lane) * VEC;
+    if constexpr (VEC == 4) { float4 q = *reinterpret_cast<const float4*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w; }
+    else { float2 q = *reinterpret_cast<const float2*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; }
+#pragma unroll
+    for (int u = 0; u < VEC; ++u) s += v[k][u];
+  }
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, q2 = 0;
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k)
+#pragma unroll
+    for (int u = 0; u < VEC; ++u) { float d = v[k][u] - mean; q2 += d * d; }
+  for (int o = 16; o; o >>= 1) q2 += __shfl_xor_sync(~0u, q2, o);
+  float inv = rsqrtf(q2 / C + 1e-5f);
+#pragma unroll
+  for (int k = 0; k < STEPS; ++k) {
+    int c = (k * 32 + lane) * VEC;
+#pragma unroll
+    for (int u = 0; u < VEC; u += 2)
+      *reinterpret_cast<half2*>(y + row * C + c + u) =
+          __floats2half2_rn((v[k][u] - mean) * inv * scale[c + u] + offset[c + u],
+                            (v[k][u + 1] - mean) * inv * scale[c + u + 1] + offset[c + u + 1]);
+  }
+}
 inline void layerNormH(const float* x, half* y, size_t rows, int C, const std::string& w, int block = -1) {
-  layerNormTK<half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, y, rows, C, P(w + "/scale", block), P(w + "/offset", block));
+  const float *sc = P(w + "/scale", block), *of = P(w + "/offset", block);
+  unsigned grid = (unsigned)((rows + 7) / 8);
+  if (C == 64) layerNormVK<64><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else if (C == 128) layerNormVK<128><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else if (C == 256) layerNormVK<256><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
+  else layerNormTK<half><<<grid, 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
 // out [rows] of a [Bt, n, ...] attention -> y[...] += out transposed back ([n, Bt] -> [Bt, n])
 __global__ void swapAddK(float* y, const float* x, int A, int B, int C) {     // y[b][a] += x[a][b]
@@ -172,10 +226,10 @@ inline TriW triWeights(const std::string& T, int blk, int C) {
   static std::map<std::pair<std::string, int>, TriW> cache;
   auto it = cache.find({T, blk});
   if (it != cache.end()) return it->second;
-  half* w = dallocT<half>((size_t)C * 5 * C);
+  half* w = wpool<half>((size_t)C * 5 * C);
   concat3K<<<blocks((size_t)C * 5 * C), 256, 0, STREAM>>>(P(T + "/projection/weights", blk), P(T + "/gate/weights", blk),
     P(T + "/gating_linear/weights", blk), w, C, 2 * C, 2 * C, C);
-  float* b = dalloc(5 * C);
+  float* b = wpool<float>(5 * C);
   concat3BiasK<<<blocks(5 * C), 256, 0, STREAM>>>(P(T + "/projection/bias", blk), P(T + "/gate/bias", blk),
     P(T + "/gating_linear/bias", blk), b, 2 * C, 2 * C, C);
   TriW tw{w, b, PH(T + "/output_projection/weights", blk)};
@@ -239,11 +293,14 @@ __global__ void scaleRowsHK(half* x, const float* mask, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) x[t] = __float2half(__half2float(x[t]) * mask[t / C]);
 }
+// eight halves (16 bytes) a thread: O is a multiple of 8, so a run of e never straddles a row
 __global__ void opmPermuteHK(const half* Pm, half* X, int bi, int L, int O) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)bi * L * O * O) return;
-  int e = (int)(t % O); size_t r = t / O; int c = (int)(r % O); r /= O; int j = (int)(r % L), i = (int)(r / L);
-  X[t] = Pm[((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O + e];
+  int O8 = O / 8;
+  if (t >= (size_t)bi * L * O * O8) return;
+  int e8 = (int)(t % O8); size_t r = t / O8; int c = (int)(r % O); r /= O; int j = (int)(r % L), i = (int)(r / L);
+  reinterpret_cast<uint4*>(X)[t] =
+      reinterpret_cast<const uint4*>(Pm)[(((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O) / 8 + e8];
 }
 
 // ---------------------------------------------------------------- a bias carried by the product
@@ -259,7 +316,7 @@ inline const half* augmentedWeight(const std::string& name, int blk, const float
   static std::map<std::pair<std::string, int>, half*> cache;
   auto it = cache.find({name, blk});
   if (it != cache.end()) return it->second;
-  half* w = dallocT<half>((size_t)(K + 8) * N);
+  half* w = wpool<half>((size_t)(K + 8) * N);
   augmentWeightK<<<blocks((size_t)(K + 8) * N), 256, 0, STREAM>>>(PH(name, blk), bias, w, K, N);
   return cache[{name, blk}] = w;
 }

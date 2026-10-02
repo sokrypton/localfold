@@ -10,7 +10,7 @@
 //           i f<k>/extra_msa [E, L]   t f<k>/extra_has_deletion, extra_deletion_value, extra_msa_mask
 //           m meta/tokens, meta/msa_rows, meta/extra_rows, meta/passes
 // The tables the featuriser needs (atom37 maps) are read from the exported weights.
-import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, openSync, readSync, writeSync, closeSync, renameSync } from "node:fs";
 import { makeA3mFeatures } from "../../src/input/a3m-features.js";
 import { chainResidues, identityMap, templateSlotAtom37 } from "../../src/af3/featurise/template-input.js";
 
@@ -30,15 +30,19 @@ for (const line of readFileSync(`${weightsDir}/model.idx`, "utf8").split("\n")) 
   const [kind, name, a, b] = line.split(" ");
   if (kind === "t" || kind === "i") index.set(name, { kind, offset: Number(a), length: Number(b) });
 }
-const bin = readFileSync(`${weightsDir}/model.bin`);
+// (each table's own bytes, not the file: reading the 370 MB of weights was a fifth of an export)
+const binFd = openSync(`${weightsDir}/model.bin`, "r");
 const table = (name) => {
   const e = index.get(name);
   if (!e) throw new Error(`${weightsDir} has no ${name}`);
-  const view = e.kind === "i" ? new Int32Array(bin.buffer, bin.byteOffset + e.offset * 4, e.length)
-    : new Float32Array(bin.buffer, bin.byteOffset + e.offset * 4, e.length);
+  const bytes = Buffer.alloc(e.length * 4);
+  readSync(binFd, bytes, 0, bytes.length, e.offset * 4);
+  const view = e.kind === "i" ? new Int32Array(bytes.buffer, bytes.byteOffset, e.length)
+    : new Float32Array(bytes.buffer, bytes.byteOffset, e.length);
   return Float32Array.from(view);
 };
 const tables = { atom37ToAtom14: table("c/atom37_to_atom14"), atom37Mask: table("c/atom37_mask") };
+closeSync(binFd);
 
 const sequence = option("sequence", "").trim().toUpperCase();
 const a3mPath = option("a3m", "");
@@ -58,8 +62,8 @@ const first = features[0];
 const L = first.aatype.length;
 
 const entries = [];
-const int = (name, v) => entries.push(["i", name, Int32Array.from(v)]);
-const flt = (name, v) => entries.push(["t", name, Float32Array.from(v)]);
+const int = (name, v) => entries.push(["i", name, v instanceof Int32Array ? v : Int32Array.from(v)]);
+const flt = (name, v) => entries.push(["t", name, v instanceof Float32Array ? v : Float32Array.from(v)]);
 int("aatype", first.aatype);
 int("residue_index", first.residueIndex);
 flt("seq_mask", first.seqMask);

@@ -28,6 +28,29 @@ if [ ! -x "$here/af2" ]; then
 fi
 weights="$here/weights-$model"
 [ -f "$weights/model.idx" ] || "$python" "$here/export_weights.py" --model "$model" --reference "$reference" --out "$weights"
-tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-node "$here/export_input.mjs" "$tmp" --weights="$weights" "${inputs[@]}"
-"$here/af2" "$tmp" --weights="$weights" --fast --out="$out" "${flags[@]}"
+tmp="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+# af2 starts first and warms up - the CUDA context, the weights on the device, then the embedder and
+# one block of each stack on a synthetic input of the shapes the export will have, which loads every
+# kernel and makes every cuBLASLt plan - while the input is exported; it then waits for model.idx.
+# The shapes are a guess from the inputs (the alignment's depth before deduplication): a wrong guess
+# warms less, it never changes the fold
+seq=""; a3m=""; maxmsa=512; maxextra=1024; templates=0
+for a in "${inputs[@]}"; do
+  case "$a" in
+    --sequence=*) seq="${a#--sequence=}" ;; --a3m=*) a3m="${a#--a3m=}" ;;
+    --max-msa=*) maxmsa="${a#--max-msa=}" ;; --max-extra=*) maxextra="${a#--max-extra=}" ;;
+    --template=*) t="${a#--template=}"; templates=$(( $(tr -cd ',' <<< "$t" | wc -c) + 1 )) ;;
+  esac
+done
+seq="${seq//:/}"
+[ -n "$seq" ] || [ -z "$a3m" ] || seq="$(grep -v '^>' "$a3m" | head -1 | tr -d 'a-z\r\n-')"
+depth=1; [ -z "$a3m" ] || depth=$(grep -c '^>' "$a3m")
+n=$(( depth < maxmsa ? depth : maxmsa )); e=$(( depth - n )); e=$(( e > maxextra ? maxextra : e )); e=$(( e < 1 ? 1 : e ))
+exec 3< <("$here/af2" "$tmp" --weights="$weights" --fast --out="$out" --wait-input --warm="${#seq},$n,$e,$templates" \
+          "${flags[@]}"; echo "af2: exit $?")
+if ! node "$here/export_input.mjs" "$tmp" --weights="$weights" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
+status=0
+while IFS= read -r line <&3; do
+  case "$line" in "af2: exit "*) status="${line#af2: exit }" ;; *) printf '%s\n' "$line" ;; esac
+done
+exit "$status"

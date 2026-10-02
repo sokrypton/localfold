@@ -6,6 +6,9 @@
 //
 // With --oracle (native/af2/oracle.py's dump of the reference on this same input), pass 0 is checked
 // against it stage by stage.
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
 #include "templates.cuh"
 #include "structure.cuh"
 #include "../../af3/src/profile.cuh"
@@ -58,26 +61,47 @@ __global__ void symmetriseK(const float* half_, float* out, int L, int B) {
   out[t] = half_[t] + half_[((size_t)j * L + i) * B + b];
 }
 
-int main(int argc, char** argv) {
-  if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
-  std::string weights, oracle, out = "fold.pdb"; int recycles = -1; bool profile = false;
-  for (int i = 2; i < argc; ++i) {
-    if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
-    else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
-    else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
-    else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
-    else if (!strcmp(argv[i], "--profile")) profile = true;
-    else if (!strcmp(argv[i], "--fast")) FAST = true;
-    else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
+// a synthetic input of the given shapes (what export_input.mjs writes, its values arbitrary), in
+// /dev/shm, for --warm: folding it loads what the real input's fold will need while that is exported
+static std::string writeWarmInput(int L, int N, int E, int T) {
+  std::string dir = "/dev/shm/af2-warm-" + std::to_string(getpid());
+  if (mkdir(dir.c_str(), 0755) && errno != EEXIST) { fprintf(stderr, "cannot make %s\n", dir.c_str()); exit(1); }
+  FILE* bin = fopen((dir + "/model.bin").c_str(), "wb");
+  std::string idx; size_t offset = 0;
+  auto put = [&](char kind, const std::string& name, size_t n, float fv, bool cycle = false) {
+    std::vector<uint32_t> v(n);
+    for (size_t i = 0; i < n; ++i) {
+      if (kind == 'i') { int x = cycle ? (int)(i % 20) : (int)fv; memcpy(&v[i], &x, 4); }
+      else { float x = fv; memcpy(&v[i], &x, 4); }
+    }
+    fwrite(v.data(), 4, n, bin);
+    idx += std::string(1, kind) + " " + name + " " + std::to_string(offset) + " " + std::to_string(n) + "\n";
+    offset += n;
+  };
+  put('i', "aatype", L, 0, true);
+  { std::vector<int> ri(L); for (int i = 0; i < L; ++i) ri[i] = i;
+    fwrite(ri.data(), 4, L, bin); idx += "i residue_index " + std::to_string(offset) + " " + std::to_string(L) + "\n"; offset += L; }
+  put('t', "seq_mask", L, 1);
+  put('i', "asym_id", L, 0); put('i', "entity_id", L, 0); put('i', "sym_id", L, 0);
+  put('t', "f0/msa_feat", (size_t)N * L * 49, 0); put('t', "f0/msa_mask", (size_t)N * L, 1);
+  put('i', "f0/extra_msa", (size_t)E * L, 0); put('t', "f0/extra_has_deletion", (size_t)E * L, 0);
+  put('t', "f0/extra_deletion_value", (size_t)E * L, 0); put('t', "f0/extra_msa_mask", (size_t)E * L, 1);
+  if (T > 0) {
+    put('i', "t/aatype", (size_t)T * L, 0, true); put('t', "t/positions", (size_t)T * L * 37 * 3, 0);
+    put('t', "t/mask", (size_t)T * L * 37, 1);
+    idx += "m meta/templates " + std::to_string(T) + "\n";
   }
-  if (weights.empty()) { fprintf(stderr, "--weights=<dir> (native/af2/export_weights.py)\n"); return 1; }
-  auto t0 = std::chrono::steady_clock::now();
-  M.load(weights); M.load(argv[1]);
-  if (!oracle.empty()) M.load(oracle);
-  CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
-  bool tf32 = FAST && !getenv("AF2_NO_TF32");
-  if (getenv("AF2_NO_FLASH")) FAST = false;
-  CB(cublasSetMathMode(H, tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));   // float32 means float32 unless --fast
+  idx += "m meta/tokens " + std::to_string(L) + "\nm meta/msa_rows " + std::to_string(N) + "\nm meta/extra_rows " +
+         std::to_string(E) + "\nm meta/passes 1\n";
+  fclose(bin);
+  FILE* f = fopen((dir + "/model.idx").c_str(), "w"); fputs(idx.c_str(), f); fclose(f);
+  return dir;
+}
+// one input, already loaded: the passes, the heads and the PDB. warm: the embedder, ONE block of
+// each stack, the structure module and the heads, nothing written - every kernel loaded, every
+// cuBLASLt plan and scratch buffer made, at this input's shapes
+static int foldInput(const std::string& oracle, const std::string& out, int recycles, bool profile, bool warm,
+                     std::chrono::steady_clock::time_point t0) {
   Trunk t{};
   t.L = (int)M.meta("meta/tokens"); t.N = (int)M.meta("meta/msa_rows"); t.E = (int)M.meta("meta/extra_rows");
   t.opmFirst = M.flag("meta/opm_first");
@@ -99,17 +123,24 @@ int main(int argc, char** argv) {
   CK(cudaMemset(prevRow, 0, (size_t)L * 256 * 4)); CK(cudaMemset(prevPair, 0, pairs * 128 * 4));
   CK(cudaMemset(prevPos, 0, (size_t)L * 37 * 3 * 4));
   float* single = dalloc((size_t)L * 384);
-  printf("AF2 %s: %d residues, %d MSA rows, %d extra, %d passes (loaded in %.1f s)\n", M.flag("meta/multimer") ? "multimer" : "monomer",
+  if (!warm) printf("AF2 %s: %d residues, %d MSA rows, %d extra, %d passes (loaded in %.1f s)\n", M.flag("meta/multimer") ? "multimer" : "monomer",
          L, t.N, t.E, passes, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-  int extraBlocks = (int)dimW("evoformer/extra_msa_stack/msa_transition/transition1/weights", 0);
-  int mainBlocks = (int)dimW("evoformer/evoformer_iteration/msa_transition/transition1/weights", 0);
+  int extraBlocks = warm ? 1 : (int)dimW("evoformer/extra_msa_stack/msa_transition/transition1/weights", 0);
+  int mainBlocks = warm ? 1 : (int)dimW("evoformer/evoformer_iteration/msa_transition/transition1/weights", 0);
+  if (warm) passes = 1;
   StructureOut so{};
   float* plddtLogits = nullptr; float* paeLogits = nullptr;
-  if (profile) { prof::init(); prof::start(); }
+  if (profile && !warm) { prof::init(); prof::start(); }
   auto tf = std::chrono::steady_clock::now();
   // everything after the embedder: the same launches on the same buffers every pass, so from pass 1
   // on it is captured once as a CUDA graph and replayed (a pass is ~6000 launches)
   auto rest = [&](bool check, int pass) {
+    auto mark = [&](const char* what) {
+      if (!getenv("AF2_STAGE_TIMES")) return;
+      CK(cudaStreamSynchronize(STREAM));
+      printf("    pass %d %-14s %.1f ms\n", pass, what, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
+    };
+    mark("embed");
     if (multimer) templateEmbedding(t.pair, t.pairMask, L);
     else if (monomerTemplates) templateEmbeddingMonomer(t.pair, t.pairMask, L, templates);
     if (t.T > 0) {
@@ -129,10 +160,14 @@ int main(int argc, char** argv) {
     }
     for (int b = 0; b < extraBlocks; ++b) {
       evoformerBlock(t, true, b);
+      if (b == 0) mark("extra 0");
       if (check && b == 0) checkOracle("extra block 0 pair", t.pair, pairs * 128, "o/extra1/pair");
     }
     if (check) checkOracle("extra stack pair", t.pair, pairs * 128, "o/extra/pair");
+    mark("extra stack");
     for (int b = 0; b < mainBlocks; ++b) {
+      if (b == 1) mark("evoformer 0");
+      if (b == 2) mark("evoformer 1");
       evoformerBlock(t, false, b);
       if (check && b == 0) {
         checkOracle("evoformer block 0 msa", t.msa, (size_t)t.N * L * 256, "o/evo1/msa");
@@ -145,7 +180,7 @@ int main(int argc, char** argv) {
       checkOracle("evoformer pair", t.pair, pairs * 128, "o/full/pair");
       checkOracle("single", single, (size_t)L * 384, "o/full/single");
     }
-    so = structureModule(single, t.pair, L, positionScale);
+    mark("evoformer"); so = structureModule(single, t.pair, L, positionScale);
     if (check) {
       checkOracle("structure act", so.act, (size_t)L * 384, "o/full/structure_act");
       checkOracle("angles", so.angles, (size_t)L * 14, "o/full/angles");
@@ -160,6 +195,7 @@ int main(int argc, char** argv) {
         checkOracle("atom37 positions", so.pos37, (size_t)L * 37 * 3, o + "final_atom_positions");
       }
     }
+    mark("structure");
     // the recycled state: the evoformer's first MSA row and pair, the final atom37 positions
     CK(cudaMemcpyAsync(prevRow, t.msa, (size_t)L * 256 * 4, cudaMemcpyDeviceToDevice, STREAM));
     CK(cudaMemcpyAsync(prevPair, t.pair, pairs * 128 * 4, cudaMemcpyDeviceToDevice, STREAM));
@@ -187,7 +223,7 @@ int main(int argc, char** argv) {
   cudaGraphExec_t graph = nullptr;
   // capturing costs about half a replayed pass and a replay saves a few percent of one (59 residues:
   // 100 against 107 ms), so only a long recycle run gains - as native/af3's trunk graph rule
-  bool graphs = !getenv("AF2_NO_GRAPHS") && oracle.empty() && (passes >= 8 || getenv("AF2_GRAPHS"));
+  bool graphs = !warm && !getenv("AF2_NO_GRAPHS") && oracle.empty() && (passes >= 8 || getenv("AF2_GRAPHS"));
   for (int pass = 0; pass < passes; ++pass) {
     bool check = pass == 0 && !oracle.empty();
     embed(t, pass, prevRow, prevPair, prevPos);
@@ -215,6 +251,10 @@ int main(int argc, char** argv) {
   }
   CK(cudaStreamSynchronize(STREAM));
   double foldMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
+  if (warm) {
+    for (float* p : {t.msa, t.extra, t.pair, t.pairMask, prevRow, prevPair, prevPos, single}) CK(cudaFree(p));
+    return 0;
+  }
   if (profile) prof::stop(30);
   std::vector<float> pl = download(plddtLogits, (size_t)L * 50);
   std::vector<float> centres(50); for (int b = 0; b < 50; ++b) centres[b] = (b + 0.5f) * 2.f;
@@ -250,4 +290,50 @@ int main(int argc, char** argv) {
   if (chains) printf("  ipTM %.4f", iptm);
   printf("  -> %s  (%d passes, %.1f ms)\n", out.c_str(), passes, foldMs);
   return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
+  std::string weights, oracle, out = "fold.pdb", warmShape; int recycles = -1; bool profile = false, waitInput = false;
+  for (int i = 2; i < argc; ++i) {
+    if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
+    else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
+    else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
+    else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
+    else if (!strcmp(argv[i], "--profile")) profile = true;
+    else if (!strcmp(argv[i], "--fast")) FAST = true;
+    else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
+    else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;   // L,N,E,T: warm up at those shapes meanwhile
+    else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
+  }
+  if (weights.empty()) { fprintf(stderr, "--weights=<dir> (native/af2/export_weights.py)\n"); return 1; }
+  auto t0 = std::chrono::steady_clock::now();
+  M.load(weights);
+  CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
+  bool tf32 = FAST && !getenv("AF2_NO_TF32");
+  if (getenv("AF2_NO_FLASH")) FAST = false;
+  CB(cublasSetMathMode(H, tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));   // float32 means float32 unless --fast
+  M.upload(0);
+  if (!warmShape.empty()) {
+    int wl = 0, wn = 1, we = 1, wt = 0;
+    if (sscanf(warmShape.c_str(), "%d,%d,%d,%d", &wl, &wn, &we, &wt) < 1 || wl < 1) { fprintf(stderr, "--warm=L,N,E,T\n"); return 1; }
+    std::string dir = writeWarmInput(wl, std::max(wn, 1), std::max(we, 1), wt);
+    int seg = (int)M.segs.size();
+    M.load(dir);
+    foldInput("", "", 0, false, true, t0);
+    CK(cudaStreamSynchronize(STREAM));
+    forgetEntries(M.unload(seg));
+    std::string rm = "rm -rf '" + dir + "'"; if (system(rm.c_str())) {}
+  }
+  if (waitInput) {          // the exporter writes model.idx last, by a rename
+    std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";
+    for (int k = 0; access(idx.c_str(), R_OK) != 0; ++k) {
+      if (access(failed.c_str(), F_OK) == 0) { fprintf(stderr, "af2: the input's export failed\n"); return 1; }
+      if (k > 600000) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
+      usleep(1000);
+    }
+  }
+  M.load(argv[1]);
+  if (!oracle.empty()) M.load(oracle);
+  return foldInput(oracle, out, recycles, profile, false, t0);
 }

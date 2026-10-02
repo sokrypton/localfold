@@ -210,7 +210,7 @@ inline const half* pairBiasFast(const half* pn, int L, int C, int H, const float
   static std::map<const float*, half*> wh;
   auto it = wh.find(w);
   if (it == wh.end()) {
-    half* h = dallocT<half>((size_t)C * H);
+    half* h = wpool<half>((size_t)C * H);
     toHalfK<<<blocks((size_t)C * H), 256, 0, STREAM>>>(w, h, (size_t)C * H);
     it = wh.emplace(w, h).first;
   }
@@ -359,7 +359,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       int bi = std::min(Bi, L - i0);
       CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &one, rt, CUDA_R_16F, L * O, lt + (size_t)i0 * O,
                       CUDA_R_16F, L * O, &zero, Pm, CUDA_R_16F, L * O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-      opmPermuteHK<<<blocks((size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
+      opmPermuteHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(Pm, X, bi, L, O);
       ltGemm(X, PH(Op + "/output_w", blk), Y, false, (size_t)bi * L, O * O, 128, nullptr, false, 0.f);
       opmAddK2<<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128);
     }

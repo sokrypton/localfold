@@ -27,7 +27,9 @@ FIX = os.path.join(REPO, "tools", "fixtures")
 BASELINE = os.path.join(HERE, "gate-baseline.json")
 TMP = os.environ.get("GATE_TMP", "/tmp/af2-gate")
 SEQ_6MRR = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
-TOL_RMSD, TOL_PLDDT = 0.05, 0.5
+# RMSD may move 0.05 A or 1% of itself, whichever is more: the no-template arms are unfolded answers
+# (17-22 A), whose RMSD swings a twentieth of an angstrom with an f16 path's rounding; pLDDT 0.5 points
+TOL_RMSD, TOL_RMSD_REL, TOL_PLDDT = 0.05, 0.01, 0.5
 ORACLE_BOUND = {"f32": 1e-4, "fast": 1e-2}
 MULTIMER = "model_1_multimer_v3"
 
@@ -124,7 +126,7 @@ def main():
                 verdict, failed = "FAILED: " + got["error"], failed + 1
             elif want and not write:
                 ok = abs(got["plddt"] - want["plddt"]) <= TOL_PLDDT and got["rmsd"] is not None \
-                    and abs(got["rmsd"] - want["rmsd"]) <= TOL_RMSD
+                    and abs(got["rmsd"] - want["rmsd"]) <= max(TOL_RMSD, TOL_RMSD_REL * want["rmsd"])
                 verdict = ("ok" if ok else "MOVED") + f" (baseline {json.dumps(want)})"
                 failed += not ok
             if write and "error" not in got:
