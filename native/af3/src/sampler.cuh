@@ -183,7 +183,7 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
 
 // AlphaFold 3's confidence files beside a structure: <stem>_confidences.json (atom_plddts in the
 // PDB's atom order, pae, token_chain_ids, token_res_ids) and <stem>_summary_confidences.json
-// (ptm, iptm, ranking_score - the score without AF3's disorder and clash terms).
+// (ptm, iptm, ranking_score with AF3's disorder and clash terms - src/scores.cuh).
 // <stem>_confidences.json and <stem>_summary_confidences.json, as the page's archive writes them
 // (web/fold-archive.js): the per-atom pLDDTs in the PDB's atom order, the distogram's contact
 // probabilities, the PAE; and the scalar scores with their per-chain and per-chain-pair forms, the
@@ -191,7 +191,8 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
 inline void writeConfidences(const std::string& pdbPath, const std::vector<size_t>& order, int n, int dense,
                              const std::vector<float>& plddt, const std::vector<float>& pae,
                              const std::vector<float>& tmTerm, const std::vector<float>& contact,
-                             double ptm, double iptm, double ranking, double meanPlddt) {
+                             double ptm, double iptm, double ranking, double meanPlddt,
+                             bool hasClash, double fractionDisordered) {
   std::string stem = pdbPath.size() > 4 && pdbPath.substr(pdbPath.size() - 4) == ".pdb"
     ? pdbPath.substr(0, pdbPath.size() - 4) : pdbPath;
   const int* asym = M.i("batch.asymId"); const int* res = M.i("batch.residueIndex");
@@ -284,13 +285,12 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
     }
     fprintf(f, "],\n");
   }
-  {   // mean atom pLDDT per chain, and the fraction of atoms under 50, over the structure's atoms
-    std::vector<double> sum(nc, 0), cnt(nc, 0); size_t disordered = 0;
+  {   // mean atom pLDDT per chain, over the structure's atoms
+    std::vector<double> sum(nc, 0), cnt(nc, 0);
     for (size_t k = 0; k < order.size(); ++k) {
       int a = (int)(std::find(chains.begin(), chains.end(), asym[order[k] / dense]) - chains.begin());
       float v = plddt[order[k]];
       if (a < nc) { sum[a] += v; cnt[a] += 1; }
-      disordered += v < 50;
     }
     fprintf(f, "  \"chain_plddt\": [");
     for (int a = 0; a < nc; ++a) { if (a) fprintf(f, ", "); num(f, cnt[a] ? sum[a] / cnt[a] : NAN); }
@@ -321,8 +321,8 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
     fprintf(f, "],\n");
     if (std::isfinite(iptm)) fprintf(f, "  \"iptm\": %.2f,\n", iptm);
     fprintf(f, "  \"ptm\": %.2f,\n  \"ranking_score\": %.2f,\n", ptm, ranking);
-    fprintf(f, "  \"fraction_disordered\": %.2f,\n  \"mean_plddt\": %.2f\n}\n",
-            order.empty() ? 0.0 : (double)disordered / order.size(), meanPlddt);
+    fprintf(f, "  \"fraction_disordered\": %.2f,\n  \"has_clash\": %.1f,\n  \"mean_plddt\": %.2f\n}\n",
+            fractionDisordered, hasClash ? 1.0 : 0.0, meanPlddt);
   }
   fclose(f);
 }

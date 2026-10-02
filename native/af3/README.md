@@ -31,13 +31,20 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + ev
 
 `--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--samples=N`
 (N diffusion samples off one trunk, AF3 runs five: each scored by the confidence head and ranked by
-0.8 ipTM + 0.2 pTM - pTM for one chain; AF3's disorder and clash terms are not computed - the best
-written to `--out`, all to `<out>_sample<k>.pdb`). Beside every structure, what the page's archive
+AF3's ranking score, 0.8 ipTM + 0.2 pTM (pTM for one chain) + 0.5 fraction_disordered -
+100 has_clash - the best written to `--out`, all to `<out>_sample<k>.pdb`). The two structure terms
+are AF3's own definitions (src/scores.cuh): has_clash, a polymer chain with more than 100 atoms or
+half its atoms within 1.1 A of a non-neighbouring polymer atom; fraction_disordered, the protein
+residues whose DSSP accessibility (each chain alone, mkdssp's dot surface reproduced) averaged
+over 25 residues exceeds 0.581 of their maximum. Both are exact against AF3's functions on the
+structures this port writes (`scores_oracle.py`, run with af3-any-model's environment: every
+residue's DSSP accessibility identical over 1,500 residues, a modified residue included, and
+has_clash on both sides of its threshold); `af3 - --score-pdb=FILE` scores any PDB. Beside every structure, what the page's archive
 writes: `<stem>_confidences.json` (atom_chain_ids and atom_plddts in the PDB's atom order, the
 distogram's contact_probs, pae, token_chain_ids, token_res_ids) and
 `<stem>_summary_confidences.json` (chain_ids, chain_pair_iptm, chain_pair_max_contact,
 chain_plddt, chain_ptm, chain_iptm, chain_pair_pae_min, iptm, ptm, ranking_score,
-fraction_disordered, mean_plddt). The samples run as ONE batch through the
+fraction_disordered, has_clash, mean_plddt). The samples run as ONE batch through the
 denoiser - the transformer's GEMMs at 5x the rows, the samples as the flash kernel's batch, what
 they share (conditioning, masks, biases) read once - and sample k draws exactly what a one-sample
 run seeded `seed + k` draws, so its structure is the same: 5CAJ's five read 1.989 / 2.023 / 1.961 /
