@@ -173,4 +173,7 @@ parent nucleotide, atoms past the 24 dense slots dropped as the reference drops 
 representative falling back to the first held atom), the kitchen-sink job still reads, for boltz2:
 6OG **0.834**, 2MG **0.823**, 6MA 0.229, 5MC 0.067 Å bond rms - where AlphaFold 3 and the other five
 families are 0.04-0.10 on every one. 6OG and 2MG are the 25-atom guanosines whose one-token form
-loses a ring atom by construction, so they cannot be whole; 6MA is the open question beside HY3.
+loses a ring atom by construction, so they cannot be whole; 6MA is the open question beside HY3. 🔴 **6MA IS NOT A DEFECT EITHER, MEASURED 2026-10-02**: a 14-bp duplex with 6MA at 2 and 9 of one
+strand, single sequence, three samples - genuine Boltz-2 **0.064 / 0.132 / 0.139 Å** bond rms over the two
+residues' 48 bonds, this port's native boltz2 **0.104 / 0.122 / 0.135 Å** on the identical input. The
+kitchen sink's 0.229 is one sample of a harder job; on a like-for-like target the two are one band.
