@@ -76,24 +76,39 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
   constexpr int KV_CHUNKS = BK * (D / 8), B_CHUNKS = BQ * (BK / 8);
   static_assert(B_CHUNKS % NT == 0, "a bias tile is a whole number of chunks a thread");
   const half* biasHead = bias + (size_t)h * n * biasStride;
+  // per-thread source pointers, advanced by a constant each tile (the bounds matter only on the
+  // last tile, which the `last` flag takes through the checked path)
+  constexpr int KV_PER = (KV_CHUNKS + NT - 1) / NT, B_PER = B_CHUNKS / NT;
+  const half* kvSrc[KV_PER]; int kvOff[KV_PER], kvJ[KV_PER];
+#pragma unroll
+  for (int k = 0; k < KV_PER; ++k) {
+    int u = k * NT + threadIdx.x, jj = u / (D / 8), c = (u % (D / 8)) * 8;
+    kvJ[k] = (KV_CHUNKS % NT == 0 || u < KV_CHUNKS) ? jj : 1 << 30;
+    kvOff[k] = jj * LDK + c;
+    kvSrc[k] = base + jj * W4 + Wd + c;
+  }
+  const half* bSrc[B_PER]; int bOff[B_PER], bC[B_PER]; bool bRow[B_PER];
+#pragma unroll
+  for (int k = 0; k < B_PER; ++k) {
+    int u = k * NT + threadIdx.x, qi = u / (BK / 8), c = (u % (BK / 8)) * 8, i = q0 + qi;
+    bRow[k] = i < n; bC[k] = c; bOff[k] = qi * LDB + c;
+    bSrc[k] = biasHead + (i < n ? i : 0) * biasStride + c;
+  }
   auto issue = [&](int j0, int st) {
     half *K = Kst(st), *V = Vst(st), *B = Bst(st);
+    bool last = j0 + BK > n;
 #pragma unroll
-    for (int u0 = 0; u0 < KV_CHUNKS; u0 += NT) {
-      int u = u0 + threadIdx.x;
-      if (KV_CHUNKS % NT == 0 || u < KV_CHUNKS) {
-        int jj = u / (D / 8), c = (u % (D / 8)) * 8, j = j0 + jj;
-        bool ok = j < n;
-        const half* src = base + (ok ? j : 0) * W4 + Wd + c;
-        cpAsync16(K + jj * LDK + c, src, ok);
-        cpAsync16(V + jj * LDK + c, src + Wd, ok);
-      }
+    for (int k = 0; k < KV_PER; ++k) {
+      if (kvJ[k] >= (1 << 30)) continue;
+      bool ok = !last || j0 + kvJ[k] < n;
+      const half* src = ok ? kvSrc[k] + j0 * W4 : base;
+      cpAsync16(K + kvOff[k], src, ok);
+      cpAsync16(V + kvOff[k], src + Wd, ok);
     }
 #pragma unroll
-    for (int u0 = 0; u0 < B_CHUNKS; u0 += NT) {
-      int u = u0 + threadIdx.x, qi = u / (BK / 8), c = (u % (BK / 8)) * 8, i = q0 + qi, j = j0 + c;
-      bool ok = i < n && j < n;
-      cpAsync16(B + qi * LDB + c, biasHead + (ok ? i * biasStride + j : 0), ok);
+    for (int k = 0; k < B_PER; ++k) {
+      bool ok = bRow[k] && (!last || j0 + bC[k] < n);
+      cpAsync16(B + bOff[k], ok ? bSrc[k] + j0 : biasHead, ok);
     }
     if (MASKED && threadIdx.x < BK) {
       int j = j0 + threadIdx.x;
@@ -418,6 +433,10 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // (a token transformer at 68 tokens is only 16 heads x 2 query blocks) and are not faster:
   // 1/2/4/8 warps read 19.6/18.6/17.8/17.6 us at 68 tokens and 32.3/30.3/23.4/26.4 at 261.
   int warps = ((n + 127) / 128) * 128 - n <= 32 ? 8 : 4;
+  // the pair track's grid attention (a row per pair row): 4 warps at every size measured
+  // (--bench-grid, 261 to 2048 tokens: 0.184 / 0.834 / 6.05 / 20.4 / 54.0 ms against 8 warps'
+  // 0.227 / 0.894 / 6.63 / 21.5 / 54.1); the token transformer's one row keeps the rule above
+  if (rows >= 32) warps = 4;               // (the denoiser's rows are its samples, a handful)
   if (FLASH_WARPS_OVERRIDE) warps = FLASH_WARPS_OVERRIDE;
   // too few blocks to fill the device: split each 16 queries' keys over four warps instead.
   // Measured at 16 heads, D 48: 9.3 against 14.7 us at 68 tokens, 13.4/19.5 at 192, and worse
