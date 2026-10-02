@@ -126,6 +126,10 @@ __global__ void biasGeluK(float* y, const float* b, size_t rows, int C) {
 inline void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tokenToRow, int T, float* lmZ,
                           const std::function<void(int, const float*)>& onState) {
   size_t R = e.rows; int C = e.model, P = e.pair;
+  // no protein token (a nucleic or ligand-only input): the tower has nothing to read, and every token
+  // takes the shim at a zero state - below, through tokenToRow's -1
+  float* single = scratch<float>("shim.single", std::max<size_t>(R, 1) * P);
+  if (R > 0) {
   float* x = scratch<float>("esmc.x", R * C);
   embedK<<<blocks(R * C), 256, 0, STREAM>>>(ids, Cw("embed/weights"), x, (int)R, C);
   // the mix weights, a constant
@@ -150,9 +154,9 @@ inline void languageModel(const Esmc& e, const int* ids, const int* seq, const i
   }
   layerNorm(x, last, R, C, Cw("final_norm/scale"), nullptr);
   mixIn(e.layers, last);
-  float* single = scratch<float>("shim.single", R * P);
   gemm(acc, Cw("lm/downproject/weights"), single, R, P, P);
   addBias(single, Cw("lm/downproject/bias"), R, P);
+  }
   // a non-protein token's state is zero: LN(0) is the offset, the mix sums to one
   float* zero = scratch<float>("shim.zero", P);
   float* z1 = scratch<float>("shim.z1", P);

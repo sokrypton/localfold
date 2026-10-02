@@ -99,7 +99,7 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # without the line (an error) it waits for the exit status
 run_af3() {
   local done=0 line
-  exec 4< <("$here/af3" "$1" --weights="$weights" --fold --fast --out="$2" --wait-input --detach-output "${foldflags[@]}"; echo "af3: exit $?")
+  exec 4< <("$here/af3" "$1" --weights="$weights" --fold --fast --out="$2" --wait-input --detach-output "${foldflags[@]}" && rc=0 || rc=$?; echo "af3: exit $rc")
   while IFS= read -r line <&4; do
     case "$line" in "af3: done") done=1; break ;; "af3: exit "*) exec 4<&-; return "${line#af3: exit }" ;; *) printf '%s\n' "$line" ;; esac
   done

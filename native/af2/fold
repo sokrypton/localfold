@@ -48,7 +48,7 @@ depth=1; [ -z "$a3m" ] || depth=$(grep -c '^>' "$a3m")
 for a in "${inputs[@]}"; do [ "$a" != "--search" ] || depth=$(( maxmsa + maxextra )); done   # (a search is usually deep)
 n=$(( depth < maxmsa ? depth : maxmsa )); e=$(( depth - n )); e=$(( e > maxextra ? maxextra : e )); e=$(( e < 1 ? 1 : e ))
 exec 3< <("$here/af2" "$tmp" --weights="$weights" --fast --out="$out" --wait-input --warm="${#seq},$n,$e,$templates" \
-          "${flags[@]}"; echo "af2: exit $?")
+          "${flags[@]}" && rc=0 || rc=$?; echo "af2: exit $rc")
 if ! node "$here/export_input.mjs" "$tmp" --weights="$weights" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
 while IFS= read -r line <&3; do

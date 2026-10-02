@@ -59,10 +59,17 @@ def fold_cases():
         ("1qys", [f"--sequence={chain_sequence(c1qys, 'A')}"], [c1qys, "A"]),
         ("5caj", [f"--sequence={chain_sequence(c5caj, 'A')}"], [c5caj, "A"]),
         ("1brs-complex", [f"--sequence={chain_sequence(c1brs, 'A')}:{chain_sequence(c1brs, 'D')}"], [c1brs, "A,D"]),
+        # what a plain protein never reaches - a ligand and an atomised modified residue, a DNA duplex, an
+        # RNA hairpin - scored on bond geometry too (native/af3/bonds.mjs: rms against CCD ideals, A)
+        ("6mrr-gol-sep3", [f"--sequence={SEQ_6MRR}", "--ligands=GOL", "--modify=SEP@3"], [c6mrr], "GOL,SEP"),
+        ("dna-duplex", ["--sequence=GCGATCGATCGC:GCGATCGATCGC", "--kinds=dna,dna"], None, "DA,DC,DG,DT"),
+        ("rna-hairpin", ["--sequence=GGCGCUUCGGCGCC", "--kinds=rna"], None, "A,C,G,U"),
+        # AlphaFold 3's own covalent-inhibitor job: sotorasib bonded to Cys12 (a declared bond)
+        ("kras-sotorasib", [f"--job={os.path.join(FIX, 'af3-jobs', 'kras_g12c_sotorasib.json')}"], None, "MOV"),
     ]
 
 
-def run_fold(name, inputs, ref):
+def run_fold(name, inputs, ref, codes=None):
     os.makedirs(TMP, exist_ok=True)
     pdb = os.path.join(TMP, name + ".pdb")
     if os.path.exists(pdb):
@@ -72,14 +79,30 @@ def run_fold(name, inputs, ref):
     m = re.search(r"mean pLDDT ([\d.]+)\s+pTM ([\d.nan]+)", text)
     if p.returncode or not m or not os.path.exists(pdb):
         return {"error": text.strip().splitlines()[-1] if text.strip() else f"exit {p.returncode}"}
-    s = subprocess.run([sys.executable, os.path.join(REPO, "native", "af3", "score.py"), pdb, *ref],
-                       capture_output=True, text=True)
-    r = re.search(r"CA RMSD ([\d.]+) A", s.stdout)
-    if not r:
-        return {"error": "unscored: " + (s.stdout + s.stderr).strip().splitlines()[-1]}
+    rmsd = None
+    if ref:
+        s = subprocess.run([sys.executable, os.path.join(REPO, "native", "af3", "score.py"), pdb, *ref],
+                           capture_output=True, text=True)
+        r = re.search(r"CA RMSD ([\d.]+) A", s.stdout)
+        if not r:
+            return {"error": "unscored: " + (s.stdout + s.stderr).strip().splitlines()[-1]}
+        rmsd = float(r.group(1))
     timing = re.search(r"sampler ([\d.]+) ms", text)
-    return {"rmsd": float(r.group(1)), "plddt": float(m.group(1)), "ptm": m.group(2),
-            "ms": float(timing.group(1)) if timing else None}
+    got = {"rmsd": rmsd, "plddt": float(m.group(1)), "ptm": m.group(2), "ms": float(timing.group(1)) if timing else None}
+    if codes:
+        b = subprocess.run(["node", os.path.join(REPO, "native", "af3", "bonds.mjs"), pdb, codes], capture_output=True, text=True).stdout
+        for cls in ("ligand", "nucleic"):
+            v = re.search(cls + r" ([\d.]+)", b)
+            if v: got[cls] = float(v.group(1))
+    if name == "kras-sotorasib":           # the declared covalent bond, Cys12 SG to the ligand's C25
+        atoms = {}
+        for line in open(pdb):
+            if line.startswith(("ATOM", "HETATM")):
+                key = ("SG" if line[17:20] == "CYS" and int(line[22:26]) == 12 and line[12:16].strip() == "SG" else
+                       "C25" if line.startswith("HETATM") and line[12:16].strip() == "C25" else None)
+                if key: atoms[key] = [float(line[30:38]), float(line[38:46]), float(line[46:54])]
+        got["covalent"] = round(sum((a - b) ** 2 for a, b in zip(atoms["SG"], atoms["C25"])) ** 0.5, 2)
+    return got
 
 
 def oracle_cases():
@@ -108,22 +131,30 @@ def main():
     base = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
     failed = 0
     if not only or "folds" in only or any(c[0] in only for c in fold_cases()):
-        for name, inputs, ref in fold_cases():
+        for case in fold_cases():
+            name, inputs, ref = case[:3]
+            codes = case[3] if len(case) > 3 else None
             if only and "folds" not in only and name not in only:
                 continue
-            got, want = run_fold(name, inputs, ref), base.get(name)
+            got, want = run_fold(name, inputs, ref, codes), base.get(name)
             verdict = "recorded" if write else "NEW (no baseline)"
             if "error" in got:
                 verdict, failed = "FAILED: " + got["error"], failed + 1
             elif want and not write:
-                ok = abs(got["plddt"] - want["plddt"]) <= TOL_PLDDT and got["rmsd"] is not None \
-                    and abs(got["rmsd"] - want["rmsd"]) <= max(TOL_RMSD, TOL_RMSD_REL * want["rmsd"])
+                ok = abs(got["plddt"] - want["plddt"]) <= TOL_PLDDT
+                if want.get("rmsd") is not None:
+                    ok = ok and got["rmsd"] is not None and abs(got["rmsd"] - want["rmsd"]) <= max(TOL_RMSD, TOL_RMSD_REL * want["rmsd"])
+                for cls in ("ligand", "nucleic"):        # bond rms may move 0.01 A
+                    if cls in want: ok = ok and cls in got and abs(got[cls] - want[cls]) <= 0.01
+                if "covalent" in want: ok = ok and got.get("covalent", 99) < 2.2     # bonded, not merely near
                 verdict = ("ok" if ok else "MOVED") + f" (baseline {json.dumps(want)})"
                 failed += not ok
             if write and "error" not in got:
-                base[name] = {k: got[k] for k in ("rmsd", "plddt", "ptm")}
+                base[name] = {k: got[k] for k in ("rmsd", "plddt", "ptm", "ligand", "nucleic", "covalent") if k in got}
+            extra = "".join(f"{k} {got[k]:.3f}  " for k in ("ligand", "nucleic", "covalent") if k in got)
+            rmsd = f"RMSD {got['rmsd']:.3f} A  " if got.get("rmsd") is not None else "RMSD   -      "
             body = "" if "error" in got else \
-                f"RMSD {got['rmsd']:.3f} A  pLDDT {got['plddt']:6.2f}  pTM {got['ptm']:>6s}  {got['ms']:7.1f} ms  "
+                f"{rmsd}pLDDT {got['plddt']:6.2f}  pTM {got['ptm']:>6s}  {extra}{got['ms']:7.1f} ms  "
             print(f"{name:24s} {body}{verdict}", flush=True)
     if not only or "oracles" in only:
         for name, data in oracle_cases():

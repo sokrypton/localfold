@@ -18,5 +18,30 @@
   "plddt": 78.32,
   "ptm": "0.7513",
   "rmsd": 0.844
+ },
+ "6mrr-gol-sep3": {
+  "ligand": 0.047,
+  "plddt": 78.84,
+  "ptm": "0.7666",
+  "rmsd": 1.619
+ },
+ "dna-duplex": {
+  "nucleic": 0.036,
+  "plddt": 57.82,
+  "ptm": "0.1767",
+  "rmsd": null
+ },
+ "kras-sotorasib": {
+  "covalent": 1.73,
+  "ligand": 0.021,
+  "plddt": 88.12,
+  "ptm": "0.9400",
+  "rmsd": null
+ },
+ "rna-hairpin": {
+  "nucleic": 0.035,
+  "plddt": 60.83,
+  "ptm": "0.0639",
+  "rmsd": null
  }
 }

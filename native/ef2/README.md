@@ -21,7 +21,22 @@ The input is the page's own: `export_input.mjs` calls `featuriseForEsmfold2` and
 ```
 native/ef2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
 native/ef2/fold 1brs.pdb --sequence=<A>:<D>                  # chains joined by ':'
+native/ef2/fold gol.pdb --sequence=<SEQ> --ligands=GOL --modify=SEP@3
+native/ef2/fold dna.pdb --sequence=GCGATCGATCGC:GCGATCGATCGC --kinds=dna,dna
+native/ef2/fold lig.pdb --sequence=<SEQ> "--smiles=OCC(O)CO"
+native/ef2/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json
 ```
+
+The input options are native/af3's exporter's, resolved the same way:
+- `--kinds`: one per chain, protein, dna or rna.
+- `--ligands`: CCD codes, fetched from the RCSB.
+- `--smiles`: built by src/chem.
+- `--modify`: `CODE@position[@chain]`, modified residues and bases.
+- `--job`: an AlphaFold 3 job file read by the page's own reader (`web/job-json.js`): its ligands,
+  glycans, ions, modified residues and bases, declared bonds and `userCCD`.
+
+All nine of AlphaFold 3's loadable example jobs fold. On the covalent KRAS/sotorasib job, Cys12 SG to
+the ligand's C25 is 1.73 Å: bonded, through the declared bond.
 
 `fold` builds `ef2` if it is missing and exports the weights once into `native/ef2/weights`
 (`export_weights.mjs`, 2.9 GB float32). It then starts `ef2`, which uploads the weights and warms up
@@ -60,6 +75,18 @@ and v of every atom attention. That is the control `ef2 --atom-f32` is held to. 
 | pTM | 0.750974 both | 0.751067 |
 
 1BRS A:D, with per-chain attention in ESM-C: hidden states 2.0e-6, pTM 0.967692 against 0.967691.
+
+Beyond plain protein, against the float32-attention oracle in float32:
+
+| input | trunk | denoiser | pLDDT per atom | pTM, both |
+|---|---:|---:|---:|---:|
+| protein + glycerol | 1.0e-6 | 9.0e-7 | 1.3e-7 | 0.775944 |
+| protein with phosphoserine at 3 | 1.4e-6 | 2.4e-7 | 1.4e-7 | 0.773445 |
+| DNA duplex | 7.6e-7 | 4.0e-7 | 2.1e-7 | 0.182829 |
+| RNA hairpin | 6.7e-7 | 4.9e-7 | 1.8e-7 | 0.063898 |
+
+With no protein token, as in a nucleic or ligand-only input, the tower is skipped, and every token
+takes the shim's value at a zero state, as the reference does.
 With the model's own bf16 atom attention left in, `s_inputs` is 1.6e-4, the module's own rounding.
 
 ## The window, which the two references disagree about
@@ -108,6 +135,13 @@ python3 native/ef2/gate.py --write
 | 1QYS from its sequence | 0.880 Å | 84.87 | 0.899 |
 | 5CAJ from its sequence | 2.085 Å | 91.88 | 0.948 |
 | 1BRS A:D from its two sequences | 0.526 Å | 94.52 | 0.968 (ipTM 0.959) |
+| 6MRR + glycerol + phosphoserine at 3 | 1.619 Å, ligand bonds 0.047 | 78.84 | 0.767 |
+| DNA duplex | nucleic bonds 0.036 | 57.82 | 0.177 |
+| RNA hairpin | nucleic bonds 0.035 | 60.83 | 0.064 |
+| KRAS + sotorasib (AF3's job) | ligand bonds 0.021, SG-C25 1.73 Å | 88.12 | 0.940 |
+
+Bond rms is against CCD ideals, scored by `native/af3/bonds.mjs`; it may move 0.01 Å. The covalent
+distance must stay under 2.2 Å, which is bonded and not merely near.
 
 The gate also checks every `data-*/` that has an `oracle-f32att/`, in both precisions:
 

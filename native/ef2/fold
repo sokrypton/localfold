@@ -30,8 +30,9 @@ seq="${seq//:/}"
 atoms=$(awk -v s="$seq" 'BEGIN { split("A5 R11 N8 D8 C6 Q9 E9 G4 H10 I8 L8 K9 M8 F11 P7 S6 T7 W14 Y12 V7", t, " ");
   for (k in t) h[substr(t[k], 1, 1)] = substr(t[k], 2) + 0; n = 0;
   for (i = 1; i <= length(s); ++i) { c = substr(s, i, 1); n += (c in h) ? h[c] : 8 } print n + 1 }')
-exec 3< <("$here/ef2" "$tmp" --weights="$weights" --out="$out" --wait-input --warm="${#seq},$atoms" --fast "${flags[@]}"; \
-          echo "ef2: exit $?")
+warm=(); [ -z "$seq" ] || warm=(--warm="${#seq},$atoms")     # (a job's size is not known before its export)
+exec 3< <("$here/ef2" "$tmp" --weights="$weights" --out="$out" --wait-input "${warm[@]}" --fast "${flags[@]}" \
+          && rc=0 || rc=$?; echo "ef2: exit $rc")     # (&& || survives set -e, which would skip the echo)
 if ! node --js-float16array "$here/export_input.mjs" "$tmp" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
 while IFS= read -r line <&3; do
