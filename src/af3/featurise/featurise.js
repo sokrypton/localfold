@@ -499,7 +499,17 @@ export function featuriseProtein(sequence, options = {}) {
         // atom leaves its dense slot EMPTY - a mid-chain phosphoserine is
         // N,CA,CB,OG,C,O,_,P,O1P,O2P,O3P with a hole at 6 where the OXT was -
         // and compacting shifts the phosphate and its three oxygens down one.
-        const flat = token * DENSE + (source.componentSlot ?? atom);
+        // 🔴 A COMPONENT WIDER THAN THE TOKEN'S DENSE SLOTS LOSES ITS LAST ATOMS, as the reference's
+        // one-token form does: 2'-O-methylguanosine is 25 heavy atoms, slot 24 is the NEXT token's
+        // slot 0, and writing it there put a phantom atom in the layout (every index after it one
+        // off) where af3-any-model's boltz2 simply has no slot for it. Said, not hidden.
+        const slotHere = source.componentSlot ?? atom;
+        if (slotHere >= DENSE) {
+          console.warn(`${modification.code}: atom ${source.name} is past the token's ${DENSE} slots`
+            + " and is dropped, as the reference's one-token residue drops it");
+          continue;
+        }
+        const flat = token * DENSE + slotHere;
         refMask[flat] = 1;
         refElement[flat] = source.element;
         refCharge[flat] = source.charge;
@@ -516,15 +526,19 @@ export function featuriseProtein(sequence, options = {}) {
       // none), not whichever atom the dictionary happens to list first, which
       // for a phosphoserine is N. Caught by `check-batch-fields.js` against the
       // reference's own gather: token 2 wants slot 2 (CB) where this wrote 0.
+      // (an atom past the dense slots was dropped above and is no representative; with none, the
+      // first atom the token holds is - the reference's "first valid atom")
       const slotOfName = (name) => {
         const found = modification.atoms.find((a) => a.name === name);
-        return found === undefined ? -1
-          : (found.componentSlot ?? modification.atoms.indexOf(found));
+        const slot = found === undefined ? -1 : (found.componentSlot ?? modification.atoms.indexOf(found));
+        return slot < DENSE ? slot : -1;
       };
+      let firstHeld = 0;
+      while (firstHeld < DENSE - 1 && !refMask[token * DENSE + firstHeld]) firstHeld += 1;
       // (a nucleotide's representative is C4 for a purine parent, C2 for a pyrimidine, as AF3's)
       const betaAt = kind === "protein" ? slotOfName("CB") : slotOfName("AG".includes(code) ? "C4" : "C2");
       const alphaAt = kind === "protein" ? slotOfName("CA") : -1;
-      pseudoBetaSlot[token] = betaAt >= 0 ? betaAt : (alphaAt >= 0 ? alphaAt : 0);
+      pseudoBetaSlot[token] = betaAt >= 0 ? betaAt : (alphaAt >= 0 ? alphaAt : firstHeld);
       for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
       token += 1;
       continue;
@@ -543,7 +557,9 @@ export function featuriseProtein(sequence, options = {}) {
       // against both references on 6MRR + GOL + SEP@3: all ten of the
       // phosphoserine's tokens, 15 -> 20, and it carries into `profile`, which
       // is a one-hot over the same alphabet.
-      aatype[token] = options.atomizedUnknownRestype === true
+      // (rf3's unknown restype is for an atomised AMINO ACID: its reference keeps a modified base's
+      // atom tokens at the parent nucleotide - a 5CM's twenty read DC, 28)
+      aatype[token] = options.atomizedUnknownRestype === true && kind === "protein"
         ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
@@ -809,8 +825,11 @@ export function featuriseProtein(sequence, options = {}) {
         // The span's own N and C, by name - the atom ORDER is the component's
         // and is not something to count on.
         const slotOf = (name) => span.atoms.findIndex((atom) => atom.name === name);
-        const nitrogen = slotOf("N");
-        const carbon = slotOf("C");
+        // (a nucleotide's backbone link is the phosphodiester: its P from the previous residue, its
+        // O3' to the next - the reference bonds a modified base back into its chain the same way)
+        const nucleic = residues[span.residue].kind !== "protein";
+        const nitrogen = slotOf(nucleic ? "P" : "N");
+        const carbon = slotOf(nucleic ? "O3'" : "C");
         const sameChain = (residue) => residue >= 0 && residue < residueCount
           && chainOfResidue[residue] === chainOfResidue[span.residue];
         // 🔴 BOTH DIRECTIONS, unlike the internal bonds, which the reference
@@ -1023,8 +1042,11 @@ export function featuriseProtein(sequence, options = {}) {
     }
   }
 
+  // (at its code in the alignment's QUERY ROW, which is its aatype except where a dialect gives
+  // the token the unknown restype and keeps its parent in the alignment - boltz2's one-token modified
+  // base, whose profile the reference puts at the parent nucleotide: 28 for a 5CM, not 20)
   for (let token = 0; token < tokens; token += 1) {
-    if (ownProfile(token)) profile[token * RESTYPES + aatype[token]] = 1;
+    if (ownProfile(token)) profile[token * RESTYPES + queryRow[token]] = 1;
   }
 
   // 🔴 THE NAME THE MODEL READS AND THE NAME A PDB CARRIES ARE NOT THE SAME

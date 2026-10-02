@@ -155,6 +155,19 @@ const TARGETS = {
     suffix: "-hy3",
     extra: () => ({ modifications: [{ chain: 0, position: 4, ...ccd("HY3") }] }),
   },
+  // ...and a modified base at a chain's FIRST residue, which keeps the 5' OP3 a mid-chain one drops
+  // (AF3's kitchen-sink example puts 6OG and 2MG there): --mods 6OG@1,6MA@2 on GATTACA, 2MG@1,5MC@4
+  // on GUACGUAC (its GUAC is under the 128-atom key window, where the reference itself crashes)
+  "dna-5prime": {
+    suffix: "-dna-5prime",
+    extra: () => ({ chainKinds: ["dna"],
+                    modifications: [{ chain: 0, position: 1, ...ccd("6OG") }, { chain: 0, position: 2, ...ccd("6MA") }] }),
+  },
+  "rna-5prime": {
+    suffix: "-rna-5prime",
+    extra: () => ({ chainKinds: ["rna"],
+                    modifications: [{ chain: 0, position: 1, ...ccd("2MG") }, { chain: 0, position: 4, ...ccd("5MC") }] }),
+  },
   "rna-mods": {
     suffix: "-rna-mods",
     extra: () => ({
