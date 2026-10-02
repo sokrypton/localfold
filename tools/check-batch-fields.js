@@ -78,6 +78,7 @@
  */
 import { readFileSync } from "node:fs";
 import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
+import { mergeRowAlignedChainA3ms } from "../src/input/chains.js";
 import { parseCcdComponent, ligandChain } from "../src/af3/featurise/ccd-component.js";
 import { dialectFor, DIALECTS, featuriserDialect } from "../src/af3/dialect.js";
 import { structuralBatch, structuralLayout } from "../src/af3/featurise/structural-tokens.js";
@@ -93,6 +94,7 @@ const MODELS = ["alphafold3", "openbind0", "opendde", "boltz2", "protenix2",
 // sequence with GLYCEROL as a second chain and a PHOSPHOSERINE at position 3 -
 // 83 tokens rather than 68, the ligand at 77-82 - dumped by
 // tools/oracle/dump_af3_batch.py --ligand GOL --ptm SEP@3.
+const fixture = (path) => readFileSync(new URL(`fixtures/${path}`, import.meta.url), "utf8");
 const ccd = (code) => parseCcdComponent(readFileSync(
   new URL(`fixtures/ccd/${code}.cif`, import.meta.url), "utf8"));
 const TARGETS = {
@@ -130,6 +132,22 @@ const TARGETS = {
                 [end(1, 3, "O6"), end(1, 5, "C1")]].map(([from, to]) => ({ from, to })),
       };
     },
+  },
+  // NUCLEIC ALIGNMENTS: an RNA chain with its own unpaired A3M, alone and beside a protein with
+  // its own - AF3 stacks the chains' unpaired rows side by side, an RNA column in RNA's codes
+  // (A 22 ... U 25), which is what a job's inline unpairedMsa gives (--chains rna:SEQ:A3M,...)
+  "rna-msa": {
+    suffix: "-rna-msa",
+    alignment: () => ({ unpaired: fixture("msa/rna-17.a3m"), paired: null }),
+    extra: () => ({ chainKinds: ["rna"], msaColumnKinds: Array(17).fill("rna") }),
+  },
+  "prot-rna-msa": {
+    suffix: "-prot-rna-msa",
+    alignment: () => ({ unpaired: mergeRowAlignedChainA3ms([fixture("msa/protein-21.a3m"), fixture("msa/rna-17.a3m")],
+                                                                 { anyLetter: true }),
+                        paired: null }),
+    extra: () => ({ chainKinds: ["protein", "rna"],
+                    msaColumnKinds: [...Array(21).fill("protein"), ...Array(17).fill("rna")] }),
   },
   "rna-mods": {
     suffix: "-rna-mods",
@@ -257,7 +275,8 @@ for (const target of Object.keys(TARGETS)) {
   const dump = dumpFor(model, target);
   if (dump === null) { missing += 1; console.log(`${model.padEnd(14)} no dump`); continue; }
   const dialect = dialectFor(model);
-  const batch = af3BatchFromA3m(dump.sequence, null, batchFor(dialect, target)).batch;
+  const batch = af3BatchFromA3m(dump.sequence, TARGETS[target].alignment?.() ?? null,
+                                { ...batchFor(dialect, target), prefixRows: true }).batch;
 
   const bad = [];
   const floor = [];   // deliberate deviations: reported every run, never failed

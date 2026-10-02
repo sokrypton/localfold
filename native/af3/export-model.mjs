@@ -182,8 +182,15 @@ if (option("job", "") !== "") {
   if (inlineMsa.unpaired.some(Boolean) || inlineMsa.paired.some(Boolean)) {
     const { mergeRowAlignedChainA3ms } = await import(`${repo}/src/input/chains.js`);
     const fill = (list) => list.map((text, i) => text ?? `>query\n${jobRequest.chains[i]}\n`);
-    const merged = (list) => (list.some(Boolean) ? (list.length === 1 ? fill(list)[0] : mergeRowAlignedChainA3ms(fill(list))) : null);
+    // 🔴 EVERY POLYMER CHAIN IS IN THE MERGED ALIGNMENT, nucleic ones too (an RNA chain's own
+    // unpairedMsa, a DNA chain's query), so each column is read in its chain's alphabet and the
+    // featuriser told the columns cover them all - parsed as protein, an RNA's U was refused, a
+    // DNA's ACGT read as amino acids, and a nucleic chain ahead of a protein shifted every column
+    const anyLetter = jobRequest.chainKinds.some((kind) => kind !== "protein");
+    const merged = (list) => (list.some(Boolean) ? (list.length === 1 ? fill(list)[0]
+      : mergeRowAlignedChainA3ms(fill(list), { anyLetter })) : null);
     jobRequest.alignment = { unpaired: merged(inlineMsa.unpaired), paired: merged(inlineMsa.paired) };
+    jobRequest.msaColumnKinds = jobRequest.chainKinds.flatMap((kind, i) => Array(jobRequest.chains[i].length).fill(kind));
     console.log(`job: inline alignments for ${inlineMsa.unpaired.filter(Boolean).length} chains (unpaired),`
       + ` ${inlineMsa.paired.filter(Boolean).length} (paired)`);
   }
@@ -237,6 +244,7 @@ if (sequence !== "") {
   }
   batch = af3BatchFromA3m(sequence, alignment, {
     maxSequences: Number(option("max-msa", "512")),
+    ...(jobRequest?.msaColumnKinds === undefined ? {} : { msaColumnKinds: jobRequest.msaColumnKinds }),
     seed: Number(option("seed", "20260831")),
     ...featuriserDialect(dialect),
     ...(ligands.length === 0 ? {} : { ligands }),

@@ -703,10 +703,19 @@ export function jobFromJson(text) {
   // visible, editable and deleted when the reader deletes it, and
   // `expandEntities` resolves the letters at fold time.
   //
-  // Written with the letters the FILE used, which is what the reader will
-  // recognise; `asymOfId` above was only ever needed to know which of them are
-  // ligands.
-  const letterOf = new Map([...asymOfId.entries()].map(([id, asym]) => [asym, id]));
+  // 🔴 WRITTEN WITH THE PAGE'S LETTERS, NOT THE FILE'S. expandEntities reads a
+  // contact's letter as a POSITION (A = 0 ... Z = 25, AA = 26), the labels the
+  // viewer and the PDB carry; the file's own ids are arbitrary (AF3's kitchen-
+  // sink job names its chains A, AA, C, ..., JJ, X, Y, Z) and the reader above
+  // reorders entities, so writing the file's letter bonded the first HEM's CHA
+  // to an ATP - the page's G - that has no such atom. Matching only by luck
+  // when a job names its chains A, B, C in the page's order, as KRAS does.
+  const pageLabel = (asym) => {
+    let label = "";
+    for (let at = asym; at >= 0; at = Math.floor(at / 26) - 1) label = String.fromCharCode(65 + (at % 26)) + label;
+    return label;
+  };
+  const letterOf = new Map([...asymOfId.values()].map((asym) => [asym, pageLabel(asym)]));
   for (const bond of reaching) {
     const side = (end) => `${letterOf.get(end.asym) ?? "?"}${end.residue}`
       + (end.atom === undefined || end.atom === "" ? "" : `:${end.atom}`);

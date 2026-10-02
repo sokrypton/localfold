@@ -322,10 +322,12 @@ export function featuriseProtein(sequence, options = {}) {
   const msaColumnOfResidue = new Int32Array(residueCount).fill(-1);
   {
     // Only the protein chains are in the alignment, in chain order, which is
-    // the order its columns are in.
+    // the order its columns are in - unless the caller's alignment spans the
+    // nucleic chains as well (`msaCoversNucleic`: a job's own RNA alignment),
+    // when every polymer residue has its column.
     let column = 0;
     for (let residue = 0; residue < residueCount; residue += 1) {
-      if (residues[residue].kind !== "protein") continue;
+      if (residues[residue].kind !== "protein" && options.msaCoversNucleic !== true) continue;
       msaColumnOfResidue[residue] = column;
       column += 1;
     }
@@ -932,6 +934,7 @@ export function featuriseProtein(sequence, options = {}) {
     const nucleicHere = row + 1 === nucleicRow ? "own" : MSA_GAP;
     for (let token = 0; token < tokens; token += 1) {
       const column = msaColumnOfToken[token];
+      // (a nucleic token WITH a column is read from the alignment like any other)
       if (column < 0 && nucleicToken[token]) {
         msa[base + token] = nucleicHere === "own" ? aatype[token] : MSA_GAP;
         continue;
@@ -992,17 +995,36 @@ export function featuriseProtein(sequence, options = {}) {
   // alignment beyond itself - gets a profile of its own sequence: measured as
   // exactly 1.0 at restype 26 for a leading A. Letting it fall out of the loop
   // below would put that 1.0 at MSA_GAP instead, which says the chain is absent.
-  for (let row = 0; row < profileDepth; row += 1) {
-    for (let token = 0; token < tokens; token += 1) {
-      if (nucleicToken[token]) continue;
+  const ownProfile = (token) => nucleicToken[token] && msaColumnOfToken[token] < 0;
+  // 🔴 EACH CHAIN'S PROFILE OVER ITS OWN ROWS, NOT THE MERGED BLOCK'S. AF3 computes it per chain
+  // before stacking the chains' unpaired rows side by side, so the gap rows that pad a shorter
+  // chain's alignment to the deepest one's are not part of it: a 3-row protein beside a 4-row RNA
+  // is averaged over 3. A chain's depth is its last row with a residue in any of its columns.
+  const depthOfChain = new Map();
+  for (let token = 0; token < polymerTokens; token += 1) {
+    if (ownProfile(token) || msaColumnOfToken[token] < 0) continue;
+    const chain = chainOfResidue[residueOfToken[token]];
+    let deepest = depthOfChain.get(chain) ?? 1;
+    for (let row = profileDepth - 1; row >= deepest; row -= 1) {
       const code = codeAt(row, token);
-      if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / profileDepth;
-      deletionMean[token] += deletionAt(row, token) / profileDepth;
+      if (code >= 0 && code !== MSA_GAP) { deepest = row + 1; break; }
+    }
+    depthOfChain.set(chain, deepest);
+  }
+  const depthOf = (token) => (token < polymerTokens && residueOfToken[token] >= 0
+    ? depthOfChain.get(chainOfResidue[residueOfToken[token]]) ?? profileDepth : profileDepth);
+  for (let token = 0; token < tokens; token += 1) {
+    if (ownProfile(token)) continue;
+    const depth = depthOf(token);
+    for (let row = 0; row < depth; row += 1) {
+      const code = codeAt(row, token);
+      if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / depth;
+      deletionMean[token] += deletionAt(row, token) / depth;
     }
   }
 
   for (let token = 0; token < tokens; token += 1) {
-    if (nucleicToken[token]) profile[token * RESTYPES + aatype[token]] = 1;
+    if (ownProfile(token)) profile[token * RESTYPES + aatype[token]] = 1;
   }
 
   // 🔴 THE NAME THE MODEL READS AND THE NAME A PDB CARRIES ARE NOT THE SAME

@@ -70,6 +70,9 @@ def main():
                         help="modified residue as CODE@POSITION, e.g. SEP@3 (1-based)")
     # a nucleic chain and its modified bases: `--kind dna --mods 5CM@5,5CM@9`
     parser.add_argument("--kind", default="protein", choices=["protein", "dna", "rna"])
+    # several polymer chains, each with its own unpaired alignment (A3M file, or "" for none):
+    # KIND:SEQUENCE[:A3M],KIND:SEQUENCE[:A3M],... - replaces --sequence/--kind
+    parser.add_argument("--chains", default=None)
     parser.add_argument("--mods", default=None,
                         help="modified bases or residues as CODE@POSITION[,...] (1-based)")
     # components the installed dictionary lacks (af3-any-model's pip install carries a minimal one,
@@ -92,7 +95,23 @@ def main():
     from alphafold3.model import feat_batch
 
     chains = None
-    if arguments.kind != "protein" or arguments.mods is not None:
+    if arguments.chains is not None:
+        from alphafold3.common import folding_input
+        chains = []
+        for k, spec in enumerate(arguments.chains.split(",")):
+            kind, seq, *rest = spec.split(":")
+            msa = open(rest[0]).read() if rest and rest[0] else None
+            cid = chr(ord("A") + k)
+            if kind == "protein":
+                chains.append(folding_input.ProteinChain(id=cid, sequence=seq, ptms=[],
+                    unpaired_msa=msa if msa is not None else "", paired_msa="", templates=[]))
+            elif kind == "rna":
+                chains.append(folding_input.RnaChain(id=cid, sequence=seq, modifications=[],
+                    unpaired_msa=msa if msa is not None else ""))
+            else:
+                chains.append(folding_input.DnaChain(id=cid, sequence=seq, modifications=[]))
+        arguments.sequence = ":".join(spec.split(":")[1] for spec in arguments.chains.split(","))
+    elif arguments.kind != "protein" or arguments.mods is not None:
         from alphafold3.common import folding_input
         mods = []
         for spec in (arguments.mods or "").split(","):

@@ -143,13 +143,15 @@ export function concatenateA3mBlocks(pairedA3m, unpairedA3m) {
  * column having no insertions before it.
  *
  * @param {readonly string[]} a3mTexts one A3M per physical chain
+ * @param {{anyLetter?: boolean}} [options]
  * @returns {string}
  */
-export function mergeRowAlignedChainA3ms(a3mTexts) {
+export function mergeRowAlignedChainA3ms(a3mTexts, { anyLetter = false } = {}) {
   if (!Array.isArray(a3mTexts) || a3mTexts.length === 0) {
     throw new RangeError("at least one chain A3M is required");
   }
-  const alignments = a3mTexts.map((text) => parseA3m(text));
+  // (`anyLetter`: chains of nucleic acids among them, whose U and T are residues - parseA3m)
+  const alignments = a3mTexts.map((text) => parseA3m(text, { anyLetter }));
   const lengths = alignments.map((alignment) => alignment.length);
   const depth = Math.max(...alignments.map((alignment) => alignment.depth));
   const lines = [];
