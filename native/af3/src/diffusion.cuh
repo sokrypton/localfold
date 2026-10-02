@@ -348,15 +348,23 @@ __global__ void gatedAddAdaLnWarpK(float* act, const float* y, const float* gate
     o[3] = fromF<TO>(sigm(sc.w) * ((v[k].w - mean) * inv) + sh.w);
   }
 }
-// A block a row, one float4 a thread (C/4 threads), the row held in registers.
-template <class TO>
-__global__ void gatedAddAdaLnVecK(float* act, const float* y, const float* gate, int ldg, const float* scale,
-                                  const float* shift, int lds, TO* out, int C, int period) {
+// four consecutive values as f32, from f32 or f16
+__device__ __forceinline__ float4 load4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ float4 load4(const half* p) {
+  uint2 u = *reinterpret_cast<const uint2*>(p);
+  float2 a = __half22float2(*reinterpret_cast<half2*>(&u.x)), b = __half22float2(*reinterpret_cast<half2*>(&u.y));
+  return make_float4(a.x, a.y, b.x, b.y);
+}
+// A block a row, one float4 a thread (C/4 threads), the row held in registers. TI: y, gate,
+// scale and shift (f16 on the fast path - half the bytes of a kernel that is all bytes).
+template <class TO, class TI>
+__global__ void gatedAddAdaLnVecK(float* act, const TI* y, const TI* gate, int ldg, const TI* scale,
+                                  const TI* shift, int lds, TO* out, int C, int period) {
   __shared__ float red[32];
   size_t r = blockIdx.x, pr = r % period; int c = threadIdx.x * 4;
   float4 x = *(float4*)(act + r * C + c);
   if (y) {
-    float4 yy = *(const float4*)(y + r * C + c), g = *(const float4*)(gate + pr * ldg + c);
+    float4 yy = load4(y + r * C + c), g = load4(gate + pr * ldg + c);
     x.x += yy.x * sigm(g.x); x.y += yy.y * sigm(g.y); x.z += yy.z * sigm(g.z); x.w += yy.w * sigm(g.w);
     *(float4*)(act + r * C + c) = x;
   }
@@ -373,26 +381,28 @@ __global__ void gatedAddAdaLnVecK(float* act, const float* y, const float* gate,
   float dx = x.x - mean, dy = x.y - mean, dz = x.z - mean, dw = x.w - mean;
   float inv = rsqrtf(blockSum(dx * dx + dy * dy + dz * dz + dw * dw) / C + 1e-5f);
   if (!out) return;
-  float4 sc = *(const float4*)(scale + pr * lds + c), sh = *(const float4*)(shift + pr * lds + c);
+  float4 sc = load4(scale + pr * lds + c), sh = load4(shift + pr * lds + c);
   TO* o = out + r * C + c;
   o[0] = fromF<TO>(sigm(sc.x) * (dx * inv) + sh.x); o[1] = fromF<TO>(sigm(sc.y) * (dy * inv) + sh.y);
   o[2] = fromF<TO>(sigm(sc.z) * (dz * inv) + sh.z); o[3] = fromF<TO>(sigm(sc.w) * (dw * inv) + sh.w);
 }
 // (gate, scale and shift shared by the samples: row r reads row r % period)
-template <class TO>
-void gatedAddAdaLn(float* act, const float* y, const float* gate, int ldg, const float* scale, const float* shift,
+template <class TO, class TI>
+void gatedAddAdaLn(float* act, const TI* y, const TI* gate, int ldg, const TI* scale, const TI* shift,
                    int lds, TO* out, int rows, int C, int period) {
   if (C % 128 == 0 && C / 4 <= 1024 && ldg % 4 == 0 && lds % 4 == 0)
-    gatedAddAdaLnVecK<TO><<<rows, C / 4, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period);
-  else
+    gatedAddAdaLnVecK<TO, TI><<<rows, C / 4, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period);
+  else if constexpr (std::is_same_v<TI, float>)
     gatedAddAdaLnK<TO><<<rows, 256, C * 4, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C, period);
+  else { fprintf(stderr, "gatedAddAdaLn: no f16-input kernel for %d channels\n", C); exit(1); }
 }
 // x += y * sigmoid(gate) with the gate read at a row stride, row r % period
-__global__ void addGatedStridedK(float* x, const float* y, const float* gate, int ld, size_t rows, int C, int period) {
+template <class TI>
+__global__ void addGatedStridedK(float* x, const TI* y, const TI* gate, int ld, size_t rows, int C, int period) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * C) return;
   size_t r = t / C; int c = (int)(t % C);
-  x[t] += y[t] * sigm(gate[(r % period) * ld + c]);
+  x[t] += toF(y[t]) * sigm(toF(gate[(r % period) * ld + c]));
 }
 // x[k * n + i] += v[i] for every sample k (n elements a sample)
 __global__ void addBroadcastK(float* x, const float* v, size_t n, size_t total) {
@@ -511,10 +521,10 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   T* cn = scratch<T>("dt.cn", (size_t)n * Ca);
   T* condT = scratch<T>("dt.condT", (size_t)n * Ca);
   layerNormPlainOnesK<T><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(cond, cn, condT, n, Cc, Ca);
-  float* gNorm = scratch<float>("dt.gNorm", (size_t)n * ldn);
-  float* gRaw = scratch<float>("dt.gRaw", (size_t)n * ldr);
-  linear<T, float>(cn, gNorm, n, Ca, ldn, tc.wNorm);
-  linear<T, float>(condT, gRaw, n, Ca, ldr, tc.wRaw);
+  T* gNorm = scratch<T>("dt.gNorm", (size_t)n * ldn);
+  T* gRaw = scratch<T>("dt.gRaw", (size_t)n * ldr);
+  linear<T, T>(cn, gNorm, n, Ca, ldn, tc.wNorm);
+  linear<T, T>(condT, gRaw, n, Ca, ldr, tc.wRaw);
   // the key mask once per sample (the flash kernel reads it per row of its batch)
   const float* maskRows = mask;
   if (NS > 1) {
@@ -527,19 +537,19 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   float* logits = scratch<float>("dt.logits", (size_t)heads * pairs);
   T* P = scratch<T>("dt.P", (size_t)heads * pairs);
   T* o = scratch<T>("dt.o", rows * Wd);
-  float* att = scratch<float>("dt.att", rows * C);
+  T* att = scratch<T>("dt.att", rows * C);
   T* tn = scratch<T>("dt.tn", rows * C);
   int I = C * factor;
   T* wide = scratch<T>("dt.wide", rows * 2 * I);
   T* gated = scratch<T>("dt.gated", rows * I);
-  float* proj = scratch<float>("dt.proj", rows * C);
+  T* proj = scratch<T>("dt.proj", rows * C);
   const float one = 1.f, zero = 0.f;
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   for (int b = 0; b < tc.nblocks; ++b) {
     std::string B = Tn + ".superBlocks." + std::to_string(b / perSuper) + ".blocks." + std::to_string(b % perSuper);
-    const float* g = gNorm + (size_t)b * 4 * C; const float* z = gRaw + (size_t)b * 2 * C;
+    const T* g = gNorm + (size_t)b * 4 * C; const T* z = gRaw + (size_t)b * 2 * C;
     // the previous block's transition residual, fused with this block's first adaptive LN
-    const float* zPrev = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C + C : nullptr;
+    const T* zPrev = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C + C : nullptr;
     gatedAddAdaLn<T>(act, b > 0 ? proj : nullptr, zPrev, ldr, g, g + C, ldn, x, (int)rows, C, n);
     linear<T, T>(x, qkvg, rows, C, 4 * Wd, qkvgWeight(B, C, Wd, false));
     if constexpr (std::is_same_v<T, half>) {
@@ -559,14 +569,14 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       }
       gateTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(o, qkvg, (int)rows, Wd);
     }
-    linear<T, float>(o, att, rows, Wd, C, B + ".Transition2");
+    linear<T, T>(o, att, rows, Wd, C, B + ".Transition2");
     gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
     linear<T, T>(tn, wide, rows, C, 2 * I, B + ".ffwTransition1");
     swiglu<T>(wide, gated, rows, I);
-    linear<T, float>(gated, proj, rows, I, C, B + ".ffwTransition2");
+    linear<T, T>(gated, proj, rows, I, C, B + ".ffwTransition2");
   }
   // the last block's transition residual
-  addGatedStridedK<<<blocks(rows * C), 256, 0, STREAM>>>(act, proj, gRaw + (size_t)(tc.nblocks - 1) * 2 * C + C, ldr,
+  addGatedStridedK<T><<<blocks(rows * C), 256, 0, STREAM>>>(act, proj, gRaw + (size_t)(tc.nblocks - 1) * 2 * C + C, ldr,
                                                          rows, C, n);
 }
 
