@@ -329,6 +329,93 @@ __global__ void atomAttentionFusedK(const T* qg, const float* qBias, const T* kv
     __syncwarp();
   }
 }
+
+// The same attention on the tensor cores, for the f16 path at D = 32, 128 keys, 32 queries:
+// two warps of 16 queries a (subset, head); S = Q K^T in registers (mma.sync m16n8k16), the pair
+// logits and mask added there, the softmax over the 128 keys in registers, O = P V with P's
+// accumulators reused as the A operand, the gate applied on the way out.
+template <int D, int KEYS>
+__global__ void __launch_bounds__(64) atomAttentionMMA(const half* qg, const float* qBias, const half* kv,
+    const float* qMask, const float* kMask, const float* pairLogits, half* out, int queries, int heads,
+    bool keyMasked, float scale) {
+  constexpr int LD = D + 8;
+  __shared__ __align__(16) half Ks[KEYS * LD];
+  __shared__ __align__(16) half Vs[KEYS * LD];
+  int s = blockIdx.x, h = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  const int Wd = heads * D, W2 = 2 * Wd;
+  for (int t = threadIdx.x; t < KEYS * (D / 8) * 2; t += 64) {
+    int which = t / (KEYS * (D / 8)), u = t % (KEYS * (D / 8)), key = u / (D / 8), c = (u % (D / 8)) * 8;
+    const half* src = kv + ((size_t)s * KEYS + key) * W2 + which * Wd + h * D + c;
+    *reinterpret_cast<uint4*>((which ? Vs : Ks) + key * LD + c) = *reinterpret_cast<const uint4*>(src);
+  }
+  __syncthreads();
+  int q0 = warp * 16, r0 = q0 + g, r1 = r0 + 8;
+  size_t i0 = (size_t)s * queries + r0, i1 = (size_t)s * queries + r1;
+  float qs = scale * LOG2E;
+  auto q2 = [&](size_t i, int e) -> uint32_t {
+    float2 f = __half22float2(*reinterpret_cast<const half2*>(qg + i * W2 + h * D + e));
+    return pack2((f.x + qBias[h * D + e]) * qs, (f.y + qBias[h * D + e + 1]) * qs);
+  };
+  uint32_t qa[D / 16][4];
+  for (int ks = 0; ks < D / 16; ++ks) {
+    int e = ks * 16 + tig * 2;
+    qa[ks][0] = q2(i0, e); qa[ks][1] = q2(i1, e); qa[ks][2] = q2(i0, e + 8); qa[ks][3] = q2(i1, e + 8);
+  }
+  float sv[KEYS / 8][4];
+  for (int nt = 0; nt < KEYS / 8; ++nt) {
+    uint32_t kb[4];
+    ldsm4(kb, Ks + (nt * 8 + (lane & 7)) * LD + (lane >> 3) * 8);
+    sv[nt][0] = sv[nt][1] = sv[nt][2] = sv[nt][3] = 0.f;
+    mma16816(sv[nt], qa[0], kb[0], kb[1]);
+    mma16816(sv[nt], qa[1], kb[2], kb[3]);
+  }
+  const float* pl0 = pairLogits + (((size_t)s * heads + h) * queries + r0) * KEYS;
+  const float* pl1 = pairLogits + (((size_t)s * heads + h) * queries + r1) * KEYS;
+  float qm0 = qMask[i0], qm1 = qMask[i1];
+  float m0 = -INFINITY, m1 = -INFINITY;
+  for (int nt = 0; nt < KEYS / 8; ++nt) {
+    int key = nt * 8 + tig * 2;
+    float2 b0 = *reinterpret_cast<const float2*>(pl0 + key), b1 = *reinterpret_cast<const float2*>(pl1 + key);
+    float km0 = kMask[(size_t)s * KEYS + key], km1 = kMask[(size_t)s * KEYS + key + 1];
+    auto mb = [&](float qm, float km) {
+      return keyMasked ? -1e9f * ((1.f - qm) + (1.f - km)) : 1e9f * (qm - 1.f) * (km - 1.f);
+    };
+    sv[nt][0] += (b0.x + mb(qm0, km0)) * LOG2E; sv[nt][1] += (b0.y + mb(qm0, km1)) * LOG2E;
+    sv[nt][2] += (b1.x + mb(qm1, km0)) * LOG2E; sv[nt][3] += (b1.y + mb(qm1, km1)) * LOG2E;
+    m0 = fmaxf(m0, fmaxf(sv[nt][0], sv[nt][1])); m1 = fmaxf(m1, fmaxf(sv[nt][2], sv[nt][3]));
+  }
+  m0 = fmaxf(m0, __shfl_xor_sync(~0u, m0, 1)); m0 = fmaxf(m0, __shfl_xor_sync(~0u, m0, 2));
+  m1 = fmaxf(m1, __shfl_xor_sync(~0u, m1, 1)); m1 = fmaxf(m1, __shfl_xor_sync(~0u, m1, 2));
+  float l0 = 0, l1 = 0;
+  for (int nt = 0; nt < KEYS / 8; ++nt) {
+    sv[nt][0] = exp2f(sv[nt][0] - m0); sv[nt][1] = exp2f(sv[nt][1] - m0);
+    sv[nt][2] = exp2f(sv[nt][2] - m1); sv[nt][3] = exp2f(sv[nt][3] - m1);
+    l0 += sv[nt][0] + sv[nt][1]; l1 += sv[nt][2] + sv[nt][3];
+  }
+  l0 += __shfl_xor_sync(~0u, l0, 1); l0 += __shfl_xor_sync(~0u, l0, 2);
+  l1 += __shfl_xor_sync(~0u, l1, 1); l1 += __shfl_xor_sync(~0u, l1, 2);
+  float o[D / 8][4] = {};
+  for (int t = 0; t < KEYS / 16; ++t) {
+    uint32_t pa[4] = { pack2(sv[2 * t][0], sv[2 * t][1]), pack2(sv[2 * t][2], sv[2 * t][3]),
+                       pack2(sv[2 * t + 1][0], sv[2 * t + 1][1]), pack2(sv[2 * t + 1][2], sv[2 * t + 1][3]) };
+    for (int et = 0; et < D / 8; et += 2) {
+      uint32_t vb[4];
+      ldsm4t(vb, Vs + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LD + (et + (lane >> 4)) * 8);
+      mma16816(o[et], pa, vb[0], vb[1]);
+      mma16816(o[et + 1], pa, vb[2], vb[3]);
+    }
+  }
+  for (int et = 0; et < D / 8; ++et) {
+    int e = et * 8 + tig * 2;
+    const half* g0 = qg + i0 * W2 + Wd + h * D + e; const half* g1 = qg + i1 * W2 + Wd + h * D + e;
+    half* o0 = out + i0 * Wd + h * D + e; half* o1 = out + i1 * Wd + h * D + e;
+    o0[0] = __float2half(o[et][0] / l0 * sigm(__half2float(g0[0])));
+    o0[1] = __float2half(o[et][1] / l0 * sigm(__half2float(g0[1])));
+    o1[0] = __float2half(o[et][2] / l1 * sigm(__half2float(g1[0])));
+    o1[1] = __float2half(o[et][3] / l1 * sigm(__half2float(g1[1])));
+  }
+}
+
 // One block of the cross-attention transformer, in place on act [queryRows][C], from the block's cache.
 // T is the GEMM inputs' type (f16 on the fast path); the residual stream stays f32.
 template <class T>
@@ -348,8 +435,18 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
   T* gathered = scratch<T>("ab.gathered", qRows * Wd);
   int warps = 8;
   size_t smem = ((size_t)sh.keys * (D + 1) * 2 + (size_t)warps * sh.keys + (size_t)warps * D) * 4;
-  atomAttentionFusedK<T><<<dim3(sh.subsets, heads), warps * 32, smem, STREAM>>>(
-    qg, W(B + ".qBias"), kv, st.qMask, st.kMask, bc.pairLogits, gathered, sh.queries, sh.keys, heads, D, st.keyMasked);
+  if constexpr (std::is_same_v<T, half>) {
+    if (D == 32 && sh.keys == 128 && sh.queries == 32)
+      atomAttentionMMA<32, 128><<<dim3(sh.subsets, heads), 64, 0, STREAM>>>(
+        qg, W(B + ".qBias"), kv, st.qMask, st.kMask, bc.pairLogits, gathered, sh.queries, heads, st.keyMasked,
+        1.f / sqrtf((float)D));
+    else
+      atomAttentionFusedK<T><<<dim3(sh.subsets, heads), warps * 32, smem, STREAM>>>(
+        qg, W(B + ".qBias"), kv, st.qMask, st.kMask, bc.pairLogits, gathered, sh.queries, sh.keys, heads, D, st.keyMasked);
+  } else {
+    atomAttentionFusedK<T><<<dim3(sh.subsets, heads), warps * 32, smem, STREAM>>>(
+      qg, W(B + ".qBias"), kv, st.qMask, st.kMask, bc.pairLogits, gathered, sh.queries, sh.keys, heads, D, st.keyMasked);
+  }
   float* attention = scratch<float>("ab.attention", qRows * C);
   linear<T, float>(gathered, attention, qRows, Wd, C, B + ".Transition2");
   T* tn = scratch<T>("ab.tn", qRows * C);
