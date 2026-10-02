@@ -295,11 +295,13 @@ __global__ void addGridK(float* pair, const float* out, int n, int C, size_t r0,
   v.x += o.x; v.y += o.y; v.z += o.z; v.w += o.w;
   *p = v;
 }
-__global__ void addGateBiasK(float* qkvg, const float* bias, size_t rows, int Wd) {
+template <class T>
+__global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * Wd) return;
   size_t r = t / Wd; int c = (int)(t % Wd);
-  qkvg[r * 4 * Wd + 3 * Wd + c] += bias[c];
+  T& g = qkvg[r * 4 * Wd + 3 * Wd + c];
+  g = fromF<T>(toF(g) + bias[c]);
 }
 
 // Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
@@ -358,7 +360,6 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   std::string qkvg = qkvgWeight(pre, C, Wd, true);
   const float* gateBias = hasW(pre + ".gatingQueryBias") ? W(pre + ".gatingQueryBias") : nullptr;
   const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;
-  if (fast && gateBias) { fprintf(stderr, "%s: a gate bias on the f16 path is not wired\n", pre.c_str()); exit(1); }
   size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
   float scale = 1.f / sqrtf((float)D);
   for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
@@ -372,7 +373,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     }
     T* qkvgOut = scratch<T>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
     linear<T, T>(act, qkvgOut, prs, C, 4 * Wd, qkvg);
-    if constexpr (!fast) if (gateBias) addGateBiasK<<<blocks(prs * Wd), 256, 0, STREAM>>>(qkvgOut, gateBias, prs, Wd);
+    if (gateBias) addGateBiasK<T><<<blocks(prs * Wd), 256, 0, STREAM>>>(qkvgOut, gateBias, prs, Wd);
     T* gathered = scratch<T>("grid.gathered", prs * Wd);
     flashGrid<T>(qkvgOut, bias, stride, mask, gathered, n, heads, D, r0, rows, tr, scale);
     if (!tr && !outBias) {

@@ -35,8 +35,10 @@ __global__ void relativeEncodingK(const int* residueIndex, const int* tokenIndex
 }
 // msa = one_hot(32) + clip(deletion) + atan(deletion/3)*2/pi, projected, plus the target
 // feature's projection broadcast over rows.
+// (width 35: an is_paired column, set on the query row (row < n) only where `pairedQuery` - boltz2
+// says yes, rosettafold3 carries the column and leaves it zero)
 __global__ void msaEmbedK(const int* rows, const float* deletion, const float* Wmsa, const float* fromTarget,
-                          float* msa, size_t count, int n, int C) {
+                          float* msa, size_t count, int n, int C, int width, bool pairedQuery) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= count * C) return;
   int c = (int)(t % C); size_t row = t / C; int token = (int)(row % n);
@@ -44,6 +46,7 @@ __global__ void msaEmbedK(const int* rows, const float* deletion, const float* W
   float v = (code >= 0 && code < 32) ? Wmsa[(size_t)code * C + c] : 0.f;
   v += fminf(fmaxf(d, 0.f), 1.f) * Wmsa[(size_t)32 * C + c];
   v += atanf(d / 3.f) * (2.f / 3.14159265358979f) * Wmsa[(size_t)33 * C + c];
+  if (width > 34 && pairedQuery && row < (size_t)n) v += Wmsa[(size_t)34 * C + c];
   msa[t] = v + fromTarget[(size_t)token * C + c];
 }
 
@@ -124,9 +127,11 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   float* fromTarget = scratch<float>("emb.fromTarget", (size_t)n * t.Cm);
   linear<float, float>(t.targetFeat, fromTarget, n, t.F, t.Cm, E + "extraMsaTargetFeat");
   size_t rows = (size_t)t.S * n;
-  if (lenW(E + "msaActivations") != (size_t)34 * t.Cm) { fprintf(stderr, "msa feature width != 34\n"); exit(1); }
+  int msaWidth = (int)(lenW(E + "msaActivations") / t.Cm);
+  if (msaWidth != 34 && msaWidth != 35) { fprintf(stderr, "msa feature width %d\n", msaWidth); exit(1); }
   msaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, W(E + "msaActivations"),
-                                                     fromTarget, t.msa, rows, n, t.Cm);
+                                                     fromTarget, t.msa, rows, n, t.Cm, msaWidth,
+                                                     M.flag("trunk.dialect.msaPairedQueryRow"));
   linear<float, float>(t.targetFeat, t.single, n, t.F, t.Cs, E + "singleActivations");
   T* sln = scratch<T>("emb.prevsln", (size_t)n * t.Cs);
   layerNorm2<float, T>(t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale",
@@ -235,6 +240,11 @@ void templateEmbedding(Trunk& t, float* out) {
 
 // ---------------------------------------------------------------- MSA stack
 template <class T>
+__global__ void biasRowsK(T* x, const float* b, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) x[t] = fromF<T>(toF(x[t]) + b[t % C]);
+}
+template <class T>
 __global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) x[t] = fromF<T>(toF(x[t]) * mask[t / C]);
@@ -271,7 +281,10 @@ void outerProductMean(Trunk& t, const std::string& pre) {
   T* L = scratch<T>("opm.left", rows * O); T* R = scratch<T>("opm.right", rows * O);
   linear<T, T>(ln, L, rows, Cm, O, pre + ".leftProjection");
   linear<T, T>(ln, R, rows, Cm, O, pre + ".rightProjection");
-  if (hasW(pre + ".leftProjectionBias")) { fprintf(stderr, "opm biases: not ported yet\n"); exit(1); }
+  if (hasW(pre + ".leftProjectionBias")) {      // rosettafold3's biased projections, before the mask
+    biasRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(L, W(pre + ".leftProjectionBias"), rows, O);
+    biasRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(R, W(pre + ".rightProjectionBias"), rows, O);
+  }
   scaleRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(L, t.msaMask, rows, O);
   scaleRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(R, t.msaMask, rows, O);
   // norm[i][j] = sum_s mask[s][i] mask[s][j]

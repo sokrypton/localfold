@@ -186,7 +186,10 @@ int main(int argc, char** argv) {
       // pseudo-beta off the structure, then the confidence head
       std::vector<float> beta((size_t)t.n * 3);
       const int* pbIdx = M.i("batch.tokenAtomsToPseudoBeta.indices"); const float* pbMask = M.f("batch.tokenAtomsToPseudoBeta.mask");
-      for (int r = 0; r < t.n; ++r) for (int a = 0; a < 3; ++a) beta[r * 3 + a] = pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
+      // rf3's head reads the token-centre CA (dense slot 1), not the pseudo-beta
+      bool ca = M.flag("trunk.dialect.confidenceCaDgram");
+      for (int r = 0; r < t.n; ++r) for (int a = 0; a < 3; ++a)
+        beta[r * 3 + a] = ca ? xk[((size_t)r * dense + 1) * 3 + a] : pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
       float* dBeta = upload(beta.data(), beta.size());
       ConfidenceOut ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
       CK(cudaFree(dBeta));

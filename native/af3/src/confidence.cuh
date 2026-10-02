@@ -8,13 +8,22 @@
 // (Wdist: protenix2's second, unbinned distance term - a bias-free projection of the raw distance)
 __global__ void confidencePairInitK(float* pair, const float* left, const float* right, const float* beta,
                                     const float* pairMask, const float* Wd, int n, int C, int bins,
-                                    float dmin, float dmax, const float* Wdist) {
+                                    float dmin, float dmax, const float* Wdist, bool caBins) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * n * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
   float sq = 0;
   for (int k = 0; k < 3; ++k) { float d = beta[i * 3 + k] - beta[j * 3 + k]; sq += d * d; }
   float v = left[(size_t)j * C + c] + right[(size_t)i * C + c];
+  if (caBins) {
+    // rf3's: the bin is how many of `bins - 1` evenly spaced bounds the (real, +1e-10) distance is past
+    double distance = sqrt((double)sq + 1e-10);
+    int bin = 0;
+    for (int at = 0; at < bins - 1; ++at) if (distance > dmin + at * ((double)(dmax - dmin) / (bins - 1))) ++bin;
+    v += Wd[(size_t)bin * C + c] * pairMask[ij];
+    pair[t] += v;
+    return;
+  }
   for (int b = 0; b < bins; ++b) {
     double lo = dmin + (double)(dmax - dmin) * b / (bins - 1), hi = dmin + (double)(dmax - dmin) * (b + 1) / (bins - 1);
     double lower = lo * lo, upper = b + 1 < bins ? hi * hi : 1e8;
@@ -41,6 +50,47 @@ __global__ void expectationK(const float* logits, float* out, const float* mask,
 }
 
 inline bool CONF_HALF = false;   // the head's four pairformer blocks in f16
+// rf3's parameter-free LayerNorm over a WHOLE tensor, real rows only (mask per row), the mean
+// and variance over `vendorWidth` columns (wider than C: the extra ones zero, each adding mean^2).
+// Deterministic: per-block partials, then one block sums them in order.
+__global__ void maskedSumK(const float* x, const float* mask, size_t rows, int C, const double* mean, double* partial) {
+  __shared__ double red[256];
+  double acc = 0;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < rows * C; i += (size_t)gridDim.x * blockDim.x) {
+    if (!(mask[i / C] > 0)) continue;
+    double v = x[i];
+    if (mean) { v -= *mean; v *= v; }
+    acc += v;
+  }
+  red[threadIdx.x] = acc; __syncthreads();
+  for (int w = blockDim.x / 2; w; w >>= 1) { if (threadIdx.x < w) red[threadIdx.x] += red[threadIdx.x + w]; __syncthreads(); }
+  if (threadIdx.x == 0) partial[blockIdx.x] = red[0];
+}
+__global__ void globalStatK(const double* partial, int parts, const float* mask, size_t rows, int C, int vendorWidth,
+                            double* stat, int which) {
+  if (threadIdx.x || blockIdx.x) return;
+  double total = 0; for (int k = 0; k < parts; ++k) total += partial[k];
+  double live = 0; for (size_t r = 0; r < rows; ++r) live += mask[r] > 0;
+  double count = fmax(live * vendorWidth, 1.0);
+  if (which == 0) stat[0] = total / count;                      // the mean
+  else {                                                        // 1 / std
+    double variance = total + (double)(vendorWidth - C) * live * stat[0] * stat[0];
+    stat[1] = 1.0 / sqrt(variance / count + 1e-5);
+  }
+}
+__global__ void applyGlobalNormK(float* x, size_t n, const double* stat) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = (float)((x[i] - stat[0]) * stat[1]);
+}
+inline void maskedGlobalNorm(float* x, const float* rowMask, size_t rows, int C, int vendorWidth) {
+  const int parts = 512;
+  double* partial = scratch<double>("gn.partial", parts); double* stat = scratch<double>("gn.stat", 2);
+  maskedSumK<<<parts, 256, 0, STREAM>>>(x, rowMask, rows, C, nullptr, partial);
+  globalStatK<<<1, 1, 0, STREAM>>>(partial, parts, rowMask, rows, C, vendorWidth, stat, 0);
+  maskedSumK<<<parts, 256, 0, STREAM>>>(x, rowMask, rows, C, stat, partial);
+  globalStatK<<<1, 1, 0, STREAM>>>(partial, parts, rowMask, rows, C, vendorWidth, stat, 1);
+  applyGlobalNormK<<<blocks(rows * C), 256, 0, STREAM>>>(x, rows * C, stat);
+}
 __global__ void clampK(float* x, float limit, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = fminf(limit, fmaxf(-limit, x[i]));
 }
@@ -51,9 +101,8 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   const std::string P = "confidence";
   int C = (int)M.meta(P + ".pairChannels"), Cs = (int)M.meta(P + ".singleChannels"), F = (int)M.meta(P + ".targetFeatWidth");
   int dense = (int)M.meta("batch.dense");
-  for (const char* f : {"trunk.dialect.confidenceGlobalNorm", "trunk.dialect.reembedConfidencePair",
-                        "trunk.dialect.confidenceCaDgram"})
-    if (M.flag(f)) { fprintf(stderr, "%s: not ported\n", f); exit(1); }
+  if (M.flag("trunk.dialect.reembedConfidencePair")) { fprintf(stderr, "reembedConfidencePair: not ported\n"); exit(1); }
+  bool caDgram = M.flag("trunk.dialect.confidenceCaDgram");
   if (hasW(P + ".interHalfDistanceLogits") || !hasW(P + ".logitsLnScale")) {
     fprintf(stderr, "confidence head variant (split heads / no head LayerNorm): not ported\n"); exit(1);
   }
@@ -62,12 +111,23 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
   CK(cudaMemcpyAsync(single, trunkSingle, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+  if (M.flag("trunk.dialect.confidenceGlobalNorm")) {
+    // rf3 normalises every detached trunk input over the whole tensor first (target_feat over the
+    // vendor's 449 columns, two wider than ours)
+    float* tf = scratch<float>("conf.targetFeat", (size_t)n * F);
+    CK(cudaMemcpyAsync(tf, targetFeat, (size_t)n * F * 4, cudaMemcpyDeviceToDevice, STREAM));
+    maskedGlobalNorm(pair, pairMask, pairs, C, C);
+    maskedGlobalNorm(single, seqMask, n, Cs, Cs);
+    maskedGlobalNorm(tf, seqMask, n, F, 449);
+    targetFeat = tf;
+  }
   float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
   linear<float, float>(targetFeat, left, n, F, C, P + ".leftTargetFeatProject");
   linear<float, float>(targetFeat, right, n, F, C, P + ".rightTargetFeatProject");
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
   confidencePairInitK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, pseudoBeta, pairMask,
-    W(P + ".distogramFeatProject"), n, C, bins, 3.25f, 50.75f, Wopt(P + ".distanceFeatProject"));
+    W(P + ".distogramFeatProject"), n, C, bins, 3.25f, 50.75f, Wopt(P + ".distanceFeatProject"), caDgram);
+  if (bins != (caDgram ? 40 : 39)) { fprintf(stderr, "confidence distogram has %d bins\n", bins); exit(1); }
   if (hasW(P + ".inputSingleNormScale")) {
     // the trunk single clamped to +-512 and LayerNormed before any use (protenix2)
     clampK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, 512.f, (size_t)n * Cs);

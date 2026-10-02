@@ -479,8 +479,7 @@ inline void prepareTransformer(const float* pairCond, int n) {
   int heads = (int)M.meta(T + ".heads"), perSuper = (int)M.meta(T + ".blocksPerSuperBlock");
   // a per-block pair LayerNorm (OpenDDE, protenix2) arrives folded into AF3's layout - its scales
   // inside the per-block projections, the shared scale all ones - so it needs nothing here
-  if (M.flag(T + ".noResidual")) { fprintf(stderr, "transformer without its residual (rf3): not ported\n"); exit(1); }
-  if (hasW(T + ".superBlocks.0.blocks.0.queryLayerNormScale")) { fprintf(stderr, "transformer q/k LayerNorm (rf3): not ported\n"); exit(1); }
+
   TransformerCache& tc = TCACHE;
   size_t pairs = (size_t)n * n;
   std::vector<std::string> names;
@@ -544,6 +543,30 @@ inline void prepareTransformer(const float* pairCond, int n) {
   tc.n = n; tc.ready = true;
 }
 
+// q and k LayerNormed over each token's whole heads x dimension row, two-pass, scale and offset
+// (rf3's kq_norm: after the projection and its bias, before the key_dim scaling); a block a row
+template <class T>
+__global__ void kqNormK(T* qkvg, const float* qs, const float* qo, const float* ks, const float* ko, int Wd) {
+  __shared__ float red[32];
+  T* row = qkvg + (size_t)blockIdx.x * 4 * Wd;
+  auto blockSum = [&](float v) {
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = v;
+    __syncthreads();
+    float t = 0; for (int w = 0; w < (int)(blockDim.x / 32); ++w) t += red[w];
+    return t;
+  };
+  for (int side = 0; side < 2; ++side) {
+    T* x = row + side * Wd; const float* sc = side ? ks : qs; const float* of = side ? ko : qo;
+    float s = 0; for (int c = threadIdx.x; c < Wd; c += blockDim.x) s += toF(x[c]);
+    float mean = blockSum(s) / Wd, q = 0;
+    for (int c = threadIdx.x; c < Wd; c += blockDim.x) { float d = toF(x[c]) - mean; q += d * d; }
+    float inv = rsqrtf(blockSum(q) / Wd + 1e-5f);
+    for (int c = threadIdx.x; c < Wd; c += blockDim.x) x[c] = fromF<T>((toF(x[c]) - mean) * inv * sc[c] + of[c]);
+    __syncthreads();
+  }
+}
 template <class T>
 void diffusionTransformer(float* act, const float* cond, const float* mask, int n) {
   const std::string Tn = "diffusion.transformer";
@@ -581,6 +604,9 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   T* wide = scratch<T>("dt.wide", rows * 2 * I);
   T* gated = scratch<T>("dt.gated", rows * I);
   T* proj = scratch<T>("dt.proj", rows * C);
+  // rf3's block wiring: the transition reads the block's INPUT (both still add to act)
+  bool noResidual = M.flag(Tn + ".noResidual");
+  float* pre = noResidual ? scratch<float>("dt.pre", rows * C) : nullptr;
   const float one = 1.f, zero = 0.f;
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   for (int b = 0; b < tc.nblocks; ++b) {
@@ -589,14 +615,21 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     // the previous block's transition residual, fused with this block's first adaptive LN
     const T* zPrev = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C + C : nullptr;
     gatedAddAdaLn<T>(act, b > 0 ? proj : nullptr, zPrev, ldr, g, g + C, ldn, x, (int)rows, C, n);
+    if (noResidual) CK(cudaMemcpyAsync(pre, act, rows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
     linear<T, T>(x, qkvg, rows, C, 4 * Wd, qkvgWeight(B, C, Wd, false));
+    bool kqNorm = hasW(B + ".queryLayerNormScale");
+    if (kqNorm) {
+      addQBiasTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), (int)rows, Wd);
+      kqNormK<T><<<(unsigned)rows, 256, 0, STREAM>>>(qkvg, W(B + ".queryLayerNormScale"), W(B + ".queryLayerNormOffset"),
+                                                    W(B + ".keyLayerNormScale"), W(B + ".keyLayerNormOffset"), Wd);
+    }
     if constexpr (std::is_same_v<T, half>) {
       // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate;
       // the samples are its batch rows, the pair bias shared
       flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, MASK_ALL_ONES && n > 192 ? nullptr : maskRows, o, n, heads, D, 0, NS, false,
-                      1.f / sqrtf((float)D), W(B + ".qBias"));
+                      1.f / sqrtf((float)D), kqNorm ? nullptr : W(B + ".qBias"));
     } else {
-      addQBiasTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), (int)rows, Wd);
+      if (!kqNorm) addQBiasTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), (int)rows, Wd);
       for (int k = 0; k < NS; ++k) {               // the precise path one sample at a time
         T* qk = qkvg + (size_t)k * n * 4 * Wd; T* ok = o + (size_t)k * n * Wd;
         CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, D, &one, qk + Wd, cudaType<T>(), 4 * Wd, D,
@@ -608,7 +641,12 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       gateTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(o, qkvg, (int)rows, Wd);
     }
     linear<T, T>(o, att, rows, Wd, C, B + ".Transition2");
-    gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
+    if (noResidual) {
+      gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, (T*)nullptr, (int)rows, C, n);
+      gatedAddAdaLn<T>(pre, (const T*)nullptr, (const T*)nullptr, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
+    } else {
+      gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
+    }
     linear<T, T>(tn, wide, rows, C, 2 * I, B + ".ffwTransition1");
     swiglu<T>(wide, gated, rows, I);
     linear<T, T>(gated, proj, rows, I, C, B + ".ffwTransition2");
