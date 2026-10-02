@@ -18,7 +18,7 @@
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
-  uint64_t seed = 42; std::string out = "fold.pdb", weightsDir;
+  uint64_t seed = 42; std::string out = "fold.pdb", weightsDir, seedsArg;
   bool waitInput = false;   // start up (CUDA, the weights on the device) while the input is still being exported
   std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
   for (int i = 2; i < argc; ++i) {
@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
+    else if (!strncmp(argv[i], "--seeds=", 8)) seedsArg = argv[i] + 8;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strncmp(argv[i], "--weights=", 10)) weightsDir = argv[i] + 10;
     else if (!strncmp(argv[i], "--score-pdb=", 12)) return scorePdbMain(argv[i] + 12);
@@ -59,6 +60,8 @@ int main(int argc, char** argv) {
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;
   const uint64_t seedArg = seed;
+  const std::string seedsArg0 = seedsArg;
+  std::vector<uint64_t> seedList;
   if (getenv("FLASH_WARPS")) FLASH_WARPS_OVERRIDE = atoi(getenv("FLASH_WARPS"));   // experiments
   if (getenv("FT_WARPS")) FT_WARPS = atoi(getenv("FT_WARPS"));
   if (getenv("TRI_PAD")) TRI_PAD = atoi(getenv("TRI_PAD"));
@@ -106,6 +109,20 @@ int main(int argc, char** argv) {
   { const float* sm = M.f("batch.seqMask"); size_t k = M.len("batch.seqMask"); MASK_ALL_ONES = true;
     for (size_t i = 0; i < k; ++i) if (!(sm[i] > 0)) MASK_ALL_ONES = false; }
   seed = !seedGiven && M.has("job.seed") ? (uint64_t)M.meta("job.seed") : seedArg;   // the job's own modelSeeds[0]
+  // --seeds=a,b,c, else the job's modelSeeds, else the one seed: AlphaFold 3 runs every seed, each
+  // with its samples, and ranks them all (one trunk serves every seed - the features do not depend
+  // on it - so each seed costs a diffusion and a confidence)
+  seedList.clear();
+  if (!seedsArg.empty()) {
+    for (size_t p = 0; p < seedsArg.size();) {
+      size_t q = seedsArg.find(',', p); if (q == std::string::npos) q = seedsArg.size();
+      seedList.push_back(strtoull(seedsArg.substr(p, q - p).c_str(), nullptr, 10)); p = q + 1;
+    }
+  } else if (!seedGiven && M.has("job.seeds.count")) {
+    for (int k = 0; k < (int)M.meta("job.seeds.count"); ++k) seedList.push_back((uint64_t)M.meta("job.seeds." + std::to_string(k)));
+  } else {
+    seedList.push_back(seed);
+  }
   printf("loaded %zu entries in %.1f s; %d tokens\n", M.index.size(),
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          (int)M.meta("batch.tokens"));
@@ -267,30 +284,43 @@ int main(int argc, char** argv) {
     bool tight = pairs * t.C * 4 > ((size_t)1 << 30);
     if (tight) releaseScratch();
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
-    // --samples=N: N diffusion samples off one trunk (AF3 runs five), each through the confidence
-    // head and ranked by AF3's ranking score without its disorder and clash terms - 0.8 ipTM +
-    // 0.2 pTM, or pTM for one chain. The samples run as one batch through the denoiser, sample k
-    // seeded `seed + k` (what a one-sample run with that seed draws); the best is written to --out
-    // and every one to <out>_sample<k>.pdb.
-    double diffMs = 0, confMs = 0, bestScore = -1e30; int best = 0;
+    // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
+    // confidence head and ranked by AF3's ranking score (src/scores.cuh). A seed's samples run as one
+    // batch through the denoiser, sample k of seed s seeded sampleSeed(s, k); the best of them all is
+    // written to --out, every one to <out>_sample<k>.pdb (<out>_seed<s>_sample<k>.pdb with several
+    // seeds), and the scores to <out>_ranking_scores.csv.
+    double diffMs = 0, confMs = 0, bestScore = -1e30; int best = 0; uint64_t bestSeed = seedList[0];
     StructureScores bestSS{ false, 0.0 };
     ConfidenceOut conf;
     std::vector<float> x;
-    // the samples as one batch through the denoiser
+    std::string stem = out.size() > 4 && out.substr(out.size() - 4) == ".pdb" ? out.substr(0, out.size() - 4) : out;
+    bool many = seedList.size() > 1 || samples > 1;
+    std::vector<std::string> ranking;
+    // every (seed, sample) through the denoiser together, up to ten a batch: a batch's GEMMs cost far
+    // less than its rows (five samples' diffusion is 1.6x one's at 68 tokens)
+    std::vector<std::pair<uint64_t, int>> runs;
+    for (uint64_t s : seedList) for (int k = 0; k < samples; ++k) runs.push_back({ s, k });
+    const size_t perBatch = std::max<size_t>(samples, 10);
+    for (size_t c0 = 0; c0 < runs.size(); c0 += perBatch) {
+    const size_t cn = std::min(perBatch, runs.size() - c0);
+    if (structural && c0 > 0) swapBatch();     // the structural tokens again, for this batch's diffusion
     auto s0 = clock();
-    NS = samples;
-    std::vector<float> xs = sample(steps, seed, mask, [&](const float* noisy, float tHat, const float* dLevel) {
+    NS = (int)cn;
+    std::vector<uint64_t> seeds;
+    for (size_t k = 0; k < cn; ++k) seeds.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
+    std::vector<float> xs = sample(steps, seeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
-    }, samples, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
+    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
     NS = 1;
-    diffMs = ms(s0, clock());
+    diffMs += ms(s0, clock());
     if (tight) releaseScratch();
     size_t atoms3 = mask.size() * 3;
     // the confidence head reads the pseudo-beta of the token space it runs in
     std::vector<int> pbIdx(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
     std::vector<float> pbMask(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
     if (structural) swapBatch();     // back to the residues, for the confidence's layout and the structure
-    for (int k = 0; k < samples; ++k) {
+    for (int k = 0; k < (int)cn; ++k) {
+      const uint64_t sd = runs[c0 + k].first; const int sk = runs[c0 + k].second;
       std::vector<float> xk(xs.begin() + k * atoms3, xs.begin() + (k + 1) * atoms3);
       auto s1 = clock();
       // pseudo-beta off the structure, then the confidence head
@@ -346,17 +376,25 @@ int main(int argc, char** argv) {
       confMs += ms(s1, clock());
       StructureScores ssk = structureScores(xk);       // AF3's clash and disorder terms, this sample's
       double score = rankingScore(ck.ptm, ck.iptm, ssk);
-      if (samples > 1) {
-        std::string path = out.size() > 4 && out.substr(out.size() - 4) == ".pdb"
-          ? out.substr(0, out.size() - 4) + "_sample" + std::to_string(k) + ".pdb" : out + "_sample" + std::to_string(k);
+      if (many) {
+        std::string tag = (seedList.size() > 1 ? "_seed" + std::to_string(sd) : std::string()) + "_sample" + std::to_string(sk);
+        std::string path = out == "/dev/null" ? out : stem + tag + ".pdb";
         auto order = writePdb(path, xk, ck.plddt.data());
         if (path != "/dev/null") writeConfidences(path, order, t.n, dense, ck.plddt, ck.pae, ck.tmTerm, contact, ck.ptm, ck.iptm,
                                                   score, ck.meanPlddt, ssk.clash, ssk.disordered);
-        printf("  sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", k, ck.meanPlddt, ck.ptm,
-               ck.iptm, score, path.c_str());
+        printf("  seed %llu sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", (unsigned long long)sd, sk,
+               ck.meanPlddt, ck.ptm, ck.iptm, score, path.c_str());
+        char row[96]; snprintf(row, sizeof row, "%llu,%d,%.17g", (unsigned long long)sd, sk, score); ranking.push_back(row);
       }
       if (!std::isfinite(score)) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", k, score); exit(1); }
-      if (score > bestScore) { bestScore = score; best = k; conf = std::move(ck); x = std::move(xk); bestSS = ssk; }
+      if (score > bestScore) { bestScore = score; best = sk; bestSeed = sd; conf = std::move(ck); x = std::move(xk); bestSS = ssk; }
+    }
+    }
+    if (many && out != "/dev/null") {        // AlphaFold 3's ranking_scores.csv
+      FILE* rf = fopen((stem + "_ranking_scores.csv").c_str(), "w");
+      fprintf(rf, "seed,sample,ranking_score\n");
+      for (auto& r : ranking) fprintf(rf, "%s\n", r.c_str());
+      fclose(rf);
     }
     if (structural) {
       for (float* p : {st.single, st.pair, st.targetFeat, st.bias, st.seqMask, st.pairMask}) CK(cudaFree(p));
@@ -366,7 +404,7 @@ int main(int argc, char** argv) {
     auto order = writePdb(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
     if (out != "/dev/null") writeConfidences(out, order, t.n, dense, conf.plddt, conf.pae, conf.tmTerm, contact, conf.ptm,
                                              conf.iptm, bestScore, conf.meanPlddt, bestSS.clash, bestSS.disordered);
-    if (samples > 1) printf("  best: sample %d\n", best);
+    if (many) printf("  best: seed %llu sample %d\n", (unsigned long long)bestSeed, best);
     if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
       FILE* pf = fopen(pp, "wb");
       fwrite(conf.pae.data(), 4, conf.pae.size(), pf); fwrite(conf.pde.data(), 4, conf.pde.size(), pf);
@@ -377,8 +415,9 @@ int main(int argc, char** argv) {
       for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);
     }
     printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", conf.meanPlddt, conf.ptm, conf.iptm, out.c_str());
-    printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d), confidence %.1f ms, total %.1f ms\n",
-           fi + 1, ms(f0, f1), recycles + 1, diffMs, steps, samples, confMs, ms(f0, f3));
+    printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d%s), confidence %.1f ms, total %.1f ms\n",
+           fi + 1, ms(f0, f1), recycles + 1, diffMs, steps, samples,
+           seedList.size() > 1 ? (" x " + std::to_string(seedList.size()) + " seeds").c_str() : "", confMs, ms(f0, f3));
     if (profiling) prof::stop(40);
     if (fi == 0 && which == 0 && serveDir.empty()) unreadWeights();
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
@@ -437,13 +476,14 @@ int main(int argc, char** argv) {
       job.close(); unlink((base + ".job").c_str());
       if (input == "quit") { printf("af3: stopped\n"); return 0; }
       steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb";
-      bool jobSeed = false; seed = seedArg;
+      bool jobSeed = false; seed = seedArg; seedsArg = seedsArg0;
       for (auto& f : flags) {
         if (!f.compare(0, 6, "--out=")) out = f.substr(6);
         else if (!f.compare(0, 10, "--samples=")) samples = atoi(f.c_str() + 10);
         else if (!f.compare(0, 8, "--steps=")) steps = atoi(f.c_str() + 8);
         else if (!f.compare(0, 11, "--recycles=")) recycles = atoi(f.c_str() + 11);
         else if (!f.compare(0, 7, "--seed=")) { seed = strtoull(f.c_str() + 7, nullptr, 10); jobSeed = true; }
+        else if (!f.compare(0, 8, "--seeds=")) seedsArg = f.substr(8);
       }
       seedGiven = jobSeed;
       fflush(stdout);

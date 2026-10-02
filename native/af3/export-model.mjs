@@ -166,7 +166,17 @@ if (option("job", "") !== "") {
     }
   }
   const job = jobFromJson(JSON.stringify(raw));
-  for (const note of job.notes) console.log(`job: ${note}`);
+  // every modelSeed, where the page folds the first: af3 runs each (src/af3.cu, --seeds)
+  const seeds = [jobs[0]?.modelSeeds ?? []].flat().map(Number);
+  for (const s of seeds) if (!Number.isInteger(s) || s < 0) throw new Error(`modelSeeds: ${s} is not a seed`);
+  for (const note of job.notes) {
+    if (seeds.length > 1 && /seeds in the file; folding the first/.test(note)) console.log(`job: ${seeds.length} seeds, each folded`);
+    else console.log(`job: ${note}`);
+  }
+  if (seeds.length > 1) {
+    entries.push(["m", "job.seeds.count", seeds.length]);
+    seeds.forEach((s, i) => entries.push(["m", `job.seeds.${i}`, s]));
+  }
   jobRequest = expandEntities(job.entities);
   sequence = jobRequest.sequence;
   if (inlineMsa.unpaired.some(Boolean) || inlineMsa.paired.some(Boolean)) {

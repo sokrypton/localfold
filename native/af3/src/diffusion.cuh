@@ -772,7 +772,7 @@ struct DiffusionFold {
   const float *trunkSingle, *trunkPair, *targetFeat, *seqMask;
   int n;
   EncoderOut enc; DecoderCache dec;
-  cudaGraphExec_t graph = nullptr; const float* graphInput = nullptr; int calls = 0;
+  cudaGraphExec_t graph = nullptr; const float* graphInput = nullptr; int calls = 0, graphNs = 0;
   // every step's single conditioning and its embedding projection, computed in one batch before
   // sampling (precomputeConditioning) - a step only copies its slices in
   std::vector<float> preLevels; float *preSingle = nullptr, *preSnProj = nullptr; bool usePre = false;
@@ -911,7 +911,7 @@ inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float n
     }
   }
   if (!GRAPHS || STAGES || f.calls++ == 0) return denoiseCore(f, positionsNoisy, noiseLevel);
-  if (!f.graph || positionsNoisy != f.graphInput) {
+  if (!f.graph || positionsNoisy != f.graphInput || NS != f.graphNs) {     // (a batch of another size: its own graph)
     if (f.graph) CK(cudaGraphExecDestroy(f.graph));
     cudaGraph_t g;
     CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
@@ -919,7 +919,7 @@ inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float n
     CK(cudaStreamEndCapture(STREAM, &g));
     CK(cudaGraphInstantiate(&f.graph, g, 0));
     CK(cudaGraphDestroy(g));
-    f.graphInput = positionsNoisy;
+    f.graphInput = positionsNoisy; f.graphNs = NS;
   }
   CK(cudaGraphLaunch(f.graph, STREAM));
   return scratch<float>("dn.out", (size_t)f.n * (int)M.meta("batch.dense") * 3 * NS);

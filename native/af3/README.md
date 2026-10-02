@@ -29,7 +29,12 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + ev
 ./af3 data                                   # f32 path, every stage against AF3
 ```
 
-`--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--samples=N`
+`--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--seeds=a,b,c`
+(every seed, as AF3 runs a job's modelSeeds - a job's list is used when no seed is given; one trunk
+serves them all, its features not depending on the seed, and every (seed, sample) goes through the
+denoiser in one batch of up to ten: three seeds of two samples 1.69 -> 1.02 s of diffusion on
+barnase-barstar; the files are `<out>_seed<s>_sample<k>.pdb`, the scores AF3's
+`<out>_ranking_scores.csv`), `--samples=N`
 (N diffusion samples off one trunk, AF3 runs five: each scored by the confidence head and ranked by
 AF3's ranking score, 0.8 ipTM + 0.2 pTM (pTM for one chain) + 0.5 fraction_disordered -
 100 has_clash - the best written to `--out`, all to `<out>_sample<k>.pdb`). The two structure terms
@@ -46,9 +51,10 @@ distogram's contact_probs, pae, token_chain_ids, token_res_ids) and
 chain_plddt, chain_ptm, chain_iptm, chain_pair_pae_min, iptm, ptm, ranking_score,
 fraction_disordered, has_clash, mean_plddt). The samples run as ONE batch through the
 denoiser - the transformer's GEMMs at 5x the rows, the samples as the flash kernel's batch, what
-they share (conditioning, masks, biases) read once - and sample k draws exactly what a one-sample
-run seeded `seed + k` draws, so its structure is the same: 5CAJ's five read 1.989 / 2.023 / 1.961 /
-1.996 / 2.018 A batched and one at a time. Five samples' diffusion: **1.33 s against 0.54 s** for
+they share (conditioning, masks, biases) read once - and sample k of seed s draws exactly what a
+one-sample run seeded s + k 2^32 draws (sample 0 is the seed's own run; no two samples of distinct
+seeds share a stream), so its structure is the same: 5CAJ with its template, sample 1 of seed 42 and
+a one-sample run with `--seed=4294967338` are 0.002 A apart, 0.201 A from the crystal each. Five samples' diffusion: **1.33 s against 0.54 s** for
 one,
 `--fast` (f16 trunk and denoiser transformer), `--stages` (per-stage profile),
 `--no-graphs`. `pairformer.cu` is the earlier one-file pairformer prototype and benchmark.

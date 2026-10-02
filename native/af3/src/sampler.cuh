@@ -21,8 +21,11 @@ inline double noiseSchedule(double t, double sigmaData = 16, double sigmaMin = 0
 // Gaussians (the start and every step's injected noise) are a counter-based hash of (seed, step,
 // element) evaluated where they are used - drawing them on the host was 7.5 million deviates and
 // ~200 ms a fold at 522 tokens - and the augmentation's twelve per step come from the host's
-// seeded stream. Nothing synchronises until the end. `ns` samples run as one batch (NS), sample k
-// seeded `seed + k`: what a single-sample run with that seed draws.
+// seeded stream. Nothing synchronises until the end. The samples run as one batch (NS), each with
+// its own seed: sample k of seed s draws from sampleSeed(s, k) = s + k 2^32 - sample 0 is what a
+// single-sample run with that seed draws, and no two (seed, sample) pairs of distinct seeds below
+// 2^32 share a stream (AF3's seeds are small integers, and five samples of seeds 1 and 2 would
+// overlap under s + k).
 __device__ __forceinline__ uint64_t mix64(uint64_t z) {        // splitmix64's finaliser
   z += 0x9e3779b97f4a7c15ull;
   z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -35,9 +38,10 @@ __device__ __forceinline__ float gaussian(uint64_t seed, uint32_t step, uint64_t
   float u1 = ((uint32_t)h + 1.f) * 2.3283064e-10f, u2 = (uint32_t)(h >> 32) * 2.3283064e-10f;
   return sqrtf(-2.f * logf(u1)) * cospif(2.f * u2);
 }
-__global__ void initialNoiseK(float* x, size_t n3, uint64_t seed0, float scale, size_t total) {
+inline uint64_t sampleSeed(uint64_t seed, int k) { return seed + ((uint64_t)k << 32); }
+__global__ void initialNoiseK(float* x, size_t n3, const uint64_t* seeds, float scale, size_t total) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < total) x[i] = scale * gaussian(seed0 + i / n3, 0, i % n3);
+  if (i < total) x[i] = scale * gaussian(seeds[i / n3], 0, i % n3);
 }
 __global__ void centroidK(const float* x, const float* mask, size_t atoms, float* c) {
   __shared__ float s[4][256];
@@ -55,7 +59,7 @@ __global__ void centroidK(const float* x, const float* mask, size_t atoms, float
 }
 // rot = e0, e1, e2 (rows) and the translation, 12 a sample; noisy = augmented x + injected * noise
 __global__ void augmentNoiseK(float* x, float* noisy, const float* mask, const float* c, const float* rot,
-                              uint64_t seed0, uint32_t step, float injected, size_t atoms, size_t total) {
+                              const uint64_t* seeds, uint32_t step, float injected, size_t atoms, size_t total) {
   size_t a = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (a >= total) return;
   size_t k = a / atoms; const float* r = rot + k * 12; const float* ck = c + k * 3;
@@ -64,7 +68,7 @@ __global__ void augmentNoiseK(float* x, float* noisy, const float* mask, const f
   for (int d = 0; d < 3; ++d) {
     float v = live ? p[0] * r[d] + p[1] * r[3 + d] + p[2] * r[6 + d] + r[9 + d] : 0.f;
     x[a * 3 + d] = v;
-    noisy[a * 3 + d] = v + injected * gaussian(seed0 + k, step, (a % atoms) * 3 + d);
+    noisy[a * 3 + d] = v + injected * gaussian(seeds[k], step, (a % atoms) * 3 + d);
   }
 }
 __global__ void eulerK(float* x, const float* noisy, const float* denoised, float scale, size_t n3) {
@@ -72,11 +76,12 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
 }
 // Returns every sample's positions, sample-major [ns][atoms][3].
-inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<float>& mask,
+inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                  const std::function<const float*(const float*, float, const float*)>& denoiseFn,
-                                 int ns = 1, double gamma0 = 0.8, double gammaMin = 1.0, double noiseScale = 1.003,
+                                 double gamma0 = 0.8, double gammaMin = 1.0, double noiseScale = 1.003,
                                  double stepScale = 1.5,
                                  const std::function<void(const std::vector<float>&)>& onLevels = {}) {
+  int ns = (int)seeds.size();
   size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
   // a model's own EDM constants where its dialect carries them (boltz2)
   double sigmaMin = 0.0004, sigmaMax = 160, rho = 7;
@@ -89,7 +94,7 @@ inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<flo
   for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
   for (int k = 0; k < ns; ++k) {
-    Normal normal(seed + k);
+    Normal normal(seeds[k]);
     for (int s = 0; s < steps; ++s) {
       double v0[3] = {normal(), normal(), normal()}, v1[3] = {normal(), normal(), normal()};
       auto norm = [](const double* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
@@ -106,7 +111,9 @@ inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<flo
     }
   }
   float* dX; CK(cudaMalloc(&dX, all3 * 4));
-  initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, seed, (float)levels[0], all3);
+  uint64_t* dSeeds; CK(cudaMalloc(&dSeeds, ns * 8));
+  CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
+  initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
   float* dRot = upload(rot.data(), rot.size()); float* dMask = upload(mask.data(), atoms);
   float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
   for (int s = 0; s < steps; ++s) {
@@ -120,13 +127,14 @@ inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<flo
     double injected = noiseScale * std::sqrt(std::max(0.0, tHat * tHat - previous * previous));
     centroidK<<<ns, 256, 0, STREAM>>>(dX, dMask, atoms, dC);
     augmentNoiseK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dNoisy, dMask, dC, dRot + (size_t)(step - 1) * ns * 12,
-                                                         seed, (uint32_t)step, (float)injected, atoms, atoms * ns);
+                                                         dSeeds, (uint32_t)step, (float)injected, atoms, atoms * ns);
     const float* d = denoiseFn(dNoisy, (float)tHat, dLevels + step - 1);
     if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     eulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dNoisy, d, (float)(stepScale * (level - tHat) / tHat), all3);
   }
   std::vector<float> out = download(dX, all3);
   for (float* p : {dX, dRot, dMask, dLevels}) CK(cudaFree(p));
+  CK(cudaFree(dSeeds));
   return out;
 }
 
