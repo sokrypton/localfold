@@ -6,15 +6,23 @@
 // path (f32 throughout) and checks every seam the oracle recorded; with --fast the f16 path.
 #include "trunk.cuh"
 #include "atom.cuh"
+#include "diffusion.cuh"
+#include "sampler.cuh"
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
-  bool fast = false; int repeat = 1, msaCap = 1024;
+  bool fast = false, doFold = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 0;
+  uint64_t seed = 42; std::string out = "fold.pdb";
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = true;
     else if (!strcmp(argv[i], "--stages")) STAGES = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
+    else if (!strcmp(argv[i], "--fold")) doFold = true;
+    else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
+    else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
+    else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
+    else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
   }
   auto t0 = std::chrono::steady_clock::now();
   M.load(argv[1]);
@@ -23,6 +31,34 @@ int main(int argc, char** argv) {
   printf("loaded %zu entries in %.1f s; %d tokens\n", M.index.size(),
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          (int)M.meta("batch.tokens"));
+
+  // One denoiser call on AF3's own inputs, against AF3's own output.
+  if (M.has("oracle.denoise.output")) {
+    int n = (int)M.meta("batch.tokens");
+    for (const char* g : {"token_atoms_to_queries", "queries_to_keys", "queries_to_token_atoms", "tokens_to_queries", "tokens_to_keys"}) {
+      std::string o = std::string("oracle.denoise.inputs.") + g + ":gather_idxs";
+      std::string mine = std::string(g) == "token_atoms_to_queries" ? "batch.tokenAtomsToQueries.indices"
+        : std::string(g) == "queries_to_keys" ? "batch.queriesToKeys.indices"
+        : std::string(g) == "queries_to_token_atoms" ? "batch.queriesToTokenAtoms.indices"
+        : std::string(g) == "tokens_to_queries" ? "batch.tokensToQueries.indices" : "batch.tokensToKeys.indices";
+      size_t len = M.len(mine), diff = 0;
+      if (M.len(o) != len) { printf("  gather %s: length %zu vs %zu\n", g, M.len(o), len); continue; }
+      for (size_t i = 0; i < len; ++i) diff += (int)M.f(o)[i] != M.i(mine)[i];
+      printf("  gather %-24s %zu of %zu differ from the batch\n", g, diff, len);
+    }
+    float* single = upload(M.f("oracle.denoise.inputs.single"), M.len("oracle.denoise.inputs.single"));
+    float* pair = upload(M.f("oracle.denoise.inputs.pair"), M.len("oracle.denoise.inputs.pair"));
+    float* sIn = upload(M.f("oracle.denoise.inputs.sInputs"), M.len("oracle.denoise.inputs.sInputs"));
+    float* pos = upload(M.f("oracle.denoise.inputs.posNoisy"), M.len("oracle.denoise.inputs.posNoisy"));
+    float* seqm = upload(M.f("oracle.denoise.inputs.seq_mask"), n);
+    float noise = (float)M.meta("oracle.denoise.noise");
+    auto s0 = std::chrono::steady_clock::now();
+    float* out = denoise(single, pair, sIn, seqm, pos, noise);
+    CK(cudaDeviceSynchronize());
+    printf("denoise (sigma %.3f) %.1f ms\n", noise, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count());
+    check("denoised", out, M.len("oracle.denoise.output"), "oracle.denoise.output");
+    DCACHE.ready = false;
+  }
 
   // target_feat from the batch: per-atom conditioning and the atom cross-attention encoder.
   int tokens = (int)M.meta("batch.tokens");
@@ -36,6 +72,33 @@ int main(int argc, char** argv) {
   Trunk t = makeTrunk(targetFeat.data(), msaCap);
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
+  if (doFold) {
+    std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
+    auto clock = [] { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    size_t pairs = (size_t)t.n * t.n;
+    auto f0 = clock();
+    for (int pass = 0; pass <= recycles; ++pass) {
+      if (pass > 0) {
+        CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
+        CK(cudaMemcpyAsync(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+      }
+      if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
+    }
+    CK(cudaDeviceSynchronize());
+    auto f1 = clock();
+    int dense = (int)M.meta("batch.dense");
+    std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)t.n * dense);
+    DCACHE.ready = false;
+    std::vector<float> x = sample(steps, seed, mask, [&](const float* noisy, float tHat) {
+      return (const float*)denoise(t.single, t.pair, t.targetFeat, t.seqMask, noisy, tHat);
+    });
+    auto f2 = clock();
+    writePdb(out, x);
+    printf("fold: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps), wrote %s\n", ms(f0, f1), recycles + 1,
+           ms(f1, f2), steps, out.c_str());
+    return 0;
+  }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
     std::string tap = std::string("oracle.trunk.stages.tap.") + name;
     std::string plain = std::string("oracle.trunk.stages.") + name;
