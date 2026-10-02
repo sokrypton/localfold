@@ -1115,13 +1115,12 @@ async function foldHolding(device, batch, weights, options, held) {
   // the browser refused the mappable buffer for it ("Failed to allocate memory
   // for buffer mapping") and then the Float32Array itself ("Array buffer
   // allocation failed"), each after a whole trunk had run - and the sampler
-  // and the confidence head bind the device copy anyway. What does need the
-  // host array: RoseTTAFold3's confidence global norm, OpenDDE's expander,
+  // and the confidence head bind the device copy anyway (RoseTTAFold3's global
+  // norm streams it in pieces). What does need the host array: OpenDDE's expander,
   // the recycle diagnostics and the oracle's seams. A trunk without it is not
   // offered for resumption, since resuming uploads it.
   const hostPairWanted = tokens * tokens * trunkPairChannels * 4 <= HOST_PAIR_MAX_BYTES
     || weights.trunk.dialect.structuralTokens === true
-    || weights.trunk.dialect.confidenceGlobalNorm === true
     || (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true
     || options.recycleDistances === true || options.onSeam !== undefined;
   const readEveryPass = (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true

@@ -3977,5 +3977,34 @@ back 25 minutes in (`keep-alive` 404, then `session_terminated`), with a
 second T4 running beside it. The same job alone on one T4 finished. Run long
 T4 jobs one at a time.
 
+**And the rest of the lineage, each at its own binding ceiling** (this A100,
+`--budget=12288`, random sequences, two steps). boltz2 and RoseTTAFold3 were
+refused first, both in the TEMPLATE stage:
+
+| model | ceiling | before | now | peak |
+|---|---|---|---|---|
+| boltz2 | 2047 | refused, `af3-template.scratch3` 512 MiB over | folds | 11.8 GB |
+| RoseTTAFold3 | 2047 | refused, `af3-template.scratch1` **4092 MiB** | folds | 9.7 GB |
+| protenix2 | 1448 | - | folds | 9.9 GB |
+| OpenBind-0 | 2047 | - | folds | 9.9 GB |
+| OpenDDE | 590 residues (1145 of 1182 subtokens) | - | folds | 11.8 GB |
+
+- **The template's scratch was sized at the grid attention's width.** boltz2's
+  template attention is 4 x 32 = 128 over 64 channels and RoseTTAFold3's 256,
+  so every scratch buffer was two or four times the track - rf3's was a 4 GiB
+  buffer, which no NVIDIA card can even bind. Only the grid's q/k/v/gate
+  chunks are that wide, so the grid now runs in as many row chunks as it takes
+  for them to fit a channel-wide buffer (`gridParts` in pair-track-gpu.js;
+  quarters still for every stack whose attention is no wider than its track,
+  which is every trunk). Bit-identical, and at 600 residues the template
+  stage's peak drops 1183 -> 919 MiB (boltz2) and 1563 -> 772 (rf3).
+- **RoseTTAFold3's confidence global norm streams the device pair** instead of
+  normalising a host copy: two 2 GiB arrays (the copy and the normalised one)
+  at 2047 tokens, which the browser will not allocate. `streamGlobalNorm` in
+  confidence-webgpu.js does the same arithmetic in the same order over 256 MiB
+  pieces - three passes, sum, variance, normalise-and-upload - so it is
+  bit-identical: `test:stock`'s rf3 signature 81.53424395815864 unchanged, and
+  it now runs at every size, so the gate exercises it.
+
 Past this, every NVIDIA card stops at the binding ceiling, and that needs the
 pair bound in windows or stored narrower across the kernels that bind it whole.

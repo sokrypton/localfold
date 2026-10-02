@@ -566,8 +566,21 @@ export async function compilePairTrack(cache, options) {
   // grid attention runs at a time. Callers allocate `pairScratchCount`.
   pipelines.pairScratchCount = gridAttention && !gridChunked
     ? PAIR_SCRATCH_COUNT : PAIR_SCRATCH_COUNT - 1;
+  // 🔴 AS MANY CHUNKS AS IT TAKES FOR THE SLOTS TO FIT A CHANNEL-WIDE BUFFER.
+  // Quarters (three slots to a buffer) and thirds (two) fit only where the
+  // attention is no wider than the track; boltz2's template is 4 x 32 = 128
+  // over 64 channels and RoseTTAFold3's 256, so every scratch buffer was sized
+  // at the attention's width - a 4 GiB buffer for rf3 at 2047 tokens, twice
+  // the binding limit, and boltz2 refused on a T4-sized budget. More chunks
+  // only add dispatches; the scratch is the track's own width now.
+  const slotsPerBuffer = compact ? 3 : 2;
+  let gridParts = compact ? 4 : 3;
+  const gridWidth = pipelines.gridWidth ?? channels;
+  while (gridChunked && slotsPerBuffer * Math.ceil(n / gridParts) * gridWidth > n * channels) {
+    gridParts += 1;
+  }
   pipelines.gridChunks = gridChunked
-    ? gridChunkUniforms(cache.device, n, compact ? 4 : 3) : undefined;
+    ? gridChunkUniforms(cache.device, n, gridParts) : undefined;
   // Where the grid's five chunk tensors live: [scratch index, slot]. Thirds
   // pack two to a buffer over scratch[1..3]; in compact mode scratch[3] is the
   // small a/b buffer, so quarters pack three into scratch[1] and two into
@@ -587,7 +600,10 @@ export async function compilePairTrack(cache, options) {
   }
   /** Bytes of scratch[index] given a full pair-sized tensor's bytes. */
   pipelines.pairScratchBytes = (index, fullBytes) => (compact && index === 3
-    ? pipelines.abOffset + pipelines.abBytes : fullBytes);
+    ? pipelines.abOffset + pipelines.abBytes
+    // ...and with the grid chunked, the track's width rather than the
+    // attention's, which the caller's `fullBytes` is sized by. See gridParts.
+    : gridChunked ? Math.min(fullBytes, n * n * channels * 4) : fullBytes);
   return pipelines;
 }
 

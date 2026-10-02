@@ -44,6 +44,72 @@ import { tmPerBinFor, tmScoreD0 } from "../../heads/tm-score.js";
 // agree with itself; sharing a mean and a variance cannot.
 import { maskedGlobalNorm, RF3_S_INPUTS_WIDTH } from "./confidence-reference.js";
 
+/** Rows of the pair read back at a time by streamGlobalNorm. */
+const NORM_PIECE_BYTES = 256 * 1048576;
+
+/**
+ * `maskedGlobalNorm` over a device buffer, written into another, with no
+ * full-size host array - the same arithmetic in the same order, so the result
+ * is bit-identical: the sum and the squared deviations accumulate row by row
+ * across pieces exactly as the host loop does, and each element is
+ * `(x - mean) * inverse` rounded to f32 as there. Three passes over the source
+ * (sum, variance, then normalise and upload), each in 256 MiB pieces of whole
+ * rows.
+ */
+async function streamGlobalNorm(device, allocator, source, target, mask, rows, channels) {
+  const rowBytes = channels * 4;
+  const pieceRows = Math.max(1, Math.floor(NORM_PIECE_BYTES / rowBytes));
+  const staging = allocator.allocate("af3-conf.norm-piece", pieceRows * rowBytes,
+    GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+  const pieces = async (visit) => {
+    for (let first = 0; first < rows; first += pieceRows) {
+      const count = Math.min(pieceRows, rows - first);
+      const encoder = device.createCommandEncoder({ label: "af3-conf.norm-piece" });
+      encoder.copyBufferToBuffer(source, first * rowBytes, staging.buffer, 0, count * rowBytes);
+      device.queue.submit([encoder.finish()]);
+      await staging.buffer.mapAsync(GPUMapMode.READ, 0, count * rowBytes);
+      const values = new Float32Array(staging.buffer.getMappedRange(0, count * rowBytes).slice(0));
+      staging.buffer.unmap();
+      visit(values, first, count);
+    }
+  };
+  try {
+    let live = 0;
+    let total = 0;
+    await pieces((values, first, count) => {
+      for (let row = 0; row < count; row += 1) {
+        if (!(mask[first + row] > 0)) continue;
+        live += 1;
+        const base = row * channels;
+        for (let c = 0; c < channels; c += 1) total += values[base + c];
+      }
+    });
+    const count = Math.max(live * channels, 1);
+    const mean = total / count;
+    let variance = 0;
+    await pieces((values, first, rowsHere) => {
+      for (let row = 0; row < rowsHere; row += 1) {
+        if (!(mask[first + row] > 0)) continue;
+        const base = row * channels;
+        for (let c = 0; c < channels; c += 1) {
+          const d = values[base + c] - mean;
+          variance += d * d;
+        }
+      }
+    });
+    const inverse = 1 / Math.sqrt(variance / count + 1e-5);
+    await pieces((values, first) => {
+      const output = new Float32Array(values.length);
+      for (let index = 0; index < values.length; index += 1) {
+        output[index] = (values[index] - mean) * inverse;
+      }
+      device.queue.writeBuffer(target, first * rowBytes, output);
+    });
+  } finally {
+    staging.release();
+  }
+}
+
 const NUM_BINS = 64;
 const MAX_ERROR_BIN = 31.0;
 const PLDDT_BINS = 50;
@@ -951,9 +1017,15 @@ export class Af3ConfidenceHeadGpu {
     // millisecond here, against a denoiser that is seconds. Reuses the CPU
     // reference's own function, which is the one place this port and its
     // differential are allowed to share code - it is a statistic, not a kernel.
+    // ...except the pair when the fold still holds it on the device, which is
+    // normalised in pieces on its way into this head's copy - see
+    // streamGlobalNorm. At 2047 tokens it is 2 GiB, and the host copy and the
+    // normalised one beside it are two arrays the browser will not allocate.
+    const streamPair = dialect?.confidenceGlobalNorm === true && input.pairBuffer !== undefined;
     if (dialect?.confidenceGlobalNorm === true) {
       input = { ...input,
-                pair: maskedGlobalNorm(input.pair, pairMask, pairs, pairChannels),
+                pair: streamPair ? input.pair
+                  : maskedGlobalNorm(input.pair, pairMask, pairs, pairChannels),
                 single: maskedGlobalNorm(input.single, seqMask, tokens, singleChannels),
                 targetFeat: maskedGlobalNorm(input.targetFeat, seqMask, tokens,
                                              targetFeatWidth, RF3_S_INPUTS_WIDTH) };
@@ -1028,11 +1100,16 @@ export class Af3ConfidenceHeadGpu {
       // that path keeps uploading what it normalised.
       const pairBytes = pairs * pairChannels * 4;
       const fromDevice = input.pairBuffer !== undefined && dialect?.confidenceGlobalNorm !== true;
-      const pair = keep(fromDevice
+      const pair = keep(fromDevice || streamPair
         ? this.allocator.allocate("af3-conf.pair", pairBytes,
           storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST)
         : this.allocator.upload("af3-conf.pair", asFloats(input.pair),
           storage | GPUBufferUsage.COPY_SRC));
+      if (streamPair) {
+        await streamGlobalNorm(this.device, this.allocator, input.pairBuffer, pair.buffer,
+                               pairMask, pairs, pairChannels);
+        input.releasePairBuffer?.();
+      }
       if (fromDevice) {
         const copy = this.device.createCommandEncoder({ label: "af3-conf.pair-copy" });
         copy.copyBufferToBuffer(input.pairBuffer, 0, pair.buffer, 0, pairBytes);
