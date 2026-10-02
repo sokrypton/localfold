@@ -225,8 +225,21 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
   every row of the grid, and per row it is half of the kernel's L2 traffic): exact, and slower in
   every geometry - 10.7 / 14.8 / 12.3 / 16.8 ms against the plain kernel's 8.8 at 1044 tokens for
   1, 2, 4 rows of 4 warps and 4 rows of 2. Not L2 bandwidth, then.
-- **The grid attention's exponentials in f16x2** (two per special-function instruction, P being
-  f16 for the PV product anyway): 9.2 against 8.6 ms at 1044 tokens. Nor did 8-warp blocks at the
-  largest sizes (8.8 / 8.1 against 8.6 / 8.0 ms at 1044 / 2088). What did pay: no mask when every
-  token is real (3-7%).
+- **The grid attention's exponentials in f16x2 on their own** (two per special-function
+  instruction): 9.2 against 8.6 ms at 1044 tokens. Combined with starting S from the bias and taking
+  P's row sums on the tensor cores (P . ones), they did pay - see below. Nor did 8-warp blocks at
+  the largest sizes (8.8 / 8.1 against 8.6 / 8.0 ms at 1044 / 2088), a third or fourth cp.async
+  stage (10.5 against 8.0 ms: the shared memory halves the blocks an SM holds), or interleaving
+  two key fragments' MMAs (the registers). What did pay: no mask when every token is real (3-7%).
+
+## What the grid attention's time was
+
+Without a profiler on this box, by counting SASS: the kernel issued ~800 integer instructions a
+tile (the cp.async addresses, recomputed every tile in a strided loop the compiler could not
+unroll) against 36 tensor-core MMAs. Compile-time trip counts and 32-bit offsets, the bias as S's
+starting value, f16x2 exponentials straight into the P fragments, P's row sums as one more MMA,
+and a tree for the row maxima: 8.07 -> 7.47 ms at 1044 tokens (`--bench-grid=1044`).
+
+The triangle contraction runs in a padded np x np space (np a multiple of 32): cuBLAS's GEMM is
+twice as fast on a multiple of 32 (1044: 5.4 against 2.7 ms the pair of them).
 

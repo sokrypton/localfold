@@ -70,17 +70,30 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
   const int Wd = heads * D, W4 = 4 * Wd;
   const half* base = qkvg + rl * (size_t)n * W4 + h * D;
   int q0 = blockIdx.x * BQ;
+  // the loads, with compile-time trip counts and 32-bit offsets: written as a strided loop from
+  // threadIdx.x the compiler could not unroll it, and the per-tile index arithmetic was ~800
+  // integer instructions a thread against 36 tensor-core MMAs
+  constexpr int KV_CHUNKS = BK * (D / 8), B_CHUNKS = BQ * (BK / 8);
+  static_assert(B_CHUNKS % NT == 0, "a bias tile is a whole number of chunks a thread");
+  const half* biasHead = bias + (size_t)h * n * biasStride;
   auto issue = [&](int j0, int st) {
     half *K = Kst(st), *V = Vst(st), *B = Bst(st);
-    for (int t = threadIdx.x; t < BK * (D / 8) * 2; t += NT) {
-      int which = t / (BK * (D / 8)), u = t % (BK * (D / 8)), jj = u / (D / 8), c = (u % (D / 8)) * 8;
-      int j = j0 + jj;
-      cpAsync16((which ? V : K) + jj * LDK + c, base + (size_t)(j < n ? j : 0) * W4 + (which + 1) * Wd + c, j < n);
+#pragma unroll
+    for (int u0 = 0; u0 < KV_CHUNKS; u0 += NT) {
+      int u = u0 + threadIdx.x;
+      if (KV_CHUNKS % NT == 0 || u < KV_CHUNKS) {
+        int jj = u / (D / 8), c = (u % (D / 8)) * 8, j = j0 + jj;
+        bool ok = j < n;
+        const half* src = base + (ok ? j : 0) * W4 + Wd + c;
+        cpAsync16(K + jj * LDK + c, src, ok);
+        cpAsync16(V + jj * LDK + c, src + Wd, ok);
+      }
     }
-    for (int t = threadIdx.x; t < BQ * (BK / 8); t += NT) {
-      int qi = t / (BK / 8), c = (t % (BK / 8)) * 8, i = q0 + qi, j = j0 + c;
+#pragma unroll
+    for (int u0 = 0; u0 < B_CHUNKS; u0 += NT) {
+      int u = u0 + threadIdx.x, qi = u / (BK / 8), c = (u % (BK / 8)) * 8, i = q0 + qi, j = j0 + c;
       bool ok = i < n && j < n;
-      cpAsync16(B + qi * LDB + c, bias + ((size_t)h * n + (i < n ? i : 0)) * biasStride + (ok ? j : 0), ok);
+      cpAsync16(B + qi * LDB + c, biasHead + (ok ? i * biasStride + j : 0), ok);
     }
     if (MASKED && threadIdx.x < BK) {
       int j = j0 + threadIdx.x;
@@ -136,10 +149,15 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
         if (k2 * 2 + 1 < D / 16) mma16816(sv[nt], qa[k2 * 2 + 1], kb[2], kb[3]);
       }
     }
-    float t0 = -INFINITY, t1 = -INFINITY;
-    for (int nt = 0; nt < BK / 8; ++nt) {
-      t0 = fmaxf(t0, fmaxf(sv[nt][0], sv[nt][1])); t1 = fmaxf(t1, fmaxf(sv[nt][2], sv[nt][3]));
-    }
+    // the row maxima as a tree, not a 16-deep chain of dependent max instructions
+    float r0m[BK / 8], r1m[BK / 8];
+#pragma unroll
+    for (int nt = 0; nt < BK / 8; ++nt) { r0m[nt] = fmaxf(sv[nt][0], sv[nt][1]); r1m[nt] = fmaxf(sv[nt][2], sv[nt][3]); }
+#pragma unroll
+    for (int w = BK / 16; w >= 1; w >>= 1)
+#pragma unroll
+      for (int nt = 0; nt < w; ++nt) { r0m[nt] = fmaxf(r0m[nt], r0m[nt + w]); r1m[nt] = fmaxf(r1m[nt], r1m[nt + w]); }
+    float t0 = r0m[0], t1 = r1m[0];
     t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
     t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
     float n0 = fmaxf(m0, t0), n1 = fmaxf(m1, t1);
