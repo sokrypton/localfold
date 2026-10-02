@@ -94,6 +94,12 @@ inline void freeTrunk(Trunk& t) {
 }
 
 template <class T> void templateEmbedding(Trunk& t, float* pairOut);
+__global__ void onehotK(const int* idx, float* out, int n, int classes) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * classes) return;
+  int c = (int)(t % classes); int v = idx[t / classes];
+  out[t] = v == c ? 1.f : 0.f;
+}
 __global__ void bondEmbedK(float* pair, const float* bonds, const float* w, size_t pairs, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < pairs * C) pair[t] += bonds[t / C] * w[t % C];
@@ -238,10 +244,7 @@ void templateEmbedding(Trunk& t, float* out) {
     if (fused) {
       linear<float, float>(Fdev(S + "features"), act, pairs, width, Ct, P + "aProjection", false, 1.f);
     } else {
-      std::vector<float> onehot((size_t)n * 31, 0.f);
-      const int* aatype = M.i(S + "aatype");
-      for (int i = 0; i < n; ++i) if (aatype[i] >= 0 && aatype[i] < 31) onehot[(size_t)i * 31 + aatype[i]] = 1.f;
-      CK(cudaMemcpy(oh, onehot.data(), onehot.size() * 4, cudaMemcpyHostToDevice));
+      onehotK<<<blocks((size_t)n * 31), 256, 0, STREAM>>>(Idev(S + "aatype"), oh, n, 31);   // on the device: capturable
       linear<float, float>(oh, row, n, 31, Ct, P + "templatePairEmbedding2");
       linear<float, float>(oh, col, n, 31, Ct, P + "templatePairEmbedding3");
       addRowColumnK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, row, col, n, Ct);
