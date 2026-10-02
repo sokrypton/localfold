@@ -57,6 +57,11 @@ def cases():
     # modified bases: AlphaFold 3's own methylated-DNA example (5CM at four CpG sites, both strands)
     out.append(("af3-dna-5cm", "af3", [f"--job={os.path.join(FIX, 'af3-jobs', 'methylated_dna.json')}"], [], None,
                 "DA,DC,DG,DT,5CM"))
+    # AF3's kitchen-sink input, every field the format has at once: two seeds, a template with an explicit
+    # residue mapping, modified residues and bases (HY3, P1L, 6OG, 6MA, 2MG, 5MC), a two-component
+    # ligand chain, a SMILES ATP, ions, an RNA alignment beside paired protein ones, declared bonds
+    out.append(("af3-kitchen-sink", "af3", [f"--job={os.path.join(FIX, 'af3-jobs', 'alphafold_input.json')}"], [], None,
+                "DA,DC,DG,DT,A,C,G,U,HY3,P1L,6OG,6MA,2MG,5MC,NAG,FUC,HEM,ATP"))
     # a glycan: five components as one ligand chain, bonded to each other and to Asn34
     out.append(("af3-glycan", "af3", [f"--job={os.path.join(FIX, 'af3-jobs', 'rnaseb_glycosylated.json')}"], [], None,
                 "NAG,BMA,MAN"))
