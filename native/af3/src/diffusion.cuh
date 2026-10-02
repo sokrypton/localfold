@@ -169,6 +169,27 @@ __global__ void layerNormPlainK(const float* in, TO* out, size_t rows, int C) {
   float inv = 1.f / sqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>((x[c] - mean) * inv);
 }
+// [LN0(x) | 1] and [x | 1], rows of C+1: the inputs of the two conditioning GEMMs
+template <class TO>
+__global__ void layerNormPlainOnesK(const float* in, TO* outNorm, TO* outRaw, size_t rows, int C, int Ca) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* x = in + row * C;
+  float s = 0;
+  for (int c = lane; c < C; c += 32) s += x[c];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, v = 0;
+  for (int c = lane; c < C; c += 32) { float d = x[c] - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = 1.f / sqrtf(v / C + 1e-5f);
+  size_t base = row * Ca;
+  for (int c = lane; c < C; c += 32) { outNorm[base + c] = fromF<TO>((x[c] - mean) * inv); outRaw[base + c] = fromF<TO>(x[c]); }
+  for (int c = C + lane; c < Ca; c += 32) {
+    float one = c == C ? 1.f : 0.f;
+    outNorm[base + c] = fromF<TO>(one); outRaw[base + c] = fromF<TO>(one);
+  }
+}
 template <class TO>
 __global__ void castK(const float* x, TO* y, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = fromF<TO>(x[i]);
@@ -423,9 +444,16 @@ inline void prepareTransformer(const float* pairCond, int n) {
       gate(".", 0); gate(".ffw", 1);
       if (hasW(B + ".ffwAToB")) { fprintf(stderr, "ffwAToB: not ported\n"); exit(1); }
     }
+    // the biases as one more input row: the GEMM's input carries a column of ones, so the add
+    // after it (60 us a step at 261 tokens) is part of the product
+    wn.insert(wn.end(), bn.begin(), bn.end()); wr.insert(wr.end(), br.begin(), br.end());
+    // ...and zero rows up to a multiple of 8, so the f16 GEMM's leading dimension stays aligned
+    // (K = 385 put cuBLAS on a slow kernel and the whole step got slower)
+    for (int r = Cc + 1; r < (Cc + 1 + 7) / 8 * 8; ++r) {
+      wn.insert(wn.end(), ldn, 0.f); wr.insert(wr.end(), ldr, 0.f);
+    }
     tc.wNorm = T + ".condNorm~"; tc.wRaw = T + ".condRaw~";
     SYNTH[tc.wNorm] = std::move(wn); SYNTH[tc.wRaw] = std::move(wr);
-    tc.bNorm = upload(bn.data(), bn.size()); tc.bRaw = upload(br.data(), br.size());
   }
   // the pair logits of every block, from the (fold-constant) pair conditioning
   float* pn = scratch<float>("dt.pn", pairs * Cz);
@@ -458,17 +486,15 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   int perSuper = (int)M.meta(Tn + ".blocksPerSuperBlock"), factor = (int)M.meta(Tn + ".transitionFactor");
   size_t pairs = (size_t)n * n;
   int ldn = tc.nblocks * 4 * C, ldr = tc.nblocks * 2 * C;
-  // every block's conditioning, two GEMMs
-  T* cn = scratch<T>("dt.cn", (size_t)n * Cc);
-  layerNormPlainK<T><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(cond, cn, n, Cc);
-  T* condT = scratch<T>("dt.condT", (size_t)n * Cc);
-  castK<T><<<blocks((size_t)n * Cc), 256, 0, STREAM>>>(cond, condT, (size_t)n * Cc);
+  // every block's conditioning, two GEMMs over [x | 1] (the biases are the weights' last row)
+  int Ca = (Cc + 1 + 7) / 8 * 8;
+  T* cn = scratch<T>("dt.cn", (size_t)n * Ca);
+  T* condT = scratch<T>("dt.condT", (size_t)n * Ca);
+  layerNormPlainOnesK<T><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(cond, cn, condT, n, Cc, Ca);
   float* gNorm = scratch<float>("dt.gNorm", (size_t)n * ldn);
   float* gRaw = scratch<float>("dt.gRaw", (size_t)n * ldr);
-  linear<T, float>(cn, gNorm, n, Cc, ldn, tc.wNorm);
-  addVectorK<<<blocks((size_t)n * ldn), 256, 0, STREAM>>>(gNorm, tc.bNorm, n, ldn);
-  linear<T, float>(condT, gRaw, n, Cc, ldr, tc.wRaw);
-  addVectorK<<<blocks((size_t)n * ldr), 256, 0, STREAM>>>(gRaw, tc.bRaw, n, ldr);
+  linear<T, float>(cn, gNorm, n, Ca, ldn, tc.wNorm);
+  linear<T, float>(condT, gRaw, n, Ca, ldr, tc.wRaw);
   T* x = scratch<T>("dt.x", (size_t)n * C);
   T* qkvg = scratch<T>("dt.qkvg", (size_t)(n + 128) * 4 * Wd);
   float* logits = scratch<float>("dt.logits", (size_t)heads * pairs);
