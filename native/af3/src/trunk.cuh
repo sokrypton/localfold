@@ -93,7 +93,7 @@ inline void freeTrunk(Trunk& t) {
   t = Trunk{};
 }
 
-template <class T> void templateEmbedding(Trunk& t, float* pairOut);
+template <class T> void templateEmbedding(Trunk& t, float* pairOut);     // adds its output into pairOut
 __global__ void onehotK(const int* idx, float* out, int n, int classes) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * classes) return;
@@ -156,9 +156,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   }
   bondTypeEmbed(t.pair, pairs, C, E);
   onSeam("z_init_generic", t.pair, pairs * C);
-  float* tmpl = scratch<float>("emb.template", pairs * C);
-  templateEmbedding<T>(t, tmpl);
-  addK<<<blocks(pairs * C), 256, 0, STREAM>>>(t.pair, tmpl, pairs * C);
+  templateEmbedding<T>(t, t.pair);     // its projection accumulated into the pair (it reads the pair first)
   onSeam("z_after_template", t.pair, pairs * C);
   // msa and single
   float* fromTarget = scratch<float>("emb.fromTarget", (size_t)n * t.Cm);
@@ -269,7 +267,7 @@ void templateEmbedding(Trunk& t, float* out) {
   }
   // divided by every slot (not the real ones), relu, projected
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
-  linear<float, float>(summed, out, pairs, Ct, Cq, P + "outputLinear");
+  linear<float, float>(summed, out, pairs, Ct, Cq, P + "outputLinear", false, 1.f);
 }
 
 // ---------------------------------------------------------------- MSA stack
