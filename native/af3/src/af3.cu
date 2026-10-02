@@ -17,7 +17,8 @@ int main(int argc, char** argv) {
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
   uint64_t seed = 42; std::string out = "fold.pdb";
   for (int i = 2; i < argc; ++i) {
-    if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = true;
+    if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
+    else if (!strcmp(argv[i], "--no-tf32")) F32_TF32 = false;
     else if (!strcmp(argv[i], "--stages")) STAGES = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
@@ -111,7 +112,9 @@ int main(int argc, char** argv) {
 
   // target_feat from the batch: per-atom conditioning and the atom cross-attention encoder.
   int tokens = (int)M.meta("batch.tokens");
+  bool tf32 = F32_TF32; F32_TF32 = false;          // target_feat once, in full f32: it feeds everything
   float* tfDev = buildTargetFeat();
+  F32_TF32 = tf32;
   check("target_feat", tfDev, (size_t)tokens * 447, "oracle.trunk.stages.target_feat");
   std::vector<float> targetFeat = download(tfDev, (size_t)tokens * 447);
   bool oracleTargetFeat = false;

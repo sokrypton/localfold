@@ -200,6 +200,9 @@ template <class T> __device__ __forceinline__ T fromF(float v) {
 }
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x)); }
 
+// The fast path's remaining f32 GEMMs (the conditioning, the atom blocks' aggregation and
+// broadcast projections, ...) on the tensor cores in TF32 - a 10-bit mantissa, as f16 has
+inline bool F32_TF32 = false;
 // Row-major Y[rows x out] = X[rows x in] W + beta Y, W (in,out) or (out,in) if transposed.
 // X and W in T (W's f16 copy for half); Y in TY; f32 accumulation always.
 template <class T, class TY>
@@ -211,10 +214,11 @@ void linear(const T* X, TY* Y, size_t rows, int in, int out, const std::string& 
   if (lenW(w) != (size_t)in * out) {
     fprintf(stderr, "%s has %zu elements, not %d x %d\n", w.c_str(), lenW(w), in, out); exit(1);
   }
+  bool tf32 = std::is_same_v<T, float> && F32_TF32;
   CB(cublasGemmEx(H, transposed ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one,
                   Wp, cudaType<T>(), transposed ? in : out, X, cudaType<T>(), in, &beta,
-                  Y, cudaType<TY>(), out, CUBLAS_COMPUTE_32F,
-                  std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                  Y, cudaType<TY>(), out, tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
+                  std::is_same_v<T, float> && !tf32 ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 // ---------------------------------------------------------------- checking and timing
