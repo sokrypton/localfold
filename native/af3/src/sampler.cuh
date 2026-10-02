@@ -77,8 +77,15 @@ inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<flo
                                  int ns = 1, double gamma0 = 0.8, double gammaMin = 1.0, double noiseScale = 1.003,
                                  double stepScale = 1.5) {
   size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
+  // a model's own EDM constants where its dialect carries them (boltz2)
+  double sigmaMin = 0.0004, sigmaMax = 160, rho = 7;
+  const std::string S = "trunk.dialect.sampler.";
+  if (M.has(S + "gamma0")) {
+    gamma0 = M.meta(S + "gamma0"); gammaMin = M.meta(S + "gammaMin"); noiseScale = M.meta(S + "noiseScale");
+    stepScale = M.meta(S + "stepScale"); rho = M.meta(S + "rho"); sigmaMin = M.meta(S + "sigmaMin"); sigmaMax = M.meta(S + "sigmaMax");
+  }
   std::vector<double> levels(steps + 1);
-  for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps);
+  for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
   for (int k = 0; k < ns; ++k) {
     Normal normal(seed + k);

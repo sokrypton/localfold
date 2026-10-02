@@ -207,7 +207,6 @@ inline AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond,
   addBiasRowsK<<<blocks(qRows * C), 256, 0, STREAM>>>(c.tg, W(B + ".ffwAdaptiveZeroCondBias"), qRows, C);
   c.pairLogits = pairLogits;
   c.chained = M.flag(B + ".chainedAtomLayerNorm");
-  if (hasW(B + ".ffwAToB")) { fprintf(stderr, "ffwAToB: not ported\n"); exit(1); }
   return c;
 }
 // sigmoid(scale) * LN(x) + shift, LN without affine
@@ -533,10 +532,11 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
                                                                           tn, qRows, C, q1);
   }
   int I = C * 2;
-  T* wide = scratch<T>("ab.wide", qRows * 2 * I);
+  T* wide = scratch<T>("ab.wide", qRows * 3 * I);
   T* gated = scratch<T>("ab.gated", qRows * I);
-  linear<T, T>(tn, wide, qRows, C, 2 * I, B + ".ffwTransition1");
-  swiglu<T>(wide, gated, qRows, I);
+  bool up; std::string w1 = upGatedTransition1(B, C, I, up);
+  linear<T, T>(tn, wide, qRows, C, up ? 3 * I : 2 * I, w1);
+  swiglu<T>(wide, gated, qRows, I, up);
   float* projected = scratch<float>("ab.projected", qRows * C);
   linear<T, float>(gated, projected, qRows, I, C, B + ".ffwTransition2");
   addSigmoidGatedK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, projected, bc.tg, qRows * C, q1 * C);
@@ -857,10 +857,44 @@ __global__ void targetFeatK(const int* aatype, const float* profile, const float
   else v = atom[(size_t)token * 384 + (c - 63)];
   out[t] = v;
 }
+// boltz2's target_feat: the atom encoder's 384 columns PLUS six bias-free projections (restype,
+// [profile | deletion mean], mol type, cyclic, method = x-ray, modified), a sum rather than AF3's
+// concatenation
+__global__ void targetFeatSumK(float* tf, const int* aatype, const float* profile, const float* delMean,
+                               const int* isDna, const int* isRna, const int* isLigand, const int* isModified,
+                               const float* wRes, const float* wProf, const float* wMol, const float* wMethod,
+                               const float* wMod, int tokens, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)tokens * C) return;
+  int token = (int)(t / C), c = (int)(t % C);
+  float v = 0;
+  int a = aatype[token];
+  if (a >= 0 && a < 31) v += wRes[a * C + c];
+  for (int k = 0; k < 31; ++k) v += profile[token * 31 + k] * wProf[k * C + c];
+  v += delMean[token] * wProf[31 * C + c];
+  // (a flag the batch does not carry is false everywhere)
+  int mol = isLigand && isLigand[token] ? 3 : isRna && isRna[token] ? 2 : isDna && isDna[token] ? 1 : 0;
+  v += wMol[mol * C + c];
+  v += wMethod[1 * C + c];                      // x-ray diffraction, the default method
+  v += wMod[(isModified && isModified[token] ? 1 : 0) * C + c];
+  tf[t] += v;                                   // cyclic: no cyclic chains, so its term is zero
+}
+inline const int* flagDev(const std::string& k) { return M.has(k) ? Idev(k) : nullptr; }
 inline float* buildTargetFeat() {
-  if (M.flag("trunk.dialect.targetFeatAtomOnly")) { fprintf(stderr, "atom-only target_feat: not ported\n"); exit(1); }
-  EncoderOut e = atomEncoder("targetFeat.encoder", "targetFeat.reference", nullptr, nullptr, nullptr);
   int tokens = (int)M.meta("batch.tokens");
+  if (M.flag("trunk.dialect.targetFeatAtomOnly")) {
+    const std::string S = "targetFeat.encoder.targetFeatSum.";
+    if (!hasW(S + "resType")) { fprintf(stderr, "atom-only target_feat without its six summed terms\n"); exit(1); }
+    EncoderOut e = atomEncoder("targetFeat.encoder", "targetFeat.reference", nullptr, nullptr, nullptr);
+    int C = 384;
+    float* tf = scratch<float>("targetFeat", (size_t)tokens * C);
+    CK(cudaMemcpyAsync(tf, e.tokenAct, (size_t)tokens * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    targetFeatSumK<<<blocks((size_t)tokens * C), 256, 0, STREAM>>>(tf, Idev("batch.aatype"), Fdev("batch.profile"),
+      Fdev("batch.deletionMean"), flagDev("batch.isDna"), flagDev("batch.isRna"), flagDev("batch.isLigand"), flagDev("batch.isModified"),
+      W(S + "resType"), W(S + "msaProfile"), W(S + "molType"), W(S + "method"), W(S + "modified"), tokens, C);
+    return tf;
+  }
+  EncoderOut e = atomEncoder("targetFeat.encoder", "targetFeat.reference", nullptr, nullptr, nullptr);
   float* tf = scratch<float>("targetFeat", (size_t)tokens * 447);
   targetFeatK<<<blocks((size_t)tokens * 447), 256, 0, STREAM>>>(Idev("batch.aatype"), Fdev("batch.profile"),
     Fdev("batch.deletionMean"), e.tokenAct, tf, tokens);

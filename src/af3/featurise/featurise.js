@@ -1042,6 +1042,23 @@ export function featuriseProtein(sequence, options = {}) {
     }
   }
 
+  // Per-token molecule flags, which boltz2's target_feat sums (its mol-type and modified
+  // conditioning) and batchFromDump has always carried from the reference's batch. Without them
+  // every token read as an unmodified protein residue.
+  const isDna = new Int32Array(tokens);
+  const isRna = new Int32Array(tokens);
+  const isLigand = new Int32Array(tokens);
+  const isModified = new Int32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    const residue = residueOfToken[token];
+    if (residue < 0) continue;
+    const kind = chainKinds[chainOfResidue[residue]];
+    isDna[token] = kind === "dna" ? 1 : 0;
+    isRna[token] = kind === "rna" ? 1 : 0;
+  }
+  for (const span of ligandSpans) isLigand.fill(1, span.from, span.from + span.count);
+  for (const span of modifiedSpans) isModified.fill(1, span.from, span.from + span.count);
+
   return {
     sequence: joined, chains, chainLengths,
     tokens, dense: DENSE, subsets, atomCount, sequences,
@@ -1055,7 +1072,7 @@ export function featuriseProtein(sequence, options = {}) {
     // every atom the model predicts is one it has a reference conformer for.
     predDenseAtomMask: refMask,
     bondMatrix, bondOrderMatrix, ligandSpans, modifiedSpans, residueOfToken,
-    chainKinds, chainOfResidue,
+    chainKinds, chainOfResidue, isDna, isRna, isLigand, isModified,
     tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms,
     tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
     features: { residueIndex, tokenIndex, asymId, entityId, symId },

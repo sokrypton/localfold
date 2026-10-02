@@ -38,18 +38,25 @@ __global__ void gatedAddK(float* pair, const T* proj, const T* gate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) pair[i] += toF(proj[i]) * sigm(toF(gate[i]));
 }
+// gated = swish(a) * b (* u with `up`: boltz2's conditioned transition up-gate), a row of wide
+// being [a | b] or [a | b | u], each I wide
 template <class T>
-__global__ void swigluK(const T* wide, T* gated, size_t rows, int I) {
+__global__ void swigluK(const T* wide, T* gated, size_t rows, int I, bool up) {
+  int L = up ? 3 * I : 2 * I;
   if constexpr (std::is_same_v<T, half>) {
     if (I % 8 == 0) {                 // eight halves (16 bytes) a thread
       size_t t = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
       if (t >= rows * I) return;
       size_t r = t / I; int i = (int)(t % I);
-      uint4 a = *(const uint4*)(wide + r * 2 * I + i), b = *(const uint4*)(wide + r * 2 * I + I + i), o;
+      uint4 a = *(const uint4*)(wide + r * L + i), b = *(const uint4*)(wide + r * L + I + i), o, u;
+      if (up) u = *(const uint4*)(wide + r * L + 2 * I + i);
       const half2* a2 = (const half2*)&a; const half2* b2 = (const half2*)&b; half2* o2 = (half2*)&o;
+      const half2* u2 = (const half2*)&u;
       for (int k = 0; k < 4; ++k) {
         float2 g = __half22float2(a2[k]), v = __half22float2(b2[k]);
-        o2[k] = __floats2half2_rn(g.x * sigm(g.x) * v.x, g.y * sigm(g.y) * v.y);
+        float x = g.x * sigm(g.x) * v.x, y = g.y * sigm(g.y) * v.y;
+        if (up) { float2 w = __half22float2(u2[k]); x *= w.x; y *= w.y; }
+        o2[k] = __floats2half2_rn(x, y);
       }
       *(uint4*)(gated + t) = o;
       return;
@@ -58,14 +65,23 @@ __global__ void swigluK(const T* wide, T* gated, size_t rows, int I) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * I) return;
   size_t r = t / I; int i = (int)(t % I);
-  float g = toF(wide[r * 2 * I + i]);
-  gated[t] = fromF<T>(g * sigm(g) * toF(wide[r * 2 * I + I + i]));
+  float g = toF(wide[r * L + i]);
+  float v = g * sigm(g) * toF(wide[r * L + I + i]);
+  if (up) v *= toF(wide[r * L + 2 * I + i]);
+  gated[t] = fromF<T>(v);
 }
 // the launch: an eighth of the threads for the vector path
 template <class T>
-void swiglu(const T* wide, T* gated, size_t rows, int I) {
+void swiglu(const T* wide, T* gated, size_t rows, int I, bool up = false) {
   size_t work = std::is_same_v<T, half> && I % 8 == 0 ? rows * I / 8 : rows * I;
-  swigluK<T><<<blocks(work), 256, 0, STREAM>>>(wide, gated, rows, I);
+  swigluK<T><<<blocks(work), 256, 0, STREAM>>>(wide, gated, rows, I, up);
+}
+// a conditioned transition's first weight: transition1, or [transition1 | ffwAToB] where the
+// bundle carries boltz2's up-gate (one GEMM for both)
+inline std::string upGatedTransition1(const std::string& B, int C, int I, bool& up) {
+  up = hasW(B + ".ffwAToB");
+  if (!up) return B + ".ffwTransition1";
+  return concatColumns(B + ".ffwTransition1|aToB~", C, {{B + ".ffwTransition1", 2 * I, false}, {B + ".ffwAToB", I, false}});
 }
 __global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

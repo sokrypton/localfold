@@ -92,6 +92,22 @@ __global__ void bondEmbedK(float* pair, const float* bonds, const float* w, size
   if (t < pairs * C) pair[t] += bonds[t / C] * w[t % C];
 }
 
+// boltz2's two extra z-init terms: token_bonds_type_embed[bond order] (row 0 on an unbonded pair,
+// trained non-zero) plus the contact conditioning's unspecified-restraint constant
+__global__ void bondTypeEmbedK(float* pair, const float* orders, const float* table, const float* unspecified,
+                               size_t pairs, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= pairs * C) return;
+  int o = orders ? (int)orders[t / C] : 0;
+  if (o < 0 || o >= 7) o = 0;
+  pair[t] += table[o * C + t % C] + unspecified[t % C];
+}
+inline void bondTypeEmbed(float* pair, size_t pairs, int C, const std::string& pre) {
+  if (!hasW(pre + "tokenBondsTypeEmbed")) return;
+  bondTypeEmbedK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
+    W(pre + "tokenBondsTypeEmbed"), W(pre + "contactEncodingUnspecified"), pairs, C);
+}
+
 // The embedder up to and including the template term. `onSeam` sees the pair after each.
 template <class T>
 void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)>& onSeam) {
@@ -118,6 +134,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     if (lenW(E + "bondEmbedding") != (size_t)C) { fprintf(stderr, "bondEmbedding is not 1 x %d\n", C); exit(1); }
     bondEmbedK<<<blocks(pairs * C), 256, 0, STREAM>>>(t.pair, Fdev("batch.bondMatrix"), W(E + "bondEmbedding"), pairs, C);
   }
+  bondTypeEmbed(t.pair, pairs, C, E);
   onSeam("z_init_generic", t.pair, pairs * C);
   float* tmpl = scratch<float>("emb.template", pairs * C);
   templateEmbedding<T>(t, tmpl);
@@ -409,10 +426,12 @@ void msaAttention(Trunk& t, const std::string& pre) {
 template <class T>
 void msaBlock(Trunk& t, int k) {
   std::string B = "trunk.msaBlocks." + std::to_string(k);
-  if (M.flag("trunk.dialect.msaUpdateBeforeOuterProduct")) { fprintf(stderr, "msa update first: not ported\n"); exit(1); }
-  outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm");
+  // the outer product off the pre-update MSA (AF3), or off the updated one (OpenDDE, boltz2)
+  bool updateFirst = M.flag("trunk.dialect.msaUpdateBeforeOuterProduct");
+  if (!updateFirst) { outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm"); }
   msaAttention<T>(t, B + ".msaAttention1"); stage("msa.attention");
   transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
+  if (updateFirst) { outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm"); }
   pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
 }
 
@@ -542,8 +561,14 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   embed<T>(t, onSeam); stage("embed");
   size_t pairs = (size_t)t.n * t.n;
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + std::to_string(msaBlocks) + ".pairChannels")) ++msaBlocks;
+  // boltz2 adds the pre-MSA pair back: its MSA module returns the updated z and the caller adds z
+  float* zIn = nullptr;
+  if (M.flag("trunk.dialect.msaDoubleAddPair")) {
+    zIn = scratch<float>("trunk.zBeforeMsa", pairs * t.C);
+    CK(cudaMemcpyAsync(zIn, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  }
   for (int k = 0; k < msaBlocks; ++k) msaBlock<T>(t, k);
-  if (M.flag("trunk.dialect.msaDoubleAddPair")) { fprintf(stderr, "msaDoubleAddPair: not ported\n"); exit(1); }
+  if (zIn) addK<<<blocks(pairs * t.C), 256, 0, STREAM>>>(t.pair, zIn, pairs * t.C);
   onSeam("z_after_msa", t.pair, pairs * t.C);
   onSeam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
   int blocks_ = 0; while (M.has("trunk.pairformerBlocks." + std::to_string(blocks_) + ".singleChannels")) ++blocks_;

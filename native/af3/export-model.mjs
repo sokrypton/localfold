@@ -37,7 +37,7 @@ const bundle = /^https?:/.test(bundleArg) ? bundleArg : new URL(`file://${bundle
 // af3-oracle-{trunk,denoise,confidence}-<name>.json) - with its bundle (--bundle)
 const oracleModel = option("oracle-model", "alphafold3");
 const batchPath = option("batch", `${repo}/oracle-dumps/af3-batch-${oracleModel}-6mrr.json`);
-const oracles = (option("oracles", option("sequence", "") === "" && option("job", "") === "" ? "trunk,denoise,realdenoise,confidence" : ""))
+const oracles = (option("oracles", option("sequence", "") === "" && option("job", "") === "" ? "trunk,denoise,stages,realdenoise,confidence" : ""))
   .split(",").filter(Boolean);
 
 const { openAf3Store, trunkWeights, trunkDepths, confidenceWeights } =

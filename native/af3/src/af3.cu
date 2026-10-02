@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
   }
 
   // The confidence head on AF3's own inputs, against AF3's own outputs.
-  if (M.has("oracle.confidence.stages.out.full_pae")) {
+  if (M.has("oracle.confidence.stages.out.full_pae") && !getenv("SKIP_CONFIDENCE_ORACLE")) {
     int n = (int)M.meta("batch.tokens");
     const std::string I = "oracle.confidence.stages.in.";
     float* pair = upload(M.f(I + "pair"), M.len(I + "pair"));
@@ -119,13 +119,14 @@ int main(int argc, char** argv) {
   int tokens = (int)M.meta("batch.tokens");
   bool tf32 = F32_TF32; F32_TF32 = false;          // target_feat once, in full f32: it feeds everything
   float* tfDev = buildTargetFeat();
+  int tfWidth = (int)M.meta("trunk.embedder.targetFeatWidth");
   F32_TF32 = tf32;
-  check("target_feat", tfDev, (size_t)tokens * 447, "oracle.trunk.stages.target_feat");
-  std::vector<float> targetFeat = download(tfDev, (size_t)tokens * 447);
+  check("target_feat", tfDev, (size_t)tokens * tfWidth, "oracle.trunk.stages.target_feat");
+  std::vector<float> targetFeat = download(tfDev, (size_t)tokens * tfWidth);
   bool oracleTargetFeat = false;
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
   if (oracleTargetFeat)
-    targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * 447);
+    targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
   Trunk t = makeTrunk(targetFeat.data(), msaCap);
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");

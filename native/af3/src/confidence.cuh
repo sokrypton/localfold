@@ -94,6 +94,73 @@ inline void maskedGlobalNorm(float* x, const float* rowMask, size_t rows, int C,
 __global__ void clampK(float* x, float limit, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = fminf(limit, fmaxf(-limit, x[i]));
 }
+// boltz2's re-embedded pair (after LN_z and the relative encoding): right[i] + left[j] off the
+// normalised s_inputs, its own 64-bin distance embedding (bounds evenly over 2..22 A), the bond
+// contact and bond-order terms and the contact conditioning's unspecified constant
+__global__ void reembedPairK(float* pair, const float* left, const float* right, const float* beta, const float* pairMask,
+                             const float* Wd, const float* bonds, const float* orders, const float* wBond,
+                             const float* wBondType, const float* unspecified, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n * C) return;
+  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+  double sq = 1e-10;
+  for (int k = 0; k < 3; ++k) { double d = (double)beta[i * 3 + k] - beta[j * 3 + k]; sq += d * d; }
+  double distance = sqrt(sq);
+  int bin = 0;
+  for (int e = 0; e < 63; ++e) if (distance > 2.0 + 20.0 * e / 62) ++bin;
+  int o = orders ? (int)orders[ij] : 0;
+  if (o < 0 || o >= 7) o = 0;
+  float v = right[(size_t)i * C + c] + left[(size_t)j * C + c] + Wd[(size_t)bin * C + c] * pairMask[ij]
+          + (bonds ? bonds[ij] * wBond[c] : 0.f) + wBondType[(size_t)o * C + c] + unspecified[c];
+  pair[t] += v;
+}
+// prod[i][j][e] = a[i][e] b[j][e], rows i0.. of a chunk
+__global__ void outerProductRowsK(const float* a, const float* b, float* out, int i0, int rowsI, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)rowsI * n * C) return;
+  int e = (int)(t % C); size_t ij = t / C; int i = i0 + (int)(ij / n), j = (int)(ij % n);
+  out[t] = a[(size_t)i * C + e] * b[(size_t)j * C + e];
+}
+// boltz2's split pair heads: the inter-chain logits where the two tokens' chains differ
+__global__ void interChainLogitsK(float* logits, const float* inter, const int* asym, int n, int bins) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n * bins) return;
+  size_t ij = t / bins; int i = (int)(ij / n), j = (int)(ij % n);
+  if (asym[i] != asym[j]) logits[t] = inter[t];
+}
+inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, const float* trunkSingle,
+                          const float* targetFeat, const float* pseudoBeta, const float* pairMask, int n, int C, int Cs, int F) {
+  const std::string R = "confidence.reembed.";
+  size_t pairs = (size_t)n * n;
+  float* sIn = scratch<float>("conf.sInputs", (size_t)n * F);
+  layerNorm2<float, float>(targetFeat, sIn, n, F, R + "sInputsNormScale", R + "sInputsNormOffset");
+  layerNorm2<float, float>(trunkSingle, single, n, Cs, R + "sNormScale", R + "sNormOffset");
+  linear<float, float>(sIn, single, n, F, Cs, R + "sInputToS", false, 1.f);
+  layerNorm2<float, float>(trunkPair, pair, pairs, C, R + "zNormScale", R + "zNormOffset");
+  if (lenW(R + "relPosProject") != (size_t)139 * C) { fprintf(stderr, "relPosProject is not 139 x %d\n", C); exit(1); }
+  relativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(
+    Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
+    Idev("batch.features.entityId"), Idev("batch.features.symId"), W(R + "relPosProject"), pair, n, C, 32, 2);
+  float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
+  float* p1 = scratch<float>("conf.p1", (size_t)n * C); float* p2 = scratch<float>("conf.p2", (size_t)n * C);
+  linear<float, float>(sIn, left, n, F, C, R + "leftTargetFeatProject");
+  linear<float, float>(sIn, right, n, F, C, R + "rightTargetFeatProject");
+  linear<float, float>(sIn, p1, n, F, C, R + "sToZProdIn1");
+  linear<float, float>(sIn, p2, n, F, C, R + "sToZProdIn2");
+  if (lenW(R + "distogramFeatProject") != (size_t)64 * C) { fprintf(stderr, "the reembed distogram is not 64 bins\n"); exit(1); }
+  reembedPairK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, pseudoBeta, pairMask, W(R + "distogramFeatProject"),
+    M.has("batch.bondMatrix") ? Fdev("batch.bondMatrix") : nullptr,
+    M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
+    W(R + "tokenBondsProject"), W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), n, C);
+  // the outer product of the two s_inputs projections through sToZProdOut, in row chunks
+  int rowsPer = std::max<int>(1, (int)(CHUNK / ((size_t)n * C)));
+  float* prod = scratch<float>("conf.prod", (size_t)std::min(rowsPer, n) * n * C);
+  for (int i0 = 0; i0 < n; i0 += rowsPer) {
+    int r = std::min(rowsPer, n - i0);
+    outerProductRowsK<<<blocks((size_t)r * n * C), 256, 0, STREAM>>>(p1, p2, prod, i0, r, n, C);
+    linear<float, float>(prod, pair + (size_t)i0 * n * C, (size_t)r * n, C, C, R + "sToZProdOut", false, 1.f);
+  }
+}
 struct ConfidenceOut { std::vector<float> plddt, pae, pde; double meanPlddt, ptm, iptm; };
 
 inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
@@ -101,15 +168,14 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   const std::string P = "confidence";
   int C = (int)M.meta(P + ".pairChannels"), Cs = (int)M.meta(P + ".singleChannels"), F = (int)M.meta(P + ".targetFeatWidth");
   int dense = (int)M.meta("batch.dense");
-  if (M.flag("trunk.dialect.reembedConfidencePair")) { fprintf(stderr, "reembedConfidencePair: not ported\n"); exit(1); }
   bool caDgram = M.flag("trunk.dialect.confidenceCaDgram");
-  if (hasW(P + ".interHalfDistanceLogits") || !hasW(P + ".logitsLnScale")) {
-    fprintf(stderr, "confidence head variant (split heads / no head LayerNorm): not ported\n"); exit(1);
-  }
   size_t pairs = (size_t)n * n;
   float* pair = scratch<float>("conf.pair", pairs * C);
-  CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
+  if (M.flag("trunk.dialect.reembedConfidencePair")) {
+    boltz2Reembed(pair, single, trunkPair, trunkSingle, targetFeat, pseudoBeta, pairMask, n, C, Cs, F);
+  } else {
+  CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(single, trunkSingle, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   if (M.flag("trunk.dialect.confidenceGlobalNorm")) {
     // rf3 normalises every detached trunk input over the whole tensor first (target_feat over the
@@ -135,6 +201,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
     layerNorm2<float, float>(single, sn, n, Cs, P + ".inputSingleNormScale", P + ".inputSingleNormOffset");
     CK(cudaMemcpyAsync(single, sn, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   }
+  }
   int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
   bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
   for (int k = 0; k < nb; ++k)
@@ -151,18 +218,33 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   ConfidenceOut out;
   float* pde = scratch<float>("conf.pde", pairs); float* pae = scratch<float>("conf.pae", pairs);
   bool preSym = M.flag("trunk.dialect.preSymmetrisedPde");
+  // a head LayerNorm the bundle does not carry is no LayerNorm (boltz2 reads z and s directly)
+  auto headNorm = [&](const float* x, float* buf, size_t rows, int Cx, const std::string& name) -> const float* {
+    if (!hasW(P + "." + name + "Scale")) return x;
+    layerNorm2<float, float>(x, buf, rows, Cx, P + "." + name + "Scale", P + "." + name + "Offset");
+    return buf;
+  };
+  // boltz2 splits each pair head into an intra-chain and an inter-chain projection
+  const int* asymDev = Idev("batch.asymId");
+  float* interLogits = hasW(P + ".interHalfDistanceLogits") || hasW(P + ".paeInterLogits")
+    ? scratch<float>("conf.interLogits", pairs * NB) : nullptr;
+  auto project = [&](const float* x, const std::string& w, const std::string& inter) {
+    linear<float, float>(x, logits, pairs, C, NB, P + "." + w);
+    if (!hasW(P + "." + inter)) return;
+    linear<float, float>(x, interLogits, pairs, C, NB, P + "." + inter);
+    interChainLogitsK<<<blocks(pairs * NB), 256, 0, STREAM>>>(logits, interLogits, asymDev, n, NB);
+  };
+  if (hasW(P + ".interHalfDistanceLogits") && !preSym) { fprintf(stderr, "split PDE heads need the pre-symmetrised PDE\n"); exit(1); }
+  const float* src = pair;
   if (preSym) {
-    // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2); AF3 adds the transpose after
+    // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2, boltz2); AF3 adds the transpose after
     float* sym = scratch<float>("conf.sym", pairs * C);
     symmetriseK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, sym, n, C);
-    layerNorm2<float, float>(sym, ln, pairs, C, P + ".logitsLnScale", P + ".logitsLnOffset");
-  } else {
-    layerNorm2<float, float>(pair, ln, pairs, C, P + ".logitsLnScale", P + ".logitsLnOffset");
+    src = sym;
   }
-  linear<float, float>(ln, logits, pairs, C, NB, P + ".leftHalfDistanceLogits");
+  project(headNorm(src, ln, pairs, C, "logitsLn"), "leftHalfDistanceLogits", "interHalfDistanceLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pde, pairMask, pairs, NB, dCentres, preSym ? 0 : n, 1.f);
-  layerNorm2<float, float>(pair, ln, pairs, C, P + ".paeLogitsLnScale", P + ".paeLogitsLnOffset");
-  linear<float, float>(ln, logits, pairs, C, NB, P + ".paeLogits");
+  project(headNorm(pair, ln, pairs, C, "paeLogitsLn"), "paeLogits", "paeInterLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pae, pairMask, pairs, NB, dCentres, 0, 1.f);
   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's
   // mean over the pairs it selects (ipTM: other chains only). src/heads/tm-score.js.
@@ -196,8 +278,8 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   std::vector<float> pc(PB);
   for (int b = 0; b < PB; ++b) pc[b] = 0.5f / PB + (float)b / PB;
   float* dpc = upload(pc.data(), PB);
-  float* sln = scratch<float>("conf.sln", (size_t)n * Cs);
-  layerNorm2<float, float>(single, sln, n, Cs, P + ".plddtLnScale", P + ".plddtLnOffset");
+  float* slnBuf = scratch<float>("conf.sln", (size_t)n * Cs);
+  const float* sln = headNorm(single, slnBuf, n, Cs, "plddtLn");
   float* pl = scratch<float>("conf.plddtLogits", (size_t)n * dense * PB);
   linear<float, float>(sln, pl, n, Cs, dense * PB, P + ".plddtLogits");
   float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);

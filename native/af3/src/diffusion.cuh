@@ -59,7 +59,7 @@ inline void plainTransition(float* x, size_t rows, int C, int factor, const std:
     size_t r = std::min(per, rows - r0);
     layerNormSlow(x + r0 * C, xn, r, C, W(P + ".ffwLayerNormScale"), Wopt(P + ".ffwLayerNormOffset"));
     linear<float, float>(xn, wide, r, C, 2 * I, P + ".ffwTransition1");
-    swigluK<float><<<blocks(r * I), 256, 0, STREAM>>>(wide, gated, r, I);
+    swigluK<float><<<blocks(r * I), 256, 0, STREAM>>>(wide, gated, r, I, false);
     linear<float, float>(gated, x + r0 * C, r, I, C, P + ".ffwTransition2", false, 1.f);
   }
 }
@@ -512,7 +512,6 @@ inline void prepareTransformer(const float* pairCond, int n) {
         CK(cudaMemcpyAsync(wr + (size_t)Cc * ldr + (size_t)b * 2 * C + slot * C, W(pre + "AdaptiveZeroCondBias"),
                            C * 4, cudaMemcpyDeviceToDevice, STREAM));
       }
-      if (hasW(B + ".ffwAToB")) { fprintf(stderr, "ffwAToB: not ported\n"); exit(1); }
     }
     tc.wNorm = T + ".condNorm~"; tc.wRaw = T + ".condRaw~";
     deviceWeight(tc.wNorm, wn, (size_t)Ca * ldn); deviceWeight(tc.wRaw, wr, (size_t)Ca * ldr);
@@ -601,7 +600,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   T* att = scratch<T>("dt.att", rows * C);
   T* tn = scratch<T>("dt.tn", rows * C);
   int I = C * factor;
-  T* wide = scratch<T>("dt.wide", rows * 2 * I);
+  T* wide = scratch<T>("dt.wide", rows * 3 * I);
   T* gated = scratch<T>("dt.gated", rows * I);
   T* proj = scratch<T>("dt.proj", rows * C);
   // rf3's block wiring: the transition reads the block's INPUT (both still add to act)
@@ -647,8 +646,9 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     } else {
       gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
     }
-    linear<T, T>(tn, wide, rows, C, 2 * I, B + ".ffwTransition1");
-    swiglu<T>(wide, gated, rows, I);
+    bool up; std::string w1 = upGatedTransition1(B, C, I, up);
+    linear<T, T>(tn, wide, rows, C, up ? 3 * I : 2 * I, w1);
+    swiglu<T>(wide, gated, rows, I, up);
     linear<T, T>(gated, proj, rows, I, C, B + ".ffwTransition2");
   }
   // the last block's transition residual
@@ -742,6 +742,14 @@ struct DiffusionFold {
   cudaGraphExec_t graph = nullptr; const float* graphInput = nullptr; int calls = 0;
 };
 inline bool GRAPHS = true;
+// the denoiser's seams against a stage oracle (oracle.stages.stages.<name>), when one was exported
+inline void dtap(const char* name, const float* d, size_t n) {
+  std::string k = std::string("oracle.stages.stages.") + name;
+  cudaStreamCaptureStatus capturing;
+  CK(cudaStreamIsCapturing(STREAM, &capturing));
+  if (capturing != cudaStreamCaptureStatusNone) return;
+  if (M.has(k) && M.len(k) == n) check((std::string("  ") + name).c_str(), d, n, k);
+}
 inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat,
                                       const float* seqMask, int n) {
   DiffusionFold f{ trunkSingle, trunkPair, targetFeat, seqMask, n, {}, {} };
@@ -759,6 +767,8 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   size_t atoms = (size_t)n * dense, total = atoms * NS;
   stage(nullptr);
   Conditioning cond = diffusionConditioning(f.trunkSingle, f.trunkPair, f.targetFeat, noiseLevel, n); stage("d.conditioning");
+  dtap("conditioning.single", cond.single, (size_t)n * (int)M.meta("diffusion.conditioning.seqChannels"));
+  dtap("conditioning.pair", cond.pair, (size_t)n * n * (int)M.meta("diffusion.conditioning.pairChannels"));
   const float* atomMask = Fdev("batch.refMask");
   float* scaled = scratch<float>("dn.scaled", total * 3);
   scalePositionsK<<<blocks(total * 3), 256, 0, STREAM>>>(positionsNoisy, atomMask, scaled, total, atoms, noiseParams);
@@ -771,13 +781,19 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   size_t rows = (size_t)n * NS;
   float* act = scratch<float>("dn.act", rows * perToken);
   CK(cudaMemcpyAsync(act, f.enc.tokenAct, rows * perToken * 4, cudaMemcpyDeviceToDevice, STREAM));
+  dtap("encoder.tokenAct", f.enc.tokenAct, rows * perToken);
   addBroadcastK<<<blocks(rows * perToken), 256, 0, STREAM>>>(act, snProj, (size_t)n * perToken, rows * perToken);
+  dtap("transformer.act", act, rows * perToken);
+  if (getenv("TX_ORACLE_IN") && M.has("oracle.stages.stages.transformer.act"))    // the transformer alone, on the oracle's input
+    CK(cudaMemcpyAsync(act, Fdev("oracle.stages.stages.transformer.act"), rows * perToken * 4, cudaMemcpyDeviceToDevice, STREAM));
   if (DIFF_HALF) diffusionTransformer<half>(act, cond.single, f.seqMask, n);
   else diffusionTransformer<float>(act, cond.single, f.seqMask, n);
   stage("d.transformer");
+  dtap("transformer.out", act, rows * perToken);
   float* actn = scratch<float>("dn.actn", rows * perToken);
   layerNormSlow(act, actn, rows, perToken, W("diffusion.outputNormScale"), Wopt("diffusion.outputNormOffset"));
   float* upd = atomDecoder(actn, f.enc, f.dec); stage("d.decoder");
+  dtap("decoder.update", upd, total * 3);
   float* out = scratch<float>("dn.out", total * 3);
   denoiseOutK<<<blocks(total * 3), 256, 0, STREAM>>>(positionsNoisy, upd, atomMask, out, total, atoms, noiseParams);
   return out;
