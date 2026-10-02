@@ -1,80 +1,81 @@
 # AlphaFold 3 in CUDA
 
-A native CUDA/cuBLAS port of this repository's AlphaFold 3, transcribed stage by
-stage from the CPU references under `src/af3/` (the specification) and checked
-against af3-any-model's own oracle dumps in `oracle-dumps/`.
-
-Status: **the pairformer (all 48 blocks) runs and matches AF3.** The rest of the
-model is not ported yet; see "Next" below.
+A native CUDA/cuBLAS AlphaFold 3, transcribed stage by stage from this repository's CPU
+references under `src/af3/` (the specification) and checked against af3-any-model's own
+oracle dumps in `oracle-dumps/`. Proteins fold end to end from a sequence (and optionally an
+A3M), with pLDDT, PAE, PDE and pTM.
 
 ## Build and run
 
 ```
 cd native/af3
-nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread -DUSE_FP16 pairformer.cu -lcublas -o pairformer16
+nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread src/af3.cu -lcublas -o af3
 
-python3 ../../tools/serve.py 8791 &        # the exporters read bundles over HTTP
-node --js-float16array --max-old-space-size=16000 export-pairformer.mjs data48   # f32 bundle, 569 MiB
-python3 index.py data48
+python3 ../../tools/serve.py 8791 &        # the exporter reads the bundle over HTTP
+# a sequence (chains joined by ":") and optionally an alignment, featurised by the repo's own
+# af3BatchFromA3m; or, with no --sequence, AF3's own 6MRR batch plus every oracle to check against
+node --js-float16array --max-old-space-size=24000 export-model.mjs data-5caj \
+  --sequence=<SEQ> --a3m=../../oracle-dumps/5caj-a.a3m
+node --js-float16array --max-old-space-size=24000 export-model.mjs data          # oracle checks
 
-./pairformer16 data48 --bf16 --graph --repeat=3            # AF3's own 6MRR input, vs AF3's output
-./pairformer16 data48 --tokens=1024 --bf16 --graph         # timing at any size (random input)
-./pairformer16 data48 --tokens=256 --bf16 --stages         # per-stage profile
+./af3 data                                   # f32 path, every stage against AF3
+./af3 data-5caj --fold --fast --out=5caj.pdb # fold: PDB with pLDDT in the B-factor column
+python3 score.py 5caj.pdb ../../tools/fixtures/5caj-crystal.pdb A
 ```
 
-`--bf16` selects the 16-bit path; with `-DUSE_FP16` that path is IEEE half,
-otherwise bfloat16. `--no-fused` is pure FP32 (the accuracy reference), `--tf32`
-TF32 linears. `export-block.mjs` exports one block plus the CPU reference's
-output (`--real` for AF3's input, otherwise random) for checking a single block.
+`--fold` options: `--steps=200 --recycles=0 --seed=42 --folds=N` (N warm repeats),
+`--fast` (f16 trunk and denoiser transformer), `--stages` (per-stage profile),
+`--no-graphs`. `pairformer.cu` is the earlier one-file pairformer prototype and benchmark.
 
-## Accuracy: 48 blocks on 6MRR (68 tokens), against AF3's `trunk_out_pair`
+## Accuracy against AF3 (6MRR, f32 bundle)
 
-f32 weights, AF3's own pairformer input (`tap.trunk_in_pair`, `tap.trunk_in_single`):
-
-| path | pair | single |
+| seam | f32 path | f16 path |
 |---|---|---|
-| FP32 | 4.2e-7 | 1.9e-7 |
-| TF32 | 2.7e-4 | 4.7e-5 |
-| **FP16** | **2.95e-4** | 1.9e-4 |
-| BF16 | 2.4e-3 | 4.7e-4 |
-| WebGPU, shipped (docs/AF3.md, f32) | 2.98e-4 | |
+| target_feat (atom encoder) | 5.4e-8 | |
+| z_after_msa | 1.0e-4 | 1.2e-4 |
+| trunk_out_pair | **3.0e-5** | 3.0e-4 |
+| single | 7.2e-6 | 1.3e-4 |
+| one denoiser call | 1.8e-5 | 1.8e-3 |
+| confidence PAE / PDE | 2.8e-6 / 3.7e-6 | |
 
-BF16 is no faster than FP16 here and its 7-bit mantissa drifts to 8x the error
-over 48 blocks; FP16 lands on WebGPU's error. 🔴 A RANDOM N(0,1) INPUT IS
-USELESS FOR THIS: through real weights it reads 1-3e-2 in any 16-bit format
-while AF3's real input reads 3e-5 - always check on `--real`/the oracle.
+WebGPU (docs/AF3.md, f32): trunk_out_pair 2.98e-4. `z_init` reads 2.2e-4 because AF3's dump
+stores that tap in bfloat16. 🔴 pLDDT on the confidence oracle's RANDOM inputs is
+ill-conditioned - a 1e-6 change to the input moves it 7.2e-3 - so it reads ~6e-3 there (the
+JS CPU reference 8.8e-3) and is checked on folds. 🔴 Likewise a random N(0,1) block input reads
+1-3e-2 in any 16-bit format where AF3's real input reads 3e-5: always check on real inputs.
 
-## Speed: 48 blocks, A100-SXM4-40GB
+Folds: 6MRR from its sequence **0.683 A** CA RMSD, pLDDT 85.1, pTM 0.720 (WebGPU 0.65-0.71);
+5CAJ (255 residues of chain A) with its MSA **2.04 A**, pLDDT 94.6, pTM 0.940 - the WebGPU
+port gives pLDDT 94.5, pTM 0.938 on the same inputs.
 
-| tokens | WebGPU (dev flags) | CUDA FP16 | |
-|---|---|---|---|
-| 64 | 51 ms | 15.3 ms | 3.3x |
-| 128 | 87 ms | 36.9 ms | 2.4x |
-| 256 | 274 ms | 142 ms | 1.9x |
-| 512 | 1202 ms | 601 ms | 2.0x |
-| 1024 | 6635 ms | 2952 ms | 2.2x |
+## Speed: A100-SXM4-40GB, 200 diffusion steps, 0 recycles
 
-WebGPU here is `bench-trunk.js --msa=1` steady pairformer with the developer
-flags; a stock-Chrome NVIDIA visitor gets about half that. No 2 GiB binding
-ceiling: 2500 and 3000 tokens run (18 and 25 GB).
+| target | WebGPU first / warm | native first / warm |
+|---|---|---|
+| 6MRR, 68 tokens | 5.1 s / 2.4 s | 1.54 s / **0.87 s** |
+| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 2.40 s / **1.69 s** |
 
-## What made it fast (in order)
+WebGPU with the developer flags (`fold.js --folds=2`); a stock-Chrome NVIDIA visitor gets
+about half its speed. No 2 GiB binding ceiling.
 
-1. Scratch buffers cached, not `cudaMalloc`'d per call: 13.7 -> 3.7 ms/block at 64.
-2. Grid attention over all rows at once where it fits.
-3. Tensor cores. TF32 first; then FP16 end to end - LayerNorm and centre-norm
-   write 16-bit directly, intermediates stay 16-bit, residuals stay f32.
-4. The grid attention as a FlashAttention-2 kernel (`flashGridAsync`): S, P and O
-   in registers via `mma.sync` m16n8k16 (WMMA's fragment layout is unspecified),
-   P's accumulators reused as the A operand of P V, cp.async double-buffered
-   K/V/bias tiles, ldmatrix (.trans for V), scores in the log2 domain. One
-   direction at 1024 tokens: ~13 ms, against PyTorch's cutlass attention 17.9 ms.
-5. Fused GEMMs: q/k/v/gate as one, triangle projection+gate as one; residual
-   adds folded into GEMMs with beta = 1.
-6. CUDA graph replay (small sizes).
+The pairformer alone (48 blocks, FP16): 64 tokens 15 ms, 256 142 ms, 1024 2.95 s - 1.9-3.3x
+the WebGPU trunk's pairformer.
 
-## Next
+## What made it fast
 
-The rest of AF3, each against the oracle: embedder + target_feat, template
-embedder, MSA stack, recycling and distogram, diffusion (conditioning, atom
-encoder/decoder, 24-block transformer, sampler), confidence head.
+Trunk: cached scratch; tensor cores, FP16 end to end with f32 residuals (LayerNorms write 16-bit
+directly); the grid attention as a FlashAttention-2 kernel on `mma.sync` (S, P, O in registers,
+cp.async double buffering, ldmatrix, log2-domain scores; head widths 16 and 32); fused q/k/v/gate
+and projection/gate GEMMs; residual adds folded into GEMMs (beta = 1).
+
+Diffusion: everything derived from the conditioning computed once per fold (atom pair
+conditioning and pair logits, every block's adaptive-LayerNorm scales/shifts and zero-init gates,
+the transformer's 24 pair-logit sets); the transformer's 144 conditioning projections as two
+GEMMs per step with each block's LayerNorm scale folded into its weights; the whole step replayed
+as a CUDA graph; the transformer in FP16.
+
+## Not ported yet
+
+Ligands and bonds, modified residues, nucleic acids (the featuriser handles them; the trunk's
+bond embedding does not), real templates (empty slots only), the other dialects (OpenDDE,
+boltz2, protenix2, IntelliFold-2, RoseTTAFold3 - each raises a named "not ported" error).

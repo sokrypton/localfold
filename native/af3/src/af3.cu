@@ -12,7 +12,7 @@
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
-  bool fast = false, doFold = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 0;
+  bool fast = false, doFold = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 0, folds = 1;
   uint64_t seed = 42; std::string out = "fold.pdb";
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = true;
@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
     else if (!strcmp(argv[i], "--fold")) doFold = true;
     else if (!strcmp(argv[i], "--no-graphs")) GRAPHS = false;
+    else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
@@ -106,7 +107,11 @@ int main(int argc, char** argv) {
   Trunk t = makeTrunk(targetFeat.data(), msaCap);
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
-  if (doFold) {
+  for (int fi = 0; doFold && fi < folds; ++fi) {
+    if (fi > 0) {   // a fresh fold: the trunk restarts from zero recycled state
+      size_t pp = (size_t)t.n * t.n * t.C;
+      CK(cudaMemset(t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
+    }
     std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
     auto clock = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -146,10 +151,10 @@ int main(int argc, char** argv) {
       double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
       for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);
     }
-    printf("confidence %.1f ms: mean pLDDT %.2f  pTM %.4f  ipTM %.4f\n", ms(f2, f3), conf.meanPlddt, conf.ptm, conf.iptm);
-    printf("fold: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps), wrote %s\n", ms(f0, f1), recycles + 1,
-           ms(f1, f2), steps, out.c_str());
-    return 0;
+    printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", conf.meanPlddt, conf.ptm, conf.iptm, out.c_str());
+    printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps), confidence %.1f ms, total %.1f ms\n", fi + 1,
+           ms(f0, f1), recycles + 1, ms(f1, f2), steps, ms(f2, f3), ms(f0, f3));
+    if (fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
     std::string tap = std::string("oracle.trunk.stages.tap.") + name;
