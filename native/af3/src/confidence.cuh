@@ -38,7 +38,7 @@ __global__ void expectationK(const float* logits, float* out, const float* mask,
   out[r] = weighted / total * scale * (mask ? mask[r] : 1.f);
 }
 
-struct ConfidenceOut { std::vector<float> plddt, pae, pde; double meanPlddt; };
+struct ConfidenceOut { std::vector<float> plddt, pae, pde; double meanPlddt, ptm, iptm; };
 
 inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
                                     const float* pseudoBeta, const float* seqMask, const float* pairMask, int n) {
@@ -82,6 +82,35 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   layerNorm2<float, float>(pair, ln, pairs, C, P + ".paeLogitsLnScale", P + ".paeLogitsLnOffset");
   linear<float, float>(ln, logits, pairs, C, NB, P + ".paeLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pae, pairMask, pairs, NB, dCentres, 0, 1.f);
+  // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's
+  // mean over the pairs it selects (ipTM: other chains only). src/heads/tm-score.js.
+  {
+    std::vector<float> pl = download(logits, pairs * NB), seq = download(seqMask, n);
+    const int* asym = M.i("batch.asymId");
+    int real = 0; for (float v : seq) real += v > 0;
+    double d0 = 1.24 * std::cbrt(std::max(real, 19) - 15.0) - 1.8;
+    std::vector<double> perBin(NB), term(pairs);
+    for (int b = 0; b < NB; ++b) perBin[b] = 1 / (1 + (double)centres[b] * centres[b] / (d0 * d0));
+    for (size_t p2 = 0; p2 < pairs; ++p2) {
+      double mx = -1e30, tot = 0, acc = 0;
+      for (int b = 0; b < NB; ++b) mx = std::max(mx, (double)pl[p2 * NB + b]);
+      for (int b = 0; b < NB; ++b) { double e = std::exp(pl[p2 * NB + b] - mx); tot += e; acc += e * perBin[b]; }
+      term[p2] = acc / tot;
+    }
+    auto reduce = [&](bool interOnly) {
+      double best = -1e30; bool any = false;
+      for (int i = 0; i < n; ++i) {
+        double tot = 0; int cnt = 0;
+        for (int j = 0; j < n; ++j) {
+          if (!(seq[i] > 0 && seq[j] > 0) || (interOnly && asym[i] == asym[j])) continue;
+          tot += term[(size_t)i * n + j]; ++cnt;
+        }
+        if (cnt) { any = true; best = std::max(best, tot / cnt); }
+      }
+      return any ? best : NAN;
+    };
+    out.ptm = reduce(false); out.iptm = reduce(true);
+  }
   const int PB = 50;
   std::vector<float> pc(PB);
   for (int b = 0; b < PB; ++b) pc[b] = 0.5f / PB + (float)b / PB;

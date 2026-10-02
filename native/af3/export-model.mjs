@@ -23,7 +23,8 @@ const option = (name, fallback) =>
   args.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback;
 const bundle = option("bundle", "http://127.0.0.1:8791/model-af3-full-f32/manifest.json");
 const batchPath = option("batch", `${repo}/oracle-dumps/af3-batch-alphafold3-6mrr.json`);
-const oracles = (option("oracles", "trunk,denoise,confidence")).split(",").filter(Boolean);
+const oracles = (option("oracles", option("sequence", "") === "" ? "trunk,denoise,confidence" : ""))
+  .split(",").filter(Boolean);
 
 const { openAf3Store, trunkWeights, trunkDepths, confidenceWeights } =
   await import(`${repo}/src/af3/weights/weights.js`);
@@ -71,8 +72,23 @@ add("confidence", await confidenceWeights(store));
 add("targetFeat", await targetFeatureWeights(store));
 add("atomReference", await atomReference(store));
 
-const dump = JSON.parse(readFileSync(batchPath, "utf8"));
-const batch = batchFromDump(dump);
+// The batch: featurised here from --sequence (chains joined by ":") and an optional --a3m,
+// through the same function the page and fold.js use; otherwise read from an AF3 batch dump.
+const sequence = option("sequence", "");
+let batch;
+if (sequence !== "") {
+  const { af3BatchFromA3m } = await import(`${repo}/src/af3/featurise/batch.js`);
+  const { featuriserDialect } = await import(`${repo}/src/af3/dialect.js`);
+  const a3mPath = option("a3m", "");
+  const alignment = a3mPath === "" ? null : readFileSync(a3mPath, "utf8");
+  batch = af3BatchFromA3m(sequence, alignment, {
+    maxSequences: Number(option("max-msa", "512")),
+    seed: Number(option("seed", "20260831")),
+    ...featuriserDialect(trunk.dialect),
+  }).batch;
+} else {
+  batch = batchFromDump(JSON.parse(readFileSync(batchPath, "utf8")));
+}
 add("batch", batch);
 // The oracle's own z_init/target_feat etc., by stage.
 const flat = (record) => Float32Array.from(Array.isArray(record.data) ? record.data.flat(Infinity) : record.data);

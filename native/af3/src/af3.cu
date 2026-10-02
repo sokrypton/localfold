@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
       perToken[k] = (float)(s2 / std::max(c2, 1.0));
     }
     writePdb(out, x, perToken.data());
-    printf("confidence %.1f ms: mean pLDDT %.2f\n", ms(f2, f3), conf.meanPlddt);
+    printf("confidence %.1f ms: mean pLDDT %.2f  pTM %.4f  ipTM %.4f\n", ms(f2, f3), conf.meanPlddt, conf.ptm, conf.iptm);
     printf("fold: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps), wrote %s\n", ms(f0, f1), recycles + 1,
            ms(f1, f2), steps, out.c_str());
     return 0;
