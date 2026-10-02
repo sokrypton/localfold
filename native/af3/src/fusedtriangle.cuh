@@ -12,6 +12,42 @@
 #pragma once
 #include "flash.cuh"
 
+// LayerNorm of a block's R rows into shared memory as f16, a warp a row and FOUR rows' loads in
+// flight per warp (one at a time left the loads latency-bound). rowOf(r) is row r's index in x,
+// or SIZE_MAX for a row past the end (normalised zeros).
+template <int C, int R, int WARPS, class RowOf>
+__device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowOf rowOf, const float* __restrict__ scale,
+                                               const float* __restrict__ offset, half* Xs, int LDX, int warp, int lane) {
+  constexpr int RPW = R / WARPS, B = RPW % 4 == 0 ? 4 : (RPW % 2 == 0 ? 2 : 1), K = C / 32;
+  for (int base = 0; base < RPW; base += B) {
+    float v[B][K];
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+      size_t row = rowOf(warp + (base + b) * WARPS);
+#pragma unroll
+      for (int k = 0; k < K; ++k) v[b][k] = row != SIZE_MAX ? x[row * C + lane + 32 * k] : 0.f;
+    }
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+      float s = 0.f;
+#pragma unroll
+      for (int k = 0; k < K; ++k) s += v[b][k];
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+      float mean = s / C, q = 0.f;
+#pragma unroll
+      for (int k = 0; k < K; ++k) { float d = v[b][k] - mean; q += d * d; }
+      for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
+      float inv = rsqrtf(q / C + 1e-5f);
+      int r = warp + (base + b) * WARPS;
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        int c = lane + 32 * k;
+        Xs[r * LDX + c] = __float2half((v[b][k] - mean) * inv * scale[c] + offset[c]);
+      }
+    }
+  }
+}
+
 constexpr int TI_NC = 32;
 __host__ __device__ constexpr size_t tiStage(int C) { return (size_t)2 * C * (TI_NC + 8) * 2; }
 
@@ -48,20 +84,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
     asm volatile("cp.async.commit_group;");
   };
   issue(0, 0);
-  for (int r = warp; r < R; r += WARPS) {
-    size_t row = row0 + r;
-    float v[C / 32]; float s = 0.f;
-    for (int k = 0; k < C / 32; ++k) { v[k] = row < pairs ? pair[row * C + lane + 32 * k] : 0.f; s += v[k]; }
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, q = 0.f;
-    for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; q += d * d; }
-    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    float inv = rsqrtf(q / C + 1e-5f);
-    for (int k = 0; k < C / 32; ++k) {
-      int c = lane + 32 * k;
-      Xs[r * LDX + c] = __float2half((v[k] - mean) * inv * lnScale[c] + lnOffset[c]);
-    }
-  }
+  lnRowsToShared<C, R, WARPS>(pair, [&](int r) { size_t row = row0 + r; return row < pairs ? row : SIZE_MAX; },
+                              lnScale, lnOffset, Xs, LDX, warp, lane);
   __syncthreads();
   uint32_t xa[KS][4];
 #pragma unroll
@@ -235,20 +259,8 @@ __global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__
     cpAsync16(Ws + k * LDW + c, Wp + (size_t)k * N + c, true);
   }
   asm volatile("cp.async.commit_group;");
-  for (int r = warp; r < R; r += WARPS) {
-    size_t row = row0 + r;
-    float v[C / 32]; float s = 0.f;
-    for (int k = 0; k < C / 32; ++k) { v[k] = row < rows ? x[row * C + lane + 32 * k] : 0.f; s += v[k]; }
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, q = 0.f;
-    for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; q += d * d; }
-    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    float inv = rsqrtf(q / C + 1e-5f);
-    for (int k = 0; k < C / 32; ++k) {
-      int c = lane + 32 * k;
-      Xs[r * LDX + c] = __float2half((v[k] - mean) * inv * lnScale[c] + lnOffset[c]);
-    }
-  }
+  lnRowsToShared<C, R, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
+                              lnScale, lnOffset, Xs, LDX, warp, lane);
   asm volatile("cp.async.wait_group 0;");
   __syncthreads();
   float acc[N / 8][4] = {};
@@ -312,23 +324,12 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
     asm volatile("cp.async.commit_group;");
   };
   issue(0, 0);
-  for (int r = warp; r < R; r += WARPS) {
-    size_t q = row0 + r;
-    float v[C / 32]; float s = 0.f;
-    if (q < rows) {
-      size_t Q = q0 + q, p = tr ? (Q % n) * n + Q / n : Q;
-      for (int k = 0; k < C / 32; ++k) { v[k] = pair[p * C + lane + 32 * k]; s += v[k]; }
-    } else for (int k = 0; k < C / 32; ++k) v[k] = 0.f;
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, qq = 0.f;
-    for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; qq += d * d; }
-    for (int o = 16; o; o >>= 1) qq += __shfl_xor_sync(~0u, qq, o);
-    float inv = rsqrtf(qq / C + 1e-5f);
-    for (int k = 0; k < C / 32; ++k) {
-      int c = lane + 32 * k;
-      Xs[r * LDX + c] = __float2half((v[k] - mean) * inv * lnScale[c] + lnOffset[c]);
-    }
-  }
+  lnRowsToShared<C, R, WARPS>(pair, [&](int r) {
+      size_t q = row0 + r;
+      if (q >= rows) return (size_t)SIZE_MAX;
+      size_t Q = q0 + q;
+      return tr ? (Q % n) * n + Q / n : Q;
+    }, lnScale, lnOffset, Xs, LDX, warp, lane);
   __syncthreads();
   uint32_t xa[KS][4];
 #pragma unroll

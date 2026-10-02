@@ -190,4 +190,8 @@ RoseTTAFold3 - each raises a named "not ported" error).
   every row of the grid, and per row it is half of the kernel's L2 traffic): exact, and slower in
   every geometry - 10.7 / 14.8 / 12.3 / 16.8 ms against the plain kernel's 8.8 at 1044 tokens for
   1, 2, 4 rows of 4 warps and 4 rows of 2. Not L2 bandwidth, then.
+- **The grid attention's exponentials in f16x2** (two per special-function instruction, P being
+  f16 for the PV product anyway): 9.2 against 8.6 ms at 1044 tokens. Nor did 8-warp blocks at the
+  largest sizes (8.8 / 8.1 against 8.6 / 8.0 ms at 1044 / 2088). What did pay: no mask when every
+  token is real (3-7%).
 

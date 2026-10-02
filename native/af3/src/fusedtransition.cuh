@@ -9,7 +9,7 @@
 // straight into A fragments of the second GEMM (the flash kernel's P trick), and accumulated into
 // the 16 x C output. The weights stream through shared memory, double-buffered.
 #pragma once
-#include "flash.cuh"
+#include "fusedtriangle.cuh"
 
 constexpr int FT_NC = 32;
 
@@ -48,21 +48,8 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
   };
   issue(0, 0);
   // LayerNorm, a warp a row (C / 32 floats a lane), into shared memory as f16
-  for (int r = warp; r < FT_ROWS; r += WARPS) {
-    size_t row = row0 + r;
-    float v[C / 32];
-    float s = 0.f;
-    for (int k = 0; k < C / 32; ++k) { v[k] = row < rows ? x[row * C + lane + 32 * k] : 0.f; s += v[k]; }
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, q = 0.f;
-    for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; q += d * d; }
-    for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    float inv = rsqrtf(q / C + 1e-5f);
-    for (int k = 0; k < C / 32; ++k) {
-      int c = lane + 32 * k;
-      Xs[r * LDX + c] = __float2half((v[k] - mean) * inv * lnScale[c] + lnOffset[c]);
-    }
-  }
+  lnRowsToShared<C, FT_ROWS, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
+                                    lnScale, lnOffset, Xs, LDX, warp, lane);
   __syncthreads();
   uint32_t xa[KS][4];
 #pragma unroll
