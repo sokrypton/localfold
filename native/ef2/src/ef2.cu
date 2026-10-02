@@ -66,6 +66,13 @@ static int foldInput(const Opts& o, bool warm) {
   const std::string& oracle = o.oracle; const std::string& out = o.out; uint64_t seed = o.seed;
   const SamplerSettings& sampler = o.sampler; bool profile = o.profile && !warm;
   auto say = [&](const char* fmt, auto... v) { if (!warm) printf(fmt, v...); };
+  // EF2_MEM: device memory in use at each phase boundary
+  auto mem = [&](const char* at) {
+    if (warm || !getenv("EF2_MEM")) return;
+    CK(cudaDeviceSynchronize()); size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
+    size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
+    printf("  memory %-22s %6.2f GB in use (scratch %.2f)\n", at, (tot - fr) / 1e9, held / 1e9);
+  };
   CB(cublasSetMathMode(H, FAST ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
   int T = (int)M.meta("meta/tokens");
   Esmc e{(int)M.meta("meta/lm_rows"), (int)M.meta("meta/width"), (int)M.meta("meta/heads"),
@@ -104,8 +111,11 @@ static int foldInput(const Opts& o, bool warm) {
   say("inputs embedder %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   if (check) checkOracle("s_inputs", sInputs, (size_t)T * Si, "o/s_inputs");
   int C = e.pair;
+  mem("language model");
   float* zi = dalloc((size_t)T * T * C); float* z = dalloc((size_t)T * T * C);
   zInit(T, C, sInputs, Si, lmZ, zi, check);
+  CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr;
+  releaseScratch();
   t0 = std::chrono::steady_clock::now();
   bool profTrunk = profile && !getenv("EF2_PROFILE_SAMPLER");
   if (profTrunk) { prof::init(); prof::start(); }
@@ -113,11 +123,17 @@ static int foldInput(const Opts& o, bool warm) {
   if (profTrunk) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   CK(cudaStreamSynchronize(STREAM));
   say("trunk %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-  float* dg = dalloc((size_t)T * T * (int)M.meta("meta/distogramBins"));
-  distogram(z, T, C, dg);
-  if (check) checkOracle("distogram", dg, (size_t)T * T * (int)M.meta("meta/distogramBins"), "o/distogram");
-  float* relPos = scratch<float>("zi.rel", (size_t)T * T * C);     // zInit's relative position encoding, kept
-  Denoiser dn = makeDenoiser(T, A, z, relPos, sInputs, check);
+  mem("trunk");
+  CK(cudaFree(zi)); zi = nullptr;
+  releaseScratch();
+  if (check) {                                   // (nothing else reads the distogram)
+    float* dg = dalloc((size_t)T * T * (int)M.meta("meta/distogramBins"));
+    distogram(z, T, C, dg);
+    checkOracle("distogram", dg, (size_t)T * T * (int)M.meta("meta/distogramBins"), "o/distogram");
+    CK(cudaFree(dg)); releaseScratch();
+  }
+  Denoiser dn = makeDenoiser(T, A, z, sInputs, check);
+  mem("denoiser built");
   if (check && M.has("o/step0/x_noisy")) {
     float* xn0 = upload(M.f("o/step0/x_noisy"), (size_t)A * 3); float* xd0 = dalloc((size_t)A * 3);
     float t = (float)M.meta("o/step0/t_hat");
@@ -135,6 +151,8 @@ static int foldInput(const Opts& o, bool warm) {
   if (profSampler) { prof::init(); prof::start(); }
   std::vector<float> coords = sample(dn, sampler, seed, &stepsRun);
   if (profSampler) { CK(cudaStreamSynchronize(STREAM)); prof::stop(30); }
+  mem("sampler");
+  freeDenoiser(dn); releaseScratch();
   say("sampler %.1f ms (%d steps)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stepsRun);
   if (!M.has("f/confidence/pae")) {
     fprintf(stderr, "the weights carry no confidence head: export them from model-esmfold2-conf-f32 (see native/ef2/README.md)\n");
@@ -142,11 +160,12 @@ static int foldInput(const Opts& o, bool warm) {
   }
   if (check && M.has("o/conf/plddt_per_atom")) {        // the head on the reference's own coordinates
     float* xo = upload(M.f("o/coords"), (size_t)A * 3);
-    confidenceHead(T, A, z, sInputs, Si, relPos, xo, true);
+    confidenceHead(T, A, z, sInputs, Si, xo, true);
   }
   t0 = std::chrono::steady_clock::now();
   float* xd = upload(coords.data(), (size_t)A * 3);
-  Confidence conf = confidenceHead(T, A, z, sInputs, Si, relPos, xd, false);
+  Confidence conf = confidenceHead(T, A, z, sInputs, Si, xd, false);
+  mem("confidence");
   say("confidence %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   std::vector<float> bf(A);
   for (int a = 0; a < A; ++a) bf[a] = 100.f * conf.plddtAtom[a];
@@ -158,6 +177,10 @@ static int foldInput(const Opts& o, bool warm) {
   if (!warm) writePdb(o.dir + "/pdb.template", out, coords, &bf);
   say("-> %s\n", out.c_str());
   if (getenv("EF2_DUMP")) { auto h = download(sInputs, (size_t)T * Si); FILE* f = fopen(getenv("EF2_DUMP"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f); }
+  // everything given back, so a warm-up leaves the real fold the card it had
+  CK(cudaStreamSynchronize(STREAM));
+  for (float* p : {z, sInputs, xd, hidden}) if (p) CK(cudaFree(p));
+  releaseScratch();
   return 0;
 }
 

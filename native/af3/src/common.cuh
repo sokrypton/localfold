@@ -41,7 +41,7 @@ struct Entry { char kind; size_t offset, length; double value; int seg; size_t d
 // vector-load kernels need it (align1 kernels otherwise, and a batched GEMM, which cannot see its
 // pointers, faults). runs: the file's byte ranges and where each lands, in file order.
 struct Run { size_t src, dst, bytes; };
-struct Segment { const float* data; size_t bytes; float* device; void* halfMirror = nullptr;
+struct Segment { const float* data; size_t bytes; float* device; std::map<std::string, void*> halfMirrors;
                  size_t deviceBytes = 0; std::vector<Run> runs; };
 struct Model {
   std::map<std::string, Entry> index;
@@ -98,7 +98,8 @@ struct Model {
     }
     Segment& s = segs[seg];
     if (s.device) { cudaDeviceSynchronize(); cudaFree(s.device); s.device = nullptr; }
-    if (s.halfMirror) { cudaFree(s.halfMirror); s.halfMirror = nullptr; }
+    for (auto& [g, h] : s.halfMirrors) cudaFree(h);
+    s.halfMirrors.clear();
     if (s.data) { munmap((void*)s.data, std::max<size_t>(s.bytes, 1)); s.data = nullptr; }
     return names;
   }
@@ -282,9 +283,12 @@ inline std::string concatColumns(const std::string& key, int C, const std::vecto
   return key;
 }
 inline std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirror (freed with it)
-// a whole file's f16 copy, made once - the first f16 read of any of its weights converts every
-// float tensor in it in ONE launch (it was ~800 allocations and conversions, one a weight, in the
-// first fold); each tensor starts on 16 bytes, as its own allocation did, for the vector loads
+// a file's f16 copy, made once per GROUP - the first f16 read of any of its weights converts every
+// float tensor of that group in ONE launch (it was ~800 allocations and conversions, one a weight, in
+// the first fold); each tensor starts on 16 bytes, as its own allocation did, for the vector loads.
+// A group is a name's first '/'-separated part ("" without one): native/ef2's file holds the folding
+// bundle (f/) and ESM-C (c/), which reads only its f32 copy - mirroring it too was 1.2 GB never read
+inline std::string halfGroup(const std::string& k) { size_t at = k.find('/'); return at == std::string::npos ? "" : k.substr(0, at); }
 inline std::map<std::string, half*> WH_AT;
 __global__ void convertTableK(const float* src, half* dst, const size_t* from, const size_t* to, const size_t* len) {
   size_t e = blockIdx.y, n = len[e];
@@ -295,25 +299,27 @@ inline const half* segmentHalf(const std::string& k) {
   const Entry& e0 = M.at(k);
   Segment& s = M.segs[e0.seg];
   M.dev(k);
-  if (!s.halfMirror) {
+  std::string group = halfGroup(k);
+  void*& mirror = s.halfMirrors[group];
+  if (!mirror) {
     std::vector<size_t> from, to, len; std::vector<std::string> names; size_t total = 0;
     for (auto& [name, e] : M.index) {
-      if (e.seg != e0.seg || e.kind != 't') continue;
+      if (e.seg != e0.seg || e.kind != 't' || halfGroup(name) != group) continue;
       from.push_back(e.devOffset); to.push_back(total); len.push_back(e.length); names.push_back(name);
       total += (e.length + 7) / 8 * 8;
     }
-    CK(cudaMalloc(&s.halfMirror, std::max<size_t>(total, 1) * 2));
+    CK(cudaMalloc(&mirror, std::max<size_t>(total, 1) * 2));
     size_t* table; CK(cudaMalloc(&table, from.size() * 3 * sizeof(size_t)));
     CK(cudaMemcpy(table, from.data(), from.size() * sizeof(size_t), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(table + from.size(), to.data(), to.size() * sizeof(size_t), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(table + 2 * from.size(), len.data(), len.size() * sizeof(size_t), cudaMemcpyHostToDevice));
     for (size_t first = 0; first < from.size(); first += 65535) {
       unsigned count = (unsigned)std::min<size_t>(65535, from.size() - first);
-      convertTableK<<<dim3(8, count), 256, 0, STREAM>>>(s.device, (half*)s.halfMirror, table + first,
+      convertTableK<<<dim3(8, count), 256, 0, STREAM>>>(s.device, (half*)mirror, table + first,
                                                        table + from.size() + first, table + 2 * from.size() + first);
     }
     CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(table));
-    for (size_t i = 0; i < names.size(); ++i) WH_AT[names[i]] = (half*)s.halfMirror + to[i];
+    for (size_t i = 0; i < names.size(); ++i) WH_AT[names[i]] = (half*)mirror + to[i];
   }
   auto it = WH_AT.find(k);
   if (it == WH_AT.end()) { fprintf(stderr, "%s is not a float tensor of its file\n", k.c_str()); exit(1); }

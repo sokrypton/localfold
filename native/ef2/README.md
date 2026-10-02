@@ -166,6 +166,24 @@ Elsewhere:
 | confidence | 5 ms | 68 ms |
 | sequence to PDB (`fold`, cold process) | 1.15 s | 1.97 s |
 
+## Memory
+
+Peak device memory at 783 tokens (5CAJ's chain three times), `--fast`: **15.9 → 8.0 GB**.
+- Each phase gives its buffers back when it is done: the language model's pair after z_init, z_init and
+  the trunk's scratch after the trunk, the denoiser's after the sampler. The warm-up fold used to keep
+  everything it allocated under the real fold.
+- The relative position encoding is computed where it is read (z_init, the diffusion's conditioning,
+  the confidence head), not kept as a pair tensor.
+- The pair-sized intermediates that only feed a projection are made 64 MB of rows at a time: the
+  recycle's LN, the diffusion's `[z | rel_pos]` and its per-block normalised pair, the confidence head's
+  outer product.
+- The distogram is computed only under `--oracle`; nothing else reads it.
+- The diffusion's 12 pair biases are kept, in f16 under `--fast`, and the conditioning pair is not.
+- The weights' f16 mirror covers the folding bundle only. It used to convert ESM-C as well (1.2 GB),
+  which reads only its f32 copy.
+
+`EF2_MEM=1` prints what is in use at each phase.
+
 ## Gate
 
 ```

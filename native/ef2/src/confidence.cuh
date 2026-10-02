@@ -10,17 +10,17 @@
 #pragma once
 #include "trunk.cuh"
 
-__global__ void confZK(float* z, const float* rel, const float* bonds, const float* wBond, const float* rows,
+__global__ void confZK(float* z, RelIdx rel, const float* bonds, const float* wBond, const float* rows,
                        const float* cols, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * T * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[t] += rel[t] + bonds[ij] * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
+  z[t] += relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + rows[(size_t)i * C + c] + cols[(size_t)j * C + c];
 }
-__global__ void outerProductK(const float* a, const float* b, float* out, int T, int C) {   // a_i * b_j
+__global__ void outerProductK(const float* a, const float* b, float* out, size_t p0, size_t n, int T, int C) {   // a_i * b_j, rows p0..
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)T * T * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
+  if (t >= n * C) return;
+  int c = (int)(t % C); size_t ij = p0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
   out[t] = a[(size_t)i * C + c] * b[(size_t)j * C + c];
 }
 __global__ void distanceEmbedK(float* z, const float* x, const int* rep, const float* edges, int nEdges,
@@ -78,8 +78,8 @@ __global__ void plddtAtomK(const float* s, const int* slot, const float* table, 
 
 struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; double ptm, iptm, meanPlddt; };
 
-inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* relPos,
-                                 const float* xDevice, bool check) {
+inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice,
+                                 bool check) {
   int C = (int)dimOf("f/confidence/sToZ", 1), Cs = (int)dimOf("f/confidence/poolingOutput", 1);
   size_t P = (size_t)T * T;
   float* s = scratch<float>("cf.s", (size_t)T * Si);
@@ -92,10 +92,14 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   gemm(s, F("confidence/sToZTranspose"), c, T, Si, C);
   gemm(s, F("confidence/sToZProdIn1"), l, T, Si, C);
   gemm(s, F("confidence/sToZProdIn2"), rr, T, Si, C);
-  confZK<<<blocks(P * C), 256, 0, STREAM>>>(z, relPos, W("token_bonds"), F("featuriser/tokenBonds"), r, c, T, C);
-  float* prod = scratch<float>("cf.prod", P * C);
-  outerProductK<<<blocks(P * C), 256, 0, STREAM>>>(l, rr, prod, T, C);
-  gemm(prod, F("confidence/sToZProdOut"), z, P, C, C, 1.f);
+  confZK<<<blocks(P * C), 256, 0, STREAM>>>(z, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), r, c, T, C);
+  size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
+  float* prod = scratch<float>("cf.prod", chunk * C);
+  for (size_t p0 = 0; p0 < P; p0 += chunk) {
+    size_t n = std::min(chunk, P - p0);
+    outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prod, p0, n, T, C);
+    gemm(prod, F("confidence/sToZProdOut"), z + p0 * C, n, C, C, 1.f);
+  }
   distanceEmbedK<<<blocks(P * C), 256, 0, STREAM>>>(z, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
     (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), T, C);
   // z + trunk(z)

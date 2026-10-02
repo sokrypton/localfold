@@ -15,11 +15,12 @@
 
 constexpr int DIFFUSION_HALF_WINDOW = 64;     // the diffusion's atom stacks are windowed (128) in both references
 
-__global__ void joinPairRelK(const float* z, const float* rel, float* out, size_t P, int C) {
+// rows [p0, p0 + n) of [z | rel_pos]
+__global__ void joinPairRelK(const float* z, RelIdx rel, float* out, size_t p0, size_t n, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= P * 2 * C) return;
-  size_t p = t / (2 * C); int c = (int)(t % (2 * C));
-  out[t] = c < C ? z[p * C + c] : rel[p * C + c - C];
+  if (t >= n * 2 * C) return;
+  size_t p = p0 + t / (2 * C); int c = (int)(t % (2 * C));
+  out[t] = c < C ? z[p * C + c] : relPosAt(rel, (int)(p / T), (int)(p % T), c - C, C);
 }
 __global__ void siluMulK(const float* a, const float* b, float* out, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -84,12 +85,13 @@ __global__ void scaleCopiesK(const float* x, const float* scales, float* out, si
   out[t] = x[r] * scales[(size_t)j * C + r % C];
 }
 // scores [H, T, T] + bias [H, T, T], softmax per row
-__global__ void biasSoftmaxK(float* S, const float* bias, int T, float scale) {
+template <class B>
+__global__ void biasSoftmaxK(float* S, const B* bias, int T, float scale) {
   size_t row = blockIdx.x;
-  float* s = S + row * T; const float* b = bias + row * T;
+  float* s = S + row * T; const B* b = bias + row * T;
   __shared__ float red[32];
   float m = -INFINITY;
-  for (int j = threadIdx.x; j < T; j += blockDim.x) { float v = s[j] * scale + b[j]; s[j] = v; m = fmaxf(m, v); }
+  for (int j = threadIdx.x; j < T; j += blockDim.x) { float v = s[j] * scale + (float)b[j]; s[j] = v; m = fmaxf(m, v); }
   for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
   if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = m;
   __syncthreads();
@@ -115,9 +117,10 @@ __global__ void biasSoftmaxK(float* S, const float* bias, int T, float scale) {
   float inv = 1.f / red[0];
   for (int j = threadIdx.x; j < T; j += blockDim.x) s[j] *= inv;
 }
-__global__ void pairToHeadsK(const float* pb, float* out, size_t P, int Hh) {   // [P, H] -> [H, P]
+template <class B>
+__global__ void pairToHeadsK(const float* pb, B* out, size_t P, int Hh) {   // [P, H] -> [H, P]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < P * Hh) out[(t % Hh) * P + t / Hh] = pb[t];
+  if (t < P * Hh) out[(t % Hh) * P + t / Hh] = (B)pb[t];
 }
 __global__ void gatherTokensK(const float* perToken, const int* atomToToken, const float* mask, float* q, int A, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -135,8 +138,9 @@ struct Denoiser {
   int T, A, Cz, Ct, heads, tokenBlocks, Si, atomBlocks;
   float sigma;
   Atoms atoms;                    // the diffusion encoder's c0, rope table, ranks
-  float* pair;                    // the conditioning's pair, [P, Cz]
-  std::vector<float*> biases;     // per token block, [H, T, T]
+  // per token block, [H, T, T] (the pair itself is not kept): f16 under --fast, f32 otherwise
+  // (f16 costs the float32 path 5e-5 on the denoiser)
+  std::vector<void*> biases; bool biasHalf;
   const float* sInputs;
   // every token block's projections of the single alone, one batched GEMM a step: entry e of G [T, 72 Ct]
   // (columns e Ct..): 4b+0..3 block b's attention gate, shift, transition gate, shift (from LN(single)
@@ -145,29 +149,40 @@ struct Denoiser {
   float* level;                   // NoiseLevel on the device
 };
 
-inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* relPos, const float* sInputs, bool check) {
+inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs, bool check) {
   Denoiser d{};
   d.T = T; d.A = A; d.Cz = (int)M.meta("meta/pairChannels"); d.Ct = (int)M.meta("meta/tokenChannels2");
   d.heads = (int)M.meta("meta/tokenHeads"); d.tokenBlocks = (int)M.meta("meta/tokenBlocks");
   d.Si = (int)M.meta("meta/singleInputs"); d.atomBlocks = (int)M.meta("meta/atomBlocks"); d.sigma = (float)M.meta("meta/sigmaData");
   d.sInputs = sInputs;
   size_t P = (size_t)T * T; int Cz = d.Cz;
-  float* joined = scratch<float>("dc.joined", P * 2 * Cz);
-  joinPairRelK<<<blocks(P * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relPos, joined, P, Cz);
-  layerNorm(joined, joined, P, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
-  d.pair = dalloc(P * Cz);
-  gemm(joined, F("diffusion/zProjection"), d.pair, P, 2 * Cz, Cz);
-  for (int l = 0; l < 2; ++l) transitionLayer(d.pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
-  if (check) checkOracle("diffusion conditioning pair", d.pair, P * Cz, "o/cond/pair");
-  float* pn = scratch<float>("dc.pn", P * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
+  // row chunks of 64 MB: neither [z | rel_pos] nor a normalised copy of the pair is ever whole
+  size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (8 * (size_t)Cz));
+  float* joined = scratch<float>("dc.joined", chunk * 2 * Cz);
+  float* pair = scratch<float>("dc.pair", P * Cz);
+  for (size_t p0 = 0; p0 < P; p0 += chunk) {
+    size_t n = std::min(chunk, P - p0);
+    joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz);
+    layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
+    gemm(joined, F("diffusion/zProjection"), pair + p0 * Cz, n, 2 * Cz, Cz);
+  }
+  for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
+  if (check) checkOracle("diffusion conditioning pair", pair, P * Cz, "o/cond/pair");
+  d.biasHalf = FAST;
+  float* pn = scratch<float>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
   for (int b = 0; b < d.tokenBlocks; ++b) {
     std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
-    layerNorm(d.pair, pn, P, Cz, F(B + "pairNormScale"), F(B + "pairNormOffset"));
-    gemm(pn, F(B + "pairBiasWeights"), pb, P, Cz, d.heads);
-    float* bias = dalloc(P * d.heads);
-    pairToHeadsK<<<blocks(P * d.heads), 256, 0, STREAM>>>(pb, bias, P, d.heads);
+    for (size_t p0 = 0; p0 < P; p0 += chunk) {
+      size_t n = std::min(chunk, P - p0);
+      layerNorm(pair + p0 * Cz, pn, n, Cz, F(B + "pairNormScale"), F(B + "pairNormOffset"));
+      gemm(pn, F(B + "pairBiasWeights"), pb + p0 * d.heads, n, Cz, d.heads);
+    }
+    void* bias;
+    if (d.biasHalf) { half* h = dallocT<half>(P * d.heads); pairToHeadsK<<<blocks(P * d.heads), 256, 0, STREAM>>>(pb, h, P, d.heads); bias = h; }
+    else { float* f = dalloc(P * d.heads); pairToHeadsK<<<blocks(P * d.heads), 256, 0, STREAM>>>(pb, f, P, d.heads); bias = f; }
     d.biases.push_back(bias);
   }
+  releaseScratch();               // the joined and projected pairs: only the biases are kept
   d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
   int Ct = d.Ct, nb = d.tokenBlocks;
   d.entries = 6 * nb;
@@ -244,7 +259,8 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   const float one = 1.f, zero = 0.f;
   CB(cublasSgemmStridedBatched(H, CUBLAS_OP_T, CUBLAS_OP_N, T, T, D, &one, kv, 2 * C, D, q, C, D, &zero, S, T,
                                (long long)T * T, Hh));
-  biasSoftmaxK<<<(unsigned)(Hh * T), 256, 0, STREAM>>>(S, d.biases[b], T, 1.f / sqrtf((float)D));
+  if (d.biasHalf) biasSoftmaxK<<<(unsigned)(Hh * T), 256, 0, STREAM>>>(S, (const half*)d.biases[b], T, 1.f / sqrtf((float)D));
+  else biasSoftmaxK<<<(unsigned)(Hh * T), 256, 0, STREAM>>>(S, (const float*)d.biases[b], T, 1.f / sqrtf((float)D));
   CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, D, T, T, &one, kv + C, 2 * C, D, S, T, (long long)T * T,
                                &zero, ctx, C, D, Hh));
   sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C, C);
@@ -300,6 +316,14 @@ inline void denoiseAtLevel(const Denoiser& d, const float* xNoisy, float* xDenoi
   float* r = scratch<float>("dn.r", (size_t)A * 3);
   gemm(q, F("diffusionAtomDecoder/outputLinear"), r, A, Ca, 3);
   edmCombineK<<<blocks((size_t)A * 3), 256, 0, STREAM>>>(xNoisy, r, xDenoised, d.level, A * 3);
+}
+inline void freeDenoiser(Denoiser& d) {
+  CK(cudaStreamSynchronize(STREAM));
+  for (void* b : d.biases) CK(cudaFree(b));
+  for (void* p : {(void*)d.single, (void*)d.snScaled, (void*)d.G, (void*)d.scales, (void*)d.ptrs, (void*)d.level})
+    CK(cudaFree(p));
+  freeAtoms(d.atoms);
+  d.biases.clear();
 }
 inline void setLevel(const Denoiser& d, float t) {
   NoiseLevel lv = noiseLevel(t, d.sigma);

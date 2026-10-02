@@ -11,30 +11,37 @@
 #pragma once
 #include "fused256.cuh"
 
-// relative position bins (residue 66, token 66, same entity 1, chain 6 = 139), one-hot rows summed
-__global__ void relPosK(const int* ri, const int* asym, const int* sym, const int* ent, const int* ti,
-                        const float* Wt, float* out, int T, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // one thread per (pair, channel)
-  if (t >= (size_t)T * T * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
+// relative position bins (residue 66, token 66, same entity 1, chain 6 = 139), one-hot rows summed;
+// computed where it is read (z_init, the diffusion's conditioning, the confidence head), never stored
+struct RelIdx { const int *ri, *asym, *sym, *ent, *ti; const float* Wt; };
+inline RelIdx relIdx() {
+  return {Idev("residue_index"), Idev("asym_id"), Idev("sym_id"), Idev("entity_id"), Idev("token_index"), F("featuriser/relPos")};
+}
+__device__ __forceinline__ float relPosAt(const RelIdx& r, int i, int j, int c, int C) {
   const int rb = 32, cb = 2;
   auto clip = [](int v, int hi) { return v < 0 ? 0 : v > hi ? hi : v; };
-  bool sameChain = asym[i] == asym[j], sameRes = ri[i] == ri[j];
-  int b0 = sameChain ? clip(ri[i] - ri[j] + rb, 2 * rb) : 2 * rb + 1;
-  int b1 = sameChain && sameRes ? clip(ti[i] - ti[j] + rb, 2 * rb) : 2 * rb + 1;
-  int b3 = sameChain ? 2 * cb + 1 : clip(sym[i] - sym[j] + cb, 2 * cb);
+  bool sameChain = r.asym[i] == r.asym[j], sameRes = r.ri[i] == r.ri[j];
+  int b0 = sameChain ? clip(r.ri[i] - r.ri[j] + rb, 2 * rb) : 2 * rb + 1;
+  int b1 = sameChain && sameRes ? clip(r.ti[i] - r.ti[j] + rb, 2 * rb) : 2 * rb + 1;
+  int b3 = sameChain ? 2 * cb + 1 : clip(r.sym[i] - r.sym[j] + cb, 2 * cb);
   const int w = 2 * rb + 2;
-  float v = Wt[(size_t)b0 * C + c] + Wt[(size_t)(w + b1) * C + c] + Wt[(size_t)(2 * w + 1 + b3) * C + c];
-  if (ent[i] == ent[j]) v += Wt[(size_t)(2 * w) * C + c];
-  out[t] = v;
+  float v = r.Wt[(size_t)b0 * C + c] + r.Wt[(size_t)(w + b1) * C + c] + r.Wt[(size_t)(2 * w + 1 + b3) * C + c];
+  if (r.ent[i] == r.ent[j]) v += r.Wt[(size_t)(2 * w) * C + c];
+  return v;
+}
+__global__ void relPosK(RelIdx r, float* out, int T, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // one thread per (pair, channel)
+  if (t >= (size_t)T * T * C) return;
+  int c = (int)(t % C); size_t ij = t / C;
+  out[t] = relPosAt(r, (int)(ij / T), (int)(ij % T), c, C);
 }
 // z_init = rows[i] + cols[j] + relpos + bonds * w_bond + lm_z
-__global__ void zInitK(const float* rows, const float* cols, const float* rel, const float* bonds, const float* wBond,
+__global__ void zInitK(const float* rows, const float* cols, RelIdx rel, const float* bonds, const float* wBond,
                        const float* lmZ, float* z, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * T * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + rel[t] + bonds[ij] * wBond[c] + lmZ[t];
+  z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lmZ[t];
 }
 __global__ void addK(float* y, const float* x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -46,15 +53,14 @@ inline void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, 
   float* rows = scratch<float>("zi.rows", (size_t)T * C); float* cols = scratch<float>("zi.cols", (size_t)T * C);
   gemm(sInputs, F("featuriser/zInit1"), rows, T, Si, C);
   gemm(sInputs, F("featuriser/zInit2"), cols, T, Si, C);
-  float* rel = scratch<float>("zi.rel", P * C);
-  relPosK<<<blocks(P * C), 256, 0, STREAM>>>(Idev("residue_index"), Idev("asym_id"), Idev("sym_id"), Idev("entity_id"),
-                                             Idev("token_index"), F("featuriser/relPos"), rel, T, C);
   if (check) {
     checkOracle("z_init_1", rows, (size_t)T * C, "o/z_init_1");
     checkOracle("z_init_2", cols, (size_t)T * C, "o/z_init_2");
+    float* rel = scratch<float>("zi.rel", P * C);
+    relPosK<<<blocks(P * C), 256, 0, STREAM>>>(relIdx(), rel, T, C);
     checkOracle("rel_pos", rel, P * C, "o/rel_pos");
   }
-  zInitK<<<blocks(P * C), 256, 0, STREAM>>>(rows, cols, rel, W("token_bonds"), F("featuriser/tokenBonds"), lmZ, z, T, C);
+  zInitK<<<blocks(P * C), 256, 0, STREAM>>>(rows, cols, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), lmZ, z, T, C);
 }
 
 // ---------------------------------------------------------------- the trunk, float32
@@ -173,11 +179,15 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
   float* mask = scratch<float>("trunk.mask", P);
   fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);      // every token is real (the token mask is all ones)
   CK(cudaMemsetAsync(z, 0, P * C * 4, STREAM));
-  float* xn = scratch<float>("trunk.xn", P * C);
+  size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));   // the recycle row by row, 64 MB at a time
+  float* xn = scratch<float>("trunk.xn", chunk * C);
   int blocksN = (int)M.meta("meta/blocks");
   for (int loop = 0; loop < loops; ++loop) {
-    layerNorm(z, xn, P, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
-    gemm(xn, F("recycle/projection"), z, P, C, C);
+    for (size_t r0 = 0; r0 < P; r0 += chunk) {
+      size_t r = std::min(chunk, P - r0);
+      layerNorm(z + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+      gemm(xn, F("recycle/projection"), z + r0 * C, r, C, C);
+    }
     addK<<<blocks(P * C), 256, 0, STREAM>>>(z, zInitP, P * C);
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " in").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/in");
     // (a CUDA graph of the 24 blocks, replayed for passes after the first, measured no faster: 453

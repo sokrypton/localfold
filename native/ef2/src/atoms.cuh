@@ -287,6 +287,13 @@ inline Atoms prepareAtoms(int A, const std::string& prefix) {
   return at;
 }
 
+inline void freeAtoms(Atoms& at) {
+  CK(cudaStreamSynchronize(STREAM));
+  for (const void* p : {(const void*)at.c0, (const void*)at.ctx.rank, (const void*)at.ctx.cosT, (const void*)at.ctx.sinT,
+                        (const void*)at.ctx.valid, (const void*)at.ctx.tokenStart, (const void*)at.ctx.tokenAtoms})
+    CK(cudaFree((void*)p));
+  at = Atoms{};
+}
 // the inputs embedder: s_inputs [T, 451] = [pool(relu(stack(c0) @ toToken)) | aatype | profile | deletion mean]
 // halfWindow 64 is biohub's esm package - the vendor's code, which windows every atom stack (flash-attn
 // window_size=(64, 64) on CUDA, the rank mask on the CPU). Dense is the page's reading, from Synthyra's
@@ -310,4 +317,5 @@ inline void inputsEmbedder(int T, int A, float* sInputs, int sWidth, bool check 
   scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, at.ctx.tokenStart, at.ctx.tokenAtoms, at.ctx.mask, sInputs, T, Ct, sWidth);
   tailInputsK<<<blocks((size_t)T * (2 * K + 1)), 256, 0, STREAM>>>(W("aatype"), W("profile"), W("deletion_mean"), sInputs,
                                                                  T, Ct, K, sWidth);
+  freeAtoms(at);
 }
