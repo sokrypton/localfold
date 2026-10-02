@@ -63,8 +63,31 @@ int main(int argc, char** argv) {
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
   { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
+  // cuBLAS's first GEMM costs ~70 ms (its library loads lazily) and each new kernel family a few
+  // more: a thread pays that with a few small GEMMs of the kinds a fold runs, while this one puts
+  // the weights on the device
+  std::thread cublasWarm([] {
+    cublasHandle_t h; cudaStream_t s;
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS || cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) return;
+    cublasSetStream(h, s);
+    void* buf; if (cudaMalloc(&buf, (size_t)3 << 20) != cudaSuccess) return;
+    char* b = (char*)buf; const float one = 1.f, zero = 0.f;
+    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 512, 512, 128, &one, b, CUDA_R_16F, 512, b + (1 << 20), CUDA_R_16F, 128, &zero,
+                 b + (2 << 20), CUDA_R_16F, 512, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 256, 576, 128, &one, b, CUDA_R_16F, 256, b + (1 << 20), CUDA_R_16F, 128, &zero,
+                 b + (2 << 20), CUDA_R_32F, 256, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 512, 256, 128, &one, b, CUDA_R_32F, 512, b + (1 << 20), CUDA_R_32F, 128, &zero,
+                 b + (2 << 20), CUDA_R_32F, 512, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cublasGemmStridedBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N, 96, 96, 96, &one, b, CUDA_R_16BF, 96, 9216, b + (1 << 20),
+                               CUDA_R_16BF, 96, 9216, &zero, b + (2 << 20), CUDA_R_16BF, 96, 9216, 8, CUBLAS_COMPUTE_32F,
+                               CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cudaStreamSynchronize(s);
+    cudaFree(buf); cublasDestroy(h); cudaStreamDestroy(s);
+  });
+  struct JoinAtExit { std::thread& t; ~JoinAtExit() { if (t.joinable()) t.join(); } } joinWarm{cublasWarm};
   Trunk t{};
-  if (waitInput && !weightsDir.empty()) M.upload(0);
+  if (!weightsDir.empty()) M.upload(0);      // now, beside the cuBLAS warm-up (both are needed before any fold)
+  if (cublasWarm.joinable()) cublasWarm.join();
   auto runInput = [&](size_t which) -> int {
   if (waitInput) {          // the exporter writes model.idx last, by a rename
     std::string idx = inputs[which] + "/model.idx";

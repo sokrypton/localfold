@@ -174,7 +174,8 @@ Each input's outputs are byte-identical to folding it alone. A single `fold` com
 before the export too (`--wait-input`), so the CUDA context and the weight upload overlap it, and
 returns once the outputs are written rather than after the driver has released the process's
 device memory (`--detach-output`: a quarter second), and the weights go up through pinned buffers
-filled by three threads (77 against 170 ms), and every weight's f16 copy is made in one launch: 6MRR is 1.06 s
+filled by three threads (77 against 170 ms), and every weight's f16 copy is made in one launch, and a thread pays cuBLAS's first-GEMM cost (~70 ms) meanwhile:
+6MRR is 1.00 s
 a command, of which the fold is
 0.64.
 
