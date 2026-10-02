@@ -56,16 +56,19 @@ Folds: 6MRR from its sequence **0.683 A** CA RMSD, pLDDT 85.1, pTM 0.720 (WebGPU
 5CAJ (255 residues of chain A) with its MSA **2.04 A**, pLDDT 94.6, pTM 0.940 - the WebGPU
 port gives pLDDT 94.5, pTM 0.938 on the same inputs.
 
-## Speed: A100-SXM4-40GB, 200 diffusion steps, `--recycles=0`
+## Speed: A100-SXM4-40GB, 200 diffusion steps, `--fast`
 
-| target | WebGPU first / warm | native first / warm |
-|---|---|---|
-| 6MRR, 68 tokens | 5.1 s / 2.4 s | 1.17 s / **0.44 s** |
-| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 1.67 s / **0.88 s** |
+| target | WebGPU first / warm (0 recycles) | native first / warm, 0 recycles | native warm, 3 recycles |
+|---|---|---|---|
+| 6MRR, 68 tokens | 5.1 s / 2.4 s | 1.13 s / **0.41 s** | 0.48 s |
+| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 1.49 s / **0.73 s** | 1.15 s |
+| 5CAJ x 2, 522 tokens, 512 rows | | 2.15 s / 1.40 s | 2.95 s |
+| 5CAJ x 4, 1044 tokens, no MSA | | 4.83 s / 4.11 s | 11.4 s |
 
 WebGPU with the developer flags (`fold.js --folds=2`); a stock-Chrome NVIDIA visitor gets
-about half its speed. No 2 GiB binding ceiling. With the default three recycles the warm folds are
-0.50 s and 1.42 s; a 1044-token complex (four 5CAJ chains, no MSA) folds warm in about 5.3 s.
+about half its speed. No 2 GiB binding ceiling. At 1044 tokens a trunk pass is 2.4 s - grid
+attention's flash kernel 40% of it - so recycles dominate there; up to ~300 tokens the 200
+denoiser steps do.
 
 The pairformer alone (48 blocks, FP16): 64 tokens 15 ms, 256 142 ms, 1024 2.95 s - 1.9-3.3x
 the WebGPU trunk's pairformer.
