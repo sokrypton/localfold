@@ -138,6 +138,23 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
   return out;
 }
 
+// A float32 array as a NumPy .npy file (format 1.0: magic, header dict padded to 64 bytes, data)
+inline void writeNpy(const std::string& path, const std::vector<float>& data, const std::vector<size_t>& shape) {
+  std::string dims;
+  for (size_t k = 0; k < shape.size(); ++k) dims += std::to_string(shape[k]) + (shape.size() == 1 || k + 1 < shape.size() ? "," : "");
+  std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + dims + "), }";
+  size_t total = 10 + header.size() + 1;
+  header += std::string((64 - total % 64) % 64, ' ') + "\n";
+  FILE* f = fopen(path.c_str(), "wb");
+  if (!f) { fprintf(stderr, "cannot write %s\n", path.c_str()); exit(1); }
+  const char magic[] = "\x93NUMPY\x01\x00";
+  fwrite(magic, 1, 8, f);
+  uint16_t len = (uint16_t)header.size(); fwrite(&len, 2, 1, f);
+  fwrite(header.data(), 1, header.size(), f);
+  fwrite(data.data(), 4, data.size(), f);
+  fclose(f);
+}
+
 // The PDB: through the exporter's template.pdb when there is one (the page's own records, the
 // slot in the x column), else one residue per token named here. `bfactors` per atom slot.
 inline std::string DATA_DIR;

@@ -42,6 +42,10 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + ev
 
 `--out=x.pdb`, or `--out=x.cif` for mmCIF as AlphaFold 3 writes it (entities, polymer sequences
 and chains declared, so AF3's own reader and gemmi both load it; the pLDDT in B_iso_or_equiv).
+`--save-embeddings` and `--save-distogram` write what AF3's `--save_embeddings` / `--save_distogram`
+do, as NumPy files beside the structure: `<stem>_single_embeddings.npy` (tokens x 384) and
+`<stem>_pair_embeddings.npy` (tokens x tokens x 128) from the trunk's last pass, and
+`<stem>_distogram.npy` (tokens x tokens x bins, the head's probabilities).
 `--af3-defaults` runs AlphaFold 3's own settings - 10 recycles (11 trunk passes) and 5 samples, as
 `run_alphafold.py` does - where the command sets neither; the plain defaults are the page's (3
 recycles, 1 sample). Warm, with them: 6MRR 0.73 s (trunk 197 ms, five samples' diffusion 489),
