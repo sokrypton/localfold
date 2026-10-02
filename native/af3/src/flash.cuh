@@ -466,7 +466,14 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // the denoiser's 48-wide heads in 48-key tiles: with 64 a 4-warp block takes 47.6 KB of shared
   // memory and three fit an SM where the registers allow four - 23.1 against 32.8 us at 261 tokens
   // and five samples, 44.0 against 45.9 at 400, level at 150 and one sample
+  // ...up to ~1700 tokens, where the longer key loop's per-tile cost overtakes the occupancy (1536: 106.7
+  // against 120.7 us; 1800: 162.3 against 154.0; 2088: 194 against 180)
   constexpr int BK = D == 48 ? 48 : FA_BK;
+  if (D == 48 && n >= 1700 && (warps == 4 || warps == 8)) {
+    if (warps == 8) flashGridHalfAt<D, 8, FA_BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
+    else flashGridHalfAt<D, 4, FA_BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
+    return;
+  }
   switch (warps) {
     case 8: flashGridHalfAt<D, 8, BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
     case 4: flashGridHalfAt<D, 4, BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
