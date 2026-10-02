@@ -138,8 +138,8 @@ int main(int argc, char** argv) {
     int dense = (int)M.meta("batch.dense");
     std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)t.n * dense);
     DiffusionFold df = prepareDiffusion(t.single, t.pair, t.targetFeat, t.seqMask, t.n);
-    std::vector<float> x = sample(steps, seed, mask, [&](const float* noisy, float tHat) {
-      return (const float*)denoiseStep(df, noisy, tHat);
+    std::vector<float> x = sample(steps, seed, mask, [&](const float* noisy, float tHat, const float* dLevel) {
+      return (const float*)denoiseStep(df, noisy, tHat, dLevel);
     });
     auto f2 = clock();
     // pseudo-beta off the structure, then the confidence head

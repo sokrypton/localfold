@@ -659,8 +659,14 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
 }
 // One denoiser call. After a first (allocating) call the step is captured as a CUDA graph and
 // replayed: about 300 small launches become one.
-inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float noiseLevel) {
-  setNoise(noiseLevel);
+// With `deviceLevel`, the noise level is read from device memory, so a caller can enqueue steps
+// without waiting on the host.
+inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float noiseLevel,
+                          const float* deviceLevel = nullptr) {
+  if (deviceLevel) {
+    if (!noiseParams) setNoise(noiseLevel);
+    CK(cudaMemcpyAsync(noiseParams, deviceLevel, 4, cudaMemcpyDeviceToDevice, STREAM));
+  } else setNoise(noiseLevel);
   if (!GRAPHS || STAGES || f.calls++ == 0) return denoiseCore(f, positionsNoisy, noiseLevel);
   if (!f.graph || positionsNoisy != f.graphInput) {
     if (f.graph) CK(cudaGraphExecDestroy(f.graph));
