@@ -229,6 +229,8 @@ __global__ void layerNormPlainK(const float* in, TO* out, size_t rows, int C) {
   for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>((x[c] - mean) * inv);
 }
 // [LN0(x) | 1] and [x | 1], rows of C+1: the inputs of the two conditioning GEMMs
+inline bool PRE_ADA = false;                  // the transformer's conditioning GEMMs are precomputed
+inline size_t PRE_ADA_BUDGET = (size_t)4 << 30;
 template <class TO>
 __global__ void layerNormPlainOnesK(const float* in, TO* outNorm, TO* outRaw, size_t rows, int C, int Ca) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -590,13 +592,15 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   size_t rows = (size_t)n * NS;                    // every sample's tokens; the conditioning is shared
   // every block's conditioning, two GEMMs over [x | 1] (the biases are the weights' last row)
   int Ca = (Cc + 1 + 7) / 8 * 8;
-  T* cn = scratch<T>("dt.cn", (size_t)n * Ca);
-  T* condT = scratch<T>("dt.condT", (size_t)n * Ca);
-  layerNormPlainOnesK<T><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(cond, cn, condT, n, Cc, Ca);
   T* gNorm = scratch<T>("dt.gNorm", (size_t)n * ldn);
   T* gRaw = scratch<T>("dt.gRaw", (size_t)n * ldr);
-  linear<T, T>(cn, gNorm, n, Ca, ldn, tc.wNorm);
-  linear<T, T>(condT, gRaw, n, Ca, ldr, tc.wRaw);
+  if (!(PRE_ADA && std::is_same_v<T, half>)) {     // else the step's slices were copied in already
+    T* cn = scratch<T>("dt.cn", (size_t)n * Ca);
+    T* condT = scratch<T>("dt.condT", (size_t)n * Ca);
+    layerNormPlainOnesK<T><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(cond, cn, condT, n, Cc, Ca);
+    linear<T, T>(cn, gNorm, n, Ca, ldn, tc.wNorm);
+    linear<T, T>(condT, gRaw, n, Ca, ldr, tc.wRaw);
+  }
   // the key mask once per sample (the flash kernel reads it per row of its batch)
   const float* maskRows = mask;
   if (NS > 1) {
@@ -755,6 +759,7 @@ struct DiffusionFold {
   // every step's single conditioning and its embedding projection, computed in one batch before
   // sampling (precomputeConditioning) - a step only copies its slices in
   std::vector<float> preLevels; float *preSingle = nullptr, *preSnProj = nullptr; bool usePre = false;
+  half *preG = nullptr, *preR = nullptr;      // and every step's adaptive-LayerNorm GEMMs, when they fit
 };
 inline bool GRAPHS = true;
 // the denoiser's seams against a stage oracle (oracle.stages.stages.<name>), when one was exported
@@ -804,6 +809,23 @@ inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& l
   for (float* p : {lv, e, en, proj, sn}) CK(cudaFree(p));
   scratch<float>("dc.single", (size_t)n * Cs); scratch<float>("dn.snProj", (size_t)n * perToken);   // a step's slices land here
   f.preLevels = levels; f.usePre = true;
+  // ...and, on the f16 path when every step's fits the budget (small inputs, where it is ~5% of a
+  // step), the transformer's two conditioning GEMMs over all steps at once
+  const std::string Tn = "diffusion.transformer";
+  int C = (int)M.meta(Tn + ".channels"), Cc = (int)M.meta(Tn + ".condChannels"), Ca = (Cc + 1 + 7) / 8 * 8;
+  size_t ldn = (size_t)TCACHE.nblocks * 4 * C, ldr = (size_t)TCACHE.nblocks * 2 * C;
+  if (f.preG) { CK(cudaFree(f.preG)); CK(cudaFree(f.preR)); f.preG = f.preR = nullptr; }
+  PRE_ADA = false;
+  if (DIFF_HALF && TCACHE.ready && Cc == Cs && rows * (ldn + ldr) * 2 <= PRE_ADA_BUDGET) {
+    half* cn = dallocT<half>(rows * Ca); half* condT = dallocT<half>(rows * Ca);
+    layerNormPlainOnesK<half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(f.preSingle, cn, condT, rows, Cc, Ca);
+    f.preG = dallocT<half>(rows * ldn); f.preR = dallocT<half>(rows * ldr);
+    linear<half, half>(cn, f.preG, rows, Ca, (int)ldn, TCACHE.wNorm);
+    linear<half, half>(condT, f.preR, rows, Ca, (int)ldr, TCACHE.wRaw);
+    CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(cn)); CK(cudaFree(condT));
+    scratch<half>("dt.gNorm", (size_t)n * ldn); scratch<half>("dt.gRaw", (size_t)n * ldr);
+    PRE_ADA = true;
+  }
 }
 // D(x; sigma): positions [NS][tokens*dense][3] in, the denoised positions out.
 inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float noiseLevel) {
@@ -865,6 +887,11 @@ inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float n
     CK(cudaMemcpyAsync(scratch<float>("dc.single", n * Cs), f.preSingle + s * n * Cs, n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
     CK(cudaMemcpyAsync(scratch<float>("dn.snProj", n * perToken), f.preSnProj + s * n * perToken, n * perToken * 4,
                        cudaMemcpyDeviceToDevice, STREAM));
+    if (f.preG) {
+      size_t ldn = (size_t)TCACHE.nblocks * 4 * (int)M.meta("diffusion.transformer.channels"), ldr = ldn / 2;
+      CK(cudaMemcpyAsync(scratch<half>("dt.gNorm", n * ldn), f.preG + s * n * ldn, n * ldn * 2, cudaMemcpyDeviceToDevice, STREAM));
+      CK(cudaMemcpyAsync(scratch<half>("dt.gRaw", n * ldr), f.preR + s * n * ldr, n * ldr * 2, cudaMemcpyDeviceToDevice, STREAM));
+    }
   }
   if (!GRAPHS || STAGES || f.calls++ == 0) return denoiseCore(f, positionsNoisy, noiseLevel);
   if (!f.graph || positionsNoisy != f.graphInput) {

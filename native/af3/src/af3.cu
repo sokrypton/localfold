@@ -379,6 +379,8 @@ int main(int argc, char** argv) {
     if (fi == 0 && which == 0 && serveDir.empty()) unreadWeights();
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
     if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); }
+    if (df.preG) { CK(cudaFree(df.preG)); CK(cudaFree(df.preR)); }
+    PRE_ADA = false;
     if (fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
