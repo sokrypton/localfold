@@ -257,8 +257,8 @@ __global__ void __launch_bounds__(KS * 32) flashSplitHalf(const half* __restrict
       bool ok = i < n && j < n;
       cpAsync16(B + qi * LDB + c, bias + ((size_t)h * n + (i < n ? i : 0)) * biasStride + (ok ? j : 0), ok);
     }
-    int j = j0 + lane;
-    Mst(st)[lane] = j < n ? (mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f) : -INFINITY;
+    int j = j0 + lane;       // (no mask: every key is real)
+    Mst(st)[lane] = j < n ? (!mask || mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f) : -INFINITY;
     asm volatile("cp.async.commit_group;");
   };
   int i0 = q0 + g, i1 = i0 + 8;
@@ -277,6 +277,14 @@ __global__ void __launch_bounds__(KS * 32) flashSplitHalf(const half* __restrict
   float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
   int tiles = (n + BK - 1) / BK;
   if (warp < tiles) issue(warp * BK, 0);
+  // the output gates the merge below writes with, loaded now (at the end they were one more round trip)
+  constexpr int GPT = (16 * D + KS * 32 - 1) / (KS * 32);
+  float gate[GPT];
+#pragma unroll
+  for (int k = 0; k < GPT; ++k) {
+    int t = threadIdx.x + k * KS * 32, row = t / D, e = t % D, i = q0 + row;
+    gate[k] = t < 16 * D && i < n ? __half2float(base[(size_t)i * W4 + 3 * Wd + e]) : 0.f;
+  }
   for (int tile = warp, it = 0; tile < tiles; tile += KS, ++it) {
     int st = it & 1;
     if (tile + KS < tiles) { issue((tile + KS) * BK, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
@@ -339,9 +347,10 @@ __global__ void __launch_bounds__(KS * 32) flashSplitHalf(const half* __restrict
   }
   if (tig == 0) { Mx[warp * 16 + g] = m0; Mx[warp * 16 + g + 8] = m1; Ls[warp * 16 + g] = l0; Ls[warp * 16 + g + 8] = l1; }
   __syncthreads();
-  for (int t = threadIdx.x; t < 16 * D; t += KS * 32) {
-    int row = t / D, e = t % D, i = q0 + row;
-    if (i >= n) continue;
+#pragma unroll
+  for (int k = 0; k < GPT; ++k) {
+    int t = threadIdx.x + k * KS * 32, row = t / D, e = t % D, i = q0 + row;
+    if (t >= 16 * D || i >= n) continue;
     float M = -INFINITY;
     for (int k = 0; k < KS; ++k) M = fmaxf(M, Mx[k * 16 + row]);
     float L = 0.f, O = 0.f;
@@ -349,7 +358,7 @@ __global__ void __launch_bounds__(KS * 32) flashSplitHalf(const half* __restrict
       float c = exp2f(Mx[k * 16 + row] - M);
       L += Ls[k * 16 + row] * c; O += Os[((size_t)k * 16 + row) * D + e] * c;
     }
-    out[(rl * n + i) * Wd + h * D + e] = __float2half(O / L * sigm(__half2float(base[(size_t)i * W4 + 3 * Wd + e])));
+    out[(rl * n + i) * Wd + h * D + e] = __float2half(O / L * sigm(gate[k]));
   }
 }
 template <int D, int KS>
@@ -445,7 +454,7 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // too few blocks to fill the device: split each 16 queries' keys over four warps instead.
   // Measured at 16 heads, D 48: 9.3 against 14.7 us at 68 tokens, 13.4/19.5 at 192, and worse
   // from 256 (22.8/21.5), where the merge outweighs the parallelism.
-  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && mask && n <= 192 && rows * heads * ((n + 63) / 64) < 4 * 108) {
+  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && n <= 192 && rows * heads * ((n + 63) / 64) < 4 * 108) {
     flashSplitHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     return;
   }

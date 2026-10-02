@@ -20,14 +20,23 @@ inline void benchOps(int n) {
   linear<half, float>(o, att, n, Wd, C, B + ".Transition2");
   linear<half, half>(x, wide, n, C, 2 * I, B + ".ffwTransition1");
   linear<half, float>(gated, att, n, I, C, B + ".ffwTransition2");
+  // inside a CUDA graph of 200 launches, as the denoiser step runs (a bare launch is ~2 us)
   auto time = [&](const char* name, const std::function<void()>& f) {
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
     for (int k = 0; k < 20; ++k) f();
-    cudaEventRecord(a, STREAM);
-    for (int k = 0; k < 500; ++k) f();
-    cudaEventRecord(b, STREAM); cudaEventSynchronize(b);
-    float ms; cudaEventElapsedTime(&ms, a, b);
-    printf("  %-22s %7.2f us\n", name, ms * 1000 / 500);
+    CK(cudaStreamSynchronize(STREAM));
+    cudaGraph_t gr; cudaGraphExec_t ge;
+    CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+    for (int k = 0; k < 200; ++k) f();
+    CK(cudaStreamEndCapture(STREAM, &gr)); CK(cudaGraphInstantiate(&ge, gr, 0));
+    CK(cudaGraphLaunch(ge, STREAM)); CK(cudaStreamSynchronize(STREAM));
+    float best = 1e9f;
+    for (int r = 0; r < 5; ++r) {
+      cudaEventRecord(a, STREAM); CK(cudaGraphLaunch(ge, STREAM)); cudaEventRecord(b, STREAM); cudaEventSynchronize(b);
+      float ms; cudaEventElapsedTime(&ms, a, b); best = std::min(best, ms);
+    }
+    CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(gr));
+    printf("  %-22s %7.2f us\n", name, best * 1000 / 200);
   };
   printf("one transformer block's operations at %d tokens:\n", n);
   float* yb = dalloc((size_t)n * C); CK(cudaMemset(yb, 0, (size_t)n * C * 4));
@@ -46,6 +55,8 @@ inline void benchOps(int n) {
   time("flash split 2", [&] { flashSplitHalfAt<48, 2>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
   time("flash split 4", [&] { flashSplitHalfAt<48, 4>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
   time("flash split 8", [&] { flashSplitHalfAt<48, 8>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
+  time("flash split 4 nomask", [&] { flashSplitHalfAt<48, 4>(qkvg, bias, (n + 7) / 8 * 8, nullptr, o, n, heads, 0, 1, false, 0.1f, nullptr); });
+  time("flash split 8 nomask", [&] { flashSplitHalfAt<48, 8>(qkvg, bias, (n + 7) / 8 * 8, nullptr, o, n, heads, 0, 1, false, 0.1f, nullptr); });
   time("T2 GEMM 768->768", [&] { linear<half, float>(o, att, n, Wd, C, B + ".Transition2"); });
   time("add gated", [&] { addGatedStridedK<float><<<blocks((size_t)n * C), 256, 0, STREAM>>>(act, att, g, 2 * C, n, C, n); });
   time("ffw1 GEMM 768->3072", [&] { linear<half, half>(x, wide, n, C, 2 * I, B + ".ffwTransition1"); });
