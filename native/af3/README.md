@@ -351,6 +351,12 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
 - **The next block's weights prefetched into L2** while the current block runs: the 68-row GEMMs
   are not bandwidth-bound at all - the same GEMM with its weights hot in L2 is 8.9 against 9.4 us
   cold, and 8.1 us for N = 768 either way.
+- **The pair residual in bf16** (AF3's own activation precision; the f32 residual is half of every
+  pair kernel's read-modify-write). Measured before building it, by pointing two kernels' residual
+  at bf16 with the traffic right and the numbers wrong, at 1044 tokens: the triangle's output
+  kernel 170 -> 138 ms, the fused transition 201 -> 201 (its arithmetic binds). Extended to the
+  other pair kernels that is ~4% of a trunk pass - not worth templating every pair consumer on the
+  storage type and moving every fold's numerics.
 - **The grid attention skipping its padding**: at 261 tokens a row's last 64-query block holds 5
   real queries and its last 64-key tile 5 real keys. Warps whose queries are all past the end
   computing nothing (they still load and wait): 0.190 against 0.191 ms at 261, 6.97 against 6.89
