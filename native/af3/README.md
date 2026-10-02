@@ -74,11 +74,26 @@ the transformer's 24 pair-logit sets); the transformer's 144 conditioning projec
 GEMMs per step with each block's LayerNorm scale folded into its weights; the whole step replayed
 as a CUDA graph; the transformer in FP16.
 
+## Ligands, modified residues, nucleic acids
+
+```
+node ... export-model.mjs data-gol --sequence=<SEQ> --ligands=GOL          # CCD codes (RCSB)
+node ... export-model.mjs data-sep --sequence=<SEQ> --modify=SEP@3         # as probe-modified.js
+node ... export-model.mjs data-dna --sequence=<SEQ>:GCGATCGC:GCGATCGC --kinds=protein,dna,dna
+node ... export-model.mjs data-smi --sequence=<SEQ> --smiles='OCC(O)CO'
+node bonds.mjs fold.pdb GOL        # bond lengths by class, ideals from the CCD
+```
+
+The featuriser is the repository's own; the trunk adds the bond embedding (one column, bias-free).
+The PDB is written through the page's own `toPdb` records (exported as `template.pdb`): chains,
+HETATM ligands under their codes, modified residues, CONECT, per-atom pLDDT. 6MRR with each, bond
+rms (A): GOL ligand **0.020**, SEP **0.051**, a DNA duplex's nucleic bonds **0.040**; protein
+mainchain 0.033-0.034 throughout.
+
 ## Not ported yet
 
-Ligands and bonds, modified residues, nucleic acids (the featuriser handles them; the trunk's
-bond embedding does not), real templates (empty slots only), the other dialects (OpenDDE,
-boltz2, protenix2, IntelliFold-2, RoseTTAFold3 - each raises a named "not ported" error).
+Real templates (empty slots only), the other dialects (OpenDDE, boltz2, protenix2, IntelliFold-2,
+RoseTTAFold3 - each raises a named "not ported" error).
 
 ## Tried and not taken
 

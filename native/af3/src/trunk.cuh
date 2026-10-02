@@ -84,6 +84,10 @@ inline Trunk makeTrunk(const float* targetFeatHost, int msaCap) {
 }
 
 template <class T> void templateEmbedding(Trunk& t, float* pairOut);
+__global__ void bondEmbedK(float* pair, const float* bonds, const float* w, size_t pairs, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < pairs * C) pair[t] += bonds[t / C] * w[t % C];
+}
 
 // The embedder up to and including the template term. `onSeam` sees the pair after each.
 template <class T>
@@ -106,8 +110,10 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     Idev("batch.features.entityId"), Idev("batch.features.symId"), W(E + "positionActivations"),
     t.pair, n, C, 32, 2);
   if (M.has("batch.bondMatrix")) {
-    // bond_embedding: bias-free, one input column; zero for a polymer without links
-    fprintf(stderr, "bonds: not ported yet\n"); exit(1);
+    // bond_embedding: bias-free, one input column (the token-pair contact); zero for a polymer
+    // without links
+    if (lenW(E + "bondEmbedding") != (size_t)C) { fprintf(stderr, "bondEmbedding is not 1 x %d\n", C); exit(1); }
+    bondEmbedK<<<blocks(pairs * C), 256, 0, STREAM>>>(t.pair, Fdev("batch.bondMatrix"), W(E + "bondEmbedding"), pairs, C);
   }
   onSeam("z_init_generic", t.pair, pairs * C);
   float* tmpl = scratch<float>("emb.template", pairs * C);

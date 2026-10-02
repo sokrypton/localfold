@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
   }
   auto t0 = std::chrono::steady_clock::now();
-  M.load(argv[1]);
+  M.load(argv[1]); DATA_DIR = argv[1];
   if (profile) prof::init();
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
@@ -150,13 +150,7 @@ int main(int argc, char** argv) {
     float* dBeta = upload(beta.data(), beta.size());
     ConfidenceOut conf = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
     auto f3 = clock();
-    std::vector<float> perToken(t.n, 0.f);
-    for (int k = 0; k < t.n; ++k) {
-      double s2 = 0, c2 = 0;
-      for (int a = 0; a < dense; ++a) if (mask[(size_t)k * dense + a]) { s2 += conf.plddt[(size_t)k * dense + a]; c2 += 1; }
-      perToken[k] = (float)(s2 / std::max(c2, 1.0));
-    }
-    writePdb(out, x, perToken.data());
+    writePdb(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
     if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
       FILE* pf = fopen(pp, "wb");
       fwrite(conf.pae.data(), 4, conf.pae.size(), pf); fwrite(conf.pde.data(), 4, conf.pde.size(), pf);

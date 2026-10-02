@@ -98,8 +98,27 @@ inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<flo
   return out;
 }
 
-// The dense atom grid as a PDB: one residue per token, atom names from ref_atom_name_chars.
+// The PDB: through the exporter's template.pdb when there is one (the page's own records, the
+// slot in the x column), else one residue per token named here. `bfactors` per atom slot.
+inline std::string DATA_DIR;
 inline void writePdb(const std::string& path, const std::vector<float>& x, const float* bfactors = nullptr) {
+  std::ifstream tf(DATA_DIR + "/template.pdb");
+  if (tf) {
+    FILE* f = fopen(path.c_str(), "w");
+    std::string line;
+    while (std::getline(tf, line)) {
+      if (line.size() >= 66 && (!line.compare(0, 4, "ATOM") || !line.compare(0, 6, "HETATM"))) {
+        size_t slot = (size_t)std::lround(std::stod(line.substr(30, 8)));
+        char coords[64];
+        snprintf(coords, sizeof coords, "%8.3f%8.3f%8.3f%6.2f%6.2f", x[slot * 3], x[slot * 3 + 1], x[slot * 3 + 2],
+                 1.0, bfactors ? bfactors[slot] : 0.0);
+        line = line.substr(0, 30) + coords + line.substr(66);
+      }
+      fprintf(f, "%s\n", line.c_str());
+    }
+    fclose(f);
+    return;
+  }
   static const char* RES[20] = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
                                 "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"};
   static const char* ELEM[] = {"X", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si",
@@ -119,7 +138,7 @@ inline void writePdb(const std::string& path, const std::vector<float>& x, const
     const char* res = aatype[t] >= 0 && aatype[t] < 20 ? RES[aatype[t]] : "UNK";
     fprintf(f, "ATOM  %5d %-4s %3s %c%4d    %8.3f%8.3f%8.3f%6.2f%6.2f          %2s\n", serial++,
             strlen(name) < 4 ? (std::string(" ") + name).c_str() : name, res, 'A' + (chain[t] - 1) % 26,
-            resIdx[t], x[i * 3], x[i * 3 + 1], x[i * 3 + 2], 1.0, bfactors ? bfactors[t] : 0.0, el);
+            resIdx[t], x[i * 3], x[i * 3 + 1], x[i * 3 + 2], 1.0, bfactors ? bfactors[i] : 0.0, el);
   }
   fprintf(f, "END\n");
   fclose(f);

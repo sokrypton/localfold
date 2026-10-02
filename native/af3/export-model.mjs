@@ -81,15 +81,49 @@ if (sequence !== "") {
   const { featuriserDialect } = await import(`${repo}/src/af3/dialect.js`);
   const a3mPath = option("a3m", "");
   const alignment = a3mPath === "" ? null : readFileSync(a3mPath, "utf8");
+  // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna
+  // (one per ":"-chain), --modify=SEP@3[@chain] (the position as tools/gpu/probe-modified.js takes it, chain index from 0)
+  const { ccdUrl, parseCcdComponent } = await import(`${repo}/src/af3/featurise/ccd-component.js`);
+  const { nameSmilesLigands, smilesComponent } = await import(`${repo}/src/chem/component.js`);
+  const ccd = async (code) => {
+    const response = await fetch(ccdUrl(code));
+    if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
+    return parseCcdComponent(await response.text());
+  };
+  const ligands = [];
+  for (const code of option("ligands", "").split(",").filter(Boolean)) ligands.push(await ccd(code));
+  const smiles = option("smiles", "").split("|").filter(Boolean);
+  const smilesNames = nameSmilesLigands(smiles);
+  for (let i = 0; i < smiles.length; i += 1) ligands.push(await smilesComponent(smiles[i], { code: smilesNames[i] }));
+  const modifications = [];
+  for (const spec of option("modify", "").split(",").filter(Boolean)) {
+    const [code, at, chain] = spec.split("@");
+    modifications.push({ chain: Number(chain ?? 0), position: Number(at), ...(await ccd(code)) });
+  }
+  const kinds = option("kinds", "");
   batch = af3BatchFromA3m(sequence, alignment, {
     maxSequences: Number(option("max-msa", "512")),
     seed: Number(option("seed", "20260831")),
     ...featuriserDialect(trunk.dialect),
+    ...(ligands.length === 0 ? {} : { ligands }),
+    ...(modifications.length === 0 ? {} : { modifications }),
+    ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
   }).batch;
 } else {
   batch = batchFromDump(JSON.parse(readFileSync(batchPath, "utf8")));
 }
 add("batch", batch);
+// The PDB's records as the page writes them (src/af3/fold.js toPdb: chains, HETATM ligands under
+// their codes, modified residues, CONECT), with each atom's dense slot as its x coordinate so the
+// native writer knows which coordinates go where.
+try {
+  const { toPdb } = await import(`${repo}/src/af3/fold.js`);
+  const slots = new Float32Array(batch.tokens * batch.dense * 3);
+  for (let i = 0; i < batch.tokens * batch.dense; i += 1) slots[i * 3] = i;
+  writeFileSync(`${out}/template.pdb`, toPdb(batch, slots, null) + "\n");
+} catch (error) {
+  console.log(`no PDB template (${error.message}); the native writer will name residues itself`);
+}
 // The oracle's own z_init/target_feat etc., by stage.
 const flat = (record) => Float32Array.from(Array.isArray(record.data) ? record.data.flat(Infinity) : record.data);
 for (const which of oracles) {
