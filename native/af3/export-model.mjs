@@ -17,6 +17,33 @@
 import { writeFileSync, mkdirSync, readFileSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
+// --serve=DIR: stay up with every module loaded (the loading was ~180 ms of a 220 ms export) and
+// export each request dropped in DIR - <id>.req, a JSON list of this script's arguments - by
+// importing this file again with those arguments (its dependencies stay cached), writing <id>.ok
+// or <id>.err. A request of ["quit"] stops it. native/af3/fold --serve runs one beside af3's.
+const serveArg = process.argv.slice(2).find((a) => a.startsWith("--serve="));
+if (serveArg !== undefined && globalThis.EXPORT_SERVING === undefined) {
+  globalThis.EXPORT_SERVING = true;
+  const { readdirSync, unlinkSync } = await import("node:fs");
+  const dir = serveArg.slice(8);
+  const argv0 = process.argv.slice(0, 2);
+  console.log(`export: serving ${dir}`);
+  for (let n = 0; ; ) {
+    const reqs = readdirSync(dir).filter((f) => f.endsWith(".req")).sort();
+    if (reqs.length === 0) { await new Promise((r) => setTimeout(r, 2)); continue; }
+    const id = reqs[0].slice(0, -4);
+    const request = JSON.parse(readFileSync(`${dir}/${id}.req`, "utf8"));
+    unlinkSync(`${dir}/${id}.req`);
+    if (request[0] === "quit") process.exit(0);
+    process.argv = [...argv0, ...request];
+    try {
+      await import(`${import.meta.url}?request=${n++}`);
+      writeFileSync(`${dir}/${id}.ok`, "");
+    } catch (error) {
+      writeFileSync(`${dir}/${id}.err`, `${error?.stack ?? error}\n`);
+    }
+  }
+}
 const args = process.argv.slice(2);
 const out = args.find((a) => !a.startsWith("--")) ?? `${repo}/native/af3/data`;
 const option = (name, fallback) =>
@@ -24,7 +51,8 @@ const option = (name, fallback) =>
 // the bundle: a URL, or a path on disk (the default - no server needed: fetch reads file:// here)
 const bundleArg = option("bundle", `${repo}/model-af3-full-f32/manifest.json`);
 const bundle = /^https?:/.test(bundleArg) ? bundleArg : new URL(`file://${bundleArg.startsWith("/") ? "" : process.cwd() + "/"}${bundleArg}`).href;
-{
+if (globalThis.EXPORT_FETCH_SHIM === undefined) {    // once per process (the server re-imports this file)
+  globalThis.EXPORT_FETCH_SHIM = true;
   const networkFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     const href = typeof url === "string" ? url : url.url ?? String(url);

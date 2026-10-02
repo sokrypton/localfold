@@ -187,9 +187,10 @@ a command, of which the fold is
 
 `native/af3/fold --serve` starts one `af3` (`--serve=DIR`) that keeps the weights on the device and
 every kernel and cuBLAS plan warm; until `native/af3/fold --stop`, every ordinary `fold` command
-for that model exports its input and hands it to the server as a job (per-job `--samples`,
-`--steps`, `--recycles`, `--seed`) - 6MRR 0.70 s a command, against 1.00 s starting `af3` each
-time. The outputs are byte-identical either way.
+for that model has its input exported by a resident exporter too (`export-model.mjs --serve`,
+node's module loading being most of an export) and hands it to the server as a job (per-job
+`--samples`, `--steps`, `--recycles`, `--seed`) - 6MRR 0.53 s a command, against 1.00 s starting
+both each time. The outputs are byte-identical either way.
 
 ## The gate
 
