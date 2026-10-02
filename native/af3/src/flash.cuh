@@ -66,7 +66,11 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
   auto Bst = [&](int s) { return Vst(s) + BK * LDK; };
   auto Mst = [&](int s) { return (float*)(Bst(s) + BQ * LDB); };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
-  size_t b = blockIdx.y; int h = (int)(b % heads); size_t rl = b / heads, r = r0 + rl;
+  // the head is the SLOWEST index: CTAs run in roughly linear order, so all rows of one head pass
+  // before the next head starts and the pair bias they share is one head's (n x n f16) rather than
+  // every head's - at 2088 tokens all four heads' bias is 35 MB against a 40 MB L2
+  const size_t rowsHere = gridDim.y / heads;
+  size_t b = blockIdx.y; int h = (int)(b / rowsHere); size_t rl = b % rowsHere, r = r0 + rl;
   const int Wd = heads * D, W4 = 4 * Wd;
   const half* base = qkvg + rl * (size_t)n * W4 + h * D;
   int q0 = blockIdx.x * BQ;
