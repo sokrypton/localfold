@@ -351,21 +351,21 @@ function readAlignment(body, where, state) {
         + " cannot read - paste the alignment or use the upload box");
     }
   }
-  let sawEmpty = false;
-  for (const field of ["unpairedMsa", "pairedMsa"]) {
+  // 🔴 AN EMPTY STRING IS NOT AN ABSENT FIELD. AlphaFold 3 reads `""` as "run
+  // this chain with no alignment" and an absent field as "search for one" -
+  // opposite instructions, and the difference between a single-sequence fold
+  // and a several-minute search. It is the same absent-is-not-zero rule the
+  // archive's B-factor column follows.
+  const read = (field) => {
     const value = body[field];
-    if (value === undefined || value === null) continue;
-    // 🔴 AN EMPTY STRING IS NOT AN ABSENT FIELD. AlphaFold 3 reads `""` as "run
-    // this chain with no alignment" and an absent field as "search for one" -
-    // opposite instructions, and the difference between a single-sequence fold
-    // and a several-minute search. It is the same absent-is-not-zero rule the
-    // archive's B-factor column follows.
-    if (String(value).trim() === "") { sawEmpty = true; continue; }
-    refuse(`${where}: ${field} carries an alignment inline, which this page`
-      + " cannot attach yet - drop the fold archive on the alignment box"
-      + " instead, or delete the field to search afresh");
-  }
-  if (sawEmpty) state.singleSequence = true;
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "string") refuse(`${where}: ${field} is A3M text`);
+    if (value.trim() === "") { state.sawEmpty = true; return ""; }
+    return value;
+  };
+  // ...and an alignment carried inline is kept, per entry, and handed back
+  // per chain copy in fold order (see jobFromJson's `alignments`)
+  return { unpaired: read("unpairedMsa"), paired: read("pairedMsa") };
 }
 
 /**
@@ -512,10 +512,10 @@ function readEntry(entry, index, state) {
     }
     modifications.push({ code, position });
   }
-  readAlignment(body, where, state);
+  const inlineMsa = readAlignment(body, where, state);
   const template = type === "protein" ? readTemplates(body, where) : undefined;
   return { type, value: sequence.trim().toUpperCase(), copies, modifications,
-           ids: idsOf(body),
+           ids: idsOf(body), inlineMsa,
            ...(template === undefined ? {} : { template }) };
 }
 
@@ -571,7 +571,7 @@ export function jobFromJson(text) {
   // Both dialects appear as a bare object and as a list of jobs in the wild.
   const jobs = Array.isArray(parsed) ? parsed : [parsed];
   if (jobs.length === 0) refuse("that file holds no jobs");
-  const state = { singleSequence: false };
+  const state = { singleSequence: false, sawEmpty: false };
   const notes = [];
   if (jobs.length > 1) {
     // 🔴 SAID, NOT SILENTLY DROPPED. Folding the first of several jobs is one
@@ -690,6 +690,29 @@ export function jobFromJson(text) {
     if (!Number.isFinite(first) || first < 0) refuse(`seed ${list[0]}`);
     seed = Math.floor(first);
   }
+  // 🔴 THE FILE'S OWN ALIGNMENTS, per polymer chain COPY in the order the
+  // entities expand to chains - the reader above reorders entities, so the
+  // list is built from them and not from the file's order. Text where the file
+  // carried one, "" where it asked for none, null where it said nothing.
+  const polymers = entities.filter((entity) => entity.inlineMsa !== undefined);
+  const perChain = { unpaired: [], paired: [] };
+  for (const entity of polymers) {
+    for (let c = 0; c < entity.copies; c += 1) {
+      perChain.unpaired.push(entity.inlineMsa.unpaired);
+      perChain.paired.push(entity.inlineMsa.paired);
+    }
+  }
+  for (const entity of entities) delete entity.inlineMsa;
+  const carried = [...perChain.unpaired, ...perChain.paired].some((text) => typeof text === "string" && text !== "");
+  let alignments;
+  if (carried) {
+    alignments = perChain;
+    const bare = perChain.unpaired.filter((text, i) => !text && !perChain.paired[i]).length;
+    notes.push(`the file's own alignments for ${perChain.unpaired.length - bare} of ${perChain.unpaired.length} chains`
+      + (bare === 0 ? "" : ` - the other ${bare} fold${bare === 1 ? "s" : ""} from ${bare === 1 ? "its" : "their"} own sequence`));
+  } else if (state.sawEmpty) {
+    state.singleSequence = true;
+  }
   if (state.singleSequence) {
     notes.push("the file asks for no alignment, so the MSA dial is set to none");
   }
@@ -731,5 +754,6 @@ export function jobFromJson(text) {
   for (const entity of entities) delete entity.ids;
   return { name: typeof job.name === "string" ? job.name : undefined,
            seed, entities, dialect, singleSequence: state.singleSequence, notes,
+           ...(alignments === undefined ? {} : { alignments }),
            ...(typeof job.userCCD === "string" && job.userCCD.trim() !== "" ? { userCcd: job.userCCD } : {}) };
 }

@@ -89,10 +89,14 @@ const EXPECTED = {
   // example job that exercises the new path.
   "streptavidin_biotin_smiles.json": { loads: ["protein:126x1", "smiles:1x1"] },
   // ...and the pipeline's own kitchen-sink input, which uses nearly every
-  // field the format has at once. It refuses on the first one it hits.
-  // ...and the kitchen sink now refuses on the NEXT thing it asks for, which
-  // the "names the next reason" case below already had to peel it to reach.
-  "alphafold_input.json": { refuses: "unpairedMsa" },
+  // field the format has at once - the last to load, once an alignment carried
+  // INLINE could be held (per chain copy, `job.alignments`). Its seed is 10.
+  "alphafold_input.json": {
+    loads: ["protein:10x1", "protein:7x1", "dna:7x1", "dna:7x1", "rna:4x1", "smiles:1x1",
+            "ligand:ATPx1", "ligand:HEMx2", "ligand:MGx2", "ligand:NAG,FUCx1", "ligand:NAx3",
+            "contact:A1:CA - H1:CHAx1", "contact:L1:O6 - L2:C1x1"],
+    seed: 10, alignedChains: 2,
+  },
 };
 
 const shape = (entities) => entities.map((entity) =>
@@ -121,8 +125,12 @@ describe("AlphaFold 3's own example jobs", () => {
     it(`loads ${name}`, () => {
       const job = jobFromJson(read(name));
       expect(shape(job.entities)).toEqual(expectation.loads);
-      // Every example seeds 42, and a seed read as a string would be one.
-      expect(job.seed).toBe(42);
+      // Every example but the kitchen sink seeds 42, and a seed read as a
+      // string would be one.
+      expect(job.seed).toBe(expectation.seed ?? 42);
+      // ...and the alignments a file carries are held, one per chain copy
+      const aligned = (job.alignments?.unpaired ?? []).filter(Boolean).length;
+      expect(aligned).toBe(expectation.alignedChains ?? 0);
       expect(job.dialect).toBe("alphafold3");
       if (expectation.modifications !== undefined) {
         expect(job.entities[0].modifications.map((one) => `${one.code}@${one.position}`))
@@ -132,19 +140,23 @@ describe("AlphaFold 3's own example jobs", () => {
   }
 
   /**
-   * 🔴 THE REFUSALS STACK, and this is the only place that can show it. One
-   * guard hiding the rest would mean a reader who deletes the field we named
-   * gets the file loaded rather than the next refusal - so the kitchen-sink
-   * input is peeled once, deliberately, and asked what it says next. It says
-   * the inline alignment, which is the honest answer: the page has nowhere to
-   * attach one yet.
+   * 🔴 THE INLINE ALIGNMENTS ARE PER CHAIN COPY, IN FOLD ORDER, and an empty
+   * string is not an absent one: AlphaFold 3 reads `""` as "this chain has no
+   * alignment" and an absent field as "search". With nothing carried at all,
+   * an empty string still turns the dial to single sequence.
    */
-  it("names the next reason when the first is removed", () => {
+  it("holds a job's inline alignments per chain, and an empty one as none", () => {
     const job = JSON.parse(read("alphafold_input.json"));
-    delete job.bondedAtomPairs;
-    let message = "(no refusal)";
-    try { jobFromJson(JSON.stringify(job)); } catch (error) { message = error.message; }
-    expect(message.includes("unpairedMsa")).toBe(true);
+    const loaded = jobFromJson(JSON.stringify(job));
+    expect(loaded.alignments.unpaired.map((text) => (text ? "text" : text)))
+      .toEqual(["text", null, null, null, "text"]);
+    expect(loaded.alignments.paired.map((text) => (text ? "text" : text)))
+      .toEqual(["text", null, null, null, null]);
+    const bare = JSON.parse(read("ubiquitin_monomer.json"));
+    bare.sequences[0].protein.unpairedMsa = "";
+    const single = jobFromJson(JSON.stringify(bare));
+    expect(single.alignments === undefined).toBe(true);
+    expect(single.singleSequence).toBe(true);
   });
 
   /**
@@ -167,15 +179,14 @@ describe("AlphaFold 3's own example jobs", () => {
    * protein/DNA complex, none of them tripping the chain-geometry rule. The
    * per-file table is in docs/WEB.md.
    */
-  it("folds thirteen of the fourteen, and says what the last one wants", () => {
+  it("loads all fourteen", () => {
     const loads = Object.values(EXPECTED).filter((one) => one.loads !== undefined);
-    // 🔴 THIRTEEN: NINE UNTIL `bondedAtomPairs` LANDED, TEN UNTIL MODIFIED BASES
-    // DID, TWELVE UNTIL A LIGAND COULD BE A CHAIN OF COMPONENTS. This count is
+    // 🔴 NINE UNTIL `bondedAtomPairs` LANDED, TEN UNTIL MODIFIED BASES DID,
+    // TWELVE UNTIL A LIGAND COULD BE A CHAIN OF COMPONENTS, THIRTEEN UNTIL AN
+    // INLINE ALIGNMENT COULD BE HELD. This count is
     // asserted so that moving a file between the two lists is a decision
     // somebody makes out loud - it has caught the prose going stale twice.
-    expect(loads).toHaveLength(13);
-    // The one left: an alignment carried inline.
-    expect(Object.values(EXPECTED).filter((one) =>
-      one.refuses === "unpairedMsa")).toHaveLength(1);
+    // FOURTEEN once an alignment carried inline could be held.
+    expect(loads).toHaveLength(14);
   });
 });

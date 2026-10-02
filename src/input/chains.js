@@ -397,3 +397,38 @@ export function deduplicateUnpairedAgainstPaired(unpairedA3m, pairedA3m) {
   }
   return `${lines.join("\n")}\n`;
 }
+
+/**
+ * A job's own alignments - AlphaFold 3's `unpairedMsa` / `pairedMsa`, one per
+ * physical polymer chain in fold order (null where the file gave none) - as the
+ * featuriser takes them: each list merged row by row (mergeRowAlignedChainA3ms),
+ * and the alphabet of every column.
+ *
+ * 🔴 EVERY POLYMER CHAIN IS IN THE MERGED ALIGNMENT, nucleic ones too (an RNA
+ * chain's own unpairedMsa, a DNA chain's query), so each column is read in its
+ * chain's alphabet and the featuriser told the columns cover them all - parsed
+ * as protein, an RNA's U was refused, a DNA's ACGT read as amino acids, and a
+ * nucleic chain ahead of a protein shifted every column. A chain the file gave
+ * no alignment is its query row alone.
+ *
+ * One function for the page and the native exporter, which each had a copy.
+ *
+ * @param {{unpaired: (?string)[], paired: (?string)[]}} perChain
+ * @param {readonly string[]} chains every polymer chain's sequence
+ * @param {readonly string[]} chainKinds "protein" | "rna" | "dna", one per chain
+ * @returns {{alignment: {unpaired: ?string, paired: ?string}, msaColumnKinds: string[]}}
+ */
+export function mergeJobAlignments(perChain, chains, chainKinds) {
+  if (perChain.unpaired.length !== chains.length || perChain.paired.length !== chains.length) {
+    throw new Error(`the job's alignments name ${perChain.unpaired.length} chains and the fold has ${chains.length}`);
+  }
+  const anyLetter = chainKinds.some((kind) => kind !== "protein");
+  const fill = (list) => list.map((text, i) => (text ? text : `>query\n${chains[i]}\n`));
+  const merged = (list) => (list.some(Boolean)
+    ? (list.length === 1 ? fill(list)[0] : mergeRowAlignedChainA3ms(fill(list), { anyLetter }))
+    : null);
+  return {
+    alignment: { unpaired: merged(perChain.unpaired), paired: merged(perChain.paired) },
+    msaColumnKinds: chainKinds.flatMap((kind, i) => Array(chains[i].length).fill(kind)),
+  };
+}

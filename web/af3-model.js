@@ -566,6 +566,8 @@ export async function foldAf3(options) {
 
   const { batch, rows } = af3BatchFromA3m(sequence, alignment, {
     maxSequences: options.maxMsaSequences,
+    // a job's own alignments cover nucleic chains too: each column's alphabet
+    ...(options.msaColumnKinds === undefined ? {} : { msaColumnKinds: options.msaColumnKinds }),
     seed: options.seed ?? 0,
     ligands,
     modifications,

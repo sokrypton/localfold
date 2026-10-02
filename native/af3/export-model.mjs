@@ -150,22 +150,19 @@ if (option("job", "") !== "") {
   const { jobFromJson } = await import(`${repo}/web/job-json.js`);
   const { expandEntities } = await import(`${repo}/web/entities.js`);
   // AlphaFold 3's data pipeline writes its alignments INTO the job (unpairedMsa / pairedMsa per
-  // chain); the page's reader refuses them, so they are lifted out here, per chain copy in the
-  // order expandEntities numbers chains (polymers in file order), and used as the alignment.
+  // chain): the page's reader returns them per chain copy (job.alignments), merged below through
+  // the page's own mergeJobAlignments.
   const raw = JSON.parse(readFileSync(option("job", ""), "utf8"));
   const jobs = Array.isArray(raw) ? raw : [raw];
-  const inlineMsa = { unpaired: [], paired: [] };
-  // ...and the TEMPLATES likewise, every one of them: AF3's data pipeline writes up to twenty a chain
-  // into the job and folds the first four, chain i's k-th in slot k, where the page's reader takes one
-  // a chain - so they are lifted out here, per chain copy, and built below (jobTemplates)
+  // The TEMPLATES, every one of them: AF3's data pipeline writes up to twenty a chain into the job
+  // and folds the first four, chain i's k-th in slot k, where the page's reader takes one a chain -
+  // so they are lifted out here, per chain copy, and built below (jobTemplates)
   let polymerCopy = 0;
   for (const entry of jobs[0]?.sequences ?? []) {
     const [kind, body] = Object.entries(entry)[0] ?? [];
     if (!["protein", "rna", "dna"].includes(kind) || body === undefined) continue;
     const copies = Array.isArray(body.id) ? body.id.length : 1;
     for (let c = 0; c < copies; c += 1) {
-      inlineMsa.unpaired.push(body.unpairedMsa || null);
-      inlineMsa.paired.push(body.pairedMsa || null);
       for (const [k, t] of (Array.isArray(body.templates) ? body.templates : []).slice(0, 4).entries()) {
         if (typeof t.mmcif !== "string") throw new Error(`template ${k} of chain ${polymerCopy}: give the mmCIF inline`);
         const q = t.queryIndices, ti = t.templateIndices;
@@ -178,10 +175,6 @@ if (option("job", "") !== "") {
       polymerCopy += 1;
     }
     delete body.templates;
-    delete body.unpairedMsa; delete body.pairedMsa;
-    for (const field of ["unpairedMsaPath", "pairedMsaPath"]) {
-      if (body[field] !== undefined) throw new Error(`${field}: give the alignment inline or with --a3m`);
-    }
   }
   const job = jobFromJson(JSON.stringify(raw));
   // every modelSeed, where the page folds the first: af3 runs each (src/af3.cu, --seeds)
@@ -198,20 +191,13 @@ if (option("job", "") !== "") {
   jobRequest = expandEntities(job.entities);
   jobUserCcd = job.userCcd ?? null;
   sequence = jobRequest.sequence;
-  if (inlineMsa.unpaired.some(Boolean) || inlineMsa.paired.some(Boolean)) {
-    const { mergeRowAlignedChainA3ms } = await import(`${repo}/src/input/chains.js`);
-    const fill = (list) => list.map((text, i) => text ?? `>query\n${jobRequest.chains[i]}\n`);
-    // 🔴 EVERY POLYMER CHAIN IS IN THE MERGED ALIGNMENT, nucleic ones too (an RNA chain's own
-    // unpairedMsa, a DNA chain's query), so each column is read in its chain's alphabet and the
-    // featuriser told the columns cover them all - parsed as protein, an RNA's U was refused, a
-    // DNA's ACGT read as amino acids, and a nucleic chain ahead of a protein shifted every column
-    const anyLetter = jobRequest.chainKinds.some((kind) => kind !== "protein");
-    const merged = (list) => (list.some(Boolean) ? (list.length === 1 ? fill(list)[0]
-      : mergeRowAlignedChainA3ms(fill(list), { anyLetter })) : null);
-    jobRequest.alignment = { unpaired: merged(inlineMsa.unpaired), paired: merged(inlineMsa.paired) };
-    jobRequest.msaColumnKinds = jobRequest.chainKinds.flatMap((kind, i) => Array(jobRequest.chains[i].length).fill(kind));
-    console.log(`job: inline alignments for ${inlineMsa.unpaired.filter(Boolean).length} chains (unpaired),`
-      + ` ${inlineMsa.paired.filter(Boolean).length} (paired)`);
+  if (job.alignments !== undefined) {
+    const { mergeJobAlignments } = await import(`${repo}/src/input/chains.js`);
+    const { alignment, msaColumnKinds } = mergeJobAlignments(job.alignments, jobRequest.chains, jobRequest.chainKinds);
+    jobRequest.alignment = alignment;
+    jobRequest.msaColumnKinds = msaColumnKinds;
+    console.log(`job: inline alignments for ${job.alignments.unpaired.filter(Boolean).length} chains (unpaired),`
+      + ` ${job.alignments.paired.filter(Boolean).length} (paired)`);
   }
   if (job.seed !== undefined) entries.push(["m", "job.seed", job.seed]);
   console.log(`job ${job.name ?? "(unnamed)"}: ${jobRequest.chains.length} chains (${jobRequest.chainKinds.join(", ")}),`

@@ -25,6 +25,7 @@ import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/af2/multimer/model.js";
 import { blankChainColumns, foldsAsSingleSequence, parseA3m }
   from "../src/input/a3m.js";
+import { mergeJobAlignments } from "../src/input/chains.js";
 import { planRecycleReuse } from "../src/af2/model/recycle-convergence.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
@@ -865,6 +866,17 @@ const predictions = new Map();
  * unpaired block, which reads back as a fold nobody ran.
  */
 function archiveMsas(chains, alignment) {
+  // 🔴 THE ARCHIVE WRITES `{unpaired, paired}` AND AN UPLOADED ARCHIVE IS HELD
+  // AS `{chainA3ms, pairedA3ms}`, so returning it whole wrote neither block and
+  // re-saving a fold made from a dropped archive lost its alignments. A job's
+  // own alignments are per chain already.
+  if (msaMode() === "upload" && uploadedMsas?.inline !== undefined) {
+    return { unpaired: uploadedMsas.inline.unpaired, paired: uploadedMsas.inline.paired };
+  }
+  if (msaMode() === "upload" && uploadedMsas?.chains > 0) {
+    return { unpaired: uploadedMsas.chainA3ms,
+             paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index)) };
+  }
   if (msaMode() === "upload" && uploadedMsas !== undefined) return uploadedMsas;
   if (msaMode() === "search" && searchCache?.raw !== undefined) {
     const { chainA3ms, pairedA3ms, single } = searchCache.raw;
@@ -2906,7 +2918,7 @@ const cheapHash = (text) => {
  */
 async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = [],
                            modifications = [], chainKinds = [], templates = [],
-                           modelLoad = undefined, family = "af3") {
+                           modelLoad = undefined, family = "af3", msaColumnKinds = undefined) {
   // 🔴 THE FOLD SAYS WHICH MODEL MADE IT, and this is not decoration. Two
   // bundles run this same function; a status line and an archive that both
   // read "AlphaFold 3" for an OpenBind fold are a record of the wrong
@@ -3148,6 +3160,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds,
+    ...(msaColumnKinds === undefined ? {} : { msaColumnKinds }),
     // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes
     // through it: a modified residue is one POSITION and ten TOKENS, so its
     // PAE and its contact map are wider than the structure they belong to and
@@ -4077,6 +4090,9 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
     // `controls["msa-text"]` already; a searched one the worker fetches itself.
     // An archive holds one alignment a chain and a Map of paired ones, which
     // JSON cannot carry; a bare a3m is the text in the box.
+    if (msaMode() === "upload" && uploadedMsas?.inline !== undefined) {
+      throw new Error("the job's own alignments fold on this machine only - fold it here, or set the MSA to search");
+    }
     if (msaMode() === "upload") {
       request.msas = uploadedMsas?.chains > 0
         ? { unpaired: uploadedMsas.chainA3ms,
@@ -4593,7 +4609,26 @@ async function fold(event) {
     // database this page has no server for. Either way the reader asked for an
     // alignment and is getting one for some of their chains, so the status line
     // says which.
-    if (nucleicCount > 0 && msaMode() !== "single") {
+    // 🔴 A JOB'S OWN ALIGNMENTS COVER EVERY POLYMER CHAIN, nucleic ones too, so
+    // they bypass the protein-only path below and reach the featuriser with
+    // each column's alphabet (mergeJobAlignments, the native exporter's too).
+    const inlineMsas = msaMode() === "upload" ? uploadedMsas?.inline : undefined;
+    if (inlineMsas !== undefined) {
+      if (!isAf3Family(family)) {
+        throw new Error("the job's own alignments are AlphaFold 3's - choose an AlphaFold 3-lineage model,"
+          + " or set the MSA to search");
+      }
+      // ...and only for the chains they were written for: an edited row is
+      // a different sequence, and its alignment would gap the wrong columns
+      [...inlineMsas.unpaired, ...inlineMsas.paired].forEach((text, at) => {
+        const chain = at % chains.length;
+        if (text && parseA3m(text, { anyLetter: true }).query.toUpperCase() !== chains[chain].toUpperCase()) {
+          throw new Error(`the job's alignment for chain ${chain + 1} is for a different sequence -`
+            + " load the job again, or set the MSA to search");
+        }
+      });
+    }
+    if (inlineMsas === undefined && nucleicCount > 0 && msaMode() !== "single") {
       const kinds = [...new Set(chainKinds.filter((kind) => kind !== "protein"))]
         .map((kind) => kind.toUpperCase()).join(" and ");
       status(proteinChains.length === 0
@@ -4605,8 +4640,18 @@ async function fold(event) {
     // sequence - the right message for an empty box, the wrong one for a job
     // that is already complete. A DNA-only fold is the same case: there is no
     // protein to search with, and no RNA database here to search instead.
-    const alignmentResult = proteinChains.length === 0
-      ? null : await alignmentText(proteinChains, signal, family, proteinWantsMsa);
+    let msaColumnKinds;
+    let alignmentResult;
+    if (inlineMsas !== undefined) {
+      const merged = mergeJobAlignments(inlineMsas, chains, chainKinds);
+      msaColumnKinds = merged.msaColumnKinds;
+      alignmentResult = { text: merged.alignment.unpaired ?? merged.alignment.paired, blocks: merged.alignment };
+      status(`Alignments from the job · ${inlineMsas.unpaired.filter(Boolean).length} unpaired,`
+        + ` ${inlineMsas.paired.filter(Boolean).length} paired`);
+    } else {
+      alignmentResult = proteinChains.length === 0
+        ? null : await alignmentText(proteinChains, signal, family, proteinWantsMsa);
+    }
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
     // A pasted or uploaded A3M is one text and cannot be split into blocks; it
@@ -4667,7 +4712,9 @@ async function fold(event) {
       template.source = best.target;
     }
     throwIfAborted(signal);
-    if (alignment !== null) {
+    // (a job's own alignments were checked chain by chain above, and cover the
+    // nucleic chains too, so this protein-only rule does not apply to them)
+    if (alignment !== null && inlineMsas === undefined) {
       // THE ALIGNMENT'S QUERY WINS. An A3M carries its own first record, and
       // folding the box's sequence against somebody else's alignment would be
       // folding two different proteins at once.
@@ -4747,7 +4794,7 @@ async function fold(event) {
     }
     if (isAf3Family(family)) {
       await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes,
-                        modifications, chainKinds, templateSources, modelLoad, family);
+                        modifications, chainKinds, templateSources, modelLoad, family, msaColumnKinds);
       return;
     }
 
@@ -5626,7 +5673,16 @@ function applyJob(job) {
       said.push(`seed ${job.seed}`);
     }
   }
-  if (job.singleSequence && modeSelect.value !== "none") {
+  if (job.alignments !== undefined) {
+    // 🔴 THE FILE'S OWN ALIGNMENTS, HELD AS AN UPLOAD. They are what AF3's data
+    // pipeline wrote for these chains; the dial says Upload so a search is not
+    // run over them, and loading another alignment replaces them.
+    uploadedMsas = { inline: job.alignments };
+    uploadedA3m = "";
+    modeSelect.value = "upload";
+    syncMode();
+    said.push("alignments from the file");
+  } else if (job.singleSequence && modeSelect.value !== "none") {
     modeSelect.value = "none";
     syncMode();
     said.push("MSA off");
@@ -5724,6 +5780,19 @@ async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
     }
     uploadedMsas = restored;
     uploadedA3m = "";
+    // 🔴 AN ARCHIVE OF A FOLD WITH NUCLEIC ALIGNMENTS (a job's own, written one
+    // file per fold chain) goes back the way it came: the archive path below
+    // merges PROTEIN chains for a search's pairing, and would count the RNA's
+    // file as a protein's
+    try {
+      const expanded = expandEntities(entityList.read());
+      if (restored.chains === expanded.chains.length && expanded.chainKinds.some((kind) => kind !== "protein")) {
+        uploadedMsas = { inline: {
+          unpaired: restored.chainA3ms.map((text) => text || null),
+          paired: expanded.chains.map((_, index) => restored.pairedA3ms.get(index) ?? null),
+        } };
+      }
+    } catch { /* rows that do not expand are reported when folded */ }
     const paired = restored.pairedA3ms.size;
     status(`archive · ${restored.chains} chain${restored.chains === 1 ? "" : "s"}`
       + `${paired > 0 ? `, ${paired} with paired rows` : ", no paired rows"}`

@@ -357,8 +357,10 @@ describe("what it refuses, and what it names", () => {
     ["ring closure", open([{ ligand: { id: "B", smiles: "C1CC" } }])],
     ["unpairedMsaPath", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
                                            unpairedMsaPath: "/tmp/a.a3m" } }])],
-    ["unpairedMsa", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
-                                       unpairedMsa: ">q\nACDEFGHIK\n" } }])],
+    // (an alignment carried inline is held now - see test/af3-example-jobs.test.js - and
+    // only one that is not text is refused)
+    ["unpairedMsa is A3M text", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
+                                                   unpairedMsa: 5 } }])],
     ["queryIndices", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
       templates: [{ mmcif: "data_T", queryIndices: [0, 1] }] } }])],
     ["mmcifPath", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
