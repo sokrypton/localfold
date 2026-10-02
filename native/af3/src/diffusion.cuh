@@ -545,7 +545,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     if constexpr (std::is_same_v<T, half>) {
       // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate;
       // the samples are its batch rows, the pair bias shared
-      flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, maskRows, o, n, heads, D, 0, NS, false,
+      flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, MASK_ALL_ONES && n > 192 ? nullptr : maskRows, o, n, heads, D, 0, NS, false,
                       1.f / sqrtf((float)D), W(B + ".qBias"));
     } else {
       addQBiasTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), (int)rows, Wd);

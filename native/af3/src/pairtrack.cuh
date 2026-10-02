@@ -297,7 +297,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);
         gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias);
         half* gathered = scratch<half>("grid.gathered", pairs * Wd);
-        flashGrid<half>(qkvgOut, bias, stride, mask, gathered, n, heads, D, 0, n, tr, scale);
+        flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
         if (!tr) linear<half, float>(gathered, pair, pairs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", pair, n, 0, pairs, tr);
         return;
@@ -312,7 +312,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         half* qkvgOut = scratch<half>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
         gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
         half* gathered = scratch<half>("grid.gathered", prs * Wd);
-        flashGrid<half>(qkvgOut, bias, stride, mask, gathered, n, heads, D, r0, rows, tr, scale);
+        flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
         if (!tr) linear<half, float>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", pair, n, r0 * n, prs, tr);
       }

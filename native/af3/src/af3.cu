@@ -35,6 +35,8 @@ int main(int argc, char** argv) {
   }
   auto t0 = std::chrono::steady_clock::now();
   M.load(argv[1]); DATA_DIR = argv[1];
+  { const float* sm = M.f("batch.seqMask"); size_t k = M.len("batch.seqMask"); MASK_ALL_ONES = true;
+    for (size_t i = 0; i < k; ++i) if (!(sm[i] > 0)) MASK_ALL_ONES = false; }
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;
   if (!seedGiven && M.has("job.seed")) seed = (uint64_t)M.meta("job.seed");   // the job's own modelSeeds[0]

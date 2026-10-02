@@ -12,6 +12,9 @@
 #include <cstdint>
 
 constexpr float LOG2E = 1.4426950408889634f;
+// every token real (the batch's sequence mask all ones), so attention masks are all ones too and
+// the flash kernels can skip them; set from the batch
+inline bool MASK_ALL_ONES = false;
 
 __device__ __forceinline__ void mma16816(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -44,8 +47,10 @@ template <int D, int WARPS> __host__ __device__ constexpr size_t faStage() {
 }
 
 // mask[r * n + j] (rows) or mask[j * n + r] (columns): the KEY's mask, the pair mask
-// transposed for the column direction; -1e9 where it is zero.
-template <int D, int WARPS>
+// transposed for the column direction; -1e9 where it is zero. MASKED false: every key is real
+// (a protein with no padding - the mask is all ones), so no mask is loaded or added and only the
+// last tile masks the keys past n (3-7% of this kernel).
+template <int D, int WARPS, bool MASKED = true>
 __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, const float* __restrict__ mask, half* __restrict__ out, int n, int heads, size_t r0, bool tr, float scale,
     const float* qBias) {
@@ -73,7 +78,7 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
       bool ok = i < n && j < n;
       cpAsync16(B + qi * LDB + c, bias + ((size_t)h * n + (i < n ? i : 0)) * biasStride + (ok ? j : 0), ok);
     }
-    if (threadIdx.x < BK) {
+    if (MASKED && threadIdx.x < BK) {
       int j = j0 + threadIdx.x;
       Mst(st)[threadIdx.x] = j < n ? (mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f)
                                    : -INFINITY;
@@ -120,8 +125,13 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
       int jj = nt * 8 + tig * 2;
       float2 u = __half22float2(*reinterpret_cast<const half2*>(br0 + jj));
       float2 v = __half22float2(*reinterpret_cast<const half2*>(br1 + jj));
-      sv[nt][0] += u.x + Ms[jj]; sv[nt][1] += u.y + Ms[jj + 1];
-      sv[nt][2] += v.x + Ms[jj]; sv[nt][3] += v.y + Ms[jj + 1];
+      float ma = 0.f, mb = 0.f;
+      if (MASKED) { ma = Ms[jj]; mb = Ms[jj + 1]; }
+      else if (tile == tiles - 1) {
+        int jg = tile * BK + jj; ma = jg < n ? 0.f : -INFINITY; mb = jg + 1 < n ? 0.f : -INFINITY;
+      }
+      sv[nt][0] += u.x + ma; sv[nt][1] += u.y + mb;
+      sv[nt][2] += v.x + ma; sv[nt][3] += v.y + mb;
       t0 = fmaxf(t0, fmaxf(sv[nt][0], sv[nt][1])); t1 = fmaxf(t1, fmaxf(sv[nt][2], sv[nt][3]));
     }
     t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
@@ -353,10 +363,10 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
   }
 }
 
-template <int D, int WARPS> void setFlashSmem() {
+template <int D, int WARPS, bool MASKED> void setFlashSmem() {
   static bool done = false;
   if (!done) {
-    CK(cudaFuncSetAttribute(flashGridHalf<D, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    CK(cudaFuncSetAttribute(flashGridHalf<D, WARPS, MASKED>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                             (int)(2 * faStage<D, WARPS>())));
     done = true;
   }
@@ -366,9 +376,16 @@ inline bool FLASH_SPLIT = true;
 template <int D, int WARPS>
 void flashGridHalfAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
                      int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias) {
-  setFlashSmem<D, WARPS>();
-  flashGridHalf<D, WARPS><<<dim3((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads)), 32 * WARPS,
-                            2 * faStage<D, WARPS>(), STREAM>>>(qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+  dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
+  if (mask) {                    // a null mask: every key real (see MASKED)
+    setFlashSmem<D, WARPS, true>();
+    flashGridHalf<D, WARPS, true><<<grid, 32 * WARPS, 2 * faStage<D, WARPS>(), STREAM>>>(
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+  } else {
+    setFlashSmem<D, WARPS, false>();
+    flashGridHalf<D, WARPS, false><<<grid, 32 * WARPS, 2 * faStage<D, WARPS>(), STREAM>>>(
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+  }
 }
 template <int D>
 void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
@@ -381,7 +398,7 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // too few blocks to fill the device: split each 16 queries' keys over four warps instead.
   // Measured at 16 heads, D 48: 9.3 against 14.7 us at 68 tokens, 13.4/19.5 at 192, and worse
   // from 256 (22.8/21.5), where the merge outweighs the parallelism.
-  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && n <= 192 && rows * heads * ((n + 63) / 64) < 4 * 108) {
+  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && mask && n <= 192 && rows * heads * ((n + 63) / 64) < 4 * 108) {
     flashSplitHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     return;
   }
