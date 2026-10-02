@@ -275,6 +275,18 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
 - **cuBLAS split-K by batching the K slices** for the denoiser's N = 768 projections: 1-4 us a
   block, less than the consumers' extra reads would cost.
 
+- **Hand-written skinny GEMMs for the denoiser's 68-row projections**, three designs: split over K
+  with per-slice f32 partials (the consumers to sum them) - 5.2 / 6.7 us against cuBLAS's 8.2 /
+  10.8 for the N = 768 projections, but no better for N = 3072, so ~5% of a 68-token fold after
+  the consumers' extra reads; the same, pipelined - no faster; no split, every block streaming its
+  columns' weights over the whole K - 15 against 9 us, each block re-reading all of X from L2.
+  cuBLAS's own tiling and split-K searches (781 configurations) found nothing faster either.
+- **The outer product mean's product straight into the output GEMM's layout** (a strided-batched
+  GEMM over query tokens, the output weight's rows permuted to match): its m = 32 tiling ran
+  0.84 ms a call against 0.5 for the GEMM and permute it replaced.
+- **Grid attention without bounds checks** (inputs padded so loads past n read finite values):
+  7.22 against 6.89 ms - at 125 registers the kernel is one register from losing a block an SM.
+
 ## What the grid attention's time was
 
 Without a profiler on this box, by counting SASS: the kernel issued ~800 integer instructions a
