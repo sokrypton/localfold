@@ -10,9 +10,12 @@
 //               i ref_space_uid atom_to_token
 //   the tower   i lm/ids lm/sequence_id (BOS/EOS per chain) lm/token_to_row (-1: not a protein token)
 //   m meta/tokens, meta/atoms, meta/lm_rows, meta/classes
+// and pdb.template beside them: the page's PDB records, each atom's index where its coordinates go
 import { writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 import { featuriseForEsmfold2, languageModelInput } from "../../src/esmfold2/featurise.js";
 import { representativeAtoms } from "../../src/esmfold2/fold.js";
+import { toDensePositions } from "../../src/esmfold2/featurise.js";
+import { toPdb } from "../../src/af3/fold.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -54,4 +57,12 @@ for (const [kind, name, value] of entries) {
 closeSync(fd);
 writeFileSync(`${out}/model.idx.tmp`, lines.join("\n") + "\n");
 renameSync(`${out}/model.idx.tmp`, `${out}/model.idx`);
+// the structure's records, from the page's own writer (residue and atom names, chains, HETATM, CONECT),
+// with each atom's INDEX where its coordinates go - x = index / 1000, y = index % 1000 - for the
+// native fold to substitute (pdb.template)
+{
+  const coordinates = new Float32Array(A * 3);
+  for (let atom = 0; atom < A; atom += 1) { coordinates[atom * 3] = Math.floor(atom / 1000); coordinates[atom * 3 + 1] = atom % 1000; }
+  writeFileSync(`${out}/pdb.template`, toPdb(f.batch, toDensePositions(f, coordinates)) + "\n");
+}
 console.log(`${T} tokens, ${A} atoms (${f.liveAtoms} live), ${lm.ids.length} tower rows -> ${out}`);

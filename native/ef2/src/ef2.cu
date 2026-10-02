@@ -6,6 +6,7 @@
 #include "esmc.cuh"
 #include "atoms.cuh"
 #include "trunk.cuh"
+#include "sampler.cuh"
 
 __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, int T, int states, int k, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -16,14 +17,19 @@ __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, 
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
-  std::string weights, oracle, out = "fold.pdb";
+  std::string weights, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strcmp(argv[i], "--atom-f32")) ATOM_BF16 = false;
-    else if (!strncmp(argv[i], "--inputs-window=", 16)) INPUTS_HALF_WINDOW = atoi(argv[i] + 16) / 2;   // 128: biohub's
+    else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
+    else if (!strncmp(argv[i], "--steps=", 8)) sampler.steps = atoi(argv[i] + 8);
+    else if (!strncmp(argv[i], "--inputs-window=", 16)) {           // 128: biohub's (the default); 0: dense
+      int w = atoi(argv[i] + 16);
+      INPUTS_HALF_WINDOW = w > 0 ? w / 2 : 1 << 30;
+    }
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (weights.empty()) { fprintf(stderr, "--weights=<dir> (native/ef2/export_weights.mjs)\n"); return 1; }
@@ -77,6 +83,25 @@ int main(int argc, char** argv) {
   float* dg = dalloc((size_t)T * T * (int)M.meta("meta/distogramBins"));
   distogram(z, T, C, dg);
   if (check) checkOracle("distogram", dg, (size_t)T * T * (int)M.meta("meta/distogramBins"), "o/distogram");
+  float* relPos = scratch<float>("zi.rel", (size_t)T * T * C);     // zInit's relative position encoding, kept
+  Denoiser dn = makeDenoiser(T, A, z, relPos, sInputs, check);
+  if (check && M.has("o/step0/x_noisy")) {
+    float* xn0 = upload(M.f("o/step0/x_noisy"), (size_t)A * 3); float* xd0 = dalloc((size_t)A * 3);
+    float t = (float)M.meta("o/step0/t_hat");
+    denoise(dn, xn0, t, xd0, true);
+    checkOracle("denoiser, step 0", xd0, (size_t)A * 3, "o/step0/x_denoised");
+    int last = (int)M.meta("o/steps") - 1;
+    std::string k = "o/step" + std::to_string(last);
+    CK(cudaMemcpy(xn0, M.f(k + "/x_noisy"), (size_t)A * 12, cudaMemcpyHostToDevice));
+    denoise(dn, xn0, (float)M.meta(k + "/t_hat"), xd0);
+    checkOracle(("denoiser, step " + std::to_string(last)).c_str(), xd0, (size_t)A * 3, k + "/x_denoised");
+  }
+  t0 = std::chrono::steady_clock::now();
+  int stepsRun = 0;
+  std::vector<float> coords = sample(dn, sampler, seed, &stepsRun);
+  printf("sampler %.1f ms (%d steps)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stepsRun);
+  writePdb(std::string(argv[1]) + "/pdb.template", out, coords);
+  printf("-> %s\n", out.c_str());
   if (getenv("EF2_DUMP")) { auto h = download(sInputs, (size_t)T * Si); FILE* f = fopen(getenv("EF2_DUMP"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f); }
   return 0;
 }

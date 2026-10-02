@@ -238,9 +238,12 @@ inline Atoms prepareAtoms(int A, const std::string& prefix) {
 }
 
 // the inputs embedder: s_inputs [T, 451] = [pool(relu(stack(c0) @ toToken)) | aatype | profile | deletion mean]
-// halfWindow: dense (1 << 30) is the page's reading (Synthyra's fastplms never windows this stage);
-// 64 is biohub's esm package, which windows every atom stack - see docs/EF2FAST.md
-inline int INPUTS_HALF_WINDOW = 1 << 30;
+// halfWindow 64 is biohub's esm package - the vendor's code, which windows every atom stack (flash-attn
+// window_size=(64, 64) on CUDA, the rank mask on the CPU). Dense is the page's reading, from Synthyra's
+// fastplms, which never windows this stage (docs/EF2FAST.md); --inputs-window=0 is that arm. Measured
+// natively against the crystals, neither reading wins everywhere: 6MRR 0.92 A windowed against 1.59
+// dense (five seeds), 1QYS 0.89 against 0.94, 5CAJ 2.10 against 1.86 (three)
+inline int INPUTS_HALF_WINDOW = 64;
 inline void inputsEmbedder(int T, int A, float* sInputs, int sWidth, bool check = false) {
   Atoms at = prepareAtoms(A, "atom");
   if (check) checkOracle("atom norm (c0)", at.c0, (size_t)A * at.ctx.C, "o/atom/norm");
