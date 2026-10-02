@@ -1,7 +1,12 @@
 """CA RMSD of a predicted PDB against a reference, after Kabsch superposition, plus the chain
 check every fold tool here asserts (consecutive CA about 3.8 A).
 
-    python3 native/af3/score.py <predicted.pdb> [reference.pdb]
+    python3 native/af3/score.py <predicted.pdb> [reference.pdb] [reference chain]
+    python3 native/af3/score.py <predicted.pdb> <reference.pdb> A,D    # a complex
+
+For a complex the predicted chains A, B, ... pair with the listed reference chains in order, one
+superposition over all of them (two chains can each be right and placed wrongly), each chain
+also re-fitted alone.
 """
 import sys
 import numpy as np
@@ -25,12 +30,14 @@ def ca(path, chain=None):
 
 
 def paired(pred, ref):
-    """The residue-number offset that matches the most residue names, and the CA pairs."""
-    best = max(range(-400, 401), key=lambda o: sum(
-        1 for k, (name, _) in pred.items() if k + o in ref and ref[k + o][0] == name))
-    keys = [k for k in pred if k + best in ref and ref[k + best][0] == pred[k][0]]
-    return (np.array([pred[k][1] for k in keys]), np.array([ref[k + best][1] for k in keys]),
-            [pred[k][1] for k in sorted(pred)])
+    """CA pairs by aligning the two chains' residue-name sequences (a gap or a numbering jump in
+    the reference shifts no residue), and the predicted chain's CAs in order."""
+    import difflib
+    pk, rk = sorted(pred), sorted(ref)
+    match = difflib.SequenceMatcher(None, [pred[k][0] for k in pk], [ref[k][0] for k in rk], autojunk=False)
+    pairs = [(pk[a + i], rk[b + i]) for a, b, size in match.get_matching_blocks() for i in range(size)]
+    return (np.array([pred[i][1] for i, _ in pairs]), np.array([ref[j][1] for _, j in pairs]),
+            [pred[k][1] for k in pk])
 
 
 def kabsch_rmsd(p, q):
@@ -42,8 +49,19 @@ def kabsch_rmsd(p, q):
     return float(np.sqrt(((p @ r - q) ** 2).sum(1).mean()))
 
 
+refChains = sys.argv[3].split(",") if len(sys.argv) > 3 else [None]
+if len(refChains) > 1:
+    ps, rs, alone = [], [], []
+    for k, rc in enumerate(refChains):
+        pk, rk, order = paired(ca(sys.argv[1], "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[k]), ca(sys.argv[2], rc))
+        steps = np.linalg.norm(np.diff(np.array(order), axis=0), axis=1)
+        alone.append(f"{rc} {kabsch_rmsd(pk, rk):.3f} A over {len(pk)} (CA-CA median {np.median(steps):.3f})")
+        ps.append(pk); rs.append(rk)
+    print(f"complex CA RMSD {kabsch_rmsd(np.concatenate(ps), np.concatenate(rs)):.3f} A over "
+          f"{sum(len(x) for x in ps)}; alone: " + ", ".join(alone))
+    sys.exit(0)
 p, r, chainOrder = paired(ca(sys.argv[1]), ca(sys.argv[2] if len(sys.argv) > 2 else "tools/fixtures/6mrr-crystal.pdb",
-                                              sys.argv[3] if len(sys.argv) > 3 else None))
+                                              refChains[0]))
 steps = np.linalg.norm(np.diff(np.array(chainOrder), axis=0), axis=1)
 print(f"CA RMSD {kabsch_rmsd(p, r):.3f} A over {len(p)}   "
       f"CA-CA median {np.median(steps):.3f} min {steps.min():.3f} max {steps.max():.3f}")

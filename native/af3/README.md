@@ -104,8 +104,16 @@ mainchain 0.033-0.034 throughout.
 `--template=<pdb or cif>:<chain>[@<query chain>]` (comma-separated, up to four slots) builds each
 slot with the page's own `buildTemplate` and its geometry with the reference's `templateGeometry`;
 the trunk adds the distogram, masks and unit vectors per real slot and counts the empty ones.
-5CAJ from its sequence alone: 21.75 A, pLDDT 29.2; with its own crystal as a template **0.200 A**,
-pLDDT 94.7 (WebGPU AlphaFold 3: 0.281).
+Parts joined by `+` share one slot, as AF3 puts each chain's k-th template in slot k
+(`1brs.pdb:A@0+1brs.pdb:D@1`); that slot may speak across its chains (`--no-span-chains` masks it).
+
+| target | no template | self-template |
+|---|---|---|
+| 5CAJ, single sequence | 21.75 A, pLDDT 29.2 | **0.139 A**, pLDDT 95.2 (WebGPU AF3 0.281) |
+| 1BRS barnase-barstar, single sequence | 16.15 A complex, ipTM 0.07 | **0.493 A** merged slot, ipTM 0.94 (WebGPU AF3 0.475); per-chain slots 0.513 |
+
+`score.py <pred> <ref> A,D` scores a complex: one superposition over all chains, each chain also
+alone, residues paired by aligning the sequences (a numbering gap in the reference shifts nothing).
 
 ## Not ported yet
 

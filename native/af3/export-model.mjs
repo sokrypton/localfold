@@ -114,34 +114,48 @@ if (sequence !== "") {
 }
 add("batch", batch);
 // --template=<pdb or cif>:<chain>[@<query chain index>], comma-separated, one slot each (at most
-// four): built by the page's own buildTemplate, and the geometry features (distogram, pseudo-beta
-// mask, unit vectors, backbone mask) by the reference's templateGeometry.
+// four); parts joined by "+" share ONE slot, as AF3 puts each chain's k-th template in slot k -
+// e.g. 1brs.pdb:A@0+1brs.pdb:D@1 - and that merged slot may speak across the chains it covers
+// (--no-span-chains masks the cross-chain block). Each part is built by the page's own
+// buildTemplate, the geometry features by the reference's templateGeometry.
 const templateSpecs = option("template", "").split(",").filter(Boolean);
 if (templateSpecs.length > 4) throw new Error("at most four template slots");
 if (templateSpecs.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);
   const { templateGeometry, multichainMaskFor, coverageOf } =
     await import(`${repo}/src/af3/featurise/template-features.js`);
+  const { mergeTemplateSlots } = await import(`${repo}/src/af3/featurise/template-input.js`);
   const chains = sequence.split(":");
+  // which token each chain's residue occupies (a modified residue or ligand shifts them)
+  const tokenOfResidue = new Int32Array(batch.chainOfResidue.length).fill(-1);
+  batch.residueOfToken.forEach((residue, token) => {
+    if (residue >= 0 && tokenOfResidue[residue] === -1) tokenOfResidue[residue] = token;
+  });
+  const residuesOfChain = [];
+  Array.from(batch.chainOfResidue).forEach((chain, residue) => (residuesOfChain[chain] ??= []).push(residue));
   templateSpecs.forEach((spec, k) => {
-    const [where, target = "0"] = spec.split("@");
-    const cut = where.lastIndexOf(":");
-    const path = where.slice(0, cut), chain = where.slice(cut + 1);
-    const index = Number(target);
-    const offset = Array.from(batch.asymId).indexOf(index + 1);
-    const built = buildTemplate({ text: readFileSync(path, "utf8"), chain, query: chains[index],
-                                  tokens: batch.tokens, offset, minConfidence: 0 });
-    const slot = built.slot;
+    const parts = spec.split("+").map((part) => {
+      const [where, target = "0"] = part.split("@");
+      const cut = where.lastIndexOf(":");
+      const path = where.slice(0, cut), chain = where.slice(cut + 1), index = Number(target);
+      const built = buildTemplate({
+        text: readFileSync(path, "utf8"), chain, query: chains[index], tokens: batch.tokens, minConfidence: 0,
+        tokenOf: (residue) => tokenOfResidue[(residuesOfChain[index] ?? [])[residue] ?? -1] ?? -1,
+      });
+      console.log(`template ${k}: ${path} chain ${chain} -> query chain ${index},`
+        + ` ${built.coverage.residues}/${built.coverage.of} residues`);
+      return built.slot;
+    });
+    const slot = parts.length === 1 ? parts[0] : mergeTemplateSlots(parts);
+    const spanChains = parts.length > 1 && !args.includes("--no-span-chains");
     const mask = multichainMaskFor(batch.asymId, batch.tokens,
-                                   { coverage: coverageOf(slot, batch.tokens), spanChains: false });
+                                   { coverage: coverageOf(slot, batch.tokens), spanChains });
     const g = templateGeometry(slot, mask, batch.tokens);
     add(`template.${k}.aatype`, Int32Array.from(slot.aatype));
     add(`template.${k}.distogram`, Float32Array.from(g.distogram));
     add(`template.${k}.pseudoBetaMask2d`, g.pseudoBetaMask2d);
     add(`template.${k}.unitVector`, g.unitVector);
     add(`template.${k}.backboneMask2d`, g.backboneMask2d);
-    console.log(`template ${k}: ${path} chain ${chain} -> query chain ${index},`
-      + ` ${built.coverage.residues}/${built.coverage.of} residues`);
   });
   add("template.count", templateSpecs.length);
 }
