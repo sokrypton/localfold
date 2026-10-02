@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-347 tools. `tools/fixtures/` is data and is not listed.
+349 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (193)
+## `tools/gpu/` - the WebGPU lane (195)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -151,6 +151,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-designed-binder-sampler.js`** - Which sampler configuration folds a DESIGNED BINDER onto its target?
 - **`probe-dispatch-aliasing.js`** - Does any dispatch bind the SAME buffer range twice?
 - **`probe-dispatch.js`** - What a dispatch costs before it computes anything.
+- **`probe-driver-memory.js`** - What the GPU driver holds beyond the buffers WebGPU has live.
 - **`probe-esmfold2-confidence.js`** - Can the distogram score the structure the sampler drew, per residue?
 - **`probe-esmfold2-msa-profile.js`** - Can EF2-fast use an MSA?
 - **`probe-esmfold2-trajectory.js`** - What a trajectory frame should BE: the sampler's state, or the model's guess?
@@ -164,6 +165,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-latency.js`** - Why the kernels sit at 270 billion instructions a second and the probe says 640: what the machine is waiting for, one variable at a time.
 - **`probe-ligand-flow.js`** - Where does a ligand's geometry actually resolve, and how few steps after it?
 - **`probe-limits.js`** - What is the largest protein this device can hold, and where does it stop?
+- **`probe-live-buffers.js`** - Every buffer a fold actually creates, against what the memory budget counts.
 - **`probe-load-dial.js`** - Does the download dial's fraction actually reach 1?
 - **`probe-matrix-ceiling.js`** - What do this device's subgroup matrix units ISSUE at, with the operands already in registers?
 - **`probe-memory.js`** - Where the HOST memory of a fold goes.
