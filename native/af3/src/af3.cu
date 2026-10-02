@@ -99,7 +99,9 @@ int main(int argc, char** argv) {
   auto runInput = [&](size_t which) -> int {
   if (waitInput) {          // the exporter writes model.idx last, by a rename
     std::string idx = inputs[which] + "/model.idx";
+    std::string failed = inputs[which] + "/model.failed";     // the wrapper's word that the export died
     for (int k = 0; access(idx.c_str(), R_OK) != 0; ++k) {
+      if (access(failed.c_str(), F_OK) == 0) { fprintf(stderr, "af3: the input's export failed\n"); return 1; }
       if (k > 600000) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
       usleep(1000);
     }

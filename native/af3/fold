@@ -111,7 +111,9 @@ if [ -z "$batch" ]; then
   # the input's index, which the exporter writes last
   run_af3 "$tmp" "$out" &
   pid=$!
-  if ! "${node[@]}" "$tmp" --no-weights --bundle="$bundle" "${inputs[@]}"; then kill $pid 2>/dev/null; exit 1; fi
+  # a failed export tells the waiting af3 so (killing $pid would reach only the subshell, leaving af3
+  # waiting on an input that will never come, holding this script's stdout open)
+  if ! "${node[@]}" "$tmp" --no-weights --bundle="$bundle" "${inputs[@]}"; then touch "$tmp/model.failed"; wait $pid; exit 1; fi
   wait $pid
   exit
 fi
@@ -128,6 +130,9 @@ run_af3 "$(IFS=,; echo "${dirs[*]}")" "$(IFS=,; echo "${outs[*]}")" &
 pid=$!
 for ((k = 0; k < ${#dirs[@]}; ++k)); do
   eval "set -- ${lines[$k]}"
-  if ! "${node[@]}" "${dirs[$k]}" --no-weights --bundle="$bundle" "${@:2}" "${inputs[@]}"; then kill $pid 2>/dev/null; exit 1; fi
+  # (the inputs before a failed export still fold; af3 stops at the failed one, as it would at a bad fold)
+  if ! "${node[@]}" "${dirs[$k]}" --no-weights --bundle="$bundle" "${@:2}" "${inputs[@]}"; then
+    mkdir -p "${dirs[$k]}"; touch "${dirs[$k]}/model.failed"; wait $pid; exit 1
+  fi
 done
 wait $pid
