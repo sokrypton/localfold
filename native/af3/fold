@@ -43,10 +43,22 @@ fi
 node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")
 [ -f "$weights/model.idx" ] || "${node[@]}" "$weights" --weights-only --bundle="$bundle"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+# af3 with its output read to the end: on success its last line is "af3: done" and it closes
+# stdout, so this returns while the driver is still releasing its device memory (a quarter second);
+# without the line (an error) it waits for the exit status
+run_af3() {
+  local done=0 line
+  exec 4< <("$here/af3" "$1" --weights="$weights" --fold --fast --out="$2" --wait-input --detach-output "${foldflags[@]}"; echo "af3: exit $?")
+  while IFS= read -r line <&4; do
+    case "$line" in "af3: done") done=1; break ;; "af3: exit "*) exec 4<&-; return "${line#af3: exit }" ;; *) printf '%s\n' "$line" ;; esac
+  done
+  exec 4<&-
+  [ $done = 1 ]
+}
 if [ -z "$batch" ]; then
   # af3 starts first - the CUDA context and the weights' upload overlap the export - and waits for
   # the input's index, which the exporter writes last
-  "$here/af3" "$tmp" --weights="$weights" --fold --fast --out="$out" --wait-input "${foldflags[@]}" &
+  run_af3 "$tmp" "$out" &
   pid=$!
   if ! "${node[@]}" "$tmp" --no-weights --bundle="$bundle" "${inputs[@]}"; then kill $pid 2>/dev/null; exit 1; fi
   wait $pid
@@ -61,8 +73,7 @@ while read -r line; do
 done < "$batch"
 [ ${#dirs[@]} -gt 0 ] || { echo "no inputs in $batch" >&2; exit 1; }
 # af3 folds each input as soon as its export lands, while the later ones are still exporting
-"$here/af3" "$(IFS=,; echo "${dirs[*]}")" --weights="$weights" --fold --fast --wait-input \
-  --out="$(IFS=,; echo "${outs[*]}")" "${foldflags[@]}" &
+run_af3 "$(IFS=,; echo "${dirs[*]}")" "$(IFS=,; echo "${outs[*]}")" &
 pid=$!
 for ((k = 0; k < ${#dirs[@]}; ++k)); do
   eval "set -- ${lines[$k]}"

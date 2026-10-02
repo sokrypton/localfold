@@ -376,6 +376,11 @@ int main(int argc, char** argv) {
   }
   return 0;
   };
+  // --detach-output: the last line is "af3: done" and stdout closes, so a caller reading it to its
+  // end can return while the driver releases this process's device memory (0.25 s, the rest of the
+  // exit); native/af3/fold does
+  bool detach = false;
+  for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--detach-output")) detach = true;
   for (size_t which = 0; which < inputs.size(); ++which) {
     int seg = (int)M.segs.size();
     int code = runInput(which);
@@ -387,5 +392,6 @@ int main(int argc, char** argv) {
       forgetEntries(M.unload(seg));
     }
   }
+  if (detach) { printf("af3: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
   return 0;
 }

@@ -171,8 +171,10 @@ alone, residues paired by aligning the sequences (a numbering gap in the referen
 fold after the first skips CUDA's start-up, the weight upload and the first fold's warm-up, and
 each input folds as soon as its export lands - three folds in 2.4 s where three commands take 4.4.
 Each input's outputs are byte-identical to folding it alone. A single `fold` command starts `af3`
-before the export too (`--wait-input`), so the CUDA context and the weight upload overlap it: 6MRR
-is 1.47 s a command, of which the fold is 0.64.
+before the export too (`--wait-input`), so the CUDA context and the weight upload overlap it, and
+returns once the outputs are written rather than after the driver has released the process's
+device memory (`--detach-output`: a quarter second): 6MRR is 1.20 s a command, of which the fold is
+0.64.
 
 ## The gate
 
