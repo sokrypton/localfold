@@ -124,6 +124,7 @@ inline void attention(int D, const float* q, const float* k, const float* v, con
   float scale = 1.f / sqrtf((float)D);
   if (D == 32) attentionK<32><<<grid, 256, 0, STREAM>>>(q, k, v, g, keyMask, pairBias, out, Bt, n, H, scale);
   else if (D == 8) attentionK<8><<<grid, 256, 0, STREAM>>>(q, k, v, g, keyMask, pairBias, out, Bt, n, H, scale);
+  else if (D == 16) attentionK<16><<<grid, 256, 0, STREAM>>>(q, k, v, g, keyMask, pairBias, out, Bt, n, H, scale);
   else { fprintf(stderr, "attention: no kernel for head width %d\n", D); exit(1); }
 }
 // add the gate's bias [H*D] to g, a [rows, H*D] block with row stride `ld`

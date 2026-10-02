@@ -201,12 +201,13 @@ inline void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, fl
   addK2<<<blocks(rows * C), 256, 0, STREAM>>>(msa, tr, rows * C);
 }
 inline void transition(float* x, size_t rows, int C, const std::string& T, int blk) {
+  int I = (int)dimW(T + "/transition1/weights", blk < 0 ? 1 : 2);     // 4C in the stacks, 2C in the template's
   float* xn = scratch<float>("tr.xn", rows * C);
-  float* mid = scratch<float>("tr.mid", rows * C * 4);
+  float* mid = scratch<float>("tr.mid", rows * I);
   float* out = scratch<float>("tr.out", rows * C);
   layerNorm(x, xn, rows, C, T + "/input_layer_norm", blk);
-  linearB(xn, T + "/transition1", blk, mid, rows, C, 4 * C, true);
-  linearB(mid, T + "/transition2", blk, out, rows, 4 * C, C);
+  linearB(xn, T + "/transition1", blk, mid, rows, C, I, true);
+  linearB(mid, T + "/transition2", blk, out, rows, I, C);
   addK2<<<blocks(rows * C), 256, 0, STREAM>>>(x, out, rows * C);
 }
 inline void outerProductMean(Trunk& t, const std::string& S, int blk, const float* msa, int rowsN, int C,
@@ -255,16 +256,17 @@ __global__ void gateMulAddK(float* pair, const float* out, const float* gate, si
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n) pair[t] += out[t] / (1.f + __expf(-gate[t]));
 }
-inline void triangleMultiplication(Trunk& t, const std::string& S, int blk, bool outgoing) {
-  int L = t.L; size_t pairs = (size_t)L * L; const int C = 128;
+inline void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
+                                   bool outgoing) {
+  size_t pairs = (size_t)L * L;
   std::string T = S + (outgoing ? "triangle_multiplication_outgoing" : "triangle_multiplication_incoming");
   float* xn = scratch<float>("tri.xn", pairs * C);
-  layerNorm(t.pair, xn, pairs, C, T + "/left_norm_input", blk);
+  layerNorm(pair, xn, pairs, C, T + "/left_norm_input", blk);
   float* proj = scratch<float>("tri.proj", pairs * 2 * C); float* gate = scratch<float>("tri.gate", pairs * 2 * C);
   linearB(xn, T + "/projection", blk, proj, pairs, C, 2 * C);
   linearB(xn, T + "/gate", blk, gate, pairs, C, 2 * C);
   float* a = scratch<float>("tri.a", pairs * C); float* b = scratch<float>("tri.b", pairs * C);
-  triSplitK<<<blocks(pairs * 2 * C), 256, 0, STREAM>>>(proj, gate, t.pairMask, a, b, L, C);
+  triSplitK<<<blocks(pairs * 2 * C), 256, 0, STREAM>>>(proj, gate, pairMask, a, b, L, C);
   float* prod = scratch<float>("tri.prod", pairs * C);
   const float one = 1.f, zero = 0.f;
   // per channel (row-major [i][k] planes): outgoing act[i,j] = sum_k a[i,k] b[j,k] = a b^T;
@@ -283,15 +285,16 @@ inline void triangleMultiplication(Trunk& t, const std::string& S, int blk, bool
   linearB(cn, T + "/output_projection", blk, out, pairs, C, C);
   float* g = scratch<float>("tri.g", pairs * C);
   linearB(xn, T + "/gating_linear", blk, g, pairs, C, C);
-  gateMulAddK<<<blocks(pairs * C), 256, 0, STREAM>>>(t.pair, out, g, pairs * C);
+  gateMulAddK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, out, g, pairs * C);
 }
-inline void triangleAttention(Trunk& t, const std::string& S, int blk, bool starting) {
-  int L = t.L; size_t pairs = (size_t)L * L; const int C = 128;
+inline void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
+                              bool starting) {
+  size_t pairs = (size_t)L * L;
   std::string A = S + (starting ? "triangle_attention_starting_node" : "triangle_attention_ending_node");
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3);
-  float* x = t.pair; float* mask = t.pairMask;
+  const float* x = pair; const float* mask = pairMask;
   float* tr = scratch<float>("tatt.tr", pairs * C); float* mt = scratch<float>("tatt.mask", pairs);
-  if (!starting) { swap01(t.pair, tr, L, L, C); swap01(t.pairMask, mt, L, L, 1); x = tr; mask = mt; }
+  if (!starting) { swap01(pair, tr, L, L, C); swap01(pairMask, mt, L, L, 1); x = tr; mask = mt; }
   float* xn = scratch<float>("tatt.xn", pairs * C);
   layerNorm(x, xn, pairs, C, A + "/query_norm", blk);
   float* proj = scratch<float>("tatt.proj", pairs * H);
@@ -301,7 +304,7 @@ inline void triangleAttention(Trunk& t, const std::string& S, int blk, bool star
   float* out = scratch<float>("tatt.out", pairs * C);
   gatedAttention(xn, L, L, C, A + "/attention", blk, H, D, mask, bias, out);
   if (!starting) { swap01(out, tr, L, L, C); out = tr; }
-  addK2<<<blocks(pairs * C), 256, 0, STREAM>>>(t.pair, out, pairs * C);
+  addK2<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, out, pairs * C);
 }
 
 // one Evoformer iteration of a stack: S is "evoformer/evoformer_iteration/" or ".../extra_msa_stack/"
@@ -318,9 +321,9 @@ inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
   else msaColumnAttention(t, S, blk, msa, rowsN, C, H, D, mask);
   transition(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk);
   if (!t.opmFirst) outerProductMean(t, S, blk, msa, rowsN, C, mask);
-  triangleMultiplication(t, S, blk, true);
-  triangleMultiplication(t, S, blk, false);
-  triangleAttention(t, S, blk, true);
-  triangleAttention(t, S, blk, false);
+  triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, true);
+  triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, false);
+  triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, true);
+  triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, false);
   transition(t.pair, (size_t)t.L * t.L, 128, S + "pair_transition", blk);
 }

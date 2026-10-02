@@ -63,6 +63,9 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--taps", default="embed,extra1,extra,evo1,full")
     parser.add_argument("--pass", dest="pass_index", type=int, default=0)
+    # --passes=P: the full network P times, each pass on its own features and the previous pass's
+    # recycled state, as AF2Runner.apply loops it; o/pass<k>/... per pass (and no taps)
+    parser.add_argument("--passes", type=int, default=0)
     args = parser.parse_args()
     sys.argv = sys.argv[:1]    # absl, somewhere in the reference, parses the command line as its own flags
     sys.path[:0] = [os.path.join(args.reference, "dev", "oracles")]
@@ -89,9 +92,11 @@ def main():
     params = runner.model_params[0]
 
     aatype = np.clip(x["aatype"].astype(np.int32), 0, 19)
-    extra_codes = x[f"f{k}/extra_msa"].reshape(E, L)
-    extra_onehot = np.eye(23, dtype=np.float32)[extra_codes]
-    batch = {
+
+    def make_batch(k):
+      extra_codes = x[f"f{k}/extra_msa"].reshape(E, L)
+      extra_onehot = np.eye(23, dtype=np.float32)[extra_codes]
+      return {
         "aatype": jnp.asarray(aatype),
         "residue_index": jnp.asarray(x["residue_index"].astype(np.int32)),
         "seq_mask": jnp.asarray(x["seq_mask"]),
@@ -109,10 +114,37 @@ def main():
         "mask_template_interchain": False,
         "position_scale": jnp.asarray(float(w["meta/position_scale"]), jnp.float32),
         "opm_first": jnp.asarray(float(w["meta/opm_first"]), jnp.float32),
+        # the reference's blank template (af2/features.py blank_features), which a multimer
+        # checkpoint's template embedder runs on
+        "template_aatype": jnp.zeros([1, L], jnp.int32),
+        "template_all_atom_positions": jnp.zeros([1, L, 37, 3], jnp.float32),
+        "template_all_atom_mask": jnp.zeros([1, L, 37], jnp.float32),
+        "template_mask": jnp.zeros([1], jnp.float32),
+        "template_pseudo_beta": jnp.zeros([1, L, 3], jnp.float32),
+        "template_pseudo_beta_mask": jnp.zeros([1, L], jnp.float32),
         "prev": {"prev_msa_first_row": jnp.zeros([L, 256], jnp.float32),
                  "prev_pair": jnp.zeros([L, L, 128], jnp.float32),
                  "prev_pos": jnp.zeros([L, 37, 3], jnp.float32)},
-    }
+      }
+    batch = make_batch(k)
+
+    if args.passes > 0:
+        cfg = copy.deepcopy(runner.cfg)
+        cfg.model.global_config.flash_attention = None
+        runner_model = af2_model.RunModel(cfg, use_multimer=True)
+        out, prev = {}, batch["prev"]
+        for p_index in range(args.passes):
+            nb = make_batch(p_index)
+            nb["prev"] = prev
+            result = runner_model.apply(params, jax.random.PRNGKey(0), nb)
+            prev = result["prev"]
+            out[f"o/pass{p_index}/final_atom_positions"] = np.asarray(result["structure_module"]["final_atom_positions"])
+            out[f"o/pass{p_index}/plddt_logits"] = np.asarray(result["predicted_lddt"]["logits"])
+            out[f"o/pass{p_index}/pair"] = np.asarray(result["representations"]["pair"])
+            print(f"pass {p_index} done", flush=True)
+        write_native(args.out, out)
+        print(f"wrote {len(out)} tensors -> {args.out}")
+        return
 
     evo = runner.cfg.model.embeddings_and_evoformer
     full_extra, full_evo = int(evo.extra_msa_stack_num_block), int(evo.evoformer_num_block)

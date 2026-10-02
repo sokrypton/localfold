@@ -6,7 +6,7 @@
 //
 // With --oracle (native/af2/oracle.py's dump of the reference on this same input), pass 0 is checked
 // against it stage by stage.
-#include "evoformer.cuh"
+#include "templates.cuh"
 #include "structure.cuh"
 
 static const char* RESTYPE3[21] = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU",
@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
   for (int pass = 0; pass < passes; ++pass) {
     bool check = pass == 0 && !oracle.empty();
     embed(t, pass, prevRow, prevPair, prevPos);
+    if (M.flag("meta/multimer")) templateEmbedding(t.pair, t.pairMask, L);
     if (check) {
       printf("pass 0 against the reference:\n");
       checkOracle("embed msa", t.msa, (size_t)t.N * L * 256, "o/embed/msa");
@@ -125,6 +126,14 @@ int main(int argc, char** argv) {
       checkOracle("angles", so.angles, (size_t)L * 14, "o/full/angles");
       checkOracle("atom14 positions", so.pos14, (size_t)L * 14 * 3, "o/full/final_atom14_positions");
       checkOracle("atom37 positions", so.pos37, (size_t)L * 37 * 3, "o/full/final_atom_positions");
+    }
+    {   // a multi-pass oracle (oracle.py --passes): every pass's pair and structure
+      std::string o = "o/pass" + std::to_string(pass) + "/";
+      if (!oracle.empty() && M.has(o + "final_atom_positions")) {
+        printf("pass %d:\n", pass);
+        checkOracle("pair", t.pair, pairs * 128, o + "pair");
+        checkOracle("atom37 positions", so.pos37, (size_t)L * 37 * 3, o + "final_atom_positions");
+      }
     }
     // the recycled state: the evoformer's first MSA row and pair, the final atom37 positions
     CK(cudaMemcpyAsync(prevRow, t.msa, (size_t)L * 256 * 4, cudaMemcpyDeviceToDevice, STREAM));

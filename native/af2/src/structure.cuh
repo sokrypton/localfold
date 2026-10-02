@@ -260,7 +260,7 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   float* un = scratch<float>("sm.un", (size_t)L * 14);
   linearB(sb, R + "unnormalized_angles", -1, un, L, 128, 14);
   StructureOut o{act, rig, dalloc((size_t)L * 37 * 3), dalloc((size_t)L * 14 * 3), dalloc((size_t)L * 14)};
-  sidechainAtomsK<<<blocks(L), 128, 0, STREAM>>>(un, rig, positionScale, Idev("aatype"), W("c/rigid_group_default_frame"),
+  sidechainAtomsK<<<blocks(L, 128), 128, 0, STREAM>>>(un, rig, positionScale, Idev("aatype"), W("c/rigid_group_default_frame"),
                                                  Idev("c/atom14_to_rigid_group"), W("c/atom14_rigid_group_positions"),
                                                  W("c/atom14_mask"), Idev("c/atom37_to_atom14"), W("c/atom37_mask"),
                                                  seqMask, o.angles, o.pos14, o.pos37, L);

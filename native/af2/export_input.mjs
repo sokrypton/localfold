@@ -42,8 +42,12 @@ const tables = { atom37ToAtom14: table("c/atom37_to_atom14"), atom37Mask: table(
 const sequence = option("sequence", "").trim().toUpperCase();
 const a3mPath = option("a3m", "");
 if (sequence === "" && a3mPath === "") throw new Error("--sequence or --a3m names the input");
-const a3m = a3mPath === "" ? `>query\n${sequence}\n` : readFileSync(a3mPath, "utf8");
+// chains joined by ":" fold as a complex: the feature builder's chain-aware path (per-chain residue
+// numbering, asym/entity/sym ids), what the page passes a multimer
+const chains = sequence.split(":").filter(Boolean);
+const a3m = a3mPath === "" ? `>query\n${chains.join("")}\n` : readFileSync(a3mPath, "utf8");
 const features = makeA3mFeatures(a3m, tables, {
+  ...(chains.length > 1 ? { chainAware: true, chainLengths: chains.map((c) => c.length), chainSequences: chains } : {}),
   recycles: Number(option("recycles", "3")),
   maxMsaSequences: Number(option("max-msa", "512")),
   maxExtraSequences: Number(option("max-extra", "1024")),
