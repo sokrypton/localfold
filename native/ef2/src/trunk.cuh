@@ -144,22 +144,9 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
     gemm(xn, F("recycle/projection"), z, P, C, C);
     addK<<<blocks(P * C), 256, 0, STREAM>>>(z, zInitP, P * C);
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " in").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/in");
-    // the 24 blocks are the same launches on the same buffers every pass: the first pass runs them (and
-    // makes every scratch buffer, plan and weight copy), the rest replay one CUDA graph of them
-    static cudaGraphExec_t graph = nullptr;
-    if (loop == 0 || check || !FAST) {
-      for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
-    } else {
-      if (!graph) {
-        cudaGraph_t g;
-        CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
-        for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
-        CK(cudaStreamEndCapture(STREAM, &g));
-        CK(cudaGraphInstantiate(&graph, g, 0));
-        CK(cudaGraphDestroy(g));
-      }
-      CK(cudaGraphLaunch(graph, STREAM));
-    }
+    // (a CUDA graph of the 24 blocks, replayed for passes after the first, measured no faster: 453
+    // against 455 ms of trunk at 261 tokens; the GPU is busy, the launches are not the cost)
+    for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " out").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/out");
     if (getenv("EF2_PASS_TIMES")) {
       static auto t0 = std::chrono::steady_clock::now();

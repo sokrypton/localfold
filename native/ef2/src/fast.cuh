@@ -193,10 +193,12 @@ inline void triangleFast(float* pair, const float* mask, int L, int C, const std
   ltGemm(xn, Fh(Tn + "gatingLinear"), pg + 4 * C, true, P, C, C, nullptr, false, 0.f, 0, 5 * C);
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
   half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-  static half* zeroed = nullptr; static size_t zeroedBytes = 0;
-  if (Lp != L && (a != zeroed || plane * C * 2 > zeroedBytes)) {     // the pad, written once (nothing else writes it)
+  // the pad, written once for a buffer and a padded size (nothing else writes it - but a buffer reused at
+  // another size has data where this layout's pad is)
+  static half* zeroed = nullptr; static int zeroedLp = 0;
+  if (Lp != L && (a != zeroed || Lp != zeroedLp)) {
     CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
-    zeroed = a; zeroedBytes = plane * C * 2;
+    zeroed = a; zeroedLp = Lp;
   }
   triSplitHK<<<dim3((unsigned)((P + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, mask, a, b, P, C, L, Lp);
   float* prod = scratch<float>("ftri.prod", plane * C);
