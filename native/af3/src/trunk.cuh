@@ -216,18 +216,20 @@ void templateEmbedding(Trunk& t, float* out) {
 }
 
 // ---------------------------------------------------------------- MSA stack
-__global__ void scaleRowsK(float* x, const float* mask, size_t rows, int C) {
+template <class T>
+__global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) x[t] *= mask[t / C];
+  if (t < rows * C) x[t] = fromF<T>(toF(x[t]) * mask[t / C]);
 }
 // [(bi, c), (j, e)] -> [(bi, j), (c, e)]
-__global__ void opmPermuteK(const float* in, float* out, int Bi, int n, int O) {
+template <class T>
+__global__ void opmPermuteK(const float* in, T* out, int Bi, int n, int O) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   size_t total = (size_t)Bi * n * O * O;
   if (t >= total) return;
   int e = (int)(t % O); size_t rest = t / O; int c = (int)(rest % O); rest /= O;
   int j = (int)(rest % n); int bi = (int)(rest / n);
-  out[t] = in[((size_t)bi * O + c) * ((size_t)n * O) + (size_t)j * O + e];
+  out[t] = fromF<T>(in[((size_t)bi * O + c) * ((size_t)n * O) + (size_t)j * O + e]);
 }
 // pair[i][j] += (bias + x) / (1e-3 + norm[i][j])   (AF3: the bias inside the scale)
 __global__ void opmAddK(float* pair, const float* x, const float* bias, const float* norm, size_t i0,
@@ -239,18 +241,21 @@ __global__ void opmAddK(float* pair, const float* x, const float* bias, const fl
   float v = biasAfterNorm ? x[t] / fmaxf(nv, 1.f) + bias[f] : (bias[f] + x[t]) / (1e-3f + nv);
   pair[(i * n + j) * C + f] += v;
 }
-inline void outerProductMean(Trunk& t, const std::string& pre) {
+// T: the projections and the contraction's inputs (f16 on the fast path, tensor cores, f32
+// accumulation); the contraction's output, the mask normaliser and the residual stay f32.
+template <class T>
+void outerProductMean(Trunk& t, const std::string& pre) {
   int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int O = (int)M.meta(pre + ".outerChannels");
   size_t rows = (size_t)S * n;
-  float* ln = scratch<float>("opm.ln", rows * Cm);
-  layerNorm2<float, float>(t.msa, ln, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
-  float* L = scratch<float>("opm.left", rows * O); float* R = scratch<float>("opm.right", rows * O);
-  linear<float, float>(ln, L, rows, Cm, O, pre + ".leftProjection");
-  linear<float, float>(ln, R, rows, Cm, O, pre + ".rightProjection");
+  T* ln = scratch<T>("opm.ln", rows * Cm);
+  layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
+  T* L = scratch<T>("opm.left", rows * O); T* R = scratch<T>("opm.right", rows * O);
+  linear<T, T>(ln, L, rows, Cm, O, pre + ".leftProjection");
+  linear<T, T>(ln, R, rows, Cm, O, pre + ".rightProjection");
   if (hasW(pre + ".leftProjectionBias")) { fprintf(stderr, "opm biases: not ported yet\n"); exit(1); }
-  scaleRowsK<<<blocks(rows * O), 256, 0, STREAM>>>(L, t.msaMask, rows, O);
-  scaleRowsK<<<blocks(rows * O), 256, 0, STREAM>>>(R, t.msaMask, rows, O);
+  scaleRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(L, t.msaMask, rows, O);
+  scaleRowsK<T><<<blocks(rows * O), 256, 0, STREAM>>>(R, t.msaMask, rows, O);
   // norm[i][j] = sum_s mask[s][i] mask[s][j]
   float* norm = scratch<float>("opm.norm", (size_t)n * n);
   const float one = 1.f, zero = 0.f;
@@ -259,17 +264,18 @@ inline void outerProductMean(Trunk& t, const std::string& pre) {
   size_t per = (size_t)n * O * O;
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / per));
   float* P = scratch<float>("opm.P", (size_t)Bi * per);
-  float* Pp = scratch<float>("opm.Pp", (size_t)Bi * per);
+  T* Pp = scratch<T>("opm.Pp", (size_t)Bi * per);
   float* X = scratch<float>("opm.X", (size_t)Bi * n * C);
   bool after = M.flag("trunk.dialect.opmBiasAfterNorm");
+  auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   for (int i0 = 0; i0 < n; i0 += Bi) {
     int bi = std::min(Bi, n - i0);
     // row-major P (bi*O x n*O) = L_blk^T R where L_blk is [S][bi*O] with row stride n*O.
     // col-major: P^T (n*O x bi*O) = R^T(op N on R as (n*O x S), ld n*O) * L_blk (op T)
-    CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, n * O, bi * O, S, &one, R, n * O,
-                   L + (size_t)i0 * O, n * O, &zero, P, n * O));
-    opmPermuteK<<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
-    linear<float, float>(Pp, X, (size_t)bi * n, O * O, C, pre + ".outputW");
+    CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, n * O, bi * O, S, &one, R, cudaType<T>(), n * O,
+                    L + (size_t)i0 * O, cudaType<T>(), n * O, &zero, P, CUDA_R_32F, n * O, CUBLAS_COMPUTE_32F, algo));
+    opmPermuteK<T><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
+    linear<T, float>(Pp, X, (size_t)bi * n, O * O, C, pre + ".outputW");
     opmAddK<<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(t.pair, X, W(pre + ".outputB"), norm, i0, bi, n,
                                                            C, after);
   }
@@ -307,7 +313,12 @@ __global__ void keyMaskK(const float* msaMask, float* keyMask, int S, int n) {
   keyMask[j] = m;
 }
 // v [s][j][h*d+e] -> [h][j][s][e]
-__global__ void msaVToHeadsK(const float* v, float* out, int S, int n, int heads, int d) {
+template <class T>
+__global__ void castK(const float* in, T* out, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = fromF<T>(in[i]);
+}
+template <class T>
+__global__ void msaVToHeadsK(const T* v, T* out, int S, int n, int heads, int d) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)S * n * heads * d) return;
   int e = (int)(t % d); size_t rest = t / d; int s = (int)(rest % S); rest /= S;
@@ -315,50 +326,62 @@ __global__ void msaVToHeadsK(const float* v, float* out, int S, int n, int heads
   out[t] = v[((size_t)s * n + j) * heads * d + h * d + e];
 }
 // o [h][i][s][e] -> [s][i][h*d+e], times sigmoid(gate)
-__global__ void msaFromHeadsK(const float* o, const float* gate, float* out, int S, int n, int heads, int d) {
+template <class T>
+__global__ void msaFromHeadsK(const T* o, const T* gate, T* out, int S, int n, int heads, int d) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)S * n * heads * d) return;
   int c = (int)(t % (heads * d)); size_t si = t / (heads * d); int i = (int)(si % n), s = (int)(si / n);
   int h = c / d, e = c % d;
-  out[t] = o[(((size_t)h * n + i) * S + s) * d + e] * (1.f / (1.f + expf(-gate[t])));
+  out[t] = fromF<T>(toF(o[(((size_t)h * n + i) * S + s) * d + e]) * (1.f / (1.f + expf(-toF(gate[t])))));
 }
-inline void msaAttention(Trunk& t, const std::string& pre) {
+// T: the activations and the weighted sum's inputs (f16 on the fast path); the softmax in f32.
+template <class T>
+void msaAttention(Trunk& t, const std::string& pre) {
   int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int heads = (int)M.meta(pre + ".heads"), d = (int)M.meta(pre + ".dimension"), Wd = heads * d;
   size_t rows = (size_t)S * n, pairs = (size_t)n * n;
-  float* ln = scratch<float>("msaatt.ln", rows * Cm);
-  layerNorm2<float, float>(t.msa, ln, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
-  float* pln = scratch<float>("msaatt.pln", pairs * C);
-  layerNorm2<float, float>(t.pair, pln, pairs, C, pre + ".pairNormScale", pre + ".pairNormOffset");
+  T* ln = scratch<T>("msaatt.ln", rows * Cm);
+  layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
+  T* pln = scratch<T>("msaatt.pln", pairs * C);
+  layerNorm2<float, T>(t.pair, pln, pairs, C, pre + ".pairNormScale", pre + ".pairNormOffset");
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
-  linear<float, float>(pln, flat, pairs, C, heads, pre + ".pairLogits");
+  linear<T, float>(pln, flat, pairs, C, heads, pre + ".pairLogits");
   float* keyMask = scratch<float>("msaatt.keymask", n);
   keyMaskK<<<blocks(n, 128), 128, 0, STREAM>>>(t.msaMask, keyMask, S, n);
   float* w = scratch<float>("msaatt.w", (size_t)heads * pairs);
   msaWeightsK<<<(unsigned)(heads * n), 128, 0, STREAM>>>(flat, keyMask, w, n, heads);
-  float* v = scratch<float>("msaatt.v", rows * Wd);
-  linear<float, float>(ln, v, rows, Cm, Wd, pre + ".vProjection");
-  float* vh = scratch<float>("msaatt.vh", rows * Wd);
-  msaVToHeadsK<<<blocks(rows * Wd), 256, 0, STREAM>>>(v, vh, S, n, heads, d);
+  const T* wT;
+  if constexpr (std::is_same_v<T, float>) wT = w;
+  else {
+    T* wh = scratch<T>("msaatt.wh", (size_t)heads * pairs);
+    castK<T><<<blocks((size_t)heads * pairs), 256, 0, STREAM>>>(w, wh, (size_t)heads * pairs);
+    wT = wh;
+  }
+  T* v = scratch<T>("msaatt.v", rows * Wd);
+  linear<T, T>(ln, v, rows, Cm, Wd, pre + ".vProjection");
+  T* vh = scratch<T>("msaatt.vh", rows * Wd);
+  msaVToHeadsK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(v, vh, S, n, heads, d);
   // per head: O_h (n x S*d) = W_h (n x n) V_h (n x S*d); col-major O^T = V^T W^T
-  float* oh = scratch<float>("msaatt.oh", rows * Wd);
+  T* oh = scratch<T>("msaatt.oh", rows * Wd);
   const float one = 1.f, zero = 0.f;
-  CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, S * d, n, n, &one, vh, S * d, (size_t)n * S * d,
-                               w, n, pairs, &zero, oh, S * d, (size_t)n * S * d, heads));
-  float* gate = scratch<float>("msaatt.gate", rows * Wd);
-  linear<float, float>(ln, gate, rows, Cm, Wd, pre + ".gatingQuery");
-  float* gated = scratch<float>("msaatt.gated", rows * Wd);
-  msaFromHeadsK<<<blocks(rows * Wd), 256, 0, STREAM>>>(oh, gate, gated, S, n, heads, d);
-  linear<float, float>(gated, t.msa, rows, Wd, Cm, pre + ".outputProjection", false, 1.f);
+  auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, S * d, n, n, &one, vh, cudaType<T>(), S * d,
+     (size_t)n * S * d, wT, cudaType<T>(), n, pairs, &zero, oh, cudaType<T>(), S * d, (size_t)n * S * d, heads,
+     CUBLAS_COMPUTE_32F, algo));
+  T* gate = scratch<T>("msaatt.gate", rows * Wd);
+  linear<T, T>(ln, gate, rows, Cm, Wd, pre + ".gatingQuery");
+  T* gated = scratch<T>("msaatt.gated", rows * Wd);
+  msaFromHeadsK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(oh, gate, gated, S, n, heads, d);
+  linear<T, float>(gated, t.msa, rows, Wd, Cm, pre + ".outputProjection", false, 1.f);
 }
 
 template <class T>
 void msaBlock(Trunk& t, int k) {
   std::string B = "trunk.msaBlocks." + std::to_string(k);
   if (M.flag("trunk.dialect.msaUpdateBeforeOuterProduct")) { fprintf(stderr, "msa update first: not ported\n"); exit(1); }
-  outerProductMean(t, B + ".outerProductMean"); stage("msa.opm");
-  msaAttention(t, B + ".msaAttention1"); stage("msa.attention");
-  transition<float>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
+  outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm");
+  msaAttention<T>(t, B + ".msaAttention1"); stage("msa.attention");
+  transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
   pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
 }
 

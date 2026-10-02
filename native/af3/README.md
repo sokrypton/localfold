@@ -23,7 +23,7 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data         
 python3 score.py 5caj.pdb ../../tools/fixtures/5caj-crystal.pdb A
 ```
 
-`--fold` options: `--steps=200 --recycles=0 --seed=42 --folds=N` (N warm repeats),
+`--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats),
 `--fast` (f16 trunk and denoiser transformer), `--stages` (per-stage profile),
 `--no-graphs`. `pairformer.cu` is the earlier one-file pairformer prototype and benchmark.
 
@@ -48,7 +48,7 @@ Folds: 6MRR from its sequence **0.683 A** CA RMSD, pLDDT 85.1, pTM 0.720 (WebGPU
 5CAJ (255 residues of chain A) with its MSA **2.04 A**, pLDDT 94.6, pTM 0.940 - the WebGPU
 port gives pLDDT 94.5, pTM 0.938 on the same inputs.
 
-## Speed: A100-SXM4-40GB, 200 diffusion steps, 0 recycles
+## Speed: A100-SXM4-40GB, 200 diffusion steps, `--recycles=0`
 
 | target | WebGPU first / warm | native first / warm |
 |---|---|---|

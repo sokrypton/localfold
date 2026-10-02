@@ -190,10 +190,6 @@ __global__ void layerNormPlainOnesK(const float* in, TO* outNorm, TO* outRaw, si
     outNorm[base + c] = fromF<TO>(one); outRaw[base + c] = fromF<TO>(one);
   }
 }
-template <class TO>
-__global__ void castK(const float* x, TO* y, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = fromF<TO>(x[i]);
-}
 template <class T>
 __global__ void addQBiasTK(T* qkvg, const float* b, int n, int Wd) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
