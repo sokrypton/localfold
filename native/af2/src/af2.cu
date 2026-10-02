@@ -81,11 +81,17 @@ int main(int argc, char** argv) {
   Trunk t{};
   t.L = (int)M.meta("meta/tokens"); t.N = (int)M.meta("meta/msa_rows"); t.E = (int)M.meta("meta/extra_rows");
   t.opmFirst = M.flag("meta/opm_first");
+  int templates = (int)M.meta("meta/templates", 0);
+  bool multimer = M.flag("meta/multimer");
+  bool monomerTemplates = !multimer && templates > 0 && M.has("w/evoformer/template_embedding/attention/query_w");
+  if (!multimer && templates > 0 && !monomerTemplates)
+    printf("(this checkpoint has no template embedder - models 3 to 5 are template-free; the template is not used)\n");
+  if (multimer || monomerTemplates) t.T = templates;   // a template's single features become MSA rows
   int passes = (int)M.meta("meta/passes");
   if (recycles >= 0) passes = std::min(passes, recycles + 1);
   float positionScale = (float)M.meta("meta/position_scale");
   int L = t.L; size_t pairs = (size_t)L * L;
-  t.msa = dalloc((size_t)t.N * L * 256); t.extra = dalloc((size_t)t.E * L * 64);
+  t.msa = dalloc((size_t)(t.N + t.T) * L * 256); t.extra = dalloc((size_t)t.E * L * 64);
   t.pair = dalloc(pairs * 128); t.pairMask = dalloc(pairs);
   float* prevRow = dalloc((size_t)L * 256); float* prevPair = dalloc(pairs * 128); float* prevPos = dalloc((size_t)L * 37 * 3);
   CK(cudaMemset(prevRow, 0, (size_t)L * 256 * 4)); CK(cudaMemset(prevPair, 0, pairs * 128 * 4));
@@ -102,7 +108,18 @@ int main(int argc, char** argv) {
   // everything after the embedder: the same launches on the same buffers every pass, so from pass 1
   // on it is captured once as a CUDA graph and replayed (a pass is ~6000 launches)
   auto rest = [&](bool check, int pass) {
-    if (M.flag("meta/multimer")) templateEmbedding(t.pair, t.pairMask, L);
+    if (multimer) templateEmbedding(t.pair, t.pairMask, L);
+    else if (monomerTemplates) templateEmbeddingMonomer(t.pair, t.pairMask, L, templates);
+    if (t.T > 0) {
+      templateRows(L, t.T, multimer, t.msa + (size_t)t.N * L * 256, const_cast<float*>(t.msaMask) + (size_t)t.N * L);
+      if (check && !multimer) {
+        checkOracle("template torsion features", scratch<float>("trow.feat", 1), (size_t)t.T * L * 57, "o/tmpl/feat");
+        if (getenv("AF2_DUMP_TFEAT")) {
+          auto h = download(scratch<float>("trow.feat", 1), (size_t)t.T * L * 57);
+          FILE* df = fopen(getenv("AF2_DUMP_TFEAT"), "wb"); fwrite(h.data(), 4, h.size(), df); fclose(df);
+        }
+      }
+    }
     if (check) {
       printf("pass 0 against the reference:\n");
       checkOracle("embed msa", t.msa, (size_t)t.N * L * 256, "o/embed/msa");

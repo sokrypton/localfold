@@ -36,7 +36,10 @@ def main():
     from alphafold3.af2.model import all_atom
 
     multimer = "multimer" in args.model
-    params = load_params([args.model], args.params, False, multimer)[0]
+    # the monomer template embedder exists in model_1/2_ptm only (3-5 are template-free), and the
+    # loader drops it unless asked: ask whenever the checkpoint has one
+    with_templates = not multimer and any(k in args.model for k in ("model_1", "model_2"))
+    params = load_params([args.model], args.params, with_templates, multimer)[0]
     if not multimer:
         params = convert_monomer_params(params)
 
@@ -58,6 +61,10 @@ def main():
         "atom37_to_atom14": all_atom.RESTYPE_ATOM37_TO_ATOM14,                 # (21, 37) int
         "atom37_mask": all_atom.RESTYPE_ATOM37_MASK,                           # (21, 37)
         "atom14_to_atom37": all_atom.RESTYPE_ATOM14_TO_ATOM37,                 # (21, 14) int
+        # the template torsions (all_atom.atom37_to_torsion_angles, compute_chi_angles)
+        "chi_atom_indices": np.asarray(all_atom.get_chi_atom_indices()),       # (21, 4, 4) int
+        "chi_angles_mask": np.asarray(list(rc.chi_angles_mask) + [[0.0] * 4]),   # (21, 4)
+        "chi_pi_periodic": np.asarray(rc.chi_pi_periodic),                     # (21, 4)
     }
     for name, value in tables.items():
         value = np.asarray(value)

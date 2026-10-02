@@ -150,6 +150,7 @@ inline void attention(int D, const float* q, const float* k, const float* v, con
     packQkvgK<<<blocks(rows * W), 256, 0, STREAM>>>(q, k, v, g, qkvg, rows, W);
     int stride = (n + 7) / 8 * 8;
     half* bias = scratch<half>("fa.bias", (size_t)H * n * stride);
+    if (pairBias && stride != n) CK(cudaMemsetAsync(bias, 0, (size_t)H * n * stride * 2, STREAM));   // pad columns: see pairBiasFast
     if (pairBias) biasToHalfK<<<blocks((size_t)H * n * n), 256, 0, STREAM>>>(pairBias, bias, H, n, stride);
     else CK(cudaMemsetAsync(bias, 0, (size_t)H * n * stride * 2, STREAM));
     half* o = scratch<half>("fa.out", rows * W);

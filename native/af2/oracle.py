@@ -86,12 +86,33 @@ def main():
     k = args.pass_index
     multimer = bool(w["meta/multimer"])
 
+    T = int(x.get("meta/templates", 0))
     runner = AF2Runner(model_type="alphafold2_multimer_v3" if multimer else "alphafold2_ptm",
-                       use_templates=False, data_dir=args.params, model_names=[args.model],
+                       use_templates=T > 0 and not multimer, data_dir=args.params, model_names=[args.model],
                        num_recycle=0, use_bfloat16=False, recycle_remat=False)
     params = runner.model_params[0]
 
     aatype = np.clip(x["aatype"].astype(np.int32), 0, 19)
+
+    # the templates (export_input.mjs --template), or the reference's blank one (af2/features.py
+    # blank_features), which a multimer checkpoint's template embedder runs on either way
+    if T > 0:
+        t_aat = x["t/aatype"].reshape(T, L).astype(np.int32)
+        t_pos = x["t/positions"].reshape(T, L, 37, 3)
+        t_msk = x["t/mask"].reshape(T, L, 37)
+        pb_atom = np.where(t_aat == 7, 1, 3)
+        pb = np.take_along_axis(t_pos, pb_atom[..., None, None].repeat(3, -1), axis=2)[:, :, 0]
+        pbm = np.take_along_axis(t_msk, pb_atom[..., None], axis=2)[:, :, 0]
+        templates = {"template_aatype": jnp.asarray(t_aat), "template_all_atom_positions": jnp.asarray(t_pos),
+                     "template_all_atom_mask": jnp.asarray(t_msk), "template_mask": jnp.ones([T], jnp.float32),
+                     "template_pseudo_beta": jnp.asarray(pb), "template_pseudo_beta_mask": jnp.asarray(pbm)}
+    else:
+        templates = {"template_aatype": jnp.zeros([1, L], jnp.int32),
+                     "template_all_atom_positions": jnp.zeros([1, L, 37, 3], jnp.float32),
+                     "template_all_atom_mask": jnp.zeros([1, L, 37], jnp.float32),
+                     "template_mask": jnp.zeros([1], jnp.float32),
+                     "template_pseudo_beta": jnp.zeros([1, L, 3], jnp.float32),
+                     "template_pseudo_beta_mask": jnp.zeros([1, L], jnp.float32)}
 
     def make_batch(k):
       extra_codes = x[f"f{k}/extra_msa"].reshape(E, L)
@@ -114,14 +135,7 @@ def main():
         "mask_template_interchain": False,
         "position_scale": jnp.asarray(float(w["meta/position_scale"]), jnp.float32),
         "opm_first": jnp.asarray(float(w["meta/opm_first"]), jnp.float32),
-        # the reference's blank template (af2/features.py blank_features), which a multimer
-        # checkpoint's template embedder runs on
-        "template_aatype": jnp.zeros([1, L], jnp.int32),
-        "template_all_atom_positions": jnp.zeros([1, L, 37, 3], jnp.float32),
-        "template_all_atom_mask": jnp.zeros([1, L, 37], jnp.float32),
-        "template_mask": jnp.zeros([1], jnp.float32),
-        "template_pseudo_beta": jnp.zeros([1, L, 3], jnp.float32),
-        "template_pseudo_beta_mask": jnp.zeros([1, L], jnp.float32),
+        **templates,
         "prev": {"prev_msa_first_row": jnp.zeros([L, 256], jnp.float32),
                  "prev_pair": jnp.zeros([L, L, 128], jnp.float32),
                  "prev_pos": jnp.zeros([L, 37, 3], jnp.float32)},
@@ -145,6 +159,20 @@ def main():
         write_native(args.out, out)
         print(f"wrote {len(out)} tensors -> {args.out}")
         return
+
+    if T > 0 and not multimer:      # the monomer template rows' 57 features, as modules.py builds them
+        from alphafold3.af2.model import all_atom
+        ret = all_atom.atom37_to_torsion_angles(aatype=templates["template_aatype"],
+                                                all_atom_pos=templates["template_all_atom_positions"],
+                                                all_atom_mask=templates["template_all_atom_mask"],
+                                                placeholder_for_undefined=False)
+        feat = np.concatenate([np.eye(22, dtype=np.float32)[np.asarray(templates["template_aatype"])],
+                               np.asarray(ret["torsion_angles_sin_cos"]).reshape(T, L, 14),
+                               np.asarray(ret["alt_torsion_angles_sin_cos"]).reshape(T, L, 14),
+                               np.asarray(ret["torsion_angles_mask"])], -1)
+        extra_out = {"o/tmpl/feat": feat}
+    else:
+        extra_out = {}
 
     evo = runner.cfg.model.embeddings_and_evoformer
     full_extra, full_evo = int(evo.extra_msa_stack_num_block), int(evo.evoformer_num_block)
@@ -202,6 +230,7 @@ def main():
             out["o/full/distogram_logits"] = np.asarray(result["distogram"]["logits"])
             out["o/full/masked_msa_logits"] = np.asarray(result["masked_msa"]["logits"])
         print(f"{tap}: extra {n_extra} evo {n_evo} done", flush=True)
+    out.update(extra_out)
     write_native(args.out, out)
     print(f"wrote {len(out)} tensors -> {args.out}")
 

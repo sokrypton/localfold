@@ -12,6 +12,7 @@
 // The tables the featuriser needs (atom37 maps) are read from the exported weights.
 import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 import { makeA3mFeatures } from "../../src/input/a3m-features.js";
+import { chainResidues, identityMap, templateSlotAtom37 } from "../../src/af3/featurise/template-input.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -74,6 +75,26 @@ features.forEach((f, k) => {
   flt(`f${k}/extra_deletion_value`, f.extraDeletionValue);
   flt(`f${k}/extra_msa_mask`, f.extraMsaMask);
 });
+// --template=<pdb>[:chain[+chain...]],... : each a structure of the query's own sequence (identity mapping, as
+// tools/gpu/fold-af2.js builds a self-template), as AF2's atom37 slots in the restype alphabet
+const templateSpecs = option("template", "").split(",").filter(Boolean);
+if (templateSpecs.length > 0) {
+  const aat = new Int32Array(templateSpecs.length * L), pos = new Float32Array(templateSpecs.length * L * 37 * 3);
+  const msk = new Float32Array(templateSpecs.length * L * 37);
+  templateSpecs.forEach((spec, k) => {
+    const [path, chain] = spec.split(":");
+    // chains joined by '+' (a complex's template, A+D): one slot over the whole query, each chain's
+    // residues following the last's, as the query's own chains follow each other
+    const text = readFileSync(path, "utf8");
+    const parts = (chain || "").split("+").map((c) => chainResidues(text, c || undefined));
+    const structure = { ...parts[0], residues: parts.flatMap((part) => part.residues) };
+    const slot = templateSlotAtom37({ structure, tokens: L, map: identityMap(structure) });
+    aat.set(slot.aatype, k * L); pos.set(slot.atomPositions, k * L * 37 * 3); msk.set(slot.atomMask, k * L * 37);
+    console.log(`template ${k}: ${path}${chain ? `:${chain}` : ""}, ${slot.covered} residues, ${slot.atoms} atoms`);
+  });
+  int("t/aatype", aat); flt("t/positions", pos); flt("t/mask", msk);
+  entries.push(["m", "meta/templates", templateSpecs.length]);
+}
 entries.push(["m", "meta/tokens", L]);
 entries.push(["m", "meta/msa_rows", first.msaSequences]);
 entries.push(["m", "meta/extra_rows", first.extraSequences]);

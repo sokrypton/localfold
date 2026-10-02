@@ -135,3 +135,200 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L) {
   linearB(sum, TE + "output_linear", -1, out, pairs, C, Cz);
   addK2<<<blocks(pairs * Cz), 256, 0, STREAM>>>(pair, out, pairs * Cz);
 }
+
+// ---------------------------------------------------------------- the monomer's template embedder
+// (af3-any-model's MonomerTemplateEmbedding / MonomerSingleTemplateEmbedding / TemplatePairStack)
+// The 88 template pair inputs - dgram(39) | mask_2d | aatype_j(22) | aatype_i(22) | unit vector(3, zeros:
+// use_template_unit_vector is off in every shipped monomer config) | backbone mask - all multiplied by
+// the backbone mask, through embedding2d (88 -> 64)
+__global__ void templatePairInputMonomerK(const int* tAatype, const float* tPos, const float* tMask, const float* w,
+                                          const float* b, float* act, int L, int C) {
+  size_t ij = (size_t)blockIdx.x;
+  if (ij >= (size_t)L * L) return;
+  int i = (int)(ij / L), j = (int)(ij % L);
+  __shared__ float feat[40];
+  __shared__ int ai, aj; __shared__ float bb;
+  if (threadIdx.x == 0) {
+    auto pbAtom = [&](int r) { return tAatype[r] == 7 ? 1 : 3; };
+    int pi = pbAtom(i), pj = pbAtom(j);
+    float m2 = tMask[(size_t)i * 37 + pi] * tMask[(size_t)j * 37 + pj];
+    float d2 = 0;
+    for (int k = 0; k < 3; ++k) { float d = tPos[((size_t)i * 37 + pi) * 3 + k] - tPos[((size_t)j * 37 + pj) * 3 + k]; d2 += d * d; }
+    for (int q = 0; q < 39; ++q) {
+      float lo = 3.25f + (50.75f - 3.25f) * q / 38.f, hi = 3.25f + (50.75f - 3.25f) * (q + 1) / 38.f;
+      feat[q] = (d2 > lo * lo && d2 < (q + 1 < 39 ? hi * hi : 1e8f)) ? 1.f : 0.f;     // (the monomer's dgram is not masked)
+    }
+    feat[39] = m2;
+    auto bbm = [&](int r) { return tMask[(size_t)r * 37] * tMask[(size_t)r * 37 + 1] * tMask[(size_t)r * 37 + 2]; };
+    bb = bbm(i) * bbm(j);
+    ai = min(max(tAatype[i], 0), 21); aj = min(max(tAatype[j], 0), 21);
+  }
+  __syncthreads();
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    float a = 0;
+    for (int q = 0; q < 40; ++q) a += feat[q] * w[q * C + c];
+    a += w[(40 + aj) * C + c] + w[(62 + ai) * C + c];
+    a += w[87 * C + c];                       // the backbone mask itself (=1 where bb is, scaled below)
+    act[ij * C + c] = a * bb + b[c];          // every input times the backbone mask, then the bias
+  }
+}
+// the pointwise attention from the query pair over the templates: q [pairs, H*D] (scaled), k, v
+// [T, pairs, H*D]; out [pairs, H*D] = softmax_t(q . k_t) v_t  (no gating; every template present)
+__global__ void templatePointAttentionK(const float* q, const float* k, const float* v, float* out, size_t pairs, int T,
+                                        int H, int D) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= pairs * H) return;
+  size_t p = t / H; int h = (int)(t % H), W = H * D;
+  float logits[8]; float mx = -INFINITY;
+  for (int s = 0; s < T; ++s) {
+    float a = 0;
+    for (int d = 0; d < D; ++d) a += q[p * W + h * D + d] * k[((size_t)s * pairs + p) * W + h * D + d];
+    logits[s] = a; mx = fmaxf(mx, a);
+  }
+  float sum = 0;
+  for (int s = 0; s < T; ++s) { logits[s] = __expf(logits[s] - mx); sum += logits[s]; }
+  for (int d = 0; d < D; ++d) {
+    float a = 0;
+    for (int s = 0; s < T; ++s) a += logits[s] * v[((size_t)s * pairs + p) * W + h * D + d];
+    out[p * W + h * D + d] = a / sum;
+  }
+}
+inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, int T) {
+  const std::string TE = "evoformer/template_embedding/", S = TE + "single_template_embedding/";
+  const std::string PS = S + "template_pair_stack/__layer_stack_no_state/";
+  const int C = 64, Cz = 128;
+  size_t pairs = (size_t)L * L;
+  if (T > 8) { fprintf(stderr, "at most 8 templates\n"); exit(1); }
+  float* reps = scratch<float>("mtmpl.reps", (size_t)T * pairs * C);
+  int nb = (int)dimW(PS + "pair_transition/transition1/weights", 0);
+  for (int k = 0; k < T; ++k) {
+    float* act = reps + (size_t)k * pairs * C;
+    templatePairInputMonomerK<<<(unsigned)pairs, 64, 0, STREAM>>>(Idev("t/aatype") + (size_t)k * L,
+      W("t/positions") + (size_t)k * L * 37 * 3, W("t/mask") + (size_t)k * L * 37,
+      P(S + "embedding2d/weights"), P(S + "embedding2d/bias"), act, L, C);
+    for (int b = 0; b < nb; ++b) {        // the MONOMER's order: both attentions, then both multiplications
+      triangleAttention(act, pairMask, L, C, PS, b, true);
+      triangleAttention(act, pairMask, L, C, PS, b, false);
+      triangleMultiplication(act, pairMask, L, C, PS, b, true);
+      triangleMultiplication(act, pairMask, L, C, PS, b, false);
+      transition(act, pairs, C, PS + "pair_transition", b);
+    }
+    float* tmp = scratch<float>("mtmpl.ln", pairs * C);
+    layerNorm(act, tmp, pairs, C, S + "output_layer_norm");
+    CK(cudaMemcpyAsync(act, tmp, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  }
+  const std::string A = TE + "attention/";
+  int Hh = (int)dimW(A + "query_w", 1), D = (int)dimW(A + "query_w", 2), Wd = Hh * D;
+  float* q = scratch<float>("mtmpl.q", pairs * Wd);
+  float* kk = scratch<float>("mtmpl.k", (size_t)T * pairs * Wd); float* vv = scratch<float>("mtmpl.v", (size_t)T * pairs * Wd);
+  gemm(pair, P(A + "query_w"), q, pairs, Cz, Wd);
+  float s = 1.f / sqrtf((float)D);
+  CB(cublasSscal(H, (int)(pairs * Wd), &s, q, 1));
+  gemm(reps, P(A + "key_w"), kk, (size_t)T * pairs, C, Wd);
+  gemm(reps, P(A + "value_w"), vv, (size_t)T * pairs, C, Wd);
+  float* o = scratch<float>("mtmpl.o", pairs * Wd);
+  templatePointAttentionK<<<blocks(pairs * Hh), 256, 0, STREAM>>>(q, kk, vv, o, pairs, T, Hh, D);
+  float* out = scratch<float>("mtmpl.out", pairs * Cz);
+  gemm(o, P(A + "output_w"), out, pairs, Wd, Cz);
+  addBiasK<<<blocks(pairs * Cz), 256, 0, STREAM>>>(out, P(A + "output_b"), pairs, Cz);
+  addK2<<<blocks(pairs * Cz), 256, 0, STREAM>>>(pair, out, pairs * Cz);
+}
+
+// ---------------------------------------------------------------- the templates' MSA rows
+__device__ inline void sub3(const float* a, const float* b, float* o) { for (int k = 0; k < 3; ++k) o[k] = a[k] - b[k]; }
+__device__ inline float dot3(const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+__device__ inline void cross3(const float* a, const float* b, float* o) {
+  o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0];
+}
+// monomer: aatype(22) | torsion sin,cos(14) | alt torsion sin,cos(14) | torsion mask(7) = 57, and the row's
+// mask (the psi torsion's) - all_atom.atom37_to_torsion_angles, placeholder off (zero_init)
+__global__ void templateTorsionFeatK(const int* tAatype, const float* tPos, const float* tMask, const int* chiIdx,
+                                     const float* chiMaskT, const float* chiPi, float* feat, float* rowMask, int L) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= L) return;
+  int aaRaw = tAatype[i], a = min(aaRaw, 20);
+  const float* p = tPos + (size_t)i * 37 * 3; const float* m = tMask + (size_t)i * 37;
+  float zp[37 * 3] = {}; float zm[37] = {};
+  const float* pp = i > 0 ? tPos + (size_t)(i - 1) * 37 * 3 : zp; const float* pm = i > 0 ? tMask + (size_t)(i - 1) * 37 : zm;
+  const float* atoms[7][4]; float tm[7];
+  atoms[0][0] = pp + 3; atoms[0][1] = pp + 6; atoms[0][2] = p; atoms[0][3] = p + 3;          // pre-omega
+  tm[0] = pm[1] * pm[2] * m[0] * m[1];
+  atoms[1][0] = pp + 6; atoms[1][1] = p; atoms[1][2] = p + 3; atoms[1][3] = p + 6;          // phi
+  tm[1] = pm[2] * m[0] * m[1] * m[2];
+  atoms[2][0] = p; atoms[2][1] = p + 3; atoms[2][2] = p + 6; atoms[2][3] = p + 12;          // psi
+  tm[2] = m[0] * m[1] * m[2] * m[4];
+  for (int c = 0; c < 4; ++c) {
+    float mm = chiMaskT[a * 4 + c];
+    for (int k = 0; k < 4; ++k) { int at = chiIdx[(a * 4 + c) * 4 + k]; atoms[3 + c][k] = p + at * 3; mm *= m[at]; }
+    tm[3 + c] = mm;
+  }
+  float* f = feat + (size_t)i * 57;
+  for (int k = 0; k < 22; ++k) f[k] = (k == min(max(aaRaw, 0), 21)) ? 1.f : 0.f;
+  for (int t = 0; t < 7; ++t) {
+    // frame: e0 = origin - neg_x, e1 = xy - origin (Gram-Schmidt), origin = atom 2; the fourth atom in it.
+    // In double: at residue 0 the previous atoms are zero padding and Gram-Schmidt cancels to a vector
+    // ~1e-14 of the backbone's, which the 1e-8 regulariser should leave near zero - in float the
+    // cancellation's rounding was amplified into an O(1) pre-omega (the reference's is exactly 0)
+    double e0[3], e1[3], e2[3], d[3];
+    for (int k = 0; k < 3; ++k) { e0[k] = (double)atoms[t][2][k] - atoms[t][1][k]; e1[k] = (double)atoms[t][0][k] - atoms[t][2][k];
+                                  d[k] = (double)atoms[t][3][k] - atoms[t][2][k]; }
+    double n0 = sqrt(e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2] + 1e-8); for (int k = 0; k < 3; ++k) e0[k] /= n0;
+    double c = e1[0] * e0[0] + e1[1] * e0[1] + e1[2] * e0[2]; for (int k = 0; k < 3; ++k) e1[k] -= c * e0[k];
+    double n1 = sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2] + 1e-8); for (int k = 0; k < 3; ++k) e1[k] /= n1;
+    e2[0] = e0[1] * e1[2] - e0[2] * e1[1]; e2[1] = e0[2] * e1[0] - e0[0] * e1[2]; e2[2] = e0[0] * e1[1] - e0[1] * e1[0];
+    double y = e1[0] * d[0] + e1[1] * d[1] + e1[2] * d[2], z = e2[0] * d[0] + e2[1] * d[1] + e2[2] * d[2];
+    double nn = sqrt(z * z + y * y + 1e-8);
+    float sn = (float)(z / nn), cs = (float)(y / nn);
+    // ...and the first residue's pre-omega is DEFINED as zero: its "previous" atoms are padding, the frame
+    // degenerate, and its exact value the regulariser's ~0 - the reference's float arithmetic happens to
+    // cancel to exactly 0 there, where any other rounding gives noise of either sign
+    if (t == 0 && i == 0) sn = cs = 0.f;
+    if (t == 2) { sn = -sn; cs = -cs; }
+    float alt = t >= 3 ? 1.f - 2.f * chiPi[a * 4 + t - 3] : 1.f;
+    f[22 + t * 2] = sn; f[22 + t * 2 + 1] = cs;
+    f[36 + t * 2] = sn * alt; f[36 + t * 2 + 1] = cs * alt;
+    f[50 + t] = tm[t];
+  }
+  rowMask[i] = tm[2];
+}
+// multimer (template_embedding_1d): aatype(22) | sin(chi) mask(4) | cos(chi) mask(4) | chi mask(4) = 34, the
+// row's mask chi 1's
+__global__ void templateChiFeatK(const int* tAatype, const float* tPos, const float* tMask, const int* chiIdx,
+                                 const float* chiMaskT, float* feat, float* rowMask, int L) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= L) return;
+  int aaRaw = tAatype[i], a = min(max(aaRaw, 0), 20);
+  const float* p = tPos + (size_t)i * 37 * 3; const float* m = tMask + (size_t)i * 37;
+  float* f = feat + (size_t)i * 34;
+  for (int k = 0; k < 22; ++k) f[k] = (k == min(max(aaRaw, 0), 21)) ? 1.f : 0.f;
+  for (int c = 0; c < 4; ++c) {
+    const float* x[4]; float mm = chiMaskT[a * 4 + c];
+    for (int k = 0; k < 4; ++k) { int at = chiIdx[(a * 4 + c) * 4 + k]; x[k] = p + at * 3; mm *= m[at]; }
+    float v1[3], v2[3], v3[3], c1[3], c2[3], c3[3];
+    sub3(x[0], x[1], v1); sub3(x[1], x[2], v2); sub3(x[3], x[2], v3);
+    cross3(v1, v2, c1); cross3(v3, v2, c2); cross3(c2, c1, c3);
+    float v2m = sqrtf(fmaxf(dot3(v2, v2), 1e-12f));
+    float ang = atan2f(dot3(c3, v2), v2m * dot3(c1, c2));
+    f[22 + c] = sinf(ang) * mm; f[26 + c] = cosf(ang) * mm; f[30 + c] = mm;
+    if (c == 0) rowMask[i] = mm;
+  }
+}
+// rows [T, L, 256] of the MSA from the templates' single features; their masks into rowMask [T, L]
+inline void templateRows(int L, int T, bool multimer, float* rows, float* rowMask) {
+  const std::string E = "evoformer/";
+  int F = multimer ? 34 : 57;
+  float* feat = scratch<float>("trow.feat", (size_t)T * L * F);
+  for (int k = 0; k < T; ++k) {
+    const int* aat = Idev("t/aatype") + (size_t)k * L;
+    const float* pos = W("t/positions") + (size_t)k * L * 37 * 3; const float* msk = W("t/mask") + (size_t)k * L * 37;
+    if (multimer)
+      templateChiFeatK<<<blocks(L, 128), 128, 0, STREAM>>>(aat, pos, msk, Idev("c/chi_atom_indices"), W("c/chi_angles_mask"),
+                                                           feat + (size_t)k * L * F, rowMask + (size_t)k * L, L);
+    else
+      templateTorsionFeatK<<<blocks(L, 128), 128, 0, STREAM>>>(aat, pos, msk, Idev("c/chi_atom_indices"), W("c/chi_angles_mask"),
+                                                               W("c/chi_pi_periodic"), feat + (size_t)k * L * F, rowMask + (size_t)k * L, L);
+  }
+  float* hid = scratch<float>("trow.hid", (size_t)T * L * 256);
+  linearB(feat, E + "template_single_embedding", -1, hid, (size_t)T * L, F, 256, true);
+  linearB(hid, E + "template_projection", -1, rows, (size_t)T * L, 256, 256);
+}

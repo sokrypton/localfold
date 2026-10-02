@@ -4,14 +4,15 @@
 #   native/af2/fold <out.pdb> --sequence=<SEQ>[:<SEQ>...] [--a3m=<path>] [--model=model_1_ptm] [-- <af2 flags>]
 #   native/af2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
 #   native/af2/fold 1brs.pdb --sequence=<A>:<B> --model=model_1_multimer_v3
+#   native/af2/fold 5caj.pdb --sequence=<SEQ> --template=5caj.pdb:A       (1brs: --template=1brs.pdb:A+D)
 #
 # --model names a DeepMind parameter set (model_1_ptm .. model_5_ptm, model_1_multimer_v3 ..); its
 # weights are exported once (native/af2/export_weights.py, af3-any-model's conversion) into
-# native/af2/weights-<model>. Input flags (--sequence, --a3m, --recycles, --max-msa, --max-extra,
-# --seed) go to export_input.mjs; flags after -- go to ./af2, which runs --fast.
+# native/af2/weights-<model>. Input flags (--sequence, --a3m, --template, --recycles, --max-msa,
+# --max-extra, --seed) go to export_input.mjs; flags after -- go to ./af2, which runs --fast.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-[ $# -ge 1 ] || { sed -n '2,13p' "$0"; exit 1; }
+[ $# -ge 1 ] || { sed -n '2,14p' "$0"; exit 1; }
 out="$1"; shift
 inputs=(); flags=(); model=model_1_ptm
 while [ $# -gt 0 ]; do

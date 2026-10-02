@@ -6,6 +6,7 @@
 
 struct Trunk {
   int L, N, E;                  // residues, MSA rows, extra MSA rows
+  int T = 0;                    // template rows appended to the MSA (their single features), after N
   float* msa;                   // [N, L, 256]
   float* extra;                 // [E, L, 64]
   float* pair;                  // [L, L, 128]
@@ -117,12 +118,12 @@ inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prev
   linearB(ef, E + "extra_msa_activations", -1, t.extra, erows, 25, 64);
   // the masks into fixed buffers: the stacks after this are replayed as one CUDA graph from pass 1 on,
   // and a graph's pointers do not change between passes
-  float* mm = scratch<float>("emb.msaMask", (size_t)N * L); float* em = scratch<float>("emb.extraMask", erows);
+  float* mm = scratch<float>("emb.msaMask", (size_t)(N + t.T) * L); float* em = scratch<float>("emb.extraMask", erows);
   CK(cudaMemcpyAsync(mm, W(f + "msa_mask"), (size_t)N * L * 4, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(em, W(f + "extra_msa_mask"), erows * 4, cudaMemcpyDeviceToDevice, STREAM));
   t.msaMask = mm; t.extraMask = em;
   auto ones = [](const float* h, size_t n) { for (size_t i = 0; i < n; ++i) if (h[i] != 1.f) return false; return true; };
-  t.msaOnes = ones(M.f(f + "msa_mask"), (size_t)N * L);
+  t.msaOnes = ones(M.f(f + "msa_mask"), (size_t)N * L) && t.T == 0;     // (a template row's mask is the template's)
   t.extraOnes = ones(M.f(f + "extra_msa_mask"), erows);
   t.pairOnes = ones(M.f("seq_mask"), L);
   pairMaskK<<<blocks(pairs), 256, 0, STREAM>>>(W("seq_mask"), t.pairMask, L);
@@ -203,18 +204,21 @@ inline void attentionCoreAcross(const half* xn, int Bt, int n, int C, const std:
   ltGemm(o, w.out, residual, false, rows, Wp, C, P(A + "/output_b", blk), false, 1.f);
 }
 // the pair bias, --fast: LN(pair) in f16 -> [pairs, H] -> the flash layout
-inline const half* pairBiasFast(const half* pn, int L, int H, const float* w, const float* pairMask, bool transposed = false) {
+inline const half* pairBiasFast(const half* pn, int L, int C, int H, const float* w, const float* pairMask, bool transposed = false) {
   size_t pairs = (size_t)L * L; int stride = (L + 7) / 8 * 8;
   float* proj = scratch<float>("fbias.proj", pairs * H);
   static std::map<const float*, half*> wh;
   auto it = wh.find(w);
   if (it == wh.end()) {
-    half* h = dallocT<half>((size_t)128 * H);
-    toHalfK<<<blocks((size_t)128 * H), 256, 0, STREAM>>>(w, h, (size_t)128 * H);
+    half* h = dallocT<half>((size_t)C * H);
+    toHalfK<<<blocks((size_t)C * H), 256, 0, STREAM>>>(w, h, (size_t)C * H);
     it = wh.emplace(w, h).first;
   }
-  ltGemm(pn, it->second, proj, false, pairs, 128, H, nullptr, false, 0.f);
+  ltGemm(pn, it->second, proj, false, pairs, C, H, nullptr, false, 0.f);
   half* bias = scratch<half>("fbias.bias", (size_t)H * L * stride);
+  // the pad columns past L are read by the kernel's 16-byte loads beside the last real ones: a stale
+  // NaN there (the buffer is shared) poisons the row, so they must hold zeros
+  if (stride != L) CK(cudaMemsetAsync(bias, 0, (size_t)H * L * stride * 2, STREAM));
   biasFromProjK<<<blocks(pairs * H), 256, 0, STREAM>>>(proj, pairMask, bias, L, H, stride, transposed);
   return bias;
 }
@@ -234,7 +238,7 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
   if (FAST) {
     half* pn = scratch<half>("frow.pn", pairs * 128);
     layerNormH(t.pair, pn, pairs, 128, R + "/feat_2d_norm", blk);
-    const half* bias = pairBiasFast(pn, L, H, P(R + "/feat_2d_weights", blk), t.pairOnes ? nullptr : t.pairMask);
+    const half* bias = pairBiasFast(pn, L, 128, H, P(R + "/feat_2d_weights", blk), t.pairOnes ? nullptr : t.pairMask);
     half* xn = scratch<half>("frow.xn", rows * C);
     layerNormH(msa, xn, rows, C, R + "/query_norm", blk);
     bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
@@ -466,7 +470,7 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
   if (FAST && pairOnes && !starting) {
     half* xn = scratch<half>("ftatt.xn", pairs * C);
     layerNormH(pair, xn, pairs, C, A + "/query_norm", blk);
-    const half* bias = pairBiasFast(xn, L, H, P(A + "/feat_2d_weights", blk), nullptr, true);
+    const half* bias = pairBiasFast(xn, L, C, H, P(A + "/feat_2d_weights", blk), nullptr, true);
     attentionCoreAcross(xn, L, L, C, A + "/attention", blk, bias, pair);
     return;
   }
@@ -476,7 +480,7 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
   if (FAST) {
     half* xn = scratch<half>("ftatt.xn", pairs * C);
     layerNormH(x, xn, pairs, C, A + "/query_norm", blk);
-    const half* bias = pairBiasFast(xn, L, H, P(A + "/feat_2d_weights", blk), nullptr);
+    const half* bias = pairBiasFast(xn, L, C, H, P(A + "/feat_2d_weights", blk), nullptr);
     attentionCore(xn, L, L, C, A + "/attention", blk, pairOnes ? nullptr : mask, bias, pair, !starting);
     return;
   }
@@ -496,7 +500,7 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
 inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
   const std::string S = extraStack ? "evoformer/extra_msa_stack/" : "evoformer/evoformer_iteration/";
   float* msa = extraStack ? t.extra : t.msa;
-  int rowsN = extraStack ? t.E : t.N, C = extraStack ? 64 : 256;
+  int rowsN = extraStack ? t.E : t.N + t.T, C = extraStack ? 64 : 256;
   const float* mask = extraStack ? t.extraMask : t.msaMask;
   std::string R = S + "msa_row_attention_with_pair_bias/attention/query_w";
   int H = (int)dimW(R, 2), D = (int)dimW(R, 3);
