@@ -648,6 +648,25 @@ __global__ void atomLogitsLayoutK(const float* flat, float* out, int block, int 
 }
 // per token: mean over its real atoms of relu(projected)
 // (over `rows` token rows of every sample, the mask read per sample's token: row % tokens)
+// aggregateK over convert(q2t, ...)'s output, without materialising it: the same sum in the same
+// order (a query the gather masks reads as 0, which the ReLU keeps 0)
+__global__ void aggregateGatherK(const float* projected, const int* idx, const float* gmask, const float* atomMask,
+                                 float* out, size_t rows, int tokens, int dense, int Cp, size_t q1) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * Cp) return;
+  size_t token = t / Cp; int c = (int)(t % Cp);
+  size_t k = token / tokens; size_t g0 = (token % tokens) * dense;
+  float count = 0, sum = 0;
+  for (int a = 0; a < dense; ++a) {
+    float m = atomMask[g0 + a];
+    count += m;
+    if (m != 0) {
+      float v = gmask[g0 + a] != 0 ? projected[((size_t)idx[g0 + a] + k * q1) * Cp + c] : 0.f;
+      sum += v > 0 ? v : 0;
+    }
+  }
+  out[t] = count > 0 ? sum / count : 0.f;
+}
 __global__ void aggregateK(const float* tokenAtoms, const float* atomMask, float* out, size_t rows, int tokens,
                            int dense, int Cp) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -899,11 +918,11 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
   o.skip = act;
   float* projected = scratch<float>("enc.aggr", qRows * o.perToken);
   linear<float, float>(act, projected, qRows, C, o.perToken, E + ".projectAtomFeaturesForAggr");
-  float* tokenAtoms = scratch<float>("enc.tokenAtoms", atoms * NS * o.perToken);
-  convert(q2t, projected, tokenAtoms, o.perToken, q1, NS);
+  // the gather back to token atoms fused into the mean: the gathered tensor was atoms x 768 floats
+  // a sample, written and read again every step (96 MB at 261 tokens and five samples)
   o.tokenAct = scratch<float>(E + ".tokenAct", (size_t)sh.tokens * NS * o.perToken);
-  aggregateK<<<blocks((size_t)sh.tokens * NS * o.perToken), 256, 0, STREAM>>>(tokenAtoms, Fdev("batch.refMask"),
-    o.tokenAct, (size_t)sh.tokens * NS, sh.tokens, sh.dense, o.perToken);
+  aggregateGatherK<<<blocks((size_t)sh.tokens * NS * o.perToken), 256, 0, STREAM>>>(projected, q2t.idx, q2t.mask,
+    Fdev("batch.refMask"), o.tokenAct, (size_t)sh.tokens * NS, sh.tokens, sh.dense, o.perToken, q1);
 }
 inline EncoderOut atomEncoder(const std::string& E, const std::string& refPrefix, const float* trunkSingle,
                               const float* trunkPair, const float* atomPositions) {

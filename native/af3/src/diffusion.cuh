@@ -696,6 +696,17 @@ __global__ void broadcastTokensK(const float* proj, float* perAtom, int tokens, 
   int c = (int)(t % C); size_t ta = t / C; int token = (int)(ta / dense);
   perAtom[t] = proj[(size_t)token * C + c];
 }
+// act[q] = (t2q.mask[q] ? proj[token of t2q.idx[q]] : 0) + skip[q], times the query's mask - what
+// broadcastTokensK, convert(t2q, ...) and addSkipMaskK computed in three passes
+__global__ void broadcastSkipK(const float* proj, const int* idx, const float* gmask, const float* skip,
+                               const float* qMask, float* act, size_t rows, int C, size_t q1, int tokens, int dense) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * C) return;
+  size_t q = t / C; int c = (int)(t % C);
+  size_t gq = q % q1, k = q / q1;
+  float v = gmask[gq] != 0 ? proj[((size_t)idx[gq] / dense + k * tokens) * C + c] : 0.f;
+  act[t] = (v + skip[t]) * qMask[gq];
+}
 __global__ void addSkipMaskK(float* act, const float* skip, const float* mask, size_t rows, int C, size_t period) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) act[t] = (act[t] + skip[t]) * mask[(t / C) % period];
@@ -723,11 +734,10 @@ inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const De
   Gather t2q = gatherOf("batch.tokenAtomsToQueries"), q2t = gatherOf("batch.queriesToTokenAtoms");
   float* proj = scratch<float>("dec.proj", (size_t)sh.tokens * NS * C);
   linear<float, float>(tokenAct, proj, (size_t)sh.tokens * NS, d.perToken, C, Dd + ".projectTokenFeaturesForBroadcast");
-  float* perAtom = scratch<float>("dec.perAtom", atoms * NS * C);
-  broadcastTokensK<<<blocks(atoms * NS * C), 256, 0, STREAM>>>(proj, perAtom, sh.tokens * NS, sh.dense, C);
+  // broadcast to token atoms, gather to queries, add the skip and mask: one pass, nothing between
   float* act = scratch<float>("dec.act", qRows * C);
-  convert(t2q, perAtom, act, C, atoms, NS);
-  addSkipMaskK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, enc.skip, enc.qMask, qRows, C, q1);
+  broadcastSkipK<<<blocks(qRows * C), 256, 0, STREAM>>>(proj, t2q.idx, t2q.mask, enc.skip, enc.qMask, act, qRows, C,
+                                                       q1, sh.tokens, sh.dense);
   AtomStep st{ gatherOf("batch.queriesToKeys"), enc.qMask, enc.kMask, M.flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
                M.flag(Dd + ".blocks.0.diffusionNoResidual") };
   bool maskPerBlock = M.flag(Dd + ".blocks.0.maskAtomActPerBlock");
