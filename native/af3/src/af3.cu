@@ -9,6 +9,7 @@
 #include "diffusion.cuh"
 #include "sampler.cuh"
 #include "confidence.cuh"
+#include "benchops.cuh"
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
@@ -36,6 +37,7 @@ int main(int argc, char** argv) {
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          (int)M.meta("batch.tokens"));
 
+  for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-ops=", 12)) { benchOps(atoi(argv[i] + 12)); return 0; }
   // One denoiser call on AF3's own inputs, against AF3's own output.
   if (M.has("oracle.denoise.output")) {
     int n = (int)M.meta("batch.tokens");

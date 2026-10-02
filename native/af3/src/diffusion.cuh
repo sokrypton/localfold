@@ -247,6 +247,37 @@ __global__ void adaLnStridedK(const float* x, const float* scale, const float* s
   for (int c = lane; c < C; c += 32)
     out[row * C + c] = sigm(scale[row * ld + c]) * ((xr[c] - mean) * inv) + shift[row * ld + c];
 }
+// One row a block: act += y * sigmoid(gate) (if y), then out = sigmoid(scale) * LN(act) + shift,
+// scale/shift/gate read at their row strides. Fuses a residual add with the next adaptive LN.
+template <class TO>
+__global__ void gatedAddAdaLnK(float* act, const float* y, const float* gate, int ldg, const float* scale,
+                               const float* shift, int lds, TO* out, int C) {
+  extern __shared__ float row[];
+  __shared__ float red[32];
+  size_t r = blockIdx.x;
+  float* a = act + r * C;
+  float s = 0;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    float v = a[c];
+    if (y) { v += y[r * C + c] * sigm(gate[r * ldg + c]); a[c] = v; }
+    row[c] = v; s += v;
+  }
+  auto blockSum = [&](float v) {
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = v;
+    __syncthreads();
+    float t = 0;
+    for (int w = 0; w < (int)(blockDim.x / 32); ++w) t += red[w];
+    return t;
+  };
+  float mean = blockSum(s) / C, v = 0;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) { float d = row[c] - mean; v += d * d; }
+  float inv = 1.f / sqrtf(blockSum(v) / C + 1e-5f);
+  if (!out) return;
+  for (int c = threadIdx.x; c < C; c += blockDim.x)
+    out[r * C + c] = fromF<TO>(sigm(scale[r * lds + c]) * ((row[c] - mean) * inv) + shift[r * lds + c]);
+}
 // x += y * sigmoid(gate) with the gate read at a row stride
 __global__ void addGatedStridedK(float* x, const float* y, const float* gate, int ld, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -259,9 +290,18 @@ __global__ void addGatedStridedK(float* x, const float* y, const float* gate, in
 //   cond' = LN0(cond) (no affine) -> [attn scale | attn shift | ffw scale | ffw shift] per block,
 //   the per-block LayerNorm scale folded into the weights (LN_s(x) W = LN0(x) diag(s) W);
 //   cond -> [attn zero gate | ffw zero gate] per block.
+// [h][i][j] f32 -> [h][i][stride] f16 * log2(e), zeros past n
+__global__ void padBiasK(const float* in, half* out, int n, int stride, int heads) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)heads * n * stride) return;
+  int j = (int)(t % stride); size_t hi = t / stride;
+  out[t] = __float2half(j < n ? in[hi * n + j] * LOG2E : 0.f);
+}
 struct TransformerCache {
   bool ready = false; int n = 0, nblocks = 0;
   std::vector<float*> pairLogits;      // [h][i][j] per block
+  std::vector<half*> biasHalf;         // the same, f16, log2(e)-scaled, rows padded: the flash kernel's
+  int stride = 0;
   std::string wNorm, wRaw;             // synthetic weight names
   float *bNorm, *bRaw;                 // the matching biases (zero where none)
 };
@@ -320,6 +360,13 @@ inline void prepareTransformer(const float* pairCond, int n) {
     tc.pairLogits[b] = scratch<float>("dt.pl" + std::to_string(b), (size_t)heads * pairs);
     atomLogitsLayoutK<<<blocks((size_t)heads * pairs), 256, 0, STREAM>>>(flat, tc.pairLogits[b], b % perSuper, perSuper, 1, heads, n, n);
   }
+  // the flash kernel's form of the same logits: f16, scaled by log2(e), rows padded to 8
+  tc.stride = (n + 7) / 8 * 8;
+  tc.biasHalf.resize(tc.nblocks);
+  for (int b = 0; b < tc.nblocks; ++b) {
+    tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b), (size_t)heads * n * tc.stride);
+    padBiasK<<<blocks((size_t)heads * n * tc.stride), 256, 0, STREAM>>>(tc.pairLogits[b], tc.biasHalf[b], n, tc.stride, heads);
+  }
   tc.n = n; tc.ready = true;
 }
 
@@ -344,7 +391,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   linear<T, float>(condT, gRaw, n, Cc, ldr, tc.wRaw);
   addVectorK<<<blocks((size_t)n * ldr), 256, 0, STREAM>>>(gRaw, tc.bRaw, n, ldr);
   T* x = scratch<T>("dt.x", (size_t)n * C);
-  T* qkvg = scratch<T>("dt.qkvg", (size_t)n * 4 * Wd);
+  T* qkvg = scratch<T>("dt.qkvg", (size_t)(n + 128) * 4 * Wd);
   float* logits = scratch<float>("dt.logits", (size_t)heads * pairs);
   T* P = scratch<T>("dt.P", (size_t)heads * pairs);
   T* o = scratch<T>("dt.o", (size_t)n * Wd);
@@ -359,23 +406,30 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   for (int b = 0; b < tc.nblocks; ++b) {
     std::string B = Tn + ".superBlocks." + std::to_string(b / perSuper) + ".blocks." + std::to_string(b % perSuper);
     const float* g = gNorm + (size_t)b * 4 * C; const float* z = gRaw + (size_t)b * 2 * C;
-    adaLnStridedTK<T><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(act, g, g + C, ldn, x, n, C);
+    // the previous block's transition residual, fused with this block's first adaptive LN
+    const float* zPrev = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C + C : nullptr;
+    gatedAddAdaLnK<T><<<n, 256, C * 4, STREAM>>>(act, b > 0 ? proj : nullptr, zPrev, ldr, g, g + C, ldn, x, C);
     linear<T, T>(x, qkvg, n, C, 4 * Wd, qkvgWeight(B, C, Wd, false));
     addQBiasTK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), n, Wd);
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, D, &one, qkvg + Wd, cudaType<T>(), 4 * Wd, D,
-       qkvg, cudaType<T>(), 4 * Wd, D, &zero, logits, CUDA_R_32F, n, pairs, heads, CUBLAS_COMPUTE_32F, algo));
-    tokenSoftmaxTK<T><<<(unsigned)(heads * n), 128, 0, STREAM>>>(logits, tc.pairLogits[b], mask, P, n, 1.f / sqrtf((float)D));
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, D, n, n, &one, qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, D,
-       P, cudaType<T>(), n, pairs, &zero, o, cudaType<T>(), Wd, D, heads, CUBLAS_COMPUTE_32F, algo));
-    gateTK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd);
+    if constexpr (std::is_same_v<T, half>) {
+      // one fused kernel: QK^T, bias, mask, online softmax, PV and the gate
+      flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, mask, o, n, heads, D, 0, 1, false, 1.f / sqrtf((float)D));
+    } else {
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, D, &one, qkvg + Wd, cudaType<T>(), 4 * Wd, D,
+         qkvg, cudaType<T>(), 4 * Wd, D, &zero, logits, CUDA_R_32F, n, pairs, heads, CUBLAS_COMPUTE_32F, algo));
+      tokenSoftmaxTK<T><<<(unsigned)(heads * n), 128, 0, STREAM>>>(logits, tc.pairLogits[b], mask, P, n, 1.f / sqrtf((float)D));
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, D, n, n, &one, qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, D,
+         P, cudaType<T>(), n, pairs, &zero, o, cudaType<T>(), Wd, D, heads, CUBLAS_COMPUTE_32F, algo));
+      gateTK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd);
+    }
     linear<T, float>(o, att, n, Wd, C, B + ".Transition2");
-    addGatedStridedK<<<blocks((size_t)n * C), 256, 0, STREAM>>>(act, att, z, ldr, n, C);
-    adaLnStridedTK<T><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(act, g + 2 * C, g + 3 * C, ldn, tn, n, C);
+    gatedAddAdaLnK<T><<<n, 256, C * 4, STREAM>>>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, C);
     linear<T, T>(tn, wide, n, C, 2 * I, B + ".ffwTransition1");
     swigluK<T><<<blocks((size_t)n * I), 256, 0, STREAM>>>(wide, gated, n, I);
     linear<T, float>(gated, proj, n, I, C, B + ".ffwTransition2");
-    addGatedStridedK<<<blocks((size_t)n * C), 256, 0, STREAM>>>(act, proj, z + C, ldr, n, C);
   }
+  // the last block's transition residual
+  addGatedStridedK<<<blocks((size_t)n * C), 256, 0, STREAM>>>(act, proj, gRaw + (size_t)(tc.nblocks - 1) * 2 * C + C, ldr, n, C);
 }
 inline bool DIFF_HALF = false;     // the denoiser's transformer in f16 (set by --fast)
 

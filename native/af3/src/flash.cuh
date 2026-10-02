@@ -235,6 +235,7 @@ void flashGrid(const T* qkvg, const T* bias, int stride, const float* mask, T* o
                int D, size_t r0, size_t rows, bool tr, float scale) {
   if constexpr (std::is_same_v<T, half>) {
     if (D == 32) flashGridHalfLaunch<32>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale);
+    else if (D == 48) flashGridHalfLaunch<48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale);
     else if (D == 16) flashGridHalfLaunch<16>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale);
     else { fprintf(stderr, "flashGrid: no f16 kernel for head width %d\n", D); exit(1); }
   } else {
