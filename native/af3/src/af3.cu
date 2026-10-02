@@ -278,7 +278,7 @@ int main(int argc, char** argv) {
     NS = samples;
     std::vector<float> xs = sample(steps, seed, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
-    }, samples);
+    }, samples, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
     NS = 1;
     diffMs = ms(s0, clock());
     if (tight) releaseScratch();
@@ -378,6 +378,7 @@ int main(int argc, char** argv) {
     if (profiling) prof::stop(40);
     if (fi == 0 && which == 0 && serveDir.empty()) unreadWeights();
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
+    if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); }
     if (fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {

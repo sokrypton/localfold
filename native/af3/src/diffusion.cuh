@@ -78,6 +78,18 @@ __global__ void fourierK(const float* params, const float* w, const float* b, fl
   float tr = 0.25f * logf(params[0] / 16.f);
   out[k] = cosf(6.283185307179586f * (tr * w[k] + b[k]));
 }
+__global__ void fourierBatchK(const float* levels, const float* w, const float* b, float* out, int nc, int S) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (t >= (size_t)S * nc) return;
+  int k = (int)(t % nc), s = (int)(t / nc);
+  float tr = 0.25f * logf(levels[s] / 16.f);
+  out[t] = cosf(6.283185307179586f * (tr * w[k] + b[k]));
+}
+// out[s][i][c] = base[i][c] + v[s][c]
+__global__ void baseplusK(const float* base, const float* v, float* out, int S, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (t >= (size_t)S * n * C) return;
+  int c = (int)(t % C); size_t si = t / C; int s = (int)(si / n), i = (int)(si % n);
+  out[t] = base[(size_t)i * C + c] + v[(size_t)s * C + c];
+}
 inline void setNoise(float noiseLevel) {
   static float* pinned = nullptr;
   if (!noiseParams) { noiseParams = dalloc(4); CK(cudaMallocHost(&pinned, 16)); }
@@ -740,6 +752,9 @@ struct DiffusionFold {
   int n;
   EncoderOut enc; DecoderCache dec;
   cudaGraphExec_t graph = nullptr; const float* graphInput = nullptr; int calls = 0;
+  // every step's single conditioning and its embedding projection, computed in one batch before
+  // sampling (precomputeConditioning) - a step only copies its slices in
+  std::vector<float> preLevels; float *preSingle = nullptr, *preSnProj = nullptr; bool usePre = false;
 };
 inline bool GRAPHS = true;
 // the denoiser's seams against a stage oracle (oracle.stages.stages.<name>), when one was exported
@@ -761,12 +776,44 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
   prepareTransformer(cond.pair, n);
   return f;
 }
+// The conditioning of every step at once: it depends on the step only through its noise level,
+// and the sampler knows all of them before it starts - so the Fourier embedding, its projection,
+// both transitions and the single-conditioning projection run as a few large GEMMs over
+// steps x tokens rows instead of ~15 small kernels a step (68 tokens: ~0.1 ms of a 1.9 ms step)
+inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& levels) {
+  const std::string P = "diffusion.conditioning";
+  int S = (int)levels.size(), n = f.n;
+  int Cs = (int)M.meta(P + ".seqChannels"), Cse = (int)M.meta("diffusion.seqChannels"), perToken = (int)M.meta("diffusion.perTokenChannels");
+  if (Cs != Cse) { fprintf(stderr, "conditioning width %d against %d\n", Cs, Cse); exit(1); }
+  if (!DCACHE.ready) diffusionConditioning(f.trunkSingle, f.trunkPair, f.targetFeat, SIGMA_DATA, n);   // the base
+  size_t nc = lenW(P + ".fourierWeight");
+  float* lv = upload(levels.data(), S);
+  float* e = dalloc((size_t)S * nc); float* en = dalloc((size_t)S * nc); float* proj = dalloc((size_t)S * Cs);
+  fourierBatchK<<<blocks((size_t)S * nc), 256, 0, STREAM>>>(lv, W(P + ".fourierWeight"), W(P + ".fourierBias"), e, (int)nc, S);
+  layerNormSlow(e, en, S, (int)nc, W(P + ".noiseEmbeddingInitialNormScale"), Wopt(P + ".noiseEmbeddingInitialNormOffset"));
+  linear<float, float>(en, proj, S, (int)nc, Cs, P + ".noiseEmbeddingInitialProjection");
+  size_t rows = (size_t)S * n;
+  if (f.preSingle) { CK(cudaFree(f.preSingle)); CK(cudaFree(f.preSnProj)); }
+  f.preSingle = dalloc(rows * Cs); f.preSnProj = dalloc(rows * perToken);
+  baseplusK<<<blocks(rows * Cs), 256, 0, STREAM>>>(DCACHE.singleBase, proj, f.preSingle, S, n, Cs);
+  for (int k = 0; k < 2; ++k) plainTransition(f.preSingle, rows, Cs, 2, P + ".singleTransitions." + std::to_string(k));
+  float* sn = dalloc(rows * Cs);
+  layerNormSlow(f.preSingle, sn, rows, Cs, W("diffusion.singleCondEmbeddingNormScale"), Wopt("diffusion.singleCondEmbeddingNormOffset"));
+  linear<float, float>(sn, f.preSnProj, rows, Cs, perToken, "diffusion.singleCondEmbeddingProjection");
+  CK(cudaStreamSynchronize(STREAM));
+  for (float* p : {lv, e, en, proj, sn}) CK(cudaFree(p));
+  scratch<float>("dc.single", (size_t)n * Cs); scratch<float>("dn.snProj", (size_t)n * perToken);   // a step's slices land here
+  f.preLevels = levels; f.usePre = true;
+}
 // D(x; sigma): positions [NS][tokens*dense][3] in, the denoised positions out.
 inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float noiseLevel) {
   int n = f.n, dense = (int)M.meta("batch.dense");
   size_t atoms = (size_t)n * dense, total = atoms * NS;
   stage(nullptr);
-  Conditioning cond = diffusionConditioning(f.trunkSingle, f.trunkPair, f.targetFeat, noiseLevel, n); stage("d.conditioning");
+  Conditioning cond;
+  if (f.usePre) cond = { scratch<float>("dc.single", (size_t)n * (int)M.meta("diffusion.conditioning.seqChannels")), DCACHE.pair };
+  else cond = diffusionConditioning(f.trunkSingle, f.trunkPair, f.targetFeat, noiseLevel, n);
+  stage("d.conditioning");
   dtap("conditioning.single", cond.single, (size_t)n * (int)M.meta("diffusion.conditioning.seqChannels"));
   dtap("conditioning.pair", cond.pair, (size_t)n * n * (int)M.meta("diffusion.conditioning.pairChannels"));
   const float* atomMask = Fdev("batch.refMask");
@@ -774,10 +821,12 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   scalePositionsK<<<blocks(total * 3), 256, 0, STREAM>>>(positionsNoisy, atomMask, scaled, total, atoms, noiseParams);
   encoderStep("diffusion.encoder", f.enc, scaled); stage("d.encoder");
   int Cs = (int)M.meta("diffusion.seqChannels"), perToken = (int)M.meta("diffusion.perTokenChannels");
-  float* sn = scratch<float>("dn.sn", (size_t)n * Cs);
-  layerNormSlow(cond.single, sn, n, Cs, W("diffusion.singleCondEmbeddingNormScale"), Wopt("diffusion.singleCondEmbeddingNormOffset"));
   float* snProj = scratch<float>("dn.snProj", (size_t)n * perToken);
-  linear<float, float>(sn, snProj, n, Cs, perToken, "diffusion.singleCondEmbeddingProjection");
+  if (!f.usePre) {
+    float* sn = scratch<float>("dn.sn", (size_t)n * Cs);
+    layerNormSlow(cond.single, sn, n, Cs, W("diffusion.singleCondEmbeddingNormScale"), Wopt("diffusion.singleCondEmbeddingNormOffset"));
+    linear<float, float>(sn, snProj, n, Cs, perToken, "diffusion.singleCondEmbeddingProjection");
+  }
   size_t rows = (size_t)n * NS;
   float* act = scratch<float>("dn.act", rows * perToken);
   CK(cudaMemcpyAsync(act, f.enc.tokenAct, rows * perToken * 4, cudaMemcpyDeviceToDevice, STREAM));
@@ -808,6 +857,15 @@ inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float n
     if (!noiseParams) setNoise(noiseLevel);
     CK(cudaMemcpyAsync(noiseParams, deviceLevel, 4, cudaMemcpyDeviceToDevice, STREAM));
   } else setNoise(noiseLevel);
+  if (f.usePre) {           // this step's precomputed conditioning, into the buffers the step reads
+    auto at = std::find(f.preLevels.begin(), f.preLevels.end(), noiseLevel);
+    if (at == f.preLevels.end()) { fprintf(stderr, "noise level %g was not precomputed\n", noiseLevel); exit(1); }
+    size_t s = at - f.preLevels.begin(), n = f.n;
+    int Cs = (int)M.meta("diffusion.conditioning.seqChannels"), perToken = (int)M.meta("diffusion.perTokenChannels");
+    CK(cudaMemcpyAsync(scratch<float>("dc.single", n * Cs), f.preSingle + s * n * Cs, n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+    CK(cudaMemcpyAsync(scratch<float>("dn.snProj", n * perToken), f.preSnProj + s * n * perToken, n * perToken * 4,
+                       cudaMemcpyDeviceToDevice, STREAM));
+  }
   if (!GRAPHS || STAGES || f.calls++ == 0) return denoiseCore(f, positionsNoisy, noiseLevel);
   if (!f.graph || positionsNoisy != f.graphInput) {
     if (f.graph) CK(cudaGraphExecDestroy(f.graph));

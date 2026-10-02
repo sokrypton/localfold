@@ -75,7 +75,8 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
 inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<float>& mask,
                                  const std::function<const float*(const float*, float, const float*)>& denoiseFn,
                                  int ns = 1, double gamma0 = 0.8, double gammaMin = 1.0, double noiseScale = 1.003,
-                                 double stepScale = 1.5) {
+                                 double stepScale = 1.5,
+                                 const std::function<void(const std::vector<float>&)>& onLevels = {}) {
   size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
   // a model's own EDM constants where its dialect carries them (boltz2)
   double sigmaMin = 0.0004, sigmaMax = 160, rho = 7;
@@ -112,6 +113,7 @@ inline std::vector<float> sample(int steps, uint64_t seed, const std::vector<flo
     double previous = levels[s], level = levels[s + 1];
     tHats[s] = (float)(previous * (1 + (level > gammaMin ? gamma0 : 0)));
   }
+  if (onLevels) onLevels(tHats);       // every step's noise level, before the first step
   float* dLevels = upload(tHats.data(), steps);
   for (int step = 1; step <= steps; ++step) {
     double previous = levels[step - 1], level = levels[step], tHat = tHats[step - 1];
