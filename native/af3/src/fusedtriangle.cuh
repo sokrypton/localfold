@@ -69,10 +69,13 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = TI_NC + 8, KS = C / 16, LDT = R + 8;
   constexpr size_t STAGE = tiStage(C);
   extern __shared__ __align__(16) unsigned char smem[];
+  // Xs is dead once its rows are A fragments, so a and b's staging takes its place (the first
+  // write follows the loop's first barrier, after every warp's ldmatrix): two blocks an SM at 8 warps
+  static_assert(2 * 16 * (R + 8) * sizeof(TA) <= R * LDX * 2, "staging fits in Xs");
   half* Xs = (half*)smem;                                           // [R][LDX]
-  TA* Ta = (TA*)(Xs + R * LDX);                                     // [16 channels][LDT], a then b
+  TA* Ta = (TA*)Xs;                                                 // [16 channels][LDT], a then b
   TA* Tb = Ta + 16 * LDT;
-  unsigned char* stages = (unsigned char*)(Tb + 16 * LDT);
+  unsigned char* stages = (unsigned char*)(Xs + R * LDX);
   auto W0 = [&](int s) { return (half*)(stages + s * STAGE); };
   auto W1 = [&](int s) { return W0(s) + C * LDW; };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
@@ -363,7 +366,7 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
 }
 
 inline bool FUSED_TRIANGLE = true;
-constexpr int TI_WARPS = 16, TO_WARPS = 8;
+constexpr int TI_WARPS = 8, TO_WARPS = 8;    // triInK: 8 warps fit two blocks an SM (1044 tokens: 828 -> 748 ms against 16)
 // rows a block, by size: a small input in the large tiles left most of the device idle (68 tokens:
 // 36 blocks of 256 rows on 108 SMs); the warps are the largest that still give two blocks an SM
 inline size_t MIN_BLOCKS = 54;      // swept: 68 tokens 89.3 -> 75.8 ms of trunk at 54, 150 tokens flat (108 and 216 slower there)
@@ -377,7 +380,7 @@ void triInAt(const float* pair, const float* mask, const std::string& pre, const
              TA* a, TA* b, half* t2, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * WARPS;
   size_t pp = (size_t)np * np;
-  size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * 16 * (R + 8) * 2 + 2 * tiStage(C);
+  size_t smem = (size_t)R * (C + 8) * 2 + 2 * tiStage(C);
   static bool attr = false;
   if (!attr) { CK(cudaFuncSetAttribute(triInK<C, WARPS, TA>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
   triInK<C, WARPS, TA><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
@@ -387,9 +390,8 @@ void triInAt(const float* pair, const float* mask, const std::string& pre, const
 template <class TA>
 void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
               TA* a, TA* b, half* t2, int n, int np, size_t cs) {
-  switch (warpsFor((size_t)np * np, {TI_WARPS, 8, 4})) {
+  switch (warpsFor((size_t)np * np, {TI_WARPS, 4})) {
     case 4: triInAt<TA, 4>(pair, mask, pre, pg, a, b, t2, n, np, cs); break;
-    case 8: triInAt<TA, 8>(pair, mask, pre, pg, a, b, t2, n, np, cs); break;
     default: triInAt<TA, TI_WARPS>(pair, mask, pre, pg, a, b, t2, n, np, cs);
   }
 }
