@@ -1,0 +1,5 @@
+# exported weights and inputs (hundreds of MiB) and build products
+data*/
+/pairformer
+/pairformer16
+*.o
