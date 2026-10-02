@@ -14,7 +14,7 @@
  * no alignment the MSA is the query alone, which is what AF3 itself produces
  * for a single-sequence input rather than a stub.
  */
-import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
+import { ccdUrl, parseCcdComponent, ligandChain } from "../src/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../src/chem/component.js";
 import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
 import { featuriserDialect } from "../src/af3/dialect.js";
@@ -535,6 +535,12 @@ export async function foldAf3(options) {
   }
   const ligands = [];
   for (const entry of options.ligandCodes ?? []) {
+    if (entry.codes !== undefined) {      // several components as one chain (a glycan)
+      const parts = [];
+      for (const code of entry.codes) { await component(code, "ligand"); parts.push(componentCache.get(code)); }
+      ligands.push(ligandChain(parts));
+      continue;
+    }
     // 🔴 A LIGAND IS EITHER A CODE OR A STRUCTURE, AND IT SAYS WHICH RATHER
     // THAN BEING SNIFFED. A plain string is a CCD code, as it always was; an
     // object carrying `smiles` is a molecule drawn out. Guessing between them

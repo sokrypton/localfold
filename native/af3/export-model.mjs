@@ -206,7 +206,7 @@ if (sequence !== "") {
     : (paired === null && unpaired.length === 1 ? unpaired[0] : { paired: merge(paired), unpaired: merge(unpaired) }));
   // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna
   // (one per ":"-chain), --modify=SEP@3[@chain] (the position as tools/gpu/probe-modified.js takes it, chain index from 0)
-  const { ccdUrl, parseCcdComponent } = await import(`${repo}/src/af3/featurise/ccd-component.js`);
+  const { ccdUrl, parseCcdComponent, ligandChain } = await import(`${repo}/src/af3/featurise/ccd-component.js`);
   const { nameSmilesLigands, smilesComponent } = await import(`${repo}/src/chem/component.js`);
   const ccd = async (code) => {
     const response = await fetch(ccdUrl(code));
@@ -219,6 +219,7 @@ if (sequence !== "") {
   if (jobRequest !== null) {           // the page's own resolution (web/af3-model.js)
     for (const entry of jobRequest.ligandCodes) {
       ligands.push(typeof entry === "string" ? await ccd(entry)
+        : entry.codes ? ligandChain(await Promise.all(entry.codes.map(ccd)))     // a glycan: one chain
         : await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
     }
     for (const m of jobRequest.modifications) {

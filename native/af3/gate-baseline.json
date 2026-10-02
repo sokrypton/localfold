@@ -38,6 +38,12 @@
   "ptm": "0.2087",
   "rmsd": null
  },
+ "af3-glycan": {
+  "ligand": 0.022,
+  "plddt": 47.72,
+  "ptm": "0.4101",
+  "rmsd": null
+ },
  "boltz2-6mrr": {
   "plddt": 96.91,
   "ptm": "0.8086",

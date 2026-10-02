@@ -61,7 +61,11 @@ def main():
     # both through `_fold_setup(chains=...)`, so every per-model convention
     # still comes from the reference rather than from this script.
     parser.add_argument("--ligand", default=None,
-                        help="CCD code of a ligand chain to add, e.g. GOL")
+                        help="CCD code of a ligand chain to add, e.g. GOL; several, comma-separated, "
+                             "are ONE chain of bonded components (a glycan: NAG,NAG,BMA,MAN,MAN)")
+    parser.add_argument("--bonds", default=None,
+                        help="bondedAtomPairs as CHAIN:RESIDUE:ATOM-CHAIN:RESIDUE:ATOM;... "
+                             "(1-based residues, as AF3's job file writes them)")
     parser.add_argument("--ptm", default=None,
                         help="modified residue as CODE@POSITION, e.g. SEP@3 (1-based)")
     # a nucleic chain and its modified bases: `--kind dna --mods 5CM@5,5CM@9`
@@ -105,7 +109,7 @@ def main():
                                            unpaired_msa="")
         chains = [chain]
         if arguments.ligand is not None:
-            chains.append(folding_input.Ligand(id="B", ccd_ids=[arguments.ligand.strip().upper()]))
+            chains.append(folding_input.Ligand(id="B", ccd_ids=[c.strip().upper() for c in arguments.ligand.split(",")]))
     elif arguments.ligand is not None or arguments.ptm is not None:
         from alphafold3.common import folding_input
         # `ptms` is a sequence of (CODE, 1-based position) tuples and a ligand
@@ -120,8 +124,18 @@ def main():
             unpaired_msa="", paired_msa="", templates=[])]
         if arguments.ligand is not None:
             chains.append(folding_input.Ligand(
-                id="B", ccd_ids=[arguments.ligand.strip().upper()]))
-    batch, _cfg, _dir = _fold_setup(arguments.model, arguments.sequence, chains=chains)
+                id="B", ccd_ids=[c.strip().upper() for c in arguments.ligand.split(",")]))
+    bonds = None
+    if arguments.bonds:
+        bonds = []
+        for pair in arguments.bonds.split(";"):
+            ends = []
+            for end in pair.split("-"):
+                chain, residue, atom = end.split(":")
+                ends.append((chain, int(residue), atom))
+            bonds.append(tuple(ends))
+    batch, _cfg, _dir = _fold_setup(arguments.model, arguments.sequence, chains=chains,
+                                    bonded_atom_pairs=bonds)
     features = feat_batch.Batch.from_data_dict(batch)
     inputs = {}
     for name, value in arrays(batch):
@@ -152,7 +166,7 @@ def main():
     tokens = int(np.asarray(features.token_features.mask).shape[0])
     suffix = ""
     if arguments.ligand is not None:
-        suffix += "-%s" % arguments.ligand.strip().lower()
+        suffix += "-%s" % arguments.ligand.strip().lower().replace(",", "")
     if arguments.ptm is not None:
         suffix += "-%s" % arguments.ptm.strip().lower().replace("@", "")
     if arguments.kind != "protein":

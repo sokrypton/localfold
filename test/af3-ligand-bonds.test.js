@@ -32,7 +32,10 @@ import { af3Source } from "./helpers/af3-source.js";
 import { featuriseProtein } from "../src/af3/featurise/featurise.js";
 import { paeMatrix } from "../web/prediction-results.js";
 import { toPdb } from "../src/af3/fold.js";
-import { ELEMENT_SYMBOLS } from "../src/af3/featurise/ccd-component.js";
+import { ELEMENT_SYMBOLS, ligandChain } from "../src/af3/featurise/ccd-component.js";
+
+// the first ligand token: one past the polymers
+const polymerStart = (batch) => batch.ligandSpans[0].from;
 
 /**
  * A ligand shaped like a small phosphate-and-metal cofactor: the elements are
@@ -350,7 +353,7 @@ describe("a bond a job declares", () => {
     chainKinds: ["protein"], ligands: [glycerol], bonds,
   });
 
-  it("joins a polymer residue to a ligand atom, both ways", () => {
+  it("joins a polymer residue to a ligand atom, in the job's direction, as a covalent bond", () => {
     const batch = batchWith([
       { from: { asym: 0, residue: 3, atom: "SG" }, to: { asym: 1, atom: "C2" } },
     ]);
@@ -359,8 +362,30 @@ describe("a bond a job declares", () => {
     // three atoms follow the five polymer tokens, so C2 is token 5 + 2.
     const cys = 2;
     const c2 = batch.ligandSpans[0].from + 2;
+    // 🔴 ONE DIRECTION, [from][to]: AF3's gather lists a declared bond once, in
+    // the order the job writes it (dumped with the pair reversed, it reverses),
+    // and its contact matrix sets exactly the listed cell. This test asserted
+    // both until a reference batch with a declared bond existed.
     assert.equal(batch.bondMatrix[cys * tokens + c2], 1);
-    assert.equal(batch.bondMatrix[c2 * tokens + cys], 1);
+    assert.equal(batch.bondMatrix[c2 * tokens + cys], 0);
+    // ...and COVALENT (5), the code AF3 gives every link between two residues
+    assert.equal(batch.bondOrderMatrix[cys * tokens + c2], 5);
+  });
+
+  it("builds a chain of components, a residue each, bonded where the job says", () => {
+    const sugar = (code) => ({ ...glycerol, code });
+    const chain = ligandChain([sugar("NAG"), sugar("BMA")]);
+    const batch = featuriseProtein("GWCTE", {
+      chainKinds: ["protein"], ligands: [chain],
+      bonds: [{ from: { asym: 1, residue: 1, atom: "O1" }, to: { asym: 1, residue: 2, atom: "C1" } }],
+    });
+    const start = polymerStart(batch);
+    // two components, one chain: residues 1 and 2, one asym, a reference space each
+    assert.deepEqual(Array.from(batch.features.residueIndex.slice(start, start + 6)), [1, 1, 1, 2, 2, 2]);
+    assert.equal(new Set(Array.from(batch.features.asymId.slice(start, start + 6))).size, 1);
+    assert.deepEqual(batch.ligandSpans.map((span) => span.code), ["NAG", "BMA"]);
+    // O1 of the first (token +1) to C1 of the second (token +3): C1 is in both
+    assert.equal(batch.bondMatrix[(start + 1) * batch.tokens + start + 3], 1);
   });
 
   it("refuses an atom the component does not have, by name", () => {

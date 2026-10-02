@@ -280,6 +280,24 @@ describe("a SMILES ligand survives the archive", () => {
     expect(after).toEqual(before);
   });
 
+  it("keeps a ligand of several components as one chain", () => {
+    // the server's `ligand` holds one code, so a glycan forces the open dialect's ccdCodes list
+    const { before, after } = roundTrip([
+      { type: "protein", value: "MKTSYIAKQRQ", copies: 1, modifications: [] },
+      { type: "ligand", value: "NAG,NAG,BMA", copies: 1, modifications: [] },
+    ]);
+    expect(after).toEqual(before);
+  });
+
+  it("keeps a modified base, in either dialect", () => {
+    const entities = [{ type: "dna", value: "ACGTACGT", copies: 1, modifications: [{ code: "5CM", position: 2 }] }];
+    const server = jobFromJson(jobRequestJson({ name: "t", seed: 7, entities }));
+    expect(server.entities[0].modifications.map((m) => `${m.code}@${m.position}`)).toEqual(["5CM@2"]);
+    const open = jobFromJson(jobRequestJson({ name: "t", seed: 7, entities: [...entities,
+      { type: "smiles", value: "CCO", copies: 1, modifications: [] }] }));
+    expect(open.entities[0].modifications.map((m) => `${m.code}@${m.position}`)).toEqual(["5CM@2"]);
+  });
+
   it("writes the open dialect only when it has to", () => {
     // 🔴 THE SERVER DIALECT IS STILL WHAT AN ORDINARY JOB GETS. It is what the
     // archive's justification rests on and what every fixture expects; the
@@ -323,8 +341,6 @@ describe("what it refuses, and what it names", () => {
     ["names itself twice", open([{ ligand: { id: "B", smiles: "CCO",
                                              ccdCodes: ["ATP"] } }])],
     ["ring closure", open([{ ligand: { id: "B", smiles: "C1CC" } }])],
-    ["ccdCodes", open([{ protein: { id: "A", sequence: "ACDEFGHIK" } },
-                       { ligand: { id: "B", ccdCodes: ["ATP", "MG"] } }])],
     ["unpairedMsaPath", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
                                            unpairedMsaPath: "/tmp/a.a3m" } }])],
     ["unpairedMsa", open([{ protein: { id: "A", sequence: "ACDEFGHIK",

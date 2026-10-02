@@ -78,7 +78,7 @@
  */
 import { readFileSync } from "node:fs";
 import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
-import { parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
+import { parseCcdComponent, ligandChain } from "../src/af3/featurise/ccd-component.js";
 import { dialectFor, DIALECTS, featuriserDialect } from "../src/af3/dialect.js";
 import { structuralBatch, structuralLayout } from "../src/af3/featurise/structural-tokens.js";
 
@@ -117,6 +117,20 @@ const TARGETS = {
   },
   // and RNA's: AlphaFold 3's modified_rna example - 2'-O-methylguanosine, pseudouridine (a C-glycoside,
   // its base joined by a carbon) and 5-methylcytidine (--kind rna --mods OMG@4,PSU@13,5MC@18)
+  // a GLYCAN: AlphaFold 3's rnaseb_glycosylated example - five components as one ligand chain,
+  // joined to each other and to Asn34 by bondedAtomPairs (--ligand NAG,NAG,BMA,MAN,MAN --bonds ...)
+  "glycan": {
+    suffix: "-glycan",
+    extra: () => {
+      const end = (asym, residue, atom) => ({ asym, residue, atom });
+      return {
+        ligands: [ligandChain(["NAG", "NAG", "BMA", "MAN", "MAN"].map(ccd))],
+        bonds: [[end(0, 34, "ND2"), end(1, 1, "C1")], [end(1, 1, "O4"), end(1, 2, "C1")],
+                [end(1, 2, "O4"), end(1, 3, "C1")], [end(1, 3, "O3"), end(1, 4, "C1")],
+                [end(1, 3, "O6"), end(1, 5, "C1")]].map(([from, to]) => ({ from, to })),
+      };
+    },
+  },
   "rna-mods": {
     suffix: "-rna-mods",
     extra: () => ({
@@ -323,22 +337,33 @@ for (const target of Object.keys(TARGETS)) {
   // first version did exactly that and reported all seven models missing the
   // ligand bonds, when six of them have every bond the reference has. Compare
   // the SET of bonded token pairs.
+  // 🔴 AND THE TWO TOKEN-LEVEL GATHERS ARE ONE MATRIX. AF3's token_bonds sets [i][j] for every pair
+  // in tokens_to_polymer_ligand_bonds AND tokens_to_ligand_ligand_bonds (evoformer.py's contact
+  // matrix), so the comparison is against their UNION - a target with a polymer-ligand bond (the
+  // glycan's Asn34-NAG link) put that pair in one list and the rest in the other, and comparing each
+  // list against the whole matrix reported every bond as extra in one of them. The ATOM-level
+  // token_atoms_to_polymer_ligand_bonds is read by no model's trunk and is noted, not compared.
+  const theirs = new Set();
+  let anyGather = false;
   for (const name of BOND_GATHERS) {
     const idx = flat(dump.inputs[`${name}:gather_idxs`]).map(Number);
     const msk = flat(dump.inputs[`${name}:gather_mask`]).map(Number);
     if (idx.length === 0) continue;
     seen.add(`${name}:gather_idxs`); seen.add(`${name}:gather_mask`);
     seen.add(`${name}:input_shape`);
-    // Each entry is a (row, column) token pair; the mask is per element.
-    const theirs = new Set();
+    if (name.startsWith("token_atoms_")) {
+      if (verbose) notes.push(`${name}: atom-level, read by no model (not compared)`);
+      continue;
+    }
+    anyGather = true;
     for (let k = 0; k * 2 + 1 < idx.length; k += 1) {
       if (!(msk[k * 2] > 0.5)) continue;
       theirs.add(`${idx[k * 2]}-${idx[k * 2 + 1]}`);
     }
-    if (theirs.size === 0) {
-      if (verbose) notes.push(`${name}: dead on both sides`);
-      continue;
-    }
+  }
+  if (anyGather) {
+    const name = "token bonds (both gathers)";
+    if (theirs.size === 0 && verbose) notes.push(`${name}: dead on both sides`);
     // 🔴 AND DIRECTION IS PART OF THE QUESTION, WHICH THE FIRST VERSION THREW
     // AWAY. It compared undirected edges, on the reasoning that the reference
     // lists most bonds one way round while this port's matrix is symmetric -
@@ -369,7 +394,10 @@ for (const target of Object.keys(TARGETS)) {
     // this target" - true of 6MRR and false of gol-sep3, so the moment a target
     // had bonds the gate stopped comparing the one channel that was empty.
     // boltz2 reads it as the second plane of its z-init bond feature and was
-    // getting zeros; see the note in featurise.js.
+    // getting zeros; see the note in featurise.js. (Its pairs are the
+    // ligand-ligand gather's.)
+    const idx = flat(dump.inputs["tokens_to_ligand_ligand_bonds:gather_idxs"]).map(Number);
+    const msk = flat(dump.inputs["tokens_to_ligand_ligand_bonds:gather_mask"]).map(Number);
     const orders = flat(dump.inputs.ligand_ligand_bond_order).map(Number);
     let orderDiff = 0;
     if (orders.length > 0 && batch.bondOrderMatrix !== undefined) {
@@ -384,7 +412,7 @@ for (const target of Object.keys(TARGETS)) {
       if (orderDiff !== 0) {
         bad.push(`ligand_ligand_bond_order: ${orderDiff} pairs with the wrong order`);
       } else if (verbose) {
-        notes.push(`ligand_ligand_bond_order: exact over ${theirs.size} pairs`);
+        notes.push(`ligand_ligand_bond_order: exact over the ligand-ligand gather`);
       }
     }
     if (missing.length !== 0 || extra.length !== 0) {

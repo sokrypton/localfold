@@ -3420,6 +3420,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // twenty characters are enough to recognise the one you typed.
   if (ligandCodes.length > 0) {
     what.push(ligandCodes.map((entry) => (typeof entry === "string" ? entry
+      : entry.codes ? entry.codes.join("-")
       : entry.smiles.length > 24 ? `${entry.smiles.slice(0, 21)}...` : entry.smiles))
       .join(", "));
   }
@@ -3548,6 +3549,10 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // small mmCIF; the 21 polymer components stay baked.
   const ligands = [];
   for (const entry of ligandCodes) {
+    if (entry.codes !== undefined) {      // a chain of components: the AF3-lineage path only
+      throw new Error(`${modelName} folds one component per ligand; ${entry.codes.join("-")} is a chain of`
+        + ` ${entry.codes.length} - fold it with an AlphaFold 3-lineage model`);
+    }
     // A structure rather than a code; see the note in web/af3-model.js.
     if (typeof entry !== "string") {
       status(`${modelName} · building ${entry.code ?? "ligand"}`);

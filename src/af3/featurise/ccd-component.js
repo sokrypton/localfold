@@ -207,6 +207,30 @@ export function parseCcdComponent(text) {
   return { code, atoms, bonds, parent };
 }
 
+/**
+ * Several components as ONE ligand chain - a glycan written as AlphaFold 3's
+ * `ccdCodes: ["NAG", "NAG", "BMA", "MAN", "MAN"]`. AF3 makes each component a
+ * residue of one chain: its atoms are tokens numbered by component (residue
+ * 1..5), each component its own reference conformer, every heavy atom kept (no
+ * leaving atom is dropped for a ligand, bonded or not), its own bonds inside it,
+ * and the links between components left to the job's bondedAtomPairs.
+ *
+ * @returns the parseCcdComponent shape, plus `residues: {code, from, count}[]`
+ */
+export function ligandChain(components) {
+  if (components.length === 1) return components[0];
+  const atoms = [];
+  const bonds = [];
+  const residues = [];
+  for (const component of components) {
+    const from = atoms.length;
+    residues.push({ code: component.code, from, count: component.atoms.length });
+    atoms.push(...component.atoms);
+    for (const bond of component.bonds) bonds.push({ ...bond, from: bond.from + from, to: bond.to + from });
+  }
+  return { code: components.map((c) => c.code).join("-"), atoms, bonds, residues };
+}
+
 // A parent component's one-letter code in its chain's alphabet (SER -> S, DC -> C, G -> G), or null
 const AMINO_LETTERS = { ALA: "A", ARG: "R", ASN: "N", ASP: "D", CYS: "C", GLN: "Q", GLU: "E", GLY: "G",
   HIS: "H", ILE: "I", LEU: "L", LYS: "K", MET: "M", PHE: "F", PRO: "P", SER: "S", THR: "T", TRP: "W",

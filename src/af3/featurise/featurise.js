@@ -582,15 +582,26 @@ export function featuriseProtein(sequence, options = {}) {
   // `sequence` covers the polymers only, and a ligand token indexed into it
   // comes back undefined and is written as UNK.
   const ligandSpans = [];
+  // each ligand chain's first token and its components (one, unless it is several bonded
+  // components - see ligandChain), for the bond endpoints below
+  const ligandStart = [];
+  const partsOf = (ligand) => ligand.residues
+    ?? [{ code: ligand.code, from: 0, count: ligand.atoms.length }];
   for (const ligand of ligands) {
     asym += 1;
+    ligandStart.push(ligandToken);
     // ...AND ITS BONDS TRAVEL WITH IT, because a writer needs them too. The
     // bond matrix beside this is token x token and one direction only, which is
     // the shape the MODEL wants; a PDB's CONECT records want the pairs, and
     // scanning L^2 cells per trajectory frame to recover them is the wrong way
     // round when the list is right here.
-    ligandSpans.push({ from: ligandToken, count: ligand.atoms.length, code: ligand.code,
-                       bonds: ligand.bonds });
+    // (a span per COMPONENT, each with its own bonds: a writer names and numbers residues by them)
+    for (const part of partsOf(ligand)) {
+      ligandSpans.push({ from: ligandToken + part.from, count: part.count, code: part.code,
+                         bonds: ligand.bonds
+                           .filter((b) => b.from >= part.from && b.from < part.from + part.count)
+                           .map((b) => ({ ...b, from: b.from - part.from, to: b.to - part.from })) });
+    }
     // Identical codes are one entity, and each occurrence is a copy of it -
     // the same rule chainIdentity applies to repeated sequences.
     //
@@ -611,16 +622,19 @@ export function featuriseProtein(sequence, options = {}) {
     const copy = (copiesOfEntity.get(entity) ?? 0) + 1;
     copiesOfEntity.set(entity, copy);
     // ...and its space continues the residues' count, not the token index. The
-    // two are the same number until a modified residue makes them differ.
-    const uid = space;
-    space += 1;
+    // two are the same number until a modified residue makes them differ. A
+    // chain of several components takes one space EACH, as AF3 gives them.
+    const parts = partsOf(ligand);
+    const uidOfPart = parts.map(() => space++);
     for (let atom = 0; atom < ligand.atoms.length; atom += 1) {
       const token = ligandToken + atom;
       const source = ligand.atoms[atom];
+      const part = parts.findIndex((p) => atom >= p.from && atom < p.from + p.count);
+      const uid = uidOfPart[part];
       aatype[token] = UNK_AATYPE;
-      // Every atom of the component is the same residue, so they share its
-      // number - AF3 writes 1 for a single-residue ligand.
-      residueIndex[token] = 1;
+      // Every atom of a component is the same residue, so they share its
+      // number - AF3 writes 1 for a single-residue ligand, k for a chain's k-th.
+      residueIndex[token] = part + 1;
       tokenIndex[token] = token + 1;
       // `asym` is already one past the last polymer chain, and AF3 counts from
       // one, so the two cancel: no further +1 here.
@@ -716,13 +730,16 @@ export function featuriseProtein(sequence, options = {}) {
     }
     if (asym >= chainLengths.length) {
       const ligand = ligands[asym - chainLengths.length];
-      const span = ligandSpans[asym - chainLengths.length];
       if (ligand === undefined) throw new Error(`${where}: no chain ${asym}`);
-      const slot = ligand.atoms.findIndex((one) => one.name === atom);
+      // a component chain is addressed by residue as well as atom (C1 is in every sugar)
+      const parts = partsOf(ligand);
+      const part = parts.length === 1 ? parts[0] : parts[residue - 1];
+      if (part === undefined) throw new Error(`${where}: ${ligand.code} has no residue ${residue}`);
+      const slot = ligand.atoms.slice(part.from, part.from + part.count).findIndex((one) => one.name === atom);
       if (slot < 0) {
-        throw new Error(`${where}: ${ligand.code} has no atom ${atom}`);
+        throw new Error(`${where}: ${part.code} has no atom ${atom}`);
       }
-      return span.from + slot;
+      return ligandStart[asym - chainLengths.length] + part.from + slot;
     }
     let global = residue - 1;
     for (let before = 0; before < asym; before += 1) global += chainLengths[before];
@@ -745,10 +762,13 @@ export function featuriseProtein(sequence, options = {}) {
   const declaredBonds = [];
   for (const [index, bond] of (options.bonds ?? []).entries()) {
     const where = `bond ${index + 1}`;
+    // 🔴 A DECLARED BOND IS COVALENT (code 5), not single: AF3's `_bond_orders_for_layout`
+    // gives every link between two residues BOND_ORDER_COVALENT - a glycosidic bond and a
+    // covalent inhibitor's alike - and boltz2's bond-type plane reads it
     declaredBonds.push({
       from: tokenOfEndpoint(bond.from, `${where} from`),
       to: tokenOfEndpoint(bond.to, `${where} to`),
-      order: bond.order ?? 1,
+      order: bond.order ?? 5,
     });
   }
 
@@ -768,15 +788,19 @@ export function featuriseProtein(sequence, options = {}) {
         }
       }
     }
-    // 🔴 BOTH DIRECTIONS ALWAYS, unlike a component's own bonds. A declared bond
-    // joins two things the featuriser laid out independently, so there is no
-    // "the writer's triangle" to follow - and AF3's own extraction writes the
-    // pair, not one corner of it.
+    // 🔴 ONE DIRECTION, THE JOB'S - [from][to] as bondedAtomPairs writes the pair - like a
+    // component's own bonds, and both only where the dialect symmetrises. This said "both
+    // directions always" until a reference batch was dumped with a declared bond (the glycosylated
+    // RNase B): AF3 lists the Asn-NAG link once, and writing a glycosidic bond reversed in the job
+    // reverses its pair in the gather (139-135 against 135-139). AF3's contact matrix sets exactly
+    // the listed [i][j].
     for (const bond of declaredBonds) {
       bondMatrix[bond.from * tokens + bond.to] = 1;
-      bondMatrix[bond.to * tokens + bond.from] = 1;
       bondOrderMatrix[bond.from * tokens + bond.to] = bond.order;
-      bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
+      if (options.symmetriseBonds) {
+        bondMatrix[bond.to * tokens + bond.from] = 1;
+        bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
+      }
     }
     if (options.atomizedBackboneBonds === true) {
       for (const span of modifiedSpans) {

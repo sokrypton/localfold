@@ -371,7 +371,8 @@ export function entityProblem(entity) {
   if (entity.type === "ligand") {
     // The same rule ccdUrl enforces, checked here so the message arrives while
     // the field is in front of the user rather than as a failed fetch later.
-    if (!/^[A-Za-z0-9]{1,5}$/.test(value)) {
+    // (several codes, comma-separated, are ONE chain of bonded components - a glycan)
+    if (!value.split(",").every((code) => /^[A-Za-z0-9]{1,5}$/.test(code.trim()))) {
       return "A CCD code is 1-5 letters or digits, like HEM or ATP";
     }
     return null;
@@ -538,7 +539,10 @@ export function expandEntities(entities) {
         const text = entity.value.trim();
         if (!smilesCodes.has(text)) smilesCodes.set(text, ligandName(smilesCodes.size));
         ligandCodes.push({ smiles: text, code: smilesCodes.get(text) });
-      } else ligandCodes.push(entity.value.trim().toUpperCase());
+      } else {
+        const codes = entity.value.trim().toUpperCase().split(",").map((code) => code.trim());
+        ligandCodes.push(codes.length === 1 ? codes[0] : { codes });
+      }
     }
   }
   // 🔴 THE CONTACTS LAST, ONCE EVERY CHAIN THEY NAME EXISTS. A letter is

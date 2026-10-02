@@ -68,7 +68,10 @@ export function jobRequestJson({ name, seed, entities }) {
   // open-dialect key, so a job carrying one cannot be written in the other
   // without dropping the bond - and a covalent inhibitor saved unbonded is the
   // archive describing a different fold.
-  if ((entities ?? []).some((entity) => (entity.type === "smiles" || entity.type === "contact")
+  // ...and so does a ligand of several components, which the server's single
+  // `ligand` code cannot hold.
+  if ((entities ?? []).some((entity) => (entity.type === "smiles" || entity.type === "contact"
+    || (entity.type === "ligand" && (entity.value ?? "").includes(",")))
     && (entity.value ?? "").trim() !== "")) {
     return openDialectJson({ name, seed, entities });
   }
@@ -99,7 +102,16 @@ export function jobRequestJson({ name, seed, entities }) {
         ...(modifications.length === 0 ? {} : { modifications }),
         useStructureTemplate: (entity.template?.kind ?? "none") !== "none" } });
     } else if (entity.type === "dna" || entity.type === "rna") {
-      sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count } });
+      // (a modified base is the job too, as a modified residue is - the server's
+      // modificationType / basePosition, the code prefixed)
+      const modifications = (entity.modifications ?? [])
+        .filter((modification) => (modification.code ?? "").trim() !== "")
+        .map((modification) => ({
+          modificationType: `CCD_${modification.code.trim().toUpperCase()}`,
+          basePosition: modification.position,
+        }));
+      sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count,
+        ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "smiles") {
       // Unreachable: the whole file went open above. Here so that adding a
       // row type never falls into the catch-all again.
@@ -171,13 +183,20 @@ function openDialectJson({ name, seed, entities }) {
       sequences.push({ protein: { id, sequence: value,
         ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "dna" || entity.type === "rna") {
-      sequences.push({ [entity.type]: { id, sequence: value } });
+      const modifications = (entity.modifications ?? [])
+        .filter((modification) => (modification.code ?? "").trim() !== "")
+        .map((modification) => ({
+          modificationType: modification.code.trim().toUpperCase(),
+          basePosition: modification.position,
+        }));
+      sequences.push({ [entity.type]: { id, sequence: value,
+        ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "smiles") {
       // 🔴 NOT UPPER-CASED. Case is meaning in a SMILES and this is the whole
       // reason this branch exists.
       sequences.push({ ligand: { id, smiles: value } });
     } else {
-      sequences.push({ ligand: { id, ccdCodes: [value.toUpperCase()] } });
+      sequences.push({ ligand: { id, ccdCodes: value.toUpperCase().split(",").map((c) => c.trim()) } });
     }
   }
   // 🔴 THE BONDS, AS `[chain, residue, atom]` PAIRS - and the chain letters
@@ -456,14 +475,12 @@ function readEntry(entry, index, state) {
     const list = Array.isArray(codes) ? codes : [codes];
     if (list.length === 0) refuse(`${where}: a ligand with no code`);
     // 🔴 SEVERAL CODES IN ONE ENTRY IS ONE CHAIN OF SEVERAL COMPONENTS, not
-    // several ligands: AF3 bonds them into one entity. Splitting them into
-    // separate rows folds the same atoms unbonded, which is a different
-    // molecule wearing the same codes.
-    if (list.length > 1) {
-      refuse(`${where}: ccdCodes lists ${list.length} components as one bonded`
-        + " chain, and this page folds one code per ligand");
-    }
-    const code = String(list[0]).trim().toUpperCase().replace(/^CCD_/, "");
+    // several ligands: AF3 makes each code a residue of one chain (a glycan),
+    // bonded by the job's bondedAtomPairs. Splitting them into separate rows
+    // would fold the same atoms as separate molecules, so the row keeps them
+    // together, comma-separated, and the featuriser builds the chain
+    // (src/af3/featurise/ccd-component.js, ligandChain).
+    const code = list.map((one) => String(one).trim().toUpperCase().replace(/^CCD_/, "")).join(",");
     return { type: "ligand", value: code, copies, modifications: [], ids: idsOf(body) };
   }
 

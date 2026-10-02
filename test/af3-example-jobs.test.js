@@ -70,7 +70,13 @@ const EXPECTED = {
   // `bondedAtomPairs` AND a five-component glycan in one ligand entry, and
   // with the bonds read it refuses on the glycan. Five CCD codes in one entry
   // is one bonded chain, which this page does not build.
-  "rnaseb_glycosylated.json": { refuses: "ccdCodes lists 5 components" },
+  // 🔴 AND IT LOADS NOW: five codes are ONE chain of five residues (ligandChain),
+  // its glycosidic bonds and the Asn34 link contacts beside it - exact against
+  // AF3's own batch (tools/check-batch-fields.js --target=glycan).
+  "rnaseb_glycosylated.json": { loads: ["protein:124x1", "ligand:NAG,NAG,BMA,MAN,MANx1",
+                                        "contact:A34:ND2 - B1:C1x1", "contact:B1:O4 - B2:C1x1",
+                                        "contact:B2:O4 - B3:C1x1", "contact:B3:O3 - B4:C1x1",
+                                        "contact:B3:O6 - B5:C1x1"] },
   // 🔴 MODIFIED BASES LOAD NOW: the featuriser takes a base's parent from its
   // chain's alphabet and the CCD (AF3's own batch is matched field for field on
   // both - tools/check-batch-fields.js, dna-5cm and rna-mods).
@@ -148,7 +154,7 @@ describe("AlphaFold 3's own example jobs", () => {
    * streptavidin/biotin job moved from the refusal list to the loading one and
    * this line went red until somebody said so out loud.
    *
-   * A five-component glycan and an inline alignment are the two gaps that remain.
+   * An inline alignment is the gap that remains.
    */
   /**
    * 🔴 AND "LOADS" IS NOT "FOLDS", WHICH THIS FILE CANNOT CHECK AND SHOULD NOT
@@ -161,17 +167,14 @@ describe("AlphaFold 3's own example jobs", () => {
    * protein/DNA complex, none of them tripping the chain-geometry rule. The
    * per-file table is in docs/WEB.md.
    */
-  it("folds twelve of the fourteen, and says what the other two want", () => {
+  it("folds thirteen of the fourteen, and says what the last one wants", () => {
     const loads = Object.values(EXPECTED).filter((one) => one.loads !== undefined);
-    // 🔴 TWELVE: NINE UNTIL `bondedAtomPairs` LANDED, TEN UNTIL MODIFIED BASES
-    // DID. This count is asserted so that moving a file between the two lists
-    // is a decision somebody makes out loud - it has caught the prose going
-    // stale twice.
-    expect(loads).toHaveLength(12);
-    // The remaining two are one each: a five-component glycan in one ligand
-    // entry, and an alignment carried inline.
-    expect(Object.values(EXPECTED).filter((one) =>
-      one.refuses === "ccdCodes lists 5 components")).toHaveLength(1);
+    // 🔴 THIRTEEN: NINE UNTIL `bondedAtomPairs` LANDED, TEN UNTIL MODIFIED BASES
+    // DID, TWELVE UNTIL A LIGAND COULD BE A CHAIN OF COMPONENTS. This count is
+    // asserted so that moving a file between the two lists is a decision
+    // somebody makes out loud - it has caught the prose going stale twice.
+    expect(loads).toHaveLength(13);
+    // The one left: an alignment carried inline.
     expect(Object.values(EXPECTED).filter((one) =>
       one.refuses === "unpairedMsa")).toHaveLength(1);
   });
