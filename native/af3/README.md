@@ -124,6 +124,12 @@ fold - is 1.0 s for 6MRR and 1.7 s for 5CAJ. No 2 GiB binding ceiling. At 1044 t
 pass is 1.97 s - grid attention's flash kernel 38% of it - so recycles dominate there; up to ~300
 tokens the 200 denoiser steps do. 2088 tokens: 11.3 s a trunk pass, 2.9 s of diffusion.
 
+Memory: from 512 tokens (a pair over 128 MB) every phase - trunk, diffusion, confidence, and the
+next fold - starts from the card it had, its predecessor's scratch given back: 1044 tokens peaked
+at 21.3 GB with the trunk's 8 GB of scratch held to the end, and peaks at 14.8 GB (the trunk's
+phase) now, byte-identical and no slower. `LOCALFOLD_MEM=1` prints what is in use at each phase,
+and the largest scratch buffers.
+
 Against AlphaFold 3 itself - af3-any-model's JAX (bf16, Triton flash attention) with DeepMind's
 weights, on this A100, `tools/oracle/bench_af3_native.py` at matched settings (one sample unless
 said, no token bucketing, the same MSA rows), steady-state calls:

@@ -229,6 +229,17 @@ template <class T> T* scratch(const std::string& name, size_t n) {
   return (T*)p;
 }
 
+// LOCALFOLD_MEM=1: device memory in use at a phase boundary, and the largest scratch buffers
+inline void memReport(const char* at) {
+  if (!getenv("LOCALFOLD_MEM")) return;
+  CK(cudaDeviceSynchronize()); size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
+  size_t held = 0; std::vector<std::pair<size_t, std::string>> big;
+  for (auto& [k, v] : SCRATCH) { held += v.second; if (v.second) big.push_back({v.second, k}); }
+  std::sort(big.rbegin(), big.rend());
+  printf("  memory %-22s %6.2f GB in use, scratch %.2f:", at, (tot - fr) / 1e9, held / 1e9);
+  for (size_t i = 0; i < big.size() && i < (getenv("LOCALFOLD_MEM_ALL") ? big.size() : 6); ++i) printf(" %s %.2f", big[i].second.c_str(), big[i].first / 1e9);
+  printf("\n");
+}
 __global__ void toHalfK(const float* x, half* y, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = __float2half(x[i]);
 }

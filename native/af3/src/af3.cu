@@ -254,6 +254,7 @@ int main(int argc, char** argv) {
   if (oracleTargetFeat)
     targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
   t = makeTrunk(targetFeat.data(), msaCap);
+  memReport("trunk built");
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
   for (int fi = 0; doFold && fi < folds; ++fi) {
@@ -294,6 +295,7 @@ int main(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
+    memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below
       double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
@@ -341,10 +343,12 @@ int main(int argc, char** argv) {
     }
     int dense = (int)M.meta("batch.dense");
     std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)nD * dense);
-    // a large input gives each phase the whole card (a pair over 1 GB: about 1450 tokens)
-    bool tight = pairs * t.C * 4 > ((size_t)1 << 30);
+    // a large input gives each phase the whole card: a pair over 128 MB, 512 tokens at 128 channels
+    // (at 1 GB, 1044 tokens peaked at 21.3 GB with the trunk's 8 GB of scratch held to the end)
+    bool tight = pairs * t.C * 4 > ((size_t)128 << 20);
     if (tight) releaseScratch();
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
+    memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
     // confidence head and ranked by AF3's ranking score (src/scores.cuh). A seed's samples run as one
     // batch through the denoiser, sample k of seed s seeded sampleSeed(s, k); the best of them all is
@@ -374,6 +378,7 @@ int main(int argc, char** argv) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
     }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
     NS = 1;
+    memReport("diffusion");
     diffMs += ms(s0, clock());
     if (tight) releaseScratch();
     size_t atoms3 = mask.size() * 3;
@@ -433,6 +438,7 @@ int main(int argc, char** argv) {
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
+        memReport("confidence");
       }
       CK(cudaFree(dBeta));
       confMs += ms(s1, clock());
@@ -486,6 +492,7 @@ int main(int argc, char** argv) {
     if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); }
     if (df.preG) { CK(cudaFree(df.preG)); CK(cudaFree(df.preR)); }
     PRE_ADA = false;
+    if (tight) releaseScratch();      // the next fold's trunk starts from the card it had
     if (fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
