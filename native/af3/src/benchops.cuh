@@ -43,6 +43,9 @@ inline void benchOps(int n) {
     time(label.c_str(), [&] { flashGrid<half>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, D, 0, 1, false, 0.1f); });
   }
   FLASH_WARPS_OVERRIDE = 0;
+  time("flash split 2", [&] { flashSplitHalfAt<48, 2>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
+  time("flash split 4", [&] { flashSplitHalfAt<48, 4>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
+  time("flash split 8", [&] { flashSplitHalfAt<48, 8>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, 0, 1, false, 0.1f, nullptr); });
   time("T2 GEMM 768->768", [&] { linear<half, float>(o, att, n, Wd, C, B + ".Transition2"); });
   time("add gated", [&] { addGatedStridedK<<<blocks((size_t)n * C), 256, 0, STREAM>>>(act, att, g, 2 * C, n, C); });
   time("ffw1 GEMM 768->3072", [&] { linear<half, half>(x, wide, n, C, 2 * I, B + ".ffwTransition1"); });

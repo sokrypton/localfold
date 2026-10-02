@@ -9,7 +9,7 @@ A3M), with pLDDT, PAE, PDE and pTM.
 
 ```
 cd native/af3
-nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread src/af3.cu -lcublas -o af3
+nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcupti -o af3
 
 python3 ../../tools/serve.py 8791 &        # the exporter reads the bundle over HTTP
 # a sequence (chains joined by ":") and optionally an alignment, featurised by the repo's own
