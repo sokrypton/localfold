@@ -407,10 +407,15 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
 }
 
 template <class T>
+void pairformerBlockAt(float* pair, float* single, const float* pairMask, const float* seqMask, int n, int C,
+                       int Cs, const std::string& B, bool swap, bool divide) {
+  pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4);
+  singleTrack<T>(single, pair, seqMask, n, C, Cs, B); stage("single");
+}
+template <class T>
 void pairformerBlock(Trunk& t, int k) {
-  std::string B = "trunk.pairformerBlocks." + std::to_string(k);
-  pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
-  singleTrack<T>(t.single, t.pair, t.seqMask, t.n, t.C, t.Cs, B); stage("single");
+  pairformerBlockAt<T>(t.pair, t.single, t.pairMask, t.seqMask, t.n, t.C, t.Cs,
+                       "trunk.pairformerBlocks." + std::to_string(k), t.swap, t.divide);
 }
 
 // ---------------------------------------------------------------- distogram

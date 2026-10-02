@@ -8,6 +8,7 @@
 #include "atom.cuh"
 #include "diffusion.cuh"
 #include "sampler.cuh"
+#include "confidence.cuh"
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
@@ -60,6 +61,37 @@ int main(int argc, char** argv) {
     DCACHE.ready = false;
   }
 
+  // The confidence head on AF3's own inputs, against AF3's own outputs.
+  if (M.has("oracle.confidence.stages.out.full_pae")) {
+    int n = (int)M.meta("batch.tokens");
+    const std::string I = "oracle.confidence.stages.in.";
+    float* pair = upload(M.f(I + "pair"), M.len(I + "pair"));
+    float* single = upload(M.f(I + "single"), M.len(I + "single"));
+    float* tf = upload(M.f(I + "targetFeat"), M.len(I + "targetFeat"));
+    float* beta = upload(M.f(I + "pseudoBeta"), M.len(I + "pseudoBeta"));
+    std::vector<float> seq(M.f(I + "seqMask"), M.f(I + "seqMask") + n), pm((size_t)n * n);
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) pm[(size_t)i * n + j] = seq[i] * seq[j];
+    float* seqm = upload(seq.data(), n); float* pairm = upload(pm.data(), pm.size());
+    ConfidenceOut c = confidenceHead(pair, single, tf, beta, seqm, pairm, n);
+    auto cmp = [&](const char* label, const std::vector<float>& mine, const std::string& o) {
+      if (!M.has(o) || M.len(o) != mine.size()) { printf("  %-24s (no oracle)\n", label); return; }
+      printf("  %-24s relRMS %.3e\n", label, relRms(mine.data(), M.f(o), mine.size()));
+    };
+    // 🔴 pLDDT ON THIS DUMP'S RANDOM INPUTS IS ILL-CONDITIONED: a 1e-6 relative change to the
+    // input single moves it by 7.2e-3 relRMS, so ~1e-2 is all this comparison can resolve.
+    // PAE and PDE are well-conditioned and are the check; a fold's mean pLDDT is the other.
+    cmp("confidence pLDDT", c.plddt, "oracle.confidence.stages.out.predicted_lddt");
+    {
+      std::vector<float> masked = c.plddt, theirs(M.f("oracle.confidence.stages.out.predicted_lddt"),
+        M.f("oracle.confidence.stages.out.predicted_lddt") + c.plddt.size());
+      const float* am = M.f("batch.refMask");
+      for (size_t i = 0; i < masked.size(); ++i) if (!am[i]) masked[i] = theirs[i] = 0;
+      printf("  %-24s relRMS %.3e\n", "  over real atoms", relRms(masked.data(), theirs.data(), masked.size()));
+    }
+    cmp("confidence PAE", c.pae, "oracle.confidence.stages.out.full_pae");
+    cmp("confidence PDE", c.pde, "oracle.confidence.stages.out.full_pde");
+  }
+
   // target_feat from the batch: per-atom conditioning and the atom cross-attention encoder.
   int tokens = (int)M.meta("batch.tokens");
   float* tfDev = buildTargetFeat();
@@ -94,7 +126,21 @@ int main(int argc, char** argv) {
       return (const float*)denoise(t.single, t.pair, t.targetFeat, t.seqMask, noisy, tHat);
     });
     auto f2 = clock();
-    writePdb(out, x);
+    // pseudo-beta off the structure, then the confidence head
+    std::vector<float> beta((size_t)t.n * 3);
+    const int* pbIdx = M.i("batch.tokenAtomsToPseudoBeta.indices"); const float* pbMask = M.f("batch.tokenAtomsToPseudoBeta.mask");
+    for (int k = 0; k < t.n; ++k) for (int a = 0; a < 3; ++a) beta[k * 3 + a] = pbMask[k] ? x[(size_t)pbIdx[k] * 3 + a] : 0.f;
+    float* dBeta = upload(beta.data(), beta.size());
+    ConfidenceOut conf = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
+    auto f3 = clock();
+    std::vector<float> perToken(t.n, 0.f);
+    for (int k = 0; k < t.n; ++k) {
+      double s2 = 0, c2 = 0;
+      for (int a = 0; a < dense; ++a) if (mask[(size_t)k * dense + a]) { s2 += conf.plddt[(size_t)k * dense + a]; c2 += 1; }
+      perToken[k] = (float)(s2 / std::max(c2, 1.0));
+    }
+    writePdb(out, x, perToken.data());
+    printf("confidence %.1f ms: mean pLDDT %.2f\n", ms(f2, f3), conf.meanPlddt);
     printf("fold: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps), wrote %s\n", ms(f0, f1), recycles + 1,
            ms(f1, f2), steps, out.c_str());
     return 0;
