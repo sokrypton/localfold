@@ -14,8 +14,9 @@ native/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
 
 `fold` builds `af3` if it is missing, exports the weights once (`native/af3/weights`, from the
 bundle on disk - no server), featurises the input with the repository's own featuriser into a
-temporary directory (0.2 s) and folds it (`--fold --fast`); everything after `--` goes to `af3`.
-A job JSON to a PDB is about 2.4 s of wall clock. By hand:
+temporary directory (0.2 s, while `af3` starts) and folds it (`--fold --fast`); everything after
+`--` goes to `af3`. A job JSON to a PDB is 1.5 s of wall clock (KRAS with sotorasib), 6MRR from
+its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 
 ```
 cd native/af3
@@ -31,14 +32,17 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + ev
 `--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--samples=N`
 (N diffusion samples off one trunk, AF3 runs five: each scored by the confidence head and ranked by
 0.8 ipTM + 0.2 pTM - pTM for one chain; AF3's disorder and clash terms are not computed - the best
-written to `--out`, all to `<out>_sample<k>.pdb`). Beside every structure, AlphaFold 3's
-`<stem>_confidences.json` (atom_plddts in the PDB's atom order, pae, token_chain_ids,
-token_res_ids) and `<stem>_summary_confidences.json` (ptm, iptm, ranking_score). The samples run as ONE batch through the
+written to `--out`, all to `<out>_sample<k>.pdb`). Beside every structure, what the page's archive
+writes: `<stem>_confidences.json` (atom_chain_ids and atom_plddts in the PDB's atom order, the
+distogram's contact_probs, pae, token_chain_ids, token_res_ids) and
+`<stem>_summary_confidences.json` (chain_ids, chain_pair_iptm, chain_pair_max_contact,
+chain_plddt, chain_ptm, chain_iptm, chain_pair_pae_min, iptm, ptm, ranking_score,
+fraction_disordered, mean_plddt). The samples run as ONE batch through the
 denoiser - the transformer's GEMMs at 5x the rows, the samples as the flash kernel's batch, what
 they share (conditioning, masks, biases) read once - and sample k draws exactly what a one-sample
 run seeded `seed + k` draws, so its structure is the same: 5CAJ's five read 1.989 / 2.023 / 1.961 /
-1.996 / 2.018 A batched and one at a time. Five samples' diffusion: **1.96 s against 3.61 s** in
-sequence (one sample 0.69 s),
+1.996 / 2.018 A batched and one at a time. Five samples' diffusion: **1.33 s against 0.54 s** for
+one,
 `--fast` (f16 trunk and denoiser transformer), `--stages` (per-stage profile),
 `--no-graphs`. `pairformer.cu` is the earlier one-file pairformer prototype and benchmark.
 
@@ -48,7 +52,7 @@ sequence (one sample 0.69 s),
 |---|---|---|
 | target_feat (atom encoder) | 5.4e-8 | |
 | z_after_msa | 1.0e-4 | 1.2e-4 |
-| trunk_out_pair | **3.0e-5** | 3.0e-4 |
+| trunk_out_pair | **3.0e-5** | 4.2e-4 |
 | single | 7.2e-6 | 1.3e-4 |
 | one denoiser call | 1.8e-5 | 1.8e-3 |
 | confidence PAE / PDE | 2.8e-6 / 3.7e-6 | |
@@ -59,9 +63,9 @@ ill-conditioned - a 1e-6 change to the input moves it 7.2e-3 - so it reads ~6e-3
 JS CPU reference 8.8e-3) and is checked on folds. 🔴 Likewise a random N(0,1) block input reads
 1-3e-2 in any 16-bit format where AF3's real input reads 3e-5: always check on real inputs.
 
-Folds: 6MRR from its sequence **0.683 A** CA RMSD, pLDDT 85.1, pTM 0.720 (WebGPU 0.65-0.71);
-5CAJ (255 residues of chain A) with its MSA **2.04 A**, pLDDT 94.6, pTM 0.940 - the WebGPU
-port gives pLDDT 94.5, pTM 0.938 on the same inputs.
+Folds: 6MRR from its sequence **0.515 A** CA RMSD, pLDDT 87.6, pTM 0.767 (WebGPU 0.65-0.71);
+5CAJ (255 residues of chain A) with its MSA **1.93 A**, pLDDT 95.1, pTM 0.943 - the WebGPU
+port gives pLDDT 94.5, pTM 0.938 on the same inputs. `gate.py` holds these and nine more.
 
 ## Speed: A100-SXM4-40GB, 200 diffusion steps, `--fast`
 
@@ -73,10 +77,10 @@ port gives pLDDT 94.5, pTM 0.938 on the same inputs.
 | 5CAJ x 4, 1044 tokens, no MSA | | 3.62 s / 3.48 s | 9.42 s |
 
 WebGPU with the developer flags (`fold.js --folds=2`); a stock-Chrome NVIDIA visitor gets
-about half its speed. A whole process - mapping model.bin, the CUDA context, target_feat, the
-fold - is 1.7 s for 6MRR and 2.4 s for 5CAJ. No 2 GiB binding ceiling. At 1044 tokens a trunk pass is 2.4 s - grid
-attention's flash kernel 40% of it - so recycles dominate there; up to ~300 tokens the 200
-denoiser steps do.
+about half its speed. A whole `fold` command - the export, the CUDA context, the weights, the
+fold - is 1.0 s for 6MRR and 1.7 s for 5CAJ. No 2 GiB binding ceiling. At 1044 tokens a trunk
+pass is 1.97 s - grid attention's flash kernel 38% of it - so recycles dominate there; up to ~300
+tokens the 200 denoiser steps do. 2088 tokens: 11.3 s a trunk pass, 2.9 s of diffusion.
 
 Against AlphaFold 3 itself - af3-any-model's JAX (bf16, Triton flash attention) with DeepMind's
 weights, on this A100, `tools/oracle/bench_af3_native.py` at matched settings (one sample unless
@@ -84,11 +88,11 @@ said, no token bucketing, the same MSA rows), steady-state calls:
 
 | 200 steps | JAX AF3 | native `--fast` | |
 |---|---|---|---|
-| 6MRR, 68 tokens, 1 pass | 1.67 s | **0.40 s** | 4.2x |
-| 5CAJ, 261 tokens, 512 rows, 1 pass | 2.76 s | **0.69 s** | 4.0x |
-| 5CAJ, 4 passes (3 recycles) | 3.47 s | **1.07 s** | 3.2x |
-| 5CAJ, 1 pass, 5 samples | 5.00 s | **1.57 s** | 3.2x |
-| 5CAJ x 4, 1044 tokens, no MSA, 1 pass | 11.1 s | **3.84 s** | 2.9x |
+| 6MRR, 68 tokens, 1 pass | 1.67 s | **0.39 s** | 4.3x |
+| 5CAJ, 261 tokens, 512 rows, 1 pass | 2.76 s | **0.67 s** | 4.1x |
+| 5CAJ, 4 passes (3 recycles) | 3.47 s | **1.02 s** | 3.4x |
+| 5CAJ, 1 pass, 5 samples | 5.00 s | **1.58 s** | 3.2x |
+| 5CAJ x 4, 1044 tokens, no MSA, 1 pass | 11.1 s | **3.48 s** | 3.2x |
 
 and JAX's first call carries ~60 s of compilation where the native first fold is within 15% of
 a warm one.
@@ -107,7 +111,7 @@ pair transition (LN, both GEMMs, SwiGLU, residual); grid attention's input (LN, 
 pair bias in one pass, the column direction reading its rows transposed in place) and the column
 direction's output projection; the single track's pair logits. The grid attention itself is a
 FlashAttention-2 kernel on `mma.sync` (S, P, O in registers, cp.async double buffering, ldmatrix,
-log2-domain scores) - occupancy-bound at ~65 TFLOP/s, see below. The MSA stack in f16 too.
+log2-domain scores) - ~85 TFLOP/s at 1044 tokens, see below. The MSA stack in f16 too.
 
 Diffusion: everything derived from the conditioning computed once per fold (atom pair
 conditioning and pair logits, every block's adaptive-LayerNorm scales/shifts and zero-init gates,
