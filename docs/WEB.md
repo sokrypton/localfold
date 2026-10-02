@@ -3860,3 +3860,49 @@ refused as "already folding". Thirty minutes now (the existing cap), and a fold
 that runs out is stopped. It finishes in **385 s** through the page where the
 fold tool, unbudgeted, takes 153: the budget makes it stream its weights, which
 is the price of the limit above.
+
+### Larger proteins on a T4: where the memory went, and the new limits
+
+**The driver held up to twice what the fold held.** `tools/gpu/probe-live-buffers.js`
+wraps a fold and counts every `createBuffer`/`destroy`: IntelliFold-2 at 512
+residues had exactly the 3988 MiB live that the budget counts, while nvidia-smi
+read 7.6 GB, and at 768 residues 19.2 GB - more than a T4. Nothing was
+untracked. `tools/gpu/probe-driver-memory.js` found why: **a destroyed buffer's
+memory is not returned, or reused, until the device ticks**, and one empty
+submit and its wait returns all of it (3 GB held across an idle queue; 104 MiB
+after one tick). The trunk's stages each freed gigabytes and the next stage
+allocated gigabytes before any tick, so on the card they overlapped. Fixed in
+four places, each bit-identical (test:stock 8 of 8 throughout):
+
+- the MSA stack and the pairformer share one pool for their five pair-sized
+  scratch buffers, destroyed right after the pairformer (19.2 -> 12.4 GB);
+- `settleReleasedMemory` drains once after the template stage and at the end of
+  each pass (12.4 -> **8.7 GB**, against 9.0 live);
+- the distogram head allocates its logits when it runs, not before the
+  pairformer, and the previous pass's pair is released once the embedder has
+  read it, so a recycled pass no longer carries seven pair-sized buffers where
+  the first carries six;
+- the trunk's last pair, kept on the device for the heads, is released as soon
+  as the confidence head has queued its copy.
+
+**And a Colab runtime budgets 80% of its GPU** (the broker asks nvidia-smi;
+`LOCALFOLD_VRAM_MIB` overrides it, so this A100 can be made to budget like a T4
+for local tests) instead of a third of host RAM. Tried at 90% before any of the
+above, it ran past the card and lost the device.
+
+**What a reader now folds on a Colab T4, through the page, single sequence:**
+
+| model | before | now |
+|---|---|---|
+| AF3 | 1024 residues | **1800** (1735 s, driver peak 10.5 GB); 2000 is refused at once, 49 MiB over the budget |
+| IntelliFold-2 | 512 (768 out of memory, the runtime lost) | **896** (1421 s, driver 10.8 GB); 1000 is refused at once |
+| OpenDDE | 512 | ~590, the binding limit below |
+
+Every refusal is one sentence at the start of the fold, and the runtime folds
+normally after it. Past the T4's memory, every NVIDIA card stops at the 2 GiB
+storage-binding limit - sqrt(limit / (pairChannels x 4)) tokens: 2047 for AF3,
+1023 for IntelliFold-2, 1182 subtokens for OpenDDE, which expands each residue -
+and a fold past it is now refused in seconds with the numbers, where OpenDDE at
+768 residues used to run ten minutes into "uncaptured: Binding size (3465222144)
+...". Going past THAT needs the pair bound in windows or stored in f16 across
+the ~28 kernels that bind it whole (docs/AF2.md's binding-ceiling notes).
