@@ -140,6 +140,7 @@ __global__ void centerNormK(const float* prod, TO* out, size_t r0, size_t rows, 
 
 inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
 inline bool FUSED_GRID = true;
+inline bool TRI_BF16 = true;
 #include "fusedtriangle.cuh"
 
 template <class T>
@@ -149,11 +150,12 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   // the channel-major arrays' channel stride, padded to 8 elements so a channel's start is
   // 16-byte aligned whatever n is (261^2 is odd)
   size_t cs = (pairs + 7) / 8 * 8;
-  T* a = scratch<T>("tri.a", cs * C);
-  T* b = scratch<T>("tri.b", cs * C);
-  // f32: in f16 the contraction (a sum over n of products) overflows - 5CAJ's went to inf
-  float* prod = scratch<float>("tri.prod", cs * C);
   std::string pg = projectionGate(pre, C);
+  T *a = nullptr, *b = nullptr;
+  float* prod = nullptr;          // f32: in f16 the contraction (a sum over n of products) overflows
+  auto buffers = [&]() {
+    a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
+  };
   float alpha = divideByLength ? 1.f / n : 1.f, zero = 0.f;
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   auto contract = [&]() {         // one n x n GEMM per channel: outgoing P = A B^T, incoming P = B^T A
@@ -167,12 +169,30 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   if constexpr (std::is_same_v<T, half>) {
     if (FUSED_TRIANGLE && C == 128) {           // three kernels: see fusedtriangle.cuh
       half* t2 = scratch<half>("tri.t2whole", pairs * C);
+      if (TRI_BF16) {
+        // a, b and the contraction's product in bf16: f32's range at half the bytes (f16's
+        // range is what overflowed), AF3's own activation precision
+        __nv_bfloat16* ab = scratch<__nv_bfloat16>("tri.abf", cs * C);
+        __nv_bfloat16* bb = scratch<__nv_bfloat16>("tri.bbf", cs * C);
+        __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs * C);
+        triIn128(pair, mask, pre, pg, ab, bb, t2, pairs, cs);
+        if (outgoing)
+          CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &alpha, bb, CUDA_R_16BF, n, cs, ab,
+            CUDA_R_16BF, n, cs, &zero, pb, CUDA_R_16BF, n, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        else
+          CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, n, n, n, &alpha, ab, CUDA_R_16BF, n, cs, bb,
+            CUDA_R_16BF, n, cs, &zero, pb, CUDA_R_16BF, n, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        triOut128(pb, pre, t2, pair, pairs, cs);
+        return;
+      }
+      buffers();
       triIn128(pair, mask, pre, pg, a, b, t2, pairs, cs);
       contract();
       triOut128(prod, pre, t2, pair, pairs, cs);
       return;
     }
   }
+  buffers();
   T* norm = scratch<T>("tri.norm", pairs * C);
   size_t rowsPer = std::max<size_t>(1, CHUNK / (4 * C));
   T* pgOut = scratch<T>("tri.pg", rowsPer * 4 * C);

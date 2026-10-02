@@ -11,6 +11,7 @@
 // weights streamed through shared memory, outputs straight from the accumulators.
 #pragma once
 #include "flash.cuh"
+#include <cuda_bf16.h>
 
 // LayerNorm of a block's R rows into shared memory as f16, a warp a row and FOUR rows' loads in
 // flight per warp (one at a time left the loads latency-bound). rowOf(r) is row r's index in x,
@@ -51,17 +52,18 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
 constexpr int TI_NC = 32;
 __host__ __device__ constexpr size_t tiStage(int C) { return (size_t)2 * C * (TI_NC + 8) * 2; }
 
-template <int C, int WARPS>
+// TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (f16 overflows)
+template <int C, int WARPS, class TA>
 __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wpg,
-    const half* __restrict__ Wg, half* __restrict__ a, half* __restrict__ b, half* __restrict__ t2, size_t pairs,
+    const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, size_t pairs,
     size_t cs) {
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = TI_NC + 8, KS = C / 16, LDT = R + 8;
   constexpr size_t STAGE = tiStage(C);
   extern __shared__ __align__(16) unsigned char smem[];
   half* Xs = (half*)smem;                                           // [R][LDX]
-  half* Ta = Xs + R * LDX;                                          // [16 channels][LDT], a then b
-  half* Tb = Ta + 16 * LDT;
+  TA* Ta = (TA*)(Xs + R * LDX);                                     // [16 channels][LDT], a then b
+  TA* Tb = Ta + 16 * LDT;
   unsigned char* stages = (unsigned char*)(Tb + 16 * LDT);
   auto W0 = [&](int s) { return (half*)(stages + s * STAGE); };
   auto W1 = [&](int s) { return W0(s) + C * LDW; };
@@ -129,10 +131,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
         int ch = nt * 4 + tig;
-        Ta[ch * LDT + lr0] = __float2half(p[nt][0] * sigm(q[nt][0]) * m0);
-        Tb[ch * LDT + lr0] = __float2half(p[nt][1] * sigm(q[nt][1]) * m0);
-        Ta[ch * LDT + lr1] = __float2half(p[nt][2] * sigm(q[nt][2]) * m1);
-        Tb[ch * LDT + lr1] = __float2half(p[nt][3] * sigm(q[nt][3]) * m1);
+        Ta[ch * LDT + lr0] = TA(p[nt][0] * sigm(q[nt][0]) * m0);
+        Tb[ch * LDT + lr0] = TA(p[nt][1] * sigm(q[nt][1]) * m0);
+        Ta[ch * LDT + lr1] = TA(p[nt][2] * sigm(q[nt][2]) * m1);
+        Tb[ch * LDT + lr1] = TA(p[nt][3] * sigm(q[nt][3]) * m1);
       }
       __syncthreads();
       // 16 bytes (8 pairs) a thread: the channel stride cs is a multiple of 8, the block's first
@@ -152,15 +154,16 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
 }
 
 // pair += (LN_center(prod) Wout) * sigmoid(t2); prod channel-major [C][pairs] f32
-template <int C, int WARPS>
-__global__ void __launch_bounds__(WARPS * 32) triOutK(const float* __restrict__ prod, const float* __restrict__ cnScale,
+template <int C, int WARPS, class TP>
+__global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
     float* __restrict__ pair, size_t pairs, size_t cs) {
-  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + 4, LDX = C + 8, LDW = C + 8, KS = C / 16, NT = C / 8;
+  constexpr int PV = 16 / sizeof(TP);                               // product elements in 16 bytes
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + PV, LDX = C + 8, LDW = C + 8, KS = C / 16, NT = C / 8;
   extern __shared__ __align__(16) unsigned char smem[];
   half* Ws = (half*)smem;                                           // [C][LDW], the whole output projection
   half* Xs = Ws + C * LDW;                                          // [R][LDX]
-  float* Ps = (float*)(Xs + R * LDX);                               // [C][LDP]
+  TP* Ps = (TP*)(Xs + R * LDX);                                     // [C][LDP]
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * R;
   for (int t = threadIdx.x; t < C * (C / 8); t += NTH) {
@@ -168,8 +171,8 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const float* __restrict__ 
     cpAsync16(Ws + k * LDW + c, Wout + (size_t)k * C + c, true);
   }
   asm volatile("cp.async.commit_group;");
-  for (int t = threadIdx.x; t < C * (R / 4); t += NTH) {            // 16 bytes (4 pairs) a thread
-    int c = t / (R / 4), r = (t % (R / 4)) * 4;
+  for (int t = threadIdx.x; t < C * (R / PV); t += NTH) {           // 16 bytes a thread
+    int c = t / (R / PV), r = (t % (R / PV)) * PV;
     size_t row = row0 + r;
     cpAsync16(Ps + c * LDP + r, prod + (size_t)c * cs + (row < cs ? row : 0), row < cs);
   }
@@ -178,7 +181,7 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const float* __restrict__ 
   __syncthreads();
   for (int r = warp; r < R; r += WARPS) {                            // the center norm, a warp a row
     float v[C / 32]; float s = 0.f;
-    for (int k = 0; k < C / 32; ++k) { v[k] = Ps[(lane + 32 * k) * LDP + r]; s += v[k]; }
+    for (int k = 0; k < C / 32; ++k) { v[k] = (float)Ps[(lane + 32 * k) * LDP + r]; s += v[k]; }
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
     float mean = s / C, q = 0.f;
     for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; q += d * d; }
@@ -223,22 +226,24 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const float* __restrict__ 
 
 inline bool FUSED_TRIANGLE = true;
 constexpr int TI_WARPS = 16, TO_WARPS = 8;
-inline void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
-                     half* a, half* b, half* t2, size_t pairs, size_t cs) {
+template <class TA>
+void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
+              TA* a, TA* b, half* t2, size_t pairs, size_t cs) {
   constexpr int C = 128, R = 16 * TI_WARPS;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * 16 * (R + 8) * 2 + 2 * tiStage(C);
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(triInK<C, TI_WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-  triInK<C, TI_WARPS><<<(unsigned)((pairs + R - 1) / R), 32 * TI_WARPS, smem, STREAM>>>(
+  if (!attr) { CK(cudaFuncSetAttribute(triInK<C, TI_WARPS, TA>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  triInK<C, TI_WARPS, TA><<<(unsigned)((pairs + R - 1) / R), 32 * TI_WARPS, smem, STREAM>>>(
     pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
     a, b, t2, pairs, cs);
 }
-inline void triOut128(const float* prod, const std::string& pre, const half* t2, float* pair, size_t pairs, size_t cs) {
+template <class TP>
+void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, size_t pairs, size_t cs) {
   constexpr int C = 128, R = 16 * TO_WARPS;
-  size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 4) * 4;
+  size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 16 / sizeof(TP)) * sizeof(TP);
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(triOutK<C, TO_WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-  triOutK<C, TO_WARPS><<<(unsigned)((pairs + R - 1) / R), 32 * TO_WARPS, smem, STREAM>>>(
+  if (!attr) { CK(cudaFuncSetAttribute(triOutK<C, TO_WARPS, TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  triOutK<C, TO_WARPS, TP><<<(unsigned)((pairs + R - 1) / R), 32 * TO_WARPS, smem, STREAM>>>(
     prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, pairs, cs);
 }
 
