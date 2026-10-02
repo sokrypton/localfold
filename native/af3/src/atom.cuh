@@ -235,6 +235,26 @@ inline void adaLn(const float* x, const float* scale, const float* shift, TO* ou
   adaLnK<TO><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, scale, shift, out, rows, C, period);
 }
 
+template <class TO>
+__global__ void adaLn2K(const float* x, const float* s1, const float* h1, const float* s2, const float* h2, TO* o1, TO* o2,
+                        size_t rows, int C, size_t period) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* xr = x + row * C;
+  float s = 0;
+  for (int c = lane; c < C; c += 32) s += xr[c];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, v = 0;
+  for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = 1.f / sqrtf(v / C + 1e-5f);
+  for (int c = lane; c < C; c += 32) {
+    size_t k = (row % period) * C + c; float n = (xr[c] - mean) * inv;
+    o1[row * C + c] = fromF<TO>(sigm(s1[k]) * n + h1[k]);
+    o2[row * C + c] = fromF<TO>(sigm(s2[k]) * n + h2[k]);
+  }
+}
 struct AtomStep {
   Gather queriesToKeys;
   const float *qMask, *kMask;
@@ -476,10 +496,8 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
     pre = scratch<float>("ab.pre", qRows * C);
     CK(cudaMemcpyAsync(pre, act, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   }
-  T* xq = scratch<T>("ab.xq", qRows * C);
-  // keys and values projected once per atom, then gathered into the subsets' key windows (a
-  // masked window slot is zero, as the LayerNorm of its zero row was)
-  T* xk = scratch<T>("ab.xk", qRows * C);
+  T* xq = scratch<T>("ab.xqk", 2 * qRows * C);
+  T* xk = xq + qRows * C;
   if (bc.chained) {         // xk = adaLN_k(adaLN_q(x)): the queries normalised in f32 first
     float* xqF = scratch<float>("ab.xqF", qRows * C);
     adaLn<float>(act, bc.qScale, bc.qShift, xqF, qRows, C, q1);
@@ -487,13 +505,21 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
     else CK(cudaMemcpyAsync(xq, xqF, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
     adaLn<T>(xqF, bc.kScale, bc.kShift, xk, qRows, C, q1);
   } else {
-    adaLn<T>(act, bc.qScale, bc.qShift, xq, qRows, C, q1);
-    adaLn<T>(act, bc.kScale, bc.kShift, xk, qRows, C, q1);
+    adaLn2K<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, bc.qScale, bc.qShift, bc.kScale, bc.kShift, xq, xk,
+                                                               qRows, C, q1);
   }
-  T* qg = scratch<T>("ab.qg", qRows * 2 * Wd); T* kvAtom = scratch<T>("ab.kvAtom", qRows * 2 * Wd);
+  T* qg = scratch<T>("ab.qgkv", 2 * qRows * 2 * Wd); T* kvAtom = qg + qRows * 2 * Wd;
   T* kv = scratch<T>("ab.kv", kRows * 2 * Wd);
-  linear<T, T>(xq, qg, qRows, C, 2 * Wd, pairedWeight(B + ".qProjection", B + ".gatingQuery", C, Wd));
-  linear<T, T>(xk, kvAtom, qRows, C, 2 * Wd, pairedWeight(B + ".kProjection", B + ".vProjection", C, Wd));
+  {
+    std::string w = concatColumns(B + ".qgkv~stack", 1, {{pairedWeight(B + ".qProjection", B + ".gatingQuery", C, Wd), C * 2 * Wd, false},
+                                                         {pairedWeight(B + ".kProjection", B + ".vProjection", C, Wd), C * 2 * Wd, false}});
+    const void* Wp; if constexpr (std::is_same_v<T, float>) Wp = W(w); else Wp = Wh(w);
+    const float one = 1.f, zero = 0.f;
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, 2 * Wd, (int)qRows, C, &one, Wp, cudaType<T>(), 2 * Wd,
+       (long long)C * 2 * Wd, xq, cudaType<T>(), C, (long long)qRows * C, &zero, qg, cudaType<T>(), 2 * Wd,
+       (long long)qRows * 2 * Wd, 2, CUBLAS_COMPUTE_32F,
+       std::is_same_v<T, float> && !F32_TF32 ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  }
   const float* qBias = W(B + ".qBias");
   if (hasW(B + ".queryLayerNormScale")) {       // rf3: normalised per atom row, the q bias inside
     atomKqNormK<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(qg, kvAtom, qBias, W(B + ".queryLayerNormScale"),
