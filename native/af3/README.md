@@ -71,6 +71,20 @@ fold - is 1.7 s for 6MRR and 2.4 s for 5CAJ. No 2 GiB binding ceiling. At 1044 t
 attention's flash kernel 40% of it - so recycles dominate there; up to ~300 tokens the 200
 denoiser steps do.
 
+Against AlphaFold 3 itself - af3-any-model's JAX (bf16, Triton flash attention) with DeepMind's
+weights, on this A100, `tools/oracle/bench_af3_native.py` at matched settings (one sample unless
+said, no token bucketing, the same MSA rows), steady-state calls:
+
+| 200 steps | JAX AF3 | native `--fast` | |
+|---|---|---|---|
+| 6MRR, 68 tokens, 1 pass | 1.67 s | **0.41 s** | 4.1x |
+| 5CAJ, 261 tokens, 512 rows, 1 pass | 2.76 s | **0.73 s** | 3.8x |
+| 5CAJ, 4 passes (3 recycles) | 3.47 s | **1.13 s** | 3.1x |
+| 5CAJ, 1 pass, 5 samples | 5.00 s | **1.57 s** | 3.2x |
+
+and JAX's first call carries ~60 s of compilation where the native first fold is within 15% of
+a warm one.
+
 The pairformer alone (48 blocks, FP16): 64 tokens 15 ms, 256 142 ms, 1024 2.95 s - 1.9-3.3x
 the WebGPU trunk's pairformer.
 
