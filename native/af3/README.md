@@ -175,8 +175,8 @@ oracles) folds the other checkpoints the page offers, through the same dialect f
 | protenix2 | trunk_out_pair 1.0e-6, denoise 1.5e-6, PAE 2.4e-7 | 0.453 A | 0.136 A |
 | IntelliFold-2 (int5 bundle) | trunk_out_pair 4.5e-2 (the quantisation; z_after_msa 9.1e-3) | 1.551 A | 0.296 A |
 | RoseTTAFold3 (int5 bundle) | trunk_out_pair 4.85e-2 (WebGPU on the same bundle 4.90e-2) | 1.621 A, bonds 0.050 A | |
-| boltz2 | trunk_out_pair 4.5e-7, PAE 4.5e-7; denoise 2.5e-2 (see below) | 0.466 A on its reference batch (WebGPU 0.507); 2.96 A single-sequence (WebGPU 4.56) | 0.347 A |
-| OpenDDE | trunk_out_pair 9.6e-7, expander 5.2e-9, refiner 1.8e-7, denoise 1.1e-6, PAE 1.8e-6 | 0.485 A on its reference batch (0.679 at the page's 16 steps) | 0.127 A |
+| boltz2 | trunk_out_pair 4.5e-7, PAE 4.5e-7; denoise 2.5e-2 (see below) | 0.460 A (0.466 on its reference batch; WebGPU 0.507) | 0.347 A |
+| OpenDDE | trunk_out_pair 9.6e-7, expander 5.2e-9, refiner 1.8e-7, denoise 1.1e-6, PAE 1.8e-6 | 1.499 A at the page's 16 steps (WebGPU 1.501); its reference batch 0.679 (0.485 at 200) | 0.127 A |
 
 Ported for them: the padded single conditioning, per-block atom pair norm, chained atom
 LayerNorms, split pair conditioning, per-block atom masking, the fused template embedder (passes

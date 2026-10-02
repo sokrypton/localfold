@@ -56,8 +56,16 @@ __host__ __device__ constexpr size_t tiStage(int C) { return (size_t)2 * C * (TI
 template <int C, int WARPS, class TA>
 __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wpg,
-    const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, size_t pairs,
+    const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np,
     size_t cs) {
+  // rows are the PADDED pair space (np x np, np a multiple of 32, which is what the contraction's
+  // GEMM wants); a padding row maps to no pair and writes zeros
+  const size_t pp = (size_t)np * np;
+  auto pairOf = [&](size_t q) -> size_t {
+    if (q >= pp) return SIZE_MAX;
+    unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;    // 32-bit: a 64-bit divide is ~70 instructions
+    return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
+  };
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = TI_NC + 8, KS = C / 16, LDT = R + 8;
   constexpr size_t STAGE = tiStage(C);
   extern __shared__ __align__(16) unsigned char smem[];
@@ -86,14 +94,14 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
     asm volatile("cp.async.commit_group;");
   };
   issue(0, 0);
-  lnRowsToShared<C, R, WARPS>(pair, [&](int r) { size_t row = row0 + r; return row < pairs ? row : SIZE_MAX; },
-                              lnScale, lnOffset, Xs, LDX, warp, lane);
+  lnRowsToShared<C, R, WARPS>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
   __syncthreads();
   uint32_t xa[KS][4];
 #pragma unroll
   for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
   int lr0 = warp * 16 + g, lr1 = lr0 + 8;                          // the thread's rows within the block
-  float m0 = row0 + lr0 < pairs ? mask[row0 + lr0] : 0.f, m1 = row0 + lr1 < pairs ? mask[row0 + lr1] : 0.f;
+  size_t pr0 = pairOf(row0 + lr0), pr1 = pairOf(row0 + lr1);
+  float m0 = pr0 != SIZE_MAX ? mask[pr0] : 0.f, m1 = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
   for (int j = 0; j < steps; ++j) {
     int st = j & 1;
     if (j + 1 < steps) { issue(j + 1, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
@@ -122,8 +130,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
         int c = c0 + nt * 8 + tig * 2;
-        if (row0 + lr0 < pairs) *reinterpret_cast<half2*>(t2 + (row0 + lr0) * C + c) = __floats2half2_rn(p[nt][0], p[nt][1]);
-        if (row0 + lr1 < pairs) *reinterpret_cast<half2*>(t2 + (row0 + lr1) * C + c) = __floats2half2_rn(p[nt][2], p[nt][3]);
+        if (row0 + lr0 < pp) *reinterpret_cast<half2*>(t2 + (row0 + lr0) * C + c) = __floats2half2_rn(p[nt][0], p[nt][1]);
+        if (row0 + lr1 < pp) *reinterpret_cast<half2*>(t2 + (row0 + lr1) * C + c) = __floats2half2_rn(p[nt][2], p[nt][3]);
       }
     } else {
       // column 2ch is a's channel ch, 2ch+1 b's (the interleaved split): this thread's column pair
@@ -137,8 +145,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
         Tb[ch * LDT + lr1] = TA(p[nt][3] * sigm(q[nt][3]) * m1);
       }
       __syncthreads();
-      // 16 bytes (8 pairs) a thread: the channel stride cs is a multiple of 8, the block's first
-      // row a multiple of R; rows past `pairs` are zero (masked) and land in the padding
+      // 16 bytes (8 rows) a thread: the channel stride cs is a multiple of 8, the block's first
+      // row a multiple of R; padding rows are zero (masked)
       for (int t = threadIdx.x; t < 16 * (R / 8); t += NTH) {
         int ch = t / (R / 8), r = (t % (R / 8)) * 8;
         size_t row = row0 + r;
@@ -157,7 +165,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
 template <int C, int WARPS, class TP>
 __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
-    float* __restrict__ pair, size_t pairs, size_t cs) {
+    float* __restrict__ pair, int n, int np, size_t cs) {
+  const size_t pp = (size_t)np * np;
   constexpr int PV = 16 / sizeof(TP);                               // product elements in 16 bytes
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + PV, LDX = C + 8, LDW = C + 8, KS = C / 16, NT = C / 8;
   extern __shared__ __align__(16) unsigned char smem[];
@@ -207,18 +216,25 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
       mma16816(acc[et + 1], xa[ks], f[2], f[3]);
     }
   }
+  // padded rows (t2 is in the padded space too) back to pairs
   size_t r0 = row0 + warp * 16 + g, r1 = r0 + 8;
+  auto pairOf = [&](size_t q) -> size_t {
+    if (q >= pp) return SIZE_MAX;
+    unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;    // 32-bit: a 64-bit divide is ~70 instructions
+    return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
+  };
+  size_t p0 = pairOf(r0), p1 = pairOf(r1);
 #pragma unroll
   for (int et = 0; et < NT; ++et) {
     int c = et * 8 + tig * 2;
-    if (r0 < pairs) {
+    if (p0 != SIZE_MAX) {
       float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r0 * C + c));
-      float2* p = (float2*)(pair + r0 * C + c); float2 v = *p;
+      float2* p = (float2*)(pair + p0 * C + c); float2 v = *p;
       v.x += acc[et][0] * sigm(gt.x); v.y += acc[et][1] * sigm(gt.y); *p = v;
     }
-    if (r1 < pairs) {
+    if (p1 != SIZE_MAX) {
       float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r1 * C + c));
-      float2* p = (float2*)(pair + r1 * C + c); float2 v = *p;
+      float2* p = (float2*)(pair + p1 * C + c); float2 v = *p;
       v.x += acc[et][2] * sigm(gt.x); v.y += acc[et][3] * sigm(gt.y); *p = v;
     }
   }
@@ -228,23 +244,25 @@ inline bool FUSED_TRIANGLE = true;
 constexpr int TI_WARPS = 16, TO_WARPS = 8;
 template <class TA>
 void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
-              TA* a, TA* b, half* t2, size_t pairs, size_t cs) {
+              TA* a, TA* b, half* t2, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * TI_WARPS;
+  size_t pp = (size_t)np * np;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * 16 * (R + 8) * 2 + 2 * tiStage(C);
   static bool attr = false;
   if (!attr) { CK(cudaFuncSetAttribute(triInK<C, TI_WARPS, TA>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-  triInK<C, TI_WARPS, TA><<<(unsigned)((pairs + R - 1) / R), 32 * TI_WARPS, smem, STREAM>>>(
+  triInK<C, TI_WARPS, TA><<<(unsigned)((pp + R - 1) / R), 32 * TI_WARPS, smem, STREAM>>>(
     pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
-    a, b, t2, pairs, cs);
+    a, b, t2, n, np, cs);
 }
 template <class TP>
-void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, size_t pairs, size_t cs) {
+void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * TO_WARPS;
+  size_t pp = (size_t)np * np;
   size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 16 / sizeof(TP)) * sizeof(TP);
   static bool attr = false;
   if (!attr) { CK(cudaFuncSetAttribute(triOutK<C, TO_WARPS, TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-  triOutK<C, TO_WARPS, TP><<<(unsigned)((pairs + R - 1) / R), 32 * TO_WARPS, smem, STREAM>>>(
-    prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, pairs, cs);
+  triOutK<C, TO_WARPS, TP><<<(unsigned)((pp + R - 1) / R), 32 * TO_WARPS, smem, STREAM>>>(
+    prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np, cs);
 }
 
 // out[h][row] = (LN(x[row]) W)[h] for a projection to few heads (N a multiple of 16, W (C, N)):

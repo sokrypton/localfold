@@ -50,6 +50,10 @@ template <int D, int WARPS> __host__ __device__ constexpr size_t faStage() {
 // transposed for the column direction; -1e9 where it is zero. MASKED false: every key is real
 // (a protein with no padding - the mask is all ones), so no mask is loaded or added and only the
 // last tile masks the keys past n (3-7% of this kernel).
+__device__ __forceinline__ uint32_t ex2h2(uint32_t x) {
+  uint32_t y; asm("ex2.approx.f16x2 %0, %1;" : "=r"(y) : "r"(x)); return y;
+}
+constexpr uint32_t ONES_H2 = 0x3C003C00u;      // half2(1, 1)
 template <int D, int WARPS, bool MASKED = true>
 __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, const float* __restrict__ mask, half* __restrict__ out, int n, int heads, size_t r0, bool tr, float scale,
@@ -99,7 +103,7 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
     qa[ks][0] = q2(i0, e); qa[ks][1] = q2(i1, e); qa[ks][2] = q2(i0, e + 8); qa[ks][3] = q2(i1, e + 8);
   }
   float o[D / 8][4] = {};
-  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+  float m0 = -INFINITY, m1 = -INFINITY, lsum[4] = {};
   int tiles = (n + BK - 1) / BK;
   issue(0, 0);
   for (int tile = 0; tile < tiles; ++tile) {
@@ -108,9 +112,23 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
     else asm volatile("cp.async.wait_group 0;");
     __syncthreads();
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st); const float* Ms = Mst(st);
+    // S starts from the bias (and the key mask), and the tensor cores accumulate Q.K onto it
+    const half* br0 = B + (warp * 16 + g) * LDB;
+    const half* br1 = br0 + 8 * LDB;
     float sv[BK / 8][4];
     for (int nt = 0; nt < BK / 8; ++nt) {
-      sv[nt][0] = sv[nt][1] = sv[nt][2] = sv[nt][3] = 0.f;
+      int jj = nt * 8 + tig * 2;
+      float2 u = __half22float2(*reinterpret_cast<const half2*>(br0 + jj));
+      float2 v = __half22float2(*reinterpret_cast<const half2*>(br1 + jj));
+      if (MASKED) {
+        float ma = Ms[jj], mb = Ms[jj + 1];
+        u.x += ma; u.y += mb; v.x += ma; v.y += mb;
+      } else if (tile == tiles - 1) {
+        int jg = tile * BK + jj;
+        if (jg >= n) { u.x = v.x = -INFINITY; }
+        if (jg + 1 >= n) { u.y = v.y = -INFINITY; }
+      }
+      sv[nt][0] = u.x; sv[nt][1] = u.y; sv[nt][2] = v.x; sv[nt][3] = v.y;
       for (int k2 = 0; k2 < D / 32 + (D % 32 ? 1 : 0); ++k2) {
         uint32_t kb[4];
         ldsm4(kb, K + (nt * 8 + (lane & 7)) * LDK + k2 * 32 + (lane >> 3) * 8);
@@ -118,36 +136,25 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
         if (k2 * 2 + 1 < D / 16) mma16816(sv[nt], qa[k2 * 2 + 1], kb[2], kb[3]);
       }
     }
-    const half* br0 = B + (warp * 16 + g) * LDB;
-    const half* br1 = br0 + 8 * LDB;
     float t0 = -INFINITY, t1 = -INFINITY;
     for (int nt = 0; nt < BK / 8; ++nt) {
-      int jj = nt * 8 + tig * 2;
-      float2 u = __half22float2(*reinterpret_cast<const half2*>(br0 + jj));
-      float2 v = __half22float2(*reinterpret_cast<const half2*>(br1 + jj));
-      float ma = 0.f, mb = 0.f;
-      if (MASKED) { ma = Ms[jj]; mb = Ms[jj + 1]; }
-      else if (tile == tiles - 1) {
-        int jg = tile * BK + jj; ma = jg < n ? 0.f : -INFINITY; mb = jg + 1 < n ? 0.f : -INFINITY;
-      }
-      sv[nt][0] += u.x + ma; sv[nt][1] += u.y + mb;
-      sv[nt][2] += v.x + ma; sv[nt][3] += v.y + mb;
       t0 = fmaxf(t0, fmaxf(sv[nt][0], sv[nt][1])); t1 = fmaxf(t1, fmaxf(sv[nt][2], sv[nt][3]));
     }
     t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
     t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
     float n0 = fmaxf(m0, t0), n1 = fmaxf(m1, t1);
     float c0 = exp2f(m0 - n0), c1 = exp2f(m1 - n1);
-    m0 = n0; m1 = n1; l0 *= c0; l1 *= c1;
+    m0 = n0; m1 = n1;
     for (int et = 0; et < D / 8; ++et) { o[et][0] *= c0; o[et][1] *= c0; o[et][2] *= c1; o[et][3] *= c1; }
-    for (int nt = 0; nt < BK / 8; ++nt) {
-      sv[nt][0] = exp2f(sv[nt][0] - n0); sv[nt][1] = exp2f(sv[nt][1] - n0);
-      sv[nt][2] = exp2f(sv[nt][2] - n1); sv[nt][3] = exp2f(sv[nt][3] - n1);
-      l0 += sv[nt][0] + sv[nt][1]; l1 += sv[nt][2] + sv[nt][3];
-    }
+    lsum[0] *= c0; lsum[1] *= c0; lsum[2] *= c1; lsum[3] *= c1;
+    // P = 2^(S - max), two at a time in f16 (ex2.approx.f16x2: half the SFU work, and the result
+    // is already the packed A fragment the PV product reads); its row sums on the tensor cores
+    // (P . ones), accumulated in f32 like O
     for (int t = 0; t < BK / 16; ++t) {
-      uint32_t pa[4] = { pack2(sv[2 * t][0], sv[2 * t][1]), pack2(sv[2 * t][2], sv[2 * t][3]),
-                         pack2(sv[2 * t + 1][0], sv[2 * t + 1][1]), pack2(sv[2 * t + 1][2], sv[2 * t + 1][3]) };
+      uint32_t pa[4] = { ex2h2(pack2(sv[2 * t][0] - n0, sv[2 * t][1] - n0)), ex2h2(pack2(sv[2 * t][2] - n1, sv[2 * t][3] - n1)),
+                         ex2h2(pack2(sv[2 * t + 1][0] - n0, sv[2 * t + 1][1] - n0)),
+                         ex2h2(pack2(sv[2 * t + 1][2] - n1, sv[2 * t + 1][3] - n1)) };
+      mma16816(lsum, pa, ONES_H2, ONES_H2);
       for (int et = 0; et < D / 8; et += 2) {
         uint32_t vb[4];
         ldsm4t(vb, V + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (et + (lane >> 4)) * 8);
@@ -157,8 +164,7 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
     }
     __syncthreads();
   }
-  l0 += __shfl_xor_sync(~0u, l0, 1); l0 += __shfl_xor_sync(~0u, l0, 2);
-  l1 += __shfl_xor_sync(~0u, l1, 1); l1 += __shfl_xor_sync(~0u, l1, 2);
+  float l0 = lsum[0], l1 = lsum[2];
   // gates read first and stored as pairs: with a store between every load the compiler
   // cannot reorder (out may alias qkvg) and the epilogue was 24 serial round trips, 10 us
   half2 ga[D / 8], gb[D / 8];

@@ -105,7 +105,7 @@ inline std::string qkvgWeight(const std::string& pre, int C, int Wd, bool transp
 // are 2ch and 2ch+1), masked, written channel-major (c, pairs) through shared memory.
 template <class T>
 __global__ void triGateK(const T* pg, const float* mask, T* a, T* b, size_t r0, size_t rows, int C,
-                         size_t pairs) {
+                         size_t pairs, int n, int np) {
   __shared__ float A[32][33], B[32][33];
   size_t row0 = (size_t)blockIdx.x * 32; int c0 = blockIdx.y * 32;
   int tx = threadIdx.x, ty = threadIdx.y;
@@ -124,21 +124,24 @@ __global__ void triGateK(const T* pg, const float* mask, T* a, T* b, size_t r0, 
   for (int cy = ty; cy < 32; cy += 8) {
     size_t local = row0 + tx; int c = c0 + cy;
     if (local < rows && c < C) {
-      a[(size_t)c * pairs + r0 + local] = fromF<T>(A[tx][cy]);
-      b[(size_t)c * pairs + r0 + local] = fromF<T>(B[tx][cy]);
+      unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
+      size_t q = (size_t)i * np + (p - i * (unsigned)n);     // the padded (np x np) position
+      a[(size_t)c * pairs + q] = fromF<T>(A[tx][cy]);
+      b[(size_t)c * pairs + q] = fromF<T>(B[tx][cy]);
     }
   }
 }
 // center_norm over the channels of a (c, pairs) array -> row-major, 32 pairs a block.
 template <class TO>
 __global__ void centerNormK(const float* prod, TO* out, size_t r0, size_t rows, int C, size_t pairs,
-                            const float* scale, const float* offset) {
+                            const float* scale, const float* offset, int n, int np) {
   extern __shared__ float T_[];
   __shared__ float mean[32], inv[32];
   size_t i0 = (size_t)blockIdx.x * 32; int tx = threadIdx.x, ty = threadIdx.y;
   for (int c = ty; c < C; c += 8) {
     size_t local = i0 + tx;
-    T_[c * 33 + tx] = local < rows ? prod[(size_t)c * pairs + r0 + local] : 0.f;
+    unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
+    T_[c * 33 + tx] = local < rows ? prod[(size_t)c * pairs + (size_t)i * np + (p - i * (unsigned)n)] : 0.f;
   }
   __syncthreads();
   if (ty == 0) {
@@ -157,54 +160,60 @@ __global__ void centerNormK(const float* prod, TO* out, size_t r0, size_t rows, 
 inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
 inline bool FUSED_GRID = true;
 inline bool TRI_BF16 = true;
+inline int TRI_PAD = 32;          // the triangle's padded size is a multiple of this (0: none)
 #include "fusedtriangle.cuh"
 
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
               bool divideByLength) {
   size_t pairs = (size_t)n * n;
-  // the channel-major arrays' channel stride, padded to 8 elements so a channel's start is
-  // 16-byte aligned whatever n is (261^2 is odd)
-  size_t cs = (pairs + 7) / 8 * 8;
+  // a, b and their product live in a PADDED np x np space per channel, np a multiple of 32, the
+  // padding zero: the contraction is unchanged and cuBLAS's GEMM runs twice as fast on a multiple
+  // of 32 (1044: 5.4 against 2.7 ms the pair of them; 522 the same)
+  int np = TRI_PAD ? (n + TRI_PAD - 1) / TRI_PAD * TRI_PAD : n;
+  size_t cs = (size_t)np * np;
   std::string pg = projectionGate(pre, C);
   T *a = nullptr, *b = nullptr;
   float* prod = nullptr;          // f32: in f16 the contraction (a sum over n of products) overflows
   auto buffers = [&]() {
     a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
+    if (np != n) {                // the padding is written by nothing here
+      CK(cudaMemsetAsync(a, 0, cs * C * sizeof(T), STREAM)); CK(cudaMemsetAsync(b, 0, cs * C * sizeof(T), STREAM));
+    }
   };
   float alpha = divideByLength ? 1.f / n : 1.f, zero = 0.f;
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   auto contract = [&]() {         // one n x n GEMM per channel: outgoing P = A B^T, incoming P = B^T A
     if (outgoing)
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &alpha, b, cudaType<T>(), n,
-        cs, a, cudaType<T>(), n, cs, &zero, prod, CUDA_R_32F, n, cs, C, CUBLAS_COMPUTE_32F, algo));
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, &alpha, b, cudaType<T>(), np,
+        cs, a, cudaType<T>(), np, cs, &zero, prod, CUDA_R_32F, np, cs, C, CUBLAS_COMPUTE_32F, algo));
     else
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, n, n, n, &alpha, a, cudaType<T>(), n,
-        cs, b, cudaType<T>(), n, cs, &zero, prod, CUDA_R_32F, n, cs, C, CUBLAS_COMPUTE_32F, algo));
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, np, np, np, &alpha, a, cudaType<T>(), np,
+        cs, b, cudaType<T>(), np, cs, &zero, prod, CUDA_R_32F, np, cs, C, CUBLAS_COMPUTE_32F, algo));
   };
   if constexpr (std::is_same_v<T, half>) {
     if (FUSED_TRIANGLE && C == 128) {           // three kernels: see fusedtriangle.cuh
-      half* t2 = scratch<half>("tri.t2whole", pairs * C);
+      half* t2 = scratch<half>("tri.t2whole", cs * C);
       if (TRI_BF16) {
         // a, b and the contraction's product in bf16: f32's range at half the bytes (f16's
         // range is what overflowed), AF3's own activation precision
         __nv_bfloat16* ab = scratch<__nv_bfloat16>("tri.abf", cs * C);
         __nv_bfloat16* bb = scratch<__nv_bfloat16>("tri.bbf", cs * C);
         __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs * C);
-        triIn128(pair, mask, pre, pg, ab, bb, t2, pairs, cs);
+        triIn128(pair, mask, pre, pg, ab, bb, t2, n, np, cs);
         if (outgoing)
-          CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &alpha, bb, CUDA_R_16BF, n, cs, ab,
-            CUDA_R_16BF, n, cs, &zero, pb, CUDA_R_16BF, n, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+          CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, &alpha, bb, CUDA_R_16BF, np, cs, ab,
+            CUDA_R_16BF, np, cs, &zero, pb, CUDA_R_16BF, np, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         else
-          CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, n, n, n, &alpha, ab, CUDA_R_16BF, n, cs, bb,
-            CUDA_R_16BF, n, cs, &zero, pb, CUDA_R_16BF, n, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        triOut128(pb, pre, t2, pair, pairs, cs);
+          CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, np, np, np, &alpha, ab, CUDA_R_16BF, np, cs, bb,
+            CUDA_R_16BF, np, cs, &zero, pb, CUDA_R_16BF, np, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        triOut128(pb, pre, t2, pair, n, np, cs);
         return;
       }
-      buffers();
-      triIn128(pair, mask, pre, pg, a, b, t2, pairs, cs);
+      a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
+      triIn128(pair, mask, pre, pg, a, b, t2, n, np, cs);   // writes the padding itself
       contract();
-      triOut128(prod, pre, t2, pair, pairs, cs);
+      triOut128(prod, pre, t2, pair, n, np, cs);
       return;
     }
   }
@@ -218,7 +227,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
                          pre + ".leftNormInputOffset");
     linear<T, T>(norm + r0 * C, pgOut, rows, C, 4 * C, pg);
     triGateK<T><<<dim3((unsigned)((rows + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(
-      pgOut, mask, a, b, r0, rows, C, cs);
+      pgOut, mask, a, b, r0, rows, C, cs, n, np);
   }
   contract();
   rowsPer = std::max<size_t>(1, CHUNK / C);
@@ -235,7 +244,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       }
     }
     centerNormK<T><<<(unsigned)((rows + 31) / 32), dim3(32, 8), C * 33 * 4, STREAM>>>(prod, centred, r0,
-      rows, C, cs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
+      rows, C, cs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), n, np);
     linear<T, T>(centred, t1, rows, C, C, pre + ".outputProjection");
     linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
     gatedAddK<T><<<blocks(rows * C), 256, 0, STREAM>>>(pair + r0 * C, t1, t2, rows * C);

@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
   if (!seedGiven && M.has("job.seed")) seed = (uint64_t)M.meta("job.seed");   // the job's own modelSeeds[0]
   if (getenv("FLASH_WARPS")) FLASH_WARPS_OVERRIDE = atoi(getenv("FLASH_WARPS"));   // experiments
   if (getenv("FT_WARPS")) FT_WARPS = atoi(getenv("FT_WARPS"));
+  if (getenv("TRI_PAD")) TRI_PAD = atoi(getenv("TRI_PAD"));
   if (profile) prof::init();
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
@@ -55,6 +56,7 @@ int main(int argc, char** argv) {
          (int)M.meta("batch.tokens"));
 
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-ops=", 12)) { benchOps(atoi(argv[i] + 12)); return 0; }
+  for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-grid=", 13)) { benchGrid(atoi(argv[i] + 13)); return 0; }
   // One denoiser call on AF3's own inputs, against AF3's own output.
   for (const char* which : {"denoise", "realdenoise"}) {
     std::string O = std::string("oracle.") + which + ".";

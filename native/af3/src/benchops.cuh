@@ -53,3 +53,34 @@ inline void benchOps(int n) {
   time("ffw2 GEMM 1536->768", [&] { linear<half, float>(gated, att, n, I, C, B + ".ffwTransition2"); });
   time("empty kernel", [&] { addK<<<1, 32, 0, STREAM>>>(att, att, 0); });
 }
+// --bench-grid=N: the pair track's grid attention alone at N tokens (4 heads of 32, every row,
+// no mask), the arms interleaved and each the median of several rounds of 10 launches
+inline void benchGrid(int n) {
+  const int heads = 4, D = 32, Wd = heads * D, stride = (n + 7) / 8 * 8;
+  size_t rows = n;
+  half* qkvg = dallocT<half>(rows * n * 4 * Wd); half* out = dallocT<half>(rows * n * Wd);
+  half* bias = dallocT<half>((size_t)heads * n * stride);
+  { std::vector<half> h(std::max(rows * n * 4 * Wd, (size_t)heads * n * stride));
+    uint64_t s = 1; for (auto& v : h) { s = s * 6364136223846793005ull + 1442695040888963407ull; v = __float2half(((s >> 40) / 16777216.f - 0.5f)); }
+    CK(cudaMemcpy(qkvg, h.data(), rows * n * 4 * Wd * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bias, h.data(), (size_t)heads * n * stride * 2, cudaMemcpyHostToDevice)); }
+  std::vector<std::pair<std::string, std::function<void()>>> arms = {
+    {"grid w4", [&] { flashGridHalfAt<32, 4>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
+    {"grid w8", [&] { flashGridHalfAt<32, 8>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
+  };
+  std::vector<std::vector<float>> t(arms.size());
+  cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+  for (int round = 0; round < 7; ++round)
+    for (size_t k = 0; k < arms.size(); ++k) {
+      arms[k].second();
+      cudaEventRecord(a, STREAM);
+      for (int i = 0; i < 10; ++i) arms[k].second();
+      cudaEventRecord(b, STREAM); cudaEventSynchronize(b);
+      float ms; cudaEventElapsedTime(&ms, a, b); t[k].push_back(ms / 10);
+    }
+  double flops = (double)n * n * n * heads * D * 4;
+  for (size_t k = 0; k < arms.size(); ++k) {
+    std::sort(t[k].begin(), t[k].end());
+    printf("  %-16s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);
+  }
+}
