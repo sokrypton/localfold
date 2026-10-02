@@ -3963,5 +3963,19 @@ Three changes, found in this order:
    undefined), since resuming uploads it. The piecewise readback stays for
    the cases that still read one.
 
+**And on a real Colab T4, through the page** (reader `?backend=colab`, the
+runtime budgeting 80% of the card, single sequence, recycles 0, diffusion 25):
+
+| job | time | driver peak | status line |
+|---|---|---|---|
+| AlphaFold 3, 2047 residues | 1472 s | 10.1 GB of 15.4 | `AlphaFold 3 · 2047 residues · in 1472 s · single sequence · 1 pass · pLDDT 21.5` |
+| IntelliFold-2, 1023 residues | 1055 s | 12.0 GB of 15.4 | `IntelliFold-2 · 1023 residues · in 1055 s · single sequence · 1 pass · pLDDT 32.4` |
+
+Random sequences, so the pLDDTs say nothing about quality. Both runs were on
+commit a4bb894. The first IntelliFold-2 run was lost when Colab took its VM
+back 25 minutes in (`keep-alive` 404, then `session_terminated`), with a
+second T4 running beside it. The same job alone on one T4 finished. Run long
+T4 jobs one at a time.
+
 Past this, every NVIDIA card stops at the binding ceiling, and that needs the
 pair bound in windows or stored narrower across the kernels that bind it whole.
