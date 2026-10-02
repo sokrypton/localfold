@@ -11,6 +11,7 @@
 //           m meta/tokens, meta/msa_rows, meta/extra_rows, meta/passes
 // The tables the featuriser needs (atom37 maps) are read from the exported weights.
 import { readFileSync, writeFileSync, mkdirSync, openSync, readSync, writeSync, closeSync, renameSync } from "node:fs";
+import { Worker } from "node:worker_threads";
 import { makeA3mFeatures } from "../../src/input/a3m-features.js";
 import { chainResidues, identityMap, templateSlotAtom37 } from "../../src/af3/featurise/template-input.js";
 
@@ -51,13 +52,24 @@ if (sequence === "" && a3mPath === "") throw new Error("--sequence or --a3m name
 // numbering, asym/entity/sym ids), what the page passes a multimer
 const chains = sequence.split(":").filter(Boolean);
 const a3m = a3mPath === "" ? `>query\n${chains.join("")}\n` : readFileSync(a3mPath, "utf8");
-const features = makeA3mFeatures(a3m, tables, {
+const featureOptions = {
   ...(chains.length > 1 ? { chainAware: true, chainLengths: chains.map((c) => c.length), chainSequences: chains } : {}),
   recycles: Number(option("recycles", "3")),
   maxMsaSequences: Number(option("max-msa", "512")),
   maxExtraSequences: Number(option("max-extra", "1024")),
   randomSeed: Number(option("seed", "0")),
-});
+};
+// a deep alignment's recycles in parallel, one worker each (makeA3mFeatureRecycle: the same features
+// as makeA3mFeatures, recycle by recycle - the nearest-centre search and the finishing are most of an
+// export, and no recycle depends on another's); a shallow one is not worth a worker's start-up
+const passes = featureOptions.recycles + 1;
+const features = passes > 1 && a3m.length > (1 << 20)
+  ? await Promise.all(Array.from({ length: passes }, (_, index) => new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("../../src/input/a3m-features-worker.mjs", import.meta.url),
+      { workerData: { a3m, tables, options: featureOptions, index } });
+    worker.once("message", resolve); worker.once("error", reject);
+  })))
+  : makeA3mFeatures(a3m, tables, featureOptions);
 const first = features[0];
 const L = first.aatype.length;
 
