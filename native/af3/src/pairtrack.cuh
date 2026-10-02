@@ -158,6 +158,7 @@ __global__ void centerNormK(const float* prod, TO* out, size_t r0, size_t rows, 
 }
 
 inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
+inline bool FUSED_GRID = true;
 #include "fusedtriangle.cuh"
 
 template <class T>
@@ -259,6 +260,27 @@ __global__ void biasLayoutK(const float* raw, TB* bias, int n, int stride, int h
   float v = j < n ? scale * raw[(swap ? ((size_t)j * n + i) : ((size_t)i * n + j)) * heads + h] : 0.f;
   bias[t] = fromF<TB>(v);
 }
+// the same from head-major raw logits [hp][pairs] (hp >= heads, the padded projection's width)
+template <class TB>
+__global__ void biasLayoutHeadMajorK(const float* raw, TB* bias, int n, int stride, int heads, bool swap,
+                                     float scale) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)heads * n * stride, pairs = (size_t)n * n;
+  if (t >= total) return;
+  int j = (int)(t % stride); size_t rest = t / stride; int i = (int)(rest % n); int h = (int)(rest / n);
+  float v = j < n ? scale * raw[(size_t)h * pairs + (swap ? ((size_t)j * n + i) : ((size_t)i * n + j))] : 0.f;
+  bias[t] = fromF<TB>(v);
+}
+// a (C, k) weight zero-padded to (C, kp) columns
+inline std::string paddedColumns(const std::string& w, int C, int k, int kp) {
+  std::string key = w + "~pad" + std::to_string(kp);
+  if (SYNTH.count(key)) return key;
+  std::vector<float> out((size_t)C * kp, 0.f);
+  const float* src = M.f(w);
+  for (int c = 0; c < C; ++c) for (int o = 0; o < k; ++o) out[(size_t)c * kp + o] = src[(size_t)c * k + o];
+  SYNTH[key] = std::move(out);
+  return key;
+}
 // pair[(r, j) or (j, r)] += out[r][j], four channels a thread (C a multiple of 4)
 __global__ void addGridK(float* pair, const float* out, int n, int C, size_t r0, size_t R, bool tr) {
   int c4 = C / 4;
@@ -283,6 +305,45 @@ template <class T>
 void gridAttention(float* pair, const float* mask, int n, int C, int heads, int D,
                    const std::string& pre, bool tr, bool swapBias) {
   size_t pairs = (size_t)n * n; int Wd = heads * D;
+  if constexpr (std::is_same_v<T, half>) {
+    // three fused kernels (fusedtriangle.cuh): LN + the bias projection (head-major), then per
+    // chunk LN + q/k/v/gate (reading the column direction's rows transposed in place), the flash
+    // kernel, and the output projection added into the pair
+    if (FUSED_GRID && C == 128 && Wd == 128 && heads <= 16 && !hasW(pre + ".gatingQueryBias") &&
+        !hasW(pre + ".outputProjectionBias")) {
+      int stride = (n + 7) / 8 * 8;
+      half* bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
+      std::string qkvg = qkvgWeight(pre, C, Wd, true);
+      std::string wb = paddedColumns(pre + ".pairBiasProjection", C, heads, 16);
+      float scale = 1.f / sqrtf((float)D);
+      if (pairs * 4 * Wd * 2 <= ((size_t)4 << 30)) {
+        // every row in one pass (this card has the memory): the bias written by the same kernel
+        CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // the padding columns
+        half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);
+        gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias);
+        half* gathered = scratch<half>("grid.gathered", pairs * Wd);
+        flashGrid<half>(qkvgOut, bias, stride, mask, gathered, n, heads, D, 0, n, tr, scale);
+        if (!tr) linear<half, float>(gathered, pair, pairs, Wd, C, pre + ".outputProjection", false, 1.f);
+        else gridOut128(gathered, pre + ".outputProjection", pair, n, 0, pairs, tr);
+        return;
+      }
+      float* raw = scratch<float>("grid.raw16", pairs * 16);
+      lnHeads128<16>(pair, pre + ".actNormScale", pre + ".actNormOffset", wb, raw, pairs);
+      biasLayoutHeadMajorK<half><<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(
+        raw, bias, n, stride, heads, tr && swapBias, LOG2E);
+      size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
+      for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
+        size_t rows = std::min(R, (size_t)n - r0), prs = rows * n;
+        half* qkvgOut = scratch<half>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
+        gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
+        half* gathered = scratch<half>("grid.gathered", prs * Wd);
+        flashGrid<half>(qkvgOut, bias, stride, mask, gathered, n, heads, D, r0, rows, tr, scale);
+        if (!tr) linear<half, float>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+        else gridOut128(gathered, pre + ".outputProjection", pair, n, r0 * n, prs, tr);
+      }
+      return;
+    }
+  }
   T* norm = scratch<T>("grid.norm", pairs * C);
   layerNorm2<float, T>(pair, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
   float* raw = scratch<float>("grid.rawbias", pairs * heads);
