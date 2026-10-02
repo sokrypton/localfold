@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# The native ESMFold2 (esmfold2-fast-600m) in one command:
+#
+#   native/ef2/fold <out.pdb> --sequence=<SEQ>[:<SEQ>...] [-- <ef2 flags>]
+#   native/ef2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
+#
+# The weights are exported once (native/ef2/export_weights.mjs, from the float32 bundles on disk:
+# model-esmfold2-trunk-f32 and model-esmc-600m-f32) into native/ef2/weights; the input goes through the
+# page's featuriser (export_input.mjs) while ef2 starts up; flags after -- go to ./ef2.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[ $# -ge 1 ] || { sed -n '2,9p' "$0"; exit 1; }
+out="$1"; shift
+inputs=(); flags=()
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--" ]; then shift; flags=("$@"); break; fi
+  inputs+=("$1"); shift
+done
+if [ ! -x "$here/ef2" ]; then
+  (cd "$here" && nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread src/ef2.cu -lcublas -lcublasLt -o ef2)
+fi
+weights="$here/weights"
+[ -f "$weights/model.idx" ] || node "$here/export_weights.mjs" "$weights"
+tmp="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+exec 3< <("$here/ef2" "$tmp" --weights="$weights" --out="$out" --wait-input "${flags[@]}"; echo "ef2: exit $?")
+if ! node --js-float16array "$here/export_input.mjs" "$tmp" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
+status=0
+while IFS= read -r line <&3; do
+  case "$line" in "ef2: exit "*) status="${line#ef2: exit }" ;; *) printf '%s\n' "$line" ;; esac
+done
+exit "$status"

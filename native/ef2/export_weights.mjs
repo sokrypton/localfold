@@ -19,7 +19,7 @@ const out = args.find((a) => !a.startsWith("--"));
 if (!out) { console.error("usage: export_weights.mjs <out dir> [--fold=<bundle dir>] [--esmc=<bundle dir>]"); process.exit(1); }
 const option = (name, fallback) => args.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback;
 const repo = new URL("../..", import.meta.url).pathname;
-const bundles = [["f", option("fold", `${repo}model-esmfold2-trunk-f32`)],
+const bundles = [["f", option("fold", `${repo}model-esmfold2-conf-f32`)],
                  ["c", option("esmc", `${repo}model-esmc-600m-f32`)]];
 
 mkdirSync(out, { recursive: true });

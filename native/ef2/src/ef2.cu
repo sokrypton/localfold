@@ -7,6 +7,7 @@
 #include "atoms.cuh"
 #include "trunk.cuh"
 #include "sampler.cuh"
+#include "confidence.cuh"
 
 __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, int T, int states, int k, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -17,13 +18,14 @@ __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, 
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
-  std::string weights, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler;
+  std::string weights, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strcmp(argv[i], "--atom-f32")) ATOM_BF16 = false;
+    else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
     else if (!strncmp(argv[i], "--steps=", 8)) sampler.steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--inputs-window=", 16)) {           // 128: biohub's (the default); 0: dense
@@ -33,9 +35,21 @@ int main(int argc, char** argv) {
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (weights.empty()) { fprintf(stderr, "--weights=<dir> (native/ef2/export_weights.mjs)\n"); return 1; }
-  M.load(weights); M.load(argv[1]);
-  if (!oracle.empty()) M.load(oracle);
+  auto tStart = std::chrono::steady_clock::now();
+  M.load(weights);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
+  M.upload(0);
+  if (waitInput) {          // the exporter writes model.idx last, by a rename
+    std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";
+    for (int k = 0; access(idx.c_str(), R_OK) != 0; ++k) {
+      if (access(failed.c_str(), F_OK) == 0) { fprintf(stderr, "ef2: the input's export failed\n"); return 1; }
+      if (k > 600000) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
+      usleep(1000);
+    }
+  }
+  M.load(argv[1]);
+  if (!oracle.empty()) M.load(oracle);
+  printf("loaded in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tStart).count());
   CB(cublasSetMathMode(H, FAST ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
   int T = (int)M.meta("meta/tokens");
   Esmc e{(int)M.meta("meta/lm_rows"), (int)M.meta("meta/width"), (int)M.meta("meta/heads"),
@@ -100,7 +114,26 @@ int main(int argc, char** argv) {
   int stepsRun = 0;
   std::vector<float> coords = sample(dn, sampler, seed, &stepsRun);
   printf("sampler %.1f ms (%d steps)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stepsRun);
-  writePdb(std::string(argv[1]) + "/pdb.template", out, coords);
+  if (!M.has("f/confidence/pae")) {
+    fprintf(stderr, "the weights carry no confidence head: export them from model-esmfold2-conf-f32 (see native/ef2/README.md)\n");
+    return 1;
+  }
+  if (check && M.has("o/conf/plddt_per_atom")) {        // the head on the reference's own coordinates
+    float* xo = upload(M.f("o/coords"), (size_t)A * 3);
+    confidenceHead(T, A, z, sInputs, Si, relPos, xo, true);
+  }
+  t0 = std::chrono::steady_clock::now();
+  float* xd = upload(coords.data(), (size_t)A * 3);
+  Confidence conf = confidenceHead(T, A, z, sInputs, Si, relPos, xd, false);
+  printf("confidence %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  std::vector<float> bf(A);
+  for (int a = 0; a < A; ++a) bf[a] = 100.f * conf.plddtAtom[a];
+  printf("mean pLDDT %.2f  pTM %.4f", 100 * conf.meanPlddt, conf.ptm);
+  { bool chains = false; std::vector<int> asym(T); CK(cudaMemcpy(asym.data(), Idev("asym_id"), T * 4, cudaMemcpyDeviceToHost));
+    for (int t = 1; t < T; ++t) chains |= asym[t] != asym[0];
+    if (chains) printf("  ipTM %.4f", conf.iptm); }
+  printf("\n");
+  writePdb(std::string(argv[1]) + "/pdb.template", out, coords, &bf);
   printf("-> %s\n", out.c_str());
   if (getenv("EF2_DUMP")) { auto h = download(sInputs, (size_t)T * Si); FILE* f = fopen(getenv("EF2_DUMP"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f); }
   return 0;

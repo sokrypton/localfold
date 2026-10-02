@@ -22,7 +22,9 @@ model on the CPU with its own ESM-C (biohub/ESMC-600M-1500000, loaded in float32
 separates a convention from that rounding).
 """
 import argparse
+import glob
 import os
+import pathlib
 import sys
 
 import numpy as np
@@ -69,6 +71,7 @@ def main():
     # CPU by default: on CUDA the model runs its language model, inputs embedder and trunk under bf16
     # autocast (use_amp = ref_pos.device.type == "cuda"), which is not the float32 reference
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--synthyra", default="", help="the Synthyra/ESMFold2-600 snapshot (default: the HF cache's)")
     args = parser.parse_args()
 
     import torch
@@ -163,6 +166,34 @@ def main():
     for h in hooks:
         h.remove()
     out["o/distogram"] = result["distogram_logits"].detach().float().cpu().numpy()[0]
+    # Synthyra's confidence head (biohub ships none; Synthyra trained one on this frozen trunk), THEIR
+    # module out of their bundle, on this fold's own trunk pair, s_inputs, coordinates and encodings
+    snap = args.synthyra or max(glob.glob(os.path.expanduser(
+        "~/.cache/huggingface/hub/models--Synthyra--ESMFold2-600/snapshots/*/")), default="")
+    if snap:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "tools", "oracle"))
+        from dump_esmfold2_confidence import unpack_runtime
+        sys.path.insert(0, str(unpack_runtime(pathlib.Path(snap) / "fastplms_bundle.py")))
+        import json
+        from safetensors.torch import load_file
+        from fastplms.models.esmfold2.configuration_esmfold2 import ESMFold2Config
+        from fastplms.models.esmfold2.modeling_esmfold2_experimental import ConfidenceHead
+        head = ConfidenceHead(ESMFold2Config(**json.loads(open(os.path.join(snap, "config.json")).read()))).eval()
+        state = {k[len("confidence_head."):]: v.float() for k, v in load_file(os.path.join(snap, "model.safetensors")).items()
+                 if k.startswith("confidence_head.")}
+        head.load_state_dict(state, strict=False)
+        T_ = lambda name: torch.as_tensor(out[name]).unsqueeze(0)
+        cout = head(s_inputs=T_("o/s_inputs"), z=T_(f"o/loop{len(loops) - 1}/out"),
+                    x_pred=result["sample_atom_coords"].detach().float().reshape(1, A, 3).cpu(),
+                    distogram_atom_idx=features["distogram_atom_idx"].cpu(), token_attention_mask=torch.ones(1, T, dtype=torch.long),
+                    atom_to_token=features["atom_to_token"].cpu(), atom_attention_mask=features["atom_attention_mask"].long().cpu(),
+                    asym_id=features["asym_id"].cpu(), mol_type=features["mol_type"].cpu(),
+                    relative_position_encoding=T_("o/rel_pos"), token_bonds_encoding=T_("o/token_bonds"))
+        for k, v in cout.items():
+            if torch.is_tensor(v):
+                a = v.detach().float().cpu().numpy()
+                out["o/conf/" + k] = a[0] if a.ndim > 0 and a.shape[0] == 1 else a
+        print("confidence:", {k: list(v.shape) for k, v in cout.items() if torch.is_tensor(v)})
     out["o/coords"] = result["sample_atom_coords"].detach().float().cpu().numpy().reshape(-1, 3)
     metas["o/loops"] = len(loops)
     metas["o/steps"] = len(steps)
