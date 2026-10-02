@@ -132,3 +132,30 @@ a mean bond ratio of 0.994** (worst 1.010) - in line with genuine Boltz-2's
 0.986-1.011 - where this brief was written against 2.705. The other six
 AF3-lineage families read 0.958-1.023 on the same job. So the reference's
 boltz2 no longer inflates a modified residue; this brief is history.
+
+## 2026-10-02: a second residue, 3-hydroxyproline - and the reference has it too
+
+Found by folding AlphaFold 3's kitchen-sink example (`alphafold_input.json`) through all seven
+families natively: boltz2 alone tore its modified residues apart - ligand-class bond rms **0.500 Å**
+against 0.04-0.10 for the other six - and the culprits were HY3 (1.12), P1L (1.07), 6OG and 2MG
+(0.82), where 5MC, the glycan, HEM and the SMILES ATP were all clean.
+
+Isolated on 6MRR with a proline introduced (`P..P..`), single sequence, bond rms of the modified
+residue (`native/af3/bonds.mjs`):
+
+| | AlphaFold 3 | boltz2 |
+|---|---:|---:|
+| SEP@3 | 0.048 | 0.078 |
+| HYP@1 (4-hydroxyproline) | 0.082 | 0.160 |
+| HY3@1 (3-hydroxyproline) | 0.087 | **0.463** |
+| HY3@4 | 0.060 | **0.897** |
+
+- **The featurisation is not it.** boltz2's batch for HY3@4 is exact against af3-any-model's own
+  (`tools/check-batch-fields.js --model=boltz2 --target=hy3`, 47 fields, the conformer floor aside):
+  one token, the component's slots, its restype and bonds.
+- **The reference does it too.** af3-any-model's own boltz2 (`run_alphafold.py --model=boltz2`, the
+  int8 weights in `~/lfjax/weights`, HY3 given as `userCCD` because the pip CCD lacks it) reads
+  **0.994 / 0.907 / 0.703 Å** over three samples - the same tearing. So LocalFold's boltz2 is
+  faithful to its reference here, and the question is the one the SEP case asked: does GENUINE
+  Boltz-2 place a 3-hydroxyproline? Not measured - `boltz` is not installed on this box. If it does,
+  this is a second defect in af3-any-model's boltz2 port, and the SEP fix above did not cover it.

@@ -149,6 +149,12 @@ const TARGETS = {
     extra: () => ({ chainKinds: ["protein", "rna"],
                     msaColumnKinds: [...Array(21).fill("protein"), ...Array(17).fill("rna")] }),
   },
+  // a modified PROLINE (3-hydroxyproline at 4): boltz2's one-token residue tore it apart where SEP
+  // folded clean (--sequence P..P.. --mods HY3@4)
+  "hy3": {
+    suffix: "-hy3",
+    extra: () => ({ modifications: [{ chain: 0, position: 4, ...ccd("HY3") }] }),
+  },
   "rna-mods": {
     suffix: "-rna-mods",
     extra: () => ({
