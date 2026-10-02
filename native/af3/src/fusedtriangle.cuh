@@ -82,7 +82,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
   const int steps = C / 16 + C / TI_NC;
   auto issue = [&](int j, int st) {
     half *w0 = W0(st), *w1 = W1(st);
-    for (int t = threadIdx.x; t < C * (TI_NC / 8); t += NTH) {
+    #pragma unroll
+    for (int t0_ = 0; t0_ < C * (TI_NC / 8); t0_ += NTH) {  // unrolled (a strided loop from threadIdx.x is not)
+      const int t = t0_ + (int)threadIdx.x;
+      if ((C * (TI_NC / 8)) % NTH != 0 && t >= (C * (TI_NC / 8))) break;
       int k = t / (TI_NC / 8), c = (t % (TI_NC / 8)) * 8;
       if (j < C / 16) {
         cpAsync16(w0 + k * LDW + c, Wpg + (size_t)k * 4 * C + j * 32 + c, true);
@@ -147,7 +150,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       __syncthreads();
       // 16 bytes (8 rows) a thread: the channel stride cs is a multiple of 8, the block's first
       // row a multiple of R; padding rows are zero (masked)
-      for (int t = threadIdx.x; t < 16 * (R / 8); t += NTH) {
+      #pragma unroll
+      for (int t0_ = 0; t0_ < 16 * (R / 8); t0_ += NTH) {  // unrolled (a strided loop from threadIdx.x is not)
+        const int t = t0_ + (int)threadIdx.x;
+        if ((16 * (R / 8)) % NTH != 0 && t >= (16 * (R / 8))) break;
         int ch = t / (R / 8), r = (t % (R / 8)) * 8;
         size_t row = row0 + r;
         if (row < cs) {
@@ -351,7 +357,9 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
       size_t q = row0 + r;
       if (q >= rows) return (size_t)SIZE_MAX;
       size_t Q = q0 + q;
-      return tr ? (Q % n) * n + Q / n : Q;
+      if (!tr) return Q;
+      unsigned u = (unsigned)Q, a = u / (unsigned)n;           // 32-bit: a 64-bit divide is ~70 instructions
+      return (size_t)(u - a * (unsigned)n) * n + a;
     }, lnScale, lnOffset, Xs, LDX, warp, lane);
   __syncthreads();
   uint32_t xa[KS][4];
@@ -401,8 +409,9 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
     for (int half8 = 0; half8 < 2; ++half8) {
       size_t q = r0 + half8 * 8;
       if (q >= rows) continue;
-      size_t Q = q0 + q, p = tr ? (Q % n) * n + Q / n : Q;
-      size_t a = p / n, b = p % n, i = swap ? b : a, jj = swap ? a : b;
+      unsigned Q = (unsigned)(q0 + q), qa = Q / (unsigned)n, qb = Q - qa * (unsigned)n;
+      unsigned a = tr ? qb : qa, b = tr ? qa : qb;               // p = (a, b)
+      size_t i = swap ? b : a, jj = swap ? a : b;
       for (int nt = 0; nt < 2; ++nt) for (int e = 0; e < 2; ++e) {
         int h = nt * 8 + tig * 2 + e;
         if (h < heads) bias[((size_t)h * n + i) * stride + jj] = __float2half(LOG2E * acc[nt][half8 * 2 + e]);
