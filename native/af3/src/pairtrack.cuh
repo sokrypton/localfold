@@ -33,9 +33,10 @@ void layerNorm2(const TI* in, TO* out, size_t rows, int C, const std::string& sc
 __global__ void addK(float* y, const float* x, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] += x[i];
 }
-__global__ void gatedAddK(float* pair, const float* proj, const float* gate, size_t n) {
+template <class T>
+__global__ void gatedAddK(float* pair, const T* proj, const T* gate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) pair[i] += proj[i] * sigm(gate[i]);
+  if (i < n) pair[i] += toF(proj[i]) * sigm(toF(gate[i]));
 }
 template <class T>
 __global__ void swigluK(const T* wide, T* gated, size_t rows, int I) {
@@ -165,6 +166,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   T* norm = scratch<T>("tri.norm", pairs * C);
   T* a = scratch<T>("tri.a", pairs * C);
   T* b = scratch<T>("tri.b", pairs * C);
+  // f32: in f16 the contraction (a sum over n of products) overflows - 5CAJ's went to inf
   float* prod = scratch<float>("tri.prod", pairs * C);
   std::string pg = projectionGate(pre, C);
   size_t rowsPer = std::max<size_t>(1, CHUNK / (4 * C));
@@ -188,15 +190,15 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       pairs, b, cudaType<T>(), n, pairs, &zero, prod, CUDA_R_32F, n, pairs, C, CUBLAS_COMPUTE_32F, algo));
   rowsPer = std::max<size_t>(1, CHUNK / C);
   T* centred = scratch<T>("tri.centred", std::min(rowsPer, pairs) * C);
-  float* t1 = scratch<float>("tri.t1", std::min(rowsPer, pairs) * C);
-  float* t2 = scratch<float>("tri.t2", std::min(rowsPer, pairs) * C);
+  T* t1 = scratch<T>("tri.t1", std::min(rowsPer, pairs) * C);
+  T* t2 = scratch<T>("tri.t2", std::min(rowsPer, pairs) * C);
   for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
     size_t rows = std::min(rowsPer, pairs - r0);
     centerNormK<T><<<(unsigned)((rows + 31) / 32), dim3(32, 8), C * 33 * 4, STREAM>>>(prod, centred, r0,
       rows, C, pairs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
-    linear<T, float>(centred, t1, rows, C, C, pre + ".outputProjection");
-    linear<T, float>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
-    gatedAddK<<<blocks(rows * C), 256, 0, STREAM>>>(pair + r0 * C, t1, t2, rows * C);
+    linear<T, T>(centred, t1, rows, C, C, pre + ".outputProjection");
+    linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
+    gatedAddK<T><<<blocks(rows * C), 256, 0, STREAM>>>(pair + r0 * C, t1, t2, rows * C);
   }
 }
 

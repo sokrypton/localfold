@@ -137,6 +137,12 @@ int main(int argc, char** argv) {
     }
     CK(cudaDeviceSynchronize());
     auto f1 = clock();
+    if (STAGES) {     // the trunk's stages, then the diffusion's below
+      double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
+      printf("trunk stages:\n");
+      for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);
+      STAGE_MS.clear();
+    }
     int dense = (int)M.meta("batch.dense");
     std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)t.n * dense);
     DiffusionFold df = prepareDiffusion(t.single, t.pair, t.targetFeat, t.seqMask, t.n);
@@ -176,6 +182,7 @@ int main(int argc, char** argv) {
         printf("  sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", k, ck.meanPlddt, ck.ptm,
                ck.iptm, score, path.c_str());
       }
+      if (!std::isfinite(score)) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", k, score); exit(1); }
       if (score > bestScore) { bestScore = score; best = k; conf = std::move(ck); x = std::move(xk); }
     }
     auto f2 = clock();
