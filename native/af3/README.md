@@ -312,6 +312,12 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
 - **The next block's weights prefetched into L2** while the current block runs: the 68-row GEMMs
   are not bandwidth-bound at all - the same GEMM with its weights hot in L2 is 8.9 against 9.4 us
   cold, and 8.1 us for N = 768 either way.
+- **The denoiser's token attention at mid sizes, three ways** (261 tokens: 80 blocks of 64
+  queries, 11.4 us for 0.21 GFLOP; the kernel costs ~3.6 us plus ~1.6 us a 64-key tile): the keys
+  split over blocks with a merge kernel (flash-decoding) - 15.7 / 21.9 / 27.6 us against 11.4 /
+  18.6 / 24.7 at 261 / 400 / 522; three to six cp.async stages - flat, then worse past 400; and
+  two warps a 16-query group, each over half of every tile, merged in shared memory - within
+  noise of the plain kernel, better at some sizes and worse at others.
 - **The outer product mean's product straight into the output GEMM's layout** (a strided-batched
   GEMM over query tokens, the output weight's rows permuted to match): its m = 32 tiling ran
   0.84 ms a call against 0.5 for the GEMM and permute it replaced.
