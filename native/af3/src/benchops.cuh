@@ -30,10 +30,19 @@ inline void benchOps(int n) {
     printf("  %-22s %7.2f us\n", name, ms * 1000 / 500);
   };
   printf("one transformer block's operations at %d tokens:\n", n);
+  float* yb = dalloc((size_t)n * C); CK(cudaMemset(yb, 0, (size_t)n * C * 4));
+  time("gatedAddAdaLn block/row", [&] { gatedAddAdaLnK<half><<<n, 256, C * 4, STREAM>>>(act, yb, g, 4 * C, g, g + C, 4 * C, x, C); });
+  time("gatedAddAdaLn vec/row", [&] { gatedAddAdaLnVecK<half><<<n, C / 4, 0, STREAM>>>(act, yb, g, 4 * C, g, g + C, 4 * C, x, C); });
+  time("gatedAddAdaLn warp/row", [&] { gatedAddAdaLnWarpK<half><<<(n + 3) / 4, 128, 0, STREAM>>>(act, yb, g, 4 * C, g, g + C, 4 * C, x, n, C); });
   time("adaLN (strided)", [&] { adaLnStridedTK<half><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(act, g, g + C, 4 * C, x, n, C); });
   time("qkvg GEMM 768->3072", [&] { linear<half, half>(x, qkvg, n, C, 4 * Wd, qw); });
   time("q bias", [&] { addQBiasTK<half><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), n, Wd); });
-  time("flash attention", [&] { flashGrid<half>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, D, 0, 1, false, 0.1f); });
+  for (int wv : {0, 1, 2, 4, 8}) {
+    FLASH_WARPS_OVERRIDE = wv;
+    std::string label = "flash attention w" + std::to_string(wv);
+    time(label.c_str(), [&] { flashGrid<half>(qkvg, bias, (n + 7) / 8 * 8, mask, o, n, heads, D, 0, 1, false, 0.1f); });
+  }
+  FLASH_WARPS_OVERRIDE = 0;
   time("T2 GEMM 768->768", [&] { linear<half, float>(o, att, n, Wd, C, B + ".Transition2"); });
   time("add gated", [&] { addGatedStridedK<<<blocks((size_t)n * C), 256, 0, STREAM>>>(act, att, g, 2 * C, n, C); });
   time("ffw1 GEMM 768->3072", [&] { linear<half, half>(x, wide, n, C, 2 * I, B + ".ffwTransition1"); });

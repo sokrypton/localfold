@@ -47,7 +47,8 @@ template <int D, int WARPS> __host__ __device__ constexpr size_t faStage() {
 // transposed for the column direction; -1e9 where it is zero.
 template <int D, int WARPS>
 __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* qkvg, const half* bias,
-    int biasStride, const float* mask, half* out, int n, int heads, size_t r0, bool tr, float scale) {
+    int biasStride, const float* mask, half* out, int n, int heads, size_t r0, bool tr, float scale,
+    const float* qBias) {
   constexpr int BQ = 16 * WARPS, BK = FA_BK, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
   constexpr size_t STAGE = faStage<D, WARPS>();
   extern __shared__ __align__(16) unsigned char smem[];
@@ -84,6 +85,7 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* qkvg, co
     if (i >= n) return 0u;
     half2 v = *reinterpret_cast<const half2*>(base + (size_t)i * W4 + e);
     float2 f = __half22float2(v);
+    if (qBias) { f.x += qBias[h * D + e]; f.y += qBias[h * D + e + 1]; }   // the query's bias, folded in here
     return pack2(f.x * scale * LOG2E, f.y * scale * LOG2E);
   };
   uint32_t qa[D / 16][4];
@@ -216,27 +218,36 @@ template <int D, int WARPS> void setFlashSmem() {
     done = true;
   }
 }
+inline int FLASH_WARPS_OVERRIDE = 0;
+template <int D, int WARPS>
+void flashGridHalfAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
+                     int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias) {
+  setFlashSmem<D, WARPS>();
+  flashGridHalf<D, WARPS><<<dim3((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads)), 32 * WARPS,
+                            2 * faStage<D, WARPS>(), STREAM>>>(qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+}
 template <int D>
 void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
-                         int n, int heads, size_t r0, size_t rows, bool tr, float scale) {
-  bool wide = ((n + 127) / 128) * 128 - n <= 32;     // 128 queries a block unless that pads >32 rows
-  if (wide) {
-    setFlashSmem<D, 8>();
-    flashGridHalf<D, 8><<<dim3((n + 127) / 128, (unsigned)(rows * heads)), 256, 2 * faStage<D, 8>(), STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale);
-  } else {
-    setFlashSmem<D, 4>();
-    flashGridHalf<D, 4><<<dim3((n + 63) / 64, (unsigned)(rows * heads)), 128, 2 * faStage<D, 4>(), STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale);
+                         int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias = nullptr) {
+  // 128 queries a block unless that pads >32 rows. Narrower blocks were measured for small n
+  // (a token transformer at 68 tokens is only 16 heads x 2 query blocks) and are not faster:
+  // 1/2/4/8 warps read 19.6/18.6/17.8/17.6 us at 68 tokens and 32.3/30.3/23.4/26.4 at 261.
+  int warps = ((n + 127) / 128) * 128 - n <= 32 ? 8 : 4;
+  if (FLASH_WARPS_OVERRIDE) warps = FLASH_WARPS_OVERRIDE;
+  switch (warps) {
+    case 8: flashGridHalfAt<D, 8>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
+    case 4: flashGridHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
+    case 2: flashGridHalfAt<D, 2>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
+    default: flashGridHalfAt<D, 1>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
   }
 }
 template <class T>
 void flashGrid(const T* qkvg, const T* bias, int stride, const float* mask, T* out, int n, int heads,
-               int D, size_t r0, size_t rows, bool tr, float scale) {
+               int D, size_t r0, size_t rows, bool tr, float scale, const float* qBias = nullptr) {
   if constexpr (std::is_same_v<T, half>) {
-    if (D == 32) flashGridHalfLaunch<32>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale);
-    else if (D == 48) flashGridHalfLaunch<48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale);
-    else if (D == 16) flashGridHalfLaunch<16>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale);
+    if (D == 32) flashGridHalfLaunch<32>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
+    else if (D == 48) flashGridHalfLaunch<48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
+    else if (D == 16) flashGridHalfLaunch<16>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else { fprintf(stderr, "flashGrid: no f16 kernel for head width %d\n", D); exit(1); }
   } else {
     dim3 g((n + 63) / 64, (unsigned)(rows * heads));

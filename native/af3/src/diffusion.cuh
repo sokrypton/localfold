@@ -278,6 +278,85 @@ __global__ void gatedAddAdaLnK(float* act, const float* y, const float* gate, in
   for (int c = threadIdx.x; c < C; c += blockDim.x)
     out[r * C + c] = fromF<TO>(sigm(scale[r * lds + c]) * ((row[c] - mean) * inv) + shift[r * lds + c]);
 }
+// The same, a warp per row with float4 loads (C a multiple of 128): 68 rows of 768 are too
+// few for a block each to pay for its two block-wide reductions.
+template <class TO>
+__global__ void gatedAddAdaLnWarpK(float* act, const float* y, const float* gate, int ldg, const float* scale,
+                                   const float* shift, int lds, TO* out, int rows, int C) {
+  int r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+  if (r >= rows) return;
+  float4* a = (float4*)(act + (size_t)r * C);
+  const int V = C / 128;                 // float4s per lane
+  float4 v[8];
+  float s = 0;
+  for (int k = 0; k < V; ++k) {
+    int c4 = lane + k * 32;
+    float4 x = a[c4];
+    if (y) {
+      float4 yy = ((const float4*)(y + (size_t)r * C))[c4];
+      float4 g = ((const float4*)(gate + (size_t)r * ldg))[c4];
+      x.x += yy.x * sigm(g.x); x.y += yy.y * sigm(g.y); x.z += yy.z * sigm(g.z); x.w += yy.w * sigm(g.w);
+      a[c4] = x;
+    }
+    v[k] = x; s += x.x + x.y + x.z + x.w;
+  }
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, q = 0;
+  for (int k = 0; k < V; ++k) {
+    float dx = v[k].x - mean, dy = v[k].y - mean, dz = v[k].z - mean, dw = v[k].w - mean;
+    q += dx * dx + dy * dy + dz * dz + dw * dw;
+  }
+  for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
+  float inv = 1.f / sqrtf(q / C + 1e-5f);
+  if (!out) return;
+  for (int k = 0; k < V; ++k) {
+    int c = (lane + k * 32) * 4;
+    float4 sc = *(const float4*)(scale + (size_t)r * lds + c), sh = *(const float4*)(shift + (size_t)r * lds + c);
+    TO* o = out + (size_t)r * C + c;
+    o[0] = fromF<TO>(sigm(sc.x) * ((v[k].x - mean) * inv) + sh.x);
+    o[1] = fromF<TO>(sigm(sc.y) * ((v[k].y - mean) * inv) + sh.y);
+    o[2] = fromF<TO>(sigm(sc.z) * ((v[k].z - mean) * inv) + sh.z);
+    o[3] = fromF<TO>(sigm(sc.w) * ((v[k].w - mean) * inv) + sh.w);
+  }
+}
+// A block a row, one float4 a thread (C/4 threads), the row held in registers.
+template <class TO>
+__global__ void gatedAddAdaLnVecK(float* act, const float* y, const float* gate, int ldg, const float* scale,
+                                  const float* shift, int lds, TO* out, int C) {
+  __shared__ float red[32];
+  size_t r = blockIdx.x; int c = threadIdx.x * 4;
+  float4 x = *(float4*)(act + r * C + c);
+  if (y) {
+    float4 yy = *(const float4*)(y + r * C + c), g = *(const float4*)(gate + r * ldg + c);
+    x.x += yy.x * sigm(g.x); x.y += yy.y * sigm(g.y); x.z += yy.z * sigm(g.z); x.w += yy.w * sigm(g.w);
+    *(float4*)(act + r * C + c) = x;
+  }
+  auto blockSum = [&](float v) {
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = v;
+    __syncthreads();
+    float t = 0;
+    for (int w = 0; w < (int)(blockDim.x / 32); ++w) t += red[w];
+    return t;
+  };
+  float mean = blockSum(x.x + x.y + x.z + x.w) / C;
+  float dx = x.x - mean, dy = x.y - mean, dz = x.z - mean, dw = x.w - mean;
+  float inv = rsqrtf(blockSum(dx * dx + dy * dy + dz * dz + dw * dw) / C + 1e-5f);
+  if (!out) return;
+  float4 sc = *(const float4*)(scale + r * lds + c), sh = *(const float4*)(shift + r * lds + c);
+  TO* o = out + r * C + c;
+  o[0] = fromF<TO>(sigm(sc.x) * (dx * inv) + sh.x); o[1] = fromF<TO>(sigm(sc.y) * (dy * inv) + sh.y);
+  o[2] = fromF<TO>(sigm(sc.z) * (dz * inv) + sh.z); o[3] = fromF<TO>(sigm(sc.w) * (dw * inv) + sh.w);
+}
+template <class TO>
+void gatedAddAdaLn(float* act, const float* y, const float* gate, int ldg, const float* scale, const float* shift,
+                   int lds, TO* out, int rows, int C) {
+  if (C % 128 == 0 && C / 4 <= 1024 && ldg % 4 == 0 && lds % 4 == 0)
+    gatedAddAdaLnVecK<TO><<<rows, C / 4, 0, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C);
+  else
+    gatedAddAdaLnK<TO><<<rows, 256, C * 4, STREAM>>>(act, y, gate, ldg, scale, shift, lds, out, C);
+}
 // x += y * sigmoid(gate) with the gate read at a row stride
 __global__ void addGatedStridedK(float* x, const float* y, const float* gate, int ld, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -408,13 +487,14 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     const float* g = gNorm + (size_t)b * 4 * C; const float* z = gRaw + (size_t)b * 2 * C;
     // the previous block's transition residual, fused with this block's first adaptive LN
     const float* zPrev = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C + C : nullptr;
-    gatedAddAdaLnK<T><<<n, 256, C * 4, STREAM>>>(act, b > 0 ? proj : nullptr, zPrev, ldr, g, g + C, ldn, x, C);
+    gatedAddAdaLn<T>(act, b > 0 ? proj : nullptr, zPrev, ldr, g, g + C, ldn, x, n, C);
     linear<T, T>(x, qkvg, n, C, 4 * Wd, qkvgWeight(B, C, Wd, false));
-    addQBiasTK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), n, Wd);
     if constexpr (std::is_same_v<T, half>) {
-      // one fused kernel: QK^T, bias, mask, online softmax, PV and the gate
-      flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, mask, o, n, heads, D, 0, 1, false, 1.f / sqrtf((float)D));
+      // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate
+      flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, mask, o, n, heads, D, 0, 1, false, 1.f / sqrtf((float)D),
+                      W(B + ".qBias"));
     } else {
+      addQBiasTK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), n, Wd);
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, D, &one, qkvg + Wd, cudaType<T>(), 4 * Wd, D,
          qkvg, cudaType<T>(), 4 * Wd, D, &zero, logits, CUDA_R_32F, n, pairs, heads, CUBLAS_COMPUTE_32F, algo));
       tokenSoftmaxTK<T><<<(unsigned)(heads * n), 128, 0, STREAM>>>(logits, tc.pairLogits[b], mask, P, n, 1.f / sqrtf((float)D));
@@ -423,7 +503,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       gateTK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd);
     }
     linear<T, float>(o, att, n, Wd, C, B + ".Transition2");
-    gatedAddAdaLnK<T><<<n, 256, C * 4, STREAM>>>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, C);
+    gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, n, C);
     linear<T, T>(tn, wide, n, C, 2 * I, B + ".ffwTransition1");
     swigluK<T><<<blocks((size_t)n * I), 256, 0, STREAM>>>(wide, gated, n, I);
     linear<T, float>(gated, proj, n, I, C, B + ".ffwTransition2");

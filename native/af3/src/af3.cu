@@ -10,10 +10,11 @@
 #include "sampler.cuh"
 #include "confidence.cuh"
 #include "benchops.cuh"
+#include "profile.cuh"
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
-  bool fast = false, doFold = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 0, folds = 1;
+  bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 0, folds = 1;
   uint64_t seed = 42; std::string out = "fold.pdb";
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = true;
@@ -22,6 +23,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
     else if (!strcmp(argv[i], "--fold")) doFold = true;
     else if (!strcmp(argv[i], "--no-graphs")) GRAPHS = false;
+    else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
@@ -30,6 +32,7 @@ int main(int argc, char** argv) {
   }
   auto t0 = std::chrono::steady_clock::now();
   M.load(argv[1]);
+  if (profile) prof::init();
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));
   { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
@@ -118,6 +121,8 @@ int main(int argc, char** argv) {
     auto clock = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     size_t pairs = (size_t)t.n * t.n;
+    bool profiling = profile && fi + 1 == folds;      // the last (warm) fold
+    if (profiling) prof::start();
     auto f0 = clock();
     for (int pass = 0; pass <= recycles; ++pass) {
       if (pass > 0) {
@@ -156,6 +161,7 @@ int main(int argc, char** argv) {
     printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", conf.meanPlddt, conf.ptm, conf.iptm, out.c_str());
     printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps), confidence %.1f ms, total %.1f ms\n", fi + 1,
            ms(f0, f1), recycles + 1, ms(f1, f2), steps, ms(f2, f3), ms(f0, f3));
+    if (profiling) prof::stop(40);
     if (fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
