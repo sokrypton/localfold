@@ -168,9 +168,11 @@ alone, residues paired by aligning the sequences (a numbering gap in the referen
 
 `native/af3/fold --batch=<file>` folds every line of `<file>` (`<out.pdb> <input flags>`) in one
 `af3` process (`af3 dir1,dir2,... --out=a.pdb,b.pdb` underneath): the weights load once and every
-fold after the first skips CUDA's start-up, the weight upload and the first fold's warm-up -
-three folds in 3.1 s where three commands take 5.1. Each input's outputs are byte-identical to
-folding it alone.
+fold after the first skips CUDA's start-up, the weight upload and the first fold's warm-up, and
+each input folds as soon as its export lands - three folds in 2.4 s where three commands take 4.4.
+Each input's outputs are byte-identical to folding it alone. A single `fold` command starts `af3`
+before the export too (`--wait-input`), so the CUDA context and the weight upload overlap it: 6MRR
+is 1.47 s a command, of which the fold is 0.64.
 
 ## The gate
 
