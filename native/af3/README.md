@@ -60,11 +60,12 @@ port gives pLDDT 94.5, pTM 0.938 on the same inputs.
 
 | target | WebGPU first / warm | native first / warm |
 |---|---|---|
-| 6MRR, 68 tokens | 5.1 s / 2.4 s | 1.54 s / **0.87 s** |
-| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 2.40 s / **1.69 s** |
+| 6MRR, 68 tokens | 5.1 s / 2.4 s | 1.17 s / **0.44 s** |
+| 5CAJ, 261 tokens, 512 MSA rows | 11.4 s / 7.4 s | 1.67 s / **0.88 s** |
 
 WebGPU with the developer flags (`fold.js --folds=2`); a stock-Chrome NVIDIA visitor gets
-about half its speed. No 2 GiB binding ceiling.
+about half its speed. No 2 GiB binding ceiling. With the default three recycles the warm folds are
+0.50 s and 1.42 s; a 1044-token complex (four 5CAJ chains, no MSA) folds warm in about 5.3 s.
 
 The pairformer alone (48 blocks, FP16): 64 tokens 15 ms, 256 142 ms, 1024 2.95 s - 1.9-3.3x
 the WebGPU trunk's pairformer.
