@@ -33,7 +33,10 @@ const bundle = /^https?:/.test(bundleArg) ? bundleArg : new URL(`file://${bundle
     return new Response(bytes, { status: 200, headers: { "content-length": String(bytes.length) } });
   };
 }
-const batchPath = option("batch", `${repo}/oracle-dumps/af3-batch-alphafold3-6mrr.json`);
+// --oracle-model=<name>: that model's own reference batch and oracles (oracle-dumps/af3-batch-<name>-6mrr.json,
+// af3-oracle-{trunk,denoise,confidence}-<name>.json) - with its bundle (--bundle)
+const oracleModel = option("oracle-model", "alphafold3");
+const batchPath = option("batch", `${repo}/oracle-dumps/af3-batch-${oracleModel}-6mrr.json`);
 const oracles = (option("oracles", option("sequence", "") === "" && option("job", "") === "" ? "trunk,denoise,realdenoise,confidence" : ""))
   .split(",").filter(Boolean);
 
@@ -259,8 +262,8 @@ const flat = (record) => Float32Array.from(Array.isArray(record.data) ? record.d
 for (const which of oracles) {
   // realdenoise: a real fold's trunk conditioning and structure, re-noised (sigma 2) - the
   // denoise oracle's own inputs are random and cannot judge a 16-bit path.
-  const path = which === "realdenoise" ? `${repo}/oracle-dumps/af3-real-denoise-alphafold3-n2.0.json`
-    : `${repo}/oracle-dumps/af3-oracle-${which}-alphafold3.json`;
+  const path = which === "realdenoise" ? `${repo}/oracle-dumps/af3-real-denoise-${oracleModel}-n2.0.json`
+    : `${repo}/oracle-dumps/af3-oracle-${which}-${oracleModel}.json`;
   let oracle;
   try { oracle = JSON.parse(readFileSync(path, "utf8")); } catch { continue; }
   const walk = (prefix, object) => {

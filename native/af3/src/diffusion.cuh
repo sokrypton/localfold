@@ -33,6 +33,16 @@ __global__ void concatK(const float* a, int wa, const float* b, int wb, float* o
   int r = (int)(t / w), c = (int)(t % w);
   out[t] = c < wa ? a[(size_t)r * wa + c] : b[(size_t)r * wb + (c - wa)];
 }
+// out[r] = [a[r] | b[r]] with zero columns at p0 and p1 (-1: none) of the padded row
+__global__ void concatPadK(const float* a, int wa, const float* b, int wb, float* out, int rows, int p0, int p1) {
+  int w = wa + wb + (p0 >= 0) + (p1 >= 0);
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)rows * w) return;
+  int r = (int)(t / w), c = (int)(t % w);
+  if (c == p0 || c == p1) { out[t] = 0.f; return; }
+  int src = c - (p0 >= 0 && c > p0) - (p1 >= 0 && c > p1);
+  out[t] = src < wa ? a[(size_t)r * wa + src] : b[(size_t)r * wb + (src - wa)];
+}
 __global__ void addVectorK(float* x, const float* v, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (t < rows * C) x[t] += v[t % C];
 }
@@ -84,7 +94,6 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
   if (hasW(P + ".zTrunkProjection") || hasW(P + ".relpeProjection")) {
     fprintf(stderr, "split/projected relpos conditioning: not ported\n"); exit(1);
   }
-  if (M.flag("trunk.dialect.padSingleCondUnknownDna")) { fprintf(stderr, "padded single cond: not ported\n"); exit(1); }
   if (!DCACHE.ready) {
     int width = Czt + rel;
     // the pair features, normalised and projected in row chunks (whole, they were 9.3 GB at 2088)
@@ -101,9 +110,16 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
       linear<float, float>(f2n, DCACHE.pair + p0 * Cz, r, width, Cz, P + ".pairCondInitialProjection");
     }
     for (int k = 0; k < 2; ++k) plainTransition(DCACHE.pair, pairs, Cz, 2, P + ".pairTransitions." + std::to_string(k));
-    int sw = Cst + F;
+    // [trunk single | target_feat]; the openfold3 lineage pads two always-zero columns (unknown DNA,
+    // after the restype and the profile blocks) - free before a linear, not before this LayerNorm
+    bool pad = M.flag("trunk.dialect.padSingleCondUnknownDna");
+    int sw = Cst + F + (pad ? 2 : 0);
+    if (lenW(P + ".singleCondInitialNormScale") != (size_t)sw) {
+      fprintf(stderr, "single conditioning: the LayerNorm is %zu wide, the features %d\n", lenW(P + ".singleCondInitialNormScale"), sw); exit(1);
+    }
     float* f1 = scratch<float>("dc.f1", (size_t)n * sw);
-    concatK<<<blocks((size_t)n * sw), 256, 0, STREAM>>>(trunkSingle, Cst, targetFeat, F, f1, n);
+    concatPadK<<<blocks((size_t)n * sw), 256, 0, STREAM>>>(trunkSingle, Cst, targetFeat, F, f1, n,
+                                                          pad ? Cst + 31 : -1, pad ? Cst + 63 : -1);
     float* f1n = scratch<float>("dc.f1n", (size_t)n * sw);
     layerNormSlow(f1, f1n, n, sw, W(P + ".singleCondInitialNormScale"), Wopt(P + ".singleCondInitialNormOffset"));
     DCACHE.singleBase = scratch<float>("dc.singleBase", (size_t)n * Cs);
