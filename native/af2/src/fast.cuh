@@ -17,12 +17,18 @@ inline const void* biasFor(const float* bias, int n, bool asHalf) {
   return copies[bias] = h;
 }
 inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t rows, int in, int out, const float* biasF,
-                   bool relu, float beta) {
+                   bool relu, float beta, int ldx = 0, int ldy = 0) {
+  if (ldx == 0) ldx = in;
+  if (ldy == 0) ldy = out;
   if (!LT) CB(cublasLtCreate(&LT));
   const void* bias = biasFor(biasF, out, yHalf);
-  static std::map<std::tuple<size_t, int, int, bool, int, bool>, LtPlan> plans;
+  if (getenv("AF2_LT_SHAPES") && beta != 0.f && biasF) {
+    static std::map<std::tuple<size_t, int, int>, int> seen;
+    if (seen[std::make_tuple(rows, in, out)]++ == 0) fprintf(stderr, "beta+bias GEMM %zu x %d x %d\n", rows, in, out);
+  }
+  static std::map<std::tuple<size_t, int, int, bool, int, bool, int, int>, LtPlan> plans;
   int epi = bias ? (relu ? 2 : 1) : (relu ? 3 : 0);
-  auto key = std::make_tuple(rows, in, out, yHalf, epi, beta != 0.f);
+  auto key = std::make_tuple(rows, in, out, yHalf, epi, beta != 0.f, ldx, ldy);
   auto it = plans.find(key);
   if (it == plans.end()) {
     LtPlan p{};
@@ -34,8 +40,8 @@ inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t ro
     // f16 copy of it is handed over below)
     // col-major: C^T (out x rows) = W^T (out x in) X^T (in x rows)
     CB(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16F, out, in, out));
-    CB(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16F, in, (uint64_t)rows, in));
-    CB(cublasLtMatrixLayoutCreate(&p.c, yHalf ? CUDA_R_16F : CUDA_R_32F, out, (uint64_t)rows, out));
+    CB(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16F, in, (uint64_t)rows, ldx));
+    CB(cublasLtMatrixLayoutCreate(&p.c, yHalf ? CUDA_R_16F : CUDA_R_32F, out, (uint64_t)rows, ldy));
     cublasLtMatmulPreference_t pref; CB(cublasLtMatmulPreferenceCreate(&pref));
     size_t ws = 0;
     CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
@@ -238,4 +244,39 @@ __global__ void opmPermuteHK(const half* Pm, half* X, int bi, int L, int O) {
   if (t >= (size_t)bi * L * O * O) return;
   int e = (int)(t % O); size_t r = t / O; int c = (int)(r % O); r /= O; int j = (int)(r % L), i = (int)(r / L);
   X[t] = Pm[((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O + e];
+}
+
+// ---------------------------------------------------------------- a bias carried by the product
+// W [K, N] (f16) with its bias as row K and zero rows to K+8: an input whose row carries a 1 at
+// column K (and zeros to K+8) then adds the bias inside the GEMM - no epilogue, no separate pass
+__global__ void augmentWeightK(const half* w, const float* b, half* out, int K, int N) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)(K + 8) * N) return;
+  int r = (int)(t / N), c = (int)(t % N);
+  out[t] = r < K ? w[(size_t)r * N + c] : r == K ? __float2half(b[c]) : __float2half(0.f);
+}
+inline const half* augmentedWeight(const std::string& name, int blk, const float* bias, int K, int N) {
+  static std::map<std::pair<std::string, int>, half*> cache;
+  auto it = cache.find({name, blk});
+  if (it != cache.end()) return it->second;
+  half* w = dallocT<half>((size_t)(K + 8) * N);
+  augmentWeightK<<<blocks((size_t)(K + 8) * N), 256, 0, STREAM>>>(PH(name, blk), bias, w, K, N);
+  return cache[{name, blk}] = w;
+}
+__global__ void onesColumnK(half* x, size_t rows, int K) {     // x [rows, K+8]: column K = 1, K+1.. = 0
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * 8) return;
+  x[(t / 8) * (K + 8) + K + t % 8] = __float2half(t % 8 == 0 ? 1.f : 0.f);
+}
+// a [rows, K+8] f16 buffer whose last 8 columns are (1, 0, ...), kept per (name, size)
+inline half* augmentedInput(const std::string& name, size_t rows, int K) {
+  static std::map<std::string, std::pair<half*, size_t>> bufs;
+  auto& [p, have] = bufs[name];
+  if (have < rows) {
+    if (p) CK(cudaFree(p));
+    p = dallocT<half>(rows * (K + 8));
+    onesColumnK<<<blocks(rows * 8), 256, 0, STREAM>>>(p, rows, K);
+    have = rows;
+  }
+  return p;
 }

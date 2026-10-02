@@ -2,6 +2,7 @@
 // (alphafold3/af2/model/modules.py: EmbeddingsAndEvoformer, EvoformerIteration), float32.
 #pragma once
 #include "fast.cuh"
+#include "flash2.cuh"
 
 struct Trunk {
   int L, N, E;                  // residues, MSA rows, extra MSA rows
@@ -146,11 +147,13 @@ inline void gatedAttention(const float* xn, int Bt, int n, int C, const std::str
 }
 // [pairs, H] f32 pair-bias projection (+ 1e9 (mask - 1) when a mask is given) -> [H, L, stride] f16 in
 // the flash kernel's log2 units
-__global__ void biasFromProjK(const float* proj, const float* pairMask, half* out, int L, int H, int stride) {
+__global__ void biasFromProjK(const float* proj, const float* pairMask, half* out, int L, int H, int stride, bool transposed) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * L * H) return;
   int h = (int)(t % H); size_t ij = t / H; int i = (int)(ij / L), j = (int)(ij % L);
   float v = proj[t] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
+  // transposed: the ending node's bias, b[h][q][k] = proj[k][q] (it attends along the first axis)
+  if (transposed) { int x = i; i = j; j = x; }
   out[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
 }
 inline const half* zeroBias(int H, int n, int stride) {        // a bias-free attention's bias, once
@@ -183,8 +186,24 @@ inline void attentionCore(const half* xn, int Bt, int n, int C, const std::strin
     swapAddK<<<blocks(rows * C), 256, 0, STREAM>>>(residual, tmp, Bt, n, C);
   }
 }
+// the same, attending ACROSS the leading axis of xn [n][Bt][C] (an MSA's columns, the triangle's ending
+// node) where it lies: the strided flash kernel reads rows and positions at strides, and the output
+// lands in the residual's own layout, so nothing is transposed
+inline void attentionCoreAcross(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const half* bias,
+                                float* residual) {
+  size_t rows = (size_t)Bt * n;
+  AttnW w = attnWeights(A, blk, C);
+  int Wp = w.H * w.Dp, stride = (n + 7) / 8 * 8;
+  half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
+  ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
+  if (!bias) bias = zeroBias(w.H, n, stride);
+  half* o = scratch<half>("fatt.o", rows * Wp);
+  flashGridStrided(qkvg, bias, stride, nullptr, o, n, w.H, w.Dp, Bt, 1.f / sqrtf((float)w.D),
+                   (size_t)4 * Wp, (size_t)Bt * 4 * Wp, (size_t)Wp, (size_t)Bt * Wp);
+  ltGemm(o, w.out, residual, false, rows, Wp, C, P(A + "/output_b", blk), false, 1.f);
+}
 // the pair bias, --fast: LN(pair) in f16 -> [pairs, H] -> the flash layout
-inline const half* pairBiasFast(const half* pn, int L, int H, const float* w, const float* pairMask) {
+inline const half* pairBiasFast(const half* pn, int L, int H, const float* w, const float* pairMask, bool transposed = false) {
   size_t pairs = (size_t)L * L; int stride = (L + 7) / 8 * 8;
   float* proj = scratch<float>("fbias.proj", pairs * H);
   static std::map<const float*, half*> wh;
@@ -196,7 +215,7 @@ inline const half* pairBiasFast(const half* pn, int L, int H, const float* w, co
   }
   ltGemm(pn, it->second, proj, false, pairs, 128, H, nullptr, false, 0.f);
   half* bias = scratch<half>("fbias.bias", (size_t)H * L * stride);
-  biasFromProjK<<<blocks(pairs * H), 256, 0, STREAM>>>(proj, pairMask, bias, L, H, stride);
+  biasFromProjK<<<blocks(pairs * H), 256, 0, STREAM>>>(proj, pairMask, bias, L, H, stride, transposed);
   return bias;
 }
 
@@ -238,6 +257,12 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
                                const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string A = S + "msa_column_attention";
+  if (FAST && t.msaOnes) {
+    half* xn = scratch<half>("fcol.xn", rows * C);
+    layerNormH(msa, xn, rows, C, A + "/query_norm", blk);
+    attentionCoreAcross(xn, L, rowsN, C, A + "/attention", blk, nullptr, msa);
+    return;
+  }
   float* tr = scratch<float>("col.tr", rows * C); float* xn = scratch<float>("col.xn", rows * C);
   float* mt = scratch<float>("col.mask", rows);
   swap01(msa, tr, rowsN, L, C);                 // [L, N, C]
@@ -288,10 +313,14 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
   float* mid = scratch<float>("tr.mid", rows * I);
   float* out = scratch<float>("tr.out", rows * C);
   if (FAST) {
-    half* xh = scratch<half>("ftr.xn", rows * C); half* mh = scratch<half>("ftr.mid", rows * I);
+    half* xh = scratch<half>("ftr.xn", rows * C);
+    half* mh = augmentedInput("ftr.mid" + std::to_string(I), rows, I);     // [rows, I+8], a 1 at column I
     layerNormH(x, xh, rows, C, T + "/input_layer_norm", blk);
-    ltGemm(xh, PH(T + "/transition1/weights", blk), mh, true, rows, C, I, P(T + "/transition1/bias", blk), true, 0.f);
-    ltGemm(mh, PH(T + "/transition2/weights", blk), x, false, rows, I, C, P(T + "/transition2/bias", blk), false, 1.f);
+    ltGemm(xh, PH(T + "/transition1/weights", blk), mh, true, rows, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8);
+    // the second layer's bias carried by the product (its epilogue with a residual add ran as a second
+    // kernel over the whole MSA): the 1 at column I picks up the bias row of the augmented weight
+    ltGemm(mh, augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C), x, false, rows, I + 8,
+           C, nullptr, false, 1.f);
     return;
   }
   layerNorm(x, xn, rows, C, T + "/input_layer_norm", blk);
@@ -434,6 +463,13 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
   size_t pairs = (size_t)L * L;
   std::string A = S + (starting ? "triangle_attention_starting_node" : "triangle_attention_ending_node");
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3);
+  if (FAST && pairOnes && !starting) {
+    half* xn = scratch<half>("ftatt.xn", pairs * C);
+    layerNormH(pair, xn, pairs, C, A + "/query_norm", blk);
+    const half* bias = pairBiasFast(xn, L, H, P(A + "/feat_2d_weights", blk), nullptr, true);
+    attentionCoreAcross(xn, L, L, C, A + "/attention", blk, bias, pair);
+    return;
+  }
   const float* x = pair; const float* mask = pairMask;
   float* tr = scratch<float>("tatt.tr", pairs * C); float* mt = scratch<float>("tatt.mask", pairs);
   if (!starting) { swap01(pair, tr, L, L, C); if (!FAST || !pairOnes) swap01(pairMask, mt, L, L, 1); x = tr; mask = mt; }
