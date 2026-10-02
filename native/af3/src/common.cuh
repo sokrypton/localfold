@@ -74,6 +74,10 @@ struct Model {
     if (s.data) { munmap((void*)s.data, std::max<size_t>(s.bytes, 1)); s.data = nullptr; }
     return names;
   }
+  // the whole directory's device copy now (af3 --wait-input does this while the input is exported)
+  void upload(int seg) {
+    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') { dev(name); touched.erase(name); return; }
+  }
   // the device copy of an entry: one allocation and one copy per file
   const float* dev(const std::string& k) {
     const Entry& e = at(k);

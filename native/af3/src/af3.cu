@@ -17,6 +17,7 @@ int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
   uint64_t seed = 42; std::string out = "fold.pdb", weightsDir;
+  bool waitInput = false;   // start up (CUDA, the weights on the device) while the input is still being exported
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
     else if (!strcmp(argv[i], "--no-tf32")) F32_TF32 = false;
@@ -35,6 +36,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strncmp(argv[i], "--weights=", 10)) weightsDir = argv[i] + 10;
+    else if (!strcmp(argv[i], "--wait-input")) waitInput = true;
   }
   auto t0 = std::chrono::steady_clock::now();
   // a batch: `af3 dir1,dir2,... --out=a.pdb,b.pdb` folds each input in this one process, the weights
@@ -61,7 +63,15 @@ int main(int argc, char** argv) {
   CB(cublasSetStream(H, STREAM));
   { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
   Trunk t{};
+  if (waitInput && !weightsDir.empty()) M.upload(0);
   auto runInput = [&](size_t which) -> int {
+  if (waitInput) {          // the exporter writes model.idx last, by a rename
+    std::string idx = inputs[which] + "/model.idx";
+    for (int k = 0; access(idx.c_str(), R_OK) != 0; ++k) {
+      if (k > 600000) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
+      usleep(1000);
+    }
+  }
   M.load(inputs[which]); DATA_DIR = inputs[which];
   if (inputs.size() > 1) out = outs[which];
   { const float* sm = M.f("batch.seqMask"); size_t k = M.len("batch.seqMask"); MASK_ALL_ONES = true;

@@ -14,7 +14,7 @@
 // 🔴 WALKED, NOT LISTED. The JS weight objects carry the dialect's tensor set - an optional
 // bias is null in one model and present in the next - and a hand-written list is the
 // allow-list this repository keeps paying for. Every typed array under the object is written.
-import { writeFileSync, mkdirSync, readFileSync, openSync, writeSync, closeSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
 const args = process.argv.slice(2);
@@ -393,5 +393,7 @@ for (const [kind, , value] of entries) {
   if (kind !== "m") writeSync(fd, Buffer.from(value.buffer, value.byteOffset, value.byteLength));
 }
 closeSync(fd);
-writeFileSync(`${out}/model.idx`, lines.join("\n") + "\n");
+// the index last and atomically: `af3 --wait-input` starts before this script and waits for it
+writeFileSync(`${out}/model.idx.tmp`, lines.join("\n") + "\n");
+renameSync(`${out}/model.idx.tmp`, `${out}/model.idx`);
 console.log(`${entries.length} entries, ${(offset * 4 / 1048576).toFixed(0)} MiB` + (batch ? `, tokens ${batch.tokens}` : " (weights only)"));
