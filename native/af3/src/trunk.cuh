@@ -285,13 +285,13 @@ __global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C) {
 }
 // [(bi, c), (j, e)] -> [(bi, j), (c, e)]
 template <class T>
-__global__ void opmPermuteK(const float* in, T* out, int Bi, int n, int O) {
+__global__ void opmPermuteK(const T* in, T* out, int Bi, int n, int O) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   size_t total = (size_t)Bi * n * O * O;
   if (t >= total) return;
   int e = (int)(t % O); size_t rest = t / O; int c = (int)(rest % O); rest /= O;
   int j = (int)(rest % n); int bi = (int)(rest / n);
-  out[t] = fromF<T>(in[((size_t)bi * O + c) * ((size_t)n * O) + (size_t)j * O + e]);
+  out[t] = in[((size_t)bi * O + c) * ((size_t)n * O) + (size_t)j * O + e];
 }
 // pair[i][j] += (bias + x) / (1e-3 + norm[i][j])   (AF3: the bias inside the scale)
 __global__ void opmAddK(float* pair, const float* x, const float* bias, const float* norm, size_t i0,
@@ -328,7 +328,7 @@ void outerProductMean(Trunk& t, const std::string& pre) {
   // in blocks of query rows i: P[(i,c),(j,e)] = sum_s L[s,i,c] R[s,j,e]
   size_t per = (size_t)n * O * O;
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / per));
-  float* P = scratch<float>("opm.P", (size_t)Bi * per);
+  T* P = scratch<T>("opm.Pt", (size_t)Bi * per);     // in T: the permute rounded it to T anyway
   T* Pp = scratch<T>("opm.Pp", (size_t)Bi * per);
   float* X = scratch<float>("opm.X", (size_t)Bi * n * C);
   bool after = M.flag("trunk.dialect.opmBiasAfterNorm");
@@ -338,7 +338,7 @@ void outerProductMean(Trunk& t, const std::string& pre) {
     // row-major P (bi*O x n*O) = L_blk^T R where L_blk is [S][bi*O] with row stride n*O.
     // col-major: P^T (n*O x bi*O) = R^T(op N on R as (n*O x S), ld n*O) * L_blk (op T)
     CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, n * O, bi * O, S, &one, R, cudaType<T>(), n * O,
-                    L + (size_t)i0 * O, cudaType<T>(), n * O, &zero, P, CUDA_R_32F, n * O, CUBLAS_COMPUTE_32F, algo));
+                    L + (size_t)i0 * O, cudaType<T>(), n * O, &zero, P, cudaType<T>(), n * O, CUBLAS_COMPUTE_32F, algo));
     opmPermuteK<T><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
     linear<T, float>(Pp, X, (size_t)bi * n, O * O, C, pre + ".outputW");
     opmAddK<<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(t.pair, X, W(pre + ".outputB"), norm, i0, bi, n,

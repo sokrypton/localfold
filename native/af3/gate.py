@@ -55,6 +55,9 @@ def cases():
                 [os.path.join(FIX, "6mrr-crystal.pdb"), "A"], "GOL,SEP"))
     out.append(("af3-dna-duplex", "af3", ["--sequence=GCGATCGATCGC:GCGATCGATCGC", "--kinds=dna,dna"], [], None, "DA,DC,DG,DT"))
     seq = chain_sequence(crystal_5caj, "A")
+    a3m = os.path.join(REPO, "oracle-dumps", "5caj-a.a3m")
+    if os.path.exists(a3m):     # the MSA stack at depth (512 of its 7907 rows)
+        out.append(("af3-5caj-msa", "af3", [f"--sequence={seq}", f"--a3m={a3m}"], [], [crystal_5caj, "A"]))
     out.append(("af3-5caj-template", "af3", [f"--sequence={seq}", f"--template={crystal_5caj}:A"], [],
                 [crystal_5caj, "A"]))
     if os.path.exists(crystal_1brs):
