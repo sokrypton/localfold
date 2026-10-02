@@ -90,6 +90,7 @@ node ... export-model.mjs data-gol --sequence=<SEQ> --ligands=GOL          # CCD
 node ... export-model.mjs data-sep --sequence=<SEQ> --modify=SEP@3         # as probe-modified.js
 node ... export-model.mjs data-dna --sequence=<SEQ>:GCGATCGC:GCGATCGC --kinds=protein,dna,dna
 node ... export-model.mjs data-smi --sequence=<SEQ> --smiles='OCC(O)CO'
+node ... export-model.mjs data-ab --sequence=<A>:<B> --a3m=a.a3m,b.a3m [--paired-a3m=pa.a3m,pb.a3m]
 node bonds.mjs fold.pdb GOL        # bond lengths by class, ideals from the CCD
 ```
 

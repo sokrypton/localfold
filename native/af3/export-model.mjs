@@ -79,8 +79,14 @@ let batch;
 if (sequence !== "") {
   const { af3BatchFromA3m } = await import(`${repo}/src/af3/featurise/batch.js`);
   const { featuriserDialect } = await import(`${repo}/src/af3/dialect.js`);
-  const a3mPath = option("a3m", "");
-  const alignment = a3mPath === "" ? null : readFileSync(a3mPath, "utf8");
+  // --a3m=<one path per chain, comma-separated> and --paired-a3m=<the same for the paired block>,
+  // merged exactly as tools/gpu/fold.js and the page merge them; a single path is a monomer's
+  const { mergeRowAlignedChainA3ms } = await import(`${repo}/src/input/chains.js`);
+  const texts = (spec) => (spec === "" ? null : spec.split(",").map((path) => readFileSync(path.trim(), "utf8")));
+  const merge = (list) => (list === null ? null : (list.length === 1 ? list[0] : mergeRowAlignedChainA3ms(list)));
+  const unpaired = texts(option("a3m", "")), paired = texts(option("paired-a3m", ""));
+  const alignment = unpaired === null && paired === null ? null
+    : (paired === null && unpaired.length === 1 ? unpaired[0] : { paired: merge(paired), unpaired: merge(unpaired) });
   // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna
   // (one per ":"-chain), --modify=SEP@3[@chain] (the position as tools/gpu/probe-modified.js takes it, chain index from 0)
   const { ccdUrl, parseCcdComponent } = await import(`${repo}/src/af3/featurise/ccd-component.js`);
