@@ -29,6 +29,8 @@ node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + ev
 ./af3 data                                   # f32 path, every stage against AF3
 ```
 
+`--out=x.pdb`, or `--out=x.cif` for mmCIF as AlphaFold 3 writes it (entities, polymer sequences
+and chains declared, so AF3's own reader and gemmi both load it; the pLDDT in B_iso_or_equiv).
 `--fold` options: `--steps=200 --recycles=3 --seed=42 --folds=N` (N warm repeats), `--seeds=a,b,c`
 (every seed, as AF3 runs a job's modelSeeds - a job's list is used when no seed is given; one trunk
 serves them all, its features not depending on the seed, and every (seed, sample) goes through the

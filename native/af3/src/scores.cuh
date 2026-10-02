@@ -300,3 +300,62 @@ inline int scorePdbMain(const std::string& path) {
          (int)hasClash(atoms, chains, x.data()));
   return 0;
 }
+
+// The structure as mmCIF (AlphaFold 3's own output format), for --out=*.cif: the PDB's records as
+// an _atom_site table, the per-atom pLDDT in B_iso_or_equiv. Each chain its own entity; a polymer
+// residue carries label_seq_id, a ligand '.'. Returns the slots in record order, as writePdb does.
+inline std::vector<size_t> writeCif(const std::string& path, const std::vector<float>& x, const float* bfactors) {
+  std::vector<ScoreAtom> atoms = scoreAtoms(DATA_DIR);
+  std::vector<ScoreChain> chains = scoreChains(atoms);
+  std::vector<size_t> order;
+  std::string name = path.substr(path.find_last_of('/') + 1);
+  name = name.substr(0, name.find_last_of('.'));
+  FILE* f = fopen(path.c_str(), "w");
+  fprintf(f, "data_%s\n#\n_entry.id %s\n#\nloop_\n_entity.id\n_entity.type\n", name.c_str(), name.c_str());
+  for (size_t c = 0; c < chains.size(); ++c) fprintf(f, "%zu %s\n", c + 1, chains[c].polymer ? "polymer" : "non-polymer");
+  // the polymers' types and sequences, and the chains' entities (what AF3's own reader requires)
+  auto dnaRes = [](const std::string& r) { return r == "DA" || r == "DC" || r == "DG" || r == "DT"; };
+  auto polyType = [&](const ScoreChain& c) {
+    if (c.protein) return "polypeptide(L)";
+    for (auto& r : c.residues) if (dnaRes(atoms[r.atoms[0]].res)) return "polydeoxyribonucleotide";
+    return "polyribonucleotide";
+  };
+  fprintf(f, "#\nloop_\n_entity_poly.entity_id\n_entity_poly.type\n");
+  for (size_t c = 0; c < chains.size(); ++c) if (chains[c].polymer) fprintf(f, "%zu %s\n", c + 1, polyType(chains[c]));
+  fprintf(f, "#\nloop_\n_entity_poly_seq.entity_id\n_entity_poly_seq.num\n_entity_poly_seq.mon_id\n_entity_poly_seq.hetero\n");
+  for (size_t c = 0; c < chains.size(); ++c) {
+    if (!chains[c].polymer) continue;
+    for (auto& r : chains[c].residues) {
+      const ScoreAtom& a = atoms[r.atoms[0]];
+      fprintf(f, "%zu %d %s n\n", c + 1, a.seq, a.res.c_str());
+    }
+  }
+  fprintf(f, "#\nloop_\n_struct_asym.id\n_struct_asym.entity_id\n");
+  for (size_t c = 0; c < chains.size(); ++c) fprintf(f, "%s %zu\n", chains[c].id.c_str(), c + 1);
+  fprintf(f, "#\nloop_\n_atom_site.group_PDB\n_atom_site.id\n_atom_site.type_symbol\n_atom_site.label_atom_id\n"
+             "_atom_site.label_alt_id\n_atom_site.label_comp_id\n_atom_site.label_asym_id\n_atom_site.label_entity_id\n"
+             "_atom_site.label_seq_id\n_atom_site.pdbx_PDB_ins_code\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n"
+             "_atom_site.Cartn_z\n_atom_site.occupancy\n_atom_site.B_iso_or_equiv\n_atom_site.auth_seq_id\n"
+             "_atom_site.auth_asym_id\n_atom_site.pdbx_PDB_model_num\n");
+  size_t serial = 1;
+  for (size_t c = 0; c < chains.size(); ++c)
+    for (auto& r : chains[c].residues)
+      for (size_t i : r.atoms) {
+        const ScoreAtom& a = atoms[i];
+        order.push_back(a.slot);
+        std::string el = a.element.empty() ? a.name.substr(0, 1) : a.element;
+        std::string atomId = a.name.find('\'') != std::string::npos ? "\"" + a.name + "\"" : a.name;
+        std::string seq = chains[c].polymer ? std::to_string(a.seq) : ".";
+        fprintf(f, "%s %zu %s %s . %s %s %zu %s %s %.3f %.3f %.3f 1.00 %.2f %d %s 1\n", a.het ? "HETATM" : "ATOM", serial++,
+                el.c_str(), atomId.c_str(), a.res.c_str(), a.chain.c_str(), c + 1, seq.c_str(),
+                a.icode == ' ' ? "?" : std::string(1, a.icode).c_str(), x[a.slot * 3], x[a.slot * 3 + 1], x[a.slot * 3 + 2],
+                bfactors ? bfactors[a.slot] : 0.0, a.seq, a.chain.c_str());
+      }
+  fprintf(f, "#\n");
+  fclose(f);
+  return order;
+}
+inline bool cifPath(const std::string& p) { return p.size() > 4 && p.substr(p.size() - 4) == ".cif"; }
+inline std::vector<size_t> writeStructure(const std::string& path, const std::vector<float>& x, const float* bfactors) {
+  return cifPath(path) ? writeCif(path, x, bfactors) : writePdb(path, x, bfactors);
+}

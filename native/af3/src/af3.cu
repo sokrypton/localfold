@@ -293,7 +293,8 @@ int main(int argc, char** argv) {
     StructureScores bestSS{ false, 0.0 };
     ConfidenceOut conf;
     std::vector<float> x;
-    std::string stem = out.size() > 4 && out.substr(out.size() - 4) == ".pdb" ? out.substr(0, out.size() - 4) : out;
+    std::string ext = cifPath(out) ? ".cif" : ".pdb";     // --out=*.cif: mmCIF, as AlphaFold 3 writes
+    std::string stem = out.size() > 4 && out.substr(out.size() - 4) == ext ? out.substr(0, out.size() - 4) : out;
     bool many = seedList.size() > 1 || samples > 1;
     std::vector<std::string> ranking;
     // every (seed, sample) through the denoiser together, up to ten a batch: a batch's GEMMs cost far
@@ -378,8 +379,8 @@ int main(int argc, char** argv) {
       double score = rankingScore(ck.ptm, ck.iptm, ssk);
       if (many) {
         std::string tag = (seedList.size() > 1 ? "_seed" + std::to_string(sd) : std::string()) + "_sample" + std::to_string(sk);
-        std::string path = out == "/dev/null" ? out : stem + tag + ".pdb";
-        auto order = writePdb(path, xk, ck.plddt.data());
+        std::string path = out == "/dev/null" ? out : stem + tag + ext;
+        auto order = writeStructure(path, xk, ck.plddt.data());
         if (path != "/dev/null") writeConfidences(path, order, t.n, dense, ck.plddt, ck.pae, ck.tmTerm, contact, ck.ptm, ck.iptm,
                                                   score, ck.meanPlddt, ssk.clash, ssk.disordered);
         printf("  seed %llu sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", (unsigned long long)sd, sk,
@@ -401,7 +402,7 @@ int main(int argc, char** argv) {
     }
     auto f2 = clock();
     auto f3 = f2;
-    auto order = writePdb(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
+    auto order = writeStructure(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
     if (out != "/dev/null") writeConfidences(out, order, t.n, dense, conf.plddt, conf.pae, conf.tmTerm, contact, conf.ptm,
                                              conf.iptm, bestScore, conf.meanPlddt, bestSS.clash, bestSS.disordered);
     if (many) printf("  best: seed %llu sample %d\n", (unsigned long long)bestSeed, best);

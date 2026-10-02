@@ -201,7 +201,8 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
                              const std::vector<float>& tmTerm, const std::vector<float>& contact,
                              double ptm, double iptm, double ranking, double meanPlddt,
                              bool hasClash, double fractionDisordered) {
-  std::string stem = pdbPath.size() > 4 && pdbPath.substr(pdbPath.size() - 4) == ".pdb"
+  std::string stem = pdbPath.size() > 4 && (pdbPath.substr(pdbPath.size() - 4) == ".pdb" ||
+                                            pdbPath.substr(pdbPath.size() - 4) == ".cif")
     ? pdbPath.substr(0, pdbPath.size() - 4) : pdbPath;
   const int* asym = M.i("batch.asymId"); const int* res = M.i("batch.residueIndex");
   const float* seq = M.f("batch.seqMask");
