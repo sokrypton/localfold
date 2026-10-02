@@ -329,6 +329,33 @@ def template_entry(template, query):
     return entry, len(mapping), entry_used
 
 
+# 🔴 THE LIVE SAMPLER BAKED THE FIRST FOLD'S ROTARY TABLES INTO EVERY LATER FOLD. alphafold3's
+# staged driver (src/alphafold3/model/staged.py, the `colab` branch the notebook installs) compiles its
+# denoise step once and caches it, passing the atom conditioning's ARRAYS through jit and closing over
+# the rest - and it sorted by `hasattr(v, 'shape')`, so ESMFold2's `rope_q`/`rope_k`, which are TUPLES
+# of arrays, were closed over as constants, while the cache key looks only at 0-d values and so never
+# changed between ESMFold2 folds. A second fold of another size died ("mul got incompatible shapes for
+# broadcasting: (192, 32, 4, 32), (51, 32, 1, 32)"); one of the SAME padded size would have folded
+# silently with the first molecule's conformer. A tuple or list of arrays is data. The fix belongs
+# upstream; until it lands this applies it, and refuses if the line it fixes has changed shape.
+STAGED_BUG = "(static if is_flag or not hasattr(v, 'shape') else arrays)[k] = v"
+STAGED_FIX = ("(static if is_flag or not (hasattr(v, 'shape') or (isinstance(v, (tuple, list)) and len(v) > 0\n"
+              "          and all(hasattr(x, 'shape') for x in v))) else arrays)[k] = v")
+
+
+def patch_staged():
+    import inspect
+    from alphafold3.model import staged
+    source = inspect.getsource(staged)
+    if STAGED_BUG not in source:
+        if "isinstance(v, (tuple, list))" in source:
+            return "fixed upstream"
+        raise RuntimeError("alphafold3.model.staged no longer has the line this worker patches; "
+                           "check whether its tuple-of-arrays conditioning still crosses jit (tools/jax_worker.py)")
+    exec(compile(source.replace(STAGED_BUG, STAGED_FIX), staged.__file__, "exec"), staged.__dict__)
+    return "patched"
+
+
 class Worker:
     """Imports once, keeps one model's runner, folds a job at a time."""
 
@@ -337,6 +364,7 @@ class Worker:
         import jax
         import run_alphafold as RA
         from alphafold3.model.components import platform
+        patch_staged()
         self.jax, self.RA, self.flags = jax, RA, flags
         device = platform.attention_config()
         self.flash = device["attention"]

@@ -31,7 +31,10 @@ WHAT IT CHECKS, each against 1BRS (barnase-barstar) and its own crystal:
     to 0.15 A rms, and
   - rosettafold3 refusing Flow, which must be a refusal and not a fold, and
   - ESMFold2 600M folding 6MRR (< 3 A), which it cannot without its language
-    model - the worker once set the flag and not the argument that decides it.
+    model - the worker once set the flag and not the argument that decides it;
+  - and a SECOND and third ESMFold2 fold: barstar (another size, < 3 A) and 6MRR reversed (the
+    same size), the latter equal to the same job in a fresh worker - the live sampler once baked
+    the first fold's rotary tables into every later one.
 About five minutes on an A100, most of it compiling.
 """
 import argparse
@@ -120,6 +123,14 @@ def main():
                           "sequences": [{"protein": {"id": "A", "sequence": mrr_sequence["A"]}}]})
     mrr_rows = [{"type": "protein", "value": mrr_sequence["A"], "copies": 1}]
 
+    ef2 = {"model-family": "ef2-fast-600m", "plm-mode": "esmc-600m", "msa-mode": "none", "af3-mode": "diffusion"}
+    def single_chain(sequence):
+        return (json.dumps({"name": "gate", "modelSeeds": [1], "dialect": "alphafold3", "version": 2,
+                            "sequences": [{"protein": {"id": "A", "sequence": sequence}}]}),
+                [{"type": "protein", "value": sequence, "copies": 1}])
+    barstar_job, barstar_rows = single_chain(barstar)
+    barstar_ca, _ = alpha_carbons(crystal_text, "D")
+    reversed_job, reversed_rows = single_chain(mrr_sequence["A"][::-1])
     multimer = {"model-family": "multimer", "msa-mode": "none", "recycles": "3", "af2Model": "1"}
     openbind = {"model-family": "openbind0", "msa-mode": "none", "af3-mode": "diffusion"}
     cases = [
@@ -149,10 +160,16 @@ def main():
         # 🔴 ESMFold2 IS ITS LANGUAGE MODEL. The worker set the flag and not
         # process_fold_input's `use_esm` argument, so the tower never ran: 6MRR
         # at 15.81 A on the 600M, where the CLI and the WebGPU port give ~1.5.
-        ("esmfold2 600M, 6MRR", mrr_job, mrr_rows,
-         {"model-family": "ef2-fast-600m", "plm-mode": "esmc-600m", "msa-mode": "none",
-          "af3-mode": "diffusion"},
+        ("esmfold2 600M, 6MRR", mrr_job, mrr_rows, ef2,
          lambda r, d: None if d < 3 else f"{d:.2f} A - is the language model reaching it?", mrr),
+        # 🔴 AND A SECOND ESMFold2 FOLD, BECAUSE THE FIRST ONE'S ROTARY TABLES WERE BAKED INTO THE
+        # LIVE SAMPLER'S CACHED STEP (see patch_staged in tools/jax_worker.py): any later fold of
+        # another size died with "mul got incompatible shapes", and one of the SAME size folded
+        # silently with the first molecule's conformer - the same-size arm is checked after the loop
+        ("esmfold2 600M, barstar (another size)", barstar_job, barstar_rows, ef2,
+         lambda r, d: None if d < 3 else f"{d:.2f} A", barstar_ca),
+        ("esmfold2 600M, 6MRR reversed (same size)", reversed_job, reversed_rows, ef2,
+         lambda r, d: None, mrr),
     ]
 
     # 🔴 ITS OWN WEIGHT CACHE, as fresh as a Colab VM's. af3-any-model takes any
@@ -161,25 +178,30 @@ def main():
     # parameters the published checkpoints have since renamed, where a Colab
     # runtime - which starts empty - folded all five.
     env = {**os.environ, "AF3_WEIGHTS_DIR": os.path.join(args.jax_dir, "weights")}
-    worker = subprocess.Popen([args.python, os.path.join(ROOT, "tools/jax_worker.py")],
-                              cwd=args.jax_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, text=True, env=env)
+    def start():
+        return subprocess.Popen([args.python, os.path.join(ROOT, "tools/jax_worker.py")],
+                                cwd=args.jax_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, env=env)
+
+    def run(proc, spec, entities, controls):
+        proc.stdin.write(json.dumps({"job": spec, "entities": entities,
+                                     "family": controls["model-family"], "controls": controls}) + "\n")
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                sys.exit("FAIL  the worker exited")
+            event = json.loads(line)
+            if event["kind"] == "result":
+                return event["payload"]
+    worker = start()
+    folded = {}
     failures = 0
     try:
         for name, spec, entities, controls, check, *truth in cases:
-            worker.stdin.write(json.dumps({"job": spec, "entities": entities,
-                                           "family": controls["model-family"],
-                                           "controls": controls}) + "\n")
-            worker.stdin.flush()
             started = time.time()
-            while True:
-                line = worker.stdout.readline()
-                if not line:
-                    sys.exit("FAIL  the worker exited")
-                event = json.loads(line)
-                if event["kind"] == "result":
-                    break
-            result = event["payload"]
+            result = run(worker, spec, entities, controls)
+            folded[name] = result
             seconds = time.time() - started
             if check is None:
                 # A refusal is the pass: it must say why, and fold nothing.
@@ -190,7 +212,8 @@ def main():
                 problem, shown = result["error"][:160], ""
             else:
                 predicted, _ = alpha_carbons(result["pdb"], "AB")
-                distance = rmsd(predicted, truth[0] if truth else crystal)
+                distance = rmsd(predicted, truth[0] if truth else crystal) \
+                    if len(predicted) == len(truth[0] if truth else crystal) else float("nan")
                 problem = check(result, distance)
                 shown = f"{distance:6.2f} A  pLDDT {result['confidence']['meanPlddt']:.1f}"
             failures += problem is not None
@@ -199,8 +222,27 @@ def main():
     finally:
         worker.stdin.close()
         worker.wait(timeout=60)
+    # the same-size arm: 6MRR reversed, folded AFTER 6MRR above, against the same job in a FRESH worker -
+    # one seed, one input, so the coordinates must agree (they were 1.0 A apart with the cached step
+    # still holding 6MRR's rotary tables, at a plausible pLDDT)
+    name = "esmfold2 600M, 6MRR reversed (same size)"
+    after = folded.get(name, {})
+    fresh_worker = start()
+    try:
+        alone = run(fresh_worker, reversed_job, reversed_rows, ef2)
+    finally:
+        fresh_worker.stdin.close()
+        fresh_worker.wait(timeout=60)
+    if "pdb" not in after or "pdb" not in alone:
+        problem = f"{after.get('error', '')}{alone.get('error', '')}"[:160] or "no structure"
+    else:
+        moved = float(np.abs(alpha_carbons(after["pdb"], "A")[0] - alpha_carbons(alone["pdb"], "A")[0]).max())
+        problem = None if moved < 1e-3 else f"{moved:.3f} A from the same job in a fresh worker"
+    failures += problem is not None
+    print(f"{'ok  ' if problem is None else 'FAIL'}  {'esmfold2: after another = alone':30s}"
+          + ("" if problem is None else f"\n      {problem}"), flush=True)
     if failures:
-        sys.exit(f"{failures} of {len(cases)} JAX worker checks failed")
+        sys.exit(f"{failures} of {len(cases) + 1} JAX worker checks failed")
     print("the JAX worker folds, templates and restarts")
 
 
