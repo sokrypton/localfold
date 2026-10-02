@@ -159,3 +159,11 @@ residue (`native/af3/bonds.mjs`):
   faithful to its reference here, and the question is the one the SEP case asked: does GENUINE
   Boltz-2 place a 3-hydroxyproline? Not measured - `boltz` is not installed on this box. If it does,
   this is a second defect in af3-any-model's boltz2 port, and the SEP fix above did not cover it.
+
+**And the modified BASES the same way, with the batch exact.** After boltz2's batch was made exact
+on modified bases too (`--target=dna-5cm|rna-mods`, four conventions fixed - the profile at the
+parent nucleotide, atoms past the 24 dense slots dropped as the reference drops them, the
+representative falling back to the first held atom), the kitchen-sink job still reads, for boltz2:
+6OG **0.834**, 2MG **0.823**, 6MA 0.229, 5MC 0.067 Å bond rms - where AlphaFold 3 and the other five
+families are 0.04-0.10 on every one. 6OG and 2MG are the 25-atom guanosines whose one-token form
+loses a ring atom by construction, so they cannot be whole; 6MA is the open question beside HY3.
