@@ -40,10 +40,6 @@ inline void gemmH(const float* X, const half* Wt, float* Y, size_t rows, int in,
 }
 
 // ---------------------------------------------------------------- elementwise
-__global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) y[t] += b[t % C];
-}
 inline void addBias(float* y, const float* b, size_t rows, int C) {
   addBiasK<<<blocks(rows * C), 256, 0, STREAM>>>(y, b, rows, C);
 }

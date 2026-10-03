@@ -30,9 +30,6 @@ void layerNorm2(const TI* in, TO* out, size_t rows, int C, const std::string& sc
                 const std::string& offset) {
   layerNormK<TI, TO><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, C, W(scale), W(offset));
 }
-__global__ void addK(float* y, const float* x, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] += x[i];
-}
 template <class T>
 __global__ void gatedAddK(float* pair, const T* proj, const T* gate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -82,10 +79,6 @@ inline std::string upGatedTransition1(const std::string& B, int C, int I, bool& 
   up = hasW(B + ".ffwAToB");
   if (!up) return B + ".ffwTransition1";
   return concatColumns(B + ".ffwTransition1|aToB~", C, {{B + ".ffwTransition1", 2 * I, false}, {B + ".ffwAToB", I, false}});
-}
-__global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < rows * C) y[i] += b[i % C];
 }
 
 // ---------------------------------------------------------------- fused weights

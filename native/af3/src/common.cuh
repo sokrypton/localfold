@@ -1215,3 +1215,4 @@ inline void stage(const char* name) {
   if (name) STAGE_MS[name] += std::chrono::duration<double, std::milli>(now - last).count();
   last = now;
 }
+#include "elementwise.cuh"    // the element-wise kernels every port shares

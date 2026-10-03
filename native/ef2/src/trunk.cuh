@@ -43,10 +43,6 @@ __global__ void zInitK(const float* rows, const float* cols, RelIdx rel, const f
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
   z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lmZ[t];
 }
-__global__ void addK(float* y, const float* x, size_t n) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) y[t] += x[t];
-}
 
 inline void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z, bool check) {
   size_t P = (size_t)T * T;
@@ -71,14 +67,6 @@ __global__ void triSplitInterleavedK(const float* proj, const float* gate, const
   int c2 = (int)(t % (2 * C)); size_t ij = t / (2 * C);
   float v = proj[t] * mask[ij] / (1.f + expf(-gate[t]));
   (c2 & 1 ? b : a)[(size_t)(c2 >> 1) * pairs + ij] = v;
-}
-__global__ void channelMajorToRowsK(const float* x, float* y, size_t pairs, int C) {   // [c][ij] -> [ij][c]
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < pairs * C) y[t] = x[(t % C) * pairs + t / C];
-}
-__global__ void gateMulAddK(float* pair, const float* out, const float* gate, size_t n) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) pair[t] += out[t] / (1.f + expf(-gate[t]));
 }
 __global__ void fillK(float* out, float v, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -202,12 +190,6 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
   }
 }
 
-__global__ void symmetriseK(const float* z, float* out, int T, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)T * T * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  out[t] = z[t] + z[((size_t)j * T + i) * C + c];
-}
 inline void distogram(const float* z, int T, int C, float* logits) {
   size_t P = (size_t)T * T; int Bn = (int)dimOf("f/distogram/weights", 1);
   float* zs = scratch<float>("dg.sym", P * C);

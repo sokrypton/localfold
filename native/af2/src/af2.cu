@@ -54,13 +54,6 @@ static float predictedTm(const std::vector<float>& logits, int L, int bins, cons
   }
   return best;
 }
-// logits[i, j] = half[i, j] + half[j, i]
-__global__ void symmetriseK(const float* half_, float* out, int L, int B) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)L * L * B) return;
-  int b = (int)(t % B); size_t ij = t / B; int i = (int)(ij / L), j = (int)(ij % L);
-  out[t] = half_[t] + half_[((size_t)j * L + i) * B + b];
-}
 
 // a synthetic input of the given shapes (what export_input.mjs writes, its values arbitrary), in
 // /dev/shm, for --warm: folding it loads what the real input's fold will need while that is exported

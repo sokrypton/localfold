@@ -175,44 +175,7 @@ __global__ void layerNormTK(const float* x, TO* y, size_t rows, int C, const flo
   float inv = rsqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) y[row * C + c] = (TO)((xr[c] - mean) * inv * scale[c] + offset[c]);
 }
-// the same at a width known at compile time: the row read once into registers, 16-byte (or 8-byte)
-// loads, a warp a row; VEC floats a lane per step, C / (32 VEC) steps
-template <int C>
-__global__ void layerNormVK(const float* __restrict__ x, half* __restrict__ y, size_t rows, const float* __restrict__ scale,
-                            const float* __restrict__ offset) {
-  constexpr int VEC = C >= 128 ? 4 : C / 32, STEPS = C / (32 * VEC);
-  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-  int lane = threadIdx.x & 31;
-  if (row >= rows) return;
-  const float* xr = x + row * C;
-  float v[STEPS][VEC];
-  float s = 0;
-#pragma unroll
-  for (int k = 0; k < STEPS; ++k) {
-    int c = (k * 32 + lane) * VEC;
-    if constexpr (VEC == 4) { float4 q = *reinterpret_cast<const float4*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w; }
-    else { float2 q = *reinterpret_cast<const float2*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; }
-#pragma unroll
-    for (int u = 0; u < VEC; ++u) s += v[k][u];
-  }
-  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-  float mean = s / C, q2 = 0;
-#pragma unroll
-  for (int k = 0; k < STEPS; ++k)
-#pragma unroll
-    for (int u = 0; u < VEC; ++u) { float d = v[k][u] - mean; q2 += d * d; }
-  for (int o = 16; o; o >>= 1) q2 += __shfl_xor_sync(~0u, q2, o);
-  float inv = rsqrtf(q2 / C + 1e-5f);
-#pragma unroll
-  for (int k = 0; k < STEPS; ++k) {
-    int c = (k * 32 + lane) * VEC;
-#pragma unroll
-    for (int u = 0; u < VEC; u += 2)
-      *reinterpret_cast<half2*>(y + row * C + c + u) =
-          __floats2half2_rn((v[k][u] - mean) * inv * scale[c + u] + offset[c + u],
-                            (v[k][u + 1] - mean) * inv * scale[c + u + 1] + offset[c + u + 1]);
-  }
-}
+// (the same at a width known at compile time: layerNormVK, elementwise.cuh)
 inline void layerNormH(const float* x, half* y, size_t rows, int C, const std::string& w, int block = -1) {
   const float *sc = P(w + "/scale", block), *of = P(w + "/offset", block);
   unsigned grid = (unsigned)((rows + 7) / 8);
@@ -290,30 +253,6 @@ __global__ void triGateTK(const half* pg, const float* mask, half* a, half* b, s
     }
   }
 }
-// prod [C][pairs] f32 -> LN over C -> [pairs, C] f16; 32 rows a block, staged through shared memory
-__global__ void centerNormTK(const float* prod, half* out, size_t pairs, int C, const float* scale, const float* offset,
-                             int L, int Lp) {      // prod [C][Lp][Lp]
-  extern __shared__ float tile[];               // [C][33]
-  size_t r0 = (size_t)blockIdx.x * 32;
-  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-  for (int c = warp; c < C; c += nw) {
-    size_t r = r0 + lane;
-    tile[c * 33 + lane] = r < pairs ? prod[(size_t)c * Lp * Lp + (r / L) * Lp + r % L] : 0.f;
-  }
-  __syncthreads();
-  for (int row = warp; row < 32; row += nw) {
-    size_t r = r0 + row;
-    if (r >= pairs) break;
-    float s = 0;
-    for (int c = lane; c < C; c += 32) s += tile[c * 33 + row];
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, v = 0;
-    for (int c = lane; c < C; c += 32) { float d = tile[c * 33 + row] - mean; v += d * d; }
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-    float inv = rsqrtf(v / C + 1e-5f);
-    for (int c = lane; c < C; c += 32) out[r * C + c] = __float2half((tile[c * 33 + row] - mean) * inv * scale[c] + offset[c]);
-  }
-}
 // ...and at 128 channels native/af3's FUSED triangle (fusedtriangle.cuh: triInK, triOutPK - the LayerNorm'd
 // rows, the 4C projection and the centred rows never written), the same computation as AlphaFold 3's with
 // biases: AF3's kernels interleave a and b (column 2ch is a's channel ch, 2ch+1 b's) where AF2 stores the
@@ -341,14 +280,6 @@ inline TriFused triFusedWeights(const std::string& T, int blk, int C) {
   interleaveTriK<<<blocks((size_t)C * 4 * C), 256, 0, STREAM>>>(P(T + "/projection/weights", blk), P(T + "/gate/weights", blk),
     P(T + "/projection/bias", blk), P(T + "/gate/bias", blk), P(T + "/gating_linear/bias", blk), w, b, C);
   return cache[{T, blk}] = TriFused{w, b};
-}
-// pair += out * sigmoid(gate), the gate the [pairs, 5C] block's last C columns
-// pair += out * sigmoid(gate), the gate's rows ld apart
-__global__ void gateMulAddHK(float* pair, const float* out, const half* gate, size_t pairs, int C, int ld) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= pairs * C) return;
-  size_t r = t / C; int c = (int)(t % C);
-  pair[t] += out[t] / (1.f + __expf(-__half2float(gate[r * ld + c])));
 }
 
 // ---------------------------------------------------------------- outer product mean, --fast

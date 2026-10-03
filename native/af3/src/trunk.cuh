@@ -561,13 +561,7 @@ void pairformerBlock(Trunk& t, int k) {
 }
 
 // ---------------------------------------------------------------- distogram
-// logits[i][j] = half[i][j] + half[j][i]
-__global__ void symmetriseK(const float* half_, float* logits, int n, int bins) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * bins) return;
-  int b = (int)(t % bins); size_t ij = t / bins; size_t i = ij / n, j = ij % n;
-  logits[t] = half_[ij * bins + b] + half_[(j * n + i) * bins + b];
-}
+// logits[i][j] = half[i][j] + half[j][i] (symmetriseK, elementwise.cuh)
 inline void distogram(Trunk& t, float* logits) {
   int bins = (int)M.meta("trunk.distogram.bins");
   size_t pairs = (size_t)t.n * t.n;

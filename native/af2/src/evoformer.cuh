@@ -417,14 +417,6 @@ __global__ void triSplitK(const float* proj, const float* gate, const float* mas
   float v = proj[t] * mask[ij] / (1.f + __expf(-gate[t]));
   if (c2 < C) a[(size_t)c2 * L * L + ij] = v; else b[(size_t)(c2 - C) * L * L + ij] = v;
 }
-__global__ void channelMajorToRowsK(const float* x, float* y, size_t pairs, int C) {   // [c][ij] -> [ij][c]
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < pairs * C) y[t] = x[(t % C) * pairs + t / C];
-}
-__global__ void gateMulAddK(float* pair, const float* out, const float* gate, size_t n) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) pair[t] += out[t] / (1.f + __expf(-gate[t]));
-}
 inline void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
                                    bool outgoing) {
   size_t pairs = (size_t)L * L;
@@ -483,7 +475,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16F, Lp, plane, b, CUDA_R_16F, Lp,
                                     plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     half* cn = xn;                // (the normalised input is spent)
-    centerNormTK<<<(unsigned)((pairs + 31) / 32), 256, (size_t)C * 33 * 4, STREAM>>>(prod, cn, pairs, C,
+    centerNormHK<<<(unsigned)((pairs + 31) / 32), 256, (size_t)C * 33 * 4, STREAM>>>(prod, cn, pairs, C,
       P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk), L, Lp);
     float* out = scratch<float>("ftri.out", pairs * C);
     ltGemm(cn, w.out, out, false, pairs, C, C, P(T + "/output_projection/bias", blk), false, 0.f);
