@@ -46,6 +46,14 @@ class Refused(Exception):
     """A job this backend does not run, said as such rather than approximated."""
 
 
+def card_use():
+    """(used, total) MiB of device memory on the card, from nvidia-smi."""
+    out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+    used, total = (int(v) for v in out[0].split(","))
+    return used, total
+
+
 def device_name():
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -294,9 +302,16 @@ def streaming(job):
 
 
 class Worker:
+    # 🔴 SEVERAL MODELS MAY STAY ON THE CARD, WHILE THERE IS ROOM. A change of model paid its server's start
+    # (0.3-0.56 s on an A100 - the context, the weights) and a first fold in a fresh process; idle, the three
+    # ports hold 0.8-2.6 GB each. So the servers last used stay up while the card is at most half full after
+    # a fold, the least recent going first, and every idle one is stopped before a job past LARGE residues -
+    # a big fold's own buffers are what the card is for.
+    LARGE = 400
+
     def __init__(self):
         self.device = device_name()
-        self.server = None
+        self.servers = {}                # key -> Server, least recently used first
         self.exporters = {}
 
     def node(self, cmd, what, log, cwd=REPO):
@@ -306,11 +321,27 @@ class Worker:
             self.exporters[script] = Exporter(script, cwd)
         return self.exporters[script].run(cmd, what, log)
 
-    def close_server(self):
-        """...and stopped before any other model folds, so two never share the card."""
-        if self.server is not None:
-            self.server.close()
-            self.server = None
+    def evict(self, keep, everything=False):
+        """Idle servers stopped, least recently used first: all of them (`everything`), or until the card is
+        at most half full. `keep` (the model about to fold, or just folded) is never one."""
+        for key in [k for k in self.servers if k != keep]:
+            if not everything:
+                used, total = card_use()
+                if used <= total // 2:
+                    return
+            self.servers.pop(key).close()
+
+    def server_for(self, key, command, residues):
+        """The model's server - kept, or started - moved to the most recently used end."""
+        self.evict(key, everything=residues > self.LARGE)
+        server = self.servers.pop(key, None)
+        if server is not None and server.proc.poll() is not None:
+            server = None
+        if server is None:
+            emit("status", f"{key[1]} on CUDA ({self.device}) · loading the weights onto the card")
+            server = Server(key, command)
+        self.servers[key] = server
+        return server
 
     def fold(self, job):
         controls = job.get("controls", {})
@@ -476,10 +507,8 @@ class Worker:
             command = [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast"]
             total = 0
         emit("progress", 0.15)
-        if self.server is None or self.server.key != key or self.server.proc.poll() is not None:
-            self.close_server()
-            emit("status", f"{family} on CUDA ({self.device}) · loading the weights onto the card")
-            self.server = Server(key, command)
+        residues = sum(len(chain) for chain in polymer_chains(job["job"]))
+        server = self.server_for(key, command, residues)
         emit("status", f"{family} on CUDA ({self.device}) · folding")
         on_file = None
         if streaming(job):
@@ -508,8 +537,9 @@ class Worker:
                     if steps:
                         emit("progress", 0.3 + 0.7 * step / steps)
                         emit("status", f"{family} on CUDA ({self.device}) · diffusion {step}/{steps}")
-        said = self.server.fold(inputs, fold, on_file)
+        said = server.fold(inputs, fold, on_file)
         log.append(said)
+        self.evict(key)
         if not any("pLDDT" in line for line in said.splitlines()):
             raise RuntimeError("the fold printed no confidence line")
         emit("progress", 1.0)

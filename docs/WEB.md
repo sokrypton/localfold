@@ -4206,3 +4206,17 @@ eight at once now, and takes a lock per bundle, so the notebook can start the de
 beside the compile (the network beside the CPU) and a fold that arrives meanwhile waits for that download
 rather than racing it into the same `.part` files.
 
+**...and a change of model, kept off the reader's clock where the card has room.** The worker stopped one
+model's server before starting the next, so moving between models paid the start (0.3-0.56 s here) and a
+fold in a fresh process every time. The servers last used now stay up while the card is at most half full
+after a fold, the least recent stopped first, and every idle one goes before a job past 400 residues. On
+this A100, moving between AF3, AF2, ESMFold2 and protenix2 and back: 0.77-1.0 s for a model's first fold,
+**0.15-0.21 s** for a return (the gate's last page fold, AF3 after AF2 and ESMFold2: 0.26 s click to
+result). On a 15 GB T4 the half-full rule keeps about two.
+
+**On the T4 itself**, profiled on Colab: a 262-residue AF3 fold is 4.0 s, 91% trunk, and its grid attention's
+flash kernel ran at 3.5-6 TFLOP/s - no cp.async and 64 KB of shared memory on Turing. A register-staged
+form (native/af3/README.md, "On a T4") is 2.1x on that kernel and 5-6.5% on the fold, with identical
+output; the T4 is power-capped, so a busier kernel lowers the clock for the rest (AF2: the flash kernels
+-1.6 s, the GEMMs +0.8 s, the fold -3%).
+
