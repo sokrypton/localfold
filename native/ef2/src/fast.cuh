@@ -18,9 +18,11 @@ template <class T> T* wpool(size_t n) {
   T* p = (T*)(chunk + used); used += bytes; return p;
 }
 struct LtPlan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; bool ok; };
+inline std::map<const float*, half*> BIAS_HALF;     // f16 copies of biases (forgotten with the derived weights)
+inline const bool BIAS_HALF_HOOK = (FORGET_HOOKS.push_back([] { BIAS_HALF.clear(); }), true);
 inline const void* biasFor(const float* bias, int n, bool asHalf) {
   if (!bias || !asHalf) return bias;
-  static std::map<const float*, half*> copies;
+  auto& copies = BIAS_HALF;
   auto it = copies.find(bias);
   if (it != copies.end()) return it->second;
   half* h = wpool<half>(n);
@@ -124,6 +126,10 @@ inline void layerNormH(const float* x, half* y, size_t rows, int C, const float*
 inline const half* Fh(const std::string& name) { return Wh("f/" + name); }
 
 inline bool FUSED = true;     // native/af3's fused triangle input (--no-fused: the unfused f16 path)
+// ...from 80 tokens only: below, its few row tiles each stream the whole 256 x 1280 weight and leave the
+// card idle - the trunk of 4 passes at 68 tokens is 42.7 ms fused against 38.9 unfused. (From 80 tokens
+// the 256-channel kernels of fused256.cuh take the block, so this one serves --no-fused256.)
+inline int FUSED_MIN_TOKENS = 80;
 // ---------------------------------------------------------------- the triangle, f16
 // pg [P, 5C] = [projection 2C | gate 2C | gatingLinear C] (f16); a, b channel-major planes [C][Lp][Lp]
 // (the pad zero), interleaved: a = proj[2c] * mask * sigmoid(gate[2c]), b likewise at 2c + 1. A 32-pair x
@@ -184,7 +190,7 @@ __global__ void gateMulAddHK(float* pair, const float* out, const half* pg, size
 inline void triangleFusedIn(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing);
 inline void triangleFast(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
   size_t P = (size_t)L * L;
-  if (FUSED && C == 256) { triangleFusedIn(pair, mask, L, C, Tn, outgoing); return; }
+  if (FUSED && C == 256 && L >= FUSED_MIN_TOKENS) { triangleFusedIn(pair, mask, L, C, Tn, outgoing); return; }
   half* xn = scratch<half>("ftri.xn", P * C);
   layerNormH(pair, xn, P, C, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"));
   half* pg = scratch<half>("ftri.pg", P * 5 * C);

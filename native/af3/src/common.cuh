@@ -18,6 +18,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <deque>
 #include <tuple>
 #include <sstream>
 #include <thread>
@@ -41,12 +42,16 @@ struct Entry { char kind; size_t offset, length; double value; int seg; size_t d
 // vector-load kernels need it (align1 kernels otherwise, and a batched GEMM, which cannot see its
 // pointers, faults). runs: the file's byte ranges and where each lands, in file order.
 struct Run { size_t src, dst, bytes; };
+// data: the file mapped, only once the host reads an entry (f()): a large file goes to the device by
+// pread into pinned buffers - a mapping of the 2.9 GB native/ef2 weights cost ~300 ms of page faults to
+// read and 275 ms more to tear down when the process exited, after its PDB was written
 struct Segment { const float* data; size_t bytes; float* device; std::map<std::string, void*> halfMirrors;
+                 int fd = -1;
                  size_t deviceBytes = 0; std::vector<Run> runs; };
 struct Model {
   std::map<std::string, Entry> index;
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
-  std::vector<Segment> segs;
+  std::deque<Segment> segs;          // (a deque: an upload thread holds a reference while another file loads)
   void load(const std::string& dir) {
     std::ifstream idx(dir + "/model.idx");
     if (!idx) { fprintf(stderr, "no %s/model.idx\n", dir.c_str()); exit(1); }
@@ -59,15 +64,13 @@ struct Model {
       if (index.count(name)) { fprintf(stderr, "%s is in two model directories\n", name.c_str()); exit(1); }
       index[name] = e;
     }
-    // mapped, not read: a 1.4 GB read into a host vector was 1.7 s of every run
+    // neither read nor mapped yet (a 1.4 GB read into a host vector was 1.7 s of every run)
     int fd = open((dir + "/model.bin").c_str(), O_RDONLY);
     if (fd < 0) { fprintf(stderr, "no %s/model.bin\n", dir.c_str()); exit(1); }
     struct stat st; fstat(fd, &st);
     size_t bytes = (size_t)st.st_size;
-    void* p = mmap(nullptr, std::max<size_t>(bytes, 1), PROT_READ, MAP_PRIVATE, fd, 0);
-    if (p == MAP_FAILED) { fprintf(stderr, "cannot map %s/model.bin\n", dir.c_str()); exit(1); }
-    close(fd);
-    Segment sg{(const float*)p, bytes, nullptr};
+    Segment sg{nullptr, bytes, nullptr};
+    sg.fd = fd;
     std::vector<Entry*> ts;
     for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') ts.push_back(&e);
     std::sort(ts.begin(), ts.end(), [](const Entry* a, const Entry* b) { return a->offset < b->offset; });
@@ -101,17 +104,42 @@ struct Model {
     for (auto& [g, h] : s.halfMirrors) cudaFree(h);
     s.halfMirrors.clear();
     if (s.data) { munmap((void*)s.data, std::max<size_t>(s.bytes, 1)); s.data = nullptr; }
+    if (s.fd >= 0) { close(s.fd); s.fd = -1; }
     return names;
   }
   // the whole directory's device copy now (af3 --wait-input does this while the input is exported)
   void upload(int seg) {
     for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') { dev(name); touched.erase(name); return; }
   }
+  // ...or in the background: the device copy is allocated at once and filled by a thread, so kernels
+  // can be launched against it meanwhile - a warm-up, whose answers are garbage until waitUploads()
+  // (and whose derived weights must then be forgotten: forgetDerivedWeights())
+  std::map<int, std::thread> pending;
+  void uploadAsync(int seg) {
+    Segment& s = segs[seg];
+    if (s.device || pending.count(seg)) return;
+    if (cudaMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess) {
+      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+    }
+    pending[seg] = std::thread([&s] {
+      if (!copyUp(s)) { fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1); }
+    });
+  }
+  void waitUploads() { for (auto& [seg, th] : pending) th.join(); pending.clear(); }
   // a file's bytes onto the device: from the mapping through small pinned buffers, three threads
   // copying each 8 MB piece while the last one's DMA runs - 77 against 170 ms for the 1.47 GB of
   // weights from pageable memory (the pinning costs 19 of it, a larger piece costs more)
+  static const float* mapped(Segment& s) {
+    if (!s.data) {
+      void* p = mmap(nullptr, std::max<size_t>(s.bytes, 1), PROT_READ, MAP_PRIVATE, s.fd, 0);
+      if (p == MAP_FAILED) { fprintf(stderr, "cannot map a model.bin (%zu bytes)\n", s.bytes); exit(1); }
+      s.data = (const float*)p;
+    }
+    return s.data;
+  }
   static bool copyUp(Segment& s) {
     if (s.bytes < ((size_t)64 << 20)) {
+      mapped(s);
       for (const Run& r : s.runs)
         if (cudaMemcpy((char*)s.device + r.dst, (const char*)s.data + r.src, r.bytes, cudaMemcpyHostToDevice) != cudaSuccess) return false;
       return true;
@@ -122,8 +150,8 @@ struct Model {
     for (int b = 0; b < NB; ++b)
       if (cudaHostAlloc(&stage[b], CH, cudaHostAllocDefault) != cudaSuccess ||
           cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming) != cudaSuccess) return false;
-    const char* src = (const char*)s.data; char* dst = (char*)s.device;
-    size_t run = 0;
+    const char* src = (const char*)s.data; char* dst = (char*)s.device;     // (src: only if already mapped)
+    size_t run = 0; bool readOk = true;
     for (size_t off = 0, i = 0; off < s.bytes; off += CH, ++i) {
       int b = (int)(i % NB);
       if (i >= (size_t)NB && cudaEventSynchronize(ev[b]) != cudaSuccess) return false;
@@ -131,9 +159,18 @@ struct Model {
       std::vector<std::thread> pool;
       for (int t = 0; t < THREADS; ++t) {
         size_t lo = t * per; if (lo >= n) break;
-        pool.emplace_back([=] { memcpy(stage[b] + lo, src + off + lo, std::min(per, n - lo)); });
+        size_t len = std::min(per, n - lo);
+        if (src) pool.emplace_back([=] { memcpy(stage[b] + lo, src + off + lo, len); });
+        else pool.emplace_back([=, &readOk] {
+          for (size_t got = 0; got < len;) {
+            ssize_t r = pread(s.fd, stage[b] + lo + got, len - got, (off_t)(off + lo + got));
+            if (r <= 0) { readOk = false; return; }
+            got += (size_t)r;
+          }
+        });
       }
       for (auto& th : pool) th.join();
+      if (!readOk) return false;
       // every run's part inside this piece, to where it lands
       while (run < s.runs.size() && s.runs[run].src + s.runs[run].bytes <= off) ++run;
       for (size_t k = run; k < s.runs.size() && s.runs[k].src < off + n; ++k) {
@@ -170,7 +207,10 @@ struct Model {
   double meta(const std::string& k) const { return at(k).value; }
   double meta(const std::string& k, double fallback) const { return has(k) ? at(k).value : fallback; }
   bool flag(const std::string& k) const { return has(k) && at(k).value != 0; }
-  const float* f(const std::string& k) const { const Entry& e = at(k); touched.insert(k); return segs[e.seg].data + e.offset; }
+  const float* f(const std::string& k) const {
+    const Entry& e = at(k); touched.insert(k);
+    return mapped(const_cast<Segment&>(segs[e.seg])) + e.offset;
+  }
   const int* i(const std::string& k) const { return (const int*)f(k); }
   size_t len(const std::string& k) const { return at(k).length; }
 };
@@ -229,6 +269,13 @@ template <class T> T* scratch(const std::string& name, size_t n) {
   return (T*)p;
 }
 
+// The process's end once its outputs are written: flushed, then _exit - the driver reclaims the device
+// with the process, where returning from main freed every allocation and destroyed the context and the
+// cuBLAS handles first (335 ms after native/ef2 had written its PDB, a third of a 6MRR fold's wall)
+[[noreturn]] inline void finish(int rc) {
+  fflush(stdout); fflush(stderr);
+  _exit(rc);
+}
 // LOCALFOLD_MEM=1: device memory in use at a phase boundary, and the largest scratch buffers
 inline void memReport(const char* at) {
   if (!getenv("LOCALFOLD_MEM")) return;
@@ -347,6 +394,21 @@ inline const half* Wh(const std::string& k) {
   half* h = dallocT<half>(n);
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(f, h, n);
   return WH[k] = h;
+}
+// every weight derived from the device copies forgotten - f16 mirrors and copies, weights built on the
+// device - after a warm-up that ran while a copy was still arriving (M.uploadAsync): they are rebuilt
+// from the finished copy on their next use. A port's own caches of derived weights register here.
+inline std::vector<std::function<void()>> FORGET_HOOKS;
+inline void forgetDerivedWeights() {
+  CK(cudaDeviceSynchronize());
+  for (auto& [k, h] : WH) if (!WH_MIRROR.count(k)) CK(cudaFree(h));
+  WH.clear(); WH_MIRROR.clear(); WH_AT.clear();
+  for (auto& s : M.segs) { for (auto& [g, h] : s.halfMirrors) CK(cudaFree(h)); s.halfMirrors.clear(); }
+  for (auto it = WF.begin(); it != WF.end();) {
+    if (M.has(it->first) && it->second == M.dev(it->first)) { ++it; continue; }
+    CK(cudaFree(it->second)); WLEN.erase(it->first); it = WF.erase(it);
+  }
+  for (auto& f : FORGET_HOOKS) f();
 }
 inline std::map<std::string, int*> IDEV;
 inline const int* Idev(const std::string& k) {

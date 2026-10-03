@@ -218,11 +218,20 @@ int main(int argc, char** argv) {
   M.load(weights);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
-  M.upload(0);
+  auto tCtx = std::chrono::steady_clock::now();
   Opts o{argv[1], oracle, out, seed, sampler, profile};
-  if (!warmShape.empty()) {
+  // The warm-up runs WHILE the weights go up (0.24 s for 2.9 GB, the GPU otherwise idle): its kernels
+  // read a copy still arriving, so its answers are garbage, and everything derived from the weights
+  // is forgotten after it. The warm fold needs only the shapes - it loads every kernel module and
+  // cuBLAS plan. 6MRR's cold trunk is 128 ms against 39 warm.
+  bool warming = !warmShape.empty();
+  if (warming) M.uploadAsync(0); else M.upload(0);
+  if (warming) {
     int wt = 0, wa = 0;
     if (sscanf(warmShape.c_str(), "%d,%d", &wt, &wa) != 2 || wt < 1 || wa < 1) { fprintf(stderr, "--warm=T,A\n"); return 1; }
+    // at most 96 tokens (past FUSED256_MIN_TOKENS, so a large input's kernels are the ones warmed): a warm
+    // fold the input's size outlasted the upload it hides behind - 5CAJ's 261 made the fold 0.2 s slower
+    if (wt > 96) { wa = std::max(1, (int)((long)wa * 96 / wt)); wt = 96; }
     std::string dir = writeWarmInput(wt, wa);
     int seg = (int)M.segs.size();
     M.load(dir);
@@ -231,6 +240,13 @@ int main(int argc, char** argv) {
     CK(cudaStreamSynchronize(STREAM));
     forgetEntries(M.unload(seg));
     std::string rm = "rm -rf '" + dir + "'"; if (system(rm.c_str())) {}
+    M.waitUploads();
+    forgetDerivedWeights();
+  }
+  if (getenv("EF2_STARTUP")) {
+    auto now = std::chrono::steady_clock::now();
+    printf("context %.0f ms, weights up%s %.0f ms\n", std::chrono::duration<double, std::milli>(tCtx - tStart).count(),
+           warming ? " and warm-up" : "", std::chrono::duration<double, std::milli>(now - tCtx).count());
   }
   if (waitInput) {          // the exporter writes model.idx last, by a rename
     std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";
@@ -243,5 +259,5 @@ int main(int argc, char** argv) {
   M.load(argv[1]);
   if (!oracle.empty()) M.load(oracle);
   printf("loaded in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tStart).count());
-  return foldInput(o, false);
+  finish(foldInput(o, false));
 }

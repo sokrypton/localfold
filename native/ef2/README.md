@@ -39,9 +39,9 @@ All nine of AlphaFold 3's loadable example jobs fold. On the covalent KRAS/sotor
 the ligand's C25 is 1.73 Å: bonded, through the declared bond.
 
 `fold` builds `ef2` if it is missing and exports the weights once into `native/ef2/weights`
-(`export_weights.mjs`, 2.9 GB float32). It then starts `ef2`, which uploads the weights and warms up
-on a synthetic input of about the right size while the input is exported. It folds with `--fast`;
-flags after `--` go to `ef2` (`--seed=`, `--steps=`, `--inputs-window=`).
+(`export_weights.mjs`, 2.9 GB float32). It then starts `ef2` while the input is exported. `ef2`
+uploads the weights and, during the upload, warms up on a synthetic input of up to 96 tokens. It folds
+with `--fast`; flags after `--` go to `ef2` (`--seed=`, `--steps=`, `--inputs-window=`).
 
 The weights come from two float32 bundles: `model-esmc-600m-f32`, and `model-esmfold2-conf-f32`.
 The second is biohub's trunk plus Synthyra's head:
@@ -164,7 +164,26 @@ Elsewhere:
 | trunk, 4 passes | 43 ms | 320 ms |
 | sampler, 11 steps | 28 ms | 48 ms |
 | confidence | 4 ms | 18 ms |
-| sequence to PDB (`fold`, cold process) | 1.15 s | 1.97 s |
+| sequence to PDB (`fold`, cold process) | 0.77 s | 1.13 s |
+
+## Start-up
+
+`fold`, sequence to PDB in a cold process: 6MRR **1.15 → 0.77 s**, 5CAJ **1.97 → 1.13 s**.
+The fold's own compute is 0.09 and 0.40 s of that. The rest:
+- **The CUDA context: 0.20 s.** Created while the input is exported (0.16 s).
+- **The weights, read with `pread` into pinned buffers rather than mapped: 0.24 s for 2.9 GB.**
+  native/af3's loader, so all three ports read this way. A mapping cost page faults to read, and
+  275 ms to tear down when the process exited, after the PDB was written. A file is mapped now only
+  when the host reads one of its entries.
+- **The warm-up runs while the weights are still arriving** (`M.uploadAsync`). Its kernels read a copy
+  still in flight, so its answers are garbage, and every weight derived from the copy is dropped
+  afterwards (`forgetDerivedWeights`: the f16 mirrors, the f16 bias copies). The fold is
+  byte-identical to one with no warm-up.
+- **The warm-up is capped at 96 tokens.** A warm fold the input's size outlasted the upload: 5CAJ's
+  261 tokens cost 0.2 s. The warm-up loads kernel modules and cuBLAS plans, and 96 tokens is already
+  in the fused kernels' range.
+
+`EF2_STARTUP=1` prints the context and upload times.
 
 ## Memory
 
