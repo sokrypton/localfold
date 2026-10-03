@@ -10,3 +10,5 @@ weights/
 *.pdb
 *_confidences.json
 weights-*/
+af3.arch
+af3.building

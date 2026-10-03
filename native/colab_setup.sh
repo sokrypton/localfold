@@ -10,8 +10,7 @@
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(ef2 af3 af2)
-cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"; arch="sm_$cc"
-echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1) ($arch)"
+echo "GPU: $(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader | head -1)"
 
 major="$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || echo 0)"
 if [ "${major:-0}" -lt 22 ]; then
@@ -21,19 +20,11 @@ fi
 
 for port in "${ports[@]}"; do
   case "$port" in
-    ef2)
-      python3 "$repo/native/fetch_bundles.py" ef2-fast-600m esmc     # (read as they are: no export)
-      (cd "$repo/native/ef2" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread src/ef2.cu \
-         -lcublas -lcublasLt -lcupti -o ef2) ;;
-    af3)
-      python3 "$repo/native/fetch_bundles.py" af3          # (read through native/af3/maps/af3.map)
-      (cd "$repo/native/af3" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread --use_fast_math src/af3.cu \
-         -lcublas -lcublasLt -lcupti -o af3) ;;
-    af2)
-      python3 "$repo/native/fetch_bundles.py" monomer multimer   # (read through native/af2/maps/*.map)
-      (cd "$repo/native/af2" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread --use_fast_math src/af2.cu \
-         -lcublas -lcublasLt -lcupti -o af2) ;;
+    ef2) python3 "$repo/native/fetch_bundles.py" ef2-fast-600m esmc ;;    # (read as they are: no export)
+    af3) python3 "$repo/native/fetch_bundles.py" af3 ;;                  # (read through native/af3/maps/af3.map)
+    af2) python3 "$repo/native/fetch_bundles.py" monomer multimer ;;     # (read through native/af2/maps/*.map)
     *) echo "unknown port $port (ef2, af3, af2)" >&2; exit 1 ;;
   esac
-  echo "$port ready"
 done
+bash "$repo/native/build.sh" "${ports[@]}"
+echo "ready: ${ports[*]}"

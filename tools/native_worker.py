@@ -79,10 +79,30 @@ def ensure_bundle(family, directory, log):
     return os.path.join(REPO, directory)
 
 
+BUILD_MARKER, BUILD_LOG = "/tmp/localfold-native-build", "/tmp/localfold-native-build.log"
+
+
+def building():
+    """Whether native/build.sh is running (its marker names a live pid)."""
+    try:
+        os.kill(int(open(BUILD_MARKER).read().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def binary(port):
+    """A port's binary - waited for while native/build.sh is still compiling it (the notebook starts the
+    build beside the service, so the first fold can arrive before it is done), refused if nothing is."""
     path = os.path.join(NATIVE, port, port)
+    started = time.time()
+    while not os.access(path, os.X_OK) and building():
+        emit("status", f"compiling the CUDA ports for this card (once a runtime) · {time.time() - started:.0f} s")
+        time.sleep(3)
     if not os.access(path, os.X_OK):
-        raise Refused(f"native/{port}/{port} is not built on this runtime - run native/colab_setup.sh")
+        said = open(BUILD_LOG).read()[-600:] if os.path.exists(BUILD_LOG) else ""
+        raise Refused(f"native/{port}/{port} is not built on this runtime - run native/build.sh"
+                      + (f" (its last build said: {said.strip()})" if said.strip() else ""))
     return path
 
 
