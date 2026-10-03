@@ -428,7 +428,7 @@ export async function buildTargetFeat(batch, weights, device) {
         // No trunk yet: the encoder zeroes both on the device.
         trunkSingleCond: null,
         trunkPairCond: null,
-      }, weights.encoder);
+      }, weights.encoder, { hostStatics: false });
 
   return targetFeatures({
     aatype: batch.aatype, profile: batch.profile, deletionMean: batch.deletionMean,

@@ -1957,7 +1957,9 @@ export class Af3AtomEncoderGpu {
       // The five static readbacks exist only when a host caller has no other
       // way to see them: not when the head still holds them, and not when it
       // is taking the device buffers directly.
-      const wantHostStatics = reuseStatic === undefined && outputs === undefined;
+      // `hostStatics: false` is a caller that wants only tokenAct (the target features).
+      const wantHostStatics = reuseStatic === undefined && outputs === undefined
+        && options.hostStatics !== false;
       const readbacks = {
         tokenAct: outputs !== undefined ? undefined
           : keep(this.allocator.allocate("atom.rb-token", tokens * perTokenChannels * 4,
@@ -2170,11 +2172,11 @@ export class Af3AtomEncoderGpu {
       return {
         tokenAct: await read(readbacks.tokenAct),
         skipConnection: await read(readbacks.skipConnection),
-        pairCond: reuseStatic?.pairCond ?? await read(readbacks.pairCond),
-        queriesCond: reuseStatic?.queriesCond ?? await read(readbacks.queriesCond),
-        keysCond: reuseStatic?.keysCond ?? await read(readbacks.keysCond),
-        queriesMask: reuseStatic?.queriesMask ?? await read(readbacks.queriesMask),
-        keysMask: reuseStatic?.keysMask ?? await read(readbacks.keysMask),
+        pairCond: wantHostStatics ? await read(readbacks.pairCond) : reuseStatic?.pairCond,
+        queriesCond: wantHostStatics ? await read(readbacks.queriesCond) : reuseStatic?.queriesCond,
+        keysCond: wantHostStatics ? await read(readbacks.keysCond) : reuseStatic?.keysCond,
+        queriesMask: wantHostStatics ? await read(readbacks.queriesMask) : reuseStatic?.queriesMask,
+        keysMask: wantHostStatics ? await read(readbacks.keysMask) : reuseStatic?.keysMask,
         // 🔴 THE SAME FIVE TENSORS, AS DEVICE BUFFERS. They are already on the
         // GPU and the decoder's next act was to upload its own copy of them -
         // 17 MiB of a 59-residue fold held twice, and read back across the bus
