@@ -164,6 +164,28 @@ static void writeConfidences(const std::string& pdb, const Trunk& t, int L, cons
   fclose(f);
 }
 
+// --tolerance=<A>: the page's early stop (src/af2/model/recycle-convergence.js, ColabFold's compute_tol) -
+// after each pass from the second on, the RMS change of every C-alpha pair distance against the last pass,
+// over the sequence mask; the fold stops when it is strictly below this. 0 runs every pass.
+static double TOLERANCE = 0;
+static double caPairChange(const std::vector<float>& a, const std::vector<float>& b, const std::vector<float>& mask, int L) {
+  double sum = 0, weights = 0;
+  for (int i = 0; i < L; ++i)
+    for (int j = 0; j < L; ++j) {
+      double w = (double)mask[i] * mask[j];
+      if (w == 0) continue;
+      double pa = 0, pb = 0;
+      for (int x = 0; x < 3; ++x) {
+        double da = a[((size_t)i * 37 + 1) * 3 + x] - a[((size_t)j * 37 + 1) * 3 + x];
+        double db = b[((size_t)i * 37 + 1) * 3 + x] - b[((size_t)j * 37 + 1) * 3 + x];
+        pa += da * da; pb += db * db;
+      }
+      double d = std::sqrt(pa) - std::sqrt(pb);
+      sum += d * d * w; weights += w;
+    }
+  return std::sqrt(sum / weights + 1e-8);
+}
+
 // one input, already loaded: the passes, the heads and the PDB. warm: the embedder, ONE block of
 // each stack, the structure module and the heads, nothing written - every kernel loaded, every
 // cuBLASLt plan and scratch buffer made, at this input's shapes
@@ -293,6 +315,21 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   // capturing costs about half a replayed pass and a replay saves a few percent of one (59 residues:
   // 100 against 107 ms), so only a long recycle run gains - as native/af3's trunk graph rule
   bool graphs = !warm && !getenv("AF2_NO_GRAPHS") && oracle.empty() && (passes >= 8 || getenv("AF2_GRAPHS"));
+  std::vector<float> previous37, seqMask;
+  double converged = -1; int ran = passes;
+  if (TOLERANCE > 0 && !warm) seqMask = std::vector<float>(M.f("seq_mask"), M.f("seq_mask") + L);
+  auto settled = [&](int pass) {           // the early stop, after a pass has run
+    if (TOLERANCE <= 0 || warm) return false;
+    CK(cudaStreamSynchronize(STREAM));
+    std::vector<float> now = download(so.pos37, (size_t)L * 37 * 3);
+    bool stop = false;
+    if (!previous37.empty()) {
+      double change = caPairChange(previous37, now, seqMask, L);
+      if (pass > 0 && change < TOLERANCE) { converged = change; ran = pass + 1; stop = true; }
+    }
+    previous37 = std::move(now);
+    return stop;
+  };
   for (int pass = 0; pass < passes; ++pass) {
     bool check = pass == 0 && !oracle.empty();
     embed(t, pass, prevRow, prevPair, prevPos);
@@ -302,6 +339,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
         CK(cudaStreamSynchronize(STREAM));
         printf("  pass %d done at %.1f ms\n", pass, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
       }
+      if (settled(pass)) break;
       continue;
     }
     if (!graph) {
@@ -317,6 +355,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       CK(cudaStreamSynchronize(STREAM));
       printf("  pass %d done at %.1f ms\n", pass, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
     }
+    if (settled(pass)) break;
   }
   CK(cudaStreamSynchronize(STREAM));
   double foldMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
@@ -358,7 +397,8 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   writeConfidences(out, t, L, mask37, aatype, asym, ri, firstAsym, plddt, pae, ptm, iptm, mean);
   printf("mean pLDDT %.2f  pTM %.4f", mean, ptm);
   if (chains) printf("  ipTM %.4f", iptm);
-  printf("  -> %s  (%d passes, %.1f ms)\n", out.c_str(), passes, foldMs);
+  printf("  -> %s  (%d passes, %.1f ms)\n", out.c_str(), ran, foldMs);
+  if (converged >= 0) printf("converged at %.2f A after %d passes\n", converged, ran);
   return 0;
 }
 
@@ -377,6 +417,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
     else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
+    else if (!strncmp(argv[i], "--tolerance=", 12)) TOLERANCE = atof(argv[i] + 12);
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
     else if (!strcmp(argv[i], "--detach-output")) DETACH = true;
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;   // L,N,E,T: warm up at those shapes meanwhile

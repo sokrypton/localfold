@@ -85,6 +85,9 @@ def cases(offline):
          "job": job([S6], ["GOL"], {0: [("SEP", 3)]})}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 9 + 6, None),
         ("af2 monomer 6mrr", {"family": "monomer", "controls": controls(**{"model-family": "monomer", "af2Model": "1"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
+        ("af2 monomer 6mrr, stopping early at 0.5 A", {"family": "monomer",
+         "controls": controls(**{"model-family": "monomer", "af2Model": "1", "tolerance": "0.5"}),
+         "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         ("af2 monomer 5caj, its crystal uploaded", {"family": "monomer",
          "controls": controls(**{"model-family": "monomer", "af2Model": "1", "recycles": "0"}),
          "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A", "filename": "5caj.pdb"})],
@@ -270,6 +273,8 @@ def main():
             problems.append(f"pLDDT {c.get('meanPlddt')} / pTM {c.get('ptm')}")
         if "status" not in kinds or kinds.count("progress") < 2:
             problems.append(f"events {kinds}")
+        if "stopping early" in name and "converged at" not in (result.get("status") or ""):
+            problems.append("the page's early stop did not stop it (or did not say so)")
         rmsd = score(result.get("pdb") or "", *reference)
         if rmsd is None or rmsd > bar:
             problems.append(f"RMSD {rmsd} past {bar} A")

@@ -15,8 +15,7 @@ What this file adds is the plumbing between them - nothing about a molecule is d
 
 🔴 WHAT IT REFUSES, IT SAYS. A sampler, a model or an input a native port does not have is a refusal
 naming it (Refused), never a nearby setting run instead: Flow (native AF3 runs diffusion), AlphaFold 2's
-models 2-5 (the page publishes them as deltas, which the native loader does not read), ESMFold2 300M,
-and AF2's early stop, which is reported rather than applied.
+models 2-5 (the page publishes them as deltas, which the native loader does not read), ESMFold2 300M.
 
 Ports: native/af3 (all seven AF3-lineage models), native/af2 (model_1_ptm, model_1_multimer_v3),
 native/ef2 (ESMFold2 600M). Each must be built (native/colab_setup.sh); a bundle not on disk is fetched.
@@ -56,9 +55,18 @@ def device_name():
         return "no GPU"
 
 
+def die_with_parent():
+    """Linux: a child gets SIGKILL when this worker goes, however it goes - Stop kills the worker (the
+    broker's way of ending a fold), and a binary left running would hold the card (tools/jax_worker.py's
+    rule, for the same reason)."""
+    import ctypes
+    import signal
+    ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
+
+
 def run(cmd, what, log, cwd=REPO):
     """A step, its output kept; a failure says the step and its last lines."""
-    done = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    done = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, preexec_fn=die_with_parent)
     log.append(f"$ {' '.join(cmd)}\n{done.stdout}{done.stderr}")
     if done.returncode != 0:
         # 🔴 A NODE STEP THAT THREW SAID WHY IN ONE SENTENCE, written for a person (the page's own readers
@@ -150,9 +158,64 @@ def token_plddt(atoms, chain_ids, res_ids):
     return [round(v, 2) for v in out]
 
 
+class Af3Server:
+    """One AF3-lineage model kept on the device between folds: native/af3's own --serve mode (a job is
+    DIR/<id>.job - the input's directory, then a flag a line - its output <id>.log, its status <id>.done).
+    A cold fold is mostly start-up - 6MRR is 0.92 s of which the fold is 0.18 on an A100: the CUDA context,
+    the 0.5 s weight upload, the kernels - and this pays it once a model."""
+
+    def __init__(self, family, bundle):
+        self.family = family
+        self.dir = os.path.join(WORK + "-serve", family)
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir)
+        self.log = open(os.path.join(self.dir, "server.log"), "w")
+        self.proc = subprocess.Popen([binary("af3"), "-", f"--serve={self.dir}", f"--bundle={bundle}",
+                                      f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}", "--fold", "--fast"],
+                                     cwd=REPO, stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
+        self.count = 0
+        deadline = time.time() + 300
+        while "af3: serving" not in open(self.log.name).read():
+            if self.proc.poll() is not None or time.time() > deadline:
+                raise RuntimeError("the AF3 server did not start: " + open(self.log.name).read()[-400:])
+            time.sleep(0.05)
+
+    def fold(self, inputs, flags):
+        self.count += 1
+        base = os.path.join(self.dir, f"{self.count:06d}")
+        with open(base + ".tmp", "w") as handle:
+            handle.write("\n".join([inputs, *flags]) + "\n")
+        os.rename(base + ".tmp", base + ".job")
+        while not os.path.exists(base + ".done"):
+            if self.proc.poll() is not None:
+                raise RuntimeError("the AF3 server exited: " + open(self.log.name).read()[-400:])
+            time.sleep(0.005)
+        said = open(base + ".log").read()
+        if int(open(base + ".done").read().strip() or 1) != 0:
+            raise RuntimeError("the fold failed: " + "\n".join(said.strip().splitlines()[-4:]))
+        return said
+
+    def close(self):
+        if self.proc.poll() is None:
+            with open(os.path.join(self.dir, "quit.tmp"), "w") as handle:
+                handle.write("quit\n")
+            os.rename(os.path.join(self.dir, "quit.tmp"), os.path.join(self.dir, "~quit.job"))
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
 class Worker:
     def __init__(self):
         self.device = device_name()
+        self.server = None
+
+    def close_server(self):
+        """...and stopped before any other model folds, so two never share the card."""
+        if self.server is not None:
+            self.server.close()
+            self.server = None
 
     def fold(self, job):
         controls = job.get("controls", {})
@@ -260,8 +323,7 @@ class Worker:
                       f"--bundle={bundle}/manifest.json", f"--job={job_path}", f"--max-msa={requested}", *flags]
             run(export, "featurising", log, cwd=os.path.join(NATIVE, "af3"))
             steps = int(controls.get("af3-count") or 0)
-            fold = [binary("af3"), inputs, f"--bundle={bundle}", f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}",
-                    "--fold", "--fast", f"--out={out_pdb}"]
+            fold = [f"--out={out_pdb}"]                  # (flags for the resident server's job)
             if steps:
                 # ...the page's floor: a modified residue's atoms stay compressed below sixteen steps (app.js)
                 spec = json.loads(job["job"])
@@ -272,6 +334,7 @@ class Worker:
             if recycles not in (None, ""):
                 fold.append(f"--recycles={int(recycles)}")
         elif port == "af2":
+            self.close_server()
             bundle = ensure_bundle(family, "model" if family == "monomer" else "model-multimer", log)
             export = [*NODE, os.path.join(NATIVE, "af2", "export_input.mjs"), inputs, f"--bundle={bundle}",
                       f"--job={job_path}", f"--max-msa={508 if requested == 512 else requested}",
@@ -281,16 +344,27 @@ class Worker:
             run(export, "featurising", log)
             model = "model_1_ptm" if family == "monomer" else "model_1_multimer_v3"
             fold = [binary("af2"), inputs, f"--bundle={bundle}",
-                    f"--map={os.path.join(NATIVE, 'af2', 'maps', model + '.map')}", "--fast", f"--out={out_pdb}"]
+                    f"--map={os.path.join(NATIVE, 'af2', 'maps', model + '.map')}", "--fast", f"--out={out_pdb}",
+                    f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
         else:
+            self.close_server()
             trunk = ensure_bundle("ef2-fast-600m", "model-esmfold2-int5", log)
             tower = ensure_bundle("esmc", "model-esmc-600m-int3", log)
             run([*NODE, os.path.join(NATIVE, "ef2", "export_input.mjs"), inputs, f"--job={job_path}"], "featurising", log)
             fold = [binary("ef2"), inputs, f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                     f"--seed={seed}", f"--out={out_pdb}"]
         emit("progress", 0.15)
-        emit("status", f"{family} on CUDA ({self.device}) · folding")
-        said = run(fold, "the fold", log)
+        if port == "af3":
+            if self.server is None or self.server.family != family or self.server.proc.poll() is not None:
+                self.close_server()
+                emit("status", f"{family} on CUDA ({self.device}) · loading the weights onto the card")
+                self.server = Af3Server(family, bundle)
+            emit("status", f"{family} on CUDA ({self.device}) · folding")
+            said = self.server.fold(inputs, fold)
+            log.append(said)
+        else:
+            emit("status", f"{family} on CUDA ({self.device}) · folding")
+            said = run(fold, "the fold", log)
         if not any("pLDDT" in line for line in said.splitlines()):
             raise RuntimeError("the fold printed no confidence line")
         emit("progress", 1.0)
@@ -303,9 +377,10 @@ class Worker:
         export_said = "\n".join(log)
         for found in re.findall(r"template[^\n]*?(\d+)/(\d+) residues", export_said):
             result["status"] += f" · template {found[0]}/{found[1]}"
-        if port == "af2" and float(controls.get("tolerance") or 0) > 0:
-            # 🔴 SAID, NOT APPLIED: native AF2 runs every pass, where the page stops on a settled structure
-            result["status"] += " · every pass run (the CUDA AF2 has no early stop)"
+        converged = re.search(r"converged at ([0-9.]+) A after (\d+) passes", said)
+        if converged:
+            # ...worded as the WebGPU fold words it
+            result["status"] += f" · converged at {converged.group(1)} Å after {converged.group(2)} passes"
         return result
 
     def collect(self, pdb_path, family, port, job, seconds):

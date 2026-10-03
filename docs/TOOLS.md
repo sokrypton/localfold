@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-349 tools. `tools/fixtures/` is data and is not listed.
+352 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -291,13 +291,14 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (89)
+## `tools/` - everything else (92)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
 
 - **`add_distogram_head.py`** - Fold AlphaFold 2's distogram head into an exported bundle, as real tensors.
 - **`analyse_quantisation.py`** - What does each quantisation scheme cost AF3's weights, per bit of storage?
+- **`append_template_single.py`** - Add AlphaFold 2's template SINGLE features to the published monomer bundles, leaving every shard already there byte-identical.
 - **`archive-roundtrip.py`** - Fold, download the archive, upload it back, fold again - and compare.
 - **`audit-knobs.py`** - Ask every tuning knob whether it does anything at all.
 - **`benchmark-a3m-model.js`** - A whole AF2 monomer fold over the 59-residue A3M fixture, timed per recycle.
@@ -327,6 +328,7 @@ go through CDP, and the deploy.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
+- **`check-native-worker.py`** - The CUDA backend's worker, folding for real: npm run test:native.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
 - **`check-smiles-batch.mjs`** - A SMILES ligand featurises to the SAME BATCH its CCD code does, field by field.
@@ -367,6 +369,7 @@ go through CDP, and the deploy.
 - **`jax_worker.py`** - The JAX backend: af3-any-model folding a LocalFold job, speaking the bridge.
 - **`mobile-layout.py`** - index.html at real phone widths: it must FIT, not merely not overflow.
 - **`model-terms.py`** - The model gate: the AlphaFold 3 terms dialog, and `?model=` in the URL.
+- **`native_worker.py`** - The CUDA backend: LocalFold's native ports folding a page's job, speaking the bridge.
 - **`negate-bundle-tensors.py`** - Negate NAMED tensors in a float32 bundle, in place.
 - **`pack_delta_model.py`** - Store one AlphaFold 2 model as a DELTA on another, at three bits a weight.
 - **`pae-from-distogram.py`** - Can a PAE matrix be estimated from a distogram and a structure?
