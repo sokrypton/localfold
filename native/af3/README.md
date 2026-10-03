@@ -335,6 +335,14 @@ of one arm (it throttles to ~1 GHz under load), so interleave arms there.
 
 ## Tried and not taken
 
+- **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
+  C = 256, 384, 512 for protenix2, OpenDDE and IntelliFold-2, whose unfused path spends ~a third of a fold
+  in LayerNorm, gate, SwiGLU and add passes): no gain - protenix2's trunk 1269 against 1259 ms, OpenDDE's
+  **2267 against 1928** (its 384-wide kernel fits two warps a block and took 704 ms). Every block re-streams
+  the 4C x C projection weights for its 64-128 rows (512 KB a block at C 256) where cuBLAS reads them once:
+  at these widths the extra memory passes are the cheaper side. A wide fusion needs the weights read once,
+  not a wider template.
+
 - **A split-K "skinny" GEMM for the denoiser's few-row projections** (68 rows x 768 x 3072, where
   cuBLAS reads 4.7 MB of weights in 9 us against a ~3.5 us bandwidth floor). Correct to 5e-7, and
   its main loop plus partial writes ran in 6 us - but the cross-slice reduction (last block of a
