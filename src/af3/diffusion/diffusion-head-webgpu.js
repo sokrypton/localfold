@@ -78,46 +78,6 @@ function headNorms(weights) {
 }
 
 /**
- * 🔴 `scale` IS [scale | offset], ALWAYS. Ten of boltz2's diffusion LayerNorms
- * carry a trained offset where AlphaFold 3's carry none, and a zero offset IS
- * the scale-only LayerNorm - so both this and the two shaders below read the
- * second half unconditionally and no caller has to know which bundle it has.
- * `packNormWeights` builds it.
- */
-function normaliseAndProject(input, rows, channels, outChannels, scale, projection) {
-  const output = new Float32Array(rows * (projection === null ? channels : outChannels));
-  for (let row = 0; row < rows; row += 1) {
-    const base = row * channels;
-    let total = 0;
-    for (let c = 0; c < channels; c += 1) total += input[base + c];
-    const mean = total / channels;
-    let variance = 0;
-    for (let c = 0; c < channels; c += 1) {
-      const d = input[base + c] - mean;
-      variance += d * d;
-    }
-    const inverse = 1 / Math.sqrt(variance / channels + 1e-5);
-    if (projection === null) {
-      for (let c = 0; c < channels; c += 1) {
-        output[base + c] = (input[base + c] - mean) * inverse * scale[c]
-          + scale[channels + c];
-      }
-      continue;
-    }
-    for (let out = 0; out < outChannels; out += 1) {
-      let value = 0;
-      for (let c = 0; c < channels; c += 1) {
-        value += ((input[base + c] - mean) * inverse * scale[c] + scale[channels + c])
-          * projection[c * outChannels + out];
-      }
-      output[row * outChannels + out] = value;
-    }
-  }
-  return output;
-}
-
-
-/**
  * LayerNorm - scale AND offset, packed into one binding - then a projection.
  * One workgroup a row.
  *
@@ -292,12 +252,14 @@ export class Af3DiffusionHeadGpu {
    * track, the projection of it, the encoder's token activations and its skip
    * connection. None of them is ever LOOKED at on the host.
    *
-   * 🔴 AND THE PAIR IS NOT AMONG THEM, ON PURPOSE. It is a per-TRUNK tensor
-   * that both the encoder and the transformer already cache by the identity of
-   * the host array, so the first call of a fold reads it back once and every
-   * step after that costs nothing. That first call is also why the chain is
-   * only used once the pair cache is warm: a device-chained first call would
-   * have no host array to key those caches on.
+   * 🔴 AND THE FIRST CALL OF A FOLD IS CHAINED TOO. It used to run unchained,
+   * awaiting each stage and reading the encoder's five statics back (14 MB at
+   * 262 tokens), because the pair conditioning was a host array the encoder's
+   * and the transformer's caches were keyed on. The pair lives in
+   * `head.pair-cond` now and the caches key on that object, and the decoder
+   * takes the encoder's statics as device buffers - so nothing needed them on
+   * the host. 262 tokens on the A100: the first step 159-191 ms -> 60-82, a
+   * warm fold 1.63 -> 1.54 s, pLDDT identical to sixteen digits.
    */
   #chain;
 
@@ -650,17 +612,11 @@ export class Af3DiffusionHeadGpu {
         && this.#conditioningPair?.tokens === tokens
         ? this.#conditioningPair.pair : undefined);
 
-    // 🔴 THE CHAIN ONLY RUNS ONCE THE PAIR CACHE IS WARM. See #chain: the
-    // first call of a fold has to read the pair conditioning back, because it
-    // is the host array the encoder's and the transformer's own caches are
-    // keyed on. That call is one step in two hundred.
-    const chained = cachedPair !== undefined;
-
     const { subsets, queries } = input.shape;
     const queryRows = subsets * queries;
     const shapeKey = `${tokens}:${dense}:${queryRows}:${weights.encoder.channels}`
       + `:${weights.perTokenChannels}:${weights.seqChannels}`;
-    const chain = chained ? {
+    const chain = {
       condSingle: this.#chainBuffer(shapeKey, "head.cond-single",
                                     tokens * weights.seqChannels * 4),
       act: this.#chainBuffer(shapeKey, "head.act", tokens * weights.perTokenChannels * 4),
@@ -670,23 +626,14 @@ export class Af3DiffusionHeadGpu {
                               queryRows * weights.encoder.channels * 4),
       normalised: this.#chainBuffer(shapeKey, "head.normalised",
                                     tokens * weights.perTokenChannels * 4),
-    } : undefined;
+    };
     // One scope over the whole chain, settled at the decoder's readback - the
     // one boundary a denoiser step already synchronises at.
-    const deferred = chained ? new DeferredValidation(this.device, "diffusion head") : undefined;
+    const deferred = new DeferredValidation(this.device, "diffusion head");
 
-    // 🔴 POOLED ONLY WHEN CHAINED, AND THAT IS ABOUT THE PEAK. A pooled
-    // allocator holds its buffers until something drops the pool, so on the
-    // unchained first call - the one that still allocates the seven readbacks
-    // - the conditioning's and the encoder's working sets were still resident
-    // while the decoder ran, and a 68-token fold's peak rose 48 MiB for a
-    // moment that lasts one step in two hundred. The chained steps need the
-    // pool because they return while the work is in flight; the first call
-    // waits for everything and can use a throwaway allocator, exactly as it
-    // did before.
-    const conditioner = chained
-      ? (this.#conditioner ??= new Af3DiffusionConditioningGpu(this.device, { pool: true }))
-      : new Af3DiffusionConditioningGpu(this.device);
+    // Pooled, because every stage returns while its work is in flight and a non-pooling release()
+    // destroys a buffer the queue may still read; the pools are dropped at the end of the call.
+    const conditioner = (this.#conditioner ??= new Af3DiffusionConditioningGpu(this.device, { pool: true }));
     // The pair conditioning's home on the device, on a fold's first call -
     // unless the caller supplied its own (OpenDDE), which stays a host array.
     let pairOutput;
@@ -710,8 +657,8 @@ export class Af3DiffusionHeadGpu {
         features: input.features, dialect: input.dialect,
       }, weights.conditioning, {
         reusePair: cachedPair,
-        ...(pairOutput !== undefined ? { outputs: { pair: pairOutput } } : {}),
-        ...(chained ? { outputs: { single: chain.condSingle }, validation: deferred } : {}),
+        outputs: { single: chain.condSingle, ...(pairOutput !== undefined ? { pair: pairOutput } : {}) },
+        validation: deferred,
       }));
     if (cachedPair === undefined) {
       // A new trunk means a new fold: drop the encoder's device-side cache too,
@@ -733,9 +680,7 @@ export class Af3DiffusionHeadGpu {
       }
     }
 
-    const atomEncoder = chained
-      ? (this.#encoder ??= new Af3AtomEncoderGpu(this.device, { pool: true }))
-      : new Af3AtomEncoderGpu(this.device);
+    const atomEncoder = (this.#encoder ??= new Af3AtomEncoderGpu(this.device, { pool: true }));
     const encoded = await stage("atom-encoder", () =>
       atomEncoder.run({
         shape: input.shape, dialect: input.dialect,
@@ -762,10 +707,8 @@ export class Af3DiffusionHeadGpu {
         // ...and the DEVICE-side half of the same idea: the encoder's static
         // tensors stay on the GPU between calls instead of being rebuilt.
         staticCache: this.#encoderBuffers,
-        ...(chained
-          ? { outputs: { tokenAct: chain.tokenAct, skipConnection: chain.skip },
-              validation: deferred }
-          : {}),
+        outputs: { tokenAct: chain.tokenAct, skipConnection: chain.skip },
+        validation: deferred,
       }));
     // ...cached under the same identity rule as the pair conditioning above,
     // and invalidated by the same thing: a new fold brings a new trunk array.
@@ -782,61 +725,37 @@ export class Af3DiffusionHeadGpu {
       };
     }
 
-    const projected = await stage("single-projection", () => this.#normaliseAndProject(
-      chained ? chain.condSingle : cond.single,
+    await stage("single-projection", () => this.#normaliseAndProject(
+      chain.condSingle,
       tokens, weights.seqChannels, weights.perTokenChannels,
       headNorms(weights).singleCondEmbedding,
       weights.singleCondEmbeddingProjection,
-      chained ? { into: chain.act, validation: deferred } : {}));
-    let act;
-    if (chained) {
-      // 🔴 A DISPATCH, NOT A LOOP OVER A COPY. The two halves of the
-      // transformer's input are produced by the two stages above, both on the
-      // device; adding them on the host would mean reading both back.
-      await this.#addInto(chain.act, chain.tokenAct, tokens * weights.perTokenChannels,
-                          deferred);
-      act = chain.act;
-    } else {
-      // ...in place: `encoded.tokenAct` is this call's own readback and
-      // nothing reads it again.
-      act = encoded.tokenAct;
-      for (let index = 0; index < act.length; index += 1) act[index] += projected[index];
-    }
+      { into: chain.act, validation: deferred }));
+    // 🔴 A DISPATCH, NOT A LOOP OVER A COPY. The two halves of the
+    // transformer's input are produced by the two stages above, both on the
+    // device; adding them on the host would mean reading both back.
+    await this.#addInto(chain.act, chain.tokenAct, tokens * weights.perTokenChannels,
+                        deferred);
 
     this.#transformer ??= new Af3DiffusionTransformerGpu(this.device);
     const transformed = await stage("transformer", () =>
       this.#transformer.run(
-        act, chained ? chain.condSingle : cond.single, cond.pair, input.seqMask, tokens,
+        chain.act, chain.condSingle, cond.pair, input.seqMask, tokens,
         this.#transformerWeights(weights),
-        chained ? { validation: deferred, keepOnDevice: true } : {}));
+        { validation: deferred, keepOnDevice: true }));
 
-    // 🔴 THIS ONE STAYS ON THE CPU, AND THE DIFFERENCE IS THE PROJECTION. With
-    // `null` for it this is a LayerNorm and nothing else - 59 rows of 768, too
-    // small to be worth a dispatch, and measured at 0 ms. The one above is a
-    // 384x768 matmul and was 58.
-    const normalised = await stage("output-norm", async () => {
-      if (!chained) {
-        return normaliseAndProject(
-          transformed.output, tokens, weights.perTokenChannels, weights.perTokenChannels,
-          headNorms(weights).output, null);
-      }
-      await this.#normaliseOnly(transformed.outputBuffer, chain.normalised, tokens,
-                                weights.perTokenChannels,
-                                headNorms(weights).output, deferred);
-      return undefined;
-    });
+    await stage("output-norm", () => this.#normaliseOnly(transformed.outputBuffer,
+      chain.normalised, tokens, weights.perTokenChannels, headNorms(weights).output, deferred));
 
     const decoded = await stage("atom-decoder", () =>
-      new Af3AtomDecoderGpu(this.device).run(normalised, encoded, input, weights.decoder,
+      new Af3AtomDecoderGpu(this.device).run(undefined, encoded, input, weights.decoder,
         { staticCache: this.#decoderBuffers,
-          ...(chained
-            ? { deviceInputs: { skipConnection: chain.skip, tokenAct: chain.normalised } }
-            : {}) }));
+          deviceInputs: { skipConnection: chain.skip, tokenAct: chain.normalised } }));
     // 🔴 SETTLED HERE AND NOWHERE EARLIER. The decoder's readback is the one
     // boundary a denoiser step already synchronises at, so every scope the
     // chain opened is read for free; opening and awaiting them per stage is
     // exactly the round trip this chain exists to remove.
-    await deferred?.settle();
+    await deferred.settle();
     // 🔴 AND THE POOLS ARE DROPPED AT THE END OF EVERY STEP. They exist so
     // that a stage can return while its work is still in flight - a
     // non-pooling release() DESTROYS, and destroying a buffer the queue is

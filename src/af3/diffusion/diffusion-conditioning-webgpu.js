@@ -979,7 +979,7 @@ export class Af3DiffusionConditioningGpu {
       if (deferred !== undefined) {
         deferred.end("diffusion conditioning");
         return {
-          pair: reusePair, single: undefined, singleBuffer: outSingle,
+          pair: reusePair ?? pair, single: undefined, singleBuffer: outSingle,
           elapsedMilliseconds: performance.now() - start,
           memory: this.allocator.snapshot(),
         };
