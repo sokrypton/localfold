@@ -4136,3 +4136,9 @@ one byte of the final file's. `LOCALFOLD_NATIVE_FRAMES=0` (the notebook's
 `cuda_frames`) or `frames: false` in a request turns it off. `test:native`
 holds every port to what it streams and the reader's viewer to frames carrying
 their contact maps and PAE.
+
+On a Colab T4 (2026-10-03), the same gate: every port streams what it streams
+on the A100 (AF3 25 frames and 4 contact maps, AF2 each pass with its scores,
+PAE and contacts, ESMFold2 11 frames and its map), every structure within 0.01 Å
+of the A100's, and the reader's page holds every frame with its contact map -
+3-4 s click to result once the bundle is on the runtime.
