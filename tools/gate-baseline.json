@@ -2,7 +2,7 @@
   "adapter": "nvidia / ampere",
   "arms": {
     "stock": {
-      "AF2": "\"checksum\": -1308439",
+      "AF2": "\"checksum\": -1325647",
       "AF3": "\"meanPlddt\": 85.83481898955768",
       "OpenDDE": "\"meanPlddt\": 92.03821231430001",
       "ESMFold2": "\"meanPlddt\": 53.834",
