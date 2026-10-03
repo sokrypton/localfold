@@ -212,3 +212,22 @@ whenever the tool is fold-opendde.js or takes `--sequence=`/`--target=`:
 `SyntaxError: Unexpected token 'o', "not found" is not valid JSON` - the
 server's 404 body parsed as a manifest. The fold.js `--model=` rows skip
 correctly.
+
+## 🔴 ROUND SEVEN ASK: the register-tiled attentions (2026-10-03)
+
+`gridAttendTiled` (AF3's `grid.attend`) and `attentionTiled` (AF2's flash attentions) are the
+register-tiled vector kernels in docs/A100.md's last section - 1.32x to 1.46x on the A100's STOCK
+path, which is the path an M2 always runs (no matrix units at 16x16). They are set in the ampere prior
+only, because src/kernels/attention.js records a kernel on this part that got 4.7x SLOWER when a lane
+held two queries' registers, and this one holds sixteen scores and sixteen accumulators a lane.
+Worth one run each way:
+
+```
+node tools/gpu-chrome.mjs tools/gpu/bench-trunk.js --model=/model-af3-int5/manifest.json --tokens=200 \
+  --msa=1 --passes=1 --profile --tune-json='{"gridAttendTiled":true}'      # and false
+node tools/gpu-chrome.mjs tools/gpu/profile-af2-block.js --length=200 --sequences=128 \
+  --tune-json='{"attentionTiled":true}'                                     # and false
+```
+
+and `check-af3-grid-attention.js --tiled` / `check-evoformer-attention.js --dimension=32
+--tune-json='{"attentionTiled":true}'` for the answers. If it wins there it belongs in DEFAULT_TUNING.
