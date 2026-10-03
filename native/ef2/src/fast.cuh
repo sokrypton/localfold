@@ -190,7 +190,10 @@ __global__ void gateMulAddHK(float* pair, const float* out, const half* pg, size
 inline void triangleFusedIn(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing);
 inline void triangleFast(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
   size_t P = (size_t)L * L;
-  if (FUSED && C == 256 && L >= FUSED_MIN_TOKENS) { triangleFusedIn(pair, mask, L, C, Tn, outgoing); return; }
+  // (its 4-warp form takes 64 rows and two weight stages - over a T4's 64 KB a block: the plain path there)
+  if (FUSED && C == 256 && L >= FUSED_MIN_TOKENS && fitsSmem((size_t)64 * (256 + 8) * 2 + 2 * tiStage(256))) {
+    triangleFusedIn(pair, mask, L, C, Tn, outgoing); return;
+  }
   half* xn = scratch<half>("ftri.xn", P * C);
   layerNormH(pair, xn, P, C, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"));
   half* pg = scratch<half>("ftri.pg", P * 5 * C);
@@ -255,7 +258,7 @@ void triInFused(const float* pair, const float* mask, const std::string& Tn, hal
   size_t pp = (size_t)np * np;
   size_t smem = (size_t)R * (CW + 8) * 2 + 2 * tiStage(CW);
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(triInK<CW, WARPS, half>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((triInK<CW, WARPS, half>), (int)smem); attr = true; }
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", CW, {{"f/" + Tn + "projection", 2 * CW, false},
                                                                     {"f/" + Tn + "gate", 2 * CW, false}});
   triInK<CW, WARPS, half><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
@@ -275,7 +278,8 @@ inline void triangleFusedIn(float* pair, const float* mask, int L, int C, const 
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
   half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
   half* t2 = scratch<half>("ftri.t2", plane * C);
-  if (plane / 64 >= 54 * 8) triInFused<8>(pair, mask, Tn, a, b, t2, L, Lp, plane);     // writes the padding itself
+  if (plane / 64 >= 54 * 8 && fitsSmem((size_t)128 * (256 + 8) * 2 + 2 * tiStage(256)))
+    triInFused<8>(pair, mask, Tn, a, b, t2, L, Lp, plane);     // writes the padding itself
   else triInFused<4>(pair, mask, Tn, a, b, t2, L, Lp, plane);
   float* prod = scratch<float>("ftri.prod", plane * C);
   const float one = 1.f, zero = 0.f;

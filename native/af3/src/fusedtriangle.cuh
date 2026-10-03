@@ -97,7 +97,7 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
         cpAsync16(w0 + k * LDW + c, Wg + (size_t)k * C + (j - C / 16) * TI_NC + c, true);
       }
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   issue(0, 0);
   lnRowsToShared<C, R, WARPS>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
@@ -110,8 +110,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
   float m0 = pr0 != SIZE_MAX ? mask[pr0] : 0.f, m1 = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
   for (int j = 0; j < steps; ++j) {
     int st = j & 1;
-    if (j + 1 < steps) { issue(j + 1, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (j + 1 < steps) { issue(j + 1, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncthreads();
     bool gating = j >= C / 16;
     const half *w0 = W0(st), *w1 = W1(st);
@@ -188,14 +188,14 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
     int k = t / (C / 8), c = (t % (C / 8)) * 8;
     cpAsync16(Ws + k * LDW + c, Wout + (size_t)k * C + c, true);
   }
-  asm volatile("cp.async.commit_group;");
+  cpCommit();
   for (int t = threadIdx.x; t < C * (R / PV); t += NTH) {           // 16 bytes a thread
     int c = t / (R / PV), r = (t % (R / PV)) * PV;
     size_t row = row0 + r;
     cpAsync16(Ps + c * LDP + r, prod + (size_t)c * cs + (row < cs ? row : 0), row < cs);
   }
-  asm volatile("cp.async.commit_group;");
-  asm volatile("cp.async.wait_group 0;");
+  cpCommit();
+  cpWait<0>();
   __syncthreads();
   for (int r = warp; r < R; r += WARPS) {                            // the center norm, a warp a row
     float v[C / 32]; float s = 0.f;
@@ -279,15 +279,15 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
       size_t row = row0 + r;
       cpAsync16(Ps + c * LDP + r, prod + (size_t)c * cs + (row < cs ? row : 0), row < cs);
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   size_t tile = blockIdx.x;
-  if (tile < tiles) issue(tile, 0); else asm volatile("cp.async.commit_group;");
+  if (tile < tiles) issue(tile, 0); else cpCommit();
   for (int it = 0; tile < tiles; ++it, tile += gridDim.x) {
     int st = it & 1;
     size_t next = tile + gridDim.x;
-    if (next < tiles) { issue(next, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (next < tiles) { issue(next, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     // the epilogue's operands, loaded now so the norm and the GEMM cover their latency (one block
     // an SM: nothing else would)
     size_t r0 = tile * R + warp * 16 + g, r1 = r0 + 8;
@@ -382,7 +382,7 @@ void triInAt(const float* pair, const float* mask, const std::string& pre, const
   size_t pp = (size_t)np * np;
   size_t smem = (size_t)R * (C + 8) * 2 + 2 * tiStage(C);
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(triInK<C, WARPS, TA>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((triInK<C, WARPS, TA>), (int)smem); attr = true; }
   triInK<C, WARPS, TA><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
     a, b, t2, n, np, cs);
@@ -404,7 +404,7 @@ void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pa
     size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)2 * C * (R + 16 / sizeof(TP)) * sizeof(TP);
     static int grid = 0;
     if (!grid) {
-      CK(cudaFuncSetAttribute(triOutPK<C, TO_WARPS, TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+      smemAttr((triOutPK<C, TO_WARPS, TP>), (int)smem);
       int perSm = 0, sms = 0;
       CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, triOutPK<C, TO_WARPS, TP>, 32 * TO_WARPS, smem));
       CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
@@ -417,7 +417,7 @@ void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pa
   }
   size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 16 / sizeof(TP)) * sizeof(TP);
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(triOutK<C, TO_WARPS, TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((triOutK<C, TO_WARPS, TP>), (int)smem); attr = true; }
   triOutK<C, TO_WARPS, TP><<<(unsigned)((pp + R - 1) / R), 32 * TO_WARPS, smem, STREAM>>>(
     prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np, cs);
 }
@@ -438,10 +438,10 @@ __global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__
     int k = t / (N / 8), c = (t % (N / 8)) * 8;
     cpAsync16(Ws + k * LDW + c, Wp + (size_t)k * N + c, true);
   }
-  asm volatile("cp.async.commit_group;");
+  cpCommit();
   lnRowsToShared<C, R, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
                               lnScale, lnOffset, Xs, LDX, warp, lane);
-  asm volatile("cp.async.wait_group 0;");
+  cpWait<0>();
   __syncthreads();
   float acc[N / 8][4] = {};
 #pragma unroll
@@ -474,7 +474,7 @@ inline void lnHeads128(const float* x, const std::string& scale, const std::stri
   constexpr int C = 128, WARPS = 8, R = 16 * WARPS;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * (N + 8) * 2 + (size_t)N * (R + 4) * 4;
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(lnHeadsK<C, N, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((lnHeadsK<C, N, WARPS>), (int)smem); attr = true; }
   lnHeadsK<C, N, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, W(scale), W(offset), Wh(w), out, rows);
 }
 
@@ -501,7 +501,7 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
       int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
       cpAsync16(w + k * LDW + c, Wq + (size_t)k * NQ + j * NC + c, true);
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   issue(0, 0);
   lnRowsToShared<C, R, WARPS>(pair, [&](int r) {
@@ -520,8 +520,8 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
   const int chunks = NQ / NC;
   for (int j = 0; j < chunks; ++j) {
     int st = j & 1;
-    if (j + 1 < chunks) { issue(j + 1, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (j + 1 < chunks) { issue(j + 1, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncthreads();
     const half* w = Wst + st * C * LDW;
     float acc[NC / 8][4] = {};
@@ -547,8 +547,8 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
       int k = t / 2, c = (t % 2) * 8;
       cpAsync16(Wbs + k * 24 + c, Wb + (size_t)k * 16 + c, true);
     }
-    asm volatile("cp.async.commit_group;");
-    asm volatile("cp.async.wait_group 0;");
+    cpCommit();
+    cpWait<0>();
     __syncthreads();
     float acc[2][4] = {};
 #pragma unroll
@@ -588,8 +588,8 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
     size_t q = row0 + r;
     cpAsync16(Xs + r * LDX + c, gathered + (q < rows ? q : 0) * WD + c, q < rows);
   }
-  asm volatile("cp.async.commit_group;");
-  asm volatile("cp.async.wait_group 0;");
+  cpCommit();
+  cpWait<0>();
   __syncthreads();
   float acc[NT][4] = {};
 #pragma unroll
@@ -623,7 +623,7 @@ void gridInAt(const float* pair, const std::string& pre, const std::string& wq, 
   constexpr int C = 128, NQ = 512, R = 16 * WARPS;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * C * (64 + 8) * 2 + (size_t)C * 24 * 2;
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(gridInK<C, NQ, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((gridInK<C, NQ, WARPS>), (int)smem); attr = true; }
   gridInK<C, NQ, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wq), out, n, q0, rows, tr, Wb, bias, heads, stride,
     swap);
@@ -642,7 +642,7 @@ void gridOutAt(const half* gathered, const std::string& w, float* pair, int n, s
   constexpr int C = 128, WD = 128, R = 16 * WARPS;
   size_t smem = (size_t)WD * (C + 8) * 2 + (size_t)R * (WD + 8) * 2;
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(gridOutK<C, WD, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((gridOutK<C, WD, WARPS>), (int)smem); attr = true; }
   gridOutK<C, WD, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wh(w), pair, n, q0, rows, tr);
 }
 inline void gridOut128(const half* gathered, const std::string& w, float* pair, int n, size_t q0, size_t rows, bool tr) {

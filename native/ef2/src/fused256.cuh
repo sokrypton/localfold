@@ -35,7 +35,7 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
       cpAsync16(a + k * LDA + c, W1 + (size_t)k * 2 * I + j * NC + c, true);
       cpAsync16(b + k * LDA + c, W1 + (size_t)k * 2 * I + I + j * NC + c, true);
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   lnRowsToShared<C, R, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
                               lnScale, lnOffset, Xs, LDX, warp, lane);
@@ -47,8 +47,8 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
   issue(0, 0);
   for (int j = 0; j < chunks; ++j) {
     int st = j & 1;
-    if (j + 1 < chunks) { issue(j + 1, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (j + 1 < chunks) { issue(j + 1, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncthreads();
     const half *a = Wa(st), *b = Wb(st);
     float ha[NC / 8][4] = {}, hb[NC / 8][4] = {};
@@ -141,7 +141,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restri
       int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
       cpAsync16(w + k * LDW + c, Wout + (size_t)k * C + n * NC + c, true);
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   issue(0, 0);
   // the output chunk, staged so the gate and the residual go out 16 bytes a thread, a row's 32 columns
@@ -152,8 +152,8 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restri
   constexpr int chunks = C / NC;
   for (int n = 0; n < chunks; ++n) {
     int st = n & 1;
-    if (n + 1 < chunks) { issue(n + 1, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (n + 1 < chunks) { issue(n + 1, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncthreads();
     const half* w = Ws(st);
     float acc[NC / 8][4] = {};
@@ -233,7 +233,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
         cpAsync16(w0 + k * LDW + c, Wg + (size_t)k * C + (j - abSteps) * NC + c, true);
       }
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   lnRowsToShared<C, R, WARPS>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
   __syncthreads();
@@ -247,8 +247,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   float m0 = pr0 != SIZE_MAX ? mask[pr0] : 0.f, m1 = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
   for (int j = 0; j < steps; ++j) {
     int st = j & 1;
-    if (j + 1 < steps) { issue(j + 1, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (j + 1 < steps) { issue(j + 1, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncthreads();
     bool gating = j >= abSteps;
     const half *w0 = W0(st), *w1 = W1(st);
@@ -304,12 +304,16 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 // ---------------------------------------------------------------- launchers
 inline bool FUSED256 = true;      // --no-fused256: the cuBLASLt path these replace
 inline int FUSED256_MIN_TOKENS = 80;
+// their shared memory: 66-80 KB a block, beyond a T4's 64 KB (there the unfused f16 path runs)
+constexpr size_t TRI_IN256_SMEM = (size_t)128 * (256 + 8) * 2, TRI_OUT256_SMEM = (size_t)256 * 65 * 4 + 2 * 64 * 4,
+                 TRANS_UP256_SMEM = (size_t)2 * 2 * 256 * (32 + 8) * 2;
+inline bool fused256Fits() { return fitsSmem(std::max({TRI_IN256_SMEM, TRI_OUT256_SMEM, TRANS_UP256_SMEM})); }
 template <int WARPS>
 void transitionUp(const float* x, const float* sc, const float* of, const half* W1, half* gated, size_t rows, int I) {
   constexpr int C = 256, R = 16 * WARPS;
   size_t smem = std::max((size_t)R * (C + 8) * 2, 2 * (size_t)2 * C * (32 + 8) * 2);   // 82 KB: two blocks an SM
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(transitionUpK<C, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((transitionUpK<C, WARPS>), (int)smem); attr = true; }
   transitionUpK<C, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, sc, of, W1, gated, rows, I);
 }
 template <int WARPS>
@@ -318,7 +322,7 @@ void triangleOut(const float* prod, const float* sc, const float* of, const half
   constexpr int C = 256, R = 16 * WARPS;
   size_t smem = (size_t)C * (R + 1) * 4 + 2 * (size_t)R * 4;
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(triangleOutK<C, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((triangleOutK<C, WARPS>), (int)smem); attr = true; }
   size_t P = (size_t)L * L;
   triangleOutK<C, WARPS><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, Wout, t2, pair, L, Lp);
 }
@@ -327,7 +331,7 @@ void triIn256(const float* pair, const float* mask, const std::string& Tn, half*
   constexpr int C = 256, R = 16 * WARPS;
   size_t pp = (size_t)np * np, smem = (size_t)R * (C + 8) * 2;
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(triIn256K<C, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((triIn256K<C, WARPS>), (int)smem); attr = true; }
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", C, {{"f/" + Tn + "projection", 2 * C, false},
                                                                    {"f/" + Tn + "gate", 2 * C, false}});
   triIn256K<C, WARPS><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(

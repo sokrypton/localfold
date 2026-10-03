@@ -73,7 +73,7 @@ __global__ void __launch_bounds__(WARPS * 32) flashStrided(const half* __restric
       Mst(st)[threadIdx.x] = j < n ? (mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f)
                                    : -INFINITY;
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   int i0 = q0 + warp * 16 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
@@ -94,8 +94,8 @@ __global__ void __launch_bounds__(WARPS * 32) flashStrided(const half* __restric
   issue(0, 0);
   for (int tile = 0; tile < tiles; ++tile) {
     int st = tile & 1;
-    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncthreads();
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st); const float* Ms = Mst(st);
     // S starts from the bias (and the key mask), and the tensor cores accumulate Q.K onto it
@@ -181,7 +181,7 @@ void flashStridedAt(const half* qkvg, const half* bias, int stride, const float*
                     size_t rows, float scale, size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
   static bool attr = false;
   if (!attr) {
-    CK(cudaFuncSetAttribute(flashStrided<D, WARPS, MASKED>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(2 * faStage<D, WARPS>())));
+    smemAttr((flashStrided<D, WARPS, MASKED>), (int)(2 * faStage<D, WARPS>()));
     attr = true;
   }
   dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));

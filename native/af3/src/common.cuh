@@ -313,6 +313,30 @@ inline void memReport(const char* at) {
   for (size_t i = 0; i < big.size() && i < (getenv("LOCALFOLD_MEM_ALL") ? big.size() : 6); ++i) printf(" %s %.2f", big[i].second.c_str(), big[i].first / 1e9);
   printf("\n");
 }
+// Shared memory a block may take: the device's opt-in limit (227 KB on an A100, 64 KB on a T4),
+// lowered by LOCALFOLD_SMEM_LIMIT to rehearse a smaller device here. A fused path that would need more
+// asks fitsSmem() and takes its unfused path; smemAttr() refuses, naming the kernel, rather than
+// letting a launch fail with "invalid argument".
+inline size_t SMEM_LIMIT = 0;
+inline size_t smemLimit() {
+  if (!SMEM_LIMIT) {
+    int dev = 0, v = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    SMEM_LIMIT = (size_t)v;
+    if (const char* e = getenv("LOCALFOLD_SMEM_LIMIT")) SMEM_LIMIT = std::min(SMEM_LIMIT, (size_t)atol(e));
+  }
+  return SMEM_LIMIT;
+}
+inline bool fitsSmem(size_t bytes) { return bytes <= smemLimit(); }
+template <class K> void smemAttrNamed(K kernel, size_t bytes, const char* name) {
+  if (!fitsSmem(bytes)) {
+    fprintf(stderr, "%s wants %zu bytes of shared memory a block; this device allows %zu (a fused path missing its fitsSmem check)\n",
+            name, bytes, smemLimit());
+    fflush(stderr); _exit(1);    // (_exit: a background upload thread may still be running)
+  }
+  CK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
+}
+#define smemAttr(kernel, bytes) smemAttrNamed(kernel, (size_t)(bytes), #kernel)
 __global__ void toHalfK(const float* x, half* y, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = __float2half(x[i]);
 }

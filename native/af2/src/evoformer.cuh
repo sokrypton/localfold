@@ -296,11 +296,16 @@ inline void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, fl
   layerNorm(tr, xn, rows, C, A + "/query_norm", blk);
   float* avg = scratch<float>("gcol.avg", (size_t)L * Wd);
   size_t smem = (size_t)(C + Wd + H * rowsN + 2 * rowsN * D) * 4;
-  static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(globalAttentionK, cudaFuncAttributeMaxDynamicSharedMemorySize, 160 * 1024)); attr = true; }
-  if (smem > 160 * 1024) { fprintf(stderr, "global attention: %d sequences do not fit one block\n", rowsN); exit(1); }
-  globalAttentionK<<<L, 256, smem, STREAM>>>(xn, mt, P(A + "/attention/query_w", blk), P(A + "/attention/key_w", blk),
-                                             P(A + "/attention/value_w", blk), avg, rowsN, C, H, D);
+  if (fitsSmem(smem) || H != 8 || D != 8) {
+    static bool attr = false;
+    if (!attr) { smemAttr((globalAttentionK), std::min<size_t>(160 * 1024, smemLimit())); attr = true; }
+    if (!fitsSmem(smem) || smem > 160 * 1024) { fprintf(stderr, "global attention: %d sequences do not fit one block\n", rowsN); exit(1); }
+    globalAttentionK<<<L, 256, smem, STREAM>>>(xn, mt, P(A + "/attention/query_w", blk), P(A + "/attention/key_w", blk),
+                                               P(A + "/attention/value_w", blk), avg, rowsN, C, H, D);
+  } else {     // a device with less shared memory (a T4): the streamed form
+    globalAttentionStreamK<8, 8><<<L, 256, (size_t)(C + Wd + 8 * H * (D + 2)) * 4, STREAM>>>(
+      xn, mt, P(A + "/attention/query_w", blk), P(A + "/attention/key_w", blk), P(A + "/attention/value_w", blk), avg, rowsN, C);
+  }
   float* gate = scratch<float>("gcol.gate", rows * Wd);
   gemm(xn, P(A + "/attention/gating_w", blk), gate, rows, C, Wd);
   addStridedBiasK<<<blocks(rows * Wd), 256, 0, STREAM>>>(gate, P(A + "/attention/gating_b", blk), rows, Wd, Wd);

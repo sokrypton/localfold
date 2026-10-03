@@ -407,7 +407,7 @@ __global__ void __launch_bounds__(64) atomAttentionMMA(const half* qg, const flo
     int which = t / (KEYS * (D / 8)), u = t % (KEYS * (D / 8)), key = u / (D / 8), c = (u % (D / 8)) * 8;
     cpAsync16((which ? Vs : Ks) + key * LD + c, kv + ((size_t)s * KEYS + key) * W2 + which * Wd + h * D + c, true);
   }
-  asm volatile("cp.async.commit_group;");
+  cpCommit();
   int q0 = warp * 16, r0 = q0 + g, r1 = r0 + 8;
   size_t i0 = (size_t)s * queries + r0, i1 = (size_t)s * queries + r1;
   float qs = scale * LOG2E;
@@ -441,7 +441,7 @@ __global__ void __launch_bounds__(64) atomAttentionMMA(const half* qg, const flo
     sv[nt][0] = (b0.x + mb(qm0, km0)) * LOG2E; sv[nt][1] = (b0.y + mb(qm0, km1)) * LOG2E;
     sv[nt][2] = (b1.x + mb(qm1, km0)) * LOG2E; sv[nt][3] = (b1.y + mb(qm1, km1)) * LOG2E;
   }
-  asm volatile("cp.async.wait_group 0;");
+  cpWait<0>();
   __syncthreads();
   float m0 = -INFINITY, m1 = -INFINITY;
   for (int nt = 0; nt < KEYS / 8; ++nt) {

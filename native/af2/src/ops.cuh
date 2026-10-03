@@ -227,6 +227,105 @@ __global__ void globalAttentionK(const float* x, const float* mask, const float*
     }
   }
 }
+// The same with almost no shared memory (the keys, values and logits of a column above held whole: 99 KB at
+// 1024 extra sequences, past a T4's 64 KB): each thread streams its keys - k and v from the input as it
+// goes - with an online softmax per head, and the block merges the threads' states (warp shuffles, then
+// the warps through shared memory)
+template <int H, int D>
+__global__ void __launch_bounds__(256) globalAttentionStreamK(const float* x, const float* mask, const float* qw,
+    const float* kw, const float* vw, float* avg, int n, int C) {
+  int b = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  extern __shared__ float sh[];
+  float* qavg = sh;                     // C
+  float* qh = qavg + C;                 // H*D
+  float* part = qh + H * D;             // [8 warps][H][D + 2]
+  const float* xb = x + (size_t)b * n * C;
+  const float* mb = mask + (size_t)b * n;
+  float msum = 0;
+  for (int s = 0; s < n; ++s) msum += mb[s];
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    float a = 0;
+    for (int s = 0; s < n; ++s) a += mb[s] * xb[(size_t)s * C + c];
+    qavg[c] = a / (msum + 1e-10f);
+  }
+  __syncthreads();
+  for (int t = threadIdx.x; t < H * D; t += blockDim.x) {
+    float a = 0;
+    for (int c = 0; c < C; ++c) a += qavg[c] * qw[(size_t)c * H * D + t];
+    qh[t] = a / sqrtf((float)D);
+  }
+  __syncthreads();
+  float m[H], l[H], acc[H][D];
+#pragma unroll
+  for (int h = 0; h < H; ++h) { m[h] = -INFINITY; l[h] = 0.f;
+#pragma unroll
+    for (int d = 0; d < D; ++d) acc[h][d] = 0.f; }
+  for (int s = threadIdx.x; s < n; s += blockDim.x) {
+    float k[D], v[D];
+#pragma unroll
+    for (int d = 0; d < D; ++d) { k[d] = 0.f; v[d] = 0.f; }
+    for (int c = 0; c < C; ++c) {
+      float xv = xb[(size_t)s * C + c];
+#pragma unroll
+      for (int d = 0; d < D; ++d) { k[d] += xv * kw[c * D + d]; v[d] += xv * vw[c * D + d]; }
+    }
+    float bias = 1e9f * (mb[s] - 1.f);
+#pragma unroll
+    for (int h = 0; h < H; ++h) {
+      float lg = bias;
+#pragma unroll
+      for (int d = 0; d < D; ++d) lg += qh[h * D + d] * k[d];
+      float mn = fmaxf(m[h], lg), cs = __expf(m[h] - mn), e = __expf(lg - mn);
+      l[h] = l[h] * cs + e;
+#pragma unroll
+      for (int d = 0; d < D; ++d) acc[h][d] = acc[h][d] * cs + e * v[d];
+      m[h] = mn;
+    }
+  }
+  // merge two states (an empty one, m = -inf, contributes nothing)
+  auto merge = [&](int h, float m2, float l2, const float* a2) {
+    float M = fmaxf(m[h], m2);
+    if (M == -INFINITY) return;
+    float ca = __expf(m[h] - M), cb = __expf(m2 - M);
+    l[h] = l[h] * ca + l2 * cb;
+#pragma unroll
+    for (int d = 0; d < D; ++d) acc[h][d] = acc[h][d] * ca + a2[d] * cb;
+    m[h] = M;
+  };
+  for (int o = 16; o; o >>= 1) {
+#pragma unroll
+    for (int h = 0; h < H; ++h) {
+      float a2[D];
+      float m2 = __shfl_xor_sync(~0u, m[h], o), l2 = __shfl_xor_sync(~0u, l[h], o);
+#pragma unroll
+      for (int d = 0; d < D; ++d) a2[d] = __shfl_xor_sync(~0u, acc[h][d], o);
+      merge(h, m2, l2, a2);
+    }
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int h = 0; h < H; ++h) {
+      float* p = part + (warp * H + h) * (D + 2);
+      p[0] = m[h]; p[1] = l[h];
+#pragma unroll
+      for (int d = 0; d < D; ++d) p[2 + d] = acc[h][d];
+    }
+  }
+  __syncthreads();
+  for (int t = threadIdx.x; t < H * D; t += blockDim.x) {
+    int h = t / D, d = t % D;
+    float M = -INFINITY;
+    for (int w = 0; w < 8; ++w) M = fmaxf(M, part[(w * H + h) * (D + 2)]);
+    float L = 0.f, A = 0.f;
+    for (int w = 0; w < 8; ++w) {
+      const float* p = part + (w * H + h) * (D + 2);
+      if (p[0] == -INFINITY) continue;
+      float c = __expf(p[0] - M);
+      L += p[1] * c; A += p[2 + d] * c;
+    }
+    avg[((size_t)b * H + h) * D + d] = A / L;
+  }
+}
 // out[b, s, h*D + d] = avg[b, h, d] * sigmoid(gate[b, s, h*D + d])
 __global__ void globalGateK(const float* avg, const float* gate, float* out, int Bt, int n, int W) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

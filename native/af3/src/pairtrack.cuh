@@ -293,7 +293,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     {   // C * 33 floats of shared memory: past the 48 KB default from C = 373 (IntelliFold-2's 512)
       static int granted = 0;
       if (C * 33 * 4 > granted) {
-        CK(cudaFuncSetAttribute(centerNormK<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, C * 33 * 4));
+        smemAttr((centerNormK<T>), C * 33 * 4);
         granted = C * 33 * 4;
       }
     }

@@ -156,7 +156,7 @@ inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::
   // the fused kernels' 64-128-pair tiles leave a small pair track's device idle: measured, warm, trunk of
   // 4 passes - 68 tokens 43.2 ms unfused against 52.7 fused; 92: 71.5 / 58.3; 195: 201 / 190;
   // 261: 368 / 320; 476: 1131 / 953
-  if (FAST && FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS) {
+  if (FAST && FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Fits()) {
     triangle256(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
     triangle256(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
     transition256(pair, (size_t)L * L, C, B + "pairTransition/");

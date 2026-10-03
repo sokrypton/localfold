@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
       int k = t / (C / 8), c = (t % (C / 8)) * 8;
       cpAsync16(w2 + k * LDW2 + c, W2 + (size_t)(j * FT_NC + k) * C + c, true);
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   issue(0, 0);
   // LayerNorm, a warp a row (C / 32 floats a lane), into shared memory as f16
@@ -57,8 +57,8 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
   float acc[NT][4] = {};
   for (int j = 0; j < chunks; ++j) {
     int st = j & 1;
-    if (j + 1 < chunks) { issue(j + 1, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (j + 1 < chunks) { issue(j + 1, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncthreads();
     const half *a = W1a(st), *b = W1b(st), *w2 = W2s(st);
     float ha[FT_NC / 8][4] = {}, hb[FT_NC / 8][4] = {};
@@ -107,7 +107,7 @@ void fusedTransitionAt(float* x, size_t rows, int C, int I, const std::string& p
   constexpr int R = 16 * WARPS;
   size_t smem = (size_t)R * (128 + 8) * 2 + 2 * ftStage<128>();
   static bool attr = false;
-  if (!attr) { CK(cudaFuncSetAttribute(fusedTransitionK<128, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { smemAttr((fusedTransitionK<128, WARPS>), (int)smem); attr = true; }
   fusedTransitionK<128, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     x, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), Wh(pre + ".transition1"),
     Wh(pre + ".transition2"), rows, I);

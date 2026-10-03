@@ -16,19 +16,46 @@ constexpr float LOG2E = 1.4426950408889634f;
 // the flash kernels can skip them; set from the batch
 inline bool MASK_ALL_ONES = false;
 
+// Turing (sm_75, a T4) has no m16n8k16 and no cp.async: there the MMA is two m16n8k8 over the same
+// fragments (a0 a1 / b0 the first eight k, a2 a3 / b1 the second - the accumulation order the k16
+// instruction uses), and a copy is a 16-byte load and shared store (the kernels' barriers already
+// order it: commit and wait become nothing)
 __device__ __forceinline__ void mma16816(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+               "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(b0));
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+               "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[2]), "r"(a[3]), "r"(b1));
+#endif
 }
 __device__ __forceinline__ uint32_t pack2(float lo, float hi) {
   half2 v = __floats2half2_rn(lo, hi);
   return *reinterpret_cast<uint32_t*>(&v);
 }
 __device__ __forceinline__ void cpAsync16(void* dst, const void* src, bool valid) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(valid ? 16 : 0));
+#else
+  *reinterpret_cast<uint4*>(dst) = valid ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+#endif
+}
+__device__ __forceinline__ void cpCommit() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;");
+#endif
+}
+template <int N> __device__ __forceinline__ void cpWait() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group %0;" :: "n"(N));
+#endif
 }
 __device__ __forceinline__ void ldsm4(uint32_t* r, const void* p) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
@@ -120,7 +147,7 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
       Mst(st)[threadIdx.x] = j < n ? (mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f)
                                    : -INFINITY;
     }
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   int i0 = q0 + warp * 16 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
@@ -141,8 +168,8 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
   issue(0, 0);
   for (int tile = 0; tile < tiles; ++tile) {
     int st = tile & 1;
-    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncthreads();
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st); const float* Ms = Mst(st);
     // S starts from the bias (and the key mask), and the tensor cores accumulate Q.K onto it
@@ -261,7 +288,7 @@ __global__ void __launch_bounds__(KS * 32) flashSplitHalf(const half* __restrict
     }
     int j = j0 + lane;       // (no mask: every key is real)
     Mst(st)[lane] = j < n ? (!mask || mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f) : -INFINITY;
-    asm volatile("cp.async.commit_group;");
+    cpCommit();
   };
   int i0 = q0 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
@@ -289,8 +316,8 @@ __global__ void __launch_bounds__(KS * 32) flashSplitHalf(const half* __restrict
   }
   for (int tile = warp, it = 0; tile < tiles; tile += KS, ++it) {
     int st = it & 1;
-    if (tile + KS < tiles) { issue((tile + KS) * BK, st ^ 1); asm volatile("cp.async.wait_group 1;"); }
-    else asm volatile("cp.async.wait_group 0;");
+    if (tile + KS < tiles) { issue((tile + KS) * BK, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
     __syncwarp();
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st); const float* Ms = Mst(st);
     float sv[BK / 8][4];
@@ -368,7 +395,7 @@ void flashSplitHalfAt(const half* qkvg, const half* bias, int stride, const floa
                       int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias) {
   size_t smem = std::max((size_t)KS * 2 * fsStage<D>(), (size_t)KS * 16 * (D + 2) * 4);
   static bool done = false;
-  if (!done) { CK(cudaFuncSetAttribute(flashSplitHalf<D, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); done = true; }
+  if (!done) { smemAttr((flashSplitHalf<D, KS>), (int)smem); done = true; }
   flashSplitHalf<D, KS><<<dim3((n + 15) / 16, (unsigned)(rows * heads)), 32 * KS, smem, STREAM>>>(
     qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
 }
@@ -420,8 +447,7 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
 template <int D, int WARPS, bool MASKED, int BK = FA_BK> void setFlashSmem() {
   static bool done = false;
   if (!done) {
-    CK(cudaFuncSetAttribute(flashGridHalf<D, WARPS, MASKED, BK>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)(2 * faStage<D, WARPS, BK>())));
+    smemAttr((flashGridHalf<D, WARPS, MASKED, BK>), (int)(2 * faStage<D, WARPS, BK>()));
     done = true;
   }
 }
