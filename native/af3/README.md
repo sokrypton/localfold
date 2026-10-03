@@ -366,7 +366,13 @@ protenix2 level within the card's ~3% drift.
 In every case the side that already ran the shared kernel is byte-identical. Measured and left as they are:
 AF3's LayerNorm against the vectorised `layerNormVK` (both ~1.2 TB/s, already bandwidth-bound, and AF3's
 uses AF3's own variance formula), and ESMFold2's float32 token attention against the f16 flash kernel (its
-sampler is 76 ms at 262 tokens and 101 at 524, so the T^2 attention is not what it spends).
+sampler is 76 ms at 262 tokens and 101 at 524, so the T^2 attention is not what it spends). And the grid flash
+attention reading its pair bias straight from global into the score registers instead of staging it (the
+staged bias tile is as large as K and V together, and a head's bias is one n x n shared by every row, so it
+is hot in L2): bit-identical, half the shared memory a stage, and **about twice as slow** - 0.182 -> 0.374 ms
+at 262 tokens, 1.032 -> 2.062 at 524, 7.23 -> 17.1 at 1044 (`--bench-grid`, 4 warps, 48-key tiles; 64-key
+tiles and 8 warps recover some and still lose). The loads land in the scores' dependency chain, where the
+staged copy is hidden behind cp.async; occupancy was not what this kernel lacked.
 
 ## The wider pair tracks
 
