@@ -8,6 +8,8 @@ the manifest names) lands in the family's `directory` under the repository, so t
 it where they look (model-af3-int5/, model-esmfold2-int5/, ...). --suffix appends to that directory
 name, for keeping a fetched copy beside a local export. A file already present at its size is kept.
 """
+import concurrent.futures
+import fcntl
 import json
 import os
 import re
@@ -60,15 +62,28 @@ def main():
         # leaves no manifest, rather than one naming shards that never came. Every shard lands through a
         # `.part` renamed when whole, so a shard that exists is a whole one and is not fetched again.
         manifest_path = os.path.join(dest, "manifest.json")
-        fetch(remote + "manifest.json", manifest_path + ".fetching")
-        manifest = json.load(open(manifest_path + ".fetching"))
-        files = sorted({record["file"] for record in manifest["tensors"].values()})
-        for k, f in enumerate(files):
-            path = os.path.join(dest, f)
-            if not os.path.exists(path):
-                fetch(remote + f, path)
-            print(f"  {name}: {f} ({k + 1}/{len(files)})", flush=True)
-        os.replace(manifest_path + ".fetching", manifest_path)
+        # ...and ONE FETCH A BUNDLE AT A TIME: the notebook prefetches the default model's while the ports
+        # compile, and a fold arriving meanwhile must wait for that download rather than race it into the
+        # same `.part` files
+        with open(os.path.join(dest, ".fetch.lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if os.path.exists(manifest_path):
+                print(f"{name} -> {dest} (already here)")
+                continue
+            fetch(remote + "manifest.json", manifest_path + ".fetching")
+            manifest = json.load(open(manifest_path + ".fetching"))
+            files = sorted({record["file"] for record in manifest["tensors"].values()})
+            # the shards eight at a time: one connection to Hugging Face is ~21 MB/s from here, eight 112
+            # (AF3's 277 MB in 2.5 s against 13.5)
+            missing = [f for f in files if not os.path.exists(os.path.join(dest, f))]
+            with concurrent.futures.ThreadPoolExecutor(8) as pool:
+                pending = {pool.submit(fetch, remote + f, os.path.join(dest, f)): f for f in missing}
+                done = len(files) - len(missing)
+                for future in concurrent.futures.as_completed(pending):
+                    future.result()
+                    done += 1
+                    print(f"  {name}: {pending[future]} ({done}/{len(files)})", flush=True)
+            os.replace(manifest_path + ".fetching", manifest_path)
         print(f"{name} -> {dest}")
 
 

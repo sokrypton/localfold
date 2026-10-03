@@ -4200,3 +4200,9 @@ with AF2 and ESMFold2 niced, since a Colab VM has two cores and the first fold w
 rehearsed here on two cores (`taskset -c 0,1`), AF3 is ready at **45 s against 69** and the whole build at 48
 against 69. Not a lever: AF3's float32 trunk path, which the worker never runs, costs nothing to compile.
 
+**...and the first fold's download.** native/fetch_bundles.py fetched a bundle's shards one at a time: ~21 MB/s
+to Hugging Face from here on one connection, 112 on eight - AF3's 277 MB in 2.5 s against 13.5. It fetches
+eight at once now, and takes a lock per bundle, so the notebook can start the default model's download
+beside the compile (the network beside the CPU) and a fold that arrives meanwhile waits for that download
+rather than racing it into the same `.part` files.
+
