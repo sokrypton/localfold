@@ -93,6 +93,9 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 EVENTS = []
 COMMANDS = []
 MAIL_LOCK = threading.Lock()
+# ...and notified on every arrival, so a reader's `/down?wait=` returns the moment there is something to
+# read rather than on its next poll (a 300 ms poll was most of a warm CUDA fold's click-to-result)
+MAIL = threading.Condition(MAIL_LOCK)
 # 🔴 AND THE OLDEST EVENTS DO GO, because a session is not one fold: 25 sampler
 # frames at a few kilobytes each, several folds deep, is a process that grows
 # for as long as the notebook is open. `EVENT_BASE` is how many have been
@@ -303,6 +306,7 @@ def push_event(event):
             drop = len(EVENTS) - EVENT_CAP // 2
             del EVENTS[:drop]
             EVENT_BASE += drop
+        MAIL.notify_all()
 
 
 class JaxWorker:
@@ -548,7 +552,14 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, native=None):
                                 "browserAlive": alive}
                     return self._json(200, head)
                 since = self._since()
+                # `wait=MS` (at most ten seconds): held until there is an event past `since`, so the reader
+                # need not poll; `waits` in the answer says this broker can, which a page talking to an older
+                # one needs to know before it stops sleeping between asks
+                wait = asked.get("wait", ["0"])[0]
+                wait = min(int(wait), 10000) / 1000 if wait.isdigit() else 0
                 with MAIL_LOCK:
+                    if wait:
+                        MAIL.wait_for(lambda: EVENT_BASE + len(EVENTS) > since, timeout=wait)
                     first = max(0, since - EVENT_BASE)
                     events = EVENTS[first:]
                     n = EVENT_BASE + len(EVENTS)
@@ -556,7 +567,7 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, native=None):
                 # `from` says where the answer actually starts, which is only
                 # different from `since` for a caller that fell behind the cap.
                 seen = self._seen()
-                return self._json(200, {"events": events, "n": n,
+                return self._json(200, {"events": events, "n": n, "waits": True,
                                         "from": EVENT_BASE + first,
                                         "folding": folding,
                                         "runtimeSeen": seen,
@@ -637,6 +648,7 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, native=None):
                         del EVENTS[:drop]
                         EVENT_BASE += drop
                     n = EVENT_BASE + len(EVENTS)
+                    MAIL.notify_all()
                 return self._json(200, {"ok": True, "n": n})
 
             # ...AND THE READER ASKING. `fold` is the only op that can collide

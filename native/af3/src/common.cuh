@@ -2,6 +2,7 @@
 #pragma once
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -772,6 +773,42 @@ template <class T> T* scratch(const std::string& name, size_t n) {
 [[noreturn]] inline void finish(int rc) {
   fflush(stdout); fflush(stderr);
   std::exit(rc);
+}
+// --serve=DIR: the process stays up, its weights resident, folding each job dropped in DIR - a cold fold is
+// mostly start-up (the CUDA context, the weight upload, the kernels' first launches) and this pays it once.
+// A job is DIR/<id>.job, renamed into place: its first line the input's directory, then one flag a line;
+// its output goes to <id>.log and its exit status to <id>.done (renamed into place). Jobs run in name
+// order; one whose first line reads "quit" stops the server. `fold(input, flags)` returns the exit status.
+inline void serveJobs(const std::string& dir, const char* name,
+                      const std::function<int(const std::string&, const std::vector<std::string>&)>& fold) {
+  printf("%s: serving %s\n", name, dir.c_str()); fflush(stdout);
+  for (;;) {
+    std::string id;
+    if (DIR* d = opendir(dir.c_str())) {
+      std::vector<std::string> jobs;
+      while (dirent* e = readdir(d)) {
+        std::string file = e->d_name;
+        if (file.size() > 4 && file.substr(file.size() - 4) == ".job") jobs.push_back(file.substr(0, file.size() - 4));
+      }
+      closedir(d);
+      if (!jobs.empty()) { std::sort(jobs.begin(), jobs.end()); id = jobs[0]; }
+    }
+    if (id.empty()) { usleep(2000); continue; }
+    std::string base = dir + "/" + id;
+    std::ifstream job(base + ".job");
+    std::string input, line; std::getline(job, input);
+    std::vector<std::string> flags; while (std::getline(job, line)) if (!line.empty()) flags.push_back(line);
+    job.close(); unlink((base + ".job").c_str());
+    if (input == "quit") { printf("%s: stopped\n", name); return; }
+    fflush(stdout); fflush(stderr);
+    int saved = dup(1), savedErr = dup(2), log = open((base + ".log").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(log, 1); dup2(log, 2); close(log);
+    int code = fold(input, flags);
+    fflush(stdout); fflush(stderr); dup2(saved, 1); dup2(savedErr, 2); close(saved); close(savedErr);
+    CK(cudaDeviceSynchronize());
+    FILE* df = fopen((base + ".done.tmp").c_str(), "w"); fprintf(df, "%d\n", code); fclose(df);
+    rename((base + ".done.tmp").c_str(), (base + ".done").c_str());
+  }
 }
 // LOCALFOLD_MEM=1: device memory in use at a phase boundary, and the largest scratch buffers
 inline void memReport(const char* at) {

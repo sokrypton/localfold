@@ -482,10 +482,12 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   CK(cudaStreamSynchronize(STREAM));
   double foldMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
   if (tapPasses) TAP().drain();       // (every pass's files written before the fold says it is done)
-  if (warm) {
+  // the fold's own buffers (scratch is kept for the next fold, by name): a served process folds many
+  auto release = [&] {
     for (float* p : {t.msa, t.extra, t.pair, t.pairMask, prevRow, prevPair, prevPos, single}) CK(cudaFree(p));
-    return 0;
-  }
+    if (graph) CK(cudaGraphExecDestroy(graph));
+  };
+  if (warm) { release(); return 0; }
   if (profile) prof::stop(30);
   std::vector<float> pl = download(plddtLogits, (size_t)L * 50);
   std::vector<float> centres(50); for (int b = 0; b < 50; ++b) centres[b] = (b + 0.5f) * 2.f;
@@ -522,6 +524,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   if (chains) printf("  ipTM %.4f", iptm);
   printf("  -> %s  (%d passes, %.1f ms)\n", out.c_str(), ran, foldMs);
   if (converged >= 0) printf("converged at %.2f A after %d passes\n", converged, ran);
+  release();
   return 0;
 }
 
@@ -530,7 +533,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 static bool DETACH = false;
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> --map=<file> | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
-  std::string weights, bundleDir, mapFile, deltaDir, oracle, out = "fold.pdb", warmShape; int recycles = -1; bool profile = false, waitInput = false;
+  std::string weights, bundleDir, mapFile, deltaDir, oracle, out = "fold.pdb", warmShape, serveDir; int recycles = -1; bool profile = false, waitInput = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--bundle=", 9)) bundleDir = argv[i] + 9;      // the page's published bundle, as it is,
@@ -546,6 +549,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
     else if (!strcmp(argv[i], "--detach-output")) DETACH = true;
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;   // L,N,E,T: warm up at those shapes meanwhile
+    else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;   // stay up, folding each job dropped there
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (bundleDir.empty() != mapFile.empty()) { fprintf(stderr, "--bundle and --map go together\n"); return 1; }
@@ -573,6 +577,27 @@ int main(int argc, char** argv) {
     CK(cudaStreamSynchronize(STREAM));
     forgetEntries(M.unload(seg));
     std::string rm = "rm -rf '" + dir + "'"; if (system(rm.c_str())) {}
+  }
+  if (!serveDir.empty()) {
+    // (the input argument is unused: each job names its own) - the job's flags: --out, --recycles,
+    // --tolerance, --frames
+    const double tolerance0 = TOLERANCE;
+    serveJobs(serveDir, "af2", [&](const std::string& input, const std::vector<std::string>& flags) {
+      std::string jobOut = "fold.pdb"; int jobRecycles = -1; TOLERANCE = tolerance0; FRAMES_DIR.clear();
+      for (auto& f : flags) {
+        if (!f.compare(0, 6, "--out=")) jobOut = f.substr(6);
+        else if (!f.compare(0, 11, "--recycles=")) jobRecycles = atoi(f.c_str() + 11);
+        else if (!f.compare(0, 12, "--tolerance=")) TOLERANCE = atof(f.c_str() + 12);
+        else if (!f.compare(0, 9, "--frames=")) FRAMES_DIR = f.substr(9);
+      }
+      int seg = (int)M.segs.size();
+      M.load(input);
+      int code = foldInput("", jobOut, jobRecycles, false, false, std::chrono::steady_clock::now());
+      CK(cudaStreamSynchronize(STREAM));
+      forgetEntries(M.unload(seg));
+      return code;
+    });
+    finish(0);
   }
   if (waitInput) {          // the exporter writes model.idx last, by a rename
     std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";

@@ -4144,3 +4144,51 @@ on the A100 (AF3 25 frames and 4 contact maps, AF2 each pass with its scores,
 PAE and contacts, ESMFold2 11 frames and its map), every structure within 0.01 Å
 of the A100's, and the reader's page holds every frame with its contact map -
 3-4 s click to result once the bundle is on the runtime.
+
+### Every port resident, and the page path cut to its round trips (2026-10-03)
+
+A warm CUDA fold of 6MRR took 0.5-1.1 s in the worker, against 0.09-0.13 s of GPU work. Timed by stage,
+almost all of it was start-up paid on every fold:
+
+| warm 6MRR, worker job to result | AF3 | AF2 | ESMFold2 |
+|---|---:|---:|---:|
+| before | 0.50 s | 1.01 s | 1.11 s |
+| AF2 and ESMFold2 resident (`--serve`) | 0.37 | 0.25 | 0.28 |
+| ...and the exporters resident (native/export_server.mjs) | **0.15** | **0.16** | **0.10** |
+
+- **AF2 and ESMFold2 stay resident, as AF3 did.** Their binaries started cold every fold - the CUDA
+  context and the weight upload, ~0.75 s. All three now serve through one loop (common.cuh's
+  `serveJobs`); the worker keeps one model on the card (a port, its family, AF2's model number) and
+  stops it before another loads. AF2 freed its fold's buffers only on its warm-up path; it frees them
+  on every fold now. Served folds are byte-identical to cold ones, and the device memory is flat over
+  twelve folds (AF2 1242 MiB, ESMFold2 2808 MiB).
+- **The page-code steps stay loaded.** Every fold ran `node` twice - the template resolver (0.13 s, even
+  for a job with no template) and the exporter (0.12-0.23 s, ~180 ms of it module loading).
+  native/export_server.mjs keeps an exporter loaded and imports it afresh a request (its dependencies
+  stay cached, its output is captured to the request's log); the resolver runs only when a row asks
+  for a template. Every export of every `test:native` case is byte-identical to a cold run's, printed
+  output included, with the jobs mixed in the order the gate runs them.
+
+Then the reader's page, click to result for a warm fold: **0.50 s for 0.1 s of fold.**
+
+- **`/down` waits.** The reader polled every 300 ms. The broker now holds `/down?wait=` until an event is
+  past `since` (a `threading.Condition` on the mailbox lock, at most ten seconds) and says `waits: true`;
+  the page sleeps between asks only when that is absent, so a page talking to an older broker still
+  paces itself. 0.50 -> 0.25 s.
+- **Only a batch's last frame is drawn as it arrives.** With Live on, AF3 stayed at 0.51 s: twenty
+  sampler frames land in two or three batches in a 0.1 s fold, and the page parsed, added and showed
+  each (~10 ms) before reading the result - then added all twenty again rebuilding the trajectory. Each
+  frame still keeps a record (its contact map, its pass's scores) and every frame is in the rebuilt
+  trajectory; a slow fold's frames come one a batch and are each drawn. 0.51 -> 0.26 s.
+
+| reader's page, click to result, warm 6MRR | before | after |
+|---|---:|---:|
+| AF3, Live on | 0.51 s | **0.26 s** |
+| AF3, Live off | 0.50 | **0.25** |
+| AF2, Live on | 0.50 | **0.25** |
+| ESMFold2, Live on | 0.50 | **0.25** |
+
+A change of model still pays its weights once (~1 s here); the first fold on a runtime still pays the
+build and the bundle download. `test:native` reports click-to-result now, not that plus its own 1 s
+settle, and takes `--only=<substring>`.
+

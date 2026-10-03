@@ -4234,12 +4234,24 @@ async function followRemoteFold({ since, label, signal }) {
     // count and this is where it is put back in order.
     const batch = [...(state.events ?? [])]
       .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    for (const said of batch) {
+    // 🔴 ONLY A BATCH'S LAST FRAME IS DRAWN AS IT ARRIVES. A warm CUDA fold is a tenth of a second, so its
+    // twenty sampler frames land in two or three batches - and drawing each (parse, add, show: ~10 ms here)
+    // made the reader wait for twenty pictures nobody could see, 0.25 s of a 0.5 s click-to-result. The
+    // others keep a record (the contact map they were streamed beside, the scores of their pass) and every
+    // frame is in the trajectory rebuilt from `framePdbs` once the result is in. A slow fold's frames come
+    // one a batch, and each is drawn.
+    const lastFrame = batch.findLastIndex((said) => said.kind === "frame");
+    for (const [at, said] of batch.entries()) {
       // The page's own calls, replayed here: the same status writes, the same
       // bar fractions, the same sampler frames, in the order they happened.
       if (said.kind === "status") status(said.payload);
       else if (said.kind === "progress") progress(said.payload);
-      else if (said.kind === "frame") { framePdbs.push(said.payload); drawnFrame = draw(said.payload); liveFrames.push(drawnFrame); }
+      else if (said.kind === "frame") {
+        framePdbs.push(said.payload);
+        drawnFrame = at === lastFrame ? draw(said.payload)
+          : { maps: liveContact === undefined ? undefined : { contact: liveContact } };
+        liveFrames.push(drawnFrame);
+      }
       else if (said.kind === "contacts") showContacts(said.payload);
       else if (said.kind === "scores") showScores(said.payload);
       // ...and the runtime's own timing rows, recorded on its card against its
@@ -4282,7 +4294,8 @@ async function followRemoteFold({ since, label, signal }) {
       throw new Error("the runtime's page has not spoken for five minutes -"
         + " its fold may have hung; run the Colab cell again");
     }
-    await new Promise((done) => setTimeout(done, 300));
+    // (a broker that held the ask has already waited for the next event; an older one answered at once)
+    if (!state.waits) await new Promise((done) => setTimeout(done, 300));
   }
   // ...and the runtime's status line beside its error only where it adds
   // something: a page that failed usually says the same thing twice.

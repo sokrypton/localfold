@@ -64,22 +64,6 @@ def die_with_parent():
     ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
 
 
-def run(cmd, what, log, cwd=REPO):
-    """A step, its output kept; a failure says the step and its last lines."""
-    done = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, preexec_fn=die_with_parent)
-    log.append(f"$ {' '.join(cmd)}\n{done.stdout}{done.stderr}")
-    if done.returncode != 0:
-        # 🔴 A NODE STEP THAT THREW SAID WHY IN ONE SENTENCE, written for a person (the page's own readers
-        # and featurisers - "AlphaFold 2 folds protein chains only"): that sentence is the answer, and
-        # the stack under it is not
-        thrown = re.findall(r"^(?:\w*Error): (.+)$", done.stderr or "", re.M)
-        if thrown and cmd[0] == "node":
-            raise Refused(thrown[-1])
-        tail = "\n".join((done.stderr or done.stdout).strip().splitlines()[-4:])
-        raise RuntimeError(f"{what} failed: {tail}")
-    return done.stdout
-
-
 def ensure_bundle(family, directory, log):
     """A bundle on disk, fetched from the registry's remote the first time - shard by shard, each said, so
     a slow download (one revision came at 0.9 MB/s on a Colab T4) reads as a download and not a hang."""
@@ -171,37 +155,6 @@ def token_plddt(atoms, chain_ids, res_ids):
     return [round(v, 2) for v in out]
 
 
-def run_streaming(cmd, what, log, frames, on_file):
-    """run(), with `frames` watched while the binary folds: each finished file (a .tmp renamed into place)
-    handed to on_file(name, path) in name order, as the binary's tap writes them (AsyncTap)."""
-    import threading
-    proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            preexec_fn=die_with_parent)
-    said = {"out": "", "err": ""}
-    readers = [threading.Thread(target=lambda k=k, f=f: said.__setitem__(k, f.read()), daemon=True)
-               for k, f in (("out", proc.stdout), ("err", proc.stderr))]
-    for reader in readers:
-        reader.start()
-    seen = set()
-
-    def collect():
-        for name in sorted(os.listdir(frames)):
-            if name not in seen and not name.endswith(".tmp"):
-                seen.add(name)
-                on_file(name, os.path.join(frames, name))
-    while proc.poll() is None:
-        collect()
-        time.sleep(0.005)
-    for reader in readers:
-        reader.join()
-    collect()
-    log.append(f"$ {' '.join(cmd)}\n{said['out']}{said['err']}")
-    if proc.returncode != 0:
-        tail = "\n".join((said["err"] or said["out"]).strip().splitlines()[-4:])
-        raise RuntimeError(f"{what} failed: {tail}")
-    return said["out"]
-
-
 def emit_scores(meta, pae_path, passes):
     """An AF2 pass's confidences as the page's `scores` event: its pLDDT (per residue and mean), pTM, ipTM
     and PAE (a byte a pair, PAE / 0.125, base64)."""
@@ -220,36 +173,36 @@ def emit_contacts(path, index, passes):
     emit("contacts", {"n": n, "pass": index, "passes": passes, "u8": base64.b64encode(data).decode()})
 
 
-class Af3Server:
-    """One AF3-lineage model kept on the device between folds: native/af3's own --serve mode (a job is
-    DIR/<id>.job - the input's directory, then a flag a line - its output <id>.log, its status <id>.done).
-    A cold fold is mostly start-up - 6MRR is 0.92 s of which the fold is 0.18 on an A100: the CUDA context,
-    the 0.5 s weight upload, the kernels - and this pays it once a model."""
+class Server:
+    """One model kept on the device between folds: the port's own --serve mode (common.cuh's serveJobs: a job
+    is DIR/<id>.job - the input's directory, then a flag a line - its output <id>.log, its status <id>.done).
+    A cold fold is mostly start-up - the CUDA context, the weight upload, the kernels' first launches: 6MRR
+    is 0.92 s cold of which the fold is 0.18 on an A100 for AF3, ~0.75 s of start-up for AF2 and ESMFold2 -
+    and this pays it once a model. `key` names the model (a port, its family, AF2's model number)."""
 
-    def __init__(self, family, bundle):
-        self.family = family
-        self.dir = os.path.join(WORK + "-serve", family)
+    def __init__(self, key, command):
+        self.key = key
+        self.dir = os.path.join(WORK + "-serve", "-".join(str(k) for k in key))
         shutil.rmtree(self.dir, ignore_errors=True)
         os.makedirs(self.dir)
         self.log = open(os.path.join(self.dir, "server.log"), "w")
-        self.proc = subprocess.Popen([binary("af3"), "-", f"--serve={self.dir}", f"--bundle={bundle}",
-                                      f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}", "--fold", "--fast"],
-                                     cwd=REPO, stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
+        self.proc = subprocess.Popen([*command, f"--serve={self.dir}"], cwd=REPO, stdout=self.log,
+                                     stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
         self.count = 0
         deadline = time.time() + 300
-        while "af3: serving" not in open(self.log.name).read():
+        while ": serving" not in open(self.log.name).read():
             if self.proc.poll() is not None or time.time() > deadline:
-                raise RuntimeError("the AF3 server did not start: " + open(self.log.name).read()[-400:])
+                raise RuntimeError(f"the {key[0]} server did not start: " + open(self.log.name).read()[-400:])
             time.sleep(0.05)
 
-    def fold(self, inputs, flags, on_frame=None, on_contacts=None):
-        """...and with `on_frame`, each sampler step's prediction as it lands (native/af3 --frames: written by
-        a thread of the binary off the copy engine, so the fold does not wait for it - +0.1-0.4% of a fold,
-        measured interleaved; the structure is byte-identical either way)."""
+    def fold(self, inputs, flags, on_file=None):
+        """...and with `on_file`, each streamed result handed over as it lands (--frames: written by a thread
+        of the binary off the copy engine, so the fold does not wait for it - +0.1-0.4% of a fold, measured
+        interleaved; the structure is byte-identical either way): on_file(name, path) in name order."""
         self.count += 1
         base = os.path.join(self.dir, f"{self.count:06d}")
         frames = base + ".frames"
-        if on_frame is not None:
+        if on_file is not None:
             os.makedirs(frames, exist_ok=True)
             flags = [*flags, f"--frames={frames}"]
         with open(base + ".tmp", "w") as handle:
@@ -258,26 +211,23 @@ class Af3Server:
         seen = set()
 
         def collect():
-            if on_frame is None:
+            if on_file is None:
                 return
             for name in sorted(os.listdir(frames)):
-                if name in seen or name.endswith(".tmp"):
-                    continue
-                seen.add(name)
-                if name.startswith("frame-"):
-                    on_frame(os.path.join(frames, name), int(name[6:10]))
-                elif name.startswith("contacts-"):           # contacts-PP-of-NN.u8: a trunk pass's map
-                    on_contacts(os.path.join(frames, name), int(name[9:11]), int(name[15:17]))
+                if name not in seen and not name.endswith(".tmp"):
+                    seen.add(name)
+                    on_file(name, os.path.join(frames, name))
         while not os.path.exists(base + ".done"):
             if self.proc.poll() is not None:
-                raise RuntimeError("the AF3 server exited: " + open(self.log.name).read()[-400:])
+                raise RuntimeError(f"the {self.key[0]} server exited: " + open(self.log.name).read()[-400:])
             collect()
             time.sleep(0.005)
         collect()
         shutil.rmtree(frames, ignore_errors=True)
         said = open(base + ".log").read()
         if int(open(base + ".done").read().strip() or 1) != 0:
-            raise RuntimeError("the fold failed: " + "\n".join(said.strip().splitlines()[-4:]))
+            thrown = [line for line in said.strip().splitlines() if line.strip()]
+            raise RuntimeError("the fold failed: " + "\n".join(thrown[-4:]))
         return said
 
     def close(self):
@@ -291,6 +241,52 @@ class Af3Server:
                 self.proc.kill()
 
 
+class Exporter:
+    """One of the page-code exporters (native/*/export*.mjs, native/resolve_templates.mjs) kept loaded between
+    folds by native/export_server.mjs: loading their modules was most of a run (~180 ms of AF3's 230 ms
+    export, a Node start for the rest). `run` takes the command a plain run would have been."""
+
+    def __init__(self, script, cwd):
+        self.dir = os.path.join(WORK + "-export", os.path.basename(os.path.dirname(script)) + "-"
+                                + os.path.basename(script))
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir)
+        self.log = open(os.path.join(self.dir, "server.log"), "w")
+        self.proc = subprocess.Popen([*NODE, os.path.join(NATIVE, "export_server.mjs"), script, self.dir], cwd=cwd,
+                                     stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
+        self.count = 0
+        while "export: serving" not in open(self.log.name).read():
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"{script} did not start: " + open(self.log.name).read()[-400:])
+            time.sleep(0.01)
+
+    def run(self, cmd, what, log):
+        """A step, for a command [*NODE or "node", script, *args]: its output kept; a failure says the step."""
+        args = cmd[cmd.index(next(c for c in cmd if c.endswith(".mjs"))) + 1:]
+        self.count += 1
+        base = os.path.join(self.dir, f"{self.count:06d}")
+        with open(base + ".tmp", "w") as handle:
+            json.dump(args, handle)
+        os.rename(base + ".tmp", base + ".req")
+        while not (os.path.exists(base + ".ok") or os.path.exists(base + ".err")):
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"{what} failed: its exporter exited - " + open(self.log.name).read()[-400:])
+            time.sleep(0.002)
+        said = open(base + ".log").read()
+        log.append(f"$ {' '.join(cmd)}\n{said}")
+        if os.path.exists(base + ".err"):
+            thrown = open(base + ".err").read()
+            log.append(thrown)
+            # 🔴 A STEP THAT THREW SAID WHY IN ONE SENTENCE, written for a person (the page's own readers and
+            # featurisers - "AlphaFold 2 folds protein chains only"): that sentence is the answer, and the
+            # stack under it is not
+            first = re.match(r"^\w*Error: (.+)$", thrown, re.M)
+            if first:
+                raise Refused(first.group(1))
+            raise RuntimeError(f"{what} failed: " + "\n".join(thrown.strip().splitlines()[:4]))
+        return said
+
+
 def streaming(job):
     """Whether a fold streams its intermediate results: the reader's own choice, the page's Live preview
     (web/colab-bridge.js), sent as `frames` - on unless it says false."""
@@ -301,6 +297,14 @@ class Worker:
     def __init__(self):
         self.device = device_name()
         self.server = None
+        self.exporters = {}
+
+    def node(self, cmd, what, log, cwd=REPO):
+        """A page-code step (`cmd` a Node command), through its resident exporter."""
+        script = next(c for c in cmd if c.endswith(".mjs"))
+        if script not in self.exporters or self.exporters[script].proc.poll() is not None:
+            self.exporters[script] = Exporter(script, cwd)
+        return self.exporters[script].run(cmd, what, log)
 
     def close_server(self):
         """...and stopped before any other model folds, so two never share the card."""
@@ -380,10 +384,13 @@ class Worker:
         elif mode != "none":
             raise Refused(f"the CUDA backend does not know the MSA mode {mode!r}")
 
-        # the templates, resolved by the page's own code
-        templates = json.loads(run(["node", os.path.join(NATIVE, "resolve_templates.mjs"), request_path,
-                                    os.path.join(WORK, "templates")], "resolving the templates", log)
-                               .strip().splitlines()[-1] or "[]")
+        # the templates, resolved by the page's own code - where a row asks for one (templateKind: a row's
+        # template with no kind, or "none", is no template; a Node start is 0.13 s of a 0.5 s warm fold)
+        templates = []
+        if any((entity.get("template") or {}).get("kind") not in (None, "none") for entity in job.get("entities", [])):
+            templates = json.loads(self.node(["node", os.path.join(NATIVE, "resolve_templates.mjs"), request_path,
+                                        os.path.join(WORK, "templates")], "resolving the templates", log)
+                                   .strip().splitlines()[-1] or "[]")
         if templates and port == "ef2":
             raise Refused("ESMFold2 takes no template")
         searched = [t["chain"] for t in templates if t["kind"] == "search"]
@@ -409,13 +416,15 @@ class Worker:
         out_pdb = os.path.join(WORK, "fold.pdb")
         emit("status", f"{family} on CUDA ({self.device}) · featurising"
              + (" and searching the ColabFold MMseqs2 server" if mode == "search" else ""))
+        # each port's resident server (Server: the model's weights stay on the card between folds) and this
+        # job's flags for it
         if port == "af3":
             bundle = ensure_bundle(family, f"model-{family}-int5", log)
             export = [*NODE, os.path.join(NATIVE, "af3", "export-model.mjs"), inputs, "--no-weights",
                       f"--bundle={bundle}/manifest.json", f"--job={job_path}", f"--max-msa={requested}", *flags]
-            run(export, "featurising", log, cwd=os.path.join(NATIVE, "af3"))
+            self.node(export, "featurising", log, cwd=os.path.join(NATIVE, "af3"))
             steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
-            fold = [f"--out={out_pdb}"]                  # (flags for the resident server's job)
+            fold = [f"--out={out_pdb}"]
             if sampler == "flow":
                 fold.append("--flow")                    # (the page's Flow: native/af3/src/sampler.cuh)
             elif (job.get("schedule") or {}).get("sigmaMax"):
@@ -427,11 +436,15 @@ class Worker:
                 spec = spec[0] if isinstance(spec, list) else spec
                 modified = any(body.get("modifications") for entry in spec.get("sequences", [])
                                for body in entry.values() if isinstance(body, dict))
-                fold.append(f"--steps={max(steps, 16) if modified else steps}")
+                steps = max(steps, 16) if modified else steps
+                fold.append(f"--steps={steps}")
             if recycles not in (None, ""):
                 fold.append(f"--recycles={int(recycles)}")
+            key = ("af3", family)
+            command = [binary("af3"), "-", f"--bundle={bundle}",
+                       f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}", "--fold", "--fast"]
+            total = steps or 200                         # (af3's default)
         elif port == "af2":
-            self.close_server()
             if templates and family == "monomer" and af2_model > 2:
                 raise Refused(f"AlphaFold 2's model {af2_model} has no template embedder (models 3, 4 and 5 are"
                               " template-free) - pick model 1 or 2, or drop the template")
@@ -445,77 +458,58 @@ class Worker:
                       f"--max-extra={extra}", f"--seed={seed}", *flags]
             if recycles not in (None, ""):
                 export.append(f"--recycles={int(recycles)}")
-            run(export, "featurising", log)
+            self.node(export, "featurising", log)
             model = f"model_{af2_model}_ptm" if family == "monomer" else f"model_{af2_model}_multimer_v3"
-            fold = [binary("af2"), inputs, f"--bundle={bundle}",
-                    f"--map={os.path.join(NATIVE, 'af2', 'maps', model + '.map')}", "--fast", f"--out={out_pdb}",
-                    f"--tolerance={float(controls.get('tolerance') or 0)}",   # (the page's early stop)
-                    *([f"--delta={delta}"] if delta else [])]
-            stream = streaming(job)
+            fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
+            key = ("af2", family, af2_model)
+            command = [binary("af2"), "-", f"--bundle={bundle}",
+                       f"--map={os.path.join(NATIVE, 'af2', 'maps', model + '.map')}", "--fast",
+                       *([f"--delta={delta}"] if delta else [])]
+            total = 0
         else:
-            self.close_server()
             small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)
             trunk = ensure_bundle(family, "model-ef2-fast-300m-int5" if small else "model-esmfold2-int5", log)
             tower = ensure_bundle("esmc-300m" if small else "esmc", "model-esmc-300m-int3" if small else "model-esmc-600m-int3", log)
-            run([*NODE, os.path.join(NATIVE, "ef2", "export_input.mjs"), inputs, f"--job={job_path}"], "featurising", log)
-            fold = [binary("ef2"), inputs, f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
-                    f"--seed={seed}", f"--out={out_pdb}"]
-            stream = streaming(job)
+            self.node([*NODE, os.path.join(NATIVE, "ef2", "export_input.mjs"), inputs, f"--job={job_path}"], "featurising", log)
+            fold = [f"--out={out_pdb}", f"--seed={seed}"]
+            key = ("ef2", family)
+            command = [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast"]
+            total = 0
         emit("progress", 0.15)
-        if port == "af3":
-            if self.server is None or self.server.family != family or self.server.proc.poll() is not None:
-                self.close_server()
-                emit("status", f"{family} on CUDA ({self.device}) · loading the weights onto the card")
-                self.server = Af3Server(family, bundle)
-            emit("status", f"{family} on CUDA ({self.device}) · folding")
-            on_frame = None
-            # 🔴 THE SAMPLER'S FRAMES, AS WebGPU AND JAX STREAM THEIRS - unless the page's Live preview is off
-            if streaming(job):
-                total = next((int(f[8:]) for f in fold if f.startswith("--steps=")), 200)   # (af3's default)
-
-                def on_frame(path, step):
-                    emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
-                    emit("progress", 0.3 + 0.7 * step / total)
-                    emit("status", f"{family} on CUDA ({self.device}) · diffusion {step}/{total}")
-
-                def on_contacts(path, index, passes):
-                    emit_contacts(path, index, passes)
-                    emit("progress", 0.15 + 0.15 * (index + 1) / passes)
-                    emit("status", f"{family} on CUDA ({self.device}) · trunk pass {index + 1}/{passes}")
-            else:
-                on_contacts = None
-            said = self.server.fold(inputs, fold, on_frame, on_contacts)
-            log.append(said)
-        elif stream:
-            # AF2's passes (structure, pLDDT, pTM/ipTM, PAE, contacts) and ESMFold2's trunk contacts and
-            # sampler frames, as the binary's tap writes them
-            emit("status", f"{family} on CUDA ({self.device}) · folding")
-            frames = os.path.join(WORK, "frames")
-            os.makedirs(frames)
-
+        if self.server is None or self.server.key != key or self.server.proc.poll() is not None:
+            self.close_server()
+            emit("status", f"{family} on CUDA ({self.device}) · loading the weights onto the card")
+            self.server = Server(key, command)
+        emit("status", f"{family} on CUDA ({self.device}) · folding")
+        on_file = None
+        if streaming(job):
+            # 🔴 WHAT EACH PORT STREAMS, AS WebGPU AND JAX STREAM IT - unless the page's Live preview is off:
+            # the AF3 lineage's trunk contacts and sampler frames, AF2's passes (structure, pLDDT, pTM/ipTM,
+            # PAE, contacts), ESMFold2's trunk contacts and sampler frames - as the binary's tap writes them
             def on_file(name, path):
                 tag = re.search(r"(\d+)-of-(\d+)", name)
                 if name.startswith("pass-") and name.endswith(".pdb"):
                     index, passes = int(tag.group(1)), int(tag.group(2))
                     emit("frame", open(path).read())
-                    emit_scores(json.load(open(path[:-4] + ".json")), os.path.join(frames, f"pae-{tag.group(0)}.u8"), passes)
+                    emit_scores(json.load(open(path[:-4] + ".json")), os.path.join(os.path.dirname(path), f"pae-{tag.group(0)}.u8"), passes)
                     emit("progress", 0.15 + 0.85 * (index + 1) / passes)
                     emit("status", f"{family} on CUDA ({self.device}) · pass {index + 1}/{passes}")
                 elif name.startswith("contacts-"):
-                    emit_contacts(path, int(tag.group(1)), int(tag.group(2)))
-                    if port == "ef2":
-                        emit("progress", 0.15 + 0.15 * (int(tag.group(1)) + 1) / int(tag.group(2)))
-                        emit("status", f"{family} on CUDA ({self.device}) · trunk pass {int(tag.group(1)) + 1}/{tag.group(2)}")
+                    index, passes = int(tag.group(1)), int(tag.group(2))
+                    emit_contacts(path, index, passes)
+                    if port != "af2":
+                        emit("progress", 0.15 + 0.15 * (index + 1) / passes)
+                        emit("status", f"{family} on CUDA ({self.device}) · trunk pass {index + 1}/{passes}")
                 elif name.startswith("frame-"):
-                    step, total = int(name[6:10]), int(name[11:15]) if name[10] == "-" else 0
-                    emit("frame", open(path).read())
-                    if total:
-                        emit("progress", 0.3 + 0.7 * step / total)
-                        emit("status", f"{family} on CUDA ({self.device}) · diffusion {step}/{total}")
-            said = run_streaming([*fold, f"--frames={frames}"], "the fold", log, frames, on_file)
-        else:
-            emit("status", f"{family} on CUDA ({self.device}) · folding")
-            said = run(fold, "the fold", log)
+                    # frame-SSSS.pdb (af3, its step count the job's) or frame-SSSS-NNNN.pdb (ef2)
+                    step = int(name[6:10])
+                    steps = int(name[11:15]) if name[10] == "-" else total
+                    emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
+                    if steps:
+                        emit("progress", 0.3 + 0.7 * step / steps)
+                        emit("status", f"{family} on CUDA ({self.device}) · diffusion {step}/{steps}")
+        said = self.server.fold(inputs, fold, on_file)
+        log.append(said)
         if not any("pLDDT" in line for line in said.splitlines()):
             raise RuntimeError("the fold printed no confidence line")
         emit("progress", 1.0)

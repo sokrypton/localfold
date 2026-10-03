@@ -566,30 +566,10 @@ int main(int argc, char** argv) {
   // end can return while the driver releases this process's device memory (0.25 s, the rest of the
   // exit); native/af3/fold does
   if (!serveDir.empty()) {
-    // a job is DIR/<id>.job (renamed into place): its first line the input's directory, then one
-    // flag a line (--out, --samples, --steps, --recycles, --seed); its output goes to <id>.log and
-    // its exit status to <id>.done. A job reading "quit" stops the server.
+    // the job's flags: --out, --samples, --steps, --flow, --sigma-max, --frames, --recycles, --seed, --seeds
     const int steps0 = steps, recycles0 = recycles, samples0 = samples, folds0 = folds;
     const bool flow0 = SAMPLER_FLOW; const double sigmaMax0 = SAMPLER_SIGMA_MAX;
-    printf("af3: serving %s\n", serveDir.c_str()); fflush(stdout);
-    for (;;) {
-      std::string id;
-      if (DIR* d = opendir(serveDir.c_str())) {
-        std::vector<std::string> jobs;
-        while (dirent* e = readdir(d)) {
-          std::string name = e->d_name;
-          if (name.size() > 4 && name.substr(name.size() - 4) == ".job") jobs.push_back(name.substr(0, name.size() - 4));
-        }
-        closedir(d);
-        if (!jobs.empty()) { std::sort(jobs.begin(), jobs.end()); id = jobs[0]; }
-      }
-      if (id.empty()) { usleep(2000); continue; }
-      std::string base = serveDir + "/" + id;
-      std::ifstream job(base + ".job");
-      std::string input, line; std::getline(job, input);
-      std::vector<std::string> flags; while (std::getline(job, line)) if (!line.empty()) flags.push_back(line);
-      job.close(); unlink((base + ".job").c_str());
-      if (input == "quit") { printf("af3: stopped\n"); return 0; }
+    serveJobs(serveDir, "af3", [&](const std::string& input, const std::vector<std::string>& flags) {
       steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb"; SAMPLER_FLOW = flow0; SAMPLER_SIGMA_MAX = sigmaMax0;
       framesDir.clear();
       bool jobSeed = false; seed = seedArg; seedsArg = seedsArg0;
@@ -605,19 +585,15 @@ int main(int argc, char** argv) {
         else if (!f.compare(0, 8, "--seeds=")) seedsArg = f.substr(8);
       }
       seedGiven = jobSeed;
-      fflush(stdout);
-      int saved = dup(1), log = open((base + ".log").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-      dup2(log, 1); close(log);
       inputs = {input}; outs = {out};
       int seg = (int)M.segs.size();
       int code = runInput(0);
-      fflush(stdout); dup2(saved, 1); close(saved);
       CK(cudaDeviceSynchronize());
       freeTrunk(t); CHIRALITY = Chirality{};
       forgetEntries(M.unload(seg));
-      FILE* df = fopen((base + ".done.tmp").c_str(), "w"); fprintf(df, "%d\n", code); fclose(df);
-      rename((base + ".done.tmp").c_str(), (base + ".done").c_str());
-    }
+      return code;
+    });
+    return 0;
   }
   bool detach = false;
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--detach-output")) detach = true;

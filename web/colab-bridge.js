@@ -529,9 +529,14 @@ const announceReady = () => { for (const listener of readyListeners) listener();
 /** Ask the runtime for something. Returns the command's sequence number. */
 export const remoteCommand = (op, payload) => ask("/in", { op, payload });
 
-/** What the runtime has said since `since`. */
-export async function remoteEvents(since, signal) {
-  const answer = await fetch(door("/down", `&since=${since}`), { signal });
+/**
+ * What the runtime has said since `since` - held by the broker until there is
+ * something (or `waitMs` passes), so a fold's events arrive as they happen and
+ * not on the next poll. The answer's `waits` says the broker did hold it: an
+ * older one answers at once, and its reader must still pause between asks.
+ */
+export async function remoteEvents(since, signal, waitMs = 8000) {
+  const answer = await fetch(door("/down", `&since=${since}&wait=${waitMs}`), { signal });
   if (!answer.ok) throw new Error(`the runtime answered ${answer.status} while folding`);
   return answer.json();
 }

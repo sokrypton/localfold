@@ -271,7 +271,7 @@ static int foldInput(const Opts& o, bool warm) {
 static bool DETACH = false;
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
-  std::string weights, foldBundle, esmcBundle, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false; std::string warmShape;
+  std::string weights, foldBundle, esmcBundle, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false; std::string warmShape, serveDir;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--fold-bundle=", 14)) foldBundle = argv[i] + 14;
@@ -292,6 +292,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-fused256")) FUSED256 = false;
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
     else if (!strncmp(argv[i], "--steps=", 8)) sampler.steps = atoi(argv[i] + 8);
+    else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;   // stay up, folding each job dropped there
     else if (!strncmp(argv[i], "--inputs-window=", 16)) {           // 128: biohub's (the default); 0: dense
       int w = atoi(argv[i] + 16);
       INPUTS_HALF_WINDOW = w > 0 ? w / 2 : 1 << 30;
@@ -346,6 +347,25 @@ int main(int argc, char** argv) {
     printf("tower f32 copies dropped: %.2f GB\n", dropped / 1e9);
     printf("context %.0f ms, weights up%s %.0f ms\n", std::chrono::duration<double, std::milli>(tCtx - tStart).count(),
            warming ? " and warm-up" : "", std::chrono::duration<double, std::milli>(now - tCtx).count());
+  }
+  if (!serveDir.empty()) {
+    // (the input argument is unused: each job names its own) - the job's flags: --out, --seed, --steps, --frames
+    serveJobs(serveDir, "ef2", [&](const std::string& input, const std::vector<std::string>& flags) {
+      Opts j = o; j.dir = input; j.out = "fold.pdb"; FRAMES_DIR.clear();
+      for (auto& f : flags) {
+        if (!f.compare(0, 6, "--out=")) j.out = f.substr(6);
+        else if (!f.compare(0, 7, "--seed=")) j.seed = strtoull(f.c_str() + 7, nullptr, 10);
+        else if (!f.compare(0, 8, "--steps=")) j.sampler.steps = atoi(f.c_str() + 8);
+        else if (!f.compare(0, 9, "--frames=")) FRAMES_DIR = f.substr(9);
+      }
+      int seg = (int)M.segs.size();
+      M.load(input);
+      int code = foldInput(j, false);
+      CK(cudaStreamSynchronize(STREAM));
+      forgetEntries(M.unload(seg));
+      return code;
+    });
+    finish(0);
   }
   if (waitInput) {          // the exporter writes model.idx last, by a rename
     std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";

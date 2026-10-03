@@ -219,6 +219,7 @@ def page_arm(bad):
             cdp.evaluate(ws, "(document.getElementById('predict').click(), true)")
             cdp.wait_for(ws, """(() => { const t = document.getElementById('status-message').textContent;
               return / on CUDA .* done in |failed|refused|Error|error/.test(t); })()""", 300, f"a CUDA fold of {family}")
+            seconds = time.time() - started           # (click to the result's status line, as a reader waits)
             time.sleep(1.0)
             got = cdp.evaluate(ws, """(() => {
               const p = window.__lastPrediction();
@@ -236,7 +237,7 @@ def page_arm(bad):
                                                  pae: fs.filter((f) => f.pae).length }; })(),
                        gpu: window.__readerGpu };
             })()""")
-            print(f"page: {family:14s} live {'on ' if streamed else 'off'} {time.time() - started:5.1f} s  {got['frames']:2d} frames {got['mapped']}  {got['status'][:70]}")
+            print(f"page: {family:14s} live {'on ' if streamed else 'off'} {seconds:5.2f} s  {got['frames']:2d} frames {got['mapped']}  {got['status'][:70]}")
             problems = []
             if " on CUDA " not in got["status"] or "done in" not in got["status"]:
                 problems.append(f"status {got['status']!r}")

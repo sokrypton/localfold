@@ -55,7 +55,8 @@ if [ "$serve" = --serve ]; then
   echo $! > "$serve_dir/pid"
   # and a resident exporter beside it: node's module loading was most of an export
   mkdir -p "$serve_dir/exp"; rm -f "$serve_dir/exp"/*
-  nohup "${node[@]}" --serve="$serve_dir/exp" > "$serve_dir/export.log" 2>&1 &
+  nohup node --js-float16array --max-old-space-size=24000 "$repo/native/export_server.mjs" "$here/export-model.mjs" \
+    "$serve_dir/exp" > "$serve_dir/export.log" 2>&1 &
   echo $! > "$serve_dir/export.pid"
   until grep -q "af3: serving" "$serve_dir/server.log" 2>/dev/null && grep -q "export: serving" "$serve_dir/export.log" 2>/dev/null; do
     kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null || { cat "$serve_dir/server.log" >&2; exit 1; }

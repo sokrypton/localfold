@@ -391,6 +391,18 @@ template geometry) - rf3's atom-block q/k norms and chirality term were found by
 - **Grid attention without bounds checks** (inputs padded so loads past n read finite values):
   7.22 against 6.89 ms - at 125 registers the kernel is one register from losing a block an SM.
 
+- **Five more forms of the grid attention's flash kernel** (`flashGrid2K`-`6K`, 2026-10-03, against the
+  shipped `flashGridHalf<32, 4>` on random grids of 4 heads of 32, arms interleaved): QT query subtiles
+  a warp over a ring of K/V/bias stages with one barrier a tile; rows of warps sharing one bias tile;
+  the bias accumulated by the tensor cores (S = I . B + Q K^T, read by `ldmatrix.trans`) with each copy's
+  pointer advanced rather than recomputed; the same with one barrier; and each warp pipelined across
+  tiles (tile t+1's scores before tile t's softmax). None beat it: 7.02 ms at 1044 tokens against 7.08
+  for the best (v5) and 7.95-9.62 for the pipelined form; 0.191 against 0.191 at 261; 0.849 against
+  0.854 at 512. Nsight Compute had the old kernel L2-bound and latency-bound together (L2 81% busy, one
+  eligible warp a scheduler); the forms that cut its instructions (2.17 -> 1.86 G at 1044) moved the
+  stall rather than removing it. The one place a form won is a MASKED grid - 0.209 against 0.231 ms at
+  261 (v4) - which a fold with every token real never runs.
+
 ## What the grid attention's time was
 
 Without a profiler on this box, by counting SASS: the kernel issued ~800 integer instructions a
