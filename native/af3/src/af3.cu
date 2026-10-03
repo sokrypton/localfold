@@ -17,6 +17,14 @@
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
+  // LOCALFOLD_UNFUSED=grid,triangle,transition: those pair-track families through their unfused kernels (to
+  // measure the two on a device - the fused ones are each a block's worth of shared memory)
+  if (const char* u = getenv("LOCALFOLD_UNFUSED")) {
+    std::string un = std::string(",") + u + ",";
+    if (un.find(",grid,") != std::string::npos) FUSED_GRID = false;
+    if (un.find(",triangle,") != std::string::npos) FUSED_TRIANGLE = false;
+    if (un.find(",transition,") != std::string::npos) FUSED_TRANSITION = false;
+  }
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
   // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
   // 5 diffusion samples - where the command does not set them; the plain defaults are the page's

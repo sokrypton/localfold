@@ -308,6 +308,25 @@ After a first fold `af3` lists every weight family it never read; for these mode
 only what should be there (heads not computed, alternative per-block forms, absent bonds and
 template geometry) - rf3's atom-block q/k norms and chirality term were found by it.
 
+## On a T4 (Turing, sm_75)
+
+Profiled on a Colab T4 (2026-10-03), a 262-token fold at the page's settings is 4.0 s against 0.57 on the
+A100, 91% trunk; 524 tokens, 18 s. The T4 has no `cp.async` and 64 KB of shared memory a block, and the
+grid attention's flash kernel, written for Ampere, ran at **3.5-6 TFLOP/s** there: its "async" copies
+become synchronous loads that stall each warp before every tile, and its two stages (39 KB at D 32) let
+one block an SM. `flashGridHalf<..., REG = true>` - taken on any device before Ampere
+(`LOCALFOLD_FLASH_REG=0|1` to measure either form anywhere) - stages the next tile in registers while
+this one computes and stores it into a single buffer, three blocks an SM: **2.64 -> 1.23 ms at 262
+tokens, 11.9 -> 8.2 at 524**, every output identical (`--bench-grid` compares the two forms, masked and
+not: 0 of 8,786,432 differ), whole folds 3.99 -> 3.73 s and 18.1 -> 17.2. On the A100 it would be 0.245
+against 0.184 ms, so Ampere keeps `cp.async`.
+
+Tried on the T4 and not taken: more blocks an SM for that kernel (`__launch_bounds__` minimums of 4-8,
+32-key tiles, 2-warp blocks: every one slower - it is not short of warps), its prefetch loads pinned in
+place with volatile asm (no change), and the grid attention unfused (`LOCALFOLD_UNFUSED=grid`; also
+`triangle`, `transition`): level at 262 tokens, 4% slower at 524. The T4 drifts up to 7% between repeats
+of one arm (it throttles to ~1 GHz under load), so interleave arms there.
+
 ## Tried and not taken
 
 - **A split-K "skinny" GEMM for the denoiser's few-row projections** (68 rows x 768 x 3072, where

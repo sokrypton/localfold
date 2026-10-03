@@ -83,7 +83,25 @@ inline void benchGrid(int n) {
     uint64_t s = 1; for (auto& v : h) { s = s * 6364136223846793005ull + 1442695040888963407ull; v = __float2half(((s >> 40) / 16777216.f - 0.5f)); }
     CK(cudaMemcpy(qkvg, h.data(), rows * n * 4 * Wd * 2, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(bias, h.data(), (size_t)heads * n * stride * 2, cudaMemcpyHostToDevice)); }
+  // the two forms of the kernel (cp.async double-buffered; REG, register-staged - a T4's) against each
+  // other, unmasked and with ~10% of keys masked: their outputs must be identical
+  float* mask = dalloc((size_t)n * n);
+  { std::vector<float> hm((size_t)n * n); uint64_t s = 7;
+    for (auto& v : hm) { s = s * 6364136223846793005ull + 1442695040888963407ull; v = (s >> 40) % 10 ? 1.f : 0.f; }
+    CK(cudaMemcpy(mask, hm.data(), hm.size() * 4, cudaMemcpyHostToDevice)); }
+  half* out2 = dallocT<half>(rows * n * Wd);
+  for (const float* mk : {(const float*)nullptr, (const float*)mask}) {
+    flashGridHalfRun<32, 4, FA_BK, false>(qkvg, bias, stride, mk, out, n, heads, 0, rows, false, 0.17f, nullptr);
+    flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, mk, out2, n, heads, 0, rows, false, 0.17f, nullptr);
+    std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
+    CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+    size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
+    printf("  cp.async against reg%s: %zu of %zu outputs differ\n", mk ? ", masked" : "", differ, a.size());
+  }
   std::vector<std::pair<std::string, std::function<void()>>> arms = {
+    {"grid w4 cp.async", [&] { flashGridHalfRun<32, 4, FA_BK, false>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
+    {"grid w4 reg", [&] { flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
+    {"grid w4 reg masked", [&] { flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, mask, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4", [&] { flashGridHalfAt<32, 4>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w8", [&] { flashGridHalfAt<32, 8>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 bk32", [&] { flashGridHalfAt<32, 4, 32>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},

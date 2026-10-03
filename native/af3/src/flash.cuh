@@ -81,8 +81,12 @@ __device__ __forceinline__ uint32_t ex2h2(uint32_t x) {
   uint32_t y; asm("ex2.approx.f16x2 %0, %1;" : "=r"(y) : "r"(x)); return y;
 }
 constexpr uint32_t ONES_H2 = 0x3C003C00u;      // half2(1, 1)
-template <int D, int WARPS, bool MASKED = true, int BK = FA_BK>
-__global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restrict__ qkvg, const half* __restrict__ bias,
+// REG: the next key tile staged in REGISTERS while this one is computed, then stored into the one shared
+// buffer - for a device without cp.async (a T4), where the double buffer's "async" copies are synchronous
+// loads that stall the warp before every tile, and its two stages (39 KB at D 32) let one block an SM fit
+// in a T4's 64 KB. The same arithmetic in the same order: the output is identical.
+template <int D, int WARPS, bool MASKED = true, int BK = FA_BK, bool REG = false, int MINB = 1>
+__global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, const float* __restrict__ mask, half* __restrict__ out, int n, int heads, size_t r0, bool tr, float scale,
     const float* qBias) {
   constexpr int BQ = 16 * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
@@ -149,6 +153,40 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
     }
     cpCommit();
   };
+  // ...REG's halves of `issue`: the loads into registers, and the registers into the one stage
+  uint4 kr[KV_PER][2], brg[B_PER]; float mr = 0.f;
+  auto loadR = [&](int j0) {
+    bool last = j0 + BK > n;
+#pragma unroll
+    for (int k = 0; k < KV_PER; ++k) {
+      if (kvJ[k] >= (1 << 30)) continue;
+      bool ok = !last || j0 + kvJ[k] < n;
+      const half* src = kvSrc[k] + (ok ? j0 * W4 : 0);
+      kr[k][0] = ok ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+      kr[k][1] = ok ? *reinterpret_cast<const uint4*>(src + Wd) : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int k = 0; k < B_PER; ++k) {
+      bool ok = bRow[k] && (!last || j0 + bC[k] < n);
+      brg[k] = ok ? *reinterpret_cast<const uint4*>(bSrc[k] + j0) : make_uint4(0, 0, 0, 0);
+    }
+    if (MASKED && threadIdx.x < BK) {
+      int j = j0 + threadIdx.x;
+      mr = j < n ? (mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f) : -INFINITY;
+    }
+  };
+  auto storeR = [&]() {
+    half *K = Kst(0), *V = Vst(0), *B = Bst(0);
+#pragma unroll
+    for (int k = 0; k < KV_PER; ++k) {
+      if (kvJ[k] >= (1 << 30)) continue;
+      *reinterpret_cast<uint4*>(K + kvOff[k]) = kr[k][0];
+      *reinterpret_cast<uint4*>(V + kvOff[k]) = kr[k][1];
+    }
+#pragma unroll
+    for (int k = 0; k < B_PER; ++k) *reinterpret_cast<uint4*>(B + bOff[k]) = brg[k];
+    if (MASKED && threadIdx.x < BK) Mst(0)[threadIdx.x] = mr;
+  };
   int i0 = q0 + warp * 16 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
     if (i >= n) return 0u;
@@ -165,12 +203,15 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
   float o[D / 8][4] = {};
   float m0 = -INFINITY, m1 = -INFINITY, lsum[4] = {};
   int tiles = (n + BK - 1) / BK;
-  issue(0, 0);
+  if constexpr (REG) { loadR(0); storeR(); __syncthreads(); if (tiles > 1) loadR(BK); }
+  else issue(0, 0);
   for (int tile = 0; tile < tiles; ++tile) {
-    int st = tile & 1;
-    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
-    else cpWait<0>();
-    __syncthreads();
+    int st = REG ? 0 : tile & 1;
+    if constexpr (!REG) {
+      if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
+      else cpWait<0>();
+      __syncthreads();
+    }
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st); const float* Ms = Mst(st);
     // S starts from the bias (and the key mask), and the tensor cores accumulate Q.K onto it
     const half* br0 = B + (warp * 16 + g) * LDB;
@@ -229,6 +270,11 @@ __global__ void __launch_bounds__(WARPS * 32) flashGridHalf(const half* __restri
       }
     }
     __syncthreads();
+    // (REG: tile+1, loaded while this one computed, into the stage every warp has finished reading; then
+    // tile+2's loads issued, to land while tile+1 computes)
+    if constexpr (REG) {
+      if (tile + 1 < tiles) { storeR(); __syncthreads(); if (tile + 2 < tiles) loadR((tile + 2) * BK); }
+    }
   }
   float l0 = lsum[0], l1 = lsum[2];
   // gates read first and stored as pairs: with a store between every load the compiler
@@ -444,28 +490,45 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
   }
 }
 
-template <int D, int WARPS, bool MASKED, int BK = FA_BK> void setFlashSmem() {
+template <int D, int WARPS, bool MASKED, int BK = FA_BK, bool REG = false, int MINB = 1> void setFlashSmem() {
   static bool done = false;
   if (!done) {
-    smemAttr((flashGridHalf<D, WARPS, MASKED, BK>), (int)(2 * faStage<D, WARPS, BK>()));
+    smemAttr((flashGridHalf<D, WARPS, MASKED, BK, REG, MINB>), (int)((REG ? 1 : 2) * faStage<D, WARPS, BK>()));
     done = true;
   }
 }
 inline int FLASH_WARPS_OVERRIDE = 0;
 inline bool FLASH_SPLIT = true;
+// the register-staged form (see flashGridHalf's REG) where the device has no cp.async - before Ampere, a
+// T4 - unless LOCALFOLD_FLASH_REG says otherwise (0 or 1: to measure either form on any device)
+inline bool flashRegStaged() {
+  static int v = [] {
+    if (const char* e = getenv("LOCALFOLD_FLASH_REG")) return atoi(e);
+    int dev, major; CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+    return major < 8 ? 1 : 0;
+  }();
+  return v != 0;
+}
+template <int D, int WARPS, int BK = FA_BK, bool REG = false, int MINB = 1>
+void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
+                      int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias) {
+  dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
+  const int bytes = (REG ? 1 : 2) * faStage<D, WARPS, BK>();
+  if (mask) {                    // a null mask: every key real (see MASKED)
+    setFlashSmem<D, WARPS, true, BK, REG, MINB>();
+    flashGridHalf<D, WARPS, true, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+  } else {
+    setFlashSmem<D, WARPS, false, BK, REG, MINB>();
+    flashGridHalf<D, WARPS, false, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+  }
+}
 template <int D, int WARPS, int BK = FA_BK>
 void flashGridHalfAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
                      int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias) {
-  dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
-  if (mask) {                    // a null mask: every key real (see MASKED)
-    setFlashSmem<D, WARPS, true, BK>();
-    flashGridHalf<D, WARPS, true, BK><<<grid, 32 * WARPS, 2 * faStage<D, WARPS, BK>(), STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
-  } else {
-    setFlashSmem<D, WARPS, false, BK>();
-    flashGridHalf<D, WARPS, false, BK><<<grid, 32 * WARPS, 2 * faStage<D, WARPS, BK>(), STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
-  }
+  if (flashRegStaged()) flashGridHalfRun<D, WARPS, BK, true>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
+  else flashGridHalfRun<D, WARPS, BK, false>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
 }
 template <int D>
 void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
