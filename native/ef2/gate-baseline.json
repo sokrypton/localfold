@@ -1,47 +1,47 @@
 {
  "1brs-complex": {
-  "plddt": 94.52,
-  "ptm": "0.9677",
-  "rmsd": 0.526
+  "plddt": 94.46,
+  "ptm": "0.9674",
+  "rmsd": 0.923
  },
  "1qys": {
-  "plddt": 84.87,
-  "ptm": "0.8986",
-  "rmsd": 0.88
+  "plddt": 83.86,
+  "ptm": "0.8784",
+  "rmsd": 0.865
  },
  "5caj": {
-  "plddt": 91.88,
-  "ptm": "0.9483",
-  "rmsd": 2.085
+  "plddt": 90.82,
+  "ptm": "0.9444",
+  "rmsd": 2.077
  },
  "6mrr": {
-  "plddt": 78.32,
-  "ptm": "0.7513",
-  "rmsd": 0.844
+  "plddt": 77.21,
+  "ptm": "0.7369",
+  "rmsd": 1.422
  },
  "6mrr-gol-sep3": {
-  "ligand": 0.047,
-  "plddt": 78.84,
-  "ptm": "0.7666",
-  "rmsd": 1.619
+  "ligand": 0.115,
+  "plddt": 80.15,
+  "ptm": "0.7895",
+  "rmsd": 1.625
  },
  "dna-duplex": {
-  "nucleic": 0.036,
-  "plddt": 57.82,
-  "ptm": "0.1767",
+  "nucleic": 0.063,
+  "plddt": 57.24,
+  "ptm": "0.1551",
   "rmsd": null
  },
  "kras-sotorasib": {
-  "covalent": 1.73,
-  "ligand": 0.021,
-  "plddt": 88.12,
-  "ptm": "0.9400",
+  "covalent": 1.79,
+  "ligand": 0.031,
+  "plddt": 83.7,
+  "ptm": "0.9108",
   "rmsd": null
  },
  "rna-hairpin": {
-  "nucleic": 0.035,
-  "plddt": 60.83,
-  "ptm": "0.0639",
+  "nucleic": 0.063,
+  "plddt": 60.07,
+  "ptm": "0.0630",
   "rmsd": null
  }
 }

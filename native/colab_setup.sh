@@ -4,7 +4,8 @@
 #   bash native/colab_setup.sh [ef2] [af3]         (both when none is named)
 #
 # Node 22 if the machine's is older (the exporters run the page's own featurisers), the bundles from the
-# registry's `remote:` URLs (native/fetch_bundles.py), each port's weights exported from them once, and
+# registry's `remote:` URLs (native/fetch_bundles.py), AF3's weights exported from them once (ESMFold2
+# reads its bundles directly), and
 # each port built for this GPU (nvidia-smi's compute capability). Idempotent: a step whose output exists
 # is skipped. The weights are the published int5/int3 bundles decoded to float32 - what the page folds
 # with - so a fold matches the page's numbers, not native/<port>/gate-baseline.json's (exported from the
@@ -24,9 +25,7 @@ fi
 for port in "${ports[@]}"; do
   case "$port" in
     ef2)
-      python3 "$repo/native/fetch_bundles.py" ef2-fast-600m esmc
-      [ -f "$repo/native/ef2/weights/model.idx" ] || node --js-float16array "$repo/native/ef2/export_weights.mjs" \
-        "$repo/native/ef2/weights" --fold="$repo/model-esmfold2-int5" --esmc="$repo/model-esmc-600m-int3"
+      python3 "$repo/native/fetch_bundles.py" ef2-fast-600m esmc     # (read as they are: no export)
       (cd "$repo/native/ef2" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread src/ef2.cu \
          -lcublas -lcublasLt -lcupti -o ef2) ;;
     af3)

@@ -38,8 +38,15 @@ The input options are native/af3's exporter's, resolved the same way:
 All nine of AlphaFold 3's loadable example jobs fold. On the covalent KRAS/sotorasib job, Cys12 SG to
 the ligand's C25 is 1.73 Å: bonded, through the declared bond.
 
-`fold` builds `ef2` if it is missing and exports the weights once into `native/ef2/weights`
-(`export_weights.mjs`, 2.9 GB float32). It then starts `ef2` while the input is exported. `ef2`
+`fold` builds `ef2` if it is missing and reads the page's own published bundles as they are - the int5
+trunk and the int3 ESM-C, fetched once by `native/fetch_bundles.py` from their Hugging Face remotes, 0.35 GB:
+their codes go to the device and are decoded there (native/af3's `Model::loadBundle`; bit-identical to
+decoding them on the host, and the load is 127 against 241 ms for the float32 file).
+
+The quantisation costs accuracy, measured on the gate's cases: 6MRR 0.84 -> 1.42 A (pLDDT 78.3 -> 77.2),
+1BRS 0.53 -> 0.92 A, ligand bonds 0.047 -> 0.115 A rms, nucleic 0.036 -> 0.063, KRAS pLDDT 88.1 -> 83.7
+with the covalent SG-C25 still bonded (1.79 A). The float32 export (`export_weights.mjs`, 2.9 GB, from
+the unpublished float32 bundles) is what the oracle checks below use, through `ef2 --weights=`. It then starts `ef2` while the input is exported. `ef2`
 uploads the weights and, during the upload, warms up on a synthetic input of up to 96 tokens. It folds
 with `--fast`; flags after `--` go to `ef2` (`--seed=`, `--steps=`, `--inputs-window=`).
 
@@ -220,16 +227,18 @@ python3 native/ef2/gate.py            # folds against gate-baseline.json, oracle
 python3 native/ef2/gate.py --write
 ```
 
+The folds run on the published bundles (as `fold` does); the oracle checks on the float32 export.
+
 | case | CA RMSD | pLDDT | pTM |
 |---|---:|---:|---:|
-| 6MRR from its sequence | 0.844 Å | 78.32 | 0.751 |
-| 1QYS from its sequence | 0.880 Å | 84.87 | 0.899 |
-| 5CAJ from its sequence | 2.085 Å | 91.88 | 0.948 |
-| 1BRS A:D from its two sequences | 0.526 Å | 94.52 | 0.968 (ipTM 0.959) |
-| 6MRR + glycerol + phosphoserine at 3 | 1.619 Å, ligand bonds 0.047 | 78.84 | 0.767 |
-| DNA duplex | nucleic bonds 0.036 | 57.82 | 0.177 |
-| RNA hairpin | nucleic bonds 0.035 | 60.83 | 0.064 |
-| KRAS + sotorasib (AF3's job) | ligand bonds 0.021, SG-C25 1.73 Å | 88.12 | 0.940 |
+| 6MRR from its sequence | 1.422 Å | 77.21 | 0.737 |
+| 1QYS from its sequence | 0.865 Å | 83.86 | 0.878 |
+| 5CAJ from its sequence | 2.077 Å | 90.82 | 0.944 |
+| 1BRS A:D from its two sequences | 0.923 Å | 94.46 | 0.967 |
+| 6MRR + glycerol + phosphoserine at 3 | 1.625 Å, ligand bonds 0.115 | 80.15 | 0.790 |
+| DNA duplex | nucleic bonds 0.063 | 57.24 | 0.155 |
+| RNA hairpin | nucleic bonds 0.063 | 60.07 | 0.063 |
+| KRAS + sotorasib (AF3's job) | ligand bonds 0.031, SG-C25 1.79 Å | 83.70 | 0.911 |
 
 Bond rms is against CCD ideals, scored by `native/af3/bonds.mjs`; it may move 0.01 Å. The covalent
 distance must stay under 2.2 Å, which is bonded and not merely near.

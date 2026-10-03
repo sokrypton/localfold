@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The same folds on any GPU, to hold one machine's native ports against another's:
 #
-#   native/crosscheck.sh <out dir> [ef2=<weights>] [af3=<weights>] [af2=<monomer weights>] [af2m=<multimer weights>]
+#   native/crosscheck.sh <out dir> [af3=<weights>] [af2=<monomer weights>] [af2m=<multimer weights>]
 #
 # Each input is featurised here by the repo's own exporters (deterministic), each port built for this
 # GPU (into <out>), and every fold's log line and PDB kept: compare two machines' <out> dirs with
@@ -10,7 +10,7 @@
 set -uo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"; N="$repo/native"
 out="$1"; shift; mkdir -p "$out"
-declare -A W=([ef2]="$N/ef2/weights" [af3]="$N/af3/weights" [af2]="" [af2m]="")
+declare -A W=([af3]="$N/af3/weights" [af2]="" [af2m]="")
 for a in "$@"; do W[${a%%=*}]="${a#*=}"; done
 arch="sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"
 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader > "$out/gpu.txt"
@@ -36,13 +36,14 @@ EOF
 FX="$repo/tools/fixtures"; S5=$(seqof "$FX/5caj-crystal.pdb" A); SA=$(seqof "$FX/1brs-crystal.pdb" A); SD=$(seqof "$FX/1brs-crystal.pdb" D)
 in="$out/inputs"; mkdir -p "$in"
 
-if [ -f "${W[ef2]}/model.idx" ]; then
+EF=(--fold-bundle="$repo/model-esmfold2-int5" --esmc-bundle="$repo/model-esmc-600m-int3")    # (the bundles as they are)
+if [ -f "$repo/model-esmfold2-int5/manifest.json" ]; then
   build ef2 ""
   ex() { local d="$in/ef2-$1"; shift; [ -f "$d/model.idx" ] || node --js-float16array "$N/ef2/export_input.mjs" "$d" "$@" > /dev/null; }
   ex 6mrr --sequence=$S6; ex 5caj --sequence=$S5; ex 1brs --sequence=$SA:$SD
   ex gol-sep --sequence=$S6 --ligands=GOL --modify=SEP@3; ex dna --sequence=GCGATCGATCGC:GCGATCGATCGC --kinds=dna,dna
-  for c in 6mrr 5caj 1brs gol-sep dna; do run ef2-$c "$out/ef2" "$in/ef2-$c" --weights="${W[ef2]}" --fast --warm=96,800 --out="$out/ef2-$c.pdb"; done
-  run ef2-6mrr-f32 "$out/ef2" "$in/ef2-6mrr" --weights="${W[ef2]}" --out="$out/ef2-6mrr-f32.pdb"
+  for c in 6mrr 5caj 1brs gol-sep dna; do run ef2-$c "$out/ef2" "$in/ef2-$c" "${EF[@]}" --fast --warm=96,800 --out="$out/ef2-$c.pdb"; done
+  run ef2-6mrr-f32 "$out/ef2" "$in/ef2-6mrr" "${EF[@]}" --out="$out/ef2-6mrr-f32.pdb"
 fi
 if [ -f "${W[af3]}/model.idx" ]; then
   build af3 "--use_fast_math"

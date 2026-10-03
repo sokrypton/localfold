@@ -22,8 +22,11 @@ done
 if [ ! -x "$here/ef2" ]; then
   (cd "$here" && nvcc -O3 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread src/ef2.cu -lcublas -lcublasLt -lcupti -o ef2)
 fi
-weights="$here/weights"
-[ -f "$weights/model.idx" ] || node "$here/export_weights.mjs" "$weights"
+# the weights: the published bundles (int5 trunk, int3 ESM-C), read as they are; fetched once
+repo="$(cd "$here/../.." && pwd)"
+[ -f "$repo/model-esmfold2-int5/manifest.json" ] && [ -f "$repo/model-esmc-600m-int3/manifest.json" ] ||
+  python3 "$repo/native/fetch_bundles.py" ef2-fast-600m esmc
+wflags=(--fold-bundle="$repo/model-esmfold2-int5" --esmc-bundle="$repo/model-esmc-600m-int3")
 tmp="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # ef2 warms up meanwhile on a synthetic input of about this size: tokens = residues, atoms = their heavy
 # atoms (a wrong guess warms less, it never changes the fold)
@@ -33,7 +36,7 @@ atoms=$(awk -v s="$seq" 'BEGIN { split("A5 R11 N8 D8 C6 Q9 E9 G4 H10 I8 L8 K9 M8
   for (k in t) h[substr(t[k], 1, 1)] = substr(t[k], 2) + 0; n = 0;
   for (i = 1; i <= length(s); ++i) { c = substr(s, i, 1); n += (c in h) ? h[c] : 8 } print n + 1 }')
 warm=(); [ -z "$seq" ] || warm=(--warm="${#seq},$atoms")     # (a job's size is not known before its export)
-exec 3< <("$here/ef2" "$tmp" --weights="$weights" --out="$out" --wait-input --detach-output "${warm[@]}" --fast "${flags[@]}" \
+exec 3< <("$here/ef2" "$tmp" "${wflags[@]}" --out="$out" --wait-input --detach-output "${warm[@]}" --fast "${flags[@]}" \
           && rc=0 || rc=$?; echo "ef2: exit $rc")     # (&& || survives set -e, which would skip the echo)
 if ! node --js-float16array "$here/export_input.mjs" "$tmp" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0

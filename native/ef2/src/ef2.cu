@@ -3,6 +3,7 @@
 // diffusion sampler - each stage held to biohub's own forward on the same input (oracle.py).
 //
 //   ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]
+//   ef2 <input dir> --fold-bundle=<dir> --esmc-bundle=<dir> ...   (the page's bundles, read as they are)
 #include "esmc.cuh"
 #include "atoms.cuh"
 #include "trunk.cuh"
@@ -200,9 +201,11 @@ static int foldInput(const Opts& o, bool warm) {
 static bool DETACH = false;
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
-  std::string weights, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false; std::string warmShape;
+  std::string weights, foldBundle, esmcBundle, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false; std::string warmShape;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
+    else if (!strncmp(argv[i], "--fold-bundle=", 14)) foldBundle = argv[i] + 14;
+    else if (!strncmp(argv[i], "--esmc-bundle=", 14)) esmcBundle = argv[i] + 14;
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
@@ -224,9 +227,15 @@ int main(int argc, char** argv) {
     }
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
-  if (weights.empty()) { fprintf(stderr, "--weights=<dir> (native/ef2/export_weights.mjs)\n"); return 1; }
+  if (weights.empty() == (foldBundle.empty() || esmcBundle.empty())) {
+    fprintf(stderr, "--weights=<dir> (native/ef2/export_weights.mjs), or --fold-bundle=<dir> and --esmc-bundle=<dir>\n");
+    return 1;
+  }
   auto tStart = std::chrono::steady_clock::now();
-  M.load(weights);
+  // the weights: one exported file, or the two bundles read as they are (decoded on the device)
+  if (!weights.empty()) M.load(weights);
+  else { M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c"); }
+  const int weightSegs = (int)M.segs.size();
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
   auto tCtx = std::chrono::steady_clock::now();
@@ -236,7 +245,7 @@ int main(int argc, char** argv) {
   // is forgotten after it. The warm fold needs only the shapes - it loads every kernel module and
   // cuBLAS plan. 6MRR's cold trunk is 128 ms against 39 warm.
   bool warming = !warmShape.empty();
-  if (warming) M.uploadAsync(0); else M.upload(0);
+  for (int sgi = 0; sgi < weightSegs; ++sgi) { if (warming) M.uploadAsync(sgi); else M.upload(sgi); }
   if (warming) {
     int wt = 0, wa = 0;
     if (sscanf(warmShape.c_str(), "%d,%d", &wt, &wa) != 2 || wt < 1 || wa < 1) { fprintf(stderr, "--warm=T,A\n"); return 1; }
@@ -259,7 +268,7 @@ int main(int argc, char** argv) {
   size_t dropped = 0;
   if (FAST) {
     Wh("c/blocks/0/qkv/weights"); Wh("f/blocks/0/pairTransition/transition1");
-    dropped = compactWeights(0, towerHalf);
+    dropped = compactWeights(M.at("c/blocks/0/qkv/weights").seg, towerHalf);
   }
   if (getenv("EF2_STARTUP")) {
     auto now = std::chrono::steady_clock::now();

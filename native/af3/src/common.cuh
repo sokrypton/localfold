@@ -37,7 +37,86 @@ inline cublasHandle_t H;
 inline cudaStream_t STREAM = cudaStreamPerThread;
 
 // ---------------------------------------------------------------- the exported model
-struct Entry { char kind; size_t offset, length; double value; int seg; size_t devOffset = 0; };
+struct Entry { char kind; size_t offset, length; double value; int seg; size_t devOffset = 0; int rec = -1; };
+
+// ---------------------------------------------------------------- a published bundle, read as it is
+// A page bundle (manifest.json and its shards, int5/int3/int8/float16/float32 as tools/quantize_af3.py
+// writes them) loads straight into a Model: its packed codes go to the device and are decoded there into
+// the float32 copy, so nothing is decoded on the host and no float32 file is ever written (ESMFold2's was
+// 2.9 GB from 0.35 GB of bundles, and a 2-vCPU Colab VM spent minutes making it). The decode is
+// src/weights/dtype.js's, to the bit: code * scale + zero in double, rounded once to float32.
+struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, dst; int kind, bits, block; };
+// kind: 0 float32, 1 float16, 2 int8 (symmetric), 3 packed int<bits> (asymmetric)
+// A JSON value (enough of JSON for a manifest)
+struct Json {
+  enum T { NUL, BOOL, NUM, STR, ARR, OBJ } t = NUL;
+  double num = 0; std::string str; std::vector<Json> arr; std::vector<std::pair<std::string, Json>> obj;
+  const Json* get(const std::string& k) const { for (auto& [n, v] : obj) if (n == k) return &v; return nullptr; }
+  static Json parse(const std::string& text) { size_t i = 0; Json v = value(text, i); return v; }
+  static void ws(const std::string& s, size_t& i) { while (i < s.size() && isspace((unsigned char)s[i])) ++i; }
+  static std::string string_(const std::string& s, size_t& i) {
+    std::string out; ++i;
+    while (i < s.size() && s[i] != '"') {
+      if (s[i] == '\\') {
+        ++i; char c = s[i++];
+        if (c == 'n') out += '\n'; else if (c == 't') out += '\t'; else if (c == 'u') { out += '?'; i += 4; }
+        else out += c;
+      } else out += s[i++];
+    }
+    ++i; return out;
+  }
+  static Json value(const std::string& s, size_t& i) {
+    ws(s, i); Json v;
+    if (i >= s.size()) { fprintf(stderr, "manifest: unexpected end\n"); exit(1); }
+    char c = s[i];
+    if (c == '{') {
+      v.t = OBJ; ++i; ws(s, i);
+      if (s[i] == '}') { ++i; return v; }
+      for (;;) {
+        ws(s, i); std::string k = string_(s, i); ws(s, i); ++i;     // ':'
+        v.obj.push_back({k, value(s, i)}); ws(s, i);
+        if (s[i] == ',') { ++i; continue; }
+        ++i; return v;                                            // '}'
+      }
+    }
+    if (c == '[') {
+      v.t = ARR; ++i; ws(s, i);
+      if (s[i] == ']') { ++i; return v; }
+      for (;;) { v.arr.push_back(value(s, i)); ws(s, i); if (s[i] == ',') { ++i; continue; } ++i; return v; }
+    }
+    if (c == '"') { v.t = STR; v.str = string_(s, i); return v; }
+    if (!strncmp(s.c_str() + i, "true", 4)) { v.t = BOOL; v.num = 1; i += 4; return v; }
+    if (!strncmp(s.c_str() + i, "false", 5)) { v.t = BOOL; i += 5; return v; }
+    if (!strncmp(s.c_str() + i, "null", 4)) { i += 4; return v; }
+    char* end; v.t = NUM; v.num = strtod(s.c_str() + i, &end); i = end - s.c_str(); return v;
+  }
+};
+// the decode, one tensor of the shard a blockIdx.y
+struct BDecode { unsigned long long src, dst, n, scale, zero; int kind, bits, block, pad; };
+__device__ __forceinline__ float bundleHalf(const unsigned char* p) {
+  unsigned short h = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__ushort_as_half(h));
+}
+__global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, float* out) {
+  BDecode d = table[blockIdx.y];
+  for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < d.n;
+       i += (unsigned long long)gridDim.x * blockDim.x) {
+    float v;
+    if (d.kind == 0) { unsigned int w; memcpy(&w, raw + d.src + 4 * i, 4); v = __uint_as_float(w); }
+    else if (d.kind == 1) v = bundleHalf(raw + d.src + 2 * i);
+    else if (d.kind == 2) {
+      double scale = (double)bundleHalf(raw + d.scale + 2 * (i / d.block));
+      v = (float)__dmul_rn((double)(signed char)raw[d.src + i], scale);
+    } else {
+      unsigned long long g = i / d.block, groupBytes = (unsigned long long)d.block * d.bits / 8;
+      unsigned long long bit = g * groupBytes * 8 + (i % d.block) * d.bits, byte = bit >> 3;
+      unsigned int code = ((raw[d.src + byte] | (raw[d.src + byte + 1] << 8)) >> (bit & 7)) & ((1u << d.bits) - 1);
+      double scale = (double)bundleHalf(raw + d.scale + 2 * g), zero = (double)bundleHalf(raw + d.zero + 2 * g);
+      v = (float)__dadd_rn(__dmul_rn((double)code, scale), zero);
+    }
+    out[d.dst + i] = v;
+  }
+}
+inline float hostHalf(const unsigned char* p) { __half_raw r; r.x = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__half(r)); }
 // model.idx/model.bin pairs, mapped: the input's directory and (af3 --weights=DIR) the weights'
 // On the device every tensor starts on 16 bytes (devOffset), wherever the file packed it: cuBLAS's
 // vector-load kernels need it (align1 kernels otherwise, and a batched GEMM, which cannot see its
@@ -48,7 +127,10 @@ struct Run { size_t src, dst, bytes; };
 // read and 275 ms more to tear down when the process exited, after its PDB was written
 struct Segment { const float* data; size_t bytes; float* device; std::map<std::string, void*> halfMirrors;
                  int fd = -1;
-                 size_t deviceBytes = 0; std::vector<Run> runs; };
+                 size_t deviceBytes = 0; std::vector<Run> runs;
+                 bool bundle = false; std::string dir; std::vector<std::string> files; std::vector<BRec> recs;
+                 std::map<int, std::vector<float>> hostCopies;     // a bundle tensor the host read, decoded
+               };
 struct Model {
   std::map<std::string, Entry> index;
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
@@ -91,6 +173,142 @@ struct Model {
     }
     sg.deviceBytes = at * 4;
     segs.push_back(sg);
+  }
+  // a page bundle (its manifest.json and shards) under `prefix/`: every tensor as `prefix/<name>` with its
+  // rank and dims (`#r`, `#k`), and the manifest's trunk/languageModel numbers as `meta/<key>` - the
+  // entries native/ef2/export_weights.mjs wrote, from the same bytes
+  void loadBundle(const std::string& dir, const std::string& prefix) {
+    std::ifstream in(dir + "/manifest.json");
+    if (!in) { fprintf(stderr, "no %s/manifest.json\n", dir.c_str()); exit(1); }
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Json m = Json::parse(text);
+    int seg = (int)segs.size();
+    Segment sg{nullptr, 0, nullptr}; sg.bundle = true; sg.dir = dir;
+    auto addMeta = [&](const std::string& name, double v) {
+      auto it = index.find(name);
+      if (it != index.end()) {
+        if (it->second.kind != 'm' || it->second.value != v) { fprintf(stderr, "%s is in two bundles, differently\n", name.c_str()); exit(1); }
+        return;
+      }
+      Entry e{'m', 0, 0, v, seg}; index[name] = e;
+    };
+    for (const char* block : {"trunk", "languageModel"})
+      if (const Json* b = m.get(block)) for (auto& [k, v] : b->obj) if (v.t == Json::NUM) addMeta("meta/" + k, v.num);
+    const Json* tensors = m.get("tensors");
+    if (!tensors) { fprintf(stderr, "%s/manifest.json has no tensors\n", dir.c_str()); exit(1); }
+    std::map<std::string, int> fileIndex;
+    size_t at = 0;
+    for (auto& [name, r] : tensors->obj) {
+      BRec b{}; const Json* j;
+      std::string file = r.get("file")->str;
+      if (!fileIndex.count(file)) { fileIndex[file] = (int)sg.files.size(); sg.files.push_back(file); }
+      b.file = fileIndex[file];
+      b.byteOffset = (j = r.get("byteOffset")) ? (size_t)j->num : 0;
+      std::string dtype = r.get("dtype")->str;
+      size_t n = 1; std::vector<double> shape;
+      for (auto& d : r.get("shape")->arr) { n *= (size_t)d.num; shape.push_back(d.num); }
+      b.elements = n;
+      if (dtype == "float32") b.kind = 0;
+      else if (dtype == "float16") b.kind = 1;
+      else if (dtype == "int8") b.kind = 2;
+      else if (dtype.size() == 4 && dtype.compare(0, 3, "int") == 0 && dtype[3] >= '1' && dtype[3] <= '7') { b.kind = 3; b.bits = dtype[3] - '0'; }
+      else { fprintf(stderr, "%s: unsupported dtype %s\n", name.c_str(), dtype.c_str()); exit(1); }
+      if (b.kind >= 2) {
+        b.block = (int)r.get("block")->num; b.scaleOffset = (size_t)r.get("scaleOffset")->num;
+        if (b.kind == 3) {
+          if (!(j = r.get("zeroOffset"))) { fprintf(stderr, "%s: %s with no zero offset\n", name.c_str(), dtype.c_str()); exit(1); }
+          b.zeroOffset = (size_t)j->num;
+          if ((b.block * b.bits) % 8) { fprintf(stderr, "%s: %s at group %d is not whole bytes\n", name.c_str(), dtype.c_str(), b.block); exit(1); }
+        }
+      }
+      if ((b.kind == 0 && b.byteOffset % 4) || (b.kind == 1 && b.byteOffset % 2)) {
+        fprintf(stderr, "%s: unaligned in its shard\n", name.c_str()); exit(1);
+      }
+      std::string key = prefix + "/" + name;
+      if (index.count(key)) { fprintf(stderr, "%s is in two model directories\n", key.c_str()); exit(1); }
+      at = (at + 3) / 4 * 4;
+      Entry e{'t', 0, n, 0, seg}; e.devOffset = at; e.rec = (int)sg.recs.size(); b.dst = at; at += n;
+      index[key] = e;
+      sg.recs.push_back(b);
+      addMeta(key + "#r", (double)shape.size());
+      for (size_t k = 0; k < shape.size(); ++k) addMeta(key + "#" + std::to_string(k), shape[k]);
+    }
+    sg.deviceBytes = at * 4;
+    for (auto& f : sg.files) { struct stat st; if (stat((dir + "/" + f).c_str(), &st)) { fprintf(stderr, "no %s/%s\n", dir.c_str(), f.c_str()); exit(1); } sg.bytes += (size_t)st.st_size; }
+    segs.push_back(sg);
+  }
+  static std::vector<unsigned char> readFile(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
+    struct stat sb; fstat(fd, &sb);
+    std::vector<unsigned char> v((size_t)sb.st_size + 2, 0);     // (+2: a packed code's second byte past the last group)
+    for (size_t got = 0; got < (size_t)sb.st_size;) {
+      ssize_t r = read(fd, v.data() + got, (size_t)sb.st_size - got);
+      if (r <= 0) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
+      got += (size_t)r;
+    }
+    close(fd);
+    return v;
+  }
+  // a bundle onto the device: each shard's bytes up as they are (read into pinned memory, two buffers so
+  // one shard is read while the last is copied and decoded), decoded there into the float32 copy
+  static bool bundleUp(Segment& s) {
+    cudaStream_t st; if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess) return false;
+    size_t most = 0;
+    std::vector<size_t> sizes;
+    for (auto& f : s.files) { struct stat sb; stat((s.dir + "/" + f).c_str(), &sb); sizes.push_back((size_t)sb.st_size + 2); most = std::max(most, sizes.back()); }
+    unsigned char* pin[2]; unsigned char* raw[2]; BDecode* dt[2]; cudaEvent_t done[2];
+    size_t maxRecs = s.recs.size();
+    for (int k = 0; k < 2; ++k)
+      if (cudaHostAlloc(&pin[k], most, cudaHostAllocDefault) != cudaSuccess || cudaMalloc(&raw[k], most) != cudaSuccess ||
+          cudaMalloc(&dt[k], maxRecs * sizeof(BDecode)) != cudaSuccess || cudaEventCreateWithFlags(&done[k], cudaEventDisableTiming) != cudaSuccess)
+        return false;
+    std::vector<std::vector<BDecode>> tables(2);
+    for (size_t fi = 0; fi < s.files.size(); ++fi) {
+      int k = (int)(fi & 1);
+      if (fi >= 2 && cudaEventSynchronize(done[k]) != cudaSuccess) return false;     // buffer k free again
+      int fd = open((s.dir + "/" + s.files[fi]).c_str(), O_RDONLY);
+      if (fd < 0) return false;
+      size_t n = sizes[fi] - 2, got = 0;
+      while (got < n) { ssize_t r = read(fd, pin[k] + got, n - got); if (r <= 0) { close(fd); return false; } got += (size_t)r; }
+      close(fd);
+      pin[k][n] = pin[k][n + 1] = 0;          // (a packed code's second byte past the last group)
+      auto& table = tables[k]; table.clear();
+      for (const BRec& b : s.recs)
+        if (b.file == (int)fi) table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.kind, b.bits, b.block, 0});
+      if (!table.empty()) {
+        if (cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            cudaMemcpyAsync(dt[k], table.data(), table.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
+        for (size_t t0 = 0; t0 < table.size(); t0 += 65535)
+          bundleDecodeK<<<dim3(64, (unsigned)std::min<size_t>(65535, table.size() - t0)), 256, 0, st>>>(raw[k], dt[k] + t0, s.device);
+      }
+      if (cudaEventRecord(done[k], st) != cudaSuccess) return false;
+    }
+    bool ok = cudaStreamSynchronize(st) == cudaSuccess && cudaGetLastError() == cudaSuccess;
+    for (int k = 0; k < 2; ++k) { cudaFreeHost(pin[k]); cudaFree(raw[k]); cudaFree(dt[k]); cudaEventDestroy(done[k]); }
+    cudaStreamDestroy(st);
+    return ok;
+  }
+  // a bundle tensor the host reads (a few small ones: ESM-C's mix weights), decoded as the device does
+  const float* hostTensor(const Segment& s, int rec) const {
+    Segment& m = const_cast<Segment&>(s);
+    auto it = m.hostCopies.find(rec);
+    if (it != m.hostCopies.end()) return it->second.data();
+    const BRec& b = s.recs[rec];
+    std::vector<unsigned char> raw = readFile(s.dir + "/" + s.files[b.file]);
+    std::vector<float> out(b.elements);
+    for (size_t i = 0; i < b.elements; ++i) {
+      if (b.kind == 0) memcpy(&out[i], &raw[b.byteOffset + 4 * i], 4);
+      else if (b.kind == 1) out[i] = hostHalf(&raw[b.byteOffset + 2 * i]);
+      else if (b.kind == 2) out[i] = (float)((double)(signed char)raw[b.byteOffset + i] * (double)hostHalf(&raw[b.scaleOffset + 2 * (i / b.block)]));
+      else {
+        size_t g = i / b.block, groupBytes = (size_t)b.block * b.bits / 8, bit = g * groupBytes * 8 + (i % b.block) * b.bits, byte = bit >> 3;
+        unsigned code = ((raw[b.byteOffset + byte] | (raw[b.byteOffset + byte + 1] << 8)) >> (bit & 7)) & ((1u << b.bits) - 1);
+        volatile double p = (double)code * (double)hostHalf(&raw[b.scaleOffset + 2 * g]);
+        out[i] = (float)(p + (double)hostHalf(&raw[b.zeroOffset + 2 * g]));
+      }
+    }
+    return (m.hostCopies[rec] = std::move(out)).data();
   }
   // drop a directory's entries, its mapping and its device copy (one input of a batch, done);
   // returns the names it held so the caches keyed on them can be cleared too
@@ -163,6 +381,7 @@ struct Model {
     return s.data;
   }
   static bool copyUp(Segment& s) {
+    if (s.bundle) return bundleUp(s);
     if (s.bytes < ((size_t)64 << 20)) {
       mapped(s);
       for (const Run& r : s.runs)
@@ -235,12 +454,14 @@ struct Model {
   bool flag(const std::string& k) const { return has(k) && at(k).value != 0; }
   const float* f(const std::string& k) const {
     const Entry& e = at(k); touched.insert(k);
+    if (segs[e.seg].bundle) return hostTensor(segs[e.seg], e.rec);
     return mapped(const_cast<Segment&>(segs[e.seg])) + e.offset;
   }
   const int* i(const std::string& k) const { return (const int*)f(k); }
   size_t len(const std::string& k) const { return at(k).length; }
 };
 inline Model M;
+
 // The weight tensors a fold never read, digits collapsed: a convention the checkpoint carries and
 // this port does not apply shows up here instead of as a quietly wrong structure (rf3's atom q/k
 // norms were found this way, after the fact).
