@@ -30,7 +30,7 @@
  */
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, createSplitReduceShader,
-         createSwigluShader, linearGrid, linearKSplits, ROW_TILE, swigluGrid } from "../esmc/block-webgpu.js";
+         createSplitSwigluReduceShader, createSwigluShader, linearGrid, linearKSplits, ROW_TILE, swigluGrid } from "../esmc/block-webgpu.js";
 import { float32ToFloat16Array } from "../weights/float16.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { residentTensorOnDevice, residentPairOnDevice, elementsOf }
@@ -689,6 +689,10 @@ export class Esmfold2DenoiserGpu {
           createSplitReduceShader({ rows: tokens, outer: hidden, splits: kSplits }, false)),
         reduceChannels: get("reduce-channels",
           createSplitReduceShader({ rows: tokens, outer: tokenChannels, splits: kSplits }, false)),
+        swigluSplit: get("swiglu-split", createLinearShader({ rows: tokens, inner: tokenChannels,
+          outer: 2 * hidden }, false, weightPrecision, false, rowTile, 4, kSplits)),
+        swigluReduce: get("swiglu-reduce",
+          createSplitSwigluReduceShader({ rows: tokens, ffn: hidden, splits: kSplits })),
       }),
       gatedSingle: get("gated-single", createGatedProductShader(tokens * hidden)),
       addSingle: get("add-single", createAddShader(tokens * tokenChannels)),
@@ -1221,7 +1225,7 @@ export class Esmfold2DenoiserGpu {
                            storage | GPUBufferUsage.COPY_SRC);
     b.readback = this.#alloc("esmfold2.diff.readback", atoms * 3,
                              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
-    if (pipelines.kSplits > 1) b.partials = scratch("partials", pipelines.kSplits * tokens * hidden);
+    if (pipelines.kSplits > 1) b.partials = scratch("partials", pipelines.kSplits * tokens * 2 * hidden);
     const atomScratchSizes = atomStackScratch(
       { atoms, channels: atomChannels, heads: atomHeads, hidden: atomHidden });
     const atomScratch = {};
@@ -1318,8 +1322,16 @@ export class Esmfold2DenoiserGpu {
       record("esmfold2.diff.ffn-adaln", pipelines.adaptive,
              [b.normAct, b.gateShift, transition.adaln.gateBias, b.modulated],
              ...elementwise(tokens * tokenChannels));
-      record("esmfold2.diff.ffn-swiglu", pipelines.swiglu,
-             [b.modulated, transition.swishWeights, b.wideG], ...swigluGrid(tokens, hidden));
+      if (kSplits === 1) {
+        record("esmfold2.diff.ffn-swiglu", pipelines.swiglu,
+               [b.modulated, transition.swishWeights, b.wideG], ...swigluGrid(tokens, hidden));
+      } else {
+        this.#record("esmfold2.diff.ffn-swiglu", pipelines.swigluSplit,
+                     [b.modulated, transition.swishWeights, b.partials],
+                     ...linearGrid(tokens, 2 * hidden, rowTile), kSplits);
+        record("esmfold2.diff.ffn-swiglu.reduce", pipelines.swigluReduce, [b.partials, b.wideG],
+               ...elementwise(tokens * hidden / 4));
+      }
       gemm("esmfold2.diff.ffn-out", "narrow", [b.wideG, transition.outWeights, b.delta], tokenChannels);
       gemm("esmfold2.diff.ffn-out-gate", "square", [b.single, transition.outGateWeights, b.outGate], tokenChannels);
       record("esmfold2.diff.ffn-add", pipelines.gatedAdd,

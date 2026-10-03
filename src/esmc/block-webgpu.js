@@ -281,6 +281,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 /**
+ * createSwigluShader split over K: the SwiGLU weight is a linear of width 2 * ffn with the gate half
+ * first, so createLinearShader({inner: model, outer: 2 * ffn}, ..., kSplits) writes its partials and
+ * this sums each split's gate and value and writes silu(gate) * value, one lane a vec4.
+ */
+export function createSplitSwigluReduceShader({ rows, ffn, splits }) {
+  const vectorFfn = ffn / 4, wide = rows * 2 * vectorFfn;
+  const sum = (offset) => Array.from({ length: splits },
+    (_, z) => `partials[${z * wide}u + base + ${offset}]`).join(" + ");
+  return `
+@group(0) @binding(0) var<storage, read> partials: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> destination: array<vec4<f32>>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * ${GRID_WIDTH * LANES}u;
+  if (slot >= ${rows * vectorFfn}u) { return; }
+  let row = slot / ${vectorFfn}u;
+  let base = row * ${2 * vectorFfn}u + slot % ${vectorFfn}u;
+  let gate = ${sum("0u")};
+  let value = ${sum(`${vectorFfn}u`)};
+  destination[slot] = gate / (vec4<f32>(1.0) + exp(-gate)) * value;
+}`;
+}
+
+/**
  * Split the fused qkv, LayerNorm q and k over the FULL width, rotate both.
  *
  * One workgroup a row. The two norms are computed here rather than by the

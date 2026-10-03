@@ -37,7 +37,7 @@ import {
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
   createLinearShader, createPrepareShader, createSwigluShader, linearGrid, linearKSplits,
-  createSplitReduceShader,
+  createSplitReduceShader, createSplitSwigluReduceShader,
   ROW_TILE, swigluGrid, QUERY_TILE,
 } from "./block-webgpu.js";
 
@@ -287,16 +287,20 @@ export class EsmcTowerGpu {
     const forcedSplits = deviceTuning(this.device).esmcKSplits;
     const splitsFor = (outer) => forcedSplits ?? linearKSplits(rows, outer, rowTile);
     const qkvSplits = splitsFor(3 * model), modelSplits = splitsFor(model);
+    const swigluSplits = splitsFor(2 * ffn);
     const splitLinear = (inner, outer, splits) => (splits === 1 ? null
       : pipeline(`esmc-linear:${rows}:${inner}:${outer}:0:${weightPrecision}:rt${rowTile}:ks${splits}`,
         createLinearShader({ rows, inner, outer }, false, weightPrecision, false, rowTile, 4, splits)));
     const splitReduce = (outer, splits, residual) => (splits === 1 ? null
       : pipeline(`esmc-reduce:${rows}:${outer}:${splits}:${residual}`,
         createSplitReduceShader({ rows, outer, splits }, residual)));
-    const [qkvSplit, outSplit, downSplit, qkvReduce, modelReduce] = await Promise.all([
-      splitLinear(model, 3 * model, qkvSplits), splitLinear(model, model, modelSplits),
-      splitLinear(ffn, model, modelSplits), splitReduce(3 * model, qkvSplits, false),
-      splitReduce(model, modelSplits, true)]);
+    const [qkvSplit, outSplit, downSplit, qkvReduce, modelReduce, swigluSplit, swigluReduce] =
+      await Promise.all([
+        splitLinear(model, 3 * model, qkvSplits), splitLinear(model, model, modelSplits),
+        splitLinear(ffn, model, modelSplits), splitReduce(3 * model, qkvSplits, false),
+        splitReduce(model, modelSplits, true), splitLinear(model, 2 * ffn, swigluSplits),
+        swigluSplits === 1 ? null : pipeline(`esmc-swiglu-reduce:${rows}:${ffn}:${swigluSplits}`,
+          createSplitSwigluReduceShader({ rows, ffn, splits: swigluSplits }))]);
     const [normPipeline, qkvPipeline, preparePipeline, attentionPipeline,
       outPipeline, swigluPipeline, downPipeline, mixPipeline,
       finalNormPipeline, singlePipeline] = await Promise.all([
@@ -378,9 +382,9 @@ export class EsmcTowerGpu {
       };
       // ...and split over K into `partials`, then summed (with the residual, when the unsplit pass
       // takes one) into the output: [input, weights, output] or [input, weights, residual, output].
-      const partials = qkvSplits > 1 || modelSplits > 1
-        ? keepPersistent(this.allocator.allocate("esmc.partials",
-          Math.max(qkvSplits * 3 * model, modelSplits * model) * rows * 4, storage))
+      const partials = qkvSplits > 1 || modelSplits > 1 || swigluSplits > 1
+        ? keepPersistent(this.allocator.allocate("esmc.partials", Math.max(qkvSplits * 3 * model,
+          modelSplits * model, swigluSplits * 2 * ffn) * rows * 4, storage))
         : null;
       const dispatchProjection = (pass, unsplit, split, reduce, splits, bindings, outer) => {
         if (splits === 1) return dispatchLinear(pass, unsplit, bindings, outer);
@@ -649,11 +653,17 @@ export class EsmcTowerGpu {
           [context, attnOut, current, afterAttention], model);
         dispatchInto(pass, normPipeline,
           [afterAttention, ffnScale, ffnOffset, ffnNormed], rows);
-        pass.setPipeline(swigluPipeline);
-        pass.setBindGroup(0, bind(swigluPipeline, [ffnNormed, fc1, gated]));
-        {
+        if (swigluSplits === 1) {
+          pass.setPipeline(swigluPipeline);
+          pass.setBindGroup(0, bind(swigluPipeline, [ffnNormed, fc1, gated]));
           const [gx, gy] = swigluGrid(rows, ffn);
           pass.dispatchWorkgroups(gx, gy);
+        } else {
+          pass.setPipeline(swigluSplit);
+          pass.setBindGroup(0, bind(swigluSplit, [ffnNormed, fc1, partials]));
+          const [gx, gy] = linearGrid(rows, 2 * ffn, rowTile);
+          pass.dispatchWorkgroups(gx, gy, swigluSplits);
+          dispatchInto(pass, swigluReduce, [partials, gated], Math.ceil(rows * ffn / 4 / LANES));
         }
         dispatchProjection(pass, downPipeline, downSplit, modelReduce, modelSplits,
           [gated, fc2, afterAttention, next], model);
