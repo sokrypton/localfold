@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 # The same folds on any GPU, to hold one machine's native ports against another's:
 #
-#   native/crosscheck.sh <out dir> [af2=<monomer weights>] [af2m=<multimer weights>]
+#   native/crosscheck.sh <out dir>
 #
 # Each input is featurised here by the repo's own exporters (deterministic), each port built for this
 # GPU (into <out>), and every fold's log line and PDB kept: compare two machines' <out> dirs with
-# native/af3/score.py (CA RMSD between the two PDBs of a case) and the pLDDT/pTM lines. ESMFold2 and
-# AF3 read their published bundles as they are (a port whose bundle is not on disk is skipped); AF2's
-# weights are given, or it is skipped.
+# native/af3/score.py (CA RMSD between the two PDBs of a case) and the pLDDT/pTM lines. Every port reads
+# the page's published bundles as they are; a port whose bundle is not on disk is skipped.
 set -uo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"; N="$repo/native"
 out="$1"; shift; mkdir -p "$out"
-declare -A W=([af2]="" [af2m]="")
-for a in "$@"; do W[${a%%=*}]="${a#*=}"; done
 arch="sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"
 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader > "$out/gpu.txt"
 log="$out/log.txt"; : > "$log"
@@ -57,16 +54,18 @@ if [ -f "$repo/model-af3-int5/manifest.json" ]; then
   for c in 6mrr 5caj-tmpl 1brs-tmpl gol; do run af3-$c "$out/af3" "$in/af3-$c" "${AW[@]}" --fold --fast --out="$out/af3-$c.pdb"; done
   run af3-6mrr-f32 "$out/af3" "$in/af3-6mrr" "${AW[@]}" --fold --steps=20 --out="$out/af3-6mrr-f32.pdb"
 fi
-if [ -n "${W[af2]}" ] && [ -f "${W[af2]}/model.idx" ]; then
+M1=(--bundle="$repo/model" --map="$N/af2/maps/model_1_ptm.map")
+MM=(--bundle="$repo/model-multimer" --map="$N/af2/maps/model_1_multimer_v3.map")
+if [ -f "$repo/model/manifest.json" ]; then
   build af2 "--use_fast_math"
-  ex2() { local d="$in/af2-$1" w="$2"; shift 2; [ -f "$d/model.idx" ] || node "$N/af2/export_input.mjs" "$d" --weights="$w" "$@" > /dev/null; }
-  ex2 6mrr "${W[af2]}" --sequence=$S6; ex2 5caj-tmpl "${W[af2]}" --sequence=$S5 --template="$FX/5caj-crystal.pdb:A"
-  run af2-6mrr "$out/af2" "$in/af2-6mrr" --weights="${W[af2]}" --fast --out="$out/af2-6mrr.pdb"
-  run af2-5caj-tmpl "$out/af2" "$in/af2-5caj-tmpl" --weights="${W[af2]}" --fast --recycles=0 --out="$out/af2-5caj-tmpl.pdb"
-  run af2-6mrr-f32 "$out/af2" "$in/af2-6mrr" --weights="${W[af2]}" --out="$out/af2-6mrr-f32.pdb"
-  if [ -n "${W[af2m]}" ] && [ -f "${W[af2m]}/model.idx" ]; then
-    ex2 1brs-tmpl "${W[af2m]}" --sequence=$SA:$SD --template="$FX/1brs-crystal.pdb:A+D"
-    run af2-1brs-tmpl "$out/af2" "$in/af2-1brs-tmpl" --weights="${W[af2m]}" --fast --out="$out/af2-1brs-tmpl.pdb"
+  ex2() { local d="$in/af2-$1" b="$2"; shift 2; [ -f "$d/model.idx" ] || node --js-float16array "$N/af2/export_input.mjs" "$d" --bundle="$b" "$@" > /dev/null; }
+  ex2 6mrr "$repo/model" --sequence=$S6; ex2 5caj-tmpl "$repo/model" --sequence=$S5 --template="$FX/5caj-crystal.pdb:A"
+  run af2-6mrr "$out/af2" "$in/af2-6mrr" "${M1[@]}" --fast --out="$out/af2-6mrr.pdb"
+  run af2-5caj-tmpl "$out/af2" "$in/af2-5caj-tmpl" "${M1[@]}" --fast --recycles=0 --out="$out/af2-5caj-tmpl.pdb"
+  run af2-6mrr-f32 "$out/af2" "$in/af2-6mrr" "${M1[@]}" --out="$out/af2-6mrr-f32.pdb"
+  if [ -f "$repo/model-multimer/manifest.json" ]; then
+    ex2 1brs-tmpl "$repo/model-multimer" --sequence=$SA:$SD --template="$FX/1brs-crystal.pdb:A+D"
+    run af2-1brs-tmpl "$out/af2" "$in/af2-1brs-tmpl" "${MM[@]}" --fast --out="$out/af2-1brs-tmpl.pdb"
   fi
 fi
 echo done > "$out/DONE"

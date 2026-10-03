@@ -6,9 +6,9 @@
 #   native/af2/fold 1brs.pdb --sequence=<A>:<B> --model=model_1_multimer_v3
 #   native/af2/fold 5caj.pdb --sequence=<SEQ> --template=5caj.pdb:A       (1brs: --template=1brs.pdb:A+D)
 #
-# --model names a DeepMind parameter set (model_1_ptm .. model_5_ptm, model_1_multimer_v3 ..); its
-# weights are exported once (native/af2/export_weights.py, af3-any-model's conversion) into
-# native/af2/weights-<model>. Input flags (--sequence, --a3m, --search, --template, --recycles,
+# --model is model_1_ptm or model_1_multimer_v3: the two the page publishes whole (its other four of
+# each are deltas against these), read as the page reads them - the bundle (model/, model-multimer/,
+# fetched once by native/fetch_bundles.py) as it is, through maps/<model>.map. Input flags (--sequence, --a3m, --search, --template, --recycles,
 # --max-msa, --max-extra, --seed) go to export_input.mjs; flags after -- go to ./af2, which runs --fast.
 set -euo pipefail
 # the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
@@ -22,14 +22,18 @@ while [ $# -gt 0 ]; do
   case "$1" in --model=*) model="${1#--model=}" ;; *) inputs+=("$1") ;; esac
   shift
 done
-python="${AF2_PYTHON:-$HOME/.venv-lfjax/bin/python}"
-reference="${AF2_REFERENCE:-/tmp/claude-1000/ref}"
 if [ ! -x "$here/af2" ]; then
   (cd "$here" && nvcc -O3 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af2.cu \
      -lcublas -lcublasLt -lcupti -o af2)
 fi
-weights="$here/weights-$model"
-[ -f "$weights/model.idx" ] || "$python" "$here/export_weights.py" --model "$model" --reference "$reference" --out "$weights"
+repo="$(cd "$here/../.." && pwd)"
+case "$model" in
+  model_1_ptm) family=monomer; bundle="$repo/model" ;;
+  model_1_multimer_v3) family=multimer; bundle="$repo/model-multimer" ;;
+  *) echo "no published bundle for $model (model_1_ptm, model_1_multimer_v3)" >&2; exit 1 ;;
+esac
+[ -f "$bundle/manifest.json" ] || python3 "$repo/native/fetch_bundles.py" "$family" >&2
+wflags=(--bundle="$bundle" --map="$here/maps/$model.map")
 tmp="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # af2 starts first and warms up - the CUDA context, the weights on the device, then the embedder and
 # one block of each stack on a synthetic input of the shapes the export will have, which loads every
@@ -49,9 +53,9 @@ seq="${seq//:/}"
 depth=1; [ -z "$a3m" ] || depth=$(grep -c '^>' "$a3m")
 for a in "${inputs[@]}"; do [ "$a" != "--search" ] || depth=$(( maxmsa + maxextra )); done   # (a search is usually deep)
 n=$(( depth < maxmsa ? depth : maxmsa )); e=$(( depth - n )); e=$(( e > maxextra ? maxextra : e )); e=$(( e < 1 ? 1 : e ))
-exec 3< <("$here/af2" "$tmp" --weights="$weights" --fast --out="$out" --wait-input --detach-output --warm="${#seq},$n,$e,$templates" \
+exec 3< <("$here/af2" "$tmp" "${wflags[@]}" --fast --out="$out" --wait-input --detach-output --warm="${#seq},$n,$e,$templates" \
           "${flags[@]}" && rc=0 || rc=$?; echo "af2: exit $rc")
-if ! node "$here/export_input.mjs" "$tmp" --weights="$weights" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
+if ! node --js-float16array "$here/export_input.mjs" "$tmp" --bundle="$bundle" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
 # "af2: done" (its stdout then closes): the fold is written and af2 is only releasing the device
 while IFS= read -r line <&3; do

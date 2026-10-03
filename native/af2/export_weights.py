@@ -61,10 +61,7 @@ def main():
         "atom37_to_atom14": all_atom.RESTYPE_ATOM37_TO_ATOM14,                 # (21, 37) int
         "atom37_mask": all_atom.RESTYPE_ATOM37_MASK,                           # (21, 37)
         "atom14_to_atom37": all_atom.RESTYPE_ATOM14_TO_ATOM37,                 # (21, 14) int
-        # the template torsions (all_atom.atom37_to_torsion_angles, compute_chi_angles)
-        "chi_atom_indices": np.asarray(all_atom.get_chi_atom_indices()),       # (21, 4, 4) int
-        "chi_angles_mask": np.asarray(list(rc.chi_angles_mask) + [[0.0] * 4]),   # (21, 4)
-        "chi_pi_periodic": np.asarray(rc.chi_pi_periodic),                     # (21, 4)
+        # (the template torsions' chi tables are compiled into native/af2: src/chi_tables.cuh)
     }
     for name, value in tables.items():
         value = np.asarray(value)

@@ -30,12 +30,20 @@ Barnase-barstar from its two sequences folds to **0.584 A, ipTM 0.92**, against 
 alignment, and the search takes 3.5 s of a 5.7 s command. It sends the sequences to
 api.colabfold.com, so it is a flag, never a default.
 
-`--model` names a DeepMind parameter set (`model_1_ptm` .. `model_5_ptm`,
-`model_1_multimer_v3` ..). The first use exports its weights from `~/lfjax/af2_params` through the
-reference's own loader and conversion (`export_weights.py`, ~/.venv-lfjax) into
-`native/af2/weights-<model>`. Chains are joined by `:`. `--template` takes a structure of the
-query's own sequence (identity mapping), and `A+D` merges a complex's chains into one slot over the
-whole query. model_3/4/5_ptm have no template embedder and refuse one. Input flags (`--recycles`,
+`--model` is `model_1_ptm` (default) or `model_1_multimer_v3`, the two the page publishes whole,
+and `fold` folds with the page's own weights: the int5 bundle (`model/`, `model-multimer/`, fetched
+once by `native/fetch_bundles.py`), read as it is - its codes decoded on the device - through
+`maps/<model>.map`. `make_map.py` builds a map (~/.venv-lfjax): the monomer's parameters are found in
+the decoded bundle by value (within int5's half step, a tie settled by the manifest's names) and the
+multimer's are joined exactly, every checkpoint element's id run through the page's exporter and the
+reference's loader both; each native tensor is then strided parts of bundle tensors. The template
+torsions' chi tables are compiled in (`src/chi_tables.cuh`). Chains are joined by `:`. `--template`
+takes a structure of the query's own sequence (identity mapping), and `A+D` merges a complex's
+chains into one slot over the whole query. 🔴 **The page's monomer bundle has no
+`template_single_embedding`/`template_projection`**, so a monomer template reaches the fold through
+the pair term alone, as on the page: 5CAJ with its own crystal is 2.531 A / pLDDT 74.5 against
+DeepMind's float32 weights' 0.205 / 97.4 (the multimer's bundle has them: 1BRS 0.272 A). The int5
+cost elsewhere is small - 6MRR 1.900 A / 84.58 against 1.882 / 85.17. Input flags (`--recycles`,
 default 3, `--max-msa` 512, `--max-extra` 1024, `--seed`) go to the exporter. Flags after `--` go
 to `af2`, which `fold` runs with `--fast`.
 
@@ -146,7 +154,8 @@ node native/af2/export_input.mjs native/af2/data-x --sequence=... [--template=..
     --model model_1_ptm --out native/af2/data-x/oracle
 ```
 
-The gate fails when its bounds are tightened under the measured figures (all eight oracle arms
+The oracles compare against af3-any-model on DeepMind's float32 weights, so their arm runs from
+`export_weights.py`'s export (`af2 ... --weights=<dir>`), which is not published. The gate fails when its bounds are tightened under the measured figures (all eight oracle arms
 and the fold). The baseline is this machine's.
 
 ## Traps it cost

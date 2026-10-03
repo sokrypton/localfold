@@ -2,7 +2,8 @@
 // checkpoints, as the reference runs them), from native/af2/export_input.mjs's features and
 // native/af2/export_weights.py's weights.
 //
-//   af2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]
+//   af2 <input dir> --bundle=<page bundle dir> --map=<maps/<model>.map> [--out=fold.pdb] [--recycles=N]
+//   af2 <input dir> --weights=<dir> [--oracle=<dir>] ...      (export_weights.py's: DeepMind's float32)
 //
 // With --oracle (native/af2/oracle.py's dump of the reference on this same input), pass 0 is checked
 // against it stage by stage.
@@ -112,7 +113,9 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     fprintf(stderr, "this checkpoint has no template embedder (models 3 to 5 are template-free): fold without --template\n");
     return 1;
   }
-  if (multimer || monomerTemplates) t.T = templates;   // a template's single features become MSA rows
+  // a template's single features become MSA rows - where the weights carry their embedder: the page's
+  // published bundles do not (its AF2 folds a template through the pair term alone), DeepMind's do
+  if ((multimer || monomerTemplates) && M.has("w/evoformer/template_single_embedding/weights")) t.T = templates;
   int passes = (int)M.meta("meta/passes");
   if (recycles >= 0) passes = std::min(passes, recycles + 1);
   float positionScale = (float)M.meta("meta/position_scale");
@@ -296,10 +299,12 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 // its end returns while the driver releases this process's device (0.16 s of exit; native/af2/fold does)
 static bool DETACH = false;
 int main(int argc, char** argv) {
-  if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
-  std::string weights, oracle, out = "fold.pdb", warmShape; int recycles = -1; bool profile = false, waitInput = false;
+  if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> --map=<file> | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
+  std::string weights, bundleDir, mapFile, oracle, out = "fold.pdb", warmShape; int recycles = -1; bool profile = false, waitInput = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
+    else if (!strncmp(argv[i], "--bundle=", 9)) bundleDir = argv[i] + 9;      // the page's published bundle, as it is,
+    else if (!strncmp(argv[i], "--map=", 6)) mapFile = argv[i] + 6;           // through maps/<model>.map
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
@@ -310,9 +315,11 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;   // L,N,E,T: warm up at those shapes meanwhile
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
-  if (weights.empty()) { fprintf(stderr, "--weights=<dir> (native/af2/export_weights.py)\n"); return 1; }
+  if (bundleDir.empty() != mapFile.empty()) { fprintf(stderr, "--bundle and --map go together\n"); return 1; }
+  if (weights.empty() == bundleDir.empty()) { fprintf(stderr, "--bundle=<dir> --map=<file>, or --weights=<dir>\n"); return 1; }
   auto t0 = std::chrono::steady_clock::now();
-  M.load(weights);
+  if (!weights.empty()) M.load(weights);
+  else M.loadBundle(bundleDir, "", mapFile);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   bool tf32 = FAST && !getenv("AF2_NO_TF32");
   if (getenv("AF2_NO_FLASH")) FAST = false;

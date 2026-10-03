@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Set up the native CUDA ports on a fresh machine (a Colab VM: T4, L4 or A100) from the published bundles:
 #
-#   bash native/colab_setup.sh [ef2] [af3]         (both when none is named)
+#   bash native/colab_setup.sh [ef2] [af3] [af2]    (all three when none is named)
 #
 # Node 22 if the machine's is older (the input exporters run the page's own featurisers), the bundles
 # from the registry's `remote:` URLs (native/fetch_bundles.py) - the weights the page folds with, read
@@ -9,7 +9,7 @@
 # capability). Idempotent: a bundle already on disk is not fetched again.
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(ef2 af3)
+ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(ef2 af3 af2)
 cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"; arch="sm_$cc"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1) ($arch)"
 
@@ -29,7 +29,11 @@ for port in "${ports[@]}"; do
       python3 "$repo/native/fetch_bundles.py" af3          # (read through native/af3/maps/af3.map)
       (cd "$repo/native/af3" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread --use_fast_math src/af3.cu \
          -lcublas -lcublasLt -lcupti -o af3) ;;
-    *) echo "unknown port $port (ef2, af3)" >&2; exit 1 ;;
+    af2)
+      python3 "$repo/native/fetch_bundles.py" monomer multimer   # (read through native/af2/maps/*.map)
+      (cd "$repo/native/af2" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread --use_fast_math src/af2.cu \
+         -lcublas -lcublasLt -lcupti -o af2) ;;
+    *) echo "unknown port $port (ef2, af3, af2)" >&2; exit 1 ;;
   esac
   echo "$port ready"
 done

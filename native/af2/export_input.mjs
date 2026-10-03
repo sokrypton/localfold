@@ -3,14 +3,15 @@
 // model.idx/model.bin format.
 //
 //   node native/af2/export_input.mjs <out dir> --sequence=<SEQ> [--a3m=<path>] [--recycles=3]
-//        [--max-msa=512] [--max-extra=1024] [--seed=0] [--weights=native/af2/weights-model_1_ptm]
+//        [--max-msa=512] [--max-extra=1024] [--seed=0] (--bundle=<page bundle dir> | --weights=<export dir>)
 //        [--search] [--template=<pdb>[:chain[+chain]],...]
 //
 // Entries:  i aatype, residue_index, asym_id, entity_id, sym_id   t seq_mask      (per residue)
 //           t f<k>/msa_feat [N, L, 49], f<k>/msa_mask [N, L]                       (pass k)
 //           i f<k>/extra_msa [E, L]   t f<k>/extra_has_deletion, extra_deletion_value, extra_msa_mask
 //           m meta/tokens, meta/msa_rows, meta/extra_rows, meta/passes
-// The tables the featuriser needs (atom37 maps) are read from the exported weights.
+// The tables the featuriser needs (atom37 maps) are read from the weights: the page's bundle (what
+// native/af2/fold folds with) or export_weights.py's directory (DeepMind's float32, for the oracles).
 import { readFileSync, writeFileSync, mkdirSync, openSync, readSync, writeSync, closeSync, renameSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { makeA3mFeatures } from "../../src/input/a3m-features.js";
@@ -24,27 +25,44 @@ const option = (name, fallback) => {
   return hit === undefined ? fallback : hit.slice(name.length + 3);
 };
 const here = new URL(".", import.meta.url).pathname;
-const weightsDir = option("weights", `${here}weights-model_1_ptm`);
-
-// the two [21, 37] tables, out of the weights' model.bin
-const index = new Map();
-for (const line of readFileSync(`${weightsDir}/model.idx`, "utf8").split("\n")) {
-  const [kind, name, a, b] = line.split(" ");
-  if (kind === "t" || kind === "i") index.set(name, { kind, offset: Number(a), length: Number(b) });
+const bundleDir = option("bundle", "");
+const weightsDir = option("weights", "");
+if ((bundleDir === "") === (weightsDir === "")) throw new Error("--bundle=<page bundle dir> or --weights=<export dir>");
+let tables, isMultimer;
+if (bundleDir !== "") {
+  // the bundle's own residue geometry (float32 there), read with the page's reader
+  const { readTensor } = await import("../../src/weights/dtype.js");
+  const manifest = JSON.parse(readFileSync(`${bundleDir}/manifest.json`, "utf8"));
+  const read = (name) => {
+    const r = manifest.tensors[name];
+    if (!r) throw new Error(`${bundleDir} has no ${name}`);
+    const b = readFileSync(`${bundleDir}/${r.file}`);
+    return Float32Array.from(readTensor(r, b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength), r.byteOffset ?? 0, true));
+  };
+  tables = { atom37ToAtom14: read("geometryAtom37ToAtom14"), atom37Mask: read("geometryAtom37Mask") };
+  isMultimer = manifest.model.name.includes("multimer");
+} else {
+  // the two [21, 37] tables, out of the weights' model.bin
+  const index = new Map();
+  for (const line of readFileSync(`${weightsDir}/model.idx`, "utf8").split("\n")) {
+    const [kind, name, a, b] = line.split(" ");
+    if (kind === "t" || kind === "i") index.set(name, { kind, offset: Number(a), length: Number(b) });
+  }
+  // (each table's own bytes, not the file: reading the 370 MB of weights was a fifth of an export)
+  const binFd = openSync(`${weightsDir}/model.bin`, "r");
+  const table = (name) => {
+    const e = index.get(name);
+    if (!e) throw new Error(`${weightsDir} has no ${name}`);
+    const bytes = Buffer.alloc(e.length * 4);
+    readSync(binFd, bytes, 0, bytes.length, e.offset * 4);
+    const view = e.kind === "i" ? new Int32Array(bytes.buffer, bytes.byteOffset, e.length)
+      : new Float32Array(bytes.buffer, bytes.byteOffset, e.length);
+    return Float32Array.from(view);
+  };
+  tables = { atom37ToAtom14: table("c/atom37_to_atom14"), atom37Mask: table("c/atom37_mask") };
+  closeSync(binFd);
+  isMultimer = readFileSync(`${weightsDir}/model.idx`, "utf8").includes("m meta/multimer 1");
 }
-// (each table's own bytes, not the file: reading the 370 MB of weights was a fifth of an export)
-const binFd = openSync(`${weightsDir}/model.bin`, "r");
-const table = (name) => {
-  const e = index.get(name);
-  if (!e) throw new Error(`${weightsDir} has no ${name}`);
-  const bytes = Buffer.alloc(e.length * 4);
-  readSync(binFd, bytes, 0, bytes.length, e.offset * 4);
-  const view = e.kind === "i" ? new Int32Array(bytes.buffer, bytes.byteOffset, e.length)
-    : new Float32Array(bytes.buffer, bytes.byteOffset, e.length);
-  return Float32Array.from(view);
-};
-const tables = { atom37ToAtom14: table("c/atom37_to_atom14"), atom37Mask: table("c/atom37_mask") };
-closeSync(binFd);
 
 const sequence = option("sequence", "").trim().toUpperCase();
 const a3mPath = option("a3m", "");
@@ -62,7 +80,7 @@ let a3m;
 if (args.includes("--search")) {
   if (a3mPath !== "") throw new Error("--search and --a3m both name the alignment");
   const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import("../../src/input/mmseqs2-api.js");
-  const multimer = readFileSync(`${weightsDir}/model.idx`, "utf8").includes("m meta/multimer 1");
+  const multimer = isMultimer;
   const t0 = performance.now();
   a3m = chains.length === 1 ? (await generateMmseqs2Msa(chains[0], {})).a3m
     : (await generateMmseqs2ComplexMsa(chains, { model: multimer ? "multimer" : "monomer" })).a3m;
@@ -129,7 +147,7 @@ if (templateSpecs.length > 0) {
   int("t/aatype", aat); flt("t/positions", pos); flt("t/mask", msk);
   entries.push(["m", "meta/templates", templateSpecs.length]);
 }
-entries.push(["m", "meta/model", weightsDir.replace(/\/+$/, "").split("/").pop().replace(/^weights-/, "")]);
+if (weightsDir !== "") entries.push(["m", "meta/model", weightsDir.replace(/\/+$/, "").split("/").pop().replace(/^weights-/, "")]);
 entries.push(["m", "meta/tokens", L]);
 entries.push(["m", "meta/msa_rows", first.msaSequences]);
 entries.push(["m", "meta/extra_rows", first.extraSequences]);

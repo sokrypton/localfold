@@ -235,6 +235,8 @@ inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, 
 }
 
 // ---------------------------------------------------------------- the templates' MSA rows
+#include "chi_tables.cuh"
+template <class T, size_t N> inline const T* symbolPtr(const T (&sym)[N]) { void* p; CK(cudaGetSymbolAddress(&p, sym)); return (const T*)p; }
 __device__ inline void sub3(const float* a, const float* b, float* o) { for (int k = 0; k < 3; ++k) o[k] = a[k] - b[k]; }
 __device__ inline float dot3(const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 __device__ inline void cross3(const float* a, const float* b, float* o) {
@@ -322,11 +324,11 @@ inline void templateRows(int L, int T, bool multimer, float* rows, float* rowMas
     const int* aat = Idev("t/aatype") + (size_t)k * L;
     const float* pos = W("t/positions") + (size_t)k * L * 37 * 3; const float* msk = W("t/mask") + (size_t)k * L * 37;
     if (multimer)
-      templateChiFeatK<<<blocks(L, 128), 128, 0, STREAM>>>(aat, pos, msk, Idev("c/chi_atom_indices"), W("c/chi_angles_mask"),
+      templateChiFeatK<<<blocks(L, 128), 128, 0, STREAM>>>(aat, pos, msk, symbolPtr(CHI_ATOM_INDICES), symbolPtr(CHI_ANGLES_MASK),
                                                            feat + (size_t)k * L * F, rowMask + (size_t)k * L, L);
     else
-      templateTorsionFeatK<<<blocks(L, 128), 128, 0, STREAM>>>(aat, pos, msk, Idev("c/chi_atom_indices"), W("c/chi_angles_mask"),
-                                                               W("c/chi_pi_periodic"), feat + (size_t)k * L * F, rowMask + (size_t)k * L, L);
+      templateTorsionFeatK<<<blocks(L, 128), 128, 0, STREAM>>>(aat, pos, msk, symbolPtr(CHI_ATOM_INDICES), symbolPtr(CHI_ANGLES_MASK),
+                                                               symbolPtr(CHI_PI_PERIODIC), feat + (size_t)k * L * F, rowMask + (size_t)k * L, L);
   }
   float* hid = scratch<float>("trow.hid", (size_t)T * L * 256);
   linearB(feat, E + "template_single_embedding", -1, hid, (size_t)T * L, F, 256, true);
