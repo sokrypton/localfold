@@ -5,6 +5,13 @@ import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profi
 import { residentPackedOnDevice } from "../weights/device-weights.js";
 import { SOURCES } from "../weights/weights.js";
 import { createAttentionRegisterFlashShader } from "../../kernels/attention.js";
+
+// The flash kernel's key chunk at this head width (its own f32 rule, max(8, 512 / (2 * head_dim / 4))),
+// rounded down to a whole number of rescale groups: head width 48 derives 21, which no group divides.
+const flashKeyChunk = (dimension, group) => {
+  const chunk = Math.max(8, Math.floor(512 / ((dimension / 4) * 2)));
+  return group > 1 ? Math.max(group, chunk - (chunk % group)) : undefined;
+};
 /**
  * AF3's diffusion token transformer: 24 blocks, AdaLN-conditioned, pair-biased.
  *
@@ -2629,8 +2636,14 @@ export class Af3DiffusionTransformerGpu {
         .then((pipeline) => { compiled.pairLogits[at] = pipeline; }));
     }
     if (flashAttend) {
-      pending.push(this.pipelines.get(`${base}:flash-attend`, createAttentionRegisterFlashShader(dimension, undefined,
-        { scale: 1 / Math.sqrt(dimension), gate: false, sharedMask: true }))
+      // ...with the device's softmax shape, the knobs AF2's attention takes (attentionGroup and
+      // attentionVectorScore). Unset, every key's score was one dependent chain of head_dim/4 dot
+      // products on a dispatch of ~80 workgroups, which is all latency.
+      const { attentionGroup: group = 1, attentionVectorScore: vectorScore = false } =
+        deviceTuning(this.device);
+      pending.push(this.pipelines.get(`${base}:flash-attend:g${group}${vectorScore ? "v" : ""}`,
+        createAttentionRegisterFlashShader(dimension, flashKeyChunk(dimension, group),
+          { scale: 1 / Math.sqrt(dimension), gate: false, sharedMask: true, group, vectorScore }))
         .then((pipeline) => { compiled.flashAttend = pipeline; }));
     }
     await Promise.all(pending);
