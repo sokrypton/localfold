@@ -284,7 +284,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // 🔴 STAGE THE ATTENTION'S KEYS COALESCED. See the note in the kernel.
   diffusionAttendStageKeys: null,
   // 🔴 THE DENOISER'S TOKEN ATTENTION ON THE SHARED FLASH KERNEL (src/kernels/attention.js, AF2's): its own
-  // gave a workgroup to each (query, head) and re-read every key and value for it. null takes it above 100
+  // gave a workgroup to each (query, head) and re-read every key and value for it. null takes it above 80
   // tokens, where it wins on the A100; true and false force either arm.
   diffusionFlashAttend: null,
   // 🔴 HOW MANY WORKGROUPS THE SINGLE PROJECTION AIMS AT. See

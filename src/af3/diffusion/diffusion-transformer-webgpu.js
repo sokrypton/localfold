@@ -2591,11 +2591,11 @@ export class Af3DiffusionTransformerGpu {
     // a key chunk staged once for 64 queries, where `attend` gives every (query, head) its own workgroup and
     // re-reads all T keys and values for it - 10 GB a call at 262 tokens. The score scaled as `attend`
     // scales it, the gate left to attention-output, one mask for every sample. Measured on the A100, 24
-    // blocks a call: 68 tokens 1.13 -> 1.36 ms (ceil(T/64) x heads workgroups starve the card), 100
-    // 1.79/1.80, 128 2.59 -> 2.06, 262 7.70 -> 4.54, 600 33.6 -> 10.4. So by default from 100 tokens up;
-    // the knob forces either arm.
+    // blocks a call, with the ampere prior's g4v softmax (7936301): 68 tokens 1.11 -> 1.27 ms (ceil(T/64)
+    // x heads workgroups starve the card), 100 1.78 -> 1.57, 128 2.59 -> 1.79, 262 7.70 -> 3.25, 600
+    // 33.6 -> 8.17. So by default above 80 tokens; the knob forces either arm.
     const flashTuning = weights.flashAttend ?? deviceTuning(this.device).diffusionFlashAttend;
-    const flashAttend = (flashTuning ?? tokens > 100) !== false && dimension % 4 === 0;
+    const flashAttend = (flashTuning ?? tokens > 80) !== false && dimension % 4 === 0;
     // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
     // sources as a workgroup size, so a cache that ignored it would hand a
     // later run the pipeline compiled for a different width.
