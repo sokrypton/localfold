@@ -85,10 +85,14 @@ constexpr uint32_t ONES_H2 = 0x3C003C00u;      // half2(1, 1)
 // buffer - for a device without cp.async (a T4), where the double buffer's "async" copies are synchronous
 // loads that stall the warp before every tile, and its two stages (39 KB at D 32) let one block an SM fit
 // in a T4's 64 KB. The same arithmetic in the same order: the output is identical.
-template <int D, int WARPS, bool MASKED = true, int BK = FA_BK, bool REG = false, int MINB = 1>
+// STRIDED: rows and positions at arbitrary strides (elements) - an attention ACROSS a tensor's leading axis
+// (an MSA's columns, the triangle's ending node) read where the tensor lies rather than from a transposed
+// copy; native/af2 runs it. Without it the addressing is the dense [rows][positions][4W] layout's, in the
+// same 32-bit arithmetic as always (the strides would cost registers the dense form has none to spare).
+template <int D, int WARPS, bool MASKED = true, int BK = FA_BK, bool REG = false, int MINB = 1, bool STRIDED = false>
 __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, const float* __restrict__ mask, half* __restrict__ out, int n, int heads, size_t r0, bool tr, float scale,
-    const float* qBias) {
+    const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
   constexpr int BQ = 16 * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
   static_assert(BK % 16 == 0, "a key tile is whole k16 steps of the PV product");
   constexpr size_t STAGE = faStage<D, WARPS, BK>();
@@ -104,7 +108,13 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   const size_t rowsHere = gridDim.y / heads;
   size_t b = blockIdx.y; int h = (int)(b / rowsHere); size_t rl = b % rowsHere, r = r0 + rl;
   const int Wd = heads * D, W4 = 4 * Wd;
-  const half* base = qkvg + rl * (size_t)n * W4 + h * D;
+  // a position's offset in q, k, v and the gate, and an output row's
+  auto pos = [&](auto i) { if constexpr (STRIDED) return (size_t)i * posStride; else return i * W4; };
+  auto outAt = [&](int i) -> size_t {
+    if constexpr (STRIDED) return rl * outRowStride + (size_t)i * outPosStride + h * D;
+    else return (rl * n + i) * Wd + h * D;
+  };
+  const half* base = qkvg + (STRIDED ? rl * rowStride : rl * (size_t)n * W4) + h * D;
   int q0 = blockIdx.x * BQ;
   // the loads, with compile-time trip counts and 32-bit offsets: written as a strided loop from
   // threadIdx.x the compiler could not unroll it, and the per-tile index arithmetic was ~800
@@ -121,7 +131,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     int u = k * NT + threadIdx.x, jj = u / (D / 8), c = (u % (D / 8)) * 8;
     kvJ[k] = (KV_CHUNKS % NT == 0 || u < KV_CHUNKS) ? jj : 1 << 30;
     kvOff[k] = jj * LDK + c;
-    kvSrc[k] = base + jj * W4 + Wd + c;
+    kvSrc[k] = base + pos(jj) + Wd + c;
   }
   const half* bSrc[B_PER]; int bOff[B_PER], bC[B_PER]; bool bRow[B_PER];
 #pragma unroll
@@ -137,7 +147,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     for (int k = 0; k < KV_PER; ++k) {
       if (kvJ[k] >= (1 << 30)) continue;
       bool ok = !last || j0 + kvJ[k] < n;
-      const half* src = ok ? kvSrc[k] + j0 * W4 : base;
+      const half* src = ok ? kvSrc[k] + pos(j0) : base;
       cpAsync16(K + kvOff[k], src, ok);
       cpAsync16(V + kvOff[k], src + Wd, ok);
     }
@@ -161,7 +171,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     for (int k = 0; k < KV_PER; ++k) {
       if (kvJ[k] >= (1 << 30)) continue;
       bool ok = !last || j0 + kvJ[k] < n;
-      const half* src = kvSrc[k] + (ok ? j0 * W4 : 0);
+      const half* src = kvSrc[k] + (ok ? pos(j0) : 0);
       kr[k][0] = ok ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
       kr[k][1] = ok ? *reinterpret_cast<const uint4*>(src + Wd) : make_uint4(0, 0, 0, 0);
     }
@@ -190,7 +200,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   int i0 = q0 + warp * 16 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
     if (i >= n) return 0u;
-    half2 v = *reinterpret_cast<const half2*>(base + (size_t)i * W4 + e);
+    half2 v = *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i) : (size_t)i * W4) + e);
     float2 f = __half22float2(v);
     if (qBias) { f.x += qBias[h * D + e]; f.y += qBias[h * D + e + 1]; }   // the query's bias, folded in here
     return pack2(f.x * scale * LOG2E, f.y * scale * LOG2E);
@@ -282,15 +292,15 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   half2 ga[D / 8], gb[D / 8];
   for (int et = 0; et < D / 8; ++et) {
     int e = et * 8 + tig * 2;
-    ga[et] = i0 < n ? *reinterpret_cast<const half2*>(base + (size_t)i0 * W4 + 3 * Wd + e) : half2{};
-    gb[et] = i1 < n ? *reinterpret_cast<const half2*>(base + (size_t)i1 * W4 + 3 * Wd + e) : half2{};
+    ga[et] = i0 < n ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i0) : (size_t)i0 * W4) + 3 * Wd + e) : half2{};
+    gb[et] = i1 < n ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i1) : (size_t)i1 * W4) + 3 * Wd + e) : half2{};
   }
   for (int et = 0; et < D / 8; ++et) {
     int e = et * 8 + tig * 2;
     float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
-    if (i0 < n) *reinterpret_cast<half2*>(out + (rl * n + i0) * Wd + h * D + e) =
+    if (i0 < n) *reinterpret_cast<half2*>(out + outAt(i0) + e) =
         __floats2half2_rn(o[et][0] / l0 * sigm(a.x), o[et][1] / l0 * sigm(a.y));
-    if (i1 < n) *reinterpret_cast<half2*>(out + (rl * n + i1) * Wd + h * D + e) =
+    if (i1 < n) *reinterpret_cast<half2*>(out + outAt(i1) + e) =
         __floats2half2_rn(o[et][2] / l1 * sigm(b2.x), o[et][3] / l1 * sigm(b2.y));
   }
 }
