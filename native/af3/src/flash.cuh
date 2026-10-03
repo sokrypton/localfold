@@ -569,7 +569,15 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   }
   switch (warps) {
     case 8: flashGridHalfAt<D, 8, BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
-    case 4: flashGridHalfAt<D, 4, BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
+    case 4:
+      // the pair track's 32-wide heads in 48-key tiles where cp.async double-buffers them: smaller stages, more
+      // blocks an SM - --bench-grid on an A100 1.036 against 1.211 ms at 524 tokens, 7.23 against 7.80 at 1044,
+      // level at 262; an L4 (99 KB a block) 0.566 against 0.747 at 262. A T4's register-staged form keeps 64
+      // (48 is 1.45 against 1.22 ms there)
+      if constexpr (D == 32) {
+        if (!flashRegStaged()) { flashGridHalfAt<D, 4, 48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break; }
+      }
+      flashGridHalfAt<D, 4, BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
     case 2: flashGridHalfAt<D, 2>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
     default: flashGridHalfAt<D, 1>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
   }

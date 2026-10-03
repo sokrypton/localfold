@@ -333,6 +333,17 @@ place with volatile asm (no change), and the grid attention unfused (`LOCALFOLD_
 `triangle`, `transition`): level at 262 tokens, 4% slower at 524. The T4 drifts up to 7% between repeats
 of one arm (it throttles to ~1 GHz under load), so interleave arms there.
 
+## On an L4 (Ada, sm_89, 99 KB of shared memory a block)
+
+Profiled on a Colab L4 (2026-10-03): a 262-token AF3 fold was 2.03 s, and the triangle multiplications
+were 53% of its trunk - the fused triangle's output kernel needs 104-139 KB at 8 warps, so the L4 ran the
+whole 128-channel lineage on the UNFUSED triangle (its gate, add and norm passes 31% of the fold). The
+output kernel now takes 4 warps where 8 do not fit (71 KB): **1.98 -> 1.54 s a fold on the L4**, the A100
+byte-identical (8 warps fit there). And the flash kernel's 64-key tiles were the wrong size on both cards:
+48-key tiles (smaller stages, more blocks an SM) are 0.566 against 0.747 ms on the L4 at 262 tokens, and
+on the A100 1.036 against 1.211 at 524, 7.23 against 7.80 at 1044, level at 262 - AF3's trunk at 1048
+tokens 8.11 -> 7.87 s. The T4's register-staged form keeps 64 (48 is slower there).
+
 ## The wider pair tracks
 
 protenix2 (256 channels), OpenDDE (384) and IntelliFold-2 (512) are 2.4x, 4x and 5.2x AlphaFold 3's trunk

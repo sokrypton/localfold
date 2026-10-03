@@ -217,17 +217,17 @@ __global__ void __launch_bounds__(WARPS * 32) flashStrided(const half* __restric
 }
 
 
-template <int D, int WARPS, bool MASKED, bool REG>
+template <int D, int WARPS, bool MASKED, bool REG, int BK = FA_BK>
 void flashStridedRun(const half* qkvg, const half* bias, int stride, const float* mask, half* out, int n, int heads,
                      size_t rows, float scale, size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
-  const int bytes = (REG ? 1 : 2) * faStage<D, WARPS>();
+  const int bytes = (REG ? 1 : 2) * faStage<D, WARPS, BK>();
   static bool attr = false;
   if (!attr) {
-    smemAttr((flashStrided<D, WARPS, MASKED, FA_BK, REG>), bytes);
+    smemAttr((flashStrided<D, WARPS, MASKED, BK, REG>), bytes);
     attr = true;
   }
   dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
-  flashStrided<D, WARPS, MASKED, FA_BK, REG><<<grid, 32 * WARPS, bytes, STREAM>>>(
+  flashStrided<D, WARPS, MASKED, BK, REG><<<grid, 32 * WARPS, bytes, STREAM>>>(
     qkvg, bias, stride, mask, out, n, heads, scale, rowStride, posStride, outRowStride, outPosStride);
 }
 template <int D, int WARPS, bool MASKED>
@@ -235,6 +235,8 @@ void flashStridedAt(const half* qkvg, const half* bias, int stride, const float*
                     size_t rows, float scale, size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
   if (flashRegStaged())
     flashStridedRun<D, WARPS, MASKED, true>(qkvg, bias, stride, mask, out, n, heads, rows, scale, rowStride, posStride, outRowStride, outPosStride);
+  else if constexpr (D == 32)     // (48-key tiles where cp.async double-buffers: flashGridHalfLaunch's rule)
+    flashStridedRun<D, WARPS, MASKED, false, 48>(qkvg, bias, stride, mask, out, n, heads, rows, scale, rowStride, posStride, outRowStride, outPosStride);
   else
     flashStridedRun<D, WARPS, MASKED, false>(qkvg, bias, stride, mask, out, n, heads, rows, scale, rowStride, posStride, outRowStride, outPosStride);
 }

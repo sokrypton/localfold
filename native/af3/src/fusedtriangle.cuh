@@ -404,40 +404,46 @@ void triIn128(const float* pair, const float* mask, const std::string& pre, cons
   }
 }
 inline bool TRI_OUT_PERSISTENT = true;
-template <class TP> constexpr size_t triOutPSmem() {
-  return (size_t)128 * 136 * 2 + (size_t)16 * TO_WARPS * 136 * 2 + (size_t)2 * 128 * (16 * TO_WARPS + 16 / sizeof(TP)) * sizeof(TP);
+template <class TP> constexpr size_t triOutPSmem(int warps = TO_WARPS) {
+  return (size_t)128 * 136 * 2 + (size_t)16 * warps * 136 * 2 + (size_t)2 * 128 * (16 * warps + 16 / sizeof(TP)) * sizeof(TP);
 }
-template <class TP> constexpr size_t triOutSmem() {
-  return (size_t)128 * 136 * 2 + (size_t)16 * TO_WARPS * 136 * 2 + (size_t)128 * (16 * TO_WARPS + 16 / sizeof(TP)) * sizeof(TP);
+template <class TP> constexpr size_t triOutSmem(int warps = TO_WARPS) {
+  return (size_t)128 * 136 * 2 + (size_t)16 * warps * 136 * 2 + (size_t)128 * (16 * warps + 16 / sizeof(TP)) * sizeof(TP);
 }
-// the three fused triangle kernels fit this device (not a T4's 64 KB: the unfused path runs there)
+// the three fused triangle kernels fit this device - at 4 warps if not 8: an L4's 99 KB a block takes the
+// output kernel at 4 (71 KB; 104 KB at 8); a T4's 64 KB takes none, and the unfused path runs there
 template <class TP> bool triFusedFits() {
-  return fitsSmem(triInSmem(4)) && fitsSmem(std::min(triOutPSmem<TP>(), triOutSmem<TP>()));
+  return fitsSmem(triInSmem(4)) && fitsSmem(std::min(triOutPSmem<TP>(4), triOutSmem<TP>(4)));
 }
-template <class TP>
-void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
-  constexpr int C = 128, R = 16 * TO_WARPS;
+template <class TP, int WARPS>
+void triOutAt(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
+  constexpr int C = 128, R = 16 * WARPS;
   size_t pp = (size_t)np * np;
-  if (TRI_OUT_PERSISTENT && fitsSmem(triOutPSmem<TP>())) {
+  if (TRI_OUT_PERSISTENT && fitsSmem(triOutPSmem<TP>(WARPS))) {
     size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)2 * C * (R + 16 / sizeof(TP)) * sizeof(TP);
     static int grid = 0;
     if (!grid) {
-      smemAttr((triOutPK<C, TO_WARPS, TP>), (int)smem);
+      smemAttr((triOutPK<C, WARPS, TP>), (int)smem);
       int perSm = 0, sms = 0;
-      CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, triOutPK<C, TO_WARPS, TP>, 32 * TO_WARPS, smem));
+      CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, triOutPK<C, WARPS, TP>, 32 * WARPS, smem));
       CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
       grid = std::max(1, perSm) * sms;
     }
     size_t tiles = (pp + R - 1) / R;
-    triOutPK<C, TO_WARPS, TP><<<(unsigned)std::min<size_t>(grid, tiles), 32 * TO_WARPS, smem, STREAM>>>(
+    triOutPK<C, WARPS, TP><<<(unsigned)std::min<size_t>(grid, tiles), 32 * WARPS, smem, STREAM>>>(
       prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np, cs);
     return;
   }
   size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 16 / sizeof(TP)) * sizeof(TP);
   static bool attr = false;
-  if (!attr) { smemAttr((triOutK<C, TO_WARPS, TP>), (int)smem); attr = true; }
-  triOutK<C, TO_WARPS, TP><<<(unsigned)((pp + R - 1) / R), 32 * TO_WARPS, smem, STREAM>>>(
+  if (!attr) { smemAttr((triOutK<C, WARPS, TP>), (int)smem); attr = true; }
+  triOutK<C, WARPS, TP><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np, cs);
+}
+template <class TP>
+void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
+  if (fitsSmem(std::min(triOutPSmem<TP>(TO_WARPS), triOutSmem<TP>(TO_WARPS)))) triOutAt<TP, TO_WARPS>(prod, pre, t2, pair, n, np, cs);
+  else triOutAt<TP, 4>(prod, pre, t2, pair, n, np, cs);
 }
 
 // out[h][row] = (LN(x[row]) W)[h] for a projection to few heads (N a multiple of 16, W (C, N)):
