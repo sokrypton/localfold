@@ -189,6 +189,9 @@ static int foldInput(const Opts& o, bool warm) {
   return 0;
 }
 
+// --detach-output: on success the last line is "ef2: done" and stdout closes, so a caller reading it to
+// its end returns while the driver releases this process's device (0.14 s of exit; native/ef2/fold does)
+static bool DETACH = false;
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
   std::string weights, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false; std::string warmShape;
@@ -203,6 +206,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;    // T,A: fold a synthetic input of that size meanwhile
     else if (!strcmp(argv[i], "--profile")) profile = true;
+    else if (!strcmp(argv[i], "--detach-output")) DETACH = true;
     else if (!strcmp(argv[i], "--no-fused")) FUSED = false;
     else if (!strcmp(argv[i], "--no-fused256")) FUSED256 = false;
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
@@ -259,5 +263,7 @@ int main(int argc, char** argv) {
   M.load(argv[1]);
   if (!oracle.empty()) M.load(oracle);
   printf("loaded in %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tStart).count());
-  finish(foldInput(o, false));
+  int rc = foldInput(o, false);
+  if (DETACH && rc == 0) { printf("ef2: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
+  finish(rc);
 }

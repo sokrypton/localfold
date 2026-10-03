@@ -164,11 +164,11 @@ Elsewhere:
 | trunk, 4 passes | 43 ms | 320 ms |
 | sampler, 11 steps | 28 ms | 48 ms |
 | confidence | 4 ms | 18 ms |
-| sequence to PDB (`fold`, cold process) | 0.77 s | 1.13 s |
+| sequence to PDB (`fold`, cold process) | 0.64 s | 0.99 s |
 
 ## Start-up
 
-`fold`, sequence to PDB in a cold process: 6MRR **1.15 → 0.77 s**, 5CAJ **1.97 → 1.13 s**.
+`fold`, sequence to PDB in a cold process: 6MRR **1.15 → 0.64 s**, 5CAJ **1.97 → 0.99 s**.
 The fold's own compute is 0.09 and 0.40 s of that. The rest:
 - **The CUDA context: 0.20 s.** Created while the input is exported (0.16 s).
 - **The weights, read with `pread` into pinned buffers rather than mapped: 0.24 s for 2.9 GB.**
@@ -182,6 +182,10 @@ The fold's own compute is 0.09 and 0.40 s of that. The rest:
 - **The warm-up is capped at 96 tokens.** A warm fold the input's size outlasted the upload: 5CAJ's
   261 tokens cost 0.2 s. The warm-up loads kernel modules and cuBLAS plans, and 96 tokens is already
   in the fused kernels' range.
+
+- **`fold` returns once the PDB is written.** On success `ef2 --detach-output` prints `ef2: done` and
+  closes stdout, and the driver releases the device after the wrapper has returned (0.14 s), as
+  native/af3's does.
 
 `EF2_STARTUP=1` prints the context and upload times.
 
