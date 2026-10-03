@@ -109,6 +109,9 @@ def cases(offline):
          (f"{FIX}/1brs-crystal.pdb", "A,D"), 25.0, len(sa) + len(sd), None),
         ("esmfold2 6mrr", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
+        # (past 80 tokens: ESMFold2's 256-channel trunk on its fused kernels, native/af3/src/fused256.cuh)
+        ("esmfold2 5caj", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
+         "entities": [protein(s5)], "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 3.0, None, None),
         ("esmfold2 300M 6mrr", {"family": "ef2-fast-300m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         # the page's short schedule (web/af3-model.js diffusionScheduleFor), which the page resolves and sends:

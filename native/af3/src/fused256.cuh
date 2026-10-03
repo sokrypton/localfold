@@ -84,15 +84,24 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
 // tile is staged channel-major (stride R + 1: the per-row reductions read a column, conflict-free), the
 // centre norm's statistics taken per row, and each warp's A fragments built straight from the tile,
 // normalised on the way; the tile's memory then holds Wout's stages, 32 output columns at a time.
-template <int C, int WARPS>
+// TT, NC: the tile's type and the output columns a weight stage holds. A float tile at 32 columns is 66.5 KB a
+// block (two an SM on an A100); a bf16 tile at 16 is 34 KB (four, the registers' limit) - the product held
+// at AF3's activation precision, which is what AF3's own triangle runs in
+template <int C, int WARPS, class TT = float, int NC = 32>
+__host__ __device__ constexpr size_t triangleOutSmem() {
+  constexpr int R = 16 * WARPS;
+  constexpr size_t tile = (size_t)C * (R + 1) * sizeof(TT), stages = (size_t)2 * C * (NC + 8) * 2 + (size_t)R * (NC + 4) * 4;
+  return (tile > stages ? tile : stages) + 2 * (size_t)R * 4;
+}
+template <int C, int WARPS, class TT = float, int NC = 32>
 __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
     float* __restrict__ pair, int L, int Lp) {
-  constexpr int NC = 32, R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + 1, LDW = NC + 8, KS = C / 16;
-  constexpr size_t PS = (size_t)C * LDP * 4, STAGE = (size_t)C * LDW * 2;
-  static_assert(2 * STAGE <= PS, "the weight stages reuse the product tile's memory");
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + 1, LDW = NC + 8, KS = C / 16;
+  constexpr size_t STAGE = (size_t)C * LDW * 2;
+  constexpr size_t PS = triangleOutSmem<C, WARPS, TT, NC>() - 2 * (size_t)R * 4;
   extern __shared__ __align__(16) unsigned char smem[];
-  float* Ps = (float*)smem;                                   // [C][LDP], then the weight stages
+  TT* Ps = (TT*)smem;                                         // [C][LDP], then the weight stages
   float* stat = (float*)(smem + PS);                          // [R] mean, [R] 1/sd
   auto Ws = [&](int s) { return (half*)(smem + s * STAGE); };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
@@ -105,14 +114,14 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restri
     size_t row = row0 + r;
     bool live = row < P;
     const float* src = prod + (live ? padded(row) : 0);
-#pragma unroll 8
-    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = live ? src[(size_t)c * plane] : 0.f;
+#pragma unroll 32
+    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? src[(size_t)c * plane] : 0.f);
   }
   __syncthreads();
   for (int r = warp; r < R; r += WARPS) {                     // the centre norm's mean and 1/sd, a warp a row
     float v[C / 32], s = 0.f;
 #pragma unroll
-    for (int k = 0; k < C / 32; ++k) { v[k] = Ps[(lane + 32 * k) * LDP + r]; s += v[k]; }
+    for (int k = 0; k < C / 32; ++k) { v[k] = (float)Ps[(lane + 32 * k) * LDP + r]; s += v[k]; }
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
     float mean = s / C, q = 0.f;
 #pragma unroll
@@ -124,7 +133,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restri
   // A fragments of m16n8k16: a0 (row g, k 2tig..+1), a1 (row g+8, ...), a2 (row g, k+8), a3 (row g+8, k+8)
   int ra = warp * 16 + g, rb = ra + 8;
   float ma = stat[ra], ia = stat[R + ra], mb = stat[rb], ib = stat[R + rb];
-  auto nrm = [&](int r, float m, float inv, int k) { return (Ps[k * LDP + r] - m) * inv * cnScale[k] + cnOffset[k]; };
+  auto nrm = [&](int r, float m, float inv, int k) { return ((float)Ps[k * LDP + r] - m) * inv * cnScale[k] + cnOffset[k]; };
   uint32_t xa[KS][4];
 #pragma unroll
   for (int ks = 0; ks < KS; ++ks) {
@@ -147,7 +156,6 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restri
   // the output chunk, staged so the gate and the residual go out 16 bytes a thread, a row's 32 columns
   // contiguous (a fragment's own stores are 8 bytes a row, eight rows a warp)
   constexpr int LDO = NC + 4;
-  static_assert(2 * STAGE + (size_t)R * LDO * 4 <= PS, "the output chunk fits beside the weight stages");
   float* Os = (float*)(smem + 2 * STAGE);
   constexpr int chunks = C / NC;
   for (int n = 0; n < chunks; ++n) {
@@ -298,6 +306,26 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
       }
     }
     __syncthreads();
+  }
+}
+
+// the triangle's output side, launched: the bf16 tile at 16-column stages (LOCALFOLD_TRIOUT_F32=1: the float tile)
+template <int C, int WARPS>
+void triangleOutRun(const float* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
+                    int L, int Lp) {
+  static const bool f32 = getenv("LOCALFOLD_TRIOUT_F32") != nullptr;
+  constexpr int R = 16 * WARPS;
+  size_t P = (size_t)L * L;
+  if (f32) {
+    constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32>();
+    static bool attr = false;
+    if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32>), (int)smem); attr = true; }
+    triangleOutK<C, WARPS, float, 32><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, Wout, t2, pair, L, Lp);
+  } else {
+    constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16>();
+    static bool attr = false;
+    if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16>), (int)smem); attr = true; }
+    triangleOutK<C, WARPS, __nv_bfloat16, 16><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, Wout, t2, pair, L, Lp);
   }
 }
 

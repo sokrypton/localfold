@@ -299,15 +299,13 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         static bool attr = false;
         if (!attr) {
           smemAttr((triIn256K<CC, WI>), (int)wideTriInSmem(CC));
-          smemAttr((triangleOutK<CC, WO>), (int)wideTriOutSmem(CC));
           attr = true;
         }
         triIn256K<CC, WI><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmem(CC), STREAM>>>(
           pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
           a, b, t2, n, np, cs);
         contract();
-        triangleOutK<CC, WO><<<(unsigned)((pairs + 16 * WO - 1) / (16 * WO)), 32 * WO, wideTriOutSmem(CC), STREAM>>>(
-          prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np);
+        triangleOutRun<CC, WO>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np);
       });
       return;
     }

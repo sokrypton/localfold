@@ -22,12 +22,7 @@ void transitionUp(const float* x, const float* sc, const float* of, const half* 
 template <int WARPS>
 void triangleOut(const float* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
                  int L, int Lp) {
-  constexpr int C = 256, R = 16 * WARPS;
-  size_t smem = (size_t)C * (R + 1) * 4 + 2 * (size_t)R * 4;
-  static bool attr = false;
-  if (!attr) { smemAttr((triangleOutK<C, WARPS>), (int)smem); attr = true; }
-  size_t P = (size_t)L * L;
-  triangleOutK<C, WARPS><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, Wout, t2, pair, L, Lp);
+  triangleOutRun<256, WARPS>(prod, sc, of, Wout, t2, pair, L, Lp);
 }
 template <int WARPS>
 void triIn256(const float* pair, const float* mask, const std::string& Tn, half* a, half* b, half* t2, int n, int np, size_t cs) {

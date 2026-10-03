@@ -377,6 +377,13 @@ same kernels fit one block an SM and LOSE (2160 against 1925 ms, 3360 against 28
 On an L4 they pay more than on the A100, at one block an SM: protenix2's trunk **5.13 -> 4.12 s** at 262
 tokens, ESMFold2's (whose they were) 1.60 -> 1.07.
 
+The triangle-out kernel of the set was latency-bound (Nsight Compute: 12.5% occupancy, tensor pipes 8% busy,
+the warps waiting on global loads) - its float tile of the product, 66.5 KB, fitted two 4-warp blocks an
+SM. It holds the product in bf16 now (AF3's own activation precision) and takes the output weights 16
+columns a stage: 34 KB, four blocks (the registers' limit), and its load loop keeps 32 loads in flight
+rather than 8. ESMFold2's trunk 326.8 -> 313.1 ms at 262 tokens and 1114 -> 1036 at 524; 5CAJ 2.100 ->
+2.101 A (ESMFold2) and 0.190 -> 0.191 (protenix2 templated); `LOCALFOLD_TRIOUT_F32=1` is the float tile.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
