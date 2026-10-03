@@ -96,3 +96,33 @@ __global__ void layerNormVK(const float* __restrict__ x, half* __restrict__ y, s
                             (v[k][u + 1] - mean) * inv * scale[c + u + 1] + offset[c + u + 1]);
   }
 }
+// the outer product mean's permute and residual (native/af2 and native/af3 each had both)
+// [(bi, c), (j, e)] -> [(bi, j), (c, e)]
+template <class T>
+__global__ void opmPermuteK(const T* in, T* out, int Bi, int n, int O) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)Bi * n * O * O;
+  if (t >= total) return;
+  int e = (int)(t % O); size_t rest = t / O; int c = (int)(rest % O); rest /= O;
+  int j = (int)(rest % n); int bi = (int)(rest / n);
+  out[t] = in[((size_t)bi * O + c) * ((size_t)n * O) + (size_t)j * O + e];
+}
+// eight halves (16 bytes) a thread: O is a multiple of 8, so a run of e never straddles a row
+__global__ void opmPermuteHK(const half* Pm, half* X, int bi, int L, int O) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int O8 = O / 8;
+  if (t >= (size_t)bi * L * O * O8) return;
+  int e8 = (int)(t % O8); size_t r = t / O8; int c = (int)(r % O); r /= O; int j = (int)(r % L), i = (int)(r / L);
+  reinterpret_cast<uint4*>(X)[t] =
+      reinterpret_cast<const uint4*>(Pm)[(((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O) / 8 + e8];
+}
+// pair[i][j] += (bias + x) / (1e-3 + norm[i][j])   (AF3: the bias inside the scale)
+__global__ void opmAddK(float* pair, const float* x, const float* bias, const float* norm, size_t i0,
+                        int Bi, int n, int C, bool biasAfterNorm) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)Bi * n * C) return;
+  int f = (int)(t % C); size_t ij = t / C; size_t i = i0 + ij / n, j = ij % n;
+  float nv = norm[i * n + j];
+  float v = biasAfterNorm ? x[t] / fmaxf(nv, 1.f) + bias[f] : (bias[f] + x[t]) / (1e-3f + nv);
+  pair[(i * n + j) * C + f] += v;
+}

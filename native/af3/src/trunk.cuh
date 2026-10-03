@@ -281,26 +281,6 @@ __global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) x[t] = fromF<T>(toF(x[t]) * mask[t / C]);
 }
-// [(bi, c), (j, e)] -> [(bi, j), (c, e)]
-template <class T>
-__global__ void opmPermuteK(const T* in, T* out, int Bi, int n, int O) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  size_t total = (size_t)Bi * n * O * O;
-  if (t >= total) return;
-  int e = (int)(t % O); size_t rest = t / O; int c = (int)(rest % O); rest /= O;
-  int j = (int)(rest % n); int bi = (int)(rest / n);
-  out[t] = in[((size_t)bi * O + c) * ((size_t)n * O) + (size_t)j * O + e];
-}
-// pair[i][j] += (bias + x) / (1e-3 + norm[i][j])   (AF3: the bias inside the scale)
-__global__ void opmAddK(float* pair, const float* x, const float* bias, const float* norm, size_t i0,
-                        int Bi, int n, int C, bool biasAfterNorm) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)Bi * n * C) return;
-  int f = (int)(t % C); size_t ij = t / C; size_t i = i0 + ij / n, j = ij % n;
-  float nv = norm[i * n + j];
-  float v = biasAfterNorm ? x[t] / fmaxf(nv, 1.f) + bias[f] : (bias[f] + x[t]) / (1e-3f + nv);
-  pair[(i * n + j) * C + f] += v;
-}
 // T: the projections and the contraction's inputs (f16 on the fast path, tensor cores, f32
 // accumulation); the contraction's output, the mask normaliser and the residual stay f32.
 template <class T>
@@ -337,7 +317,13 @@ void outerProductMean(Trunk& t, const std::string& pre) {
     // col-major: P^T (n*O x bi*O) = R^T(op N on R as (n*O x S), ld n*O) * L_blk (op T)
     CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, n * O, bi * O, S, &one, R, cudaType<T>(), n * O,
                     L + (size_t)i0 * O, cudaType<T>(), n * O, &zero, P, cudaType<T>(), n * O, CUBLAS_COMPUTE_32F, algo));
-    opmPermuteK<T><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
+    // (16 bytes a thread where the type and width allow: native/af2's opmPermuteHK)
+    if constexpr (std::is_same_v<T, half>) {
+      if (O % 8 == 0) opmPermuteHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(P, Pp, bi, n, O);
+      else opmPermuteK<T><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
+    } else {
+      opmPermuteK<T><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(P, Pp, bi, n, O);
+    }
     linear<T, float>(Pp, X, (size_t)bi * n, O * O, C, pre + ".outputW");
     opmAddK<<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(t.pair, X, W(pre + ".outputB"), norm, i0, bi, n,
                                                            C, after);

@@ -379,7 +379,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
                       CUDA_R_16F, L * O, &zero, Pm, CUDA_R_16F, L * O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
       opmPermuteHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(Pm, X, bi, L, O);
       ltGemm(X, PH(Op + "/output_w", blk), Y, false, (size_t)bi * L, O * O, 128, nullptr, false, 0.f);
-      opmAddK2<<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128);
+      opmAddK<<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false);
     }
     return;
   }
@@ -404,9 +404,9 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     // row-major P (bi*O x L*O) = left_blk^T right, as col-major P^T = right * left_blk^T
     CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &one, rt, L * O, lt + (size_t)i0 * O, L * O,
                    &zero, Pm, L * O));
-    opmPermuteK2<<<blocks((size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
+    opmPermuteK<float><<<blocks((size_t)bi * per), 256, 0, STREAM>>>(Pm, X, bi, L, O);
     gemm(X, P(Op + "/output_w", blk), Y, (size_t)bi * L, O * O, 128);
-    opmAddK2<<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128);
+    opmAddK<<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false);
   }
 }
 // a, b [c][i][k] (channel-major) from the projection's two halves, masked and gated

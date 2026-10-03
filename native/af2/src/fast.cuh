@@ -287,15 +287,6 @@ __global__ void scaleRowsHK(half* x, const float* mask, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) x[t] = __float2half(__half2float(x[t]) * mask[t / C]);
 }
-// eight halves (16 bytes) a thread: O is a multiple of 8, so a run of e never straddles a row
-__global__ void opmPermuteHK(const half* Pm, half* X, int bi, int L, int O) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  int O8 = O / 8;
-  if (t >= (size_t)bi * L * O * O8) return;
-  int e8 = (int)(t % O8); size_t r = t / O8; int c = (int)(r % O); r /= O; int j = (int)(r % L), i = (int)(r / L);
-  reinterpret_cast<uint4*>(X)[t] =
-      reinterpret_cast<const uint4*>(Pm)[(((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O) / 8 + e8];
-}
 
 // ---------------------------------------------------------------- a bias carried by the product
 // W [K, N] (f16) with its bias as row K and zero rows to K+8: an input whose row carries a 1 at

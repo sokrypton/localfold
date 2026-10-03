@@ -330,21 +330,6 @@ __global__ void globalGateK(const float* avg, const float* gate, float* out, int
   out[t] = avg[b * W + w] / (1.f + __expf(-gate[t]));
 }
 
-// ---------------------------------------------------------------- outer product mean
-// P[(i, c), (j, e)] (rows i0.., a block of bi of them) -> X[(i, j), (c, e)]
-__global__ void opmPermuteK2(const float* Pm, float* X, int bi, int L, int O) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)bi * L * O * O) return;
-  int e = (int)(t % O); size_t r = t / O; int c = (int)(r % O); r /= O; int j = (int)(r % L), i = (int)(r / L);
-  X[t] = Pm[((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O + e];
-}
-// pair[(i0+i), j] += (X[i, j] + b) / (1e-3 + norm[i0+i, j])
-__global__ void opmAddK2(float* pair, const float* X, const float* b, const float* norm, int i0, int bi, int L, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)bi * L * C) return;
-  int f = (int)(t % C); size_t ij = t / C; size_t i = i0 + ij / L, j = ij % L;
-  pair[(i * L + j) * C + f] += (X[t] + b[f]) / (1e-3f + norm[i * L + j]);
-}
 __global__ void scaleRowsK2(float* x, const float* mask, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) x[t] *= mask[t / C];
