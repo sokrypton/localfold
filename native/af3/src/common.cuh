@@ -295,12 +295,12 @@ template <class T> T* scratch(const std::string& name, size_t n) {
   return (T*)p;
 }
 
-// The process's end once its outputs are written: flushed, then _exit - the driver reclaims the device
-// with the process, where returning from main freed every allocation and destroyed the context and the
-// cuBLAS handles first (335 ms after native/ef2 had written its PDB, a third of a 6MRR fold's wall)
+// The process's end once its outputs are written: flushed first. (std::exit, not _exit: _exit measured no
+// faster - the time is the driver's release of the device, which --detach-output takes off a caller's
+// clock - and it skipped the atexit reports, AF2_GEMM_TIMES among them.)
 [[noreturn]] inline void finish(int rc) {
   fflush(stdout); fflush(stderr);
-  _exit(rc);
+  std::exit(rc);
 }
 // LOCALFOLD_MEM=1: device memory in use at a phase boundary, and the largest scratch buffers
 inline void memReport(const char* at) {
