@@ -388,6 +388,8 @@ export async function compilePairTrack(cache, options) {
         // the geometry is swept per kernel and never inherited. See
         // src/af3/trunk/grid-attention-matrix.js.
         attendMatrix: options.attendMatrix ?? false,
+        // ...and the register-tiled vector attend where there are no matrix units (gridAttendTiled).
+        attendTiled: options.attendTiled ?? false,
         chunked: gridChunked,
         // 🔴 THE DEVICE'S OWN LIMIT, because `grid.normalize`'s row tile stages
         // `rows * channels` floats and IntelliFold-2's 512 channels put the
@@ -468,6 +470,7 @@ export async function compilePairTrack(cache, options) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
                   + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}`
+                  + `:t${options.attendTiled ?? 0}`
                   + `:ch${gridChunked}`
                   // ...and every row tile, which the device's storage limit
                   // now chooses. They are baked into the source AND divide the

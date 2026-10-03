@@ -904,14 +904,161 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
   const matrixGeometry = shape.attendMatrix
     ? gridAttendMatrixGeometry(shape.attendMatrix === true ? undefined : shape.attendMatrix)
     : null;
-  const attendShader = matrixGeometry === null ? attend : createGridAttendMatrixShader(
+  // 🔴 THE REGISTER-TILED FORM, for a device with no matrix units - which is every visitor (see
+  // CLAUDE.md, round four). `attend` gives a lane ONE query: each key costs it 16 vec4 workgroup reads
+  // for 64 multiply-adds, plus a rescale of all eight accumulators, and nothing it reads is shared with
+  // a second query. Here a lane holds a 4x4 block of (query, key) scores, so a staged vec4 feeds four
+  // dot products; the softmax max is reduced across the eight lanes of a query row through workgroup
+  // memory, the running sum stays a per-lane partial until the end, and the output is rescaled once a
+  // 32-key tile instead of once a key. Same bindings, same masking (the conditional subtraction the
+  // note in `attend` insists on), same clamped indices. Head width 32 only.
+  const tiledShape = (typeof shape.attendTiled === "string" ? shape.attendTiled : "4x4").split("x").map(Number);
+  // workgroup bytes: q and the shared key/P tile at nine vec4 a row (P wider at 8 queries a lane), v at
+  // eight, and the row reduction
+  const tiledBytes = 16 * (8 * tiledShape[0] * 9 + 8 * tiledShape[1] * Math.max(9, 2 * tiledShape[0] + 1)
+    + 8 * tiledShape[1] * 8) + 4 * 8 * tiledShape[0] * 8;
+  const tiled = matrixGeometry === null && (shape.attendTiled === true || typeof shape.attendTiled === "string")
+    && dimension === 32 && tiledBytes <= (shape.maxComputeWorkgroupStorageSize ?? 16384);
+  const attendShader = matrixGeometry !== null ? createGridAttendMatrixShader(
     { n, heads, dimension, transpose },
     { q: store4.q, k: store4.k, v: store4.v, gathered: gatheredStorage },
-    matrixGeometry);
+    matrixGeometry) : tiled ? gridAttendTiled() : attend;
+
+  function gridAttendTiled() {
+    // QA queries and KB keys a lane: lanes are 8 x 8, so a workgroup takes BQ = 8 * QA queries and
+    // walks the keys BK = 8 * KB at a time. `gridAttendTiled: "8x4"` picks one; true is 4x4.
+    const [QA, KB] = (typeof shape.attendTiled === "string" ? shape.attendTiled : "4x4")
+      .split("x").map(Number);
+    const BQ = 8 * QA, BK = 8 * KB;
+    const AQ = Array.from({ length: QA }, (_, a) => a);
+    const BKs = Array.from({ length: KB }, (_, b) => b);
+    const PV = QA / 4;   // vec4s of P a (key, query group) holds
+    const PSTRIDE = 8 * PV + 1;
+    const eachA = (f) => AQ.map(f).join("\n");
+    const eachB = (f) => BKs.map(f).join("\n");
+    const eachAB = (f) => AQ.flatMap((a) => BKs.map((b) => f(a, b))).join("\n");
+    const T = [0, 1, 2, 3, 4, 5, 6, 7];
+    const rowOf = chunked ? "local_row" : "row";
+    const maxOf = (a) => BKs.map((b) => `logit${a}_${b}`).reduce((x, y) => `max(${x}, ${y})`);
+    return `${common}
+@group(0) @binding(0) var<storage, read> q: array<${store4.q === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(1) var<storage, read> k: array<${store4.k === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(2) var<storage, read> v: array<${store4.v === "f16" ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read> mask: array<f32>;
+@group(0) @binding(5) var<storage, read_write> gathered: array<${packGathered ? "vec2<u32>" : "vec4<f32>"}>;
+${chunkBinding(6)}
+${packGathered ? `
+fn store4(v: vec4<f32>) -> vec2<u32> {
+  return vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
+}` : ""}${needsLoad4 ? `
+fn load4(w: vec2<u32>) -> vec4<f32> {
+  let lo = unpack2x16float(w.x);
+  let hi = unpack2x16float(w.y);
+  return vec4<f32>(lo.x, lo.y, hi.x, hi.y);
+}` : ""}
+
+const HD4: u32 = 8u;
+// A staged row is nine vec4 rather than eight, so eight lanes reading eight different rows land in
+// eight different banks.
+const STRIDE: u32 = 9u;
+var<workgroup> q_tile: array<vec4<f32>, ${BQ * 9}>;
+// The key tile and P share one array: P is written after the barrier that follows the last read of
+// the keys, and the next tile's keys are staged after the barrier that follows the last read of P.
+// That is what keeps this inside WebGPU's guaranteed 16 KiB (14.6 KiB at 4x4).
+var<workgroup> kp_tile: array<vec4<f32>, ${BK * Math.max(9, PSTRIDE)}>;
+var<workgroup> v_tile: array<vec4<f32>, ${BK * 8}>;
+var<workgroup> red: array<f32, ${BQ * 8}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+${chunked ? `  let local_row = group.y;
+  if (local_row >= chunk.y) { return; }
+  let row = chunk.x + local_row;` : "  let row = group.y;"}
+  let head = group.z;
+  if (row >= N || head >= HEADS) { return; }
+  let local = local_id.x;
+  let q0 = group.x * ${BQ}u;
+  // This lane's queries are q0 + a * 8 + qg and its keys j0 + b * 8 + kg; in the PV product its four
+  // dimensions are kg * 4 ..
+  let qg = local / 8u;
+  let kg = local % 8u;
+
+  for (var index = local; index < ${BQ * 8}u; index += 64u) {
+    let slot = index / HD4;
+    let i = min(q0 + slot, N - 1u);
+    q_tile[slot * STRIDE + index % HD4] = ${vec4Of("q", `((${rowOf} * N + i) * HEADS + head) * HD4 + index % HD4`)};
+  }
+${eachA((a) => `  let i${a} = q0 + ${a * 8}u + qg;
+  let bias_row${a} = head * PAIRS + min(i${a}, N - 1u) * N;
+  var m${a} = -3.0e38;
+  var l${a} = 0.0;
+  var o${a} = vec4<f32>(0.0);`)}
+
+  for (var j0 = 0u; j0 < N; j0 += ${BK}u) {
+    workgroupBarrier();
+    for (var index = local; index < ${BK * 8}u; index += 64u) {
+      let slot = index / HD4;
+      let j = min(j0 + slot, N - 1u);
+      let source = ((${rowOf} * N + j) * HEADS + head) * HD4 + index % HD4;
+      kp_tile[slot * STRIDE + index % HD4] = ${vec4Of("k", "source")};
+      v_tile[index] = ${vec4Of("v", "source")};
+    }
+    workgroupBarrier();
+
+${eachAB((a, b) => `    var s${a}_${b} = 0.0;`)}
+${T.map((t) => `    {
+${eachA((a) => `      let qv${a} = q_tile[(${a * 8}u + qg) * STRIDE + ${t}u];`)}
+${eachB((b) => `      let kv${b} = kp_tile[(${b * 8}u + kg) * STRIDE + ${t}u];`)}
+${eachAB((a, b) => `      s${a}_${b} += dot(qv${a}, kv${b});`)}
+    }`).join("\n")}
+
+${eachB((b) => `    let key${b} = j0 + ${b * 8}u + kg;
+    let jc${b} = min(key${b}, N - 1u);
+    let masked${b} = mask[${transpose ? `jc${b} * N + row` : `row * N + jc${b}`}];`)}
+${eachAB((a, b) => `    var logit${a}_${b} = s${a}_${b} * SCALE + bias[bias_row${a} + jc${b}];
+    if (masked${b} <= 0.0) { logit${a}_${b} = logit${a}_${b} - 1.0e9; }
+    if (key${b} >= N) { logit${a}_${b} = -3.0e38; }`)}
+${eachA((a) => `    red[(${a * 8}u + qg) * 8u + kg] = ${maxOf(a)};`)}
+    workgroupBarrier();
+${eachA((a) => `    var tile_max${a} = red[(${a * 8}u + qg) * 8u];
+    for (var r = 1u; r < 8u; r += 1u) { tile_max${a} = max(tile_max${a}, red[(${a * 8}u + qg) * 8u + r]); }
+    let new_m${a} = max(m${a}, tile_max${a});
+    let alpha${a} = exp(m${a} - new_m${a});
+    m${a} = new_m${a};
+${BKs.map((b) => `    let p${a}_${b} = exp(logit${a}_${b} - new_m${a});`).join("\n")}
+    l${a} = l${a} * alpha${a} + (${BKs.map((b) => `p${a}_${b}`).join(" + ")});
+    o${a} = o${a} * alpha${a};`)}
+${eachB((b) => Array.from({ length: PV }, (_, part) =>
+    `    kp_tile[(${b * 8}u + kg) * ${PSTRIDE}u + qg * ${PV}u + ${part}u] = vec4<f32>(${[0, 1, 2, 3].map((c) => `p${part * 4 + c}_${b}`).join(", ")});`).join("\n"))}
+    workgroupBarrier();
+    for (var key = 0u; key < ${BK}u; key += 1u) {
+      let vv = v_tile[key * HD4 + kg];
+${Array.from({ length: PV }, (_, part) => `      let p${part} = kp_tile[key * ${PSTRIDE}u + qg * ${PV}u + ${part}u];
+${[0, 1, 2, 3].map((c) => `      o${part * 4 + c} += p${part}[${c}] * vv;`).join("\n")}`).join("\n")}
+    }
+  }
+
+  // The running sums are per lane until here: one reduction over the row's eight lanes.
+  workgroupBarrier();
+${eachA((a) => `  red[(${a * 8}u + qg) * 8u + kg] = l${a};`)}
+  workgroupBarrier();
+${eachA((a) => `  {
+    var total = 0.0;
+    for (var r = 0u; r < 8u; r += 1u) { total += red[(${a * 8}u + qg) * 8u + r]; }
+    if (i${a} < N) {
+      let index = ((${rowOf} * N + i${a}) * HEADS + head) * HD4 + kg;
+      gathered[index] = ${packGathered ? `store4(o${a} / total)` : `o${a} / total`};
+    }
+  }`)}
+}`;
+  }
 
   return { normalize, bias: biasPass, project, attend: attendShader, project_out,
            tiles: { projectRows, projectOutRows, normalizeRows: NORMALIZE_ROWS,
-                    attendRows: matrixGeometry === null ? 64 : matrixGeometry.rows } };
+                    attendRows: matrixGeometry !== null ? matrixGeometry.rows
+                      : tiled ? 8 * tiledShape[0] : 64 } };
 }
 
 export class Af3GridSelfAttentionGpu {
@@ -960,13 +1107,14 @@ export class Af3GridSelfAttentionGpu {
     const attendMatrix = options.attendMatrix ?? false;
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale,
-        attendMatrix,
+        attendMatrix, attendTiled: options.attendTiled ?? false,
         ...(attendKeyChunkSize === undefined ? {} : { attendKeyChunk: attendKeyChunkSize }) },
       packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
       + `:${epsilon}:${variance}:${dialect.swapTransposedBias}:${stagedPrecision}`
       + `:${attendLazyRescale}:${attendKeyChunkSize ?? "d"}`
-      + `:m${attendMatrix === false ? "0" : JSON.stringify(attendMatrix)}`;
+      + `:m${attendMatrix === false ? "0" : JSON.stringify(attendMatrix)}`
+      + `:t${options.attendTiled ?? 0}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),

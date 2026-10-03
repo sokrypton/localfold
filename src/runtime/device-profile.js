@@ -391,6 +391,8 @@ export const DEFAULT_TUNING = Object.freeze({
   // because the geometry that suits one is 5-6% wrong for the other. See
   // src/af3/trunk/grid-attention-matrix.js.
   gridAttendMatrix: null,
+  // grid.attend's register-tiled vector form (a 4x4 score block a lane) where the matrix form is off.
+  gridAttendTiled: null,
   esmfold2TokenRowTile: null,
   // ESMFold2's token projections split over K; null derives it from the workgroup count (see
   // tokenKSplits in src/esmfold2/diffusion-webgpu.js), 1 is the unsplit kernel.
@@ -713,6 +715,11 @@ const PRIORS = new Map([
     // block, 16384 of them at 512 tokens over eight blocks, so the device is
     // full either way and the fixed costs a bigger tile amortises are what is
     // left to win. Re-sweep on any device that is not this one.
+    // ...and where the matrix units are absent - a STOCK Chrome on this card - the register-tiled vector
+    // attend. A100, LOCALFOLD_STOCK_FLAGS=1: grid.attend 0.633 -> 0.443 ms a call at 200 tokens and
+    // 3.95 -> 2.71 at 400; whole fold 1.635 -> 1.615 s at 262, 3.41 -> 3.24 at 400. 4x4 a lane beat
+    // 8x4 (3.20), 4x8 (3.50) and 8x8 (4.98) at 400. Inert where gridAttendMatrix resolves.
+    gridAttendTiled: true,
     gridAttendMatrix: true,
     gridAttendMatrixTile: "4x32",
     pairTransitionSplit: true,

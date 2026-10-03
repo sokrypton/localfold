@@ -138,7 +138,7 @@ export async function main(device, args) {
       for (const draw of draws) {
         const run = await runner.run(
           draw.pair, mask, { n, channels: CHANNELS, transpose }, weights, DIALECT,
-          { stagedPrecision });
+          { stagedPrecision, attendTiled: option(args, "tiled", "") === "" ? args.includes("--tiled") : option(args, "tiled", "") });
         relRms = Math.max(relRms, relativeRms(run.output, draw.expected));
         elapsedMilliseconds = run.elapsedMilliseconds;
         memory = run.memory;

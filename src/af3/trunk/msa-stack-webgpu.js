@@ -140,6 +140,7 @@ export class Af3MsaStackGpu {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
+      attendTiled: deviceTuning(this.device).gridAttendTiled ?? false,
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,

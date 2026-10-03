@@ -456,6 +456,7 @@ export class Af3PairformerStackGpu {
       // 🔴 THE HEAD WIDTH IS THIS BUNDLE'S, NOT AF3's. OpenDDE runs this same
       // pairformer at its own widths, and a geometry the device cannot hold at
       // one of them resolves to false rather than throwing.
+      attendTiled: deviceTuning(this.device).gridAttendTiled ?? false,
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, blocks[0].pairAttention1.dimension, deviceTuning(this.device)),
       // 🔴 THE SPLIT TRANSITION'S VALUE IS THIS BUNDLE'S CHANNEL WIDTH. AF3's
