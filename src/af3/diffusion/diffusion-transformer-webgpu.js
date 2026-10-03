@@ -4,7 +4,8 @@ import { packNamedWeights } from "../../weights/weight-pack.js";
 import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
 import { residentPackedOnDevice } from "../weights/device-weights.js";
 import { SOURCES } from "../weights/weights.js";
-import { createAttentionRegisterFlashShader } from "../../kernels/attention.js";
+import { createAttentionRegisterFlashShader, createAttentionSplitCombineShader }
+  from "../../kernels/attention.js";
 
 // The flash kernel's key chunk at this head width (its own f32 rule, max(8, 512 / (2 * head_dim / 4))),
 // rounded down to a whole number of rescale groups: head width 48 derives 21, which no group divides.
@@ -2641,10 +2642,28 @@ export class Af3DiffusionTransformerGpu {
       // products on a dispatch of ~80 workgroups, which is all latency.
       const { attentionGroup: group = 1, attentionVectorScore: vectorScore = false } =
         deviceTuning(this.device);
-      pending.push(this.pipelines.get(`${base}:flash-attend:g${group}${vectorScore ? "v" : ""}`,
+      // 🔴 AND SPLIT OVER KEYS WHILE THE (query tile, head) PAIRS ARE TOO FEW: at 262 tokens they are 80
+      // workgroups, each walking all 262 keys. Doubled while that is short of ~512 workgroups and each
+      // split keeps at least 32 keys; `diffusionFlashSplits` forces a count (1 is unsplit).
+      const tiles = Math.ceil(tokens / 64) * heads;
+      let flashSplits = deviceTuning(this.device).diffusionFlashSplits ?? 1;
+      if (deviceTuning(this.device).diffusionFlashSplits == null) {
+        while (flashSplits < 16 && tiles * flashSplits < 512 && tokens / (flashSplits * 2) >= 32) {
+          flashSplits *= 2;
+        }
+      }
+      compiled.flashSplits = flashSplits;
+      pending.push(this.pipelines.get(
+        `${base}:flash-attend:g${group}${vectorScore ? "v" : ""}:s${flashSplits}`,
         createAttentionRegisterFlashShader(dimension, flashKeyChunk(dimension, group),
-          { scale: 1 / Math.sqrt(dimension), gate: false, sharedMask: true, group, vectorScore }))
+          { scale: 1 / Math.sqrt(dimension), gate: false, sharedMask: true, group, vectorScore,
+            keySplits: flashSplits }))
         .then((pipeline) => { compiled.flashAttend = pipeline; }));
+      if (flashSplits > 1) {
+        pending.push(this.pipelines.get(`${base}:flash-combine:s${flashSplits}`,
+          createAttentionSplitCombineShader(dimension, flashSplits))
+          .then((pipeline) => { compiled.flashCombine = pipeline; }));
+      }
     }
     await Promise.all(pending);
     return { channels, condChannels, pairChannels, heads, dimension, perSuper,
@@ -2719,6 +2738,11 @@ export class Af3DiffusionTransformerGpu {
       if (flashParams !== null) {
         write(flashParams, new Uint32Array([samples, tokens, width, heads, dimension, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
       }
+      const flashSplits = compiled.flashSplits ?? 1;
+      const flashPartial = flashParams === null || flashSplits === 1 ? null
+        : scratch("difftx.flash-partial", flashSplits * samples * tokens * width * 4, storage);
+      const flashStats = flashPartial === null ? null
+        : scratch("difftx.flash-stats", flashSplits * samples * tokens * heads * 8, storage);
       // See #pairNorm: everything on this line and the two below it is the
       // trunk's, not the step's, and is skipped outright when the caller keeps
       // this instance across a schedule.
@@ -3181,8 +3205,18 @@ export class Af3DiffusionTransformerGpu {
           }
           const slots = rows * heads;
           if (flashParams !== null) {
-            runBlock("attend", compiled.flashAttend, [q, k, v, maskBuffer, logits, flashParams, gathered],
-                Math.ceil(tokens / 64), samples, heads);
+            if (flashPartial === null) {
+              runBlock("attend", compiled.flashAttend, [q, k, v, maskBuffer, logits, flashParams, gathered],
+                  Math.ceil(tokens / 64), samples, heads);
+            } else {
+              runBlock("attend", compiled.flashAttend,
+                  [q, k, v, maskBuffer, logits, flashParams, flashPartial, flashStats],
+                  Math.ceil(tokens / 64) * flashSplits, samples, heads);
+              const combineGroups = Math.ceil(samples * tokens * heads / 64);
+              runBlock("attend-combine", compiled.flashCombine,
+                  [flashPartial, flashStats, flashParams, gathered],
+                  Math.min(combineGroups, GRID_WIDTH), Math.ceil(combineGroups / GRID_WIDTH));
+            }
           } else {
             runBlock("attend", compiled.attend, [q, k, v, logits, maskBuffer, gathered],
                 Math.min(slots, GRID_WIDTH), Math.ceil(slots / GRID_WIDTH));

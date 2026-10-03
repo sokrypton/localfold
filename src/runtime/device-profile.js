@@ -287,6 +287,8 @@ export const DEFAULT_TUNING = Object.freeze({
   // gave a workgroup to each (query, head) and re-read every key and value for it. null takes it above 80
   // tokens, where it wins on the A100; true and false force either arm.
   diffusionFlashAttend: null,
+  // ...and its key splits; null derives them from the workgroup count (diffusion-transformer-webgpu.js).
+  diffusionFlashSplits: null,
   // 🔴 HOW MANY WORKGROUPS THE SINGLE PROJECTION AIMS AT. See
   // singleProjectSplits: 110 and a candidate list stopping at 3 are an M2's
   // answer, and the constant is written into the rule rather than measured per

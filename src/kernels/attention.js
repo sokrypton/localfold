@@ -971,7 +971,15 @@ fn store4(v: vec4<f32>) -> vec2<u32> {
   const scale = options.scale ?? null;
   const gated = options.gate ?? true;
   const sharedMask = options.sharedMask ?? false;
-  if (queriesPerLane > 1 && (scale !== null || !gated || sharedMask)) {
+  // 🔴 SPLIT OVER KEYS, FOR A CALLER WITH TOO FEW (query tile, head) PAIRS TO FILL THE DEVICE - AF3's
+  // denoiser at 262 tokens is 80 workgroups each walking every key. Workgroup x carries the split too
+  // (x = tile * keySplits + split); each split writes its unnormalised accumulator to `output` and its
+  // running (max, sum) to `partial_stats`, and createAttentionSplitCombineShader merges them. At 1 the
+  // source is the one this function always produced. Not with lazyRescale or queriesPerLane.
+  const keySplits = options.keySplits ?? 1;
+  if (keySplits > 1 && (lazyRescale || queriesPerLane > 1 || gated)) {
+    throw new RangeError("a key-split attention takes neither lazyRescale, queriesPerLane nor a gate");
+  }  if (queriesPerLane > 1 && (scale !== null || !gated || sharedMask)) {
     throw new RangeError("the multi-query attention form takes none of scale, gate: false or sharedMask");
   }
   const scaled = (expression) => (scale === null ? expression : `(${expression}) * ${Number(scale).toPrecision(9)}`);
@@ -1240,7 +1248,7 @@ ${Array.from({ length: vectors }, (_, t) =>
       `      acc${t} = acc${t} * ${narrow("previous_scale")}${indices.map((g) => ` + ${narrow(`w${g}`)} * ${chunkRead(`staged${g} + ${t}u`)}`).join("")};`),
     `    }`,
   ].join("\n");
-  return `${enable}${COMMON}
+  const source = `${enable}${COMMON}
 const HD4: u32 = ${vectors}u;
 const KEY_CHUNK: u32 = ${chunk}u;
 ${bindingLines}
@@ -1290,6 +1298,72 @@ ${inner}
   if (live) {
 ${each((t) => write4("output", `q_base + ${t}u`,
   gated ? `(vec4<f32>(acc${t}) / running_sum) * ${read4("gate", `q_base + ${t}u`)}` : `vec4<f32>(acc${t}) / running_sum`))}
+  }
+}`;
+  return keySplits > 1 ? splitSource(source, keySplits, vectors, each, packOut) : source;
+}
+
+/** createAttentionRegisterFlashShader's source turned into its key-split form (see keySplits). */
+function splitSource(source, splits, vectors, each, packOut) {
+  if (packOut) throw new RangeError("a key-split attention writes f32 partials");
+  const edits = [
+    [/@group\(0\) @binding\((\d+)\) var<storage, read_write> output: array<vec4<f32>>;/,
+     (_, n) => `@group(0) @binding(${n}) var<storage, read_write> output: array<vec4<f32>>;
+@group(0) @binding(${Number(n) + 1}) var<storage, read_write> partial_stats: array<vec2<f32>>;
+const SPLITS: u32 = ${splits}u;`],
+    [/let q_index = group\.x \* 64u \+ local;/, `let split = group.x % SPLITS;
+  let q_index = (group.x / SPLITS) * 64u + local;`],
+    [/for \(var k0 = 0u; k0 < p\.queries; k0 \+= KEY_CHUNK\) \{/,
+     `let span = ((p.queries + SPLITS * KEY_CHUNK - 1u) / (SPLITS * KEY_CHUNK)) * KEY_CHUNK;
+  let key_start = split * span;
+  let key_end = min(key_start + span, p.queries);
+  for (var k0 = key_start; k0 < key_end; k0 += KEY_CHUNK) {`],
+    [/if \(k0 \+ slot >= p\.queries\) \{ break; \}/, "if (k0 + slot >= key_end) { break; }"],
+    [/  if \(live\) \{\n[\s\S]*?\n  \}\n\}$/, `  if (live) {
+    let stride = p.batch * p.queries * p.heads;
+${each((t) => `    output[split * stride * HD4 + q_base + ${t}u] = vec4<f32>(acc${t});`)}
+    partial_stats[split * stride + q_base / HD4] = vec2<f32>(running_max, running_sum);
+  }
+}`],
+  ];
+  let out = source;
+  for (const [pattern, replacement] of edits) {
+    const next = out.replace(pattern, replacement);
+    if (next === out) throw new Error(`key-split derivation matched nothing: ${pattern}`);
+    out = next;
+  }
+  // ...and every key-liveness test against the split's end rather than the sequence's.
+  out = out.replace(/let live(\d+) = key_at\1 < p\.queries;/g, "let live$1 = key_at$1 < key_end;");
+  return out;
+}
+
+/**
+ * Merges createAttentionRegisterFlashShader's key splits: per (sample, query, head) row, the largest
+ * split max M, weights w_s = exp(m_s - M), and out = sum w_s acc_s / sum w_s l_s. A split that saw no
+ * live key carries max -1e30 and weight 0. One lane a row.
+ */
+export function createAttentionSplitCombineShader(headDim, splits) {
+  const vectors = headDim / 4;
+  const terms = (f) => Array.from({ length: splits }, (_, s) => f(s)).join("\n");
+  return `${COMMON}
+@group(0) @binding(0) var<storage, read> partial: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> partial_stats: array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> output: array<vec4<f32>>;
+
+const HD4: u32 = ${vectors}u;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let stride = p.batch * p.queries * p.heads;
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= stride) { return; }
+${terms((s) => `  let st${s} = partial_stats[${s}u * stride + row];`)}
+  let top = ${Array.from({ length: splits }, (_, s) => `st${s}.x`).reduce((a, b) => `max(${a}, ${b})`)};
+${terms((s) => `  let w${s} = exp(st${s}.x - top);`)}
+  let total = ${Array.from({ length: splits }, (_, s) => `w${s} * st${s}.y`).join(" + ")};
+  for (var t = 0u; t < HD4; t += 1u) {
+    output[row * HD4 + t] = (${Array.from({ length: splits }, (_, s) => `w${s} * partial[(${s}u * stride + row) * HD4 + t]`).join(" + ")}) / total;
   }
 }`;
 }
