@@ -3,33 +3,33 @@
   "arms": {
     "stock": {
       "AF2": "\"checksum\": -1308439",
-      "AF3": "\"meanPlddt\": 85.8348190958907",
-      "OpenDDE": "\"meanPlddt\": 92.03821190225953",
+      "AF3": "\"meanPlddt\": 85.83481898955768",
+      "OpenDDE": "\"meanPlddt\": 92.03821231430001",
       "ESMFold2": "\"meanPlddt\": 53.834",
-      "boltz2": "\"meanPlddt\": 96.45960561240592",
-      "protenix2": "\"meanPlddt\": 84.65288535061613",
+      "boltz2": "\"meanPlddt\": 96.45960355220356",
+      "protenix2": "\"meanPlddt\": 84.65288616805127",
       "intellifold2": "\"meanPlddt\": 83.22311307497674",
-      "rosettafold3": "\"meanPlddt\": 81.53424395815864"
+      "rosettafold3": "\"meanPlddt\": 81.53424660780875"
     },
     "portable": {
       "AF2": "\"checksum\": -1315603",
-      "AF3": "\"meanPlddt\": 85.83318174009955",
-      "OpenDDE": "\"meanPlddt\": 92.0395810064123",
-      "ESMFold2": "\"meanPlddt\": 73.344",
-      "boltz2": "\"meanPlddt\": 96.45921661961785",
-      "protenix2": "\"meanPlddt\": 84.67090746916129",
+      "AF3": "\"meanPlddt\": 85.83318152078768",
+      "OpenDDE": "\"meanPlddt\": 92.03958103299556",
+      "ESMFold2": "\"meanPlddt\": 73.342",
+      "boltz2": "\"meanPlddt\": 96.4592171645746",
+      "protenix2": "\"meanPlddt\": 84.67090796759734",
       "intellifold2": "\"meanPlddt\": 83.22122222341169",
-      "rosettafold3": "\"meanPlddt\": 81.53339809397752"
+      "rosettafold3": "\"meanPlddt\": 81.53339713531015"
     },
     "spec-floor": {
       "AF2": "\"checksum\": -1304306",
-      "AF3": "\"meanPlddt\": 85.81644298141427",
-      "OpenDDE": "\"meanPlddt\": 92.04126241065899",
-      "ESMFold2": "\"meanPlddt\": 73.344",
-      "boltz2": "\"meanPlddt\": 96.45788437314981",
-      "protenix2": "\"meanPlddt\": 84.66979245441716",
+      "AF3": "\"meanPlddt\": 85.86446509544027",
+      "OpenDDE": "\"meanPlddt\": 92.0408317353252",
+      "ESMFold2": "\"meanPlddt\": 73.342",
+      "boltz2": "\"meanPlddt\": 96.45803189693012",
+      "protenix2": "\"meanPlddt\": 84.66752680336556",
       "intellifold2": "\"meanPlddt\": 83.21916888438386",
-      "rosettafold3": "\"meanPlddt\": 81.53200262046401"
+      "rosettafold3": "\"meanPlddt\": 81.5316873653605"
     }
   },
   "recorded": "2026-10-03"
