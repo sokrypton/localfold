@@ -15,7 +15,10 @@ for a in "$@"; do W[${a%%=*}]="${a#*=}"; done
 arch="sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"
 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader > "$out/gpu.txt"
 log="$out/log.txt"; : > "$log"
-run() { local name="$1"; shift; { echo "== $name"; /usr/bin/time -f "wall %e s" "$@" 2>&1; echo "exit $?"; } >> "$log" 2>&1; }
+run() {      # (shell timing: a Colab image has no /usr/bin/time)
+  local name="$1" t0 rc; shift; t0=$(date +%s.%N)
+  { echo "== $name"; "$@" 2>&1; rc=$?; echo "wall $(echo "$(date +%s.%N) - $t0" | bc) s"; echo "exit $rc"; } >> "$log" 2>&1
+}
 build() { (cd "$N/$1" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread $2 src/$1.cu -lcublas -lcublasLt -lcupti \
           -o "$out/$1" 2>&1 | grep -E "error" >> "$log"); }
 S6=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE
