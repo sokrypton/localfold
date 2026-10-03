@@ -4220,3 +4220,12 @@ form (native/af3/README.md, "On a T4") is 2.1x on that kernel and 5-6.5% on the 
 output; the T4 is power-capped, so a busier kernel lowers the clock for the rest (AF2: the flash kernels
 -1.6 s, the GEMMs +0.8 s, the fold -3%).
 
+**...and a model's first fold, its server started before the job is featurised.** The worker exported the
+job (a Node step, or seconds of MSA search) and only then started the model's server - the CUDA context, the
+weights' upload, and a first fold that pays every kernel load, weight copy and cuBLAS plan (ESMFold2's
+language model 98 ms against 11 warm, its sampler 77 against 50). The server starts first now, with AF2's and
+ESMFold2's `--warm` fold, so all of it runs beside the featurisation; the job is taken once the server is up.
+First fold of 6MRR through the worker: AF3 1.00 -> 0.75 s, AF2 0.94 -> 0.65, ESMFold2 1.01 -> 0.72; on the
+reader's page 1.52 -> 1.27, 1.00 -> 0.75, 1.01 -> 0.77. (A warm-up run AFTER the job is ready only adds:
+ESMFold2's launch-to-result 0.94 s cold against 1.03-1.10 warmed.)
+

@@ -196,12 +196,11 @@ class Server:
         self.log = open(os.path.join(self.dir, "server.log"), "w")
         self.proc = subprocess.Popen([*command, f"--serve={self.dir}"], cwd=REPO, stdout=self.log,
                                      stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
+        # 🔴 NOT WAITED FOR: the worker starts a model's server BEFORE it featurises the job, so the CUDA
+        # context, the weights' upload and AF2's and ESMFold2's warm-up fold (--warm: every kernel, weight copy
+        # and cuBLAS plan loaded) run beside the exporter or the MSA search; a job dropped meanwhile is taken
+        # once the server is up, and a server that dies first says so through fold()'s wait
         self.count = 0
-        deadline = time.time() + 300
-        while ": serving" not in open(self.log.name).read():
-            if self.proc.poll() is not None or time.time() > deadline:
-                raise RuntimeError(f"the {key[0]} server did not start: " + open(self.log.name).read()[-400:])
-            time.sleep(0.05)
 
     def fold(self, inputs, flags, on_file=None):
         """...and with `on_file`, each streamed result handed over as it lands (--frames: written by a thread
@@ -386,6 +385,7 @@ class Worker:
         with open(request_path, "w") as handle:
             json.dump({"entities": job.get("entities", [])}, handle)
 
+        residues = sum(len(chain) for chain in polymer_chains(job["job"]))
         # the alignment, as the page's MSA row asked for it
         mode = "none" if port == "ef2" else controls.get("msa-mode", "none")
         flags, a3m = [], None
@@ -451,6 +451,10 @@ class Worker:
         # job's flags for it
         if port == "af3":
             bundle = ensure_bundle(family, f"model-{family}-int5", log)
+            key = ("af3", family)
+            server = self.server_for(key, [binary("af3"), "-", f"--bundle={bundle}",
+                                           f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}", "--fold", "--fast"],
+                                     residues)
             export = [*NODE, os.path.join(NATIVE, "af3", "export-model.mjs"), inputs, "--no-weights",
                       f"--bundle={bundle}/manifest.json", f"--job={job_path}", f"--max-msa={requested}", *flags]
             self.node(export, "featurising", log, cwd=os.path.join(NATIVE, "af3"))
@@ -471,9 +475,6 @@ class Worker:
                 fold.append(f"--steps={steps}")
             if recycles not in (None, ""):
                 fold.append(f"--recycles={int(recycles)}")
-            key = ("af3", family)
-            command = [binary("af3"), "-", f"--bundle={bundle}",
-                       f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}", "--fold", "--fast"]
             total = steps or 200                         # (af3's default)
         elif port == "af2":
             if templates and family == "monomer" and af2_model > 2:
@@ -484,31 +485,30 @@ class Worker:
             if af2_model > 1:
                 short = "mono" if family == "monomer" else "multi"
                 delta = ensure_bundle(f"{family}-{af2_model}", f"model-{short}-{af2_model}-delta", log)
+            model = f"model_{af2_model}_ptm" if family == "monomer" else f"model_{af2_model}_multimer_v3"
+            key = ("af2", family, af2_model)
+            server = self.server_for(key, [binary("af2"), "-", f"--bundle={bundle}",
+                                           f"--map={os.path.join(NATIVE, 'af2', 'maps', model + '.map')}", "--fast",
+                                           *([f"--delta={delta}"] if delta else []), "--warm=64,8,8,0"], residues)
             export = [*NODE, os.path.join(NATIVE, "af2", "export_input.mjs"), inputs, f"--bundle={bundle}",
                       f"--job={job_path}", f"--max-msa={508 if requested == 512 else requested}",
                       f"--max-extra={extra}", f"--seed={seed}", *flags]
             if recycles not in (None, ""):
                 export.append(f"--recycles={int(recycles)}")
             self.node(export, "featurising", log)
-            model = f"model_{af2_model}_ptm" if family == "monomer" else f"model_{af2_model}_multimer_v3"
             fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
-            key = ("af2", family, af2_model)
-            command = [binary("af2"), "-", f"--bundle={bundle}",
-                       f"--map={os.path.join(NATIVE, 'af2', 'maps', model + '.map')}", "--fast",
-                       *([f"--delta={delta}"] if delta else [])]
             total = 0
         else:
             small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)
             trunk = ensure_bundle(family, "model-ef2-fast-300m-int5" if small else "model-esmfold2-int5", log)
             tower = ensure_bundle("esmc-300m" if small else "esmc", "model-esmc-300m-int3" if small else "model-esmc-600m-int3", log)
+            key = ("ef2", family)
+            server = self.server_for(key, [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
+                                           "--warm=96,800"], residues)
             self.node([*NODE, os.path.join(NATIVE, "ef2", "export_input.mjs"), inputs, f"--job={job_path}"], "featurising", log)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
-            key = ("ef2", family)
-            command = [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast"]
             total = 0
         emit("progress", 0.15)
-        residues = sum(len(chain) for chain in polymer_chains(job["job"]))
-        server = self.server_for(key, command, residues)
         emit("status", f"{family} on CUDA ({self.device}) · folding")
         on_file = None
         if streaming(job):
