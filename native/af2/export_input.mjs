@@ -106,7 +106,25 @@ if (args.includes("--search")) {
   mkdirSync(out, { recursive: true });
   writeFileSync(`${out}/search.a3m`, a3m);       // (what the search returned, for whoever shows the alignment)
 } else {
-  a3m = a3mPath === "" ? `>query\n${chains.join("")}\n` : readFileSync(a3mPath, "utf8");
+  // --a3m=<one per chain, comma-separated> [--paired-a3m=<the same>]: an archive's per-chain alignments,
+  // merged as the page merges them (web/app.js: mergeSearchedChains, the search path's own function)
+  const paths = a3mPath.split(",").filter(Boolean);
+  if (paths.length > 1 || option("paired-a3m", "") !== "") {
+    if (paths.length !== chains.length) throw new Error(`${paths.length} alignments for ${chains.length} chains`);
+    const pairedPaths = option("paired-a3m", "").split(",");
+    const paired = chains.map((_, index) => (pairedPaths[index] ? readFileSync(pairedPaths[index], "utf8") : ""));
+    const { mergeSearchedChains } = await import("../../src/input/mmseqs2-api.js");
+    a3m = mergeSearchedChains({
+      sequences: chains,
+      chainA3ms: paths.map((path) => readFileSync(path, "utf8")),
+      // (no paired block at all is no map: the merge reads a map's every chain)
+      pairedA3ms: paired.some((text) => text.trim() !== "")
+        ? new Map(chains.map((chain, index) => [chain, paired[index]])) : undefined,
+      model: isMultimer ? "multimer" : "monomer",
+    }).a3m;
+  } else {
+    a3m = a3mPath === "" ? `>query\n${chains.join("")}\n` : readFileSync(a3mPath, "utf8");
+  }
 }
 const featureOptions = {
   ...(chains.length > 1 ? { chainAware: true, chainLengths: chains.map((c) => c.length), chainSequences: chains } : {}),

@@ -287,10 +287,7 @@ class Worker:
                 flags.append(f"--a3m={path}")
                 a3m = msas["merged"]
             elif any(msas.get("unpaired") or []):
-                if port != "af3":
-                    raise Refused("an alignment per chain folds on WebGPU or JAX; the CUDA AF2 takes one merged"
-                                  " alignment")
-                paths = {"unpaired": [], "paired": []}
+                paths = {"unpaired": [], "paired": []}       # (merged by each exporter as the page merges them)
                 for side in paths:
                     for index, text in enumerate(msas.get(side) or []):
                         path = os.path.join(WORK, f"msa-{side}-{index}.a3m")
