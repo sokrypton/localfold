@@ -4,7 +4,7 @@
     "stock": {
       "AF2": "\"checksum\": -1325647",
       "AF3": "\"meanPlddt\": 85.83481898955768",
-      "OpenDDE": "\"meanPlddt\": 92.03821231430001",
+      "OpenDDE": "\"meanPlddt\": 92.03821220796698",
       "ESMFold2": "\"meanPlddt\": 53.834",
       "boltz2": "\"meanPlddt\": 96.45960355220356",
       "protenix2": "\"meanPlddt\": 84.65288616805127",
@@ -14,7 +14,7 @@
     "portable": {
       "AF2": "\"checksum\": -1315603",
       "AF3": "\"meanPlddt\": 85.83318152078768",
-      "OpenDDE": "\"meanPlddt\": 92.03958103299556",
+      "OpenDDE": "\"meanPlddt\": 92.03958173745185",
       "ESMFold2": "\"meanPlddt\": 73.342",
       "boltz2": "\"meanPlddt\": 96.4592171645746",
       "protenix2": "\"meanPlddt\": 84.67090796759734",
@@ -24,7 +24,7 @@
     "spec-floor": {
       "AF2": "\"checksum\": -1304306",
       "AF3": "\"meanPlddt\": 85.86446509544027",
-      "OpenDDE": "\"meanPlddt\": 92.0408317353252",
+      "OpenDDE": "\"meanPlddt\": 92.04083246636473",
       "ESMFold2": "\"meanPlddt\": 73.342",
       "boltz2": "\"meanPlddt\": 96.45803189693012",
       "protenix2": "\"meanPlddt\": 84.66752680336556",
