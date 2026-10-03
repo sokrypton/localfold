@@ -6,8 +6,8 @@
 #   native/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=5caj.a3m --template=5caj.pdb:A
 #   native/af3/fold 6mrr.pdb --model=protenix2 --sequence=<SEQ>
 #
-# --model=<name> picks the bundle (model-<name>-full-f32, -f32 or -int5, in that order; default
-# af3) and keeps its exported weights in native/af3/weights-<name>.
+# --model=<name> picks the model (default af3): its published bundle, model-<name>-int5 - what the
+# page folds with, fetched once (native/fetch_bundles.py) - read as it is through maps/<name>.map.
 #
 #   native/af3/fold --serve [--model=<name>]     then any number of ordinary fold commands, then
 #   native/af3/fold --stop  [--model=<name>]
@@ -19,8 +19,8 @@
 #
 # Input flags go to export-model.mjs (--sequence, --a3m, --paired-a3m, --job, --ligands, --smiles,
 # --modify, --kinds, --template, --bundle); fold flags to ./af3 (--samples, --recycles, --steps,
-# --seed, ...), which runs --fold --fast. Builds ./af3 if it is missing, exports the weights once
-# (to native/af3/weights) and each input to a temporary directory.
+# --seed, ...), which runs --fold --fast. Builds ./af3 if it is missing and exports each input to a
+# temporary directory.
 set -euo pipefail
 # the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
 gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"; echo "sm_${cc:-80}"; }
@@ -36,24 +36,22 @@ while [ $# -gt 0 ]; do
   shift
 done
 repo="$(cd "$here/../.." && pwd)"
-bundle=""
-for suffix in full-f32 f32 int5; do
-  [ -f "$repo/model-$model-$suffix/manifest.json" ] && { bundle="$repo/model-$model-$suffix/manifest.json"; break; }
-done
-[ -n "$bundle" ] || { echo "no bundle for model $model under $repo" >&2; exit 1; }
-weights="$here/weights"; [ "$model" = af3 ] || weights="$here/weights-$model"
+map="$here/maps/$model.map"
+[ -f "$map" ] || { echo "no model $model (no $map)" >&2; exit 1; }
+bundle="$repo/model-$model-int5/manifest.json"
+[ -f "$bundle" ] || python3 "$repo/native/fetch_bundles.py" "$model" >&2
+wflags=(--bundle="$repo/model-$model-int5" --map="$map")
 if [ ! -x "$here/af3" ]; then
   (cd "$here" && nvcc -O3 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af3.cu \
      -lcublas -lcublasLt -lcupti -o af3)
 fi
 node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")
-[ -f "$weights/model.idx" ] || "${node[@]}" "$weights" --weights-only --bundle="$bundle"
 serve_dir="/tmp/af3-serve-$model-$(id -u)"
 server_up() { [ -f "$serve_dir/pid" ] && kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null; }
 if [ "$serve" = --serve ]; then
   server_up && { echo "already serving $model ($serve_dir)"; exit 0; }
   mkdir -p "$serve_dir"; rm -f "$serve_dir"/*.job "$serve_dir"/*.done
-  nohup "$here/af3" - --serve="$serve_dir" --weights="$weights" --fold --fast "${foldflags[@]}" > "$serve_dir/server.log" 2>&1 &
+  nohup "$here/af3" - --serve="$serve_dir" "${wflags[@]}" --fold --fast "${foldflags[@]}" > "$serve_dir/server.log" 2>&1 &
   echo $! > "$serve_dir/pid"
   # and a resident exporter beside it: node's module loading was most of an export
   mkdir -p "$serve_dir/exp"; rm -f "$serve_dir/exp"/*
@@ -101,7 +99,7 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # without the line (an error) it waits for the exit status
 run_af3() {
   local done=0 line
-  exec 4< <("$here/af3" "$1" --weights="$weights" --fold --fast --out="$2" --wait-input --detach-output "${foldflags[@]}" && rc=0 || rc=$?; echo "af3: exit $rc")
+  exec 4< <("$here/af3" "$1" "${wflags[@]}" --fold --fast --out="$2" --wait-input --detach-output "${foldflags[@]}" && rc=0 || rc=$?; echo "af3: exit $rc")
   while IFS= read -r line <&4; do
     case "$line" in "af3: done") done=1; break ;; "af3: exit "*) exec 4<&-; return "${line#af3: exit }" ;; *) printf '%s\n' "$line" ;; esac
   done

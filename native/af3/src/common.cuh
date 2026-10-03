@@ -45,8 +45,34 @@ struct Entry { char kind; size_t offset, length; double value; int seg; size_t d
 // the float32 copy, so nothing is decoded on the host and no float32 file is ever written (ESMFold2's was
 // 2.9 GB from 0.35 GB of bundles, and a 2-vCPU Colab VM spent minutes making it). The decode is
 // src/weights/dtype.js's, to the bit: code * scale + zero in double, rounded once to float32.
-struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, dst; int kind, bits, block; };
-// kind: 0 float32, 1 float16, 2 int8 (symmetric), 3 packed int<bits> (asymmetric)
+struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, dst, first = 0; int kind, bits, block; };
+// kind: 0 float32, 1 float16, 2 int8 (symmetric), 3 packed int<bits> (asymmetric), 4 zeros (a map's `z`),
+// 5 gathered (a map's `p` lines: parts of bundle tensors decoded into scratch, see GPart);
+// first: the element of the bundle tensor this entry starts at (a map's slice of a stacked tensor)
+// A map's `p` line: one PART of a gathered tensor - a grid of up to 6 axes walked over the destination
+// (dst + sum i_k * dstStride_k) and one or two sources (srcOff + sum i_k * srcStride_k, into a bundle
+// tensor decoded whole into scratch). op: 'v' the source, 'x' the product of two (one float32 multiply,
+// as the page's loader folds a LayerNorm scale into a projection), 'i' the source as an int32 (a
+// residue table the bundle stores as float32), 'o' one. What no part covers is zero.
+struct GPart { int rec, op, rank, nsrc; size_t dims[6], dst; long long dstStride[6]; int src[2]; size_t srcOff[2]; long long srcStride[2][6]; };
+struct GPartD { unsigned long long n, dst, off[2], dims[6]; long long ds[6], ss[2][6]; int rank, op; };
+__global__ void bundleGatherK(const float* scratch, const GPartD* parts, float* out) {
+  GPartD p = parts[blockIdx.y];
+  for (unsigned long long o = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; o < p.n;
+       o += (unsigned long long)gridDim.x * blockDim.x) {
+    unsigned long long r = o; long long d = (long long)p.dst, a = (long long)p.off[0], b = (long long)p.off[1];
+    for (int k = p.rank - 1; k >= 0; --k) {
+      long long i = (long long)(r % p.dims[k]); r /= p.dims[k];
+      d += i * p.ds[k]; a += i * p.ss[0][k]; b += i * p.ss[1][k];
+    }
+    float v;
+    if (p.op == 'o') v = 1.f;
+    else if (p.op == 'x') v = __fmul_rn(scratch[a], scratch[b]);
+    else if (p.op == 'i') v = __int_as_float((int)scratch[a]);
+    else v = scratch[a];
+    out[d] = v;
+  }
+}
 // A JSON value (enough of JSON for a manifest)
 struct Json {
   enum T { NUL, BOOL, NUM, STR, ARR, OBJ } t = NUL;
@@ -92,15 +118,17 @@ struct Json {
   }
 };
 // the decode, one tensor of the shard a blockIdx.y
-struct BDecode { unsigned long long src, dst, n, scale, zero; int kind, bits, block, pad; };
+struct BDecode { unsigned long long src, dst, n, scale, zero, first; int kind, bits, block, pad; };
 __device__ __forceinline__ float bundleHalf(const unsigned char* p) {
   unsigned short h = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__ushort_as_half(h));
 }
 __global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, float* out) {
   BDecode d = table[blockIdx.y];
-  for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < d.n;
-       i += (unsigned long long)gridDim.x * blockDim.x) {
+  for (unsigned long long o = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; o < d.n;
+       o += (unsigned long long)gridDim.x * blockDim.x) {
+    unsigned long long i = d.first + o;     // the bundle tensor's element
     float v;
+    if (d.kind == 4) { out[d.dst + o] = 0.f; continue; }
     if (d.kind == 0) { unsigned int w; memcpy(&w, raw + d.src + 4 * i, 4); v = __uint_as_float(w); }
     else if (d.kind == 1) v = bundleHalf(raw + d.src + 2 * i);
     else if (d.kind == 2) {
@@ -113,7 +141,7 @@ __global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, fl
       double scale = (double)bundleHalf(raw + d.scale + 2 * g), zero = (double)bundleHalf(raw + d.zero + 2 * g);
       v = (float)__dadd_rn(__dmul_rn((double)code, scale), zero);
     }
-    out[d.dst + i] = v;
+    out[d.dst + o] = v;
   }
 }
 inline float hostHalf(const unsigned char* p) { __half_raw r; r.x = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__half(r)); }
@@ -130,6 +158,7 @@ struct Segment { const float* data; size_t bytes; float* device; std::map<std::s
                  size_t deviceBytes = 0; std::vector<Run> runs;
                  bool bundle = false; std::string dir; std::vector<std::string> files; std::vector<BRec> recs;
                  std::map<int, std::vector<float>> hostCopies;     // a bundle tensor the host read, decoded
+                 std::vector<BRec> srcRecs; size_t scratchElems = 0; std::vector<GPart> parts;   // (gathered tensors)
                };
 struct Model {
   std::map<std::string, Entry> index;
@@ -177,7 +206,9 @@ struct Model {
   // a page bundle (its manifest.json and shards) under `prefix/`: every tensor as `prefix/<name>` with its
   // rank and dims (`#r`, `#k`), and the manifest's trunk/languageModel numbers as `meta/<key>` - the
   // entries native/ef2/export_weights.mjs wrote, from the same bytes
-  void loadBundle(const std::string& dir, const std::string& prefix) {
+  // With `map` (a port's .map, native/make_map.mjs), the entries are the map's instead: each `b` line a
+  // slice of a bundle tensor under the port's own name, each `z` zeros, each `m` metadata as it is.
+  void loadBundle(const std::string& dir, const std::string& prefix, const std::string& map = "") {
     std::ifstream in(dir + "/manifest.json");
     if (!in) { fprintf(stderr, "no %s/manifest.json\n", dir.c_str()); exit(1); }
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -197,6 +228,7 @@ struct Model {
     const Json* tensors = m.get("tensors");
     if (!tensors) { fprintf(stderr, "%s/manifest.json has no tensors\n", dir.c_str()); exit(1); }
     std::map<std::string, int> fileIndex;
+    std::map<std::string, BRec> byName;      // (map mode) every bundle tensor, by its bundle name
     size_t at = 0;
     for (auto& [name, r] : tensors->obj) {
       BRec b{}; const Json* j;
@@ -224,6 +256,7 @@ struct Model {
       if ((b.kind == 0 && b.byteOffset % 4) || (b.kind == 1 && b.byteOffset % 2)) {
         fprintf(stderr, "%s: unaligned in its shard\n", name.c_str()); exit(1);
       }
+      if (!map.empty()) { byName[name] = b; continue; }
       std::string key = prefix + "/" + name;
       if (index.count(key)) { fprintf(stderr, "%s is in two model directories\n", key.c_str()); exit(1); }
       at = (at + 3) / 4 * 4;
@@ -232,6 +265,69 @@ struct Model {
       sg.recs.push_back(b);
       addMeta(key + "#r", (double)shape.size());
       for (size_t k = 0; k < shape.size(); ++k) addMeta(key + "#" + std::to_string(k), shape[k]);
+    }
+    if (!map.empty()) {
+      std::ifstream mf(map);
+      if (!mf) { fprintf(stderr, "no %s\n", map.c_str()); exit(1); }
+      std::string line; std::map<std::string, int> srcIndex;
+      while (std::getline(mf, line)) {
+        std::istringstream in(line); char kind; std::string name; in >> kind >> name;
+        if (kind == 'm') { double v; in >> v; addMeta(name, v); continue; }
+        BRec b{};
+        size_t n;
+        if (kind == 'b') {
+          std::string source; size_t first; in >> source >> first >> n;
+          auto it = byName.find(source);
+          if (it == byName.end() || first + n > it->second.elements) {
+            fprintf(stderr, "%s: %s does not hold [%zu, %zu) of %s (another export of the bundle?)\n", map.c_str(),
+                    dir.c_str(), first, first + n, source.c_str());
+            exit(1);
+          }
+          b = it->second; b.first = first;
+        } else if (kind == 'z') { in >> n; b.kind = 4; b.file = -1; }
+        else if (kind == 'p') {
+          GPart g{}; char op; in >> n >> op >> g.rank;
+          g.op = op; g.nsrc = op == 'o' ? 0 : op == 'x' ? 2 : 1;
+          bool okLine = (op == 'v' || op == 'x' || op == 'i' || op == 'o') && g.rank >= 1 && g.rank <= 6;
+          size_t count = 1;
+          for (int k = 0; okLine && k < g.rank; ++k) { in >> g.dims[k]; count *= g.dims[k]; }
+          long long lo = 0, hi = 0;
+          if (okLine) in >> g.dst;
+          for (int k = 0; okLine && k < g.rank; ++k) { in >> g.dstStride[k]; (g.dstStride[k] < 0 ? lo : hi) += g.dstStride[k] * (long long)(g.dims[k] - 1); }
+          okLine = okLine && (long long)g.dst + lo >= 0 && (long long)g.dst + hi < (long long)n && count > 0;
+          for (int q = 0; okLine && q < g.nsrc; ++q) {
+            std::string source; in >> source >> g.srcOff[q];
+            auto it = byName.find(source);
+            long long slo = 0, shi = 0;
+            for (int k = 0; k < g.rank; ++k) { in >> g.srcStride[q][k]; (g.srcStride[q][k] < 0 ? slo : shi) += g.srcStride[q][k] * (long long)(g.dims[k] - 1); }
+            if (it == byName.end() || (long long)g.srcOff[q] + slo < 0 || (long long)g.srcOff[q] + shi >= (long long)it->second.elements) {
+              fprintf(stderr, "%s: %s does not hold that view of %s (another export of the bundle?)\n", map.c_str(), dir.c_str(), source.c_str());
+              exit(1);
+            }
+            if (!srcIndex.count(source)) {
+              BRec r = it->second; sg.scratchElems = (sg.scratchElems + 3) / 4 * 4; r.dst = sg.scratchElems; sg.scratchElems += r.elements;
+              srcIndex[source] = (int)sg.srcRecs.size(); sg.srcRecs.push_back(r);
+            }
+            g.src[q] = srcIndex[source];
+          }
+          if (!okLine || in.fail()) { fprintf(stderr, "%s: a malformed p line for %s\n", map.c_str(), name.c_str()); exit(1); }
+          auto it = index.find(name);
+          if (it != index.end()) {
+            if (it->second.seg != seg || it->second.rec < 0 || sg.recs[it->second.rec].kind != 5 || it->second.length != n) {
+              fprintf(stderr, "%s: %s is a p tensor and something else\n", map.c_str(), name.c_str()); exit(1);
+            }
+            g.rec = it->second.rec; sg.parts.push_back(g); continue;
+          }
+          b.kind = 5; b.file = -1; g.rec = (int)sg.recs.size(); sg.parts.push_back(g);
+        }
+        else { fprintf(stderr, "%s: a line of kind %c\n", map.c_str(), kind); exit(1); }
+        if (index.count(name)) { fprintf(stderr, "%s is in two model directories\n", name.c_str()); exit(1); }
+        b.elements = n;
+        at = (at + 3) / 4 * 4;
+        Entry e{'t', 0, n, 0, seg}; e.devOffset = at; e.rec = (int)sg.recs.size(); b.dst = at; at += n;
+        index[name] = e;
+        sg.recs.push_back(b);
+      }
     }
     sg.deviceBytes = at * 4;
     for (auto& f : sg.files) { struct stat st; if (stat((dir + "/" + f).c_str(), &st)) { fprintf(stderr, "no %s/%s\n", dir.c_str(), f.c_str()); exit(1); } sg.bytes += (size_t)st.st_size; }
@@ -263,7 +359,11 @@ struct Model {
       if (cudaHostAlloc(&pin[k], most, cudaHostAllocDefault) != cudaSuccess || cudaMalloc(&raw[k], most) != cudaSuccess ||
           cudaMalloc(&dt[k], maxRecs * sizeof(BDecode)) != cudaSuccess || cudaEventCreateWithFlags(&done[k], cudaEventDisableTiming) != cudaSuccess)
         return false;
-    std::vector<std::vector<BDecode>> tables(2);
+    std::vector<std::vector<BDecode>> tables(2), scratchTables(2);
+    float* scratch = nullptr;
+    if (s.scratchElems && cudaMalloc(&scratch, s.scratchElems * 4) != cudaSuccess) return false;
+    BDecode* sdt[2] = {nullptr, nullptr};
+    for (int k = 0; k < 2 && !s.srcRecs.empty(); ++k) if (cudaMalloc(&sdt[k], s.srcRecs.size() * sizeof(BDecode)) != cudaSuccess) return false;
     for (size_t fi = 0; fi < s.files.size(); ++fi) {
       int k = (int)(fi & 1);
       if (fi >= 2 && cudaEventSynchronize(done[k]) != cudaSuccess) return false;     // buffer k free again
@@ -275,16 +375,45 @@ struct Model {
       pin[k][n] = pin[k][n + 1] = 0;          // (a packed code's second byte past the last group)
       auto& table = tables[k]; table.clear();
       for (const BRec& b : s.recs)
-        if (b.file == (int)fi) table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.kind, b.bits, b.block, 0});
+        if (b.file == (int)fi || (b.kind == 4 && fi == 0))
+          table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.kind, b.bits, b.block, 0});
       if (!table.empty()) {
         if (cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess ||
             cudaMemcpyAsync(dt[k], table.data(), table.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         for (size_t t0 = 0; t0 < table.size(); t0 += 65535)
           bundleDecodeK<<<dim3(64, (unsigned)std::min<size_t>(65535, table.size() - t0)), 256, 0, st>>>(raw[k], dt[k] + t0, s.device);
       }
+      auto& stable = scratchTables[k]; stable.clear();     // (the sources of gathered tensors, whole, into scratch)
+      for (const BRec& b : s.srcRecs)
+        if (b.file == (int)fi) stable.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, 0, b.kind, b.bits, b.block, 0});
+      if (!stable.empty()) {
+        if (table.empty() && cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
+        if (cudaMemcpyAsync(sdt[k], stable.data(), stable.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
+        for (size_t t0 = 0; t0 < stable.size(); t0 += 65535)
+          bundleDecodeK<<<dim3(64, (unsigned)std::min<size_t>(65535, stable.size() - t0)), 256, 0, st>>>(raw[k], sdt[k] + t0, scratch);
+      }
       if (cudaEventRecord(done[k], st) != cudaSuccess) return false;
     }
+    GPartD* pt = nullptr;
+    if (!s.parts.empty()) {
+      for (const BRec& b : s.recs) if (b.kind == 5 && cudaMemsetAsync(s.device + b.dst, 0, b.elements * 4, st) != cudaSuccess) return false;
+      std::vector<GPartD> pd;
+      for (const GPart& g : s.parts) {
+        GPartD d{}; d.n = 1; d.rank = g.rank; d.op = g.op; d.dst = s.recs[g.rec].dst + g.dst;
+        for (int k = 0; k < g.rank; ++k) { d.dims[k] = g.dims[k]; d.n *= g.dims[k]; d.ds[k] = g.dstStride[k]; }
+        for (int q = 0; q < g.nsrc; ++q) {
+          d.off[q] = s.srcRecs[g.src[q]].dst + g.srcOff[q];
+          for (int k = 0; k < g.rank; ++k) d.ss[q][k] = g.srcStride[q][k];
+        }
+        pd.push_back(d);
+      }
+      if (cudaMalloc(&pt, pd.size() * sizeof(GPartD)) != cudaSuccess ||
+          cudaMemcpyAsync(pt, pd.data(), pd.size() * sizeof(GPartD), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
+      for (size_t t0 = 0; t0 < pd.size(); t0 += 65535)
+        bundleGatherK<<<dim3(64, (unsigned)std::min<size_t>(65535, pd.size() - t0)), 256, 0, st>>>(scratch, pt + t0, s.device);
+    }
     bool ok = cudaStreamSynchronize(st) == cudaSuccess && cudaGetLastError() == cudaSuccess;
+    cudaFree(pt); cudaFree(scratch); cudaFree(sdt[0]); cudaFree(sdt[1]);
     for (int k = 0; k < 2; ++k) { cudaFreeHost(pin[k]); cudaFree(raw[k]); cudaFree(dt[k]); cudaEventDestroy(done[k]); }
     cudaStreamDestroy(st);
     return ok;
@@ -295,20 +424,48 @@ struct Model {
     auto it = m.hostCopies.find(rec);
     if (it != m.hostCopies.end()) return it->second.data();
     const BRec& b = s.recs[rec];
+    if (b.kind == 5) {
+      std::vector<float> out(b.elements, 0.f);
+      std::map<int, std::vector<float>> src;
+      for (const GPart& g : s.parts) {
+        if (g.rec != rec) continue;
+        for (int q = 0; q < g.nsrc; ++q) if (!src.count(g.src[q])) src[g.src[q]] = decodeHost(s, s.srcRecs[g.src[q]]);
+        size_t total = 1; for (int k = 0; k < g.rank; ++k) total *= g.dims[k];
+        for (size_t o = 0; o < total; ++o) {
+          size_t r = o; long long d = (long long)g.dst, a = (long long)g.srcOff[0], c = (long long)g.srcOff[1];
+          for (int k = g.rank - 1; k >= 0; --k) {
+            long long i = (long long)(r % g.dims[k]); r /= g.dims[k];
+            d += i * g.dstStride[k]; a += i * g.srcStride[0][k]; c += i * g.srcStride[1][k];
+          }
+          float v;
+          if (g.op == 'o') v = 1.f;
+          else if (g.op == 'x') v = src[g.src[0]][a] * src[g.src[1]][c];
+          else if (g.op == 'i') { int iv = (int)src[g.src[0]][a]; memcpy(&v, &iv, 4); }
+          else v = src[g.src[0]][a];
+          out[d] = v;
+        }
+      }
+      return (m.hostCopies[rec] = std::move(out)).data();
+    }
+    return (m.hostCopies[rec] = decodeHost(s, b)).data();
+  }
+  static std::vector<float> decodeHost(const Segment& s, const BRec& b) {
+    std::vector<float> out(b.elements, 0.f);
+    if (b.kind == 4) return out;
     std::vector<unsigned char> raw = readFile(s.dir + "/" + s.files[b.file]);
-    std::vector<float> out(b.elements);
-    for (size_t i = 0; i < b.elements; ++i) {
-      if (b.kind == 0) memcpy(&out[i], &raw[b.byteOffset + 4 * i], 4);
-      else if (b.kind == 1) out[i] = hostHalf(&raw[b.byteOffset + 2 * i]);
-      else if (b.kind == 2) out[i] = (float)((double)(signed char)raw[b.byteOffset + i] * (double)hostHalf(&raw[b.scaleOffset + 2 * (i / b.block)]));
+    for (size_t o = 0; o < b.elements; ++o) {
+      size_t i = b.first + o;
+      if (b.kind == 0) memcpy(&out[o], &raw[b.byteOffset + 4 * i], 4);
+      else if (b.kind == 1) out[o] = hostHalf(&raw[b.byteOffset + 2 * i]);
+      else if (b.kind == 2) out[o] = (float)((double)(signed char)raw[b.byteOffset + i] * (double)hostHalf(&raw[b.scaleOffset + 2 * (i / b.block)]));
       else {
         size_t g = i / b.block, groupBytes = (size_t)b.block * b.bits / 8, bit = g * groupBytes * 8 + (i % b.block) * b.bits, byte = bit >> 3;
         unsigned code = ((raw[b.byteOffset + byte] | (raw[b.byteOffset + byte + 1] << 8)) >> (bit & 7)) & ((1u << b.bits) - 1);
         volatile double p = (double)code * (double)hostHalf(&raw[b.scaleOffset + 2 * g]);
-        out[i] = (float)(p + (double)hostHalf(&raw[b.zeroOffset + 2 * g]));
+        out[o] = (float)(p + (double)hostHalf(&raw[b.zeroOffset + 2 * g]));
       }
     }
-    return (m.hostCopies[rec] = std::move(out)).data();
+    return out;
   }
   // drop a directory's entries, its mapping and its device copy (one input of a batch, done);
   // returns the names it held so the caches keyed on them can be cleared too

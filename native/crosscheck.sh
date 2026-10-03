@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # The same folds on any GPU, to hold one machine's native ports against another's:
 #
-#   native/crosscheck.sh <out dir> [af3=<weights>] [af2=<monomer weights>] [af2m=<multimer weights>]
+#   native/crosscheck.sh <out dir> [af2=<monomer weights>] [af2m=<multimer weights>]
 #
 # Each input is featurised here by the repo's own exporters (deterministic), each port built for this
 # GPU (into <out>), and every fold's log line and PDB kept: compare two machines' <out> dirs with
-# native/af3/score.py (CA RMSD between the two PDBs of a case) and the pLDDT/pTM lines. A port whose
-# weights are not given is skipped. Defaults: native/<port>/weights (what native/colab_setup.sh writes).
+# native/af3/score.py (CA RMSD between the two PDBs of a case) and the pLDDT/pTM lines. ESMFold2 and
+# AF3 read their published bundles as they are (a port whose bundle is not on disk is skipped); AF2's
+# weights are given, or it is skipped.
 set -uo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"; N="$repo/native"
 out="$1"; shift; mkdir -p "$out"
-declare -A W=([af3]="$N/af3/weights" [af2]="" [af2m]="")
+declare -A W=([af2]="" [af2m]="")
 for a in "$@"; do W[${a%%=*}]="${a#*=}"; done
 arch="sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"
 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader > "$out/gpu.txt"
@@ -45,15 +46,16 @@ if [ -f "$repo/model-esmfold2-int5/manifest.json" ]; then
   for c in 6mrr 5caj 1brs gol-sep dna; do run ef2-$c "$out/ef2" "$in/ef2-$c" "${EF[@]}" --fast --warm=96,800 --out="$out/ef2-$c.pdb"; done
   run ef2-6mrr-f32 "$out/ef2" "$in/ef2-6mrr" "${EF[@]}" --out="$out/ef2-6mrr-f32.pdb"
 fi
-if [ -f "${W[af3]}/model.idx" ]; then
+AW=(--bundle="$repo/model-af3-int5" --map="$N/af3/maps/af3.map")    # (the bundle as it is, through its map)
+if [ -f "$repo/model-af3-int5/manifest.json" ]; then
   build af3 "--use_fast_math"
   B="$repo/model-af3-int5/manifest.json"
   ex3() { local d="$in/af3-$1"; shift; [ -f "$d/model.idx" ] || (cd "$N/af3" && node --js-float16array --max-old-space-size=24000 \
           export-model.mjs "$d" --no-weights --bundle="$B" "$@" > /dev/null); }
   ex3 6mrr --sequence=$S6; ex3 5caj-tmpl --sequence=$S5 --template="$FX/5caj-crystal.pdb:A"
   ex3 1brs-tmpl --sequence=$SA:$SD --template="$FX/1brs-crystal.pdb:A@0+$FX/1brs-crystal.pdb:D@1"; ex3 gol --sequence=$S6 --ligands=GOL
-  for c in 6mrr 5caj-tmpl 1brs-tmpl gol; do run af3-$c "$out/af3" "$in/af3-$c" --weights="${W[af3]}" --fold --fast --out="$out/af3-$c.pdb"; done
-  run af3-6mrr-f32 "$out/af3" "$in/af3-6mrr" --weights="${W[af3]}" --fold --steps=20 --out="$out/af3-6mrr-f32.pdb"
+  for c in 6mrr 5caj-tmpl 1brs-tmpl gol; do run af3-$c "$out/af3" "$in/af3-$c" "${AW[@]}" --fold --fast --out="$out/af3-$c.pdb"; done
+  run af3-6mrr-f32 "$out/af3" "$in/af3-6mrr" "${AW[@]}" --fold --steps=20 --out="$out/af3-6mrr-f32.pdb"
 fi
 if [ -n "${W[af2]}" ] && [ -f "${W[af2]}/model.idx" ]; then
   build af2 "--use_fast_math"

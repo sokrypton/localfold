@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
   // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
   // 5 diffusion samples - where the command does not set them; the plain defaults are the page's
   bool af3Defaults = false, saveEmbeddings = false, saveDistogram = false;
-  uint64_t seed = 42; std::string out = "fold.pdb", weightsDir, seedsArg;
+  uint64_t seed = 42; std::string out = "fold.pdb", weightsDir, bundleDir, mapFile, seedsArg;
   bool waitInput = false;   // start up (CUDA, the weights on the device) while the input is still being exported
   std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
   for (int i = 2; i < argc; ++i) {
@@ -47,6 +47,8 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--seeds=", 8)) seedsArg = argv[i] + 8;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strncmp(argv[i], "--weights=", 10)) weightsDir = argv[i] + 10;
+    else if (!strncmp(argv[i], "--bundle=", 9)) bundleDir = argv[i] + 9;       // a published bundle, read as it is,
+    else if (!strncmp(argv[i], "--map=", 6)) mapFile = argv[i] + 6;            // through the port's map (maps/<family>.map)
     else if (!strncmp(argv[i], "--score-pdb=", 12)) return scorePdbMain(argv[i] + 12);
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;
     else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;
@@ -63,7 +65,10 @@ int main(int argc, char** argv) {
   if (inputs.size() > 1 && outs.size() != inputs.size()) {
     fprintf(stderr, "%zu inputs and %zu --out paths: a batch names one output per input\n", inputs.size(), outs.size()); return 1;
   }
+  if (!bundleDir.empty() != !mapFile.empty()) { fprintf(stderr, "--bundle and --map go together\n"); return 1; }
   if (!weightsDir.empty()) M.load(weightsDir);      // the weights exported once (--weights-only)
+  else if (!bundleDir.empty()) M.loadBundle(bundleDir, "", mapFile);
+  const bool haveWeights = !weightsDir.empty() || !bundleDir.empty();
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;
   if (af3Defaults) {
@@ -112,7 +117,7 @@ int main(int argc, char** argv) {
   });
   struct JoinAtExit { std::thread& t; ~JoinAtExit() { if (t.joinable()) t.join(); } } joinWarm{cublasWarm};
   Trunk t{};
-  if (!weightsDir.empty()) M.upload(0);      // now, beside the cuBLAS warm-up (both are needed before any fold)
+  if (haveWeights) M.upload(0);      // now, beside the cuBLAS warm-up (both are needed before any fold)
   if (cublasWarm.joinable()) cublasWarm.join();
   auto runInput = [&](size_t which) -> int {
   if (waitInput) {          // the exporter writes model.idx last, by a rename

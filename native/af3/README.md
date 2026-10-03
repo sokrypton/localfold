@@ -29,8 +29,10 @@ does (5CAJ: its own chain B found, 1.864 A with the alignment - a crystal templa
 alignment moves this target little: chain A by hand gives 1.836, and 0.289 without the alignment).
 Both send the sequences to api.colabfold.com, so they are flags, never defaults.
 
-`fold` builds `af3` if it is missing, exports the weights once (`native/af3/weights`, from the
-bundle on disk - no server), featurises the input with the repository's own featuriser into a
+`fold` builds `af3` if it is missing, reads the weights the page folds with - the published
+int5 bundle (`model-<model>-int5`, fetched once by `native/fetch_bundles.py`), as it is: its codes
+go to the device and are decoded there, and `maps/<model>.map` names each tensor's slice of it
+(below) - featurises the input with the repository's own featuriser into a
 temporary directory (0.2 s, while `af3` starts) and folds it (`--fold --fast`); everything after
 `--` goes to `af3`. An alignment keeps a seeded 1024 of its rows, AF3's own `num_msa`
 (`--max-msa=N` to change it: 512 is 3.6% less trunk on 5CAJ's 7907-row search, pLDDT 95.08
@@ -40,13 +42,20 @@ its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 ```
 cd native/af3
 nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -o af3
-node --js-float16array --max-old-space-size=24000 export-model.mjs weights --weights-only
 node --js-float16array export-model.mjs in --no-weights --sequence=<SEQ> [--a3m=...]
-./af3 in --weights=weights --fold --fast --out=fold.pdb
+./af3 in --bundle=../../model-af3-int5 --map=maps/af3.map --fold --fast --out=fold.pdb
 python3 score.py fold.pdb ../../tools/fixtures/5caj-crystal.pdb A
 node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + every oracle
 ./af3 data                                   # f32 path, every stage against AF3
 ```
+
+The oracles want the float32 weights (`export-model.mjs weights --weights-only
+--bundle=<f32 manifest>`, then `--weights=weights`), which are not published. A map is regenerated
+only when a bundle is re-exported: `node --js-float16array native/make_map.mjs model-<m>-int5
+<that bundle's --weights-only export> native/af3/maps/<m>.map` finds every native tensor in the
+decoded bundle - a slice of one bundle tensor, zeros, ones, or a per-block LayerNorm scale folded
+into its projection as the page's loader folds it - checked bit for bit, and fails on anything
+else. A fold through a map is byte-identical to one from the export it was made from (all seven).
 
 `--out=x.pdb`, or `--out=x.cif` for mmCIF as AlphaFold 3 writes it (entities, polymer sequences
 and chains declared, so AF3's own reader and gemmi both load it; the pLDDT in B_iso_or_equiv).
@@ -256,7 +265,8 @@ both each time. The outputs are byte-identical either way.
 barnase-barstar with their crystals as templates, scores each against the deposited structure and
 holds RMSD and mean pLDDT to `gate-baseline.json` (0.05 A, 0.5 points; `--write` re-records,
 `--only=` takes models or case names). Run it after any kernel change; it takes about three
-minutes once every model's weights are exported. The baseline is this A100's.
+minutes. The baseline is this A100's, on the published int5 bundles (the float32 ones gave
+af3-6mrr 0.515 A / 87.57 where int5 gives 0.550 / 87.39; the kitchen sink 79.04 against 73.47).
 
 ## Other AF3-lineage models
 
