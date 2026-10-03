@@ -41,7 +41,7 @@ its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 
 ```
 cd native/af3
-nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -o af3
+nvcc -O1 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -o af3
 node --js-float16array export-model.mjs in --no-weights --sequence=<SEQ> [--a3m=...]
 ./af3 in --bundle=../../model-af3-int5 --map=maps/af3.map --fold --fast --out=fold.pdb
 python3 score.py fold.pdb ../../tools/fixtures/5caj-crystal.pdb A

@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 if [ ! -x "$here/af2" ]; then
-  (cd "$here" && nvcc -O3 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af2.cu \
+  (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af2.cu \
      -lcublas -lcublasLt -lcupti -o af2)
 fi
 repo="$(cd "$here/../.." && pwd)"

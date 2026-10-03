@@ -42,7 +42,7 @@ bundle="$repo/model-$model-int5/manifest.json"
 [ -f "$bundle" ] || python3 "$repo/native/fetch_bundles.py" "$model" >&2
 wflags=(--bundle="$repo/model-$model-int5" --map="$map")
 if [ ! -x "$here/af3" ]; then
-  (cd "$here" && nvcc -O3 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af3.cu \
+  (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af3.cu \
      -lcublas -lcublasLt -lcupti -o af3)
 fi
 node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")

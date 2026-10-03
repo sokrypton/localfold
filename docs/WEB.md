@@ -4192,3 +4192,11 @@ A change of model still pays its weights once (~1 s here); the first fold on a r
 build and the bundle download. `test:native` reports click-to-result now, not that plus its own 1 s
 settle, and takes `--only=<substring>`.
 
+**The first build, cut where it is spent.** nvcc's `-O` is the HOST code's optimisation level (the device
+code is optimised regardless - the SASS is byte-identical), and host `-O3` was 24.5 s of AF3's 61 s compile
+for no measurable run time: every port now builds at `-O1` (13.5 s; `-O0` would be 8.4 s and costs a fold
+7%). Total compile work 123 -> 101 CPU-seconds. And AF3, the page's default model, compiles at full priority
+with AF2 and ESMFold2 niced, since a Colab VM has two cores and the first fold waits only on its own port:
+rehearsed here on two cores (`taskset -c 0,1`), AF3 is ready at **45 s against 69** and the whole build at 48
+against 69. Not a lever: AF3's float32 trunk path, which the worker never runs, costs nothing to compile.
+

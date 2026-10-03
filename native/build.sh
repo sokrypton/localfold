@@ -21,12 +21,17 @@ echo $$ > "$marker"; trap 'rm -f "$marker"' EXIT
 pids=()
 for port in "${ports[@]}"; do
   case "$port" in af3|af2) fast=--use_fast_math ;; ef2) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
+  # AF3 - the page's default model, so usually the first fold - at full priority and the others niced: a
+  # Colab VM has two cores and three compiles, and the first fold waits only on its own port's binary
+  prio=""; [ "$port" = af3 ] || prio="nice -n 10"
   out="$here/$port/$port"
   # (the stamp is the card AND the sources - every port includes native/af3/src's shared headers - so a
   # checkout that changed a kernel rebuilds rather than keep the last binary)
   stamp="$arch $(cat "$here/$port"/src/*.cu* "$here"/af3/src/*.cuh | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
-  ( cd "$here/$port" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread $fast src/$port.cu \
+  # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical
+  # - and host -O3 was 40% of AF3's compile for no measurable run time; -O0 costs a fold 7%)
+  ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 -arch=$arch --default-stream per-thread $fast src/$port.cu \
       -lcublas -lcublasLt -lcupti -o "$out.building" >> "$log" 2>&1 \
     && mv "$out.building" "$out" && echo "$stamp" > "$out.arch" && echo "built $port for $arch" >> "$log" \
     || { echo "FAILED $port for $arch" >> "$log"; exit 1; } ) &
