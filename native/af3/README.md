@@ -355,6 +355,8 @@ live in src/fused256.cuh and protenix2 takes them from 80 tokens - triangle in, 
 triangle out, and the transition's widening ahead of cuBLAS's second GEMM: **trunk 1259 -> 1180 ms (6.4%)
 at 262 tokens**, templated 5CAJ 0.191 A either way (`test:native` holds it). At 384 and 512 channels the
 same kernels fit one block an SM and LOSE (2160 against 1925 ms, 3360 against 2821), so those stay unfused.
+On an L4 they pay more than on the A100, at one block an SM: protenix2's trunk **5.13 -> 4.12 s** at 262
+tokens, ESMFold2's (whose they were) 1.60 -> 1.07.
 
 ## Tried and not taken
 
