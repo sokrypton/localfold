@@ -393,6 +393,8 @@ export const DEFAULT_TUNING = Object.freeze({
   gridAttendMatrix: null,
   // grid.attend's register-tiled vector form (a 4x4 score block a lane) where the matrix form is off.
   gridAttendTiled: null,
+  // AF2's flash attention in the same register-tiled form (src/kernels/attention.js), on the f32 path.
+  attentionTiled: null,
   esmfold2TokenRowTile: null,
   // ESMFold2's token projections split over K; null derives it from the workgroup count (see
   // tokenKSplits in src/esmfold2/diffusion-webgpu.js), 1 is the unsplit kernel.
@@ -720,6 +722,10 @@ const PRIORS = new Map([
     // 3.95 -> 2.71 at 400; whole fold 1.635 -> 1.615 s at 262, 3.41 -> 3.24 at 400. 4x4 a lane beat
     // 8x4 (3.20), 4x8 (3.50) and 8x8 (4.98) at 400. Inert where gridAttendMatrix resolves.
     gridAttendTiled: true,
+    // ...and AF2's attentions in the same form (src/kernels/attention.js), where attentionMatrix is not
+    // chosen. Stock flags, 400 residues, 128 rows: a block 46.3 -> 43.9 ms, the triangle attentions
+    // 3.64 -> 2.76 ms each, MSA row 2.38 -> 1.79, column 0.655 -> 0.587.
+    attentionTiled: true,
     gridAttendMatrix: true,
     gridAttendMatrixTile: "4x32",
     pairTransitionSplit: true,

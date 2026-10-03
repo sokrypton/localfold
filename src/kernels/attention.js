@@ -1295,6 +1295,142 @@ ${each((t) => write4("output", `q_base + ${t}u`,
 }
 
 /**
+ * AF2's flash attention with each lane holding a 4x4 block of (query, key) scores - the register-tiled
+ * form of createAttentionRegisterFlashShader, for a device without matrix units (every visitor's Chrome;
+ * see CLAUDE.md, round four). That kernel gives a lane ONE query, so each staged key costs it 16 vec4
+ * workgroup reads for 64 multiply-adds and a rescale of all eight accumulators. Here a staged vec4 feeds
+ * four dot products, the row max is reduced across a query row's eight lanes through workgroup memory,
+ * the running sum stays per lane until one final reduction, and the output is rescaled once a 32-key
+ * tile. AF3's grid.attend took the same change (src/af3/trunk/grid-attention-webgpu.js) at 1.46x.
+ *
+ * Same bindings, uniform and semantics as the register kernel at `group: 1`: the query arrives
+ * pre-scaled, the mask enters as 1e9 * (mask - 1), the logit is clamped to +-1e8, a key past the end
+ * is excluded, and the output is gated. Head width 32 and f32 storage only; 32 queries a workgroup.
+ * Workgroup storage 14.6 KiB - P shares the key tile's array, which is safe because P is written after
+ * the barrier that ends the keys' last read and the next keys are staged after the one that ends P's.
+ */
+export function createAttentionTiledFlashShader(storage = {}) {
+  // Packed two halves to a word where the caller stores them so - the register kernel's convention,
+  // which needs no shader-f16: pack2x16float and unpack2x16float are core WGSL.
+  const packIn = storage.input === "f16";
+  const packValue = (storage.value ?? storage.input) === "f16";
+  const packOut = storage.output === "f16";
+  const vec4In = packIn ? "vec2<u32>" : "vec4<f32>";
+  const readIn = (array, index) => (packIn ? `load4(${array}[${index}])` : `${array}[${index}]`);
+  const readValue = (index) => (packValue ? `load4(value[${index}])` : `value[${index}]`);
+  const A = [0, 1, 2, 3];
+  const T = [0, 1, 2, 3, 4, 5, 6, 7];
+  const each = (f) => A.map(f).join("\n");
+  const each2 = (f) => A.flatMap((a) => A.map((b) => f(a, b))).join("\n");
+  return `${COMMON}
+@group(0) @binding(0) var<storage, read> query: array<${vec4In}>;
+@group(0) @binding(1) var<storage, read> key: array<${vec4In}>;
+@group(0) @binding(2) var<storage, read> value: array<${packValue ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(3) var<storage, read> gate: array<${vec4In}>;
+@group(0) @binding(4) var<storage, read> mask: array<f32>;
+@group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
+@group(0) @binding(6) var<uniform> p: Parameters;
+@group(0) @binding(7) var<storage, read_write> output: array<${packOut ? "vec2<u32>" : "vec4<f32>"}>;
+${packIn || packValue ? `
+fn load4(w: vec2<u32>) -> vec4<f32> {
+  let lo = unpack2x16float(w.x);
+  let hi = unpack2x16float(w.y);
+  return vec4<f32>(lo.x, lo.y, hi.x, hi.y);
+}` : ""}${packOut ? `
+fn store4(v: vec4<f32>) -> vec2<u32> {
+  return vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
+}` : ""}
+
+const HD4: u32 = 8u;
+const STRIDE: u32 = 9u;
+var<workgroup> q_tile: array<vec4<f32>, 288>;
+var<workgroup> kp_tile: array<vec4<f32>, 288>;
+var<workgroup> v_tile: array<vec4<f32>, 256>;
+var<workgroup> red: array<f32, 256>;
+
+fn mask_index(batch: u32, key_index: u32) -> u32 {
+  if (p.transpose == 0u) { return batch * p.queries + key_index; }
+  return key_index * p.batch + batch;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let batch_index = group.y;
+  let head = group.z;
+  if (batch_index >= p.batch || head >= p.heads) { return; }
+  let n = p.queries;
+  let local = local_id.x;
+  let q0 = group.x * 32u;
+  // queries q0 + a * 8 + qg, keys j0 + b * 8 + kg; dimensions kg * 4 .. in the PV product
+  let qg = local / 8u;
+  let kg = local % 8u;
+  for (var index = local; index < 256u; index += 64u) {
+    let slot = index / HD4;
+    let i = min(q0 + slot, n - 1u);
+    q_tile[slot * STRIDE + index % HD4] = ${readIn("query", "((batch_index * n + i) * p.heads + head) * HD4 + index % HD4")};
+  }
+${each((a) => `  let i${a} = q0 + ${a * 8}u + qg;
+  let ic${a} = min(i${a}, n - 1u);
+  var m${a} = -3.0e38;
+  var l${a} = 0.0;
+  var o${a} = vec4<f32>(0.0);`)}
+
+  for (var j0 = 0u; j0 < n; j0 += 32u) {
+    workgroupBarrier();
+    for (var index = local; index < 256u; index += 64u) {
+      let slot = index / HD4;
+      let j = min(j0 + slot, n - 1u);
+      let source = ((batch_index * n + j) * p.heads + head) * HD4 + index % HD4;
+      kp_tile[slot * STRIDE + index % HD4] = ${readIn("key", "source")};
+      v_tile[index] = ${readValue("source")};
+    }
+    workgroupBarrier();
+${each2((a, b) => `    var s${a}${b} = 0.0;`)}
+${T.map((t) => `    {
+${each((a) => `      let qv${a} = q_tile[(${a * 8}u + qg) * STRIDE + ${t}u];`)}
+${each((b) => `      let kv${b} = kp_tile[(${b * 8}u + kg) * STRIDE + ${t}u];`)}
+${each2((a, b) => `      s${a}${b} += dot(qv${a}, kv${b});`)}
+    }`).join("\n")}
+${each((b) => `    let key${b} = j0 + ${b * 8}u + kg;
+    let kc${b} = min(key${b}, n - 1u);
+    let masked${b} = 1e9 * (mask[mask_index(batch_index, kc${b})] - 1.0);`)}
+${each2((a, b) => `    var logit${a}${b} = s${a}${b} + masked${b};
+    if (p.has_pair_bias != 0u) { logit${a}${b} += pair_bias[(head * n + ic${a}) * n + kc${b}]; }
+    logit${a}${b} = select(-3.0e38, clamp(logit${a}${b}, -1e8, 1e8), key${b} < n);`)}
+${each((a) => `    red[(${a * 8}u + qg) * 8u + kg] = max(max(logit${a}0, logit${a}1), max(logit${a}2, logit${a}3));`)}
+    workgroupBarrier();
+${each((a) => `    var tile_max${a} = red[(${a * 8}u + qg) * 8u];
+    for (var r = 1u; r < 8u; r += 1u) { tile_max${a} = max(tile_max${a}, red[(${a * 8}u + qg) * 8u + r]); }
+    let new_m${a} = max(m${a}, tile_max${a});
+    let alpha${a} = exp(m${a} - new_m${a});
+    m${a} = new_m${a};
+${A.map((b) => `    let p${a}${b} = exp(logit${a}${b} - new_m${a});`).join("\n")}
+    l${a} = l${a} * alpha${a} + (p${a}0 + p${a}1 + p${a}2 + p${a}3);
+    o${a} = o${a} * alpha${a};`)}
+${each((b) => `    kp_tile[(${b * 8}u + kg) * STRIDE + qg] = vec4<f32>(p0${b}, p1${b}, p2${b}, p3${b});`)}
+    workgroupBarrier();
+    for (var k = 0u; k < 32u; k += 1u) {
+      let pk = kp_tile[k * STRIDE + qg];
+      let vv = v_tile[k * HD4 + kg];
+${each((a) => `      o${a} += pk[${a}] * vv;`)}
+    }
+  }
+  workgroupBarrier();
+${each((a) => `  red[(${a * 8}u + qg) * 8u + kg] = l${a};`)}
+  workgroupBarrier();
+${each((a) => `  {
+    var total = 0.0;
+    for (var r = 0u; r < 8u; r += 1u) { total += red[(${a * 8}u + qg) * 8u + r]; }
+    if (i${a} < n) {
+      let index = ((batch_index * n + i${a}) * p.heads + head) * HD4 + kg;
+      output[index] = ${packOut ? "store4" : ""}((o${a} / total) * ${readIn("gate", "index")});
+    }
+  }`)}
+}`;
+}
+
+/**
  * The subgroup size every one of these kernels is written for. It is pinned in
  * the shader as `@subgroup_size(32)` and assumed by the lane arithmetic, so it
  * is a correctness requirement and not a preference.
@@ -1874,6 +2010,17 @@ export function selectAttentionFlashKernel(
     // The VALUE follows the other inputs unless a caller separates it. See the
     // note in createAttentionRegisterFlashShader for why anyone would.
     const valueStorage = storage.value ?? inputStorage;
+    // 🔴 THE REGISTER-TILED FORM, where a device asks for it and the inputs are the f32 ones it takes.
+    if (tuning.attentionTiled === true && headDim === 32 && precision === "f32"
+        && queriesPerLane === 1) {
+      const tiledKey = `attention:flash-tiled-32-${inputStorage}${valueStorage}${outputStorage}`;
+      return {
+        cacheKey: tiledKey,
+        shader: shaderSource(device, tiledKey, () => createAttentionTiledFlashShader(
+          { input: inputStorage, value: valueStorage, output: outputStorage })),
+        queryTile: 32, variant, packedStorageSupported: true, valueStorage,
+      };
+    }
     const registerKey = `attention:flash-registers-${headDim}-${precision}`
       + (inputStorage === "f32" && outputStorage === "f32"
         ? "" : `-storage${inputStorage}${outputStorage}`)
