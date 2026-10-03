@@ -292,9 +292,9 @@ class Af3Server:
 
 
 def streaming(job):
-    """Whether a fold streams its intermediate results - on unless the runtime (LOCALFOLD_NATIVE_FRAMES=0,
-    the notebook's `cuda_frames`) or the request (`frames: false`) says otherwise."""
-    return os.environ.get("LOCALFOLD_NATIVE_FRAMES", "1") != "0" and job.get("frames", True) is not False
+    """Whether a fold streams its intermediate results: the reader's own choice, the page's Live preview
+    (web/colab-bridge.js), sent as `frames` - on unless it says false."""
+    return job.get("frames", True) is not False
 
 
 class Worker:
@@ -466,8 +466,7 @@ class Worker:
                 self.server = Af3Server(family, bundle)
             emit("status", f"{family} on CUDA ({self.device}) · folding")
             on_frame = None
-            # 🔴 THE SAMPLER'S FRAMES, AS WebGPU AND JAX STREAM THEIRS - on unless the runtime or the job says
-            # otherwise (LOCALFOLD_NATIVE_FRAMES=0, or `frames: false` in the request)
+            # 🔴 THE SAMPLER'S FRAMES, AS WebGPU AND JAX STREAM THEIRS - unless the page's Live preview is off
             if streaming(job):
                 total = next((int(f[8:]) for f in fold if f.startswith("--steps=")), 200)   # (af3's default)
 

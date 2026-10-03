@@ -4132,8 +4132,10 @@ Measured interleaved on the A100, job to result with streaming on and off: AF3
 +0.9%. Every final structure is byte-identical with streaming on; the last
 streamed frame is the final structure to 0.003 Å; AF2's last pass's pLDDT, pTM
 and ipTM equal its final confidences exactly; a streamed contact map is within
-one byte of the final file's. `LOCALFOLD_NATIVE_FRAMES=0` (the notebook's
-`cuda_frames`) or `frames: false` in a request turns it off. `test:native`
+one byte of the final file's. It is the reader's to turn off, on the page:
+the badge's **Live** checkbox beside the backend picker (shown for CUDA,
+remembered per browser), sent as `frames` with each fold - it decides what that
+page draws, so it lives there and not in the notebook. `test:native`
 holds every port to what it streams and the reader's viewer to frames carrying
 their contact maps and PAE.
 

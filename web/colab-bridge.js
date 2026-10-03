@@ -510,6 +510,11 @@ export function base64ToBytes(text) {
  */
 let backendChoice = "webgpu";
 export const remoteBackendChoice = () => backendChoice;
+// ...and whether a CUDA fold streams its intermediate results to this page while it runs (each trunk pass's
+// contact map, the sampler's frames, AF2's passes with their scores) - the reader's choice, on the badge,
+// because it is this page that draws them. Measured at under 1% of a fold (tools/native_worker.py).
+let liveChoice = true;
+export const remoteLiveChoice = () => liveChoice;
 
 // 🔴 WHETHER THE RUNTIME HAS A REAL GPU IS NOT KNOWN UNTIL /health ANSWERS, and
 // the choice above says "webgpu" until then - so anything that acts on it early
@@ -665,6 +670,30 @@ function installColabStatus() {
           catch (cause) { /* remembered for this page only */ }
         });
         badge.insertBefore(pick, leave);
+        // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it is
+        // set here, per fold, by whoever is watching - and shown only for the backend it applies to
+        if (offered.includes("native")) {
+          const live = document.createElement("label");
+          live.className = "colab-live";
+          live.title = "Live preview: stream a CUDA fold's intermediate results as it runs - each trunk"
+            + " pass's contact map, the sampler's frames, AlphaFold 2's passes with their scores. Off, the"
+            + " page shows the finished fold only. Measured at under 1% of a fold.";
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          try { box.checked = localStorage.getItem("localfold.colabLive") !== "off"; }
+          catch (cause) { box.checked = true; }
+          liveChoice = box.checked;
+          box.addEventListener("change", () => {
+            liveChoice = box.checked;
+            try { localStorage.setItem("localfold.colabLive", box.checked ? "on" : "off"); }
+            catch (cause) { /* remembered for this page only */ }
+          });
+          live.append(box, document.createTextNode(" Live"));
+          const showLive = () => { live.hidden = pick.value !== "native"; };
+          pick.addEventListener("change", showLive);
+          showLive();
+          badge.insertBefore(live, leave);
+        }
       }
       leave.title = releases
         ? "Stop folding here and release this Colab machine: the service"

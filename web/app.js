@@ -79,7 +79,7 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
-import { colabRole, installColabBridge, onRemoteReady, remoteBackendChoice, remoteCommand,
+import { colabRole, installColabBridge, onRemoteReady, remoteBackendChoice, remoteCommand, remoteLiveChoice,
   remoteEvents, remoteWebgpuReal,
   remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
 // A runtime page the Colab broker opened reads its weights through the broker;
@@ -4080,6 +4080,8 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // this page's and not re-implemented in Python. See tools/jax_worker.py.
   if (remoteBackendChoice() === "jax" || remoteBackendChoice() === "native") {
     request.backend = remoteBackendChoice();
+    // ...and, for CUDA, whether it streams its intermediate results here (the badge's Live preview)
+    if (request.backend === "native") request.frames = remoteLiveChoice();
     // ...the RESOLVED model, which is not the row's value where a second row
     // picks it: the PLM row turns "ef2" into the 600M or 300M checkpoint.
     request.family = family;

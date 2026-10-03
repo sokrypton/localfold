@@ -192,7 +192,13 @@ def page_arm(bad):
           pick.value = 'native'; pick.dispatchEvent(new Event('change', { bubbles: true }));
           return true;
         })()""")
-        for family, tokens in (("af3", 68), ("monomer", 68), ("ef2-fast-600m", 68)):
+        # the badge's Live preview: present for CUDA, and off means the finished fold only
+        live = cdp.evaluate(ws, "(() => { const l = document.querySelector('.colab-live'); return l ? { shown: !l.hidden, on: l.querySelector('input').checked } : null; })()")
+        if not live or not live["shown"] or not live["on"]:
+            bad.append(f"page: the Live preview box is {live} - want it shown and on for CUDA")
+        for family, tokens, streamed in (("af3", 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True), ("af3", 68, False)):
+            cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.colab-live input');
+              if (b.checked !== {'true' if streamed else 'false'}) b.click(); return b.checked; }})()""")
             cdp.evaluate(ws, f"""(() => {{
               const g = (id) => document.getElementById(id);
               g('model-family').value = '{family}';
@@ -224,7 +230,7 @@ def page_arm(bad):
                                                  pae: fs.filter((f) => f.pae).length }; })(),
                        gpu: window.__readerGpu };
             })()""")
-            print(f"page: {family:14s} {time.time() - started:5.1f} s  {got['frames']:2d} frames {got['mapped']}  {got['status'][:80]}")
+            print(f"page: {family:14s} live {'on ' if streamed else 'off'} {time.time() - started:5.1f} s  {got['frames']:2d} frames {got['mapped']}  {got['status'][:70]}")
             problems = []
             if " on CUDA " not in got["status"] or "done in" not in got["status"]:
                 problems.append(f"status {got['status']!r}")
@@ -234,13 +240,16 @@ def page_arm(bad):
                 problems.append(f"PAE {got['pae']} (typed {got['paeTyped']}), pLDDT {got['plddt']}")
             if got["atoms"] < tokens * 4:
                 problems.append(f"{got['atoms']} atoms")
-            if family in ("af3", "ef2-fast-600m") and (got["frames"] < 5 or got["mapped"]["contact"] < 5):
+            if not streamed:
+                if got["frames"] > 1:
+                    problems.append(f"Live preview off and the viewer still holds {got['frames']} frames")
+            elif family in ("af3", "ef2-fast-600m") and (got["frames"] < 5 or got["mapped"]["contact"] < 5):
                 problems.append(f"the viewer holds {got['frames']} frames, {got['mapped']['contact']} with a contact map")
-            if family == "monomer" and (got["mapped"]["pae"] < 1 or got["mapped"]["contact"] < 1):
+            if streamed and family == "monomer" and (got["mapped"]["pae"] < 1 or got["mapped"]["contact"] < 1):
                 problems.append(f"the viewer's AF2 passes carry {got['mapped']} - no streamed PAE or contacts")
             if got["gpu"]:
                 problems.append("the reader's browser asked for a WebGPU adapter")
-            bad += [f"page {family}: {p}" for p in problems]
+            bad += [f"page {family}{'' if streamed else ' (live off)'}: {p}" for p in problems]
     finally:
         if reader is not None:
             reader.terminate()
