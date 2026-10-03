@@ -164,6 +164,37 @@ static void writeConfidences(const std::string& pdb, const Trunk& t, int L, cons
   fclose(f);
 }
 
+// --frames=DIR: each pass streamed as the page shows a local AF2 fold's - its structure (superposed onto
+// the first pass's, pLDDT in the B factors), its pLDDT, pTM and ipTM, its PAE and contact map - through
+// common.cuh's AsyncTap, so the fold does not wait for them: pass-PP-of-NN.pdb / .json, pae-PP-of-NN.u8
+// (PAE / 0.125, a byte a pair), contacts-PP-of-NN.u8 (probability * 255; where the weights carry the
+// distogram head)
+static std::string FRAMES_DIR;
+// a pair's expected PAE and its pTM term (confidence.compute_tm's), from its 64 logits - reduced on the
+// device, because the logits are 64 floats a pair (17 MB a pass at 261 residues) and these are two
+__global__ void paeTmK(const float* logits, size_t pairs, float d0, float* pae, float* tm) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= pairs) return;
+  const float* l = logits + ij * 64;
+  const float step = 31.f / 62;
+  float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = fmaxf(mx, l[b]);
+  float s = 0, e = 0, t = 0;
+  for (int b = 0; b < 64; ++b) {
+    float c = b < 63 ? b * step + step / 2 : 62 * step + step / 2 + step;
+    float p = expf(l[b] - mx); s += p; e += p * c; t += p / (1 + (c / d0) * (c / d0));
+  }
+  pae[ij] = e / s; tm[ij] = t / s;
+}
+// P(distance < 8 A) from the symmetrised distogram logits: bins 0..18 (breaks 2.3125 + 0.3125 b)
+__global__ void contact8K(const float* logits, size_t pairs, float* out) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= pairs) return;
+  const float* l = logits + ij * 64;
+  float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = fmaxf(mx, l[b]);
+  float s = 0, near = 0; for (int b = 0; b < 64; ++b) { float p = expf(l[b] - mx); s += p; if (b <= 18) near += p; }
+  out[ij] = near / s;
+}
+
 // --tolerance=<A>: the page's early stop (src/af2/model/recycle-convergence.js, ColabFold's compute_tol) -
 // after each pass from the second on, the RMS change of every C-alpha pair distance against the last pass,
 // over the sequence mask; the fold stops when it is strictly below this. 0 runs every pass.
@@ -318,6 +349,95 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   std::vector<float> previous37, seqMask;
   double converged = -1; int ran = passes;
   if (TOLERANCE > 0 && !warm) seqMask = std::vector<float>(M.f("seq_mask"), M.f("seq_mask") + L);
+  // --frames: the pass tap (see FRAMES_DIR) - host copies of what a pass's PDB needs, taken once
+  std::vector<int> hAatype, hRi, hAsym; int hFirstAsym = 0;
+  std::vector<double> passReference; double passCentre[3] = {};
+  const bool tapPasses = !FRAMES_DIR.empty() && !warm;
+  const bool tapContacts = tapPasses && M.has("w/distogram_head/half_logits/weights");
+  if (tapPasses) {
+    hAatype.resize(L); hRi.resize(L); hAsym.resize(L);
+    CK(cudaMemcpy(hAatype.data(), Idev("aatype"), L * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hRi.data(), Idev("residue_index"), L * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hAsym.data(), Idev("asym_id"), L * 4, cudaMemcpyDeviceToHost));
+    hFirstAsym = *std::min_element(hAsym.begin(), hAsym.end());
+    TAP().reserve(passes, (size_t)L * 37 * 3 * 4 + (size_t)L * 50 * 4 + pairs * 4 + pairs * 2 + 4 * 256);
+  }
+  auto tapPass = [&](int pass) {
+    if (!tapPasses) return;
+    float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
+    float* paeF = scratch<float>("tap.pae", pairs); float* tmF = scratch<float>("tap.tm", pairs);
+    paeTmK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, paeF, tmF);
+    unsigned char* pae8 = scratch<unsigned char>("tap.pae8", pairs);
+    quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(paeF, pae8, pairs, 0.125f);
+    std::vector<std::pair<const void*, size_t>> parts = {{so.pos37, (size_t)L * 37 * 3 * 4}, {plddtLogits, (size_t)L * 50 * 4},
+                                                         {tmF, pairs * 4}, {pae8, pairs}};
+    if (tapContacts) {
+      float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
+      linearB(t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
+      symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
+      float* cf = scratch<float>("tap.contact", pairs); unsigned char* c8 = scratch<unsigned char>("tap.contact8", pairs);
+      contact8K<<<blocks(pairs), 256, 0, STREAM>>>(dg, pairs, cf);
+      quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(cf, c8, pairs, 1.f / 255);
+      parts.push_back({c8, pairs});
+    }
+    char tag[32]; snprintf(tag, sizeof tag, "%02d-of-%02d", pass, passes);
+    std::string base = FRAMES_DIR + "/", id = tag;
+    const float* mask37 = M.f("c/atom37_mask");
+    TAP().offer(parts, [&, base, id, mask37](const char* host, const std::vector<size_t>& at) {
+      const float* pos = (const float*)(host + at[0]); const float* pl = (const float*)(host + at[1]);
+      const float* tm = (const float*)(host + at[2]);
+      std::vector<float> plddt(L);
+      for (int i = 0; i < L; ++i) {
+        const float* l = pl + i * 50; float mx = -INFINITY; for (int b = 0; b < 50; ++b) mx = std::max(mx, l[b]);
+        double s = 0, e = 0; for (int b = 0; b < 50; ++b) { double p = std::exp(l[b] - mx); s += p; e += p * (b + 0.5) * 2; }
+        plddt[i] = (float)(e / s);
+      }
+      double mean = 0; for (float v : plddt) mean += v / L;
+      auto tmScore = [&](bool interface) {
+        double best = 0;
+        for (int i = 0; i < L; ++i) {
+          double sum = 0, n = 0;
+          for (int j = 0; j < L; ++j) { if (interface && hAsym[i] == hAsym[j]) continue; sum += tm[(size_t)i * L + j]; n += 1; }
+          if (n > 0) best = std::max(best, sum / (n + 1e-8));
+        }
+        return best;
+      };
+      bool chains = false; for (int i = 1; i < L; ++i) chains |= hAsym[i] != hAsym[0];
+      double ptm = tmScore(false), iptm = chains ? tmScore(true) : -1;
+      // the atoms, superposed onto the first pass's (the page aligns its passes to the first)
+      std::vector<double> pts; std::vector<std::pair<int, int>> which;
+      for (int i = 0; i < L; ++i) {
+        int aa = std::min(std::max(hAatype[i], 0), 19);
+        for (int a = 0; a < 37; ++a) if (mask37[aa * 37 + a] != 0) {
+          which.push_back({i, a}); for (int d = 0; d < 3; ++d) pts.push_back(pos[((size_t)i * 37 + a) * 3 + d]);
+        }
+      }
+      double c[3] = {}; size_t na = which.size();
+      for (size_t k = 0; k < na; ++k) for (int d = 0; d < 3; ++d) c[d] += pts[k * 3 + d] / na;
+      for (size_t k = 0; k < na; ++k) for (int d = 0; d < 3; ++d) pts[k * 3 + d] -= c[d];
+      if (passReference.empty()) { passReference = pts; for (int d = 0; d < 3; ++d) passCentre[d] = c[d]; }
+      double R[9]; bestRotation(pts, passReference, R);
+      std::string out; char line[128];
+      for (size_t k = 0; k < na; ++k) {
+        int i = which[k].first, a = which[k].second, aa = std::min(std::max(hAatype[i], 0), 19);
+        const double* p = &pts[k * 3]; double q[3];
+        for (int d = 0; d < 3; ++d) q[d] = R[d * 3] * p[0] + R[d * 3 + 1] * p[1] + R[d * 3 + 2] * p[2] + passCentre[d];
+        snprintf(line, sizeof line, "ATOM  %5d %-4s %3s %c%4d    %8.3f%8.3f%8.3f%6.2f%6.2f           %c\n", (int)k + 1,
+                 strlen(ATOM37[a]) < 4 ? (std::string(" ") + ATOM37[a]).c_str() : ATOM37[a], RESTYPE3[hAatype[i] > 19 ? 20 : aa],
+                 (char)('A' + std::min(hAsym[i] - hFirstAsym, 25)), hRi[i] + 1, q[0], q[1], q[2], 1.0, plddt[i], ATOM37[a][0]);
+        out += line;
+      }
+      out += "END\n";
+      writeWhole(base + "pae-" + id + ".u8", host + at[3], pairs);
+      if (at.size() > 4) writeWhole(base + "contacts-" + id + ".u8", host + at[4], pairs);
+      std::string js = "{\"meanPlddt\": " + std::to_string(mean) + ", \"ptm\": " + std::to_string(ptm)
+                       + (iptm >= 0 ? ", \"iptm\": " + std::to_string(iptm) : std::string()) + ", \"plddt\": [";
+      for (int i = 0; i < L; ++i) { char v[16]; snprintf(v, sizeof v, "%s%.2f", i ? ", " : "", plddt[i]); js += v; }
+      js += "]}\n";
+      writeWhole(base + "pass-" + id + ".json", js.data(), js.size());
+      writeWhole(base + "pass-" + id + ".pdb", out.data(), out.size());     // (last: the worker keys on it)
+    });
+  };
   auto settled = [&](int pass) {           // the early stop, after a pass has run
     if (TOLERANCE <= 0 || warm) return false;
     CK(cudaStreamSynchronize(STREAM));
@@ -339,6 +459,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
         CK(cudaStreamSynchronize(STREAM));
         printf("  pass %d done at %.1f ms\n", pass, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
       }
+      tapPass(pass);
       if (settled(pass)) break;
       continue;
     }
@@ -355,10 +476,12 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       CK(cudaStreamSynchronize(STREAM));
       printf("  pass %d done at %.1f ms\n", pass, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
     }
+    tapPass(pass);
     if (settled(pass)) break;
   }
   CK(cudaStreamSynchronize(STREAM));
   double foldMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
+  if (tapPasses) TAP().drain();       // (every pass's files written before the fold says it is done)
   if (warm) {
     for (float* p : {t.msa, t.extra, t.pair, t.pairMask, prevRow, prevPair, prevPos, single}) CK(cudaFree(p));
     return 0;
@@ -419,6 +542,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strncmp(argv[i], "--tolerance=", 12)) TOLERANCE = atof(argv[i] + 12);
+    else if (!strncmp(argv[i], "--frames=", 9)) FRAMES_DIR = argv[i] + 9;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
     else if (!strcmp(argv[i], "--detach-output")) DETACH = true;
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;   // L,N,E,T: warm up at those shapes meanwhile

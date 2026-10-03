@@ -171,6 +171,55 @@ def token_plddt(atoms, chain_ids, res_ids):
     return [round(v, 2) for v in out]
 
 
+def run_streaming(cmd, what, log, frames, on_file):
+    """run(), with `frames` watched while the binary folds: each finished file (a .tmp renamed into place)
+    handed to on_file(name, path) in name order, as the binary's tap writes them (AsyncTap)."""
+    import threading
+    proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            preexec_fn=die_with_parent)
+    said = {"out": "", "err": ""}
+    readers = [threading.Thread(target=lambda k=k, f=f: said.__setitem__(k, f.read()), daemon=True)
+               for k, f in (("out", proc.stdout), ("err", proc.stderr))]
+    for reader in readers:
+        reader.start()
+    seen = set()
+
+    def collect():
+        for name in sorted(os.listdir(frames)):
+            if name not in seen and not name.endswith(".tmp"):
+                seen.add(name)
+                on_file(name, os.path.join(frames, name))
+    while proc.poll() is None:
+        collect()
+        time.sleep(0.005)
+    for reader in readers:
+        reader.join()
+    collect()
+    log.append(f"$ {' '.join(cmd)}\n{said['out']}{said['err']}")
+    if proc.returncode != 0:
+        tail = "\n".join((said["err"] or said["out"]).strip().splitlines()[-4:])
+        raise RuntimeError(f"{what} failed: {tail}")
+    return said["out"]
+
+
+def emit_scores(meta, pae_path, passes):
+    """An AF2 pass's confidences as the page's `scores` event: its pLDDT (per residue and mean), pTM, ipTM
+    and PAE (a byte a pair, PAE / 0.125, base64)."""
+    import base64
+    data = open(pae_path, "rb").read()
+    emit("scores", {**meta, "n": int(round(len(data) ** 0.5)), "paeU8": base64.b64encode(data).decode(),
+                    "paeScale": 0.125, "passes": passes})
+
+
+def emit_contacts(path, index, passes):
+    """A pass's contact map as the page's `contacts` event: one byte a pair (probability * 255), base64 -
+    68 KB for 261 tokens where float32 JSON would be ten times that."""
+    import base64
+    data = open(path, "rb").read()
+    n = int(round(len(data) ** 0.5))
+    emit("contacts", {"n": n, "pass": index, "passes": passes, "u8": base64.b64encode(data).decode()})
+
+
 class Af3Server:
     """One AF3-lineage model kept on the device between folds: native/af3's own --serve mode (a job is
     DIR/<id>.job - the input's directory, then a flag a line - its output <id>.log, its status <id>.done).
@@ -193,7 +242,7 @@ class Af3Server:
                 raise RuntimeError("the AF3 server did not start: " + open(self.log.name).read()[-400:])
             time.sleep(0.05)
 
-    def fold(self, inputs, flags, on_frame=None):
+    def fold(self, inputs, flags, on_frame=None, on_contacts=None):
         """...and with `on_frame`, each sampler step's prediction as it lands (native/af3 --frames: written by
         a thread of the binary off the copy engine, so the fold does not wait for it - +0.1-0.4% of a fold,
         measured interleaved; the structure is byte-identical either way)."""
@@ -212,9 +261,13 @@ class Af3Server:
             if on_frame is None:
                 return
             for name in sorted(os.listdir(frames)):
-                if name.endswith(".pdb") and name not in seen:
-                    seen.add(name)
+                if name in seen or name.endswith(".tmp"):
+                    continue
+                seen.add(name)
+                if name.startswith("frame-"):
                     on_frame(os.path.join(frames, name), int(name[6:10]))
+                elif name.startswith("contacts-"):           # contacts-PP-of-NN.u8: a trunk pass's map
+                    on_contacts(os.path.join(frames, name), int(name[9:11]), int(name[15:17]))
         while not os.path.exists(base + ".done"):
             if self.proc.poll() is not None:
                 raise RuntimeError("the AF3 server exited: " + open(self.log.name).read()[-400:])
@@ -236,6 +289,12 @@ class Af3Server:
                 self.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+
+
+def streaming(job):
+    """Whether a fold streams its intermediate results - on unless the runtime (LOCALFOLD_NATIVE_FRAMES=0,
+    the notebook's `cuda_frames`) or the request (`frames: false`) says otherwise."""
+    return os.environ.get("LOCALFOLD_NATIVE_FRAMES", "1") != "0" and job.get("frames", True) is not False
 
 
 class Worker:
@@ -389,6 +448,7 @@ class Worker:
                     f"--map={os.path.join(NATIVE, 'af2', 'maps', model + '.map')}", "--fast", f"--out={out_pdb}",
                     f"--tolerance={float(controls.get('tolerance') or 0)}",   # (the page's early stop)
                     *([f"--delta={delta}"] if delta else [])]
+            stream = streaming(job)
         else:
             self.close_server()
             small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)
@@ -397,6 +457,7 @@ class Worker:
             run([*NODE, os.path.join(NATIVE, "ef2", "export_input.mjs"), inputs, f"--job={job_path}"], "featurising", log)
             fold = [binary("ef2"), inputs, f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                     f"--seed={seed}", f"--out={out_pdb}"]
+            stream = streaming(job)
         emit("progress", 0.15)
         if port == "af3":
             if self.server is None or self.server.family != family or self.server.proc.poll() is not None:
@@ -407,15 +468,49 @@ class Worker:
             on_frame = None
             # 🔴 THE SAMPLER'S FRAMES, AS WebGPU AND JAX STREAM THEIRS - on unless the runtime or the job says
             # otherwise (LOCALFOLD_NATIVE_FRAMES=0, or `frames: false` in the request)
-            if os.environ.get("LOCALFOLD_NATIVE_FRAMES", "1") != "0" and job.get("frames", True) is not False:
+            if streaming(job):
                 total = next((int(f[8:]) for f in fold if f.startswith("--steps=")), 200)   # (af3's default)
 
                 def on_frame(path, step):
                     emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
-                    emit("progress", 0.15 + 0.85 * step / total)
+                    emit("progress", 0.3 + 0.7 * step / total)
                     emit("status", f"{family} on CUDA ({self.device}) · diffusion {step}/{total}")
-            said = self.server.fold(inputs, fold, on_frame)
+
+                def on_contacts(path, index, passes):
+                    emit_contacts(path, index, passes)
+                    emit("progress", 0.15 + 0.15 * (index + 1) / passes)
+                    emit("status", f"{family} on CUDA ({self.device}) · trunk pass {index + 1}/{passes}")
+            else:
+                on_contacts = None
+            said = self.server.fold(inputs, fold, on_frame, on_contacts)
             log.append(said)
+        elif stream:
+            # AF2's passes (structure, pLDDT, pTM/ipTM, PAE, contacts) and ESMFold2's trunk contacts and
+            # sampler frames, as the binary's tap writes them
+            emit("status", f"{family} on CUDA ({self.device}) · folding")
+            frames = os.path.join(WORK, "frames")
+            os.makedirs(frames)
+
+            def on_file(name, path):
+                tag = re.search(r"(\d+)-of-(\d+)", name)
+                if name.startswith("pass-") and name.endswith(".pdb"):
+                    index, passes = int(tag.group(1)), int(tag.group(2))
+                    emit("frame", open(path).read())
+                    emit_scores(json.load(open(path[:-4] + ".json")), os.path.join(frames, f"pae-{tag.group(0)}.u8"), passes)
+                    emit("progress", 0.15 + 0.85 * (index + 1) / passes)
+                    emit("status", f"{family} on CUDA ({self.device}) · pass {index + 1}/{passes}")
+                elif name.startswith("contacts-"):
+                    emit_contacts(path, int(tag.group(1)), int(tag.group(2)))
+                    if port == "ef2":
+                        emit("progress", 0.15 + 0.15 * (int(tag.group(1)) + 1) / int(tag.group(2)))
+                        emit("status", f"{family} on CUDA ({self.device}) · trunk pass {int(tag.group(1)) + 1}/{tag.group(2)}")
+                elif name.startswith("frame-"):
+                    step, total = int(name[6:10]), int(name[11:15]) if name[10] == "-" else 0
+                    emit("frame", open(path).read())
+                    if total:
+                        emit("progress", 0.3 + 0.7 * step / total)
+                        emit("status", f"{family} on CUDA ({self.device}) · diffusion {step}/{total}")
+            said = run_streaming([*fold, f"--frames={frames}"], "the fold", log, frames, on_file)
         else:
             emit("status", f"{family} on CUDA ({self.device}) · folding")
             said = run(fold, "the fold", log)

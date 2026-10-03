@@ -23,6 +23,8 @@
 #include <tuple>
 #include <sstream>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -1031,6 +1033,120 @@ inline double relRms(const float* a, const float* b, size_t n) {
   double num = 0, den = 0;
   for (size_t i = 0; i < n; ++i) { double e = (double)a[i] - b[i]; num += e * e; den += (double)b[i] * b[i]; }
   return std::sqrt(num / std::max(den, 1e-300));
+}
+// The rotation taking `moving` (centred) onto `fixed` (centred) in the least-squares sense - Horn's
+// quaternion method: the largest eigenvector of a symmetric 4x4 built from their covariance (Jacobi).
+inline void bestRotation(const std::vector<double>& moving, const std::vector<double>& fixed, double R[9]) {
+  double S[3][3] = {};
+  for (size_t i = 0; i + 2 < moving.size(); i += 3)
+    for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) S[a][b] += moving[i + a] * fixed[i + b];
+  double N[4][4] = {
+    {S[0][0] + S[1][1] + S[2][2], S[1][2] - S[2][1], S[2][0] - S[0][2], S[0][1] - S[1][0]},
+    {S[1][2] - S[2][1], S[0][0] - S[1][1] - S[2][2], S[0][1] + S[1][0], S[2][0] + S[0][2]},
+    {S[2][0] - S[0][2], S[0][1] + S[1][0], -S[0][0] + S[1][1] - S[2][2], S[1][2] + S[2][1]},
+    {S[0][1] - S[1][0], S[2][0] + S[0][2], S[1][2] + S[2][1], -S[0][0] - S[1][1] + S[2][2]}};
+  double V[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+  for (int sweep = 0; sweep < 50; ++sweep) {
+    double off = 0; for (int p = 0; p < 4; ++p) for (int q = p + 1; q < 4; ++q) off += N[p][q] * N[p][q];
+    if (off < 1e-22) break;
+    for (int p = 0; p < 4; ++p) for (int q = p + 1; q < 4; ++q) {
+      if (std::fabs(N[p][q]) < 1e-300) continue;
+      double theta = (N[q][q] - N[p][p]) / (2 * N[p][q]);
+      double t = (theta >= 0 ? 1 : -1) / (std::fabs(theta) + std::sqrt(theta * theta + 1)), c = 1 / std::sqrt(t * t + 1), sn = t * c;
+      for (int k = 0; k < 4; ++k) { double a = N[k][p], b = N[k][q]; N[k][p] = c * a - sn * b; N[k][q] = sn * a + c * b; }
+      for (int k = 0; k < 4; ++k) { double a = N[p][k], b = N[q][k]; N[p][k] = c * a - sn * b; N[q][k] = sn * a + c * b; }
+      for (int k = 0; k < 4; ++k) { double a = V[k][p], b = V[k][q]; V[k][p] = c * a - sn * b; V[k][q] = sn * a + c * b; }
+    }
+  }
+  int best = 0; for (int k = 1; k < 4; ++k) if (N[k][k] > N[best][best]) best = k;
+  double w = V[0][best], x = V[1][best], y = V[2][best], z = V[3][best];
+  double R0[9] = {w * w + x * x - y * y - z * z, 2 * (x * y - w * z), 2 * (x * z + w * y),
+                  2 * (x * y + w * z), w * w - x * x + y * y - z * z, 2 * (y * z - w * x),
+                  2 * (x * z - w * y), 2 * (y * z + w * x), w * w - x * x - y * y + z * z};
+  for (int k = 0; k < 9; ++k) R[k] = R0[k];
+}
+
+// ---------------------------------------------------------------- the asynchronous tap
+// Device buffers handed to a host thread WITHOUT the fold's stream waiting for them: what streams a fold's
+// intermediate results (sampler frames, each trunk pass's contact map, AF2's per-pass confidences) to the
+// page. offer() snapshots the parts into a free slot on the fold's own stream (device-to-device, a few
+// hundred KB at most, in stream order so the next step cannot overwrite them first) and records an event;
+// a second stream - the copy engine - waits on it and copies the slot to pinned host memory; one host
+// thread waits for THAT and calls the job's `done` with the host bytes, in the order offered.
+// 🔴 THE SLOTS ARE RESERVED BEFORE A FOLD (reserve), because cudaMalloc synchronises the device and one
+// allocated mid-fold would stall it - and kept between folds. With no free slot an offer is DROPPED: an
+// intermediate result is a picture, and the fold never waits for one.
+struct AsyncTap {
+  struct Slot { char* dev = nullptr; char* host = nullptr; size_t cap = 0; cudaEvent_t ready{}, copied{}; bool busy = false; };
+  struct Job { int slot; std::vector<size_t> offsets; std::function<void(const char*, const std::vector<size_t>&)> done; };
+  std::vector<Slot> slots; cudaStream_t copy = nullptr;
+  std::mutex mu; std::condition_variable cv; std::deque<Job> queue; bool stopping = false; int pending = 0;
+  std::thread writer; int dropped = 0;
+  // at least `count` slots of at least `bytes` each (allocating, so: before a fold)
+  void reserve(int count, size_t bytes) {
+    bytes = (bytes + 255) / 256 * 256;         // (an offer rounds each part so)
+    if (!copy) {
+      CK(cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking));
+      writer = std::thread([this] { loop(); });
+    }
+    drain();
+    for (auto& sl : slots) if (sl.cap < bytes) {
+      CK(cudaFree(sl.dev)); CK(cudaFreeHost(sl.host));
+      CK(cudaMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
+    }
+    while ((int)slots.size() < count) {
+      Slot sl; CK(cudaMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
+      CK(cudaEventCreateWithFlags(&sl.ready, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&sl.copied, cudaEventDisableTiming));
+      slots.push_back(sl);
+    }
+  }
+  bool offer(const std::vector<std::pair<const void*, size_t>>& parts,
+             std::function<void(const char*, const std::vector<size_t>&)> done) {
+    size_t total = 0; std::vector<size_t> offsets;
+    for (auto& p : parts) { offsets.push_back(total); total += (p.second + 255) / 256 * 256; }
+    int k = -1;
+    { std::lock_guard<std::mutex> lock(mu);
+      for (size_t j = 0; j < slots.size(); ++j) if (!slots[j].busy && slots[j].cap >= total) { k = (int)j; slots[j].busy = true; ++pending; break; } }
+    if (k < 0) { ++dropped; return false; }
+    Slot& sl = slots[k];
+    for (size_t q = 0; q < parts.size(); ++q)
+      CK(cudaMemcpyAsync(sl.dev + offsets[q], parts[q].first, parts[q].second, cudaMemcpyDeviceToDevice, STREAM));
+    CK(cudaEventRecord(sl.ready, STREAM));
+    CK(cudaStreamWaitEvent(copy, sl.ready, 0));
+    CK(cudaMemcpyAsync(sl.host, sl.dev, total, cudaMemcpyDeviceToHost, copy));
+    CK(cudaEventRecord(sl.copied, copy));
+    { std::lock_guard<std::mutex> lock(mu); queue.push_back({k, offsets, std::move(done)}); }
+    cv.notify_one();
+    return true;
+  }
+  // every offered job handed over (the end of a fold, before its outputs are declared written)
+  void drain() {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [this] { return pending == 0; });
+  }
+  void loop() {
+    for (;;) {
+      Job job;
+      { std::unique_lock<std::mutex> lock(mu); cv.wait(lock, [this] { return stopping || !queue.empty(); });
+        if (queue.empty()) return; job = std::move(queue.front()); queue.pop_front(); }
+      Slot& sl = slots[job.slot];
+      CK(cudaEventSynchronize(sl.copied));                // (this thread waits; the fold does not)
+      job.done(sl.host, job.offsets);
+      { std::lock_guard<std::mutex> lock(mu); sl.busy = false; --pending; }
+      cv.notify_all();
+    }
+  }
+};
+inline AsyncTap& TAP() { static AsyncTap* tap = new AsyncTap(); return *tap; }   // (never destroyed: its thread lives with the process)
+// a probability or a distance as one byte a pair, on the device, before it is tapped: x / scale, clamped
+__global__ void quantiseK(const float* in, unsigned char* out, size_t n, float scale) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = (unsigned char)fminf(255.f, fmaxf(0.f, rintf(in[i] / scale)));
+}
+// a file written whole: a temporary renamed into place, so a reader never sees half of one
+inline void writeWhole(const std::string& path, const void* data, size_t bytes) {
+  FILE* f = fopen((path + ".tmp").c_str(), "wb"); fwrite(data, 1, bytes, f); fclose(f);
+  rename((path + ".tmp").c_str(), path.c_str());
 }
 inline std::vector<float> download(const float* d, size_t n) {
   std::vector<float> h(n);

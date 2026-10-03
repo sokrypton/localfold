@@ -218,9 +218,13 @@ def page_arm(bad):
                        atoms: (p?.pdb ?? '').split(String.fromCharCode(10)).filter((l) => l.startsWith('ATOM')).length,
                        frames: (() => { const v = Object.values(window.py2dmol_viewers ?? {})[0]?.renderer;
                                         return v?.objectsData?.[v?.currentObjectName]?.frames?.length ?? 0; })(),
+                       mapped: (() => { const v = Object.values(window.py2dmol_viewers ?? {})[0]?.renderer;
+                                        const fs = v?.objectsData?.[v?.currentObjectName]?.frames ?? [];
+                                        return { contact: fs.filter((f) => f.maps?.contact).length,
+                                                 pae: fs.filter((f) => f.pae).length }; })(),
                        gpu: window.__readerGpu };
             })()""")
-            print(f"page: {family:14s} {time.time() - started:5.1f} s  {got['frames']:2d} viewer frames  {got['status'][:100]}")
+            print(f"page: {family:14s} {time.time() - started:5.1f} s  {got['frames']:2d} frames {got['mapped']}  {got['status'][:80]}")
             problems = []
             if " on CUDA " not in got["status"] or "done in" not in got["status"]:
                 problems.append(f"status {got['status']!r}")
@@ -230,8 +234,10 @@ def page_arm(bad):
                 problems.append(f"PAE {got['pae']} (typed {got['paeTyped']}), pLDDT {got['plddt']}")
             if got["atoms"] < tokens * 4:
                 problems.append(f"{got['atoms']} atoms")
-            if family == "af3" and got["frames"] < 5:
-                problems.append(f"the viewer holds {got['frames']} frames - the sampler's were not streamed")
+            if family in ("af3", "ef2-fast-600m") and (got["frames"] < 5 or got["mapped"]["contact"] < 5):
+                problems.append(f"the viewer holds {got['frames']} frames, {got['mapped']['contact']} with a contact map")
+            if family == "monomer" and (got["mapped"]["pae"] < 1 or got["mapped"]["contact"] < 1):
+                problems.append(f"the viewer's AF2 passes carry {got['mapped']} - no streamed PAE or contacts")
             if got["gpu"]:
                 problems.append("the reader's browser asked for a WebGPU adapter")
             bad += [f"page {family}: {p}" for p in problems]
@@ -298,18 +304,24 @@ def main():
             problems.append(f"pLDDT {c.get('meanPlddt')} / pTM {c.get('ptm')}")
         if "status" not in kinds or kinds.count("progress") < 2:
             problems.append(f"events {kinds}")
-        # the AF3 lineage streams its sampler's frames (native/af3 --frames), the bar moving with them
-        if payload["family"] in ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3"):
-            if kinds.count("frame") < 5:
-                problems.append(f"{kinds.count('frame')} frames streamed")
-            if fractions != sorted(fractions):
-                problems.append("the progress bar went backwards")
+        # what each port streams (--frames, through the binaries' AsyncTap), the bar moving with it: the
+        # AF3 lineage its sampler and each trunk pass's contact map, AF2 each pass (structure + scores, and
+        # contacts where the bundle carries the distogram head), ESMFold2 its trunk's contacts and sampler
+        family = payload["family"].split("-")[0]
+        want = {"frame": 5, "contacts": 1} if family in ("af3", "openbind0", "opendde", "boltz2", "protenix2",
+                                                         "intellifold2", "rosettafold3", "ef2") \
+            else {"frame": 1, "scores": 1, **({"contacts": 1} if family == "monomer" else {})}
+        for kind, least in want.items():
+            if kinds.count(kind) < least:
+                problems.append(f"{kinds.count(kind)} {kind} events streamed")
+        if fractions != sorted(fractions):
+            problems.append("the progress bar went backwards")
         if "stopping early" in name and "converged at" not in (result.get("status") or ""):
             problems.append("the page's early stop did not stop it (or did not say so)")
         rmsd = score(result.get("pdb") or "", *reference)
         if rmsd is None or rmsd > bar:
             problems.append(f"RMSD {rmsd} past {bar} A")
-        print(f"{name:44s} RMSD {rmsd} A (bar {bar})  {n} tokens  {kinds.count('frame'):2d} frames  {seconds:5.1f} s"
+        print(f"{name:44s} RMSD {rmsd} A (bar {bar})  {n} tokens  {kinds.count('frame'):2d}f {kinds.count('contacts')}c {kinds.count('scores')}s  {seconds:5.1f} s"
               f"  | {result.get('status')}")
         bad += [f"{name}: {p}" for p in problems]
     worker.stdin.close()

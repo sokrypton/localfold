@@ -286,12 +286,31 @@ int main(int argc, char** argv) {
       if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
     };
     cudaGraphExec_t trunkGraph = nullptr;
+    // --frames: each pass's contact map too (the page shows the trunk's after every recycle, before the
+    // sampler has a structure), computed on the device, quantised to a byte a pair and tapped (AsyncTap):
+    // contacts-PP-of-NN.u8, n*n bytes, probability * 255
+    const bool tapContacts = !framesDir.empty() && M.has("batch.contactBins");
+    if (tapContacts) TAP().reserve(recycles + 1, (size_t)t.n * t.n);
+    auto afterPass = [&](int pass) {
+      if (!tapContacts) return;
+      int bins = (int)M.meta("trunk.distogram.bins");
+      size_t pairs = (size_t)t.n * t.n;
+      float* logits = scratch<float>("disto.logits", pairs * bins);
+      distogram(t, logits);
+      float* probs = scratch<float>("disto.contact", pairs);
+      contactProbsK<<<blocks(pairs), 256, 0, STREAM>>>(logits, Idev("batch.contactBins"), t.pairMask, probs, pairs, bins);
+      unsigned char* bytes = scratch<unsigned char>("disto.contact8", pairs);
+      quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(probs, bytes, pairs, 1.f / 255);
+      std::string path = framesDir + "/contacts-" + (pass < 10 ? "0" : "") + std::to_string(pass) + "-of-"
+                         + (recycles + 1 < 10 ? "0" : "") + std::to_string(recycles + 1) + ".u8";
+      TAP().offer({{bytes, pairs}}, [path, pairs](const char* host, const std::vector<size_t>&) { writeWhole(path, host, pairs); });
+    };
     for (int pass = 0; pass <= recycles; ++pass) {
-      if (pass == 0) { if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none); continue; }
+      if (pass == 0) { if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none); afterPass(pass); continue; }
       // (capturing and instantiating costs ~15 ms and a replayed pass saves ~2 ms at 68 tokens, more
       // as the launches grow: a first fold breaks even at 7 recycles there - AF3's 10 gain 6 ms - and
       // at 3 from ~200 tokens, so the graph is taken where it measured a gain)
-      if (!GRAPHS || STAGES || !(recycles >= 7 || t.n >= 200)) { recyclePass(); continue; }
+      if (!GRAPHS || STAGES || !(recycles >= 7 || t.n >= 200)) { recyclePass(); afterPass(pass); continue; }
       if (!trunkGraph) {
         cudaGraph_t g;
         CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
@@ -301,6 +320,7 @@ int main(int argc, char** argv) {
         CK(cudaGraphDestroy(g));
       }
       CK(cudaGraphLaunch(trunkGraph, STREAM));
+      afterPass(pass);
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
@@ -389,7 +409,10 @@ int main(int argc, char** argv) {
       // backbone while its pLDDT reads as if nothing were wrong
       fprintf(stderr, "this checkpoint has no working flow sampler - fold it with diffusion\n"); return 1;
     }
-    if (!framesDir.empty() && c0 == 0) frames.start(framesDir, mask.size() * 3, steps);   // (the first batch's first sample)
+    if (!framesDir.empty() && c0 == 0) {          // (the first batch's first sample)
+      TAP().reserve(FrameStreamer::planned(steps), mask.size() * 3 * 4);
+      frames.start(framesDir, mask.size() * 3, steps);
+    }
     std::vector<float> xs = sample(steps, seeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
     }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
@@ -477,7 +500,7 @@ int main(int argc, char** argv) {
     }
     if (!framesDir.empty()) {
       frames.finish();
-      printf("frames: %d written, %d dropped\n", frames.written, frames.dropped);
+      printf("frames: %d written, %d dropped\n", frames.written, TAP().dropped);
     }
     if (many && out != "/dev/null") {        // AlphaFold 3's ranking_scores.csv
       FILE* rf = fopen((stem + "_ranking_scores.csv").c_str(), "w");

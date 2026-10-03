@@ -100,6 +100,8 @@ inline void rigidAlign(std::vector<float>& x, const std::vector<float>& target, 
 
 inline bool SAMPLER_GRAPH = true;    // --no-sampler-graph: every step launched as it is
 // the whole sampler; returns the final coordinates [A, 3] on the host
+// what a sampler step's prediction is handed to (ef2.cu's --frames): the denoised positions on the device
+inline std::function<void(const float*, int, int)> FRAME_HOOK;
 inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t seed, int* stepsRun = nullptr) {
   int A = d.A;
   std::mt19937_64 rng(seed);
@@ -147,6 +149,7 @@ inline std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, ui
       }
       CK(cudaGraphLaunch(graph, STREAM));
     }
+    if (FRAME_HOOK) FRAME_HOOK(dd, i + 1, steps);
     CK(cudaMemcpyAsync(xd.data(), dd, (size_t)A * 12, cudaMemcpyDeviceToHost, STREAM));
     CK(cudaStreamSynchronize(STREAM));
     rigidAlign(x, xd, mask, A);

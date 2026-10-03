@@ -4100,3 +4100,39 @@ folded: **81 s** for that one, of which the fold is under two. Every other
 model's first fold is its download (Boltz-2 12 s, AF2 8.5, ESMFold2 and its
 tower 29), and AF3 again was **2.0 s click to result**. Every result came back
 with its PAE (4624 = 68^2) and the model labelled `(CUDA)`.
+
+### Streaming a CUDA fold's intermediate results, without slowing it
+
+A WebGPU or JAX fold on the runtime streams its sampler's frames; a CUDA fold
+now streams everything its page-side twin shows while it folds:
+
+| port | streamed | page shows |
+|---|---|---|
+| AF3 lineage | each trunk pass's contact map; 25 sampler frames (fewer steps: each) | the map in the panel before the sampler, then every frame carrying the latest |
+| AF2 | each pass: structure (superposed on the first), pLDDT, pTM/ipTM, PAE, contacts (where the bundle has the distogram head) | each pass a frame with its own PAE, contact map and scores card |
+| ESMFold2 | the trunk's contact map (the page's per-pair thresholds, `contactBinCountsByPair`); every sampler step | as AF3 |
+
+AF3's pLDDT and PAE come off its confidence head, which runs once after the
+sampler - there is nothing earlier to stream, on the page or here.
+
+🔴 **NOTHING IN THE FOLD WAITS FOR ANY OF IT.** common.cuh's `AsyncTap`: the
+fold's stream snapshots the buffer into a slot reserved before the fold
+(device-to-device, in stream order), a second stream on the copy engine moves
+the slot to pinned memory, and one host thread writes the file - superposing a
+frame (Horn's quaternion method), reducing an AF2 pass's 64-bin PAE logits to
+its expected PAE and pTM term on the device first (17 MB a pass at 261
+residues becomes 270 KB), quantising a contact map or PAE to a byte a pair. A
+slot reserved mid-fold would stall it (cudaMalloc synchronises), so they are
+reserved before and kept; with no free slot a result is dropped, never waited
+for. The superposition first lived in the worker in Python (11 ms a 5CAJ frame)
+and cost +8-13% job to result - which is why it moved into the binary.
+
+Measured interleaved on the A100, job to result with streaming on and off: AF3
+6MRR +0.6%, 5CAJ -0.1%, AF2 +0.3% (monomer and multimer), ESMFold2 with a ligand
++0.9%. Every final structure is byte-identical with streaming on; the last
+streamed frame is the final structure to 0.003 Å; AF2's last pass's pLDDT, pTM
+and ipTM equal its final confidences exactly; a streamed contact map is within
+one byte of the final file's. `LOCALFOLD_NATIVE_FRAMES=0` (the notebook's
+`cuda_frames`) or `frames: false` in a request turns it off. `test:native`
+holds every port to what it streams and the reader's viewer to frames carrying
+their contact maps and PAE.

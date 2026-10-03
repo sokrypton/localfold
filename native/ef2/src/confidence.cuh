@@ -202,7 +202,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
 // takes all three ports: <stem>_confidences.json - the expected PAE, token_plddts (the head's own pooling
 // of its atoms), the token layout (chain letters from asym_id, residue numbers from residue_index) - and
 // <stem>_summary_confidences.json (pTM, ipTM for a complex, mean pLDDT). Atom pLDDTs are the PDB's B factors.
-inline void writeConfidences(const std::string& pdb, int T, const Confidence& conf) {
+inline void writeConfidences(const std::string& pdb, int T, const Confidence& conf, const std::vector<float>& contacts = {}) {
   std::string stem = pdb.size() > 4 && pdb.substr(pdb.size() - 4) == ".pdb" ? pdb.substr(0, pdb.size() - 4) : pdb;
   std::vector<int> asym(T), res(T);
   CK(cudaMemcpy(asym.data(), Idev("asym_id"), T * 4, cudaMemcpyDeviceToHost));
@@ -220,7 +220,17 @@ inline void writeConfidences(const std::string& pdb, int T, const Confidence& co
     for (int j = 0; j < T; ++j) fprintf(f, "%s%.2f", j ? ", " : "", conf.pae[(size_t)i * T + j]);
     fprintf(f, "]");
   }
-  fprintf(f, "],\n \"token_plddts\": [");
+  fprintf(f, "]");
+  if (!contacts.empty()) {
+    fprintf(f, ",\n \"contact_probs\": [");
+    for (int i = 0; i < T; ++i) {
+      fprintf(f, "%s[", i ? ",\n  " : "");
+      for (int j = 0; j < T; ++j) fprintf(f, "%s%.2f", j ? ", " : "", contacts[(size_t)i * T + j]);
+      fprintf(f, "]");
+    }
+    fprintf(f, "]");
+  }
+  fprintf(f, ",\n \"token_plddts\": [");
   for (int i = 0; i < T; ++i) fprintf(f, "%s%.2f", i ? ", " : "", 100.f * conf.plddtToken[i]);
   fprintf(f, "],\n \"token_chain_ids\": [");
   for (int i = 0; i < T; ++i) fprintf(f, "%s\"%s\"", i ? ", " : "", chainId(asym[i] - first + 1).c_str());

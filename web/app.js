@@ -4134,7 +4134,44 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
  */
 async function followRemoteFold({ since, label, signal }) {
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
-  const draw = remoteFrameDrawer(stem);
+  // 🔴 A REMOTE FOLD'S INTERMEDIATE CONTACT MAPS, AS A LOCAL ONE SHOWS THEM. The CUDA backend streams
+  // each trunk pass's map (tools/native_worker.py, `contacts`: a byte a pair); before the sampler has a
+  // frame it goes to the panel as the local trunk's does, and every frame after it carries the latest.
+  let liveContact;
+  const draw = remoteFrameDrawer(stem, () => (liveContact === undefined ? undefined : { contact: liveContact }));
+  let drawnFrame;
+  // (every drawn frame, so the trajectory rebuilt after the result keeps what was streamed onto it)
+  const liveFrames = [];
+  const carry = (into, from) => {
+    if (into === undefined || from === undefined) return;
+    for (const key of ["maps", "pae", "pae_n", "confidence"]) if (from[key] !== undefined) into[key] = from[key];
+  };
+  // ...and a pass's confidences (the CUDA AF2 streams each pass's, `scores`), onto the card and onto the
+  // frame that pass drew - its PAE and pLDDT, as a local AF2 fold's appendPass gives its frames
+  const showScores = (payload) => {
+    try {
+      updateScoresCard({ meanPlddt: payload.meanPlddt, ptm: payload.ptm, iptm: payload.iptm ?? Number.NaN });
+      if (drawnFrame === undefined || payload.paeU8 === undefined) return;
+      const bytes = Uint8Array.from(atob(payload.paeU8), (c) => c.charCodeAt(0));
+      const pae = new Float32Array(bytes.length);
+      for (let i = 0; i < bytes.length; i += 1) pae[i] = bytes[i] * payload.paeScale;
+      drawnFrame.confidence = { meanPlddt: payload.meanPlddt, ptm: payload.ptm, iptm: payload.iptm,
+                                plddt: Float32Array.from(payload.plddt ?? []), predictedAlignedError: pae };
+      drawnFrame.pae = paeMatrix(pae, payload.n);
+      drawnFrame.pae_n = payload.n;
+      refreshHeatmap();
+    } catch (cause) { console.warn("streamed scores skipped:", cause); }
+  };
+  const showContacts = (payload) => {
+    try {
+      const bytes = Uint8Array.from(atob(payload.u8), (c) => c.charCodeAt(0));
+      const probs = new Float32Array(bytes.length);
+      for (let i = 0; i < bytes.length; i += 1) probs[i] = bytes[i] / 255;
+      liveContact = contactMapFor(probs, undefined);
+      if (liveContact === undefined) return;
+      showTrunkContacts(liveContact, expandEntities(formInputs().entities).chains);
+    } catch (cause) { console.warn("streamed contact map skipped:", cause); }
+  };
   const framePdbs = [];
   let result;
   for (;;) {
@@ -4166,7 +4203,9 @@ async function followRemoteFold({ since, label, signal }) {
       // bar fractions, the same sampler frames, in the order they happened.
       if (said.kind === "status") status(said.payload);
       else if (said.kind === "progress") progress(said.payload);
-      else if (said.kind === "frame") { framePdbs.push(said.payload); draw(said.payload); }
+      else if (said.kind === "frame") { framePdbs.push(said.payload); drawnFrame = draw(said.payload); liveFrames.push(drawnFrame); }
+      else if (said.kind === "contacts") showContacts(said.payload);
+      else if (said.kind === "scores") showScores(said.payload);
       // ...and the runtime's own timing rows, recorded on its card against its
       // clock, rather than a reconstruction of them from over here.
       else if (said.kind === "dev") devAdopt(said.payload);
@@ -4266,11 +4305,13 @@ async function followRemoteFold({ since, label, signal }) {
   if (api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
     const first = viewer.objectsData?.[viewerObject]?.frames?.[0];
     if (first !== undefined) first.name = first.label = first.title = "sampler_0";
+    carry(first, liveFrames[0]);
     for (const [index, text] of [...framePdbs.slice(1, -1), result.pdb].entries()) {
       try {
         const frame = api.frameFromText(text);
         const last = index === framePdbs.length - 2;
         frame.name = frame.label = frame.title = last ? "final" : `sampler_${index + 1}`;
+        carry(frame, liveFrames[index + 1]);
         viewer.addFrame(frame, viewerObject);
       } catch (cause) { console.warn("frame skipped:", cause); }
     }
@@ -4398,8 +4439,9 @@ async function attachToRunningFold() {
  * on the trunk - and a fold the runtime REFUSES (429, a second reader) would
  * leave an empty object on the page with nothing ever arriving in it.
  */
-function remoteFrameDrawer(stem) {
+function remoteFrameDrawer(stem, liveMaps = () => undefined) {
   let drawn = 0;
+  let lastFrame;
   let opened = false;
   let colouring = false;
   return (pdb) => {
@@ -4415,7 +4457,11 @@ function remoteFrameDrawer(stem) {
       foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
+      // ...carrying the latest streamed contact map, as a local fold's frames carry theirs
+      const maps = liveMaps();
+      if (maps !== undefined) frame.maps = { ...frame.maps, ...maps };
       renderer.addFrame(frame, renderer.currentObjectName);
+      lastFrame = frame;
       renderer.setFrame(object.frames.length - 1);
       // The B-factor column of every model this backend drives is a pLDDT, so
       // the trajectory is watchable in confidence from its first frame - the
@@ -4424,6 +4470,7 @@ function remoteFrameDrawer(stem) {
     } catch (cause) {
       console.warn("live frame skipped:", cause);
     }
+    return lastFrame;
   };
 }
 

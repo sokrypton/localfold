@@ -63,6 +63,19 @@ static std::string writeWarmInput(int T, int A) {
 // one input, loaded: the whole fold. warm: the same launches on a synthetic input, nothing printed or
 // written - every weight conversion, cuBLAS plan and kernel module loaded while the real input is exported
 struct Opts { std::string dir, oracle, out; uint64_t seed; SamplerSettings sampler; bool profile; };
+// --frames=DIR: the trunk's contact map (contacts-00-of-01.u8, a byte a pair) and every sampler step's
+// prediction (frame-SSSS-NNNN.pdb), written through common.cuh's AsyncTap so the fold does not wait for them
+static std::string FRAMES_DIR;
+// the softmax mass of each pair's first contact_bins bins (the bias is already in the logits: distogram())
+__global__ void contactsK(const float* logits, const int* contactBins, float* out, size_t pairs, int bins) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= pairs) return;
+  const float* l = logits + ij * bins;
+  float mx = -INFINITY; for (int b = 0; b < bins; ++b) mx = fmaxf(mx, l[b]);
+  float total = 0, near = 0;
+  for (int b = 0; b < bins; ++b) { float w = expf(l[b] - mx); total += w; if (b < contactBins[ij]) near += w; }
+  out[ij] = near / fmaxf(total, 1e-30f);
+}
 static int foldInput(const Opts& o, bool warm) {
   const std::string& oracle = o.oracle; const std::string& out = o.out; uint64_t seed = o.seed;
   const SamplerSettings& sampler = o.sampler; bool profile = o.profile && !warm;
@@ -135,6 +148,32 @@ static int foldInput(const Opts& o, bool warm) {
   mem("trunk");
   CK(cudaFree(zi)); zi = nullptr;
   if (tight) releaseScratch();
+  // the page's contact map off the trunk's distogram (src/esmfold2/distogram-webgpu.js: the softmax mass
+  // under each pair's threshold, the bins the exporter counted) - for the confidences file, and with
+  // --frames tapped to the page before the sampler runs, as the page shows its own
+  std::vector<float> contacts;
+  if (!warm && M.has("contact_bins")) {
+    int bins = (int)M.meta("meta/distogramBins");
+    if ((int)M.meta("meta/contactBinsFor") != bins) {
+      fprintf(stderr, "the input's contact bins were counted for a %d-bin distogram and this one has %d\n",
+              (int)M.meta("meta/contactBinsFor"), bins);
+      return 1;
+    }
+    size_t P = (size_t)T * T;
+    float* dg = scratch<float>("dg.logits", P * bins);
+    distogram(z, T, C, dg);
+    float* probs = scratch<float>("dg.contacts", P);
+    contactsK<<<blocks(P), 256, 0, STREAM>>>(dg, Idev("contact_bins"), probs, P, bins);
+    if (!FRAMES_DIR.empty()) {
+      TAP().reserve(1, P);
+      unsigned char* bytes = scratch<unsigned char>("dg.contacts8", P);
+      quantiseK<<<blocks(P), 256, 0, STREAM>>>(probs, bytes, P, 1.f / 255);
+      std::string path = FRAMES_DIR + "/contacts-00-of-01.u8";
+      TAP().offer({{bytes, P}}, [path, P](const char* host, const std::vector<size_t>&) { writeWhole(path, host, P); });
+    }
+    contacts = download(probs, P);
+    if (tight) releaseScratch();
+  }
   if (check) {                                   // (nothing else reads the distogram)
     float* dg = dalloc((size_t)T * T * (int)M.meta("meta/distogramBins"));
     distogram(z, T, C, dg);
@@ -158,7 +197,38 @@ static int foldInput(const Opts& o, bool warm) {
   int stepsRun = 0;
   bool profSampler = profile && profStage == "sampler";
   if (profSampler) { prof::init(); prof::start(); }
+  // --frames: each sampler step's prediction, superposed onto the first (as the page draws its frames),
+  // written off the fold's path by the tap's thread
+  std::vector<double> frameRef; double frameCentre[3] = {};
+  std::vector<float> frameMask;
+  if (!FRAMES_DIR.empty() && !warm) {
+    frameMask = download(dn.atoms.ctx.mask, A);
+    TAP().reserve(64, (size_t)A * 12);
+    FRAME_HOOK = [&, A](const float* dd, int step, int steps) {
+      char name[64]; snprintf(name, sizeof name, "/frame-%04d-%04d.pdb", step, steps);
+      std::string path = FRAMES_DIR + name;
+      TAP().offer({{dd, (size_t)A * 12}}, [&, A, path](const char* host, const std::vector<size_t>&) {
+        const float* x = (const float*)host;
+        std::vector<double> pts; std::vector<int> live;
+        for (int a = 0; a < A; ++a) if (frameMask[a] > 0) { live.push_back(a); for (int k = 0; k < 3; ++k) pts.push_back(x[a * 3 + k]); }
+        double c[3] = {};
+        for (size_t q = 0; q < live.size(); ++q) for (int k = 0; k < 3; ++k) c[k] += pts[q * 3 + k] / live.size();
+        for (size_t q = 0; q < live.size(); ++q) for (int k = 0; k < 3; ++k) pts[q * 3 + k] -= c[k];
+        if (frameRef.empty()) { frameRef = pts; for (int k = 0; k < 3; ++k) frameCentre[k] = c[k]; }
+        double R[9]; bestRotation(pts, frameRef, R);
+        std::vector<float> moved(x, x + (size_t)A * 3);
+        for (size_t q = 0; q < live.size(); ++q) {
+          const double* p = &pts[q * 3];
+          for (int k = 0; k < 3; ++k) moved[live[q] * 3 + k] = (float)(R[k * 3] * p[0] + R[k * 3 + 1] * p[1] + R[k * 3 + 2] * p[2] + frameCentre[k]);
+        }
+        writePdb(o.dir + "/pdb.template", path + ".tmp", moved);
+        rename((path + ".tmp").c_str(), path.c_str());
+      });
+    };
+  }
   std::vector<float> coords = sample(dn, sampler, seed, &stepsRun);
+  FRAME_HOOK = nullptr;
+  if (!FRAMES_DIR.empty()) TAP().drain();
   if (profSampler) { CK(cudaStreamSynchronize(STREAM)); prof::stop(30); }
   mem("sampler");
   freeDenoiser(dn); if (tight) releaseScratch();
@@ -186,7 +256,7 @@ static int foldInput(const Opts& o, bool warm) {
     for (int t = 1; t < T; ++t) chains |= asym[t] != asym[0];
     if (chains) say("  ipTM %.4f", conf.iptm); }
   say("\n");
-  if (!warm) { writePdb(o.dir + "/pdb.template", out, coords, &bf); writeConfidences(out, T, conf); }
+  if (!warm) { writePdb(o.dir + "/pdb.template", out, coords, &bf); writeConfidences(out, T, conf, contacts); }
   say("-> %s\n", out.c_str());
   if (getenv("EF2_DUMP")) { auto h = download(sInputs, (size_t)T * Si); FILE* f = fopen(getenv("EF2_DUMP"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f); }
   // everything given back, so a warm-up leaves the real fold the card it had
@@ -217,6 +287,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;    // T,A: fold a synthetic input of that size meanwhile
     else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strcmp(argv[i], "--detach-output")) DETACH = true;
+    else if (!strncmp(argv[i], "--frames=", 9)) FRAMES_DIR = argv[i] + 9;   // stream the trunk's contacts and the sampler's frames
     else if (!strcmp(argv[i], "--no-fused")) FUSED = false;
     else if (!strcmp(argv[i], "--no-fused256")) FUSED256 = false;
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);

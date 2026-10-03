@@ -85,6 +85,14 @@ const flt = (name, v) => entries.push(["t", name, v instanceof Float32Array ? v 
 int("residue_index", f.residueIndex); int("token_index", f.tokenIndex); int("asym_id", f.asymId);
 int("entity_id", f.entityId); int("sym_id", f.symId); int("mol_type", f.molType);
 int("res_type", f.residueType); int("input_ids", f.inputIds);
+// the page's contact rule (src/esmfold2/distogram-webgpu.js): per pair, how many distogram bins lie under
+// its threshold - for the 128-bin distogram both published checkpoints carry, stamped, so the binary
+// refuses them against any other
+{
+  const { contactBinCountsByPair } = await import("../../src/esmfold2/distogram-webgpu.js");
+  int("contact_bins", contactBinCountsByPair(f.molType, f.residueType, f.tokens, 128));
+  entries.push(["m", "meta/contactBinsFor", 128]);
+}
 int("distogram_atom_idx", representativeAtoms(f, T));
 flt("aatype", f.aatype); flt("profile", f.profile); flt("deletion_mean", f.deletionMean);
 flt("token_bonds", f.tokenBonds);

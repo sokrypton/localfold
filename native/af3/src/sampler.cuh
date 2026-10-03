@@ -256,53 +256,17 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
 // a host thread waits for THAT copy, writes the PDB through the input's template and frees the slot. When
 // no slot is free (the writer has fallen behind) the frame is DROPPED: a frame is a picture, and the fold
 // never waits for one. Frames are written whole (a temporary file renamed into place).
-// The rotation taking `moving` (centred) onto `fixed` (centred) in the least-squares sense - Horn's
-// quaternion method: the largest eigenvector of a symmetric 4x4 built from their covariance (Jacobi).
-inline void bestRotation(const std::vector<double>& moving, const std::vector<double>& fixed, double R[9]) {
-  double S[3][3] = {};
-  for (size_t i = 0; i + 2 < moving.size(); i += 3)
-    for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) S[a][b] += moving[i + a] * fixed[i + b];
-  double N[4][4] = {
-    {S[0][0] + S[1][1] + S[2][2], S[1][2] - S[2][1], S[2][0] - S[0][2], S[0][1] - S[1][0]},
-    {S[1][2] - S[2][1], S[0][0] - S[1][1] - S[2][2], S[0][1] + S[1][0], S[2][0] + S[0][2]},
-    {S[2][0] - S[0][2], S[0][1] + S[1][0], -S[0][0] + S[1][1] - S[2][2], S[1][2] + S[2][1]},
-    {S[0][1] - S[1][0], S[2][0] + S[0][2], S[1][2] + S[2][1], -S[0][0] - S[1][1] + S[2][2]}};
-  double V[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
-  for (int sweep = 0; sweep < 50; ++sweep) {
-    double off = 0; for (int p = 0; p < 4; ++p) for (int q = p + 1; q < 4; ++q) off += N[p][q] * N[p][q];
-    if (off < 1e-22) break;
-    for (int p = 0; p < 4; ++p) for (int q = p + 1; q < 4; ++q) {
-      if (std::fabs(N[p][q]) < 1e-300) continue;
-      double theta = (N[q][q] - N[p][p]) / (2 * N[p][q]);
-      double t = (theta >= 0 ? 1 : -1) / (std::fabs(theta) + std::sqrt(theta * theta + 1)), c = 1 / std::sqrt(t * t + 1), sn = t * c;
-      for (int k = 0; k < 4; ++k) { double a = N[k][p], b = N[k][q]; N[k][p] = c * a - sn * b; N[k][q] = sn * a + c * b; }
-      for (int k = 0; k < 4; ++k) { double a = N[p][k], b = N[q][k]; N[p][k] = c * a - sn * b; N[q][k] = sn * a + c * b; }
-      for (int k = 0; k < 4; ++k) { double a = V[k][p], b = V[k][q]; V[k][p] = c * a - sn * b; V[k][q] = sn * a + c * b; }
-    }
-  }
-  int best = 0; for (int k = 1; k < 4; ++k) if (N[k][k] > N[best][best]) best = k;
-  double w = V[0][best], x = V[1][best], y = V[2][best], z = V[3][best];
-  double R0[9] = {w * w + x * x - y * y - z * z, 2 * (x * y - w * z), 2 * (x * z + w * y),
-                  2 * (x * y + w * z), w * w - x * x + y * y - z * z, 2 * (y * z - w * x),
-                  2 * (x * z - w * y), 2 * (y * z + w * x), w * w - x * x - y * y + z * z};
-  for (int k = 0; k < 9; ++k) R[k] = R0[k];
-}
-
 struct FrameStreamer {
   // 🔴 THE FRAMES ARE PLANNED, NOT CAUGHT: the host queues a fold's steps far ahead of the GPU (a 25-step
   // diffusion is enqueued in a few ms and runs for 50), so a slot cannot free before the next step is
-  // offered - a ring of three caught 4 frames of 25 and dropped the rest. So at most MAX frames, evenly
-  // spaced and always the last step, each with its own slot; a frame is still dropped rather than waited
-  // for, which now happens only if the writer has not kept up with a whole fold.
+  // offered - a ring of three caught 4 frames of 25. So at most MAX frames, evenly spaced and always the
+  // last step, each with its own slot of the tap (common.cuh's AsyncTap, reserved before the fold).
   static constexpr int MAX = 25;
-  std::string dir; size_t n3 = 0; int stride = 1, steps = 0;
-  std::vector<float*> dev, host; std::vector<cudaEvent_t> ready, copied; std::vector<char> busy;
-  cudaStream_t copy = nullptr;
-  std::mutex mu; std::condition_variable cv; std::deque<std::pair<int, int>> queue; bool stopping = false;
-  std::thread writer; int written = 0, dropped = 0;
+  std::string dir; size_t n3 = 0; int stride = 1, steps = 0, written = 0;
   std::vector<std::string> lines; std::vector<size_t> slots;     // the input's template.pdb, read once
   std::vector<double> reference; double refCentre[3] = {};
   static bool isAtom(const std::string& l) { return l.size() >= 66 && (!l.compare(0, 4, "ATOM") || !l.compare(0, 6, "HETATM")); }
+  static int planned(int steps) { return std::min(steps, MAX) + 1; }
   bool start(const std::string& d, size_t atoms3, int totalSteps) {
     std::ifstream tf(DATA_DIR + "/template.pdb");
     if (!tf) { fprintf(stderr, "frames: no %s/template.pdb, none written\n", DATA_DIR.c_str()); return false; }
@@ -312,88 +276,40 @@ struct FrameStreamer {
     }
     dir = d; n3 = atoms3; steps = totalSteps;
     stride = std::max(1, (steps + MAX - 1) / MAX);
-    int K = std::min(steps, MAX) + 1;
-    // (the slots are kept between folds - a served model's next fold reuses them - and grown only when a
-    // fold needs more or bigger: pinned memory is slow to allocate)
-    Pool& pool = POOL();
-    if (pool.n3 < n3 || (int)pool.dev.size() < K) {
-      pool.release();
-      pool.n3 = n3;
-      CK(cudaStreamCreateWithFlags(&pool.copy, cudaStreamNonBlocking));
-      pool.dev.resize(K); pool.host.resize(K); pool.ready.resize(K); pool.copied.resize(K);
-      for (int k = 0; k < K; ++k) {
-        CK(cudaMalloc(&pool.dev[k], n3 * 4)); CK(cudaMallocHost(&pool.host[k], n3 * 4));
-        CK(cudaEventCreateWithFlags(&pool.ready[k], cudaEventDisableTiming));
-        CK(cudaEventCreateWithFlags(&pool.copied[k], cudaEventDisableTiming));
-      }
-    }
-    dev = pool.dev; host = pool.host; ready = pool.ready; copied = pool.copied; copy = pool.copy;
-    busy.assign(dev.size(), 0);
-    writer = std::thread([this] {
-      for (;;) {
-        std::pair<int, int> job;
-        { std::unique_lock<std::mutex> lock(mu); cv.wait(lock, [this] { return stopping || !queue.empty(); });
-          if (queue.empty()) return; job = queue.front(); queue.pop_front(); }
-        int k = job.first;
-        CK(cudaEventSynchronize(copied[k]));              // (this thread waits; the fold does not)
-        // the template's atoms, superposed onto the first frame's (the page draws its own sampler frames
-        // fitted to the first): the prediction moves as it settles, not as the walk rotates it
-        std::vector<double> pts(slots.size() * 3);
-        double c[3] = {};
-        for (size_t a = 0; a < slots.size(); ++a)
-          for (int d = 0; d < 3; ++d) { pts[a * 3 + d] = host[k][slots[a] * 3 + d]; c[d] += pts[a * 3 + d] / slots.size(); }
-        { std::lock_guard<std::mutex> lock(mu); busy[k] = 0; }
-        for (size_t a = 0; a < slots.size(); ++a) for (int d = 0; d < 3; ++d) pts[a * 3 + d] -= c[d];
-        if (reference.empty()) { reference = pts; for (int d = 0; d < 3; ++d) refCentre[d] = c[d]; }
-        double R[9]; bestRotation(pts, reference, R);
-        char name[64]; snprintf(name, sizeof name, "/frame-%04d.pdb", job.second);
-        FILE* f = fopen((dir + name + ".tmp").c_str(), "w");
-        size_t a = 0;
-        for (auto& line : lines) {
-          if (a < slots.size() && isAtom(line)) {
-            const double* p = &pts[a * 3];
-            double q[3];
-            for (int d = 0; d < 3; ++d) q[d] = R[d * 3] * p[0] + R[d * 3 + 1] * p[1] + R[d * 3 + 2] * p[2] + refCentre[d];
-            fprintf(f, "%s%8.3f%8.3f%8.3f%s\n", line.substr(0, 30).c_str(), q[0], q[1], q[2], line.substr(54).c_str());
-            ++a;
-          } else fprintf(f, "%s\n", line.c_str());
-        }
-        fclose(f);
-        rename((dir + name + ".tmp").c_str(), (dir + name).c_str());
-        ++written;
-      }
-    });
-    FRAME_HOOK = [this](const float* d, int step, int) { if (step % stride == 0 || step == steps) offer(d, step); };
+    FRAME_HOOK = [this](const float* p, int step, int) {
+      if (step % stride == 0 || step == steps)
+        TAP().offer({{p, n3 * 4}}, [this, step](const char* host, const std::vector<size_t>&) { write((const float*)host, step); });
+    };
     return true;
   }
-  void offer(const float* d, int step) {
-    int k = -1;
-    { std::lock_guard<std::mutex> lock(mu);
-      for (size_t j = 0; j < busy.size(); ++j) if (!busy[j]) { k = (int)j; busy[j] = 1; break; } }
-    if (k < 0) { ++dropped; return; }
-    CK(cudaMemcpyAsync(dev[k], d, n3 * 4, cudaMemcpyDeviceToDevice, STREAM));   // the snapshot, in stream order
-    CK(cudaEventRecord(ready[k], STREAM));
-    CK(cudaStreamWaitEvent(copy, ready[k], 0));
-    CK(cudaMemcpyAsync(host[k], dev[k], n3 * 4, cudaMemcpyDeviceToHost, copy));
-    CK(cudaEventRecord(copied[k], copy));
-    { std::lock_guard<std::mutex> lock(mu); queue.push_back({k, step}); }
-    cv.notify_one();
-  }
-  void finish() {
-    FRAME_HOOK = nullptr;
-    { std::lock_guard<std::mutex> lock(mu); stopping = true; }
-    cv.notify_one();
-    if (writer.joinable()) writer.join();
-  }
-  struct Pool {
-    size_t n3 = 0; std::vector<float*> dev, host; std::vector<cudaEvent_t> ready, copied; cudaStream_t copy = nullptr;
-    void release() {
-      for (size_t k = 0; k < dev.size(); ++k) { cudaFree(dev[k]); cudaFreeHost(host[k]); cudaEventDestroy(ready[k]); cudaEventDestroy(copied[k]); }
-      if (copy) cudaStreamDestroy(copy);
-      dev.clear(); host.clear(); ready.clear(); copied.clear(); copy = nullptr; n3 = 0;
+  // (the tap's thread) the template's atoms, superposed onto the first frame's - the page draws its own
+  // sampler frames fitted to the first: the prediction moves as it settles, not as the walk rotates it
+  void write(const float* x, int step) {
+    std::vector<double> pts(slots.size() * 3);
+    double c[3] = {};
+    for (size_t a = 0; a < slots.size(); ++a)
+      for (int d = 0; d < 3; ++d) { pts[a * 3 + d] = x[slots[a] * 3 + d]; c[d] += pts[a * 3 + d] / slots.size(); }
+    for (size_t a = 0; a < slots.size(); ++a) for (int d = 0; d < 3; ++d) pts[a * 3 + d] -= c[d];
+    if (reference.empty()) { reference = pts; for (int d = 0; d < 3; ++d) refCentre[d] = c[d]; }
+    double R[9]; bestRotation(pts, reference, R);
+    std::string out; out.reserve(lines.size() * 82);
+    size_t a = 0; char buf[32];
+    for (auto& line : lines) {
+      if (a < slots.size() && isAtom(line)) {
+        const double* p = &pts[a * 3];
+        out += line.substr(0, 30);
+        for (int d = 0; d < 3; ++d) {
+          snprintf(buf, sizeof buf, "%8.3f", R[d * 3] * p[0] + R[d * 3 + 1] * p[1] + R[d * 3 + 2] * p[2] + refCentre[d]);
+          out += buf;
+        }
+        out += line.substr(54); out += '\n'; ++a;
+      } else { out += line; out += '\n'; }
     }
-  };
-  static Pool& POOL() { static Pool pool; return pool; }
+    char name[64]; snprintf(name, sizeof name, "/frame-%04d.pdb", step);
+    writeWhole(dir + name, out.data(), out.size());
+    ++written;
+  }
+  void finish() { FRAME_HOOK = nullptr; TAP().drain(); }
 };
 
 // AlphaFold 3's confidence files beside a structure: <stem>_confidences.json (atom_plddts in the
