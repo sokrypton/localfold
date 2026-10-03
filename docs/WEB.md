@@ -4089,3 +4089,14 @@ folding AF3, AF2 and ESMFold2 through a real broker with its browser asking for
 no GPU (`--no-page` skips it). `npm run test:colab` gained a CUDA arm on a stub
 worker - routing, Stop, the JAX worker untouched - and checks the picker offers
 all three, CUDA first.
+
+**...and the notebook itself, on a fresh Colab T4 (2026-10-03).** The cell as
+committed - only the repository handed in as a git bundle, since it fetches
+`main` - then a reader's page on the service it started: `/health` offers
+`webgpu` and `native`, the picker defaults to CUDA, and the first AF3 fold
+arrived while `native/build.sh` was still compiling, waited on it saying
+"compiling the CUDA ports for this card", fetched its bundle shard by shard and
+folded: **81 s** for that one, of which the fold is under two. Every other
+model's first fold is its download (Boltz-2 12 s, AF2 8.5, ESMFold2 and its
+tower 29), and AF3 again was **2.0 s click to result**. Every result came back
+with its PAE (4624 = 68^2) and the model labelled `(CUDA)`.
