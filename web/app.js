@@ -4078,8 +4078,8 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // 🔴 A JAX FOLD IS HANDED THE JOB AS AlphaFold 3 JSON, written by the same
   // module that writes the archive's request - so the entity conversion is
   // this page's and not re-implemented in Python. See tools/jax_worker.py.
-  if (remoteBackendChoice() === "jax") {
-    request.backend = "jax";
+  if (remoteBackendChoice() === "jax" || remoteBackendChoice() === "native") {
+    request.backend = remoteBackendChoice();
     // ...the RESOLVED model, which is not the row's value where a second row
     // picks it: the PLM row turns "ef2" into the 600M or 300M checkpoint.
     request.family = family;
@@ -4100,7 +4100,8 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
         : { merged: uploadedMsas?.merged ?? uploadedA3m };
     }
   }
-  status(`${label} · folding on the runtime${request.backend === "jax" ? " with JAX" : ""}…`);
+  status(`${label} · folding on the runtime${request.backend === "jax" ? " with JAX"
+    : request.backend === "native" ? " with CUDA" : ""}…`);
   progress("waiting");
   // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
   // every event of the session, so a reader that started at zero would replay
@@ -4221,7 +4222,9 @@ async function followRemoteFold({ since, label, signal }) {
   // token layout, the context the archive and the session read), and it goes
   // through the same doors: loadIntoViewer for the picture, recordPrediction
   // for the downloads, the scores card and the saved session.
-  const jax = result.jax === true ? jaxPrediction(result, stem, label) : null;
+  // ...and a CUDA fold the same way: tools/native_worker.py sends the same fields.
+  const jax = result.jax === true ? jaxPrediction(result, stem, label, "JAX")
+    : result.native === true ? jaxPrediction(result, stem, label, "CUDA") : null;
 
   // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
   // fills the sequence strip, the download buttons and the scores card - the
@@ -4304,7 +4307,7 @@ async function followRemoteFold({ since, label, signal }) {
  * - the entities, the settings, the form - is this page's, taken now, because
  * the reader's form is what asked for this fold.
  */
-function jaxPrediction(result, stem, label) {
+function jaxPrediction(result, stem, label, backend = "JAX") {
   const floats = (values) => (values == null ? undefined : Float32Array.from(values));
   const given = result.confidence ?? {};
   const confidence = {
@@ -4332,7 +4335,7 @@ function jaxPrediction(result, stem, label) {
     chainLengths: chains.map((chain) => chain.length),
     contactSource: { contactProbs: confidence.contactProbs },
     tokens: result.tokens,
-    model: `${label} (JAX)`,
+    model: `${label} (${backend})`,
     family,
     entities,
     inputs: { entities, controls },
@@ -4343,12 +4346,12 @@ function jaxPrediction(result, stem, label) {
     msas: result.msas ?? {},
     msaOrigin: {
       none: SINGLE_SEQUENCE_ORIGIN,
-      search: "MMseqs2 search at api.colabfold.com (by the JAX backend)",
+      search: `MMseqs2 search at api.colabfold.com (by the ${backend} backend)`,
       paste: "pasted by hand",
       upload: "uploaded a3m",
     }[mode] ?? mode,
     settings: {
-      backend: `JAX (${result.model})`,
+      backend: `${backend} (${result.model})`,
       seed: Number(controls["random-seed"]) || 1,
       recycles: Number(controls.recycles) || undefined,
       "max msa": controls["max-msa"],

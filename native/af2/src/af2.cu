@@ -98,6 +98,72 @@ static std::string writeWarmInput(int L, int N, int E, int T) {
   FILE* f = fopen((dir + "/model.idx").c_str(), "w"); fputs(idx.c_str(), f); fclose(f);
   return dir;
 }
+// AlphaFold 3's confidence files beside the PDB, as native/af3 writes them (sampler.cuh) and the page's
+// archive reads them: <stem>_confidences.json - atom_plddts in the PDB's atom order, the expected PAE
+// (AF2's 64 bins, centres as predictedTm's), contact_probs = P(Cb distance < 8 A) from the distogram
+// where the weights carry its head (the page's multimer bundle does not), the token layout - and
+// <stem>_summary_confidences.json (pTM, ipTM for a complex, mean pLDDT)
+static void writeConfidences(const std::string& pdb, const Trunk& t, int L, const float* mask37, const std::vector<int>& aatype,
+                             const std::vector<int>& asym, const std::vector<int>& ri, int firstAsym,
+                             const std::vector<float>& plddt, const std::vector<float>& paeLogits, float ptm, float iptm,
+                             double mean) {
+  std::string stem = pdb.size() > 4 && pdb.substr(pdb.size() - 4) == ".pdb" ? pdb.substr(0, pdb.size() - 4) : pdb;
+  size_t pairs = (size_t)L * L;
+  std::vector<float> centres(64);
+  for (int b = 0; b < 63; ++b) centres[b] = b * (31.f / 62) + 31.f / 124;
+  centres[63] = centres[62] + 31.f / 62;
+  std::vector<float> pae = expectation(paeLogits, pairs, 64, centres);
+  std::vector<float> contact;
+  if (M.has("w/distogram_head/half_logits/weights")) {
+    float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
+    linearB(t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
+    symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
+    std::vector<float> lg = download(dg, pairs * 64);
+    contact.resize(pairs);
+    for (size_t r = 0; r < pairs; ++r) {         // bins 0..18 lie below 8 A (breaks 2.3125 + 0.3125 b)
+      const float* l = lg.data() + r * 64;
+      float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = std::max(mx, l[b]);
+      double s = 0, near = 0;
+      for (int b = 0; b < 64; ++b) { double e = std::exp(l[b] - mx); s += e; if (b <= 18) near += e; }
+      contact[r] = (float)(near / s);
+    }
+  }
+  auto chainId = [&](int i) { return (char)('A' + std::min(asym[i] - firstAsym, 25)); };
+  auto matrix = [&](FILE* f, const std::vector<float>& m) {
+    fprintf(f, "[");
+    for (int i = 0; i < L; ++i) {
+      fprintf(f, "%s[", i ? ",\n  " : "");
+      for (int j = 0; j < L; ++j) fprintf(f, "%s%.2f", j ? ", " : "", m[(size_t)i * L + j]);
+      fprintf(f, "]");
+    }
+    fprintf(f, "]");
+  };
+  FILE* f = fopen((stem + "_confidences.json").c_str(), "w");
+  std::string chains, values;
+  for (int i = 0; i < L; ++i) {
+    int aa = std::min(std::max(aatype[i], 0), 19);
+    for (int a = 0; a < 37; ++a) {
+      if (mask37[aa * 37 + a] == 0) continue;
+      char v[24]; snprintf(v, sizeof v, "%.2f", plddt[i]);
+      chains += std::string(chains.empty() ? "\"" : ", \"") + chainId(i) + "\"";
+      values += std::string(values.empty() ? "" : ", ") + v;
+    }
+  }
+  fprintf(f, "{\"atom_chain_ids\": [%s],\n \"atom_plddts\": [%s],\n", chains.c_str(), values.c_str());
+  if (!contact.empty()) { fprintf(f, " \"contact_probs\": "); matrix(f, contact); fprintf(f, ",\n"); }
+  fprintf(f, " \"pae\": "); matrix(f, pae);
+  fprintf(f, ",\n \"token_chain_ids\": [");
+  for (int i = 0; i < L; ++i) fprintf(f, "%s\"%c\"", i ? ", " : "", chainId(i));
+  fprintf(f, "],\n \"token_res_ids\": [");
+  for (int i = 0; i < L; ++i) fprintf(f, "%s%d", i ? ", " : "", ri[i] + 1);
+  fprintf(f, "]}\n");
+  fclose(f);
+  f = fopen((stem + "_summary_confidences.json").c_str(), "w");
+  fprintf(f, "{\"ptm\": %.4f, \"iptm\": %s, \"mean_plddt\": %.2f}\n", ptm,
+          std::isfinite(iptm) ? std::to_string(iptm).c_str() : "null", mean);
+  fclose(f);
+}
+
 // one input, already loaded: the passes, the heads and the PDB. warm: the embedder, ONE block of
 // each stack, the structure module and the heads, nothing written - every kernel loaded, every
 // cuBLASLt plan and scratch buffer made, at this input's shapes
@@ -289,6 +355,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     }
   }
   fprintf(f, "END\n"); fclose(f);
+  writeConfidences(out, t, L, mask37, aatype, asym, ri, firstAsym, plddt, pae, ptm, iptm, mean);
   printf("mean pLDDT %.2f  pTM %.4f", mean, ptm);
   if (chains) printf("  ipTM %.4f", iptm);
   printf("  -> %s  (%d passes, %.1f ms)\n", out.c_str(), passes, foldMs);

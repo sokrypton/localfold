@@ -16,7 +16,9 @@ asks. Four routes carry that, all of them token-checked:
 
 With `--jax-dir`, a fold whose payload says `backend: "jax"` is not forwarded
 to the page: tools/jax_worker.py runs it with af3-any-model and its events land
-in the same mailbox, so the reader follows either one with the same code.
+in the same mailbox, so the reader follows either one with the same code. With
+`--native`, `backend: "native"` goes to tools/native_worker.py the same way -
+LocalFold's CUDA ports, on the page's own weights.
 
 🔴 THE POINT IS THAT THERE IS NO SECOND IMPLEMENTATION. The fold that runs
 here is web/app.js's own, in a real browser, from this checkout - the same
@@ -107,8 +109,8 @@ EVENT_CAP = 4000
 # accepted and lowered by the runtime page's own `result`, which is the event
 # that says it has finished in every way a fold can finish.
 FOLDING = {"on": False}
-# ...and whether the fold running is the JAX worker's, which is who a Stop is for.
-JAX_FOLDING = {"on": False}
+# ...and which worker's fold is running (None: the page's), which is who a Stop is for.
+WORKER_FOLDING = {"on": None}
 # 🔴 AND WHEN THE RUNTIME PAGE LAST ASKED FOR ITS COMMANDS, which is the only
 # sign of life there is. A Colab runtime is recycled when the notebook is
 # closed or left idle, and a reader whose fold was mid-flight then polls a
@@ -296,7 +298,7 @@ def push_event(event):
         EVENTS.append(event)
         if event.get("kind") == "result":
             FOLDING["on"] = False
-            JAX_FOLDING["on"] = False
+            WORKER_FOLDING["on"] = None
         if len(EVENTS) > EVENT_CAP:
             drop = len(EVENTS) - EVENT_CAP // 2
             del EVENTS[:drop]
@@ -304,7 +306,8 @@ def push_event(event):
 
 
 class JaxWorker:
-    """tools/jax_worker.py, started on the first JAX fold and kept for the next.
+    """A worker process (tools/jax_worker.py, tools/native_worker.py), started on its
+    first fold and kept for the next.
 
     🔴 ITS LINES ARE EVENTS, ITS SEQ IS ITS OWN. The worker prints one bridge
     event per line; they are numbered here, as the page numbers its own, so
@@ -312,16 +315,18 @@ class JaxWorker:
     the two numberings never interleave.
     """
 
-    def __init__(self, directory):
+    def __init__(self, directory, script="jax_worker.py", stub="LOCALFOLD_JAX_WORKER", name="JAX"):
         self.directory = directory
+        self.script, self.stub, self.name = script, stub, name
         self.proc = None
         self.seq = 0
         self.lock = threading.Lock()
 
     def _start(self):
-        # LOCALFOLD_JAX_WORKER stands a stub in for the real worker, which is
-        # how tools/check-colab-bridge.py tests this path with no GPU and no JAX.
-        worker = os.environ.get("LOCALFOLD_JAX_WORKER") or os.path.join(REPO, "tools", "jax_worker.py")
+        # LOCALFOLD_JAX_WORKER (LOCALFOLD_NATIVE_WORKER) stands a stub in for the
+        # real worker, which is how tools/check-colab-bridge.py tests this path
+        # with no GPU and no JAX.
+        worker = os.environ.get(self.stub) or os.path.join(REPO, "tools", self.script)
         self.proc = subprocess.Popen(
             [sys.executable, worker],
             cwd=self.directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -334,7 +339,7 @@ class JaxWorker:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if event.get("kind") == "jax-ready":
+            if event.get("kind") in ("jax-ready", "native-ready"):
                 continue
             with self.lock:
                 event["seq"] = self.seq
@@ -345,7 +350,7 @@ class JaxWorker:
             folding = FOLDING["on"]
         if folding and proc is self.proc:
             push_event({"kind": "result", "seq": self.seq, "at": int(time.time() * 1000),
-                        "payload": {"error": "the JAX worker exited"}})
+                        "payload": {"error": f"the {self.name} worker exited"}})
 
     def fold(self, payload):
         with self.lock:
@@ -355,8 +360,8 @@ class JaxWorker:
             self.proc.stdin.flush()
 
     def stop(self):
-        """JAX cannot be interrupted mid-computation: the worker goes, and the
-        next JAX fold starts a new one (and recompiles)."""
+        """JAX cannot be interrupted mid-computation (nor a native binary from
+        outside it): the worker goes, and the next fold starts a new one."""
         with self.lock:
             proc, self.proc = self.proc, None
         if proc is not None:
@@ -365,7 +370,8 @@ class JaxWorker:
                     "payload": {"error": "stopped"}})
 
 
-def serve(port, backend, token, host="127.0.0.1", jax=None):
+def serve(port, backend, token, host="127.0.0.1", jax=None, native=None):
+    workers = {name: worker for name, worker in (("jax", jax), ("native", native)) if worker is not None}
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=REPO, **kw)
@@ -582,7 +588,7 @@ def serve(port, backend, token, host="127.0.0.1", jax=None):
                                         # Disconnect releases the MACHINE or
                                         # only stops the service on it.
                                         "colabRuntime": bool(RUNTIME_ADDR),
-                                        "backends": ["webgpu"] + (["jax"] if jax else []),
+                                        "backends": ["webgpu"] + list(workers),
                                         "gpu": backend.adapter()})
             return super().do_GET()
 
@@ -654,20 +660,21 @@ def serve(port, backend, token, host="127.0.0.1", jax=None):
             if op not in ("fold", "stop", "ping", "warm"):
                 return self._json(400, {"error": f'unknown op "{op}"'})
             payload = body.get("payload") or {}
-            if op == "fold" and payload.get("backend") == "jax":
-                if jax is None:
-                    return self._json(400, {"error": "this runtime has no JAX backend"})
+            wanted = payload.get("backend")
+            if op == "fold" and wanted in ("jax", "native"):
+                if wanted not in workers:
+                    return self._json(400, {"error": f"this runtime has no {'JAX' if wanted == 'jax' else 'CUDA'} backend"})
                 with MAIL_LOCK:
                     if FOLDING["on"]:
                         return self._json(429, {"error": "one GPU, one fold: try again"})
                     FOLDING["on"] = True
-                    JAX_FOLDING["on"] = True
-                jax.fold(payload)
-                return self._json(200, {"ok": True, "backend": "jax"})
-            if op == "stop" and JAX_FOLDING["on"] and jax is not None:
-                JAX_FOLDING["on"] = False
-                jax.stop()
-                return self._json(200, {"ok": True, "backend": "jax"})
+                    WORKER_FOLDING["on"] = wanted
+                workers[wanted].fold(payload)
+                return self._json(200, {"ok": True, "backend": wanted})
+            if op == "stop" and WORKER_FOLDING["on"] in workers:
+                name, WORKER_FOLDING["on"] = WORKER_FOLDING["on"], None
+                workers[name].stop()
+                return self._json(200, {"ok": True, "backend": name})
             with MAIL_LOCK:
                 if op == "fold" and FOLDING["on"]:
                     return self._json(429, {"error": "one GPU, one fold: try again"})
@@ -699,12 +706,15 @@ def main():
                         help="what to bind; the tunnel reaches loopback")
     parser.add_argument("--jax-dir", default=None,
                         help="the ColabFold2 install directory: offers the JAX backend")
+    parser.add_argument("--native", action="store_true",
+                        help="offer the CUDA backend: native/ built (native/colab_setup.sh)")
     arguments = parser.parse_args()
 
     token = arguments.token or secrets.token_urlsafe(24)
     backend = Backend(arguments.port, arguments.cdp_port, arguments.profile, token)
     jax = JaxWorker(arguments.jax_dir) if arguments.jax_dir else None
-    httpd = serve(arguments.port, backend, token, arguments.host, jax)
+    native = JaxWorker(REPO, "native_worker.py", "LOCALFOLD_NATIVE_WORKER", "CUDA") if arguments.native else None
+    httpd = serve(arguments.port, backend, token, arguments.host, jax, native)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {REPO} on {arguments.host}:{arguments.port}"
           + (" · Disconnect will release this Colab machine" if RUNTIME_ADDR
@@ -735,8 +745,9 @@ def main():
         # In a Colab runtime the container takes them; on a developer's machine
         # they are the "another browser on the machine" that makes the next
         # measurement somebody else's.
-        if jax is not None and jax.proc is not None:
-            jax.proc.kill()
+        for worker in (jax, native):
+            if worker is not None and worker.proc is not None:
+                worker.proc.kill()
         if backend.proc is not None:
             backend.proc.terminate()
             try:

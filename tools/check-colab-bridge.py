@@ -146,14 +146,20 @@ for line in sys.stdin:
         time.sleep(120)
     say("result", {"pdb": "END\\n", "scores": {"mean_plddt": 90.0}, "status": "stub done"})
 ''')
+# ...and the CUDA backend's (tools/native_worker.py), the same protocol from another stub: what is
+# tested is that `backend: "native"` reaches IT and not the JAX worker or the page.
+NATIVE_STUB = os.path.join(JAX_DIR, "native_stub_worker.py")
+with open(NATIVE_STUB, "w") as handle:
+    handle.write(open(STUB).read().replace('"jax-ready"', '"native-ready"').replace("stub on JAX", "stub on CUDA")
+                 .replace('"stub done"', '"native stub done"'))
 
 print(f"starting the broker on {PORT} (a headless Chrome comes with it)…")
 backend = subprocess.Popen(
     [sys.executable, "tools/colab_backend.py", "--port", str(PORT),
      "--cdp-port", str(CDP_PORT), "--token", TOKEN,
-     "--profile", "/tmp/localfold-bridge-check", "--jax-dir", JAX_DIR],
+     "--profile", "/tmp/localfold-bridge-check", "--jax-dir", JAX_DIR, "--native"],
     cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-    env=dict(os.environ, LOCALFOLD_JAX_WORKER=STUB))
+    env=dict(os.environ, LOCALFOLD_JAX_WORKER=STUB, LOCALFOLD_NATIVE_WORKER=NATIVE_STUB))
 try:
     ready, adapter = False, None
     deadline = time.time() + 180
@@ -323,6 +329,19 @@ try:
           return { ...want, 'af3-mode': 'flow', 'msa-mode': 'none' };
         })()""")
         print(f"  the reader's form: {chosen}")
+        # 🔴 THE BACKEND PICKER OFFERS ALL THREE AND DEFAULTS TO CUDA, which this broker was started with -
+        # and this arm is about the WebGPU relay, so it picks WebGPU as a reader would, through the control.
+        cdp.wait_for(reader_ws, "!!document.querySelector('.colab-backend')", 60, "the backend picker")
+        picker = cdp.evaluate(reader_ws, """(() => {
+          const pick = document.querySelector('.colab-backend');
+          const offered = [...pick.options].map((o) => o.value), first = pick.value;
+          pick.value = 'webgpu';
+          pick.dispatchEvent(new Event('change', { bubbles: true }));
+          return { offered, first };
+        })()""")
+        print(f"  the backend picker offers {picker['offered']}, defaulting to {picker['first']}")
+        if sorted(picker["offered"]) != ["jax", "native", "webgpu"] or picker["first"] != "native":
+            bad.append(f"the picker offers {picker['offered']} defaulting to {picker['first']}; want all three, CUDA first")
         cdp.wait_for(reader_ws, "!document.getElementById('predict').disabled", 60,
                      "the reader's fold button")
         cdp.evaluate(reader_ws, "(document.getElementById('predict').click(), true)")
@@ -814,6 +833,29 @@ try:
     if again is None or (again.get("payload") or {}).get("status") != "stub done":
         bad.append("the JAX fold after a Stop did not run - the worker was not restarted")
     print("  and the next JAX fold runs on a new worker")
+
+    # 10c · the CUDA backend: its own worker, its own Stop, and the other worker untouched.
+    if "native" not in (health.get("backends") or []):
+        bad.append(f"/health lists {health.get('backends')} with --native given")
+    code, said = call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
+    result, since_jax, seen = wait_for_event("result", since_jax, 30)
+    statuses = [event.get("payload") for event in seen if event.get("kind") == "status"]
+    print(f"  native fold: {code} -> {(result or {}).get('payload', {}).get('status')}, said {statuses}")
+    if result is None or (result.get("payload") or {}).get("status") != "native stub done" or "stub on CUDA" not in statuses:
+        bad.append(f"a CUDA fold did not come back through the native worker: {statuses}")
+    call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}", "hang": True}})
+    wait_for_event("frame", since_jax, 30)
+    call("/in", {"op": "stop"})
+    stopped, since_jax, _ = wait_for_event("result", since_jax, 15)
+    _, head = call("/down?head=1")
+    print(f"  native stop: {(stopped or {}).get('payload')}, folding {head.get('folding')}")
+    if (stopped or {}).get("payload", {}).get("error") != "stopped" or head.get("folding"):
+        bad.append("Stop did not end a CUDA fold")
+    code, said = call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}"}})
+    again, since_jax, _ = wait_for_event("result", since_jax, 30)
+    if again is None or (again.get("payload") or {}).get("status") != "stub done":
+        bad.append("a JAX fold after a CUDA Stop did not run on the JAX worker")
+    print("  and a JAX fold after it still runs on the JAX worker")
 
     # 11 · and nothing answers without the token.
     for route, body in (("/down?since=0", None), ("/out?since=0", None),

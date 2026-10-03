@@ -502,9 +502,11 @@ export function base64ToBytes(text) {
 
 /**
  * Which implementation folds on the runtime: this page's WebGPU fold, run by
- * the runtime's headless copy of it, or af3-any-model on JAX (the reference,
- * and the only one that reaches a TPU). The badge offers the choice when the
- * runtime was started with a JAX backend; see tools/jax_worker.py.
+ * the runtime's headless copy of it, LocalFold's native CUDA ports (the same
+ * weights and inputs, compiled for the card - tools/native_worker.py), or
+ * af3-any-model on JAX (the reference, and the only one that reaches a TPU).
+ * The badge offers the choice when the runtime was started with more than one;
+ * see tools/colab_backend.py.
  */
 let backendChoice = "webgpu";
 export const remoteBackendChoice = () => backendChoice;
@@ -617,13 +619,18 @@ function installColabStatus() {
       // that pretends there is something to decide.
       runtimeWebgpu = gpu.webgpu !== false && gpu.vendor !== "google"
         && !/swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
-      if ((health.backends ?? []).includes("jax") && !badge.querySelector("select")) {
+      const offered = health.backends ?? [];
+      if ((offered.includes("jax") || offered.includes("native")) && !badge.querySelector("select")) {
         const pick = document.createElement("select");
         pick.className = "colab-backend";
-        pick.title = "WebGPU: this page's own fold, on the runtime's GPU - fast to"
-          + " start. JAX: af3-any-model, the reference implementation - a minute of"
-          + " compile on its first fold, and the one that runs on a TPU.";
-        for (const [value, text] of [["webgpu", "WebGPU"], ["jax", "JAX"]]) {
+        pick.title = "CUDA: LocalFold's native ports, compiled for the runtime's card -"
+          + " the page's own weights and inputs, and the fastest. WebGPU: this page's"
+          + " own fold, on the runtime's GPU. JAX: af3-any-model, the reference"
+          + " implementation - a minute of compile on its first fold, and the one that"
+          + " runs on a TPU.";
+        const choices = [["native", "CUDA"], ["webgpu", "WebGPU"], ["jax", "JAX"]]
+          .filter(([value]) => value === "webgpu" || offered.includes(value));
+        for (const [value, text] of choices) {
           const option = document.createElement("option");
           option.value = value;
           option.textContent = text;
@@ -641,9 +648,14 @@ function installColabStatus() {
         // fold - and the TPU sits idle; only JAX reaches it.
         const software = gpu.webgpu === false || gpu.vendor === "google"
           || /swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
-        try { pick.value = localStorage.getItem("localfold.colabBackend") ?? (software ? "jax" : "webgpu"); }
-        catch (cause) { pick.value = software ? "jax" : "webgpu"; }
-        if (gpu.webgpu === false) pick.value = "jax";
+        // ...and where the CUDA backend is offered it is the default: it is the
+        // same fold as WebGPU's, minutes faster on the card the runtime has.
+        const fallback = offered.includes("native") ? "native" : software ? "jax" : "webgpu";
+        let stored = null;
+        try { stored = localStorage.getItem("localfold.colabBackend"); }
+        catch (cause) { /* remembered for this page only */ }
+        pick.value = choices.some(([value]) => value === stored) ? stored : fallback;
+        if (gpu.webgpu === false && pick.value === "webgpu") pick.value = fallback === "webgpu" ? "jax" : fallback;
         if (pick.value === "") pick.value = "webgpu";
         backendChoice = pick.value;
         pick.addEventListener("change", () => {

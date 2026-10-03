@@ -197,3 +197,39 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   CK(cudaFree(z)); CK(cudaFree(dSlot));
   return out;
 }
+
+// AlphaFold 3's confidence files beside the PDB, in native/af3's layout (its sampler.cuh) so one reader
+// takes all three ports: <stem>_confidences.json - the expected PAE, token_plddts (the head's own pooling
+// of its atoms), the token layout (chain letters from asym_id, residue numbers from residue_index) - and
+// <stem>_summary_confidences.json (pTM, ipTM for a complex, mean pLDDT). Atom pLDDTs are the PDB's B factors.
+inline void writeConfidences(const std::string& pdb, int T, const Confidence& conf) {
+  std::string stem = pdb.size() > 4 && pdb.substr(pdb.size() - 4) == ".pdb" ? pdb.substr(0, pdb.size() - 4) : pdb;
+  std::vector<int> asym(T), res(T);
+  CK(cudaMemcpy(asym.data(), Idev("asym_id"), T * 4, cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(res.data(), Idev("residue_index"), T * 4, cudaMemcpyDeviceToHost));
+  auto chainId = [](int a) {
+    std::string id; for (a = a - 1; ; a = a / 26 - 1) { id.insert(id.begin(), (char)('A' + a % 26)); if (a < 26) break; }
+    return id;
+  };
+  bool chains = false; for (int t = 1; t < T; ++t) chains |= asym[t] != asym[0];
+  int first = *std::min_element(asym.begin(), asym.end());     // (EF2 counts chains and residues from 0;
+  FILE* f = fopen((stem + "_confidences.json").c_str(), "w");    //  the PDB from A and 1)
+  fprintf(f, "{\"pae\": [");
+  for (int i = 0; i < T; ++i) {
+    fprintf(f, "%s[", i ? ",\n  " : "");
+    for (int j = 0; j < T; ++j) fprintf(f, "%s%.2f", j ? ", " : "", conf.pae[(size_t)i * T + j]);
+    fprintf(f, "]");
+  }
+  fprintf(f, "],\n \"token_plddts\": [");
+  for (int i = 0; i < T; ++i) fprintf(f, "%s%.2f", i ? ", " : "", 100.f * conf.plddtToken[i]);
+  fprintf(f, "],\n \"token_chain_ids\": [");
+  for (int i = 0; i < T; ++i) fprintf(f, "%s\"%s\"", i ? ", " : "", chainId(asym[i] - first + 1).c_str());
+  fprintf(f, "],\n \"token_res_ids\": [");
+  for (int i = 0; i < T; ++i) fprintf(f, "%s%d", i ? ", " : "", res[i] + 1);
+  fprintf(f, "]}\n");
+  fclose(f);
+  f = fopen((stem + "_summary_confidences.json").c_str(), "w");
+  if (chains) fprintf(f, "{\"ptm\": %.4f, \"iptm\": %.4f, \"mean_plddt\": %.2f}\n", conf.ptm, conf.iptm, 100 * conf.meanPlddt);
+  else fprintf(f, "{\"ptm\": %.4f, \"iptm\": null, \"mean_plddt\": %.2f}\n", conf.ptm, 100 * conf.meanPlddt);
+  fclose(f);
+}

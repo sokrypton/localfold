@@ -186,7 +186,7 @@ static int foldInput(const Opts& o, bool warm) {
     for (int t = 1; t < T; ++t) chains |= asym[t] != asym[0];
     if (chains) say("  ipTM %.4f", conf.iptm); }
   say("\n");
-  if (!warm) writePdb(o.dir + "/pdb.template", out, coords, &bf);
+  if (!warm) { writePdb(o.dir + "/pdb.template", out, coords, &bf); writeConfidences(out, T, conf); }
   say("-> %s\n", out.c_str());
   if (getenv("EF2_DUMP")) { auto h = download(sInputs, (size_t)T * Si); FILE* f = fopen(getenv("EF2_DUMP"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f); }
   // everything given back, so a warm-up leaves the real fold the card it had

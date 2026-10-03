@@ -4,7 +4,7 @@
 //
 //   node native/af2/export_input.mjs <out dir> --sequence=<SEQ> [--a3m=<path>] [--recycles=3]
 //        [--max-msa=512] [--max-extra=1024] [--seed=0] (--bundle=<page bundle dir> | --weights=<export dir>)
-//        [--search] [--template=<pdb>[:chain[+chain]],...]
+//        [--search] [--template=<structure>:<chain>[@<query chain>][+...],...] [--job=<AF3 job.json>]
 //
 // Entries:  i aatype, residue_index, asym_id, entity_id, sym_id   t seq_mask      (per residue)
 //           t f<k>/msa_feat [N, L, 49], f<k>/msa_mask [N, L]                       (pass k)
@@ -15,7 +15,6 @@
 import { readFileSync, writeFileSync, mkdirSync, openSync, readSync, writeSync, closeSync, renameSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { makeA3mFeatures } from "../../src/input/a3m-features.js";
-import { chainResidues, identityMap, templateSlotAtom37 } from "../../src/af3/featurise/template-input.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -64,7 +63,24 @@ if (bundleDir !== "") {
   isMultimer = readFileSync(`${weightsDir}/model.idx`, "utf8").includes("m meta/multimer 1");
 }
 
-const sequence = option("sequence", "").trim().toUpperCase();
+let sequence = option("sequence", "").trim().toUpperCase();
+// --job=<AF3 job.json>: the page's own reader (web/job-json.js, web/entities.js), as native/af3's and
+// native/ef2's exporters read one. AlphaFold 2 folds protein chains and nothing else, so anything else
+// in the job is refused by name rather than dropped
+if (option("job", "") !== "") {
+  if (sequence !== "") throw new Error("--job and --sequence both name the input");
+  const { jobFromJson } = await import("../../web/job-json.js");
+  const { expandEntities } = await import("../../web/entities.js");
+  const job = jobFromJson(readFileSync(option("job", ""), "utf8"));
+  for (const note of job.notes) console.log(`job: ${note}`);
+  const request = expandEntities(job.entities);
+  const other = request.chainKinds.filter((kind) => kind !== "protein");
+  if (other.length > 0) throw new Error(`AlphaFold 2 folds protein chains only; this job has ${[...new Set(other)].join(", ")}`);
+  if (request.ligandCodes.length > 0) throw new Error("AlphaFold 2 folds protein chains only; this job has a ligand");
+  if (request.modifications.length > 0) throw new Error("AlphaFold 2 folds the standard residues only; this job has a modified residue");
+  if ((request.bonds ?? []).length > 0) throw new Error("AlphaFold 2 takes no declared bond; this job has one");
+  sequence = request.sequence;
+}
 const a3mPath = option("a3m", "");
 if (sequence === "" && a3mPath === "") throw new Error("--sequence or --a3m names the input");
 if (args.includes("--search") && sequence === "") throw new Error("--search needs --sequence");
@@ -76,15 +92,19 @@ const chains = sequence.split(":").filter(Boolean);
 // paired block for distinct ones, and the merge the WEIGHTS read ("multimer": dense within an entity,
 // block-diagonal between; "monomer": block-diagonal throughout). It sends the sequences to
 // api.colabfold.com, so it is asked for, never assumed
-let a3m;
+let a3m, searchedHits = null;       // (--search's template hits, by chain)
 if (args.includes("--search")) {
   if (a3mPath !== "") throw new Error("--search and --a3m both name the alignment");
   const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import("../../src/input/mmseqs2-api.js");
   const multimer = isMultimer;
   const t0 = performance.now();
-  a3m = chains.length === 1 ? (await generateMmseqs2Msa(chains[0], {})).a3m
-    : (await generateMmseqs2ComplexMsa(chains, { model: multimer ? "multimer" : "monomer" })).a3m;
+  const searched = chains.length === 1 ? await generateMmseqs2Msa(chains[0], {})
+    : await generateMmseqs2ComplexMsa(chains, { model: multimer ? "multimer" : "monomer" });
+  a3m = searched.a3m;
+  searchedHits = searched.templateHits ?? new Map();
   console.log(`search: ${chains.length} chain(s) from api.colabfold.com in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  mkdirSync(out, { recursive: true });
+  writeFileSync(`${out}/search.a3m`, a3m);       // (what the search returned, for whoever shows the alignment)
 } else {
   a3m = a3mPath === "" ? `>query\n${chains.join("")}\n` : readFileSync(a3mPath, "utf8");
 }
@@ -127,25 +147,59 @@ features.forEach((f, k) => {
   flt(`f${k}/extra_deletion_value`, f.extraDeletionValue);
   flt(`f${k}/extra_msa_mask`, f.extraMsaMask);
 });
-// --template=<pdb>[:chain[+chain...]],... : each a structure of the query's own sequence (identity mapping, as
-// tools/gpu/fold-af2.js builds a self-template), as AF2's atom37 slots in the restype alphabet
+// --template=<structure>:<chain>[@<query chain>][+...],... : one slot each, built as the page builds AF2's
+// (web/app.js): every part aligned to its chain by the page's buildTemplate in the atom37 layout - PDB or
+// mmCIF - the multimer's at its chain's residue offset, parts merged by mergeAtom37Templates. A part with
+// no "@" takes the next query chain, so `1brs.pdb:A+D` is A onto chain 0 and D onto chain 1.
 const templateSpecs = option("template", "").split(",").filter(Boolean);
-if (templateSpecs.length > 0) {
-  const aat = new Int32Array(templateSpecs.length * L), pos = new Float32Array(templateSpecs.length * L * 37 * 3);
-  const msk = new Float32Array(templateSpecs.length * L * 37);
-  templateSpecs.forEach((spec, k) => {
-    const [path, chain] = spec.split(":");
-    // chains joined by '+' (a complex's template, A+D): one slot over the whole query, each chain's
-    // residues following the last's, as the query's own chains follow each other
-    const text = readFileSync(path, "utf8");
-    const parts = (chain || "").split("+").map((c) => chainResidues(text, c || undefined));
-    const structure = { ...parts[0], residues: parts.flatMap((part) => part.residues) };
-    const slot = templateSlotAtom37({ structure, tokens: L, map: identityMap(structure) });
+// --template-search-chains=<chains>: the page's "from the MSA search" template - each listed chain's BEST
+// hit from the same search, aligned and placed as any other part, all in the one slot AF2 takes
+const searchChains = option("template-search-chains", "").split(",").filter(Boolean).map(Number);
+if (searchChains.length > 0 && searchedHits === null) throw new Error("--template-search-chains needs --search: the hits come from that search");
+if (templateSpecs.length > 1) {
+  throw new Error("AlphaFold 2 takes one template slot: join its parts with '+'");
+}
+if (templateSpecs.length > 0 || searchChains.length > 0) {
+  const { buildTemplate, mergeAtom37Templates } = await import("../../web/template-source.js");
+  const chains = sequence.split(":").filter(Boolean);
+  const offsets = chains.map((_, at) => chains.slice(0, at).reduce((n, c) => n + c.length, 0));
+  const searchParts = [];
+  if (searchChains.length > 0) {
+    const { fetchMmseqs2Templates } = await import("../../src/input/mmseqs2-api.js");
+    for (const at of searchChains) {
+      const best = (searchedHits.get(at) ?? [])[0];
+      if (best === undefined) throw new Error(`the search found no template for chain ${at + 1}`);
+      const text = (await fetchMmseqs2Templates([best.target])).get(best.id);
+      if (text === undefined) throw new Error(`no structure came back for ${best.target}`);
+      searchParts.push({ text, chain: best.chain, at, label: best.target });
+    }
+  }
+  const specs = templateSpecs.length > 0 ? templateSpecs : [""];
+  const aat = new Int32Array(L), pos = new Float32Array(L * 37 * 3);
+  const msk = new Float32Array(L * 37);
+  specs.forEach((spec, k) => {
+    const [path0, chains0] = spec.split(":");
+    const parts = spec === "" ? [] : spec.includes("@") ? spec.split("+").map((part) => {
+      const [where, at] = part.split("@"); const cut = where.lastIndexOf(":");
+      return { path: where.slice(0, cut), chain: where.slice(cut + 1) || undefined, at: Number(at) };
+    }) : (chains0 ?? "").split("+").map((c, at) => ({ path: path0, chain: c || undefined, at }));
+    const all = [...parts.map((p) => ({ ...p, text: readFileSync(p.path, "utf8") })), ...searchParts];
+    const taken = new Set();
+    const built = all.map(({ text, chain, at }) => {
+      if (!isMultimer && at !== 0) throw new Error("AlphaFold 2's monomer takes a template on its one chain only");
+      if (at >= chains.length) throw new Error(`template ${k}: no query chain ${at}`);
+      if (taken.has(at)) throw new Error(`AlphaFold 2 takes one template a chain; chain ${at + 1} has two`);
+      taken.add(at);
+      return buildTemplate({ text, chain, query: isMultimer ? chains[at] : chains.join(""),
+                             offset: isMultimer ? offsets[at] : 0, tokens: L, minConfidence: 0, layout: "atom37" });
+    });
+    const slot = (built.length === 1 ? built[0] : mergeAtom37Templates(built, L)).slot;
     aat.set(slot.aatype, k * L); pos.set(slot.atomPositions, k * L * 37 * 3); msk.set(slot.atomMask, k * L * 37);
-    console.log(`template ${k}: ${path}${chain ? `:${chain}` : ""}, ${slot.covered} residues, ${slot.atoms} atoms`);
+    console.log(`template: ${[spec, ...searchParts.map((p) => `search hit ${p.label}`)].filter(Boolean).join(" + ")},`
+      + ` ${slot.covered} residues, ${slot.atoms} atoms`);
   });
   int("t/aatype", aat); flt("t/positions", pos); flt("t/mask", msk);
-  entries.push(["m", "meta/templates", templateSpecs.length]);
+  entries.push(["m", "meta/templates", 1]);
 }
 if (weightsDir !== "") entries.push(["m", "meta/model", weightsDir.replace(/\/+$/, "").split("/").pop().replace(/^weights-/, "")]);
 entries.push(["m", "meta/tokens", L]);

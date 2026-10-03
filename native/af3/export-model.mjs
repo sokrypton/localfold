@@ -239,6 +239,8 @@ if (sequence !== "") {
       searchedHits = searched.templateHits;
     }
     searchedProteinAt = allKinds.flatMap((kind, i) => (kind === "protein" ? [i] : []));
+    // (one chain's alignment as the search returned it, for whoever shows the alignment)
+    if (typeof alignment === "string") writeFileSync(`${out}/search.a3m`, alignment);
     console.log(`search: ${proteins.length} protein chain(s) from api.colabfold.com in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
   }
   // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna
@@ -352,7 +354,7 @@ if (templateSpecs.length > 0) {
     const parts = spec.split("+").map((part) => {
       const [where, target = "0"] = part.split("@");
       const cut = where.lastIndexOf(":");
-      const path = where.slice(0, cut), chain = where.slice(cut + 1), index = Number(target);
+      const path = where.slice(0, cut), chain = where.slice(cut + 1) || undefined, index = Number(target);
       const built = buildTemplate({
         text: readFileSync(path, "utf8"), chain, query: chains[index], tokens: batch.tokens, minConfidence: 0,
         tokenOf: (residue) => tokenOfResidue[(residuesOfChain[index] ?? [])[residue] ?? -1] ?? -1,
@@ -405,6 +407,22 @@ if (args.includes("--search-templates")) {
   }
   if (extraSlotParts.length === 0) console.log("search: no template hits");
 }
+// ...--template-search-chains=<fold chains>: the page's "from the MSA search" template (web/app.js): each
+// listed chain's BEST hit from the same search, in a slot of its own; a chain the search found nothing
+// for is an error, as it is on the page
+const searchChains = option("template-search-chains", "").split(",").filter(Boolean).map(Number);
+if (searchChains.length > 0) {
+  if (searchedHits === null) throw new Error("--template-search-chains needs --search: the hits come from that search");
+  const { fetchMmseqs2Templates } = await import(`${repo}/src/input/mmseqs2-api.js`);
+  const hits = new Map([...searchedHits].map(([at, found]) => [searchedProteinAt[at] ?? at, found]));
+  for (const chain of searchChains) {
+    const best = (hits.get(chain) ?? [])[0];
+    if (best === undefined) throw new Error(`the search found no template for chain ${chain + 1}`);
+    const text = (await fetchMmseqs2Templates([best.target])).get(best.id);
+    if (text === undefined) throw new Error(`no structure came back for ${best.target}`);
+    extraSlotParts.push([{ text, chainId: best.chain, chain, label: `search hit ${best.target}` }]);
+  }
+}
 if (extraSlotParts.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);
   const { mergeTemplateSlots } = await import(`${repo}/src/af3/featurise/template-input.js`);
@@ -452,6 +470,7 @@ if (dialect.chiralCentres === true) {
   const width = dialect.boltz2TemplateFeatures ? 109 : dialect.rosettafold3TemplateFeatures ? 66
     : dialect.fusedTemplateLayout ? dialect.fusedTemplateLayout.distogramBins + 1 + 2 * dialect.fusedTemplateLayout.restypes + 4 : 0;
   const { fusedTemplateFeatures } = fused ? await import(`${repo}/src/af3/trunk/template-webgpu.js`) : {};
+  if (slots.length > TEMPLATES) throw new Error(`${slots.length} template slots; every family folds with at most ${TEMPLATES}`);
   const passes = [];
   if (dialect.templateFeatureMeanOnePass === true) {
     const present = slots.filter(({ slot }) => Array.prototype.some.call(slot.atomMask, (v) => v > 0));
