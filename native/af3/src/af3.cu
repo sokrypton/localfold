@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strcmp(argv[i], "--af3-defaults")) af3Defaults = true;
+    else if (!strcmp(argv[i], "--flow")) SAMPLER_FLOW = true;     // the page's Flow sampler (sampler.cuh)
     else if (!strcmp(argv[i], "--save-embeddings")) saveEmbeddings = true;
     else if (!strcmp(argv[i], "--save-distogram")) saveDistogram = true;
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
@@ -381,6 +382,11 @@ int main(int argc, char** argv) {
     NS = (int)cn;
     std::vector<uint64_t> seeds;
     for (size_t k = 0; k < cn; ++k) seeds.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
+    if (SAMPLER_FLOW && M.flag("trunk.dialect.noFlowSampler")) {
+      // the page's own rule (noFlowSampler, src/af3/dialect.js): this checkpoint's walk collapses the
+      // backbone while its pLDDT reads as if nothing were wrong
+      fprintf(stderr, "this checkpoint has no working flow sampler - fold it with diffusion\n"); return 1;
+    }
     std::vector<float> xs = sample(steps, seeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
     }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
@@ -532,6 +538,7 @@ int main(int argc, char** argv) {
     // flag a line (--out, --samples, --steps, --recycles, --seed); its output goes to <id>.log and
     // its exit status to <id>.done. A job reading "quit" stops the server.
     const int steps0 = steps, recycles0 = recycles, samples0 = samples, folds0 = folds;
+    const bool flow0 = SAMPLER_FLOW;
     printf("af3: serving %s\n", serveDir.c_str()); fflush(stdout);
     for (;;) {
       std::string id;
@@ -551,12 +558,13 @@ int main(int argc, char** argv) {
       std::vector<std::string> flags; while (std::getline(job, line)) if (!line.empty()) flags.push_back(line);
       job.close(); unlink((base + ".job").c_str());
       if (input == "quit") { printf("af3: stopped\n"); return 0; }
-      steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb";
+      steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb"; SAMPLER_FLOW = flow0;
       bool jobSeed = false; seed = seedArg; seedsArg = seedsArg0;
       for (auto& f : flags) {
         if (!f.compare(0, 6, "--out=")) out = f.substr(6);
         else if (!f.compare(0, 10, "--samples=")) samples = atoi(f.c_str() + 10);
         else if (!f.compare(0, 8, "--steps=")) steps = atoi(f.c_str() + 8);
+        else if (f == "--flow") SAMPLER_FLOW = true;
         else if (!f.compare(0, 11, "--recycles=")) recycles = atoi(f.c_str() + 11);
         else if (!f.compare(0, 7, "--seed=")) { seed = strtoull(f.c_str() + 7, nullptr, 10); jobSeed = true; }
         else if (!f.compare(0, 8, "--seeds=")) seedsArg = f.substr(8);

@@ -85,6 +85,11 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
 }
+// --flow: the page's Flow (src/af3/diffusion/diffusion-sampler-webgpu.js flowOnGpu, step "replace") in
+// place of AF3's diffusion - one draw at the top of a schedule that starts at 160 A (sigmaMax 10 sigma_data,
+// AF3's own sigmaMin and rho, whatever the model's dialect), then the state REPLACED by each prediction:
+// no centring, no rotation, no injected noise
+inline bool SAMPLER_FLOW = false;
 // Returns every sample's positions, sample-major [ns][atoms][3].
 inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                  const std::function<const float*(const float*, float, const float*)>& denoiseFn,
@@ -101,6 +106,25 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     stepScale = M.meta(S + "stepScale"); rho = M.meta(S + "rho"); sigmaMin = M.meta(S + "sigmaMin"); sigmaMax = M.meta(S + "sigmaMax");
   }
   std::vector<double> levels(steps + 1);
+  if (SAMPLER_FLOW) {
+    for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, 0.0004, 10, 7);
+    std::vector<float> at(levels.begin(), levels.begin() + steps);
+    if (onLevels) onLevels(at);
+    float* dX; CK(cudaMalloc(&dX, all3 * 4));
+    uint64_t* dSeeds; CK(cudaMalloc(&dSeeds, ns * 8));
+    CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
+    initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
+    float* dLevels = upload(at.data(), steps);
+    for (int step = 1; step <= steps; ++step) {
+      const float* d = denoiseFn(dX, (float)levels[step - 1], dLevels + step - 1);
+      if (step == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
+      CK(cudaMemcpyAsync(dX, d, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    }
+    std::vector<float> out = download(dX, all3);
+    for (float* p : {dX, dLevels}) CK(cudaFree(p));
+    CK(cudaFree(dSeeds));
+    return out;
+  }
   for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
   for (int k = 0; k < ns; ++k) {

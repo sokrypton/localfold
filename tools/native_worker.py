@@ -14,8 +14,8 @@ MMseqs2 client; the weights are the published bundles the page folds with, read 
 What this file adds is the plumbing between them - nothing about a molecule is decided here.
 
 🔴 WHAT IT REFUSES, IT SAYS. A sampler, a model or an input a native port does not have is a refusal
-naming it (Refused), never a nearby setting run instead: Flow (native AF3 runs diffusion), a template on
-AlphaFold 2's template-free models.
+naming it (Refused), never a nearby setting run instead: Flow on rosettafold3 (the page's own rule), a
+template on AlphaFold 2's template-free models.
 
 Ports: native/af3 (all seven AF3-lineage models), native/af2 (all five of each, monomer and multimer),
 native/ef2 (ESMFold2, 600M and 300M). Each must be built (native/colab_setup.sh); a bundle not on disk is fetched.
@@ -253,9 +253,12 @@ class Worker:
             raise Refused(f"the CUDA backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
                           " and ESMFold2)")
         sampler = controls.get("af3-mode", "diffusion")
-        if port == "af3" and sampler != "diffusion":
-            raise Refused(f"the CUDA backend's AF3 samples by diffusion only - set the sampler to Diffusion"
-                          f" (it was {sampler})")
+        if port == "af3" and sampler not in ("diffusion", "flow"):
+            raise Refused(f"the CUDA backend does not know the sampler {sampler!r}")
+        if port == "af3" and sampler == "flow" and family == "rosettafold3":
+            # ...the page's own rule: its walk collapses the backbone while pLDDT reads as if nothing were
+            # wrong (noFlowSampler, src/af3/dialect.js)
+            raise Refused("rosettafold3 has no working flow sampler - set the sampler to Diffusion")
         emit("status", f"{family} on CUDA ({self.device}) · reading the job")
         emit("progress", 0.02)
         started = time.time()
@@ -338,6 +341,8 @@ class Worker:
             run(export, "featurising", log, cwd=os.path.join(NATIVE, "af3"))
             steps = int(controls.get("af3-count") or 0)
             fold = [f"--out={out_pdb}"]                  # (flags for the resident server's job)
+            if sampler == "flow":
+                fold.append("--flow")                    # (the page's Flow: native/af3/src/sampler.cuh)
             if steps:
                 # ...the page's floor: a modified residue's atoms stay compressed below sixteen steps (app.js)
                 spec = json.loads(job["job"])

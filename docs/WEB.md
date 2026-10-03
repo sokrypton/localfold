@@ -4038,8 +4038,9 @@ identity (every AF2 gate case unchanged); the search is the page's MMseqs2
 client; AF2 stops early by the page's rule (`--tolerance`, ColabFold's
 `compute_tol`, worded "converged at X Å after N passes").
 
-🔴 **WHAT IT DOES NOT HAVE, IT REFUSES BY NAME**: Flow (native AF3 samples by
-diffusion), an alignment per chain on AF2, a template on ESMFold2 or on AF2's
+🔴 **WHAT IT DOES NOT HAVE, IT REFUSES BY NAME**: Flow on RoseTTAFold3 (the
+page's own rule - native AF3 has the page's Flow, `af3 --flow`, for every other
+model: 6MRR 0.725 Å at 16 steps), an alignment per chain on AF2, a template on ESMFold2 or on AF2's
 template-free models 3-5, anything but protein chains on AF2. A featuriser's own
 refusal comes back as its sentence, not its stack.
 
