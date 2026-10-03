@@ -344,6 +344,25 @@ byte-identical (8 warps fit there). And the flash kernel's 64-key tiles were the
 on the A100 1.036 against 1.211 at 524, 7.23 against 7.80 at 1044, level at 262 - AF3's trunk at 1048
 tokens 8.11 -> 7.87 s. The T4's register-staged form keeps 64 (48 is slower there).
 
+## Kernels the three ports share
+
+native/af2 and native/ef2 include this directory's headers, and where two ports had written the same kernel
+it now lives here once:
+
+| kernel | was | now |
+|---|---|---|
+| the fused triangle multiplication (`triInK`, `triOutPK`) | AF3 only; AF2 had its own unfused path | AF2's 128-channel triangle too (a `BIAS` option, its weights re-laid once): 5% of an AF2 fold with an alignment |
+| the fused transition (`fusedTransitionK`) | AF3 only | AF2's pair transition too (a `RELU` form with biases) |
+| the 256-channel fused kernels (`fused256.cuh`) | ESMFold2 only | protenix2 too: 6.4% (A100), 20% (L4) |
+| the flash grid attention (`flashGridHalf`) | AF2 had a 200-line copy with strides (`flashStrided`) | one kernel, a `STRIDED` form - AF3's dense form unchanged |
+| the outer product mean's permute and residual | both ports | shared; AF3 takes AF2's 16-byte permute (9.9 -> 3.3 ms) |
+| eight element-wise kernels (`elementwise.cuh`) | a copy in each port | once |
+
+In every case the side that already ran the shared kernel is byte-identical. Measured and left as they are:
+AF3's LayerNorm against the vectorised `layerNormVK` (both ~1.2 TB/s, already bandwidth-bound, and AF3's
+uses AF3's own variance formula), and ESMFold2's float32 token attention against the f16 flash kernel (its
+sampler is 76 ms at 262 tokens and 101 at 524, so the T^2 attention is not what it spends).
+
 ## The wider pair tracks
 
 protenix2 (256 channels), OpenDDE (384) and IntelliFold-2 (512) are 2.4x, 4x and 5.2x AlphaFold 3's trunk
