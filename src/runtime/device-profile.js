@@ -874,8 +874,10 @@ const PRIORS = new Map([
     // read and written once a block, so their traffic grows with the token
     // count - about 4.8 GB a step at 256 tokens and 10.3 at 544, against a
     // 1.5 TB/s card. A crossover SHOULD exist; 175 was simply the wrong one.
+    // ...and `maxGroups` halves the split while qkvg's split dispatch would pass ~2000 workgroups:
+    // 16 to 150 tokens, 8 to ~260, 4 above (see the rule in diffusion-transformer-webgpu.js).
     diffusionSplitK: { splits: 16, tile: 4, crossover: 512, outSplits: 4,
-                       attnSplits: 4, attnTile: 2, normSplits: 4 },
+                       attnSplits: 4, attnTile: 2, normSplits: 4, maxGroups: 2000 },
     // On, with the geometry derived from this device's tile. See the note on
     // matrixLinear in DEFAULT_TUNING for why this is opt-in.
     matrixLinear: {},

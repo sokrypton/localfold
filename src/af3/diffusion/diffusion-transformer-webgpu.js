@@ -2413,7 +2413,16 @@ export class Af3DiffusionTransformerGpu {
         width, lanes: weights.lanes ?? 256, tile: wantedTile }));
     const splitting = splitRule !== null && splitRule !== undefined
       && tokens < splitRule.crossover && channels % splitRule.splits === 0;
-    const kSplits = splitting ? splitRule.splits : 1;
+    // 🔴 FEWER SPLITS AS THE TOKENS GROW, WHERE THE RULE CAPS THE DISPATCH (`maxGroups`). Sixteen splits
+    // at 262 tokens launch ~12,700 qkvg workgroups on a card that holds ~4,500 and write 51 MB of
+    // partials a block for the reduce to read back. Halving down to 4 while the split dispatch would
+    // exceed the cap: A100, AF3 int5, warm folds, 16 / 8 / 4 splits - 150 tokens 0.79 / 0.81 / 0.83 s,
+    // 200 1.04 / 1.02 / 1.05, 262 1.485 / 1.45 / 1.45, 400 2.98 / - / 2.90 (2 does not compile there).
+    let kSplits = splitting ? splitRule.splits : 1;
+    if (splitting && splitRule.maxGroups !== undefined) {
+      const unsplit = Math.ceil(tokens / splitRule.tile) * Math.max(1, width / (weights.lanes ?? 256));
+      while (kSplits > 4 && unsplit * kSplits > splitRule.maxGroups) kSplits /= 2;
+    }
     // 🔴 THE SHARED TILE IS UNCHANGED BY THE SPLIT. Only qkvg has a K split
     // behind it, so only qkvg can afford the bigger tile; adaln, ffw-adaln and
     // the rest measured 0.54x-0.82x when the raised tile reached them, which is
