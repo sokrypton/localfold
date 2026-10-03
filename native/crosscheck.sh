@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# The same folds on any GPU, to hold one machine's native ports against another's:
+#
+#   native/crosscheck.sh <out dir> [ef2=<weights>] [af3=<weights>] [af2=<monomer weights>] [af2m=<multimer weights>]
+#
+# Each input is featurised here by the repo's own exporters (deterministic), each port built for this
+# GPU (into <out>), and every fold's log line and PDB kept: compare two machines' <out> dirs with
+# native/af3/score.py (CA RMSD between the two PDBs of a case) and the pLDDT/pTM lines. A port whose
+# weights are not given is skipped. Defaults: native/<port>/weights (what native/colab_setup.sh writes).
+set -uo pipefail
+repo="$(cd "$(dirname "$0")/.." && pwd)"; N="$repo/native"
+out="$1"; shift; mkdir -p "$out"
+declare -A W=([ef2]="$N/ef2/weights" [af3]="$N/af3/weights" [af2]="" [af2m]="")
+for a in "$@"; do W[${a%%=*}]="${a#*=}"; done
+arch="sm_$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '. ')"
+nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader > "$out/gpu.txt"
+log="$out/log.txt"; : > "$log"
+run() { local name="$1"; shift; { echo "== $name"; /usr/bin/time -f "wall %e s" "$@" 2>&1; echo "exit $?"; } >> "$log" 2>&1; }
+build() { (cd "$N/$1" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread $2 src/$1.cu -lcublas -lcublasLt -lcupti \
+          -o "$out/$1" 2>&1 | grep -E "error" >> "$log"); }
+S6=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE
+seqof() { python3 - "$1" "$2" <<'EOF'
+import sys
+three = dict(ALA="A", ARG="R", ASN="N", ASP="D", CYS="C", GLN="Q", GLU="E", GLY="G", HIS="H", ILE="I", LEU="L", LYS="K",
+             MET="M", PHE="F", PRO="P", SER="S", THR="T", TRP="W", TYR="Y", VAL="V", MSE="M")
+seen, s = set(), ""
+for l in open(sys.argv[1]):
+    if l.startswith(("ATOM", "HETATM")) and l[12:16] == " CA " and l[21] == sys.argv[2] and l[22:27] not in seen:
+        seen.add(l[22:27]); s += three.get(l[17:20], "X")
+print(s)
+EOF
+}
+FX="$repo/tools/fixtures"; S5=$(seqof "$FX/5caj-crystal.pdb" A); SA=$(seqof "$FX/1brs-crystal.pdb" A); SD=$(seqof "$FX/1brs-crystal.pdb" D)
+in="$out/inputs"; mkdir -p "$in"
+
+if [ -f "${W[ef2]}/model.idx" ]; then
+  build ef2 ""
+  ex() { local d="$in/ef2-$1"; shift; [ -f "$d/model.idx" ] || node --js-float16array "$N/ef2/export_input.mjs" "$d" "$@" > /dev/null; }
+  ex 6mrr --sequence=$S6; ex 5caj --sequence=$S5; ex 1brs --sequence=$SA:$SD
+  ex gol-sep --sequence=$S6 --ligands=GOL --modify=SEP@3; ex dna --sequence=GCGATCGATCGC:GCGATCGATCGC --kinds=dna,dna
+  for c in 6mrr 5caj 1brs gol-sep dna; do run ef2-$c "$out/ef2" "$in/ef2-$c" --weights="${W[ef2]}" --fast --warm=96,800 --out="$out/ef2-$c.pdb"; done
+  run ef2-6mrr-f32 "$out/ef2" "$in/ef2-6mrr" --weights="${W[ef2]}" --out="$out/ef2-6mrr-f32.pdb"
+fi
+if [ -f "${W[af3]}/model.idx" ]; then
+  build af3 "--use_fast_math"
+  B="$repo/model-af3-int5/manifest.json"
+  ex3() { local d="$in/af3-$1"; shift; [ -f "$d/model.idx" ] || (cd "$N/af3" && node --js-float16array --max-old-space-size=24000 \
+          export-model.mjs "$d" --no-weights --bundle="$B" "$@" > /dev/null); }
+  ex3 6mrr --sequence=$S6; ex3 5caj-tmpl --sequence=$S5 --template="$FX/5caj-crystal.pdb:A"
+  ex3 1brs-tmpl --sequence=$SA:$SD --template="$FX/1brs-crystal.pdb:A@0+$FX/1brs-crystal.pdb:D@1"; ex3 gol --sequence=$S6 --ligands=GOL
+  for c in 6mrr 5caj-tmpl 1brs-tmpl gol; do run af3-$c "$out/af3" "$in/af3-$c" --weights="${W[af3]}" --fold --fast --out="$out/af3-$c.pdb"; done
+  run af3-6mrr-f32 "$out/af3" "$in/af3-6mrr" --weights="${W[af3]}" --fold --steps=20 --out="$out/af3-6mrr-f32.pdb"
+fi
+if [ -n "${W[af2]}" ] && [ -f "${W[af2]}/model.idx" ]; then
+  build af2 "--use_fast_math"
+  ex2() { local d="$in/af2-$1" w="$2"; shift 2; [ -f "$d/model.idx" ] || node "$N/af2/export_input.mjs" "$d" --weights="$w" "$@" > /dev/null; }
+  ex2 6mrr "${W[af2]}" --sequence=$S6; ex2 5caj-tmpl "${W[af2]}" --sequence=$S5 --template="$FX/5caj-crystal.pdb:A"
+  run af2-6mrr "$out/af2" "$in/af2-6mrr" --weights="${W[af2]}" --fast --out="$out/af2-6mrr.pdb"
+  run af2-5caj-tmpl "$out/af2" "$in/af2-5caj-tmpl" --weights="${W[af2]}" --fast --recycles=0 --out="$out/af2-5caj-tmpl.pdb"
+  run af2-6mrr-f32 "$out/af2" "$in/af2-6mrr" --weights="${W[af2]}" --out="$out/af2-6mrr-f32.pdb"
+  if [ -n "${W[af2m]}" ] && [ -f "${W[af2m]}/model.idx" ]; then
+    ex2 1brs-tmpl "${W[af2m]}" --sequence=$SA:$SD --template="$FX/1brs-crystal.pdb:A+D"
+    run af2-1brs-tmpl "$out/af2" "$in/af2-1brs-tmpl" --weights="${W[af2m]}" --fast --out="$out/af2-1brs-tmpl.pdb"
+  fi
+fi
+echo done > "$out/DONE"
