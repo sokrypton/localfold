@@ -191,6 +191,22 @@ inline bool FUSED_GRID = true;
 inline bool TRI_BF16 = true;
 inline int TRI_PAD = 8;           // the triangle's padded size is a multiple of this (0: none)
 #include "fusedtriangle.cuh"
+#include "fused256.cuh"
+// The 256-channel pair track's fused kernels (fused256.cuh, ESMFold2's): native/af3's at 128 channels hold
+// a whole output tile or weight on the chip, which at 256 is past the registers and shared memory a block
+// gets; these stream their weights in narrower steps, two blocks an SM. Below ~80 tokens their tiles leave
+// the device idle (ESMFold2's measurement), and a T4's 64 KB fits none of them.
+inline bool FUSED_WIDE = true;
+inline int FUSED_WIDE_MIN_TOKENS = 80;
+// ...at 256 channels only: at OpenDDE's 384 and IntelliFold-2's 512 the same kernels fit one block an SM and
+// lose to the unfused path (262 tokens: trunk 2160 against 1925 ms, 3360 against 2821)
+constexpr size_t wideTriInSmem(int C) { return (size_t)128 * (C + 8) * 2; }                       // 8 warps
+constexpr size_t wideTriOutSmem(int C) { return (size_t)C * 65 * 4 + 2 * 64 * 4; }               // 4 warps
+constexpr size_t wideUpSmem(int C) { return std::max((size_t)128 * (C + 8) * 2, (size_t)2 * 2 * C * (32 + 8) * 2); }
+inline bool wideFits(int C) {
+  return C == 256 && fitsSmem(std::max({wideTriInSmem(C), wideTriOutSmem(C), wideUpSmem(C)}));
+}
+template <class F> void wideWidth(int, F f) { f(std::integral_constant<int, 256>{}); }
 
 // The bf16 contraction, one np x np GEMM per channel. cuBLAS's default picks a 64x256 tile from
 // np 152 to 392 (cuBLAS 12, A100), where a 128x128 tile is up to a quarter faster - 66.5 against
@@ -280,6 +296,28 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         cs, b, cudaType<T>(), np, cs, &zero, prod, CUDA_R_32F, np, cs, C, CUBLAS_COMPUTE_32F, algo));
   };
   if constexpr (std::is_same_v<T, half>) {
+    if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
+      // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
+      // contraction into f32, then the centre norm, the output projection, the gate and the residual
+      a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
+      half* t2 = scratch<half>("tri.t2whole", cs * C);
+      wideWidth(C, [&](auto width) {
+        constexpr int CC = decltype(width)::value, WI = 8, WO = 4;
+        static bool attr = false;
+        if (!attr) {
+          smemAttr((triIn256K<CC, WI>), (int)wideTriInSmem(CC));
+          smemAttr((triangleOutK<CC, WO>), (int)wideTriOutSmem(CC));
+          attr = true;
+        }
+        triIn256K<CC, WI><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmem(CC), STREAM>>>(
+          pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
+          a, b, t2, n, np, cs);
+        contract();
+        triangleOutK<CC, WO><<<(unsigned)((pairs + 16 * WO - 1) / (16 * WO)), 32 * WO, wideTriOutSmem(CC), STREAM>>>(
+          prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np);
+      });
+      return;
+    }
     if (FUSED_TRIANGLE && C == 128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>())) {   // see fusedtriangle.cuh
       half* t2 = scratch<half>("tri.t2whole", cs * C);
       if (TRI_BF16) {
@@ -347,6 +385,27 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   if (w1 % (2 * (size_t)C)) { fprintf(stderr, "%s.transition1 has %zu elements, not C %d x 2I\n", pre.c_str(), w1, C); exit(1); }
   int I = (int)(w1 / (2 * (size_t)C));
   if constexpr (std::is_same_v<T, half>) if (fusedTransition(x, rows, C, I, pre)) return;
+  if constexpr (std::is_same_v<T, half>) {
+    // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
+    // residual as its beta - the [rows, 2I] widening never written
+    if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
+      constexpr int WU = 8, R = 16 * WU;
+      size_t rowsPer = std::max<size_t>(R, CHUNK / (2 * I)) / R * R;
+      half* gated = scratch<half>("tr.gated", std::min(rowsPer, rows) * I);
+      wideWidth(C, [&](auto width) {
+        constexpr int CC = decltype(width)::value;
+        static bool attr = false;
+        if (!attr) { smemAttr((transitionUpK<CC, WU>), (int)wideUpSmem(CC)); attr = true; }
+        for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
+          size_t r = std::min(rowsPer, rows - r0);
+          transitionUpK<CC, WU><<<(unsigned)((r + R - 1) / R), 32 * WU, wideUpSmem(CC), STREAM>>>(
+            x + r0 * C, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), Wh(pre + ".transition1"), gated, r, I);
+          linear<half, float>(gated, x + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
+        }
+      });
+      return;
+    }
+  }
   size_t rowsPer = std::max<size_t>(1, CHUNK / (2 * I));
   T* xn = scratch<T>("tr.x", std::min(rowsPer, rows) * C);
   T* wide = scratch<T>("tr.wide", std::min(rowsPer, rows) * 2 * I);

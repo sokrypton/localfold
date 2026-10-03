@@ -333,6 +333,18 @@ place with volatile asm (no change), and the grid attention unfused (`LOCALFOLD_
 `triangle`, `transition`): level at 262 tokens, 4% slower at 524. The T4 drifts up to 7% between repeats
 of one arm (it throttles to ~1 GHz under load), so interleave arms there.
 
+## The wider pair tracks
+
+protenix2 (256 channels), OpenDDE (384) and IntelliFold-2 (512) are 2.4x, 4x and 5.2x AlphaFold 3's trunk
+at 262 tokens - no more than their widths predict (attention heads 8, 12 and 8 x 64 against 4; projections
+by the width squared) - but their unfused path spends about a third of it in LayerNorm, gate, SwiGLU and
+add passes. ESMFold2's port already had fused kernels for a 256-channel track that stream their weights
+in narrow steps (two blocks an SM where native/af3's 128-channel ones would need 255 registers); they now
+live in src/fused256.cuh and protenix2 takes them from 80 tokens - triangle in, the f16 contraction,
+triangle out, and the transition's widening ahead of cuBLAS's second GEMM: **trunk 1259 -> 1180 ms (6.4%)
+at 262 tokens**, templated 5CAJ 0.191 A either way (`test:native` holds it). At 384 and 512 channels the
+same kernels fit one block an SM and LOSE (2160 against 1925 ms, 3360 against 2821), so those stay unfused.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at

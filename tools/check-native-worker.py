@@ -79,6 +79,10 @@ def cases(offline):
          "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 0.5, None, None),
         ("protenix2 6mrr", {"family": "protenix2", "controls": controls(**{"model-family": "protenix2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.0, 68, None),
+        # (past 80 tokens: protenix2's 256-channel pair track on its fused kernels, native/af3/src/fused256.cuh)
+        ("protenix2 5caj, its crystal uploaded", {"family": "protenix2", "controls": controls(**{"model-family": "protenix2"}),
+         "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A", "filename": "5caj.pdb"})],
+         "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 0.5, None, None),
         ("opendde 6mrr", {"family": "opendde", "controls": controls(**{"model-family": "opendde", "af3-count": "16"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
         ("af3 6mrr + GOL + SEP3", {"family": "af3", "controls": controls(),
