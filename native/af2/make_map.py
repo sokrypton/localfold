@@ -307,7 +307,8 @@ def main():
     for module in ([] if multimer else params):
         for pname, value in params[module].items():
             value = np.asarray(value)
-            if any(f"alphafold_iteration/{x}" in f"{module}/" for x in NOT_IN_PAGE):
+            optional = any(f"alphafold_iteration/{x}" in f"{module}/" for x in NOT_IN_PAGE + ORACLE_ONLY)
+            if optional and locate(value, bundle, f"{module}/{pname}", names_of)[0] is None:
                 ids.setdefault(module, {})[pname] = np.zeros(value.shape, np.int64)   # (through the converter, then dropped)
                 continue
             # the triangle multiplications' fused projection/gate: the bundle keeps left and right apart

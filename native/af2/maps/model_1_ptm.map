@@ -1164,6 +1164,20 @@ m w/evoformer/template_embedding/single_template_embedding/template_pair_stack/_
 m w/evoformer/template_embedding/single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/projection/weights#0 2
 m w/evoformer/template_embedding/single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/projection/weights#1 64
 m w/evoformer/template_embedding/single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/projection/weights#2 128
+p w/evoformer/template_projection/bias 256 v 1 256 0 1 template_single_haiku_0002 0 1
+m w/evoformer/template_projection/bias#r 1
+m w/evoformer/template_projection/bias#0 256
+p w/evoformer/template_projection/weights 65536 v 2 256 256 0 256 1 template_single_haiku_0003 0 256 1
+m w/evoformer/template_projection/weights#r 2
+m w/evoformer/template_projection/weights#0 256
+m w/evoformer/template_projection/weights#1 256
+p w/evoformer/template_single_embedding/bias 256 v 1 256 0 1 template_single_haiku_0000 0 1
+m w/evoformer/template_single_embedding/bias#r 1
+m w/evoformer/template_single_embedding/bias#0 256
+p w/evoformer/template_single_embedding/weights 14592 v 2 57 256 0 256 1 template_single_haiku_0001 0 256 1
+m w/evoformer/template_single_embedding/weights#r 2
+m w/evoformer/template_single_embedding/weights#0 57
+m w/evoformer/template_single_embedding/weights#1 256
 p w/evoformer/~_relative_encoding/position_activations/bias 128 v 1 128 0 1 embedding_haiku_0004 0 1
 m w/evoformer/~_relative_encoding/position_activations/bias#r 1
 m w/evoformer/~_relative_encoding/position_activations/bias#0 128

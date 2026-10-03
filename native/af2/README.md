@@ -39,10 +39,10 @@ multimer's are joined exactly, every checkpoint element's id run through the pag
 reference's loader both; each native tensor is then strided parts of bundle tensors. The template
 torsions' chi tables are compiled in (`src/chi_tables.cuh`). Chains are joined by `:`. `--template`
 takes a structure of the query's own sequence (identity mapping), and `A+D` merges a complex's
-chains into one slot over the whole query. 🔴 **The page's monomer bundle has no
-`template_single_embedding`/`template_projection`**, so a monomer template reaches the fold through
-the pair term alone, as on the page: 5CAJ with its own crystal is 2.531 A / pLDDT 74.5 against
-DeepMind's float32 weights' 0.205 / 97.4 (the multimer's bundle has them: 1BRS 0.272 A). The int5
+chains into one slot over the whole query. The page's monomer bundle carries the templates' single features too (`templateSingle`, float32,
+added by `tools/append_template_single.py` without touching a published shard - the exporter's
+section scopes had missed them): 5CAJ with its own crystal is 0.217 A / pLDDT 97.22 against
+DeepMind float32's 0.205 / 97.4, and 2.531 / 74.5 without them. The int5
 cost elsewhere is small - 6MRR 1.900 A / 84.58 against 1.882 / 85.17. Input flags (`--recycles`,
 default 3, `--max-msa` 512, `--max-extra` 1024, `--seed`) go to the exporter. Flags after `--` go
 to `af2`, which `fold` runs with `--fast`.
