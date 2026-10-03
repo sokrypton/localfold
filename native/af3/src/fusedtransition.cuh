@@ -116,6 +116,10 @@ void fusedTransitionAt(float* x, size_t rows, int C, int I, const std::string& p
 inline bool fusedTransition(float* x, size_t rows, int C, int I, const std::string& pre) {
   if (!FUSED_TRANSITION || C != 128 || I % FT_NC) return false;
   int warps = FT_WARPS == 8 && (rows + 127) / 128 < MIN_BLOCKS ? 4 : FT_WARPS;   // a small input: more, smaller blocks
+  // no more than the device's shared memory (a T4's 64 KB takes the 4-warp form, or the unfused one)
+  auto smemFor = [](int w) { return (size_t)16 * w * (128 + 8) * 2 + 2 * ftStage<128>(); };
+  while (warps > 4 && !fitsSmem(smemFor(warps))) warps /= 2;
+  if (!fitsSmem(smemFor(warps))) return false;
   if (warps == 4) fusedTransitionAt<4>(x, rows, C, I, pre);
   else if (warps == 16) fusedTransitionAt<16>(x, rows, C, I, pre);
   else fusedTransitionAt<8>(x, rows, C, I, pre);

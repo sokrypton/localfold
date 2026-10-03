@@ -22,6 +22,8 @@
 # --seed, ...), which runs --fold --fast. Builds ./af3 if it is missing, exports the weights once
 # (to native/af3/weights) and each input to a temporary directory.
 set -euo pipefail
+# the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
+gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"; echo "sm_${cc:-80}"; }
 here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { sed -n '2,17p' "$0"; exit 1; }
 batch=""; serve=""
@@ -41,7 +43,7 @@ done
 [ -n "$bundle" ] || { echo "no bundle for model $model under $repo" >&2; exit 1; }
 weights="$here/weights"; [ "$model" = af3 ] || weights="$here/weights-$model"
 if [ ! -x "$here/af3" ]; then
-  (cd "$here" && nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu \
+  (cd "$here" && nvcc -O3 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af3.cu \
      -lcublas -lcublasLt -lcupti -o af3)
 fi
 node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")

@@ -375,6 +375,13 @@ inline int warpsFor(size_t rows, std::initializer_list<int> options) {
   for (int w : options) { last = w; if ((rows + 16 * w - 1) / (16 * w) >= MIN_BLOCKS) return w; }
   return last;
 }
+// ...and no more than the device's shared memory allows (a T4's 64 KB): the first option, at or after
+// `w`, whose blocks fit; 0 if none does
+template <class F> int warpsFitting(int w, std::initializer_list<int> options, F smemFor) {
+  bool from = false;
+  for (int o : options) { if (o == w) from = true; if (from && fitsSmem(smemFor(o))) return o; }
+  return 0;
+}
 template <class TA, int WARPS>
 void triInAt(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
              TA* a, TA* b, half* t2, int n, int np, size_t cs) {
@@ -387,20 +394,31 @@ void triInAt(const float* pair, const float* mask, const std::string& pre, const
     pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
     a, b, t2, n, np, cs);
 }
+inline size_t triInSmem(int warps) { return (size_t)16 * warps * (128 + 8) * 2 + 2 * tiStage(128); }
 template <class TA>
 void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
               TA* a, TA* b, half* t2, int n, int np, size_t cs) {
-  switch (warpsFor((size_t)np * np, {TI_WARPS, 4})) {
+  switch (warpsFitting(warpsFor((size_t)np * np, {TI_WARPS, 4}), {TI_WARPS, 4}, triInSmem)) {
     case 4: triInAt<TA, 4>(pair, mask, pre, pg, a, b, t2, n, np, cs); break;
     default: triInAt<TA, TI_WARPS>(pair, mask, pre, pg, a, b, t2, n, np, cs);
   }
 }
 inline bool TRI_OUT_PERSISTENT = true;
+template <class TP> constexpr size_t triOutPSmem() {
+  return (size_t)128 * 136 * 2 + (size_t)16 * TO_WARPS * 136 * 2 + (size_t)2 * 128 * (16 * TO_WARPS + 16 / sizeof(TP)) * sizeof(TP);
+}
+template <class TP> constexpr size_t triOutSmem() {
+  return (size_t)128 * 136 * 2 + (size_t)16 * TO_WARPS * 136 * 2 + (size_t)128 * (16 * TO_WARPS + 16 / sizeof(TP)) * sizeof(TP);
+}
+// the three fused triangle kernels fit this device (not a T4's 64 KB: the unfused path runs there)
+template <class TP> bool triFusedFits() {
+  return fitsSmem(triInSmem(4)) && fitsSmem(std::min(triOutPSmem<TP>(), triOutSmem<TP>()));
+}
 template <class TP>
 void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * TO_WARPS;
   size_t pp = (size_t)np * np;
-  if (TRI_OUT_PERSISTENT) {
+  if (TRI_OUT_PERSISTENT && fitsSmem(triOutPSmem<TP>())) {
     size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)2 * C * (R + 16 / sizeof(TP)) * sizeof(TP);
     static int grid = 0;
     if (!grid) {
@@ -628,10 +646,13 @@ void gridInAt(const float* pair, const std::string& pre, const std::string& wq, 
     pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wq), out, n, q0, rows, tr, Wb, bias, heads, stride,
     swap);
 }
+inline size_t gridInSmem(int warps) { return (size_t)16 * warps * (128 + 8) * 2 + (size_t)2 * 128 * (64 + 8) * 2 + (size_t)128 * 24 * 2; }
+inline size_t gridOutSmem(int warps) { return (size_t)128 * (128 + 8) * 2 + (size_t)16 * warps * (128 + 8) * 2; }
+inline bool gridFusedFits() { return fitsSmem(gridInSmem(2)) && fitsSmem(gridOutSmem(2)); }
 inline void gridIn128(const float* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
                       size_t rows, bool tr, const half* Wb = nullptr, half* bias = nullptr, int heads = 0,
                       int stride = 0, bool swap = false) {
-  switch (warpsFor(rows, {GI_WARPS, 4, 2})) {
+  switch (warpsFitting(warpsFor(rows, {GI_WARPS, 4, 2}), {GI_WARPS, 4, 2}, gridInSmem)) {
     case 2: gridInAt<2>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
     case 4: gridInAt<4>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
     default: gridInAt<GI_WARPS>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap);
@@ -646,7 +667,7 @@ void gridOutAt(const half* gathered, const std::string& w, float* pair, int n, s
   gridOutK<C, WD, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wh(w), pair, n, q0, rows, tr);
 }
 inline void gridOut128(const half* gathered, const std::string& w, float* pair, int n, size_t q0, size_t rows, bool tr) {
-  switch (warpsFor(rows, {GO_WARPS, 4, 2})) {
+  switch (warpsFitting(warpsFor(rows, {GO_WARPS, 4, 2}), {GO_WARPS, 4, 2}, gridOutSmem)) {
     case 2: gridOutAt<2>(gathered, w, pair, n, q0, rows, tr); break;
     case 4: gridOutAt<4>(gathered, w, pair, n, q0, rows, tr); break;
     default: gridOutAt<GO_WARPS>(gathered, w, pair, n, q0, rows, tr);

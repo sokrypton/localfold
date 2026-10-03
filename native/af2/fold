@@ -11,6 +11,8 @@
 # native/af2/weights-<model>. Input flags (--sequence, --a3m, --search, --template, --recycles,
 # --max-msa, --max-extra, --seed) go to export_input.mjs; flags after -- go to ./af2, which runs --fast.
 set -euo pipefail
+# the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
+gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"; echo "sm_${cc:-80}"; }
 here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { sed -n '2,14p' "$0"; exit 1; }
 out="$1"; shift
@@ -23,7 +25,7 @@ done
 python="${AF2_PYTHON:-$HOME/.venv-lfjax/bin/python}"
 reference="${AF2_REFERENCE:-/tmp/claude-1000/ref}"
 if [ ! -x "$here/af2" ]; then
-  (cd "$here" && nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af2.cu \
+  (cd "$here" && nvcc -O3 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af2.cu \
      -lcublas -lcublasLt -lcupti -o af2)
 fi
 weights="$here/weights-$model"

@@ -157,6 +157,35 @@ __global__ void centerNormK(const float* prod, TO* out, size_t r0, size_t rows, 
   }
 }
 
+// the same in two passes over prod (the statistics, then the normalised rows) when its C x 33 tile does not
+// fit (IntelliFold-2's 512 channels on a T4: 67.5 KB)
+template <class TO>
+__global__ void centerNormStreamK(const float* prod, TO* out, size_t r0, size_t rows, int C, size_t pairs,
+                                  const float* scale, const float* offset, int n, int np) {
+  __shared__ float ps[8][33], pss[8][33], mean[32], inv[32];
+  size_t i0 = (size_t)blockIdx.x * 32; int tx = threadIdx.x, ty = threadIdx.y;
+  size_t local = i0 + tx;
+  unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
+  size_t at = (size_t)i * np + (p - i * (unsigned)n);
+  float s = 0, ss = 0;
+  if (local < rows) for (int c = ty; c < C; c += 8) { float v = prod[(size_t)c * pairs + at]; s += v; ss += v * v; }
+  ps[ty][tx] = s; pss[ty][tx] = ss;
+  __syncthreads();
+  if (ty == 0) {
+    float a = 0, b = 0;
+    for (int k = 0; k < 8; ++k) { a += ps[k][tx]; b += pss[k][tx]; }
+    float m = a / C; mean[tx] = m; inv[tx] = rsqrtf(b / C - m * m + 1e-5f);
+  }
+  __syncthreads();
+  for (int ry = ty; ry < 32; ry += 8) {
+    size_t lr = i0 + ry; if (lr >= rows) continue;
+    unsigned q = (unsigned)(r0 + lr), qi = q / (unsigned)n;
+    size_t qa = (size_t)qi * np + (q - qi * (unsigned)n);
+    for (int c = tx; c < C; c += 32)
+      out[lr * C + c] = fromF<TO>((prod[(size_t)c * pairs + qa] - mean[ry]) * inv[ry] * scale[c] + offset[c]);
+  }
+}
+
 inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
 inline bool FUSED_GRID = true;
 inline bool TRI_BF16 = true;
@@ -251,7 +280,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         cs, b, cudaType<T>(), np, cs, &zero, prod, CUDA_R_32F, np, cs, C, CUBLAS_COMPUTE_32F, algo));
   };
   if constexpr (std::is_same_v<T, half>) {
-    if (FUSED_TRIANGLE && C == 128) {           // three kernels: see fusedtriangle.cuh
+    if (FUSED_TRIANGLE && C == 128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>())) {   // see fusedtriangle.cuh
       half* t2 = scratch<half>("tri.t2whole", cs * C);
       if (TRI_BF16) {
         // a, b and the contraction's product in bf16: f32's range at half the bytes (f16's
@@ -290,15 +319,18 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   T* t2 = scratch<T>("tri.t2", std::min(rowsPer, pairs) * C);
   for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
     size_t rows = std::min(rowsPer, pairs - r0);
-    {   // C * 33 floats of shared memory: past the 48 KB default from C = 373 (IntelliFold-2's 512)
+    if (fitsSmem((size_t)C * 33 * 4)) {   // C * 33 floats of shared memory: past the 48 KB default from C = 373 (IntelliFold-2's 512)
       static int granted = 0;
       if (C * 33 * 4 > granted) {
         smemAttr((centerNormK<T>), C * 33 * 4);
         granted = C * 33 * 4;
       }
+      centerNormK<T><<<(unsigned)((rows + 31) / 32), dim3(32, 8), C * 33 * 4, STREAM>>>(prod, centred, r0,
+        rows, C, cs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), n, np);
+    } else {
+      centerNormStreamK<T><<<(unsigned)((rows + 31) / 32), dim3(32, 8), 0, STREAM>>>(prod, centred, r0,
+        rows, C, cs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), n, np);
     }
-    centerNormK<T><<<(unsigned)((rows + 31) / 32), dim3(32, 8), C * 33 * 4, STREAM>>>(prod, centred, r0,
-      rows, C, cs, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), n, np);
     linear<T, T>(centred, t1, rows, C, C, pre + ".outputProjection");
     linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
     gatedAddK<T><<<blocks(rows * C), 256, 0, STREAM>>>(pair + r0 * C, t1, t2, rows * C);
@@ -396,7 +428,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     // three fused kernels (fusedtriangle.cuh): LN + the bias projection (head-major), then per
     // chunk LN + q/k/v/gate (reading the column direction's rows transposed in place), the flash
     // kernel, and the output projection added into the pair
-    if (FUSED_GRID && C == 128 && Wd == 128 && heads <= 16 && !hasW(pre + ".gatingQueryBias") &&
+    if (FUSED_GRID && C == 128 && Wd == 128 && heads <= 16 && gridFusedFits() && !hasW(pre + ".gatingQueryBias") &&
         !hasW(pre + ".outputProjectionBias")) {
       int stride = (n + 7) / 8 * 8;
       half* bias = scratch<half>("grid.bias", (size_t)heads * n * stride);

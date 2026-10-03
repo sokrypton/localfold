@@ -485,7 +485,8 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // ...and ONE row only: with the samples as rows (--samples=5) the grid kernel has the blocks it
   // lacked, and the split loses at every size measured - 11.1 against 8.2 us at 68 tokens and five
   // rows, 27.0 against 13.4 at 150, 15.7 against 8.8 at 192 and two rows (a tie at 68 and two)
-  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && rows == 1 && n <= 192 && heads * ((n + 63) / 64) < 4 * 108) {
+  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && rows == 1 && n <= 192 && heads * ((n + 63) / 64) < 4 * 108 &&
+      fitsSmem(4 * 2 * fsStage<D>())) {        // (the split's four warps' own buffers: 67 KB at D 48, past a T4's 64)
     flashSplitHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     return;
   }
@@ -495,6 +496,9 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // ...up to ~1700 tokens, where the longer key loop's per-tile cost overtakes the occupancy (1536: 106.7
   // against 120.7 us; 1800: 162.3 against 154.0; 2088: 194 against 180)
   constexpr int BK = D == 48 ? 48 : FA_BK;
+  // no more warps than the device's shared memory allows (a T4's 64 KB)
+  if (warps == 8 && !fitsSmem(2 * faStage<D, 8, BK>())) warps = 4;
+  if (warps == 4 && !fitsSmem(2 * faStage<D, 4, BK>())) warps = 2;
   if (D == 48 && n >= 1700 && (warps == 4 || warps == 8)) {
     if (warps == 8) flashGridHalfAt<D, 8, FA_BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else flashGridHalfAt<D, 4, FA_BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);

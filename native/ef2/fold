@@ -9,6 +9,8 @@
 # page's featuriser (export_input.mjs) while ef2 starts up and warms up; flags after -- go to ./ef2,
 # which runs --fast.
 set -euo pipefail
+# the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
+gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"; echo "sm_${cc:-80}"; }
 here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { sed -n '2,9p' "$0"; exit 1; }
 out="$1"; shift
@@ -18,7 +20,7 @@ while [ $# -gt 0 ]; do
   inputs+=("$1"); shift
 done
 if [ ! -x "$here/ef2" ]; then
-  (cd "$here" && nvcc -O3 -std=c++17 -arch=sm_80 --default-stream per-thread src/ef2.cu -lcublas -lcublasLt -lcupti -o ef2)
+  (cd "$here" && nvcc -O3 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread src/ef2.cu -lcublas -lcublasLt -lcupti -o ef2)
 fi
 weights="$here/weights"
 [ -f "$weights/model.idx" ] || node "$here/export_weights.mjs" "$weights"
