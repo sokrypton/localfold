@@ -3828,3 +3828,26 @@ on the GPU and N on this tree's CPU reference from the same start, so a defect
 that accumulates per block and one that lives in a single kernel look different.
 Here it showed a clean linear accumulation, which is what sent the search to the
 knobs rather than to a kernel.
+
+## 🔴 2026-10-03: a 40-token fold's sampler step cost more than AF3's at 262 tokens - two latency faults
+
+A warm 40-token fold was 0.63 s on the A100 (int5) and each of its 11 denoise steps 28 ms. Found with
+`fold-esmfold2.js --profile` (new; the last repeat, a pass a dispatch):
+
+- **`createLinearShader` walks all of K in one workgroup**, so a 768x768 projection at 40 tokens was 60
+  workgroups - 0.13 ms for 24 MFLOP. Batching the step's ~350 dispatches into one compute pass moved
+  nothing (28 ms either way), which is what said the time was in the kernels. `kSplits` (opt-in; the
+  144 unsplit forms are byte-identical) puts K ranges on workgroup z and `createSplitReduceShader`
+  sums them; `linearKSplits` picks the smallest power of two reaching ~1024 workgroups, at most 8.
+  The SwiGLU splits the same way, since its weight IS a linear of width 2*ffn
+  (`createSplitSwigluReduceShader`). Denoiser step 28 -> 12 ms at 40 tokens, 32 -> 18 at 150, 39 -> 28
+  at 262. Knobs `esmfold2TokenKSplits`, `esmcKSplits`; the row tile alone (`esmfold2TokenRowTile` 1)
+  was worth 2 ms.
+- **The ESM-C tower awaited `onSubmittedWorkDone` after each of its 36 blocks** to release the block's
+  scratch, which WebGPU allows once the naming command buffer is submitted. Language model 111 -> 52 ms
+  at 40 tokens (39 with the split SwiGLU), 121 -> ~90 at 262; checksums identical, resident and
+  streamed (`--budget=2000`).
+
+Warm folds: 40 tokens 0.63 -> 0.38 s, 150 1.16 -> 0.93, 262 2.13 -> 1.93. `check-esmc-tower.js` sits
+closer to its oracle split (worst block 2.6e-6 -> 1.7e-6 against 5e-5); `check-esmfold2-diffusion-gpu.js`
+1.43e-4 / 2.38e-4 either arm.

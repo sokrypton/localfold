@@ -6535,3 +6535,33 @@ S-adenosylmethionine carries an atom named CA, and the bench's backbone check
 collects every CA in the PDB - so the SAM row reads as broken at a CA-CA of
 3.83 A in all three arms. Filter the ligand's residue before trusting that
 column.
+
+## 🔴 The WebGPU sampler, 2026-10-03: three things the CUDA port did not do, and one it did that did not transfer
+
+Measured on the A100 (developer flags, int5 bundle), 5CAJ chain A (262 tokens) unless stated.
+
+- **The denoiser's token attention runs on AF2's register flash kernel** (`0bb9c91`,
+  `diffusionFlashAttend`). The old `attend` gave every (query, head) a workgroup and re-read all keys
+  and values for it. 24 blocks a call: 68 tokens 1.13 -> 1.36 ms (ceil(T/64) x heads workgroups starve
+  the card - so it is OFF below 100 tokens), 128 2.59 -> 2.06, 262 7.70 -> 4.54, 600 33.6 -> 10.4.
+  Oracle 9.92e-4 both arms. 32 lanes a workgroup instead of 64: +11% at 600, -9% at 262, not taken.
+- **The head's first call of a fold is chained like every other** (`06f0c36`). It awaited each stage
+  and read the encoder's five statics back (14 MB at 262 tokens) because the pair conditioning was
+  once a host array the caches keyed on. First step 159-191 -> 60-82 ms, warm fold 1.63 -> 1.54 s.
+- **buildTargetFeat stops reading those statics back too** (`438b5ae`): 67-85 -> 39-42 ms a fold.
+- 🔴 **DECLINED: the single conditioning's noise-free half once a fold** - the CUDA port's
+  `DCACHE.singleBase`. A batched profile of OpenDDE put `single-initial` at 2.6 ms a call on 130
+  workgroups, about a sixth of a 16 ms step. Built (base kernel once, a C_SEQ-wide noise row and a
+  broadcast a step) and measured interleaved against HEAD: OpenDDE's steady repeat 250-253 against
+  260-286 ms of sampler, AF3 at 262 tokens 1.467-1.531 s against 1.475-1.502 - nothing. 🔴 **THE 2.6 ms
+  WAS THE PROFILE, NOT THE KERNEL**: fold-opendde's profile spans every repeat, and the early ones run
+  the pipeline cache's first-tier (`.generic`, opaque loop bounds) kernels before the unrolled ones
+  land. A per-kernel cost read off a profile that includes a fold's first repeats is a first-tier
+  cost. The new kernels even made repeat 3 WORSE (331-340 against 259-263), because three new
+  pipelines start on that tier too.
+- **Where the gap to CUDA is now**: at 262 tokens the trunks are close (native ~380 ms warm against
+  ~430-500 ms of WebGPU GPU time); the sampler is not (native 74 ms for 25 steps, WebGPU ~830). The
+  denoiser's projections run ~6 TFLOPS of f32 on vector kernels - the transformer has no matrix-unit
+  path, and a stock browser has no matrix units, so the CUDA port's tensor cores have no WebGPU
+  equivalent for a visitor. At 68 tokens a call is ~290 dispatches at ~35 us each and the shipped split
+  configuration still beats every fewer-dispatch alternative swept (10 ms against 11-16).
