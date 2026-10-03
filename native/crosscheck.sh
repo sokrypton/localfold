@@ -17,7 +17,7 @@ nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader > "$o
 log="$out/log.txt"; : > "$log"
 run() {      # (shell timing: a Colab image has no /usr/bin/time)
   local name="$1" t0 rc; shift; t0=$(date +%s.%N)
-  { echo "== $name"; "$@" 2>&1; rc=$?; echo "wall $(echo "$(date +%s.%N) - $t0" | bc) s"; echo "exit $rc"; } >> "$log" 2>&1
+  { echo "== $name"; "$@" 2>&1; rc=$?; echo "wall $(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $t0}") s"; echo "exit $rc"; } >> "$log" 2>&1
 }
 build() { (cd "$N/$1" && nvcc -O3 -std=c++17 -arch=$arch --default-stream per-thread $2 src/$1.cu -lcublas -lcublasLt -lcupti \
           -o "$out/$1" 2>&1 | grep -E "error" >> "$log"); }
