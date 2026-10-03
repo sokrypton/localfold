@@ -140,7 +140,7 @@ export function linearGrid(rows, outer, rowTile = ROW_TILE) {
  */
 export function createLinearShader({ rows, inner, outer }, withResidual,
                                    weightPrecision = "f32", boundsTest = false,
-                                   rowTile = ROW_TILE, unroll = 4) {
+                                   rowTile = ROW_TILE, unroll = 4, kSplits = 1) {
   if (!["f32", "f16"].includes(weightPrecision)) {
     throw new RangeError(`unknown weight precision ${weightPrecision}`);
   }
@@ -149,6 +149,14 @@ export function createLinearShader({ rows, inner, outer }, withResidual,
   }
   const half = weightPrecision === "f16";
   const vectorColumns = outer / 4;
+  // 🔴 SPLIT OVER K WHEN THE ROWS ARE FEW. A workgroup walks the whole inner extent serially, so at 40
+  // tokens a 768x768 projection is 60 workgroups each with a long dependent loop - latency, not
+  // arithmetic (0.13 ms for 24 MFLOP on an A100). With kSplits > 1 workgroup z takes one K range and
+  // writes a partial to output[z]; createSplitReduceShader sums them (and adds the residual). At 1 the
+  // source is the one this function always produced.
+  const split = kSplits > 1;
+  const span = split ? Math.ceil(inner / K_CHUNK / kSplits) * K_CHUNK : inner;
+  if (split && withResidual) throw new RangeError("a split linear leaves the residual to its reduce");
   const load = half
     ? (e) => `vec4<f32>(weights[${e}])`
     : (e) => `weights[${e}]`;
@@ -161,7 +169,7 @@ export function createLinearShader({ rows, inner, outer }, withResidual,
     let row = row_origin + ${t}u;
     if (row < ${rows}u && vector_column < ${vectorColumns}u) {
       let slot = row * ${vectorColumns}u + vector_column;
-      output[slot] = ${withResidual ? `residual[slot] + acc_${t}` : `acc_${t}`};
+      output[${split ? `group.z * ${rows * vectorColumns}u + ` : ""}slot] = ${withResidual ? `residual[slot] + acc_${t}` : `acc_${t}`};
     }
   }`);
   }
@@ -216,7 +224,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
 ${declare.join("\n")}
 
-  for (var k0 = 0u; k0 < ${inner}u; k0 += ${K_CHUNK}u) {
+${split ? `  let k_start = group.z * ${span}u;
+  let k_end = min(k_start + ${span}u, ${inner}u);
+` : ""}  for (var k0 = ${split ? "k_start" : "0u"}; k0 < ${split ? "k_end" : `${inner}u`}; k0 += ${K_CHUNK}u) {
     for (var slot = local.x; slot < ${rowTile * K_CHUNK}u; slot += ${LANES}u) {
       let t = slot / ${K_CHUNK}u;
       let k = slot % ${K_CHUNK}u;
@@ -234,6 +244,39 @@ ${body.join("\n")}
   }
 
 ${stores.join("\n")}
+}`;
+}
+
+/**
+ * How many K splits a createLinearShader projection of this shape takes: the smallest power of two
+ * whose workgroup count reaches `target`, at most `cap`. A few rows leave a projection a few dozen
+ * workgroups each walking all of K - ESMFold2's denoiser at 40 tokens ran 60 a pass at 0.13 ms for
+ * 24 MFLOP - and splitting K is what gives the device the rest.
+ */
+export function linearKSplits(rows, outer, rowTile = ROW_TILE, cap = 8, target = 1024) {
+  const groups = linearGrid(rows, outer, rowTile).reduce((a, b) => a * b, 1);
+  let splits = 1;
+  while (splits < cap && groups * splits < target) splits *= 2;
+  return splits;
+}
+
+/**
+ * Sums createLinearShader's kSplits partials into the output, plus the residual when it has one.
+ * One lane a vec4; dispatch elementwise over rows * outer / 4 lanes.
+ */
+export function createSplitReduceShader({ rows, outer, splits }, withResidual) {
+  const vectors = rows * (outer / 4);
+  const terms = Array.from({ length: splits }, (_, z) => `partials[${z * vectors}u + slot]`).join(" + ");
+  return `
+@group(0) @binding(0) var<storage, read> partials: array<vec4<f32>>;
+${withResidual ? "@group(0) @binding(1) var<storage, read> residual: array<vec4<f32>>;" : ""}
+@group(0) @binding(${withResidual ? 2 : 1}) var<storage, read_write> output: array<vec4<f32>>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * ${GRID_WIDTH * LANES}u;
+  if (slot >= ${vectors}u) { return; }
+  output[slot] = ${withResidual ? "residual[slot] + " : ""}${terms};
 }`;
 }
 

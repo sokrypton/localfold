@@ -392,7 +392,12 @@ export const DEFAULT_TUNING = Object.freeze({
   // src/af3/trunk/grid-attention-matrix.js.
   gridAttendMatrix: null,
   esmfold2TokenRowTile: null,
+  // ESMFold2's token projections split over K; null derives it from the workgroup count (see
+  // tokenKSplits in src/esmfold2/diffusion-webgpu.js), 1 is the unsplit kernel.
+  esmfold2TokenKSplits: null,
   esmcRowTile: null,
+  // ESM-C's per-block projections split over K; null derives it (linearKSplits in src/esmc/block-webgpu.js).
+  esmcKSplits: null,
   // 🔴 TIERED ON EVERY DEVICE, because a first fold is mostly driver compile on
   // every NVIDIA part measured and most visitors fold once. Colab, driver cache
   // cleared, AF3 68 residues first fold / AF2 whole run, seconds: T4 14 -> 8.6

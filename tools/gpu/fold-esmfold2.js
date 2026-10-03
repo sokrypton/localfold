@@ -47,6 +47,7 @@ import {
 import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
 
 import { profileBuffers } from "./buffer-profile.js";
+import { profileDevice } from "./profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -452,7 +453,10 @@ export async function main(device, args = []) {
   }
 
   const repeats = [];
+  // --profile times every labelled pass of the LAST repeat (a warm fold), one pass a dispatch.
+  const profile = args.includes("--profile") ? profileDevice(device) : null;
   for (let again = 1; again < repeat; again += 1) {
+    if (profile !== null && again === repeat - 1) profile.reset();
     const started = performance.now();
     const other = await foldEsmfold2(device, {
       sequence, allocator, seed, sampler,
@@ -992,6 +996,8 @@ export async function main(device, args = []) {
         }),
       };
     })(),
+    ...(profile === null ? {} : { profile: { dropped: profile.dropped(),
+      rows: (await profile.report()).sort((x, y) => y.ms - x.ms).slice(0, 30) } }),
     sequence, sampler, seed, trunkPrecision, trunkWeights, repeats,
     contactSweep: sweep, certaintyByChain,
     lmMask: result.lmMask,

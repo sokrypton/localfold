@@ -36,7 +36,8 @@ import {
 } from "../weights/quantised-upload.js";
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
-  createLinearShader, createPrepareShader, createSwigluShader, linearGrid,
+  createLinearShader, createPrepareShader, createSwigluShader, linearGrid, linearKSplits,
+  createSplitReduceShader,
   ROW_TILE, swigluGrid, QUERY_TILE,
 } from "./block-webgpu.js";
 
@@ -281,6 +282,21 @@ export class EsmcTowerGpu {
     // shared eight - a smaller tile re-reads the weights per row tile, which a
     // T4 pays for. Each output sums k in order at any tile. See device-profile.js.
     const rowTile = deviceTuning(this.device).esmcRowTile ?? ROW_TILE;
+    // 🔴 AND K SPLITS WHERE THE ROWS ARE FEW - see linearKSplits. A short sequence's projections are a
+    // few dozen workgroups each walking all of K; `esmcKSplits` forces a count (1 is the unsplit kernel).
+    const forcedSplits = deviceTuning(this.device).esmcKSplits;
+    const splitsFor = (outer) => forcedSplits ?? linearKSplits(rows, outer, rowTile);
+    const qkvSplits = splitsFor(3 * model), modelSplits = splitsFor(model);
+    const splitLinear = (inner, outer, splits) => (splits === 1 ? null
+      : pipeline(`esmc-linear:${rows}:${inner}:${outer}:0:${weightPrecision}:rt${rowTile}:ks${splits}`,
+        createLinearShader({ rows, inner, outer }, false, weightPrecision, false, rowTile, 4, splits)));
+    const splitReduce = (outer, splits, residual) => (splits === 1 ? null
+      : pipeline(`esmc-reduce:${rows}:${outer}:${splits}:${residual}`,
+        createSplitReduceShader({ rows, outer, splits }, residual)));
+    const [qkvSplit, outSplit, downSplit, qkvReduce, modelReduce] = await Promise.all([
+      splitLinear(model, 3 * model, qkvSplits), splitLinear(model, model, modelSplits),
+      splitLinear(ffn, model, modelSplits), splitReduce(3 * model, qkvSplits, false),
+      splitReduce(model, modelSplits, true)]);
     const [normPipeline, qkvPipeline, preparePipeline, attentionPipeline,
       outPipeline, swigluPipeline, downPipeline, mixPipeline,
       finalNormPipeline, singlePipeline] = await Promise.all([
@@ -359,6 +375,21 @@ export class EsmcTowerGpu {
         pass.setBindGroup(0, bind(built, bindings));
         const [x, y] = linearGrid(rows, outer, rowTile);
         pass.dispatchWorkgroups(x, y);
+      };
+      // ...and split over K into `partials`, then summed (with the residual, when the unsplit pass
+      // takes one) into the output: [input, weights, output] or [input, weights, residual, output].
+      const partials = qkvSplits > 1 || modelSplits > 1
+        ? keepPersistent(this.allocator.allocate("esmc.partials",
+          Math.max(qkvSplits * 3 * model, modelSplits * model) * rows * 4, storage))
+        : null;
+      const dispatchProjection = (pass, unsplit, split, reduce, splits, bindings, outer) => {
+        if (splits === 1) return dispatchLinear(pass, unsplit, bindings, outer);
+        const [input, weights] = bindings;
+        pass.setPipeline(split);
+        pass.setBindGroup(0, bind(split, [input, weights, partials]));
+        const [x, y] = linearGrid(rows, outer, rowTile);
+        pass.dispatchWorkgroups(x, y, splits);
+        dispatchInto(pass, reduce, [partials, ...bindings.slice(2)], Math.ceil(rows * outer / 4 / LANES));
       };
 
       const readBack = async (allocation, elements, label) => {
@@ -606,14 +637,16 @@ export class EsmcTowerGpu {
         const encoder = this.device.createCommandEncoder({ label: `esmc-block-${layer}` });
         const pass = encoder.beginComputePass({ label: `esmc-block-${layer}` });
         dispatchInto(pass, normPipeline, [current, attnScale, attnOffset, normed], rows);
-        dispatchLinear(pass, qkvPipeline, [normed, qkvWeights, qkv], 3 * model);
+        dispatchProjection(pass, qkvPipeline, qkvSplit, qkvReduce, qkvSplits,
+          [normed, qkvWeights, qkv], 3 * model);
         dispatchInto(pass, preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
         pass.setPipeline(attentionPipeline);
         pass.setBindGroup(0, bind(attentionPipeline, sequenceId === undefined
           ? [query, key, value, context]
           : [query, key, value, context, sequenceBuffer]));
         pass.dispatchWorkgroups(Math.ceil(rows / QUERY_TILE), heads);
-        dispatchLinear(pass, outPipeline, [context, attnOut, current, afterAttention], model);
+        dispatchProjection(pass, outPipeline, outSplit, modelReduce, modelSplits,
+          [context, attnOut, current, afterAttention], model);
         dispatchInto(pass, normPipeline,
           [afterAttention, ffnScale, ffnOffset, ffnNormed], rows);
         pass.setPipeline(swigluPipeline);
@@ -622,7 +655,8 @@ export class EsmcTowerGpu {
           const [gx, gy] = swigluGrid(rows, ffn);
           pass.dispatchWorkgroups(gx, gy);
         }
-        dispatchLinear(pass, downPipeline, [gated, fc2, afterAttention, next], model);
+        dispatchProjection(pass, downPipeline, downSplit, modelReduce, modelSplits,
+          [gated, fc2, afterAttention, next], model);
         // 🔴 THE LAST STATE IS FINAL-NORMED AND THE OTHER 36 ARE NOT, so the
         // mix reads `next` directly here and a normed copy on the last layer.
         if (layer + 1 < layers) {
@@ -632,9 +666,10 @@ export class EsmcTowerGpu {
         pass.end();
         this.device.queue.submit([encoder.finish()]);
 
-        // A buffer still queued cannot be released, which is why the tower
-        // submits per block rather than once.
-        await this.device.queue.onSubmittedWorkDone();
+        // 🔴 RELEASED ONCE SUBMITTED, NOT ONCE FINISHED. WebGPU lets a buffer be destroyed after the
+        // command buffer naming it is SUBMITTED - the work completes and the memory goes after it;
+        // destroying one before its submit is what fails. This awaited onSubmittedWorkDone a block, 36
+        // host-device round trips a fold, for a release that did not need it.
         for (let index = perBlock.length - 1; index >= 0; index -= 1) perBlock[index].release();
 
         if (capture.has(layer + 1) && layer + 1 < layers) {
