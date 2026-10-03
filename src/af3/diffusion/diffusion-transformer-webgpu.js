@@ -4,6 +4,7 @@ import { packNamedWeights } from "../../weights/weight-pack.js";
 import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
 import { residentPackedOnDevice } from "../weights/device-weights.js";
 import { SOURCES } from "../weights/weights.js";
+import { createAttentionRegisterFlashShader } from "../../kernels/attention.js";
 /**
  * AF3's diffusion token transformer: 24 blocks, AdaLN-conditioned, pair-biased.
  *
@@ -2570,6 +2571,15 @@ export class Af3DiffusionTransformerGpu {
                     // `txBlockOrder`.
                     upGate: txHasUpGate(weights.superBlocks?.[0]?.blocks?.[0]) };
     const sources = createDiffusionTransformerShaders(shape, sampleOffsets);
+    // 🔴 THE TOKEN ATTENTION ON THE SHARED FLASH KERNEL (AF2's register flash, src/kernels/attention.js):
+    // a key chunk staged once for 64 queries, where `attend` gives every (query, head) its own workgroup and
+    // re-reads all T keys and values for it - 10 GB a call at 262 tokens. The score scaled as `attend`
+    // scales it, the gate left to attention-output, one mask for every sample. Measured on the A100, 24
+    // blocks a call: 68 tokens 1.13 -> 1.36 ms (ceil(T/64) x heads workgroups starve the card), 100
+    // 1.79/1.80, 128 2.59 -> 2.06, 262 7.70 -> 4.54, 600 33.6 -> 10.4. So by default from 100 tokens up;
+    // the knob forces either arm.
+    const flashTuning = weights.flashAttend ?? deviceTuning(this.device).diffusionFlashAttend;
+    const flashAttend = (flashTuning ?? tokens > 100) !== false && dimension % 4 === 0;
     // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
     // sources as a workgroup size, so a cache that ignored it would hand a
     // later run the pipeline compiled for a different width.
@@ -2586,7 +2596,7 @@ export class Af3DiffusionTransformerGpu {
       // ...and rosettafold3's two: the block wiring adds a kernel and the q/k
       // LayerNorm adds a kernel AND four `const W_*` to every other source in
       // this stack, because the offsets shift behind it.
-      + `:nr${shape.noResidual}:kq${shape.kqNorm}`;
+      + `:nr${shape.noResidual}:kq${shape.kqNorm}:fa${flashAttend}`;
     // 🔴 AWAITED TOGETHER, NOT ONE AT A TIME. `createComputePipelineAsync`
     // compiles off the main thread, so a loop that awaits each one in turn
     // serialises eleven compilations that could overlap - and this stack's
@@ -2608,6 +2618,11 @@ export class Af3DiffusionTransformerGpu {
       pending.push(this.pipelines.get(
         `${base}:pair-logits:${at}`, sources.pairLogitsFor(at, perSuper))
         .then((pipeline) => { compiled.pairLogits[at] = pipeline; }));
+    }
+    if (flashAttend) {
+      pending.push(this.pipelines.get(`${base}:flash-attend`, createAttentionRegisterFlashShader(dimension, undefined,
+        { scale: 1 / Math.sqrt(dimension), gate: false, sharedMask: true }))
+        .then((pipeline) => { compiled.flashAttend = pipeline; }));
     }
     await Promise.all(pending);
     return { channels, condChannels, pairChannels, heads, dimension, perSuper,
@@ -2675,6 +2690,13 @@ export class Af3DiffusionTransformerGpu {
       const maskBuffer = scratch("difftx.mask", tokens * 4,
         storage | GPUBufferUsage.COPY_DST);
       write(maskBuffer, mask);
+      // the flash attention's parameters (src/kernels/attention.js's Parameters: batch = the samples, the
+      // queries, the width, heads, head_dim, transpose, has_pair_bias)
+      const flashParams = compiled.flashAttend === undefined ? null
+        : scratch("difftx.flash-params", 64, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+      if (flashParams !== null) {
+        write(flashParams, new Uint32Array([samples, tokens, width, heads, dimension, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+      }
       // See #pairNorm: everything on this line and the two below it is the
       // trunk's, not the step's, and is skipped outright when the caller keeps
       // this instance across a schedule.
@@ -3136,8 +3158,13 @@ export class Af3DiffusionTransformerGpu {
                 Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
           }
           const slots = rows * heads;
-          runBlock("attend", compiled.attend, [q, k, v, logits, maskBuffer, gathered],
-              Math.min(slots, GRID_WIDTH), Math.ceil(slots / GRID_WIDTH));
+          if (flashParams !== null) {
+            runBlock("attend", compiled.flashAttend, [q, k, v, maskBuffer, logits, flashParams, gathered],
+                Math.ceil(tokens / 64), samples, heads);
+          } else {
+            runBlock("attend", compiled.attend, [q, k, v, logits, maskBuffer, gathered],
+                Math.min(slots, GRID_WIDTH), Math.ceil(slots / GRID_WIDTH));
+          }
           if (attnKSplits > 1) {
             runBlock("attention-output", compiled.attentionOutput,
                 [gathered, gate, blockWeights, attnPartials],

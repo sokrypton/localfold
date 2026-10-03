@@ -962,6 +962,30 @@ fn store4(v: vec4<f32>) -> vec2<u32> {
   const vectorScore = options.vectorScore ?? false;
   const lazyRescale = options.lazyRescale ?? false;
   const queriesPerLane = options.queriesPerLane ?? 1;
+  // 🔴 THREE CONTRACTS OTHER CALLERS HAVE, EACH OFF BY DEFAULT SO AF2'S SHADERS ARE BYTE-IDENTICAL. AF3's
+  // denoiser (src/af3/diffusion/diffusion-transformer-webgpu.js) scales the SCORE rather than the query
+  // (`scale`), applies its sigmoid gate in the output projection that follows (`gate: false` - no gate
+  // binding, the attention written as it is), and keeps ONE key mask for every sample in its batch
+  // (`sharedMask`). Its own kernel gave a workgroup to each (query, head) and re-read every key and value
+  // for it; this one stages a key chunk once for 64 queries, which is the whole difference.
+  const scale = options.scale ?? null;
+  const gated = options.gate ?? true;
+  const sharedMask = options.sharedMask ?? false;
+  if (queriesPerLane > 1 && (scale !== null || !gated || sharedMask)) {
+    throw new RangeError("the multi-query attention form takes none of scale, gate: false or sharedMask");
+  }
+  const scaled = (expression) => (scale === null ? expression : `(${expression}) * ${Number(scale).toPrecision(9)}`);
+  const bindingLines = [["query", `array<${packIn ? "vec2<u32>" : "vec4<f32>"}>`, "read"],
+    ["key", `array<${packIn ? "vec2<u32>" : "vec4<f32>"}>`, "read"],
+    ["value", `array<${(options.valueStorage ?? options.inputStorage) === "f16" ? "vec2<u32>" : "vec4<f32>"}>`, "read"],
+    ...(gated ? [["gate", `array<${packIn ? "vec2<u32>" : "vec4<f32>"}>`, "read"]] : []),
+    ["mask", "array<f32>", "read"], ["pair_bias", "array<f32>", "read"], ["p", "Parameters", "uniform"],
+    ["output", `array<${options.outputStorage === "f16" ? "vec2<u32>" : "vec4<f32>"}>`, "read_write"]]
+    .map(([name, type, access], binding) => (access === "uniform"
+      ? `@group(0) @binding(${binding}) var<uniform> ${name}: ${type};`
+      : `@group(0) @binding(${binding}) var<storage, ${access}> ${name}: ${type};`)).join("\n");
+  const maskIndexBody = sharedMask ? `  return key_index;` : `  if (p.transpose == 0u) { return batch * p.queries + key_index; }
+  return key_index * p.batch + batch;`;
   // 🔴 THE REGISTER FILE IS WHAT THIS KERNEL IS SHORT OF, WHICH IS THE OPPOSITE
   // OF WHAT ITS FLOP RATE SUGGESTS. Eight query vectors and eight accumulators
   // are 64 registers a lane before anything else; two queries a lane doubles
@@ -1062,7 +1086,7 @@ fn store4(v: vec4<f32>) -> vec2<u32> {
     `      if (k_index >= p.queries) { break; }`,
     `      let staged = slot * HD4;`,
     scoreOf("", "staged"),
-    `      var logit = score + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);`,
+    `      var logit = ${scaled("score")} + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);`,
     `      if (p.has_pair_bias != 0u) {`,
     `        logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];`,
     `      }`,
@@ -1200,7 +1224,7 @@ ${Array.from({ length: vectors }, (_, t) =>
       `      let live${g} = key_at${g} < p.queries;`,
       `      let staged${g} = (slot + ${g}u) * HD4;`,
       scoreOf(g, `staged${g}`),
-      `      var logit${g} = score${g} + 1e9 * (mask[mask_index(batch_index, min(key_at${g}, p.queries - 1u))] - 1.0);`,
+      `      var logit${g} = ${scaled(`score${g}`)} + 1e9 * (mask[mask_index(batch_index, min(key_at${g}, p.queries - 1u))] - 1.0);`,
       `      if (p.has_pair_bias != 0u) {`,
       `        logit${g} += pair_bias[(head * p.queries + q_index) * p.queries + min(key_at${g}, p.queries - 1u)];`,
       `      }`,
@@ -1219,22 +1243,14 @@ ${Array.from({ length: vectors }, (_, t) =>
   return `${enable}${COMMON}
 const HD4: u32 = ${vectors}u;
 const KEY_CHUNK: u32 = ${chunk}u;
-@group(0) @binding(0) var<storage, read> query: array<${vec4In}>;
-@group(0) @binding(1) var<storage, read> key: array<${vec4In}>;
-@group(0) @binding(2) var<storage, read> value: array<${vec4Value}>;
-@group(0) @binding(3) var<storage, read> gate: array<${vec4In}>;
-@group(0) @binding(4) var<storage, read> mask: array<f32>;
-@group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
-@group(0) @binding(6) var<uniform> p: Parameters;
-@group(0) @binding(7) var<storage, read_write> output: array<${vec4Out}>;
+${bindingLines}
 
 var<workgroup> key_chunk: array<${chunkType}, ${chunk * vectors}>;
 var<workgroup> value_chunk: array<${chunkType}, ${chunk * vectors}>;
 
 ${helpers}
 fn mask_index(batch: u32, key_index: u32) -> u32 {
-  if (p.transpose == 0u) { return batch * p.queries + key_index; }
-  return key_index * p.batch + batch;
+${maskIndexBody}
 }
 
 @compute @workgroup_size(64)
@@ -1273,7 +1289,7 @@ ${inner}
 
   if (live) {
 ${each((t) => write4("output", `q_base + ${t}u`,
-  `(vec4<f32>(acc${t}) / running_sum) * ${read4("gate", `q_base + ${t}u`)}`))}
+  gated ? `(vec4<f32>(acc${t}) / running_sum) * ${read4("gate", `q_base + ${t}u`)}` : `vec4<f32>(acc${t}) / running_sum`))}
   }
 }`;
 }

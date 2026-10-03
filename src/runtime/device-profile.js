@@ -283,6 +283,10 @@ export const DEFAULT_TUNING = Object.freeze({
   pairformerSubmissionWindow: null,
   // 🔴 STAGE THE ATTENTION'S KEYS COALESCED. See the note in the kernel.
   diffusionAttendStageKeys: null,
+  // 🔴 THE DENOISER'S TOKEN ATTENTION ON THE SHARED FLASH KERNEL (src/kernels/attention.js, AF2's): its own
+  // gave a workgroup to each (query, head) and re-read every key and value for it. null takes it above 100
+  // tokens, where it wins on the A100; true and false force either arm.
+  diffusionFlashAttend: null,
   // 🔴 HOW MANY WORKGROUPS THE SINGLE PROJECTION AIMS AT. See
   // singleProjectSplits: 110 and a candidate list stopping at 3 are an M2's
   // answer, and the constant is written into the rule rather than measured per
