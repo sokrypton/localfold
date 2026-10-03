@@ -433,6 +433,8 @@ inline size_t compactWeights(int seg, const std::function<bool(const std::string
 // every weight derived from the device copies forgotten - f16 mirrors and copies, weights built on the
 // device - after a warm-up that ran while a copy was still arriving (M.uploadAsync): they are rebuilt
 // from the finished copy on their next use. A port's own caches of derived weights register here.
+// (Not for native/af3 as it stands: TCACHE folds its conditioning weights once per process and keeps
+// the names, and OpenDDE's structural.cuh registers VIEWS into a file's copy, which this would free.)
 inline std::vector<std::function<void()>> FORGET_HOOKS;
 inline void forgetDerivedWeights() {
   CK(cudaDeviceSynchronize());
@@ -492,10 +494,43 @@ void linear(const T* X, TY* Y, size_t rows, int in, int out, const std::string& 
     fprintf(stderr, "%s has %zu elements, not %d x %d\n", w.c_str(), lenW(w), in, out); exit(1);
   }
   bool tf32 = std::is_same_v<T, float> && F32_TF32;
+  // LOCALFOLD_GEMM_TIMES: every call timed by events, summed by weight and shape, printed at exit (an
+  // analysis aid; not under graph capture)
+  static bool timing = getenv("LOCALFOLD_GEMM_TIMES") != nullptr;
+  struct Timed { std::string key; double flop; cudaEvent_t a, b; };
+  static std::vector<Timed>* timed = nullptr;
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  if (timing) cudaStreamIsCapturing(STREAM, &cap);
+  bool timeThis = timing && cap == cudaStreamCaptureStatusNone;
+  cudaEvent_t ea = nullptr, eb = nullptr;
+  if (timeThis) {
+    if (!timed) {
+      timed = new std::vector<Timed>;
+      atexit([] {
+        std::map<std::string, std::tuple<double, double, int>> sum;
+        for (auto& t : *timed) { float ms; cudaEventElapsedTime(&ms, t.a, t.b); auto& v = sum[t.key]; std::get<0>(v) += ms; std::get<1>(v) += t.flop; std::get<2>(v)++; }
+        std::vector<std::pair<double, std::string>> order;
+        for (auto& [k, v] : sum) order.push_back({std::get<0>(v), k});
+        std::sort(order.rbegin(), order.rend());
+        for (size_t i = 0; i < order.size() && i < 30; ++i) {
+          auto& v = sum[order[i].second];
+          printf("  %9.2f ms %6d x  %-60s %6.1f TFLOP/s\n", std::get<0>(v), std::get<2>(v), order[i].second.c_str(),
+                 std::get<1>(v) / (std::get<0>(v) * 1e-3) / 1e12);
+        }
+      });
+    }
+    cudaEventCreate(&ea); cudaEventCreate(&eb); cudaEventRecord(ea, STREAM);
+  }
   CB(cublasGemmEx(H, transposed ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one,
                   Wp, cudaType<T>(), transposed ? in : out, X, cudaType<T>(), in, &beta,
                   Y, cudaType<TY>(), out, tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F,
                   std::is_same_v<T, float> && !tf32 ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  if (timeThis) {
+    cudaEventRecord(eb, STREAM);
+    std::string k = w; for (char& ch : k) if (isdigit((unsigned char)ch)) ch = 'N';
+    char shape[80]; snprintf(shape, sizeof shape, " %zux%dx%d%s", rows, in, out, std::is_same_v<TY, float> ? " f32out" : "");
+    timed->push_back({k + shape, 2.0 * rows * in * out, ea, eb});
+  }
 }
 
 // ---------------------------------------------------------------- checking and timing
