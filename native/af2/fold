@@ -47,11 +47,12 @@ seq="${seq//:/}"
 depth=1; [ -z "$a3m" ] || depth=$(grep -c '^>' "$a3m")
 for a in "${inputs[@]}"; do [ "$a" != "--search" ] || depth=$(( maxmsa + maxextra )); done   # (a search is usually deep)
 n=$(( depth < maxmsa ? depth : maxmsa )); e=$(( depth - n )); e=$(( e > maxextra ? maxextra : e )); e=$(( e < 1 ? 1 : e ))
-exec 3< <("$here/af2" "$tmp" --weights="$weights" --fast --out="$out" --wait-input --warm="${#seq},$n,$e,$templates" \
+exec 3< <("$here/af2" "$tmp" --weights="$weights" --fast --out="$out" --wait-input --detach-output --warm="${#seq},$n,$e,$templates" \
           "${flags[@]}" && rc=0 || rc=$?; echo "af2: exit $rc")
 if ! node "$here/export_input.mjs" "$tmp" --weights="$weights" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
+# "af2: done" (its stdout then closes): the fold is written and af2 is only releasing the device
 while IFS= read -r line <&3; do
-  case "$line" in "af2: exit "*) status="${line#af2: exit }" ;; *) printf '%s\n' "$line" ;; esac
+  case "$line" in "af2: done") break ;; "af2: exit "*) status="${line#af2: exit }" ;; *) printf '%s\n' "$line" ;; esac
 done
 exit "$status"

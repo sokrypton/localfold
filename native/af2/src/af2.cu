@@ -292,6 +292,9 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   return 0;
 }
 
+// --detach-output: on success the last line is "af2: done" and stdout closes, so a caller reading it to
+// its end returns while the driver releases this process's device (0.16 s of exit; native/af2/fold does)
+static bool DETACH = false;
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
   std::string weights, oracle, out = "fold.pdb", warmShape; int recycles = -1; bool profile = false, waitInput = false;
@@ -303,6 +306,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
+    else if (!strcmp(argv[i], "--detach-output")) DETACH = true;
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;   // L,N,E,T: warm up at those shapes meanwhile
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
@@ -335,5 +339,7 @@ int main(int argc, char** argv) {
   }
   M.load(argv[1]);
   if (!oracle.empty()) M.load(oracle);
-  return foldInput(oracle, out, recycles, profile, false, t0);
+  int rc = foldInput(oracle, out, recycles, profile, false, t0);
+  if (DETACH && rc == 0) { printf("af2: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
+  finish(rc);
 }

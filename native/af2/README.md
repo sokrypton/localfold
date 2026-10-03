@@ -93,7 +93,10 @@ On the A100, 5CAJ (261 residues, 512 + 1024 rows):
 | native `--fast` | **444 ms** | **2.02 s** |
 | af3-any-model JAX AF2 (bf16) | 637 ms | 2.55 s |
 
-6MRR from its sequence: 1.2 s of wall clock a command, 324 ms of it the fold.
+`fold`, sequence to PDB in a cold process: 6MRR **0.59 s** (110 ms of it the fold), and 5CAJ with
+its 7907-row alignment 2.47 s. On success `af2 --detach-output` prints `af2: done` and closes stdout,
+so `fold` returns while the driver releases the device (0.16 s). Weights are read with `pread`
+rather than mapped (native/af3's loader).
 
 ## Memory
 
