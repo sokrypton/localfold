@@ -319,6 +319,12 @@ inline void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, fl
 }
 inline void transition(float* x, size_t rows, int C, const std::string& T, int blk) {
   int I = (int)dimW(T + "/transition1/weights", blk < 0 ? 1 : 2);     // 4C in the stacks, 2C in the template's
+  // at 128 channels (the pair stacks) native/af3's fused transition, its ReLU-with-bias form: the LayerNorm'd
+  // rows and the widened ones never written
+  if (FAST && fusedTransitionRaw<true>(x, rows, C, I, P(T + "/input_layer_norm/scale", blk), P(T + "/input_layer_norm/offset", blk),
+                                       PH(T + "/transition1/weights", blk), PH(T + "/transition2/weights", blk),
+                                       P(T + "/transition1/bias", blk), P(T + "/transition2/bias", blk)))
+    return;
   if (FAST) {
     // in row chunks of ~128 MB of the widened rows (the whole widened tensor was 1.26 GB of a pair track
     // at 783 residues; a chunk of 2^15+ rows keeps the GEMMs as fast)

@@ -2,7 +2,7 @@
 // the ReLU and the residual add in cuBLASLt's epilogue, and weights re-laid once for them.
 #pragma once
 #include "ops.cuh"
-#include "../../af3/src/fusedtriangle.cuh"
+#include "../../af3/src/fusedtransition.cuh"     // (and fusedtriangle.cuh)
 
 // ---------------------------------------------------------------- cuBLASLt, row-major
 // Y[rows, out] (f32 or f16) = X[rows, in] (f16) W[in, out] (f16) (+ bias[out] f32) (ReLU) (+ beta Y)

@@ -189,3 +189,8 @@ halves one after the other: `interleaveTriK`). a and b in f16 and the product in
 them. 262 tokens with 512 alignment rows: 1.80 -> 1.71 s on an A100; every `test:native` AF2 case at its
 previous RMSD. The template stack's 64-channel triangle keeps the unfused path.
 
+...and the pair stacks' transition (128 channels) on native/af3's fused transition, in a ReLU-with-bias form
+that kernel gained (`fusedTransitionK<..., RELU>`; AF3's SwiGLU instantiation unchanged): the LayerNorm'd
+and the 512-wide rows never written. 1% on an A100 (1.71 -> 1.69 s at 262 tokens and 512 rows), where the
+GEMMs bind; the bytes it saves are what a T4's or an L4's transition is made of.
+
