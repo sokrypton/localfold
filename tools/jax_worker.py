@@ -419,6 +419,8 @@ class Worker:
             config.heads.diffusion.eval.stepwise = True
             # LocalFold's Flow, which sokrypton/alphafold3's sampler carries too.
             config.heads.diffusion.eval.flow = settings["flow"]
+            if settings["sigma_max"] and not settings["flow"]:
+                config.heads.diffusion.eval.sigma_max = settings["sigma_max"]
             if model == "alphafold3":
                 directory = "af3_native_weights"
                 if not glob.glob(f"{directory}/*.bin.zst"):
@@ -487,10 +489,12 @@ class Worker:
             raise Refused("ESMFold2 takes no template")
         depth = str(controls.get("max-msa") or "512:1024").split(":")[0]
         settings = {"recycles": int(controls.get("recycles") or 0),
-                    "steps": int(controls.get("af3-count") or 0),
+                    "steps": int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0),
                     "msa": int(depth) if depth.isdigit() else 512,
                     "af2_model": int(controls.get("af2Model") or 1),
                     "flow": sampler == "flow",
+                    # the page's short schedule (web/af3-model.js diffusionScheduleFor), resolved there
+                    "sigma_max": float((job.get("schedule") or {}).get("sigmaMax") or 0),
                     "templates": bool(templated)}
         # All five multimer models carry the multimer template embedder; only
         # the monomer's 3, 4 and 5 are template-free.

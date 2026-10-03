@@ -2918,6 +2918,52 @@ const cheapHash = (text) => {
 };
 
 /**
+ * The sampler a fold of `family` runs: its mode, its step count and its
+ * schedule, resolved from the controls once - for this page's own fold AND for
+ * one handed to a runtime, which would otherwise fall back to the model's own
+ * defaults (200 steps from AF3's start) where this page folds 20 from 80.
+ */
+function samplerPlan(family, ligandCodes, modifications) {
+  // 🔴 FORCED IN CODE, NOT ONLY HIDDEN. Hiding a control does not change its
+  // value: the shared `#af3-mode` select still reads "flow" behind a hidden
+  // row, which is the trap docs/EF2FAST.md records for that model an hour
+  // after hiding its own.
+  // 🔴 FORCED FOR rosettafold3 TOO, and for a worse reason than OpenDDE's - see
+  // `samplerModeFor`. Hiding the row does not change the select's value, which
+  // is the trap the comment above records.
+  const mode = samplerModeFor(family,
+    document.getElementById("af3-mode")?.value ?? "diffusion");
+  const counts = countsForFamily(family);
+  // 🔴 THE SAME FALLBACK AS `syncAf3Count`, AND IT WAS MISSING HERE. That
+  // function reads `table[mode] ?? table.flow ?? table.diffusion`; this one
+  // subscripted the table and took `.preferred` off whatever came back, so a
+  // mode with no row - a stale select value, a removed option, a family whose
+  // table is narrower than AF3's - threw "cannot read properties of undefined"
+  // in the middle of starting a fold rather than falling back. Two readings of
+  // one table, one of them guarded, is this file's own stale-allow-list trap.
+  // `test/sampler-options.test.js` gates the two lists against each other.
+  const row = counts[mode] ?? counts.diffusion ?? counts.flow;
+  const asked = Number(document.getElementById("af3-count")?.value)
+    || row.preferred;
+  // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
+  // insurance rather than policy - a stale stored value or a hand-edited option
+  // is the only way below it now. AF3_COUNTS carries the measurements and the
+  // reason; the short version is that a modified residue's atoms are each their
+  // own token and eight steps leaves them compressed (0.835 against a control
+  // of 1.003) while sixteen does not (0.974).
+  const calls = Math.max(asked, modifications.length > 0 ? 16 : 0);
+  return {
+    mode, asked, calls,
+    // AlphaFold 3's short schedule below its own twenty-five steps; see
+    // ALPHAFOLD3_COUNTS in web/af3-model.js.
+    // ...and lower where the job carries a ligand or a modified residue,
+    // which the low-noise calls settle; see SHORT_SCHEDULES.
+    schedule: diffusionScheduleFor(family, mode, calls,
+      { hasLigand: ligandCodes.length > 0 || modifications.length > 0 }),
+  };
+}
+
+/**
  * One AlphaFold 3 fold, drawn into py2Dmol as it computes.
  *
  * 🔴 THE PANELS ARE BUILT ON THE FIRST FRAME AND THE SCORES ARRIVE ON THE LAST.
@@ -2991,34 +3037,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     if (problem !== null) throw new Error(problem);
   }
 
-  // 🔴 FORCED IN CODE, NOT ONLY HIDDEN. Hiding a control does not change its
-  // value: the shared `#af3-mode` select still reads "flow" behind a hidden
-  // row, which is the trap docs/EF2FAST.md records for that model an hour
-  // after hiding its own.
-  // 🔴 FORCED FOR rosettafold3 TOO, and for a worse reason than OpenDDE's - see
-  // `samplerModeFor`. Hiding the row does not change the select's value, which
-  // is the trap the comment above records.
-  const mode = samplerModeFor(chosenFamily(),
-    document.getElementById("af3-mode")?.value ?? "diffusion");
-  const counts = countsForFamily(chosenFamily());
-  // 🔴 THE SAME FALLBACK AS `syncAf3Count`, AND IT WAS MISSING HERE. That
-  // function reads `table[mode] ?? table.flow ?? table.diffusion`; this one
-  // subscripted the table and took `.preferred` off whatever came back, so a
-  // mode with no row - a stale select value, a removed option, a family whose
-  // table is narrower than AF3's - threw "cannot read properties of undefined"
-  // in the middle of starting a fold rather than falling back. Two readings of
-  // one table, one of them guarded, is this file's own stale-allow-list trap.
-  // `test/sampler-options.test.js` gates the two lists against each other.
-  const row = counts[mode] ?? counts.diffusion ?? counts.flow;
-  const asked = Number(document.getElementById("af3-count")?.value)
-    || row.preferred;
-  // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
-  // insurance rather than policy - a stale stored value or a hand-edited option
-  // is the only way below it now. AF3_COUNTS carries the measurements and the
-  // reason; the short version is that a modified residue's atoms are each their
-  // own token and eight steps leaves them compressed (0.835 against a control
-  // of 1.003) while sixteen does not (0.974).
-  const calls = Math.max(asked, modifications.length > 0 ? 16 : 0);
+  const { mode, asked, calls, schedule } = samplerPlan(chosenFamily(), ligandCodes, modifications);
   const recycles = recycleCount();
   const { requested: maxMsaSequences } = maxMsaConfig();
   // 🔴 RECYCLES ARE NOT IN THE KEY, because more of them is a CONTINUATION
@@ -3168,12 +3187,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let viewerModified = [];
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
-    // AlphaFold 3's short schedule below its own twenty-five steps; see
-    // ALPHAFOLD3_COUNTS in web/af3-model.js.
-    // ...and lower where the job carries a ligand or a modified residue,
-    // which the low-noise calls settle; see SHORT_SCHEDULES.
-    schedule: diffusionScheduleFor(family, mode, calls,
-      { hasLigand: ligandCodes.length > 0 || modifications.length > 0 }),
+    schedule,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds,
     ...(msaColumnKinds === undefined ? {} : { msaColumnKinds }),
@@ -4096,6 +4110,10 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // this page's and not re-implemented in Python. See tools/jax_worker.py.
   if (remoteBackendChoice() === "jax" || remoteBackendChoice() === "native") {
     request.backend = remoteBackendChoice();
+    // ...and the sampler this page would fold with (samplerPlan): the steps as well as the start, because an
+    // empty dial is the family's preferred count here and would be the model's own default there
+    const { calls, schedule } = samplerPlan(family, ligandCodes ?? [], modifications ?? []);
+    request.schedule = { steps: calls, ...schedule };
     // ...and, for CUDA, whether it streams its intermediate results here (the badge's Live preview)
     if (request.backend === "native") request.frames = remoteLiveChoice();
     // ...the RESOLVED model, which is not the row's value where a second row

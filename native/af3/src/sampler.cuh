@@ -94,6 +94,11 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
 // AF3's own sigmaMin and rho, whatever the model's dialect), then the state REPLACED by each prediction:
 // no centring, no rotation, no injected noise
 inline bool SAMPLER_FLOW = false;
+// --sigma-max=X: where the diffusion schedule starts, in sigma_data units (AF3's own is 160) - the page's
+// short schedule (web/af3-model.js diffusionScheduleFor: 80 for a plain protein, 40 for a ligand job, on
+// the families its measurements favour), handed to a CUDA fold so it samples what the page samples. 0 is
+// the model's own. Flow keeps its own start.
+inline double SAMPLER_SIGMA_MAX = 0;
 // what a sampler step's prediction is handed to (FrameStreamer, below): the denoised positions on the device
 // and the step, called on the host between steps - it must not wait on the GPU
 inline std::function<void(const float*, int, int)> FRAME_HOOK;
@@ -133,6 +138,7 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     CK(cudaFree(dSeeds));
     return out;
   }
+  if (SAMPLER_SIGMA_MAX > 0) sigmaMax = SAMPLER_SIGMA_MAX;
   for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
   for (int k = 0; k < ns; ++k) {

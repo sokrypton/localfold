@@ -414,10 +414,13 @@ class Worker:
             export = [*NODE, os.path.join(NATIVE, "af3", "export-model.mjs"), inputs, "--no-weights",
                       f"--bundle={bundle}/manifest.json", f"--job={job_path}", f"--max-msa={requested}", *flags]
             run(export, "featurising", log, cwd=os.path.join(NATIVE, "af3"))
-            steps = int(controls.get("af3-count") or 0)
+            steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
             fold = [f"--out={out_pdb}"]                  # (flags for the resident server's job)
             if sampler == "flow":
                 fold.append("--flow")                    # (the page's Flow: native/af3/src/sampler.cuh)
+            elif (job.get("schedule") or {}).get("sigmaMax"):
+                # the page's short schedule, resolved there (diffusionScheduleFor), started where it starts
+                fold.append(f"--sigma-max={float(job['schedule']['sigmaMax'])}")
             if steps:
                 # ...the page's floor: a modified residue's atoms stay compressed below sixteen steps (app.js)
                 spec = json.loads(job["job"])

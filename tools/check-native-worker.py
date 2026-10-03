@@ -3,6 +3,7 @@
     python3 tools/check-native-worker.py             # every case (two go to api.colabfold.com)
     python3 tools/check-native-worker.py --offline   # without the search cases
     python3 tools/check-native-worker.py --no-page   # without the page arm (a headless Chrome, a broker)
+    python3 tools/check-native-worker.py --only=6mrr  # just the cases whose name contains it
 
 tools/native_worker.py over its own stdin protocol, one process for every case as the broker runs it,
 each job shaped as the page sends one (AlphaFold 3 JSON from the entity rows, the rows themselves, the
@@ -106,6 +107,11 @@ def cases(offline):
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
         ("esmfold2 300M 6mrr", {"family": "ef2-fast-300m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
+        # the page's short schedule (web/af3-model.js diffusionScheduleFor), which the page resolves and sends:
+        # an empty step dial is the family's preferred count there and the model's own 200 here
+        ("af3 6mrr, the page's short schedule", {"family": "af3", "controls": controls(**{"af3-count": ""}),
+         "schedule": {"steps": 20, "sigmaMax": 80}, "entities": [protein(S6)], "job": job([S6])},
+         (f"{FIX}/6mrr-crystal.pdb", "A"), 1.0, 68, None),
         ("af3 6mrr, the Flow sampler", {"family": "af3", "controls": controls(**{"af3-mode": "flow", "af3-count": "16"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.2, 68, None),
         ("refused: flow on rosettafold3", {"family": "rosettafold3",
@@ -265,6 +271,9 @@ def page_arm(bad):
 def main():
     offline = "--offline" in sys.argv
     plan = cases(offline)
+    only = next((a[7:] for a in sys.argv if a.startswith("--only=")), None)   # (a substring of the case names)
+    if only is not None:
+        plan = [case for case in plan if only in case[0]]
     worker = subprocess.Popen([sys.executable, os.path.join(REPO, "tools", "native_worker.py")], cwd=REPO,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open("/tmp/localfold-native-check.log", "w"),
                               text=True, bufsize=1)

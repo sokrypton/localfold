@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strcmp(argv[i], "--af3-defaults")) af3Defaults = true;
     else if (!strcmp(argv[i], "--flow")) SAMPLER_FLOW = true;     // the page's Flow sampler (sampler.cuh)
+    else if (!strncmp(argv[i], "--sigma-max=", 12)) SAMPLER_SIGMA_MAX = atof(argv[i] + 12);   // where diffusion starts
     else if (!strncmp(argv[i], "--frames=", 9)) framesDir = argv[i] + 9;   // each step's prediction, streamed (FrameStreamer)
     else if (!strcmp(argv[i], "--save-embeddings")) saveEmbeddings = true;
     else if (!strcmp(argv[i], "--save-distogram")) saveDistogram = true;
@@ -569,7 +570,7 @@ int main(int argc, char** argv) {
     // flag a line (--out, --samples, --steps, --recycles, --seed); its output goes to <id>.log and
     // its exit status to <id>.done. A job reading "quit" stops the server.
     const int steps0 = steps, recycles0 = recycles, samples0 = samples, folds0 = folds;
-    const bool flow0 = SAMPLER_FLOW;
+    const bool flow0 = SAMPLER_FLOW; const double sigmaMax0 = SAMPLER_SIGMA_MAX;
     printf("af3: serving %s\n", serveDir.c_str()); fflush(stdout);
     for (;;) {
       std::string id;
@@ -589,7 +590,7 @@ int main(int argc, char** argv) {
       std::vector<std::string> flags; while (std::getline(job, line)) if (!line.empty()) flags.push_back(line);
       job.close(); unlink((base + ".job").c_str());
       if (input == "quit") { printf("af3: stopped\n"); return 0; }
-      steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb"; SAMPLER_FLOW = flow0;
+      steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb"; SAMPLER_FLOW = flow0; SAMPLER_SIGMA_MAX = sigmaMax0;
       framesDir.clear();
       bool jobSeed = false; seed = seedArg; seedsArg = seedsArg0;
       for (auto& f : flags) {
@@ -597,6 +598,7 @@ int main(int argc, char** argv) {
         else if (!f.compare(0, 10, "--samples=")) samples = atoi(f.c_str() + 10);
         else if (!f.compare(0, 8, "--steps=")) steps = atoi(f.c_str() + 8);
         else if (f == "--flow") SAMPLER_FLOW = true;
+        else if (!f.compare(0, 12, "--sigma-max=")) SAMPLER_SIGMA_MAX = atof(f.c_str() + 12);
         else if (!f.compare(0, 9, "--frames=")) framesDir = f.substr(9);
         else if (!f.compare(0, 11, "--recycles=")) recycles = atoi(f.c_str() + 11);
         else if (!f.compare(0, 7, "--seed=")) { seed = strtoull(f.c_str() + 7, nullptr, 10); jobSeed = true; }
