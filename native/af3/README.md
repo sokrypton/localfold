@@ -358,6 +358,11 @@ it now lives here once:
 | the outer product mean's permute and residual | both ports | shared; AF3 takes AF2's 16-byte permute (9.9 -> 3.3 ms) |
 | eight element-wise kernels (`elementwise.cuh`) | a copy in each port | once |
 
+On a Colab L4, this round against the commit before it (684a04f), two interleaved rounds at 262 tokens: AF2
+with 512 alignment rows 6.76 / 7.11 -> 6.44 / 6.68 s (5-6%: the fused triangle and transition reach it
+there), ESMFold2's trunk 1067 / 1089 -> 1052 / 1074 ms and 4271 / 4351 -> 4206 / 4299 at 524, AF3 and
+protenix2 level within the card's ~3% drift.
+
 In every case the side that already ran the shared kernel is byte-identical. Measured and left as they are:
 AF3's LayerNorm against the vectorised `layerNormVK` (both ~1.2 TB/s, already bandwidth-bound, and AF3's
 uses AF3's own variance formula), and ESMFold2's float32 token attention against the f16 flash kernel (its
