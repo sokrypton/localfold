@@ -15,10 +15,10 @@ What this file adds is the plumbing between them - nothing about a molecule is d
 
 🔴 WHAT IT REFUSES, IT SAYS. A sampler, a model or an input a native port does not have is a refusal
 naming it (Refused), never a nearby setting run instead: Flow (native AF3 runs diffusion), AlphaFold 2's
-models 2-5 (the page publishes them as deltas, which the native loader does not read), ESMFold2 300M.
+models 2-5 (the page publishes them as deltas, which the native loader does not read).
 
 Ports: native/af3 (all seven AF3-lineage models), native/af2 (model_1_ptm, model_1_multimer_v3),
-native/ef2 (ESMFold2 600M). Each must be built (native/colab_setup.sh); a bundle not on disk is fetched.
+native/ef2 (ESMFold2, 600M and 300M). Each must be built (native/colab_setup.sh); a bundle not on disk is fetched.
 """
 import json
 import os
@@ -233,11 +233,11 @@ class Worker:
             port = "af3"
         elif family in ("monomer", "multimer"):
             port = "af2"
-        elif family == "ef2-fast-600m":
+        elif family in ("ef2-fast-600m", "ef2-fast-300m"):
             port = "ef2"
         else:
             raise Refused(f"the CUDA backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
-                          " model 1 and ESMFold2 600M)")
+                          " model 1 and ESMFold2)")
         sampler = controls.get("af3-mode", "diffusion")
         if port == "af3" and sampler != "diffusion":
             raise Refused(f"the CUDA backend's AF3 samples by diffusion only - set the sampler to Diffusion"
@@ -348,8 +348,9 @@ class Worker:
                     f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
         else:
             self.close_server()
-            trunk = ensure_bundle("ef2-fast-600m", "model-esmfold2-int5", log)
-            tower = ensure_bundle("esmc", "model-esmc-600m-int3", log)
+            small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)
+            trunk = ensure_bundle(family, "model-ef2-fast-300m-int5" if small else "model-esmfold2-int5", log)
+            tower = ensure_bundle("esmc-300m" if small else "esmc", "model-esmc-300m-int3" if small else "model-esmc-600m-int3", log)
             run([*NODE, os.path.join(NATIVE, "ef2", "export_input.mjs"), inputs, f"--job={job_path}"], "featurising", log)
             fold = [binary("ef2"), inputs, f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                     f"--seed={seed}", f"--out={out_pdb}"]

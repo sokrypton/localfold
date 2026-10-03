@@ -99,6 +99,8 @@ def cases(offline):
          "job": job([sa, sd])}, (f"{FIX}/1brs-crystal.pdb", "A,D"), 1.0, len(sa) + len(sd), None),
         ("esmfold2 6mrr", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
+        ("esmfold2 300M 6mrr", {"family": "ef2-fast-300m", "controls": controls(**{"model-family": "ef2"}),
+         "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         ("refused: flow", {"family": "af3", "controls": controls(**{"af3-mode": "flow"}), "entities": [protein(S6)],
          "job": job([S6])}, None, None, None, "Diffusion"),
         ("refused: AF2 model 3", {"family": "monomer-3", "controls": controls(**{"model-family": "monomer"}),
