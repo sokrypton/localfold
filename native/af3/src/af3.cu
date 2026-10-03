@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
   // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
   // 5 diffusion samples - where the command does not set them; the plain defaults are the page's
   bool af3Defaults = false, saveEmbeddings = false, saveDistogram = false;
-  uint64_t seed = 42; std::string out = "fold.pdb", weightsDir, bundleDir, mapFile, seedsArg;
+  uint64_t seed = 42; std::string out = "fold.pdb", weightsDir, bundleDir, mapFile, seedsArg, framesDir;
   bool waitInput = false;   // start up (CUDA, the weights on the device) while the input is still being exported
   std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
   for (int i = 2; i < argc; ++i) {
@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strcmp(argv[i], "--af3-defaults")) af3Defaults = true;
     else if (!strcmp(argv[i], "--flow")) SAMPLER_FLOW = true;     // the page's Flow sampler (sampler.cuh)
+    else if (!strncmp(argv[i], "--frames=", 9)) framesDir = argv[i] + 9;   // each step's prediction, streamed (FrameStreamer)
     else if (!strcmp(argv[i], "--save-embeddings")) saveEmbeddings = true;
     else if (!strcmp(argv[i], "--save-distogram")) saveDistogram = true;
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
@@ -375,6 +376,7 @@ int main(int argc, char** argv) {
     std::vector<std::pair<uint64_t, int>> runs;
     for (uint64_t s : seedList) for (int k = 0; k < samples; ++k) runs.push_back({ s, k });
     const size_t perBatch = std::max<size_t>(samples, 10);
+    FrameStreamer frames;
     for (size_t c0 = 0; c0 < runs.size(); c0 += perBatch) {
     const size_t cn = std::min(perBatch, runs.size() - c0);
     if (structural && c0 > 0) swapBatch();     // the structural tokens again, for this batch's diffusion
@@ -387,9 +389,11 @@ int main(int argc, char** argv) {
       // backbone while its pLDDT reads as if nothing were wrong
       fprintf(stderr, "this checkpoint has no working flow sampler - fold it with diffusion\n"); return 1;
     }
+    if (!framesDir.empty() && c0 == 0) frames.start(framesDir, mask.size() * 3, steps);   // (the first batch's first sample)
     std::vector<float> xs = sample(steps, seeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
     }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
+    FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
     NS = 1;
     memReport("diffusion");
     diffMs += ms(s0, clock());
@@ -470,6 +474,10 @@ int main(int argc, char** argv) {
       if (!std::isfinite(score)) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", k, score); exit(1); }
       if (score > bestScore) { bestScore = score; best = sk; bestSeed = sd; conf = std::move(ck); x = std::move(xk); bestSS = ssk; }
     }
+    }
+    if (!framesDir.empty()) {
+      frames.finish();
+      printf("frames: %d written, %d dropped\n", frames.written, frames.dropped);
     }
     if (many && out != "/dev/null") {        // AlphaFold 3's ranking_scores.csv
       FILE* rf = fopen((stem + "_ranking_scores.csv").c_str(), "w");
@@ -559,12 +567,14 @@ int main(int argc, char** argv) {
       job.close(); unlink((base + ".job").c_str());
       if (input == "quit") { printf("af3: stopped\n"); return 0; }
       steps = steps0; recycles = recycles0; samples = samples0; folds = folds0; out = "fold.pdb"; SAMPLER_FLOW = flow0;
+      framesDir.clear();
       bool jobSeed = false; seed = seedArg; seedsArg = seedsArg0;
       for (auto& f : flags) {
         if (!f.compare(0, 6, "--out=")) out = f.substr(6);
         else if (!f.compare(0, 10, "--samples=")) samples = atoi(f.c_str() + 10);
         else if (!f.compare(0, 8, "--steps=")) steps = atoi(f.c_str() + 8);
         else if (f == "--flow") SAMPLER_FLOW = true;
+        else if (!f.compare(0, 9, "--frames=")) framesDir = f.substr(9);
         else if (!f.compare(0, 11, "--recycles=")) recycles = atoi(f.c_str() + 11);
         else if (!f.compare(0, 7, "--seed=")) { seed = strtoull(f.c_str() + 7, nullptr, 10); jobSeed = true; }
         else if (!f.compare(0, 8, "--seeds=")) seedsArg = f.substr(8);

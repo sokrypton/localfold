@@ -216,9 +216,11 @@ def page_arm(bad):
                        paeTyped: p?.confidence?.predictedAlignedError instanceof Float32Array,
                        plddt: p?.confidence?.plddt?.length ?? null,
                        atoms: (p?.pdb ?? '').split(String.fromCharCode(10)).filter((l) => l.startsWith('ATOM')).length,
+                       frames: (() => { const v = Object.values(window.py2dmol_viewers ?? {})[0]?.renderer;
+                                        return v?.objectsData?.[v?.currentObjectName]?.frames?.length ?? 0; })(),
                        gpu: window.__readerGpu };
             })()""")
-            print(f"page: {family:14s} {time.time() - started:5.1f} s  {got['status'][:110]}")
+            print(f"page: {family:14s} {time.time() - started:5.1f} s  {got['frames']:2d} viewer frames  {got['status'][:100]}")
             problems = []
             if " on CUDA " not in got["status"] or "done in" not in got["status"]:
                 problems.append(f"status {got['status']!r}")
@@ -228,6 +230,8 @@ def page_arm(bad):
                 problems.append(f"PAE {got['pae']} (typed {got['paeTyped']}), pLDDT {got['plddt']}")
             if got["atoms"] < tokens * 4:
                 problems.append(f"{got['atoms']} atoms")
+            if family == "af3" and got["frames"] < 5:
+                problems.append(f"the viewer holds {got['frames']} frames - the sampler's were not streamed")
             if got["gpu"]:
                 problems.append("the reader's browser asked for a WebGPU adapter")
             bad += [f"page {family}: {p}" for p in problems]
@@ -255,10 +259,12 @@ def main():
         started = time.time()
         worker.stdin.write(json.dumps(payload) + "\n")
         worker.stdin.flush()
-        kinds, result = [], None
+        kinds, result, fractions = [], None, []
         for line in worker.stdout:
             event = json.loads(line)
             kinds.append(event["kind"])
+            if event["kind"] == "progress":
+                fractions.append(event["payload"])
             if event["kind"] == "result":
                 result = event["payload"]
                 break
@@ -292,12 +298,19 @@ def main():
             problems.append(f"pLDDT {c.get('meanPlddt')} / pTM {c.get('ptm')}")
         if "status" not in kinds or kinds.count("progress") < 2:
             problems.append(f"events {kinds}")
+        # the AF3 lineage streams its sampler's frames (native/af3 --frames), the bar moving with them
+        if payload["family"] in ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3"):
+            if kinds.count("frame") < 5:
+                problems.append(f"{kinds.count('frame')} frames streamed")
+            if fractions != sorted(fractions):
+                problems.append("the progress bar went backwards")
         if "stopping early" in name and "converged at" not in (result.get("status") or ""):
             problems.append("the page's early stop did not stop it (or did not say so)")
         rmsd = score(result.get("pdb") or "", *reference)
         if rmsd is None or rmsd > bar:
             problems.append(f"RMSD {rmsd} past {bar} A")
-        print(f"{name:44s} RMSD {rmsd} A (bar {bar})  {n} tokens  {seconds:5.1f} s  | {result.get('status')}")
+        print(f"{name:44s} RMSD {rmsd} A (bar {bar})  {n} tokens  {kinds.count('frame'):2d} frames  {seconds:5.1f} s"
+              f"  | {result.get('status')}")
         bad += [f"{name}: {p}" for p in problems]
     worker.stdin.close()
     worker.wait(timeout=60)

@@ -193,16 +193,35 @@ class Af3Server:
                 raise RuntimeError("the AF3 server did not start: " + open(self.log.name).read()[-400:])
             time.sleep(0.05)
 
-    def fold(self, inputs, flags):
+    def fold(self, inputs, flags, on_frame=None):
+        """...and with `on_frame`, each sampler step's prediction as it lands (native/af3 --frames: written by
+        a thread of the binary off the copy engine, so the fold does not wait for it - +0.1-0.4% of a fold,
+        measured interleaved; the structure is byte-identical either way)."""
         self.count += 1
         base = os.path.join(self.dir, f"{self.count:06d}")
+        frames = base + ".frames"
+        if on_frame is not None:
+            os.makedirs(frames, exist_ok=True)
+            flags = [*flags, f"--frames={frames}"]
         with open(base + ".tmp", "w") as handle:
             handle.write("\n".join([inputs, *flags]) + "\n")
         os.rename(base + ".tmp", base + ".job")
+        seen = set()
+
+        def collect():
+            if on_frame is None:
+                return
+            for name in sorted(os.listdir(frames)):
+                if name.endswith(".pdb") and name not in seen:
+                    seen.add(name)
+                    on_frame(os.path.join(frames, name), int(name[6:10]))
         while not os.path.exists(base + ".done"):
             if self.proc.poll() is not None:
                 raise RuntimeError("the AF3 server exited: " + open(self.log.name).read()[-400:])
+            collect()
             time.sleep(0.005)
+        collect()
+        shutil.rmtree(frames, ignore_errors=True)
         said = open(base + ".log").read()
         if int(open(base + ".done").read().strip() or 1) != 0:
             raise RuntimeError("the fold failed: " + "\n".join(said.strip().splitlines()[-4:]))
@@ -385,7 +404,17 @@ class Worker:
                 emit("status", f"{family} on CUDA ({self.device}) · loading the weights onto the card")
                 self.server = Af3Server(family, bundle)
             emit("status", f"{family} on CUDA ({self.device}) · folding")
-            said = self.server.fold(inputs, fold)
+            on_frame = None
+            # 🔴 THE SAMPLER'S FRAMES, AS WebGPU AND JAX STREAM THEIRS - on unless the runtime or the job says
+            # otherwise (LOCALFOLD_NATIVE_FRAMES=0, or `frames: false` in the request)
+            if os.environ.get("LOCALFOLD_NATIVE_FRAMES", "1") != "0" and job.get("frames", True) is not False:
+                total = next((int(f[8:]) for f in fold if f.startswith("--steps=")), 200)   # (af3's default)
+
+                def on_frame(path, step):
+                    emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
+                    emit("progress", 0.15 + 0.85 * step / total)
+                    emit("status", f"{family} on CUDA ({self.device}) · diffusion {step}/{total}")
+            said = self.server.fold(inputs, fold, on_frame)
             log.append(said)
         else:
             emit("status", f"{family} on CUDA ({self.device}) · folding")
