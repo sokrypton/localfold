@@ -6,7 +6,9 @@
 #pragma once
 #include "../../af3/src/flash.cuh"
 
-template <int D, int WARPS, bool MASKED = true, int BK = FA_BK>
+// REG: as flashGridHalf's (native/af3/src/flash.cuh) - the next tile staged in registers, one shared buffer,
+// for a device without cp.async (a T4)
+template <int D, int WARPS, bool MASKED = true, int BK = FA_BK, bool REG = false>
 __global__ void __launch_bounds__(WARPS * 32) flashStrided(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, const float* __restrict__ mask, half* __restrict__ out, int n, int heads, float scale,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
@@ -75,6 +77,39 @@ __global__ void __launch_bounds__(WARPS * 32) flashStrided(const half* __restric
     }
     cpCommit();
   };
+  uint4 kr[KV_PER][2], brg[B_PER]; float mr = 0.f;
+  auto loadR = [&](int j0) {
+    bool last = j0 + BK > n;
+#pragma unroll
+    for (int k = 0; k < KV_PER; ++k) {
+      if (kvJ[k] >= (1 << 30)) continue;
+      bool ok = !last || j0 + kvJ[k] < n;
+      const half* src = kvSrc[k] + (ok ? (size_t)j0 * posStride : 0);
+      kr[k][0] = ok ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+      kr[k][1] = ok ? *reinterpret_cast<const uint4*>(src + Wd) : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int k = 0; k < B_PER; ++k) {
+      bool ok = bRow[k] && (!last || j0 + bC[k] < n);
+      brg[k] = ok ? *reinterpret_cast<const uint4*>(bSrc[k] + j0) : make_uint4(0, 0, 0, 0);
+    }
+    if (MASKED && threadIdx.x < BK) {
+      int j = j0 + threadIdx.x;
+      mr = j < n ? (mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f) : -INFINITY;
+    }
+  };
+  auto storeR = [&]() {
+    half *K = Kst(0), *V = Vst(0), *B = Bst(0);
+#pragma unroll
+    for (int k = 0; k < KV_PER; ++k) {
+      if (kvJ[k] >= (1 << 30)) continue;
+      *reinterpret_cast<uint4*>(K + kvOff[k]) = kr[k][0];
+      *reinterpret_cast<uint4*>(V + kvOff[k]) = kr[k][1];
+    }
+#pragma unroll
+    for (int k = 0; k < B_PER; ++k) *reinterpret_cast<uint4*>(B + bOff[k]) = brg[k];
+    if (MASKED && threadIdx.x < BK) Mst(0)[threadIdx.x] = mr;
+  };
   int i0 = q0 + warp * 16 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
     if (i >= n) return 0u;
@@ -91,12 +126,15 @@ __global__ void __launch_bounds__(WARPS * 32) flashStrided(const half* __restric
   float o[D / 8][4] = {};
   float m0 = -INFINITY, m1 = -INFINITY, lsum[4] = {};
   int tiles = (n + BK - 1) / BK;
-  issue(0, 0);
+  if constexpr (REG) { loadR(0); storeR(); __syncthreads(); if (tiles > 1) loadR(BK); }
+  else issue(0, 0);
   for (int tile = 0; tile < tiles; ++tile) {
-    int st = tile & 1;
-    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
-    else cpWait<0>();
-    __syncthreads();
+    int st = REG ? 0 : tile & 1;
+    if constexpr (!REG) {
+      if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
+      else cpWait<0>();
+      __syncthreads();
+    }
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st); const float* Ms = Mst(st);
     // S starts from the bias (and the key mask), and the tensor cores accumulate Q.K onto it
     const half* br0 = B + (warp * 16 + g) * LDB;
@@ -155,6 +193,9 @@ __global__ void __launch_bounds__(WARPS * 32) flashStrided(const half* __restric
       }
     }
     __syncthreads();
+    if constexpr (REG) {
+      if (tile + 1 < tiles) { storeR(); __syncthreads(); if (tile + 2 < tiles) loadR((tile + 2) * BK); }
+    }
   }
   float l0 = lsum[0], l1 = lsum[2];
   // gates read first and stored as pairs: with a store between every load the compiler
@@ -176,17 +217,26 @@ __global__ void __launch_bounds__(WARPS * 32) flashStrided(const half* __restric
 }
 
 
-template <int D, int WARPS, bool MASKED>
-void flashStridedAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out, int n, int heads,
-                    size_t rows, float scale, size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
+template <int D, int WARPS, bool MASKED, bool REG>
+void flashStridedRun(const half* qkvg, const half* bias, int stride, const float* mask, half* out, int n, int heads,
+                     size_t rows, float scale, size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
+  const int bytes = (REG ? 1 : 2) * faStage<D, WARPS>();
   static bool attr = false;
   if (!attr) {
-    smemAttr((flashStrided<D, WARPS, MASKED>), (int)(2 * faStage<D, WARPS>()));
+    smemAttr((flashStrided<D, WARPS, MASKED, FA_BK, REG>), bytes);
     attr = true;
   }
   dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
-  flashStrided<D, WARPS, MASKED><<<grid, 32 * WARPS, 2 * faStage<D, WARPS>(), STREAM>>>(
+  flashStrided<D, WARPS, MASKED, FA_BK, REG><<<grid, 32 * WARPS, bytes, STREAM>>>(
     qkvg, bias, stride, mask, out, n, heads, scale, rowStride, posStride, outRowStride, outPosStride);
+}
+template <int D, int WARPS, bool MASKED>
+void flashStridedAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out, int n, int heads,
+                    size_t rows, float scale, size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
+  if (flashRegStaged())
+    flashStridedRun<D, WARPS, MASKED, true>(qkvg, bias, stride, mask, out, n, heads, rows, scale, rowStride, posStride, outRowStride, outPosStride);
+  else
+    flashStridedRun<D, WARPS, MASKED, false>(qkvg, bias, stride, mask, out, n, heads, rows, scale, rowStride, posStride, outRowStride, outPosStride);
 }
 // rows x (n positions) of a [.., 4W] qkvg at the given strides (elements); out likewise ([.., W])
 inline void flashGridStrided(const half* qkvg, const half* bias, int stride, const float* mask, half* out, int n, int heads,

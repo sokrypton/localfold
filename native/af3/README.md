@@ -321,6 +321,12 @@ tokens, 11.9 -> 8.2 at 524**, every output identical (`--bench-grid` compares th
 not: 0 of 8,786,432 differ), whole folds 3.99 -> 3.73 s and 18.1 -> 17.2. On the A100 it would be 0.245
 against 0.184 ms, so Ampere keeps `cp.async`.
 
+AF2's strided copy of the kernel (native/af2/src/flash2.cuh) takes the same form there. Its fold with 512
+alignment rows at 262 residues moved only 3% (12.25 -> 11.84 s, identical), and the profile says why: the
+two flash kernels fell 2.91 -> 1.99 and 2.39 -> 1.69 s while cuBLAS's GEMMs ROSE 2.21 -> 2.94 - **the T4 is
+power-capped (70 W)**, so a kernel that keeps the card busier lowers the clock for everything else. On a
+T4 what pays is less work, not better-overlapped work.
+
 Tried on the T4 and not taken: more blocks an SM for that kernel (`__launch_bounds__` minimums of 4-8,
 32-key tiles, 2-warp blocks: every one slower - it is not short of warps), its prefetch loads pinned in
 place with volatile asm (no change), and the grid attention unfused (`LOCALFOLD_UNFUSED=grid`; also
