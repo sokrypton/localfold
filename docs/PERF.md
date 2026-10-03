@@ -2311,3 +2311,50 @@ both true) and has never been swept on Turing; and the triangle kernel runs at
 **0.19-0.24 effective TFLOP/s** on a part rated ~8 f32, which is a ceiling
 question rather than a knob question and wants the same figure from the M2 and
 the A100 beside it before anything is concluded from it.
+
+## 🔴 The M2's sampler: three levers measured, none taken
+
+Measured 2026-09-26 on the M2 (stock flags, `shader-f16`, no matrix units),
+AF3 int5, 58 tokens unless stated. A page fold is ~45% sampler (25 steps x ~47
+ms) and a denoiser call is ~40 ms of GPU, ~31 ms of it the diffusion
+transformer. Knob sweeps first - all at the shipped default: split-K 1.4-3.3x
+SLOWER, the shared token tile of 2 12% slower, `diffusionNormSplit` flat on
+whole folds, `transitionThreadTarget` flat on the trunk. Then three kernel
+changes to `qkvg`, each timed with `bench-diffusion-transformer.js --profile`:
+
+| arm | qkvg, 11 calls |
+|---|---:|
+| shipped (tile 4, f16 weights widened to f32) | 68.0 ms |
+| f16 multiply-adds, runs of 16-32 summed in f16 into f32 | 61-63 |
+| ...on top of an interleaved q/k/v/gate `vec4<f16>` read (timing prototype) | 68-69 |
+| token tile 2 for qkvg alone (honest dispatch) | 63-64 |
+
+**Nothing moves more than ~10% of one kernel**, which is ~1.5% of a denoiser
+call. The interleaved read changing nothing says `qkvg` is not bound on load
+INSTRUCTIONS: four scalar streams and one vec4 stream are the same bytes. f16
+arithmetic buys a little and stops stacking with anything; `ffw-wide` at tile 2
+is 1.4x SLOWER (107 against 77, and 322 against 148 at 150 tokens).
+
+🔴 **AND THE TILE ARM FIRST MEASURED 1.5x, WHICH WAS HALF THE WORK.** Without a
+K split, `qkvg` and `ffw-wide` are dispatched as `Math.ceil(rows / tile)` - the
+SHARED tile - while their shaders tile by `qkvgTile`/`wideTile`. Those are equal
+in every shipping path, so it is latent; a change that lets them differ must
+move the dispatch too. A fold with the prior on failed the chain-geometry gate
+(good); the bench reported the missing tokens as `qkvg 68 -> 45` (bad), because
+it has **no correctness check at all** - synthetic weights, time only. CLAUDE.md's
+"a dispatch dividing by eight under a shader tiling by four, reported as a 30%
+speedup", once more. Check a new arm through `fold.js` before believing a bench.
+
+🔴 **AND THE TRUNK, AT 255 TOKENS x 1024 ROWS, THE SAME STORY.** A steady pass is
+~6.2 s; pair-transition 16%, grid.attend 16%, grid.project 11%, opm.contract 9%,
+the triangle kernels ~23%. Three more arms, none taken:
+
+| arm | kernel | whole pass |
+|---|---|---|
+| LayerNorm barrier trees emptied in the pair transition (`bench-transition.js 8:128:n`, an upper bound for subgroup reductions) | 24.8 -> 23.6 ms (-5%) | - |
+| f16 pair weights (`--pair-weights=f16`); the transition itself 18.6 -> 16.4 | - | 6042-6245 -> 5962-5966 ms, flat at 58 tokens |
+| the OPM vector GEMM reading A's four rows as one vec4 (5 -> 2 shared reads a k step) | 567 -> 532 ms | unmoved (6202/6338 against 6208/6457) |
+
+The pair transition already runs its f16-staged arm (18.5 ms a call in the
+profile against 18.6 in the bench), so the precision lever it has left is the
+weights, which docs/AF3.md declined on accuracy and which buys 1-4% here.

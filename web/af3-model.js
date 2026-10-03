@@ -108,6 +108,9 @@ export const AF3_COUNTS = {
   // model's own setting was the one number the page could not select. 25 keeps
   // the floor the note above measured - below twenty the sampler does not land,
   // and ten gives 5.91 A on 6MRR with a CA-CA of 8.40 A.
+  // 🔴 THAT FLOOR IS FOR THE MODEL'S OWN SCHEDULE. Started at sigma 80 rather
+  // than 160, twenty steps match twenty-five - see ALPHAFOLD3_COUNTS below,
+  // which is what AlphaFold 3 itself now takes; this row is every other family's.
   diffusion: { label: "Diffusion", values: [25, 50, 100, 200], preferred: 25 },
 };
 
@@ -185,6 +188,98 @@ export const OPENDDE_COUNTS = {
   flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
   diffusion: { label: "Diffusion", values: [16, 25, 50, 100, 200], preferred: 16 },
 };
+
+/**
+ * AlphaFold 3's own dial: twenty diffusion steps on a schedule that starts
+ * lower, where every other family keeps twenty-five on the model's.
+ *
+ * 🔴 THE TOP OF THE SCHEDULE IS MOSTLY WASTED CALLS, SO THE FIX IS WHERE THE
+ * STEPS GO, NOT HOW MANY. AF3's schedule starts at sigma 160 x sigmaData, where
+ * the denoiser's skip weight is ~4e-5 and its output all but ignores its input -
+ * and a rho of 7 still spends several of twenty-five calls up there. Starting at
+ * 80 puts those calls lower. Measured on the M2, AF3 int5, stock flags:
+ * tools/gpu/bench-sampler-geometry.js over seven systems (protein, +GOL, +ATP,
+ * +SEP, RNA, DNA, protein+DNA) and eight seeds, bond rms, and
+ * fold-opendde.js against the crystal, four seeds, mean CA-RMSD:
+ *
+ *   arm                  calls  bond median  mean    >0.15 A   6MRR   1QYS
+ *   diffusion 25           25     0.0576    0.0841    6/56    0.640  0.906
+ *   sigmaMax 80, 20        20     0.0561    0.0777    5/56    0.593  0.896
+ *   sigmaMax 80, 16        16     0.0588    0.0653    3/56    0.690  0.843
+ *   sigmaMax 40, 16        16     0.0592    0.0610    1/56    0.721  0.938
+ *   diffusion 16           16     0.0625    0.0760    4/56      -      -
+ *
+ * Twenty at 80 is no worse than twenty-five on anything measured and 20% fewer
+ * denoiser calls. Truncating alone (16 at 160) is what the older note under
+ * AF3_COUNTS warns against; moving the start is what makes fewer calls land.
+ * A lower start trades the fold for bonds - 40 is the best bond geometry here
+ * and 0.08 A worse on 6MRR - because the high-noise calls place the chain.
+ *
+ * 🔴 PER CHECKPOINT, BECAUSE IT DOES NOT TRANSFER. The same study against each
+ * family's own twenty-five (eight seeds of bonds, four of CA-RMSD):
+ *
+ *   intellifold2  1QYS 1.223 -> 1.027, 6MRR level; bad folds 14 -> 9, glycerol
+ *                 0.120 -> 0.052, SEP 0.202 -> 0.094.                 TAKEN
+ *   protenix2     6MRR 1.236 -> 0.846, 1QYS 0.936 -> 0.892; glycerol 0.097 ->
+ *                 0.118.                     held for a ligand sweep
+ *   openbind0     6MRR 1.706 -> 1.546, 1QYS 0.957 -> 0.876; glycerol 0.117 ->
+ *                 0.174.                     held for a ligand sweep
+ *   boltz2        level on folds, glycerol 0.032 -> 0.051. NOT TAKEN: its own
+ *                 schedule (rho 8) already puts its calls low.
+ *   rosettafold3  level on folds, glycerol 0.095 -> 0.409, and 1QYS seed 3 is NOT
+ *                 A CHAIN (a CA-CA of 8.29 A at pLDDT 80.15).         NOT TAKEN
+ *   opendde       its own sixteen already; twelve from 80 is level on RMSD and
+ *                 the bond bench cannot run it.                        NOT TAKEN
+ */
+/**
+ * 🔴 AND WHERE THE TWENTY CALLS START DEPENDS ON WHAT IS BEING FOLDED. The
+ * high-noise calls PLACE a chain and the low-noise ones SETTLE a small
+ * molecule, so a job with a ligand or a modified residue wants the start lower.
+ * Mean ligand bond rms over ten CCD ligands (GOL EDO ATP ADP BTN SAM PLP HEM
+ * NAD FAD) x four seeds, bench-sampler-geometry.js --ligands=:
+ *
+ *   family         own 25   sigma 80/20   sigma 40/20
+ *   af3            0.064      0.061         0.051
+ *   protenix2      0.084      0.086         0.075
+ *   openbind0      0.100      0.117         0.080
+ *   intellifold2   0.153      0.139         0.167
+ *
+ * and on plain proteins sigma 80 places the chain best (6MRR, protenix2 1.236
+ * -> 0.846, openbind0 1.706 -> 1.546) where sigma 40 costs it (af3 0.640 ->
+ * 0.707). So each family names two starts. A family not listed keeps its own
+ * schedule and its own twenty-five - see the table above for why boltz2,
+ * rosettafold3 and opendde are not here.
+ */
+export const SHORT_SCHEDULES = Object.freeze({
+  af3: Object.freeze({ protein: 80, ligand: 40 }),
+  intellifold2: Object.freeze({ protein: 80, ligand: 80 }),
+  protenix2: Object.freeze({ protein: 80, ligand: 40 }),
+  openbind0: Object.freeze({ protein: 80, ligand: 40 }),
+});
+export const SHORT_SCHEDULE_FAMILIES = Object.freeze(Object.keys(SHORT_SCHEDULES));
+export const ALPHAFOLD3_COUNTS = Object.freeze({
+  ...AF3_COUNTS,
+  diffusion: { label: "Diffusion", values: [20, 25, 50, 100, 200], preferred: 20 },
+});
+/** Below this many steps a listed family takes its short schedule. */
+export const ALPHAFOLD3_SHORT_SCHEDULE = Object.freeze({ below: 25, sigmaMax: 80 });
+
+/** The step dial for a family - one reading, for the dial and the fold alike. */
+export function countsForFamily(family) {
+  return family === "opendde" ? OPENDDE_COUNTS
+    : SHORT_SCHEDULE_FAMILIES.includes(family) ? ALPHAFOLD3_COUNTS : AF3_COUNTS;
+}
+
+/**
+ * The sampler schedule a page fold passes, or undefined for the model's own.
+ * See ALPHAFOLD3_COUNTS.
+ */
+export function diffusionScheduleFor(family, mode, steps, { hasLigand = false } = {}) {
+  const starts = SHORT_SCHEDULES[family];
+  if (starts === undefined || mode !== "diffusion") return undefined;
+  if (!(steps < ALPHAFOLD3_SHORT_SCHEDULE.below)) return undefined;
+  return { sigmaMax: hasLigand ? starts.ligand : starts.protein };
+}
 
 /**
  * 🔴 ONLY THE 20 AMINO ACIDS AND X. featurise.js maps anything else to UNK,

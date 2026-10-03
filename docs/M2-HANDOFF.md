@@ -133,3 +133,82 @@ believed or re-recorded.
 Report back in the same shape the earlier rounds did: numbers per arm, same
 box, and which knob should become an Apple-prior entry in
 `src/runtime/device-profile.js` rather than a default change.
+
+## 🔴 THE M2'S REPLY (2026-09-26)
+
+Apple M2, 10 cores, 16 GB, macOS 13.2, headless Chrome 154, **stock flags**
+(`shader-f16` yes, subgroup matrices no). `opus-55-opt` with `origin/main`
+merged. Every row is arm against arm on this box, interleaved, two rounds
+unless noted. Bundles here: af3-int5, af2-monomer-int5, esmfold2-int5 -
+nothing else, so every other model is untested on Apple.
+
+### 🔴 A BUG ONLY A DEVICE WITHOUT THE AMPERE PRIOR COULD SEE: A SECOND FOLD DIED
+
+`fold.js --folds=2` died in fold 2 with `[Buffer "int5-codes"] used in submit
+while destroyed` and never finished (the harness hung; the page would have too).
+`releaseStreamedWeights` destroys a prefix's recorded codes at a fold's end, but
+cannot take them out of `recordings.byKey` - a WeakMap - so the next fold,
+streaming again, replayed destroyed buffers. It runs only where
+`keepTrunkWeights` is not true, which is every device but the ampere prior:
+**every visitor's second fold**. Streaming off (`streamTrunkWeights=false`) was
+the only arm that survived; f16 and flags made no difference.
+
+Fixed: `releaseRecording` marks the recording and `residentWeightBufferFilled`
+treats a released one as a miss and records again. Three folds in one process
+then match the unstreamed arm to every digit (85.83089054918456), and
+`probe-submits --folds=2 --repeats=3` is 85.8 / pTM 0.741 three times.
+**Gated**: the AF3 row in tools/gate-folds.mjs now folds twice with
+`--tune=keepTrunkWeights=false`, so an A100 takes the release path too - watched
+failing with the fix reverted.
+
+### Section 1, measured
+
+| change | M2 result | verdict |
+|---|---|---|
+| AF3 OPM as two GEMMs | 255 tok x 1024 rows: OPM 1312 -> 645 ms (2 passes), steady pass 6850 -> 6240 (**-9%**), +16 MiB. 68 x 128: 15.0 -> 11.8 ms, pass unmoved | keep |
+| AF2 vector OPM | warm fold 59 res 1117 -> 1095 ms, 200 res x 256/512 rows 11150 -> 10620 (**-4.8%**), checksum identical | keep |
+| ESMFold2 token row tile | sampler (11 steps) tile 1: 271-292, **2: 254-256**, 4: 269-273, 8: 349-353; checksum -133920 in every arm | 2 is right here too |
+| ESM-C row tile | LM 178-216 ms across 1/2/4/8, flat | no prior |
+| small-fold trunk streaming | 5CAJ-255: peak **952 -> 751 MiB**, warm 15.7-16.1 s both arms, pLDDT identical | keep (after the fix) |
+| large-fold release/stream | 400 res: peak 1063 -> 684 MiB, 37.5-38.2 s both arms, ~400 pageouts either way | keep; no case for a lower threshold - nothing here comes near a 16 GB machine's pressure |
+| vector split, f16 scratch - numerics | `check-transition-split.js --vector=1` (new arm): relRMS **4.3e-4** f16 / 5e-7 f32 at 256, 384, 512 | sound |
+| vector split - speed, isolated | `bench-transition.js` `vsplit` (new arm) vs the fused kernel at its shipped tile: 256 ch **1.02-1.07x**, 384 **2.0x**, 512 **2.5x** | wins where wide |
+| vector split - speed, in ESMFold2 (256 ch) | trunk 462 -> 494 ms at 59 res, 11.7-12.1 -> 12.3 s at 200; peak +72 MiB at 200 | **loses at 256** |
+
+🔴 **ONE PRIOR CANDIDATE: `pairTransitionSplitMinChannels: 320` for metal-3**
+- keeps 256 fused and 384/512 split. Measured on ESMFold2 only; protenix2 and
+boltz2 are also 256 and are not on this box, so it is a recommendation, not
+a change.
+
+`check-transition-split.js` without `--vector=1` checks the MATRIX split, which a
+stock browser never runs - on this M2 it silently took the 8x8 units under the
+developer flag. `bench-transition.js` likewise priced only the matrix split.
+
+### Section 2, the page (AF3, 6MRR, single sequence, `--dev-report`)
+
+| | main | branch |
+|---|---:|---:|
+| first visit, fold done at | 2762-2849 ms | **2653-2680** |
+| returning visit (`--keep-profile`) | 2544-2602 | 2512-2525 |
+| sampler start | 183-216 | 130-132 |
+| **page peak** | **430 MiB** | **552 MiB** |
+
+-4% on a first fold, -1-2% on a return. 🔴 **The peak rises 121 MiB**: the
+diffusion transformer's 378 MiB of resident weights now fill during the trunk
+(`966c134`) instead of after it. Not a problem on this machine; worth a line
+wherever the page's peak is quoted.
+
+### Section 3, correctness where Metal clamps
+
+`npm test` 1300/0. `probe-grid-overdispatch.js`: shipped 1,1,1; stripped arm
+CLAMPS (367, 4117, 273). Gates, stock flags: test:stock AF2/AF3/ESMFold2 ok;
+test:template af3 0.241 / af2 2.497 A; test:ligand af3 0.061; test:modified
+af3 0.98, esmfold2 0.99. test:cache and test:batch cannot run here (one model,
+no dumps). Not run: test:portable, test:spec-floor, test:delta (needs bundles
+this box lacks).
+
+🔴 A missing bundle is a FAIL, not a SKIP, in test:stock and test:template
+whenever the tool is fold-opendde.js or takes `--sequence=`/`--target=`:
+`SyntaxError: Unexpected token 'o', "not found" is not valid JSON` - the
+server's 404 body parsed as a manifest. The fold.js `--model=` rows skip
+correctly.

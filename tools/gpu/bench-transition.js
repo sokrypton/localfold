@@ -119,9 +119,13 @@ export async function main(device, args) {
         (whole, open_) => `${open_ ?? ""}f16(slot)${open_ ? ")" : ""}`],
     t2: [/let w = weights\[W_T2 \+ \(chunk0 \+ slot\) \* CHANNELS \+ c\];/,
          "let w = f32(slot) * 1e-6;"],
+    // "n" empties the LayerNorm's per-row barrier trees - the upper bound on
+    // what subgroup reductions could take back.
+    n: [/for \(var stride = WORKGROUP \/ 2u; stride > 0u; stride >>= 1u\) \{/g,
+        "for (var stride = 0u; stride > 0u; stride >>= 1u) {"],
   };
   // ...the fused arms; `split` is a different shape of arm and is built below.
-  for (const spec of arms_spec.filter((a) => a.split("@")[0] !== "split")) {
+  for (const spec of arms_spec.filter((a) => !["split", "vsplit"].includes(a.split("@")[0]))) {
     // `8:128@f16` names the tile and chunk, then the element the two staged
     // blocks are held in. The suffix is optional and f32 is what every arm
     // meant before it existed.
@@ -168,16 +172,23 @@ export async function main(device, args) {
   // still wins; at ESMFold2's 256 it does not. `split` takes the buffer
   // precisions as `split@f16` or `split@f32`, which narrows the two
   // intermediates and nothing the units do.
-  for (const spec of arms_spec.filter((a) => a.split("@")[0] === "split")) {
-    const [, precision = "f16"] = spec.split("@");
-    const config = deviceMatrixConfig(device, { element: "f16" });
-    if (config === null) continue;
+  //
+  // 🔴 `vsplit` IS THE SPLIT A STOCK BROWSER RUNS - the register-tiled vector
+  // GEMM that splitTransitionConfig answers with where there are no matrix
+  // units, which is every visitor. `split` needs the units and skips without
+  // them, so without this arm the bench could not price the default at all.
+  for (const spec of arms_spec.filter((a) => ["split", "vsplit"].includes(a.split("@")[0]))) {
+    const [kind, precision = "f16"] = spec.split("@");
+    const vector = kind === "vsplit";
+    const config = vector ? null : deviceMatrixConfig(device, { element: "f16" });
+    if (!vector && config === null) continue;
     const split = createTransitionSplitShaders(
       { rows, channels, factor }, packed.offsets, 1e-5, "fast",
       { normalizedStorage: precision, wideStorage: precision,
-        matrix: { result: config.resultComponentType, matrixElement: config.componentType,
-                  tile: { M: config.M, N: config.N, K: config.K } } });
-    const bytes = stagedMatrixStorage({
+        matrix: vector ? { vector: true, storage: precision }
+          : { result: config.resultComponentType, matrixElement: config.componentType,
+              tile: { M: config.M, N: config.N, K: config.K } } });
+    const bytes = vector ? 0 : stagedMatrixStorage({
       ...split.geometry, tile: { M: config.M, N: config.N, K: config.K },
       result: config.resultComponentType });
     if (bytes > device.limits.maxComputeWorkgroupStorageSize) continue;

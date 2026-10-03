@@ -77,3 +77,66 @@ test("the sampler select and the count tables name the same modes", async (t) =>
     assert.equal(AF3_COUNTS.ode, undefined);
   });
 });
+
+test("AlphaFold 3's short schedule is its own and nobody else's", async (t) => {
+  const { ALPHAFOLD3_COUNTS, ALPHAFOLD3_SHORT_SCHEDULE, countsForFamily,
+          diffusionScheduleFor } = await import("../web/af3-model.js");
+  const modes = optionsOf("af3-mode");
+
+  await t.test("its table offers the same modes as the page", () => {
+    assert.deepEqual(Object.keys(ALPHAFOLD3_COUNTS).sort(), Object.keys(AF3_COUNTS).sort());
+    for (const mode of modes) assert.ok(ALPHAFOLD3_COUNTS[mode] !== undefined, mode);
+  });
+
+  await t.test("its preferred count takes the short schedule", () => {
+    const preferred = ALPHAFOLD3_COUNTS.diffusion.preferred;
+    assert.ok(preferred < ALPHAFOLD3_SHORT_SCHEDULE.below);
+    assert.deepEqual(diffusionScheduleFor("af3", "diffusion", preferred),
+                     { sigmaMax: ALPHAFOLD3_SHORT_SCHEDULE.sigmaMax });
+  });
+
+  await t.test("the model's own schedule everywhere else", () => {
+    assert.equal(diffusionScheduleFor("af3", "diffusion", 25), undefined);
+    assert.equal(diffusionScheduleFor("af3", "diffusion", 200), undefined);
+    assert.equal(diffusionScheduleFor("af3", "flow", 16), undefined);
+    for (const family of ["boltz2", "rosettafold3", "opendde"]) {
+      assert.equal(diffusionScheduleFor(family, "diffusion", 20), undefined, family);
+    }
+    assert.equal(countsForFamily("boltz2"), AF3_COUNTS);
+    assert.equal(countsForFamily("opendde"), OPENDDE_COUNTS);
+    assert.equal(countsForFamily("af3"), ALPHAFOLD3_COUNTS);
+    // ...and IntelliFold-2, the second checkpoint it was measured on and won.
+    assert.deepEqual(diffusionScheduleFor("intellifold2", "diffusion", 20),
+                     { sigmaMax: ALPHAFOLD3_SHORT_SCHEDULE.sigmaMax });
+    assert.equal(countsForFamily("intellifold2"), ALPHAFOLD3_COUNTS);
+  });
+
+  await t.test("a job with a ligand starts lower where the family measured it", async () => {
+    const { SHORT_SCHEDULES } = await import("../web/af3-model.js");
+    assert.deepEqual(diffusionScheduleFor("af3", "diffusion", 20, { hasLigand: true }),
+                     { sigmaMax: 40 });
+    assert.deepEqual(diffusionScheduleFor("protenix2", "diffusion", 20), { sigmaMax: 80 });
+    assert.deepEqual(diffusionScheduleFor("protenix2", "diffusion", 20, { hasLigand: true }),
+                     { sigmaMax: 40 });
+    assert.deepEqual(diffusionScheduleFor("intellifold2", "diffusion", 20, { hasLigand: true }),
+                     { sigmaMax: 80 });
+    for (const [family, starts] of Object.entries(SHORT_SCHEDULES)) {
+      assert.ok(starts.protein > 0 && starts.ligand > 0, family);
+      assert.equal(countsForFamily(family), ALPHAFOLD3_COUNTS, family);
+    }
+  });
+
+  // 🔴 ONE READING OF THE TABLE. The dial and the fold each chose a table by
+  // family, and a second family-specific table is exactly where two copies of
+  // that choice would disagree - the dial offering 20 and the fold defaulting
+  // to 25, or the reverse.
+  await t.test("web/app.js reads the table through countsForFamily only", () => {
+    const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+    assert.equal((app.match(/countsForFamily\(/g) ?? []).length, 2);
+    assert.ok(!/[^_]AF3_COUNTS\[|OPENDDE_COUNTS\[/.test(app));
+    assert.ok(/schedule: diffusionScheduleFor\(/.test(app));
+    // ...and it says whether the job has a ligand, or every job gets the
+    // protein start and the ligand arm is dead code.
+    assert.ok(/hasLigand: ligandCodes\.length > 0 \|\| modifications\.length > 0/.test(app));
+  });
+});

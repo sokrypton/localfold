@@ -38,7 +38,8 @@ import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
-import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
+import { OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
+  countsForFamily, diffusionScheduleFor,
   samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
@@ -2065,6 +2066,16 @@ function foldIsShowing(renderer) {
  * never draws.
  */
 function revealViewer(renderer) {
+  // 🔴 THE CONFIDENCE TRACE IS ASKED FOR HERE, BECAUSE ONLY WE KNOW IT IS ONE.
+  // py2Dmol reads a B-FACTOR column into `plddts` for every structure there
+  // is, so its own page deliberately does not offer the plot - a graph titled
+  // pLDDT over a crystal structure is a label that is simply wrong. Every
+  // structure on THIS page is a prediction, so the ambiguity does not exist
+  // here and the panel is switched on. `initialize` is idempotent, which is
+  // what lets this sit on a function that runs per fold rather than once.
+  try {
+    if (window.Plddt && renderer) window.Plddt.initialize(renderer);
+  } catch { /* a missing panel is a lost tab, not a lost fold */ }
   const container = document.getElementById("viewer-container");
   if (container === null || getComputedStyle(container).display !== "none") return;
   container.style.display = "flex";
@@ -2644,8 +2655,8 @@ function syncAf3Count() {
   const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
   // ...and OpenDDE's own, because more steps make its fold worse; see
   // OPENDDE_COUNTS for the two targets and nine folds that say so.
-  const table = ef2 ? ESMFOLD2_COUNTS
-    : chosenFamily() === "opendde" ? OPENDDE_COUNTS : AF3_COUNTS;
+  // ...and AlphaFold 3's, whose short schedule is its own; see ALPHAFOLD3_COUNTS.
+  const table = ef2 ? ESMFOLD2_COUNTS : countsForFamily(chosenFamily());
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : mode]
     ?? table.flow ?? table.diffusion;
   const title = document.getElementById("af3-count-label");
@@ -2855,13 +2866,12 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // value: the shared `#af3-mode` select still reads "flow" behind a hidden
   // row, which is the trap docs/EF2FAST.md records for that model an hour
   // after hiding its own.
-  const opendde = chosenFamily() === "opendde";
   // 🔴 FORCED FOR rosettafold3 TOO, and for a worse reason than OpenDDE's - see
   // `samplerModeFor`. Hiding the row does not change the select's value, which
   // is the trap the comment above records.
   const mode = samplerModeFor(chosenFamily(),
     document.getElementById("af3-mode")?.value ?? "diffusion");
-  const counts = opendde ? OPENDDE_COUNTS : AF3_COUNTS;
+  const counts = countsForFamily(chosenFamily());
   // 🔴 THE SAME FALLBACK AS `syncAf3Count`, AND IT WAS MISSING HERE. That
   // function reads `table[mode] ?? table.flow ?? table.diffusion`; this one
   // subscripted the table and took `.preferred` off whatever came back, so a
@@ -3024,6 +3034,12 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let viewerModified = [];
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
+    // AlphaFold 3's short schedule below its own twenty-five steps; see
+    // ALPHAFOLD3_COUNTS in web/af3-model.js.
+    // ...and lower where the job carries a ligand or a modified residue,
+    // which the low-noise calls settle; see SHORT_SCHEDULES.
+    schedule: diffusionScheduleFor(family, mode, calls,
+      { hasLigand: ligandCodes.length > 0 || modifications.length > 0 }),
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds,
     // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes

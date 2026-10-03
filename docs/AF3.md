@@ -6440,3 +6440,98 @@ this same function - the A10 has the reference checkout.
 The counts on the small targets are small enough to be noisy: one clash in 595
 atoms is 1.68, so 5K9P's rosettafold3 15.13 is nine clashes and 6MRR's
 rosettafold3 0 is none. The pooled row is the one to quote.
+
+## 🔴 AlphaFold 3 takes twenty steps from sigma 80, not twenty-five from 160
+
+Measured on the M2 (2026-09-26), AF3 int5, stock flags. The schedule starts at
+160 x sigmaData, where the denoiser's skip weight is ~4e-5 and its output all
+but ignores its input, and rho 7 still spends several of twenty-five calls up
+there. Fewer steps on the same schedule is the regression the note under
+`AF3_COUNTS` records; fewer steps from a LOWER START is not.
+
+`tools/gpu/bench-sampler-geometry.js --schedule-arms=` (new: named arms with
+their own `sigmaMax`, `rho`, ...) over seven systems and eight seeds, bond rms,
+plus `fold-opendde.js --schedule=` (new) against the crystal, four seeds:
+
+| arm | calls | bond median | mean | > 0.15 A | 6MRR | 1QYS |
+|---|---:|---:|---:|---:|---:|---:|
+| diffusion 25 | 25 | 0.0576 | 0.0841 | 6/56 | 0.640 | 0.906 |
+| **sigmaMax 80, 20** | **20** | **0.0561** | **0.0777** | **5/56** | **0.593** | **0.896** |
+| sigmaMax 80, 16 | 16 | 0.0588 | 0.0653 | 3/56 | 0.690 | 0.843 |
+| sigmaMax 40, 16 | 16 | 0.0592 | 0.0610 | 1/56 | 0.721 | 0.938 |
+| sigmaMax 20, 16 | 16 | 0.0581 | 0.0816 | 6/56 | 0.711 | 0.938 |
+| diffusion 16 | 16 | 0.0625 | 0.0760 | 4/56 | - | - |
+
+5CAJ with a self-template is 0.244 A either way; 5K9P from sequence fails either
+way. The trade inside the table is real: the high-noise calls PLACE the chain
+(RMSD wants a high start) and the low-noise density fixes BONDS (a ligand or a
+modified residue wants a low one). 80 at 20 wins both; 40 at 16 is the best
+bond geometry here and 0.08 A worse on 6MRR.
+
+🔴 **THE SEP COLUMN IS ONE SEED WIDE.** Across three rounds the 25-step
+baseline's phosphoserine median read 0.099, 0.222 and 0.367 - a single bad
+draw moves the mean - so rank arms on the median and the count over 0.15 A,
+over eight seeds or more, never on three.
+
+The page: `ALPHAFOLD3_COUNTS` (20 preferred) and `diffusionScheduleFor` in
+web/af3-model.js, read once through `countsForFamily`, gated by
+test/sampler-options.test.js. AlphaFold 3 ONLY - boltz2 has its own schedule
+(rho 8) and the other families are unmeasured, so they keep 25 on theirs. Page
+fold, 6MRR, first visit: done at 2653-2680 ms -> **2298-2415**, pLDDT 67.4 ->
+69.2.
+
+### 🔴 ...and the other six checkpoints: it does NOT transfer as one setting
+
+The same arms against each family's OWN twenty-five-step schedule, same
+panel (bonds over seven systems x eight seeds; CA-RMSD over four seeds):
+
+| family | 6MRR | 1QYS | bonds | ligands | verdict |
+|---|---|---|---|---|---|
+| intellifold2 | 1.528 -> 1.533 | 1.223 -> **1.027** | median 0.082 -> 0.076, bad 14 -> 9 | GOL 0.120 -> **0.052**, SEP 0.202 -> 0.094 | **taken** |
+| protenix2 | 1.236 -> **0.846** | 0.936 -> 0.892 | level | GOL 0.097 -> 0.118, SEP better | held: ligand sweep |
+| openbind0 | 1.706 -> 1.546 | 0.957 -> 0.876 | level | GOL 0.117 -> 0.174, ATP better | held: ligand sweep |
+| boltz2 | 0.508 -> 0.529 | 0.896 -> 0.852 | level | GOL 0.032 -> 0.051 | not taken |
+| rosettafold3 | 1.597 -> 1.627 | 0.957 -> 0.884 | level | **GOL 0.095 -> 0.409** | not taken |
+| opendde | 16 at 160 vs 12 at 80: level | level | not runnable | - | not taken |
+
+🔴 **rosettafold3 at sigma 80 / 20 returned a fold that is NOT A CHAIN** - 1QYS
+seed 3, a consecutive CA-CA of 8.29 A, pLDDT 80.15 - while its own twenty-five
+on the same seed is fine. The schedule is a per-checkpoint constant exactly as
+`dialect.sampler` already is (boltz2's rho 8), and one family's win is no
+evidence for the next: `SHORT_SCHEDULE_FAMILIES` in web/af3-model.js is the list.
+
+🔴 **THE TRADE IS WHERE THE CALLS SIT, AND LIGANDS PULL THE OTHER WAY.** sigma 80
+at 20 keeps the default's calls below 1 A (4) and cuts the ones above 640 A
+(6 -> 3), which is where the fold gains come from; a small flexible ligand
+(glycerol) settles in the 1-16 A band, which 20 steps thins. A lower start (40)
+is the best glycerol on AF3 and protenix2 and the worst fold placement. So a
+schedule that depends on whether the job HAS a ligand - which the page knows
+before the fold - is the next thing to measure, with `--ligands=` over a real
+set rather than three molecules.
+
+### 🔴 ...and the start depends on whether the job has a ligand
+
+Ten CCD ligands (GOL EDO ATP ADP BTN SAM PLP HEM NAD FAD) x four seeds,
+`bench-sampler-geometry.js --ligands=`, mean ligand bond rms (median, count
+over 0.15 A of 40):
+
+| family | own 25 | sigma 80 / 20 | sigma 40 / 20 |
+|---|---|---|---|
+| af3 | 0.064 (0.048, 2) | 0.061 (0.047, 2) | **0.051** (0.047, 0) |
+| protenix2 | 0.084 (0.055, 4) | 0.086 (0.059, 6) | **0.075** (0.056, 4) |
+| openbind0 | 0.100 (0.067, 7) | 0.117 (0.072, 9) | **0.080** (0.058, 3) |
+| intellifold2 | 0.153 (0.120, 18) | **0.139** (0.077, 15) | 0.167 (0.084, 14) |
+
+The high-noise calls place a chain and the low-noise calls settle a small
+molecule, so at the same twenty calls the start should follow the job:
+`SHORT_SCHEDULES` in web/af3-model.js names a protein start and a ligand start
+per family (80/40 for af3, protenix2 and openbind0; 80/80 for intellifold2),
+and the page passes `hasLigand` for a ligand or a modified residue. That brings
+protenix2 and openbind0 in: sigma 80 improves their plain folds (above) and
+sigma 40 beats their own twenty-five on ligands.
+
+🔴 **THE FOUR "NOT A CHAIN" ROWS IN EVERY ARM ARE THE BENCH, NOT THE FOLD.**
+S-adenosylmethionine carries an atom named CA, and the bench's backbone check
+collects every CA in the PDB - so the SAM row reads as broken at a CA-CA of
+3.83 A in all three arms. Filter the ligand's residue before trusting that
+column.

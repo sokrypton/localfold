@@ -348,6 +348,10 @@ export async function main(device, args) {
     // criterion; 0 is off. See src/af3/feature-convergence.js.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     mode: option(args, "mode", "diffusion"),
+    // `--schedule=sigmaMax=40+rho=7` overrides the sampler's EDM schedule.
+    ...(option(args, "schedule", "") === "" ? {} : { schedule: Object.fromEntries(
+      option(args, "schedule", "").split("+").map((p) => p.split("="))
+        .map(([k, v]) => [k, Number(v)])) }),
     // 🔴 THE CONFIDENCE HEAD'S REAL INPUTS, for the arm its oracle cannot be:
     // dump_af3_opendde_confidence.py synthesises the atom layout and feeds
     // seeded normals, so the head has never seen a real trunk's pair here.
@@ -473,6 +477,10 @@ export async function main(device, args) {
         : args.includes("--resident") ? true : undefined,
       steps, recycles, seed: Number(option(args, "seed", "20260831")),
       mode: option(args, "mode", "diffusion"),
+    // `--schedule=sigmaMax=40+rho=7` overrides the sampler's EDM schedule.
+    ...(option(args, "schedule", "") === "" ? {} : { schedule: Object.fromEntries(
+      option(args, "schedule", "").split("+").map((p) => p.split("="))
+        .map(([k, v]) => [k, Number(v)])) }),
       onStage: (name) => {
         const now = performance.now();
         if (lastStage !== null) {

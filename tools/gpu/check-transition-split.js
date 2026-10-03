@@ -28,6 +28,13 @@
  * boundary is a place three shaders have to agree about where a row is. The
  * default forces a chunk far smaller than any of the row counts, so every arm
  * here crosses several of them; `--chunk=0` is the unchunked path.
+ *
+ * 🔴 `--vector=1` IS THE SPLIT A STOCK BROWSER RUNS, AND WITHOUT IT THIS CHECKED
+ * ONLY THE MATRIX ONE. No stock browser exposes subgroup matrices, so from
+ * VECTOR_SPLIT_MIN_CHANNELS up every visitor gets `createVectorGemmShader`, with
+ * f16 scratch where the device has `shader-f16` - which an M2 does and a stock
+ * A100 does not, so that storage had never run anywhere. It needs no matrix
+ * config: `--vector=1 --normalized=f32 --wide=f32` is the storage control.
  */
 import {
   createTransitionShader, createTransitionSplitShaders, packTransitionWeights,
@@ -72,14 +79,19 @@ export async function main(device, args) {
   const forcedChunk = Number(option(args, "chunk", "256"));
   const normalizedStorage = option(args, "normalized", "f16");
   const wideStorage = option(args, "wide", "f16");
-  const bound = Number(option(args, "bound", normalizedStorage === "f32" && wideStorage === "f32"
-    ? "6e-3" : "1e-2"));
+  const allF32 = normalizedStorage === "f32" && wideStorage === "f32";
+  // The vector split multiplies in f32 with an f32 accumulator, as the fused
+  // kernel does, so with f32 scratch the two differ only by summation order.
+  const vectorArm = option(args, "vector", "0") === "1";
+  const bound = Number(option(args, "bound",
+    vectorArm ? (allF32 ? "1e-5" : "1e-2") : (allF32 ? "6e-3" : "1e-2")));
   const epsilon = 1e-5;
   const variance = "fast";
   const intermediate = channels * factor;
 
-  const config = deviceMatrixConfig(device, { element: "f16" });
-  if (config === null) {
+  const vector = option(args, "vector", "0") === "1";
+  const config = vector ? null : deviceMatrixConfig(device, { element: "f16" });
+  if (!vector && config === null) {
     return { skipped: "this device has no f16 subgroup matrix configuration" };
   }
 
@@ -142,14 +154,14 @@ export async function main(device, args) {
       { rows, channels, factor }, packed.offsets, epsilon, variance,
       { normalizedStorage, wideStorage, weightPrecision: splitWeightPrecision,
         // ...at the block that SHIPS, unless --block= says otherwise.
-        matrix: { result: config.resultComponentType, matrixElement: config.componentType,
+        matrix: vector ? { vector: true, storage: wideStorage } : { result: config.resultComponentType, matrixElement: config.componentType,
                   tile: { M: config.M, N: config.N, K: config.K },
                   ...stagedMatrixBlock(option(args, "block", null)
                     ?? deviceTuning(device).stagedMatrixBlock),
                   ...(direct ? { directWeights: true } : {}),
                   ...(prefetch ? { prefetch: true } : {}),
                   ...(resultType === "" ? {} : { result: resultType }) } });
-    const bytes = stagedMatrixStorage({
+    const bytes = vector ? 0 : stagedMatrixStorage({
       ...split.geometry, tile: { M: config.M, N: config.N, K: config.K },
       result: config.resultComponentType });
     if (bytes > device.limits.maxComputeWorkgroupStorageSize) {
@@ -264,5 +276,6 @@ export async function main(device, args) {
   }
 
   if (failed > 0) throw new Error(`${failed} split transition shape(s) outside tolerance`);
-  return { channels, factor, intermediate, normalizedStorage, wideStorage, bound, rows: rows_ };
+  return { path: vector ? "vector" : "matrix", channels, factor, intermediate,
+           normalizedStorage, wideStorage, bound, rows: rows_ };
 }
