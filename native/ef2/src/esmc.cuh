@@ -66,13 +66,27 @@ __global__ void softmaxSeqK(float* S, const int* seq, int rows, float scale) {
 
 struct Esmc { int rows, model, heads, ffn, layers, pair; };
 
+// --fast: the tower's four matrices a block run on their f16 mirror, and their f32 copy is dropped from
+// the device (compactTowerWeights): 2.2 GB of the 2.9 GB of weights, never read again in f32
+inline bool TOWER16 = true;      // --no-tower16: the tower's f32 copies kept, TF32 GEMMs
+inline bool towerHalf(const std::string& name) {
+  if (!TOWER16 || name.rfind("c/blocks/", 0)) return false;
+  for (const char* m : {"/qkv/weights", "/attn_out/weights", "/fc1/weights", "/fc2/weights"})
+    if (name.size() > strlen(m) && !name.compare(name.size() - strlen(m), strlen(m), m)) return true;
+  return false;
+}
+inline void towerGemm(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f) {
+  if (FAST && TOWER16) gemmH(X, Wh("c/" + w), Y, rows, in, out, beta);
+  else gemm(X, Cw(w), Y, rows, in, out, beta);
+}
+
 inline void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
   std::string B = "blocks/" + std::to_string(layer) + "/";
   size_t R = e.rows; int C = e.model;
   float* xn = scratch<float>("esmc.xn", R * C);
   float* qkv = scratch<float>("esmc.qkv", R * 3 * C);
   layerNorm(x, xn, R, C, Cw(B + "attn_norm/scale"), Cw(B + "attn_norm/offset"));
-  gemm(xn, Cw(B + "qkv/weights"), qkv, R, C, 3 * C);
+  towerGemm(xn, B + "qkv/weights", qkv, R, C, 3 * C);
   float* q = scratch<float>("esmc.q", R * C); float* k = scratch<float>("esmc.k", R * C);
   layerNorm(qkv, q, R, C, Cw(B + "q_norm/scale"), nullptr, 1e-5f, 3 * C, C);
   layerNorm(qkv + C, k, R, C, Cw(B + "k_norm/scale"), nullptr, 1e-5f, 3 * C, C);
@@ -89,12 +103,12 @@ inline void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 64, (int)R, (int)R, &one, qkv + 2 * C, 3 * C, 64, S,
                                  (int)R, (long long)R * R, &zero, ctx, C, 64, e.heads));
   }
-  gemm(ctx, Cw(B + "attn_out/weights"), x, R, C, C, 1.f);
+  towerGemm(ctx, B + "attn_out/weights", x, R, C, C, 1.f);
   layerNorm(x, xn, R, C, Cw(B + "ffn_norm/scale"), Cw(B + "ffn_norm/offset"));
   float* h = scratch<float>("esmc.h", R * 2 * e.ffn); float* g = scratch<float>("esmc.g", R * e.ffn);
-  gemm(xn, Cw(B + "fc1/weights"), h, R, C, 2 * e.ffn);
+  towerGemm(xn, B + "fc1/weights", h, R, C, 2 * e.ffn);
   swigluK<<<blocks(R * e.ffn), 256, 0, STREAM>>>(h, g, R, e.ffn);
-  gemm(g, Cw(B + "fc2/weights"), x, R, e.ffn, C, 1.f);
+  towerGemm(g, B + "fc2/weights", x, R, e.ffn, C, 1.f);
 }
 
 __global__ void axpyK(float* y, const float* x, float a, size_t n) {

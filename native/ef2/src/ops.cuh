@@ -30,6 +30,15 @@ inline void gemm(const float* X, const float* Wt, float* Y, size_t rows, int in,
                  ldy ? ldy : out));
 }
 
+// the same with an f16 weight (W's mirror) and f32 X and Y: X narrowed to f16, tensor cores, f32 accumulation
+inline void gemmH(const float* X, const half* Wt, float* Y, size_t rows, int in, int out, float beta = 0.f) {
+  half* xh = scratch<half>("gemmh.x", rows * in);
+  toHalfK<<<blocks(rows * in), 256, 0, STREAM>>>(X, xh, rows * in);
+  const float one = 1.f;
+  CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, (int)rows, in, &one, Wt, CUDA_R_16F, out, xh, CUDA_R_16F, in, &beta,
+                  Y, CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
 // ---------------------------------------------------------------- elementwise
 __global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

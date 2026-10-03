@@ -17,6 +17,7 @@
 #include <set>
 #include <fstream>
 #include <functional>
+#include <array>
 #include <map>
 #include <deque>
 #include <tuple>
@@ -126,6 +127,30 @@ struct Model {
     });
   }
   void waitUploads() { for (auto& [seg, th] : pending) th.join(); pending.clear(); }
+  // the device copy rebuilt without the entries `drop` names - read from their f16 mirror from now on
+  // (build it first); dev() of a dropped entry is an error. The caller forgets any pointer it cached.
+  static constexpr size_t DROPPED = ~(size_t)0;
+  size_t compact(int seg, const std::function<bool(const std::string&)>& drop) {
+    Segment& s = segs[seg];
+    if (!s.device) { fprintf(stderr, "compact: the file is not on the device\n"); exit(1); }
+    std::vector<std::pair<Entry*, std::string>> keep;
+    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm' && e.devOffset != DROPPED) keep.push_back({&e, name});
+    std::sort(keep.begin(), keep.end(), [](auto& a, auto& b) { return a.first->devOffset < b.first->devOffset; });
+    size_t at = 0; std::vector<std::array<size_t, 3>> moves; std::vector<Entry*> dropped;
+    for (auto& [e, name] : keep) {
+      if (drop(name)) { dropped.push_back(e); continue; }
+      at = (at + 3) / 4 * 4;
+      moves.push_back({e->devOffset, at, e->length}); e->devOffset = at; at += e->length;
+    }
+    float* fresh; CK(cudaMalloc(&fresh, std::max<size_t>(at, 1) * 4));
+    for (auto& m : moves) CK(cudaMemcpyAsync(fresh + m[1], s.device + m[0], m[2] * 4, cudaMemcpyDeviceToDevice, STREAM));
+    CK(cudaStreamSynchronize(STREAM));
+    CK(cudaFree(s.device));
+    size_t freed = s.deviceBytes - at * 4;
+    s.device = fresh; s.deviceBytes = at * 4;
+    for (Entry* e : dropped) e->devOffset = DROPPED;
+    return freed;
+  }
   // a file's bytes onto the device: from the mapping through small pinned buffers, three threads
   // copying each 8 MB piece while the last one's DMA runs - 77 against 170 ms for the 1.47 GB of
   // weights from pageable memory (the pinning costs 19 of it, a larger piece costs more)
@@ -196,6 +221,7 @@ struct Model {
         fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
       }
     }
+    if (e.devOffset == DROPPED) { fprintf(stderr, "%s: its f32 device copy was dropped (read its f16 mirror)\n", k.c_str()); exit(1); }
     return s.device + e.devOffset;
   }
   bool has(const std::string& k) const { return index.count(k) > 0; }
@@ -356,10 +382,10 @@ __global__ void convertTableK(const float* src, half* dst, const size_t* from, c
 inline const half* segmentHalf(const std::string& k) {
   const Entry& e0 = M.at(k);
   Segment& s = M.segs[e0.seg];
-  M.dev(k);
   std::string group = halfGroup(k);
   void*& mirror = s.halfMirrors[group];
   if (!mirror) {
+    M.dev(k);
     std::vector<size_t> from, to, len; std::vector<std::string> names; size_t total = 0;
     for (auto& [name, e] : M.index) {
       if (e.seg != e0.seg || e.kind != 't' || halfGroup(name) != group) continue;
@@ -394,6 +420,15 @@ inline const half* Wh(const std::string& k) {
   half* h = dallocT<half>(n);
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(f, h, n);
   return WH[k] = h;
+}
+// a file's device copy without the entries `drop` names (they must have their f16 mirror already):
+// every cached f32 pointer into it forgotten
+inline size_t compactWeights(int seg, const std::function<bool(const std::string&)>& drop) {
+  size_t freed = M.compact(seg, drop);
+  for (auto it = WF.begin(); it != WF.end();) {
+    if (M.has(it->first) && M.at(it->first).seg == seg) it = WF.erase(it); else ++it;
+  }
+  return freed;
 }
 // every weight derived from the device copies forgotten - f16 mirrors and copies, weights built on the
 // device - after a warm-up that ran while a copy was still arriving (M.uploadAsync): they are rebuilt

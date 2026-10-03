@@ -83,12 +83,15 @@ static int foldInput(const Opts& o, bool warm) {
   float* hidden = check ? dalloc((size_t)T * states * e.model) : nullptr;
   float* lmZ = dalloc((size_t)T * T * e.pair);
   auto t0 = std::chrono::steady_clock::now();
+  bool profLm = profile && getenv("EF2_PROFILE") && std::string(getenv("EF2_PROFILE")) == "lm";
+  if (profLm) { prof::init(); prof::start(); }
   languageModel(e, Idev("lm/ids"), Idev("lm/sequence_id"), Idev("lm/token_to_row"), T, lmZ,
                 [&](int k, const float* x) {
                   if (check) gatherStateK<<<blocks((size_t)T * e.model), 256, 0, STREAM>>>(x, Idev("lm/token_to_row"),
                                                                                          hidden, T, states, k, e.model);
                 });
   CK(cudaStreamSynchronize(STREAM));
+  if (profLm) prof::stop(15);
   say("language model %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   if (check) {
     checkOracle("lm hidden states (37)", hidden, (size_t)T * states * e.model, "o/lm_hidden");
@@ -115,9 +118,12 @@ static int foldInput(const Opts& o, bool warm) {
   float* zi = dalloc((size_t)T * T * C); float* z = dalloc((size_t)T * T * C);
   zInit(T, C, sInputs, Si, lmZ, zi, check);
   CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr;
-  releaseScratch();
+  // a large input gives each phase the whole card: its predecessor's scratch released (a pair over
+  // 128 MB, ~350 tokens). Below that the scratch is kept - re-allocating it cost every phase cudaMallocs
+  bool tight = (size_t)T * T * C * 4 > ((size_t)128 << 20);
+  if (tight) releaseScratch();
   t0 = std::chrono::steady_clock::now();
-  // --profile times one stage's kernels: EF2_PROFILE=trunk (the default), sampler or confidence
+  // --profile times one stage's kernels: EF2_PROFILE=trunk (the default), lm, sampler or confidence
   std::string profStage = getenv("EF2_PROFILE") ? getenv("EF2_PROFILE") : "trunk";
   bool profTrunk = profile && profStage == "trunk";
   if (profTrunk) { prof::init(); prof::start(); }
@@ -127,12 +133,12 @@ static int foldInput(const Opts& o, bool warm) {
   say("trunk %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   mem("trunk");
   CK(cudaFree(zi)); zi = nullptr;
-  releaseScratch();
+  if (tight) releaseScratch();
   if (check) {                                   // (nothing else reads the distogram)
     float* dg = dalloc((size_t)T * T * (int)M.meta("meta/distogramBins"));
     distogram(z, T, C, dg);
     checkOracle("distogram", dg, (size_t)T * T * (int)M.meta("meta/distogramBins"), "o/distogram");
-    CK(cudaFree(dg)); releaseScratch();
+    CK(cudaFree(dg)); if (tight) releaseScratch();
   }
   Denoiser dn = makeDenoiser(T, A, z, sInputs, check);
   mem("denoiser built");
@@ -154,7 +160,7 @@ static int foldInput(const Opts& o, bool warm) {
   std::vector<float> coords = sample(dn, sampler, seed, &stepsRun);
   if (profSampler) { CK(cudaStreamSynchronize(STREAM)); prof::stop(30); }
   mem("sampler");
-  freeDenoiser(dn); releaseScratch();
+  freeDenoiser(dn); if (tight) releaseScratch();
   say("sampler %.1f ms (%d steps)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stepsRun);
   if (!M.has("f/confidence/pae")) {
     fprintf(stderr, "the weights carry no confidence head: export them from model-esmfold2-conf-f32 (see native/ef2/README.md)\n");
@@ -185,7 +191,7 @@ static int foldInput(const Opts& o, bool warm) {
   // everything given back, so a warm-up leaves the real fold the card it had
   CK(cudaStreamSynchronize(STREAM));
   for (float* p : {z, sInputs, xd, hidden}) if (p) CK(cudaFree(p));
-  releaseScratch();
+  if (tight) releaseScratch();
   return 0;
 }
 
@@ -201,6 +207,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strcmp(argv[i], "--no-sampler16")) SAMPLER16 = false;
+    else if (!strcmp(argv[i], "--no-tower16")) TOWER16 = false;
     else if (!strcmp(argv[i], "--no-sampler-graph")) SAMPLER_GRAPH = false;
     else if (!strcmp(argv[i], "--atom-f32")) ATOM_BF16 = false;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
@@ -247,8 +254,16 @@ int main(int argc, char** argv) {
     M.waitUploads();
     forgetDerivedWeights();
   }
+  // --fast: the f16 mirrors made now (the ESM-C tower's, the folding bundle's), and the tower's matrices'
+  // f32 copy dropped from the device - 2.2 GB, read only through the mirror on this path
+  size_t dropped = 0;
+  if (FAST) {
+    Wh("c/blocks/0/qkv/weights"); Wh("f/blocks/0/pairTransition/transition1");
+    dropped = compactWeights(0, towerHalf);
+  }
   if (getenv("EF2_STARTUP")) {
     auto now = std::chrono::steady_clock::now();
+    printf("tower f32 copies dropped: %.2f GB\n", dropped / 1e9);
     printf("context %.0f ms, weights up%s %.0f ms\n", std::chrono::duration<double, std::milli>(tCtx - tStart).count(),
            warming ? " and warm-up" : "", std::chrono::duration<double, std::milli>(now - tCtx).count());
   }

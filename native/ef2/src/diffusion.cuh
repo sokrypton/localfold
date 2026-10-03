@@ -182,7 +182,7 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
     else { float* f = dalloc(P * d.heads); pairToHeadsK<<<blocks(P * d.heads), 256, 0, STREAM>>>(pb, f, P, d.heads); bias = f; }
     d.biases.push_back(bias);
   }
-  releaseScratch();               // the joined and projected pairs: only the biases are kept
+  if ((size_t)P * Cz * 4 > ((size_t)128 << 20)) releaseScratch();     // the joined and projected pairs (a large input)
   d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
   int Ct = d.Ct, nb = d.tokenBlocks;
   d.entries = 6 * nb;

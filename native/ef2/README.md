@@ -191,7 +191,13 @@ The fold's own compute is 0.09 and 0.40 s of that. The rest:
 
 ## Memory
 
-Peak device memory at 783 tokens (5CAJ's chain three times), `--fast`: **15.9 → 8.0 GB**.
+Peak device memory at 783 tokens (5CAJ's chain three times), `--fast`: **15.9 → 6.8 GB**.
+- The ESM-C tower's four matrices a block run on their f16 mirror (`gemmH`), and their f32 device copy
+  is dropped once the mirror is built (native/af3's `compactWeights`): 2.29 GB, the bulk of the 2.9 GB of
+  weights. LM pair 2.4e-4 against the oracle, as under TF32, and slightly faster (783 tokens: 58.9 against
+  61.2 ms). `--no-tower16` keeps the f32 copies.
+- From ~350 tokens (a pair over 128 MB) each phase gives its predecessor's scratch back. Below that the
+  scratch is kept, because re-allocating it cost every phase `cudaMalloc`s (6MRR's language model 12 → 9 ms).
 - Each phase gives its buffers back when it is done: the language model's pair after z_init, z_init and
   the trunk's scratch after the trunk, the denoiser's after the sampler. The warm-up fold used to keep
   everything it allocated under the real fold.
