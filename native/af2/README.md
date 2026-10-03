@@ -194,3 +194,9 @@ that kernel gained (`fusedTransitionK<..., RELU>`; AF3's SwiGLU instantiation un
 and the 512-wide rows never written. 1% on an A100 (1.71 -> 1.69 s at 262 tokens and 512 rows), where the
 GEMMs bind; the bytes it saves are what a T4's or an L4's transition is made of.
 
+
+Measured and left (2026-10-03, A100, 262 residues, 512 alignment rows): the MSA column attention's
+strided flash kernel at 8 warps rather than 4 is slower (235 against 224 ms of strided flash a fold), and
+its transposed-copy form (the masked path's) runs the attention at the same speed and adds 110 ms of
+transposes - the strided reads are not what it spends. At ~73 TFLOP/s (70 GFLOP a call) it is not the
+outlier its time share suggests.
