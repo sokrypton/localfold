@@ -177,3 +177,15 @@ and the fold). The baseline is this machine's.
   error 15 several kernels later.
 - **The side-chain kernel launched 128 threads over a 256-residue grid**, so it computed the first
   128 residues only. It was invisible on every input shorter than that.
+
+## Shared with native/af3: the fused triangle multiplication
+
+AlphaFold 2's triangle multiplication at 128 channels is AlphaFold 3's with biases, and it had its own
+unfused path (LayerNorm, a [C, 5C] GEMM, a gate kernel, the contraction, a centre norm, the output GEMM, a
+gated add). It now runs native/af3's fused kernels (src/fusedtriangle.cuh: `triInK`, `triOutPK`) through
+their raw-pointer launchers, with a BIAS option those kernels gained (AF3's own instantiations unchanged,
+byte-identical folds) and the weights re-laid once (AF3 interleaves a and b's columns where AF2 stores the
+halves one after the other: `interleaveTriK`). a and b in f16 and the product in f32, as AF2's path had
+them. 262 tokens with 512 alignment rows: 1.80 -> 1.71 s on an A100; every `test:native` AF2 case at its
+previous RMSD. The template stack's 64-channel triangle keeps the unfused path.
+

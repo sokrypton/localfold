@@ -2,6 +2,7 @@
 // the ReLU and the residual add in cuBLASLt's epilogue, and weights re-laid once for them.
 #pragma once
 #include "ops.cuh"
+#include "../../af3/src/fusedtriangle.cuh"
 
 // ---------------------------------------------------------------- cuBLASLt, row-major
 // Y[rows, out] (f32 or f16) = X[rows, in] (f16) W[in, out] (f16) (+ bias[out] f32) (ReLU) (+ beta Y)
@@ -312,6 +313,34 @@ __global__ void centerNormTK(const float* prod, half* out, size_t pairs, int C, 
     float inv = rsqrtf(v / C + 1e-5f);
     for (int c = lane; c < C; c += 32) out[r * C + c] = __float2half((tile[c * 33 + row] - mean) * inv * scale[c] + offset[c]);
   }
+}
+// ...and at 128 channels native/af3's FUSED triangle (fusedtriangle.cuh: triInK, triOutPK - the LayerNorm'd
+// rows, the 4C projection and the centred rows never written), the same computation as AlphaFold 3's with
+// biases: AF3's kernels interleave a and b (column 2ch is a's channel ch, 2ch+1 b's) where AF2 stores the
+// halves one after the other, so the weights are re-laid once, and the biases ride along (BIAS)
+__global__ void interleaveTriK(const float* proj, const float* gate, const float* pb, const float* gb, const float* lb,
+                               half* wpg, float* bias, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < (size_t)C * 4 * C) {
+    int k = (int)(t / (4 * C)), col = (int)(t % (4 * C)), part = col / (2 * C), cc = col % (2 * C), ch = cc / 2;
+    const float* src = part ? gate : proj;
+    wpg[t] = __float2half(src[(size_t)k * 2 * C + (cc & 1) * C + ch]);
+  }
+  if (t < (size_t)5 * C) {
+    int col = (int)t;
+    if (col < 4 * C) { int part = col / (2 * C), cc = col % (2 * C), ch = cc / 2; bias[t] = (part ? gb : pb)[(cc & 1) * C + ch]; }
+    else bias[t] = lb[col - 4 * C];
+  }
+}
+struct TriFused { const half* wpg; const float* bias; };
+inline TriFused triFusedWeights(const std::string& T, int blk, int C) {
+  static std::map<std::pair<std::string, int>, TriFused> cache;
+  auto it = cache.find({T, blk});
+  if (it != cache.end()) return it->second;
+  half* w = wpool<half>((size_t)C * 4 * C); float* b = wpool<float>((size_t)5 * C);
+  interleaveTriK<<<blocks((size_t)C * 4 * C), 256, 0, STREAM>>>(P(T + "/projection/weights", blk), P(T + "/gate/weights", blk),
+    P(T + "/projection/bias", blk), P(T + "/gate/bias", blk), P(T + "/gating_linear/bias", blk), w, b, C);
+  return cache[{T, blk}] = TriFused{w, b};
 }
 // pair += out * sigmoid(gate), the gate the [pairs, 5C] block's last C columns
 // pair += out * sigmoid(gate), the gate's rows ld apart

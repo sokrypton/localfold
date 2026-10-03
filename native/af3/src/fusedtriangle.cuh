@@ -52,12 +52,14 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
 constexpr int TI_NC = 32;
 __host__ __device__ constexpr size_t tiStage(int C) { return (size_t)2 * C * (TI_NC + 8) * 2; }
 
-// TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (f16 overflows)
-template <int C, int WARPS, class TA>
+// TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (f16 overflows).
+// BIAS: AlphaFold 2's projections carry biases, AF3's do not - `bias` is [4C, the projection | gate columns
+// in Wpg's order][C, the gating linear's]; without BIAS the kernel is the one AF3 has always run
+template <int C, int WARPS, class TA, bool BIAS = false>
 __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wpg,
     const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np,
-    size_t cs) {
+    size_t cs, const float* __restrict__ bias = nullptr) {
   // rows are the PADDED pair space (np x np, np a multiple of 8, which is what the contraction's
   // GEMM wants); a padding row maps to no pair and writes zeros
   const size_t pp = (size_t)np * np;
@@ -131,6 +133,18 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
         }
       }
     }
+    if constexpr (BIAS) {
+#pragma unroll
+      for (int nt = 0; nt < TI_NC / 8; ++nt) {
+        int col = (gating ? 4 * C + (j - C / 16) * TI_NC : j * TI_NC) + nt * 8 + tig * 2;
+        float b0 = bias[col], b1 = bias[col + 1];
+        p[nt][0] += b0; p[nt][1] += b1; p[nt][2] += b0; p[nt][3] += b1;
+        if (!gating) {
+          float g0 = bias[2 * C + col], g1 = bias[2 * C + col + 1];
+          q[nt][0] += g0; q[nt][1] += g1; q[nt][2] += g0; q[nt][3] += g1;
+        }
+      }
+    }
     if (gating) {                       // t2, row-major: columns (j - C/16)*32 + nt*8 + 2 tig
       int c0 = (j - C / 16) * TI_NC;
 #pragma unroll
@@ -171,10 +185,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
 }
 
 // pair += (LN_center(prod) Wout) * sigmoid(t2); prod channel-major [C][pairs] f32
-template <int C, int WARPS, class TP>
+template <int C, int WARPS, class TP, bool BIAS = false>
 __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
-    float* __restrict__ pair, int n, int np, size_t cs) {
+    float* __restrict__ pair, int n, int np, size_t cs, const float* __restrict__ bias = nullptr) {
   const size_t pp = (size_t)np * np;
   constexpr int PV = 16 / sizeof(TP);                               // product elements in 16 bytes
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + PV, LDX = C + 8, LDW = C + 8, KS = C / 16, NT = C / 8;
@@ -236,15 +250,17 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
 #pragma unroll
   for (int et = 0; et < NT; ++et) {
     int c = et * 8 + tig * 2;
+    float ob0 = 0.f, ob1 = 0.f;      // (the output projection's bias, where the model has one)
+    if constexpr (BIAS) { ob0 = bias[c]; ob1 = bias[c + 1]; }
     if (p0 != SIZE_MAX) {
       float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r0 * C + c));
       float2* p = (float2*)(pair + p0 * C + c); float2 v = *p;
-      v.x += acc[et][0] * sigm(gt.x); v.y += acc[et][1] * sigm(gt.y); *p = v;
+      v.x += (acc[et][0] + ob0) * sigm(gt.x); v.y += (acc[et][1] + ob1) * sigm(gt.y); *p = v;
     }
     if (p1 != SIZE_MAX) {
       float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r1 * C + c));
       float2* p = (float2*)(pair + p1 * C + c); float2 v = *p;
-      v.x += acc[et][2] * sigm(gt.x); v.y += acc[et][3] * sigm(gt.y); *p = v;
+      v.x += (acc[et][2] + ob0) * sigm(gt.x); v.y += (acc[et][3] + ob1) * sigm(gt.y); *p = v;
     }
   }
 }
@@ -252,10 +268,10 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
 // triOutK as a PERSISTENT kernel: each block keeps the output projection in shared memory for
 // every tile it takes and prefetches its next product tile while it computes the current one
 // (the one-shot kernel loaded 32 KB of weights and its tile, then computed, at two blocks an SM)
-template <int C, int WARPS, class TP>
+template <int C, int WARPS, class TP, bool BIAS = false>
 __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
-    float* __restrict__ pair, int n, int np, size_t cs) {
+    float* __restrict__ pair, int n, int np, size_t cs, const float* __restrict__ bias = nullptr) {
   const size_t pp = (size_t)np * np;
   constexpr int PV = 16 / sizeof(TP);
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + PV, LDX = C + 8, LDW = C + 8, KS = C / 16, NT = C / 8;
@@ -352,13 +368,15 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
 #pragma unroll
     for (int et = 0; et < NT; ++et) {
       int c = et * 8 + tig * 2;
+      float ob0 = 0.f, ob1 = 0.f;
+      if constexpr (BIAS) { ob0 = bias[c]; ob1 = bias[c + 1]; }
       if (p0 != SIZE_MAX) {
         float2 gt = __half22float2(gv[et][0]), v = pv[et][0];
-        v.x += acc[et][0] * sigm(gt.x); v.y += acc[et][1] * sigm(gt.y); *(float2*)(pair + p0 * C + c) = v;
+        v.x += (acc[et][0] + ob0) * sigm(gt.x); v.y += (acc[et][1] + ob1) * sigm(gt.y); *(float2*)(pair + p0 * C + c) = v;
       }
       if (p1 != SIZE_MAX) {
         float2 gt = __half22float2(gv[et][1]), v = pv[et][1];
-        v.x += acc[et][2] * sigm(gt.x); v.y += acc[et][3] * sigm(gt.y); *(float2*)(pair + p1 * C + c) = v;
+        v.x += (acc[et][2] + ob0) * sigm(gt.x); v.y += (acc[et][3] + ob1) * sigm(gt.y); *(float2*)(pair + p1 * C + c) = v;
       }
     }
     __syncthreads();                                                 // Xs and this stage are reused
@@ -382,26 +400,32 @@ template <class F> int warpsFitting(int w, std::initializer_list<int> options, F
   for (int o : options) { if (o == w) from = true; if (from && fitsSmem(smemFor(o))) return o; }
   return 0;
 }
-template <class TA, int WARPS>
-void triInAt(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
-             TA* a, TA* b, half* t2, int n, int np, size_t cs) {
+// the launchers on raw pointers (AlphaFold 2 calls these with its own weights and biases), then AF3's by name
+template <class TA, int WARPS, bool BIAS>
+void triInLaunch(const float* pair, const float* mask, const float* lnScale, const float* lnOffset, const half* Wpg,
+                 const half* Wg, const float* bias, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * WARPS;
   size_t pp = (size_t)np * np;
   size_t smem = (size_t)R * (C + 8) * 2 + 2 * tiStage(C);
   static bool attr = false;
-  if (!attr) { smemAttr((triInK<C, WARPS, TA>), (int)smem); attr = true; }
-  triInK<C, WARPS, TA><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-    pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
-    a, b, t2, n, np, cs);
+  if (!attr) { smemAttr((triInK<C, WARPS, TA, BIAS>), (int)smem); attr = true; }
+  triInK<C, WARPS, TA, BIAS><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+    pair, mask, lnScale, lnOffset, Wpg, Wg, a, b, t2, n, np, cs, bias);
 }
 inline size_t triInSmem(int warps) { return (size_t)16 * warps * (128 + 8) * 2 + 2 * tiStage(128); }
+template <class TA, bool BIAS = false>
+void triInRaw(const float* pair, const float* mask, const float* lnScale, const float* lnOffset, const half* Wpg,
+              const half* Wg, const float* bias, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
+  switch (warpsFitting(warpsFor((size_t)np * np, {TI_WARPS, 4}), {TI_WARPS, 4}, triInSmem)) {
+    case 4: triInLaunch<TA, 4, BIAS>(pair, mask, lnScale, lnOffset, Wpg, Wg, bias, a, b, t2, n, np, cs); break;
+    default: triInLaunch<TA, TI_WARPS, BIAS>(pair, mask, lnScale, lnOffset, Wpg, Wg, bias, a, b, t2, n, np, cs);
+  }
+}
 template <class TA>
 void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
               TA* a, TA* b, half* t2, int n, int np, size_t cs) {
-  switch (warpsFitting(warpsFor((size_t)np * np, {TI_WARPS, 4}), {TI_WARPS, 4}, triInSmem)) {
-    case 4: triInAt<TA, 4>(pair, mask, pre, pg, a, b, t2, n, np, cs); break;
-    default: triInAt<TA, TI_WARPS>(pair, mask, pre, pg, a, b, t2, n, np, cs);
-  }
+  triInRaw<TA>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
+               nullptr, a, b, t2, n, np, cs);
 }
 inline bool TRI_OUT_PERSISTENT = true;
 template <class TP> constexpr size_t triOutPSmem(int warps = TO_WARPS) {
@@ -415,35 +439,43 @@ template <class TP> constexpr size_t triOutSmem(int warps = TO_WARPS) {
 template <class TP> bool triFusedFits() {
   return fitsSmem(triInSmem(4)) && fitsSmem(std::min(triOutPSmem<TP>(4), triOutSmem<TP>(4)));
 }
-template <class TP, int WARPS>
-void triOutAt(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
+template <class TP, int WARPS, bool BIAS>
+void triOutLaunch(const TP* prod, const float* cnScale, const float* cnOffset, const half* Wout, const float* bias,
+                  const half* t2, float* pair, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * WARPS;
   size_t pp = (size_t)np * np;
   if (TRI_OUT_PERSISTENT && fitsSmem(triOutPSmem<TP>(WARPS))) {
     size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)2 * C * (R + 16 / sizeof(TP)) * sizeof(TP);
     static int grid = 0;
     if (!grid) {
-      smemAttr((triOutPK<C, WARPS, TP>), (int)smem);
+      smemAttr((triOutPK<C, WARPS, TP, BIAS>), (int)smem);
       int perSm = 0, sms = 0;
-      CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, triOutPK<C, WARPS, TP>, 32 * WARPS, smem));
+      CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, triOutPK<C, WARPS, TP, BIAS>, 32 * WARPS, smem));
       CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
       grid = std::max(1, perSm) * sms;
     }
     size_t tiles = (pp + R - 1) / R;
-    triOutPK<C, WARPS, TP><<<(unsigned)std::min<size_t>(grid, tiles), 32 * WARPS, smem, STREAM>>>(
-      prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np, cs);
+    triOutPK<C, WARPS, TP, BIAS><<<(unsigned)std::min<size_t>(grid, tiles), 32 * WARPS, smem, STREAM>>>(
+      prod, cnScale, cnOffset, Wout, t2, pair, n, np, cs, bias);
     return;
   }
   size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 16 / sizeof(TP)) * sizeof(TP);
   static bool attr = false;
-  if (!attr) { smemAttr((triOutK<C, WARPS, TP>), (int)smem); attr = true; }
-  triOutK<C, WARPS, TP><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-    prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np, cs);
+  if (!attr) { smemAttr((triOutK<C, WARPS, TP, BIAS>), (int)smem); attr = true; }
+  triOutK<C, WARPS, TP, BIAS><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+    prod, cnScale, cnOffset, Wout, t2, pair, n, np, cs, bias);
+}
+template <class TP, bool BIAS = false>
+void triOutRaw(const TP* prod, const float* cnScale, const float* cnOffset, const half* Wout, const float* bias,
+               const half* t2, float* pair, int n, int np, size_t cs) {
+  if (fitsSmem(std::min(triOutPSmem<TP>(TO_WARPS), triOutSmem<TP>(TO_WARPS))))
+    triOutLaunch<TP, TO_WARPS, BIAS>(prod, cnScale, cnOffset, Wout, bias, t2, pair, n, np, cs);
+  else triOutLaunch<TP, 4, BIAS>(prod, cnScale, cnOffset, Wout, bias, t2, pair, n, np, cs);
 }
 template <class TP>
 void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
-  if (fitsSmem(std::min(triOutPSmem<TP>(TO_WARPS), triOutSmem<TP>(TO_WARPS)))) triOutAt<TP, TO_WARPS>(prod, pre, t2, pair, n, np, cs);
-  else triOutAt<TP, 4>(prod, pre, t2, pair, n, np, cs);
+  triOutRaw<TP>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), nullptr,
+                t2, pair, n, np, cs);
 }
 
 // out[h][row] = (LN(x[row]) W)[h] for a projection to few heads (N a multiple of 16, W (C, N)):
