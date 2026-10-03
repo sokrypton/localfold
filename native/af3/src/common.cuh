@@ -45,10 +45,13 @@ struct Entry { char kind; size_t offset, length; double value; int seg; size_t d
 // the float32 copy, so nothing is decoded on the host and no float32 file is ever written (ESMFold2's was
 // 2.9 GB from 0.35 GB of bundles, and a 2-vCPU Colab VM spent minutes making it). The decode is
 // src/weights/dtype.js's, to the bit: code * scale + zero in double, rounded once to float32.
-struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, dst, first = 0; int kind, bits, block; };
+struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, dst, first = 0; int kind, bits, block;
+               int round16 = 0, accumulate = 0, addRec = -1; };
 // kind: 0 float32, 1 float16, 2 int8 (symmetric), 3 packed int<bits> (asymmetric), 4 zeros (a map's `z`),
 // 5 gathered (a map's `p` lines: parts of bundle tensors decoded into scratch, see GPart);
 // first: the element of the bundle tensor this entry starts at (a map's slice of a stacked tensor)
+// round16 / accumulate / addRec: a DELTA bundle's `addTo` tensor (src/bundles/delta-tensor-store.js) - the
+// base's value rounded to float16, then the delta's decode added in float32 by the record addRec names
 // A map's `p` line: one PART of a gathered tensor - a grid of up to 6 axes walked over the destination
 // (dst + sum i_k * dstStride_k) and one or two sources (srcOff + sum i_k * srcStride_k, into a bundle
 // tensor decoded whole into scratch). op: 'v' the source, 'x' the product of two (one float32 multiply,
@@ -118,7 +121,7 @@ struct Json {
   }
 };
 // the decode, one tensor of the shard a blockIdx.y
-struct BDecode { unsigned long long src, dst, n, scale, zero, first; int kind, bits, block, pad; };
+struct BDecode { unsigned long long src, dst, n, scale, zero, first; int kind, bits, block, flags; };   // flags: 1 round16, 2 accumulate
 __device__ __forceinline__ float bundleHalf(const unsigned char* p) {
   unsigned short h = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__ushort_as_half(h));
 }
@@ -141,7 +144,8 @@ __global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, fl
       double scale = (double)bundleHalf(raw + d.scale + 2 * g), zero = (double)bundleHalf(raw + d.zero + 2 * g);
       v = (float)__dadd_rn(__dmul_rn((double)code, scale), zero);
     }
-    out[d.dst + o] = v;
+    if (d.flags & 1) v = __half2float(__float2half_rn(v));
+    out[d.dst + o] = (d.flags & 2) ? __fadd_rn(out[d.dst + o], v) : v;
   }
 }
 inline float hostHalf(const unsigned char* p) { __half_raw r; r.x = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__half(r)); }
@@ -208,7 +212,9 @@ struct Model {
   // entries native/ef2/export_weights.mjs wrote, from the same bytes
   // With `map` (a port's .map, native/make_map.mjs), the entries are the map's instead: each `b` line a
   // slice of a bundle tensor under the port's own name, each `z` zeros, each `m` metadata as it is.
-  void loadBundle(const std::string& dir, const std::string& prefix, const std::string& map = "") {
+  void loadBundle(const std::string& dir, const std::string& prefix, const std::string& map = "",
+                  const std::string& delta = "") {
+    if (!delta.empty() && map.empty()) { fprintf(stderr, "a delta bundle is read through a map\n"); exit(1); }
     std::ifstream in(dir + "/manifest.json");
     if (!in) { fprintf(stderr, "no %s/manifest.json\n", dir.c_str()); exit(1); }
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -229,10 +235,12 @@ struct Model {
     if (!tensors) { fprintf(stderr, "%s/manifest.json has no tensors\n", dir.c_str()); exit(1); }
     std::map<std::string, int> fileIndex;
     std::map<std::string, BRec> byName;      // (map mode) every bundle tensor, by its bundle name
+    std::map<std::string, BRec> deltaOf;     // (a delta) the record added to an addTo tensor's base
     size_t at = 0;
-    for (auto& [name, r] : tensors->obj) {
+    // a manifest record as a BRec; `where` prefixes its file (a delta's shards live in another directory)
+    auto record = [&](const std::string& name, const Json& r, const std::string& where, std::vector<double>* shapeOut) {
       BRec b{}; const Json* j;
-      std::string file = r.get("file")->str;
+      std::string file = where + r.get("file")->str;
       if (!fileIndex.count(file)) { fileIndex[file] = (int)sg.files.size(); sg.files.push_back(file); }
       b.file = fileIndex[file];
       b.byteOffset = (j = r.get("byteOffset")) ? (size_t)j->num : 0;
@@ -256,6 +264,13 @@ struct Model {
       if ((b.kind == 0 && b.byteOffset % 4) || (b.kind == 1 && b.byteOffset % 2)) {
         fprintf(stderr, "%s: unaligned in its shard\n", name.c_str()); exit(1);
       }
+      if (shapeOut) *shapeOut = shape;
+      return b;
+    };
+    for (auto& [name, r] : tensors->obj) {
+      std::vector<double> shape;
+      BRec b = record(name, r, "", &shape);
+      size_t n = b.elements;
       if (!map.empty()) { byName[name] = b; continue; }
       std::string key = prefix + "/" + name;
       if (index.count(key)) { fprintf(stderr, "%s is in two model directories\n", key.c_str()); exit(1); }
@@ -266,15 +281,71 @@ struct Model {
       addMeta(key + "#r", (double)shape.size());
       for (size_t k = 0; k < shape.size(); ++k) addMeta(key + "#" + std::to_string(k), shape[k]);
     }
+    // 🔴 A DELTA BUNDLE, READ AS THE PAGE READS ONE (src/bundles/delta-tensor-store.js): AlphaFold 2's
+    // models 2-5 are published as int3 differences on model 1, and its header says what each tensor is -
+    // `addTo` (the base's value ROUNDED TO FLOAT16, because that is what the delta was taken against, plus
+    // the delta's decode), `whole` (the delta's own), `absent` (gone: model_3/4/5 have no template
+    // embedder); anything unnamed is the base's. The map names the base's tensors, as for model 1.
+    std::string deltaModel;
+    if (!delta.empty()) {
+      std::ifstream din(delta + "/manifest.json");
+      if (!din) { fprintf(stderr, "no %s/manifest.json\n", delta.c_str()); exit(1); }
+      Json dm = Json::parse(std::string((std::istreambuf_iterator<char>(din)), std::istreambuf_iterator<char>()));
+      const Json* header = dm.get("delta");
+      const Json* dt = dm.get("tensors");
+      if (!header || !dt) { fprintf(stderr, "%s carries no delta header - it is not a delta\n", delta.c_str()); exit(1); }
+      if (const Json* mname = header->get("model")) deltaModel = mname->str;
+      std::string where = (delta[0] == '/' ? delta : std::string(realpath(delta.c_str(), nullptr))) + "/";
+      auto names = [&](const char* key) {
+        std::vector<std::string> out;
+        if (const Json* list = header->get(key)) for (auto& v : list->arr) out.push_back(v.str);
+        return out;
+      };
+      for (auto& name : names("absent")) byName.erase(name);
+      for (auto& name : names("whole")) {
+        const Json* r = dt->get(name);
+        if (!r) { fprintf(stderr, "%s: the delta's header names %s whole and holds no such tensor\n", delta.c_str(), name.c_str()); exit(1); }
+        byName[name] = record(name, *r, where, nullptr);
+      }
+      for (auto& name : names("addTo")) {
+        const Json* r = dt->get(name);
+        auto it = byName.find(name);
+        if (!r || it == byName.end()) { fprintf(stderr, "%s: %s is addTo but missing from the delta or the base\n", delta.c_str(), name.c_str()); exit(1); }
+        BRec d = record(name, *r, where, nullptr);
+        if (d.elements != it->second.elements) { fprintf(stderr, "%s: %s is %zu in the delta, %zu in the base\n", delta.c_str(), name.c_str(), d.elements, it->second.elements); exit(1); }
+        it->second.round16 = 1;
+        d.accumulate = 1;
+        deltaOf[name] = d;
+      }
+    }
+    // an addTo tensor is two records into one place: the base rounded to f16 (`b`, already flagged), then
+    // the delta added; the second goes after the first in `pool`, and decodes after it (its shard does)
+    auto withDelta = [&](const std::string& source, BRec& b, std::vector<BRec>& pool) {
+      auto it = deltaOf.find(source);
+      if (it == deltaOf.end()) return;
+      BRec d = it->second; d.first = b.first; d.elements = b.elements; d.dst = b.dst;
+      b.addRec = (int)pool.size() + 1;     // (b is pushed first, then d)
+      pool.push_back(b); pool.push_back(d);
+    };
     if (!map.empty()) {
       std::ifstream mf(map);
       if (!mf) { fprintf(stderr, "no %s\n", map.c_str()); exit(1); }
       std::string line; std::map<std::string, int> srcIndex;
+      bool mapDelta = false;
       while (std::getline(mf, line)) {
         std::istringstream in(line); char kind; std::string name; in >> kind >> name;
         if (kind == 'm') { double v; in >> v; addMeta(name, v); continue; }
+        if (kind == 'D') {          // this map is for a delta model: the one named, on the bundle it was made from
+          if (delta.empty() || name != deltaModel) {
+            fprintf(stderr, "%s is for %s on a delta bundle; %s\n", map.c_str(), name.c_str(),
+                    delta.empty() ? "no --delta was given" : ("the delta given is " + deltaModel).c_str());
+            exit(1);
+          }
+          mapDelta = true; continue;
+        }
         BRec b{};
         size_t n;
+        std::string bSource;
         if (kind == 'b') {
           std::string source; size_t first; in >> source >> first >> n;
           auto it = byName.find(source);
@@ -283,7 +354,8 @@ struct Model {
                     dir.c_str(), first, first + n, source.c_str());
             exit(1);
           }
-          b = it->second; b.first = first;
+          b = it->second; b.first = first; b.addRec = -1;
+          bSource = source;
         } else if (kind == 'z') { in >> n; b.kind = 4; b.file = -1; }
         else if (kind == 'p') {
           GPart g{}; char op; in >> n >> op >> g.rank;
@@ -306,7 +378,9 @@ struct Model {
             }
             if (!srcIndex.count(source)) {
               BRec r = it->second; sg.scratchElems = (sg.scratchElems + 3) / 4 * 4; r.dst = sg.scratchElems; sg.scratchElems += r.elements;
-              srcIndex[source] = (int)sg.srcRecs.size(); sg.srcRecs.push_back(r);
+              srcIndex[source] = (int)sg.srcRecs.size();
+              if (deltaOf.count(source)) withDelta(source, r, sg.srcRecs);
+              else sg.srcRecs.push_back(r);
             }
             g.src[q] = srcIndex[source];
           }
@@ -326,13 +400,17 @@ struct Model {
         at = (at + 3) / 4 * 4;
         Entry e{'t', 0, n, 0, seg}; e.devOffset = at; e.rec = (int)sg.recs.size(); b.dst = at; at += n;
         index[name] = e;
-        sg.recs.push_back(b);
+        if (!bSource.empty() && deltaOf.count(bSource)) withDelta(bSource, b, sg.recs);
+        else sg.recs.push_back(b);
       }
+      if (!delta.empty() && !mapDelta) { fprintf(stderr, "%s is not a map for a delta model (no D line)\n", map.c_str()); exit(1); }
     }
     sg.deviceBytes = at * 4;
-    for (auto& f : sg.files) { struct stat st; if (stat((dir + "/" + f).c_str(), &st)) { fprintf(stderr, "no %s/%s\n", dir.c_str(), f.c_str()); exit(1); } sg.bytes += (size_t)st.st_size; }
+    for (auto& f : sg.files) { struct stat st; if (stat(shardPath(sg, f).c_str(), &st)) { fprintf(stderr, "no %s\n", shardPath(sg, f).c_str()); exit(1); } sg.bytes += (size_t)st.st_size; }
     segs.push_back(sg);
   }
+  // a shard's path: relative to the bundle's directory, or absolute (a delta's, in its own directory)
+  static std::string shardPath(const Segment& s, const std::string& f) { return f[0] == '/' ? f : s.dir + "/" + f; }
   static std::vector<unsigned char> readFile(const std::string& path) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(1); }
@@ -352,7 +430,7 @@ struct Model {
     cudaStream_t st; if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess) return false;
     size_t most = 0;
     std::vector<size_t> sizes;
-    for (auto& f : s.files) { struct stat sb; stat((s.dir + "/" + f).c_str(), &sb); sizes.push_back((size_t)sb.st_size + 2); most = std::max(most, sizes.back()); }
+    for (auto& f : s.files) { struct stat sb; stat(shardPath(s, f).c_str(), &sb); sizes.push_back((size_t)sb.st_size + 2); most = std::max(most, sizes.back()); }
     unsigned char* pin[2]; unsigned char* raw[2]; BDecode* dt[2]; cudaEvent_t done[2];
     size_t maxRecs = s.recs.size();
     for (int k = 0; k < 2; ++k)
@@ -367,7 +445,7 @@ struct Model {
     for (size_t fi = 0; fi < s.files.size(); ++fi) {
       int k = (int)(fi & 1);
       if (fi >= 2 && cudaEventSynchronize(done[k]) != cudaSuccess) return false;     // buffer k free again
-      int fd = open((s.dir + "/" + s.files[fi]).c_str(), O_RDONLY);
+      int fd = open(shardPath(s, s.files[fi]).c_str(), O_RDONLY);
       if (fd < 0) return false;
       size_t n = sizes[fi] - 2, got = 0;
       while (got < n) { ssize_t r = read(fd, pin[k] + got, n - got); if (r <= 0) { close(fd); return false; } got += (size_t)r; }
@@ -376,7 +454,8 @@ struct Model {
       auto& table = tables[k]; table.clear();
       for (const BRec& b : s.recs)
         if (b.file == (int)fi || (b.kind == 4 && fi == 0))
-          table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.kind, b.bits, b.block, 0});
+          table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.kind, b.bits, b.block,
+                           b.round16 | (b.accumulate << 1)});
       if (!table.empty()) {
         if (cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess ||
             cudaMemcpyAsync(dt[k], table.data(), table.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
@@ -385,7 +464,8 @@ struct Model {
       }
       auto& stable = scratchTables[k]; stable.clear();     // (the sources of gathered tensors, whole, into scratch)
       for (const BRec& b : s.srcRecs)
-        if (b.file == (int)fi) stable.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, 0, b.kind, b.bits, b.block, 0});
+        if (b.file == (int)fi) stable.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.kind,
+                                                 b.bits, b.block, b.round16 | (b.accumulate << 1)});
       if (!stable.empty()) {
         if (table.empty() && cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         if (cudaMemcpyAsync(sdt[k], stable.data(), stable.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
@@ -429,7 +509,7 @@ struct Model {
       std::map<int, std::vector<float>> src;
       for (const GPart& g : s.parts) {
         if (g.rec != rec) continue;
-        for (int q = 0; q < g.nsrc; ++q) if (!src.count(g.src[q])) src[g.src[q]] = decodeHost(s, s.srcRecs[g.src[q]]);
+        for (int q = 0; q < g.nsrc; ++q) if (!src.count(g.src[q])) src[g.src[q]] = decodeComposite(s, s.srcRecs, g.src[q]);
         size_t total = 1; for (int k = 0; k < g.rank; ++k) total *= g.dims[k];
         for (size_t o = 0; o < total; ++o) {
           size_t r = o; long long d = (long long)g.dst, a = (long long)g.srcOff[0], c = (long long)g.srcOff[1];
@@ -447,12 +527,23 @@ struct Model {
       }
       return (m.hostCopies[rec] = std::move(out)).data();
     }
-    return (m.hostCopies[rec] = decodeHost(s, b)).data();
+    return (m.hostCopies[rec] = decodeComposite(s, s.recs, rec)).data();
+  }
+  // a record as the device decodes it: a delta's addTo is the base rounded to float16 plus the delta's
+  static std::vector<float> decodeComposite(const Segment& s, const std::vector<BRec>& pool, int i) {
+    const BRec& b = pool[i];
+    std::vector<float> out = decodeHost(s, b);
+    if (b.round16) for (float& v : out) v = __half2float(__float2half_rn(v));
+    if (b.addRec >= 0) {
+      std::vector<float> d = decodeHost(s, pool[b.addRec]);
+      for (size_t k = 0; k < out.size(); ++k) out[k] = out[k] + d[k];
+    }
+    return out;
   }
   static std::vector<float> decodeHost(const Segment& s, const BRec& b) {
     std::vector<float> out(b.elements, 0.f);
     if (b.kind == 4) return out;
-    std::vector<unsigned char> raw = readFile(s.dir + "/" + s.files[b.file]);
+    std::vector<unsigned char> raw = readFile(shardPath(s, s.files[b.file]));
     for (size_t o = 0; o < b.elements; ++o) {
       size_t i = b.first + o;
       if (b.kind == 0) memcpy(&out[o], &raw[b.byteOffset + 4 * i], 4);

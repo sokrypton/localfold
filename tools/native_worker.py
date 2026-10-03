@@ -14,10 +14,10 @@ MMseqs2 client; the weights are the published bundles the page folds with, read 
 What this file adds is the plumbing between them - nothing about a molecule is decided here.
 
 🔴 WHAT IT REFUSES, IT SAYS. A sampler, a model or an input a native port does not have is a refusal
-naming it (Refused), never a nearby setting run instead: Flow (native AF3 runs diffusion), AlphaFold 2's
-models 2-5 (the page publishes them as deltas, which the native loader does not read).
+naming it (Refused), never a nearby setting run instead: Flow (native AF3 runs diffusion), a template on
+AlphaFold 2's template-free models.
 
-Ports: native/af3 (all seven AF3-lineage models), native/af2 (model_1_ptm, model_1_multimer_v3),
+Ports: native/af3 (all seven AF3-lineage models), native/af2 (all five of each, monomer and multimer),
 native/ef2 (ESMFold2, 600M and 300M). Each must be built (native/colab_setup.sh); a bundle not on disk is fetched.
 """
 import json
@@ -81,9 +81,22 @@ def run(cmd, what, log, cwd=REPO):
 
 
 def ensure_bundle(family, directory, log):
+    """A bundle on disk, fetched from the registry's remote the first time - shard by shard, each said, so
+    a slow download (one revision came at 0.9 MB/s on a Colab T4) reads as a download and not a hang."""
     if not os.path.exists(os.path.join(REPO, directory, "manifest.json")):
         emit("status", f"fetching the {family} weights")
-        run([sys.executable, os.path.join(NATIVE, "fetch_bundles.py"), family], f"fetching {family}", log)
+        fetcher = subprocess.Popen([sys.executable, os.path.join(NATIVE, "fetch_bundles.py"), family], cwd=REPO,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                   preexec_fn=die_with_parent)
+        said = []
+        for line in fetcher.stdout:
+            said.append(line)
+            found = re.search(r"\((\d+)/(\d+)\)", line)
+            if found:
+                emit("status", f"fetching the {family} weights · shard {found.group(1)} of {found.group(2)}")
+        if fetcher.wait() != 0:
+            raise RuntimeError(f"fetching {family} failed: {''.join(said[-4:])}")
+        log.append("".join(said))
     return os.path.join(REPO, directory)
 
 
@@ -220,15 +233,16 @@ class Worker:
     def fold(self, job):
         controls = job.get("controls", {})
         family = job.get("family") or controls.get("model-family", "af3")
+        # 🔴 AF2's FAMILY CARRIES ITS MODEL NUMBER (the page resolves the number box into `monomer-2`,
+        # `multimer-5`): models 2-5 are published as deltas on model 1 and read as the page reads them
+        # (common.cuh's loadBundle --delta, bit-exact against src/bundles/delta-tensor-store.js)
         base, _, number = family.partition("-")
-        if base in ("monomer", "multimer") and number.isdigit():
-            if number != "1":
-                raise Refused(f"AlphaFold 2's model {number} is published as a delta on model 1, which the CUDA"
-                              " backend does not read yet - pick model 1, or fold on WebGPU or JAX")
+        af2_model = 1
+        if base in ("monomer", "multimer"):
+            af2_model = int(number) if number.isdigit() else int(controls.get("af2Model") or 1)
+            if not 1 <= af2_model <= 5:
+                raise Refused(f"AlphaFold 2 has models 1 to 5, not {af2_model}")
             family = base
-        if base in ("monomer", "multimer") and controls.get("af2Model") not in (None, "", "1", 1):
-            raise Refused(f"AlphaFold 2's model {controls.get('af2Model')} is published as a delta on model 1,"
-                          " which the CUDA backend does not read yet - pick model 1, or fold on WebGPU or JAX")
         if family in AF3_FAMILIES:
             port = "af3"
         elif family in ("monomer", "multimer"):
@@ -237,7 +251,7 @@ class Worker:
             port = "ef2"
         else:
             raise Refused(f"the CUDA backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
-                          " model 1 and ESMFold2)")
+                          " and ESMFold2)")
         sampler = controls.get("af3-mode", "diffusion")
         if port == "af3" and sampler != "diffusion":
             raise Refused(f"the CUDA backend's AF3 samples by diffusion only - set the sampler to Diffusion"
@@ -335,17 +349,25 @@ class Worker:
                 fold.append(f"--recycles={int(recycles)}")
         elif port == "af2":
             self.close_server()
+            if templates and family == "monomer" and af2_model > 2:
+                raise Refused(f"AlphaFold 2's model {af2_model} has no template embedder (models 3, 4 and 5 are"
+                              " template-free) - pick model 1 or 2, or drop the template")
             bundle = ensure_bundle(family, "model" if family == "monomer" else "model-multimer", log)
+            delta = None
+            if af2_model > 1:
+                short = "mono" if family == "monomer" else "multi"
+                delta = ensure_bundle(f"{family}-{af2_model}", f"model-{short}-{af2_model}-delta", log)
             export = [*NODE, os.path.join(NATIVE, "af2", "export_input.mjs"), inputs, f"--bundle={bundle}",
                       f"--job={job_path}", f"--max-msa={508 if requested == 512 else requested}",
                       f"--max-extra={extra}", f"--seed={seed}", *flags]
             if recycles not in (None, ""):
                 export.append(f"--recycles={int(recycles)}")
             run(export, "featurising", log)
-            model = "model_1_ptm" if family == "monomer" else "model_1_multimer_v3"
+            model = f"model_{af2_model}_ptm" if family == "monomer" else f"model_{af2_model}_multimer_v3"
             fold = [binary("af2"), inputs, f"--bundle={bundle}",
                     f"--map={os.path.join(NATIVE, 'af2', 'maps', model + '.map')}", "--fast", f"--out={out_pdb}",
-                    f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
+                    f"--tolerance={float(controls.get('tolerance') or 0)}",   # (the page's early stop)
+                    *([f"--delta={delta}"] if delta else [])]
         else:
             self.close_server()
             small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)

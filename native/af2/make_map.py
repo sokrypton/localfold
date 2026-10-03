@@ -36,27 +36,46 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
 
-def decode_bundle(bundle_dir, scratch):
-    """the bundle decoded by the page's own reader: name -> float32 array (flat)"""
+def decode_bundle(bundle_dir, scratch, delta_dir=None):
+    """the bundle decoded by the page's own reader: name -> float32 array (flat). With a delta bundle, the
+    model it reconstructs, as src/bundles/delta-tensor-store.js reconstructs it: `addTo` the base rounded
+    to float16 plus the delta, `whole` the delta's own, `absent` gone, anything else the base's"""
     script = os.path.join(scratch, "decode_bundle.mjs")
     with open(script, "w") as f:
         f.write(f'''import {{ readFileSync, writeFileSync, openSync, writeSync, closeSync }} from "node:fs";
 import {{ readTensor }} from "{REPO}/src/weights/dtype.js";
-const [dir, out] = process.argv.slice(2);
-const m = JSON.parse(readFileSync(`${{dir}}/manifest.json`, "utf8"));
-const shards = new Map(); const idx = {{}}; let off = 0; const fd = openSync(`${{out}}.f32`, "w");
-for (const [name, r] of Object.entries(m.tensors)) {{
-  if (!shards.has(r.file)) {{ const b = readFileSync(`${{dir}}/${{r.file}}`); shards.set(r.file, b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)); }}
-  const v = readTensor(r, shards.get(r.file), r.byteOffset ?? 0, true);
+const [dir, out, deltaDir] = process.argv.slice(2);
+const read = (d) => {{
+  const m = JSON.parse(readFileSync(`${{d}}/manifest.json`, "utf8")); const shards = new Map();
+  return {{ m, get: (name) => {{
+    const r = m.tensors[name];
+    if (!shards.has(r.file)) {{ const b = readFileSync(`${{d}}/${{r.file}}`); shards.set(r.file, b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)); }}
+    return readTensor(r, shards.get(r.file), r.byteOffset ?? 0, true);
+  }} }};
+}};
+const base = read(dir), delta = deltaDir ? read(deltaDir) : null;
+const h = delta ? delta.m.delta : null;
+const addTo = new Set(h?.addTo ?? []), whole = new Set(h?.whole ?? []), absent = new Set(h?.absent ?? []);
+const idx = {{}}; let off = 0; const fd = openSync(`${{out}}.f32`, "w");
+for (const name of Object.keys(base.m.tensors)) {{
+  if (absent.has(name)) continue;
+  let v;
+  if (whole.has(name)) v = delta.get(name);
+  else if (addTo.has(name)) {{
+    const held = Float16Array.from(base.get(name)), added = delta.get(name);
+    v = new Float32Array(held.length); for (let i = 0; i < v.length; i += 1) v[i] = held[i] + added[i];
+  }} else v = base.get(name);
   writeSync(fd, Buffer.from(v.buffer, v.byteOffset, v.byteLength)); idx[name] = [off, v.length]; off += v.length;
 }}
-closeSync(fd); writeFileSync(`${{out}}.json`, JSON.stringify(idx));
+closeSync(fd); writeFileSync(`${{out}}.json`, JSON.stringify({{ idx, model: h?.model ?? null }}));
 ''')
     out = os.path.join(scratch, "bundle")
-    subprocess.run(["node", "--js-float16array", "--max-old-space-size=24000", script, bundle_dir, out], check=True)
+    subprocess.run(["node", "--js-float16array", "--max-old-space-size=24000", script, bundle_dir, out,
+                    *([delta_dir] if delta_dir else [])], check=True)
     flat = np.fromfile(out + ".f32", dtype=np.float32)
-    index = json.load(open(out + ".json"))
-    return {name: flat[o:o + n] for name, (o, n) in index.items()}
+    meta = json.load(open(out + ".json"))
+    decode_bundle.model = meta["model"]
+    return {name: flat[o:o + n] for name, (o, n) in meta["idx"].items()}
 
 
 def rel(a, b):
@@ -91,10 +110,22 @@ def manifest_names(bundle_dir):
     return names
 
 
+STEP_CHECK = [True]
+
+
 def locate(value, bundle, path="", names=None):
     """the (bundle tensor, first element) a parameter is stored at: the best match, which must be close
     and clearly better than the next"""
     t = value.ravel().astype(np.float32); n = t.size
+    # 🔴 THE MANIFEST'S NAME FIRST, WHERE IT GIVES ONE: a bundle tensor whose name is the parameter's own
+    # haiku path, of its size, is an identification, so the values only have to confirm it (relRMS under
+    # 0.3) - a delta model's small biases sit at 0.15 (an int3 difference over a few dozen values), past
+    # what a search by value alone can be trusted at
+    if names:
+        named = [b for b, ns in names.items() if b in bundle and bundle[b].size == n
+                 and any(path.endswith("/" + x) for x in ns)]
+        if len(named) == 1 and rel(bundle[named[0]], t) < 0.3:
+            return (named[0], 0), rel(bundle[named[0]], t)
     scored = []
     for name, v in bundle.items():
         if v.size % n:
@@ -107,7 +138,10 @@ def locate(value, bundle, path="", names=None):
     if not scored or scored[0][0] > 0.08:
         return None, scored[0][0] if scored else np.inf
     # among the close ones, those int5's step bound admits (a float32 tensor matches exactly)
-    ok = [x for x in scored if x[0] < 0.08 and (x[0] == 0 or within_step(t, bundle[x[1]][x[2]:x[2] + n], x[2]))]
+    # (a delta model's values are the base's f16 plus an int3 difference, which int5's step does not bound:
+    # there the relRMS and the names decide)
+    ok = [x for x in scored if x[0] < 0.08 and (x[0] == 0 or not STEP_CHECK[0]
+                                                or within_step(t, bundle[x[1]][x[2]:x[2] + n], x[2]))]
     if not ok:
         return None, scored[0][0]
     scored = ok
@@ -239,7 +273,9 @@ def multimer_ids(args, bundle, names):
             sys.exit(f"{bname}: the exporter's layout gives {cid.size} elements, the bundle holds {bundle[bname].size}")
         live = cid > 0
         got = flat_values[cid[live]]
-        if live.any() and rel(bundle[bname][live], got) > 0.08:
+        # (int5's error is ~4%; a delta model's small tensors, an int3 difference over a few hundred values,
+        # sit at 0.12-0.15 - a wrong join is far past either)
+        if live.any() and rel(bundle[bname][live], got) > (0.08 if STEP_CHECK[0] else 0.3):
             sys.exit(f"{bname}: the bundle does not hold the checkpoint where the join says (relRMS {rel(bundle[bname][live], got):.3f})")
         pos = np.nonzero(live)[0]
         fresh = inv[cid[live]] == 0
@@ -283,6 +319,7 @@ def main():
     ap.add_argument("--params", default=os.path.expanduser("~/lfjax/af2_params"))
     ap.add_argument("--reference", default="/tmp/claude-1000/ref")
     ap.add_argument("--bundle", required=True, help="the bundle's directory (model, model-multimer, ...)")
+    ap.add_argument("--delta", default=None, help="a delta bundle on it (model-mono-2-delta, ...): models 2-5")
     ap.add_argument("--out", required=True)
     ap.add_argument("--scratch", default="/tmp/claude-1000/af2map")
     args = ap.parse_args()
@@ -293,7 +330,8 @@ def main():
     from alphafold3.af2.model import all_atom
 
     os.makedirs(args.scratch, exist_ok=True)
-    bundle = decode_bundle(args.bundle, args.scratch)
+    bundle = decode_bundle(args.bundle, args.scratch, args.delta)
+    STEP_CHECK[0] = args.delta is None
     names = list(bundle)
     names_of = manifest_names(args.bundle)
     multimer = "multimer" in args.model
@@ -338,7 +376,7 @@ def main():
         ids = convert_monomer_params(ids)
 
     # 3: export_weights.py's own entry loop, on ids
-    lines = []
+    lines = [f"D {decode_bundle.model}"] if args.delta else []     # (loaded only with that delta: common.cuh)
     prefix = "alphafold/alphafold_iteration/"
     for module in sorted(ids):
         for pname, value in sorted(ids[module].items()):

@@ -55,19 +55,20 @@ def main():
             sys.exit(f"{name} has no published remote")
         dest = os.path.normpath(os.path.join(repo, directory.rstrip("/") + opts.get("suffix", "")))
         os.makedirs(dest, exist_ok=True)
+        # 🔴 THE MANIFEST LAST: it is what says a bundle is here (the native wrappers and the CUDA worker
+        # check for it), so it is written only once every shard it names is - an interrupted download
+        # leaves no manifest, rather than one naming shards that never came. Every shard lands through a
+        # `.part` renamed when whole, so a shard that exists is a whole one and is not fetched again.
         manifest_path = os.path.join(dest, "manifest.json")
-        fetch(remote + "manifest.json", manifest_path)
-        manifest = json.load(open(manifest_path))
-        sizes = {}
-        for record in manifest["tensors"].values():
-            end = record.get("byteOffset", 0) + record["byteLength"] if "byteLength" in record else None
-            sizes[record["file"]] = max(sizes.get(record["file"], 0), end or 0)
-        for k, f in enumerate(sorted(sizes)):
+        fetch(remote + "manifest.json", manifest_path + ".fetching")
+        manifest = json.load(open(manifest_path + ".fetching"))
+        files = sorted({record["file"] for record in manifest["tensors"].values()})
+        for k, f in enumerate(files):
             path = os.path.join(dest, f)
-            if os.path.exists(path) and os.path.getsize(path) >= sizes[f] > 0:
-                continue
-            fetch(remote + f, path)
-            print(f"  {name}: {f} ({k + 1}/{len(sizes)})", flush=True)
+            if not os.path.exists(path):
+                fetch(remote + f, path)
+            print(f"  {name}: {f} ({k + 1}/{len(files)})", flush=True)
+        os.replace(manifest_path + ".fetching", manifest_path)
         print(f"{name} -> {dest}")
 
 

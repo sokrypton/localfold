@@ -15,6 +15,10 @@ It runs:
 
 The input is the page's own: `export_input.mjs` calls `featuriseForEsmfold2` and
 `languageModelInput` (src/esmfold2/featurise.js), and the PDB is the page's writer's records.
+Beside it every fold writes AlphaFold 3's `<stem>_confidences.json` (the expected PAE, `token_plddts`,
+the token layout) and `<stem>_summary_confidences.json` (pTM, ipTM, mean pLDDT), as native/af3 does -
+what the CUDA backend (tools/native_worker.py) hands the page. The 300M checkpoint folds through the
+same binary (`--fold-bundle=model-ef2-fast-300m-int5 --esmc-bundle=model-esmc-300m-int3`).
 
 ## Run
 

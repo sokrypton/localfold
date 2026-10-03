@@ -2,7 +2,7 @@
 // checkpoints, as the reference runs them), from native/af2/export_input.mjs's features and
 // native/af2/export_weights.py's weights.
 //
-//   af2 <input dir> --bundle=<page bundle dir> --map=<maps/<model>.map> [--out=fold.pdb] [--recycles=N]
+//   af2 <input dir> --bundle=<page bundle dir> --map=<maps/<model>.map> [--delta=<dir>] [--out=fold.pdb] [--recycles=N]
 //   af2 <input dir> --weights=<dir> [--oracle=<dir>] ...      (export_weights.py's: DeepMind's float32)
 //
 // With --oracle (native/af2/oracle.py's dump of the reference on this same input), pass 0 is checked
@@ -407,11 +407,12 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 static bool DETACH = false;
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> --map=<file> | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
-  std::string weights, bundleDir, mapFile, oracle, out = "fold.pdb", warmShape; int recycles = -1; bool profile = false, waitInput = false;
+  std::string weights, bundleDir, mapFile, deltaDir, oracle, out = "fold.pdb", warmShape; int recycles = -1; bool profile = false, waitInput = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--bundle=", 9)) bundleDir = argv[i] + 9;      // the page's published bundle, as it is,
     else if (!strncmp(argv[i], "--map=", 6)) mapFile = argv[i] + 6;           // through maps/<model>.map
+    else if (!strncmp(argv[i], "--delta=", 8)) deltaDir = argv[i] + 8;        // models 2-5: their delta on model 1
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
@@ -427,12 +428,17 @@ int main(int argc, char** argv) {
   if (weights.empty() == bundleDir.empty()) { fprintf(stderr, "--bundle=<dir> --map=<file>, or --weights=<dir>\n"); return 1; }
   auto t0 = std::chrono::steady_clock::now();
   if (!weights.empty()) M.load(weights);
-  else M.loadBundle(bundleDir, "", mapFile);
+  else M.loadBundle(bundleDir, "", mapFile, deltaDir);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   bool tf32 = FAST && !getenv("AF2_NO_TF32");
   if (getenv("AF2_NO_FLASH")) FAST = false;
   CB(cublasSetMathMode(H, tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));   // float32 means float32 unless --fast
   M.upload(0);
+  if (const char* dump = getenv("AF2_DUMP_WEIGHT")) {      // name:path - one weight as the device holds it
+    std::string spec = dump, name = spec.substr(0, spec.find(':')), path = spec.substr(spec.find(':') + 1);
+    std::vector<float> h = download(W(name), M.len(name));
+    FILE* df = fopen(path.c_str(), "wb"); fwrite(h.data(), 4, h.size(), df); fclose(df);
+  }
   if (!warmShape.empty()) {
     int wl = 0, wn = 1, we = 1, wt = 0;
     if (sscanf(warmShape.c_str(), "%d,%d,%d,%d", &wl, &wn, &we, &wt) < 1 || wl < 1) { fprintf(stderr, "--warm=L,N,E,T\n"); return 1; }

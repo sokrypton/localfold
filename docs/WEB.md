@@ -4008,3 +4008,84 @@ refused first, both in the TEMPLATE stage:
 
 Past this, every NVIDIA card stops at the binding ceiling, and that needs the
 pair bound in windows or stored narrower across the kernels that bind it whole.
+
+## A third backend on the Colab runtime: CUDA (LocalFold's native ports)
+
+The badge's picker now offers **CUDA** beside WebGPU and JAX, and defaults to it
+wherever the runtime offers it. It folds with `native/` - the CUDA ports of AF3
+(all seven AF3-lineage models), AlphaFold 2 (all five models, monomer and
+multimer) and ESMFold2 (600M and 300M) - on the page's own published bundles, read as they
+are (`native/*/maps`). The point is speed: a fold is a second or two on the card
+the runtime already has, with no compile minute and no second browser.
+
+**The pieces.** `tools/native_worker.py` speaks `tools/jax_worker.py`'s line
+protocol, so the broker (`tools/colab_backend.py --native`) relays it exactly as
+it relays JAX, and the page ingests the result through the same builder
+(`jaxPrediction`, labelled `(CUDA)`). The notebook's `cuda_backend` (on by
+default) installs Node 22 where the image is older, starts `native/build.sh` in
+the background - the three ports compiled in parallel for the card, atomically,
+stamped with the card and a hash of the sources - and starts the broker with
+`--native`; a CUDA fold that arrives mid-build waits on it, saying so.
+
+🔴 **NOTHING ABOUT A MOLECULE IS DECIDED IN THE WORKER.** Each exporter reads
+the reader's AF3 JSON with the page's own reader (`native/af2/export_input.mjs`
+gained `--job`); template rows go through the page's `expandEntities` and
+`fetchStructure` (`native/resolve_templates.mjs`); a "from the MSA search"
+template is the search's best hit per chain, as the page takes it
+(`--template-search-chains` on both exporters); AF2's templates are aligned and
+merged by the page's `buildTemplate`/`mergeAtom37Templates` instead of mapped by
+identity (every AF2 gate case unchanged); the search is the page's MMseqs2
+client; AF2 stops early by the page's rule (`--tolerance`, ColabFold's
+`compute_tol`, worded "converged at X Å after N passes").
+
+🔴 **WHAT IT DOES NOT HAVE, IT REFUSES BY NAME**: Flow (native AF3 samples by
+diffusion), an alignment per chain on AF2, a template on ESMFold2 or on AF2's
+template-free models 3-5, anything but protein chains on AF2. A featuriser's own
+refusal comes back as its sentence, not its stack.
+
+🔴 **AF2's MODELS 2-5 ARE READ AS THE PAGE READS THEM**: published as int3
+deltas on model 1 (`tools/pack_delta_model.py`), each tensor `addTo` (model 1's
+value ROUNDED TO FLOAT16 - what the delta was taken against - plus the delta),
+`whole` or `absent` by the delta's header. The native loader does the same on
+the device (`loadBundle(..., delta)`: a base record flagged to round, then the
+delta's accumulated in float32), and a dumped weight matches
+src/bundles/delta-tensor-store.js's reconstruction in every element (12,582,912
+of 12,582,912 for a transition stack, 512 of 512 for a bias). Against DeepMind's
+own float32 weights: model_3 on 5CAJ 1.883 Å / pLDDT 96.43 against 1.936 / 96.38,
+the multimer's model_2 on templated 1BRS 0.344 against 0.340, ipTM identical. A
+delta model's map carries a `D <model>` line and refuses to load without that
+delta.
+
+**What the page needed from the ports.** native/af2 and native/ef2 wrote only a
+PDB; both now write AlphaFold 3's `*_confidences.json` and
+`*_summary_confidences.json` beside it, as native/af3 always did - the expected
+PAE, pTM and ipTM, the token layout, and AF2's contact probabilities from its
+distogram where the weights carry the head (the page's multimer bundle does
+not). Without them a CUDA fold arrived with no PAE plot and no contact map.
+
+**The AF3 lineage stays resident.** A cold AF3 fold of 6MRR is 0.92 s on the
+A100 of which the fold is 0.18 - the rest is the CUDA context and the weight
+upload - so the worker keeps one AF3-lineage model on the card through
+native/af3's own `--serve` mode (a served fold is byte-identical to a cold
+one), stops it before an AF2 or ESMFold2 fold so two models never share the
+card, and every child dies with the worker (`PR_SET_PDEATHSIG`), so a Stop -
+which kills the worker - leaves nothing holding the GPU.
+
+**Measured on a Colab T4 (2026-10-03), `npm run test:native` there:** the build
+is 134 s for all three ports (hidden behind the service starting); every fold
+within 0.01 Å of the A100's - AF3 6MRR 0.624, 5CAJ with its crystal 0.231,
+protenix2 0.645, OpenDDE 1.183, AF2 6MRR 1.903, AF2 5CAJ templated 0.216, the
+multimer's 1BRS 0.282, ESMFold2 1.467, AF3 1BRS from a searched MSA 0.59, AF2
+5CAJ from a searched MSA and template 0.346. The first fold of a model is
+15-50 s and is the Hugging Face download of its bundle (AF3 22 s, OpenDDE 39,
+ESMFold2 and its tower 50); a later one is ~2 s; the reader's page, click to
+ingested result, 2.8-3.4 s for AF3, AF2 and ESMFold2.
+
+**Gates.** `npm run test:native` (tools/check-native-worker.py): the real worker
+over its own protocol on this A100 - every fold scored against its crystal,
+every result held to the fields the page ingests, four refusals, two searched
+cases (`--offline` skips them), AF2's early stop, and a real reader's page
+folding AF3, AF2 and ESMFold2 through a real broker with its browser asking for
+no GPU (`--no-page` skips it). `npm run test:colab` gained a CUDA arm on a stub
+worker - routing, Stop, the JAX worker untouched - and checks the picker offers
+all three, CUDA first.

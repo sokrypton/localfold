@@ -1,3 +1,4 @@
+D model_2_ptm
 p w/distogram_head/half_logits/bias 64 v 1 64 0 1 af2DistogramHalfLogitsBias 0 1
 m w/distogram_head/half_logits/bias#r 1
 m w/distogram_head/half_logits/bias#0 64
