@@ -6565,3 +6565,16 @@ Measured on the A100 (developer flags, int5 bundle), 5CAJ chain A (262 tokens) u
   path, and a stock browser has no matrix units, so the CUDA port's tensor cores have no WebGPU
   equivalent for a visitor. At 68 tokens a call is ~290 dispatches at ~35 us each and the shipped split
   configuration still beats every fewer-dispatch alternative swept (10 ms against 11-16).
+
+### 🔴 ...and the denoiser's flash attention twice more (2026-10-03)
+
+- **It never took the device's softmax shape** (`7936301`). AF2's call sites pass `attentionGroup` and
+  `attentionVectorScore` (the ampere prior's g4v, 1.226x there); the denoiser passed neither, and head
+  width 48 derives a key chunk of 21 that no group divides. With both: 128 tokens 2.05 -> 1.79 ms a
+  call, 262 4.56 -> 3.25, 600 10.38 -> 8.17. Vector score alone moves nothing; group 8 ties or loses.
+- **It splits over keys** (`e7b4b64`): 80 workgroups at 262 tokens each walked every key.
+  `keySplits` on createAttentionRegisterFlashShader plus createAttentionSplitCombineShader; doubled
+  while the dispatch is short of ~512 workgroups and each split keeps 32 keys. 262 tokens 3.25 -> 1.69
+  + 0.60 (combine), 600 8.18 -> 4.94 + 0.58; warm folds 1.44 -> 1.38 s at 262. The combine is a fixed
+  ~0.45 ms a call, which is why the old per-(query, head) kernel still wins below 80 tokens (68: 1.12
+  against 1.46) and the threshold is 80.
