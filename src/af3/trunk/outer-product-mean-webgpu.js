@@ -252,9 +252,17 @@ ${offsets.leftProjectionBias === undefined ? "" : `      // rosettafold3's biase
   //
   // 4x4 reads eight values to buy sixteen multiply-adds, against the two reads
   // for one that a workgroup per pair did.
-  const blockI = shape.blockI ?? OPM_BLOCK_I;
+  let blockI = shape.blockI ?? OPM_BLOCK_I;
   const blockJ = shape.blockJ ?? OPM_BLOCK_J;
   const cellChunk = Math.min(products, shape.cellChunk ?? OPM_CELL_CHUNK);
+  // 🔴 A REQUESTED BLOCK IS PRICED AGAINST THE DEVICE. The contraction stages
+  // `cellChunk * blockI * blockJ` floats; the turing prior's block of 8 is
+  // 32 KiB, which a device at WebGPU's guaranteed 16 KiB cannot create. It
+  // halves until it fits, and the dispatch reads the block returned below.
+  const storageLimit = shape.maxComputeWorkgroupStorageSize;
+  while (storageLimit !== undefined && blockI > 1 && cellChunk * blockI * blockJ * 4 > storageLimit) {
+    blockI /= 2;
+  }
   if (products % cellChunk !== 0) {
     throw new Error(`PRODUCTS ${products} is not a multiple of the cell chunk ${cellChunk}`);
   }

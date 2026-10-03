@@ -51,6 +51,17 @@ export const AF3_MSA_CODES = Object.freeze({
 /** The gap, which is neither an amino acid nor a nucleotide. */
 export const AF3_MSA_GAP = 21;
 
+// AF3's _RNA_TO_ID and _DNA_TO_ID: the nucleotides continue past the gap, and every other letter
+// is the nucleic unknown, 30
+const nucleicCodes = (table) => {
+  const codes = {};
+  for (let c = 65; c <= 90; c += 1) codes[String.fromCharCode(c)] = 30;
+  return Object.freeze({ ...codes, ...table, "-": 21 });
+};
+export const AF3_RNA_MSA_CODES = nucleicCodes({ A: 22, G: 23, C: 24, U: 25 });
+export const AF3_DNA_MSA_CODES = nucleicCodes({ A: 26, G: 27, C: 28, T: 29 });
+const CODES_OF_KIND = { protein: AF3_MSA_CODES, rna: AF3_RNA_MSA_CODES, dna: AF3_DNA_MSA_CODES };
+
 /**
  * Turn A3M text into AF3's MSA rows.
  *
@@ -102,9 +113,23 @@ export function af3MsaFromA3m(alignment, options = {}) {
   // crop is the deterministic prefix it always was.
   const { random } = options;
 
+  // 🔴 A COLUMN'S ALPHABET IS ITS CHAIN'S. A U in an RNA column is uracil (25), in a protein
+  // column selenocysteine (read as C); `columnKinds` names each column's chain kind when the
+  // alignment spans nucleic chains, and every column is protein without it.
+  const columnKinds = options.columnKinds;
+  const codeTables = columnKinds === undefined ? null
+    : columnKinds.map((kind) => CODES_OF_KIND[kind] ?? AF3_MSA_CODES);
+  const codeOf = (aligned, column) => {
+    const table = codeTables === null ? AF3_MSA_CODES : codeTables[column];
+    return table[aligned[column]] ?? (table === AF3_MSA_CODES ? AF3_MSA_CODES.X : 30);
+  };
   const parse = (text) => {
     if (text === undefined || text === null || text.trim() === "") return null;
-    return parseA3m(text);
+    const parsed = parseA3m(text, { anyLetter: codeTables !== null });
+    if (codeTables !== null && parsed.length !== codeTables.length) {
+      throw new Error(`the alignment is ${parsed.length} columns and its chains ${codeTables.length}`);
+    }
+    return parsed;
   };
   const paired = parse(texts.paired);
   const unpaired = parse(texts.unpaired);
@@ -190,7 +215,7 @@ export function af3MsaFromA3m(alignment, options = {}) {
       for (let column = 0; column < parsed.length; column += 1) {
         // An unlisted character cannot reach here - parseA3m rejects anything
         // outside its alphabet - so the fallback is unknown rather than an error.
-        codes[column] = AF3_MSA_CODES[aligned[column]] ?? AF3_MSA_CODES.X;
+        codes[column] = codeOf(aligned, column);
       }
       msa.push(codes);
       deletionMatrix.push(Float32Array.from(parsed.deletionMatrix[row]));
@@ -230,7 +255,7 @@ export function af3MsaFromA3m(alignment, options = {}) {
         const aligned = parsed.sequences[row];
         const codes = new Int32Array(parsed.length);
         for (let column = 0; column < parsed.length; column += 1) {
-          codes[column] = AF3_MSA_CODES[aligned[column]] ?? AF3_MSA_CODES.X;
+          codes[column] = codeOf(aligned, column);
         }
         profileMsa.push(codes);
         profileDeletionMatrix.push(Float32Array.from(parsed.deletionMatrix[row]));

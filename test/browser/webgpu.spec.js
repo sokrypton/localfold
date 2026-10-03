@@ -30,18 +30,6 @@ test("runs fp16 inputs and weights when the browser exposes shader-f16", async({
   expect(metrics?.maxAbsoluteError).toBeLessThan(1e-2);
 });
 
-test("shows the single-sequence folding page", async({ page }) => {
-  await page.goto("/");
-  await expect(page.getByRole("heading", { name: /AlphaFold2/ })).toBeVisible();
-  await expect(page.locator("#sequence-length")).toHaveText("59 residues");
-  await expect(page.getByRole("button", { name: "Fold" })).toBeVisible();
-  await expect(page.locator("#results")).toBeHidden();
-  // ...the residue count follows the box, which is the only live wiring the
-  // page has before a GPU is involved.
-  await page.locator("#sequence").fill("ACDEFGHIKL");
-  await expect(page.locator("#sequence-length")).toHaveText("10 residues");
-});
-
 // THE MUTATION PANEL, DRIVEN AS A READER DRIVES IT.
 //
 // Built by web/mutate.js; needs no GPU, no weights and no fold - the viewer only
@@ -50,7 +38,13 @@ test("shows the single-sequence folding page", async({ page }) => {
 // browser has: where it sits, what it reports, and - the reason it stopped
 // being a popup - what does NOT close it.
 test("docks a mutation panel under the viewer and stages a pick", async({ page }) => {
-  await page.goto("/");
+  // 🔴 single.html IS THE PAGE THAT DOCKS IT, AND IT IS HELD BACK (b0dc258) -
+  // gitignored, copied by build_site.py when present. This went to "/", which
+  // has no #mutate-host, so it failed for as long as single.html was out.
+  // Skipped while the page is absent, run again the day it returns, the way
+  // tools/mobile-layout.py treats the same two pages.
+  const response = await page.goto("/single.html");
+  test.skip(!response?.ok(), "single.html is held back (b0dc258); this panel docks on it");
   const result = await page.evaluate(async() => {
     const { createMutationPanel } = await import("/web/mutate.js");
     const host = document.getElementById("mutate-host");

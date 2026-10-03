@@ -9,10 +9,16 @@ which folds - and the one a reader opens, `index.html?backend=colab`, which
 asks. Four routes carry that, all of them token-checked:
 
     GET  /health            what the card is, and whether a fold is running
-    POST /in                the reader asks: {op: "fold"|"stop"|"ping", payload}
+    POST /in                the reader asks: {op: "fold"|"stop"|"ping"|"warm", payload}
     GET  /out?since=N       the runtime page collects what has been asked
     POST /up                the runtime page pushes what it says and draws
     GET  /down?since=N      the reader receives it
+
+With `--jax-dir`, a fold whose payload says `backend: "jax"` is not forwarded
+to the page: tools/jax_worker.py runs it with af3-any-model and its events land
+in the same mailbox, so the reader follows either one with the same code. With
+`--native`, `backend: "native"` goes to tools/native_worker.py the same way -
+LocalFold's CUDA ports, on the page's own weights.
 
 🔴 THE POINT IS THAT THERE IS NO SECOND IMPLEMENTATION. The fold that runs
 here is web/app.js's own, in a real browser, from this checkout - the same
@@ -44,6 +50,8 @@ the page a reader might point at a runtime from their own laptop, and an
 allow-list of origins cannot be written for a URL that changes every session.
 """
 import argparse
+import urllib.error
+import urllib.request
 import hmac
 import http.server
 import json
@@ -60,6 +68,19 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cdp                                                   # noqa: E402
 
+WEIGHT_CACHE = os.environ.get("LOCALFOLD_WEIGHT_CACHE", "/tmp/localfold-weight-cache")
+def gpu_total_mib():
+    """The first GPU's total memory in MiB, from the driver, or None."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        return int(out[0]) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+# What may cache: the weight shards, as tools/serve.py names them.
+CACHEABLE = (".bin", ".safetensors", ".zst", ".gz")
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # 🔴 TWO MAILBOXES AND ONE SEQUENCE EACH, WHICH IS THE WHOLE BROKER. `EVENTS`
@@ -88,6 +109,8 @@ EVENT_CAP = 4000
 # accepted and lowered by the runtime page's own `result`, which is the event
 # that says it has finished in every way a fold can finish.
 FOLDING = {"on": False}
+# ...and which worker's fold is running (None: the page's), which is who a Stop is for.
+WORKER_FOLDING = {"on": None}
 # 🔴 AND WHEN THE RUNTIME PAGE LAST ASKED FOR ITS COMMANDS, which is the only
 # sign of life there is. A Colab runtime is recycled when the notebook is
 # closed or left idle, and a reader whose fold was mid-flight then polls a
@@ -191,16 +214,28 @@ class Backend:
         # first measured runtime came back on **SwiftShader** - vendor
         # 'google', architecture 'swiftshader', no shader-f16, a 1 GiB buffer
         # ceiling - which is the CPU wearing the card's clothes.
+        # `LOCALFOLD_KEEP_PROFILE=1` starts on the profile as it was left -
+        # its HTTP and shader caches included - instead of a wiped one, so a
+        # session that restores a saved profile pays what a returning visitor
+        # does rather than a first visit.
         self.proc, self.ws = cdp.launch(self.cdp_port, self.profile,
+                                        keep=os.environ.get("LOCALFOLD_KEEP_PROFILE") == "1",
                                         extra_args=["--disable-vulkan-surface"])
         self.ws.call("Page.enable")
         self.ws.call("Runtime.enable")
         # 🔴 `role=runtime` IS THE PAGE BEING TOLD WHICH HALF IT IS, and the
         # token rides beside it because every route this page calls checks
         # one. web/colab-bridge.js reads both out of its own URL.
+        # ...and how much memory its GPU has, which no browser API reports.
+        # The page budgets from it on a runtime; see getDevice in web/model.js.
+        # `LOCALFOLD_VRAM_MIB` stands in for the driver's answer, so a big card
+        # can be made to budget like a small one (a T4 is 15360).
+        vram = int(os.environ.get("LOCALFOLD_VRAM_MIB") or 0) or gpu_total_mib()
         self.ws.call("Page.navigate", url=(
             f"http://127.0.0.1:{self.port}/index.html"
-            f"?role=runtime&t={urllib.parse.quote(self.token)}"))
+            f"?role=runtime{'' if os.environ.get('LOCALFOLD_WEIGHT_PROXY') == '0' else '&weights=proxy'}"
+            f"{'' if vram is None else f'&vram={vram}'}"
+            f"&t={urllib.parse.quote(self.token)}"))
         cdp.wait_for(self.ws, "!!window.__entityList", 180, "the page")
         # 🔴 THE TERMS DIALOG WOULD OTHERWISE EAT THE CLICK. AlphaFold 3's
         # parameters are gated behind an acknowledgement that opens in FRONT of
@@ -255,10 +290,108 @@ class Backend:
             time.sleep(0.25)
         return False
 
-def serve(port, backend, token, host="127.0.0.1"):
+def push_event(event):
+    """One event into the mailbox, as `/up` would put it there."""
+    global EVENT_BASE
+    event["got"] = int(time.time() * 1000)
+    with MAIL_LOCK:
+        EVENTS.append(event)
+        if event.get("kind") == "result":
+            FOLDING["on"] = False
+            WORKER_FOLDING["on"] = None
+        if len(EVENTS) > EVENT_CAP:
+            drop = len(EVENTS) - EVENT_CAP // 2
+            del EVENTS[:drop]
+            EVENT_BASE += drop
+
+
+class JaxWorker:
+    """A worker process (tools/jax_worker.py, tools/native_worker.py), started on its
+    first fold and kept for the next.
+
+    🔴 ITS LINES ARE EVENTS, ITS SEQ IS ITS OWN. The worker prints one bridge
+    event per line; they are numbered here, as the page numbers its own, so
+    the reader's sort-by-seq holds for them too. One fold runs at a time, so
+    the two numberings never interleave.
+    """
+
+    def __init__(self, directory, script="jax_worker.py", stub="LOCALFOLD_JAX_WORKER", name="JAX"):
+        self.directory = directory
+        self.script, self.stub, self.name = script, stub, name
+        self.proc = None
+        self.seq = 0
+        self.lock = threading.Lock()
+
+    def _start(self):
+        # LOCALFOLD_JAX_WORKER (LOCALFOLD_NATIVE_WORKER) stands a stub in for the
+        # real worker, which is how tools/check-colab-bridge.py tests this path
+        # with no GPU and no JAX.
+        worker = os.environ.get(self.stub) or os.path.join(REPO, "tools", self.script)
+        self.proc = subprocess.Popen(
+            [sys.executable, worker],
+            cwd=self.directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, bufsize=1)
+        threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("kind") in ("jax-ready", "native-ready"):
+                continue
+            with self.lock:
+                event["seq"] = self.seq
+                self.seq += 1
+            push_event(event)
+        # ...a worker that died mid-fold must still end the fold.
+        with MAIL_LOCK:
+            folding = FOLDING["on"]
+        if folding and proc is self.proc:
+            push_event({"kind": "result", "seq": self.seq, "at": int(time.time() * 1000),
+                        "payload": {"error": f"the {self.name} worker exited"}})
+
+    def fold(self, payload):
+        with self.lock:
+            if self.proc is None or self.proc.poll() is not None:
+                self._start()
+            self.proc.stdin.write(json.dumps(payload) + "\n")
+            self.proc.stdin.flush()
+
+    def stop(self):
+        """JAX cannot be interrupted mid-computation (nor a native binary from
+        outside it): the worker goes, and the next fold starts a new one."""
+        with self.lock:
+            proc, self.proc = self.proc, None
+        if proc is not None:
+            proc.kill()
+        push_event({"kind": "result", "seq": self.seq, "at": int(time.time() * 1000),
+                    "payload": {"error": "stopped"}})
+
+
+def serve(port, backend, token, host="127.0.0.1", jax=None, native=None):
+    workers = {name: worker for name, worker in (("jax", jax), ("native", native)) if worker is not None}
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=REPO, **kw)
+
+        # 🔴 NO-STORE ON THE PAGE'S OWN FILES, as tools/serve.py sends and for
+        # the reason CLAUDE.md gives: SimpleHTTPRequestHandler sends no cache
+        # headers, so Chrome caches every ES module heuristically. Both browsers
+        # this serves keep a profile - the reader's is the user's own, and the
+        # runtime's survives under LOCALFOLD_KEEP_PROFILE or a wipe that races
+        # Chrome's exit - and a page holding last week's colab-bridge.js
+        # talking to a runtime on this week's is a fold that fails on the
+        # wire format. Measured: the runtime page ran a stale bridge module
+        # while this server was serving the new one. Weight shards are
+        # content-addressed (their URLs pin a commit) and cache for a year.
+        def end_headers(self):
+            if self.path.split("?")[0].endswith(CACHEABLE):
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            else:
+                self.send_header("Cache-Control", "no-store, must-revalidate")
+            super().end_headers()
 
         def log_message(self, *a):
             pass
@@ -271,8 +404,21 @@ def serve(port, backend, token, host="127.0.0.1"):
 
         def _json(self, code, payload):
             body = json.dumps(payload).encode()
+            # 🔴 COMPRESSED, BECAUSE ON COLAB THIS CROSSES THE INTERNET. A
+            # finished fold's result is ~5 MB of JSON (AF3 at 255 residues) and
+            # a trajectory frame a PDB's worth of text; gzip takes them 2.5x
+            # and 4-5x at its fastest level, ~0.1 s for a result here. Only
+            # where the client asked (a browser always does; urllib does not)
+            # and only for a body worth it - the 300 ms polls between events
+            # are a few hundred bytes.
+            gzipped = len(body) > 65536 and "gzip" in self.headers.get("Accept-Encoding", "")
+            if gzipped:
+                import gzip
+                body = gzip.compress(body, compresslevel=1)
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            if gzipped:
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(body)))
             self._cors()
             self.end_headers()
@@ -313,8 +459,67 @@ def serve(port, backend, token, host="127.0.0.1"):
             except ValueError:
                 return 0
 
+        # 🔴 THE RUNTIME PAGE'S WEIGHTS COME THROUGH HERE. Headless Chrome on a
+        # Colab T4 (two vCPUs) fetched IntelliFold-2's 641 MB from Hugging Face
+        # at 29 MB/s - 22 s, and 55 s beside a fold's compiles - where curl on
+        # the same VM takes 6.8 s and Chrome reads the same files over loopback
+        # in 6.6. Its network stack is what the two cores cannot feed. So this
+        # fetches upstream in Python, streams the bytes to the page as they
+        # arrive and keeps a copy on disk for the next request; the page asks
+        # here only when the broker told it to (`weights=proxy`), and only for
+        # huggingface.co - see bundleBaseUrl in src/bundles/manifests/index.js.
+        def _weights_proxy(self, rest):
+            import hashlib
+            import shutil
+            cache = os.path.join(WEIGHT_CACHE, hashlib.sha256(rest.encode()).hexdigest())
+            if os.path.exists(cache):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(os.path.getsize(cache)))
+                self.end_headers()
+                with open(cache, "rb") as source:
+                    shutil.copyfileobj(source, self.wfile, 1 << 20)
+                return None
+            upstream = "https://huggingface.co/" + rest
+            try:
+                response = urllib.request.urlopen(
+                    urllib.request.Request(upstream, headers={"User-Agent": "localfold-broker"}),
+                    timeout=60)
+            except urllib.error.HTTPError as error:
+                return self._json(error.code, {"error": f"upstream {error.code} for {rest}"})
+            except OSError as error:
+                return self._json(502, {"error": f"upstream unreachable: {error}"})
+            os.makedirs(WEIGHT_CACHE, exist_ok=True)
+            partial = f"{cache}.{threading.get_ident()}.part"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            length = response.headers.get("Content-Length")
+            if length is not None:
+                self.send_header("Content-Length", length)
+            self.end_headers()
+            wrote = 0
+            with open(partial, "wb") as copy:
+                while True:
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    copy.write(chunk)
+                    wrote += len(chunk)
+                    try:
+                        self.wfile.write(chunk)
+                    except OSError:
+                        break
+            # ...kept only when whole, so a torn download is fetched again.
+            if length is not None and wrote == int(length):
+                os.replace(partial, cache)
+            else:
+                os.remove(partial)
+            return None
+
         def do_GET(self):
             route = urllib.parse.urlparse(self.path).path
+            if route.startswith("/hf/"):
+                return self._weights_proxy(route[len("/hf/"):])
             if route in ("/down", "/out", "/health") and not self._authorised():
                 return self._json(403, {"error": "token"})
             # 🔴 A WATERMARK, NOT A QUEUE THE READER DRAINS. Two polls can
@@ -383,6 +588,7 @@ def serve(port, backend, token, host="127.0.0.1"):
                                         # Disconnect releases the MACHINE or
                                         # only stops the service on it.
                                         "colabRuntime": bool(RUNTIME_ADDR),
+                                        "backends": ["webgpu"] + list(workers),
                                         "gpu": backend.adapter()})
             return super().do_GET()
 
@@ -451,8 +657,24 @@ def serve(port, backend, token, host="127.0.0.1"):
                 threading.Thread(target=lambda: (time.sleep(0.3),
                                                  STOPPING.set()), daemon=True).start()
                 return None
-            if op not in ("fold", "stop", "ping"):
+            if op not in ("fold", "stop", "ping", "warm"):
                 return self._json(400, {"error": f'unknown op "{op}"'})
+            payload = body.get("payload") or {}
+            wanted = payload.get("backend")
+            if op == "fold" and wanted in ("jax", "native"):
+                if wanted not in workers:
+                    return self._json(400, {"error": f"this runtime has no {'JAX' if wanted == 'jax' else 'CUDA'} backend"})
+                with MAIL_LOCK:
+                    if FOLDING["on"]:
+                        return self._json(429, {"error": "one GPU, one fold: try again"})
+                    FOLDING["on"] = True
+                    WORKER_FOLDING["on"] = wanted
+                workers[wanted].fold(payload)
+                return self._json(200, {"ok": True, "backend": wanted})
+            if op == "stop" and WORKER_FOLDING["on"] in workers:
+                name, WORKER_FOLDING["on"] = WORKER_FOLDING["on"], None
+                workers[name].stop()
+                return self._json(200, {"ok": True, "backend": name})
             with MAIL_LOCK:
                 if op == "fold" and FOLDING["on"]:
                     return self._json(429, {"error": "one GPU, one fold: try again"})
@@ -482,11 +704,17 @@ def main():
     parser.add_argument("--profile", default="/tmp/localfold-backend")
     parser.add_argument("--host", default="127.0.0.1",
                         help="what to bind; the tunnel reaches loopback")
+    parser.add_argument("--jax-dir", default=None,
+                        help="the ColabFold2 install directory: offers the JAX backend")
+    parser.add_argument("--native", action="store_true",
+                        help="offer the CUDA backend: native/ built (native/colab_setup.sh)")
     arguments = parser.parse_args()
 
     token = arguments.token or secrets.token_urlsafe(24)
     backend = Backend(arguments.port, arguments.cdp_port, arguments.profile, token)
-    httpd = serve(arguments.port, backend, token, arguments.host)
+    jax = JaxWorker(arguments.jax_dir) if arguments.jax_dir else None
+    native = JaxWorker(REPO, "native_worker.py", "LOCALFOLD_NATIVE_WORKER", "CUDA") if arguments.native else None
+    httpd = serve(arguments.port, backend, token, arguments.host, jax, native)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {REPO} on {arguments.host}:{arguments.port}"
           + (" · Disconnect will release this Colab machine" if RUNTIME_ADDR
@@ -517,6 +745,9 @@ def main():
         # In a Colab runtime the container takes them; on a developer's machine
         # they are the "another browser on the machine" that makes the next
         # measurement somebody else's.
+        for worker in (jax, native):
+            if worker is not None and worker.proc is not None:
+                worker.proc.kill()
         if backend.proc is not None:
             backend.proc.terminate()
             try:

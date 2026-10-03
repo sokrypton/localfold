@@ -111,6 +111,7 @@ export async function main(device, args = []) {
   };
 
   const result = await foldBatch(device, batch, weights, {
+    trunkLogits: true,
     mode: "diffusion", steps, stopAfter: steps, recycles, seed,
   });
 

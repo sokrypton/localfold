@@ -46,8 +46,9 @@ const SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYT
 const CASES = [
   { code: "GOL", smiles: "C(O)C(O)CO" },                      // C1 O1 C2 O2 C3 O3
   { code: "EDO", smiles: "C(O)CO" },                          // C1 O1 C2 O2
-  { code: "URE", smiles: "C(=O)(N)N" },                       // C O N1 N2
-  // ...and two whose dictionary names this port cannot reproduce.
+  // ...and three whose dictionary names a SMILES does not reproduce - URE's lone C and O are
+  // C1 and O1 by AlphaFold 3's rule for a molecule with no names (every atom numbered)
+  { code: "URE", smiles: "C(=O)(N)N", namesDiffer: true },    // C O N1 N2
   { code: "ACE", smiles: "C(=O)C", namesDiffer: true },       // C O CH3
   { code: "BEN", smiles: "c1(ccccc1)C(=N)N", namesDiffer: true },  // C1..C6 C N1 N2
 ];
@@ -55,9 +56,11 @@ const CASES = [
 /**
  * 🔴 AN ATOM NAME IS A MODEL INPUT AND A SMILES HAS NO RIGHT ANSWER FOR IT.
  * `refAtomNameChars` carries the atom's name into the features, and this port
- * names a built component element-plus-counter - C1, C2, O1 - which is the
- * dictionary's own convention for many entries and not for all of them: ACE
- * calls its methyl `CH3` and BEN calls its seventh carbon plain `C`. For a
+ * names a built component element-plus-counter - C1, C2, O1, every atom
+ * numbered, which is AlphaFold 3's own rule for a SMILES ligand
+ * (assign_atom_names_from_graph) - and the dictionary's convention for many
+ * entries and not for all of them: ACE calls its methyl `CH3`, BEN its seventh
+ * carbon plain `C`, URE its lone carbon and oxygen `C` and `O`. For a
  * ligand that has no CCD entry, which is the whole point of the SMILES path,
  * there is no dictionary name to match and any consistent scheme is as good as
  * another. For one that DOES have an entry, folding it by code rather than by
@@ -180,6 +183,33 @@ for (const { code, smiles, namesDiffer } of CASES) {
       // field decides is asserted and agrees".
       && !/\/ligandSpans\[\d+\]\/bonds\[/.test(line));
 
+    // 🔴 EXCEPT A RING BOND WRITTEN THE OTHER WAY ROUND, WHICH THE REFERENCE DOES TOO. A SMILES
+    // ring-closure bond runs from the atom that closes the ring to the one that opened it - RDKit
+    // creates it so, and AlphaFold 3's SMILES path lists it so: its own BEN batch has (17,12) from
+    // the SMILES and (12,17) from the CCD. For a model that does not symmetrise its bonds that is
+    // a different matrix in the reference as well, so a difference made ENTIRELY of exact reversals
+    // (each entry's mirror set on the other side, at the same order) is reported, not failed.
+    const reversedOnly = (() => {
+      const a = fromCode.batch.bondMatrix, b = fromSmiles.batch.bondMatrix;
+      const oa = fromCode.batch.bondOrderMatrix, ob = fromSmiles.batch.bondOrderMatrix;
+      const n = fromCode.batch.tokens;
+      if (a === undefined || b === undefined || a.length !== b.length) return false;
+      let any = false;
+      for (let i = 0; i < n; i += 1) {
+        for (let j = 0; j < n; j += 1) {
+          const k = i * n + j, m = j * n + i;
+          if (a[k] === b[k] && (oa?.[k] ?? 0) === (ob?.[k] ?? 0)) continue;
+          any = true;
+          if (!(a[k] === b[m] && b[k] === a[m] && (oa?.[k] ?? 0) === (ob?.[m] ?? 0))) return false;
+        }
+      }
+      return any;
+    })();
+    if (reversedOnly) {
+      for (let at = real.length - 1; at >= 0; at -= 1) {
+        if (/^\/bond(Order)?Matrix:/.test(real[at])) real.splice(at, 1);
+      }
+    }
     // ...and that claim is only safe while those two really are compared.
     for (const field of ["bondMatrix", "bondOrderMatrix"]) {
       if (fromCode.batch[field] === undefined) {

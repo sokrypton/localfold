@@ -6,12 +6,31 @@ describe("DEFAULT_MANIFEST", () => {
     expect(DEFAULT_MANIFEST.formatVersion).toBe(1);
     expect(DEFAULT_MANIFEST.model.name).toBe("model_1");
     expect(DEFAULT_MANIFEST.bundle.model).toBe("model_1_ptm");
-    // 🔴 STILL EIGHT SHARDS, AND TWO MORE TENSORS THAN THERE WERE. The
-    // distogram head is appended to the LAST shard rather than given one of
-    // its own, so the 227 MB before it are untouched and an upload transfers
-    // one shard.
-    expect(DEFAULT_MANIFEST.bundle.shards).toBe(8);
-    expect(DEFAULT_MANIFEST.bundle.tensors).toBe(337);
+    // 🔴 NINE SHARDS: the distogram head was appended to the LAST shard, and
+    // the template single features (tools/append_template_single.py) came in a
+    // ninth of their own, so the eight before it are byte-identical and an
+    // upload transfers one small file.
+    expect(DEFAULT_MANIFEST.bundle.shards).toBe(9);
+    expect(DEFAULT_MANIFEST.bundle.tensors).toBe(341);
+  });
+
+  it("carries the template single features, float32, in a section of their own", () => {
+    // AF2 monomer turns a template's torsion angles into MSA rows through
+    // these two layers; without them 5CAJ with its own crystal folds to 2.53 A
+    // against 0.22 (native/af2). A section of their own, so nothing that reads
+    // templateEmbedding meets them.
+    const params = DEFAULT_MANIFEST.templateSingle.parameters;
+    const shapes = {
+      template_single_embedding: { weights: [57, 256], bias: [256] },
+      template_projection: { weights: [256, 256], bias: [256] },
+    };
+    for (const [module, leaves] of Object.entries(shapes)) {
+      for (const [leaf, shape] of Object.entries(leaves)) {
+        const record = DEFAULT_MANIFEST.tensors[params[module][leaf]];
+        expect(record.shape).toEqual(shape);
+        expect(record.dtype).toBe("float32");
+      }
+    }
   });
 
   it("carries the distogram head as tensors in the shards", () => {
@@ -56,9 +75,9 @@ describe("DEFAULT_MANIFEST", () => {
     expect(typeof bias.byteOffset).toBe("number");
   });
 
-  it("contains all 337 tensor entries with valid shapes and dtypes", () => {
+  it("contains all 341 tensor entries with valid shapes and dtypes", () => {
     const tensorKeys = Object.keys(DEFAULT_MANIFEST.tensors);
-    expect(tensorKeys.length).toBe(337);
+    expect(tensorKeys.length).toBe(341);
 
     // 🔴 int5 IS IN THE LIST BECAUSE THE BUNDLE IS int5 NOW - asymmetric, group
     // 32, 73 MiB against the int8 export's 98 and measured free on a fold. A
@@ -93,4 +112,30 @@ describe("DEFAULT_MANIFEST", () => {
     expect(Object.keys(DEFAULT_MANIFEST.confidenceHeads.parameters).length).toBeGreaterThan(0);
     expect(DEFAULT_MANIFEST.residueGeometry.tensors.length).toBe(6);
   });
+});
+
+describe("the monomer deltas and the template single features", async () => {
+  // A delta inherits every base tensor its header does not name, so each
+  // delta must decide these four: model_2_ptm carries its own WHOLE, and
+  // model_3/4/5_ptm, which have no template embedder, mark them absent - and
+  // the store then drops the section, as it drops templateEmbedding.
+  const { DeltaTensorStore } = await import("../src/bundles/delta-tensor-store.js");
+  const names = Object.values(DEFAULT_MANIFEST.templateSingle.parameters).flatMap((l) => Object.values(l));
+  it("model_2 carries them whole", async () => {
+    const { MANIFEST } = await import("../src/bundles/manifests/monomer-2.js");
+    for (const name of names) {
+      expect(MANIFEST.delta.whole.includes(name)).toBe(true);
+      expect(MANIFEST.tensors[name].dtype).toBe("float32");
+    }
+  });
+  for (const k of [3, 4, 5]) {
+    it(`model_${k} has none, and the store drops the section`, async () => {
+      const { MANIFEST } = await import(`../src/bundles/manifests/monomer-${k}.js`);
+      for (const name of names) expect(MANIFEST.delta.absent.includes(name)).toBe(true);
+      const store = new DeltaTensorStore({ manifest: DEFAULT_MANIFEST }, { manifest: MANIFEST });
+      expect(store.manifest.templateSingle).toBe(undefined);
+      expect(store.manifest.templateEmbedding).toBe(undefined);
+      for (const name of names) expect(store.manifest.tensors[name]).toBe(undefined);
+    });
+  }
 });

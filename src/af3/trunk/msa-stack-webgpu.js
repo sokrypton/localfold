@@ -153,7 +153,7 @@ export class Af3MsaStackGpu {
       // 8 MSA and 4 template - so a knob wired only into the pairformer leaves
       // an eighth of that kernel on the vector path for no reason. It costs no
       // memory and reads the layout this pack already writes.
-      gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device),
+      gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device, pairChannels),
       // 🔴 AND THE SPLIT TRANSITION, WHICH THIS STACK ALSO NEVER HAD. Four of
       // an AF3 trunk's `pair-transition` passes are this stack's, and at
       // OpenDDE's 384 channels the fused kernel loses to the split by 3.71x -
@@ -207,6 +207,8 @@ export class Af3MsaStackGpu {
                        // in outer-product-mean-webgpu.js.
                        opmBiasAfterNorm: dialect.opmBiasAfterNorm === true,
                        ...(opmBlockI == null ? {} : { blockI: opmBlockI }),
+                       maxComputeWorkgroupStorageSize:
+                         this.device.limits?.maxComputeWorkgroupStorageSize,
                        ...(opmTuning.opmCellChunk == null
                          ? {} : { cellChunk: opmTuning.opmCellChunk }) };
     const opmOffsets = packOuterProductMeanWeights(sample.outerProductMean).offsets;
@@ -288,7 +290,7 @@ export class Af3MsaStackGpu {
       // catch.
       const scratch = [];
       for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
-        scratch.push(keep(this.allocator.allocate(
+        scratch.push(keep((options.scratchAllocator ?? this.allocator).allocate(
           `af3-msa.scratch${index}`,
           pipelines.pairScratchBytes(index,
   storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index])), storage)));

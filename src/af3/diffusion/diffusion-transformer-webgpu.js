@@ -2181,10 +2181,27 @@ export class Af3DiffusionTransformerGpu {
    *   transitionFactor, blocksPerSuperBlock, pairInputLayerNormScale, superBlocks
    */
   async run(act, cond, pairCond, mask, tokens, weights, options = {}) {
+    // 🔴 A CALLER'S BUFFER IS UPDATED IN PLACE, ONE SUPER-BLOCK A SUBMIT, so a
+    // retry from the top would apply the super-blocks already submitted twice -
+    // the pairformer had exactly that bug (see its run()). The activation is
+    // tokens x channels, a few MiB, so it is copied aside first, and only where
+    // a refusal can happen at all: a budget, and weights not yet given up.
+    const snapshot = act instanceof GPUBuffer && this.residentWeights
+      && memoryBudgetBytes(this.device) !== undefined
+      ? this.device.createBuffer({ label: "difftx.act-snapshot", size: act.size,
+          usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
+      : undefined;
+    const copy = (from, to) => {
+      const encoder = this.device.createCommandEncoder({ label: "difftx.act-snapshot" });
+      encoder.copyBufferToBuffer(from, 0, to, 0, act.size);
+      this.device.queue.submit([encoder.finish()]);
+    };
+    if (snapshot !== undefined) copy(act, snapshot);
     try {
       return await this.#runBlocks(act, cond, pairCond, mask, tokens, weights, options);
     } catch (error) {
       if (!(error instanceof GpuMemoryBudgetError) || !this.residentWeights) throw error;
+      if (snapshot !== undefined) copy(snapshot, act);
       // The pairformer's reasoning exactly; see the note on its run(). The
       // refusal arrives with some blocks already resident and their command
       // buffers in flight, so the call is abandoned rather than patched up.
@@ -2195,6 +2212,8 @@ export class Af3DiffusionTransformerGpu {
       this.degradedTo = `uploading weights per call (${(reclaimed / (1024 * 1024)).toFixed(0)}`
         + ` MiB reclaimed): ${error.message}`;
       return await this.#runBlocks(act, cond, pairCond, mask, tokens, weights, options);
+    } finally {
+      snapshot?.destroy();
     }
   }
 

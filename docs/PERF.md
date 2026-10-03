@@ -2358,3 +2358,303 @@ the triangle kernels ~23%. Three more arms, none taken:
 The pair transition already runs its f16-staged arm (18.5 ms a call in the
 profile against 18.6 in the bench), so the precision lever it has left is the
 weights, which docs/AF3.md declined on accuracy and which buys 1-4% here.
+
+## The T4's wide models ran the vector kernels: three matrix choices were the ampere prior's alone
+
+The head-to-head (docs/WEB.md) had a T4 at 180 s cold for IntelliFold-2 at 261
+residues and protenix2 at 58 s warm. Two causes, found without a T4:
+
+1. **NOT the bridge, which was the first guess and is wrong.** Those cells ran
+   before the readback stopped sending a 158 MiB event, but the T4's own status
+   lines say what the FOLD took, and at 261 residues it is nearly all of it:
+   AF3 22 s of 24, boltz2 29 of 32, protenix2 55 of 58, IntelliFold-2 177 of
+   180. The old bridge pinned to two cores here costs 2-3 s. Against this A100
+   the fold is 5.5x slower for AF3, 6x boltz2, 8x protenix2 and **11x
+   IntelliFold-2** - the widest pair track, and the outlier.
+2. **The wide models lost three kernels a T4 has the units for.** On this A100
+   with `--prior=turing`, IntelliFold-2 (512-channel pair) slowed 54% against
+   its own prior where AF3 slowed 11%. Bisecting the ampere prior's 41 knobs
+   (`--no-prior=<group>`) put it on `pairTransitionSplit` (the MATRIX split),
+   `triangleProjectMatrix` and `gridProjectMatrix`: each was `true` only in the
+   ampere prior, so a T4 - and every GPU with matrix units and no prior - ran
+   them on the vector path at every width. The width rules were already
+   written (192 channels, `TRANSITION_SPLIT_MIN_CHANNELS`,
+   `TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS`); they now DECIDE when no prior has,
+   and a prior may only refuse. AF3-width models (128) are untouched, so the
+   turing prior's own T4 measurements stand.
+
+| A100 under `--prior=turing`, 5CAJ 261 | before | after |
+|---|---:|---:|
+| IntelliFold-2, first / warm | 12.4 / 8.88 s | **7.7 / 6.07** |
+| OpenDDE, a fold | 11.15 s | **8.12** |
+| AF3, warm | 2.02 s | 2.04 |
+| boltz2, warm | 2.66 s | 2.64 |
+
+pLDDT identical to the last digit against this card's own prior (IntelliFold-2
+83.453, OpenDDE 92.04 on 6MRR), which has always taken these kernels.
+🔴 **AND THE GRID PROJECTION NOW PRICES ITS FIT**: it stages 32 KiB, and the
+width rule's first spec-floor run could not create it at WebGPU's guaranteed 16
+KiB - unseen while only a 48 KiB part chose it. `gridProjectMatrixConfig`
+declines like the triangle's and the transition's choosers. The turing
+prior's `opmBlockI: 8` had the same shape - 32 KiB on the OPM contraction at
+16 KiB - and now halves until it fits (`createOuterProductMeanShaders` takes the
+device's limit); no real device has both, but the choosers are all priced now.
+
+**MEASURED ON A T4 SINCE**, through the reader page and the bridge exactly as a
+Colab user folds: one VM, the code before this change against after it and
+after it again, a fresh browser profile and the NVIDIA shader cache cleared per
+arm, seconds cold / warm:
+
+| T4 | before | after | after, again |
+|---|---:|---:|---:|
+| IntelliFold-2, 261 | 165.6 / 161.5 | **98.7 / 96.9** | 98.7 / 95.6 |
+| OpenDDE, 261 | 117.0 / 108.9 | **80.4 / 70.2** | 76.1 / 70.3 |
+| protenix2, 261 | 55.8 / 54.5 | **40.3 / 37.4** | 42.4 / 38.9 |
+| AF3, 261 (128 channels, the control) | 25.7 / 24.3 | 34.3 / 23.5 | 27.8 / 24.1 |
+| IntelliFold-2, 68 | 54.0 / 13.7 | 58.3 / 8.6 | 54.8 / 9.2 |
+| OpenDDE, 68 | 41.4 / 10.1 | 46.9 / 8.6 | 45.5 / 9.1 |
+
+A third to two fifths off the wide models at 261 residues, cold and warm alike;
+AF3 unmoved warm. The cold price the turing prior was built to avoid shows at 68
+residues and is small - OpenDDE 41 -> 45-47 s, IntelliFold-2 within its own
+scatter - against 30-65 s saved on a fold of 261. 🔴 **AND protenix2 GAINS
+TOO**, which the A100 proxy did not predict (5% there): its trunk pair is 128
+but not every track it runs is, so the width rules reach part of it. The proxy
+found the defect; only the T4 could price it.
+
+## A T4's cold fold is waiting, so the runtime starts while the reader is choosing
+
+Measured on a Colab T4, through the page with its weights from Hugging Face, 68
+residues, a fresh profile and the NVIDIA shader cache cleared per model
+(`createComputePipeline` intervals unioned, shard timings from the resource
+table):
+
+| cold | wall | weights arrived | pipelines | compiler busy |
+|---|---:|---:|---:|---:|
+| AF3 | 22.5 s | 9.5 s | 124 | 16.5 s |
+| protenix2 | 27.7 | 8.0 | 144 | 23.7 |
+| OpenDDE | 50.5 | 21.0 | 186 | 43.8 |
+| IntelliFold-2 | 73.6 | **57.2** | 182 | **63.9** |
+
+So the compiler is busy for three quarters of the wall or more, and
+IntelliFold-2's 612 MB take nearly as long again at ~10 MB/s. None of it
+depends on the SEQUENCE - only on the model - and a Colab runtime sat idle while
+the reader chose one and typed. The reader now sends `warm` when the model
+changes (web/app.js `warmRemoteModel`; only after `/health` says the runtime has
+a real GPU, so a TPU's SwiftShader is never asked), and the runtime starts that
+model's weights and its trunk's pipelines (`window.__warmModel`); the loaders
+keep their promises, so the fold takes what is under way. Same T4, fold pressed
+at once against 60 s after choosing:
+
+| T4, cold, 68 residues | at once | after 60 s |
+|---|---:|---:|
+| IntelliFold-2 | 67.0 s | **14.9** |
+| OpenDDE | 78.5 | **12.5** |
+| AF3 | 32.3 | **12.1** |
+
+pLDDT identical in each pair. On the A100 the same is 9.2 -> 6.1 s. What is left
+is the fold itself and the stages the warm does not reach (the sampler and the
+confidence head compile at the fold); a reader who presses Fold within a few
+seconds of choosing gets a partial head start.
+
+### ...and then the runtime also folds a throwaway, and fetches its weights itself
+
+Two more steps on the same T4, and one dead end.
+
+**The warm-up now folds a dummy.** `warmAf3Pipelines` compiles the trunk from
+the manifest's shapes, but the sampler, the atom encoder and decoder, the
+conditioning and the confidence head have no compile-only path, so a warmed
+first fold still paid them. Once the weights are in, the runtime now folds a
+dummy sequence at the reader's length (two sampler steps, no recycles) through
+`foldAf3`: every pipeline compiled and the weights resident. A real fold waits
+for a dummy already running and supersedes one not yet started. AF3 after 60 s
+of choosing: **12.1 -> 6.6 s**, which is a warm fold.
+
+**The runtime's weights come through the broker.** The T4 VM downloads
+IntelliFold-2's 641 MB from Hugging Face in **6.8 s with parallel curl**, but
+its headless Chrome fetched them at 29 MB/s (22 s alone, 55 s beside a fold's
+compiles) - the network stack is what two vCPUs cannot feed, since Chrome reads
+the same files over loopback in 6.6 s. The broker now serves `/hf/<path>`:
+Python fetches upstream, streams to the page and keeps a disk copy
+(`_weights_proxy`), and `bundleBaseUrl` rewrites Hugging Face URLs to it only
+on a page the broker opened with `weights=proxy`. IntelliFold-2 folded at once
+with the proxy: 18.7 and 23.0 s; without, 44.7 and then 21.2 - Hugging Face's
+CDN is fast once it has the files, so the proxy removes the worst case more
+than it moves the median. The loader also stopped teeing each download into
+Cache Storage (the copy is written from the finished buffer) and reports
+progress at most every 100 ms.
+
+T4, 68 residues, from the start of this pass:
+
+| | at once, before | at once, now | after 60 s, now |
+|---|---:|---:|---:|
+| AF3 | 32.3 s | 16.3 | **6.6** |
+| IntelliFold-2 | 73.9 s | ~19-23 | 13.0 |
+
+🔴 **THE DRIVER'S SHADER CACHE IS NOT A LEVER, AND ONE RUN SAID IT WAS.** A
+fresh browser profile with NVIDIA's `~/.cache/nvidia/GLCache` kept read AF3
+23.5 -> 12.4 s once; repeated, 20.3 -> 20.2 with the cache populated. A T4's
+cold fold scatters by 1.5x (above), and one pair is inside it. Shipping or
+persisting that cache is not pursued. (`__GL_SHADER_DISK_CACHE_PATH` does not
+redirect it for Chrome's Vulkan either.)
+
+🔴 **AND A DAY OF LOCAL BRIDGE NUMBERS WERE A STALE BROWSER'S.** Two headless
+Chromes from a pinned-core experiment kept debugging port 9333 for a day, and
+every local broker after them attached to the OLD browser - old page, old
+modules from its HTTP cache - instead of starting its own. The proxy "did
+nothing" until the port was checked. A broker's `cdp.launch` cannot tell a
+browser it started from one it found; kill by profile, and check the port.
+
+### The runtime page's own overhead on a T4
+
+A warm AF3 fold at 68 residues on the T4 is **3.8 s through `fold.js`** (4 passes,
+25 steps) and **3.2-3.5 s folded directly in the runtime page**, so the page is
+not the slow part once it is warm. A JavaScript profile of the runtime during a
+fold (CDP `Profiler`, 0.5 ms sampling) put 547 ms in `fetch` - every status, bar
+fraction and sampler frame was its own POST to the broker - and time in drawing
+each frame into a viewer nobody looks at. Two changes:
+
+- **the runtime pushes its live frames and draws none**; the finished structure
+  still loads, which its download button reads;
+- **the bridge sends a task's events as one request**, by microtask, and a batch
+  older than 50 ms goes at once (a long synchronous stretch must not hold the
+  feed - `test:colab`'s busy-page arm failed at 6 s with the microtask alone).
+
+The warm-up dummy also takes one recycle now, so a recycled pass's kernels
+compile. T4, 68 residues:
+
+| | at once | after 60 s |
+|---|---:|---:|
+| AF3 | **13.0 s** (32.3 at the start of these passes) | **6.4** |
+| IntelliFold-2 | 18.7-40.8 (network) | **8.9** (67 at the start) |
+
+IntelliFold-2 folded at once is Hugging Face's to decide: 28.9 s before its
+fold began on one run, 6.5 on another, through the same proxy. What is left
+after a warm-up is the first real fold's ~5 s against 3.2-3.5 for later ones.
+
+### Every family warms, and what the upgrades are worth
+
+The warm-up covers ESMFold2 and AlphaFold 2 now - a throwaway fold through each
+family's own entry point (`foldEsmfold2`; `AlphaFoldMonomerGpu` /
+`AlphaFoldUnifiedGpu` with the multimer's regime over two chains). T4, 68
+residues, fold at once against 60 s after choosing:
+
+| T4 | at once | after 60 s |
+|---|---:|---:|
+| ESMFold2 600M | 28.7 s | **5.6** |
+| AF2 monomer | 21.9 s | **3.4** |
+| AF3 | 13.0 s | 6.4-7.0 (5.4 after 150 s) |
+
+The AF3 gap between 60 s and 150 s is the tiered upgrades still compiling one
+at a time on two vCPUs. Letting them take every thread while nothing folds was
+tried (`setUpgradeBoost`) and reverted: three arms read 5.5 / 7.1 / 8.5 s, which
+is the T4's own scatter and no evidence either way. Not taken without a result.
+
+### The T4 prior: ampere's knobs under turing's (2026-09-30)
+
+The turing prior set four knobs and left the rest at DEFAULT_TUNING, on the
+strength of a standalone triangle bench where ampere's entry regressed 40%. A
+whole fold disagrees. Colab T4, two rounds interleaved, 255 residues, seconds:
+AF3 warm 11.5-13.0 -> **10.7-10.9**, first fold 17.1-20.9 -> **14.5-15.8**, AF2
+monomer 15.2-16.3 -> **12.0-12.1**, IntelliFold-2 warm 35.5 -> **33.4**, against
+ampere's entry alone at 11.2-11.4 / 15.4-15.9 / 12.0 / 33.8. So turing is now
+ampere's entry with turing's measured settings on top and `opmBlockITokens`
+cleared (see device-profile.js). The same T4 profile found the AF3 trunk's
+distogram stage at 918 ms of a 3.1 s pass with a 5.7 ms kernel - the readback,
+not the head - which is what the logits change addressed; the pair and single
+read back for the conditioning and confidence heads are the rest of it, and
+taking them off the host touches the trunk cache and rf3's host global norm.
+
+**And the new prior's trunk knobs, each flipped on a T4** (bench-trunk, 255
+tokens, every arm beside its own baseline, AF3 two rounds, IntelliFold-2 one):
+none of the six should move. Trunk pass, ms, baseline -> arm:
+`triangleProjectMatrix` off AF3 1497 -> 1756 and 1607 -> 1918, IntelliFold-2
+14164 -> 20077; `gridProjectMatrix` off 1522 -> 1651, 14124 -> 17333;
+`gridAttendMatrix` off 1431 -> 1620; `pairTransitionSplit` off 1469 -> 1635 and,
+for IntelliFold-2's 512-channel pair, **14135 -> 65576 (4.6x)**;
+`stagedMatrixPrefetch` and `transitionThreadTarget` inside the noise.
+
+**The pair round trip, split by `bench-trunk.js --readback=contacts`** (reads
+back the contact map alone, as a fold's non-final passes do; timing only, the
+next pass recycles zeros). IntelliFold-2 at 255 tokens on this A100, two rounds:
+the distogram stage 880 -> 745 ms and the next pass's embedder 126 -> 5 ms, so
+reading the 133 MB pair back and uploading it again is ~260 ms a pass that does
+it - and a fold does it once, on the last pass, where the conditioning and the
+confidence head upload it again. Keeping it on the device is worth ~0.2 s of a
+13 s warm fold here, estimated 0.5-1 s of 33 on a T4; not taken, since it
+touches the trunk cache, the confidence head and rf3's host global norm. The
+other ~745 ms charged to that stage is not the readback: the stage clock also
+absorbs pairformer work still on the GPU.
+
+**And it does not cost the cold start.** `fold.js --folds=N`'s "first fold"
+cannot judge a prior's compile cost - bench tools run the tiered compile off and
+the driver's shader cache survives between arms - so the page was measured
+instead: Colab T4, the reader folds the moment it picks the model, driver cache,
+profile and weight cache cleared before every arm, two rounds. AF3 at 68
+residues 17.6 / 14.9 s old against 15.0 / 16.4 new; AF2 15.5 / 12.2 against
+15.6 / 18.2 - inside this card's spread both ways. A brand-new VM's very first
+fold read 21.7 s for AF3 (Chrome's first start and a cold path to Hugging Face
+included); 60 s after picking the model the page folds AF3 in 6.1 s and AF2 in
+4.0.
+
+**And the other six families on the same T4, old prior -> new** (two rounds
+interleaved, 255 residues, warm folds, seconds): ESMFold2 **18.0-18.3 -> 7.5-7.6**
+(its trunk 3.8 -> 1.3 s a recycle), AF2 multimer 16.7-17.3 -> 13.0-13.3,
+RoseTTAFold3 12.4-14.1 -> 11.2-11.6, Boltz-2 13.9-16.2 -> 13.5-14.0, Protenix-v2
+15.5-17.1 -> 15.5-15.8, OpenDDE 69.8 -> 67.4-67.7. No family got slower. Every
+fold passed its tool's chain check; ESMFold2's pLDDT reads 65.16 (old) and 65.70
+(new) on the T4 against 65.28 on this A100 under either prior, which is the
+kernel choice moving a stochastic sampler, not a different answer.
+
+### Keeping a T4 runtime's shader caches between sessions: measured, not worth it
+
+A returning Colab user starts on a new VM with no NVIDIA driver cache and no
+Chrome profile, so the question was whether saving both (to Drive, as the
+notebook already does for JAX's compile cache) would take the first fold down.
+Measured on one T4 by folding cold, saving `~/.cache/nvidia/GLCache` (5.5 MB)
+and the runtime's profile (`LOCALFOLD_KEEP_PROFILE=1` on the broker keeps it),
+then restoring each into a cleared machine, weights always re-downloaded. AF3
+at 68 residues, folded the moment the model is picked, two rounds: restored
+nothing 12.2 / 21.8 s, driver cache 16.1 / 20.5, profile 14.7 / 23.0, both
+13.5 / 15.8; AF2 7.3-13.2 across every arm. The rounds disagree by more than the
+arms do (the card heats between them), and the profile is **696 MB** - 338 MB of
+`DawnWebGPUCache` and 344 MB of service-worker cache - to move through Drive
+every session for no measurable win. Not built.
+
+The number that did stand out is the VM's FIRST fold: 23.0 s against 12.2 for
+the "restored nothing" arm on the same machine minutes later, with every cache
+of ours cleared in both. What a fresh VM pays is first-launch and network
+warm-up below this repository - the OS page cache, the CDN path to Hugging Face
+- not shader compilation.
+
+**And the tiles under it, swept on a T4 and left alone.** The turing entry says
+its grid-attention tile "was NOT swept here"; neither were the staged GEMM block
+or the triangle projection's tiles, all of them ampere's. bench-trunk, AF3 at
+255 tokens, each arm beside its own baseline, two rounds, trunk-pass change:
+grid-attend tile 2x16 +4.4/+7.3%, 2x32 -1.8/+2.4, 4x16 +3.4/+2.7, 6x16 -0.4/+1.1;
+staged block 64x64x16x1x4 +1.3/-1.2, 128x64x16x2x4 -3.0/+1.2, 32x128x16x1x8
+-4.3/-2.3, 64x128x32x1x8 +1.9/-1.8, 128x128x16x2x8 +4.2/+0.4; triangle pair
+tile 32x16 -4.0/0.0, 16x32 +4.7/-0.5; triangle output columns 32 0.0/-1.4, 128
+-5.0/-1.4. The baseline drifted 2212 -> 2606 ms across the session as the card
+heated, and nothing clears that by both rounds' agreement and size together:
+the two that lean the same way twice (32x128x16x1x8, columns 128) do so by 2-5%,
+inside this card's spread. A plateau, so ampere's tiles stay.
+
+### The trunk's last pair stays on the device for the heads that read it
+
+Every AF3-lineage fold read its last pass's pair back to the host (kept: a retry
+and a re-sampled fold resume from it) and then uploaded it TWICE more, once for
+the diffusion conditioning and once for the confidence head - `tokens^2 x
+pairChannels` floats each, 133 MB apiece for IntelliFold-2 at 255 tokens. The
+last pass now keeps its pair allocation for every model, as OpenDDE's already
+did for its expander: the conditioning binds it (it only reads), and the
+confidence head copies it on the device (it updates its pair in place).
+RoseTTAFold3's host global norm keeps its upload; a resumed or re-sampled trunk
+has no device pair and uploads from the host as before - checked on the page:
+fresh, "(trunk reused)" and "(1 more recycle)" all fold.
+
+Warm folds at 255 residues on this A100, interleaved: IntelliFold-2 6.27-6.33 ->
+**6.03-6.12 s**, AF3 2.42-2.52 -> 2.40-2.48. Peak device memory unchanged - 1605.5
+MiB and 897.8 MiB both ways, because the peak is in the trunk and not the
+sampler. Every pLDDT identical to the last digit; test:stock 8 of 8, ligand,
+modified, template, portable, spec-floor and cache all pass.

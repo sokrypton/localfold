@@ -68,7 +68,10 @@ export function jobRequestJson({ name, seed, entities }) {
   // open-dialect key, so a job carrying one cannot be written in the other
   // without dropping the bond - and a covalent inhibitor saved unbonded is the
   // archive describing a different fold.
-  if ((entities ?? []).some((entity) => (entity.type === "smiles" || entity.type === "contact")
+  // ...and so does a ligand of several components, which the server's single
+  // `ligand` code cannot hold.
+  if ((entities ?? []).some((entity) => (entity.type === "smiles" || entity.type === "contact"
+    || (entity.type === "ligand" && (entity.value ?? "").includes(",")))
     && (entity.value ?? "").trim() !== "")) {
     return openDialectJson({ name, seed, entities });
   }
@@ -99,7 +102,16 @@ export function jobRequestJson({ name, seed, entities }) {
         ...(modifications.length === 0 ? {} : { modifications }),
         useStructureTemplate: (entity.template?.kind ?? "none") !== "none" } });
     } else if (entity.type === "dna" || entity.type === "rna") {
-      sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count } });
+      // (a modified base is the job too, as a modified residue is - the server's
+      // modificationType / basePosition, the code prefixed)
+      const modifications = (entity.modifications ?? [])
+        .filter((modification) => (modification.code ?? "").trim() !== "")
+        .map((modification) => ({
+          modificationType: `CCD_${modification.code.trim().toUpperCase()}`,
+          basePosition: modification.position,
+        }));
+      sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count,
+        ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "smiles") {
       // Unreachable: the whole file went open above. Here so that adding a
       // row type never falls into the catch-all again.
@@ -117,6 +129,17 @@ export function jobRequestJson({ name, seed, entities }) {
     dialect: "alphafoldserver",
     version: 3,
   }], null, 2)}\n`;
+}
+
+/**
+ * The job as AlphaFold 3's own open-source JSON, which is what run_alphafold.py
+ * and the JAX backend read (tools/jax_worker.py) - the server dialect's reader
+ * there takes version 1 only, and this page writes 3.
+ */
+export function jobInputJson({ name, seed, entities }) {
+  // ...as ONE object: a JSON list is how that reader recognises the SERVER
+  // dialect, so the archive's `[{...}]` is refused there as a malformed one.
+  return `${JSON.stringify(JSON.parse(openDialectJson({ name, seed, entities }))[0], null, 2)}\n`;
 }
 
 /**
@@ -160,13 +183,20 @@ function openDialectJson({ name, seed, entities }) {
       sequences.push({ protein: { id, sequence: value,
         ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "dna" || entity.type === "rna") {
-      sequences.push({ [entity.type]: { id, sequence: value } });
+      const modifications = (entity.modifications ?? [])
+        .filter((modification) => (modification.code ?? "").trim() !== "")
+        .map((modification) => ({
+          modificationType: modification.code.trim().toUpperCase(),
+          basePosition: modification.position,
+        }));
+      sequences.push({ [entity.type]: { id, sequence: value,
+        ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "smiles") {
       // 🔴 NOT UPPER-CASED. Case is meaning in a SMILES and this is the whole
       // reason this branch exists.
       sequences.push({ ligand: { id, smiles: value } });
     } else {
-      sequences.push({ ligand: { id, ccdCodes: [value.toUpperCase()] } });
+      sequences.push({ ligand: { id, ccdCodes: value.toUpperCase().split(",").map((c) => c.trim()) } });
     }
   }
   // 🔴 THE BONDS, AS `[chain, residue, atom]` PAIRS - and the chain letters
@@ -321,21 +351,21 @@ function readAlignment(body, where, state) {
         + " cannot read - paste the alignment or use the upload box");
     }
   }
-  let sawEmpty = false;
-  for (const field of ["unpairedMsa", "pairedMsa"]) {
+  // 🔴 AN EMPTY STRING IS NOT AN ABSENT FIELD. AlphaFold 3 reads `""` as "run
+  // this chain with no alignment" and an absent field as "search for one" -
+  // opposite instructions, and the difference between a single-sequence fold
+  // and a several-minute search. It is the same absent-is-not-zero rule the
+  // archive's B-factor column follows.
+  const read = (field) => {
     const value = body[field];
-    if (value === undefined || value === null) continue;
-    // 🔴 AN EMPTY STRING IS NOT AN ABSENT FIELD. AlphaFold 3 reads `""` as "run
-    // this chain with no alignment" and an absent field as "search for one" -
-    // opposite instructions, and the difference between a single-sequence fold
-    // and a several-minute search. It is the same absent-is-not-zero rule the
-    // archive's B-factor column follows.
-    if (String(value).trim() === "") { sawEmpty = true; continue; }
-    refuse(`${where}: ${field} carries an alignment inline, which this page`
-      + " cannot attach yet - drop the fold archive on the alignment box"
-      + " instead, or delete the field to search afresh");
-  }
-  if (sawEmpty) state.singleSequence = true;
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "string") refuse(`${where}: ${field} is A3M text`);
+    if (value.trim() === "") { state.sawEmpty = true; return ""; }
+    return value;
+  };
+  // ...and an alignment carried inline is kept, per entry, and handed back
+  // per chain copy in fold order (see jobFromJson's `alignments`)
+  return { unpaired: read("unpairedMsa"), paired: read("pairedMsa") };
 }
 
 /**
@@ -365,18 +395,29 @@ function readTemplates(body, where) {
       + " cannot read - inline the mmCIF or pick a template on the row");
   }
   checkKeys(template, TEMPLATE_KEYS, `${where} template`);
-  for (const field of ["queryIndices", "templateIndices"]) {
-    if (template[field] !== undefined && template[field] !== null) {
-      refuse(`${where}: ${field} sets the template's residue mapping, and this`
-        + " page computes its own - the fold would use a different alignment"
-        + " than the file asks for");
+  // 🔴 AN EXPLICIT RESIDUE MAPPING IS THE JOB'S, AND IS USED AS GIVEN: queryIndices[k] (into the
+  // query) pairs with templateIndices[k] (into the template chain's residues, in file order), both
+  // from 0 - in place of the alignment this page would otherwise compute, which could pair the
+  // residues differently from what the file asks for.
+  const hasQuery = template.queryIndices !== undefined && template.queryIndices !== null;
+  const hasTemplate = template.templateIndices !== undefined && template.templateIndices !== null;
+  let mapping;
+  if (hasQuery || hasTemplate) {
+    const q = template.queryIndices, t = template.templateIndices;
+    if (!Array.isArray(q) || !Array.isArray(t) || q.length !== t.length) {
+      refuse(`${where}: queryIndices and templateIndices are two lists of one length`);
     }
+    if (![...q, ...t].every((v) => Number.isInteger(v) && v >= 0)) {
+      refuse(`${where}: queryIndices and templateIndices hold whole numbers from 0`);
+    }
+    mapping = q.map((query, k) => [query, t[k]]);
   }
   const mmcif = template.mmcif;
   if (typeof mmcif !== "string" || mmcif.trim() === "") {
     refuse(`${where}: a template with no mmcif in it`);
   }
-  return { kind: "upload", text: mmcif, filename: "template.cif", source: "" };
+  return { kind: "upload", text: mmcif, filename: "template.cif", source: "",
+           ...(mapping === undefined ? {} : { mapping }) };
 }
 
 /** One `sequences` entry, as an entity. */
@@ -445,14 +486,12 @@ function readEntry(entry, index, state) {
     const list = Array.isArray(codes) ? codes : [codes];
     if (list.length === 0) refuse(`${where}: a ligand with no code`);
     // 🔴 SEVERAL CODES IN ONE ENTRY IS ONE CHAIN OF SEVERAL COMPONENTS, not
-    // several ligands: AF3 bonds them into one entity. Splitting them into
-    // separate rows folds the same atoms unbonded, which is a different
-    // molecule wearing the same codes.
-    if (list.length > 1) {
-      refuse(`${where}: ccdCodes lists ${list.length} components as one bonded`
-        + " chain, and this page folds one code per ligand");
-    }
-    const code = String(list[0]).trim().toUpperCase().replace(/^CCD_/, "");
+    // several ligands: AF3 makes each code a residue of one chain (a glycan),
+    // bonded by the job's bondedAtomPairs. Splitting them into separate rows
+    // would fold the same atoms as separate molecules, so the row keeps them
+    // together, comma-separated, and the featuriser builds the chain
+    // (src/af3/featurise/ccd-component.js, ligandChain).
+    const code = list.map((one) => String(one).trim().toUpperCase().replace(/^CCD_/, "")).join(",");
     return { type: "ligand", value: code, copies, modifications: [], ids: idsOf(body) };
   }
 
@@ -463,8 +502,8 @@ function readEntry(entry, index, state) {
   const modifications = [];
   for (const modification of body.modifications ?? []) {
     // The open-source dialect names a base modification differently from a
-    // protein one, and this page refuses both on a nucleic chain anyway - so
-    // the field is read either way and entitiesProblem gives the message.
+    // protein one (modificationType / basePosition), so the field is read
+    // either way.
     const code = ptmCode(modification.ptmType ?? modification.modificationType,
                          where);
     const position = Number(modification.ptmPosition ?? modification.basePosition);
@@ -473,13 +512,10 @@ function readEntry(entry, index, state) {
     }
     modifications.push({ code, position });
   }
-  if (NUCLEIC_TYPES.includes(type) && modifications.length > 0) {
-    refuse(`${where}: modified bases are not supported yet`);
-  }
-  readAlignment(body, where, state);
+  const inlineMsa = readAlignment(body, where, state);
   const template = type === "protein" ? readTemplates(body, where) : undefined;
   return { type, value: sequence.trim().toUpperCase(), copies, modifications,
-           ids: idsOf(body),
+           ids: idsOf(body), inlineMsa,
            ...(template === undefined ? {} : { template }) };
 }
 
@@ -535,7 +571,7 @@ export function jobFromJson(text) {
   // Both dialects appear as a bare object and as a list of jobs in the wild.
   const jobs = Array.isArray(parsed) ? parsed : [parsed];
   if (jobs.length === 0) refuse("that file holds no jobs");
-  const state = { singleSequence: false };
+  const state = { singleSequence: false, sawEmpty: false };
   const notes = [];
   if (jobs.length > 1) {
     // 🔴 SAID, NOT SILENTLY DROPPED. Folding the first of several jobs is one
@@ -544,11 +580,16 @@ export function jobFromJson(text) {
     notes.push(`${jobs.length} jobs in the file; loaded the first`);
   }
   const job = jobs[0] ?? {};
-  for (const field of ["userCCD", "userCCDPath"]) {
-    if (job[field] !== undefined && job[field] !== null) {
-      refuse(`${field} describes chemistry this page does not build - remove it`
-        + " to fold the rest");
-    }
+  // `userCCD` (components the job defines itself, as mmCIF) is RETURNED, not refused here: the
+  // native exporter resolves ligand codes against it before the RCSB, and the page - which would
+  // have to hold the chemistry as state nobody can see - refuses it where it applies a job.
+  // A path to a file beside the JSON is still refused: nothing here can read it.
+  if (job.userCCDPath !== undefined && job.userCCDPath !== null) {
+    refuse("userCCDPath points at a file beside the JSON, which this reader cannot open"
+      + " - inline it as userCCD");
+  }
+  if (job.userCCD !== undefined && job.userCCD !== null && typeof job.userCCD !== "string") {
+    refuse("userCCD is mmCIF text");
   }
   // 🔴 ABSENT MEANS THE SERVER'S, WHICH IS UPSTREAM'S RULE AND NOT AN OBVIOUS
   // ONE: a job with neither `dialect` nor `version` is read by folding_input.py
@@ -571,8 +612,11 @@ export function jobFromJson(text) {
   // order and the featuriser appends ligand tokens after every polymer token.
   // A file listing its ligand first is perfectly legal and would otherwise
   // claim a chain index the polymers still use.
-  entities.sort((left, right) =>
-    Number(left.type === "ligand") - Number(right.type === "ligand"));
+  // 🔴 AND A SMILES LIGAND IS A LIGAND: keyed on `ligand` alone the sort moved
+  // AF3's kitchen-sink SMILES (its last entry, chain Z) ahead of every CCD
+  // ligand, where AlphaFold 3 keeps the file's order.
+  const isLigand = (entity) => entity.type === "ligand" || entity.type === "smiles";
+  entities.sort((left, right) => Number(isLigand(left)) - Number(isLigand(right)));
 
   // 🔴 THE BONDS A JOB DECLARES, WHICH THREE OF AlphaFold 3's OWN FOURTEEN
   // EXAMPLES CARRY. `bondedAtomPairs` names each end as
@@ -649,6 +693,29 @@ export function jobFromJson(text) {
     if (!Number.isFinite(first) || first < 0) refuse(`seed ${list[0]}`);
     seed = Math.floor(first);
   }
+  // 🔴 THE FILE'S OWN ALIGNMENTS, per polymer chain COPY in the order the
+  // entities expand to chains - the reader above reorders entities, so the
+  // list is built from them and not from the file's order. Text where the file
+  // carried one, "" where it asked for none, null where it said nothing.
+  const polymers = entities.filter((entity) => entity.inlineMsa !== undefined);
+  const perChain = { unpaired: [], paired: [] };
+  for (const entity of polymers) {
+    for (let c = 0; c < entity.copies; c += 1) {
+      perChain.unpaired.push(entity.inlineMsa.unpaired);
+      perChain.paired.push(entity.inlineMsa.paired);
+    }
+  }
+  for (const entity of entities) delete entity.inlineMsa;
+  const carried = [...perChain.unpaired, ...perChain.paired].some((text) => typeof text === "string" && text !== "");
+  let alignments;
+  if (carried) {
+    alignments = perChain;
+    const bare = perChain.unpaired.filter((text, i) => !text && !perChain.paired[i]).length;
+    notes.push(`the file's own alignments for ${perChain.unpaired.length - bare} of ${perChain.unpaired.length} chains`
+      + (bare === 0 ? "" : ` - the other ${bare} fold${bare === 1 ? "s" : ""} from ${bare === 1 ? "its" : "their"} own sequence`));
+  } else if (state.sawEmpty) {
+    state.singleSequence = true;
+  }
   if (state.singleSequence) {
     notes.push("the file asks for no alignment, so the MSA dial is set to none");
   }
@@ -667,10 +734,19 @@ export function jobFromJson(text) {
   // visible, editable and deleted when the reader deletes it, and
   // `expandEntities` resolves the letters at fold time.
   //
-  // Written with the letters the FILE used, which is what the reader will
-  // recognise; `asymOfId` above was only ever needed to know which of them are
-  // ligands.
-  const letterOf = new Map([...asymOfId.entries()].map(([id, asym]) => [asym, id]));
+  // 🔴 WRITTEN WITH THE PAGE'S LETTERS, NOT THE FILE'S. expandEntities reads a
+  // contact's letter as a POSITION (A = 0 ... Z = 25, AA = 26), the labels the
+  // viewer and the PDB carry; the file's own ids are arbitrary (AF3's kitchen-
+  // sink job names its chains A, AA, C, ..., JJ, X, Y, Z) and the reader above
+  // reorders entities, so writing the file's letter bonded the first HEM's CHA
+  // to an ATP - the page's G - that has no such atom. Matching only by luck
+  // when a job names its chains A, B, C in the page's order, as KRAS does.
+  const pageLabel = (asym) => {
+    let label = "";
+    for (let at = asym; at >= 0; at = Math.floor(at / 26) - 1) label = String.fromCharCode(65 + (at % 26)) + label;
+    return label;
+  };
+  const letterOf = new Map([...asymOfId.values()].map((asym) => [asym, pageLabel(asym)]));
   for (const bond of reaching) {
     const side = (end) => `${letterOf.get(end.asym) ?? "?"}${end.residue}`
       + (end.atom === undefined || end.atom === "" ? "" : `:${end.atom}`);
@@ -680,5 +756,7 @@ export function jobFromJson(text) {
   // ...and the letters go no further.
   for (const entity of entities) delete entity.ids;
   return { name: typeof job.name === "string" ? job.name : undefined,
-           seed, entities, dialect, singleSequence: state.singleSequence, notes };
+           seed, entities, dialect, singleSequence: state.singleSequence, notes,
+           ...(alignments === undefined ? {} : { alignments }),
+           ...(typeof job.userCCD === "string" && job.userCCD.trim() !== "" ? { userCcd: job.userCCD } : {}) };
 }

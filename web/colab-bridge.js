@@ -117,8 +117,22 @@ export function tapOut(kind, payload) {
   if (colabRole() !== "runtime") return;
   pending.push({ kind, payload, at: Date.now(), seq: seqOut });
   seqOut += 1;
-  flush();
+  // ...and sent at the END OF THIS TASK, not per event. A microtask runs
+  // before the task yields, so the rule above holds (the send starts in the
+  // task that made it), but a sampler step's status, bar and frame go as ONE
+  // request instead of three - on a T4's two vCPUs a fold's fetches were
+  // 547 ms of its main thread.
+  // 🔴 BUT NEVER LATER THAN 50 ms INSIDE ONE LONG TASK: a microtask waits for
+  // the task to end, and a page busy in one synchronous stretch held events
+  // for its whole length (test:colab measured 6 s). Past 50 ms the batch goes
+  // now, from the task that made it.
+  if (Date.now() - pending[0].at >= 50) { flush(); return; }
+  if (!flushQueued) {
+    flushQueued = true;
+    queueMicrotask(() => { flushQueued = false; flush(); });
+  }
 }
+let flushQueued = false;
 
 /* ------------------------------------------------- ...and what it is told to do */
 
@@ -136,6 +150,10 @@ const statusText = () =>
  */
 const failed = () =>
   !!document.getElementById("status-message")?.classList.contains("error");
+
+/** Prediction fields a reader never reads: see readBack. */
+const RUNTIME_ONLY = new Set(["pair", "paeLogits", "lddtLogits", "finalRepresentation",
+                              "msaFirstRow"]);
 
 /** Is a fold running here? The page states it; everything else is a proxy. */
 const folding = () => !!(window.__foldState && window.__foldState.running);
@@ -165,14 +183,29 @@ async function readBack() {
   // "values.subarray is not a function" while the picture beside it was
   // perfect. The kind travels with the numbers and `revivePrediction` puts it
   // back, so what the reader holds is what a local fold would have held.
-  const predJson = JSON.stringify(pred, (key, value) =>
-    (ArrayBuffer.isView(value) && !(value instanceof DataView))
-      ? { __typed: value.constructor.name, v: Array.from(value) } : value);
+  // 🔴 AND THE MODEL'S INTERMEDIATES STAY HERE. Each AF2 recycle carries its
+  // pair representation (L^2 x 128) and the PAE and lDDT LOGITS the finished
+  // numbers were read from; at 255 residues the prediction was 1 GB as JSON
+  // and every fold died on "Invalid string length" with the structure drawn.
+  // Nothing on the reader reads them - the archive writes the confidences, and
+  // the contact map was computed here from the pair - so they are not sent.
+  // ...and a typed array travels as its BYTES, base64: a float as JSON text
+  // is 10-18 characters and 5.3 as base64, and the broker and the reader each
+  // parse what is sent.
+  const predJson = encodePrediction(pred);
   return {
     predJson,
     a3m: pred.a3m ?? null,
-    confidence: pred.confidence ?? null,
-    scores: pred.scores ?? null,
+    // 🔴 NOT A SECOND COPY OF THE CONFIDENCES. They are in `predJson`, filtered
+    // and typed; sent again here they went through a plain stringify, where a
+    // typed array becomes an object with a key per element and the PAE
+    // LOGITS rode along - 130 MiB of a 158 MiB event for one AF2 fold at 261
+    // residues, and fifteen seconds between "Done" and the reader seeing it.
+    confidence: null,
+    // 🔴 AND NOT A SECOND COPY OF THE SCORES EITHER: they are `pred.scores`,
+    // inside `predJson`, and the reader takes them from there. Sent twice they
+    // were 7.3 of an AF3 fold's 8.8 MB at 255 residues, over the internet.
+    scores: null,
     chains: pred.chains ?? null,
     length: pred.length ?? null,
     status: statusText(),
@@ -255,12 +288,24 @@ async function runFold(request) {
   // agreeing is not something to rest a completion test on.
   const pressed = Date.now();
   button.click();
-  const deadline = Date.now() + Math.min((request.timeout ?? 300) * 1000, 1800_000);
+  // 🔴 THIRTY MINUTES UNLESS ASKED, NOT FIVE. The reader sends no timeout,
+  // and five minutes ended IntelliFold-2 at 512 residues on a Colab T4 at 73%
+  // of its last trunk pass - legitimately slow, streaming its weights under the
+  // memory budget - while the reader watched the bar move. The reader already
+  // has a stop button and gives up on a runtime that stops answering; this is
+  // only the backstop for a page that hangs.
+  // 🔴 AND A FOLD THAT RUNS OUT OF TIME IS STOPPED, not left running behind
+  // its own error: it held the GPU and the next request was refused as
+  // "already folding".
+  const deadline = Date.now() + Math.min((request.timeout ?? 1800) * 1000, 1800_000);
   for (;;) {
     await idle(250);
     const state = window.__foldState ?? null;
     if (state !== null && state.running === false && state.since > pressed) break;
-    if (Date.now() > deadline) return { error: "timed out", status: statusText() };
+    if (Date.now() > deadline) {
+      if (folding()) button.click();
+      return { error: "timed out", status: statusText() };
+    }
   }
   // 🔴 "READY" IS "IT CAN HAND ONE OVER", NOT "THE FOLD ENDED".
   // `loadIntoViewer` clears the object's frames and re-adds them, so the
@@ -289,6 +334,12 @@ async function obey(command) {
     // The transport's own check, and the only op that needs no GPU: it is what
     // tools/check-colab-bridge.py proves the two directions with.
     tapOut("pong", { at: Date.now(), folding: folding(), status: statusText() });
+    return;
+  }
+  if (op === "warm") {
+    // The reader has picked a model: start its weights and pipelines here,
+    // unless a fold is already using the GPU. See warmRemoteModel in app.js.
+    if (!folding()) window.__warmModel?.(payload?.family, payload?.tokens);
     return;
   }
   if (op === "stop") {
@@ -374,13 +425,106 @@ const TYPED = {
   Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array,
 };
 
-export function revivePrediction(json) {
-  return JSON.parse(json, (key, value) => {
-    if (value === null || typeof value !== "object") return value;
-    const kind = TYPED[value.__typed];
-    return (kind !== undefined && Array.isArray(value.v)) ? kind.from(value.v) : value;
+/**
+ * The prediction as the string the bridge carries.
+ *
+ * 🔴 SHARED OBJECTS ARE SENT ONCE. JSON has no references, so every object
+ * the prediction reaches twice was written out twice: an AF2 pass holds its
+ * structure and confidences in its wrapper AND in its `pass`, and
+ * `contactSource` is one of those passes again - 10 MB for an AF2 fold at 255
+ * residues, two thirds of it repeats. The first appearance carries `__id`; a
+ * later one is `{__ref: id}`, which `revivePrediction` puts back as the SAME
+ * object, as the runtime held it. Typed arrays travel as their bytes, and the
+ * model's intermediates (RUNTIME_ONLY) not at all.
+ */
+export function encodePrediction(pred) {
+  const ids = new Map();
+  return JSON.stringify(pred, (key, value) => {
+    if (RUNTIME_ONLY.has(key)) return undefined;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    const seen = ids.get(value);
+    if (seen !== undefined) return { __ref: seen };
+    const id = ids.size;
+    ids.set(value, id);
+    if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+      return { __typed: value.constructor.name, b64: bytesToBase64(value), __id: id };
+    }
+    return { __id: id, ...value };
   });
 }
+
+/**
+ * ...and back. `JSON.parse` revives children before parents and siblings in
+ * order, so an object's first appearance is complete before any later
+ * `{__ref}` to it is reached - one pass resolves them.
+ */
+export function revivePrediction(json) {
+  const byId = new Map();
+  return JSON.parse(json, (key, value) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    if (value.__ref !== undefined && Object.keys(value).length === 1) {
+      if (!byId.has(value.__ref)) throw new Error(`prediction reference ${value.__ref} before its object`);
+      return byId.get(value.__ref);
+    }
+    const id = value.__id;
+    let revived = value;
+    const kind = TYPED[value.__typed];
+    if (kind !== undefined && typeof value.b64 === "string") {
+      const bytes = base64ToBytes(value.b64);
+      revived = new kind(bytes.buffer, bytes.byteOffset, bytes.byteLength / kind.BYTES_PER_ELEMENT);
+    } else if (kind !== undefined && Array.isArray(value.v)) {
+      revived = kind.from(value.v);
+    } else if (id !== undefined) {
+      delete value.__id;
+    }
+    if (id !== undefined) byId.set(id, revived);
+    return revived;
+  });
+}
+
+/** A typed array's bytes as base64, in chunks: `apply` has an argument limit. */
+export function bytesToBase64(view) {
+  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  let binary = "";
+  for (let at = 0; at < bytes.length; at += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(at, at + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/** ...and back, into a fresh buffer aligned for any element type. */
+export function base64ToBytes(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let at = 0; at < binary.length; at += 1) bytes[at] = binary.charCodeAt(at);
+  return bytes;
+}
+
+/**
+ * Which implementation folds on the runtime: this page's WebGPU fold, run by
+ * the runtime's headless copy of it, LocalFold's native CUDA ports (the same
+ * weights and inputs, compiled for the card - tools/native_worker.py), or
+ * af3-any-model on JAX (the reference, and the only one that reaches a TPU).
+ * The badge offers the choice when the runtime was started with more than one;
+ * see tools/colab_backend.py.
+ */
+let backendChoice = "webgpu";
+export const remoteBackendChoice = () => backendChoice;
+// ...and whether a CUDA fold streams its intermediate results to this page while it runs (each trunk pass's
+// contact map, the sampler's frames, AF2's passes with their scores) - the reader's choice, on the badge,
+// because it is this page that draws them. Measured at under 1% of a fold (tools/native_worker.py).
+let liveChoice = true;
+export const remoteLiveChoice = () => liveChoice;
+
+// 🔴 WHETHER THE RUNTIME HAS A REAL GPU IS NOT KNOWN UNTIL /health ANSWERS, and
+// the choice above says "webgpu" until then - so anything that acts on it early
+// (the model warm-up) waits for this. A TPU runtime's WebGPU is SwiftShader: a
+// warm-up there downloads weights and compiles on the CPU beside JAX.
+let runtimeWebgpu = null;
+const readyListeners = [];
+export const remoteWebgpuReal = () => runtimeWebgpu === true;
+export function onRemoteReady(listener) { readyListeners.push(listener); }
+const announceReady = () => { for (const listener of readyListeners) listener(); };
 
 /** Ask the runtime for something. Returns the command's sequence number. */
 export const remoteCommand = (op, payload) => ask("/in", { op, payload });
@@ -475,6 +619,82 @@ function installColabStatus() {
       // by hand there is no machine to hand back, and a button that promises
       // one either way is wrong half the time.
       releases = health.colabRuntime === true;
+      // 🔴 THE CHOICE APPEARS ONLY WHERE IT EXISTS. A runtime started without
+      // `--jax-dir` has one backend, and a select with one option is a control
+      // that pretends there is something to decide.
+      runtimeWebgpu = gpu.webgpu !== false && gpu.vendor !== "google"
+        && !/swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
+      const offered = health.backends ?? [];
+      if ((offered.includes("jax") || offered.includes("native")) && !badge.querySelector("select")) {
+        const pick = document.createElement("select");
+        pick.className = "colab-backend";
+        pick.title = "CUDA: LocalFold's native ports, compiled for the runtime's card -"
+          + " the page's own weights and inputs, and the fastest. WebGPU: this page's"
+          + " own fold, on the runtime's GPU. JAX: af3-any-model, the reference"
+          + " implementation - a minute of compile on its first fold, and the one that"
+          + " runs on a TPU.";
+        const choices = [["native", "CUDA"], ["webgpu", "WebGPU"], ["jax", "JAX"]]
+          .filter(([value]) => value === "webgpu" || offered.includes(value));
+        for (const [value, text] of choices) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = text;
+          // 🔴 NO ADAPTER AT ALL IS NOT A SLOW CARD - a fold there fails. Offered
+          // disabled, with the reason, rather than hidden: the reader should see
+          // why their usual backend is not available on this runtime.
+          if (value === "webgpu" && gpu.webgpu === false) {
+            option.disabled = true;
+            option.textContent = "WebGPU (no GPU on this runtime)";
+          }
+          pick.append(option);
+        }
+        // 🔴 WHERE WebGPU HAS NO CARD, JAX IS THE DEFAULT. A TPU runtime (or any
+        // without a GPU driver) gives WebGPU SwiftShader - the CPU, minutes a
+        // fold - and the TPU sits idle; only JAX reaches it.
+        const software = gpu.webgpu === false || gpu.vendor === "google"
+          || /swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
+        // ...and where the CUDA backend is offered it is the default: it is the
+        // same fold as WebGPU's, minutes faster on the card the runtime has.
+        const fallback = offered.includes("native") ? "native" : software ? "jax" : "webgpu";
+        let stored = null;
+        try { stored = localStorage.getItem("localfold.colabBackend"); }
+        catch (cause) { /* remembered for this page only */ }
+        pick.value = choices.some(([value]) => value === stored) ? stored : fallback;
+        if (gpu.webgpu === false && pick.value === "webgpu") pick.value = fallback === "webgpu" ? "jax" : fallback;
+        if (pick.value === "") pick.value = "webgpu";
+        backendChoice = pick.value;
+        pick.addEventListener("change", () => {
+          backendChoice = pick.value;
+          announceReady();
+          try { localStorage.setItem("localfold.colabBackend", pick.value); }
+          catch (cause) { /* remembered for this page only */ }
+        });
+        badge.insertBefore(pick, leave);
+        // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it is
+        // set here, per fold, by whoever is watching - and shown only for the backend it applies to
+        if (offered.includes("native")) {
+          const live = document.createElement("label");
+          live.className = "colab-live";
+          live.title = "Live preview: stream a CUDA fold's intermediate results as it runs - each trunk"
+            + " pass's contact map, the sampler's frames, AlphaFold 2's passes with their scores. Off, the"
+            + " page shows the finished fold only. Measured at under 1% of a fold.";
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          try { box.checked = localStorage.getItem("localfold.colabLive") !== "off"; }
+          catch (cause) { box.checked = true; }
+          liveChoice = box.checked;
+          box.addEventListener("change", () => {
+            liveChoice = box.checked;
+            try { localStorage.setItem("localfold.colabLive", box.checked ? "on" : "off"); }
+            catch (cause) { /* remembered for this page only */ }
+          });
+          live.append(box, document.createTextNode(" Live"));
+          const showLive = () => { live.hidden = pick.value !== "native"; };
+          pick.addEventListener("change", showLive);
+          showLive();
+          badge.insertBefore(live, leave);
+        }
+      }
       leave.title = releases
         ? "Stop folding here and release this Colab machine: the service"
           + " stops, its GPU is freed and the runtime is unassigned. This page"
@@ -484,6 +704,7 @@ function installColabStatus() {
       // ...and the timing report is headed with it, because the rows in it
       // were recorded on that card and not on this one.
       if (card !== "") devSourceIs(`the Colab runtime · ${card}`);
+      announceReady();
     } catch (cause) { /* the pulse below is what matters; this is its name */ }
   };
 

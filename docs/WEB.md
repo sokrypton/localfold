@@ -3106,3 +3106,1041 @@ uppercase a contact on screen the way it would a SMILES.
 which expands to the linker as a LIGAND plus two bonds - fits this row exactly
 (`DSSO A53 - C66`), and the parser leaves room for it, but it needs a table of
 linker codes and the atoms each attaches by. That is the next piece.
+## A second backend on the Colab runtime: JAX (af3-any-model), and the TPU it reaches
+
+The notebook's `jax_backend` box installs ColabFold2's JAX implementation beside
+LocalFold's own - by running ColabFold2's OWN install cell headless into
+`/content/jax` (it owns the CUDA and TPU pins), not a copy of it - and starts
+the service with `--jax-dir`. The reader's Colab badge then offers **WebGPU /
+JAX**. WebGPU is this page's fold on the runtime's card; JAX is
+`sokrypton/alphafold3` (af3-any-model), the implementation the port is checked
+against, and the only one a TPU runtime can run: WebGPU reaches hardware only
+through a Vulkan/Metal/D3D12 driver, and a TPU has none.
+
+**The seam is the bridge, not the fold.** `tools/jax_worker.py` is one
+long-lived process (a model is minutes of compile, so its weights and JAX's
+compile cache are kept) that takes a job a line on stdin and prints the bridge's
+own events on stdout - `status`, `progress`, `frame`, `result` - so the reader
+follows a JAX fold with the loop that follows a WebGPU one. The job is the
+page's own AlphaFold 3 JSON (`jobInputJson`, the open dialect, as ONE object:
+that reader takes a list to mean the server dialect, and takes the server
+dialect only at version 1), so the entity conversion is not re-implemented in
+Python. The result is AF3's own per-token pLDDT, PAE, contact probabilities,
+token layout and the alignment used; the reader builds its prediction from them
+(`jaxPrediction` in web/app.js) and records it, so the scores card, the archive
+download and the saved session behave as they do for a local fold.
+
+What reaches it from the page: the model (resolved - the PLM row's ESMFold2
+size, AF2's model number, which the page folds into the family name as
+`monomer-2`), recycles, steps, MSA depth, seed, the MSA row - none, search
+(the worker asks the ColabFold MMseqs2 server itself), paste, or an upload,
+which travels with the job; a merged alignment over several chains is split by
+chain length as the page splits one - and a TEMPLATE: a PDB entry or an
+AlphaFold DB model is fetched as mmCIF by the worker, an uploaded file is used
+as it is (a PDB file is converted to the smallest mmCIF alphafold3 reads, one
+chain's polymer, first alternate location), the chain is cut out and globally
+aligned to its query, and it goes in as AlphaFold 3's own template input. AF2's
+monomer takes one through its models 1 and 2. AlphaFold 3's parameters are
+fetched on its first JAX fold - after the page's own terms dialog, which gates
+sending one at all. What is REFUSED with a message rather than approximated: the
+Flow sampler (JAX samples by diffusion), a template "from the MSA search", AF2
+models 3-5 with a template (they have no template embedder), and a template on
+AF2 multimer or ESMFold2.
+
+🔴 Three things that cost a run each:
+- **The library prints to stdout**, so events have a private copy of fd 1 and
+  fd 1 itself goes to stderr - and that copy does not survive `exec`: the
+  worker re-execs itself when a job names a ligand code it has not fetched
+  (the CCD tables are read at import), and until fd 1 was put back on the pipe
+  first, the restarted worker folded on, printing its events to stderr, while
+  the broker saw the pipe close.
+- **A protein chain must carry `templates: []`** even when the alignment is
+  searched: the MMseqs2 fill supplies alignments only.
+- **Stop kills the worker** - JAX cannot be interrupted mid-computation - and
+  the next JAX fold starts a new one and recompiles. `test:colab` holds that
+  with a stub worker (`LOCALFOLD_JAX_WORKER`), watched failing with the kill
+  removed.
+
+Measured through the real reader page (openbind0, 68 residues): a T4 31-99 s
+for a model's first fold (compile) and 4 s after; an L4 130 s then ~1 s; a
+Colab TPU v5e 44 s cold, pLDDT 84.9, every frame streamed to the reader.
+
+### Every model through the JAX backend, on the reader's page (an L4, 2026-09-27)
+
+Driven through `index.html?backend=colab` in a real browser - the model row,
+the MSA row, Fold, then the scores card and the archive download read back:
+
+| case | result |
+|---|---|
+| openbind0: single sequence / search / paste / + GOL / + SEP@3 | folded, 25 frames, card and archive (the MSA cases carry `msas/`) |
+| boltz2, protenix2, intellifold2, rosettafold3 | folded, 25 frames each (a model's first fold 56-60 s, compile included) |
+| opendde | folded, pLDDT 91.6, final frame only (live frames since sokrypton/alphafold3@0a533eb - see below) |
+| ESMFold2 600M / 300M | folded, 11 frames each |
+| AF2 monomer (model 2) / multimer (2 chains) | folded, a frame a recycle (the first AF2 fold 350 s, most of it the parameter download) |
+| AlphaFold 3 without DeepMind's parameters, Flow, a template | refused, with the reason on the status line (superseded: see below) |
+| a WebGPU fold from the same page, then JAX again | both folded - the selector switches per fold |
+
+🔴 (SUPERSEDED - fixed upstream in sokrypton/alphafold3@0a533eb, see the next
+section.) opendde had no live frames on JAX because af3-any-model's stepwise
+path failed on a structural-token model through its own CLI too (`--stepwise_recycles`:
+KeyError 'init' in staged.py; stepwise diffusion: a (68, 24) mask against
+(160, 24, 3) positions in `random_augmentation`), while `run_alphafold.py
+--model=opendde` folds the same job. That is the upstream's to fix; the worker
+folds it plain and says so.
+
+### ...and the refusals it no longer needs (an L4, 2026-09-27)
+
+| case | result |
+|---|---|
+| 5CAJ chain A, openbind0, no template | CA-RMSD 19.47 A, pLDDT 36.8 - the control |
+| ...with the PDB entry 5CAJ_A | **0.47 A**, pLDDT 94.5 |
+| ...with the crystal uploaded as a file | **0.47 A**, pLDDT 94.5 |
+| ...AF2 monomer model 1, uploaded crystal | **0.19 A**, pLDDT 97.7 |
+| ...AF2 model 3 with a template | refused by the page: no template embedder |
+| 1BRS A:D, one pasted alignment over both chains | split by chain, folded |
+| AlphaFold 3 on a runtime without its parameters | fetched (973 MiB in ~50 s), then folded |
+
+🔴 The uploaded file failed twice before it parsed, both in the PDB-to-mmCIF
+step and both invisible to the PDB-entry path (RCSB's own mmCIF is complete):
+5CAJ's alternate locations came through as duplicate atoms, and its waters and
+ligands sat under the protein's chain letter as extra entities the minimal file
+could not describe - "cannot assign 6 input values to the 2 output values" in
+the parser's chain bookkeeping both times.
+
+### A third pass: the search's templates, a merged MSA panel, and two upstream fixes (an L4, 2026-09-27)
+
+| case | result |
+|---|---|
+| opendde, live | **16 frames**, pLDDT 82.7 - with the upstream fix below |
+| 5CAJ chain A, MSA search + "template from the MSA search" | **0.40 A**, pLDDT 94.2 - the search's best pdb70 hit |
+| ...the same template kind with no search | refused: it needs one |
+| 1BRS A:D, search | folded, pLDDT 93.8; the MSA panel gets ONE merged alignment (19,660 rows: the paired rows side by side, then each chain's own with gaps over the other) |
+
+The page offers WebGPU disabled, with the reason, on a runtime whose WebGPU has
+no adapter at all (a TPU) - a fold there would fail rather than crawl.
+
+**Fixed in sokrypton/alphafold3's `colab` branch (0a533eb)**, which the
+notebook's install overlays, so a new runtime has them:
+- `staged_fold` turns on `eval.stepwise` itself: `--stepwise_recycles` never set
+  it and died at `st['init']` with KeyError 'init' on EVERY model.
+- The `denoise` stage returned early with the residue batch and trunk
+  embeddings, so a structural-token model could not run live (the (68, 24)
+  mask against (160, 24, 3) positions). It rebuilds the struct/ batch now, and
+  `diff_cond` hands back the expander and refiner's embeddings as
+  `denoise_carry` for every step.
+- `fill_missing_msas(template_hits={})` returns the pdb70 hits the unpaired
+  job's tar already carries, and `fetch_template(name)` a hit's mmCIF from
+  ColabFold's template endpoint - which is what the worker uses, rather than
+  reading the tar on its way through the library.
+
+### A fourth pass: Flow on JAX, and a compile cache that outlives the runtime (an L4, 2026-09-27)
+
+The page's **Flow** sampler runs on the JAX backend now: sokrypton/alphafold3
+gained the same walk (31bb0bf - `SampleConfig.flow`: one draw at sigma_max 10,
+then the prediction replaces the state, no augmentation and no noise), and the
+worker sets it from the sampler row. rosettafold3 refuses it with the page's own
+reason (`noFlowSampler`). 6MRR, CA-RMSD to the crystal:
+
+| | diffusion (JAX) | flow (JAX) | flow (WebGPU) |
+|---|---:|---:|---:|
+| openbind0 | 1.72 A | 1.74 A | 1.82 A |
+| boltz2 | 0.57 A | 0.54 A | - |
+
+The notebook's `jax_cache_to_drive` box mounts Drive and points the worker's
+compile cache there (`LOCALFOLD_JAX_CACHE`), which is ColabFold2's own
+`persist_cache_to_drive` for the same reason: a model's first fold is a minute
+or two of compile, and a new runtime starts without the cache. Not measured
+here - the mount needs an interactive Drive consent.
+
+What the JAX backend now refuses: templates on ESMFold2 (WebGPU refuses them
+too; the AF2 multimer's were refused here and are taken now - see below), AF2 models 3-5 with a template, rosettafold3 with
+Flow. Nothing else. A TPU re-run of this pass could not be allocated (two
+allocation timeouts); the previous pass's TPU run folded end to end.
+
+## AlphaFold 2 multimer templates, on both backends
+
+The multimer was refused a template everywhere, on the grounds that its
+embedder is a different dialect and nothing built a slot for it. The embedder
+was always there - src/af2/multimer/template.js takes an atom37 slot over the
+WHOLE complex plus `asymId`, and model.js forwarded it every recycle - so what
+was missing was the slot:
+
+- **the page** builds one atom37 slot over the complex: each templated chain
+  through `buildTemplate` at its own residue offset, the rest gap, merged by
+  `mergeAtom37Templates` (web/template-source.js). That is AlphaFold's own
+  multimer layout - one template per chain along the residue axis - and
+  `asymId` keeps two files from claiming a relative placement. One template a
+  chain; a second on the same chain is refused.
+- **fold-af2.js** takes `--chain=A,D` on a target (the chain lengths come with
+  it) and `--template=path:A,D`.
+- **JAX** needed nothing upstream: af3-any-model's `from_af3_batch` already
+  turns the AF3 batch's per-chain templates into multimer `template_*`
+  features, with the alphabet measured for `af2_multimer`, and all five
+  multimer checkpoints keep their template weights. The worker's refusal was
+  the whole gap, and the monomer's "models 3-5 have no template embedder"
+  refusal no longer catches the multimer.
+
+1BRS A:D (barnase-barstar), crystal self-template, single sequence:
+
+| | recycles | no template | both chains | barnase only |
+|---|---:|---|---|---|
+| WebGPU, `fold-af2.js` | 0 | 16.679 A | 0.782 A | - |
+| WebGPU, `fold-af2.js` | 3 | - | **0.474 A**, pLDDT 94.98, pTM 0.888, ipTM **0.868** | - |
+| WebGPU, the page (`fold-in-page.py`) | 1 | pLDDT 38.5, ipTM 0.08 | pLDDT 89.6, ipTM 0.58 | pLDDT 64.7, ipTM 0.12 |
+| JAX, L4, model 1 | 3 | 15.98 A, ipTM 0.07 | **0.34 A**, pLDDT 94.9, pTM 0.890, ipTM **0.87** | 11.22 A, pLDDT 67.5 |
+| JAX, L4, model 3 | 3 | - | 0.43 A, pLDDT 95.8, ipTM 0.89 | - |
+
+At matched recycles the two backends agree on confidence to the second
+decimal. One chain templated lifts that chain and leaves the interface unknown
+(ipTM 0.09-0.12), which is the right answer rather than a failure. The
+multimer arm is in `npm run test:template` now (0.782 against 16.679).
+
+### The second pass: search templates on a complex, the deltas, a homodimer
+
+🔴 **A TEMPLATE "FROM THE MSA SEARCH" FAILED ON EVERY COMPLEX, FOR EVERY
+MODEL.** `generateMmseqs2ComplexMsa` ran one search per chain, each returning
+its pdb70 hits, and its return dropped them all - so with the MSA set to
+Search the page said "Automatic templates need an MSA search". Single chains
+were never affected, which is why nothing saw it. It returns `templateHits` by
+chain now (`test/mmseqs2-api.test.js`, watched failing without the fix). 1BRS
+through the page, both chains `auto`: the multimer takes 6pqk_A and 1brs_D,
+pLDDT 97.4 / ipTM **0.929**; AlphaFold 3 the same two, pLDDT 96.2.
+
+The rest of the pass confirmed rather than changed:
+
+| | no template | templated |
+|---|---|---|
+| WebGPU multimer-2 / -3 / -5 (deltas), 1BRS, 3 recycles | 15.2 / 14.2 / 12.9 A | 0.61 / 0.79 / 0.51 A |
+| WebGPU page, 1TIM A:B homodimer, both copies | pLDDT 39.1, ipTM 0.11 | pLDDT 91.4, ipTM 0.84 |
+| JAX through the reader page (L4), 1BRS, 3 recycles | 15.83 A | upload 0.34 A · search+auto 0.40 A (search alone 0.57) |
+
+The delta bundles carry the multimer template embedder, so "All 5" folds with
+the template on every model. A homodimer's copies each get the entity's
+template (entities.js expands copies into chains), which is AlphaFold's own
+behaviour. The saved job and the archive were already per-chain.
+
+### The third pass: the archive, the probe, the cache
+
+🔴 **A SAVED FOLD'S TEMPLATES CAME BACK AS A SEARCH, ON EVERY MODEL.** The
+request in the archive can only say `useStructureTemplate: true`, which the
+reader rightly turns into "from the MSA search" - so a fold of 1BRS against
+its own crystal, dropped back on the page, asked the MMseqs2 server for
+templates nobody had chosen. The structures were in the archive all along
+(`templates/…_template_hit_N_chains_x.pdb`), but their names give the FOLD
+chain and not the structure's, and barstar is chain D of 1brs. The archive now
+writes `templates/<name>_templates.json` beside them - file, fold chain,
+structure chain, source - and `templatesFromArchive` puts each back on its row
+as an upload. `--job-round-trip` on the templated multimer: before
+`upload, upload`, after `upload, upload`, `same: true` (it read
+`search, search` before). An archive without the index, like the AF3
+server's, restores none, as it did.
+
+`fold-in-page.py` stops on a status line with the `error` class and exits 1
+with the message: the automatic-template failure above had it sit out a
+900 s timeout on a line that already said why. The same failure now ends in
+2.4 s.
+
+`npm run test:cache` gains a templated monomer arm, because the monomer's
+template kernels compile only with a slot. The multimer's embedder runs every
+recycle, so the existing multimer arm covers it. Clean in both orders, and
+also clean with templated monomer and templated multimer in one process.
+
+### The fourth pass: a JAX fold's templates reach its archive
+
+🔴 **A FOLD ON THE JAX BACKEND SAVED `templates: none` WHATEVER IT USED.**
+`jaxPrediction` wrote `templates: []`, because the structures are fetched and
+aligned on the RUNTIME, not by the page - so the archive the third pass taught
+to carry templates had nothing to carry, its README said none, and a dropped
+archive refolded without them. The worker now returns the structure each fold
+chain used (`{chain, text, chainId, source}`, one entry a copy, numbered over
+the polymer rows the way the page numbers them), and the page records it.
+L4, through the reader page:
+
+| | fold | archive dropped back |
+|---|---|---|
+| 1BRS A:D, uploads A and D | 0.34 A | `archive · 2 chains · 2 templates`, rows `upload@A`, `upload@D` |
+| 1TIM, ONE entity with copies 2, upload A | **1.01 A**, pLDDT 94.1 | one row, copies 2, `upload@A` |
+
+The second row is also the first JAX run of a templated entity with copies: the
+AF3 JSON writes one protein entry with two ids and one template, and both
+copies take it.
+
+### The fifth pass: the TPU, and the search on JAX
+
+The final code on a **TPU v5e** (the first TPU allocation in three tries),
+through the reader page:
+
+| | fold | archive dropped back |
+|---|---|---|
+| multimer, 1BRS, uploads A and D | 0.34 A, pLDDT 94.8, 34 s | `upload@A`, `upload@D` |
+| multimer, 1BRS, both chains from the search | 0.40 A, pLDDT 97.6 | `upload@A:6pqk_A`, `upload@D:1brs_D` |
+| openbind0, 1BRS, both chains from the search | 0.51 A, pLDDT 95.2 | the same two |
+
+So a search-picked template now saves as the structure the search chose and
+reloads as that structure, on both lineages. The install pins jax to 0.11.1 for
+tokamax on a TPU and needs nothing else.
+
+A JAX fold's final status names each template and its coverage now
+(`· template 1brs-crystal.pdb 108/108 · template … 87/87`), as the WebGPU fold's
+always has: it was reported mid-run and then overwritten by "done", so a
+template that arrived looked like one that did not. 🔴 Its first version
+crashed every templated fold - the new list was called `named`, which the loop
+beside it already uses for a template's display name - and only the TPU run
+caught it, because `test:colab`'s stub worker never reaches `fold()`.
+
+### The sixth pass: the JAX worker folds on this machine, as a gate
+
+Every JAX check so far needed a Colab VM, because the only local exercise of the
+worker - `test:colab` - uses a STUB that never reaches `Worker.fold`. That is
+how a name clash in the fifth pass's template bookkeeping crashed every
+templated JAX fold until a TPU run caught it.
+
+af3-any-model installs on this A100 exactly as on Colab: a Python 3.13 venv
+with `jax[cuda12]==0.11.1` and `dm-tree` (preinstalled on the Colab image), then
+ColabFold2's own install cell run in `~/lfjax` (57 s). The
+`alphafold3-colabfold` wheel is manylinux 2.28, so this box's glibc 2.35 takes
+it - unlike Dawn's node binding. And it folds to the digit what the L4 and the
+TPU folded: 1BRS multimer 15.78 A bare and **0.34 A**, ipTM 0.87, templated.
+
+`npm run test:jax` (`tools/check-jax-worker.py`) is the gate: the worker over
+its own stdin protocol, five cases in about three minutes - the multimer's two
+template arms, the templates the result must carry (one per fold chain, with
+the structure chain) and name on the status line, openbind0 templated
+(0.50 A), a GOL job after those (the worker's `execv` restart), and
+rosettafold3 refusing Flow. With the clash put back it fails on exactly the two
+templated folds with `'str' object has no attribute 'append'`.
+
+### The seventh pass: every family through the page, locally - and ESMFold2 without its language model
+
+With the worker local, the whole reader-page suite runs here: the broker
+(`tools/colab_backend.py --jax-dir ~/lfjax`, started from the venv's Python)
+and a reader page, every family end to end. **16 of 16** and the template
+suite **7 of 7** - after one thing about this box:
+
+- af3-any-model takes ANY blob already in `~/.cache/alphafold3/weights`, and
+  this machine had checkpoints from 4 September there. boltz2, protenix2,
+  rosettafold3, opendde and esmfold2-600M died on parameters the published
+  checkpoints have since renamed (`single_cond_initial_norm/scale` at 831 wide,
+  `boltz2_cyclic_conditioning` missing). A Colab runtime starts empty, which is
+  why every Colab run folded them. `AF3_WEIGHTS_DIR=~/lfjax/weights` gives the
+  local install a cache of its own; nothing is deleted.
+
+🔴 **EVERY ESMFold2 FOLD ON THE JAX BACKEND RAN WITHOUT ITS LANGUAGE MODEL.**
+The suite checks that a fold ARRIVES - frames, a card, an archive - and ESMFold2
+600M arrived at pLDDT 56 where 300M read 85, which is what gave it away. Scored
+against 6MRR's crystal: **15.81 A**. af3-any-model's own CLI folds the same job
+to 1.52 A (int8) / 1.56 (fp32), and the WebGPU port to 1.47. The worker set
+`FLAGS.use_esm_embeddings`, which is what `main()` reads to decide the matter;
+`process_fold_input` takes `use_esm` as an ARGUMENT, defaults it to False, and
+never looks at the flag. So the ESM-C tower never ran for any ESMFold2 fold on
+this backend. With the argument passed: **600M 1.47 A** - the WebGPU port's
+number to the hundredth - and 300M 1.71 (its structure happened not to move on
+a designed 68-mer; its pLDDT did, 89.2 -> 85.6). `test:jax` now folds 6MRR on
+the 600M with a 3 A bar, and fails at 15.44 A with the argument removed.
+
+### The eighth pass: the worker against af3-any-model's own CLI, family by family
+
+"It arrived" is what the ESMFold2 bug hid behind, so this pass holds every
+family's JAX fold to af3-any-model's `run_alphafold.py` on the same job (6MRR,
+single sequence, seed 1), on the A100:
+
+| model | CLI | worker | CLI vs worker |
+|---|---:|---:|---:|
+| openbind0 | 1.60 A | 1.84 A | 0.66 A |
+| boltz2 | 0.46 | 0.53 | 0.23 |
+| protenix2 | 1.33 | 1.50 | 0.61 |
+| intellifold2 | 1.58 | 1.61 | 0.24 |
+| rosettafold3 | 1.78 | 1.61 | 0.82 |
+| opendde | 1.54 | 0.72 | 1.29 |
+| alphafold3 | 0.73 | 0.79 | 0.37 |
+| esmfold2 600M | 1.52 | 1.47 | 0.18 |
+| esmfold2 300M | 1.72 | 1.71 | 0.10 |
+
+All at the CLI's quality, and not identical - which is DOCUMENTED rather than
+a defect: the worker runs `--stepwise_recycles` (the live frames need it) and
+that flag's own help says "NOT bit-identical to the fused path: each pass gets
+an independently split PRNG key". Against the CLI run WITH that flag the worker
+agrees to **0.032 A** (opendde), **0.037** (rosettafold3), **0.074** (openbind0)
+- so the worker configures nothing differently from the reference.
+
+And chemistry, which neither number above sees:
+- **GOL** beside 6MRR, bond rms: openbind0 0.062, boltz2 0.019, protenix2 0.033,
+  intellifold2 0.040, rosettafold3 0.097, opendde 0.018, af3 0.025, esmfold2
+  0.038 - WebGPU's `test:ligand` range. `test:jax`'s ligand case now asserts
+  the bonds (0.15 A rms) instead of the residue name.
+- **SEP@3**, mean bond ratio: af3 1.023, openbind0 0.958, boltz2 **0.994**,
+  protenix2 0.991, intellifold2 0.995, rosettafold3 0.998, opendde 0.997,
+  esmfold2 1.013. The 0.994 closes docs/BOLTZ2_PTM.md: af3-any-model's boltz2
+  inflated a phosphoserine 2.7x when that brief was written, and no longer does.
+
+### The ninth pass: every control reaches the JAX fold - and one did not
+
+The ESMFold2 bug was a setting that never reached the model, so this pass
+asked it of every control the page sends (`FOLD_CONTROLS`), against a baseline
+fold of the same job on the A100:
+
+| control | changes the fold? |
+|---|---|
+| seed (job `modelSeeds`) | yes, 0.609 A; the same seed reproduces to 0.000 |
+| steps (`af3-count`) | yes (4 steps is 489 A - the page offers 25 and up, 16 for OpenDDE) |
+| recycles | yes, 0.524 A |
+| sampler, MSA mode, MSA depth, AF2 model | yes (earlier passes) |
+| **tolerance** | **no - never read** |
+
+🔴 **THE PAGE'S RECYCLE EARLY STOP WAS SENT WITH EVERY AF2 FOLD AND IGNORED.**
+JAX ran every pass where WebGPU stopped on a settled structure. af3-any-model's
+AF2 recycle loop is Python and already calls `on_recycle` after each pass, so
+the change upstream is small: **`on_recycle` may return True to end recycling
+there**, that pass becoming the answer (sokrypton/alphafold3 `colab` d6d3357;
+the notebook's own callback returns None, so nothing else changes). The worker
+measures with the same metric WebGPU uses - ColabFold's `compute_tol`, the RMS
+change of every C-alpha pair distance - under the same rule (not before the
+second pass; 0 is every pass), and says so the same way:
+
+| | WebGPU | JAX |
+|---|---|---|
+| monomer, 6MRR, tolerance 0.1 | 3 passes of 4 | **3 passes**, `converged at 0.10 Å after 3 passes`, pLDDT 85.12 (85.07 with all 4) |
+| multimer, templated 1BRS, 0.5 | - | **2 passes**, 0.37 A (0.34 with all 4) |
+
+`test:jax` has the multimer case now, and fails with the stop disabled.
+
+## WebGPU against JAX, head to head - and the eight defects it found
+
+Asked for as the baseline for an automatic backend choice: every model, both
+backends, every GPU the Colab plan reaches, timed from the reader's click to the
+result in the page, COLD (fresh browser profile, empty weight and compile
+caches) and WARM (again, another seed so WebGPU cannot replay its cached
+answer), on 6MRR (68 residues) and 5CAJ chain A (261), single sequence. Every
+fold is scored against its crystal, because a fast wrong fold is not a win.
+The harness is a reader page driving `tools/colab_backend.py`, exactly as a
+Colab user's page does. The first pass mostly measured defects, so these came
+first:
+
+1. **WebGPU kept every model it had folded.** Residency is kept between folds
+   so the same model's next fold skips its packing, and it was kept across a
+   CHANGE of model too: 677 -> 1281 -> 2171 -> 2874 MiB live, and the fourth
+   model died in WebGPU validation. `releaseAllWeights` on a change of family;
+   `npm run test:switch` folds ten models in one page and holds live bytes
+   under 2 GiB (6151 MiB with the release removed).
+2. **JAX preallocated 75% of the card** under the page's own WebGPU Chrome:
+   out of memory on one side, a lost device on the other. The worker sets
+   `XLA_PYTHON_CLIENT_PREALLOCATE=false`.
+3. **JAX kept every model it had folded too** - 1.6 GB in use after one model,
+   16 GB after eleven - through a JAX trace that `weakref.finalize`'s registry
+   keeps alive, holding the parameters as constants. `jax.clear_caches()` and
+   `gc` do not reach it. The worker now restarts on a change of model.
+4. **...and restarting by `os.execv` never let go of a TPU**: exec keeps the
+   process and its descriptors, libtpu kept the device, and every fold after
+   the first on a v5e died "Unable to initialize backend 'tpu'". `jax_worker.py`
+   is now a supervisor (no JAX) that relays to a worker CHILD and starts a fresh
+   one when needed; the child dies with its parent. A switch costs ~3 s of
+   process start and takes its executables from the on-disk compile cache.
+5. **AF2 compiled its network twice** in af3-any-model: the recycles ran
+   through `jax.checkpoint(one_pass)` and the final pass through `one_pass`, so
+   the first fold that reached the final pass paid a second compile - 11 s on
+   an A100, skipped by any fold that stopped early on convergence. Prediction
+   takes no gradient (sokrypton/alphafold3 colab f9c11cb): 12.1 s -> 0.8 s.
+6. **A remote AF2 fold at 255 residues died on "Invalid string length"**: every
+   recycle carried its pair representation and PAE logits, ~1 GB as JSON. The
+   bridge keeps model intermediates on the runtime, and the page drops each
+   recycle's host pair once its contact map is built (26 MB).
+7. **...and still took 15 s to arrive**, because the readback sent the
+   confidences a second time, outside the filtered prediction, where a typed
+   array stringifies as an object with a key per element - 130 MiB of a
+   158 MiB event. Gone, and typed arrays travel as base64 bytes (which keeps
+   NaN, turned into null before): "Done" to the reader having it, 15.5 s ->
+   0.6-0.9 s.
+8. **The JAX worker's weight cache on this box was September's** -
+   af3-any-model takes any blob already in `~/.cache/alphafold3/weights` - so
+   the local install runs on its own `AF3_WEIGHTS_DIR`. (A Colab runtime starts
+   empty; this was never a user's problem.)
+
+### The numbers, after the fixes
+
+Cold / warm seconds from the click to the result in the page; '!' marks a fold
+more than 4 A from its crystal, which on 5CAJ is every model on both backends -
+it does not fold from a single sequence, and the two backends agree about that.
+T4 is 57 of 80 cells and the TPU has none: Colab ended every session and
+stopped allocating partway through the rerun. The A100 is this box, run through
+the same broker and reader page.
+
+### 6mrr: cold / warm seconds, WebGPU vs JAX ('!' = RMSD >= 4 A)
+
+| model | a100-local WebGPU | a100-local JAX | t4 WebGPU | t4 JAX | l4 WebGPU | l4 JAX | g4 WebGPU | g4 JAX |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| openbind0 | 6 / 2 | 82 / 2 | 23 / 6 | 117 / 4 | 5 / 3 | 139 / 2 | 2 / 2 | 51 / 2 |
+| af3 | 6 / 2 | 69 / 2 | 15 / 5 | 110 / 4 | 4 / 2 | 71 / 2 | 2 / 2 | 28 / 2 |
+| boltz2 | 6 / 2 | 89 / 2 | 17 / 8 | 113 / 6 | 4 / 3 | 68 / 2 | 2 / 2 | 33 / 2 |
+| protenix2 | 5 / 2 | 70 / 2 | 16 / 7 | 108 / 6 | 4 / 3 | 67 / 2 | 2 / 2 | 30 / 2 |
+| intellifold2 | 8 / 4 | 99 / 2 | 51 / 14 | 129 / 16 | 7 / 4 | 68 / 3 | 3 / 2 | 34 / 2 |
+| rosettafold3 | 4 / 2 | 64 / 2 | 18 / 5 | 102 / 5 | 4 / 2 | 67 / 2 | 2 / 2 | 32 / 2 |
+| opendde | 10 / 4 | 96 / 2 | 42 / 12 | 134 / 13 | 6 / 4 | 88 / 3 | 2 / 2 | 36 / 2 |
+| ef2-fast-600m | 6 / 2 | 92 / 2 | 23 / 2 | 76 / 4 | 4 / 2 | 47 / 2 | 2 / 2 | 26 / 2 |
+| monomer | 4 / 2 | 67 / 2 | 11 / 7 | 304 / 3 | 4 / 2 | 102 / 2 | 2 / 2 | 48 / 2 |
+| multimer | 4 / 2 | 37 / 2 | 12 / 3 | 70 / 4 | 2 / 2 | 46 / 2 | 2 / 2 | 17 / 2 |
+
+### 5caj: cold / warm seconds, WebGPU vs JAX ('!' = RMSD >= 4 A)
+
+| model | a100-local WebGPU | a100-local JAX | t4 WebGPU | t4 JAX | l4 WebGPU | l4 JAX | g4 WebGPU | g4 JAX |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| openbind0 | 7! / 6! | 104! / 6! | 36! / 23! | 147! / 35! | 10! / 9! | 74! / 9! | 4! / 3! | 30! / 2! |
+| af3 | 6! / 6! | 82! / 5! | 26! / 24! | 143! / 34! | 9! / 9! | 74! / 9! | 3! / 2! | 30! / 2! |
+| boltz2 | 6! / 6! | 104! / 6! | 33! / 32! | 155! / 47! | 11! / 10! | 82! / 12! | 4! / 3! | 32! / 3! |
+| protenix2 | 10! / 9! | 89! / 6! | 58! / 58! | 180! / 73! | 16! / 15! | 82! / 17! | 4! / 4! | 32! / 4! |
+| intellifold2 | 18! / 17! | 106! / 12! | 180! /  |  | 37! / 36! | 96! / 35! | 8! / 8! | 34! / 6! |
+| rosettafold3 | 6! / 6! | 73! / 6! |  |  | 9! / 10! | 79! / 10! | 3! / 2! | 31! / 2! |
+| opendde | 14! / 13! | 105! / 120! |  |  | 30! / 27! | 110! / 35! | 7! / 6! | 36! / 6! |
+| ef2-fast-600m | 124 / 3 | 99 / 4 |  |  | 8 / 4 | 43 / 6 | 2 / 2 | 18 / 2 |
+| monomer | 23! / 8! | 63! / 6! |  |  | 14! / 14! | 45! / 12! | 4! / 4! | 27! / 4! |
+| multimer | 4! / 6! | 65! / 6! |  |  | 8! / 9! | 50! / 11! | 2! / 2! | 31! / 4! |
+
+Setup, once per machine (the notebook's own cell): Chrome/Vulkan **5.4 s (G4),
+9.1 (L4), 20.6 (T4)**; the JAX install on top of it **25.2, 34.4, 36.7**, and
+76.7 on a TPU v5e (where jax is re-pinned for tokamax).
+
+**For an automatic choice, WebGPU wins where it can run.** Cold - the one fold
+most visitors make - it is 2-58 s against JAX's 17-304 s, which is almost all
+XLA compile, before the install is counted. Warm, the two tie at 68 residues and
+mostly at 261: G4 and L4 even, the T4 FASTER on WebGPU (23-58 s against 34-73),
+and only the A100's widest models faster on JAX (IntelliFold-2 12 s against 17,
+protenix2 6 against 9). So the rule is the one the page already follows - WebGPU
+wherever there is a real adapter, JAX where there is none (a TPU, or SwiftShader)
+- and an automatic switch to JAX would pay 30-150 s of compile to win a few
+seconds a fold, for a reader folding the same large model repeatedly on an A100.
+
+Two A100 cells read ~120 s where the fold itself had finished in 3-9 s (OpenDDE
+warm on JAX, EF2-fast cold on WebGPU at 261). Re-run back to back they read
+10.5 s and 8.0 s: a transient on the network or the box, not the backends.
+
+What this makes the next targets: WebGPU on a T4 at the wide pair tracks
+(IntelliFold-2 180 s cold at 261 residues, protenix2 58 s even warm), and JAX's
+cold compile, which the notebook's Drive compile cache already takes off a
+RETURNING reader.
+
+### AF2 with early stop off, so both backends run every pass
+
+The AF2 rows above ran the page's default recycle tolerance (0.1 A), so two
+backends could stop after different pass counts by rounding alone. With
+`tolerance: 0` both run all four (the JAX status line no longer reads
+"converged"; WebGPU's "saved pass N of 4" is its RANKING of four passes that all
+ran). A100, cold / warm seconds, empty caches:
+
+| AF2, 4 passes | WebGPU | JAX |
+|---|---:|---:|
+| monomer, 68 | 4.0 / 2.5 | 70.2 / 2.0 |
+| multimer, 68 | 4.0 / 2.5 | 37.6 / 2.0 |
+| monomer, 261 | 9.0 / 8.5 | 63.2 / 6.5 |
+| multimer, 261 | 4.5 / 4.5 | 67.7 / 6.5 |
+
+Same picture: WebGPU wins cold by 8-16x, JAX wins warm by 0.5 s at 68 and by
+2 s for the monomer at 261, and WebGPU's multimer is faster warm at 261. The
+benchmark sets `tolerance: 0` from now on. The one step-count difference left
+is ESMFold2's (11 denoiser steps on WebGPU, which follows the vendor's
+`max_inference_sigma` cap, against af3-any-model's 15), which favours WebGPU by
+about a quarter of that model's sampler.
+
+### The supervisor worker on a TPU v5e
+
+`npm run test:jax` on a Colab TPU v5e (`python3 tools/check-jax-worker.py
+--python $(command -v python3) --jax-dir /content/jax`, after the notebook's own
+setup: 21 s, JAX install 81 s): **all seven cases pass** - the multimer's two
+template arms (16.28 -> 0.34 A), the early stop, a switch to openbind0 (0.49 A),
+a GOL job that needs new chemistry, rosettafold3's Flow refusal and ESMFold2 600M
+(1.47 A). Every one after the first is a job the exec-based restart killed on a
+TPU with "Unable to initialize backend 'tpu'"; the supervisor starts a fresh
+child and the TPU is released with the old one.
+
+### The T4's missing cells, and AF2 with early stop off on it
+
+Filled in on one Colab T4 (same harness, cold / warm seconds). With the width
+rules, WebGPU's wide models at 261 residues are 99 / 97 s (IntelliFold-2) and
+80 / 70 (OpenDDE):
+
+| T4 | WebGPU | JAX |
+|---|---:|---:|
+| IntelliFold-2, 68 | 58.3 / 8.6 | 129.9 / 13.5 |
+| IntelliFold-2, 261 | **98.7 / 96.9** | 289.7 / 185.2 |
+| OpenDDE, 68 | 46.9 / 8.6 | 128.2 / 10.6 |
+| OpenDDE, 261 | **80.4 / 70.2** | **out of memory** |
+| AF2 monomer, 68, 4 passes | 12.6 / 5.7 | 168.3 / 3.5 |
+| AF2 multimer, 68, 4 passes | 6.0 / 2.5 | 66.9 / 3.5 |
+| AF2 monomer, 261, 4 passes | 26.0 / 26.6 | 80.0 / 25.6 |
+| AF2 multimer, 261, 4 passes | 19.3 / 18.2 | 92.5 / 27.8 |
+
+On a T4 WebGPU is ahead warm as well as cold on the wide models - IntelliFold-2
+nearly 2x at 261 - and **OpenDDE at 261 does not fit JAX on the 16 GB card at
+all** (RESOURCE_EXHAUSTED in a fresh worker process, so not the old leak), where
+WebGPU folds it in 70 s. AF2 warm is a tie at 261 for the monomer and WebGPU's
+for the multimer; JAX leads warm only at 68 residues, by 2 s.
+
+### A Colab A100 against this A100, and what the difference was (2026-09-30)
+
+Same card on both (A100-SXM4-40GB), same commit, same harness
+(`bench_h2h.py`, WebGPU only, fresh profile and empty caches, reader page ->
+broker -> runtime page), every model at 6MRR (68) and 5CAJ (261). All 160 folds
+give the same structure to 0.01 A on both machines, so only time differs.
+Click-to-done seconds, cold / warm, before and after the fix below:
+
+| 261 residues | this A100 before | Colab before | this A100 after | Colab after |
+|---|---:|---:|---:|---:|
+| AF2 monomer | 10.5 / 9.0 | 12.5 / 11.6 | 6.5 / 5.0 | 7.1 / **5.6** |
+| AF3 | 5.0 / 4.5 | 6.0 / 5.5 | 5.0 / 4.6 | 5.6 / 5.0 |
+| IntelliFold-2 | 24.6 / 16.1 | 29.3 / 19.1 | 24.6 / 16.0 | 29.2 / 19.3 |
+| OpenDDE | 24.1 / 12.6 | 26.8 / 15.5 | 21.6 / 12.1 | 26.6 / 14.5 |
+| ESMFold2 | 5.1 / 3.0 | 6.1 / 4.1 | 5.5 / 3.0 | 6.5 / 4.1 |
+
+At 68 residues every model is within 0.5 s warm on both, which is the
+harness's polling resolution. The first Colab session's first fold took 61 s
+(8.0 on the second session) and its OpenDDE and Boltz-2 68-residue colds were
+23 and 12 s (11.0 and 5.5 on the second): VM and network variance, not the port.
+
+🔴 **THE GPU WAS NEVER THE DIFFERENCE, AND EACH CANDIDATE WAS MEASURED OUT:**
+- clocks: 1410 MHz under load on Colab with no throttle reason, and
+  `nvidia-smi -lgc 1410,1410` there changes nothing (IntelliFold-2 19.1 s both
+  ways); releasing this box's lock changes nothing either (15.9 against 16.1);
+- the device: `probe-alu.js` within 6% everywhere (f32 FMA 14.0 against 14.9
+  TFLOP/s, vec4 f16 110 against 115, streamed reads 145 against 145),
+  `probe-dispatch.js` within 10%;
+- the browser build: Colab's Chrome 153 headless shell run HERE gives this
+  box's times (IntelliFold-2 16.1, OpenDDE 12.1, monomer 7.6 warm);
+- the fold itself: `fold-af2.js --target=5caj --repeat=3` is 1.02 / 1.00 s on
+  Colab against 1.005 / 1.002 here, an AF2 block's GPU time 15.7 against 15.0 ms.
+
+What differs is the HOST: a 2.2 GHz Xeon (12 vCPUs) against an EPYC 7J13 (30).
+The same Chrome binary runs a typed-array JavaScript loop in **485 ms there and
+237 here** (map work 1.2x). So a fold slows on Colab in proportion to its
+host-side JavaScript, and the page had one fold that was mostly that.
+
+🔴 **AF2's CONTACT MAP WAS HALF OF AN AF2 FOLD ON THE PAGE.** Every pass,
+`web/app.js` asked for the pair representation back (`pairHost`, `L^2 * 128`
+floats, 35 MB at 261) and ran the distogram head over it in JavaScript
+(`L^2 * 128 * 64` multiply-adds) in a `setTimeout` on the main thread - between
+the fold's own steps, so it delayed them rather than overlapping. With it
+switched off the page's AF2 fold at 255 residues was **2.6 s against 6.0**, the
+fold tool's own 2.5 at those settings. It is on the device now
+(`src/heads/distogram-webgpu.js`, monomer.js's `contacts` option): `L * L`
+probabilities come back, `probe-af2-contacts.js` holds them to the host function
+every pass (5-7e-7 at 58 residues, 1.0e-6 at 255; a kernel reading the forward
+pair twice fails at 0.14), and `fold-in-page.py --model monomer` still puts a
+contact map on every frame. The Colab gap for AF2 went from 2.6 s to 0.6.
+
+**What is left** is the GPU-bound families' host work at 2x the cost: 10-20%
+warm at 261 (IntelliFold-2 16.0 against 19.3 s). Profiled here, IntelliFold-2's
+warm fold is 3.1 s of JavaScript in 13.7, most of it re-packing trunk weights -
+which is deliberate: at 255 residues the fold is past
+`WEIGHT_RELEASE_MIN_BYTES`, so it streams its trunk weights and gives them back
+(4458 MiB held against 3343 released, +3% on this box). On Colab that trade
+costs about twice as much time and the same memory.
+
+🔴 **AND A NEW COLAB IMAGE BROKE THE NOTEBOOK'S SETUP ON THE WAY.** Two A100
+sessions today (driver 580.178) ended the setup before Chrome was in place:
+the driver step's `ldconfig` ran while the background `apt-get install` ran
+dpkg's own, the two collided on `/etc/ld.so.cache~` ("Renaming ... failed"),
+and `set -e` stopped the script. The runtime then had no browser and the
+reader's page timed out with nothing folded. The notebook now runs one
+`ldconfig`, after the apt job is waited for; the next fresh A100 set up in 10 s.
+
+**The next pass, profiling each family's page JavaScript over the fold alone**
+(`Profiler` started at the click; an earlier window that opened before it
+charged the previous fold's session save to this one). Three more host costs,
+none of them a wall-clock win on this box because each overlapped GPU time the
+fold was waiting on anyway - they are worth taking because a Colab runtime pays
+them at twice the price:
+- the pairformer asked `packTransitionWeights(block).offsets` and
+  `packSingleAttentionWeights(block).offsets` on EVERY run, which decoded and
+  concatenated the tensors to read a running sum of lengths - ten call sites of
+  that shape. `packNamedWeights` now takes lengths from the SOURCES thunks and
+  builds `data` only when read: AF3's warm fold 1085 -> 894 ms of JavaScript,
+  `readTensorRange` 223 -> 6. `test:stock` 8 of 8 signatures unchanged;
+- the AF2 multimer read its pair back every pass (35 MB at 261) for a structure
+  module and confidence heads that take a device tensor - 3.4 -> 3.2 s, same
+  checksum. Its bundle has no distogram head, so it has never had a contact map;
+- `toPdb` rebuilt the same records for each of a trajectory's 26 frames:
+  cached per batch, byte-identical, 77-88 -> 47-54 ms.
+
+**And the reader does none of the work - measured, then made a gate.** A reader
+page (`?backend=colab`) instrumented for WebGPU and weight traffic, folding
+through a runtime: AF3, AF3 with a SMILES ligand, AF2 monomer and multimer,
+ESMFold2, OpenDDE, and AF3 on 5CAJ with a 128-row search and an uploaded
+template (255/255). Across all of them and a 20 s idle after load the reader
+**never requested a WebGPU adapter, created no pipeline, buffer or submit, and
+fetched no weight file**; its JavaScript was 50-490 ms a fold, and 0.9-1.8 s
+with an alignment, all of it py2Dmol drawing the structure and the MSA.
+`test:colab`'s reader arm now asserts it (adapter requests and `.bin` /
+huggingface / `/hf/` fetches both zero), and fails on a reader made to ask for
+an adapter and one shard.
+
+🔴 **AND THE COLAB WARM-UP NO LONGER RUNS AlphaFold 3 BEFORE ITS TERMS ARE
+ACCEPTED.** The reader asks its runtime to warm whichever model is selected, and
+the runtime's warm-up is a real fold of a dummy sequence - so a reader who had
+never seen the licence dialog had AF3 running on their runtime the moment the
+page connected, where the local page runs nothing of AF3's until
+`agreeModelTerms` has been answered. `warmRemoteModel` skips `af3` until
+`termsAccepted()`; every other model, OpenBind-0 included, warms as before.
+Checked against a broker: a fresh reader sends no warm, and after accepting,
+choosing AF3 sends one. The cost is that a first-time AF3 reader's first fold is
+unwarmed; a returning one is warmed on connect as before.
+
+### What a remote fold sends back, halved
+
+The reader is quick once a result arrives (0.05-0.1 s to load it), but the
+result was large, and on Colab it crosses the internet: **8.8 MB** for an AF3
+fold at 255 residues, 8.9 for ESMFold2, 12.0 for AF2. Most of it was repeats.
+`scores` went twice (top level and inside `predJson`) - 7.3 of AF3's 8.8 MB -
+and JSON has no references, so every object the prediction reaches twice was
+written twice: an AF2 pass holds its structure and confidences in its wrapper
+AND in `pass`, and `contactSource` is one of those passes again.
+`encodePrediction` (web/colab-bridge.js) now writes a repeated object or typed
+array as `{__ref}` to its first appearance and `revivePrediction` relinks it,
+so the reader holds the same shared objects the runtime did; the reader takes
+`scores` from the prediction. **4.80 / 4.85 / 6.95 MB.** Checked end to end: a
+remote AF2 and AF3 fold's "download all" archive still carries `pae`,
+`contact_probs` and `atom_plddts` (AF2's from `contactSource`, a reference now),
+and test:colab, test:pending and the bridge payload test (which asserts the
+identities come back) pass.
+
+🔴 **AND THE BROKER NOW SENDS `Cache-Control: no-store`, BECAUSE THE RUNTIME
+PAGE RAN A STALE MODULE WHILE MEASURING THIS.** The broker served the repo
+through `SimpleHTTPRequestHandler`, which sends no cache headers - CLAUDE.md's
+`python3 -m http.server` trap - and a runtime whose profile survived (a wipe
+that raced Chrome's exit; `LOCALFOLD_KEEP_PROFILE`) imported last session's
+`colab-bridge.js` while the server held the new one: the first measurement of
+this change read the old sizes exactly. The reader's browser is the user's own
+and caches the same way, so a returning reader could hold a bridge that cannot
+read the new wire format. Everything but weight shards is `no-store` now, as
+tools/serve.py does.
+
+🔴 **AND `cdp.launch` NOW REFUSES A PORT THAT ALREADY ANSWERS.** The rest of
+that stale module was this: a Chrome left on the broker's debugging port from an
+earlier run survived a cleanup that never named its profile, the new Chrome
+could not bind the port and exited, and `launch`'s poll found the OLD browser
+and returned it - so the restarted broker drove a page that re-loaded modules
+from its own cache, holding 3.6 GB of device memory besides. The page-level
+re-checks of the pair change were re-run on verified code (the trunk-reused and
+continued paths fold; IntelliFold-2 at 261 residues 15.6 s warm through the page,
+so the earlier "15.3" was the stale runtime and the page gain sits inside the
+noise; the fold-tool numbers were always fresh). Colab VMs and every
+`gpu-chrome.mjs` run start their own browser and were never affected.
+
+**...and gzipped on the way.** The broker compresses a JSON response over 64
+KiB when the client asks for gzip (a browser always does; urllib, and so every
+gate, does not), at the fastest level. Measured on a session of folds here: the
+events go 45.5 MB -> 17.8 MB (2.6x) - a result 2.5x (its base64 compresses
+least), a trajectory frame 4-5x - for ~0.1 s of CPU per 5 MB result on this box
+and roughly twice that on a Colab VM. On a 10-50 Mbit/s link that is 0.5-2.5 s
+a fold back; on a fast one it is about even. Whether Colab's proxy already
+compressed was not measured; a response already marked gzip passes through it.
+
+### Large proteins on a Colab T4: what the reader sees
+
+Random sequences on a T4 through the fold tool (no budget): AF3 folds 512 /
+768 / 1024 residues (53 / 115 / 225 s, peaks 1.1 / 2.2 / 3.7 GB); IntelliFold-2
+and OpenDDE fold 512 and fail at 768 - IntelliFold-2 on Vulkan's
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`, reported only as an uncaptured error.
+
+Through the page the budget catches it first, and a reader sees one sentence:
+"Needs 5857 MiB, over this device's 5461 MiB limit. Too large for this runtime
+- try a shorter sequence or a smaller model." It used to read twice, joined,
+ending in a "Fold anyway" relayed as text from a page nobody can click.
+
+🔴 **BUDGETING FROM THE GPU'S OWN SIZE WAS TRIED AND REVERTED.** The limit is a
+third of host RAM (navigator.deviceMemory, capped at 8 GiB), 5461 MiB against
+a 16 GiB card, so passing the card's size from nvidia-smi and budgeting 90% of
+it looked like a free win. It let IntelliFold-2 at 768 proceed, ran past the
+card at 16% of the trunk - the budget counts the buffers this port creates, not
+the driver's and Dawn's own - and LOST THE DEVICE, after which every fold on
+that runtime failed in seconds, a 512-residue one included. The host-RAM guess
+refuses that fold cleanly. Calibrating the accounting against what the card
+really holds is what would let it go; until then it stays.
+
+🔴 **AND A REMOTE FOLD HAD FIVE MINUTES.** The runtime waited `request.timeout
+?? 300` seconds and the reader sends none, so IntelliFold-2 at 512 residues was
+cut off at 73% of its last trunk pass - and left running, so the next fold was
+refused as "already folding". Thirty minutes now (the existing cap), and a fold
+that runs out is stopped. It finishes in **385 s** through the page where the
+fold tool, unbudgeted, takes 153: the budget makes it stream its weights, which
+is the price of the limit above.
+
+### Larger proteins on a T4: where the memory went, and the new limits
+
+**The driver held up to twice what the fold held.** `tools/gpu/probe-live-buffers.js`
+wraps a fold and counts every `createBuffer`/`destroy`: IntelliFold-2 at 512
+residues had exactly the 3988 MiB live that the budget counts, while nvidia-smi
+read 7.6 GB, and at 768 residues 19.2 GB - more than a T4. Nothing was
+untracked. `tools/gpu/probe-driver-memory.js` found why: **a destroyed buffer's
+memory is not returned, or reused, until the device ticks**, and one empty
+submit and its wait returns all of it (3 GB held across an idle queue; 104 MiB
+after one tick). The trunk's stages each freed gigabytes and the next stage
+allocated gigabytes before any tick, so on the card they overlapped. Fixed in
+four places, each bit-identical (test:stock 8 of 8 throughout):
+
+- the MSA stack and the pairformer share one pool for their five pair-sized
+  scratch buffers, destroyed right after the pairformer (19.2 -> 12.4 GB);
+- `settleReleasedMemory` drains once after the template stage and at the end of
+  each pass (12.4 -> **8.7 GB**, against 9.0 live);
+- the distogram head allocates its logits when it runs, not before the
+  pairformer, and the previous pass's pair is released once the embedder has
+  read it, so a recycled pass no longer carries seven pair-sized buffers where
+  the first carries six;
+- the trunk's last pair, kept on the device for the heads, is released as soon
+  as the confidence head has queued its copy.
+
+**And a Colab runtime budgets 80% of its GPU** (the broker asks nvidia-smi;
+`LOCALFOLD_VRAM_MIB` overrides it, so this A100 can be made to budget like a T4
+for local tests) instead of a third of host RAM. Tried at 90% before any of the
+above, it ran past the card and lost the device.
+
+**What a reader now folds on a Colab T4, through the page, single sequence:**
+
+| model | before | now |
+|---|---|---|
+| AF3 | 1024 residues | **1800** (1735 s, driver peak 10.5 GB); 2000 is refused at once, 49 MiB over the budget |
+| IntelliFold-2 | 512 (768 out of memory, the runtime lost) | **896** (1421 s, driver 10.8 GB); 1000 is refused at once |
+| OpenDDE | 512 | ~590, the binding limit below |
+
+Every refusal is one sentence at the start of the fold, and the runtime folds
+normally after it. Past the T4's memory, every NVIDIA card stops at the 2 GiB
+storage-binding limit - sqrt(limit / (pairChannels x 4)) tokens: 2047 for AF3,
+1023 for IntelliFold-2, 1182 subtokens for OpenDDE, which expands each residue -
+and a fold past it is now refused in seconds with the numbers, where OpenDDE at
+768 residues used to run ten minutes into "uncaptured: Binding size (3465222144)
+...". Going past THAT needs the pair bound in windows or stored in f16 across
+the ~28 kernels that bind it whole (docs/AF2.md's binding-ceiling notes).
+
+### Past the T4's memory to the binding ceiling: a lean pair layout, a retry that double-ran blocks, and a host copy that cannot exist
+
+**Both models now fold to their binding ceiling under a T4's budget** (measured
+on this A100 with `--budget=12288`, which is 80% of a T4; random sequences,
+two diffusion steps, so the pLDDTs are not quality):
+
+| model | before | now | peak |
+|---|---|---|---|
+| IntelliFold-2 | 896 (1000 refused) | **1023** - the 2 GiB binding ceiling | 10.2 GB |
+| AlphaFold 3 | 1800 (2000 refused) | **2047** - the 2 GiB binding ceiling | 9.7 GB |
+
+Three changes, found in this order:
+
+1. **The trunk's scratch was five pair-sized buffers whenever the matrix-unit
+   kernels were on.** `probe-live-buffers.js` on IntelliFold-2 at 1000
+   residues: 12.65 GB peak, 9.8 GB of it `af3-msa.scratch0-4`, and nothing
+   after the trunk above 7.4 GB. The vector kernels already have a layout
+   that needs three and a quarter (the grid by row chunks, the triangle by
+   channel quarters - `compact` in pair-track-gpu.js), but the matrix
+   projections and attend need whole tensors, so it was never taken where
+   they run (developer flags, and the Colab runtime). The trunk now takes
+   the lean layout for both stacks (they share one pool) when
+   `resident + 5 pair + 512 MiB` would cross the budget: **12.65 -> 9.8 GB at
+   1000 residues**, pLDDT 33.2662 against 33.2670. It costs the matrix units:
+   the pairformer is **94 s at 1023 against 40 s at 1000** on the A100. A
+   device with no budget, or room, is unchanged - `test:stock` 8 of 8.
+   `fold.js --lean-pair=on|off` forces either.
+
+2. 🔴 **THE PAIRFORMER'S RESIDENCY RETRY APPLIED BLOCKS TWICE.** When the
+   budget refuses a resident weight partway through the stack, `run()`
+   abandons it and starts again uploading per block - from block 0. But the
+   trunk hands the stack its own pair and single (`pairBuffer`), updated in
+   place, so the blocks already submitted ran a second time. **IntelliFold-2
+   at 1000 residues gave pLDDT 78.7 under a 12 GB budget and 33.3 without
+   one**, no error anywhere; at 68 tokens the two were identical because
+   nothing was refused. A block submits only once fully encoded, so the
+   retry now resumes at the refused block: **33.266156422049974 both ways,
+   bit-identical.** The diffusion transformer's retry had the same shape (the
+   chained `head.act` is updated per super-block); its activation is a few
+   MiB, so it is copied aside before the call when a refusal is possible and
+   put back before the retry. Any T4 fold large enough to lose residency
+   mid-stack before this was affected - including the 1800/896 rows in the
+   section above, which were taken before the fix.
+
+3. **AlphaFold 3 at 2047 died after the trunk, twice, on the HOST copy of
+   the pair.** It is 2 GiB: first "Failed to allocate memory for buffer
+   mapping" on the readback, then, read back in 256 MiB pieces, "RangeError:
+   Array buffer allocation failed" on the Float32Array itself. Nothing
+   needed it - the sampler and the confidence head bind the trunk's device
+   copy - so past 1 GiB (`HOST_PAIR_MAX_BYTES` in fold.js; AF3 past 1448
+   tokens, IntelliFold-2 past 724) it is not made, unless RoseTTAFold3's
+   confidence global norm, OpenDDE's expander, the recycle diagnostics or an
+   oracle asks. Such a trunk is not offered for resumption (`reusable` is
+   undefined), since resuming uploads it. The piecewise readback stays for
+   the cases that still read one.
+
+**And on a real Colab T4, through the page** (reader `?backend=colab`, the
+runtime budgeting 80% of the card, single sequence, recycles 0, diffusion 25):
+
+| job | time | driver peak | status line |
+|---|---|---|---|
+| AlphaFold 3, 2047 residues | 1472 s | 10.1 GB of 15.4 | `AlphaFold 3 · 2047 residues · in 1472 s · single sequence · 1 pass · pLDDT 21.5` |
+| IntelliFold-2, 1023 residues | 1055 s | 12.0 GB of 15.4 | `IntelliFold-2 · 1023 residues · in 1055 s · single sequence · 1 pass · pLDDT 32.4` |
+
+Random sequences, so the pLDDTs say nothing about quality. Both runs were on
+commit a4bb894. The first IntelliFold-2 run was lost when Colab took its VM
+back 25 minutes in (`keep-alive` 404, then `session_terminated`), with a
+second T4 running beside it. The same job alone on one T4 finished. Run long
+T4 jobs one at a time.
+
+**And the rest of the lineage, each at its own binding ceiling** (this A100,
+`--budget=12288`, random sequences, two steps). boltz2 and RoseTTAFold3 were
+refused first, both in the TEMPLATE stage:
+
+| model | ceiling | before | now | peak |
+|---|---|---|---|---|
+| boltz2 | 2047 | refused, `af3-template.scratch3` 512 MiB over | folds | 11.8 GB |
+| RoseTTAFold3 | 2047 | refused, `af3-template.scratch1` **4092 MiB** | folds | 9.7 GB |
+| protenix2 | 1448 | - | folds | 9.9 GB |
+| OpenBind-0 | 2047 | - | folds | 9.9 GB |
+| OpenDDE | 590 residues (1145 of 1182 subtokens) | - | folds | 11.8 GB |
+
+- **The template's scratch was sized at the grid attention's width.** boltz2's
+  template attention is 4 x 32 = 128 over 64 channels and RoseTTAFold3's 256,
+  so every scratch buffer was two or four times the track - rf3's was a 4 GiB
+  buffer, which no NVIDIA card can even bind. Only the grid's q/k/v/gate
+  chunks are that wide, so the grid now runs in as many row chunks as it takes
+  for them to fit a channel-wide buffer (`gridParts` in pair-track-gpu.js;
+  quarters still for every stack whose attention is no wider than its track,
+  which is every trunk). Bit-identical, and at 600 residues the template
+  stage's peak drops 1183 -> 919 MiB (boltz2) and 1563 -> 772 (rf3).
+- **RoseTTAFold3's confidence global norm streams the device pair** instead of
+  normalising a host copy: two 2 GiB arrays (the copy and the normalised one)
+  at 2047 tokens, which the browser will not allocate. `streamGlobalNorm` in
+  confidence-webgpu.js does the same arithmetic in the same order over 256 MiB
+  pieces - three passes, sum, variance, normalise-and-upload - so it is
+  bit-identical: `test:stock`'s rf3 signature 81.53424395815864 unchanged, and
+  it now runs at every size, so the gate exercises it.
+
+Past this, every NVIDIA card stops at the binding ceiling, and that needs the
+pair bound in windows or stored narrower across the kernels that bind it whole.
+
+## A third backend on the Colab runtime: CUDA (LocalFold's native ports)
+
+The badge's picker now offers **CUDA** beside WebGPU and JAX, and defaults to it
+wherever the runtime offers it. It folds with `native/` - the CUDA ports of AF3
+(all seven AF3-lineage models), AlphaFold 2 (all five models, monomer and
+multimer) and ESMFold2 (600M and 300M) - on the page's own published bundles, read as they
+are (`native/*/maps`). The point is speed: a fold is a second or two on the card
+the runtime already has, with no compile minute and no second browser.
+
+**The pieces.** `tools/native_worker.py` speaks `tools/jax_worker.py`'s line
+protocol, so the broker (`tools/colab_backend.py --native`) relays it exactly as
+it relays JAX, and the page ingests the result through the same builder
+(`jaxPrediction`, labelled `(CUDA)`). The notebook's `cuda_backend` (on by
+default) installs Node 22 where the image is older, starts `native/build.sh` in
+the background - the three ports compiled in parallel for the card, atomically,
+stamped with the card and a hash of the sources - and starts the broker with
+`--native`; a CUDA fold that arrives mid-build waits on it, saying so.
+
+🔴 **NOTHING ABOUT A MOLECULE IS DECIDED IN THE WORKER.** Each exporter reads
+the reader's AF3 JSON with the page's own reader (`native/af2/export_input.mjs`
+gained `--job`); template rows go through the page's `expandEntities` and
+`fetchStructure` (`native/resolve_templates.mjs`); a "from the MSA search"
+template is the search's best hit per chain, as the page takes it
+(`--template-search-chains` on both exporters); AF2's templates are aligned and
+merged by the page's `buildTemplate`/`mergeAtom37Templates` instead of mapped by
+identity (every AF2 gate case unchanged); the search is the page's MMseqs2
+client; AF2 stops early by the page's rule (`--tolerance`, ColabFold's
+`compute_tol`, worded "converged at X Å after N passes").
+
+🔴 **WHAT IT DOES NOT HAVE, IT REFUSES BY NAME**: Flow on RoseTTAFold3 (the
+page's own rule - native AF3 has the page's Flow, `af3 --flow`, for every other
+model: 6MRR 0.725 Å at 16 steps), a template on ESMFold2 or on AF2's template-free models 3-5, anything but protein chains on AF2. A featuriser's own
+refusal comes back as its sentence, not its stack.
+
+🔴 **AF2's MODELS 2-5 ARE READ AS THE PAGE READS THEM**: published as int3
+deltas on model 1 (`tools/pack_delta_model.py`), each tensor `addTo` (model 1's
+value ROUNDED TO FLOAT16 - what the delta was taken against - plus the delta),
+`whole` or `absent` by the delta's header. The native loader does the same on
+the device (`loadBundle(..., delta)`: a base record flagged to round, then the
+delta's accumulated in float32), and a dumped weight matches
+src/bundles/delta-tensor-store.js's reconstruction in every element (12,582,912
+of 12,582,912 for a transition stack, 512 of 512 for a bias). Against DeepMind's
+own float32 weights: model_3 on 5CAJ 1.883 Å / pLDDT 96.43 against 1.936 / 96.38,
+the multimer's model_2 on templated 1BRS 0.344 against 0.340, ipTM identical. A
+delta model's map carries a `D <model>` line and refuses to load without that
+delta.
+
+**What the page needed from the ports.** native/af2 and native/ef2 wrote only a
+PDB; both now write AlphaFold 3's `*_confidences.json` and
+`*_summary_confidences.json` beside it, as native/af3 always did - the expected
+PAE, pTM and ipTM, the token layout, and AF2's contact probabilities from its
+distogram where the weights carry the head (the page's multimer bundle does
+not). Without them a CUDA fold arrived with no PAE plot and no contact map.
+
+**The AF3 lineage stays resident.** A cold AF3 fold of 6MRR is 0.92 s on the
+A100 of which the fold is 0.18 - the rest is the CUDA context and the weight
+upload - so the worker keeps one AF3-lineage model on the card through
+native/af3's own `--serve` mode (a served fold is byte-identical to a cold
+one), stops it before an AF2 or ESMFold2 fold so two models never share the
+card, and every child dies with the worker (`PR_SET_PDEATHSIG`), so a Stop -
+which kills the worker - leaves nothing holding the GPU.
+
+**Measured on a Colab T4 (2026-10-03), `npm run test:native` there:** the build
+is 134 s for all three ports (hidden behind the service starting); every fold
+within 0.01 Å of the A100's - AF3 6MRR 0.624, 5CAJ with its crystal 0.231,
+protenix2 0.645, OpenDDE 1.183, AF2 6MRR 1.903, AF2 5CAJ templated 0.216, the
+multimer's 1BRS 0.282, ESMFold2 1.467, AF3 1BRS from a searched MSA 0.59, AF2
+5CAJ from a searched MSA and template 0.346. The first fold of a model is
+15-50 s and is the Hugging Face download of its bundle (AF3 22 s, OpenDDE 39,
+ESMFold2 and its tower 50); a later one is ~2 s; the reader's page, click to
+ingested result, 2.8-3.4 s for AF3, AF2 and ESMFold2.
+
+**Gates.** `npm run test:native` (tools/check-native-worker.py): the real worker
+over its own protocol on this A100 - every fold scored against its crystal,
+every result held to the fields the page ingests, four refusals, two searched
+cases (`--offline` skips them), AF2's early stop, and a real reader's page
+folding AF3, AF2 and ESMFold2 through a real broker with its browser asking for
+no GPU (`--no-page` skips it). `npm run test:colab` gained a CUDA arm on a stub
+worker - routing, Stop, the JAX worker untouched - and checks the picker offers
+all three, CUDA first.
+
+**...and the notebook itself, on a fresh Colab T4 (2026-10-03).** The cell as
+committed - only the repository handed in as a git bundle, since it fetches
+`main` - then a reader's page on the service it started: `/health` offers
+`webgpu` and `native`, the picker defaults to CUDA, and the first AF3 fold
+arrived while `native/build.sh` was still compiling, waited on it saying
+"compiling the CUDA ports for this card", fetched its bundle shard by shard and
+folded: **81 s** for that one, of which the fold is under two. Every other
+model's first fold is its download (Boltz-2 12 s, AF2 8.5, ESMFold2 and its
+tower 29), and AF3 again was **2.0 s click to result**. Every result came back
+with its PAE (4624 = 68^2) and the model labelled `(CUDA)`.
+
+### Streaming a CUDA fold's intermediate results, without slowing it
+
+A WebGPU or JAX fold on the runtime streams its sampler's frames; a CUDA fold
+now streams everything its page-side twin shows while it folds:
+
+| port | streamed | page shows |
+|---|---|---|
+| AF3 lineage | each trunk pass's contact map; 25 sampler frames (fewer steps: each) | the map in the panel before the sampler, then every frame carrying the latest |
+| AF2 | each pass: structure (superposed on the first), pLDDT, pTM/ipTM, PAE, contacts (where the bundle has the distogram head) | each pass a frame with its own PAE, contact map and scores card |
+| ESMFold2 | the trunk's contact map (the page's per-pair thresholds, `contactBinCountsByPair`); every sampler step | as AF3 |
+
+AF3's pLDDT and PAE come off its confidence head, which runs once after the
+sampler - there is nothing earlier to stream, on the page or here.
+
+🔴 **NOTHING IN THE FOLD WAITS FOR ANY OF IT.** common.cuh's `AsyncTap`: the
+fold's stream snapshots the buffer into a slot reserved before the fold
+(device-to-device, in stream order), a second stream on the copy engine moves
+the slot to pinned memory, and one host thread writes the file - superposing a
+frame (Horn's quaternion method), reducing an AF2 pass's 64-bin PAE logits to
+its expected PAE and pTM term on the device first (17 MB a pass at 261
+residues becomes 270 KB), quantising a contact map or PAE to a byte a pair. A
+slot reserved mid-fold would stall it (cudaMalloc synchronises), so they are
+reserved before and kept; with no free slot a result is dropped, never waited
+for. The superposition first lived in the worker in Python (11 ms a 5CAJ frame)
+and cost +8-13% job to result - which is why it moved into the binary.
+
+Measured interleaved on the A100, job to result with streaming on and off: AF3
+6MRR +0.6%, 5CAJ -0.1%, AF2 +0.3% (monomer and multimer), ESMFold2 with a ligand
++0.9%. Every final structure is byte-identical with streaming on; the last
+streamed frame is the final structure to 0.003 Å; AF2's last pass's pLDDT, pTM
+and ipTM equal its final confidences exactly; a streamed contact map is within
+one byte of the final file's. It is the reader's to turn off, on the page:
+the badge's **Live** checkbox beside the backend picker (shown for CUDA,
+remembered per browser), sent as `frames` with each fold - it decides what that
+page draws, so it lives there and not in the notebook. `test:native`
+holds every port to what it streams and the reader's viewer to frames carrying
+their contact maps and PAE.
+
+On a Colab T4 (2026-10-03), the same gate: every port streams what it streams
+on the A100 (AF3 25 frames and 4 contact maps, AF2 each pass with its scores,
+PAE and contacts, ESMFold2 11 frames and its map), every structure within 0.01 Å
+of the A100's, and the reader's page holds every frame with its contact map -
+3-4 s click to result once the bundle is on the runtime.

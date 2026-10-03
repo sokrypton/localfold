@@ -41,7 +41,7 @@
  * create, and each would need its own CCD entries.
  */
 import { conformerFor, aatypeFor } from "./reference-conformers.js";
-import { polymerResidue, ELEMENT_SYMBOLS } from "./ccd-component.js";
+import { polymerResidue, parentLetter, ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { nucleicAatypeFor, nucleicConformerFor }
   from "./reference-conformers-nucleic.js";
 import { chainIdentity, residueIndexPerChain } from "../../input/chains.js";
@@ -252,6 +252,10 @@ export function featuriseProtein(sequence, options = {}) {
   // them. Absent, every chain is protein, which is what every caller before
   // nucleic acids meant.
   const chainKinds = chains.map((_, index) => options.chainKinds?.[index] ?? "protein");
+  // A modified residue's PARENT restype, through the alphabet of its chain's kind: a modified base
+  // (5CM on a DNA C) is a DC, which the amino-acid table would read as a cysteine
+  const parentAatype = (kind, code) => (kind === "protein"
+    ? aatypeFor(code) : (nucleicAatypeFor(kind, code) ?? UNK_AATYPE));
   const modificationOf = new Map();
   for (const modification of options.modifications ?? []) {
     modificationOf.set(`${modification.chain}:${modification.position}`, modification);
@@ -268,10 +272,13 @@ export function featuriseProtein(sequence, options = {}) {
       // OXT it loses on forming a peptide bond: ten atoms in the middle of a
       // chain and eleven at the C-terminus, which is what AF3 counts. See
       // polymerResidue.
-      const modification = asked === null
-        ? null : polymerResidue(asked, at === chain.length - 1);
+      // (a nucleotide's terminal atom is the 5' OP3, at the chain's first residue)
+      const protein = chainKinds[chainIndex] === "protein";
+      const modification = asked === null ? null
+        : polymerResidue(asked, protein ? at === chain.length - 1 : at === 0, protein ? "OXT" : "OP3");
       residues.push({
-        code: chain[at],
+        // a modified residue's letter is its dictionary parent's (see parseCcdComponent)
+        code: (modification !== null && parentLetter(modification.parent, chainKinds[chainIndex])) || chain[at],
         kind: chainKinds[chainIndex],
         // 🔴 THE TERMINAL RULE IS AT THE OTHER END FOR A NUCLEOTIDE. A protein
         // residue takes its extra atom (OXT) at the chain's LAST residue; a
@@ -315,10 +322,12 @@ export function featuriseProtein(sequence, options = {}) {
   const msaColumnOfResidue = new Int32Array(residueCount).fill(-1);
   {
     // Only the protein chains are in the alignment, in chain order, which is
-    // the order its columns are in.
+    // the order its columns are in - unless the caller's alignment spans the
+    // nucleic chains as well (`msaCoversNucleic`: a job's own RNA alignment),
+    // when every polymer residue has its column.
     let column = 0;
     for (let residue = 0; residue < residueCount; residue += 1) {
-      if (residues[residue].kind !== "protein") continue;
+      if (residues[residue].kind !== "protein" && options.msaCoversNucleic !== true) continue;
       msaColumnOfResidue[residue] = column;
       column += 1;
     }
@@ -476,7 +485,7 @@ export function featuriseProtein(sequence, options = {}) {
                            residue, atoms: modification.atoms,
                            bonds: modification.bonds, oneToken: true });
       aatype[token] = options.atomizedUnknownRestype === true
-        ? UNK_AATYPE : aatypeFor(code);
+        ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
       asymId[token] = asym;
@@ -490,7 +499,17 @@ export function featuriseProtein(sequence, options = {}) {
         // atom leaves its dense slot EMPTY - a mid-chain phosphoserine is
         // N,CA,CB,OG,C,O,_,P,O1P,O2P,O3P with a hole at 6 where the OXT was -
         // and compacting shifts the phosphate and its three oxygens down one.
-        const flat = token * DENSE + (source.componentSlot ?? atom);
+        // 🔴 A COMPONENT WIDER THAN THE TOKEN'S DENSE SLOTS LOSES ITS LAST ATOMS, as the reference's
+        // one-token form does: 2'-O-methylguanosine is 25 heavy atoms, slot 24 is the NEXT token's
+        // slot 0, and writing it there put a phantom atom in the layout (every index after it one
+        // off) where af3-any-model's boltz2 simply has no slot for it. Said, not hidden.
+        const slotHere = source.componentSlot ?? atom;
+        if (slotHere >= DENSE) {
+          console.warn(`${modification.code}: atom ${source.name} is past the token's ${DENSE} slots`
+            + " and is dropped, as the reference's one-token residue drops it");
+          continue;
+        }
+        const flat = token * DENSE + slotHere;
         refMask[flat] = 1;
         refElement[flat] = source.element;
         refCharge[flat] = source.charge;
@@ -507,14 +526,19 @@ export function featuriseProtein(sequence, options = {}) {
       // none), not whichever atom the dictionary happens to list first, which
       // for a phosphoserine is N. Caught by `check-batch-fields.js` against the
       // reference's own gather: token 2 wants slot 2 (CB) where this wrote 0.
+      // (an atom past the dense slots was dropped above and is no representative; with none, the
+      // first atom the token holds is - the reference's "first valid atom")
       const slotOfName = (name) => {
         const found = modification.atoms.find((a) => a.name === name);
-        return found === undefined ? -1
-          : (found.componentSlot ?? modification.atoms.indexOf(found));
+        const slot = found === undefined ? -1 : (found.componentSlot ?? modification.atoms.indexOf(found));
+        return slot < DENSE ? slot : -1;
       };
-      const betaAt = slotOfName("CB");
-      const alphaAt = slotOfName("CA");
-      pseudoBetaSlot[token] = betaAt >= 0 ? betaAt : (alphaAt >= 0 ? alphaAt : 0);
+      let firstHeld = 0;
+      while (firstHeld < DENSE - 1 && !refMask[token * DENSE + firstHeld]) firstHeld += 1;
+      // (a nucleotide's representative is C4 for a purine parent, C2 for a pyrimidine, as AF3's)
+      const betaAt = kind === "protein" ? slotOfName("CB") : slotOfName("AG".includes(code) ? "C4" : "C2");
+      const alphaAt = kind === "protein" ? slotOfName("CA") : -1;
+      pseudoBetaSlot[token] = betaAt >= 0 ? betaAt : (alphaAt >= 0 ? alphaAt : firstHeld);
       for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
       token += 1;
       continue;
@@ -533,8 +557,10 @@ export function featuriseProtein(sequence, options = {}) {
       // against both references on 6MRR + GOL + SEP@3: all ten of the
       // phosphoserine's tokens, 15 -> 20, and it carries into `profile`, which
       // is a one-hot over the same alphabet.
-      aatype[token] = options.atomizedUnknownRestype === true
-        ? UNK_AATYPE : aatypeFor(code);
+      // (rf3's unknown restype is for an atomised AMINO ACID: its reference keeps a modified base's
+      // atom tokens at the parent nucleotide - a 5CM's twenty read DC, 28)
+      aatype[token] = options.atomizedUnknownRestype === true && kind === "protein"
+        ? UNK_AATYPE : parentAatype(kind, code);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
       asymId[token] = asym;
@@ -566,6 +592,11 @@ export function featuriseProtein(sequence, options = {}) {
   // independent ones, and giving each its own uid tells the atom encoder they
   // may not be compared, which is the opposite of true.
   let asym = chainLengths.length;
+  // 🔴 A LIGAND'S ENTITY FOLLOWS THE POLYMER ENTITIES, NOT THE POLYMER CHAINS. AF3 numbers distinct
+  // entities in chain order, so a homodimer's two copies are entity 1 and its ligand entity 2 -
+  // counting chains gave the ligand 3 (AF3's tetr_dimer_tetracycline example, against AF3's batch)
+  let polymerEntities = 0;
+  if (identity !== null) for (const e of identity.entityId) polymerEntities = Math.max(polymerEntities, e + 1);
   // Keyed on what the ligand IS, not on what it is called; see below.
   const entityOfLigand = new Map();
   const copiesOfEntity = new Map();
@@ -574,15 +605,26 @@ export function featuriseProtein(sequence, options = {}) {
   // `sequence` covers the polymers only, and a ligand token indexed into it
   // comes back undefined and is written as UNK.
   const ligandSpans = [];
+  // each ligand chain's first token and its components (one, unless it is several bonded
+  // components - see ligandChain), for the bond endpoints below
+  const ligandStart = [];
+  const partsOf = (ligand) => ligand.residues
+    ?? [{ code: ligand.code, from: 0, count: ligand.atoms.length }];
   for (const ligand of ligands) {
     asym += 1;
+    ligandStart.push(ligandToken);
     // ...AND ITS BONDS TRAVEL WITH IT, because a writer needs them too. The
     // bond matrix beside this is token x token and one direction only, which is
     // the shape the MODEL wants; a PDB's CONECT records want the pairs, and
     // scanning L^2 cells per trajectory frame to recover them is the wrong way
     // round when the list is right here.
-    ligandSpans.push({ from: ligandToken, count: ligand.atoms.length, code: ligand.code,
-                       bonds: ligand.bonds });
+    // (a span per COMPONENT, each with its own bonds: a writer names and numbers residues by them)
+    for (const part of partsOf(ligand)) {
+      ligandSpans.push({ from: ligandToken + part.from, count: part.count, code: part.code,
+                         bonds: ligand.bonds
+                           .filter((b) => b.from >= part.from && b.from < part.from + part.count)
+                           .map((b) => ({ ...b, from: b.from - part.from, to: b.to - part.from })) });
+    }
     // Identical codes are one entity, and each occurrence is a copy of it -
     // the same rule chainIdentity applies to repeated sequences.
     //
@@ -603,21 +645,24 @@ export function featuriseProtein(sequence, options = {}) {
     const copy = (copiesOfEntity.get(entity) ?? 0) + 1;
     copiesOfEntity.set(entity, copy);
     // ...and its space continues the residues' count, not the token index. The
-    // two are the same number until a modified residue makes them differ.
-    const uid = space;
-    space += 1;
+    // two are the same number until a modified residue makes them differ. A
+    // chain of several components takes one space EACH, as AF3 gives them.
+    const parts = partsOf(ligand);
+    const uidOfPart = parts.map(() => space++);
     for (let atom = 0; atom < ligand.atoms.length; atom += 1) {
       const token = ligandToken + atom;
       const source = ligand.atoms[atom];
+      const part = parts.findIndex((p) => atom >= p.from && atom < p.from + p.count);
+      const uid = uidOfPart[part];
       aatype[token] = UNK_AATYPE;
-      // Every atom of the component is the same residue, so they share its
-      // number - AF3 writes 1 for a single-residue ligand.
-      residueIndex[token] = 1;
+      // Every atom of a component is the same residue, so they share its
+      // number - AF3 writes 1 for a single-residue ligand, k for a chain's k-th.
+      residueIndex[token] = part + 1;
       tokenIndex[token] = token + 1;
       // `asym` is already one past the last polymer chain, and AF3 counts from
       // one, so the two cancel: no further +1 here.
       asymId[token] = asym;
-      entityId[token] = chains.length + entity + 1;
+      entityId[token] = polymerEntities + entity + 1;
       symId[token] = copy;
       seqMask[token] = 1;
 
@@ -708,13 +753,16 @@ export function featuriseProtein(sequence, options = {}) {
     }
     if (asym >= chainLengths.length) {
       const ligand = ligands[asym - chainLengths.length];
-      const span = ligandSpans[asym - chainLengths.length];
       if (ligand === undefined) throw new Error(`${where}: no chain ${asym}`);
-      const slot = ligand.atoms.findIndex((one) => one.name === atom);
+      // a component chain is addressed by residue as well as atom (C1 is in every sugar)
+      const parts = partsOf(ligand);
+      const part = parts.length === 1 ? parts[0] : parts[residue - 1];
+      if (part === undefined) throw new Error(`${where}: ${ligand.code} has no residue ${residue}`);
+      const slot = ligand.atoms.slice(part.from, part.from + part.count).findIndex((one) => one.name === atom);
       if (slot < 0) {
-        throw new Error(`${where}: ${ligand.code} has no atom ${atom}`);
+        throw new Error(`${where}: ${part.code} has no atom ${atom}`);
       }
-      return span.from + slot;
+      return ligandStart[asym - chainLengths.length] + part.from + slot;
     }
     let global = residue - 1;
     for (let before = 0; before < asym; before += 1) global += chainLengths[before];
@@ -737,10 +785,13 @@ export function featuriseProtein(sequence, options = {}) {
   const declaredBonds = [];
   for (const [index, bond] of (options.bonds ?? []).entries()) {
     const where = `bond ${index + 1}`;
+    // 🔴 A DECLARED BOND IS COVALENT (code 5), not single: AF3's `_bond_orders_for_layout`
+    // gives every link between two residues BOND_ORDER_COVALENT - a glycosidic bond and a
+    // covalent inhibitor's alike - and boltz2's bond-type plane reads it
     declaredBonds.push({
       from: tokenOfEndpoint(bond.from, `${where} from`),
       to: tokenOfEndpoint(bond.to, `${where} to`),
-      order: bond.order ?? 1,
+      order: bond.order ?? 5,
     });
   }
 
@@ -760,23 +811,30 @@ export function featuriseProtein(sequence, options = {}) {
         }
       }
     }
-    // 🔴 BOTH DIRECTIONS ALWAYS, unlike a component's own bonds. A declared bond
-    // joins two things the featuriser laid out independently, so there is no
-    // "the writer's triangle" to follow - and AF3's own extraction writes the
-    // pair, not one corner of it.
+    // 🔴 ONE DIRECTION, THE JOB'S - [from][to] as bondedAtomPairs writes the pair - like a
+    // component's own bonds, and both only where the dialect symmetrises. This said "both
+    // directions always" until a reference batch was dumped with a declared bond (the glycosylated
+    // RNase B): AF3 lists the Asn-NAG link once, and writing a glycosidic bond reversed in the job
+    // reverses its pair in the gather (139-135 against 135-139). AF3's contact matrix sets exactly
+    // the listed [i][j].
     for (const bond of declaredBonds) {
       bondMatrix[bond.from * tokens + bond.to] = 1;
-      bondMatrix[bond.to * tokens + bond.from] = 1;
       bondOrderMatrix[bond.from * tokens + bond.to] = bond.order;
-      bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
+      if (options.symmetriseBonds) {
+        bondMatrix[bond.to * tokens + bond.from] = 1;
+        bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
+      }
     }
     if (options.atomizedBackboneBonds === true) {
       for (const span of modifiedSpans) {
         // The span's own N and C, by name - the atom ORDER is the component's
         // and is not something to count on.
         const slotOf = (name) => span.atoms.findIndex((atom) => atom.name === name);
-        const nitrogen = slotOf("N");
-        const carbon = slotOf("C");
+        // (a nucleotide's backbone link is the phosphodiester: its P from the previous residue, its
+        // O3' to the next - the reference bonds a modified base back into its chain the same way)
+        const nucleic = residues[span.residue].kind !== "protein";
+        const nitrogen = slotOf(nucleic ? "P" : "N");
+        const carbon = slotOf(nucleic ? "O3'" : "C");
         const sameChain = (residue) => residue >= 0 && residue < residueCount
           && chainOfResidue[residue] === chainOfResidue[span.residue];
         // 🔴 BOTH DIRECTIONS, unlike the internal bonds, which the reference
@@ -791,11 +849,22 @@ export function featuriseProtein(sequence, options = {}) {
           bondOrderMatrix[a * tokens + b] = 1;
           bondOrderMatrix[b * tokens + a] = 1;
         };
-        // The neighbouring residue's token is the one adjacent to the span,
-        // which holds while the neighbour is not itself atomised - the case
-        // this port has a reference dump for.
-        if (nitrogen >= 0 && sameChain(span.residue - 1)) link(span.from - 1, span.from + nitrogen);
-        if (carbon >= 0 && sameChain(span.residue + 1)) link(span.from + carbon, span.from + span.count);
+        // The neighbouring residue's token is the one adjacent to the span - while that neighbour is
+        // one token. 🔴 AN ATOMISED NEIGHBOUR IS MANY: the token before this span is then the previous
+        // residue's LAST ATOM (a 5' 6OG's OP3), and the link from it was a bond the reference does not
+        // have. Its own forward link is the bond (O3' to this residue's P), so the backward one is
+        // skipped, and a forward link into an atomised residue lands on its own P (or N). AF3's
+        // kitchen-sink DNA, 6OG at 1 and 6MA at 2, against rf3's batch: 67-70 both ways, not 69-70.
+        const spanOf = (residue) => modifiedSpans.find((other) => other.residue === residue);
+        if (nitrogen >= 0 && sameChain(span.residue - 1) && spanOf(span.residue - 1) === undefined) {
+          link(span.from - 1, span.from + nitrogen);
+        }
+        if (carbon >= 0 && sameChain(span.residue + 1)) {
+          const next = spanOf(span.residue + 1);
+          const into = next === undefined ? 0
+            : next.atoms.findIndex((atom) => atom.name === (nucleic ? "P" : "N"));
+          if (into >= 0) link(span.from + carbon, span.from + span.count + into);
+        }
       }
     }
     bondMatrix[0] = 0;
@@ -862,7 +931,7 @@ export function featuriseProtein(sequence, options = {}) {
   if (options.atomizedUnknownRestype === true
       && options.atomizedUnknownMsa !== true) {
     for (const span of modifiedSpans) {
-      const parent = aatypeFor(residues[span.residue].code);
+      const parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
       for (let at = 0; at < span.count; at += 1) queryRow[span.from + at] = parent;
     }
   }
@@ -893,6 +962,13 @@ export function featuriseProtein(sequence, options = {}) {
   // columns and rows 2 and 3 read 21. Gapping every row but the query is the
   // natural reading and is one row short, which is a row the model reads as the
   // chain being absent from its own alignment.
+  // ...and rosettafold3's atomised token is unknown in EVERY row, a gap's included: its reference
+  // profile is 1.0 at restype 20 for a hydroxyproline and for a P1L whose alignment row is a gap
+  // (AF3's kitchen-sink job, against rf3's batch) - where reading the A3M gave P, or half gap
+  const unknownEverywhere = new Uint8Array(tokens);
+  if (options.atomizedUnknownMsa === true) {
+    for (const span of modifiedSpans) unknownEverywhere.fill(1, span.from, span.from + span.count);
+  }
   const nucleicRow = unpairedFromRow();
   for (let row = 0; row < extra.length; row += 1) {
     const base = (row + 1) * tokens;
@@ -900,11 +976,13 @@ export function featuriseProtein(sequence, options = {}) {
     const nucleicHere = row + 1 === nucleicRow ? "own" : MSA_GAP;
     for (let token = 0; token < tokens; token += 1) {
       const column = msaColumnOfToken[token];
+      // (a nucleic token WITH a column is read from the alignment like any other)
       if (column < 0 && nucleicToken[token]) {
         msa[base + token] = nucleicHere === "own" ? aatype[token] : MSA_GAP;
         continue;
       }
-      msa[base + token] = column < 0 ? MSA_GAP : (extra[row][column] ?? MSA_GAP);
+      msa[base + token] = unknownEverywhere[token] ? queryRow[token]
+        : column < 0 ? MSA_GAP : (extra[row][column] ?? MSA_GAP);
       if (deletions !== undefined) {
         deletionMatrix[base + token] = column < 0 ? 0 : (deletions[column] ?? 0);
       }
@@ -946,8 +1024,12 @@ export function featuriseProtein(sequence, options = {}) {
     ? (row, token) => msa[(unpairedFrom + row) * tokens + token]
     : (row, token) => {
       const column = msaColumnOfToken[token];
-      if (column < 0) return -1;
-      return profileRows[row] === undefined ? -1 : profileRows[row][column];
+      // a token with no column (a ligand's) is a gap in every row, as `msa` holds it above: AF3's
+      // profile puts a ligand token's whole weight on the gap - measured on its kitchen-sink job,
+      // 1.0 at restype 21 for every ligand token - where returning nothing left it all zeros
+      if (column < 0) return MSA_GAP;
+      if (profileRows[row] === undefined) return -1;
+      return unknownEverywhere[token] ? queryRow[token] : profileRows[row][column];
     };
   const deletionAt = profileRows === null
     ? (row, token) => deletionMatrix[(unpairedFrom + row) * tokens + token]
@@ -960,17 +1042,40 @@ export function featuriseProtein(sequence, options = {}) {
   // alignment beyond itself - gets a profile of its own sequence: measured as
   // exactly 1.0 at restype 26 for a leading A. Letting it fall out of the loop
   // below would put that 1.0 at MSA_GAP instead, which says the chain is absent.
-  for (let row = 0; row < profileDepth; row += 1) {
-    for (let token = 0; token < tokens; token += 1) {
-      if (nucleicToken[token]) continue;
+  const ownProfile = (token) => nucleicToken[token] && msaColumnOfToken[token] < 0;
+  // 🔴 EACH CHAIN'S PROFILE OVER ITS OWN ROWS, NOT THE MERGED BLOCK'S. AF3 computes it per chain
+  // before stacking the chains' unpaired rows side by side, so the gap rows that pad a shorter
+  // chain's alignment to the deepest one's are not part of it: a 3-row protein beside a 4-row RNA
+  // is averaged over 3. A chain's depth is its last row with a residue in any of its columns.
+  const depthOfChain = new Map();
+  for (let token = 0; token < polymerTokens; token += 1) {
+    // (an rf3 atomised token reads unknown in every row, which says nothing about the chain's depth)
+    if (ownProfile(token) || msaColumnOfToken[token] < 0 || unknownEverywhere[token]) continue;
+    const chain = chainOfResidue[residueOfToken[token]];
+    let deepest = depthOfChain.get(chain) ?? 1;
+    for (let row = profileDepth - 1; row >= deepest; row -= 1) {
       const code = codeAt(row, token);
-      if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / profileDepth;
-      deletionMean[token] += deletionAt(row, token) / profileDepth;
+      if (code >= 0 && code !== MSA_GAP) { deepest = row + 1; break; }
+    }
+    depthOfChain.set(chain, deepest);
+  }
+  const depthOf = (token) => (token < polymerTokens && residueOfToken[token] >= 0
+    ? depthOfChain.get(chainOfResidue[residueOfToken[token]]) ?? profileDepth : profileDepth);
+  for (let token = 0; token < tokens; token += 1) {
+    if (ownProfile(token)) continue;
+    const depth = depthOf(token);
+    for (let row = 0; row < depth; row += 1) {
+      const code = codeAt(row, token);
+      if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / depth;
+      deletionMean[token] += deletionAt(row, token) / depth;
     }
   }
 
+  // (at its code in the alignment's QUERY ROW, which is its aatype except where a dialect gives
+  // the token the unknown restype and keeps its parent in the alignment - boltz2's one-token modified
+  // base, whose profile the reference puts at the parent nucleotide: 28 for a 5CM, not 20)
   for (let token = 0; token < tokens; token += 1) {
-    if (nucleicToken[token]) profile[token * RESTYPES + aatype[token]] = 1;
+    if (ownProfile(token)) profile[token * RESTYPES + queryRow[token]] = 1;
   }
 
   // 🔴 THE NAME THE MODEL READS AND THE NAME A PDB CARRIES ARE NOT THE SAME
@@ -1042,6 +1147,23 @@ export function featuriseProtein(sequence, options = {}) {
     }
   }
 
+  // Per-token molecule flags, which boltz2's target_feat sums (its mol-type and modified
+  // conditioning) and batchFromDump has always carried from the reference's batch. Without them
+  // every token read as an unmodified protein residue.
+  const isDna = new Int32Array(tokens);
+  const isRna = new Int32Array(tokens);
+  const isLigand = new Int32Array(tokens);
+  const isModified = new Int32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    const residue = residueOfToken[token];
+    if (residue < 0) continue;
+    const kind = chainKinds[chainOfResidue[residue]];
+    isDna[token] = kind === "dna" ? 1 : 0;
+    isRna[token] = kind === "rna" ? 1 : 0;
+  }
+  for (const span of ligandSpans) isLigand.fill(1, span.from, span.from + span.count);
+  for (const span of modifiedSpans) isModified.fill(1, span.from, span.from + span.count);
+
   return {
     sequence: joined, chains, chainLengths,
     tokens, dense: DENSE, subsets, atomCount, sequences,
@@ -1055,7 +1177,7 @@ export function featuriseProtein(sequence, options = {}) {
     // every atom the model predicts is one it has a reference conformer for.
     predDenseAtomMask: refMask,
     bondMatrix, bondOrderMatrix, ligandSpans, modifiedSpans, residueOfToken,
-    chainKinds, chainOfResidue,
+    chainKinds, chainOfResidue, isDna, isRna, isLigand, isModified,
     tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms,
     tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
     features: { residueIndex, tokenIndex, asymId, entityId, symId },

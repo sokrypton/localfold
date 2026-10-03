@@ -53,6 +53,9 @@ import {
 } from "./sampler-reference.js";
 import { ESMFOLD2_PHASES, esmfold2Plan, trunkPhase } from "./cost.js";
 
+/** The largest pair copied to the host; past it the browser refuses the array. */
+const HOST_PAIR_MAX_BYTES = 1024 * 1024 * 1024;
+
 /**
  * The sampler settings a caller can name, the way AF3's page offers
  * `diffusion-200` and `flow-16`.
@@ -652,7 +655,13 @@ export async function foldEsmfold2(device, options) {
     // it has an offset - so the first loop's input is z_init plus a real
     // vector. Skipping the projection on the first loop is the natural
     // shortcut and a different model.
-    device.queue.writeBuffer(pair.buffer, 0, new Float32Array(pairs * channels));
+    // ...zeroed on the device: a host array of zeros is 2 GiB at 1448 tokens,
+    // which the browser refused ("Array buffer allocation failed").
+    {
+      const encoder = device.createCommandEncoder({ label: "esmfold2.pair-zero" });
+      encoder.clearBuffer(pair.buffer, 0, pairs * channels * 4);
+      device.queue.submit([encoder.finish()]);
+    }
     const trunk = new Esmfold2TrunkGpu(device, { allocator, ...options.trunk });
     const slice = (allocation, row, rows) => ({
       buffer: allocation.buffer, byteOffset: row * channels * 4,
@@ -744,7 +753,11 @@ export async function foldEsmfold2(device, options) {
     // the sampler, which is why the trunk's four loops cost no traffic at all.
     // One readback at the end is a quarter of what looping through the host
     // would have cost, and it buys a fold that changes only its sampler.
-    const reusable = options.wantReusable !== true ? undefined : {
+    // 🔴 AND NOT PAST A GIGABYTE, where the browser will not hand out the array
+    // (`HOST_PAIR_MAX_BYTES`; AF3's fold.js has the same rule and the same
+    // failure). A trunk that cannot be cached is simply not offered for reuse.
+    const hostPairFits = pairs * channels * 4 <= HOST_PAIR_MAX_BYTES;
+    const reusable = options.wantReusable !== true || !hostPairFits ? undefined : {
       tokens, channels, sInputs,
       pair: await (async () => {
         const back = allocator.allocate("esmfold2.pair-readback", pairs * channels * 4,
@@ -777,7 +790,7 @@ export async function foldEsmfold2(device, options) {
     const budget = memoryBudgetBytes(device);
     const deviceConfidence = options.confidenceWeights != null
       && options.returnConfidenceInputs !== true
-      && (budget == null || 2 * pairs * channels * 4 * 6 < budget);
+      && (budget == null || 2 * pairs * channels * 4 * 6 < budget || !hostPairFits);
     const deviceCopy = (label, source) => {
       const copy = allocator.allocate(label, pairs * channels * 4,
                                       storage | GPUBufferUsage.COPY_DST);
@@ -1014,6 +1027,15 @@ export async function foldEsmfold2(device, options) {
     // exists for; Synthyra froze that trunk and trained a head on it, and a
     // bundle exported with `--confidence` carries it. Both are returned, so a
     // caller can prefer the real one and nothing that read the estimate breaks.
+    // 🔴 THE SAMPLER'S BUFFERS GO BEFORE THE HEAD RUNS, not after it: the
+    // conditioning (written into relPos) and the twelve bias tensors are dead
+    // once the last step is in, and the head reads its own copies taken before
+    // the sampler. Held through it, they were 3.5 GB of ESMFold2's 16.9 GB
+    // peak at 1448 tokens, inside the head's block stack.
+    const memory = allocator.snapshot();
+    denoiser.release();
+    relPos.release();
+    held.splice(held.indexOf(relPos), 1);
     let confidence;
     if (options.confidenceWeights != null) {
       const rep = representativeAtoms(features, tokens);
@@ -1065,8 +1087,6 @@ export async function foldEsmfold2(device, options) {
       }
     }
 
-    const memory = allocator.snapshot();
-    denoiser.release();
     // ...the retained distogram is 46 MiB at 300 tokens and nothing reads it
     // after the last frame.
     frames?.release();

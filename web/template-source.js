@@ -24,7 +24,7 @@
  */
 import { alignPositions } from "./align.js";
 import {
-  chainResidues, filterByConfidence, identityMap, templateSlot, templateSlotAtom37,
+  GAP_AATYPE, chainResidues, filterByConfidence, identityMap, templateSlot, templateSlotAtom37,
 } from "../src/af3/featurise/template-input.js";
 import { ONE_LETTER } from "../src/af3/fold.js";
 import { parseCIFAtoms } from "../src/design/mpnn/pdb.js";
@@ -144,6 +144,36 @@ export function mapToQuery(structure, query) {
   return { map, sequence: query, identical: false };
 }
 
+// [queryIndex, templateIndex] pairs from 0. 🔴 A TEMPLATE INDEX COUNTS THE CHAIN'S FULL SEQUENCE, as AF3
+// reads it - its label_seq_id less one, unresolved residues included - not the residues the file has
+// coordinates for: a template with a disordered loop would otherwise pair every residue after it with
+// the wrong one. A residue the index names but the file does not resolve has nothing to give and is
+// left out; a file with no label_seq_id (a PDB) counts its residues in order. An index past either end
+// is the job's mistake and is refused.
+function explicitMap(mapping, structure, query) {
+  const byLabel = new Map();
+  structure.residues.forEach((residue, at) => {
+    if (Number.isInteger(residue.labelSeq)) byLabel.set(residue.labelSeq - 1, at);
+  });
+  const labelled = byLabel.size > 0;
+  const map = new Map();
+  for (const [queryIndex, templateIndex] of mapping) {
+    if (query !== "" && queryIndex >= query.length) {
+      throw new Error(`template mapping: query index ${queryIndex} is past the ${query.length}-residue chain`);
+    }
+    if (labelled) {
+      if (byLabel.has(templateIndex)) map.set(queryIndex, byLabel.get(templateIndex));
+      continue;
+    }
+    if (templateIndex >= structure.residues.length) {
+      throw new Error(`template mapping: template index ${templateIndex} is past its`
+        + ` ${structure.residues.length} residues`);
+    }
+    map.set(queryIndex, templateIndex);
+  }
+  return { map, sequence: query || structure.sequence, identical: false };
+}
+
 /**
  * A template slot for one chain, from a fetched or dropped structure.
  *
@@ -164,6 +194,8 @@ export function mapToQuery(structure, query) {
  *   is a line of code, but a number from 0 to 100 is a modelling choice the
  *   dropdown cannot explain in the space it has, and nothing on screen said
  *   what the default had done. A caller that wants it passes it.
+ * @param {[number, number][]} [options.mapping] query to template residue pairs (from 0), as a job's
+ *   queryIndices / templateIndices give them, in place of the alignment
  * @param {boolean} [options.spanChains]
  * @param {"dense"|"atom37"} [options.layout] which slot layout to build.
  *   🔴 THE TWO ARE NOT INTERCHANGEABLE AND NEITHER THROWS ON THE OTHER.
@@ -188,7 +220,10 @@ export function buildTemplate(options) {
       ? "that structure has no protein chain this can read"
       : `that structure has no chain ${options.chain}`);
   }
-  const { map, sequence, identical } = mapToQuery(structure, options.query ?? "");
+  // an explicit mapping (a job's queryIndices / templateIndices) in place of the alignment
+  const { map, sequence, identical } = options.mapping
+    ? explicitMap(options.mapping, structure, options.query ?? "")
+    : mapToQuery(structure, options.query ?? "");
   const kept = filterByConfidence(map, structure, options.minConfidence ?? 0,
                                   (residue) => residue.confidence);
   const chainLength = (options.query ?? "").length || structure.residues.length;
@@ -247,6 +282,7 @@ export function residuesFromCif(text, chain) {
     if (!byNumber.has(number)) {
       const residue = {
         number,
+        labelSeq: atom.labelSeq,
         code: ONE_LETTER[atom.resName] ?? (atom.resName === "MSE" ? "M" : "X"),
         atoms: new Map(),
         // An experimental structure states no per-residue confidence, and a
@@ -278,4 +314,38 @@ export function describeCoverage(coverage) {
   // that still produces a template.
   if (coverage.aligned) parts.push("aligned to the sequence you typed");
   return parts.join(" · ");
+}
+
+/**
+ * AlphaFold 2 multimer's one template slot, from per-chain atom37 slots that
+ * `buildTemplate` wrote at each chain's offset over the same token axis.
+ *
+ * The chains are disjoint by construction, so a token is taken from whichever
+ * slot covers it; the rest stay gap and masked, as each slot already is.
+ *
+ * @param {{slot: object, coverage: object}[]} built
+ * @param {number} tokens
+ */
+export function mergeAtom37Templates(built, tokens) {
+  const slots = 37;
+  const aatype = new Int32Array(tokens).fill(GAP_AATYPE);
+  const atomPositions = new Float32Array(tokens * slots * 3);
+  const atomMask = new Float32Array(tokens * slots);
+  for (const { slot } of built) {
+    for (let token = 0; token < tokens; token += 1) {
+      if (slot.aatype[token] === GAP_AATYPE) continue;
+      if (aatype[token] !== GAP_AATYPE) throw new Error(`two templates cover token ${token}`);
+      aatype[token] = slot.aatype[token];
+      atomMask.set(slot.atomMask.subarray(token * slots, (token + 1) * slots), token * slots);
+      atomPositions.set(slot.atomPositions.subarray(token * slots * 3, (token + 1) * slots * 3),
+                        token * slots * 3);
+    }
+  }
+  const covered = built.reduce((sum, part) => sum + part.slot.covered, 0);
+  const atoms = built.reduce((sum, part) => sum + part.slot.atoms, 0);
+  return {
+    slot: { aatype, atomPositions, atomMask, covered, atoms, spanChains: false },
+    coverage: { residues: covered, of: tokens, atoms },
+    parts: built,
+  };
 }

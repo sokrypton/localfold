@@ -280,6 +280,38 @@ describe("a SMILES ligand survives the archive", () => {
     expect(after).toEqual(before);
   });
 
+  it("hands a job's own chemistry (userCCD) to the caller rather than refusing it", () => {
+    // the native exporter resolves ligand codes against it; the page refuses it in applyJob
+    const job = jobFromJson(server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
+                                   { userCCD: "data_LIG\n_chem_comp.id LIG" }));
+    expect(job.userCcd).toContain("data_LIG");
+  });
+
+  it("reads a template's explicit residue mapping, and refuses a lopsided one", () => {
+    const job = (template) => open([{ protein: { id: "A", sequence: "ACDEFGHIK", templates: [template] } }]);
+    const read = jobFromJson(job({ mmcif: "data_T\n_atom_site.id 1", queryIndices: [0, 1, 2], templateIndices: [3, 4, 5] }));
+    expect(read.entities[0].template.mapping).toEqual([[0, 3], [1, 4], [2, 5]]);
+    expect(refusal(job({ mmcif: "data_T", queryIndices: [0, 1], templateIndices: [0] }))).toContain("one length");
+  });
+
+  it("keeps a ligand of several components as one chain", () => {
+    // the server's `ligand` holds one code, so a glycan forces the open dialect's ccdCodes list
+    const { before, after } = roundTrip([
+      { type: "protein", value: "MKTSYIAKQRQ", copies: 1, modifications: [] },
+      { type: "ligand", value: "NAG,NAG,BMA", copies: 1, modifications: [] },
+    ]);
+    expect(after).toEqual(before);
+  });
+
+  it("keeps a modified base, in either dialect", () => {
+    const entities = [{ type: "dna", value: "ACGTACGT", copies: 1, modifications: [{ code: "5CM", position: 2 }] }];
+    const server = jobFromJson(jobRequestJson({ name: "t", seed: 7, entities }));
+    expect(server.entities[0].modifications.map((m) => `${m.code}@${m.position}`)).toEqual(["5CM@2"]);
+    const open = jobFromJson(jobRequestJson({ name: "t", seed: 7, entities: [...entities,
+      { type: "smiles", value: "CCO", copies: 1, modifications: [] }] }));
+    expect(open.entities[0].modifications.map((m) => `${m.code}@${m.position}`)).toEqual(["5CM@2"]);
+  });
+
   it("writes the open dialect only when it has to", () => {
     // 🔴 THE SERVER DIALECT IS STILL WHAT AN ORDINARY JOB GETS. It is what the
     // archive's justification rests on and what every fixture expects; the
@@ -316,26 +348,27 @@ describe("what it refuses, and what it names", () => {
     ["bondedAtomPairs",
      server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
             { bondedAtomPairs: [[["A", 1, "CA"], ["B", 1, "CA"]]] })],
-    ["userCCD", server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
-                       { userCCD: "data_LIG" })],
+    ["userCCDPath", server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
+                           { userCCDPath: "/tmp/ccd.cif" })],
     // 🔴 `smiles` IS ACCEPTED NOW AND THE REFUSAL MOVED TO THE AMBIGUOUS CASE.
     // A ligand naming itself both ways cannot be resolved: see web/job-json.js.
     ["names itself twice", open([{ ligand: { id: "B", smiles: "CCO",
                                              ccdCodes: ["ATP"] } }])],
     ["ring closure", open([{ ligand: { id: "B", smiles: "C1CC" } }])],
-    ["ccdCodes", open([{ protein: { id: "A", sequence: "ACDEFGHIK" } },
-                       { ligand: { id: "B", ccdCodes: ["ATP", "MG"] } }])],
     ["unpairedMsaPath", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
                                            unpairedMsaPath: "/tmp/a.a3m" } }])],
-    ["unpairedMsa", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
-                                       unpairedMsa: ">q\nACDEFGHIK\n" } }])],
+    // (an alignment carried inline is held now - see test/af3-example-jobs.test.js - and
+    // only one that is not text is refused)
+    ["unpairedMsa is A3M text", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
+                                                   unpairedMsa: 5 } }])],
     ["queryIndices", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
       templates: [{ mmcif: "data_T", queryIndices: [0, 1] }] } }])],
     ["mmcifPath", open([{ protein: { id: "A", sequence: "ACDEFGHIK",
       templates: [{ mmcifPath: "/tmp/t.cif" }] } }])],
     ["not a chain kind", open([{ peptide: { id: "A", sequence: "ACDE" } }])],
-    ["modified bases", open([{ dna: { id: "A", sequence: "ACGTACGT",
-      modifications: [{ modificationType: "6MA", basePosition: 1 }] } }])],
+    // (a modified BASE loads now; a modified amino acid on a base does not)
+    ["modified amino acid", open([{ dna: { id: "A", sequence: "ACGTACGT",
+      modifications: [{ modificationType: "SEP", basePosition: 1 }] } }])],
     ["no `sequences`", JSON.stringify({ name: "j", modelSeeds: [1] })],
     ["not JSON", "ACDEFGHIK"],
   ];

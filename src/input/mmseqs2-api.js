@@ -570,6 +570,12 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
     // second round trip. Absent when the search did not pair.
     pairedA3ms: pairedResult === undefined ? undefined : pairedBySequence,
     tickets: unique.map((sequence) => bySequence.get(sequence).ticket),
+    // 🔴 AND THE TEMPLATE HITS, BY CHAIN. Each chain's search came back with
+    // its own under index 0 (a one-chain job is query 101), and this return
+    // dropped them all - so on every complex, AF3's and the multimer's alike,
+    // a template "from the MSA search" was told the MSA was not a search.
+    templateHits: new Map(sequences.map((sequence, index) =>
+      [index, bySequence.get(sequence).templateHits?.get(0) ?? []])),
     depth: alignment.depth,
     elapsedMilliseconds: performance.now() - started,
   };

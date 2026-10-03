@@ -371,7 +371,8 @@ export function entityProblem(entity) {
   if (entity.type === "ligand") {
     // The same rule ccdUrl enforces, checked here so the message arrives while
     // the field is in front of the user rather than as a failed fetch later.
-    if (!/^[A-Za-z0-9]{1,5}$/.test(value)) {
+    // (several codes, comma-separated, are ONE chain of bonded components - a glycan)
+    if (!value.split(",").every((code) => /^[A-Za-z0-9]{1,5}$/.test(code.trim()))) {
       return "A CCD code is 1-5 letters or digits, like HEM or ATP";
     }
     return null;
@@ -410,18 +411,20 @@ export function entityProblem(entity) {
     ? nucleicProblem(cleaned, entity.type)
     : sequenceProblem(cleaned);
   if (sequenceFault !== null) return sequenceFault;
-  // 🔴 A MODIFICATION ON A NUCLEIC CHAIN IS REFUSED RATHER THAN IGNORED. AF3
-  // takes modified bases and this featuriser does not: its modified-residue
-  // path resolves the parent through the amino-acid table, so a modified base
-  // would be featurised as a modified amino acid and fold to something. The
-  // popup does not offer them, so this catches a restored or pasted list.
-  if (NUCLEIC_TYPES.includes(entity.type) && (entity.modifications ?? []).length > 0) {
-    return `Modified bases are not supported yet on a ${entity.type.toUpperCase()} chain`;
-  }
+  // A modified BASE is taken as AF3 takes it: the featuriser resolves its parent
+  // through its chain's own alphabet and the component's CCD parent (5CM on a
+  // DNA chain is a DC, never the cysteine the amino-acid table would read), and
+  // its OP3 leaves mid-chain as its parent's does - exact against AF3's own
+  // batch on DNA and RNA (tools/check-batch-fields.js, dna-5cm and rna-mods).
   // ...the modifications last, because every one of their messages talks about
   // a position in a sequence that has to be valid first.
   const seen = new Set();
   for (const modification of entity.modifications ?? []) {
+    // (a modified AMINO ACID on a nucleic chain is still refused: its parent is not a base)
+    const code = (modification.code ?? "").trim().toUpperCase();
+    if (NUCLEIC_TYPES.includes(entity.type) && COMMON_MODIFICATIONS.some((entry) => entry.code === code)) {
+      return `${code} is a modified amino acid, not a base of a ${entity.type.toUpperCase()} chain`;
+    }
     const fault = modificationProblem(modification, cleaned);
     if (fault !== null) return fault;
     if (seen.has(modification.position)) {
@@ -536,7 +539,10 @@ export function expandEntities(entities) {
         const text = entity.value.trim();
         if (!smilesCodes.has(text)) smilesCodes.set(text, ligandName(smilesCodes.size));
         ligandCodes.push({ smiles: text, code: smilesCodes.get(text) });
-      } else ligandCodes.push(entity.value.trim().toUpperCase());
+      } else {
+        const codes = entity.value.trim().toUpperCase().split(",").map((code) => code.trim());
+        ligandCodes.push(codes.length === 1 ? codes[0] : { codes });
+      }
     }
   }
   // 🔴 THE CONTACTS LAST, ONCE EVERY CHAIN THEY NAME EXISTS. A letter is

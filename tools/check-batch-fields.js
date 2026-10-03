@@ -78,7 +78,8 @@
  */
 import { readFileSync } from "node:fs";
 import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
-import { parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
+import { mergeRowAlignedChainA3ms } from "../src/input/chains.js";
+import { parseCcdComponent, ligandChain } from "../src/af3/featurise/ccd-component.js";
 import { dialectFor, DIALECTS, featuriserDialect } from "../src/af3/dialect.js";
 import { structuralBatch, structuralLayout } from "../src/af3/featurise/structural-tokens.js";
 
@@ -93,6 +94,7 @@ const MODELS = ["alphafold3", "openbind0", "opendde", "boltz2", "protenix2",
 // sequence with GLYCEROL as a second chain and a PHOSPHOSERINE at position 3 -
 // 83 tokens rather than 68, the ligand at 77-82 - dumped by
 // tools/oracle/dump_af3_batch.py --ligand GOL --ptm SEP@3.
+const fixture = (path) => readFileSync(new URL(`fixtures/${path}`, import.meta.url), "utf8");
 const ccd = (code) => parseCcdComponent(readFileSync(
   new URL(`fixtures/ccd/${code}.cif`, import.meta.url), "utf8"));
 const TARGETS = {
@@ -102,6 +104,88 @@ const TARGETS = {
     extra: () => ({
       modifications: [{ chain: 0, position: 3, ...ccd("SEP") }],
       ligands: [ccd("GOL")],
+    }),
+  },
+  // a modified BASE: 20 nucleotides of DNA with 5-methylcytosine at 5 and 9 - each atomised into 20
+  // tokens with the PARENT's restype (DC, not the cysteine the amino-acid table reads), its OP3 gone
+  // mid-chain. Dumped by dump_af3_batch.py --kind dna --mods 5CM@5,5CM@9 --user-ccd 5CM.cif
+  // (af3-any-model's pip install carries a CCD without any modified base).
+  "dna-5cm": {
+    suffix: "-dna-5cm",
+    extra: () => ({
+      chainKinds: ["dna"],
+      modifications: [{ chain: 0, position: 5, ...ccd("5CM") }, { chain: 0, position: 9, ...ccd("5CM") }],
+    }),
+  },
+  // and RNA's: AlphaFold 3's modified_rna example - 2'-O-methylguanosine, pseudouridine (a C-glycoside,
+  // its base joined by a carbon) and 5-methylcytidine (--kind rna --mods OMG@4,PSU@13,5MC@18)
+  // a GLYCAN: AlphaFold 3's rnaseb_glycosylated example - five components as one ligand chain,
+  // joined to each other and to Asn34 by bondedAtomPairs (--ligand NAG,NAG,BMA,MAN,MAN --bonds ...)
+  "glycan": {
+    suffix: "-glycan",
+    extra: () => {
+      const end = (asym, residue, atom) => ({ asym, residue, atom });
+      return {
+        ligands: [ligandChain(["NAG", "NAG", "BMA", "MAN", "MAN"].map(ccd))],
+        bonds: [[end(0, 34, "ND2"), end(1, 1, "C1")], [end(1, 1, "O4"), end(1, 2, "C1")],
+                [end(1, 2, "O4"), end(1, 3, "C1")], [end(1, 3, "O3"), end(1, 4, "C1")],
+                [end(1, 3, "O6"), end(1, 5, "C1")]].map(([from, to]) => ({ from, to })),
+      };
+    },
+  },
+  // NUCLEIC ALIGNMENTS: an RNA chain with its own unpaired A3M, alone and beside a protein with
+  // its own - AF3 stacks the chains' unpaired rows side by side, an RNA column in RNA's codes
+  // (A 22 ... U 25), which is what a job's inline unpairedMsa gives (--chains rna:SEQ:A3M,...)
+  "rna-msa": {
+    suffix: "-rna-msa",
+    alignment: () => ({ unpaired: fixture("msa/rna-17.a3m"), paired: null }),
+    extra: () => ({ chainKinds: ["rna"], msaColumnKinds: Array(17).fill("rna") }),
+  },
+  "prot-rna-msa": {
+    suffix: "-prot-rna-msa",
+    alignment: () => ({ unpaired: mergeRowAlignedChainA3ms([fixture("msa/protein-21.a3m"), fixture("msa/rna-17.a3m")],
+                                                                 { anyLetter: true }),
+                        paired: null }),
+    extra: () => ({ chainKinds: ["protein", "rna"],
+                    msaColumnKinds: [...Array(21).fill("protein"), ...Array(17).fill("rna")] }),
+  },
+  // a modified PROLINE (3-hydroxyproline at 4): boltz2's one-token residue tore it apart where SEP
+  // folded clean (--sequence P..P.. --mods HY3@4)
+  "hy3": {
+    suffix: "-hy3",
+    extra: () => ({ modifications: [{ chain: 0, position: 4, ...ccd("HY3") }] }),
+  },
+  // ...and a modified base at a chain's FIRST residue, which keeps the 5' OP3 a mid-chain one drops
+  // (AF3's kitchen-sink example puts 6OG and 2MG there): --mods 6OG@1,6MA@2 on GATTACA, 2MG@1,5MC@4
+  // on GUACGUAC (its GUAC is under the 128-atom key window, where the reference itself crashes)
+  "dna-5prime": {
+    suffix: "-dna-5prime",
+    extra: () => ({ chainKinds: ["dna"],
+                    modifications: [{ chain: 0, position: 1, ...ccd("6OG") }, { chain: 0, position: 2, ...ccd("6MA") }] }),
+  },
+  "rna-5prime": {
+    suffix: "-rna-5prime",
+    extra: () => ({ chainKinds: ["rna"],
+                    modifications: [{ chain: 0, position: 1, ...ccd("2MG") }, { chain: 0, position: 4, ...ccd("5MC") }] }),
+  },
+  // AlphaFold 3's KITCHEN-SINK example (tools/fixtures/af3-jobs/alphafold_input.json) as the page
+  // and the native exporter read it - jobFromJson, expandEntities, mergeJobAlignments, the SMILES
+  // built here - against AF3's own featurisation of the same file (dump_af3_batch.py --job, the
+  // twelve components it lacks as --user-ccd): two proteins with PTMs, two DNA and an RNA chain with
+  // modified bases, inline alignments over protein and RNA, ten ligand chains (a two-component
+  // glycan, a SMILES), and its bonds
+  "kitchen-sink": {
+    suffix: "-kitchen-sink",
+    alignment: () => KITCHEN.alignment,
+    extra: () => KITCHEN.options,
+    smilesCodes: () => KITCHEN.smilesCodes,
+  },
+  "rna-mods": {
+    suffix: "-rna-mods",
+    extra: () => ({
+      chainKinds: ["rna"],
+      modifications: [{ chain: 0, position: 4, ...ccd("OMG") }, { chain: 0, position: 13, ...ccd("PSU") },
+                      { chain: 0, position: 18, ...ccd("5MC") }],
     }),
   },
 };
@@ -115,6 +199,11 @@ const FIELDS = {
   residue_index: (b) => b.residueIndex,
   token_index: (b) => b.tokenIndex,
   seq_mask: (b) => b.seqMask,
+  // boltz2's target_feat sums a mol-type and a modified conditioning off these
+  is_dna: (b) => b.isDna,
+  is_rna: (b) => b.isRna,
+  is_ligand: (b) => b.isLigand,
+  is_modified: (b) => b.isModified,
   deletion_mean: (b) => b.deletionMean,
   profile: (b) => b.profile,
   ref_mask: (b) => b.refMask,
@@ -140,9 +229,7 @@ const ABSENT = {
   msa_mask: "as msa",
   deletion_matrix: "as msa",
   is_protein: "derived from aatype at use, not stored",
-  is_dna: "as is_protein", is_rna: "as is_protein", is_ligand: "as is_protein",
   is_water: "as is_protein", is_nonstandard_polymer_chain: "as is_protein",
-  is_modified: "boltz2 only; derived from the modification list at use",
   frames_mask: "the frame set is built in the confidence head, not the batch",
   residue_center_index: "derived from the dense layout at use",
   chiral_angles: "gated in check-atom-windows.js",
@@ -178,6 +265,47 @@ const verbose = args.includes("--verbose");
 // nobody has watched fail is a gate that may be comparing nothing. See the
 // bottom of this file for the run that proves it.
 const falsify = (args.find((a) => a.startsWith("--falsify=")) ?? "").slice(10);
+// a job file's inputs as the page and the native exporter read it (a SMILES conformer is async)
+async function jobInputs(file) {
+  const { jobFromJson } = await import("../web/job-json.js");
+  const { expandEntities } = await import("../web/entities.js");
+  const { mergeJobAlignments } = await import("../src/input/chains.js");
+  const { smilesComponent } = await import("../src/chem/component.js");
+  const job = jobFromJson(fixture(file));
+  const request = expandEntities(job.entities);
+  const merged = job.alignments === undefined ? null
+    : mergeJobAlignments(job.alignments, request.chains, request.chainKinds);
+  const ligands = [];
+  const smilesCodes = request.ligandCodes.filter((entry) => entry?.smiles !== undefined)
+    .map((entry) => entry.code ?? "LIG");
+  for (const entry of request.ligandCodes) {
+    ligands.push(typeof entry === "string" ? ccd(entry)
+      : entry.codes ? ligandChain(entry.codes.map(ccd))
+      : await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
+  }
+  return {
+    smilesCodes,
+    alignment: merged?.alignment ?? null,
+    options: {
+      chainKinds: request.chainKinds, ligands,
+      ...(merged === null ? {} : { msaColumnKinds: merged.msaColumnKinds }),
+      modifications: request.modifications.map((m) => ({ chain: m.chain, position: m.position, ...ccd(m.code) })),
+      ...(request.bonds === undefined ? {} : { bonds: request.bonds }),
+    },
+  };
+}
+const KITCHEN = await jobInputs("af3-jobs/alphafold_input.json");
+// ...and every other AlphaFold 3 example job, each against AF3's own featurisation of the file
+// (dump_af3_batch.py --job ... --out oracle-dumps/af3-batch-alphafold3-6mrr-job-<name>.json):
+// their chain ids already sort in this port's order, so no relabelling
+const JOB_NAMES = ["barnase_barstar", "calmodulin_4calcium", "erk2_phosphorylated", "kras_g12c_sotorasib",
+  "methylated_dna", "modified_rna", "rnaseb_glycosylated", "streptavidin_biotin_smiles", "tetr_dimer_dna",
+  "tetr_dimer_tetracycline", "tetr_homodimer", "u1a_rna_hairpin", "ubiquitin_monomer"];
+for (const name of JOB_NAMES) {
+  const inputs = await jobInputs(`af3-jobs/${name}.json`);
+  TARGETS[`job:${name}`] = { suffix: `-job-${name}`, alignment: () => inputs.alignment,
+                             extra: () => inputs.options, smilesCodes: () => inputs.smilesCodes };
+}
 const onlyTarget = (args.find((a) => a.startsWith("--target=")) ?? "").slice(9);
 
 /** The dump for one (model, target), or null when it has not been generated. */
@@ -219,7 +347,8 @@ for (const target of Object.keys(TARGETS)) {
   const dump = dumpFor(model, target);
   if (dump === null) { missing += 1; console.log(`${model.padEnd(14)} no dump`); continue; }
   const dialect = dialectFor(model);
-  const batch = af3BatchFromA3m(dump.sequence, null, batchFor(dialect, target)).batch;
+  const batch = af3BatchFromA3m(dump.sequence, TARGETS[target].alignment?.() ?? null,
+                                { ...batchFor(dialect, target), prefixRows: true }).batch;
 
   const bad = [];
   const floor = [];   // deliberate deviations: reported every run, never failed
@@ -299,22 +428,33 @@ for (const target of Object.keys(TARGETS)) {
   // first version did exactly that and reported all seven models missing the
   // ligand bonds, when six of them have every bond the reference has. Compare
   // the SET of bonded token pairs.
+  // 🔴 AND THE TWO TOKEN-LEVEL GATHERS ARE ONE MATRIX. AF3's token_bonds sets [i][j] for every pair
+  // in tokens_to_polymer_ligand_bonds AND tokens_to_ligand_ligand_bonds (evoformer.py's contact
+  // matrix), so the comparison is against their UNION - a target with a polymer-ligand bond (the
+  // glycan's Asn34-NAG link) put that pair in one list and the rest in the other, and comparing each
+  // list against the whole matrix reported every bond as extra in one of them. The ATOM-level
+  // token_atoms_to_polymer_ligand_bonds is read by no model's trunk and is noted, not compared.
+  const theirs = new Set();
+  let anyGather = false;
   for (const name of BOND_GATHERS) {
     const idx = flat(dump.inputs[`${name}:gather_idxs`]).map(Number);
     const msk = flat(dump.inputs[`${name}:gather_mask`]).map(Number);
     if (idx.length === 0) continue;
     seen.add(`${name}:gather_idxs`); seen.add(`${name}:gather_mask`);
     seen.add(`${name}:input_shape`);
-    // Each entry is a (row, column) token pair; the mask is per element.
-    const theirs = new Set();
+    if (name.startsWith("token_atoms_")) {
+      if (verbose) notes.push(`${name}: atom-level, read by no model (not compared)`);
+      continue;
+    }
+    anyGather = true;
     for (let k = 0; k * 2 + 1 < idx.length; k += 1) {
       if (!(msk[k * 2] > 0.5)) continue;
       theirs.add(`${idx[k * 2]}-${idx[k * 2 + 1]}`);
     }
-    if (theirs.size === 0) {
-      if (verbose) notes.push(`${name}: dead on both sides`);
-      continue;
-    }
+  }
+  if (anyGather) {
+    const name = "token bonds (both gathers)";
+    if (theirs.size === 0 && verbose) notes.push(`${name}: dead on both sides`);
     // 🔴 AND DIRECTION IS PART OF THE QUESTION, WHICH THE FIRST VERSION THREW
     // AWAY. It compared undirected edges, on the reasoning that the reference
     // lists most bonds one way round while this port's matrix is symmetric -
@@ -345,9 +485,24 @@ for (const target of Object.keys(TARGETS)) {
     // this target" - true of 6MRR and false of gol-sep3, so the moment a target
     // had bonds the gate stopped comparing the one channel that was empty.
     // boltz2 reads it as the second plane of its z-init bond feature and was
-    // getting zeros; see the note in featurise.js.
+    // getting zeros; see the note in featurise.js. (Its pairs are the
+    // ligand-ligand gather's.)
+    const idx = flat(dump.inputs["tokens_to_ligand_ligand_bonds:gather_idxs"]).map(Number);
+    const msk = flat(dump.inputs["tokens_to_ligand_ligand_bonds:gather_mask"]).map(Number);
     const orders = flat(dump.inputs.ligand_ligand_bond_order).map(Number);
     let orderDiff = 0;
+    // 🔴 A SMILES LIGAND'S BOND ORDERS ARE A REPORTED DEVIATION, NOT A FAILURE. The reference
+    // looks a bond's order up in the component's CCD entry, and a SMILES-only ligand has none:
+    // `_ccd_bond_orders` returns an empty mapping and every bond reads OTHER (0) - its own docstring
+    // says so. This port carries the molecule's real orders, which is what genuine Boltz-2 (the one
+    // model that reads the feature) featurises from RDKit; the reference's 0 is a gap in its lookup.
+    const smilesTokens = new Set();
+    for (const span of batch.ligandSpans ?? []) {
+      if ((TARGETS[target].smilesCodes?.() ?? []).includes(span.code)) {
+        for (let t = span.from; t < span.from + span.count; t += 1) smilesTokens.add(t);
+      }
+    }
+    let smilesOrders = 0;
     if (orders.length > 0 && batch.bondOrderMatrix !== undefined) {
       seen.add("ligand_ligand_bond_order");
       for (let k = 0; k * 2 + 1 < idx.length; k += 1) {
@@ -355,12 +510,18 @@ for (const target of Object.keys(TARGETS)) {
         const a = idx[k * 2];
         const b = idx[k * 2 + 1];
         if (a === b) continue;
-        if (batch.bondOrderMatrix[a * batch.tokens + b] !== orders[k]) orderDiff += 1;
+        if (batch.bondOrderMatrix[a * batch.tokens + b] !== orders[k]) {
+          if (orders[k] === 0 && smilesTokens.has(a) && smilesTokens.has(b)) smilesOrders += 1;
+          else orderDiff += 1;
+        }
+      }
+      if (smilesOrders !== 0) {
+        floor.push(`ligand_ligand_bond_order: ${smilesOrders} SMILES-ligand pairs the reference has as OTHER (no CCD entry to read) and this port as the molecule's own orders`);
       }
       if (orderDiff !== 0) {
         bad.push(`ligand_ligand_bond_order: ${orderDiff} pairs with the wrong order`);
       } else if (verbose) {
-        notes.push(`ligand_ligand_bond_order: exact over ${theirs.size} pairs`);
+        notes.push(`ligand_ligand_bond_order: exact over the ligand-ligand gather`);
       }
     }
     if (missing.length !== 0 || extra.length !== 0) {

@@ -63,7 +63,7 @@ export class DeltaTensorStore {
                       bundle: { ...base.manifest.bundle, model: header.model ?? "delta" },
                       delta: header };
     if (this.#header.absent.size > 0) {
-      for (const section of ["templateEmbedding"]) {
+      for (const section of ["templateEmbedding", "templateSingle"]) {
         const parameters = base.manifest[section]?.parameters;
         if (parameters === undefined) continue;
         const names = Object.values(parameters).flatMap((leaves) => Object.values(leaves));

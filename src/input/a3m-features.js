@@ -392,13 +392,27 @@ function finishRecycle(plan, assignments, context) {
 /** CPU feature preprocessing for A3M text, with the search on the host. */
 export function makeA3mFeatures(a3mText, tables, options = {}) {
   const { plans, context } = planA3mFeatures(a3mText, tables, options);
-  return plans.map((plan) => {
-    const mark = performance.now();
-    const assignments = nearestCentres(plan.centerCodes, context.encoded, plan.extras,
-      plan.centers.length, context.length);
-    featureStats.nearestMs += performance.now() - mark;
-    return finishRecycle(plan, assignments, context);
-  });
+  return plans.map((plan) => hostRecycle(plan, context));
+}
+
+/**
+ * ONE recycle's features, exactly as `makeA3mFeatures(...)[index]`: every
+ * recycle is planned (planning is cheap and seeded in sequence, so recycle k's
+ * plan needs the k before it) and only `index` is searched and finished - so
+ * independent workers can each take a recycle (native/af2/export_input.mjs).
+ */
+export function makeA3mFeatureRecycle(a3mText, tables, options, index) {
+  const { plans, context } = planA3mFeatures(a3mText, tables, options);
+  if (!(index >= 0 && index < plans.length)) throw new Error(`recycle ${index} of ${plans.length}`);
+  return hostRecycle(plans[index], context);
+}
+
+function hostRecycle(plan, context) {
+  const mark = performance.now();
+  const assignments = nearestCentres(plan.centerCodes, context.encoded, plan.extras,
+    plan.centers.length, context.length);
+  featureStats.nearestMs += performance.now() - mark;
+  return finishRecycle(plan, assignments, context);
 }
 
 /**

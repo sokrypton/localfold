@@ -38,7 +38,7 @@ export const MODEL_BUNDLES = {
   monomer: {
     model: "model_1_ptm",
     directory: "./model/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/8a8aa55554b71e8e867a197e84f382cad3f444ad/af2-monomer-int5/",
     release: "model1-ptm",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer.js"),
@@ -55,7 +55,7 @@ export const MODEL_BUNDLES = {
     model: "model_2_ptm",
     delta: { base: "monomer" },
     directory: "./model-mono-2-delta/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-2/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/8a8aa55554b71e8e867a197e84f382cad3f444ad/af2-monomer-2/",
     release: "model2-ptm-delta",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-2.js"),
@@ -78,7 +78,7 @@ export const MODEL_BUNDLES = {
     // test/model-bundles.test.js holds the two to each other.
     noTemplateEmbedder: true,
     directory: "./model-mono-3-delta/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-3/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/8a8aa55554b71e8e867a197e84f382cad3f444ad/af2-monomer-3/",
     release: "model3-ptm-delta",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-3.js"),
@@ -101,7 +101,7 @@ export const MODEL_BUNDLES = {
     // test/model-bundles.test.js holds the two to each other.
     noTemplateEmbedder: true,
     directory: "./model-mono-4-delta/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-4/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/8a8aa55554b71e8e867a197e84f382cad3f444ad/af2-monomer-4/",
     release: "model4-ptm-delta",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-4.js"),
@@ -124,7 +124,7 @@ export const MODEL_BUNDLES = {
     // test/model-bundles.test.js holds the two to each other.
     noTemplateEmbedder: true,
     directory: "./model-mono-5-delta/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/b61b5a3ed56470025daeac7986f884bb5451d2fd/af2-monomer-5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/8a8aa55554b71e8e867a197e84f382cad3f444ad/af2-monomer-5/",
     release: "model5-ptm-delta",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-5.js"),
@@ -476,10 +476,19 @@ export const AF3_FAMILIES = ["af3", "openbind0", "opendde", "boltz2", "protenix2
  *
  * @param {ModelFamily} family
  */
+const HUGGING_FACE = "https://huggingface.co/";
+
 export function bundleBaseUrl(family) {
   const bundle = MODEL_BUNDLES[family];
   if (bundle === undefined) throw new RangeError(`unknown model family ${family}`);
-  const base = bundle.remote ?? bundle.directory;
+  let base = bundle.remote ?? bundle.directory;
+  // 🔴 A COLAB RUNTIME PAGE READS ITS WEIGHTS THROUGH THE BROKER, whose Python
+  // fetches Hugging Face at curl's speed where the runtime's headless Chrome on
+  // two vCPUs could not (see _weights_proxy in tools/colab_backend.py). Set
+  // only on a page the broker opened with `weights=proxy`; a reader's own
+  // browser never takes this.
+  const proxy = globalThis.__localfoldWeightsProxy;
+  if (proxy && base.startsWith(HUGGING_FACE)) base = proxy + base.slice(HUGGING_FACE.length);
   return base.endsWith("/") ? base : `${base}/`;
 }
 

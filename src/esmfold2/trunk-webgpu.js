@@ -40,7 +40,7 @@ import {
 } from "../runtime/device-profile.js";
 import { stagedMatrixBlock } from "../kernels/matrix-linear.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
-import { residencyAllowed } from "../runtime/device-memory.js";
+import { memoryTotals, residencyAllowed } from "../runtime/device-memory.js";
 import {
   allocateTransitionSplit, packTransitionWeights, splitTransitionConfig,
   TRANSITION_SPLIT_MIN_CHANNELS,
@@ -212,7 +212,18 @@ export class Esmfold2TrunkGpu {
     // 🔴 ITS OWN KNOB, not derived from the transition's - see the note on
     // projectMatrixConfig in src/af3/trunk/pairformer-block-webgpu.js - and its own
     // width rule, which is about precision rather than memory.
-    const triangleProjectMatrix = tuning.triangleProjectMatrix === true && splitConfig !== null
+    // 🔴 THE MATRIX PROJECTION HOLDS ONE MORE PAIR-SIZED BUFFER, AND THE BUDGET
+    // DECIDES WHETHER THERE IS ROOM. Without it the triangle runs a quarter of
+    // its channels at a time (`compact` in pair-track-gpu.js): three pair-sized
+    // scratch tensors and a small one, against four. ESMFold2 at 1448 tokens
+    // was refused on a T4-sized budget for exactly that fourth one. The same
+    // rule as AF3's trunk (see trunk-webgpu.js there); `options.leanPair`
+    // forces it either way.
+    const { residentBytes, budgetBytes } = memoryTotals(this.device);
+    const leanPair = options.leanPair ?? (budgetBytes != null
+      && residentBytes + 4 * pairs * channels * 4 + 512 * 1048576 > budgetBytes);
+    const triangleProjectMatrix = !leanPair
+      && tuning.triangleProjectMatrix === true && splitConfig !== null
       && channels >= (tuning.triangleProjectMatrixMinChannels
         ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)
       ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,

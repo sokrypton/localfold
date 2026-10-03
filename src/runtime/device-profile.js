@@ -1218,6 +1218,26 @@ PRIORS.set("lovelace", PRIORS.get("ampere"));
 // single cold run is what most visitors make, so it takes the L4's prior.
 PRIORS.set("blackwell", PRIORS.get("lovelace"));
 
+// 🔴 AND THE T4 TAKES AMPERE'S KNOBS UNDER ITS OWN, BECAUSE A WHOLE FOLD SAYS
+// SO WHERE A KERNEL BENCH SAID OTHERWISE. The turing entry above was written
+// against a standalone triangle bench on which ampere's entry regressed 40%,
+// and so it set four knobs and left every other one at its default - including
+// AF2's matrix and chunking knobs and the diffusion settings, none of which
+// that bench runs. Folded end to end on a Colab T4 (two rounds interleaved,
+// because the card throttles; seconds, 255 residues):
+//
+//                            turing        turing over ampere   ampere alone
+//   AF3, warm folds          11.5-13.0     10.7-10.9            11.2-11.4
+//   AF3, first fold          17.1-20.9     14.5-15.8            15.4-15.9
+//   AF2 monomer, repeats     15.2-16.3     12.0-12.1            12.0
+//   IntelliFold-2, warm      35.5-35.6     33.4-33.5            33.8-33.9
+//
+// Turing's own measured settings stay on top (its OPM block, grid-attend
+// matrix, the pinned diffusion geometry, AF2's attention off the matrix units)
+// and `opmBlockITokens` is cleared, because that is ampere's memory system
+// turning over at 256 tokens and block ONE is this card's worst arm.
+PRIORS.set("turing", { ...PRIORS.get("ampere"), ...PRIORS.get("turing"), opmBlockITokens: null });
+
 const VENDOR_PRIORS = new Map([
   // 🔴 NOTHING FOR "apple" ON PURPOSE. Its measurements ARE the defaults above,
   // and an entry that restated them would be a second place for them to drift.

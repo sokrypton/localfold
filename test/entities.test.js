@@ -213,10 +213,15 @@ describe("nucleic entities", () => {
     expect(entityProblem(chain("dna", "ACGN"))).toMatch(/N is not one of A, C, G, T/);
   });
 
-  it("refuses a modified base rather than featurising it as an amino acid", () => {
+  it("refuses a modified amino acid on a nucleic chain", () => {
     const modified = { ...chain("dna", "ACGT"),
       modifications: [{ code: "SEP", position: 2 }] };
-    expect(entityProblem(modified)).toMatch(/not supported/);
+    expect(entityProblem(modified)).toMatch(/modified amino acid/);
+  });
+  it("takes a modified base", () => {
+    const modified = { ...chain("dna", "ACGT"),
+      modifications: [{ code: "5CM", position: 2 }] };
+    expect(entityProblem(modified)).toBe(null);
   });
 });
 

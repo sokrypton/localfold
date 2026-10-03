@@ -1,0 +1,1443 @@
+p w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_b 12288 v 3 48 8 32 0 256 32 1 stack_haiku_0000 0 256 32 1
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_b#r 3
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_b#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_b#1 8
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_b#2 32
+p w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_w 3145728 v 4 48 256 8 32 0 65536 256 32 1 stack_haiku_0001 0 65536 256 32 1
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_w#r 4
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_w#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_w#1 256
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_w#2 8
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/gating_w#3 32
+p w/evoformer/evoformer_iteration/msa_column_attention/attention/key_w 3145728 v 4 48 256 8 32 0 65536 256 32 1 stack_haiku_0002 0 65536 256 32 1
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/key_w#r 4
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/key_w#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/key_w#1 256
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/key_w#2 8
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/key_w#3 32
+p w/evoformer/evoformer_iteration/msa_column_attention/attention/output_b 12288 v 2 48 256 0 256 1 stack_haiku_0003 0 256 1
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/output_b#r 2
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/output_b#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/output_b#1 256
+p w/evoformer/evoformer_iteration/msa_column_attention/attention/output_w 3145728 v 4 48 8 32 256 0 65536 8192 256 1 stack_haiku_0004 0 65536 8192 256 1
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/output_w#r 4
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/output_w#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/output_w#1 8
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/output_w#2 32
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/output_w#3 256
+p w/evoformer/evoformer_iteration/msa_column_attention/attention/query_w 3145728 v 4 48 256 8 32 0 65536 256 32 1 stack_haiku_0005 0 65536 256 32 1
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/query_w#r 4
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/query_w#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/query_w#1 256
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/query_w#2 8
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/query_w#3 32
+p w/evoformer/evoformer_iteration/msa_column_attention/attention/value_w 3145728 v 4 48 256 8 32 0 65536 256 32 1 stack_haiku_0006 0 65536 256 32 1
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/value_w#r 4
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/value_w#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/value_w#1 256
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/value_w#2 8
+m w/evoformer/evoformer_iteration/msa_column_attention/attention/value_w#3 32
+p w/evoformer/evoformer_iteration/msa_column_attention/query_norm/offset 12288 v 2 48 256 0 256 1 stack_haiku_0007 0 256 1
+m w/evoformer/evoformer_iteration/msa_column_attention/query_norm/offset#r 2
+m w/evoformer/evoformer_iteration/msa_column_attention/query_norm/offset#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/query_norm/offset#1 256
+p w/evoformer/evoformer_iteration/msa_column_attention/query_norm/scale 12288 v 2 48 256 0 256 1 stack_haiku_0008 0 256 1
+m w/evoformer/evoformer_iteration/msa_column_attention/query_norm/scale#r 2
+m w/evoformer/evoformer_iteration/msa_column_attention/query_norm/scale#0 48
+m w/evoformer/evoformer_iteration/msa_column_attention/query_norm/scale#1 256
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_weights 49152 v 3 48 128 8 0 1024 8 1 stack_haiku_0009 0 1024 8 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_weights#r 3
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_weights#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_weights#1 128
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_weights#2 8
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_b 12288 v 3 48 8 32 0 256 32 1 stack_haiku_0010 0 256 32 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_b#r 3
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_b#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_b#1 8
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_b#2 32
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_w 3145728 v 4 48 256 8 32 0 65536 256 32 1 stack_haiku_0011 0 65536 256 32 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_w#r 4
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_w#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_w#1 256
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_w#2 8
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/gating_w#3 32
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/key_w 3145728 v 4 48 256 8 32 0 65536 256 32 1 stack_haiku_0012 0 65536 256 32 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/key_w#r 4
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/key_w#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/key_w#1 256
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/key_w#2 8
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/key_w#3 32
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_b 12288 v 2 48 256 0 256 1 stack_haiku_0013 0 256 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_b#r 2
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_b#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_b#1 256
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_w 3145728 v 4 48 8 32 256 0 65536 8192 256 1 stack_haiku_0014 0 65536 8192 256 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_w#r 4
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_w#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_w#1 8
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_w#2 32
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/output_w#3 256
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w 3145728 v 4 48 256 8 32 0 65536 256 32 1 stack_haiku_0015 0 65536 256 32 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w#r 4
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w#1 256
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w#2 8
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w#3 32
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/value_w 3145728 v 4 48 256 8 32 0 65536 256 32 1 stack_haiku_0016 0 65536 256 32 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/value_w#r 4
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/value_w#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/value_w#1 256
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/value_w#2 8
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/value_w#3 32
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm/offset 6144 v 2 48 128 0 128 1 stack_haiku_0017 0 128 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm/offset#r 2
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm/offset#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm/offset#1 128
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm/scale 6144 v 2 48 128 0 128 1 stack_haiku_0018 0 128 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm/scale#r 2
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm/scale#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/feat_2d_norm/scale#1 128
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/query_norm/offset 12288 v 2 48 256 0 256 1 stack_haiku_0019 0 256 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/query_norm/offset#r 2
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/query_norm/offset#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/query_norm/offset#1 256
+p w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/query_norm/scale 12288 v 2 48 256 0 256 1 stack_haiku_0020 0 256 1
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/query_norm/scale#r 2
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/query_norm/scale#0 48
+m w/evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/query_norm/scale#1 256
+p w/evoformer/evoformer_iteration/msa_transition/input_layer_norm/offset 12288 v 2 48 256 0 256 1 stack_haiku_0021 0 256 1
+m w/evoformer/evoformer_iteration/msa_transition/input_layer_norm/offset#r 2
+m w/evoformer/evoformer_iteration/msa_transition/input_layer_norm/offset#0 48
+m w/evoformer/evoformer_iteration/msa_transition/input_layer_norm/offset#1 256
+p w/evoformer/evoformer_iteration/msa_transition/input_layer_norm/scale 12288 v 2 48 256 0 256 1 stack_haiku_0022 0 256 1
+m w/evoformer/evoformer_iteration/msa_transition/input_layer_norm/scale#r 2
+m w/evoformer/evoformer_iteration/msa_transition/input_layer_norm/scale#0 48
+m w/evoformer/evoformer_iteration/msa_transition/input_layer_norm/scale#1 256
+p w/evoformer/evoformer_iteration/msa_transition/transition1/bias 49152 v 2 48 1024 0 1024 1 stack_haiku_0023 0 1024 1
+m w/evoformer/evoformer_iteration/msa_transition/transition1/bias#r 2
+m w/evoformer/evoformer_iteration/msa_transition/transition1/bias#0 48
+m w/evoformer/evoformer_iteration/msa_transition/transition1/bias#1 1024
+p w/evoformer/evoformer_iteration/msa_transition/transition1/weights 12582912 v 3 48 256 1024 0 262144 1024 1 stack_haiku_0024 0 262144 1024 1
+m w/evoformer/evoformer_iteration/msa_transition/transition1/weights#r 3
+m w/evoformer/evoformer_iteration/msa_transition/transition1/weights#0 48
+m w/evoformer/evoformer_iteration/msa_transition/transition1/weights#1 256
+m w/evoformer/evoformer_iteration/msa_transition/transition1/weights#2 1024
+p w/evoformer/evoformer_iteration/msa_transition/transition2/bias 12288 v 2 48 256 0 256 1 stack_haiku_0025 0 256 1
+m w/evoformer/evoformer_iteration/msa_transition/transition2/bias#r 2
+m w/evoformer/evoformer_iteration/msa_transition/transition2/bias#0 48
+m w/evoformer/evoformer_iteration/msa_transition/transition2/bias#1 256
+p w/evoformer/evoformer_iteration/msa_transition/transition2/weights 12582912 v 3 48 1024 256 0 262144 256 1 stack_haiku_0026 0 262144 256 1
+m w/evoformer/evoformer_iteration/msa_transition/transition2/weights#r 3
+m w/evoformer/evoformer_iteration/msa_transition/transition2/weights#0 48
+m w/evoformer/evoformer_iteration/msa_transition/transition2/weights#1 1024
+m w/evoformer/evoformer_iteration/msa_transition/transition2/weights#2 256
+p w/evoformer/evoformer_iteration/outer_product_mean/output_b 6144 v 2 48 128 0 128 1 stack_haiku_0027 0 128 1
+m w/evoformer/evoformer_iteration/outer_product_mean/output_b#r 2
+m w/evoformer/evoformer_iteration/outer_product_mean/output_b#0 48
+m w/evoformer/evoformer_iteration/outer_product_mean/output_b#1 128
+p w/evoformer/evoformer_iteration/outer_product_mean/output_w 6291456 v 4 48 32 32 128 0 131072 4096 128 1 stack_haiku_0028 0 131072 4096 128 1
+m w/evoformer/evoformer_iteration/outer_product_mean/output_w#r 4
+m w/evoformer/evoformer_iteration/outer_product_mean/output_w#0 48
+m w/evoformer/evoformer_iteration/outer_product_mean/output_w#1 32
+m w/evoformer/evoformer_iteration/outer_product_mean/output_w#2 32
+m w/evoformer/evoformer_iteration/outer_product_mean/output_w#3 128
+p w/evoformer/evoformer_iteration/outer_product_mean/layer_norm_input/offset 12288 v 2 48 256 0 256 1 stack_haiku_0029 0 256 1
+m w/evoformer/evoformer_iteration/outer_product_mean/layer_norm_input/offset#r 2
+m w/evoformer/evoformer_iteration/outer_product_mean/layer_norm_input/offset#0 48
+m w/evoformer/evoformer_iteration/outer_product_mean/layer_norm_input/offset#1 256
+p w/evoformer/evoformer_iteration/outer_product_mean/layer_norm_input/scale 12288 v 2 48 256 0 256 1 stack_haiku_0030 0 256 1
+m w/evoformer/evoformer_iteration/outer_product_mean/layer_norm_input/scale#r 2
+m w/evoformer/evoformer_iteration/outer_product_mean/layer_norm_input/scale#0 48
+m w/evoformer/evoformer_iteration/outer_product_mean/layer_norm_input/scale#1 256
+p w/evoformer/evoformer_iteration/outer_product_mean/left_projection/bias 1536 v 2 48 32 0 32 1 stack_haiku_0031 0 32 1
+m w/evoformer/evoformer_iteration/outer_product_mean/left_projection/bias#r 2
+m w/evoformer/evoformer_iteration/outer_product_mean/left_projection/bias#0 48
+m w/evoformer/evoformer_iteration/outer_product_mean/left_projection/bias#1 32
+p w/evoformer/evoformer_iteration/outer_product_mean/left_projection/weights 393216 v 3 48 256 32 0 8192 32 1 stack_haiku_0032 0 8192 32 1
+m w/evoformer/evoformer_iteration/outer_product_mean/left_projection/weights#r 3
+m w/evoformer/evoformer_iteration/outer_product_mean/left_projection/weights#0 48
+m w/evoformer/evoformer_iteration/outer_product_mean/left_projection/weights#1 256
+m w/evoformer/evoformer_iteration/outer_product_mean/left_projection/weights#2 32
+p w/evoformer/evoformer_iteration/outer_product_mean/right_projection/bias 1536 v 2 48 32 0 32 1 stack_haiku_0033 0 32 1
+m w/evoformer/evoformer_iteration/outer_product_mean/right_projection/bias#r 2
+m w/evoformer/evoformer_iteration/outer_product_mean/right_projection/bias#0 48
+m w/evoformer/evoformer_iteration/outer_product_mean/right_projection/bias#1 32
+p w/evoformer/evoformer_iteration/outer_product_mean/right_projection/weights 393216 v 3 48 256 32 0 8192 32 1 stack_haiku_0034 0 8192 32 1
+m w/evoformer/evoformer_iteration/outer_product_mean/right_projection/weights#r 3
+m w/evoformer/evoformer_iteration/outer_product_mean/right_projection/weights#0 48
+m w/evoformer/evoformer_iteration/outer_product_mean/right_projection/weights#1 256
+m w/evoformer/evoformer_iteration/outer_product_mean/right_projection/weights#2 32
+p w/evoformer/evoformer_iteration/pair_transition/input_layer_norm/offset 6144 v 2 48 128 0 128 1 stack_haiku_0035 0 128 1
+m w/evoformer/evoformer_iteration/pair_transition/input_layer_norm/offset#r 2
+m w/evoformer/evoformer_iteration/pair_transition/input_layer_norm/offset#0 48
+m w/evoformer/evoformer_iteration/pair_transition/input_layer_norm/offset#1 128
+p w/evoformer/evoformer_iteration/pair_transition/input_layer_norm/scale 6144 v 2 48 128 0 128 1 stack_haiku_0036 0 128 1
+m w/evoformer/evoformer_iteration/pair_transition/input_layer_norm/scale#r 2
+m w/evoformer/evoformer_iteration/pair_transition/input_layer_norm/scale#0 48
+m w/evoformer/evoformer_iteration/pair_transition/input_layer_norm/scale#1 128
+p w/evoformer/evoformer_iteration/pair_transition/transition1/bias 24576 v 2 48 512 0 512 1 stack_haiku_0037 0 512 1
+m w/evoformer/evoformer_iteration/pair_transition/transition1/bias#r 2
+m w/evoformer/evoformer_iteration/pair_transition/transition1/bias#0 48
+m w/evoformer/evoformer_iteration/pair_transition/transition1/bias#1 512
+p w/evoformer/evoformer_iteration/pair_transition/transition1/weights 3145728 v 3 48 128 512 0 65536 512 1 stack_haiku_0038 0 65536 512 1
+m w/evoformer/evoformer_iteration/pair_transition/transition1/weights#r 3
+m w/evoformer/evoformer_iteration/pair_transition/transition1/weights#0 48
+m w/evoformer/evoformer_iteration/pair_transition/transition1/weights#1 128
+m w/evoformer/evoformer_iteration/pair_transition/transition1/weights#2 512
+p w/evoformer/evoformer_iteration/pair_transition/transition2/bias 6144 v 2 48 128 0 128 1 stack_haiku_0039 0 128 1
+m w/evoformer/evoformer_iteration/pair_transition/transition2/bias#r 2
+m w/evoformer/evoformer_iteration/pair_transition/transition2/bias#0 48
+m w/evoformer/evoformer_iteration/pair_transition/transition2/bias#1 128
+p w/evoformer/evoformer_iteration/pair_transition/transition2/weights 3145728 v 3 48 512 128 0 65536 128 1 stack_haiku_0040 0 65536 128 1
+m w/evoformer/evoformer_iteration/pair_transition/transition2/weights#r 3
+m w/evoformer/evoformer_iteration/pair_transition/transition2/weights#0 48
+m w/evoformer/evoformer_iteration/pair_transition/transition2/weights#1 512
+m w/evoformer/evoformer_iteration/pair_transition/transition2/weights#2 128
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/feat_2d_weights 24576 v 3 48 128 4 0 512 4 1 stack_haiku_0041 0 512 4 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/feat_2d_weights#r 3
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/feat_2d_weights#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/feat_2d_weights#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/feat_2d_weights#2 4
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_b 6144 v 3 48 4 32 0 128 32 1 stack_haiku_0042 0 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_b#r 3
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_b#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_b#1 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_b#2 32
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_w 786432 v 4 48 128 4 32 0 16384 128 32 1 stack_haiku_0043 0 16384 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_w#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_w#2 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/gating_w#3 32
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/key_w 786432 v 4 48 128 4 32 0 16384 128 32 1 stack_haiku_0044 0 16384 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/key_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/key_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/key_w#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/key_w#2 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/key_w#3 32
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_b 6144 v 2 48 128 0 128 1 stack_haiku_0045 0 128 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_b#r 2
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_b#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_b#1 128
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_w 786432 v 4 48 4 32 128 0 16384 4096 128 1 stack_haiku_0046 0 16384 4096 128 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_w#1 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_w#2 32
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/output_w#3 128
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/query_w 786432 v 4 48 128 4 32 0 16384 128 32 1 stack_haiku_0047 0 16384 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/query_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/query_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/query_w#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/query_w#2 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/query_w#3 32
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/value_w 786432 v 4 48 128 4 32 0 16384 128 32 1 stack_haiku_0048 0 16384 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/value_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/value_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/value_w#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/value_w#2 4
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/attention/value_w#3 32
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/query_norm/offset 6144 v 2 48 128 0 128 1 stack_haiku_0049 0 128 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/query_norm/offset#r 2
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/query_norm/offset#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/query_norm/offset#1 128
+p w/evoformer/evoformer_iteration/triangle_attention_ending_node/query_norm/scale 6144 v 2 48 128 0 128 1 stack_haiku_0050 0 128 1
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/query_norm/scale#r 2
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/query_norm/scale#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_ending_node/query_norm/scale#1 128
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/feat_2d_weights 24576 v 3 48 128 4 0 512 4 1 stack_haiku_0051 0 512 4 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/feat_2d_weights#r 3
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/feat_2d_weights#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/feat_2d_weights#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/feat_2d_weights#2 4
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_b 6144 v 3 48 4 32 0 128 32 1 stack_haiku_0052 0 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_b#r 3
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_b#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_b#1 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_b#2 32
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_w 786432 v 4 48 128 4 32 0 16384 128 32 1 stack_haiku_0053 0 16384 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_w#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_w#2 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/gating_w#3 32
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/key_w 786432 v 4 48 128 4 32 0 16384 128 32 1 stack_haiku_0054 0 16384 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/key_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/key_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/key_w#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/key_w#2 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/key_w#3 32
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_b 6144 v 2 48 128 0 128 1 stack_haiku_0055 0 128 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_b#r 2
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_b#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_b#1 128
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_w 786432 v 4 48 4 32 128 0 16384 4096 128 1 stack_haiku_0056 0 16384 4096 128 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_w#1 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_w#2 32
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/output_w#3 128
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/query_w 786432 v 4 48 128 4 32 0 16384 128 32 1 stack_haiku_0057 0 16384 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/query_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/query_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/query_w#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/query_w#2 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/query_w#3 32
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/value_w 786432 v 4 48 128 4 32 0 16384 128 32 1 stack_haiku_0058 0 16384 128 32 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/value_w#r 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/value_w#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/value_w#1 128
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/value_w#2 4
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/attention/value_w#3 32
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/query_norm/offset 6144 v 2 48 128 0 128 1 stack_haiku_0059 0 128 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/query_norm/offset#r 2
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/query_norm/offset#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/query_norm/offset#1 128
+p w/evoformer/evoformer_iteration/triangle_attention_starting_node/query_norm/scale 6144 v 2 48 128 0 128 1 stack_haiku_0060 0 128 1
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/query_norm/scale#r 2
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/query_norm/scale#0 48
+m w/evoformer/evoformer_iteration/triangle_attention_starting_node/query_norm/scale#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/center_norm/offset 6144 v 2 48 128 0 128 1 stack_haiku_0061 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/center_norm/offset#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/center_norm/offset#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/center_norm/offset#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/center_norm/scale 6144 v 2 48 128 0 128 1 stack_haiku_0062 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/center_norm/scale#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/center_norm/scale#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/center_norm/scale#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/bias 12288 v 2 48 128 0 256 1 stack_haiku_0067 0 128 1
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/bias 12288 v 2 48 128 128 256 1 stack_haiku_0073 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/bias#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/bias#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/bias#1 256
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/weights 1572864 v 3 48 128 128 0 32768 256 1 stack_haiku_0068 0 16384 128 1
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/weights 1572864 v 3 48 128 128 128 32768 256 1 stack_haiku_0074 0 16384 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/weights#r 3
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/weights#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/weights#1 128
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gate/weights#2 256
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/bias 6144 v 2 48 128 0 128 1 stack_haiku_0063 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/bias#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/bias#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/bias#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/weights 786432 v 3 48 128 128 0 16384 128 1 stack_haiku_0064 0 16384 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/weights#r 3
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/weights#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/weights#1 128
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/gating_linear/weights#2 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/left_norm_input/offset 6144 v 2 48 128 0 128 1 stack_haiku_0065 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/left_norm_input/offset#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/left_norm_input/offset#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/left_norm_input/offset#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/left_norm_input/scale 6144 v 2 48 128 0 128 1 stack_haiku_0066 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/left_norm_input/scale#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/left_norm_input/scale#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/left_norm_input/scale#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/bias 6144 v 2 48 128 0 128 1 stack_haiku_0071 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/bias#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/bias#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/bias#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/weights 786432 v 3 48 128 128 0 16384 128 1 stack_haiku_0072 0 16384 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/weights#r 3
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/weights#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/weights#1 128
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/output_projection/weights#2 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/bias 12288 v 2 48 128 0 256 1 stack_haiku_0069 0 128 1
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/bias 12288 v 2 48 128 128 256 1 stack_haiku_0075 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/bias#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/bias#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/bias#1 256
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/weights 1572864 v 3 48 128 128 0 32768 256 1 stack_haiku_0070 0 16384 128 1
+p w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/weights 1572864 v 3 48 128 128 128 32768 256 1 stack_haiku_0076 0 16384 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/weights#r 3
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/weights#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/weights#1 128
+m w/evoformer/evoformer_iteration/triangle_multiplication_incoming/projection/weights#2 256
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/center_norm/offset 6144 v 2 48 128 0 128 1 stack_haiku_0077 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/center_norm/offset#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/center_norm/offset#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/center_norm/offset#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/center_norm/scale 6144 v 2 48 128 0 128 1 stack_haiku_0078 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/center_norm/scale#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/center_norm/scale#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/center_norm/scale#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/bias 12288 v 2 48 128 0 256 1 stack_haiku_0083 0 128 1
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/bias 12288 v 2 48 128 128 256 1 stack_haiku_0089 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/bias#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/bias#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/bias#1 256
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/weights 1572864 v 3 48 128 128 0 32768 256 1 stack_haiku_0084 0 16384 128 1
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/weights 1572864 v 3 48 128 128 128 32768 256 1 stack_haiku_0090 0 16384 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/weights#r 3
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/weights#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/weights#1 128
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gate/weights#2 256
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/bias 6144 v 2 48 128 0 128 1 stack_haiku_0079 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/bias#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/bias#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/bias#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/weights 786432 v 3 48 128 128 0 16384 128 1 stack_haiku_0080 0 16384 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/weights#r 3
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/weights#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/weights#1 128
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/gating_linear/weights#2 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/left_norm_input/offset 6144 v 2 48 128 0 128 1 stack_haiku_0081 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/left_norm_input/offset#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/left_norm_input/offset#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/left_norm_input/offset#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/left_norm_input/scale 6144 v 2 48 128 0 128 1 stack_haiku_0082 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/left_norm_input/scale#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/left_norm_input/scale#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/left_norm_input/scale#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/bias 6144 v 2 48 128 0 128 1 stack_haiku_0087 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/bias#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/bias#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/bias#1 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/weights 786432 v 3 48 128 128 0 16384 128 1 stack_haiku_0088 0 16384 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/weights#r 3
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/weights#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/weights#1 128
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/output_projection/weights#2 128
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/bias 12288 v 2 48 128 0 256 1 stack_haiku_0085 0 128 1
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/bias 12288 v 2 48 128 128 256 1 stack_haiku_0091 0 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/bias#r 2
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/bias#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/bias#1 256
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/weights 1572864 v 3 48 128 128 0 32768 256 1 stack_haiku_0086 0 16384 128 1
+p w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/weights 1572864 v 3 48 128 128 128 32768 256 1 stack_haiku_0092 0 16384 128 1
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/weights#r 3
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/weights#0 48
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/weights#1 128
+m w/evoformer/evoformer_iteration/triangle_multiplication_outgoing/projection/weights#2 256
+p w/evoformer/extra_msa_activations/bias 64 v 1 64 0 1 embedding_haiku_0000 0 1
+m w/evoformer/extra_msa_activations/bias#r 1
+m w/evoformer/extra_msa_activations/bias#0 64
+p w/evoformer/extra_msa_activations/weights 1600 v 2 25 64 0 64 1 embedding_haiku_0001 0 64 1
+m w/evoformer/extra_msa_activations/weights#r 2
+m w/evoformer/extra_msa_activations/weights#0 25
+m w/evoformer/extra_msa_activations/weights#1 64
+p w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_b 256 v 3 4 8 8 0 64 8 1 extra_stack_haiku_0000 0 64 8 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_b#r 3
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_b#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_b#1 8
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_b#2 8
+p w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_w 16384 v 4 4 64 8 8 0 4096 64 8 1 extra_stack_haiku_0001 0 4096 64 8 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_w#r 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_w#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_w#1 64
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_w#2 8
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/gating_w#3 8
+p w/evoformer/extra_msa_stack/msa_column_global_attention/attention/key_w 2048 v 3 4 64 8 0 512 8 1 extra_stack_haiku_0002 0 512 8 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/key_w#r 3
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/key_w#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/key_w#1 64
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/key_w#2 8
+p w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_b 256 v 2 4 64 0 64 1 extra_stack_haiku_0003 0 64 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_b#r 2
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_b#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_b#1 64
+p w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_w 16384 v 4 4 8 8 64 0 4096 512 64 1 extra_stack_haiku_0004 0 4096 512 64 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_w#r 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_w#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_w#1 8
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_w#2 8
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/output_w#3 64
+p w/evoformer/extra_msa_stack/msa_column_global_attention/attention/query_w 16384 v 4 4 64 8 8 0 4096 64 8 1 extra_stack_haiku_0005 0 4096 64 8 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/query_w#r 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/query_w#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/query_w#1 64
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/query_w#2 8
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/query_w#3 8
+p w/evoformer/extra_msa_stack/msa_column_global_attention/attention/value_w 2048 v 3 4 64 8 0 512 8 1 extra_stack_haiku_0006 0 512 8 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/value_w#r 3
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/value_w#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/value_w#1 64
+m w/evoformer/extra_msa_stack/msa_column_global_attention/attention/value_w#2 8
+p w/evoformer/extra_msa_stack/msa_column_global_attention/query_norm/offset 256 v 2 4 64 0 64 1 extra_stack_haiku_0007 0 64 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/query_norm/offset#r 2
+m w/evoformer/extra_msa_stack/msa_column_global_attention/query_norm/offset#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/query_norm/offset#1 64
+p w/evoformer/extra_msa_stack/msa_column_global_attention/query_norm/scale 256 v 2 4 64 0 64 1 extra_stack_haiku_0008 0 64 1
+m w/evoformer/extra_msa_stack/msa_column_global_attention/query_norm/scale#r 2
+m w/evoformer/extra_msa_stack/msa_column_global_attention/query_norm/scale#0 4
+m w/evoformer/extra_msa_stack/msa_column_global_attention/query_norm/scale#1 64
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_weights 4096 v 3 4 128 8 0 1024 8 1 extra_stack_haiku_0009 0 1024 8 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_weights#r 3
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_weights#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_weights#1 128
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_weights#2 8
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_b 256 v 3 4 8 8 0 64 8 1 extra_stack_haiku_0010 0 64 8 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_b#r 3
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_b#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_b#1 8
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_b#2 8
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_w 16384 v 4 4 64 8 8 0 4096 64 8 1 extra_stack_haiku_0011 0 4096 64 8 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_w#r 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_w#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_w#1 64
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_w#2 8
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/gating_w#3 8
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/key_w 16384 v 4 4 64 8 8 0 4096 64 8 1 extra_stack_haiku_0012 0 4096 64 8 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/key_w#r 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/key_w#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/key_w#1 64
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/key_w#2 8
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/key_w#3 8
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_b 256 v 2 4 64 0 64 1 extra_stack_haiku_0013 0 64 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_b#r 2
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_b#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_b#1 64
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_w 16384 v 4 4 8 8 64 0 4096 512 64 1 extra_stack_haiku_0014 0 4096 512 64 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_w#r 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_w#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_w#1 8
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_w#2 8
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/output_w#3 64
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/query_w 16384 v 4 4 64 8 8 0 4096 64 8 1 extra_stack_haiku_0015 0 4096 64 8 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/query_w#r 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/query_w#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/query_w#1 64
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/query_w#2 8
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/query_w#3 8
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/value_w 16384 v 4 4 64 8 8 0 4096 64 8 1 extra_stack_haiku_0016 0 4096 64 8 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/value_w#r 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/value_w#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/value_w#1 64
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/value_w#2 8
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/attention/value_w#3 8
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm/offset 512 v 2 4 128 0 128 1 extra_stack_haiku_0017 0 128 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm/offset#r 2
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm/offset#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm/offset#1 128
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm/scale 512 v 2 4 128 0 128 1 extra_stack_haiku_0018 0 128 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm/scale#r 2
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm/scale#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/feat_2d_norm/scale#1 128
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/query_norm/offset 256 v 2 4 64 0 64 1 extra_stack_haiku_0019 0 64 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/query_norm/offset#r 2
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/query_norm/offset#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/query_norm/offset#1 64
+p w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/query_norm/scale 256 v 2 4 64 0 64 1 extra_stack_haiku_0020 0 64 1
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/query_norm/scale#r 2
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/query_norm/scale#0 4
+m w/evoformer/extra_msa_stack/msa_row_attention_with_pair_bias/query_norm/scale#1 64
+p w/evoformer/extra_msa_stack/msa_transition/input_layer_norm/offset 256 v 2 4 64 0 64 1 extra_stack_haiku_0021 0 64 1
+m w/evoformer/extra_msa_stack/msa_transition/input_layer_norm/offset#r 2
+m w/evoformer/extra_msa_stack/msa_transition/input_layer_norm/offset#0 4
+m w/evoformer/extra_msa_stack/msa_transition/input_layer_norm/offset#1 64
+p w/evoformer/extra_msa_stack/msa_transition/input_layer_norm/scale 256 v 2 4 64 0 64 1 extra_stack_haiku_0022 0 64 1
+m w/evoformer/extra_msa_stack/msa_transition/input_layer_norm/scale#r 2
+m w/evoformer/extra_msa_stack/msa_transition/input_layer_norm/scale#0 4
+m w/evoformer/extra_msa_stack/msa_transition/input_layer_norm/scale#1 64
+p w/evoformer/extra_msa_stack/msa_transition/transition1/bias 1024 v 2 4 256 0 256 1 extra_stack_haiku_0023 0 256 1
+m w/evoformer/extra_msa_stack/msa_transition/transition1/bias#r 2
+m w/evoformer/extra_msa_stack/msa_transition/transition1/bias#0 4
+m w/evoformer/extra_msa_stack/msa_transition/transition1/bias#1 256
+p w/evoformer/extra_msa_stack/msa_transition/transition1/weights 65536 v 3 4 64 256 0 16384 256 1 extra_stack_haiku_0024 0 16384 256 1
+m w/evoformer/extra_msa_stack/msa_transition/transition1/weights#r 3
+m w/evoformer/extra_msa_stack/msa_transition/transition1/weights#0 4
+m w/evoformer/extra_msa_stack/msa_transition/transition1/weights#1 64
+m w/evoformer/extra_msa_stack/msa_transition/transition1/weights#2 256
+p w/evoformer/extra_msa_stack/msa_transition/transition2/bias 256 v 2 4 64 0 64 1 extra_stack_haiku_0025 0 64 1
+m w/evoformer/extra_msa_stack/msa_transition/transition2/bias#r 2
+m w/evoformer/extra_msa_stack/msa_transition/transition2/bias#0 4
+m w/evoformer/extra_msa_stack/msa_transition/transition2/bias#1 64
+p w/evoformer/extra_msa_stack/msa_transition/transition2/weights 65536 v 3 4 256 64 0 16384 64 1 extra_stack_haiku_0026 0 16384 64 1
+m w/evoformer/extra_msa_stack/msa_transition/transition2/weights#r 3
+m w/evoformer/extra_msa_stack/msa_transition/transition2/weights#0 4
+m w/evoformer/extra_msa_stack/msa_transition/transition2/weights#1 256
+m w/evoformer/extra_msa_stack/msa_transition/transition2/weights#2 64
+p w/evoformer/extra_msa_stack/outer_product_mean/output_b 512 v 2 4 128 0 128 1 extra_stack_haiku_0027 0 128 1
+m w/evoformer/extra_msa_stack/outer_product_mean/output_b#r 2
+m w/evoformer/extra_msa_stack/outer_product_mean/output_b#0 4
+m w/evoformer/extra_msa_stack/outer_product_mean/output_b#1 128
+p w/evoformer/extra_msa_stack/outer_product_mean/output_w 524288 v 4 4 32 32 128 0 131072 4096 128 1 extra_stack_haiku_0028 0 131072 4096 128 1
+m w/evoformer/extra_msa_stack/outer_product_mean/output_w#r 4
+m w/evoformer/extra_msa_stack/outer_product_mean/output_w#0 4
+m w/evoformer/extra_msa_stack/outer_product_mean/output_w#1 32
+m w/evoformer/extra_msa_stack/outer_product_mean/output_w#2 32
+m w/evoformer/extra_msa_stack/outer_product_mean/output_w#3 128
+p w/evoformer/extra_msa_stack/outer_product_mean/layer_norm_input/offset 256 v 2 4 64 0 64 1 extra_stack_haiku_0029 0 64 1
+m w/evoformer/extra_msa_stack/outer_product_mean/layer_norm_input/offset#r 2
+m w/evoformer/extra_msa_stack/outer_product_mean/layer_norm_input/offset#0 4
+m w/evoformer/extra_msa_stack/outer_product_mean/layer_norm_input/offset#1 64
+p w/evoformer/extra_msa_stack/outer_product_mean/layer_norm_input/scale 256 v 2 4 64 0 64 1 extra_stack_haiku_0030 0 64 1
+m w/evoformer/extra_msa_stack/outer_product_mean/layer_norm_input/scale#r 2
+m w/evoformer/extra_msa_stack/outer_product_mean/layer_norm_input/scale#0 4
+m w/evoformer/extra_msa_stack/outer_product_mean/layer_norm_input/scale#1 64
+p w/evoformer/extra_msa_stack/outer_product_mean/left_projection/bias 128 v 2 4 32 0 32 1 extra_stack_haiku_0031 0 32 1
+m w/evoformer/extra_msa_stack/outer_product_mean/left_projection/bias#r 2
+m w/evoformer/extra_msa_stack/outer_product_mean/left_projection/bias#0 4
+m w/evoformer/extra_msa_stack/outer_product_mean/left_projection/bias#1 32
+p w/evoformer/extra_msa_stack/outer_product_mean/left_projection/weights 8192 v 3 4 64 32 0 2048 32 1 extra_stack_haiku_0032 0 2048 32 1
+m w/evoformer/extra_msa_stack/outer_product_mean/left_projection/weights#r 3
+m w/evoformer/extra_msa_stack/outer_product_mean/left_projection/weights#0 4
+m w/evoformer/extra_msa_stack/outer_product_mean/left_projection/weights#1 64
+m w/evoformer/extra_msa_stack/outer_product_mean/left_projection/weights#2 32
+p w/evoformer/extra_msa_stack/outer_product_mean/right_projection/bias 128 v 2 4 32 0 32 1 extra_stack_haiku_0033 0 32 1
+m w/evoformer/extra_msa_stack/outer_product_mean/right_projection/bias#r 2
+m w/evoformer/extra_msa_stack/outer_product_mean/right_projection/bias#0 4
+m w/evoformer/extra_msa_stack/outer_product_mean/right_projection/bias#1 32
+p w/evoformer/extra_msa_stack/outer_product_mean/right_projection/weights 8192 v 3 4 64 32 0 2048 32 1 extra_stack_haiku_0034 0 2048 32 1
+m w/evoformer/extra_msa_stack/outer_product_mean/right_projection/weights#r 3
+m w/evoformer/extra_msa_stack/outer_product_mean/right_projection/weights#0 4
+m w/evoformer/extra_msa_stack/outer_product_mean/right_projection/weights#1 64
+m w/evoformer/extra_msa_stack/outer_product_mean/right_projection/weights#2 32
+p w/evoformer/extra_msa_stack/pair_transition/input_layer_norm/offset 512 v 2 4 128 0 128 1 extra_stack_haiku_0035 0 128 1
+m w/evoformer/extra_msa_stack/pair_transition/input_layer_norm/offset#r 2
+m w/evoformer/extra_msa_stack/pair_transition/input_layer_norm/offset#0 4
+m w/evoformer/extra_msa_stack/pair_transition/input_layer_norm/offset#1 128
+p w/evoformer/extra_msa_stack/pair_transition/input_layer_norm/scale 512 v 2 4 128 0 128 1 extra_stack_haiku_0036 0 128 1
+m w/evoformer/extra_msa_stack/pair_transition/input_layer_norm/scale#r 2
+m w/evoformer/extra_msa_stack/pair_transition/input_layer_norm/scale#0 4
+m w/evoformer/extra_msa_stack/pair_transition/input_layer_norm/scale#1 128
+p w/evoformer/extra_msa_stack/pair_transition/transition1/bias 2048 v 2 4 512 0 512 1 extra_stack_haiku_0037 0 512 1
+m w/evoformer/extra_msa_stack/pair_transition/transition1/bias#r 2
+m w/evoformer/extra_msa_stack/pair_transition/transition1/bias#0 4
+m w/evoformer/extra_msa_stack/pair_transition/transition1/bias#1 512
+p w/evoformer/extra_msa_stack/pair_transition/transition1/weights 262144 v 3 4 128 512 0 65536 512 1 extra_stack_haiku_0038 0 65536 512 1
+m w/evoformer/extra_msa_stack/pair_transition/transition1/weights#r 3
+m w/evoformer/extra_msa_stack/pair_transition/transition1/weights#0 4
+m w/evoformer/extra_msa_stack/pair_transition/transition1/weights#1 128
+m w/evoformer/extra_msa_stack/pair_transition/transition1/weights#2 512
+p w/evoformer/extra_msa_stack/pair_transition/transition2/bias 512 v 2 4 128 0 128 1 extra_stack_haiku_0039 0 128 1
+m w/evoformer/extra_msa_stack/pair_transition/transition2/bias#r 2
+m w/evoformer/extra_msa_stack/pair_transition/transition2/bias#0 4
+m w/evoformer/extra_msa_stack/pair_transition/transition2/bias#1 128
+p w/evoformer/extra_msa_stack/pair_transition/transition2/weights 262144 v 3 4 512 128 0 65536 128 1 extra_stack_haiku_0040 0 65536 128 1
+m w/evoformer/extra_msa_stack/pair_transition/transition2/weights#r 3
+m w/evoformer/extra_msa_stack/pair_transition/transition2/weights#0 4
+m w/evoformer/extra_msa_stack/pair_transition/transition2/weights#1 512
+m w/evoformer/extra_msa_stack/pair_transition/transition2/weights#2 128
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/feat_2d_weights 2048 v 3 4 128 4 0 512 4 1 extra_stack_haiku_0041 0 512 4 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/feat_2d_weights#r 3
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/feat_2d_weights#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/feat_2d_weights#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/feat_2d_weights#2 4
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_b 512 v 3 4 4 32 0 128 32 1 extra_stack_haiku_0042 0 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_b#r 3
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_b#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_b#1 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_b#2 32
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_w 65536 v 4 4 128 4 32 0 16384 128 32 1 extra_stack_haiku_0043 0 16384 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_w#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_w#2 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/gating_w#3 32
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/key_w 65536 v 4 4 128 4 32 0 16384 128 32 1 extra_stack_haiku_0044 0 16384 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/key_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/key_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/key_w#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/key_w#2 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/key_w#3 32
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_b 512 v 2 4 128 0 128 1 extra_stack_haiku_0045 0 128 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_b#r 2
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_b#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_b#1 128
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_w 65536 v 4 4 4 32 128 0 16384 4096 128 1 extra_stack_haiku_0046 0 16384 4096 128 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_w#1 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_w#2 32
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/output_w#3 128
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/query_w 65536 v 4 4 128 4 32 0 16384 128 32 1 extra_stack_haiku_0047 0 16384 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/query_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/query_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/query_w#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/query_w#2 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/query_w#3 32
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/value_w 65536 v 4 4 128 4 32 0 16384 128 32 1 extra_stack_haiku_0048 0 16384 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/value_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/value_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/value_w#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/value_w#2 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/attention/value_w#3 32
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/query_norm/offset 512 v 2 4 128 0 128 1 extra_stack_haiku_0049 0 128 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/query_norm/offset#r 2
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/query_norm/offset#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/query_norm/offset#1 128
+p w/evoformer/extra_msa_stack/triangle_attention_ending_node/query_norm/scale 512 v 2 4 128 0 128 1 extra_stack_haiku_0050 0 128 1
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/query_norm/scale#r 2
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/query_norm/scale#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_ending_node/query_norm/scale#1 128
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/feat_2d_weights 2048 v 3 4 128 4 0 512 4 1 extra_stack_haiku_0051 0 512 4 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/feat_2d_weights#r 3
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/feat_2d_weights#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/feat_2d_weights#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/feat_2d_weights#2 4
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_b 512 v 3 4 4 32 0 128 32 1 extra_stack_haiku_0052 0 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_b#r 3
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_b#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_b#1 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_b#2 32
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_w 65536 v 4 4 128 4 32 0 16384 128 32 1 extra_stack_haiku_0053 0 16384 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_w#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_w#2 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/gating_w#3 32
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/key_w 65536 v 4 4 128 4 32 0 16384 128 32 1 extra_stack_haiku_0054 0 16384 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/key_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/key_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/key_w#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/key_w#2 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/key_w#3 32
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_b 512 v 2 4 128 0 128 1 extra_stack_haiku_0055 0 128 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_b#r 2
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_b#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_b#1 128
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_w 65536 v 4 4 4 32 128 0 16384 4096 128 1 extra_stack_haiku_0056 0 16384 4096 128 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_w#1 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_w#2 32
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/output_w#3 128
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/query_w 65536 v 4 4 128 4 32 0 16384 128 32 1 extra_stack_haiku_0057 0 16384 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/query_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/query_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/query_w#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/query_w#2 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/query_w#3 32
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/value_w 65536 v 4 4 128 4 32 0 16384 128 32 1 extra_stack_haiku_0058 0 16384 128 32 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/value_w#r 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/value_w#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/value_w#1 128
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/value_w#2 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/attention/value_w#3 32
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/query_norm/offset 512 v 2 4 128 0 128 1 extra_stack_haiku_0059 0 128 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/query_norm/offset#r 2
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/query_norm/offset#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/query_norm/offset#1 128
+p w/evoformer/extra_msa_stack/triangle_attention_starting_node/query_norm/scale 512 v 2 4 128 0 128 1 extra_stack_haiku_0060 0 128 1
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/query_norm/scale#r 2
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/query_norm/scale#0 4
+m w/evoformer/extra_msa_stack/triangle_attention_starting_node/query_norm/scale#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/center_norm/offset 512 v 2 4 128 0 128 1 extra_stack_haiku_0061 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/center_norm/offset#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/center_norm/offset#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/center_norm/offset#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/center_norm/scale 512 v 2 4 128 0 128 1 extra_stack_haiku_0062 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/center_norm/scale#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/center_norm/scale#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/center_norm/scale#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/bias 1024 v 2 4 128 0 256 1 extra_stack_haiku_0067 0 128 1
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/bias 1024 v 2 4 128 128 256 1 extra_stack_haiku_0073 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/bias#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/bias#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/bias#1 256
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/weights 131072 v 3 4 128 128 0 32768 256 1 extra_stack_haiku_0068 0 16384 128 1
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/weights 131072 v 3 4 128 128 128 32768 256 1 extra_stack_haiku_0074 0 16384 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/weights#r 3
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/weights#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/weights#1 128
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gate/weights#2 256
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/bias 512 v 2 4 128 0 128 1 extra_stack_haiku_0063 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/bias#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/bias#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/bias#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/weights 65536 v 3 4 128 128 0 16384 128 1 extra_stack_haiku_0064 0 16384 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/weights#r 3
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/weights#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/weights#1 128
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/gating_linear/weights#2 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/left_norm_input/offset 512 v 2 4 128 0 128 1 extra_stack_haiku_0065 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/left_norm_input/offset#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/left_norm_input/offset#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/left_norm_input/offset#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/left_norm_input/scale 512 v 2 4 128 0 128 1 extra_stack_haiku_0066 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/left_norm_input/scale#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/left_norm_input/scale#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/left_norm_input/scale#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/bias 512 v 2 4 128 0 128 1 extra_stack_haiku_0071 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/bias#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/bias#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/bias#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/weights 65536 v 3 4 128 128 0 16384 128 1 extra_stack_haiku_0072 0 16384 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/weights#r 3
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/weights#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/weights#1 128
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/output_projection/weights#2 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/bias 1024 v 2 4 128 0 256 1 extra_stack_haiku_0069 0 128 1
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/bias 1024 v 2 4 128 128 256 1 extra_stack_haiku_0075 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/bias#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/bias#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/bias#1 256
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/weights 131072 v 3 4 128 128 0 32768 256 1 extra_stack_haiku_0070 0 16384 128 1
+p w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/weights 131072 v 3 4 128 128 128 32768 256 1 extra_stack_haiku_0076 0 16384 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/weights#r 3
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/weights#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/weights#1 128
+m w/evoformer/extra_msa_stack/triangle_multiplication_incoming/projection/weights#2 256
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/center_norm/offset 512 v 2 4 128 0 128 1 extra_stack_haiku_0077 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/center_norm/offset#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/center_norm/offset#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/center_norm/offset#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/center_norm/scale 512 v 2 4 128 0 128 1 extra_stack_haiku_0078 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/center_norm/scale#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/center_norm/scale#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/center_norm/scale#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/bias 1024 v 2 4 128 0 256 1 extra_stack_haiku_0083 0 128 1
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/bias 1024 v 2 4 128 128 256 1 extra_stack_haiku_0089 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/bias#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/bias#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/bias#1 256
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/weights 131072 v 3 4 128 128 0 32768 256 1 extra_stack_haiku_0084 0 16384 128 1
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/weights 131072 v 3 4 128 128 128 32768 256 1 extra_stack_haiku_0090 0 16384 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/weights#r 3
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/weights#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/weights#1 128
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gate/weights#2 256
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/bias 512 v 2 4 128 0 128 1 extra_stack_haiku_0079 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/bias#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/bias#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/bias#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/weights 65536 v 3 4 128 128 0 16384 128 1 extra_stack_haiku_0080 0 16384 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/weights#r 3
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/weights#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/weights#1 128
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/gating_linear/weights#2 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/left_norm_input/offset 512 v 2 4 128 0 128 1 extra_stack_haiku_0081 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/left_norm_input/offset#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/left_norm_input/offset#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/left_norm_input/offset#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/left_norm_input/scale 512 v 2 4 128 0 128 1 extra_stack_haiku_0082 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/left_norm_input/scale#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/left_norm_input/scale#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/left_norm_input/scale#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/bias 512 v 2 4 128 0 128 1 extra_stack_haiku_0087 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/bias#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/bias#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/bias#1 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/weights 65536 v 3 4 128 128 0 16384 128 1 extra_stack_haiku_0088 0 16384 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/weights#r 3
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/weights#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/weights#1 128
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/output_projection/weights#2 128
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/bias 1024 v 2 4 128 0 256 1 extra_stack_haiku_0085 0 128 1
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/bias 1024 v 2 4 128 128 256 1 extra_stack_haiku_0091 0 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/bias#r 2
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/bias#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/bias#1 256
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/weights 131072 v 3 4 128 128 0 32768 256 1 extra_stack_haiku_0086 0 16384 128 1
+p w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/weights 131072 v 3 4 128 128 128 32768 256 1 extra_stack_haiku_0092 0 16384 128 1
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/weights#r 3
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/weights#0 4
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/weights#1 128
+m w/evoformer/extra_msa_stack/triangle_multiplication_outgoing/projection/weights#2 256
+p w/evoformer/left_single/bias 128 v 1 128 0 1 embedding_haiku_0002 0 1
+m w/evoformer/left_single/bias#r 1
+m w/evoformer/left_single/bias#0 128
+p w/evoformer/left_single/weights 2688 v 2 21 128 0 128 1 embedding_haiku_0003 128 128 1
+m w/evoformer/left_single/weights#r 2
+m w/evoformer/left_single/weights#0 21
+m w/evoformer/left_single/weights#1 128
+p w/evoformer/preprocess_1d/bias 256 v 1 256 0 1 embedding_haiku_0006 0 1
+m w/evoformer/preprocess_1d/bias#r 1
+m w/evoformer/preprocess_1d/bias#0 256
+p w/evoformer/preprocess_1d/weights 5376 v 2 21 256 0 256 1 embedding_haiku_0007 256 256 1
+m w/evoformer/preprocess_1d/weights#r 2
+m w/evoformer/preprocess_1d/weights#0 21
+m w/evoformer/preprocess_1d/weights#1 256
+p w/evoformer/preprocess_msa/bias 256 v 1 256 0 1 embedding_haiku_0008 0 1
+m w/evoformer/preprocess_msa/bias#r 1
+m w/evoformer/preprocess_msa/bias#0 256
+p w/evoformer/preprocess_msa/weights 12544 v 2 49 256 0 256 1 embedding_haiku_0009 0 256 1
+m w/evoformer/preprocess_msa/weights#r 2
+m w/evoformer/preprocess_msa/weights#0 49
+m w/evoformer/preprocess_msa/weights#1 256
+p w/evoformer/prev_msa_first_row_norm/offset 256 v 1 256 0 1 embedding_haiku_0010 0 1
+m w/evoformer/prev_msa_first_row_norm/offset#r 1
+m w/evoformer/prev_msa_first_row_norm/offset#0 256
+p w/evoformer/prev_msa_first_row_norm/scale 256 v 1 256 0 1 embedding_haiku_0011 0 1
+m w/evoformer/prev_msa_first_row_norm/scale#r 1
+m w/evoformer/prev_msa_first_row_norm/scale#0 256
+p w/evoformer/prev_pair_norm/offset 128 v 1 128 0 1 embedding_haiku_0012 0 1
+m w/evoformer/prev_pair_norm/offset#r 1
+m w/evoformer/prev_pair_norm/offset#0 128
+p w/evoformer/prev_pair_norm/scale 128 v 1 128 0 1 embedding_haiku_0013 0 1
+m w/evoformer/prev_pair_norm/scale#r 1
+m w/evoformer/prev_pair_norm/scale#0 128
+p w/evoformer/prev_pos_linear/bias 128 v 1 128 0 1 embedding_haiku_0014 0 1
+m w/evoformer/prev_pos_linear/bias#r 1
+m w/evoformer/prev_pos_linear/bias#0 128
+p w/evoformer/prev_pos_linear/weights 1920 v 2 15 128 0 128 1 embedding_haiku_0015 0 128 1
+m w/evoformer/prev_pos_linear/weights#r 2
+m w/evoformer/prev_pos_linear/weights#0 15
+m w/evoformer/prev_pos_linear/weights#1 128
+p w/evoformer/right_single/bias 128 v 1 128 0 1 embedding_haiku_0016 0 1
+m w/evoformer/right_single/bias#r 1
+m w/evoformer/right_single/bias#0 128
+p w/evoformer/right_single/weights 2688 v 2 21 128 0 128 1 embedding_haiku_0017 128 128 1
+m w/evoformer/right_single/weights#r 2
+m w/evoformer/right_single/weights#0 21
+m w/evoformer/right_single/weights#1 128
+p w/evoformer/single_activations/bias 384 v 1 384 0 1 embedding_haiku_0018 0 1
+m w/evoformer/single_activations/bias#r 1
+m w/evoformer/single_activations/bias#0 384
+p w/evoformer/single_activations/weights 98304 v 2 256 384 0 384 1 embedding_haiku_0019 0 384 1
+m w/evoformer/single_activations/weights#r 2
+m w/evoformer/single_activations/weights#0 256
+m w/evoformer/single_activations/weights#1 384
+p w/evoformer/template_embedding/output_linear/bias 128 v 1 128 0 1 template_haiku_0000 0 1
+m w/evoformer/template_embedding/output_linear/bias#r 1
+m w/evoformer/template_embedding/output_linear/bias#0 128
+p w/evoformer/template_embedding/output_linear/weights 8192 v 2 64 128 0 128 1 template_haiku_0001 0 128 1
+m w/evoformer/template_embedding/output_linear/weights#r 2
+m w/evoformer/template_embedding/output_linear/weights#0 64
+m w/evoformer/template_embedding/output_linear/weights#1 128
+p w/evoformer/template_embedding/single_template_embedding/output_layer_norm/offset 64 v 1 64 0 1 template_haiku_0002 0 1
+m w/evoformer/template_embedding/single_template_embedding/output_layer_norm/offset#r 1
+m w/evoformer/template_embedding/single_template_embedding/output_layer_norm/offset#0 64
+p w/evoformer/template_embedding/single_template_embedding/output_layer_norm/scale 64 v 1 64 0 1 template_haiku_0003 0 1
+m w/evoformer/template_embedding/single_template_embedding/output_layer_norm/scale#r 1
+m w/evoformer/template_embedding/single_template_embedding/output_layer_norm/scale#0 64
+p w/evoformer/template_embedding/single_template_embedding/query_embedding_norm/offset 128 v 1 128 0 1 template_haiku_0004 0 1
+m w/evoformer/template_embedding/single_template_embedding/query_embedding_norm/offset#r 1
+m w/evoformer/template_embedding/single_template_embedding/query_embedding_norm/offset#0 128
+p w/evoformer/template_embedding/single_template_embedding/query_embedding_norm/scale 128 v 1 128 0 1 template_haiku_0005 0 1
+m w/evoformer/template_embedding/single_template_embedding/query_embedding_norm/scale#r 1
+m w/evoformer/template_embedding/single_template_embedding/query_embedding_norm/scale#0 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/input_layer_norm/offset 128 v 2 2 64 0 64 1 template_haiku_0006 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/input_layer_norm/offset#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/input_layer_norm/offset#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/input_layer_norm/offset#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/input_layer_norm/scale 128 v 2 2 64 0 64 1 template_haiku_0007 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/input_layer_norm/scale#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/input_layer_norm/scale#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/input_layer_norm/scale#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/bias 256 v 2 2 128 0 128 1 template_haiku_0008 0 128 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/bias#1 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/weights 16384 v 3 2 64 128 0 8192 128 1 template_haiku_0009 0 8192 128 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition1/weights#2 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/bias 128 v 2 2 64 0 64 1 template_haiku_0010 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/bias#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/weights 16384 v 3 2 128 64 0 8192 64 1 template_haiku_0011 0 8192 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/weights#1 128
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/pair_transition/transition2/weights#2 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/feat_2d_weights 512 v 3 2 64 4 0 256 4 1 template_haiku_0012 0 256 4 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/feat_2d_weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/feat_2d_weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/feat_2d_weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/feat_2d_weights#2 4
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_b 128 v 3 2 4 16 0 64 16 1 template_haiku_0013 0 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_b#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_b#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_b#1 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_b#2 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_w 8192 v 4 2 64 4 16 0 4096 64 16 1 template_haiku_0014 0 4096 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_w#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_w#2 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/gating_w#3 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/key_w 8192 v 4 2 64 4 16 0 4096 64 16 1 template_haiku_0015 0 4096 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/key_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/key_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/key_w#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/key_w#2 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/key_w#3 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_b 128 v 2 2 64 0 64 1 template_haiku_0016 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_b#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_b#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_b#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_w 8192 v 4 2 4 16 64 0 4096 1024 64 1 template_haiku_0017 0 4096 1024 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_w#1 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_w#2 16
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/output_w#3 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/query_w 8192 v 4 2 64 4 16 0 4096 64 16 1 template_haiku_0018 0 4096 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/query_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/query_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/query_w#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/query_w#2 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/query_w#3 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/value_w 8192 v 4 2 64 4 16 0 4096 64 16 1 template_haiku_0019 0 4096 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/value_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/value_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/value_w#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/value_w#2 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/attention/value_w#3 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/query_norm/offset 128 v 2 2 64 0 64 1 template_haiku_0020 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/query_norm/offset#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/query_norm/offset#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/query_norm/offset#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/query_norm/scale 128 v 2 2 64 0 64 1 template_haiku_0021 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/query_norm/scale#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/query_norm/scale#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_ending_node/query_norm/scale#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/feat_2d_weights 512 v 3 2 64 4 0 256 4 1 template_haiku_0022 0 256 4 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/feat_2d_weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/feat_2d_weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/feat_2d_weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/feat_2d_weights#2 4
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_b 128 v 3 2 4 16 0 64 16 1 template_haiku_0023 0 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_b#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_b#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_b#1 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_b#2 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_w 8192 v 4 2 64 4 16 0 4096 64 16 1 template_haiku_0024 0 4096 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_w#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_w#2 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/gating_w#3 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/key_w 8192 v 4 2 64 4 16 0 4096 64 16 1 template_haiku_0025 0 4096 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/key_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/key_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/key_w#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/key_w#2 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/key_w#3 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_b 128 v 2 2 64 0 64 1 template_haiku_0026 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_b#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_b#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_b#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_w 8192 v 4 2 4 16 64 0 4096 1024 64 1 template_haiku_0027 0 4096 1024 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_w#1 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_w#2 16
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/output_w#3 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/query_w 8192 v 4 2 64 4 16 0 4096 64 16 1 template_haiku_0028 0 4096 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/query_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/query_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/query_w#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/query_w#2 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/query_w#3 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/value_w 8192 v 4 2 64 4 16 0 4096 64 16 1 template_haiku_0029 0 4096 64 16 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/value_w#r 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/value_w#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/value_w#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/value_w#2 4
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/attention/value_w#3 16
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/query_norm/offset 128 v 2 2 64 0 64 1 template_haiku_0030 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/query_norm/offset#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/query_norm/offset#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/query_norm/offset#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/query_norm/scale 128 v 2 2 64 0 64 1 template_haiku_0031 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/query_norm/scale#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/query_norm/scale#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_attention_starting_node/query_norm/scale#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/center_norm/offset 128 v 2 2 64 0 64 1 template_haiku_0032 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/center_norm/offset#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/center_norm/offset#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/center_norm/offset#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/center_norm/scale 128 v 2 2 64 0 64 1 template_haiku_0033 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/center_norm/scale#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/center_norm/scale#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/center_norm/scale#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/bias 256 v 2 2 64 0 128 1 template_haiku_0038 0 64 1
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/bias 256 v 2 2 64 64 128 1 template_haiku_0044 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/bias#1 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/weights 16384 v 3 2 64 64 0 8192 128 1 template_haiku_0039 0 4096 64 1
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/weights 16384 v 3 2 64 64 64 8192 128 1 template_haiku_0045 0 4096 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gate/weights#2 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/bias 128 v 2 2 64 0 64 1 template_haiku_0034 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/bias#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/weights 8192 v 3 2 64 64 0 4096 64 1 template_haiku_0035 0 4096 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/gating_linear/weights#2 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/left_norm_input/offset 128 v 2 2 64 0 64 1 template_haiku_0036 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/left_norm_input/offset#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/left_norm_input/offset#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/left_norm_input/offset#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/left_norm_input/scale 128 v 2 2 64 0 64 1 template_haiku_0037 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/left_norm_input/scale#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/left_norm_input/scale#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/left_norm_input/scale#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/bias 128 v 2 2 64 0 64 1 template_haiku_0042 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/bias#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/weights 8192 v 3 2 64 64 0 4096 64 1 template_haiku_0043 0 4096 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/output_projection/weights#2 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/bias 256 v 2 2 64 0 128 1 template_haiku_0040 0 64 1
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/bias 256 v 2 2 64 64 128 1 template_haiku_0046 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/bias#1 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/weights 16384 v 3 2 64 64 0 8192 128 1 template_haiku_0041 0 4096 64 1
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/weights 16384 v 3 2 64 64 64 8192 128 1 template_haiku_0047 0 4096 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_incoming/projection/weights#2 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/center_norm/offset 128 v 2 2 64 0 64 1 template_haiku_0048 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/center_norm/offset#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/center_norm/offset#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/center_norm/offset#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/center_norm/scale 128 v 2 2 64 0 64 1 template_haiku_0049 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/center_norm/scale#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/center_norm/scale#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/center_norm/scale#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/bias 256 v 2 2 64 0 128 1 template_haiku_0054 0 64 1
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/bias 256 v 2 2 64 64 128 1 template_haiku_0060 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/bias#1 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/weights 16384 v 3 2 64 64 0 8192 128 1 template_haiku_0055 0 4096 64 1
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/weights 16384 v 3 2 64 64 64 8192 128 1 template_haiku_0061 0 4096 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gate/weights#2 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/bias 128 v 2 2 64 0 64 1 template_haiku_0050 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/bias#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/weights 8192 v 3 2 64 64 0 4096 64 1 template_haiku_0051 0 4096 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/gating_linear/weights#2 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/left_norm_input/offset 128 v 2 2 64 0 64 1 template_haiku_0052 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/left_norm_input/offset#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/left_norm_input/offset#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/left_norm_input/offset#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/left_norm_input/scale 128 v 2 2 64 0 64 1 template_haiku_0053 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/left_norm_input/scale#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/left_norm_input/scale#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/left_norm_input/scale#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/bias 128 v 2 2 64 0 64 1 template_haiku_0058 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/bias#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/weights 8192 v 3 2 64 64 0 4096 64 1 template_haiku_0059 0 4096 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/output_projection/weights#2 64
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/bias 256 v 2 2 64 0 128 1 template_haiku_0056 0 64 1
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/bias 256 v 2 2 64 64 128 1 template_haiku_0062 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/bias#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/bias#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/bias#1 128
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/weights 16384 v 3 2 64 64 0 8192 128 1 template_haiku_0057 0 4096 64 1
+p w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/weights 16384 v 3 2 64 64 64 8192 128 1 template_haiku_0063 0 4096 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/weights#r 3
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/weights#0 2
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/weights#1 64
+m w/evoformer/template_embedding/single_template_embedding/template_embedding_iteration/triangle_multiplication_outgoing/projection/weights#2 128
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_0/bias 64 v 1 64 0 1 template_haiku_0064 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_0/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_0/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_0/weights 2496 v 2 39 64 0 64 1 template_haiku_0065 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_0/weights#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_0/weights#0 39
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_0/weights#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_1/bias 64 v 1 64 0 1 template_haiku_0066 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_1/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_1/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_1/weights 64 v 1 64 0 1 template_haiku_0067 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_1/weights#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_1/weights#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_2/bias 64 v 1 64 0 1 template_haiku_0068 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_2/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_2/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_2/weights 1408 v 2 22 64 0 64 1 template_haiku_0069 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_2/weights#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_2/weights#0 22
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_2/weights#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_3/bias 64 v 1 64 0 1 template_haiku_0070 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_3/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_3/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_3/weights 1408 v 2 22 64 0 64 1 template_haiku_0071 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_3/weights#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_3/weights#0 22
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_3/weights#1 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_4/bias 64 v 1 64 0 1 template_haiku_0072 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_4/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_4/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_4/weights 64 v 1 64 0 1 template_haiku_0073 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_4/weights#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_4/weights#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_5/bias 64 v 1 64 0 1 template_haiku_0074 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_5/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_5/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_5/weights 64 v 1 64 0 1 template_haiku_0075 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_5/weights#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_5/weights#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_6/bias 64 v 1 64 0 1 template_haiku_0076 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_6/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_6/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_6/weights 64 v 1 64 0 1 template_haiku_0077 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_6/weights#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_6/weights#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_7/bias 64 v 1 64 0 1 template_haiku_0078 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_7/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_7/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_7/weights 64 v 1 64 0 1 template_haiku_0079 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_7/weights#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_7/weights#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_8/bias 64 v 1 64 0 1 template_haiku_0080 0 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_8/bias#r 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_8/bias#0 64
+p w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_8/weights 8192 v 2 128 64 0 64 1 template_haiku_0081 0 64 1
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_8/weights#r 2
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_8/weights#0 128
+m w/evoformer/template_embedding/single_template_embedding/template_pair_embedding_8/weights#1 64
+p w/evoformer/template_projection/bias 256 v 1 256 0 1 template_haiku_0082 0 1
+m w/evoformer/template_projection/bias#r 1
+m w/evoformer/template_projection/bias#0 256
+p w/evoformer/template_projection/weights 65536 v 2 256 256 0 256 1 template_haiku_0083 0 256 1
+m w/evoformer/template_projection/weights#r 2
+m w/evoformer/template_projection/weights#0 256
+m w/evoformer/template_projection/weights#1 256
+p w/evoformer/template_single_embedding/bias 256 v 1 256 0 1 template_haiku_0084 0 1
+m w/evoformer/template_single_embedding/bias#r 1
+m w/evoformer/template_single_embedding/bias#0 256
+p w/evoformer/template_single_embedding/weights 8704 v 2 34 256 0 256 1 template_haiku_0085 0 256 1
+m w/evoformer/template_single_embedding/weights#r 2
+m w/evoformer/template_single_embedding/weights#0 34
+m w/evoformer/template_single_embedding/weights#1 256
+p w/evoformer/~_relative_encoding/position_activations/bias 128 v 1 128 0 1 embedding_haiku_0004 0 1
+m w/evoformer/~_relative_encoding/position_activations/bias#r 1
+m w/evoformer/~_relative_encoding/position_activations/bias#0 128
+p w/evoformer/~_relative_encoding/position_activations/weights 9344 v 2 73 128 0 128 1 embedding_haiku_0005 0 128 1
+m w/evoformer/~_relative_encoding/position_activations/weights#r 2
+m w/evoformer/~_relative_encoding/position_activations/weights#0 73
+m w/evoformer/~_relative_encoding/position_activations/weights#1 128
+p w/predicted_aligned_error_head/logits/bias 64 v 1 64 0 1 confidence_haiku_0008 0 1
+m w/predicted_aligned_error_head/logits/bias#r 1
+m w/predicted_aligned_error_head/logits/bias#0 64
+p w/predicted_aligned_error_head/logits/weights 8192 v 2 128 64 0 64 1 confidence_haiku_0009 0 64 1
+m w/predicted_aligned_error_head/logits/weights#r 2
+m w/predicted_aligned_error_head/logits/weights#0 128
+m w/predicted_aligned_error_head/logits/weights#1 64
+p w/predicted_lddt_head/act_0/bias 128 v 1 128 0 1 confidence_haiku_0000 0 1
+m w/predicted_lddt_head/act_0/bias#r 1
+m w/predicted_lddt_head/act_0/bias#0 128
+p w/predicted_lddt_head/act_0/weights 49152 v 2 384 128 0 128 1 confidence_haiku_0001 0 128 1
+m w/predicted_lddt_head/act_0/weights#r 2
+m w/predicted_lddt_head/act_0/weights#0 384
+m w/predicted_lddt_head/act_0/weights#1 128
+p w/predicted_lddt_head/act_1/bias 128 v 1 128 0 1 confidence_haiku_0002 0 1
+m w/predicted_lddt_head/act_1/bias#r 1
+m w/predicted_lddt_head/act_1/bias#0 128
+p w/predicted_lddt_head/act_1/weights 16384 v 2 128 128 0 128 1 confidence_haiku_0003 0 128 1
+m w/predicted_lddt_head/act_1/weights#r 2
+m w/predicted_lddt_head/act_1/weights#0 128
+m w/predicted_lddt_head/act_1/weights#1 128
+p w/predicted_lddt_head/input_layer_norm/offset 384 v 1 384 0 1 confidence_haiku_0004 0 1
+m w/predicted_lddt_head/input_layer_norm/offset#r 1
+m w/predicted_lddt_head/input_layer_norm/offset#0 384
+p w/predicted_lddt_head/input_layer_norm/scale 384 v 1 384 0 1 confidence_haiku_0005 0 1
+m w/predicted_lddt_head/input_layer_norm/scale#r 1
+m w/predicted_lddt_head/input_layer_norm/scale#0 384
+p w/predicted_lddt_head/logits/bias 50 v 1 50 0 1 confidence_haiku_0006 0 1
+m w/predicted_lddt_head/logits/bias#r 1
+m w/predicted_lddt_head/logits/bias#0 50
+p w/predicted_lddt_head/logits/weights 6400 v 2 128 50 0 50 1 confidence_haiku_0007 0 50 1
+m w/predicted_lddt_head/logits/weights#r 2
+m w/predicted_lddt_head/logits/weights#0 128
+m w/predicted_lddt_head/logits/weights#1 50
+p w/structure_module/fold_iteration/attention_layer_norm/offset 384 v 1 384 0 1 structure_haiku_0002 0 1
+m w/structure_module/fold_iteration/attention_layer_norm/offset#r 1
+m w/structure_module/fold_iteration/attention_layer_norm/offset#0 384
+p w/structure_module/fold_iteration/attention_layer_norm/scale 384 v 1 384 0 1 structure_haiku_0003 0 1
+m w/structure_module/fold_iteration/attention_layer_norm/scale#r 1
+m w/structure_module/fold_iteration/attention_layer_norm/scale#0 384
+p w/structure_module/fold_iteration/invariant_point_attention/trainable_point_weights 12 v 1 12 0 1 structure_haiku_0004 0 1
+m w/structure_module/fold_iteration/invariant_point_attention/trainable_point_weights#r 1
+m w/structure_module/fold_iteration/invariant_point_attention/trainable_point_weights#0 12
+p w/structure_module/fold_iteration/invariant_point_attention/attention_2d/bias 12 v 1 12 0 1 structure_haiku_0005 0 1
+m w/structure_module/fold_iteration/invariant_point_attention/attention_2d/bias#r 1
+m w/structure_module/fold_iteration/invariant_point_attention/attention_2d/bias#0 12
+p w/structure_module/fold_iteration/invariant_point_attention/attention_2d/weights 1536 v 2 128 12 0 12 1 structure_haiku_0006 0 12 1
+m w/structure_module/fold_iteration/invariant_point_attention/attention_2d/weights#r 2
+m w/structure_module/fold_iteration/invariant_point_attention/attention_2d/weights#0 128
+m w/structure_module/fold_iteration/invariant_point_attention/attention_2d/weights#1 12
+p w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/bias 144 v 3 12 3 4 0 12 4 1 structure_haiku_0007 0 12 144 1
+m w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/bias#r 2
+m w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/bias#0 12
+m w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/bias#1 12
+p w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/weights 55296 v 4 384 12 3 4 0 144 12 4 1 structure_haiku_0008 0 432 12 144 1
+m w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/weights#r 3
+m w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/weights#0 384
+m w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/weights#1 12
+m w/structure_module/fold_iteration/invariant_point_attention/k_point_projection/point_projection/weights#2 12
+z w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/bias 192
+m w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/bias#r 2
+m w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/bias#0 12
+m w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/bias#1 16
+p w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/weights 73728 v 3 384 12 16 0 192 16 1 structure_haiku_0010 0 384 32 1
+m w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/weights#r 3
+m w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/weights#0 384
+m w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/weights#1 12
+m w/structure_module/fold_iteration/invariant_point_attention/k_scalar_projection/weights#2 16
+p w/structure_module/fold_iteration/invariant_point_attention/output_projection/bias 384 v 1 384 0 1 structure_haiku_0011 0 1
+m w/structure_module/fold_iteration/invariant_point_attention/output_projection/bias#r 1
+m w/structure_module/fold_iteration/invariant_point_attention/output_projection/bias#0 384
+p w/structure_module/fold_iteration/invariant_point_attention/output_projection/weights 811008 v 2 2112 384 0 384 1 structure_haiku_0012 0 384 1
+m w/structure_module/fold_iteration/invariant_point_attention/output_projection/weights#r 2
+m w/structure_module/fold_iteration/invariant_point_attention/output_projection/weights#0 2112
+m w/structure_module/fold_iteration/invariant_point_attention/output_projection/weights#1 384
+p w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/bias 144 v 3 12 3 4 0 12 4 1 structure_haiku_0013 0 4 48 1
+m w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/bias#r 2
+m w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/bias#0 12
+m w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/bias#1 12
+p w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/weights 55296 v 4 384 12 3 4 0 144 12 4 1 structure_haiku_0014 0 144 4 48 1
+m w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/weights#r 3
+m w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/weights#0 384
+m w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/weights#1 12
+m w/structure_module/fold_iteration/invariant_point_attention/q_point_projection/point_projection/weights#2 12
+z w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/bias 192
+m w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/bias#r 2
+m w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/bias#0 12
+m w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/bias#1 16
+p w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/weights 73728 v 3 384 12 16 0 192 16 1 structure_haiku_0016 0 192 16 1
+m w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/weights#r 3
+m w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/weights#0 384
+m w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/weights#1 12
+m w/structure_module/fold_iteration/invariant_point_attention/q_scalar_projection/weights#2 16
+p w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/bias 288 v 3 12 3 8 0 24 8 1 structure_haiku_0007 4 12 144 1
+m w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/bias#r 2
+m w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/bias#0 12
+m w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/bias#1 24
+p w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/weights 110592 v 4 384 12 3 8 0 288 24 8 1 structure_haiku_0008 4 432 12 144 1
+m w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/weights#r 3
+m w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/weights#0 384
+m w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/weights#1 12
+m w/structure_module/fold_iteration/invariant_point_attention/v_point_projection/point_projection/weights#2 24
+z w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/bias 192
+m w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/bias#r 2
+m w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/bias#0 12
+m w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/bias#1 16
+p w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/weights 73728 v 3 384 12 16 0 192 16 1 structure_haiku_0010 16 384 32 1
+m w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/weights#r 3
+m w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/weights#0 384
+m w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/weights#1 12
+m w/structure_module/fold_iteration/invariant_point_attention/v_scalar_projection/weights#2 16
+p w/structure_module/fold_iteration/quat_rigid/rigid/bias 6 v 1 6 0 1 structure_haiku_0000 0 1
+m w/structure_module/fold_iteration/quat_rigid/rigid/bias#r 1
+m w/structure_module/fold_iteration/quat_rigid/rigid/bias#0 6
+p w/structure_module/fold_iteration/quat_rigid/rigid/weights 2304 v 2 384 6 0 6 1 structure_haiku_0001 0 6 1
+m w/structure_module/fold_iteration/quat_rigid/rigid/weights#r 2
+m w/structure_module/fold_iteration/quat_rigid/rigid/weights#0 384
+m w/structure_module/fold_iteration/quat_rigid/rigid/weights#1 6
+p w/structure_module/fold_iteration/rigid_sidechain/input_projection/bias 128 v 1 128 0 1 structure_haiku_0017 0 1
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection/bias#r 1
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection/bias#0 128
+p w/structure_module/fold_iteration/rigid_sidechain/input_projection/weights 49152 v 2 384 128 0 128 1 structure_haiku_0018 0 128 1
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection/weights#r 2
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection/weights#0 384
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection/weights#1 128
+p w/structure_module/fold_iteration/rigid_sidechain/input_projection_1/bias 128 v 1 128 0 1 structure_haiku_0019 0 1
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection_1/bias#r 1
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection_1/bias#0 128
+p w/structure_module/fold_iteration/rigid_sidechain/input_projection_1/weights 49152 v 2 384 128 0 128 1 structure_haiku_0020 0 128 1
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection_1/weights#r 2
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection_1/weights#0 384
+m w/structure_module/fold_iteration/rigid_sidechain/input_projection_1/weights#1 128
+p w/structure_module/fold_iteration/rigid_sidechain/resblock1/bias 128 v 1 128 0 1 structure_haiku_0021 0 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1/bias#r 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1/bias#0 128
+p w/structure_module/fold_iteration/rigid_sidechain/resblock1/weights 16384 v 2 128 128 0 128 1 structure_haiku_0022 0 128 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1/weights#r 2
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1/weights#0 128
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1/weights#1 128
+p w/structure_module/fold_iteration/rigid_sidechain/resblock1_1/bias 128 v 1 128 0 1 structure_haiku_0023 0 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1_1/bias#r 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1_1/bias#0 128
+p w/structure_module/fold_iteration/rigid_sidechain/resblock1_1/weights 16384 v 2 128 128 0 128 1 structure_haiku_0024 0 128 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1_1/weights#r 2
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1_1/weights#0 128
+m w/structure_module/fold_iteration/rigid_sidechain/resblock1_1/weights#1 128
+p w/structure_module/fold_iteration/rigid_sidechain/resblock2/bias 128 v 1 128 0 1 structure_haiku_0025 0 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2/bias#r 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2/bias#0 128
+p w/structure_module/fold_iteration/rigid_sidechain/resblock2/weights 16384 v 2 128 128 0 128 1 structure_haiku_0026 0 128 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2/weights#r 2
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2/weights#0 128
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2/weights#1 128
+p w/structure_module/fold_iteration/rigid_sidechain/resblock2_1/bias 128 v 1 128 0 1 structure_haiku_0027 0 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2_1/bias#r 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2_1/bias#0 128
+p w/structure_module/fold_iteration/rigid_sidechain/resblock2_1/weights 16384 v 2 128 128 0 128 1 structure_haiku_0028 0 128 1
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2_1/weights#r 2
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2_1/weights#0 128
+m w/structure_module/fold_iteration/rigid_sidechain/resblock2_1/weights#1 128
+p w/structure_module/fold_iteration/rigid_sidechain/unnormalized_angles/bias 14 v 1 14 0 1 structure_haiku_0029 0 1
+m w/structure_module/fold_iteration/rigid_sidechain/unnormalized_angles/bias#r 1
+m w/structure_module/fold_iteration/rigid_sidechain/unnormalized_angles/bias#0 14
+p w/structure_module/fold_iteration/rigid_sidechain/unnormalized_angles/weights 1792 v 2 128 14 0 14 1 structure_haiku_0030 0 14 1
+m w/structure_module/fold_iteration/rigid_sidechain/unnormalized_angles/weights#r 2
+m w/structure_module/fold_iteration/rigid_sidechain/unnormalized_angles/weights#0 128
+m w/structure_module/fold_iteration/rigid_sidechain/unnormalized_angles/weights#1 14
+p w/structure_module/fold_iteration/transition/bias 384 v 1 384 0 1 structure_haiku_0031 0 1
+m w/structure_module/fold_iteration/transition/bias#r 1
+m w/structure_module/fold_iteration/transition/bias#0 384
+p w/structure_module/fold_iteration/transition/weights 147456 v 2 384 384 0 384 1 structure_haiku_0032 0 384 1
+m w/structure_module/fold_iteration/transition/weights#r 2
+m w/structure_module/fold_iteration/transition/weights#0 384
+m w/structure_module/fold_iteration/transition/weights#1 384
+p w/structure_module/fold_iteration/transition_1/bias 384 v 1 384 0 1 structure_haiku_0033 0 1
+m w/structure_module/fold_iteration/transition_1/bias#r 1
+m w/structure_module/fold_iteration/transition_1/bias#0 384
+p w/structure_module/fold_iteration/transition_1/weights 147456 v 2 384 384 0 384 1 structure_haiku_0034 0 384 1
+m w/structure_module/fold_iteration/transition_1/weights#r 2
+m w/structure_module/fold_iteration/transition_1/weights#0 384
+m w/structure_module/fold_iteration/transition_1/weights#1 384
+p w/structure_module/fold_iteration/transition_2/bias 384 v 1 384 0 1 structure_haiku_0035 0 1
+m w/structure_module/fold_iteration/transition_2/bias#r 1
+m w/structure_module/fold_iteration/transition_2/bias#0 384
+p w/structure_module/fold_iteration/transition_2/weights 147456 v 2 384 384 0 384 1 structure_haiku_0036 0 384 1
+m w/structure_module/fold_iteration/transition_2/weights#r 2
+m w/structure_module/fold_iteration/transition_2/weights#0 384
+m w/structure_module/fold_iteration/transition_2/weights#1 384
+p w/structure_module/fold_iteration/transition_layer_norm/offset 384 v 1 384 0 1 structure_haiku_0037 0 1
+m w/structure_module/fold_iteration/transition_layer_norm/offset#r 1
+m w/structure_module/fold_iteration/transition_layer_norm/offset#0 384
+p w/structure_module/fold_iteration/transition_layer_norm/scale 384 v 1 384 0 1 structure_haiku_0038 0 1
+m w/structure_module/fold_iteration/transition_layer_norm/scale#r 1
+m w/structure_module/fold_iteration/transition_layer_norm/scale#0 384
+p w/structure_module/initial_projection/bias 384 v 1 384 0 1 structure_haiku_0039 0 1
+m w/structure_module/initial_projection/bias#r 1
+m w/structure_module/initial_projection/bias#0 384
+p w/structure_module/initial_projection/weights 147456 v 2 384 384 0 384 1 structure_haiku_0040 0 384 1
+m w/structure_module/initial_projection/weights#r 2
+m w/structure_module/initial_projection/weights#0 384
+m w/structure_module/initial_projection/weights#1 384
+p w/structure_module/pair_layer_norm/offset 128 v 1 128 0 1 structure_haiku_0041 0 1
+m w/structure_module/pair_layer_norm/offset#r 1
+m w/structure_module/pair_layer_norm/offset#0 128
+p w/structure_module/pair_layer_norm/scale 128 v 1 128 0 1 structure_haiku_0042 0 1
+m w/structure_module/pair_layer_norm/scale#r 1
+m w/structure_module/pair_layer_norm/scale#0 128
+p w/structure_module/single_layer_norm/offset 384 v 1 384 0 1 structure_haiku_0043 0 1
+m w/structure_module/single_layer_norm/offset#r 1
+m w/structure_module/single_layer_norm/offset#0 384
+p w/structure_module/single_layer_norm/scale 384 v 1 384 0 1 structure_haiku_0044 0 1
+m w/structure_module/single_layer_norm/scale#r 1
+m w/structure_module/single_layer_norm/scale#0 384
+p c/rigid_group_default_frame 2688 v 1 2688 0 1 geometryDefaultFrames 0 1
+p c/atom14_to_rigid_group 294 i 1 294 0 1 geometryAtom14ToGroup 0 1
+p c/atom14_rigid_group_positions 882 v 1 882 0 1 geometryAtom14Positions 0 1
+p c/atom14_mask 294 v 1 294 0 1 geometryAtom14Mask 0 1
+p c/atom37_to_atom14 777 i 1 777 0 1 geometryAtom37ToAtom14 0 1
+p c/atom37_mask 777 v 1 777 0 1 geometryAtom37Mask 0 1
+m meta/multimer 1
+m meta/position_scale 20.0
+m meta/opm_first 1

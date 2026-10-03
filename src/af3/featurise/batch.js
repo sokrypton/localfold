@@ -45,6 +45,8 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
     : af3MsaFromA3m(alignment, {
       maxSequences: options.maxSequences,
+      // an alignment over nucleic chains too: each column's alphabet (see af3MsaFromA3m)
+      ...(options.msaColumnKinds === undefined ? {} : { columnKinds: options.msaColumnKinds }),
       // 🔴 SEEDED FROM THE FOLD'S OWN SEED, so a subsample is part of what a
       // seed names. AF3 draws its shuffle from the same key that drives the
       // rest of the model; here two seeds are two alignments as well as two
@@ -111,6 +113,8 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     // boundary, is what stops a caller getting it backwards.
     ...(options.dedupeSelfMsa === undefined
       ? {} : { duplicateQueryRow: options.dedupeSelfMsa === false }),
+    // ...and the featuriser told its columns cover every polymer residue, not the protein ones alone
+    ...(options.msaColumnKinds?.some((kind) => kind !== "protein") ? { msaCoversNucleic: true } : {}),
     msa: rows.msa,
     deletionMatrix: rows.deletionMatrix,
     unpairedFrom: rows.unpairedFrom,

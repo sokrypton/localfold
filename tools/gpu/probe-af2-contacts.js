@@ -33,6 +33,11 @@
  * real contacts at the very top, which a transposed matrix cannot do; it does
  * not say the head is calibrated. Run it with a real alignment for that.
  *
+ * 🔴 AND IT HOLDS THE DEVICE'S MAP TO THIS HOST FUNCTION. The page asks
+ * monomer.js for `contacts` and the probabilities come from
+ * src/heads/distogram-webgpu.js; every pass here asserts the two agree
+ * (`deviceMaxAbsDiff`, bar 1e-4), so the AUC above scores both.
+ *
  * 🔴 AND THE DIAGONAL IS EXCLUDED. Neighbours are in contact in any chain,
  * folded or not, so scoring them inflates every number and would hide exactly
  * the failure this is looking for. |i - j| >= 6, the usual short-range cut.
@@ -115,7 +120,7 @@ export async function main(device, args) {
     // the confidence heads no longer round-trip - and this is the same request
     // web/app.js makes for the contact overlay.
     { recycles, randomSeed: 0, maxMsaSequences: rows, maxExtraSequences: extraRows,
-      chainLengths: [sequence.length], pairHost: true },
+      chainLengths: [sequence.length], pairHost: true, contacts: distogram },
     paeBreaks,
   );
 
@@ -150,8 +155,18 @@ export async function main(device, args) {
         if (contacts[i * length + j] > 0.5) predicted += 1;
       }
     }
+    // 🔴 AND THE DEVICE'S MAP, WHICH IS THE ONE THE PAGE SHOWS. `contacts` is
+    // src/heads/distogram-webgpu.js over the same pass's pair; f32 against
+    // this function's f64 accumulators, so the bar is a rounding one.
+    const device_ = recycle.contactProbs;
+    const deviceMaxAbsDiff = device_ === undefined ? null
+      : contacts.reduce((worst, value, k) => Math.max(worst, Math.abs(value - device_[k])), 0);
+    if (!(deviceMaxAbsDiff <= 1e-4)) {
+      throw new Error(`pass ${index}: device contact map differs from the host's by ${deviceMaxAbsDiff}`);
+    }
     passes.push({
       recycle: index,
+      deviceMaxAbsDiff: Number(deviceMaxAbsDiff.toExponential(2)),
       auc: Number(rocAuc(scores, labels).toFixed(3)),
       trueContacts: labels.reduce((a, b) => a + b, 0),
       predictedOverHalf: predicted,

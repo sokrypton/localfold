@@ -272,7 +272,11 @@ def main():
     # 🔴 SINGLE SEQUENCE BY DEFAULT, because this tool is a wiring check and a
     # search is a minute of somebody else's server. `--msa-mode search` is
     # needed for `--template auto`, which has nothing to draw on without one.
-    parser.add_argument("--msa-mode", default="none", choices=["none", "search"])
+    # 🔴 AND A --job SETS IT ITSELF: a job carrying its own alignments turns the
+    # dial to Upload, and forcing "none" over that folded AF3's kitchen-sink job
+    # as a single sequence with its alignments sitting unused. Unless asked, a
+    # --job run leaves the dial where the job put it.
+    parser.add_argument("--msa-mode", default=None, choices=["none", "search"])
     # 🔴 EF2-fast's OWN "single sequence". Its evolutionary information comes
     # from a protein language model rather than an alignment, so turning ESM-C
     # off is the same ablation `--msa-mode none` is for the other models.
@@ -394,7 +398,8 @@ def main():
                              " `auto` to use what the MSA search finds, or"
                              " pdb:ID / afdb:ID to name the database outright,"
                              " or upload:PATH[@CHAIN] for a local structure."
-                             " Goes to the network either way.")
+                             " Goes to the network either way. `;` gives one"
+                             " a protein chain, in order.")
     parser.add_argument("--then-sequence", default=None,
                         help="fold a SECOND time on this sequence, which is a"
                              " fresh fold rather than a continuation")
@@ -846,13 +851,16 @@ def main():
               const list = window.__entityList;
               if (!list) return 'no entity list';
               const entities = list.read();
-              const protein = entities.find((e) => e.type === 'protein');
-              if (!protein) return 'no protein entity';
-              protein.template = %s;
+              // `;` separates one template a protein chain, in order.
+              const templates = %s;
+              const proteins = entities.filter((e) => e.type === 'protein');
+              if (proteins.length < templates.length) return 'fewer protein entities than templates';
+              templates.forEach((template, at) => { proteins[at].template = template; });
               list.set(entities);
-              return JSON.stringify(list.read().map((e) => e.template || null));
-            })()""" % json.dumps(template_entry(args.template))))
+              return JSON.stringify(list.read().map((e) => e.template ? e.template.kind : null));
+            })()""" % json.dumps([template_entry(t) for t in args.template.split(";")])))
 
+        msa_mode = args.msa_mode if args.msa_mode is not None else (None if args.job else "none")
         cdp.evaluate(ws, """(() => {
           const set = (id, value) => {
             const el = document.getElementById(id);
@@ -863,7 +871,7 @@ def main():
           set('model-family', %s);
           set('af2Model', %s);
           set('recycles', %s);
-          set('msa-mode', %s);
+          if (%s !== null) set('msa-mode', %s);
           set('plm-mode', %s);
           // 🔴 THE STEP COUNT IS SET LAST, AND IT WAS SET FOURTH. `#af3-count`
           // is REBUILT from the chosen model's own table - `syncAf3Count` - and
@@ -892,7 +900,7 @@ def main():
           } catch (e) { /* asked again, which the dialog check covers */ }
         })()""" % (json.dumps(args.model), json.dumps(args.af2_model),
                    json.dumps(args.recycles),
-                   json.dumps(args.msa_mode), json.dumps(args.plm),
+                   json.dumps(msa_mode), json.dumps(msa_mode), json.dumps(args.plm),
                    json.dumps(args.steps)))
         time.sleep(0.5)
         print("controls:", cdp.evaluate(ws, """(() => {
@@ -1017,13 +1025,21 @@ def main():
                 coords: v.coords ? v.coords.length : 0});
             })()"""))
                 time.sleep(0.35)
+        # 🔴 A FOLD THAT FAILED IS FINISHED TOO. Waiting only for success sat
+        # out the whole timeout on a status line that already said why - fifteen
+        # minutes, once, on "Automatic templates need an MSA search".
         cdp.wait_for(ws, """(() => {
           const s = document.getElementById('status-message');
           const text = s ? s.textContent : '';
+          if (s && s.classList.contains('error')) return true;
           return /done|complete|finished|s\\b/i.test(text)
             && document.getElementById('downloads').style.display !== 'none';
         })()""", timeout=args.timeout, what="the fold to finish",
                      progress=STATUS_LINE)
+        failed = cdp.evaluate(ws, """(() => { const s = document.getElementById('status-message');
+          return s && s.classList.contains('error') ? s.textContent : ''; })()""")
+        if failed:
+            raise SystemExit(f"the fold failed: {failed}")
         time.sleep(1.5)
         if args.tab_trace:
             cdp.evaluate(ws, "cancelAnimationFrame(window.__tabRaf), 1")

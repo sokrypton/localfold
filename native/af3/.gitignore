@@ -1,0 +1,14 @@
+# exported weights and inputs (hundreds of MiB) and build products
+data*/
+/pairformer
+/pairformer16
+*.o
+/af3
+weights/
+/af3prof
+/af3t
+*.pdb
+*_confidences.json
+weights-*/
+af3.arch
+af3.building

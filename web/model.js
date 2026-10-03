@@ -173,7 +173,21 @@ export function getDevice() {
     // that asks for too much should fail loudly and does; a page that asks for
     // too much takes the machine down with it, so this is where the ceiling is
     // set. `null` takes the guess in device-memory.js from navigator.deviceMemory.
-    const device = await requestAlphaFoldDevice(adapter, { memoryBudgetBytes: null });
+    // 🔴 ON A COLAB RUNTIME, FROM THE GPU'S OWN SIZE - 80% OF IT. The broker
+    // asks nvidia-smi (`vram`, MiB). The budget counts the buffers this port
+    // holds, and the driver used to hold up to TWICE that: a destroyed buffer's
+    // memory comes back only on a device tick, so a stage that freed gigabytes
+    // overlapped the next on the card. 90% of a T4 was tried then, and
+    // IntelliFold-2 at 768 residues ran past the card and lost the device. The
+    // trunk now shares its stacks' scratch and settles freed memory at its
+    // stage boundaries (trunk-webgpu.js, settleReleasedMemory), which brought
+    // that fold's driver peak to 8.7 GB against 9.0 live; 80% leaves the rest
+    // for Chrome's and Dawn's own. Everywhere else the host-RAM guess stands.
+    const asked = new URLSearchParams(location.search);
+    const vram = asked.get("role") === "runtime" ? Number(asked.get("vram")) : NaN;
+    const device = await requestAlphaFoldDevice(adapter, {
+      memoryBudgetBytes: vram > 0 ? Math.round(vram * 1048576 * 0.8) : null,
+    });
     // ...so the footer's timing panel can read this device's memory counters.
     // It reads them; it does not install anything on the device.
     devUseDevice(device);

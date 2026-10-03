@@ -71,6 +71,17 @@ export class GpuBufferAllocator {
       throw new RangeError(`invalid allocation size ${requestedBytes} for ${label}`);
     }
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
+    // 🔴 A POOLED STORAGE BUFFER CARRIES BOTH COPY FLAGS, so one size is one
+    // key. The key is size AND usage, and AlphaFold 2's graph asks for the
+    // same pair size as STORAGE, STORAGE|COPY_SRC and STORAGE|COPY_DST in
+    // different places - three pools that could never serve each other, each
+    // holding pair-sized buffers nothing was using. Extra usage flags are legal
+    // and cost nothing; a mapped buffer keeps its own (MAP_READ pairs with
+    // COPY_DST alone).
+    const mapped = GPUBufferUsage.MAP_READ | GPUBufferUsage.MAP_WRITE;
+    if (this.#pooling && (usage & GPUBufferUsage.STORAGE) !== 0 && (usage & mapped) === 0) {
+      usage |= GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+    }
     const key = `${byteLength}:${usage}`;
     const pooled = poolingDisabled ? undefined : this.#pool.get(key);
     let buffer = pooled?.pop();
@@ -154,3 +165,21 @@ export class GpuBufferAllocator {
     };
   }
 }
+
+/**
+ * Let the driver take back what has just been destroyed, before more is asked.
+ *
+ * 🔴 A DESTROYED BUFFER'S MEMORY COMES BACK ON A DEVICE TICK, AND NOT BEFORE.
+ * Measured (tools/gpu/probe-driver-memory.js): six 512 MiB buffers destroyed
+ * and left alone held 3 GB on the card for as long as the queue was idle, and
+ * new allocations did NOT reuse it - then one empty submit and its wait
+ * returned all of it. A stage that frees gigabytes and is followed by a stage
+ * that allocates gigabytes therefore overlaps the two on the card, which is
+ * how IntelliFold-2 at 768 residues reached 19.2 GB by nvidia-smi with 9 GB
+ * live and ran a 16 GB T4 out of memory. One drain at such a boundary.
+ */
+export async function settleReleasedMemory(device) {
+  device.queue.submit([device.createCommandEncoder({ label: "localfold.settle" }).finish()]);
+  await device.queue.onSubmittedWorkDone();
+}
+

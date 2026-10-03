@@ -7,6 +7,7 @@
  * multimer atom geometry, and outerProductMeanFirst / positionScale say which
  * regime to run. Everything else, including every kernel, is shared.
  */
+import { encodeContactProbabilities } from "../../heads/distogram-webgpu.js";
 import { ConfidenceHeadsGpu } from "../../heads/confidence.js";
 import { encodeInputEmbedder } from "./input-embedder.js";
 import {
@@ -14,6 +15,7 @@ import {
 } from "./block.js";
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
+import { settleReleasedMemory } from "../../runtime/allocator.js";
 import { af2Plan, planTotal } from "../../runtime/cost-model.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../../runtime/abort.js";
 import { DeferredValidation } from "../../runtime/validation.js";
@@ -128,6 +130,8 @@ export class AlphaFoldUnifiedGpu {
         length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
       }), signal)
       : undefined;
+    // ...and its memory returned before the stacks allocate; see monomer.js.
+    if (template !== undefined) await settleReleasedMemory(this.device);
     throwIfAborted(signal);
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
@@ -367,18 +371,35 @@ export class AlphaFoldUnifiedGpu {
         readbackEncoder.copyBufferToBuffer(
           embedding.msa.allocation.buffer, 0, msaFirstRowTensor.allocation.buffer, 0, length * 256 * 4,
         );
-        const pairReadback = execution.createReadback(
-          `monomer.pair-readback-${recycle}`, embedding.pairWithoutTemplates, readbackEncoder,
-        );
+        // 🔴 THE PAIR STAYS ON THE DEVICE, as it has on the monomer since its
+        // 0.82 s note: this read `L^2 * 128` floats back every pass (35 MB at
+        // 261 residues) and handed the copy to the structure module and the
+        // confidence heads, which upload it again and take a device tensor.
+        // `pairHost` still asks for it; `contacts` is the page's contact map,
+        // computed here (src/heads/distogram-webgpu.js) - it was computed in
+        // JavaScript from that copy, on the main thread, between passes.
+        const pairReadback = recycleOptions.pairHost === true
+          ? execution.createReadback(
+            `monomer.pair-readback-${recycle}`, embedding.pairWithoutTemplates, readbackEncoder)
+          : undefined;
+        const contactTensor = recycleOptions.contacts === undefined ? undefined
+          : await encodeContactProbabilities(execution, readbackEncoder,
+            embedding.pairWithoutTemplates, recycleOptions.contacts, length);
+        const contactReadback = contactTensor === undefined ? undefined
+          : execution.createReadback(`monomer.contact-readback-${recycle}`, contactTensor, readbackEncoder);
         await submit(readbackEncoder, `readback recycle ${recycle}`);
-        const [msaFirstRow, pair] = await withAbort(Promise.all([
-          execution.mapFloat32(msaFirstRowTensor), execution.mapFloat32(pairReadback),
+        const [msaFirstRow, pair, contactProbs] = await withAbort(Promise.all([
+          execution.mapFloat32(msaFirstRowTensor),
+          pairReadback === undefined ? undefined : execution.mapFloat32(pairReadback),
+          contactReadback === undefined ? undefined : execution.mapFloat32(contactReadback),
         ]), signal);
         throwIfAborted(signal);
-        releaseTensor(msaFirstRowTensor); releaseTensor(pairReadback); releaseTensor(msaMask);
+        releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
+        if (pairReadback !== undefined) releaseTensor(pairReadback);
+        if (contactReadback !== undefined) { releaseTensor(contactReadback); releaseTensor(contactTensor); }
 
         const structure = await withAbort(new StructureModuleGpu(this.device).run({
-          msaFirstRow, pair, mask: features.seqMask, aatype: features.aatype,
+          msaFirstRow, pair: embedding.pairWithoutTemplates, mask: features.seqMask, aatype: features.aatype,
           atom37ToAtom14: features.atom37ToAtom14, atom37Mask: features.atom37Mask,
           length, weights: weights.structure, geometry: weights.geometry,
           positionScale,
@@ -387,14 +408,14 @@ export class AlphaFoldUnifiedGpu {
         }), signal);
         throwIfAborted(signal);
         const confidence = await withAbort(new ConfidenceHeadsGpu(this.device).run(
-          structure.finalRepresentation, pair, length, weights.lddt, weights.pae, paeBreaks,
+          structure.finalRepresentation, embedding.pairWithoutTemplates, length, weights.lddt, weights.pae, paeBreaks,
           () => step(CONFIDENCE_STEP), signal, recycleOptions.chainLengths,
         ), signal);
         throwIfAborted(signal);
         const recycleDistance = recycleConvergenceDistance(
           previousAtom37, structure.atom37, features.seqMask,
         );
-        const recycleResult = { msaFirstRow, pair, structure, confidence,
+        const recycleResult = { msaFirstRow, pair, contactProbs, structure, confidence,
           recycleDistance,
           elapsedMilliseconds: performance.now() - recycleStart };
         results.push(recycleResult);

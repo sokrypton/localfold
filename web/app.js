@@ -25,6 +25,7 @@ import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/af2/multimer/model.js";
 import { blankChainColumns, foldsAsSingleSequence, parseA3m }
   from "../src/input/a3m.js";
+import { mergeJobAlignments } from "../src/input/chains.js";
 import { planRecycleReuse } from "../src/af2/model/recycle-convergence.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
@@ -35,7 +36,6 @@ import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
   expandSearchedChains, planSearchReuse, searchCacheEntry }
   from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
-import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
@@ -52,6 +52,7 @@ import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js
 import { smilesComponent } from "../src/chem/component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel, releaseModel } from "./model.js";
+import { releaseAllWeights } from "../src/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../src/bundles/manifests/index.js";
@@ -68,19 +69,25 @@ import { complexSequenceProblem } from "./sequence.js";
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesFromText, entitiesProblem, expandEntities, POLYMER_TYPES,
          templateKind } from "./entities.js";
-import { buildFoldArchive, tokenLayoutFrom, msasFromArchive,
+import { buildFoldArchive, tokenLayoutFrom, msasFromArchive, templatesFromArchive,
          SINGLE_SEQUENCE_ORIGIN } from "./fold-archive.js";
-import { jobFromJson } from "./job-json.js";
+import { jobFromJson, jobInputJson } from "./job-json.js";
 import {
   clearSession, jobMeta, readSession, readSessionMeta, saveSession,
 } from "./fold-session.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
-import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
+import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
-import { colabRole, installColabBridge, remoteCommand, remoteEvents, remoteHead,
-  revivePrediction, tapOut } from "./colab-bridge.js";
+import { colabRole, installColabBridge, onRemoteReady, remoteBackendChoice, remoteCommand, remoteLiveChoice,
+  remoteEvents, remoteWebgpuReal,
+  remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
+// A runtime page the Colab broker opened reads its weights through the broker;
+// see bundleBaseUrl in src/bundles/manifests/index.js.
+if (new URLSearchParams(location.search).get("weights") === "proxy") {
+  globalThis.__localfoldWeightsProxy = "/hf/";
+}
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -756,13 +763,12 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   //
   // 🔴 AND AlphaFold 2's MONOMER IS NOT IN THAT CLASS ANY MORE. Its term was
   // always there and oracle-checked; the driver simply never forwarded the
-  // slot, so this refusal was right for the wrong reason. The MULTIMER stays
-  // refused here: it forwards a template in its own driver, but its embedder
-  // is a different dialect with a different feature set and nothing on this
-  // page has ever built one for it - which is exactly the gap that made the
-  // monomer's term look supported for a year.
-  if (templateCount > 0 && !isAf3Family(choice) && graphOf(choice) !== "monomer") {
-    throw new Error("Templates need AF3, OpenBind-0 or AlphaFold 2 monomer;"
+  // slot, so this refusal was right for the wrong reason. Nor is the MULTIMER:
+  // its embedder is a different dialect, and the page builds its slot too -
+  // one atom37 slot over the complex, each chain at its offset (see the AF2
+  // branch of the fold). 1BRS A:D with a self-template: 16.68 -> 0.78 A.
+  if (templateCount > 0 && !isAf3Family(choice) && !["monomer", "multimer"].includes(graphOf(choice))) {
+    throw new Error("Templates need an AF3-lineage model or AlphaFold 2;"
       + ` the model is set to ${choice}`);
   }
   // 🔴 AND THREE OF ALPHAFOLD 2's FIVE MODELS HAVE NO TEMPLATE EMBEDDER AT ALL.
@@ -861,6 +867,17 @@ const predictions = new Map();
  * unpaired block, which reads back as a fold nobody ran.
  */
 function archiveMsas(chains, alignment) {
+  // 🔴 THE ARCHIVE WRITES `{unpaired, paired}` AND AN UPLOADED ARCHIVE IS HELD
+  // AS `{chainA3ms, pairedA3ms}`, so returning it whole wrote neither block and
+  // re-saving a fold made from a dropped archive lost its alignments. A job's
+  // own alignments are per chain already.
+  if (msaMode() === "upload" && uploadedMsas?.inline !== undefined) {
+    return { unpaired: uploadedMsas.inline.unpaired, paired: uploadedMsas.inline.paired };
+  }
+  if (msaMode() === "upload" && uploadedMsas?.chains > 0) {
+    return { unpaired: uploadedMsas.chainA3ms,
+             paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index)) };
+  }
   if (msaMode() === "upload" && uploadedMsas !== undefined) return uploadedMsas;
   if (msaMode() === "search" && searchCache?.raw !== undefined) {
     const { chainA3ms, pairedA3ms, single } = searchCache.raw;
@@ -907,6 +924,120 @@ let foldContext = {};
  * path, and half of it is what the fold RESOLVED rather than what was asked
  * for. Reading a form back out of a report is how the two drift.
  */
+// The family the page last folded, so a change of model can release the last
+// one's resident weights - see the fold's first lines.
+let lastFoldedFamily;
+
+/**
+ * 🔴 A COLAB RUNTIME SITS IDLE WHILE THE READER CHOOSES, AND A T4's COLD FOLD
+ * IS NEARLY ALL WAITING. Measured on one (68 residues, empty caches): the
+ * compiler busy 16.5 s of AF3's 22.5, 43.8 of OpenDDE's 50.5, 63.9 of
+ * IntelliFold-2's 73.6 - whose 612 MB also took 57 s to arrive. So the reader
+ * tells the runtime which model it has picked, the moment it picks it, and the
+ * runtime starts that model's download and pipeline compiles while the
+ * sequence is still being typed. The loaders keep their promises, so the fold
+ * takes what is already under way. WebGPU only: a JAX fold starts its own
+ * worker. See `warmModel`, which is what the runtime runs.
+ */
+let warmedRemotely;
+function warmRemoteModel(family) {
+  if (remoteBackend() === null || remoteBackendChoice() !== "webgpu" || !remoteWebgpuReal()) return;
+  // 🔴 NOT AlphaFold 3 BEFORE ITS TERMS ARE ACCEPTED. The warm-up runs a real
+  // fold of a dummy sequence, and this page runs nothing of AF3's until the
+  // reader has agreed to DeepMind's parameter terms (agreeModelTerms) - a
+  // runtime warming it ahead of that would be the one place it did. A reader
+  // who accepted before is warmed as soon as they connect; one accepting now
+  // folds on the next click, and the fold's own path compiles what it needs.
+  if (family === "af3" && !termsAccepted()) return;
+  if (family === warmedRemotely) return;
+  warmedRemotely = family;
+  const tokens = entityList.read().reduce((sum, entity) =>
+    sum + (POLYMER_TYPES.includes(entity.type) ? String(entity.value ?? "").length * entity.copies : 0), 0);
+  void remoteCommand("warm", { family, tokens: tokens || 100 }).catch(() => {});
+}
+
+// ...and once the runtime has said what GPU it has, or the reader switches to
+// WebGPU, the model already chosen is warmed.
+onRemoteReady(() => { try { warmRemoteModel(chosenFamily()); } catch (cause) { /* nothing chosen yet */ } });
+
+/**
+ * The runtime's half: start `family`'s download and compiles.
+ *
+ * 🔴 AND THEN A THROWAWAY FOLD, BECAUSE THE TRUNK WARM LEFT A THIRD OF THE
+ * COMPILE. `warmAf3Pipelines` builds the pairformer and the template embedder
+ * from the manifest's shapes; the sampler, the atom encoder and decoder, the
+ * conditioning and the confidence head have no compile-only path, and on a T4
+ * they were the 6 s between a warmed first fold (12.1 s) and a warm one (6.2).
+ * A real fold of a dummy sequence at the reader's length - two sampler steps,
+ * one recycle - compiles every stage exactly as the fold will, and leaves this
+ * model's weights resident for it. The fold waits for it (see `warmingFold`).
+ */
+let warmingFold = null;
+// Set by a real fold: a warm-up that has not yet reached its dummy fold skips it
+// rather than make the reader's fold wait behind it.
+let warmSuperseded = false;
+window.__warmModel = (family, tokens) => {
+  const signal = new AbortController().signal;
+  const preload = startModelPreload(family, signal);
+  void preload.catch(() => {});
+  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(family);
+  const af2 = !ef2 && !isAf3Family(family);
+  if (!ef2) void getDevice().then((device) => warmAf3Pipelines(family, tokens, device)).catch(() => {});
+  const length = Number.isSafeInteger(tokens) && tokens >= 16 && tokens <= 1000 ? tokens : 64;
+  warmSuperseded = false;
+  const previous = warmingFold ?? Promise.resolve();
+  warmingFold = previous.then(async () => {
+    const device = await getDevice();
+    const weights = ef2 || af2 ? await preload : await loadAf3Weights(() => {}, family);
+    if (warmSuperseded) return;
+    // ...as a fold of this family would: the last one's weights go first.
+    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) releaseAllWeights(device);
+    lastFoldedFamily = family;
+    const residues = "ACDEFGHIKLMNPQRSTVWY".repeat(Math.ceil(length / 20)).slice(0, length);
+    if (af2) {
+      // ...and AlphaFold 2's, the multimer over two chains so its chain-aware
+      // regime is what compiles.
+      const model = weights;
+      const multimer = graphOf(family) === "multimer";
+      const chains = multimer
+        ? [residues.slice(0, length >> 1), residues.slice(length >> 1)] : [residues];
+      const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
+      await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device).predictA3m(
+        `>query\n${chains.join("")}\n`, model.weights, model.featureTables,
+        { recycles: 1, randomSeed: 1, maxMsaSequences, maxExtraSequences, tolerance: 0, signal,
+          chainLengths: chains.map((chain) => chain.length),
+          ...(multimer ? { outerProductMeanFirst: true, positionScale: 20, chainAware: true,
+                           chainSequences: chains } : {}) },
+        model.paeBreaks, () => {}, () => {});
+      return;
+    }
+    if (ef2) {
+      // ...and ESMFold2's, through the same entry point its fold takes, with
+      // the tower it builds: the language model, trunk, sampler and head all
+      // compile on the dummy.
+      const loaded = weights;
+      await foldEsmfold2(device, {
+        sequence: residues,
+        entities: { sequence: residues, chainKinds: ["protein"], ligands: [], modifications: [] },
+        shape: { ...loaded.shape, loops: 2 },
+        weights: loaded.weights, confidenceWeights: loaded.confidenceWeights,
+        tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
+                                   loaded.shape.pairChannels),
+        sampler: samplerPreset(), seed: 1, languageModel: usesLanguageModel(family),
+        languageModelMiB: loaded.language?.megabytes,
+      });
+      return;
+    }
+    await foldAf3({
+      // ...ONE recycle, not none: a pass that reads the last pass's pair and
+      // single compiles kernels a first pass does not, and the reader's fold
+      // has recycles.
+      sequence: residues, mode: "diffusion", calls: 2, recycles: 1, seed: 1, weights, device,
+      signal, chainKinds: ["protein"], onStatus: () => {}, onProgress: () => {},
+    });
+  }).catch((cause) => console.warn("warm-up fold:", cause));
+};
+
 const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
                        "msa-text", "max-msa", "recycles", "tolerance",
                        "af3-mode", "af3-count", "random-seed"];
@@ -1709,7 +1840,14 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
       return res;
     };
     const origRender = viewer.render ? viewer.render.bind(viewer) : null;
-    if (origRender) {
+    // 🔴 A COLAB RUNTIME DRAWS NOTHING, the finished structure included. Its
+    // live frames already stop at `remoteTap` (drawLiveFrame); this is the
+    // rest - 60-140 ms of canvas a fold on an A100 box, on a page no one sees,
+    // on a CPU that also has the fold to run. The frames are still built, so
+    // anything that reads the viewer's objects reads what it always did.
+    if (origRender && colabRole() === "runtime") {
+      viewer.render = () => {};
+    } else if (origRender) {
       viewer.render = function(...args) {
         const res = origRender(...args);
         syncScoresCardToActiveFrame();
@@ -2402,37 +2540,27 @@ function meanByChain(asymId, values) {
   });
 }
 
-function attachContactMap(frame, recycle, weights, length) {
-  if (weights?.distogram === undefined || recycle.pair === undefined) return;
-  setTimeout(() => {
-    try {
-      const head = weights.distogram;
-      const contacts = distogramContactProbabilities(
-        recycle.pair, head.halfLogitsWeights, head.halfLogitsBias, length,
-        { bins: head.bins, first: head.firstBreak, last: head.lastBreak });
-      // AF2 tokenises one residue per letter - nothing to collapse, and it
-      // refuses a modified residue outright (see modelFamily).
-      const contact = contactMapFor(contacts, undefined);
-      if (contact === undefined) return;
-      frame.maps = { ...frame.maps, contact };
-      // ...and kept, so a rewind can put this frame back without recomputing a
-      // head that costs 131 ms at 128 residues and 712 at 300.
-      recycle.contactMap = contact;
-      // 🔴 AND THE PROBABILITIES THEMSELVES, NOT ONLY THE BYTES. `contactMapFor`
-      // quantises to 0-255 for the heatmap, which is all the panel needs and is
-      // a lossy thing to put in a results file - the archive writes the same
-      // numbers AlphaFold 3 does, so it wants what the head produced.
-      recycle.contactProbs = contacts;
-      refreshHeatmap();
-      // 🔴 AND THE SAVED COPY IS REWRITTEN, because it was written before this
-      // arrived. AF2's contact map is the panel its archive is worth keeping
-      // for, and the fold was already saved without it by the time this runs.
-      // One record, so this replaces rather than adds.
-      if (lastPrediction?.contactSource === recycle) void rememberSession(lastPrediction);
-    } catch (cause) {
-      console.warn("contact map unavailable for this pass", cause);
-    }
-  }, 0);
+function attachContactMap(frame, recycle) {
+  // The probabilities come from the device (monomer.js's `contacts` option,
+  // src/heads/distogram-webgpu.js). 🔴 THEY WERE COMPUTED HERE, in JavaScript,
+  // from a host copy of the pair representation - on the main thread between
+  // the fold's own steps, which made it 3.4 s of a 6.0 s AF2 fold at 261
+  // residues and more on a slower CPU. A pass without them (the multimer, a
+  // pass restored from a session saved before) has no contact map, as before.
+  const contacts = recycle.contactProbs;
+  if (contacts === undefined) return;
+  // AF2 tokenises one residue per letter - nothing to collapse, and it
+  // refuses a modified residue outright (see modelFamily).
+  const contact = contactMapFor(contacts, undefined);
+  if (contact === undefined) return;
+  frame.maps = { ...frame.maps, contact };
+  // ...and kept, so a rewind can put this frame back without recomputing it.
+  recycle.contactMap = contact;
+  refreshHeatmap();
+  // 🔴 AND THE SAVED COPY IS REWRITTEN, because it was written before this
+  // frame existed. AF2's contact map is the panel its archive is worth keeping
+  // for. One record, so this replaces rather than adds.
+  if (lastPrediction?.contactSource === recycle) void rememberSession(lastPrediction);
 }
 
 function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStructure = undefined,
@@ -2460,7 +2588,7 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
   // that ever says so: pass zero - the one `loadIntoViewer` and every
   // `frames.length === 0` site key on - belongs to the run being resumed.
   foldIsShowing(viewer);
-  attachContactMap(frame, recycle, weights, sequence.length);
+  attachContactMap(frame, recycle);
   // ...and jump to it, so the newest pass is the one being looked at.
   const object = viewer.objects?.find((entry) => entry.name === viewerObject);
   if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
@@ -2537,6 +2665,7 @@ function setFoldButton(state) {
 function syncModelControls() {
   const family = chosenFamily();
   const af3 = isAf3Family(family);
+  warmRemoteModel(family);
   // 🔴 THE MODEL NUMBER IS AF2's ALONE, and the test is the ROW's value rather
   // than the resolved family - `chosenFamily` has already folded the number
   // into it, so asking the resolved one whether to show the control that
@@ -2800,7 +2929,7 @@ const cheapHash = (text) => {
  */
 async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = [],
                            modifications = [], chainKinds = [], templates = [],
-                           modelLoad = undefined, family = "af3") {
+                           modelLoad = undefined, family = "af3", msaColumnKinds = undefined) {
   // 🔴 THE FOLD SAYS WHICH MODEL MADE IT, and this is not decoration. Two
   // bundles run this same function; a status line and an archive that both
   // read "AlphaFold 3" for an OpenBind fold are a record of the wrong
@@ -2985,6 +3114,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let liveSampler = 0;
   const drawLiveFrame = (pdb, kind) => {
     remoteTap("frame", pdb);
+    // 🔴 A COLAB RUNTIME PUSHES ITS FRAMES AND DRAWS NONE. Nobody looks at
+    // that page - the reader draws what it is sent - and on a T4's two vCPUs
+    // parsing and rendering every sampler step competed with the fold itself.
+    // The finished structure still loads into it, which its download needs.
+    if (colabRole() === "runtime") return;
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -3042,6 +3176,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       { hasLigand: ligandCodes.length > 0 || modifications.length > 0 }),
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds,
+    ...(msaColumnKinds === undefined ? {} : { msaColumnKinds }),
     // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes
     // through it: a modified residue is one POSITION and ten TOKENS, so its
     // PAE and its contact map are wider than the structure they belong to and
@@ -3314,6 +3449,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // twenty characters are enough to recognise the one you typed.
   if (ligandCodes.length > 0) {
     what.push(ligandCodes.map((entry) => (typeof entry === "string" ? entry
+      : entry.codes ? entry.codes.join("-")
       : entry.smiles.length > 24 ? `${entry.smiles.slice(0, 21)}...` : entry.smiles))
       .join(", "));
   }
@@ -3442,6 +3578,10 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // small mmCIF; the 21 polymer components stay baked.
   const ligands = [];
   for (const entry of ligandCodes) {
+    if (entry.codes !== undefined) {      // a chain of components: the AF3-lineage path only
+      throw new Error(`${modelName} folds one component per ligand; ${entry.codes.join("-")} is a chain of`
+        + ` ${entry.codes.length} - fold it with an AlphaFold 3-lineage model`);
+    }
     // A structure rather than a code; see the note in web/af3-model.js.
     if (typeof entry !== "string") {
       status(`${modelName} · building ${entry.code ?? "ligand"}`);
@@ -3498,6 +3638,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const framePdbs = [];
   const drawLiveFrame = (pdb) => {
     remoteTap("frame", pdb);
+    // 🔴 A COLAB RUNTIME PUSHES ITS FRAMES AND DRAWS NONE. Nobody looks at
+    // that page - the reader draws what it is sent - and on a T4's two vCPUs
+    // parsing and rendering every sampler step competed with the fold itself.
+    // The finished structure still loads into it, which its download needs.
+    if (colabRole() === "runtime") return;
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -3946,7 +4091,35 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   const { entities, controls } = formInputs();
   const request = { entities, controls };
   const label = MODEL_LABELS[family] ?? family;
-  status(`${label} · folding on the runtime…`);
+  // 🔴 A JAX FOLD IS HANDED THE JOB AS AlphaFold 3 JSON, written by the same
+  // module that writes the archive's request - so the entity conversion is
+  // this page's and not re-implemented in Python. See tools/jax_worker.py.
+  if (remoteBackendChoice() === "jax" || remoteBackendChoice() === "native") {
+    request.backend = remoteBackendChoice();
+    // ...and, for CUDA, whether it streams its intermediate results here (the badge's Live preview)
+    if (request.backend === "native") request.frames = remoteLiveChoice();
+    // ...the RESOLVED model, which is not the row's value where a second row
+    // picks it: the PLM row turns "ef2" into the 600M or 300M checkpoint.
+    request.family = family;
+    request.job = jobInputJson({ name: safeJobName(entityList.header() ?? "fold"),
+      seed: Number(controls["random-seed"]) || 1, entities });
+    // ...and an uploaded alignment travels with the job, because the worker is
+    // on the other machine and the file is on this one. A pasted one is in
+    // `controls["msa-text"]` already; a searched one the worker fetches itself.
+    // An archive holds one alignment a chain and a Map of paired ones, which
+    // JSON cannot carry; a bare a3m is the text in the box.
+    if (msaMode() === "upload" && uploadedMsas?.inline !== undefined) {
+      throw new Error("the job's own alignments fold on this machine only - fold it here, or set the MSA to search");
+    }
+    if (msaMode() === "upload") {
+      request.msas = uploadedMsas?.chains > 0
+        ? { unpaired: uploadedMsas.chainA3ms,
+            paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index) ?? "") }
+        : { merged: uploadedMsas?.merged ?? uploadedA3m };
+    }
+  }
+  status(`${label} · folding on the runtime${request.backend === "jax" ? " with JAX"
+    : request.backend === "native" ? " with CUDA" : ""}…`);
   progress("waiting");
   // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
   // every event of the session, so a reader that started at zero would replay
@@ -3979,7 +4152,44 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
  */
 async function followRemoteFold({ since, label, signal }) {
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
-  const draw = remoteFrameDrawer(stem);
+  // 🔴 A REMOTE FOLD'S INTERMEDIATE CONTACT MAPS, AS A LOCAL ONE SHOWS THEM. The CUDA backend streams
+  // each trunk pass's map (tools/native_worker.py, `contacts`: a byte a pair); before the sampler has a
+  // frame it goes to the panel as the local trunk's does, and every frame after it carries the latest.
+  let liveContact;
+  const draw = remoteFrameDrawer(stem, () => (liveContact === undefined ? undefined : { contact: liveContact }));
+  let drawnFrame;
+  // (every drawn frame, so the trajectory rebuilt after the result keeps what was streamed onto it)
+  const liveFrames = [];
+  const carry = (into, from) => {
+    if (into === undefined || from === undefined) return;
+    for (const key of ["maps", "pae", "pae_n", "confidence"]) if (from[key] !== undefined) into[key] = from[key];
+  };
+  // ...and a pass's confidences (the CUDA AF2 streams each pass's, `scores`), onto the card and onto the
+  // frame that pass drew - its PAE and pLDDT, as a local AF2 fold's appendPass gives its frames
+  const showScores = (payload) => {
+    try {
+      updateScoresCard({ meanPlddt: payload.meanPlddt, ptm: payload.ptm, iptm: payload.iptm ?? Number.NaN });
+      if (drawnFrame === undefined || payload.paeU8 === undefined) return;
+      const bytes = Uint8Array.from(atob(payload.paeU8), (c) => c.charCodeAt(0));
+      const pae = new Float32Array(bytes.length);
+      for (let i = 0; i < bytes.length; i += 1) pae[i] = bytes[i] * payload.paeScale;
+      drawnFrame.confidence = { meanPlddt: payload.meanPlddt, ptm: payload.ptm, iptm: payload.iptm,
+                                plddt: Float32Array.from(payload.plddt ?? []), predictedAlignedError: pae };
+      drawnFrame.pae = paeMatrix(pae, payload.n);
+      drawnFrame.pae_n = payload.n;
+      refreshHeatmap();
+    } catch (cause) { console.warn("streamed scores skipped:", cause); }
+  };
+  const showContacts = (payload) => {
+    try {
+      const bytes = Uint8Array.from(atob(payload.u8), (c) => c.charCodeAt(0));
+      const probs = new Float32Array(bytes.length);
+      for (let i = 0; i < bytes.length; i += 1) probs[i] = bytes[i] / 255;
+      liveContact = contactMapFor(probs, undefined);
+      if (liveContact === undefined) return;
+      showTrunkContacts(liveContact, expandEntities(formInputs().entities).chains);
+    } catch (cause) { console.warn("streamed contact map skipped:", cause); }
+  };
   const framePdbs = [];
   let result;
   for (;;) {
@@ -4011,7 +4221,9 @@ async function followRemoteFold({ since, label, signal }) {
       // bar fractions, the same sampler frames, in the order they happened.
       if (said.kind === "status") status(said.payload);
       else if (said.kind === "progress") progress(said.payload);
-      else if (said.kind === "frame") { framePdbs.push(said.payload); draw(said.payload); }
+      else if (said.kind === "frame") { framePdbs.push(said.payload); drawnFrame = draw(said.payload); liveFrames.push(drawnFrame); }
+      else if (said.kind === "contacts") showContacts(said.payload);
+      else if (said.kind === "scores") showScores(said.payload);
       // ...and the runtime's own timing rows, recorded on its card against its
       // clock, rather than a reconstruction of them from over here.
       else if (said.kind === "dev") devAdopt(said.payload);
@@ -4054,7 +4266,22 @@ async function followRemoteFold({ since, label, signal }) {
     }
     await new Promise((done) => setTimeout(done, 300));
   }
-  if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);
+  // ...and the runtime's status line beside its error only where it adds
+  // something: a page that failed usually says the same thing twice.
+  if (result.error) {
+    throw new Error(result.status && !result.status.includes(result.error)
+      && !result.error.includes(result.status) ? `${result.error} · ${result.status}` : result.error);
+  }
+
+  // 🔴 A JAX FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
+  // PREDICTION - there is no copy of this page on the other side to build one.
+  // So it is built here, in the shape the AF3 path records (typed arrays, a
+  // token layout, the context the archive and the session read), and it goes
+  // through the same doors: loadIntoViewer for the picture, recordPrediction
+  // for the downloads, the scores card and the saved session.
+  // ...and a CUDA fold the same way: tools/native_worker.py sends the same fields.
+  const jax = result.jax === true ? jaxPrediction(result, stem, label, "JAX")
+    : result.native === true ? jaxPrediction(result, stem, label, "CUDA") : null;
 
   // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
   // fills the sequence strip, the download buttons and the scores card - the
@@ -4070,11 +4297,22 @@ async function followRemoteFold({ since, label, signal }) {
   // pass `{pdb, scores: {}}`, so a remote fold came back with no MSA panel, no
   // PAE plot and an empty scores card - the page looked like it had folded
   // nothing but coordinates, because it had been given nothing else.
+  // The runtime's prediction, revived BEFORE the viewer is loaded: its
+  // confidences are the ones the viewer draws (the readback no longer sends a
+  // second, untyped copy - see readBack in web/colab-bridge.js).
+  let remote = null;
+  if (jax === null && result.predJson) {
+    try {
+      remote = revivePrediction(result.predJson);
+    } catch (cause) {
+      console.warn("the runtime's prediction did not parse:", cause);
+    }
+  }
   await loadIntoViewer({
     stem, pdb: framePdbs[0] ?? result.pdb,
-    scores: result.scores ?? {},
-    a3m: result.a3m,
-    confidence: result.confidence,
+    scores: jax?.scores ?? remote?.scores ?? result.scores ?? {},
+    a3m: result.a3m ?? undefined,
+    confidence: jax?.confidence ?? remote?.confidence ?? result.confidence,
     length: result.length,
   });
   if (viewer !== undefined && Object.keys(camera).length > 0) {
@@ -4085,11 +4323,13 @@ async function followRemoteFold({ since, label, signal }) {
   if (api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
     const first = viewer.objectsData?.[viewerObject]?.frames?.[0];
     if (first !== undefined) first.name = first.label = first.title = "sampler_0";
+    carry(first, liveFrames[0]);
     for (const [index, text] of [...framePdbs.slice(1, -1), result.pdb].entries()) {
       try {
         const frame = api.frameFromText(text);
         const last = index === framePdbs.length - 2;
         frame.name = frame.label = frame.title = last ? "final" : `sampler_${index + 1}`;
+        carry(frame, liveFrames[index + 1]);
         viewer.addFrame(frame, viewerObject);
       } catch (cause) { console.warn("frame skipped:", cause); }
     }
@@ -4102,22 +4342,80 @@ async function followRemoteFold({ since, label, signal }) {
   // without a word. The runtime sends its whole prediction object and it is
   // registered here under THIS page's stem, which is the name the viewer knows
   // the object by and therefore the one `activePrediction` looks up.
-  if (result.predJson) {
-    try {
-      const remote = revivePrediction(result.predJson);
-      remote.stem = stem;
-      // ...through the one funnel, so this path records what every other
-      // one does: the last prediction, the map entry, the downloads, and
-      // the page's claim on the object (see recordPrediction).
-      recordPrediction(remote, remote.family ?? familyFromLabel(remote.model));
-    } catch (cause) {
-      console.warn("the runtime's prediction did not parse:", cause);
-    }
+  if (jax !== null) {
+    recordPrediction(jax, jax.family);
+    void rememberSessionWhenSettled(lastPrediction);
+  } else if (remote !== null) {
+    remote.stem = stem;
+    // ...through the one funnel, so this path records what every other
+    // one does: the last prediction, the map entry, the downloads, and
+    // the page's claim on the object (see recordPrediction).
+    recordPrediction(remote, remote.family ?? familyFromLabel(remote.model));
   }
   // ...and the runtime's own summary, which already reads the way this page's
   // status line does - it is the same code, on the other machine.
   status(result.status || `${label} · folded on the runtime`);
   progress(null);
+}
+
+/**
+ * A JAX fold's result as this page's own prediction.
+ *
+ * The worker (tools/jax_worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
+ * contact probabilities, its token layout and the alignment it used; the rest
+ * - the entities, the settings, the form - is this page's, taken now, because
+ * the reader's form is what asked for this fold.
+ */
+function jaxPrediction(result, stem, label, backend = "JAX") {
+  const floats = (values) => (values == null ? undefined : Float32Array.from(values));
+  const given = result.confidence ?? {};
+  const confidence = {
+    ...given,
+    // 🔴 NaN, NOT ABSENT, FOR A FOLD WITH NO INTERFACE - which is what the AF3
+    // path records and what the scores card reads as "-". Absent, the card kept
+    // the LAST fold's ipTM: a monomer after a complex read "ipTM 0.51".
+    iptm: given.iptm ?? Number.NaN,
+    plddt: floats(given.plddt),
+    predictedAlignedError: floats(given.predictedAlignedError),
+    contactProbs: floats(given.contactProbs),
+  };
+  const chains = result.chains ?? [];
+  const { entities, controls } = formInputs();
+  // ...the family the worker folded, which the request named RESOLVED.
+  const family = result.family ?? chosenFamily();
+  const mode = controls["msa-mode"] ?? "none";
+  return {
+    stem,
+    pdb: result.pdb,
+    confidence,
+    scores: confidenceJson(chains.join(""), confidence),
+    a3m: result.a3m ?? undefined,
+    chains,
+    chainLengths: chains.map((chain) => chain.length),
+    contactSource: { contactProbs: confidence.contactProbs },
+    tokens: result.tokens,
+    model: `${label} (${backend})`,
+    family,
+    entities,
+    inputs: { entities, controls },
+    // ...the structures the worker used, one a fold chain, in the shape the
+    // archive writes - so a saved JAX fold reloads with its templates rather
+    // than as a search, and its README does not say "templates: none".
+    templates: result.templates ?? [],
+    msas: result.msas ?? {},
+    msaOrigin: {
+      none: SINGLE_SEQUENCE_ORIGIN,
+      search: `MMseqs2 search at api.colabfold.com (by the ${backend} backend)`,
+      paste: "pasted by hand",
+      upload: "uploaded a3m",
+    }[mode] ?? mode,
+    settings: {
+      backend: `${backend} (${result.model})`,
+      seed: Number(controls["random-seed"]) || 1,
+      recycles: Number(controls.recycles) || undefined,
+      "max msa": controls["max-msa"],
+    },
+  };
 }
 
 /**
@@ -4159,8 +4457,9 @@ async function attachToRunningFold() {
  * on the trunk - and a fold the runtime REFUSES (429, a second reader) would
  * leave an empty object on the page with nothing ever arriving in it.
  */
-function remoteFrameDrawer(stem) {
+function remoteFrameDrawer(stem, liveMaps = () => undefined) {
   let drawn = 0;
+  let lastFrame;
   let opened = false;
   let colouring = false;
   return (pdb) => {
@@ -4176,7 +4475,11 @@ function remoteFrameDrawer(stem) {
       foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
+      // ...carrying the latest streamed contact map, as a local fold's frames carry theirs
+      const maps = liveMaps();
+      if (maps !== undefined) frame.maps = { ...frame.maps, ...maps };
       renderer.addFrame(frame, renderer.currentObjectName);
+      lastFrame = frame;
       renderer.setFrame(object.frames.length - 1);
       // The B-factor column of every model this backend drives is a pLDDT, so
       // the trajectory is watchable in confidence from its first frame - the
@@ -4185,6 +4488,7 @@ function remoteFrameDrawer(stem) {
     } catch (cause) {
       console.warn("live frame skipped:", cause);
     }
+    return lastFrame;
   };
 }
 
@@ -4284,6 +4588,18 @@ async function fold(event) {
                             templates: request.templates ?? [], family, signal });
       return;
     }
+    // 🔴 A DIFFERENT MODEL LETS THE LAST ONE'S GPU WEIGHTS GO. Residency is
+    // kept between folds so the same model's next fold skips its packing, and
+    // it was kept across a CHANGE of model too - four models in one page and
+    // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
+    // ...and a warm-up fold still running is waited for, not raced: it is
+    // compiling what this fold needs and holds the GPU (see __warmModel).
+    warmSuperseded = true;
+    if (warmingFold !== null) await warmingFold;
+    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
+      releaseAllWeights(await getDevice());
+    }
+    lastFoldedFamily = family;
     // ...and started, not awaited. The templates and the alignment below are
     // network work of their own; this runs beside them.
     const modelLoad = startModelPreload(family, signal);
@@ -4310,7 +4626,7 @@ async function fold(event) {
     // this used to say "AF3 only: AF2's drivers take a template through a
     // different path and nothing on this page builds one for them yet", and
     // the reason was that monomer.js never forwarded the slot. It does now.
-    // The MULTIMER is still refused upstream, in chosenFamily's guard.
+    // And for the MULTIMER, one slot over the complex.
     const templateSources = [];
     for (const template of request.templates ?? []) {
       const kind = templateKind(template);
@@ -4361,7 +4677,26 @@ async function fold(event) {
     // database this page has no server for. Either way the reader asked for an
     // alignment and is getting one for some of their chains, so the status line
     // says which.
-    if (nucleicCount > 0 && msaMode() !== "single") {
+    // 🔴 A JOB'S OWN ALIGNMENTS COVER EVERY POLYMER CHAIN, nucleic ones too, so
+    // they bypass the protein-only path below and reach the featuriser with
+    // each column's alphabet (mergeJobAlignments, the native exporter's too).
+    const inlineMsas = msaMode() === "upload" ? uploadedMsas?.inline : undefined;
+    if (inlineMsas !== undefined) {
+      if (!isAf3Family(family)) {
+        throw new Error("the job's own alignments are AlphaFold 3's - choose an AlphaFold 3-lineage model,"
+          + " or set the MSA to search");
+      }
+      // ...and only for the chains they were written for: an edited row is
+      // a different sequence, and its alignment would gap the wrong columns
+      [...inlineMsas.unpaired, ...inlineMsas.paired].forEach((text, at) => {
+        const chain = at % chains.length;
+        if (text && parseA3m(text, { anyLetter: true }).query.toUpperCase() !== chains[chain].toUpperCase()) {
+          throw new Error(`the job's alignment for chain ${chain + 1} is for a different sequence -`
+            + " load the job again, or set the MSA to search");
+        }
+      });
+    }
+    if (inlineMsas === undefined && nucleicCount > 0 && msaMode() !== "single") {
       const kinds = [...new Set(chainKinds.filter((kind) => kind !== "protein"))]
         .map((kind) => kind.toUpperCase()).join(" and ");
       status(proteinChains.length === 0
@@ -4373,8 +4708,18 @@ async function fold(event) {
     // sequence - the right message for an empty box, the wrong one for a job
     // that is already complete. A DNA-only fold is the same case: there is no
     // protein to search with, and no RNA database here to search instead.
-    const alignmentResult = proteinChains.length === 0
-      ? null : await alignmentText(proteinChains, signal, family, proteinWantsMsa);
+    let msaColumnKinds;
+    let alignmentResult;
+    if (inlineMsas !== undefined) {
+      const merged = mergeJobAlignments(inlineMsas, chains, chainKinds);
+      msaColumnKinds = merged.msaColumnKinds;
+      alignmentResult = { text: merged.alignment.unpaired ?? merged.alignment.paired, blocks: merged.alignment };
+      status(`Alignments from the job · ${inlineMsas.unpaired.filter(Boolean).length} unpaired,`
+        + ` ${inlineMsas.paired.filter(Boolean).length} paired`);
+    } else {
+      alignmentResult = proteinChains.length === 0
+        ? null : await alignmentText(proteinChains, signal, family, proteinWantsMsa);
+    }
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
     // A pasted or uploaded A3M is one text and cannot be split into blocks; it
@@ -4435,7 +4780,9 @@ async function fold(event) {
       template.source = best.target;
     }
     throwIfAborted(signal);
-    if (alignment !== null) {
+    // (a job's own alignments were checked chain by chain above, and cover the
+    // nucleic chains too, so this protein-only rule does not apply to them)
+    if (alignment !== null && inlineMsas === undefined) {
       // THE ALIGNMENT'S QUERY WINS. An A3M carries its own first record, and
       // folding the box's sequence against somebody else's alignment would be
       // folding two different proteins at once.
@@ -4515,7 +4862,7 @@ async function fold(event) {
     }
     if (isAf3Family(family)) {
       await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes,
-                        modifications, chainKinds, templateSources, modelLoad, family);
+                        modifications, chainKinds, templateSources, modelLoad, family, msaColumnKinds);
       return;
     }
 
@@ -4574,27 +4921,39 @@ async function fold(event) {
     // See test/template-atom37-layout.test.js.
     let af2Template;
     if (templateSources.length > 0) {
-      // 🔴 REFUSED RATHER THAN DROPPED. `?graph=unified` runs the MULTIMER's
-      // graph over a monomer, and that embedder is a different dialect nothing
-      // here builds a slot for - so folding on would quietly ignore it, which
-      // is the failure this whole path exists to avoid.
-      if (unified) {
-        // ...and it names which of the two it is, because a session restored
-        // from a job that set both reaches here without passing chosenFamily's
-        // guard, and "drop ?graph=unified" is not advice a multimer can take.
-        throw new Error(multimer
-          ? "AlphaFold 2 multimer's template embedder is a different dialect"
-            + " and this page does not build a slot for it"
-          : "the unified graph has no monomer template embedder;"
-            + " drop ?graph=unified to fold with a template");
+      // 🔴 REFUSED RATHER THAN DROPPED. `?graph=unified` over a MONOMER family
+      // runs the multimer's graph with the monomer's weights, which have no
+      // multimer template embedder - so folding on would quietly ignore it.
+      if (unified && !multimer) {
+        throw new Error("the unified graph has no monomer template embedder;"
+          + " drop ?graph=unified to fold with a template");
       }
-      const source = templateSources[0];
-      status(`Aligning template ${source.source ?? ""}`);
-      af2Template = buildTemplate({
-        text: source.text, chain: source.chainId, query: sequence,
-        tokens: sequence.length, minConfidence: source.minConfidence ?? 0,
-        layout: "atom37",
-      });
+      // 🔴 THE MULTIMER TAKES ONE atom37 SLOT OVER THE WHOLE COMPLEX, each
+      // templated chain written at its own residue offset and the rest left as
+      // gap - which is what AlphaFold's multimer pipeline builds too, one
+      // template per chain concatenated along the residue axis. asymId masks
+      // what crosses chains, so two chains templated from two files never
+      // claim to know their relative placement. The monomer is one chain at
+      // offset zero, so it is the same loop.
+      const offsets = chainLengths.map((_, at) => chainLengths.slice(0, at).reduce((a, b) => a + b, 0));
+      const seen = new Set();
+      const built = [];
+      for (const source of templateSources) {
+        const at = multimer ? source.chain ?? 0 : 0;
+        if (seen.has(at)) {
+          throw new Error(`AlphaFold 2 takes one template a chain; chain ${at + 1} has two`);
+        }
+        seen.add(at);
+        status(`Aligning template ${source.source ?? ""}`);
+        built.push(buildTemplate({
+          text: source.text, chain: source.chainId,
+          query: multimer ? chains[at] : sequence, offset: multimer ? offsets[at] : 0,
+          tokens: sequence.length, minConfidence: source.minConfidence ?? 0,
+          layout: "atom37",
+          ...(source.mapping === undefined ? {} : { mapping: source.mapping }),
+        }));
+      }
+      af2Template = built.length === 1 ? built[0] : mergeAtom37Templates(built, sequence.length);
       throwIfAborted(signal);
     }
 
@@ -4608,7 +4967,8 @@ async function fold(event) {
       // ...the SOURCE rather than the slot: the slot is megabytes of float and
       // the text plus the chain is what decides every one of them.
       template: af2Template === undefined ? null
-        : cheapHash(`${templateSources[0].text}\u0000${templateSources[0].chainId ?? ""}`),
+        : cheapHash(templateSources.map((source) =>
+          `${source.chain ?? ""}\u0000${source.text}\u0000${source.chainId ?? ""}`).join("\u0001")),
     });
     // 🔴 AND A SWEEP IS NEVER A CONTINUATION. The cache holds ONE model's trunk
     // under a key naming that model, so resuming a five-model run would replay
@@ -4789,7 +5149,7 @@ async function fold(event) {
           void initialLoadPromise.then(() => {
             const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
             if (frame !== undefined) {
-              attachContactMap(frame, recycle, weights, sequence.length);
+              attachContactMap(frame, recycle);
             }
           });
         } else {
@@ -4892,12 +5252,12 @@ async function fold(event) {
           // (the CLI tools, the differential gates, an embedder) folds once and
           // used to pay for it anyway.
           { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-          // ...and `pairHost: true` for the distogram contact overlay, which is
-          // the only reader of the host copy of the pair representation.
+          // ...and `contacts`, the distogram head, for the contact overlay:
+          // monomer.js computes it on the device and returns the probabilities.
           // ...and the template slot, which monomer.js forwards into
           // QueryOnlyTemplateGpu. `undefined` is a fully masked template, which
           // is what every fold on this page was before it.
-            resume, resumable: true, pairHost: true, template: af2Template?.slot, ...regime },
+            resume, resumable: true, contacts: weights.distogram, template: af2Template?.slot, ...regime },
           model.paeBreaks, onRecycle, runProgress);
 
       // 🔴 THE EARLIER PASSES COME BACK FOR THE ANIMATION. A continuation returns
@@ -5141,12 +5501,14 @@ async function fold(event) {
     // the only thing on screen that says one arrived.
     let templateText = "";
     if (af2Template !== undefined) {
-      const source = templateSources[0];
-      if (source.origin !== undefined) {
-        source.origin.status = describeCoverage(af2Template.coverage);
-      }
-      templateText = ` · template ${source.source ?? ""}`
-        + ` ${af2Template.coverage.residues}/${af2Template.coverage.of}`;
+      // One entry a templated chain; the monomer is the one-part case.
+      const parts = af2Template.parts ?? [af2Template];
+      parts.forEach((part, index) => {
+        const source = templateSources[index];
+        if (source.origin !== undefined) source.origin.status = describeCoverage(part.coverage);
+        templateText += ` · template ${source.source ?? ""}`
+          + ` ${part.coverage.residues}/${part.coverage.of}`;
+      });
     }
     status(`${foldWasReplayed ? "Already folded · shown from memory"
       : `Done in ${took} s`} · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
@@ -5174,7 +5536,13 @@ async function fold(event) {
       // paging and reports nothing: without it the failure is not an error
       // message, it is a machine that stops responding. That is what the title
       // on the button says, in those words.
-      if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
+      // ...but not on a Colab runtime: its button would be on a page nobody can
+      // click, and lifting the ceiling there was measured to lose the device -
+      // a T4 ran past its memory and every later fold on that runtime failed.
+      if (error instanceof GpuMemoryBudgetError && colabRole() === "runtime") {
+        status(`${describeBudget(error)} Too large for this runtime -`
+          + " try a shorter sequence or a smaller model.", true);
+      } else if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
         statusWithAction(
           describeBudget(error),
           "Fold anyway",
@@ -5360,6 +5728,10 @@ reportModelFromUrl();
  */
 
 function applyJob(job) {
+  // (the page builds no chemistry a job defines itself; the native fold does - native/af3/fold)
+  if (job.userCcd !== undefined) {
+    throw new Error("userCCD describes chemistry this page does not build - remove it to fold the rest");
+  }
   entityList.set(job.entities);
   const said = [];
   if (job.seed !== undefined) {
@@ -5369,7 +5741,16 @@ function applyJob(job) {
       said.push(`seed ${job.seed}`);
     }
   }
-  if (job.singleSequence && modeSelect.value !== "none") {
+  if (job.alignments !== undefined) {
+    // 🔴 THE FILE'S OWN ALIGNMENTS, HELD AS AN UPLOAD. They are what AF3's data
+    // pipeline wrote for these chains; the dial says Upload so a search is not
+    // run over them, and loading another alignment replaces them.
+    uploadedMsas = { inline: job.alignments };
+    uploadedA3m = "";
+    modeSelect.value = "upload";
+    syncMode();
+    said.push("alignments from the file");
+  } else if (job.singleSequence && modeSelect.value !== "none") {
     modeSelect.value = "none";
     syncMode();
     said.push("MSA off");
@@ -5427,6 +5808,28 @@ async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
       try { loadedJob = applyJob(jobFromJson(files.get(requestName))); }
       catch (error) { loadedJob = `job not loaded: ${error.message}`; }
     }
+    // 🔴 AND THE TEMPLATES, AS THE STRUCTURES THAT WERE USED. The request
+    // says only `useStructureTemplate: true`, which reads back as "from the
+    // search" - so an uploaded crystal came back as a search nobody asked for.
+    // The archive carries the files and an index naming each one's chain.
+    const usedTemplates = templatesFromArchive(files);
+    if (usedTemplates.length > 0 && typeof loadedJob === "string"
+        && !loadedJob.startsWith("job not loaded")) {
+      const rows = entityList.read();
+      // A fold chain is a polymer COPY, so the rows are walked counting copies.
+      const rowOfChain = [];
+      rows.forEach((row, at) => {
+        if (POLYMER_TYPES.includes(row.type)) for (let c = 0; c < row.copies; c += 1) rowOfChain.push(at);
+      });
+      for (const used of usedTemplates) {
+        const row = rows[rowOfChain[used.chain]];
+        if (row?.type !== "protein") continue;
+        row.template = { kind: "upload", text: used.text, filename: used.filename,
+                         source: used.structureChain ?? "" };
+      }
+      entityList.set(rows);
+      loadedJob += ` · ${usedTemplates.length} template${usedTemplates.length === 1 ? "" : "s"}`;
+    }
     const restored = msasFromArchive(files);
     if (restored.chains === 0 && restored.merged === undefined) {
       if (loadedJob !== undefined) { status(`archive · ${loadedJob}`); return; }
@@ -5445,6 +5848,19 @@ async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
     }
     uploadedMsas = restored;
     uploadedA3m = "";
+    // 🔴 AN ARCHIVE OF A FOLD WITH NUCLEIC ALIGNMENTS (a job's own, written one
+    // file per fold chain) goes back the way it came: the archive path below
+    // merges PROTEIN chains for a search's pairing, and would count the RNA's
+    // file as a protein's
+    try {
+      const expanded = expandEntities(entityList.read());
+      if (restored.chains === expanded.chains.length && expanded.chainKinds.some((kind) => kind !== "protein")) {
+        uploadedMsas = { inline: {
+          unpaired: restored.chainA3ms.map((text) => text || null),
+          paired: expanded.chains.map((_, index) => restored.pairedA3ms.get(index) ?? null),
+        } };
+      }
+    } catch { /* rows that do not expand are reported when folded */ }
     const paired = restored.pairedA3ms.size;
     status(`archive · ${restored.chains} chain${restored.chains === 1 ? "" : "s"}`
       + `${paired > 0 ? `, ${paired} with paired rows` : ", no paired rows"}`
@@ -5723,21 +6139,12 @@ function archiveFor(pred, { includeAlignment = true } = {}) {
           // ...per chain, which the confidence object itself does not carry:
           // `meanByChain` needs the token-to-chain map and the fold has it.
           chainPlddt: pred.chainPlddt,
-          // 🔴 RESOLVED HERE, NOT WHEN THE FOLD FINISHED. AlphaFold 2 computes
-          // its contact map in a setTimeout - the distogram head costs 131 ms
-          // at 128 residues and is deliberately off the fold's critical path -
-          // so at the moment the prediction was stored it does not exist yet.
-          // By the time anyone presses this it does. `contactSource` is the
-          // pass the saved structure came from, which is not always the last.
-          // 🔴 ONE FIELD, AND IT IS A REFERENCE RATHER THAN A COPY. The three
-          // models produce this at three different MOMENTS - AF3 with the
-          // trunk, EF2-fast with the trunk and no confidence object to put it
-          // in, AF2 in a setTimeout off the saved pass, because its distogram
-          // head costs 131 ms at 128 residues and is deliberately off the
-          // fold's critical path. So `contactSource` holds the OBJECT that
-          // carries them, which for AF2 is still filling in when the
-          // prediction is stored and is filled by the time anyone presses
-          // this. It was three fields and the archive knew two of them.
+          // `contactSource` is the pass the saved structure came from, which
+          // is not always the last. 🔴 ONE FIELD, AND IT IS A REFERENCE RATHER
+          // THAN A COPY: the three models produce contact probabilities at
+          // different moments (AF3 and EF2-fast with the trunk, AF2 with each
+          // pass, on the device), so it holds the OBJECT that carries them. It
+          // was three fields and the archive knew two of them.
           contactProbs: pred.contactSource?.contactProbs,
         },
       },
@@ -5790,7 +6197,7 @@ element("download-all").addEventListener("click", async () => {
  * where it arrives.
  */
 async function rememberSessionWhenSettled(pred) {
-  if (!pred?.pdb) return;
+  if (!pred?.pdb || colabRole() === "runtime") return;   // see rememberSession
   const registry = window.py2dmol_viewers ?? {};
   const renderer = registry[Object.keys(registry)[0]]?.renderer;
   const count = () => renderer?.objectsData?.[pred.stem]?.frames?.length ?? 0;
@@ -5812,6 +6219,11 @@ async function rememberSessionWhenSettled(pred) {
 
 async function rememberSession(pred) {
   if (!pred?.pdb) return;
+  // 🔴 NOT ON A COLAB RUNTIME. Nobody reloads that page to get a fold back -
+  // the reader's own page saves what it was sent - and the save is the whole
+  // viewer session stringified and gzipped: 94-229 ms of main thread after each
+  // fold on an A100 box, twice that on a runtime's CPU, in the way of the next.
+  if (colabRole() === "runtime") return;
   try {
     // 🔴 py2Dmol BUILDS THIS, NOT US. `buildViewerState` is what its own Save
     // button writes, so the session carries every frame - the whole sampler

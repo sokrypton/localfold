@@ -147,11 +147,28 @@ export function parseCcdComponent(text) {
   // stays an error.
   const monatomic = atomLoop.rows.filter(
     (row) => !["H", "D"].includes((at(row, "type_symbol") ?? "").toUpperCase())).length === 1;
-  const coordinate = (row, axis) => {
-    for (const column of [`pdbx_model_Cartn_${axis}_ideal`, `model_Cartn_${axis}`]) {
-      const parsed = Number.parseFloat(at(row, column));
-      if (Number.isFinite(parsed)) return parsed;
+  // 🔴 AND ONE FRAME FOR THE WHOLE COMPONENT. AF3 takes the model coordinates for EVERY atom when any
+  // ideal one is "?" (features.py's '?' in pos) - mixing ideal and model atoms puts two frames in
+  // one conformer - and they are a CRYSTAL frame, TAC's 20-35 A from the origin, where AF3 itself
+  // feeds an RDKit conformer about it and `ref_pos` is an atom feature as well as an offset. So
+  // model coordinates are centred on their heavy atoms (AF3's tetracycline example: worst
+  // ref_pos 46.8 A against its batch before).
+  const heavy = atomLoop.rows.filter(
+    (row) => !["H", "D"].includes((at(row, "type_symbol") ?? "").toUpperCase()));
+  const ideal = heavy.every((row) => ["x", "y", "z"].every(
+    (axis) => Number.isFinite(Number.parseFloat(at(row, `pdbx_model_Cartn_${axis}_ideal`)))));
+  const modelCentre = { x: 0, y: 0, z: 0 };
+  if (!ideal && !monatomic) {
+    for (const axis of ["x", "y", "z"]) {
+      let sum = 0;
+      for (const row of heavy) sum += Number.parseFloat(at(row, `model_Cartn_${axis}`));
+      modelCentre[axis] = sum / heavy.length;
     }
+  }
+  const coordinate = (row, axis) => {
+    const column = ideal ? `pdbx_model_Cartn_${axis}_ideal` : `model_Cartn_${axis}`;
+    const parsed = Number.parseFloat(at(row, column));
+    if (Number.isFinite(parsed)) return ideal ? parsed : Math.round((parsed - modelCentre[axis]) * 1000) / 1000;
     if (monatomic) return 0;
     throw new Error(`${code} has no usable ${axis} coordinate`);
   };
@@ -192,9 +209,54 @@ export function parseCcdComponent(text) {
     const from = byName.get(bondAt(row, "atom_id_1"));
     const to = byName.get(bondAt(row, "atom_id_2"));
     if (from === undefined || to === undefined) continue;   // a bond to a hydrogen
-    bonds.push({ from, to, order: BOND_ORDERS[bondAt(row, "value_order") ?? "SING"] ?? 1 });
+    // 🔴 AN AROMATIC FLAG WINS OVER THE VALUE ORDER, AS IN AF3's `_ccd_bond_orders` (code 4): a
+    // guanine's imidazole is written SING/DOUB with pdbx_aromatic_flag Y, and the reference's bond
+    // order for those five bonds is AROMATIC - what boltz2's bond-type plane reads.
+    const aromatic = (bondAt(row, "pdbx_aromatic_flag") ?? "N").toUpperCase() === "Y";
+    bonds.push({ from, to, order: aromatic ? 4 : (BOND_ORDERS[bondAt(row, "value_order") ?? "SING"] ?? 1) });
   }
-  return { code, atoms, bonds };
+  // 🔴 THE PARENT IS THE DICTIONARY'S, NOT THE SEQUENCE'S. AF3 replaces the residue with the
+  // component and takes its restype from `mon_nstd_parent_comp_id`, so a modification on a
+  // position whose letter is another residue still reads as its own parent - AlphaFold 3's own
+  // modified_rna example puts 2'-O-methylguanosine on a C, and its tokens are G's.
+  const named = text.match(/_chem_comp\.mon_nstd_parent_comp_id\s+(\S+)/)?.[1]?.replace(/['"]/g, "");
+  const parent = named === undefined || named === "?" || named === "." ? null : named.split(",")[0].toUpperCase();
+  return { code, atoms, bonds, parent };
+}
+
+/**
+ * Several components as ONE ligand chain - a glycan written as AlphaFold 3's
+ * `ccdCodes: ["NAG", "NAG", "BMA", "MAN", "MAN"]`. AF3 makes each component a
+ * residue of one chain: its atoms are tokens numbered by component (residue
+ * 1..5), each component its own reference conformer, every heavy atom kept (no
+ * leaving atom is dropped for a ligand, bonded or not), its own bonds inside it,
+ * and the links between components left to the job's bondedAtomPairs.
+ *
+ * @returns the parseCcdComponent shape, plus `residues: {code, from, count}[]`
+ */
+export function ligandChain(components) {
+  if (components.length === 1) return components[0];
+  const atoms = [];
+  const bonds = [];
+  const residues = [];
+  for (const component of components) {
+    const from = atoms.length;
+    residues.push({ code: component.code, from, count: component.atoms.length });
+    atoms.push(...component.atoms);
+    for (const bond of component.bonds) bonds.push({ ...bond, from: bond.from + from, to: bond.to + from });
+  }
+  return { code: components.map((c) => c.code).join("-"), atoms, bonds, residues };
+}
+
+// A parent component's one-letter code in its chain's alphabet (SER -> S, DC -> C, G -> G), or null
+const AMINO_LETTERS = { ALA: "A", ARG: "R", ASN: "N", ASP: "D", CYS: "C", GLN: "Q", GLU: "E", GLY: "G",
+  HIS: "H", ILE: "I", LEU: "L", LYS: "K", MET: "M", PHE: "F", PRO: "P", SER: "S", THR: "T", TRP: "W",
+  TYR: "Y", VAL: "V" };
+export function parentLetter(parent, kind) {
+  if (parent === null || parent === undefined) return null;
+  if (kind === "protein") return AMINO_LETTERS[parent] ?? null;
+  if (kind === "dna") return { DA: "A", DC: "C", DG: "G", DT: "T" }[parent] ?? null;
+  return ["A", "C", "G", "U"].includes(parent) ? parent : null;
 }
 
 /**
@@ -215,9 +277,11 @@ export function parseCcdComponent(text) {
  * @param {{code: string, atoms: object[], bonds: object[]}} component
  * @param {boolean} isCTerminal
  */
-export function polymerResidue(component, isCTerminal) {
+export function polymerResidue(component, isTerminal, terminalAtom = "OXT") {
+  // the leaving atom a terminal residue keeps: a protein's OXT at its C-terminus, a nucleotide's OP3
+  // at its 5' end (a modified base drops its OP3 mid-chain, as its parent nucleotide does)
   const keep = component.atoms.map(
-    (atom) => !atom.leaving || (isCTerminal && atom.name === "OXT"));
+    (atom) => !atom.leaving || (isTerminal && atom.name === terminalAtom));
   const renumbered = [];
   let next = 0;
   for (let index = 0; index < component.atoms.length; index += 1) {
@@ -225,6 +289,7 @@ export function polymerResidue(component, isCTerminal) {
   }
   return {
     code: component.code,
+    parent: component.parent ?? null,
     // 🔴 EACH KEPT ATOM REMEMBERS ITS INDEX IN THE COMPONENT, because a
     // one-token modified residue is laid out by that index and NOT compacted.
     // AF3 leaves the removed atom's dense slot EMPTY: a phosphoserine in the

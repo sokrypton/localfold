@@ -14,7 +14,7 @@
  * no alignment the MSA is the query alone, which is what AF3 itself produces
  * for a single-sequence input rather than a stub.
  */
-import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
+import { ccdUrl, parseCcdComponent, ligandChain } from "../src/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../src/chem/component.js";
 import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
 import { featuriserDialect } from "../src/af3/dialect.js";
@@ -630,6 +630,12 @@ export async function foldAf3(options) {
   }
   const ligands = [];
   for (const entry of options.ligandCodes ?? []) {
+    if (entry.codes !== undefined) {      // several components as one chain (a glycan)
+      const parts = [];
+      for (const code of entry.codes) { await component(code, "ligand"); parts.push(componentCache.get(code)); }
+      ligands.push(ligandChain(parts));
+      continue;
+    }
     // 🔴 A LIGAND IS EITHER A CODE OR A STRUCTURE, AND IT SAYS WHICH RATHER
     // THAN BEING SNIFFED. A plain string is a CCD code, as it always was; an
     // object carrying `smiles` is a molecule drawn out. Guessing between them
@@ -655,6 +661,8 @@ export async function foldAf3(options) {
 
   const { batch, rows } = af3BatchFromA3m(sequence, alignment, {
     maxSequences: options.maxMsaSequences,
+    // a job's own alignments cover nucleic chains too: each column's alphabet
+    ...(options.msaColumnKinds === undefined ? {} : { msaColumnKinds: options.msaColumnKinds }),
     seed: options.seed ?? 0,
     ligands,
     modifications,
@@ -804,6 +812,7 @@ export async function foldAf3(options) {
       tokens: batch.tokens,
       minConfidence: template.minConfidence ?? 0,
       spanChains: template.spanChains === true,
+      ...(template.mapping === undefined ? {} : { mapping: template.mapping }),
       tokenOf: (residue) => tokenOfResidue[(residuesOfChain[template.chain] ?? [])[residue]
         ?? -1] ?? -1,
     })).map((built) => {

@@ -27,6 +27,8 @@
  */
 /** A fold whose largest pair tensor is this size or more releases its weights. */
 const WEIGHT_RELEASE_MIN_BYTES = 64 * 1024 * 1024;
+/** The largest trunk pair copied to the host when nothing needs it there. */
+const HOST_PAIR_MAX_BYTES = 1024 * 1024 * 1024;
 import { ELEMENT_SYMBOLS } from "./featurise/ccd-component.js";
 import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
   from "./feature-convergence.js";
@@ -146,19 +148,53 @@ export function atomName(nameChars, slot) {
  * not ask for would change what every one of them parses.
  */
 export function toPdb(batch, positions, plddt, options = {}) {
-  const { tokens, dense, sequence } = batch;
+  // 🔴 ONE TEMPLATE A BATCH, BECAUSE A TRAJECTORY IS 25 FILES OF THE SAME
+  // RECORDS. Everything in an ATOM line but the coordinates and the B-factor -
+  // serial, name, residue, chain, element, TER, CONECT - is fixed by the batch,
+  // and it was rebuilt for every frame: 26 PDBs after each AF3 fold, ~100 ms at
+  // 255 residues on the critical path, doubled on a Colab runtime's CPU.
+  const { records, conect } = pdbTemplate(batch);
   const lines = [];
   // ...first, before any coordinate record: a reader that stops at the first
   // ATOM never sees anything written after one, and most readers do.
   for (const text of options.remark ?? []) lines.push(`REMARK   1 ${text}`);
+  for (const record of records) {
+    if (record === "TER") { lines.push("TER"); continue; }
+    const { slot, head, tail } = record;
+    const confidence = plddt ? plddt[slot] : 0;
+    lines.push(head
+      + positions[slot * 3].toFixed(3).padStart(8)
+      + positions[slot * 3 + 1].toFixed(3).padStart(8)
+      + positions[slot * 3 + 2].toFixed(3).padStart(8)
+      + "  1.00" + confidence.toFixed(2).padStart(6) + tail);
+  }
+  for (const line of conect) lines.push(line);
+  lines.push("END");
+  return lines.join("\n");
+}
+
+const PDB_TEMPLATES = new WeakMap();
+
+/** The position-free part of `toPdb`'s output for a batch, built once. */
+function pdbTemplate(batch) {
+  const cached = PDB_TEMPLATES.get(batch);
+  if (cached !== undefined) return cached;
+  const { tokens, dense, sequence } = batch;
+  const records = [];
+  const conect = [];
   let serial = 1;
   // 🔴 ONE LETTER PER CHAIN, NOT "A" FOR EVERYTHING. A complex written as one
   // chain is a single 126-residue protein as far as any viewer or scoring tool
   // is concerned, with a peptide bond implied across an interface that has
   // none.
+  // 🔴 SIXTY-TWO, NOT TWENTY-SIX: a PDB chain is one character, and the 27th chain of a large
+  // complex wrapped back onto A and was MERGED with it in every reader. Upper case, then lower case,
+  // then digits - the convention viewers accept - before the format runs out (an mmCIF names them
+  // all; native/af3 writes one with --out=*.cif).
+  const CHAIN_CHARACTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const chainLetter = (token) => {
     const asym = batch.asymId === undefined ? 1 : batch.asymId[token];
-    return "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[(asym - 1) % 26];
+    return CHAIN_CHARACTERS[(asym - 1) % CHAIN_CHARACTERS.length];
   };
   // 🔴 A LIGAND IS HETATM, AND IT HAS A NAME. `sequence` covers the polymers,
   // so a ligand token indexed into it is undefined and used to be written as a
@@ -207,8 +243,7 @@ export function toPdb(batch, positions, plddt, options = {}) {
       if (!batch.predDenseAtomMask[slot]) continue;
       if (ligandCode !== undefined && atom === 0) serialOfToken.set(token, serial);
       const name = atomName(batch.displayAtomNameChars ?? batch.refAtomNameChars, slot);
-      const confidence = plddt ? plddt[slot] : 0;
-      lines.push(
+      records.push({ slot, head:
         (ligandCode === undefined ? "ATOM  " : "HETATM")
         + String(serial).padStart(5) + " "
         + (name.length < 4 ? ` ${name}`.padEnd(4) : name.slice(0, 4)) + " "
@@ -220,17 +255,13 @@ export function toPdb(batch, positions, plddt, options = {}) {
         // chain by a residue, which against a helical protein reads as a 3.7 A
         // RMSD and a TM-score of 0.37 - a plausible "wrong fold" rather than an
         // obvious bug. The real number was 0.69 A.
-        + String(batch.features.residueIndex[token]).padStart(4) + "    "
-        + positions[slot * 3].toFixed(3).padStart(8)
-        + positions[slot * 3 + 1].toFixed(3).padStart(8)
-        + positions[slot * 3 + 2].toFixed(3).padStart(8)
-        + "  1.00" + confidence.toFixed(2).padStart(6) + "          "
-        + elementSymbol(batch.refElement[slot]).padStart(2));
+        + String(batch.features.residueIndex[token]).padStart(4) + "    ",
+      tail: "          " + elementSymbol(batch.refElement[slot]).padStart(2) });
       serial += 1;
     }
     if (batch.asymId !== undefined && token + 1 < tokens
         && batch.asymId[token + 1] !== batch.asymId[token]) {
-      lines.push("TER");
+      records.push("TER");
     }
   }
   // 🔴 CONECT, OR THE LIGAND IS A BAG OF ATOMS. A viewer handed no bonds
@@ -265,11 +296,12 @@ export function toPdb(batch, positions, plddt, options = {}) {
     for (let start = 0; start < bonded.length; start += 4) {
       let line = "CONECT" + String(atom).padStart(5);
       for (const other of bonded.slice(start, start + 4)) line += String(other).padStart(5);
-      lines.push(line);
+      conect.push(line);
     }
   }
-  lines.push("END");
-  return lines.join("\n");
+  const template = { records, conect };
+  PDB_TEMPLATES.set(batch, template);
+  return template;
 }
 
 /**
@@ -735,6 +767,27 @@ async function foldHolding(device, batch, weights, options, held) {
   // them as its device prior says. `largeFoldReleasesWeights: false` opts out.
   const largestTokens = weights.trunk?.dialect?.structuralTokens === true
     ? Math.max(batch.tokens, structuralLayout(batch).tokens) : batch.tokens;
+  // 🔴 AND A FOLD WHOSE PAIR CANNOT BE BOUND IS REFUSED HERE, NOT TEN MINUTES
+  // IN. Every pair-sized dispatch binds `tokens^2 x pairChannels` floats, and
+  // a binding is capped at maxStorageBufferBindingSize - 2 GiB on NVIDIA,
+  // whatever memory the card has - so the ceiling is sqrt(limit / (channels x
+  // 4)) tokens: 2047 for AF3, 1023 for IntelliFold-2's 512-channel pair, and
+  // for OpenDDE, which expands each residue into subtokens, about 590
+  // residues. Past it a fold ran for minutes and died on "uncaptured: Binding
+  // size (3465222144) of [Buffer "expand.pair-out"] is larger than the
+  // maximum storage buffer binding size" (OpenDDE at 768 residues).
+  const pairChannelsForCeiling = weights.trunk?.embedder?.pairChannels ?? 128;
+  const ceilingTokens = Math.floor(Math.sqrt(
+    device.limits.maxStorageBufferBindingSize / (pairChannelsForCeiling * 4)));
+  if (largestTokens > ceilingTokens) {
+    const expanded = largestTokens > batch.tokens
+      ? ` (${batch.tokens} tokens, expanded to ${largestTokens} by this model)` : "";
+    throw new Error(`This job is too large for this GPU: its pair representation is`
+      + ` ${largestTokens} tokens${expanded} and this model can bind at most`
+      + ` ${ceilingTokens} here (${pairChannelsForCeiling} channels against a`
+      + ` ${Math.floor(device.limits.maxStorageBufferBindingSize / 1048576)} MiB binding limit).`
+      + " Try a shorter sequence or a model with a narrower pair.");
+  }
   // 🔴 64 MiB, NOT THE CHUNKING'S 128: the trade differs. IntelliFold-2 at 255
   // residues (127 MiB a pair tensor) was 4458 MiB held against 3343 released,
   // for +3% on a warm fold (23.65 -> 24.37 s).
@@ -1053,12 +1106,28 @@ async function foldHolding(device, batch, weights, options, held) {
   // did. A tolerance, or a caller asking for `recycleDeltas`, reads every pass
   // as before, because both compare host arrays.
   let previousBuffers;
-  // 🔴 OpenDDE'S EXPANDER READS THE LAST PASS'S PAIR, SO THAT PASS KEEPS IT ON
-  // THE DEVICE. The host array is still read back - a retry resumes from it -
-  // but the expander binds this instead of uploading `tokens^2 x 384` again.
-  // Only this loop sets it, never a resumed trunk, whose allocation is gone.
-  const keepFinalPair = weights.trunk.dialect.structuralTokens === true;
+  // 🔴 THE LAST PASS'S PAIR STAYS ON THE DEVICE, FOR EVERY MODEL. OpenDDE's
+  // expander binds it, and so do the diffusion conditioning and the confidence
+  // head, which used to upload `tokens^2 x pairChannels` from the host copy
+  // each - 133 MB apiece for IntelliFold-2 at 255 tokens. The host array is
+  // still read back: a retry and a re-sampled fold resume from it. Only this
+  // loop sets it, never a resumed trunk, whose allocation is gone - and then
+  // both consumers upload from the host as they always did.
+  const keepFinalPair = true;
   let finalPair;
+  // 🔴 AND PAST A GIGABYTE THE HOST COPY IS NOT MADE AT ALL, unless something
+  // can only read a host array. AlphaFold 3's pair at 2047 tokens is 2 GiB:
+  // the browser refused the mappable buffer for it ("Failed to allocate memory
+  // for buffer mapping") and then the Float32Array itself ("Array buffer
+  // allocation failed"), each after a whole trunk had run - and the sampler
+  // and the confidence head bind the device copy anyway (RoseTTAFold3's global
+  // norm streams it in pieces). What does need the host array: OpenDDE's expander,
+  // the recycle diagnostics and the oracle's seams. A trunk without it is not
+  // offered for resumption, since resuming uploads it.
+  const hostPairWanted = tokens * tokens * trunkPairChannels * 4 <= HOST_PAIR_MAX_BYTES
+    || weights.trunk.dialect.structuralTokens === true
+    || (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true
+    || options.recycleDistances === true || options.onSeam !== undefined;
   const readEveryPass = (options.recycleTolerance ?? 0) > 0 || options.recycleDeltas === true
     || options.recycleDistances === true;
   void trunkPairChannels; void trunkSingleChannels;
@@ -1139,14 +1208,24 @@ async function foldHolding(device, batch, weights, options, held) {
       contactClasses: af3ContactClasses(batch, tokens),
     }, weights.trunk, weights.trunk.dialect, {
       keepOutputs: !lastPass || keepFinalPair,
-      readback: { pair: readAll, single: readAll,
-                  logits: readAll || featureTolerance > 0 || options.recycleDistances === true },
+      // 🔴 THE LOGITS ONLY WHERE SOMETHING READS THEM: the distance diagnostics,
+      // or a caller that says so (`trunkLogits`). They were read on every last
+      // pass - `L^2 * 64` floats, 16.6 MB at 255 tokens and 256 MB at 1000 -
+      // for a fold that uses the contact map computed beside them.
+      readback: { pair: readAll && hostPairWanted, single: readAll,
+                  logits: options.trunkLogits === true || featureTolerance > 0
+                    || options.recycleDistances === true },
       onStage: (name, ms) => stage("trunk", { name, ms }),
+      // ...and the previous pass's buffers, once the embedder has read them.
+      onEmbedded: () => { held.drop(recycledFrom?.pair); held.drop(recycledFrom?.single); },
       // The trunk's own seams, for a caller holding the reference's taps.
       ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
       // ...the MSA stack's first-half stop point, for bisecting one block
       // against the oracle. See src/af3/trunk/msa-stack-webgpu.js.
       ...(options.stopAfterOpm === true ? { stopAfterOpm: true } : {}),
+      // ...and the pair track's scratch layout, which the budget decides unless
+      // a caller forces it (the control arm; see trunk-webgpu.js).
+      ...(options.leanPair === undefined ? {} : { leanPair: options.leanPair }),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
       // Four of the trunk's five stages report nothing while they run, and on a
       // large protein each is seconds. See af3TrunkStageSpans.
@@ -1246,7 +1325,8 @@ async function foldHolding(device, batch, weights, options, held) {
   // retrying re-ran every pass of work that had already succeeded. The loop
   // above has finished by here, so this carries all the recycles that were
   // asked for.
-  stage("trunk-done", { trunk, reusable: { trunk, targetFeat, recycles } });
+  stage("trunk-done", { trunk,
+    reusable: trunk.pair === undefined ? undefined : { trunk, targetFeat, recycles } });
 
   // 🔴 AND THE PAIRFORMER'S WEIGHTS GO BACK HERE, for the same reason the
   // diffusion transformer's go back below: the stage that can read them is
@@ -1286,7 +1366,8 @@ async function foldHolding(device, batch, weights, options, held) {
                                      finalPair, held)
     : undefined;
   const headInput = structural === undefined
-    ? { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair }
+    ? { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair,
+        ...(finalPair === undefined ? {} : { trunkPairBuffer: finalPair.buffer }) }
     : structural.headInput;
 
   // 🔴 TWO WAYS TO TURN THE TRUNK INTO COORDINATES, AND THEY ARE NOT THE SAME
@@ -1448,6 +1529,15 @@ async function foldHolding(device, batch, weights, options, held) {
     }
     return new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
       tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
+      // ...the trunk's own pair, copied on the device rather than uploaded
+      // again. Not on OpenDDE's path: its expander has already released it.
+      ...(finalPair === undefined || structural !== undefined ? {} : {
+        pairBuffer: finalPair.buffer,
+        // 🔴 RELEASED AS SOON AS THE HEAD HAS COPIED IT, NOT AT THE FOLD'S END.
+        // Held through the confidence blocks it was 1.6 GB at 896 residues of
+        // IntelliFold-2, which a Colab T4 refused 22 minutes in.
+        releasePairBuffer: () => { held.drop(finalPair); finalPair = undefined; },
+      }),
       // 🔴 boltz2's HEAD REBUILDS z, so it needs what the EMBEDDER needed:
       // relative positions, the bond matrix and its orders. AF3's reads none of
       // them and the field is simply absent there.
@@ -1712,7 +1802,7 @@ async function foldHolding(device, batch, weights, options, held) {
     chainPtm, chainIptm,
     // What a caller hands back to skip the trunk next time. Returned even when
     // it was reused, so the cache survives a chain of re-samples.
-    reusable: { trunk, targetFeat, recycles },
+    reusable: trunk.pair === undefined ? undefined : { trunk, targetFeat, recycles },
     meanPlddt, atoms, scores,
     // Per RESIDUE, from the alpha carbon - which is what pLDDT means when it is
     // shown on a cartoon, and what a per-residue check has to compare against.

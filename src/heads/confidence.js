@@ -278,7 +278,9 @@ export class ConfidenceHeadsGpu {
         const pass = encoder.beginComputePass(); pass.setPipeline(pipeline);
         pass.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
-          entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+          entries: buffers.map((buffer, binding) => ({ binding, resource: buffer.byteSize === undefined
+            ? { buffer: buffer.buffer }
+            : { buffer: buffer.buffer, offset: buffer.byteOffset, size: buffer.byteSize } })),
         }));
         pass.dispatchWorkgroups(x, y); pass.end();
       };
@@ -292,7 +294,29 @@ export class ConfidenceHeadsGpu {
       linearDispatch(act0, params[1], act1Raw, length, hiddenChannels);
       dispatch(relu, [act1Raw, act1], Math.ceil(act1Raw.byteLength / 4 / 64));
       linearDispatch(act1, params[2], lddtLogits, length, lddtBins);
-      linearDispatch(pair, params[3], paeLogits, length * length, paeBins);
+      // 🔴 THE PAE PROJECTION'S ROWS ARE EVERY PAIR, 32 TO A WORKGROUP IN Y, so
+      // past 1448 residues it asked for more than the 65535 workgroups a
+      // dimension allows - "Dispatch workgroup count Y (80000) exceeds max" at
+      // 1600 - and no AF2 fold that long could finish. Row chunks, each bound
+      // as its own slice of the pair and the logits with its own row count:
+      // the same rows through the same kernel.
+      {
+        const pairRows = length * length;
+        const chunkRows = 65535 * TRANSITION_TILE_ROWS;
+        if (pairRows <= chunkRows) {
+          linearDispatch(pair, params[3], paeLogits, pairRows, paeBins);
+        } else {
+          for (let first = 0; first < pairRows; first += chunkRows) {
+            const rows = Math.min(chunkRows, pairRows - first);
+            const slice = (allocation, width) => ({ buffer: allocation.buffer,
+              byteOffset: first * width * 4, byteSize: rows * width * 4 });
+            linearDispatch(slice(pair, pairChannels),
+              linearParams(`confidence.pae-params-${first}`, rows, pairChannels, paeBins,
+                           offsets[8], offsets[9]),
+              slice(paeLogits, paeBins), rows, paeBins);
+          }
+        }
+      }
       // ...and both PAE expectations, where the logits already are.
       const centers = paeCenters(breaks);
       const tmPerBin = tmPerBinFor(centers, tmScoreD0(length));

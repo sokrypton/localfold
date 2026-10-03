@@ -1,5 +1,5 @@
 import { storageArray, storedElement, storedPair } from "../../runtime/storage.js";
-import { packNamedWeights } from "../../weights/weight-pack.js";
+import { packNamedWeights, weightLength } from "../../weights/weight-pack.js";
 // 🔴 ONE COPY, IN THE LOWER MODULE. This file and src/kernels/triangle/shaders.js each
 // stage the same eight-row LayerNorm, and both come to EXACTLY 16,960 bytes at
 // 512 channels - so fixing one left the error byte-for-byte identical and read
@@ -188,10 +188,10 @@ function transposeOutChannels(values, channels, width) {
 export function packGridAttentionWeights(weights, shape = undefined) {
   const width = (shape?.width) ?? weights.heads * weights.dimension;
   const sizeOf = (name) => name === "qkvgProjection"
-    ? QKVG.reduce((total, part) => total + weights[part].length, 0)
-    : weights[name].length;
+    ? QKVG.reduce((total, part) => total + weightLength(weights, part), 0)
+    : weightLength(weights, name);
   for (const name of [...GRID_ORDER.filter((n) => n !== "qkvgProjection"), ...QKVG]) {
-    if (weights[name] === undefined) throw new Error(`grid attention weights missing ${name}`);
+    if (weightLength(weights, name) === undefined) throw new Error(`grid attention weights missing ${name}`);
   }
   const laid = (name) => {
     const values = weights[name];

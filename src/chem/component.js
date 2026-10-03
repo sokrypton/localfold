@@ -130,8 +130,16 @@ export async function smilesComponent(smiles, options = {}) {
   return {
     code,
     atoms,
+    // an aromatic ring's bonds AROMATIC (4) - what a CCD component's pdbx_aromatic_flag gives and
+    // AF3's bond-order feature takes - not their Kekule 1s and 2s, so a SMILES ligand and its
+    // dictionary twin hand the model the same bond orders
+    // ...and a RING-CLOSURE bond from the atom that closes the ring to the one that opened it, as
+    // RDKit creates it (C1CC1: (0,1) (1,2) (2,0)) and so as AlphaFold 3's SMILES path lists it - the
+    // direction is a feature for a model that does not symmetrise its bonds (AF3's kitchen-sink job:
+    // its SMILES ligand's three ring bonds came out reversed against the reference's batch)
     bonds: graph.bonds.map((bond) => ({
-      from: bond.from, to: bond.to, order: Math.round(bond.order),
+      from: bond.ring ? bond.to : bond.from, to: bond.ring ? bond.from : bond.to,
+      order: bond.aromatic ? 4 : Math.round(bond.order),
     })),
     smiles,
     conformerError: best.error,
@@ -161,20 +169,19 @@ const round = (value) => Math.round(value * 1000) / 1000;
  * `component.js`'s caller rather than silently renamed.
  */
 function nameAtoms(atoms, graph) {
+  // AlphaFold 3's own rule for a molecule with no dictionary names
+  // (rdkit_utils.assign_atom_names_from_graph): the element in upper case and its
+  // count so far - C1, C2, ..., CL1 - every atom numbered, a lone sulfur S1 and
+  // not S. The names are a model input (ref_atom_name_chars), so the dictionary's
+  // habit of leaving a lone atom unnumbered read one character apart on AF3's
+  // streptavidin/biotin job.
   const counts = new Map();
   atoms.forEach((atom, index) => {
-    const symbol = ELEMENT_SYMBOLS[graph.atoms[index].element - 1] ?? "X";
+    const symbol = (ELEMENT_SYMBOLS[graph.atoms[index].element - 1] ?? "X").toUpperCase();
     const next = (counts.get(symbol) ?? 0) + 1;
     counts.set(symbol, next);
-    // A component with ONE carbon calls it C, not C1, which is what the
-    // dictionary does for a monatomic ion and for a lone substituent.
     atom.name = `${symbol}${next}`;
   });
-  for (const [symbol, total] of counts) {
-    if (total !== 1) continue;
-    const only = atoms.find((atom) => atom.name === `${symbol}1`);
-    if (only !== undefined) only.name = symbol;
-  }
 }
 
 /**

@@ -164,6 +164,9 @@ export function parseCIFAtoms(text) {
         resName: pick(row, "auth_comp_id", pick(row, "label_comp_id", "")).toUpperCase(),
         chain: pick(row, "auth_asym_id", pick(row, "label_asym_id", "A")),
         resSeq: parseInt(pick(row, "auth_seq_id", pick(row, "label_seq_id", "0")), 10),
+        // (the position in the entity's FULL sequence, unresolved residues counted - what an AF3 job's
+        // templateIndices index; NaN where the file has none)
+        labelSeq: parseInt(pick(row, "label_seq_id", "."), 10),
         iCode: iCode === "." || iCode === "?" ? "" : iCode,
         x: parseFloat(pick(row, "Cartn_x", "0")),
         y: parseFloat(pick(row, "Cartn_y", "0")),

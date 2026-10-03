@@ -22,7 +22,11 @@
  * against a run that takes tens of seconds. That is not worth the plumbing, and
  * the stage boundary is where a caller wants to be able to look anyway.
  */
-import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { GpuBufferAllocator, settleReleasedMemory } from "../../runtime/allocator.js";
+import { memoryTotals } from "../../runtime/device-memory.js";
+
+/** The largest tensor the distogram head reads back through one mapping. */
+const READBACK_PIECE_BYTES = 256 * 1048576;
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { Af3EmbedderGpu } from "./embedder-webgpu.js";
 import { Af3MsaStackGpu } from "./msa-stack-webgpu.js";
@@ -186,6 +190,15 @@ export class Af3TrunkGpu {
     const tokens = input.tokens;
     const pairs = tokens * tokens;
     const timings = {};
+    // 🔴 ONE POOL FOR THE TWO STACKS' PAIR SCRATCH, SO THEY SHARE IT. The MSA
+    // stack and the pairformer each allocated five pair-sized scratch buffers
+    // and destroyed them when done - and the driver returns a destroyed
+    // buffer's memory only on a later device tick, so on the card the two sets
+    // overlapped: IntelliFold-2 at 512 residues peaked at 7.6 GB by nvidia-smi
+    // with 4.0 GB live, which is what ran a T4 out of memory at 768. Released
+    // into this pool, the MSA stack's scratch is the pairformer's; destroyed
+    // once, when the pass is done and drained.
+    const scratchAllocator = new GpuBufferAllocator(this.device, true);
     // 🔴 ANNOUNCED BEFORE IT RUNS, NOT ONLY AFTER IT FINISHES. `onStage` fires
     // with a duration, so it can only ever mark a stage that is over - and on a
     // large protein the MSA stack alone is seconds, which the page spent
@@ -256,6 +269,12 @@ export class Af3TrunkGpu {
       () => new Af3EmbedderGpu(this.device).run(input, weights.embedder,
                                                 { ...options, keepOnDevice: true, validation }));
     const owned = [embedded.pairAllocation, embedded.msaAllocation, embedded.singleAllocation];
+    // 🔴 THE PREVIOUS PASS'S PAIR AND SINGLE ARE READ BY THE EMBEDDER AND
+    // NOTHING ELSE, so the caller may let them go now rather than when this
+    // pass returns. Held to the end, every recycled pass carried SEVEN
+    // pair-sized buffers (the old pair, the new one, five scratch) where the
+    // first carried six. The queue orders a destroy behind the embedder's reads.
+    options.onEmbedded?.();
     try {
       const pair = embedded.pairAllocation;
       // 🔴 A SNAPSHOT, because the template stage adds INTO this same buffer.
@@ -298,6 +317,9 @@ export class Af3TrunkGpu {
         // 🔴 THE TEMPLATE TERM IS ADDED INTO THE EMBEDDER'S PAIR, on the device
         // now: `pairBuffer` is read as z and updated in place as z + term.
         weights.template, dialect, { ...options, pairBuffer: pair.buffer, validation }));
+      // ...and its working set given back to the driver before the MSA stack
+      // asks for five pair-sized buffers of its own: see settleReleasedMemory.
+      await settleReleasedMemory(this.device);
       const afterTemplate = await readSeam("tap.z_after_template", pair, pairElements);
       // ...and the template module's OWN output, which is what the reference
       // traces as `evoformer/template_embedding`. `z_after_template` is
@@ -331,10 +353,24 @@ export class Af3TrunkGpu {
         encoder.copyBufferToBuffer(pair.buffer, 0, preMsa.buffer, 0, pairElements * 4);
         this.device.queue.submit([encoder.finish()]);
       }
-      await stage("msa-stack", () => new Af3MsaStackGpu(this.device, this.options).run(
+      // 🔴 FIVE PAIR-SIZED SCRATCH BUFFERS OR THREE AND A QUARTER, AND THE
+      // BUDGET DECIDES. The matrix-unit kernels need the whole-tensor layout
+      // (five), the vector ones run the grid by row chunks and the triangle by
+      // channel quarters (see `compact` in pair-track-gpu.js). IntelliFold-2 at
+      // 1000 residues peaked at 12.65 GB in this stage with 9.8 GB of it that
+      // scratch, where nothing after the trunk passes 7.4 GB - so where the
+      // whole layout would not fit, both stacks (they share one pool) take the
+      // lean one instead of refusing the fold. A device with no budget, or room
+      // to spare, keeps the matrix kernels.
+      const { residentBytes, budgetBytes } = memoryTotals(this.device);
+      const leanPair = options.leanPair ?? (budgetBytes != null
+        && residentBytes + 5 * pairElements * 4 + 512 * 1048576 > budgetBytes);
+      const trackOptions = leanPair ? { ...this.options, pairMatrixKernels: false } : this.options;
+      this.lastLeanPair = leanPair;
+      await stage("msa-stack", () => new Af3MsaStackGpu(this.device, trackOptions).run(
         { pairMask: input.pairMask, msaMask: input.msaMask, tokens, sequences: input.sequences },
         weights.msaBlocks, dialect,
-        { ...options, stopAfterOpm: options.stopAfterOpm === true,
+        { ...options, stopAfterOpm: options.stopAfterOpm === true, scratchAllocator,
           pairBuffer: pair.buffer, msaBuffer: embedded.msaAllocation.buffer, validation }));
       if (doubleAdd) {
         const add = await this.pipelines.get(`af3-trunk:add:${pairElements}`,
@@ -373,10 +409,10 @@ export class Af3TrunkGpu {
       const head = await this.#prepareDistogram(input.pairMask, tokens,
                                                 weights.distogram, input.contactClasses);
       owned.push(...head.allocations);
-      const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, this.options).run(
+      const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, trackOptions).run(
         { pairMask: input.pairMask, seqMask: input.seqMask, tokens },
         weights.pairformerBlocks, dialect, {
-          ...options,
+          ...options, scratchAllocator,
           pairBuffer: pair.buffer, singleBuffer: embedded.singleAllocation.buffer,
           deferReadback: true, validation,
           onBlock: (index) => options.onPairformerBlock?.(index,
@@ -385,6 +421,14 @@ export class Af3TrunkGpu {
           // line should show. See the note in pairformer-block-webgpu.js.
           onBlockDone: (completed, total) => options.onPairformerBlockDone?.(completed, total),
         }));
+      // 🔴 THE SCRATCH IS DONE WITH ONCE THE PAIRFORMER IS, SO IT GOES NOW. The
+      // pool lived to the end of the pass, which put five pair-sized buffers
+      // beside the distogram's readback of the pair: IntelliFold-2 at 896
+      // residues was refused on a T4-sized budget for `af3-disto.readback`
+      // (1568 MiB) with 7.8 GB of finished scratch still held. Queue order
+      // keeps the destroy behind the blocks still in flight.
+      scratchAllocator.destroyPooled();
+      await settleReleasedMemory(this.device);
       // The pairformer's own encode/wait split, carried out so a bench can report
       // where the stack's wall time went without re-instrumenting it.
       this.lastPairformerSplit = pairformer.split;
@@ -425,7 +469,10 @@ export class Af3TrunkGpu {
         binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings, ...kept,
       };
     } finally {
+      scratchAllocator.destroyPooled();
       for (const allocation of owned) allocation.release();
+      // ...and handed back before the next pass allocates its own.
+      await settleReleasedMemory(this.device);
     }
   }
 
@@ -475,22 +522,35 @@ export class Af3TrunkGpu {
     const binsBuffer = keep(this.allocator.upload("af3-disto.contact-bins",
       af3ContactBins(contactClasses, tokens, binEdges(bins)), storage));
     const weightBuffer = keep(this.allocator.upload("af3-disto.weights", packed, storage));
-    const logits = keep(this.allocator.allocate("af3-disto.logits", pairs * bins * 4,
-      storage | GPUBufferUsage.COPY_SRC));
-    const contact = keep(this.allocator.allocate("af3-disto.contact", pairs * 4,
-      storage | GPUBufferUsage.COPY_SRC));
 
     const run = async (pairAllocation, singleAllocation, pairElements, singleElements, wanted) => {
+      // 🔴 ALLOCATED HERE, WHEN THE HEAD RUNS, NOT WHEN IT IS PREPARED. The
+      // head is prepared before the pairformer, and its logits are `pairs x
+      // bins` floats - 977 MiB at 2000 tokens - which stood beside the stacks'
+      // scratch for the whole pass: AF3 at 2000 residues was refused on a
+      // T4-sized budget for exactly this buffer. By now the scratch is gone.
+      // Released by this function, below - the trunk copied `allocations` when
+      // the head was prepared, before these existed.
+      const logits = this.allocator.allocate("af3-disto.logits", pairs * bins * 4,
+        storage | GPUBufferUsage.COPY_SRC);
+      const contact = this.allocator.allocate("af3-disto.contact", pairs * 4,
+        storage | GPUBufferUsage.COPY_SRC);
       const mapRead = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
-      const readback = [
+      const readback = [];
+      try {
+      for (const [name, source, elements, want] of [
         ["logits", logits, pairs * bins, wanted.logits], ["contactProbs", contact, pairs, true],
         ["pair", pairAllocation, pairElements, wanted.pair],
         ["single", singleAllocation, singleElements, wanted.single],
-      ].filter(([, , , want]) => want).map(([name, source, elements]) => ({
-        name, source, bytes: elements * 4,
-        target: this.allocator.allocate("af3-disto.readback", elements * 4, mapRead),
-      }));
-      try {
+      ]) {
+        if (!want) continue;
+        if (elements * 4 > READBACK_PIECE_BYTES) {
+          readback.push({ name, source, bytes: elements * 4, target: undefined });
+          continue;
+        }
+        readback.push({ name, source, bytes: elements * 4,
+          target: this.allocator.allocate("af3-disto.readback", elements * 4, mapRead) });
+      }
       this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-distogram" });
       const pass = encoder.beginComputePass({ label: "af3-distogram" });
@@ -504,22 +564,50 @@ export class Af3TrunkGpu {
       const groups = Math.ceil(pairs / 64);
       pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       pass.end();
-      for (const { source, target, bytes } of readback) {
+      const whole = readback.filter(({ target }) => target !== undefined);
+      for (const { source, target, bytes } of whole) {
         encoder.copyBufferToBuffer(source.buffer, 0, target.buffer, 0, bytes);
       }
       this.device.queue.submit([encoder.finish()]);
       const scope = this.device.popErrorScope();
-      await Promise.all(readback.map(({ target }) => target.buffer.mapAsync(GPUMapMode.READ)));
+      await Promise.all(whole.map(({ target }) => target.buffer.mapAsync(GPUMapMode.READ)));
       const error = await scope;
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
       const result = {};
-      for (const { name, target } of readback) {
+      for (const { name, target } of whole) {
         result[name] = new Float32Array(target.buffer.getMappedRange().slice(0));
         target.buffer.unmap();
       }
+      // 🔴 A LARGE TENSOR COMES BACK IN PIECES THROUGH ONE STAGING BUFFER.
+      // AlphaFold 3's pair at 2047 tokens is 2 GiB, and a mappable buffer that
+      // size failed in the driver ("Failed to allocate memory for buffer
+      // mapping") after the whole trunk had run - on a card with gigabytes
+      // free. The host array is the same; only the staging is cut up.
+      for (const { name, source, bytes, target } of readback) {
+        if (target !== undefined) continue;
+        const out = new Float32Array(bytes / 4);
+        const staging = this.allocator.allocate("af3-disto.readback-piece",
+          READBACK_PIECE_BYTES, mapRead);
+        try {
+          for (let offset = 0; offset < bytes; offset += READBACK_PIECE_BYTES) {
+            const size = Math.min(READBACK_PIECE_BYTES, bytes - offset);
+            const copy = this.device.createCommandEncoder({ label: "af3-disto.readback-piece" });
+            copy.copyBufferToBuffer(source.buffer, offset, staging.buffer, 0, size);
+            this.device.queue.submit([copy.finish()]);
+            await staging.buffer.mapAsync(GPUMapMode.READ, 0, size);
+            out.set(new Float32Array(staging.buffer.getMappedRange(0, size)), offset / 4);
+            staging.buffer.unmap();
+          }
+        } finally {
+          staging.release();
+        }
+        result[name] = out;
+      }
       return result;
       } finally {
-        for (const { target } of readback) target.release();
+        for (const { target } of readback) target?.release();
+        logits.release();
+        contact.release();
       }
     };
     return { run, allocations };

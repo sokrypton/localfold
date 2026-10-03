@@ -39,7 +39,17 @@ function stringOfCodes(codes, length) {
   return out;
 }
 
-export function parseA3m(text) {
+// (`anyLetter`: every capital letter is an aligned residue - a nucleic chain's columns, which
+// carry U, T and nucleotide ambiguity codes; the caller maps them by its chain's alphabet)
+const ANY_LETTER = (() => {
+  const table = new Uint8Array(128);
+  for (let c = 65; c <= 90; c += 1) table[c] = 1;
+  table["-".charCodeAt(0)] = 1;
+  return table;
+})();
+
+export function parseA3m(text, { anyLetter = false } = {}) {
+  const allowed = anyLetter ? ANY_LETTER : ALIGNED_CODE;
   const descriptions = [];
   const rawSequences = [];
   let current = -1;
@@ -77,7 +87,7 @@ export function parseA3m(text) {
         insertionCount += 1;
         continue;
       }
-      if (code > 127 || ALIGNED_CODE[code] === 0) {
+      if (code > 127 || allowed[code] === 0) {
         throw new Error(`A3M sequence ${descriptions[row]} contains invalid residue `
           + `${JSON.stringify(raw[at])}`);
       }

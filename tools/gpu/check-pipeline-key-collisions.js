@@ -222,6 +222,10 @@ export async function main(device, args) {
   const DEFAULT_TOOLS = [
     "fold-af2 --length=59 --rows=16 --extra-rows=16",
     "fold-af2 --family=multimer --chains=30,29 --length=59 --rows=16 --extra-rows=16",
+    // The monomer's template kernels compile only when a slot is passed; the
+    // multimer's embedder runs every recycle, so the arm above already has it.
+    "fold-af2 --target=5caj --chain=A --rows=16 --extra-rows=16"
+      + " --template=/tools/fixtures/5caj-crystal.pdb:A",
     "fold-esmfold2 --bundle=/model-esmfold2-int5 --length=40",
   ].join(";");
   const toolsGiven = args.some((a) => a.startsWith("--tools="));
