@@ -2439,7 +2439,7 @@ export class Af3DiffusionTransformerGpu {
     const qkvgTile = splitting
       ? Math.min(weights.qkvgTile ?? splitRule.tile, fits(channels)) : tile;
     const wideTile = splitting
-      ? Math.min(weights.wideTile ?? splitRule.tile, fits(channels)) : tile;
+      ? Math.min(weights.wideTile ?? splitRule.wideTile ?? splitRule.tile, fits(channels)) : tile;
     // ffw-out's inner extent is the intermediate, so it gets its own part
     // count - and its epilogue is a projection, so the reduction is most of
     // the original kernel. Same crossover.

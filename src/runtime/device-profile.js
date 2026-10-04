@@ -891,7 +891,11 @@ const PRIORS = new Map([
     // 1.5 TB/s card. A crossover SHOULD exist; 175 was simply the wrong one.
     // ...and `maxGroups` halves the split while qkvg's split dispatch would pass ~2000 workgroups:
     // 16 to 150 tokens, 8 to ~260, 4 above (see the rule in diffusion-transformer-webgpu.js).
-    diffusionSplitK: { splits: 16, tile: 4, crossover: 512, outSplits: 4,
+    // ...and with the cap the 512-token crossover no longer holds: 4 splits beat none at 600 / 800 / 1000
+    // tokens, 67 -> 60 / 87 -> 78 / 115 -> 105 ms a denoiser call (bench-head, 2026-10-04), so the
+    // crossover is out of reach. `wideTile` 8 is ffw-wide's own token tile: 3.87 -> 2.67 ms a call at
+    // 262 tokens, 2.13 -> 1.79 at 150, where qkvg loses at 8 (3.22 -> 3.51).
+    diffusionSplitK: { splits: 16, tile: 4, wideTile: 8, crossover: 4096, outSplits: 4,
                        attnSplits: 4, attnTile: 2, normSplits: 4, maxGroups: 2000 },
     // On, with the geometry derived from this device's tile. See the note on
     // matrixLinear in DEFAULT_TUNING for why this is opt-in.
