@@ -67,6 +67,13 @@ struct Opts { std::string dir, oracle, out; uint64_t seed; SamplerSettings sampl
 // prediction (frame-SSSS-NNNN.pdb), written through common.cuh's AsyncTap so the fold does not wait for them
 static std::string FRAMES_DIR;
 // the softmax mass of each pair's first contact_bins bins (the bias is already in the logits: distogram())
+// pair positions [p0, p0 + cnt) of z + z^T (symmetriseK's arithmetic, a block at a time)
+__global__ void symmetriseRowsK(const float* z, float* out, size_t p0, size_t cnt, int T, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= cnt * C) return;
+  int c = (int)(t % C); size_t ij = p0 + t / C, i = ij / T, j = ij % T;
+  out[t] = z[ij * C + c] + z[(j * T + i) * C + c];
+}
 __global__ void contactsK(const float* logits, const int* contactBins, float* out, size_t pairs, int bins) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (ij >= pairs) return;
@@ -178,10 +185,25 @@ static int foldInput(const Opts& o, bool warm) {
       return 1;
     }
     size_t P = (size_t)T * T;
-    float* dg = scratch<float>("dg.logits", P * bins);
-    distogram(z, T, C, dg);
     float* probs = scratch<float>("dg.contacts", P);
-    contactsK<<<blocks(P), 256, 0, STREAM>>>(dg, Idev("contact_bins"), probs, P, bins);
+    if (tight) {
+      // on a card short of room a block of pair positions at a time: z + z^T, the projection, the contact mass -
+      // never the symmetrised pair (5.9 GB at 2400 tokens) or the logits (2.95 GB) whole; the same arithmetic
+      int Bn = (int)dimOf("f/distogram/weights", 1);
+      size_t per = std::max<size_t>(1, std::min(P, ((size_t)64 << 20) / std::max(C, Bn)));
+      float* zs = scratch<float>("dg.symRows", per * C); float* dg = scratch<float>("dg.logitRows", per * bins);
+      for (size_t p0 = 0; p0 < P; p0 += per) {
+        size_t n = std::min(per, P - p0);
+        symmetriseRowsK<<<blocks(n * C), 256, 0, STREAM>>>(z, zs, p0, n, T, C);
+        gemm(zs, F("distogram/weights"), dg, n, C, Bn);
+        addBias(dg, F("distogram/bias"), n, Bn);
+        contactsK<<<blocks(n), 256, 0, STREAM>>>(dg, Idev("contact_bins") + p0, probs + p0, n, bins);
+      }
+    } else {
+      float* dg = scratch<float>("dg.logits", P * bins);
+      distogram(z, T, C, dg);
+      contactsK<<<blocks(P), 256, 0, STREAM>>>(dg, Idev("contact_bins"), probs, P, bins);
+    }
     if (!FRAMES_DIR.empty()) {
       TAP().reserve(1, P);
       unsigned char* bytes = scratch<unsigned char>("dg.contacts8", P);
@@ -263,7 +285,7 @@ static int foldInput(const Opts& o, bool warm) {
   float* xd = upload(coords.data(), (size_t)A * 3);
   bool profConf = profile && profStage == "confidence";
   if (profConf) { prof::init(); prof::start(); }
-  Confidence conf = confidenceHead(T, A, z, sInputs, Si, xd, false);
+  Confidence conf = confidenceHead(T, A, z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
   if (profConf) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   mem("confidence");
   say("confidence %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());

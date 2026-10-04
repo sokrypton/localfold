@@ -277,7 +277,11 @@ neither z_init nor the language model's pair (two 256-channel f32 pairs) is kept
 multiplication goes in output blocks** (`triangleBlockedEf2`, on native/af3/src/triblocked.cuh, shared
 with native/af2) where the whole form would not fit with room to spare. `LOCALFOLD_BIG=1` forces both;
 6MRR 1.422 A either way, and check-native-worker passes under it. A simulated T4 folds 1,600 residues.
-Open: the pair transition still normalises the whole pair (`ftr.xn`, 2.95 GB at 2,400), and the
-confidence head holds three pairs (the trunk's, its LayerNorm'd input, and a residual copy) - the input
-can be the trunk's pair normalised in place on the last call, and the residual saved to pinned host
-memory.
+On the same short card the pair transition normalises a chunk of rows at a time (the whole f16 normalised
+pair was 2.95 GB at 2,400), the confidence head's last call normalises the trunk's z in place and parks its
+residual in pinned host memory while its blocks run (two 256-channel pairs fewer), and the distogram goes a
+block of pair positions at a time (z + z^T and the logits were 5.9 and 2.95 GB whole) - each the same
+arithmetic, byte-identical (contacts identical at 600). **A simulated T4 now folds 2,000 residues** (trunk
+30 s, CA-CA median 3.793, none out of band). At 2,400 the trunk finishes and the diffusion conditioning's own
+256-channel pair (5.9 GB, `dc.pair`) is the next holder - it would want AF3's streamed conditioning, which was
+not ported; at 2,800 the triangle's fixed operand (4 GB) no longer fits.

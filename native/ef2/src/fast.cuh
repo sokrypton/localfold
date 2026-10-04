@@ -167,13 +167,18 @@ __global__ void swigluHK(const half* h, half* g, size_t rows, int I) {
 }
 inline void transitionFast(float* pair, size_t P, int C, const std::string& Tn) {
   int I = (int)dimOf("f/" + Tn + "transition2", 0);
-  half* xn = scratch<half>("ftr.xn", P * C);
-  layerNormH(pair, xn, P, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
   size_t chunk = std::max<size_t>(1, ((size_t)128 << 20) / (3 * (size_t)I));
+  // the LayerNorm whole, or - on a card short of room - a chunk of rows at a time, as the GEMMs already go: it
+  // is per row, so the same values (the whole f16 normalised pair was 2.95 GB at 2400 tokens, where a simulated
+  // T4 ran out)
+  bool chunked = shortPair(P, C);
+  half* xn = scratch<half>("ftr.xn", (chunked ? std::min(P, chunk) : P) * C);
+  if (!chunked) layerNormH(pair, xn, P, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
   half* h = scratch<half>("ftr.h", std::min(P, chunk) * 2 * I); half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     size_t r = std::min(chunk, P - r0);
-    ltGemm(xn + r0 * C, Fh(Tn + "transition1"), h, true, r, C, 2 * I, nullptr, false, 0.f);
+    if (chunked) layerNormH(pair + r0 * C, xn, r, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
+    ltGemm(xn + (chunked ? 0 : r0 * C), Fh(Tn + "transition1"), h, true, r, C, 2 * I, nullptr, false, 0.f);
     swigluHK<<<blocks(r * I), 256, 0, STREAM>>>(h, g, r, I);
     ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
   }

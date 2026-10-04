@@ -110,13 +110,17 @@ __global__ void tmRowsK(const float* tm, const int* asym, double* rows, int T) {
 
 struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; double ptm, iptm, meanPlddt; };
 
+// consume: the trunk's z is read by nothing after this call - on a card short of room the head then works in it
 inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice,
-                                 bool check) {
+                                 bool check, bool consume = false) {
   int C = (int)dimOf("f/confidence/sToZ", 1), Cs = (int)dimOf("f/confidence/poolingOutput", 1);
   size_t P = (size_t)T * T;
   float* s = scratch<float>("cf.s", (size_t)T * Si);
   layerNorm(sInputs, s, T, Si, F("confidence/sInputsNorm/scale"), F("confidence/sInputsNorm/offset"));
-  float* z = dalloc(P * C);
+  // on a card short of room, a last call normalises the trunk's z in place (each lane reads its channels before
+  // writing them): a 256-channel f32 pair fewer, 4.1 GB at 2000 tokens
+  bool tight = shortPair(P, C), inPlace = consume && tight;
+  float* z = inPlace ? const_cast<float*>(zTrunk) : dalloc(P * C);
   layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
   float* r = scratch<float>("cf.r", (size_t)T * C); float* c = scratch<float>("cf.c", (size_t)T * C);
   float* l = scratch<float>("cf.l", (size_t)T * C); float* rr = scratch<float>("cf.rr", (size_t)T * C);
@@ -134,15 +138,36 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   }
   distanceEmbedK<<<blocks(P * C), 256, 0, STREAM>>>(z, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
     (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), T, C);
-  // z + trunk(z)
-  float* stack = dalloc(P * C);
-  CK(cudaMemcpyAsync(stack, z, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  // z + trunk(z) - on a card short of room z waits in pinned host memory while the blocks run on it in place,
+  // then comes back a chunk at a time and is added (the same sum: one more pair-sized tensor not on the card)
   float* mask = scratch<float>("trunk.mask", P);
   fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);
+  float* stack = tight ? z : dalloc(P * C);
+  static float* heldBuf = nullptr; static size_t heldHave = 0;     // (pinned, kept for the process, grown as needed)
+  if (tight && heldHave < P * C) {
+    if (heldBuf) CK(cudaFreeHost(heldBuf));
+    if (cudaMallocHost(&heldBuf, P * C * 4) != cudaSuccess) {
+      fprintf(stderr, "cannot pin %.2f GB of host memory for the confidence head's residual\n", P * C * 4 / 1e9); exit(1);
+    }
+    heldHave = P * C;
+  }
+  float* held = tight ? heldBuf : nullptr;
+  if (tight) CK(cudaMemcpyAsync(held, z, P * C * 4, cudaMemcpyDeviceToHost, STREAM));
+  else CK(cudaMemcpyAsync(stack, z, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b)
     trunkBlock(stack, mask, T, C, "confidence/blocks", b);
-  addK<<<blocks(P * C), 256, 0, STREAM>>>(z, stack, P * C);
-  CK(cudaFree(stack));
+  if (tight) {
+    releaseScratch({ "ftri.", "ftr.", "trib." });
+    float* back = scratch<float>("cf.back", chunk * C);
+    for (size_t p0 = 0; p0 < P; p0 += chunk) {
+      size_t n = std::min(chunk, P - p0);
+      CK(cudaMemcpyAsync(back, held + p0 * C, n * C * 4, cudaMemcpyHostToDevice, STREAM));
+      addK<<<blocks(n * C), 256, 0, STREAM>>>(z + p0 * C, back, n * C);
+    }
+  } else {
+    addK<<<blocks(P * C), 256, 0, STREAM>>>(z, stack, P * C);
+    CK(cudaFree(stack));
+  }
   // single by row-attention pooling
   float* score = scratch<float>("cf.score", P);
   gemm(z, F("confidence/poolingAttention"), score, P, C, 1);
@@ -194,7 +219,8 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     checkOracle("confidence PAE logits", paeL, P * pb, "o/conf/pae_logits");
     if (M.has("o/conf/ptm")) printf("  pTM %.6f against the oracle's %.6f\n", out.ptm, M.f("o/conf/ptm")[0]);
   }
-  CK(cudaFree(z)); CK(cudaFree(dSlot));
+  if (!inPlace) CK(cudaFree(z));
+  CK(cudaFree(dSlot));
   return out;
 }
 
