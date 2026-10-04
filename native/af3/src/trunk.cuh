@@ -588,6 +588,10 @@ template <class T>
 void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size_t)>& onSeam) {
   embed<T>(t, onSeam); stage("embed");
   size_t pairs = (size_t)t.n * t.n;
+  // on a card short of room, the embedder's and template stack's scratch given back before the MSA
+  // stack, and the MSA stack's before the pairformer (see shortPair)
+  bool tight = shortPair(pairs, t.C);
+  if (tight) releaseScratch({ "emb.", "tmpl." });
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + std::to_string(msaBlocks) + ".pairChannels")) ++msaBlocks;
   // boltz2 adds the pre-MSA pair back: its MSA module returns the updated z and the caller adds z
   float* zIn = nullptr;
@@ -597,6 +601,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   }
   for (int k = 0; k < msaBlocks; ++k) msaBlock<T>(t, k);
   if (zIn) addK<<<blocks(pairs * t.C), 256, 0, STREAM>>>(t.pair, zIn, pairs * t.C);
+  if (tight) releaseScratch({ "msaatt.", "opm.", "trunk.zBeforeMsa" });
   onSeam("z_after_msa", t.pair, pairs * t.C);
   onSeam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
   int blocks_ = 0; while (M.has("trunk.pairformerBlocks." + std::to_string(blocks_) + ".singleChannels")) ++blocks_;

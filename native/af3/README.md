@@ -521,6 +521,20 @@ the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2
   68 x 25 (52.0 against 52.8), and a LOSS at 262 and 525 (71.5 against 69.9, 101.3 against 98.1),
   interleaved on the A100. The diffusion phase now peaks at 5.31 GB at 68 x 200 (was 8.32) and 7.63
   at 525 (was 10.54). The single conditioning's precompute stays: it is 42 MB at 68 x 200.
+- **A large input gives scratch back as it goes**, where it used to hold every stage's buffers to
+  the end. At 1048 tokens the trunk peaked at 12.88 GB with the template stack's five pair tensors
+  (1.4 GB), the MSA attention's and the recycled-pair LayerNorm still held through the pairformer, and
+  the diffusion at 11.31 GB with the preparation's pair LayerNorms and per-super-block logits (1.4 GB)
+  held through every step. Now **10.47 and 9.89 GB**. The diffusion's releases cost nothing measurable
+  and run whenever the pair is over 128 MB; the trunk's cost the recycles their graph and a
+  reallocation a pass - 2.5% of the trunk at 525 tokens, 0.3% at 1048 - so they run only where the
+  pair is over a 64th of the card (`shortPair`: 1135 tokens on 40 GB, 690 on a T4). Releasing the
+  conditioning's chunk buffers too (`dc.f2*`, `pt.*`) was measured and not taken: they are CHUNK-sized
+  at any length, and reallocating them cost 16 ms of a 100 ms diffusion at 525 tokens.
+- **The grid attention takes every row in one pass only while its q/k/v/gate are a 32nd of the
+  card** (it was a fixed 4 GB): whole is 3.3% of the trunk faster at 262 tokens and 4.8% at 1048, and
+  at 1048 it is the 1.13 GB the row chunks do not hold - nothing on 40 GB, and the difference between
+  fitting and not near a T4's 15.
 - **What is left at the floor is the weights, twice**: the file's f32 device copy and, on `--fast`,
   its f16 mirror (3.8 GB in use at "trunk built" with 0.04 of scratch). native/ef2 drops the ESM-C
   tower's f32 copy after mirroring (`compactWeights`, 2.2 GB) because its tower reads only the mirror.

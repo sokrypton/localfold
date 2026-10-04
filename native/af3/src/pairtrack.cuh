@@ -486,7 +486,12 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       std::string qkvg = qkvgWeight(pre, C, Wd, true);
       std::string wb = paddedColumns(pre + ".pairBiasProjection", C, heads, 16);
       float scale = 1.f / sqrtf((float)D);
-      if (pairs * 4 * Wd * 2 <= ((size_t)4 << 30)) {
+      // 🔴 every row in one pass only while its q/k/v/gate are a 32nd of the card: whole is 3.3% of
+      // the trunk faster at 262 tokens and 4.8% at 1048 (465 against 481 ms, 7.82 against 8.20 s on an
+      // A100), and at 1048 it is 1.13 GB the chunks do not hold (trunk peak 12.88 against 11.73 GB) -
+      // nothing on 40 GB, the difference between fitting and not near a T4's 15
+      static const size_t gridWhole = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t / 32; }();
+      if (pairs * 4 * Wd * 2 <= gridWhole) {
         // every row in one pass (this card has the memory): the bias written by the same kernel
         CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // the padding columns
         half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);

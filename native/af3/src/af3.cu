@@ -319,7 +319,11 @@ int main(int argc, char** argv) {
       // (capturing and instantiating costs ~15 ms and a replayed pass saves ~2 ms at 68 tokens, more
       // as the launches grow: a first fold breaks even at 7 recycles there - AF3's 10 gain 6 ms - and
       // at 3 from ~200 tokens, so the graph is taken where it measured a gain)
-      if (!GRAPHS || STAGES || !(recycles >= 7 || t.n >= 200)) { recyclePass(); afterPass(pass); continue; }
+      // ...and not where a pass gives its stages' scratch back (runTrunk, shortPair), which a capture
+      // cannot do
+      if (!GRAPHS || STAGES || !(recycles >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
+        recyclePass(); afterPass(pass); continue;
+      }
       if (!trunkGraph) {
         cudaGraph_t g;
         CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
@@ -383,9 +387,14 @@ int main(int argc, char** argv) {
     std::vector<float> mask(M.f("batch.refMask"), M.f("batch.refMask") + (size_t)nD * dense);
     // a large input gives each phase the whole card: a pair over 128 MB, 512 tokens at 128 channels
     // (at 1 GB, 1044 tokens peaked at 21.3 GB with the trunk's 8 GB of scratch held to the end)
-    bool tight = pairs * t.C * 4 > ((size_t)128 << 20);
+    bool tight = tightPair(pairs, t.C);
     if (tight) releaseScratch();
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
+    // ...and the pair-sized tensors only the preparation reads, given back before the steps: the
+    // transformer's and the encoder's pair LayerNorms and the per-super-block logits (1.4 GB at 1048
+    // tokens, held through every step). Not the conditioning's chunk buffers (dc.f2*, pt.*): they are
+    // CHUNK-sized whatever the length, and giving them back cost 16 ms of a 100 ms diffusion at 525
+    if (tight) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln" });
     memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
     // confidence head and ranked by AF3's ranking score (src/scores.cuh). A seed's samples run as one

@@ -747,6 +747,28 @@ inline void releaseScratch() {
   CK(cudaDeviceSynchronize());
   for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFree(slot.first)); slot = {nullptr, 0}; }
 }
+// A large input's pair is over 128 MB (512 tokens at 128 channels): there each phase gets the card
+// to itself, and a stage's own scratch is given back when the stage is done.
+inline bool tightPair(size_t pairs, int C) { return pairs * C * 4 > ((size_t)128 << 20); }
+// ...and short of room: the pair over a 64th of the card (1135 tokens at 128 channels on 40 GB, 690
+// on a T4's 15). The trunk gives each stage's scratch back between stages only here, because doing it
+// costs the recycles their graph and a reallocation a pass - 2.5% of the trunk at 525 tokens, 0.3% at
+// 1048 - for 2.4 GB of a 1048-token trunk's peak (12.88 -> 10.47 GB)
+inline bool shortPair(size_t pairs, int C) {
+  static const size_t card = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t; }();
+  return pairs * C * 4 > card / 64;
+}
+// the scratch buffers named by any of `prefixes`, given back (the next use allocates afresh)
+inline void releaseScratch(std::initializer_list<const char*> prefixes) {
+  bool synced = false;
+  for (auto& [name, slot] : SCRATCH) {
+    if (!slot.first) continue;
+    bool match = false; for (const char* p : prefixes) if (!name.compare(0, strlen(p), p)) match = true;
+    if (!match) continue;
+    if (!synced) { CK(cudaStreamSynchronize(STREAM)); synced = true; }
+    CK(cudaFree(slot.first)); slot = {nullptr, 0};
+  }
+}
 template <class T> T* scratch(const std::string& name, size_t n) {
   auto& [p, have] = SCRATCH[name];
   if (have < n * sizeof(T)) {
