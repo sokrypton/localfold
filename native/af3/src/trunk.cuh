@@ -614,7 +614,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   bool tight = shortPair(pairs, t.C);
   // ...and the template stack's own triangle buffers: it runs 64 channels through the unfused path,
   // whose names the 128-channel pairformer never asks for again (4.9 GB at 2620 tokens)
-  if (tight) releaseScratch({ "emb.", "tmpl.", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.pg", "tri.centred",
+  if (tight) releaseScratch({ "emb.", "tmpl.", "trib.", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.pg", "tri.centred",
                               "tri.t1", "tri.t2" });
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + std::to_string(msaBlocks) + ".pairChannels")) ++msaBlocks;
   // boltz2 adds the pre-MSA pair back: its MSA module returns the updated z and the caller adds z
@@ -626,7 +626,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   for (int k = 0; k < msaBlocks; ++k) msaBlock<T>(t, k);
   if (zIn) addK<<<blocks(pairs * t.C), 256, 0, STREAM>>>(t.pair, zIn, pairs * t.C);
   memReport("  trunk: MSA stack");
-  if (tight) releaseScratch({ "msaatt.", "opm.", "trunk.zBeforeMsa" });
+  if (tight) releaseScratch({ "msaatt.", "opm.", "trunk.zBeforeMsa", "trib." });
   onSeam("z_after_msa", t.pair, pairs * t.C);
   onSeam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
   int blocks_ = 0; while (M.has("trunk.pairformerBlocks." + std::to_string(blocks_) + ".singleChannels")) ++blocks_;
@@ -634,7 +634,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   memReport("  trunk: pairformer");
   // ...and the pair track's own, before the next pass's template stack allocates beside it: held, they
   // put a recycle pass's peak at its embedding (17.71 against 12.88 GB at 1572 tokens)
-  if (tight) releaseScratch({ "tri.", "grid.", "tr.", "st." });
+  if (tight) releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
   onSeam("trunk_out_pair", t.pair, pairs * t.C);
   onSeam("single", t.single, (size_t)t.n * t.Cs);
 }

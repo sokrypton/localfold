@@ -497,8 +497,26 @@ __global__ void flatToBiasHalfRowsK(const float* flat, half* out, int block, int
   out[((size_t)h * n + i0 + ii) * stride + j] =
     __float2half(j < n ? flat[((size_t)ii * n + j) * nblocks * heads + block * heads + h] * LOG2E : 0.f);
 }
+// layerNormSlowK into f16, no offset: the two-pass variance, the module's convention
+__global__ void layerNormSlowHalfK(const float* in, half* out, size_t rows, int C, const float* scale) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* x = in + row * C;
+  float s = 0;
+  for (int c = lane; c < C; c += 32) s += x[c];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, v = 0;
+  for (int c = lane; c < C; c += 32) { float d = x[c] - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = 1.f / sqrtf(v / C + 1e-5f);
+  for (int c = lane; c < C; c += 32) out[row * C + c] = __float2half((x[c] - mean) * inv * scale[c]);
+}
 struct TransformerCache {
   bool ready = false; int n = 0, nblocks = 0;
+  // on a card short of room the biases are not kept for all blocks: the LayerNorm'd pair is, in f16, and
+  // each super block's biases are made from it as the step reaches it (refreshSuperBlockBias)
+  half* pn16 = nullptr; int perSuper = 0, heads = 0, Cz = 0;
   std::vector<float*> pairLogits;      // [h][i][j] per block
   std::vector<half*> biasHalf;         // the same, f16, log2(e)-scaled, rows padded: the flash kernel's
   int stride = 0;
@@ -552,26 +570,25 @@ inline void prepareTransformer(const float* pairCond, int n) {
   }
   // the pair logits of every block, from the (fold-constant) pair conditioning
   tc.stride = (n + 7) / 8 * 8;
-  if (DIFF_HALF && shortPair(pairs, Cz)) {
-    // on a card short of room in row chunks, a super block at a time: the normalised pair and its
-    // projection held for a chunk of rows rather than whole (4.5 GB at 2096 tokens, alive beside the
-    // biases they make), the LayerNorm recomputed per super block
+  tc.pn16 = nullptr;                   // (an earlier fold's, in a resident process)
+  // (recomputing costs a step time - 2.3 s of a 2096-token fold - so only where every block's biases would
+  // not fit with room to spare)
+  if (DIFF_HALF && shortPair(pairs, Cz) && !roomFor((size_t)tc.nblocks * heads * n * tc.stride * 2)) {
+    // on a card short of room: the LayerNorm'd pair kept in f16 (half the f32 pair it is made from), and
+    // biases for one super block at a time, made as the step reaches it - 24 blocks' biases held were
+    // 768 bytes a pair, 3.4 GB at 2096 tokens, the diffusion's largest tensor
+    tc.pn16 = scratch<half>("dt.pn16", pairs * Cz);
+    size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / Cz));
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNormSlowHalfK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(pairCond + r0 * Cz, tc.pn16 + r0 * Cz, r, Cz,
+                                                                      W(T + ".pairInputLayerNormScale"));
+    }
+    tc.perSuper = perSuper; tc.heads = heads; tc.Cz = Cz;
     tc.pairLogits.assign(tc.nblocks, nullptr);
     tc.biasHalf.assign(tc.nblocks, nullptr);
     for (int b = 0; b < tc.nblocks; ++b)
-      tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b), (size_t)heads * n * tc.stride);
-    int ri = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(Cz, perSuper * heads))));
-    float* pnc = scratch<float>("dt.pn", (size_t)ri * n * Cz);
-    float* flatc = scratch<float>("dt.flat", (size_t)ri * n * perSuper * heads);
-    for (int sb = 0; sb * perSuper < tc.nblocks; ++sb)
-      for (int i0 = 0; i0 < n; i0 += ri) {
-        int r = std::min(ri, n - i0); size_t rows = (size_t)r * n;
-        layerNormSlow(pairCond + (size_t)i0 * n * Cz, pnc, rows, Cz, W(T + ".pairInputLayerNormScale"), nullptr);
-        linear<float, float>(pnc, flatc, rows, Cz, perSuper * heads, T + ".superBlocks." + std::to_string(sb) + ".pairLogitsProjection");
-        for (int b = sb * perSuper; b < std::min(tc.nblocks, (sb + 1) * perSuper); ++b)
-          flatToBiasHalfRowsK<<<blocks((size_t)heads * r * tc.stride), 256, 0, STREAM>>>(flatc, tc.biasHalf[b], b % perSuper,
-                                                                                    perSuper, heads, n, tc.stride, i0, r);
-      }
+      tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b % perSuper), (size_t)heads * n * tc.stride);
     tc.n = n; tc.ready = true;
     return;
   }
@@ -622,6 +639,22 @@ __global__ void kqNormK(T* qkvg, const float* qs, const float* qo, const float* 
     float inv = rsqrtf(blockSum(q) / Wd + 1e-5f);
     for (int c = threadIdx.x; c < Wd; c += blockDim.x) x[c] = fromF<T>((toF(x[c]) - mean) * inv * sc[c] + of[c]);
     __syncthreads();
+  }
+}
+// super block sb's biases from the f16 LayerNorm'd pair, into the buffers its blocks share with every other
+// super block's (see TransformerCache::pn16): row chunks of the projection, laid out as the flash kernel reads
+inline void refreshSuperBlockBias(int sb, int n) {
+  TransformerCache& tc = TCACHE;
+  int ps = tc.perSuper, heads = tc.heads, Cz = tc.Cz;
+  int ri = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(Cz, ps * heads))));
+  float* flatc = scratch<float>("dt.flat", (size_t)ri * n * ps * heads);
+  std::string w = "diffusion.transformer.superBlocks." + std::to_string(sb) + ".pairLogitsProjection";
+  for (int i0 = 0; i0 < n; i0 += ri) {
+    int r = std::min(ri, n - i0); size_t rows = (size_t)r * n;
+    linear<half, float>(tc.pn16 + (size_t)i0 * n * Cz, flatc, rows, Cz, ps * heads, w);
+    for (int b = sb * ps; b < std::min(tc.nblocks, (sb + 1) * ps); ++b)
+      flatToBiasHalfRowsK<<<blocks((size_t)heads * r * tc.stride), 256, 0, STREAM>>>(flatc, tc.biasHalf[b], b % ps,
+                                                                                ps, heads, n, tc.stride, i0, r);
   }
 }
 template <class T>
@@ -689,6 +722,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     if constexpr (std::is_same_v<T, half>) {
       // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate;
       // the samples are its batch rows, the pair bias shared
+      if (tc.pn16 && b % perSuper == 0) refreshSuperBlockBias(b / perSuper, n);
       flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, MASK_ALL_ONES ? nullptr : maskRows, o, n, heads, D, 0, NS, false,
                       1.f / sqrtf((float)D), kqNorm ? nullptr : W(B + ".qBias"));
     } else {

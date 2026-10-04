@@ -132,6 +132,21 @@ __global__ void outerProductRowsK(const float* a, const float* b, float* out, in
   out[t] = a[(size_t)i * C + e] * b[(size_t)j * C + e];
 }
 // boltz2's split pair heads: the inter-chain logits where the two tokens' chains differ
+// rows [r0, r0 + cnt) of z + z^T, row-major
+__global__ void symmetriseRowsK(const float* z, float* out, size_t r0, size_t cnt, int T, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= cnt * C) return;
+  int c = (int)(t % C); size_t ij = r0 + t / C; size_t i = ij / T, j = ij % T;
+  out[t] = z[ij * C + c] + z[(j * T + i) * C + c];
+}
+// the same over pairs [r0, r0 + cnt) of logits, from a chunk of inter-chain logits
+__global__ void interChainLogitsRowsK(float* logits, const float* inter, const int* asym, int n, int bins, size_t r0,
+                                      size_t cnt) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= cnt * bins) return;
+  size_t ij = r0 + t / bins; int i = (int)(ij / n), j = (int)(ij % n);
+  if (asym[i] != asym[j]) logits[r0 * bins + t] = inter[t];
+}
 __global__ void interChainLogitsK(float* logits, const float* inter, const int* asym, int n, int bins) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * n * bins) return;
@@ -173,19 +188,24 @@ inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, co
 }
 struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
 
+// consumeTrunkPair: the trunk's pair is read by nothing after this call, so the head works in it rather
+// than in a copy (the caller says so for a card short of room, on its last confidence call)
 inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
-                                    const float* pseudoBeta, const float* seqMask, const float* pairMask, int n) {
+                                    const float* pseudoBeta, const float* seqMask, const float* pairMask, int n,
+                                    bool consumeTrunkPair = false) {
   const std::string P = "confidence";
   int C = (int)M.meta(P + ".pairChannels"), Cs = (int)M.meta(P + ".singleChannels"), F = (int)M.meta(P + ".targetFeatWidth");
   int dense = (int)M.meta("batch.dense");
   bool caDgram = M.flag("trunk.dialect.confidenceCaDgram");
   size_t pairs = (size_t)n * n;
-  float* pair = scratch<float>("conf.pair", pairs * C);
+  bool reembed = M.flag("trunk.dialect.reembedConfidencePair");
+  bool inPlace = consumeTrunkPair && !reembed;                 // (boltz2 builds its pair from the trunk's: no aliasing)
+  float* pair = inPlace ? const_cast<float*>(trunkPair) : scratch<float>("conf.pair", pairs * C);
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
-  if (M.flag("trunk.dialect.reembedConfidencePair")) {
+  if (reembed) {
     boltz2Reembed(pair, single, trunkPair, trunkSingle, targetFeat, pseudoBeta, pairMask, n, C, Cs, F);
   } else {
-  CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  if (!inPlace) CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(single, trunkSingle, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   if (M.flag("trunk.dialect.confidenceGlobalNorm")) {
     // rf3 normalises every detached trunk input over the whole tensor first (target_feat over the
@@ -221,14 +241,17 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
     else pairformerBlockAt<float>(pair, single, pairMask, seqMask, n, C, Cs, P + ".blocks." + std::to_string(k), swap, divide);
   // on a card short of room the stack's scratch goes before the heads allocate theirs, so the two peak
   // apart rather than together
-  if (shortPair(pairs, C)) releaseScratch({ "tri.", "grid.", "tr.", "st." });
+  if (shortPair(pairs, C)) releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
   // the error bins: 64 of them up to 31 A, the last one step past the second-to-last
   const int NB = 64; double step = 31.0 / (NB - 2);
   std::vector<float> centres(NB);
   for (int b = 0; b < NB - 1; ++b) centres[b] = (float)(b * step + step / 2);
   centres[NB - 1] = (float)(centres[NB - 2] + step);
   float* dCentres = upload(centres.data(), NB);
-  float* ln = scratch<float>("conf.ln", pairs * C);
+  // on a card short of room the heads' LayerNorm (and the symmetrised pair it reads) run in row chunks
+  bool chunked = shortPair(pairs, C);
+  size_t rowsPer = chunked ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
+  float* ln = scratch<float>("conf.ln", rowsPer * C);
   float* logits = scratch<float>("conf.logits", pairs * NB);
   ConfidenceOut out;
   float* pde = scratch<float>("conf.pde", pairs); float* pae = scratch<float>("conf.pae", pairs);
@@ -242,7 +265,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   // boltz2 splits each pair head into an intra-chain and an inter-chain projection
   const int* asymDev = Idev("batch.asymId");
   float* interLogits = hasW(P + ".interHalfDistanceLogits") || hasW(P + ".paeInterLogits")
-    ? scratch<float>("conf.interLogits", pairs * NB) : nullptr;
+    ? scratch<float>("conf.interLogits", (chunked ? rowsPer : pairs) * NB) : nullptr;
   auto project = [&](const float* x, const std::string& w, const std::string& inter) {
     linear<float, float>(x, logits, pairs, C, NB, P + "." + w);
     if (!hasW(P + "." + inter)) return;
@@ -250,16 +273,35 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
     interChainLogitsK<<<blocks(pairs * NB), 256, 0, STREAM>>>(logits, interLogits, asymDev, n, NB);
   };
   if (hasW(P + ".interHalfDistanceLogits") && !preSym) { fprintf(stderr, "split PDE heads need the pre-symmetrised PDE\n"); exit(1); }
-  const float* src = pair;
-  if (preSym) {
-    // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2, boltz2); AF3 adds the transpose after
-    float* sym = scratch<float>("conf.sym", pairs * C);
-    symmetriseK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, sym, n, C);
-    src = sym;
+  // a head's logits, LN(x) W (with boltz2's inter-chain half), a chunk of rows at a time when chunked
+  float* sym = preSym && chunked ? scratch<float>("conf.sym", rowsPer * C) : nullptr;
+  auto headLogits = [&](bool symmetrised, const std::string& norm, const std::string& w, const std::string& inter) {
+    for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
+      size_t cnt = std::min(rowsPer, pairs - r0);
+      const float* x = pair + r0 * C;
+      if (symmetrised) { symmetriseRowsK<<<blocks(cnt * C), 256, 0, STREAM>>>(pair, sym, r0, cnt, n, C); x = sym; }
+      const float* xn = headNorm(x, ln, cnt, C, norm);
+      linear<float, float>(xn, logits + r0 * NB, cnt, C, NB, P + "." + w);
+      if (!hasW(P + "." + inter)) continue;
+      linear<float, float>(xn, interLogits, cnt, C, NB, P + "." + inter);
+      interChainLogitsRowsK<<<blocks(cnt * NB), 256, 0, STREAM>>>(logits, interLogits, asymDev, n, NB, r0, cnt);
+    }
+  };
+  if (chunked) {
+    headLogits(preSym, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
+  } else {
+    const float* src = pair;
+    if (preSym) {
+      // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2, boltz2); AF3 adds the transpose after
+      float* whole = scratch<float>("conf.sym", pairs * C);
+      symmetriseK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, whole, n, C);
+      src = whole;
+    }
+    project(headNorm(src, ln, pairs, C, "logitsLn"), "leftHalfDistanceLogits", "interHalfDistanceLogits");
   }
-  project(headNorm(src, ln, pairs, C, "logitsLn"), "leftHalfDistanceLogits", "interHalfDistanceLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pde, pairMask, pairs, NB, dCentres, preSym ? 0 : n, 1.f);
-  project(headNorm(pair, ln, pairs, C, "paeLogitsLn"), "paeLogits", "paeInterLogits");
+  if (chunked) headLogits(false, "paeLogitsLn", "paeLogits", "paeInterLogits");
+  else project(headNorm(pair, ln, pairs, C, "paeLogitsLn"), "paeLogits", "paeInterLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pae, pairMask, pairs, NB, dCentres, 0, 1.f);
   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's
   // mean over the pairs it selects (ipTM: other chains only). src/heads/tm-score.js.

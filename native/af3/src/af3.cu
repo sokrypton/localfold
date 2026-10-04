@@ -506,7 +506,10 @@ int main(int argc, char** argv) {
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
-        ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
+        // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
+        bool last = c0 + k + 1 == runs.size();
+        ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
+                            last && shortPair((size_t)t.n * t.n, t.C));
         releaseConcatCopies(); memReport("confidence");
       }
       CK(cudaFree(dBeta));

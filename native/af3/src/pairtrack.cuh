@@ -258,6 +258,161 @@ inline void triContractBf16(bool outgoing, int np, size_t cs, int C, float alpha
       CUDA_R_16BF, np, cs, &zero, p, CUDA_R_16BF, np, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
+
+// ---------------------------------------------------------------- the triangle multiplication in blocks
+// A RECTANGLE of the padded pair space - rows [i0, i0 + I), columns [j0, j0 + J) - with q = (i - i0) J
+// + (j - j0) its own index: the operands of one block of the contraction and its output live there.
+struct TriRect { int i0, I, j0, J; size_t size() const { return (size_t)I * J; } };
+__device__ __forceinline__ size_t rectPair(const TriRect& r, size_t q, int n) {     // the pair at q, SIZE_MAX for padding
+  size_t i = r.i0 + q / r.J, j = r.j0 + q % r.J;
+  return i < (size_t)n && j < (size_t)n ? i * n + j : SIZE_MAX;
+}
+// LayerNorm of rows [q0, q0 + cnt) of a rectangle, read from the pair where they lie (zeros for padding),
+// and their mask - a warp a row
+template <class TO>
+__global__ void rectLayerNormK(const float* pair, const float* mask, TO* out, float* m, TriRect r, size_t q0, size_t cnt,
+                               int n, int C, const float* scale, const float* offset) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= cnt) return;
+  size_t p = rectPair(r, q0 + row, n);
+  const float* x = p != SIZE_MAX ? pair + p * C : nullptr;
+  float s = 0, ss = 0;
+  for (int c = lane; c < C; c += 32) { float v = x ? x[c] : 0.f; s += v; ss += v * v; }
+  for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
+  float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(((x ? x[c] : 0.f) - mean) * inv * scale[c] + offset[c]);
+  if (lane == 0 && m) m[row] = p != SIZE_MAX ? mask[p] : 0.f;
+}
+// one operand from a chunk's (rows, 2C) [projection | gate] rows, channel-major into the rectangle's
+// buffer at q0 + row - through a 32 x 32 tile, so the reads run along the channels and the writes along
+// the rows
+template <class T>
+__global__ void rectGateK(const T* pg, const float* m, T* out, size_t q0, size_t cnt, int C, size_t size) {
+  __shared__ float A[32][33];
+  size_t row0 = (size_t)blockIdx.x * 32; int c0 = blockIdx.y * 32;
+  int tx = threadIdx.x, ty = threadIdx.y;
+  for (int ry = ty; ry < 32; ry += 8) {
+    size_t row = row0 + ry; int c = c0 + tx;
+    float v = 0;
+    if (row < cnt && c < C) { const T* p = pg + row * 2 * C; v = toF(p[c]) * m[row] * sigm(toF(p[C + c])); }
+    A[ry][tx] = v;
+  }
+  __syncthreads();
+  for (int cy = ty; cy < 32; cy += 8) {
+    size_t row = row0 + tx; int c = c0 + cy;
+    if (row < cnt && c < C) out[(size_t)c * size + q0 + row] = fromF<T>(A[tx][cy]);
+  }
+}
+// center_norm of rows [q0, q0 + cnt) of a rectangle's product (channel-major), row-major out: the
+// channel-major tile read along the rows, 32 rows a block
+template <class TO>
+__global__ void rectCenterNormK(const float* prod, TO* out, size_t q0, size_t cnt, int C, size_t size,
+                                const float* scale, const float* offset) {
+  __shared__ float ps[8][33], pss[8][33], mean[32], inv[32];
+  size_t row0 = (size_t)blockIdx.x * 32; int tx = threadIdx.x, ty = threadIdx.y;
+  size_t row = row0 + tx;
+  float s = 0, ss = 0;
+  if (row < cnt) for (int c = ty; c < C; c += 8) { float v = prod[(size_t)c * size + q0 + row]; s += v; ss += v * v; }
+  ps[ty][tx] = s; pss[ty][tx] = ss;
+  __syncthreads();
+  if (ty == 0) {
+    float a = 0, b = 0;
+    for (int k = 0; k < 8; ++k) { a += ps[k][tx]; b += pss[k][tx]; }
+    float mu = a / C; mean[tx] = mu; inv[tx] = rsqrtf(b / C - mu * mu + 1e-5f);
+  }
+  __syncthreads();
+  // out[row][c]: each warp row of the block writes a row's channels; the reads of prod are strided by
+  // `size`, a channel a lane - the norm's pass above was the coalesced one
+  for (int ry = ty; ry < 32; ry += 8) {
+    size_t lr = row0 + ry; if (lr >= cnt) continue;
+    for (int c = tx; c < C; c += 32)
+      out[lr * C + c] = fromF<TO>((prod[(size_t)c * size + q0 + lr] - mean[ry]) * inv[ry] * scale[c] + offset[c]);
+  }
+}
+// pair[at q] += t1 * sigmoid(t2) for the chunk's real rows
+template <class T>
+__global__ void rectGatedAddK(float* pair, const T* t1, const T* t2, TriRect r, size_t q0, size_t cnt, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= cnt * C) return;
+  size_t row = t / C; int c = (int)(t % C);
+  size_t p = rectPair(r, q0 + row, n);
+  if (p != SIZE_MAX) pair[p * C + c] += toF(t1[t]) * sigm(toF(t2[t]));
+}
+
+// [projection | gate] of ONE operand (side 0 = a, 1 = b) as a (C, 2C) matrix, from the interleaved (C, 2C)
+// projection and gate (column 2ch is a's channel ch, 2ch + 1 b's)
+__global__ void operandWeightK(const float* proj, const float* gate, float* out, int C, int side) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)C * 2 * C) return;
+  int k = (int)(t / (2 * C)), o = (int)(t % (2 * C));
+  out[t] = o < C ? proj[(size_t)k * 2 * C + 2 * o + side] : gate[(size_t)k * 2 * C + 2 * (o - C) + side];
+}
+inline std::string operandWeight(const std::string& pre, int C, int side) {
+  std::string key = pre + ".operand" + std::to_string(side) + "~";
+  if (!WF.count(key) && !WH.count(key)) {
+    float* d = dalloc((size_t)C * 2 * C);
+    operandWeightK<<<blocks((size_t)C * 2 * C), 256, 0, STREAM>>>(W(pre + ".projection"), W(pre + ".gate"), d, C, side);
+    deviceWeight(key, d, (size_t)C * 2 * C);
+  }
+  return key;
+}
+// The whole triangle multiplication in BLOCKS, for a card short of room: the fixed operand b built whole
+// (np^2 x C), then per block of OUTPUT rows (outgoing) or columns (incoming) the free operand a, the
+// contraction and the output on that block alone - never a LayerNorm'd plane, a whole a or a whole
+// product. Outgoing P[i, j] = sum_k a[i, k] b[j, k]: a row block reads pair rows the earlier blocks did
+// not write. Incoming P[i, j] = sum_k a[k, j] b[k, i]: a COLUMN block reads pair columns the earlier
+// blocks did not write - a row block would read rows they had. The reduction over k is never split.
+template <class T>
+void triangleBlocked(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
+                     bool divideByLength, int np) {
+  size_t cs = (size_t)np * np;
+  // each operand's own half of [projection | gate], so the two passes together project once
+  std::string pgOf[2] = { operandWeight(pre, C, 0), operandWeight(pre, C, 1) };
+  float alpha = divideByLength ? 1.f / n : 1.f, zero = 0.f;
+  auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  size_t per = std::max<size_t>(32, CHUNK / (4 * C));            // rows a chunk of the row-wise steps
+  float* m = scratch<float>("trib.mask", per);
+  T* ln = scratch<T>("trib.ln", per * C); T* pgOut = scratch<T>("trib.pg", per * 2 * C);
+  // LN(pair) -> [projection | gate] -> one operand (side 0 = a, 1 = b), over a rectangle in chunks
+  auto operands = [&](const TriRect& r, T* out, int side) {
+    for (size_t q0 = 0; q0 < r.size(); q0 += per) {
+      size_t cnt = std::min(per, r.size() - q0);
+      rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, m, r, q0, cnt, n, C,
+        W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"));
+      linear<T, T>(ln, pgOut, cnt, C, 2 * C, pgOf[side]);
+      rectGateK<T><<<dim3((unsigned)((cnt + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(pgOut, m, out, q0, cnt, C, r.size());
+    }
+  };
+  T* b = scratch<T>("trib.b", cs * C);
+  operands({0, np, 0, np}, b, 1);
+  // a block of the free operand and its product: about CHUNK / C rows of the rectangle each
+  int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
+  T* a = scratch<T>("trib.a", (size_t)width * np * C);
+  float* prod = scratch<float>("trib.prod", (size_t)width * np * C);
+  T* t1 = scratch<T>("trib.t1", per * C); T* t2 = scratch<T>("trib.t2", per * C);
+  for (int k0 = 0; k0 < n; k0 += width) {
+    int w = std::min(width, np - k0);
+    TriRect r = outgoing ? TriRect{k0, w, 0, np} : TriRect{0, np, k0, w};
+    operands(r, a, 0);
+    if (outgoing)          // (as the whole contraction, with w output rows)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, np, w, np, &alpha, b, cudaType<T>(), np, cs, a,
+        cudaType<T>(), np, r.size(), &zero, prod, CUDA_R_32F, np, r.size(), C, CUBLAS_COMPUTE_32F, algo));
+    else                   // (with w output columns)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, w, np, np, &alpha, a, cudaType<T>(), w, r.size(), b,
+        cudaType<T>(), np, cs, &zero, prod, CUDA_R_32F, w, r.size(), C, CUBLAS_COMPUTE_32F, algo));
+    for (size_t q0 = 0; q0 < r.size(); q0 += per) {
+      size_t cnt = std::min(per, r.size() - q0);
+      rectCenterNormK<T><<<(unsigned)((cnt + 31) / 32), dim3(32, 8), 0, STREAM>>>(prod, ln, q0, cnt, C, r.size(),
+        W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
+      linear<T, T>(ln, t1, cnt, C, C, pre + ".outputProjection");
+      rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, nullptr, r, q0, cnt, n, C,
+        W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"));
+      linear<T, T>(ln, t2, cnt, C, C, pre + ".gatingLinear");
+      rectGatedAddK<T><<<blocks(cnt * C), 256, 0, STREAM>>>(pair, t1, t2, r, q0, cnt, n, C);
+    }
+  }
+}
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
               bool divideByLength) {
@@ -269,6 +424,15 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   // 76.6 -> 72.3 ms at 68 tokens, 442 -> 438 at 261, 1617 -> 1606 at 522, flat at 150 and 1044
   int np = TRI_PAD ? (n + TRI_PAD - 1) / TRI_PAD * TRI_PAD : n;
   size_t cs = (size_t)np * np;
+  // on a card short of room, in blocks of the output (triangleBlocked): no whole a, product or
+  // LayerNorm'd plane - whichever kernels the device would otherwise run
+  // (blocking costs time - a fifth of a trunk at 2096 tokens - so only where the whole form's operands,
+  // product and gate, five planes, would not fit with room to spare)
+  if (shortPair(pairs, C) && !roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf",
+                                                         "tri.pbf", "tri.t2whole" })) {
+    triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
+    return;
+  }
   std::string pg = projectionGate(pre, C);
   T *a = nullptr, *b = nullptr;
   float* prod = nullptr;          // f32: in f16 the contraction (a sum over n of products) overflows

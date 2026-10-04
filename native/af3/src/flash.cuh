@@ -572,7 +572,10 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // no more warps than the device's shared memory allows (a T4's 64 KB)
   if (warps == 8 && !fitsSmem(2 * faStage<D, 8, BK>())) warps = 4;
   if (warps == 4 && !fitsSmem(2 * faStage<D, 4, BK>())) warps = 2;
-  if (D == 48 && n >= 1700 && (warps == 4 || warps == 8)) {
+  // (64-key tiles: their own shared memory checked - 66 KB double-buffered at 4 warps, past a 64 KB device)
+  const int stages = flashRegStaged() ? 1 : 2;
+  if (D == 48 && n >= 1700 && (warps == 4 || warps == 8) &&
+      fitsSmem(stages * (warps == 8 ? faStage<D, 8, FA_BK>() : faStage<D, 4, FA_BK>()))) {
     if (warps == 8) flashGridHalfAt<D, 8, FA_BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else flashGridHalfAt<D, 4, FA_BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     return;

@@ -749,6 +749,9 @@ inline void releaseScratch() {
 }
 // A large input's pair is over 128 MB (512 tokens at 128 channels): there each phase gets the card
 // to itself, and a stage's own scratch is given back when the stage is done.
+// LOCALFOLD_BIG=1: every big-input path at any size (shortPair true, roomFor false) - how they are checked
+// against the ordinary ones on an input small enough to fold both ways
+inline const bool BIG_FORCED = getenv("LOCALFOLD_BIG") != nullptr;
 inline bool tightPair(size_t pairs, int C) { return pairs * C * 4 > ((size_t)128 << 20); }
 // ...and short of room: the pair over a 64th of the card (1135 tokens at 128 channels on 40 GB, 690
 // on a T4's 15). The trunk gives each stage's scratch back between stages only here, because doing it
@@ -756,6 +759,7 @@ inline bool tightPair(size_t pairs, int C) { return pairs * C * 4 > ((size_t)128
 // 1048 - for 2.4 GB of a 1048-token trunk's peak (12.88 -> 10.47 GB)
 inline bool shortPair(size_t pairs, int C) {
   static const size_t card = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t; }();
+  if (BIG_FORCED) return true;
   return pairs * C * 4 > card / 64;
 }
 // the scratch buffers named, given back (the next use allocates afresh): a name ending in '.' is a
@@ -773,6 +777,16 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
     if (!synced) { CK(cudaStreamSynchronize(STREAM)); synced = true; }
     CK(cudaFree(slot.first)); slot = {nullptr, 0};
   }
+}
+// Whether `bytes` more would fit on the card now with an eighth of it to spare - for the memory levers that
+// cost time (blocked contractions, recomputed biases), which only a short card should pay. Scratch held
+// under any of `held` already counts toward it, since the whole form would reuse it.
+inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) {
+  if (BIG_FORCED) return false;
+  for (auto& [name, slot] : SCRATCH)
+    for (const char* p : held) if (name == p) bytes -= std::min(bytes, slot.second);
+  size_t f, t; CK(cudaMemGetInfo(&f, &t));
+  return f > bytes + t / 8;
 }
 template <class T> T* scratch(const std::string& name, size_t n) {
   auto& [p, have] = SCRATCH[name];
