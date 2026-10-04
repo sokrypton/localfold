@@ -2658,3 +2658,58 @@ Warm folds at 255 residues on this A100, interleaved: IntelliFold-2 6.27-6.33 ->
 MiB and 897.8 MiB both ways, because the peak is in the trunk and not the
 sampler. Every pLDDT identical to the last digit; test:stock 8 of 8, ligand,
 modified, template, portable, spec-floor and cache all pass.
+
+## 🔴 A stock fold's device peak, halved: what a short device holds and why
+
+Measured on the A100 under `LOCALFOLD_STOCK_FLAGS=1` (no shader-f16, which is
+what an NVIDIA visitor's Chrome has) with `fold.js --budget=2800`, because the
+PAGE sets a budget (`deviceMemory / 3`) and a tool run does not - without
+`--budget` none of the streaming rules below engage, and a peak taken that way
+is not a visitor's. 262 tokens, 25 steps:
+
+| | AF3 | boltz2 |
+|---|---:|---:|
+| session start | 1594 MiB | 2110 MiB |
+| sampler weights stream (c82de34) | 1126 | 1490 |
+| pair norm fused, conditioning in place, no batched gates while streaming (28b092a) | **796** | **967** |
+
+Four changes, in order of what they took:
+
+1. **The sampler's decoded weights stream** from their int5 codes (as the
+   trunk's always have) when a budget is set and the device lacks shader-f16 or
+   the budget is under 2 GiB - `streamSamplerWeights` forces either arm. An f32
+   decoded copy of all 24 blocks was the largest thing a fold held.
+2. **No batched gates while the sampler streams** - 297 MiB of the 1093:
+   the decoded gate weights of every block at once (`difftx.zerogate`, 162) and
+   four per-block outputs over the tokens (`adaln-scale-shift`,
+   `ffw-adaln-scale-shift`, two `zero-gates`, 110). It costs **4-5% of a warm
+   fold** (3.00 -> 3.11-3.17 s, two rounds interleaved), which is the right side
+   of the trade in the mode that exists because room is short, and the wrong
+   side everywhere else - so streaming decides it, over any prior.
+3. **The pair LayerNorm folds into the pair-logits pass.** It wrote a
+   normalised copy of the pair conditioning (`difftx.pair-norm`, 33.5 MiB at
+   262 tokens, 4x that at IntelliFold-2's 512 channels) to be read by a pass
+   that, cached, runs ONCE a block a schedule. Bit-identical (574/574 atoms,
+   2113/2113 at 262), because each element is computed by the same expression
+   in the same order.
+4. **The conditioning's two pair transitions run in place** - the shared
+   transition kernel's residual form - where each wrote a pair-sized delta to
+   `cond.pair-scratch` and added it back. Bit-identical: f32 addition commutes.
+
+🔴 **WHAT IS LEFT IS NOT WASTE.** `int5-codes` (254 MiB for AF3) is the bundle
+itself and is what streaming decodes from; `difftx.block.resident.stream` is
+the one super-block being decoded; `difftx.pair-logits` (100.6) is the
+per-block attention bias cache, whose recompute at ~1 ms a block per step is
+not worth 100 MiB; `af3-embed.pair` and `head.pair-cond` are the trunk's pair
+and its conditioned form, both read later.
+
+🔴 **AND IntelliFold-2's PEAK MOVED TO THE CONFIDENCE HEAD** (945 MiB at 262):
+its pairformer's scratch is 469 MiB - 3.5 pair tensors at 512 channels, already
+in compact mode - beside a 134 MiB pair and a 128 MiB split-transition chunk.
+The next cut there is the triangle's normalised-pair scratch, which needs the
+LayerNorm folded into the triangle projections (vector and matrix) - a shared
+kernel change, not taken here.
+
+🔴 **check-af3-denoise.js on boltz2 FAILS AT 2.206e-1 ON `main` TOO**, with
+the identical figure, so it is a stale dump against a changed reference, not
+anything here. AlphaFold 3 reads 9.92e-4 before and after.

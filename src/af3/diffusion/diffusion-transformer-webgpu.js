@@ -2318,7 +2318,13 @@ export class Af3DiffusionTransformerGpu {
     // 30% speedup. One resolution, passed down.
     const workgroupStorage = this.device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
     const intermediate = channels * weights.transitionFactor;
-    const fits = (perToken) => Math.max(1, Math.floor(workgroupStorage / (perToken * 4)));
+    // ...rounded down to a tile the shaders take (1, 2 or a multiple of 4): at
+    // WebGPU's guaranteed 16 KiB a 768-channel row fits five, and min(8, 5)
+    // was a tile `tilingFor` refuses.
+    const fits = (perToken) => {
+      const room = Math.max(1, Math.floor(workgroupStorage / (perToken * 4)));
+      return room >= 4 ? room - (room % 4) : room >= 2 ? 2 : 1;
+    };
     // 🔴 FOUR, AND RE-MEASURED AFTER THE CONDITIONING WAS STAGED. Eight used to
     // lose partly because two kernels' zero-gate loops were TILE global reads a
     // step; staged, those loops cost the same whatever the tile, so the reason
@@ -2496,9 +2502,7 @@ export class Af3DiffusionTransformerGpu {
     // the other tiles use.
     const wantedGateTile = weights.gateTile
       ?? shapedKnob(deviceTuning(this.device).diffusionGateTile) ?? 8;
-    const gateTileRoom = fits(condChannels);
-    const gateTile = Math.max(1, Math.min(wantedGateTile, gateTileRoom >= 4
-      ? gateTileRoom - (gateTileRoom % 4) : (gateTileRoom >= 2 ? 2 : 1)));
+    const gateTile = Math.max(1, Math.min(wantedGateTile, fits(condChannels)));
     // 🔴 f16 WHEREVER THE DEVICE HAS IT, FOR THE MEMORY. See the note in the
     // shader factory: this is the largest resident tensor a fold holds.
     const weightPrecision = weights.weightPrecision
