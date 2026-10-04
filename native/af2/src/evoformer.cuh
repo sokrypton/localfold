@@ -615,6 +615,30 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       return;
     }
   }
+  // a, b and the contraction's product in bf16 (f32's range at half the bytes - f16's range is what overflows),
+  // as native/af3 has them and as AlphaFold 2's own trunk runs (global_config.bfloat16): the output kernel then
+  // stages half the product and takes its persistent form. AF2_TRI_F32=1 keeps the f32 product.
+  static const bool triBf16 = !getenv("AF2_TRI_F32");
+  if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && triFusedFits<__nv_bfloat16>()) {
+    int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+    TriFused w = triFusedWeights(T, blk, C);
+    __nv_bfloat16* a = scratch<__nv_bfloat16>("ftri.abf", plane * C); __nv_bfloat16* b = scratch<__nv_bfloat16>("ftri.bbf", plane * C);
+    half* t2 = scratch<half>("ftri.t2", plane * C);
+    triInRaw<__nv_bfloat16, true>(pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk),
+                                  w.wpg, PH(T + "/gating_linear/weights", blk), w.bias, a, b, t2, L, Lp, plane);
+    __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
+    const float one = 1.f, zero = 0.f;
+    if (outgoing)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16BF, Lp, plane, a, CUDA_R_16BF, Lp,
+                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    else
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16BF, Lp, plane, b, CUDA_R_16BF, Lp,
+                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    triOutRaw<__nv_bfloat16, true>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                   PH(T + "/output_projection/weights", blk), P(T + "/output_projection/bias", blk), t2, pair, L, Lp,
+                                   plane);
+    return;
+  }
   if (FAST && FUSED_TRIANGLE && C == 128 && triFusedFits<float>()) {
     // native/af3's fused kernels (fast.cuh, triFusedWeights): LN, the gated projections and the gating
     // linear in one kernel, AF2's contraction, then the centre norm, the output projection and the gate
