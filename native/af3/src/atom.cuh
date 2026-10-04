@@ -923,7 +923,7 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
       if (!M.has("chiral.centers")) { fprintf(stderr, "this bundle reads chirality centres the input lacks: export it again\n"); exit(1); }
       const Chirality& ch = chirality(atoms);
       float* grads = scratch<float>("enc.chiralGrads", atoms * NS * 3);
-      chiralGradK<<<blocks(atoms * NS), 128, 0, STREAM>>>(atomPositions, ch.centers, ch.angles, ch.offsets, ch.entries,
+      chiralGradK<<<blocks(atoms * NS, 128), 128, 0, STREAM>>>(atomPositions, ch.centers, ch.angles, ch.offsets, ch.entries,
                                                          grads, atoms, NS);
       float* gc = scratch<float>("enc.gc", qRows * 3);
       convert(t2q, grads, gc, 3, atoms, NS);
