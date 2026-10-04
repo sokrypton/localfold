@@ -135,7 +135,22 @@ __global__ void biasGeluK(float* y, const float* b, size_t rows, int C) {
   if (t < rows * C) y[t] = geluF(y[t] + b[t % C]);
 }
 
-// the tower and the shim: ids [rows] -> the language model's pair term lm_z [T, T, pair]
+// the language model's pair term for pair rows [i0, i0 + b) (i of [T, T, pair]), from the per-token states
+// s [T, P]: join, the pair MLP, its LayerNorm - in blocks of `bi` rows, the size languageModel uses
+inline int lmPairBlock(int T, int P) { return std::max(1, std::min(T, (int)(((size_t)32 << 20) / ((size_t)T * 2 * P)))); }
+inline void lmPairRows(const float* s, int T, int P, int i0, int b, float* o) {
+  int bi = lmPairBlock(T, P);
+  float* join = scratch<float>("shim.join", (size_t)bi * T * 2 * P); float* hid = scratch<float>("shim.hid", (size_t)bi * T * P);
+  size_t cells = (size_t)b * T;
+  pairJoinK<<<blocks(cells * P), 256, 0, STREAM>>>(s, join, T, i0, b, P);
+  gemm(join, Cw("lm/pair_mlp_1/weights"), hid, cells, 2 * P, P);
+  biasGeluK<<<blocks(cells * P), 256, 0, STREAM>>>(hid, Cw("lm/pair_mlp_1/bias"), cells, P);
+  gemm(hid, Cw("lm/pair_mlp_2/weights"), o, cells, P, P);
+  addBias(o, Cw("lm/pair_mlp_2/bias"), cells, P);
+  layerNorm(o, o, cells, P, Cw("lm/pair_norm/scale"), Cw("lm/pair_norm/offset"));
+}
+// the tower and the shim: ids [rows] -> the language model's pair term lm_z [T, T, pair] (null lmZ: only
+// the per-token states, in scratch "shim.tokens" - a streamed z_init makes the pair as it needs it)
 // onState(k, x): every one of the 37 hidden states, for a check
 inline void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tokenToRow, int T, float* lmZ,
                           const std::function<void(int, const float*)>& onState) {
@@ -180,16 +195,7 @@ inline void languageModel(const Esmc& e, const int* ids, const int* seq, const i
   float* s = scratch<float>("shim.tokens", (size_t)T * P);
   scatterRowsK<<<blocks((size_t)T * P), 256, 0, STREAM>>>(single, tokenToRow, zero, s, T, P);
   // the pair, a block of rows at a time
-  int bi = std::max(1, std::min(T, (int)(((size_t)32 << 20) / ((size_t)T * 2 * P))));
-  float* join = scratch<float>("shim.join", (size_t)bi * T * 2 * P); float* hid = scratch<float>("shim.hid", (size_t)bi * T * P);
-  for (int i0 = 0; i0 < T; i0 += bi) {
-    int b = std::min(bi, T - i0); size_t cells = (size_t)b * T;
-    pairJoinK<<<blocks(cells * P), 256, 0, STREAM>>>(s, join, T, i0, b, P);
-    gemm(join, Cw("lm/pair_mlp_1/weights"), hid, cells, 2 * P, P);
-    biasGeluK<<<blocks(cells * P), 256, 0, STREAM>>>(hid, Cw("lm/pair_mlp_1/bias"), cells, P);
-    float* o = lmZ + (size_t)i0 * T * P;
-    gemm(hid, Cw("lm/pair_mlp_2/weights"), o, cells, P, P);
-    addBias(o, Cw("lm/pair_mlp_2/bias"), cells, P);
-    layerNorm(o, o, cells, P, Cw("lm/pair_norm/scale"), Cw("lm/pair_norm/offset"));
-  }
+  if (!lmZ) return;
+  int bi = lmPairBlock(T, P);
+  for (int i0 = 0; i0 < T; i0 += bi) lmPairRows(s, T, P, i0, std::min(bi, T - i0), lmZ + (size_t)i0 * T * P);
 }

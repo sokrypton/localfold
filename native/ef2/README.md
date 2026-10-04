@@ -267,3 +267,17 @@ I tightened its bounds once to confirm it fails.
 - **A padding zeroed once is not zeroed for another size.** The unfused triangle zeroed its padded
   planes once per buffer. A warm-up at another size leaves data where the next layout's padding is,
   so it now re-zeroes when the padded size changes.
+
+## How large a fold fits (in progress)
+
+On a card short of room (`shortPair`): **z_init is streamed** - it is row-local (the language model's pair
+term comes from per-token states through a pair MLP, a block of rows at a time), so each recycle makes it
+a block at a time and adds it into z, in the stored form's block size and order: byte-identical, and
+neither z_init nor the language model's pair (two 256-channel f32 pairs) is kept. The **triangle
+multiplication goes in output blocks** (`triangleBlockedEf2`, on native/af3/src/triblocked.cuh, shared
+with native/af2) where the whole form would not fit with room to spare. `LOCALFOLD_BIG=1` forces both;
+6MRR 1.422 A either way, and check-native-worker passes under it. A simulated T4 folds 1,600 residues.
+Open: the pair transition still normalises the whole pair (`ftr.xn`, 2.95 GB at 2,400), and the
+confidence head holds three pairs (the trunk's, its LayerNorm'd input, and a residual copy) - the input
+can be the trunk's pair normalised in place on the last call, and the residual saved to pinned host
+memory.

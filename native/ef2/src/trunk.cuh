@@ -44,6 +44,28 @@ __global__ void zInitK(const float* rows, const float* cols, RelIdx rel, const f
   z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lmZ[t];
 }
 
+// a STREAMED z_init (a card short of room): neither it nor the language model's pair is kept - each loop
+// makes its rows a block at a time from the per-token states and adds them in (zInitK's sum, in its order)
+struct ZInitStream { const float* rows; const float* cols; const float* s; int P; };
+inline ZInitStream ZINIT_STREAM{};
+__global__ void zInitAddRowsK(float* z, const float* rows, const float* cols, RelIdx rel, const float* bonds, const float* wBond,
+                              const float* lm, int T, int C, size_t r0, size_t cnt) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= cnt * C) return;
+  int c = (int)(t % C); size_t ij = r0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
+  z[r0 * C + t] += rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lm[t];
+}
+inline void zInitAddStreamed(float* z, int T, int C) {
+  const ZInitStream& zs = ZINIT_STREAM;
+  int bi = lmPairBlock(T, zs.P);
+  float* lm = scratch<float>("zi.lmRows", (size_t)bi * T * zs.P);
+  for (int i0 = 0; i0 < T; i0 += bi) {
+    int b = std::min(bi, T - i0); size_t cells = (size_t)b * T;
+    lmPairRows(zs.s, T, zs.P, i0, b, lm);
+    zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(z, zs.rows, zs.cols, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"),
+                                                         lm, T, C, (size_t)i0 * T, cells);
+  }
+}
 inline void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z, bool check) {
   size_t P = (size_t)T * T;
   float* rows = scratch<float>("zi.rows", (size_t)T * C); float* cols = scratch<float>("zi.cols", (size_t)T * C);
@@ -141,8 +163,46 @@ inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
     ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
   }
 }
+#include "../../af3/src/triblocked.cuh"
+// one operand's [projection | gate] (C, 2C) f16 from the interleaved projection and gate (column 2ch is a's
+// channel ch, 2ch + 1 b's), side 0 = a
+__global__ void operandInterleavedK(const float* proj, const float* gate, half* w, int C, int side) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)C * 2 * C) return;
+  int k = (int)(t / (2 * C)), o = (int)(t % (2 * C));
+  w[t] = __float2half(o < C ? proj[(size_t)k * 2 * C + 2 * o + side] : gate[(size_t)k * 2 * C + 2 * (o - C) + side]);
+}
+// the triangle multiplication in output blocks (native/af3/src/triblocked.cuh), for a card short of room
+inline void triangleBlockedEf2(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+  static std::map<std::pair<std::string, int>, half*> ops;
+  auto opOf = [&](int side) {
+    auto key = std::make_pair(Tn, side);
+    auto it = ops.find(key);
+    if (it != ops.end()) return it->second;
+    half* w = dallocT<half>((size_t)C * 2 * C);
+    operandInterleavedK<<<blocks((size_t)C * 2 * C), 256, 0, STREAM>>>(F(Tn + "projection"), F(Tn + "gate"), w, C, side);
+    return ops[key] = w;
+  };
+  TriBlockedW w{ F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"), opOf(0), opOf(1), nullptr, nullptr,
+                 F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), nullptr,
+                 Fh(Tn + "gatingLinear"), nullptr };
+  triangleBlockedHalf(pair, mask, L, C, w, outgoing, (size_t)64 << 20);
+}
 inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b) {
   std::string B = prefix + "/" + std::to_string(b) + "/";
+  // on a card short of room, the triangles in output blocks where the whole forms would not fit with room
+  // to spare (the transitions already go a chunk of rows at a time)
+  if (FAST && shortPair((size_t)L * L, C)) {
+    int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+    if (!roomFor(5 * plane * C * 2, { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.pg", "ftri.cn", "ftri.out" })) {
+      releaseScratch({ "ftri." });
+      triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
+      triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+      if (FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Fits()) transition256(pair, (size_t)L * L, C, B + "pairTransition/");
+      else transitionFast(pair, (size_t)L * L, C, B + "pairTransition/");
+      return;
+    }
+  }
   // the fused kernels' 64-128-pair tiles leave a small pair track's device idle: measured, warm, trunk of
   // 4 passes - 68 tokens 43.2 ms unfused against 52.7 fused; 92: 71.5 / 58.3; 195: 201 / 190;
   // 261: 368 / 320; 476: 1131 / 953
@@ -178,7 +238,8 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
       layerNorm(z + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
       gemm(xn, F("recycle/projection"), z + r0 * C, r, C, C);
     }
-    addK<<<blocks(P * C), 256, 0, STREAM>>>(z, zInitP, P * C);
+    if (zInitP) addK<<<blocks(P * C), 256, 0, STREAM>>>(z, zInitP, P * C);
+    else zInitAddStreamed(z, T, C);
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " in").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/in");
     // (a CUDA graph of the 24 blocks, replayed for passes after the first, measured no faster: 453
     // against 455 ms of trunk at 261 tokens; the GPU is busy, the launches are not the cost)

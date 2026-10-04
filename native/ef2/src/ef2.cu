@@ -82,6 +82,7 @@ static int foldInput(const Opts& o, bool warm) {
   auto say = [&](const char* fmt, auto... v) { if (!warm) printf(fmt, v...); };
   // EF2_MEM: device memory in use at each phase boundary
   auto mem = [&](const char* at) {
+    if (!warm && getenv("LOCALFOLD_MEM")) { memReport(at); return; }   // (common.cuh's, with the largest holders)
     if (warm || !getenv("EF2_MEM")) return;
     CK(cudaDeviceSynchronize()); size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
     size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
@@ -95,7 +96,9 @@ static int foldInput(const Opts& o, bool warm) {
   bool check = !oracle.empty() && !warm;
   int states = e.layers + 1;
   float* hidden = check ? dalloc((size_t)T * states * e.model) : nullptr;
-  float* lmZ = dalloc((size_t)T * T * e.pair);
+  // on a card short of room z_init is streamed (ZINIT_STREAM): the language model's pair is never made whole
+  const bool streamZ = !check && shortPair((size_t)T * T, e.pair);
+  float* lmZ = streamZ ? nullptr : dalloc((size_t)T * T * e.pair);
   auto t0 = std::chrono::steady_clock::now();
   bool profLm = profile && getenv("EF2_PROFILE") && std::string(getenv("EF2_PROFILE")) == "lm";
   if (profLm) { prof::init(); prof::start(); }
@@ -129,9 +132,23 @@ static int foldInput(const Opts& o, bool warm) {
   if (check) checkOracle("s_inputs", sInputs, (size_t)T * Si, "o/s_inputs");
   int C = e.pair;
   mem("language model");
-  float* zi = dalloc((size_t)T * T * C); float* z = dalloc((size_t)T * T * C);
-  zInit(T, C, sInputs, Si, lmZ, zi, check);
-  CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr;
+  float* zi = nullptr; float* z = dalloc((size_t)T * T * C);
+  float *ziRows = nullptr, *ziCols = nullptr, *sTok = nullptr;
+  if (streamZ) {
+    // what the streamed z_init reads, kept past the scratch release below: the per-token states and the
+    // row and column projections - [T, C] each
+    sTok = dalloc((size_t)T * e.pair);
+    CK(cudaMemcpyAsync(sTok, scratch<float>("shim.tokens", (size_t)T * e.pair), (size_t)T * e.pair * 4, cudaMemcpyDeviceToDevice, STREAM));
+    ziRows = dalloc((size_t)T * C); ziCols = dalloc((size_t)T * C);
+    gemm(sInputs, F("featuriser/zInit1"), ziRows, T, Si, C);
+    gemm(sInputs, F("featuriser/zInit2"), ziCols, T, Si, C);
+    ZINIT_STREAM = { ziRows, ziCols, sTok, e.pair };
+    CK(cudaStreamSynchronize(STREAM));
+  } else {
+    zi = dalloc((size_t)T * T * C);
+    zInit(T, C, sInputs, Si, lmZ, zi, check);
+    CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr;
+  }
   // a large input gives each phase the whole card: its predecessor's scratch released (a pair over
   // 128 MB, ~350 tokens). Below that the scratch is kept - re-allocating it cost every phase cudaMallocs
   bool tight = (size_t)T * T * C * 4 > ((size_t)128 << 20);
@@ -146,7 +163,8 @@ static int foldInput(const Opts& o, bool warm) {
   CK(cudaStreamSynchronize(STREAM));
   say("trunk %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   mem("trunk");
-  CK(cudaFree(zi)); zi = nullptr;
+  if (zi) { CK(cudaFree(zi)); zi = nullptr; }
+  for (float* p : { ziRows, ziCols, sTok }) if (p) CK(cudaFree(p));
   if (tight) releaseScratch();
   // the page's contact map off the trunk's distogram (src/esmfold2/distogram-webgpu.js: the softmax mass
   // under each pair's threshold, the bins the exporter counted) - for the confidences file, and with
