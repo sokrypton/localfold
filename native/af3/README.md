@@ -633,7 +633,12 @@ pass. What the T4's own paths needed beyond the A100's:
   1.8 GB at 100 steps and 2,900 tokens.
 - the 64-key branch of the grid flash kernel checks its own shared memory - it asked for 66 KB at 4 warps.
 
-At 3,200 the MSA stack is what stops it: the pair (5.2 GB), the blocked triangle's fixed operand (2.6 GB)
+🔴 **AND NOW 3,200** (4 minutes of A100 arithmetic, clean at 100 steps): the blocked triangle gives its
+fixed operand back at the end of every call rather than at the end of a stage, since the MSA attention
+of the next block peaks beside the pair too. At 3,500 the operand itself (3.1 GB) no longer fits beside
+the pair (6.3 GB) and ~1.8 GB of weights. Before this:
+
+At 3,200 the MSA stack was what stopped it: the pair (5.2 GB), the blocked triangle's fixed operand (2.6 GB)
 and ~1.9 GB of weights. The next levers are 2-D tiles for the triangle (the fixed operand a quarter the
 size, recomputed four times - the projection is a tenth of the contraction's arithmetic) and dropping the
 file's f32 copy of tensors only read through their f16 mirror.

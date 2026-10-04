@@ -412,6 +412,9 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
       rectGatedAddK<T><<<blocks(cnt * C), 256, 0, STREAM>>>(pair, t1, t2, r, q0, cnt, n, C);
     }
   }
+  // given back at once: the fixed operand is a plane, and the next stage (the MSA attention, the grid
+  // attention) peaks beside the pair too - at these sizes a reallocation a call is nothing
+  releaseScratch({ "trib." });
 }
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
