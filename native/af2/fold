@@ -49,7 +49,7 @@ for a in "${inputs[@]}"; do
   esac
 done
 seq="${seq//:/}"
-[ -n "$seq" ] || [ -z "$a3m" ] || seq="$(grep -v '^>' "$a3m" | head -1 | tr -d 'a-z\r\n-')"
+[ -n "$seq" ] || [ -z "$a3m" ] || seq="$(grep -m1 -v '^>' "$a3m" | tr -d 'a-z\r\n-')"
 depth=1; [ -z "$a3m" ] || depth=$(grep -c '^>' "$a3m")
 for a in "${inputs[@]}"; do [ "$a" != "--search" ] || depth=$(( maxmsa + maxextra )); done   # (a search is usually deep)
 n=$(( depth < maxmsa ? depth : maxmsa )); e=$(( depth - n )); e=$(( e > maxextra ? maxextra : e )); e=$(( e < 1 ? 1 : e ))

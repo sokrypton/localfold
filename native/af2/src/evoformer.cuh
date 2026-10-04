@@ -470,6 +470,22 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
   linearB(mid, T + "/transition2", blk, out, rows, I, C);
   addK2<<<blocks(rows * C), 256, 0, STREAM>>>(x, out, rows * C);
 }
+// lt [s][i][c] -> [i][c][s], the left operand of the shallow form's contraction
+__global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * L * O) return;
+  int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
+  out[t] = lt[((size_t)s * L + i) * O + c];
+}
+// The outer product mean's SHALLOW form, for an alignment of few rows: the output projection folded into the
+// right operand first - T[c][s][j][f] = sum_e R[s][j][e] W[c O + e][f], a batched GEMM over c (W's rows for one
+// c are contiguous) - then Y[i][j][f] = sum_{c,s} L[s][i][c] T[c][s][j][f], one GEMM with K = O x S. Its work
+// is n^2 S O 128 against the standard form's n^2 O^2 (S + 128): a single sequence is ~30x less, and the forms
+// cross in FLOPs near S = 43 - but measured on an A100 at 500 residues, whole fold, the shallow form is faster
+// to 128 rows (1991 -> 1657 ms at 4, 2071 -> 1784 at 32, 2443 -> 2317 at 128) and slower from 256 (2912 against
+// 3063): the standard form's permute and its O^2-wide product are memory, not arithmetic. LOCALFOLD_OPM_SHALLOW
+// sets the deepest alignment it takes (0: never).
+inline const int OPM_SHALLOW = getenv("LOCALFOLD_OPM_SHALLOW") ? atoi(getenv("LOCALFOLD_OPM_SHALLOW")) : 128;
 inline void outerProductMean(Trunk& t, const std::string& S, int blk, const float* msa, int rowsN, int C,
                              const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
@@ -488,6 +504,25 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     float* norm = scratch<float>("opm.norm", (size_t)L * L);
     const float one = 1.f, zero = 0.f;
     CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, L, L, rowsN, &one, msaMask, L, msaMask, L, &zero, norm, L));
+    if (rowsN <= OPM_SHALLOW) {
+      const half* W = PH(Op + "/output_w", blk);           // [O*O][128] f16
+      half* T = scratch<half>("fopm.T", (size_t)O * rows * 128);
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, 128, (int)rows, O, &one, W, CUDA_R_16F, 128, (long long)O * 128,
+                                    rt, CUDA_R_16F, O, 0, &zero, T, CUDA_R_16F, 128, (long long)rows * 128, O,
+                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      half* Lt = scratch<half>("fopm.Lt", rows * O);
+      opmLeftToICS<<<blocks(rows * O), 256, 0, STREAM>>>(lt, Lt, rowsN, L, O);
+      int K = O * rowsN;
+      int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
+      float* Y = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
+      for (int i0 = 0; i0 < L; i0 += Bi) {
+        int bi = std::min(Bi, L - i0);
+        CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, L * 128, bi, K, &one, T, CUDA_R_16F, L * 128, Lt + (size_t)i0 * K,
+                        CUDA_R_16F, K, &zero, Y, CUDA_R_32F, L * 128, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        opmAddK<<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false);
+      }
+      return;
+    }
     size_t per = (size_t)L * O * O;
     int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
     half* Pm = scratch<half>("fopm.P", (size_t)Bi * per);

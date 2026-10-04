@@ -357,6 +357,14 @@ __global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) x[t] = fromF<T>(toF(x[t]) * mask[t / C]);
 }
+// lt [s][i][c] -> [i][c][s], the left operand of the shallow form's contraction (native/af2 has its twin)
+__global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * L * O) return;
+  int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
+  out[t] = lt[((size_t)s * L + i) * O + c];
+}
+inline const int OPM_SHALLOW = getenv("LOCALFOLD_OPM_SHALLOW") ? atoi(getenv("LOCALFOLD_OPM_SHALLOW")) : 128;
 // T: the projections and the contraction's inputs (f16 on the fast path, tensor cores, f32
 // accumulation); the contraction's output, the mask normaliser and the residual stay f32.
 template <class T>
@@ -379,13 +387,37 @@ void outerProductMean(Trunk& t, const std::string& pre) {
   float* norm = scratch<float>("opm.norm", (size_t)n * n);
   const float one = 1.f, zero = 0.f;
   CB(cublasSgemm(H, CUBLAS_OP_N, CUBLAS_OP_T, n, n, S, &one, t.msaMask, n, t.msaMask, n, &zero, norm, n));
+  bool after = M.flag("trunk.dialect.opmBiasAfterNorm");
+  // a shallow alignment (a single sequence, a few rows): the output projection folded into the right operand
+  // first, then one contraction with K = O x S - native/af2's outerProductMean has the measurement (whole AF2
+  // fold at 500 residues 18% faster on one row, the forms crossing between 128 and 256 rows)
+  if constexpr (std::is_same_v<T, half>) {
+    if (S <= OPM_SHALLOW) {
+      const half* Wo = Wh(pre + ".outputW");            // [O*O][C]: a c's rows contiguous
+      half* Tc = scratch<half>("opm.T", (size_t)O * rows * C);
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, (int)rows, O, &one, Wo, CUDA_R_16F, C, (long long)O * C,
+                                    R, CUDA_R_16F, O, 0, &zero, Tc, CUDA_R_16F, C, (long long)rows * C, O,
+                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      half* Lt = scratch<half>("opm.Lt", rows * O);
+      opmLeftToICS<<<blocks(rows * O), 256, 0, STREAM>>>(L, Lt, S, n, O);
+      int K = O * S;
+      int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * C)));
+      float* X = scratch<float>("opm.X", (size_t)Bi * n * C);
+      for (int i0 = 0; i0 < n; i0 += Bi) {
+        int bi = std::min(Bi, n - i0);
+        CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, n * C, bi, K, &one, Tc, CUDA_R_16F, n * C, Lt + (size_t)i0 * K,
+                        CUDA_R_16F, K, &zero, X, CUDA_R_32F, n * C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        opmAddK<<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(t.pair, X, W(pre + ".outputB"), norm, i0, bi, n, C, after);
+      }
+      return;
+    }
+  }
   // in blocks of query rows i: P[(i,c),(j,e)] = sum_s L[s,i,c] R[s,j,e]
   size_t per = (size_t)n * O * O;
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / per));
   T* P = scratch<T>("opm.Pt", (size_t)Bi * per);     // in T: the permute rounded it to T anyway
   T* Pp = scratch<T>("opm.Pp", (size_t)Bi * per);
   float* X = scratch<float>("opm.X", (size_t)Bi * n * C);
-  bool after = M.flag("trunk.dialect.opmBiasAfterNorm");
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   for (int i0 = 0; i0 < n; i0 += Bi) {
     int bi = std::min(Bi, n - i0);
