@@ -883,17 +883,31 @@ inline size_t lenW(const std::string& k) {
   auto it = WLEN.find(k);
   return it != WLEN.end() && !M.has(k) ? it->second : M.len(k);
 }
+// A weight concatenated along its output columns (concatColumns): each part (C, width) row-major
+// (in, out), or stored (width, C) if `transposed`; a part with no name is zero columns.
+struct Part { std::string name; int width; bool transposed; };
+// ...and how each was built, so its f32 copy can be given back once its f16 one exists (Wh) and built
+// again, exactly, by a later W() - the fast path reads only the f16 one
+inline std::map<std::string, std::pair<int, std::vector<Part>>> CONCAT;
+inline std::vector<float*> CONCAT_FREE;
+// the f32 copies Wh() queued, given back (one drain for all of them; at a phase boundary)
+inline void releaseConcatCopies() {
+  if (CONCAT_FREE.empty()) return;
+  CK(cudaDeviceSynchronize());
+  for (float* p : CONCAT_FREE) CK(cudaFree(p));
+  CONCAT_FREE.clear();
+}
+inline void buildConcat(const std::string& key);
 inline const float* W(const std::string& k) {
   auto it = WF.find(k);
   if (it != WF.end()) return it->second;
+  if (CONCAT.count(k)) { buildConcat(k); return WF[k]; }
   WLEN[k] = M.len(k);
   return WF[k] = const_cast<float*>(M.dev(k));
 }
 inline void deviceWeight(const std::string& k, float* p, size_t n) { WF[k] = p; WLEN[k] = n; }
-// A weight concatenated along its output columns, on the device from its copies of the parts:
-// each part (C, width) row-major (in, out), or stored (width, C) if `transposed`; a part with no
-// name is zero columns. Returns `key`, under which W()/Wh() serve the (C, sum of widths) result.
-struct Part { std::string name; int width; bool transposed; };
+// The concatenation on the device from its copies of the parts. concatColumns returns `key`, under
+// which W()/Wh() serve the (C, sum of widths) result.
 __global__ void transposeIntoK(const float* src, float* dst, int C, int width, size_t ld) {   // dst[c][o] = src[o][c]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)C * width) return;
@@ -901,7 +915,12 @@ __global__ void transposeIntoK(const float* src, float* dst, int C, int width, s
   dst[c * ld + o] = src[(size_t)o * C + c];
 }
 inline std::string concatColumns(const std::string& key, int C, const std::vector<Part>& parts) {
-  if (WF.count(key)) return key;
+  CONCAT.emplace(key, std::make_pair(C, parts));
+  if (!WF.count(key) && !WH.count(key)) buildConcat(key);
+  return key;
+}
+inline void buildConcat(const std::string& key) {
+  const auto& [C, parts] = CONCAT.at(key);
   size_t total = 0; for (auto& p : parts) total += p.width;
   float* d = dalloc((size_t)C * total);
   size_t off = 0;
@@ -918,7 +937,6 @@ inline std::string concatColumns(const std::string& key, int C, const std::vecto
     off += p.width;
   }
   deviceWeight(key, d, (size_t)C * total);
-  return key;
 }
 inline std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirror (freed with it)
 // a file's f16 copy, made once per GROUP - the first f16 read of any of its weights converts every
@@ -973,6 +991,10 @@ inline const half* Wh(const std::string& k) {
   const float* f = W(k); size_t n = WLEN[k];
   half* h = dallocT<half>(n);
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(f, h, n);
+  // a concatenation's f32 copy given back at the next phase boundary (buildConcat makes it again if
+  // asked) - AF3's peak 7.06 -> 6.57 GB at 262 tokens. Queued, not freed here: a cudaFree drains the
+  // device, and one per weight was 27 ms of a cold 464 ms trunk
+  if (CONCAT.count(k)) { CONCAT_FREE.push_back(const_cast<float*>(f)); WF.erase(k); }
   return WH[k] = h;
 }
 // a file's device copy without the entries `drop` names (they must have their f16 mirror already):

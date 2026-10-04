@@ -535,6 +535,16 @@ the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2
   card** (it was a fixed 4 GB): whole is 3.3% of the trunk faster at 262 tokens and 4.8% at 1048, and
   at 1048 it is the 1.13 GB the row chunks do not hold - nothing on 40 GB, and the difference between
   fitting and not near a T4's 15.
+- **A concatenated weight's f32 copy is given back once its f16 one exists** (`CONCAT`, `Wh`):
+  the q/k/v/gate and paired projections are built by concatenating the file's tensors, and the fast
+  path reads only the f16 result, so the f32 copy - 585 MB of AF3's - is queued and freed at the next
+  phase boundary (one drain, not one a weight: freeing each at once was 27 ms of a cold 464 ms
+  trunk), and rebuilt exactly from the file by a later W() if anything asks. AF3's peak at 262 tokens
+  7.06 -> 6.58 GB, every fold byte-identical across the AF3 lineage, a cold fold ~7 ms slower.
+  🔴 **IT FOUND A BUG BY MOVING THE ALLOCATOR**: rosettafold3 alone came out 0.12 A different, and
+  the cause was its chirality gradient launched over half its atoms (a 128-thread launch counted at
+  256 a block), the rest read from whatever memory the buffer landed in - a fold that depended on
+  the memory layout, invisible until the layout changed.
 - **What is left at the floor is the weights, twice**: the file's f32 device copy and, on `--fast`,
   its f16 mirror (3.8 GB in use at "trunk built" with 0.04 of scratch). native/ef2 drops the ESM-C
   tower's f32 copy after mirroring (`compactWeights`, 2.2 GB) because its tower reads only the mirror.

@@ -337,7 +337,7 @@ int main(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
-    memReport("trunk");
+    releaseConcatCopies(); memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below
       double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
@@ -395,7 +395,7 @@ int main(int argc, char** argv) {
     // tokens, held through every step). Not the conditioning's chunk buffers (dc.f2*, pt.*): they are
     // CHUNK-sized whatever the length, and giving them back cost 16 ms of a 100 ms diffusion at 525
     if (tight) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln" });
-    memReport("diffusion prepared");
+    releaseConcatCopies(); memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
     // confidence head and ranked by AF3's ranking score (src/scores.cuh). A seed's samples run as one
     // batch through the denoiser, sample k of seed s seeded sampleSeed(s, k); the best of them all is
@@ -436,7 +436,7 @@ int main(int argc, char** argv) {
     }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
     FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
     NS = 1;
-    memReport("diffusion");
+    releaseConcatCopies(); memReport("diffusion");
     diffMs += ms(s0, clock());
     if (tight) releaseScratch();
     size_t atoms3 = mask.size() * 3;
@@ -496,7 +496,7 @@ int main(int argc, char** argv) {
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n);
-        memReport("confidence");
+        releaseConcatCopies(); memReport("confidence");
       }
       CK(cudaFree(dBeta));
       confMs += ms(s1, clock());
