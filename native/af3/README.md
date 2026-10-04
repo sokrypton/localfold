@@ -661,3 +661,61 @@ Past 2^32 elements in one pair tensor (4.6e9 here) nothing overflowed: the indic
 per-channel ones stay under 2^32 to 65,536 tokens. The fixed cost at this size is the trunk's pair
 itself (18.4 GB in f32) and the blocked triangle's fixed operand (9.2 GB), which must be whole: a
 2-D tiling would read pair entries earlier tiles had written.
+
+### 🔴 Past the card: the pair in host memory (tier 2), and where it stops
+
+Past ~6,000 tokens on 40 GB the f32 pair alone (512 bytes a token pair, 59 GB at 10,761) is more than the card.
+**Tier 2** keeps it in pinned host memory and passes it through the card a WINDOW at a time - whole rows, or
+whole columns copied with one 2-D DMA - running the same kernels on the window (`forRowWindows`,
+`forColWindows` in common.cuh; a device pair is one window, so the ordinary paths are untouched and fold
+byte-identical). It is taken only when the trunk would not fit otherwise (`hostTier`: 1.8x the pair beside
+what is free, held scratch counting as free), and `LOCALFOLD_BIG=2` takes it at any size - with every tier-1
+path - which is how it is checked (200 tokens: CA 0.156 A from tier 1, mean PAE 0.05 apart; the gate's AF3,
+protenix2 and ligand folds all pass).
+
+- **explicit copies, double-buffered**: a kernel reading host memory in place managed 9 GB/s (1.5 for a
+  read-modify-write) and a managed allocation paged by the driver ran a 3,500-token trunk over 7x slower than
+  resident; copies run 24 GB/s each way, the next window up and the last down on their own streams while one
+  is computed on.
+- **the column direction is the row direction on a turned window**: the incoming triangle is its rectangle
+  addressing (`TriRect`'s window fields) over a column window; the column attention runs the row kernels on a
+  window turned on the card (the flash kernel's `tr` reads only the mask).
+- **the light passes ride on the heavy one before them**: the row attention's bias off the incoming
+  triangle's column windows, the column attention's off the row attention's, and from the transition's
+  windows the single track and the next block's outgoing fixed operand - ten pair reads a pairformer block
+  became six.
+- **the triangle's blocks as wide as what is free allows**: every block reads the whole fixed operand, so at
+  10,761 tokens 48-row blocks read 29.6 GB 224 times a triangle - 4.4 s of memory traffic for 1.1 s of
+  arithmetic; a window a block is 56 reads.
+- **everything else pair-shaped follows**: the template stack's 64-channel activation (and its sum, and
+  boltz2's residual copy) and each template feature a window of rows at a time, the confidence head's pair
+  and heads (the logits per chunk, never whole), and the diffusion's LayerNorm'd pair - from which every
+  block's biases are made once and kept in host memory where it has room, two device slots copying them up
+  as the step reaches them.
+
+**What it costs.** 2,000 tokens: trunk 220 s against tier 1's 55 - copy-bound there (2 GB pair, ~22 GB a
+block across PCIe). The copies scale as the square of the length and the arithmetic as the cube, so at
+10,761 tokens they mostly hide behind it: **10,761 tokens fold on this 40 GB A100 in 2.7 hours** (trunk 150
+minutes over 4 passes - 42 s a block - diffusion at 100 steps 5.7, confidence 3.1), every consecutive CA-CA
+in band (median 3.984 A), the card's stage boundaries at 8-12 GB in the trunk and the triangle's fixed
+operand (29.6 GB) beside them inside it, 89 GB of host memory pinned for the pair and its companions. The
+first attempt ran out at the confidence head's first triangle, 1 GB short: the sampler's precomputed
+per-step conditioning (5 GB at 100 steps) was held past the sampler, and the encoder's pair projection
+(7.4 GB) through every step - both now go when their last reader is done.
+
+**Where it stops - and it should.** Tier 2 trades the card for host RAM: ~770 bytes a token pair pinned
+(the pair, and beside it the template stack's or the diffusion's), plus the pair again where a fold has
+more than one sample (the confidence head's copy). The card still holds the triangle's fixed operand whole
+(256 bytes a pair) and ~5 GB beside it. `tier2Fits` asks both BEFORE anything is pinned and refuses an
+input past them at once, naming the longest this machine takes. Measured Colab tiers (2026-10-04):
+
+| Colab `--gpu` | card | host RAM | tier 1 alone | with tier 2 | limit |
+|---|---|---|---|---|---|
+| T4 | 15 GB | 12.7 GB | ~3,200 | ~3,200 | host RAM: tier 2 does not help |
+| L4 | 22.5 GB | 53 GB | ~3,900 | ~8,000 | both |
+| A100 | 40 GB | 83.5 GB | 6,000 | ~10,000 | host RAM |
+| G4 (RTX PRO 6000) | 96 GB | 177 GB | ~9,000 | ~15,000 | host RAM, and time (~5 h of trunk) |
+
+(estimates from the measured per-pair costs, except 6,000 and 10,761 measured on this 216 GB box.) Past those
+it would take new machinery - a fixed operand in pieces, or more than one GPU - for folds that already take
+hours of a model trained on a few hundred tokens.

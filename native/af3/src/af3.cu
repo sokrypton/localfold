@@ -227,7 +227,7 @@ int main(int argc, char** argv) {
     std::vector<float> seq(M.f(I + "seqMask"), M.f(I + "seqMask") + n), pm((size_t)n * n);
     for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) pm[(size_t)i * n + j] = seq[i] * seq[j];
     float* seqm = upload(seq.data(), n); float* pairm = upload(pm.data(), pm.size());
-    ConfidenceOut c = confidenceHead(pair, single, tf, beta, seqm, pairm, n);
+    ConfidenceOut c = confidenceHead(Pair{pair, nullptr, n, (int)M.meta("confidence.pairChannels")}, single, tf, beta, seqm, pairm, n);
     auto cmp = [&](const char* label, const std::vector<float>& mine, const std::string& o) {
       if (!M.has(o) || M.len(o) != mine.size()) { printf("  %-24s (no oracle)\n", label); return; }
       printf("  %-24s relRMS %.3e\n", label, relRms(mine.data(), M.f(o), mine.size()));
@@ -271,6 +271,7 @@ int main(int argc, char** argv) {
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
   if (oracleTargetFeat)
     targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
+  FOLD_RUNS = samples * (int)seedList.size();
   t = makeTrunk(targetFeat.data(), msaCap);
   memReport("trunk built");
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
@@ -278,9 +279,13 @@ int main(int argc, char** argv) {
   for (int fi = 0; doFold && fi < folds; ++fi) {
     if (fi > 0) {   // a fresh fold: the trunk restarts from zero recycled state
       size_t pp = (size_t)t.n * t.n * t.C;
-      if (!t.pair) t.pair = dalloc(pp);                // (left parked by the last fold)
-      // (in place, the pair is the recycled one)
-      CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
+      if (t.pairHost) memset(t.pairHost, 0, pp * 4);   // (tier 2: the pair is in host memory)
+      else {
+        if (!t.pair) t.pair = dalloc(pp);              // (left parked by the last fold)
+        // (in place, the pair is the recycled one)
+        CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pp * 4));
+      }
+      CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
     }
     std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
     auto clock = [] { return std::chrono::steady_clock::now(); };
@@ -305,12 +310,8 @@ int main(int argc, char** argv) {
     if (tapContacts) TAP().reserve(recycles + 1, (size_t)t.n * t.n);
     auto afterPass = [&](int pass) {
       if (!tapContacts) return;
-      int bins = (int)M.meta("trunk.distogram.bins");
       size_t pairs = (size_t)t.n * t.n;
-      float* logits = scratch<float>("disto.logits", pairs * bins);
-      distogram(t, logits);
-      float* probs = scratch<float>("disto.contact", pairs);
-      contactProbsK<<<blocks(pairs), 256, 0, STREAM>>>(logits, Idev("batch.contactBins"), t.pairMask, probs, pairs, bins);
+      float* probs = contactProbsDevice(t);
       unsigned char* bytes = scratch<unsigned char>("disto.contact8", pairs);
       quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(probs, bytes, pairs, 1.f / 255);
       std::string path = framesDir + "/contacts-" + (pass < 10 ? "0" : "") + std::to_string(pass) + "-of-"
@@ -340,6 +341,7 @@ int main(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
+    if (t.pairHost) freeTemplateHost();      // (tier 2: 30 GB of pinned host memory at 10761 tokens)
     releaseConcatCopies(); memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below
@@ -359,7 +361,11 @@ int main(int argc, char** argv) {
       size_t n = t.n;
       if (saveEmbeddings) {
         writeNpy(base + "_single_embeddings.npy", download(t.single, n * t.Cs), { n, (size_t)t.Cs });
-        writeNpy(base + "_pair_embeddings.npy", download(t.pair, n * n * t.C), { n, n, (size_t)t.C });
+        writeNpy(base + "_pair_embeddings.npy", t.pairHost ? std::vector<float>(t.pairHost, t.pairHost + n * n * t.C)
+                                                           : download(t.pair, n * n * t.C), { n, n, (size_t)t.C });
+      }
+      if (saveDistogram && t.pairHost) {
+        fprintf(stderr, "--save-distogram: a pair this card cannot hold has no whole distogram to save\n"); return 1;
       }
       if (saveDistogram) {
         int bins = (int)M.meta("trunk.distogram.bins");
@@ -381,6 +387,7 @@ int main(int argc, char** argv) {
     const float *dS = t.single, *dP = t.pair, *dTf = t.targetFeat, *dSeq = t.seqMask;
     int nD = t.n;
     std::vector<int> resAsym(M.i("batch.asymId"), M.i("batch.asymId") + t.n);
+    if (structural && t.pairHost) { fprintf(stderr, "a pair this card cannot hold does not fold with OpenDDE's structural tokens\n"); return 1; }
     if (structural) {
       st = expandStructural(t.single, t.pair, t.targetFeat, t.n, fast);
       swapBatch();
@@ -396,13 +403,20 @@ int main(int argc, char** argv) {
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
     if (!structural && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
-        parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); dP = nullptr; }
+        t.pair && parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); dP = nullptr; }
+    // tier 2: the pair is already where a parked one waits (makeTrunk), which only the streamed preparation reads
+    if (t.pairHost && !(DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond"))) {
+      fprintf(stderr, "a pair this card cannot hold needs the f16 diffusion and an encoder that takes the pair's projection\n");
+      return 1;
+    }
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
     // ...and the pair-sized tensors only the preparation reads, given back before the steps: the
     // transformer's and the encoder's pair LayerNorms and the per-super-block logits (1.4 GB at 1048
     // tokens, held through every step). Not the conditioning's chunk buffers (dc.f2*, pt.*): they are
     // CHUNK-sized whatever the length, and giving them back cost 16 ms of a 100 ms diffusion at 525
-    if (tight) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln" });
+    // ...and the encoder's per-token-pair projection, which only its preparation reads (folded into the atom
+    // pairs' conditioning): held through every step it was 7.4 GB of the sampler's peak at 10761 tokens
+    if (tight) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln", "enc.tp", "enc.h1", "enc.h2" });
     // ...and on a card short of room the conditioning pair itself: the steps read the precomputed
     // single conditioning, the prepared encoder and the cached logits, never the pair (DCACHE stays
     // ready - its single base is what a later batch's precompute reads)
@@ -453,6 +467,10 @@ int main(int argc, char** argv) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
     }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
     FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
+    // the steps' precomputed conditioning (steps x tokens rows, 5 GB at 100 steps and 10761 tokens) is read by
+    // nothing after the sampler - the next batch makes its own - and held to the end it left the confidence
+    // head's fixed operand 1 GB short there
+    if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); df.preSingle = df.preSnProj = nullptr; }
     NS = 1;
     releaseConcatCopies(); memReport("diffusion");
     diffMs += ms(s0, clock());
@@ -513,11 +531,11 @@ int main(int argc, char** argv) {
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
-        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * 4);    // (parked for the sampler)
+        if (!t.pair && !t.pairHost) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * 4);    // (parked for the sampler)
         // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
         bool last = c0 + k + 1 == runs.size();
-        ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
-                            last && shortPair((size_t)t.n * t.n, t.C));
+        ck = confidenceHead(t.P(), t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
+                            last && (t.pairHost || shortPair((size_t)t.n * t.n, t.C)));
         releaseConcatCopies(); memReport("confidence");
       }
       CK(cudaFree(dBeta));
@@ -538,6 +556,9 @@ int main(int argc, char** argv) {
       if (score > bestScore) { bestScore = score; best = sk; bestSeed = sd; conf = std::move(ck); x = std::move(xk); bestSS = ssk; }
     }
     }
+    // (tier 2: the fold's pinned host buffers - the sampler's biases, the confidence head's copy - given back,
+    // so the next fold of a resident process sees the host memory they held)
+    if (t.pairHost) for (auto& [k, v] : HOST_KEPT) hostKeptFree(k);
     if (!framesDir.empty()) {
       frames.finish();
       printf("frames: %d written, %d dropped\n", frames.written, TAP().dropped);

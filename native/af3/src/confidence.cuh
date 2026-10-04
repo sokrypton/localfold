@@ -32,10 +32,10 @@ __global__ void confidenceBinK(const float* beta, int n, int bins, float dmin, f
 }
 __global__ void confidencePairInitK(float* pair, const float* left, const float* right, const int* binOf,
                                     const float* sqOf, const float* pairMask, const float* Wd, int n, int C,
-                                    const float* Wdist, bool caBins) {
+                                    const float* Wdist, bool caBins, size_t p0 = 0, size_t cnt = SIZE_MAX) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+  if (t >= (cnt < (size_t)n * n ? cnt : (size_t)n * n) * C) return;
+  int c = (int)(t % C); size_t ij = p0 + t / C; int i = (int)(ij / n), j = (int)(ij % n);
   float v = left[(size_t)j * C + c] + right[(size_t)i * C + c];
   int bin = binOf[ij];
   if (bin >= 0) v += Wd[(size_t)bin * C + c] * pairMask[ij];
@@ -165,7 +165,7 @@ inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, co
   if (lenW(R + "relPosProject") != (size_t)139 * C) { fprintf(stderr, "relPosProject is not 139 x %d\n", C); exit(1); }
   relativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(
     Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
-    Idev("batch.features.entityId"), Idev("batch.features.symId"), W(R + "relPosProject"), pair, n, C, 32, 2);
+    Idev("batch.features.entityId"), Idev("batch.features.symId"), W(R + "relPosProject"), pair, n, C, 32, 2, 0, pairs);
   float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
   float* p1 = scratch<float>("conf.p1", (size_t)n * C); float* p2 = scratch<float>("conf.p2", (size_t)n * C);
   linear<float, float>(sIn, left, n, F, C, R + "leftTargetFeatProject");
@@ -190,9 +190,10 @@ struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPl
 
 // consumeTrunkPair: the trunk's pair is read by nothing after this call, so the head works in it rather
 // than in a copy (the caller says so for a card short of room, on its last confidence call)
-inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
+inline ConfidenceOut confidenceHead(const Pair& trunk, const float* trunkSingle, const float* targetFeat,
                                     const float* pseudoBeta, const float* seqMask, const float* pairMask, int n,
                                     bool consumeTrunkPair = false) {
+  const float* trunkPair = trunk.dev;
   const std::string P = "confidence";
   int C = (int)M.meta(P + ".pairChannels"), Cs = (int)M.meta(P + ".singleChannels"), F = (int)M.meta(P + ".targetFeatWidth");
   int dense = (int)M.meta("batch.dense");
@@ -200,12 +201,23 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   size_t pairs = (size_t)n * n;
   bool reembed = M.flag("trunk.dialect.reembedConfidencePair");
   bool inPlace = consumeTrunkPair && !reembed;                 // (boltz2 builds its pair from the trunk's: no aliasing)
-  float* pair = inPlace ? const_cast<float*>(trunkPair) : scratch<float>("conf.pair", pairs * C);
+  // tier 2: the head's pair in host memory too - the trunk's own on the last call, else a copy beside it
+  if (trunk.host && (reembed || M.flag("trunk.dialect.confidenceGlobalNorm"))) {
+    fprintf(stderr, "a pair this card cannot hold has no confidence head for this model (it %s the whole pair)\n",
+            reembed ? "re-embeds" : "normalises over"); exit(1);
+  }
+  Pair cp{nullptr, nullptr, n, C};
+  if (trunk.host) {
+    cp.host = inPlace ? trunk.host : hostKept("conf.pair", pairs * C);
+    if (!inPlace) { CK(cudaStreamSynchronize(STREAM)); memcpy(cp.host, trunk.host, pairs * C * 4); }
+  }
+  float* pair = trunk.host ? nullptr : inPlace ? const_cast<float*>(trunkPair) : scratch<float>("conf.pair", pairs * C);
+  if (!trunk.host) cp.dev = pair;
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
   if (reembed) {
     boltz2Reembed(pair, single, trunkPair, trunkSingle, targetFeat, pseudoBeta, pairMask, n, C, Cs, F);
   } else {
-  if (!inPlace) CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  if (!inPlace && !trunk.host) CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(single, trunkSingle, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   if (M.flag("trunk.dialect.confidenceGlobalNorm")) {
     // rf3 normalises every detached trunk input over the whole tensor first (target_feat over the
@@ -223,8 +235,10 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
   int* binOf = scratch<int>("conf.bin", pairs); float* sqOf = scratch<float>("conf.sq", pairs);
   confidenceBinK<<<blocks(pairs), 256, 0, STREAM>>>(pseudoBeta, n, bins, 3.25f, 50.75f, caDgram, binOf, sqOf);
-  confidencePairInitK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, binOf, sqOf, pairMask,
-    W(P + ".distogramFeatProject"), n, C, Wopt(P + ".distanceFeatProject"), caDgram);
+  forRowWindows(cp, true, [&](float* w, size_t i0, size_t I) {
+    confidencePairInitK<<<blocks(I * n * C), 256, 0, STREAM>>>(w, left, right, binOf, sqOf, pairMask,
+      W(P + ".distogramFeatProject"), n, C, Wopt(P + ".distanceFeatProject"), caDgram, i0 * n, I * n);
+  });
   if (bins != (caDgram ? 40 : 39)) { fprintf(stderr, "confidence distogram has %d bins\n", bins); exit(1); }
   if (hasW(P + ".inputSingleNormScale")) {
     // the trunk single clamped to +-512 and LayerNormed before any use (protenix2)
@@ -236,12 +250,14 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   }
   int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
   bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
-  for (int k = 0; k < nb; ++k)
-    if (CONF_HALF) pairformerBlockAt<half>(pair, single, pairMask, seqMask, n, C, Cs, P + ".blocks." + std::to_string(k), swap, divide);
-    else pairformerBlockAt<float>(pair, single, pairMask, seqMask, n, C, Cs, P + ".blocks." + std::to_string(k), swap, divide);
+  for (int k = 0; k < nb; ++k) {
+    std::string next = k + 1 < nb ? P + ".blocks." + std::to_string(k + 1) : "";
+    if (CONF_HALF) pairformerBlockAt<half>(cp, single, pairMask, seqMask, Cs, P + ".blocks." + std::to_string(k), swap, divide, nullptr, next);
+    else pairformerBlockAt<float>(cp, single, pairMask, seqMask, Cs, P + ".blocks." + std::to_string(k), swap, divide, nullptr, next);
+  }
   // on a card short of room the stack's scratch goes before the heads allocate theirs, so the two peak
   // apart rather than together
-  if (shortPair(pairs, C)) releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
+  if (shortPair(pairs, C) || cp.host) releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st.", "hp." });
   // the error bins: 64 of them up to 31 A, the last one step past the second-to-last
   const int NB = 64; double step = 31.0 / (NB - 2);
   std::vector<float> centres(NB);
@@ -249,12 +265,21 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   centres[NB - 1] = (float)(centres[NB - 2] + step);
   float* dCentres = upload(centres.data(), NB);
   // on a card short of room the heads' LayerNorm (and the symmetrised pair it reads) run in row chunks
-  bool chunked = shortPair(pairs, C);
+  bool chunked = shortPair(pairs, C) || cp.host;
   size_t rowsPer = chunked ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
   float* ln = scratch<float>("conf.ln", rowsPer * C);
-  float* logits = scratch<float>("conf.logits", pairs * NB);
+  // (tier 2 never holds the logits whole: each chunk's are reduced to its expectations at once)
+  float* logits = scratch<float>("conf.logits", (cp.host ? rowsPer : pairs) * NB);
   ConfidenceOut out;
   float* pde = scratch<float>("conf.pde", pairs); float* pae = scratch<float>("conf.pae", pairs);
+  // the TM term's per-bin weights, off the real token count (src/heads/tm-score.js)
+  std::vector<float> seq = download(seqMask, n);
+  int real = 0; for (float v : seq) real += v > 0;
+  double d0 = 1.24 * std::cbrt(std::max(real, 19) - 15.0) - 1.8;
+  std::vector<float> perBin(NB);
+  for (int b = 0; b < NB; ++b) perBin[b] = (float)(1 / (1 + (double)centres[b] * centres[b] / (d0 * d0)));
+  float* dPerBin = upload(perBin.data(), NB);
+  float* dTerm = scratch<float>("conf.tmTerm", pairs);
   bool preSym = M.flag("trunk.dialect.preSymmetrisedPde");
   // a head LayerNorm the bundle does not carry is no LayerNorm (boltz2 reads z and s directly)
   auto headNorm = [&](const float* x, float* buf, size_t rows, int Cx, const std::string& name) -> const float* {
@@ -287,7 +312,44 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
       interChainLogitsRowsK<<<blocks(cnt * NB), 256, 0, STREAM>>>(logits, interLogits, asymDev, n, NB, r0, cnt);
     }
   };
-  if (chunked) {
+  if (cp.host) {
+    // tier 2: per window of rows, with the same columns turned into rows beside it - each chunk's PDE logits
+    // from LN(z_ij + z_ji) (pre-symmetrised) or LN(z_ij) W + LN(z_ji) W (AF3), its PAE logits and TM term
+    float* l2 = scratch<float>("conf.logitsT", rowsPer * NB);
+    float* symc = preSym ? scratch<float>("conf.sym", rowsPer * C) : nullptr;
+    auto proj = [&](const float* x, float* to, size_t cnt, size_t p0, const std::string& norm, const std::string& w,
+                    const std::string& inter) {
+      const float* xn = headNorm(x, ln, cnt, C, norm);
+      linear<float, float>(xn, to, cnt, C, NB, P + "." + w);
+      if (!hasW(P + "." + inter)) return;
+      linear<float, float>(xn, interLogits, cnt, C, NB, P + "." + inter);
+      interChainLogitsRowsK<<<blocks(cnt * NB), 256, 0, STREAM>>>(to - p0 * NB, interLogits, asymDev, n, NB, p0, cnt);
+    };
+    forRowWindows(cp, false, [&](float* w, size_t i0, size_t I) {
+      size_t wn = I * n;
+      float* cols = scratch<float>("hp.win2", wn * C);
+      CK(cudaMemcpy2DAsync(cols, I * C * 4, cp.host + i0 * C, (size_t)n * C * 4, I * C * 4, n, cudaMemcpyHostToDevice, STREAM));
+      float* turned = scratch<float>("hp.turned", wn * C);
+      transposeWindowK<<<blocks(wn * C * 4 / 16), 256, 0, STREAM>>>((const uint4*)cols, (uint4*)turned, n, I, C * 4 / 16);
+      for (size_t q = 0; q < wn; q += rowsPer) {
+        size_t cnt = std::min(rowsPer, wn - q), p0 = i0 * n + q;
+        if (preSym) {
+          CK(cudaMemcpyAsync(symc, w + q * C, cnt * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+          addK<<<blocks(cnt * C), 256, 0, STREAM>>>(symc, turned + q * C, cnt * C);
+          proj(symc, logits, cnt, p0, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
+        } else {
+          proj(w + q * C, logits, cnt, p0, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
+          proj(turned + q * C, l2, cnt, p0, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
+          addK<<<blocks(cnt * NB), 256, 0, STREAM>>>(logits, l2, cnt * NB);
+        }
+        expectationK<<<blocks(cnt), 256, 0, STREAM>>>(logits, pde + p0, pairMask + p0, cnt, NB, dCentres, 0, 1.f);
+        proj(w + q * C, logits, cnt, p0, "paeLogitsLn", "paeLogits", "paeInterLogits");
+        expectationK<<<blocks(cnt), 256, 0, STREAM>>>(logits, pae + p0, pairMask + p0, cnt, NB, dCentres, 0, 1.f);
+        expectationK<<<blocks(cnt), 256, 0, STREAM>>>(logits, dTerm + p0, nullptr, cnt, NB, dPerBin, 0, 1.f);
+      }
+    });
+    releaseScratch({ "hp." });
+  } else if (chunked) {
     headLogits(preSym, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
   } else {
     const float* src = pair;
@@ -299,22 +361,17 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
     }
     project(headNorm(src, ln, pairs, C, "logitsLn"), "leftHalfDistanceLogits", "interHalfDistanceLogits");
   }
+  if (!cp.host) {
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pde, pairMask, pairs, NB, dCentres, preSym ? 0 : n, 1.f);
   if (chunked) headLogits(false, "paeLogitsLn", "paeLogits", "paeInterLogits");
   else project(headNorm(pair, ln, pairs, C, "paeLogitsLn"), "paeLogits", "paeInterLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pae, pairMask, pairs, NB, dCentres, 0, 1.f);
+  expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, dTerm, nullptr, pairs, NB, dPerBin, 0, 1.f);
+  }
   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's
   // mean over the pairs it selects (ipTM: other chains only). src/heads/tm-score.js.
   {
-    std::vector<float> seq = download(seqMask, n);
     const int* asym = M.i("batch.asymId");
-    int real = 0; for (float v : seq) real += v > 0;
-    double d0 = 1.24 * std::cbrt(std::max(real, 19) - 15.0) - 1.8;
-    std::vector<float> perBin(NB);
-    for (int b = 0; b < NB; ++b) perBin[b] = (float)(1 / (1 + (double)centres[b] * centres[b] / (d0 * d0)));
-    float* dPerBin = upload(perBin.data(), NB);
-    float* dTerm = scratch<float>("conf.tmTerm", pairs);
-    expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, dTerm, nullptr, pairs, NB, dPerBin, 0, 1.f);
     std::vector<float> term = download(dTerm, pairs);
     CK(cudaFree(dPerBin));
     auto reduce = [&](bool interOnly) {

@@ -262,10 +262,18 @@ inline void triContractBf16(bool outgoing, int np, size_t cs, int C, float alpha
 // ---------------------------------------------------------------- the triangle multiplication in blocks
 // A RECTANGLE of the padded pair space - rows [i0, i0 + I), columns [j0, j0 + J) - with q = (i - i0) J
 // + (j - j0) its own index: the operands of one block of the contraction and its output live there.
-struct TriRect { int i0, I, j0, J; size_t size() const { return (size_t)I * J; } };
-__device__ __forceinline__ size_t rectPair(const TriRect& r, size_t q, int n) {     // the pair at q, SIZE_MAX for padding
+// A pair held in host memory (tier 2) is read through a WINDOW on the device: rows [wi0, ...) by columns
+// [wj0, wj0 + ws), row-major - ws 0 for the pair itself.
+struct TriRect {
+  int i0, I, j0, J; int wi0 = 0, wj0 = 0, ws = 0;
+  size_t size() const { return (size_t)I * J; }
+};
+// the pair at q (SIZE_MAX for padding), and its place in the window
+__device__ __forceinline__ size_t rectPair(const TriRect& r, size_t q, int n, size_t* win = nullptr) {
   size_t i = r.i0 + q / r.J, j = r.j0 + q % r.J;
-  return i < (size_t)n && j < (size_t)n ? i * n + j : SIZE_MAX;
+  if (i >= (size_t)n || j >= (size_t)n) return SIZE_MAX;
+  if (win) *win = r.ws ? (i - r.wi0) * r.ws + (j - r.wj0) : i * n + j;
+  return i * n + j;
 }
 // LayerNorm of rows [q0, q0 + cnt) of a rectangle, read from the pair where they lie (zeros for padding),
 // and their mask - a warp a row
@@ -275,8 +283,8 @@ __global__ void rectLayerNormK(const float* pair, const float* mask, TO* out, fl
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= cnt) return;
-  size_t p = rectPair(r, q0 + row, n);
-  const float* x = p != SIZE_MAX ? pair + p * C : nullptr;
+  size_t pw = 0, p = rectPair(r, q0 + row, n, &pw);
+  const float* x = p != SIZE_MAX ? pair + pw * C : nullptr;
   float s = 0, ss = 0;
   for (int c = lane; c < C; c += 32) { float v = x ? x[c] : 0.f; s += v; ss += v * v; }
   for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
@@ -336,8 +344,8 @@ __global__ void rectGatedAddK(float* pair, const T* t1, const T* t2, TriRect r, 
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   size_t row = t / C; int c = (int)(t % C);
-  size_t p = rectPair(r, q0 + row, n);
-  if (p != SIZE_MAX) pair[p * C + c] += toF(t1[t]) * sigm(toF(t2[t]));
+  size_t pw = 0, p = rectPair(r, q0 + row, n, &pw);
+  if (p != SIZE_MAX) pair[pw * C + c] += toF(t1[t]) * sigm(toF(t2[t]));
 }
 
 // [projection | gate] of ONE operand (side 0 = a, 1 = b) as a (C, 2C) matrix, from the interleaved (C, 2C)
@@ -363,9 +371,31 @@ inline std::string operandWeight(const std::string& pre, int C, int side) {
 // product. Outgoing P[i, j] = sum_k a[i, k] b[j, k]: a row block reads pair rows the earlier blocks did
 // not write. Incoming P[i, j] = sum_k a[k, j] b[k, i]: a COLUMN block reads pair columns the earlier
 // blocks did not write - a row block would read rows they had. The reduction over k is never split.
+// Tier 2: the fixed operand b's rows [i0, i0 + I) - the last window's padding rows too - from a window of whole
+// rows, into b (np^2 x C, channel-major). On its own pass, or riding on the pass before (pairUpdates).
+inline std::string HOST_B_READY;       // the triangle whose b is already built in trib.b (pairUpdates)
+template <class T>
+void triOperandRows(const float* w, size_t i0, size_t I, int n, int C, int np, const float* mask, const std::string& pre,
+                    T* b) {
+  size_t cs = (size_t)np * np, per = std::max<size_t>(32, CHUNK / (4 * C));
+  std::string pg = operandWeight(pre, C, 1);
+  float* m = scratch<float>("trib.mask", per);
+  T* ln = scratch<T>("trib.ln", per * C); T* pgOut = scratch<T>("trib.pg", per * 2 * C);
+  int rows = i0 + I == (size_t)n ? np - (int)i0 : (int)I;
+  TriRect r{(int)i0, rows, 0, np, (int)i0, 0, n};
+  for (size_t q0 = 0; q0 < r.size(); q0 += per) {
+    size_t cnt = std::min(per, r.size() - q0);
+    rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(w, mask, ln, m, r, q0, cnt, n, C,
+      W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"));
+    linear<T, T>(ln, pgOut, cnt, C, 2 * C, pg);
+    rectGateK<T><<<dim3((unsigned)((cnt + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(pgOut, m, b, i0 * np + q0,
+                                                                                             cnt, C, cs);
+  }
+}
 template <class T>
 void triangleBlocked(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
-                     bool divideByLength, int np) {
+                     bool divideByLength, int np, const Pair* hp = nullptr, bool bBuilt = false,
+                     const std::function<void(float*, size_t, size_t)>& after = nullptr) {
   size_t cs = (size_t)np * np;
   // each operand's own half of [projection | gate], so the two passes together project once
   std::string pgOf[2] = { operandWeight(pre, C, 0), operandWeight(pre, C, 1) };
@@ -374,27 +404,44 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   size_t per = std::max<size_t>(32, CHUNK / (4 * C));            // rows a chunk of the row-wise steps
   float* m = scratch<float>("trib.mask", per);
   T* ln = scratch<T>("trib.ln", per * C); T* pgOut = scratch<T>("trib.pg", per * 2 * C);
-  // LN(pair) -> [projection | gate] -> one operand (side 0 = a, 1 = b), over a rectangle in chunks
-  auto operands = [&](const TriRect& r, T* out, int side) {
+  // LN(pair) -> [projection | gate] -> one operand (side 0 = a, 1 = b), over a rectangle in chunks, into
+  // `out` at base + q of a buffer `size` long per channel (the rectangle's own size unless it is a part of b)
+  auto operands = [&](const float* src, const TriRect& r, T* out, int side, size_t size, size_t base) {
     for (size_t q0 = 0; q0 < r.size(); q0 += per) {
       size_t cnt = std::min(per, r.size() - q0);
-      rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, m, r, q0, cnt, n, C,
+      rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(src, mask, ln, m, r, q0, cnt, n, C,
         W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"));
       linear<T, T>(ln, pgOut, cnt, C, 2 * C, pgOf[side]);
-      rectGateK<T><<<dim3((unsigned)((cnt + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(pgOut, m, out, q0, cnt, C, r.size());
+      rectGateK<T><<<dim3((unsigned)((cnt + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(pgOut, m, out, base + q0,
+                                                                                               cnt, C, size);
     }
   };
   T* b = scratch<T>("trib.b", cs * C);
-  operands({0, np, 0, np}, b, 1);
-  // a block of the free operand and its product: about CHUNK / C rows of the rectangle each
+  // a pair in host memory: b from each window of rows in turn - unless the pass before built it already
+  if (hp && bBuilt) {
+    if (SCRATCH["trib.b"].second < cs * C * sizeof(T)) { fprintf(stderr, "%s: its fixed operand was not kept\n", pre.c_str()); exit(1); }
+  } else if (hp) forRowWindows(*hp, false, [&](float* w, size_t i0, size_t I) { triOperandRows<T>(w, i0, I, n, C, np, mask, pre, b); });
+  else operands(pair, {0, np, 0, np}, b, 1, cs, 0);
+  // a block of the free operand and its product: at least CHUNK / C rows of the rectangle, and as many more as
+  // what is free beside b allows (in tier 2 a window - hostWindowRows budgets for it - and on the card up to
+  // 1024 rows) - every block reads the whole
+  // of b (np^2 x C), so at 10761 tokens 48-row blocks read 29.6 GB 224 times a triangle, 4.4 s of memory traffic
+  // for 1.1 s of arithmetic
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
+  if (hp) width = (int)std::max<size_t>(width, std::min<size_t>(np, (hostWindowRows(n, C) + 7) / 8 * 8));   // (its budget)
+  else {
+    size_t f, t; CK(cudaMemGetInfo(&f, &t));
+    size_t perRow = (size_t)np * C * (sizeof(T) + 4), spare = f > t / 16 ? f - t / 16 : 0;    // a and prod, a row each
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+  }
   T* a = scratch<T>("trib.a", (size_t)width * np * C);
   float* prod = scratch<float>("trib.prod", (size_t)width * np * C);
   T* t1 = scratch<T>("trib.t1", per * C); T* t2 = scratch<T>("trib.t2", per * C);
-  for (int k0 = 0; k0 < n; k0 += width) {
-    int w = std::min(width, np - k0);
-    TriRect r = outgoing ? TriRect{k0, w, 0, np} : TriRect{0, np, k0, w};
-    operands(r, a, 0);
+  // the output block at rows (outgoing) or columns (incoming) [k0, k0 + w), of `src` - the pair, or a window
+  // whose rows begin at wi0 (columns at wj0) and are ws wide
+  auto block = [&](float* src, int k0, int w, int wi0, int wj0, int ws) {
+    TriRect r = outgoing ? TriRect{k0, w, 0, np, wi0, wj0, ws} : TriRect{0, np, k0, w, wi0, wj0, ws};
+    operands(src, r, a, 0, r.size(), 0);
     if (outgoing)          // (as the whole contraction, with w output rows)
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, np, w, np, &alpha, b, cudaType<T>(), np, cs, a,
         cudaType<T>(), np, r.size(), &zero, prod, CUDA_R_32F, np, r.size(), C, CUBLAS_COMPUTE_32F, algo));
@@ -406,12 +453,24 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
       rectCenterNormK<T><<<(unsigned)((cnt + 31) / 32), dim3(32, 8), 0, STREAM>>>(prod, ln, q0, cnt, C, r.size(),
         W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
       linear<T, T>(ln, t1, cnt, C, C, pre + ".outputProjection");
-      rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, nullptr, r, q0, cnt, n, C,
+      rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(src, mask, ln, nullptr, r, q0, cnt, n, C,
         W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"));
       linear<T, T>(ln, t2, cnt, C, C, pre + ".gatingLinear");
-      rectGatedAddK<T><<<blocks(cnt * C), 256, 0, STREAM>>>(pair, t1, t2, r, q0, cnt, n, C);
+      rectGatedAddK<T><<<blocks(cnt * C), 256, 0, STREAM>>>(src, t1, t2, r, q0, cnt, n, C);
     }
-  }
+  };
+  if (!hp) for (int k0 = 0; k0 < n; k0 += width) block(pair, k0, std::min(width, np - k0), 0, 0, 0);
+  // ...in host memory each window of output rows (columns) in turn, its blocks inside it: a block reads only
+  // its own rows (columns), which no earlier block wrote
+  // (`after` sees each window once its blocks are done, before it is written back)
+  else if (outgoing) forRowWindows(*hp, true, [&](float* w, size_t i0, size_t I) {
+    for (int k0 = (int)i0; k0 < (int)(i0 + I); k0 += width) block(w, k0, std::min(width, (int)(i0 + I) - k0), (int)i0, 0, n);
+    if (after) after(w, i0, I);
+  });
+  else forColWindows(*hp, true, [&](float* w, size_t j0, size_t J) {
+    for (int k0 = (int)j0; k0 < (int)(j0 + J); k0 += width) block(w, k0, std::min(width, (int)(j0 + J) - k0), 0, (int)j0, (int)J);
+    if (after) after(w, j0, J);
+  });
   // given back at once: the fixed operand is a plane, and the next stage (the MSA attention, the grid
   // attention) peaks beside the pair too - at these sizes a reallocation a call is nothing
   releaseScratch({ "trib." });
@@ -621,12 +680,23 @@ __global__ void biasLayoutHeadMajorK(const float* raw, TB* bias, int n, int stri
 // padding columns are the caller's to zero
 template <class TB>
 __global__ void biasFromRawRowsK(const float* raw, TB* bias, size_t r0, size_t cnt, int n, int stride, int heads,
-                                 bool swap, float scale) {
+                                 bool swap, float scale, size_t wc = 0, size_t j0 = 0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)heads * cnt) return;
-  size_t h = t / cnt, q = t % cnt, p = r0 + q, a = p / n, b = p % n;      // pair p is (a, b)
+  // pair p is (a, b) - p counted over a column window of wc columns from j0 where wc is given (tier 2)
+  size_t h = t / cnt, q = t % cnt, p = r0 + q, w = wc ? wc : n, a = p / w, b = j0 + p % w;
   size_t i = swap ? b : a, j = swap ? a : b;
   bias[(h * n + i) * stride + j] = fromF<TB>(scale * raw[h * cnt + q]);
+}
+// ...and from a chunk's row-major raw logits [cnt][heads] (a plain projection's output)
+template <class TB>
+__global__ void biasFromFlatRowsK(const float* raw, TB* bias, size_t r0, size_t cnt, int n, int stride, int heads,
+                                  bool swap, float scale, size_t wc = 0, size_t j0 = 0) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)heads * cnt) return;
+  size_t h = t % heads, q = t / heads, p = r0 + q, w = wc ? wc : n, a = p / w, b = j0 + p % w;
+  size_t i = swap ? b : a, j = swap ? a : b;
+  bias[(h * n + i) * stride + j] = fromF<TB>(scale * raw[q * heads + h]);
 }
 // a (C, k) weight zero-padded to (C, kp) columns
 inline std::string paddedColumns(const std::string& w, int C, int k, int kp) {
@@ -781,6 +851,97 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   }
 }
 
+// dst[b][a] = src[a][b], rows of `chunks` 16-byte pieces: a column window [n][J][C] <-> [J][n][C]
+__global__ void transposeWindowK(const uint4* src, uint4* dst, size_t A, size_t B, int chunks) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= A * B * chunks) return;
+  int c = (int)(t % chunks); size_t rest = t / chunks, a = rest % A, b = rest / A;
+  dst[t] = src[(a * B + b) * chunks + c];
+}
+// whether tier 2's grid attention takes the fused kernels (gridAttention's own test)
+template <class T> bool gridHostFused(int C, int heads, int D, const std::string& pre) {
+  if constexpr (std::is_same_v<T, half>)
+    return FUSED_GRID && C == 128 && heads * D == 128 && heads <= 16 && gridFusedFits() && !hasW(pre + ".gatingQueryBias") &&
+           !hasW(pre + ".outputProjectionBias");
+  return false;
+}
+// The grid attention's bias from `cnt` positions of a window - the pair positions from p0 (wc 0), or a column
+// window's, counted from p0 over its wc columns from j0 - into the flash kernel's layout (the padding columns
+// are the caller's to zero)
+template <class T>
+void gridBiasPart(const float* w, size_t cnt, size_t p0, size_t wc, size_t j0, T* bias, int n, int C, int heads, int D,
+                  const std::string& pre, bool tr, bool swapBias) {
+  bool fused = gridHostFused<T>(C, heads, D, pre);
+  constexpr bool fast = std::is_same_v<T, half>;
+  int stride = (n + 7) / 8 * 8;
+  std::string wb = fused ? paddedColumns(pre + ".pairBiasProjection", C, heads, 16) : "";
+  size_t per = std::max<size_t>(1, std::min((size_t)n * n, CHUNK / std::max(C, 16)));
+  float* raw = scratch<float>("grid.raw16", per * 16);
+  for (size_t q = 0; q < cnt; q += per) {
+    size_t r = std::min(per, cnt - q);
+    if (fused) {
+      if constexpr (std::is_same_v<T, half>) lnHeads128<16>(w + q * C, pre + ".actNormScale", pre + ".actNormOffset", wb, raw, r);
+      biasFromRawRowsK<T><<<blocks((size_t)heads * r), 256, 0, STREAM>>>(raw, bias, p0 + q, r, n, stride, heads,
+                                                                        tr && swapBias, LOG2E, wc, j0);
+    } else {
+      T* lnc = scratch<T>("grid.normChunk", per * C);
+      layerNorm2<float, T>(w + q * C, lnc, r, C, pre + ".actNormScale", pre + ".actNormOffset");
+      linear<T, float>(lnc, raw, r, C, heads, pre + ".pairBiasProjection");
+      biasFromFlatRowsK<T><<<blocks((size_t)heads * r), 256, 0, STREAM>>>(raw, bias, p0 + q, r, n, stride, heads,
+                                                                         tr && swapBias, fast ? LOG2E : 1.f, wc, j0);
+    }
+  }
+}
+// Grid attention over a pair in host memory (tier 2), its bias built on an earlier pass (pairUpdates): each
+// window of rows - or of columns, turned on the device so its columns are rows and the row-direction kernels
+// run on it (the flash kernel keeps `tr`, which reads only the mask). `after` sees each window of rows once
+// attended, before it is written back.
+template <class T>
+void gridAttentionHost(const Pair& P, const float* mask, int n, int C, int heads, int D, const std::string& pre,
+                       bool tr, T* bias, const std::function<void(float*, size_t, size_t)>& after = nullptr) {
+  int Wd = heads * D, stride = (n + 7) / 8 * 8;
+  float scale = 1.f / sqrtf((float)D);
+  bool fused = gridHostFused<T>(C, heads, D, pre);
+  constexpr bool fast = std::is_same_v<T, half>;
+  std::string qkvg = qkvgWeight(pre, C, Wd, true);
+  const float* gateBias = hasW(pre + ".gatingQueryBias") ? W(pre + ".gatingQueryBias") : nullptr;
+  const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;
+  size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
+  // rows [a0, a0 + A) of the attention's own order (pair rows, or pair columns), in `rows` - a window holding
+  // them from its row 0 at attention row w0
+  auto attend = [&](float* rows, size_t w0, size_t A) {
+    for (size_t r0 = w0; r0 < w0 + A; r0 += R) {
+      size_t cnt = std::min(R, w0 + A - r0), prs = cnt * n;
+      float* local = rows + (r0 - w0) * n * C;
+      T* qkvgOut = scratch<T>("grid.qkvg", (prs + 128) * 4 * Wd);    // padding: the last query block
+      if (fused) {
+        if constexpr (std::is_same_v<T, half>) gridIn128(local, pre, qkvg, qkvgOut, n, 0, prs, false);
+      } else {
+        T* g = scratch<T>("grid.act", prs * C);
+        layerNorm2<float, T>(local, g, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
+        linear<T, T>(g, qkvgOut, prs, C, 4 * Wd, qkvg);
+        if (gateBias) addGateBiasK<T><<<blocks(prs * Wd), 256, 0, STREAM>>>(qkvgOut, gateBias, prs, Wd);
+      }
+      T* gathered = scratch<T>("grid.gathered", prs * Wd);
+      flashGrid<T>(qkvgOut, bias, stride, MASK_ALL_ONES && fast ? nullptr : mask, gathered, n, heads, D, r0, cnt, tr, scale);
+      if (!outBias) { linear<T, float>(gathered, local, prs, Wd, C, pre + ".outputProjection", false, 1.f); continue; }
+      float* o = scratch<float>("grid.out", prs * C);
+      linear<T, float>(gathered, o, prs, Wd, C, pre + ".outputProjection");
+      addBiasK<<<blocks(prs * C), 256, 0, STREAM>>>(o, outBias, prs, C);
+      addK<<<blocks(prs * C), 256, 0, STREAM>>>(local, o, prs * C);
+    }
+  };
+  if (!tr) { forRowWindows(P, true, [&](float* w, size_t i0, size_t I) { attend(w, i0, I); if (after) after(w, i0, I); }); return; }
+  if (C * 4 % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
+  forColWindows(P, true, [&](float* w, size_t j0, size_t J) {
+    float* turned = scratch<float>("hp.turned", J * n * C);
+    int chunks = C * 4 / 16;
+    transposeWindowK<<<blocks(J * n * chunks), 256, 0, STREAM>>>((const uint4*)w, (uint4*)turned, n, J, chunks);
+    attend(turned, j0, J);
+    transposeWindowK<<<blocks(J * n * chunks), 256, 0, STREAM>>>((const uint4*)turned, (uint4*)w, J, n, chunks);
+  });
+}
+
 // The five pair updates of a pairformer/MSA/template block, in AF3's order.
 template <class T>
 void pairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
@@ -791,4 +952,47 @@ void pairUpdates(float* pair, const float* mask, int n, int C, const std::string
   gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); stage("grid.row");
   gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); stage("grid.col");
   transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition"); stage("transition");
+}
+// ...on a pair in host memory (tier 2): every update window by window, and each light pass - a fixed operand,
+// an attention's bias, the single track's rows - riding on the window pass before it, whose rows (or columns)
+// are on the card already: the row attention's bias off the incoming triangle's column windows, the column
+// attention's off the row attention's windows, and (from the transition's windows) `finalRows` - the single
+// track - and the next block's outgoing fixed operand, `nextOut`, where nothing touches the pair in between.
+// Ten pair reads a pairformer block became six.
+template <class T>
+void pairUpdates(const Pair& P, const float* mask, const std::string& pre, bool swap, bool divide, int transitionFactor,
+                 const std::function<void(const float*, size_t, size_t)>& finalRows = nullptr, const std::string& nextOut = "") {
+  if (!P.host) {
+    pairUpdates<T>(P.dev, mask, P.n, P.C, pre, swap, divide, transitionFactor);
+    if (finalRows) finalRows(P.dev, 0, P.n);
+    return;
+  }
+  int n = P.n, C = P.C, np = TRI_PAD ? (n + TRI_PAD - 1) / TRI_PAD * TRI_PAD : n, stride = (n + 7) / 8 * 8;
+  std::string out = pre + ".triangleMultiplicationOutgoing", in = pre + ".triangleMultiplicationIncoming";
+  std::string a1 = pre + ".pairAttention1", a2 = pre + ".pairAttention2";
+  int h1 = (int)M.meta(a1 + ".heads"), D1 = (int)M.meta(a1 + ".dimension");
+  int h2 = (int)M.meta(a2 + ".heads"), D2 = (int)M.meta(a2 + ".dimension");
+  bool built = HOST_B_READY == out; HOST_B_READY.clear();
+  triangleBlocked<T>(nullptr, mask, n, C, out, true, divide, np, &P, built); stage("tri.out");
+  T* rowBias = scratch<T>("grid.biasRow", (size_t)h1 * n * stride);
+  CK(cudaMemsetAsync(rowBias, 0, (size_t)h1 * n * stride * sizeof(T), STREAM));
+  triangleBlocked<T>(nullptr, mask, n, C, in, false, divide, np, &P, false, [&](float* w, size_t j0, size_t J) {
+    gridBiasPart<T>(w, (size_t)n * J, 0, J, j0, rowBias, n, C, h1, D1, a1, false, swap);
+  }); stage("tri.in");
+  T* colBias = scratch<T>("grid.biasCol", (size_t)h2 * n * stride);
+  CK(cudaMemsetAsync(colBias, 0, (size_t)h2 * n * stride * sizeof(T), STREAM));
+  gridAttentionHost<T>(P, mask, n, C, h1, D1, a1, false, rowBias, [&](float* w, size_t i0, size_t I) {
+    gridBiasPart<T>(w, I * n, i0 * n, 0, 0, colBias, n, C, h2, D2, a2, true, swap);
+  }); stage("grid.row");
+  gridAttentionHost<T>(P, mask, n, C, h2, D2, a2, true, colBias); stage("grid.col");
+  // (the column windows' turned copy and both attentions' biases: the next fixed operand wants the room)
+  releaseScratch({ "hp.turned", "grid.biasRow", "grid.biasCol" });
+  T* bNext = nextOut.empty() ? nullptr : scratch<T>("trib.b", (size_t)np * np * C);
+  forRowWindows(P, true, [&](float* w, size_t i0, size_t I) {
+    transition<T>(w, I * n, C, transitionFactor, pre + ".pairTransition");
+    if (finalRows) finalRows(w, i0, I);
+    if (bNext) triOperandRows<T>(w, i0, I, n, C, np, mask, nextOut, bNext);
+  });
+  if (bNext) HOST_B_READY = nextOut;
+  stage("transition");
 }
