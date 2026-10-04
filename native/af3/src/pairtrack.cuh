@@ -428,10 +428,15 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   // LayerNorm'd plane - whichever kernels the device would otherwise run
   // (blocking costs time - a fifth of a trunk at 2096 tokens - so only where the whole form's operands,
   // product and gate, five planes, would not fit with room to spare)
-  if (shortPair(pairs, C) && !roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf",
-                                                         "tri.pbf", "tri.t2whole" })) {
-    triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
-    return;
+  // (whichever form runs gives back the other's buffers first: scratch outlives the call, so a whole form
+  // taken while there was room would otherwise sit beside the blocks of the next call, which had none)
+  if (shortPair(pairs, C)) {
+    if (!roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
+      releaseScratch({ "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" });
+      triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
+      return;
+    }
+    releaseScratch({ "trib." });
   }
   std::string pg = projectionGate(pre, C);
   T *a = nullptr, *b = nullptr;

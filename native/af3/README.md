@@ -585,3 +585,32 @@ per-super-block logits and the 24 cached biases at once - 12.4 GB of scratch at 
 the per-phase lines alone could not show. The WebGPU page stops earlier and for a different reason:
 every pair-sized dispatch binds `tokens^2 x channels` floats against a 2 GiB binding limit on NVIDIA,
 so 2047 tokens for AF3 and 1023 for IntelliFold-2.
+
+### 🔴 5,000 tokens on a 40 GB A100
+
+`native/af3/fold` folds a **5,000-token** chain on this A100 at a **35.0 GB** peak in 12.2 minutes (trunk
+11.0, diffusion at 100 steps 1.0, confidence 0.2), every consecutive CA-CA in band (median 3.913 A).
+4,192 tokens: 34.4 GB, 6.5 minutes. What it took, beyond the stage releases above - each only on a card
+short of room, so a fold that fits runs exactly as before (68, 262 and 1572 tokens byte-identical):
+
+- **the recycled pair is re-embedded IN PLACE**: each pair row's new value reads only the same row of the
+  last pass, so its LayerNorm and projection are taken a chunk of rows at a time and the rows overwritten
+  - no second pair (9 GB at 4,192 tokens), and the first pass starts from a zeroed pair.
+- **the diffusion's conditioning pair is STREAMED**: each chunk of its rows, once transitioned, goes
+  straight into the encoder's pair projection and the transformer's f16 LayerNorm'd pair; the f32 pair
+  (9 GB at 4,192, beside the trunk's) never exists. It was the peak hidden inside the preparation.
+- **the triangle multiplication in output blocks** and **the diffusion biases per super block** where
+  the whole forms do not fit with an eighth of the card to spare (`roomFor`) - both cost time, so the
+  card's free memory decides, and whichever form runs gives back the other's buffers first.
+- **the template stack's sum is its one pass's activation** when only one pass counts (no templates, or
+  one) - exact, and at every size; the MSA row attention's and the template query's LayerNorm'd pairs
+  in row chunks; the f32 logits of the diffusion transformer only on the f32 path that reads them.
+
+🔴 **A 25-STEP SAMPLER IS NOT CONVERGED PAST ~2,000 TOKENS, AND THAT IS NOT THIS PASS.** A 2,096-token
+fold at 25 steps put 294 of 2,102 consecutive CA-CA distances out of band on the path from before any
+of this; at 100 steps, 0. The large folds here are checked at 100 steps, which at these sizes is cheap.
+🔴 **AND A COMMA IS NOT A CHAIN BREAK HERE**: `--sequence=A,B` exports one chain with an unknown residue
+between, which is why these "repeats" are one chain.
+
+`LOCALFOLD_BIG=1` runs every big-input path at any size; 6MRR through all seven AF3-lineage models agrees
+with the ordinary paths within rounding (0.738 A for AlphaFold 3 either way).

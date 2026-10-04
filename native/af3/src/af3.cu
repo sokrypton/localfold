@@ -278,8 +278,8 @@ int main(int argc, char** argv) {
   for (int fi = 0; doFold && fi < folds; ++fi) {
     if (fi > 0) {   // a fresh fold: the trunk restarts from zero recycled state
       size_t pp = (size_t)t.n * t.n * t.C;
-      if (!t.prevPair) t.prevPair = dalloc(pp);     // (given back after the last fold's trunk)
-      CK(cudaMemset(t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
+      // (in place, the pair is the recycled one)
+      CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
     }
     std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
     auto clock = [] { return std::chrono::steady_clock::now(); };
@@ -291,8 +291,8 @@ int main(int argc, char** argv) {
     // A recycle pass is ~1000 launches with identical shapes and pointers, so from the second pass on
     // it replays as one CUDA graph, captured from that pass (the first has sized every scratch buffer)
     auto recyclePass = [&]() {
-      if (!t.prevPair) { t.prevPair = t.pair; t.pair = dalloc(pairs * t.C); }   // (embed gave it back: hand it the pair)
-      else CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      if (!t.inPlaceRecycle)        // (in place, the pair already is the recycled pair: see embed)
+        CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
       CK(cudaMemcpyAsync(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
       if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
     };
@@ -339,9 +339,6 @@ int main(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
-    // the recycled pair is the trunk's alone: on a card short of room it is given back for the
-    // diffusion and the confidence head (3.5 GB at 2620 tokens)
-    if (shortPair(pairs, t.C) && t.prevPair) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }
     releaseConcatCopies(); memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below

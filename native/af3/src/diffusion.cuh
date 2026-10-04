@@ -96,6 +96,9 @@ inline void setNoise(float noiseLevel) {
   pinned[0] = noiseLevel;
   CK(cudaMemcpyAsync(noiseParams, pinned, 4, cudaMemcpyHostToDevice, STREAM));
 }
+// Set by a streamed preparation (prepareDiffusion, a card short of room): the conditioning pair is not
+// kept - each chunk of its rows, once transitioned, is handed here and dropped.
+inline std::function<void(const float*, size_t, size_t)> PAIR_CHUNK_SINK;
 inline Conditioning diffusionConditioning(const float* trunkSingle, const float* trunkPair,
                                           const float* targetFeat, float noiseLevel, int n) {
   const std::string P = "diffusion.conditioning";
@@ -113,7 +116,9 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
     size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / std::max(width, rel + Czt)));
     float* f2 = scratch<float>("dc.f2", per * width);
     float* f2n = scratch<float>("dc.f2n", per * width);
-    DCACHE.pair = scratch<float>("dc.pair", pairs * Cz);
+    const bool streamed = (bool)PAIR_CHUNK_SINK;
+    DCACHE.pair = streamed ? nullptr : scratch<float>("dc.pair", pairs * Cz);
+    float* chunk = streamed ? scratch<float>("dc.pairChunk", per * Cz) : nullptr;
     for (size_t p0 = 0; p0 < pairs; p0 += per) {
       size_t r = std::min(per, pairs - p0);
       auto features = [&](float* outRows, int trunkWidth) {
@@ -138,9 +143,14 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
         concatK<<<blocks(r * width), 256, 0, STREAM>>>(first, firstWidth, relProj, Cz, f2, (int)r);
       }
       layerNormSlow(f2, f2n, r, width, W(P + ".pairCondInitialNormScale"), Wopt(P + ".pairCondInitialNormOffset"));
-      linear<float, float>(f2n, DCACHE.pair + p0 * Cz, r, width, Cz, P + ".pairCondInitialProjection");
+      linear<float, float>(f2n, streamed ? chunk : DCACHE.pair + p0 * Cz, r, width, Cz, P + ".pairCondInitialProjection");
+      if (!streamed) continue;
+      // (the transitions are row-wise, so a chunk's rows are final once they have run)
+      for (int k = 0; k < 2; ++k) plainTransition(chunk, r, Cz, 2, P + ".pairTransitions." + std::to_string(k));
+      PAIR_CHUNK_SINK(chunk, p0, r);
     }
-    for (int k = 0; k < 2; ++k) plainTransition(DCACHE.pair, pairs, Cz, 2, P + ".pairTransitions." + std::to_string(k));
+    if (!streamed)
+      for (int k = 0; k < 2; ++k) plainTransition(DCACHE.pair, pairs, Cz, 2, P + ".pairTransitions." + std::to_string(k));
     // [trunk single | target_feat]; the openfold3 lineage pads two always-zero columns (unknown DNA,
     // after the restype and the profile blocks) - free before a linear, not before this LayerNorm
     bool pad = M.flag("trunk.dialect.padSingleCondUnknownDna");
@@ -512,6 +522,8 @@ __global__ void layerNormSlowHalfK(const float* in, half* out, size_t rows, int 
   float inv = 1.f / sqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) out[row * C + c] = __float2half((x[c] - mean) * inv * scale[c]);
 }
+inline half* PN16_GIVEN = nullptr;     // a streamed preparation's LayerNorm'd pair (prepareTransformer)
+inline void refreshSuperBlockBias(int sb, int n);
 struct TransformerCache {
   bool ready = false; int n = 0, nblocks = 0;
   // on a card short of room the biases are not kept for all blocks: the LayerNorm'd pair is, in f16, and
@@ -573,25 +585,39 @@ inline void prepareTransformer(const float* pairCond, int n) {
   tc.pn16 = nullptr;                   // (an earlier fold's, in a resident process)
   // (recomputing costs a step time - 2.3 s of a 2096-token fold - so only where every block's biases would
   // not fit with room to spare)
-  if (DIFF_HALF && shortPair(pairs, Cz) && !roomFor((size_t)tc.nblocks * heads * n * tc.stride * 2)) {
-    // on a card short of room: the LayerNorm'd pair kept in f16 (half the f32 pair it is made from), and
-    // biases for one super block at a time, made as the step reaches it - 24 blocks' biases held were
-    // 768 bytes a pair, 3.4 GB at 2096 tokens, the diffusion's largest tensor
-    tc.pn16 = scratch<half>("dt.pn16", pairs * Cz);
-    size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / Cz));
-    for (size_t r0 = 0; r0 < pairs; r0 += per) {
-      size_t r = std::min(per, pairs - r0);
-      layerNormSlowHalfK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(pairCond + r0 * Cz, tc.pn16 + r0 * Cz, r, Cz,
-                                                                      W(T + ".pairInputLayerNormScale"));
+  // a streamed preparation hands the LayerNorm'd pair in f16 (pairCond null): the biases are made from it,
+  // every block's now where they fit with room to spare, else a super block at a time in the step
+  const bool given = pairCond == nullptr;
+  if (given && !(DIFF_HALF && PN16_GIVEN)) { fprintf(stderr, "a streamed preparation needs the f16 path\n"); exit(1); }
+  if (DIFF_HALF && (given || shortPair(pairs, Cz))) {
+    bool lazy = !roomFor((size_t)tc.nblocks * heads * n * tc.stride * 2);
+    if (given || lazy) {
+      // the LayerNorm'd pair kept in f16 (half the f32 pair it is made from); with `lazy`, biases for one
+      // super block at a time, made as the step reaches it - 24 blocks' biases held were 768 bytes a pair,
+      // 3.4 GB at 2096 tokens, the diffusion's largest tensor
+      tc.pn16 = given ? PN16_GIVEN : scratch<half>("dt.pn16", pairs * Cz);
+      if (!given) {
+        size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / Cz));
+        for (size_t r0 = 0; r0 < pairs; r0 += per) {
+          size_t r = std::min(per, pairs - r0);
+          layerNormSlowHalfK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(pairCond + r0 * Cz, tc.pn16 + r0 * Cz, r, Cz,
+                                                                          W(T + ".pairInputLayerNormScale"));
+        }
+      }
+      tc.perSuper = perSuper; tc.heads = heads; tc.Cz = Cz;
+      tc.pairLogits.assign(tc.nblocks, nullptr);
+      tc.biasHalf.assign(tc.nblocks, nullptr);
+      for (int b = 0; b < tc.nblocks; ++b)
+        tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(lazy ? b % perSuper : b), (size_t)heads * n * tc.stride);
+      tc.n = n; tc.ready = true;
+      if (!lazy) {                     // every block's biases now, and the f16 pair given back
+        for (int sb = 0; sb * perSuper < tc.nblocks; ++sb) refreshSuperBlockBias(sb, n);
+        releaseScratch({ "dt.pn16" }); tc.pn16 = nullptr;
+      }
+      return;
     }
-    tc.perSuper = perSuper; tc.heads = heads; tc.Cz = Cz;
-    tc.pairLogits.assign(tc.nblocks, nullptr);
-    tc.biasHalf.assign(tc.nblocks, nullptr);
-    for (int b = 0; b < tc.nblocks; ++b)
-      tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b % perSuper), (size_t)heads * n * tc.stride);
-    tc.n = n; tc.ready = true;
-    return;
   }
+  if (given) { fprintf(stderr, "a streamed preparation reached the whole-pair path\n"); exit(1); }
   float* pn = scratch<float>("dt.pn", pairs * Cz);
   layerNormSlow(pairCond, pn, pairs, Cz, W(T + ".pairInputLayerNormScale"), nullptr);
   float* flat = scratch<float>("dt.flat", pairs * perSuper * heads);
@@ -688,8 +714,9 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   size_t prows = std::is_same_v<T, half> ? padRows16(rows) : rows;   // the fast path's GEMM rows
   T* x = scratch<T>("dt.x", prows * C);
   T* qkvg = scratch<T>("dt.qkvg", (prows + 128) * 4 * Wd);
-  float* logits = scratch<float>("dt.logits", (size_t)heads * pairs);
-  T* P = scratch<T>("dt.P", (size_t)heads * pairs);
+  // (the precise path's alone: the f16 path's flash kernel holds no [heads, n, n] logits)
+  float* logits = std::is_same_v<T, half> ? nullptr : scratch<float>("dt.logits", (size_t)heads * pairs);
+  T* P = std::is_same_v<T, half> ? nullptr : scratch<T>("dt.P", (size_t)heads * pairs);
   T* o = scratch<T>("dt.o", prows * Wd);
   T* att = scratch<T>("dt.att", prows * C);
   T* tn = scratch<T>("dt.tn", prows * C);
@@ -893,8 +920,36 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
   DiffusionFold f{ trunkSingle, trunkPair, targetFeat, seqMask, n, {}, {} };
   DCACHE.ready = false;
   setNoise(SIGMA_DATA);
+  const std::string Pc = "diffusion.conditioning", E = "diffusion.encoder", T = "diffusion.transformer";
+  int Cz = (int)M.meta(Pc + ".pairChannels");
+  size_t pairs = (size_t)n * n;
+  if (DIFF_HALF && shortPair(pairs, Cz) && hasW(E + ".embedTrunkPairCond")) {
+    // a card short of room: the conditioning pair streamed - each chunk of rows straight into the
+    // encoder's pair projection and the transformer's f16 LayerNorm'd pair, never the f32 pair whole
+    // (9 GB at 4192 tokens, beside the trunk's)
+    int Cp = (int)M.meta(E + ".pairChannels");
+    float* tp = scratch<float>("enc.tp", pairs * Cp);
+    half* pn16 = scratch<half>("dt.pn16", pairs * Cz);
+    PAIR_CHUNK_SINK = [&](const float* chunk, size_t p0, size_t r) {
+      float* ln = scratch<float>("enc.tpln", r * Cz);
+      layerNormSlow(chunk, ln, r, Cz, W(E + ".lnormTrunkPairCondScale"), Wopt(E + ".lnormTrunkPairCondOffset"));
+      linear<float, float>(ln, tp + p0 * Cp, r, Cz, Cp, E + ".embedTrunkPairCond");
+      layerNormSlowHalfK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(chunk, pn16 + p0 * Cz, r, Cz,
+                                                                      W(T + ".pairInputLayerNormScale"));
+    };
+    diffusionConditioning(trunkSingle, trunkPair, targetFeat, SIGMA_DATA, n);
+    PAIR_CHUNK_SINK = nullptr;
+    ENC_TP_GIVEN = tp;
+    f.enc = prepareEncoder(E, "atomReference", trunkSingle, nullptr);
+    ENC_TP_GIVEN = nullptr;
+    f.dec = prepareDecoder(f.enc);
+    PN16_GIVEN = pn16;
+    prepareTransformer(nullptr, n);
+    PN16_GIVEN = nullptr;
+    return f;
+  }
   Conditioning cond = diffusionConditioning(trunkSingle, trunkPair, targetFeat, SIGMA_DATA, n);  // builds the pair
-  f.enc = prepareEncoder("diffusion.encoder", "atomReference", trunkSingle, cond.pair);
+  f.enc = prepareEncoder(E, "atomReference", trunkSingle, cond.pair);
   f.dec = prepareDecoder(f.enc);
   prepareTransformer(cond.pair, n);
   return f;

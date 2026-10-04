@@ -739,6 +739,7 @@ struct EncoderOut {
 };
 
 // trunkSingle [tokens][Cs] and trunkPair [tokens^2][Cz] may be null (target_feat).
+inline float* ENC_TP_GIVEN = nullptr;
 inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, const float* trunkSingle,
                                  const float* trunkPair) {
   AtomShape sh = atomShape();
@@ -789,8 +790,8 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   float* row = scratch<float>("enc.row", qRows * Cp); float* col = scratch<float>("enc.col", kRows * Cp);
   linear<float, float>(rq, row, qRows, C, Cp, E + ".singleToPairCondRow");
   linear<float, float>(rk, col, kRows, C, Cp, E + ".singleToPairCondCol");
-  float* tp = nullptr;
-  if (trunkPair) {
+  float* tp = ENC_TP_GIVEN;             // (a streamed preparation's, made chunk by chunk: prepareDiffusion)
+  if (!tp && trunkPair) {
     int Cz = (int)M.meta(E + ".trunkPairChannels");
     size_t pairs = (size_t)sh.tokens * sh.tokens;
     // (in row chunks on a card short of room: the normalised pair is read once, by this projection)

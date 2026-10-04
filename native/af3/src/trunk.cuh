@@ -11,6 +11,14 @@ __global__ void outerSumK(const float* left, const float* right, float* pair, in
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
   pair[t] = left[(size_t)i * C + c] + right[(size_t)j * C + c];
 }
+// rows [r0, r0 + cnt) of the pair (as pair rows i*n+j) = left[i] + right[j] + add[row]
+__global__ void outerSumRowsK(const float* left, const float* right, const float* add, float* pair, size_t r0, size_t cnt,
+                              int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= cnt * C) return;
+  int c = (int)(t % C); size_t ij = r0 + t / C; size_t i = ij / n, j = ij % n;
+  pair[r0 * C + t] = left[i * C + c] + right[j * C + c] + add[t];
+}
 // AF3's relative encoding, 139 one-hot columns, folded straight into its projection: each
 // pair adds the four or five weight rows its one-hot selects.
 __global__ void relativeEncodingK(const int* residueIndex, const int* tokenIndex, const int* asymId,
@@ -55,6 +63,7 @@ struct Trunk {
   int C, Cs, Cm, F;         // pair, single, msa channels, target-feature width
   float *pair, *single, *msa, *targetFeat, *pairMask, *seqMask, *msaMask;
   float *prevPair, *prevSingle;
+  bool inPlaceRecycle = false;         // the recycled pair is t.pair (makeTrunk)
   int* msaRows; float* deletion;
   bool swap, divide;
 };
@@ -72,8 +81,12 @@ inline Trunk makeTrunk(const float* targetFeatHost, int msaCap) {
   size_t pairs = (size_t)t.n * t.n;
   t.pair = dalloc(pairs * t.C); t.single = dalloc((size_t)t.n * t.Cs);
   t.msa = dalloc((size_t)t.S * t.n * t.Cm);
-  t.prevPair = dalloc(pairs * t.C); t.prevSingle = dalloc((size_t)t.n * t.Cs);
-  CK(cudaMemset(t.prevPair, 0, pairs * t.C * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
+  // on a card short of room the recycled pair is the pair itself, re-embedded in place (embed): no second
+  // pair-sized tensor - 9 GB at 4192 tokens - and the first pass starts from a zeroed pair
+  t.inPlaceRecycle = shortPair(pairs, t.C);
+  t.prevPair = t.inPlaceRecycle ? nullptr : dalloc(pairs * t.C); t.prevSingle = dalloc((size_t)t.n * t.Cs);
+  CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pairs * t.C * 4));
+  CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
   t.targetFeat = upload(targetFeatHost, (size_t)t.n * t.F);
   std::vector<float> seq(M.f("batch.seqMask"), M.f("batch.seqMask") + t.n), pm(pairs);
   for (int i = 0; i < t.n; ++i) for (int j = 0; j < t.n; ++j) pm[(size_t)i * t.n + j] = seq[i] * seq[j];
@@ -137,11 +150,24 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   }
   linear<float, float>(pairSource, left, n, sourceWidth, C, E + "leftSingle");
   linear<float, float>(pairSource, right, n, sourceWidth, C, E + "rightSingle");
+  if (t.inPlaceRecycle) {
+    // in place, a chunk of rows at a time: each row's new value reads only the same row of the last pass's
+    // pair, so the projection of the old rows is taken first and the rows are then overwritten with
+    // left + right + it
+    size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
+    T* ln = scratch<T>("emb.prevln", per * C);
+    float* prev = scratch<float>("emb.prevproj", per * C);
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNorm2<float, T>(t.pair + r0 * C, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
+      linear<T, float>(ln, prev, r, C, C, E + "prevEmbedding");
+      outerSumRowsK<<<blocks(r * C), 256, 0, STREAM>>>(left, right, prev, t.pair, r0, r, n, C);
+    }
+  } else {
   outerSumK<<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C);
   onSeam("z_before_prev", t.pair, pairs * C);
   // the recycled pair: LayerNorm then projection, which is NOT zero on the first pass - on a card short
-  // of room in row chunks, and the recycled pair given back once read (runTrunk's caller hands the
-  // next pass the pair itself rather than a copy: see recyclePass in af3.cu)
+  // of room in row chunks
   bool tight = shortPair(pairs, C);
   size_t per = tight ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
   T* ln = scratch<T>("emb.prevln", per * C);
@@ -150,7 +176,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     layerNorm2<float, T>(t.prevPair + r0 * C, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     linear<T, float>(ln, t.pair + r0 * C, r, C, C, E + "prevEmbedding", false, 1.f);
   }
-  if (tight) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }
+  }
   onSeam("z_after_prev", t.pair, pairs * C);
   relativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(
     Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
@@ -212,6 +238,9 @@ __global__ void templateGeometryK(float* act, const float* dgram, const float* p
 // (protenix2, boltz2, rf3) - its feature columns projected; then the stack's blocks (wrapped in a
 // residual under boltz2), the output LayerNorm, summed with the pass's repeat weight; the sum
 // divided by every slot, relu, projected.
+__global__ void scaleK(float* x, float s, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = s * x[i];
+}
 __global__ void addScaledK(float* y, const float* x, float s, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] += s * x[i];
 }
@@ -247,8 +276,11 @@ void templateEmbedding(Trunk& t, float* out) {
   if (!tight) queryInto(query);
   float* act = scratch<float>("tmpl.act", pairs * Ct);
   float* before = outer ? scratch<float>("tmpl.before", pairs * Ct) : nullptr;
-  float* summed = scratch<float>("tmpl.summed", pairs * Ct);
-  CK(cudaMemsetAsync(summed, 0, pairs * Ct * 4, STREAM));
+  // one pass that counts (no templates, or one): its normalised activation IS the sum, scaled in place by
+  // its repeat - the same products in the same order as adding it to a zeroed sum, without the sum
+  int live = 0; for (int k = 0; k < passes; ++k) live += M.meta("template." + std::to_string(k) + ".repeat") != 0.;
+  float* summed = live == 1 ? act : scratch<float>("tmpl.summed", pairs * Ct);
+  if (live != 1) CK(cudaMemsetAsync(summed, 0, pairs * Ct * 4, STREAM));
   float* oh = scratch<float>("tmpl.onehot", (size_t)n * 31);
   float* row = scratch<float>("tmpl.row", (size_t)n * Ct); float* col = scratch<float>("tmpl.col", (size_t)n * Ct);
   int nb = 0; while (M.has(P + "blocks." + std::to_string(nb) + ".pairTransition.transition1")) ++nb;
@@ -284,7 +316,8 @@ void templateEmbedding(Trunk& t, float* out) {
     // in place: act is the pass's own and is written afresh by the next (one warp a row, each lane
     // reading an element before writing it)
     layerNorm2<float, float>(act, act, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");
-    addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
+    if (live == 1) scaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
+    else addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
   }
   // divided by every slot (not the real ones), relu, projected
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
@@ -412,10 +445,15 @@ void msaAttention(Trunk& t, const std::string& pre) {
   size_t rows = (size_t)S * n, pairs = (size_t)n * n;
   T* ln = scratch<T>("msaatt.ln", rows * Cm);
   layerNorm2<float, T>(t.msa, ln, rows, Cm, pre + ".actNormScale", pre + ".actNormOffset");
-  T* pln = scratch<T>("msaatt.pln", pairs * C);
-  layerNorm2<float, T>(t.pair, pln, pairs, C, pre + ".pairNormScale", pre + ".pairNormOffset");
+  // the pair's LayerNorm feeds only the bias projection: on a card short of room it is taken in row chunks
+  size_t per = shortPair(pairs, C) ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
+  T* pln = scratch<T>("msaatt.pln", per * C);
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
-  linear<T, float>(pln, flat, pairs, C, heads, pre + ".pairLogits");
+  for (size_t r0 = 0; r0 < pairs; r0 += per) {
+    size_t r = std::min(per, pairs - r0);
+    layerNorm2<float, T>(t.pair + r0 * C, pln, r, C, pre + ".pairNormScale", pre + ".pairNormOffset");
+    linear<T, float>(pln, flat + r0 * heads, r, C, heads, pre + ".pairLogits");
+  }
   float* keyMask = scratch<float>("msaatt.keymask", n);
   keyMaskK<<<blocks(n, 128), 128, 0, STREAM>>>(t.msaMask, keyMask, S, n);
   float* w = scratch<float>("msaatt.w", (size_t)heads * pairs);
@@ -614,7 +652,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   bool tight = shortPair(pairs, t.C);
   // ...and the template stack's own triangle buffers: it runs 64 channels through the unfused path,
   // whose names the 128-channel pairformer never asks for again (4.9 GB at 2620 tokens)
-  if (tight) releaseScratch({ "emb.", "tmpl.", "trib.", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.pg", "tri.centred",
+  if (tight) releaseScratch({ "emb.", "tmpl.", "trib.", "grid.", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.pg", "tri.centred",
                               "tri.t1", "tri.t2" });
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + std::to_string(msaBlocks) + ".pairChannels")) ++msaBlocks;
   // boltz2 adds the pre-MSA pair back: its MSA module returns the updated z and the caller adds z
