@@ -96,7 +96,8 @@ static std::string writeWarmInput(int L, int N, int E, int T) {
 // (AF2's 64 bins, centres as predictedTm's), contact_probs = P(Cb distance < 8 A) from the distogram
 // where the weights carry its head (the page's multimer bundle does not), the token layout - and
 // <stem>_summary_confidences.json (pTM, ipTM for a complex, mean pLDDT)
-static void writeConfidences(const std::string& pdb, const Trunk& t, int L, const float* mask37, const std::vector<int>& aatype,
+static inline std::vector<float> contactsChunked(const float* pair, int L);   // (below)
+void writeConfidences(const std::string& pdb, const Trunk& t, int L, const float* mask37, const std::vector<int>& aatype,
                              const std::vector<int>& asym, const std::vector<int>& ri, int firstAsym,
                              const std::vector<float>& plddt, const std::vector<float>& paeLogits, float ptm, float iptm,
                              double mean) {
@@ -107,7 +108,9 @@ static void writeConfidences(const std::string& pdb, const Trunk& t, int L, cons
   centres[63] = centres[62] + 31.f / 62;
   std::vector<float> pae = expectation(paeLogits, pairs, 64, centres);
   std::vector<float> contact;
-  if (M.has("w/distogram_head/half_logits/weights")) {
+  if (M.has("w/distogram_head/half_logits/weights") && AF2_TIGHT) {
+    contact = contactsChunked(t.pair, L);
+  } else if (M.has("w/distogram_head/half_logits/weights")) {
     float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
     linearB(t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
     symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
@@ -188,6 +191,36 @@ __global__ void contact8K(const float* logits, size_t pairs, float* out) {
   out[ij] = near / s;
 }
 
+// On a card short of room the pair heads never hold [pairs, 64] logits whole: the distogram's contact
+// probabilities a block of rows at a time (a row's symmetrised logit is its own half plus the transposed
+// pair's), and the PAE logits a chunk of pairs at a time into `onChunk`.
+inline std::vector<float> contactsChunked(const float* pair, int L) {
+  size_t pairs = (size_t)L * L;
+  size_t R = std::max<size_t>(1, std::min<size_t>(L, AF2_CHUNK / ((size_t)L * 128)));
+  float* rowsT = scratch<float>("head.rowsT", R * L * 128);
+  float* a = scratch<float>("head.dgramHalf", R * L * 64); float* b = scratch<float>("head.dgramHalfT", R * L * 64);
+  float* c = scratch<float>("head.contact", pairs);
+  for (size_t r0 = 0; r0 < (size_t)L; r0 += R) {
+    size_t r = std::min(R, (size_t)L - r0), rows = r * L;
+    linearB(pair + r0 * L * 128, "distogram_head/half_logits", -1, a, rows, 128, 64);
+    gatherColumnsK<<<blocks(rows * 128), 256, 0, STREAM>>>(pair, rowsT, L, 128, r0, r);
+    linearB(rowsT, "distogram_head/half_logits", -1, b, rows, 128, 64);
+    addK2<<<blocks(rows * 64), 256, 0, STREAM>>>(a, b, rows * 64);
+    contact8K<<<blocks(rows), 256, 0, STREAM>>>(a, rows, c + r0 * L);
+  }
+  std::vector<float> out = download(c, pairs);
+  releaseScratch({ "head.rowsT", "head.dgramHalf", "head.dgramHalfT", "head.contact" });
+  return out;
+}
+inline void paeChunked(const float* pair, int L, const std::function<void(const float*, size_t, size_t)>& onChunk) {
+  size_t pairs = (size_t)L * L, per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / 64));
+  float* lg = scratch<float>("head.paeChunk", per * 64);
+  for (size_t r0 = 0; r0 < pairs; r0 += per) {
+    size_t r = std::min(per, pairs - r0);
+    linearB(pair + r0 * 128, "predicted_aligned_error_head/logits", -1, lg, r, 128, 64);
+    onChunk(lg, r0, r);
+  }
+}
 // --tolerance=<A>: the page's early stop (src/af2/model/recycle-convergence.js, ColabFold's compute_tol) -
 // after each pass from the second on, the RMS change of every C-alpha pair distance against the last pass,
 // over the sequence mask; the fold stops when it is strictly below this. 0 runs every pass.
@@ -234,8 +267,14 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   int L = t.L; size_t pairs = (size_t)L * L;
   t.msa = dalloc((size_t)(t.N + t.T) * L * 256); t.extra = dalloc((size_t)t.E * L * 64);
   t.pair = dalloc(pairs * 128); t.pairMask = dalloc(pairs);
-  float* prevRow = dalloc((size_t)L * 256); float* prevPair = dalloc(pairs * 128); float* prevPos = dalloc((size_t)L * 37 * 3);
-  CK(cudaMemset(prevRow, 0, (size_t)L * 256 * 4)); CK(cudaMemset(prevPair, 0, pairs * 128 * 4));
+  // on a card short of room the recycled pair is the pair itself, re-embedded in place (embed): no second
+  // pair-sized tensor, and the first pass starts from a zeroed pair. No CUDA graph there either - a pass
+  // takes seconds and frees what the next stage needs.
+  const bool tight = shortPair(pairs, 128);
+  AF2_TIGHT = tight;
+  float* prevRow = dalloc((size_t)L * 256); float* prevPair = tight ? nullptr : dalloc(pairs * 128);
+  float* prevPos = dalloc((size_t)L * 37 * 3);
+  CK(cudaMemset(prevRow, 0, (size_t)L * 256 * 4)); CK(cudaMemset(tight ? t.pair : prevPair, 0, pairs * 128 * 4));
   CK(cudaMemset(prevPos, 0, (size_t)L * 37 * 3 * 4));
   float* single = dalloc((size_t)L * 384);
   if (!warm) printf("AF2 %s: %d residues, %d MSA rows, %d extra, %d passes (loaded in %.1f s)\n", M.flag("meta/multimer") ? "multimer" : "monomer",
@@ -255,7 +294,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       CK(cudaStreamSynchronize(STREAM));
       printf("    pass %d %-14s %.1f ms\n", pass, what, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
     };
-    mark("embed");
+    mark("embed"); memReport("embedded");
     if (multimer) templateEmbedding(t.pair, t.pairMask, L);
     else if (monomerTemplates) templateEmbeddingMonomer(t.pair, t.pairMask, L, templates);
     if (t.T > 0) {
@@ -279,7 +318,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       if (check && b == 0) checkOracle("extra block 0 pair", t.pair, pairs * 128, "o/extra1/pair");
     }
     if (check) checkOracle("extra stack pair", t.pair, pairs * 128, "o/extra/pair");
-    mark("extra stack");
+    mark("extra stack"); memReport("extra stack");
     for (int b = 0; b < mainBlocks; ++b) {
       if (b == 1) mark("evoformer 0");
       if (b == 2) mark("evoformer 1");
@@ -310,10 +349,10 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
         checkOracle("atom37 positions", so.pos37, (size_t)L * 37 * 3, o + "final_atom_positions");
       }
     }
-    mark("structure");
+    mark("structure"); memReport("structure");
     // the recycled state: the evoformer's first MSA row and pair, the final atom37 positions
     CK(cudaMemcpyAsync(prevRow, t.msa, (size_t)L * 256 * 4, cudaMemcpyDeviceToDevice, STREAM));
-    CK(cudaMemcpyAsync(prevPair, t.pair, pairs * 128 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    if (prevPair) CK(cudaMemcpyAsync(prevPair, t.pair, pairs * 128 * 4, cudaMemcpyDeviceToDevice, STREAM));
     CK(cudaMemcpyAsync(prevPos, so.pos37, (size_t)L * 37 * 3 * 4, cudaMemcpyDeviceToDevice, STREAM));
     // heads, on this pass's representations
     const std::string PL = "predicted_lddt_head/";
@@ -324,8 +363,10 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     linearB(a, PL + "act_0", -1, h1, L, 384, 128, true);
     linearB(h1, PL + "act_1", -1, h2, L, 128, 128, true);
     linearB(h2, PL + "logits", -1, plddtLogits, L, 128, 50);
-    paeLogits = scratch<float>("head.pae", pairs * 64);
-    linearB(t.pair, "predicted_aligned_error_head/logits", -1, paeLogits, pairs, 128, 64);
+    if (!AF2_TIGHT) {
+      paeLogits = scratch<float>("head.pae", pairs * 64);
+      linearB(t.pair, "predicted_aligned_error_head/logits", -1, paeLogits, pairs, 128, 64);
+    }
     if (check) {
       checkOracle("pLDDT logits", plddtLogits, (size_t)L * 50, "o/full/plddt_logits");
       checkOracle("PAE logits", paeLogits, pairs * 64, "o/full/pae_logits");
@@ -359,12 +400,21 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     if (!tapPasses) return;
     float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
     float* paeF = scratch<float>("tap.pae", pairs); float* tmF = scratch<float>("tap.tm", pairs);
-    paeTmK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, paeF, tmF);
+    if (AF2_TIGHT) paeChunked(t.pair, L, [&](const float* lg, size_t r0, size_t r) {
+      paeTmK<<<blocks(r), 256, 0, STREAM>>>(lg, r, d0, paeF + r0, tmF + r0);
+    });
+    else paeTmK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, paeF, tmF);
     unsigned char* pae8 = scratch<unsigned char>("tap.pae8", pairs);
     quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(paeF, pae8, pairs, 0.125f);
     std::vector<std::pair<const void*, size_t>> parts = {{so.pos37, (size_t)L * 37 * 3 * 4}, {plddtLogits, (size_t)L * 50 * 4},
                                                          {tmF, pairs * 4}, {pae8, pairs}};
-    if (tapContacts) {
+    if (tapContacts && AF2_TIGHT) {
+      std::vector<float> ch = contactsChunked(t.pair, L);
+      float* cf = scratch<float>("tap.contact", pairs); unsigned char* c8 = scratch<unsigned char>("tap.contact8", pairs);
+      CK(cudaMemcpyAsync(cf, ch.data(), pairs * 4, cudaMemcpyHostToDevice, STREAM));
+      quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(cf, c8, pairs, 1.f / 255);
+      parts.push_back({c8, pairs});
+    } else if (tapContacts) {
       float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
       linearB(t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
       symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
@@ -446,7 +496,9 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   for (int pass = 0; pass < passes; ++pass) {
     bool check = pass == 0 && !oracle.empty();
     embed(t, pass, prevRow, prevPair, prevPos);
-    if (!graphs || pass == 0) {
+    // (the embedding's own buffers, on a card short of room - not its two masks, which the stacks read)
+    if (tight) releaseScratch({ "emb.dgram", "emb.dgl", "emb.prevln", "emb.rel", "emb.rell", "emb.tmp", "emb.extraFeat" });
+    if (!graphs || tight || pass == 0) {
       rest(check, pass);
       if (getenv("AF2_PASS_TIMES")) {
         CK(cudaStreamSynchronize(STREAM));
@@ -485,7 +537,13 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   std::vector<float> pl = download(plddtLogits, (size_t)L * 50);
   std::vector<float> centres(50); for (int b = 0; b < 50; ++b) centres[b] = (b + 0.5f) * 2.f;
   std::vector<float> plddt = expectation(pl, L, 50, centres);
-  std::vector<float> pae = download(paeLogits, pairs * 64);
+  std::vector<float> pae;
+  if (AF2_TIGHT) {                 // (the last pass's pair, its logits a chunk at a time to the host)
+    pae.resize(pairs * 64);
+    paeChunked(t.pair, L, [&](const float* lg, size_t r0, size_t r) {
+      CK(cudaMemcpy(pae.data() + r0 * 64, lg, r * 64 * 4, cudaMemcpyDeviceToHost));
+    });
+  } else pae = download(paeLogits, pairs * 64);
   std::vector<int> asym(L); CK(cudaMemcpy(asym.data(), Idev("asym_id"), L * 4, cudaMemcpyDeviceToHost));
   float ptm = predictedTm(pae, L, 64, &asym, false);
   bool chains = false; for (int i = 1; i < L; ++i) chains |= asym[i] != asym[0];

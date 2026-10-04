@@ -200,3 +200,36 @@ strided flash kernel at 8 warps rather than 4 is slower (235 against 224 ms of s
 its transposed-copy form (the masked path's) runs the attention at the same speed and adds 110 ms of
 transposes - the strided reads are not what it spends. At ~73 TFLOP/s (70 GFLOP a call) it is not the
 outlier its time share suggests.
+
+## How large a fold fits
+
+On a card short of room (`shortPair`) AlphaFold 2 takes native/af3's approach - each stage gives back what
+it alone used, and what is read once is taken in chunks of rows rather than held whole - and the levers
+that cost time engage only when the whole form would not fit with an eighth of the card to spare
+(`roomFor`). A fold that fits runs exactly as before (6MRR byte-identical); `LOCALFOLD_BIG=1` forces every
+path at any size, and the whole of `tools/check-native-worker.py` passes under it.
+
+- **the recycled pair re-embedded in place**: every term of a row (the outer sum, the previous positions'
+  distogram, the LayerNorm'd old row, the relative encoding) reads only that row, so no second pair.
+- **the triangle attention in chunks of attention rows**: the bias from the pair in chunks, then per chunk
+  its LayerNorm, q/k/v/gate, the flash kernel and the output - never the LayerNorm'd pair, the q/k/v/gate
+  or the output whole, nor the ending node's transposed copy of the pair (its rows are gathered from the
+  columns, its mask read transposed: the flash kernel's row offset indexes only the mask).
+- **`attentionCore` in chunks of rows** where its buffers would not fit (the MSA row attention's q/k/v/gate
+  grow with the alignment's depth), and the row attention's pair bias from the pair in chunks.
+- **the triangle multiplication in output blocks** (native/af3's `triangleBlocked`, with AF2's biases and
+  its projection halves one after the other).
+- **the structure module's LayerNorm'd pair never stored**: each pair position's mean and inverse (8 bytes)
+  and the IPA reads `(pair - mean) * inv * scale + offset` where it needs it - layerNormK's own
+  arithmetic, so the same values.
+- **the pair heads in chunks**: the PAE logits a chunk of pairs at a time (to the host for the output, into
+  the PAE and TM terms for the per-pass frames) and the distogram's contact probabilities a block of rows
+  at a time.
+- no CUDA graph on such a card (graphs run only at 8+ passes anyway), so a choice made from the free
+  memory cannot differ between a pass and its capture.
+
+Measured single sequence, 4 passes: a simulated T4 (`LOCALFOLD_SMEM_LIMIT=65536 LOCALFOLD_FLASH_REG=1` and
+a second process holding all but 14.6 GiB) folds **3,500 residues** in 4.8 minutes of A100 arithmetic,
+where ~1,300 was its limit; on the A100 3,144 residues peak at 34.9 GB on the whole forms (there is room
+for them). At 2,096 residues the big paths against the ordinary ones: pLDDT 20.18 / 20.17, 0.39 A apart
+on a fold of pLDDT 20.

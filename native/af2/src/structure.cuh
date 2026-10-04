@@ -95,9 +95,41 @@ __global__ void ipaOutputsK(const float* attn, const float* vs, const float* vp,
     f[base + 2 * Hh * Pv + idx] = loc[2];
     f[base + 3 * Hh * Pv + idx] = sqrtf(fmaxf(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2], 1e-16f));
   }
-  for (int c = threadIdx.x; c < C2; c += blockDim.x) {
+  for (int c = threadIdx.x; act2d && c < C2; c += blockDim.x) {     // (no act2d: ipaPairOutputsK writes it)
     float s = 0;
     for (int k = 0; k < L; ++k) s += a[k] * act2d[((size_t)q * L + k) * C2 + c];
+    f[Hh * Cs + 4 * Hh * Pv + h * C2 + c] = s;
+  }
+}
+// a pair position's LayerNorm statistics, by layerNormK's own arithmetic (two passes, a warp a row)
+__global__ void lnStatsK(const float* x, float2* stats, size_t rows, int C) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= rows) return;
+  const float* xr = x + row * C;
+  float s = 0;
+  for (int c = lane; c < C; c += 32) s += xr[c];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, v = 0;
+  for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  if (lane == 0) stats[row] = make_float2(mean, rsqrtf(v / C + 1e-5f));
+}
+// ipaOutputsK's pair term with act2d made where it is read: (pair - mean) * inv * scale + offset, the
+// LayerNorm's own arithmetic, so the same values as the stored act2d - which on a card short of room is
+// not stored (a pair-sized f32 tensor)
+__global__ void ipaPairOutputsK(const float* attn, const float* pair, const float2* stats, const float* scale,
+                                const float* offset, float* final_, int L, int Hh, int Cs, int Pv, int C2) {
+  int q = blockIdx.x / Hh, h = blockIdx.x % Hh;
+  const float* a = attn + ((size_t)q * Hh + h) * L;
+  int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
+  float* f = final_ + (size_t)q * Fw;
+  for (int c = threadIdx.x; c < C2; c += blockDim.x) {
+    float s = 0;
+    for (int k = 0; k < L; ++k) {
+      size_t at = (size_t)q * L + k; float2 st = stats[at];
+      s += a[k] * ((pair[at * C2 + c] - st.x) * st.y * scale[c] + offset[c]);
+    }
     f[Hh * Cs + 4 * Hh * Pv + h * C2 + c] = s;
   }
 }
@@ -185,13 +217,25 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   layerNorm(single, initial, L, C, S + "single_layer_norm");
   float* act = scratch<float>("sm.act", (size_t)L * C);
   linearB(initial, S + "initial_projection", -1, act, L, C, C);
-  float* act2d = scratch<float>("sm.act2d", pairs * C2);
-  layerNorm(pair, act2d, pairs, C2, S + "pair_layer_norm");
+  const bool lean = AF2_TIGHT && !roomFor(pairs * C2 * 4, { "sm.act2d" });
+  float* act2d = lean ? nullptr : scratch<float>("sm.act2d", pairs * C2);
+  float2* stats = lean ? scratch<float2>("sm.lnstats", pairs) : nullptr;
+  if (lean) { releaseScratch({ "sm.act2d" }); lnStatsK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(pair, stats, pairs, C2); }
+  else layerNorm(pair, act2d, pairs, C2, S + "pair_layer_norm");
   int Hh = (int)dimW(I + "q_scalar_projection/weights", 1), Cs = (int)dimW(I + "q_scalar_projection/weights", 2);
   int Pq = (int)dimW(I + "q_point_projection/point_projection/weights", 2) / 3;
   int Pv = (int)dimW(I + "v_point_projection/point_projection/weights", 2) / 3;
   float* b2d = scratch<float>("sm.b2d", pairs * Hh);
-  linearB(act2d, I + "attention_2d", -1, b2d, pairs, C2, Hh);    // the same every iteration (shared weights)
+  if (!lean) linearB(act2d, I + "attention_2d", -1, b2d, pairs, C2, Hh);    // the same every iteration (shared weights)
+  else {                         // (on a card short of room, from the LayerNorm in chunks of pairs)
+    size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / C2));
+    float* lnc = scratch<float>("sm.lnc", per * C2);
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNorm(pair + r0 * C2, lnc, r, C2, S + "pair_layer_norm");
+      linearB(lnc, I + "attention_2d", -1, b2d + r0 * Hh, r, C2, Hh);
+    }
+  }
   float* pw = scratch<float>("sm.pw", Hh);
   softplusScaleK<<<1, 32, 0, STREAM>>>(P(I + "trainable_point_weights"), pw, Hh, sqrtf(1.f / (Pq * 9.f / 2.f)));
   float* rig = scratch<float>("sm.rigid", (size_t)L * 12);
@@ -228,6 +272,8 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
     pointsToGlobalK<<<blocks((size_t)L * Hh * Pv), 256, 0, STREAM>>>(proj, rig, vp, L, Hh, Pv);
     ipaWeightsK<<<(unsigned)(((size_t)L * Hh + 7) / 8), 256, 0, STREAM>>>(qs, ks, qp, kp, b2d, pw, seqMask, attn, L, Hh, Cs, Pq);
     ipaOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, vs, vp, act2d, rig, fin, L, Hh, Cs, Pv, C2);
+    if (lean) ipaPairOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, pair, stats, P(S + "pair_layer_norm/scale"),
+                                                         P(S + "pair_layer_norm/offset"), fin, L, Hh, Cs, Pv, C2);
     linearB(fin, I + "output_projection", -1, upd, L, Fw, C);
     addK2<<<blocks((size_t)L * C), 256, 0, STREAM>>>(act, upd, (size_t)L * C);
     layerNorm(act, t1, L, C, F + "attention_layer_norm");
