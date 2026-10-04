@@ -132,8 +132,8 @@ inline void triangle256(float* pair, const float* mask, int L, int C, const std:
 inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
   int I = (int)dimOf("f/" + Tn + "transition2", 0);
   // whole waves of transitionUpK within the same ~64 MB of widened rows (see transitionUpWaveRows)
-  size_t wave = transitionUpWaveRows<8>(), budget = ((size_t)64 << 20) / (2 * (size_t)I);
-  size_t chunk = std::max<size_t>(1, budget / wave) * wave;
+  size_t chunk = transitionUpChunkRows<256, 8>(std::max((size_t)128 * (256 + 8) * 2, 2 * (size_t)2 * 256 * (32 + 8) * 2),
+                                               ((size_t)64 << 20) / (2 * (size_t)I));
   half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     size_t r = std::min(chunk, P - r0);

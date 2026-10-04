@@ -381,7 +381,8 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
     // residual as its beta - the [rows, 2I] widening never written
     if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
       constexpr int WU = 8, R = 16 * WU;
-      size_t rowsPer = std::max<size_t>(R, CHUNK / (2 * I)) / R * R;
+      // whole waves of transitionUpK inside the same budget (transitionUpChunkRows)
+      size_t rowsPer = transitionUpChunkRows<256, WU>(wideUpSmem(256), std::max<size_t>(R, CHUNK / (2 * I)));
       half* gated = scratch<half>("tr.gated", std::min(rowsPer, rows) * I);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value;

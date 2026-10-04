@@ -78,6 +78,29 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
   }
 }
 
+// The rows one full wave of transitionUpK<C, WARPS> covers - the blocks every multiprocessor holds at
+// once, times the multiprocessors, times a block's 16 * WARPS rows - so a caller that chunks its rows can
+// chunk in whole waves. A chunk of 32768 rows was 256 blocks on an A100 at two a multiprocessor, 1.19
+// waves: two rounds with the second nearly empty, then a 25-block tail at 0.12 waves - five rounds of the
+// device where three do (Nsight Compute, ESMFold2 at 262 tokens).
+template <int C, int WARPS>
+size_t transitionUpWaveRows(size_t smem) {
+  static size_t rows = [smem] {
+    smemAttr((transitionUpK<C, WARPS>), (int)smem);
+    int perSm = 0, dev = 0, sms = 0;
+    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, transitionUpK<C, WARPS>, 32 * WARPS, smem));
+    CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    return (size_t)std::max(1, perSm) * sms * 16 * WARPS;
+  }();
+  return rows;
+}
+// ...and the largest whole number of those waves inside a budget of rows (at least one wave)
+template <int C, int WARPS>
+size_t transitionUpChunkRows(size_t smem, size_t budgetRows) {
+  size_t wave = transitionUpWaveRows<C, WARPS>(smem);
+  return std::max<size_t>(1, budgetRows / wave) * wave;
+}
+
 // ---------------------------------------------------------------- the triangle's output side
 // prod: channel-major [C][Lp][Lp] f32 (the padded contraction's output); t2: the gating linear's raw
 // output, [Lp * Lp][C] f16 (triInK's); pair: [L * L][C] f32. A block is 16 WARPS pairs: the product

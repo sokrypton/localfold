@@ -19,23 +19,6 @@ void transitionUp(const float* x, const float* sc, const float* of, const half* 
   if (!attr) { smemAttr((transitionUpK<C, WARPS>), (int)smem); attr = true; }
   transitionUpK<C, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, sc, of, W1, gated, rows, I);
 }
-// The rows one full wave of transitionUpK covers - the blocks every multiprocessor holds at once, times
-// the multiprocessors, times a block's 16 * WARPS rows - so a caller that chunks the rows can chunk in whole
-// waves. (A chunk of 32768 rows was 256 blocks on an A100, 1.19 waves: two rounds with the second nearly
-// empty, then a 25-block tail at 0.12 waves - five rounds of the device where three do.)
-template <int WARPS>
-size_t transitionUpWaveRows() {
-  static size_t rows = [] {
-    constexpr int C = 256, R = 16 * WARPS;
-    size_t smem = std::max((size_t)R * (C + 8) * 2, 2 * (size_t)2 * C * (32 + 8) * 2);
-    smemAttr((transitionUpK<C, WARPS>), (int)smem);
-    int perSm = 0, dev = 0, sms = 0;
-    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, transitionUpK<C, WARPS>, 32 * WARPS, smem));
-    CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-    return (size_t)std::max(1, perSm) * sms * R;
-  }();
-  return rows;
-}
 template <int WARPS>
 void triangleOut(const float* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
                  int L, int Lp) {
