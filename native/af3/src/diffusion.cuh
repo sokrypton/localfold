@@ -532,15 +532,12 @@ __global__ void layerNormSlowHalfK(const float* in, half* out, size_t rows, int 
   for (int c = lane; c < C; c += 32) out[row * C + c] = __float2half((x[c] - mean) * inv * scale[c]);
 }
 inline half* PN16_GIVEN = nullptr;     // a streamed preparation's LayerNorm'd pair (prepareTransformer)
-inline half* PN16_HOST = nullptr;      // ...kept in host memory instead, where the card cannot hold it
 inline void refreshSuperBlockBias(int sb, int n);
 struct TransformerCache {
   bool ready = false; int n = 0, nblocks = 0;
   // on a card short of room the biases are not kept for all blocks: the LayerNorm'd pair is, in f16, and
   // each super block's biases are made from it as the step reaches it (refreshSuperBlockBias)
   half* pn16 = nullptr; int perSuper = 0, heads = 0, Cz = 0;
-  half* pn16Host = nullptr;            // tier 2: the LayerNorm'd pair in host memory, read once for the biases
-  std::vector<half*> biasHost;         // ...which are then every block's in host memory, two slots on the card
   std::vector<float*> pairLogits;      // [h][i][j] per block
   std::vector<half*> biasHalf;         // the same, f16, log2(e)-scaled, rows padded: the flash kernel's
   int stride = 0;
@@ -600,15 +597,14 @@ inline void prepareTransformer(const float* pairCond, int n) {
   // a streamed preparation hands the LayerNorm'd pair in f16 (pairCond null): the biases are made from it,
   // every block's now where they fit with room to spare, else a super block at a time in the step
   const bool given = pairCond == nullptr;
-  if (given && !(DIFF_HALF && (PN16_GIVEN || PN16_HOST))) { fprintf(stderr, "a streamed preparation needs the f16 path\n"); exit(1); }
-  tc.pn16Host = given ? PN16_HOST : nullptr;
+  if (given && !(DIFF_HALF && PN16_GIVEN)) { fprintf(stderr, "a streamed preparation needs the f16 path\n"); exit(1); }
   if (DIFF_HALF && (given || shortPair(pairs, Cz))) {
-    bool lazy = tc.pn16Host || !roomFor((size_t)tc.nblocks * heads * n * tc.stride * 2);
+    bool lazy = !roomFor((size_t)tc.nblocks * heads * n * tc.stride * 2);
     if (given || lazy) {
       // the LayerNorm'd pair kept in f16 (half the f32 pair it is made from); with `lazy`, biases for one
       // super block at a time, made as the step reaches it - 24 blocks' biases held were 768 bytes a pair,
       // 3.4 GB at 2096 tokens, the diffusion's largest tensor
-      tc.pn16 = tc.pn16Host ? nullptr : given ? PN16_GIVEN : scratch<half>("dt.pn16", pairs * Cz);
+      tc.pn16 = given ? PN16_GIVEN : scratch<half>("dt.pn16", pairs * Cz);
       if (!given) {
         size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / Cz));
         for (size_t r0 = 0; r0 < pairs; r0 += per) {
@@ -623,28 +619,6 @@ inline void prepareTransformer(const float* pairCond, int n) {
       for (int b = 0; b < tc.nblocks; ++b)
         tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(lazy ? b % perSuper : b), (size_t)heads * n * tc.stride);
       tc.n = n; tc.ready = true;
-      tc.biasHost.clear();
-      // (where the host can hold every block's biases beside what it pins already, with 8 GB to spare; else
-      // each super block's are refreshed from the LayerNorm'd pair as the step reaches it, as on the card)
-      size_t allBias = (size_t)tc.nblocks * heads * n * tc.stride * 2;
-      if (tc.pn16Host && allBias + ((size_t)8 << 30) < hostAvailable()) {
-        // tier 2: every block's biases made once, a super block at a time, and kept in host memory - a step then
-        // copies each block's up as it is reached (biasWait), 384 channels a pair where refreshing every super
-        // block from the LayerNorm'd pair read 768, and computed nothing
-        size_t per = (size_t)heads * n * tc.stride;
-        half* host = (half*)hostKept("diffusion.biases", tc.nblocks * per / 2 + 1);
-        for (int sb = 0; sb * perSuper < tc.nblocks; ++sb) {
-          refreshSuperBlockBias(sb, n);
-          for (int b = sb * perSuper; b < std::min(tc.nblocks, (sb + 1) * perSuper); ++b)
-            CK(cudaMemcpyAsync(host + b * per, tc.biasHalf[b], per * 2, cudaMemcpyDeviceToHost, STREAM));
-        }
-        CK(cudaStreamSynchronize(STREAM));
-        for (int b = 0; b < tc.nblocks; ++b) tc.biasHost.push_back(host + b * per);
-        tc.pn16Host = nullptr; hostKeptFree("diffusion.pn16");
-        for (int k = 2; k < perSuper; ++k) releaseScratch({ ("dt.bh" + std::to_string(k)).c_str() });
-        for (int b = 0; b < tc.nblocks; ++b) tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b % 2), per);
-        return;
-      }
       if (!lazy) {                     // every block's biases now, and the f16 pair given back
         for (int sb = 0; sb * perSuper < tc.nblocks; ++sb) refreshSuperBlockBias(sb, n);
         releaseScratch({ "dt.pn16" }); tc.pn16 = nullptr;
@@ -710,54 +684,13 @@ inline void refreshSuperBlockBias(int sb, int n) {
   int ri = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(Cz, ps * heads))));
   float* flatc = scratch<float>("dt.flat", (size_t)ri * n * ps * heads);
   std::string w = "diffusion.transformer.superBlocks." + std::to_string(sb) + ".pairLogitsProjection";
-  auto rowsOf = [&](const half* pn, int i0, int r) {
-    size_t rows = (size_t)r * n;
-    linear<half, float>(pn, flatc, rows, Cz, ps * heads, w);
+  for (int i0 = 0; i0 < n; i0 += ri) {
+    int r = std::min(ri, n - i0); size_t rows = (size_t)r * n;
+    linear<half, float>(tc.pn16 + (size_t)i0 * n * Cz, flatc, rows, Cz, ps * heads, w);
     for (int b = sb * ps; b < std::min(tc.nblocks, (sb + 1) * ps); ++b)
       flatToBiasHalfRowsK<<<blocks((size_t)heads * r * tc.stride), 256, 0, STREAM>>>(flatc, tc.biasHalf[b], b % ps,
                                                                                 ps, heads, n, tc.stride, i0, r);
-  };
-  if (!tc.pn16Host) {
-    for (int i0 = 0; i0 < n; i0 += ri) rowsOf(tc.pn16 + (size_t)i0 * n * Cz, i0, std::min(ri, n - i0));
-    return;
   }
-  // tier 2: the LayerNorm'd pair streamed up from host memory, a chunk of rows a window
-  size_t count = (n + ri - 1) / ri, half2 = (size_t)ri * n * Cz / 2;     // (a window in floats)
-  windowed(count, false, half2, [&](float* slot, size_t k, bool, cudaStream_t s) {
-    int i0 = (int)k * ri, r = std::min(ri, n - i0);
-    CK(cudaMemcpyAsync(slot, tc.pn16Host + (size_t)i0 * n * Cz, (size_t)r * n * Cz * 2, cudaMemcpyHostToDevice, s));
-  }, [&](float* slot, size_t k) { int i0 = (int)k * ri; rowsOf((const half*)slot, i0, std::min(ri, n - i0)); });
-}
-// Tier 2: block b's biases copied up from host memory into slot b % 2 on a stream of their own - b + 1's already
-// on its way while b computes, b + 2's issued once b's attention is done with the slot (biasDone). Every copy is
-// waited on within the call, so a captured step stays a joined graph.
-inline cudaStream_t BIAS_STREAM = nullptr;
-inline cudaEvent_t BIAS_LOADED[2], BIAS_USED[2];
-inline void biasLoad(int b) {
-  TransformerCache& tc = TCACHE;
-  size_t bytes = (size_t)tc.heads * tc.n * tc.stride * 2;
-  CK(cudaMemcpyAsync(tc.biasHalf[b], tc.biasHost[b], bytes, cudaMemcpyHostToDevice, BIAS_STREAM));
-  CK(cudaEventRecord(BIAS_LOADED[b % 2], BIAS_STREAM));
-}
-inline void biasWait(int b) {
-  TransformerCache& tc = TCACHE;
-  if (b == 0) {
-    if (!BIAS_STREAM) {
-      CK(cudaStreamCreateWithFlags(&BIAS_STREAM, cudaStreamNonBlocking));
-      for (int k = 0; k < 2; ++k) { CK(cudaEventCreateWithFlags(&BIAS_LOADED[k], cudaEventDisableTiming));
-                                    CK(cudaEventCreateWithFlags(&BIAS_USED[k], cudaEventDisableTiming)); }
-    }
-    CK(cudaEventRecord(BIAS_USED[0], STREAM)); CK(cudaStreamWaitEvent(BIAS_STREAM, BIAS_USED[0], 0));   // (the fork)
-    biasLoad(0);
-    if (tc.nblocks > 1) biasLoad(1);
-  }
-  CK(cudaStreamWaitEvent(STREAM, BIAS_LOADED[b % 2], 0));
-}
-inline void biasDone(int b) {
-  TransformerCache& tc = TCACHE;
-  if (b + 2 >= tc.nblocks) return;
-  CK(cudaEventRecord(BIAS_USED[b % 2], STREAM)); CK(cudaStreamWaitEvent(BIAS_STREAM, BIAS_USED[b % 2], 0));
-  biasLoad(b + 2);
 }
 template <class T>
 void diffusionTransformer(float* act, const float* cond, const float* mask, int n) {
@@ -825,11 +758,9 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     if constexpr (std::is_same_v<T, half>) {
       // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate;
       // the samples are its batch rows, the pair bias shared
-      if ((tc.pn16 || tc.pn16Host) && b % perSuper == 0) refreshSuperBlockBias(b / perSuper, n);
-      if (!tc.biasHost.empty()) biasWait(b);
+      if (tc.pn16 && b % perSuper == 0) refreshSuperBlockBias(b / perSuper, n);
       flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, MASK_ALL_ONES ? nullptr : maskRows, o, n, heads, D, 0, NS, false,
                       1.f / sqrtf((float)D), kqNorm ? nullptr : W(B + ".qBias"));
-      if (!tc.biasHost.empty()) biasDone(b);
     } else {
       if (!kqNorm) addQBiasTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), (int)rows, Wd);
       for (int k = 0; k < NS; ++k) {               // the precise path one sample at a time
@@ -1007,20 +938,13 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
     // (9 GB at 4192 tokens, beside the trunk's)
     int Cp = (int)M.meta(E + ".pairChannels");
     float* tp = scratch<float>("enc.tp", pairs * Cp);
-    // the LayerNorm'd pair on the card where it fits beside a super block's biases, else in host memory
-    // (tier 2: 29.6 GB at 10761 tokens, beside 15 GB of biases)
-    int heads = (int)M.meta(T + ".heads"), perSuper = (int)M.meta(T + ".blocksPerSuperBlock");
-    size_t biasBytes = (size_t)perSuper * heads * n * ((n + 7) / 8 * 8) * 2;
-    bool pnHost = HOST_FORCED || !roomFor(pairs * Cz * 2 + biasBytes);
-    half* pn16 = pnHost ? nullptr : scratch<half>("dt.pn16", pairs * Cz);
-    half* pnHostBuf = pnHost ? (half*)hostKept("diffusion.pn16", pairs * Cz / 2 + 1) : nullptr;
+    half* pn16 = scratch<half>("dt.pn16", pairs * Cz);
     PAIR_CHUNK_SINK = [&](const float* chunk, size_t p0, size_t r) {
       float* ln = scratch<float>("enc.tpln", r * Cz);
       layerNormSlow(chunk, ln, r, Cz, W(E + ".lnormTrunkPairCondScale"), Wopt(E + ".lnormTrunkPairCondOffset"));
       linear<float, float>(ln, tp + p0 * Cp, r, Cz, Cp, E + ".embedTrunkPairCond");
-      half* to = pnHost ? scratch<half>("dt.pn16chunk", r * Cz) : pn16 + p0 * Cz;
-      layerNormSlowHalfK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(chunk, to, r, Cz, W(T + ".pairInputLayerNormScale"));
-      if (pnHost) CK(cudaMemcpyAsync(pnHostBuf + p0 * Cz, to, r * Cz * 2, cudaMemcpyDeviceToHost, STREAM));
+      layerNormSlowHalfK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(chunk, pn16 + p0 * Cz, r, Cz,
+                                                                      W(T + ".pairInputLayerNormScale"));
     };
     diffusionConditioning(trunkSingle, trunkPair, targetFeat, SIGMA_DATA, n);
     PAIR_CHUNK_SINK = nullptr;
@@ -1028,10 +952,9 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
     f.enc = prepareEncoder(E, "atomReference", trunkSingle, nullptr);
     ENC_TP_GIVEN = nullptr;
     f.dec = prepareDecoder(f.enc);
-    if (pnHost) releaseScratch({ "dt.pn16chunk" });
-    PN16_GIVEN = pn16; PN16_HOST = pnHostBuf;
+    PN16_GIVEN = pn16;
     prepareTransformer(nullptr, n);
-    PN16_GIVEN = nullptr; PN16_HOST = nullptr;
+    PN16_GIVEN = nullptr;
     return f;
   }
   Conditioning cond = diffusionConditioning(trunkSingle, trunkPair, targetFeat, SIGMA_DATA, n);  // builds the pair

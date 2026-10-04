@@ -811,9 +811,7 @@ inline void scratchReportOOM(const char* what, size_t bytes) {
 // one (callers take the new pointer).
 inline float* PARK_HOST = nullptr; inline size_t PARK_HAVE = 0;
 inline bool parkWorthIt(size_t bytes) { return !roomFor(bytes); }
-// the parking buffer at least `bytes` long (its contents kept only while it does not grow) - also the home of
-// a trunk pair the card never holds (tier 2, makeTrunk)
-inline float* parkBuffer(size_t bytes) {
+inline void parkToHost(float*& dev, size_t bytes) {
   if (PARK_HAVE < bytes) {
     if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
     if (cudaMallocHost(&PARK_HOST, bytes) != cudaSuccess) {
@@ -822,10 +820,6 @@ inline float* parkBuffer(size_t bytes) {
     }
     PARK_HAVE = bytes;
   }
-  return PARK_HOST;
-}
-inline void parkToHost(float*& dev, size_t bytes) {
-  parkBuffer(bytes);
   CK(cudaMemcpyAsync(PARK_HOST, dev, bytes, cudaMemcpyDeviceToHost, STREAM));
   CK(cudaStreamSynchronize(STREAM));
   CK(cudaFree(dev)); dev = nullptr;
@@ -852,138 +846,6 @@ template <class T> T* scratch(const std::string& name, size_t n) {
     have = n * sizeof(T);
   }
   return (T*)p;
-}
-
-// ---------------------------------------------------------------- tier 2: a pair in host memory
-// Past what the card holds even in blocks, a pair-shaped tensor lives in pinned host memory and passes
-// through the card a window of whole rows (or of whole columns) at a time. Copies run at ~24 GB/s each way
-// on an A100; a kernel reading host memory in place managed 9 (1.5 for a read-modify-write), and a managed
-// allocation paged by the driver was over 7x slower than resident on a 3500-token trunk - so the windows are
-// explicit. LOCALFOLD_BIG=2 takes this tier at any size (with every tier-1 path), which is how it is checked.
-inline const bool HOST_FORCED = getenv("LOCALFOLD_BIG") && atoi(getenv("LOCALFOLD_BIG")) >= 2;
-inline float* hostPairAlloc(size_t elems) {
-  float* h = nullptr;
-  if (cudaHostAlloc(&h, std::max<size_t>(elems, 1) * 4, cudaHostAllocDefault) != cudaSuccess) {
-    fprintf(stderr, "cannot pin %.2f GB of host memory for a pair the card cannot hold: this input needs more host RAM\n",
-            elems * 4 / 1e9);
-    exit(1);
-  }
-  return h;
-}
-// A window's base moved back to where pair position p0 would be in a whole pair - for kernels that index the
-// pair by absolute position (i * n + j) and touch only the window's own positions.
-inline float* shifted(float* window, size_t p0, int C) { return window - p0 * (size_t)C; }
-// A pair-shaped [n][n][C] f32 tensor: on the device (dev), or in host memory (host).
-struct Pair {
-  float* dev = nullptr; float* host = nullptr; int n = 0, C = 0;
-  size_t elems() const { return (size_t)n * n * C; }
-};
-// the rows a window takes - and the triangle's block in tier 2, which never crosses one (triangleBlocked): two
-// windows and a block of the free operand and its product (np x C x 6 bytes a row) out of a 16th of what is free
-// at the first window (the weights up), at most 2 GB, the triangle's fixed operand beside them. 194-row windows
-// with 48-row blocks at 10761 tokens read that operand (29.6 GB) 224 times a triangle; 110 of each, 98 times,
-// in the same memory. Under LOCALFOLD_BIG=2 a third of the pair, so a small input crosses windows.
-inline size_t hostWindowRows(int n, int C) {
-  if (HOST_FORCED) return std::max(1, (n + 2) / 3);
-  static const size_t budget = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return std::min<size_t>((size_t)2 << 30, f / 16); }();
-  size_t np = (n + 7) / 8 * 8, perRow = 2 * (size_t)n * C * 4 + np * C * 6;
-  return std::max<size_t>(1, std::min<size_t>(n, budget / perRow));
-}
-// The windows are double-buffered: while one is computed on the next is copied up and the last copied down,
-// each way on its own stream (an A100 copies both ways at once), so the copies hide behind the arithmetic
-// where there is enough of it. `copy(slot, k, up)` moves window k between host and slot; f(slot, k) runs on
-// STREAM. A device pair takes none of this (forRowWindows).
-template <class Copy, class F> void windowed(size_t count, bool write, size_t slotElems, Copy copy, F f) {
-  static cudaStream_t up = nullptr, down = nullptr;
-  static std::vector<cudaEvent_t> evs;
-  if (!up) { CK(cudaStreamCreateWithFlags(&up, cudaStreamNonBlocking)); CK(cudaStreamCreateWithFlags(&down, cudaStreamNonBlocking)); }
-  auto ev = [&](size_t i) {
-    while (evs.size() <= i) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); evs.push_back(e); }
-    return evs[i];
-  };
-  // (one window loop at a time: the slots and events are shared - a loop inside another's f would overwrite them)
-  static bool busy = false;
-  if (busy) { fprintf(stderr, "a window loop inside another (windowed)\n"); exit(1); }
-  struct Busy { bool& b; Busy(bool& x) : b(x) { b = true; } ~Busy() { b = false; } } guard(busy);
-  float* slot[2] = { scratch<float>("hp.win", slotElems), count > 1 ? scratch<float>("hp.win.b", slotElems) : nullptr };
-  // events: 0 the start, then per window k: up 1+3k, computed 2+3k, down 3+3k
-  CK(cudaEventRecord(ev(0), STREAM));
-  CK(cudaStreamWaitEvent(up, ev(0), 0)); CK(cudaStreamWaitEvent(down, ev(0), 0));
-  auto issueUp = [&](size_t k) {
-    // the slot is free once its last window was copied down (or, read-only, computed on)
-    if (k >= 2) CK(cudaStreamWaitEvent(up, ev(write ? 3 + 3 * (k - 2) : 2 + 3 * (k - 2)), 0));
-    copy(slot[k % 2], k, true, up);
-    CK(cudaEventRecord(ev(1 + 3 * k), up));
-  };
-  issueUp(0);
-  for (size_t k = 0; k < count; ++k) {
-    if (k + 1 < count) issueUp(k + 1);
-    CK(cudaStreamWaitEvent(STREAM, ev(1 + 3 * k), 0));
-    f(slot[k % 2], k);
-    CK(cudaEventRecord(ev(2 + 3 * k), STREAM));
-    if (write) {
-      CK(cudaStreamWaitEvent(down, ev(2 + 3 * k), 0));
-      copy(slot[k % 2], k, false, down);
-      CK(cudaEventRecord(ev(3 + 3 * k), down));
-    }
-  }
-  // what follows on STREAM - the next windows' copies up among it - sees the host copy whole
-  if (write) CK(cudaStreamWaitEvent(STREAM, ev(3 + 3 * (count - 1)), 0));
-}
-// f(window, i0, I) for each block of whole rows [i0, i0 + I) - the window [I][n][C] - written back unless
-// `write` is false. A device pair is one window, the pair itself.
-template <class F> void forRowWindows(const Pair& p, bool write, F f) {
-  if (!p.host) { f(p.dev, (size_t)0, (size_t)p.n); return; }
-  size_t R = hostWindowRows(p.n, p.C), row = (size_t)p.n * p.C, count = (p.n + R - 1) / R;
-  windowed(count, write, R * row, [&](float* w, size_t k, bool toDevice, cudaStream_t s) {
-    size_t i0 = k * R, I = std::min(R, (size_t)p.n - i0);
-    if (toDevice) CK(cudaMemcpyAsync(w, p.host + i0 * row, I * row * 4, cudaMemcpyHostToDevice, s));
-    else CK(cudaMemcpyAsync(p.host + i0 * row, w, I * row * 4, cudaMemcpyDeviceToHost, s));
-  }, [&](float* w, size_t k) { size_t i0 = k * R; f(w, i0, std::min(R, (size_t)p.n - i0)); });
-}
-// ...and for each block of whole columns [j0, j0 + J): the window [n][J][C], row i holding (i, j0 .. j0 + J)
-template <class F> void forColWindows(const Pair& p, bool write, F f) {
-  if (!p.host) { f(p.dev, (size_t)0, (size_t)p.n); return; }
-  size_t R = hostWindowRows(p.n, p.C), C = p.C, pitch = (size_t)p.n * C * 4, count = (p.n + R - 1) / R;
-  windowed(count, write, R * p.n * C, [&](float* w, size_t k, bool toDevice, cudaStream_t s) {
-    size_t j0 = k * R, J = std::min(R, (size_t)p.n - j0);
-    if (toDevice) CK(cudaMemcpy2DAsync(w, J * C * 4, p.host + j0 * C, pitch, J * C * 4, p.n, cudaMemcpyHostToDevice, s));
-    else CK(cudaMemcpy2DAsync(p.host + j0 * C, pitch, w, J * C * 4, J * C * 4, p.n, cudaMemcpyDeviceToHost, s));
-  }, [&](float* w, size_t k) { size_t j0 = k * R; f(w, j0, std::min(R, (size_t)p.n - j0)); });
-}
-// rows [i0, i0 + I) of a second pair beside a window: copied up into scratch `slot` (in place for a device
-// pair), and written back by commitRows
-inline float* stageRows(const Pair& p, size_t i0, size_t I, const char* slot) {
-  size_t row = (size_t)p.n * p.C;
-  if (!p.host) return p.dev + i0 * row;
-  float* w = scratch<float>(slot, I * row);
-  CK(cudaMemcpyAsync(w, p.host + i0 * row, I * row * 4, cudaMemcpyHostToDevice, STREAM));
-  return w;
-}
-inline void commitRows(const Pair& p, size_t i0, size_t I, const float* w) {
-  size_t row = (size_t)p.n * p.C;
-  if (p.host) CK(cudaMemcpyAsync(p.host + i0 * row, w, I * row * 4, cudaMemcpyDeviceToHost, STREAM));
-}
-// a pinned host buffer kept for the process under `name`, grown as needed (a pair re-pinned every recycle
-// would pay the pinning - seconds at tens of GB - each time)
-inline std::map<std::string, std::pair<float*, size_t>> HOST_KEPT;
-inline float* hostKept(const std::string& name, size_t elems) {
-  auto& [p, have] = HOST_KEPT[name];
-  if (have < elems) { if (p) CK(cudaFreeHost(p)); p = hostPairAlloc(elems); have = elems; }
-  return p;
-}
-// ...given back (the device done with it first): a phase's own, once the phase is over
-inline void hostKeptFree(const std::string& name) {
-  auto it = HOST_KEPT.find(name);
-  if (it == HOST_KEPT.end() || !it->second.first) return;
-  CK(cudaStreamSynchronize(STREAM)); CK(cudaFreeHost(it->second.first)); it->second = {nullptr, 0};
-}
-// host memory the system could still hand out (MemAvailable), for a lever that pins tens of GB
-inline size_t hostAvailable() {
-  FILE* f = fopen("/proc/meminfo", "r"); size_t kb = 0; char line[256];
-  while (f && fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) break;
-  if (f) fclose(f);
-  return kb * 1024;
 }
 
 // The process's end once its outputs are written: flushed first. (std::exit, not _exit: _exit measured no
