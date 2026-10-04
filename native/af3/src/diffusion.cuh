@@ -964,6 +964,10 @@ inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& l
   int Cs = (int)M.meta(P + ".seqChannels"), Cse = (int)M.meta("diffusion.seqChannels"), perToken = (int)M.meta("diffusion.perTokenChannels");
   if (Cs != Cse) { fprintf(stderr, "conditioning width %d against %d\n", Cs, Cse); exit(1); }
   if (!DCACHE.ready) diffusionConditioning(f.trunkSingle, f.trunkPair, f.targetFeat, SIGMA_DATA, n);   // the base
+  // every step's at once is steps x tokens rows - 1.8 GB at 100 steps and 2900 tokens - so where that does
+  // not fit with room to spare each step makes its own (denoiseCore's !usePre path; a few small kernels)
+  if (f.preSingle) { CK(cudaFree(f.preSingle)); CK(cudaFree(f.preSnProj)); f.preSingle = f.preSnProj = nullptr; }
+  if (!roomFor((size_t)S * n * (2 * Cs + perToken) * 4)) { f.usePre = false; return; }
   size_t nc = lenW(P + ".fourierWeight");
   float* lv = upload(levels.data(), S);
   float* e = dalloc((size_t)S * nc); float* en = dalloc((size_t)S * nc); float* proj = dalloc((size_t)S * Cs);
@@ -971,7 +975,6 @@ inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& l
   layerNormSlow(e, en, S, (int)nc, W(P + ".noiseEmbeddingInitialNormScale"), Wopt(P + ".noiseEmbeddingInitialNormOffset"));
   linear<float, float>(en, proj, S, (int)nc, Cs, P + ".noiseEmbeddingInitialProjection");
   size_t rows = (size_t)S * n;
-  if (f.preSingle) { CK(cudaFree(f.preSingle)); CK(cudaFree(f.preSnProj)); }
   f.preSingle = dalloc(rows * Cs); f.preSnProj = dalloc(rows * perToken);
   baseplusK<<<blocks(rows * Cs), 256, 0, STREAM>>>(DCACHE.singleBase, proj, f.preSingle, S, n, Cs);
   for (int k = 0; k < 2; ++k) plainTransition(f.preSingle, rows, Cs, 2, P + ".singleTransitions." + std::to_string(k));

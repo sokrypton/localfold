@@ -734,8 +734,13 @@ inline void unreadWeights() {
 }
 
 // ---------------------------------------------------------------- device memory
-inline float* dalloc(size_t n) { float* p; CK(cudaMalloc(&p, std::max<size_t>(n, 1) * 4)); return p; }
-template <class T> T* dallocT(size_t n) { T* p; CK(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T))); return p; }
+inline void scratchReportOOM(const char* what, size_t bytes);
+template <class T> T* dallocT(size_t n) {
+  T* p;
+  if (cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)) != cudaSuccess) { scratchReportOOM("a direct allocation", n * sizeof(T)); exit(1); }
+  return p;
+}
+inline float* dalloc(size_t n) { return dallocT<float>(n); }
 template <class T> T* upload(const T* h, size_t n) {
   T* p = dallocT<T>(n); CK(cudaMemcpy(p, h, n * sizeof(T), cudaMemcpyHostToDevice)); return p;
 }
@@ -787,6 +792,41 @@ inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) 
     for (const char* p : held) if (name == p) bytes -= std::min(bytes, slot.second);
   size_t f, t; CK(cudaMemGetInfo(&f, &t));
   return f > bytes + t / 8;
+}
+// what holds the device when an allocation is refused: the largest scratch buffers, and the free memory
+inline void scratchReportOOM(const char* what, size_t bytes) {
+  cudaGetLastError();
+  size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
+  size_t freeB, totalB; cudaMemGetInfo(&freeB, &totalB);
+  fprintf(stderr, "out of device memory: %s wants %.2f GB; scratch holds %.2f GB, %.2f of %.2f GB free\n",
+          what, bytes / 1e9, held / 1e9, freeB / 1e9, totalB / 1e9);
+  std::vector<std::pair<size_t, std::string>> big;
+  for (auto& [k, v] : SCRATCH) big.push_back({v.second, k});
+  std::sort(big.rbegin(), big.rend());
+  for (size_t i = 0; i < big.size() && i < 12; ++i) fprintf(stderr, "  %8.2f GB  %s\n", big[i].first / 1e9, big[i].second.c_str());
+}
+// A pair-sized tensor PARKED in pinned host memory while nothing on the device reads it - the template
+// stack's blocks and the diffusion sampler leave the trunk's pair alone - on a card short of room. One
+// pinned buffer for the process, grown as needed; parking frees the device copy and unparking makes a new
+// one (callers take the new pointer).
+inline float* PARK_HOST = nullptr; inline size_t PARK_HAVE = 0;
+inline bool parkWorthIt(size_t bytes) { return !roomFor(bytes); }
+inline void parkToHost(float*& dev, size_t bytes) {
+  if (PARK_HAVE < bytes) {
+    if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
+    if (cudaMallocHost(&PARK_HOST, bytes) != cudaSuccess) {
+      fprintf(stderr, "cannot pin %.2f GB of host memory to park the pair: this input needs more host RAM\n", bytes / 1e9);
+      exit(1);
+    }
+    PARK_HAVE = bytes;
+  }
+  CK(cudaMemcpyAsync(PARK_HOST, dev, bytes, cudaMemcpyDeviceToHost, STREAM));
+  CK(cudaStreamSynchronize(STREAM));
+  CK(cudaFree(dev)); dev = nullptr;
+}
+inline void unparkFromHost(float*& dev, size_t bytes) {
+  dev = dallocT<float>(bytes / 4);
+  CK(cudaMemcpyAsync(dev, PARK_HOST, bytes, cudaMemcpyHostToDevice, STREAM));
 }
 template <class T> T* scratch(const std::string& name, size_t n) {
   auto& [p, have] = SCRATCH[name];

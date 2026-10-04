@@ -307,6 +307,10 @@ void templateEmbedding(Trunk& t, float* out) {
       }
     }
     if (outer) CK(cudaMemcpyAsync(before, act, pairs * Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
+    // with one pass the trunk's pair is read before the stack (the query) and after it (the output) and
+    // not in between: on a card short of room it waits in host memory while the stack runs
+    bool parked = live == 1 && tight && out == t.pair && parkWorthIt(pairs * Cq * 4);
+    if (parked) { parkToHost(t.pair, pairs * Cq * 4); out = nullptr; }
     for (int b = 0; b < nb; ++b) {
       std::string B = P + "blocks." + std::to_string(b);
       int factor = (int)(lenW(B + ".pairTransition.transition1") / ((size_t)Ct * Ct * 2));
@@ -318,6 +322,7 @@ void templateEmbedding(Trunk& t, float* out) {
     layerNorm2<float, float>(act, act, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");
     if (live == 1) scaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
     else addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
+    if (parked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkFromHost(t.pair, pairs * Cq * 4); out = t.pair; }
   }
   // divided by every slot (not the real ones), relu, projected
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);

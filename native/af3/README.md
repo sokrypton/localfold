@@ -614,3 +614,26 @@ between, which is why these "repeats" are one chain.
 
 `LOCALFOLD_BIG=1` runs every big-input path at any size; 6MRR through all seven AF3-lineage models agrees
 with the ordinary paths within rounding (0.738 A for AlphaFold 3 either way).
+
+### 🔴 And on a T4: 2,900 tokens
+
+Simulated on this A100 as a T4 sees it - `LOCALFOLD_SMEM_LIMIT=65536` (its 64 KB of shared memory, so the
+fused triangle and grid kernels step aside for the unfused ones, as they do there), `LOCALFOLD_FLASH_REG=1`
+(its register-staged flash kernel) and a second process holding all but 14.6 GiB - a T4 folds **2,900
+tokens** (3 minutes of A100 arithmetic; clean geometry at 100 steps) where it folded 2,000 before this
+pass. What the T4's own paths needed beyond the A100's:
+
+- **the unfused grid attention's LayerNorm'd pair is not kept** - per pair position, so the bias pass and
+  each chunk take it again from the pair (a column chunk gathered transposed first): safe in place, since
+  a row chunk writes only its rows and a column chunk only its columns.
+- **the trunk's pair PARKED in pinned host memory** while nothing reads it: during the template stack
+  (one pass: the pair is read for the query before and for the output after) and through the sampler
+  (back for the confidence head). Only where the card is short (`parkWorthIt`), since it crosses PCIe.
+- **the sampler's per-step conditioning is not precomputed** where it does not fit: steps x tokens rows,
+  1.8 GB at 100 steps and 2,900 tokens.
+- the 64-key branch of the grid flash kernel checks its own shared memory - it asked for 66 KB at 4 warps.
+
+At 3,200 the MSA stack is what stops it: the pair (5.2 GB), the blocked triangle's fixed operand (2.6 GB)
+and ~1.9 GB of weights. The next levers are 2-D tiles for the triangle (the fixed operand a quarter the
+size, recomputed four times - the projection is a tenth of the contraction's arithmetic) and dropping the
+file's f32 copy of tensors only read through their f16 mirror.

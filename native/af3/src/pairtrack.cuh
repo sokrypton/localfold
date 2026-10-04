@@ -688,10 +688,25 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       return;
     }
   }
-  T* norm = scratch<T>("grid.norm", pairs * C);
-  layerNorm2<float, T>(pair, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
+  // On a card short of room the LayerNorm'd pair is not kept: it is per pair position, so the bias pass and
+  // each chunk's q/k/v/gate take it again from the pair (a column chunk gathered transposed first). In
+  // place that is safe: a row chunk writes only its own rows, a column chunk only its own columns, and the
+  // bias is all taken before any is written.
+  const bool streamNorm = shortPair(pairs, C);
+  T* norm = streamNorm ? nullptr : scratch<T>("grid.norm", pairs * C);
   float* raw = scratch<float>("grid.rawbias", pairs * heads);
-  linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
+  if (!streamNorm) {
+    layerNorm2<float, T>(pair, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
+    linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
+  } else {
+    size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
+    T* lnc = scratch<T>("grid.normChunk", per * C);
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNorm2<float, T>(pair + r0 * C, lnc, r, C, pre + ".actNormScale", pre + ".actNormOffset");
+      linear<T, float>(lnc, raw + r0 * heads, r, C, heads, pre + ".pairBiasProjection");
+    }
+  }
   int stride = (n + 7) / 8 * 8;
   constexpr bool fast = std::is_same_v<T, half>;
   T* bias = scratch<T>("grid.bias", (size_t)heads * n * stride);
@@ -704,8 +719,19 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   float scale = 1.f / sqrtf((float)D);
   for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
     size_t rows = std::min(R, (size_t)n - r0), prs = rows * n;
-    const T* act = norm + r0 * n * C;
-    if (tr) {
+    const T* act = streamNorm ? nullptr : norm + r0 * n * C;
+    if (streamNorm) {
+      T* g = scratch<T>("grid.act", prs * C);
+      const float* src = pair + r0 * n * C;
+      if (tr) {
+        float* g32 = scratch<float>("grid.act32", prs * C);
+        if (C * 4 % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
+        gatherTransposedK<<<blocks(prs * C * 4 / 16), 256, 0, STREAM>>>(pair, g32, n, C, r0, rows, 4);
+        src = g32;
+      }
+      layerNorm2<float, T>(src, g, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
+      act = g;
+    } else if (tr) {
       T* g = scratch<T>("grid.act", prs * C);
       if (C * sizeof(T) % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
       gatherTransposedK<<<blocks(prs * C * sizeof(T) / 16), 256, 0, STREAM>>>(norm, g, n, C, r0, rows, sizeof(T));

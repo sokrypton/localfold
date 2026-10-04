@@ -278,6 +278,7 @@ int main(int argc, char** argv) {
   for (int fi = 0; doFold && fi < folds; ++fi) {
     if (fi > 0) {   // a fresh fold: the trunk restarts from zero recycled state
       size_t pp = (size_t)t.n * t.n * t.C;
+      if (!t.pair) t.pair = dalloc(pp);                // (left parked by the last fold)
       // (in place, the pair is the recycled one)
       CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
     }
@@ -402,6 +403,10 @@ int main(int argc, char** argv) {
     // ready - its single base is what a later batch's precompute reads)
     if (shortPair((size_t)nD * nD, (int)M.meta("diffusion.conditioning.pairChannels"))) {
       releaseScratch({ "dc.pair" }); DCACHE.pair = nullptr;
+      // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
+      // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
+      releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj", "pt." });
+      if (!structural && parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); df.trunkPair = nullptr; }
     }
     releaseConcatCopies(); memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
@@ -503,6 +508,7 @@ int main(int argc, char** argv) {
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
+        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * 4);    // (parked for the sampler)
         // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
         bool last = c0 + k + 1 == runs.size();
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
