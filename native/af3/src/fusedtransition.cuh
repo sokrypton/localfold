@@ -20,8 +20,8 @@ __host__ __device__ constexpr size_t ftStage() {   // W1 a and b chunks [C][NC+8
 
 // RELU: AlphaFold 2's transition - x += ReLU(LN(x) W1 + b1) W2 + b2, W1 [C][I] (one half, not SwiGLU's two);
 // without it the kernel is AF3's
-template <int C, int WARPS, bool RELU = false>
-__global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
+template <int C, int WARPS, bool RELU = false, class PT = float>
+__global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(PT* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1, const half* __restrict__ W2, size_t rows, int I,
     const float* __restrict__ b1 = nullptr, const float* __restrict__ b2 = nullptr) {
   constexpr int FT_ROWS = 16 * WARPS, NTH = 32 * WARPS;
@@ -109,27 +109,27 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
     int c = et * 8 + tig * 2;
     float o0 = 0.f, o1 = 0.f;
     if constexpr (RELU) { o0 = b2[c]; o1 = b2[c + 1]; }
-    if (r0 < rows) { float2* p = (float2*)(x + r0 * C + c); float2 v = *p; v.x += acc[et][0] + o0; v.y += acc[et][1] + o1; *p = v; }
-    if (r1 < rows) { float2* p = (float2*)(x + r1 * C + c); float2 v = *p; v.x += acc[et][2] + o0; v.y += acc[et][3] + o1; *p = v; }
+    if (r0 < rows) { PT* p = x + r0 * C + c; float2 v = ld2(p); v.x += acc[et][0] + o0; v.y += acc[et][1] + o1; st2(p, v); }
+    if (r1 < rows) { PT* p = x + r1 * C + c; float2 v = ld2(p); v.x += acc[et][2] + o0; v.y += acc[et][3] + o1; st2(p, v); }
   }
 }
 
 inline bool FUSED_TRANSITION = true;
 inline int FT_WARPS = 8;
-template <int WARPS, bool RELU = false>
-void fusedTransitionAt(float* x, size_t rows, int I, const float* lnScale, const float* lnOffset, const half* W1,
+template <int WARPS, bool RELU = false, class PT = float>
+void fusedTransitionAt(PT* x, size_t rows, int I, const float* lnScale, const float* lnOffset, const half* W1,
                        const half* W2, const float* b1, const float* b2) {
   constexpr int R = 16 * WARPS;
   size_t smem = (size_t)R * (128 + 8) * 2 + 2 * ftStage<128>();
   static bool attr = false;
-  if (!attr) { smemAttr((fusedTransitionK<128, WARPS, RELU>), (int)smem); attr = true; }
-  fusedTransitionK<128, WARPS, RELU><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+  if (!attr) { smemAttr((fusedTransitionK<128, WARPS, RELU, PT>), (int)smem); attr = true; }
+  fusedTransitionK<128, WARPS, RELU, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     x, lnScale, lnOffset, W1, W2, rows, I, b1, b2);
 }
 // x += transition(x) for C = 128, f16 weights, on raw pointers (AlphaFold 2 calls it with RELU and its
 // biases); false if the shape is not this kernel's or the device cannot hold its blocks
-template <bool RELU = false>
-inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float* lnScale, const float* lnOffset,
+template <bool RELU = false, class PT = float>
+inline bool fusedTransitionRaw(PT* x, size_t rows, int C, int I, const float* lnScale, const float* lnOffset,
                                const half* W1, const half* W2, const float* b1 = nullptr, const float* b2 = nullptr) {
   if (!FUSED_TRANSITION || C != 128 || I % FT_NC) return false;
   int warps = FT_WARPS == 8 && (rows + 127) / 128 < MIN_BLOCKS ? 4 : FT_WARPS;   // a small input: more, smaller blocks
@@ -137,13 +137,14 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
   auto smemFor = [](int w) { return (size_t)16 * w * (128 + 8) * 2 + 2 * ftStage<128>(); };
   while (warps > 4 && !fitsSmem(smemFor(warps))) warps /= 2;
   if (!fitsSmem(smemFor(warps))) return false;
-  if (warps == 4) fusedTransitionAt<4, RELU>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
-  else if (warps == 16) fusedTransitionAt<16, RELU>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
-  else fusedTransitionAt<8, RELU>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+  if (warps == 4) fusedTransitionAt<4, RELU, PT>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+  else if (warps == 16) fusedTransitionAt<16, RELU, PT>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+  else fusedTransitionAt<8, RELU, PT>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
   return true;
 }
-inline bool fusedTransition(float* x, size_t rows, int C, int I, const std::string& pre) {
+template <class PT = float>
+inline bool fusedTransition(PT* x, size_t rows, int C, int I, const std::string& pre) {
   if (!FUSED_TRANSITION || C != 128 || I % FT_NC) return false;
-  return fusedTransitionRaw(x, rows, C, I, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"),
+  return fusedTransitionRaw<false, PT>(x, rows, C, I, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"),
                             Wh(pre + ".transition1"), Wh(pre + ".transition2"));
 }

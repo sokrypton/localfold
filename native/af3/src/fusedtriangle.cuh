@@ -16,8 +16,8 @@
 // LayerNorm of a block's R rows into shared memory as f16, a warp a row and FOUR rows' loads in
 // flight per warp (one at a time left the loads latency-bound). rowOf(r) is row r's index in x,
 // or SIZE_MAX for a row past the end (normalised zeros).
-template <int C, int R, int WARPS, class RowOf>
-__device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowOf rowOf, const float* __restrict__ scale,
+template <int C, int R, int WARPS, class RowOf, class PT>
+__device__ __forceinline__ void lnRowsToShared(const PT* __restrict__ x, RowOf rowOf, const float* __restrict__ scale,
                                                const float* __restrict__ offset, half* Xs, int LDX, int warp, int lane) {
   constexpr int RPW = R / WARPS, B = RPW % 4 == 0 ? 4 : (RPW % 2 == 0 ? 2 : 1), K = C / 32;
   for (int base = 0; base < RPW; base += B) {
@@ -26,7 +26,7 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
     for (int b = 0; b < B; ++b) {
       size_t row = rowOf(warp + (base + b) * WARPS);
 #pragma unroll
-      for (int k = 0; k < K; ++k) v[b][k] = row != SIZE_MAX ? x[row * C + lane + 32 * k] : 0.f;
+      for (int k = 0; k < K; ++k) v[b][k] = row != SIZE_MAX ? toF(x[row * C + lane + 32 * k]) : 0.f;
     }
 #pragma unroll
     for (int b = 0; b < B; ++b) {
@@ -55,8 +55,8 @@ __host__ __device__ constexpr size_t tiStage(int C) { return (size_t)2 * C * (TI
 // TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (f16 overflows).
 // BIAS: AlphaFold 2's projections carry biases, AF3's do not - `bias` is [4C, the projection | gate columns
 // in Wpg's order][C, the gating linear's]; without BIAS the kernel is the one AF3 has always run
-template <int C, int WARPS, class TA, bool BIAS = false>
-__global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ pair, const float* __restrict__ mask,
+template <int C, int WARPS, class TA, bool BIAS = false, class PT = float>
+__global__ void __launch_bounds__(WARPS * 32) triInK(const PT* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wpg,
     const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np,
     size_t cs, const float* __restrict__ bias = nullptr) {
@@ -185,10 +185,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
 }
 
 // pair += (LN_center(prod) Wout) * sigmoid(t2); prod channel-major [C][pairs] f32
-template <int C, int WARPS, class TP, bool BIAS = false>
+template <int C, int WARPS, class TP, bool BIAS = false, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
-    float* __restrict__ pair, int n, int np, size_t cs, const float* __restrict__ bias = nullptr) {
+    PT* __restrict__ pair, int n, int np, size_t cs, const float* __restrict__ bias = nullptr) {
   const size_t pp = (size_t)np * np;
   constexpr int PV = 16 / sizeof(TP);                               // product elements in 16 bytes
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + PV, LDX = C + 8, LDW = C + 8, KS = C / 16, NT = C / 8;
@@ -254,13 +254,13 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
     if constexpr (BIAS) { ob0 = bias[c]; ob1 = bias[c + 1]; }
     if (p0 != SIZE_MAX) {
       float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r0 * C + c));
-      float2* p = (float2*)(pair + p0 * C + c); float2 v = *p;
-      v.x += (acc[et][0] + ob0) * sigm(gt.x); v.y += (acc[et][1] + ob1) * sigm(gt.y); *p = v;
+      PT* p = pair + p0 * C + c; float2 v = ld2(p);
+      v.x += (acc[et][0] + ob0) * sigm(gt.x); v.y += (acc[et][1] + ob1) * sigm(gt.y); st2(p, v);
     }
     if (p1 != SIZE_MAX) {
       float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r1 * C + c));
-      float2* p = (float2*)(pair + p1 * C + c); float2 v = *p;
-      v.x += (acc[et][2] + ob0) * sigm(gt.x); v.y += (acc[et][3] + ob1) * sigm(gt.y); *p = v;
+      PT* p = pair + p1 * C + c; float2 v = ld2(p);
+      v.x += (acc[et][2] + ob0) * sigm(gt.x); v.y += (acc[et][3] + ob1) * sigm(gt.y); st2(p, v);
     }
   }
 }
@@ -268,10 +268,10 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
 // triOutK as a PERSISTENT kernel: each block keeps the output projection in shared memory for
 // every tile it takes and prefetches its next product tile while it computes the current one
 // (the one-shot kernel loaded 32 KB of weights and its tile, then computed, at two blocks an SM)
-template <int C, int WARPS, class TP, bool BIAS = false>
+template <int C, int WARPS, class TP, bool BIAS = false, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
-    float* __restrict__ pair, int n, int np, size_t cs, const float* __restrict__ bias = nullptr) {
+    PT* __restrict__ pair, int n, int np, size_t cs, const float* __restrict__ bias = nullptr) {
   const size_t pp = (size_t)np * np;
   constexpr int PV = 16 / sizeof(TP);
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + PV, LDX = C + 8, LDW = C + 8, KS = C / 16, NT = C / 8;
@@ -317,8 +317,8 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
 #pragma unroll
     for (int et = 0; et < NT; ++et) {
       int c = et * 8 + tig * 2;
-      if (p0 != SIZE_MAX) { pv[et][0] = *(const float2*)(pair + p0 * C + c); gv[et][0] = *reinterpret_cast<const half2*>(t2 + r0 * C + c); }
-      if (p1 != SIZE_MAX) { pv[et][1] = *(const float2*)(pair + p1 * C + c); gv[et][1] = *reinterpret_cast<const half2*>(t2 + r1 * C + c); }
+      if (p0 != SIZE_MAX) { pv[et][0] = ld2(pair + p0 * C + c); gv[et][0] = *reinterpret_cast<const half2*>(t2 + r0 * C + c); }
+      if (p1 != SIZE_MAX) { pv[et][1] = ld2(pair + p1 * C + c); gv[et][1] = *reinterpret_cast<const half2*>(t2 + r1 * C + c); }
     }
     __syncthreads();
     const TP* Ps = Pst + st * C * LDP;
@@ -372,11 +372,11 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
       if constexpr (BIAS) { ob0 = bias[c]; ob1 = bias[c + 1]; }
       if (p0 != SIZE_MAX) {
         float2 gt = __half22float2(gv[et][0]), v = pv[et][0];
-        v.x += (acc[et][0] + ob0) * sigm(gt.x); v.y += (acc[et][1] + ob1) * sigm(gt.y); *(float2*)(pair + p0 * C + c) = v;
+        v.x += (acc[et][0] + ob0) * sigm(gt.x); v.y += (acc[et][1] + ob1) * sigm(gt.y); st2(pair + p0 * C + c, v);
       }
       if (p1 != SIZE_MAX) {
         float2 gt = __half22float2(gv[et][1]), v = pv[et][1];
-        v.x += (acc[et][2] + ob0) * sigm(gt.x); v.y += (acc[et][3] + ob1) * sigm(gt.y); *(float2*)(pair + p1 * C + c) = v;
+        v.x += (acc[et][2] + ob0) * sigm(gt.x); v.y += (acc[et][3] + ob1) * sigm(gt.y); st2(pair + p1 * C + c, v);
       }
     }
     __syncthreads();                                                 // Xs and this stage are reused
@@ -401,30 +401,30 @@ template <class F> int warpsFitting(int w, std::initializer_list<int> options, F
   return 0;
 }
 // the launchers on raw pointers (AlphaFold 2 calls these with its own weights and biases), then AF3's by name
-template <class TA, int WARPS, bool BIAS>
-void triInLaunch(const float* pair, const float* mask, const float* lnScale, const float* lnOffset, const half* Wpg,
+template <class TA, int WARPS, bool BIAS, class PT = float>
+void triInLaunch(const PT* pair, const float* mask, const float* lnScale, const float* lnOffset, const half* Wpg,
                  const half* Wg, const float* bias, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * WARPS;
   size_t pp = (size_t)np * np;
   size_t smem = (size_t)R * (C + 8) * 2 + 2 * tiStage(C);
   static bool attr = false;
-  if (!attr) { smemAttr((triInK<C, WARPS, TA, BIAS>), (int)smem); attr = true; }
-  triInK<C, WARPS, TA, BIAS><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+  if (!attr) { smemAttr((triInK<C, WARPS, TA, BIAS, PT>), (int)smem); attr = true; }
+  triInK<C, WARPS, TA, BIAS, PT><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     pair, mask, lnScale, lnOffset, Wpg, Wg, a, b, t2, n, np, cs, bias);
 }
 inline size_t triInSmem(int warps) { return (size_t)16 * warps * (128 + 8) * 2 + 2 * tiStage(128); }
-template <class TA, bool BIAS = false>
-void triInRaw(const float* pair, const float* mask, const float* lnScale, const float* lnOffset, const half* Wpg,
+template <class TA, bool BIAS = false, class PT = float>
+void triInRaw(const PT* pair, const float* mask, const float* lnScale, const float* lnOffset, const half* Wpg,
               const half* Wg, const float* bias, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
   switch (warpsFitting(warpsFor((size_t)np * np, {TI_WARPS, 4}), {TI_WARPS, 4}, triInSmem)) {
-    case 4: triInLaunch<TA, 4, BIAS>(pair, mask, lnScale, lnOffset, Wpg, Wg, bias, a, b, t2, n, np, cs); break;
-    default: triInLaunch<TA, TI_WARPS, BIAS>(pair, mask, lnScale, lnOffset, Wpg, Wg, bias, a, b, t2, n, np, cs);
+    case 4: triInLaunch<TA, 4, BIAS, PT>(pair, mask, lnScale, lnOffset, Wpg, Wg, bias, a, b, t2, n, np, cs); break;
+    default: triInLaunch<TA, TI_WARPS, BIAS, PT>(pair, mask, lnScale, lnOffset, Wpg, Wg, bias, a, b, t2, n, np, cs);
   }
 }
-template <class TA>
-void triIn128(const float* pair, const float* mask, const std::string& pre, const std::string& pg,
+template <class TA, class PT = float>
+void triIn128(const PT* pair, const float* mask, const std::string& pre, const std::string& pg,
               TA* a, TA* b, half* t2, int n, int np, size_t cs) {
-  triInRaw<TA>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
+  triInRaw<TA, false, PT>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
                nullptr, a, b, t2, n, np, cs);
 }
 inline bool TRI_OUT_PERSISTENT = true;
@@ -439,50 +439,50 @@ template <class TP> constexpr size_t triOutSmem(int warps = TO_WARPS) {
 template <class TP> bool triFusedFits() {
   return fitsSmem(triInSmem(4)) && fitsSmem(std::min(triOutPSmem<TP>(4), triOutSmem<TP>(4)));
 }
-template <class TP, int WARPS, bool BIAS>
+template <class TP, int WARPS, bool BIAS, class PT = float>
 void triOutLaunch(const TP* prod, const float* cnScale, const float* cnOffset, const half* Wout, const float* bias,
-                  const half* t2, float* pair, int n, int np, size_t cs) {
+                  const half* t2, PT* pair, int n, int np, size_t cs) {
   constexpr int C = 128, R = 16 * WARPS;
   size_t pp = (size_t)np * np;
   if (TRI_OUT_PERSISTENT && fitsSmem(triOutPSmem<TP>(WARPS))) {
     size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)2 * C * (R + 16 / sizeof(TP)) * sizeof(TP);
     static int grid = 0;
     if (!grid) {
-      smemAttr((triOutPK<C, WARPS, TP, BIAS>), (int)smem);
+      smemAttr((triOutPK<C, WARPS, TP, BIAS, PT>), (int)smem);
       int perSm = 0, sms = 0;
-      CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, triOutPK<C, WARPS, TP, BIAS>, 32 * WARPS, smem));
+      CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, triOutPK<C, WARPS, TP, BIAS, PT>, 32 * WARPS, smem));
       CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
       grid = std::max(1, perSm) * sms;
     }
     size_t tiles = (pp + R - 1) / R;
-    triOutPK<C, WARPS, TP, BIAS><<<(unsigned)std::min<size_t>(grid, tiles), 32 * WARPS, smem, STREAM>>>(
+    triOutPK<C, WARPS, TP, BIAS, PT><<<(unsigned)std::min<size_t>(grid, tiles), 32 * WARPS, smem, STREAM>>>(
       prod, cnScale, cnOffset, Wout, t2, pair, n, np, cs, bias);
     return;
   }
   size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 16 / sizeof(TP)) * sizeof(TP);
   static bool attr = false;
-  if (!attr) { smemAttr((triOutK<C, WARPS, TP, BIAS>), (int)smem); attr = true; }
-  triOutK<C, WARPS, TP, BIAS><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+  if (!attr) { smemAttr((triOutK<C, WARPS, TP, BIAS, PT>), (int)smem); attr = true; }
+  triOutK<C, WARPS, TP, BIAS, PT><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     prod, cnScale, cnOffset, Wout, t2, pair, n, np, cs, bias);
 }
-template <class TP, bool BIAS = false>
+template <class TP, bool BIAS = false, class PT = float>
 void triOutRaw(const TP* prod, const float* cnScale, const float* cnOffset, const half* Wout, const float* bias,
-               const half* t2, float* pair, int n, int np, size_t cs) {
+               const half* t2, PT* pair, int n, int np, size_t cs) {
   if (fitsSmem(std::min(triOutPSmem<TP>(TO_WARPS), triOutSmem<TP>(TO_WARPS))))
-    triOutLaunch<TP, TO_WARPS, BIAS>(prod, cnScale, cnOffset, Wout, bias, t2, pair, n, np, cs);
-  else triOutLaunch<TP, 4, BIAS>(prod, cnScale, cnOffset, Wout, bias, t2, pair, n, np, cs);
+    triOutLaunch<TP, TO_WARPS, BIAS, PT>(prod, cnScale, cnOffset, Wout, bias, t2, pair, n, np, cs);
+  else triOutLaunch<TP, 4, BIAS, PT>(prod, cnScale, cnOffset, Wout, bias, t2, pair, n, np, cs);
 }
-template <class TP>
-void triOut128(const TP* prod, const std::string& pre, const half* t2, float* pair, int n, int np, size_t cs) {
-  triOutRaw<TP>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), nullptr,
+template <class TP, class PT = float>
+void triOut128(const TP* prod, const std::string& pre, const half* t2, PT* pair, int n, int np, size_t cs) {
+  triOutRaw<TP, false, PT>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), nullptr,
                 t2, pair, n, np, cs);
 }
 
 // out[h][row] = (LN(x[row]) W)[h] for a projection to few heads (N a multiple of 16, W (C, N)):
 // the single track's pair logits, the pair read once and written head-major (the layout the
 // softmax reads) through shared memory.
-template <int C, int N, int WARPS>
-__global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__ x, const float* __restrict__ lnScale,
+template <int C, int N, int WARPS, class PT = float>
+__global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const PT* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wp, float* __restrict__ out, size_t rows) {
   static_assert(N % 16 == 0, "the column loop takes 16 at a time");
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = N + 8, KS = C / 16, LDO = R + 4;
@@ -524,14 +524,14 @@ __global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__
     if (row0 + r < rows) out[(size_t)h * rows + row0 + r] = Os[h * LDO + r];
   }
 }
-template <int N>
-inline void lnHeads128(const float* x, const std::string& scale, const std::string& offset, const std::string& w,
+template <int N, class PT = float>
+inline void lnHeads128(const PT* x, const std::string& scale, const std::string& offset, const std::string& w,
                        float* out, size_t rows) {
   constexpr int C = 128, WARPS = 8, R = 16 * WARPS;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * (N + 8) * 2 + (size_t)N * (R + 4) * 4;
   static bool attr = false;
-  if (!attr) { smemAttr((lnHeadsK<C, N, WARPS>), (int)smem); attr = true; }
-  lnHeadsK<C, N, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, W(scale), W(offset), Wh(w), out, rows);
+  if (!attr) { smemAttr((lnHeadsK<C, N, WARPS, PT>), (int)smem); attr = true; }
+  lnHeadsK<C, N, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, W(scale), W(offset), Wh(w), out, rows);
 }
 
 // The grid attention's input projection: LN(pair row) -> q, k, v, gate (C x NQ), for output rows
@@ -540,8 +540,8 @@ inline void lnHeads128(const float* x, const std::string& scale, const std::stri
 // With `bias` (only when one call covers every row), it also writes the pair bias - LN(pair) times
 // the (C, 16) zero-padded bias projection, heads < 16 - straight into the flash kernel's
 // [h][i][stride] f16 layout, scaled by log2(e), (i, j) swapped where `swap`.
-template <int C, int NQ, int WARPS>
-__global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ pair, const float* __restrict__ lnScale,
+template <int C, int NQ, int WARPS, class PT = float>
+__global__ void __launch_bounds__(WARPS * 32) gridInK(const PT* __restrict__ pair, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wq, half* __restrict__ out, int n, size_t q0,
     size_t rows, bool tr, const half* __restrict__ Wb, half* __restrict__ bias, int heads, int stride, bool swap) {
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, NC = 64, LDW = NC + 8, KS = C / 16;
@@ -627,9 +627,9 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
   }
 }
 // pair[(j, r)] += (gathered[(r, j)] Wout) for output rows q0 .. q0+rows (the column direction)
-template <int C, int WD, int WARPS>
+template <int C, int WD, int WARPS, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ gathered, const half* __restrict__ Wout,
-    float* __restrict__ pair, int n, size_t q0, size_t rows, bool tr) {
+    PT* __restrict__ pair, int n, size_t q0, size_t rows, bool tr) {
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = WD + 8, LDW = C + 8, KS = WD / 16, NT = C / 8;
   extern __shared__ __align__(16) unsigned char smem[];
   half* Ws = (half*)smem; half* Xs = Ws + WD * LDW;
@@ -667,47 +667,49 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
 #pragma unroll
     for (int et = 0; et < NT; ++et) {
       int c = et * 8 + tig * 2;
-      float2* d = (float2*)(pair + p * C + c); float2 v = *d;
-      v.x += acc[et][half8 * 2]; v.y += acc[et][half8 * 2 + 1]; *d = v;
+      PT* d = pair + p * C + c; float2 v = ld2(d);
+      v.x += acc[et][half8 * 2]; v.y += acc[et][half8 * 2 + 1]; st2(d, v);
     }
   }
 }
 constexpr int GI_WARPS = 8, GO_WARPS = 8;
-template <int WARPS>
-void gridInAt(const float* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
+template <int WARPS, class PT = float>
+void gridInAt(const PT* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
               size_t rows, bool tr, const half* Wb, half* bias, int heads, int stride, bool swap) {
   constexpr int C = 128, NQ = 512, R = 16 * WARPS;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * C * (64 + 8) * 2 + (size_t)C * 24 * 2;
   static bool attr = false;
-  if (!attr) { smemAttr((gridInK<C, NQ, WARPS>), (int)smem); attr = true; }
-  gridInK<C, NQ, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+  if (!attr) { smemAttr((gridInK<C, NQ, WARPS, PT>), (int)smem); attr = true; }
+  gridInK<C, NQ, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wq), out, n, q0, rows, tr, Wb, bias, heads, stride,
     swap);
 }
 inline size_t gridInSmem(int warps) { return (size_t)16 * warps * (128 + 8) * 2 + (size_t)2 * 128 * (64 + 8) * 2 + (size_t)128 * 24 * 2; }
 inline size_t gridOutSmem(int warps) { return (size_t)128 * (128 + 8) * 2 + (size_t)16 * warps * (128 + 8) * 2; }
 inline bool gridFusedFits() { return fitsSmem(gridInSmem(2)) && fitsSmem(gridOutSmem(2)); }
-inline void gridIn128(const float* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
+template <class PT = float>
+inline void gridIn128(const PT* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
                       size_t rows, bool tr, const half* Wb = nullptr, half* bias = nullptr, int heads = 0,
                       int stride = 0, bool swap = false) {
   switch (warpsFitting(warpsFor(rows, {GI_WARPS, 4, 2}), {GI_WARPS, 4, 2}, gridInSmem)) {
-    case 2: gridInAt<2>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
-    case 4: gridInAt<4>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
-    default: gridInAt<GI_WARPS>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap);
+    case 2: gridInAt<2, PT>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
+    case 4: gridInAt<4, PT>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
+    default: gridInAt<GI_WARPS, PT>(pair, pre, wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap);
   }
 }
-template <int WARPS>
-void gridOutAt(const half* gathered, const std::string& w, float* pair, int n, size_t q0, size_t rows, bool tr) {
+template <int WARPS, class PT = float>
+void gridOutAt(const half* gathered, const std::string& w, PT* pair, int n, size_t q0, size_t rows, bool tr) {
   constexpr int C = 128, WD = 128, R = 16 * WARPS;
   size_t smem = (size_t)WD * (C + 8) * 2 + (size_t)R * (WD + 8) * 2;
   static bool attr = false;
-  if (!attr) { smemAttr((gridOutK<C, WD, WARPS>), (int)smem); attr = true; }
-  gridOutK<C, WD, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wh(w), pair, n, q0, rows, tr);
+  if (!attr) { smemAttr((gridOutK<C, WD, WARPS, PT>), (int)smem); attr = true; }
+  gridOutK<C, WD, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wh(w), pair, n, q0, rows, tr);
 }
-inline void gridOut128(const half* gathered, const std::string& w, float* pair, int n, size_t q0, size_t rows, bool tr) {
+template <class PT = float>
+inline void gridOut128(const half* gathered, const std::string& w, PT* pair, int n, size_t q0, size_t rows, bool tr) {
   switch (warpsFitting(warpsFor(rows, {GO_WARPS, 4, 2}), {GO_WARPS, 4, 2}, gridOutSmem)) {
-    case 2: gridOutAt<2>(gathered, w, pair, n, q0, rows, tr); break;
-    case 4: gridOutAt<4>(gathered, w, pair, n, q0, rows, tr); break;
-    default: gridOutAt<GO_WARPS>(gathered, w, pair, n, q0, rows, tr);
+    case 2: gridOutAt<2, PT>(gathered, w, pair, n, q0, rows, tr); break;
+    case 4: gridOutAt<4, PT>(gathered, w, pair, n, q0, rows, tr); break;
+    default: gridOutAt<GO_WARPS, PT>(gathered, w, pair, n, q0, rows, tr);
   }
 }

@@ -124,3 +124,63 @@ inline void benchGrid(int n) {
     printf("  %-16s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);
   }
 }
+// --bench-pair=N: the pair track's six hot pair kernels at N tokens with the pair stored in f32 and in bf16
+// (branch bf16-pair) - what a bf16 pair is worth, kernel by kernel, on pairformer block 0's weights. Each the
+// median of five rounds of ten launches (the pair is read-modify-written: its values drift, its cost does not).
+inline void benchPair(int n) {
+  using bf = __nv_bfloat16;
+  const std::string B = "trunk.pairformerBlocks.0", tri = B + ".triangleMultiplicationOutgoing", ga = B + ".pairAttention1";
+  const int C = 128, np = (n + 7) / 8 * 8;
+  size_t pairs = (size_t)n * n, cs = (size_t)np * np;
+  int heads = (int)M.meta(ga + ".heads"), D = (int)M.meta(ga + ".dimension"), Wd = heads * D;
+  int I = (int)(lenW(B + ".pairTransition.transition1") / (2 * (size_t)C));
+  float* pf = dalloc(pairs * C); bf* pb = dallocT<bf>(pairs * C);
+  { std::vector<float> h(pairs * C); uint64_t s = 1;
+    for (auto& v : h) { s = s * 6364136223846793005ull + 1442695040888963407ull; v = ((s >> 40) / 16777216.f - 0.5f); }
+    CK(cudaMemcpy(pf, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+    std::vector<bf> hb(h.size()); for (size_t i = 0; i < h.size(); ++i) hb[i] = __float2bfloat16(h[i]);
+    CK(cudaMemcpy(pb, hb.data(), hb.size() * 2, cudaMemcpyHostToDevice)); }
+  float* mask = dalloc(pairs); { std::vector<float> m(pairs, 1.f); CK(cudaMemcpy(mask, m.data(), pairs * 4, cudaMemcpyHostToDevice)); }
+  bf *a = dallocT<bf>(cs * C), *b = dallocT<bf>(cs * C), *prod = dallocT<bf>(cs * C);
+  half* t2 = dallocT<half>(cs * C);
+  CK(cudaMemset(prod, 0, cs * C * 2)); CK(cudaMemset(t2, 0, cs * C * 2));
+  half* qo = dallocT<half>((pairs + 128) * 4 * Wd); half* gathered = dallocT<half>(pairs * Wd);
+  CK(cudaMemset(gathered, 0, pairs * Wd * 2));
+  float* h16 = dalloc(pairs * 16);
+  std::string pg = projectionGate(tri, C), qkvg = qkvgWeight(ga, C, Wd, true);
+  auto time = [](const std::function<void()>& f) {
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    for (int k = 0; k < 3; ++k) f();
+    std::vector<float> r;
+    for (int round = 0; round < 5; ++round) {
+      cudaEventRecord(e0, STREAM); for (int k = 0; k < 10; ++k) f(); cudaEventRecord(e1, STREAM); cudaEventSynchronize(e1);
+      float ms; cudaEventElapsedTime(&ms, e0, e1); r.push_back(ms / 10);
+    }
+    std::sort(r.begin(), r.end()); return r[2];
+  };
+  struct Arm { const char* name; std::function<void()> f32, b16; };
+  std::vector<Arm> arms = {
+    {"triangle in (LN + projections)", [&] { triIn128<bf>(pf, mask, tri, pg, a, b, t2, n, np, cs); },
+                                       [&] { triIn128<bf, bf>(pb, mask, tri, pg, a, b, t2, n, np, cs); }},
+    {"triangle out (pair += ...)", [&] { triOut128<bf>(prod, tri, t2, pf, n, np, cs); },
+                                   [&] { triOut128<bf, bf>(prod, tri, t2, pb, n, np, cs); }},
+    {"grid in (LN + q/k/v/g)", [&] { gridIn128(pf, ga, qkvg, qo, n, 0, pairs, false); },
+                               [&] { gridIn128<bf>(pb, ga, qkvg, qo, n, 0, pairs, false); }},
+    {"grid out, column (pair += ...)", [&] { gridOut128(gathered, ga + ".outputProjection", pf, n, 0, pairs, true); },
+                                       [&] { gridOut128<bf>(gathered, ga + ".outputProjection", pb, n, 0, pairs, true); }},
+    {"pair transition (fused)", [&] { fusedTransition(pf, pairs, C, I, B + ".pairTransition"); },
+                                [&] { fusedTransition<bf>(pb, pairs, C, I, B + ".pairTransition"); }},
+    {"single track's pair bias", [&] { lnHeads128<16>(pf, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset",
+                                                      B + ".singlePairLogitsProjection", h16, pairs); },
+                                 [&] { lnHeads128<16, bf>(pb, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset",
+                                                          B + ".singlePairLogitsProjection", h16, pairs); }},
+  };
+  printf("bench-pair at %d tokens (ms a launch, median of five rounds of ten)\n", n);
+  double tf = 0, tb = 0;
+  for (auto& arm : arms) {
+    float x = time(arm.f32), y = time(arm.b16);
+    tf += x; tb += y;
+    printf("  %-34s f32 %7.3f  bf16 %7.3f  saves %6.3f (%4.1f%%)\n", arm.name, x, y, x - y, 100 * (x - y) / x);
+  }
+  printf("  %-34s f32 %7.3f  bf16 %7.3f  saves %6.3f\n", "all six once", tf, tb, tf - tb);
+}

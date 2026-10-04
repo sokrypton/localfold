@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
@@ -1110,10 +1111,23 @@ template <class T> constexpr cudaDataType cudaType() {
   return std::is_same_v<T, float> ? CUDA_R_32F : CUDA_R_16F;
 }
 template <class T> __device__ __forceinline__ float toF(T v) {
-  if constexpr (std::is_same_v<T, float>) return v; else return __half2float(v);
+  if constexpr (std::is_same_v<T, float>) return v;
+  else if constexpr (std::is_same_v<T, __nv_bfloat16>) return __bfloat162float(v);
+  else return __half2float(v);
 }
 template <class T> __device__ __forceinline__ T fromF(float v) {
-  if constexpr (std::is_same_v<T, float>) return v; else return __float2half(v);
+  if constexpr (std::is_same_v<T, float>) return v;
+  else if constexpr (std::is_same_v<T, __nv_bfloat16>) return __float2bfloat16(v);
+  else return __float2half(v);
+}
+// two adjacent channels of a pair stored as PT (float, or bf16 - branch bf16-pair), read and written as float2
+template <class PT> __device__ __forceinline__ float2 ld2(const PT* p) {
+  if constexpr (std::is_same_v<PT, float>) return *reinterpret_cast<const float2*>(p);
+  else return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
+}
+template <class PT> __device__ __forceinline__ void st2(PT* p, float2 v) {
+  if constexpr (std::is_same_v<PT, float>) *reinterpret_cast<float2*>(p) = v;
+  else *reinterpret_cast<__nv_bfloat162*>(p) = __float22bfloat162_rn(v);
 }
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x)); }
 
