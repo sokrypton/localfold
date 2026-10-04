@@ -233,10 +233,10 @@ export class Af3DiffusionHeadGpu {
   /**
    * The transformer, kept rather than rebuilt per call.
    *
-   * 🔴 IT HOLDS THE NORMALISED PAIR CONDITIONING, and that is the point: a
-   * fresh instance per step has nothing to remember, so the stack re-uploaded
-   * and re-normalised a tokens^2 x 128 tensor on every one of them. See
-   * Af3DiffusionTransformerGpu's #pairNorm.
+   * 🔴 IT HOLDS THE PER-BLOCK PAIR LOGITS, and that is the point: a fresh
+   * instance per step has nothing to remember, so the stack re-uploaded and
+   * re-projected a tokens^2 x 128 tensor on every one of them. See
+   * Af3DiffusionTransformerGpu's #pairLogits.
    */
   #transformer;
 

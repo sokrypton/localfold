@@ -601,34 +601,6 @@ fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
 fn swish(value: f32) -> f32 { return value / (1.0 + exp(-value)); }
 `;
 
-  // The shared LayerNorm over the pair conditioning. Two-pass, no offset.
-  const normalisePair = `
-const PAIRS: u32 = ${pairs}u;
-const C_PAIR: u32 = ${pairChannels}u;
-const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
-const EPSILON: f32 = 1.0e-5;
-@group(0) @binding(0) var<storage, read> pair_cond: array<f32>;
-@group(0) @binding(1) var<storage, read> scale: array<f32>;
-@group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
-  let base = row * C_PAIR;
-  var total = 0.0;
-  for (var c = 0u; c < C_PAIR; c += 1u) { total += pair_cond[base + c]; }
-  let mean = total / f32(C_PAIR);
-  var variance = 0.0;
-  for (var c = 0u; c < C_PAIR; c += 1u) {
-    let d = pair_cond[base + c] - mean;
-    variance += d * d;
-  }
-  let inverse_std = inverseSqrt(variance / f32(C_PAIR) + EPSILON);
-  for (var c = 0u; c < C_PAIR; c += 1u) {
-    normalized[base + c] = (pair_cond[base + c] - mean) * inverse_std * scale[c];
-  }
-}`;
-
   // One super-block's projection, unpacked into per-block head-major logits.
   // 🔴 THE PROJECTION IS (pair, blocksPerSuper, heads) and the attention wants
   // (head, i, j) - so this pass is where the six-by-four nesting is resolved.
@@ -649,21 +621,34 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   const pairLogitsFor = (inner, perSuper) => `${common}
 const INNER: u32 = ${inner}u;
 const PER_SUPER: u32 = ${perSuper}u;
-@group(0) @binding(0) var<storage, read> normalized: array<f32>;
+@group(0) @binding(0) var<storage, read> pair_cond: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
 // ...as vec4, which is why the column base must be a multiple of four: it is
 // c * PER_SUPER * HEADS + INNER * HEADS, and HEADS is sixteen.
-@group(0) @binding(1) var<storage, read> projection: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(2) var<storage, read> projection: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> logits: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x + id.y * GRID_WIDTH * 64u;
   if (row >= PAIRS) { return; }
   let base = row * C_PAIR;
+  // The pair LayerNorm (two-pass, no offset), in the row's own thread: a
+  // normalised copy of the pair would be one more pair-sized tensor held for
+  // a pass that, cached, runs once a block a schedule.
+  var sum = 0.0;
+  for (var c = 0u; c < C_PAIR; c += 1u) { sum += pair_cond[base + c]; }
+  let mean = sum / f32(C_PAIR);
+  var variance = 0.0;
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    let d = pair_cond[base + c] - mean;
+    variance += d * d;
+  }
+  let inverse_std = inverseSqrt(variance / f32(C_PAIR) + EPSILON);
   ${overHeadVectors((h) => `var total${h} = vec4<f32>(0.0);`)}
   for (var c = 0u; c < C_PAIR; c += 1u) {
     // ...read once, used by every head.
-    let x = normalized[base + c];
+    let x = (pair_cond[base + c] - mean) * inverse_std * scale[c];
     let column = (c * PER_SUPER * HEADS + INNER * HEADS) / 4u;
     ${overHeadVectors((h) => `total${h} += x * projection[column + ${h}u];`)}
   }
@@ -1928,7 +1913,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   gate[index] = sg;
 }`;
 
-  return { normalisePair, normaliseCond, pairLogitsFor, adaln, qkvg, qkvgReduce, attend, attentionOutput,
+  return { normaliseCond, pairLogitsFor, adaln, qkvg, qkvgReduce, attend, attentionOutput,
            adalnReduce, ffwAdalnReduce, normKSplits,
            normPartialFloats: normKSplits > 1 ? normKSplits * 2 * rows * channels : 0,
            attentionOutputReduce, attnKSplits,
@@ -2025,28 +2010,18 @@ export function derivedSplitRule({ measuredWidth, rows, channels, width, lanes, 
 
 export class Af3DiffusionTransformerGpu {
   /**
-   * The normalised pair conditioning, kept across calls.
-   *
-   * 🔴 NEITHER THE PAIR CONDITIONING NOR ITS LAYERNORM READS THE NOISE LEVEL.
-   * The stack's twenty-four blocks all read one normalised pair tensor, built
-   * by a single pass at the top of the call - and a sampler was uploading the
-   * unnormalised tokens^2 x 128 tensor and running that pass again on every
-   * step, for the identical bytes. At 59 tokens that is 1.8 MB across the bus
-   * and a 3481 x 128 layer norm, two hundred times; at 256 tokens, 34 MB.
-   *
-   * Keyed on the array's identity, which is the same question the diffusion
-   * head asks of its own pair cache: a new fold brings a new array. The buffer
-   * lives outside the pooled allocator, because a pooled one is recycled when
-   * the call that took it ends.
+   * The pair conditioning #pairLogits were computed from - by identity, since
+   * the head hands the same tensor to every call of a schedule. `undefined`
+   * until the submit that fills the logits.
    */
-  #pairNorm;
+  #pairCondSeen;
 
   /**
    * The per-block pair attention biases, for the whole SCHEDULE.
    *
    * 🔴 THEY WERE RECOMPUTED ONCE A CALL FOR THE IDENTICAL ANSWER. The
-   * pair-logits pass reads #pairNorm - which is the trunk's, built once and
-   * held - and the super-block's `pairLogitsProjection`, which is a weight.
+   * pair-logits pass reads the pair conditioning - which is the trunk's, built
+   * once and held - and the super-block's `pairLogitsProjection`, which is a weight.
    * Neither moves with the noise level, so twenty-four passes an hour of the
    * fold produced bit-for-bit what the previous call produced. Measured at 200
    * tokens with tools/gpu/fold.js --profile --profile-from=trunk-done, that is
@@ -2060,8 +2035,7 @@ export class Af3DiffusionTransformerGpu {
    *
    * `ready` is set only after the submit that fills them, because run()
    * restarts the whole call on a budget refusal and a cache that merely EXISTS
-   * would then be handed to attend uninitialised - the same trap #pairNorm's
-   * `pairCond` guards against.
+   * would then be handed to attend uninitialised.
    */
   #pairLogits;
 
@@ -2116,8 +2090,6 @@ export class Af3DiffusionTransformerGpu {
     this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
   }
 
-  /** Give back the normalised pair tensor. Callers that keep an instance own this. */
-  /** Give back the normalised pair tensor alone. */
   #releasePairLogits() {
     if (this.#pairLogits === undefined) return;
     for (const buffer of this.#pairLogits.buffers) {
@@ -2125,15 +2097,7 @@ export class Af3DiffusionTransformerGpu {
       noteDestroy(this.device, this.#pairLogits.bytes, "difftx.pair-logits");
     }
     this.#pairLogits = undefined;
-    this.#bindGroups.clear();
-  }
-
-  #releasePairNorm() {
-    this.#releasePairLogits();
-    if (this.#pairNorm === undefined) return;
-    this.#pairNorm.buffer.destroy();
-    noteDestroy(this.device, this.#pairNorm.bytes, "difftx.pair-norm");
-    this.#pairNorm = undefined;
+    this.#pairCondSeen = undefined;
     this.#bindGroups.clear();
   }
 
@@ -2147,10 +2111,6 @@ export class Af3DiffusionTransformerGpu {
       }
       this.#scratch = undefined;
     }
-    if (this.#pairNorm === undefined) return;
-    this.#pairNorm.buffer.destroy();
-    noteDestroy(this.device, this.#pairNorm.bytes, "difftx.pair-norm");
-    this.#pairNorm = undefined;
   }
 
   /**
@@ -2518,8 +2478,14 @@ export class Af3DiffusionTransformerGpu {
         budgetBytes: memoryBudgetBytes(this.device),
         residentBytes: memoryTotals(this.device).residentBytes,
         bytes: batchedBytes });
+    // 🔴 NOT WHILE THE SAMPLER STREAMS, whatever a prior says: streaming is
+    // the mode for a device short of room, and there the batch is the largest
+    // thing a call holds - the decoded gate weights of every block at once
+    // plus four per-block outputs, 297 MiB of a 1093 MiB stock AF3 peak at 262
+    // tokens - for 4-5% of a warm fold (3.00 -> 3.11-3.17 s).
     const batchedGates = (weights.batchedGates
-      ?? deviceTuning(this.device).diffusionBatchedGates ?? affordable) === true;
+      ?? (isStreamed(this.device, "difftx.") ? false
+        : deviceTuning(this.device).diffusionBatchedGates ?? affordable)) === true;
     // See the note in the shader factory: this kernel wants the OPPOSITE of
     // what every other kernel here wants, because the block axis already fills
     // the device and weight bandwidth is what binds it.
@@ -2743,42 +2709,6 @@ export class Af3DiffusionTransformerGpu {
         : scratch("difftx.flash-partial", flashSplits * samples * tokens * width * 4, storage);
       const flashStats = flashPartial === null ? null
         : scratch("difftx.flash-stats", flashSplits * samples * tokens * heads * 8, storage);
-      // See #pairNorm: everything on this line and the two below it is the
-      // trunk's, not the step's, and is skipped outright when the caller keeps
-      // this instance across a schedule.
-      const normBytes = pairs * pairChannels * 4;
-      const buildPairNorm = this.#pairNorm?.pairCond !== pairCond
-        || this.#pairNorm?.bytes !== normBytes;
-      if (buildPairNorm) {
-        // 🔴 THE PAIR NORM ALONE, NOT dispose(). The scratch set was created
-        // three lines above and its buffers are already bound into this call's
-        // command encoder; dropping it here destroyed a buffer the submit then
-        // used, which WebGPU reports at the end of the stack rather than here.
-        this.#releasePairNorm();
-        noteAllocation(this.device, "difftx.pair-norm", normBytes);
-        // 🔴 `pairCond` IS NOT SET UNTIL THE PASS THAT FILLS THIS HAS BEEN
-        // SUBMITTED. An allocation between here and there can refuse on
-        // budget, and run() retries the whole call - which would find a cache
-        // that matches and skip the norm, handing twenty-four blocks an
-        // uninitialised buffer.
-        this.#pairNorm = {
-          pairCond: undefined, bytes: normBytes,
-          buffer: this.device.createBuffer({
-            label: "difftx.pair-norm", size: normBytes, usage: storage,
-          }),
-        };
-      }
-      const normalized = { buffer: this.#pairNorm.buffer };
-      // A pair conditioning already on the device is bound, not uploaded.
-      // (`instanceof`, because a Float32Array has a `.buffer` too.)
-      const pairBuffer = !buildPairNorm ? undefined
-        : typeof GPUBuffer !== "undefined" && pairCond?.buffer instanceof GPUBuffer
-          ? { buffer: pairCond.buffer }
-          : keep(this.allocator.upload("difftx.pair", pairCond, storage));
-      const pairScale = buildPairNorm
-        ? keep(this.allocator.upload("difftx.pair-scale",
-                                     weights.pairInputLayerNormScale, storage))
-        : undefined;
       // See #pairLogits: one buffer a block, held for the schedule, because
       // nothing the pair-logits pass reads moves with the noise level.
       const logitsBytes = heads * pairs * 4;
@@ -2795,10 +2725,22 @@ export class Af3DiffusionTransformerGpu {
         ?? PAIR_LOGITS_CACHE_BYTES);
       const cached = Math.max(0,
         Math.min(blockCount, Math.floor(cacheBytes / logitsBytes)));
-      const buildPairLogits = buildPairNorm
+      const buildPairLogits = this.#pairCondSeen !== pairCond
         || this.#pairLogits?.ready !== true
         || this.#pairLogits.bytes !== logitsBytes
         || this.#pairLogits.buffers.length !== cached;
+      // The pair conditioning and its LayerNorm scale, for every call that
+      // computes a block's logits. One already on the device is bound, not
+      // uploaded. (`instanceof`, because a Float32Array has a `.buffer` too.)
+      const computesLogits = buildPairLogits || cached < blockCount;
+      const pairBuffer = !computesLogits ? undefined
+        : typeof GPUBuffer !== "undefined" && pairCond?.buffer instanceof GPUBuffer
+          ? { buffer: pairCond.buffer }
+          : keep(this.allocator.upload("difftx.pair", pairCond, storage));
+      const pairScale = computesLogits
+        ? scratch("difftx.pair-scale", pairChannels * 4, storage | GPUBufferUsage.COPY_DST)
+        : undefined;
+      if (computesLogits) write(pairScale, weights.pairInputLayerNormScale);
       if (buildPairLogits) {
         this.#releasePairLogits();
         const buffers = [];
@@ -2884,26 +2826,6 @@ export class Af3DiffusionTransformerGpu {
       // denoiser step at the one boundary that already synchronises.
       const validation = options.validation
         ?? new DeferredValidation(this.device, "diffusion transformer");
-      // The shared pair LayerNorm, once for the whole stack - and once for the
-      // whole SCHEDULE, since nothing it reads moves with the noise level.
-      if (buildPairNorm) {
-        validation.begin();
-        const encoder = this.device.createCommandEncoder({ label: "difftx.pair-norm" });
-        const pass = encoder.beginComputePass({ label: "pair-norm" });
-        pass.setPipeline(compiled.normalisePair);
-        pass.setBindGroup(0, this.device.createBindGroup({
-          layout: compiled.normalisePair.getBindGroupLayout(0),
-          entries: [pairBuffer, pairScale, normalized].map((allocation, binding) => ({
-            binding, resource: { buffer: allocation.buffer },
-          })),
-        }));
-        const groups = Math.ceil(pairs / 64);
-        pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
-        pass.end();
-        this.device.queue.submit([encoder.finish()]);
-        validation.end("pair layer norm");
-        this.#pairNorm.pairCond = pairCond;
-      }
 
       // 🔴 AND THE CONDITIONING'S NORM, ONCE FOR THE WHOLE CALL, for the same
       // reason the pair norm above is: nothing it reads moves with the block.
@@ -3166,7 +3088,7 @@ export class Af3DiffusionTransformerGpu {
           if (buildPairLogits || at >= cached) {
             const pairGroups = Math.ceil(pairs / 64);
             runBlock("pair-logits", compiled.pairLogits[inner],
-                [normalized, projection, logits],
+                [pairBuffer, pairScale, projection, logits],
                 Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));
           }
           if (normKSplits > 1) {
@@ -3312,6 +3234,7 @@ export class Af3DiffusionTransformerGpu {
       // ...only now, because a refusal anywhere above restarts the call and a
       // cache marked ready before it is filled is one attend reads as noise.
       this.#pairLogits.ready = true;
+      this.#pairCondSeen = pairCond;
       // 🔴 THE PAIR PROJECTIONS ARE RELEASED AFTER THE SUBMIT, NOT INSIDE THE
       // LOOP. They are pooled, so releasing one while a later block's encoded
       // pass still refers to it would hand the same buffer to that block's

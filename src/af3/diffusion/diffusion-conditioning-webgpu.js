@@ -707,8 +707,6 @@ export class Af3DiffusionConditioningGpu {
       pairInitial: reusePair !== undefined ? undefined
         : this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
       singleInitial: this.pipelines.get(`${base}:single-initial`, sources.singleInitial),
-      addPair: reusePair !== undefined ? undefined
-        : this.pipelines.get(`${base}:add-pair`, createAddShader(pairs * pairChannels)),
       addSingle: this.pipelines.get(`${base}:add-single`,
         createAddShader(tokens * seqChannels)),
     };
@@ -717,7 +715,7 @@ export class Af3DiffusionConditioningGpu {
     for (let index = 0; index < 2; index += 1) {
       transitionPipelines.pair.push(reusePair !== undefined ? undefined
         : this.pipelines.get(`${base}:pair-transition:${index}`,
-            createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2 },
+            createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2, residual: true },
                                    prepared.pairTransitions[index].offsets, 1e-5, "two-pass")));
       // 🔴 THE SINGLE TRANSITION IS `tokens` ROWS AND THE KERNEL DISPATCHES
       // ROWS ONLY, so at 68 tokens it runs 68 workgroups of the default 128
@@ -876,8 +874,6 @@ export class Af3DiffusionConditioningGpu {
         ? keep(this.allocator.allocate("cond.single", tokens * seqChannels * 4,
             storage | GPUBufferUsage.COPY_SRC))
         : { buffer: outSingle };
-      const pairScratch = onlyIfNew(() => keep(this.allocator.allocate("cond.pair-scratch",
-        pairs * pairChannels * 4, storage)));
       const singleScratch = keep(this.allocator.allocate("cond.single-scratch",
         tokens * seqChannels * 4, storage));
       const readPair = outPair !== undefined ? undefined
@@ -942,7 +938,6 @@ export class Af3DiffusionConditioningGpu {
           [trunkSingle, targetFeat, singleScale, singleProjection, noise, noiseWeights, single],
           tokens);
 
-      const pairAdd = spread(Math.ceil(pairs * pairChannels / 64));
       const singleAdd = spread(Math.ceil(tokens * seqChannels / 64));
       // `transitions: 0` stops after the initial projections, which is how the
       // closed-form relative-encoding path is checked on its own.
@@ -950,9 +945,10 @@ export class Af3DiffusionConditioningGpu {
       for (let index = 0; index < transitionCount; index += 1) {
         if (reusePair === undefined) {
           const perPair = spread(Math.ceil(pairs / transitionRowTile(pairs, pairChannels)));
+          // In place (the kernel's residual form): a delta written to a
+          // pair-sized scratch and added back was one more pair tensor held.
           run(`pair-transition-${index}`, transitionPipelines.pair[index],
-              [pair, transitionWeights.pair[index], pairScratch], perPair[0], perPair[1]);
-          run(`pair-add-${index}`, compiled.addPair, [pair, pairScratch], pairAdd[0], pairAdd[1]);
+              [pair, transitionWeights.pair[index]], perPair[0], perPair[1]);
         }
         run(`single-transition-${index}`, transitionPipelines.single[index],
             [single, transitionWeights.single[index], singleScratch],
