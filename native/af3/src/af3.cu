@@ -291,7 +291,8 @@ int main(int argc, char** argv) {
     // A recycle pass is ~1000 launches with identical shapes and pointers, so from the second pass on
     // it replays as one CUDA graph, captured from that pass (the first has sized every scratch buffer)
     auto recyclePass = [&]() {
-      CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      if (!t.prevPair) { t.prevPair = t.pair; t.pair = dalloc(pairs * t.C); }   // (embed gave it back: hand it the pair)
+      else CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
       CK(cudaMemcpyAsync(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
       if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
     };
@@ -340,7 +341,7 @@ int main(int argc, char** argv) {
     CK(cudaDeviceSynchronize());
     // the recycled pair is the trunk's alone: on a card short of room it is given back for the
     // diffusion and the confidence head (3.5 GB at 2620 tokens)
-    if (shortPair(pairs, t.C)) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }
+    if (shortPair(pairs, t.C) && t.prevPair) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }
     releaseConcatCopies(); memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below
@@ -399,6 +400,12 @@ int main(int argc, char** argv) {
     // tokens, held through every step). Not the conditioning's chunk buffers (dc.f2*, pt.*): they are
     // CHUNK-sized whatever the length, and giving them back cost 16 ms of a 100 ms diffusion at 525
     if (tight) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln" });
+    // ...and on a card short of room the conditioning pair itself: the steps read the precomputed
+    // single conditioning, the prepared encoder and the cached logits, never the pair (DCACHE stays
+    // ready - its single base is what a later batch's precompute reads)
+    if (shortPair((size_t)nD * nD, (int)M.meta("diffusion.conditioning.pairChannels"))) {
+      releaseScratch({ "dc.pair" }); DCACHE.pair = nullptr;
+    }
     releaseConcatCopies(); memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
     // confidence head and ranked by AF3's ranking score (src/scores.cuh). A seed's samples run as one

@@ -488,6 +488,15 @@ __global__ void flatToBiasHalfK(const float* flat, half* out, int block, int nbl
   int j = (int)(t % stride); size_t rest = t / stride; int i = (int)(rest % n), h = (int)(rest / n);
   out[t] = __float2half(j < n ? flat[((size_t)i * n + j) * nblocks * heads + block * heads + h] * LOG2E : 0.f);
 }
+// the same over rows [i0, i0 + ri) of i, from a flat chunk holding only those rows
+__global__ void flatToBiasHalfRowsK(const float* flat, half* out, int block, int nblocks, int heads, int n, int stride,
+                                    int i0, int ri) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)heads * ri * stride) return;
+  int j = (int)(t % stride); size_t rest = t / stride; int ii = (int)(rest % ri), h = (int)(rest / ri);
+  out[((size_t)h * n + i0 + ii) * stride + j] =
+    __float2half(j < n ? flat[((size_t)ii * n + j) * nblocks * heads + block * heads + h] * LOG2E : 0.f);
+}
 struct TransformerCache {
   bool ready = false; int n = 0, nblocks = 0;
   std::vector<float*> pairLogits;      // [h][i][j] per block
@@ -542,6 +551,30 @@ inline void prepareTransformer(const float* pairCond, int n) {
     deviceWeight(tc.wNorm, wn, (size_t)Ca * ldn); deviceWeight(tc.wRaw, wr, (size_t)Ca * ldr);
   }
   // the pair logits of every block, from the (fold-constant) pair conditioning
+  tc.stride = (n + 7) / 8 * 8;
+  if (DIFF_HALF && shortPair(pairs, Cz)) {
+    // on a card short of room in row chunks, a super block at a time: the normalised pair and its
+    // projection held for a chunk of rows rather than whole (4.5 GB at 2096 tokens, alive beside the
+    // biases they make), the LayerNorm recomputed per super block
+    tc.pairLogits.assign(tc.nblocks, nullptr);
+    tc.biasHalf.assign(tc.nblocks, nullptr);
+    for (int b = 0; b < tc.nblocks; ++b)
+      tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(b), (size_t)heads * n * tc.stride);
+    int ri = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(Cz, perSuper * heads))));
+    float* pnc = scratch<float>("dt.pn", (size_t)ri * n * Cz);
+    float* flatc = scratch<float>("dt.flat", (size_t)ri * n * perSuper * heads);
+    for (int sb = 0; sb * perSuper < tc.nblocks; ++sb)
+      for (int i0 = 0; i0 < n; i0 += ri) {
+        int r = std::min(ri, n - i0); size_t rows = (size_t)r * n;
+        layerNormSlow(pairCond + (size_t)i0 * n * Cz, pnc, rows, Cz, W(T + ".pairInputLayerNormScale"), nullptr);
+        linear<float, float>(pnc, flatc, rows, Cz, perSuper * heads, T + ".superBlocks." + std::to_string(sb) + ".pairLogitsProjection");
+        for (int b = sb * perSuper; b < std::min(tc.nblocks, (sb + 1) * perSuper); ++b)
+          flatToBiasHalfRowsK<<<blocks((size_t)heads * r * tc.stride), 256, 0, STREAM>>>(flatc, tc.biasHalf[b], b % perSuper,
+                                                                                    perSuper, heads, n, tc.stride, i0, r);
+      }
+    tc.n = n; tc.ready = true;
+    return;
+  }
   float* pn = scratch<float>("dt.pn", pairs * Cz);
   layerNormSlow(pairCond, pn, pairs, Cz, W(T + ".pairInputLayerNormScale"), nullptr);
   float* flat = scratch<float>("dt.flat", pairs * perSuper * heads);
@@ -814,6 +847,7 @@ struct DiffusionFold {
 inline bool GRAPHS = true;
 // the denoiser's seams against a stage oracle (oracle.stages.stages.<name>), when one was exported
 inline void dtap(const char* name, const float* d, size_t n) {
+  if (!d) return;                 // (a tensor given back: the conditioning pair of a large fold)
   std::string k = std::string("oracle.stages.stages.") + name;
   cudaStreamCaptureStatus capturing;
   CK(cudaStreamIsCapturing(STREAM, &capturing));

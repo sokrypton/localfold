@@ -219,6 +219,9 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   for (int k = 0; k < nb; ++k)
     if (CONF_HALF) pairformerBlockAt<half>(pair, single, pairMask, seqMask, n, C, Cs, P + ".blocks." + std::to_string(k), swap, divide);
     else pairformerBlockAt<float>(pair, single, pairMask, seqMask, n, C, Cs, P + ".blocks." + std::to_string(k), swap, divide);
+  // on a card short of room the stack's scratch goes before the heads allocate theirs, so the two peak
+  // apart rather than together
+  if (shortPair(pairs, C)) releaseScratch({ "tri.", "grid.", "tr.", "st." });
   // the error bins: 64 of them up to 31 A, the last one step past the second-to-last
   const int NB = 64; double step = 31.0 / (NB - 2);
   std::vector<float> centres(NB);

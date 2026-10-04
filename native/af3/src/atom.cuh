@@ -793,10 +793,15 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   if (trunkPair) {
     int Cz = (int)M.meta(E + ".trunkPairChannels");
     size_t pairs = (size_t)sh.tokens * sh.tokens;
-    float* ln = scratch<float>("enc.tpln", pairs * Cz);
-    layerNormSlow(trunkPair, ln, pairs, Cz, W(E + ".lnormTrunkPairCondScale"), Wopt(E + ".lnormTrunkPairCondOffset"));
+    // (in row chunks on a card short of room: the normalised pair is read once, by this projection)
+    size_t per = shortPair(pairs, Cz) ? std::max<size_t>(1, std::min(pairs, CHUNK / Cz)) : pairs;
+    float* ln = scratch<float>("enc.tpln", per * Cz);
     tp = scratch<float>("enc.tp", pairs * Cp);
-    linear<float, float>(ln, tp, pairs, Cz, Cp, E + ".embedTrunkPairCond");
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNormSlow(trunkPair + r0 * Cz, ln, r, Cz, W(E + ".lnormTrunkPairCondScale"), Wopt(E + ".lnormTrunkPairCondOffset"));
+      linear<float, float>(ln, tp + r0 * Cp, r, Cz, Cp, E + ".embedTrunkPairCond");
+    }
   }
   float* qPos = scratch<float>("enc.qPos", qRows * 3); float* kPos = scratch<float>("enc.kPos", kRows * 3);
   float* qUid = scratch<float>("enc.qUid", qRows); float* kUid = scratch<float>("enc.kUid", kRows);

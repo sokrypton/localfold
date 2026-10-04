@@ -139,10 +139,18 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   linear<float, float>(pairSource, right, n, sourceWidth, C, E + "rightSingle");
   outerSumK<<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C);
   onSeam("z_before_prev", t.pair, pairs * C);
-  // the recycled pair: LayerNorm then projection, which is NOT zero on the first pass
-  T* ln = scratch<T>("emb.prevln", pairs * C);
-  layerNorm2<float, T>(t.prevPair, ln, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
-  linear<T, float>(ln, t.pair, pairs, C, C, E + "prevEmbedding", false, 1.f);
+  // the recycled pair: LayerNorm then projection, which is NOT zero on the first pass - on a card short
+  // of room in row chunks, and the recycled pair given back once read (runTrunk's caller hands the
+  // next pass the pair itself rather than a copy: see recyclePass in af3.cu)
+  bool tight = shortPair(pairs, C);
+  size_t per = tight ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
+  T* ln = scratch<T>("emb.prevln", per * C);
+  for (size_t r0 = 0; r0 < pairs; r0 += per) {
+    size_t r = std::min(per, pairs - r0);
+    layerNorm2<float, T>(t.prevPair + r0 * C, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
+    linear<T, float>(ln, t.pair + r0 * C, r, C, C, E + "prevEmbedding", false, 1.f);
+  }
+  if (tight) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }
   onSeam("z_after_prev", t.pair, pairs * C);
   relativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(
     Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
@@ -222,13 +230,23 @@ void templateEmbedding(Trunk& t, float* out) {
   if (fused && lenW(P + "aProjection") != (size_t)width * Ct) {
     fprintf(stderr, "template features are %d wide, the projection takes %zu\n", width, lenW(P + "aProjection") / Ct); exit(1);
   }
-  T* ln = scratch<T>("tmpl.ln", pairs * Cq);
-  layerNorm2<float, T>(t.pair, ln, pairs, Cq, P + "queryEmbeddingNormScale", P + "queryEmbeddingNormOffset");
-  float* query = scratch<float>("tmpl.query", pairs * Ct);
-  linear<T, float>(ln, query, pairs, Cq, Ct, P + (fused ? "zProjection" : "templatePairEmbedding8"));
+  // The query term, LN(pair) projected - the same for every pass. On a card short of room it is not
+  // kept: each pass recomputes it into its activation in row chunks (the normalised pair is read once,
+  // by the projection), which is a pair-sized tensor fewer for a LayerNorm and a narrow GEMM a pass.
+  bool tight = shortPair(pairs, Cq);
+  size_t per = tight ? std::max<size_t>(1, std::min(pairs, CHUNK / Cq)) : pairs;
+  T* ln = scratch<T>("tmpl.ln", per * Cq);
+  auto queryInto = [&](float* dst) {
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNorm2<float, T>(t.pair + r0 * Cq, ln, r, Cq, P + "queryEmbeddingNormScale", P + "queryEmbeddingNormOffset");
+      linear<T, float>(ln, dst + r0 * Ct, r, Cq, Ct, P + (fused ? "zProjection" : "templatePairEmbedding8"));
+    }
+  };
+  float* query = tight ? nullptr : scratch<float>("tmpl.query", pairs * Ct);
+  if (!tight) queryInto(query);
   float* act = scratch<float>("tmpl.act", pairs * Ct);
   float* before = outer ? scratch<float>("tmpl.before", pairs * Ct) : nullptr;
-  float* normed = scratch<float>("tmpl.normed", pairs * Ct);
   float* summed = scratch<float>("tmpl.summed", pairs * Ct);
   CK(cudaMemsetAsync(summed, 0, pairs * Ct * 4, STREAM));
   float* oh = scratch<float>("tmpl.onehot", (size_t)n * 31);
@@ -238,7 +256,8 @@ void templateEmbedding(Trunk& t, float* out) {
     std::string S = "template." + std::to_string(k) + ".";
     float repeat = (float)M.meta(S + "repeat");
     if (repeat == 0.f) continue;                // a slot weighed zero (boltz2's empty ones)
-    CK(cudaMemcpyAsync(act, query, pairs * Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
+    if (tight) queryInto(act);
+    else CK(cudaMemcpyAsync(act, query, pairs * Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
     if (fused) {
       linear<float, float>(Fdev(S + "features"), act, pairs, width, Ct, P + "aProjection", false, 1.f);
     } else {
@@ -262,8 +281,10 @@ void templateEmbedding(Trunk& t, float* out) {
       pairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor);
     }
     if (outer) addK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, before, pairs * Ct);
-    layerNorm2<float, float>(act, normed, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");
-    addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, normed, repeat, pairs * Ct);
+    // in place: act is the pass's own and is written afresh by the next (one warp a row, each lane
+    // reading an element before writing it)
+    layerNorm2<float, float>(act, act, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");
+    addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
   }
   // divided by every slot (not the real ones), relu, projected
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);

@@ -555,22 +555,33 @@ the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2
 ## How large a fold fits
 
 Measured on the A100 (40 GB, `peak` sampled from the device every 0.1 s, one fold, 25 steps, single
-sequence), after the trunk gives back each stage's scratch, the template stack's triangle buffers, the
-pair track's own before the next pass, and the recycled pair after the trunk:
+sequence). On a card short of room (`shortPair`: the pair over a 64th of the card) every stage gives
+back what it alone used as soon as it is done, and what is read once is computed in row chunks rather
+than held whole: the recycled pair (handed to the next pass rather than copied, freed once the
+embedder has read it), the embedder's and the template query's normalised pairs, the template stack's
+output norm (in place) and its 64-channel triangle buffers, the pair track's scratch before the next
+pass's template stack, the conditioning pair after the diffusion is prepared, the encoder's and the
+transformer's normalised pairs (the transformer's a super block and a chunk of rows at a time), and
+the confidence stack's scratch before its heads. Every fold measured byte-identical to the build
+before - the chunking changes no sum.
 
-| tokens | peak | trunk (4 passes) | whole fold |
+| tokens | peak, start of the pass | peak now | whole fold |
 |---:|---:|---:|---:|
-| 1572 | 12.9 GB | 22.1 s | 23 s |
-| 2096 | 19.4 GB | 47.5 s | 49 s |
-| 2620 | 27.7 GB | 88.1 s | 91 s |
-| 3144 | 37.8 GB | 144.2 s | 149 s |
+| 1572 | 15.9 GB | **10.2 GB** | 23 s |
+| 2096 | 24.7 GB | **13.9 GB** | 49 s |
+| 2620 | 36.0 GB | **19.2 GB** | 91 s |
+| 3144 | (did not fit beside the 2620 figures' trend) | **25.6 GB** | 149 s |
+| 3668 | - | **33.6 GB** | 242 s |
 
-The peak is about **4.6 GB + 3.36 GB per million token pairs**, which puts the ceiling at **~1720
-tokens on a T4** (15 GB), **~2270 on an L4** (22.5 GB), **~3200 on a 40 GB A100** and **~4700 on an
-80 GB one** - the last at roughly eight minutes of trunk. The T4 figure is measured, not fitted: with a
-second process holding all but 14.6 GiB of this card, 1725 tokens folds and 1750 runs out (above 1135
-tokens the A100 takes the same low-memory paths a T4 does). Before this pass 1572 tokens peaked at
-15.9 GB and 2620 at 36.0; the template stack allocating beside the previous pass's pair-track buffers
-was the peak (17.71 GB at 1572, in `LOCALFOLD_MEM=1`'s per-stage lines). The WebGPU page stops
-earlier and for a different reason: every pair-sized dispatch binds `tokens^2 x channels` floats
-against a 2 GiB binding limit on NVIDIA, so 2047 tokens for AF3 and 1023 for IntelliFold-2.
+The peak is now about **4.4 GB + 2.17 GB per million token pairs** (it was 3.36), so the ceiling is
+**~2200 tokens on a T4** (15 GB) - measured: with a second process holding all but 14.6 GiB of this
+card, 2200 folds and 2250 runs out, where 1725 was the limit before - **~2850 on an L4** (22.5 GB),
+**~4000 on a 40 GB A100** (3668 measured), and more on an 80 GB card, where time is the constraint
+(the trunk grows as the cube: ~4 minutes at 3668). 🔴 Past ~4096 tokens a pair tensor at 128
+channels is more than 2^31 elements, so any kernel indexing it with an `int` overflows; not audited.
+`LOCALFOLD_MEM=1` prints the device at every stage of the trunk; the peaks hunted here were INSIDE a
+phase (the diffusion's preparation held the conditioning pair, two normalised copies of it, the
+per-super-block logits and the 24 cached biases at once - 12.4 GB of scratch at 2096 tokens), which
+the per-phase lines alone could not show. The WebGPU page stops earlier and for a different reason:
+every pair-sized dispatch binds `tokens^2 x channels` floats against a 2 GiB binding limit on NVIDIA,
+so 2047 tokens for AF3 and 1023 for IntelliFold-2.
