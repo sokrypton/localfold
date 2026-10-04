@@ -758,12 +758,17 @@ inline bool shortPair(size_t pairs, int C) {
   static const size_t card = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t; }();
   return pairs * C * 4 > card / 64;
 }
-// the scratch buffers named by any of `prefixes`, given back (the next use allocates afresh)
-inline void releaseScratch(std::initializer_list<const char*> prefixes) {
+// the scratch buffers named, given back (the next use allocates afresh): a name ending in '.' is a
+// prefix ("tmpl."), any other is exact ("tri.a", which must not take "tri.abf" with it)
+inline void releaseScratch(std::initializer_list<const char*> names) {
   bool synced = false;
   for (auto& [name, slot] : SCRATCH) {
     if (!slot.first) continue;
-    bool match = false; for (const char* p : prefixes) if (!name.compare(0, strlen(p), p)) match = true;
+    bool match = false;
+    for (const char* p : names) {
+      size_t len = strlen(p);
+      if (len && p[len - 1] == '.' ? !name.compare(0, len, p) : name == p) match = true;
+    }
     if (!match) continue;
     if (!synced) { CK(cudaStreamSynchronize(STREAM)); synced = true; }
     CK(cudaFree(slot.first)); slot = {nullptr, 0};
@@ -835,6 +840,9 @@ inline void serveJobs(const std::string& dir, const char* name,
 // LOCALFOLD_MEM=1: device memory in use at a phase boundary, and the largest scratch buffers
 inline void memReport(const char* at) {
   if (!getenv("LOCALFOLD_MEM")) return;
+  cudaStreamCaptureStatus capturing;                 // (a recycle pass being captured: no sync there)
+  CK(cudaStreamIsCapturing(STREAM, &capturing));
+  if (capturing != cudaStreamCaptureStatusNone) return;
   CK(cudaDeviceSynchronize()); size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
   size_t held = 0; std::vector<std::pair<size_t, std::string>> big;
   for (auto& [k, v] : SCRATCH) { held += v.second; if (v.second) big.push_back({v.second, k}); }

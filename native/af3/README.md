@@ -551,3 +551,26 @@ the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2
   native/af3 cannot do that blind: layer-norm scales, biases and the f32 conditioning GEMMs read the f32
   copy, and a path a first fold did not take (templates, an alignment, a ligand) may read one later -
   so it wants the set of f32 readers named, as ef2's `towerHalf` names its own.
+
+## How large a fold fits
+
+Measured on the A100 (40 GB, `peak` sampled from the device every 0.1 s, one fold, 25 steps, single
+sequence), after the trunk gives back each stage's scratch, the template stack's triangle buffers, the
+pair track's own before the next pass, and the recycled pair after the trunk:
+
+| tokens | peak | trunk (4 passes) | whole fold |
+|---:|---:|---:|---:|
+| 1572 | 12.9 GB | 22.1 s | 23 s |
+| 2096 | 19.4 GB | 47.5 s | 49 s |
+| 2620 | 27.7 GB | 88.1 s | 91 s |
+| 3144 | 37.8 GB | 144.2 s | 149 s |
+
+The peak is about **4.6 GB + 3.36 GB per million token pairs**, which puts the ceiling at **~1720
+tokens on a T4** (15 GB), **~2270 on an L4** (22.5 GB), **~3200 on a 40 GB A100** and **~4700 on an
+80 GB one** - the last at roughly eight minutes of trunk. The T4 figure is measured, not fitted: with a
+second process holding all but 14.6 GiB of this card, 1725 tokens folds and 1750 runs out (above 1135
+tokens the A100 takes the same low-memory paths a T4 does). Before this pass 1572 tokens peaked at
+15.9 GB and 2620 at 36.0; the template stack allocating beside the previous pass's pair-track buffers
+was the peak (17.71 GB at 1572, in `LOCALFOLD_MEM=1`'s per-stage lines). The WebGPU page stops
+earlier and for a different reason: every pair-sized dispatch binds `tokens^2 x channels` floats
+against a 2 GiB binding limit on NVIDIA, so 2047 tokens for AF3 and 1023 for IntelliFold-2.

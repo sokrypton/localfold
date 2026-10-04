@@ -278,6 +278,7 @@ int main(int argc, char** argv) {
   for (int fi = 0; doFold && fi < folds; ++fi) {
     if (fi > 0) {   // a fresh fold: the trunk restarts from zero recycled state
       size_t pp = (size_t)t.n * t.n * t.C;
+      if (!t.prevPair) t.prevPair = dalloc(pp);     // (given back after the last fold's trunk)
       CK(cudaMemset(t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
     }
     std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
@@ -337,6 +338,9 @@ int main(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
+    // the recycled pair is the trunk's alone: on a card short of room it is given back for the
+    // diffusion and the confidence head (3.5 GB at 2620 tokens)
+    if (shortPair(pairs, t.C)) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }
     releaseConcatCopies(); memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below

@@ -586,12 +586,15 @@ inline std::vector<float> contactProbabilities(Trunk& t) {
 // The whole trunk pass. `onSeam(name, ptr, n)` sees the oracle's seams.
 template <class T>
 void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size_t)>& onSeam) {
-  embed<T>(t, onSeam); stage("embed");
+  embed<T>(t, onSeam); stage("embed"); memReport("  trunk: embedded");
   size_t pairs = (size_t)t.n * t.n;
   // on a card short of room, the embedder's and template stack's scratch given back before the MSA
   // stack, and the MSA stack's before the pairformer (see shortPair)
   bool tight = shortPair(pairs, t.C);
-  if (tight) releaseScratch({ "emb.", "tmpl." });
+  // ...and the template stack's own triangle buffers: it runs 64 channels through the unfused path,
+  // whose names the 128-channel pairformer never asks for again (4.9 GB at 2620 tokens)
+  if (tight) releaseScratch({ "emb.", "tmpl.", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.pg", "tri.centred",
+                              "tri.t1", "tri.t2" });
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + std::to_string(msaBlocks) + ".pairChannels")) ++msaBlocks;
   // boltz2 adds the pre-MSA pair back: its MSA module returns the updated z and the caller adds z
   float* zIn = nullptr;
@@ -601,11 +604,16 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   }
   for (int k = 0; k < msaBlocks; ++k) msaBlock<T>(t, k);
   if (zIn) addK<<<blocks(pairs * t.C), 256, 0, STREAM>>>(t.pair, zIn, pairs * t.C);
+  memReport("  trunk: MSA stack");
   if (tight) releaseScratch({ "msaatt.", "opm.", "trunk.zBeforeMsa" });
   onSeam("z_after_msa", t.pair, pairs * t.C);
   onSeam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
   int blocks_ = 0; while (M.has("trunk.pairformerBlocks." + std::to_string(blocks_) + ".singleChannels")) ++blocks_;
   for (int k = 0; k < blocks_; ++k) pairformerBlock<T>(t, k);
+  memReport("  trunk: pairformer");
+  // ...and the pair track's own, before the next pass's template stack allocates beside it: held, they
+  // put a recycle pass's peak at its embedding (17.71 against 12.88 GB at 1572 tokens)
+  if (tight) releaseScratch({ "tri.", "grid.", "tr.", "st." });
   onSeam("trunk_out_pair", t.pair, pairs * t.C);
   onSeam("single", t.single, (size_t)t.n * t.Cs);
 }
