@@ -54,7 +54,7 @@ import {
 } from "../runtime/resident.js";
 import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
   from "../runtime/device-memory.js";
-import { deviceTuning } from "../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../heads/tm-score.js";
 import { sampleOnGpu, flowOnGpu } from "./diffusion/diffusion-sampler-webgpu.js";
@@ -826,8 +826,20 @@ async function foldHolding(device, batch, weights, options, held) {
     // ~90 MiB where the decoded weights held 570. The sampler's weights stay
     // decoded here: streaming them too reached 1072 MiB for +4% on a warm fold.
     // `streamTrunkWeights: false` keeps them decoded.
-    releaseResidentWeights(device, "w.");
-    setStreamedWeights(device, ["w."]);
+    // 🔴 AND THE SAMPLER'S TOO WHERE ROOM IS SHORT. Decoded, the diffusion transformer's weights are the
+    // largest thing a fold holds - 918 MB for AF3 and 1351 for boltz2 in f32, half that where the device
+    // has shader-f16 - and they replay from their codes at a decode a block a step. A100 under stock flags
+    // (no f16), warm folds: AF3 peak 1198 -> 740 MiB at 68 tokens for 0.446 -> 0.514 s, 1594 -> 1136 at
+    // 262 for 1.47 -> 1.58; boltz2 1708 -> 1106 and 2110 -> 1508 MiB for +5-7%. With f16 it saves 143-175
+    // MiB for 4-9%. So: streamed when a budget is set (the page always sets one, deviceMemory / 3) and
+    // either the weights would decode to f32 or the budget is under 2 GiB; a run with no ceiling keeps
+    // them. `streamSamplerWeights` forces either.
+    const budget = memoryBudgetBytes(device);
+    const sampler = deviceTuning(device).streamSamplerWeights ?? (budget !== undefined && budget !== null
+      && (!halfPrecisionAvailable(device) || budget < 2 * 1024 ** 3));
+    const prefixes = sampler ? ["w.", "difftx."] : ["w."];
+    for (const prefix of prefixes) releaseResidentWeights(device, prefix);
+    setStreamedWeights(device, prefixes);
   }
   const { tokens, dense } = batch;
   const stage = (name, detail = {}) => options.onStage?.(name, detail);

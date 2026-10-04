@@ -271,6 +271,8 @@ export const DEFAULT_TUNING = Object.freeze({
   // ...and streams its trunk weights from their codes inside the fold; `false`
   // keeps them decoded for the fold's passes. See setStreamedWeights.
   largeFoldStreamsWeights: null,
+  // ...and below that size, whether the sampler's weights stream from their codes like the trunk's.
+  streamSamplerWeights: null,
   // ...and a small fold streams its trunk's, keeping the codes between folds;
   // false keeps them decoded. See foldHolding.
   streamTrunkWeights: null,

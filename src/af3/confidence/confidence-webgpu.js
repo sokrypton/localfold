@@ -58,7 +58,9 @@ const NORM_PIECE_BYTES = 256 * 1048576;
  */
 async function streamGlobalNorm(device, allocator, source, target, mask, rows, channels) {
   const rowBytes = channels * 4;
-  const pieceRows = Math.max(1, Math.floor(NORM_PIECE_BYTES / rowBytes));
+  // ...and never more rows than there are: the staging buffer was a full 256 MiB at 68 tokens (a
+  // 2.4 MB pair), the largest single allocation of an rf3 fold's peak.
+  const pieceRows = Math.max(1, Math.min(rows, Math.floor(NORM_PIECE_BYTES / rowBytes)));
   const staging = allocator.allocate("af3-conf.norm-piece", pieceRows * rowBytes,
     GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
   const pieces = async (visit) => {
