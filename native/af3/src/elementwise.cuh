@@ -12,11 +12,12 @@ __global__ void addBiasK(float* y, const float* b, size_t rows, int C) {
   if (t < rows * C) y[t] += b[t % C];
 }
 
-__global__ void symmetriseK(const float* z, float* out, int T, int C) {
+template <class Z>
+__global__ void symmetriseK(const Z* z, float* out, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * T * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  out[t] = z[t] + z[((size_t)j * T + i) * C + c];
+  out[t] = toF(z[t]) + toF(z[((size_t)j * T + i) * C + c]);
 }
 
 __global__ void gateMulAddK(float* pair, const float* out, const float* gate, size_t n) {
@@ -117,12 +118,13 @@ __global__ void opmPermuteHK(const half* Pm, half* X, int bi, int L, int O) {
       reinterpret_cast<const uint4*>(Pm)[(((size_t)i * O + c) * ((size_t)L * O) + (size_t)j * O) / 8 + e8];
 }
 // pair[i][j] += (bias + x) / (1e-3 + norm[i][j])   (AF3: the bias inside the scale)
-__global__ void opmAddK(float* pair, const float* x, const float* bias, const float* norm, size_t i0,
+template <class P>
+__global__ void opmAddK(P* pair, const float* x, const float* bias, const float* norm, size_t i0,
                         int Bi, int n, int C, bool biasAfterNorm) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)Bi * n * C) return;
   int f = (int)(t % C); size_t ij = t / C; size_t i = i0 + ij / n, j = ij % n;
   float nv = norm[i * n + j];
   float v = biasAfterNorm ? x[t] / fmaxf(nv, 1.f) + bias[f] : (bias[f] + x[t]) / (1e-3f + nv);
-  pair[(i * n + j) * C + f] += v;
+  pair[(i * n + j) * C + f] = fromF<P>(toF(pair[(i * n + j) * C + f]) + v);
 }

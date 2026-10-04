@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
       printf("  gather %-24s %zu of %zu differ from the batch\n", g, diff, len);
     }
     float* single = upload(M.f(O + "inputs.single"), M.len(O + "inputs.single"));
-    float* pair = upload(M.f(O + "inputs.pair"), M.len(O + "inputs.pair"));
+    PairT* pair = uploadPair(M.f(O + "inputs.pair"), M.len(O + "inputs.pair"));
     float* sIn = upload(M.f(O + "inputs.sInputs"), M.len(O + "inputs.sInputs"));
     float* pos = upload(M.f(O + "inputs.posNoisy"), M.len(O + "inputs.posNoisy"));
     float* seqm = upload(M.f(O + "inputs.seq_mask"), n);
@@ -202,7 +202,7 @@ int main(int argc, char** argv) {
     // OpenDDE's own head, on the dump's own (synthesised) inputs - token-agnostic, no extra bias
     const std::string I = "oracle.confidence.stages.in.";
     int n = (int)M.meta("oracle.confidence.tokens"), dense = (int)M.meta("oracle.confidence.slots");
-    float* pair = upload(M.f(I + "pair"), M.len(I + "pair"));
+    PairT* pair = uploadPair(M.f(I + "pair"), M.len(I + "pair"));
     float* single = upload(M.f(I + "single"), M.len(I + "single"));
     float* tf = upload(M.f(I + "targetFeat"), M.len(I + "targetFeat"));
     std::vector<float> hc(M.f(I + "coordinates"), M.f(I + "coordinates") + M.len(I + "coordinates"));
@@ -221,7 +221,7 @@ int main(int argc, char** argv) {
   } else if (M.has("oracle.confidence.stages.out.full_pae") && !getenv("SKIP_CONFIDENCE_ORACLE")) {
     int n = (int)M.meta("batch.tokens");
     const std::string I = "oracle.confidence.stages.in.";
-    float* pair = upload(M.f(I + "pair"), M.len(I + "pair"));
+    PairT* pair = uploadPair(M.f(I + "pair"), M.len(I + "pair"));
     float* single = upload(M.f(I + "single"), M.len(I + "single"));
     float* tf = upload(M.f(I + "targetFeat"), M.len(I + "targetFeat"));
     float* beta = upload(M.f(I + "pseudoBeta"), M.len(I + "pseudoBeta"));
@@ -253,11 +253,12 @@ int main(int argc, char** argv) {
     const std::string I = "oracle.structural.stages.in.";
     int nRes = (int)M.meta(I + "single.shape0");
     float* single = upload(M.f(I + "single"), M.len(I + "single"));
-    float* pair = upload(M.f(I + "pair"), M.len(I + "pair"));
+    PairT* pair = uploadPair(M.f(I + "pair"), M.len(I + "pair"));
     float* tf = upload(M.f(I + "targetFeat"), M.len(I + "targetFeat"));
     printf("structural stage on the oracle's inputs:\n");
     Structural s = expandStructural(single, pair, tf, nRes, false);
-    for (float* p : {s.single, s.pair, s.targetFeat, s.bias, s.seqMask, s.pairMask, single, pair, tf}) CK(cudaFree(p));
+    for (void* p : {(void*)s.single, (void*)s.pair, (void*)s.targetFeat, (void*)s.bias, (void*)s.seqMask, (void*)s.pairMask,
+                    (void*)single, (void*)pair, (void*)tf}) CK(cudaFree(p));
   }
 
   // target_feat from the batch: per-atom conditioning and the atom cross-attention encoder.
@@ -280,9 +281,9 @@ int main(int argc, char** argv) {
   for (int fi = 0; doFold && fi < folds; ++fi) {
     if (fi > 0) {   // a fresh fold: the trunk restarts from zero recycled state
       size_t pp = (size_t)t.n * t.n * t.C;
-      if (!t.pair) t.pair = dalloc(pp);                // (left parked by the last fold)
+      if (!t.pair) t.pair = dallocT<PairT>(pp);        // (left parked by the last fold)
       // (in place, the pair is the recycled one)
-      CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
+      CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pp * sizeof(PairT))); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
     }
     std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
     auto clock = [] { return std::chrono::steady_clock::now(); };
@@ -295,7 +296,7 @@ int main(int argc, char** argv) {
     // it replays as one CUDA graph, captured from that pass (the first has sized every scratch buffer)
     auto recyclePass = [&]() {
       if (!t.inPlaceRecycle)        // (in place, the pair already is the recycled pair: see embed)
-        CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
+        CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * sizeof(PairT), cudaMemcpyDeviceToDevice, STREAM));
       CK(cudaMemcpyAsync(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
       if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
     };
@@ -361,7 +362,9 @@ int main(int argc, char** argv) {
       size_t n = t.n;
       if (saveEmbeddings) {
         writeNpy(base + "_single_embeddings.npy", download(t.single, n * t.Cs), { n, (size_t)t.Cs });
-        writeNpy(base + "_pair_embeddings.npy", download(t.pair, n * n * t.C), { n, n, (size_t)t.C });
+        float* pf = scratch<float>("save.pair", n * n * t.C);
+        pairToFloatK<<<blocks(n * n * t.C), 256, 0, STREAM>>>(t.pair, pf, n * n * t.C);
+        writeNpy(base + "_pair_embeddings.npy", download(pf, n * n * t.C), { n, n, (size_t)t.C });
       }
       if (saveDistogram) {
         int bins = (int)M.meta("trunk.distogram.bins");
@@ -380,7 +383,7 @@ int main(int argc, char** argv) {
     // OpenDDE: the expander and refiner, then everything after runs on the structural tokens
     bool structural = M.flag("trunk.dialect.structuralTokens");
     Structural st;
-    const float *dS = t.single, *dP = t.pair, *dTf = t.targetFeat, *dSeq = t.seqMask;
+    const float *dS = t.single, *dTf = t.targetFeat, *dSeq = t.seqMask; const PairT* dP = t.pair;
     int nD = t.n;
     std::vector<int> resAsym(M.i("batch.asymId"), M.i("batch.asymId") + t.n);
     if (structural) {
@@ -398,7 +401,7 @@ int main(int argc, char** argv) {
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
     if (!structural && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
-        parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); dP = nullptr; }
+        parkWorthIt(pairs * t.C * sizeof(PairT))) { parkToHost(t.pair, pairs * t.C * sizeof(PairT)); dP = nullptr; }
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
     // ...and the pair-sized tensors only the preparation reads, given back before the steps: the
     // transformer's and the encoder's pair LayerNorms and the per-super-block logits (1.4 GB at 1048
@@ -416,7 +419,7 @@ int main(int argc, char** argv) {
       // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
       // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
       releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj", "pt." });
-      if (!structural && t.pair && parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); df.trunkPair = nullptr; }
+      if (!structural && t.pair && parkWorthIt(pairs * t.C * sizeof(PairT))) { parkToHost(t.pair, pairs * t.C * sizeof(PairT)); df.trunkPair = nullptr; }
     }
     releaseConcatCopies(); memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
@@ -522,7 +525,7 @@ int main(int argc, char** argv) {
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
-        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * 4);    // (parked for the sampler)
+        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * sizeof(PairT));    // (parked for the sampler)
         // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
         bool last = c0 + k + 1 == runs.size();
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
@@ -558,7 +561,8 @@ int main(int argc, char** argv) {
       fclose(rf);
     }
     if (structural) {
-      for (float* p : {st.single, st.pair, st.targetFeat, st.bias, st.seqMask, st.pairMask}) CK(cudaFree(p));
+      for (void* p : {(void*)st.single, (void*)st.pair, (void*)st.targetFeat, (void*)st.bias, (void*)st.seqMask, (void*)st.pairMask})
+        CK(cudaFree(p));
     }
     auto f2 = clock();
     auto f3 = f2;
@@ -586,6 +590,7 @@ int main(int argc, char** argv) {
     if (tight) releaseScratch();      // the next fold's trunk starts from the card it had
     if (fi + 1 == folds) return 0;
   }
+  PAIR_SEAMS = true;          // (the stored pair is cast up for the seams this check reads)
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
     std::string tap = std::string("oracle.trunk.stages.tap.") + name;
     std::string plain = std::string("oracle.trunk.stages.") + name;

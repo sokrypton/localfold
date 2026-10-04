@@ -30,7 +30,7 @@ __global__ void confidenceBinK(const float* beta, int n, int bins, float dmin, f
   }
   binOut[ij] = bin; sqOut[ij] = sq;
 }
-__global__ void confidencePairInitK(float* pair, const float* left, const float* right, const int* binOf,
+__global__ void confidencePairInitK(PairT* pair, const float* left, const float* right, const int* binOf,
                                     const float* sqOf, const float* pairMask, const float* Wd, int n, int C,
                                     const float* Wdist, bool caBins) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -40,7 +40,7 @@ __global__ void confidencePairInitK(float* pair, const float* left, const float*
   int bin = binOf[ij];
   if (bin >= 0) v += Wd[(size_t)bin * C + c] * pairMask[ij];
   if (!caBins && Wdist) v += sqrtf(sqOf[ij] + 1e-10f) * Wdist[c];
-  pair[t] += v;
+  pair[t] = fromF<PairT>(toF(pair[t]) + v);
 }
 // expectation over bins of softmax(logits) . centres, optionally symmetrised (logits[ij] + logits[ji])
 __global__ void expectationK(const float* logits, float* out, const float* mask, size_t rows, int bins,
@@ -63,12 +63,13 @@ inline bool CONF_HALF = false;   // the head's four pairformer blocks in f16
 // rf3's parameter-free LayerNorm over a WHOLE tensor, real rows only (mask per row), the mean
 // and variance over `vendorWidth` columns (wider than C: the extra ones zero, each adding mean^2).
 // Deterministic: per-block partials, then one block sums them in order.
-__global__ void maskedSumK(const float* x, const float* mask, size_t rows, int C, const double* mean, double* partial) {
+template <class X>
+__global__ void maskedSumK(const X* x, const float* mask, size_t rows, int C, const double* mean, double* partial) {
   __shared__ double red[256];
   double acc = 0;
   for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < rows * C; i += (size_t)gridDim.x * blockDim.x) {
     if (!(mask[i / C] > 0)) continue;
-    double v = x[i];
+    double v = toF(x[i]);
     if (mean) { v -= *mean; v *= v; }
     acc += v;
   }
@@ -88,11 +89,13 @@ __global__ void globalStatK(const double* partial, int parts, const float* mask,
     stat[1] = 1.0 / sqrt(variance / count + 1e-5);
   }
 }
-__global__ void applyGlobalNormK(float* x, size_t n, const double* stat) {
+template <class X>
+__global__ void applyGlobalNormK(X* x, size_t n, const double* stat) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) x[i] = (float)((x[i] - stat[0]) * stat[1]);
+  if (i < n) x[i] = fromF<X>((float)((toF(x[i]) - stat[0]) * stat[1]));
 }
-inline void maskedGlobalNorm(float* x, const float* rowMask, size_t rows, int C, int vendorWidth) {
+template <class X>
+inline void maskedGlobalNorm(X* x, const float* rowMask, size_t rows, int C, int vendorWidth) {
   const int parts = 512;
   double* partial = scratch<double>("gn.partial", parts); double* stat = scratch<double>("gn.stat", 2);
   maskedSumK<<<parts, 256, 0, STREAM>>>(x, rowMask, rows, C, nullptr, partial);
@@ -107,7 +110,7 @@ __global__ void clampK(float* x, float limit, size_t n) {
 // boltz2's re-embedded pair (after LN_z and the relative encoding): right[i] + left[j] off the
 // normalised s_inputs, its own 64-bin distance embedding (bounds evenly over 2..22 A), the bond
 // contact and bond-order terms and the contact conditioning's unspecified constant
-__global__ void reembedPairK(float* pair, const float* left, const float* right, const float* beta, const float* pairMask,
+__global__ void reembedPairK(PairT* pair, const float* left, const float* right, const float* beta, const float* pairMask,
                              const float* Wd, const float* bonds, const float* orders, const float* wBond,
                              const float* wBondType, const float* unspecified, int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -122,7 +125,7 @@ __global__ void reembedPairK(float* pair, const float* left, const float* right,
   if (o < 0 || o >= 7) o = 0;
   float v = right[(size_t)i * C + c] + left[(size_t)j * C + c] + Wd[(size_t)bin * C + c] * pairMask[ij]
           + (bonds ? bonds[ij] * wBond[c] : 0.f) + wBondType[(size_t)o * C + c] + unspecified[c];
-  pair[t] += v;
+  pair[t] = fromF<PairT>(toF(pair[t]) + v);
 }
 // prod[i][j][e] = a[i][e] b[j][e], rows i0.. of a chunk
 __global__ void outerProductRowsK(const float* a, const float* b, float* out, int i0, int rowsI, int n, int C) {
@@ -133,11 +136,12 @@ __global__ void outerProductRowsK(const float* a, const float* b, float* out, in
 }
 // boltz2's split pair heads: the inter-chain logits where the two tokens' chains differ
 // rows [r0, r0 + cnt) of z + z^T, row-major
-__global__ void symmetriseRowsK(const float* z, float* out, size_t r0, size_t cnt, int T, int C) {
+template <class Z>
+__global__ void symmetriseRowsK(const Z* z, float* out, size_t r0, size_t cnt, int T, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = r0 + t / C; size_t i = ij / T, j = ij % T;
-  out[t] = z[ij * C + c] + z[(j * T + i) * C + c];
+  out[t] = toF(z[ij * C + c]) + toF(z[(j * T + i) * C + c]);
 }
 // the same over pairs [r0, r0 + cnt) of logits, from a chunk of inter-chain logits
 __global__ void interChainLogitsRowsK(float* logits, const float* inter, const int* asym, int n, int bins, size_t r0,
@@ -153,7 +157,7 @@ __global__ void interChainLogitsK(float* logits, const float* inter, const int* 
   size_t ij = t / bins; int i = (int)(ij / n), j = (int)(ij % n);
   if (asym[i] != asym[j]) logits[t] = inter[t];
 }
-inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, const float* trunkSingle,
+inline void boltz2Reembed(PairT* pair, float* single, const PairT* trunkPair, const float* trunkSingle,
                           const float* targetFeat, const float* pseudoBeta, const float* pairMask, int n, int C, int Cs, int F) {
   const std::string R = "confidence.reembed.";
   size_t pairs = (size_t)n * n;
@@ -161,7 +165,7 @@ inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, co
   layerNorm2<float, float>(targetFeat, sIn, n, F, R + "sInputsNormScale", R + "sInputsNormOffset");
   layerNorm2<float, float>(trunkSingle, single, n, Cs, R + "sNormScale", R + "sNormOffset");
   linear<float, float>(sIn, single, n, F, Cs, R + "sInputToS", false, 1.f);
-  layerNorm2<float, float>(trunkPair, pair, pairs, C, R + "zNormScale", R + "zNormOffset");
+  layerNorm2<PairT, PairT>(trunkPair, pair, pairs, C, R + "zNormScale", R + "zNormOffset");
   if (lenW(R + "relPosProject") != (size_t)139 * C) { fprintf(stderr, "relPosProject is not 139 x %d\n", C); exit(1); }
   relativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(
     Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
@@ -183,14 +187,14 @@ inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, co
   for (int i0 = 0; i0 < n; i0 += rowsPer) {
     int r = std::min(rowsPer, n - i0);
     outerProductRowsK<<<blocks((size_t)r * n * C), 256, 0, STREAM>>>(p1, p2, prod, i0, r, n, C);
-    linear<float, float>(prod, pair + (size_t)i0 * n * C, (size_t)r * n, C, C, R + "sToZProdOut", false, 1.f);
+    linearIntoPair<float>(prod, pair + (size_t)i0 * n * C, (size_t)r * n, C, C, R + "sToZProdOut");
   }
 }
 struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
 
 // consumeTrunkPair: the trunk's pair is read by nothing after this call, so the head works in it rather
 // than in a copy (the caller says so for a card short of room, on its last confidence call)
-inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
+inline ConfidenceOut confidenceHead(const PairT* trunkPair, const float* trunkSingle, const float* targetFeat,
                                     const float* pseudoBeta, const float* seqMask, const float* pairMask, int n,
                                     bool consumeTrunkPair = false) {
   const std::string P = "confidence";
@@ -200,12 +204,12 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   size_t pairs = (size_t)n * n;
   bool reembed = M.flag("trunk.dialect.reembedConfidencePair");
   bool inPlace = consumeTrunkPair && !reembed;                 // (boltz2 builds its pair from the trunk's: no aliasing)
-  float* pair = inPlace ? const_cast<float*>(trunkPair) : scratch<float>("conf.pair", pairs * C);
+  PairT* pair = inPlace ? const_cast<PairT*>(trunkPair) : scratch<PairT>("conf.pair", pairs * C);
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
   if (reembed) {
     boltz2Reembed(pair, single, trunkPair, trunkSingle, targetFeat, pseudoBeta, pairMask, n, C, Cs, F);
   } else {
-  if (!inPlace) CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  if (!inPlace) CK(cudaMemcpyAsync(pair, trunkPair, pairs * C * sizeof(PairT), cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(single, trunkSingle, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   if (M.flag("trunk.dialect.confidenceGlobalNorm")) {
     // rf3 normalises every detached trunk input over the whole tensor first (target_feat over the
@@ -278,8 +282,13 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   auto headLogits = [&](bool symmetrised, const std::string& norm, const std::string& w, const std::string& inter) {
     for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
       size_t cnt = std::min(rowsPer, pairs - r0);
-      const float* x = pair + r0 * C;
+      const float* x;
       if (symmetrised) { symmetriseRowsK<<<blocks(cnt * C), 256, 0, STREAM>>>(pair, sym, r0, cnt, n, C); x = sym; }
+      else {                                   // (the heads read f32: the bf16 pair cast up a block at a time)
+        float* xf = scratch<float>("conf.pairRows", rowsPer * C);
+        pairToFloatK<<<blocks(cnt * C), 256, 0, STREAM>>>(pair + r0 * C, xf, cnt * C);
+        x = xf;
+      }
       const float* xn = headNorm(x, ln, cnt, C, norm);
       linear<float, float>(xn, logits + r0 * NB, cnt, C, NB, P + "." + w);
       if (!hasW(P + "." + inter)) continue;
@@ -290,7 +299,9 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   if (chunked) {
     headLogits(preSym, "logitsLn", "leftHalfDistanceLogits", "interHalfDistanceLogits");
   } else {
-    const float* src = pair;
+    float* pairF = scratch<float>("conf.pairF", pairs * C);     // (the heads read f32)
+    pairToFloatK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, pairF, pairs * C);
+    const float* src = pairF;
     if (preSym) {
       // symmetrised BEFORE the projection: LN(z + z^T) W (protenix2, boltz2); AF3 adds the transpose after
       float* whole = scratch<float>("conf.sym", pairs * C);
@@ -301,7 +312,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   }
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pde, pairMask, pairs, NB, dCentres, preSym ? 0 : n, 1.f);
   if (chunked) headLogits(false, "paeLogitsLn", "paeLogits", "paeInterLogits");
-  else project(headNorm(pair, ln, pairs, C, "paeLogitsLn"), "paeLogits", "paeInterLogits");
+  else project(headNorm(scratch<float>("conf.pairF", pairs * C), ln, pairs, C, "paeLogitsLn"), "paeLogits", "paeInterLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pae, pairMask, pairs, NB, dCentres, 0, 1.f);
   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's
   // mean over the pairs it selects (ipTM: other chains only). src/heads/tm-score.js.

@@ -37,7 +37,7 @@ inline void structuralTap(const char* name, const float* d, int rows, int cols, 
 }
 struct Structural {
   int n = 0;
-  float *single = nullptr, *pair = nullptr, *targetFeat = nullptr, *bias = nullptr;
+  float* single = nullptr; PairT* pair = nullptr; float *targetFeat = nullptr, *bias = nullptr;
   float *seqMask = nullptr, *pairMask = nullptr;
 };
 
@@ -62,16 +62,16 @@ __global__ void singleStructK(float* out, const float* a, const float* b, const 
   out[t] = a[t] + b[t] + roleEmb[(size_t)role[i] * C + c];
 }
 // the residue pair under each structural pair, in matrix-group order
-__global__ void gatherPairSortedK(const float* pair, const int* order, const int* parent, float* out, int n, int nRes,
+__global__ void gatherPairSortedK(const PairT* pair, const int* order, const int* parent, float* out, int n, int nRes,
                                   int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * n * C) return;
   size_t r = t / C; int c = (int)(t % C);
   int ij = order[r], i = ij / n, j = ij % n;
-  out[t] = pair[((size_t)parent[i] * nRes + parent[j]) * C + c];
+  out[t] = toF(pair[((size_t)parent[i] * nRes + parent[j]) * C + c]);
 }
 // pair[ij] = gathered + projected + the five boolean-feature embeddings (the false row counts)
-__global__ void scatterPairK(float* pair, const float* gathered, const float* projected, const int* order,
+__global__ void scatterPairK(PairT* pair, const float* gathered, const float* projected, const int* order,
                              const int* sameParent, const int* twin, const int* prev, const int* next, const int* type,
                              const float* eSame, const float* eTwin, const float* ePrev, const float* eNext,
                              const float* eType, int n, int C) {
@@ -79,8 +79,8 @@ __global__ void scatterPairK(float* pair, const float* gathered, const float* pr
   if (t >= (size_t)n * n * C) return;
   size_t r = t / C; int c = (int)(t % C);
   int ij = order[r];
-  pair[(size_t)ij * C + c] = gathered[t] + projected[t] + eSame[sameParent[ij] * C + c] + eTwin[twin[ij] * C + c]
-                           + ePrev[prev[ij] * C + c] + eNext[next[ij] * C + c] + eType[type[ij] * C + c];
+  pair[(size_t)ij * C + c] = fromF<PairT>(gathered[t] + projected[t] + eSame[sameParent[ij] * C + c] + eTwin[twin[ij] * C + c]
+                           + ePrev[prev[ij] * C + c] + eNext[next[ij] * C + c] + eType[type[ij] * C + c]);
 }
 __global__ void attentionBiasK(float* bias, const int* sameParent, const int* twin, const int* prev, const int* next,
                                const int* type, const float* bSame, const float* bTwin, const float* bPrev,
@@ -92,7 +92,7 @@ __global__ void attentionBiasK(float* bias, const int* sameParent, const int* tw
 }
 
 // The expander and the refiner. Reads the residue batch (call before swapBatch).
-inline Structural expandStructural(const float* trunkSingle, const float* trunkPair, const float* targetFeat, int nRes,
+inline Structural expandStructural(const float* trunkSingle, const PairT* trunkPair, const float* targetFeat, int nRes,
                                    bool fast) {
   const std::string E = "expander.";
   Structural s;
@@ -140,7 +140,7 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
     if (!WF.count(w)) deviceWeight(w, (float*)W(E + "pairBlockProj") + (size_t)k * C * C, (size_t)C * C);
     linear<float, float>(gathered + (size_t)start[k] * C, projected + (size_t)start[k] * C, count, C, C, w);
   }
-  s.pair = dalloc(pairs * C);
+  s.pair = dallocT<PairT>(pairs * C);
   const int *sp = Idev("structural.sameParent"), *tw = Idev("structural.twin"), *pv = Idev("structural.prevBackbone"),
             *nx = Idev("structural.nextBackbone"), *ty = Idev("structural.rolePairType");
   scatterPairK<<<blocks(pairs * C), 256, 0, STREAM>>>(s.pair, gathered, projected, dOrder, sp, tw, pv, nx, ty,
@@ -172,7 +172,7 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
 // ---------------------------------------------------------------- OpenDDE's confidence head
 // pair + s1[j] + s2[i] + the distance's bin embedding (3.25 A up, 1.25 A bins, the last open) +
 // the raw distance's projection, off the per-token coordinates the sampler produced
-__global__ void ddePairInitK(float* pair, const float* s1, const float* s2, const float* coords, const float* Wd,
+__global__ void ddePairInitK(PairT* pair, const float* s1, const float* s2, const float* coords, const float* Wd,
                              const float* Wraw, int n, int C, int bins) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * n * C) return;
@@ -183,8 +183,8 @@ __global__ void ddePairInitK(float* pair, const float* s1, const float* s2, cons
   int bin = (int)floorf((distance - 3.25f) / 1.25f);
   if (distance < 3.25f) bin = -1;
   if (bin >= bins) bin = bins - 1;
-  pair[t] += s1[(size_t)j * C + c] + s2[(size_t)i * C + c] + (bin >= 0 ? Wd[(size_t)bin * C + c] : 0.f)
-           + distance * Wraw[c];
+  pair[t] = fromF<PairT>(toF(pair[t]) + s1[(size_t)j * C + c] + s2[(size_t)i * C + c] + (bin >= 0 ? Wd[(size_t)bin * C + c] : 0.f)
+           + distance * Wraw[c]);
 }
 // plddt_weight [slot][c][bin] -> [c][slot * bins + bin], so one GEMM gives every slot's logits
 __global__ void slotMajorK(const float* w, float* out, int slots, int C, int bins) {
@@ -197,7 +197,7 @@ __global__ void slotMajorK(const float* w, float* out, int slots, int C, int bin
 // Returns pLDDT per structural atom slot, PAE/PDE per structural pair, and the per-pair TM term
 // (d0 from `tmTokens`, the residue count pTM is reported over).
 struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm; };
-inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refinedSingle, const float* sInputs,
+inline DdeConfidence ddeConfidence(const PairT* refinedPair, const float* refinedSingle, const float* sInputs,
                                    const float* coords, const float* seqMask, const float* pairMask, const float* bias,
                                    int n, int dense, int tmTokens) {
   const std::string P = "ddeConfidence.";
@@ -211,8 +211,8 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   clampK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, 512.f, (size_t)n * Cs);
   float* sn = scratch<float>("dc.singleNorm", (size_t)n * Cs);
   layerNorm2<float, float>(single, sn, n, Cs, P + "inputStrunkLnScale", P + "inputStrunkLnOffset");
-  float* pair = scratch<float>("dc.pair", pairs * C);
-  CK(cudaMemcpyAsync(pair, refinedPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  PairT* pair = scratch<PairT>("dc.pair", pairs * C);
+  CK(cudaMemcpyAsync(pair, refinedPair, pairs * C * sizeof(PairT), cudaMemcpyDeviceToDevice, STREAM));
   float* s1 = scratch<float>("dc.s1", (size_t)n * C); float* s2 = scratch<float>("dc.s2", (size_t)n * C);
   linear<float, float>(sInputs, s1, n, F, C, P + "s1");
   linear<float, float>(sInputs, s2, n, F, C, P + "s2");
@@ -241,7 +241,7 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, val, nullptr, pairs, pdeBins, dC, 0, 1.f);
   out.pde = download(val, pairs);
   CK(cudaFree(dC)); dC = upload(paeC.data(), paeBins);
-  layerNorm2<float, float>(pair, ln, pairs, C, P + "paeLnScale", P + "paeLnOffset");
+  layerNorm2<PairT, float>(pair, ln, pairs, C, P + "paeLnScale", P + "paeLnOffset");
   linear<float, float>(ln, logits, pairs, C, paeBins, P + "pae");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, val, nullptr, pairs, paeBins, dC, 0, 1.f);
   out.pae = download(val, pairs);

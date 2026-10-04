@@ -812,7 +812,7 @@ inline void scratchReportOOM(const char* what, size_t bytes) {
 // one (callers take the new pointer).
 inline float* PARK_HOST = nullptr; inline size_t PARK_HAVE = 0;
 inline bool parkWorthIt(size_t bytes) { return !roomFor(bytes); }
-inline void parkToHost(float*& dev, size_t bytes) {
+template <class P> inline void parkToHost(P*& dev, size_t bytes) {
   if (PARK_HAVE < bytes) {
     if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
     if (cudaMallocHost(&PARK_HOST, bytes) != cudaSuccess) {
@@ -825,8 +825,8 @@ inline void parkToHost(float*& dev, size_t bytes) {
   CK(cudaStreamSynchronize(STREAM));
   CK(cudaFree(dev)); dev = nullptr;
 }
-inline void unparkFromHost(float*& dev, size_t bytes) {
-  dev = dallocT<float>(bytes / 4);
+template <class P> inline void unparkFromHost(P*& dev, size_t bytes) {
+  dev = dallocT<P>(bytes / sizeof(P));
   CK(cudaMemcpyAsync(dev, PARK_HOST, bytes, cudaMemcpyHostToDevice, STREAM));
 }
 template <class T> T* scratch(const std::string& name, size_t n) {
@@ -1108,8 +1108,11 @@ inline const float* Fdev(const std::string& k) {     // non-weight float inputs 
 // The activations' storage type is T throughout a stage: float for the precise path that
 // is checked against AF3, half for the fast one. Residual streams stay f32 either way.
 template <class T> constexpr cudaDataType cudaType() {
-  return std::is_same_v<T, float> ? CUDA_R_32F : CUDA_R_16F;
+  return std::is_same_v<T, float> ? CUDA_R_32F : std::is_same_v<T, __nv_bfloat16> ? CUDA_R_16BF : CUDA_R_16F;
 }
+// The pair's storage: bf16 on branch bf16-pair (its arithmetic stays f32 - every kernel converts on load and
+// store), half the bytes of the f32 pair for the kernels that read-modify-write it
+using PairT = __nv_bfloat16;
 template <class T> __device__ __forceinline__ float toF(T v) {
   if constexpr (std::is_same_v<T, float>) return v;
   else if constexpr (std::is_same_v<T, __nv_bfloat16>) return __bfloat162float(v);

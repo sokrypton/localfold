@@ -99,7 +99,7 @@ inline void setNoise(float noiseLevel) {
 // Set by a streamed preparation (prepareDiffusion, a card short of room): the conditioning pair is not
 // kept - each chunk of its rows, once transitioned, is handed here and dropped.
 inline std::function<void(const float*, size_t, size_t)> PAIR_CHUNK_SINK;
-inline Conditioning diffusionConditioning(const float* trunkSingle, const float* trunkPair,
+inline Conditioning diffusionConditioning(const float* trunkSingle, const PairT* trunkPairIn,
                                           const float* targetFeat, float noiseLevel, int n) {
   const std::string P = "diffusion.conditioning";
   int Cz = (int)M.meta(P + ".pairChannels"), Cs = (int)M.meta(P + ".seqChannels");
@@ -121,15 +121,22 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
     float* chunk = streamed ? scratch<float>("dc.pairChunk", per * Cz) : nullptr;
     // a trunk pair parked in host memory (af3.cu, a card short of room) is read a chunk of rows at a time:
     // each chunk copied up, and `trunkPair` a base the chunk's own row offsets land inside
-    const bool fromHost = streamed && !trunkPair;
+    // (the trunk pair is stored bf16 - branch bf16-pair - so each chunk of its rows is cast up to f32 here, the
+    // conditioning's arithmetic f32 as it was; a parked pair's chunk is copied up first)
+    const bool fromHost = streamed && !trunkPairIn;
     if (fromHost && !PARK_HOST) { fprintf(stderr, "the conditioning has no trunk pair\n"); exit(1); }
-    float* trunkRows = fromHost ? scratch<float>("dc.trunkRows", per * Czt) : nullptr;
+    float* trunkRows = scratch<float>("dc.trunkRows", per * Czt);
+    PairT* hostRows = fromHost ? scratch<PairT>("dc.trunkRowsP", per * Czt) : nullptr;
+    const float* trunkPair = nullptr;
     for (size_t p0 = 0; p0 < pairs; p0 += per) {
       size_t r = std::min(per, pairs - p0);
+      const PairT* src = trunkPairIn + p0 * Czt;
       if (fromHost) {
-        CK(cudaMemcpyAsync(trunkRows, PARK_HOST + p0 * Czt, r * Czt * 4, cudaMemcpyHostToDevice, STREAM));
-        trunkPair = trunkRows - p0 * Czt;
+        CK(cudaMemcpyAsync(hostRows, (const PairT*)PARK_HOST + p0 * Czt, r * Czt * sizeof(PairT), cudaMemcpyHostToDevice, STREAM));
+        src = hostRows;
       }
+      pairToFloatK<<<blocks(r * Czt), 256, 0, STREAM>>>(src, trunkRows, r * Czt);
+      trunkPair = trunkRows - p0 * Czt;
       auto features = [&](float* outRows, int trunkWidth) {
         pairFeaturesK<<<blocks(r * (trunkWidth + rel)), 256, 0, STREAM>>>(trunkPair, Idev("batch.features.residueIndex"),
           Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), Idev("batch.features.entityId"),
@@ -906,7 +913,7 @@ __global__ void denoiseOutK(const float* x, const float* upd, const float* mask,
 
 // Everything the denoiser computes once per fold.
 struct DiffusionFold {
-  const float *trunkSingle, *trunkPair, *targetFeat, *seqMask;
+  const float* trunkSingle; const PairT* trunkPair; const float *targetFeat, *seqMask;
   int n;
   EncoderOut enc; DecoderCache dec;
   cudaGraphExec_t graph = nullptr; const float* graphInput = nullptr; int calls = 0, graphNs = 0;
@@ -924,7 +931,7 @@ inline void dtap(const char* name, const float* d, size_t n) {
   if (capturing != cudaStreamCaptureStatusNone) return;
   if (M.has(k) && M.len(k) == n) check((std::string("  ") + name).c_str(), d, n, k);
 }
-inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat,
+inline DiffusionFold prepareDiffusion(const float* trunkSingle, const PairT* trunkPair, const float* targetFeat,
                                       const float* seqMask, int n) {
   DiffusionFold f{ trunkSingle, trunkPair, targetFeat, seqMask, n, {}, {} };
   DCACHE.ready = false;
@@ -1074,7 +1081,7 @@ inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float n
   CK(cudaGraphLaunch(f.graph, STREAM));
   return scratch<float>("dn.out", (size_t)f.n * (int)M.meta("batch.dense") * 3 * NS);
 }
-inline float* denoise(const float* trunkSingle, const float* trunkPair, const float* targetFeat,
+inline float* denoise(const float* trunkSingle, const PairT* trunkPair, const float* targetFeat,
                       const float* seqMask, const float* positionsNoisy, float noiseLevel) {
   DiffusionFold f = prepareDiffusion(trunkSingle, trunkPair, targetFeat, seqMask, (int)M.meta("batch.tokens"));
   return denoiseStep(f, positionsNoisy, noiseLevel);

@@ -31,9 +31,9 @@ void layerNorm2(const TI* in, TO* out, size_t rows, int C, const std::string& sc
   layerNormK<TI, TO><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, C, W(scale), W(offset));
 }
 template <class T>
-__global__ void gatedAddK(float* pair, const T* proj, const T* gate, size_t n) {
+__global__ void gatedAddK(PairT* pair, const T* proj, const T* gate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) pair[i] += toF(proj[i]) * sigm(toF(gate[i]));
+  if (i < n) pair[i] = fromF<PairT>(toF(pair[i]) + toF(proj[i]) * sigm(toF(gate[i])));
 }
 // gated = swish(a) * b (* u with `up`: boltz2's conditioned transition up-gate), a row of wide
 // being [a | b] or [a | b | u], each I wide
@@ -180,6 +180,59 @@ __global__ void centerNormStreamK(const float* prod, TO* out, size_t r0, size_t 
 }
 
 inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
+// pair rows += X W (or = X W) - cuBLAS writes no bf16 from f16 inputs, so a block of rows at a time through f32
+// (branch bf16-pair: the pair is stored bf16, its arithmetic f32)
+__global__ void addToPairK(PairT* pair, const float* d, size_t n, bool add) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) pair[i] = fromF<PairT>((add ? toF(pair[i]) : 0.f) + d[i]);
+}
+__global__ void pairToFloatK(const PairT* x, float* y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = toF(x[i]);
+}
+__global__ void floatToPairK(const float* x, PairT* y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = fromF<PairT>(x[i]);
+}
+// a pair from the host's f32 (an oracle's input), stored as the pair is
+inline PairT* uploadPair(const float* h, size_t n) {
+  float* f = upload(h, n); PairT* p = dallocT<PairT>(n);
+  floatToPairK<<<blocks(n), 256, 0, STREAM>>>(f, p, n);
+  CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(f));
+  return p;
+}
+__global__ void addPairK(PairT* y, const PairT* x, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = fromF<PairT>(toF(y[i]) + toF(x[i]));
+}
+template <class T>
+void linearIntoPair(const T* x, PairT* pair, size_t rows, int in, int out, const std::string& w, bool add = true) {
+  size_t per = std::max<size_t>(1, CHUNK / out);
+  float* tmp = scratch<float>("pp.add", std::min(per, rows) * out);
+  for (size_t r0 = 0; r0 < rows; r0 += per) {
+    size_t r = std::min(per, rows - r0);
+    linear<T, float>(x + r0 * in, tmp, r, in, out, w);
+    addToPairK<<<blocks(r * out), 256, 0, STREAM>>>(pair + r0 * out, tmp, r * out, add);
+  }
+}
+// Y (+)= X W with X the pair: cast up a block of rows at a time into f32 (a bf16 GEMM input has no f16 weights
+// to pair with), the GEMM f32 as the f32 pair's was; Y f32, or the pair itself (`add` into it, or written)
+template <class TO>
+void linearFromPair(const PairT* x, TO* y, size_t rows, int in, int out, const std::string& w, bool add = false) {
+  size_t per = std::max<size_t>(1, CHUNK / std::max(in, out));
+  float* xf = scratch<float>("pp.in", std::min(per, rows) * in);
+  for (size_t r0 = 0; r0 < rows; r0 += per) {
+    size_t r = std::min(per, rows - r0);
+    pairToFloatK<<<blocks(r * in), 256, 0, STREAM>>>(x + r0 * in, xf, r * in);
+    if constexpr (std::is_same_v<TO, PairT>) {
+      float* tmp = scratch<float>("pp.add", std::min(per, rows) * out);
+      linear<float, float>(xf, tmp, r, in, out, w);
+      addToPairK<<<blocks(r * out), 256, 0, STREAM>>>(y + r0 * out, tmp, r * out, add);
+    } else {
+      linear<float, TO>(xf, y + r0 * out, r, in, out, w, false, add ? 1.f : 0.f);
+    }
+  }
+}
 inline bool FUSED_GRID = true;
 inline bool TRI_BF16 = true;
 inline int TRI_PAD = 8;           // the triangle's padded size is a multiple of this (0: none)
@@ -270,18 +323,18 @@ __device__ __forceinline__ size_t rectPair(const TriRect& r, size_t q, int n) { 
 // LayerNorm of rows [q0, q0 + cnt) of a rectangle, read from the pair where they lie (zeros for padding),
 // and their mask - a warp a row
 template <class TO>
-__global__ void rectLayerNormK(const float* pair, const float* mask, TO* out, float* m, TriRect r, size_t q0, size_t cnt,
+__global__ void rectLayerNormK(const PairT* pair, const float* mask, TO* out, float* m, TriRect r, size_t q0, size_t cnt,
                                int n, int C, const float* scale, const float* offset) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= cnt) return;
   size_t p = rectPair(r, q0 + row, n);
-  const float* x = p != SIZE_MAX ? pair + p * C : nullptr;
+  const PairT* x = p != SIZE_MAX ? pair + p * C : nullptr;
   float s = 0, ss = 0;
-  for (int c = lane; c < C; c += 32) { float v = x ? x[c] : 0.f; s += v; ss += v * v; }
+  for (int c = lane; c < C; c += 32) { float v = x ? toF(x[c]) : 0.f; s += v; ss += v * v; }
   for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
   float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
-  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(((x ? x[c] : 0.f) - mean) * inv * scale[c] + offset[c]);
+  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(((x ? toF(x[c]) : 0.f) - mean) * inv * scale[c] + offset[c]);
   if (lane == 0 && m) m[row] = p != SIZE_MAX ? mask[p] : 0.f;
 }
 // one operand from a chunk's (rows, 2C) [projection | gate] rows, channel-major into the rectangle's
@@ -332,12 +385,12 @@ __global__ void rectCenterNormK(const float* prod, TO* out, size_t q0, size_t cn
 }
 // pair[at q] += t1 * sigmoid(t2) for the chunk's real rows
 template <class T>
-__global__ void rectGatedAddK(float* pair, const T* t1, const T* t2, TriRect r, size_t q0, size_t cnt, int n, int C) {
+__global__ void rectGatedAddK(PairT* pair, const T* t1, const T* t2, TriRect r, size_t q0, size_t cnt, int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   size_t row = t / C; int c = (int)(t % C);
   size_t p = rectPair(r, q0 + row, n);
-  if (p != SIZE_MAX) pair[p * C + c] += toF(t1[t]) * sigm(toF(t2[t]));
+  if (p != SIZE_MAX) pair[p * C + c] = fromF<PairT>(toF(pair[p * C + c]) + toF(t1[t]) * sigm(toF(t2[t])));
 }
 
 // [projection | gate] of ONE operand (side 0 = a, 1 = b) as a (C, 2C) matrix, from the interleaved (C, 2C)
@@ -364,7 +417,7 @@ inline std::string operandWeight(const std::string& pre, int C, int side) {
 // not write. Incoming P[i, j] = sum_k a[k, j] b[k, i]: a COLUMN block reads pair columns the earlier
 // blocks did not write - a row block would read rows they had. The reduction over k is never split.
 template <class T>
-void triangleBlocked(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
+void triangleBlocked(PairT* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
                      bool divideByLength, int np) {
   size_t cs = (size_t)np * np;
   // each operand's own half of [projection | gate], so the two passes together project once
@@ -425,7 +478,7 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   releaseScratch({ "trib." });
 }
 template <class T>
-void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
+void triangle(PairT* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
               bool divideByLength) {
   size_t pairs = (size_t)n * n;
   // a, b and their product live in a PADDED np x np space per channel, np a multiple of 8, the
@@ -469,7 +522,8 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         cs, b, cudaType<T>(), np, cs, &zero, prod, CUDA_R_32F, np, cs, C, CUBLAS_COMPUTE_32F, algo));
   };
   if constexpr (std::is_same_v<T, half>) {
-    if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
+    // (the 256-channel kernels take an f32 pair; no AF3-lineage pair is 256 wide)
+    if constexpr (std::is_same_v<PairT, float>) if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
       a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
@@ -515,7 +569,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   T* pgOut = scratch<T>("tri.pg", rowsPer * 4 * C);
   for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
     size_t rows = std::min(rowsPer, pairs - r0);
-    layerNorm2<float, T>(pair + r0 * C, norm + r0 * C, rows, C, pre + ".leftNormInputScale",
+    layerNorm2<PairT, T>(pair + r0 * C, norm + r0 * C, rows, C, pre + ".leftNormInputScale",
                          pre + ".leftNormInputOffset");
     linear<T, T>(norm + r0 * C, pgOut, rows, C, 4 * C, pg);
     triGateK<T><<<dim3((unsigned)((rows + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(
@@ -548,15 +602,15 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
 
 // ---------------------------------------------------------------- transition
 #include "fusedtransition.cuh"
-template <class T>
-void transition(float* x, size_t rows, int C, int factor, const std::string& pre) {
+template <class T, class X = float>
+void transition(X* x, size_t rows, int C, int factor, const std::string& pre) {
   // the width is the weight's (OpenDDE's refiner is factor 2 where its trunk is 4)
   (void)factor;
   size_t w1 = lenW(pre + ".transition1");
   if (w1 % (2 * (size_t)C)) { fprintf(stderr, "%s.transition1 has %zu elements, not C %d x 2I\n", pre.c_str(), w1, C); exit(1); }
   int I = (int)(w1 / (2 * (size_t)C));
   if constexpr (std::is_same_v<T, half>) if (fusedTransition(x, rows, C, I, pre)) return;
-  if constexpr (std::is_same_v<T, half>) {
+  if constexpr (std::is_same_v<T, half> && std::is_same_v<X, float>) {
     // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
     // residual as its beta - the [rows, 2I] widening never written
     if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
@@ -584,10 +638,11 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   T* gated = scratch<T>("tr.gated", std::min(rowsPer, rows) * I);
   for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
     size_t r = std::min(rowsPer, rows - r0);
-    layerNorm2<float, T>(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
+    layerNorm2<X, T>(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
     linear<T, T>(xn, wide, r, C, 2 * I, pre + ".transition1");
     swiglu<T>(wide, gated, r, I);
-    linear<T, float>(gated, x + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
+    if constexpr (std::is_same_v<X, float>) linear<T, float>(gated, x + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
+    else linearIntoPair<T>(gated, x + r0 * C, r, I, C, pre + ".transition2");
   }
 }
 
@@ -641,16 +696,16 @@ inline std::string paddedColumns(const std::string& w, int C, int k, int kp) {
   return concatColumns(w + "~pad" + std::to_string(kp), C, {{w, k, false}, {"", kp - k, false}});
 }
 // pair[(r, j) or (j, r)] += out[r][j], four channels a thread (C a multiple of 4)
-__global__ void addGridK(float* pair, const float* out, int n, int C, size_t r0, size_t R, bool tr) {
+__global__ void addGridK(PairT* pair, const float* out, int n, int C, size_t r0, size_t R, bool tr) {
   int c4 = C / 4;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= R * n * c4) return;
   int c = (int)(t % c4); size_t rest = t / c4; size_t j = rest % n; size_t r = r0 + rest / n;
   size_t to = tr ? (j * n + r) : (r * n + j);
-  float4* p = reinterpret_cast<float4*>(pair) + to * c4 + c;
-  float4 v = *p, o = reinterpret_cast<const float4*>(out)[t];
-  v.x += o.x; v.y += o.y; v.z += o.z; v.w += o.w;
-  *p = v;
+  PairT* p = pair + (to * c4 + c) * 4;
+  float2 a = ld2(p), b = ld2(p + 2); float4 o = reinterpret_cast<const float4*>(out)[t];
+  a.x += o.x; a.y += o.y; b.x += o.z; b.y += o.w;
+  st2(p, a); st2(p + 2, b);
 }
 template <class T>
 __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
@@ -663,7 +718,7 @@ __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
 
 // Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
 template <class T>
-void gridAttention(float* pair, const float* mask, int n, int C, int heads, int D,
+void gridAttention(PairT* pair, const float* mask, int n, int C, int heads, int D,
                    const std::string& pre, bool tr, bool swapBias) {
   size_t pairs = (size_t)n * n; int Wd = heads * D;
   if constexpr (std::is_same_v<T, half>) {
@@ -689,7 +744,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias);
         half* gathered = scratch<half>("grid.gathered", pairs * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
-        if (!tr) linear<half, float>(gathered, pair, pairs, Wd, C, pre + ".outputProjection", false, 1.f);
+        if (!tr) linearIntoPair<half>(gathered, pair, pairs, Wd, C, pre + ".outputProjection");
         else gridOut128(gathered, pre + ".outputProjection", pair, n, 0, pairs, tr);
         return;
       }
@@ -717,7 +772,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
         half* gathered = scratch<half>("grid.gathered", prs * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
-        if (!tr) linear<half, float>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+        if (!tr) linearIntoPair<half>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection");
         else gridOut128(gathered, pre + ".outputProjection", pair, n, r0 * n, prs, tr);
       }
       return;
@@ -731,14 +786,14 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   T* norm = streamNorm ? nullptr : scratch<T>("grid.norm", pairs * C);
   float* raw = scratch<float>("grid.rawbias", pairs * heads);
   if (!streamNorm) {
-    layerNorm2<float, T>(pair, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
+    layerNorm2<PairT, T>(pair, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
     linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
   } else {
     size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
     T* lnc = scratch<T>("grid.normChunk", per * C);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      layerNorm2<float, T>(pair + r0 * C, lnc, r, C, pre + ".actNormScale", pre + ".actNormOffset");
+      layerNorm2<PairT, T>(pair + r0 * C, lnc, r, C, pre + ".actNormScale", pre + ".actNormOffset");
       linear<T, float>(lnc, raw + r0 * heads, r, C, heads, pre + ".pairBiasProjection");
     }
   }
@@ -757,14 +812,14 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     const T* act = streamNorm ? nullptr : norm + r0 * n * C;
     if (streamNorm) {
       T* g = scratch<T>("grid.act", prs * C);
-      const float* src = pair + r0 * n * C;
+      const PairT* src = pair + r0 * n * C;
       if (tr) {
-        float* g32 = scratch<float>("grid.act32", prs * C);
-        if (C * 4 % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
-        gatherTransposedK<<<blocks(prs * C * 4 / 16), 256, 0, STREAM>>>(pair, g32, n, C, r0, rows, 4);
-        src = g32;
+        PairT* gp = scratch<PairT>("grid.actPair", prs * C);
+        if (C * sizeof(PairT) % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
+        gatherTransposedK<<<blocks(prs * C * sizeof(PairT) / 16), 256, 0, STREAM>>>(pair, gp, n, C, r0, rows, sizeof(PairT));
+        src = gp;
       }
-      layerNorm2<float, T>(src, g, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
+      layerNorm2<PairT, T>(src, g, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
       act = g;
     } else if (tr) {
       T* g = scratch<T>("grid.act", prs * C);
@@ -779,7 +834,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     flashGrid<T>(qkvgOut, bias, stride, MASK_ALL_ONES && std::is_same_v<T, half> ? nullptr : mask, gathered, n, heads, D,
                  r0, rows, tr, scale);       // (no mask when every token is real: the unmasked kernel)
     if (!tr && !outBias) {
-      linear<T, float>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+      linearIntoPair<T>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection");
       continue;
     }
     float* o = scratch<float>("grid.out", prs * C);
@@ -791,7 +846,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
 
 // The five pair updates of a pairformer/MSA/template block, in AF3's order.
 template <class T>
-void pairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
+void pairUpdates(PairT* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
                  bool divide, int transitionFactor) {
   triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationOutgoing", true, divide); stage("tri.out");
   triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationIncoming", false, divide); stage("tri.in");
