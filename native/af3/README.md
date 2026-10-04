@@ -570,7 +570,7 @@ before - the chunking changes no sum.
 | 1572 | 15.9 GB | **10.2 GB** | 23 s |
 | 2096 | 24.7 GB | **13.9 GB** | 49 s |
 | 2620 | 36.0 GB | **19.2 GB** | 91 s |
-| 3144 | (did not fit beside the 2620 figures' trend) | **25.6 GB** | 149 s |
+| 3144 | 37.8 GB (after the first round) | **25.6 GB** | 149 s |
 | 3668 | - | **33.6 GB** | 242 s |
 
 The peak is now about **4.4 GB + 2.17 GB per million token pairs** (it was 3.36), so the ceiling is
