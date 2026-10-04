@@ -510,3 +510,20 @@ The triangle contraction runs in a padded np x np space (np a multiple of 8): cu
 twice as fast on an aligned size (1044: 5.4 against 2.7 ms the pair of them). A multiple of 32 was
 the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2 rows against 72^2).
 
+
+## Device memory: what a fold holds
+
+`LOCALFOLD_MEM=1` prints the device in use at each phase and the largest scratch buffers.
+
+- **The transformer's conditioning GEMMs are no longer precomputed over every step.** They were held
+  for the schedule up to a 4 GB budget - rows x 24 blocks x 6C halves, **3.0 GB at 68 tokens x 200
+  steps and 2.3 at 525 x 25** - for 2% of the diffusion at 68 x 200 (308.8 against 315.6 ms), 1% at
+  68 x 25 (52.0 against 52.8), and a LOSS at 262 and 525 (71.5 against 69.9, 101.3 against 98.1),
+  interleaved on the A100. The diffusion phase now peaks at 5.31 GB at 68 x 200 (was 8.32) and 7.63
+  at 525 (was 10.54). The single conditioning's precompute stays: it is 42 MB at 68 x 200.
+- **What is left at the floor is the weights, twice**: the file's f32 device copy and, on `--fast`,
+  its f16 mirror (3.8 GB in use at "trunk built" with 0.04 of scratch). native/ef2 drops the ESM-C
+  tower's f32 copy after mirroring (`compactWeights`, 2.2 GB) because its tower reads only the mirror.
+  native/af3 cannot do that blind: layer-norm scales, biases and the f32 conditioning GEMMs read the f32
+  copy, and a path a first fold did not take (templates, an alignment, a ligand) may read one later -
+  so it wants the set of f32 readers named, as ef2's `towerHalf` names its own.
