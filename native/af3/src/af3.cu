@@ -392,6 +392,11 @@ int main(int argc, char** argv) {
     // (at 1 GB, 1044 tokens peaked at 21.3 GB with the trunk's 8 GB of scratch held to the end)
     bool tight = tightPair(pairs, t.C);
     if (tight) releaseScratch();
+    // on a card short of room the trunk's pair waits in host memory from here to the confidence head: the
+    // streamed preparation reads it a chunk of rows at a time and the sampler not at all
+    // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
+    if (!structural && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
+        parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); dP = nullptr; }
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
     // ...and the pair-sized tensors only the preparation reads, given back before the steps: the
     // transformer's and the encoder's pair LayerNorms and the per-super-block logits (1.4 GB at 1048
@@ -406,7 +411,7 @@ int main(int argc, char** argv) {
       // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
       // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
       releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj", "pt." });
-      if (!structural && parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); df.trunkPair = nullptr; }
+      if (!structural && t.pair && parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); df.trunkPair = nullptr; }
     }
     releaseConcatCopies(); memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the

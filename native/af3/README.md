@@ -637,3 +637,22 @@ At 3,200 the MSA stack is what stops it: the pair (5.2 GB), the blocked triangle
 and ~1.9 GB of weights. The next levers are 2-D tiles for the triangle (the fixed operand a quarter the
 size, recomputed four times - the projection is a tenth of the contraction's arithmetic) and dropping the
 file's f32 copy of tensors only read through their f16 mirror.
+
+### 🔴 6,000 tokens on a 40 GB A100
+
+**6,000 tokens folds** at a 37.7 GB peak in 19.9 minutes (trunk 18.1, diffusion at 100 steps 1.4,
+confidence 0.4), every consecutive CA-CA in band (median 3.885 A). Each attempt failed at the next holder
+and each holder had the same shape - a pair-sized intermediate kept whole for a reader that wants rows:
+
+| attempt failed at | what held | now |
+|---|---|---|
+| the pairformer's single attention | `[heads, n, n]` pair logits, scores and probabilities (6.9 GB) | blocks of query rows, each block's pair logits from its own pair rows |
+| the MSA stack, pass 2 | the MSA attention's pair-sized buffers through the block's pair track | given back as the attention ends |
+| the grid attention's bias | its 16-column projection of the whole pair (2.3 GB) | in chunks of pairs, each laid into the bias |
+| the distogram | `[pairs, bins]` logits and their half (9.2 GB each) | blocks of rows: a row's logit is its own half plus the transposed pair's |
+| the diffusion's preparation | the trunk's pair (18.4 GB) beside the f16 LayerNorm'd pair | the pair parked BEFORE the preparation, which reads it from the host a chunk at a time |
+
+Past 2^32 elements in one pair tensor (4.6e9 here) nothing overflowed: the indices are 64-bit and the
+per-channel ones stay under 2^32 to 65,536 tokens. The fixed cost at this size is the trunk's pair
+itself (18.4 GB in f32) and the blocked triangle's fixed operand (9.2 GB), which must be whole: a
+2-D tiling would read pair entries earlier tiles had written.

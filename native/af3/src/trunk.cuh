@@ -486,6 +486,8 @@ void msaAttention(Trunk& t, const std::string& pre) {
   T* gated = scratch<T>("msaatt.gated", rows * Wd);
   msaFromHeadsK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(oh, gate, gated, S, n, heads, d);
   linear<T, float>(gated, t.msa, rows, Wd, Cm, pre + ".outputProjection", false, 1.f);
+  // (on a card short of room its pair-sized buffers go now, before the block's pair track allocates)
+  if (shortPair(pairs, C)) releaseScratch({ "msaatt." });
 }
 
 template <class T>
@@ -556,6 +558,52 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   size_t pairs = (size_t)n * n;
   std::string A = B + ".singleAttention";
   int heads = (int)M.meta(A + ".heads"), d = (int)M.meta(A + ".dimension"), Wd = heads * d;
+  // On a card short of room, in blocks of query rows: each block's pair logits from its own pair rows, its
+  // scores, softmax and values - the [heads, n, n] logits, probabilities and pair logits never whole
+  // (6.9 GB at 6000 tokens). The softmax is a row's alone and the projection is per pair position.
+  if (shortPair(pairs, C) && !extraBias) {
+    int R = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)heads * n)));
+    float* pl = scratch<float>("st.pl", (size_t)heads * R * n);
+    float* logits = scratch<float>("st.logits", (size_t)heads * R * n);
+    T* P = scratch<T>("st.P", (size_t)heads * R * n);
+    T* nrm = scratch<T>("st.nrm", (size_t)n * Cs);
+    T* qkvg = scratch<T>("st.qkvg", (size_t)n * 4 * Wd);
+    T* o = scratch<T>("st.o", (size_t)n * Wd);
+    layerNorm2<float, T>(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
+    linear<T, T>(nrm, qkvg, n, Cs, 4 * Wd, qkvgWeight(A, Cs, Wd, false));
+    addQBiasK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(A + ".qBias"), n, Wd);
+    const float one = 1.f, zero = 0.f;
+    auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    float* flat = nullptr; T* ln = nullptr;
+    for (int i0 = 0; i0 < n; i0 += R) {
+      int r = std::min(R, n - i0); size_t rows = (size_t)r * n;
+      const float* prow = pair + (size_t)i0 * n * C;
+      bool fusedHeads = false;
+      if constexpr (std::is_same_v<T, half>)
+        if (C == 128 && heads == 16) {
+          lnHeads128<16>(prow, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset",
+                         B + ".singlePairLogitsProjection", pl, rows);
+          fusedHeads = true;
+        }
+      if (!fusedHeads) {
+        if (!flat) { flat = scratch<float>("st.flat", (size_t)heads * R * n); ln = scratch<T>("st.ln", (size_t)R * n * C); }
+        layerNorm2<float, T>(prow, ln, rows, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
+        linear<T, float>(ln, flat, rows, C, heads, B + ".singlePairLogitsProjection");
+        logitsLayoutK<<<blocks(rows * heads), 256, 0, STREAM>>>(flat, pl, rows, heads);
+      }
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, r, d, &one,
+         qkvg + Wd, cudaType<T>(), 4 * Wd, d, qkvg + (size_t)i0 * 4 * Wd, cudaType<T>(), 4 * Wd, d, &zero, logits, CUDA_R_32F, n,
+         rows, heads, CUBLAS_COMPUTE_32F, algo));
+      singleSoftmaxK<T><<<(unsigned)(heads * r), 128, 0, STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d));
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, r, n, &one,
+         qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), n, rows, &zero, o + (size_t)i0 * Wd, cudaType<T>(),
+         Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
+    }
+    gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd);
+    linear<T, float>(o, single, n, Wd, Cs, A + ".outputProjection", false, 1.f);
+    transition<T>(single, n, Cs, 4, B + ".singleTransition");
+    return;
+  }
   float* pl = scratch<float>("st.pl", pairs * heads);
   bool fused = false;
   if constexpr (std::is_same_v<T, half>)
@@ -640,9 +688,33 @@ inline std::vector<float> contactProbabilities(Trunk& t) {
   if (!M.has("batch.contactBins")) return {};
   int bins = (int)M.meta("trunk.distogram.bins");
   size_t pairs = (size_t)t.n * t.n;
+  float* out = scratch<float>("disto.contact", pairs);
+  if (shortPair(pairs, t.C)) {
+    // on a card short of room in blocks of rows: a row's symmetrised logit is its own half-logit plus the
+    // transposed pair's, so each block projects its rows and the column entries gathered from the pair -
+    // never the [pairs, bins] logits whole (9.2 GB at 6000 tokens, twice)
+    int n = t.n, C = t.C;
+    size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(C, bins))));
+    float* rowsT = scratch<float>("disto.rowsT", R * n * C);
+    float* a = scratch<float>("disto.half", R * n * bins); float* b = scratch<float>("disto.halfT", R * n * bins);
+    bool bias = hasW("trunk.distogram.halfLogitsBias");
+    for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
+      size_t r = std::min(R, (size_t)n - r0), rows = r * n;
+      linear<float, float>(t.pair + r0 * n * C, a, rows, C, bins, "trunk.distogram.halfLogits");
+      gatherTransposedK<<<blocks(rows * C * 4 / 16), 256, 0, STREAM>>>(t.pair, rowsT, n, C, r0, r, 4);
+      linear<float, float>(rowsT, b, rows, C, bins, "trunk.distogram.halfLogits");
+      if (bias) {
+        addBiasK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, W("trunk.distogram.halfLogitsBias"), rows, bins);
+        addBiasK<<<blocks(rows * bins), 256, 0, STREAM>>>(b, W("trunk.distogram.halfLogitsBias"), rows, bins);
+      }
+      addK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, b, rows * bins);
+      contactProbsK<<<blocks(rows), 256, 0, STREAM>>>(a, Idev("batch.contactBins") + r0 * n, t.pairMask + r0 * n,
+                                                      out + r0 * n, rows, bins);
+    }
+    return download(out, pairs);
+  }
   float* logits = scratch<float>("disto.logits", pairs * bins);
   distogram(t, logits);
-  float* out = scratch<float>("disto.contact", pairs);
   contactProbsK<<<blocks(pairs), 256, 0, STREAM>>>(logits, Idev("batch.contactBins"), t.pairMask, out, pairs, bins);
   return download(out, pairs);
 }

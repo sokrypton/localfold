@@ -119,8 +119,17 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
     const bool streamed = (bool)PAIR_CHUNK_SINK;
     DCACHE.pair = streamed ? nullptr : scratch<float>("dc.pair", pairs * Cz);
     float* chunk = streamed ? scratch<float>("dc.pairChunk", per * Cz) : nullptr;
+    // a trunk pair parked in host memory (af3.cu, a card short of room) is read a chunk of rows at a time:
+    // each chunk copied up, and `trunkPair` a base the chunk's own row offsets land inside
+    const bool fromHost = streamed && !trunkPair;
+    if (fromHost && !PARK_HOST) { fprintf(stderr, "the conditioning has no trunk pair\n"); exit(1); }
+    float* trunkRows = fromHost ? scratch<float>("dc.trunkRows", per * Czt) : nullptr;
     for (size_t p0 = 0; p0 < pairs; p0 += per) {
       size_t r = std::min(per, pairs - p0);
+      if (fromHost) {
+        CK(cudaMemcpyAsync(trunkRows, PARK_HOST + p0 * Czt, r * Czt * 4, cudaMemcpyHostToDevice, STREAM));
+        trunkPair = trunkRows - p0 * Czt;
+      }
       auto features = [&](float* outRows, int trunkWidth) {
         pairFeaturesK<<<blocks(r * (trunkWidth + rel)), 256, 0, STREAM>>>(trunkPair, Idev("batch.features.residueIndex"),
           Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), Idev("batch.features.entityId"),

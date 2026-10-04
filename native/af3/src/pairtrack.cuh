@@ -614,6 +614,17 @@ __global__ void biasLayoutHeadMajorK(const float* raw, TB* bias, int n, int stri
   float v = j < n ? scale * raw[(size_t)h * pairs + (swap ? ((size_t)j * n + i) : ((size_t)i * n + j))] : 0.f;
   bias[t] = fromF<TB>(v);
 }
+// the same from a chunk of pairs [r0, r0 + cnt) of raw (head-major over the chunk: [heads'][cnt]) - the
+// padding columns are the caller's to zero
+template <class TB>
+__global__ void biasFromRawRowsK(const float* raw, TB* bias, size_t r0, size_t cnt, int n, int stride, int heads,
+                                 bool swap, float scale) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)heads * cnt) return;
+  size_t h = t / cnt, q = t % cnt, p = r0 + q, a = p / n, b = p % n;      // pair p is (a, b)
+  size_t i = swap ? b : a, j = swap ? a : b;
+  bias[(h * n + i) * stride + j] = fromF<TB>(scale * raw[h * cnt + q]);
+}
 // a (C, k) weight zero-padded to (C, kp) columns
 inline std::string paddedColumns(const std::string& w, int C, int k, int kp) {
   return concatColumns(w + "~pad" + std::to_string(kp), C, {{w, k, false}, {"", kp - k, false}});
@@ -660,7 +671,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // A100), and at 1048 it is 1.13 GB the chunks do not hold (trunk peak 12.88 against 11.73 GB) -
       // nothing on 40 GB, the difference between fitting and not near a T4's 15
       static const size_t gridWhole = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t / 32; }();
-      if (pairs * 4 * Wd * 2 <= gridWhole) {
+      if (!BIG_FORCED && pairs * 4 * Wd * 2 <= gridWhole) {
         // every row in one pass (this card has the memory): the bias written by the same kernel
         CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // the padding columns
         half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);
@@ -671,10 +682,23 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         else gridOut128(gathered, pre + ".outputProjection", pair, n, 0, pairs, tr);
         return;
       }
+      if (shortPair(pairs, C)) {
+        // on a card short of room the 16-column projection in chunks of pairs, each laid into the bias
+        size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / 16));
+        float* raw = scratch<float>("grid.raw16", per * 16);
+        CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));     // the padding columns
+        for (size_t r0 = 0; r0 < pairs; r0 += per) {
+          size_t r = std::min(per, pairs - r0);
+          lnHeads128<16>(pair + r0 * C, pre + ".actNormScale", pre + ".actNormOffset", wb, raw, r);
+          biasFromRawRowsK<half><<<blocks((size_t)heads * r), 256, 0, STREAM>>>(raw, bias, r0, r, n, stride, heads,
+                                                                              tr && swapBias, LOG2E);
+        }
+      } else {
       float* raw = scratch<float>("grid.raw16", pairs * 16);
       lnHeads128<16>(pair, pre + ".actNormScale", pre + ".actNormOffset", wb, raw, pairs);
       biasLayoutHeadMajorK<half><<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(
         raw, bias, n, stride, heads, tr && swapBias, LOG2E);
+      }
       size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
       for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
         size_t rows = std::min(R, (size_t)n - r0), prs = rows * n;
