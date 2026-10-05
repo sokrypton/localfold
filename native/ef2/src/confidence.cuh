@@ -23,17 +23,22 @@ __global__ void outerProductK(const float* a, const float* b, float* out, size_t
   int c = (int)(t % C); size_t ij = p0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
   out[t] = a[(size_t)i * C + c] * b[(size_t)j * C + c];
 }
+// a warp a pair: its distance and bucket once (a ballot over the edges), then the row 16 bytes a lane - an
+// element a thread took the distance and walked every edge for each of the C channels (12 ms of a 1,044-token
+// confidence head's 194; C a multiple of 4)
 __global__ void distanceEmbedK(float* z, const float* x, const int* rep, const float* edges, int nEdges,
                                const float* table, int T, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)T * T * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
+  size_t ij = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5; int lane = threadIdx.x & 31;
+  if (ij >= (size_t)T * T) return;
+  int i = (int)(ij / T), j = (int)(ij % T);
   const float* a = x + (size_t)rep[i] * 3; const float* b = x + (size_t)rep[j] * 3;
   float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
   float d = sqrtf(dx * dx + dy * dy + dz * dz);
   int bucket = 0;
-  for (int e = 0; e < nEdges; ++e) bucket += d > edges[e];
-  z[t] += table[(size_t)bucket * C + c];
+  for (int e0 = 0; e0 < nEdges; e0 += 32) bucket += __popc(__ballot_sync(~0u, e0 + lane < nEdges && d > edges[e0 + lane]));
+  float4* row = reinterpret_cast<float4*>(z + ij * C);
+  const float4* tb = reinterpret_cast<const float4*>(table + (size_t)bucket * C);
+  for (int c = lane; c < C / 4; c += 32) { float4 v = row[c], w = tb[c]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; row[c] = v; }
 }
 // row-attention pooling: pooled[i] = sum_j softmax_j(score[i, j]) z[i, j]   (a block per row, C <= 1024)
 __global__ void rowPoolK(const float* z, const float* score, float* pooled, int T, int C) {
@@ -139,7 +144,7 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
     outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prod, p0, n, T, C);
     gemm(prod, F("confidence/sToZProdOut"), z + p0 * C, n, C, C, 1.f);
   }
-  distanceEmbedK<<<blocks(P * C), 256, 0, STREAM>>>(z, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
+  distanceEmbedK<<<blocks(P * 32), 256, 0, STREAM>>>(z, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
     (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), T, C);
   // z + trunk(z) - on a card short of room z waits in pinned host memory while the blocks run on it in place,
   // then comes back a chunk at a time and is added (the same sum: one more pair-sized tensor not on the card)

@@ -133,8 +133,11 @@ static int foldInput(const Opts& o, bool warm) {
   int A = (int)M.meta("meta/atoms"), Si = (int)M.meta("meta/singleInputs");
   float* sInputs = dalloc((size_t)T * Si);
   t0 = std::chrono::steady_clock::now();
+  bool profIn = profile && getenv("EF2_PROFILE") && std::string(getenv("EF2_PROFILE")) == "inputs";
+  if (profIn) { prof::init(); prof::start(); }
   inputsEmbedder(T, A, sInputs, Si, check);
   CK(cudaStreamSynchronize(STREAM));
+  if (profIn) prof::stop(15);
   say("inputs embedder %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   if (check) checkOracle("s_inputs", sInputs, (size_t)T * Si, "o/s_inputs");
   int C = e.pair;
@@ -161,7 +164,7 @@ static int foldInput(const Opts& o, bool warm) {
   bool tight = (size_t)T * T * C * 4 > ((size_t)128 << 20);
   if (tight) releaseScratch();
   t0 = std::chrono::steady_clock::now();
-  // --profile times one stage's kernels: EF2_PROFILE=trunk (the default), lm, sampler or confidence
+  // --profile times one stage's kernels: EF2_PROFILE=trunk (the default), lm, inputs, sampler or confidence
   std::string profStage = getenv("EF2_PROFILE") ? getenv("EF2_PROFILE") : "trunk";
   bool profTrunk = profile && profStage == "trunk";
   if (profTrunk) { prof::init(); prof::start(); }
