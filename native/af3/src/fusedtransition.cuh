@@ -100,7 +100,7 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
       for (int m = 0; m < MT; ++m) {
         auto gate = [&](int nt, int e) {
           if constexpr (RELU) return fmaxf(ha[m][nt][e] + b1[j * NC + nt * 8 + tig * 2 + (e & 1)], 0.f);
-          else { float v = ha[m][nt][e]; return v * sigm(v) * hb[m][nt][e]; }
+          else { float v = ha[m][nt][e]; return v * sigmH(v) * hb[m][nt][e]; }   // packed to f16 next
         };
         pa[m][0] = pack2(gate(2 * t, 0), gate(2 * t, 1)); pa[m][1] = pack2(gate(2 * t, 2), gate(2 * t, 3));
         pa[m][2] = pack2(gate(2 * t + 1, 0), gate(2 * t + 1, 1)); pa[m][3] = pack2(gate(2 * t + 1, 2), gate(2 * t + 1, 3));
@@ -114,18 +114,35 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
       }
     }
   }
-  // the residual: rows g and g + 8 of each of the warp's 16-row tiles, columns et*8 + 2 tig (+1)
+  // the residual, through the warp's own Xs rows (only it read them, as its A fragments; the loop's
+  // barriers are behind every warp) 64 f32 columns at a time, so the read-modify-write is 16 bytes a lane
+  // of whole rows, where a fragment's layout was 8 bytes in each of 8 rows
+  constexpr int RW = 16 * MT, LDY = C / 2 + 4;
+  static_assert(C == 128 && RW * LDY * 4 <= RW * LDX * 2, "a half of the warp's accumulators fits in its rows");
+  float* Ys = reinterpret_cast<float*>(Xs + warp * RW * LDX);
 #pragma unroll
-  for (int m = 0; m < MT; ++m) {
-    size_t r0 = row0 + (warp * MT + m) * 16 + g, r1 = r0 + 8;
+  for (int hh = 0; hh < 2; ++hh) {
 #pragma unroll
-    for (int et = 0; et < NT; ++et) {
-      int c = et * 8 + tig * 2;
-      float o0 = 0.f, o1 = 0.f;
-      if constexpr (RELU) { o0 = b2[c]; o1 = b2[c + 1]; }
-      if (r0 < rows) { float2* p = (float2*)(x + r0 * C + c); float2 v = *p; v.x += acc[m][et][0] + o0; v.y += acc[m][et][1] + o1; *p = v; }
-      if (r1 < rows) { float2* p = (float2*)(x + r1 * C + c); float2 v = *p; v.x += acc[m][et][2] + o0; v.y += acc[m][et][3] + o1; *p = v; }
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int e8 = 0; e8 < NT / 2; ++e8) {
+        int et = hh * (NT / 2) + e8, c = e8 * 8 + tig * 2;
+        *reinterpret_cast<float2*>(Ys + (m * 16 + g) * LDY + c) = make_float2(acc[m][et][0], acc[m][et][1]);
+        *reinterpret_cast<float2*>(Ys + (m * 16 + g + 8) * LDY + c) = make_float2(acc[m][et][2], acc[m][et][3]);
+      }
+    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < RW / 2; ++i) {                          // row i * 2 + lane / 16, columns (lane % 16) * 4
+      int rl = i * 2 + (lane >> 4), cl = (lane & 15) * 4, c = hh * (C / 2) + cl;
+      size_t row = row0 + warp * RW + rl;
+      if (row >= rows) continue;
+      float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl);
+      float4* p = (float4*)(x + row * C + c); float4 v = *p;
+      float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+      if constexpr (RELU) { o0 = b2[c]; o1 = b2[c + 1]; o2 = b2[c + 2]; o3 = b2[c + 3]; }
+      v.x += a4.x + o0; v.y += a4.y + o1; v.z += a4.z + o2; v.w += a4.w + o3; *p = v;
     }
+    __syncwarp();
   }
 }
 

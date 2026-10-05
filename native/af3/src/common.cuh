@@ -1116,6 +1116,14 @@ template <class T> __device__ __forceinline__ T fromF(float v) {
   if constexpr (std::is_same_v<T, float>) return v; else return __float2half(v);
 }
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x)); }
+// the sigmoid on one MUFU op (tanh.approx: |error| of the sigmoid <= ~2.5e-4) where exp and a reciprocal
+// were two - only where that is below the noise already there: a result rounded to f16 straight after
+// (its own step ~4.9e-4 relative), or the triangle output's gate, whose update comes off a bf16 product
+// (~4e-3 relative). The transition, triangle-input and triangle-output kernels' sigmoids (ncu: 11-18% of
+// their stall samples); a 5CAJ fold moves 0.006 A rms
+__device__ __forceinline__ float sigmH(float x) {
+  float t; asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(0.5f * x)); return fmaf(0.5f, t, 0.5f);
+}
 
 // The fast path's remaining f32 GEMMs (the conditioning, the atom blocks' aggregation and
 // broadcast projections, ...) on the tensor cores in TF32 - a 10-bit mantissa, as f16 has

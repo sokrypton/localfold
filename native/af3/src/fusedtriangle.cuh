@@ -176,11 +176,11 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       // nt*8 + 2 tig is channel nt*4 + tig of the step's 16; staged channel-major
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
-        int ch = nt * 4 + tig;
-        Ta[ch * LDT + lr0] = TA(p[nt][0] * sigm(q[nt][0]) * m0);
-        Tb[ch * LDT + lr0] = TA(p[nt][1] * sigm(q[nt][1]) * m0);
-        Ta[ch * LDT + lr1] = TA(p[nt][2] * sigm(q[nt][2]) * m1);
-        Tb[ch * LDT + lr1] = TA(p[nt][3] * sigm(q[nt][3]) * m1);
+        int ch = nt * 4 + tig;                    // (sigmH: the product is rounded to 16 bits next)
+        Ta[ch * LDT + lr0] = TA(p[nt][0] * sigmH(q[nt][0]) * m0);
+        Tb[ch * LDT + lr0] = TA(p[nt][1] * sigmH(q[nt][1]) * m0);
+        Ta[ch * LDT + lr1] = TA(p[nt][2] * sigmH(q[nt][2]) * m1);
+        Tb[ch * LDT + lr1] = TA(p[nt][3] * sigmH(q[nt][3]) * m1);
       }
       __syncthreads();
       // 16 bytes (8 rows) a thread: the channel stride cs is a multiple of 8, the block's first
@@ -273,12 +273,12 @@ __global__ void __launch_bounds__(WARPS * 32) triOutK(const TP* __restrict__ pro
     if (p0 != SIZE_MAX) {
       float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r0 * C + c));
       float2* p = (float2*)(pair + p0 * C + c); float2 v = *p;
-      v.x += (acc[et][0] + ob0) * sigm(gt.x); v.y += (acc[et][1] + ob1) * sigm(gt.y); *p = v;
+      v.x += (acc[et][0] + ob0) * sigmH(gt.x); v.y += (acc[et][1] + ob1) * sigmH(gt.y); *p = v;
     }
     if (p1 != SIZE_MAX) {
       float2 gt = __half22float2(*reinterpret_cast<const half2*>(t2 + r1 * C + c));
       float2* p = (float2*)(pair + p1 * C + c); float2 v = *p;
-      v.x += (acc[et][2] + ob0) * sigm(gt.x); v.y += (acc[et][3] + ob1) * sigm(gt.y); *p = v;
+      v.x += (acc[et][2] + ob0) * sigmH(gt.x); v.y += (acc[et][3] + ob1) * sigmH(gt.y); *p = v;
     }
   }
 }
@@ -324,19 +324,26 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
     else cpWait<0>();
     // the epilogue's operands, loaded now so the norm and the GEMM cover their latency (one block
     // an SM: nothing else would)
-    size_t r0 = tile * R + warp * 16 + g, r1 = r0 + 8;
     auto pairOf = [&](size_t q) -> size_t {
       if (q >= pp) return SIZE_MAX;
       unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
       return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
     };
-    size_t p0 = pairOf(r0), p1 = pairOf(r1);
-    float2 pv[NT][2]; half2 gv[NT][2];
+    // in the epilogue's layout (below): half hh of the columns, piece i - row i * 2 + lane / 16 of the
+    // warp's 16, columns hh * 64 + (lane % 16) * 4 .. + 4 - so a load is 16 bytes of pair and 8 of gate,
+    // whole rows, where a fragment's layout was 8 and 4 bytes in each of 8 rows (ncu: lg_throttle 35%)
+    constexpr int EP = 16 * (C / 2) / 4 / 32;                       // pieces a lane, a half
+    static_assert(C == 128 && EP == 8, "the epilogue is laid out for C 128");
+    size_t pe[EP]; float4 pv[2][EP]; uint2 gv[2][EP];
 #pragma unroll
-    for (int et = 0; et < NT; ++et) {
-      int c = et * 8 + tig * 2;
-      if (p0 != SIZE_MAX) { pv[et][0] = *(const float2*)(pair + p0 * C + c); gv[et][0] = *reinterpret_cast<const half2*>(t2 + r0 * C + c); }
-      if (p1 != SIZE_MAX) { pv[et][1] = *(const float2*)(pair + p1 * C + c); gv[et][1] = *reinterpret_cast<const half2*>(t2 + r1 * C + c); }
+    for (int i = 0; i < EP; ++i) {
+      size_t rr = tile * R + warp * 16 + i * 2 + (lane >> 4);
+      pe[i] = pairOf(rr);
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        int c = hh * (C / 2) + (lane & 15) * 4;
+        if (pe[i] != SIZE_MAX) { pv[hh][i] = *(const float4*)(pair + pe[i] * C + c); gv[hh][i] = *reinterpret_cast<const uint2*>(t2 + rr * C + c); }
+      }
     }
     __syncthreads();
     const TP* Ps = Pst + st * C * LDP;
@@ -383,19 +390,35 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
         mma16816(acc[et + 1], xa[ks], f[2], f[3]);
       }
     }
+    // the accumulators through the warp's own Xs rows (dead since its fragments were loaded; the next
+    // tile's norm writes them after the loop's last barrier), 64 f32 columns at a time - 16 rows of 68
+    // floats is exactly those rows' 4352 bytes - then written back as whole-row pieces
+    float* Ys = reinterpret_cast<float*>(Xs + warp * 16 * LDX);
+    constexpr int LDY = C / 2 + 4;
+    static_assert(16 * LDY * 4 <= 16 * LDX * 2, "a half of the warp's accumulators fits in its rows");
 #pragma unroll
-    for (int et = 0; et < NT; ++et) {
-      int c = et * 8 + tig * 2;
-      float ob0 = 0.f, ob1 = 0.f;
-      if constexpr (BIAS) { ob0 = bias[c]; ob1 = bias[c + 1]; }
-      if (p0 != SIZE_MAX) {
-        float2 gt = __half22float2(gv[et][0]), v = pv[et][0];
-        v.x += (acc[et][0] + ob0) * sigm(gt.x); v.y += (acc[et][1] + ob1) * sigm(gt.y); *(float2*)(pair + p0 * C + c) = v;
+    for (int hh = 0; hh < 2; ++hh) {
+#pragma unroll
+      for (int e8 = 0; e8 < NT / 2; ++e8) {
+        int et = hh * (NT / 2) + e8, c = e8 * 8 + tig * 2;
+        *reinterpret_cast<float2*>(Ys + g * LDY + c) = make_float2(acc[et][0], acc[et][1]);
+        *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[et][2], acc[et][3]);
       }
-      if (p1 != SIZE_MAX) {
-        float2 gt = __half22float2(gv[et][1]), v = pv[et][1];
-        v.x += (acc[et][2] + ob0) * sigm(gt.x); v.y += (acc[et][3] + ob1) * sigm(gt.y); *(float2*)(pair + p1 * C + c) = v;
+      __syncwarp();
+#pragma unroll
+      for (int i = 0; i < EP; ++i) {
+        if (pe[i] == SIZE_MAX) continue;
+        int rl = i * 2 + (lane >> 4), cl = (lane & 15) * 4, c = hh * (C / 2) + cl;
+        float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl), v = pv[hh][i];
+        float2 g01 = __half22float2(*reinterpret_cast<const half2*>(&gv[hh][i].x));
+        float2 g23 = __half22float2(*reinterpret_cast<const half2*>(&gv[hh][i].y));
+        float b0 = 0.f, b1 = 0.f, b2 = 0.f, b3 = 0.f;
+        if constexpr (BIAS) { b0 = bias[c]; b1 = bias[c + 1]; b2 = bias[c + 2]; b3 = bias[c + 3]; }
+        v.x += (a4.x + b0) * sigmH(g01.x); v.y += (a4.y + b1) * sigmH(g01.y);
+        v.z += (a4.z + b2) * sigmH(g23.x); v.w += (a4.w + b3) * sigmH(g23.y);
+        *(float4*)(pair + pe[i] * C + c) = v;
       }
+      __syncwarp();
     }
     __syncthreads();                                                 // Xs and this stage are reused
   }
@@ -675,6 +698,23 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
     cpAsync16(Xs + r * LDX + c, gathered + (q < rows ? q : 0) * WD + c, q < rows);
   }
   cpCommit();
+  // the residual's rows, read before the GEMM covers their latency, in the epilogue's layout: half hh of
+  // the columns, piece i - row i * 2 + lane / 16 of the warp's 16, columns hh * 64 + (lane % 16) * 4 - so
+  // the read-modify-write is 16 bytes a lane of whole rows, where a fragment's layout was 8 bytes in each
+  // of 8 rows (ncu: 69% of the kernel's stall samples on those two lines)
+  constexpr int EP = 16 * (C / 2) / 4 / 32;
+  static_assert(C == 128 && EP == 8 && WD == 128, "the epilogue is laid out for C 128");
+  size_t pe[EP]; float4 pv[2][EP];
+#pragma unroll
+  for (int i = 0; i < EP; ++i) {
+    size_t q = row0 + warp * 16 + i * 2 + (lane >> 4);
+    if (q < rows) {
+      unsigned Q = (unsigned)(q0 + q), a = Q / (unsigned)n;           // 32-bit: a 64-bit divide is ~70 instructions
+      pe[i] = tr ? (size_t)(Q - a * (unsigned)n) * n + a : (size_t)Q;
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) pv[hh][i] = *(const float4*)(pair + pe[i] * C + hh * (C / 2) + (lane & 15) * 4);
+    } else pe[i] = SIZE_MAX;
+  }
   cpWait<0>();
   __syncthreads();
   float acc[NT][4] = {};
@@ -689,17 +729,29 @@ __global__ void __launch_bounds__(WARPS * 32) gridOutK(const half* __restrict__ 
       mma16816(acc[et], xa, f[0], f[1]); mma16816(acc[et + 1], xa, f[2], f[3]);
     }
   }
-  size_t qa = row0 + warp * 16 + g;
-  for (int half8 = 0; half8 < 2; ++half8) {
-    size_t q = qa + half8 * 8;
-    if (q >= rows) continue;
-    size_t Q = q0 + q, p = tr ? (Q % n) * n + Q / n : Q;
+  // the accumulators through the warp's own Xs rows (only it read them), 64 f32 columns at a time
+  float* Ys = reinterpret_cast<float*>(Xs + warp * 16 * LDX);
+  constexpr int LDY = C / 2 + 4;
+  static_assert(16 * LDY * 4 <= 16 * LDX * 2, "a half of the warp's accumulators fits in its rows");
+  __syncwarp();
 #pragma unroll
-    for (int et = 0; et < NT; ++et) {
-      int c = et * 8 + tig * 2;
-      float2* d = (float2*)(pair + p * C + c); float2 v = *d;
-      v.x += acc[et][half8 * 2]; v.y += acc[et][half8 * 2 + 1]; *d = v;
+  for (int hh = 0; hh < 2; ++hh) {
+#pragma unroll
+    for (int e8 = 0; e8 < NT / 2; ++e8) {
+      int et = hh * (NT / 2) + e8, c = e8 * 8 + tig * 2;
+      *reinterpret_cast<float2*>(Ys + g * LDY + c) = make_float2(acc[et][0], acc[et][1]);
+      *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[et][2], acc[et][3]);
     }
+    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < EP; ++i) {
+      if (pe[i] == SIZE_MAX) continue;
+      int rl = i * 2 + (lane >> 4), cl = (lane & 15) * 4;
+      float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl), v = pv[hh][i];
+      v.x += a4.x; v.y += a4.y; v.z += a4.z; v.w += a4.w;
+      *(float4*)(pair + pe[i] * C + hh * (C / 2) + cl) = v;
+    }
+    __syncwarp();
   }
 }
 constexpr int GI_WARPS = 8, GO_WARPS = 8;

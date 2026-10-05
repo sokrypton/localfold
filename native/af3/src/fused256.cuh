@@ -69,7 +69,7 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
     size_t r0 = row0 + warp * 16 + g, r1 = r0 + 8;
 #pragma unroll
     for (int nt = 0; nt < NC / 8; ++nt) {
-      auto gate = [&](int e) { float v = ha[nt][e]; return v * sigm(v) * hb[nt][e]; };
+      auto gate = [&](int e) { float v = ha[nt][e]; return v * sigmH(v) * hb[nt][e]; };   // rounded to f16 next
       int c = j * NC + nt * 8 + tig * 2;
       if (r0 < rows) *reinterpret_cast<uint32_t*>(gated + r0 * I + c) = pack2(gate(0), gate(1));
       if (r1 < rows) *reinterpret_cast<uint32_t*>(gated + r1 * I + c) = pack2(gate(2), gate(3));
@@ -214,7 +214,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restri
       uint2 gw = *reinterpret_cast<const uint2*>(t2 + padded(row) * C + c);
       float2 g01 = __half22float2(*reinterpret_cast<half2*>(&gw.x)), g23 = __half22float2(*reinterpret_cast<half2*>(&gw.y));
       float4* d = reinterpret_cast<float4*>(pair + row * C + c); float4 v = *d;
-      v.x += o.x * sigm(g01.x); v.y += o.y * sigm(g01.y); v.z += o.z * sigm(g23.x); v.w += o.w * sigm(g23.y);
+      v.x += o.x * sigmH(g01.x); v.y += o.y * sigmH(g01.y); v.z += o.z * sigmH(g23.x); v.w += o.w * sigmH(g23.y);
       *d = v;
     }
     __syncthreads();
@@ -314,10 +314,10 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
         int ch = nt * 4 + tig;
-        Ta[ch * LDT + lr0] = __float2half(p[nt][0] * sigm(q[nt][0]) * m0);
-        Tb[ch * LDT + lr0] = __float2half(p[nt][1] * sigm(q[nt][1]) * m0);
-        Ta[ch * LDT + lr1] = __float2half(p[nt][2] * sigm(q[nt][2]) * m1);
-        Tb[ch * LDT + lr1] = __float2half(p[nt][3] * sigm(q[nt][3]) * m1);
+        Ta[ch * LDT + lr0] = __float2half(p[nt][0] * sigmH(q[nt][0]) * m0);
+        Tb[ch * LDT + lr0] = __float2half(p[nt][1] * sigmH(q[nt][1]) * m0);
+        Ta[ch * LDT + lr1] = __float2half(p[nt][2] * sigmH(q[nt][2]) * m1);
+        Tb[ch * LDT + lr1] = __float2half(p[nt][3] * sigmH(q[nt][3]) * m1);
       }
       __syncthreads();
 #pragma unroll
