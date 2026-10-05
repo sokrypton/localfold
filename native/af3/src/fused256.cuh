@@ -116,8 +116,10 @@ __host__ __device__ constexpr size_t triangleOutSmem() {
   constexpr size_t tile = (size_t)C * (R + 1) * sizeof(TT), stages = (size_t)2 * C * (NC + 8) * 2 + (size_t)R * (NC + 4) * 4;
   return (tile > stages ? tile : stages) + 2 * (size_t)R * 4;
 }
-template <int C, int WARPS, class TT = float, int NC = 32>
-__global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restrict__ prod, const float* __restrict__ cnScale,
+// TP: the product's type in memory - f32, or bf16 (ESMFold2's: the contraction writes half the bytes and
+// this reads half; the tile is bf16 either way)
+template <int C, int WARPS, class TT = float, int NC = 32, class TP = float>
+__global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Wout, const half* __restrict__ t2,
     float* __restrict__ pair, int L, int Lp) {
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + 1, LDW = NC + 8, KS = C / 16;
@@ -136,9 +138,9 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restri
     int r = threadIdx.x % R;
     size_t row = row0 + r;
     bool live = row < P;
-    const float* src = prod + (live ? padded(row) : 0);
+    const TP* src = prod + (live ? padded(row) : 0);
 #pragma unroll 32
-    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? src[(size_t)c * plane] : 0.f);
+    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? (float)src[(size_t)c * plane] : 0.f);
   }
   __syncthreads();
   for (int r = warp; r < R; r += WARPS) {                     // the centre norm's mean and 1/sd, a warp a row
@@ -227,10 +229,11 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const float* __restri
 // rows' memory once they are A fragments, so a block is the rows' 68 KB and two fit an SM.
 // Output as triInK's: a, b channel-major padded planes (interleaved split, masked), t2 the gating
 // linear's raw output over the padded rows.
-template <int C, int WARPS>
+// TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (an f16 one overflows)
+template <int C, int WARPS, class TA = half>
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wpg,
-    const half* __restrict__ Wg, half* __restrict__ a, half* __restrict__ b, half* __restrict__ t2, int n, int np,
+    const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np,
     size_t cs) {
   // the weight stage is unpadded, [k][NC], its two 16-byte halves swapped on rows with bit 2 of k set
   // (sw): the padded 48-byte rows kept ldmatrix conflict-free but serialised the cp.async writes ~6.7x
@@ -250,8 +253,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   half* Xs = (half*)smem;
   auto W0 = [&](int s) { return (half*)(smem + s * STAGE); };
   auto W1 = [&](int s) { return W0(s) + C * LDW; };
-  half* Ta = (half*)(smem + 2 * STAGE);
-  half* Tb = Ta + CH * LDT;
+  TA* Ta = (TA*)(smem + 2 * STAGE);
+  TA* Tb = Ta + CH * LDT;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * R;
   const int abSteps = C / CH, steps = abSteps + C / NC;
@@ -314,10 +317,10 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
         int ch = nt * 4 + tig;
-        Ta[ch * LDT + lr0] = __float2half(p[nt][0] * sigmH(q[nt][0]) * m0);
-        Tb[ch * LDT + lr0] = __float2half(p[nt][1] * sigmH(q[nt][1]) * m0);
-        Ta[ch * LDT + lr1] = __float2half(p[nt][2] * sigmH(q[nt][2]) * m1);
-        Tb[ch * LDT + lr1] = __float2half(p[nt][3] * sigmH(q[nt][3]) * m1);
+        Ta[ch * LDT + lr0] = TA(p[nt][0] * sigmH(q[nt][0]) * m0);
+        Tb[ch * LDT + lr0] = TA(p[nt][1] * sigmH(q[nt][1]) * m0);
+        Ta[ch * LDT + lr1] = TA(p[nt][2] * sigmH(q[nt][2]) * m1);
+        Tb[ch * LDT + lr1] = TA(p[nt][3] * sigmH(q[nt][3]) * m1);
       }
       __syncthreads();
 #pragma unroll
@@ -338,8 +341,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 }
 
 // the triangle's output side, launched: the bf16 tile at 16-column stages (LOCALFOLD_TRIOUT_F32=1: the float tile)
-template <int C, int WARPS>
-void triangleOutRun(const float* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
+template <int C, int WARPS, class TP = float>
+void triangleOutRun(const TP* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
                     int L, int Lp) {
   static const bool f32 = getenv("LOCALFOLD_TRIOUT_F32") != nullptr;
   constexpr int R = 16 * WARPS;
@@ -347,13 +350,13 @@ void triangleOutRun(const float* prod, const float* sc, const float* of, const h
   if (f32) {
     constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32>();
     static bool attr = false;
-    if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32>), (int)smem); attr = true; }
-    triangleOutK<C, WARPS, float, 32><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, Wout, t2, pair, L, Lp);
+    if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP>), (int)smem); attr = true; }
+    triangleOutK<C, WARPS, float, 32, TP><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, Wout, t2, pair, L, Lp);
   } else {
     constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16>();
     static bool attr = false;
-    if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16>), (int)smem); attr = true; }
-    triangleOutK<C, WARPS, __nv_bfloat16, 16><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, Wout, t2, pair, L, Lp);
+    if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP>), (int)smem); attr = true; }
+    triangleOutK<C, WARPS, __nv_bfloat16, 16, TP><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, Wout, t2, pair, L, Lp);
   }
 }
 

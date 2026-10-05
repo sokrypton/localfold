@@ -136,20 +136,34 @@ inline void pairTransition(float* pair, int L, int C, const std::string& Tn) {
 }
 // the 256-channel block on the fused kernels (fused256.cuh): triInK -> the f16 contraction -> triangleOutK,
 // and transitionUpK -> the second GEMM (cuBLASLt, the residual as beta)
-inline void triangle256(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+#include "../../af3/src/tricontract.cuh"
+// a and b in bf16 and the product written bf16 (AF3's triangle: TRI_BF16), half the bytes of the f32 product
+// both ways; LOCALFOLD_EF2_TRI_F16=1 keeps f16 operands and the f32 product
+inline bool EF2_TRI_BF16 = !getenv("LOCALFOLD_EF2_TRI_F16");
+template <class TA, class TP>
+inline void triangle256As(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing,
+                          cudaDataType ta, cudaDataType tp) {
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
-  half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
+  TA* a = scratch<TA>("ftri.a", plane * C); TA* b = scratch<TA>("ftri.b", plane * C);
   half* t2 = scratch<half>("ftri.t2", plane * C);
   triIn256<8>(pair, mask, Tn, a, b, t2, L, Lp, plane);
-  float* prod = scratch<float>("ftri.prod", plane * C);
+  TP* prod = scratch<TP>("ftri.prod", plane * C);
+  if constexpr (std::is_same_v<TA, __nv_bfloat16>) {   // native/af3's contraction, a cached plan at every size
+    triContractBf16(outgoing, Lp, plane, C, 1.f, a, b, prod, true);
+  } else {
   const float one = 1.f, zero = 0.f;
   if (outgoing)
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16F, Lp, plane, a, CUDA_R_16F, Lp,
-                                  plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, ta, Lp, plane, a, ta, Lp,
+                                  plane, &zero, prod, tp, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
   else
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16F, Lp, plane, b, CUDA_R_16F, Lp,
-                                  plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, ta, Lp, plane, b, ta, Lp,
+                                  plane, &zero, prod, tp, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  }
   triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp);
+}
+inline void triangle256(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+  if (EF2_TRI_BF16) triangle256As<__nv_bfloat16, __nv_bfloat16>(pair, mask, L, C, Tn, outgoing, CUDA_R_16BF, CUDA_R_16BF);
+  else triangle256As<half, float>(pair, mask, L, C, Tn, outgoing, CUDA_R_16F, CUDA_R_32F);
 }
 inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
   int I = (int)dimOf("f/" + Tn + "transition2", 0);

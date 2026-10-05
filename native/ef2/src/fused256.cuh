@@ -19,19 +19,19 @@ void transitionUp(const float* x, const float* sc, const float* of, const half* 
   if (!attr) { smemAttr((transitionUpK<C, WARPS>), (int)smem); attr = true; }
   transitionUpK<C, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, sc, of, W1, gated, rows, I);
 }
-template <int WARPS>
-void triangleOut(const float* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
+template <int WARPS, class TP>
+void triangleOut(const TP* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
                  int L, int Lp) {
-  triangleOutRun<256, WARPS>(prod, sc, of, Wout, t2, pair, L, Lp);
+  triangleOutRun<256, WARPS, TP>(prod, sc, of, Wout, t2, pair, L, Lp);
 }
-template <int WARPS>
-void triIn256(const float* pair, const float* mask, const std::string& Tn, half* a, half* b, half* t2, int n, int np, size_t cs) {
+template <int WARPS, class TA>
+void triIn256(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
   constexpr int C = 256, R = 16 * WARPS;
   size_t pp = (size_t)np * np, smem = (size_t)R * (C + 8) * 2;
   static bool attr = false;
-  if (!attr) { smemAttr((triIn256K<C, WARPS>), (int)smem); attr = true; }
+  if (!attr) { smemAttr((triIn256K<C, WARPS, TA>), (int)smem); attr = true; }
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", C, {{"f/" + Tn + "projection", 2 * C, false},
                                                                    {"f/" + Tn + "gate", 2 * C, false}});
-  triIn256K<C, WARPS><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+  triIn256K<C, WARPS, TA><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     pair, mask, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"), Wh(pg), Fh(Tn + "gatingLinear"), a, b, t2, n, np, cs);
 }
