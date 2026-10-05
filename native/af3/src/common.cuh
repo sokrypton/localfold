@@ -166,7 +166,14 @@ struct Segment { const float* data; size_t bytes; float* device; std::map<std::s
                  bool bundle = false; std::string dir; std::vector<std::string> files; std::vector<BRec> recs;
                  std::map<int, std::vector<float>> hostCopies;     // a bundle tensor the host read, decoded
                  std::vector<BRec> srcRecs; size_t scratchElems = 0; std::vector<GPart> parts;   // (gathered tensors)
+                 // RESIDENT int8 (loadBundle's residentPrefix): tensors kept on the device as their codes and float16
+                 // scales, never decoded into the float32 copy - a model too large for it (ESM-C 6B: 25 GB as float32,
+                 // 6.4 GB as codes) - each with where its codes and scales land in `resident`
+                 struct Res { BRec b; size_t codes, scales; };
+                 std::vector<Res> residentRecs; unsigned char* resident = nullptr; size_t residentBytes = 0;
                };
+// a resident int8 tensor on the device: codes, a float16 scale per `block` consecutive elements
+struct ResidentInt8 { const signed char* codes; const __half* scales; size_t elements; int block; };
 struct Model {
   std::map<std::string, Entry> index;
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
@@ -216,7 +223,7 @@ struct Model {
   // With `map` (a port's .map, native/make_map.mjs), the entries are the map's instead: each `b` line a
   // slice of a bundle tensor under the port's own name, each `z` zeros, each `m` metadata as it is.
   void loadBundle(const std::string& dir, const std::string& prefix, const std::string& map = "",
-                  const std::string& delta = "") {
+                  const std::string& delta = "", const std::string& residentPrefix = "") {
     if (!delta.empty() && map.empty()) { fprintf(stderr, "a delta bundle is read through a map\n"); exit(1); }
     std::ifstream in(dir + "/manifest.json");
     if (!in) { fprintf(stderr, "no %s/manifest.json\n", dir.c_str()); exit(1); }
@@ -277,6 +284,16 @@ struct Model {
       if (!map.empty()) { byName[name] = b; continue; }
       std::string key = prefix + "/" + name;
       if (index.count(key)) { fprintf(stderr, "%s is in two model directories\n", key.c_str()); exit(1); }
+      if (!residentPrefix.empty() && b.kind == 2 && !name.compare(0, residentPrefix.size(), residentPrefix)) {
+        auto align = [](size_t v) { return (v + 255) / 256 * 256; };
+        Segment::Res r{b, align(sg.residentBytes), 0};
+        r.scales = align(r.codes + n); sg.residentBytes = r.scales + 2 * ((n + b.block - 1) / b.block);
+        Entry e{'q', 0, n, 0, seg}; e.rec = (int)sg.residentRecs.size();
+        index[key] = e; sg.residentRecs.push_back(r);
+        addMeta(key + "#r", (double)shape.size());
+        for (size_t k = 0; k < shape.size(); ++k) addMeta(key + "#" + std::to_string(k), shape[k]);
+        continue;
+      }
       at = (at + 3) / 4 * 4;
       Entry e{'t', 0, n, 0, seg}; e.devOffset = at; e.rec = (int)sg.recs.size(); b.dst = at; at += n;
       index[key] = e;
@@ -441,6 +458,7 @@ struct Model {
           cudaMalloc(&dt[k], maxRecs * sizeof(BDecode)) != cudaSuccess || cudaEventCreateWithFlags(&done[k], cudaEventDisableTiming) != cudaSuccess)
         return false;
     std::vector<std::vector<BDecode>> tables(2), scratchTables(2);
+    if (s.residentBytes && !s.resident && cudaMalloc(&s.resident, s.residentBytes) != cudaSuccess) return false;
     float* scratch = nullptr;
     if (s.scratchElems && cudaMalloc(&scratch, s.scratchElems * 4) != cudaSuccess) return false;
     BDecode* sdt[2] = {nullptr, nullptr};
@@ -454,6 +472,11 @@ struct Model {
       while (got < n) { ssize_t r = read(fd, pin[k] + got, n - got); if (r <= 0) { close(fd); return false; } got += (size_t)r; }
       close(fd);
       pin[k][n] = pin[k][n + 1] = 0;          // (a packed code's second byte past the last group)
+      for (const auto& r : s.residentRecs)    // the resident tensors' codes and scales, as they are
+        if (r.b.file == (int)fi &&
+            (cudaMemcpyAsync(s.resident + r.codes, pin[k] + r.b.byteOffset, r.b.elements, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+             cudaMemcpyAsync(s.resident + r.scales, pin[k] + r.b.scaleOffset, 2 * ((r.b.elements + r.b.block - 1) / r.b.block),
+                             cudaMemcpyHostToDevice, st) != cudaSuccess)) return false;
       auto& table = tables[k]; table.clear();
       for (const BRec& b : s.recs)
         if (b.file == (int)fi || (b.kind == 4 && fi == 0))
@@ -579,7 +602,7 @@ struct Model {
   }
   // the whole directory's device copy now (af3 --wait-input does this while the input is exported)
   void upload(int seg) {
-    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm') { dev(name); touched.erase(name); return; }
+    for (auto& [name, e] : index) if (e.seg == seg && e.kind == 't') { dev(name); touched.erase(name); return; }
   }
   // ...or in the background: the device copy is allocated at once and filled by a thread, so kernels
   // can be launched against it meanwhile - a warm-up, whose answers are garbage until waitUploads()
@@ -603,7 +626,7 @@ struct Model {
     Segment& s = segs[seg];
     if (!s.device) { fprintf(stderr, "compact: the file is not on the device\n"); exit(1); }
     std::vector<std::pair<Entry*, std::string>> keep;
-    for (auto& [name, e] : index) if (e.seg == seg && e.kind != 'm' && e.devOffset != DROPPED) keep.push_back({&e, name});
+    for (auto& [name, e] : index) if (e.seg == seg && e.kind == 't' && e.devOffset != DROPPED) keep.push_back({&e, name});
     std::sort(keep.begin(), keep.end(), [](auto& a, auto& b) { return a.first->devOffset < b.first->devOffset; });
     size_t at = 0; std::vector<std::array<size_t, 3>> moves; std::vector<Entry*> dropped;
     for (auto& [e, name] : keep) {
@@ -692,7 +715,20 @@ struct Model {
       }
     }
     if (e.devOffset == DROPPED) { fprintf(stderr, "%s: its f32 device copy was dropped (read its f16 mirror)\n", k.c_str()); exit(1); }
+    if (e.kind == 'q') { fprintf(stderr, "%s is resident int8: read it with residentInt8\n", k.c_str()); exit(1); }
     return s.device + e.devOffset;
+  }
+  bool isResident(const std::string& k) const { auto it = index.find(k); return it != index.end() && it->second.kind == 'q'; }
+  ResidentInt8 residentInt8(const std::string& k) {
+    const Entry& e = at(k);
+    if (e.kind != 'q') { fprintf(stderr, "%s is not resident int8\n", k.c_str()); exit(1); }
+    touched.insert(k);
+    Segment& s = segs[e.seg];
+    if (!s.device && (cudaMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s))) {
+      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+    }
+    const auto& r = s.residentRecs[e.rec];
+    return { (const signed char*)(s.resident + r.codes), (const __half*)(s.resident + r.scales), r.b.elements, r.b.block };
   }
   bool has(const std::string& k) const { return index.count(k) > 0; }
   const Entry& at(const std::string& k) const {

@@ -41,7 +41,7 @@ __global__ void zInitK(const float* rows, const float* cols, RelIdx rel, const f
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * T * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lmZ[t];
+  z[t] = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + (lmZ ? lmZ[t] : 0.f);
 }
 
 // a STREAMED z_init (a card short of room): neither it nor the language model's pair is kept - each loop
@@ -239,10 +239,82 @@ inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::
 }
 
 // the recycle loop: z (out) = the trunk's last pass
-inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops, bool check) {
+// ---------------------------------------------------------------- the released models' recycle (parcae)
+// counter-based randoms: a uniform in [0, 1) from (seed, stream, index), splitmix64 twice - so a fold is the
+// same fold for the same seed, whatever the launch shape
+__device__ __forceinline__ uint64_t mix64(uint64_t z) {
+  z += 0x9E3779B97F4A7C15ull; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+__device__ __forceinline__ float uniform01(uint64_t seed, uint64_t stream, uint64_t i) {
+  return (float)(mix64(seed ^ mix64(stream * 0x100000001B3ull + i)) >> 40) * (1.f / 16777216.f);
+}
+// the initial pair state: a normal of std sqrt(2 / (5 C)) truncated at 3 std (biohub's _init_pair_state -
+// trunc_normal_, which redraws past the bounds; here a Box-Muller draw redrawn the same way)
+__global__ void truncNormalK(float* z, size_t n, float std, uint64_t seed) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n) return;
+  float v = 0.f;
+  for (int k = 0; k < 64; ++k) {
+    float u1 = fmaxf(uniform01(seed, 2 * k, t), 1e-7f), u2 = uniform01(seed, 2 * k + 1, t);
+    v = sqrtf(-2.f * logf(u1)) * cospif(2.f * u2);
+    if (fabsf(v) <= 3.f) break;
+  }
+  z[t] = fminf(fmaxf(v, -3.f), 3.f) * std;
+}
+// out = dropout(in, p): zeroed with probability p, else scaled by 1 / (1 - p) (F.dropout, training=True)
+__global__ void dropoutK(const float* in, float* out, size_t n, float p, uint64_t seed, uint64_t stream) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n) return;
+  out[t] = uniform01(seed, stream, t) < p ? 0.f : in[t] / (1.f - p);
+}
+// z = a * z + y, a per channel
+__global__ void decayUpdateK(float* z, const float* y, const float* a, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * C) return;
+  z[t] = a[t % C] * z[t] + y[t];
+}
+inline bool parcaeRecycle() { return M.has("f/recycle/decay"); }
+
+inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops, bool check,
+                         const float* lmZ = nullptr, uint64_t seed = 0) {
   size_t P = (size_t)T * T;
   float* mask = scratch<float>("trunk.mask", P);
   fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);      // every token is real (the token mask is all ones)
+  if (parcaeRecycle()) {
+    // the released models (ESMFold2, ESMFold2-Fast): z starts as noise; each pass refines a dropped-out copy of
+    // the language model's pair through its own pair-only blocks, injects z_init plus that, LayerNorm'd and
+    // projected, into a per-channel decay of z, and runs the trunk; after the last pass the readout and the
+    // coda (biohub's modeling_esmfold2.py _run_one_loop and forward)
+    if (!zInitP || !lmZ) { fprintf(stderr, "the parcae recycle needs z_init and the language model's pair whole\n"); exit(1); }
+    const float p = (float)M.meta("meta/lmDropout");
+    const int blocksN = (int)M.meta("meta/blocks"), lmBlocks = (int)M.meta("meta/lmEncoderBlocks"),
+              codaBlocks = (int)M.meta("meta/codaBlocks");
+    truncNormalK<<<blocks(P * C), 256, 0, STREAM>>>(z, P * C, sqrtf(2.f / (5.f * C)), seed ^ 0x5eedull);
+    float* inject = scratch<float>("trunk.inject", P * C);
+    size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
+    float* xn = scratch<float>("trunk.xn", chunk * C); float* y = scratch<float>("trunk.y", chunk * C);
+    for (int loop = 0; loop < loops; ++loop) {
+      if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(lmZ, inject, P * C, p, seed, 1000 + loop);
+      else CK(cudaMemcpyAsync(inject, lmZ, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+      for (int b = 0; b < lmBlocks; ++b) trunkBlock(inject, mask, T, C, "lmEncoder/blocks", b);
+      addK<<<blocks(P * C), 256, 0, STREAM>>>(inject, zInitP, P * C);
+      for (size_t r0 = 0; r0 < P; r0 += chunk) {
+        size_t r = std::min(chunk, P - r0);
+        layerNorm(inject + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        gemm(xn, F("recycle/projection"), y, r, C, C);
+        decayUpdateK<<<blocks(r * C), 256, 0, STREAM>>>(z + r0 * C, y, F("recycle/decay"), r, C);
+      }
+      for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
+    }
+    for (size_t r0 = 0; r0 < P; r0 += chunk) {          // the readout, a chunk of rows at a time, in place
+      size_t r = std::min(chunk, P - r0);
+      gemm(z + r0 * C, F("readout"), y, r, C, C);
+      CK(cudaMemcpyAsync(z + r0 * C, y, r * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    }
+    for (int b = 0; b < codaBlocks; ++b) trunkBlock(z, mask, T, C, "coda/blocks", b);
+    return;
+  }
   CK(cudaMemsetAsync(z, 0, P * C * 4, STREAM));
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));   // the recycle row by row, 64 MB at a time
   float* xn = scratch<float>("trunk.xn", chunk * C);

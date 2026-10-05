@@ -62,7 +62,7 @@ static std::string writeWarmInput(int T, int A) {
 
 // one input, loaded: the whole fold. warm: the same launches on a synthetic input, nothing printed or
 // written - every weight conversion, cuBLAS plan and kernel module loaded while the real input is exported
-struct Opts { std::string dir, oracle, out; uint64_t seed; SamplerSettings sampler; bool profile; };
+struct Opts { std::string dir, oracle, out; uint64_t seed; SamplerSettings sampler; bool profile; bool stepsGiven = false; };
 // --frames=DIR: the trunk's contact map (contacts-00-of-01.u8, a byte a pair) and every sampler step's
 // prediction (frame-SSSS-NNNN.pdb), written through common.cuh's AsyncTap so the fold does not wait for them
 static std::string FRAMES_DIR;
@@ -85,7 +85,17 @@ __global__ void contactsK(const float* logits, const int* contactBins, float* ou
 }
 static int foldInput(const Opts& o, bool warm) {
   const std::string& oracle = o.oracle; const std::string& out = o.out; uint64_t seed = o.seed;
-  const SamplerSettings& sampler = o.sampler; bool profile = o.profile && !warm;
+  // a bundle that states its sampler (the released models: tools/export_esmfold2_trunk.py) is sampled so - the
+  // command's or the job's --steps still wins
+  SamplerSettings sampler = o.sampler;
+  if (M.has("meta/samplerSteps")) {
+    if (!o.stepsGiven && !warm) sampler.steps = (int)M.meta("meta/samplerSteps");
+    sampler.gamma0 = M.meta("meta/samplerGamma0"); sampler.gammaMin = M.meta("meta/samplerGammaMin");
+    sampler.noiseScale = M.meta("meta/samplerNoiseScale"); sampler.stepScale = M.meta("meta/samplerStepScale");
+    sampler.p = M.meta("meta/samplerRho"); sampler.sMin = M.meta("meta/samplerSigmaMin");
+    sampler.sMax = M.meta("meta/samplerSigmaMax"); sampler.maxSigma = M.meta("meta/samplerMaxSigma");
+  }
+  bool profile = o.profile && !warm;
   auto say = [&](const char* fmt, auto... v) { if (!warm) printf(fmt, v...); };
   // EF2_MEM: device memory in use at each phase boundary
   auto mem = [&](const char* at) {
@@ -97,14 +107,17 @@ static int foldInput(const Opts& o, bool warm) {
   };
   CB(cublasSetMathMode(H, FAST ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
   int T = (int)M.meta("meta/tokens");
+  const bool residentTower = M.has("c/blocks/0/fc2/weightsT");      // (ESM-C 6B: [out, in], resident int8)
   Esmc e{(int)M.meta("meta/lm_rows"), (int)M.meta("meta/width"), (int)M.meta("meta/heads"),
-         (int)dimOf("c/blocks/0/fc2/weights", 0), (int)M.meta("meta/layers"), (int)M.meta("meta/pairChannels")};
+         residentTower ? (int)dimOf("c/blocks/0/fc2/weightsT", 1) : (int)dimOf("c/blocks/0/fc2/weights", 0),
+         (int)M.meta("meta/layers"), (int)M.meta("meta/pairChannels"), (float)M.meta("meta/residualScale", 1.0)};
   say("ESMFold2: %d tokens, %d atoms, %d tower rows\n", T, (int)M.meta("meta/atoms"), e.rows);
   bool check = !oracle.empty() && !warm;
   int states = e.layers + 1;
   float* hidden = check ? dalloc((size_t)T * states * e.model) : nullptr;
   // on a card short of room z_init is streamed (ZINIT_STREAM): the language model's pair is never made whole
-  const bool streamZ = !check && shortPair((size_t)T * T, e.pair);
+  const bool parcae = parcaeRecycle();           // (the released models keep the language model's pair: their loop reads it)
+  const bool streamZ = !check && !parcae && shortPair((size_t)T * T, e.pair);
   float* lmZ = streamZ ? nullptr : dalloc((size_t)T * T * e.pair);
   auto t0 = std::chrono::steady_clock::now();
   bool profLm = profile && getenv("EF2_PROFILE") && std::string(getenv("EF2_PROFILE")) == "lm";
@@ -156,8 +169,8 @@ static int foldInput(const Opts& o, bool warm) {
     CK(cudaStreamSynchronize(STREAM));
   } else {
     zi = dalloc((size_t)T * T * C);
-    zInit(T, C, sInputs, Si, lmZ, zi, check);
-    CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr;
+    zInit(T, C, sInputs, Si, parcae ? nullptr : lmZ, zi, check);
+    if (!parcae) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
   }
   // a large input gives each phase the whole card: its predecessor's scratch released (a pair over
   // 128 MB, ~350 tokens). Below that the scratch is kept - re-allocating it cost every phase cudaMallocs
@@ -168,7 +181,8 @@ static int foldInput(const Opts& o, bool warm) {
   std::string profStage = getenv("EF2_PROFILE") ? getenv("EF2_PROFILE") : "trunk";
   bool profTrunk = profile && profStage == "trunk";
   if (profTrunk) { prof::init(); prof::start(); }
-  foldingTrunk(T, C, zi, z, 4, check);
+  foldingTrunk(T, C, zi, z, M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4, check, lmZ, seed);
+  if (lmZ) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
   if (profTrunk) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   CK(cudaStreamSynchronize(STREAM));
   say("trunk %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -314,7 +328,7 @@ static int foldInput(const Opts& o, bool warm) {
 static bool DETACH = false;
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
-  std::string weights, foldBundle, esmcBundle, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false; std::string warmShape, serveDir;
+  std::string weights, foldBundle, esmcBundle, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false, stepsGiven = false; std::string warmShape, serveDir;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--fold-bundle=", 14)) foldBundle = argv[i] + 14;
@@ -335,7 +349,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-fused")) FUSED = false;
     else if (!strcmp(argv[i], "--no-fused256")) FUSED256 = false;
     else if (!strncmp(argv[i], "--seed=", 7)) seed = strtoull(argv[i] + 7, nullptr, 10);
-    else if (!strncmp(argv[i], "--steps=", 8)) sampler.steps = atoi(argv[i] + 8);
+    else if (!strncmp(argv[i], "--steps=", 8)) { sampler.steps = atoi(argv[i] + 8); stepsGiven = true; }
     else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;   // stay up, folding each job dropped there
     else if (!strncmp(argv[i], "--inputs-window=", 16)) {           // 128: biohub's (the default); 0: dense
       int w = atoi(argv[i] + 16);
@@ -350,12 +364,12 @@ int main(int argc, char** argv) {
   auto tStart = std::chrono::steady_clock::now();
   // the weights: one exported file, or the two bundles read as they are (decoded on the device)
   if (!weights.empty()) M.load(weights);
-  else { M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c"); }
+  else { M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c", "", "", "blocks/"); }   // (int8 tower blocks stay resident)
   const int weightSegs = (int)M.segs.size();
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it
   auto tCtx = std::chrono::steady_clock::now();
-  Opts o{argv[1], oracle, out, seed, sampler, profile};
+  Opts o{argv[1], oracle, out, seed, sampler, profile, stepsGiven};
   // The warm-up runs WHILE the weights go up (0.24 s for 2.9 GB, the GPU otherwise idle): its kernels
   // read a copy still arriving, so its answers are garbage, and everything derived from the weights
   // is forgotten after it. The warm fold needs only the shapes - it loads every kernel module and
@@ -383,8 +397,11 @@ int main(int argc, char** argv) {
   // f32 copy dropped from the device - 2.2 GB, read only through the mirror on this path
   size_t dropped = 0;
   if (FAST) {
-    Wh("c/blocks/0/qkv/weights"); Wh("f/blocks/0/pairTransition/transition1");
-    dropped = compactWeights(M.at("c/blocks/0/qkv/weights").seg, towerHalf);
+    Wh("f/blocks/0/pairTransition/transition1");
+    if (M.has("c/blocks/0/qkv/weights")) {           // (a resident tower has no float32 copy to drop)
+      Wh("c/blocks/0/qkv/weights");
+      dropped = compactWeights(M.at("c/blocks/0/qkv/weights").seg, towerHalf);
+    }
   }
   if (getenv("EF2_STARTUP")) {
     auto now = std::chrono::steady_clock::now();
@@ -399,7 +416,7 @@ int main(int argc, char** argv) {
       for (auto& f : flags) {
         if (!f.compare(0, 6, "--out=")) j.out = f.substr(6);
         else if (!f.compare(0, 7, "--seed=")) j.seed = strtoull(f.c_str() + 7, nullptr, 10);
-        else if (!f.compare(0, 8, "--steps=")) j.sampler.steps = atoi(f.c_str() + 8);
+        else if (!f.compare(0, 8, "--steps=")) { j.sampler.steps = atoi(f.c_str() + 8); j.stepsGiven = true; }
         else if (!f.compare(0, 9, "--frames=")) FRAMES_DIR = f.substr(9);
       }
       int seg = (int)M.segs.size();

@@ -199,6 +199,25 @@ export function contactBinCountsByPair(molType, residueType, tokens, bins,
     (angstroms) => contactBinCount(bins, edges, angstroms));
 }
 
+/**
+ * The same counts for a distogram with AlphaFold 3's bins - what the RELEASED ESMFold2 and ESMFold2-Fast carry
+ * (64 bins, breaks linspace(2.3125, 21.6875, 63); the experimental tier's is 128 over 2-52). AF3's rule, not
+ * the centre rule above: a bin counts when its top edge is under the threshold, the last bin's top one
+ * spacing past the last break (src/af3/featurise/contact-classes.js af3ContactBins).
+ */
+export const AF3_DISTOGRAM_BREAKS = Array.from({ length: 63 }, (_, k) => 2.3125 + (k * (21.6875 - 2.3125)) / 62);
+export function contactBinCountsByPairBreaks(molType, residueType, tokens, breaks = AF3_DISTOGRAM_BREAKS) {
+  const classes = new Int32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) classes[token] = esmfold2Class(molType[token], residueType[token]);
+  const spacing = breaks[breaks.length - 1] - breaks[breaks.length - 2];
+  const top = (bin) => (bin < breaks.length ? breaks[bin] : breaks[breaks.length - 1] + spacing);
+  return contactBinsByPair(classes, tokens, (angstroms) => {
+    let count = 0;
+    while (count <= breaks.length && top(count) <= angstroms + 1e-3) count += 1;
+    return count;
+  });
+}
+
 /** `out[i, j] = pair[i, j] + pair[j, i]`, which is what the head is handed. */
 export function createSymmetriseShader({ tokens, channels }) {
   const pairs = tokens * tokens;

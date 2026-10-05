@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-352 tools. `tools/fixtures/` is data and is not listed.
+353 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -291,7 +291,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (92)
+## `tools/` - everything else (93)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -353,6 +353,7 @@ go through CDP, and the deploy.
 - **`export_alphafold_structure_reference.py`** - Replay and export the official AF2 structure module from a trunk fixture.
 - **`export_alphafold_template_parameters.py`** - Add official model template parameters to an existing reference manifest.
 - **`export_confidence_reference.py`** - Export AF2 pLDDT/PAE head parameters and final-recycle reference logits.
+- **`export_esmc6b.py`** - ESM-C 6B (the tower of the released ESMFold2 and ESMFold2-Fast) as a bundle the native port reads, with the tower's matrices kept int8 - from af3-any-model's own quantisation, not a second one.
 - **`export_esmc_model.py`** - ESM-C's tower and ESMFold2's shim -> the bundle format the browser reads.
 - **`export_esmfold2_trunk.py`** - ESMFold2's folding trunk -> a LocalFold bundle, in AF3's pairformer layout.
 - **`export_monomer_model.py`** - Write a LocalFold float32 monomer directory from AF2 params_model_N_ptm.npz.

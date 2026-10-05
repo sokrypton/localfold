@@ -195,7 +195,18 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   // PAE logits
   int pb = (int)dimOf("f/confidence/pae", 1);
   float* paeL = scratch<float>("cf.pae", P * pb);
-  gemm(z, F("confidence/pae"), paeL, P, C, pb);
+  if (M.has("f/confidence/paeNorm/scale")) {
+    // the released heads LayerNorm the pair in front of the PAE projection (pae_ln); a chunk of rows at a time
+    size_t per = std::max<size_t>(1, std::min(P, ((size_t)64 << 20) / (4 * (size_t)C)));
+    float* zn = scratch<float>("cf.paeIn", per * C);
+    for (size_t p0 = 0; p0 < P; p0 += per) {
+      size_t n = std::min(per, P - p0);
+      layerNorm(z + p0 * C, zn, n, C, F("confidence/paeNorm/scale"), F("confidence/paeNorm/offset"));
+      gemm(zn, F("confidence/pae"), paeL + p0 * pb, n, C, pb);
+    }
+  } else {
+    gemm(z, F("confidence/pae"), paeL, P, C, pb);
+  }
   Confidence out;
   out.plddtAtom = download(pa, A);
   std::vector<float> mask_ = download(W("atom_mask"), A);

@@ -83,6 +83,8 @@ def main():
     arguments = parser.parse_args()
 
     source = SafeTensors(ROOT / arguments.esmfold2 / 'model.safetensors')
+    config_path = ROOT / arguments.esmfold2 / 'config.json'
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
     get = lambda name: source[name]
     layers = len({k.split('.')[2] for k in source.keys()
                   if k.startswith('folding_trunk.blocks.')})
@@ -103,11 +105,42 @@ def main():
                 continue                      # synthesised, never shipped
             for leaf, array in values.items():
                 writer.add('blocks/%d/%s/%s' % (layer, group, leaf), array)
-    # The recycle projection, which is the trunk's one divergence from AF3.
-    writer.add('recycle/norm/scale', np.asarray(get('pair_loop_proj.0.weight'), np.float32))
-    writer.add('recycle/norm/offset', np.asarray(get('pair_loop_proj.0.bias'), np.float32))
-    writer.add('recycle/projection', np.ascontiguousarray(
-        np.asarray(get('pair_loop_proj.1.weight'), np.float32).T))
+    # The recycle, which is the trunk's one divergence from AF3 - in one of two forms. The experimental tier
+    # (esmfold2_lm600m / lm300m) projects the previous pass's pair: z = z_init + W(LN(z)). The released
+    # models (ESMFold2, ESMFold2-Fast) run "parcae", a discretised linear state update in which the
+    # LayerNorm is on the INJECTION and not on z: z = a * z + LN(z_init + lm_encoder(...)) b^T, then the
+    # trunk (biohub's modeling_esmfold2.py _run_one_loop). a and b are folded here, in float64, from the
+    # three parameters the checkpoint keeps - a = exp(-softplus(log_delta) exp(log_a)), b = softplus(
+    # log_delta)[:, None] b_cont - as _discretized_dynamics folds them at every call.
+    parcae = 'parcae_log_a' in source.keys()
+    coda_blocks = lm_encoder_blocks = 0
+    if parcae:
+        delta = np.logaddexp(0.0, np.asarray(get('parcae_log_delta'), np.float64))     # softplus
+        writer.add('recycle/decay', np.exp(-delta * np.exp(np.asarray(get('parcae_log_a'), np.float64))).astype(np.float32))
+        writer.add('recycle/norm/scale', np.asarray(get('parcae_input_norm.weight'), np.float32))
+        writer.add('recycle/norm/offset', np.asarray(get('parcae_input_norm.bias'), np.float32))
+        b = delta[:, None] * np.asarray(get('parcae_b_cont'), np.float64)             # F.linear(x, b): x b^T
+        writer.add('recycle/projection', np.ascontiguousarray(b.T.astype(np.float32)))
+        # after the loop: the readout, then the coda's pair-only blocks - what the distogram, the diffusion and
+        # the confidence head read; the recycle carries the pre-coda pair
+        writer.add('readout', np.ascontiguousarray(np.asarray(get('parcae_readout.weight'), np.float32).T))
+        # ...and inside the loop, the language model's pair refined by its own pair-only blocks before it is
+        # injected (in place of the experimental tier's adding the shim's pair to z_init once)
+        for prefix, out_name in (('parcae_coda', 'coda'), ('lm_encoder', 'lmEncoder')):
+            count = len({k.split('.')[2] for k in source.keys() if k.startswith(prefix + '.blocks.')})
+            for layer in range(count):
+                for group, values in trunk_block(get, layer, channels, arguments.heads, prefix=prefix).items():
+                    if not isinstance(values, dict) or group == 'pairAttention':
+                        continue
+                    for leaf, array in values.items():
+                        writer.add('%s/blocks/%d/%s/%s' % (out_name, layer, group, leaf), array)
+            if out_name == 'coda': coda_blocks = count
+            else: lm_encoder_blocks = count
+    else:
+        writer.add('recycle/norm/scale', np.asarray(get('pair_loop_proj.0.weight'), np.float32))
+        writer.add('recycle/norm/offset', np.asarray(get('pair_loop_proj.0.bias'), np.float32))
+        writer.add('recycle/projection', np.ascontiguousarray(
+            np.asarray(get('pair_loop_proj.1.weight'), np.float32).T))
     # 🔴 EVERYTHING THAT BUILDS z_init EXCEPT THE ATOM ENCODER AND THE LANGUAGE
     # MODEL. z_init is a sum of five terms and these are the three cheap ones;
     # the shim's pair term is already in the ESM-C bundle, and the atom
@@ -297,8 +330,11 @@ def main():
                     writer.add('confidence/blocks/%d/%s/%s' % (layer, group, leaf), array)
         vector = lambda name: np.asarray(head[name], np.float32)
         matrix = lambda name: np.ascontiguousarray(np.asarray(head[name], np.float32).T)
+        # (the released heads - ESMFold2, ESMFold2-Fast - put a LayerNorm in front of the PAE projection; the
+        # Synthyra head on the experimental tier has none)
+        has_pae_norm = 'pae_ln.weight' in head
         for leaf, name in (('s_inputs_norm', 'sInputsNorm'), ('z_norm', 'zNorm'),
-                           ('plddt_ln', 'plddtNorm')):
+                           ('plddt_ln', 'plddtNorm')) + ((('pae_ln', 'paeNorm'),) if has_pae_norm else ()):
             writer.add('confidence/%s/scale' % name, vector('%s.weight' % leaf))
             writer.add('confidence/%s/offset' % name, vector('%s.bias' % leaf))
         for leaf, name in (('s_to_z', 'sToZ'), ('s_to_z_transpose', 'sToZTranspose'),
@@ -339,7 +375,7 @@ def main():
             # Stated, because a reader who counts 93 against 89 should find the
             # answer here rather than in a diff.
             'unusedInCheckpoint': list(HEAD_UNUSED),
-            'pairOnlyBlocks': True, 'hasPde': False,
+            'pairOnlyBlocks': True, 'hasPde': False, 'paeNorm': has_pae_norm,
         }
 
     # 🔴 CLOSED AFTER THE LAST `add`, WHICH IS NOT WHERE IT USED TO BE. The
@@ -385,6 +421,24 @@ def main():
                       '%s.atom_to_token_linear.weight'
                       % 'inputs_embedder.atom_attention_encoder')[0]),
                   'relativeFeatures': int(source.shape('rel_pos.embed.weight')[1]),
+                  'recycle': 'parcae' if parcae else 'projection',
+                  # the released models' loop, from their own config.json beside the checkpoint: num_loops + 1 passes
+                  # (biohub's forward: total_steps = max(1, num_loops + 1)), and the dropout on the language model's
+                  # pair - p 0.25, a fresh mask every pass and AT INFERENCE (F.dropout(training=True))
+                  # ...and their sampler: AlphaFold 3's EDM constants (rho 7, sigma 4e-4 to 160) with the config's
+                  # churn, noise and step scale, fourteen steps, the schedule clipped at sigma 256 - where the
+                  # experimental tier runs Boltz-2's (af3-any-model model_registry._SAMPLER_CONSTANTS)
+                  **({'samplerSteps': int(config['structure_head'].get('inference_num_steps', 14)),
+                      'samplerGamma0': float(config['structure_head'].get('gamma_0', 0.8)),
+                      'samplerGammaMin': float(config['structure_head'].get('gamma_min', 1.0)),
+                      'samplerNoiseScale': float(config['structure_head'].get('noise_scale', 1.003)),
+                      'samplerStepScale': float(config['structure_head'].get('step_scale', 1.5)),
+                      'samplerRho': 7.0, 'samplerSigmaMin': 0.0004, 'samplerSigmaMax': 160.0, 'samplerMaxSigma': 256.0}
+                     if parcae and 'structure_head' in config else {}),
+                  **({'loops': int(config.get('num_loops', 3)),
+                      'lmDropout': float(config.get('lm_encoder', {}).get('lm_dropout', 0.0))
+                      if config.get('lm_encoder', {}).get('per_loop_lm_dropout') else 0.0} if parcae else {}),
+                  'codaBlocks': coda_blocks, 'lmEncoderBlocks': lm_encoder_blocks,
                   'weightLayout': 'af3-pairformer-in-out',
                   'triangleDoubleWidth': 'interleaved',
                   'transitionDoubleWidth': 'blocked-gate-first'},

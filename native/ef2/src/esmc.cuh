@@ -64,7 +64,7 @@ __global__ void softmaxSeqK(float* S, const int* seq, int rows, float scale) {
   for (int j = threadIdx.x; j < rows; j += blockDim.x) s[j] *= inv;
 }
 
-struct Esmc { int rows, model, heads, ffn, layers, pair; };
+struct Esmc { int rows, model, heads, ffn, layers, pair; float residualScale = 1.f; };
 
 // --fast: the tower's four matrices a block run on their f16 mirror, and their f32 copy is dropped from
 // the device (compactTowerWeights): 2.2 GB of the 2.9 GB of weights, never read again in f32
@@ -75,7 +75,26 @@ inline bool towerHalf(const std::string& name) {
     if (name.size() > strlen(m) && !name.compare(name.size() - strlen(m), strlen(m), m)) return true;
   return false;
 }
-inline void towerGemm(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f) {
+// a RESIDENT int8 matrix (ESM-C 6B, tools/export_esmc6b.py): [out, in] codes with a float16 scale a row, expanded
+// to float16 in scratch for one GEMM - the tower is 6.4 GB as codes and 12.7 GB as float16, which no T4 holds
+__global__ void expandRowsInt8K(const signed char* q, const __half* scale, __half* w, size_t n, int block) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) w[t] = __float2half(__half2float(scale[t / block]) * (float)q[t]);
+}
+inline void towerGemm(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,
+                      float alpha = 1.f) {
+  if (M.isResident("c/" + w + "T")) {
+    ResidentInt8 r = M.residentInt8("c/" + w + "T");
+    if (r.elements != (size_t)in * out || r.block != in) { fprintf(stderr, "c/%sT is not [%d, %d] a row a scale\n", w.c_str(), out, in); exit(1); }
+    __half* w16 = scratch<__half>("tower.w16", r.elements);
+    expandRowsInt8K<<<blocks(r.elements), 256, 0, STREAM>>>(r.codes, r.scales, w16, r.elements, r.block);
+    __half* xh = scratch<__half>("gemmh.x", rows * in);
+    toHalfK<<<blocks(rows * in), 256, 0, STREAM>>>(X, xh, rows * in);
+    CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, out, (int)rows, in, &alpha, w16, CUDA_R_16F, in, xh, CUDA_R_16F, in, &beta,
+                    Y, CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    return;
+  }
+  if (alpha != 1.f) { fprintf(stderr, "towerGemm: a residual scale needs the resident path\n"); exit(1); }
   if (FAST && TOWER16) gemmH(X, Wh("c/" + w), Y, rows, in, out, beta);
   else gemm(X, Cw(w), Y, rows, in, out, beta);
 }
@@ -103,12 +122,12 @@ inline void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 64, (int)R, (int)R, &one, qkv + 2 * C, 3 * C, 64, S,
                                  (int)R, (long long)R * R, &zero, ctx, C, 64, e.heads));
   }
-  towerGemm(ctx, B + "attn_out/weights", x, R, C, C, 1.f);
+  towerGemm(ctx, B + "attn_out/weights", x, R, C, C, 1.f, 1.f / e.residualScale);   // x + f(x) / sqrt(layers / 36)
   layerNorm(x, xn, R, C, Cw(B + "ffn_norm/scale"), Cw(B + "ffn_norm/offset"));
   float* h = scratch<float>("esmc.h", R * 2 * e.ffn); float* g = scratch<float>("esmc.g", R * e.ffn);
   towerGemm(xn, B + "fc1/weights", h, R, C, 2 * e.ffn);
   swigluK<<<blocks(R * e.ffn), 256, 0, STREAM>>>(h, g, R, e.ffn);
-  towerGemm(g, B + "fc2/weights", x, R, e.ffn, C, 1.f);
+  towerGemm(g, B + "fc2/weights", x, R, e.ffn, C, 1.f, 1.f / e.residualScale);
 }
 
 __global__ void axpyK(float* y, const float* x, float a, size_t n) {

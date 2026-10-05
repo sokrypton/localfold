@@ -88,10 +88,15 @@ int("res_type", f.residueType); int("input_ids", f.inputIds);
 // the page's contact rule (src/esmfold2/distogram-webgpu.js): per pair, how many distogram bins lie under
 // its threshold - for the 128-bin distogram both published checkpoints carry, stamped, so the binary
 // refuses them against any other
+// (--fold-bundle=<dir>: the released models' 64-bin distogram is AlphaFold 3's grid, counted by AF3's rule)
 {
-  const { contactBinCountsByPair } = await import("../../src/esmfold2/distogram-webgpu.js");
-  int("contact_bins", contactBinCountsByPair(f.molType, f.residueType, f.tokens, 128));
-  entries.push(["m", "meta/contactBinsFor", 128]);
+  const { contactBinCountsByPair, contactBinCountsByPairBreaks } = await import("../../src/esmfold2/distogram-webgpu.js");
+  const bundleArg = process.argv.slice(2).find((a) => a.startsWith("--fold-bundle="))?.slice(14);
+  const bins = bundleArg ? JSON.parse(readFileSync(`${bundleArg}/manifest.json`, "utf8")).trunk?.distogramBins ?? 128 : 128;
+  if (bins !== 128 && bins !== 64) throw new Error(`a ${bins}-bin distogram: only 128 (2-52) and 64 (AF3's) are known`);
+  int("contact_bins", bins === 128 ? contactBinCountsByPair(f.molType, f.residueType, f.tokens, 128)
+                                   : contactBinCountsByPairBreaks(f.molType, f.residueType, f.tokens));
+  entries.push(["m", "meta/contactBinsFor", bins]);
 }
 int("distogram_atom_idx", representativeAtoms(f, T));
 flt("aatype", f.aatype); flt("profile", f.profile); flt("deletion_mean", f.deletionMean);
