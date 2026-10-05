@@ -325,40 +325,44 @@ __global__ void biasFromProjRowsK(const float* proj, half* out, int L, int H, in
   if (transposed) { size_t x = i; i = j; j = x; }
   out[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
 }
+// [C][H] f32 -> [C][16] f16, zero columns past H (gridInK's bias projection reads 16)
+__global__ void padHeadsK(const float* w, half* out, int C, int H) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= C * 16) return;
+  int k = t / 16, c = t % 16;
+  out[t] = __float2half(c < H ? w[k * H + c] : 0.f);
+}
 inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa, int rowsN, int C, int H, int D,
                             const float* msaMask) {
   int L = t.L; size_t pairs = (size_t)L * L, rows = (size_t)rowsN * L;
   std::string R = S + "msa_row_attention_with_pair_bias";
   if (FAST) {
+    // the pair bias straight from the pair: native/af3's lnHeadsK (LN + the projection to 16 columns, H of
+    // them live) in chunks, then laid out with the pair mask - no LN'd copy of the pair, no GEMM
     const half* bias;
-    if (AF2_TIGHT && !roomFor(pairs * 128 * 2, { "frow.pn" })) {
-      // on a card short of room the pair's LayerNorm feeds the bias a chunk of rows at a time
-      releaseScratch({ "frow.pn" });
-      static std::map<const float*, half*> whCache;
-      const float* wf = P(R + "/feat_2d_weights", blk);
-      auto it = whCache.find(wf);
-      if (it == whCache.end()) {
-        half* h = wpool<half>((size_t)128 * H);
-        toHalfK<<<blocks((size_t)128 * H), 256, 0, STREAM>>>(wf, h, (size_t)128 * H);
-        it = whCache.emplace(wf, h).first;
-      }
+    {
+      if (H > 16) { fprintf(stderr, "msa row attention: %d heads, the fused pair bias takes 16\n", H); exit(1); }
       int stride = (L + 7) / 8 * 8;
+      static std::map<const float*, half*> wbCache;
+      const float* wf = P(R + "/feat_2d_weights", blk);
+      auto it = wbCache.find(wf);
+      if (it == wbCache.end()) {
+        half* h = wpool<half>((size_t)128 * 16);
+        padHeadsK<<<blocks((size_t)128 * 16), 256, 0, STREAM>>>(wf, h, 128, H);
+        it = wbCache.emplace(wf, h).first;
+      }
       half* b = scratch<half>("fbias.bias", (size_t)H * L * stride);
       if (stride != L) CK(cudaMemsetAsync(b, 0, (size_t)H * L * stride * 2, STREAM));
-      size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / 128));
-      half* lnc = scratch<half>("frow.lnc", per * 128); float* projc = scratch<float>("fbias.projc", per * H);
+      size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / 16));
+      float* raw = scratch<float>("fbias.raw16", per * 16);
+      const float *sc = P(R + "/feat_2d_norm/scale", blk), *of = P(R + "/feat_2d_norm/offset", blk);
       for (size_t r0 = 0; r0 < pairs; r0 += per) {
         size_t r = std::min(per, pairs - r0);
-        layerNormH(t.pair + r0 * 128, lnc, r, 128, R + "/feat_2d_norm", blk);
-        ltGemm(lnc, it->second, projc, false, r, 128, H, nullptr, false, 0.f);
-        biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(projc, b, L, H, stride, false, r0, r,
-                                                             t.pairOnes ? nullptr : t.pairMask);
+        lnHeadsRaw<16>(t.pair + r0 * 128, sc, of, it->second, raw, r);
+        biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(raw, b, L, H, stride, false, r0, r,
+                                                             t.pairOnes ? nullptr : t.pairMask, true);
       }
       bias = b;
-    } else {
-      half* pn = scratch<half>("frow.pn", pairs * 128);
-      layerNormH(t.pair, pn, pairs, 128, R + "/feat_2d_norm", blk);
-      bias = pairBiasFast(pn, L, 128, H, P(R + "/feat_2d_weights", blk), t.pairOnes ? nullptr : t.pairMask);
     }
     half* xn = scratch<half>("frow.xn", rows * C);
     layerNormH(msa, xn, rows, C, R + "/query_norm", blk);
@@ -816,13 +820,6 @@ inline void triangleAttentionChunked(float* pair, const float* pairMask, int L, 
       addColumnsK<<<blocks(rows * C), 256, 0, STREAM>>>(pair, tmp, L, C, b0, bc);
     }
   }
-}
-// [C][H] f32 -> [C][16] f16, zero columns past H (gridInK's bias projection reads 16)
-__global__ void padHeadsK(const float* w, half* out, int C, int H) {
-  int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= C * 16) return;
-  int k = t / 16, c = t % 16;
-  out[t] = __float2half(c < H ? w[k * H + c] : 0.f);
 }
 inline bool FUSED_GRID_AF2 = !getenv("LOCALFOLD_AF2_UNFUSED_GRID");
 // The triangle attention on native/af3's fused grid kernels: LN + q/k/v/gate (+ the gate bias) + the pair
