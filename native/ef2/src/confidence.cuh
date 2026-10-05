@@ -119,7 +119,10 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   layerNorm(sInputs, s, T, Si, F("confidence/sInputsNorm/scale"), F("confidence/sInputsNorm/offset"));
   // on a card short of room, a last call normalises the trunk's z in place (each lane reads its channels before
   // writing them): a 256-channel f32 pair fewer, 4.1 GB at 2000 tokens
-  bool tight = shortPair(P, C), inPlace = consume && tight;
+  // (tight only where the device lacks the room for the two pair-sized tensors the roomy form holds: parking
+  // the residual on the host was 1.17 s of a 1,044-token fold on a 40 GB A100 - a 1.1 GB pinned allocation
+  // and a copy each way - with 30 GB free; LOCALFOLD_BIG=1 still takes the parked form)
+  bool tight = shortPair(P, C) && !roomFor(2 * P * C * 4), inPlace = consume && tight;
   float* z = inPlace ? const_cast<float*>(zTrunk) : dalloc(P * C);
   layerNorm(zTrunk, z, P, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
   float* r = scratch<float>("cf.r", (size_t)T * C); float* c = scratch<float>("cf.c", (size_t)T * C);
