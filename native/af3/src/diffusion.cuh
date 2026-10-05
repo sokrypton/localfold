@@ -538,6 +538,7 @@ struct TransformerCache {
   // on a card short of room the biases are not kept for all blocks: the LayerNorm'd pair is, in f16, and
   // each super block's biases are made from it as the step reaches it (refreshSuperBlockBias)
   half* pn16 = nullptr; int perSuper = 0, heads = 0, Cz = 0;
+  int kept = 0;                        // super blocks [0, kept) keep their own biases; the rest share one set, refreshed
   std::vector<float*> pairLogits;      // [h][i][j] per block
   std::vector<half*> biasHalf;         // the same, f16, log2(e)-scaled, rows padded: the flash kernel's
   int stride = 0;
@@ -591,7 +592,7 @@ inline void prepareTransformer(const float* pairCond, int n) {
   }
   // the pair logits of every block, from the (fold-constant) pair conditioning
   tc.stride = (n + 7) / 8 * 8;
-  tc.pn16 = nullptr;                   // (an earlier fold's, in a resident process)
+  tc.pn16 = nullptr; tc.kept = 0;      // (an earlier fold's, in a resident process)
   // (recomputing costs a step time - 2.3 s of a 2096-token fold - so only where every block's biases would
   // not fit with room to spare)
   // a streamed preparation hands the LayerNorm'd pair in f16 (pairCond null): the biases are made from it,
@@ -599,7 +600,18 @@ inline void prepareTransformer(const float* pairCond, int n) {
   const bool given = pairCond == nullptr;
   if (given && !(DIFF_HALF && PN16_GIVEN)) { fprintf(stderr, "a streamed preparation needs the f16 path\n"); exit(1); }
   if (DIFF_HALF && (given || shortPair(pairs, Cz))) {
-    bool lazy = !roomFor((size_t)tc.nblocks * heads * n * tc.stride * 2);
+    // as many super blocks' biases kept as the card has room for (what an earlier fold's bias and f16-pair buffers
+    // hold counted), the rest made in the step - all or nothing it was: at 4,000 tokens the 12.3 GB of every
+    // block's biases did not fit, so all six super blocks were remade at every step (diffusion 4.2 s at 3,000
+    // tokens, 75.6 s at 4,000)
+    const int nSB = (tc.nblocks + perSuper - 1) / perSuper;
+    const size_t sbBytes = (size_t)perSuper * heads * n * tc.stride * 2, pnBytes = given ? 0 : pairs * Cz * 2;
+    size_t held = 0;
+    for (auto& [k, v] : SCRATCH) if (!k.compare(0, 5, "dt.bh") || k == "dt.pn16") held += v.second;
+    auto fits = [&](size_t need) { return roomFor(need > held ? need - held : 0); };
+    int kept = fits((size_t)tc.nblocks * heads * n * tc.stride * 2) ? nSB : 0;
+    if (kept < nSB) while (kept + 1 < nSB && fits((size_t)(kept + 2) * sbBytes + pnBytes)) ++kept;   // kept + the shared set
+    bool lazy = kept < nSB;
     if (given || lazy) {
       // the LayerNorm'd pair kept in f16 (half the f32 pair it is made from); with `lazy`, biases for one
       // super block at a time, made as the step reaches it - 24 blocks' biases held were 768 bytes a pair,
@@ -617,12 +629,11 @@ inline void prepareTransformer(const float* pairCond, int n) {
       tc.pairLogits.assign(tc.nblocks, nullptr);
       tc.biasHalf.assign(tc.nblocks, nullptr);
       for (int b = 0; b < tc.nblocks; ++b)
-        tc.biasHalf[b] = scratch<half>("dt.bh" + std::to_string(lazy ? b % perSuper : b), (size_t)heads * n * tc.stride);
-      tc.n = n; tc.ready = true;
-      if (!lazy) {                     // every block's biases now, and the f16 pair given back
-        for (int sb = 0; sb * perSuper < tc.nblocks; ++sb) refreshSuperBlockBias(sb, n);
-        releaseScratch({ "dt.pn16" }); tc.pn16 = nullptr;
-      }
+        tc.biasHalf[b] = scratch<half>(b / perSuper < kept ? "dt.bh" + std::to_string(b) : "dt.bhL" + std::to_string(b % perSuper),
+                                       (size_t)heads * n * tc.stride);
+      tc.n = n; tc.ready = true; tc.kept = kept;
+      for (int sb = 0; sb < kept; ++sb) refreshSuperBlockBias(sb, n);    // the kept super blocks' biases now
+      if (!lazy) { releaseScratch({ "dt.pn16" }); tc.pn16 = nullptr; }  // every one kept: the f16 pair given back
       return;
     }
   }
@@ -758,7 +769,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     if constexpr (std::is_same_v<T, half>) {
       // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate;
       // the samples are its batch rows, the pair bias shared
-      if (tc.pn16 && b % perSuper == 0) refreshSuperBlockBias(b / perSuper, n);
+      if (tc.pn16 && b % perSuper == 0 && b / perSuper >= tc.kept) refreshSuperBlockBias(b / perSuper, n);
       flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, MASK_ALL_ONES ? nullptr : maskRows, o, n, heads, D, 0, NS, false,
                       1.f / sqrtf((float)D), kqNorm ? nullptr : W(B + ".qBias"));
     } else {
