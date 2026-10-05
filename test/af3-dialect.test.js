@@ -349,9 +349,11 @@ it("featuriserDialect carries every featuriser convention", () => {
 // 81.53. The page's sampler select defaults to Flow, so that is what a visitor
 // picking this model would have got, with a confidence number saying nothing
 // was wrong. Every other family folds in flow (af3 CA-CA 3.58, if2 3.88).
-it("only rosettafold3 declares that it has no flow sampler", () => {
+// chai1 too, for a different reason: its sampler is its own second-order walk (chaiSampler), so a flow walk
+// is not a mode it has at all.
+it("only rosettafold3 and chai1 declare that they have no flow sampler", () => {
   for (const [model, dialect] of Object.entries(DIALECTS)) {
-    assert.equal(dialect.noFlowSampler, model === "rosettafold3",
+    assert.equal(dialect.noFlowSampler, model === "rosettafold3" || model === "chai1",
       `${model}'s noFlowSampler`);
   }
 });

@@ -165,7 +165,7 @@ export const OPENDDE_SAMPLER_MODE = "diffusion";
  * `foldBatch` throws for these rather than switching silently; the page's job
  * is to not ask. See `noFlowSampler` in src/af3/dialect.js.
  */
-export const NO_FLOW_SAMPLER_FAMILIES = ["rosettafold3"];
+export const NO_FLOW_SAMPLER_FAMILIES = ["rosettafold3", "chai1"];
 export const samplerModeFor = (family, asked) =>
   (family === "opendde" || NO_FLOW_SAMPLER_FAMILIES.includes(family)
     ? OPENDDE_SAMPLER_MODE : asked);

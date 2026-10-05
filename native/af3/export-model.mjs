@@ -469,7 +469,10 @@ if (dialect.chiralCentres === true) {
   }
   passes.forEach((pass, k) => {
     const real = pass.slot !== undefined;
-    const covered = !(dialect.templateVisibilityByCoverage === true && !real && pass.features === undefined);
+    // (chai1 masks each template's output by its own coverage and divides by the PRESENT templates, so an
+    // empty slot contributes exactly zero - af3-any-model template_modules.py)
+    const covered = !((dialect.templateVisibilityByCoverage === true || dialect.chaiTemplates === true)
+      && !real && pass.features === undefined);
     add(`template.${k}.repeat`, covered ? pass.repeat : 0);
     add(`template.${k}.aatype`, real ? Int32Array.from(pass.slot.aatype)
       : (pass.aatype ?? new Int32Array(batch.tokens).fill(pass.emptyAatype ?? 0)));
@@ -485,7 +488,7 @@ if (dialect.chiralCentres === true) {
     }
   });
   add("template.passes", passes.length);
-  add("template.templates", TEMPLATES);
+  add("template.templates", dialect.chaiTemplates === true ? Math.max(1, slots.length) : TEMPLATES);
   add("template.featureWidth", width);
   add("template.outerResidual", dialect.templateStackOuterResidual === true);
 }

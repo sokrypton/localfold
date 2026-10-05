@@ -117,23 +117,31 @@ const txStackFor = (perBlockPair) => {
  * whose leaves decode when they are read. See src/af3/weights/weights.js: the diffusion
  * head is 920 MiB of float32 and the device already holds all of it.
  */
-function atomBlock(store, root, index) {
+function atomBlock(store, root, index, chai = false) {
   const at = (leaf) => stacked(store, `${root}${leaf}`, index);
   const maybe = (leaf) => stackedIfPresent(store, `${root}${leaf}`, index);
+  // 🔴 CHAI-1's ATOM BLOCK HAS NONE OF THESE (dialect.chaiAtomStack): its adaptive LayerNorm normalises neither
+  // the conditioning nor carries a scale bias - `(cond @ Ws + 1) * LN(x) + cond @ Wb` - and its attention ends in
+  // the gate with no gating query and no output projection. Optional for chai ALONE, so a missing tensor in any
+  // other bundle is still the error it should be.
+  const opt = chai ? maybe : at;
   return {
-    qSingleCondLayerNormScale: at("qsingle_cond_layer_norm/scale"),
+    qSingleCondLayerNormScale: opt("qsingle_cond_layer_norm/scale"),
     qSingleCondScaleWeights: at("qsingle_cond_scale/weights"),
-    qSingleCondScaleBias: at("qsingle_cond_scale/bias"),
+    qSingleCondScaleBias: opt("qsingle_cond_scale/bias"),
     qSingleCondBias: at("qsingle_cond_bias/weights"),
-    kSingleCondLayerNormScale: at("ksingle_cond_layer_norm/scale"),
+    kSingleCondLayerNormScale: opt("ksingle_cond_layer_norm/scale"),
     kSingleCondScaleWeights: at("ksingle_cond_scale/weights"),
-    kSingleCondScaleBias: at("ksingle_cond_scale/bias"),
+    kSingleCondScaleBias: opt("ksingle_cond_scale/bias"),
     kSingleCondBias: at("ksingle_cond_bias/weights"),
     qProjection: at("q_projection/weights"),
     qBias: at("q_projection/bias"),
     kProjection: at("k_projection/weights"),
     vProjection: at("v_projection/weights"),
-    gatingQuery: at("gating_query/weights"),
+    // (chai: zeros, so the kernels' fused sigmoid gate is exactly 0.5 - which native undoes where the missing
+    // output projection would have been)
+    gatingQuery: chai ? new Float32Array(dims(store, `${root}q_projection/weights`).slice(1).reduce((a, b) => a * b, 1))
+      : at("gating_query/weights"),
     // rosettafold3's kq_norm in the ATOM stacks - see the token transformer's.
     // Their tensors sit under the same root the rest of the block uses, because
     // rf3 is in PER_BLOCK_ATOM_PAIR_LAYER_NORM and so takes the
@@ -142,12 +150,12 @@ function atomBlock(store, root, index) {
     queryLayerNormOffset: maybe("query_layer_norm/offset"),
     keyLayerNormScale: maybe("key_layer_norm/scale"),
     keyLayerNormOffset: maybe("key_layer_norm/offset"),
-    Transition2: at("transition2/weights"),
+    Transition2: opt("transition2/weights"),
     AdaptiveZeroCondWeights: at("adaptive_zero_cond/weights"),
     AdaptiveZeroCondBias: at("adaptive_zero_cond/bias"),
-    ffwSingleCondLayerNormScale: at("ffw_single_cond_layer_norm/scale"),
+    ffwSingleCondLayerNormScale: opt("ffw_single_cond_layer_norm/scale"),
     ffwSingleCondScaleWeights: at("ffw_single_cond_scale/weights"),
-    ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias"),
+    ffwSingleCondScaleBias: opt("ffw_single_cond_scale/bias"),
     ffwSingleCondBias: at("ffw_single_cond_bias/weights"),
     ffwTransition1: at("ffw_transition1/weights"),
     // 🔴 boltz2's CONDITIONED TRANSITION HAS A THIRD PROJECTION. Its
@@ -290,11 +298,14 @@ async function constantAtomBias(store, ...names) {
 }
 
 async function atomBlockWith(store, stack, index, dialect) {
-  const block = await bind(store, atomBlock(store, stack, index));
+  const block = await bind(store, atomBlock(store, stack, index, dialect?.chaiAtomStack === true));
   // 🔴 ONE LIST, IN dialect.js. Listing these here and again in every hand-built
   // weight dict is how `maskAtomActPerBlock` reached the loader and not
   // check-af3-atom-decoder.js, killing that differential silently.
   Object.assign(block, atomBlockDialect(dialect));
+  // chai-1's atom stack (adaLN, gate-free attention, same-token mask): set here until a kernel reads it off the
+  // block, when it joins atomBlockDialect's list (test/dialect-routes.test.js pins that list's read routes)
+  block.chaiAtomStack = dialect.chaiAtomStack;
   // 🔴 CHAI-1 AND IntelliFold-2 RE-ZERO THE PADDED ATOM SLOTS AT THE TOP OF
   // EVERY BLOCK, because they pad the flat atom axis INSIDE each attention
   // call rather than once for the stack. Carried per block, like the other
@@ -359,6 +370,20 @@ export async function targetFeatureWeights(store) {
     : encoder;
   const W = (leaf) => store.tensor(`${root}_${leaf}/weights`);
   const pairNorm = await atomPairNorm(store, stackRoot, perBlockPair);
+  const chai = dialect.chaiAtomStack === true;
+  const Wopt = (leaf) => (chai ? null : W(leaf));
+  // 🔴 CHAI-1's TOKEN EMBEDDING (dialect.chaiTokenEmbedding): token_feats = one_hot(aatype) @ W + b
+  // + [profile | deletion_mean] @ W + esm2 @ W; s_cat = [pooled atoms | token_feats]; and TWO projections of
+  // s_cat - the trunk's target_feat and the diffusion module's (af3-any-model model.py, create_target_feat_embedding).
+  const C = (name) => store.tensor(`diffuser/chai1_${name}`);
+  const chaiToken = dialect.chaiTokenEmbedding !== true ? null : {
+    tokenFeatureWeights: await C("token_feature_embedding/weights"),
+    tokenFeatureBias: await C("token_feature_embedding/bias"),
+    msaProfileWeights: await C("msa_profile_embedding/weights"),
+    esmWeights: await C("esm_embedding/weights"),
+    singleProjInTrunk: await C("single_proj_in_trunk/weights"),
+    singleProjInStructure: await C("single_proj_in_structure/weights"),
+  };
   return {
     dialect,
     reference: {
@@ -450,12 +475,16 @@ export async function targetFeatureWeights(store) {
       // not depend on what ran before it.
       singleToPairCondRow: await W("single_to_pair_cond_row_1"),
       singleToPairCondCol: await W("single_to_pair_cond_col_1"),
-      embedPairOffsets: await W("embed_pair_offsets_1"),
-      embedPairDistances: await W("embed_pair_distances_1"),
-      embedPairOffsetsValid: await W("embed_pair_offsets_valid"),
+      embedPairOffsets: await Wopt("embed_pair_offsets_1"),
+      embedPairDistances: await Wopt("embed_pair_distances_1"),
+      embedPairOffsetsValid: await Wopt("embed_pair_offsets_valid"),
+      // chai's atom-pair feature in their place: [12-class squared-distance one-hot | 1/(1+d^2) | valid] (14)
+      // through a BIASED linear, and a two-layer pair MLP with no input relu
+      ...(chai ? { embedAtomPairFeat: await W("embed_atom_pair_feat"),
+                   embedAtomPairFeatBias: await store.tensor(`${root}_embed_atom_pair_feat/bias`) } : {}),
       pairMlp1: await W("pair_mlp_1"),
       pairMlp2: await W("pair_mlp_2"),
-      pairMlp3: await W("pair_mlp_3"),
+      pairMlp3: await Wopt("pair_mlp_3"),
       // The first entry is the shared tensor under stock AF3 and block 0's
       // under OpenDDE; `pairNormPerBlock` beside them says which, and a caller
       // that ignores it gets AlphaFold 3's behaviour on an OpenDDE bundle -
@@ -480,6 +509,7 @@ export async function targetFeatureWeights(store) {
       // tools/gpu/check-af3-target-feat-gpu.js, which is also where the 33x
       // comes from.
       targetFeatSum: sum,
+      chaiToken,
       trunkSingleChannels: 384,
       trunkPairChannels: 128,
       lnormTrunkSingleCondScale: new Float32Array(384),
@@ -619,7 +649,10 @@ export async function conditioningWeights(store, dialect) {
     // `single_activations` is [447, 384] and says 447 outright.
     targetFeatWidth: dims(store, "diffuser/evoformer/single_activations/weights")[0],
     relativeWidth: 139,
-    trunkPairChannels: splitPair
+    // chai: [z_trunk | chai's structure token-pair features], half each
+    trunkPairChannels: dialect.chaiDiffusionConditioning === true
+      ? dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0] / 2
+      : splitPair
       ? dims(store, `${HEAD}/z_trunk_projection/weights`)[0]
       // ...and where only the RELPOS is projected, the concatenation is two
       // equal halves, so the trunk pair's width is what relpe was projected TO.
@@ -642,6 +675,19 @@ export async function conditioningWeights(store, dialect) {
     } : {}),
     pairTransitions: [await transition("pair_transition_0"),
                       await transition("pair_transition_1")],
+    // 🔴 CHAI-1 CLOSES BOTH CONDITIONING TRACKS WITH AN AFFINE LayerNorm (after the pair transitions; after the
+    // single transitions and the noise term) - without them its token transformer reached 9.2e7 against chai's
+    // 160 in af3-any-model. And its pair input's second half is chai's STRUCTURE token-pair projection (the
+    // relative one-hots and the frozen single-chain columns, plus the bond term), not the trunk's z_init.
+    ...(dialect.chaiDiffusionConditioning !== true ? {} : {
+      pairCondFinalNormScale: await T("pair_cond_final_norm/scale"),
+      pairCondFinalNormOffset: await T("pair_cond_final_norm/offset"),
+      singleCondFinalNormScale: await T("single_cond_final_norm/scale"),
+      singleCondFinalNormOffset: await T("single_cond_final_norm/offset"),
+      structurePairWeights: await store.tensor("diffuser/chai1_structure_token_pair/weights"),
+      structurePairBias: await store.tensor("diffuser/chai1_structure_token_pair/bias"),
+      structureBondWeights: await store.tensor("diffuser/chai1_structure_bond/weights"),
+    }),
     singleCondInitialNormScale: await T("single_cond_initial_norm/scale"),
     singleCondInitialNormOffset: await O("single_cond_initial_norm/offset"),
     singleCondInitialProjection: await T("single_cond_initial_projection/weights"),
@@ -663,7 +709,7 @@ export async function conditioningWeights(store, dialect) {
   };
 }
 
-export async function diffusionWeights(store, superBlocks = 6) {
+export async function diffusionWeights(store, superBlocks = undefined) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
   const O = (name) => offsetOf(store, `${HEAD}/${name}`);
   // The atom stacks' dialect flags; see `atomBlockWith`.
@@ -712,6 +758,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
     ? `${TX}/${stackName}/${stackName}/pair_logits_projection/weights`
     : `${TX}/${stackName}/pair_logits_projection/weights`;
   const rawProjections = await store.tensor(projectionName);
+  // the super-block count off the bundle: AF3's 6 of 4, chai's 4 of 4
+  superBlocks ??= store.shape(projectionName)[0];
+  const chai = dialect.chaiAtomStack === true;
   const projectionStride = rawProjections.length / store.shape(projectionName)[0];
 
   /**
@@ -758,16 +807,20 @@ export async function diffusionWeights(store, superBlocks = 6) {
     const blocks = [];
     for (let inner = 0; inner < 4; inner += 1) {
       const at = (leaf) => stacked(store, `${txStackFor(perBlockPair)}${leaf}`, s * 4 + inner, 2);
+      // chai's adaLN and gate-free attention, as in `atomBlock`
+      const opt = chai ? (leaf) => maybeTx(leaf, s * 4 + inner) : at;
       blocks.push(await bind(store, {
-        SingleCondLayerNormScale: at("single_cond_layer_norm/scale"),
+        SingleCondLayerNormScale: opt("single_cond_layer_norm/scale"),
         SingleCondScaleWeights: at("single_cond_scale/weights"),
-        SingleCondScaleBias: at("single_cond_scale/bias"),
+        SingleCondScaleBias: opt("single_cond_scale/bias"),
         SingleCondBias: at("single_cond_bias/weights"),
         qProjection: at("q_projection/weights"),
         qBias: at("q_projection/bias"),
         kProjection: at("k_projection/weights"),
         vProjection: at("v_projection/weights"),
-        gatingQuery: at("gating_query/weights"),
+        // (chai: zeros, the fused gate exactly 0.5, which native doubles back in the output projection)
+        gatingQuery: chai ? new Float32Array(store.shape(`${txStackFor(perBlockPair)}q_projection/weights`)
+          .slice(2).reduce((a, b) => a * b, 1)) : at("gating_query/weights"),
         // 🔴 rosettafold3's kq_norm: A TRAINED LayerNorm ON q AND k, over the
         // FLATTENED num_head * key_dim axis rather than per head, applied after
         // the projection and before the key_dim scaling. Only the diffusion
@@ -782,9 +835,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
         Transition2: at("transition2/weights"),
         AdaptiveZeroCondWeights: at("adaptive_zero_cond/weights"),
         AdaptiveZeroCondBias: at("adaptive_zero_cond/bias"),
-        ffwSingleCondLayerNormScale: at("ffw_single_cond_layer_norm/scale"),
+        ffwSingleCondLayerNormScale: opt("ffw_single_cond_layer_norm/scale"),
         ffwSingleCondScaleWeights: at("ffw_single_cond_scale/weights"),
-        ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias"),
+        ffwSingleCondScaleBias: opt("ffw_single_cond_scale/bias"),
         ffwSingleCondBias: at("ffw_single_cond_bias/weights"),
         ffwTransition1: at("ffw_transition1/weights"),
         // See `atomBlock`: boltz2's transition up-gate, nested two deep here.
@@ -810,7 +863,8 @@ export async function diffusionWeights(store, superBlocks = 6) {
     // ...and the head's own single width is the conditioning's too: boltz2
     // embeds 768 where AlphaFold 3 embeds 384.
     seqChannels: conditioning.seqChannels, perTokenChannels: 768,
-    singleCondEmbeddingNormScale: await T("single_cond_embedding_norm/scale"),
+    // (chai has none: its conditioning ends in single_cond_final_norm, which this would undo by re-centring)
+    singleCondEmbeddingNormScale: chai ? null : await T("single_cond_embedding_norm/scale"),
     singleCondEmbeddingNormOffset: await O("single_cond_embedding_norm/offset"),
     singleCondEmbeddingProjection: await T("single_cond_embedding_projection/weights"),
     outputNormScale: await T("output_norm/scale"),
@@ -853,6 +907,8 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // reaches these stacks - see `chainedAtomLayerNorm`. False everywhere
       // else, and the encoder generates the kernels it always did.
       noResidual: dialect.diffusionNoResidual === true,
+      // chai's adaptive LayerNorm (eps 0.1, raw conditioning, (scale + 1), no scale bias) and no gating query
+      chaiAdaLn: chai,
       pairInputLayerNormScale: perBlockPair
         ? new Float32Array(folded.channels).fill(1)
         : await store.tensor(`${TX}/pair_input_layer_norm/scale`),
@@ -880,13 +936,15 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // line used to contradict. See `targetFeatureWeights` for the bisect.
       singleToPairCondRow: await T("diffusion_single_to_pair_cond_row_1/weights"),
       singleToPairCondCol: await T("diffusion_single_to_pair_cond_col_1/weights"),
-      embedPairOffsets: await T("diffusion_embed_pair_offsets_1/weights"),
-      embedPairDistances: await T("diffusion_embed_pair_distances_1/weights"),
+      embedPairOffsets: chai ? null : await T("diffusion_embed_pair_offsets_1/weights"),
+      embedPairDistances: chai ? null : await T("diffusion_embed_pair_distances_1/weights"),
       // ...and this one has no _1 form, which makes the set look like a typo.
-      embedPairOffsetsValid: await T("diffusion_embed_pair_offsets_valid/weights"),
+      embedPairOffsetsValid: chai ? null : await T("diffusion_embed_pair_offsets_valid/weights"),
+      ...(chai ? { embedAtomPairFeat: await T("diffusion_embed_atom_pair_feat/weights"),
+                   embedAtomPairFeatBias: await T("diffusion_embed_atom_pair_feat/bias") } : {}),
       pairMlp1: await T("diffusion_pair_mlp_1/weights"),
       pairMlp2: await T("diffusion_pair_mlp_2/weights"),
-      pairMlp3: await T("diffusion_pair_mlp_3/weights"),
+      pairMlp3: chai ? null : await T("diffusion_pair_mlp_3/weights"),
       // Shared under AlphaFold 3, per block under OpenDDE - and under OpenDDE
       // the tensors live INSIDE the stack, which is why the root moves too.
       pairInputLayerNormScale: encoderPairNorm.scale[0],
@@ -928,6 +986,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
       atomFeaturesLayerNormScale: await T("diffusion_atom_features_layer_norm/scale"),
       atomFeaturesLayerNormOffset: await O("diffusion_atom_features_layer_norm/offset"),
       atomFeaturesToPositionUpdate: await T("diffusion_atom_features_to_position_update/weights"),
+      // chai conditions its decoder on a SECOND, affine LayerNorm of the encoder's conditioning
+      ...(chai ? { postAtomCondLayerNormScale: await T("diffusion_post_atom_cond_layer_norm/scale"),
+                   postAtomCondLayerNormOffset: await T("diffusion_post_atom_cond_layer_norm/offset") } : {}),
       blocks: [await atomBlockWith(store, decoderStackFor(atomPerBlock), 0, dialect),
                await atomBlockWith(store, decoderStackFor(atomPerBlock), 1, dialect),
                await atomBlockWith(store, decoderStackFor(atomPerBlock), 2, dialect)],

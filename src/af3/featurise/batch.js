@@ -102,7 +102,8 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     // 🔴 DROP_ATOMS: four families carry no terminal OXT and no 5' OP3. The
     // featuriser's switch is `terminalAtoms`, which ESMFold2 already used; this
     // is the same knob under the dialect's name. See dialect.js.
-    ...(options.dropTerminalAtoms === true ? { terminalAtoms: false } : {}),
+    ...(options.dropTerminalAtoms === true ? { terminalAtoms: false }
+      : options.dropTerminalAtoms === "protein" ? { terminalAtoms: "nucleic" } : {}),
     // 🔴 AND THE QUERY TWICE, for the three families whose paired and unpaired
     // blocks each contribute it. Only where the alignment is empty; see
     // `duplicateQueryRow` in dialect.js.

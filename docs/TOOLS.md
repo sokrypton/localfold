@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-355 tools. `tools/fixtures/` is data and is not listed.
+356 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -292,7 +292,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (94)
+## `tools/` - everything else (95)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -353,6 +353,7 @@ go through CDP, and the deploy.
 - **`export_af3_model.py`** - Write a LocalFold float32 model directory from AF3-lineage parameters.
 - **`export_alphafold_structure_reference.py`** - Replay and export the official AF2 structure module from a trunk fixture.
 - **`export_alphafold_template_parameters.py`** - Add official model template parameters to an existing reference manifest.
+- **`export_chai1_structure_pair.py`** - Add chai-lab's STRUCTURE token-pair weights to a Chai-1 bundle - the half af3-any-model's converter drops.
 - **`export_confidence_reference.py`** - Export AF2 pLDDT/PAE head parameters and final-recycle reference logits.
 - **`export_esm2_3b.py`** - ESM2 3B (the tower Chai-1's tokens read) as a bundle the native port reads, its matrices kept int8 - from af3-any-model's own quantisation (lm/esm2.bin.zst), not a second one.
 - **`export_esmc6b.py`** - ESM-C 6B (the tower of the released ESMFold2 and ESMFold2-Fast) as a bundle the native port reads, with the tower's matrices kept int8 - from af3-any-model's own quantisation, not a second one.

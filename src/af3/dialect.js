@@ -246,6 +246,17 @@ export const ALPHAFOLD3 = Object.freeze({
   // than in the contraction.
   triangleMulDivideByLength: false,
   structuralTokens: false,
+  chaiAtomStack: false,
+  chaiTokenEmbedding: false,
+  parallelPairformer: false,
+  groupedOuterProduct: false,
+  chaiMsaFeatures: false,
+  chaiDiffusionConditioning: false,
+  chaiSampler: false,
+  chaiConfidence: false,
+  chaiTemplates: false,
+  recycleFromInit: false,
+  mlpDistogram: false,
 });
 
 /**
@@ -345,6 +356,17 @@ export const OPENBIND0 = Object.freeze({
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: false,
   structuralTokens: false,
+  chaiAtomStack: false,
+  chaiTokenEmbedding: false,
+  parallelPairformer: false,
+  groupedOuterProduct: false,
+  chaiMsaFeatures: false,
+  chaiDiffusionConditioning: false,
+  chaiSampler: false,
+  chaiConfidence: false,
+  chaiTemplates: false,
+  recycleFromInit: false,
+  mlpDistogram: false,
 });
 
 
@@ -512,6 +534,17 @@ export const OPENDDE = Object.freeze({
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: false,
   structuralTokens: true,
+  chaiAtomStack: false,
+  chaiTokenEmbedding: false,
+  parallelPairformer: false,
+  groupedOuterProduct: false,
+  chaiMsaFeatures: false,
+  chaiDiffusionConditioning: false,
+  chaiSampler: false,
+  chaiConfidence: false,
+  chaiTemplates: false,
+  recycleFromInit: false,
+  mlpDistogram: false,
 });
 
 /**
@@ -678,6 +711,17 @@ export const PROTENIX2 = Object.freeze({
   // concatenation. See docs/AF3.md for the feature order, which has a trap in
   // it worth reading before implementing.
   fusedTemplateEmbedder: true,
+  chaiAtomStack: false,
+  chaiTokenEmbedding: false,
+  parallelPairformer: false,
+  groupedOuterProduct: false,
+  chaiMsaFeatures: false,
+  chaiDiffusionConditioning: false,
+  chaiSampler: false,
+  chaiConfidence: false,
+  chaiTemplates: false,
+  recycleFromInit: false,
+  mlpDistogram: false,
 });
 
 /**
@@ -858,6 +902,17 @@ export const BOLTZ2 = Object.freeze({
   // activation starts as a copy of the conditioning - and boltz2, rosettafold3
   // and chai1 need them split: q reads `a`, c reads `a + token_to_atom(s_trunk)`.
   preTrunkQuery: true,
+  chaiAtomStack: false,
+  chaiTokenEmbedding: false,
+  parallelPairformer: false,
+  groupedOuterProduct: false,
+  chaiMsaFeatures: false,
+  chaiDiffusionConditioning: false,
+  chaiSampler: false,
+  chaiConfidence: false,
+  chaiTemplates: false,
+  recycleFromInit: false,
+  mlpDistogram: false,
 });
 
 /**
@@ -955,6 +1010,17 @@ export const INTELLIFOLD2 = Object.freeze({
   maskAtomActPerBlock: true,
   triangleMulDivideByLength: false,
   structuralTokens: false,
+  chaiAtomStack: false,
+  chaiTokenEmbedding: false,
+  parallelPairformer: false,
+  groupedOuterProduct: false,
+  chaiMsaFeatures: false,
+  chaiDiffusionConditioning: false,
+  chaiSampler: false,
+  chaiConfidence: false,
+  chaiTemplates: false,
+  recycleFromInit: false,
+  mlpDistogram: false,
 });
 
 /**
@@ -1143,6 +1209,98 @@ export const ROSETTAFOLD3 = Object.freeze({
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: true,
   structuralTokens: false,
+  chaiAtomStack: false,
+  chaiTokenEmbedding: false,
+  parallelPairformer: false,
+  groupedOuterProduct: false,
+  chaiMsaFeatures: false,
+  chaiDiffusionConditioning: false,
+  chaiSampler: false,
+  chaiConfidence: false,
+  chaiTemplates: false,
+  recycleFromInit: false,
+  mlpDistogram: false,
+});
+
+
+/**
+ * Chai-1 (chaidiscovery, Apache 2.0), as af3-any-model maps it onto AlphaFold 3's scopes (converters/chai1.py).
+ *
+ * 🔴 NOT OPENFOLD-DERIVED, SO MOST OF IT IS ITS OWN. chai ships frozen TorchScript, and its graph differs from
+ * AF3's in ~45 places that no other model here shares; rather than one flag each, they are grouped by stage
+ * (the eleven `chai*`/`parallelPairformer`/`groupedOuterProduct`/`recycleFromInit`/`mlpDistogram` flags, false in
+ * every other dialect). The rest are flags other models already carry. Each group names the conventions it
+ * covers where it is consumed.
+ *
+ * 🔴 AND AT TWO SEAMS af3-any-model IS NOT CHAI, MEASURED ON chai-lab's OWN TENSORS (tools/oracle/run_chai_lab.py,
+ * 6MRR): the diffusion module's pair input is chai's STRUCTURE token-pair features, not the trunk's z_init
+ * (relRMS 9.2 apart), and the confidence head's single input is the TRUNK projection, not the structure one
+ * (0.0 against 1.07). This port follows chai there; everywhere else it follows af3-any-model.
+ */
+export const CHAI1 = Object.freeze({
+  preTrunkQuery: true,
+  sampler: null,
+  msaDoubleAddPair: true,
+  targetFeatAtomOnly: false,
+  centreRefConformers: false,
+  emptyTemplateAatype: null,
+  rosettafold3TemplateFeatures: false,
+  templateFeatureMeanOnePass: false,
+  boltz2TemplateFeatures: false,
+  fusedTemplateLayout: null,
+  emptyTemplateRestypeColumns: null,
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: true,
+  fusedTemplateEmbedder: false,
+  projectedRelpos: false,
+  preSymmetrisedPde: false,
+  templateMeanOverAllSlots: false,
+  swapTransposedBias: false,
+  symmetriseBonds: false,
+  maskPaddedKeys: false,
+  padSingleCondUnknownDna: false,
+  pairInitFromSingle: false,
+  msaUpdateBeforeOuterProduct: false,
+  distogramBias: true,
+  keyMaskedAtomAttention: false,
+  perBlockPairLayerNorm: true,
+  perBlockAtomPairLayerNorm: false,
+  chainedAtomLayerNorm: false,
+  splitPairConditioning: false,
+  confidenceGlobalNorm: false,
+  chiralCentres: false,
+  confidenceCaDgram: false,
+  dedupeSelfMsa: false,
+  dropTerminalAtoms: "protein",
+  atomizedElementNames: false,
+  atomizedUnknownRestype: false,
+  atomizedUnknownMsa: false,
+  atomizedBackboneBonds: false,
+  modifiedAsOneToken: false,
+  noFlowSampler: true,
+  qblockAtomKeys: false,
+  paddedAtomKeys: true,
+  diffusionNoResidual: true,
+  msaPairedQueryRow: false,
+  maskAtomActPerBlock: true,
+  triangleMulDivideByLength: false,
+  structuralTokens: false,
+  chaiAtomStack: true,
+  chaiTokenEmbedding: true,
+  parallelPairformer: true,
+  groupedOuterProduct: true,
+  chaiMsaFeatures: true,
+  chaiDiffusionConditioning: true,
+  chaiSampler: true,
+  chaiConfidence: true,
+  chaiTemplates: true,
+  recycleFromInit: true,
+  mlpDistogram: true,
 });
 
 export const DIALECTS = Object.freeze({
@@ -1153,6 +1311,7 @@ export const DIALECTS = Object.freeze({
   opendde: OPENDDE,
   intellifold2: INTELLIFOLD2,
   rosettafold3: ROSETTAFOLD3,
+  chai1: CHAI1,
 });
 
 /**
@@ -1236,6 +1395,7 @@ export const DIALECT_ALIASES = Object.freeze({
   if2: "intellifold2",
   intellifold: "intellifold2",
   rf3: "rosettafold3",
+  chai: "chai1",
 });
 
 /**

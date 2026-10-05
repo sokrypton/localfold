@@ -127,6 +127,9 @@ export function batchFromDump(dump) {
       }
       return { residueOfToken, chainOfResidue };
     })(),
+    // chai1's tokens read ESM2 3B's last hidden state ([tokens, 2560], zeros on non-protein tokens): a batch
+    // field only for that family, which a batch dumped for it carries
+    ...(dump.inputs.esm_embeddings === undefined ? {} : { esmEmbeddings: floats(raw("esm_embeddings")) }),
     refPos: floats(raw("ref_pos")), refMask,
     refElement: ints(raw("ref_element")), refCharge: floats(raw("ref_charge")),
     refAtomNameChars: ints(raw("ref_atom_name_chars")),

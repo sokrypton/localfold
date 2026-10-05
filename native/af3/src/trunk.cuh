@@ -3,6 +3,11 @@
 #pragma once
 #include "pairtrack.cuh"
 
+// acc += work - base (an update run on a copy of its input, added as a difference: chai-1's parallel blocks)
+__global__ void addDiffK(float* acc, const float* work, const float* base, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) acc[i] += work[i] - base[i];
+}
+
 // ---------------------------------------------------------------- embedder
 // pair[i][j] = left[i] + right[j]
 __global__ void outerSumK(const float* left, const float* right, float* pair, int n, int C) {
@@ -41,6 +46,42 @@ __global__ void relativeEncodingK(const int* residueIndex, const int* tokenIndex
   if (sameEntity) v += Wpos[(size_t)(positionBins * 2) * C + c];
   pair[t] += v;
 }
+// chai-1's relative encoding (af3-any-model evoformer.py): two 67-class one-hots, the residue separation (same
+// chain: clip(ri_i - ri_j + 33, 0, 65), else 66) and the token separation (same residue of the same chain:
+// clip(ti_i - ti_j + 32, 0, 65), else 66), through a BIASED linear - its frozen single-chain token-pair columns
+// are in the bias
+__global__ void chaiRelativeEncodingK(const int* residueIndex, const int* tokenIndex, const int* asymId, const float* Wpos,
+                                      const float* bias, float* pair, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n * C) return;
+  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+  auto clip = [](int v) { return v < 0 ? 0 : (v > 65 ? 65 : v); };
+  bool sameChain = asymId[i] == asymId[j];
+  int rss = sameChain ? clip(residueIndex[i] - residueIndex[j] + 33) : 66;
+  int rts = sameChain && residueIndex[i] == residueIndex[j] ? clip(tokenIndex[i] - tokenIndex[j] + 32) : 66;
+  pair[t] += bias[c] + Wpos[(size_t)rss * C + c] + Wpos[(size_t)(67 + rts) * C + c];
+}
+// chai-1's MSA features (af3-any-model featurization.py create_msa_feat, chai1): 41 columns per row and token,
+// [is_paired | source one-hot (6; row 0 class 4, else 2) | deletion value | has deletion | one_hot(msa, 32)],
+// through a BIASED linear, plus the recycled single's projection. is_paired: the row covers tokens of more
+// than one chain.
+__global__ void chaiMsaEmbedK(const int* rows, const float* deletion, const float* msaMask, const int* asymId,
+                              const float* Wmsa, const float* bias, const float* fromSingle, float* msa, size_t count, int n,
+                              int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= count * C) return;
+  int c = (int)(t % C); size_t row = t / C; int token = (int)(row % n); size_t s = row / n;
+  int first = -1; bool paired = false;
+  for (int k = 0; k < n && !paired; ++k)
+    if (msaMask[s * n + k] != 0) { if (first < 0) first = asymId[k]; else if (asymId[k] != first) paired = true; }
+  float d = deletion[row];
+  int code = rows[row];
+  float v = bias[c] + (paired ? Wmsa[c] : 0.f) + Wmsa[(size_t)(1 + (s == 0 ? 4 : 2)) * C + c]
+          + atanf(d / 3.f) * (2.f / 3.14159265358979f) * Wmsa[(size_t)7 * C + c]
+          + fminf(fmaxf(d, 0.f), 1.f) * Wmsa[(size_t)8 * C + c]
+          + (code >= 0 && code < 32 ? Wmsa[(size_t)(9 + code) * C + c] : 0.f);
+  msa[t] = v + fromSingle[(size_t)token * C + c];
+}
 // msa = one_hot(32) + clip(deletion) + atan(deletion/3)*2/pi, projected, plus the target
 // feature's projection broadcast over rows.
 // (width 35: an is_paired column, set on the query row (row < n) only where `pairedQuery` - boltz2
@@ -66,6 +107,7 @@ struct Trunk {
   bool inPlaceRecycle = false;         // the recycled pair is t.pair (makeTrunk)
   int* msaRows; float* deletion;
   bool swap, divide;
+  int pass = 0;              // the recycle pass embed() is building (chai-1 seeds the first from z_init/s_init)
 };
 
 // Whether an input fits the card, asked before the trunk allocates anything, so a fold past it is refused at once
@@ -167,7 +209,27 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   }
   linear<float, float>(pairSource, left, n, sourceWidth, C, E + "leftSingle");
   linear<float, float>(pairSource, right, n, sourceWidth, C, E + "rightSingle");
-  if (t.inPlaceRecycle) {
+  const bool chai = M.flag("trunk.dialect.recycleFromInit");
+  auto chaiRelEnc = [&]() {
+    chaiRelativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(Idev("batch.features.residueIndex"),
+      Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), W(E + "positionActivations"),
+      W(E + "positionActivationsBias"), t.pair, n, C);
+  };
+  if (chai && t.pass == 0) {
+    // chai's first pass recycles z_init itself (chai1.py seeds the carry with the initial representation):
+    // z = z_init + prev_embedding(LN(z_init)), z_init = left + right + the relative encoding - row by row in place
+    outerSumK<<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C);
+    chaiRelEnc();
+    size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
+    T* ln = scratch<T>("emb.prevln", per * C);
+    float* prev = scratch<float>("emb.prevproj", per * C);
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNorm2<float, T>(t.pair + r0 * C, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
+      linear<T, float>(ln, prev, r, C, C, E + "prevEmbedding");
+      addK<<<blocks(r * C), 256, 0, STREAM>>>(t.pair + r0 * C, prev, r * C);
+    }
+  } else if (t.inPlaceRecycle) {
     // in place, a chunk of rows at a time: each row's new value reads only the same row of the last pass's
     // pair, so the projection of the old rows is taken first and the rows are then overwritten with
     // left + right + it
@@ -195,7 +257,8 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   }
   }
   onSeam("z_after_prev", t.pair, pairs * C);
-  relativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(
+  if (chai) { if (t.pass > 0) chaiRelEnc(); }      // (the first pass added it before the recycle term)
+  else relativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(
     Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
     Idev("batch.features.entityId"), Idev("batch.features.symId"), W(E + "positionActivations"),
     t.pair, n, C, 32, 2);
@@ -210,6 +273,25 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   templateEmbedding<T>(t, t.pair);     // its projection accumulated into the pair (it reads the pair first)
   onSeam("z_after_template", t.pair, pairs * C);
   // msa and single
+  auto buildSingle = [&]() {
+    linear<float, float>(t.targetFeat, t.single, n, t.F, t.Cs, E + "singleActivations");
+    T* sln = scratch<T>("emb.prevsln", (size_t)n * t.Cs);
+    // (chai's first pass recycles s_init, which t.single holds at this point)
+    layerNorm2<float, T>(chai && t.pass == 0 ? t.single : t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale",
+                         E + "prevSingleEmbeddingNormOffset");
+    linear<T, float>(sln, t.single, n, t.Cs, t.Cs, E + "prevSingleEmbedding", false, 1.f);
+  };
+  if (M.flag("trunk.dialect.chaiMsaFeatures")) {
+    buildSingle();
+    float* fromSingle = scratch<float>("emb.fromTarget", (size_t)n * t.Cm);
+    linear<float, float>(t.single, fromSingle, n, t.Cs, t.Cm, E + "extraMsaTargetFeat");
+    size_t rows = (size_t)t.S * n;
+    if (lenW(E + "msaActivations") != (size_t)41 * t.Cm) { fprintf(stderr, "chai's msa features are not 41 wide\n"); exit(1); }
+    chaiMsaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, t.msaMask, Idev("batch.features.asymId"),
+      W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle, t.msa, rows, n, t.Cm);
+    ++t.pass;
+    return;
+  }
   float* fromTarget = scratch<float>("emb.fromTarget", (size_t)n * t.Cm);
   linear<float, float>(t.targetFeat, fromTarget, n, t.F, t.Cm, E + "extraMsaTargetFeat");
   size_t rows = (size_t)t.S * n;
@@ -218,11 +300,8 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   msaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, W(E + "msaActivations"),
                                                      fromTarget, t.msa, rows, n, t.Cm, msaWidth,
                                                      M.flag("trunk.dialect.msaPairedQueryRow"));
-  linear<float, float>(t.targetFeat, t.single, n, t.F, t.Cs, E + "singleActivations");
-  T* sln = scratch<T>("emb.prevsln", (size_t)n * t.Cs);
-  layerNorm2<float, T>(t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale",
-                       E + "prevSingleEmbeddingNormOffset");
-  linear<T, float>(sln, t.single, n, t.Cs, t.Cs, E + "prevSingleEmbedding", false, 1.f);
+  buildSingle();
+  ++t.pass;
 }
 
 // ---------------------------------------------------------------- template stack
@@ -346,6 +425,53 @@ void templateEmbedding(Trunk& t, float* out) {
   linear<float, float>(summed, out, pairs, Ct, Cq, P + "outputLinear", false, 1.f);
 }
 
+// chai-1's PARALLEL pair track (af3-any-model modules.py, PairFormerIteration under chai): every update reads the
+// stage's input z0 and they are summed, z = z0 + f1(z0) + f2(z0) + ..., where AlphaFold 3 applies them one after
+// another. The kernels here update a pair in place, so each update after the first runs on a fresh copy of z0
+// and adds its difference. The ending-node triangle attention's output is NOT transposed back under chai
+// (its fused attention concatenates [dir0(i,j), dir1(j,i)] before one output projection), so its difference is
+// added transposed: AlphaFold 3's ending-node update at (j, i) is chai's at (i, j).
+enum class PairUpdate { TriOut, TriIn, GridRow, GridCol, Transition };
+template <class T>
+void runPairUpdate(PairUpdate u, float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
+                   bool divide, int transitionFactor) {
+  int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
+  switch (u) {
+    case PairUpdate::TriOut: triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationOutgoing", true, divide); break;
+    case PairUpdate::TriIn: triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationIncoming", false, divide); break;
+    case PairUpdate::GridRow: gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); break;
+    case PairUpdate::GridCol: gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); break;
+    case PairUpdate::Transition: transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition"); break;
+  }
+}
+// pair[i][j] += work[j][i] - base[j][i]
+__global__ void addDiffTransposedK(float* acc, const float* work, const float* base, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n * C) return;
+  int c = (int)(t % C); size_t ij = t / C; size_t i = ij / n, j = ij % n;
+  size_t ji = (j * n + i) * C + c;
+  acc[t] += work[ji] - base[ji];
+}
+template <class T>
+void parallelPairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap, bool divide,
+                         int transitionFactor, std::initializer_list<PairUpdate> updates) {
+  size_t pc = (size_t)n * n * C;
+  float* base = scratch<float>("par.base", pc);
+  float* work = scratch<float>("par.work", pc);
+  CK(cudaMemcpyAsync(base, pair, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
+  bool first = true;
+  for (PairUpdate u : updates) {
+    if (first && u != PairUpdate::GridCol) {     // the first runs on the pair itself
+      runPairUpdate<T>(u, pair, mask, n, C, pre, swap, divide, transitionFactor);
+      first = false; continue;
+    }
+    first = false;
+    CK(cudaMemcpyAsync(work, base, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
+    runPairUpdate<T>(u, work, mask, n, C, pre, swap, divide, transitionFactor);
+    if (u == PairUpdate::GridCol) addDiffTransposedK<<<blocks(pc), 256, 0, STREAM>>>(pair, work, base, n, C);
+    else addDiffK<<<blocks(pc), 256, 0, STREAM>>>(pair, work, base, pc);
+  }
+}
 // ---------------------------------------------------------------- MSA stack
 template <class T>
 __global__ void biasRowsK(T* x, const float* b, size_t rows, int C) {
@@ -437,6 +563,73 @@ void outerProductMean(Trunk& t, const std::string& pre) {
                                                            C, after);
   }
 }
+// chai-1's GROUPED outer product (af3-any-model modules.py): x = LN(m); L, R = x Wl, x Wr reshaped
+// [S][n][G][K], times the MSA mask; P[i,j,g,k,l] = sum_s L[s,i,g,k] R[s,j,g,l] - NOT divided by any count;
+// P = LN(P; eps 0.1, scale, offset) over its G*K*K; pair += P Wout + b. f32 throughout: the sum grows with
+// the alignment's depth before the norm.
+// [S][n][G*K] -> [G][S][n][K]
+__global__ void groupMajorK(const float* x, float* out, int S, int n, int G, int K) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * n * G * K) return;
+  int k = (int)(t % K); size_t r = t / K; int i = (int)(r % n); r /= n; int s = (int)(r % S); int g = (int)(r / S);
+  out[t] = x[(((size_t)s * n + i) * G + g) * K + k];
+}
+// Pg [G][(i,k)][(j,l)] (bi query rows) -> out [(i,j)][(g,k,l)]
+__global__ void groupedPermuteK(const float* P, float* out, int bi, int n, int G, int K) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t per = (size_t)G * K * K;
+  if (t >= (size_t)bi * n * per) return;
+  int l = (int)(t % K); size_t r = t / K; int k = (int)(r % K); r /= K; int g = (int)(r % G); r /= G;
+  int j = (int)(r % n); int i = (int)(r / n);
+  out[t] = P[(size_t)g * ((size_t)bi * K * n * K) + (((size_t)i * K + k) * n + j) * K + l];
+}
+// LayerNorm over rows of width C with a given epsilon, affine (a warp a row)
+__global__ void layerNormEpsK(float* x, int rows, int C, const float* scale, const float* offset, float eps) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= (size_t)rows) return;
+  float* xr = x + row * C;
+  float s = 0; for (int c = lane; c < C; c += 32) s += xr[c];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  float mean = s / C, v = 0;
+  for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
+  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+  float inv = rsqrtf(v / C + eps);
+  for (int c = lane; c < C; c += 32) xr[c] = (xr[c] - mean) * inv * scale[c] + offset[c];
+}
+inline void groupedOuterProduct(Trunk& t, const std::string& pre) {
+  int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
+  int O = (int)M.meta(pre + ".outerChannels"), G = (int)M.meta(pre + ".groups"), K = O / G, per = G * K * K;
+  size_t rows = (size_t)S * n;
+  float* ln = scratch<float>("gopm.ln", rows * Cm);
+  layerNorm2<float, float>(t.msa, ln, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
+  float* L = scratch<float>("gopm.left", rows * O); float* R = scratch<float>("gopm.right", rows * O);
+  linear<float, float>(ln, L, rows, Cm, O, pre + ".leftProjection");
+  linear<float, float>(ln, R, rows, Cm, O, pre + ".rightProjection");
+  scaleRowsK<float><<<blocks(rows * O), 256, 0, STREAM>>>(L, t.msaMask, rows, O);
+  scaleRowsK<float><<<blocks(rows * O), 256, 0, STREAM>>>(R, t.msaMask, rows, O);
+  float* Lg = scratch<float>("gopm.lg", rows * O); float* Rg = scratch<float>("gopm.rg", rows * O);
+  groupMajorK<<<blocks(rows * O), 256, 0, STREAM>>>(L, Lg, S, n, G, K);
+  groupMajorK<<<blocks(rows * O), 256, 0, STREAM>>>(R, Rg, S, n, G, K);
+  int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * per * 2 + (size_t)n * C)));
+  float* P = scratch<float>("gopm.P", (size_t)Bi * n * per);
+  float* Pp = scratch<float>("gopm.Pp", (size_t)Bi * n * per);
+  float* X = scratch<float>("gopm.X", (size_t)Bi * n * C);
+  const float one = 1.f, zero = 0.f;
+  for (int i0 = 0; i0 < n; i0 += Bi) {
+    int bi = std::min(Bi, n - i0);
+    // per group, row-major P_g [(i,k)][(j,l)] = sum_s L_g[s,i,k] R_g[s,j,l]: col-major P^T = R_g (n*K x S) L_blk^T
+    CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_T, n * K, bi * K, S, &one, Rg, n * K, (long long)S * n * K,
+                                 Lg + (size_t)i0 * K, n * K, (long long)S * n * K, &zero, P, n * K,
+                                 (long long)bi * K * n * K, G));
+    groupedPermuteK<<<blocks((size_t)bi * n * per), 256, 0, STREAM>>>(P, Pp, bi, n, G, K);
+    layerNormEpsK<<<(unsigned)(((size_t)bi * n + 7) / 8), 256, 0, STREAM>>>(Pp, bi * n, per, W(pre + ".productNormScale"),
+                                                                           W(pre + ".productNormOffset"), 0.1f);
+    linear<float, float>(Pp, X, (size_t)bi * n, per, C, pre + ".outputW");
+    addBiasK<<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(X, W(pre + ".outputB"), (size_t)bi * n, C);
+    addK<<<blocks((size_t)bi * n * C), 256, 0, STREAM>>>(t.pair + (size_t)i0 * n * C, X, (size_t)bi * n * C);
+  }
+}
 // logits[h][i][j] from [ij][h], key mask, softmax over j, in place
 __global__ void msaWeightsK(const float* flat, const float* keyMask, float* w, int n, int heads) {
   size_t rowId = blockIdx.x; int h = (int)(rowId / n), i = (int)(rowId % n);
@@ -509,7 +702,10 @@ void msaAttention(Trunk& t, const std::string& pre) {
     linear<T, float>(pln, flat + r0 * heads, r, C, heads, pre + ".pairLogits");
   }
   float* keyMask = scratch<float>("msaatt.keymask", n);
-  keyMaskK<<<blocks(n, 128), 128, 0, STREAM>>>(t.msaMask, keyMask, S, n);
+  // chai: the logits masked by the TOKEN pair mask, not by the alignment's coverage; the values zeroed instead
+  const bool chaiMask = M.flag("trunk.dialect.chaiMsaFeatures");
+  if (chaiMask) CK(cudaMemcpyAsync(keyMask, t.seqMask, n * 4, cudaMemcpyDeviceToDevice, STREAM));
+  else keyMaskK<<<blocks(n, 128), 128, 0, STREAM>>>(t.msaMask, keyMask, S, n);
   float* w = scratch<float>("msaatt.w", (size_t)heads * pairs);
   msaWeightsK<<<(unsigned)(heads * n), 128, 0, STREAM>>>(flat, keyMask, w, n, heads);
   const T* wT;
@@ -535,6 +731,7 @@ void msaAttention(Trunk& t, const std::string& pre) {
     int sc = std::min(Sc, S - s0); size_t cr = (size_t)sc * n;
     const T* lnc = ln + (size_t)s0 * n * Cm;
     linear<T, T>(lnc, v, cr, Cm, Wd, pre + ".vProjection");
+    if (chaiMask) scaleRowsK<T><<<blocks(cr * Wd), 256, 0, STREAM>>>(v, t.msaMask + (size_t)s0 * n, cr, Wd);
     msaVToHeadsK<T><<<blocks(cr * Wd), 256, 0, STREAM>>>(v, vh, sc, n, heads, d);
     // per head: O_h (n x sc*d) = W_h (n x n) V_h (n x sc*d); col-major O^T = V^T W^T
     CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, n, n, &one, vh, cudaType<T>(), sc * d,
@@ -551,6 +748,17 @@ void msaAttention(Trunk& t, const std::string& pre) {
 template <class T>
 void msaBlock(Trunk& t, int k) {
   std::string B = "trunk.msaBlocks." + std::to_string(k);
+  if (M.flag("trunk.dialect.groupedOuterProduct")) {
+    // chai-1 (modules.py): z += grouped OPM(m); m += attention(m, z); m += transition(m); then the pair track in two
+    // parallel stages - z += triOut(z) + triIn(z) + transition(z), then z += attnStart(z) + attnEnd(z)
+    groupedOuterProduct(t, B + ".outerProductMean"); stage("msa.opm");
+    msaAttention<T>(t, B + ".msaAttention1"); stage("msa.attention");
+    transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
+    parallelPairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4,
+                           { PairUpdate::TriOut, PairUpdate::TriIn, PairUpdate::Transition });
+    parallelPairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4, { PairUpdate::GridRow, PairUpdate::GridCol });
+    return;
+  }
   // the outer product off the pre-update MSA (AF3), or off the updated one (OpenDDE, boltz2)
   bool updateFirst = M.flag("trunk.dialect.msaUpdateBeforeOuterProduct");
   if (!updateFirst) { outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm"); }
@@ -599,11 +807,11 @@ __global__ void addQBiasK(T* qkvg, const float* b, int n, int Wd) {
   qkvg[i * 4 * Wd + c] = fromF<T>(toF(qkvg[i * 4 * Wd + c]) + b[c]);
 }
 template <class T>
-__global__ void gateK(T* o, const T* qkvg, int n, int Wd) {
+__global__ void gateK(T* o, const T* qkvg, int n, int Wd, float gateBias = 0.f) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * Wd) return;
   size_t i = t / Wd; int c = (int)(t % Wd);
-  o[t] = fromF<T>(toF(o[t]) * sigm(toF(qkvg[i * 4 * Wd + 3 * Wd + c])));
+  o[t] = fromF<T>(toF(o[t]) * sigm(toF(qkvg[i * 4 * Wd + 3 * Wd + c]) + gateBias));
 }
 // OpenDDE's refiner and confidence blocks add one precomputed [i][j] bias to every head's logits
 __global__ void addBiasHeadsK(float* pl, const float* bias, size_t pairs, int heads) {
@@ -613,6 +821,22 @@ __global__ void addBiasHeadsK(float* pl, const float* bias, size_t pairs, int he
 template <class T>
 void singleTrack(float* single, const float* pair, const float* seqMask, int n, int C, int Cs,
                  const std::string& B, const float* extraBias = nullptr) {
+  // chai-1's parallel block: the gate is sigmoid(g + 1) (its gating linear's bias, a constant) and the
+  // transition reads the block's INPUT single, s = s0 + attention(s0) + transition(s0)
+  const bool parallel = M.flag("trunk.dialect.parallelPairformer");
+  const float gateBias = parallel ? 1.f : 0.f;
+  float* s0 = nullptr;
+  if (parallel) {
+    s0 = scratch<float>("st.s0", (size_t)n * Cs);
+    CK(cudaMemcpyAsync(s0, single, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+  }
+  auto singleTransition = [&]() {
+    if (!parallel) { transition<T>(single, n, Cs, 4, B + ".singleTransition"); return; }
+    float* w = scratch<float>("st.work", (size_t)n * Cs);
+    CK(cudaMemcpyAsync(w, s0, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+    transition<T>(w, n, Cs, 4, B + ".singleTransition");
+    addDiffK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, w, s0, (size_t)n * Cs);
+  };
   size_t pairs = (size_t)n * n;
   std::string A = B + ".singleAttention";
   int heads = (int)M.meta(A + ".heads"), d = (int)M.meta(A + ".dimension"), Wd = heads * d;
@@ -657,9 +881,9 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
          qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), n, rows, &zero, o + (size_t)i0 * Wd, cudaType<T>(),
          Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
     }
-    gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd);
+    gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
     linear<T, float>(o, single, n, Wd, Cs, A + ".outputProjection", false, 1.f);
-    transition<T>(single, n, Cs, 4, B + ".singleTransition");
+    singleTransition();
     return;
   }
   float* pl = scratch<float>("st.pl", pairs * heads);
@@ -699,14 +923,21 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, n, n, &one,
      qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), n, (size_t)n * n, &zero, o, cudaType<T>(),
      Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
-  gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd);
+  gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
   linear<T, float>(o, single, n, Wd, Cs, A + ".outputProjection", false, 1.f);
-  transition<T>(single, n, Cs, 4, B + ".singleTransition");
+  singleTransition();
 }
 
 template <class T>
 void pairformerBlockAt(float* pair, float* single, const float* pairMask, const float* seqMask, int n, int C,
                        int Cs, const std::string& B, bool swap, bool divide, const float* extraBias = nullptr) {
+  if (M.flag("trunk.dialect.parallelPairformer")) {
+    // the single track reads the pair ENTERING the block: kept in par.base by the pair updates
+    parallelPairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, { PairUpdate::TriOut, PairUpdate::TriIn,
+      PairUpdate::GridRow, PairUpdate::GridCol, PairUpdate::Transition });
+    singleTrack<T>(single, scratch<float>("par.base", (size_t)n * n * C), seqMask, n, C, Cs, B, extraBias); stage("single");
+    return;
+  }
   pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4);
   singleTrack<T>(single, pair, seqMask, n, C, Cs, B, extraBias); stage("single");
 }

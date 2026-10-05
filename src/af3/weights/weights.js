@@ -465,7 +465,15 @@ export async function embedderWeights(store) {
     // 🔴 [1, 128] - ONE input feature, the contact matrix. It was in the
     // shipped bundle and read by nothing, so every fold downloaded it and
     // multiplied it by no ligand bonds at all. See embedder-webgpu.js.
-    bondEmbedding: await T("bond_embedding/weights"),
+    // (absent from chai1, whose token-pair stream has no bond column: af3-any-model skips _embed_bonds for it)
+    ...(store.manifest?.tensors?.[`${EVO}/bond_embedding/weights`] === undefined
+      ? { bondEmbedding: null } : { bondEmbedding: await T("bond_embedding/weights") }),
+    // chai1's relative encoding and MSA embedding carry BIASES (its frozen single-chain token-pair columns are
+    // folded into the first); absent everywhere else
+    ...(store.manifest?.tensors?.[`${EVO}/~_relative_encoding/position_activations/bias`] === undefined ? {} : {
+      positionActivationsBias: await T("~_relative_encoding/position_activations/bias"),
+      msaActivationsBias: await T("msa_activations/bias"),
+    }),
     // 🔴 boltz2's z-INIT CARRIES TWO MORE TERMS AND BOTH CONTRIBUTE ON EVERY
     // INPUT. `token_bonds_type_embed` is an nn.Embedding over bond ORDER whose
     // row 0 - "no bond" - is a learned NONZERO vector, and
@@ -624,6 +632,14 @@ export async function msaBlockWeights(store, index) {
           ? at("outer_product_mean/right_projection/bias") : null,
       outputW: at("outer_product_mean/output_w"),
       outputB: at("outer_product_mean/output_b"),
+      // 🔴 chai1's outer product is GROUPED (af3-any-model modules.py): 8 groups of 8 x 8 products summed over
+      // the rows, NOT averaged, then LayerNorm(eps 0.1) over the 512 before output_w - so it carries the norm
+      // and states the group count by its width
+      ...(has(store, `${MSA_STACK}/outer_product_mean/product_norm/scale`) ? {
+        productNormScale: at("outer_product_mean/product_norm/scale"),
+        productNormOffset: at("outer_product_mean/product_norm/offset"),
+        groups: outerChannels * outerChannels / dims(store, `${MSA_STACK}/outer_product_mean/product_norm/scale`)[1],
+      } : {}),
     },
     msaAttention1: {
       heads: msaHeads, dimension: msaDimension,
@@ -836,8 +852,11 @@ export async function confidenceWeights(store) {
       paeLogitsLnOffset: await T("pae_logits_ln/offset"),
       plddtLnScale: await T("plddt_logits_ln/scale"),
       plddtLnOffset: await T("plddt_logits_ln/offset"),
-      resolvedLnScale: await T("experimentally_resolved_ln/scale"),
-      resolvedLnOffset: await T("experimentally_resolved_ln/offset"),
+      // (chai1 has no experimentally-resolved head: af3-any-model's NO_RESOLVED_HEAD)
+      ...(has("experimentally_resolved_ln/scale") ? {
+        resolvedLnScale: await T("experimentally_resolved_ln/scale"),
+        resolvedLnOffset: await T("experimentally_resolved_ln/offset"),
+      } : {}),
     } : {}),
     leftHalfDistanceLogits: await T("left_half_distance_logits/weights"),
     paeLogits: await T("pae_logits/weights"),
@@ -848,7 +867,8 @@ export async function confidenceWeights(store) {
       paeInterLogits: await T("pae_inter_logits/weights"),
     } : {}),
     plddtLogits: await T("plddt_logits/weights"),
-    experimentallyResolvedLogits: await T("experimentally_resolved_logits/weights"),
+    experimentallyResolvedLogits: has("experimentally_resolved_logits/weights")
+      ? await T("experimentally_resolved_logits/weights") : null,
   };
 }
 

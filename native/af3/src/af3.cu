@@ -159,6 +159,7 @@ int main(int argc, char** argv) {
   } else {
     seedList.push_back(seed);
   }
+  setAdaMode(M.flag("trunk.dialect.chaiAtomStack"));     // (chai-1's adaptive LayerNorm form, for every atom and token stack)
   printf("loaded %zu entries in %.1f s; %d tokens\n", M.index.size(),
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          (int)M.meta("batch.tokens"));
@@ -283,6 +284,7 @@ int main(int argc, char** argv) {
       if (!t.pair) t.pair = dalloc(pp);                // (left parked by the last fold)
       // (in place, the pair is the recycled one)
       CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
+      t.pass = 0;
     }
     std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
     auto clock = [] { return std::chrono::steady_clock::now(); };

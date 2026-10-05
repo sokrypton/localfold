@@ -4,6 +4,18 @@
 #pragma once
 #include "pairtrack.cuh"
 
+// The adaptive LayerNorm's two forms: AlphaFold 3's sigmoid(scale) * LN(x; eps 1e-5) + shift, and chai-1's
+// (scale + 1) * LN(x; eps 0.1) + shift (af3-any-model diffusion_transformer.py's chai adaLN: the conditioning is
+// not normalised and the scale has no bias). The +1 is folded into the scale where it is made (adaCond), so a
+// kernel reads the multiplier as is; set once a model, by setAdaMode, since every adaLN of one model is one form.
+__device__ int ADA_RAW_D = 0;
+__device__ float ADA_EPS_D = 1e-5f;
+__device__ __forceinline__ float adaMul(float s) { return ADA_RAW_D ? s : sigm(s); }
+inline bool ADA_RAW = false;
+inline void setAdaMode(bool chai) {
+  int raw = chai ? 1 : 0; float eps = chai ? 0.1f : 1e-5f; ADA_RAW = chai;
+  CK(cudaMemcpyToSymbol(ADA_RAW_D, &raw, sizeof raw)); CK(cudaMemcpyToSymbol(ADA_EPS_D, &eps, sizeof eps));
+}
 struct Gather { const int* idx; const float* mask; int count; };
 inline Gather gatherOf(const std::string& name) {
   return { Idev(name + ".indices"), Fdev(name + ".mask"), (int)M.len(name + ".indices") };
@@ -181,7 +193,16 @@ struct AtomBlockCache {
   bool chained = false;     // the keys' adaptive LN reads the normalised queries (OpenDDE, protenix2)
 };
 // scale = LN_s(cond) W + b and shift = LN_s(cond) W' for one adaptive LayerNorm
+__global__ void addConstK(float* x, float v, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] += v;
+}
 inline void adaCond(const float* cond, size_t rows, int C, int condC, const std::string& w, float* scale, float* shift) {
+  if (ADA_RAW) {            // chai: the conditioning as it is, scale = cond Ws + 1 (no bias), shift = cond Wb
+    linear<float, float>(cond, scale, rows, condC, C, w + "SingleCondScaleWeights");
+    addConstK<<<blocks(rows * C), 256, 0, STREAM>>>(scale, 1.f, rows * C);
+    linear<float, float>(cond, shift, rows, condC, C, w + "SingleCondBias");
+    return;
+  }
   float* cn = scratch<float>("ada.cn", rows * condC);
   layerNormSlow(cond, cn, rows, condC, W(w + "SingleCondLayerNormScale"), nullptr);
   linear<float, float>(cn, scale, rows, condC, C, w + "SingleCondScaleWeights");
@@ -223,10 +244,10 @@ __global__ void adaLnK(const float* x, const float* scale, const float* shift, T
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = 1.f / sqrtf(v / C + 1e-5f);
+  float inv = 1.f / sqrtf(v / C + ADA_EPS_D);
   for (int c = lane; c < C; c += 32) {
     size_t k = (row % period) * C + c;
-    out[row * C + c] = fromF<TO>(sigm(scale[k]) * ((xr[c] - mean) * inv) + shift[k]);
+    out[row * C + c] = fromF<TO>(adaMul(scale[k]) * ((xr[c] - mean) * inv) + shift[k]);
   }
 }
 template <class TO>
@@ -250,12 +271,12 @@ __global__ void adaLn2K(const float* x, const float* s1, const float* h1, const 
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
     float mean = sum / C, q = (v.x - mean) * (v.x - mean) + (v.y - mean) * (v.y - mean) + (v.z - mean) * (v.z - mean) + (v.w - mean) * (v.w - mean);
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    float inv = 1.f / sqrtf(q / C + 1e-5f);
+    float inv = 1.f / sqrtf(q / C + ADA_EPS_D);
     float n[4] = { (v.x - mean) * inv, (v.y - mean) * inv, (v.z - mean) * inv, (v.w - mean) * inv };
     float as[4] = { a.x, a.y, a.z, a.w }, bs[4] = { b.x, b.y, b.z, b.w }, cs[4] = { c2.x, c2.y, c2.z, c2.w }, ds[4] = { d.x, d.y, d.z, d.w };
     for (int e = 0; e < 4; ++e) {
-      o1[row * C + lane * 4 + e] = fromF<TO>(sigm(as[e]) * n[e] + bs[e]);
-      o2[row * C + lane * 4 + e] = fromF<TO>(sigm(cs[e]) * n[e] + ds[e]);
+      o1[row * C + lane * 4 + e] = fromF<TO>(adaMul(as[e]) * n[e] + bs[e]);
+      o2[row * C + lane * 4 + e] = fromF<TO>(adaMul(cs[e]) * n[e] + ds[e]);
     }
     return;
   }
@@ -265,11 +286,11 @@ __global__ void adaLn2K(const float* x, const float* s1, const float* h1, const 
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = 1.f / sqrtf(v / C + 1e-5f);
+  float inv = 1.f / sqrtf(v / C + ADA_EPS_D);
   for (int c = lane; c < C; c += 32) {
     size_t k = (row % period) * C + c; float n = (xr[c] - mean) * inv;
-    o1[row * C + c] = fromF<TO>(sigm(s1[k]) * n + h1[k]);
-    o2[row * C + c] = fromF<TO>(sigm(s2[k]) * n + h2[k]);
+    o1[row * C + c] = fromF<TO>(adaMul(s1[k]) * n + h1[k]);
+    o2[row * C + c] = fromF<TO>(adaMul(s2[k]) * n + h2[k]);
   }
 }
 struct AtomStep {
@@ -296,10 +317,10 @@ __global__ void gatherAdaLnK(const float* act, const int* idx, const float* gmas
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = (live ? xr[c] : 0.f) - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = 1.f / sqrtf(v / C + 1e-5f);
+  float inv = 1.f / sqrtf(v / C + ADA_EPS_D);
   for (int c = lane; c < C; c += 32) {
     size_t k = row * C + c;
-    out[k] = fromF<TO>(sigm(scale[k]) * (((live ? xr[c] : 0.f) - mean) * inv) + shift[k]);
+    out[k] = fromF<TO>(adaMul(scale[k]) * (((live ? xr[c] : 0.f) - mean) * inv) + shift[k]);
   }
 }
 // act += y * sigmoid(gate); out = sigmoid(scale) * LN(act) + shift; warp per row
@@ -322,10 +343,10 @@ __global__ void gatedAddAdaLnRowsK(float* act, const float* y, const float* gate
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
     float mean = sum / C, q = (x.x - mean) * (x.x - mean) + (x.y - mean) * (x.y - mean) + (x.z - mean) * (x.z - mean) + (x.w - mean) * (x.w - mean);
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    float inv = 1.f / sqrtf(q / C + 1e-5f);
+    float inv = 1.f / sqrtf(q / C + ADA_EPS_D);
     TO* o = out + row * C + c0;
-    o[0] = fromF<TO>(sigm(sc.x) * ((x.x - mean) * inv) + sh.x); o[1] = fromF<TO>(sigm(sc.y) * ((x.y - mean) * inv) + sh.y);
-    o[2] = fromF<TO>(sigm(sc.z) * ((x.z - mean) * inv) + sh.z); o[3] = fromF<TO>(sigm(sc.w) * ((x.w - mean) * inv) + sh.w);
+    o[0] = fromF<TO>(adaMul(sc.x) * ((x.x - mean) * inv) + sh.x); o[1] = fromF<TO>(adaMul(sc.y) * ((x.y - mean) * inv) + sh.y);
+    o[2] = fromF<TO>(adaMul(sc.z) * ((x.z - mean) * inv) + sh.z); o[3] = fromF<TO>(adaMul(sc.w) * ((x.w - mean) * inv) + sh.w);
     return;
   }
   for (int c = lane; c < C; c += 32) { float v = a[c] + y[row * C + c] * sigm(gate[pr + c]); a[c] = v; s += v; }
@@ -334,8 +355,8 @@ __global__ void gatedAddAdaLnRowsK(float* act, const float* y, const float* gate
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = a[c] - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = 1.f / sqrtf(v / C + 1e-5f);
-  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(sigm(scale[pr + c]) * ((a[c] - mean) * inv) + shift[pr + c]);
+  float inv = 1.f / sqrtf(v / C + ADA_EPS_D);
+  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(adaMul(scale[pr + c]) * ((a[c] - mean) * inv) + shift[pr + c]);
 }
 __global__ void addSigmoidGatedK(float* x, const float* y, const float* gate, size_t n, size_t period) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] += y[i] * sigm(gate[i % period]);
@@ -521,6 +542,10 @@ inline const float* zeros(size_t n) {          // a device vector of zeros, at l
   if (n > have) { if (z) CK(cudaFree(z)); z = dalloc(n); CK(cudaMemset(z, 0, n * 4)); have = n; }
   return z;
 }
+template <class T>
+__global__ void castScaleK(const T* x, float* y, float a, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = a * toF(x[i]);
+}
 // One block of the cross-attention transformer, in place on act [queryRows][C], from the block's cache.
 // T is the GEMM inputs' type (f16 on the fast path); the residual stream stays f32.
 template <class T>
@@ -587,7 +612,8 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
       st.keyMasked, sh.subsets);
   }
   float* attention = scratch<float>("ab.attention", qRows * C);
-  linear<T, float>(gathered, attention, qRows, Wd, C, B + ".Transition2");
+  if (hasW(B + ".Transition2")) linear<T, float>(gathered, attention, qRows, Wd, C, B + ".Transition2");
+  else castScaleK<T><<<blocks(qRows * C), 256, 0, STREAM>>>(gathered, attention, 2.f, qRows * C);   // chai
   T* tn = scratch<T>("ab.tn", qRows * C);
   if (st.noResidual) {
     addSigmoidGatedK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, attention, bc.zg, qRows * C, q1 * C);
@@ -635,6 +661,43 @@ __global__ void atomPairK(const float* row, const float* col, const float* qPos,
   if (trunkPair && tqMask[qi] != 0 && tkMask[ki] != 0)
     v += trunkPair[((size_t)tqIdx[qi] * tokens + tkIdx[ki]) * Cp + c];
   pair[t] = v;
+}
+// chai-1's atom-pair term in place of AF3's offset/distance/valid one (af3-any-model atom_cross_attention.py):
+// feat = [one_hot(#(|d|^2 > e^2 for e in 0,1,2,3,4,5,6,8,12,16), or 11 where the two atoms share no reference
+// space; 12) | 1 / (1 + |d|^2) | valid], through a BIASED linear (14 -> Cp) - the bias on every pair
+__global__ void chaiAtomPairK(const float* row, const float* col, const float* qPos, const float* kPos,
+                              const float* qUid, const float* kUid, const float* Wf, const float* bf, const float* trunkPair,
+                              const int* tqIdx, const float* tqMask, const int* tkIdx, const float* tkMask,
+                              float* pair, int subsets, int queries, int keys, int Cp, int tokens) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)subsets * queries * keys * Cp;
+  if (t >= total) return;
+  int c = (int)(t % Cp); size_t rest = t / Cp; int key = (int)(rest % keys); size_t qi = rest / keys;
+  int s = (int)(qi / queries);
+  size_t ki = (size_t)s * keys + key;
+  float v = row[qi * Cp + c] + col[ki * Cp + c];
+  if (trunkPair && tqMask[qi] != 0 && tkMask[ki] != 0)
+    v += trunkPair[((size_t)tqIdx[qi] * tokens + tkIdx[ki]) * Cp + c];
+  bool valid = qUid[qi] == kUid[ki];
+  float d0 = qPos[qi * 3] - kPos[ki * 3], d1 = qPos[qi * 3 + 1] - kPos[ki * 3 + 1], d2 = qPos[qi * 3 + 2] - kPos[ki * 3 + 2];
+  float sq = d0 * d0 + d1 * d1 + d2 * d2;
+  const float edges[10] = { 0.f, 1.f, 4.f, 9.f, 16.f, 25.f, 36.f, 64.f, 144.f, 256.f };
+  int idx = 0;
+  for (int e = 0; e < 10; ++e) idx += sq > edges[e];
+  if (!valid) idx = 11;
+  v += bf[c] + Wf[(size_t)idx * Cp + c] + Wf[(size_t)12 * Cp + c] / (1.f + sq) + (valid ? Wf[(size_t)13 * Cp + c] : 0.f);
+  pair[t] = v;
+}
+// chai-1 restricts every atom attention to atoms of the SAME TOKEN (af3-any-model diffusion_transformer.py,
+// `where(same_token, bias, -1e9)`): folded into a block's pair logits [s][h][q][k] once a fold
+__global__ void sameTokenMaskK(float* pl, const int* tqIdx, const float* tqMask, const int* tkIdx, const float* tkMask,
+                               int subsets, int heads, int queries, int keys) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)subsets * heads * queries * keys) return;
+  int key = (int)(t % keys); size_t rest = t / keys; int q = (int)(rest % queries); rest /= queries;
+  int s = (int)(rest / heads);
+  size_t qi = (size_t)s * queries + q, ki = (size_t)s * keys + key;
+  if (!(tqMask[qi] != 0 && tkMask[ki] != 0 && tqIdx[qi] == tkIdx[ki])) pl[t] = -1e9f;
 }
 // flat [(s,q,k)][blocks*heads] -> per block [s][h][q][k]
 __global__ void atomLogitsLayoutK(const float* flat, float* out, int block, int nblocks, int subsets,
@@ -760,7 +823,10 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   o.qMask = scratch<float>(E + ".qMask", qRows);
   convert(t2q, Fdev("batch.refMask"), o.qMask, 1);
   o.qStart = o.qCond;
-  if (M.flag("trunk.dialect.preTrunkQuery") && trunkSingle) {
+  const bool chai = M.flag("trunk.dialect.chaiAtomStack");
+  // (chai separates them in the target_feat encoder too, which has no trunk term: there its conditioning is
+  // LN(a), not a)
+  if (M.flag("trunk.dialect.preTrunkQuery") && (trunkSingle || chai)) {
     // the queries start from the per-atom features alone (rf3, boltz2); every adaptive LayerNorm
     // still reads the full conditioning
     o.qStart = scratch<float>(E + ".qStart", qRows * C);
@@ -777,6 +843,11 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
     float* perQuery = scratch<float>("enc.perQuery", qRows * C);
     convert(gatherOf("batch.tokensToQueries"), proj, perQuery, C);
     addK<<<blocks(qRows * C), 256, 0, STREAM>>>(o.qCond, perQuery, qRows * C);
+  }
+  if (chai) {                 // chai: cond = LN(a [+ the trunk term]), affine-free, before the mask
+    float* n = scratch<float>("enc.condLn", qRows * C);
+    layerNormSlow(o.qCond, n, qRows, C, nullptr, nullptr);
+    CK(cudaMemcpyAsync(o.qCond, n, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   }
   scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(o.qCond, o.qMask, qRows, C, qRows);
   o.kCond = scratch<float>(E + ".kCond", kRows * C);
@@ -822,19 +893,36 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   size_t pairRows = qRows * sh.keys;
   o.pair = scratch<float>(E + ".pair", pairRows * Cp);
   Gather tq = gatherOf("batch.tokensToQueries"), tk = gatherOf("batch.tokensToKeys");
-  atomPairK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(row, col, qPos, kPos, qUid, kUid, o.kMask,
-    W(E + ".embedPairOffsets"), W(E + ".embedPairDistances"), W(E + ".embedPairOffsetsValid"), tp,
-    tq.idx, tq.mask, tk.idx, tk.mask, o.pair, sh.subsets, sh.queries, sh.keys, Cp, sh.tokens,
-    M.flag("trunk.dialect.maskPaddedKeys"));
+  if (chai)
+    chaiAtomPairK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(row, col, qPos, kPos, qUid, kUid, W(E + ".embedAtomPairFeat"),
+      W(E + ".embedAtomPairFeatBias"), tp, tq.idx, tq.mask, tk.idx, tk.mask, o.pair, sh.subsets, sh.queries, sh.keys, Cp,
+      sh.tokens);
+  else
+    atomPairK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(row, col, qPos, kPos, qUid, kUid, o.kMask,
+      W(E + ".embedPairOffsets"), W(E + ".embedPairDistances"), W(E + ".embedPairOffsetsValid"), tp,
+      tq.idx, tq.mask, tk.idx, tk.mask, o.pair, sh.subsets, sh.queries, sh.keys, Cp, sh.tokens,
+      M.flag("trunk.dialect.maskPaddedKeys"));
   float* h1 = scratch<float>("enc.h1", pairRows * Cp); float* h2 = scratch<float>("enc.h2", pairRows * Cp);
+  if (chai) {                 // chai's pair MLP: two layers, no relu on its input
+    linear<float, float>(o.pair, h2, pairRows, Cp, Cp, E + ".pairMlp1");
+    reluK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
+    linear<float, float>(h1, o.pair, pairRows, Cp, Cp, E + ".pairMlp2", false, 1.f);
+  } else {
   reluK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(o.pair, h1, pairRows * Cp);
   linear<float, float>(h1, h2, pairRows, Cp, Cp, E + ".pairMlp1");
   reluK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
   linear<float, float>(h1, h2, pairRows, Cp, Cp, E + ".pairMlp2");
   reluK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(h2, h1, pairRows * Cp);
   linear<float, float>(h1, o.pair, pairRows, Cp, Cp, E + ".pairMlp3", false, 1.f);
+  }
   int nblocks = 0; while (M.has(E + ".blocks." + std::to_string(nblocks) + ".qProjection")) ++nblocks;
   std::vector<float*> logits = atomPairLogits(E, o.pair, pairRows, Cp, nblocks, o.heads, sh);
+  if (chai) {
+    size_t per = (size_t)sh.subsets * o.heads * sh.queries * sh.keys;
+    for (float* pl : logits)
+      sameTokenMaskK<<<blocks(per), 256, 0, STREAM>>>(pl, tq.idx, tq.mask, tk.idx, tk.mask, sh.subsets, o.heads, sh.queries,
+                                                      sh.keys);
+  }
   for (int b = 0; b < nblocks; ++b)
     o.blocks.push_back(prepareAtomBlock(E + ".blocks." + std::to_string(b), o.qCond, qRows, C, logits[b]));
   o.keyMasked = M.flag(E + ".blocks.0.keyMaskedAtomAttention");
@@ -997,8 +1085,50 @@ __global__ void targetFeatSumK(float* tf, const int* aatype, const float* profil
   tf[t] += v;                                   // cyclic: no cyclic chains, so its term is zero
 }
 inline const int* flagDev(const std::string& k) { return M.has(k) ? Idev(k) : nullptr; }
+// chai-1's token features (af3-any-model model.py, create_target_feat_embedding): one_hot(aatype, 31) W + b
+// + [profile (31) | deletion_mean] W' (the ESM2 term is added after, as a GEMM)
+__global__ void chaiTokenFeatK(const int* aatype, const float* profile, const float* delMean, const float* Wt,
+                               const float* bt, const float* Wp, float* out, int tokens, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)tokens * C) return;
+  int token = (int)(t / C), c = (int)(t % C);
+  int a = aatype[token];
+  float v = bt[c] + (a >= 0 && a < 31 ? Wt[(size_t)a * C + c] : 0.f);
+  for (int k = 0; k < 31; ++k) v += profile[(size_t)token * 31 + k] * Wp[(size_t)k * C + c];
+  v += delMean[token] * Wp[(size_t)31 * C + c];
+  out[t] = v;
+}
+__global__ void concatColsK(const float* a, const float* b, float* out, size_t rows, int Ca, int Cb) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * (Ca + Cb)) return;
+  size_t r = t / (Ca + Cb); int c = (int)(t % (Ca + Cb));
+  out[t] = c < Ca ? a[r * Ca + c] : b[r * Cb + c - Ca];
+}
+inline float* TARGET_FEAT_STRUCTURE = nullptr;     // chai-1's second projection: the diffusion module's target_feat
 inline float* buildTargetFeat() {
   int tokens = (int)M.meta("batch.tokens");
+  if (M.flag("trunk.dialect.chaiTokenEmbedding")) {
+    // s_cat = [pooled atoms (384) | token features (384)]; the trunk's target_feat = s_cat W_trunk and the
+    // diffusion module's = s_cat W_structure (SEPARATE_STRUCTURE_TARGET_FEAT)
+    const std::string P = "targetFeat.encoder.chaiToken.";
+    EncoderOut e = atomEncoder("targetFeat.encoder", "targetFeat.reference", nullptr, nullptr, nullptr);
+    int Cp = e.perToken, C = (int)(lenW(P + "tokenFeatureBias"));
+    float* feat = scratch<float>("tf.token", (size_t)tokens * C);
+    chaiTokenFeatK<<<blocks((size_t)tokens * C), 256, 0, STREAM>>>(Idev("batch.aatype"), Fdev("batch.profile"),
+      Fdev("batch.deletionMean"), W(P + "tokenFeatureWeights"), W(P + "tokenFeatureBias"), W(P + "msaProfileWeights"), feat,
+      tokens, C);
+    if (!M.has("batch.esmEmbeddings")) { fprintf(stderr, "chai-1 reads ESM2 embeddings and the batch has none\n"); exit(1); }
+    int E = (int)(M.len("batch.esmEmbeddings") / tokens);
+    linear<float, float>(Fdev("batch.esmEmbeddings"), feat, tokens, E, C, P + "esmWeights", false, 1.f);
+    float* cat = scratch<float>("tf.cat", (size_t)tokens * (Cp + C));
+    concatColsK<<<blocks((size_t)tokens * (Cp + C)), 256, 0, STREAM>>>(e.tokenAct, feat, cat, tokens, Cp, C);
+    int out = (int)(lenW(P + "singleProjInTrunk") / (Cp + C));
+    float* tf = scratch<float>("targetFeat", (size_t)tokens * out);
+    linear<float, float>(cat, tf, tokens, Cp + C, out, P + "singleProjInTrunk");
+    TARGET_FEAT_STRUCTURE = scratch<float>("targetFeatStructure", (size_t)tokens * out);
+    linear<float, float>(cat, TARGET_FEAT_STRUCTURE, tokens, Cp + C, out, P + "singleProjInStructure");
+    return tf;
+  }
   if (M.flag("trunk.dialect.targetFeatAtomOnly")) {
     const std::string S = "targetFeat.encoder.targetFeatSum.";
     if (!hasW(S + "resType")) { fprintf(stderr, "atom-only target_feat without its six summed terms\n"); exit(1); }

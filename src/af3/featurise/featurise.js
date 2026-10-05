@@ -289,7 +289,9 @@ export function featuriseProtein(sequence, options = {}) {
         // list has no OP3 and its dumps carry no OXT - so `terminalAtoms:
         // false` is what a caller building for it passes. It is off only when
         // asked, because every AF3-shaped caller means the AF3 rule.
-        terminal: options.terminalAtoms === false ? false
+        // 🔴 AND CHAI-1 DROPS ONLY THE PROTEIN'S: its reference masks the C-terminal OXT and keeps the 5' OP3
+        // (`drop_atoms=('OXT',)`), so `terminalAtoms: "nucleic"` keeps a nucleotide's and no other.
+        terminal: options.terminalAtoms === false || (options.terminalAtoms === "nucleic" && protein) ? false
           : (chainKinds[chainIndex] === "protein"
             ? at === chain.length - 1
             : at === 0),

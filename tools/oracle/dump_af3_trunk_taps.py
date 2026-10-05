@@ -45,7 +45,9 @@ if os.environ.get("DETERMINISTIC_MSA"):
     _feat.shuffle_msa = lambda key, msa: (msa, key)
 PASSES = int(os.environ.get("PASSES", "1"))
 seq, _ = fold_check.parse_ca(os.path.expanduser("~/6MRR.pdb"))
-batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, None)
+# MODEL_DIR= names the blob's directory (default fold_check's ~/ported/<model>), so the dump reads the blob the
+# bundle under test was exported from
+batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, os.environ.get("MODEL_DIR") or None)
 # 🔴 fp32, NOT the fold path's bfloat16. A port compared against a bfloat16
 # reference is being held to the reference's rounding as well as its model.
 cfg.global_config.bfloat16 = "none"
@@ -68,14 +70,22 @@ def fwd(b):
             "single": jnp.zeros((length, cfg.evoformer.seq_channel), jnp.float32)}
     target = af3_model.create_target_feat_embedding(
         batch=fb, config=cfg.evoformer, global_config=cfg.global_config)
+    # chai1 (SEPARATE_STRUCTURE_TARGET_FEAT) returns (trunk, structure): the trunk gets the first
+    structure = None
+    if isinstance(target, tuple):
+        target, structure = target
     module = ev.Evoformer(cfg.evoformer, cfg.global_config)
     embeddings = None
+    if MODEL == "chai1":      # chai seeds pass 1 with the initial representations (model.py's recycle_first)
+        prev = {**prev, "recycle_first": jnp.ones((), jnp.float32)}
     for _ in range(PASSES):
         embeddings = module(batch=fb, prev=prev, target_feat=target,
                             key=jax.random.PRNGKey(0))
         prev = {**prev, **{k: v.astype(jnp.float32)
                            for k, v in embeddings.items() if k in prev}}
-    return embeddings, target
+        if "recycle_first" in prev:
+            prev["recycle_first"] = jnp.zeros((), jnp.float32)
+    return embeddings, (target if structure is None else (target, structure))
 
 
 b = jax.tree_util.tree_map(jnp.asarray, utils.remove_invalidly_typed_feats(batch))
@@ -148,10 +158,12 @@ def put(name, a):
                     "data": a.ravel().tolist()}
     print("  %-22s %-20s rms %9.4f" % (name, list(a.shape), record[name]["rms"]))
 
+if isinstance(target, tuple):
+    put("target_feat_structure", target[1]); target = target[0]
 put("target_feat", target)
 for name, values in taps.items():
     put("tap.%s" % name, values[-1])       # the LAST pass; the dump keeps one cycle
-for name in ("single", "pair"):
+for name in ("single", "pair", "pair_init"):
     if name in out: put(name, out[name])
 # 🔴 AND `CAPTURE=LIST` MUST COME AFTER THE FORWARD PASS. Placed at the first
 # `CAPTURE = ...`, which is BEFORE it, `SCOPES` is empty and the listing prints
