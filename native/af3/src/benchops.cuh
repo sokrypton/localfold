@@ -110,21 +110,28 @@ inline void benchGrid(int n) {
     }
     printf("  2R against the f32-score kernel: relRMS %.3e, max |d| %.3e\n", std::sqrt(num / std::max(den, 1e-30)), mx);
   }
+  for (int rr : {2, 3}) {   // RR rows a block share one bias tile: the same arithmetic, so the same bytes
+    flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr);
+    if (rr == 2) flashGrid2RRun<32, 4, 48, 2, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr);
+    else flashGrid2RRun<32, 4, 48, 2, 3>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr);
+    std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
+    CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+    size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
+    printf("  2R rr%d against rr1: %zu of %zu outputs differ\n", rr, differ, a.size());
+  }
   std::vector<std::pair<std::string, std::function<void()>>> arms = {
     {"grid w4 cp.async", [&] { flashGridHalfRun<32, 4, FA_BK, false>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 reg", [&] { flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 reg masked", [&] { flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, mask, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4", [&] { flashGridHalfAt<32, 4>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
-    {"grid w8", [&] { flashGridHalfAt<32, 8>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
-    {"grid w4 bk32", [&] { flashGridHalfAt<32, 4, 32>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 bk48", [&] { flashGridHalfAt<32, 4, 48>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
-    {"grid w4 bk96", [&] { flashGridHalfAt<32, 4, 96>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"2R w4 bk48 mt2", [&] { flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
-    {"2R w4 bk32 mt3", [&] { flashGrid2RRun<32, 4, 32, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
-    {"2R w4 bk48 mt3", [&] { flashGrid2RRun<32, 4, 48, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
-    {"2R w4 bk32 mt4", [&] { flashGrid2RRun<32, 4, 32, 4>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
-    {"2R w4 bk48 mt4", [&] { flashGrid2RRun<32, 4, 48, 4>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
-    {"2R w2 bk48 mt4", [&] { flashGrid2RRun<32, 2, 48, 4>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk48 rr2", [&] { flashGrid2RRun<32, 4, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk48 rr3", [&] { flashGrid2RRun<32, 4, 48, 2, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk32 rr2", [&] { flashGrid2RRun<32, 4, 32, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk64 rr2", [&] { flashGrid2RRun<32, 4, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk48 rr2", [&] { flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk48 rr3", [&] { flashGrid2RRun<32, 2, 48, 2, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w8 bk48 mt1", [&] { flashGrid2RRun<32, 8, 48, 1>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
   };
   std::vector<std::vector<float>> t(arms.size());
@@ -141,5 +148,56 @@ inline void benchGrid(int n) {
   for (size_t k = 0; k < arms.size(); ++k) {
     std::sort(t[k].begin(), t[k].end());
     printf("  %-16s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);
+  }
+}
+// --bench-trans=N: the pair transition (C 128, I 512) alone over N*N rows, each form against the
+// shipped one on the same input (relRMS of the update), then the forms timed interleaved
+inline void benchTrans(int n) {
+  const int C = 128, I = 512;
+  size_t rows = (size_t)n * n;
+  float* x0 = dalloc(rows * C); float* x = dalloc(rows * C); float* ref = dalloc(rows * C);
+  half* W1 = dallocT<half>((size_t)C * 2 * I); half* W2 = dallocT<half>((size_t)I * C);
+  float* sc = dalloc(C); float* of = dalloc(C);
+  uint64_t s = 1; auto rnd = [&] { s = s * 6364136223846793005ull + 1442695040888963407ull; return (s >> 40) / 16777216.f - 0.5f; };
+  { std::vector<float> h(rows * C); for (auto& v : h) v = rnd(); CK(cudaMemcpy(x0, h.data(), h.size() * 4, cudaMemcpyHostToDevice)); }
+  { std::vector<half> h((size_t)C * 2 * I); for (auto& v : h) v = __float2half(rnd() * 0.2f); CK(cudaMemcpy(W1, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+    std::vector<half> h2((size_t)I * C); for (auto& v : h2) v = __float2half(rnd() * 0.2f); CK(cudaMemcpy(W2, h2.data(), h2.size() * 2, cudaMemcpyHostToDevice)); }
+  { std::vector<float> h(C); for (auto& v : h) v = 1.f + rnd() * 0.2f; CK(cudaMemcpy(sc, h.data(), C * 4, cudaMemcpyHostToDevice));
+    for (auto& v : h) v = rnd() * 0.2f; CK(cudaMemcpy(of, h.data(), C * 4, cudaMemcpyHostToDevice)); }
+  std::vector<std::pair<std::string, std::function<void()>>> arms = {
+    {"w8 mt1 nc32", [&] { fusedTransitionAt<8, false, 1, 32>(x, rows, I, sc, of, W1, W2, nullptr, nullptr); }},
+    {"w4 mt1 nc32", [&] { fusedTransitionAt<4, false, 1, 32>(x, rows, I, sc, of, W1, W2, nullptr, nullptr); }},
+    {"w4 mt2 nc16", [&] { fusedTransitionAt<4, false, 2, 16>(x, rows, I, sc, of, W1, W2, nullptr, nullptr); }},
+  };
+  auto delta = [&](float* out) {   // the update, out - x0, on the host
+    std::vector<float> a(rows * C), b(rows * C);
+    CK(cudaMemcpy(a.data(), out, a.size() * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b.data(), x0, b.size() * 4, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < a.size(); ++i) a[i] -= b[i];
+    return a;
+  };
+  CK(cudaMemcpy(ref, x0, rows * C * 4, cudaMemcpyDeviceToDevice));
+  std::swap(x, ref); arms[0].second(); std::swap(x, ref); CK(cudaStreamSynchronize(STREAM));
+  auto dr = delta(ref);
+  for (size_t k = 1; k < arms.size(); ++k) {
+    CK(cudaMemcpy(x, x0, rows * C * 4, cudaMemcpyDeviceToDevice)); arms[k].second(); CK(cudaStreamSynchronize(STREAM));
+    auto d = delta(x); double num = 0, den = 0;
+    for (size_t i = 0; i < d.size(); ++i) { num += (d[i] - dr[i]) * (double)(d[i] - dr[i]); den += (double)dr[i] * dr[i]; }
+    printf("  %-14s against %s: relRMS %.3e\n", arms[k].first.c_str(), arms[0].first.c_str(), std::sqrt(num / den));
+  }
+  std::vector<std::vector<float>> t(arms.size());
+  cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+  for (int round = 0; round < 7; ++round)
+    for (size_t k = 0; k < arms.size(); ++k) {
+      CK(cudaMemcpy(x, x0, rows * C * 4, cudaMemcpyDeviceToDevice));
+      arms[k].second();
+      cudaEventRecord(a, STREAM);
+      for (int i = 0; i < 10; ++i) arms[k].second();
+      cudaEventRecord(b, STREAM); cudaEventSynchronize(b);
+      float ms; cudaEventElapsedTime(&ms, a, b); t[k].push_back(ms / 10);
+    }
+  double flops = (double)rows * (C * 2 * I + I * C) * 2;
+  for (size_t k = 0; k < arms.size(); ++k) {
+    std::sort(t[k].begin(), t[k].end());
+    printf("  %-14s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);
   }
 }

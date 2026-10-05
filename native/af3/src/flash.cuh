@@ -580,33 +580,39 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
 // every K and V fragment a warp loads from shared memory feeds both tiles' MMAs. With heads 32 wide the one-tile
 // kernel reads ~10 bytes of shared memory a score (K and V 8, the bias 2) against 64 multiply-adds - bound by
 // that bandwidth (~240 cycles a block-tile for ~54 of tensor work); this halves the K/V part.
-template <int D, int WARPS, int BK, int MT = 2> __host__ __device__ constexpr size_t fa2Stage() {
-  return (size_t)2 * BK * (D + 8) * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
+// RR: grid rows a block (WARPS warps each, the same head and queries): the bias tile, the same for every
+// row, is read from L2 once for all RR of them - at RR 1 it is two thirds of the block's L2 traffic
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ constexpr size_t fa2Stage() {
+  return (size_t)RR * 2 * BK * (D + 8) * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
 }
-template <int D, int WARPS, int BK, int MT = 2>
-__global__ void __launch_bounds__(WARPS * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
-    int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias) {
-  constexpr int BQ = 16 * MT * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
-  constexpr size_t STAGE = fa2Stage<D, WARPS, BK, MT>();
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1>
+__global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
+    int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal) {
+  constexpr int BQ = 16 * MT * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * RR * 32, NTR = WARPS * 32;
+  constexpr size_t STAGE = fa2Stage<D, WARPS, BK, MT, RR>();
   extern __shared__ __align__(16) unsigned char smem[];
-  auto Kst = [&](int s) { return (half*)(smem + s * STAGE); };
+  // the thread's row of the block's RR (constants at RR 1: a runtime offset in every address costs 18%)
+  const int rg = RR == 1 ? 0 : (int)threadIdx.x / NTR, tr = RR == 1 ? (int)threadIdx.x : (int)threadIdx.x % NTR;
+  auto Kst = [&](int s) { return (half*)(smem + s * STAGE) + rg * 2 * BK * LDK; };
   auto Vst = [&](int s) { return Kst(s) + BK * LDK; };
-  auto Bst = [&](int s) { return Vst(s) + BK * LDK; };
-  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
-  const size_t rowsHere = gridDim.y / heads;
-  size_t b = blockIdx.y; int h = (int)(b / rowsHere); size_t rl = b % rowsHere;
+  auto Bst = [&](int s) { return (half*)(smem + s * STAGE) + RR * 2 * BK * LDK; };
+  int warp = tr >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  const size_t rowsHere = rowsTotal, perHead = (rowsHere + RR - 1) / RR;
+  size_t b = blockIdx.y; int h = (int)(b / perHead); size_t rl = (b % perHead) * RR + rg;
+  const bool live = RR == 1 || rl < rowsHere;                        // a last block's spare row computes, stores nothing
+  if (!live) rl = rowsHere - 1;
   const int Wd = heads * D, W4 = 4 * Wd;
   const half* base = qkvg + rl * (size_t)n * W4 + h * D;
   int q0 = blockIdx.x * BQ;
   constexpr int KV_CHUNKS = BK * (D / 8), B_CHUNKS = BQ * (BK / 8);
   static_assert(B_CHUNKS % NT == 0, "a bias tile is a whole number of chunks a thread");
   const half* biasHead = bias + (size_t)h * n * biasStride;
-  constexpr int KV_PER = (KV_CHUNKS + NT - 1) / NT, B_PER = B_CHUNKS / NT;
+  constexpr int KV_PER = (KV_CHUNKS + NTR - 1) / NTR, B_PER = B_CHUNKS / NT;
   const half* kvSrc[KV_PER]; int kvOff[KV_PER], kvJ[KV_PER];
 #pragma unroll
   for (int k = 0; k < KV_PER; ++k) {
-    int u = k * NT + threadIdx.x, jj = u / (D / 8), c = (u % (D / 8)) * 8;
-    kvJ[k] = (KV_CHUNKS % NT == 0 || u < KV_CHUNKS) ? jj : 1 << 30;
+    int u = k * NTR + tr, jj = u / (D / 8), c = (u % (D / 8)) * 8;
+    kvJ[k] = (KV_CHUNKS % NTR == 0 || u < KV_CHUNKS) ? jj : 1 << 30;
     kvOff[k] = jj * LDK + c;
     kvSrc[k] = base + (size_t)jj * W4 + Wd + c;
   }
@@ -746,9 +752,9 @@ __global__ void __launch_bounds__(WARPS * 32) flashGrid2R(const half* __restrict
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
       float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
-      if (i0 < n) *reinterpret_cast<half2*>(out + (rl * n + i0) * Wd + h * D + e) =
+      if (live && i0 < n) *reinterpret_cast<half2*>(out + (rl * n + i0) * Wd + h * D + e) =
           __floats2half2_rn(o[mt][et][0] / l0 * sigm(a.x), o[mt][et][1] / l0 * sigm(a.y));
-      if (i1 < n) *reinterpret_cast<half2*>(out + (rl * n + i1) * Wd + h * D + e) =
+      if (live && i1 < n) *reinterpret_cast<half2*>(out + (rl * n + i1) * Wd + h * D + e) =
           __floats2half2_rn(o[mt][et][2] / l1 * sigm(b2.x), o[mt][et][3] / l1 * sigm(b2.y));
     }
   }
@@ -757,16 +763,20 @@ __global__ void __launch_bounds__(WARPS * 32) flashGrid2R(const half* __restrict
 // A100 0.884 -> 0.753 ms at 500 tokens, 6.34 -> 5.02 at 1000 (80.7 -> 102 TFLOP/s), output relRMS 3.9e-4 from
 // the f32-score kernel's. Three or four tiles a warp spill (0.95-1.0 ms at 500); eight warps of one tile with
 // f16 scores reach 0.764. LOCALFOLD_FLASH_2R=0 keeps the one-tile kernel.
+// It runs as 2 warps x 2 grid rows a block (RR 2): 64-query tiles pad a row less than 128-query ones (1,044
+// queries are 1,088 against 1,152) while the two rows share the bias tile, so K/V and bias traffic stay the
+// 4-warp form's - 6.27 -> 5.87 ms at 1,044 tokens, 0.251 -> 0.215 at 300, level at 500 (512 either way);
+// bit-identical to RR 1.
 inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
-template <int D, int WARPS, int BK, int MT = 2>
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
                     const float* qBias) {
   constexpr int BQ = 16 * MT * WARPS;
-  const int bytes = 2 * (int)fa2Stage<D, WARPS, BK, MT>();
+  const int bytes = 2 * (int)fa2Stage<D, WARPS, BK, MT, RR>();
   static bool attr = false;
-  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT>), bytes); attr = true; }
-  dim3 grid((n + BQ - 1) / BQ, (unsigned)(rows * heads));
-  flashGrid2R<D, WARPS, BK, MT><<<grid, 32 * WARPS, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias);
+  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR>), bytes); attr = true; }
+  dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
+  flashGrid2R<D, WARPS, BK, MT, RR><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows);
 }
 template <int D, int WARPS, bool MASKED, int BK = FA_BK, bool REG = false, int MINB = 1, bool F16S = false> void setFlashSmem() {
   static bool done = false;
@@ -799,7 +809,7 @@ void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const floa
     flashGridHalf<D, WARPS, true, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
   } else if (FLASH_2R && !REG && D == 32 && WARPS == 4 && BK == 48) {   // (the unmasked kernel reads no r0)
-    flashGrid2RRun<D, WARPS, BK>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    flashGrid2RRun<D, 2, BK, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
   } else if (FLASH_F16S) {
     setFlashSmem<D, WARPS, false, BK, REG, MINB, true>();
     flashGridHalf<D, WARPS, false, BK, REG, MINB, false, true><<<grid, 32 * WARPS, bytes, STREAM>>>(
