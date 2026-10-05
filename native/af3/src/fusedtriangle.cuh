@@ -50,7 +50,13 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
 }
 
 constexpr int TI_NC = 32;
-__host__ __device__ constexpr size_t tiStage(int C) { return (size_t)2 * C * (TI_NC + 8) * 2; }
+// a stage's two [C][TI_NC] weight chunks, unpadded 64-byte rows with each 16-byte piece XOR-swizzled by
+// (k >> 1) & 3 (tiSw): eight cp.async writes then fill one aligned 128-byte line and the 8-row ldmatrix
+// reads still hit distinct banks (the padded 80-byte rows: ncu, 31% of triInK's shared wavefronts excessive).
+// 55.3 -> 53.2 ms of a 261-token fold, 725 -> 698 at 1,044, byte-identical. (gridInK's 144-byte rows the
+// same way, 128 bytes with k & 7: no change, so left.)
+__host__ __device__ constexpr size_t tiStage(int C) { return (size_t)2 * C * TI_NC * 2; }
+__device__ __forceinline__ int tiSw(int k, int c) { return k * TI_NC + (c ^ (((k >> 1) & 3) << 3)); }
 
 // TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (f16 overflows).
 // BIAS: AlphaFold 2's projections carry biases, AF3's do not - `bias` is [4C, the projection | gate columns
@@ -68,7 +74,7 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
     unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;    // 32-bit: a 64-bit divide is ~70 instructions
     return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
   };
-  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = TI_NC + 8, KS = C / 16, LDT = R + 8;
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = TI_NC, KS = C / 16, LDT = R + 8;
   constexpr size_t STAGE = tiStage(C);
   extern __shared__ __align__(16) unsigned char smem[];
   // Xs is dead once its rows are A fragments, so a and b's staging takes its place (the first
@@ -93,10 +99,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       if ((C * (TI_NC / 8)) % NTH != 0 && t >= (C * (TI_NC / 8))) break;
       int k = t / (TI_NC / 8), c = (t % (TI_NC / 8)) * 8;
       if (j < C / 16) {
-        cpAsync16(w0 + k * LDW + c, Wpg + (size_t)k * 4 * C + j * 32 + c, true);
-        cpAsync16(w1 + k * LDW + c, Wpg + (size_t)k * 4 * C + 2 * C + j * 32 + c, true);
+        cpAsync16(w0 + tiSw(k, c), Wpg + (size_t)k * 4 * C + j * 32 + c, true);
+        cpAsync16(w1 + tiSw(k, c), Wpg + (size_t)k * 4 * C + 2 * C + j * 32 + c, true);
       } else {
-        cpAsync16(w0 + k * LDW + c, Wg + (size_t)k * C + (j - C / 16) * TI_NC + c, true);
+        cpAsync16(w0 + tiSw(k, c), Wg + (size_t)k * C + (j - C / 16) * TI_NC + c, true);
       }
     }
     cpCommit();
@@ -124,11 +130,11 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       for (int n2 = 0; n2 < TI_NC / 16; ++n2) {
         int k = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), c = n2 * 16 + (lane >> 4) * 8;
         uint32_t f0[4];
-        ldsm4t(f0, w0 + k * LDW + c);
+        ldsm4t(f0, w0 + tiSw(k, c));
         mma16816(p[2 * n2], xa[ks], f0[0], f0[1]); mma16816(p[2 * n2 + 1], xa[ks], f0[2], f0[3]);
         if (!gating) {
           uint32_t f1[4];
-          ldsm4t(f1, w1 + k * LDW + c);
+          ldsm4t(f1, w1 + tiSw(k, c));
           mma16816(q[2 * n2], xa[ks], f1[0], f1[1]); mma16816(q[2 * n2 + 1], xa[ks], f1[2], f1[3]);
         }
       }

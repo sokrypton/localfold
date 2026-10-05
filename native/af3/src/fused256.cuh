@@ -232,7 +232,12 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wpg,
     const half* __restrict__ Wg, half* __restrict__ a, half* __restrict__ b, half* __restrict__ t2, int n, int np,
     size_t cs) {
-  constexpr int NC = 16, CH = NC / 2, R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = NC + 8, KS = C / 16, LDT = R + 8;
+  // the weight stage is unpadded, [k][NC], its two 16-byte halves swapped on rows with bit 2 of k set
+  // (sw): the padded 48-byte rows kept ldmatrix conflict-free but serialised the cp.async writes ~6.7x
+  // (ncu: 40% of the kernel's shared wavefronts excessive, all of them those four LDGSTS); swizzled,
+  // both are conflict-free - 87.9 -> 84.7 ms of ESMFold2's 5CAJ trunk, byte-identical
+  constexpr int NC = 16, CH = NC / 2, R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = NC, KS = C / 16, LDT = R + 8;
+  auto sw = [](int k, int c) { return k * LDW + (c ^ (((k >> 2) & 1) << 3)); };
   constexpr size_t STAGE = (size_t)2 * C * LDW * 2;
   static_assert(2 * STAGE + (size_t)2 * CH * LDT * 2 <= (size_t)R * LDX * 2, "the stages and the a/b staging fit in the rows");
   const size_t pp = (size_t)np * np;
@@ -258,10 +263,10 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
       if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
       int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
       if (j < abSteps) {
-        cpAsync16(w0 + k * LDW + c, Wpg + (size_t)k * 4 * C + j * NC + c, true);
-        cpAsync16(w1 + k * LDW + c, Wpg + (size_t)k * 4 * C + 2 * C + j * NC + c, true);
+        cpAsync16(w0 + sw(k, c), Wpg + (size_t)k * 4 * C + j * NC + c, true);
+        cpAsync16(w1 + sw(k, c), Wpg + (size_t)k * 4 * C + 2 * C + j * NC + c, true);
       } else {
-        cpAsync16(w0 + k * LDW + c, Wg + (size_t)k * C + (j - abSteps) * NC + c, true);
+        cpAsync16(w0 + sw(k, c), Wg + (size_t)k * C + (j - abSteps) * NC + c, true);
       }
     }
     cpCommit();
@@ -288,11 +293,11 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     for (int ks = 0; ks < KS; ++ks) {
       int k = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), c = (lane >> 4) * 8;
       uint32_t f0[4];
-      ldsm4t(f0, w0 + k * LDW + c);
+      ldsm4t(f0, w0 + sw(k, c));
       mma16816(p[0], xa[ks], f0[0], f0[1]); mma16816(p[1], xa[ks], f0[2], f0[3]);
       if (!gating) {
         uint32_t f1[4];
-        ldsm4t(f1, w1 + k * LDW + c);
+        ldsm4t(f1, w1 + sw(k, c));
         mma16816(q[0], xa[ks], f1[0], f1[1]); mma16816(q[1], xa[ks], f1[2], f1[3]);
       }
     }

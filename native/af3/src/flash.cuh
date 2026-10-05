@@ -582,13 +582,23 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
 // that bandwidth (~240 cycles a block-tile for ~54 of tensor work); this halves the K/V part.
 // RR: grid rows a block (WARPS warps each, the same head and queries): the bias tile, the same for every
 // row, is read from L2 once for all RR of them - at RR 1 it is two thirds of the block's L2 traffic
+// K and V rows: at D 32 unpadded 64-byte rows, each 16-byte chunk XOR-swizzled by (row >> 1) & 3, so the
+// cp.async writes (two rows a 128-byte line) and the 8-row ldmatrix reads both hit distinct banks - the
+// padded 80-byte rows were conflict-free to read and conflicting to write: --bench-grid 5.65 -> 5.24 ms at
+// 1,044 tokens, 0.204 -> 0.191 at 300, bit-identical. Otherwise D + 8 as before. (The same swizzle on the
+// bias tile - 128-byte rows, chunk ^ row & 7 - was measured 3.6% slower: wider rows, more address math.)
+template <int D> __host__ __device__ constexpr int fa2Ldk() { return D == 32 ? D : D + 8; }
+template <int D> __device__ __forceinline__ int fa2Kv(int r, int c) {
+  if constexpr (D == 32) return r * D + (c ^ (((r >> 1) & 3) << 3));
+  else return r * (D + 8) + c;
+}
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ constexpr size_t fa2Stage() {
-  return (size_t)RR * 2 * BK * (D + 8) * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
+  return (size_t)RR * 2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
 }
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1>
 __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal) {
-  constexpr int BQ = 16 * MT * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * RR * 32, NTR = WARPS * 32;
+  constexpr int BQ = 16 * MT * WARPS, LDK = fa2Ldk<D>(), LDB = BK + 8, NT = WARPS * RR * 32, NTR = WARPS * 32;
   constexpr size_t STAGE = fa2Stage<D, WARPS, BK, MT, RR>();
   extern __shared__ __align__(16) unsigned char smem[];
   // the thread's row of the block's RR (constants at RR 1: a runtime offset in every address costs 18%)
@@ -613,7 +623,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
   for (int k = 0; k < KV_PER; ++k) {
     int u = k * NTR + tr, jj = u / (D / 8), c = (u % (D / 8)) * 8;
     kvJ[k] = (KV_CHUNKS % NTR == 0 || u < KV_CHUNKS) ? jj : 1 << 30;
-    kvOff[k] = jj * LDK + c;
+    kvOff[k] = fa2Kv<D>(jj, c);
     kvSrc[k] = base + (size_t)jj * W4 + Wd + c;
   }
   const half* bSrc[B_PER]; int bOff[B_PER], bC[B_PER]; bool bRow[B_PER];
@@ -694,7 +704,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 #pragma unroll
       for (int k2 = 0; k2 < D / 32 + (D % 32 ? 1 : 0); ++k2) {
         uint32_t kb[4];
-        ldsm4(kb, K + (nt * 8 + (lane & 7)) * LDK + k2 * 32 + (lane >> 3) * 8);
+        ldsm4(kb, K + fa2Kv<D>(nt * 8 + (lane & 7), k2 * 32 + (lane >> 3) * 8));
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
           mma16816h(sh[mt][nt], qa[mt][k2 * 2], kb[0], kb[1]);
@@ -732,7 +742,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 #pragma unroll
       for (int et = 0; et < D / 8; et += 2) {
         uint32_t vb[4];
-        ldsm4t(vb, V + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (et + (lane >> 4)) * 8);
+        ldsm4t(vb, V + fa2Kv<D>(t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (et + (lane >> 4)) * 8));
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) { mma16816(o[mt][et], pa[mt], vb[0], vb[1]); mma16816(o[mt][et + 1], pa[mt], vb[2], vb[3]); }
       }
