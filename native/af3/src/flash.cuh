@@ -53,33 +53,37 @@ __device__ __forceinline__ uint32_t pack2(float lo, float hi) {
   half2 v = __floats2half2_rn(lo, hi);
   return *reinterpret_cast<uint32_t*>(&v);
 }
+// every one of these carries a "memory" clobber: without it the compiler takes cp.async, the group wait and
+// ldmatrix for instructions that touch no memory and may schedule an ldmatrix ahead of the wait or the
+// barrier that makes the tile it reads complete - a race that a neighbouring plain shared load had been
+// pinning in place (found when a form of the grid kernel without its bias loads came out nondeterministic)
 __device__ __forceinline__ void cpAsync16(void* dst, const void* src, bool valid) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(valid ? 16 : 0));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(valid ? 16 : 0) : "memory");
 #else
   *reinterpret_cast<uint4*>(dst) = valid ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
 #endif
 }
 __device__ __forceinline__ void cpCommit() {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-  asm volatile("cp.async.commit_group;");
+  asm volatile("cp.async.commit_group;" ::: "memory");
 #endif
 }
 template <int N> __device__ __forceinline__ void cpWait() {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-  asm volatile("cp.async.wait_group %0;" :: "n"(N));
+  asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
 #endif
 }
 __device__ __forceinline__ void ldsm4(uint32_t* r, const void* p) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");
 }
 __device__ __forceinline__ void ldsm4t(uint32_t* r, const void* p) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");
 }
 
 constexpr int FA_BK = 64;
@@ -595,9 +599,13 @@ template <int D> __device__ __forceinline__ int fa2Kv(int r, int c) {
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ constexpr size_t fa2Stage() {
   return (size_t)RR * 2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
 }
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1>
+// NB: no bias at all (AF2's MSA column attention): the scores start at zero and no bias tile is loaded
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false>
 __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
-    int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal) {
+    int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
+    size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
+  // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is
+  // (n * 4W, 4W, n * W, W); AF2's attention ACROSS a tensor's leading axis passes its own
   constexpr int BQ = 16 * MT * WARPS, LDK = fa2Ldk<D>(), LDB = BK + 8, NT = WARPS * RR * 32, NTR = WARPS * 32;
   constexpr size_t STAGE = fa2Stage<D, WARPS, BK, MT, RR>();
   extern __shared__ __align__(16) unsigned char smem[];
@@ -612,7 +620,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
   const bool live = RR == 1 || rl < rowsHere;                        // a last block's spare row computes, stores nothing
   if (!live) rl = rowsHere - 1;
   const int Wd = heads * D, W4 = 4 * Wd;
-  const half* base = qkvg + rl * (size_t)n * W4 + h * D;
+  const half* base = qkvg + rl * rowStride + h * D;
   int q0 = blockIdx.x * BQ;
   constexpr int KV_CHUNKS = BK * (D / 8), B_CHUNKS = BQ * (BK / 8);
   static_assert(B_CHUNKS % NT == 0, "a bias tile is a whole number of chunks a thread");
@@ -624,7 +632,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
     int u = k * NTR + tr, jj = u / (D / 8), c = (u % (D / 8)) * 8;
     kvJ[k] = (KV_CHUNKS % NTR == 0 || u < KV_CHUNKS) ? jj : 1 << 30;
     kvOff[k] = fa2Kv<D>(jj, c);
-    kvSrc[k] = base + (size_t)jj * W4 + Wd + c;
+    kvSrc[k] = base + (size_t)jj * posStride + Wd + c;
   }
   const half* bSrc[B_PER]; int bOff[B_PER], bC[B_PER]; bool bRow[B_PER];
 #pragma unroll
@@ -640,20 +648,22 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
     for (int k = 0; k < KV_PER; ++k) {
       if (kvJ[k] >= (1 << 30)) continue;
       bool ok = !last || j0 + kvJ[k] < n;
-      const half* src = ok ? kvSrc[k] + (size_t)j0 * W4 : base;
+      const half* src = ok ? kvSrc[k] + (size_t)j0 * posStride : base;
       cpAsync16(K + kvOff[k], src, ok);
       cpAsync16(V + kvOff[k], src + Wd, ok);
     }
+    if constexpr (!NB) {   // (braced: an unbraced if constexpr over a #pragma'd loop lost the commit below)
 #pragma unroll
-    for (int k = 0; k < B_PER; ++k) {
-      bool ok = bRow[k] && (!last || j0 + bC[k] < n);
-      cpAsync16(B + bOff[k], ok ? bSrc[k] + j0 : biasHead, ok);
+      for (int k = 0; k < B_PER; ++k) {
+        bool ok = bRow[k] && (!last || j0 + bC[k] < n);
+        cpAsync16(B + bOff[k], ok ? bSrc[k] + j0 : biasHead, ok);
+      }
     }
     cpCommit();
   };
   auto q2 = [&](int i, int e) -> uint32_t {
     if (i >= n) return 0u;
-    half2 v = *reinterpret_cast<const half2*>(base + (size_t)i * W4 + e);
+    half2 v = *reinterpret_cast<const half2*>(base + (size_t)i * posStride + e);
     float2 f = __half22float2(v);
     if (qBias) { f.x += qBias[h * D + e]; f.y += qBias[h * D + e + 1]; }
     return pack2(f.x * scale * LOG2E, f.y * scale * LOG2E);
@@ -690,8 +700,11 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 #pragma unroll
       for (int nt = 0; nt < BK / 8; ++nt) {
         int jj = nt * 8 + tig * 2;
-        sh[mt][nt][0] = *reinterpret_cast<const uint32_t*>(hb0 + jj);
-        sh[mt][nt][1] = *reinterpret_cast<const uint32_t*>(hb1 + jj);
+        if constexpr (NB) { sh[mt][nt][0] = 0u; sh[mt][nt][1] = 0u; }
+        else {
+          sh[mt][nt][0] = *reinterpret_cast<const uint32_t*>(hb0 + jj);
+          sh[mt][nt][1] = *reinterpret_cast<const uint32_t*>(hb1 + jj);
+        }
         if (tile == tiles - 1) {
           int jg = tile * BK + jj;
           if (jg >= n) { sh[mt][nt][0] = (sh[mt][nt][0] & 0xFFFF0000u) | 0xFC00u; sh[mt][nt][1] = (sh[mt][nt][1] & 0xFFFF0000u) | 0xFC00u; }
@@ -756,8 +769,8 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
     half2 ga[D / 8], gb[D / 8];
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
-      ga[et] = i0 < n ? *reinterpret_cast<const half2*>(base + (size_t)i0 * W4 + 3 * Wd + e) : half2{};
-      gb[et] = i1 < n ? *reinterpret_cast<const half2*>(base + (size_t)i1 * W4 + 3 * Wd + e) : half2{};
+      ga[et] = i0 < n ? *reinterpret_cast<const half2*>(base + (size_t)i0 * posStride + 3 * Wd + e) : half2{};
+      gb[et] = i1 < n ? *reinterpret_cast<const half2*>(base + (size_t)i1 * posStride + 3 * Wd + e) : half2{};
     }
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
@@ -781,7 +794,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
     for (int r0 = 0; r0 < 16 * MT; r0 += ROWS_AT) {
       int r = r0 + lane / PER, c = (lane % PER) * 8;
       int i = q0 + warp * 16 * MT + r;
-      if (live && i < n) *reinterpret_cast<uint4*>(out + (rl * n + i) * Wd + h * D + c) = *reinterpret_cast<const uint4*>(Ys + r * (D + 8) + c);
+      if (live && i < n) *reinterpret_cast<uint4*>(out + rl * outRowStride + (size_t)i * outPosStride + h * D + c) = *reinterpret_cast<const uint4*>(Ys + r * (D + 8) + c);
     }
   }
 }
@@ -798,15 +811,19 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 // keys where the third stage costs a block an SM - three warps a scheduler already overlap one warp's
 // softmax with another's MMAs.
 inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1>
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
-                    const float* qBias) {
+                    const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
+                    size_t outPosStride = 0) {
   constexpr int BQ = 16 * MT * WARPS;
+  const size_t W = (size_t)heads * D;
+  if (!posStride) { rowStride = (size_t)n * 4 * W; posStride = 4 * W; outRowStride = (size_t)n * W; outPosStride = W; }
   const int bytes = 2 * (int)fa2Stage<D, WARPS, BK, MT, RR>();
   static bool attr = false;
-  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR>), bytes); attr = true; }
+  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
-  flashGrid2R<D, WARPS, BK, MT, RR><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows);
+  flashGrid2R<D, WARPS, BK, MT, RR, NB><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
+                                                                              rowStride, posStride, outRowStride, outPosStride);
 }
 template <int D, int WARPS, bool MASKED, int BK = FA_BK, bool REG = false, int MINB = 1, bool F16S = false> void setFlashSmem() {
   static bool done = false;
