@@ -641,22 +641,46 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
     bRow[k] = i < n; bC[k] = c; bOff[k] = qi * LDB + c;
     bSrc[k] = biasHead + (size_t)(i < n ? i : 0) * biasStride + c;
   }
+  // a whole tile's issue walks running pointers, a key tile on each call: the bounds and the 64-bit offsets
+  // are the last tile's alone (they were ~70 of a tile's ~430 instructions a warp, for its 9 copies) -
+  // 2274 -> 2211 ms of AF3's grid attention at 1,044 tokens, byte-identical
+  const half* kvCur[KV_PER]; const half* bCur[B_PER];
+#pragma unroll
+  for (int k = 0; k < KV_PER; ++k) kvCur[k] = kvSrc[k];
+#pragma unroll
+  for (int k = 0; k < B_PER; ++k) bCur[k] = bSrc[k];
+  const size_t kvStep = (size_t)BK * posStride;
   auto issue = [&](int j0, int st) {
     half *K = Kst(st), *V = Vst(st), *B = Bst(st);
     bool last = j0 + BK > n;
+    if (!last) {
+#pragma unroll
+      for (int k = 0; k < KV_PER; ++k) {
+        if (KV_CHUNKS % NTR == 0 || kvJ[k] < (1 << 30)) {
+          cpAsync16(K + kvOff[k], kvCur[k], true);
+          cpAsync16(V + kvOff[k], kvCur[k] + Wd, true);
+        }
+        kvCur[k] += kvStep;
+      }
+      if constexpr (!NB) {
+#pragma unroll
+        for (int k = 0; k < B_PER; ++k) { cpAsync16(B + bOff[k], bRow[k] ? bCur[k] : biasHead, bRow[k]); bCur[k] += BK; }
+      }
+      cpCommit();
+      return;
+    }
 #pragma unroll
     for (int k = 0; k < KV_PER; ++k) {
       if (kvJ[k] >= (1 << 30)) continue;
-      bool ok = !last || j0 + kvJ[k] < n;
-      const half* src = ok ? kvSrc[k] + (size_t)j0 * posStride : base;
-      cpAsync16(K + kvOff[k], src, ok);
-      cpAsync16(V + kvOff[k], src + Wd, ok);
+      bool ok = j0 + kvJ[k] < n;
+      cpAsync16(K + kvOff[k], ok ? kvCur[k] : base, ok);
+      cpAsync16(V + kvOff[k], (ok ? kvCur[k] : base) + Wd, ok);
     }
     if constexpr (!NB) {   // (braced: an unbraced if constexpr over a #pragma'd loop lost the commit below)
 #pragma unroll
       for (int k = 0; k < B_PER; ++k) {
-        bool ok = bRow[k] && (!last || j0 + bC[k] < n);
-        cpAsync16(B + bOff[k], ok ? bSrc[k] + j0 : biasHead, ok);
+        bool ok = bRow[k] && j0 + bC[k] < n;
+        cpAsync16(B + bOff[k], ok ? bCur[k] : biasHead, ok);
       }
     }
     cpCommit();
@@ -724,6 +748,9 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
           if (k2 * 2 + 1 < D / 16) mma16816h(sh[mt][nt], qa[mt][k2 * 2 + 1], kb[2], kb[3]);
         }
       }
+    // (skipping the rescale when no row of the warp moved its max - a vote, each factor then exactly 1 - is
+    // byte-identical and slower: 2211 -> 2251 ms of AF3's grid attention at 1,044 tokens, 111 -> 123 ms of
+    // AF2's MSA column attention)
     __half2 hn[MT][2];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
