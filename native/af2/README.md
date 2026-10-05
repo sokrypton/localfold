@@ -137,6 +137,16 @@ second copy, each length its own process):
 | peak, native | 7.2 GB | 7.7 GB | 11.7 GB | 16.7 GB |
 | peak, ColabFold | 5.8 GB | 9.8 GB | 14.9 GB | 22.7 GB |
 
+Native's peak at 1,044 is above ColabFold's because it spends memory the card has: two rules scale with
+the card's size. Grid attention runs in one pass while its q/k/v/gate buffer is at most a 32nd of the
+card (1.12 GB at 1,044 against a 1.25 GB cut-off on 40 GB; at 1,566 it would be 2.5 GB, so it chunks).
+Each stage's scratch is kept between stages while the pair is at most a 64th (558 MB at 1,044 against
+625 MB; 1.25 GB at 1,566 releases it). 1,044 is the longest chain under both cut-offs, so it takes every
+memory-for-speed form - which is why 1,566 peaks only 0.5 GB higher at 2.25x the pair. Every lean form
+forced (`LOCALFOLD_BIG=1`, which also turns on the costly ones such as parking the residual in host
+memory) gives 3.6 GB at 11.4 s against 7.2 GB at 6.4 s. On a smaller card the lean forms start sooner by
+themselves: on a T4's 15 GB, once the pair passes ~234 MB (~680 residues).
+
 The earlier table had ColabFold's 261-residue fold at 2.1 s; it measures 1.2 s now under either
 allocator and the other three of its numbers are unchanged, so that cell was the outlier. Native
 uses the page's int5 weights with TF32/f16; ColabFold DeepMind's float32 with bf16 and its kernels;
