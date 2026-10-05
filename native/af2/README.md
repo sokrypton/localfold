@@ -125,6 +125,17 @@ so the 522-residue one). Harness and inputs: `/tmp/claude-1000/af2bench` (the sc
 | peak, native | 1.2 GB | 1.6 GB | 3.0 GB | 3.3 GB |
 | peak, ColabFold | — | — | 3.2 GB | 3.3 GB |
 
+Longer single chains (5CAJ repeated 4, 6, 8 and 10 times; native median of three, ColabFold its warm
+second copy, each length its own process):
+
+| | 1,044 res | 1,566 res | 2,088 res | 2,610 res |
+|---|---:|---:|---:|---:|
+| native AF2 | **7.1 s** | **19.8 s** | **40.1 s** | **70.4 s** |
+| ColabFold 1.6.3, fast kernels | 19.4 s | 47.2 s | 80.7 s | 178.1 s |
+| native's speed-up | 2.7x | 2.4x | 2.0x | 2.5x |
+| peak, native | 7.7 GB | 8.5 GB | 12.9 GB | 18.5 GB |
+| peak, ColabFold | 5.8 GB | 9.8 GB | 14.9 GB | 22.7 GB |
+
 The earlier table had ColabFold's 261-residue fold at 2.1 s; it measures 1.2 s now under either
 allocator and the other three of its numbers are unchanged, so that cell was the outlier. Native
 uses the page's int5 weights with TF32/f16; ColabFold DeepMind's float32 with bf16 and its kernels;
