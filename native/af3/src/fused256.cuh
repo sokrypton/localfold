@@ -10,33 +10,6 @@
 #pragma once
 #include "fusedtriangle.cuh"
 
-// W's columns [col0, col0 + cols) as cols / NC tiles of [K][NC], each contiguous: a kernel streaming NC
-// columns at a time then reads one run of global memory per stage, where from W itself each 16-byte
-// piece is a row (ld halves) from its neighbour's - and a cp.async write takes one shared wavefront per
-// global row it touches (Nsight Compute: triIn256K's stage writes at 5.4x their ideal wavefronts).
-// Tiled and swizzled (stageSw), a 1,044-token ESMFold2 trunk's three streaming kernels: triIn256K 1010 ->
-// 893 ms, transitionUpK 877 -> 737, triangleOutK 736 -> 687 - the trunk 3753 -> 3463 ms, byte-identical;
-// the tiling is a few microseconds a call, into scratch, so it costs no memory that persists
-__global__ void tileColumnsK(const half* __restrict__ W, int K, int ld, int col0, int cols, int NC, half* __restrict__ out) {
-  size_t e = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
-  if (e >= (size_t)K * cols) return;
-  int c = (int)(e % NC); size_t rest = e / NC; int k = (int)(rest % K), t = (int)(rest / K);
-  *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<const uint4*>(W + (size_t)k * ld + col0 + t * NC + c);
-}
-inline void tileColumns(const half* W, int K, int ld, int col0, int cols, int NC, half* out) {
-  size_t n8 = (size_t)K * cols / 8;
-  tileColumnsK<<<(unsigned)((n8 + 255) / 256), 256, 0, STREAM>>>(W, K, ld, col0, cols, NC, out);
-}
-// A weight stage of NC = 16 or 32 halves a row, unpadded, its 16-byte chunks XOR-swizzled so both the
-// cp.async writes (a warp's 512 contiguous bytes) and the ldmatrix.trans reads (8 consecutive rows at one
-// chunk) are conflict-free - padded rows kept the reads clean and serialised the writes
-template <int NC>
-__device__ __forceinline__ int stageSw(int k, int c) {
-  static_assert(NC == 16 || NC == 32, "a 32- or 64-byte stage row");
-  if constexpr (NC == 16) return k * NC + (c ^ (((k >> 2) & 1) << 3));
-  else return k * NC + (c ^ (((k >> 1) & 3) << 3));
-}
-
 // ---------------------------------------------------------------- the transition's widening
 // A block is 16 WARPS rows; the LN'd rows stay in registers as MMA A fragments; W1's [gate | value]
 // halves are walked 32 columns at a time (each chunk and its SwiGLU partner), double-buffered.
@@ -150,10 +123,11 @@ size_t transitionUpChunkRows(size_t smem, size_t budgetRows) {
 // TT, NC: the tile's type and the output columns a weight stage holds. A float tile at 32 columns is 66.5 KB a
 // block (two an SM on an A100); a bf16 tile at 16 is 34 KB (four, the registers' limit) - the product held
 // at AF3's activation precision, which is what AF3's own triangle runs in
-template <int C, int WARPS, class TT = float, int NC = 32>
+template <int C, int WARPS, class TT = float, int NC = 32, class TP = float>
 __host__ __device__ constexpr size_t triangleOutSmem() {
   constexpr int R = 16 * WARPS;
-  constexpr size_t tile = (size_t)C * (R + 1) * sizeof(TT), stages = (size_t)2 * C * NC * 2 + (size_t)R * (NC + 4) * 4;
+  constexpr bool VEC = sizeof(TT) == 2 && sizeof(TP) == 2;      // (triangleOutK's 16-byte product loads)
+  constexpr size_t tile = (size_t)C * (R + (VEC ? 8 : 1)) * sizeof(TT), stages = (size_t)2 * C * NC * 2 + (size_t)R * (NC + 4) * 4;
   return (tile > stages ? tile : stages) + 2 * (size_t)R * 4;
 }
 // TP: the product's type in memory - f32, or bf16 (ESMFold2's: the contraction writes half the bytes and
@@ -163,9 +137,15 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     const float* __restrict__ cnOffset, const half* __restrict__ Woutt, const half* __restrict__ t2,
     float* __restrict__ pair, int L, int Lp) {
   // Woutt: Wout's NC-column tiles (tileColumns), the stages unpadded and swizzled (stageSw)
-  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + 1, KS = C / 16;
+  // VEC (a 16-bit product into a 16-bit tile - ESMFold2's and protenix2's bf16): the block's rows are the
+  // PADDED pair space, so eight consecutive rows are 16 contiguous, aligned bytes of a channel and the tile
+  // fills by cp.async - where an unpadded row's product was two bytes a thread (Nsight Compute: long
+  // scoreboard 41% of the kernel's stalls, on those loads); a padding row computes and stores nothing
+  constexpr bool VEC = sizeof(TT) == 2 && sizeof(TP) == 2;
+  static_assert(!VEC || std::is_same_v<TT, TP>, "the tile takes the product's bytes as they are");
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDP = R + (VEC ? 8 : 1), KS = C / 16;
   constexpr size_t STAGE = (size_t)C * NC * 2;
-  constexpr size_t PS = triangleOutSmem<C, WARPS, TT, NC>() - 2 * (size_t)R * 4;
+  constexpr size_t PS = triangleOutSmem<C, WARPS, TT, NC, TP>() - 2 * (size_t)R * 4;
   extern __shared__ __align__(16) unsigned char smem[];
   TT* Ps = (TT*)smem;                                         // [C][LDP], then the weight stages
   float* stat = (float*)(smem + PS);                          // [R] mean, [R] 1/sd
@@ -174,9 +154,26 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
   const size_t P = (size_t)L * L, plane = (size_t)Lp * Lp;
   size_t row0 = (size_t)blockIdx.x * R;
   auto padded = [&](size_t r) { unsigned u = (unsigned)r, i = u / (unsigned)L; return (size_t)i * Lp + (u - i * L); };
-  static_assert(NTH % R == 0, "a thread keeps one pair of the tile");
-  {   // a thread keeps one pair (its padded index computed once) and walks the channels
-    int r = threadIdx.x % R;
+  // a row's pair (the unpadded index) and its padded index, in whichever space the rows are
+  auto pairAt = [&](size_t row) -> size_t {
+    if constexpr (VEC) {
+      if (row >= plane) return SIZE_MAX;
+      unsigned u = (unsigned)row, i = u / (unsigned)Lp, j = u - i * (unsigned)Lp;
+      return i < (unsigned)L && j < (unsigned)L ? (size_t)i * L + j : SIZE_MAX;
+    } else return row < P ? row : SIZE_MAX;
+  };
+  auto paddedAt = [&](size_t row) -> size_t { if constexpr (VEC) return row; else return padded(row); };
+  if constexpr (VEC) {
+#pragma unroll
+    for (int t0_ = 0; t0_ < C * (R / 8); t0_ += NTH) {
+      int t = t0_ + (int)threadIdx.x, c = t / (R / 8), r = (t % (R / 8)) * 8;
+      size_t row = row0 + r;
+      cpAsync16(Ps + c * LDP + r, prod + (size_t)c * plane + (row < plane ? row : 0), row < plane);
+    }
+    cpCommit(); cpWait<0>();
+  } else {
+    static_assert(NTH % R == 0, "a thread keeps one pair of the tile");
+    int r = threadIdx.x % R;   // a thread keeps one pair (its padded index computed once) and walks the channels
     size_t row = row0 + r;
     bool live = row < P;
     const TP* src = prod + (live ? padded(row) : 0);
@@ -184,16 +181,38 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? (float)src[(size_t)c * plane] : 0.f);
   }
   __syncthreads();
-  for (int r = warp; r < R; r += WARPS) {                     // the centre norm's mean and 1/sd, a warp a row
-    float v[C / 32], s = 0.f;
+  // the centre norm's mean and 1/sd, a warp a row; at VEC's LDP (R + 8) a warp's reads across one row
+  // conflict four ways, so it takes two rows a word (a bf16 pair) - the same sums in the same order, so
+  // byte-identical (a thread pair a row reads conflict-free and sums in another order: 0.7% more of the
+  // trunk, and a different fold). ESMFold2 trunk 3462 -> 3415 ms at 1,044 tokens, 223.6 -> 220.5 at 261
+  auto rowStats = [&](int r, float (&v)[C / 32]) {
+    float s = 0.f;
 #pragma unroll
-    for (int k = 0; k < C / 32; ++k) { v[k] = (float)Ps[(lane + 32 * k) * LDP + r]; s += v[k]; }
+    for (int k = 0; k < C / 32; ++k) s += v[k];
     for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
     float mean = s / C, q = 0.f;
 #pragma unroll
     for (int k = 0; k < C / 32; ++k) { float d = v[k] - mean; q += d * d; }
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
     if (lane == 0) { stat[r] = mean; stat[R + r] = rsqrtf(q / C + 1e-5f); }
+  };
+  if constexpr (VEC) {
+    for (int r = 2 * warp; r < R; r += 2 * WARPS) {
+      float va[C / 32], vb[C / 32];
+#pragma unroll
+      for (int k = 0; k < C / 32; ++k) {
+        uint32_t w = *reinterpret_cast<const uint32_t*>(Ps + (lane + 32 * k) * LDP + r);
+        va[k] = (float)reinterpret_cast<const TT*>(&w)[0]; vb[k] = (float)reinterpret_cast<const TT*>(&w)[1];
+      }
+      rowStats(r, va); rowStats(r + 1, vb);
+    }
+  } else {
+    for (int r = warp; r < R; r += WARPS) {
+      float v[C / 32];
+#pragma unroll
+      for (int k = 0; k < C / 32; ++k) v[k] = (float)Ps[(lane + 32 * k) * LDP + r];
+      rowStats(r, v);
+    }
   }
   __syncthreads();
   // A fragments of m16n8k16: a0 (row g, k 2tig..+1), a1 (row g+8, ...), a2 (row g, k+8), a3 (row g+8, k+8)
@@ -250,13 +269,13 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     __syncthreads();
     for (int t = threadIdx.x; t < R * (NC / 4); t += NTH) {
       int r = t / (NC / 4), q = (t % (NC / 4)) * 4;
-      size_t row = row0 + r;
-      if (row >= P) continue;
+      size_t row = row0 + r, pr = pairAt(row);
+      if (pr == SIZE_MAX) continue;
       int c = n * NC + q;
       float4 o = *reinterpret_cast<const float4*>(Os + r * LDO + q);
-      uint2 gw = *reinterpret_cast<const uint2*>(t2 + padded(row) * C + c);
+      uint2 gw = *reinterpret_cast<const uint2*>(t2 + paddedAt(row) * C + c);
       float2 g01 = __half22float2(*reinterpret_cast<half2*>(&gw.x)), g23 = __half22float2(*reinterpret_cast<half2*>(&gw.y));
-      float4* d = reinterpret_cast<float4*>(pair + row * C + c); float4 v = *d;
+      float4* d = reinterpret_cast<float4*>(pair + pr * C + c); float4 v = *d;
       v.x += o.x * sigmH(g01.x); v.y += o.y * sigmH(g01.y); v.z += o.z * sigmH(g23.x); v.w += o.w * sigmH(g23.y);
       *d = v;
     }
@@ -271,16 +290,8 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
 // Output as triInK's: a, b channel-major padded planes (interleaved split, masked), t2 the gating
 // linear's raw output over the padded rows.
 // TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (an f16 one overflows)
-// triIn256K's weights as it streams them (5 C^2 halves): the projection's two halves and the gating linear,
-// 16 columns a tile
-constexpr size_t triIn256TileHalves(int C) { return (size_t)5 * C * C; }
-inline void tileTriIn256(const half* Wpg, const half* Wg, int C, half* out) {
-  tileColumns(Wpg, C, 4 * C, 0, 2 * C, 16, out);
-  tileColumns(Wpg, C, 4 * C, 2 * C, 2 * C, 16, out + (size_t)2 * C * C);
-  tileColumns(Wg, C, C, 0, C, 16, out + (size_t)4 * C * C);
-}
 
-// Wt: tileTriIn256's layout
+// Wt: tileTriIn's layout at 16 columns a tile
 template <int C, int WARPS, class TA = half>
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
@@ -406,10 +417,12 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
     if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP>), (int)smem); attr = true; }
     triangleOutK<C, WARPS, float, 32, TP><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp);
   } else {
-    constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16>();
+    constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
+    constexpr bool vec = sizeof(TP) == 2;                       // the padded rows (triangleOutK's VEC)
+    size_t rows = vec ? (size_t)Lp * Lp : P;
     static bool attr = false;
     if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP>), (int)smem); attr = true; }
-    triangleOutK<C, WARPS, __nv_bfloat16, 16, TP><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp);
+    triangleOutK<C, WARPS, __nv_bfloat16, 16, TP><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp);
   }
 }
 

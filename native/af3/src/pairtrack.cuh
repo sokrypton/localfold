@@ -417,8 +417,8 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
       half* t2 = scratch<half>("tri.t2whole", cs * C);
-      half* wt = scratch<half>("tri.wt256", triIn256TileHalves(C));
-      tileTriIn256(Wh(pg), Wh(pre + ".gatingLinear"), C, wt);
+      half* wt = scratch<half>("tri.wt256", triInTileHalves(C));
+      tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
       if (TRI_BF16) {
         // as the 128-channel path: a, b and the product in bf16, the product half the bytes both ways
         __nv_bfloat16* ab = scratch<__nv_bfloat16>("tri.abf", cs * C);

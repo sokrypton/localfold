@@ -56,6 +56,43 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
   }
 }
 
+// W's columns [col0, col0 + cols) as cols / NC tiles of [K][NC], each contiguous: a kernel streaming NC
+// columns at a time then reads one run of global memory per stage, where from W itself each 16-byte
+// piece is a row (ld halves) from its neighbour's - and a cp.async write takes one shared wavefront per
+// global row it touches (Nsight Compute: triIn256K's stage writes at 5.4x their ideal wavefronts).
+// Tiled and swizzled (stageSw), a 1,044-token ESMFold2 trunk's three streaming kernels: triIn256K 1010 ->
+// 893 ms, transitionUpK 877 -> 737, triangleOutK 736 -> 687 - the trunk 3753 -> 3463 ms, byte-identical;
+// the tiling is a few microseconds a call, into scratch, so it costs no memory that persists
+__global__ void tileColumnsK(const half* __restrict__ W, int K, int ld, int col0, int cols, int NC, half* __restrict__ out) {
+  size_t e = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+  if (e >= (size_t)K * cols) return;
+  int c = (int)(e % NC); size_t rest = e / NC; int k = (int)(rest % K), t = (int)(rest / K);
+  *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<const uint4*>(W + (size_t)k * ld + col0 + t * NC + c);
+}
+inline void tileColumns(const half* W, int K, int ld, int col0, int cols, int NC, half* out) {
+  size_t n8 = (size_t)K * cols / 8;
+  tileColumnsK<<<(unsigned)((n8 + 255) / 256), 256, 0, STREAM>>>(W, K, ld, col0, cols, NC, out);
+}
+// A weight stage of NC = 16 or 32 halves a row, unpadded, its 16-byte chunks XOR-swizzled so both the
+// cp.async writes (a warp's 512 contiguous bytes) and the ldmatrix.trans reads (8 consecutive rows at one
+// chunk) are conflict-free - padded rows kept the reads clean and serialised the writes
+template <int NC>
+__device__ __forceinline__ int stageSw(int k, int c) {
+  static_assert(NC == 16 || NC == 32, "a 32- or 64-byte stage row");
+  if constexpr (NC == 16) return k * NC + (c ^ (((k >> 2) & 1) << 3));
+  else return k * NC + (c ^ (((k >> 1) & 3) << 3));
+}
+
+// triIn256K's weights as it streams them (5 C^2 halves, NC columns a tile): the
+// projection's first half (a and b), its second (their gates), then the gating linear - so step j's
+// tile is at (j * C) * NC whichever of the three it falls in, the second half 2 C^2 on
+constexpr size_t triInTileHalves(int C) { return (size_t)5 * C * C; }
+inline void tileTriIn(const half* Wpg, const half* Wg, int C, int NC, half* out) {
+  tileColumns(Wpg, C, 4 * C, 0, 2 * C, NC, out);
+  tileColumns(Wpg, C, 4 * C, 2 * C, 2 * C, NC, out + (size_t)2 * C * C);
+  tileColumns(Wg, C, C, 0, C, NC, out + (size_t)4 * C * C);
+}
+
 constexpr int TI_NC = 32;
 // a stage's two [C][TI_NC] weight chunks, unpadded 64-byte rows with each 16-byte piece XOR-swizzled by
 // (k >> 1) & 3 (tiSw): eight cp.async writes then fill one aligned 128-byte line and the 8-row ldmatrix
@@ -63,7 +100,7 @@ constexpr int TI_NC = 32;
 // 55.3 -> 53.2 ms of a 261-token fold, 725 -> 698 at 1,044, byte-identical. (gridInK's 144-byte rows the
 // same way, 128 bytes with k & 7: no change, so left.)
 __host__ __device__ constexpr size_t tiStage(int C) { return (size_t)2 * C * TI_NC * 2; }
-__device__ __forceinline__ int tiSw(int k, int c) { return k * TI_NC + (c ^ (((k >> 1) & 3) << 3)); }
+__device__ __forceinline__ int tiSw(int k, int c) { return stageSw<TI_NC>(k, c); }
 
 // TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (f16 overflows).
 // BIAS: AlphaFold 2's projections carry biases, AF3's do not - `bias` is [4C, the projection | gate columns
@@ -105,6 +142,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       const int t = t0_ + (int)threadIdx.x;
       if ((C * (TI_NC / 8)) % NTH != 0 && t >= (C * (TI_NC / 8))) break;
       int k = t / (TI_NC / 8), c = (t % (TI_NC / 8)) * 8;
+      // (the weights tiled as triIn256K's are, tileTriIn at TI_NC: the kernel unchanged at 64-byte rows
+      // and the fold 3 ms slower at 261 tokens for the tiling's launches - not taken)
       if (j < C / 16) {
         cpAsync16(w0 + tiSw(k, c), Wpg + (size_t)k * 4 * C + j * 32 + c, true);
         cpAsync16(w1 + tiSw(k, c), Wpg + (size_t)k * 4 * C + 2 * C + j * 32 + c, true);

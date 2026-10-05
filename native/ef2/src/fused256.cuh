@@ -32,8 +32,8 @@ void triIn256(const float* pair, const float* mask, const std::string& Tn, TA* a
   if (!attr) { smemAttr((triIn256K<C, WARPS, TA>), (int)smem); attr = true; }
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", C, {{"f/" + Tn + "projection", 2 * C, false},
                                                                    {"f/" + Tn + "gate", 2 * C, false}});
-  half* wt = scratch<half>("ftri.wt", triIn256TileHalves(C));
-  tileTriIn256(Wh(pg), Fh(Tn + "gatingLinear"), C, wt);
+  half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
+  tileTriIn(Wh(pg), Fh(Tn + "gatingLinear"), C, 16, wt);
   triIn256K<C, WARPS, TA><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     pair, mask, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"), wt, a, b, t2, n, np, cs);
 }

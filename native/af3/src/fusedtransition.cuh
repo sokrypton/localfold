@@ -9,7 +9,7 @@
 // straight into A fragments of the second GEMM (the flash kernel's P trick), and accumulated into
 // the 16 x C output. The weights stream through shared memory, double-buffered.
 #pragma once
-#include "fused256.cuh"   // tileColumns, stageSw
+#include "fusedtriangle.cuh"
 
 constexpr int FT_NC = 32;
 
