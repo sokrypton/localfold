@@ -322,6 +322,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-sampler16")) SAMPLER16 = false;
     else if (!strcmp(argv[i], "--no-tower16")) TOWER16 = false;
     else if (!strcmp(argv[i], "--no-sampler-graph")) SAMPLER_GRAPH = false;
+    else if (!strcmp(argv[i], "--no-token-flash")) TOKEN_FLASH = false;
     else if (!strcmp(argv[i], "--atom-f32")) ATOM_BF16 = false;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;    // T,A: fold a synthetic input of that size meanwhile

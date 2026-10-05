@@ -122,6 +122,22 @@ __global__ void pairToHeadsK(const float* pb, B* out, size_t P, int Hh) {   // [
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < P * Hh) out[(t % Hh) * P + t / Hh] = (B)pb[t];
 }
+// [T * T, H] -> the flash kernel's [H, T, stride] f16, log2(e)-scaled (the padding columns stay as cleared)
+__global__ void pairToFlashBiasK(const float* pb, half* out, int T, int Hh, int stride) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)T * T * Hh) return;
+  int h = (int)(t % Hh); size_t p = t / Hh; int i = (int)(p / T), j = (int)(p % T);
+  out[((size_t)h * T + i) * stride + j] = __float2half(pb[t] * 1.4426950408889634f);
+}
+// [T, 4C] f32 -> f16, the flash kernel's q | k | v | gate rows (the projection's columns in that order)
+__global__ void toHalfRowsK(const float* x, half* y, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = __float2half(x[t]);
+}
+__global__ void halfToFloatK(const half* x, float* y, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = __half2float(x[t]);
+}
 __global__ void gatherTokensK(const float* perToken, const int* atomToToken, const float* mask, float* q, int A, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)A * C) return;
@@ -141,6 +157,10 @@ struct Denoiser {
   // per token block, [H, T, T] (the pair itself is not kept): f16 under --fast, f32 otherwise
   // (f16 costs the float32 path 5e-5 on the denoiser)
   std::vector<void*> biases; bool biasHalf;
+  // flashBias (--fast, a head width the flash kernel has): the biases instead in native/af3's flash layout -
+  // [H, T, stride] f16, log2(e)-scaled, rows padded to `stride` - and the token blocks' attention on that
+  // kernel (scores never written), as native/af3's own denoiser runs
+  bool flashBias = false; int stride = 0;
   const float* sInputs;
   // every token block's projections of the single alone, one batched GEMM a step: entry e of G [T, 72 Ct]
   // (columns e Ct..): 4b+0..3 block b's attention gate, shift, transition gate, shift (from LN(single)
@@ -149,6 +169,7 @@ struct Denoiser {
   float* level;                   // NoiseLevel on the device
 };
 
+inline bool TOKEN_FLASH = true;   // --no-token-flash: the token blocks' attention through the [H, T, T] scores
 inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs, bool check) {
   Denoiser d{};
   d.T = T; d.A = A; d.Cz = (int)M.meta("meta/pairChannels"); d.Ct = (int)M.meta("meta/tokenChannels2");
@@ -169,6 +190,9 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
   if (check) checkOracle("diffusion conditioning pair", pair, P * Cz, "o/cond/pair");
   d.biasHalf = FAST;
+  int D = d.Ct / d.heads;
+  d.flashBias = FAST && TOKEN_FLASH && (D == 16 || D == 32 || D == 48 || D == 64);
+  d.stride = (T + 7) / 8 * 8;
   float* pn = scratch<float>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
   for (int b = 0; b < d.tokenBlocks; ++b) {
     std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
@@ -178,7 +202,12 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
       gemm(pn, F(B + "pairBiasWeights"), pb + p0 * d.heads, n, Cz, d.heads);
     }
     void* bias;
-    if (d.biasHalf) { half* h = dallocT<half>(P * d.heads); pairToHeadsK<<<blocks(P * d.heads), 256, 0, STREAM>>>(pb, h, P, d.heads); bias = h; }
+    if (d.flashBias) {
+      half* h = dallocT<half>((size_t)d.heads * T * d.stride);
+      CK(cudaMemsetAsync(h, 0, (size_t)d.heads * T * d.stride * 2, STREAM));
+      pairToFlashBiasK<<<blocks(P * d.heads), 256, 0, STREAM>>>(pb, h, T, d.heads, d.stride);
+      bias = h;
+    } else if (d.biasHalf) { half* h = dallocT<half>(P * d.heads); pairToHeadsK<<<blocks(P * d.heads), 256, 0, STREAM>>>(pb, h, P, d.heads); bias = h; }
     else { float* f = dalloc(P * d.heads); pairToHeadsK<<<blocks(P * d.heads), 256, 0, STREAM>>>(pb, f, P, d.heads); bias = f; }
     d.biases.push_back(bias);
   }
@@ -249,6 +278,25 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
   float* x = scratch<float>("tb.x", (size_t)T * C);
   adaLN(d, a, x, 4 * b, B + "attention/adaln/");
+  float* o = scratch<float>("tb.o", (size_t)T * C);
+  if (d.flashBias) {
+    // q | k | v | gate in one GEMM (the weights' columns concatenated once), then native/af3's flash kernel:
+    // the query bias, QK^T, the pair bias, the softmax, PV and the gate, no [H, T, T] scores at all
+    // (they were 52 of the sampler's 139 GPU ms at 1,044 tokens: the score matrix's softmax and two GEMMs)
+    std::string wq = concatColumns("f/" + B + "attention/qkvg~", C, {{"f/" + B + "attention/queryWeights", C, false},
+                                                                     {"f/" + B + "attention/kvWeights", 2 * C, false},
+                                                                     {"f/" + B + "attention/gateWeights", C, false}});
+    float* qkvg = scratch<float>("tb.qkvg", (size_t)T * 4 * C);
+    gemm(x, W(wq), qkvg, T, C, 4 * C);
+    half* qh = scratch<half>("tb.qkvgh", (size_t)(T + 128) * 4 * C);    // (padding: the last query block's rows)
+    toHalfRowsK<<<blocks((size_t)T * 4 * C), 256, 0, STREAM>>>(qkvg, qh, (size_t)T * 4 * C);
+    half* oh = scratch<half>("tb.oh", (size_t)T * C);
+    flashGrid<half>(qh, (const half*)d.biases[b], d.stride, nullptr, oh, T, Hh, D, 0, 1, false, 1.f / sqrtf((float)D),
+                    F(B + "attention/queryBias"));
+    float* ctx = scratch<float>("tb.ctx", (size_t)T * C);
+    halfToFloatK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(oh, ctx, (size_t)T * C);
+    gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
+  } else {
   float* q = scratch<float>("tb.q", (size_t)T * C); float* kv = scratch<float>("tb.kv", (size_t)T * 2 * C);
   float* gt = scratch<float>("tb.gate", (size_t)T * C);
   gemm(x, F(B + "attention/queryWeights"), q, T, C, C);
@@ -264,8 +312,8 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, D, T, T, &one, kv + C, 2 * C, D, S, T, (long long)T * T,
                                &zero, ctx, C, D, Hh));
   sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C, C);
-  float* o = scratch<float>("tb.o", (size_t)T * C);
   gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
+  }
   sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), T, C, ld);
   addK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, (size_t)T * C);
   // the conditioned transition
