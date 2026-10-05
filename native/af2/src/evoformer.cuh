@@ -449,6 +449,10 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
   if (FAST) {
     // in row chunks of ~128 MB of the widened rows (the whole widened tensor was 1.26 GB of a pair track
     // at 783 residues; a chunk of 2^15+ rows keeps the GEMMs as fast)
+    // (at 256 channels - the MSA stacks - the LayerNorm and the widening as one kernel was measured and is
+    // slower: native/af3's transitionUpK in a ReLU-with-bias form, writing these augmented rows, 182.8 ms
+    // over 5CAJ's 576 calls against 117.8 for the LN plus this GEMM it replaced, and 181.6 at two tiles a
+    // warp. At 256 channels its m16-a-warp MMAs read each weight fragment for one MMA; cuBLAS does better.)
     size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)(I + 8))));
     half* xh = scratch<half>("ftr.xn", chunk * C);
     half* mh = augmentedInput("ftr.mid" + std::to_string(I), chunk, I);     // [rows, I+8], a 1 at column I
