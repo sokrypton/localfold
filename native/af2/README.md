@@ -112,17 +112,18 @@ On the A100, 5CAJ (261 residues, 512 + 1024 rows):
 **Against ColabFold 1.6.3 with its Pallas kernels** (`--use-fast-kernels`), re-measured 2026-10-05 on
 this A100: model_1_ptm, 4 passes with early stop off, no relax, exact lengths, 512:1024 alignment
 budget, warm (ColabFold's per-model `took` on a repeated length, its compile excluded; native's fold
-time after its warm-up pass, median of five). Peak is GPU memory over idle, sampled at 100 ms
+time after its warm-up pass, median of five; re-run after the 2026-10-05 overnight kernel work). Peak is GPU memory over idle, sampled at 100 ms
 (ColabFold with `XLA_PYTHON_CLIENT_PREALLOCATE=false`; its single-sequence figure is the run's peak,
-so the 522-residue one). Harness and inputs: `/tmp/claude-1000/af2bench` (the scripts are short).
+so the 522-residue one). Harness and inputs: `/tmp/claude-1000/af2bench` (the scripts are short; native's is
+`native_bench.sh`).
 
 | | 68 res | 261 res | 522 res | 261 + 7,907-row MSA |
 |---|---:|---:|---:|---:|
-| native AF2, now | **0.09 s** | **0.43 s** | **1.55 s** | **1.48 s** |
+| native AF2, now | **0.086 s** | **0.39 s** | **1.37 s** | **1.46 s** |
 | native AF2, 2026-10-03 | 0.11 s | 0.68 s | 2.67 s | 1.73 s |
 | ColabFold 1.6.3, fast kernels | 0.2 s | 1.2 s | 4.6 s | 3.2 s |
-| native's speed-up | ~2x | 2.8x | 3.0x | 2.2x |
-| peak, native | 1.2 GB | 1.6 GB | 3.0 GB | 3.3 GB |
+| native's speed-up | ~2.3x | 3.1x | 3.4x | 2.2x |
+| peak, native | 1.2 GB | 1.6 GB | 2.8 GB | 3.2 GB |
 | peak, ColabFold | — | — | 3.2 GB | 3.3 GB |
 
 Longer single chains (5CAJ repeated 4, 6, 8 and 10 times; native median of three, ColabFold its warm
@@ -130,10 +131,10 @@ second copy, each length its own process):
 
 | | 1,044 res | 1,566 res | 2,088 res | 2,610 res |
 |---|---:|---:|---:|---:|
-| native AF2 | **7.1 s** | **19.8 s** | **40.1 s** | **70.4 s** |
+| native AF2 | **6.4 s** | **17.5 s** | **35.9 s** | **63.7 s** |
 | ColabFold 1.6.3, fast kernels | 19.4 s | 47.2 s | 80.7 s | 178.1 s |
-| native's speed-up | 2.7x | 2.4x | 2.0x | 2.5x |
-| peak, native | 7.7 GB | 8.5 GB | 12.9 GB | 18.5 GB |
+| native's speed-up | 3.0x | 2.7x | 2.2x | 2.8x |
+| peak, native | 7.2 GB | 7.7 GB | 11.7 GB | 16.7 GB |
 | peak, ColabFold | 5.8 GB | 9.8 GB | 14.9 GB | 22.7 GB |
 
 The earlier table had ColabFold's 261-residue fold at 2.1 s; it measures 1.2 s now under either
