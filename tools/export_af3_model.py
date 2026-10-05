@@ -148,6 +148,10 @@ BLOBS = {
     # exporter does not care which vendor wrote them.
     "intellifold2": "~/ported/intellifold2/intellifold2.bin.zst",
     "rosettafold3": "~/ported/rosettafold3/rosettafold3.bin.zst",
+    # Chai-1 (Apache 2.0), not OpenFold-derived: chai ships frozen TorchScript, and af3-any-model's converter maps
+    # it onto AlphaFold 3's scopes. Its tokens also read ESM2 3B (lm/esm2.bin.zst, a separate bundle).
+    #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/main/chai1/chai1.bin.zst
+    "chai1": "~/af3_ported/ref/weights/chai1/chai1.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs
