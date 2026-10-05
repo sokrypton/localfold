@@ -28,8 +28,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'esmc'))
 
 from safetensors_read import SafeTensors                    # noqa: E402
-from esmfold2_trunk_weights import trunk_block              # noqa: E402
-from export_esmc_model import ShardWriter                   # noqa: E402
+from esmfold2_trunk_weights import trunk_block, transition_weights   # noqa: E402
+from export_esmc_model import ShardWriter, SHIM_TENSORS     # noqa: E402
 
 
 # 🔴 FOUR OF THE HEAD'S 93 TENSORS ARE DEAD, AND EXPORTING THEM WOULD SAY THE
@@ -60,6 +60,10 @@ def open_head(path):
     if not out:
         raise SystemExit('%s carries no confidence_head tensors' % path)
     return out
+
+
+def transposed_of(get, name):
+    return np.ascontiguousarray(np.asarray(get(name), np.float32).T)
 
 
 def main():
@@ -141,6 +145,59 @@ def main():
         writer.add('recycle/norm/offset', np.asarray(get('pair_loop_proj.0.bias'), np.float32))
         writer.add('recycle/projection', np.ascontiguousarray(
             np.asarray(get('pair_loop_proj.1.weight'), np.float32).T))
+    # The full ESMFold2's MSA encoder (ESMFold2-Fast has none: msa_encoder.enabled false). It reads the
+    # alignment and z_init and its answer REPLACES the injection (msa_encoder_overwrite) - biohub's
+    # MSAEncoder: m = embed([one-hot 33 | has_deletion | deletion_value]) + project_inputs(s_inputs)[token];
+    # per block the outer product mean into the pair (Wout(outer) / max(pair count, 1), the bias divided
+    # too), then - not on the last block - the pair-weighted averaging and the MSA's transition, then the
+    # pair-only block every trunk block is. Matrices inner-major ([in, out]) as everywhere here.
+    msa_blocks = len({k.split('.')[2] for k in source.keys() if k.startswith('msa_encoder.blocks.')})
+    msa_meta = {}
+    if msa_blocks:
+        writer.add('msaEncoder/embed', transposed_of(get, 'msa_encoder.embed.weight'))
+        writer.add('msaEncoder/projectInputs', transposed_of(get, 'msa_encoder.project_inputs.weight'))
+        for layer in range(msa_blocks):
+            at = 'msa_encoder.blocks.%d' % layer
+            out = 'msaEncoder/blocks/%d/' % layer
+            opm = at + '.outer_product_mean'
+            writer.add(out + 'outerProductMean/normScale', np.asarray(get(opm + '.norm.weight'), np.float32))
+            writer.add(out + 'outerProductMean/normOffset', np.asarray(get(opm + '.norm.bias'), np.float32))
+            writer.add(out + 'outerProductMean/projection', transposed_of(get, opm + '.W.weight'))      # [Cm, a | b]
+            writer.add(out + 'outerProductMean/output', transposed_of(get, opm + '.Wout.weight'))      # [(c, d), C]
+            writer.add(out + 'outerProductMean/outputBias', np.asarray(get(opm + '.Wout.bias'), np.float32))
+            pwa = at + '.msa_pair_weighted_averaging'
+            if pwa + '.Wv.weight' in source.keys():
+                writer.add(out + 'pairWeightedAveraging/normScale', np.asarray(get(pwa + '.norm_single.weight'), np.float32))
+                writer.add(out + 'pairWeightedAveraging/normOffset', np.asarray(get(pwa + '.norm_single.bias'), np.float32))
+                writer.add(out + 'pairWeightedAveraging/pairNormScale', np.asarray(get(pwa + '.compute_bias.0.weight'), np.float32))
+                writer.add(out + 'pairWeightedAveraging/pairNormOffset', np.asarray(get(pwa + '.compute_bias.0.bias'), np.float32))
+                writer.add(out + 'pairWeightedAveraging/pairLogits', transposed_of(get, pwa + '.compute_bias.1.weight'))
+                writer.add(out + 'pairWeightedAveraging/value', transposed_of(get, pwa + '.Wv.weight'))
+                writer.add(out + 'pairWeightedAveraging/gate', transposed_of(get, pwa + '.Wgate.weight'))
+                writer.add(out + 'pairWeightedAveraging/output', transposed_of(get, pwa + '.Wout.weight'))
+                for leaf, array in transition_weights(get, at + '.msa_transition').items():
+                    writer.add(out + 'msaTransition/' + leaf, array)
+            for group, values in trunk_block(get, layer, channels, arguments.heads, prefix='msa_encoder').items():
+                if not isinstance(values, dict) or group == 'pairAttention':
+                    continue
+                for leaf, array in values.items():
+                    writer.add(out + group + '/' + leaf, array)
+        msa = config.get('msa_encoder', {})
+        msa_meta = {'msaBlocks': msa_blocks, 'msaChannels': int(source.shape('msa_encoder.embed.weight')[0]),
+                    'msaHeads': int(msa.get('n_heads_msa', 8)),
+                    'msaHeadWidth': int(source.shape('msa_encoder.blocks.0.msa_pair_weighted_averaging.Wv.weight')[0])
+                    // int(msa.get('n_heads_msa', 8)),
+                    'opmHidden': int(source.shape('msa_encoder.blocks.0.outer_product_mean.W.weight')[0]) // 2,
+                    'msaMaxDepth': 1024, 'msaColumnMaskRate': 0.1}
+    # The language model's shim, which is this checkpoint's and not the tower's: the full ESMFold2's twelve
+    # differ from ESMFold2-Fast's in every tensor, so a folding bundle carries its own and the native port reads
+    # it before the ESM-C bundle's (native/ef2/src/ops.cuh shimKey). Laid out as tools/export_esmc6b.py lays it.
+    if 'language_model.base_z_combine' in source.keys():
+        for leaf, name in SHIM_TENSORS:
+            values = np.asarray(get('language_model.' + leaf), np.float32)
+            if name in ('lm/projection/weights', 'lm/downproject/weights', 'lm/pair_mlp_1/weights', 'lm/pair_mlp_2/weights'):
+                values = np.ascontiguousarray(values.T)
+            writer.add(name, values)
     # 🔴 EVERYTHING THAT BUILDS z_init EXCEPT THE ATOM ENCODER AND THE LANGUAGE
     # MODEL. z_init is a sum of five terms and these are the three cheap ones;
     # the shim's pair term is already in the ESM-C bundle, and the atom
@@ -438,7 +495,11 @@ def main():
                   **({'loops': int(config.get('num_loops', 3)),
                       'lmDropout': float(config.get('lm_encoder', {}).get('lm_dropout', 0.0))
                       if config.get('lm_encoder', {}).get('per_loop_lm_dropout') else 0.0} if parcae else {}),
-                  'codaBlocks': coda_blocks, 'lmEncoderBlocks': lm_encoder_blocks,
+                  'codaBlocks': coda_blocks, 'lmEncoderBlocks': lm_encoder_blocks, **msa_meta,
+                  # whether s_inputs carries the alignment's profile and mean deletion: biohub's experimental
+                  # forward zeroes both under disable_msa_features, the released one reads them (one row of
+                  # the query when there is no alignment)
+                  'msaFeatures': 0 if config.get('disable_msa_features', True) else 1,
                   'weightLayout': 'af3-pairformer-in-out',
                   'triangleDoubleWidth': 'interleaved',
                   'transitionDoubleWidth': 'blocked-gate-first'},

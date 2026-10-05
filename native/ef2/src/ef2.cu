@@ -7,6 +7,7 @@
 #include "esmc.cuh"
 #include "atoms.cuh"
 #include "trunk.cuh"
+#include "msa.cuh"
 #include "sampler.cuh"
 #include "confidence.cuh"
 #include "../../af3/src/profile.cuh"
@@ -45,7 +46,8 @@ static std::string writeWarmInput(int T, int A) {
   std::vector<float> aat((size_t)T * K, 0.f), pos((size_t)A * 3), ones(A, 1.f), zA(A, 0.f), zT(T, 0.f);
   for (int t = 0; t < T; ++t) aat[(size_t)t * K + 2] = 1.f;
   for (int a = 0; a < A; ++a) { pos[a * 3] = 1.5f * (a % 7); pos[a * 3 + 1] = 1.1f * (a % 5); pos[a * 3 + 2] = 0.9f * (a % 3); }
-  flts("aatype", aat); flts("profile", std::vector<float>((size_t)T * K, 0.f)); flts("deletion_mean", zT);
+  flts("aatype", aat); flts("profile", aat); flts("deletion_mean", zT);
+  ints("msa/rows", restype); flts("msa/deletion", zT);     // a one-row alignment: the query
   flts("token_bonds", std::vector<float>((size_t)T * T, 0.f));
   flts("ref_pos", pos); flts("ref_charge", zA); flts("atom_mask", ones);
   ints("ref_element", el); ints("ref_atom_name_chars", names); ints("ref_space_uid", uid); ints("atom_to_token", a2t);
@@ -54,7 +56,7 @@ static std::string writeWarmInput(int T, int A) {
   for (int t = 0; t < T; ++t) t2r[t] = t + 1;
   ints("lm/ids", lm); ints("lm/sequence_id", lmSeq); ints("lm/token_to_row", t2r);
   idx += "m meta/tokens " + std::to_string(T) + "\nm meta/atoms " + std::to_string(A) + "\nm meta/lm_rows " +
-         std::to_string(T + 2) + "\nm meta/classes " + std::to_string(K) + "\n";
+         std::to_string(T + 2) + "\nm meta/classes " + std::to_string(K) + "\nm meta/msa_depth 1\n";
   fclose(bin);
   FILE* f = fopen((dir + "/model.idx").c_str(), "w"); fputs(idx.c_str(), f); fclose(f);
   return dir;
@@ -143,6 +145,10 @@ static int foldInput(const Opts& o, bool warm) {
     }
     checkOracle("lm pair", lmZ, (size_t)T * T * e.pair, "o/lm_z");
   }
+  if (getenv("EF2_SAVE_LMZ") && lmZ && !warm) {   // the language model's pair, raw float32 [T, T, P] (a comparison aid)
+    auto h = download(lmZ, (size_t)T * T * e.pair); FILE* f = fopen(getenv("EF2_SAVE_LMZ"), "wb");
+    fwrite(h.data(), 4, h.size(), f); fclose(f);
+  }
   int A = (int)M.meta("meta/atoms"), Si = (int)M.meta("meta/singleInputs");
   float* sInputs = dalloc((size_t)T * Si);
   t0 = std::chrono::steady_clock::now();
@@ -170,6 +176,23 @@ static int foldInput(const Opts& o, bool warm) {
   } else {
     zi = dalloc((size_t)T * T * C);
     zInit(T, C, sInputs, Si, parcae ? nullptr : lmZ, zi, check);
+    if (hasMsaEncoder()) {            // the full ESMFold2: the alignment's encoder over z_init, which it replaces
+      auto m0 = std::chrono::steady_clock::now();
+      if (getenv("EF2_SAVE_ZINIT") && !warm) {       // (comparison aids: the encoder's two inputs, raw float32)
+        auto h = download(zi, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_ZINIT"), "wb");
+        fwrite(h.data(), 4, h.size(), f); fclose(f);
+        auto s = download(sInputs, (size_t)T * Si); f = fopen((std::string(getenv("EF2_SAVE_ZINIT")) + ".s").c_str(), "wb");
+        fwrite(s.data(), 4, s.size(), f); fclose(f);
+      }
+      msaEncode(zi, sInputs, T, C, Si, seed);
+      CK(cudaStreamSynchronize(STREAM));
+      say("msa encoder %.1f ms (%d rows)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m0).count(),
+          std::min((int)M.meta("meta/msa_depth"), (int)M.meta("meta/msaMaxDepth")));
+      if (getenv("EF2_SAVE_INJECT") && !warm) {      // (a comparison aid: the encoder's pair, raw float32)
+        auto h = download(zi, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_INJECT"), "wb");
+        fwrite(h.data(), 4, h.size(), f); fclose(f);
+      }
+    }
     if (!parcae) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
   }
   // a large input gives each phase the whole card: its predecessor's scratch released (a pair over
@@ -181,8 +204,12 @@ static int foldInput(const Opts& o, bool warm) {
   std::string profStage = getenv("EF2_PROFILE") ? getenv("EF2_PROFILE") : "trunk";
   bool profTrunk = profile && profStage == "trunk";
   if (profTrunk) { prof::init(); prof::start(); }
-  foldingTrunk(T, C, zi, z, M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4, check, lmZ, seed);
+  foldingTrunk(T, C, zi, z, getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4, check, lmZ, seed);
   if (lmZ) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
+  if (getenv("EF2_SAVE_PAIR") && !warm) {         // the trunk's final pair, raw float32 [T, T, C] (a comparison aid)
+    auto h = download(z, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_PAIR"), "wb");
+    fwrite(h.data(), 4, h.size(), f); fclose(f);
+  }
   if (profTrunk) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   CK(cudaStreamSynchronize(STREAM));
   say("trunk %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());

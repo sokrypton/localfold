@@ -13,7 +13,12 @@ inline bool GEMM16 = false;
 // "f/<bundle name>" (the folding bundle) or "c/<bundle name>" (ESM-C); dims from "#k"
 inline size_t dimOf(const std::string& key, int k) { return (size_t)M.meta(key + "#" + std::to_string(k)); }
 inline const float* F(const std::string& name) { return W("f/" + name); }
-inline const float* Cw(const std::string& name) { return W("c/" + name); }
+// the shim ("lm/...") is per folding model and the tower is shared: a folding bundle that carries its own
+// shim is read first (the full ESMFold2's differs from ESMFold2-Fast's in all twelve tensors)
+inline std::string shimKey(const std::string& name) {
+  return !name.rfind("lm/", 0) && M.has("f/" + name) ? "f/" + name : "c/" + name;
+}
+inline const float* Cw(const std::string& name) { return W(shimKey(name)); }
 
 // ---------------------------------------------------------------- GEMM, row-major
 // Y[rows, out] = X[rows, in] Wt[in, out] (+ beta Y); f32 accumulate (TF32 only under --fast)

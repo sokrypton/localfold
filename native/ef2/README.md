@@ -64,6 +64,59 @@ python3 tools/export_esmfold2_trunk.py --esmfold2 esmfold2-fast-600m --out model
 
 `ef2` refuses weights without a head, as the page does.
 
+## The released models: ESMFold2-Fast and ESMFold2
+
+The same binary folds biohub's two released checkpoints, which the page does not ship (their tower is ESM-C 6B):
+
+```
+native/ef2/fold 6mrr.pdb --model=esmfold2-fast --sequence=GWSTELEKHREEL...
+native/ef2/fold 6mrr.pdb --model=esmfold2 --sequence=GWSTELEKHREEL... --a3m=<one A3M per protein chain>
+```
+
+What they add over the experimental tier:
+- the parcae recycle. z starts as truncated-normal noise. Each of four passes refines a dropped-out copy of the
+  language model's pair (p 0.25, at inference too) through a 4-block lm_encoder, injects it into a per-channel
+  decay of z, and runs the trunk. Then a readout and a 2-block coda.
+- ESM-C 6B, kept resident as af3-any-model's int8 codes (6.4 GB) and expanded a layer at a time.
+- AF3's 64-bin distogram, its sampler constants (14 steps clipped at sigma 256), and a PAE LayerNorm in the
+  confidence head.
+- the alignment's profile and mean deletion in s_inputs (`msaFeatures` in the bundle). With no alignment, the
+  profile is one row of the query, as biohub's builder makes it. The experimental tier zeroes both
+  (`disable_msa_features`), and its bundles predate the field.
+- ESMFold2 only: 48 trunk blocks, and an MSA encoder (4 blocks, 128 channels) over z_init whose output replaces
+  the injection. Each block is an outer product mean, `Wout(outer) / max(pair count, 1)` with the bias divided
+  too; then, except on the last block, a pair-weighted averaging and a SwiGLU transition; then the pair-only
+  block. Neither its inputs nor z_init change between passes, so it runs once a fold (src/msa.cuh).
+
+The alignment follows biohub's `esm` builder (prepare_input.py, paired_msa.py):
+- a protein chain's rows come from its A3M, or from its sequence alone;
+- any other token gets its residue type in row 0 and a gap below;
+- the deletion value is `(pi / 2) atan(d / 3)`, the vendor's transform (af3-any-model uses AF3's `2 / pi`);
+- past 1,024 rows it is subsampled, keeping the query and the A3M's order;
+- 10% of the non-query columns are masked, drawn from the seed, as the vendor does at inference.
+
+Rows of different chains are stacked unpaired: the vendor's taxonomy pairing is not done here.
+`EF2_DETERMINISTIC=1` turns off every random draw (z noise, LM dropout, column mask, subsample).
+
+The bundles come from the old-format checkpoints (biohub/ESMFold2-Fast at c6c7958d63, biohub/ESMFold2 at
+8fc3ff4710: the ones carrying `parcae_*` names). Each folding bundle carries its own language-model shim, because
+the two checkpoints' shims differ in all twelve tensors. The tower is shared.
+
+```
+python3 tools/export_esmfold2_trunk.py --esmfold2 <ESMFold2 dir> --confidence <ESMFold2 dir>/model.safetensors \
+    --out model-esmfold2-f32                                     # 894 MiB; model-esmfold2-fast-f32 is 719
+python3 tools/export_esmc6b.py --tower <af3-any-model's esmc.unpacked> --esmfold2 <either dir> --out model-esmc-6b-int8
+```
+
+Measured against references:
+- ESMFold2, two passes against af3-any-model's `esmfold2` (float32, dropout off, `EF2_DETERMINISTIC=1`): the
+  trunk's pair agrees to relRMS **1.89e-3**, the same as ESMFold2-Fast's 1.7e-3.
+- The MSA encoder at 256 rows of a real alignment, against biohub's own `MSAEncoder` fed native's z_init and
+  s_inputs: **3.5e-7**. The rows and deletions are identical to the vendor's `construct_paired_msa`.
+- 5CAJ from its sequence: **1.97 Å**, pLDDT 97.4 (ESMFold2-Fast 1.69-1.91, 92.3).
+- Warm on the A100, the encoder costs 19 ms at 261 tokens with one row and 44 ms with 1,024 rows, against a
+  470 ms trunk.
+
 ## Exactness
 
 `oracle.py` runs biohub's forward on the CPU in float32, with its own ESM-C (biohub/ESMC-600M-1500000)

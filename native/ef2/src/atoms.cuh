@@ -248,7 +248,7 @@ __global__ void tailInputsK(const float* aatype, const float* profile, const flo
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)T * (2 * K + 1)) return;
   int token = (int)(t / (2 * K + 1)), f = (int)(t % (2 * K + 1));
-  float v = f < K ? aatype[token * K + f] : f < 2 * K ? profile[token * K + f - K] : delMean[token];
+  float v = f < K ? aatype[token * K + f] : !profile ? 0.f : f < 2 * K ? profile[token * K + f - K] : delMean[token];
   out[(size_t)token * ld + C + f] = v;
 }
 
@@ -315,7 +315,11 @@ inline void inputsEmbedder(int T, int A, float* sInputs, int sWidth, bool check 
   gemm(x, F("atom/toToken"), tok, A, C, Ct);
   reluK<<<blocks((size_t)A * Ct), 256, 0, STREAM>>>(tok, (size_t)A * Ct);
   scatterMeanK<<<blocks((size_t)T * Ct), 256, 0, STREAM>>>(tok, at.ctx.tokenStart, at.ctx.tokenAtoms, at.ctx.mask, sInputs, T, Ct, sWidth);
-  tailInputsK<<<blocks((size_t)T * (2 * K + 1)), 256, 0, STREAM>>>(W("aatype"), W("profile"), W("deletion_mean"), sInputs,
+  // the alignment's profile and mean deletion only where the checkpoint reads them: the released models do; the
+  // experimental tier (disable_msa_features) zeroes both, and its bundles predate the field
+  const bool msaFeatures = M.has("meta/msaFeatures") && M.meta("meta/msaFeatures") > 0;
+  tailInputsK<<<blocks((size_t)T * (2 * K + 1)), 256, 0, STREAM>>>(W("aatype"), msaFeatures ? W("profile") : nullptr,
+                                                                 msaFeatures ? W("deletion_mean") : nullptr, sInputs,
                                                                  T, Ct, K, sWidth);
   freeAtoms(at);
 }

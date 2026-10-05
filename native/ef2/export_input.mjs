@@ -99,7 +99,66 @@ int("res_type", f.residueType); int("input_ids", f.inputIds);
   entries.push(["m", "meta/contactBinsFor", bins]);
 }
 int("distogram_atom_idx", representativeAtoms(f, T));
-flt("aatype", f.aatype); flt("profile", f.profile); flt("deletion_mean", f.deletionMean);
+// The alignment, as biohub's esm builds it (esm/models/esmfold2/prepare_input.py, paired_msa.py): a protein
+// chain's rows from its A3M (--a3m=<path>[,<path>...], one per protein chain in order, empty for none) or
+// its sequence alone; any other token its residue type in row 0 and a gap below. Rows past the query are
+// stacked chain beside chain UNPAIRED (the vendor also pairs rows across chains by the taxonomy in their
+// headers, which is not done here). Residue codes are ESMFold2's: the twenty at 2-21 in three-letter
+// order, the gap 1, anything else 22. Its profile - the one-hot mean over rows - and its mean deletion
+// value, (pi / 2) atan(d / 3) (the vendor's transform, where AF3's is 2 / pi), are the s_inputs columns
+// both released models read; the full ESMFold2's MSA encoder reads the rows.
+{
+  const GAP = 1, UNK = 22, LETTERS = "ARNDCQEGHILKMFPSTWYV";
+  const code = (ch) => ch === "-" ? GAP : LETTERS.includes(ch) ? LETTERS.indexOf(ch) + 2 : UNK;
+  const parseA3m = (text) => {
+    const rows = [], dels = [];
+    for (const record of text.split(/^>/m).slice(1)) {
+      const seq = record.split("\n").slice(1).join("").replace(/\s/g, "");
+      const r = [], d = []; let ins = 0;
+      for (const ch of seq) {
+        if (ch === "." || (ch >= "a" && ch <= "z")) { ins += 1; continue; }
+        r.push(code(ch.toUpperCase())); d.push(ins); ins = 0;
+      }
+      rows.push(r); dels.push(d);
+    }
+    return { rows, dels };
+  };
+  const chainSeqs = sequence.split(":");
+  const chainKinds = kinds === "" ? chainSeqs.map(() => "protein") : kinds.split(",");
+  const a3ms = option("a3m", "").split(",");
+  const firstToken = new Map();
+  for (let t = 0; t < T; t += 1) if (!firstToken.has(f.asymId[t])) firstToken.set(f.asymId[t], t);
+  const asyms = [...firstToken.keys()];
+  const chainMsa = new Map();
+  let proteinAt = 0;
+  for (let c = 0; c < chainSeqs.length; c += 1) {
+    if (chainKinds[c] !== "protein") continue;
+    const path = a3ms[proteinAt++] ?? "";
+    const msa = path !== "" ? parseA3m(readFileSync(path, "utf8"))
+      : { rows: [[...chainSeqs[c]].map(code)], dels: [new Array(chainSeqs[c].length).fill(0)] };
+    chainMsa.set(asyms[c], msa);
+  }
+  const depth = Math.min(16384, Math.max(1, ...[...chainMsa.values()].map((m) => m.rows.length)));
+  const rows = new Int32Array(depth * T).fill(GAP), dels = new Float32Array(depth * T);
+  for (let t = 0; t < T; t += 1) {
+    const msa = chainMsa.get(f.asymId[t]);
+    if (!msa) { rows[t] = f.residueType[t]; continue; }
+    const width = msa.rows[0].length;
+    const col = Math.min(f.residueIndex[t] - f.residueIndex[firstToken.get(f.asymId[t])], width - 1);
+    for (let r = 0; r < Math.min(depth, msa.rows.length); r += 1) {
+      rows[r * T + t] = msa.rows[r][col]; dels[r * T + t] = msa.dels[r][col];
+    }
+  }
+  const profile = new Float32Array(T * 33), deletionMean = new Float32Array(T);
+  for (let r = 0; r < depth; r += 1) for (let t = 0; t < T; t += 1) {
+    profile[t * 33 + rows[r * T + t]] += 1 / depth;
+    deletionMean[t] += (Math.PI / 2) * Math.atan(dels[r * T + t] / 3) / depth;
+  }
+  int("msa/rows", rows); flt("msa/deletion", dels);
+  entries.push(["m", "meta/msa_depth", depth]);
+  flt("profile", profile); flt("deletion_mean", deletionMean);
+}
+flt("aatype", f.aatype);
 flt("token_bonds", f.tokenBonds);
 flt("ref_pos", f.refPos); flt("ref_charge", f.refCharge); flt("atom_mask", f.mask);
 int("ref_element", f.refElement); int("ref_atom_name_chars", f.refAtomNameChars);

@@ -181,8 +181,8 @@ inline void languageModel(const Esmc& e, const int* ids, const int* seq, const i
   float* x = scratch<float>("esmc.x", R * C);
   embedK<<<blocks(R * C), 256, 0, STREAM>>>(ids, Cw("embed/weights"), x, (int)R, C);
   // the mix weights, a constant
-  std::vector<float> mix(M.len("c/lm/combine"));
-  { const float* cmb = M.f("c/lm/combine"); float mx = -INFINITY, s = 0;
+  std::vector<float> mix(M.len(shimKey("lm/combine")));
+  { const float* cmb = M.f(shimKey("lm/combine")); float mx = -INFINITY, s = 0;
     for (size_t i = 0; i < mix.size(); ++i) mx = std::max(mx, cmb[i]);
     for (size_t i = 0; i < mix.size(); ++i) { mix[i] = expf(cmb[i] - mx); s += mix[i]; }
     for (auto& m : mix) m /= s; }

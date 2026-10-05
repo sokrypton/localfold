@@ -3,6 +3,10 @@
 #
 #   native/ef2/fold <out.pdb> --sequence=<SEQ>[:<SEQ>...] [-- <ef2 flags>]
 #   native/ef2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
+#   native/ef2/fold 6mrr.pdb --model=esmfold2 --sequence=GWSTELEKHREEL... [--a3m=<path>[,<path>...]]
+#
+# --model=esmfold2-fast-600m (the default: the experimental tier the page ships), or one of the released models,
+# esmfold2-fast and esmfold2 (with its MSA encoder), from their local bundles (see README.md, "The released models").
 #
 # The weights are exported once (native/ef2/export_weights.mjs, from the float32 bundles on disk:
 # model-esmfold2-trunk-f32 and model-esmc-600m-f32) into native/ef2/weights; the input goes through the
@@ -14,19 +18,29 @@ gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noh
 here="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 1 ] || { sed -n '2,9p' "$0"; exit 1; }
 out="$1"; shift
-inputs=(); flags=()
+inputs=(); flags=(); model=esmfold2-fast-600m
 while [ $# -gt 0 ]; do
   if [ "$1" = "--" ]; then shift; flags=("$@"); break; fi
-  inputs+=("$1"); shift
+  case "$1" in --model=*) model="${1#--model=}" ;; *) inputs+=("$1") ;; esac; shift
 done
 if [ ! -x "$here/ef2" ]; then
   (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread src/ef2.cu -lcublas -lcublasLt -lcupti -o ef2)
 fi
 # the weights: the published bundles (int5 trunk, int3 ESM-C), read as they are; fetched once
 repo="$(cd "$here/../.." && pwd)"
-[ -f "$repo/model-esmfold2-int5/manifest.json" ] && [ -f "$repo/model-esmc-600m-int3/manifest.json" ] ||
-  python3 "$repo/native/fetch_bundles.py" ef2-fast-600m esmc
-wflags=(--fold-bundle="$repo/model-esmfold2-int5" --esmc-bundle="$repo/model-esmc-600m-int3")
+case "$model" in
+  esmfold2-fast-600m)
+    [ -f "$repo/model-esmfold2-int5/manifest.json" ] && [ -f "$repo/model-esmc-600m-int3/manifest.json" ] ||
+      python3 "$repo/native/fetch_bundles.py" ef2-fast-600m esmc
+    fold_bundle="$repo/model-esmfold2-int5"; esmc_bundle="$repo/model-esmc-600m-int3" ;;
+  esmfold2|esmfold2-fast)
+    fold_bundle="$repo/model-$model-f32"; esmc_bundle="$repo/model-esmc-6b-int8"
+    for b in "$fold_bundle" "$esmc_bundle"; do
+      [ -f "$b/manifest.json" ] || { echo "no $b: export it first (native/ef2/README.md, \"The released models\")" >&2; exit 1; }
+    done ;;
+  *) echo "--model=$model: esmfold2-fast-600m, esmfold2-fast or esmfold2" >&2; exit 1 ;;
+esac
+wflags=(--fold-bundle="$fold_bundle" --esmc-bundle="$esmc_bundle")
 tmp="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # ef2 warms up meanwhile on a synthetic input of about this size: tokens = residues, atoms = their heavy
 # atoms (a wrong guess warms less, it never changes the fold)
@@ -38,7 +52,7 @@ atoms=$(awk -v s="$seq" 'BEGIN { split("A5 R11 N8 D8 C6 Q9 E9 G4 H10 I8 L8 K9 M8
 warm=(); [ -z "$seq" ] || warm=(--warm="${#seq},$atoms")     # (a job's size is not known before its export)
 exec 3< <("$here/ef2" "$tmp" "${wflags[@]}" --out="$out" --wait-input --detach-output "${warm[@]}" --fast "${flags[@]}" \
           && rc=0 || rc=$?; echo "ef2: exit $rc")     # (&& || survives set -e, which would skip the echo)
-if ! node --js-float16array "$here/export_input.mjs" "$tmp" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
+if ! node --js-float16array "$here/export_input.mjs" "$tmp" "${inputs[@]}" --fold-bundle="$fold_bundle"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
 # "ef2: done" (its stdout then closes): the fold is written and ef2 is only releasing the device
 while IFS= read -r line <&3; do

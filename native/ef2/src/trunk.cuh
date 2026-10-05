@@ -120,8 +120,10 @@ inline void triangle(float* pair, const float* mask, int L, int C, const std::st
   gemm(xn, F(Tn + "gatingLinear"), g, P, C, C);
   gateMulAddK<<<blocks(P * C), 256, 0, STREAM>>>(pair, out, g, P * C);
 }
-inline void pairTransition(float* pair, int L, int C, const std::string& Tn) {
-  size_t P = (size_t)L * L; int I = (int)dimOf("f/" + Tn + "transition2", 0);
+// the SwiGLU transition over any rows (the MSA encoder's MSA track too), residual added
+inline void rowsTransition(float* x, size_t P, int C, const std::string& Tn) {
+  if (FAST) { transitionFast(x, P, C, Tn); return; }
+  float* pair = x; int I = (int)dimOf("f/" + Tn + "transition2", 0);
   float* xn = scratch<float>("tr.xn", P * C);
   layerNorm(pair, xn, P, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
   // a chunk of rows at a time: the widened rows are 2I per pair
@@ -134,6 +136,7 @@ inline void pairTransition(float* pair, int L, int C, const std::string& Tn) {
     gemm(g, F(Tn + "transition2"), pair + r0 * C, r, I, C, 1.f);
   }
 }
+inline void pairTransition(float* pair, int L, int C, const std::string& Tn) { rowsTransition(pair, (size_t)L * L, C, Tn); }
 // the 256-channel block on the fused kernels (fused256.cuh): triInK -> the f16 contraction -> triangleOutK,
 // and transitionUpK -> the second GEMM (cuBLASLt, the residual as beta)
 #include "../../af3/src/tricontract.cuh"
@@ -287,10 +290,14 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
     // projected, into a per-channel decay of z, and runs the trunk; after the last pass the readout and the
     // coda (biohub's modeling_esmfold2.py _run_one_loop and forward)
     if (!zInitP || !lmZ) { fprintf(stderr, "the parcae recycle needs z_init and the language model's pair whole\n"); exit(1); }
-    const float p = (float)M.meta("meta/lmDropout");
+    // EF2_DETERMINISTIC=1: no dropout and a zero initial state - af3-any-model's reading (its recycle starts from
+    // zeros), and with its LM_PAIR_DROPOUT set to 0 a fold the two can compare tensor for tensor
+    static const bool deterministic = getenv("EF2_DETERMINISTIC") != nullptr;
+    const float p = deterministic ? 0.f : (float)M.meta("meta/lmDropout");
     const int blocksN = (int)M.meta("meta/blocks"), lmBlocks = (int)M.meta("meta/lmEncoderBlocks"),
               codaBlocks = (int)M.meta("meta/codaBlocks");
-    truncNormalK<<<blocks(P * C), 256, 0, STREAM>>>(z, P * C, sqrtf(2.f / (5.f * C)), seed ^ 0x5eedull);
+    if (deterministic) CK(cudaMemsetAsync(z, 0, P * C * 4, STREAM));
+    else truncNormalK<<<blocks(P * C), 256, 0, STREAM>>>(z, P * C, sqrtf(2.f / (5.f * C)), seed ^ 0x5eedull);
     float* inject = scratch<float>("trunk.inject", P * C);
     size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
     float* xn = scratch<float>("trunk.xn", chunk * C); float* y = scratch<float>("trunk.y", chunk * C);
@@ -307,11 +314,18 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
       }
       for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
     }
+    auto dumpPair = [&](const char* env) {             // (comparison aids: the pair at a seam, raw float32)
+      if (!getenv(env)) return;
+      std::vector<float> h(P * C); CK(cudaMemcpy(h.data(), z, P * C * 4, cudaMemcpyDeviceToHost));
+      FILE* f = fopen(getenv(env), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
+    };
+    dumpPair("EF2_SAVE_PRE_READOUT");
     for (size_t r0 = 0; r0 < P; r0 += chunk) {          // the readout, a chunk of rows at a time, in place
       size_t r = std::min(chunk, P - r0);
       gemm(z + r0 * C, F("readout"), y, r, C, C);
       CK(cudaMemcpyAsync(z + r0 * C, y, r * C * 4, cudaMemcpyDeviceToDevice, STREAM));
     }
+    dumpPair("EF2_SAVE_PRE_CODA");
     for (int b = 0; b < codaBlocks; ++b) trunkBlock(z, mask, T, C, "coda/blocks", b);
     return;
   }
