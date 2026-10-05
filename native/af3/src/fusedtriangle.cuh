@@ -87,10 +87,19 @@ __device__ __forceinline__ int stageSw(int k, int c) {
 // projection's first half (a and b), its second (their gates), then the gating linear - so step j's
 // tile is at (j * C) * NC whichever of the three it falls in, the second half 2 C^2 on
 constexpr size_t triInTileHalves(int C) { return (size_t)5 * C * C; }
+// (the three segments in one launch: ESMFold2's trunk at 261 tokens 214.2 -> 213.05 ms against three)
+__global__ void tileTriInK(const half* __restrict__ Wpg, const half* __restrict__ Wg, int C, int NC, half* __restrict__ out) {
+  size_t e = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8, seg = (size_t)2 * C * C;
+  if (e >= (size_t)5 * C * C) return;
+  int part = e / seg < 2 ? (int)(e / seg) : 2;           // the projection's halves, then the gating linear
+  size_t f = e - part * seg;
+  int c = (int)(f % NC); size_t rest = f / NC; int k = (int)(rest % C), t = (int)(rest / C);
+  const half* src = part < 2 ? Wpg + (size_t)k * 4 * C + part * 2 * C + t * NC + c : Wg + (size_t)k * C + t * NC + c;
+  *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<const uint4*>(src);
+}
 inline void tileTriIn(const half* Wpg, const half* Wg, int C, int NC, half* out) {
-  tileColumns(Wpg, C, 4 * C, 0, 2 * C, NC, out);
-  tileColumns(Wpg, C, 4 * C, 2 * C, 2 * C, NC, out + (size_t)2 * C * C);
-  tileColumns(Wg, C, C, 0, C, NC, out + (size_t)4 * C * C);
+  size_t n8 = (size_t)5 * C * C / 8;
+  tileTriInK<<<(unsigned)((n8 + 255) / 256), 256, 0, STREAM>>>(Wpg, Wg, C, NC, out);
 }
 
 constexpr int TI_NC = 32;
