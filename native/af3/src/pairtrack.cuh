@@ -416,8 +416,26 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
-      a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
       half* t2 = scratch<half>("tri.t2whole", cs * C);
+      if (TRI_BF16) {
+        // as the 128-channel path: a, b and the product in bf16, the product half the bytes both ways
+        __nv_bfloat16* ab = scratch<__nv_bfloat16>("tri.abf", cs * C);
+        __nv_bfloat16* bb = scratch<__nv_bfloat16>("tri.bbf", cs * C);
+        __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs * C);
+        wideWidth(C, [&](auto width) {
+          constexpr int CC = decltype(width)::value, WI = 8, WO = 4;
+          static bool attr = false;
+          if (!attr) { smemAttr((triIn256K<CC, WI, __nv_bfloat16>), (int)wideTriInSmem(CC)); attr = true; }
+          triIn256K<CC, WI, __nv_bfloat16><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmem(CC), STREAM>>>(
+            pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
+            ab, bb, t2, n, np, cs);
+          triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
+          triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                                Wh(pre + ".outputProjection"), t2, pair, n, np);
+        });
+        return;
+      }
+      a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value, WI = 8, WO = 4;
         static bool attr = false;
