@@ -168,12 +168,13 @@ inline void triangle256(float* pair, const float* mask, int L, int C, const std:
 inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
   int I = (int)dimOf("f/" + Tn + "transition2", 0);
   // whole waves of transitionUpK within the same ~64 MB of widened rows (see transitionUpWaveRows)
-  size_t chunk = transitionUpChunkRows<256, 8>(std::max((size_t)128 * (256 + 8) * 2, 2 * (size_t)2 * 256 * (32 + 8) * 2),
-                                               ((size_t)64 << 20) / (2 * (size_t)I));
+  size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), ((size_t)64 << 20) / (2 * (size_t)I));
   half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
+  half* w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
+  tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     size_t r = std::min(chunk, P - r0);
-    transitionUp<8>(pair + r0 * C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), Fh(Tn + "transition1"), g, r, I);
+    transitionUp<8>(pair + r0 * C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), w1t, g, r, I);
     ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
   }
 }

@@ -195,7 +195,7 @@ inline int FUSED_WIDE_MIN_TOKENS = 80;
 // lose to the unfused path (262 tokens: trunk 2160 against 1925 ms, 3360 against 2821)
 constexpr size_t wideTriInSmem(int C) { return (size_t)128 * (C + 8) * 2; }                       // 8 warps
 constexpr size_t wideTriOutSmem(int C) { return (size_t)C * 65 * 4 + 2 * 64 * 4; }               // 4 warps
-constexpr size_t wideUpSmem(int C) { return std::max((size_t)128 * (C + 8) * 2, (size_t)2 * 2 * C * (32 + 8) * 2); }
+constexpr size_t wideUpSmem(int C) { return transitionUpSmem<256, 8>(); }   // (C is 256)
 inline bool wideFits(int C) {
   return C == 256 && fitsSmem(std::max({wideTriInSmem(C), wideTriOutSmem(C), wideUpSmem(C)}));
 }
@@ -417,6 +417,8 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
       half* t2 = scratch<half>("tri.t2whole", cs * C);
+      half* wt = scratch<half>("tri.wt256", triIn256TileHalves(C));
+      tileTriIn256(Wh(pg), Wh(pre + ".gatingLinear"), C, wt);
       if (TRI_BF16) {
         // as the 128-channel path: a, b and the product in bf16, the product half the bytes both ways
         __nv_bfloat16* ab = scratch<__nv_bfloat16>("tri.abf", cs * C);
@@ -427,8 +429,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
           static bool attr = false;
           if (!attr) { smemAttr((triIn256K<CC, WI, __nv_bfloat16>), (int)wideTriInSmem(CC)); attr = true; }
           triIn256K<CC, WI, __nv_bfloat16><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmem(CC), STREAM>>>(
-            pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
-            ab, bb, t2, n, np, cs);
+            pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs);
           triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
           triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                                 Wh(pre + ".outputProjection"), t2, pair, n, np);
@@ -444,8 +445,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
           attr = true;
         }
         triIn256K<CC, WI><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmem(CC), STREAM>>>(
-          pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
-          a, b, t2, n, np, cs);
+          pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs);
         contract();
         triangleOutRun<CC, WO>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np);
       });
@@ -526,6 +526,8 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
       // whole waves of transitionUpK inside the same budget (transitionUpChunkRows)
       size_t rowsPer = transitionUpChunkRows<256, WU>(wideUpSmem(256), std::max<size_t>(R, CHUNK / (2 * I)));
       half* gated = scratch<half>("tr.gated", std::min(rowsPer, rows) * I);
+      half* w1t = scratch<half>("tr.w1t", (size_t)2 * C * I);
+      tileTransitionUp(Wh(pre + ".transition1"), C, I, w1t);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value;
         static bool attr = false;
@@ -533,7 +535,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
         for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
           size_t r = std::min(rowsPer, rows - r0);
           transitionUpK<CC, WU><<<(unsigned)((r + R - 1) / R), 32 * WU, wideUpSmem(CC), STREAM>>>(
-            x + r0 * C, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), Wh(pre + ".transition1"), gated, r, I);
+            x + r0 * C, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), w1t, gated, r, I);
           linear<half, float>(gated, x + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
         }
       });
