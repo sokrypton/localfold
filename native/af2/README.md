@@ -109,6 +109,27 @@ On the A100, 5CAJ (261 residues, 512 + 1024 rows):
 | native `--fast` | **444 ms** | **2.02 s** |
 | af3-any-model JAX AF2 (bf16) | 637 ms | 2.55 s |
 
+**Against ColabFold 1.6.3 with its Pallas kernels** (`--use-fast-kernels`), re-measured 2026-10-05 on
+this A100: model_1_ptm, 4 passes with early stop off, no relax, exact lengths, 512:1024 alignment
+budget, warm (ColabFold's per-model `took` on a repeated length, its compile excluded; native's fold
+time after its warm-up pass, median of five). Peak is GPU memory over idle, sampled at 100 ms
+(ColabFold with `XLA_PYTHON_CLIENT_PREALLOCATE=false`; its single-sequence figure is the run's peak,
+so the 522-residue one). Harness and inputs: `/tmp/claude-1000/af2bench` (the scripts are short).
+
+| | 68 res | 261 res | 522 res | 261 + 7,907-row MSA |
+|---|---:|---:|---:|---:|
+| native AF2, now | **0.09 s** | **0.43 s** | **1.55 s** | **1.48 s** |
+| native AF2, 2026-10-03 | 0.11 s | 0.68 s | 2.67 s | 1.73 s |
+| ColabFold 1.6.3, fast kernels | 0.2 s | 1.2 s | 4.6 s | 3.2 s |
+| native's speed-up | ~2x | 2.8x | 3.0x | 2.2x |
+| peak, native | 1.2 GB | 1.6 GB | 3.0 GB | 3.3 GB |
+| peak, ColabFold | — | — | 3.2 GB | 3.3 GB |
+
+The earlier table had ColabFold's 261-residue fold at 2.1 s; it measures 1.2 s now under either
+allocator and the other three of its numbers are unchanged, so that cell was the outlier. Native
+uses the page's int5 weights with TF32/f16; ColabFold DeepMind's float32 with bf16 and its kernels;
+both fold 6MRR and 5CAJ to within 0.02 A of each other against the crystal.
+
 `fold`, sequence to PDB in a cold process: 6MRR **0.59 s** (110 ms of it the fold), and 5CAJ with
 its 7907-row alignment 2.47 s. On success `af2 --detach-output` prints `af2: done` and closes stdout,
 so `fold` returns while the driver releases the device (0.16 s). Weights are read with `pread`
