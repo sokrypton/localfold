@@ -630,6 +630,8 @@ inline void triangleBlocked2(float* pair, const float* mask, int L, int C, const
                  PH(T + "/gating_linear/weights", blk), P(T + "/gating_linear/bias", blk) };
   triangleBlockedHalf(pair, mask, L, C, w, outgoing, AF2_CHUNK);
 }
+// the triangle's whole-form buffers (both precisions'): what a pass already holds counts toward its room
+#define TRI_FAST_HELD { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf" }
 inline void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
                                    bool outgoing) {
   size_t pairs = (size_t)L * L;
@@ -637,7 +639,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   // on a card short of room, in blocks of the output, where the whole form would not fit with room to spare
   if (FAST && shortPair(pairs, C)) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
-    if (!roomFor(5 * plane * C * 2, { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out" })) {
+    if (!roomFor(5 * plane * C * 2, TRI_FAST_HELD)) {
       releaseScratch({ "ftri." });
       triangleBlocked2(pair, pairMask, L, C, T, blk, outgoing);
       return;
@@ -849,8 +851,16 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
   CK(cudaMemsetAsync(bias, 0, (size_t)H * L * stride * 2, STREAM));                // the padding columns
   const float* mask = pairOnes ? nullptr : pairMask;
   float scale = 1.f / sqrtf((float)w.D);
-  static const size_t whole = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t / 32; }();
-  if (!BIG_FORCED && pairs * 4 * Wp * 2 <= whole) {
+  // every row in one pass whenever the card has the room for its q/k/v/gate and output (what they already
+  // hold counted, so each pass decides alike) - not below a fixed 32nd of the card: at 1,566 residues
+  // 17.43 -> 16.43 s, at 2,088 35.80 -> 34.19 s (peak 7.9 -> 10.7 and 12.0 -> 17.1 GB on 40 GB); the
+  // chunked form only where the memory is not there (LOCALFOLD_BIG=1 forces it, roomFor).
+  // 🔴 The room asked for includes the triangle multiplication's whole form (five planes): these buffers
+  // stay held while it runs, and starved of them it blocks - at 2,610 residues the one-pass grid took the
+  // memory and the fold went 63.7 -> 104.4 s
+  size_t triPlane = (size_t)((L + 7) / 8 * 8) * ((L + 7) / 8 * 8);
+  if (roomFor(((pairs + 128) * 4 * Wp + pairs * Wp) * 2 + 5 * triPlane * C * 2,
+              {"fatt.qkvg", "fatt.o", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf"})) {
     half* qkvg = scratch<half>("fatt.qkvg", (pairs + 128) * 4 * Wp);
     gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr);
     half* o = scratch<half>("fatt.o", pairs * Wp);

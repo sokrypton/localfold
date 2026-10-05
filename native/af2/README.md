@@ -131,21 +131,22 @@ second copy, each length its own process):
 
 | | 1,044 res | 1,566 res | 2,088 res | 2,610 res |
 |---|---:|---:|---:|---:|
-| native AF2 | **6.4 s** | **17.5 s** | **35.9 s** | **63.7 s** |
+| native AF2 | **6.4 s** | **16.5 s** | **34.3 s** | **61.0 s** |
 | ColabFold 1.6.3, fast kernels | 19.4 s | 47.2 s | 80.7 s | 178.1 s |
-| native's speed-up | 3.0x | 2.7x | 2.2x | 2.8x |
-| peak, native | 7.2 GB | 7.7 GB | 11.7 GB | 16.7 GB |
+| native's speed-up | 3.0x | 2.9x | 2.4x | 2.9x |
+| peak, native | 7.2 GB | 10.5 GB | 16.7 GB | 24.6 GB |
 | peak, ColabFold | 5.8 GB | 9.8 GB | 14.9 GB | 22.7 GB |
 
-Native's peak at 1,044 is above ColabFold's because it spends memory the card has: two rules scale with
-the card's size. Grid attention runs in one pass while its q/k/v/gate buffer is at most a 32nd of the
-card (1.12 GB at 1,044 against a 1.25 GB cut-off on 40 GB; at 1,566 it would be 2.5 GB, so it chunks).
-Each stage's scratch is kept between stages while the pair is at most a 64th (558 MB at 1,044 against
-625 MB; 1.25 GB at 1,566 releases it). 1,044 is the longest chain under both cut-offs, so it takes every
-memory-for-speed form - which is why 1,566 peaks only 0.5 GB higher at 2.25x the pair. Every lean form
-forced (`LOCALFOLD_BIG=1`, which also turns on the costly ones such as parking the residual in host
-memory) gives 3.6 GB at 11.4 s against 7.2 GB at 6.4 s. On a smaller card the lean forms start sooner by
-themselves: on a T4's 15 GB, once the pair passes ~234 MB (~680 residues).
+Native spends memory the card has whenever that makes it faster. Grid attention runs over every row in
+one pass when the device has the room for its buffers and for the triangle multiplication's whole form
+beside them (`roomFor`, free memory at the time); it was capped at a fixed 32nd of the card, which chunked
+it from ~1,100 residues on 40 GB with 25 GB free - 17.5 / 35.9 / 63.7 s at 1,566 / 2,088 / 2,610 then,
+peaks 7.7 / 11.7 / 16.7 GB. Taken alone, without reserving the triangle's room, it starved the triangle
+into its blocked form at 2,610 and the fold went to 104 s. The rest of what native keeps or gives back
+by length (the embedder's chunks, stage scratch released past a 64th of the card) was measured at no
+time either way here, so it stays lean. Every lean form forced (`LOCALFOLD_BIG=1`, which also turns on
+the costly ones such as parking the residual in host memory) is 3.6 GB at 11.4 s at 1,044 against 7.2 GB
+at 6.4 s. On a smaller card the chunked forms come in by themselves where the memory runs out.
 
 The earlier table had ColabFold's 261-residue fold at 2.1 s; it measures 1.2 s now under either
 allocator and the other three of its numbers are unchanged, so that cell was the outlier. Native

@@ -641,12 +641,16 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       std::string qkvg = qkvgWeight(pre, C, Wd, true);
       std::string wb = paddedColumns(pre + ".pairBiasProjection", C, heads, 16);
       float scale = 1.f / sqrtf((float)D);
-      // 🔴 every row in one pass only while its q/k/v/gate are a 32nd of the card: whole is 3.3% of
-      // the trunk faster at 262 tokens and 4.8% at 1048 (465 against 481 ms, 7.82 against 8.20 s on an
-      // A100), and at 1048 it is 1.13 GB the chunks do not hold (trunk peak 12.88 against 11.73 GB) -
-      // nothing on 40 GB, the difference between fitting and not near a T4's 15
-      static const size_t gridWhole = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t / 32; }();
-      if (!BIG_FORCED && pairs * 4 * Wd * 2 <= gridWhole) {
+      // 🔴 every row in one pass whenever the card has the room for it (what its buffers already hold
+      // counted, so every pass decides alike): whole is 3.3% of the trunk faster at 262 tokens and 4.8% at
+      // 1048 (465 against 481 ms, 7.82 against 8.20 s on an A100) for 1.13 GB the chunks do not hold - it
+      // was capped at a fixed 32nd of the card, which chunked from ~1,100 tokens on 40 GB with 25 GB free.
+      // The chunks only where the memory is short (LOCALFOLD_BIG=1 forces them, roomFor)
+      // (the room asked for includes the triangle multiplication's whole form, five planes, which these
+      // buffers would otherwise starve into its blocked form - see native/af2's twin)
+      size_t triPlane = (size_t)((n + 7) / 8 * 8) * ((n + 7) / 8 * 8);
+      if (roomFor(((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + 5 * triPlane * C * 2,
+                  {"grid.qkvg", "grid.gathered", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole"})) {
         // every row in one pass (this card has the memory): the bias written by the same kernel
         CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // the padding columns
         half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);
