@@ -798,11 +798,89 @@ inline void triangleAttentionChunked(float* pair, const float* pairMask, int L, 
     }
   }
 }
+// [C][H] f32 -> [C][16] f16, zero columns past H (gridInK's bias projection reads 16)
+__global__ void padHeadsK(const float* w, half* out, int C, int H) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= C * 16) return;
+  int k = t / 16, c = t % 16;
+  out[t] = __float2half(c < H ? w[k * H + c] : 0.f);
+}
+inline bool FUSED_GRID_AF2 = !getenv("LOCALFOLD_AF2_UNFUSED_GRID");
+// The triangle attention on native/af3's fused grid kernels: LN + q/k/v/gate (+ the gate bias) + the pair
+// bias projection in one kernel reading the ending node's rows transposed where they lie, the flash
+// kernel, and the output projection (+ its bias) added into the pair - transposed in place for the ending
+// node, so no gather, no scatter and no LN'd copy of the pair. One pass where the q/k/v/gate are a 32nd of
+// the card (the bias written by the same kernel); else the bias first (LN + projection, chunked), then the
+// rows a chunk at a time.
+inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int C, const std::string& A, int blk,
+                                  bool starting, bool pairOnes) {
+  size_t pairs = (size_t)L * L;
+  AttnW w = attnWeights(A + "/attention", blk, C);
+  int H = w.H, Wp = H * w.Dp, stride = (L + 7) / 8 * 8;
+  const bool tr = !starting;
+  const float *lnS = P(A + "/query_norm/scale", blk), *lnO = P(A + "/query_norm/offset", blk);
+  const float* ob = P(A + "/attention/output_b", blk);
+  static std::map<const float*, half*> wbCache;
+  const float* wf = P(A + "/feat_2d_weights", blk);
+  auto it = wbCache.find(wf);
+  if (it == wbCache.end()) {
+    half* h = wpool<half>((size_t)C * 16);
+    padHeadsK<<<blocks((size_t)C * 16), 256, 0, STREAM>>>(wf, h, C, H);
+    it = wbCache.emplace(wf, h).first;
+  }
+  const half* Wb = it->second;
+  half* bias = scratch<half>("fbias.bias", (size_t)H * L * stride);
+  CK(cudaMemsetAsync(bias, 0, (size_t)H * L * stride * 2, STREAM));                // the padding columns
+  const float* mask = pairOnes ? nullptr : pairMask;
+  float scale = 1.f / sqrtf((float)w.D);
+  static const size_t whole = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t / 32; }();
+  if (!BIG_FORCED && pairs * 4 * Wp * 2 <= whole) {
+    half* qkvg = scratch<half>("fatt.qkvg", (pairs + 128) * 4 * Wp);
+    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr);
+    half* o = scratch<half>("fatt.o", pairs * Wp);
+    flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, 0, L, tr, scale);
+    if (!tr) ltGemm(o, w.out, pair, false, pairs, Wp, C, ob, false, 1.f);
+    else gridOutRaw(o, w.out, ob, pair, L, 0, pairs, tr);
+    return;
+  }
+  {   // the bias, all of it before any row is attended (and before any is written)
+    size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / C));
+    half* lnc = scratch<half>("ftatt.lnc", per * C);
+    float* projc = scratch<float>("fbias.projc", per * H);
+    static std::map<const float*, half*> whCache;
+    auto wh = whCache.find(wf);
+    if (wh == whCache.end()) {
+      half* h = wpool<half>((size_t)C * H);
+      toHalfK<<<blocks((size_t)C * H), 256, 0, STREAM>>>(wf, h, (size_t)C * H);
+      wh = whCache.emplace(wf, h).first;
+    }
+    for (size_t r0 = 0; r0 < pairs; r0 += per) {
+      size_t r = std::min(per, pairs - r0);
+      layerNormH(pair + r0 * C, lnc, r, C, A + "/query_norm", blk);
+      ltGemm(lnc, wh->second, projc, false, r, C, H, nullptr, false, 0.f);
+      biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(projc, bias, L, H, stride, tr, r0, r);
+    }
+  }
+  size_t R = std::max<size_t>(1, std::min<size_t>(L, AF2_CHUNK / ((size_t)L * 4 * Wp)));
+  half* qkvg = scratch<half>("fatt.qkvg", (R * L + 128) * 4 * Wp);
+  half* o = scratch<half>("fatt.o", R * L * Wp);
+  for (size_t b0 = 0; b0 < (size_t)L; b0 += R) {
+    size_t bc = std::min(R, (size_t)L - b0), rows = bc * L;
+    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, b0 * L, rows, tr);
+    flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, b0, bc, tr, scale);
+    if (!tr) ltGemm(o, w.out, pair + b0 * L * C, false, rows, Wp, C, ob, false, 1.f);
+    else gridOutRaw(o, w.out, ob, pair, L, b0 * L, rows, tr);
+  }
+}
 inline void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
                               bool starting, bool pairOnes = false) {
   size_t pairs = (size_t)L * L;
   std::string A = S + (starting ? "triangle_attention_starting_node" : "triangle_attention_ending_node");
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3);
+  if (FAST && FUSED_GRID_AF2 && C == 128 && H * (D < 16 ? 16 : D) == 128 && H <= 16 && gridFusedFits()) {
+    triangleAttentionGrid(pair, pairMask, L, C, A, blk, starting, pairOnes);
+    return;
+  }
   if (FAST && shortPair(pairs, C)) { triangleAttentionChunked(pair, pairMask, L, C, A, blk, starting, pairOnes); return; }
   if (FAST && pairOnes && !starting) {
     half* xn = scratch<half>("ftatt.xn", pairs * C);
