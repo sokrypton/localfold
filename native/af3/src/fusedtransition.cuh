@@ -28,10 +28,19 @@ __device__ __forceinline__ int w2Sw(int k, int c) {
 // (RELU: the one half). From W1 itself each 16-byte piece of a stage was a row from its neighbour's,
 // and a cp.async write takes a shared wavefront per global row: 50% of the kernel's shared wavefronts
 // were excess, nearly all of them those writes (Nsight Compute, AF3 at 1,044 tokens)
+// Made once a weight and kept (128-256 KB each): tiled per call it was two launches a transition, 1.2 ms
+// of a 68-token AF3 fold's 117. Forgotten with the derived weights (FORGET_HOOKS), which rebuild W1 itself.
 template <bool RELU>
-inline void tileTransitionW1(const half* W1, int C, int I, int NC, half* out) {
+inline const half* transitionW1Tiles(const half* W1, int C, int I, int NC) {
+  static std::map<std::pair<const half*, int>, half*> tiles;
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : tiles) CK(cudaFree(p)); tiles.clear(); }); hooked = true; }
+  auto it = tiles.find({W1, NC});
+  if (it != tiles.end()) return it->second;
+  half* out = dallocT<half>((size_t)C * I * (RELU ? 1 : 2));
   if constexpr (RELU) tileColumns(W1, C, I, 0, I, NC, out);
   else { tileColumns(W1, C, 2 * I, 0, I, NC, out); tileColumns(W1, C, 2 * I, I, I, NC, out + (size_t)C * I); }
+  return tiles[{W1, NC}] = out;
 }
 
 // RELU: AlphaFold 2's transition - x += ReLU(LN(x) W1 + b1) W2 + b2, W1 [C][I] (one half, not SwiGLU's two);
@@ -167,8 +176,7 @@ void fusedTransitionAt(float* x, size_t rows, int I, const float* lnScale, const
   size_t smem = (size_t)R * (128 + 8) * 2 + 2 * ftStage<128, NC>();
   static bool attr = false;
   if (!attr) { smemAttr((fusedTransitionK<128, WARPS, RELU, MT, NC>), (int)smem); attr = true; }
-  half* w1t = scratch<half>("ft.w1t", (size_t)128 * I * (RELU ? 1 : 2));
-  tileTransitionW1<RELU>(W1, 128, I, NC, w1t);
+  const half* w1t = transitionW1Tiles<RELU>(W1, 128, I, NC);
   fusedTransitionK<128, WARPS, RELU, MT, NC><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
     x, lnScale, lnOffset, w1t, W2, rows, I, b1, b2);
 }
