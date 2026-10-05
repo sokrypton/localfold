@@ -766,7 +766,11 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 // It runs as 2 warps x 2 grid rows a block (RR 2): 64-query tiles pad a row less than 128-query ones (1,044
 // queries are 1,088 against 1,152) while the two rows share the bias tile, so K/V and bias traffic stay the
 // 4-warp form's - 6.27 -> 5.87 ms at 1,044 tokens, 0.251 -> 0.215 at 300, level at 500 (512 either way);
-// bit-identical to RR 1.
+// bit-identical to RR 1. Software-pipelining the loop (tile t+1's Q K^T beside tile t's softmax and P V,
+// three stages of shared memory) was measured and is slower: bit-identical, but 6.29 -> 6.79 ms at 1,044
+// tokens with 32-key tiles (the occupancy the 48-key form keeps with two stages), and 5.77 -> 7.58 at 48
+// keys where the third stage costs a block an SM - three warps a scheduler already overlap one warp's
+// softmax with another's MMAs.
 inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
