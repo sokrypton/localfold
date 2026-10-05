@@ -752,10 +752,26 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
     for (int et = 0; et < D / 8; ++et) {
       int e = et * 8 + tig * 2;
       float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
-      if (live && i0 < n) *reinterpret_cast<half2*>(out + (rl * n + i0) * Wd + h * D + e) =
+      // staged in the warp's own slice of the (now idle) stage memory, written below as whole rows
+      half* Ys = (half*)smem + (size_t)(threadIdx.x >> 5) * (16 * MT) * (D + 8);
+      *reinterpret_cast<half2*>(Ys + (mt * 16 + g) * (D + 8) + e) =
           __floats2half2_rn(o[mt][et][0] / l0 * sigm(a.x), o[mt][et][1] / l0 * sigm(a.y));
-      if (live && i1 < n) *reinterpret_cast<half2*>(out + (rl * n + i1) * Wd + h * D + e) =
+      *reinterpret_cast<half2*>(Ys + (mt * 16 + g + 8) * (D + 8) + e) =
           __floats2half2_rn(o[mt][et][2] / l1 * sigm(b2.x), o[mt][et][3] / l1 * sigm(b2.y));
+    }
+  }
+  // the warp's 16 MT rows of this head, 2 D bytes each, as 16-byte stores (D / 8 lanes a row) rather than
+  // 4 bytes in each of 8 rows; every warp is past the loop's last barrier, so the stages are free
+  static_assert((size_t)WARPS * RR * 16 * MT * (D + 8) * 2 <= 2 * STAGE, "the output staging fits in the stages");
+  __syncwarp();
+  {
+    const half* Ys = (const half*)smem + (size_t)(threadIdx.x >> 5) * (16 * MT) * (D + 8);
+    constexpr int PER = D / 8, ROWS_AT = 32 / PER;
+#pragma unroll
+    for (int r0 = 0; r0 < 16 * MT; r0 += ROWS_AT) {
+      int r = r0 + lane / PER, c = (lane % PER) * 8;
+      int i = q0 + warp * 16 * MT + r;
+      if (live && i < n) *reinterpret_cast<uint4*>(out + (rl * n + i) * Wd + h * D + c) = *reinterpret_cast<const uint4*>(Ys + r * (D + 8) + c);
     }
   }
 }

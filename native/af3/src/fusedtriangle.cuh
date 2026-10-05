@@ -146,13 +146,25 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
       }
     }
     if (gating) {                       // t2, row-major: columns (j - C/16)*32 + nt*8 + 2 tig
+      // through the warp's own rows of Xs (no other warp touches them in the gating steps - a and b's
+      // staging is idle - and the last a/b step ended at a barrier): 16-byte stores of whole 64-byte row
+      // pieces, not 4 bytes in each of 8 rows: 787 -> 729 ms over a 1,044-token fold, 59.7 -> 55.3 at 261
       int c0 = (j - C / 16) * TI_NC;
+      half* Ys = Xs + warp * 16 * LDX;
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
-        int c = c0 + nt * 8 + tig * 2;
-        if (row0 + lr0 < pp) *reinterpret_cast<half2*>(t2 + (row0 + lr0) * C + c) = __floats2half2_rn(p[nt][0], p[nt][1]);
-        if (row0 + lr1 < pp) *reinterpret_cast<half2*>(t2 + (row0 + lr1) * C + c) = __floats2half2_rn(p[nt][2], p[nt][3]);
+        int c = nt * 8 + tig * 2;
+        *reinterpret_cast<half2*>(Ys + g * LDX + c) = __floats2half2_rn(p[nt][0], p[nt][1]);
+        *reinterpret_cast<half2*>(Ys + (g + 8) * LDX + c) = __floats2half2_rn(p[nt][2], p[nt][3]);
       }
+      __syncwarp();
+#pragma unroll
+      for (int i = 0; i < 16 * (TI_NC / 8) / 32; ++i) {
+        int r = i * (32 / (TI_NC / 8)) + lane / (TI_NC / 8), c = (lane % (TI_NC / 8)) * 8;
+        size_t row = row0 + warp * 16 + r;
+        if (row < pp) *reinterpret_cast<uint4*>(t2 + row * C + c0 + c) = *reinterpret_cast<const uint4*>(Ys + r * LDX + c);
+      }
+      __syncwarp();
     } else {
       // column 2ch is a's channel ch, 2ch+1 b's (the interleaved split): this thread's column pair
       // nt*8 + 2 tig is channel nt*4 + tig of the step's 16; staged channel-major
@@ -590,12 +602,24 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
         mma16816(acc[2 * n2], xa[ks], f[0], f[1]); mma16816(acc[2 * n2 + 1], xa[ks], f[2], f[3]);
       }
     }
+    // through the warp's own rows of Xs (dead once they are A fragments; no other warp reads them) so a
+    // store is 16 bytes a lane, whole 128-byte rows, rather than 4 bytes in each of 8 rows: 781 -> 595 ms
+    // over a 1,044-token fold's 424 calls, 59.1 -> 44.8 at 261, the fold byte-identical
+    half* Ys = Xs + warp * 16 * LDX;
 #pragma unroll
     for (int nt = 0; nt < NC / 8; ++nt) {
-      int c = j * NC + nt * 8 + tig * 2;
-      if (r0 < rows) *reinterpret_cast<half2*>(out + r0 * NQ + c) = __floats2half2_rn(acc[nt][0], acc[nt][1]);
-      if (r1 < rows) *reinterpret_cast<half2*>(out + r1 * NQ + c) = __floats2half2_rn(acc[nt][2], acc[nt][3]);
+      int c = nt * 8 + tig * 2;
+      *reinterpret_cast<half2*>(Ys + g * LDX + c) = __floats2half2_rn(acc[nt][0], acc[nt][1]);
+      *reinterpret_cast<half2*>(Ys + (g + 8) * LDX + c) = __floats2half2_rn(acc[nt][2], acc[nt][3]);
     }
+    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < 16 * (NC / 8) / 32; ++i) {
+      int r = i * (32 / (NC / 8)) + lane / (NC / 8), c = (lane % (NC / 8)) * 8;
+      size_t row = row0 + warp * 16 + r;
+      if (row < rows) *reinterpret_cast<uint4*>(out + row * NQ + j * NC + c) = *reinterpret_cast<const uint4*>(Ys + r * LDX + c);
+    }
+    __syncwarp();
     __syncthreads();
   }
   if (bias) {
