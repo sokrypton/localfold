@@ -317,11 +317,11 @@ __global__ void pairBiasK(const float* proj, const float* pairMask, float* bias,
 
 // the bias from pair rows [r0, r0 + cnt) (biasFromProjK over a chunk)
 __global__ void biasFromProjRowsK(const float* proj, half* out, int L, int H, int stride, bool transposed, size_t r0,
-                                  size_t cnt, const float* pairMask = nullptr) {
+                                  size_t cnt, const float* pairMask = nullptr, bool headMajor = false) {   // proj [cnt][H], or [H][cnt]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * H) return;
   int h = (int)(t % H); size_t ij = r0 + t / H; size_t i = ij / L, j = ij % L;
-  float v = proj[t] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
+  float v = proj[headMajor ? (size_t)h * cnt + t / H : t] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
   if (transposed) { size_t x = i; i = j; j = x; }
   out[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
 }
@@ -476,11 +476,16 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
   addK2<<<blocks(rows * C), 256, 0, STREAM>>>(x, out, rows * C);
 }
 // lt [s][i][c] -> [i][c][s], the left operand of the shallow form's contraction
-__global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O) {
+__global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O, float scale = 1.f) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)S * L * O) return;
   int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
-  out[t] = lt[((size_t)s * L + i) * O + c];
+  out[t] = scale == 1.f ? lt[((size_t)s * L + i) * O + c] : __float2half(__half2float(lt[((size_t)s * L + i) * O + c]) * scale);
+}
+// the output bias over a pair row's L positions, scaled: [L][C] of bias[c] * scale
+__global__ void tileBiasK(const float* bias, float* out, int L, int C, float scale) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < (size_t)L * C) out[t] = bias[t % C] * scale;
 }
 // The outer product mean's SHALLOW form, for an alignment of few rows: the output projection folded into the
 // right operand first - T[c][s][j][f] = sum_e R[s][j][e] W[c O + e][f], a batched GEMM over c (W's rows for one
@@ -516,8 +521,22 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
                                     rt, CUDA_R_16F, O, 0, &zero, T, CUDA_R_16F, 128, (long long)rows * 128, O,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
       half* Lt = scratch<half>("fopm.Lt", rows * O);
-      opmLeftToICS<<<blocks(rows * O), 256, 0, STREAM>>>(lt, Lt, rowsN, L, O);
+      // with every MSA row live the norm is rowsN at every pair, so (Y + b) / (1e-3 + norm) folds into the
+      // GEMM: L scaled by the constant, the bias tiled and scaled, accumulated straight into the pair (no
+      // f32 Y written and read back, no opmAddK: 1.06 s of a 2,088-residue fold)
+      const float inv = ones ? 1.f / (1e-3f + (float)rowsN) : 1.f;
+      opmLeftToICS<<<blocks(rows * O), 256, 0, STREAM>>>(lt, Lt, rowsN, L, O, inv);
       int K = O * rowsN;
+      if (ones) {
+        float* bt = scratch<float>("fopm.btile", (size_t)L * 128);
+        tileBiasK<<<blocks((size_t)L * 128), 256, 0, STREAM>>>(P(Op + "/output_b", blk), bt, L, 128, inv);
+        int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
+        for (int i0 = 0; i0 < L; i0 += Bi) {
+          int bi = std::min(Bi, L - i0);
+          ltGemm(Lt + (size_t)i0 * K, T, t.pair + (size_t)i0 * L * 128, false, bi, K, L * 128, bt, false, 1.f);
+        }
+        return;
+      }
       int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / ((size_t)L * 128)));
       float* Y = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
       for (int i0 = 0; i0 < L; i0 += Bi) {
@@ -843,22 +862,14 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
     else gridOutRaw(o, w.out, ob, pair, L, 0, pairs, tr);
     return;
   }
-  {   // the bias, all of it before any row is attended (and before any is written)
-    size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / C));
-    half* lnc = scratch<half>("ftatt.lnc", per * C);
-    float* projc = scratch<float>("fbias.projc", per * H);
-    static std::map<const float*, half*> whCache;
-    auto wh = whCache.find(wf);
-    if (wh == whCache.end()) {
-      half* h = wpool<half>((size_t)C * H);
-      toHalfK<<<blocks((size_t)C * H), 256, 0, STREAM>>>(wf, h, (size_t)C * H);
-      wh = whCache.emplace(wf, h).first;
-    }
+  {   // the bias, all of it before any row is attended (and before any is written): LN + the 16-column
+      // projection in one kernel (lnHeadsK), then laid out head-major
+    size_t per = std::max<size_t>(1, std::min(pairs, AF2_CHUNK / 16));
+    float* raw = scratch<float>("fbias.raw16", per * 16);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      layerNormH(pair + r0 * C, lnc, r, C, A + "/query_norm", blk);
-      ltGemm(lnc, wh->second, projc, false, r, C, H, nullptr, false, 0.f);
-      biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(projc, bias, L, H, stride, tr, r0, r);
+      lnHeadsRaw<16>(pair + r0 * C, lnS, lnO, Wb, raw, r);
+      biasFromProjRowsK<<<blocks(r * H), 256, 0, STREAM>>>(raw, bias, L, H, stride, tr, r0, r, nullptr, true);   // lnHeadsK writes head-major
     }
   }
   size_t R = std::max<size_t>(1, std::min<size_t>(L, AF2_CHUNK / ((size_t)L * 4 * Wp)));

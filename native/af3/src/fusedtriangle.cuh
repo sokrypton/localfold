@@ -573,13 +573,17 @@ __global__ void __launch_bounds__(WARPS * 32) lnHeadsK(const float* __restrict__
   }
 }
 template <int N>
-inline void lnHeads128(const float* x, const std::string& scale, const std::string& offset, const std::string& w,
-                       float* out, size_t rows) {
-  constexpr int C = 128, WARPS = 8, R = 16 * WARPS;
+inline void lnHeadsRaw(const float* x, const float* scale, const float* offset, const half* w, float* out, size_t rows) {
+  constexpr int C = 128, WARPS = 8, R = 16 * WARPS;      // (raw pointers: AF2's pair-bias pass)
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * (N + 8) * 2 + (size_t)N * (R + 4) * 4;
   static bool attr = false;
   if (!attr) { smemAttr((lnHeadsK<C, N, WARPS>), (int)smem); attr = true; }
-  lnHeadsK<C, N, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, W(scale), W(offset), Wh(w), out, rows);
+  lnHeadsK<C, N, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, scale, offset, w, out, rows);
+}
+template <int N>
+inline void lnHeads128(const float* x, const std::string& scale, const std::string& offset, const std::string& w,
+                       float* out, size_t rows) {
+  lnHeadsRaw<N>(x, W(scale), W(offset), Wh(w), out, rows);
 }
 
 // The grid attention's input projection: LN(pair row) -> q, k, v, gate (C x NQ), for output rows
