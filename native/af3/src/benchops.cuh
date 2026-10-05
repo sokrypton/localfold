@@ -98,6 +98,18 @@ inline void benchGrid(int n) {
     size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
     printf("  cp.async against reg%s: %zu of %zu outputs differ\n", mk ? ", masked" : "", differ, a.size());
   }
+  {   // flashGrid2R (f16 scores, two tiles a warp) against the f32-score kernel, unmasked: how far its output moves
+    flashGridHalfRun<32, 4, 48, false>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr);
+    flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr);
+    std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
+    CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+    double num = 0, den = 0, mx = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      double x = __half2float(a[i]), y = __half2float(b2[i]);
+      num += (x - y) * (x - y); den += x * x; mx = std::max(mx, std::fabs(x - y));
+    }
+    printf("  2R against the f32-score kernel: relRMS %.3e, max |d| %.3e\n", std::sqrt(num / std::max(den, 1e-30)), mx);
+  }
   std::vector<std::pair<std::string, std::function<void()>>> arms = {
     {"grid w4 cp.async", [&] { flashGridHalfRun<32, 4, FA_BK, false>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 reg", [&] { flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
@@ -107,6 +119,13 @@ inline void benchGrid(int n) {
     {"grid w4 bk32", [&] { flashGridHalfAt<32, 4, 32>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 bk48", [&] { flashGridHalfAt<32, 4, 48>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 bk96", [&] { flashGridHalfAt<32, 4, 96>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
+    {"2R w4 bk48 mt2", [&] { flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk32 mt3", [&] { flashGrid2RRun<32, 4, 32, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk48 mt3", [&] { flashGrid2RRun<32, 4, 48, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk32 mt4", [&] { flashGrid2RRun<32, 4, 32, 4>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w4 bk48 mt4", [&] { flashGrid2RRun<32, 4, 48, 4>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w2 bk48 mt4", [&] { flashGrid2RRun<32, 2, 48, 4>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"2R w8 bk48 mt1", [&] { flashGrid2RRun<32, 8, 48, 1>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
   };
   std::vector<std::vector<float>> t(arms.size());
   cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);

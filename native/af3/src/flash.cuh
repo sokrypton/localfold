@@ -35,6 +35,20 @@ __device__ __forceinline__ void mma16816(float* d, const uint32_t* a, uint32_t b
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[2]), "r"(a[3]), "r"(b1));
 #endif
 }
+// the same with an f16 accumulator (two half2 registers: row g, row g + 8) - F16S's scores
+__device__ __forceinline__ void mma16816h(uint32_t* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+               : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};"
+               : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(b0));
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};"
+               : "+r"(d[0]), "+r"(d[1]) : "r"(a[2]), "r"(a[3]), "r"(b1));
+#endif
+}
+__device__ __forceinline__ __half2 asH2(uint32_t u) { return *reinterpret_cast<__half2*>(&u); }
+__device__ __forceinline__ uint32_t asU32(__half2 h) { return *reinterpret_cast<uint32_t*>(&h); }
 __device__ __forceinline__ uint32_t pack2(float lo, float hi) {
   half2 v = __floats2half2_rn(lo, hi);
   return *reinterpret_cast<uint32_t*>(&v);
@@ -89,7 +103,14 @@ constexpr uint32_t ONES_H2 = 0x3C003C00u;      // half2(1, 1)
 // (an MSA's columns, the triangle's ending node) read where the tensor lies rather than from a transposed
 // copy; native/af2 runs it. Without it the addressing is the dense [rows][positions][4W] layout's, in the
 // same 32-bit arithmetic as always (the strides would cost registers the dense form has none to spare).
-template <int D, int WARPS, bool MASKED = true, int BK = FA_BK, bool REG = false, int MINB = 1, bool STRIDED = false>
+// F16S (unmasked only): the scores accumulated in f16 - the bias tile IS the MMA's accumulator input, the row max
+// and the subtraction packed half2 ops, the subtraction's result already the exponent's packed input - where
+// the f32 scores spent ~140 scalar instructions a tile against 27 MMAs (bias conversions and adds, 24 subtracts,
+// 12 pack conversions, the max): the kernel is issue-bound on them. 11 mantissa bits for a logit, where
+// AlphaFold 3's own JAX runs these in bf16's 8; the running max is rounded to an f16 value so the exponents and
+// the rescale agree.
+template <int D, int WARPS, bool MASKED = true, int BK = FA_BK, bool REG = false, int MINB = 1, bool STRIDED = false,
+          bool F16S = false>
 __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, const float* __restrict__ mask, half* __restrict__ out, int n, int heads, size_t r0, bool tr, float scale,
     const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
@@ -223,6 +244,61 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
       __syncthreads();
     }
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st); const float* Ms = Mst(st);
+    if constexpr (F16S && !MASKED) {
+      const half* hb0 = B + (warp * 16 + g) * LDB;
+      const half* hb1 = hb0 + 8 * LDB;
+      uint32_t sh[BK / 8][2];
+#pragma unroll
+      for (int nt = 0; nt < BK / 8; ++nt) {
+        int jj = nt * 8 + tig * 2;
+        sh[nt][0] = *reinterpret_cast<const uint32_t*>(hb0 + jj);
+        sh[nt][1] = *reinterpret_cast<const uint32_t*>(hb1 + jj);
+        if (tile == tiles - 1) {                       // keys past n: -inf (f16 0xFC00), both rows
+          int jg = tile * BK + jj;
+          if (jg >= n) { sh[nt][0] = (sh[nt][0] & 0xFFFF0000u) | 0xFC00u; sh[nt][1] = (sh[nt][1] & 0xFFFF0000u) | 0xFC00u; }
+          if (jg + 1 >= n) { sh[nt][0] = (sh[nt][0] & 0xFFFFu) | 0xFC000000u; sh[nt][1] = (sh[nt][1] & 0xFFFFu) | 0xFC000000u; }
+        }
+#pragma unroll
+        for (int k2 = 0; k2 < D / 32 + (D % 32 ? 1 : 0); ++k2) {
+          uint32_t kb[4];
+          ldsm4(kb, K + (nt * 8 + (lane & 7)) * LDK + k2 * 32 + (lane >> 3) * 8);
+          mma16816h(sh[nt], qa[k2 * 2], kb[0], kb[1]);
+          if (k2 * 2 + 1 < D / 16) mma16816h(sh[nt], qa[k2 * 2 + 1], kb[2], kb[3]);
+        }
+      }
+      __half2 x0 = asH2(sh[0][0]), x1 = asH2(sh[0][1]);
+#pragma unroll
+      for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, asH2(sh[nt][0])); x1 = __hmax2(x1, asH2(sh[nt][1])); }
+      float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
+      t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
+      t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+      // (the new maxima rounded to f16 values: the exponents subtract exactly these, and the rescale uses them)
+      float n0 = __half2float(__float2half(fmaxf(m0, t0))), n1 = __half2float(__float2half(fmaxf(m1, t1)));
+      float c0 = exp2f(m0 - n0), c1 = exp2f(m1 - n1);
+      m0 = n0; m1 = n1;
+#pragma unroll
+      for (int et = 0; et < D / 8; ++et) { o[et][0] *= c0; o[et][1] *= c0; o[et][2] *= c1; o[et][3] *= c1; }
+      lsum[0] *= c0; lsum[1] *= c0; lsum[2] *= c1; lsum[3] *= c1;
+      __half2 h0 = __float2half2_rn(n0), h1 = __float2half2_rn(n1);
+#pragma unroll
+      for (int t = 0; t < BK / 16; ++t) {
+        uint32_t pa[4] = { ex2h2(asU32(__hsub2(asH2(sh[2 * t][0]), h0))), ex2h2(asU32(__hsub2(asH2(sh[2 * t][1]), h1))),
+                           ex2h2(asU32(__hsub2(asH2(sh[2 * t + 1][0]), h0))), ex2h2(asU32(__hsub2(asH2(sh[2 * t + 1][1]), h1))) };
+        mma16816(lsum, pa, ONES_H2, ONES_H2);
+#pragma unroll
+        for (int et = 0; et < D / 8; et += 2) {
+          uint32_t vb[4];
+          ldsm4t(vb, V + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (et + (lane >> 4)) * 8);
+          mma16816(o[et], pa, vb[0], vb[1]);
+          mma16816(o[et + 1], pa, vb[2], vb[3]);
+        }
+      }
+      __syncthreads();
+      if constexpr (REG) {
+        if (tile + 1 < tiles) { storeR(); __syncthreads(); if (tile + 2 < tiles) loadR((tile + 2) * BK); }
+      }
+      continue;
+    }
     // S starts from the bias (and the key mask), and the tensor cores accumulate Q.K onto it
     const half* br0 = B + (warp * 16 + g) * LDB;
     const half* br1 = br0 + 8 * LDB;
@@ -500,14 +576,208 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
   }
 }
 
-template <int D, int WARPS, bool MASKED, int BK = FA_BK, bool REG = false, int MINB = 1> void setFlashSmem() {
+// TWO query tiles a warp (32 rows, BQ = 32 x WARPS), f16 scores, unmasked, dense rows, cp.async double-buffered:
+// every K and V fragment a warp loads from shared memory feeds both tiles' MMAs. With heads 32 wide the one-tile
+// kernel reads ~10 bytes of shared memory a score (K and V 8, the bias 2) against 64 multiply-adds - bound by
+// that bandwidth (~240 cycles a block-tile for ~54 of tensor work); this halves the K/V part.
+template <int D, int WARPS, int BK, int MT = 2> __host__ __device__ constexpr size_t fa2Stage() {
+  return (size_t)2 * BK * (D + 8) * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
+}
+template <int D, int WARPS, int BK, int MT = 2>
+__global__ void __launch_bounds__(WARPS * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
+    int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias) {
+  constexpr int BQ = 16 * MT * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
+  constexpr size_t STAGE = fa2Stage<D, WARPS, BK, MT>();
+  extern __shared__ __align__(16) unsigned char smem[];
+  auto Kst = [&](int s) { return (half*)(smem + s * STAGE); };
+  auto Vst = [&](int s) { return Kst(s) + BK * LDK; };
+  auto Bst = [&](int s) { return Vst(s) + BK * LDK; };
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  const size_t rowsHere = gridDim.y / heads;
+  size_t b = blockIdx.y; int h = (int)(b / rowsHere); size_t rl = b % rowsHere;
+  const int Wd = heads * D, W4 = 4 * Wd;
+  const half* base = qkvg + rl * (size_t)n * W4 + h * D;
+  int q0 = blockIdx.x * BQ;
+  constexpr int KV_CHUNKS = BK * (D / 8), B_CHUNKS = BQ * (BK / 8);
+  static_assert(B_CHUNKS % NT == 0, "a bias tile is a whole number of chunks a thread");
+  const half* biasHead = bias + (size_t)h * n * biasStride;
+  constexpr int KV_PER = (KV_CHUNKS + NT - 1) / NT, B_PER = B_CHUNKS / NT;
+  const half* kvSrc[KV_PER]; int kvOff[KV_PER], kvJ[KV_PER];
+#pragma unroll
+  for (int k = 0; k < KV_PER; ++k) {
+    int u = k * NT + threadIdx.x, jj = u / (D / 8), c = (u % (D / 8)) * 8;
+    kvJ[k] = (KV_CHUNKS % NT == 0 || u < KV_CHUNKS) ? jj : 1 << 30;
+    kvOff[k] = jj * LDK + c;
+    kvSrc[k] = base + (size_t)jj * W4 + Wd + c;
+  }
+  const half* bSrc[B_PER]; int bOff[B_PER], bC[B_PER]; bool bRow[B_PER];
+#pragma unroll
+  for (int k = 0; k < B_PER; ++k) {
+    int u = k * NT + threadIdx.x, qi = u / (BK / 8), c = (u % (BK / 8)) * 8, i = q0 + qi;
+    bRow[k] = i < n; bC[k] = c; bOff[k] = qi * LDB + c;
+    bSrc[k] = biasHead + (size_t)(i < n ? i : 0) * biasStride + c;
+  }
+  auto issue = [&](int j0, int st) {
+    half *K = Kst(st), *V = Vst(st), *B = Bst(st);
+    bool last = j0 + BK > n;
+#pragma unroll
+    for (int k = 0; k < KV_PER; ++k) {
+      if (kvJ[k] >= (1 << 30)) continue;
+      bool ok = !last || j0 + kvJ[k] < n;
+      const half* src = ok ? kvSrc[k] + (size_t)j0 * W4 : base;
+      cpAsync16(K + kvOff[k], src, ok);
+      cpAsync16(V + kvOff[k], src + Wd, ok);
+    }
+#pragma unroll
+    for (int k = 0; k < B_PER; ++k) {
+      bool ok = bRow[k] && (!last || j0 + bC[k] < n);
+      cpAsync16(B + bOff[k], ok ? bSrc[k] + j0 : biasHead, ok);
+    }
+    cpCommit();
+  };
+  auto q2 = [&](int i, int e) -> uint32_t {
+    if (i >= n) return 0u;
+    half2 v = *reinterpret_cast<const half2*>(base + (size_t)i * W4 + e);
+    float2 f = __half22float2(v);
+    if (qBias) { f.x += qBias[h * D + e]; f.y += qBias[h * D + e + 1]; }
+    return pack2(f.x * scale * LOG2E, f.y * scale * LOG2E);
+  };
+  int ib[MT];                                                        // each tile's row g (and g + 8)
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt) ib[mt] = q0 + warp * 16 * MT + mt * 16 + g;
+  uint32_t qa[MT][D / 16][4];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+    for (int ks = 0; ks < D / 16; ++ks) {
+      int e = ks * 16 + tig * 2;
+      qa[mt][ks][0] = q2(ib[mt], e); qa[mt][ks][1] = q2(ib[mt] + 8, e);
+      qa[mt][ks][2] = q2(ib[mt], e + 8); qa[mt][ks][3] = q2(ib[mt] + 8, e + 8);
+    }
+  float o[MT][D / 8][4] = {};
+  float mx[MT][2], lsum[MT][4] = {};
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt) mx[mt][0] = mx[mt][1] = -INFINITY;
+  int tiles = (n + BK - 1) / BK;
+  issue(0, 0);
+  for (int tile = 0; tile < tiles; ++tile) {
+    int st = tile & 1;
+    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
+    __syncthreads();
+    const half *K = Kst(st), *V = Vst(st), *B = Bst(st);
+    uint32_t sh[MT][BK / 8][2];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      const half* hb0 = B + (warp * 16 * MT + mt * 16 + g) * LDB;
+      const half* hb1 = hb0 + 8 * LDB;
+#pragma unroll
+      for (int nt = 0; nt < BK / 8; ++nt) {
+        int jj = nt * 8 + tig * 2;
+        sh[mt][nt][0] = *reinterpret_cast<const uint32_t*>(hb0 + jj);
+        sh[mt][nt][1] = *reinterpret_cast<const uint32_t*>(hb1 + jj);
+        if (tile == tiles - 1) {
+          int jg = tile * BK + jj;
+          if (jg >= n) { sh[mt][nt][0] = (sh[mt][nt][0] & 0xFFFF0000u) | 0xFC00u; sh[mt][nt][1] = (sh[mt][nt][1] & 0xFFFF0000u) | 0xFC00u; }
+          if (jg + 1 >= n) { sh[mt][nt][0] = (sh[mt][nt][0] & 0xFFFFu) | 0xFC000000u; sh[mt][nt][1] = (sh[mt][nt][1] & 0xFFFFu) | 0xFC000000u; }
+        }
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < BK / 8; ++nt)
+#pragma unroll
+      for (int k2 = 0; k2 < D / 32 + (D % 32 ? 1 : 0); ++k2) {
+        uint32_t kb[4];
+        ldsm4(kb, K + (nt * 8 + (lane & 7)) * LDK + k2 * 32 + (lane >> 3) * 8);
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+          mma16816h(sh[mt][nt], qa[mt][k2 * 2], kb[0], kb[1]);
+          if (k2 * 2 + 1 < D / 16) mma16816h(sh[mt][nt], qa[mt][k2 * 2 + 1], kb[2], kb[3]);
+        }
+      }
+    __half2 hn[MT][2];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      __half2 x0 = asH2(sh[mt][0][0]), x1 = asH2(sh[mt][0][1]);
+#pragma unroll
+      for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, asH2(sh[mt][nt][0])); x1 = __hmax2(x1, asH2(sh[mt][nt][1])); }
+      float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
+      t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
+      t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+      float n0 = __half2float(__float2half(fmaxf(mx[mt][0], t0))), n1 = __half2float(__float2half(fmaxf(mx[mt][1], t1)));
+      float c0 = exp2f(mx[mt][0] - n0), c1 = exp2f(mx[mt][1] - n1);
+      mx[mt][0] = n0; mx[mt][1] = n1;
+#pragma unroll
+      for (int et = 0; et < D / 8; ++et) { o[mt][et][0] *= c0; o[mt][et][1] *= c0; o[mt][et][2] *= c1; o[mt][et][3] *= c1; }
+      lsum[mt][0] *= c0; lsum[mt][1] *= c0; lsum[mt][2] *= c1; lsum[mt][3] *= c1;
+      hn[mt][0] = __float2half2_rn(n0); hn[mt][1] = __float2half2_rn(n1);
+    }
+#pragma unroll
+    for (int t = 0; t < BK / 16; ++t) {
+      uint32_t pa[MT][4];
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        pa[mt][0] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t][0]), hn[mt][0])));
+        pa[mt][1] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t][1]), hn[mt][1])));
+        pa[mt][2] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t + 1][0]), hn[mt][0])));
+        pa[mt][3] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t + 1][1]), hn[mt][1])));
+        mma16816(lsum[mt], pa[mt], ONES_H2, ONES_H2);
+      }
+#pragma unroll
+      for (int et = 0; et < D / 8; et += 2) {
+        uint32_t vb[4];
+        ldsm4t(vb, V + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (et + (lane >> 4)) * 8);
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) { mma16816(o[mt][et], pa[mt], vb[0], vb[1]); mma16816(o[mt][et + 1], pa[mt], vb[2], vb[3]); }
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt) {
+    int i0 = ib[mt], i1 = i0 + 8;
+    float l0 = lsum[mt][0], l1 = lsum[mt][2];
+    half2 ga[D / 8], gb[D / 8];
+    for (int et = 0; et < D / 8; ++et) {
+      int e = et * 8 + tig * 2;
+      ga[et] = i0 < n ? *reinterpret_cast<const half2*>(base + (size_t)i0 * W4 + 3 * Wd + e) : half2{};
+      gb[et] = i1 < n ? *reinterpret_cast<const half2*>(base + (size_t)i1 * W4 + 3 * Wd + e) : half2{};
+    }
+    for (int et = 0; et < D / 8; ++et) {
+      int e = et * 8 + tig * 2;
+      float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
+      if (i0 < n) *reinterpret_cast<half2*>(out + (rl * n + i0) * Wd + h * D + e) =
+          __floats2half2_rn(o[mt][et][0] / l0 * sigm(a.x), o[mt][et][1] / l0 * sigm(a.y));
+      if (i1 < n) *reinterpret_cast<half2*>(out + (rl * n + i1) * Wd + h * D + e) =
+          __floats2half2_rn(o[mt][et][2] / l1 * sigm(b2.x), o[mt][et][3] / l1 * sigm(b2.y));
+    }
+  }
+}
+// the unmasked, dense 32-wide grid attention through flashGrid2R (4 warps, 48-key tiles): --bench-grid on the
+// A100 0.884 -> 0.753 ms at 500 tokens, 6.34 -> 5.02 at 1000 (80.7 -> 102 TFLOP/s), output relRMS 3.9e-4 from
+// the f32-score kernel's. Three or four tiles a warp spill (0.95-1.0 ms at 500); eight warps of one tile with
+// f16 scores reach 0.764. LOCALFOLD_FLASH_2R=0 keeps the one-tile kernel.
+inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
+template <int D, int WARPS, int BK, int MT = 2>
+void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
+                    const float* qBias) {
+  constexpr int BQ = 16 * MT * WARPS;
+  const int bytes = 2 * (int)fa2Stage<D, WARPS, BK, MT>();
+  static bool attr = false;
+  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT>), bytes); attr = true; }
+  dim3 grid((n + BQ - 1) / BQ, (unsigned)(rows * heads));
+  flashGrid2R<D, WARPS, BK, MT><<<grid, 32 * WARPS, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias);
+}
+template <int D, int WARPS, bool MASKED, int BK = FA_BK, bool REG = false, int MINB = 1, bool F16S = false> void setFlashSmem() {
   static bool done = false;
   if (!done) {
-    smemAttr((flashGridHalf<D, WARPS, MASKED, BK, REG, MINB>), (int)((REG ? 1 : 2) * faStage<D, WARPS, BK>()));
+    smemAttr((flashGridHalf<D, WARPS, MASKED, BK, REG, MINB, false, F16S>), (int)((REG ? 1 : 2) * faStage<D, WARPS, BK>()));
     done = true;
   }
 }
 inline int FLASH_WARPS_OVERRIDE = 0;
+// F16S (flashGridHalf): the unmasked kernel's scores in f16 - LOCALFOLD_FLASH_F16S=1 (being measured)
+inline bool FLASH_F16S = getenv("LOCALFOLD_FLASH_F16S") && atoi(getenv("LOCALFOLD_FLASH_F16S"));
 inline bool FLASH_SPLIT = true;
 // the register-staged form (see flashGridHalf's REG) where the device has no cp.async - before Ampere, a
 // T4 - unless LOCALFOLD_FLASH_REG says otherwise (0 or 1: to measure either form on any device)
@@ -527,6 +797,12 @@ void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const floa
   if (mask) {                    // a null mask: every key real (see MASKED)
     setFlashSmem<D, WARPS, true, BK, REG, MINB>();
     flashGridHalf<D, WARPS, true, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+  } else if (FLASH_2R && !REG && D == 32 && WARPS == 4 && BK == 48) {   // (the unmasked kernel reads no r0)
+    flashGrid2RRun<D, WARPS, BK>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+  } else if (FLASH_F16S) {
+    setFlashSmem<D, WARPS, false, BK, REG, MINB, true>();
+    flashGridHalf<D, WARPS, false, BK, REG, MINB, false, true><<<grid, 32 * WARPS, bytes, STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
   } else {
     setFlashSmem<D, WARPS, false, BK, REG, MINB>();
