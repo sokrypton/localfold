@@ -718,6 +718,41 @@ struct Model {
     if (e.kind == 'q') { fprintf(stderr, "%s is resident int8: read it with residentInt8\n", k.c_str()); exit(1); }
     return s.device + e.devOffset;
   }
+  // The resident codes off the device and back: a fold short of room parks a tower it has finished with (ESM-C 6B's
+  // 6.4 GB, idle once the language model has run), and the next fold reads it back from its shards - the bytes
+  // bundleUp copied, a tensor at a time through one pinned buffer
+  size_t parkResident() {
+    size_t freed = 0;
+    for (auto& s : segs) if (s.resident) { CK(cudaFree(s.resident)); s.resident = nullptr; freed += s.residentBytes; }
+    return freed;
+  }
+  bool residentParked() const { for (auto& s : segs) if (s.residentBytes && !s.resident) return true; return false; }
+  void unparkResident() {
+    for (auto& s : segs) {
+      if (!s.residentBytes || s.resident) continue;
+      CK(cudaMalloc(&s.resident, s.residentBytes));
+      size_t most = 0;
+      for (const auto& r : s.residentRecs) most = std::max(most, r.b.elements + 2 * ((r.b.elements + r.b.block - 1) / r.b.block));
+      unsigned char* pin; CK(cudaHostAlloc(&pin, most, cudaHostAllocDefault));
+      int file = -1, fd = -1;
+      for (const auto& r : s.residentRecs) {
+        if (r.b.file != file) { if (fd >= 0) close(fd); file = r.b.file; fd = open(shardPath(s, s.files[file]).c_str(), O_RDONLY); }
+        size_t sbytes = 2 * ((r.b.elements + r.b.block - 1) / r.b.block);
+        auto readAt = [&](unsigned char* to, size_t n, size_t at) {
+          for (size_t got = 0; got < n;) {
+            ssize_t k = pread(fd, to + got, n - got, (off_t)(at + got));
+            if (k <= 0) { fprintf(stderr, "cannot read %s\n", s.files[file].c_str()); exit(1); }
+            got += (size_t)k;
+          }
+        };
+        readAt(pin, r.b.elements, r.b.byteOffset); readAt(pin + r.b.elements, sbytes, r.b.scaleOffset);
+        CK(cudaMemcpy(s.resident + r.codes, pin, r.b.elements, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(s.resident + r.scales, pin + r.b.elements, sbytes, cudaMemcpyHostToDevice));
+      }
+      if (fd >= 0) close(fd);
+      CK(cudaFreeHost(pin));
+    }
+  }
   bool isResident(const std::string& k) const { auto it = index.find(k); return it != index.end() && it->second.kind == 'q'; }
   ResidentInt8 residentInt8(const std::string& k) {
     const Entry& e = at(k);

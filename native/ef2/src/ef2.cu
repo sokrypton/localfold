@@ -122,6 +122,11 @@ static int foldInput(const Opts& o, bool warm) {
   const bool streamZ = !check && !parcae && shortPair((size_t)T * T, e.pair);
   float* lmZ = streamZ ? nullptr : dalloc((size_t)T * T * e.pair);
   auto t0 = std::chrono::steady_clock::now();
+  if (residentTower && M.residentParked()) {      // (the last fold parked the tower: back from its shards)
+    M.unparkResident();
+    say("tower back on the device in %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    t0 = std::chrono::steady_clock::now();
+  }
   bool profLm = profile && getenv("EF2_PROFILE") && std::string(getenv("EF2_PROFILE")) == "lm";
   if (profLm) { prof::init(); prof::start(); }
   languageModel(e, Idev("lm/ids"), Idev("lm/sequence_id"), Idev("lm/token_to_row"), T, lmZ,
@@ -132,6 +137,22 @@ static int foldInput(const Opts& o, bool warm) {
   CK(cudaStreamSynchronize(STREAM));
   if (profLm) prof::stop(15);
   say("language model %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  // the resident tower is idle until the next fold: on a card without room beside it for the trunk's three pairs
+  // (z_init, z and the injection) it leaves the device, and the next fold reads it back (1,500 tokens on a T4 ran out
+  // with it held: 6.4 GB of codes beside four 2.3 GB pairs)
+  if (residentTower && !roomFor(3 * (size_t)T * T * e.pair * 4, { "tower.w16" })) {
+    releaseScratch({ "tower.", "esmc." });
+    if (!streamZ) releaseScratch({ "shim." });     // (a streamed z_init reads shim.tokens later)
+    say("tower parked off the device: %.2f GB\n", M.parkResident() / 1e9);
+  }
+  // the language model's pair is read once a pass, to seed the injection: on a card without room beside it for the
+  // trunk's three pairs it waits in pinned host memory and is copied in each pass (four 3.1 GB pairs at 1,750 tokens
+  // did not fit a T4 beside the folding weights)
+  const float* lmHost = nullptr;
+  if (parcae && lmZ && !roomFor(3 * (size_t)T * T * e.pair * 4)) {
+    parkToHost(lmZ, (size_t)T * T * e.pair * 4); lmHost = PARK_HOST;
+    say("language model's pair parked in host memory\n");
+  }
   if (check) {
     checkOracle("lm hidden states (37)", hidden, (size_t)T * states * e.model, "o/lm_hidden");
     if (getenv("EF2_PER_STATE")) {
@@ -161,7 +182,7 @@ static int foldInput(const Opts& o, bool warm) {
   if (check) checkOracle("s_inputs", sInputs, (size_t)T * Si, "o/s_inputs");
   int C = e.pair;
   mem("language model");
-  float* zi = nullptr; float* z = dalloc((size_t)T * T * C);
+  float* zi = nullptr; float* z = nullptr;          // (z after the MSA encoder: one pair fewer while it runs)
   float *ziRows = nullptr, *ziCols = nullptr, *sTok = nullptr;
   if (streamZ) {
     // what the streamed z_init reads, kept past the scratch release below: the per-token states and the
@@ -197,6 +218,7 @@ static int foldInput(const Opts& o, bool warm) {
   }
   // a large input gives each phase the whole card: its predecessor's scratch released (a pair over
   // 128 MB, ~350 tokens). Below that the scratch is kept - re-allocating it cost every phase cudaMallocs
+  z = dalloc((size_t)T * T * C);
   bool tight = (size_t)T * T * C * 4 > ((size_t)128 << 20);
   if (tight) releaseScratch();
   t0 = std::chrono::steady_clock::now();
@@ -204,7 +226,7 @@ static int foldInput(const Opts& o, bool warm) {
   std::string profStage = getenv("EF2_PROFILE") ? getenv("EF2_PROFILE") : "trunk";
   bool profTrunk = profile && profStage == "trunk";
   if (profTrunk) { prof::init(); prof::start(); }
-  foldingTrunk(T, C, zi, z, getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4, check, lmZ, seed);
+  foldingTrunk(T, C, zi, z, getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4, check, lmZ, seed, lmHost);
   if (lmZ) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
   if (getenv("EF2_SAVE_PAIR") && !warm) {         // the trunk's final pair, raw float32 [T, T, C] (a comparison aid)
     auto h = download(z, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_PAIR"), "wb");

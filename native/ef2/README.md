@@ -117,6 +117,20 @@ Measured against references:
 - Warm on the A100, the encoder costs 19 ms at 261 tokens with one row and 44 ms with 1,024 rows, against a
   470 ms trunk.
 
+**On a T4: ESMFold2 folds up to about 1,750 tokens.** That is measured on a simulated T4 (the T4's shared-memory
+limit, plus a second process holding all but 14.6 GiB of the A100); 2,000 runs out. Two things a short card does
+that a large one does not, both decided by free memory (`roomFor`) and both bit-identical (relRMS 0 through
+`LOCALFOLD_BIG=1`):
+- **the tower leaves the device after the language model.** ESM-C 6B's 6.4 GB of codes are idle until the next
+  fold, which reads them back from the shards (`Model::parkResident` / `unparkResident`; 0.84 s here, from the
+  page cache). Without this, 1,500 tokens ran out.
+- **the language model's pair waits in pinned host memory**, copied into the injection once a pass. The loop
+  otherwise holds four pairs (z_init, z, the injection and this), 3.1 GB each at 1,750 tokens. z itself is
+  allocated only after the MSA encoder.
+
+The next wall is the three pairs the loop cannot do without, beside the triangle's scratch. Going past it would
+mean float16 pairs.
+
 ## Exactness
 
 `oracle.py` runs biohub's forward on the CPU in float32, with its own ESM-C (biohub/ESMC-600M-1500000)

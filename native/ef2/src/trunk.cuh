@@ -280,7 +280,7 @@ __global__ void decayUpdateK(float* z, const float* y, const float* a, size_t ro
 inline bool parcaeRecycle() { return M.has("f/recycle/decay"); }
 
 inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops, bool check,
-                         const float* lmZ = nullptr, uint64_t seed = 0) {
+                         const float* lmZ = nullptr, uint64_t seed = 0, const float* lmHost = nullptr) {
   size_t P = (size_t)T * T;
   float* mask = scratch<float>("trunk.mask", P);
   fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);      // every token is real (the token mask is all ones)
@@ -289,7 +289,7 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
     // the language model's pair through its own pair-only blocks, injects z_init plus that, LayerNorm'd and
     // projected, into a per-channel decay of z, and runs the trunk; after the last pass the readout and the
     // coda (biohub's modeling_esmfold2.py _run_one_loop and forward)
-    if (!zInitP || !lmZ) { fprintf(stderr, "the parcae recycle needs z_init and the language model's pair whole\n"); exit(1); }
+    if (!zInitP || (!lmZ && !lmHost)) { fprintf(stderr, "the parcae recycle needs z_init and the language model's pair whole\n"); exit(1); }
     // EF2_DETERMINISTIC=1: no dropout and a zero initial state - af3-any-model's reading (its recycle starts from
     // zeros), and with its LM_PAIR_DROPOUT set to 0 a fold the two can compare tensor for tensor
     static const bool deterministic = getenv("EF2_DETERMINISTIC") != nullptr;
@@ -302,7 +302,10 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
     size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));
     float* xn = scratch<float>("trunk.xn", chunk * C); float* y = scratch<float>("trunk.y", chunk * C);
     for (int loop = 0; loop < loops; ++loop) {
-      if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(lmZ, inject, P * C, p, seed, 1000 + loop);
+      if (lmHost) {                                 // (parked in host memory: copied in, then dropped out in place)
+        CK(cudaMemcpyAsync(inject, lmHost, P * C * 4, cudaMemcpyHostToDevice, STREAM));
+        if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(inject, inject, P * C, p, seed, 1000 + loop);
+      } else if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(lmZ, inject, P * C, p, seed, 1000 + loop);
       else CK(cudaMemcpyAsync(inject, lmZ, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
       for (int b = 0; b < lmBlocks; ++b) trunkBlock(inject, mask, T, C, "lmEncoder/blocks", b);
       addK<<<blocks(P * C), 256, 0, STREAM>>>(inject, zInitP, P * C);
