@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-# Genuine chai-lab 0.6.1 on one sequence, with the ESM2 embedding handed in (af3-any-model's ESM2 3B, int8 - the
-# same tower chai downloads as a 5.7 GB fp16 trace) and every exported module's inputs and outputs recorded.
+"""Genuine chai-lab 0.6.1 on one sequence, every exported module's inputs and outputs recorded - Chai-1's oracle.
+
+  CHAI_DOWNLOADS_DIR=<assets> ~/venv_chai/bin/python tools/oracle/run_chai_lab.py <SEQ> <esm2.npy> <out dir> [recycles] [steps]
+
+The ESM2 embedding is handed in (af3-any-model's ESM2 3B, int8 - the same tower chai downloads as a 5.7 GB fp16
+trace), and the MSA axis of anything recorded is cut to its first 8 rows (chai pads it to 16,384). ~/venv_chai is
+chai-lab with --no-deps over ~/venv_boltz's torch 2.7.1 (a .pth file), which chai's exported modules load in.
+"""
 import sys, os, pathlib, numpy as np, torch
 seq, emb_path, out_dir = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
 recycles = int(sys.argv[4]) if len(sys.argv) > 4 else 3

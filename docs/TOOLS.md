@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-353 tools. `tools/fixtures/` is data and is not listed.
+355 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -214,7 +214,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (46)
+## `tools/oracle/` - the reference side (47)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -262,6 +262,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`probe_af3_ptm_bonds.py`** - Does the REFERENCE inflate a modified residue too, or only this port?
 - **`probe_af3_sidechain_harness.py`** - Why does fold_check's AF3 contract side chains where run_alphafold's does not?
 - **`relative_encoding.py`** - Layer 1: the relative-position encoding, ours against AF2-multimer's.
+- **`run_chai_lab.py`** - Genuine chai-lab 0.6.1 on one sequence, every exported module's inputs and outputs recorded - Chai-1's oracle.
 - **`score_modified_cif.py`** - Score a modified residue's own bonds in a predicted mmCIF.
 - **`template_reference.py`** - AF2-multimer's template embedder, in numpy.
 - **`triangle_reference.py`** - AF2's fused triangle multiplication on the toy pair, as a reference.
@@ -291,7 +292,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (93)
+## `tools/` - everything else (94)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -353,6 +354,7 @@ go through CDP, and the deploy.
 - **`export_alphafold_structure_reference.py`** - Replay and export the official AF2 structure module from a trunk fixture.
 - **`export_alphafold_template_parameters.py`** - Add official model template parameters to an existing reference manifest.
 - **`export_confidence_reference.py`** - Export AF2 pLDDT/PAE head parameters and final-recycle reference logits.
+- **`export_esm2_3b.py`** - ESM2 3B (the tower Chai-1's tokens read) as a bundle the native port reads, its matrices kept int8 - from af3-any-model's own quantisation (lm/esm2.bin.zst), not a second one.
 - **`export_esmc6b.py`** - ESM-C 6B (the tower of the released ESMFold2 and ESMFold2-Fast) as a bundle the native port reads, with the tower's matrices kept int8 - from af3-any-model's own quantisation, not a second one.
 - **`export_esmc_model.py`** - ESM-C's tower and ESMFold2's shim -> the bundle format the browser reads.
 - **`export_esmfold2_trunk.py`** - ESMFold2's folding trunk -> a LocalFold bundle, in AF3's pairformer layout.
