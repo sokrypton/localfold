@@ -9,13 +9,29 @@
 // straight into A fragments of the second GEMM (the flash kernel's P trick), and accumulated into
 // the 16 x C output. The weights stream through shared memory, double-buffered.
 #pragma once
-#include "fusedtriangle.cuh"
+#include "fused256.cuh"   // tileColumns, stageSw
 
 constexpr int FT_NC = 32;
 
 template <int C, int NC = FT_NC>
-__host__ __device__ constexpr size_t ftStage() {   // W1 a and b chunks [C][NC+8], W2 chunk [NC][C+8]
-  return (size_t)2 * C * (NC + 8) * 2 + (size_t)NC * (C + 8) * 2;
+__host__ __device__ constexpr size_t ftStage() {   // W1 a and b chunks [C][NC] (stageSw), W2 chunk [NC][C] (w2Sw)
+  return (size_t)2 * C * NC * 2 + (size_t)NC * C * 2;
+}
+// a W2 stage row is C = 128 halves unpadded, its sixteen 16-byte chunks XOR-swizzled by the row's low three
+// bits: ldmatrix.trans reads eight consecutive rows at one chunk
+template <int C>
+__device__ __forceinline__ int w2Sw(int k, int c) {
+  static_assert(C == 128, "sixteen chunks a row");
+  return k * C + (c ^ ((k & 7) << 3));
+}
+// W1 as fusedTransitionK streams it: NC-column tiles [C][NC] contiguous (tileColumns), a's then b's
+// (RELU: the one half). From W1 itself each 16-byte piece of a stage was a row from its neighbour's,
+// and a cp.async write takes a shared wavefront per global row: 50% of the kernel's shared wavefronts
+// were excess, nearly all of them those writes (Nsight Compute, AF3 at 1,044 tokens)
+template <bool RELU>
+inline void tileTransitionW1(const half* W1, int C, int I, int NC, half* out) {
+  if constexpr (RELU) tileColumns(W1, C, I, 0, I, NC, out);
+  else { tileColumns(W1, C, 2 * I, 0, I, NC, out); tileColumns(W1, C, 2 * I, I, I, NC, out + (size_t)C * I); }
 }
 
 // RELU: AlphaFold 2's transition - x += ReLU(LN(x) W1 + b1) W2 + b2, W1 [C][I] (one half, not SwiGLU's two);
@@ -24,17 +40,17 @@ __host__ __device__ constexpr size_t ftStage() {   // W1 a and b chunks [C][NC+8
 // columns a chunk (16 keeps MT 2's registers in bounds)
 template <int C, int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC>
 __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
-    const float* __restrict__ lnOffset, const half* __restrict__ W1, const half* __restrict__ W2, size_t rows, int I,
+    const float* __restrict__ lnOffset, const half* __restrict__ W1t, const half* __restrict__ W2, size_t rows, int I,
     const float* __restrict__ b1 = nullptr, const float* __restrict__ b2 = nullptr) {
   constexpr int FT_ROWS = 16 * WARPS * MT, NTH = 32 * WARPS;
-  constexpr int LDX = C + 8, LDA = NC + 8, LDW2 = C + 8, KS = C / 16, NT = C / 8;
+  constexpr int LDX = C + 8, KS = C / 16, NT = C / 8;
   constexpr size_t STAGE = ftStage<C, NC>();
   extern __shared__ __align__(16) unsigned char smem[];
   half* Xs = (half*)smem;                                    // [FT_ROWS][LDX]
   unsigned char* stages = smem + (size_t)FT_ROWS * LDX * 2;
   auto W1a = [&](int s) { return (half*)(stages + s * STAGE); };
-  auto W1b = [&](int s) { return W1a(s) + C * LDA; };
-  auto W2s = [&](int s) { return W1b(s) + C * LDA; };
+  auto W1b = [&](int s) { return W1a(s) + C * NC; };
+  auto W2s = [&](int s) { return W1b(s) + C * NC; };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * FT_ROWS;
   int chunks = I / NC;
@@ -42,16 +58,13 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
     half *a = W1a(st), *b = W1b(st), *w2 = W2s(st);
     for (int t = threadIdx.x; t < C * (NC / 8); t += NTH) {      // W1 rows k, NC columns each half
       int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
-      if constexpr (RELU) {
-        cpAsync16(a + k * LDA + c, W1 + (size_t)k * I + j * NC + c, true);
-      } else {
-        cpAsync16(a + k * LDA + c, W1 + (size_t)k * 2 * I + j * NC + c, true);
-        cpAsync16(b + k * LDA + c, W1 + (size_t)k * 2 * I + I + j * NC + c, true);
-      }
+      const half* src = W1t + ((size_t)j * C + k) * NC + c;
+      cpAsync16(a + stageSw<NC>(k, c), src, true);
+      if constexpr (!RELU) cpAsync16(b + stageSw<NC>(k, c), src + (size_t)C * I, true);
     }
     for (int t = threadIdx.x; t < NC * (C / 8); t += NTH) {       // W2 rows j*NC .. , all C columns
       int k = t / (C / 8), c = (t % (C / 8)) * 8;
-      cpAsync16(w2 + k * LDW2 + c, W2 + (size_t)(j * NC + k) * C + c, true);
+      cpAsync16(w2 + w2Sw<C>(k, c), W2 + (size_t)(j * NC + k) * C + c, true);
     }
     cpCommit();
   };
@@ -82,11 +95,11 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
       for (int n2 = 0; n2 < NC / 16; ++n2) {
         uint32_t fa[4], fb[4];
         int k = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), c = n2 * 16 + (lane >> 4) * 8;
-        ldsm4t(fa, a + k * LDA + c);
+        ldsm4t(fa, a + stageSw<NC>(k, c));
 #pragma unroll
         for (int m = 0; m < MT; ++m) { mma16816(ha[m][2 * n2], xa[m][ks], fa[0], fa[1]); mma16816(ha[m][2 * n2 + 1], xa[m][ks], fa[2], fa[3]); }
         if constexpr (!RELU) {
-          ldsm4t(fb, b + k * LDA + c);
+          ldsm4t(fb, b + stageSw<NC>(k, c));
 #pragma unroll
           for (int m = 0; m < MT; ++m) { mma16816(hb[m][2 * n2], xa[m][ks], fb[0], fb[1]); mma16816(hb[m][2 * n2 + 1], xa[m][ks], fb[2], fb[3]); }
         }
@@ -108,7 +121,7 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
 #pragma unroll
       for (int et = 0; et < NT; et += 2) {
         uint32_t vb[4];
-        ldsm4t(vb, w2 + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW2 + (et + (lane >> 4)) * 8);
+        ldsm4t(vb, w2 + w2Sw<C>(t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (et + (lane >> 4)) * 8));
 #pragma unroll
         for (int m = 0; m < MT; ++m) { mma16816(acc[m][et], pa[m], vb[0], vb[1]); mma16816(acc[m][et + 1], pa[m], vb[2], vb[3]); }
       }
@@ -154,8 +167,10 @@ void fusedTransitionAt(float* x, size_t rows, int I, const float* lnScale, const
   size_t smem = (size_t)R * (128 + 8) * 2 + 2 * ftStage<128, NC>();
   static bool attr = false;
   if (!attr) { smemAttr((fusedTransitionK<128, WARPS, RELU, MT, NC>), (int)smem); attr = true; }
+  half* w1t = scratch<half>("ft.w1t", (size_t)128 * I * (RELU ? 1 : 2));
+  tileTransitionW1<RELU>(W1, 128, I, NC, w1t);
   fusedTransitionK<128, WARPS, RELU, MT, NC><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-    x, lnScale, lnOffset, W1, W2, rows, I, b1, b2);
+    x, lnScale, lnOffset, w1t, W2, rows, I, b1, b2);
 }
 inline bool FUSED_TRANSITION = true;
 inline int FT_WARPS = 8;
