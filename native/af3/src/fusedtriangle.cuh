@@ -13,13 +13,20 @@
 #include "flash.cuh"
 #include <cuda_bf16.h>
 
-// LayerNorm of a block's R rows into shared memory as f16, a warp a row and FOUR rows' loads in
+// LayerNorm of a block's R rows into shared memory as f16, a warp a row and several rows' loads in
 // flight per warp (one at a time left the loads latency-bound). rowOf(r) is row r's index in x,
 // or SIZE_MAX for a row past the end (normalised zeros).
+// up to LN_ROWS_IN_FLIGHT rows' loads in flight a warp: 8 where it was 4 (ncu: ~30% of gridInK's stall
+// samples were this prologue waiting on DRAM) - 1-3% on triInK, gridInK and the transition, byte-identical;
+// 16 measures the same as 8
+#ifndef LN_ROWS_IN_FLIGHT
+#define LN_ROWS_IN_FLIGHT 8
+#endif
 template <int C, int R, int WARPS, class RowOf>
 __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowOf rowOf, const float* __restrict__ scale,
                                                const float* __restrict__ offset, half* Xs, int LDX, int warp, int lane) {
-  constexpr int RPW = R / WARPS, B = RPW % 4 == 0 ? 4 : (RPW % 2 == 0 ? 2 : 1), K = C / 32;
+  constexpr int RPW = R / WARPS, B = LN_ROWS_IN_FLIGHT > 0 && RPW % LN_ROWS_IN_FLIGHT == 0 ? LN_ROWS_IN_FLIGHT
+                                  : RPW % 4 == 0 ? 4 : (RPW % 2 == 0 ? 2 : 1), K = C / 32;
   for (int base = 0; base < RPW; base += B) {
     float v[B][K];
 #pragma unroll
