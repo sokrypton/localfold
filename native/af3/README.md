@@ -519,6 +519,14 @@ round's warps taking their fragments before the next - one round's rows beside t
 normed by the same arithmetic. Byte-identical; on a Colab T4 protenix2's input kernel 1768 -> 1477 ms over a
 fold. NOT occupancy-bound after all: the whole fold moves less than the card's thermal drift, and at 128
 channels against the 8-warp form it is 428 -> 420 - so it is taken only where 8 warps do not fit.
+ESMFold2 on a T4 ran its whole 256-channel pair track UNFUSED: `fused256Fits` asked all three of the
+8-warp kernels to fit, and none does in 64 KB. It now takes their T4 forms - the rounded input kernel, the
+output kernel's bf16 tile, and `transitionUpK` in rounds with 16-column stages (`transitionUpK<256, 16, 16,
+8>`, ~49 KB) - with its contraction in f16 where there is no bf16 MMA. Colab T4, 5CAJ: the trunk 2367/2385 ->
+1622/1647 ms (-31%), and under `LOCALFOLD_SMEM_LIMIT=65536` here it is byte-identical to the A100's fold. The
+same transition form for the AF3 lineage measured level there (protenix2's 1083 ms against ~1100 for its
+LN, GEMM and SwiGLU passes) and is not taken.
+
 
 
 A T4 has no `cp.async`, so `cpAsync16` there is a load and a store - and every streaming kernel's "issue the

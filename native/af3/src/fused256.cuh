@@ -14,44 +14,77 @@
 // A block is 16 WARPS rows; the LN'd rows stay in registers as MMA A fragments; W1's [gate | value]
 // halves are walked 32 columns at a time (each chunk and its SwiGLU partner), double-buffered.
 // W1t: W1 [C][2I] as tileTransitionUp lays it out - the gate half's 32-column tiles, then the value half's
-template <int C, int WARPS>
+// NC, XROUNDS: the output columns a stage holds (W1t's tiles stay 32 wide; a 16-column stage is half of
+// one) and, past 1, triIn256K's rounds - a T4's form: 16 warps, their rows normed 32 at a time beside 16-column
+// stages, ~49 KB where the 8-warp form is 67.6 KB. Every output's sum over k runs in the same order in all
+// forms, so they are byte-identical.
+template <int C, int WARPS, int NC = 32, int XROUNDS = 1>
 __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1t, half* __restrict__ gated, size_t rows, int I) {
-  constexpr int NC = 32, R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, KS = C / 16;
+  constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, KS = C / 16;
   constexpr size_t STAGE = (size_t)2 * C * NC * 2;
   auto sw = [](int k, int c) { return stageSw<NC>(k, c); };
   extern __shared__ __align__(16) unsigned char smem[];
   // the LN'd rows and the weight stages share memory: the rows go into registers (A fragments) before
-  // the first stage is issued, so a block's footprint is the larger of the two, not their sum
-  half* Xs = (half*)smem;
+  // the first stage is issued, so a block's footprint is the larger of the two, not their sum (in rounds, the
+  // rows have a buffer of their own after the stages)
+  half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE);
   unsigned char* stages = smem;
   auto Wa = [&](int s) { return (half*)(stages + s * STAGE); };
   auto Wb = [&](int s) { return Wa(s) + C * NC; };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * R;
   int chunks = I / NC;
-  auto issue = [&](int j, int st) {
+  constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
+  auto stage = [&](int j, int st, auto&& op) {
     half *a = Wa(st), *b = Wb(st);
-    for (int t = threadIdx.x; t < C * (NC / 8); t += NTH) {
-      int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
-      const half* src = W1t + ((size_t)j * C + k) * NC + c;
-      cpAsync16(a + sw(k, c), src, true);
-      cpAsync16(b + sw(k, c), src + (size_t)C * I, true);
-    }
-    cpCommit();
-  };
-  lnRowsToShared<C, R, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
-                              lnScale, lnOffset, Xs, LDX, warp, lane);
-  __syncthreads();
-  uint32_t xa[KS][4];
 #pragma unroll
-  for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
-  __syncthreads();                    // every warp has its fragments: the stages may overwrite the rows
-  issue(0, 0);
+    for (int it = 0; it < ITER; ++it) {
+      const int t = it * NTH + (int)threadIdx.x;
+      if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
+      int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
+      const half* src = W1t + ((size_t)(j * NC / 32) * C + k) * 32 + (j * NC) % 32 + c;   // (32-column tiles)
+      op(2 * it, a + sw(k, c), src);
+      op(2 * it + 1, b + sw(k, c), src + (size_t)C * I);
+    }
+  };
+  auto issue = [&](int j, int st) { stage(j, st, [](int, half* d, const half* s) { cpAsync16(d, s, true); }); cpCommit(); };
+#if LF_REG_STAGES
+  RegStage<2 * ITER> next;            // (sm_75: the next chunk's weights held in registers across this chunk)
+#endif
+  uint32_t xa[KS][4];
+  if constexpr (XROUNDS == 1) {
+    lnRowsToShared<C, R, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
+                                lnScale, lnOffset, Xs, LDX, warp, lane);
+    __syncthreads();
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+    __syncthreads();                    // every warp has its fragments: the stages may overwrite the rows
+    issue(0, 0);
+  } else {
+    static_assert(R % XROUNDS == 0 && (R / XROUNDS) % 16 == 0 && (R / XROUNDS) % WARPS == 0, "whole warps' rows a round");
+    constexpr int XR = R / XROUNDS;
+    issue(0, 0);
+#pragma unroll 1
+    for (int rd = 0; rd < XROUNDS; ++rd) {
+      lnRowsToShared<C, XR, WARPS>(x, [&](int r) { size_t row = row0 + rd * XR + r; return row < rows ? row : SIZE_MAX; },
+                                   lnScale, lnOffset, Xs, LDX, warp, lane);
+      __syncthreads();
+      if (warp * 16 / XR == rd) {
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 - rd * XR + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+      }
+      __syncthreads();
+    }
+  }
   for (int j = 0; j < chunks; ++j) {
     int st = j & 1;
+#if LF_REG_STAGES
+    if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half*, const half* src) { next.load(i, src); });
+#else
     if (j + 1 < chunks) { issue(j + 1, st ^ 1); cpWait<1>(); }
     else cpWait<0>();
+#endif
     __syncthreads();
     const half *a = Wa(st), *b = Wb(st);
     float ha[NC / 8][4] = {}, hb[NC / 8][4] = {};
@@ -77,6 +110,9 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
       if (r0 < rows) *reinterpret_cast<uint32_t*>(gated + r0 * I + c) = pack2(gate(0), gate(1));
       if (r1 < rows) *reinterpret_cast<uint32_t*>(gated + r1 * I + c) = pack2(gate(2), gate(3));
     }
+#if LF_REG_STAGES
+    if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
+#endif
     __syncthreads();
   }
 }
@@ -88,8 +124,11 @@ inline void tileTransitionUp(const half* W1, int C, int I, half* out) {
   tileColumns(W1, C, 2 * I, I, I, 32, out + (size_t)C * I);
 }
 // transitionUpK's dynamic shared memory: the larger of the LN'd rows and the two weight stages
-template <int C, int WARPS>
-constexpr size_t transitionUpSmem() { return std::max((size_t)16 * WARPS * (C + 8) * 2, (size_t)2 * 2 * C * 32 * 2); }
+template <int C, int WARPS, int NC = 32, int XROUNDS = 1>
+constexpr size_t transitionUpSmem() {
+  if constexpr (XROUNDS > 1) return (size_t)2 * 2 * C * NC * 2 + (size_t)16 * WARPS / XROUNDS * (C + 8) * 2;
+  else return std::max((size_t)16 * WARPS * (C + 8) * 2, (size_t)2 * 2 * C * NC * 2);
+}
 
 // The rows one full wave of transitionUpK<C, WARPS> covers - the blocks every multiprocessor holds at
 // once, times the multiprocessors, times a block's 16 * WARPS rows - so a caller that chunks its rows can

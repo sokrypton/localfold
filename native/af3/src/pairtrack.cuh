@@ -609,6 +609,9 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
       });
       return;
     }
+    // (a T4's form of it - transitionUpK<256, 16, 16, 8>, rows normed in rounds, ~49 KB - is what ESMFold2 takes
+    // there; here it measured LEVEL on a Colab T4: protenix2's fused transition 1083 ms against the LN, GEMM and
+    // SwiGLU passes' ~1100, the folds within the card's drift. Not taken.)
   }
   // every row in one pass where the card has the room (OpenDDE at 255 tokens: the trunk's transitions 370 -> 353
   // ms for 0.6 GB; chunks of 1-8k rows, small enough for L2 to hold the widening, are 397-615 - the GEMMs lose more)

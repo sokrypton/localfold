@@ -149,7 +149,7 @@ inline void triangle256As(float* pair, const float* mask, int L, int C, const st
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
   TA* a = scratch<TA>("ftri.a", plane * C); TA* b = scratch<TA>("ftri.b", plane * C);
   half* t2 = scratch<half>("ftri.t2", plane * C);
-  triIn256<8>(pair, mask, Tn, a, b, t2, L, Lp, plane);
+  triIn256<TA>(pair, mask, Tn, a, b, t2, L, Lp, plane);
   TP* prod = scratch<TP>("ftri.prod", plane * C);
   if constexpr (std::is_same_v<TA, __nv_bfloat16>) {   // native/af3's contraction, a cached plan at every size
     triContractBf16(outgoing, Lp, plane, C, 1.f, a, b, prod, true);
@@ -164,12 +164,33 @@ inline void triangle256As(float* pair, const float* mask, int L, int C, const st
   }
   triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp);
 }
+inline bool bf16Mma() {          // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
+  static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+  return major >= 8;
+}
 inline void triangle256(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
-  if (EF2_TRI_BF16) triangle256As<__nv_bfloat16, __nv_bfloat16>(pair, mask, L, C, Tn, outgoing, CUDA_R_16BF, CUDA_R_16BF);
+  if (EF2_TRI_BF16 && bf16Mma()) triangle256As<__nv_bfloat16, __nv_bfloat16>(pair, mask, L, C, Tn, outgoing, CUDA_R_16BF, CUDA_R_16BF);
   else triangle256As<half, float>(pair, mask, L, C, Tn, outgoing, CUDA_R_16F, CUDA_R_32F);
 }
 inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
   int I = (int)dimOf("f/" + Tn + "transition2", 0);
+  if (!fused256Big()) {            // a T4: the 16-warp form, its rows normed in rounds (byte-identical)
+    constexpr int WU = 16, R = 16 * WU;
+    constexpr size_t smem = transitionUpSmem<256, WU, 16, 8>();
+    size_t chunk = std::max<size_t>(R, ((size_t)64 << 20) / (2 * (size_t)I) / R * R);
+    half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
+    half* w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
+    tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
+    static bool attr = false;
+    if (!attr) { smemAttr((transitionUpK<256, WU, 16, 8>), (int)smem); attr = true; }
+    for (size_t r0 = 0; r0 < P; r0 += chunk) {
+      size_t r = std::min(chunk, P - r0);
+      transitionUpK<256, WU, 16, 8><<<(unsigned)((r + R - 1) / R), 32 * WU, smem, STREAM>>>(
+        pair + r0 * C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), w1t, g, r, I);
+      ltGemm(g, Fh(Tn + "transition2"), pair + r0 * C, false, r, I, C, nullptr, false, 1.f);
+    }
+    return;
+  }
   // whole waves of transitionUpK within the same ~64 MB of widened rows (see transitionUpWaveRows)
   size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), ((size_t)64 << 20) / (2 * (size_t)I));
   half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
