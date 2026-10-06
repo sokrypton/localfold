@@ -66,7 +66,8 @@ is 2e-7 to 6e-7 on 6MRR and **5.4e-7 on 5CAJ with its crystal as template**; den
 confidence 1e-6. 6MRR from its sequence folds at 0.92-1.93 A over five samples (chai-lab
 0.95-1.78); 5CAJ at 2.32 A, 2.28 with its template - the N-terminal tag and the doubly-modelled
 165-169 loop, 0.46 / 0.39 A over the best 90%. The int5 bundle (233 MiB) gives 2.38 / 2.33. Neither
-bundle is published yet, so the page and the worker do not offer it.
+bundle is published yet: the CUDA worker folds it where both bundles are on disk (`test:native`
+skips its three cases elsewhere, saying so), and the page does not offer it.
 
 `--out=x.pdb`, or `--out=x.cif` for mmCIF as AlphaFold 3 writes it (entities, polymer sequences
 and chains declared, so AF3's own reader and gemmi both load it; the pLDDT in B_iso_or_equiv).

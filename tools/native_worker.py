@@ -32,7 +32,9 @@ import traceback
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 NATIVE = os.path.join(REPO, "native")
 WORK = os.environ.get("LOCALFOLD_NATIVE_WORK", "/tmp/localfold-native")
-AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3")
+AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
+# ...whose dialect has no working flow sampler (noFlowSampler, src/af3/dialect.js)
+NO_FLOW_FAMILIES = ("rosettafold3", "chai1")
 NODE = ["node", "--js-float16array", "--max-old-space-size=24000"]
 OUT = sys.stdout
 
@@ -367,10 +369,10 @@ class Worker:
         sampler = controls.get("af3-mode", "diffusion")
         if port == "af3" and sampler not in ("diffusion", "flow"):
             raise Refused(f"the CUDA backend does not know the sampler {sampler!r}")
-        if port == "af3" and sampler == "flow" and family == "rosettafold3":
-            # ...the page's own rule: its walk collapses the backbone while pLDDT reads as if nothing were
-            # wrong (noFlowSampler, src/af3/dialect.js)
-            raise Refused("rosettafold3 has no working flow sampler - set the sampler to Diffusion")
+        if port == "af3" and sampler == "flow" and family in NO_FLOW_FAMILIES:
+            # ...the page's own rule: rf3's walk collapses the backbone while pLDDT reads as if nothing were
+            # wrong, and chai-1 samples with its own second-order step (noFlowSampler, src/af3/dialect.js)
+            raise Refused(f"{family} has no working flow sampler - set the sampler to Diffusion")
         emit("status", f"{family} on CUDA ({self.device}) · reading the job")
         emit("progress", 0.02)
         started = time.time()
@@ -452,9 +454,11 @@ class Worker:
         if port == "af3":
             bundle = ensure_bundle(family, f"model-{family}-int5", log)
             key = ("af3", family)
+            # chai-1's token features are ESM2 3B's, computed in the fold (native/af3/src/esm2.cuh)
+            esm = [f"--esm-bundle={ensure_bundle('esm2-3b', 'model-esm2-3b-int8', log)}"] if family == "chai1" else []
             server = self.server_for(key, [binary("af3"), "-", f"--bundle={bundle}",
-                                           f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}", "--fold", "--fast"],
-                                     residues)
+                                           f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}", "--fold", "--fast",
+                                           *esm], residues)
             export = [*NODE, os.path.join(NATIVE, "af3", "export-model.mjs"), inputs, "--no-weights",
                       f"--bundle={bundle}/manifest.json", f"--job={job_path}", f"--max-msa={requested}", *flags]
             self.node(export, "featurising", log, cwd=os.path.join(NATIVE, "af3"))
