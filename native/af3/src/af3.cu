@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--fold")) doFold = true;
     else if (!strcmp(argv[i], "--no-graphs")) GRAPHS = false;
     else if (!strcmp(argv[i], "--profile")) profile = true;
+    else if (!strcmp(argv[i], "--chai-second-order")) CHAI_SECOND_ORDER = true;     // chai-lab's two calls a step
     else if (!strcmp(argv[i], "--no-flash-split")) FLASH_SPLIT = false;
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);

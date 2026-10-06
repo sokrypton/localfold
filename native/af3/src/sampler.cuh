@@ -119,7 +119,15 @@ __global__ void chaiCorrectK(float* x, const float* d2, const float* g1, float l
 // where 4e-4 <= sigma_prev <= 80 (the scaled sigma against chai's raw thresholds - the weights were sampled so),
 // noise 1.003 sqrt(max(1e-6, tHat^2 - sigma_prev^2)), and its second-order step:
 //   x' = noisy + dt g1;  x = x' + dt ((x' - D(x', sigma)) / sigma + g1) / 2      (dt = sigma - tHat)
-// Two denoiser calls a step, both on one input buffer so one captured graph serves them.
+// (two denoiser calls a step, both on one input buffer so one captured graph serves them), the correction
+// ADDED to the Euler point rather than replacing it - so the walk overshoots, as AF3's step scale 1.5 does.
+// 🔴 BY DEFAULT IT IS ONE CALL A STEP: taking the second call's denoised structure as the first's,
+// D(x', sigma) = D(noisy, tHat), makes its slope EXACTLY g1 (x' - D is (noisy - D) sigma / tHat), so the step is
+// x = noisy + 2 dt g1. Same seed, same steps, the two land 0.02-0.07 A apart at 200 steps (6MRR, 5CAJ) with
+// the same bond geometry on protein, glycerol, ATP, a phosphoserine and DNA - for half the diffusion
+// (5CAJ, 5 x 200: 1805 -> 917 ms) - and at equal calls one-call 50 beats two-call 25 (backbone bonds 0.042
+// against 0.054 A). --chai-second-order is chai-lab's sampler as written.
+inline bool CHAI_SECOND_ORDER = false;
 inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                      const std::function<const float*(const float*, float, const float*)>& denoiseFn,
                                      const std::function<void(const std::vector<float>&)>& onLevels) {
@@ -172,6 +180,10 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
     const float* d1 = denoiseFn(dIn, (float)tHat, dLevels + 2 * (s - 1));
     if (s == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
     if (FRAME_HOOK) FRAME_HOOK(d1, s, T);
+    if (!CHAI_SECOND_ORDER) {                    // one call: the correction's D taken as this step's (see above)
+      chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)(2 * dt), all3);
+      continue;
+    }
     chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)dt, all3);
     CK(cudaMemcpyAsync(dIn, dX, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
     const float* d2 = denoiseFn(dIn, (float)level, dLevels + 2 * (s - 1) + 1);

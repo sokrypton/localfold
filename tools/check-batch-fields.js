@@ -370,6 +370,24 @@ for (const target of Object.keys(TARGETS)) {
     }
     const ours = pick(batch);
     if (ours === undefined) { notes.push(`${name}: unmapped`); continue; }
+    // 🔴 chai1's ATOMISED RESIDUE IS UNKNOWN, WHERE af3-any-model's CHAI GIVES IT THE PARENT: chai-lab's restype is
+    // gemmi's fasta_code(), which is X for every modified residue (SEP, TPO, MSE ...), and its ESM2 sequence
+    // reads X there too. Followed here (atomizedUnknownRestype) because it moves the fold - a phosphoserine's
+    // bonds 0.21 -> 0.11 A rms, chai-lab 0.07. Reported where the tokens are atomised and ours read 20;
+    // every other token is still asserted.
+    if (model === "chai1" && name === "aatype") {
+      const tokensOf = new Map();
+      for (const r of batch.residueOfToken) if (r >= 0) tokensOf.set(r, (tokensOf.get(r) ?? 0) + 1);
+      let atomised = 0, other = 0;
+      for (let t = 0; t < Math.min(ours.length, theirs.length); t += 1) {
+        if (Number(ours[t]) === theirs[t]) continue;
+        const r = batch.residueOfToken[t];
+        if (r >= 0 && tokensOf.get(r) > 1 && Number(ours[t]) === 20) atomised += 1; else other += 1;
+      }
+      if (other !== 0) bad.push(`aatype: ${other} tokens differ that are not an atomised residue's`);
+      if (atomised !== 0) floor.push(`aatype: ${atomised} atomised-residue tokens unknown (chai-lab's gemmi X) where the reference has the parent`);
+      continue;
+    }
     // 🔴 COMPARE THE OVERLAP AND SAY SO. Their atom axis is the dense grid and
     // ours is compacted for some models; a length difference is reported as
     // its own line rather than silently truncating the comparison to nothing.

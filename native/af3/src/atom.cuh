@@ -698,16 +698,18 @@ __global__ void chaiAtomPairK(const float* row, const float* col, const float* q
   v += bf[c] + Wf[(size_t)idx * Cp + c] + Wf[(size_t)12 * Cp + c] / (1.f + sq) + (valid ? Wf[(size_t)13 * Cp + c] : 0.f);
   pair[t] = v;
 }
-// chai-1 restricts every atom attention to atoms of the SAME TOKEN (af3-any-model diffusion_transformer.py,
-// `where(same_token, bias, -1e9)`): folded into a block's pair logits [s][h][q][k] once a fold
-__global__ void sameTokenMaskK(float* pl, const int* tqIdx, const float* tqMask, const int* tkIdx, const float* tkMask,
-                               int subsets, int heads, int queries, int keys) {
+// chai-1's atom attention mask: both atoms real AND in one reference space (one residue, or one ligand) -
+// chai-lab's block_atom_pair_mask, which get_blocked_atom_pair_dists ANDs with the same-ref-space mask IN PLACE
+// before the attention reads it. "Same token" agrees wherever a token is a residue (6MRR, nucleic acids) and
+// blinds every atom of a ligand or an atomised residue to the rest of its molecule: glycerol's bonds 0.29 A rms.
+__global__ void sameRefSpaceMaskK(float* pl, const float* qUid, const float* tqMask, const float* kUid, const float* tkMask,
+                                  int subsets, int heads, int queries, int keys) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)subsets * heads * queries * keys) return;
   int key = (int)(t % keys); size_t rest = t / keys; int q = (int)(rest % queries); rest /= queries;
   int s = (int)(rest / heads);
   size_t qi = (size_t)s * queries + q, ki = (size_t)s * keys + key;
-  if (!(tqMask[qi] != 0 && tkMask[ki] != 0 && tqIdx[qi] == tkIdx[ki])) pl[t] = -1e9f;
+  if (!(tqMask[qi] != 0 && tkMask[ki] != 0 && qUid[qi] == kUid[ki])) pl[t] = -1e9f;
 }
 // flat [(s,q,k)][blocks*heads] -> per block [s][h][q][k]
 __global__ void atomLogitsLayoutK(const float* flat, float* out, int block, int nblocks, int subsets,
@@ -805,6 +807,7 @@ struct EncoderOut {
   float* tokenAct;        // [tokens][perToken]
   float* skip;            // [queryRows][C]
   float *qMask, *kMask, *qCond, *kCond, *pair;
+  float *qUid, *kUid;       // each query's and key's reference space (chai's decoder masks by it too)
   float* qStart;            // the activation's start: qCond, or (preTrunkQuery) it before the trunk term
   std::vector<AtomBlockCache> blocks;
   int C, heads, D, perToken;
@@ -886,7 +889,8 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
     }
   }
   float* qPos = scratch<float>("enc.qPos", qRows * 3); float* kPos = scratch<float>("enc.kPos", kRows * 3);
-  float* qUid = scratch<float>("enc.qUid", qRows); float* kUid = scratch<float>("enc.kUid", kRows);
+  float* qUid = scratch<float>(E + ".qUid", qRows); float* kUid = scratch<float>(E + ".kUid", kRows);
+  o.qUid = qUid; o.kUid = kUid;
   convert(t2q, Fdev("batch.refPos"), qPos, 3);
   convert(q2k, qPos, kPos, 3);
   // the batch's own uids, every time: a process-wide cache handed OpenDDE's structural-token
@@ -930,8 +934,8 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
   if (chai) {
     size_t per = (size_t)sh.subsets * o.heads * sh.queries * sh.keys;
     for (float* pl : logits)
-      sameTokenMaskK<<<blocks(per), 256, 0, STREAM>>>(pl, tq.idx, tq.mask, tk.idx, tk.mask, sh.subsets, o.heads, sh.queries,
-                                                      sh.keys);
+      sameRefSpaceMaskK<<<blocks(per), 256, 0, STREAM>>>(pl, qUid, tq.mask, kUid, tk.mask, sh.subsets, o.heads, sh.queries,
+                                                         sh.keys);
   }
   for (int b = 0; b < nblocks; ++b)
     o.blocks.push_back(prepareAtomBlock(E + ".blocks." + std::to_string(b), o.qCond, qRows, C, logits[b]));

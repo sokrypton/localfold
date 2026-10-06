@@ -272,6 +272,18 @@ if (sequence !== "") {
 } else {
   batch = batchFromDump(JSON.parse(readFileSync(batchPath, "utf8")));
 }
+// 🔴 chai-1's token-bond feature is the job's DECLARED covalent bonds alone (chai-lab TokenBondRestraint: its
+// restraints and glycan links, never a ligand's own CCD bonds), so with none declared it is all zeros, through
+// both halves of bond_loss_input_proj (no bias). The bond matrix the featuriser builds holds every ligand
+// bond and must not reach its trunk or diffusion. A declared bond needs the trunk half of that projection,
+// which no bundle carries yet: refused by name rather than folded without it.
+if (dialect?.chaiTokenEmbedding === true) {
+  if (jobRequest?.bonds?.length) {
+    throw new Error("Chai-1 does not take declared covalent bonds yet (bondedAtomPairs, a glycan's links): the"
+      + " trunk half of its bond projection is not in the bundle");
+  }
+  delete batch.bondMatrix;
+}
 add("batch", batch);
 // chai1's tokens read ESM2 3B, which native runs (src/esm2.cuh, --esm-bundle): each protein chain's token ids and
 // every token's row (src/af3/featurise/esm2-input.js) - unless the batch already carries the embeddings (a dump's)

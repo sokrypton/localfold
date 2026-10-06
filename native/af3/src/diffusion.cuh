@@ -945,15 +945,15 @@ inline DecoderCache prepareDecoder(const EncoderOut& enc) {
   const float* cond = enc.qCond;
   if (M.flag("trunk.dialect.chaiAtomStack")) {
     // chai conditions its decoder on a second, affine LayerNorm of the encoder's conditioning, and restricts its
-    // attention to the same token as the encoder does
+    // attention to one reference space as the encoder does
     float* c2 = scratch<float>("dec.cond", qRows * d.C);
     layerNormSlow(enc.qCond, c2, qRows, d.C, W(Dd + ".postAtomCondLayerNormScale"), W(Dd + ".postAtomCondLayerNormOffset"));
     cond = c2;
     Gather tq = gatherOf("batch.tokensToQueries"), tk = gatherOf("batch.tokensToKeys");
     size_t per = (size_t)sh.subsets * d.heads * sh.queries * sh.keys;
     for (float* pl : logits)
-      sameTokenMaskK<<<blocks(per), 256, 0, STREAM>>>(pl, tq.idx, tq.mask, tk.idx, tk.mask, sh.subsets, d.heads, sh.queries,
-                                                      sh.keys);
+      sameRefSpaceMaskK<<<blocks(per), 256, 0, STREAM>>>(pl, enc.qUid, tq.mask, enc.kUid, tk.mask, sh.subsets, d.heads,
+                                                         sh.queries, sh.keys);
   }
   for (int b = 0; b < nblocks; ++b)
     d.blocks.push_back(prepareAtomBlock(Dd + ".blocks." + std::to_string(b), cond, qRows, d.C, logits[b]));

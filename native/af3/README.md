@@ -67,7 +67,21 @@ confidence 1e-6. 6MRR from its sequence folds at 0.92-1.93 A over five samples (
 0.95-1.78); 5CAJ at 2.32 A, 2.28 with its template - the N-terminal tag and the doubly-modelled
 165-169 loop, 0.46 / 0.39 A over the best 90%. The int5 bundle (233 MiB) gives 2.38 / 2.33. Neither
 bundle is published yet: the CUDA worker folds it where both bundles are on disk (`test:native`
-skips its three cases elsewhere, saying so), and the page does not offer it.
+skips its four cases elsewhere, saying so), and the page does not offer it.
+
+Where this port leaves af3-any-model for chai-lab, measured each time:
+- **One denoiser call a step** (sampler.cuh; `--chai-second-order` is chai-lab's two). Same seed and steps,
+  the two land 0.02-0.07 A apart at 200 steps with the same bonds on protein, glycerol, ATP, a
+  phosphoserine and DNA, for half the diffusion (5CAJ, 5 x 200: 2.82 -> 1.93 s a fold).
+- **Atom attention within one reference space, not one token** - chai-lab ANDs its block mask with the
+  same-ref-space mask in place before attending. The two agree wherever a token is a residue (6MRR, a
+  nucleic acid) and the token rule blinds a ligand's atoms to each other: glycerol 0.29 -> 0.053 A bond
+  rms, ATP 0.27 -> 0.058.
+- **An atomised residue's tokens are unknown** (gemmi's fasta code, X for SEP): a phosphoserine
+  0.21 -> 0.11 A, where chai-lab is 0.07 - the rest is open.
+- **No token-bond term**: chai-lab's carries declared covalent bonds alone, so an ordinary ligand's is
+  zero, and a declared one (`bondedAtomPairs`, a glycan) is refused until its trunk weights are exported.
+- The diffusion's pair input (chai's structure token-pair features) and the confidence head's single.
 
 `--out=x.pdb`, or `--out=x.cif` for mmCIF as AlphaFold 3 writes it (entities, polymer sequences
 and chains declared, so AF3's own reader and gemmi both load it; the pLDDT in B_iso_or_equiv).
