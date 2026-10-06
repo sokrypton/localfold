@@ -62,7 +62,21 @@ if os.environ.get("TEMPLATE_CIF"):
         tmpl = folding_input.Template(mmcif=tmpl.mmcif, query_to_template_map={i: i + off for i in range(len(seq))})
     templates = [tmpl]
     print("self-template", len(seq), "residues:", seq)
-batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, os.environ.get("MODEL_DIR") or None, templates)
+# SEQ= / SEP=<position> / USER_CCD=<cif>: another job, a phosphoserine on it (an atomised residue, which 6MRR
+# cannot reach)
+chains = None
+if os.environ.get("SEQ"):
+    seq = os.environ["SEQ"]
+if os.environ.get("SEP"):
+    from alphafold3.common import folding_input
+    chains = [folding_input.ProteinChain(id="A", sequence=seq, ptms=[("SEP", int(os.environ["SEP"]))],
+                                         unpaired_msa="", paired_msa="", templates=[])]
+if os.environ.get("USER_CCD"):
+    import functools
+    from alphafold3.constants import decoded_ccd
+    decoded_ccd.get_ccd = functools.partial(decoded_ccd.get_ccd, user_ccd=open(os.environ["USER_CCD"]).read())
+batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, os.environ.get("MODEL_DIR") or None, templates,
+                                               chains=chains)
 # 🔴 fp32, NOT the fold path's bfloat16. A port compared against a bfloat16
 # reference is being held to the reference's rounding as well as its model.
 cfg.global_config.bfloat16 = "none"

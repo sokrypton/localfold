@@ -84,15 +84,33 @@ def structure_pair(tf):
 def main():
     import haiku as hk, jax, jax.numpy as jnp
     from alphafold3.model import params as afp
-    seq, _ = fold_check.parse_ca(os.path.expanduser("~/6MRR.pdb"))
-    batch, cfg, model_dir = fold_check._fold_setup("chai1", seq, os.environ.get("MODEL_DIR") or None)
+    # SEQ= / SEP=<position> / USER_CCD=<cif>: another job (a phosphoserine, to reach the atomised-residue
+    # paths 6MRR cannot), its trunk conditioning RANDOM (SYNTH=1) since no trunk dump exists for it - both
+    # sides read the same inputs, so exactness is what this measures, not geometry; SUFFIX= names the outputs
+    seq = os.environ.get("SEQ") or fold_check.parse_ca(os.path.expanduser("~/6MRR.pdb"))[0]
+    chains = None
+    if os.environ.get("SEP"):
+        from alphafold3.common import folding_input
+        chains = [folding_input.ProteinChain(id="A", sequence=seq, ptms=[("SEP", int(os.environ["SEP"]))],
+                                             unpaired_msa="", paired_msa="", templates=[])]
+    if os.environ.get("USER_CCD"):
+        import functools
+        from alphafold3.constants import decoded_ccd
+        decoded_ccd.get_ccd = functools.partial(decoded_ccd.get_ccd, user_ccd=open(os.environ["USER_CCD"]).read())
+    batch, cfg, model_dir = fold_check._fold_setup("chai1", seq, os.environ.get("MODEL_DIR") or None, chains=chains)
     cfg.global_config.bfloat16 = "none"
     fb = feat_batch.Batch.from_data_dict(batch)
     feats = flat_atom_features(fb)
     n_tok = int(np.asarray(fb.token_features.mask).shape[0]); max_atoms = feats["mask"].shape[1]
-    trunk = json.loads((REPO / "oracle-dumps" / "af3-oracle-trunk-chai1.json").read_text())["stages"]
-    get = lambda k: np.asarray(trunk[k]["data"], np.float32).reshape(trunk[k]["shape"])
-    s, z, s_struct = get("single"), get("pair"), get("target_feat_structure")
+    if os.environ.get("SYNTH"):
+        r = np.random.default_rng(1)
+        s = (r.normal(size=(n_tok, 384)) * 0.5).astype(np.float32)
+        z = (r.normal(size=(n_tok, n_tok, 256)) * 0.5).astype(np.float32)
+        s_struct = (r.normal(size=(n_tok, 384)) * 0.5).astype(np.float32)
+    else:
+        trunk = json.loads((REPO / "oracle-dumps" / "af3-oracle-trunk-chai1.json").read_text())["stages"]
+        get = lambda k: np.asarray(trunk[k]["data"], np.float32).reshape(trunk[k]["shape"])
+        s, z, s_struct = get("single"), get("pair"), get("target_feat_structure")
     z_struct = structure_pair(fb.token_features)
     if os.environ.get("Z_STRUCT_OUT"):
         np.save(os.environ["Z_STRUCT_OUT"], z_struct)
@@ -130,11 +148,12 @@ def main():
         put(k, batch[k])
     put("seq_mask", fb.token_features.mask)
     out["output"] = {"shape": list(x.shape), "data": x.astype(np.float32).ravel().tolist()}
-    (REPO / "oracle-dumps" / "af3-oracle-denoise-chai1.json").write_text(json.dumps(out))
+    tag = "chai1" + os.environ.get("SUFFIX", "")
+    (REPO / "oracle-dumps" / f"af3-oracle-denoise-{tag}.json").write_text(json.dumps(out))
     stages = {"model": "chai1", "tokens": n_tok, "maxAtoms": int(max_atoms), "noise": NOISE, "stages": TRACE,
               "source": out["source"] + ", seams traced"}
-    (REPO / "oracle-dumps" / "af3-oracle-stages-chai1.json").write_text(json.dumps(stages))
-    print("wrote af3-oracle-denoise-chai1.json and af3-oracle-stages-chai1.json;", ", ".join(sorted(TRACE)))
+    (REPO / "oracle-dumps" / f"af3-oracle-stages-{tag}.json").write_text(json.dumps(stages))
+    print(f"wrote af3-oracle-denoise-{tag}.json and af3-oracle-stages-{tag}.json;", ", ".join(sorted(TRACE)))
 
 
 if __name__ == "__main__":
