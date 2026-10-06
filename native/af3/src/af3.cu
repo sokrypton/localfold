@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
   else if (!bundleDir.empty()) M.loadBundle(bundleDir, "", mapFile);
   // (its matrices stay resident as int8 codes and expand a layer at a time: src/esm2.cuh)
   const int esmSeg = (int)M.segs.size();
-  if (!esmBundle.empty()) M.loadBundle(esmBundle, "e", "", "", "blocks/");
+  if (!esmBundle.empty()) M.loadBundle(esmBundle, "e", "", "", "blocks/", true);   // (int3 or int8 codes, resident)
   const bool haveWeights = !weightsDir.empty() || !bundleDir.empty();
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;

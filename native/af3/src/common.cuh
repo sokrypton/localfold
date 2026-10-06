@@ -166,14 +166,38 @@ struct Segment { const float* data; size_t bytes; float* device; std::map<std::s
                  bool bundle = false; std::string dir; std::vector<std::string> files; std::vector<BRec> recs;
                  std::map<int, std::vector<float>> hostCopies;     // a bundle tensor the host read, decoded
                  std::vector<BRec> srcRecs; size_t scratchElems = 0; std::vector<GPart> parts;   // (gathered tensors)
-                 // RESIDENT int8 (loadBundle's residentPrefix): tensors kept on the device as their codes and float16
-                 // scales, never decoded into the float32 copy - a model too large for it (ESM-C 6B: 25 GB as float32,
-                 // 6.4 GB as codes) - each with where its codes and scales land in `resident`
-                 struct Res { BRec b; size_t codes, scales; };
+                 // RESIDENT codes (loadBundle's residentPrefix): tensors kept on the device as their int8 or packed
+                 // int<bits> codes and float16 scales (and zeros, packed), never decoded into the float32 copy - a model
+                 // too large for it (ESM-C 6B: 25 GB as float32, 6.4 GB as codes; ESM2 3B at int3: 11 GB, 1.1) - each
+                 // with where its codes, scales and zeros land in `resident`
+                 struct Res { BRec b; size_t codes, scales, zeros; };
                  std::vector<Res> residentRecs; unsigned char* resident = nullptr; size_t residentBytes = 0;
                };
-// a resident int8 tensor on the device: codes, a float16 scale per `block` consecutive elements
-struct ResidentInt8 { const signed char* codes; const __half* scales; size_t elements; int block; };
+// A float32 array as a NumPy .npy file (format 1.0: magic, header dict padded to 64 bytes, data)
+inline void writeNpy(const std::string& path, const std::vector<float>& data, const std::vector<size_t>& shape) {
+  std::string dims;
+  for (size_t k = 0; k < shape.size(); ++k) dims += std::to_string(shape[k]) + (shape.size() == 1 || k + 1 < shape.size() ? "," : "");
+  std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + dims + "), }";
+  size_t total = 10 + header.size() + 1;
+  header += std::string((64 - total % 64) % 64, ' ') + "\n";
+  FILE* f = fopen(path.c_str(), "wb");
+  if (!f) { fprintf(stderr, "cannot write %s\n", path.c_str()); exit(1); }
+  const char magic[] = "\x93NUMPY\x01\x00";
+  fwrite(magic, 1, 8, f);
+  uint16_t len = (uint16_t)header.size(); fwrite(&len, 2, 1, f);
+  fwrite(header.data(), 1, header.size(), f);
+  fwrite(data.data(), 4, data.size(), f);
+  fclose(f);
+}
+// a resident tensor on the device: codes, a float16 scale per `block` consecutive elements, and - packed int<bits>,
+// asymmetric (bits < 8) - a float16 zero per block too (value = code * scale + zero); bits 8 is symmetric int8
+struct ResidentInt8 { const signed char* codes; const __half* scales; size_t elements; int block;
+                      const __half* zeros = nullptr; int bits = 8; };
+// a resident record's bytes: its codes, and its scales (zeros the same again, packed)
+inline size_t residentCodeBytes(const BRec& b) {
+  return b.kind == 2 ? b.elements : (b.elements + b.block - 1) / b.block * ((size_t)b.block * b.bits / 8);
+}
+inline size_t residentScaleBytes(const BRec& b) { return 2 * ((b.elements + b.block - 1) / b.block); }
 struct Model {
   std::map<std::string, Entry> index;
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
@@ -223,7 +247,7 @@ struct Model {
   // With `map` (a port's .map, native/make_map.mjs), the entries are the map's instead: each `b` line a
   // slice of a bundle tensor under the port's own name, each `z` zeros, each `m` metadata as it is.
   void loadBundle(const std::string& dir, const std::string& prefix, const std::string& map = "",
-                  const std::string& delta = "", const std::string& residentPrefix = "") {
+                  const std::string& delta = "", const std::string& residentPrefix = "", bool residentPacked = false) {
     if (!delta.empty() && map.empty()) { fprintf(stderr, "a delta bundle is read through a map\n"); exit(1); }
     std::ifstream in(dir + "/manifest.json");
     if (!in) { fprintf(stderr, "no %s/manifest.json\n", dir.c_str()); exit(1); }
@@ -284,10 +308,15 @@ struct Model {
       if (!map.empty()) { byName[name] = b; continue; }
       std::string key = prefix + "/" + name;
       if (index.count(key)) { fprintf(stderr, "%s is in two model directories\n", key.c_str()); exit(1); }
-      if (!residentPrefix.empty() && b.kind == 2 && !name.compare(0, residentPrefix.size(), residentPrefix)) {
+      // (int8 under the prefix is always resident; packed int<bits> only where the caller reads it so - ESM2 3B's
+      // int3 - and is decoded into the float32 copy otherwise, as ESM-C 600M's tower expects)
+      if (!residentPrefix.empty() && (b.kind == 2 || (b.kind == 3 && residentPacked)) &&
+          !name.compare(0, residentPrefix.size(), residentPrefix)) {
         auto align = [](size_t v) { return (v + 255) / 256 * 256; };
-        Segment::Res r{b, align(sg.residentBytes), 0};
-        r.scales = align(r.codes + n); sg.residentBytes = r.scales + 2 * ((n + b.block - 1) / b.block);
+        Segment::Res r{b, align(sg.residentBytes), 0, 0};
+        r.scales = align(r.codes + residentCodeBytes(b));
+        r.zeros = align(r.scales + residentScaleBytes(b));
+        sg.residentBytes = b.kind == 3 ? r.zeros + residentScaleBytes(b) : r.scales + residentScaleBytes(b);
         Entry e{'q', 0, n, 0, seg}; e.rec = (int)sg.residentRecs.size();
         index[key] = e; sg.residentRecs.push_back(r);
         addMeta(key + "#r", (double)shape.size());
@@ -472,11 +501,13 @@ struct Model {
       while (got < n) { ssize_t r = read(fd, pin[k] + got, n - got); if (r <= 0) { close(fd); return false; } got += (size_t)r; }
       close(fd);
       pin[k][n] = pin[k][n + 1] = 0;          // (a packed code's second byte past the last group)
-      for (const auto& r : s.residentRecs)    // the resident tensors' codes and scales, as they are
+      for (const auto& r : s.residentRecs)    // the resident tensors' codes, scales and zeros, as they are
         if (r.b.file == (int)fi &&
-            (cudaMemcpyAsync(s.resident + r.codes, pin[k] + r.b.byteOffset, r.b.elements, cudaMemcpyHostToDevice, st) != cudaSuccess ||
-             cudaMemcpyAsync(s.resident + r.scales, pin[k] + r.b.scaleOffset, 2 * ((r.b.elements + r.b.block - 1) / r.b.block),
-                             cudaMemcpyHostToDevice, st) != cudaSuccess)) return false;
+            (cudaMemcpyAsync(s.resident + r.codes, pin[k] + r.b.byteOffset, residentCodeBytes(r.b), cudaMemcpyHostToDevice, st) != cudaSuccess ||
+             cudaMemcpyAsync(s.resident + r.scales, pin[k] + r.b.scaleOffset, residentScaleBytes(r.b),
+                             cudaMemcpyHostToDevice, st) != cudaSuccess ||
+             (r.b.kind == 3 && cudaMemcpyAsync(s.resident + r.zeros, pin[k] + r.b.zeroOffset, residentScaleBytes(r.b),
+                                               cudaMemcpyHostToDevice, st) != cudaSuccess))) return false;
       auto& table = tables[k]; table.clear();
       for (const BRec& b : s.recs)
         if (b.file == (int)fi || (b.kind == 4 && fi == 0))
@@ -732,12 +763,12 @@ struct Model {
       if (!s.residentBytes || s.resident) continue;
       CK(cudaMalloc(&s.resident, s.residentBytes));
       size_t most = 0;
-      for (const auto& r : s.residentRecs) most = std::max(most, r.b.elements + 2 * ((r.b.elements + r.b.block - 1) / r.b.block));
+      for (const auto& r : s.residentRecs) most = std::max(most, residentCodeBytes(r.b) + 2 * residentScaleBytes(r.b));
       unsigned char* pin; CK(cudaHostAlloc(&pin, most, cudaHostAllocDefault));
       int file = -1, fd = -1;
       for (const auto& r : s.residentRecs) {
         if (r.b.file != file) { if (fd >= 0) close(fd); file = r.b.file; fd = open(shardPath(s, s.files[file]).c_str(), O_RDONLY); }
-        size_t sbytes = 2 * ((r.b.elements + r.b.block - 1) / r.b.block);
+        size_t cbytes = residentCodeBytes(r.b), sbytes = residentScaleBytes(r.b);
         auto readAt = [&](unsigned char* to, size_t n, size_t at) {
           for (size_t got = 0; got < n;) {
             ssize_t k = pread(fd, to + got, n - got, (off_t)(at + got));
@@ -745,9 +776,11 @@ struct Model {
             got += (size_t)k;
           }
         };
-        readAt(pin, r.b.elements, r.b.byteOffset); readAt(pin + r.b.elements, sbytes, r.b.scaleOffset);
-        CK(cudaMemcpy(s.resident + r.codes, pin, r.b.elements, cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(s.resident + r.scales, pin + r.b.elements, sbytes, cudaMemcpyHostToDevice));
+        readAt(pin, cbytes, r.b.byteOffset); readAt(pin + cbytes, sbytes, r.b.scaleOffset);
+        if (r.b.kind == 3) readAt(pin + cbytes + sbytes, sbytes, r.b.zeroOffset);
+        CK(cudaMemcpy(s.resident + r.codes, pin, cbytes, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(s.resident + r.scales, pin + cbytes, sbytes, cudaMemcpyHostToDevice));
+        if (r.b.kind == 3) CK(cudaMemcpy(s.resident + r.zeros, pin + cbytes + sbytes, sbytes, cudaMemcpyHostToDevice));
       }
       if (fd >= 0) close(fd);
       CK(cudaFreeHost(pin));
@@ -763,7 +796,8 @@ struct Model {
       fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
     }
     const auto& r = s.residentRecs[e.rec];
-    return { (const signed char*)(s.resident + r.codes), (const __half*)(s.resident + r.scales), r.b.elements, r.b.block };
+    return { (const signed char*)(s.resident + r.codes), (const __half*)(s.resident + r.scales), r.b.elements, r.b.block,
+             r.b.kind == 3 ? (const __half*)(s.resident + r.zeros) : nullptr, r.b.kind == 3 ? r.b.bits : 8 };
   }
   bool has(const std::string& k) const { return index.count(k) > 0; }
   const Entry& at(const std::string& k) const {

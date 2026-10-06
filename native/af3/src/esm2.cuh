@@ -7,8 +7,9 @@
 //               x = x + gelu(LN(x; ffn_norm) @ fc1 + b) @ fc2 + b      (exact gelu, no residual scale)
 //   out = LN(x; final_norm), the LAST state only, one chain at a time as [BOS, residues, EOS], BOS/EOS stripped
 //
-// The bundle is tools/export_esm2_3b.py's: matrices RESIDENT as af3-any-model's int8 codes ([out, in], a float16
-// scale a row; q | k | v stacked), each expanded to float16 for its GEMM - 2.7 GB on the device, not 11.
+// The bundle is tools/export_esm2_3b.py's layout ([out, in]; q | k | v stacked), its matrices RESIDENT as codes and
+// each expanded to float16 for its GEMM: the published int3 at group 128 (tools/quantize_af3.py, ESM-C's codec) -
+// 1.1 GB on the device, not 11 - or af3-any-model's int8, a float16 scale a row (2.7 GB).
 // Loaded under `e/` (Model::loadBundle(dir, "e", "", "", "blocks/")).
 #pragma once
 #include "common.cuh"
@@ -18,6 +19,16 @@ namespace esm2 {
 __global__ void expandK(const signed char* q, const __half* scale, __half* w, size_t n, int block) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n) w[t] = __float2half(__half2float(scale[t / block]) * (float)q[t]);
+}
+// ...or packed int<bits> codes with a float16 scale and zero per `block` (tools/quantize_af3.py's asymmetric
+// int3, group 128 - ESM-C's codec), value = code * scale + zero
+__global__ void expandPackedK(const unsigned char* q, const __half* scale, const __half* zero, __half* w, size_t n,
+                              int block, int bits) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n) return;
+  size_t g = t / block, bit = g * ((size_t)block * bits) + (t % block) * bits, byte = bit >> 3;
+  unsigned int code = ((q[byte] | ((unsigned int)q[byte + 1] << 8)) >> (bit & 7)) & ((1u << bits) - 1);
+  w[t] = __float2half((float)code * __half2float(scale[g]) + __half2float(zero[g]));
 }
 __global__ void embedK(const int* ids, const float* table, float* x, int rows, int C, float scale) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -90,9 +101,13 @@ inline Tower tower() {
 // Y [rows, out] = X [rows, in] W^T (+ beta Y), W the resident e/<name>/weightsT: f16 inputs, f32 accumulation
 inline void gemm(const float* X, const std::string& name, float* Y, int rows, int in, int out, float beta) {
   ResidentInt8 r = M.residentInt8("e/" + name + "/weightsT");
-  if (r.elements != (size_t)in * out || r.block != in) { fprintf(stderr, "e/%s/weightsT is not [%d, %d]\n", name.c_str(), out, in); exit(1); }
+  if (r.elements != (size_t)in * out || (r.bits == 8 && r.block != in)) {
+    fprintf(stderr, "e/%s/weightsT is not [%d, %d]\n", name.c_str(), out, in); exit(1);
+  }
   __half* w = scratch<__half>("esm2.w16", r.elements);
-  expandK<<<blocks(r.elements), 256, 0, STREAM>>>(r.codes, r.scales, w, r.elements, r.block);
+  if (r.bits == 8) expandK<<<blocks(r.elements), 256, 0, STREAM>>>(r.codes, r.scales, w, r.elements, r.block);
+  else expandPackedK<<<blocks(r.elements), 256, 0, STREAM>>>((const unsigned char*)r.codes, r.scales, r.zeros, w, r.elements,
+                                                            r.block, r.bits);
   __half* xh = scratch<__half>("esm2.xh", (size_t)rows * in);
   toHalfRowsK<<<blocks((size_t)rows * in), 256, 0, STREAM>>>(X, xh, (size_t)rows * in);
   const float one = 1.f;

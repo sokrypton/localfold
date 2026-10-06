@@ -1142,6 +1142,8 @@ inline float* esmEmbeddings(int tokens, int& E) {
   }
   float* out = scratch<float>("esm.emb", (size_t)tokens * E);
   gatherEsmRowsK<<<blocks((size_t)tokens * E), 256, 0, STREAM>>>(rows, Idev("esm.tokenRow"), out, tokens, E);
+  // (LOCALFOLD_SAVE_SEAMS=<dir>: the tower's rows too, as esm.npy - how a codec for its weights is judged)
+  if (const char* dir = getenv("LOCALFOLD_SAVE_SEAMS")) writeNpy(std::string(dir) + "/esm.npy", download(rows, total * E), { total, (size_t)E });
   return out;
 }
 inline float* buildTargetFeat() {

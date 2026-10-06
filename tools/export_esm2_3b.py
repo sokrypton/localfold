@@ -3,6 +3,14 @@
 af3-any-model's own quantisation (lm/esm2.bin.zst), not a second one.
 
   python3 tools/export_esm2_3b.py --tower <af3-any-model's esm2.unpacked dir> --out model-esm2-3b-int8
+  ~/venv_ef2/bin/python tools/export_esm2_3b.py --hf <facebook/esm2_t36_3B_UR50D dir> --out model-esm2-3b-f32 \
+      --check model-esm2-3b-int8
+  python3 tools/quantize_af3.py --source model-esm2-3b-f32 --out model-esm2-3b-int3 --bits 3 --group 128
+
+--hf writes the same tensors, every one float32, from the ORIGINAL weights (Hugging Face's EsmForMaskedLM
+checkpoint) - the quantiser's source, for an int3 bundle at ESM-C's group 128 rather than one requantised from
+af3-any-model's int8. --check holds each matrix to the int8 bundle's dequantised values, so a wrong mapping
+fails here rather than as a quietly worse language model.
 
 36 blocks x 2560, 40 heads of 64, FFN 10240; 2.8 B parameters, 2.7 GB as int8 codes. As tools/export_esmc6b.py
 does for ESM-C 6B, each matrix [in, out] with a float32 scale per OUTPUT channel (esm.py `_deq`) is written
@@ -32,11 +40,91 @@ from export_esmc6b import MixedShards                       # noqa: E402
 VECTORS = ('attn_norm/scale', 'attn_norm/offset', 'ffn_norm/scale', 'ffn_norm/offset')
 
 
+def from_hf(hf_dir, out, check):
+    """The original checkpoint as a float32 bundle in this tool's layout (see the header)."""
+    import torch
+    state = {}
+    for part in sorted(pathlib.Path(hf_dir).glob('pytorch_model-*.bin')):
+        state.update(torch.load(part, map_location='cpu', weights_only=True))
+    get = lambda k: state[k].float().numpy()
+    layers = 1 + max(int(k.split('.')[3]) for k in state if k.startswith('esm.encoder.layer.'))
+    out_dir = ROOT / out
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in list(out_dir.glob('weights-*.bin')):
+        stale.unlink()
+    writer = MixedShards(out_dir)
+    tensors = {'embed/weights': get('esm.embeddings.word_embeddings.weight'),
+               'final_norm/scale': get('esm.encoder.emb_layer_norm_after.weight'),
+               'final_norm/offset': get('esm.encoder.emb_layer_norm_after.bias')}
+    for layer in range(layers):
+        h, at = 'esm.encoder.layer.%d.' % layer, 'blocks/%d/' % layer
+        tensors[at + 'attn_norm/scale'] = get(h + 'attention.LayerNorm.weight')
+        tensors[at + 'attn_norm/offset'] = get(h + 'attention.LayerNorm.bias')
+        tensors[at + 'ffn_norm/scale'] = get(h + 'LayerNorm.weight')
+        tensors[at + 'ffn_norm/offset'] = get(h + 'LayerNorm.bias')
+        qkv = ['attention.self.%s' % m for m in ('query', 'key', 'value')]       # torch Linear weights are [out, in]
+        tensors[at + 'qkv/weightsT'] = np.concatenate([get(h + m + '.weight') for m in qkv])
+        tensors[at + 'qkv/bias'] = np.concatenate([get(h + m + '.bias') for m in qkv])
+        for ours, theirs in (('attn_out', 'attention.output.dense'), ('fc1', 'intermediate.dense'), ('fc2', 'output.dense')):
+            tensors[at + ours + '/weightsT'] = get(h + theirs + '.weight')
+            tensors[at + ours + '/bias'] = get(h + theirs + '.bias')
+    if check:
+        reference = json.loads((ROOT / check / 'manifest.json').read_text())['tensors']
+        worst, worst_name = 0.0, None
+        for name, values in tensors.items():
+            r = reference[name]
+            if list(values.shape) != r['shape']:
+                raise SystemExit('%s: %s here, %s in %s' % (name, list(values.shape), r['shape'], check))
+            raw = (ROOT / check / r['file']).read_bytes()
+            n = int(np.prod(r['shape']))
+            if r['dtype'] == 'float32':
+                theirs = np.frombuffer(raw, '<f4', n, r['byteOffset'])
+            else:
+                codes = np.frombuffer(raw, np.int8, n, r['byteOffset']).astype(np.float32)
+                scale = np.frombuffer(raw, '<f2', n // r['block'], r['scaleOffset']).astype(np.float32)
+                theirs = codes * np.repeat(scale, r['block'])
+            rel = float(np.sqrt(np.mean((values.ravel() - theirs) ** 2) / np.mean(theirs ** 2)))
+            if rel > worst:
+                worst, worst_name = rel, name
+            # (int8 with one scale a ROW is coarse on fc2's 10240-wide rows: 2.8e-2 there; a wrong tensor is ~1.4)
+            if rel > 1e-1:
+                raise SystemExit('%s: relRMS %.2e against %s - not the same tensor' % (name, rel, check))
+        print('every tensor within relRMS %.2e of %s (its int8 rounding; worst %s)' % (worst, check, worst_name))
+    for name, values in tensors.items():
+        writer.float32(name, values)
+    writer.close()
+    width = tensors['embed/weights'].shape[1]
+    manifest = {
+        'formatVersion': 1,
+        'source': 'ESM2 3B from facebook/esm2_t36_3B_UR50D (float32), the quantiser\'s source',
+        'model': {'name': 'esm2', 'recycles': 0},
+        'bundle': {'purpose': 'native-inference', 'model': 'esm2', 'encoding': 'float32'},
+        'languageModel': {'tower': 'esm2-3b', 'layers': int(layers), 'width': int(width), 'heads': int(width // 64),
+                          'ffn': int(tensors['blocks/0/fc1/weightsT'].shape[0]), 'residualScale': 1.0,
+                          'embedScale': 1.0 - 0.15 * 0.8, 'transposedMatrices': 1},
+        'weightLayout': 'blocks/*/*/weightsT are [out, in]; qkv rows are q | k | v',
+        # 🔴 THE TOKEN EMBEDDING STAYS float32 (338 KB), as af3-any-model's int8 keeps it: at int3 group 128 its
+        # rare rows go first, and X - every modified residue in Chai-1's ESM2 sequence - took a phosphoserine
+        # job's pLDDT 82.5 -> 77.4 and pTM 0.75 -> 0.65 with the structure unmoved
+        'float32Tensors': ['embed/weights'],
+        'tensors': writer.records,
+    }
+    (out_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print('%s: %d layers x %d, %d tensors' % (out_dir.name, layers, width, len(writer.records)))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--tower', required=True, help="af3-any-model's esm2.unpacked directory (its .npy cache)")
+    parser.add_argument('--tower', help="af3-any-model's esm2.unpacked directory (its .npy cache)")
+    parser.add_argument('--hf', help="facebook/esm2_t36_3B_UR50D's directory: a float32 bundle from it")
+    parser.add_argument('--check', help='an int8 bundle each --hf tensor must agree with')
     parser.add_argument('--out', default='model-esm2-3b-int8')
     arguments = parser.parse_args()
+    if arguments.hf:
+        return from_hf(arguments.hf, arguments.out, arguments.check)
+    if not arguments.tower:
+        parser.error('--tower or --hf')
     tower = pathlib.Path(arguments.tower)
     load = lambda key: np.load(tower / (key.replace('/', '__') + '.npy'), mmap_mode='r')
     out_dir = ROOT / arguments.out
