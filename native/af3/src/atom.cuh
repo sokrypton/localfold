@@ -1164,7 +1164,7 @@ inline float* buildTargetFeat() {
     } else {
       // ESM2 3B here (src/esm2.cuh): each protein chain alone, its rows gathered onto the tokens, zeros elsewhere
       if (!M.has("esm.ids")) { fprintf(stderr, "chai-1 reads ESM2 embeddings: the input has neither them nor esm.ids\n"); exit(1); }
-      if (!M.has("e/embed/weights")) { fprintf(stderr, "chai-1 reads ESM2: give af3 --esm-bundle=<model-esm2-3b-int8>\n"); exit(1); }
+      if (!M.has("e/esm2/embed/weights")) { fprintf(stderr, "chai-1 reads ESM2: give af3 --esm-bundle=<a directory holding af3-any-model's lm/esm2.bin.zst>\n"); exit(1); }
       esm = esmEmbeddings(tokens, E);
     }
     linear<float, float>(esm, feat, tokens, E, C, P + "esmWeights", false, 1.f);

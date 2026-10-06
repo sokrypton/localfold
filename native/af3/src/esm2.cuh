@@ -7,28 +7,23 @@
 //               x = x + gelu(LN(x; ffn_norm) @ fc1 + b) @ fc2 + b      (exact gelu, no residual scale)
 //   out = LN(x; final_norm), the LAST state only, one chain at a time as [BOS, residues, EOS], BOS/EOS stripped
 //
-// The bundle is tools/export_esm2_3b.py's layout ([out, in]; q | k | v stacked), its matrices RESIDENT as codes and
-// each expanded to float16 for its GEMM: the published int3 at group 128 (tools/quantize_af3.py, ESM-C's codec) -
-// 1.1 GB on the device, not 11 - or af3-any-model's int8, a float16 scale a row (2.7 GB).
-// Loaded under `e/` (Model::loadBundle(dir, "e", "", "", "blocks/")).
+// The weights are af3-any-model's own lm/esm2.bin.zst, read as published (common.cuh's blob reader): its matrices
+// [in, out] int8 with a float32 scale per output channel, kept RESIDENT as their codes (2.7 GB, not 11) and each
+// expanded to float16 for its GEMM; biases and norms float16. q, k and v are three matrices there, expanded side
+// by side into one [in, 3C] so the attention's projection stays one GEMM.
+// Loaded under `e/` (Model::loadBundle(dir, "e", "", "", "esm2/blocks/")).
 #pragma once
 #include "common.cuh"
 
 namespace esm2 {
-// a resident [out, in] int8 matrix, a float16 scale a row, expanded to float16
-__global__ void expandK(const signed char* q, const __half* scale, __half* w, size_t n, int block) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) w[t] = __float2half(__half2float(scale[t / block]) * (float)q[t]);
-}
-// ...or packed int<bits> codes with a float16 scale and zero per `block` (tools/quantize_af3.py's asymmetric
-// int3, group 128 - ESM-C's codec), value = code * scale + zero
-__global__ void expandPackedK(const unsigned char* q, const __half* scale, const __half* zero, __half* w, size_t n,
-                              int block, int bits) {
+// a resident [in, out] int8 matrix (a blob's: a float32 scale per channel of `out` and per block of rows) expanded
+// to float16 into columns [col0, col0 + out) of a [in, ld] matrix
+__global__ void expandColumnsK(const signed char* q, const float* scale, __half* w, size_t n, int out, size_t rows,
+                               int rowBlocks, int ld, int col0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n) return;
-  size_t g = t / block, bit = g * ((size_t)block * bits) + (t % block) * bits, byte = bit >> 3;
-  unsigned int code = ((q[byte] | ((unsigned int)q[byte + 1] << 8)) >> (bit & 7)) & ((1u << bits) - 1);
-  w[t] = __float2half((float)code * __half2float(scale[g]) + __half2float(zero[g]));
+  size_t row = t / out, col = t % out, g = (rows + rowBlocks - 1) / rowBlocks;
+  w[row * ld + col0 + col] = __float2half((float)q[t] * scale[(row / g) * out + col]);
 }
 __global__ void embedK(const int* ids, const float* table, float* x, int rows, int C, float scale) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -94,27 +89,51 @@ __global__ void toHalfRowsK(const float* x, __half* y, size_t n) {
 }
 
 struct Tower { int layers, C, heads, ffn; float embedScale; };
-inline Tower tower() {
-  return { (int)M.meta("meta/layers"), (int)M.meta("meta/width"), (int)M.meta("meta/heads"), (int)M.meta("meta/ffn"),
-           (float)M.meta("meta/embedScale") };
+// a block's tensor: esm2/blocks/<module>/<layer>/<leaf>, the blob's own naming
+inline std::string blockName(int layer, const std::string& module, const std::string& leaf) {
+  return "esm2/blocks/" + module + "/" + std::to_string(layer) + "/" + leaf;
 }
-// Y [rows, out] = X [rows, in] W^T (+ beta Y), W the resident e/<name>/weightsT: f16 inputs, f32 accumulation
-inline void gemm(const float* X, const std::string& name, float* Y, int rows, int in, int out, float beta) {
-  ResidentInt8 r = M.residentInt8("e/" + name + "/weightsT");
-  if (r.elements != (size_t)in * out || (r.bits == 8 && r.block != in)) {
-    fprintf(stderr, "e/%s/weightsT is not [%d, %d]\n", name.c_str(), out, in); exit(1);
+// the shapes say it (the blob carries no header): 36 blocks x 2560, heads of 64, FFN 10240
+inline Tower tower() {
+  int layers = 0; while (M.has("e/" + blockName(layers, "q", "weights"))) ++layers;
+  int C = (int)M.meta("e/esm2/embed/weights#1"), ffn = (int)M.meta("e/" + blockName(0, "fc1", "weights") + "#1");
+  if (layers == 0 || C % 64) { fprintf(stderr, "e/: not ESM2's blob (%d blocks, width %d)\n", layers, C); exit(1); }
+  return { layers, C, C / 64, ffn, 1.f - 0.15f * 0.8f };       // (token dropout's inference constant)
+}
+// Y [rows, out] = X [rows, in] W (+ beta Y), W the resident [in, out] matrices named, side by side: f16 inputs, f32
+// accumulation
+inline void gemm(const float* X, const std::vector<std::string>& names, float* Y, int rows, int in, int out, float beta) {
+  __half* w = scratch<__half>("esm2.w16", (size_t)in * out);
+  int col0 = 0;
+  for (const std::string& name : names) {
+    ResidentInt8 r = M.residentInt8("e/" + name);
+    if (!r.scales32 || r.rows != (size_t)in || col0 + r.block > out) {
+      fprintf(stderr, "e/%s is not a [%d, *] int8 matrix of the blob's\n", name.c_str(), in); exit(1);
+    }
+    expandColumnsK<<<blocks(r.elements), 256, 0, STREAM>>>(r.codes, r.scales32, w, r.elements, r.block, r.rows, r.rowBlocks,
+                                                           out, col0);
+    col0 += r.block;
   }
-  __half* w = scratch<__half>("esm2.w16", r.elements);
-  if (r.bits == 8) expandK<<<blocks(r.elements), 256, 0, STREAM>>>(r.codes, r.scales, w, r.elements, r.block);
-  else expandPackedK<<<blocks(r.elements), 256, 0, STREAM>>>((const unsigned char*)r.codes, r.scales, r.zeros, w, r.elements,
-                                                            r.block, r.bits);
+  if (col0 != out) { fprintf(stderr, "e/%s...: %d columns, not %d\n", names[0].c_str(), col0, out); exit(1); }
   __half* xh = scratch<__half>("esm2.xh", (size_t)rows * in);
   toHalfRowsK<<<blocks((size_t)rows * in), 256, 0, STREAM>>>(X, xh, (size_t)rows * in);
   const float one = 1.f;
-  CB(cublasGemmEx(H, CUBLAS_OP_T, CUBLAS_OP_N, out, rows, in, &one, w, CUDA_R_16F, in, xh, CUDA_R_16F, in, &beta, Y,
+  CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, rows, in, &one, w, CUDA_R_16F, out, xh, CUDA_R_16F, in, &beta, Y,
                   CUDA_R_32F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 inline const float* Wf(const std::string& name) { return W("e/" + name); }
+// q | k | v's biases as one [3C], once a layer
+inline const float* qkvBias(int layer, int C) {
+  static std::map<int, float*> made;
+  float*& b = made[layer];
+  if (!b) {
+    CK(cudaMalloc(&b, 3 * (size_t)C * 4));
+    for (int m = 0; m < 3; ++m)
+      CK(cudaMemcpyAsync(b + m * C, Wf(blockName(layer, std::string(1, "qkv"[m]), "bias")), (size_t)C * 4,
+                         cudaMemcpyDeviceToDevice, STREAM));
+  }
+  return b;
+}
 
 // one chain: ids [n] (its residues, ESM2's alphabet) -> out [n, C], the last state after the final LayerNorm
 inline void embedChain(const Tower& t, const int* idsDevWrapped, int n, float* out) {
@@ -125,13 +144,13 @@ inline void embedChain(const Tower& t, const int* idsDevWrapped, int n, float* o
   float* ctx = scratch<float>("esm2.ctx", (size_t)R * C);
   float* h = scratch<float>("esm2.h", (size_t)R * t.ffn);
   float* S = scratch<float>("esm2.scores", (size_t)t.heads * R * R);
-  embedK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(idsDevWrapped, Wf("embed/weights"), x, R, C, t.embedScale);
+  embedK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(idsDevWrapped, Wf("esm2/embed/weights"), x, R, C, t.embedScale);
   const float one = 1.f, zero = 0.f;
   for (int l = 0; l < t.layers; ++l) {
-    std::string B = "blocks/" + std::to_string(l) + "/";
-    layerNormK<<<(R + 7) / 8, 256, 0, STREAM>>>(x, xn, R, C, Wf(B + "attn_norm/scale"), Wf(B + "attn_norm/offset"));
-    gemm(xn, B + "qkv", qkv, R, C, 3 * C, 0.f);
-    biasK<<<blocks((size_t)R * 3 * C), 256, 0, STREAM>>>(qkv, Wf(B + "qkv/bias"), R, 3 * C);
+    auto N = [&](const char* module, const char* leaf) { return blockName(l, module, leaf); };
+    layerNormK<<<(R + 7) / 8, 256, 0, STREAM>>>(x, xn, R, C, Wf(N("attn_norm", "scale")), Wf(N("attn_norm", "offset")));
+    gemm(xn, { N("q", "weights"), N("k", "weights"), N("v", "weights") }, qkv, R, C, 3 * C, 0.f);
+    biasK<<<blocks((size_t)R * 3 * C), 256, 0, STREAM>>>(qkv, qkvBias(l, C), R, 3 * C);
     ropeK<<<blocks((size_t)R * t.heads * 64), 256, 0, STREAM>>>(qkv, R, t.heads, C);
     // per head: S = K^T Q (col-major [keys, queries]), softmax over keys, ctx = V S
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_T, CUBLAS_OP_N, R, R, 64, &one, qkv + C, 3 * C, 64, qkv, 3 * C, 64, &zero,
@@ -139,15 +158,15 @@ inline void embedChain(const Tower& t, const int* idsDevWrapped, int n, float* o
     softmaxK<<<(unsigned)(t.heads * R), 256, 0, STREAM>>>(S, R, 0.125f);
     CB(cublasSgemmStridedBatched(H, CUBLAS_OP_N, CUBLAS_OP_N, 64, R, R, &one, qkv + 2 * C, 3 * C, 64, S, R,
                                  (long long)R * R, &zero, ctx, C, 64, t.heads));
-    gemm(ctx, B + "attn_out", x, R, C, C, 1.f);
-    biasK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(x, Wf(B + "attn_out/bias"), R, C);
-    layerNormK<<<(R + 7) / 8, 256, 0, STREAM>>>(x, xn, R, C, Wf(B + "ffn_norm/scale"), Wf(B + "ffn_norm/offset"));
-    gemm(xn, B + "fc1", h, R, C, t.ffn, 0.f);
-    biasGeluK<<<blocks((size_t)R * t.ffn), 256, 0, STREAM>>>(h, Wf(B + "fc1/bias"), R, t.ffn);
-    gemm(h, B + "fc2", x, R, t.ffn, C, 1.f);
-    biasK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(x, Wf(B + "fc2/bias"), R, C);
+    gemm(ctx, { N("attn_out", "weights") }, x, R, C, C, 1.f);
+    biasK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(x, Wf(N("attn_out", "bias")), R, C);
+    layerNormK<<<(R + 7) / 8, 256, 0, STREAM>>>(x, xn, R, C, Wf(N("ffn_norm", "scale")), Wf(N("ffn_norm", "offset")));
+    gemm(xn, { N("fc1", "weights") }, h, R, C, t.ffn, 0.f);
+    biasGeluK<<<blocks((size_t)R * t.ffn), 256, 0, STREAM>>>(h, Wf(N("fc1", "bias")), R, t.ffn);
+    gemm(h, { N("fc2", "weights") }, x, R, t.ffn, C, 1.f);
+    biasK<<<blocks((size_t)R * C), 256, 0, STREAM>>>(x, Wf(N("fc2", "bias")), R, C);
   }
   // the final LayerNorm over the residues only (BOS and EOS dropped)
-  layerNormK<<<(n + 7) / 8, 256, 0, STREAM>>>(x + C, out, n, C, Wf("final_norm/scale"), Wf("final_norm/offset"));
+  layerNormK<<<(n + 7) / 8, 256, 0, STREAM>>>(x + C, out, n, C, Wf("esm2/final_norm/scale"), Wf("esm2/final_norm/offset"));
 }
 }  // namespace esm2

@@ -32,7 +32,7 @@ for port in "${ports[@]}"; do
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical
   # - and host -O3 was 40% of AF3's compile for no measurable run time; -O0 costs a fold 7%)
   ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 -arch=$arch --default-stream per-thread $fast src/$port.cu \
-      -lcublas -lcublasLt -lcupti -o "$out.building" >> "$log" 2>&1 \
+      -lcublas -lcublasLt -lcupti -ldl -o "$out.building" >> "$log" 2>&1 \
     && mv "$out.building" "$out" && echo "$stamp" > "$out.arch" && echo "built $port for $arch" >> "$log" \
     || { echo "FAILED $port for $arch" >> "$log"; exit 1; } ) &
   pids+=($!)

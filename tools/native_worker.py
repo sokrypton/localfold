@@ -94,6 +94,28 @@ def ensure_bundle(family, directory, log):
     return os.path.join(REPO, directory)
 
 
+def ensure_blob(name, log):
+    """af3-any-model's own published blob (native/fetch_bundles.py --af3-any-model): the AF3 lineage's weights
+    for every family but AlphaFold 3, whose parameters it may not redistribute, and chai-1's ESM2."""
+    import glob
+    directory = os.path.join(REPO, "af3am-" + name)
+    if not glob.glob(os.path.join(directory, "*.bin.zst")):
+        emit("status", f"fetching the {name} weights")
+        fetcher = subprocess.Popen([sys.executable, os.path.join(NATIVE, "fetch_bundles.py"), "--af3-any-model", name],
+                                   cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                   preexec_fn=die_with_parent)
+        said = []
+        for line in fetcher.stdout:
+            said.append(line)
+            found = re.search(r"\((\d+)/(\d+)\)", line)
+            if found:
+                emit("status", f"fetching the {name} weights · part {found.group(1)} of {found.group(2)}")
+        if fetcher.wait() != 0:
+            raise RuntimeError(f"fetching {name} failed: {''.join(said[-4:])}")
+        log.append("".join(said))
+    return directory
+
+
 BUILD_MARKER, BUILD_LOG = "/tmp/localfold-native-build", "/tmp/localfold-native-build.log"
 
 
@@ -452,15 +474,21 @@ class Worker:
         # each port's resident server (Server: the model's weights stay on the card between folds) and this
         # job's flags for it
         if port == "af3":
-            bundle = ensure_bundle(family, f"model-{family}-int5", log)
+            # af3-any-model's own int8 blob for every family it publishes; AlphaFold 3 itself (whose parameters it
+            # may not redistribute) from LocalFold's bundle, the page's
+            if family == "af3":
+                bundle = ensure_bundle(family, f"model-{family}-int5", log)
+                dialect = f"--bundle={bundle}/manifest.json"
+            else:
+                bundle, dialect = ensure_blob(family, log), f"--family={family}"
             key = ("af3", family)
             # chai-1's token features are ESM2 3B's, computed in the fold (native/af3/src/esm2.cuh)
-            esm = [f"--esm-bundle={ensure_bundle('esm2-3b', 'model-esm2-3b-int8', log)}"] if family == "chai1" else []
+            esm = [f"--esm-bundle={ensure_blob('esm2', log)}"] if family == "chai1" else []
             server = self.server_for(key, [binary("af3"), "-", f"--bundle={bundle}",
                                            f"--map={os.path.join(NATIVE, 'af3', 'maps', family + '.map')}", "--fold", "--fast",
                                            *esm], residues)
             export = [*NODE, os.path.join(NATIVE, "af3", "export-model.mjs"), inputs, "--no-weights",
-                      f"--bundle={bundle}/manifest.json", f"--job={job_path}", f"--max-msa={requested}", *flags]
+                      dialect, f"--job={job_path}", f"--max-msa={requested}", *flags]
             self.node(export, "featurising", log, cwd=os.path.join(NATIVE, "af3"))
             steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
             fold = [f"--out={out_pdb}"]

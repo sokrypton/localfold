@@ -3,6 +3,13 @@
 
     python3 native/fetch_bundles.py af3 ef2-fast-600m esmc [--into=<repo>] [--suffix=-remote]
 
+    python3 native/fetch_bundles.py --af3-any-model chai1 esm2
+
+--af3-any-model fetches af3-any-model's own published blobs instead (huggingface.co/sokrypton/af3-any-model, int8,
+pinned below), the weights the CUDA ports fold the AF3 lineage with - one *.bin.zst each, into af3am-<name>/,
+which native/af3 reads as published (common.cuh's blob reader). AlphaFold 3's own parameters are not there:
+DeepMind does not let them be redistributed, so af3 keeps LocalFold's bundle.
+
 Each name is a family key of src/bundles/manifests/index.js; its bundle (manifest.json and every shard
 the manifest names) lands in the family's `directory` under the repository, so the native wrappers find
 it where they look (model-af3-int5/, model-esmfold2-int5/, ...). --suffix appends to that directory
@@ -30,6 +37,64 @@ def families(index_js):
     return out
 
 
+# af3-any-model's int8 blobs, at the commit that added chai-lab's structure token-pair weights to chai1's
+AF3_ANY_MODEL = "https://huggingface.co/sokrypton/af3-any-model/resolve/28141c703dfd09e5d208c1a9938a653688ec36d8/"
+BLOBS = {
+    "chai1": "chai1/chai1.int8.bin.zst",
+    "boltz2": "boltz2/boltz2.int8.bin.zst",
+    "protenix2": "protenix/protenix2.int8.bin.zst",
+    "intellifold2": "intellifold2/intellifold2.int8.bin.zst",
+    "rosettafold3": "rosettafold3/rosettafold3.int8.bin.zst",
+    "openbind0": "openfold3/openbind0.int8.bin.zst",
+    "opendde": "opendde/opendde.int8.bin.zst",
+    "esm2": "lm/esm2.bin.zst",          # (chai-1's ESM2 3B: int8 as published, its only form)
+}
+
+
+def fetch_ranged(url, path, name, parts=8):
+    """One large file as `parts` byte ranges at once (one connection is ~21 MB/s from here), then joined."""
+    with urllib.request.urlopen(urllib.request.Request(url, method="HEAD")) as resp:
+        size = int(resp.headers["Content-Length"])
+    step = -(-size // parts)
+    ranges = [(k * step, min(size, (k + 1) * step) - 1) for k in range(parts) if k * step < size]
+
+    def piece(k):
+        lo, hi = ranges[k]
+        req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (lo, hi)})
+        with urllib.request.urlopen(req) as resp, open("%s.part%d" % (path, k), "wb") as f:
+            while chunk := resp.read(1 << 22):
+                f.write(chunk)
+        if os.path.getsize("%s.part%d" % (path, k)) != hi - lo + 1:
+            raise RuntimeError("%s: range %d came back short" % (url, k))
+        return k
+    with concurrent.futures.ThreadPoolExecutor(parts) as pool:
+        for done, _ in enumerate(pool.map(piece, range(len(ranges))), 1):
+            print(f"  {name}: {os.path.basename(path)} ({done}/{len(ranges)})", flush=True)
+    with open(path + ".part", "wb") as out:
+        for k in range(len(ranges)):
+            with open("%s.part%d" % (path, k), "rb") as f:
+                while chunk := f.read(1 << 24):
+                    out.write(chunk)
+            os.remove("%s.part%d" % (path, k))
+    if os.path.getsize(path + ".part") != size:
+        raise RuntimeError("%s: %d bytes, not %d" % (url, os.path.getsize(path + ".part"), size))
+    os.replace(path + ".part", path)
+
+
+def fetch_blobs(names, repo):
+    for name in names:
+        if name not in BLOBS:
+            sys.exit(f"af3-any-model has no blob named {name!r} here: {', '.join(BLOBS)}")
+        dest = os.path.join(repo, "af3am-" + name)
+        os.makedirs(dest, exist_ok=True)
+        path = os.path.join(dest, os.path.basename(BLOBS[name]))
+        with open(os.path.join(dest, ".fetch.lock"), "w") as lock:     # (one fetch a blob at a time)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not os.path.exists(path):
+                fetch_ranged(AF3_ANY_MODEL + BLOBS[name], path, name)
+        print(f"{name} -> {dest}")
+
+
 def fetch(url, path):
     tmp = path + ".part"
     with urllib.request.urlopen(url) as resp, open(tmp, "wb") as f:
@@ -45,6 +110,8 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     opts = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
     repo = opts.get("into", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if "--af3-any-model" in sys.argv[1:]:
+        return fetch_blobs(args, repo)
     known = families(os.path.join(repo, "src", "bundles", "manifests", "index.js"))
     if not args:
         print("families:", " ".join(sorted(known)))

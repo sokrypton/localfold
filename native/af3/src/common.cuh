@@ -3,6 +3,7 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -49,9 +50,12 @@ struct Entry { char kind; size_t offset, length; double value; int seg; size_t d
 // 2.9 GB from 0.35 GB of bundles, and a 2-vCPU Colab VM spent minutes making it). The decode is
 // src/weights/dtype.js's, to the bit: code * scale + zero in double, rounded once to float32.
 struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, dst, first = 0; int kind, bits, block;
-               int round16 = 0, accumulate = 0, addRec = -1; };
+               int round16 = 0, accumulate = 0, addRec = -1; size_t rows = 0; int rowBlocks = 0; };
 // kind: 0 float32, 1 float16, 2 int8 (symmetric), 3 packed int<bits> (asymmetric), 4 zeros (a map's `z`),
-// 5 gathered (a map's `p` lines: parts of bundle tensors decoded into scratch, see GPart);
+// 5 gathered (a map's `p` lines: parts of bundle tensors decoded into scratch, see GPart),
+// 6 int8 as af3-any-model's blobs store it (a float32 scale per CHANNEL of the last axis, `block` of them, and per
+//   BLOCK of rows: `rowBlocks` of the `rows`, ceil(rows / rowBlocks) rows each - its params.dequantise_int8),
+// 7 bfloat16 (a blob's uint16 bit patterns);
 // first: the element of the bundle tensor this entry starts at (a map's slice of a stacked tensor)
 // round16 / accumulate / addRec: a DELTA bundle's `addTo` tensor (src/bundles/delta-tensor-store.js) - the
 // base's value rounded to float16, then the delta's decode added in float32 by the record addRec names
@@ -124,7 +128,7 @@ struct Json {
   }
 };
 // the decode, one tensor of the shard a blockIdx.y
-struct BDecode { unsigned long long src, dst, n, scale, zero, first; int kind, bits, block, flags; };   // flags: 1 round16, 2 accumulate
+struct BDecode { unsigned long long src, dst, n, scale, zero, first, rows; int kind, bits, block, flags, rowBlocks; };   // flags: 1 round16, 2 accumulate
 __device__ __forceinline__ float bundleHalf(const unsigned char* p) {
   unsigned short h = (unsigned short)(p[0] | (p[1] << 8)); return __half2float(__ushort_as_half(h));
 }
@@ -140,6 +144,13 @@ __global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, fl
     else if (d.kind == 2) {
       double scale = (double)bundleHalf(raw + d.scale + 2 * (i / d.block));
       v = (float)__dmul_rn((double)(signed char)raw[d.src + i], scale);
+    } else if (d.kind == 6) {          // (float32 times float32, as numpy multiplies them)
+      unsigned long long row = i / d.block, col = i % d.block, g = (d.rows + d.rowBlocks - 1) / d.rowBlocks;
+      unsigned int w; memcpy(&w, raw + d.scale + 4 * ((row / g) * d.block + col), 4);
+      v = __fmul_rn((float)(signed char)raw[d.src + i], __uint_as_float(w));
+    } else if (d.kind == 7) {
+      unsigned int h = (unsigned int)(raw[d.src + 2 * i] | (raw[d.src + 2 * i + 1] << 8));
+      v = __uint_as_float(h << 16);
     } else {
       unsigned long long g = i / d.block, groupBytes = (unsigned long long)d.block * d.bits / 8;
       unsigned long long bit = g * groupBytes * 8 + (i % d.block) * d.bits, byte = bit >> 3;
@@ -166,11 +177,10 @@ struct Segment { const float* data; size_t bytes; float* device; std::map<std::s
                  bool bundle = false; std::string dir; std::vector<std::string> files; std::vector<BRec> recs;
                  std::map<int, std::vector<float>> hostCopies;     // a bundle tensor the host read, decoded
                  std::vector<BRec> srcRecs; size_t scratchElems = 0; std::vector<GPart> parts;   // (gathered tensors)
-                 // RESIDENT codes (loadBundle's residentPrefix): tensors kept on the device as their int8 or packed
-                 // int<bits> codes and float16 scales (and zeros, packed), never decoded into the float32 copy - a model
-                 // too large for it (ESM-C 6B: 25 GB as float32, 6.4 GB as codes; ESM2 3B at int3: 11 GB, 1.1) - each
-                 // with where its codes, scales and zeros land in `resident`
-                 struct Res { BRec b; size_t codes, scales, zeros; };
+                 // RESIDENT int8 (loadBundle's residentPrefix): tensors kept on the device as their codes and scales,
+                 // never decoded into the float32 copy - a model too large for it (ESM-C 6B: 25 GB as float32, 6.4 GB
+                 // as codes; ESM2 3B: 11 and 2.7) - each with where its codes and scales land in `resident`
+                 struct Res { BRec b; size_t codes, scales; };
                  std::vector<Res> residentRecs; unsigned char* resident = nullptr; size_t residentBytes = 0;
                };
 // A float32 array as a NumPy .npy file (format 1.0: magic, header dict padded to 64 bytes, data)
@@ -189,15 +199,154 @@ inline void writeNpy(const std::string& path, const std::vector<float>& data, co
   fwrite(data.data(), 4, data.size(), f);
   fclose(f);
 }
-// a resident tensor on the device: codes, a float16 scale per `block` consecutive elements, and - packed int<bits>,
-// asymmetric (bits < 8) - a float16 zero per block too (value = code * scale + zero); bits 8 is symmetric int8
-struct ResidentInt8 { const signed char* codes; const __half* scales; size_t elements; int block;
-                      const __half* zeros = nullptr; int bits = 8; };
-// a resident record's bytes: its codes, and its scales (zeros the same again, packed)
-inline size_t residentCodeBytes(const BRec& b) {
-  return b.kind == 2 ? b.elements : (b.elements + b.block - 1) / b.block * ((size_t)b.block * b.bits / 8);
+// ---------------------------------------------------------------- af3-any-model's published blobs
+// sokrypton/af3-any-model on Hugging Face publishes each model as ONE zstd-compressed stream of haiku records
+// (alphafold3/model/params.py encode_record: <5i> scope, name, dtype, shape lengths and the payload's bytes,
+// then the strings, the shape and the C-order payload). Its tensor names are the ones LocalFold's bundles were
+// exported under, so a port's .map reads a blob as it reads a bundle. Decompressed ONCE, to `<blob>.raw` beside
+// it, through the system's libzstd (dlopen: no headers, no build dependency), and read as a one-shard bundle.
+struct ZstdIn { const void* src; size_t size, pos; };
+struct ZstdOut { void* dst; size_t size, pos; };
+// decompressed into `<blob>.raw/NNN` shards of at most BLOB_SHARD bytes, split at record boundaries, so the upload
+// reads it as it reads a bundle's shards: two pinned buffers of one shard each, not two of a 2.8 GB stream
+inline constexpr size_t BLOB_SHARD = 256ull << 20;
+inline std::vector<std::string> blobShards(const std::string& blob) {
+  std::string dir = blob + ".raw";
+  auto listed = [&]() {
+    std::vector<std::string> out; std::ifstream done(dir + "/done"); std::string f;
+    while (done >> f) out.push_back(dir + "/" + f);
+    return out;
+  };
+  if (auto have = listed(); !have.empty()) return have;
+  void* lib = dlopen("libzstd.so.1", RTLD_NOW);
+  if (!lib) lib = dlopen("libzstd.so", RTLD_NOW);
+  if (!lib) { fprintf(stderr, "reading %s needs libzstd (libzstd.so.1): %s\n", blob.c_str(), dlerror()); exit(1); }
+  auto sym = [&](const char* n) { void* f = dlsym(lib, n); if (!f) { fprintf(stderr, "libzstd has no %s\n", n); exit(1); } return f; };
+  auto create = (void* (*)())sym("ZSTD_createDStream");
+  auto init = (size_t (*)(void*))sym("ZSTD_initDStream");
+  auto step = (size_t (*)(void*, ZstdOut*, ZstdIn*))sym("ZSTD_decompressStream");
+  auto isError = (unsigned (*)(size_t))sym("ZSTD_isError");
+  auto errName = (const char* (*)(size_t))sym("ZSTD_getErrorName");
+  auto release = (size_t (*)(void*))sym("ZSTD_freeDStream");
+  FILE* in = fopen(blob.c_str(), "rb");
+  if (!in) { fprintf(stderr, "cannot read %s\n", blob.c_str()); exit(1); }
+  std::string tmp = dir + ".part." + std::to_string(getpid());
+  mkdir(tmp.c_str(), 0755);
+  // the decompressed stream in order; whole records cut into shards as they complete
+  std::vector<char> pending; std::vector<std::string> names; FILE* out = nullptr; size_t inShard = 0;
+  auto emit = [&](bool flushAll) {
+    size_t at = 0;
+    for (;;) {
+      if (pending.size() - at < 20) break;
+      int32_t h[5]; memcpy(h, pending.data() + at, 20);
+      size_t len = 20 + (size_t)h[0] + h[1] + h[2] + 4 * (size_t)h[3] + (size_t)(uint32_t)h[4];
+      if (pending.size() - at < len) break;
+      // (never before a `__q_scale`: an int8 tensor's scales share its shard)
+      std::string nm(pending.data() + at + 20 + h[0], (size_t)h[1]);
+      bool scale = nm.size() > 9 && !nm.compare(nm.size() - 9, 9, "__q_scale");
+      if (!out || (inShard > 0 && inShard + len > BLOB_SHARD && !scale)) {
+        if (out && fclose(out)) { fprintf(stderr, "cannot write %s\n", tmp.c_str()); exit(1); }
+        char file[16]; snprintf(file, sizeof file, "%03zu", names.size()); names.push_back(file);
+        out = fopen((tmp + "/" + file).c_str(), "wb"); inShard = 0;
+        if (!out) { fprintf(stderr, "cannot write %s/%s\n", tmp.c_str(), file); exit(1); }
+      }
+      fwrite(pending.data() + at, 1, len, out); inShard += len; at += len;
+    }
+    pending.erase(pending.begin(), pending.begin() + at);
+    if (flushAll && !pending.empty()) { fprintf(stderr, "%s: a truncated record\n", blob.c_str()); exit(1); }
+  };
+  void* ds = create(); init(ds);
+  std::vector<char> ib(1 << 20), ob(1 << 22);
+  size_t got, last = 0;
+  auto take = [&](ZstdIn& zi) {
+    ZstdOut zo{ ob.data(), ob.size(), 0 };
+    last = step(ds, &zo, &zi);
+    if (isError(last)) { fprintf(stderr, "%s: %s\n", blob.c_str(), errName(last)); exit(1); }
+    pending.insert(pending.end(), ob.data(), ob.data() + zo.pos);
+    if (pending.size() > (64u << 20)) emit(false);
+    return zo.pos;
+  };
+  while ((got = fread(ib.data(), 1, ib.size(), in)) > 0) { ZstdIn zi{ ib.data(), got, 0 }; while (zi.pos < zi.size) take(zi); }
+  while (last != 0) { ZstdIn zi{ nullptr, 0, 0 }; if (take(zi) == 0) break; }   // (0: the frame is done)
+  release(ds); fclose(in);
+  if (last != 0) { fprintf(stderr, "%s: a truncated stream\n", blob.c_str()); exit(1); }
+  emit(true);
+  if (out && fclose(out)) { fprintf(stderr, "cannot write %s\n", tmp.c_str()); exit(1); }
+  { std::ofstream done(tmp + "/done"); for (auto& n : names) done << n << "\n"; }
+  if (rename(tmp.c_str(), dir.c_str())) { fprintf(stderr, "cannot write %s\n", dir.c_str()); exit(1); }
+  return listed();
 }
-inline size_t residentScaleBytes(const BRec& b) { return 2 * ((b.elements + b.block - 1) / b.block); }
+// the one *.bin.zst a directory holds ("" when it is a bundle: a manifest.json)
+inline std::string findBlob(const std::string& dir) {
+  struct stat st;
+  if (!stat((dir + "/manifest.json").c_str(), &st)) return "";
+  std::vector<std::string> found;
+  if (DIR* d = opendir(dir.c_str())) {
+    while (dirent* e = readdir(d)) { std::string n = e->d_name; if (n.size() > 8 && n.compare(n.size() - 8, 8, ".bin.zst") == 0) found.push_back(n); }
+    closedir(d);
+  }
+  if (found.size() != 1) { fprintf(stderr, "%s holds %s and no manifest.json\n", dir.c_str(), found.empty() ? "no *.bin.zst" : "more than one *.bin.zst"); exit(1); }
+  return dir + "/" + found[0];
+}
+// every tensor of a decompressed blob as a record of its one shard: name, BRec, shape
+inline std::vector<std::tuple<std::string, BRec, std::vector<double>>> blobRecords(const std::vector<std::string>& shards) {
+  struct Rec { std::string dtype; std::vector<double> shape; size_t offset, bytes; int file; };
+  std::map<std::string, Rec> recs;
+  for (size_t fi = 0; fi < shards.size(); ++fi) {
+    FILE* f = fopen(shards[fi].c_str(), "rb");
+    if (!f) { fprintf(stderr, "cannot read %s\n", shards[fi].c_str()); exit(1); }
+    size_t at = 0;
+    for (;;) {
+      int32_t h[5];
+      if (fread(h, 4, 5, f) != 5) break;
+      std::string scope(h[0], 0), name(h[1], 0), dtype(h[2], 0);
+      std::vector<int32_t> shape(h[3]);
+      if (fread(scope.data(), 1, h[0], f) != (size_t)h[0] || fread(name.data(), 1, h[1], f) != (size_t)h[1] ||
+          fread(dtype.data(), 1, h[2], f) != (size_t)h[2] || fread(shape.data(), 4, h[3], f) != (size_t)h[3]) {
+        fprintf(stderr, "%s: a truncated record\n", shards[fi].c_str()); exit(1);
+      }
+      at += 20 + h[0] + h[1] + h[2] + 4 * (size_t)h[3];
+      recs[scope + "/" + name] = { dtype, std::vector<double>(shape.begin(), shape.end()), at, (size_t)(uint32_t)h[4], (int)fi };
+      at += (size_t)(uint32_t)h[4];
+      fseek(f, (long)at, SEEK_SET);
+    }
+    fclose(f);
+  }
+  std::vector<std::tuple<std::string, BRec, std::vector<double>>> out;
+  for (auto& [name, r] : recs) {
+    if (!name.compare(0, 9, "__meta__/")) continue;
+    if (name.size() > 9 && !name.compare(name.size() - 9, 9, "__q_scale")) continue;
+    BRec b{}; b.file = r.file; b.byteOffset = r.offset;
+    size_t n = 1; for (double d : r.shape) n *= (size_t)d;
+    b.elements = n;
+    if (r.dtype == "float32") b.kind = 0;
+    else if (r.dtype == "float16") b.kind = 1;
+    else if (r.dtype == "uint16") b.kind = 7;
+    else if (r.dtype == "int8") {
+      auto sc = recs.find(name + "__q_scale");
+      if (sc == recs.end() || sc->second.dtype != "float32" || r.shape.empty() || sc->second.file != r.file) {
+        fprintf(stderr, "%s: int8 with no float32 __q_scale\n", name.c_str()); exit(1);
+      }
+      b.kind = 6; b.scaleOffset = sc->second.offset; b.block = (int)r.shape.back(); b.rows = n / b.block;
+      const auto& ss = sc->second.shape;
+      b.rowBlocks = ss.size() == 1 ? 1 : (int)ss[0];
+      if (ss.back() != r.shape.back() || (ss.size() != 1 && ss.size() != 2)) {
+        fprintf(stderr, "%s: a __q_scale of an unknown layout\n", name.c_str()); exit(1);
+      }
+    } else { fprintf(stderr, "%s: unsupported blob dtype %s\n", name.c_str(), r.dtype.c_str()); exit(1); }
+    out.emplace_back(name, b, r.shape);
+  }
+  return out;
+}
+// a resident int8 tensor on the device: codes and either a float16 scale per `block` consecutive elements (a bundle's,
+// kind 2) or - an af3-any-model blob's, kind 6 - float32 scales per channel of the last axis (`block` of them) and
+// per block of rows (`rowBlocks` of the `rows`)
+struct ResidentInt8 { const signed char* codes; const __half* scales; size_t elements; int block;
+                      const float* scales32 = nullptr; size_t rows = 0; int rowBlocks = 0; };
+// a resident record's scales, in bytes (its codes are one a element)
+inline size_t residentScaleBytes(const BRec& b) {
+  return b.kind == 6 ? 4 * (size_t)b.rowBlocks * b.block : 2 * ((b.elements + b.block - 1) / b.block);
+}
 struct Model {
   std::map<std::string, Entry> index;
   mutable std::set<std::string> touched;  // every entry whose values were read (see unreadWeights)
@@ -247,11 +396,14 @@ struct Model {
   // With `map` (a port's .map, native/make_map.mjs), the entries are the map's instead: each `b` line a
   // slice of a bundle tensor under the port's own name, each `z` zeros, each `m` metadata as it is.
   void loadBundle(const std::string& dir, const std::string& prefix, const std::string& map = "",
-                  const std::string& delta = "", const std::string& residentPrefix = "", bool residentPacked = false) {
+                  const std::string& delta = "", const std::string& residentPrefix = "") {
     if (!delta.empty() && map.empty()) { fprintf(stderr, "a delta bundle is read through a map\n"); exit(1); }
-    std::ifstream in(dir + "/manifest.json");
-    if (!in) { fprintf(stderr, "no %s/manifest.json\n", dir.c_str()); exit(1); }
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::string blob = findBlob(dir);       // (af3-any-model's: a directory holding one *.bin.zst)
+    std::string text = "{\"tensors\": {}}";
+    if (blob.empty()) {
+      std::ifstream in(dir + "/manifest.json");
+      text.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
     Json m = Json::parse(text);
     int seg = (int)segs.size();
     Segment sg{nullptr, 0, nullptr}; sg.bundle = true; sg.dir = dir;
@@ -301,22 +453,25 @@ struct Model {
       if (shapeOut) *shapeOut = shape;
       return b;
     };
-    for (auto& [name, r] : tensors->obj) {
-      std::vector<double> shape;
-      BRec b = record(name, r, "", &shape);
+    std::vector<std::tuple<std::string, BRec, std::vector<double>>> entries;
+    if (!blob.empty()) {
+      std::vector<std::string> shards = blobShards(blob);
+      for (auto& f : shards) { fileIndex[f] = (int)sg.files.size(); sg.files.push_back(f); }
+      entries = blobRecords(shards);
+    } else {
+      for (auto& [name, r] : tensors->obj) { std::vector<double> shape; BRec b = record(name, r, "", &shape); entries.emplace_back(name, b, shape); }
+    }
+    for (auto& [name, b, shape] : entries) {
       size_t n = b.elements;
       if (!map.empty()) { byName[name] = b; continue; }
       std::string key = prefix + "/" + name;
       if (index.count(key)) { fprintf(stderr, "%s is in two model directories\n", key.c_str()); exit(1); }
-      // (int8 under the prefix is always resident; packed int<bits> only where the caller reads it so - ESM2 3B's
-      // int3 - and is decoded into the float32 copy otherwise, as ESM-C 600M's tower expects)
-      if (!residentPrefix.empty() && (b.kind == 2 || (b.kind == 3 && residentPacked)) &&
-          !name.compare(0, residentPrefix.size(), residentPrefix)) {
+      // (int8 under the prefix, a bundle's or a blob's; packed codes - ESM-C 600M's int3 - decode into the float32 copy
+      // its tower reads)
+      if (!residentPrefix.empty() && (b.kind == 2 || b.kind == 6) && !name.compare(0, residentPrefix.size(), residentPrefix)) {
         auto align = [](size_t v) { return (v + 255) / 256 * 256; };
-        Segment::Res r{b, align(sg.residentBytes), 0, 0};
-        r.scales = align(r.codes + residentCodeBytes(b));
-        r.zeros = align(r.scales + residentScaleBytes(b));
-        sg.residentBytes = b.kind == 3 ? r.zeros + residentScaleBytes(b) : r.scales + residentScaleBytes(b);
+        Segment::Res r{b, align(sg.residentBytes), 0};
+        r.scales = align(r.codes + n); sg.residentBytes = r.scales + residentScaleBytes(b);
         Entry e{'q', 0, n, 0, seg}; e.rec = (int)sg.residentRecs.size();
         index[key] = e; sg.residentRecs.push_back(r);
         addMeta(key + "#r", (double)shape.size());
@@ -501,18 +656,16 @@ struct Model {
       while (got < n) { ssize_t r = read(fd, pin[k] + got, n - got); if (r <= 0) { close(fd); return false; } got += (size_t)r; }
       close(fd);
       pin[k][n] = pin[k][n + 1] = 0;          // (a packed code's second byte past the last group)
-      for (const auto& r : s.residentRecs)    // the resident tensors' codes, scales and zeros, as they are
+      for (const auto& r : s.residentRecs)    // the resident tensors' codes and scales, as they are
         if (r.b.file == (int)fi &&
-            (cudaMemcpyAsync(s.resident + r.codes, pin[k] + r.b.byteOffset, residentCodeBytes(r.b), cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            (cudaMemcpyAsync(s.resident + r.codes, pin[k] + r.b.byteOffset, r.b.elements, cudaMemcpyHostToDevice, st) != cudaSuccess ||
              cudaMemcpyAsync(s.resident + r.scales, pin[k] + r.b.scaleOffset, residentScaleBytes(r.b),
-                             cudaMemcpyHostToDevice, st) != cudaSuccess ||
-             (r.b.kind == 3 && cudaMemcpyAsync(s.resident + r.zeros, pin[k] + r.b.zeroOffset, residentScaleBytes(r.b),
-                                               cudaMemcpyHostToDevice, st) != cudaSuccess))) return false;
+                             cudaMemcpyHostToDevice, st) != cudaSuccess)) return false;
       auto& table = tables[k]; table.clear();
       for (const BRec& b : s.recs)
         if (b.file == (int)fi || (b.kind == 4 && fi == 0))
-          table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.kind, b.bits, b.block,
-                           b.round16 | (b.accumulate << 1)});
+          table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.rows, b.kind, b.bits, b.block,
+                           b.round16 | (b.accumulate << 1), b.rowBlocks});
       if (!table.empty()) {
         if (cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess ||
             cudaMemcpyAsync(dt[k], table.data(), table.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
@@ -521,8 +674,8 @@ struct Model {
       }
       auto& stable = scratchTables[k]; stable.clear();     // (the sources of gathered tensors, whole, into scratch)
       for (const BRec& b : s.srcRecs)
-        if (b.file == (int)fi) stable.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.kind,
-                                                 b.bits, b.block, b.round16 | (b.accumulate << 1)});
+        if (b.file == (int)fi) stable.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.rows, b.kind,
+                                                 b.bits, b.block, b.round16 | (b.accumulate << 1), b.rowBlocks});
       if (!stable.empty()) {
         if (table.empty() && cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         if (cudaMemcpyAsync(sdt[k], stable.data(), stable.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
@@ -606,7 +759,15 @@ struct Model {
       if (b.kind == 0) memcpy(&out[o], &raw[b.byteOffset + 4 * i], 4);
       else if (b.kind == 1) out[o] = hostHalf(&raw[b.byteOffset + 2 * i]);
       else if (b.kind == 2) out[o] = (float)((double)(signed char)raw[b.byteOffset + i] * (double)hostHalf(&raw[b.scaleOffset + 2 * (i / b.block)]));
-      else {
+      else if (b.kind == 6) {
+        size_t row = i / b.block, col = i % b.block, g = (b.rows + b.rowBlocks - 1) / b.rowBlocks;
+        float sc; memcpy(&sc, &raw[b.scaleOffset + 4 * ((row / g) * b.block + col)], 4);
+        volatile float p = (float)(signed char)raw[b.byteOffset + i] * sc;
+        out[o] = p;
+      } else if (b.kind == 7) {
+        unsigned int h = (unsigned int)(raw[b.byteOffset + 2 * i] | (raw[b.byteOffset + 2 * i + 1] << 8)) << 16;
+        memcpy(&out[o], &h, 4);
+      } else {
         size_t g = i / b.block, groupBytes = (size_t)b.block * b.bits / 8, bit = g * groupBytes * 8 + (i % b.block) * b.bits, byte = bit >> 3;
         unsigned code = ((raw[b.byteOffset + byte] | (raw[b.byteOffset + byte + 1] << 8)) >> (bit & 7)) & ((1u << b.bits) - 1);
         volatile double p = (double)code * (double)hostHalf(&raw[b.scaleOffset + 2 * g]);
@@ -763,12 +924,12 @@ struct Model {
       if (!s.residentBytes || s.resident) continue;
       CK(cudaMalloc(&s.resident, s.residentBytes));
       size_t most = 0;
-      for (const auto& r : s.residentRecs) most = std::max(most, residentCodeBytes(r.b) + 2 * residentScaleBytes(r.b));
+      for (const auto& r : s.residentRecs) most = std::max(most, r.b.elements + residentScaleBytes(r.b));
       unsigned char* pin; CK(cudaHostAlloc(&pin, most, cudaHostAllocDefault));
       int file = -1, fd = -1;
       for (const auto& r : s.residentRecs) {
         if (r.b.file != file) { if (fd >= 0) close(fd); file = r.b.file; fd = open(shardPath(s, s.files[file]).c_str(), O_RDONLY); }
-        size_t cbytes = residentCodeBytes(r.b), sbytes = residentScaleBytes(r.b);
+        size_t cbytes = r.b.elements, sbytes = residentScaleBytes(r.b);
         auto readAt = [&](unsigned char* to, size_t n, size_t at) {
           for (size_t got = 0; got < n;) {
             ssize_t k = pread(fd, to + got, n - got, (off_t)(at + got));
@@ -777,10 +938,8 @@ struct Model {
           }
         };
         readAt(pin, cbytes, r.b.byteOffset); readAt(pin + cbytes, sbytes, r.b.scaleOffset);
-        if (r.b.kind == 3) readAt(pin + cbytes + sbytes, sbytes, r.b.zeroOffset);
         CK(cudaMemcpy(s.resident + r.codes, pin, cbytes, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(s.resident + r.scales, pin + cbytes, sbytes, cudaMemcpyHostToDevice));
-        if (r.b.kind == 3) CK(cudaMemcpy(s.resident + r.zeros, pin + cbytes + sbytes, sbytes, cudaMemcpyHostToDevice));
       }
       if (fd >= 0) close(fd);
       CK(cudaFreeHost(pin));
@@ -796,8 +955,10 @@ struct Model {
       fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
     }
     const auto& r = s.residentRecs[e.rec];
-    return { (const signed char*)(s.resident + r.codes), (const __half*)(s.resident + r.scales), r.b.elements, r.b.block,
-             r.b.kind == 3 ? (const __half*)(s.resident + r.zeros) : nullptr, r.b.kind == 3 ? r.b.bits : 8 };
+    if (r.b.kind == 6)
+      return { (const signed char*)(s.resident + r.codes), nullptr, r.b.elements, r.b.block,
+               (const float*)(s.resident + r.scales), r.b.rows, r.b.rowBlocks };
+    return { (const signed char*)(s.resident + r.codes), (const __half*)(s.resident + r.scales), r.b.elements, r.b.block };
   }
   bool has(const std::string& k) const { return index.count(k) > 0; }
   const Entry& at(const std::string& k) const {

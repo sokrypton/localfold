@@ -298,6 +298,7 @@ and turning it into a bundle.
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
 
+- **`add_chai1_structure_to_blob.py`** - Add chai-lab's structure token-pair weights to af3-any-model's published chai1 blobs - the weights its converter drops.
 - **`add_distogram_head.py`** - Fold AlphaFold 2's distogram head into an exported bundle, as real tensors.
 - **`analyse_quantisation.py`** - What does each quantisation scheme cost AF3's weights, per bit of storage?
 - **`append_template_single.py`** - Add AlphaFold 2's template SINGLE features to the published monomer bundles, leaving every shard already there byte-identical.
@@ -356,7 +357,6 @@ go through CDP, and the deploy.
 - **`export_alphafold_template_parameters.py`** - Add official model template parameters to an existing reference manifest.
 - **`export_chai1_structure_pair.py`** - Add chai-lab's STRUCTURE token-pair weights to a Chai-1 bundle - the half af3-any-model's converter drops.
 - **`export_confidence_reference.py`** - Export AF2 pLDDT/PAE head parameters and final-recycle reference logits.
-- **`export_esm2_3b.py`** - ESM2 3B (the tower Chai-1's tokens read) as a bundle the native port reads, its matrices kept int8 - from af3-any-model's own quantisation (lm/esm2.bin.zst), not a second one.
 - **`export_esmc6b.py`** - ESM-C 6B (the tower of the released ESMFold2 and ESMFold2-Fast) as a bundle the native port reads, with the tower's matrices kept int8 - from af3-any-model's own quantisation, not a second one.
 - **`export_esmc_model.py`** - ESM-C's tower and ESMFold2's shim -> the bundle format the browser reads.
 - **`export_esmfold2_trunk.py`** - ESMFold2's folding trunk -> a LocalFold bundle, in AF3's pairformer layout.

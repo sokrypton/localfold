@@ -29,10 +29,12 @@ does (5CAJ: its own chain B found, 1.864 A with the alignment - a crystal templa
 alignment moves this target little: chain A by hand gives 1.836, and 0.289 without the alignment).
 Both send the sequences to api.colabfold.com, so they are flags, never defaults.
 
-`fold` builds `af3` if it is missing, reads the weights the page folds with - the published
-int5 bundle (`model-<model>-int5`, fetched once by `native/fetch_bundles.py`), as it is: its codes
-go to the device and are decoded there, and `maps/<model>.map` names each tensor's slice of it
-(below) - featurises the input with the repository's own featuriser into a
+`fold` builds `af3` if it is missing, reads the model's weights as published - **af3-any-model's
+own int8 blob** for every model it publishes (`af3am-<model>/`, fetched once by
+`native/fetch_bundles.py --af3-any-model` from huggingface.co/sokrypton/af3-any-model, the files its
+JAX backend reads), and for AlphaFold 3 itself, whose parameters it may not redistribute, LocalFold's
+int5 bundle (`model-af3-int5`) - with its codes decoded on the device, `maps/<model>.map` naming each
+tensor's slice of it (below) - featurises the input with the repository's own featuriser into a
 temporary directory (0.2 s, while `af3` starts) and folds it (`--fold --fast`); everything after
 `--` goes to `af3`. An alignment keeps a seeded 1024 of its rows, AF3's own `num_msa`
 (`--max-msa=N` to change it: 512 is 3.6% less trunk on 5CAJ's 7907-row search, pLDDT 95.08
@@ -41,7 +43,7 @@ its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 
 ```
 cd native/af3
-nvcc -O1 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -o af3
+nvcc -O1 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -ldl -o af3
 node --js-float16array export-model.mjs in --no-weights --sequence=<SEQ> [--a3m=...]
 ./af3 in --bundle=../../model-af3-int5 --map=maps/af3.map --fold --fast --out=fold.pdb
 python3 score.py fold.pdb ../../tools/fixtures/5caj-crystal.pdb A
@@ -57,17 +59,30 @@ decoded bundle - a slice of one bundle tensor, zeros, ones, or a per-block Layer
 into its projection as the page's loader folds it - checked bit for bit, and fails on anything
 else. A fold through a map is byte-identical to one from the export it was made from (all seven).
 
+🔴 **A BLOB IS READ AS IT IS PUBLISHED** (common.cuh's blob reader): one zstd stream of haiku records, its
+tensor names the ones LocalFold's bundles were exported under - so the same map reads either, checked on
+all seven: every bundle tensor is in its blob at its shape but chai1's structure-pair three, which
+`tools/add_chai1_structure_to_blob.py` added to af3-any-model's chai1 blobs (commit 28141c7, every other
+record byte-identical). Decompressed once, through the system's libzstd, into record-aligned shards
+beside it (`<blob>.raw/`, 256 MB each, an int8 tensor and its scales in one) so the upload streams them
+as it streams a bundle's: ESM2's 2.8 GB loads in 2.0 s warm at 1 GB of host memory. int8 is a float32
+scale per output channel and per block of rows; the decode is af3-any-model's `dequantise_int8` exactly
+(0.0 over boltz2's 120 int8 tensors). Measured against the int5 bundles on 6MRR: boltz2 0.573 / 0.564 A,
+protenix2 1.536 / 1.514, intellifold2 1.564 / 1.551, openbind0 1.716 / 1.104, opendde 1.519 / 1.533,
+rosettafold3 1.644 / 1.817 - one sample's seed band - and chai1's ligands better (GOL 0.021 / 0.053 A,
+SEP 0.074 / 0.108).
+
 **Chai-1** (`maps/chai1.map`) folds through the same binary on af3-any-model's conventions (the
 `chai*` flags in src/af3/dialect.js), and takes two things nobody else does: ESM2 3B's embeddings,
-computed in the fold by `--esm-bundle=../../model-esm2-3b-int8` (tools/export_esm2_3b.py), and the
-structure token-pair weights af3-any-model's converter drops (tools/export_chai1_structure_pair.py,
-which the bundle must have before `quantize_af3.py`). Against af3-any-model at f32, every trunk seam
+computed in the fold from af3-any-model's `lm/esm2.bin.zst` (`--esm-bundle=<its directory>`, within
+1.0e-2 of the float32 model, its int8 codes resident), and chai-lab's structure token-pair weights,
+which af3-any-model's converter drops and its chai1 blobs now carry (tools/export_chai1_structure_pair.py
+reads them out of chai-lab, tools/add_chai1_structure_to_blob.py adds them). Against af3-any-model at f32, every trunk seam
 is 2e-7 to 6e-7 on 6MRR and **5.4e-7 on 5CAJ with its crystal as template**; denoise 4.4e-7,
 confidence 1e-6. 6MRR from its sequence folds at 0.92-1.93 A over five samples (chai-lab
 0.95-1.78); 5CAJ at 2.32 A, 2.28 with its template - the N-terminal tag and the doubly-modelled
-165-169 loop, 0.46 / 0.39 A over the best 90%. The int5 bundle (233 MiB) gives 2.38 / 2.33. Neither
-bundle is published yet: the CUDA worker folds it where both bundles are on disk (`test:native`
-skips its four cases elsewhere, saying so), and the page does not offer it.
+165-169 loop, 0.46 / 0.39 A over the best 90%. The CUDA worker folds it (`test:native` has four
+cases); the page does not offer it, having no WebGPU forward for it yet.
 
 Where this port leaves af3-any-model for chai-lab, measured each time:
 - **One denoiser call a step** (sampler.cuh; `--chai-second-order` is chai-lab's two). Same seed and steps,
@@ -78,7 +93,8 @@ Where this port leaves af3-any-model for chai-lab, measured each time:
   nucleic acid) and the token rule blinds a ligand's atoms to each other: glycerol 0.29 -> 0.053 A bond
   rms, ATP 0.27 -> 0.058.
 - **An atomised residue's tokens are unknown** (gemmi's fasta code, X for SEP): a phosphoserine
-  0.21 -> 0.11 A, where chai-lab is 0.07 - the rest is open.
+  0.21 -> 0.074 A from the int8 blob, inside chai-lab's 0.054-0.089. This and the attention mask are
+  fixed in af3-any-model too (its 4ec4850).
 - **No token-bond term**: chai-lab's carries declared covalent bonds alone, so an ordinary ligand's is
   zero, and a declared one (`bondedAtomPairs`, a glycan) is refused until its trunk weights are exported.
 - The diffusion's pair input (chai's structure token-pair features) and the confidence head's single.

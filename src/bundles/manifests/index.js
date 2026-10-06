@@ -337,30 +337,6 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_ROSETTAFOLD3_MODEL",
     load: () => import("./rosettafold3.js"),
   },
-  // Chai-1, through the CUDA backend only for now: the page has no WebGPU forward for it yet, so no
-  // `<option>` offers it and it is in none of the family lists below. Its token features are ESM2 3B's,
-  // computed in the fold from the `companion` bundle (native/af3/src/esm2.cuh).
-  chai1: {
-    model: "chai1",
-    directory: "./model-chai1-int5/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/80269cd90387205f3d441a8e7c4e146a5a54f92d/chai1-int5/",
-    release: "chai1-int5",
-    variable: "LOCALFOLD_INCLUDE_CHAI1_MODEL",
-    companion: "esm2-3b",
-    webgpu: false,
-    load: () => import("./chai1.js"),
-  },
-  // ESM2 3B, Chai-1's language model: int8, one scale a row, q|k|v stacked (tools/export_esm2_3b.py). 2.7 GB.
-  "esm2-3b": {
-    model: "esm2",
-    directory: "./model-esm2-3b-int8/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/80269cd90387205f3d441a8e7c4e146a5a54f92d/esm2-3b-int8/",
-    release: "esm2-3b-int8",
-    variable: "LOCALFOLD_INCLUDE_ESM2_MODEL",
-    companion: undefined,
-    foldingModel: false,
-    load: () => import("./esm2-3b.js"),
-  },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
   //
   // 🔴 IT IS TWO BUNDLES AND THE FIRST ENTRY IN THIS TABLE THAT IS. The folding
@@ -436,8 +412,7 @@ export const MODEL_BUNDLES = {
  * picker would be offering a language model as a structure predictor.
  */
 export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
-  // (`webgpu: false`: a model only the CUDA backend folds yet, which no control on the page may offer)
-  .filter(([, bundle]) => bundle.foldingModel !== false && bundle.webgpu !== false)
+  .filter(([, bundle]) => bundle.foldingModel !== false)
   .map(([family]) => family);
 
 /**

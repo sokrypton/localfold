@@ -24,7 +24,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --model=*) model="${1#--model=}" ;; *) inputs+=("$1") ;; esac; shift
 done
 if [ ! -x "$here/ef2" ]; then
-  (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread src/ef2.cu -lcublas -lcublasLt -lcupti -o ef2)
+  (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread src/ef2.cu -lcublas -lcublasLt -lcupti -ldl -o ef2)
 fi
 # the weights: the published bundles (int5 trunk, int3 ESM-C), read as they are; fetched once
 repo="$(cd "$here/../.." && pwd)"

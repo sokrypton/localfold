@@ -85,7 +85,7 @@ inline void towerGemm(const float* X, const std::string& w, float* Y, size_t row
                       float alpha = 1.f) {
   if (M.isResident("c/" + w + "T")) {
     ResidentInt8 r = M.residentInt8("c/" + w + "T");
-    if (r.bits != 8) { fprintf(stderr, "c/%sT: the resident ESM-C tower reads int8 codes\n", w.c_str()); exit(1); }
+    if (r.scales32) { fprintf(stderr, "c/%sT: the resident ESM-C tower reads int8 codes, a scale a row\n", w.c_str()); exit(1); }
     if (r.elements != (size_t)in * out || r.block != in) { fprintf(stderr, "c/%sT is not [%d, %d] a row a scale\n", w.c_str(), out, in); exit(1); }
     __half* w16 = scratch<__half>("tower.w16", r.elements);
     expandRowsInt8K<<<blocks(r.elements), 256, 0, STREAM>>>(r.codes, r.scales, w16, r.elements, r.block);

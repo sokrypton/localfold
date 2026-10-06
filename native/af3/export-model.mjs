@@ -81,13 +81,15 @@ const add = (name, value) => {
 };
 
 // --weights-only writes the weights alone (once, for every input: `af3 <batch dir> --weights=<dir>`);
-// --no-weights writes the input alone (the dialect then comes from the bundle's manifest)
+// --no-weights writes the input alone (the dialect then comes from --family=<model>, or the bundle's manifest:
+// a fold from af3-any-model's published blob has no manifest)
 const weightsOnly = args.includes("--weights-only"), noWeights = args.includes("--no-weights");
 let dialect;
 if (noWeights) {
   const { dialectFor } = await import(`${repo}/src/af3/dialect.js`);
-  const manifest = JSON.parse(Buffer.from(await (await fetch(bundle)).arrayBuffer()).toString("utf8"));
-  dialect = dialectFor(manifest?.model?.name);
+  const family = option("family", "");
+  const manifest = family === "" ? JSON.parse(Buffer.from(await (await fetch(bundle)).arrayBuffer()).toString("utf8")) : null;
+  dialect = dialectFor(family === "" ? manifest?.model?.name : family);
 } else {
   const store = await openAf3Store(bundle);
   const depths = trunkDepths(store);
