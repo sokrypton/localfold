@@ -118,8 +118,14 @@ __global__ void triGateK(const T* pg, const float* mask, T* a, T* b, size_t r0, 
     if (local < rows && c < C) {
       float m = mask[r0 + local];
       const T* p = pg + local * 4 * C; const T* g = p + 2 * C;
-      va = toF(p[c * 2]) * m * sigm(toF(g[c * 2]));
-      vb = toF(p[c * 2 + 1]) * m * sigm(toF(g[c * 2 + 1]));
+      if constexpr (std::is_same_v<T, half>) {        // channel c's two halves, one 4-byte load each
+        float2 pv = __half22float2(*reinterpret_cast<const half2*>(p + c * 2));
+        float2 gv = __half22float2(*reinterpret_cast<const half2*>(g + c * 2));
+        va = pv.x * m * sigm(gv.x); vb = pv.y * m * sigm(gv.y);
+      } else {
+        va = toF(p[c * 2]) * m * sigm(toF(g[c * 2]));
+        vb = toF(p[c * 2 + 1]) * m * sigm(toF(g[c * 2 + 1]));
+      }
     }
     A[ry][tx] = va; B[ry][tx] = vb;
   }
@@ -484,7 +490,8 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   buffers();
   T* norm = scratch<T>("tri.norm", pairs * C);
   size_t rowsPer = std::max<size_t>(1, CHUNK / (4 * C));
-  T* pgOut = scratch<T>("tri.pg", rowsPer * 4 * C);
+  if (pairs > rowsPer && roomFor(pairs * 4 * C * sizeof(T), {"tri.pg"})) rowsPer = pairs;   // (as the transition's)
+  T* pgOut = scratch<T>("tri.pg", std::min(rowsPer, pairs) * 4 * C);
   for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
     size_t rows = std::min(rowsPer, pairs - r0);
     layerNorm2<float, T>(pair + r0 * C, norm + r0 * C, rows, C, pre + ".leftNormInputScale",
@@ -553,7 +560,10 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
       return;
     }
   }
+  // every row in one pass where the card has the room (OpenDDE at 255 tokens: the trunk's transitions 370 -> 353
+  // ms for 0.6 GB; chunks of 1-8k rows, small enough for L2 to hold the widening, are 397-615 - the GEMMs lose more)
   size_t rowsPer = std::max<size_t>(1, CHUNK / (2 * I));
+  if (rows > rowsPer && roomFor(rows * (C + 3 * (size_t)I) * sizeof(T), {"tr.x", "tr.wide", "tr.gated"})) rowsPer = rows;
   T* xn = scratch<T>("tr.x", std::min(rowsPer, rows) * C);
   T* wide = scratch<T>("tr.wide", std::min(rowsPer, rows) * 2 * I);
   T* gated = scratch<T>("tr.gated", std::min(rowsPer, rows) * I);

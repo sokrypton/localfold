@@ -472,6 +472,12 @@ the plain norm it absorbs (88 against 83 us a call - four 4-warp blocks an SM wh
 so it pays only the GEMM's difference: eight rows in flight a warp took it from 102 us, sixteen and eight
 warps no further.
 
+At 384 channels (OpenDDE) the unfused triangle's projection and the unfused transition run every row in one
+pass where the card has the room (`roomFor`, 0.2 and 0.6 GB at 255 tokens), and the triangle's gate reads
+each channel's two halves in one load: `triGateK` 156.6 -> 140.8 ms a fold, the trunk 1600 -> ~1560 ms,
+atoms identical. Chunks small enough for L2 to hold the transition's widening (1-8k rows) LOSE, 397-615
+against 370 ms - the GEMMs shrink faster than the elementwise passes speed up.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
@@ -518,6 +524,9 @@ warps no further.
   219 against 199 ms at 1044 tokens. Stripping it, neither the residual (-23 ms) nor the second
   GEMM (-27) dominates.
 
+- **The unfused centre norm's statistics over all eight rows of threads** (one row of 32 summed every
+  channel serially): 3 ms of OpenDDE's 1600 - its time is the strided load, not the sum. **And the
+  unfused gated residual four elements a thread**: level (105.6 against 105.9 ms) - it moves ~1.36 TB/s.
 - **The triangle-out norm two rows a thread** (one 32-bit shared read of a bf16 pair for two adjacent
   rows, half the threads, each row's sums in the same order): byte-identical and level at 261, 524 and
   1044 tokens - the norm is not what bounds the kernel. **And fused256's `triangleOutK` with its scale
