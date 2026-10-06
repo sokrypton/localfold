@@ -125,5 +125,11 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     profileMsa: rows.profileMsa,
     profileDeletionMatrix: rows.profileDeletionMatrix,
   });
+  // 🔴 CHAI-1 WITH NO ALIGNMENT FOLDS FROM AN ALL-GAP ONE (af3-any-model model_features.py _zero_msa, checked there
+  // against chai's own captured features): the MSA mask, the profile and the mean deletion all zero, where AF3's
+  // featuriser keeps the query's row and profile live. Only with no alignment at all.
+  if (options.chaiMsaFeatures === true && (alignment === null || alignment === undefined)) {
+    batch.msaMask.fill(0); batch.profile.fill(0); batch.deletionMean.fill(0);
+  }
   return { batch, rows };
 }

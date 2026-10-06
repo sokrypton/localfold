@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-356 tools. `tools/fixtures/` is data and is not listed.
+357 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -214,7 +214,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (47)
+## `tools/oracle/` - the reference side (48)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -251,6 +251,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_af3_trunk.py`** - Run the AF3 trunk on a toy protein, on CPU, and dump inputs and outputs.
 - **`dump_af3_trunk_taps.py`** - af3-any-model's whole TRUNK on the real 6MRR batch, stage by stage.
 - **`dump_af3_tx_supers.py`** - af3-any-model's token transformer at a TRUNCATED depth, for a bisect.
+- **`dump_chai1_denoise.py`** - af3-any-model's diffusion head for Chai-1, one denoise step on the REAL trunk, with chai's own pair input.
 - **`dump_esmfold2_confidence.py`** - Synthyra's ESMFold2 ConfidenceHead, inputs and outputs, from THEIR code.
 - **`dump_monomer_template.py`** - Capture AF2-MONOMER's template embedder by running AF2's own module.
 - **`dump_multimer_template.py`** - Capture AF2-multimer's template embedder from JAX, with a REAL template.

@@ -1203,8 +1203,8 @@ inline bool F32_TF32 = false;
 // X and W in T (W's f16 copy for half); Y in TY; f32 accumulation always.
 template <class T, class TY>
 void linear(const T* X, TY* Y, size_t rows, int in, int out, const std::string& w,
-            bool transposed = false, float beta = 0.f) {
-  const float one = 1.f;
+            bool transposed = false, float beta = 0.f, float alpha = 1.f) {
+  const float one = alpha;
   const void* Wp;
   if constexpr (std::is_same_v<T, float>) Wp = W(w); else Wp = Wh(w);
   if (lenW(w) != (size_t)in * out) {

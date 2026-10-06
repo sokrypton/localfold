@@ -306,7 +306,10 @@ int main(int argc, char** argv) {
     // sampler has a structure), computed on the device, quantised to a byte a pair and tapped (AsyncTap):
     // contacts-PP-of-NN.u8, n*n bytes, probability * 255
     const bool tapContacts = !framesDir.empty() && M.has("batch.contactBins");
-    if (tapContacts) TAP().reserve(recycles + 1, (size_t)t.n * t.n);
+    // chai-1 counts its recycles as TOTAL passes (chai-lab's num_trunk_recycles, af3-any-model's num_trunk_passes),
+    // where AlphaFold 3's are passes after the first: the page's 3 is chai-lab's own default of 3 passes
+    const int lastPass = M.flag("trunk.dialect.recycleFromInit") ? std::max(1, recycles) - 1 : recycles;
+    if (tapContacts) TAP().reserve(lastPass + 1, (size_t)t.n * t.n);
     auto afterPass = [&](int pass) {
       if (!tapContacts) return;
       int bins = (int)M.meta("trunk.distogram.bins");
@@ -318,17 +321,17 @@ int main(int argc, char** argv) {
       unsigned char* bytes = scratch<unsigned char>("disto.contact8", pairs);
       quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(probs, bytes, pairs, 1.f / 255);
       std::string path = framesDir + "/contacts-" + (pass < 10 ? "0" : "") + std::to_string(pass) + "-of-"
-                         + (recycles + 1 < 10 ? "0" : "") + std::to_string(recycles + 1) + ".u8";
+                         + (lastPass + 1 < 10 ? "0" : "") + std::to_string(lastPass + 1) + ".u8";
       TAP().offer({{bytes, pairs}}, [path, pairs](const char* host, const std::vector<size_t>&) { writeWhole(path, host, pairs); });
     };
-    for (int pass = 0; pass <= recycles; ++pass) {
+    for (int pass = 0; pass <= lastPass; ++pass) {
       if (pass == 0) { if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none); afterPass(pass); continue; }
       // (capturing and instantiating costs ~15 ms and a replayed pass saves ~2 ms at 68 tokens, more
       // as the launches grow: a first fold breaks even at 7 recycles there - AF3's 10 gain 6 ms - and
       // at 3 from ~200 tokens, so the graph is taken where it measured a gain)
       // ...and not where a pass gives its stages' scratch back (runTrunk, shortPair), which a capture
       // cannot do
-      if (!GRAPHS || STAGES || !(recycles >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
+      if (!GRAPHS || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
         recyclePass(); afterPass(pass); continue;
       }
       if (!trunkGraph) {
@@ -382,7 +385,9 @@ int main(int argc, char** argv) {
     // OpenDDE: the expander and refiner, then everything after runs on the structural tokens
     bool structural = M.flag("trunk.dialect.structuralTokens");
     Structural st;
-    const float *dS = t.single, *dP = t.pair, *dTf = t.targetFeat, *dSeq = t.seqMask;
+    // (chai-1's diffusion reads its own projection of the token features, not the trunk's: SEPARATE_STRUCTURE_TARGET_FEAT)
+    const float *dS = t.single, *dP = t.pair, *dSeq = t.seqMask;
+    const float* dTf = M.flag("trunk.dialect.chaiTokenEmbedding") ? TARGET_FEAT_STRUCTURE : t.targetFeat;
     int nD = t.n;
     std::vector<int> resAsym(M.i("batch.asymId"), M.i("batch.asymId") + t.n);
     if (structural) {
@@ -579,7 +584,7 @@ int main(int argc, char** argv) {
     }
     printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", conf.meanPlddt, conf.ptm, conf.iptm, out.c_str());
     printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d%s), confidence %.1f ms, total %.1f ms\n",
-           fi + 1, ms(f0, f1), recycles + 1, diffMs, steps, samples,
+           fi + 1, ms(f0, f1), M.flag("trunk.dialect.recycleFromInit") ? std::max(1, recycles) : recycles + 1, diffMs, steps, samples,
            seedList.size() > 1 ? (" x " + std::to_string(seedList.size()) + " seeds").c_str() : "", confMs, ms(f0, f3));
     if (profiling) prof::stop(40);
     if (fi == 0 && which == 0 && serveDir.empty()) unreadWeights();

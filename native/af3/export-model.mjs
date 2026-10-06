@@ -273,6 +273,13 @@ if (sequence !== "") {
   batch = batchFromDump(JSON.parse(readFileSync(batchPath, "utf8")));
 }
 add("batch", batch);
+// chai1's tokens read ESM2 3B, which native runs (src/esm2.cuh, --esm-bundle): each protein chain's token ids and
+// every token's row (src/af3/featurise/esm2-input.js) - unless the batch already carries the embeddings (a dump's)
+if (dialect?.chaiTokenEmbedding === true && batch.esmEmbeddings === undefined) {
+  const { esm2Inputs } = await import(`${repo}/src/af3/featurise/esm2-input.js`);
+  const e = esm2Inputs(batch);
+  add("esm.ids", e.ids); add("esm.chainLengths", e.chainLengths); add("esm.tokenRow", e.tokenRow);
+}
 // the distogram's contact bins per token pair (src/af3/featurise/contact-classes.js), as the page
 // reads contact_probs off the distogram: the bin count is the bundle's
 {

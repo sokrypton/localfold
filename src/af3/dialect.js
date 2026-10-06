@@ -1385,6 +1385,7 @@ export function featuriserDialect(dialect) {
     atomizedUnknownMsa: dialect.atomizedUnknownMsa,
     atomizedBackboneBonds: dialect.atomizedBackboneBonds,
     modifiedAsOneToken: dialect.modifiedAsOneToken,
+    chaiMsaFeatures: dialect.chaiMsaFeatures,
   };
 }
 

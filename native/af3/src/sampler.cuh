@@ -102,6 +102,86 @@ inline double SAMPLER_SIGMA_MAX = 0;
 // what a sampler step's prediction is handed to (FrameStreamer, below): the denoised positions on the device
 // and the step, called on the host between steps - it must not wait on the GPU
 inline std::function<void(const float*, int, int)> FRAME_HOOK;
+// x' = noisy + dt g1 (g1 = (noisy - D1) / tHat, kept), and the second call's input is x'
+__global__ void chaiEulerK(float* x, float* g1, const float* noisy, const float* d1, float tHat, float dt, size_t n3) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n3) return;
+  float g = (noisy[i] - d1[i]) / tHat;
+  g1[i] = g; x[i] = noisy[i] + dt * g;
+}
+// x += dt ((x - D2) / level + g1) / 2 - the averaged correction ADDED to the Euler-updated point
+__global__ void chaiCorrectK(float* x, const float* d2, const float* g1, float level, float dt, size_t n3) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n3) x[i] += dt * ((x[i] - d2[i]) / level + g1[i]) * 0.5f;
+}
+// chai-1's sampler (af3-any-model diffusion_head.py, chai1.py's): its schedule (sigma_max 80, rho 7, sigma_min 4e-4)
+// at the N MIDPOINTS t = (2k + 1) / 2N; per transition the augmentation, churn min(80 / N, sqrt 2 - 1) only
+// where 4e-4 <= sigma_prev <= 80 (the scaled sigma against chai's raw thresholds - the weights were sampled so),
+// noise 1.003 sqrt(max(1e-6, tHat^2 - sigma_prev^2)), and its second-order step:
+//   x' = noisy + dt g1;  x = x' + dt ((x' - D(x', sigma)) / sigma + g1) / 2      (dt = sigma - tHat)
+// Two denoiser calls a step, both on one input buffer so one captured graph serves them.
+inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
+                                     const std::function<const float*(const float*, float, const float*)>& denoiseFn,
+                                     const std::function<void(const std::vector<float>&)>& onLevels) {
+  int ns = (int)seeds.size(), N = steps;
+  size_t atoms = mask.size(), n3 = atoms * 3, all3 = n3 * ns;
+  std::vector<double> levels(N);
+  for (int k = 0; k < N; ++k) levels[k] = noiseSchedule((2.0 * k + 1) / (2.0 * N), 16, 0.0004, 80, 7);
+  const double churn = std::min(80.0 / N, std::sqrt(2.0) - 1.0);
+  int T = N - 1;                       // transitions
+  std::vector<float> rot((size_t)std::max(T, 1) * ns * 12), at;     // [tHat, sigma] a transition
+  for (int k = 0; k < ns; ++k) {
+    Normal normal(seeds[k]);
+    for (int s = 0; s < T; ++s) {
+      double v0[3] = {normal(), normal(), normal()}, v1[3] = {normal(), normal(), normal()};
+      auto norm = [](const double* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+      double e0[3], e1[3], e2[3], s0 = 1 / std::max(1e-10, norm(v0));
+      for (int d = 0; d < 3; ++d) e0[d] = v0[d] * s0;
+      double dot = v1[0] * e0[0] + v1[1] * e0[1] + v1[2] * e0[2], w[3];
+      for (int d = 0; d < 3; ++d) w[d] = v1[d] - e0[d] * dot;
+      double s1 = 1 / std::max(1e-10, norm(w));
+      for (int d = 0; d < 3; ++d) e1[d] = w[d] * s1;
+      e2[0] = e0[1] * e1[2] - e0[2] * e1[1]; e2[1] = e0[2] * e1[0] - e0[0] * e1[2]; e2[2] = e0[0] * e1[1] - e0[1] * e1[0];
+      float* r = &rot[((size_t)s * ns + k) * 12];
+      for (int d = 0; d < 3; ++d) { r[d] = (float)e0[d]; r[3 + d] = (float)e1[d]; r[6 + d] = (float)e2[d]; }
+      for (int d = 0; d < 3; ++d) r[9 + d] = (float)normal();
+    }
+  }
+  std::vector<double> tHats(T);
+  for (int s = 0; s < T; ++s) {
+    double prev = levels[s];
+    tHats[s] = prev * (1 + (prev >= 4e-4 && prev <= 80 ? churn : 0));
+    at.push_back((float)tHats[s]); at.push_back((float)levels[s + 1]);
+  }
+  if (onLevels) onLevels(at);
+  float* dX; CK(cudaMalloc(&dX, all3 * 4));
+  uint64_t* dSeeds; CK(cudaMalloc(&dSeeds, ns * 8));
+  CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
+  initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
+  float* dRot = upload(rot.data(), rot.size()); float* dMask = upload(mask.data(), atoms);
+  float* dIn = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
+  float* dG = scratch<float>("sample.grad", all3); float* dNoisy = scratch<float>("sample.noisyKeep", all3);
+  float* dLevels = upload(at.data(), at.size());
+  for (int s = 1; s <= T; ++s) {
+    double prev = levels[s - 1], level = levels[s], tHat = tHats[s - 1], dt = level - tHat;
+    double injected = 1.003 * std::sqrt(std::max(1e-6, tHat * tHat - prev * prev));
+    centroidK<<<ns, 1024, 0, STREAM>>>(dX, dMask, atoms, dC);
+    augmentNoiseK<<<blocks(atoms * ns), 256, 0, STREAM>>>(dX, dIn, dMask, dC, dRot + (size_t)(s - 1) * ns * 12,
+                                                         dSeeds, (uint32_t)s, (float)injected, atoms, atoms * ns);
+    CK(cudaMemcpyAsync(dNoisy, dIn, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    const float* d1 = denoiseFn(dIn, (float)tHat, dLevels + 2 * (s - 1));
+    if (s == 1) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
+    if (FRAME_HOOK) FRAME_HOOK(d1, s, T);
+    chaiEulerK<<<blocks(all3), 256, 0, STREAM>>>(dX, dG, dNoisy, d1, (float)tHat, (float)dt, all3);
+    CK(cudaMemcpyAsync(dIn, dX, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    const float* d2 = denoiseFn(dIn, (float)level, dLevels + 2 * (s - 1) + 1);
+    chaiCorrectK<<<blocks(all3), 256, 0, STREAM>>>(dX, d2, dG, (float)level, (float)dt, all3);
+  }
+  std::vector<float> out = download(dX, all3);
+  for (float* p : {dX, dRot, dMask, dLevels}) CK(cudaFree(p));
+  CK(cudaFree(dSeeds));
+  return out;
+}
 // Returns every sample's positions, sample-major [ns][atoms][3].
 inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                                  const std::function<const float*(const float*, float, const float*)>& denoiseFn,
@@ -139,6 +219,7 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     return out;
   }
   if (SAMPLER_SIGMA_MAX > 0) sigmaMax = SAMPLER_SIGMA_MAX;
+  if (M.flag("trunk.dialect.chaiSampler")) return sampleChai(steps, seeds, mask, denoiseFn, onLevels);
   for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
   std::vector<float> rot((size_t)steps * ns * 12), tHats(steps);
   for (int k = 0; k < ns; ++k) {

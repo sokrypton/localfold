@@ -66,8 +66,8 @@ __global__ void chaiRelativeEncodingK(const int* residueIndex, const int* tokenI
 // through a BIASED linear, plus the recycled single's projection. is_paired: the row covers tokens of more
 // than one chain.
 __global__ void chaiMsaEmbedK(const int* rows, const float* deletion, const float* msaMask, const int* asymId,
-                              const float* Wmsa, const float* bias, const float* fromSingle, float* msa, size_t count, int n,
-                              int C) {
+                              const int* isLigand, const float* Wmsa, const float* bias, const float* fromSingle, float* msa,
+                              size_t count, int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= count * C) return;
   int c = (int)(t % C); size_t row = t / C; int token = (int)(row % n); size_t s = row / n;
@@ -76,6 +76,9 @@ __global__ void chaiMsaEmbedK(const int* rows, const float* deletion, const floa
     if (msaMask[s * n + k] != 0) { if (first < 0) first = asymId[k]; else if (asymId[k] != first) paired = true; }
   float d = deletion[row];
   int code = rows[row];
+  // a non-polymer token: chai's query row carries the unknown residue (20) and every other row its mask class
+  // (31), where AlphaFold 3 puts the gap on all of them (featurization.py create_msa_feat, chai1)
+  if (isLigand && isLigand[token]) code = s == 0 ? 20 : 31;
   float v = bias[c] + (paired ? Wmsa[c] : 0.f) + Wmsa[(size_t)(1 + (s == 0 ? 4 : 2)) * C + c]
           + atanf(d / 3.f) * (2.f / 3.14159265358979f) * Wmsa[(size_t)7 * C + c]
           + fminf(fmaxf(d, 0.f), 1.f) * Wmsa[(size_t)8 * C + c]
@@ -288,7 +291,8 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     size_t rows = (size_t)t.S * n;
     if (lenW(E + "msaActivations") != (size_t)41 * t.Cm) { fprintf(stderr, "chai's msa features are not 41 wide\n"); exit(1); }
     chaiMsaEmbedK<<<blocks(rows * t.Cm), 256, 0, STREAM>>>(t.msaRows, t.deletion, t.msaMask, Idev("batch.features.asymId"),
-      W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle, t.msa, rows, n, t.Cm);
+      M.has("batch.isLigand") ? Idev("batch.isLigand") : nullptr, W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle,
+      t.msa, rows, n, t.Cm);
     ++t.pass;
     return;
   }
@@ -948,17 +952,41 @@ void pairformerBlock(Trunk& t, int k) {
 }
 
 // ---------------------------------------------------------------- distogram
+// the half logits of `rows` pair rows: one linear (+ a trained bias: OpenDDE, boltz2, ...), or chai-1's MLP head
+// (LN, gelu(z W1 + b1), then W2 + b2; sokrypton/chai-lab@dgram), in row chunks
+__global__ void biasGeluRowsK(float* y, const float* b, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) { float v = y[t] + b[t % C]; y[t] = 0.5f * v * (1.f + erff(v * 0.70710678118654752f)); }
+}
+inline void distogramHalf(const float* pair, float* half_, size_t rows, int C, int bins) {
+  const std::string D = "trunk.distogram.";
+  if (hasW(D + "hidden")) {
+    int Hd = (int)(lenW(D + "hiddenBias"));
+    size_t per = std::max<size_t>(1, std::min(rows, CHUNK / std::max(C, Hd)));
+    float* ln = scratch<float>("disto.ln", per * C); float* h = scratch<float>("disto.hidden", per * Hd);
+    for (size_t r0 = 0; r0 < rows; r0 += per) {
+      size_t r = std::min(per, rows - r0);
+      layerNorm2<float, float>(pair + r0 * C, ln, r, C, D + "inputLayerNormScale", D + "inputLayerNormOffset");
+      linear<float, float>(ln, h, r, C, Hd, D + "hidden");
+      biasGeluRowsK<<<blocks(r * Hd), 256, 0, STREAM>>>(h, W(D + "hiddenBias"), r, Hd);
+      linear<float, float>(h, half_ + r0 * bins, r, Hd, bins, D + "halfLogits");
+    }
+  } else {
+    linear<float, float>(pair, half_, rows, C, bins, D + "halfLogits");
+  }
+  // (a bias is in each half, so twice in the symmetrised logit - what those checkpoints were trained with)
+  if (hasW(D + "halfLogitsBias")) addBiasK<<<blocks(rows * bins), 256, 0, STREAM>>>(half_, W(D + "halfLogitsBias"), rows, bins);
+}
+// chai-1 symmetrises by the MEAN: (half + half^T) / 2
+inline float distogramSymScale() { return M.flag("trunk.dialect.mlpDistogram") ? 0.5f : 1.f; }
 // logits[i][j] = half[i][j] + half[j][i] (symmetriseK, elementwise.cuh)
 inline void distogram(Trunk& t, float* logits) {
   int bins = (int)M.meta("trunk.distogram.bins");
   size_t pairs = (size_t)t.n * t.n;
   float* half_ = scratch<float>("disto.half", pairs * bins);
-  linear<float, float>(t.pair, half_, pairs, t.C, bins, "trunk.distogram.halfLogits");
-  // a trained bias (OpenDDE, boltz2, ...) is in each half, so twice in the symmetrised logit -
-  // what those checkpoints were trained with (src/af3/trunk/trunk-webgpu.js)
-  if (hasW("trunk.distogram.halfLogitsBias"))
-    addBiasK<<<blocks(pairs * bins), 256, 0, STREAM>>>(half_, W("trunk.distogram.halfLogitsBias"), pairs, bins);
+  distogramHalf(t.pair, half_, pairs, t.C, bins);
   symmetriseK<<<blocks(pairs * bins), 256, 0, STREAM>>>(half_, logits, t.n, bins);
+  if (distogramSymScale() != 1.f) scaleK<<<blocks(pairs * bins), 256, 0, STREAM>>>(logits, distogramSymScale(), pairs * bins);
 }
 // P(distance under the pair's contact threshold): the softmax mass of the first contactBins[ij]
 // bins (src/af3/featurise/contact-classes.js), masked
@@ -986,17 +1014,13 @@ inline std::vector<float> contactProbabilities(Trunk& t) {
     size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(C, bins))));
     float* rowsT = scratch<float>("disto.rowsT", R * n * C);
     float* a = scratch<float>("disto.half", R * n * bins); float* b = scratch<float>("disto.halfT", R * n * bins);
-    bool bias = hasW("trunk.distogram.halfLogitsBias");
     for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
       size_t r = std::min(R, (size_t)n - r0), rows = r * n;
-      linear<float, float>(t.pair + r0 * n * C, a, rows, C, bins, "trunk.distogram.halfLogits");
+      distogramHalf(t.pair + r0 * n * C, a, rows, C, bins);
       gatherTransposedK<<<blocks(rows * C * 4 / 16), 256, 0, STREAM>>>(t.pair, rowsT, n, C, r0, r, 4);
-      linear<float, float>(rowsT, b, rows, C, bins, "trunk.distogram.halfLogits");
-      if (bias) {
-        addBiasK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, W("trunk.distogram.halfLogitsBias"), rows, bins);
-        addBiasK<<<blocks(rows * bins), 256, 0, STREAM>>>(b, W("trunk.distogram.halfLogitsBias"), rows, bins);
-      }
+      distogramHalf(rowsT, b, rows, C, bins);
       addK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, b, rows * bins);
+      if (distogramSymScale() != 1.f) scaleK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, distogramSymScale(), rows * bins);
       contactProbsK<<<blocks(rows), 256, 0, STREAM>>>(a, Idev("batch.contactBins") + r0 * n, t.pairMask + r0 * n,
                                                       out + r0 * n, rows, bins);
     }

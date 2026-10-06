@@ -428,6 +428,11 @@ function pairTrack(store, root, index) {
     outputProjectionBias:
       has(store, `${root}/pair_attention${which}/output_projection/bias`)
         ? at(`pair_attention${which}/output_projection/bias`) : null,
+    // 🔴 chai1's CONFIDENCE triangle attention has a (2c, 2c) output projection whose halves are applied to a
+    // direction's output and its transpose, which at inference cancel to one projection per direction with the
+    // two halves' weights SUMMED (af3-any-model modules.py, dual_output). Present only there.
+    ...(has(store, `${root}/pair_attention${which}/output_projection_transposed/weights`)
+      ? { outputProjectionTransposed: at(`pair_attention${which}/output_projection_transposed/weights`) } : {}),
   });
   return {
     triangleMultiplicationOutgoing: triangle("outgoing"),
@@ -730,9 +735,20 @@ export async function distogramWeights(store, dialect = af3Dialect(store)) {
       + `${biasName}, and its dialect says ${dialect.distogramBias}; one of the `
       + "two is wrong and the fold would be silently different either way");
   }
+  // chai1's head (sokrypton/chai-lab@dgram, post hoc): LN, a GELU hidden layer, then half_logits, symmetrised
+  // by the MEAN (dialect.mlpDistogram) - so half_logits reads the hidden width, not the pair's
+  const mlp = dialect?.mlpDistogram === true;
   return {
-    halfLogits: await store.tensor(name), pairChannels, bins,
+    halfLogits: await store.tensor(name), pairChannels: mlp ? dims(store, "diffuser/distogram_head/hidden/weights")[0]
+      : pairChannels, bins,
     ...(present ? { halfLogitsBias: await store.tensor(biasName) } : {}),
+    ...(mlp ? {
+      inputLayerNormScale: await store.tensor("diffuser/distogram_head/input_layer_norm/scale"),
+      inputLayerNormOffset: await store.tensor("diffuser/distogram_head/input_layer_norm/offset"),
+      hidden: await store.tensor("diffuser/distogram_head/hidden/weights"),
+      hiddenBias: await store.tensor("diffuser/distogram_head/hidden/bias"),
+      hiddenWidth: pairChannels,
+    } : {}),
   };
 }
 

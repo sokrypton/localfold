@@ -8,14 +8,12 @@
 // (scale + 1) * LN(x; eps 0.1) + shift (af3-any-model diffusion_transformer.py's chai adaLN: the conditioning is
 // not normalised and the scale has no bias). The +1 is folded into the scale where it is made (adaCond), so a
 // kernel reads the multiplier as is; set once a model, by setAdaMode, since every adaLN of one model is one form.
-__device__ int ADA_RAW_D = 0;
-__device__ float ADA_EPS_D = 1e-5f;
-__device__ __forceinline__ float adaMul(float s) { return ADA_RAW_D ? s : sigm(s); }
+// (a template parameter, RAW, not a device variable: reading the epsilon from memory changed how AlphaFold 3's
+// kernels compiled and moved its folds - so each mode is its own instantiation and AF3's is the code it was)
+#define ADA(s) (RAW ? (s) : sigm(s))
+#define ADA_EPS (RAW ? 0.1f : 1e-5f)
 inline bool ADA_RAW = false;
-inline void setAdaMode(bool chai) {
-  int raw = chai ? 1 : 0; float eps = chai ? 0.1f : 1e-5f; ADA_RAW = chai;
-  CK(cudaMemcpyToSymbol(ADA_RAW_D, &raw, sizeof raw)); CK(cudaMemcpyToSymbol(ADA_EPS_D, &eps, sizeof eps));
-}
+inline void setAdaMode(bool chai) { ADA_RAW = chai; }
 struct Gather { const int* idx; const float* mask; int count; };
 inline Gather gatherOf(const std::string& name) {
   return { Idev(name + ".indices"), Fdev(name + ".mask"), (int)M.len(name + ".indices") };
@@ -231,7 +229,7 @@ inline AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond,
   return c;
 }
 // sigmoid(scale) * LN(x) + shift, LN without affine
-template <class TO>
+template <class TO, bool RAW = false>
 __global__ void adaLnK(const float* x, const float* scale, const float* shift, TO* out, size_t rows, int C,
                        size_t period) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -244,19 +242,20 @@ __global__ void adaLnK(const float* x, const float* scale, const float* shift, T
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = 1.f / sqrtf(v / C + ADA_EPS_D);
+  float inv = 1.f / sqrtf(v / C + ADA_EPS);
   for (int c = lane; c < C; c += 32) {
     size_t k = (row % period) * C + c;
-    out[row * C + c] = fromF<TO>(adaMul(scale[k]) * ((xr[c] - mean) * inv) + shift[k]);
+    out[row * C + c] = fromF<TO>(ADA(scale[k]) * ((xr[c] - mean) * inv) + shift[k]);
   }
 }
 template <class TO>
 inline void adaLn(const float* x, const float* scale, const float* shift, TO* out, size_t rows, int C,
                   size_t period) {
-  adaLnK<TO><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, scale, shift, out, rows, C, period);
+  if (ADA_RAW) adaLnK<TO, true><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, scale, shift, out, rows, C, period);
+  else adaLnK<TO><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(x, scale, shift, out, rows, C, period);
 }
 
-template <class TO>
+template <class TO, bool RAW = false>
 __global__ void adaLn2K(const float* x, const float* s1, const float* h1, const float* s2, const float* h2, TO* o1, TO* o2,
                         size_t rows, int C, size_t period) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -271,12 +270,12 @@ __global__ void adaLn2K(const float* x, const float* s1, const float* h1, const 
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
     float mean = sum / C, q = (v.x - mean) * (v.x - mean) + (v.y - mean) * (v.y - mean) + (v.z - mean) * (v.z - mean) + (v.w - mean) * (v.w - mean);
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    float inv = 1.f / sqrtf(q / C + ADA_EPS_D);
+    float inv = 1.f / sqrtf(q / C + ADA_EPS);
     float n[4] = { (v.x - mean) * inv, (v.y - mean) * inv, (v.z - mean) * inv, (v.w - mean) * inv };
     float as[4] = { a.x, a.y, a.z, a.w }, bs[4] = { b.x, b.y, b.z, b.w }, cs[4] = { c2.x, c2.y, c2.z, c2.w }, ds[4] = { d.x, d.y, d.z, d.w };
     for (int e = 0; e < 4; ++e) {
-      o1[row * C + lane * 4 + e] = fromF<TO>(adaMul(as[e]) * n[e] + bs[e]);
-      o2[row * C + lane * 4 + e] = fromF<TO>(adaMul(cs[e]) * n[e] + ds[e]);
+      o1[row * C + lane * 4 + e] = fromF<TO>(ADA(as[e]) * n[e] + bs[e]);
+      o2[row * C + lane * 4 + e] = fromF<TO>(ADA(cs[e]) * n[e] + ds[e]);
     }
     return;
   }
@@ -286,11 +285,11 @@ __global__ void adaLn2K(const float* x, const float* s1, const float* h1, const 
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = 1.f / sqrtf(v / C + ADA_EPS_D);
+  float inv = 1.f / sqrtf(v / C + ADA_EPS);
   for (int c = lane; c < C; c += 32) {
     size_t k = (row % period) * C + c; float n = (xr[c] - mean) * inv;
-    o1[row * C + c] = fromF<TO>(adaMul(s1[k]) * n + h1[k]);
-    o2[row * C + c] = fromF<TO>(adaMul(s2[k]) * n + h2[k]);
+    o1[row * C + c] = fromF<TO>(ADA(s1[k]) * n + h1[k]);
+    o2[row * C + c] = fromF<TO>(ADA(s2[k]) * n + h2[k]);
   }
 }
 struct AtomStep {
@@ -303,7 +302,7 @@ inline std::string pairedWeight(const std::string& a, const std::string& b, int 
   return concatColumns(a + "|" + b + "~", C, {{a, Wd, false}, {b, Wd, false}});
 }
 // a key row gathered from the queries (zero where masked), then its adaptive LN; warp per row
-template <class TO>
+template <class TO, bool RAW = false>
 __global__ void gatherAdaLnK(const float* act, const int* idx, const float* gmask, const float* scale,
                              const float* shift, TO* out, size_t rows, int C) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -317,14 +316,14 @@ __global__ void gatherAdaLnK(const float* act, const int* idx, const float* gmas
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = (live ? xr[c] : 0.f) - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = 1.f / sqrtf(v / C + ADA_EPS_D);
+  float inv = 1.f / sqrtf(v / C + ADA_EPS);
   for (int c = lane; c < C; c += 32) {
     size_t k = row * C + c;
-    out[k] = fromF<TO>(adaMul(scale[k]) * (((live ? xr[c] : 0.f) - mean) * inv) + shift[k]);
+    out[k] = fromF<TO>(ADA(scale[k]) * (((live ? xr[c] : 0.f) - mean) * inv) + shift[k]);
   }
 }
 // act += y * sigmoid(gate); out = sigmoid(scale) * LN(act) + shift; warp per row
-template <class TO>
+template <class TO, bool RAW = false>
 __global__ void gatedAddAdaLnRowsK(float* act, const float* y, const float* gate, const float* scale,
                                    const float* shift, TO* out, size_t rows, int C, size_t period) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -343,10 +342,10 @@ __global__ void gatedAddAdaLnRowsK(float* act, const float* y, const float* gate
     for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
     float mean = sum / C, q = (x.x - mean) * (x.x - mean) + (x.y - mean) * (x.y - mean) + (x.z - mean) * (x.z - mean) + (x.w - mean) * (x.w - mean);
     for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
-    float inv = 1.f / sqrtf(q / C + ADA_EPS_D);
+    float inv = 1.f / sqrtf(q / C + ADA_EPS);
     TO* o = out + row * C + c0;
-    o[0] = fromF<TO>(adaMul(sc.x) * ((x.x - mean) * inv) + sh.x); o[1] = fromF<TO>(adaMul(sc.y) * ((x.y - mean) * inv) + sh.y);
-    o[2] = fromF<TO>(adaMul(sc.z) * ((x.z - mean) * inv) + sh.z); o[3] = fromF<TO>(adaMul(sc.w) * ((x.w - mean) * inv) + sh.w);
+    o[0] = fromF<TO>(ADA(sc.x) * ((x.x - mean) * inv) + sh.x); o[1] = fromF<TO>(ADA(sc.y) * ((x.y - mean) * inv) + sh.y);
+    o[2] = fromF<TO>(ADA(sc.z) * ((x.z - mean) * inv) + sh.z); o[3] = fromF<TO>(ADA(sc.w) * ((x.w - mean) * inv) + sh.w);
     return;
   }
   for (int c = lane; c < C; c += 32) { float v = a[c] + y[row * C + c] * sigm(gate[pr + c]); a[c] = v; s += v; }
@@ -355,8 +354,8 @@ __global__ void gatedAddAdaLnRowsK(float* act, const float* y, const float* gate
   float mean = s / C, v = 0;
   for (int c = lane; c < C; c += 32) { float d = a[c] - mean; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = 1.f / sqrtf(v / C + ADA_EPS_D);
-  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(adaMul(scale[pr + c]) * ((a[c] - mean) * inv) + shift[pr + c]);
+  float inv = 1.f / sqrtf(v / C + ADA_EPS);
+  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(ADA(scale[pr + c]) * ((a[c] - mean) * inv) + shift[pr + c]);
 }
 __global__ void addSigmoidGatedK(float* x, const float* y, const float* gate, size_t n, size_t period) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] += y[i] * sigm(gate[i % period]);
@@ -537,6 +536,12 @@ __global__ void atomKqNormK(T* qg, T* kv, const float* qBias, const float* qs, c
       x[c] = fromF<T>((toF(x[c]) + (side ? 0.f : qBias[c]) - mean) * inv * sc[c] + of[c]);
   }
 }
+__global__ void fillOnesK(float* x, size_t n) { size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = 1.f; }
+inline const float* ones(size_t n) {           // a device vector of ones, at least n long
+  static float* o = nullptr; static size_t have = 0;
+  if (n > have) { if (o) CK(cudaFree(o)); o = dalloc(n); fillOnesK<<<blocks(n), 256, 0, STREAM>>>(o, n); CK(cudaStreamSynchronize(STREAM)); have = n; }
+  return o;
+}
 inline const float* zeros(size_t n) {          // a device vector of zeros, at least n long
   static float* z = nullptr; static size_t have = 0;
   if (n > have) { if (z) CK(cudaFree(z)); z = dalloc(n); CK(cudaMemset(z, 0, n * 4)); have = n; }
@@ -569,8 +574,10 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
     else CK(cudaMemcpyAsync(xq, xqF, qRows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
     adaLn<T>(xqF, bc.kScale, bc.kShift, xk, qRows, C, q1);
   } else {
-    adaLn2K<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, bc.qScale, bc.qShift, bc.kScale, bc.kShift, xq, xk,
-                                                               qRows, C, q1);
+    if (ADA_RAW) adaLn2K<T, true><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, bc.qScale, bc.qShift, bc.kScale,
+                                                                                bc.kShift, xq, xk, qRows, C, q1);
+    else adaLn2K<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, bc.qScale, bc.qShift, bc.kScale, bc.kShift, xq, xk,
+                                                                    qRows, C, q1);
   }
   T* qg = scratch<T>("ab.qgkv", 2 * qRows * 2 * Wd); T* kvAtom = qg + qRows * 2 * Wd;
   T* kv = scratch<T>("ab.kv", kRows * 2 * Wd);
@@ -619,7 +626,9 @@ void crossAttentionBlockT(float* act, const AtomStep& st, const AtomBlockCache& 
     addSigmoidGatedK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, attention, bc.zg, qRows * C, q1 * C);
     adaLn<T>(pre, bc.ffwScale, bc.ffwShift, tn, qRows, C, q1);
   } else {
-    gatedAddAdaLnRowsK<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, attention, bc.zg, bc.ffwScale, bc.ffwShift,
+if (ADA_RAW) gatedAddAdaLnRowsK<T, true><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, attention, bc.zg, bc.ffwScale, bc.ffwShift,
+                                                                          tn, qRows, C, q1);
+    else gatedAddAdaLnRowsK<T><<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, attention, bc.zg, bc.ffwScale, bc.ffwShift,
                                                                           tn, qRows, C, q1);
   }
   int I = C * 2;
@@ -1125,7 +1134,11 @@ inline float* buildTargetFeat() {
     int out = (int)(lenW(P + "singleProjInTrunk") / (Cp + C));
     float* tf = scratch<float>("targetFeat", (size_t)tokens * out);
     linear<float, float>(cat, tf, tokens, Cp + C, out, P + "singleProjInTrunk");
-    TARGET_FEAT_STRUCTURE = scratch<float>("targetFeatStructure", (size_t)tokens * out);
+    {   // kept past the phases' scratch releases: the diffusion reads it after the trunk
+      static size_t have = 0;
+      size_t need = (size_t)tokens * out;
+      if (need > have) { if (TARGET_FEAT_STRUCTURE) CK(cudaFree(TARGET_FEAT_STRUCTURE)); TARGET_FEAT_STRUCTURE = dalloc(need); have = need; }
+    }
     linear<float, float>(cat, TARGET_FEAT_STRUCTURE, tokens, Cp + C, out, P + "singleProjInStructure");
     return tf;
   }

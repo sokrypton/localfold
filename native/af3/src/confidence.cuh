@@ -9,14 +9,19 @@
 // the distogram bin of each pair (-1: none) and its squared distance, once a pair rather than once a
 // channel (a 39-step double-precision search per element was 24 ms of a 1044-token fold)
 __global__ void confidenceBinK(const float* beta, int n, int bins, float dmin, float dmax, bool caBins, int* binOut,
-                               float* sqOut) {
+                               float* sqOut, bool chaiBins = false) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (ij >= (size_t)n * n) return;
   int i = (int)(ij / n), j = (int)(ij % n);
   float sq = 0;
   for (int k = 0; k < 3; ++k) { float d = beta[i * 3 + k] - beta[j * 3 + k]; sq += d * d; }
   int bin = -1;
-  if (caBins) {
+  if (chaiBins) {
+    // chai-1's: 16 bins, how many of 15 evenly spaced bounds from 3.375 to 21.375 the distance (+1e-10) is past
+    float distance = sqrtf(sq + 1e-10f);
+    bin = 0;
+    for (int at = 0; at < bins - 1; ++at) bin += distance > 3.375f + at * (18.f / (bins - 2));
+  } else if (caBins) {
     // rf3's: the bin is how many of `bins - 1` evenly spaced bounds the (real, +1e-10) distance is past
     double distance = sqrt((double)sq + 1e-10);
     bin = 0;
@@ -32,13 +37,13 @@ __global__ void confidenceBinK(const float* beta, int n, int bins, float dmin, f
 }
 __global__ void confidencePairInitK(float* pair, const float* left, const float* right, const int* binOf,
                                     const float* sqOf, const float* pairMask, const float* Wd, int n, int C,
-                                    const float* Wdist, bool caBins) {
+                                    const float* Wdist, bool caBins, bool unmasked = false) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * n * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
   float v = left[(size_t)j * C + c] + right[(size_t)i * C + c];
   int bin = binOf[ij];
-  if (bin >= 0) v += Wd[(size_t)bin * C + c] * pairMask[ij];
+  if (bin >= 0) v += Wd[(size_t)bin * C + c] * (unmasked ? 1.f : pairMask[ij]);
   if (!caBins && Wdist) v += sqrtf(sqOf[ij] + 1e-10f) * Wdist[c];
   pair[t] += v;
 }
@@ -190,6 +195,50 @@ struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPl
 
 // consumeTrunkPair: the trunk's pair is read by nothing after this call, so the head works in it rather
 // than in a copy (the caller says so for a card short of room, on its last confidence call)
+// chai-1's pLDDT: each (token, dense slot)'s ATOM37 index, by its name (AF3's 4 characters, ASCII - 32)
+inline const int* atom37Index(int n, int dense) {
+  static const char* ATOM37[37] = { "N", "CA", "C", "CB", "O", "CG", "CG1", "CG2", "OG", "OG1", "SG", "CD", "CD1", "CD2",
+    "ND1", "ND2", "OD1", "OD2", "SD", "CE", "CE1", "CE2", "CE3", "NE", "NE1", "NE2", "OE1", "OE2", "CH2", "NH1", "NH2", "OH",
+    "CZ", "CZ2", "CZ3", "NZ", "OXT" };
+  const int* chars = M.i("batch.refAtomNameChars");
+  std::vector<int> idx((size_t)n * dense, 0);
+  for (size_t a = 0; a < idx.size(); ++a)
+    for (int k = 0; k < 37; ++k) {
+      bool same = true;
+      for (int c = 0; c < 4; ++c) {
+        int want = c < (int)strlen(ATOM37[k]) ? ATOM37[k][c] - 32 : 0;
+        if (chars[a * 4 + c] != want) { same = false; break; }
+      }
+      if (same) { idx[a] = k; break; }
+    }
+  int* d = scratch<int>("conf.atom37", idx.size());
+  CK(cudaMemcpy(d, idx.data(), idx.size() * 4, cudaMemcpyHostToDevice));
+  return d;
+}
+__global__ void gatherPlddt37K(const float* p37, const int* idx, float* out, int n, int dense, int bins) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * dense * bins) return;
+  int b = (int)(t % bins); size_t slot = t / bins; size_t token = slot / dense;
+  out[t] = p37[(token * 37 + idx[slot]) * bins + b];
+}
+// chai-1's confidence triangle attention: each direction's output projection plus its transposed twin, summed in
+// place once (their two applications cancel to one at inference - af3-any-model modules.py, dual_output)
+__global__ void addInPlaceK(float* a, const float* b, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i];
+}
+inline void foldDualOutputs() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  for (int k = 0; M.has("confidence.blocks." + std::to_string(k) + ".singleChannels"); ++k)
+    for (int a = 1; a <= 2; ++a) {
+      std::string G = "confidence.blocks." + std::to_string(k) + ".pairAttention" + std::to_string(a);
+      if (!hasW(G + ".outputProjectionTransposed")) continue;
+      addInPlaceK<<<blocks(lenW(G + ".outputProjection")), 256, 0, STREAM>>>(const_cast<float*>(W(G + ".outputProjection")),
+        W(G + ".outputProjectionTransposed"), lenW(G + ".outputProjection"));
+    }
+  CK(cudaStreamSynchronize(STREAM));
+}
 inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
                                     const float* pseudoBeta, const float* seqMask, const float* pairMask, int n,
                                     bool consumeTrunkPair = false) {
@@ -222,10 +271,11 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   linear<float, float>(targetFeat, right, n, F, C, P + ".rightTargetFeatProject");
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
   int* binOf = scratch<int>("conf.bin", pairs); float* sqOf = scratch<float>("conf.sq", pairs);
-  confidenceBinK<<<blocks(pairs), 256, 0, STREAM>>>(pseudoBeta, n, bins, 3.25f, 50.75f, caDgram, binOf, sqOf);
+  const bool chai = M.flag("trunk.dialect.chaiConfidence");     // chai-1's 16-bin distance embedding, unmasked
+  confidenceBinK<<<blocks(pairs), 256, 0, STREAM>>>(pseudoBeta, n, bins, 3.25f, 50.75f, caDgram, binOf, sqOf, chai);
   confidencePairInitK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, binOf, sqOf, pairMask,
-    W(P + ".distogramFeatProject"), n, C, Wopt(P + ".distanceFeatProject"), caDgram);
-  if (bins != (caDgram ? 40 : 39)) { fprintf(stderr, "confidence distogram has %d bins\n", bins); exit(1); }
+    W(P + ".distogramFeatProject"), n, C, Wopt(P + ".distanceFeatProject"), caDgram, chai);
+  if (bins != (chai ? 16 : caDgram ? 40 : 39)) { fprintf(stderr, "confidence distogram has %d bins\n", bins); exit(1); }
   if (hasW(P + ".inputSingleNormScale")) {
     // the trunk single clamped to +-512 and LayerNormed before any use (protenix2)
     clampK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, 512.f, (size_t)n * Cs);
@@ -234,6 +284,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
     CK(cudaMemcpyAsync(single, sn, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   }
   }
+  foldDualOutputs();
   int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
   bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
   for (int k = 0; k < nb; ++k)
@@ -339,7 +390,13 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   float* slnBuf = scratch<float>("conf.sln", (size_t)n * Cs);
   const float* sln = headNorm(single, slnBuf, n, Cs, "plddtLn");
   float* pl = scratch<float>("conf.plddtLogits", (size_t)n * dense * PB);
-  linear<float, float>(sln, pl, n, Cs, dense * PB, P + ".plddtLogits");
+  if (M.flag("trunk.dialect.chaiConfidence")) {
+    // chai-1 predicts pLDDT over the 37 ATOM37 slots and gathers each dense slot's by its atom NAME (no match: slot 0)
+    float* p37 = scratch<float>("conf.plddt37", (size_t)n * 37 * PB);
+    linear<float, float>(sln, p37, n, Cs, 37 * PB, P + ".plddtLogits");
+    gatherPlddt37K<<<blocks((size_t)n * dense * PB), 256, 0, STREAM>>>(p37, atom37Index(n, dense), pl, n, dense, PB);
+  } else
+    linear<float, float>(sln, pl, n, Cs, dense * PB, P + ".plddtLogits");
   float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);
   expectationK<<<blocks((size_t)n * dense), 256, 0, STREAM>>>(pl, plddt, nullptr, (size_t)n * dense, PB, dpc, 0, 100.f);
   out.plddt = download(plddt, (size_t)n * dense);

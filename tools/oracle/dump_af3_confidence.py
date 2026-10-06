@@ -31,7 +31,8 @@ from alphafold3.model.network import confidence_head, evoformer as ev
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "boltz2"
 SCALE = float(os.environ.get("POS_SCALE", "12.0"))
 seq, _ = fold_check.parse_ca(os.path.expanduser("~/6MRR.pdb"))
-batch_dict, cfg, model_dir = fold_check._fold_setup(MODEL, seq, None)
+# MODEL_DIR= names the blob's directory (default fold_check's ~/ported/<model>)
+batch_dict, cfg, model_dir = fold_check._fold_setup(MODEL, seq, os.environ.get("MODEL_DIR") or None)
 batch = feat_batch.Batch.from_data_dict(batch_dict)
 cfg.global_config.bfloat16 = "none"
 n = int(np.asarray(batch.token_features.mask).shape[0])
