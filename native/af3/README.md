@@ -478,6 +478,14 @@ each channel's two halves in one load: `triGateK` 156.6 -> 140.8 ms a fold, the 
 atoms identical. Chunks small enough for L2 to hold the transition's widening (1-8k rows) LOSE, 397-615
 against 370 ms - the GEMMs shrink faster than the elementwise passes speed up.
 
+Both triangle input kernels (`triInK` at 128 channels, `triIn256K` for ESMFold2 and protenix2) take the
+gating linear TWO tiles a step, one in each weight stage - the second stage idled in those steps, and
+Nsight Compute had `triIn256K` waiting on its MMA chains (stall_wait 25%, the HMMAs accumulating into one
+register back to back): twice the independent chains and half the steps. Byte-identical:
+`--bench-tri` `triInK` 0.1205 -> 0.1134 ms at 261 tokens, 1.514 -> 1.403 at 1044; `triIn256K` 68.6 ->
+64.2 ms over an ESMFold2 5CAJ fold. And `triangleOutK` stages its centre norm's scale and offset in shared
+memory (2 KB; four blocks an SM still fit): 0.2414 -> 0.2353 ms at 261, 3.204 -> 3.095 at 1044, exact.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
@@ -531,7 +539,8 @@ against 370 ms - the GEMMs shrink faster than the elementwise passes speed up.
   rows, half the threads, each row's sums in the same order): byte-identical and level at 261, 524 and
   1044 tokens - the norm is not what bounds the kernel. **And fused256's `triangleOutK` with its scale
   and offset as float2 loads** (half the loads, exact): 11% SLOWER at every size (0.241 -> 0.269 ms at
-  261) - the registers to hold them cost a kernel that is register-limited at four blocks an SM.
+  261) - the registers to hold them cost a kernel that is register-limited at four blocks an SM (shared
+  memory is what paid, above).
 - **Two 16-row tiles a warp in the triangle's input kernel** (each weight fragment feeding two
   MMAs, half the shared-memory reads): 8 warps of 32 rows lost to 16 of 16 - 252 against 230 ms at
   1044 tokens; 16 warps of 32 rows do not fit in shared memory.

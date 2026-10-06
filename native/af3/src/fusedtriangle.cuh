@@ -145,7 +145,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
   size_t row0 = (size_t)blockIdx.x * R;
   // steps 0 .. C/16-1: 16 channels of a and b (projection columns 2ch.., gate columns 2C+2ch..);
   // then C/32 steps of the gating linear, 32 columns each
-  const int steps = C / 16 + C / TI_NC;
+  // (the gating linear two tiles a step, one a stage: four of twelve steps become two, eight chains each)
+  const int steps = C / 16 + C / TI_NC / 2;
   auto issue = [&](int j, int st) {
     half *w0 = W0(st), *w1 = W1(st);
     #pragma unroll
@@ -159,7 +160,8 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
         cpAsync16(w0 + tiSw(k, c), Wpg + (size_t)k * 4 * C + j * 32 + c, true);
         cpAsync16(w1 + tiSw(k, c), Wpg + (size_t)k * 4 * C + 2 * C + j * 32 + c, true);
       } else {
-        cpAsync16(w0 + tiSw(k, c), Wg + (size_t)k * C + (j - C / 16) * TI_NC + c, true);
+        cpAsync16(w0 + tiSw(k, c), Wg + (size_t)k * C + 2 * (j - C / 16) * TI_NC + c, true);
+        cpAsync16(w1 + tiSw(k, c), Wg + (size_t)k * C + (2 * (j - C / 16) + 1) * TI_NC + c, true);
       }
     }
     cpCommit();
@@ -189,41 +191,41 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
         uint32_t f0[4];
         ldsm4t(f0, w0 + tiSw(k, c));
         mma16816(p[2 * n2], xa[ks], f0[0], f0[1]); mma16816(p[2 * n2 + 1], xa[ks], f0[2], f0[3]);
-        if (!gating) {
-          uint32_t f1[4];
-          ldsm4t(f1, w1 + tiSw(k, c));
-          mma16816(q[2 * n2], xa[ks], f1[0], f1[1]); mma16816(q[2 * n2 + 1], xa[ks], f1[2], f1[3]);
-        }
+        uint32_t f1[4];
+        ldsm4t(f1, w1 + tiSw(k, c));
+        mma16816(q[2 * n2], xa[ks], f1[0], f1[1]); mma16816(q[2 * n2 + 1], xa[ks], f1[2], f1[3]);
       }
     }
     if constexpr (BIAS) {
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
-        int col = (gating ? 4 * C + (j - C / 16) * TI_NC : j * TI_NC) + nt * 8 + tig * 2;
+        int col = (gating ? 4 * C + 2 * (j - C / 16) * TI_NC : j * TI_NC) + nt * 8 + tig * 2;
         float b0 = bias[col], b1 = bias[col + 1];
         p[nt][0] += b0; p[nt][1] += b1; p[nt][2] += b0; p[nt][3] += b1;
-        if (!gating) {
-          float g0 = bias[2 * C + col], g1 = bias[2 * C + col + 1];
-          q[nt][0] += g0; q[nt][1] += g1; q[nt][2] += g0; q[nt][3] += g1;
-        }
+        int qcol = gating ? col + TI_NC : 2 * C + col;       // the second gating tile, or the gate's columns
+        float g0 = bias[qcol], g1 = bias[qcol + 1];
+        q[nt][0] += g0; q[nt][1] += g1; q[nt][2] += g0; q[nt][3] += g1;
       }
     }
     if (gating) {                       // t2, row-major: columns (j - C/16)*32 + nt*8 + 2 tig
       // through the warp's own rows of Xs (no other warp touches them in the gating steps - a and b's
       // staging is idle - and the last a/b step ended at a barrier): 16-byte stores of whole 64-byte row
       // pieces, not 4 bytes in each of 8 rows: 787 -> 729 ms over a 1,044-token fold, 59.7 -> 55.3 at 261
-      int c0 = (j - C / 16) * TI_NC;
+      int c0 = 2 * (j - C / 16) * TI_NC;                    // p the first tile's columns, q the second's
       half* Ys = Xs + warp * 16 * LDX;
+      constexpr int W2 = 2 * TI_NC;
 #pragma unroll
       for (int nt = 0; nt < TI_NC / 8; ++nt) {
         int c = nt * 8 + tig * 2;
         *reinterpret_cast<half2*>(Ys + g * LDX + c) = __floats2half2_rn(p[nt][0], p[nt][1]);
         *reinterpret_cast<half2*>(Ys + (g + 8) * LDX + c) = __floats2half2_rn(p[nt][2], p[nt][3]);
+        *reinterpret_cast<half2*>(Ys + g * LDX + TI_NC + c) = __floats2half2_rn(q[nt][0], q[nt][1]);
+        *reinterpret_cast<half2*>(Ys + (g + 8) * LDX + TI_NC + c) = __floats2half2_rn(q[nt][2], q[nt][3]);
       }
       __syncwarp();
 #pragma unroll
-      for (int i = 0; i < 16 * (TI_NC / 8) / 32; ++i) {
-        int r = i * (32 / (TI_NC / 8)) + lane / (TI_NC / 8), c = (lane % (TI_NC / 8)) * 8;
+      for (int i = 0; i < 16 * (W2 / 8) / 32; ++i) {
+        int r = i * (32 / (W2 / 8)) + lane / (W2 / 8), c = (lane % (W2 / 8)) * 8;
         size_t row = row0 + warp * 16 + r;
         if (row < pp) *reinterpret_cast<uint4*>(t2 + row * C + c0 + c) = *reinterpret_cast<const uint4*>(Ys + r * LDX + c);
       }
