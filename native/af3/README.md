@@ -513,6 +513,13 @@ Rehearsed here it looked like 15% (protenix2's trunk 977.7 -> 832.2 ms, Chai-1's
 T4 it is 1.5-2.5% (protenix2 at 255 tokens, interleaved: 6960 -> 6857 and 7538 -> 7352 ms, the card drifting
 8% between rounds). The rehearsal caps shared memory, not a T4's arithmetic or its f16-into-f32 contraction:
 read a T4 number off a T4.
+On a T4 at 256 channels the input kernel ran 4 warps holding a whole SM (its rows and stages, 34 KB, of 64);
+it now runs 16 warps that LayerNorm their rows 32 at a time into a buffer of their own (`XROUNDS`), each
+round's warps taking their fragments before the next - one round's rows beside the stages, 57 KB, every row
+normed by the same arithmetic. Byte-identical; on a Colab T4 protenix2's input kernel 1768 -> 1477 ms over a
+fold. NOT occupancy-bound after all: the whole fold moves less than the card's thermal drift, and at 128
+channels against the 8-warp form it is 428 -> 420 - so it is taken only where 8 warps do not fit.
+
 
 A T4 has no `cp.async`, so `cpAsync16` there is a load and a store - and every streaming kernel's "issue the
 next stage, then compute this one" blocked on the issue: a memory round trip a step, exposed. The four that

@@ -217,10 +217,22 @@ inline bool wideFits(int C) {
 }
 // ...and the TRIANGLE's two at 128 channels, where the 128-channel fused kernels do not fit (a T4's 64 KB: the
 // output kernel holds the whole 128 x 128 weight, 71 KB, where these stream it 16 columns a stage, ~35 KB)
-constexpr size_t wideTriInSmemW(int C, int warps) { return triIn256Smem<__nv_bfloat16>(C, warps); }
-// the input kernel at 8 warps where they fit, else 4 (a T4: 256 channels at 8 warps are 67.6 KB) - a row's
-// arithmetic does not depend on the block it is in, so either is byte-identical
-inline int wideTriInWarps(int C) { return fitsSmem(wideTriInSmemW(C, 8)) ? 8 : 4; }
+// the input kernel's forms: 8 warps holding all their rows, else 16 warps norming their rows 32 at a time
+// (TRIIN_ROUNDED: a T4 at 256 channels, where 8 warps' rows are 67.6 KB), else 4 warps. A row's
+// arithmetic does not depend on the form, so all three are byte-identical.
+constexpr int TRIIN_ROUNDED = 16, TRIIN_XROUNDS = 8;
+constexpr size_t wideTriInSmemW(int C, int warps) {
+  return warps == TRIIN_ROUNDED ? triIn256Smem<__nv_bfloat16>(C, warps, TRIIN_XROUNDS) : triIn256Smem<__nv_bfloat16>(C, warps);
+}
+inline int wideTriInWarps(int C) {
+  static const int forced = getenv("LOCALFOLD_TRIIN_WARPS") ? atoi(getenv("LOCALFOLD_TRIIN_WARPS")) : 0;
+  if (forced) return forced;
+  // (measured on a Colab T4: at 256 channels the rounded form is 1768 -> 1477 ms of protenix2's input kernel
+  // against the 4-warp one; at 128, where 8 warps fit, 428 -> 420 against them - so only where 8 do not fit,
+  // and an L4, unmeasured, keeps its 8)
+  if (fitsSmem(wideTriInSmemW(C, 8))) return 8;
+  return fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED)) ? TRIIN_ROUNDED : 4;
+}
 // (the output kernel as triangleOutRun launches it: the bf16 tile at 16-column stages, either product type)
 inline size_t wideTriOutSmemReal(int C) {
   auto at = [](auto width) {
@@ -234,7 +246,14 @@ template <class F> void wideWidth(int C, F f) {
   if (C == 128) f(std::integral_constant<int, 128>{}); else f(std::integral_constant<int, 256>{});
 }
 template <class F> void wideWarps(int C, F f) {
-  if (wideTriInWarps(C) == 8) f(std::integral_constant<int, 8>{}); else f(std::integral_constant<int, 4>{});
+  int w = wideTriInWarps(C);
+  if (w == 8) f(std::integral_constant<int, 8>{});
+  else if (w == TRIIN_ROUNDED) f(std::integral_constant<int, TRIIN_ROUNDED>{});
+  else f(std::integral_constant<int, 4>{});
+}
+// triIn256K's template for a warp count (the rounded form at TRIIN_ROUNDED)
+template <int CC, int WI, class TA> constexpr auto triIn256For() {
+  if constexpr (WI == TRIIN_ROUNDED) return triIn256K<CC, WI, TA, TRIIN_XROUNDS>; else return triIn256K<CC, WI, TA>;
 }
 inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
   static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
@@ -471,8 +490,9 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
           wideWarps(C, [&](auto warps) {
             constexpr int WI = decltype(warps)::value;
             static bool attr = false;
-            if (!attr) { smemAttr((triIn256K<CC, WI, __nv_bfloat16>), (int)wideTriInSmemW(CC, WI)); attr = true; }
-            triIn256K<CC, WI, __nv_bfloat16><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
+            constexpr auto kern = triIn256For<CC, WI, __nv_bfloat16>();
+            if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+            kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
               pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs);
           });
           triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
@@ -487,8 +507,9 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         wideWarps(C, [&](auto warps) {
           constexpr int WI = decltype(warps)::value;
           static bool attr = false;
-          if (!attr) { smemAttr((triIn256K<CC, WI>), (int)wideTriInSmemW(CC, WI)); attr = true; }
-          triIn256K<CC, WI><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
+          constexpr auto kern = triIn256For<CC, WI, half>();
+          if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+          kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
             pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs);
         });
         contract();

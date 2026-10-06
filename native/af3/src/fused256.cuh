@@ -324,12 +324,18 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
 // TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (an f16 one overflows)
 
 // its dynamic shared memory: the LN'd rows, or the two weight stages and the a/b staging after them
-template <class TA = half> constexpr size_t triIn256Smem(int C, int warps) {
+// ...or, in ROUNDS (xrounds > 1), the stages, the staging and one round's 16 * warps / xrounds rows, none aliased
+template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int xrounds = 1) {
   size_t rows = (size_t)16 * warps * (C + 8) * 2, stages = (size_t)2 * 2 * C * 16 * 2 + (size_t)2 * 8 * (16 * warps + 8) * sizeof(TA);
+  if (xrounds > 1) return stages + (size_t)16 * warps / xrounds * (C + 8) * 2;
   return rows > stages ? rows : stages;
 }
 // Wt: tileTriIn's layout at 16 columns a tile
-template <int C, int WARPS, class TA = half>
+// XROUNDS > 1: the block's rows LayerNorm'd a round at a time into a buffer of their own, each round's warps
+// taking their fragments from it before the next - so a block of 16 warps needs one round's rows, not all of
+// them, beside its stages. On a T4 (64 KB an SM) the 4-warp form held a whole SM for 4 warps; this holds it
+// for 16. Every row is normed exactly as before (lnRowsToShared's per-row arithmetic), so byte-identical.
+template <int C, int WARPS, class TA = half, int XROUNDS = 1>
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
     TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs) {
@@ -349,7 +355,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
   };
   extern __shared__ __align__(16) unsigned char smem[];
-  half* Xs = (half*)smem;
+  half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE + (size_t)2 * CH * LDT * sizeof(TA));
   auto W0 = [&](int s) { return (half*)(smem + s * STAGE); };
   auto W1 = [&](int s) { return W0(s) + C * LDW; };
   TA* Ta = (TA*)(smem + 2 * STAGE);
@@ -378,13 +384,29 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 #if LF_REG_STAGES
   RegStage<2 * ITER> next;            // (sm_75: the next step's tiles held in registers across this step's MMAs)
 #endif
-  lnRowsToShared<C, R, WARPS>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
-  __syncthreads();
   uint32_t xa[KS][4];
+  if constexpr (XROUNDS == 1) {
+    lnRowsToShared<C, R, WARPS>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
+    __syncthreads();
 #pragma unroll
-  for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
-  __syncthreads();                    // every warp has its fragments: the stages take the rows' memory
-  issue(0, 0);
+    for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+    __syncthreads();                    // every warp has its fragments: the stages take the rows' memory
+    issue(0, 0);
+  } else {
+    static_assert(R % XROUNDS == 0 && (R / XROUNDS) % 16 == 0 && (R / XROUNDS) % WARPS == 0, "whole warps' rows a round");
+    constexpr int XR = R / XROUNDS;
+    issue(0, 0);                        // (the stages have memory of their own here)
+#pragma unroll 1
+    for (int rd = 0; rd < XROUNDS; ++rd) {
+      lnRowsToShared<C, XR, WARPS>(pair, [&](int r) { return pairOf(row0 + rd * XR + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
+      __syncthreads();
+      if (warp * 16 / XR == rd) {
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 - rd * XR + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+      }
+      __syncthreads();                  // the round's warps have their fragments: the next round's rows go there
+    }
+  }
   int lr0 = warp * 16 + g, lr1 = lr0 + 8;
   size_t pr0 = pairOf(row0 + lr0), pr1 = pairOf(row0 + lr1);
   float m0 = pr0 != SIZE_MAX ? mask[pr0] : 0.f, m1 = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
