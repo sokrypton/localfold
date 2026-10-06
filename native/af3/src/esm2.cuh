@@ -17,13 +17,13 @@
 
 namespace esm2 {
 // a resident [in, out] int8 matrix (a blob's: a float32 scale per channel of `out` and per block of rows) expanded
-// to float16 into columns [col0, col0 + out) of a [in, ld] matrix
-__global__ void expandColumnsK(const signed char* q, const float* scale, __half* w, size_t n, int out, size_t rows,
-                               int rowBlocks, int ld, int col0) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= n) return;
-  size_t row = t / out, col = t % out, g = (rows + rowBlocks - 1) / rowBlocks;
-  w[row * ld + col0 + col] = __float2half((float)q[t] * scale[(row / g) * out + col]);
+// to float16 into columns [col0, col0 + out) of a [in, ld] matrix. A row a blockIdx.y and columns across the
+// threads: per element there is no division left (the 64-bit ones of a flat index made this most of the
+// tower's time - 64 ms of Chai-1's target features on 6MRR)
+__global__ void expandColumnsK(const signed char* q, const float* scale, __half* w, int out, int g, int ld, int col0) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+  if (col >= out) return;
+  w[(size_t)row * ld + col0 + col] = __float2half((float)q[(size_t)row * out + col] * scale[(size_t)(row / g) * out + col]);
 }
 __global__ void embedK(const int* ids, const float* table, float* x, int rows, int C, float scale) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -110,8 +110,9 @@ inline void gemm(const float* X, const std::vector<std::string>& names, float* Y
     if (!r.scales32 || r.rows != (size_t)in || col0 + r.block > out) {
       fprintf(stderr, "e/%s is not a [%d, *] int8 matrix of the blob's\n", name.c_str(), in); exit(1);
     }
-    expandColumnsK<<<blocks(r.elements), 256, 0, STREAM>>>(r.codes, r.scales32, w, r.elements, r.block, r.rows, r.rowBlocks,
-                                                           out, col0);
+    int g = (int)((r.rows + r.rowBlocks - 1) / r.rowBlocks);
+    expandColumnsK<<<dim3((unsigned)((r.block + 255) / 256), (unsigned)r.rows), 256, 0, STREAM>>>(r.codes, r.scales32, w,
+                                                                                               r.block, g, out, col0);
     col0 += r.block;
   }
   if (col0 != out) { fprintf(stderr, "e/%s...: %d columns, not %d\n", names[0].c_str(), col0, out); exit(1); }
