@@ -587,6 +587,9 @@ sm_75 code JIT-compiled on the A100 is 16% faster for boltz2 - the A100's own sm
 - **An L2 prefetch of the fused transition's residual** (`prefetch.global.L2` over the block's rows right
   after its norm, so the epilogue's read at the end hits L2): 0.199 -> 0.201 ms at 261 tokens, 2.797 ->
   2.816 at 1044 - level to slightly worse.
+- **`flashGrid2R` on a T4** (its two query tiles a warp, with the next key tile held in registers where there
+  is no cp.async): slower than the register-staged `flashGridHalf` there - 698 ms (48-key tiles) and 645 (64)
+  against 624 over a boltz2 fold. Its two stages at 39-51 KB leave a T4 SM one block of 4 warps.
 - **The trunk's pair as a persisting L2 window** (`cudaAccessPolicyWindow`: at 255 tokens the f32 pair is
   33 MB and an A100 sets aside up to 26 MB): byte-identical and 14% SLOWER - trunk 311.6 -> 354.5 ms, and
   the diffusion, which never reads the pair, 60.0 -> 72.1. The set-aside costs every other stream more
