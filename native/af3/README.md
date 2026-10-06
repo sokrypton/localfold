@@ -452,6 +452,16 @@ The input kernel's LayerNorm keeps its lane's scale and offset in registers for 
 `triInK` at 261, flat at 1044; at 1044 it runs ~117 TFLOP/s beside ~0.9 TB/s). A warm templated 5CAJ
 fold's trunk 320.4 -> 314.5 ms, the PDB byte-identical.
 
+The unfused grid attention (every pair width but 128: Chai-1, protenix2, OpenDDE, IntelliFold-2) wrote its
+column direction's output projection to a float temporary and added it into the pair TRANSPOSED in a
+pass of its own (`addGridK`, 150 us a call at 255 tokens). A strided-batched GEMM adds it there itself
+(attention row r's token j is pair (j, r): ldc = n*C, a block stride of C, beta = 1), and Chai-1's
+parallel block, whose ending-node residual is untransposed, takes an ordinary beta = 1 GEMM. Warm folds
+at 255 tokens, byte-identical: Chai-1's trunk 573.7 -> 557.0 ms, protenix2's 798 -> 778, OpenDDE's 1654
+-> 1623. `LOCALFOLD_GRID_STRIDED=0` is the gathered-and-scattered arm. The same trick on the INPUT side
+(reading the normed pair transposed in place, no gather) loses: 41.6 against 35 ms for the gather and
+one GEMM.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at

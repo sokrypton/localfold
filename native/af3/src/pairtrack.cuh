@@ -636,6 +636,8 @@ __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
   g = fromF<T>(toF(g) + bias[c]);
 }
 
+// the unfused column direction's two GEMMs strided in place (LOCALFOLD_GRID_STRIDED=0: gathered and scattered)
+inline bool GRID_STRIDED = true;
 // Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
 template <class T>
 void gridAttention(float* pair, const float* mask, int n, int C, int heads, int D,
@@ -745,13 +747,16 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       }
       layerNorm2<float, T>(src, g, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
       act = g;
-    } else if (tr) {
+    }
+    T* qkvgOut = scratch<T>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
+    if (tr && !streamNorm) {
+      // (read transposed in place by a strided-batched GEMM instead: 41.6 against 35 ms for the gather and
+      // one GEMM, Chai-1 at 255 tokens - not taken)
       T* g = scratch<T>("grid.act", prs * C);
       if (C * sizeof(T) % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
       gatherTransposedK<<<blocks(prs * C * sizeof(T) / 16), 256, 0, STREAM>>>(norm, g, n, C, r0, rows, sizeof(T));
       act = g;
     }
-    T* qkvgOut = scratch<T>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
     linear<T, T>(act, qkvgOut, prs, C, 4 * Wd, qkvg);
     if (gateBias) addGateBiasK<T><<<blocks(prs * Wd), 256, 0, STREAM>>>(qkvgOut, gateBias, prs, Wd);
     T* gathered = scratch<T>("grid.gathered", prs * Wd);
@@ -760,6 +765,19 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     if (!tr && !outBias) {
       linear<T, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
       continue;
+    }
+    if (tr && !outBias && RESIDUAL_UNTRANSPOSED) {
+      // the residual kept untransposed (the parallel pair block's): the GEMM adds into it itself
+      linear<T, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+      continue;
+    }
+    if constexpr (std::is_same_v<T, half>) {
+      if (GRID_STRIDED && tr && !outBias) {
+        // the output projection added into the pair where it belongs, (j, r), by the GEMM itself
+        linearStrided<T, float>(gathered, Wd, (size_t)n * Wd, into(pair) + r0 * C, (size_t)n * C, C, n, (int)rows, Wd, C,
+                                pre + ".outputProjection", 1.f);
+        continue;
+      }
     }
     float* o = scratch<float>("grid.out", prs * C);
     linear<T, float>(gathered, o, prs, Wd, C, pre + ".outputProjection");

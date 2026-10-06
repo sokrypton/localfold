@@ -1465,6 +1465,21 @@ void linear(const T* X, TY* Y, size_t rows, int in, int out, const std::string& 
   }
 }
 
+// linear() over `batch` blocks of `rows` rows, X and Y each at their own row stride and block stride (in
+// elements): a transposed operand read or written in place - block b's row j at X + b * sx + j * ldx
+template <class T, class TY>
+void linearStrided(const T* X, size_t ldx, size_t sx, TY* Y, size_t ldy, size_t sy, int rows, int batch, int in,
+                   int out, const std::string& w, float beta = 0.f) {
+  static_assert(!std::is_same_v<T, float>, "the f16 path's");
+  const float one = 1.f;
+  if (lenW(w) != (size_t)in * out) {
+    fprintf(stderr, "%s has %zu elements, not %d x %d\n", w.c_str(), lenW(w), in, out); exit(1);
+  }
+  CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, out, rows, in, &one, Wh(w), cudaType<T>(), out, 0,
+                                X, cudaType<T>(), (long long)ldx, (long long)sx, &beta, Y, cudaType<TY>(), (long long)ldy,
+                                (long long)sy, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
 // ---------------------------------------------------------------- checking and timing
 inline double relRms(const float* a, const float* b, size_t n) {
   double num = 0, den = 0;
