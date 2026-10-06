@@ -4,8 +4,60 @@
 #include "pairtrack.cuh"
 
 // acc += work - base (an update run on a copy of its input, added as a difference: chai-1's parallel blocks)
+template <class T>
+__global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) x[t] = fromF<T>(toF(x[t]) * mask[t / C]);
+}
 __global__ void addDiffK(float* acc, const float* work, const float* base, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) acc[i] += work[i] - base[i];
+}
+// chai-1's PARALLEL pair track (af3-any-model modules.py, PairFormerIteration under chai): every update reads the
+// stage's input z0 and they are summed, z = z0 + f1(z0) + f2(z0) + ..., where AlphaFold 3 applies them one after
+// another. The kernels here update a pair in place, so each update after the first runs on a fresh copy of z0
+// and adds its difference. The ending-node triangle attention's output is NOT transposed back under chai
+// (its fused attention concatenates [dir0(i,j), dir1(j,i)] before one output projection), so its difference is
+// added transposed: AlphaFold 3's ending-node update at (j, i) is chai's at (i, j).
+enum class PairUpdate { TriOut, TriIn, GridRow, GridCol, Transition };
+template <class T>
+void runPairUpdate(PairUpdate u, float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
+                   bool divide, int transitionFactor) {
+  int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
+  switch (u) {
+    case PairUpdate::TriOut: triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationOutgoing", true, divide); break;
+    case PairUpdate::TriIn: triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationIncoming", false, divide); break;
+    case PairUpdate::GridRow: gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); break;
+    case PairUpdate::GridCol: gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); break;
+    case PairUpdate::Transition: transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition"); break;
+  }
+}
+// pair[i][j] += work[j][i] - base[j][i]
+__global__ void addDiffTransposedK(float* acc, const float* work, const float* base, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n * C) return;
+  int c = (int)(t % C); size_t ij = t / C; size_t i = ij / n, j = ij % n;
+  size_t ji = (j * n + i) * C + c;
+  acc[t] += work[ji] - base[ji];
+}
+template <class T>
+void parallelPairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap, bool divide,
+                         int transitionFactor, std::initializer_list<PairUpdate> updates) {
+  size_t pc = (size_t)n * n * C;
+  float* base = scratch<float>("par.base", pc);
+  float* work = scratch<float>("par.work", pc);
+  CK(cudaMemcpyAsync(base, pair, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
+  bool first = true;
+  for (PairUpdate u : updates) {
+    if (first && u != PairUpdate::GridCol) {     // the first runs on the pair itself
+      runPairUpdate<T>(u, pair, mask, n, C, pre, swap, divide, transitionFactor);
+      first = false; continue;
+    }
+    first = false;
+    CK(cudaMemcpyAsync(work, base, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
+    runPairUpdate<T>(u, work, mask, n, C, pre, swap, divide, transitionFactor);
+    if (u == PairUpdate::GridCol) addDiffTransposedK<<<blocks(pc), 256, 0, STREAM>>>(pair, work, base, n, C);
+    else addDiffK<<<blocks(pc), 256, 0, STREAM>>>(pair, work, base, pc);
+  }
 }
 
 // ---------------------------------------------------------------- embedder
@@ -384,6 +436,8 @@ void templateEmbedding(Trunk& t, float* out) {
   float* oh = scratch<float>("tmpl.onehot", (size_t)n * 31);
   float* row = scratch<float>("tmpl.row", (size_t)n * Ct); float* col = scratch<float>("tmpl.col", (size_t)n * Ct);
   int nb = 0; while (M.has(P + "blocks." + std::to_string(nb) + ".pairTransition.transition1")) ++nb;
+  // LOCALFOLD_TEMPLATE_BLOCKS=<n>: the stack truncated, to bisect against dump_af3_trunk_taps.py TEMPLATE_BLOCKS= / TEMPLATE_IDENTITY=1
+  if (const char* cap = getenv("LOCALFOLD_TEMPLATE_BLOCKS")) nb = std::min(nb, atoi(cap));
   for (int k = 0; k < passes; ++k) {
     std::string S = "template." + std::to_string(k) + ".";
     float repeat = (float)M.meta(S + "repeat");
@@ -406,6 +460,8 @@ void templateEmbedding(Trunk& t, float* out) {
           W(P + "templatePairEmbedding7"), pairs, Ct, bins);
       }
     }
+    // chai-1's fused projection's bias, once on the stack's input (af3-any-model FUSED_TEMPLATE_FEATURE_BIAS)
+    if (hasW(P + "templateFeatureBias")) addBiasK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, W(P + "templateFeatureBias"), pairs, Ct);
     if (outer) CK(cudaMemcpyAsync(before, act, pairs * Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
     // with one pass the trunk's pair is read before the stack (the query) and after it (the output) and
     // not in between: on a card short of room it waits in host memory while the stack runs
@@ -414,12 +470,18 @@ void templateEmbedding(Trunk& t, float* out) {
     for (int b = 0; b < nb; ++b) {
       std::string B = P + "blocks." + std::to_string(b);
       int factor = (int)(lenW(B + ".pairTransition.transition1") / ((size_t)Ct * Ct * 2));
-      pairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor);
+      if (M.flag("trunk.dialect.parallelPairformer"))        // chai: its parallel pair-only iteration
+        parallelPairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor, { PairUpdate::TriOut, PairUpdate::TriIn,
+          PairUpdate::GridRow, PairUpdate::GridCol, PairUpdate::Transition });
+      else pairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor);
     }
     if (outer) addK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, before, pairs * Ct);
     // in place: act is the pass's own and is written afresh by the next (one warp a row, each lane
     // reading an element before writing it)
     layerNorm2<float, float>(act, act, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");
+    // chai masks each template's output by its own coverage (pseudo-beta both ends, same chain)
+    if (M.flag("trunk.dialect.chaiTemplates") && M.has(S + "pseudoBetaMask2d"))
+      scaleRowsK<float><<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, Fdev(S + "pseudoBetaMask2d"), pairs, Ct);
     if (live == 1) scaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
     else addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
     if (parked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkFromHost(t.pair, pairs * Cq * 4); out = t.pair; }
@@ -429,63 +491,11 @@ void templateEmbedding(Trunk& t, float* out) {
   linear<float, float>(summed, out, pairs, Ct, Cq, P + "outputLinear", false, 1.f);
 }
 
-// chai-1's PARALLEL pair track (af3-any-model modules.py, PairFormerIteration under chai): every update reads the
-// stage's input z0 and they are summed, z = z0 + f1(z0) + f2(z0) + ..., where AlphaFold 3 applies them one after
-// another. The kernels here update a pair in place, so each update after the first runs on a fresh copy of z0
-// and adds its difference. The ending-node triangle attention's output is NOT transposed back under chai
-// (its fused attention concatenates [dir0(i,j), dir1(j,i)] before one output projection), so its difference is
-// added transposed: AlphaFold 3's ending-node update at (j, i) is chai's at (i, j).
-enum class PairUpdate { TriOut, TriIn, GridRow, GridCol, Transition };
-template <class T>
-void runPairUpdate(PairUpdate u, float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
-                   bool divide, int transitionFactor) {
-  int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
-  switch (u) {
-    case PairUpdate::TriOut: triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationOutgoing", true, divide); break;
-    case PairUpdate::TriIn: triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationIncoming", false, divide); break;
-    case PairUpdate::GridRow: gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); break;
-    case PairUpdate::GridCol: gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); break;
-    case PairUpdate::Transition: transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition"); break;
-  }
-}
-// pair[i][j] += work[j][i] - base[j][i]
-__global__ void addDiffTransposedK(float* acc, const float* work, const float* base, int n, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
-  int c = (int)(t % C); size_t ij = t / C; size_t i = ij / n, j = ij % n;
-  size_t ji = (j * n + i) * C + c;
-  acc[t] += work[ji] - base[ji];
-}
-template <class T>
-void parallelPairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap, bool divide,
-                         int transitionFactor, std::initializer_list<PairUpdate> updates) {
-  size_t pc = (size_t)n * n * C;
-  float* base = scratch<float>("par.base", pc);
-  float* work = scratch<float>("par.work", pc);
-  CK(cudaMemcpyAsync(base, pair, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
-  bool first = true;
-  for (PairUpdate u : updates) {
-    if (first && u != PairUpdate::GridCol) {     // the first runs on the pair itself
-      runPairUpdate<T>(u, pair, mask, n, C, pre, swap, divide, transitionFactor);
-      first = false; continue;
-    }
-    first = false;
-    CK(cudaMemcpyAsync(work, base, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
-    runPairUpdate<T>(u, work, mask, n, C, pre, swap, divide, transitionFactor);
-    if (u == PairUpdate::GridCol) addDiffTransposedK<<<blocks(pc), 256, 0, STREAM>>>(pair, work, base, n, C);
-    else addDiffK<<<blocks(pc), 256, 0, STREAM>>>(pair, work, base, pc);
-  }
-}
 // ---------------------------------------------------------------- MSA stack
 template <class T>
 __global__ void biasRowsK(T* x, const float* b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) x[t] = fromF<T>(toF(x[t]) + b[t % C]);
-}
-template <class T>
-__global__ void scaleRowsK(T* x, const float* mask, size_t rows, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) x[t] = fromF<T>(toF(x[t]) * mask[t / C]);
 }
 // lt [s][i][c] -> [i][c][s], the left operand of the shallow form's contraction (native/af2 has its twin)
 __global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O) {

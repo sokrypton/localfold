@@ -37,6 +37,8 @@ const CHAIN = 21;
 // structure is numbered against a reference it does not quite match.
 const RES_SEQ = [22, 27];
 // The B-factor, which a predicted structure uses to carry pLDDT.
+const ALT_LOC = 16;
+const OCCUPANCY = [54, 60];
 const B_FACTOR = [60, 66];
 const X = [30, 38];
 const Y = [38, 46];
@@ -64,6 +66,8 @@ export function coordinateAtoms(pdb) {
   const residues = [];
   const bFactors = [];
   const hetero = [];
+  const altLocs = [];
+  const occupancies = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const record = line.slice(...RECORD);
@@ -86,8 +90,11 @@ export function coordinateAtoms(pdb) {
     const bFactor = Number(line.slice(...B_FACTOR));
     bFactors.push(Number.isFinite(bFactor) ? bFactor : 0);
     hetero.push(record === "HETATM");
+    altLocs.push(line[ALT_LOC] === undefined ? "" : line[ALT_LOC].trim());
+    const occupancy = Number(line.slice(...OCCUPANCY));
+    occupancies.push(Number.isFinite(occupancy) ? occupancy : 1);
   }
-  return { lines, at, points, names, chains, residueNames, residues, bFactors, hetero };
+  return { lines, at, points, names, chains, residueNames, residues, bFactors, hetero, altLocs, occupancies };
 }
 
 /**

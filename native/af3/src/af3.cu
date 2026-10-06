@@ -602,6 +602,8 @@ int main(int argc, char** argv) {
     std::string tap = std::string("oracle.trunk.stages.tap.") + name;
     std::string plain = std::string("oracle.trunk.stages.") + name;
     check(name, d, n, M.has(tap) ? tap : plain);
+    // LOCALFOLD_SAVE_SEAMS=<dir>: each seam as <dir>/<name>.npy too, for an oracle too large to load here
+    if (const char* dir = getenv("LOCALFOLD_SAVE_SEAMS")) writeNpy(std::string(dir) + "/" + name + ".npy", download(d, n), { n });
   };
   std::function<void(const char*, const float*, size_t)> quiet = [](const char*, const float*, size_t) {};
   for (int it = 0; it < repeat; ++it) {

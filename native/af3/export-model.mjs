@@ -481,13 +481,19 @@ if (dialect.chiralCentres === true) {
     const covered = !((dialect.templateVisibilityByCoverage === true || dialect.chaiTemplates === true)
       && !real && pass.features === undefined);
     add(`template.${k}.repeat`, covered ? pass.repeat : 0);
-    add(`template.${k}.aatype`, real ? Int32Array.from(pass.slot.aatype)
+    // (chai: a template residue with no atoms is the GAP restype, 21 - template_modules.py)
+    const residueCovered = (token) => {
+      for (let a = 0; a < batch.dense; a += 1) if (pass.slot.atomMask[token * batch.dense + a] > 0) return true;
+      return false;
+    };
+    add(`template.${k}.aatype`, real ? Int32Array.from(pass.slot.aatype, (v, token) =>
+      (dialect.chaiTemplates === true && !residueCovered(token) ? 21 : v))
       : (pass.aatype ?? new Int32Array(batch.tokens).fill(pass.emptyAatype ?? 0)));
     if (fused) {
       add(`template.${k}.features`, pass.features ?? fusedTemplateFeatures(real ? pass.slot : undefined, batch.tokens,
         width, dialect, real ? pass.mask : undefined, (pass.emptyAatype ?? 0) !== 0));
     } else if (real) {
-      const g = templateGeometry(pass.slot, pass.mask, batch.tokens);
+      const g = templateGeometry(pass.slot, pass.mask, batch.tokens, undefined, { chai: dialect.chaiTemplates === true });
       add(`template.${k}.distogram`, Float32Array.from(g.distogram));
       add(`template.${k}.pseudoBetaMask2d`, g.pseudoBetaMask2d);
       add(`template.${k}.unitVector`, g.unitVector);

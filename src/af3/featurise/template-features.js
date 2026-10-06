@@ -306,7 +306,7 @@ export function backboneFrames(aatype, positions, mask, tokens, layout = AF3_DEN
  *            unitVector: Float32Array, backboneMask2d: Float32Array}}
  *   `unitVector` is [tokens, tokens, 3], already masked.
  */
-export function templateGeometry(template, multichainMask2d, tokens, layout = AF3_DENSE) {
+export function templateGeometry(template, multichainMask2d, tokens, layout = AF3_DENSE, options = {}) {
   const { aatype, atomMask } = template;
   const slots = layoutFor(layout).slots;
   // 🔴 THE POSITIONS ARE MASKED FIRST, which AF3 does as
@@ -362,6 +362,30 @@ export function templateGeometry(template, multichainMask2d, tokens, layout = AF
     }
   }
 
+  // 🔴 CHAI-1's DISTOGRAM IS ITS OWN (af3-any-model template_modules.py, from chai-lab's TemplateDistogramGenerator):
+  // 38 classes from how many of linspace(3.25, 50.75, 38)[1:] the distance (+1e-10) is past, and a MASK class 38
+  // wherever the pair is not covered - a one-hot there, where AF3 feeds an all-zero row
+  if (options.chai === true) {
+    const out = new Float32Array(tokens * tokens * DGRAM_BINS);
+    for (let i = 0; i < tokens; i += 1) {
+      for (let j = 0; j < tokens; j += 1) {
+        const pair = i * tokens + j;
+        let cls = 38;
+        if (pseudoBetaMask2d[pair] > 0) {
+          let sq = 1e-10;
+          for (let k = 0; k < 3; k += 1) {
+            const d = beta.positions[i * 3 + k] - beta.positions[j * 3 + k];
+            sq += d * d;
+          }
+          const distance = Math.fround(Math.sqrt(sq));
+          cls = 0;
+          for (let e = 1; e < 38; e += 1) if (distance > Math.fround(3.25 + (47.5 * e) / 37)) cls += 1;
+        }
+        out[pair * DGRAM_BINS + cls] = 1;
+      }
+    }
+    return { distogram: out, pseudoBetaMask2d, unitVector, backboneMask2d };
+  }
   // The distogram is masked last, exactly as AF3 does: `dgram *= mask[..., None]`
   // - unless the dialect says otherwise. See AF2_ATOM37_MONOMER.
   const maskDistogram = layout.maskDistogram !== false;

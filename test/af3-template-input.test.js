@@ -1,6 +1,6 @@
 import { describe, expect, it } from "./harness.js";
 import {
-  GAP_AATYPE, chainResidues, filterByConfidence, identityMap, templateSlot,
+  GAP_AATYPE, chainResidues, chosenAltLocs, filterByConfidence, identityMap, templateSlot,
 } from "../src/af3/featurise/template-input.js";
 import { NUM_DENSE } from "../src/af3/featurise/template-features.js";
 import { aatypeFor } from "../src/af3/featurise/reference-conformers.js";
@@ -155,5 +155,35 @@ describe("identityMap and filterByConfidence", () => {
     expect([...filterByConfidence(map, structure, 70, confidence)])
       .toEqual([[0, 0], [1, 1], [2, 2]]);
     expect(filterByConfidence(map, structure, 0, confidence)).toBe(map);
+  });
+});
+
+describe("alternate locations", () => {
+  // `line` with an altLoc and an occupancy written into columns 17 and 55-60
+  const alt = (text, altLoc, occupancy) =>
+    text.slice(0, 16) + altLoc + text.slice(17, 54) + occupancy.toFixed(2).padStart(6) + text.slice(60);
+
+  it("keeps the most occupied conformer, as AF3 and Biopython do, not the first", () => {
+    // 5CAJ's residues 166, 168 and 247 are this shape: B at 0.52 after A at 0.48
+    const pdb = [
+      line(1, "N", "SER", "A", 1, " ", 0, 0, 0),
+      alt(line(2, "CA", "SER", "A", 1, " ", 1, 0, 0), "A", 0.48),
+      alt(line(3, "CA", "SER", "A", 1, " ", 2, 0, 0), "B", 0.52),
+      alt(line(4, "OG", "SER", "A", 1, " ", 3, 0, 0), "A", 0.48),
+      alt(line(5, "OG", "SER", "A", 1, " ", 4, 0, 0), "B", 0.52),
+    ].join("\n");
+    const [residue] = chainResidues(pdb, "A").residues;
+    expect(residue.atoms.get("N")[0]).toBe(0);
+    expect(residue.atoms.get("CA")[0]).toBe(2);
+    expect(residue.atoms.get("OG")[0]).toBe(4);
+  });
+
+  it("breaks a tie alphabetically, and leaves a residue without conformers alone", () => {
+    const chosen = chosenAltLocs([
+      { key: "1", altLoc: "B", occupancy: 0.5 }, { key: "1", altLoc: "A", occupancy: 0.5 },
+      { key: "2", altLoc: "", occupancy: 1 },
+    ]);
+    expect(chosen.get("1")).toBe("A");
+    expect(chosen.has("2")).toBe(false);
   });
 });

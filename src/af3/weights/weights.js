@@ -595,6 +595,9 @@ export async function templateWeights(store, dialect = undefined, options = {}) 
     outputLayerNormScale: await T(`${TEMPLATE_SINGLE}/output_layer_norm/scale`),
     outputLayerNormOffset: await T(`${TEMPLATE_SINGLE}/output_layer_norm/offset`),
     outputLinear: await T(`${TEMPLATE}/output_linear/weights`),
+    // chai1's fused feature projection's bias, added once to the stack's input (FUSED_TEMPLATE_FEATURE_BIAS)
+    ...(store.manifest?.tensors?.[`${TEMPLATE_SINGLE}/template_feature_bias`] === undefined ? {}
+      : { templateFeatureBias: await T(`${TEMPLATE_SINGLE}/template_feature_bias`) }),
   };
 }
 

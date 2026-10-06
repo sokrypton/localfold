@@ -57,6 +57,17 @@ decoded bundle - a slice of one bundle tensor, zeros, ones, or a per-block Layer
 into its projection as the page's loader folds it - checked bit for bit, and fails on anything
 else. A fold through a map is byte-identical to one from the export it was made from (all seven).
 
+**Chai-1** (`maps/chai1.map`) folds through the same binary on af3-any-model's conventions (the
+`chai*` flags in src/af3/dialect.js), and takes two things nobody else does: ESM2 3B's embeddings,
+computed in the fold by `--esm-bundle=../../model-esm2-3b-int8` (tools/export_esm2_3b.py), and the
+structure token-pair weights af3-any-model's converter drops (tools/export_chai1_structure_pair.py,
+which the bundle must have before `quantize_af3.py`). Against af3-any-model at f32, every trunk seam
+is 2e-7 to 6e-7 on 6MRR and **5.4e-7 on 5CAJ with its crystal as template**; denoise 4.4e-7,
+confidence 1e-6. 6MRR from its sequence folds at 0.92-1.93 A over five samples (chai-lab
+0.95-1.78); 5CAJ at 2.32 A, 2.28 with its template - the N-terminal tag and the doubly-modelled
+165-169 loop, 0.46 / 0.39 A over the best 90%. The int5 bundle (233 MiB) gives 2.38 / 2.33. Neither
+bundle is published yet, so the page and the worker do not offer it.
+
 `--out=x.pdb`, or `--out=x.cif` for mmCIF as AlphaFold 3 writes it (entities, polymer sequences
 and chains declared, so AF3's own reader and gemmi both load it; the pLDDT in B_iso_or_equiv).
 `--save-embeddings` and `--save-distogram` write what AF3's `--save_embeddings` / `--save_distogram`

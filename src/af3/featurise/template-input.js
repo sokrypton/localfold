@@ -53,6 +53,39 @@ export const GAP_AATYPE = 21;
 const HETERO_RESIDUES = { MSE: "M" };
 
 /**
+ * Which alternate location each residue keeps: the one with the highest
+ * occupancy, ties to the alphabetically first - AlphaFold 3's rule
+ * (structure/cpp/mmcif_altlocs.h) and Biopython's, so AF2's too.
+ *
+ * 🔴 NOT "THE FIRST ONE", WHICH IS WHAT BOTH READERS HERE DID. 5CAJ chain A
+ * has three residues whose B conformer is the more occupied (0.52 against
+ * 0.48), and taking A there moved Chai-1's template features off
+ * af3-any-model's: 76 distogram classes and unit vectors up to 0.12.
+ *
+ * @param {{key: string, altLoc: string, occupancy: number}[]} atoms
+ * @returns {Map<string, string>} residue key -> the altLoc to keep
+ */
+export function chosenAltLocs(atoms) {
+  const totals = new Map();
+  for (const { key, altLoc, occupancy } of atoms) {
+    if (altLoc === "") continue;
+    if (!totals.has(key)) totals.set(key, new Map());
+    const per = totals.get(key);
+    const [sum, count] = per.get(altLoc) ?? [0, 0];
+    per.set(altLoc, [sum + occupancy, count + 1]);
+  }
+  const chosen = new Map();
+  for (const [key, per] of totals) {
+    let best = null, bestOccupancy = -Infinity;
+    for (const [altLoc, [sum, count]] of [...per].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+      if (sum / count > bestOccupancy) { best = altLoc; bestOccupancy = sum / count; }
+    }
+    chosen.set(key, best);
+  }
+  return chosen;
+}
+
+/**
  * One chain of a structure, as residues in file order.
  *
  * 🔴 KEYED ON THE RESIDUE NUMBER, NEVER ON POSITION IN THE ATOM LIST. A PDB's
@@ -75,8 +108,11 @@ export function chainResidues(text, chain) {
     ?? atoms.chains[0];
   const byNumber = new Map();
   const order = [];
+  const keep = chosenAltLocs(atoms.points.map((_, index) => ({ key: atoms.residues[index],
+    altLoc: atoms.chains[index] === wanted ? atoms.altLocs[index] : "", occupancy: atoms.occupancies[index] })));
   for (let index = 0; index < atoms.points.length; index += 1) {
     if (atoms.chains[index] !== wanted) continue;
+    if (atoms.altLocs[index] !== "" && keep.get(atoms.residues[index]) !== atoms.altLocs[index]) continue;
     const name = atoms.residueNames[index];
     if (atoms.hetero?.[index] === true && HETERO_RESIDUES[name] === undefined) continue;
     const number = atoms.residues[index];
@@ -96,7 +132,7 @@ export function chainResidues(text, chain) {
       byNumber.set(number, residue);
       order.push(residue);
     }
-    // ...first occurrence wins, which is the A altLoc in a file that has them.
+    // ...first occurrence wins (one alternate location is left by now).
     const residue = byNumber.get(number);
     if (!residue.atoms.has(atoms.names[index])) {
       residue.atoms.set(atoms.names[index], atoms.points[index]);

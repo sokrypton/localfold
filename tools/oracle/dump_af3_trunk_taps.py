@@ -47,7 +47,22 @@ PASSES = int(os.environ.get("PASSES", "1"))
 seq, _ = fold_check.parse_ca(os.path.expanduser("~/6MRR.pdb"))
 # MODEL_DIR= names the blob's directory (default fold_check's ~/ported/<model>), so the dump reads the blob the
 # bundle under test was exported from
-batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, os.environ.get("MODEL_DIR") or None)
+# TEMPLATE_CIF=<file> [TEMPLATE_CHAIN=A]: fold that chain's sequence with the structure as its own template
+# (template_parity._self_template), and name the dump with SUFFIX=
+templates = None
+if os.environ.get("TEMPLATE_CIF"):
+    import template_parity
+    seq, tmpl = template_parity._self_template(os.environ["TEMPLATE_CIF"], os.environ.get("TEMPLATE_CHAIN", "A"))
+    # 🔴 _self_template maps query i to template i, which is right only when the chain's SEQRES starts where the
+    # resolved sequence does. 5CAJ's carries a 15-residue expression tag first, so identity templates the query
+    # against a structure shifted 15 residues: TEMPLATE_OFFSET=15 there.
+    off = int(os.environ.get("TEMPLATE_OFFSET", "0"))
+    if off:
+        from alphafold3.common import folding_input
+        tmpl = folding_input.Template(mmcif=tmpl.mmcif, query_to_template_map={i: i + off for i in range(len(seq))})
+    templates = [tmpl]
+    print("self-template", len(seq), "residues:", seq)
+batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, os.environ.get("MODEL_DIR") or None, templates)
 # 🔴 fp32, NOT the fold path's bfloat16. A port compared against a bfloat16
 # reference is being held to the reference's rounding as well as its model.
 cfg.global_config.bfloat16 = "none"
@@ -59,6 +74,18 @@ BLOCKS = int(os.environ.get("BLOCKS", "0")) or cfg.evoformer.pairformer.num_laye
 cfg.evoformer.pairformer.num_layer = BLOCKS
 MSA_BLOCKS = int(os.environ.get("MSA_BLOCKS", "0")) or cfg.evoformer.msa_stack.num_layer
 cfg.evoformer.msa_stack.num_layer = MSA_BLOCKS
+# TEMPLATE_IDENTITY=1: every template block passes its input through - the embedding and output path alone
+if os.environ.get("TEMPLATE_IDENTITY"):
+    from alphafold3.model.network import modules as _modules
+    _pfi = _modules.PairFormerIteration.__call__
+    def _identity(self, act, *a, **k):
+        if "template" in self.module_name:
+            return act
+        return _pfi(self, act, *a, **k)
+    _modules.PairFormerIteration.__call__ = _identity
+# TEMPLATE_BLOCKS= truncates the template stack the same way (not to 0: a zero-block stack is no template path)
+TEMPLATE_BLOCKS = int(os.environ.get("TEMPLATE_BLOCKS", "0")) or cfg.evoformer.template.template_stack.num_layer
+cfg.evoformer.template.template_stack.num_layer = TEMPLATE_BLOCKS
 
 
 @hk.transform
@@ -110,6 +137,8 @@ for scope, leaves in params.items():
             value = value[:want[0]]
             cut += 1
         sliced[scope][leaf] = value
+if os.environ.get("TEMPLATE_IDENTITY"):    # its blocks' weights are unread, and a stack would scan over them
+    sliced = {k: v for k, v in sliced.items() if "template_embedding_iteration" not in k}
 if cut:
     print("  sliced %d stacked tensors to %d blocks" % (cut, BLOCKS))
     for name in _cut_names[:6]:
@@ -229,7 +258,11 @@ if CAPTURE:
     # A capture that matches nothing is a typo, not agreement.
     assert kept, "CAPTURE=%r matched none of %d modules" % (CAPTURE, len(SCOPES))
 
-p = ("/tmp/af3-oracle-trunk-%s.json" % MODEL if BLOCKS == 48
-     else "/tmp/af3-oracle-trunk-%s-b%d.json" % (MODEL, BLOCKS))
+# ONLY=<regex> keeps just the matching records (a 261-token dump is 2.6 GB whole)
+if os.environ.get("ONLY"):
+    import re as _re2
+    record = {k: v for k, v in record.items() if _re2.search(os.environ["ONLY"], k)}
+p = ("/tmp/af3-oracle-trunk-%s%s.json" % (MODEL, os.environ.get("SUFFIX", "")) if BLOCKS == 48
+     else "/tmp/af3-oracle-trunk-%s%s-b%d.json" % (MODEL, os.environ.get("SUFFIX", ""), BLOCKS))
 open(p, "w").write(json.dumps({"model": MODEL, "passes": PASSES, "stages": record}))
 print("wrote", p, "%.1f MB" % (os.path.getsize(p) / 2 ** 20))

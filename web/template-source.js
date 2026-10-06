@@ -24,7 +24,7 @@
  */
 import { alignPositions } from "./align.js";
 import {
-  GAP_AATYPE, chainResidues, filterByConfidence, identityMap, templateSlot, templateSlotAtom37,
+  GAP_AATYPE, chainResidues, chosenAltLocs, filterByConfidence, identityMap, templateSlot, templateSlotAtom37,
 } from "../src/af3/featurise/template-input.js";
 import { ONE_LETTER } from "../src/af3/fold.js";
 import { parseCIFAtoms } from "../src/design/mpnn/pdb.js";
@@ -271,14 +271,17 @@ export function residuesFromCif(text, chain) {
   // the waters into residues.
   const atoms = parseCIFAtoms(text).filter((atom) =>
     (!atom.hetero || atom.resName === "MSE")
-    && atom.occupancy > 0 && Number.isFinite(atom.x)
-    && (atom.altLoc === "" || atom.altLoc === "A"));
+    && atom.occupancy > 0 && Number.isFinite(atom.x));
   const wanted = chain ?? atoms[0]?.chain;
+  const keyOf = (atom) => `${atom.resSeq}${atom.iCode}`;
+  const keep = chosenAltLocs(atoms.filter((atom) => atom.chain === wanted)
+    .map((atom) => ({ key: keyOf(atom), altLoc: atom.altLoc, occupancy: atom.occupancy })));
   const byNumber = new Map();
   const order = [];
   for (const atom of atoms) {
     if (atom.chain !== wanted) continue;
-    const number = `${atom.resSeq}${atom.iCode}`;
+    if (atom.altLoc !== "" && keep.get(keyOf(atom)) !== atom.altLoc) continue;
+    const number = keyOf(atom);
     if (!byNumber.has(number)) {
       const residue = {
         number,
