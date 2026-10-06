@@ -95,15 +95,20 @@ def ensure_bundle(family, directory, log):
 
 
 def ensure_blob(name, log):
-    """af3-any-model's own published blob (native/fetch_bundles.py --af3-any-model): the AF3 lineage's weights
-    for every family but AlphaFold 3, whose parameters it may not redistribute, and chai-1's ESM2."""
+    """af3-any-model's own published blob (native/fetch_bundles.py --af3-any-model): every AF3-lineage family's
+    weights, and chai-1's ESM2. AlphaFold 3's are Google DeepMind's, for academic non-commercial use: the page
+    folds only once its model-terms dialog has been accepted, which is the acceptance the fetcher asks for."""
     import glob
     directory = os.path.join(REPO, "af3am-" + name)
     if not glob.glob(os.path.join(directory, "*.bin.zst")):
         emit("status", f"fetching the {name} weights")
+        env = dict(os.environ)
+        if name == "af3":
+            accepted = {n.strip() for n in env.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",") if n.strip()}
+            env["LOCALFOLD_ACCEPT_MODEL_TERMS"] = ",".join(sorted(accepted | {"alphafold3"}))
         fetcher = subprocess.Popen([sys.executable, os.path.join(NATIVE, "fetch_bundles.py"), "--af3-any-model", name],
                                    cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                   preexec_fn=die_with_parent)
+                                   preexec_fn=die_with_parent, env=env)
         said = []
         for line in fetcher.stdout:
             said.append(line)
@@ -474,13 +479,8 @@ class Worker:
         # each port's resident server (Server: the model's weights stay on the card between folds) and this
         # job's flags for it
         if port == "af3":
-            # af3-any-model's own int8 blob for every family it publishes; AlphaFold 3 itself (whose parameters it
-            # may not redistribute) from LocalFold's bundle, the page's
-            if family == "af3":
-                bundle = ensure_bundle(family, f"model-{family}-int5", log)
-                dialect = f"--bundle={bundle}/manifest.json"
-            else:
-                bundle, dialect = ensure_blob(family, log), f"--family={family}"
+            # af3-any-model's own int8 blob, every family (AlphaFold 3's under DeepMind's academic terms)
+            bundle, dialect = ensure_blob(family, log), f"--family={family}"
             key = ("af3", family)
             # chai-1's token features are ESM2 3B's, computed in the fold (native/af3/src/esm2.cuh)
             esm = [f"--esm-bundle={ensure_blob('esm2', log)}"] if family == "chai1" else []

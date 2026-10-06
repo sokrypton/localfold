@@ -1390,6 +1390,8 @@ export function featuriserDialect(dialect) {
 }
 
 export const DIALECT_ALIASES = Object.freeze({
+  // LocalFold's own family key for DeepMind's checkpoint (src/bundles/manifests/index.js)
+  af3: "alphafold3",
   openbind: "openbind0",
   // The reference's own short names, which a bundle exported through it may
   // carry: `if2`/`intellifold` and `rf3`.

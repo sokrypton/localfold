@@ -46,6 +46,17 @@ m trunk.dialect.msaPairedQueryRow 0
 m trunk.dialect.maskAtomActPerBlock 0
 m trunk.dialect.triangleMulDivideByLength 0
 m trunk.dialect.structuralTokens 0
+m trunk.dialect.chaiAtomStack 0
+m trunk.dialect.chaiTokenEmbedding 0
+m trunk.dialect.parallelPairformer 0
+m trunk.dialect.groupedOuterProduct 0
+m trunk.dialect.chaiMsaFeatures 0
+m trunk.dialect.chaiDiffusionConditioning 0
+m trunk.dialect.chaiSampler 0
+m trunk.dialect.chaiConfidence 0
+m trunk.dialect.chaiTemplates 0
+m trunk.dialect.recycleFromInit 0
+m trunk.dialect.mlpDistogram 0
 m trunk.embedder.pairChannels 128
 m trunk.embedder.singleChannels 384
 m trunk.embedder.msaChannels 64
@@ -3279,8 +3290,8 @@ b diffusion.conditioning.singleTransitions.1.ffwLayerNormScale diffuser/~/diffus
 b diffusion.conditioning.singleTransitions.1.ffwLayerNormOffset diffuser/~/diffusion_head/single_transition_1ffw_layer_norm/offset 0 384
 b diffusion.conditioning.singleTransitions.1.ffwTransition1 diffuser/~/diffusion_head/single_transition_1ffw_transition1/weights 0 589824
 b diffusion.conditioning.singleTransitions.1.ffwTransition2 diffuser/~/diffusion_head/single_transition_1ffw_transition2/weights 0 294912
-b diffusion.conditioning.fourierWeight diffuser/~/diffusion_head/fourier_embedding_weight 0 256
-b diffusion.conditioning.fourierBias diffuser/~/diffusion_head/fourier_embedding_bias 0 256
+c diffusion.conditioning.fourierWeight 256 0.458736420 0.0651623830 -0.0727830604 -0.269922584 0.642921150 -0.407639682 3.60116863 0.544613838 -0.326449037 2.10888267 1.30805349 1.19838560 -1.37745857 1.99475312 -1.64120293 1.07823789 -0.0228820592 0.883052826 0.480999440 0.176553741 0.302819490 0.806468725 0.626053333 -0.239653468 -1.02609432 0.750061095 -0.199130371 0.0746639594 0.664312363 -0.609905303 -0.697091937 -0.444536328 -1.77656078 0.0229987800 0.0409555212 0.354858637 -0.476026595 -0.988203883 -0.241067708 -1.07254291 -0.997417569 0.226976037 1.41390419 1.54984057 -0.122372910 0.201563373 0.617671430 0.239590287 0.924540341 1.84082258 0.890302241 0.395989120 -1.52224910 0.296690494 1.52356744 -0.339683771 0.241551444 -0.523083806 -0.236226648 0.928254545 -0.638646066 -0.621693075 0.786235511 -0.803521454 -0.454960674 1.30877995 -0.0668652803 1.00248849 -0.635934711 0.163725019 -1.46133232 1.10562658 -0.0169392694 0.286845475 -0.728432298 0.661335349 -1.92225552 0.702412307 -0.968688667 -0.473093390 -1.66894221 0.460187227 -0.568061054 0.326947838 -0.465298831 1.02299964 0.846882045 1.19581807 -1.82454145 0.0599971302 -0.595300734 1.44862521 -0.349337131 -0.465644866 -0.550055385 -1.61170268 0.175023064 0.386700630 -1.12133658 -0.293430358 -0.525274456 -1.26285112 1.07982683 0.512152195 1.48963666 1.09847653 -0.0156335793 0.325744569 1.94779706 -1.29198587 1.06249654 -0.869659901 0.229752660 -0.271826476 -0.211308971 -0.417739332 -0.0232903492 1.31049252 0.0557926483 -1.23127055 -0.996911049 0.270587206 -0.725093186 -0.144217968 -1.48605061 1.35041201 1.29619241 -1.01022530 -0.797879875 -0.161668584 0.872106850 1.69248152 1.42469788 -0.723251045 -1.24823737 0.0705111772 0.713329911 -0.0736042932 -0.919552267 -2.68856549 -0.440339357 0.354829341 -0.579338133 0.974680424 -0.310504943 -0.884544253 -2.08785224 0.473228216 -0.0240017194 0.266448200 -0.191476271 -2.10538960 -1.27962470 -1.35999286 2.09867334 0.650995135 0.216044918 -0.459510177 0.159944266 -0.314206928 -0.652026176 -0.610779762 -1.06100249 -1.47254968 1.18165290 -0.786562204 1.28182006 1.80323684 1.09196901 0.261186957 -0.301685810 0.397493333 0.268125743 -1.51995814 -0.469099462 0.0387425497 -1.36774313 2.30143976 2.06959820 -0.416475207 1.85624206 0.490197003 -0.0672653913 0.00457313005 0.239154235 -1.84971249 -0.204823270 -0.340978801 -0.579330325 -1.10541213 -0.302699834 -0.164304256 -0.823717177 0.103458121 1.78753936 0.0478676297 1.86778629 -0.652149916 0.815441430 -0.282149374 0.311872572 0.576619864 1.21938801 -1.56046617 0.380464286 -0.182359651 0.817945242 -0.404743433 0.465380281 -1.15558851 0.596257925 -1.07801270 0.0731085837 0.615260839 0.555184960 -0.497875541 0.927038789 -1.27780271 -0.833734691 -0.430155754 0.418777585 -1.03987372 -1.46055734 0.612823963 0.155905947 -0.342695206 0.565090716 -1.17904210 0.113748550 -1.83310866 0.387347937 -0.586230040 0.779311061 1.53930688 -0.702996254 -0.113893360 -1.14818096 -0.444006324 1.21887410 0.640667558 -0.702494025 -0.272448808 0.385860980 -1.07925785 0.124487072 -1.28286278 0.378275305 0.688123643 1.65695465 0.124405168 -0.0368983001 1.10224664 -0.283236295 -0.479391694 0.701208293 -0.672045827
+c diffusion.conditioning.fourierBias 256 0.00465964992 0.217382431 0.222777486 0.684638739 0.845968485 0.173370361 0.395737529 0.781535625 0.863111854 0.217823267 0.243778825 0.423107028 0.198873520 0.104860187 0.487075806 0.222054601 0.972634554 0.297149658 0.112445593 0.530205250 0.367962360 0.372946382 0.802616715 0.0466909409 0.863196611 0.759071708 0.772970200 0.0111479796 0.558508039 0.917999148 0.230323195 0.121547222 0.267019272 0.429347157 0.479517817 0.967825770 0.867850423 0.619856477 0.0574381389 0.418001175 0.688818932 0.605751991 0.210586667 0.644121051 0.639585257 0.893907905 0.697555542 0.893451691 0.533307552 0.569859385 0.307240486 0.00984560978 0.914070368 0.921189785 0.941530704 0.810974598 0.705376267 0.328107476 0.472272635 0.118214011 0.449830890 0.307672262 0.317563891 0.629694462 0.698925376 0.169491172 0.0620709695 0.467177272 0.953481793 0.623635888 0.490187287 0.0692003965 0.393339038 0.412999034 0.525148630 0.611972451 0.568718910 0.650539875 0.222034216 0.467485309 0.869315028 0.870500207 0.402087212 0.320849061 0.550846100 0.945845962 0.762799025 0.362505317 0.742729068 0.666820645 0.964528322 0.647683024 0.880708456 0.569954634 0.0639561415 0.694993496 0.444948077 0.397756577 0.202808976 0.333635211 0.0599900484 0.444148779 0.652270198 0.0119907903 0.719950557 0.190456867 0.483421445 0.251277328 0.665159941 0.224651575 0.223131061 0.0630280972 0.557836652 0.936255813 0.588008404 0.725253701 0.528792977 0.771954179 0.155486822 0.0102874003 0.393251419 0.454012394 0.714940786 0.330119967 0.0505069494 0.263816595 0.630647063 0.476040244 0.0859341621 0.00383424992 0.0635268688 0.0551024713 0.0355299711 0.358106375 0.560942888 0.609221697 0.885997772 0.454197884 0.404866338 0.712978244 0.349766731 0.978252172 0.129159927 0.0956625864 0.643189192 0.167173266 0.823086143 0.326720715 0.816887856 0.848571181 0.999227762 0.0755170584 0.187660217 0.130512357 0.391363502 0.0876872465 0.920482278 0.871857882 0.391584277 0.792247772 0.174926877 0.689024448 0.819807291 0.704581857 0.594894767 0.933248878 0.499866366 0.407054782 0.892029166 0.206732392 0.393397570 0.209969640 0.0292379893 0.539924383 0.401198149 0.103666067 0.0804459974 0.955515981 0.205180168 0.688262105 0.901592970 0.690087914 0.868808150 0.162464380 0.896282792 0.114816427 0.613536477 0.415450811 0.924783111 0.782124758 0.482926965 0.796210766 0.119474888 0.0174702406 0.229280233 0.873872638 0.863497853 0.895267367 0.589047790 0.138967752 0.681949258 0.558241248 0.444282055 0.554223776 0.281899691 0.279237747 0.0997995064 0.669947147 0.459435463 0.712077618 0.173006892 0.834349155 0.0257308502 0.458580852 0.559347987 0.306766748 0.522193670 0.345445752 0.192808747 0.269379497 0.0714764595 0.0629501268 0.763828874 0.387376070 0.588259816 0.174234748 0.0550944805 0.972288251 0.943806171 0.916640162 0.188001156 0.417718649 0.594206452 0.773719311 0.646877885 0.272846699 0.223109126 0.156638622 0.455731988 0.503867984 0.667122722 0.716496468 0.284756541 0.834154129 0.752613664 0.615177989 0.935445547 0.761418700 0.854742408 0.747669339 0.334595919 0.784779072 0.0725088120 0.101742387 0.953327298 0.807939053
 b diffusion.conditioning.noiseEmbeddingInitialNormScale diffuser/~/diffusion_head/noise_embedding_initial_norm/scale 0 256
 b diffusion.conditioning.noiseEmbeddingInitialProjection diffuser/~/diffusion_head/noise_embedding_initial_projection/weights 0 98304
 m diffusion.transformer.channels 768
@@ -3292,6 +3303,7 @@ m diffusion.transformer.condChannels 384
 m diffusion.transformer.pairChannels 128
 m diffusion.transformer.pairNormPerBlock 0
 m diffusion.transformer.noResidual 0
+m diffusion.transformer.chaiAdaLn 0
 b diffusion.transformer.pairInputLayerNormScale diffuser/~/diffusion_head/transformer/pair_input_layer_norm/scale 0 128
 b diffusion.transformer.superBlocks.0.pairLogitsProjection diffuser/~/diffusion_head/transformer/__layer_stack_with_per_layer/pair_logits_projection/weights 0 8192
 b diffusion.transformer.superBlocks.0.blocks.0.SingleCondLayerNormScale diffuser/~/diffusion_head/transformer/__layer_stack_with_per_layer/__layer_stack_with_per_layer/transformersingle_cond_layer_norm/scale 0 384
@@ -3837,6 +3849,7 @@ m diffusion.encoder.blocks.0.chainedAtomLayerNorm 0
 m diffusion.encoder.blocks.0.keyMaskedAtomAttention 0
 m diffusion.encoder.blocks.0.maskAtomActPerBlock 0
 m diffusion.encoder.blocks.0.diffusionNoResidual 0
+m diffusion.encoder.blocks.0.chaiAtomStack 0
 b diffusion.encoder.blocks.1.qSingleCondLayerNormScale diffuser/~/diffusion_head/diffusion_atom_transformer_encoder/__layer_stack_with_per_layer/diffusion_atom_transformer_encoderqsingle_cond_layer_norm/scale 128 128
 b diffusion.encoder.blocks.1.qSingleCondScaleWeights diffuser/~/diffusion_head/diffusion_atom_transformer_encoder/__layer_stack_with_per_layer/diffusion_atom_transformer_encoderqsingle_cond_scale/weights 16384 16384
 b diffusion.encoder.blocks.1.qSingleCondScaleBias diffuser/~/diffusion_head/diffusion_atom_transformer_encoder/__layer_stack_with_per_layer/diffusion_atom_transformer_encoderqsingle_cond_scale/bias 128 128
@@ -3865,6 +3878,7 @@ m diffusion.encoder.blocks.1.chainedAtomLayerNorm 0
 m diffusion.encoder.blocks.1.keyMaskedAtomAttention 0
 m diffusion.encoder.blocks.1.maskAtomActPerBlock 0
 m diffusion.encoder.blocks.1.diffusionNoResidual 0
+m diffusion.encoder.blocks.1.chaiAtomStack 0
 b diffusion.encoder.blocks.2.qSingleCondLayerNormScale diffuser/~/diffusion_head/diffusion_atom_transformer_encoder/__layer_stack_with_per_layer/diffusion_atom_transformer_encoderqsingle_cond_layer_norm/scale 256 128
 b diffusion.encoder.blocks.2.qSingleCondScaleWeights diffuser/~/diffusion_head/diffusion_atom_transformer_encoder/__layer_stack_with_per_layer/diffusion_atom_transformer_encoderqsingle_cond_scale/weights 32768 16384
 b diffusion.encoder.blocks.2.qSingleCondScaleBias diffuser/~/diffusion_head/diffusion_atom_transformer_encoder/__layer_stack_with_per_layer/diffusion_atom_transformer_encoderqsingle_cond_scale/bias 256 128
@@ -3893,6 +3907,7 @@ m diffusion.encoder.blocks.2.chainedAtomLayerNorm 0
 m diffusion.encoder.blocks.2.keyMaskedAtomAttention 0
 m diffusion.encoder.blocks.2.maskAtomActPerBlock 0
 m diffusion.encoder.blocks.2.diffusionNoResidual 0
+m diffusion.encoder.blocks.2.chaiAtomStack 0
 m diffusion.decoder.channels 128
 m diffusion.decoder.pairChannels 16
 m diffusion.decoder.heads 4
@@ -3938,6 +3953,7 @@ m diffusion.decoder.blocks.0.chainedAtomLayerNorm 0
 m diffusion.decoder.blocks.0.keyMaskedAtomAttention 0
 m diffusion.decoder.blocks.0.maskAtomActPerBlock 0
 m diffusion.decoder.blocks.0.diffusionNoResidual 0
+m diffusion.decoder.blocks.0.chaiAtomStack 0
 b diffusion.decoder.blocks.1.qSingleCondLayerNormScale diffuser/~/diffusion_head/diffusion_atom_transformer_decoder/__layer_stack_with_per_layer/diffusion_atom_transformer_decoderqsingle_cond_layer_norm/scale 128 128
 b diffusion.decoder.blocks.1.qSingleCondScaleWeights diffuser/~/diffusion_head/diffusion_atom_transformer_decoder/__layer_stack_with_per_layer/diffusion_atom_transformer_decoderqsingle_cond_scale/weights 16384 16384
 b diffusion.decoder.blocks.1.qSingleCondScaleBias diffuser/~/diffusion_head/diffusion_atom_transformer_decoder/__layer_stack_with_per_layer/diffusion_atom_transformer_decoderqsingle_cond_scale/bias 128 128
@@ -3966,6 +3982,7 @@ m diffusion.decoder.blocks.1.chainedAtomLayerNorm 0
 m diffusion.decoder.blocks.1.keyMaskedAtomAttention 0
 m diffusion.decoder.blocks.1.maskAtomActPerBlock 0
 m diffusion.decoder.blocks.1.diffusionNoResidual 0
+m diffusion.decoder.blocks.1.chaiAtomStack 0
 b diffusion.decoder.blocks.2.qSingleCondLayerNormScale diffuser/~/diffusion_head/diffusion_atom_transformer_decoder/__layer_stack_with_per_layer/diffusion_atom_transformer_decoderqsingle_cond_layer_norm/scale 256 128
 b diffusion.decoder.blocks.2.qSingleCondScaleWeights diffuser/~/diffusion_head/diffusion_atom_transformer_decoder/__layer_stack_with_per_layer/diffusion_atom_transformer_decoderqsingle_cond_scale/weights 32768 16384
 b diffusion.decoder.blocks.2.qSingleCondScaleBias diffuser/~/diffusion_head/diffusion_atom_transformer_decoder/__layer_stack_with_per_layer/diffusion_atom_transformer_decoderqsingle_cond_scale/bias 256 128
@@ -3994,6 +4011,7 @@ m diffusion.decoder.blocks.2.chainedAtomLayerNorm 0
 m diffusion.decoder.blocks.2.keyMaskedAtomAttention 0
 m diffusion.decoder.blocks.2.maskAtomActPerBlock 0
 m diffusion.decoder.blocks.2.diffusionNoResidual 0
+m diffusion.decoder.blocks.2.chaiAtomStack 0
 m confidence.pairChannels 128
 m confidence.singleChannels 384
 m confidence.targetFeatWidth 447
@@ -4305,6 +4323,7 @@ m targetFeat.encoder.blocks.0.chainedAtomLayerNorm 0
 m targetFeat.encoder.blocks.0.keyMaskedAtomAttention 0
 m targetFeat.encoder.blocks.0.maskAtomActPerBlock 0
 m targetFeat.encoder.blocks.0.diffusionNoResidual 0
+m targetFeat.encoder.blocks.0.chaiAtomStack 0
 b targetFeat.encoder.blocks.1.qSingleCondLayerNormScale diffuser/evoformer_conditioning_atom_transformer_encoder/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoderqsingle_cond_layer_norm/scale 128 128
 b targetFeat.encoder.blocks.1.qSingleCondScaleWeights diffuser/evoformer_conditioning_atom_transformer_encoder/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoderqsingle_cond_scale/weights 16384 16384
 b targetFeat.encoder.blocks.1.qSingleCondScaleBias diffuser/evoformer_conditioning_atom_transformer_encoder/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoderqsingle_cond_scale/bias 128 128
@@ -4333,6 +4352,7 @@ m targetFeat.encoder.blocks.1.chainedAtomLayerNorm 0
 m targetFeat.encoder.blocks.1.keyMaskedAtomAttention 0
 m targetFeat.encoder.blocks.1.maskAtomActPerBlock 0
 m targetFeat.encoder.blocks.1.diffusionNoResidual 0
+m targetFeat.encoder.blocks.1.chaiAtomStack 0
 b targetFeat.encoder.blocks.2.qSingleCondLayerNormScale diffuser/evoformer_conditioning_atom_transformer_encoder/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoderqsingle_cond_layer_norm/scale 256 128
 b targetFeat.encoder.blocks.2.qSingleCondScaleWeights diffuser/evoformer_conditioning_atom_transformer_encoder/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoderqsingle_cond_scale/weights 32768 16384
 b targetFeat.encoder.blocks.2.qSingleCondScaleBias diffuser/evoformer_conditioning_atom_transformer_encoder/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoderqsingle_cond_scale/bias 256 128
@@ -4361,6 +4381,7 @@ m targetFeat.encoder.blocks.2.chainedAtomLayerNorm 0
 m targetFeat.encoder.blocks.2.keyMaskedAtomAttention 0
 m targetFeat.encoder.blocks.2.maskAtomActPerBlock 0
 m targetFeat.encoder.blocks.2.diffusionNoResidual 0
+m targetFeat.encoder.blocks.2.chaiAtomStack 0
 m targetFeat.encoder.trunkSingleChannels 384
 m targetFeat.encoder.trunkPairChannels 128
 z targetFeat.encoder.lnormTrunkSingleCondScale 384

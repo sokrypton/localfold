@@ -55,7 +55,9 @@ struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, ds
 // 5 gathered (a map's `p` lines: parts of bundle tensors decoded into scratch, see GPart),
 // 6 int8 as af3-any-model's blobs store it (a float32 scale per CHANNEL of the last axis, `block` of them, and per
 //   BLOCK of rows: `rowBlocks` of the `rows`, ceil(rows / rowBlocks) rows each - its params.dequantise_int8),
-// 7 bfloat16 (a blob's uint16 bit patterns);
+// 7 bfloat16 (a blob's uint16 bit patterns),
+// 8 a map's `c` line: literal values (byteOffset indexes Segment::consts) - stock AlphaFold 3's frozen Fourier
+//   embedding, a constant of its source that DeepMind's af3.bin.zst does not carry;
 // first: the element of the bundle tensor this entry starts at (a map's slice of a stacked tensor)
 // round16 / accumulate / addRec: a DELTA bundle's `addTo` tensor (src/bundles/delta-tensor-store.js) - the
 // base's value rounded to float16, then the delta's decode added in float32 by the record addRec names
@@ -182,6 +184,7 @@ struct Segment { const float* data; size_t bytes; float* device; std::map<std::s
                  // as codes; ESM2 3B: 11 and 2.7) - each with where its codes and scales land in `resident`
                  struct Res { BRec b; size_t codes, scales; };
                  std::vector<Res> residentRecs; unsigned char* resident = nullptr; size_t residentBytes = 0;
+                 std::vector<std::vector<float>> consts;   // (a map's `c` lines, kind 8)
                };
 // A float32 array as a NumPy .npy file (format 1.0: magic, header dict padded to 64 bytes, data)
 inline void writeNpy(const std::string& path, const std::vector<float>& data, const std::vector<size_t>& shape) {
@@ -286,7 +289,10 @@ inline std::string findBlob(const std::string& dir) {
     closedir(d);
   }
   if (found.size() != 1) { fprintf(stderr, "%s holds %s and no manifest.json\n", dir.c_str(), found.empty() ? "no *.bin.zst" : "more than one *.bin.zst"); exit(1); }
-  return dir + "/" + found[0];
+  char* real = realpath((dir + "/" + found[0]).c_str(), nullptr);      // (absolute: its shards' paths are)
+  std::string path = real ? real : dir + "/" + found[0];
+  free(real);
+  return path;
 }
 // every tensor of a decompressed blob as a record of its one shard: name, BRec, shape
 inline std::vector<std::tuple<std::string, BRec, std::vector<double>>> blobRecords(const std::vector<std::string>& shards) {
@@ -561,6 +567,12 @@ struct Model {
           b = it->second; b.first = first; b.addRec = -1;
           bSource = source;
         } else if (kind == 'z') { in >> n; b.kind = 4; b.file = -1; }
+        else if (kind == 'c') {
+          in >> n; std::vector<float> v(n);
+          for (size_t k = 0; k < n && in; ++k) in >> v[k];
+          if (in.fail()) { fprintf(stderr, "%s: a malformed c line for %s\n", map.c_str(), name.c_str()); exit(1); }
+          b.kind = 8; b.file = -1; b.byteOffset = sg.consts.size(); sg.consts.push_back(std::move(v));
+        }
         else if (kind == 'p') {
           GPart g{}; char op; in >> n >> op >> g.rank;
           g.op = op; g.nsrc = op == 'o' ? 0 : op == 'x' ? 2 : 1;
@@ -702,6 +714,9 @@ struct Model {
       for (size_t t0 = 0; t0 < pd.size(); t0 += 65535)
         bundleGatherK<<<dim3(64, (unsigned)std::min<size_t>(65535, pd.size() - t0)), 256, 0, st>>>(scratch, pt + t0, s.device);
     }
+    for (const BRec& b : s.recs)            // a map's literal tensors, as they are
+      if (b.kind == 8 && cudaMemcpyAsync(s.device + b.dst, s.consts[b.byteOffset].data(), b.elements * 4,
+                                         cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
     bool ok = cudaStreamSynchronize(st) == cudaSuccess && cudaGetLastError() == cudaSuccess;
     cudaFree(pt); cudaFree(scratch); cudaFree(sdt[0]); cudaFree(sdt[1]);
     for (int k = 0; k < 2; ++k) { cudaFreeHost(pin[k]); cudaFree(raw[k]); cudaFree(dt[k]); cudaEventDestroy(done[k]); }
@@ -753,6 +768,7 @@ struct Model {
   static std::vector<float> decodeHost(const Segment& s, const BRec& b) {
     std::vector<float> out(b.elements, 0.f);
     if (b.kind == 4) return out;
+    if (b.kind == 8) return s.consts[b.byteOffset];
     std::vector<unsigned char> raw = readFile(shardPath(s, s.files[b.file]));
     for (size_t o = 0; o < b.elements; ++o) {
       size_t i = b.first + o;

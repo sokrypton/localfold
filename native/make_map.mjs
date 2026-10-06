@@ -65,7 +65,7 @@ const evalFold = (f) => {
 const lines = readFileSync(`${weightsDir}/model.idx`, "utf8").split("\n").filter(Boolean);
 const binFd = openSync(`${weightsDir}/model.bin`, "r");     // (read a tensor at a time: a file may pass 2 GiB)
 const outLines = [];
-let slices = 0, zeros = 0, derived = 0; const missing = [];
+let slices = 0, zeros = 0, derived = 0, consts = 0; const missing = [];
 for (const line of lines) {
   if (!line.startsWith("t ")) { outLines.push(line); continue; }
   const [, name, offset, length] = line.split(" ");
@@ -85,6 +85,13 @@ for (const line of lines) {
       if (same) { found = [source, first]; break search; }
     }
   }
+  // stock AlphaFold 3's Fourier noise embedding is a CONSTANT of its source (frozen from a fixed seed), which
+  // LocalFold's exporter bakes into the bundle and DeepMind's own af3.bin.zst does not carry: written as its
+  // values (`c`, 9 significant digits round-trip a float32) so one map reads the bundle and that blob alike.
+  // Ported models trained their own and carry it, so theirs stay `b` slices.
+  if (found && manifest.model?.name === "alphafold3" && /\/fourier_embedding_(weight|bias)$/.test(found[0])) {
+    outLines.push(`c ${name} ${n} ${Array.from(t, (x) => x.toPrecision(9)).join(" ")}`); ++consts; continue;
+  }
   if (found) { outLines.push(`b ${name} ${found[0]} ${found[1]} ${n}`); ++slices; continue; }
   if (t.every((x) => x === 0)) { outLines.push(`z ${name} ${n}`); ++zeros; continue; }
   if (t.every((x) => x === 1)) { outLines.push(`p ${name} ${n} o 1 ${n} 0 1`); ++derived; continue; }
@@ -102,4 +109,4 @@ if (missing.length) {
   process.exit(1);
 }
 writeFileSync(out, outLines.join("\n") + "\n");
-console.log(`${out}: ${slices} slices, ${zeros} zero tensors, ${derived} derived, ${outLines.length - slices - zeros - derived} metadata lines`);
+console.log(`${out}: ${slices} slices, ${zeros} zero tensors, ${derived} derived, ${consts} constants, ${outLines.length - slices - zeros - derived - consts} metadata lines`);

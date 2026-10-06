@@ -30,11 +30,13 @@ alignment moves this target little: chain A by hand gives 1.836, and 0.289 witho
 Both send the sequences to api.colabfold.com, so they are flags, never defaults.
 
 `fold` builds `af3` if it is missing, reads the model's weights as published - **af3-any-model's
-own int8 blob** for every model it publishes (`af3am-<model>/`, fetched once by
-`native/fetch_bundles.py --af3-any-model` from huggingface.co/sokrypton/af3-any-model, the files its
-JAX backend reads), and for AlphaFold 3 itself, whose parameters it may not redistribute, LocalFold's
-int5 bundle (`model-af3-int5`) - with its codes decoded on the device, `maps/<model>.map` naming each
-tensor's slice of it (below) - featurises the input with the repository's own featuriser into a
+own int8 blob** for all eight (`af3am-<model>/`, fetched once by `native/fetch_bundles.py
+--af3-any-model` from huggingface.co/sokrypton/af3-any-model, the files its JAX backend reads), with
+its codes decoded on the device and `maps/<model>.map` naming each tensor's slice of it (below).
+**AlphaFold 3's are Google DeepMind's parameters, hosted for academic, non-commercial use under its
+[AF3 terms](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)**: the
+first fetch asks you to accept them, or `LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3` says you have (the
+CUDA worker sets it, the page having asked). Then `fold` featurises the input with the repository's own featuriser into a
 temporary directory (0.2 s, while `af3` starts) and folds it (`--fold --fast`); everything after
 `--` goes to `af3`. An alignment keeps a seeded 1024 of its rows, AF3's own `num_msa`
 (`--max-msa=N` to change it: 512 is 3.6% less trunk on 5CAJ's 7907-row search, pLDDT 95.08
@@ -44,8 +46,8 @@ its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 ```
 cd native/af3
 nvcc -O1 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -ldl -o af3
-node --js-float16array export-model.mjs in --no-weights --sequence=<SEQ> [--a3m=...]
-./af3 in --bundle=../../model-af3-int5 --map=maps/af3.map --fold --fast --out=fold.pdb
+node --js-float16array export-model.mjs in --no-weights --family=af3 --sequence=<SEQ> [--a3m=...]
+./af3 in --bundle=../../af3am-af3 --map=maps/af3.map --fold --fast --out=fold.pdb
 python3 score.py fold.pdb ../../tools/fixtures/5caj-crystal.pdb A
 node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + every oracle
 ./af3 data                                   # f32 path, every stage against AF3
@@ -61,13 +63,16 @@ else. A fold through a map is byte-identical to one from the export it was made 
 
 🔴 **A BLOB IS READ AS IT IS PUBLISHED** (common.cuh's blob reader): one zstd stream of haiku records, its
 tensor names the ones LocalFold's bundles were exported under - so the same map reads either, checked on
-all seven: every bundle tensor is in its blob at its shape but chai1's structure-pair three, which
+all eight: every bundle tensor is in its blob at its shape but chai1's structure-pair three, which
 `tools/add_chai1_structure_to_blob.py` added to af3-any-model's chai1 blobs (commit 28141c7, every other
-record byte-identical). Decompressed once, through the system's libzstd, into record-aligned shards
+record byte-identical), and AlphaFold 3's two Fourier tensors - a constant of its source, frozen from a
+fixed seed, which DeepMind's file does not carry - written into `maps/af3.map` as their values (a `c`
+line; `make_map.mjs` emits it for a stock AF3 bundle): one map reads the int5 bundle and the blob alike,
+the bundle's fold byte-identical through it. Decompressed once, through the system's libzstd, into record-aligned shards
 beside it (`<blob>.raw/`, 256 MB each, an int8 tensor and its scales in one) so the upload streams them
 as it streams a bundle's: ESM2's 2.8 GB loads in 2.0 s warm at 1 GB of host memory. int8 is a float32
 scale per output channel and per block of rows; the decode is af3-any-model's `dequantise_int8` exactly
-(0.0 over boltz2's 120 int8 tensors). Measured against the int5 bundles on 6MRR: boltz2 0.573 / 0.564 A,
+(0.0 over boltz2's 120 int8 tensors). Measured against the int5 bundles on 6MRR: af3 0.620 / 0.620 A, boltz2 0.573 / 0.564,
 protenix2 1.536 / 1.514, intellifold2 1.564 / 1.551, openbind0 1.716 / 1.104, opendde 1.519 / 1.533,
 rosettafold3 1.644 / 1.817 - one sample's seed band - and chai1's ligands better (GOL 0.021 / 0.053 A,
 SEP 0.074 / 0.108).

@@ -7,8 +7,9 @@
 #   native/af3/fold 6mrr.pdb --model=protenix2 --sequence=<SEQ>
 #
 # --model=<name> picks the model (default af3): af3-any-model's own published int8 blob (af3am-<name>/, fetched
-# once by native/fetch_bundles.py --af3-any-model; chai1 with ESM2 3B's beside it) - or, for AlphaFold 3, whose
-# parameters af3-any-model may not redistribute, LocalFold's bundle (model-af3-int5) - read through maps/<name>.map.
+# once by native/fetch_bundles.py --af3-any-model; chai1 with ESM2 3B's beside it), read through maps/<name>.map.
+# AlphaFold 3's are Google DeepMind's, for academic non-commercial use: the first fetch asks you to accept its
+# terms (or set LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3).
 #
 #   native/af3/fold --serve [--model=<name>]     then any number of ordinary fold commands, then
 #   native/af3/fold --stop  [--model=<name>]
@@ -39,17 +40,11 @@ done
 repo="$(cd "$here/../.." && pwd)"
 map="$here/maps/$model.map"
 [ -f "$map" ] || { echo "no model $model (no $map)" >&2; exit 1; }
-if [ "$model" = af3 ]; then
-  bundle="$repo/model-$model-int5/manifest.json"
-  [ -f "$bundle" ] || python3 "$repo/native/fetch_bundles.py" "$model" >&2
-  wflags=(--bundle="$repo/model-$model-int5" --map="$map"); dialect=(--bundle="$bundle")
-else
-  ls "$repo/af3am-$model"/*.bin.zst >/dev/null 2>&1 || python3 "$repo/native/fetch_bundles.py" --af3-any-model "$model" >&2
-  wflags=(--bundle="$repo/af3am-$model" --map="$map"); dialect=(--family="$model")
-  if [ "$model" = chai1 ]; then
-    ls "$repo/af3am-esm2"/*.bin.zst >/dev/null 2>&1 || python3 "$repo/native/fetch_bundles.py" --af3-any-model esm2 >&2
-    wflags+=(--esm-bundle="$repo/af3am-esm2")
-  fi
+ls "$repo/af3am-$model"/*.bin.zst >/dev/null 2>&1 || python3 "$repo/native/fetch_bundles.py" --af3-any-model "$model" >&2 || exit 1
+wflags=(--bundle="$repo/af3am-$model" --map="$map"); dialect=(--family="$model")
+if [ "$model" = chai1 ]; then
+  ls "$repo/af3am-esm2"/*.bin.zst >/dev/null 2>&1 || python3 "$repo/native/fetch_bundles.py" --af3-any-model esm2 >&2 || exit 1
+  wflags+=(--esm-bundle="$repo/af3am-esm2")
 fi
 if [ ! -x "$here/af3" ]; then
   (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af3.cu \

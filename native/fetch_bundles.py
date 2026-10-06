@@ -7,8 +7,9 @@
 
 --af3-any-model fetches af3-any-model's own published blobs instead (huggingface.co/sokrypton/af3-any-model, int8,
 pinned below), the weights the CUDA ports fold the AF3 lineage with - one *.bin.zst each, into af3am-<name>/,
-which native/af3 reads as published (common.cuh's blob reader). AlphaFold 3's own parameters are not there:
-DeepMind does not let them be redistributed, so af3 keeps LocalFold's bundle.
+which native/af3 reads as published (common.cuh's blob reader). AlphaFold 3's own (af3) are hosted there for
+academic, non-commercial use under Google DeepMind's AF3 terms, and fetched only once those terms are accepted:
+LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3, or a yes at the prompt.
 
 Each name is a family key of src/bundles/manifests/index.js; its bundle (manifest.json and every shard
 the manifest names) lands in the family's `directory` under the repository, so the native wrappers find
@@ -37,9 +38,10 @@ def families(index_js):
     return out
 
 
-# af3-any-model's int8 blobs, at the commit that added chai-lab's structure token-pair weights to chai1's
-AF3_ANY_MODEL = "https://huggingface.co/sokrypton/af3-any-model/resolve/28141c703dfd09e5d208c1a9938a653688ec36d8/"
+# af3-any-model's int8 blobs, at the commit that added AlphaFold 3's (after chai1's structure token-pair weights)
+AF3_ANY_MODEL = "https://huggingface.co/sokrypton/af3-any-model/resolve/98f787eacd6e49cdba88e044622773a8702f03fe/"
 BLOBS = {
+    "af3": "alphafold3/af3.int8.bin.zst",     # (Google DeepMind's: academic, non-commercial use, terms first)
     "chai1": "chai1/chai1.int8.bin.zst",
     "boltz2": "boltz2/boltz2.int8.bin.zst",
     "protenix2": "protenix/protenix2.int8.bin.zst",
@@ -81,10 +83,31 @@ def fetch_ranged(url, path, name, parts=8):
     os.replace(path + ".part", path)
 
 
+AF3_TERMS = ("AlphaFold 3's parameters are Google DeepMind's, for academic, non-commercial use only, under the\n"
+             "AlphaFold 3 Model Parameters Terms of Use and Prohibited Use Policy:\n"
+             "  https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md\n"
+             "  https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_PROHIBITED_USE_POLICY.md")
+
+
+def accepted_af3_terms():
+    """The user's acceptance of DeepMind's AF3 terms: LOCALFOLD_ACCEPT_MODEL_TERMS naming alphafold3 (what
+    tools/build_site.py reads too, and what the CUDA worker sets once the page's terms dialog has been
+    accepted), or a yes at a prompt."""
+    named = {n.strip() for n in os.environ.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",")}
+    if "alphafold3" in named:
+        return True
+    print(AF3_TERMS, file=sys.stderr)
+    if not sys.stdin.isatty():
+        return False
+    return input("Do you accept these terms? [y/N] ").strip().lower() in ("y", "yes")
+
+
 def fetch_blobs(names, repo):
     for name in names:
         if name not in BLOBS:
             sys.exit(f"af3-any-model has no blob named {name!r} here: {', '.join(BLOBS)}")
+        if name == "af3" and not accepted_af3_terms():
+            sys.exit("AlphaFold 3's parameters need its terms accepted first: set LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3")
         dest = os.path.join(repo, "af3am-" + name)
         os.makedirs(dest, exist_ok=True)
         path = os.path.join(dest, os.path.basename(BLOBS[name]))
