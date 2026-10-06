@@ -486,6 +486,14 @@ register back to back): twice the independent chains and half the steps. Byte-id
 64.2 ms over an ESMFold2 5CAJ fold. And `triangleOutK` stages its centre norm's scale and offset in shared
 memory (2 KB; four blocks an SM still fit): 0.2414 -> 0.2353 ms at 261, 3.204 -> 3.095 at 1044, exact.
 
+A cold start (the first fold after a model is chosen) was mostly PINNING, not reading: `bundleUp` read each
+shard into one of two shard-sized pinned buffers, and on this A100 host 2 x 256 MB of `cudaHostAlloc` is
+0.4 s to allocate and 0.16 to free, per bundle - where reading AF3's 367 MB from the page cache is 0.04. A
+ring of four 4 MB pinned pieces, kept for the process, now feeds each shard's device buffer (resident codes
+copied from it device to device). Byte-identical; whole cold runs at 255 tokens: AF3 1.72 -> 1.20 s,
+Chai-1 (two bundles, ESM2 3B's among them) 2.84 -> 1.67, ESMFold2 (16 MB shards, so it pinned little)
+1.10 -> 1.05. A first try at four 16 MB pieces made ESMFold2 0.1 s SLOWER: it pinned more than before.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
@@ -532,6 +540,10 @@ memory (2 KB; four blocks an SM still fit): 0.2414 -> 0.2353 ms at 261, 3.204 ->
   219 against 199 ms at 1044 tokens. Stripping it, neither the residual (-23 ms) nor the second
   GEMM (-27) dominates.
 
+- **The trunk's pair as a persisting L2 window** (`cudaAccessPolicyWindow`: at 255 tokens the f32 pair is
+  33 MB and an A100 sets aside up to 26 MB): byte-identical and 14% SLOWER - trunk 311.6 -> 354.5 ms, and
+  the diffusion, which never reads the pair, 60.0 -> 72.1. The set-aside costs every other stream more
+  than the pair's hits return.
 - **The unfused centre norm's statistics over all eight rows of threads** (one row of 32 summed every
   channel serially): 3 ms of OpenDDE's 1600 - its time is the strided load, not the sum. **And the
   unfused gated residual four elements a thread**: level (105.6 against 105.9 ms) - it moves ~1.36 TB/s.

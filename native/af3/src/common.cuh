@@ -647,12 +647,24 @@ struct Model {
     size_t most = 0;
     std::vector<size_t> sizes;
     for (auto& f : s.files) { struct stat sb; stat(shardPath(s, f).c_str(), &sb); sizes.push_back((size_t)sb.st_size + 2); most = std::max(most, sizes.back()); }
-    unsigned char* pin[2]; unsigned char* raw[2]; BDecode* dt[2]; cudaEvent_t done[2];
+    // each shard read through a small ring of pinned pieces, kept for the process, into its device buffer:
+    // pinning costs ~0.8 ms a MB here, so the two shard-sized pinned buffers this used were 0.4 s to allocate
+    // and 0.16 to free for 256 MB shards - more than the whole read (AF3's cold start 1.7 -> 1.25 s, Chai-1's
+    // 2.8 -> 1.8) - and 16 MB of pieces cost ~13 ms once
+    constexpr size_t PIECE = (size_t)4 << 20; constexpr int NP = 4;
+    static unsigned char* ring[NP]; static cudaEvent_t freed[NP];
+    static std::mutex ringMu; std::lock_guard<std::mutex> ringHeld(ringMu);   // (uploadAsync: a thread a segment)
+    if (!ring[0])
+      for (int b = 0; b < NP; ++b)
+        if (cudaHostAlloc(&ring[b], PIECE, cudaHostAllocDefault) != cudaSuccess ||
+            cudaEventCreateWithFlags(&freed[b], cudaEventDisableTiming) != cudaSuccess) return false;
+    unsigned char* raw[2]; BDecode* dt[2]; cudaEvent_t done[2];
     size_t maxRecs = s.recs.size();
     for (int k = 0; k < 2; ++k)
-      if (cudaHostAlloc(&pin[k], most, cudaHostAllocDefault) != cudaSuccess || cudaMalloc(&raw[k], most) != cudaSuccess ||
+      if (cudaMalloc(&raw[k], most) != cudaSuccess ||
           cudaMalloc(&dt[k], maxRecs * sizeof(BDecode)) != cudaSuccess || cudaEventCreateWithFlags(&done[k], cudaEventDisableTiming) != cudaSuccess)
         return false;
+    size_t piece = 0;                                        // pieces issued, over every shard
     std::vector<std::vector<BDecode>> tables(2), scratchTables(2);
     if (s.residentBytes && !s.resident && cudaMalloc(&s.resident, s.residentBytes) != cudaSuccess) return false;
     float* scratch = nullptr;
@@ -664,23 +676,29 @@ struct Model {
       if (fi >= 2 && cudaEventSynchronize(done[k]) != cudaSuccess) return false;     // buffer k free again
       int fd = open(shardPath(s, s.files[fi]).c_str(), O_RDONLY);
       if (fd < 0) return false;
-      size_t n = sizes[fi] - 2, got = 0;
-      while (got < n) { ssize_t r = read(fd, pin[k] + got, n - got); if (r <= 0) { close(fd); return false; } got += (size_t)r; }
+      size_t n = sizes[fi] - 2;
+      for (size_t off = 0; off < n; off += PIECE, ++piece) {
+        int b = (int)(piece % NP);
+        if (piece >= NP && cudaEventSynchronize(freed[b]) != cudaSuccess) { close(fd); return false; }
+        size_t len = std::min(PIECE, n - off), got = 0;
+        while (got < len) { ssize_t r = read(fd, ring[b] + got, len - got); if (r <= 0) { close(fd); return false; } got += (size_t)r; }
+        if (cudaMemcpyAsync(raw[k] + off, ring[b], len, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            cudaEventRecord(freed[b], st) != cudaSuccess) { close(fd); return false; }
+      }
       close(fd);
-      pin[k][n] = pin[k][n + 1] = 0;          // (a packed code's second byte past the last group)
+      if (cudaMemsetAsync(raw[k] + n, 0, 2, st) != cudaSuccess) return false;   // (a packed code's second byte past the last group)
       for (const auto& r : s.residentRecs)    // the resident tensors' codes and scales, as they are
         if (r.b.file == (int)fi &&
-            (cudaMemcpyAsync(s.resident + r.codes, pin[k] + r.b.byteOffset, r.b.elements, cudaMemcpyHostToDevice, st) != cudaSuccess ||
-             cudaMemcpyAsync(s.resident + r.scales, pin[k] + r.b.scaleOffset, residentScaleBytes(r.b),
-                             cudaMemcpyHostToDevice, st) != cudaSuccess)) return false;
+            (cudaMemcpyAsync(s.resident + r.codes, raw[k] + r.b.byteOffset, r.b.elements, cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
+             cudaMemcpyAsync(s.resident + r.scales, raw[k] + r.b.scaleOffset, residentScaleBytes(r.b),
+                             cudaMemcpyDeviceToDevice, st) != cudaSuccess)) return false;
       auto& table = tables[k]; table.clear();
       for (const BRec& b : s.recs)
         if (b.file == (int)fi || (b.kind == 4 && fi == 0))
           table.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.rows, b.kind, b.bits, b.block,
                            b.round16 | (b.accumulate << 1), b.rowBlocks});
       if (!table.empty()) {
-        if (cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess ||
-            cudaMemcpyAsync(dt[k], table.data(), table.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
+        if (cudaMemcpyAsync(dt[k], table.data(), table.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         for (size_t t0 = 0; t0 < table.size(); t0 += 65535)
           bundleDecodeK<<<dim3(64, (unsigned)std::min<size_t>(65535, table.size() - t0)), 256, 0, st>>>(raw[k], dt[k] + t0, s.device);
       }
@@ -689,7 +707,6 @@ struct Model {
         if (b.file == (int)fi) stable.push_back({b.byteOffset, b.dst, b.elements, b.scaleOffset, b.zeroOffset, b.first, b.rows, b.kind,
                                                  b.bits, b.block, b.round16 | (b.accumulate << 1), b.rowBlocks});
       if (!stable.empty()) {
-        if (table.empty() && cudaMemcpyAsync(raw[k], pin[k], n + 2, cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         if (cudaMemcpyAsync(sdt[k], stable.data(), stable.size() * sizeof(BDecode), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
         for (size_t t0 = 0; t0 < stable.size(); t0 += 65535)
           bundleDecodeK<<<dim3(64, (unsigned)std::min<size_t>(65535, stable.size() - t0)), 256, 0, st>>>(raw[k], sdt[k] + t0, scratch);
@@ -719,7 +736,7 @@ struct Model {
                                          cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
     bool ok = cudaStreamSynchronize(st) == cudaSuccess && cudaGetLastError() == cudaSuccess;
     cudaFree(pt); cudaFree(scratch); cudaFree(sdt[0]); cudaFree(sdt[1]);
-    for (int k = 0; k < 2; ++k) { cudaFreeHost(pin[k]); cudaFree(raw[k]); cudaFree(dt[k]); cudaEventDestroy(done[k]); }
+    for (int k = 0; k < 2; ++k) { cudaFree(raw[k]); cudaFree(dt[k]); cudaEventDestroy(done[k]); }
     cudaStreamDestroy(st);
     return ok;
   }
