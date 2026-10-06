@@ -250,6 +250,20 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     int st = n & 1;
     if (n + 1 < chunks) { issue(n + 1, st ^ 1); cpWait<1>(); }
     else cpWait<0>();
+    // the chunk's residual and gate, loaded before its MMAs so they cover the latency (ncu: long scoreboard
+    // 39% of the kernel's stalls, on these loads issued after the GEMM)
+    constexpr int PER = R * (NC / 4) / NTH;
+    static_assert(R * (NC / 4) % NTH == 0, "whole items a thread");
+    float4 pv[PER]; uint2 gv[PER];
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      int t = threadIdx.x + i * NTH, r = t / (NC / 4), q = (t % (NC / 4)) * 4;
+      size_t row = row0 + r, pr = pairAt(row);
+      if (pr != SIZE_MAX) {
+        gv[i] = *reinterpret_cast<const uint2*>(t2 + paddedAt(row) * C + n * NC + q);
+        pv[i] = *reinterpret_cast<const float4*>(pair + pr * C + n * NC + q);
+      }
+    }
     __syncthreads();
     const half* w = Ws(st);
     float acc[NC / 8][4] = {};
@@ -270,17 +284,18 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
       *reinterpret_cast<float2*>(Os + rb * LDO + c) = make_float2(acc[nt][2], acc[nt][3]);
     }
     __syncthreads();
-    for (int t = threadIdx.x; t < R * (NC / 4); t += NTH) {
-      int r = t / (NC / 4), q = (t % (NC / 4)) * 4;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      int t = threadIdx.x + i * NTH, r = t / (NC / 4), q = (t % (NC / 4)) * 4;
       size_t row = row0 + r, pr = pairAt(row);
       if (pr == SIZE_MAX) continue;
       int c = n * NC + q;
       float4 o = *reinterpret_cast<const float4*>(Os + r * LDO + q);
-      uint2 gw = *reinterpret_cast<const uint2*>(t2 + paddedAt(row) * C + c);
+      uint2 gw = gv[i];
       float2 g01 = __half22float2(*reinterpret_cast<half2*>(&gw.x)), g23 = __half22float2(*reinterpret_cast<half2*>(&gw.y));
-      float4* d = reinterpret_cast<float4*>(pair + pr * C + c); float4 v = *d;
+      float4 v = pv[i];
       v.x += o.x * sigmH(g01.x); v.y += o.y * sigmH(g01.y); v.z += o.z * sigmH(g23.x); v.w += o.w * sigmH(g23.y);
-      *d = v;
+      *reinterpret_cast<float4*>(pair + pr * C + c) = v;
     }
     __syncthreads();
   }

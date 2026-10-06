@@ -494,6 +494,11 @@ copied from it device to device). Byte-identical; whole cold runs at 255 tokens:
 Chai-1 (two bundles, ESM2 3B's among them) 2.84 -> 1.67, ESMFold2 (16 MB shards, so it pinned little)
 1.10 -> 1.05. A first try at four 16 MB pieces made ESMFold2 0.1 s SLOWER: it pinned more than before.
 
+`triangleOutK` (the 256-channel triangle output: ESMFold2, protenix2) loads each chunk's residual and gate
+before the chunk's MMAs rather than after them - Nsight Compute had long scoreboard at 39% of its stalls,
+on those loads: `--bench-tri` 0.2357 -> 0.2138 ms at 261 tokens, 3.095 -> 2.906 at 1044, byte-identical.
+(Issuing them at the very top of the iteration, ahead of the stage wait, is level.)
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
@@ -540,6 +545,9 @@ Chai-1 (two bundles, ESM2 3B's among them) 2.84 -> 1.67, ESMFold2 (16 MB shards,
   219 against 199 ms at 1044 tokens. Stripping it, neither the residual (-23 ms) nor the second
   GEMM (-27) dominates.
 
+- **An L2 prefetch of the fused transition's residual** (`prefetch.global.L2` over the block's rows right
+  after its norm, so the epilogue's read at the end hits L2): 0.199 -> 0.201 ms at 261 tokens, 2.797 ->
+  2.816 at 1044 - level to slightly worse.
 - **The trunk's pair as a persisting L2 window** (`cudaAccessPolicyWindow`: at 255 tokens the f32 pair is
   33 MB and an A100 sets aside up to 26 MB): byte-identical and 14% SLOWER - trunk 311.6 -> 354.5 ms, and
   the diffusion, which never reads the pair, 60.0 -> 72.1. The set-aside costs every other stream more
