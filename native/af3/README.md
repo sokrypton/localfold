@@ -499,6 +499,15 @@ before the chunk's MMAs rather than after them - Nsight Compute had long scorebo
 on those loads: `--bench-tri` 0.2357 -> 0.2138 ms at 261 tokens, 3.095 -> 2.906 at 1044, byte-identical.
 (Issuing them at the very top of the iteration, ahead of the stage wait, is level.)
 
+On a T4 (64 KB of shared memory a block) the 128-channel triangle ran unfused - a LayerNorm, the
+projection GEMM, the gate pass, the contraction, a centre norm, two GEMMs and the gated add - because the
+fused output kernel holds the whole 128 x 128 weight (71 KB). It takes `fused256.cuh`'s two kernels now,
+instantiated at 128 channels, which stream that weight 16 columns a stage (~35 KB), with the contraction in
+f16 into f32 where the device has no bf16 MMA (`bf16Tensor`). Measured on a Colab T4, boltz2 at 255 tokens,
+arms interleaved: the trunk 3.38-3.51 -> 3.02-3.08 s, a fold ~3.95 -> ~3.55 s (pLDDT 32.04 -> 32.05: other
+kernels, not other arithmetic in kind). Rehearsed here under `LOCALFOLD_SMEM_LIMIT=65536 --no-tri-bf16`,
+where the trunk is 425.7 -> 331.6 ms. The A100 and an L4, where the 128-channel kernels fit, are unchanged.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at

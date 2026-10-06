@@ -215,7 +215,16 @@ constexpr size_t wideUpSmem(int C) { return transitionUpSmem<256, 8>(); }   // (
 inline bool wideFits(int C) {
   return C == 256 && fitsSmem(std::max({wideTriInSmem(C), wideTriOutSmem(C), wideUpSmem(C)}));
 }
-template <class F> void wideWidth(int, F f) { f(std::integral_constant<int, 256>{}); }
+// ...and the TRIANGLE's two at 128 channels, where the 128-channel fused kernels do not fit (a T4's 64 KB: the
+// output kernel holds the whole 128 x 128 weight, 71 KB, where these stream it 16 columns a stage, ~35 KB)
+constexpr size_t wideTriFitsSmem(int C) { return std::max(wideTriInSmem(C), wideTriOutSmem(C)); }
+template <class F> void wideWidth(int C, F f) {
+  if (C == 128) f(std::integral_constant<int, 128>{}); else f(std::integral_constant<int, 256>{});
+}
+inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
+  static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+  return major >= 8;
+}
 
 #include "tricontract.cuh"
 
@@ -429,13 +438,15 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         cs, b, cudaType<T>(), np, cs, &zero, prod, CUDA_R_32F, np, cs, C, CUBLAS_COMPUTE_32F, algo));
   };
   if constexpr (std::is_same_v<T, half>) {
-    if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
+    bool narrowFused = C == 128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
+    bool wide = C == 256 ? wideFits(C) : C == 128 && !narrowFused && fitsSmem(wideTriFitsSmem(128));
+    if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wide) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
       half* t2 = scratch<half>("tri.t2whole", cs * C);
       half* wt = scratch<half>("tri.wt256", triInTileHalves(C));
       tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
-      if (TRI_BF16) {
+      if (TRI_BF16 && bf16Tensor()) {
         // as the 128-channel path: a, b and the product in bf16, the product half the bytes both ways
         __nv_bfloat16* ab = scratch<__nv_bfloat16>("tri.abf", cs * C);
         __nv_bfloat16* bb = scratch<__nv_bfloat16>("tri.bbf", cs * C);
