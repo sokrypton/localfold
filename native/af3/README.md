@@ -93,11 +93,12 @@ Where this port leaves af3-any-model for chai-lab, measured each time:
   nucleic acid) and the token rule blinds a ligand's atoms to each other: glycerol 0.29 -> 0.053 A bond
   rms, ATP 0.27 -> 0.058.
 - **An atomised residue's tokens are unknown** (gemmi's fasta code, X for SEP): a phosphoserine
-  0.21 -> 0.074 A from the int8 blob, inside chai-lab's 0.054-0.089. This and the attention mask are
-  fixed in af3-any-model too (its 4ec4850).
+  0.21 -> 0.074 A from the int8 blob, inside chai-lab's 0.054-0.089.
 - **No token-bond term**: chai-lab's carries declared covalent bonds alone, so an ordinary ligand's is
   zero, and a declared one (`bondedAtomPairs`, a glycan) is refused until its trunk weights are exported.
-- The diffusion's pair input (chai's structure token-pair features) and the confidence head's single.
+- The diffusion's pair input (chai's structure token-pair features) and the confidence head's single. The
+  first is fixed in af3-any-model as well (its c38fec3); the attention mask and the unknown restype in its
+  4ec4850.
 
 `--out=x.pdb`, or `--out=x.cif` for mmCIF as AlphaFold 3 writes it (entities, polymer sequences
 and chains declared, so AF3's own reader and gemmi both load it; the pLDDT in B_iso_or_equiv).

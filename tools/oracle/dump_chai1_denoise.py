@@ -3,10 +3,11 @@
     cd /tmp/claude-1000/ref && JAX_PLATFORMS=cuda ESM_EMB=<esm2.npy> MODEL_DIR=<chai1 blob dir> \
       PYTHONPATH=.:dev/oracles ~/.venv-lfjax/bin/python <repo>/tools/oracle/dump_chai1_denoise.py
 
-🔴 af3-any-model's chai diffusion conditions on `[z_trunk | pair_init]` with pair_init = the TRUNK's z_init
+🔴 af3-any-model's chai diffusion conditioned on `[z_trunk | pair_init]` with pair_init = the TRUNK's z_init
 (diffusion_head.py, evoformer.py), where chai-lab's is its STRUCTURE token-pair features
 (`token_pair_structure_input_feats`, chai1.py): relRMS 9.2 apart on 6MRR, measured on chai-lab's own tensors.
-So this hands the reference head chai's structure pair in that slot - built here from the bundle's
+Fixed there since (its c38fec3, model.Chai1StructurePair, 2.4e-7 from this file's structure_pair). This
+still hands the reference head chai's structure pair in that slot, so it reads the same on either side of it - built here from the bundle's
 `diffuser/chai1_structure_token_pair` weights (tools/export_chai1_structure_pair.py) - and the oracle is chai at
 that seam and af3-any-model everywhere else. `Z_STRUCT_OUT=<file.npy>` writes the structure pair too, for the check
 against chai-lab's captured diffusion input.
