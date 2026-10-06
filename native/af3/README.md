@@ -507,6 +507,12 @@ f16 into f32 where the device has no bf16 MMA (`bf16Tensor`). Measured on a Cola
 arms interleaved: the trunk 3.38-3.51 -> 3.02-3.08 s, a fold ~3.95 -> ~3.55 s (pLDDT 32.04 -> 32.05: other
 kernels, not other arithmetic in kind). Rehearsed here under `LOCALFOLD_SMEM_LIMIT=65536 --no-tri-bf16`,
 where the trunk is 425.7 -> 331.6 ms. The A100 and an L4, where the 128-channel kernels fit, are unchanged.
+The 256-channel triangle (Chai-1, protenix2) takes the same kernels on a T4 too, its input kernel at 4 warps
+where 8 do not fit (byte-identical per row; the stages then outgrow the rows, so the launch sizes the larger).
+Rehearsed here it looked like 15% (protenix2's trunk 977.7 -> 832.2 ms, Chai-1's 682.7 -> 580.8); ON A REAL
+T4 it is 1.5-2.5% (protenix2 at 255 tokens, interleaved: 6960 -> 6857 and 7538 -> 7352 ms, the card drifting
+8% between rounds). The rehearsal caps shared memory, not a T4's arithmetic or its f16-into-f32 contraction:
+read a T4 number off a T4.
 
 ## Tried and not taken
 

@@ -217,9 +217,24 @@ inline bool wideFits(int C) {
 }
 // ...and the TRIANGLE's two at 128 channels, where the 128-channel fused kernels do not fit (a T4's 64 KB: the
 // output kernel holds the whole 128 x 128 weight, 71 KB, where these stream it 16 columns a stage, ~35 KB)
-constexpr size_t wideTriFitsSmem(int C) { return std::max(wideTriInSmem(C), wideTriOutSmem(C)); }
+constexpr size_t wideTriInSmemW(int C, int warps) { return triIn256Smem<__nv_bfloat16>(C, warps); }
+// the input kernel at 8 warps where they fit, else 4 (a T4: 256 channels at 8 warps are 67.6 KB) - a row's
+// arithmetic does not depend on the block it is in, so either is byte-identical
+inline int wideTriInWarps(int C) { return fitsSmem(wideTriInSmemW(C, 8)) ? 8 : 4; }
+// (the output kernel as triangleOutRun launches it: the bf16 tile at 16-column stages, either product type)
+inline size_t wideTriOutSmemReal(int C) {
+  auto at = [](auto width) {
+    constexpr int CC = decltype(width)::value;
+    return std::max(triangleOutSmem<CC, 4, __nv_bfloat16, 16, __nv_bfloat16>(), triangleOutSmem<CC, 4, __nv_bfloat16, 16, float>());
+  };
+  return C == 128 ? at(std::integral_constant<int, 128>{}) : at(std::integral_constant<int, 256>{});
+}
+inline size_t wideTriFitsSmem(int C) { return std::max(wideTriInSmemW(C, 4), wideTriOutSmemReal(C)); }
 template <class F> void wideWidth(int C, F f) {
   if (C == 128) f(std::integral_constant<int, 128>{}); else f(std::integral_constant<int, 256>{});
+}
+template <class F> void wideWarps(int C, F f) {
+  if (wideTriInWarps(C) == 8) f(std::integral_constant<int, 8>{}); else f(std::integral_constant<int, 4>{});
 }
 inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
   static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
@@ -439,7 +454,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   };
   if constexpr (std::is_same_v<T, half>) {
     bool narrowFused = C == 128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
-    bool wide = C == 256 ? wideFits(C) : C == 128 && !narrowFused && fitsSmem(wideTriFitsSmem(128));
+    bool wide = (C == 256 || (C == 128 && !narrowFused)) && fitsSmem(wideTriFitsSmem(C));
     if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wide) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
@@ -452,11 +467,14 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         __nv_bfloat16* bb = scratch<__nv_bfloat16>("tri.bbf", cs * C);
         __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs * C);
         wideWidth(C, [&](auto width) {
-          constexpr int CC = decltype(width)::value, WI = 8, WO = 4;
-          static bool attr = false;
-          if (!attr) { smemAttr((triIn256K<CC, WI, __nv_bfloat16>), (int)wideTriInSmem(CC)); attr = true; }
-          triIn256K<CC, WI, __nv_bfloat16><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmem(CC), STREAM>>>(
-            pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs);
+          constexpr int CC = decltype(width)::value, WO = 4;
+          wideWarps(C, [&](auto warps) {
+            constexpr int WI = decltype(warps)::value;
+            static bool attr = false;
+            if (!attr) { smemAttr((triIn256K<CC, WI, __nv_bfloat16>), (int)wideTriInSmemW(CC, WI)); attr = true; }
+            triIn256K<CC, WI, __nv_bfloat16><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
+              pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs);
+          });
           triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
           triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                                 Wh(pre + ".outputProjection"), t2, into(pair), n, np);
@@ -465,14 +483,14 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       }
       a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
       wideWidth(C, [&](auto width) {
-        constexpr int CC = decltype(width)::value, WI = 8, WO = 4;
-        static bool attr = false;
-        if (!attr) {
-          smemAttr((triIn256K<CC, WI>), (int)wideTriInSmem(CC));
-          attr = true;
-        }
-        triIn256K<CC, WI><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmem(CC), STREAM>>>(
-          pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs);
+        constexpr int CC = decltype(width)::value, WO = 4;
+        wideWarps(C, [&](auto warps) {
+          constexpr int WI = decltype(warps)::value;
+          static bool attr = false;
+          if (!attr) { smemAttr((triIn256K<CC, WI>), (int)wideTriInSmemW(CC, WI)); attr = true; }
+          triIn256K<CC, WI><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
+            pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs);
+        });
         contract();
         triangleOutRun<CC, WO>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, into(pair), n, np);
       });

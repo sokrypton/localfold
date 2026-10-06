@@ -309,6 +309,11 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
 // linear's raw output over the padded rows.
 // TA: a and b's type - f16, or bf16 so the contraction can write a bf16 product (an f16 one overflows)
 
+// its dynamic shared memory: the LN'd rows, or the two weight stages and the a/b staging after them
+template <class TA = half> constexpr size_t triIn256Smem(int C, int warps) {
+  size_t rows = (size_t)16 * warps * (C + 8) * 2, stages = (size_t)2 * 2 * C * 16 * 2 + (size_t)2 * 8 * (16 * warps + 8) * sizeof(TA);
+  return rows > stages ? rows : stages;
+}
 // Wt: tileTriIn's layout at 16 columns a tile
 template <int C, int WARPS, class TA = half>
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
@@ -321,7 +326,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   constexpr int NC = 16, CH = NC / 2, R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = NC, KS = C / 16, LDT = R + 8;
   auto sw = [](int k, int c) { return stageSw<NC>(k, c); };
   constexpr size_t STAGE = (size_t)2 * C * LDW * 2;
-  static_assert(2 * STAGE + (size_t)2 * CH * LDT * 2 <= (size_t)R * LDX * 2, "the stages and the a/b staging fit in the rows");
+  // (the stages and the a/b staging take the rows' memory once the rows are fragments: the launch gives the
+  // larger of the two - at 8 warps the rows, at 4 the stages, triIn256Smem)
   const size_t pp = (size_t)np * np;
   auto pairOf = [&](size_t q) -> size_t {
     if (q >= pp) return SIZE_MAX;
