@@ -514,6 +514,15 @@ T4 it is 1.5-2.5% (protenix2 at 255 tokens, interleaved: 6960 -> 6857 and 7538 -
 8% between rounds). The rehearsal caps shared memory, not a T4's arithmetic or its f16-into-f32 contraction:
 read a T4 number off a T4.
 
+A T4 has no `cp.async`, so `cpAsync16` there is a load and a store - and every streaming kernel's "issue the
+next stage, then compute this one" blocked on the issue: a memory round trip a step, exposed. The four that
+run on a T4 (`triIn256K`, `triangleOutK`, `fusedTransitionK`, `gridInK`) now hold the next stage in registers
+across the step (`RegStage`, `LF_REG_STAGES`: loaded before the MMAs, stored into the idle stage after them,
+the barrier that opens the next step publishing it). Byte-identical on the T4 and, through a compute_75 PTX
+build, here. Colab T4, 255 tokens, interleaved: boltz2's trunk 2889/2937 -> 2689/2727 ms (-7%), protenix2's
+6349/6536 -> 6149/6489 (-1 to -3%: its 256-channel input kernel at 4 warps is bound elsewhere). The same
+sm_75 code JIT-compiled on the A100 is 16% faster for boltz2 - the A100's own sm_80 path is unchanged.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at

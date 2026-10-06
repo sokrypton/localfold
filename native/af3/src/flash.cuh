@@ -65,6 +65,19 @@ __device__ __forceinline__ void cpAsync16(void* dst, const void* src, bool valid
   *reinterpret_cast<uint4*>(dst) = valid ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
 #endif
 }
+// sm_75 has no cp.async: cpAsync16 there is a load and a store, so a kernel "prefetching" its next stage
+// blocks on it right where it meant to overlap. A kernel that cares loads the next stage into registers
+// before its compute (RegStage::load) and stores it into the idle stage after (store) - LF_REG_STAGES
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#define LF_REG_STAGES 1
+#else
+#define LF_REG_STAGES 0
+#endif
+template <int N> struct RegStage {
+  uint4 v[N];
+  __device__ __forceinline__ void load(int i, const void* src) { v[i] = *reinterpret_cast<const uint4*>(src); }
+  __device__ __forceinline__ void store(int i, void* dst) const { *reinterpret_cast<uint4*>(dst) = v[i]; }
+};
 __device__ __forceinline__ void cpCommit() {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm volatile("cp.async.commit_group;" ::: "memory");

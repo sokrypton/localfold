@@ -661,14 +661,21 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
   half* Wbs = Wst + 2 * C * LDW;                                   // [C][24], the bias projection
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * R;
-  auto issue = [&](int j, int st) {
+  constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
+  auto stage = [&](int j, int st, auto&& op) {
     half* w = Wst + st * C * LDW;
-    for (int t = threadIdx.x; t < C * (NC / 8); t += NTH) {
+#pragma unroll
+    for (int it = 0; it < ITER; ++it) {
+      const int t = it * NTH + (int)threadIdx.x;
+      if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
       int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
-      cpAsync16(w + k * LDW + c, Wq + (size_t)k * NQ + j * NC + c, true);
+      op(it, w + k * LDW + c, Wq + (size_t)k * NQ + j * NC + c);
     }
-    cpCommit();
   };
+  auto issue = [&](int j, int st) { stage(j, st, [](int, half* d, const half* s) { cpAsync16(d, s, true); }); cpCommit(); };
+#if LF_REG_STAGES
+  RegStage<ITER> next;                // (sm_75: the next chunk's weights held in registers across this chunk)
+#endif
   issue(0, 0);
   lnRowsToShared<C, R, WARPS>(pair, [&](int r) {
       size_t q = row0 + r;
@@ -686,8 +693,12 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
   const int chunks = NQ / NC;
   for (int j = 0; j < chunks; ++j) {
     int st = j & 1;
+#if LF_REG_STAGES
+    if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half*, const half* src) { next.load(i, src); });
+#else
     if (j + 1 < chunks) { issue(j + 1, st ^ 1); cpWait<1>(); }
     else cpWait<0>();
+#endif
     __syncthreads();
     const half* w = Wst + st * C * LDW;
     float acc[NC / 8][4] = {};
@@ -726,6 +737,9 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
       if (row < rows) *reinterpret_cast<uint4*>(out + row * NQ + j * NC + c) = *reinterpret_cast<const uint4*>(Ys + r * LDX + c);
     }
     __syncwarp();
+#if LF_REG_STAGES
+    if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
+#endif
     __syncthreads();
   }
   if (bias) {

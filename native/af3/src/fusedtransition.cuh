@@ -63,20 +63,30 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   size_t row0 = (size_t)blockIdx.x * FT_ROWS;
   int chunks = I / NC;
-  auto issue = [&](int j, int st) {
+  constexpr int IT1 = (C * (NC / 8) + NTH - 1) / NTH, IT2 = (NC * (C / 8) + NTH - 1) / NTH;
+  auto stage = [&](int j, int st, auto&& op) {
     half *a = W1a(st), *b = W1b(st), *w2 = W2s(st);
-    for (int t = threadIdx.x; t < C * (NC / 8); t += NTH) {      // W1 rows k, NC columns each half
+#pragma unroll
+    for (int it = 0; it < IT1; ++it) {                            // W1 rows k, NC columns each half
+      const int t = it * NTH + (int)threadIdx.x;
+      if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
       int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
       const half* src = W1t + ((size_t)j * C + k) * NC + c;
-      cpAsync16(a + stageSw<NC>(k, c), src, true);
-      if constexpr (!RELU) cpAsync16(b + stageSw<NC>(k, c), src + (size_t)C * I, true);
+      op(it, a + stageSw<NC>(k, c), src);
+      if constexpr (!RELU) op(IT1 + it, b + stageSw<NC>(k, c), src + (size_t)C * I);
     }
-    for (int t = threadIdx.x; t < NC * (C / 8); t += NTH) {       // W2 rows j*NC .. , all C columns
+#pragma unroll
+    for (int it = 0; it < IT2; ++it) {                            // W2 rows j*NC .. , all C columns
+      const int t = it * NTH + (int)threadIdx.x;
+      if ((NC * (C / 8)) % NTH != 0 && t >= NC * (C / 8)) break;
       int k = t / (C / 8), c = (t % (C / 8)) * 8;
-      cpAsync16(w2 + w2Sw<C>(k, c), W2 + (size_t)(j * NC + k) * C + c, true);
+      op(2 * IT1 + it, w2 + w2Sw<C>(k, c), W2 + (size_t)(j * NC + k) * C + c);
     }
-    cpCommit();
   };
+  auto issue = [&](int j, int st) { stage(j, st, [](int, half* d, const half* s) { cpAsync16(d, s, true); }); cpCommit(); };
+#if LF_REG_STAGES
+  RegStage<2 * IT1 + IT2> next;       // (sm_75: the next chunk's weights held in registers across this chunk)
+#endif
   issue(0, 0);
   // LayerNorm, a warp a row (C / 32 floats a lane), into shared memory as f16
   lnRowsToShared<C, FT_ROWS, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
@@ -93,9 +103,14 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
     int st = j & 1;
     // chunk j has landed; the barrier also says every warp is done with the stage the next issue
     // overwrites (chunk j - 1's), so one barrier a chunk
+#if LF_REG_STAGES
+    if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half*, const half* src) { next.load(i, src); });
+    __syncthreads();
+#else
     cpWait<0>();
     __syncthreads();
     if (j + 1 < chunks) issue(j + 1, st ^ 1);
+#endif
     const half *a = W1a(st), *b = W1b(st), *w2 = W2s(st);
     float ha[MT][NC / 8][4] = {}, hb[MT][NC / 8][4] = {};
 #pragma unroll
@@ -135,6 +150,9 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
         for (int m = 0; m < MT; ++m) { mma16816(acc[m][et], pa[m], vb[0], vb[1]); mma16816(acc[m][et + 1], pa[m], vb[2], vb[3]); }
       }
     }
+#if LF_REG_STAGES
+    if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
+#endif
   }
   // the residual, through the warp's own Xs rows (only it read them, as its A fragments; the loop's
   // barriers are behind every warp) 64 f32 columns at a time, so the read-modify-write is 16 bytes a lane

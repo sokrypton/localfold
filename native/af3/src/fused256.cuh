@@ -232,14 +232,21 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     xa[ks][3] = pack2(nrm(rb, mb, ib, k + 8), nrm(rb, mb, ib, k + 9));
   }
   __syncthreads();                                            // Ps is dead from here: the weight stages take it
-  auto issue = [&](int n, int st) {
+  constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
+  auto stage = [&](int n, int st, auto&& op) {
     half* w = Ws(st);
-    for (int t = threadIdx.x; t < C * (NC / 8); t += NTH) {
+#pragma unroll
+    for (int it = 0; it < ITER; ++it) {
+      const int t = it * NTH + (int)threadIdx.x;
+      if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
       int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
-      cpAsync16(w + stageSw<NC>(k, c), Woutt + ((size_t)n * C + k) * NC + c, true);
+      op(it, w + stageSw<NC>(k, c), Woutt + ((size_t)n * C + k) * NC + c);
     }
-    cpCommit();
   };
+  auto issue = [&](int n, int st) { stage(n, st, [](int, half* d, const half* s) { cpAsync16(d, s, true); }); cpCommit(); };
+#if LF_REG_STAGES
+  RegStage<ITER> next;                // (sm_75: the next chunk's weights held in registers across this chunk)
+#endif
   issue(0, 0);
   // the output chunk, staged so the gate and the residual go out 16 bytes a thread, a row's 32 columns
   // contiguous (a fragment's own stores are 8 bytes a row, eight rows a warp)
@@ -248,8 +255,12 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
   constexpr int chunks = C / NC;
   for (int n = 0; n < chunks; ++n) {
     int st = n & 1;
+#if LF_REG_STAGES
+    if (n + 1 < chunks) stage(n + 1, st ^ 1, [&](int i, half*, const half* src) { next.load(i, src); });
+#else
     if (n + 1 < chunks) { issue(n + 1, st ^ 1); cpWait<1>(); }
     else cpWait<0>();
+#endif
     // the chunk's residual and gate, loaded before its MMAs so they cover the latency (ncu: long scoreboard
     // 39% of the kernel's stalls, on these loads issued after the GEMM)
     constexpr int PER = R * (NC / 4) / NTH;
@@ -297,6 +308,9 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
       v.x += o.x * sigmH(g01.x); v.y += o.y * sigmH(g01.y); v.z += o.z * sigmH(g23.x); v.w += o.w * sigmH(g23.y);
       *reinterpret_cast<float4*>(pair + pr * C + c) = v;
     }
+#if LF_REG_STAGES
+    if (n + 1 < chunks) stage(n + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
+#endif
     __syncthreads();
   }
 }
@@ -345,25 +359,25 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   // the gating linear's steps take TWO of its tiles, one a stage (w1 idles there otherwise): four accumulator
   // chains a step where they had two, and half the steps (ncu had the kernel waiting on its MMA chains)
   const int abSteps = C / CH, steps = abSteps + C / NC / 2;
-  auto issue = [&](int j, int st) {
+  constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
+  // step j's two weight tiles, each 16-byte piece handed to op(index, its place in stage st, its source)
+  auto stage = [&](int j, int st, auto&& op) {
     half *w0 = W0(st), *w1 = W1(st);
 #pragma unroll
-    for (int t0_ = 0; t0_ < C * (NC / 8); t0_ += NTH) {
-      const int t = t0_ + (int)threadIdx.x;
+    for (int it = 0; it < ITER; ++it) {
+      const int t = it * NTH + (int)threadIdx.x;
       if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
       int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
-      if (j < abSteps) {
-        const half* src = Wt + ((size_t)j * C + k) * NC + c;   // the tiles run on from the projection into the gating linear
-        cpAsync16(w0 + sw(k, c), src, true);
-        cpAsync16(w1 + sw(k, c), src + (size_t)2 * C * C, true);
-      } else {
-        const half* src = Wt + ((size_t)(abSteps + 2 * (j - abSteps)) * C + k) * NC + c + (size_t)2 * C * C;
-        cpAsync16(w0 + sw(k, c), src, true);
-        cpAsync16(w1 + sw(k, c), src + (size_t)C * NC, true);
-      }
+      const half* src = j < abSteps ? Wt + ((size_t)j * C + k) * NC + c   // the tiles run on from the projection into the gating linear
+                                    : Wt + ((size_t)(abSteps + 2 * (j - abSteps)) * C + k) * NC + c + (size_t)2 * C * C;
+      op(2 * it, w0 + sw(k, c), src);
+      op(2 * it + 1, w1 + sw(k, c), src + (j < abSteps ? (size_t)2 * C * C : (size_t)C * NC));
     }
-    cpCommit();
   };
+  auto issue = [&](int j, int st) { stage(j, st, [](int, half* d, const half* s) { cpAsync16(d, s, true); }); cpCommit(); };
+#if LF_REG_STAGES
+  RegStage<2 * ITER> next;            // (sm_75: the next step's tiles held in registers across this step's MMAs)
+#endif
   lnRowsToShared<C, R, WARPS>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
   __syncthreads();
   uint32_t xa[KS][4];
@@ -376,8 +390,12 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   float m0 = pr0 != SIZE_MAX ? mask[pr0] : 0.f, m1 = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
   for (int j = 0; j < steps; ++j) {
     int st = j & 1;
+#if LF_REG_STAGES
+    if (j + 1 < steps) stage(j + 1, st ^ 1, [&](int i, half*, const half* s) { next.load(i, s); });
+#else
     if (j + 1 < steps) { issue(j + 1, st ^ 1); cpWait<1>(); }
     else cpWait<0>();
+#endif
     __syncthreads();
     bool gating = j >= abSteps;
     const half *w0 = W0(st), *w1 = W1(st);
@@ -426,6 +444,9 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
         }
       }
     }
+#if LF_REG_STAGES
+    if (j + 1 < steps) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });   // (stage st^1 was
+#endif                                                                         // last read before this step's barrier)
     __syncthreads();
   }
 }
