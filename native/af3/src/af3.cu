@@ -106,6 +106,7 @@ int main(int argc, char** argv) {
   if (getenv("MIN_BLOCKS")) MIN_BLOCKS = strtoull(getenv("MIN_BLOCKS"), nullptr, 10);
   if (getenv("TRI_OUT_PERSISTENT")) TRI_OUT_PERSISTENT = atoi(getenv("TRI_OUT_PERSISTENT"));
   if (getenv("LOCALFOLD_GRID_STRIDED")) GRID_STRIDED = atoi(getenv("LOCALFOLD_GRID_STRIDED"));
+  if (getenv("LOCALFOLD_LN_NORM_HEADS")) LN_NORM_HEADS = atoi(getenv("LOCALFOLD_LN_NORM_HEADS"));
   if (profile) prof::init();
   CB(cublasCreate(&H));
   CB(cublasSetStream(H, STREAM));

@@ -636,6 +636,99 @@ __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
   g = fromF<T>(toF(g) + bias[c]);
 }
 
+// The unfused grid attention's LayerNorm and its pair-bias projection in one pass: the pair normed as
+// layerNormK norms it (the same arithmetic, so `norm` is byte-identical) into `norm` AND shared memory, then
+// projected on the tensor cores to 16 padded heads, head-major (out[h][row]) - where cuBLAS took the
+// few-column GEMM as a 16x16 WMMA kernel that read the whole normed pair back.
+template <int C, int WARPS>
+__global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restrict__ x, const float* __restrict__ scale,
+    const float* __restrict__ offset, const half* __restrict__ Wp, half* __restrict__ norm, float* __restrict__ out,
+    size_t rows, int heads) {
+  constexpr int N = 16, R = 16 * WARPS, LDX = C + 8, LDW = N + 8, KS = C / 16, K = C / 32;
+  extern __shared__ __align__(16) unsigned char smem[];
+  half* Xs = (half*)smem; half* Ws = Xs + R * LDX;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  size_t row0 = (size_t)blockIdx.x * R;
+  for (int t = threadIdx.x; t < C * (N / 8); t += WARPS * 32) {
+    int k = t / (N / 8), c = (t % (N / 8)) * 8;
+    cpAsync16(Ws + k * LDW + c, Wp + (size_t)k * N + c, true);
+  }
+  cpCommit();
+  float sc[K], of[K];
+#pragma unroll
+  for (int k = 0; k < K; ++k) { sc[k] = scale[lane + 32 * k]; of[k] = offset[lane + 32 * k]; }
+  // the warp's own 16 rows, eight in flight (Chai-1 at 255 tokens: 32.8 -> 28.1 ms over a fold's 320 calls at
+  // four, 16 no better; four at 512 channels, where eight rows are 128 registers)
+  constexpr int B = C >= 512 ? 4 : 8;
+#pragma unroll 1
+  for (int i0 = 0; i0 < 16; i0 += B) {
+    float v[B][K];
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+      size_t row = row0 + warp * 16 + i0 + b;
+#pragma unroll
+      for (int k = 0; k < K; ++k) v[b][k] = row < rows ? x[row * C + lane + 32 * k] : 0.f;
+    }
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+      int r = warp * 16 + i0 + b;
+      size_t row = row0 + r;
+      float s = 0, ss = 0;
+#pragma unroll
+      for (int k = 0; k < K; ++k) { s += v[b][k]; ss += v[b][k] * v[b][k]; }
+      for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
+      float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+#pragma unroll
+      for (int k = 0; k < K; ++k) {
+        half h = __float2half((v[b][k] - mean) * inv * sc[k] + of[k]);
+        if (row >= rows) h = __float2half(0.f);
+        Xs[r * LDX + lane + 32 * k] = h;
+        if (row < rows) norm[row * C + lane + 32 * k] = h;
+      }
+    }
+  }
+  cpWait<0>();
+  __syncthreads();
+  float acc[N / 8][4] = {};
+#pragma unroll
+  for (int ks = 0; ks < KS; ++ks) {
+    uint32_t xa[4];
+    ldsm4(xa, Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+    uint32_t f[4];
+    ldsm4t(f, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + (lane >> 4) * 8);
+    mma16816(acc[0], xa, f[0], f[1]); mma16816(acc[1], xa, f[2], f[3]);
+  }
+  size_t r0 = row0 + warp * 16 + g, r1 = r0 + 8;
+#pragma unroll
+  for (int nt = 0; nt < 2; ++nt) {
+    int h = nt * 8 + tig * 2;
+    if (h < heads) { if (r0 < rows) out[(size_t)h * rows + r0] = acc[nt][0]; if (r1 < rows) out[(size_t)h * rows + r1] = acc[nt][2]; }
+    if (h + 1 < heads) { if (r0 < rows) out[(size_t)(h + 1) * rows + r0] = acc[nt][1]; if (r1 < rows) out[(size_t)(h + 1) * rows + r1] = acc[nt][3]; }
+  }
+}
+template <int C> constexpr size_t lnNormHeadsSmem(int warps) { return (size_t)16 * warps * (C + 8) * 2 + (size_t)C * 24 * 2; }
+// norm + head-major raw bias for C 256/384/512 (false: not this width, or the device's shared memory)
+inline bool LN_NORM_HEADS = true;
+inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, int C, int heads, const std::string& pre) {
+  if (!LN_NORM_HEADS || heads > 16) return false;
+  auto run = [&](auto width) -> bool {
+    constexpr int CC = decltype(width)::value, WARPS = 4, R = 16 * WARPS;   // (8 warps: no faster)
+    constexpr size_t smem = lnNormHeadsSmem<CC>(WARPS);
+    if (!fitsSmem(smem)) return false;
+    static bool attr = false;
+    if (!attr) { smemAttr((lnNormHeadsK<CC, WARPS>), (int)smem); attr = true; }
+    std::string wb = concatColumns(pre + ".pairBiasProjection~pad16", CC, {{pre + ".pairBiasProjection", heads, false}, {"", 16 - heads, false}});
+    lnNormHeadsK<CC, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+      pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wb), norm, raw, rows, heads);
+    return true;
+  };
+  switch (C) {
+    case 256: return run(std::integral_constant<int, 256>{});
+    case 384: return run(std::integral_constant<int, 384>{});
+    case 512: return run(std::integral_constant<int, 512>{});
+    default: return false;
+  }
+}
 // the unfused column direction's two GEMMs strided in place (LOCALFOLD_GRID_STRIDED=0: gathered and scattered)
 inline bool GRID_STRIDED = true;
 // Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
@@ -711,9 +804,13 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   const bool streamNorm = shortPair(pairs, C);
   T* norm = streamNorm ? nullptr : scratch<T>("grid.norm", pairs * C);
   float* raw = scratch<float>("grid.rawbias", pairs * heads);
+  bool headMajor = false;
   if (!streamNorm) {
-    layerNorm2<float, T>(pair, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
-    linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
+    if constexpr (std::is_same_v<T, half>) headMajor = lnNormHeads(pair, norm, raw, pairs, C, heads, pre);
+    if (!headMajor) {
+      layerNorm2<float, T>(pair, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
+      linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
+    }
   } else {
     size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
     T* lnc = scratch<T>("grid.normChunk", per * C);
@@ -726,8 +823,12 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   int stride = (n + 7) / 8 * 8;
   constexpr bool fast = std::is_same_v<T, half>;
   T* bias = scratch<T>("grid.bias", (size_t)heads * n * stride);
-  biasLayoutK<T><<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(
-    raw, bias, n, stride, heads, tr && swapBias, fast ? LOG2E : 1.f);
+  if (headMajor)
+    biasLayoutHeadMajorK<T><<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(
+      raw, bias, n, stride, heads, tr && swapBias, fast ? LOG2E : 1.f);
+  else
+    biasLayoutK<T><<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(
+      raw, bias, n, stride, heads, tr && swapBias, fast ? LOG2E : 1.f);
   std::string qkvg = qkvgWeight(pre, C, Wd, true);
   const float* gateBias = hasW(pre + ".gatingQueryBias") ? W(pre + ".gatingQueryBias") : nullptr;
   const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;

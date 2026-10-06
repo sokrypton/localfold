@@ -462,6 +462,16 @@ at 255 tokens, byte-identical: Chai-1's trunk 573.7 -> 557.0 ms, protenix2's 798
 (reading the normed pair transposed in place, no gather) loses: 41.6 against 35 ms for the gather and
 one GEMM.
 
+The same path's LayerNorm and pair-bias projection are one kernel at 256, 384 and 512 channels
+(`lnNormHeadsK`): the pair normed with `layerNormK`'s own arithmetic (so the normed pair is byte-identical)
+into global memory and shared memory, then projected on the tensor cores to 16 padded heads. cuBLAS had
+taken the few-column projection as a 16x16 WMMA kernel re-reading the whole normed pair (11.7 ms of a
+Chai-1 fold). Trunks at 255 tokens: Chai-1 556.9 -> 547.9 ms, protenix2 777.7 -> 766.0, OpenDDE 1622 ->
+1604, every PDB byte-identical; `LOCALFOLD_LN_NORM_HEADS=0` is the old pair of kernels. It is slower than
+the plain norm it absorbs (88 against 83 us a call - four 4-warp blocks an SM where the norm runs full),
+so it pays only the GEMM's difference: eight rows in flight a warp took it from 102 us, sixteen and eight
+warps no further.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
