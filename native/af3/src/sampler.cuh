@@ -1,6 +1,7 @@
 // AF3's EDM sampler around the denoiser, and the PDB the fold writes.
 // Transcribed from src/af3/diffusion/diffusion-sampler-reference.js.
 #pragma once
+#include <charconv>
 #include "diffusion.cuh"
 #include <random>
 #include <condition_variable>
@@ -416,28 +417,34 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
     std::string id; for (a = a - 1; ; a = a / 26 - 1) { id.insert(id.begin(), (char)('A' + a % 26)); if (a < 26) break; }
     return id;
   };
-  auto matrix = [&](FILE* f, const std::vector<float>& m) {
-    fprintf(f, "[");
+  // into one buffer and out in one write: a fprintf a number was 27 ms of every sample's file (two 261 x 261
+  // matrices); std::to_chars's fixed precision rounds exactly as "%.2f" does, so the bytes are the same
+  std::string j;
+  j.reserve((size_t)n * n * 14 + order.size() * 16 + 4096);
+  auto fixed2 = [&](float v) { char b[64]; auto r = std::to_chars(b, b + sizeof b, v, std::chars_format::fixed, 2); j.append(b, r.ptr); };
+  auto matrix = [&](const std::vector<float>& m) {
+    j += "[";
     for (int i = 0; i < n; ++i) {
-      fprintf(f, "%s[", i ? ",\n  " : "");
-      for (int j = 0; j < n; ++j) fprintf(f, "%s%.2f", j ? ", " : "", m[(size_t)i * n + j]);
-      fprintf(f, "]");
+      j += i ? ",\n  [" : "[";
+      for (int c = 0; c < n; ++c) { if (c) j += ", "; fixed2(m[(size_t)i * n + c]); }
+      j += "]";
     }
-    fprintf(f, "]");
+    j += "]";
   };
+  j += "{\"atom_chain_ids\": [";
+  for (size_t k = 0; k < order.size(); ++k) { if (k) j += ", "; j += "\"" + chainId(asym[order[k] / dense]) + "\""; }
+  j += "],\n \"atom_plddts\": [";
+  for (size_t k = 0; k < order.size(); ++k) { if (k) j += ", "; fixed2(plddt[order[k]]); }
+  j += "],\n";
+  if (!contact.empty()) { j += " \"contact_probs\": "; matrix(contact); j += ",\n"; }
+  j += " \"pae\": "; matrix(pae);
+  j += ",\n \"token_chain_ids\": [";
+  for (int i = 0; i < n; ++i) { if (i) j += ", "; j += "\"" + chainId(asym[i]) + "\""; }
+  j += "],\n \"token_res_ids\": [";
+  for (int i = 0; i < n; ++i) { if (i) j += ", "; j += std::to_string(res[i]); }
+  j += "]}\n";
   FILE* f = fopen((stem + "_confidences.json").c_str(), "w");
-  fprintf(f, "{\"atom_chain_ids\": [");
-  for (size_t k = 0; k < order.size(); ++k) fprintf(f, "%s\"%s\"", k ? ", " : "", chainId(asym[order[k] / dense]).c_str());
-  fprintf(f, "],\n \"atom_plddts\": [");
-  for (size_t k = 0; k < order.size(); ++k) fprintf(f, "%s%.2f", k ? ", " : "", plddt[order[k]]);
-  fprintf(f, "],\n");
-  if (!contact.empty()) { fprintf(f, " \"contact_probs\": "); matrix(f, contact); fprintf(f, ",\n"); }
-  fprintf(f, " \"pae\": "); matrix(f, pae);
-  fprintf(f, ",\n \"token_chain_ids\": [");
-  for (int i = 0; i < n; ++i) fprintf(f, "%s\"%s\"", i ? ", " : "", chainId(asym[i]).c_str());
-  fprintf(f, "],\n \"token_res_ids\": [");
-  for (int i = 0; i < n; ++i) fprintf(f, "%s%d", i ? ", " : "", res[i]);
-  fprintf(f, "]}\n");
+  fwrite(j.data(), 1, j.size(), f);
   fclose(f);
 
   // the chains, by asym id in token order

@@ -5,6 +5,7 @@
 // Reads <data-dir>/model.{idx,bin} (export-model.mjs). Without --fast it runs the precise
 // path (f32 throughout) and checks every seam the oracle recorded; with --fast the f16 path.
 #include <dirent.h>
+#include <future>
 #include "trunk.cuh"
 #include "atom.cuh"
 #include "diffusion.cuh"
@@ -298,6 +299,7 @@ int main(int argc, char** argv) {
     size_t pairs = (size_t)t.n * t.n;
     bool profiling = profile && fi + 1 == folds;      // the last (warm) fold
     if (profiling) prof::start();
+    ++SCORE_ATOMS_GEN;                                // (this fold's input: its atoms are read once, scores.cuh)
     auto f0 = clock();
     // A recycle pass is ~1000 launches with identical shapes and pointers, so from the second pass on
     // it replays as one CUDA graph, captured from that pass (the first has sized every scratch buffer)
@@ -484,6 +486,14 @@ int main(int argc, char** argv) {
     std::vector<int> pbIdx(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
     std::vector<float> pbMask(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
     if (structural) swapBatch();     // back to the residues, for the confidence's layout and the structure
+    // each sample's host work - its clash and disorder scores and, with several samples, its files - runs on a
+    // thread beside the next sample's confidence head, joined at the batch's end (before the next batch's
+    // swapBatch can change what the model's batch entries mean): 5 x ~23 ms of a 5-sample fold
+    struct SampleDone { ConfidenceOut ck; std::vector<float> xk; uint64_t sd; int sk, k; std::string path;
+                        StructureScores ss; double score; };
+    std::vector<std::unique_ptr<SampleDone>> done;
+    std::vector<std::future<void>> hostWork;
+    foldAtoms();                     // (built here, before any thread reads it)
     for (int k = 0; k < (int)cn; ++k) {
       const uint64_t sd = runs[c0 + k].first; const int sk = runs[c0 + k].second;
       std::vector<float> xk(xs.begin() + k * atoms3, xs.begin() + (k + 1) * atoms3);
@@ -544,20 +554,35 @@ int main(int argc, char** argv) {
       }
       CK(cudaFree(dBeta));
       confMs += ms(s1, clock());
-      StructureScores ssk = structureScores(xk);       // AF3's clash and disorder terms, this sample's
-      double score = rankingScore(ck.ptm, ck.iptm, ssk);
+      auto d = std::make_unique<SampleDone>();
+      d->ck = std::move(ck); d->xk = std::move(xk); d->sd = sd; d->sk = sk; d->k = k;
       if (many) {
         std::string tag = (seedList.size() > 1 ? "_seed" + std::to_string(sd) : std::string()) + "_sample" + std::to_string(sk);
-        std::string path = out == "/dev/null" ? out : stem + tag + ext;
-        auto order = writeStructure(path, xk, ck.plddt.data());
-        if (path != "/dev/null") writeConfidences(path, order, t.n, dense, ck.plddt, ck.pae, ck.tmTerm, contact, ck.ptm, ck.iptm,
-                                                  score, ck.meanPlddt, ssk.clash, ssk.disordered);
-        printf("  seed %llu sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", (unsigned long long)sd, sk,
-               ck.meanPlddt, ck.ptm, ck.iptm, score, path.c_str());
-        char row[96]; snprintf(row, sizeof row, "%llu,%d,%.17g", (unsigned long long)sd, sk, score); ranking.push_back(row);
+        d->path = out == "/dev/null" ? out : stem + tag + ext;
       }
-      if (!std::isfinite(score)) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", k, score); exit(1); }
-      if (score > bestScore) { bestScore = score; best = sk; bestSeed = sd; conf = std::move(ck); x = std::move(xk); bestSS = ssk; }
+      SampleDone* dp = d.get(); done.push_back(std::move(d));
+      hostWork.push_back(std::async(std::launch::async, [dp, many, n = t.n, dense, &contact] {
+        dp->ss = structureScores(dp->xk);              // AF3's clash and disorder terms, this sample's
+        dp->score = rankingScore(dp->ck.ptm, dp->ck.iptm, dp->ss);
+        if (!many) return;
+        auto order = writeStructure(dp->path, dp->xk, dp->ck.plddt.data());
+        if (dp->path != "/dev/null")
+          writeConfidences(dp->path, order, n, dense, dp->ck.plddt, dp->ck.pae, dp->ck.tmTerm, contact, dp->ck.ptm,
+                           dp->ck.iptm, dp->score, dp->ck.meanPlddt, dp->ss.clash, dp->ss.disordered);
+      }));
+    }
+    for (auto& w : hostWork) w.get();
+    for (auto& dp : done) {          // (in sample order: the lines, the ranking and the best, as before)
+      if (many) {
+        printf("  seed %llu sample %d: mean pLDDT %.2f  pTM %.4f  ipTM %.4f  ranking %.4f -> %s\n", (unsigned long long)dp->sd,
+               dp->sk, dp->ck.meanPlddt, dp->ck.ptm, dp->ck.iptm, dp->score, dp->path.c_str());
+        char row[96]; snprintf(row, sizeof row, "%llu,%d,%.17g", (unsigned long long)dp->sd, dp->sk, dp->score);
+        ranking.push_back(row);
+      }
+      if (!std::isfinite(dp->score)) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", dp->k, dp->score); exit(1); }
+      if (dp->score > bestScore) {
+        bestScore = dp->score; best = dp->sk; bestSeed = dp->sd; conf = std::move(dp->ck); x = std::move(dp->xk); bestSS = dp->ss;
+      }
     }
     }
     if (!framesDir.empty()) {

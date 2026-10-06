@@ -915,7 +915,7 @@ struct Model {
   // the device copy of an entry: one allocation and one copy per file
   const float* dev(const std::string& k) {
     const Entry& e = at(k);
-    touched.insert(k);
+    { std::lock_guard<std::mutex> g(hostMu); touched.insert(k); }
     Segment& s = segs[e.seg];
     if (!s.device) {
       if (cudaMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s)) {
@@ -965,7 +965,7 @@ struct Model {
   ResidentInt8 residentInt8(const std::string& k) {
     const Entry& e = at(k);
     if (e.kind != 'q') { fprintf(stderr, "%s is not resident int8\n", k.c_str()); exit(1); }
-    touched.insert(k);
+    { std::lock_guard<std::mutex> g(hostMu); touched.insert(k); }
     Segment& s = segs[e.seg];
     if (!s.device && (cudaMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s))) {
       fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
@@ -985,7 +985,11 @@ struct Model {
   double meta(const std::string& k) const { return at(k).value; }
   double meta(const std::string& k, double fallback) const { return has(k) ? at(k).value : fallback; }
   bool flag(const std::string& k) const { return has(k) && at(k).value != 0; }
+  // (host reads may come from the fold's output thread too - af3.cu writes each sample's files beside the next
+  // sample's confidence - so what they mutate, `touched`, the host copies and a file's mapping, is guarded)
+  mutable std::mutex hostMu;
   const float* f(const std::string& k) const {
+    std::lock_guard<std::mutex> g(hostMu);
     const Entry& e = at(k); touched.insert(k);
     if (segs[e.seg].bundle) return hostTensor(segs[e.seg], e.rec);
     return mapped(const_cast<Segment&>(segs[e.seg])) + e.offset;

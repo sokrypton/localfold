@@ -178,16 +178,18 @@ inline bool hasClash(const std::vector<ScoreAtom>& atoms, const std::vector<Scor
 // DSSP's accessibility of every residue of one chain (the chain alone), rounded as DSSP prints it
 inline std::vector<int> dsspAccessibility(const std::vector<ScoreAtom>& atoms, const ScoreChain& chain, const float* x) {
   const float kWater = 1.4f;
-  static std::vector<float> dots;      // DSSP's MSurfaceDots(200): 401 points on the unit sphere
-  if (dots.empty()) {
+  // DSSP's MSurfaceDots(200): 401 points on the unit sphere (built once, thread-safely: samples score in parallel)
+  static const std::vector<float> dots = [] {
+    std::vector<float> d;
     const int N = 200, P = 2 * N + 1;
     const float golden = (1 + std::sqrt(5.0f)) / 2, kPI = 3.141592653589793238462643383279502884f;
     for (int i = -N; i <= N; ++i) {
       float lat = std::asin((2.0f * i) / P);
       float lon = static_cast<float>(std::fmod(i, golden) * 2 * kPI / golden);
-      dots.insert(dots.end(), { std::sin(lon) * std::cos(lat), std::cos(lon) * std::cos(lat), std::sin(lat) });
+      d.insert(d.end(), { std::sin(lon) * std::cos(lat), std::cos(lon) * std::cos(lat), std::sin(lat) });
     }
-  }
+    return d;
+  }();
   const float weight = (4 * 3.141592653589793238462643383279502884f) / 401;
   struct A { float x, y, z, r; int res; };
   std::vector<A> pts;
@@ -237,7 +239,9 @@ inline std::vector<int> dsspAccessibility(const std::vector<ScoreAtom>& atoms, c
       surface[i] = s * radius * radius;
     }
   };
-  int nt = std::max(1, std::min((int)std::thread::hardware_concurrency(), (int)(pts.size() / 512) + 1));
+  // (128 atoms a thread: 5CAJ's 2,106 took 5 threads at 512, and each atom is independent - summed in order
+  // below, so the count cannot change the answer)
+  int nt = std::max(1, std::min((int)std::thread::hardware_concurrency(), (int)(pts.size() / 128) + 1));
   std::vector<std::thread> th;
   for (int t = 0; t < nt; ++t) th.emplace_back(work, (int)(pts.size() * t / nt), (int)(pts.size() * (t + 1) / nt));
   for (auto& t : th) t.join();
@@ -291,11 +295,23 @@ inline double fractionDisordered(const std::vector<ScoreAtom>& atoms, const std:
   return (double)over / all.size();
 }
 
+// the input's atoms and chains, built once a fold rather than once a sample: they are the input's, not the
+// coordinates', and reading them re-parsed template.pdb (af3.cu bumps the generation at each fold - a serve
+// job's input directory is reused with new contents)
+inline int SCORE_ATOMS_GEN = 0;
+struct FoldAtoms { std::vector<ScoreAtom> atoms; std::vector<ScoreChain> chains; };
+inline const FoldAtoms& foldAtoms() {
+  static FoldAtoms cached; static int gen = -1; static std::string dir;
+  if (gen != SCORE_ATOMS_GEN || dir != DATA_DIR) {
+    cached.atoms = scoreAtoms(DATA_DIR); cached.chains = scoreChains(cached.atoms); gen = SCORE_ATOMS_GEN; dir = DATA_DIR;
+  }
+  return cached;
+}
+
 struct StructureScores { bool clash; double disordered; };
 inline StructureScores structureScores(const std::vector<float>& x) {
-  std::vector<ScoreAtom> atoms = scoreAtoms(DATA_DIR);
-  std::vector<ScoreChain> chains = scoreChains(atoms);
-  return { hasClash(atoms, chains, x.data()), fractionDisordered(atoms, chains, x.data()) };
+  const FoldAtoms& fa = foldAtoms();
+  return { hasClash(fa.atoms, fa.chains, x.data()), fractionDisordered(fa.atoms, fa.chains, x.data()) };
 }
 inline double rankingScore(double ptm, double iptm, const StructureScores& s) {
   double base = std::isnan(iptm) ? ptm : 0.8 * iptm + 0.2 * ptm;
@@ -318,8 +334,8 @@ inline int scorePdbMain(const std::string& path) {
 // an _atom_site table, the per-atom pLDDT in B_iso_or_equiv. Each chain its own entity; a polymer
 // residue carries label_seq_id, a ligand '.'. Returns the slots in record order, as writePdb does.
 inline std::vector<size_t> writeCif(const std::string& path, const std::vector<float>& x, const float* bfactors) {
-  std::vector<ScoreAtom> atoms = scoreAtoms(DATA_DIR);
-  std::vector<ScoreChain> chains = scoreChains(atoms);
+  const std::vector<ScoreAtom>& atoms = foldAtoms().atoms;
+  const std::vector<ScoreChain>& chains = foldAtoms().chains;
   // one ENTITY per distinct chain (its residue names in order), as mmCIF means it and AF3's own
   // writer does: copies of one sequence share it (one entity a chain also broke AF3's reader past
   // ten entities - it paired chain A with another entity's sequence)
