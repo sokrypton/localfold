@@ -14,10 +14,11 @@ __global__ void addDiffK(float* acc, const float* work, const float* base, size_
 }
 // chai-1's PARALLEL pair track (af3-any-model modules.py, PairFormerIteration under chai): every update reads the
 // stage's input z0 and they are summed, z = z0 + f1(z0) + f2(z0) + ..., where AlphaFold 3 applies them one after
-// another. The kernels here update a pair in place, so each update after the first runs on a fresh copy of z0
-// and adds its difference. The ending-node triangle attention's output is NOT transposed back under chai
-// (its fused attention concatenates [dir0(i,j), dir1(j,i)] before one output projection), so its difference is
-// added transposed: AlphaFold 3's ending-node update at (j, i) is chai's at (i, j).
+// another. Each update after the first reads a copy of z0 and adds its residual into the pair (pairtrack.cuh's
+// RESIDUAL_INTO): one copy a block and no difference taken - trunk 910 -> 714 ms on 5CAJ against a copy of z0
+// and a difference per update. The ending-node triangle attention's output is NOT transposed back under chai
+// (its fused attention concatenates [dir0(i,j), dir1(j,i)] before one output projection), so its residual goes
+// in untransposed: AlphaFold 3's ending-node update at (j, i) is chai's at (i, j).
 enum class PairUpdate { TriOut, TriIn, GridRow, GridCol, Transition };
 template <class T>
 void runPairUpdate(PairUpdate u, float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
@@ -31,20 +32,11 @@ void runPairUpdate(PairUpdate u, float* pair, const float* mask, int n, int C, c
     case PairUpdate::Transition: transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition"); break;
   }
 }
-// pair[i][j] += work[j][i] - base[j][i]
-__global__ void addDiffTransposedK(float* acc, const float* work, const float* base, int n, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
-  int c = (int)(t % C); size_t ij = t / C; size_t i = ij / n, j = ij % n;
-  size_t ji = (j * n + i) * C + c;
-  acc[t] += work[ji] - base[ji];
-}
 template <class T>
 void parallelPairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap, bool divide,
                          int transitionFactor, std::initializer_list<PairUpdate> updates) {
   size_t pc = (size_t)n * n * C;
   float* base = scratch<float>("par.base", pc);
-  float* work = scratch<float>("par.work", pc);
   CK(cudaMemcpyAsync(base, pair, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
   bool first = true;
   for (PairUpdate u : updates) {
@@ -53,10 +45,10 @@ void parallelPairUpdates(float* pair, const float* mask, int n, int C, const std
       first = false; continue;
     }
     first = false;
-    CK(cudaMemcpyAsync(work, base, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
-    runPairUpdate<T>(u, work, mask, n, C, pre, swap, divide, transitionFactor);
-    if (u == PairUpdate::GridCol) addDiffTransposedK<<<blocks(pc), 256, 0, STREAM>>>(pair, work, base, n, C);
-    else addDiffK<<<blocks(pc), 256, 0, STREAM>>>(pair, work, base, pc);
+    // reading the block's input, adding into the pair (into()); the ending-node attention untransposed
+    RESIDUAL_INTO = pair; RESIDUAL_UNTRANSPOSED = u == PairUpdate::GridCol;
+    runPairUpdate<T>(u, base, mask, n, C, pre, swap, divide, transitionFactor);
+    RESIDUAL_INTO = nullptr; RESIDUAL_UNTRANSPOSED = false;
   }
 }
 

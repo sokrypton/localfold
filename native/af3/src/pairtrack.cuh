@@ -4,6 +4,16 @@
 #pragma once
 #include "common.cuh"
 
+// Where a pair update adds its residual: its own input (nullptr, every model) or, for chai-1's parallel
+// block (trunk.cuh's parallelPairUpdates), the block's running sum - so an update reads the pair ENTERING the
+// block and adds into another buffer, with no copy of it. Every residual add of the three updates below
+// goes through into(); a kernel that adds in place without it would write the block's input.
+inline float* RESIDUAL_INTO = nullptr;
+inline float* into(float* x) { return RESIDUAL_INTO ? RESIDUAL_INTO : x; }
+// ...and chai's ending-node attention adds its difference TRANSPOSED (AF3's at (j, i) is chai's at (i, j)), which
+// is the column pass's own residual without its transpose
+inline bool RESIDUAL_UNTRANSPOSED = false;
+
 // ---------------------------------------------------------------- elementwise kernels
 // LayerNorm over the last axis with AF3's fast variance E[x^2] - E[x]^2. One warp a row.
 template <class TI, class TO>
@@ -361,7 +371,7 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
       rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, nullptr, r, q0, cnt, n, C,
         W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"));
       linear<T, T>(ln, t2, cnt, C, C, pre + ".gatingLinear");
-      rectGatedAddK<T><<<blocks(cnt * C), 256, 0, STREAM>>>(pair, t1, t2, r, q0, cnt, n, C);
+      rectGatedAddK<T><<<blocks(cnt * C), 256, 0, STREAM>>>(into(pair), t1, t2, r, q0, cnt, n, C);
     }
   }
   // given back at once: the fixed operand is a plane, and the next stage (the MSA attention, the grid
@@ -432,7 +442,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
             pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs);
           triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
           triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
-                                                Wh(pre + ".outputProjection"), t2, pair, n, np);
+                                                Wh(pre + ".outputProjection"), t2, into(pair), n, np);
         });
         return;
       }
@@ -447,7 +457,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         triIn256K<CC, WI><<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmem(CC), STREAM>>>(
           pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs);
         contract();
-        triangleOutRun<CC, WO>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, pair, n, np);
+        triangleOutRun<CC, WO>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, into(pair), n, np);
       });
       return;
     }
@@ -461,13 +471,13 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs * C);
         triIn128(pair, mask, pre, pg, ab, bb, t2, n, np, cs);
         triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
-        triOut128(pb, pre, t2, pair, n, np, cs);
+        triOut128(pb, pre, t2, into(pair), n, np, cs);
         return;
       }
       a = scratch<T>("tri.a", cs * C); b = scratch<T>("tri.b", cs * C); prod = scratch<float>("tri.prod", cs * C);
       triIn128(pair, mask, pre, pg, a, b, t2, n, np, cs);   // writes the padding itself
       contract();
-      triOut128(prod, pre, t2, pair, n, np, cs);
+      triOut128(prod, pre, t2, into(pair), n, np, cs);
       return;
     }
   }
@@ -504,7 +514,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     }
     linear<T, T>(centred, t1, rows, C, C, pre + ".outputProjection");
     linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
-    gatedAddK<T><<<blocks(rows * C), 256, 0, STREAM>>>(pair + r0 * C, t1, t2, rows * C);
+    gatedAddK<T><<<blocks(rows * C), 256, 0, STREAM>>>(into(pair) + r0 * C, t1, t2, rows * C);
   }
 }
 
@@ -517,7 +527,8 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   size_t w1 = lenW(pre + ".transition1");
   if (w1 % (2 * (size_t)C)) { fprintf(stderr, "%s.transition1 has %zu elements, not C %d x 2I\n", pre.c_str(), w1, C); exit(1); }
   int I = (int)(w1 / (2 * (size_t)C));
-  if constexpr (std::is_same_v<T, half>) if (fusedTransition(x, rows, C, I, pre)) return;
+  // (the fused 128-channel kernel adds in place, so not under a redirected residual - nothing parallel is 128 wide)
+  if constexpr (std::is_same_v<T, half>) if (!RESIDUAL_INTO && fusedTransition(x, rows, C, I, pre)) return;
   if constexpr (std::is_same_v<T, half>) {
     // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
     // residual as its beta - the [rows, 2I] widening never written
@@ -536,7 +547,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
           size_t r = std::min(rowsPer, rows - r0);
           transitionUpK<CC, WU><<<(unsigned)((r + R - 1) / R), 32 * WU, wideUpSmem(CC), STREAM>>>(
             x + r0 * C, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), w1t, gated, r, I);
-          linear<half, float>(gated, x + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
+          linear<half, float>(gated, into(x) + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
         }
       });
       return;
@@ -551,7 +562,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
     layerNorm2<float, T>(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
     linear<T, T>(xn, wide, r, C, 2 * I, pre + ".transition1");
     swiglu<T>(wide, gated, r, I);
-    linear<T, float>(gated, x + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
+    linear<T, float>(gated, into(x) + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
   }
 }
 
@@ -634,7 +645,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     // three fused kernels (fusedtriangle.cuh): LN + the bias projection (head-major), then per
     // chunk LN + q/k/v/gate (reading the column direction's rows transposed in place), the flash
     // kernel, and the output projection added into the pair
-    if (FUSED_GRID && C == 128 && Wd == 128 && heads <= 16 && gridFusedFits() && !hasW(pre + ".gatingQueryBias") &&
+    if (FUSED_GRID && C == 128 && Wd == 128 && heads <= 16 && gridFusedFits() && !RESIDUAL_UNTRANSPOSED && !hasW(pre + ".gatingQueryBias") &&
         !hasW(pre + ".outputProjectionBias")) {
       int stride = (n + 7) / 8 * 8;
       half* bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
@@ -657,8 +668,8 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias);
         half* gathered = scratch<half>("grid.gathered", pairs * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
-        if (!tr) linear<half, float>(gathered, pair, pairs, Wd, C, pre + ".outputProjection", false, 1.f);
-        else gridOut128(gathered, pre + ".outputProjection", pair, n, 0, pairs, tr);
+        if (!tr) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
+        else gridOut128(gathered, pre + ".outputProjection", into(pair), n, 0, pairs, tr);
         return;
       }
       if (shortPair(pairs, C)) {
@@ -685,8 +696,8 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
         half* gathered = scratch<half>("grid.gathered", prs * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
-        if (!tr) linear<half, float>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
-        else gridOut128(gathered, pre + ".outputProjection", pair, n, r0 * n, prs, tr);
+        if (!tr) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+        else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr);
       }
       return;
     }
@@ -747,13 +758,13 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     flashGrid<T>(qkvgOut, bias, stride, MASK_ALL_ONES && std::is_same_v<T, half> ? nullptr : mask, gathered, n, heads, D,
                  r0, rows, tr, scale);       // (no mask when every token is real: the unmasked kernel)
     if (!tr && !outBias) {
-      linear<T, float>(gathered, pair + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+      linear<T, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
       continue;
     }
     float* o = scratch<float>("grid.out", prs * C);
     linear<T, float>(gathered, o, prs, Wd, C, pre + ".outputProjection");
     if (outBias) addBiasK<<<blocks(prs * C), 256, 0, STREAM>>>(o, outBias, prs, C);
-    addGridK<<<blocks(prs * C / 4), 256, 0, STREAM>>>(pair, o, n, C, r0, rows, tr);
+    addGridK<<<blocks(prs * C / 4), 256, 0, STREAM>>>(into(pair), o, n, C, r0, rows, tr && !RESIDUAL_UNTRANSPOSED);
   }
 }
 
