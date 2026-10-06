@@ -171,10 +171,10 @@ __host__ __device__ constexpr size_t triangleOutSmem() {
 }
 // TP: the product's type in memory - f32, or bf16 (ESMFold2's: the contraction writes half the bytes and
 // this reads half; the tile is bf16 either way)
-template <int C, int WARPS, class TT = float, int NC = 32, class TP = float>
+template <int C, int WARPS, class TT = float, int NC = 32, class TP = float, bool BIAS = false>
 __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Woutt, const half* __restrict__ t2,
-    float* __restrict__ pair, int L, int Lp) {
+    float* __restrict__ pair, int L, int Lp, const float* __restrict__ ob = nullptr) {   // ob: AF2's output bias
   // Woutt: Wout's NC-column tiles (tileColumns), the stages unpadded and swizzled (stageSw)
   // VEC (a 16-bit product into a 16-bit tile - ESMFold2's and protenix2's bf16): the block's rows are the
   // PADDED pair space, so eight consecutive rows are 16 contiguous, aligned bytes of a channel and the tile
@@ -344,6 +344,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
       uint2 gw = gv[i];
       float2 g01 = __half22float2(*reinterpret_cast<half2*>(&gw.x)), g23 = __half22float2(*reinterpret_cast<half2*>(&gw.y));
       float4 v = pv[i];
+      if constexpr (BIAS) { o.x += ob[c]; o.y += ob[c + 1]; o.z += ob[c + 2]; o.w += ob[c + 3]; }
       v.x += o.x * sigmH(g01.x); v.y += o.y * sigmH(g01.y); v.z += o.z * sigmH(g23.x); v.w += o.w * sigmH(g23.y);
       *reinterpret_cast<float4*>(pair + pr * C + c) = v;
     }
@@ -374,10 +375,13 @@ template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int x
 // taking their fragments from it before the next - so a block of 16 warps needs one round's rows, not all of
 // them, beside its stages. On a T4 (64 KB an SM) the 4-warp form held a whole SM for 4 warps; this holds it
 // for 16. Every row is normed exactly as before (lnRowsToShared's per-row arithmetic), so byte-identical.
-template <int C, int WARPS, class TA = half, int XROUNDS = 1>
+// BIAS: AlphaFold 2's projections carry biases (triInK's layout: [4C, projection | gate in Wpg's order][C, the
+// gating linear's]); without it the kernel is the one AF3's lineage and ESMFold2 run
+template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false>
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
-    TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs) {
+    TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs,
+    const float* __restrict__ bias = nullptr) {
   // the weight stage is unpadded, [k][NC], its two 16-byte halves swapped on rows with bit 2 of k set
   // (sw): the padded 48-byte rows kept ldmatrix conflict-free but serialised the cp.async writes ~6.7x
   // (ncu: 40% of the kernel's shared wavefronts excessive, all of them those four LDGSTS); swizzled,
@@ -471,6 +475,16 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
       ldsm4t(f1, w1 + sw(k, c));
       mma16816(q[0], xa[ks], f1[0], f1[1]); mma16816(q[1], xa[ks], f1[2], f1[3]);
     }
+    if constexpr (BIAS) {
+#pragma unroll
+      for (int nt = 0; nt < NC / 8; ++nt) {
+        int col = gating ? 4 * C + 2 * (j - abSteps) * NC + nt * 8 + tig * 2 : j * NC + nt * 8 + tig * 2;
+        int qcol = gating ? col + NC : 2 * C + col;          // the second gating tile, or the gate's columns
+        float b0 = bias[col], b1 = bias[col + 1], g0 = bias[qcol], g1 = bias[qcol + 1];
+        p[nt][0] += b0; p[nt][1] += b1; p[nt][2] += b0; p[nt][3] += b1;
+        q[nt][0] += g0; q[nt][1] += g1; q[nt][2] += g0; q[nt][3] += g1;
+      }
+    }
     if (gating) {
       int c0 = 2 * (j - abSteps) * NC;                         // p the first tile's columns, q the second's
 #pragma unroll
@@ -515,17 +529,27 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 // the triangle's output side, launched: the bf16 tile at 16-column stages (LOCALFOLD_TRIOUT_F32=1: the float tile)
 template <int C, int WARPS, class TP = float>
 void triangleOutRun(const TP* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
-                    int L, int Lp) {
+                    int L, int Lp, const float* ob = nullptr) {
   static const bool f32 = getenv("LOCALFOLD_TRIOUT_F32") != nullptr;
   constexpr int R = 16 * WARPS;
   size_t P = (size_t)L * L;
   half* wt = scratch<half>("triout.wt", (size_t)C * C);
-  tileColumns(Wout, C, C, 0, C, f32 ? 32 : 16, wt);
-  if (f32) {
+  tileColumns(Wout, C, C, 0, C, f32 || ob ? 32 : 16, wt);
+  if (f32 && !ob) {
     constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32>();
     static bool attr = false;
     if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP>), (int)smem); attr = true; }
     triangleOutK<C, WARPS, float, 32, TP><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp);
+  } else if (ob) {
+    // AF2's output bias - and its f32 product kept f32 in the tile, as AF2's own kernels keep it (the bf16 tile
+    // read the triangle's update 2e-3 off theirs; a float tile at 128 channels is ~34 KB, inside a T4)
+    if constexpr (sizeof(TP) == 4) {
+      constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32, TP>();
+      static bool attr = false;
+      if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP, true>), (int)smem); attr = true; }
+      triangleOutK<C, WARPS, float, 32, TP, true><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+        prod, sc, of, wt, t2, pair, L, Lp, ob);
+    } else { fprintf(stderr, "triangleOutRun: an output bias takes an f32 product (AF2's)\n"); exit(1); }
   } else {
     constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
     constexpr bool vec = sizeof(TP) == 2;                       // the padded rows (triangleOutK's VEC)

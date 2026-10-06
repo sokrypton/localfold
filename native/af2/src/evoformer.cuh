@@ -690,6 +690,34 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
                            PH(T + "/output_projection/weights", blk), P(T + "/output_projection/bias", blk), t2, pair, L, Lp, plane);
     return;
   }
+  // a T4, where neither fused form above fits (the output kernel holds the whole 128 x 128 weight, 71 KB):
+  // native/af3's streaming triangle kernels at 128 channels, biased, the weight 16 columns a stage (~35 KB),
+  // the contraction f16 into f32 (no bf16 MMA there)
+  if (FAST && FUSED_TRIANGLE && C == 128 && L >= 80 &&
+      fitsSmem(std::max(triIn256Smem<half>(128, 8), triangleOutSmem<128, 4, float, 32, float>()))) {
+    int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+    TriFused w = triFusedWeights(T, blk, C);
+    half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
+    tileTriIn(w.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+    half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
+    half* t2 = scratch<half>("ftri.t2", plane * C);
+    constexpr int WI = 8;
+    static bool attr = false;
+    if (!attr) { smemAttr((triIn256K<128, WI, half, 1, true>), (int)triIn256Smem<half>(128, WI)); attr = true; }
+    triIn256K<128, WI, half, 1, true><<<(unsigned)((plane + 16 * WI - 1) / (16 * WI)), 32 * WI, triIn256Smem<half>(128, WI), STREAM>>>(
+      pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias);
+    float* prod = scratch<float>("ftri.prod", plane * C);
+    const float one = 1.f, zero = 0.f;
+    if (outgoing)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16F, Lp, plane, a, CUDA_R_16F, Lp,
+                                    plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    else
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16F, Lp, plane, b, CUDA_R_16F, Lp,
+                                    plane, &zero, prod, CUDA_R_32F, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    triangleOutRun<128, 4, float>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                  PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk));
+    return;
+  }
   if (FAST) {
     TriW w = triWeights(T, blk, C);
     half* xn = scratch<half>("ftri.xn", pairs * C);

@@ -526,6 +526,12 @@ output kernel's bf16 tile, and `transitionUpK` in rounds with 16-column stages (
 1622/1647 ms (-31%), and under `LOCALFOLD_SMEM_LIMIT=65536` here it is byte-identical to the A100's fold. The
 same transition form for the AF3 lineage measured level there (protenix2's 1083 ms against ~1100 for its
 LN, GEMM and SwiGLU passes) and is not taken.
+AlphaFold 2 on a T4 ran its triangle unfused for the same reason. `triIn256K` and `triangleOutK` take AF2's
+biases now (`BIAS`), and at 128 channels with AF2's f32 product the output kernel keeps a float tile (~34 KB):
+the bf16 tile read the update 2e-3 off AF2's own kernels, the float tile is within its f16 operands' rounding.
+Colab T4, 5CAJ with 512 + 1024 alignment rows, interleaved: 11027/11284/11770 -> 10640/11021/11475 ms
+(-3%), pLDDT and pTM unchanged.
+
 
 
 

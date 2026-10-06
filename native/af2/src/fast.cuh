@@ -3,6 +3,7 @@
 #pragma once
 #include "ops.cuh"
 #include "../../af3/src/fusedtransition.cuh"     // (and fusedtriangle.cuh)
+#include "../../af3/src/fused256.cuh"          // (its streaming triangle kernels: a T4's, below)
 
 // ---------------------------------------------------------------- cuBLASLt, row-major
 // Y[rows, out] (f32 or f16) = X[rows, in] (f16) W[in, out] (f16) (+ bias[out] f32) (ReLU) (+ beta Y)
