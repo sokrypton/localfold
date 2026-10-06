@@ -83,7 +83,7 @@ import { parseCcdComponent, ligandChain } from "../src/af3/featurise/ccd-compone
 import { dialectFor, DIALECTS, featuriserDialect } from "../src/af3/dialect.js";
 import { structuralBatch, structuralLayout } from "../src/af3/featurise/structural-tokens.js";
 
-const MODELS = ["alphafold3", "openbind0", "opendde", "boltz2", "protenix2",
+const MODELS = ["alphafold3", "openbind0", "opendde", "boltz2", "protenix2", "chai1",
                 "intellifold2", "rosettafold3"];
 
 // 🔴 TWO TARGETS, BECAUSE ONE OF THEM CANNOT REACH FOUR CONVENTIONS. 6MRR is a
@@ -231,6 +231,9 @@ const ABSENT = {
   is_protein: "derived from aatype at use, not stored",
   is_water: "as is_protein", is_nonstandard_polymer_chain: "as is_protein",
   frames_mask: "the frame set is built in the confidence head, not the batch",
+  // chai1's: ESM2 3B's output, which this port computes in the fold (native/af3/src/esm2.cuh, 3.3e-4 against the
+  // reference's tower) from the ids src/af3/featurise/esm2-input.js writes - an input to the model, not a feature
+  esm_embeddings: "computed by the fold's own ESM2 tower, not the featuriser",
   residue_center_index: "derived from the dense layout at use",
   chiral_angles: "gated in check-atom-windows.js",
   chiral_centers: "gated in check-atom-windows.js",
@@ -358,6 +361,13 @@ for (const target of Object.keys(TARGETS)) {
     const theirs = flat(dump.inputs[name]).map(Number);
     if (theirs.length === 0) continue;
     seen.add(name);
+    // 🔴 chai1's reference batch is dumped through fold_check, which featurises with has_msa=False, so its
+    // no-alignment zeroing (model_features.py _zero_msa) fires even on a target that HAS one - while this port,
+    // handed that alignment, rightly keeps it. Those two fields are reported, not asserted, there.
+    if (model === "chai1" && TARGETS[target].alignment && (name === "profile" || name === "deletion_mean")) {
+      floor.push(`${name}: the reference dumped with no alignment (fold_check has_msa=False), this port with one`);
+      continue;
+    }
     const ours = pick(batch);
     if (ours === undefined) { notes.push(`${name}: unmapped`); continue; }
     // 🔴 COMPARE THE OVERLAP AND SAY SO. Their atom axis is the dense grid and

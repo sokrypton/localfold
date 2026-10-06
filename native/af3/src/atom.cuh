@@ -3,6 +3,7 @@
 // Transcribed from src/af3/diffusion/{atom-conditioning,atom-encoder}-reference.js. f32.
 #pragma once
 #include "pairtrack.cuh"
+#include "esm2.cuh"
 
 // The adaptive LayerNorm's two forms: AlphaFold 3's sigmoid(scale) * LN(x; eps 1e-5) + shift, and chai-1's
 // (scale + 1) * LN(x; eps 0.1) + shift (af3-any-model diffusion_transformer.py's chai adaLN: the conditioning is
@@ -1114,6 +1115,31 @@ __global__ void concatColsK(const float* a, const float* b, float* out, size_t r
   out[t] = c < Ca ? a[r * Ca + c] : b[r * Cb + c - Ca];
 }
 inline float* TARGET_FEAT_STRUCTURE = nullptr;     // chai-1's second projection: the diffusion module's target_feat
+__global__ void gatherEsmRowsK(const float* rows, const int* tokenRow, float* out, int tokens, int E) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)tokens * E) return;
+  int token = (int)(t / E), r = tokenRow[token];
+  out[t] = r < 0 ? 0.f : rows[(size_t)r * E + t % E];
+}
+inline float* esmEmbeddings(int tokens, int& E) {
+  esm2::Tower tw = esm2::tower();
+  E = tw.C;
+  const int* ids = M.i("esm.ids"); const int* lens = M.i("esm.chainLengths"); size_t chains = M.len("esm.chainLengths");
+  size_t total = 0; for (size_t c = 0; c < chains; ++c) total += lens[c];
+  float* rows = scratch<float>("esm.rows", std::max<size_t>(1, total) * E);
+  size_t row = 0, at = 0;
+  for (size_t c = 0; c < chains; ++c) {
+    int L = lens[c];
+    int* d = scratch<int>("esm.ids", L + 2);
+    CK(cudaMemcpyAsync(d, ids + at, (L + 2) * 4, cudaMemcpyHostToDevice, STREAM));
+    CK(cudaStreamSynchronize(STREAM));
+    esm2::embedChain(tw, d, L, rows + row * E);
+    row += L; at += L + 2;
+  }
+  float* out = scratch<float>("esm.emb", (size_t)tokens * E);
+  gatherEsmRowsK<<<blocks((size_t)tokens * E), 256, 0, STREAM>>>(rows, Idev("esm.tokenRow"), out, tokens, E);
+  return out;
+}
 inline float* buildTargetFeat() {
   int tokens = (int)M.meta("batch.tokens");
   if (M.flag("trunk.dialect.chaiTokenEmbedding")) {
@@ -1126,9 +1152,17 @@ inline float* buildTargetFeat() {
     chaiTokenFeatK<<<blocks((size_t)tokens * C), 256, 0, STREAM>>>(Idev("batch.aatype"), Fdev("batch.profile"),
       Fdev("batch.deletionMean"), W(P + "tokenFeatureWeights"), W(P + "tokenFeatureBias"), W(P + "msaProfileWeights"), feat,
       tokens, C);
-    if (!M.has("batch.esmEmbeddings")) { fprintf(stderr, "chai-1 reads ESM2 embeddings and the batch has none\n"); exit(1); }
-    int E = (int)(M.len("batch.esmEmbeddings") / tokens);
-    linear<float, float>(Fdev("batch.esmEmbeddings"), feat, tokens, E, C, P + "esmWeights", false, 1.f);
+    const float* esm = nullptr; int E = 0;
+    if (M.has("batch.esmEmbeddings")) {                       // (a dump's, computed by the reference)
+      esm = Fdev("batch.esmEmbeddings"); E = (int)(M.len("batch.esmEmbeddings") / tokens);
+    } else {
+      // ESM2 3B here (src/esm2.cuh): each protein chain alone, its rows gathered onto the tokens, zeros elsewhere
+      if (!M.has("esm.ids")) { fprintf(stderr, "chai-1 reads ESM2 embeddings: the input has neither them nor esm.ids\n"); exit(1); }
+      if (!M.has("e/embed/weights")) { fprintf(stderr, "chai-1 reads ESM2: give af3 --esm-bundle=<model-esm2-3b-int8>\n"); exit(1); }
+      esm = esmEmbeddings(tokens, E);
+    }
+    linear<float, float>(esm, feat, tokens, E, C, P + "esmWeights", false, 1.f);
+    releaseScratch({ "esm2.", "esm." });
     float* cat = scratch<float>("tf.cat", (size_t)tokens * (Cp + C));
     concatColsK<<<blocks((size_t)tokens * (Cp + C)), 256, 0, STREAM>>>(e.tokenAct, feat, cat, tokens, Cp, C);
     int out = (int)(lenW(P + "singleProjInTrunk") / (Cp + C));
