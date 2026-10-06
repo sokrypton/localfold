@@ -443,6 +443,15 @@ columns a stage: 34 KB, four blocks (the registers' limit), and its load loop ke
 rather than 8. ESMFold2's trunk 326.8 -> 313.1 ms at 262 tokens and 1114 -> 1036 at 524; 5CAJ 2.100 ->
 2.101 A (ESMFold2) and 0.190 -> 0.191 (protenix2 templated); `LOCALFOLD_TRIOUT_F32=1` is the float tile.
 
+The triangle-out kernel's centre norm read its scale and offset from global memory a float at a time -
+128 scalar loads a thread a tile, four times the loads of the residual and gate it exists to stream, and
+Nsight Compute's top stall (lg_throttle) on a persistent kernel holding one block an SM. Read once into
+shared memory: `--bench-tri` 0.1185 -> 0.1089 ms at 261 tokens and 1.416 -> 1.326 at 1044, byte-identical,
+and at 1044 the kernel now moves ~1.27 TB/s of its 1.55 - memory-bound, so what is left there is bytes.
+The input kernel's LayerNorm keeps its lane's scale and offset in registers for all its rows (2% of
+`triInK` at 261, flat at 1044; at 1044 it runs ~117 TFLOP/s beside ~0.9 TB/s). A warm templated 5CAJ
+fold's trunk 320.4 -> 314.5 ms, the PDB byte-identical.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
@@ -489,6 +498,11 @@ rather than 8. ESMFold2's trunk 326.8 -> 313.1 ms at 262 tokens and 1114 -> 1036
   219 against 199 ms at 1044 tokens. Stripping it, neither the residual (-23 ms) nor the second
   GEMM (-27) dominates.
 
+- **The triangle-out norm two rows a thread** (one 32-bit shared read of a bf16 pair for two adjacent
+  rows, half the threads, each row's sums in the same order): byte-identical and level at 261, 524 and
+  1044 tokens - the norm is not what bounds the kernel. **And fused256's `triangleOutK` with its scale
+  and offset as float2 loads** (half the loads, exact): 11% SLOWER at every size (0.241 -> 0.269 ms at
+  261) - the registers to hold them cost a kernel that is register-limited at four blocks an SM.
 - **Two 16-row tiles a warp in the triangle's input kernel** (each weight fragment feeding two
   MMAs, half the shared-memory reads): 8 warps of 32 rows lost to 16 of 16 - 252 against 230 ms at
   1044 tokens; 16 warps of 32 rows do not fit in shared memory.

@@ -211,3 +211,76 @@ inline void benchTrans(int n) {
     printf("  %-14s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);
   }
 }
+// --bench-tri=N: the fused triangle's output kernel alone at N tokens (bf16 product, C 128), on random
+// inputs: a checksum of the updated pair (to compare two builds bit for bit) and the median of 7 x 10 calls
+inline void benchTri(int n) {
+  const int C = 128, np = (n + 7) / 8 * 8;
+  size_t pp = (size_t)np * np, cs = pp, rows = (size_t)n * n;
+  uint64_t s = 1; auto rnd = [&] { s = s * 6364136223846793005ull + 1442695040888963407ull; return (s >> 40) / 16777216.f - 0.5f; };
+  auto fill = [&](auto* d, size_t count, float scale, float base) {
+    using T = std::remove_pointer_t<decltype(d)>;
+    std::vector<T> h(count); for (auto& v : h) v = (T)(base + rnd() * scale);
+    CK(cudaMemcpy(d, h.data(), count * sizeof(T), cudaMemcpyHostToDevice));
+  };
+  __nv_bfloat16* prod = dallocT<__nv_bfloat16>((size_t)C * cs); half* t2 = dallocT<half>(pp * C); half* Wo = dallocT<half>((size_t)C * C);
+  float* p0 = dalloc(rows * C); float* pair = dalloc(rows * C); float* sc = dalloc(C); float* of = dalloc(C);
+  fill(prod, (size_t)C * cs, 4.f, 0.f); fill(t2, pp * C, 4.f, 0.f); fill(Wo, (size_t)C * C, 0.2f, 0.f);
+  fill(p0, rows * C, 2.f, 0.f); fill(sc, C, 0.2f, 1.f); fill(of, C, 0.2f, 0.f);
+  CK(cudaMemcpy(pair, p0, rows * C * 4, cudaMemcpyDeviceToDevice));
+  triOutRaw<__nv_bfloat16>(prod, sc, of, Wo, nullptr, t2, pair, n, np, cs);
+  std::vector<uint32_t> h(rows * C); CK(cudaMemcpy(h.data(), pair, h.size() * 4, cudaMemcpyDeviceToHost));
+  uint64_t sum = 1469598103934665603ull; for (uint32_t v : h) sum = (sum ^ v) * 1099511628211ull;
+  std::vector<float> t;
+  cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+  for (int round = 0; round < 7; ++round) {
+    cudaEventRecord(a, STREAM);
+    for (int i = 0; i < 10; ++i) triOutRaw<__nv_bfloat16>(prod, sc, of, Wo, nullptr, t2, pair, n, np, cs);
+    cudaEventRecord(b, STREAM); cudaEventSynchronize(b);
+    float ms; cudaEventElapsedTime(&ms, a, b); t.push_back(ms / 10);
+  }
+  std::sort(t.begin(), t.end());
+  printf("triOut %d tokens: checksum %016llx  %.4f ms\n", n, (unsigned long long)sum, t[3]);
+  // the input kernel: LN(pair) -> a, b (channel-major, bf16) and t2
+  half* Wpg = dallocT<half>((size_t)C * 4 * C); half* Wg = dallocT<half>((size_t)C * C); float* mask = dalloc(rows);
+  fill(Wpg, (size_t)C * 4 * C, 0.2f, 0.f); fill(Wg, (size_t)C * C, 0.2f, 0.f); fill(mask, rows, 0.f, 1.f);
+  __nv_bfloat16* a2 = dallocT<__nv_bfloat16>((size_t)C * cs); __nv_bfloat16* b2 = dallocT<__nv_bfloat16>((size_t)C * cs);
+  auto runIn = [&] { triInRaw<__nv_bfloat16>(p0, mask, sc, of, Wpg, Wg, nullptr, a2, b2, t2, n, np, cs); };
+  runIn(); CK(cudaStreamSynchronize(STREAM));
+  sum = 1469598103934665603ull;
+  std::vector<std::pair<const void*, size_t>> outs = {{a2, (size_t)C * cs * 2}, {b2, (size_t)C * cs * 2}, {t2, pp * C * 2}};
+  for (auto [ptr, bytes] : outs) {
+    std::vector<uint16_t> hh(bytes / 2); CK(cudaMemcpy(hh.data(), ptr, bytes, cudaMemcpyDeviceToHost));
+    for (uint16_t v : hh) sum = (sum ^ v) * 1099511628211ull;
+  }
+  t.clear();
+  for (int round = 0; round < 7; ++round) {
+    cudaEventRecord(a, STREAM);
+    for (int i = 0; i < 10; ++i) runIn();
+    cudaEventRecord(b, STREAM); cudaEventSynchronize(b);
+    float ms; cudaEventElapsedTime(&ms, a, b); t.push_back(ms / 10);
+  }
+  std::sort(t.begin(), t.end());
+  printf("triIn  %d tokens: checksum %016llx  %.4f ms\n", n, (unsigned long long)sum, t[3]);
+  // the 256-channel output kernel (fused256.cuh: protenix2, ESMFold2), its bf16 product in the padded rows
+  {
+    const int C2 = 256;
+    __nv_bfloat16* pr2 = dallocT<__nv_bfloat16>((size_t)C2 * cs); half* t22 = dallocT<half>(pp * C2); half* Wo2 = dallocT<half>((size_t)C2 * C2);
+    float* q0 = dalloc(rows * C2); float* q = dalloc(rows * C2); float* sc2 = dalloc(C2); float* of2 = dalloc(C2);
+    fill(pr2, (size_t)C2 * cs, 4.f, 0.f); fill(t22, pp * C2, 4.f, 0.f); fill(Wo2, (size_t)C2 * C2, 0.2f, 0.f);
+    fill(q0, rows * C2, 2.f, 0.f); fill(sc2, C2, 0.2f, 1.f); fill(of2, C2, 0.2f, 0.f);
+    CK(cudaMemcpy(q, q0, rows * C2 * 4, cudaMemcpyDeviceToDevice));
+    auto run = [&] { triangleOutRun<256, 4, __nv_bfloat16>(pr2, sc2, of2, Wo2, t22, q, n, np); };
+    run();
+    std::vector<uint32_t> hq(rows * C2); CK(cudaMemcpy(hq.data(), q, hq.size() * 4, cudaMemcpyDeviceToHost));
+    sum = 1469598103934665603ull; for (uint32_t v : hq) sum = (sum ^ v) * 1099511628211ull;
+    t.clear();
+    for (int round = 0; round < 7; ++round) {
+      cudaEventRecord(a, STREAM);
+      for (int i = 0; i < 10; ++i) run();
+      cudaEventRecord(b, STREAM); cudaEventSynchronize(b);
+      float ms; cudaEventElapsedTime(&ms, a, b); t.push_back(ms / 10);
+    }
+    std::sort(t.begin(), t.end());
+    printf("triOut256 %d tokens: checksum %016llx  %.4f ms\n", n, (unsigned long long)sum, t[3]);
+  }
+}

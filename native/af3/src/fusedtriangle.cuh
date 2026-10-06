@@ -27,6 +27,9 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
                                                const float* __restrict__ offset, half* Xs, int LDX, int warp, int lane) {
   constexpr int RPW = R / WARPS, B = LN_ROWS_IN_FLIGHT > 0 && RPW % LN_ROWS_IN_FLIGHT == 0 ? LN_ROWS_IN_FLIGHT
                                   : RPW % 4 == 0 ? 4 : (RPW % 2 == 0 ? 2 : 1), K = C / 32;
+  float sc[K], of[K];                       // a lane's channels' scale and offset, loaded once for all its rows
+#pragma unroll
+  for (int k = 0; k < K; ++k) { sc[k] = scale[lane + 32 * k]; of[k] = offset[lane + 32 * k]; }
   for (int base = 0; base < RPW; base += B) {
     float v[B][K];
 #pragma unroll
@@ -49,8 +52,7 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
       int r = warp + (base + b) * WARPS;
 #pragma unroll
       for (int k = 0; k < K; ++k) {
-        int c = lane + 32 * k;
-        Xs[r * LDX + c] = __float2half((v[b][k] - mean) * inv * scale[c] + offset[c]);
+        Xs[r * LDX + lane + 32 * k] = __float2half((v[b][k] - mean) * inv * sc[k] + of[k]);
       }
     }
   }
@@ -352,6 +354,10 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
   half* Ws = (half*)smem;                                           // [C][LDW]
   half* Xs = Ws + C * LDW;                                          // [R][LDX]
   TP* Pst = (TP*)(Xs + R * LDX);                                    // two stages of [C][LDP]
+  // the center norm's scale and offset, read once: a thread's half row of them was 128 scalar loads a
+  // tile from global memory, four times the epilogue's (ncu: lg_throttle the kernel's top stall)
+  float* Ns = (float*)(Pst + 2 * C * LDP);                           // [2][C]
+  for (int c = threadIdx.x; c < C; c += NTH) { Ns[c] = cnScale[c]; Ns[C + c] = cnOffset[c]; }
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t tiles = (pp + R - 1) / R;
 #pragma unroll
@@ -424,8 +430,8 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
           int c = c0 + 2 * e;
-          w[e] = pack2(((float)Ps[c * LDP + r] - mean) * inv * cnScale[c] + cnOffset[c],
-                       ((float)Ps[(c + 1) * LDP + r] - mean) * inv * cnScale[c + 1] + cnOffset[c + 1]);
+          w[e] = pack2(((float)Ps[c * LDP + r] - mean) * inv * Ns[c] + Ns[C + c],
+                       ((float)Ps[(c + 1) * LDP + r] - mean) * inv * Ns[c + 1] + Ns[C + c + 1]);
         }
         *reinterpret_cast<uint4*>(Xs + r * LDX + c0) = make_uint4(w[0], w[1], w[2], w[3]);
       }
@@ -525,7 +531,8 @@ void triIn128(const float* pair, const float* mask, const std::string& pre, cons
 }
 inline bool TRI_OUT_PERSISTENT = true;
 template <class TP> constexpr size_t triOutPSmem(int warps = TO_WARPS) {
-  return (size_t)128 * 136 * 2 + (size_t)16 * warps * 136 * 2 + (size_t)2 * 128 * (16 * warps + 16 / sizeof(TP)) * sizeof(TP);
+  return (size_t)128 * 136 * 2 + (size_t)16 * warps * 136 * 2 + (size_t)2 * 128 * (16 * warps + 16 / sizeof(TP)) * sizeof(TP)
+         + 2 * 128 * sizeof(float);
 }
 template <class TP> constexpr size_t triOutSmem(int warps = TO_WARPS) {
   return (size_t)128 * 136 * 2 + (size_t)16 * warps * 136 * 2 + (size_t)128 * (16 * warps + 16 / sizeof(TP)) * sizeof(TP);
@@ -541,7 +548,7 @@ void triOutLaunch(const TP* prod, const float* cnScale, const float* cnOffset, c
   constexpr int C = 128, R = 16 * WARPS;
   size_t pp = (size_t)np * np;
   if (TRI_OUT_PERSISTENT && fitsSmem(triOutPSmem<TP>(WARPS))) {
-    size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)2 * C * (R + 16 / sizeof(TP)) * sizeof(TP);
+    size_t smem = triOutPSmem<TP>(WARPS);
     static int grid = 0;
     if (!grid) {
       smemAttr((triOutPK<C, WARPS, TP, BIAS>), (int)smem);
