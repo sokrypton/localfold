@@ -80,10 +80,13 @@ describe("the pinned registry manifests", () => {
       // test/af3-diffusion-weights.test.js. A bundle exported before that was
       // understood may carry ZEROS under the name the loader now reads, which
       // no shape check can see - but its ABSENCE can be.
+      // ...and chai-1 embeds its atom pairs as a distogram one-hot (`embed_atom_pair_feat`), not as AF3's
+      // offsets and distances - the pair tensors its own loader branch reads.
+      const chai = manifest.model?.name === "chai1";
       for (const leaf of ["diffusion_single_to_pair_cond_row",
                           "diffusion_single_to_pair_cond_col",
-                          "diffusion_embed_pair_offsets",
-                          "diffusion_embed_pair_distances"]) {
+                          ...(chai ? ["diffusion_embed_atom_pair_feat"]
+                            : ["diffusion_embed_pair_offsets", "diffusion_embed_pair_distances"])]) {
         assert.ok(manifest.tensors[`${HEAD}/${leaf}/weights`] !== undefined,
           `${name} has no ${leaf}; the loader stopped reading the _1 form`);
       }

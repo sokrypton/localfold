@@ -195,6 +195,18 @@ BUNDLES = {
         "module": "src/bundles/manifests/rosettafold3.js",
         "model": "rosettafold3",
     },
+    # Chai-1 at int5 group 32, with chai-lab's structure token-pair weights; CUDA-only for now. 233 MiB.
+    "chai1": {
+        "export": "model-chai1-int5",
+        "module": "src/bundles/manifests/chai1.js",
+        "model": "chai1",
+    },
+    # ESM2 3B, Chai-1's language model, int8. 2.7 GB.
+    "esm2-3b": {
+        "export": "model-esm2-3b-int8",
+        "module": "src/bundles/manifests/esm2-3b.js",
+        "model": "esm2",
+    },
     # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
     # and the whole structure head, at int5 group 32. 122 MiB.
     #

@@ -163,13 +163,6 @@ def cases(offline):
              "entities": [protein(s5, {"kind": "search"})], "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 2.5,
              None, None),
         ]
-    # 🔴 Chai-1's bundles (model-chai1-int5, model-esm2-3b-int8) are not published yet, so the worker cannot fetch
-    # them: its cases run where they were built and are a SKIP elsewhere, said, until the registry has a remote
-    unpublished = [d for d in ("model-chai1-int5", "model-esm2-3b-int8")
-                   if not os.path.exists(os.path.join(REPO, d, "manifest.json"))]
-    if unpublished:
-        print("skip  chai1 - no local %s, and it is not published" % ", ".join(unpublished))
-        out = [case for case in out if "chai1" not in case[0]]
     return out
 
 
