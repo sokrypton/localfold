@@ -1007,9 +1007,12 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
           fusedHeads = true;
         }
       if (!fusedHeads) {
-        if (pair16) { PAIR16 = true; needF32Pair("the single track's unfused pair logits"); }
         if (!flat) { flat = scratch<float>("st.flat", (size_t)heads * R * n); ln = scratch<T>("st.ln", (size_t)R * n * C); }
-        layerNorm2<float, T>(prow, ln, rows, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
+        if (pair16)        // (a bf16 pair's rows, normed by the kernel that reads them)
+          layerNormK<__nv_bfloat16, T><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(
+            reinterpret_cast<const __nv_bfloat16*>(prow), ln, rows, C, W(B + ".singlePairLogitsNormScale"),
+            W(B + ".singlePairLogitsNormOffset"));
+        else layerNorm2<float, T>(prow, ln, rows, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
         linear<T, float>(ln, flat, rows, C, heads, B + ".singlePairLogitsProjection");
         logitsLayoutK<<<blocks(rows * heads), 256, 0, STREAM>>>(flat, pl, rows, heads);
       }

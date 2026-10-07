@@ -960,7 +960,6 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   // place that is safe: a row chunk writes only its own rows, a column chunk only its own columns, and the
   // bias is all taken before any is written.
   const bool streamNorm = shortPair(pairs, C);
-  if (streamNorm) needF32Pair("the unfused grid attention's streamed norm");
   T* norm = streamNorm ? nullptr : scratch<T>("grid.norm", pairs * C);
   float* raw = scratch<float>("grid.rawbias", pairs * heads);
   bool headMajor = false, normTransposed = false;
@@ -980,7 +979,8 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     T* lnc = scratch<T>("grid.normChunk", per * C);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      layerNorm2<float, T>(pair + r0 * C, lnc, r, C, pre + ".actNormScale", pre + ".actNormOffset");
+      if (PAIR16) lnPairRows<T>(pair, r0, lnc, r, C, pre + ".actNormScale", pre + ".actNormOffset");   // (a bf16 pair)
+      else layerNorm2<float, T>(pair + r0 * C, lnc, r, C, pre + ".actNormScale", pre + ".actNormOffset");
       linear<T, float>(lnc, raw + r0 * heads, r, C, heads, pre + ".pairBiasProjection");
     }
   }
@@ -1003,14 +1003,19 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     const T* act = streamNorm ? nullptr : norm + r0 * n * C;
     if (streamNorm) {
       T* g = scratch<T>("grid.act", prs * C);
-      const float* src = pair + r0 * n * C;
+      // (a bf16 pair's rows, or the column direction's gathered in the pair's own element - 2 bytes or 4 - and
+      // normed by the kernel that reads that element)
+      const int elem = PAIR16 ? 2 : 4;
+      const float* src = PAIR16 ? nullptr : pair + r0 * n * C;
+      size_t srcRow = r0 * n;
       if (tr) {
         float* g32 = scratch<float>("grid.act32", prs * C);
-        if (C * 4 % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
-        gatherTransposedK<<<blocks(prs * C * 4 / 16), 256, 0, STREAM>>>(pair, g32, n, C, r0, rows, 4);
-        src = g32;
+        if (C * elem % 16) { fprintf(stderr, "grid attention: %d channels are not 16-byte rows\n", C); exit(1); }
+        gatherTransposedK<<<blocks(prs * C * elem / 16), 256, 0, STREAM>>>(pair, g32, n, C, r0, rows, elem);
+        src = g32; srcRow = 0;
       }
-      layerNorm2<float, T>(src, g, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
+      if (PAIR16) lnPairRows<T>(tr ? src : pair, srcRow, g, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
+      else layerNorm2<float, T>(src, g, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
       act = g;
     }
     T* qkvgOut = scratch<T>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
@@ -1067,11 +1072,13 @@ inline bool pairBf16Ok(int n, int C, const std::string& B0) {
   static const bool off = getenv("LOCALFOLD_PAIR_F32") != nullptr;
   if (off) return false;
   // the wider tracks (256, 384, 512): their streaming triangle, the unfused one, the 256-channel and unfused
-  // transitions and the unfused grid attention all take a bf16 pair - not their big-input forms
+  // transitions and the unfused grid attention all take a bf16 pair - their big-input forms too (the blocked
+  // triangle, the grid attention's streamed norm, the single track's chunked pair logits), which held a wide
+  // model's pair in f32 past the line: IntelliFold-2 at 960 tokens 36.6 s there against 34.1 on the ordinary paths
   // (Ampere on: on a Colab T4, which has no f32 -> bf16 conversion instruction, it was level or slower - protenix2's
   // trunk 5654/6045/6589 -> 5725/6102/6602 ms, OpenDDE's 14811/14693 -> 14603/14694 - where the 128-channel track's
   // was 2.7% faster)
-  if (C != 128) return (C == 256 || C == 384 || C == 512) && bf16Tensor() && !shortPair((size_t)n * n, C);
+  if (C != 128) return (C == 256 || C == 384 || C == 512) && bf16Tensor();
   bool narrow = FUSED_TRIANGLE && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
   bool wide = FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && fitsSmem(wideTriFitsSmem(128));
   std::string A = B0 + ".pairAttention1";
