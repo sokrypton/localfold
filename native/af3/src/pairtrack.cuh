@@ -322,6 +322,7 @@ inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction st
 }
 
 #include "tricontract.cuh"
+#include "triingemm.cuh"
 
 // ---------------------------------------------------------------- the triangle multiplication in blocks
 // A RECTANGLE of the padded pair space - rows [i0, i0 + I), columns [j0, j0 + J) - with q = (i - i0) J
@@ -553,6 +554,9 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs * C);
         wideWidth(C, [&](auto width) {
           constexpr int CC = decltype(width)::value, WO = 4;
+          // (the GEMM-shaped input kernel where this device has its shared memory; else triIn256K)
+          if (!triInGemm<CC, __nv_bfloat16>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"),
+                                           triInGemmWeights(pre, Wh(pg), Wh(pre + ".gatingLinear"), C), ab, bb, t2, n, np, cs))
           wideWarps(C, [&](auto warps) {
             constexpr int WI = decltype(warps)::value;
             WITH_PAIR_T(

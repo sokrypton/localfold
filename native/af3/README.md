@@ -627,6 +627,22 @@ lost), its untransposed column residual goes through the f16 product and add, an
 recycle and relative encoding take the bf16 pair. Trunk **535.3 -> 496.4 ms (-7.3%)** at 255 tokens; the gate's
 three Chai-1 rows move in the third decimal.
 
+**A new kernel for the wide triangle's input side** (`triingemm.cuh`, 384 and 512 channels, Ampere on): the LN'd rows
+written once as f16 (`lnPlaneK`), then a tiled GEMM against the [projection | gate | gating linear] weights packed
+into 128-column tiles whose warps hold 32 projection columns and their gates, so the gating and the mask happen in
+registers and a and b leave through a per-warp transpose. cuBLAS's own choice for the bare GEMM is the same shape
+(128 x 128 blocks of 4 warps, 2 an SM, 32-deep k), and three things took this one from slower than triIn256K to
+faster: the fragments double-buffered in registers (the helpers are `asm volatile`, so the order written is the
+order issued), every swizzled address reduced to a per-thread base plus an XOR or add with a constant over a fully
+unrolled k loop (the generic form spent a third of its issue slots on integer arithmetic), and the masks read before
+the main loop rather than after it. Nsight: tensor pipe 68% active against triIn256K's ~50% and cuBLAS's 76% on the
+bare GEMM, 65M instructions against cuBLAS's 83M. **Byte-identical to triIn256K** (the same f16 rounding of the LN'd
+rows, the same k order in every f32 accumulation), on three seeds of OpenDDE and IntelliFold-2. Trunk at 261 tokens:
+OpenDDE **1453 -> 1422 ms**, IntelliFold-2 **2309 -> 2261**; at 256 channels its LN pass costs more than the GEMM
+saves (protenix2 713 -> 719), so it starts at 384. `LOCALFOLD_TRIIN_GEMM=0` keeps triIn256K. A resident-rows form
+(a block's 64 LN'd rows held in shared memory, warps of 32 x 64) was written first and lost: 50 KB of rows a block
+holds the SM at 8 warps, and it ran 4-18% slower.
+
 ## Tried and not taken
 
 - **The 384/512-channel fused transition at 4 warps and 16-column stages** (~50 KB, two blocks an SM, where 8 warps
