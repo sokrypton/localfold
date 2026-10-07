@@ -623,6 +623,10 @@ SM (byte-identical; OpenDDE 1476 -> 1449 ms, IntelliFold-2 2323 -> 2301, level a
 
 ## Tried and not taken
 
+- **The 384/512-channel fused transition at 4 warps and 16-column stages** (~50 KB, two blocks an SM, where 8 warps
+  and 32 columns are ~100 KB and one): byte-identical and **10% slower** a trunk (OpenDDE 1446 -> 1587 ms,
+  IntelliFold-2 2298 -> 2448) - the opposite of the triangle's input kernel, which gained at 4 warps.
+
 - **More blocks an SM for the grid attention's `flashGrid2R`** (2026-10-07: `__launch_bounds__(..., 4)`, from
   162 registers and three blocks to 128 and four - Nsight has it L2-bound at 18.75% occupancy): the shipped form
   (2 warps x 2 rows, 48-key tiles) went **0.671 -> 0.737 ms** at 510 tokens on its 20 bytes of spills; only arms
