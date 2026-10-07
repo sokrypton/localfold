@@ -613,6 +613,11 @@ registers, 60 bytes, the 8-warp input form, ~100 KB) and 512 spills more and sti
 1.836 A), IntelliFold-2's 2.057 against 2.055. On a Colab T4, which takes OpenDDE's in its 4-warp form (512's does
 not fit 64 KB there): trunk 10787/11288/11676 -> 10404/10874/11414 ms. `LOCALFOLD_NO_WIDER=1` keeps the unfused
 triangle. 🔴 THE GATE CANNOT SEE IT: OpenDDE's case is 6MRR, 68 tokens, under the streaming triangle's 80.
+And the 256-channel fused transition (`transitionUpK`) at those widths too, which an older measurement had losing
+(262 tokens, the triangle and transition together: 2160 against 1925 ms, 3360 against 2821 - the kernels have
+changed since): OpenDDE's trunk **1529 -> 1477 ms**, IntelliFold-2's **2455 -> 2327**, on top of the triangle, RMSDs
+within 0.005 A on two seeds each. ~100 KB a block at 8 warps, so a T4 keeps the unfused one; `LOCALFOLD_NO_WIDER=1`
+restores both. OpenDDE's trunk from 1688 to ~1480 ms and IntelliFold-2's from 2649 to ~2330 in all.
 
 ## Tried and not taken
 

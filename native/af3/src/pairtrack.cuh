@@ -251,13 +251,17 @@ inline void linearIntoPairRows(const T* X, float* pair, size_t r0, size_t rows, 
 // the device idle (ESMFold2's measurement), and a T4's 64 KB fits none of them.
 inline bool FUSED_WIDE = true;
 inline int FUSED_WIDE_MIN_TOKENS = 80;
-// ...at 256 channels only: at OpenDDE's 384 and IntelliFold-2's 512 the same kernels fit one block an SM and
-// lose to the unfused path (262 tokens: trunk 2160 against 1925 ms, 3360 against 2821)
+// ...and at OpenDDE's 384 and IntelliFold-2's 512 too, now (LOCALFOLD_NO_WIDER=1: the unfused paths there). They fit
+// one block an SM there and once lost to the unfused path (262 tokens: trunk 2160 against 1925 ms, 3360 against 2821);
+// re-measured 2026-10-07 on the kernels as they stand, each wins on its own - see README, "The wider pair tracks"
+inline const bool FUSED_WIDER = !getenv("LOCALFOLD_NO_WIDER");
 constexpr size_t wideTriInSmem(int C) { return (size_t)128 * (C + 8) * 2; }                       // 8 warps
 constexpr size_t wideTriOutSmem(int C) { return (size_t)C * 65 * 4 + 2 * 64 * 4; }               // 4 warps
-constexpr size_t wideUpSmem(int C) { return transitionUpSmem<256, 8>(); }   // (C is 256)
+constexpr size_t wideUpSmem(int C) {
+  return C == 384 ? transitionUpSmem<384, 8>() : C == 512 ? transitionUpSmem<512, 8>() : transitionUpSmem<256, 8>();
+}
 inline bool wideFits(int C) {
-  return C == 256 && fitsSmem(std::max({wideTriInSmem(C), wideTriOutSmem(C), wideUpSmem(C)}));
+  return (C == 256 || (FUSED_WIDER && (C == 384 || C == 512))) && fitsSmem(std::max({wideTriInSmem(C), wideTriOutSmem(C), wideUpSmem(C)}));
 }
 // ...and the TRIANGLE's two at 128 channels, where the 128-channel fused kernels do not fit (a T4's 64 KB: the
 // output kernel holds the whole 128 x 128 weight, 71 KB, where these stream it 16 columns a stage, ~35 KB)
@@ -532,8 +536,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     bool narrowFused = C == 128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
     // (384 and 512 channels - OpenDDE, IntelliFold-2 - too: their unfused triangle was the LN, a [C, 4C] GEMM, the gate,
     // the centre norm, two GEMMs and a gated add; LOCALFOLD_NO_WIDER=1 keeps it)
-    static const bool wider = !getenv("LOCALFOLD_NO_WIDER");
-    bool wide = (C == 256 || (wider && (C == 384 || C == 512)) || (C == 128 && !narrowFused)) && fitsSmem(wideTriFitsSmem(C));
+    bool wide = (C == 256 || (FUSED_WIDER && (C == 384 || C == 512)) || (C == 128 && !narrowFused)) && fitsSmem(wideTriFitsSmem(C));
     if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wide) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
@@ -653,7 +656,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
     if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
       constexpr int WU = 8, R = 16 * WU;
       // whole waves of transitionUpK inside the same budget (transitionUpChunkRows)
-      size_t rowsPer = transitionUpChunkRows<256, WU>(wideUpSmem(256), std::max<size_t>(R, CHUNK / (2 * I)));
+      size_t rowsPer = transitionUpChunkRows<256, WU>(wideUpSmem(C), std::max<size_t>(R, CHUNK / (2 * I)));
       half* w1t = scratch<half>("tr.w1t", (size_t)2 * C * I);
       tileTransitionUp(Wh(pre + ".transition1"), C, I, w1t);
       wideWidth(C, [&](auto width) {
