@@ -491,6 +491,13 @@ the plain norm it absorbs (88 against 83 us a call - four 4-warp blocks an SM wh
 so it pays only the GEMM's difference: eight rows in flight a warp took it from 102 us, sixteen and eight
 warps no further.
 
+In the column direction the same kernel writes the normed pair TRANSPOSED (row (i, j) at (j, i)), which is the
+layout the gather pass then produced - so the gather and one full read and write of the normed plane are gone
+(2026-10-07). Warm trunks at 261 tokens, byte-identical: OpenDDE 1413.9 -> 1403.9 ms, IntelliFold-2 2241.5/2249.0
+-> 2232.2/2239.4; `LOCALFOLD_GRID_NORM_T=0` is the gathered arm. The rest of item "a fused 384/512 grid input"
+is NOT worth a kernel: the q/k/v/gate GEMM must read the normed plane either way, and cuBLAS already takes it
+at full rate - an LN-prologue GEMM (triingemm.cuh's main loop) would re-implement the same GEMM.
+
 At 384 channels (OpenDDE) the unfused triangle's projection and the unfused transition run every row in one
 pass where the card has the room (`roomFor`, 0.2 and 0.6 GB at 255 tokens), and the triangle's gate reads
 each channel's two halves in one load: `triGateK` 156.6 -> 140.8 ms a fold, the trunk 1600 -> ~1560 ms,

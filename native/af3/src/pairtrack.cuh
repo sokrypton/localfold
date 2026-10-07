@@ -794,7 +794,7 @@ __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
 template <int C, int WARPS, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restrict__ x, const float* __restrict__ scale,
     const float* __restrict__ offset, const half* __restrict__ Wp, half* __restrict__ norm, float* __restrict__ out,
-    size_t rows, int heads) {
+    size_t rows, int heads, int ntr) {
   constexpr int N = 16, R = 16 * WARPS, LDX = C + 8, LDW = N + 8, KS = C / 16, K = C / 32;
   extern __shared__ __align__(16) unsigned char smem[];
   half* Xs = (half*)smem; half* Ws = Xs + R * LDX;
@@ -823,7 +823,7 @@ __global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restri
 #pragma unroll
     for (int b = 0; b < B; ++b) {
       int r = warp * 16 + i0 + b;
-      size_t row = row0 + r;
+      size_t row = row0 + r, wrow = ntr ? (row % ntr) * ntr + row / ntr : row;   // (ntr: the norm written transposed)
       float s = 0, ss = 0;
 #pragma unroll
       for (int k = 0; k < K; ++k) { s += v[b][k]; ss += v[b][k] * v[b][k]; }
@@ -834,7 +834,7 @@ __global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restri
         half h = __float2half((v[b][k] - mean) * inv * sc[k] + of[k]);
         if (row >= rows) h = __float2half(0.f);
         Xs[r * LDX + lane + 32 * k] = h;
-        if (row < rows) norm[row * C + lane + 32 * k] = h;
+        if (row < rows) norm[wrow * C + lane + 32 * k] = h;
       }
     }
   }
@@ -858,9 +858,11 @@ __global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restri
   }
 }
 template <int C> constexpr size_t lnNormHeadsSmem(int warps) { return (size_t)16 * warps * (C + 8) * 2 + (size_t)C * 24 * 2; }
-// norm + head-major raw bias for C 256/384/512 (false: not this width, or the device's shared memory)
+// norm + head-major raw bias for C 256/384/512 (false: not this width, or the device's shared memory); ntr > 0: the
+// norm written transposed over an ntr x ntr grid (the column direction's rows, which a gather pass otherwise makes)
 inline bool LN_NORM_HEADS = true;
-inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, int C, int heads, const std::string& pre) {
+inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, int C, int heads, const std::string& pre,
+                        int ntr = 0) {
   if (!LN_NORM_HEADS || heads > 16) return false;
   auto run = [&](auto width) -> bool {
     constexpr int CC = decltype(width)::value, WARPS = 4, R = 16 * WARPS;   // (8 warps: no faster)
@@ -871,7 +873,7 @@ inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, 
       static bool attr = false;
       if (!attr) { smemAttr((lnNormHeadsK<CC, WARPS, PT>), (int)smem); attr = true; }
       lnNormHeadsK<CC, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-        pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wb), norm, raw, rows, heads));
+        pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wb), norm, raw, rows, heads, ntr));
     return true;
   };
   switch (C) {
@@ -961,9 +963,14 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   if (streamNorm) needF32Pair("the unfused grid attention's streamed norm");
   T* norm = streamNorm ? nullptr : scratch<T>("grid.norm", pairs * C);
   float* raw = scratch<float>("grid.rawbias", pairs * heads);
-  bool headMajor = false;
+  bool headMajor = false, normTransposed = false;
+  static const bool noNormT = getenv("LOCALFOLD_GRID_NORM_T") && !atoi(getenv("LOCALFOLD_GRID_NORM_T"));
   if (!streamNorm) {
-    if constexpr (std::is_same_v<T, half>) headMajor = lnNormHeads(pair, norm, raw, pairs, C, heads, pre);
+    if constexpr (std::is_same_v<T, half>) {
+      normTransposed = tr && !noNormT;
+      headMajor = lnNormHeads(pair, norm, raw, pairs, C, heads, pre, normTransposed ? n : 0);
+      normTransposed = normTransposed && headMajor;
+    }
     if (!headMajor) {
       lnPairRows<T>(pair, 0, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
       linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
@@ -1007,7 +1014,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       act = g;
     }
     T* qkvgOut = scratch<T>("grid.qkvg", (prs + 128) * 4 * Wd);   // padding: the last query block
-    if (tr && !streamNorm) {
+    if (tr && !streamNorm && !normTransposed) {
       // (read transposed in place by a strided-batched GEMM instead: 41.6 against 35 ms for the gather and
       // one GEMM, Chai-1 at 255 tokens - not taken)
       T* g = scratch<T>("grid.act", prs * C);
