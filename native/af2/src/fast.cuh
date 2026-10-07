@@ -15,7 +15,7 @@ template <class T> T* wpool(size_t n) {
   size_t bytes = (n * sizeof(T) + 255) / 256 * 256;
   if (used + bytes > have) {
     have = std::max<size_t>(bytes, (size_t)64 << 20);
-    CK(cudaMalloc(&chunk, have)); used = 0;
+    CK(devMalloc(&chunk, have)); used = 0;
   }
   T* p = (T*)(chunk + used); used += bytes; return p;
 }

@@ -103,7 +103,7 @@ static int foldInput(const Opts& o, bool warm) {
   auto mem = [&](const char* at) {
     if (!warm && getenv("LOCALFOLD_MEM")) { memReport(at); return; }   // (common.cuh's, with the largest holders)
     if (warm || !getenv("EF2_MEM")) return;
-    CK(cudaDeviceSynchronize()); size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
+    CK(cudaDeviceSynchronize()); size_t fr, tot; deviceMemInfo(&fr, &tot);
     size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
     printf("  memory %-22s %6.2f GB in use (scratch %.2f)\n", at, (tot - fr) / 1e9, held / 1e9);
   };

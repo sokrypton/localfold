@@ -128,7 +128,7 @@ inline const float* qkvBias(int layer, int C) {
   static std::map<int, float*> made;
   float*& b = made[layer];
   if (!b) {
-    CK(cudaMalloc(&b, 3 * (size_t)C * 4));
+    CK(devMalloc(&b, 3 * (size_t)C * 4));
     for (int m = 0; m < 3; ++m)
       CK(cudaMemcpyAsync(b + m * C, Wf(blockName(layer, std::string(1, "qkv"[m]), "bias")), (size_t)C * 4,
                          cudaMemcpyDeviceToDevice, STREAM));

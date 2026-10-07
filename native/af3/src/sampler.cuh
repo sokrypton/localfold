@@ -163,8 +163,8 @@ inline std::vector<float> sampleChai(int steps, const std::vector<uint64_t>& see
     at.push_back((float)tHats[s]); at.push_back((float)levels[s + 1]);
   }
   if (onLevels) onLevels(at);
-  float* dX; CK(cudaMalloc(&dX, all3 * 4));
-  uint64_t* dSeeds; CK(cudaMalloc(&dSeeds, ns * 8));
+  float* dX; CK(devMalloc(&dX, all3 * 4));
+  uint64_t* dSeeds; CK(devMalloc(&dSeeds, ns * 8));
   CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
   initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
   float* dRot = upload(rot.data(), rot.size()); float* dMask = upload(mask.data(), atoms);
@@ -215,8 +215,8 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
     for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, 0.0004, 10, 7);
     std::vector<float> at(levels.begin(), levels.begin() + steps);
     if (onLevels) onLevels(at);
-    float* dX; CK(cudaMalloc(&dX, all3 * 4));
-    uint64_t* dSeeds; CK(cudaMalloc(&dSeeds, ns * 8));
+    float* dX; CK(devMalloc(&dX, all3 * 4));
+    uint64_t* dSeeds; CK(devMalloc(&dSeeds, ns * 8));
     CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
     initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
     float* dLevels = upload(at.data(), steps);
@@ -252,8 +252,8 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
       for (int d = 0; d < 3; ++d) r[9 + d] = (float)normal();
     }
   }
-  float* dX; CK(cudaMalloc(&dX, all3 * 4));
-  uint64_t* dSeeds; CK(cudaMalloc(&dSeeds, ns * 8));
+  float* dX; CK(devMalloc(&dX, all3 * 4));
+  uint64_t* dSeeds; CK(devMalloc(&dSeeds, ns * 8));
   CK(cudaMemcpyAsync(dSeeds, seeds.data(), ns * 8, cudaMemcpyHostToDevice, STREAM));
   initialNoiseK<<<blocks(all3), 256, 0, STREAM>>>(dX, n3, dSeeds, (float)levels[0], all3);
   float* dRot = upload(rot.data(), rot.size()); float* dMask = upload(mask.data(), atoms);

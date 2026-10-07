@@ -179,7 +179,7 @@ struct Trunk {
 // 6000 tokens on 40 GB, and 3200 but not 3500 on a simulated T4 - as measured. Scratch held counts as free.
 inline bool foldFits(int n, int C) {
   if (getenv("LOCALFOLD_NO_FOLD_FITS")) return true;     // (to find a ceiling by experiment)
-  size_t f, t; CK(cudaMemGetInfo(&f, &t));
+  size_t f, t; deviceMemInfo(&f, &t);
   for (auto& [name, slot] : SCRATCH) f += slot.second;
   double perPair = C * 4 * 1.8;
   size_t need = (size_t)((double)n * n * perPair) + t / 20;

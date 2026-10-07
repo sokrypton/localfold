@@ -41,6 +41,42 @@
 using half = __half;
 inline cublasHandle_t H;
 inline cudaStream_t STREAM = cudaStreamPerThread;
+// The named scratch comes from one stream-ordered pool that keeps what it is given back (release threshold: never):
+// a large input gives each stage's scratch back for the next, and a fresh cudaMalloc of a big buffer is not cheap
+// here - 0.9 ms at 1 GB, 37 at 2, 145 at 4 - while the pool hands the same pages to the next stage's buffers, of
+// any shape, in 0.01 ms (it reserves the most a stage asked for, not the sum). What it holds idle is free memory to
+// every question asked of the card (deviceMemInfo), and a plain allocation refused while it holds some trims it
+// and asks again (devMalloc).
+inline cudaMemPool_t scratchPool() {
+  static cudaMemPool_t pool = [] {
+    cudaMemPoolProps props = {};
+    props.allocType = cudaMemAllocationTypePinned;
+    props.location.type = cudaMemLocationTypeDevice;
+    CK(cudaGetDevice(&props.location.id));
+    cudaMemPool_t p; CK(cudaMemPoolCreate(&p, &props));
+    uint64_t never = ~0ull; CK(cudaMemPoolSetAttribute(p, cudaMemPoolAttrReleaseThreshold, &never));
+    return p;
+  }();
+  return pool;
+}
+inline size_t poolIdle() {
+  // (a pool may not be asked while a stream captures - a recycle pass asks roomFor as it is captured - so there the
+  // last answer, which the eager pass it repeats was given)
+  static size_t last = 0;
+  cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+  if (capturing != cudaStreamCaptureStatusNone) return last;
+  uint64_t reserved = 0, used = 0;
+  CK(cudaMemPoolGetAttribute(scratchPool(), cudaMemPoolAttrReservedMemCurrent, &reserved));
+  CK(cudaMemPoolGetAttribute(scratchPool(), cudaMemPoolAttrUsedMemCurrent, &used));
+  return last = reserved > used ? reserved - used : 0;
+}
+inline void deviceMemInfo(size_t* f, size_t* t) { CK(cudaMemGetInfo(f, t)); *f += poolIdle(); }
+inline void trimPool() { CK(cudaDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); }
+template <class P> cudaError_t devMalloc(P** p, size_t bytes) {
+  cudaError_t e = cudaMalloc((void**)p, bytes);
+  if (e == cudaErrorMemoryAllocation && poolIdle()) { cudaGetLastError(); trimPool(); e = cudaMalloc((void**)p, bytes); }
+  return e;
+}
 
 // ---------------------------------------------------------------- the exported model
 struct Entry { char kind; size_t offset, length; double value; int seg; size_t devOffset = 0; int rec = -1; };
@@ -663,16 +699,16 @@ struct Model {
     unsigned char* raw[2]; BDecode* dt[2]; cudaEvent_t done[2];
     size_t maxRecs = s.recs.size();
     for (int k = 0; k < 2; ++k)
-      if (cudaMalloc(&raw[k], most) != cudaSuccess ||
-          cudaMalloc(&dt[k], maxRecs * sizeof(BDecode)) != cudaSuccess || cudaEventCreateWithFlags(&done[k], cudaEventDisableTiming) != cudaSuccess)
+      if (devMalloc(&raw[k], most) != cudaSuccess ||
+          devMalloc(&dt[k], maxRecs * sizeof(BDecode)) != cudaSuccess || cudaEventCreateWithFlags(&done[k], cudaEventDisableTiming) != cudaSuccess)
         return false;
     size_t piece = 0;                                        // pieces issued, over every shard
     std::vector<std::vector<BDecode>> tables(2), scratchTables(2);
-    if (s.residentBytes && !s.resident && cudaMalloc(&s.resident, s.residentBytes) != cudaSuccess) return false;
+    if (s.residentBytes && !s.resident && devMalloc(&s.resident, s.residentBytes) != cudaSuccess) return false;
     float* scratch = nullptr;
-    if (s.scratchElems && cudaMalloc(&scratch, s.scratchElems * 4) != cudaSuccess) return false;
+    if (s.scratchElems && devMalloc(&scratch, s.scratchElems * 4) != cudaSuccess) return false;
     BDecode* sdt[2] = {nullptr, nullptr};
-    for (int k = 0; k < 2 && !s.srcRecs.empty(); ++k) if (cudaMalloc(&sdt[k], s.srcRecs.size() * sizeof(BDecode)) != cudaSuccess) return false;
+    for (int k = 0; k < 2 && !s.srcRecs.empty(); ++k) if (devMalloc(&sdt[k], s.srcRecs.size() * sizeof(BDecode)) != cudaSuccess) return false;
     for (size_t fi = 0; fi < s.files.size(); ++fi) {
       int k = (int)(fi & 1);
       if (fi >= 2 && cudaEventSynchronize(done[k]) != cudaSuccess) return false;     // buffer k free again
@@ -728,7 +764,7 @@ struct Model {
         }
         pd.push_back(d);
       }
-      if (cudaMalloc(&pt, pd.size() * sizeof(GPartD)) != cudaSuccess ||
+      if (devMalloc(&pt, pd.size() * sizeof(GPartD)) != cudaSuccess ||
           cudaMemcpyAsync(pt, pd.data(), pd.size() * sizeof(GPartD), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
       for (size_t t0 = 0; t0 < pd.size(); t0 += 65535)
         bundleGatherK<<<dim3(64, (unsigned)std::min<size_t>(65535, pd.size() - t0)), 256, 0, st>>>(scratch, pt + t0, s.device);
@@ -838,7 +874,7 @@ struct Model {
   void uploadAsync(int seg) {
     Segment& s = segs[seg];
     if (s.device || pending.count(seg)) return;
-    if (cudaMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess) {
+    if (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess) {
       fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
     }
     pending[seg] = std::thread([&s] {
@@ -861,7 +897,7 @@ struct Model {
       at = (at + 3) / 4 * 4;
       moves.push_back({e->devOffset, at, e->length}); e->devOffset = at; at += e->length;
     }
-    float* fresh; CK(cudaMalloc(&fresh, std::max<size_t>(at, 1) * 4));
+    float* fresh; CK(devMalloc(&fresh, std::max<size_t>(at, 1) * 4));
     for (auto& m : moves) CK(cudaMemcpyAsync(fresh + m[1], s.device + m[0], m[2] * 4, cudaMemcpyDeviceToDevice, STREAM));
     CK(cudaStreamSynchronize(STREAM));
     CK(cudaFree(s.device));
@@ -937,7 +973,7 @@ struct Model {
     { std::lock_guard<std::mutex> g(hostMu); touched.insert(k); }
     Segment& s = segs[e.seg];
     if (!s.device) {
-      if (cudaMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s)) {
+      if (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s)) {
         fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
       }
     }
@@ -957,7 +993,7 @@ struct Model {
   void unparkResident() {
     for (auto& s : segs) {
       if (!s.residentBytes || s.resident) continue;
-      CK(cudaMalloc(&s.resident, s.residentBytes));
+      CK(devMalloc(&s.resident, s.residentBytes));
       size_t most = 0;
       for (const auto& r : s.residentRecs) most = std::max(most, r.b.elements + residentScaleBytes(r.b));
       unsigned char* pin; CK(cudaHostAlloc(&pin, most, cudaHostAllocDefault));
@@ -986,7 +1022,7 @@ struct Model {
     if (e.kind != 'q') { fprintf(stderr, "%s is not resident int8\n", k.c_str()); exit(1); }
     { std::lock_guard<std::mutex> g(hostMu); touched.insert(k); }
     Segment& s = segs[e.seg];
-    if (!s.device && (cudaMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s))) {
+    if (!s.device && (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s))) {
       fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
     }
     const auto& r = s.residentRecs[e.rec];
@@ -1042,7 +1078,7 @@ inline void unreadWeights() {
 inline void scratchReportOOM(const char* what, size_t bytes);
 template <class T> T* dallocT(size_t n) {
   T* p;
-  if (cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)) != cudaSuccess) { scratchReportOOM("a direct allocation", n * sizeof(T)); exit(1); }
+  if (devMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)) != cudaSuccess) { scratchReportOOM("a direct allocation", n * sizeof(T)); exit(1); }
   return p;
 }
 inline float* dalloc(size_t n) { return dallocT<float>(n); }
@@ -1055,7 +1091,7 @@ inline std::map<std::string, std::pair<void*, size_t>> SCRATCH;
 // large input, so each phase has the whole card (every phase asks for its buffers again).
 inline void releaseScratch() {
   CK(cudaDeviceSynchronize());
-  for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFree(slot.first)); slot = {nullptr, 0}; }
+  for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0}; }
 }
 // A large input's pair is over 128 MB (512 tokens at 128 channels): there each phase gets the card
 // to itself, and a stage's own scratch is given back when the stage is done.
@@ -1077,7 +1113,7 @@ inline bool shortPair(size_t pairs, int C) {
   if (BIG_FORCED) return true;
   if (SHORT_PAIR_TIMES > 0) {
     static const size_t room = [] {
-      size_t f, t; CK(cudaMemGetInfo(&f, &t));
+      size_t f, t; deviceMemInfo(&f, &t);
       for (auto& [name, slot] : SCRATCH) f += slot.second;
       size_t r = f > t / 20 ? f - t / 20 : 0;
       if (getenv("LOCALFOLD_MEM")) fprintf(stderr, "  memory room for the ordinary paths %.2f GB (a pair up to %.2f GB)\n",
@@ -1101,8 +1137,8 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
       if (len && p[len - 1] == '.' ? !name.compare(0, len, p) : name == p) match = true;
     }
     if (!match) continue;
-    if (!synced) { CK(cudaStreamSynchronize(STREAM)); synced = true; }
-    CK(cudaFree(slot.first)); slot = {nullptr, 0};
+    if (!synced) { CK(cudaDeviceSynchronize()); synced = true; }
+    CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0};
   }
 }
 // Whether `bytes` more would fit on the card now with an eighth of it to spare - for the memory levers that
@@ -1112,14 +1148,14 @@ inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) 
   if (BIG_FORCED) return false;
   for (auto& [name, slot] : SCRATCH)
     for (const char* p : held) if (name == p) bytes -= std::min(bytes, slot.second);
-  size_t f, t; CK(cudaMemGetInfo(&f, &t));
+  size_t f, t; deviceMemInfo(&f, &t);
   return f > bytes + t / 8;
 }
 // what holds the device when an allocation is refused: the largest scratch buffers, and the free memory
 inline void scratchReportOOM(const char* what, size_t bytes) {
   cudaGetLastError();
   size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
-  size_t freeB, totalB; cudaMemGetInfo(&freeB, &totalB);
+  size_t freeB, totalB; deviceMemInfo(&freeB, &totalB);
   fprintf(stderr, "out of device memory: %s wants %.2f GB; scratch holds %.2f GB, %.2f of %.2f GB free\n",
           what, bytes / 1e9, held / 1e9, freeB / 1e9, totalB / 1e9);
   std::vector<std::pair<size_t, std::string>> big;
@@ -1153,10 +1189,20 @@ inline void unparkFromHost(float*& dev, size_t bytes) {
 template <class T> T* scratch(const std::string& name, size_t n) {
   auto& [p, have] = SCRATCH[name];
   if (have < n * sizeof(T)) {
-    if (p) CK(cudaFree(p));
-    if (cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)) != cudaSuccess) {
+    // (from the pool, stream-ordered - and freed only after the device is idle, as cudaFree was: the frame tap's
+    // copies read scratch on a stream of their own. Never inside a capture, where a pool allocation would become
+    // the graph's own; a recycle pass is captured once every buffer is sized)
+    size_t bytes = std::max<size_t>(n, 1) * sizeof(T);
+    cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+    if (p) { CK(cudaDeviceSynchronize()); CK(cudaFreeAsync(p, STREAM)); p = nullptr; }
+    cudaError_t e = capturing != cudaStreamCaptureStatusNone ? cudaMalloc(&p, bytes)
+                                                             : cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
+    if (e != cudaSuccess && capturing == cudaStreamCaptureStatusNone) {     // (fragmented idle pages: trimmed, asked again)
+      cudaGetLastError(); trimPool(); e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
+    }
+    if (e != cudaSuccess) {
       size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
-      size_t freeB, totalB; cudaMemGetInfo(&freeB, &totalB);
+      size_t freeB, totalB; deviceMemInfo(&freeB, &totalB);
       fprintf(stderr, "out of device memory: scratch %s wants %.2f GB; scratch holds %.2f GB, %.2f of %.2f GB free\n",
               name.c_str(), n * sizeof(T) / 1e9, held / 1e9, freeB / 1e9, totalB / 1e9);
       std::vector<std::pair<size_t, std::string>> big;
@@ -1219,7 +1265,7 @@ inline void memReport(const char* at) {
   cudaStreamCaptureStatus capturing;                 // (a recycle pass being captured: no sync there)
   CK(cudaStreamIsCapturing(STREAM, &capturing));
   if (capturing != cudaStreamCaptureStatusNone) return;
-  CK(cudaDeviceSynchronize()); size_t fr, tot; CK(cudaMemGetInfo(&fr, &tot));
+  CK(cudaDeviceSynchronize()); size_t fr, tot; deviceMemInfo(&fr, &tot);     // (the pool's idle pages not "in use")
   size_t held = 0; std::vector<std::pair<size_t, std::string>> big;
   for (auto& [k, v] : SCRATCH) { held += v.second; if (v.second) big.push_back({v.second, k}); }
   std::sort(big.rbegin(), big.rend());
@@ -1348,8 +1394,8 @@ inline const half* segmentHalf(const std::string& k) {
       from.push_back(e.devOffset); to.push_back(total); len.push_back(e.length); names.push_back(name);
       total += (e.length + 7) / 8 * 8;
     }
-    CK(cudaMalloc(&mirror, std::max<size_t>(total, 1) * 2));
-    size_t* table; CK(cudaMalloc(&table, from.size() * 3 * sizeof(size_t)));
+    CK(devMalloc(&mirror, std::max<size_t>(total, 1) * 2));
+    size_t* table; CK(devMalloc(&table, from.size() * 3 * sizeof(size_t)));
     CK(cudaMemcpy(table, from.data(), from.size() * sizeof(size_t), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(table + from.size(), to.data(), to.size() * sizeof(size_t), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(table + 2 * from.size(), len.data(), len.size() * sizeof(size_t), cudaMemcpyHostToDevice));
@@ -1600,10 +1646,10 @@ struct AsyncTap {
     drain();
     for (auto& sl : slots) if (sl.cap < bytes) {
       CK(cudaFree(sl.dev)); CK(cudaFreeHost(sl.host));
-      CK(cudaMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
+      CK(devMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
     }
     while ((int)slots.size() < count) {
-      Slot sl; CK(cudaMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
+      Slot sl; CK(devMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
       CK(cudaEventCreateWithFlags(&sl.ready, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&sl.copied, cudaEventDisableTiming));
       slots.push_back(sl);
     }

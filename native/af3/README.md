@@ -945,10 +945,22 @@ One fold, 25 steps, single sequence, the two rules (2026-10-07):
 kernels took 8.09 s of GPU time a pass against the ordinary mode's 8.25 - the GPU sat idle 45% of the pass. Each block
 gave the triangle's whole-form planes back and the grid attention allocated its own afresh, a synchronous `cudaFree`
 and a `cudaMalloc` of a 4.1 GB `grid.qkvg` - and a `cudaMalloc` past 2 GB is not cheap here (1 GB 0.9 ms, 2 GB 37 ms,
-4 GB 145 ms). `pairUpdatesKeep` now keeps the three updates' scratch whenever the card holds it at once (9x the f32
-pair, the scratch already held counted as free): AlphaFold 3 at 2000 tokens **55.2 -> 31.5 s**, byte-identical, peak
-11.9 -> 19.0 GB; IntelliFold-2 at 960 **40.4 -> 36.9 s**, byte-identical. `LOCALFOLD_RELEASE_BETWEEN=1` is the
-always-release arm.
+4 GB 145 ms). **The named scratch now comes from one stream-ordered pool that keeps what it is given back**
+(`scratchPool`, common.cuh): the release hands the triangle's pages to the grid attention's buffers in 0.01 ms, and
+the pool reserves the most any stage asks for, not the sum. Its idle pages count as free to every question asked of
+the card (`deviceMemInfo`), and a plain allocation refused while it holds some trims it and asks again
+(`devMalloc`). Byte-identical:
+
+| | before | the pool | peak |
+|---|---:|---:|---:|
+| AlphaFold 3, 2000 tokens | 55.2 s | **31.2 s** (the ordinary paths: 31.7, at 32.7 GB) | 11.8 GB |
+| IntelliFold-2, 960 | 40.4 s | **36.4 s** | 11.8 GB |
+| AlphaFold 3, 1100 on a simulated T4 (big-input paths) | 17.3 s | **8.6 s** (the ordinary paths: 9.0) | |
+
+Keeping the three updates' scratch instead (no release when the card holds it) was the first fix and measured the same
+31.3 s at 19.0 GB, so the release stays and the pool makes it free. 🔴 **A POOL MAY NOT BE ASKED ITS SIZE WHILE A
+STREAM CAPTURES** ("operation not permitted when stream is capturing" out of `roomFor` inside a recycle pass's
+capture), so there `poolIdle` gives the last answer, which the eager pass the capture repeats was given.
 
 Most of it is not the bf16 pair: OpenDDE at 765 with `LOCALFOLD_PAIR_F32=1` on the ordinary paths is 13.0 s.
 🔴 **AND THE FIRST RUN PAST THE OLD LINE RAN OUT OF MEMORY, IN A STAGE THE PAIR DOES NOT SIZE**: OpenDDE's
