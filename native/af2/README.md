@@ -256,6 +256,12 @@ mean's product in f16 to halve its add (14 ms faster at 494 residues, and 6MRR f
 contraction (`triContractBf16`, the 128x128 tile from np 200 to 352): 5CAJ 1658 -> 1653 ms, a 494-residue fold
 1342 -> 1360 (outside the window the plan's cuBLASLt pick, with no workspace, is slower than cuBLAS's own).
 
+...and the post-fold reductions on the device (`paeTmPairsK`, `contactPairsK`): the expected PAE, each pair's TM term
+and the distogram's P(< 8 A) were four host passes over pairs x 64 logits with an exp a bin, behind two 17 MB
+downloads - 218 ms between a 261-residue fold's last pass and its result, now 69 (a warm templated 5CAJ job through
+the worker 393 -> 237 ms). Same double accumulation in the same bin order; every PAE and contact value, pTM and ipTM
+identical at the precision the files carry (5CAJ, 1BRS), the gates unchanged.
+
 Measured and left (2026-10-03, A100, 262 residues, 512 alignment rows): the MSA column attention's
 strided flash kernel at 8 warps rather than 4 is slower (235 against 224 ms of strided flash a fold), and
 its transposed-copy form (the masked path's) runs the attention at the same speed and adds 110 ms of

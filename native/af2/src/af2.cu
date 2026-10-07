@@ -55,6 +55,46 @@ static float predictedTm(const std::vector<float>& logits, int L, int bins, cons
   return best;
 }
 
+// The same three reductions on the device, one thread a pair (each was a host pass over pairs x 64 logits with an exp
+// per bin - with the logits' two 17 MB downloads, most of the 218 ms between a 261-residue fold's last pass and its
+// result): the PAE expectation and the pair's TM term (predictedTm's, before its row means), and the distogram's
+// P(< 8 A). Double accumulation in the host's bin order; the exp is the device's.
+__global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* pae, double* tm) {
+  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= pairs) return;
+  const float* l = logits + r * 64;
+  float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = fmaxf(mx, l[b]);
+  double s = 0, e = 0, t = 0;
+  for (int b = 0; b < 64; ++b) {
+    float c = b < 63 ? b * 0.5f + 0.25f : 62 * 0.5f + 0.25f + 0.5f;
+    double p = expf(l[b] - mx);
+    s += p; e += p * c; t += p / (1 + (c / d0) * (c / d0));
+  }
+  pae[r] = (float)(e / s); tm[r] = t / s;
+}
+__global__ void contactPairsK(const float* logits, size_t pairs, float* out) {
+  size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= pairs) return;
+  const float* l = logits + r * 64;
+  float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = fmaxf(mx, l[b]);
+  double s = 0, near = 0;
+  for (int b = 0; b < 64; ++b) { double e = expf(l[b] - mx); s += e; if (b <= 18) near += e; }
+  out[r] = (float)(near / s);
+}
+// predictedTm from the per-pair terms: the best row's mean (over the other chains' columns for the interface)
+static float tmFromTerms(const std::vector<double>& tm, int L, const std::vector<int>& asym, bool interface) {
+  float best = 0;
+  for (int i = 0; i < L; ++i) {
+    double sum = 0, count = 0;
+    for (int j = 0; j < L; ++j) {
+      if (interface && asym[i] == asym[j]) continue;
+      sum += tm[(size_t)i * L + j]; count += 1;
+    }
+    if (count > 0) best = std::max(best, (float)(sum / (count + 1e-8)));
+  }
+  return best;
+}
+
 // a synthetic input of the given shapes (what export_input.mjs writes, its values arbitrary), in
 // /dev/shm, for --warm: folding it loads what the real input's fold will need while that is exported
 static std::string writeWarmInput(int L, int N, int E, int T) {
@@ -99,14 +139,13 @@ static std::string writeWarmInput(int L, int N, int E, int T) {
 static inline std::vector<float> contactsChunked(const float* pair, int L);   // (below)
 void writeConfidences(const std::string& pdb, const float* pair, int L, const float* mask37, const std::vector<int>& aatype,
                              const std::vector<int>& asym, const std::vector<int>& ri, int firstAsym,
-                             const std::vector<float>& plddt, const std::vector<float>& paeLogits, float ptm, float iptm,
+                             const std::vector<float>& plddt, const std::vector<float>& pae, float ptm, float iptm,
                              double mean) {
   std::string stem = pdb.size() > 4 && pdb.substr(pdb.size() - 4) == ".pdb" ? pdb.substr(0, pdb.size() - 4) : pdb;
   size_t pairs = (size_t)L * L;
   std::vector<float> centres(64);
   for (int b = 0; b < 63; ++b) centres[b] = b * (31.f / 62) + 31.f / 124;
   centres[63] = centres[62] + 31.f / 62;
-  std::vector<float> pae = expectation(paeLogits, pairs, 64, centres);
   std::vector<float> contact;
   if (M.has("w/distogram_head/half_logits/weights") && AF2_TIGHT) {
     contact = contactsChunked(pair, L);
@@ -114,15 +153,9 @@ void writeConfidences(const std::string& pdb, const float* pair, int L, const fl
     float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
     linearB(pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
     symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
-    std::vector<float> lg = download(dg, pairs * 64);
-    contact.resize(pairs);
-    for (size_t r = 0; r < pairs; ++r) {         // bins 0..18 lie below 8 A (breaks 2.3125 + 0.3125 b)
-      const float* l = lg.data() + r * 64;
-      float mx = -INFINITY; for (int b = 0; b < 64; ++b) mx = std::max(mx, l[b]);
-      double s = 0, near = 0;
-      for (int b = 0; b < 64; ++b) { double e = std::exp(l[b] - mx); s += e; if (b <= 18) near += e; }
-      contact[r] = (float)(near / s);
-    }
+    float* cp = scratch<float>("head.contactP", pairs);      // (bins 0..18 lie below 8 A: breaks 2.3125 + 0.3125 b)
+    contactPairsK<<<blocks(pairs), 256, 0, STREAM>>>(dg, pairs, cp);
+    contact = download(cp, pairs);
   }
   auto chainId = [&](int i) { return (char)('A' + std::min(asym[i] - firstAsym, 25)); };
   auto matrix = [&](FILE* f, const std::vector<float>& m) {
@@ -537,17 +570,31 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   std::vector<float> pl = download(plddtLogits, (size_t)L * 50);
   std::vector<float> centres(50); for (int b = 0; b < 50; ++b) centres[b] = (b + 0.5f) * 2.f;
   std::vector<float> plddt = expectation(pl, L, 50, centres);
-  std::vector<float> pae;
-  if (AF2_TIGHT) {                 // (the last pass's pair, its logits a chunk at a time to the host)
-    pae.resize(pairs * 64);
-    paeChunked(t.pair, L, [&](const float* lg, size_t r0, size_t r) {
-      CK(cudaMemcpy(pae.data() + r0 * 64, lg, r * 64 * 4, cudaMemcpyDeviceToHost));
-    });
-  } else pae = download(paeLogits, pairs * 64);
   std::vector<int> asym(L); CK(cudaMemcpy(asym.data(), Idev("asym_id"), L * 4, cudaMemcpyDeviceToHost));
-  float ptm = predictedTm(pae, L, 64, &asym, false);
   bool chains = false; for (int i = 1; i < L; ++i) chains |= asym[i] != asym[0];
-  float iptm = chains ? predictedTm(pae, L, 64, &asym, true) : NAN;
+  std::vector<float> pae;          // the expected PAE a pair
+  float ptm, iptm;
+  if (AF2_TIGHT) {                 // (the last pass's pair, its logits a chunk at a time to the host)
+    std::vector<float> lg(pairs * 64);
+    paeChunked(t.pair, L, [&](const float* chunk, size_t r0, size_t r) {
+      CK(cudaMemcpy(lg.data() + r0 * 64, chunk, r * 64 * 4, cudaMemcpyDeviceToHost));
+    });
+    ptm = predictedTm(lg, L, 64, &asym, false);
+    iptm = chains ? predictedTm(lg, L, 64, &asym, true) : NAN;
+    std::vector<float> centres(64);
+    for (int b = 0; b < 63; ++b) centres[b] = b * (31.f / 62) + 31.f / 124;
+    centres[63] = centres[62] + 31.f / 62;
+    pae = expectation(lg, pairs, 64, centres);
+  } else {
+    float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
+    float* pe = scratch<float>("head.paeE", pairs); double* tt = scratch<double>("head.tmT", pairs);
+    paeTmPairsK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
+    pae = download(pe, pairs);
+    std::vector<double> tm(pairs);
+    CK(cudaMemcpy(tm.data(), tt, pairs * 8, cudaMemcpyDeviceToHost));
+    ptm = tmFromTerms(tm, L, asym, false);
+    iptm = chains ? tmFromTerms(tm, L, asym, true) : NAN;
+  }
   double mean = 0; for (float v : plddt) mean += v; mean /= L;
   // the PDB
   std::vector<float> pos = download(so.pos37, (size_t)L * 37 * 3);
