@@ -310,6 +310,15 @@ node's module loading being most of an export) and hands it to the server as a j
 `--samples`, `--steps`, `--recycles`, `--seed`) - 6MRR 0.53 s a command, against 1.00 s starting
 both each time. The outputs are byte-identical either way.
 
+What a warm job costs around the fold, measured through tools/native_worker.py (AF3, 5CAJ, its crystal as the
+template, A100): 732 ms job to result, of which the trunk and the sampler were ~410. Two host costs grew as the
+square of the length and are gone, byte-identical: the template's distogram crosses as each pair's one-hot BIN
+(`template.k.distogramBin`) instead of 39 floats a pair - the export 1.15 -> 0.76 s and 181 -> 30 MiB at 1,020
+tokens, its conversion, copy and write having been 0.63 s where the geometry is 0.16 - and the worker passes the
+PAE and contact matrices through as the binary wrote them (`flat_matrix`, two-decimal text spliced into the
+result line) instead of parsing, rounding and re-serialising 136,000 Python floats (95 of the 167 ms between the
+last sampler step and the result). Now 580 ms.
+
 ## The gate
 
 `python3 native/af3/gate.py` folds 6MRR from its sequence through all seven models, plus 5CAJ and

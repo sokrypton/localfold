@@ -508,7 +508,19 @@ if (dialect.chiralCentres === true) {
         width, dialect, real ? pass.mask : undefined, (pass.emptyAatype ?? 0) !== 0));
     } else if (real) {
       const g = templateGeometry(pass.slot, pass.mask, batch.tokens, undefined, { chai: dialect.chaiTemplates === true });
-      add(`template.${k}.distogram`, Float32Array.from(g.distogram));
+      // the distogram as each pair's bin (-1 for none): it is one-hot, and as 4-byte floats it was 156 bytes a pair -
+      // 160 MB at 1,020 tokens, whose conversion, copy and write were 0.63 s of the export where the geometry is 0.16
+      const bins = g.distogram.length / (batch.tokens * batch.tokens), bin = new Int32Array(batch.tokens * batch.tokens).fill(-1);
+      for (let p = 0; p < bin.length; p += 1) {
+        for (let b = 0; b < bins; b += 1) {
+          const v = g.distogram[p * bins + b];
+          if (v === 0) continue;
+          if (v !== 1 || bin[p] !== -1) throw new Error(`template ${k}'s distogram is not one-hot at pair ${p}`);
+          bin[p] = b;
+        }
+      }
+      add(`template.${k}.distogramBin`, bin);
+      add(`template.${k}.distogramBins`, bins);
       add(`template.${k}.pseudoBetaMask2d`, g.pseudoBetaMask2d);
       add(`template.${k}.unitVector`, g.unitVector);
       add(`template.${k}.backboneMask2d`, g.backboneMask2d);

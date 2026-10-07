@@ -39,9 +39,29 @@ NODE = ["node", "--js-float16array", "--max-old-space-size=24000"]
 OUT = sys.stdout
 
 
-def emit(kind, payload):
-    OUT.write(json.dumps({"kind": kind, "payload": payload, "at": int(time.time() * 1000)}) + "\n")
+def emit(kind, payload, raw=None):
+    """raw: {placeholder string: JSON text} spliced in for the placeholder after serialising (a result's matrices,
+    passed through as the binary wrote them - see collect)"""
+    line = json.dumps({"kind": kind, "payload": payload, "at": int(time.time() * 1000)})
+    for placeholder, text in (raw or {}).items():
+        line = line.replace(json.dumps(placeholder), text, 1)
+    OUT.write(line + "\n")
     OUT.flush()
+
+
+def flat_matrix(text, key):
+    """The [[...]] matrix under `key` in a confidences file's text, as the text of one flat JSON list - and the
+    file's text with it replaced by null. The binaries write it as rows of two-decimal numbers, so cutting the
+    brackets out is the same list a parse, a flatten and a round produced, without the n^2 Python floats (95 ms of a
+    261-token job's 167 ms of result handling: the load, the flatten and round, the dump)."""
+    at = text.find(f'"{key}": [[')
+    if at < 0:
+        return text, None
+    start = at + len(key) + 4
+    end = text.index("]]", start) + 2
+    # (the rows' newlines out too: the protocol is a JSON object a line)
+    flat = "[" + text[start + 1:end - 1].replace("[", "").replace("]", "").replace("\n", "") + "]"
+    return text[:start] + "null" + text[end:], flat
 
 
 class Refused(Exception):
@@ -593,20 +613,28 @@ class Worker:
     def collect(self, pdb_path, family, port, job, seconds):
         stem = pdb_path[:-4]
         pdb = open(pdb_path).read()
-        confidences = json.load(open(f"{stem}_confidences.json"))
+        text = open(f"{stem}_confidences.json").read()
+        text, pae = flat_matrix(text, "pae")
+        text, contacts = flat_matrix(text, "contact_probs")
+        confidences = json.loads(text)
         summary = json.load(open(f"{stem}_summary_confidences.json"))
         chain_ids = confidences["token_chain_ids"]
         res_ids = confidences["token_res_ids"]
         plddt = confidences.get("token_plddts") or token_plddt(pdb_atoms(pdb), chain_ids, res_ids)
 
-        def flat(matrix):
-            return None if matrix is None else [round(float(v), 2) for row in matrix for v in row]
+        raw = {}
+
+        def flat(text, name):                      # (a placeholder the emitter replaces with the matrix's text)
+            if text is None:
+                return None
+            raw["\u0000" + name] = text
+            return "\u0000" + name
         confidence = {
             "plddt": [round(float(v), 2) for v in plddt],
             "meanPlddt": round(sum(plddt) / max(1, len(plddt)), 2),
             "ptm": summary.get("ptm"),
-            "predictedAlignedError": flat(confidences.get("pae")),
-            "contactProbs": flat(confidences.get("contact_probs")),
+            "predictedAlignedError": flat(pae, "pae"),
+            "contactProbs": flat(contacts, "contacts"),
         }
         if summary.get("iptm") is not None:
             confidence["iptm"] = summary["iptm"]
@@ -618,6 +646,7 @@ class Worker:
             "chains": polymer_chains(job["job"]), "msas": {},
             "atoms": len(pdb_atoms(pdb)),
             "status": f"{family} on CUDA ({self.device}) · done in {seconds:.1f} s · pLDDT {mean:.1f}",
+            "_raw": raw,
         }
 
 
@@ -628,7 +657,8 @@ def main():
         if not line.strip():
             continue
         try:
-            emit("result", worker.fold(json.loads(line)))
+            result = worker.fold(json.loads(line))
+            emit("result", result, result.pop("_raw", None))
         except Exception as cause:                                # noqa: BLE001
             traceback.print_exc(file=sys.stderr)
             said = str(cause) if isinstance(cause, Refused) else f"{type(cause).__name__}: {cause}"

@@ -453,14 +453,16 @@ __global__ void reluScaleK(float* x, float s, size_t n) {
 }
 // act += the geometry features of a real template slot: the distogram (one-hot bins) projected,
 // and five scalar features each times a per-channel weight (AF3's num_input_dims=0).
-__global__ void templateGeometryK(float* act, const float* dgram, const float* pb, const float* uv, const float* bb,
+// (the distogram as each pair's one-hot bin, -1 for none: its row of W0, the one term the one-hot's sum had)
+__global__ void templateGeometryK(float* act, const int* bin, const float* pb, const float* uv, const float* bb,
                                   const float* W0, const float* W1, const float* W4, const float* W5,
-                                  const float* W6, const float* W7, size_t pairs, int C, int bins) {
+                                  const float* W6, const float* W7, size_t pairs, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= pairs * C) return;
   int c = (int)(t % C); size_t p = t / C;
   float v = 0.f;
-  for (int b = 0; b < bins; ++b) { float d = dgram[p * bins + b]; if (d != 0.f) v += d * W0[(size_t)b * C + c]; }
+  int b = bin[p];
+  if (b >= 0) v += 1.f * W0[(size_t)b * C + c];
   v += pb[p] * W1[c] + uv[p * 3] * W4[c] + uv[p * 3 + 1] * W5[c] + uv[p * 3 + 2] * W6[c] + bb[p] * W7[c];
   act[t] += v;
 }
@@ -531,13 +533,16 @@ void templateEmbedding(Trunk& t, float* out) {
       linear<float, float>(oh, row, n, 31, Ct, P + "templatePairEmbedding2");
       linear<float, float>(oh, col, n, 31, Ct, P + "templatePairEmbedding3");
       addRowColumnK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, row, col, n, Ct);
-      if (M.has(S + "distogram")) {
+      if (M.has(S + "distogramBin")) {
         int bins = (int)(lenW(P + "templatePairEmbedding0") / Ct);
-        if (M.len(S + "distogram") != pairs * bins) { fprintf(stderr, "%sdistogram is not %zu x %d\n", S.c_str(), pairs, bins); exit(1); }
-        templateGeometryK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, Fdev(S + "distogram"), Fdev(S + "pseudoBetaMask2d"),
+        if (M.len(S + "distogramBin") != pairs || (int)M.meta(S + "distogramBins") != bins) {
+          fprintf(stderr, "%sdistogram: %zu pairs of %d bins, not %zu of %d\n", S.c_str(), M.len(S + "distogramBin"),
+                  (int)M.meta(S + "distogramBins"), pairs, bins); exit(1);
+        }
+        templateGeometryK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, Idev(S + "distogramBin"), Fdev(S + "pseudoBetaMask2d"),
           Fdev(S + "unitVector"), Fdev(S + "backboneMask2d"), W(P + "templatePairEmbedding0"), W(P + "templatePairEmbedding1"),
           W(P + "templatePairEmbedding4"), W(P + "templatePairEmbedding5"), W(P + "templatePairEmbedding6"),
-          W(P + "templatePairEmbedding7"), pairs, Ct, bins);
+          W(P + "templatePairEmbedding7"), pairs, Ct);
       }
     }
     // chai-1's fused projection's bias, once on the stack's input (af3-any-model FUSED_TEMPLATE_FEATURE_BIAS)
