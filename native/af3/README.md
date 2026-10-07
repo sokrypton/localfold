@@ -937,6 +937,14 @@ there - 6.8 GB each at 1080 residues - which ran beside the trunk's ordinary-pat
 mode gave that back between stages. The trunk's scratch now goes back BEFORE the expansion whenever the pair is over
 128 MB (`tightPair`), as it already did after it.
 
+🔴 **KNOWN: `foldFits` DOES NOT SIZE OpenDDE's SECOND TOKEN SPACE.** It asks by residues, and OpenDDE's sampler and
+confidence head work over ~2 structural tokens a residue. Under a simulated T4 (all but 14.6 GiB held, its
+shared-memory limit, register-staged flash) OpenDDE folds 500 residues (971 structural tokens, ~11 GB) and runs out
+at 600 (1167: `dc.sym` wants 2.09 GB) - in both big-input rules, so not the line above - while `foldFits` would admit
+~2000. A constant does not fix it: the structural stages hold ~5x their pair on the T4's unfused kernels and ~2.5x
+on the A100's (1080 residues, 23.3 GB), so one number either admits the T4's failure or refuses folds the A100
+runs. The reader gets an error either way, a late one instead of an early one.
+
 ### `--recycle-tolerance`: the page's AF3 early stop, as an option (off)
 
 `--recycle-tolerance=<A>` stops recycling once two consecutive passes moved the distogram's predicted distances
