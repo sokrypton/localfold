@@ -678,6 +678,14 @@ cost**: the confidence head's `reembedPairK` took each pair's distance bin per E
 510 tokens**. The bin is taken once a pair now (`reembedBinK`, the same double arithmetic): byte-identical, Boltz-2's
 confidence head on the T4 628 -> 379 ms.
 
+**The fused transition's form follows the blocks an SM holds.** Nsight Compute on the T4: the two-tile form (4 warps x
+two 16-row tiles, 59 KB) runs at 255 registers and one block an SM, 12.5% occupancy. Neither alternative helps there -
+8 warps x one tile is 0.7-1.5% slower and 4 x one tile 4-7% slower, interleaved over three throttling rounds - because
+two tiles feed each weight fragment to two MMAs, which a part with a single resident block needs. On an A100, which
+holds three of the one-tile form's 42 KB blocks, the one-tile form is 1.6% of the trunk faster at 261 tokens and ~0.4%
+at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two and is unmeasured).
+`LOCALFOLD_FT_FORM=1/2` forces one or the other.
+
 ## Tried and not taken
 
 - **OpenDDE's refiner and confidence stacks on a bf16 pair** (2026-10-07; the structural pair converted around their

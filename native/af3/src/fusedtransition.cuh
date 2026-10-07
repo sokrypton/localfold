@@ -217,7 +217,19 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
   // two 16-row tiles a warp on 4 warps (128-row blocks, 68 KB): 1.14x the 8-warp one-tile form at 1,044
   // tokens (--bench-trans), bit-identical; where it does not fit (a T4) or the input is small, the one-tile forms
   if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) {
-    fusedTransitionAt<4, RELU, 2, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+    // one 16-row tile a warp (42 KB a 64-row block) where an SM holds three of those blocks: on an A100 1.6% of the
+    // trunk at 261 tokens and ~0.4% at 1,000 over two tiles a warp (59 KB, 255 registers), bit-identical. A T4 holds one
+    // block either way and loses 4-7% to it (two tiles amortise each weight fragment over two MMAs, which is what
+    // a part with a single resident block needs); an L4 (two) is unmeasured and keeps the two-tile form.
+    // LOCALFOLD_FT_FORM=1/2 forces it
+    static const bool oneTile = [] {
+      if (const char* e = getenv("LOCALFOLD_FT_FORM")) return atoi(e) == 1;
+      int dev, perSm = 0; CK(cudaGetDevice(&dev));
+      CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+      return (size_t)perSm >= 3 * ((size_t)64 * (128 + 8) * 2 + 2 * ftStage<128, 16>());
+    }();
+    if (oneTile) fusedTransitionAt<4, RELU, 1, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
+    else fusedTransitionAt<4, RELU, 2, 16>(x, rows, I, lnScale, lnOffset, W1, W2, b1, b2);
     return true;
   }
   int warps = FT_WARPS == 8 && (rows + 127) / 128 < MIN_BLOCKS ? 4 : FT_WARPS;   // a small input: more, smaller blocks
