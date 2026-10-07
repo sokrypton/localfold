@@ -97,7 +97,7 @@ static std::string writeWarmInput(int L, int N, int E, int T) {
 // where the weights carry its head (the page's multimer bundle does not), the token layout - and
 // <stem>_summary_confidences.json (pTM, ipTM for a complex, mean pLDDT)
 static inline std::vector<float> contactsChunked(const float* pair, int L);   // (below)
-void writeConfidences(const std::string& pdb, const Trunk& t, int L, const float* mask37, const std::vector<int>& aatype,
+void writeConfidences(const std::string& pdb, const float* pair, int L, const float* mask37, const std::vector<int>& aatype,
                              const std::vector<int>& asym, const std::vector<int>& ri, int firstAsym,
                              const std::vector<float>& plddt, const std::vector<float>& paeLogits, float ptm, float iptm,
                              double mean) {
@@ -109,10 +109,10 @@ void writeConfidences(const std::string& pdb, const Trunk& t, int L, const float
   std::vector<float> pae = expectation(paeLogits, pairs, 64, centres);
   std::vector<float> contact;
   if (M.has("w/distogram_head/half_logits/weights") && AF2_TIGHT) {
-    contact = contactsChunked(t.pair, L);
+    contact = contactsChunked(pair, L);
   } else if (M.has("w/distogram_head/half_logits/weights")) {
     float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
-    linearB(t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
+    linearB(pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
     symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
     std::vector<float> lg = download(dg, pairs * 64);
     contact.resize(pairs);
@@ -266,7 +266,10 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   float positionScale = (float)M.meta("meta/position_scale");
   int L = t.L; size_t pairs = (size_t)L * L;
   t.msa = dalloc((size_t)(t.N + t.T) * L * 256); t.extra = dalloc((size_t)t.E * L * 64);
-  t.pair = dalloc(pairs * 128); t.pairMask = dalloc(pairs);
+  // (the pair in bf16 where every update takes it - evoformer.cuh, AF2_P16; not under an oracle, which reads it f32)
+  AF2_P16 = oracle.empty() && af2Pair16Ok(L);
+  t.pair = AF2_P16 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(pairs * 128)) : dalloc(pairs * 128);
+  t.pairMask = dalloc(pairs);
   // on a card short of room the recycled pair is the pair itself, re-embedded in place (embed): no second
   // pair-sized tensor, and the first pass starts from a zeroed pair. No CUDA graph there either - a pass
   // takes seconds and frees what the next stage needs.
@@ -291,7 +294,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   auto rest = [&](bool check, int pass) {
     auto mark = [&](const char* what) {
       if (!getenv("AF2_STAGE_TIMES")) return;
-      CK(cudaStreamSynchronize(STREAM));
+      CK(cudaStreamSynchronize(STREAM)); CK(cudaGetLastError());
       printf("    pass %d %-14s %.1f ms\n", pass, what, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
     };
     mark("embed"); memReport("embedded");
@@ -328,13 +331,16 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
         checkOracle("evoformer block 0 pair", t.pair, pairs * 128, "o/evo1/pair");
       }
     }
+    // a bf16 pair converted once into the recycled pair, which every reader after the stacks takes
+    if (AF2_P16) pairBf16ToF32K<<<blocks(pairs * 128), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), prevPair, pairs * 128);
+    const float* pairOut = AF2_P16 ? prevPair : t.pair;
     linearB(t.msa, "evoformer/single_activations", -1, single, L, 256, 384);
     if (check) {
       checkOracle("evoformer msa first row", t.msa, (size_t)L * 256, "o/full/msa_first_row");
       checkOracle("evoformer pair", t.pair, pairs * 128, "o/full/pair");
       checkOracle("single", single, (size_t)L * 384, "o/full/single");
     }
-    mark("evoformer"); memReport("evoformer"); so = structureModule(single, t.pair, L, positionScale);
+    mark("evoformer"); memReport("evoformer"); so = structureModule(single, pairOut, L, positionScale);
     if (check) {
       checkOracle("structure act", so.act, (size_t)L * 384, "o/full/structure_act");
       checkOracle("angles", so.angles, (size_t)L * 14, "o/full/angles");
@@ -352,7 +358,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     mark("structure"); memReport("structure");
     // the recycled state: the evoformer's first MSA row and pair, the final atom37 positions
     CK(cudaMemcpyAsync(prevRow, t.msa, (size_t)L * 256 * 4, cudaMemcpyDeviceToDevice, STREAM));
-    if (prevPair) CK(cudaMemcpyAsync(prevPair, t.pair, pairs * 128 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    if (prevPair && !AF2_P16) CK(cudaMemcpyAsync(prevPair, t.pair, pairs * 128 * 4, cudaMemcpyDeviceToDevice, STREAM));
     CK(cudaMemcpyAsync(prevPos, so.pos37, (size_t)L * 37 * 3 * 4, cudaMemcpyDeviceToDevice, STREAM));
     // heads, on this pass's representations
     const std::string PL = "predicted_lddt_head/";
@@ -365,7 +371,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     linearB(h2, PL + "logits", -1, plddtLogits, L, 128, 50);
     if (!AF2_TIGHT) {
       paeLogits = scratch<float>("head.pae", pairs * 64);
-      linearB(t.pair, "predicted_aligned_error_head/logits", -1, paeLogits, pairs, 128, 64);
+      linearB(pairOut, "predicted_aligned_error_head/logits", -1, paeLogits, pairs, 128, 64);
     }
     if (check) {
       checkOracle("pLDDT logits", plddtLogits, (size_t)L * 50, "o/full/plddt_logits");
@@ -416,7 +422,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       parts.push_back({c8, pairs});
     } else if (tapContacts) {
       float* dh = scratch<float>("head.dgramHalf", pairs * 64); float* dg = scratch<float>("head.dgram", pairs * 64);
-      linearB(t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
+      linearB(AF2_P16 ? prevPair : t.pair, "distogram_head/half_logits", -1, dh, pairs, 128, 64);
       symmetriseK<<<blocks(pairs * 64), 256, 0, STREAM>>>(dh, dg, L, 64);
       float* cf = scratch<float>("tap.contact", pairs); unsigned char* c8 = scratch<unsigned char>("tap.contact8", pairs);
       contact8K<<<blocks(pairs), 256, 0, STREAM>>>(dg, pairs, cf);
@@ -570,7 +576,8 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     }
   }
   fprintf(f, "END\n"); fclose(f);
-  writeConfidences(out, t, L, mask37, aatype, asym, ri, firstAsym, plddt, pae, ptm, iptm, mean);
+  // (the last pass's pair as f32: the recycled copy where the pair itself is bf16)
+  writeConfidences(out, AF2_P16 ? prevPair : t.pair, L, mask37, aatype, asym, ri, firstAsym, plddt, pae, ptm, iptm, mean);
   printf("mean pLDDT %.2f  pTM %.4f", mean, ptm);
   if (chains) printf("  ipTM %.4f", iptm);
   printf("  -> %s  (%d passes, %.1f ms)\n", out.c_str(), ran, foldMs);

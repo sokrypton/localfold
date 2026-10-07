@@ -239,6 +239,21 @@ and the 512-wide rows never written. 1% on an A100 (1.71 -> 1.69 s at 262 tokens
 GEMMs bind; the bytes it saves are what a T4's or an L4's transition is made of.
 
 
+...and the pair itself in bf16 (`AF2_P16`, evoformer.cuh), on Ampere and later, where every update both stacks
+run has a bf16 form (`af2Pair16Ok`: either fused triangle form or a T4's streaming one, the fused grid attention,
+the fused transition, and not a card short of room): native/af3's pair kernels take it through `PAIR16`, set
+around a block's pair updates only; the embedder and the templates add into it; the outer product mean's
+folded GEMM goes through an f32 block and an add; the row-direction attention output takes `gridOutK` as the
+column one does (cuBLAS has no f16-in, bf16-out GEMM). After the stacks it is converted once into the recycled
+pair (f32), which the structure module, the heads, the confidences and the next pass's embedder read - so no
+f32 pair is ever kept beside it. A100: 5CAJ with 512 + 1024 rows 1676 -> 1664 ms (-0.7%), 494 residues from a
+single sequence 1363 -> 1343 (-1.5%); the gate's AF2 rows move in the third decimal (6MRR 1.903 -> 1.901 A,
+5CAJ templated 0.214 -> 0.213, 1BRS's delta 0.285 -> 0.283). 🔴 A COLAB T4 IS 1-3% SLOWER WITH IT (9.76 -> 9.79
+s, 9.23 -> 9.50): Turing has no f32 -> bf16 conversion instruction, and its biased float-tile triangle output
+went 1237 -> 1520 ms of a 494-residue fold - so it is off below sm_80. Tried and not taken: the outer product
+mean's product in f16 to halve its add (14 ms faster at 494 residues, and 6MRR from a single sequence 1.898 ->
+2.001 A, pLDDT 84.6 -> 81.1). `LOCALFOLD_PAIR_F32=1` keeps the f32 pair.
+
 Measured and left (2026-10-03, A100, 262 residues, 512 alignment rows): the MSA column attention's
 strided flash kernel at 8 warps rather than 4 is slower (235 against 224 ms of strided flash a fold), and
 its transposed-copy form (the masked path's) runs the attention at the same speed and adds 110 ms of

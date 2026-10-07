@@ -204,10 +204,16 @@ inline int FT_WARPS = 8;
 inline bool FT_TWO_TILES = !getenv("LOCALFOLD_FT_ONE_TILE");
 // x += transition(x) for C = 128, f16 weights, on raw pointers (AlphaFold 2 calls it with RELU and its
 // biases); false if the shape is not this kernel's or the device cannot hold its blocks
+// whether fusedTransitionRaw has a form for this shape on this device (the two-tile form, else the one-tile at 4 warps)
+inline bool fusedTransitionFits(size_t rows, int C, int I) {
+  if (!FUSED_TRANSITION || C != 128 || I % FT_NC) return false;
+  if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) return true;
+  return fitsSmem((size_t)16 * 4 * (128 + 8) * 2 + 2 * ftStage<128>());
+}
 template <bool RELU = false>
 inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float* lnScale, const float* lnOffset,
                                const half* W1, const half* W2, const float* b1 = nullptr, const float* b2 = nullptr) {
-  if (!FUSED_TRANSITION || C != 128 || I % FT_NC) return false;
+  if (!fusedTransitionFits(rows, C, I)) return false;
   // two 16-row tiles a warp on 4 warps (128-row blocks, 68 KB): 1.14x the 8-warp one-tile form at 1,044
   // tokens (--bench-trans), bit-identical; where it does not fit (a T4) or the input is small, the one-tile forms
   if (FT_TWO_TILES && (rows + 127) / 128 >= MIN_BLOCKS && fitsSmem((size_t)128 * (128 + 8) * 2 + 2 * ftStage<128, 16>())) {

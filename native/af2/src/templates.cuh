@@ -97,7 +97,7 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L) {
     tAatype = zi; tPos = zp; tMask = zm; T = 1;
   } else { tAatype = Idev("t/aatype"); tPos = W("t/positions"); tMask = W("t/mask"); }
   float* qn = scratch<float>("tmpl.qn", pairs * Cz);
-  layerNorm(pair, qn, pairs, Cz, S + "query_embedding_norm");
+  layerNorm(pairF32(pair, pairs * Cz), qn, pairs, Cz, S + "query_embedding_norm");
   // the nine linears' biases, summed once
   static float* bsum = nullptr;
   if (!bsum) {
@@ -133,7 +133,7 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L) {
   reluScaleK<<<blocks(pairs * C), 256, 0, STREAM>>>(sum, 1.f / T, pairs * C);
   float* out = scratch<float>("tmpl.out", pairs * Cz);
   linearB(sum, TE + "output_linear", -1, out, pairs, C, Cz);
-  addK2<<<blocks(pairs * Cz), 256, 0, STREAM>>>(pair, out, pairs * Cz);
+  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks(pairs * Cz), 256, 0, STREAM>>>(pair, out, pairs * Cz));
 }
 
 // ---------------------------------------------------------------- the monomer's template embedder
@@ -221,7 +221,7 @@ inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, 
   int Hh = (int)dimW(A + "query_w", 1), D = (int)dimW(A + "query_w", 2), Wd = Hh * D;
   float* q = scratch<float>("mtmpl.q", pairs * Wd);
   float* kk = scratch<float>("mtmpl.k", (size_t)T * pairs * Wd); float* vv = scratch<float>("mtmpl.v", (size_t)T * pairs * Wd);
-  gemm(pair, P(A + "query_w"), q, pairs, Cz, Wd);
+  gemm(pairF32(pair, pairs * Cz), P(A + "query_w"), q, pairs, Cz, Wd);
   float s = 1.f / sqrtf((float)D);
   CB(cublasSscal(H, (int)(pairs * Wd), &s, q, 1));
   gemm(reps, P(A + "key_w"), kk, (size_t)T * pairs, C, Wd);
@@ -231,7 +231,7 @@ inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, 
   float* out = scratch<float>("mtmpl.out", pairs * Cz);
   gemm(o, P(A + "output_w"), out, pairs, Wd, Cz);
   addBiasK<<<blocks(pairs * Cz), 256, 0, STREAM>>>(out, P(A + "output_b"), pairs, Cz);
-  addK2<<<blocks(pairs * Cz), 256, 0, STREAM>>>(pair, out, pairs * Cz);
+  WITH_PT(AF2_P16, addIntoPairK<PT, float><<<blocks(pairs * Cz), 256, 0, STREAM>>>(pair, out, pairs * Cz));
 }
 
 // ---------------------------------------------------------------- the templates' MSA rows
