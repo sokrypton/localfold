@@ -193,9 +193,28 @@ inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
   }
   // whole waves of transitionUpK within the same ~64 MB of widened rows (see transitionUpWaveRows)
   size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), ((size_t)64 << 20) / (2 * (size_t)I));
-  half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
   half* w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
   tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
+  if (PAIR16) {
+    // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the pair
+    using B16 = __nv_bfloat16;
+    constexpr int WU = 8, R = 16 * WU;
+    constexpr size_t smem = transitionUpSmem<256, WU>();
+    B16* g = scratch<B16>("ftr.gbf", std::min(P, chunk) * I);
+    static bool attr = false;
+    if (!attr) { smemAttr((transitionUpK<256, WU, 32, 1, B16, B16>), (int)smem); attr = true; }
+    const float one = 1.f;
+    for (size_t r0 = 0; r0 < P; r0 += chunk) {
+      size_t r = std::min(chunk, P - r0);
+      B16* rows = reinterpret_cast<B16*>(pair) + r0 * C;
+      transitionUpK<256, WU, 32, 1, B16, B16><<<(unsigned)((r + R - 1) / R), 32 * WU, smem, STREAM>>>(
+        reinterpret_cast<float*>(rows), F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), w1t, g, r, I);
+      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, (int)r, I, &one, Wbf("f/" + Tn + "transition2"), CUDA_R_16BF, C, g,
+                      CUDA_R_16BF, I, &one, rows, CUDA_R_16BF, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    return;
+  }
+  half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     size_t r = std::min(chunk, P - r0);
     transitionUp<8>(pair + r0 * C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), w1t, g, r, I);
@@ -299,6 +318,35 @@ __global__ void decayUpdateK(float* z, const float* y, const float* a, size_t ro
   z[t] = a[t % C] * z[t] + y[t];
 }
 inline bool parcaeRecycle() { return M.has("f/recycle/decay"); }
+// ---------------------------------------------------------------- the pair in bf16 through the blocks (EF2_P16)
+// Where every block takes the fused 256-channel path on Ampere or later (and the card has room), a run of blocks
+// works on a bf16 copy of the pair - the triangle's input and output kernels and the transition read and write
+// half the bytes, the transition's second GEMM accumulating into it in bf16 - converted in before the run and out
+// after it (the recycle's own arithmetic on z stays f32). LOCALFOLD_PAIR_F32=1 keeps the f32 pair.
+__global__ void ef2ToBf16K(const float* in, __nv_bfloat16* out, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16(in[i]);
+}
+__global__ void ef2FromBf16K(const __nv_bfloat16* in, float* out, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __bfloat162float(in[i]);
+}
+inline bool ef2Pair16(int L, int C) {
+  static const bool off = getenv("LOCALFOLD_PAIR_F32") != nullptr;
+  return !off && FAST && FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Big() && bf16Mma() &&
+         !shortPair((size_t)L * L, C);
+}
+inline void trunkBlocks(float* pair, const float* mask, int L, int C, const std::string& prefix, int from, int to) {
+  if (from >= to) return;
+  if (!ef2Pair16(L, C)) { for (int b = from; b < to; ++b) trunkBlock(pair, mask, L, C, prefix, b); return; }
+  size_t n = (size_t)L * L * C;
+  __nv_bfloat16* p16 = scratch<__nv_bfloat16>("ef2.p16", n);
+  ef2ToBf16K<<<blocks(n), 256, 0, STREAM>>>(pair, p16, n);
+  PAIR16 = true;
+  for (int b = from; b < to; ++b) trunkBlock(reinterpret_cast<float*>(p16), mask, L, C, prefix, b);
+  PAIR16 = false;
+  ef2FromBf16K<<<blocks(n), 256, 0, STREAM>>>(p16, pair, n);
+}
 
 inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops, bool check,
                          const float* lmZ = nullptr, uint64_t seed = 0, const float* lmHost = nullptr) {
@@ -328,7 +376,7 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
         if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(inject, inject, P * C, p, seed, 1000 + loop);
       } else if (p > 0.f) dropoutK<<<blocks(P * C), 256, 0, STREAM>>>(lmZ, inject, P * C, p, seed, 1000 + loop);
       else CK(cudaMemcpyAsync(inject, lmZ, P * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-      for (int b = 0; b < lmBlocks; ++b) trunkBlock(inject, mask, T, C, "lmEncoder/blocks", b);
+      trunkBlocks(inject, mask, T, C, "lmEncoder/blocks", 0, lmBlocks);
       addK<<<blocks(P * C), 256, 0, STREAM>>>(inject, zInitP, P * C);
       for (size_t r0 = 0; r0 < P; r0 += chunk) {
         size_t r = std::min(chunk, P - r0);
@@ -336,7 +384,7 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
         gemm(xn, F("recycle/projection"), y, r, C, C);
         decayUpdateK<<<blocks(r * C), 256, 0, STREAM>>>(z + r0 * C, y, F("recycle/decay"), r, C);
       }
-      for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
+      trunkBlocks(z, mask, T, C, "blocks", 0, blocksN);
     }
     auto dumpPair = [&](const char* env) {             // (comparison aids: the pair at a seam, raw float32)
       if (!getenv(env)) return;
@@ -350,7 +398,7 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
       CK(cudaMemcpyAsync(z + r0 * C, y, r * C * 4, cudaMemcpyDeviceToDevice, STREAM));
     }
     dumpPair("EF2_SAVE_PRE_CODA");
-    for (int b = 0; b < codaBlocks; ++b) trunkBlock(z, mask, T, C, "coda/blocks", b);
+    trunkBlocks(z, mask, T, C, "coda/blocks", 0, codaBlocks);
     return;
   }
   CK(cudaMemsetAsync(z, 0, P * C * 4, STREAM));
@@ -368,7 +416,8 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " in").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/in");
     // (a CUDA graph of the 24 blocks, replayed for passes after the first, measured no faster: 453
     // against 455 ms of trunk at 261 tokens; the GPU is busy, the launches are not the cost)
-    for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);
+    if (check) for (int b = 0; b < blocksN; ++b) trunkBlock(z, mask, T, C, "blocks", b);   // (an oracle reads f32)
+    else trunkBlocks(z, mask, T, C, "blocks", 0, blocksN);
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " out").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/out");
     if (getenv("EF2_PASS_TIMES")) {
       static auto t0 = std::chrono::steady_clock::now();

@@ -235,6 +235,13 @@ Elsewhere:
 - The contraction runs on zero-padded f16 planes.
 - Every other GEMM uses TF32.
 - A CUDA graph of the trunk's passes measured nothing.
+- **The pair in bf16 through each run of blocks** (`trunkBlocks`, `ef2Pair16`: Ampere on, the fused 256-channel path,
+  not on a card short of room): the language model's encoder blocks, the 24 and the coda work on a bf16 copy of the
+  pair converted in before the run and out after it (the recycle's own arithmetic stays f32) - the triangle's
+  input and output kernels read and write half the bytes, and the transition writes its gated rows in bf16 so its
+  second GEMM runs bf16 throughout and accumulates straight into the pair. 5CAJ, warm: trunk **204.2 -> 190.9 ms
+  (-6.5%)**; CA RMSD 2.099-2.118 against 2.095-2.102 A on three seeds, mean pLDDT 90.83 -> 90.69.
+  `LOCALFOLD_PAIR_F32=1` keeps the f32 pair. The gate's 5CAJ case 2.102 -> 2.103 A.
 
 | A100, warm | 6MRR (68 tokens) | 5CAJ (261) |
 |---|---:|---:|

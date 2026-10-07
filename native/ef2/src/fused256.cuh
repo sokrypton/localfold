@@ -34,14 +34,15 @@ template <int WARPS, class TA, int XROUNDS = 1>
 void triIn256Form(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
   constexpr int C = 256, R = 16 * WARPS;
   size_t pp = (size_t)np * np, smem = XROUNDS == 1 ? (size_t)R * (C + 8) * 2 : triIn256Smem<TA>(C, WARPS, XROUNDS);
-  static bool attr = false;
-  if (!attr) { smemAttr((triIn256K<C, WARPS, TA, XROUNDS>), (int)smem); attr = true; }
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", C, {{"f/" + Tn + "projection", 2 * C, false},
                                                                    {"f/" + Tn + "gate", 2 * C, false}});
   half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
   tileTriIn(Wh(pg), Fh(Tn + "gatingLinear"), C, 16, wt);
-  triIn256K<C, WARPS, TA, XROUNDS><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-    pair, mask, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"), wt, a, b, t2, n, np, cs);
+  WITH_PAIR_T(                    // (the pair f32, or bf16 under PAIR16: see trunk.cuh's EF2_P16)
+    static bool attr = false;
+    if (!attr) { smemAttr((triIn256K<C, WARPS, TA, XROUNDS, false, PT>), (int)smem); attr = true; }
+    triIn256K<C, WARPS, TA, XROUNDS, false, PT><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+      pair, mask, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"), wt, a, b, t2, n, np, cs));
 }
 // the 8-warp form where it fits, else the T4's
 template <class TA>
