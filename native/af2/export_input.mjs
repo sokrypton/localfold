@@ -14,7 +14,7 @@
 // native/af2/fold folds with) or export_weights.py's directory (DeepMind's float32, for the oracles).
 import { readFileSync, writeFileSync, mkdirSync, openSync, readSync, writeSync, closeSync, renameSync } from "node:fs";
 import { Worker } from "node:worker_threads";
-import { makeA3mFeatures } from "../../src/input/a3m-features.js";
+import { makeA3mFeatures, planA3mRecycles } from "../../src/input/a3m-features.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -133,16 +133,21 @@ const featureOptions = {
   maxExtraSequences: Number(option("max-extra", "1024")),
   randomSeed: Number(option("seed", "0")),
 };
-// a deep alignment's recycles in parallel, one worker each (makeA3mFeatureRecycle: the same features
-// as makeA3mFeatures, recycle by recycle - the nearest-centre search and the finishing are most of an
-// export, and no recycle depends on another's); a shallow one is not worth a worker's start-up
+// a deep alignment planned ONCE here - the parse, the encoding, the profile and every recycle's masking - and
+// each recycle's nearest-centre search and finishing in a worker of its own (no recycle depends on another's).
+// Each worker used to re-plan from the A3M text: the parse is the largest single cost of an export (185 of a
+// recycle's ~440 ms for 5CAJ's 7907 rows), four times over on a Colab T4's two CPUs. Byte-identical: the same
+// functions, in the same order. A shallow alignment is not worth a worker's start-up
 const passes = featureOptions.recycles + 1;
 const features = passes > 1 && a3m.length > (1 << 20)
-  ? await Promise.all(Array.from({ length: passes }, (_, index) => new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("../../src/input/a3m-features-worker.mjs", import.meta.url),
-      { workerData: { a3m, tables, options: featureOptions, index } });
-    worker.once("message", resolve); worker.once("error", reject);
-  })))
+  ? await (async () => {
+    const { plans, context } = planA3mRecycles(a3m, tables, featureOptions);
+    return Promise.all(plans.map((plan) => new Promise((resolve, reject) => {
+      const worker = new Worker(new URL("../../src/input/a3m-features-worker.mjs", import.meta.url),
+        { workerData: { plan, context } });
+      worker.once("message", resolve); worker.once("error", reject);
+    })));
+  })()
   : makeA3mFeatures(a3m, tables, featureOptions);
 const first = features[0];
 const L = first.aatype.length;

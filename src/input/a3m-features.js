@@ -250,6 +250,10 @@ function planA3mFeatures(a3mText, tables, options) {
       encoded[base + residue] = code < 128 ? CODE_OF_CHARACTER[code] : 20;
     }
   }
+  // the deletions flat, as the codes are: what finishing reads, and what a worker is handed - nested arrays of
+  // numbers were most of the bytes a structured clone copied, and a row's slice allocates
+  const deletions = new Float32Array(depth * length);
+  for (let row = 0; row < depth; row += 1) deletions.set(alignment.deletionMatrix[row], row * length);
   featureStats.encodeMs += performance.now() - mark; mark = performance.now();
   const base = makeQueryOnlyFeatures(alignment.query, tables, {
     recycles: 0, chainLengths: options.chainLengths,
@@ -312,7 +316,7 @@ function planA3mFeatures(a3mText, tables, options) {
     featureStats.maskMs += performance.now() - mark; mark = performance.now();
     plans.push({ centers, extras, centerCodes });
   }
-  return { plans, context: { alignment, encoded, base, length, options } };
+  return { plans, context: { encoded, deletions, base, length, options } };
 }
 
 /**
@@ -320,7 +324,7 @@ function planA3mFeatures(a3mText, tables, options) {
  * 49-channel MSA block, and the extra rows.
  */
 function finishRecycle(plan, assignments, context) {
-  const { alignment, encoded, base, length, options } = context;
+  const { encoded, deletions, base, length, options } = context;
   const { centers, extras, centerCodes } = plan;
   let mark = performance.now();
     const profile = new Float32Array(centers.length * length * 23);
@@ -328,7 +332,7 @@ function finishRecycle(plan, assignments, context) {
     const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
       profile[(center * length + residue) * 23 + centerCodes[center * length + residue]] = 1;
-      deletionSums[center * length + residue] = alignment.deletionMatrix[centers[center]] [residue];
+      deletionSums[center * length + residue] = deletions[centers[center] * length + residue];
     }
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
       const row = extras[extraIndex]; const center = assignments[extraIndex];
@@ -336,7 +340,7 @@ function finishRecycle(plan, assignments, context) {
         const slot = center * length + residue; counts[slot] = counts[slot] + 1;
         const profileSlot = slot * 23 + encoded[row * length + residue];
         profile[profileSlot] = profile[profileSlot] + 1;
-        deletionSums[slot] = deletionSums[slot] + alignment.deletionMatrix[row] [residue];
+        deletionSums[slot] = deletionSums[slot] + deletions[row * length + residue];
       }
     }
     // 🔴 THE PROFILE STAYS ON FOR AN ALIGNMENT. ColabDesign2's make_msa_feats
@@ -352,7 +356,7 @@ function finishRecycle(plan, assignments, context) {
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
       const slot = center * length + residue; const output = slot * 49;
       msaFeatures[output + centerCodes[slot]] = 1;
-      const deletion = alignment.deletionMatrix[centers[center]] [residue];
+      const deletion = deletions[centers[center] * length + residue];
       msaFeatures[output + 23] = Math.min(deletion, 1); msaFeatures[output + 24] = deletionValue(deletion);
       if (useClusterProfile) {
         for (let code = 0; code < 23; code += 1) msaFeatures[output + 25 + code] = profile[slot * 23 + code] / counts[slot];
@@ -370,7 +374,7 @@ function finishRecycle(plan, assignments, context) {
     const extraMsaMask = new Float32Array(extraSequences * length);
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) for (let residue = 0; residue < length; residue += 1) {
       const slot = extraIndex * length + residue; const row = extras[extraIndex];
-      const deletion = alignment.deletionMatrix[row] [residue];
+      const deletion = deletions[row * length + residue];
       extraMsa[slot] = encoded[row * length + residue]; extraHasDeletion[slot] = Math.min(deletion, 1);
       extraDeletionValue[slot] = deletionValue(deletion); extraMsaMask[slot] = 1;
     }
@@ -406,6 +410,18 @@ export function makeA3mFeatureRecycle(a3mText, tables, options, index) {
   if (!(index >= 0 && index < plans.length)) throw new Error(`recycle ${index} of ${plans.length}`);
   return hostRecycle(plans[index], context);
 }
+
+/**
+ * The three steps apart, for a caller that runs them in different places (native/af2/export_input.mjs: the
+ * plan once - parsing the A3M is the largest single cost of an export, and every recycle worker used to repeat
+ * it - then each recycle's search and finish in a worker, or the search on the CUDA port's device). The
+ * context holds only typed arrays and plain values, so it crosses to a worker as it is.
+ */
+export function planA3mRecycles(a3mText, tables, options = {}) { return planA3mFeatures(a3mText, tables, options); }
+export function searchA3mRecycle(plan, context) {
+  return nearestCentres(plan.centerCodes, context.encoded, plan.extras, plan.centers.length, context.length);
+}
+export function finishA3mRecycle(plan, assignments, context) { return finishRecycle(plan, assignments, context); }
 
 function hostRecycle(plan, context) {
   const mark = performance.now();
