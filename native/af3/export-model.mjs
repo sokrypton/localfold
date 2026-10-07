@@ -504,8 +504,50 @@ if (dialect.chiralCentres === true) {
       (dialect.chaiTemplates === true && !residueCovered(token) ? 21 : v))
       : (pass.aatype ?? new Int32Array(batch.tokens).fill(pass.emptyAatype ?? 0)));
     if (fused) {
-      add(`template.${k}.features`, pass.features ?? fusedTemplateFeatures(real ? pass.slot : undefined, batch.tokens,
-        width, dialect, real ? pass.mask : undefined, (pass.emptyAatype ?? 0) !== 0));
+      // the feature columns sparse - a row's nonzero (column, value) pairs, K the most any row has, the rest -1 - and
+      // scattered back on the device into the dense matrix the projection reads: dense they were 108 floats a pair
+      // in every pass, an empty one included (protenix2 at 1,020 tokens: a 1.3 GB input and 4.9 s of export)
+      const rows = batch.tokens * batch.tokens, gap = (pass.emptyAatype ?? 0) !== 0;
+      // (an empty slot's rows are all one row - no geometry, one residue class: taken from a two-token input, its four
+      // rows checked equal, and tiled, rather than built and scanned at every pair)
+      let dense = pass.features, tile = null;
+      if (dense === undefined && !real) {
+        const small = fusedTemplateFeatures(undefined, 2, width, dialect, undefined, gap);
+        let same = true;
+        for (let r = 1; r < 4 && same; r += 1) for (let c = 0; c < width; c += 1) if (small[r * width + c] !== small[c]) { same = false; break; }
+        if (same) tile = small.subarray(0, width);
+      }
+      if (dense === undefined && tile === null) {
+        dense = fusedTemplateFeatures(real ? pass.slot : undefined, batch.tokens, width, dialect, real ? pass.mask : undefined, gap);
+      }
+      let K = 1;
+      if (tile !== null) {
+        K = Math.max(1, tile.reduce((n, v) => n + (v !== 0 ? 1 : 0), 0));
+      } else {
+        for (let r = 0; r < rows; r += 1) {
+          let nz = 0;
+          for (let c = 0; c < width; c += 1) if (dense[r * width + c] !== 0) nz += 1;
+          if (nz > K) K = nz;
+        }
+      }
+      const idx = new Int32Array(rows * K).fill(-1), val = new Float32Array(rows * K);
+      if (tile !== null) {
+        const ti = new Int32Array(K).fill(-1), tv = new Float32Array(K);
+        let at = 0;
+        for (let c = 0; c < width; c += 1) if (tile[c] !== 0) { ti[at] = c; tv[at] = tile[c]; at += 1; }
+        for (let r = 0; r < rows; r += 1) { idx.set(ti, r * K); val.set(tv, r * K); }
+      } else {
+        for (let r = 0; r < rows; r += 1) {
+          let at = r * K;
+          for (let c = 0; c < width; c += 1) {
+            const v = dense[r * width + c];
+            if (v !== 0) { idx[at] = c; val[at] = v; at += 1; }
+          }
+        }
+      }
+      add(`template.${k}.featuresIdx`, idx);
+      add(`template.${k}.featuresVal`, val);
+      add(`template.${k}.featuresK`, K);
     } else if (real) {
       const g = templateGeometry(pass.slot, pass.mask, batch.tokens, undefined, { chai: dialect.chaiTemplates === true });
       // the distogram as each pair's bin (-1 for none): it is one-hot, and as 4-byte floats it was 156 bytes a pair -

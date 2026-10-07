@@ -319,6 +319,13 @@ PAE and contact matrices through as the binary wrote them (`flat_matrix`, two-de
 result line) instead of parsing, rounding and re-serialising 136,000 Python floats (95 of the 167 ms between the
 last sampler step and the result). Now 580 ms.
 
+...and the fused template embedder's columns (protenix2, boltz2, rf3) cross sparse - each row's nonzero (column,
+value) pairs, `template.k.featuresIdx/Val/K` - scattered back on the device into the dense matrix the projection
+reads, byte-identical (boltz2's 5CAJ fold compared against the dense path, file for file). Dense, every pass wrote
+108-109 floats a pair, an empty slot's included, whose rows are all one row: protenix2's input at 1,020 tokens was
+**864 MB with no template at all** (2.65 s of export) and 1,292 MB with one (4.93 s). Sparse, and an empty slot's
+row taken from a two-token input and tiled: 38 MB / 0.50 s and 102 MB / 1.78 s; 54 -> 3 MB at 255 tokens.
+
 ## The gate
 
 `python3 native/af3/gate.py` folds 6MRR from its sequence through all seven models, plus 5CAJ and

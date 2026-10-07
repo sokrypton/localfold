@@ -453,6 +453,13 @@ __global__ void reluScaleK(float* x, float s, size_t n) {
 }
 // act += the geometry features of a real template slot: the distogram (one-hot bins) projected,
 // and five scalar features each times a per-channel weight (AF3's num_input_dims=0).
+// dense[r][idx[r][k]] = val[r][k] for every row's K (column, value) pairs, -1 a padding column
+__global__ void scatterRowsK(const int* idx, const float* val, float* dense, size_t rows, int K, int width) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * K) return;
+  int c = idx[t];
+  if (c >= 0) dense[(t / K) * width + c] = val[t];
+}
 // (the distogram as each pair's one-hot bin, -1 for none: its row of W0, the one term the one-hot's sum had)
 __global__ void templateGeometryK(float* act, const int* bin, const float* pb, const float* uv, const float* bb,
                                   const float* W0, const float* W1, const float* W4, const float* W5,
@@ -527,7 +534,13 @@ void templateEmbedding(Trunk& t, float* out) {
     if (tight) queryInto(act);
     else CK(cudaMemcpyAsync(act, query, pairs * Ct * 4, cudaMemcpyDeviceToDevice, STREAM));
     if (fused) {
-      linear<float, float>(Fdev(S + "features"), act, pairs, width, Ct, P + "aProjection", false, 1.f);
+      // the exporter's sparse rows scattered back into the dense [pairs, width] matrix, then the same projection
+      int K = (int)M.meta(S + "featuresK");
+      if (M.len(S + "featuresIdx") != pairs * K) { fprintf(stderr, "%sfeatures: %zu entries, not %zu x %d\n", S.c_str(), M.len(S + "featuresIdx"), pairs, K); exit(1); }
+      float* dense = scratch<float>("tmpl.features", pairs * width);
+      CK(cudaMemsetAsync(dense, 0, pairs * width * 4, STREAM));
+      scatterRowsK<<<blocks(pairs * K), 256, 0, STREAM>>>(Idev(S + "featuresIdx"), Fdev(S + "featuresVal"), dense, pairs, K, width);
+      linear<float, float>(dense, act, pairs, width, Ct, P + "aProjection", false, 1.f);
     } else {
       onehotK<<<blocks((size_t)n * 31), 256, 0, STREAM>>>(Idev(S + "aatype"), oh, n, 31);   // on the device: capturable
       linear<float, float>(oh, row, n, 31, Ct, P + "templatePairEmbedding2");
