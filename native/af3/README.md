@@ -566,8 +566,14 @@ pair. Phase two holds it in bf16 for the whole trunk (`usePair16`, `pair16Eligib
 pair are allocated at half the bytes, the embedder, the template stack's boundary, the MSA stack (outer product,
 attention's pair LayerNorm, its pair updates), boltz2's pre-MSA add and the distogram read and write it in bf16
 (`layerNormPairRows`, `linearIntoPair`, `WITH_PT`), and it converts to f32 once when the trunk is done, for the
-heads, the sampler and the confidence head. Same speed as phase one; NO memory saved yet - where memory binds the
-big-input paths (`shortPair`) still keep the pair f32. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
+heads, the sampler and the confidence head. The big-input paths take it too now (the blocked triangle's two pair
+kernels, in-place recycling, the chunked grid and single-track offsets, the pair parked at its own size). Measured
+for the ceiling by holding the card from a second process (`LOCALFOLD_NO_FOLD_FITS=1`), 1530 tokens: bf16 and f32
+both fold with 7.75 GB free and both fail at 7.5 - 🔴 THE MEMORY CEILING DID NOT MOVE, because what binds there is
+the template stack, which runs with the trunk's pair parked in host memory (its own 64-channel f32 activation and
+unfused triangle buffers); raising it means shrinking that stack. (Its bf16 chunk held into the next pass's
+template stack first made bf16 WORSE - 7.75 failed - until it was given back.) What it does do under pressure: the
+trunk 29.9 -> 24.3 s at 7.75 GB free (-18%); 3% where memory is plentiful. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
 output on cuBLAS, which only garbage allows; the kernels are partly latency-bound, so halving their bytes is
 ~15% of each, not half.
 

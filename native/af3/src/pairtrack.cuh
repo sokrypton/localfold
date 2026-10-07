@@ -272,19 +272,20 @@ __device__ __forceinline__ size_t rectPair(const TriRect& r, size_t q, int n) { 
 }
 // LayerNorm of rows [q0, q0 + cnt) of a rectangle, read from the pair where they lie (zeros for padding),
 // and their mask - a warp a row
-template <class TO>
+template <class TO, class PT = float>
 __global__ void rectLayerNormK(const float* pair, const float* mask, TO* out, float* m, TriRect r, size_t q0, size_t cnt,
                                int n, int C, const float* scale, const float* offset) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= cnt) return;
   size_t p = rectPair(r, q0 + row, n);
-  const float* x = p != SIZE_MAX ? pair + p * C : nullptr;
+  const bool live = p != SIZE_MAX;
   float s = 0, ss = 0;
-  for (int c = lane; c < C; c += 32) { float v = x ? x[c] : 0.f; s += v; ss += v * v; }
+  for (int c = lane; c < C; c += 32) { float v = live ? pairLd<PT>(pair, p * C + c) : 0.f; s += v; ss += v * v; }
   for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
   float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
-  for (int c = lane; c < C; c += 32) out[row * C + c] = fromF<TO>(((x ? x[c] : 0.f) - mean) * inv * scale[c] + offset[c]);
+  for (int c = lane; c < C; c += 32)
+    out[row * C + c] = fromF<TO>(((live ? pairLd<PT>(pair, p * C + c) : 0.f) - mean) * inv * scale[c] + offset[c]);
   if (lane == 0 && m) m[row] = p != SIZE_MAX ? mask[p] : 0.f;
 }
 // one operand from a chunk's (rows, 2C) [projection | gate] rows, channel-major into the rectangle's
@@ -334,13 +335,13 @@ __global__ void rectCenterNormK(const float* prod, TO* out, size_t q0, size_t cn
   }
 }
 // pair[at q] += t1 * sigmoid(t2) for the chunk's real rows
-template <class T>
+template <class T, class PT = float>
 __global__ void rectGatedAddK(float* pair, const T* t1, const T* t2, TriRect r, size_t q0, size_t cnt, int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   size_t row = t / C; int c = (int)(t % C);
   size_t p = rectPair(r, q0 + row, n);
-  if (p != SIZE_MAX) pair[p * C + c] += toF(t1[t]) * sigm(toF(t2[t]));
+  if (p != SIZE_MAX) pairSt<PT>(pair, p * C + c, pairLd<PT>(pair, p * C + c) + toF(t1[t]) * sigm(toF(t2[t])));
 }
 
 // [projection | gate] of ONE operand (side 0 = a, 1 = b) as a (C, 2C) matrix, from the interleaved (C, 2C)
@@ -381,8 +382,8 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   auto operands = [&](const TriRect& r, T* out, int side) {
     for (size_t q0 = 0; q0 < r.size(); q0 += per) {
       size_t cnt = std::min(per, r.size() - q0);
-      rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, m, r, q0, cnt, n, C,
-        W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"));
+      WITH_PAIR_T(rectLayerNormK<T, PT><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, m, r, q0, cnt, n, C,
+        W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset")));
       linear<T, T>(ln, pgOut, cnt, C, 2 * C, pgOf[side]);
       rectGateK<T><<<dim3((unsigned)((cnt + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(pgOut, m, out, q0, cnt, C, r.size());
     }
@@ -417,10 +418,10 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
       rectCenterNormK<T><<<(unsigned)((cnt + 31) / 32), dim3(32, 8), 0, STREAM>>>(prod, ln, q0, cnt, C, r.size(),
         W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
       linear<T, T>(ln, t1, cnt, C, C, pre + ".outputProjection");
-      rectLayerNormK<T><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, nullptr, r, q0, cnt, n, C,
-        W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"));
+      WITH_PAIR_T(rectLayerNormK<T, PT><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, nullptr, r, q0, cnt, n, C,
+        W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset")));
       linear<T, T>(ln, t2, cnt, C, C, pre + ".gatingLinear");
-      rectGatedAddK<T><<<blocks(cnt * C), 256, 0, STREAM>>>(into(pair), t1, t2, r, q0, cnt, n, C);
+      WITH_PAIR_T(rectGatedAddK<T, PT><<<blocks(cnt * C), 256, 0, STREAM>>>(into(pair), t1, t2, r, q0, cnt, n, C));
     }
   }
   // given back at once: the fixed operand is a plane, and the next stage (the MSA attention, the grid
@@ -447,7 +448,6 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   if (shortPair(pairs, C)) {
     if (!roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
       releaseScratch({ "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" });
-      needF32Pair("the blocked triangle");
       triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
       return;
     }
@@ -798,6 +798,11 @@ inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, 
     default: return false;
   }
 }
+// the pair's row `row` (of C channels) as a float* base in whichever storage PAIR16 says it has
+inline float* pairRow(float* pair, size_t row, int C) {
+  return PAIR16 ? reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(pair) + row * C) : pair + row * C;
+}
+inline const float* pairRow(const float* pair, size_t row, int C) { return pairRow(const_cast<float*>(pair), row, C); }
 // pair16[r] += h[r] for rows of C halves (the bf16 pair's row-direction grid output, after its f16 GEMM)
 __global__ void addHalfToBf16K(__nv_bfloat16* pair, const half* h, size_t n8) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -812,9 +817,14 @@ __global__ void addHalfToBf16K(__nv_bfloat16* pair, const half* h, size_t n8) {
   reinterpret_cast<uint4*>(pair)[i] = p;
 }
 inline void rowOut16(const half* gathered, float* pair, size_t rows, int Wd, int C, const std::string& w) {
-  half* o = scratch<half>("grid.out16", rows * C);
-  linear<half, half>(gathered, o, rows, Wd, C, w);
-  addHalfToBf16K<<<blocks(rows * C / 8), 256, 0, STREAM>>>(reinterpret_cast<__nv_bfloat16*>(pair), o, rows * C / 8);
+  // (in chunks: a whole pass's product would be a pair-sized f16 tensor, the bytes the bf16 pair saves)
+  size_t per = std::max<size_t>(1, std::min(rows, CHUNK / C));
+  half* o = scratch<half>("grid.out16", per * C);
+  for (size_t r0 = 0; r0 < rows; r0 += per) {
+    size_t r = std::min(per, rows - r0);
+    linear<half, half>(gathered + r0 * Wd, o, r, Wd, C, w);
+    addHalfToBf16K<<<blocks(r * C / 8), 256, 0, STREAM>>>(reinterpret_cast<__nv_bfloat16*>(pair) + r0 * C, o, r * C / 8);
+  }
 }
 // the unfused column direction's two GEMMs strided in place (LOCALFOLD_GRID_STRIDED=0: gathered and scattered)
 inline bool GRID_STRIDED = true;
@@ -863,7 +873,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));     // the padding columns
         for (size_t r0 = 0; r0 < pairs; r0 += per) {
           size_t r = std::min(per, pairs - r0);
-          lnHeads128<16>(pair + r0 * C, pre + ".actNormScale", pre + ".actNormOffset", wb, raw, r);
+          lnHeads128<16>(pairRow(pair, r0, C), pre + ".actNormScale", pre + ".actNormOffset", wb, raw, r);
           biasFromRawRowsK<half><<<blocks((size_t)heads * r), 256, 0, STREAM>>>(raw, bias, r0, r, n, stride, heads,
                                                                               tr && swapBias, LOG2E);
         }
@@ -880,7 +890,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
         half* gathered = scratch<half>("grid.gathered", prs * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
-        if (!tr && PAIR16) rowOut16(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection");
+        if (!tr && PAIR16) rowOut16(gathered, pairRow(into(pair), r0 * n, C), prs, Wd, C, pre + ".outputProjection");
         else if (!tr) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr);
       }
@@ -984,7 +994,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
 // keeps it f32 (the comparison arm)
 inline bool pairBf16Ok(int n, int C, const std::string& B0) {
   static const bool off = getenv("LOCALFOLD_PAIR_F32") != nullptr;
-  if (off || C != 128 || M.flag("trunk.dialect.parallelPairformer") || shortPair((size_t)n * n, C)) return false;
+  if (off || C != 128 || M.flag("trunk.dialect.parallelPairformer")) return false;
   bool narrow = FUSED_TRIANGLE && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
   bool wide = FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && fitsSmem(wideTriFitsSmem(128));
   std::string A = B0 + ".pairAttention1";

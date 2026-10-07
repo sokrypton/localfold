@@ -71,12 +71,13 @@ __global__ void outerSumK(const float* left, const float* right, float* pair, in
   pairSt<PT>(pair, t, left[(size_t)i * C + c] + right[(size_t)j * C + c]);
 }
 // rows [r0, r0 + cnt) of the pair (as pair rows i*n+j) = left[i] + right[j] + add[row]
+template <class PT = float>
 __global__ void outerSumRowsK(const float* left, const float* right, const float* add, float* pair, size_t r0, size_t cnt,
                               int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = r0 + t / C; size_t i = ij / n, j = ij % n;
-  pair[r0 * C + t] = left[i * C + c] + right[j * C + c] + add[t];
+  pairSt<PT>(pair, r0 * C + t, left[i * C + c] + right[j * C + c] + add[t]);
 }
 // AF3's relative encoding, 139 one-hot columns, folded straight into its projection: each
 // pair adds the four or five weight rows its one-hot selects.
@@ -176,6 +177,7 @@ struct Trunk {
 // short of shared memory, whose unfused kernels hold more: 1.8x the pair and a 20th of the card spare admit
 // 6000 tokens on 40 GB, and 3200 but not 3500 on a simulated T4 - as measured. Scratch held counts as free.
 inline bool foldFits(int n, int C) {
+  if (getenv("LOCALFOLD_NO_FOLD_FITS")) return true;     // (to find a ceiling by experiment)
   size_t f, t; CK(cudaMemGetInfo(&f, &t));
   for (auto& [name, slot] : SCRATCH) f += slot.second;
   double perPair = C * 4 * 1.8;
@@ -211,6 +213,7 @@ inline void usePair16(Trunk& t, bool on) {
 inline void pairToF32(Trunk& t) {
   if (!t.p16) return;
   size_t pc = (size_t)t.n * t.n * t.C;
+  if (shortPair((size_t)t.n * t.n, t.C)) releaseScratch();   // (near the card's limit: the trunk's scratch first)
   float* f = dalloc(pc);
   fromBf16K<<<blocks(pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), f, pc);
   CK(cudaStreamSynchronize(STREAM));
@@ -366,9 +369,9 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     float* prev = scratch<float>("emb.prevproj", per * C);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      layerNorm2<float, T>(t.pair + r0 * C, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
+      layerNormPairRows<T>(t.pair, t.p16, r0, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
       linear<T, float>(ln, prev, r, C, C, E + "prevEmbedding");
-      outerSumRowsK<<<blocks(r * C), 256, 0, STREAM>>>(left, right, prev, t.pair, r0, r, n, C);
+      WITH_PT(t.p16, outerSumRowsK<PT><<<blocks(r * C), 256, 0, STREAM>>>(left, right, prev, t.pair, r0, r, n, C));
     }
   } else {
   WITH_PT(t.p16, outerSumK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C));
@@ -383,6 +386,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     layerNormPairRows<T>(t.prevPair, t.p16, r0, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     linearIntoPair<T>(ln, t.pair, t.p16, r0, r, C, C, E + "prevEmbedding");
   }
+  if (tight) releaseScratch({ "p16." });     // (its chunk is not held into the template stack, which binds there)
   }
   onSeam("z_after_prev", t.pair, pairs * C);
   if (chai) { if (t.pass > 0) chaiRelEnc(); }      // (the first pass added it before the recycle term)
@@ -539,7 +543,7 @@ void templateEmbedding(Trunk& t, float* out) {
     // with one pass the trunk's pair is read before the stack (the query) and after it (the output) and
     // not in between: on a card short of room it waits in host memory while the stack runs
     bool parked = live == 1 && tight && out == t.pair && parkWorthIt(pairs * Cq * 4);
-    if (parked) { parkToHost(t.pair, pairs * Cq * 4); out = nullptr; }
+    if (parked) { parkToHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = nullptr; }
     for (int b = 0; b < nb; ++b) {
       std::string B = P + "blocks." + std::to_string(b);
       int factor = (int)(lenW(B + ".pairTransition.transition1") / ((size_t)Ct * Ct * 2));
@@ -557,11 +561,12 @@ void templateEmbedding(Trunk& t, float* out) {
       scaleRowsK<float><<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, Fdev(S + "pseudoBetaMask2d"), pairs, Ct);
     if (live == 1) scaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
     else addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
-    if (parked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkFromHost(t.pair, pairs * Cq * 4); out = t.pair; }
+    if (parked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkFromHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = t.pair; }
   }
   // divided by every slot (not the real ones), relu, projected
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
   linearIntoPair<float>(summed, out, t.p16 && out == t.pair, 0, pairs, Ct, Cq, P + "outputLinear");
+  if (tight) releaseScratch({ "p16." });     // (not held into the next pass's template stack, which binds there)
 }
 
 // ---------------------------------------------------------------- MSA stack
@@ -952,7 +957,8 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
     float* flat = nullptr; T* ln = nullptr;
     for (int i0 = 0; i0 < n; i0 += R) {
       int r = std::min(R, n - i0); size_t rows = (size_t)r * n;
-      const float* prow = pair + (size_t)i0 * n * C;
+      const float* prow = pair16 ? reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(pair) + (size_t)i0 * n * C)
+                                 : pair + (size_t)i0 * n * C;       // (a bf16 pair's rows are C halves)
       bool fusedHeads = false;
       if constexpr (std::is_same_v<T, half>)
         if (C == 128 && heads == 16) {
