@@ -112,17 +112,27 @@ __global__ void clampK(float* x, float limit, size_t n) {
 // boltz2's re-embedded pair (after LN_z and the relative encoding): right[i] + left[j] off the
 // normalised s_inputs, its own 64-bin distance embedding (bounds evenly over 2..22 A), the bond
 // contact and bond-order terms and the contact conditioning's unspecified constant
-__global__ void reembedPairK(float* pair, const float* left, const float* right, const float* beta, const float* pairMask,
-                             const float* Wd, const float* bonds, const float* orders, const float* wBond,
-                             const float* wBondType, const float* unspecified, int n, int C) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
-  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+// each pair's distance bin, once (in double, as it always was): taken per ELEMENT - C times a pair, a double sqrt
+// and a 63-step double comparison loop each - it was 252 ms of one launch on a T4 at 510 tokens, whose FP64 runs at
+// 1/32 of its f32
+__global__ void reembedBinK(const float* beta, int* binOut, int n) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= (size_t)n * n) return;
+  int i = (int)(ij / n), j = (int)(ij % n);
   double sq = 1e-10;
   for (int k = 0; k < 3; ++k) { double d = (double)beta[i * 3 + k] - beta[j * 3 + k]; sq += d * d; }
   double distance = sqrt(sq);
   int bin = 0;
   for (int e = 0; e < 63; ++e) if (distance > 2.0 + 20.0 * e / 62) ++bin;
+  binOut[ij] = bin;
+}
+__global__ void reembedPairK(float* pair, const float* left, const float* right, const int* bins, const float* pairMask,
+                             const float* Wd, const float* bonds, const float* orders, const float* wBond,
+                             const float* wBondType, const float* unspecified, int n, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n * C) return;
+  int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
+  int bin = bins[ij];
   int o = orders ? (int)orders[ij] : 0;
   if (o < 0 || o >= 7) o = 0;
   float v = right[(size_t)i * C + c] + left[(size_t)j * C + c] + Wd[(size_t)bin * C + c] * pairMask[ij]
@@ -178,7 +188,9 @@ inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, co
   linear<float, float>(sIn, p1, n, F, C, R + "sToZProdIn1");
   linear<float, float>(sIn, p2, n, F, C, R + "sToZProdIn2");
   if (lenW(R + "distogramFeatProject") != (size_t)64 * C) { fprintf(stderr, "the reembed distogram is not 64 bins\n"); exit(1); }
-  reembedPairK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, pseudoBeta, pairMask, W(R + "distogramFeatProject"),
+  int* bins = scratch<int>("conf.bin", pairs);
+  reembedBinK<<<blocks(pairs), 256, 0, STREAM>>>(pseudoBeta, bins, n);
+  reembedPairK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, bins, pairMask, W(R + "distogramFeatProject"),
     M.has("batch.bondMatrix") ? Fdev("batch.bondMatrix") : nullptr,
     M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
     W(R + "tokenBondsProject"), W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), n, C);

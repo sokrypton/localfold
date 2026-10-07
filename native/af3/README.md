@@ -666,6 +666,18 @@ saves (protenix2 713 -> 719), so it starts at 384. `LOCALFOLD_TRIIN_GEMM=0` keep
 (a block's 64 LN'd rows held in shared memory, warps of 32 x 64) was written first and lost: 50 KB of rows a block
 holds the SM at 8 warps, and it ran 4-18% slower.
 
+### A T4's own profile (2026-10-07)
+
+Measured on a Colab T4 rather than simulated, AlphaFold 3 at 261 tokens (alignment, template) folds in 3.49 s warm and
+at 510 in 11.9 s; Boltz-2 at 510 in 12.6. The time is the pair track's fused kernels - the grid attention's flash
+kernel 26%, the fused transition 16%, the grid attention's input 13%, the triangle's input 12% and output 8% - and the
+unfused forms lose on every family there too (Boltz-2 at 510: 16.3-17.3 s with `LOCALFOLD_UNFUSED=transition`,
+`grid` or `triangle` against 12.3-14.5 fused, the T4 throttling between runs). **One kernel was a defect, not a
+cost**: the confidence head's `reembedPairK` took each pair's distance bin per ELEMENT - a double-precision sqrt and a
+63-step double comparison loop, 128 times a pair - on a part whose FP64 is 1/32 of its f32: **252 ms of one launch at
+510 tokens**. The bin is taken once a pair now (`reembedBinK`, the same double arithmetic): byte-identical, Boltz-2's
+confidence head on the T4 628 -> 379 ms.
+
 ## Tried and not taken
 
 - **OpenDDE's refiner and confidence stacks on a bf16 pair** (2026-10-07; the structural pair converted around their
