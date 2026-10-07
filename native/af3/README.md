@@ -603,6 +603,12 @@ two-stage kernel (it is the same arithmetic), and AF2's column attention no long
 - **An L2 prefetch of the fused transition's residual** (`prefetch.global.L2` over the block's rows right
   after its norm, so the epilogue's read at the end hits L2): 0.199 -> 0.201 ms at 261 tokens, 2.797 ->
   2.816 at 1044 - level to slightly worse.
+- **int8 tensor cores through cuBLASLt** (IMMA, int32 accumulate: the weights already ship int8, the activations
+  quantised per row), for AF2's MSA transition shapes. cuBLASLt's int8 writes int32 only (no f16 output), which
+  doubles the bytes of GEMMs already bound by their output: on a T4 133632x256x1024 is 3.08 ms against f16's 2.80,
+  65536x128x512 0.66 against 0.39; only the narrow down-projection pays (133632x1024x256: 1.41 against 1.97) and
+  its input would need a quantising pass (~1.3 ms over its 273 MB on a T4) costing more than it saves. An A100:
+  0.418 against 0.356, 0.244 against 0.295. Worth it only as hand-written int8 kernels with fused epilogues.
 - **`flashGrid2R` on a T4** (its two query tiles a warp, with the next key tile held in registers where there
   is no cp.async): slower than the register-staged `flashGridHalf` there - 698 ms (48-key tiles) and 645 (64)
   against 624 over a boltz2 fold. Its two stages at 39-51 KB leave a T4 SM one block of 4 warps.
