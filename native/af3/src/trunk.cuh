@@ -35,6 +35,7 @@ void runPairUpdate(PairUpdate u, float* pair, const float* mask, int n, int C, c
 template <class T>
 void parallelPairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap, bool divide,
                          int transitionFactor, std::initializer_list<PairUpdate> updates) {
+  needF32Pair("the parallel pair block");
   size_t pc = (size_t)n * n * C;
   float* base = scratch<float>("par.base", pc);
   CK(cudaMemcpyAsync(base, pair, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
@@ -52,6 +53,14 @@ void parallelPairUpdates(float* pair, const float* mask, int n, int C, const std
   }
 }
 
+__global__ void toBf16K(const float* x, __nv_bfloat16* y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = __float2bfloat16(x[i]);
+}
+__global__ void fromBf16K(const __nv_bfloat16* x, float* y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = __bfloat162float(x[i]);
+}
 // ---------------------------------------------------------------- embedder
 // pair[i][j] = left[i] + right[j]
 __global__ void outerSumK(const float* left, const float* right, float* pair, int n, int C) {
@@ -827,6 +836,9 @@ __global__ void addBiasHeadsK(float* pl, const float* bias, size_t pairs, int he
 template <class T>
 void singleTrack(float* single, const float* pair, const float* seqMask, int n, int C, int Cs,
                  const std::string& B, const float* extraBias = nullptr) {
+  // a bf16 pair (PAIR16) is read here only for the pair logits; everything else is the f32 single
+  const bool pair16 = PAIR16;
+  struct F32Scope { bool was; F32Scope() : was(PAIR16) { PAIR16 = false; } ~F32Scope() { PAIR16 = was; } } f32Scope;
   // chai-1's parallel block: the gate is sigmoid(g + 1) (its gating linear's bias, a constant) and the
   // transition reads the block's INPUT single, s = s0 + attention(s0) + transition(s0)
   const bool parallel = M.flag("trunk.dialect.parallelPairformer");
@@ -869,11 +881,14 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
       bool fusedHeads = false;
       if constexpr (std::is_same_v<T, half>)
         if (C == 128 && heads == 16) {
+          PAIR16 = pair16;
           lnHeads128<16>(prow, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset",
                          B + ".singlePairLogitsProjection", pl, rows);
+          PAIR16 = false;
           fusedHeads = true;
         }
       if (!fusedHeads) {
+        if (pair16) { PAIR16 = true; needF32Pair("the single track's unfused pair logits"); }
         if (!flat) { flat = scratch<float>("st.flat", (size_t)heads * R * n); ln = scratch<T>("st.ln", (size_t)R * n * C); }
         layerNorm2<float, T>(prow, ln, rows, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
         linear<T, float>(ln, flat, rows, C, heads, B + ".singlePairLogitsProjection");
@@ -896,11 +911,14 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   bool fused = false;
   if constexpr (std::is_same_v<T, half>)
     if (C == 128 && heads == 16) {     // one kernel: LN, the projection, the head-major layout
+      PAIR16 = pair16;
       lnHeads128<16>(pair, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset",
                      B + ".singlePairLogitsProjection", pl, pairs);
+      PAIR16 = false;
       fused = true;
     }
   if (!fused) {
+    if (pair16) { PAIR16 = true; needF32Pair("the single track's unfused pair logits"); }
     float* flat = scratch<float>("st.flat", pairs * heads);
     size_t rowsPer = std::max<size_t>(1, CHUNK / C);
     T* ln = scratch<T>("st.ln", std::min(rowsPer, pairs) * C);
@@ -1060,7 +1078,21 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   onSeam("z_after_msa", t.pair, pairs * t.C);
   onSeam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
   int blocks_ = 0; while (M.has("trunk.pairformerBlocks." + std::to_string(blocks_) + ".singleChannels")) ++blocks_;
+  // the stack's pair in bf16 where every update it runs takes one (pairBf16Ok): converted in and out here, so
+  // everything before and after it - the embedder, the MSA stack, the heads, the diffusion - keeps the f32 pair
+  bool p16 = false;
+  if constexpr (std::is_same_v<T, half>) p16 = blocks_ > 0 && pairBf16Ok(t.n, t.C, "trunk.pairformerBlocks.0");
+  float* pair32 = t.pair;
+  if (p16) {
+    __nv_bfloat16* p = scratch<__nv_bfloat16>("trunk.pair16", pairs * t.C);
+    toBf16K<<<blocks(pairs * t.C), 256, 0, STREAM>>>(t.pair, p, pairs * t.C);
+    t.pair = reinterpret_cast<float*>(p); PAIR16 = true;
+  }
   for (int k = 0; k < blocks_; ++k) pairformerBlock<T>(t, k);
+  if (p16) {
+    PAIR16 = false; t.pair = pair32;
+    fromBf16K<<<blocks(pairs * t.C), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(scratch<__nv_bfloat16>("trunk.pair16", pairs * t.C)), t.pair, pairs * t.C);
+  }
   memReport("  trunk: pairformer");
   // ...and the pair track's own, before the next pass's template stack allocates beside it: held, they
   // put a recycle pass's peak at its embedding (17.71 against 12.88 GB at 1572 tokens)

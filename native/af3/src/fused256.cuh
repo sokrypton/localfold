@@ -171,7 +171,7 @@ __host__ __device__ constexpr size_t triangleOutSmem() {
 }
 // TP: the product's type in memory - f32, or bf16 (ESMFold2's: the contraction writes half the bytes and
 // this reads half; the tile is bf16 either way)
-template <int C, int WARPS, class TT = float, int NC = 32, class TP = float, bool BIAS = false>
+template <int C, int WARPS, class TT = float, int NC = 32, class TP = float, bool BIAS = false, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Woutt, const half* __restrict__ t2,
     float* __restrict__ pair, int L, int Lp, const float* __restrict__ ob = nullptr) {   // ob: AF2's output bias
@@ -311,7 +311,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
       size_t row = row0 + r, pr = pairAt(row);
       if (pr != SIZE_MAX) {
         gv[i] = *reinterpret_cast<const uint2*>(t2 + paddedAt(row) * C + n * NC + q);
-        pv[i] = *reinterpret_cast<const float4*>(pair + pr * C + n * NC + q);
+        pv[i] = pairLd4<PT>(pair, pr * C + n * NC + q);
       }
     }
     __syncthreads();
@@ -346,7 +346,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
       float4 v = pv[i];
       if constexpr (BIAS) { o.x += ob[c]; o.y += ob[c + 1]; o.z += ob[c + 2]; o.w += ob[c + 3]; }
       v.x += o.x * sigmH(g01.x); v.y += o.y * sigmH(g01.y); v.z += o.z * sigmH(g23.x); v.w += o.w * sigmH(g23.y);
-      *reinterpret_cast<float4*>(pair + pr * C + c) = v;
+      pairSt4<PT>(pair, pr * C + c, v);
     }
 #if LF_REG_STAGES
     if (n + 1 < chunks) stage(n + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });
@@ -377,7 +377,7 @@ template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int x
 // for 16. Every row is normed exactly as before (lnRowsToShared's per-row arithmetic), so byte-identical.
 // BIAS: AlphaFold 2's projections carry biases (triInK's layout: [4C, projection | gate in Wpg's order][C, the
 // gating linear's]); without it the kernel is the one AF3's lineage and ESMFold2 run
-template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false>
+template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
     TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs,
@@ -429,7 +429,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 #endif
   uint32_t xa[KS][4];
   if constexpr (XROUNDS == 1) {
-    lnRowsToShared<C, R, WARPS>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
+    lnRowsToShared<C, R, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
     __syncthreads();
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
@@ -441,7 +441,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     issue(0, 0);                        // (the stages have memory of their own here)
 #pragma unroll 1
     for (int rd = 0; rd < XROUNDS; ++rd) {
-      lnRowsToShared<C, XR, WARPS>(pair, [&](int r) { return pairOf(row0 + rd * XR + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
+      lnRowsToShared<C, XR, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + rd * XR + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
       __syncthreads();
       if (warp * 16 / XR == rd) {
 #pragma unroll
@@ -537,26 +537,29 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
   tileColumns(Wout, C, C, 0, C, f32 || ob ? 32 : 16, wt);
   if (f32 && !ob) {
     constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32>();
-    static bool attr = false;
-    if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP>), (int)smem); attr = true; }
-    triangleOutK<C, WARPS, float, 32, TP><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp);
+    WITH_PAIR_T(
+      static bool attr = false;
+      if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP, false, PT>), (int)smem); attr = true; }
+      triangleOutK<C, WARPS, float, 32, TP, false, PT><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp));
   } else if (ob) {
     // AF2's output bias - and its f32 product kept f32 in the tile, as AF2's own kernels keep it (the bf16 tile
     // read the triangle's update 2e-3 off theirs; a float tile at 128 channels is ~34 KB, inside a T4)
     if constexpr (sizeof(TP) == 4) {
       constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32, TP>();
-      static bool attr = false;
-      if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP, true>), (int)smem); attr = true; }
-      triangleOutK<C, WARPS, float, 32, TP, true><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-        prod, sc, of, wt, t2, pair, L, Lp, ob);
+      WITH_PAIR_T(
+        static bool attr = false;
+        if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP, true, PT>), (int)smem); attr = true; }
+        triangleOutK<C, WARPS, float, 32, TP, true, PT><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+          prod, sc, of, wt, t2, pair, L, Lp, ob));
     } else { fprintf(stderr, "triangleOutRun: an output bias takes an f32 product (AF2's)\n"); exit(1); }
   } else {
     constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
     constexpr bool vec = sizeof(TP) == 2;                       // the padded rows (triangleOutK's VEC)
     size_t rows = vec ? (size_t)Lp * Lp : P;
-    static bool attr = false;
-    if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP>), (int)smem); attr = true; }
-    triangleOutK<C, WARPS, __nv_bfloat16, 16, TP><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp);
+    WITH_PAIR_T(
+      static bool attr = false;
+      if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT>), (int)smem); attr = true; }
+      triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp));
   }
 }
 

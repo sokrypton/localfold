@@ -554,6 +554,18 @@ scheduler a cycle, 37.5% occupancy. Colab T4: AF2 5CAJ 10806/11156 -> 10336/1075
 two-stage kernel (it is the same arithmetic), and AF2's column attention no longer builds a zero bias for it.
 `LOCALFOLD_FLASH_2R1=0` is the old kernel.
 
+The pairformer's pair in bf16 (AlphaFold 3's own activation precision), phase one: where every update a stack
+runs has a bf16 form (`pairBf16Ok`: the 128-channel fused triangle - or the T4's streaming one - the fused grid
+attention and the fused transition), the trunk converts its pair to bf16 before the 48 blocks and back after, and
+those kernels take a pair element type (`PT`, `PAIR16`, `WITH_PAIR_T`); every path without one calls `needF32Pair`
+and refuses rather than misread. The row-direction grid output's GEMM writes f16 and one pass adds it (cuBLAS has
+no f16-in, bf16-out GEMM; `gridOutK` there was slower on a T4). AF3 at 255 tokens on the A100: trunk 312.4 ->
+302.5 ms (-3.2%); boltz2 on a Colab T4 2566/2597/2628 -> 2498/2523/2560 (-2.7%). The gate's AF3 RMSDs move
+in the third decimal (0.552 -> 0.553, 0.168 -> 0.170, 0.541 -> 0.536). `LOCALFOLD_PAIR_F32=1` keeps the f32
+pair. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
+output on cuBLAS, which only garbage allows; the kernels are partly latency-bound, so halving their bytes is
+~15% of each, not half.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at

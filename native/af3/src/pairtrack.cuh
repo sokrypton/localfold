@@ -252,8 +252,8 @@ template <class F> void wideWarps(int C, F f) {
   else f(std::integral_constant<int, 4>{});
 }
 // triIn256K's template for a warp count (the rounded form at TRIIN_ROUNDED)
-template <int CC, int WI, class TA> constexpr auto triIn256For() {
-  if constexpr (WI == TRIIN_ROUNDED) return triIn256K<CC, WI, TA, TRIIN_XROUNDS>; else return triIn256K<CC, WI, TA>;
+template <int CC, int WI, class TA, class PT = float> constexpr auto triIn256For() {
+  if constexpr (WI == TRIIN_ROUNDED) return triIn256K<CC, WI, TA, TRIIN_XROUNDS, false, PT>; else return triIn256K<CC, WI, TA, 1, false, PT>;
 }
 inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
   static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
@@ -447,6 +447,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   if (shortPair(pairs, C)) {
     if (!roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
       releaseScratch({ "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" });
+      needF32Pair("the blocked triangle");
       triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
       return;
     }
@@ -489,11 +490,12 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
           constexpr int CC = decltype(width)::value, WO = 4;
           wideWarps(C, [&](auto warps) {
             constexpr int WI = decltype(warps)::value;
-            static bool attr = false;
-            constexpr auto kern = triIn256For<CC, WI, __nv_bfloat16>();
-            if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-            kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
-              pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs, nullptr);
+            WITH_PAIR_T(
+              static bool attr = false;
+              constexpr auto kern = triIn256For<CC, WI, __nv_bfloat16, PT>();
+              if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+              kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
+                pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs, nullptr));
           });
           triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
           triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
@@ -506,11 +508,12 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         constexpr int CC = decltype(width)::value, WO = 4;
         wideWarps(C, [&](auto warps) {
           constexpr int WI = decltype(warps)::value;
-          static bool attr = false;
-          constexpr auto kern = triIn256For<CC, WI, half>();
-          if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-          kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
-            pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs, nullptr);
+          WITH_PAIR_T(
+            static bool attr = false;
+            constexpr auto kern = triIn256For<CC, WI, half, PT>();
+            if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+            kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
+              pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs, nullptr));
         });
         contract();
         triangleOutRun<CC, WO>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"), Wh(pre + ".outputProjection"), t2, into(pair), n, np);
@@ -537,6 +540,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       return;
     }
   }
+  needF32Pair("the unfused triangle");
   buffers();
   T* norm = scratch<T>("tri.norm", pairs * C);
   size_t rowsPer = std::max<size_t>(1, CHUNK / (4 * C));
@@ -590,6 +594,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
     // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
     // residual as its beta - the [rows, 2I] widening never written
     if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
+      needF32Pair("the 256-channel transition");
       constexpr int WU = 8, R = 16 * WU;
       // whole waves of transitionUpK inside the same budget (transitionUpChunkRows)
       size_t rowsPer = transitionUpChunkRows<256, WU>(wideUpSmem(256), std::max<size_t>(R, CHUNK / (2 * I)));
@@ -615,6 +620,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   }
   // every row in one pass where the card has the room (OpenDDE at 255 tokens: the trunk's transitions 370 -> 353
   // ms for 0.6 GB; chunks of 1-8k rows, small enough for L2 to hold the widening, are 397-615 - the GEMMs lose more)
+  needF32Pair("the unfused transition");
   size_t rowsPer = std::max<size_t>(1, CHUNK / (2 * I));
   if (rows > rowsPer && roomFor(rows * (C + 3 * (size_t)I) * sizeof(T), {"tr.x", "tr.wide", "tr.gated"})) rowsPer = rows;
   T* xn = scratch<T>("tr.x", std::min(rowsPer, rows) * C);
@@ -792,6 +798,24 @@ inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, 
     default: return false;
   }
 }
+// pair16[r] += h[r] for rows of C halves (the bf16 pair's row-direction grid output, after its f16 GEMM)
+__global__ void addHalfToBf16K(__nv_bfloat16* pair, const half* h, size_t n8) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n8) return;
+  uint4 p = reinterpret_cast<uint4*>(pair)[i], a = reinterpret_cast<const uint4*>(h)[i];
+  __nv_bfloat162* pp = reinterpret_cast<__nv_bfloat162*>(&p); const half2* aa = reinterpret_cast<const half2*>(&a);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    float2 x = __bfloat1622float2(pp[k]), y = __half22float2(aa[k]);
+    pp[k] = __floats2bfloat162_rn(x.x + y.x, x.y + y.y);
+  }
+  reinterpret_cast<uint4*>(pair)[i] = p;
+}
+inline void rowOut16(const half* gathered, float* pair, size_t rows, int Wd, int C, const std::string& w) {
+  half* o = scratch<half>("grid.out16", rows * C);
+  linear<half, half>(gathered, o, rows, Wd, C, w);
+  addHalfToBf16K<<<blocks(rows * C / 8), 256, 0, STREAM>>>(reinterpret_cast<__nv_bfloat16*>(pair), o, rows * C / 8);
+}
 // the unfused column direction's two GEMMs strided in place (LOCALFOLD_GRID_STRIDED=0: gathered and scattered)
 inline bool GRID_STRIDED = true;
 // Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
@@ -826,7 +850,9 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias);
         half* gathered = scratch<half>("grid.gathered", pairs * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
-        if (!tr) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
+        // (a bf16 pair: cuBLAS takes no f16-in, bf16-out GEMM, so the projection goes to f16 and one pass adds it)
+        if (!tr && PAIR16) rowOut16(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection");
+        else if (!tr) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, 0, pairs, tr);
         return;
       }
@@ -854,12 +880,14 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
         half* gathered = scratch<half>("grid.gathered", prs * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
-        if (!tr) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+        if (!tr && PAIR16) rowOut16(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection");
+        else if (!tr) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr);
       }
       return;
     }
   }
+  needF32Pair("the unfused grid attention");
   // On a card short of room the LayerNorm'd pair is not kept: it is per pair position, so the bias pass and
   // each chunk's q/k/v/gate take it again from the pair (a column chunk gathered transposed first). In
   // place that is safe: a row chunk writes only its own rows, a column chunk only its own columns, and the
@@ -950,6 +978,22 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   }
 }
 
+// Whether a pairformer stack can hold its pair in bf16 (PAIR16): every update it would run has a bf16 form - the
+// 128-channel fused triangle (or, where that does not fit, the streaming one from FUSED_WIDE_MIN_TOKENS), the fused
+// grid attention and the fused transition - and nothing takes the big-input or parallel paths. LOCALFOLD_PAIR_F32=1
+// keeps it f32 (the comparison arm)
+inline bool pairBf16Ok(int n, int C, const std::string& B0) {
+  static const bool off = getenv("LOCALFOLD_PAIR_F32") != nullptr;
+  if (off || C != 128 || M.flag("trunk.dialect.parallelPairformer") || shortPair((size_t)n * n, C)) return false;
+  bool narrow = FUSED_TRIANGLE && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
+  bool wide = FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && fitsSmem(wideTriFitsSmem(128));
+  std::string A = B0 + ".pairAttention1";
+  bool grid = FUSED_GRID && gridFusedFits() && !hasW(A + ".gatingQueryBias") && !hasW(A + ".outputProjectionBias") &&
+              (int)M.meta(A + ".heads") * (int)M.meta(A + ".dimension") == 128 && (int)M.meta(A + ".heads") <= 16;
+  int I = (int)(lenW(B0 + ".pairTransition.transition1") / (2 * (size_t)C));
+  bool tr = FUSED_TRANSITION && fitsSmem((size_t)16 * 4 * 2 * (128 + 8) * 2 + 2 * ftStage<128, 16>()) && I % 16 == 0;
+  return (narrow || wide) && grid && tr;
+}
 // The five pair updates of a pairformer/MSA/template block, in AF3's order.
 template <class T>
 void pairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,

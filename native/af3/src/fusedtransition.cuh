@@ -47,7 +47,7 @@ inline const half* transitionW1Tiles(const half* W1, int C, int I, int NC) {
 // without it the kernel is AF3's. MT: 16-row tiles a warp - at 2 every weight fragment read from shared
 // memory feeds two MMAs instead of one (the kernel is bound by those reads at MT 1); NC: intermediate
 // columns a chunk (16 keeps MT 2's registers in bounds)
-template <int C, int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC>
+template <int C, int WARPS, bool RELU = false, int MT = 1, int NC = FT_NC, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1t, const half* __restrict__ W2, size_t rows, int I,
     const float* __restrict__ b1 = nullptr, const float* __restrict__ b2 = nullptr) {
@@ -89,7 +89,7 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
 #endif
   issue(0, 0);
   // LayerNorm, a warp a row (C / 32 floats a lane), into shared memory as f16
-  lnRowsToShared<C, FT_ROWS, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
+  lnRowsToShared<C, FT_ROWS, WARPS, PT>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
                                     lnScale, lnOffset, Xs, LDX, warp, lane);
   __syncthreads();
   uint32_t xa[MT][KS][4];
@@ -177,10 +177,10 @@ __global__ void __launch_bounds__(WARPS * 32) fusedTransitionK(float* __restrict
       size_t row = row0 + warp * RW + rl;
       if (row >= rows) continue;
       float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl);
-      float4* p = (float4*)(x + row * C + c); float4 v = *p;
+      float4 v = pairLd4<PT>(x, row * C + c);
       float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
       if constexpr (RELU) { o0 = b2[c]; o1 = b2[c + 1]; o2 = b2[c + 2]; o3 = b2[c + 3]; }
-      v.x += a4.x + o0; v.y += a4.y + o1; v.z += a4.z + o2; v.w += a4.w + o3; *p = v;
+      v.x += a4.x + o0; v.y += a4.y + o1; v.z += a4.z + o2; v.w += a4.w + o3; pairSt4<PT>(x, row * C + c, v);
     }
     __syncwarp();
   }
@@ -192,11 +192,12 @@ void fusedTransitionAt(float* x, size_t rows, int I, const float* lnScale, const
                        const half* W2, const float* b1, const float* b2) {
   constexpr int R = 16 * WARPS * MT;
   size_t smem = (size_t)R * (128 + 8) * 2 + 2 * ftStage<128, NC>();
-  static bool attr = false;
-  if (!attr) { smemAttr((fusedTransitionK<128, WARPS, RELU, MT, NC>), (int)smem); attr = true; }
   const half* w1t = transitionW1Tiles<RELU>(W1, 128, I, NC);
-  fusedTransitionK<128, WARPS, RELU, MT, NC><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-    x, lnScale, lnOffset, w1t, W2, rows, I, b1, b2);
+  WITH_PAIR_T(
+    static bool attr = false;
+    if (!attr) { smemAttr((fusedTransitionK<128, WARPS, RELU, MT, NC, PT>), (int)smem); attr = true; }
+    fusedTransitionK<128, WARPS, RELU, MT, NC, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+      x, lnScale, lnOffset, w1t, W2, rows, I, b1, b2));
 }
 inline bool FUSED_TRANSITION = true;
 inline int FT_WARPS = 8;
