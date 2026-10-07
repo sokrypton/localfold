@@ -700,6 +700,21 @@ at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two an
   register-staged form's shape, swept with `LOCALFOLD_BENCH_ONE=1 --bench-grid=N`, where 64-key tiles win the bench
   by 8% at 510 tokens and lose or tie in the fold (9.43/10.45/10.85 s against 9.76/11.10/10.79, and slower at 261).
   The shipped forms are the best of their family there; what would move the T4 is a different algorithm, not a knob.
+- **Research: what the T4's grid-attention flash kernel spends its time on** (2026-10-07, five Colab rounds). Bench-only
+  ablations (`ABL` on flashGrid2R, `ONE abl ...` arms under `LOCALFOLD_BENCH_ONE=1 --bench-grid`) at 510 tokens: the
+  whole kernel 6.33 ms, without P V 5.20, without Q K^T 4.88, without the max and exponentials 5.60, the MMAs alone
+  (no softmax, no tile loads) 3.77 - which is itself ~3.6x off the tensor peak, so the units are fed, not starved of
+  arithmetic: ~6 bytes of shared memory a score (bias 2, K 2, V 2) on a part with half an A100's shared bandwidth an
+  SM. Three designs built on that and measured in folds, none taken: **f32 scores** (`S32`: the max and exponentials
+  in f32, no f16<->f32 round trips - __hmax2 and ex2.f16x2 are both emulated through f32 on sm_75), level everywhere;
+  **four query tiles a warp** (K and V shared over 64 rows, ~4 bytes a score; 255 registers, no spills at 32-key
+  tiles), 11-15% in the bench at 510 and level or slower in folds (shipped fastest in eight of nine size/round
+  pairs); and the register-reduced forms below. 🔴 **AND ONE ABLATION LIED**: "no max" read 6.8x faster - past the
+  T4's peak - because Colab's CUDA 13 mis-parsed an `else` followed by `#pragma unroll` (CUDA 12.2 here compiled it
+  fine); braced, the same arm is as slow as the whole kernel. A number past the hardware's peak is a broken
+  measurement, not a discovery. Also found and fixed on the way: the register-staged form stages its output in its
+  one stage's memory, which four tiles overflow (an illegal access) - it is sized to the larger of the two now.
+  The T4 drifts 30% across rounds (9.0 -> 11.9 s for one fold), so a kernel win under ~10% cannot be seen in its folds.
 - **A register-reduced flash kernel for the T4** (2026-10-07; `PREF`/`MINB` on flashGrid2R, arms in `--bench-grid`
   under `LOCALFOLD_BENCH_ONE=1`). Without the register-held prefetch the shipped shape compiles to 159 registers
   (from 195: three blocks an SM instead of two, no spills, bit-identical), and 4 warps of one tile with 32-key tiles to
