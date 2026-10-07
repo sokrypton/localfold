@@ -278,6 +278,9 @@ inline int wideTriInWarps(int C) {
   // (measured on a Colab T4: at 256 channels the rounded form is 1768 -> 1477 ms of protenix2's input kernel
   // against the 4-warp one; at 128, where 8 warps fit, 428 -> 420 against them - so only where 8 do not fit,
   // and an L4, unmeasured, keeps its 8)
+  // (past 256 channels 8 warps' rows are one block an SM - ~100 KB at 384, 133 at 512 - and 4 are faster on an A100:
+  // OpenDDE's trunk 1476 -> 1449 ms at 261 tokens, IntelliFold-2's 2323 -> 2301; level at 256)
+  if (C > 256) return 4;
   if (fitsSmem(wideTriInSmemW(C, 8))) return 8;
   return fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED)) ? TRIIN_ROUNDED : 4;
 }

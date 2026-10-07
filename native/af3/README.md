@@ -617,7 +617,9 @@ And the 256-channel fused transition (`transitionUpK`) at those widths too, whic
 (262 tokens, the triangle and transition together: 2160 against 1925 ms, 3360 against 2821 - the kernels have
 changed since): OpenDDE's trunk **1529 -> 1477 ms**, IntelliFold-2's **2455 -> 2327**, on top of the triangle, RMSDs
 within 0.005 A on two seeds each. ~100 KB a block at 8 warps, so a T4 keeps the unfused one; `LOCALFOLD_NO_WIDER=1`
-restores both. OpenDDE's trunk from 1688 to ~1480 ms and IntelliFold-2's from 2649 to ~2330 in all.
+restores both. The triangle's input kernel takes 4 warps past 256 channels, where 8 warps' rows are one block an
+SM (byte-identical; OpenDDE 1476 -> 1449 ms, IntelliFold-2 2323 -> 2301, level at 256). OpenDDE's trunk from 1688 to
+~1450 ms and IntelliFold-2's from 2649 to ~2300 in all (-14%, -13%).
 
 ## Tried and not taken
 
