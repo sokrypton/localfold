@@ -283,11 +283,21 @@ inline size_t wideTriOutSmemReal(int C) {
     constexpr int CC = decltype(width)::value;
     return std::max(triangleOutSmem<CC, 4, __nv_bfloat16, 16, __nv_bfloat16>(), triangleOutSmem<CC, 4, __nv_bfloat16, 16, float>());
   };
-  return C == 128 ? at(std::integral_constant<int, 128>{}) : at(std::integral_constant<int, 256>{});
+  switch (C) {
+    case 128: return at(std::integral_constant<int, 128>{});
+    case 384: return at(std::integral_constant<int, 384>{});
+    case 512: return at(std::integral_constant<int, 512>{});
+    default: return at(std::integral_constant<int, 256>{});
+  }
 }
 inline size_t wideTriFitsSmem(int C) { return std::max(wideTriInSmemW(C, 4), wideTriOutSmemReal(C)); }
 template <class F> void wideWidth(int C, F f) {
-  if (C == 128) f(std::integral_constant<int, 128>{}); else f(std::integral_constant<int, 256>{});
+  switch (C) {
+    case 128: f(std::integral_constant<int, 128>{}); break;
+    case 384: f(std::integral_constant<int, 384>{}); break;
+    case 512: f(std::integral_constant<int, 512>{}); break;
+    default: f(std::integral_constant<int, 256>{});
+  }
 }
 template <class F> void wideWarps(int C, F f) {
   int w = wideTriInWarps(C);
@@ -520,7 +530,10 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   };
   if constexpr (std::is_same_v<T, half>) {
     bool narrowFused = C == 128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
-    bool wide = (C == 256 || (C == 128 && !narrowFused)) && fitsSmem(wideTriFitsSmem(C));
+    // (384 and 512 channels - OpenDDE, IntelliFold-2 - too: their unfused triangle was the LN, a [C, 4C] GEMM, the gate,
+    // the centre norm, two GEMMs and a gated add; LOCALFOLD_NO_WIDER=1 keeps it)
+    static const bool wider = !getenv("LOCALFOLD_NO_WIDER");
+    bool wide = (C == 256 || (wider && (C == 384 || C == 512)) || (C == 128 && !narrowFused)) && fitsSmem(wideTriFitsSmem(C));
     if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wide) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual

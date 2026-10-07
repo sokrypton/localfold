@@ -604,6 +604,16 @@ goes to the add passes where cuBLAS cannot write a bf16 pair from f16 operands (
 COLAB T4 IT IS LEVEL OR SLOWER (protenix2's trunk 5654/6045/6589 -> 5725/6102/6602 ms, OpenDDE's 14811/14693 ->
 14603/14694), so it is off below sm_80; the 128-channel track keeps it there (boltz2 -2.7%).
 
+...and the streaming triangle (`triIn256K`, `triangleOutK`) at 384 and 512 channels too, where OpenDDE and
+IntelliFold-2 ran the unfused one - the LayerNorm, a [C, 4C] GEMM, the gate, the centre norm, two more GEMMs and a
+gated add. The kernels were written for any width and taken only at 256; 384 spills nothing that matters (255
+registers, 60 bytes, the 8-warp input form, ~100 KB) and 512 spills more and still wins. A100 at 261 tokens with a
+1024-row alignment: OpenDDE's trunk **1688 -> 1544 ms (-8.5%)** (1507 -> 1339 single-sequence), IntelliFold-2's
+**2649 -> 2453 (-7.4%)**; 5CAJ's CA RMSD the same to the third decimal on three seeds either way (1.775 / 1.896 /
+1.836 A), IntelliFold-2's 2.057 against 2.055. On a Colab T4, which takes OpenDDE's in its 4-warp form (512's does
+not fit 64 KB there): trunk 10787/11288/11676 -> 10404/10874/11414 ms. `LOCALFOLD_NO_WIDER=1` keeps the unfused
+triangle. 🔴 THE GATE CANNOT SEE IT: OpenDDE's case is 6MRR, 68 tokens, under the streaming triangle's 80.
+
 ## Tried and not taken
 
 - **More blocks an SM for the grid attention's `flashGrid2R`** (2026-10-07: `__launch_bounds__(..., 4)`, from
