@@ -63,9 +63,9 @@ __global__ void singleStructK(float* out, const float* a, const float* b, const 
 }
 // the residue pair under each structural pair, in matrix-group order
 __global__ void gatherPairSortedK(const float* pair, const int* order, const int* parent, float* out, int n, int nRes,
-                                  int C) {
+                                  int C, size_t rows) {       // (rows: of `order`, from its pointer - a chunk of it)
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
+  if (t >= rows * C) return;
   size_t r = t / C; int c = (int)(t % C);
   int ij = order[r], i = ij / n, j = ij % n;
   out[t] = pair[((size_t)parent[i] * nRes + parent[j]) * C + c];
@@ -74,9 +74,9 @@ __global__ void gatherPairSortedK(const float* pair, const int* order, const int
 __global__ void scatterPairK(float* pair, const float* gathered, const float* projected, const int* order,
                              const int* sameParent, const int* twin, const int* prev, const int* next, const int* type,
                              const float* eSame, const float* eTwin, const float* ePrev, const float* eNext,
-                             const float* eType, int n, int C) {
+                             const float* eType, int n, int C, size_t rows) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
+  if (t >= rows * C) return;
   size_t r = t / C; int c = (int)(t % C);
   int ij = order[r];
   pair[(size_t)ij * C + c] = gathered[t] + projected[t] + eSame[sameParent[ij] * C + c] + eTwin[twin[ij] * C + c]
@@ -129,29 +129,40 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
     for (size_t ij = 0; ij < pairs; ++ij) order[fill[hr[ij / n] * DDE_ROLES + hr[ij % n]]++] = (int)ij; }
   (void)hp;
   int* dOrder = upload(order.data(), pairs);
-  float* gathered = scratch<float>("st.gathered", pairs * C);
-  float* projected = scratch<float>("st.projected", pairs * C);
-  gatherPairSortedK<<<blocks(pairs * C), 256, 0, STREAM>>>(trunkPair, dOrder, parent, gathered, n, nRes, C);
   if (lenW(E + "pairBlockProj") != (size_t)DDE_ROLES * DDE_ROLES * C * C) { fprintf(stderr, "pairBlockProj is not 49 x C x C\n"); exit(1); }
-  for (int k = 0; k < DDE_ROLES * DDE_ROLES; ++k) {
-    int count = start[k + 1] - start[k];
-    if (!count) continue;
-    std::string w = E + "pairBlockProj#" + std::to_string(k);
-    if (!WF.count(w)) deviceWeight(w, (float*)W(E + "pairBlockProj") + (size_t)k * C * C, (size_t)C * C);
-    linear<float, float>(gathered + (size_t)start[k] * C, projected + (size_t)start[k] * C, count, C, C, w);
-  }
   s.pair = dalloc(pairs * C);
   const int *sp = Idev("structural.sameParent"), *tw = Idev("structural.twin"), *pv = Idev("structural.prevBackbone"),
             *nx = Idev("structural.nextBackbone"), *ty = Idev("structural.rolePairType");
-  scatterPairK<<<blocks(pairs * C), 256, 0, STREAM>>>(s.pair, gathered, projected, dOrder, sp, tw, pv, nx, ty,
-    W(E + "sameParentEmbedding"), W(E + "sameResidueTwinEmbedding"), W(E + "prevBbChainEmbedding"),
-    W(E + "nextBbChainEmbedding"), W(E + "rolePairTypeEmbedding"), n, C);
+  // the sorted pairs whole, or - where two f32 [pairs, C] work buffers do not fit beside the pair they build (12.2 GB
+  // each at 1450 residues) - in chunks of the sorted order, each role's GEMM over its part of the chunk (a GEMM of
+  // other rows may round differently, so only there)
+  const size_t per = roomFor(2 * pairs * C * 4) ? pairs : std::max<size_t>(1, CHUNK / C);
+  float* gathered = scratch<float>("st.gathered", per * C);
+  float* projected = scratch<float>("st.projected", per * C);
+  for (size_t a = 0; a < pairs; a += per) {
+    size_t cnt = std::min(per, pairs - a);
+    gatherPairSortedK<<<blocks(cnt * C), 256, 0, STREAM>>>(trunkPair, dOrder + a, parent, gathered, n, nRes, C, cnt);
+    for (int k = 0; k < DDE_ROLES * DDE_ROLES; ++k) {
+      size_t lo = std::max<size_t>(start[k], a), hi = std::min<size_t>(start[k + 1], a + cnt);
+      if (lo >= hi) continue;
+      std::string w = E + "pairBlockProj#" + std::to_string(k);
+      if (!WF.count(w)) deviceWeight(w, (float*)W(E + "pairBlockProj") + (size_t)k * C * C, (size_t)C * C);
+      linear<float, float>(gathered + (lo - a) * C, projected + (lo - a) * C, hi - lo, C, C, w);
+    }
+    scatterPairK<<<blocks(cnt * C), 256, 0, STREAM>>>(s.pair, gathered, projected, dOrder + a, sp, tw, pv, nx, ty,
+      W(E + "sameParentEmbedding"), W(E + "sameResidueTwinEmbedding"), W(E + "prevBbChainEmbedding"),
+      W(E + "nextBbChainEmbedding"), W(E + "rolePairTypeEmbedding"), n, C, cnt);
+  }
   s.bias = dalloc(pairs);
   attentionBiasK<<<blocks(pairs), 256, 0, STREAM>>>(s.bias, sp, tw, pv, nx, ty, W(E + "attnBiasSameParent"),
     W(E + "attnBiasSameResidueTwin"), W(E + "attnBiasPrevBbChain"), W(E + "attnBiasNextBbChain"),
     W(E + "attnBiasRolePairType"), pairs);
   structuralTap("expander.attnBias", s.bias, n, n, true);
   CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(dOrder));
+  // the two f32 [pairs, C] work buffers read by nothing past the scatter: given back before the refiner, whose
+  // pairformer blocks over the same structural pair need the room (9.8 GB each at 1300 residues, 2530 subtokens,
+  // which is what the refiner's triangle ran out beside) - cheap through the scratch pool
+  releaseScratch({ "st.gathered", "st.projected" });
   // the masks, from the structural batch's own seq mask
   std::vector<float> seq(M.f("sbatch.seqMask"), M.f("sbatch.seqMask") + n), pm(pairs);
   for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) pm[(size_t)i * n + j] = seq[i] * seq[j];
@@ -199,7 +210,7 @@ __global__ void slotMajorK(const float* w, float* out, int slots, int C, int bin
 struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm; };
 inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refinedSingle, const float* sInputs,
                                    const float* coords, const float* seqMask, const float* pairMask, const float* bias,
-                                   int n, int dense, int tmTokens) {
+                                   int n, int dense, int tmTokens, bool consume = false) {
   const std::string P = "ddeConfidence.";
   int C = (int)M.meta(P + "pairChannels"), Cs = (int)M.meta(P + "singleChannels"), F = (int)M.meta(P + "singleInputChannels");
   int bins = (int)M.meta(P + "distanceBins"), paeBins = (int)M.meta(P + "paeBins"), pdeBins = (int)M.meta(P + "pdeBins");
@@ -211,8 +222,10 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   clampK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, 512.f, (size_t)n * Cs);
   float* sn = scratch<float>("dc.singleNorm", (size_t)n * Cs);
   layerNorm2<float, float>(single, sn, n, Cs, P + "inputStrunkLnScale", P + "inputStrunkLnOffset");
-  float* pair = scratch<float>("dc.pair", pairs * C);
-  CK(cudaMemcpyAsync(pair, refinedPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+  // consume: the refined pair worked on in place - the fold's last head, nothing reads it after (the copy is a whole
+  // f32 pair, 7.7 GB at 1150 residues)
+  float* pair = consume ? const_cast<float*>(refinedPair) : scratch<float>("dc.pair", pairs * C);
+  if (!consume) CK(cudaMemcpyAsync(pair, refinedPair, pairs * C * 4, cudaMemcpyDeviceToDevice, STREAM));
   float* s1 = scratch<float>("dc.s1", (size_t)n * C); float* s2 = scratch<float>("dc.s2", (size_t)n * C);
   linear<float, float>(sInputs, s1, n, F, C, P + "s1");
   linear<float, float>(sInputs, s2, n, F, C, P + "s2");
@@ -223,38 +236,40 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
     if (CONF_HALF) pairformerBlockAt<half>(pair, sn, pairMask, seqMask, n, C, Cs, B, swap, divide, bias);
     else pairformerBlockAt<float>(pair, sn, pairMask, seqMask, n, C, Cs, B, swap, divide, bias);
   }
-  // PAE from the pair, PDE from the symmetrised pair; 64 bins over [0, 32], softmax against centres
+  // PAE from the pair, PDE from the symmetrised pair; 64 bins over [0, 32], softmax against centres - in blocks of
+  // rows (each pair's LayerNorm, projection and expectation are its own, so byte-identical): the symmetrised and the
+  // LayerNorm'd pair whole were two more f32 copies of the pair beside it and the refined one, 7.7 GB each at 1150
+  // residues (2236 structural tokens), which is what ran out of a 40 GB card
   DdeConfidence out;
   int NB = std::max(paeBins, pdeBins);
-  float* ln = scratch<float>("dc.ln", pairs * C);
-  float* logits = scratch<float>("dc.logits", pairs * NB);
-  float* val = scratch<float>("dc.val", pairs);
+  const size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(C, NB))));
+  float* ln = scratch<float>("dc.ln", R * n * C);
+  float* sym = scratch<float>("dc.sym", R * n * C);
+  float* logits = scratch<float>("dc.logits", R * n * NB);
+  float* pde = scratch<float>("dc.pde", pairs); float* pae = scratch<float>("dc.pae", pairs);
+  float* tm = scratch<float>("dc.tm", pairs);
   auto centresFor = [](int nb) {
     std::vector<float> c(nb); for (int b = 0; b < nb; ++b) c[b] = 32.f / nb * (b + 0.5f); return c;
   };
   std::vector<float> pdeC = centresFor(pdeBins), paeC = centresFor(paeBins);
-  float* dC = upload(pdeC.data(), pdeBins);
-  float* sym = scratch<float>("dc.sym", pairs * C);
-  symmetriseK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, sym, n, C);
-  layerNorm2<float, float>(sym, ln, pairs, C, P + "pdeLnScale", P + "pdeLnOffset");
-  linear<float, float>(ln, logits, pairs, C, pdeBins, P + "pde");
-  expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, val, nullptr, pairs, pdeBins, dC, 0, 1.f);
-  out.pde = download(val, pairs);
-  CK(cudaFree(dC)); dC = upload(paeC.data(), paeBins);
-  layerNorm2<float, float>(pair, ln, pairs, C, P + "paeLnScale", P + "paeLnOffset");
-  linear<float, float>(ln, logits, pairs, C, paeBins, P + "pae");
-  expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, val, nullptr, pairs, paeBins, dC, 0, 1.f);
-  out.pae = download(val, pairs);
-  {   // the TM term per pair off the same PAE distribution
-    double d0 = 1.24 * std::cbrt(std::max(tmTokens, 19) - 15.0) - 1.8;
-    std::vector<float> perBin(paeBins);
-    for (int b = 0; b < paeBins; ++b) perBin[b] = (float)(1 / (1 + (double)paeC[b] * paeC[b] / (d0 * d0)));
-    float* dPer = upload(perBin.data(), paeBins);
-    expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, val, nullptr, pairs, paeBins, dPer, 0, 1.f);
-    out.tmTerm = download(val, pairs);
-    CK(cudaFree(dPer));
+  double d0 = 1.24 * std::cbrt(std::max(tmTokens, 19) - 15.0) - 1.8;     // the TM term per pair off the PAE distribution
+  std::vector<float> perBin(paeBins);
+  for (int b = 0; b < paeBins; ++b) perBin[b] = (float)(1 / (1 + (double)paeC[b] * paeC[b] / (d0 * d0)));
+  float* dPde = upload(pdeC.data(), pdeBins); float* dPae = upload(paeC.data(), paeBins);
+  float* dPer = upload(perBin.data(), paeBins);
+  for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
+    size_t r = std::min(R, (size_t)n - r0), rows = r * n, p0 = r0 * n;
+    symmetriseRowsK<<<blocks(rows * C), 256, 0, STREAM>>>(pair, sym, n, C, r0, r);
+    layerNorm2<float, float>(sym, ln, rows, C, P + "pdeLnScale", P + "pdeLnOffset");
+    linear<float, float>(ln, logits, rows, C, pdeBins, P + "pde");
+    expectationK<<<blocks(rows), 256, 0, STREAM>>>(logits, pde + p0, nullptr, rows, pdeBins, dPde, 0, 1.f);
+    layerNorm2<float, float>(pair + p0 * C, ln, rows, C, P + "paeLnScale", P + "paeLnOffset");
+    linear<float, float>(ln, logits, rows, C, paeBins, P + "pae");
+    expectationK<<<blocks(rows), 256, 0, STREAM>>>(logits, pae + p0, nullptr, rows, paeBins, dPae, 0, 1.f);
+    expectationK<<<blocks(rows), 256, 0, STREAM>>>(logits, tm + p0, nullptr, rows, paeBins, dPer, 0, 1.f);
   }
-  CK(cudaFree(dC));
+  out.pde = download(pde, pairs); out.pae = download(pae, pairs); out.tmTerm = download(tm, pairs);
+  CK(cudaFree(dPde)); CK(cudaFree(dPae)); CK(cudaFree(dPer));
   // pLDDT per atom: the token's normalised single against the matrix of the atom's dense slot
   std::string wk = P + "plddtWeight~slotMajor";
   if (!WF.count(wk)) {

@@ -542,8 +542,9 @@ int main(int argc, char** argv) {
       if (structural) {
         // OpenDDE's own head on the structural tokens, mapped back: atoms through residueAtomGather,
         // pairs through each residue's representative (backbone) subtoken
+        const bool lastHead = c0 + cn == runs.size() && k + 1 == (int)cn;   // (no later sample or batch reads st.pair)
         DdeConfidence dc = ddeConfidence(st.pair, st.single, st.targetFeat, dBeta, st.seqMask, st.pairMask, st.bias,
-                                         nD, dense, t.n);
+                                         nD, dense, t.n, lastHead);
         const int* gather = M.i("structural.residueAtomGather"); const int* rep = M.i("structural.residueRepToken");
         std::vector<float> xr((size_t)t.n * dense * 3, 0.f);
         ck.plddt.assign((size_t)t.n * dense, 0.f);

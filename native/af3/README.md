@@ -962,6 +962,21 @@ Keeping the three updates' scratch instead (no release when the card holds it) w
 STREAM CAPTURES** ("operation not permitted when stream is capturing" out of `roomFor` inside a recycle pass's
 capture), so there `poolIdle` gives the last answer, which the eager pass the capture repeats was given.
 
+**A wide model's big-input paths take its bf16 pair too** (the grid attention's streamed LayerNorm and the single
+track's chunked pair logits were the two that read it as f32, so past the line its pair went back to f32):
+IntelliFold-2 at 960 tokens 36.4 -> 35.1 s, against 34.1 on the ordinary paths. The gates' big lane moves by the bf16
+pair and no further (OpenDDE 6MRR 1.083 -> 0.936 A, where its ordinary lanes read 1.081 and 0.939).
+
+🔴 **OpenDDE's CEILING ON 40 GB WAS ~1100 RESIDUES AND IS PAST 1450 NOW, AND NONE OF IT WAS THE TRUNK.** Its second
+token space (~2 structural tokens a residue) holds f32 [pairs, 384] tensors of 7.7 GB at 1150 residues and 12.2 at
+1450, and three stages held several at once: the confidence head's working copy, symmetrised and LayerNorm'd pairs
+beside the refined one (four whole copies - the PAE and PDE heads are per pair, so they run in row chunks now, and the
+fold's last head works on the refined pair in place instead of copying it); the expander's two work buffers, held
+through the refiner after it (given back now); and those same two buffers beside the 12.2 GB pair they build (in
+chunks of the role-sorted order where they do not fit - only there, since a GEMM over other rows may round
+differently). Every fold that fitted before is byte-identical, four samples across two seeds included. 1150 residues
+41.9 s at 22.3 GB, 1300 57.3 s at 26.3, **1450 73.9 s at 30.8**.
+
 Most of it is not the bf16 pair: OpenDDE at 765 with `LOCALFOLD_PAIR_F32=1` on the ordinary paths is 13.0 s.
 🔴 **AND THE FIRST RUN PAST THE OLD LINE RAN OUT OF MEMORY, IN A STAGE THE PAIR DOES NOT SIZE**: OpenDDE's
 structural expander works in its second token space (~2 tokens a residue) and takes two f32 [pairs, C] buffers
@@ -969,7 +984,8 @@ there - 6.8 GB each at 1080 residues - which ran beside the trunk's ordinary-pat
 mode gave that back between stages. The trunk's scratch now goes back BEFORE the expansion whenever the pair is over
 128 MB (`tightPair`), as it already did after it.
 
-🔴 **KNOWN: `foldFits` DOES NOT SIZE OpenDDE's SECOND TOKEN SPACE.** It asks by residues, and OpenDDE's sampler and
+🔴 **KNOWN: `foldFits` DOES NOT SIZE OpenDDE's SECOND TOKEN SPACE** (measured before its ceiling moved, below - the
+numbers here are a simulated T4's). It asks by residues, and OpenDDE's sampler and
 confidence head work over ~2 structural tokens a residue. Under a simulated T4 (all but 14.6 GiB held, its
 shared-memory limit, register-staged flash) OpenDDE folds 500 residues (971 structural tokens, ~11 GB) and runs out
 at 600 (1167: `dc.sym` wants 2.09 GB) - in both big-input rules, so not the line above - while `foldFits` would admit

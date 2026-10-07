@@ -19,6 +19,13 @@ __global__ void symmetriseK(const float* z, float* out, int T, int C) {
   out[t] = z[t] + z[((size_t)j * T + i) * C + c];
 }
 
+// rows [r0, r0 + R) of z + z^T (the whole: symmetriseK)
+__global__ void symmetriseRowsK(const float* z, float* out, int T, int C, size_t r0, size_t R) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= R * T * C) return;
+  int c = (int)(t % C); size_t ij = t / C; size_t i = r0 + ij / T, j = ij % T;
+  out[t] = z[(i * T + j) * C + c] + z[(j * T + i) * C + c];
+}
 __global__ void gateMulAddK(float* pair, const float* out, const float* gate, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n) pair[t] += out[t] / (1.f + __expf(-gate[t]));
