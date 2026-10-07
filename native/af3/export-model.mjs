@@ -465,7 +465,8 @@ if (dialect.chiralCentres === true) {
     || dialect.rosettafold3TemplateFeatures === true;
   const width = dialect.boltz2TemplateFeatures ? 109 : dialect.rosettafold3TemplateFeatures ? 66
     : dialect.fusedTemplateLayout ? dialect.fusedTemplateLayout.distogramBins + 1 + 2 * dialect.fusedTemplateLayout.restypes + 4 : 0;
-  const { fusedTemplateFeatures } = fused ? await import(`${repo}/src/af3/trunk/template-webgpu.js`) : {};
+  const { fusedTemplateFeatures, fusedTemplateFeaturesSparse, sparseTemplateFeatures } =
+    fused ? await import(`${repo}/src/af3/trunk/template-webgpu.js`) : {};
   if (slots.length > TEMPLATES) throw new Error(`${slots.length} template slots; every family folds with at most ${TEMPLATES}`);
   const passes = [];
   if (dialect.templateFeatureMeanOnePass === true) {
@@ -507,44 +508,14 @@ if (dialect.chiralCentres === true) {
       // the feature columns sparse - a row's nonzero (column, value) pairs, K the most any row has, the rest -1 - and
       // scattered back on the device into the dense matrix the projection reads: dense they were 108 floats a pair
       // in every pass, an empty one included (protenix2 at 1,020 tokens: a 1.3 GB input and 4.9 s of export)
-      const rows = batch.tokens * batch.tokens, gap = (pass.emptyAatype ?? 0) !== 0;
-      // (an empty slot's rows are all one row - no geometry, one residue class: taken from a two-token input, its four
-      // rows checked equal, and tiled, rather than built and scanned at every pair)
-      let dense = pass.features, tile = null;
-      if (dense === undefined && !real) {
-        const small = fusedTemplateFeatures(undefined, 2, width, dialect, undefined, gap);
-        let same = true;
-        for (let r = 1; r < 4 && same; r += 1) for (let c = 0; c < width; c += 1) if (small[r * width + c] !== small[c]) { same = false; break; }
-        if (same) tile = small.subarray(0, width);
-      }
-      if (dense === undefined && tile === null) {
-        dense = fusedTemplateFeatures(real ? pass.slot : undefined, batch.tokens, width, dialect, real ? pass.mask : undefined, gap);
-      }
-      let K = 1;
-      if (tile !== null) {
-        K = Math.max(1, tile.reduce((n, v) => n + (v !== 0 ? 1 : 0), 0));
-      } else {
-        for (let r = 0; r < rows; r += 1) {
-          let nz = 0;
-          for (let c = 0; c < width; c += 1) if (dense[r * width + c] !== 0) nz += 1;
-          if (nz > K) K = nz;
-        }
-      }
-      const idx = new Int32Array(rows * K).fill(-1), val = new Float32Array(rows * K);
-      if (tile !== null) {
-        const ti = new Int32Array(K).fill(-1), tv = new Float32Array(K);
-        let at = 0;
-        for (let c = 0; c < width; c += 1) if (tile[c] !== 0) { ti[at] = c; tv[at] = tile[c]; at += 1; }
-        for (let r = 0; r < rows; r += 1) { idx.set(ti, r * K); val.set(tv, r * K); }
-      } else {
-        for (let r = 0; r < rows; r += 1) {
-          let at = r * K;
-          for (let c = 0; c < width; c += 1) {
-            const v = dense[r * width + c];
-            if (v !== 0) { idx[at] = c; val[at] = v; at += 1; }
-          }
-        }
-      }
+      // (the page's own sparse form - src/af3/trunk/template-webgpu.js, sparseTemplateFeatures - split into the
+      // native port's columns and values)
+      const gap = (pass.emptyAatype ?? 0) !== 0;
+      const packed = pass.features !== undefined ? sparseTemplateFeatures(pass.features, width)
+        : fusedTemplateFeaturesSparse(real ? pass.slot : undefined, batch.tokens, width, dialect, real ? pass.mask : undefined, gap);
+      const K = packed[0], rows = (packed.length - 1) / (2 * K);
+      const idx = new Int32Array(rows * K), val = new Float32Array(rows * K), words = new Uint32Array(val.buffer);
+      for (let e = 0; e < rows * K; e += 1) { idx[e] = packed[1 + 2 * e] | 0; words[e] = packed[2 + 2 * e]; }
       add(`template.${k}.featuresIdx`, idx);
       add(`template.${k}.featuresVal`, val);
       add(`template.${k}.featuresK`, K);

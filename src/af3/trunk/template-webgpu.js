@@ -202,6 +202,17 @@ export function fusedTemplateFeatures(template, tokens, width, dialect,
   // worse still, and this reads what is below. Written the wrong way twice
   // before the batch dump was read carefully enough to notice that a one-hot of
   // zero is a one.
+  const columns = emptyTemplateColumns(dialect, useGap);
+  const pairs = tokens * tokens;
+  const features = new Float32Array(pairs * width);
+  for (let index = 0; index < pairs; index += 1) {
+    for (const column of columns) features[index * width + column] = 1;
+  }
+  return features;
+}
+
+// The columns an empty slot sets to 1, every pair alike (see fusedTemplateFeatures' empty branch)
+export function emptyTemplateColumns(dialect, useGap = true) {
   const layout = dialect?.fusedTemplateLayout;
   const gapColumns = dialect?.emptyTemplateRestypeColumns;
   const columns = useGap ? gapColumns
@@ -212,12 +223,56 @@ export function fusedTemplateFeatures(template, tokens, width, dialect,
       + "empty template slot carries GAP under protenix2 and zeros under "
       + "boltz2, and guessing either is a different model");
   }
-  const pairs = tokens * tokens;
-  const features = new Float32Array(pairs * width);
-  for (let index = 0; index < pairs; index += 1) {
-    for (const column of columns) features[index * width + column] = 1;
+  return columns;
+}
+
+// 🔴 THE FEATURES SPARSE, AS THE SHADER CONSUMES THEM. Dense, a slot was 108-109 floats a pair - an empty slot's
+// included, whose rows are all one row - built on the host and uploaded: 864 MB at 1,020 tokens for protenix2 with
+// no template at all (measured through the native port's exporter, which built the same arrays). Each row instead
+// carries its nonzero (column, value) pairs IN COLUMN ORDER, K the most any row has and the rest padding: the
+// shader adds the same terms in the same order the dense loop did when it skipped the zeros, so the embed is
+// byte-identical. Layout: [K, then rows x K x (column, f32 bits)], padding column SPARSE_PAD.
+export const SPARSE_PAD = 0xFFFFFFFF;
+const ONE_BITS = 0x3F800000;
+export function sparseTemplateFeatures(dense, width) {
+  const rows = dense.length / width;
+  let K = 1;
+  for (let r = 0; r < rows; r += 1) {
+    let nz = 0;
+    for (let c = 0; c < width; c += 1) if (dense[r * width + c] !== 0) nz += 1;
+    if (nz > K) K = nz;
   }
-  return features;
+  const packed = new Uint32Array(1 + rows * K * 2);
+  const bits = new Float32Array(1), word = new Uint32Array(bits.buffer);
+  packed[0] = K;
+  for (let r = 0; r < rows; r += 1) {
+    let at = 1 + r * K * 2, k = 0;
+    for (let c = 0; c < width; c += 1) {
+      const v = dense[r * width + c];
+      if (v === 0) continue;
+      bits[0] = v; packed[at] = c; packed[at + 1] = word[0]; at += 2; k += 1;
+    }
+    for (; k < K; k += 1, at += 2) packed[at] = SPARSE_PAD;
+  }
+  return packed;
+}
+// fusedTemplateFeatures, sparse - an empty slot's rows written from its columns, never built dense
+export function fusedTemplateFeaturesSparse(template, tokens, width, dialect, multichainMask2d = undefined,
+                                            useGap = true) {
+  if (template !== undefined && template !== null) {
+    return sparseTemplateFeatures(fusedTemplateFeatures(template, tokens, width, dialect, multichainMask2d, useGap), width);
+  }
+  const columns = [...emptyTemplateColumns(dialect, useGap)].sort((a, b) => a - b);
+  const K = Math.max(1, columns.length), rows = tokens * tokens;
+  const row = new Uint32Array(K * 2);
+  for (let k = 0; k < K; k += 1) {
+    row[2 * k] = k < columns.length ? columns[k] : SPARSE_PAD;
+    row[2 * k + 1] = k < columns.length ? ONE_BITS : 0;
+  }
+  const packed = new Uint32Array(1 + rows * K * 2);
+  packed[0] = K;
+  for (let r = 0; r < rows; r += 1) packed.set(row, 1 + r * K * 2);
+  return packed;
 }
 
 export function packTemplateWeights(weights) {
@@ -525,7 +580,7 @@ const W_Z_PROJECTION: u32 = ${offsets.zProjection ?? 0}u;
 const W_A_PROJECTION: u32 = ${offsets.aProjection ?? 0}u;
 
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
-@group(0) @binding(1) var<storage, read> features: array<f32>;
+@group(0) @binding(1) var<storage, read> features: array<u32>;   // sparse: see sparseTemplateFeatures
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> act: array<f32>;
 ${embedPrelude}
@@ -540,11 +595,13 @@ ${projectRows("W_Z_PROJECTION")}
     for (var r = 0u; r < EMBED_ROWS; r += 1u) {
       let row = first + r;
       if (row >= PAIRS) { break; }
-      let feature_base = row * FEATURE_WIDTH;
+      let feature_k = features[0];
+      let feature_base = 1u + row * feature_k * 2u;
       var value = values[r];
-      for (var c = 0u; c < FEATURE_WIDTH; c += 1u) {
-        let f = features[feature_base + c];
-        if (f != 0.0) { value += f * weights[W_A_PROJECTION + c * CHANNELS + e]; }
+      for (var k = 0u; k < feature_k; k += 1u) {
+        let c = features[feature_base + 2u * k];
+        if (c == 0xFFFFFFFFu) { break; }
+        value += bitcast<f32>(features[feature_base + 2u * k + 1u]) * weights[W_A_PROJECTION + c * CHANNELS + e];
       }
       act[row * CHANNELS + e] = value;
     }
@@ -866,10 +923,11 @@ export class Af3TemplateEmbedderGpu {
           // gated by nothing, so this refuses rather than guessing.
           features: fused ? keep(this.allocator.upload(
             `af3-template.features.${slot}`,
-            given ?? fusedTemplateFeatures(template, tokens, featureWidth, dialect,
-                                  template === undefined || template === null
-                                    ? undefined : chainMaskFor(template),
-                                  (emptyAatype ?? 0) !== 0),
+            given !== undefined ? sparseTemplateFeatures(given, featureWidth)
+              : fusedTemplateFeaturesSparse(template, tokens, featureWidth, dialect,
+                                            template === undefined || template === null
+                                              ? undefined : chainMaskFor(template),
+                                            (emptyAatype ?? 0) !== 0),
             storage)) : undefined,
         });
       }
