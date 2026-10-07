@@ -18,9 +18,10 @@
 // one) and, past 1, triIn256K's rounds - a T4's form: 16 warps, their rows normed 32 at a time beside 16-column
 // stages, ~49 KB where the 8-warp form is 67.6 KB. Every output's sum over k runs in the same order in all
 // forms, so they are byte-identical.
-template <int C, int WARPS, int NC = 32, int XROUNDS = 1>
+// TG: the gated rows' type (bf16 for a second GEMM that accumulates straight into a bf16 pair)
+template <int C, int WARPS, int NC = 32, int XROUNDS = 1, class PT = float, class TG = half>
 __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
-    const float* __restrict__ lnOffset, const half* __restrict__ W1t, half* __restrict__ gated, size_t rows, int I) {
+    const float* __restrict__ lnOffset, const half* __restrict__ W1t, TG* __restrict__ gated, size_t rows, int I) {
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, KS = C / 16;
   constexpr size_t STAGE = (size_t)2 * C * NC * 2;
   auto sw = [](int k, int c) { return stageSw<NC>(k, c); };
@@ -54,8 +55,8 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
 #endif
   uint32_t xa[KS][4];
   if constexpr (XROUNDS == 1) {
-    lnRowsToShared<C, R, WARPS>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
-                                lnScale, lnOffset, Xs, LDX, warp, lane);
+    lnRowsToShared<C, R, WARPS, PT>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
+                                    lnScale, lnOffset, Xs, LDX, warp, lane);
     __syncthreads();
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
@@ -67,7 +68,7 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
     issue(0, 0);
 #pragma unroll 1
     for (int rd = 0; rd < XROUNDS; ++rd) {
-      lnRowsToShared<C, XR, WARPS>(x, [&](int r) { size_t row = row0 + rd * XR + r; return row < rows ? row : SIZE_MAX; },
+      lnRowsToShared<C, XR, WARPS, PT>(x, [&](int r) { size_t row = row0 + rd * XR + r; return row < rows ? row : SIZE_MAX; },
                                    lnScale, lnOffset, Xs, LDX, warp, lane);
       __syncthreads();
       if (warp * 16 / XR == rd) {
@@ -107,8 +108,13 @@ __global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restr
     for (int nt = 0; nt < NC / 8; ++nt) {
       auto gate = [&](int e) { float v = ha[nt][e]; return v * sigmH(v) * hb[nt][e]; };   // rounded to f16 next
       int c = j * NC + nt * 8 + tig * 2;
-      if (r0 < rows) *reinterpret_cast<uint32_t*>(gated + r0 * I + c) = pack2(gate(0), gate(1));
-      if (r1 < rows) *reinterpret_cast<uint32_t*>(gated + r1 * I + c) = pack2(gate(2), gate(3));
+      if constexpr (std::is_same_v<TG, half>) {
+        if (r0 < rows) *reinterpret_cast<uint32_t*>(gated + r0 * I + c) = pack2(gate(0), gate(1));
+        if (r1 < rows) *reinterpret_cast<uint32_t*>(gated + r1 * I + c) = pack2(gate(2), gate(3));
+      } else {
+        if (r0 < rows) *reinterpret_cast<__nv_bfloat162*>(gated + r0 * I + c) = __floats2bfloat162_rn(gate(0), gate(1));
+        if (r1 < rows) *reinterpret_cast<__nv_bfloat162*>(gated + r1 * I + c) = __floats2bfloat162_rn(gate(2), gate(3));
+      }
     }
 #if LF_REG_STAGES
     if (j + 1 < chunks) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });

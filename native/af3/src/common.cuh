@@ -1347,6 +1347,20 @@ inline const half* segmentHalf(const std::string& k) {
   if (it == WH_AT.end()) { fprintf(stderr, "%s is not a float tensor of its file\n", k.c_str()); exit(1); }
   return it->second;
 }
+__global__ void toBf16WK(const float* in, __nv_bfloat16* out, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16(in[i]);
+}
+// a weight's bf16 copy (a GEMM whose operands and output are bf16: a product accumulated straight into a bf16 pair)
+inline const __nv_bfloat16* Wbf(const std::string& k) {
+  static std::map<std::string, __nv_bfloat16*> cache;
+  auto it = cache.find(k);
+  if (it != cache.end()) return it->second;
+  const float* f = W(k); size_t n = lenW(k);
+  __nv_bfloat16* b = dallocT<__nv_bfloat16>(n);
+  toBf16WK<<<blocks(n), 256, 0, STREAM>>>(f, b, n);
+  return cache[k] = b;
+}
 inline const half* Wh(const std::string& k) {
   auto it = WH.find(k);
   if (it != WH.end()) return it->second;
@@ -1411,7 +1425,7 @@ inline const float* Fdev(const std::string& k) {     // non-weight float inputs 
 // The activations' storage type is T throughout a stage: float for the precise path that
 // is checked against AF3, half for the fast one. Residual streams stay f32 either way.
 template <class T> constexpr cudaDataType cudaType() {
-  return std::is_same_v<T, float> ? CUDA_R_32F : CUDA_R_16F;
+  return std::is_same_v<T, float> ? CUDA_R_32F : std::is_same_v<T, __nv_bfloat16> ? CUDA_R_16BF : CUDA_R_16F;
 }
 template <class T> __device__ __forceinline__ float toF(T v) {
   if constexpr (std::is_same_v<T, float>) return v;
@@ -1443,7 +1457,9 @@ void linear(const T* X, TY* Y, size_t rows, int in, int out, const std::string& 
             bool transposed = false, float beta = 0.f, float alpha = 1.f) {
   const float one = alpha;
   const void* Wp;
-  if constexpr (std::is_same_v<T, float>) Wp = W(w); else Wp = Wh(w);
+  if constexpr (std::is_same_v<T, float>) Wp = W(w);
+  else if constexpr (std::is_same_v<T, __nv_bfloat16>) Wp = Wbf(w);
+  else Wp = Wh(w);
   if (lenW(w) != (size_t)in * out) {
     fprintf(stderr, "%s has %zu elements, not %d x %d\n", w.c_str(), lenW(w), in, out); exit(1);
   }

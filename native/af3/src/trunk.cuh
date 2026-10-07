@@ -1015,13 +1015,14 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
       fused = true;
     }
   if (!fused) {
-    if (pair16) { PAIR16 = true; needF32Pair("the single track's unfused pair logits"); }
     float* flat = scratch<float>("st.flat", pairs * heads);
     size_t rowsPer = std::max<size_t>(1, CHUNK / C);
     T* ln = scratch<T>("st.ln", std::min(rowsPer, pairs) * C);
     for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
       size_t r = std::min(rowsPer, pairs - r0);
-      layerNorm2<float, T>(pair + r0 * C, ln, r, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
+      PAIR16 = pair16;               // (the pair read in its own element type; the rest of the track is f32)
+      lnPairRows<T>(pair, r0, ln, r, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
+      PAIR16 = false;
       linear<T, float>(ln, flat + r0 * heads, r, C, heads, B + ".singlePairLogitsProjection");
     }
     logitsLayoutK<<<blocks(pairs * heads), 256, 0, STREAM>>>(flat, pl, pairs, heads);

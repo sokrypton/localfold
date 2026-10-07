@@ -40,11 +40,6 @@ void layerNorm2(const TI* in, TO* out, size_t rows, int C, const std::string& sc
                 const std::string& offset) {
   layerNormK<TI, TO><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(in, out, rows, C, W(scale), W(offset));
 }
-template <class T>
-__global__ void gatedAddK(float* pair, const T* proj, const T* gate, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) pair[i] += toF(proj[i]) * sigm(toF(gate[i]));
-}
 // gated = swish(a) * b (* u with `up`: boltz2's conditioned transition up-gate), a row of wide
 // being [a | b] or [a | b | u], each I wide
 template <class T>
@@ -195,13 +190,61 @@ __global__ void centerNormStreamK(const float* prod, TO* out, size_t r0, size_t 
   }
 }
 
-inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
 inline bool TIGHT_STACK = false;          // the template stack on a trunk short of room (triangle, templateEmbedding)
 inline bool FUSED_GRID = true;
 inline bool TRI_BF16 = true;
 inline int TRI_PAD = 8;           // the triangle's padded size is a multiple of this (0: none)
+inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
 #include "fusedtriangle.cuh"
 #include "fused256.cuh"
+template <class T, class PT = float>
+__global__ void gatedAddK(float* pair, const T* proj, const T* gate, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) pairSt<PT>(pair, i, pairLd<PT>(pair, i) + toF(proj[i]) * sigm(toF(gate[i])));
+}
+// ---- the pair's rows in either element type (PAIR16): a row's address, a LayerNorm of rows, a product added in
+inline float* pairRow(float* pair, size_t row, int C) {
+  return PAIR16 ? reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(pair) + row * C) : pair + row * C;
+}
+inline const float* pairRow(const float* pair, size_t row, int C) { return pairRow(const_cast<float*>(pair), row, C); }
+// pair16[r] += h[r] for rows of C halves (the bf16 pair's row-direction grid output, after its f16 GEMM)
+__global__ void addHalfToBf16K(__nv_bfloat16* pair, const half* h, size_t n8) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n8) return;
+  uint4 p = reinterpret_cast<uint4*>(pair)[i], a = reinterpret_cast<const uint4*>(h)[i];
+  __nv_bfloat162* pp = reinterpret_cast<__nv_bfloat162*>(&p); const half2* aa = reinterpret_cast<const half2*>(&a);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    float2 x = __bfloat1622float2(pp[k]), y = __half22float2(aa[k]);
+    pp[k] = __floats2bfloat162_rn(x.x + y.x, x.y + y.y);
+  }
+  reinterpret_cast<uint4*>(pair)[i] = p;
+}
+inline void rowOut16(const half* gathered, float* pair, size_t rows, int Wd, int C, const std::string& w) {
+  // (in chunks: a whole pass's product would be a pair-sized f16 tensor, the bytes the bf16 pair saves)
+  size_t per = std::max<size_t>(1, std::min(rows, CHUNK / C));
+  half* o = scratch<half>("grid.out16", per * C);
+  for (size_t r0 = 0; r0 < rows; r0 += per) {
+    size_t r = std::min(per, rows - r0);
+    linear<half, half>(gathered + r0 * Wd, o, r, Wd, C, w);
+    addHalfToBf16K<<<blocks(r * C / 8), 256, 0, STREAM>>>(reinterpret_cast<__nv_bfloat16*>(pair) + r0 * C, o, r * C / 8);
+  }
+}
+// LN of pair rows [r0, r0 + rows) into out (the pair f32 or, under PAIR16, bf16)
+template <class TO>
+inline void lnPairRows(const float* pair, size_t r0, TO* out, size_t rows, int C, const std::string& scale,
+                       const std::string& offset) {
+  WITH_PAIR_T(layerNormK<PT, TO><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(
+    reinterpret_cast<const PT*>(pair) + r0 * C, out, rows, C, W(scale), W(offset)));
+}
+// pair rows [r0, r0 + rows) += X W: the GEMM's own beta into an f32 pair, an f16 product and an add into a bf16 one
+template <class T>
+inline void linearIntoPairRows(const T* X, float* pair, size_t r0, size_t rows, int in, int C, const std::string& w) {
+  if constexpr (std::is_same_v<T, half>) if (PAIR16) { rowOut16(X, pairRow(pair, r0, C), rows, in, C, w); return; }
+  needF32Pair("a precise-path product into the pair");
+  linear<T, float>(X, pair + r0 * C, rows, in, C, w, false, 1.f);
+}
+
 // The 256-channel pair track's fused kernels (fused256.cuh, ESMFold2's): native/af3's at 128 channels hold
 // a whole output tile or weight on the chip, which at 256 is past the registers and shared memory a block
 // gets; these stream their weights in narrower steps, two blocks an SM. Below ~80 tokens their tiles leave
@@ -543,7 +586,6 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       return;
     }
   }
-  needF32Pair("the unfused triangle");
   buffers();
   T* norm = scratch<T>("tri.norm", pairs * C);
   size_t rowsPer = std::max<size_t>(1, CHUNK / (4 * C));
@@ -551,8 +593,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   T* pgOut = scratch<T>("tri.pg", std::min(rowsPer, pairs) * 4 * C);
   for (size_t r0 = 0; r0 < pairs; r0 += rowsPer) {
     size_t rows = std::min(rowsPer, pairs - r0);
-    layerNorm2<float, T>(pair + r0 * C, norm + r0 * C, rows, C, pre + ".leftNormInputScale",
-                         pre + ".leftNormInputOffset");
+    lnPairRows<T>(pair, r0, norm + r0 * C, rows, C, pre + ".leftNormInputScale", pre + ".leftNormInputOffset");
     linear<T, T>(norm + r0 * C, pgOut, rows, C, 4 * C, pg);
     triGateK<T><<<dim3((unsigned)((rows + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(
       pgOut, mask, a, b, r0, rows, C, cs, n, np);
@@ -578,7 +619,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     }
     linear<T, T>(centred, t1, rows, C, C, pre + ".outputProjection");
     linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
-    gatedAddK<T><<<blocks(rows * C), 256, 0, STREAM>>>(into(pair) + r0 * C, t1, t2, rows * C);
+    WITH_PAIR_T(gatedAddK<T, PT><<<blocks(rows * C), 256, 0, STREAM>>>(pairRow(into(pair), r0, C), t1, t2, rows * C));
   }
 }
 
@@ -597,15 +638,29 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
     // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
     // residual as its beta - the [rows, 2I] widening never written
     if (FUSED_WIDE && FUSED_TRANSITION && rows >= (size_t)FUSED_WIDE_MIN_TOKENS * FUSED_WIDE_MIN_TOKENS && wideFits(C)) {
-      needF32Pair("the 256-channel transition");
       constexpr int WU = 8, R = 16 * WU;
       // whole waves of transitionUpK inside the same budget (transitionUpChunkRows)
       size_t rowsPer = transitionUpChunkRows<256, WU>(wideUpSmem(256), std::max<size_t>(R, CHUNK / (2 * I)));
-      half* gated = scratch<half>("tr.gated", std::min(rowsPer, rows) * I);
       half* w1t = scratch<half>("tr.w1t", (size_t)2 * C * I);
       tileTransitionUp(Wh(pre + ".transition1"), C, I, w1t);
       wideWidth(C, [&](auto width) {
         constexpr int CC = decltype(width)::value;
+        if (PAIR16) {
+          // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the
+          // pair - no f16 product and add pass
+          using B16 = __nv_bfloat16;
+          B16* gated = scratch<B16>("tr.gatedbf", std::min(rowsPer, rows) * I);
+          static bool attr = false;
+          if (!attr) { smemAttr((transitionUpK<CC, WU, 32, 1, B16, B16>), (int)wideUpSmem(CC)); attr = true; }
+          for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
+            size_t r = std::min(rowsPer, rows - r0);
+            transitionUpK<CC, WU, 32, 1, B16, B16><<<(unsigned)((r + R - 1) / R), 32 * WU, wideUpSmem(CC), STREAM>>>(
+              pairRow(x, r0, C), W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"), w1t, gated, r, I);
+            linear<B16, B16>(gated, reinterpret_cast<B16*>(pairRow(into(x), r0, C)), r, I, C, pre + ".transition2", false, 1.f);
+          }
+          return;
+        }
+        half* gated = scratch<half>("tr.gated", std::min(rowsPer, rows) * I);
         static bool attr = false;
         if (!attr) { smemAttr((transitionUpK<CC, WU>), (int)wideUpSmem(CC)); attr = true; }
         for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
@@ -623,7 +678,6 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   }
   // every row in one pass where the card has the room (OpenDDE at 255 tokens: the trunk's transitions 370 -> 353
   // ms for 0.6 GB; chunks of 1-8k rows, small enough for L2 to hold the widening, are 397-615 - the GEMMs lose more)
-  needF32Pair("the unfused transition");
   size_t rowsPer = std::max<size_t>(1, CHUNK / (2 * I));
   if (rows > rowsPer && roomFor(rows * (C + 3 * (size_t)I) * sizeof(T), {"tr.x", "tr.wide", "tr.gated"})) rowsPer = rows;
   T* xn = scratch<T>("tr.x", std::min(rowsPer, rows) * C);
@@ -631,10 +685,10 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   T* gated = scratch<T>("tr.gated", std::min(rowsPer, rows) * I);
   for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
     size_t r = std::min(rowsPer, rows - r0);
-    layerNorm2<float, T>(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
+    lnPairRows<T>(x, r0, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
     linear<T, T>(xn, wide, r, C, 2 * I, pre + ".transition1");
     swiglu<T>(wide, gated, r, I);
-    linear<T, float>(gated, into(x) + r0 * C, r, I, C, pre + ".transition2", false, 1.f);
+    linearIntoPairRows<T>(gated, into(x), r0, r, I, C, pre + ".transition2");
   }
 }
 
@@ -688,16 +742,18 @@ inline std::string paddedColumns(const std::string& w, int C, int k, int kp) {
   return concatColumns(w + "~pad" + std::to_string(kp), C, {{w, k, false}, {"", kp - k, false}});
 }
 // pair[(r, j) or (j, r)] += out[r][j], four channels a thread (C a multiple of 4)
-__global__ void addGridK(float* pair, const float* out, int n, int C, size_t r0, size_t R, bool tr) {
+template <class PT = float, class TO = float>
+__global__ void addGridK(float* pair, const TO* out, int n, int C, size_t r0, size_t R, bool tr) {
   int c4 = C / 4;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= R * n * c4) return;
   int c = (int)(t % c4); size_t rest = t / c4; size_t j = rest % n; size_t r = r0 + rest / n;
   size_t to = tr ? (j * n + r) : (r * n + j);
-  float4* p = reinterpret_cast<float4*>(pair) + to * c4 + c;
-  float4 v = *p, o = reinterpret_cast<const float4*>(out)[t];
+  float4 v = pairLd4<PT>(pair, (to * c4 + c) * 4), o;
+  if constexpr (std::is_same_v<TO, float>) o = reinterpret_cast<const float4*>(out)[t];
+  else { o.x = toF(out[t * 4]); o.y = toF(out[t * 4 + 1]); o.z = toF(out[t * 4 + 2]); o.w = toF(out[t * 4 + 3]); }
   v.x += o.x; v.y += o.y; v.z += o.z; v.w += o.w;
-  *p = v;
+  pairSt4<PT>(pair, (to * c4 + c) * 4, v);
 }
 template <class T>
 __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
@@ -712,7 +768,7 @@ __global__ void addGateBiasK(T* qkvg, const float* bias, size_t rows, int Wd) {
 // layerNormK norms it (the same arithmetic, so `norm` is byte-identical) into `norm` AND shared memory, then
 // projected on the tensor cores to 16 padded heads, head-major (out[h][row]) - where cuBLAS took the
 // few-column GEMM as a 16x16 WMMA kernel that read the whole normed pair back.
-template <int C, int WARPS>
+template <int C, int WARPS, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restrict__ x, const float* __restrict__ scale,
     const float* __restrict__ offset, const half* __restrict__ Wp, half* __restrict__ norm, float* __restrict__ out,
     size_t rows, int heads) {
@@ -739,7 +795,7 @@ __global__ void __launch_bounds__(WARPS * 32) lnNormHeadsK(const float* __restri
     for (int b = 0; b < B; ++b) {
       size_t row = row0 + warp * 16 + i0 + b;
 #pragma unroll
-      for (int k = 0; k < K; ++k) v[b][k] = row < rows ? x[row * C + lane + 32 * k] : 0.f;
+      for (int k = 0; k < K; ++k) v[b][k] = row < rows ? pairLd<PT>(x, row * C + lane + 32 * k) : 0.f;
     }
 #pragma unroll
     for (int b = 0; b < B; ++b) {
@@ -787,11 +843,12 @@ inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, 
     constexpr int CC = decltype(width)::value, WARPS = 4, R = 16 * WARPS;   // (8 warps: no faster)
     constexpr size_t smem = lnNormHeadsSmem<CC>(WARPS);
     if (!fitsSmem(smem)) return false;
-    static bool attr = false;
-    if (!attr) { smemAttr((lnNormHeadsK<CC, WARPS>), (int)smem); attr = true; }
     std::string wb = concatColumns(pre + ".pairBiasProjection~pad16", CC, {{pre + ".pairBiasProjection", heads, false}, {"", 16 - heads, false}});
-    lnNormHeadsK<CC, WARPS><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-      pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wb), norm, raw, rows, heads);
+    WITH_PAIR_T(
+      static bool attr = false;
+      if (!attr) { smemAttr((lnNormHeadsK<CC, WARPS, PT>), (int)smem); attr = true; }
+      lnNormHeadsK<CC, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+        pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wb), norm, raw, rows, heads));
     return true;
   };
   switch (C) {
@@ -802,33 +859,6 @@ inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, 
   }
 }
 // the pair's row `row` (of C channels) as a float* base in whichever storage PAIR16 says it has
-inline float* pairRow(float* pair, size_t row, int C) {
-  return PAIR16 ? reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(pair) + row * C) : pair + row * C;
-}
-inline const float* pairRow(const float* pair, size_t row, int C) { return pairRow(const_cast<float*>(pair), row, C); }
-// pair16[r] += h[r] for rows of C halves (the bf16 pair's row-direction grid output, after its f16 GEMM)
-__global__ void addHalfToBf16K(__nv_bfloat16* pair, const half* h, size_t n8) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n8) return;
-  uint4 p = reinterpret_cast<uint4*>(pair)[i], a = reinterpret_cast<const uint4*>(h)[i];
-  __nv_bfloat162* pp = reinterpret_cast<__nv_bfloat162*>(&p); const half2* aa = reinterpret_cast<const half2*>(&a);
-#pragma unroll
-  for (int k = 0; k < 4; ++k) {
-    float2 x = __bfloat1622float2(pp[k]), y = __half22float2(aa[k]);
-    pp[k] = __floats2bfloat162_rn(x.x + y.x, x.y + y.y);
-  }
-  reinterpret_cast<uint4*>(pair)[i] = p;
-}
-inline void rowOut16(const half* gathered, float* pair, size_t rows, int Wd, int C, const std::string& w) {
-  // (in chunks: a whole pass's product would be a pair-sized f16 tensor, the bytes the bf16 pair saves)
-  size_t per = std::max<size_t>(1, std::min(rows, CHUNK / C));
-  half* o = scratch<half>("grid.out16", per * C);
-  for (size_t r0 = 0; r0 < rows; r0 += per) {
-    size_t r = std::min(per, rows - r0);
-    linear<half, half>(gathered + r0 * Wd, o, r, Wd, C, w);
-    addHalfToBf16K<<<blocks(r * C / 8), 256, 0, STREAM>>>(reinterpret_cast<__nv_bfloat16*>(pair) + r0 * C, o, r * C / 8);
-  }
-}
 // the unfused column direction's two GEMMs strided in place (LOCALFOLD_GRID_STRIDED=0: gathered and scattered)
 inline bool GRID_STRIDED = true;
 // Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
@@ -900,19 +930,19 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       return;
     }
   }
-  needF32Pair("the unfused grid attention");
   // On a card short of room the LayerNorm'd pair is not kept: it is per pair position, so the bias pass and
   // each chunk's q/k/v/gate take it again from the pair (a column chunk gathered transposed first). In
   // place that is safe: a row chunk writes only its own rows, a column chunk only its own columns, and the
   // bias is all taken before any is written.
   const bool streamNorm = shortPair(pairs, C);
+  if (streamNorm) needF32Pair("the unfused grid attention's streamed norm");
   T* norm = streamNorm ? nullptr : scratch<T>("grid.norm", pairs * C);
   float* raw = scratch<float>("grid.rawbias", pairs * heads);
   bool headMajor = false;
   if (!streamNorm) {
     if constexpr (std::is_same_v<T, half>) headMajor = lnNormHeads(pair, norm, raw, pairs, C, heads, pre);
     if (!headMajor) {
-      layerNorm2<float, T>(pair, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
+      lnPairRows<T>(pair, 0, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
       linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
     }
   } else {
@@ -968,26 +998,35 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     flashGrid<T>(qkvgOut, bias, stride, MASK_ALL_ONES && std::is_same_v<T, half> ? nullptr : mask, gathered, n, heads, D,
                  r0, rows, tr, scale);       // (no mask when every token is real: the unmasked kernel)
     if (!tr && !outBias) {
-      linear<T, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+      linearIntoPairRows<T>(gathered, into(pair), r0 * n, prs, Wd, C, pre + ".outputProjection");
       continue;
     }
     if (tr && !outBias && RESIDUAL_UNTRANSPOSED) {
+      needF32Pair("the parallel block's untransposed residual");
       // the residual kept untransposed (the parallel pair block's): the GEMM adds into it itself
       linear<T, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
       continue;
     }
     if constexpr (std::is_same_v<T, half>) {
-      if (GRID_STRIDED && tr && !outBias) {
+      if (GRID_STRIDED && tr && !outBias && !PAIR16) {
         // the output projection added into the pair where it belongs, (j, r), by the GEMM itself
         linearStrided<T, float>(gathered, Wd, (size_t)n * Wd, into(pair) + r0 * C, (size_t)n * C, C, n, (int)rows, Wd, C,
                                 pre + ".outputProjection", 1.f);
         continue;
       }
     }
+    if constexpr (std::is_same_v<T, half>) {
+      if (PAIR16 && !outBias) {     // (a bf16 pair: the product in f16, added where it belongs)
+        T* o16 = scratch<T>("grid.out16", prs * C);
+        linear<T, T>(gathered, o16, prs, Wd, C, pre + ".outputProjection");
+        addGridK<__nv_bfloat16, T><<<blocks(prs * C / 4), 256, 0, STREAM>>>(into(pair), o16, n, C, r0, rows, tr);
+        continue;
+      }
+    }
     float* o = scratch<float>("grid.out", prs * C);
     linear<T, float>(gathered, o, prs, Wd, C, pre + ".outputProjection");
     if (outBias) addBiasK<<<blocks(prs * C), 256, 0, STREAM>>>(o, outBias, prs, C);
-    addGridK<<<blocks(prs * C / 4), 256, 0, STREAM>>>(into(pair), o, n, C, r0, rows, tr && !RESIDUAL_UNTRANSPOSED);
+    WITH_PAIR_T(addGridK<PT, float><<<blocks(prs * C / 4), 256, 0, STREAM>>>(into(pair), o, n, C, r0, rows, tr && !RESIDUAL_UNTRANSPOSED));
   }
 }
 
@@ -997,7 +1036,13 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
 // keeps it f32 (the comparison arm)
 inline bool pairBf16Ok(int n, int C, const std::string& B0) {
   static const bool off = getenv("LOCALFOLD_PAIR_F32") != nullptr;
-  if (off || C != 128 || M.flag("trunk.dialect.parallelPairformer")) return false;
+  if (off || M.flag("trunk.dialect.parallelPairformer")) return false;
+  // the wider tracks (256, 384, 512): their streaming triangle, the unfused one, the 256-channel and unfused
+  // transitions and the unfused grid attention all take a bf16 pair - not their big-input forms
+  // (Ampere on: on a Colab T4, which has no f32 -> bf16 conversion instruction, it was level or slower - protenix2's
+  // trunk 5654/6045/6589 -> 5725/6102/6602 ms, OpenDDE's 14811/14693 -> 14603/14694 - where the 128-channel track's
+  // was 2.7% faster)
+  if (C != 128) return (C == 256 || C == 384 || C == 512) && bf16Tensor() && !shortPair((size_t)n * n, C);
   bool narrow = FUSED_TRIANGLE && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
   bool wide = FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && fitsSmem(wideTriFitsSmem(128));
   std::string A = B0 + ".pairAttention1";

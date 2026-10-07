@@ -592,6 +592,18 @@ prepare (they ran out beside `enc.tp` and `dt.pn16`). 1530 tokens now folds with
 output on cuBLAS, which only garbage allows; the kernels are partly latency-bound, so halving their bytes is
 ~15% of each, not half.
 
+...and the wider tracks too - protenix2's 256 channels, OpenDDE's 384, IntelliFold-2's 512 (`pairBf16Ok`), on Ampere
+and later and not on a card short of room: the streaming triangle and the unfused one (`lnPairRows`, a typed
+`gatedAddK`), the 256-channel transition (`transitionUpK` on a bf16 pair, writing its gated rows in bf16 so the
+second GEMM runs bf16 throughout and accumulates straight into the pair - `Wbf`, a weight's bf16 copy) and the
+unfused one, the unfused grid attention (`lnNormHeadsK`, the row output through an f16 product and
+`addHalfToBf16K`, the column output through a typed `addGridK`), and the single track's unfused pair logits. A100 at
+261 tokens: protenix2's trunk **749.5 -> 712.2 ms (-5.0%)**, OpenDDE's **1566 -> 1510 (-3.6%)**; the gate's rows move
+in the third decimal and OpenDDE's 6MRR 1.08 -> 0.949 A, inside its seed band. What is left of the bytes it saves
+goes to the add passes where cuBLAS cannot write a bf16 pair from f16 operands (41 ms of protenix2's 805). 🔴 ON A
+COLAB T4 IT IS LEVEL OR SLOWER (protenix2's trunk 5654/6045/6589 -> 5725/6102/6602 ms, OpenDDE's 14811/14693 ->
+14603/14694), so it is off below sm_80; the 128-channel track keeps it there (boltz2 -2.7%).
+
 ## Tried and not taken
 
 - **More blocks an SM for the grid attention's `flashGrid2R`** (2026-10-07: `__launch_bounds__(..., 4)`, from
