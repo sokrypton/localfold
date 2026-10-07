@@ -49,19 +49,16 @@ __device__ __forceinline__ int tgB(int k, int nn) { return k * 128 + (((nn >> 3)
 constexpr int TG_STAGES = TG_STAGES_N;
 constexpr size_t TG_STAGE = (size_t)(128 * 32 + 32 * 128) * 2;
 constexpr size_t triInGemmSmem() { return TG_STAGES * TG_STAGE; }      // (the epilogue's staging reuses it)
-template <int C, class TA>
-__global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, const float* __restrict__ pair,
-    const float* __restrict__ mask, const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b,
-    half* __restrict__ t2, int n, int np, size_t cs) {
-  constexpr int KC = C / 32, NAB = C / 32, LDT = 72;
-  extern __shared__ __align__(16) unsigned char smem[];
-  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+// The GEMM's main loop: acc (a warp's 64 x 64) = X[row0 .. row0 + 128][0 .. C] Wt[0 .. C][0 .. 128], X row-major with
+// rows past pp read as zero, Wt one packed [C][128] tile. Leaves every cp.async group drained.
+template <int C>
+__device__ __forceinline__ void tgMain(const half* __restrict__ X, const half* __restrict__ Wt, size_t row0, size_t pp,
+                                       unsigned char* smem, float (&acc)[4][8][4]) {
+  constexpr int KC = C / 32;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int wm = warp & 1, wn = warp >> 1;
-  const int t = blockIdx.x;                                      // the column tile (fastest: a row tile's run together)
-  const size_t pp = (size_t)np * np, row0 = (size_t)blockIdx.y * 128;
   auto As = [&](int s) { return (half*)(smem + s * TG_STAGE); };
   auto Bs = [&](int s) { return As(s) + 128 * 32; };
-  const half* Wt = Wg + (size_t)t * C * 128;
   // every address below from per-thread bases: the swizzles (tgA, tgB) reduce to an XOR with a constant across a
   // chunk's k16 steps and column groups, so with the k loop unrolled each ldmatrix and copy is a base plus an
   // immediate (written out because the generic form cost a third of the issue slots in integer arithmetic)
@@ -89,21 +86,6 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
   };
 #pragma unroll
   for (int s0 = 0; s0 < TG_STAGES - 1; ++s0) issue(s0);
-  // the thread's eight rows' masks, read now - under the pipeline's fill, not after the last MMA
-  float msk[4][2];
-#pragma unroll
-  for (int mi = 0; mi < 4; ++mi)
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      size_t q = row0 + wm * 64 + mi * 16 + g + h * 8;
-      float v = 0.f;
-      if (t < NAB && q < pp) {
-        unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
-        if (i < (unsigned)n && j < (unsigned)n) v = mask[(size_t)i * n + j];
-      }
-      msk[mi][h] = v;
-    }
-  float acc[4][8][4] = {};
   // fragments double-buffered in registers: the next half-step's loads in flight under this one's 32 MMAs (the
   // helpers are asm volatile, so the order written is the order issued); a chunk's barrier and its next copy sit
   // between its two half-steps, once every thread holds the chunk's second half in registers
@@ -143,6 +125,34 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
     mmas(1);
   }
   cpWait<0>();
+}
+template <int C, class TA>
+__global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, const float* __restrict__ pair,
+    const float* __restrict__ mask, const half* __restrict__ Wg, TA* __restrict__ a, TA* __restrict__ b,
+    half* __restrict__ t2, int n, int np, size_t cs) {
+  constexpr int KC = C / 32, NAB = C / 32, LDT = 72;
+  extern __shared__ __align__(16) unsigned char smem[];
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  int wm = warp & 1, wn = warp >> 1;
+  const int t = blockIdx.x;                                      // the column tile (fastest: a row tile's run together)
+  const size_t pp = (size_t)np * np, row0 = (size_t)blockIdx.y * 128;
+  const half* Wt = Wg + (size_t)t * C * 128;
+  // the thread's eight rows' masks, read before the main loop (issued under the pipeline's fill)
+  float msk[4][2];
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      size_t q = row0 + wm * 64 + mi * 16 + g + h * 8;
+      float v = 0.f;
+      if (t < NAB && q < pp) {
+        unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
+        if (i < (unsigned)n && j < (unsigned)n) v = mask[(size_t)i * n + j];
+      }
+      msk[mi][h] = v;
+    }
+  float acc[4][8][4] = {};
+  tgMain<C>(X, Wt, row0, pp, smem, acc);
   __syncthreads();                      // the stages are free: the epilogue's staging takes them
   if (t < NAB) {
     // a and b: projection n8 tiles 0..3 against their gates 4..7, staged channel-major for 16-byte row stores
@@ -230,3 +240,4 @@ inline bool triInGemm(const float* pair, const float* mask, const float* sc, con
   triInGemmK<C, TA><<<grid, 128, smem, STREAM>>>(X, pair, mask, Wg, a, b, t2, n, np, cs);
   return true;
 }
+

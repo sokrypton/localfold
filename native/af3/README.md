@@ -645,6 +645,20 @@ holds the SM at 8 warps, and it ran 4-18% slower.
 
 ## Tried and not taken
 
+- **A row-resident flash attention for the grid attention** (2026-10-07; one block a (row, head) loading all of its
+  keys and values once - 37 KB at 261 tokens - and its warps walking the query tiles with no barrier; the arithmetic
+  flashGrid2R's to the instruction, and **byte-identical**): slower every way it was fed its bias. From L2 a fragment
+  at a time, AF3's trunk 367 -> 398 ms at 261 tokens and 1121 -> 1290 at 510 (long scoreboard the stall); prefetched a
+  tile ahead, the same; copied per warp into its own double buffer, 420 and 1436 (the resident keys and the per-warp
+  buffers hold an SM at 8 warps, and a two-deep per-warp pipeline hides nothing). flashGrid2R's trade - one bias
+  tile shared by two rows through the block's memory, keys and values re-read per query block - is the better one.
+- **The wide triangle's output side as a tiled GEMM** (a centre-norm pass writing the normed rows row-major, then
+  `tgMain` with the gate and the residual staged through shared memory): byte-identical to triangleOutK, and slower -
+  OpenDDE's trunk 1417 -> 1535 ms. Two passes move half again the bytes of the fused kernel, and the centre-norm
+  pass's transpose of a channel-major tile was shared-memory bound (mio throttle, 1.4M bank conflicts a call); an
+  `ldmatrix.trans` form might rescue the pass, not the extra bytes. (Removed; the GEMM's main loop, `tgMain`, is
+  the input kernel's.)
+
 - **The 384/512-channel fused transition at 4 warps and 16-column stages** (~50 KB, two blocks an SM, where 8 warps
   and 32 columns are ~100 KB and one): byte-identical and **10% slower** a trunk (OpenDDE 1446 -> 1587 ms,
   IntelliFold-2 2298 -> 2448) - the opposite of the triangle's input kernel, which gained at 4 warps.
