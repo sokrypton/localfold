@@ -344,6 +344,13 @@ I tightened its bounds once to confirm it fails.
 
 ## How large a fold fits (in progress)
 
+"Short of room" is native/af3's free-memory line now (2026-10-07; `shortPair`, common.cuh): 18x the f32 pair
+against the room this process had at its first ask, where it was a 64th of the card - 790 residues on 40 GB, ~480 on
+a T4. At 1044 residues on the A100 the ordinary paths take the trunk 3424 -> 3197 ms (a cold fold) for a peak of 9.0
+GB against 7.8; under a simulated T4 (all but 14.6 GiB held, its shared-memory limit) 780 residues fold on the
+ordinary paths in ~6.7 GB. `LOCALFOLD_SHORT_PAIR_TIMES=0` is the old rule. (native/af2 keeps the old rule: at 1275
+residues its two modes are 9.90 against 9.84 s.)
+
 On a card short of room (`shortPair`): **z_init is streamed** - it is row-local (the language model's pair
 term comes from per-token states through a pair MLP, a block of rows at a time), so each recycle makes it
 a block at a time and adds it into z, in the stored form's block size and order: byte-identical, and
