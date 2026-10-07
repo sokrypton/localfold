@@ -281,7 +281,7 @@ inline void attentionCoreAcross(const half* xn, int Bt, int n, int C, const std:
   half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
   ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
   // no bias (the column attention): the grid kernel takes none and loads no zeros; any other form wants them
-  if (!bias && !(FLASH_2R && w.Dp == 32 && !flashRegStaged())) bias = zeroBias(w.H, n, stride);
+  if (!bias && !(FLASH_2R && w.Dp == 32 && (!flashRegStaged() || flash2R1Takes()))) bias = zeroBias(w.H, n, stride);
   half* o = scratch<half>("fatt.o", rows * Wp);
   flashGridStrided(qkvg, bias, stride, nullptr, o, n, w.H, w.Dp, Bt, 1.f / sqrtf((float)w.D),
                    (size_t)4 * Wp, (size_t)Bt * 4 * Wp, (size_t)Wp, (size_t)Bt * Wp);

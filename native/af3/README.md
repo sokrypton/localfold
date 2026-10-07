@@ -544,6 +544,16 @@ build, here. Colab T4, 255 tokens, interleaved: boltz2's trunk 2889/2937 -> 2689
 6349/6536 -> 6149/6489 (-1 to -3%: its 256-channel input kernel at 4 warps is bound elsewhere). The same
 sm_75 code JIT-compiled on the A100 is 16% faster for boltz2 - the A100's own sm_80 path is unchanged.
 
+A T4's unmasked 32-wide grid attention - AF2's MSA row and column attention, the AF3 lineage's pair track -
+runs `flashGrid2R` in a ONE-stage form: its two query tiles a warp (each K/V fragment feeding both) at the
+footprint of the register-staged kernel it replaces (~19.5 KB: three 4-warp blocks an SM), the next key tile
+held in registers across the compute and stored between two barriers. The two-stage form was slower there
+(one block an SM; below). Nsight Compute on the T4 had the old kernel latency-bound - 0.27 instructions a
+scheduler a cycle, 37.5% occupancy. Colab T4: AF2 5CAJ 10806/11156 -> 10336/10754 ms (its flash kernels
+3682 -> 3266), boltz2's trunk 2815/2867 -> 2775/2813; 64-key tiles no better. Byte-identical to the A100's
+two-stage kernel (it is the same arithmetic), and AF2's column attention no longer builds a zero bias for it.
+`LOCALFOLD_FLASH_2R1=0` is the old kernel.
+
 ## Tried and not taken
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at

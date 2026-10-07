@@ -21,9 +21,16 @@ void flashStridedRun(const half* qkvg, const half* bias, int stride, const float
 template <int D, int WARPS, bool MASKED>
 void flashStridedAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out, int n, int heads,
                     size_t rows, float scale, size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
-  if (flashRegStaged())
+  if (flashRegStaged()) {
+    // a T4: flashGrid2R's one-stage form where it applies (unmasked, 32 wide; a null bias - the column attention -
+    // loads no bias tile)
+    if constexpr (D == 32 && !MASKED) {
+      if (!bias ? flash2R1Strided<true>(qkvg, bias, stride, out, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride)
+                : flash2R1Strided<false>(qkvg, bias, stride, out, n, heads, rows, scale, nullptr, rowStride, posStride, outRowStride, outPosStride))
+        return;
+    }
     flashStridedRun<D, WARPS, MASKED, true>(qkvg, bias, stride, mask, out, n, heads, rows, scale, rowStride, posStride, outRowStride, outPosStride);
-  else if constexpr (D == 32 && !MASKED) {
+  } else if constexpr (D == 32 && !MASKED) {
     // unmasked at 32 wide: the pair track's grid kernel (two tiles a warp, f16 scores, two rows a block)
     // at these strides - the MSA's column attention and the triangle's ending node
     // (a null bias - the column attention has none - takes the form that loads no bias tile)

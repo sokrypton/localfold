@@ -613,7 +613,9 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
   return (size_t)RR * 2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
 }
 // NB: no bias at all (AF2's MSA column attention): the scores start at zero and no bias tile is loaded
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false>
+// ONE: one stage, the next tile held in registers across the tile's compute and stored between two barriers -
+// a T4's form (no cp.async; two stages are 39 KB, one block of 4 warps an SM there, one is three)
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
 __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
@@ -698,6 +700,46 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
     }
     cpCommit();
   };
+  // ONE's halves of `issue`: its loads into registers (the same pieces, the same running pointers, the same zeros
+  // past the end), and the registers into the stage
+  uint4 rkv[ONE ? KV_PER : 1][2], rb[ONE && B_PER > 0 ? B_PER : 1];
+  auto loadR = [&](int j0) {
+    if constexpr (ONE) {
+      const uint4 z = make_uint4(0, 0, 0, 0);
+      bool last = j0 + BK > n;
+#pragma unroll
+      for (int k = 0; k < KV_PER; ++k) {
+        if (!(KV_CHUNKS % NTR == 0 || kvJ[k] < (1 << 30))) { if (!last) kvCur[k] += kvStep; continue; }
+        bool ok = !last || j0 + kvJ[k] < n;
+        rkv[k][0] = ok ? *reinterpret_cast<const uint4*>(kvCur[k]) : z;
+        rkv[k][1] = ok ? *reinterpret_cast<const uint4*>(kvCur[k] + Wd) : z;
+        if (!last) kvCur[k] += kvStep;
+      }
+      if constexpr (!NB) {
+#pragma unroll
+        for (int k = 0; k < B_PER; ++k) {
+          bool ok = last ? bRow[k] && j0 + bC[k] < n : bRow[k];
+          rb[k] = ok ? *reinterpret_cast<const uint4*>(bCur[k]) : z;
+          if (!last) bCur[k] += BK;
+        }
+      }
+    }
+  };
+  auto storeR = [&]() {
+    if constexpr (ONE) {
+      half *K = Kst(0), *V = Vst(0), *B = Bst(0);
+#pragma unroll
+      for (int k = 0; k < KV_PER; ++k) {
+        if (!(KV_CHUNKS % NTR == 0 || kvJ[k] < (1 << 30))) continue;
+        *reinterpret_cast<uint4*>(K + kvOff[k]) = rkv[k][0];
+        *reinterpret_cast<uint4*>(V + kvOff[k]) = rkv[k][1];
+      }
+      if constexpr (!NB) {
+#pragma unroll
+        for (int k = 0; k < B_PER; ++k) *reinterpret_cast<uint4*>(B + bOff[k]) = rb[k];
+      }
+    }
+  };
   auto q2 = [&](int i, int e) -> uint32_t {
     if (i >= n) return 0u;
     half2 v = *reinterpret_cast<const half2*>(base + (size_t)i * posStride + e);
@@ -722,11 +764,16 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) mx[mt][0] = mx[mt][1] = -INFINITY;
   int tiles = (n + BK - 1) / BK;
-  issue(0, 0);
+  if constexpr (ONE) { loadR(0); storeR(); }
+  else issue(0, 0);
   for (int tile = 0; tile < tiles; ++tile) {
-    int st = tile & 1;
-    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
-    else cpWait<0>();
+    int st = ONE ? 0 : tile & 1;
+    if constexpr (ONE) {
+      if (tile + 1 < tiles) loadR((tile + 1) * BK);
+    } else {
+      if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
+      else cpWait<0>();
+    }
     __syncthreads();
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st);
     uint32_t sh[MT][BK / 8][2];
@@ -800,6 +847,10 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
         for (int mt = 0; mt < MT; ++mt) { mma16816(o[mt][et], pa[mt], vb[0], vb[1]); mma16816(o[mt][et + 1], pa[mt], vb[2], vb[3]); }
       }
     }
+    if constexpr (ONE) {
+      __syncthreads();                // every warp is done with the stage: the next tile goes in
+      if (tile + 1 < tiles) storeR();
+    }
     __syncthreads();
   }
 #pragma unroll
@@ -851,19 +902,42 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 // keys where the third stage costs a block an SM - three warps a scheduler already overlap one warp's
 // softmax with another's MMAs.
 inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false>
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
                     const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
                     size_t outPosStride = 0) {
   constexpr int BQ = 16 * MT * WARPS;
   const size_t W = (size_t)heads * D;
   if (!posStride) { rowStride = (size_t)n * 4 * W; posStride = 4 * W; outRowStride = (size_t)n * W; outPosStride = W; }
-  const int bytes = 2 * (int)fa2Stage<D, WARPS, BK, MT, RR>();
+  const int bytes = (ONE ? 1 : 2) * (int)fa2Stage<D, WARPS, BK, MT, RR>();
   static bool attr = false;
-  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB>), bytes); attr = true; }
+  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
-  flashGrid2R<D, WARPS, BK, MT, RR, NB><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
+  flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
                                                                               rowStride, posStride, outRowStride, outPosStride);
+}
+inline int flash2R1Tile() {
+  static const int v = getenv("LOCALFOLD_FLASH_2R1") ? atoi(getenv("LOCALFOLD_FLASH_2R1")) : 48;
+  return v;
+}
+// a T4's (register-staged) unmasked 32-wide grid attention through flashGrid2R's one-stage form - two query tiles a
+// warp at a register-staged kernel's footprint (LOCALFOLD_FLASH_2R1: 0 off, 48 or 64 the key tile); false: not taken
+// will flash2R1Strided take this device's unmasked 32-wide attention (so a caller may pass no bias at all)
+inline bool flash2R1Takes() {
+  int bk = flash2R1Tile();
+  return (bk == 64 && fitsSmem(fa2Stage<32, 2, 64, 2, 2>())) || (bk == 48 && fitsSmem(fa2Stage<32, 2, 48, 2, 2>()));
+}
+template <bool NB = false>
+bool flash2R1Strided(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
+                     const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
+                     size_t outPosStride = 0) {
+  int bk = flash2R1Tile();
+  if (bk == 64 && fitsSmem(fa2Stage<32, 2, 64, 2, 2>()))
+    flashGrid2RRun<32, 2, 64, 2, 2, NB, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rowStride, posStride, outRowStride, outPosStride);
+  else if (bk == 48 && fitsSmem(fa2Stage<32, 2, 48, 2, 2>()))
+    flashGrid2RRun<32, 2, 48, 2, 2, NB, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias, rowStride, posStride, outRowStride, outPosStride);
+  else return false;
+  return true;
 }
 template <int D, int WARPS, bool MASKED, int BK = FA_BK, bool REG = false, int MINB = 1, bool F16S = false> void setFlashSmem() {
   static bool done = false;
@@ -962,6 +1036,7 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
       // (48 is 1.45 against 1.22 ms there)
       if constexpr (D == 32) {
         if (!flashRegStaged()) { flashGridHalfAt<D, 4, 48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break; }
+        if (!mask && flash2R1Strided(qkvg, bias, stride, out, n, heads, rows, scale, qBias)) break;
       }
       flashGridHalfAt<D, 4, BK>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
     case 2: flashGridHalfAt<D, 2>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break;
