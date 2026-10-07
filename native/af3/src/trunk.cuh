@@ -761,13 +761,22 @@ template <class T>
 __global__ void castK(const float* in, T* out, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = fromF<T>(in[i]);
 }
+// rows of `cols` floats into rows of `ld` (the padding zero)
 template <class T>
-__global__ void msaVToHeadsK(const T* v, T* out, int S, int n, int heads, int d) {
+__global__ void castRowsPadK(const float* in, T* out, size_t rows, int cols, int ld) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)S * n * heads * d) return;
+  if (t >= rows * ld) return;
+  int c = (int)(t % ld); size_t r = t / ld;
+  out[t] = fromF<T>(c < cols ? in[r * cols + c] : 0.f);
+}
+template <class T>
+__global__ void msaVToHeadsK(const T* v, T* out, int S, int n, int heads, int d, int np) {
+  // (np >= n positions a head, the rows past n zero: the GEMM's K padded with the weights' rows)
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * np * heads * d) return;
   int e = (int)(t % d); size_t rest = t / d; int s = (int)(rest % S); rest /= S;
-  int j = (int)(rest % n); int h = (int)(rest / n);
-  out[t] = v[((size_t)s * n + j) * heads * d + h * d + e];
+  int j = (int)(rest % np); int h = (int)(rest / np);
+  out[t] = j < n ? v[((size_t)s * n + j) * heads * d + h * d + e] : fromF<T>(0.f);
 }
 // o [h][i][s][e] -> [s][i][h*d+e], times sigmoid(gate)
 template <class T>
@@ -802,11 +811,14 @@ void msaAttention(Trunk& t, const std::string& pre) {
   else keyMaskK<<<blocks(n, 128), 128, 0, STREAM>>>(t.msaMask, keyMask, S, n);
   float* w = scratch<float>("msaatt.w", (size_t)heads * pairs);
   msaWeightsK<<<(unsigned)(heads * n), 128, 0, STREAM>>>(flat, keyMask, w, n, heads);
-  const T* wT;
+  const T* wT; int ldw = n;
   if constexpr (std::is_same_v<T, float>) wT = w;
   else {
-    T* wh = scratch<T>("msaatt.wh", (size_t)heads * pairs);
-    castK<T><<<blocks((size_t)heads * pairs), 256, 0, STREAM>>>(w, wh, (size_t)heads * pairs);
+    // rows padded to a multiple of 8 halves, and the GEMM's K with them: at a token count that is not one, cuBLAS
+    // could only take the GEMM below on its align-1 kernels (261 tokens: 0.27 ms a call, sm75's own kernel)
+    ldw = (n + 7) / 8 * 8;
+    T* wh = scratch<T>("msaatt.wh", (size_t)heads * n * ldw);
+    castRowsPadK<T><<<blocks((size_t)heads * n * ldw), 256, 0, STREAM>>>(w, wh, (size_t)heads * n, n, ldw);
     wT = wh;
   }
   // the values, the per-head weighted sums, the gate and the output - each MSA row's own, so on a card short of
@@ -815,7 +827,7 @@ void msaAttention(Trunk& t, const std::string& pre) {
   int Sc = shortPair(pairs, C) ? (int)std::max<size_t>(1, std::min<size_t>(S, CHUNK / ((size_t)n * Wd))) : S;
   if (BIG_FORCED) Sc = std::max(1, std::min(Sc, (S + 2) / 3));
   T* v = scratch<T>("msaatt.v", (size_t)Sc * n * Wd);
-  T* vh = scratch<T>("msaatt.vh", (size_t)Sc * n * Wd);
+  T* vh = scratch<T>("msaatt.vh", (size_t)Sc * ldw * Wd);
   T* oh = scratch<T>("msaatt.oh", (size_t)Sc * n * Wd);
   T* gate = scratch<T>("msaatt.gate", (size_t)Sc * n * Wd);
   T* gated = scratch<T>("msaatt.gated", (size_t)Sc * n * Wd);
@@ -826,10 +838,11 @@ void msaAttention(Trunk& t, const std::string& pre) {
     const T* lnc = ln + (size_t)s0 * n * Cm;
     linear<T, T>(lnc, v, cr, Cm, Wd, pre + ".vProjection");
     if (chaiMask) scaleRowsK<T><<<blocks(cr * Wd), 256, 0, STREAM>>>(v, t.msaMask + (size_t)s0 * n, cr, Wd);
-    msaVToHeadsK<T><<<blocks(cr * Wd), 256, 0, STREAM>>>(v, vh, sc, n, heads, d);
+    msaVToHeadsK<T><<<blocks((size_t)sc * ldw * Wd), 256, 0, STREAM>>>(v, vh, sc, n, heads, d, ldw);
     // per head: O_h (n x sc*d) = W_h (n x n) V_h (n x sc*d); col-major O^T = V^T W^T
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, n, n, &one, vh, cudaType<T>(), sc * d,
-       (size_t)n * sc * d, wT, cudaType<T>(), n, pairs, &zero, oh, cudaType<T>(), sc * d, (size_t)n * sc * d, heads,
+    // (K = ldw: the weights' padded columns and the values' padded rows are zero)
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, sc * d, n, ldw, &one, vh, cudaType<T>(), sc * d,
+       (size_t)ldw * sc * d, wT, cudaType<T>(), ldw, (size_t)n * ldw, &zero, oh, cudaType<T>(), sc * d, (size_t)n * sc * d, heads,
        CUBLAS_COMPUTE_32F, algo));
     linear<T, T>(lnc, gate, cr, Cm, Wd, pre + ".gatingQuery");
     msaFromHeadsK<T><<<blocks(cr * Wd), 256, 0, STREAM>>>(oh, gate, gated, sc, n, heads, d);
@@ -871,9 +884,11 @@ __global__ void logitsLayoutK(const float* flat, float* out, size_t pairs, int h
 }
 template <class T>
 __global__ void singleSoftmaxK(const float* logits, const float* pairLogits, const float* seqMask, T* P,
-                               int n, float scale) {
+                               int n, float scale, int ld = 0) {
+  // ld: the logits' and P's row stride (0: n), P's columns from n to ld written zero
+  if (!ld) ld = n;
   size_t rowId = blockIdx.x;
-  const float* L = logits + rowId * n; const float* B = pairLogits + rowId * n;
+  const float* L = logits + rowId * ld; const float* B = pairLogits + rowId * n;
   __shared__ float red[32];
   float mx = -INFINITY;
   for (int j = threadIdx.x; j < n; j += blockDim.x) mx = fmaxf(mx, L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f));
@@ -892,8 +907,8 @@ __global__ void singleSoftmaxK(const float* logits, const float* pairLogits, con
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o); if (threadIdx.x == 0) red[0] = v; }
   __syncthreads();
   float inv = 1.f / red[0];
-  for (int j = threadIdx.x; j < n; j += blockDim.x)
-    P[rowId * n + j] = fromF<T>(expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx) * inv);
+  for (int j = threadIdx.x; j < ld; j += blockDim.x)
+    P[rowId * ld + j] = j < n ? fromF<T>(expf(L[j] * scale + B[j] + 1e9f * (seqMask[j] - 1.f) - mx) * inv) : fromF<T>(0.f);
 }
 template <class T>
 __global__ void addQBiasK(T* qkvg, const float* b, int n, int Wd) {
@@ -1012,22 +1027,26 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
     logitsLayoutK<<<blocks(pairs * heads), 256, 0, STREAM>>>(flat, pl, pairs, heads);
   }
   if (extraBias) addBiasHeadsK<<<blocks(pairs * heads), 256, 0, STREAM>>>(pl, extraBias, pairs, heads);
+  // the scores' and probabilities' rows padded to a multiple of 8 in f16, and P V's K with them (P's padded columns
+  // and qkvg's padded rows zero): at a token count that is not one, cuBLAS took both GEMMs on its align-1 kernels
+  const int ldn = std::is_same_v<T, half> ? (n + 7) / 8 * 8 : n;
   T* nrm = scratch<T>("st.nrm", (size_t)n * Cs);
-  T* qkvg = scratch<T>("st.qkvg", (size_t)n * 4 * Wd);
+  T* qkvg = scratch<T>("st.qkvg", (size_t)ldn * 4 * Wd);
+  if (ldn != n) CK(cudaMemsetAsync(qkvg + (size_t)n * 4 * Wd, 0, (size_t)(ldn - n) * 4 * Wd * sizeof(T), STREAM));
   layerNorm2<float, T>(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
   linear<T, T>(nrm, qkvg, n, Cs, 4 * Wd, qkvgWeight(A, Cs, Wd, false));
   addQBiasK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(A + ".qBias"), n, Wd);
-  float* logits = scratch<float>("st.logits", (size_t)heads * n * n);
-  T* P = scratch<T>("st.P", (size_t)heads * n * n);
+  float* logits = scratch<float>("st.logits", (size_t)heads * n * ldn);
+  T* P = scratch<T>("st.P", (size_t)heads * n * ldn);
   T* o = scratch<T>("st.o", (size_t)n * Wd);
   const float one = 1.f, zero = 0.f;
   auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-  CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, n, n, d, &one,
-     qkvg + Wd, cudaType<T>(), 4 * Wd, d, qkvg, cudaType<T>(), 4 * Wd, d, &zero, logits, CUDA_R_32F, n,
-     (size_t)n * n, heads, CUBLAS_COMPUTE_32F, algo));
-  singleSoftmaxK<T><<<(unsigned)(heads * n), 128, 0, STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d));
-  CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, n, n, &one,
-     qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), n, (size_t)n * n, &zero, o, cudaType<T>(),
+  CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, ldn, n, d, &one,
+     qkvg + Wd, cudaType<T>(), 4 * Wd, d, qkvg, cudaType<T>(), 4 * Wd, d, &zero, logits, CUDA_R_32F, ldn,
+     (size_t)n * ldn, heads, CUBLAS_COMPUTE_32F, algo));
+  singleSoftmaxK<T><<<(unsigned)(heads * n), 128, 0, STREAM>>>(logits, pl, seqMask, P, n, 1.f / sqrtf((float)d), ldn);
+  CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, d, n, ldn, &one,
+     qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), ldn, (size_t)n * ldn, &zero, o, cudaType<T>(),
      Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
   gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
   linear<T, float>(o, single, n, Wd, Cs, A + ".outputProjection", false, 1.f);

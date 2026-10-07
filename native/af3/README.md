@@ -216,7 +216,10 @@ pair transition (LN, both GEMMs, SwiGLU, residual); grid attention's input (LN, 
 pair bias in one pass, the column direction reading its rows transposed in place) and the column
 direction's output projection; the single track's pair logits. The grid attention itself is a
 FlashAttention-2 kernel on `mma.sync` (S, P, O in registers, cp.async double buffering, ldmatrix,
-log2-domain scores) - ~85 TFLOP/s at 1044 tokens, see below. The MSA stack in f16 too.
+log2-domain scores) - ~85 TFLOP/s at 1044 tokens, see below. The MSA stack in f16 too. The small attention GEMMs a
+token count that is not a multiple of 8 would put on cuBLAS's align-1 kernels - the MSA attention's weights x
+values, the single track's scores and P V - take rows padded to 8 (and K with them, the padding zero): AF3 at 261
+tokens with a 1024-row alignment, trunk 371.1 -> 367.0 ms; level at 68 and 510.
 
 Diffusion: everything derived from the conditioning computed once per fold (atom pair
 conditioning and pair logits, every block's adaptive-LayerNorm scales/shifts and zero-init gates,
@@ -590,6 +593,15 @@ output on cuBLAS, which only garbage allows; the kernels are partly latency-boun
 ~15% of each, not half.
 
 ## Tried and not taken
+
+- **More blocks an SM for the grid attention's `flashGrid2R`** (2026-10-07: `__launch_bounds__(..., 4)`, from
+  162 registers and three blocks to 128 and four - Nsight has it L2-bound at 18.75% occupancy): the shipped form
+  (2 warps x 2 rows, 48-key tiles) went **0.671 -> 0.737 ms** at 510 tokens on its 20 bytes of spills; only arms
+  that do not ship gained (the 8-warp one 0.864 -> 0.790).
+
+- **`gridOutK` for the row direction too** (the bf16 pair's f16 GEMM + add pass, `rowOut16`): the trunk level at
+  261 and 510 tokens on an A100 (370.3 against 371.0 ms, 1123 against 1121). AlphaFold 2's port takes it, where it
+  was 6-10 ms of a 494-residue fold faster than its own GEMM + add.
 
 - **The fused grid-attention kernels at every pair width** (2026-10-03: `gridInK`/`gridOutK` launched at
   C = 256, 384, 512 for protenix2, OpenDDE and IntelliFold-2, whose unfused path spends ~a third of a fold

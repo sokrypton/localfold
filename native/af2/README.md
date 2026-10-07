@@ -252,7 +252,9 @@ single sequence 1363 -> 1343 (-1.5%); the gate's AF2 rows move in the third deci
 s, 9.23 -> 9.50): Turing has no f32 -> bf16 conversion instruction, and its biased float-tile triangle output
 went 1237 -> 1520 ms of a 494-residue fold - so it is off below sm_80. Tried and not taken: the outer product
 mean's product in f16 to halve its add (14 ms faster at 494 residues, and 6MRR from a single sequence 1.898 ->
-2.001 A, pLDDT 84.6 -> 81.1). `LOCALFOLD_PAIR_F32=1` keeps the f32 pair.
+2.001 A, pLDDT 84.6 -> 81.1). `LOCALFOLD_PAIR_F32=1` keeps the f32 pair. Nor native/af3's cached cuBLASLt plan for the bf16
+contraction (`triContractBf16`, the 128x128 tile from np 200 to 352): 5CAJ 1658 -> 1653 ms, a 494-residue fold
+1342 -> 1360 (outside the window the plan's cuBLASLt pick, with no workspace, is slower than cuBLAS's own).
 
 Measured and left (2026-10-03, A100, 262 residues, 512 alignment rows): the MSA column attention's
 strided flash kernel at 8 warps rather than 4 is slower (235 against 224 ms of strided flash a fold), and
