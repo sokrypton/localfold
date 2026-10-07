@@ -621,6 +621,12 @@ restores both. The triangle's input kernel takes 4 warps past 256 channels, wher
 SM (byte-identical; OpenDDE 1476 -> 1449 ms, IntelliFold-2 2323 -> 2301, level at 256). OpenDDE's trunk from 1688 to
 ~1450 ms and IntelliFold-2's from 2649 to ~2300 in all (-14%, -13%).
 
+...and Chai-1, the last 256-channel model on an f32 pair: its parallel pair block keeps the block's input at the
+pair's own width (`par.base`, which the single track must ask for at that same size or it is reallocated and
+lost), its untransposed column residual goes through the f16 product and add, and its first pass's z_init
+recycle and relative encoding take the bf16 pair. Trunk **535.3 -> 496.4 ms (-7.3%)** at 255 tokens; the gate's
+three Chai-1 rows move in the third decimal.
+
 ## Tried and not taken
 
 - **The 384/512-channel fused transition at 4 warps and 16-column stages** (~50 KB, two blocks an SM, where 8 warps

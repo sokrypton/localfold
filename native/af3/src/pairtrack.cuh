@@ -1021,9 +1021,8 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       continue;
     }
     if (tr && !outBias && RESIDUAL_UNTRANSPOSED) {
-      needF32Pair("the parallel block's untransposed residual");
-      // the residual kept untransposed (the parallel pair block's): the GEMM adds into it itself
-      linear<T, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+      // the residual kept untransposed (the parallel pair block's): added at the rows' own positions
+      linearIntoPairRows<T>(gathered, into(pair), r0 * n, prs, Wd, C, pre + ".outputProjection");
       continue;
     }
     if constexpr (std::is_same_v<T, half>) {
@@ -1055,7 +1054,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
 // keeps it f32 (the comparison arm)
 inline bool pairBf16Ok(int n, int C, const std::string& B0) {
   static const bool off = getenv("LOCALFOLD_PAIR_F32") != nullptr;
-  if (off || M.flag("trunk.dialect.parallelPairformer")) return false;
+  if (off) return false;
   // the wider tracks (256, 384, 512): their streaming triangle, the unfused one, the 256-channel and unfused
   // transitions and the unfused grid attention all take a bf16 pair - not their big-input forms
   // (Ampere on: on a Colab T4, which has no f32 -> bf16 conversion instruction, it was level or slower - protenix2's

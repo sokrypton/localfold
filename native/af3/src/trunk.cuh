@@ -35,10 +35,10 @@ void runPairUpdate(PairUpdate u, float* pair, const float* mask, int n, int C, c
 template <class T>
 void parallelPairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap, bool divide,
                          int transitionFactor, std::initializer_list<PairUpdate> updates) {
-  needF32Pair("the parallel pair block");
-  size_t pc = (size_t)n * n * C;
-  float* base = scratch<float>("par.base", pc);
-  CK(cudaMemcpyAsync(base, pair, pc * 4, cudaMemcpyDeviceToDevice, STREAM));
+  // (the block's input at the pair's own width: bf16 under PAIR16)
+  size_t pc = (size_t)n * n * C, e = PAIR16 ? 2 : 4;
+  float* base = scratch<float>("par.base", (pc * e + 3) / 4);
+  CK(cudaMemcpyAsync(base, pair, pc * e, cudaMemcpyDeviceToDevice, STREAM));
   bool first = true;
   for (PairUpdate u : updates) {
     if (first && u != PairUpdate::GridCol) {     // the first runs on the pair itself
@@ -106,6 +106,7 @@ __global__ void relativeEncodingK(const int* residueIndex, const int* tokenIndex
 // chain: clip(ri_i - ri_j + 33, 0, 65), else 66) and the token separation (same residue of the same chain:
 // clip(ti_i - ti_j + 32, 0, 65), else 66), through a BIASED linear - its frozen single-chain token-pair columns
 // are in the bias
+template <class PT = float>
 __global__ void chaiRelativeEncodingK(const int* residueIndex, const int* tokenIndex, const int* asymId, const float* Wpos,
                                       const float* bias, float* pair, int n, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -115,7 +116,7 @@ __global__ void chaiRelativeEncodingK(const int* residueIndex, const int* tokenI
   bool sameChain = asymId[i] == asymId[j];
   int rss = sameChain ? clip(residueIndex[i] - residueIndex[j] + 33) : 66;
   int rts = sameChain && residueIndex[i] == residueIndex[j] ? clip(tokenIndex[i] - tokenIndex[j] + 32) : 66;
-  pair[t] += bias[c] + Wpos[(size_t)rss * C + c] + Wpos[(size_t)(67 + rts) * C + c];
+  pairSt<PT>(pair, t, pairLd<PT>(pair, t) + bias[c] + Wpos[(size_t)rss * C + c] + Wpos[(size_t)(67 + rts) * C + c]);
 }
 // chai-1's MSA features (af3-any-model featurization.py create_msa_feat, chai1): 41 columns per row and token,
 // [is_paired | source one-hot (6; row 0 class 4, else 2) | deletion value | has deletion | one_hot(msa, 32)],
@@ -194,7 +195,7 @@ inline bool foldFits(int n, int C) {
 inline bool pair16Eligible(const Trunk& t) {
   if (!pairBf16Ok(t.n, t.C, "trunk.pairformerBlocks.0")) return false;
   if (M.has("trunk.msaBlocks.0.pairChannels") && !pairBf16Ok(t.n, t.C, "trunk.msaBlocks.0")) return false;
-  return !M.flag("trunk.dialect.groupedOuterProduct") && !M.flag("trunk.dialect.recycleFromInit");
+  return true;
 }
 // t.pair and t.prevPair (re)allocated in the precision a fold asks for, zeroed - the recycled state of a fresh fold
 inline void usePair16(Trunk& t, bool on) {
@@ -342,23 +343,24 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   linear<float, float>(pairSource, right, n, sourceWidth, C, E + "rightSingle");
   const bool chai = M.flag("trunk.dialect.recycleFromInit");
   auto chaiRelEnc = [&]() {
-    chaiRelativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(Idev("batch.features.residueIndex"),
+    WITH_PT(t.p16, chaiRelativeEncodingK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(Idev("batch.features.residueIndex"),
       Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), W(E + "positionActivations"),
-      W(E + "positionActivationsBias"), t.pair, n, C);
+      W(E + "positionActivationsBias"), t.pair, n, C));
   };
   if (chai && t.pass == 0) {
     // chai's first pass recycles z_init itself (chai1.py seeds the carry with the initial representation):
     // z = z_init + prev_embedding(LN(z_init)), z_init = left + right + the relative encoding - row by row in place
-    outerSumK<<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C);
+    WITH_PT(t.p16, outerSumK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C));
     chaiRelEnc();
     size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
     T* ln = scratch<T>("emb.prevln", per * C);
     float* prev = scratch<float>("emb.prevproj", per * C);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
-      layerNorm2<float, T>(t.pair + r0 * C, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
+      layerNormPairRows<T>(t.pair, t.p16, r0, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
       linear<T, float>(ln, prev, r, C, C, E + "prevEmbedding");
-      addK<<<blocks(r * C), 256, 0, STREAM>>>(t.pair + r0 * C, prev, r * C);
+      WITH_PT(t.p16, pairAddK<PT, float><<<blocks(r * C), 256, 0, STREAM>>>(
+        reinterpret_cast<float*>(reinterpret_cast<PT*>(t.pair) + r0 * C), prev, r * C));
     }
   } else if (t.inPlaceRecycle) {
     // in place, a chunk of rows at a time: each row's new value reads only the same row of the last pass's
@@ -861,9 +863,11 @@ void msaBlock(Trunk& t, int k) {
     groupedOuterProduct(t, B + ".outerProductMean"); stage("msa.opm");
     msaAttention<T>(t, B + ".msaAttention1"); stage("msa.attention");
     transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
+    PAIR16 = t.p16;
     parallelPairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4,
                            { PairUpdate::TriOut, PairUpdate::TriIn, PairUpdate::Transition });
     parallelPairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4, { PairUpdate::GridRow, PairUpdate::GridCol });
+    PAIR16 = false;
     return;
   }
   // the outer product off the pre-update MSA (AF3), or off the updated one (OpenDDE, boltz2)
@@ -1061,7 +1065,9 @@ void pairformerBlockAt(float* pair, float* single, const float* pairMask, const 
     // the single track reads the pair ENTERING the block: kept in par.base by the pair updates
     parallelPairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, { PairUpdate::TriOut, PairUpdate::TriIn,
       PairUpdate::GridRow, PairUpdate::GridCol, PairUpdate::Transition });
-    singleTrack<T>(single, scratch<float>("par.base", (size_t)n * n * C), seqMask, n, C, Cs, B, extraBias); stage("single");
+    // (par.base at the size parallelPairUpdates made it - the pair's own width - or it is reallocated, and lost)
+    singleTrack<T>(single, scratch<float>("par.base", ((size_t)n * n * C * (PAIR16 ? 2 : 4) + 3) / 4), seqMask, n, C, Cs, B,
+                   extraBias); stage("single");
     return;
   }
   pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, shortPair((size_t)n * n, C));
