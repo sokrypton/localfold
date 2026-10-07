@@ -2,6 +2,7 @@
 #pragma once
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cuda_bf16.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -1413,10 +1414,14 @@ template <class T> constexpr cudaDataType cudaType() {
   return std::is_same_v<T, float> ? CUDA_R_32F : CUDA_R_16F;
 }
 template <class T> __device__ __forceinline__ float toF(T v) {
-  if constexpr (std::is_same_v<T, float>) return v; else return __half2float(v);
+  if constexpr (std::is_same_v<T, float>) return v;
+  else if constexpr (std::is_same_v<T, __nv_bfloat16>) return __bfloat162float(v);
+  else return __half2float(v);
 }
 template <class T> __device__ __forceinline__ T fromF(float v) {
-  if constexpr (std::is_same_v<T, float>) return v; else return __float2half(v);
+  if constexpr (std::is_same_v<T, float>) return v;
+  else if constexpr (std::is_same_v<T, __nv_bfloat16>) return __float2bfloat16(v);
+  else return __float2half(v);
 }
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x)); }
 // the sigmoid on one MUFU op (tanh.approx: |error| of the sigmoid <= ~2.5e-4) where exp and a reciprocal

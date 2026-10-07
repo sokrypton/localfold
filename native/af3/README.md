@@ -562,7 +562,12 @@ and refuses rather than misread. The row-direction grid output's GEMM writes f16
 no f16-in, bf16-out GEMM; `gridOutK` there was slower on a T4). AF3 at 255 tokens on the A100: trunk 312.4 ->
 302.5 ms (-3.2%); boltz2 on a Colab T4 2566/2597/2628 -> 2498/2523/2560 (-2.7%). The gate's AF3 RMSDs move
 in the third decimal (0.552 -> 0.553, 0.168 -> 0.170, 0.541 -> 0.536). `LOCALFOLD_PAIR_F32=1` keeps the f32
-pair. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
+pair. Phase two holds it in bf16 for the whole trunk (`usePair16`, `pair16Eligible`): `t.pair` and the recycled
+pair are allocated at half the bytes, the embedder, the template stack's boundary, the MSA stack (outer product,
+attention's pair LayerNorm, its pair updates), boltz2's pre-MSA add and the distogram read and write it in bf16
+(`layerNormPairRows`, `linearIntoPair`, `WITH_PT`), and it converts to f32 once when the trunk is done, for the
+heads, the sampler and the confidence head. Same speed as phase one; NO memory saved yet - where memory binds the
+big-input paths (`shortPair`) still keep the pair f32. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
 output on cuBLAS, which only garbage allows; the kernels are partly latency-bound, so halving their bytes is
 ~15% of each, not half.
 

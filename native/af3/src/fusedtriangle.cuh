@@ -27,6 +27,9 @@ inline bool PAIR16 = false;
 inline void needF32Pair(const char* where) {
   if (PAIR16) { fprintf(stderr, "%s has no bf16-pair form: the stack should have kept the pair f32\n", where); exit(1); }
 }
+// ...and with the flag given (the trunk's pair outside its pair-track updates: t.p16)
+#define WITH_PT(flag, ...) do { if (flag) { using PT = __nv_bfloat16; __VA_ARGS__; } else { using PT = float; __VA_ARGS__; } } while (0)
+template <class PT> __device__ __forceinline__ void pairSt(float* p, size_t i, float v) { reinterpret_cast<PT*>(p)[i] = fromF<PT>(v); }
 #define WITH_PAIR_T(...) do { if (PAIR16) { using PT = __nv_bfloat16; __VA_ARGS__; } else { using PT = float; __VA_ARGS__; } } while (0)
 template <class PT> __device__ __forceinline__ float pairLd(const float* p, size_t i) {
   return (float)reinterpret_cast<const PT*>(p)[i];

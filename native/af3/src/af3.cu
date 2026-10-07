@@ -288,12 +288,15 @@ int main(int argc, char** argv) {
   memReport("trunk built");
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
+  // the fold's pair in bf16 where every stack takes it (pair16Eligible; LOCALFOLD_PAIR_F32=1 keeps f32)
+  const bool want16 = doFold && fast && pair16Eligible(t);
+  if (doFold && want16) printf("trunk: the pair in bf16\n");
   for (int fi = 0; doFold && fi < folds; ++fi) {
-    if (fi > 0) {   // a fresh fold: the trunk restarts from zero recycled state
+    if (fi > 0 || want16) {   // a fresh fold: the trunk restarts from zero recycled state
       size_t pp = (size_t)t.n * t.n * t.C;
-      if (!t.pair) t.pair = dalloc(pp);                // (left parked by the last fold)
-      // (in place, the pair is the recycled one)
-      CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pp * 4)); CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
+      if (!t.pair && !want16) t.pair = dalloc(pp);     // (left parked by the last fold)
+      usePair16(t, want16);   // (in place, the pair is the recycled one; zeroed)
+      CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
       t.pass = 0;
     }
     std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
@@ -308,7 +311,7 @@ int main(int argc, char** argv) {
     // it replays as one CUDA graph, captured from that pass (the first has sized every scratch buffer)
     auto recyclePass = [&]() {
       if (!t.inPlaceRecycle)        // (in place, the pair already is the recycled pair: see embed)
-        CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * 4, cudaMemcpyDeviceToDevice, STREAM));
+        CK(cudaMemcpyAsync(t.prevPair, t.pair, pairs * t.C * (t.p16 ? 2 : 4), cudaMemcpyDeviceToDevice, STREAM));
       CK(cudaMemcpyAsync(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
       if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
     };
@@ -358,6 +361,7 @@ int main(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
+    pairToF32(t);                     // (a bf16 trunk's pair, for the heads, the sampler and the confidence head)
     releaseConcatCopies(); memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below
