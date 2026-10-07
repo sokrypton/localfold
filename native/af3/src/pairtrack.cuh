@@ -1082,11 +1082,29 @@ inline bool pairBf16Ok(int n, int C, const std::string& B0) {
   return (narrow || wide) && grid && tr;
 }
 // The five pair updates of a pairformer/MSA/template block, in AF3's order.
-template <class T>
 // releaseBetween: each update's scratch given back before the next (the template stack on a card short of room,
-// where the triangle's whole-form buffers - 1.8 GB at 1530 tokens - otherwise sat beside the grid attention's)
+// where the triangle's whole-form buffers - 1.8 GB at 1530 tokens - otherwise sat beside the grid attention's) -
+// unless the card holds all three updates' scratch at once (pairUpdatesKeep)
+inline bool pairUpdatesKeep(size_t pairs, int C) {
+  // 🔴 the release is a synchronous cudaFree of the triangle's whole-form planes and a cudaMalloc of the grid
+  // attention's, every block: at 2000 tokens on 40 GB it was 21 of a 55 s fold (the GPU idle 45% of a pass), the
+  // kernels themselves the ordinary paths' to the millisecond. The three hold ~6.7x the f32 pair at 128 channels
+  // (13.8 GB at 2000 tokens) and ~8.4x at 384 (OpenDDE at 765), so 9x with an eighth of the card spare - the
+  // scratch they already hold counted as free, since it is what they would reuse
+  static const bool off = getenv("LOCALFOLD_RELEASE_BETWEEN") != nullptr;    // (the always-release arm)
+  if (off || BIG_FORCED) return false;
+  size_t need = (size_t)9 * pairs * C * 4, held = 0;
+  for (auto& [name, slot] : SCRATCH)
+    for (const char* p : { "tri.", "trib.", "grid.", "tr." })
+      if (!name.compare(0, strlen(p), p)) held += slot.second;
+  need -= std::min(need, held);
+  size_t f, t; CK(cudaMemGetInfo(&f, &t));
+  return f > need + t / 8;
+}
+template <class T>
 void pairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
                  bool divide, int transitionFactor, bool releaseBetween = false) {
+  if (releaseBetween && pairUpdatesKeep((size_t)n * n, C)) releaseBetween = false;
   triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationOutgoing", true, divide); stage("tri.out");
   triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationIncoming", false, divide); stage("tri.in");
   if (releaseBetween) releaseScratch({ "tri.", "trib." });
