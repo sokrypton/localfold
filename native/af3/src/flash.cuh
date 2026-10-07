@@ -615,8 +615,11 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
 // NB: no bias at all (AF2's MSA column attention): the scores start at zero and no bias tile is loaded
 // ONE: one stage, the next tile held in registers across the tile's compute and stored between two barriers -
 // a T4's form (no cp.async; two stages are 39 KB, one block of 4 warps an SM there, one is three)
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
-__global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
+// PREF (ONE only): the next tile held in registers across this one's compute - false loads it straight into the stage
+// after the compute (exposed, and ~36 registers fewer, for more blocks an SM on a part bound by latency); MINB: the
+// blocks an SM the registers are capped for
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, bool PREF = true, int MINB = 1>
+__global__ void __launch_bounds__(WARPS * RR * 32, MINB) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
   // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is
@@ -769,7 +772,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
   for (int tile = 0; tile < tiles; ++tile) {
     int st = ONE ? 0 : tile & 1;
     if constexpr (ONE) {
-      if (tile + 1 < tiles) loadR((tile + 1) * BK);
+      if (PREF && tile + 1 < tiles) loadR((tile + 1) * BK);
     } else {
       if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); }
       else cpWait<0>();
@@ -849,7 +852,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
     }
     if constexpr (ONE) {
       __syncthreads();                // every warp is done with the stage: the next tile goes in
-      if (tile + 1 < tiles) storeR();
+      if (tile + 1 < tiles) { if (!PREF) loadR((tile + 1) * BK); storeR(); }
     }
     __syncthreads();
   }
@@ -902,7 +905,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 // keys where the third stage costs a block an SM - three warps a scheduler already overlap one warp's
 // softmax with another's MMAs.
 inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, bool PREF = true, int MINB = 1>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
                     const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
                     size_t outPosStride = 0) {
@@ -911,9 +914,9 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, i
   if (!posStride) { rowStride = (size_t)n * 4 * W; posStride = 4 * W; outRowStride = (size_t)n * W; outPosStride = W; }
   const int bytes = (ONE ? 1 : 2) * (int)fa2Stage<D, WARPS, BK, MT, RR>();
   static bool attr = false;
-  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE>), bytes); attr = true; }
+  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, PREF, MINB>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
-  flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
+  flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, PREF, MINB><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
                                                                               rowStride, posStride, outRowStride, outPosStride);
 }
 inline int flash2R1Tile() {

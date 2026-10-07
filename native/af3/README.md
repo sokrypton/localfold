@@ -700,6 +700,13 @@ at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two an
   register-staged form's shape, swept with `LOCALFOLD_BENCH_ONE=1 --bench-grid=N`, where 64-key tiles win the bench
   by 8% at 510 tokens and lose or tie in the fold (9.43/10.45/10.85 s against 9.76/11.10/10.79, and slower at 261).
   The shipped forms are the best of their family there; what would move the T4 is a different algorithm, not a knob.
+- **A register-reduced flash kernel for the T4** (2026-10-07; `PREF`/`MINB` on flashGrid2R, arms in `--bench-grid`
+  under `LOCALFOLD_BENCH_ONE=1`). Without the register-held prefetch the shipped shape compiles to 159 registers
+  (from 195: three blocks an SM instead of two, no spills, bit-identical), and 4 warps of one tile with 32-key tiles to
+  80 (four blocks, every warp slot). **Occupancy was not the limit**: in AlphaFold 3 folds on the T4, three rounds
+  interleaved, all within ±1% (510 tokens 10.92/11.06/11.16 s and 10.98/11.33/11.39 against 11.75/10.98/11.05; 261
+  tokens 3.107/3.098/3.084 against 3.117/3.104/3.100), while the bench put the leaner forms 12-25% behind at 1000
+  tokens - the exposed loads and the extra warps' traffic cost what the hidden latency gives.
 - **OpenDDE's refiner and confidence stacks on a bf16 pair** (2026-10-07; the structural pair converted around their
   eight pairformer blocks, the refiner's f32 copy given back while they ran): **no gain at any size** - 15.59 against
   15.69 s at 765 residues, 74.38 against 74.30 at 1450, the peak 30.75 GB both ways (it is the diffusion's, holding

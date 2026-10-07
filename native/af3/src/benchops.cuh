@@ -154,6 +154,13 @@ inline void benchGrid(int n) {
     {"ONE w4 bk48 mt2 rr1", [&] { flashGrid2RRun<32, 4, 48, 2, 1, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"ONE w2 bk48 mt2 rr3", [&] { flashGrid2RRun<32, 2, 48, 2, 3, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"ONE w4 bk32 mt1 rr2", [&] { flashGrid2RRun<32, 4, 32, 1, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk48 nopref", [&] { flashGrid2RRun<32, 2, 48, 2, 2, false, true, false>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk48 minb3", [&] { flashGrid2RRun<32, 2, 48, 2, 2, false, true, true, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk48 nopref minb3", [&] { flashGrid2RRun<32, 2, 48, 2, 2, false, true, false, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk64 nopref minb3", [&] { flashGrid2RRun<32, 2, 64, 2, 2, false, true, false, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w4 bk32 mt1 nopref minb3", [&] { flashGrid2RRun<32, 4, 32, 1, 2, false, true, false, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w4 bk32 mt1 pref", [&] { flashGrid2RRun<32, 4, 32, 1, 2, false, true, true, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w4 bk48 mt1 rr1 nopref", [&] { flashGrid2RRun<32, 4, 48, 1, 1, false, true, false, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"ONE w2 bk64 mt1 rr2", [&] { flashGrid2RRun<32, 2, 64, 1, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
   };
   if (getenv("LOCALFOLD_BENCH_ONE"))           // (a T4: only the register-staged forms, the rest wanting cp.async's room)
