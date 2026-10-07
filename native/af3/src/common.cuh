@@ -3,6 +3,7 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuda_bf16.h>
+#include <charconv>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -1637,6 +1638,21 @@ __global__ void quantiseK(const float* in, unsigned char* out, size_t n, float s
 inline void writeWhole(const std::string& path, const void* data, size_t bytes) {
   FILE* f = fopen((path + ".tmp").c_str(), "wb"); fwrite(data, 1, bytes, f); fclose(f);
   rename((path + ".tmp").c_str(), path.c_str());
+}
+// a square matrix as the confidence files write it - rows "[a, b, ...]" joined by ",\n  ", two decimals - into j
+// (std::to_chars's fixed precision rounds as "%.2f" does; a fprintf a number was 27 ms of a 261 x 261 matrix)
+inline void appendMatrix2(std::string& j, const float* m, int L) {
+  j.reserve(j.size() + (size_t)L * L * 7 + 16);
+  j += "[";
+  for (int i = 0; i < L; ++i) {
+    j += i ? ",\n  [" : "[";
+    for (int c = 0; c < L; ++c) {
+      if (c) j += ", ";
+      char b[64]; auto r = std::to_chars(b, b + sizeof b, m[(size_t)i * L + c], std::chars_format::fixed, 2); j.append(b, r.ptr);
+    }
+    j += "]";
+  }
+  j += "]";
 }
 inline std::vector<float> download(const float* d, size_t n) {
   std::vector<float> h(n);

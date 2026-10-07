@@ -259,21 +259,11 @@ inline void writeConfidences(const std::string& pdb, int T, const Confidence& co
   bool chains = false; for (int t = 1; t < T; ++t) chains |= asym[t] != asym[0];
   int first = *std::min_element(asym.begin(), asym.end());     // (EF2 counts chains and residues from 0;
   FILE* f = fopen((stem + "_confidences.json").c_str(), "w");    //  the PDB from A and 1)
-  fprintf(f, "{\"pae\": [");
-  for (int i = 0; i < T; ++i) {
-    fprintf(f, "%s[", i ? ",\n  " : "");
-    for (int j = 0; j < T; ++j) fprintf(f, "%s%.2f", j ? ", " : "", conf.pae[(size_t)i * T + j]);
-    fprintf(f, "]");
-  }
-  fprintf(f, "]");
-  if (!contacts.empty()) {
-    fprintf(f, ",\n \"contact_probs\": [");
-    for (int i = 0; i < T; ++i) {
-      fprintf(f, "%s[", i ? ",\n  " : "");
-      for (int j = 0; j < T; ++j) fprintf(f, "%s%.2f", j ? ", " : "", contacts[(size_t)i * T + j]);
-      fprintf(f, "]");
-    }
-    fprintf(f, "]");
+  {
+    std::string j = "{\"pae\": ";
+    appendMatrix2(j, conf.pae.data(), T);
+    if (!contacts.empty()) { j += ",\n \"contact_probs\": "; appendMatrix2(j, contacts.data(), T); }
+    fwrite(j.data(), 1, j.size(), f);
   }
   fprintf(f, ",\n \"token_plddts\": [");
   for (int i = 0; i < T; ++i) fprintf(f, "%s%.2f", i ? ", " : "", 100.f * conf.plddtToken[i]);

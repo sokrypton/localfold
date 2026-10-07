@@ -126,13 +126,7 @@ void writeConfidences(const std::string& pdb, const float* pair, int L, const fl
   }
   auto chainId = [&](int i) { return (char)('A' + std::min(asym[i] - firstAsym, 25)); };
   auto matrix = [&](FILE* f, const std::vector<float>& m) {
-    fprintf(f, "[");
-    for (int i = 0; i < L; ++i) {
-      fprintf(f, "%s[", i ? ",\n  " : "");
-      for (int j = 0; j < L; ++j) fprintf(f, "%s%.2f", j ? ", " : "", m[(size_t)i * L + j]);
-      fprintf(f, "]");
-    }
-    fprintf(f, "]");
+    std::string j; appendMatrix2(j, m.data(), L); fwrite(j.data(), 1, j.size(), f);
   };
   FILE* f = fopen((stem + "_confidences.json").c_str(), "w");
   std::string chains, values;
