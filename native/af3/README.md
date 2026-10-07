@@ -688,6 +688,18 @@ at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two an
 
 ## Tried and not taken
 
+- **Rewriting the T4's pair-track kernels, the measurements that came first** (2026-10-07, a Colab T4, AlphaFold 3 at
+  510 tokens). Each fused kernel against the unfused passes with the bf16 pair kept (`LOCALFOLD_SKIP_FUSED`; the
+  older `LOCALFOLD_UNFUSED` also takes the pair to f32, which is what made its arms look so slow): the transition
+  1882 ms fused against 2400, the triangle 3226 against 4603, and the grid attention **a tie** (5459 against 5464) -
+  half the T4's trunk either way, most of it the flash kernel at ~9 TFLOP/s. Nsight Compute there: tensor pipe 37%
+  active, the transcendental pipe 36%, stalls spread over fixed-latency waits, the shared-memory queue and global
+  loads, the issue slots 12% used - latency-bound at two warps a scheduler (195 registers, two blocks an SM). Two
+  ideas measured dead: the emulated k16's two dependent k8 halves are NOT issued back to back (`asm volatile` or
+  not, ptxas interleaves them - identical schedules, 108 HMMAs a tile, none waiting on its neighbour); and the
+  register-staged form's shape, swept with `LOCALFOLD_BENCH_ONE=1 --bench-grid=N`, where 64-key tiles win the bench
+  by 8% at 510 tokens and lose or tie in the fold (9.43/10.45/10.85 s against 9.76/11.10/10.79, and slower at 261).
+  The shipped forms are the best of their family there; what would move the T4 is a different algorithm, not a knob.
 - **OpenDDE's refiner and confidence stacks on a bf16 pair** (2026-10-07; the structural pair converted around their
   eight pairformer blocks, the refiner's f32 copy given back while they ran): **no gain at any size** - 15.59 against
   15.69 s at 765 residues, 74.38 against 74.30 at 1450, the peak 30.75 GB both ways (it is the diffusion's, holding

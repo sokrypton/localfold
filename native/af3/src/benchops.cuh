@@ -90,6 +90,7 @@ inline void benchGrid(int n) {
     for (auto& v : hm) { s = s * 6364136223846793005ull + 1442695040888963407ull; v = (s >> 40) % 10 ? 1.f : 0.f; }
     CK(cudaMemcpy(mask, hm.data(), hm.size() * 4, cudaMemcpyHostToDevice)); }
   half* out2 = dallocT<half>(rows * n * Wd);
+  if (!getenv("LOCALFOLD_BENCH_ONE")) {      // (the cross-checks run cp.async forms a T4 has no room for)
   for (const float* mk : {(const float*)nullptr, (const float*)mask}) {
     flashGridHalfRun<32, 4, FA_BK, false>(qkvg, bias, stride, mk, out, n, heads, 0, rows, false, 0.17f, nullptr);
     flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, mk, out2, n, heads, 0, rows, false, 0.17f, nullptr);
@@ -129,6 +130,7 @@ inline void benchGrid(int n) {
     size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
     printf("  2R rr%d against rr1: %zu of %zu outputs differ\n", rr, differ, a.size());
   }
+  }
   std::vector<std::pair<std::string, std::function<void()>>> arms = {
     {"grid w4 cp.async", [&] { flashGridHalfRun<32, 4, FA_BK, false>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 reg", [&] { flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
@@ -143,7 +145,19 @@ inline void benchGrid(int n) {
     {"2R w2 bk48 rr2", [&] { flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w2 bk48 rr3", [&] { flashGrid2RRun<32, 2, 48, 2, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w8 bk48 mt1", [&] { flashGrid2RRun<32, 8, 48, 1>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    // the register-staged (ONE) forms - what a T4 runs, which has no cp.async
+    {"ONE w2 bk48 mt2 rr2", [&] { flashGrid2RRun<32, 2, 48, 2, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk64 mt2 rr2", [&] { flashGrid2RRun<32, 2, 64, 2, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk32 mt2 rr2", [&] { flashGrid2RRun<32, 2, 32, 2, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk48 mt1 rr1", [&] { flashGrid2RRun<32, 2, 48, 1, 1, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w4 bk48 mt1 rr1", [&] { flashGrid2RRun<32, 4, 48, 1, 1, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w4 bk48 mt2 rr1", [&] { flashGrid2RRun<32, 4, 48, 2, 1, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk48 mt2 rr3", [&] { flashGrid2RRun<32, 2, 48, 2, 3, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w4 bk32 mt1 rr2", [&] { flashGrid2RRun<32, 4, 32, 1, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"ONE w2 bk64 mt1 rr2", [&] { flashGrid2RRun<32, 2, 64, 1, 2, false, true>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
   };
+  if (getenv("LOCALFOLD_BENCH_ONE"))           // (a T4: only the register-staged forms, the rest wanting cp.async's room)
+    arms.erase(std::remove_if(arms.begin(), arms.end(), [](auto& a) { return a.first.rfind("ONE", 0) != 0; }), arms.end());
   std::vector<std::vector<float>> t(arms.size());
   cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
   for (int round = 0; round < 7; ++round)

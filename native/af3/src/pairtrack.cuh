@@ -42,6 +42,12 @@ void layerNorm2(const TI* in, TO* out, size_t rows, int C, const std::string& sc
 }
 // gated = swish(a) * b (* u with `up`: boltz2's conditioned transition up-gate), a row of wide
 // being [a | b] or [a | b | u], each I wide
+// (an experiment's arm: LOCALFOLD_SKIP_FUSED=transition|grid|triangle skips that fused 128-channel kernel at its call
+// site, keeping the bf16 pair - LOCALFOLD_UNFUSED also takes the pair back to f32)
+inline bool skipFused(const char* what) {
+  static const std::string v = getenv("LOCALFOLD_SKIP_FUSED") ? getenv("LOCALFOLD_SKIP_FUSED") : "";
+  return !v.empty() && v.find(what) != std::string::npos;
+}
 template <class T>
 __global__ void swigluK(const T* wide, T* gated, size_t rows, int I, bool up) {
   int L = up ? 3 * I : 2 * I;
@@ -541,7 +547,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     // (384 and 512 channels - OpenDDE, IntelliFold-2 - too: their unfused triangle was the LN, a [C, 4C] GEMM, the gate,
     // the centre norm, two GEMMs and a gated add; LOCALFOLD_NO_WIDER=1 keeps it)
     bool wide = (C == 256 || (FUSED_WIDER && (C == 384 || C == 512)) || (C == 128 && !narrowFused)) && fitsSmem(wideTriFitsSmem(C));
-    if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wide) {
+    if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wide && !(C == 128 && skipFused("triangle"))) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
       half* t2 = scratch<half>("tri.t2whole", cs * C);
@@ -589,7 +595,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
       });
       return;
     }
-    if (FUSED_TRIANGLE && C == 128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>())) {   // see fusedtriangle.cuh
+    if (FUSED_TRIANGLE && C == 128 && !skipFused("triangle") && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>())) {   // see fusedtriangle.cuh
       half* t2 = scratch<half>("tri.t2whole", cs * C);
       if (TRI_BF16) {
         // a, b and the contraction's product in bf16: f32's range at half the bytes (f16's
@@ -656,7 +662,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   if (w1 % (2 * (size_t)C)) { fprintf(stderr, "%s.transition1 has %zu elements, not C %d x 2I\n", pre.c_str(), w1, C); exit(1); }
   int I = (int)(w1 / (2 * (size_t)C));
   // (the fused 128-channel kernel adds in place, so not under a redirected residual - nothing parallel is 128 wide)
-  if constexpr (std::is_same_v<T, half>) if (!RESIDUAL_INTO && fusedTransition(x, rows, C, I, pre)) return;
+  if constexpr (std::is_same_v<T, half>) if (!RESIDUAL_INTO && !skipFused("transition") && fusedTransition(x, rows, C, I, pre)) return;
   if constexpr (std::is_same_v<T, half>) {
     // 256 channels: LN, the widening and SwiGLU in one kernel (fused256.cuh), then the second GEMM with the
     // residual as its beta - the [rows, 2I] widening never written
@@ -895,7 +901,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     // three fused kernels (fusedtriangle.cuh): LN + the bias projection (head-major), then per
     // chunk LN + q/k/v/gate (reading the column direction's rows transposed in place), the flash
     // kernel, and the output projection added into the pair
-    if (FUSED_GRID && C == 128 && Wd == 128 && heads <= 16 && gridFusedFits() && !RESIDUAL_UNTRANSPOSED && !hasW(pre + ".gatingQueryBias") &&
+    if (FUSED_GRID && C == 128 && !skipFused("grid") && Wd == 128 && heads <= 16 && gridFusedFits() && !RESIDUAL_UNTRANSPOSED && !hasW(pre + ".gatingQueryBias") &&
         !hasW(pre + ".outputProjectionBias")) {
       int stride = (n + 7) / 8 * 8;
       half* bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
