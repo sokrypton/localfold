@@ -668,6 +668,17 @@ holds the SM at 8 warps, and it ran 4-18% slower.
 
 ## Tried and not taken
 
+- **Four of the 2026-10-07 list, measured first and declined** (each against the number that decides it):
+  the **denoiser transformer at small sizes** - its block is 67 us at 261 tokens, 46 of it four GEMMs cuBLAS runs at
+  ~85 TFLOP/s on 272 rows with its first heuristic choice already the best, and every attention and adaLN variant
+  `--bench-ops` lists (block, warp, split, 32/48/64-key tiles, 1-8 warps) already measured with the shipped one the
+  fastest; SwiGLU and the two adaLNs are 9 us of it. The **outer product mean's output with a fused epilogue** - the
+  whole OPM is 22 of a ~500 ms stage-synced trunk (4.4%), and on the bf16 pair cuBLAS has no f16-in, bf16-out GEMM
+  to take the residual, so the permute and add it would remove are ~1%. **bf16 on the big-input paths** - with the
+  free-memory line a wide model takes them only past ~900-1100 tokens on 40 GB, and where both arms were measured
+  the bf16 pair is 2% of OpenDDE's trunk (765 tokens: 12.77 s against 13.0 with `LOCALFOLD_PAIR_F32=1`).
+  **Template pair features on the device** - the export is 0.50-0.56 s at 1,020 tokens since the sparse fused
+  features, and moving it would put a second featuriser beside the page's, which this port exists not to do.
 - **A row-resident flash attention for the grid attention** (2026-10-07; one block a (row, head) loading all of its
   keys and values once - 37 KB at 261 tokens - and its warps walking the query tiles with no barrier; the arithmetic
   flashGrid2R's to the instruction, and **byte-identical**): slower every way it was fed its bias. From L2 a fragment
