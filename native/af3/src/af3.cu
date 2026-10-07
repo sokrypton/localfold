@@ -18,6 +18,9 @@
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
+  // the big-input paths when 18x the f32 pair does not fit the room (common.cuh, shortPair);
+  // LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
+  SHORT_PAIR_TIMES = getenv("LOCALFOLD_SHORT_PAIR_TIMES") ? atof(getenv("LOCALFOLD_SHORT_PAIR_TIMES")) : 18;
   // LOCALFOLD_UNFUSED=grid,triangle,transition: those pair-track families through their unfused kernels (to
   // measure the two on a device - the fused ones are each a block's worth of shared memory)
   if (const char* u = getenv("LOCALFOLD_UNFUSED")) {
@@ -26,7 +29,7 @@ int main(int argc, char** argv) {
     if (un.find(",triangle,") != std::string::npos) FUSED_TRIANGLE = false;
     if (un.find(",transition,") != std::string::npos) FUSED_TRANSITION = false;
   }
-  bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1;   // 3 recycles: the page's default
+  bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1; double recycleTolerance = 0;   // 3 recycles: the page's default
   // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
   // 5 diffusion samples - where the command does not set them; the plain defaults are the page's
   bool af3Defaults = false, saveEmbeddings = false, saveDistogram = false;
@@ -49,6 +52,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
+    else if (!strncmp(argv[i], "--recycle-tolerance=", 20)) recycleTolerance = atof(argv[i] + 20);   // angstroms; 0 off
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strcmp(argv[i], "--af3-defaults")) af3Defaults = true;
     else if (!strcmp(argv[i], "--flow")) SAMPLER_FLOW = true;     // the page's Flow sampler (sampler.cuh)
@@ -338,15 +342,33 @@ int main(int argc, char** argv) {
                          + (lastPass + 1 < 10 ? "0" : "") + std::to_string(lastPass + 1) + ".u8";
       TAP().offer({{bytes, pairs}}, [path, pairs](const char* host, const std::vector<size_t>&) { writeWhole(path, host, pairs); });
     };
+    // --recycle-tolerance: stop once two consecutive passes moved the distogram's predicted distances less than it
+    // (the page's rule, src/af3/feature-convergence.js shouldStopRecycling - one crossing is not enough, GB1's trunk
+    // dips under 0.5 A and then moves 1.09 A); off (0) by default, as on the page
+    std::vector<double> changes;
+    int passesRun = lastPass + 1;
+    auto converged = [&](int pass) {
+      if (recycleTolerance <= 0 || pass == lastPass) return false;
+      double c = distogramChange(t, pass);
+      changes.push_back(c);
+      size_t k = changes.size();
+      if (k < 3 || changes[k - 1] >= recycleTolerance || changes[k - 2] >= recycleTolerance) return false;
+      printf("trunk: converged at %.2f A after %d passes\n", changes[k - 1], pass + 1);
+      passesRun = pass + 1;
+      return true;
+    };
     for (int pass = 0; pass <= lastPass; ++pass) {
-      if (pass == 0) { if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none); afterPass(pass); continue; }
+      if (pass == 0) {
+        if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
+        afterPass(pass); if (converged(pass)) break; continue;
+      }
       // (capturing and instantiating costs ~15 ms and a replayed pass saves ~2 ms at 68 tokens, more
       // as the launches grow: a first fold breaks even at 7 recycles there - AF3's 10 gain 6 ms - and
       // at 3 from ~200 tokens, so the graph is taken where it measured a gain)
       // ...and not where a pass gives its stages' scratch back (runTrunk, shortPair), which a capture
       // cannot do
       if (!GRAPHS || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
-        recyclePass(); afterPass(pass); continue;
+        recyclePass(); afterPass(pass); if (converged(pass)) break; continue;
       }
       if (!trunkGraph) {
         cudaGraph_t g;
@@ -357,7 +379,7 @@ int main(int argc, char** argv) {
         CK(cudaGraphDestroy(g));
       }
       CK(cudaGraphLaunch(trunkGraph, STREAM));
-      afterPass(pass);
+      afterPass(pass); if (converged(pass)) break;
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
@@ -406,6 +428,10 @@ int main(int argc, char** argv) {
     int nD = t.n;
     std::vector<int> resAsym(M.i("batch.asymId"), M.i("batch.asymId") + t.n);
     if (structural) {
+      // (a large input's trunk scratch given back BEFORE the expansion, not after: its structural pair - ~2 tokens a
+      // residue - takes two f32 [pairs, C] buffers of its own, 6.8 GB each at 1080 residues, which beside the trunk's
+      // ordinary-path scratch ran out of a 40 GB card)
+      if (tightPair(pairs, t.C)) releaseScratch();
       st = expandStructural(t.single, t.pair, t.targetFeat, t.n, fast);
       swapBatch();
       dS = st.single; dP = st.pair; dTf = st.targetFeat; dSeq = st.seqMask; nD = st.n;
@@ -622,7 +648,7 @@ int main(int argc, char** argv) {
     }
     printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", conf.meanPlddt, conf.ptm, conf.iptm, out.c_str());
     printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d%s), confidence %.1f ms, total %.1f ms\n",
-           fi + 1, ms(f0, f1), M.flag("trunk.dialect.recycleFromInit") ? std::max(1, recycles) : recycles + 1, diffMs, steps, samples,
+           fi + 1, ms(f0, f1), passesRun, diffMs, steps, samples,
            seedList.size() > 1 ? (" x " + std::to_string(seedList.size()) + " seeds").c_str() : "", confMs, ms(f0, f3));
     if (profiling) prof::stop(40);
     if (fi == 0 && which == 0 && serveDir.empty()) unreadWeights();

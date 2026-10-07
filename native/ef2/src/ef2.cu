@@ -377,6 +377,9 @@ static int foldInput(const Opts& o, bool warm) {
 static bool DETACH = false;
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
+  // the big-input paths when SHORT_PAIR_TIMES x the f32 pair does not fit the room (native/af3's common.cuh,
+  // shortPair); LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
+  SHORT_PAIR_TIMES = getenv("LOCALFOLD_SHORT_PAIR_TIMES") ? atof(getenv("LOCALFOLD_SHORT_PAIR_TIMES")) : 0;
   std::string weights, foldBundle, esmcBundle, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false, stepsGiven = false; std::string warmShape, serveDir;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;

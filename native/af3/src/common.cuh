@@ -1063,13 +1063,30 @@ inline void releaseScratch() {
 // against the ordinary ones on an input small enough to fold both ways
 inline const bool BIG_FORCED = getenv("LOCALFOLD_BIG") != nullptr;
 inline bool tightPair(size_t pairs, int C) { return pairs * C * 4 > ((size_t)128 << 20); }
-// ...and short of room: the pair over a 64th of the card (1135 tokens at 128 channels on 40 GB, 690
-// on a T4's 15). The trunk gives each stage's scratch back between stages only here, because doing it
-// costs the recycles their graph and a reallocation a pass - 2.5% of the trunk at 525 tokens, 0.3% at
-// 1048 - for 2.4 GB of a 1048-token trunk's peak (12.88 -> 10.47 GB)
+// ...and short of room. AF3 (SHORT_PAIR_TIMES, set by af3.cu): when SHORT_PAIR_TIMES times the f32 pair does not
+// fit the room this process had at its first ask - free memory, held scratch counted, a 20th of the card spare,
+// fixed then so a warm fold decides as a cold one does (and a second process holding memory moves it, which a card
+// fraction did not). The ordinary paths peak at 16-18x the f32 pair, weights included (AF3 32.7 GB at 2000 tokens,
+// a 2.05 GB pair; OpenDDE 16.5 GB at 765, 0.90 GB): 20 puts the line at ~1900 tokens for AF3 on 40 GB, ~1100 for
+// OpenDDE. It was a 64th of the card, which sent AF3 down the big-input paths from 1118 tokens and OpenDDE from
+// 646 with the card two-thirds empty - 55.2 against 31.8 s a fold at 2000 tokens, OpenDDE's trunk 17.8 against
+// 12.8 s at 765. AF2 and ESMFold2 (0) keep the 64th until measured. Under it the trunk gives each stage's scratch
+// back between stages, which costs the recycles their graph and a reallocation a pass.
+inline double SHORT_PAIR_TIMES = 0;
 inline bool shortPair(size_t pairs, int C) {
-  static const size_t card = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t; }();
   if (BIG_FORCED) return true;
+  if (SHORT_PAIR_TIMES > 0) {
+    static const size_t room = [] {
+      size_t f, t; CK(cudaMemGetInfo(&f, &t));
+      for (auto& [name, slot] : SCRATCH) f += slot.second;
+      size_t r = f > t / 20 ? f - t / 20 : 0;
+      if (getenv("LOCALFOLD_MEM")) fprintf(stderr, "  memory room for the ordinary paths %.2f GB (a pair up to %.2f GB)\n",
+                                           r / 1e9, r / 1e9 / SHORT_PAIR_TIMES);
+      return r;
+    }();
+    return (double)pairs * C * 4 * SHORT_PAIR_TIMES > (double)room;
+  }
+  static const size_t card = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t; }();
   return pairs * C * 4 > card / 64;
 }
 // the scratch buffers named, given back (the next use allocates afresh): a name ending in '.' is a

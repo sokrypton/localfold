@@ -1158,6 +1158,43 @@ __global__ void contactProbsK(const float* logits, const int* contactBins, const
   for (int b = 0; b < bins; ++b) { float p = expf(l[b] - mx); total += p; if (b < contactBins[ij]) contact += p; }
   out[ij] = pairMask[ij] * contact / total;
 }
+// --recycle-tolerance: the RMS change of the distance each pair's distogram predicts, the page's criterion
+// (src/af3/feature-convergence.js, expectedDistances and distanceChange): the expectation over the bin centres - the
+// open first and last bins at their breaks - written over `prev`, the squared change summed into acc
+__global__ void distogramChangeK(const float* logits, float* prev, double* acc, size_t pairs, int bins, bool first) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  float sq = 0.f;
+  if (ij < pairs) {
+    const float* l = logits + ij * bins;
+    const float fb = 2.3125f, lb = 21.6875f;
+    float mx = -INFINITY;
+    for (int b = 0; b < bins; ++b) mx = fmaxf(mx, l[b]);
+    float total = 0.f, weighted = 0.f;
+    for (int b = 0; b < bins; ++b) {
+      float centre = b == 0 ? fb : b == bins - 1 ? lb : fb + (lb - fb) * (b - 0.5f) / (bins - 2);
+      float p = expf(l[b] - mx); total += p; weighted += p * centre;
+    }
+    float d = total > 0.f ? weighted / total : 0.f;
+    if (!first) { float dd = d - prev[ij]; sq = dd * dd; }
+    prev[ij] = d;
+  }
+  for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(~0u, sq, o);
+  if ((threadIdx.x & 31) == 0 && sq > 0.f) atomicAdd(acc, (double)sq);
+}
+// this pass's change in angstroms (pass 0: none, -1), the pair's distogram computed again
+inline double distogramChange(Trunk& t, int pass) {
+  int bins = (int)M.meta("trunk.distogram.bins");
+  size_t pairs = (size_t)t.n * t.n;
+  float* logits = scratch<float>("disto.logits", pairs * bins);
+  distogram(t, logits);
+  float* prev = scratch<float>("disto.expected", pairs);
+  double* acc = scratch<double>("disto.change", 1);
+  CK(cudaMemsetAsync(acc, 0, sizeof(double), STREAM));
+  distogramChangeK<<<blocks(pairs), 256, 0, STREAM>>>(logits, prev, acc, pairs, bins, pass == 0);
+  double sum; CK(cudaMemcpyAsync(&sum, acc, sizeof(double), cudaMemcpyDeviceToHost, STREAM));
+  CK(cudaStreamSynchronize(STREAM));
+  return pass == 0 ? -1 : std::sqrt(sum / pairs);
+}
 inline std::vector<float> contactProbabilities(Trunk& t) {
   if (!M.has("batch.contactBins")) return {};
   int bins = (int)M.meta("trunk.distogram.bins");

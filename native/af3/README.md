@@ -851,7 +851,7 @@ the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2
   held through every step. Now **10.47 and 9.89 GB**. The diffusion's releases cost nothing measurable
   and run whenever the pair is over 128 MB; the trunk's cost the recycles their graph and a
   reallocation a pass - 2.5% of the trunk at 525 tokens, 0.3% at 1048 - so they run only where the
-  pair is over a 64th of the card (`shortPair`: 1135 tokens on 40 GB, 690 on a T4). Releasing the
+  pair is short of room (`shortPair`; see "The big-input line" below). Releasing the
   conditioning's chunk buffers too (`dc.f2*`, `pt.*`) was measured and not taken: they are CHUNK-sized
   at any length, and reallocating them cost 16 ms of a 100 ms diffusion at 525 tokens.
 - **The grid attention takes every row in one pass only while its q/k/v/gate are a 32nd of the
@@ -878,7 +878,7 @@ the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2
 ## How large a fold fits
 
 Measured on the A100 (40 GB, `peak` sampled from the device every 0.1 s, one fold, 25 steps, single
-sequence). On a card short of room (`shortPair`: the pair over a 64th of the card) every stage gives
+sequence). On a card short of room (`shortPair`, below) every stage gives
 back what it alone used as soon as it is done, and what is read once is computed in row chunks rather
 than held whole: the recycled pair (handed to the next pass rather than copied, freed once the
 embedder has read it), the embedder's and the template query's normalised pairs, the template stack's
@@ -908,6 +908,53 @@ per-super-block logits and the 24 cached biases at once - 12.4 GB of scratch at 
 the per-phase lines alone could not show. The WebGPU page stops earlier and for a different reason:
 every pair-sized dispatch binds `tokens^2 x channels` floats against a 2 GiB binding limit on NVIDIA,
 so 2047 tokens for AF3 and 1023 for IntelliFold-2.
+
+### 🔴 The big-input line is the card's FREE memory, not a 64th of it
+
+`shortPair` - the switch every big-input path above hangs off, and the one that also takes the recycles' CUDA
+graph away - was "the pair over a 64th of the card": 1118 tokens for AlphaFold 3 on 40 GB, **646 for OpenDDE and
+560 for IntelliFold-2**, whose pairs are 3-4x wider, with the card two-thirds empty either way. It is now **18x the
+f32 pair against the room this process had at its first ask** (free memory, held scratch counted, a 20th of the
+card spare; fixed then, so a warm fold decides as a cold one does, and a second process holding memory moves it
+where a card fraction could not). The ordinary paths peak at 14-15x the f32 pair beyond what is resident by then
+(AlphaFold 3 32.7 GB at 2000 tokens on a 2.05 GB pair, OpenDDE 16.3 GB at 765 on 0.90). On this A100 the room
+reads 32-35 GB, so the line is ~1940 tokens for AlphaFold 3, ~1090 for OpenDDE, ~930 for IntelliFold-2 and ~1360
+at 256 channels. `LOCALFOLD_SHORT_PAIR_TIMES=0` is the old rule; native/af2 and native/ef2 keep it until measured.
+One fold, 25 steps, single sequence, the two rules (2026-10-07):
+
+| | tokens | old rule | free-memory rule | peak |
+|---|---:|---:|---:|---:|
+| AlphaFold 3 | 1905 | 50.5 s | **28.3 s** | 11.3 -> 30.3 GB |
+| OpenDDE | 765 | trunk 17.75 s | **12.77 s** | 14.2 -> 16.3 GB |
+| OpenDDE | 1080 | 43.9 s | **37.8 s** | 20.7 -> 23.3 GB |
+| IntelliFold-2 | 920 | 38.3 s | **32.3 s** | 11.6 -> 22.1 GB |
+| protenix2 | 1345 | 34.6 s | **29.4 s** | 10.1 -> 23.2 GB |
+
+Most of it is not the bf16 pair: OpenDDE at 765 with `LOCALFOLD_PAIR_F32=1` on the ordinary paths is 13.0 s.
+🔴 **AND THE FIRST RUN PAST THE OLD LINE RAN OUT OF MEMORY, IN A STAGE THE PAIR DOES NOT SIZE**: OpenDDE's
+structural expander works in its second token space (~2 tokens a residue) and takes two f32 [pairs, C] buffers
+there - 6.8 GB each at 1080 residues - which ran beside the trunk's ordinary-path scratch because only the big-input
+mode gave that back between stages. The trunk's scratch now goes back BEFORE the expansion whenever the pair is over
+128 MB (`tightPair`), as it already did after it.
+
+### `--recycle-tolerance`: the page's AF3 early stop, as an option (off)
+
+`--recycle-tolerance=<A>` stops recycling once two consecutive passes moved the distogram's predicted distances
+(the expectation over its bins, every pair) by less than that RMS - the criterion docs/AF3.md built for the page and
+ships at zero, ported as it stands (src/af3/feature-convergence.js; two passes and not one because GB1's trunk dips
+under 0.5 A and then moves 1.09). Each pass computes the distogram once more and reads one number back. **Off by
+default and not wired into the worker**: dropping recycles is a default for the page to decide, and the threshold is
+not calibrated (2026-10-07). At 0.5 A, 25 steps, a warm fold:
+
+| input | recycles | trunk, off | at 0.5 A | passes | CA RMSD to the full run |
+|---|---:|---:|---:|---:|---:|
+| 5CAJ, alignment (pLDDT 95) | 3 | 367 ms | 292 | 3 of 4 | 0.037 A |
+| 5CAJ | 10 | 1005 | 295 | 3 of 11 | 0.072 |
+| 1TIM, alignment (pLDDT 95) | 3 | 1176 | 901 | 3 of 4 | 0.053 |
+| 1TIM | 10 | 3251 | 905 | 3 of 11 | 0.208 (3 against 10 recycles with no stop: 0.190) |
+| OpenDDE 765, single sequence (pLDDT 44) | 10 | 34.9 s | 9.6 s | 3 of 11 | 14.4 (3 against 10 with no stop: 6.8 - the sampler, docs/AF3.md) |
+
+Every input converged at the earliest pass the rule allows (0.02 A on the confident two, 0.23 on the low one).
 
 ### 🔴 5,000 tokens on a 40 GB A100
 
