@@ -1055,6 +1055,10 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
     };
     diffusionConditioning(trunkSingle, trunkPair, targetFeat, SIGMA_DATA, n);
     PAIR_CHUNK_SINK = nullptr;
+    // the chunk loop's working rows given back before the encoder and decoder prepare beside tp and pn16
+    // (0.9 GB at 1530 tokens, which is what they ran out of)
+    releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.trunkRows", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj",
+                     "enc.tpln", "pt." });
     ENC_TP_GIVEN = tp;
     f.enc = prepareEncoder(E, "atomReference", trunkSingle, nullptr);
     ENC_TP_GIVEN = nullptr;

@@ -860,7 +860,7 @@ void msaBlock(Trunk& t, int k) {
   transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
   if (updateFirst) { outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm"); }
   PAIR16 = t.p16;
-  pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
+  pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4, shortPair((size_t)t.n * t.n, t.C));
   PAIR16 = false;
 }
 
@@ -1044,7 +1044,7 @@ void pairformerBlockAt(float* pair, float* single, const float* pairMask, const 
     singleTrack<T>(single, scratch<float>("par.base", (size_t)n * n * C), seqMask, n, C, Cs, B, extraBias); stage("single");
     return;
   }
-  pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4);
+  pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, shortPair((size_t)n * n, C));
   singleTrack<T>(single, pair, seqMask, n, C, Cs, B, extraBias); stage("single");
 }
 template <class T>
@@ -1156,7 +1156,9 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   bool tight = shortPair(pairs, t.C);
   // ...and the template stack's own triangle buffers: it runs 64 channels through the unfused path,
   // whose names the 128-channel pairformer never asks for again (4.9 GB at 2620 tokens)
-  if (tight) releaseScratch({ "emb.", "tmpl.", "trib.", "grid.", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.pg", "tri.centred",
+  // (and the target_feat atom encoder's: its pair conditioning and working rows, ~0.5 GB at 1530 tokens, which
+  // nothing reads once target_feat is built - the diffusion's encoder allocates its own)
+  if (tight) releaseScratch({ "targetFeat.encoder.", "enc.", "apl.", "emb.", "tmpl.", "trib.", "grid.", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.pg", "tri.centred",
                               "tri.t1", "tri.t2" });
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + std::to_string(msaBlocks) + ".pairChannels")) ++msaBlocks;
   // boltz2 adds the pre-MSA pair back: its MSA module returns the updated z and the caller adds z

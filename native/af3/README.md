@@ -580,7 +580,12 @@ hands each update's scratch back before the next (`tri.`/`trib.`, `grid.`, `tr.`
 f32 and 6.5 in bf16** (was 7.75 both); f32 fails at 6.5 in `trib.t2`, and at 6.0 both fail in the blocked triangle
 (`trib.prod`/`trib.t2`), the next thing to shrink. On a simulated T4 (14.6 GiB, `LOCALFOLD_SMEM_LIMIT`) the template
 stack is not what binds: 3570 tokens folds in bf16 (trunk 262 s, before and after) and f32 runs out in `trib.a`;
-4080 fails in `trib.prod` either way. RMSDs on all three gates unchanged. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
+4080 fails in `trib.prod` either way. RMSDs on all three gates unchanged. Then three more releases on a card short of
+room: the target_feat atom encoder's buffers (`targetFeat.encoder.`, `enc.`, `apl.`, ~0.5 GB at 1530 tokens - nothing
+reads them once target_feat is built) before the trunk, each pair update's scratch between updates in the MSA stack and
+the pairformer too (`releaseBetween`), and the conditioning's chunk buffers before the diffusion's encoder and decoder
+prepare (they ran out beside `enc.tp` and `dt.pn16`). 1530 tokens now folds with **6.0 GB free in both** (bf16 trunk
+29.8 s, f32 35.5 s); at 5.5 the sampler's own step buffers (`dt.flat`) are what is short. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
 output on cuBLAS, which only garbage allows; the kernels are partly latency-bound, so halving their bytes is
 ~15% of each, not half.
 
