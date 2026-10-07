@@ -668,6 +668,11 @@ holds the SM at 8 warps, and it ran 4-18% slower.
 
 ## Tried and not taken
 
+- **OpenDDE's refiner and confidence stacks on a bf16 pair** (2026-10-07; the structural pair converted around their
+  eight pairformer blocks, the refiner's f32 copy given back while they ran): **no gain at any size** - 15.59 against
+  15.69 s at 765 residues, 74.38 against 74.30 at 1450, the peak 30.75 GB both ways (it is the diffusion's, holding
+  the structural pair for the head after it). At 384 channels the bf16 pair is worth ~2% of a pairformer block and
+  these eight are a fifth of the fold; PAE moved 0.03 A on average for nothing.
 - **Four of the 2026-10-07 list, measured first and declined** (each against the number that decides it):
   the **denoiser transformer at small sizes** - its block is 67 us at 261 tokens, 46 of it four GEMMs cuBLAS runs at
   ~85 TFLOP/s on 272 rows with its first heuristic choice already the best, and every attention and adaLN variant
