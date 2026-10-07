@@ -196,6 +196,7 @@ __global__ void centerNormStreamK(const float* prod, TO* out, size_t r0, size_t 
 }
 
 inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
+inline bool TIGHT_STACK = false;          // the template stack on a trunk short of room (triangle, templateEmbedding)
 inline bool FUSED_GRID = true;
 inline bool TRI_BF16 = true;
 inline int TRI_PAD = 8;           // the triangle's padded size is a multiple of this (0: none)
@@ -445,8 +446,10 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   // product and gate, five planes, would not fit with room to spare)
   // (whichever form runs gives back the other's buffers first: scratch outlives the call, so a whole form
   // taken while there was room would otherwise sit beside the blocks of the next call, which had none)
-  if (shortPair(pairs, C)) {
-    if (!roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
+  if (shortPair(pairs, C) || TIGHT_STACK) {
+    // (TIGHT_STACK: a narrower stack - the template's 64 channels - on a trunk short of room, where its own pair is
+    // under the threshold but the card is not: its whole form, 1.5 GB at 1530 tokens, was what ran out)
+    if (TIGHT_STACK || !roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
       releaseScratch({ "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" });
       triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
       return;
@@ -1006,12 +1009,17 @@ inline bool pairBf16Ok(int n, int C, const std::string& B0) {
 }
 // The five pair updates of a pairformer/MSA/template block, in AF3's order.
 template <class T>
+// releaseBetween: each update's scratch given back before the next (the template stack on a card short of room,
+// where the triangle's whole-form buffers - 1.8 GB at 1530 tokens - otherwise sat beside the grid attention's)
 void pairUpdates(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap,
-                 bool divide, int transitionFactor) {
+                 bool divide, int transitionFactor, bool releaseBetween = false) {
   triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationOutgoing", true, divide); stage("tri.out");
   triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationIncoming", false, divide); stage("tri.in");
+  if (releaseBetween) releaseScratch({ "tri.", "trib." });
   int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
   gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); stage("grid.row");
   gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); stage("grid.col");
+  if (releaseBetween) releaseScratch({ "grid." });
   transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition"); stage("transition");
+  if (releaseBetween) releaseScratch({ "tr." });
 }

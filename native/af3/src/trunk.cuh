@@ -402,6 +402,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   }
   bondTypeEmbed(t.pair, pairs, C, E, t.p16);
   onSeam("z_init_generic", t.pair, pairs * C);
+  if (shortPair(pairs, C)) releaseScratch({ "emb.prevln", "emb.prevproj", "p16." });   // (not held into the template stack)
   templateEmbedding<T>(t, t.pair);     // its projection accumulated into the pair (it reads the pair first)
   onSeam("z_after_template", t.pair, pairs * C);
   // msa and single
@@ -550,7 +551,7 @@ void templateEmbedding(Trunk& t, float* out) {
       if (M.flag("trunk.dialect.parallelPairformer"))        // chai: its parallel pair-only iteration
         parallelPairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor, { PairUpdate::TriOut, PairUpdate::TriIn,
           PairUpdate::GridRow, PairUpdate::GridCol, PairUpdate::Transition });
-      else pairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor);
+      else { TIGHT_STACK = tight; pairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor, tight); TIGHT_STACK = false; }
     }
     if (outer) addK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, before, pairs * Ct);
     // in place: act is the pass's own and is written afresh by the next (one warp a row, each lane

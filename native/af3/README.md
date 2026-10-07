@@ -573,7 +573,14 @@ both fold with 7.75 GB free and both fail at 7.5 - 🔴 THE MEMORY CEILING DID N
 the template stack, which runs with the trunk's pair parked in host memory (its own 64-channel f32 activation and
 unfused triangle buffers); raising it means shrinking that stack. (Its bf16 chunk held into the next pass's
 template stack first made bf16 WORSE - 7.75 failed - until it was given back.) What it does do under pressure: the
-trunk 29.9 -> 24.3 s at 7.75 GB free (-18%); 3% where memory is plentiful. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
+trunk 29.9 -> 24.3 s at 7.75 GB free (-18%); 3% where memory is plentiful. Then the template stack itself was
+shrunk: near the card's limit (`TIGHT_STACK`) its triangles take the blocked form, `pairUpdates(..., releaseBetween)`
+hands each update's scratch back before the next (`tri.`/`trib.`, `grid.`, `tr.`), and the embedder's
+`emb.prevln`/`emb.prevproj` and the bf16 chunks go before the stack starts. 1530 tokens now folds with **7.0 GB free in
+f32 and 6.5 in bf16** (was 7.75 both); f32 fails at 6.5 in `trib.t2`, and at 6.0 both fail in the blocked triangle
+(`trib.prod`/`trib.t2`), the next thing to shrink. On a simulated T4 (14.6 GiB, `LOCALFOLD_SMEM_LIMIT`) the template
+stack is not what binds: 3570 tokens folds in bf16 (trunk 262 s, before and after) and f32 runs out in `trib.a`;
+4080 fails in `trib.prod` either way. RMSDs on all three gates unchanged. 🔴 THE PROTOTYPE PROMISED 5% AND 14% - it moved the right bytes through garbage values and kept the row
 output on cuBLAS, which only garbage allows; the kernels are partly latency-bound, so halving their bytes is
 ~15% of each, not half.
 
