@@ -191,8 +191,11 @@ inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
     }
     return;
   }
-  // whole waves of transitionUpK within the same ~64 MB of widened rows (see transitionUpWaveRows)
-  size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), ((size_t)64 << 20) / (2 * (size_t)I));
+  // whole waves of transitionUpK within ~64 MB of widened rows (see transitionUpWaveRows) - or 1 GB where the card
+  // has the room: fewer, larger down-projection GEMMs, which cuBLAS runs on a faster kernel past ~100k rows. The
+  // trunk at 988 tokens 2556 -> 2485 ms (-2.8%), at 494 601 -> 598, at 261 194 -> 193, byte-identical on all three
+  const size_t budget = roomFor((size_t)1 << 30, {"ftr.g", "ftr.gbf"}) ? (size_t)1 << 30 : (size_t)64 << 20;
+  size_t chunk = transitionUpChunkRows<256, 8>(transitionUpSmem<256, 8>(), budget / (2 * (size_t)I));
   half* w1t = scratch<half>("ftr.w1t", (size_t)2 * C * I);
   tileTransitionUp(Fh(Tn + "transition1"), C, I, w1t);
   if (PAIR16) {
