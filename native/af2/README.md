@@ -158,6 +158,25 @@ its 7907-row alignment 2.47 s. On success `af2 --detach-output` prints `af2: don
 so `fold` returns while the driver releases the device (0.16 s). Weights are read with `pread`
 rather than mapped (native/af3's loader).
 
+## A deep alignment's featurisation (2026-10-08)
+
+The features are the page's own (src/input/a3m-features.js, through export_input.mjs). For 5CAJ's 7907-row
+alignment one recycle's featurisation was ~440 ms in Node - parsing and encoding the A3M 185, the nearest-centre
+search 158, the rest ~95 - and the four recycles ran in four workers that **each parsed the whole A3M again**. Now
+the alignment is planned once (parse, encode, profile, every recycle's masking) and the workers take only a
+recycle's search and finishing: byte-identical (5CAJ, 1TIM's 16469 rows and the 59-residue fixture), 1.0 -> 0.74 s
+here and **1.58 -> 1.25 s (5CAJ) and 2.0 -> 1.4 s (1TIM) on two CPUs**, a Colab T4's.
+
+**And the nearest-centre search runs on the card where the machine has fewer cores than recycles** - the page's
+device search (src/input/nearest-centres-webgpu.js) in CUDA (`--nearest=<out>`, a serve job; the zero-byte count and
+the first-centre tie of the host loop, integers both ways). The exporter plans and writes the searches
+(`--search-out`), the AF2 server assigns them, and the exporter finishes from the assignments (`--assignments`), its
+plan held between the two requests by native/export_server.mjs's one process. Byte-identical; through a warm
+exporter on two CPUs 5CAJ 0.99 -> 0.82-0.92 s and 1TIM 1.04 -> 0.92-0.99, and with thirty cores ~20 ms slower (the
+round trips), which is why tools/native_worker.py takes it only below as many cores as recycles
+(`sched_getaffinity`, so a VM's or a `taskset`'s limit counts). A shallow alignment never takes it. Exercised end to
+end by the gate's searched AF2 case on two CPUs (`taskset -c 0,1 python3 tools/check-native-worker.py --no-page`).
+
 ## Memory
 
 Peak device memory, `--fast`: 783 residues from a single sequence **9.0 → 5.7 GB**; 5CAJ with

@@ -547,7 +547,19 @@ class Worker:
                       f"--max-extra={extra}", f"--seed={seed}", *flags]
             if recycles not in (None, ""):
                 export.append(f"--recycles={int(recycles)}")
-            self.node(export, "featurising", log)
+            # 🔴 A DEEP ALIGNMENT'S NEAREST-CENTRE SEARCH ON THE CARD WHERE THE MACHINE HAS FEWER CORES THAN
+            # RECYCLES: the exporter runs a recycle's search in a worker of its own, so with the cores it is
+            # parallel and free, and on a Colab T4's two CPUs it serialises - there it goes to the AF2 server
+            # (--nearest) between the exporter's two requests, the features byte-identical (export_input.mjs).
+            # Measured: 5CAJ's 7907 rows 0.99 -> 0.82-0.92 s on two CPUs, and ~20 ms of round trips slower with
+            # thirty, where it is not used. The exporter skips it for a shallow alignment (no search file)
+            passes = (int(recycles) if recycles not in (None, "") else 3) + 1
+            search = os.path.join(inputs, "nearest.search") if len(os.sched_getaffinity(0)) < passes else None
+            self.node([*export, f"--search-out={search}"] if search else export, "featurising", log)
+            if search and os.path.exists(search):
+                assigned = search[:-len(".search")] + ".assign"
+                server.fold(search, [f"--nearest={assigned}"])
+                self.node([*export, f"--assignments={assigned}"], "featurising", log)
             fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
             total = 0
         else:

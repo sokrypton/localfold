@@ -38,7 +38,9 @@ for (let n = 0; ; ) {
   try {
     await import(`${url}?request=${n++}`);
   } catch (error) {
-    failed = error;
+    // (an exporter that stops after a first phase on purpose - native/af2/export_input.mjs's --search-out -
+    // says so with `phaseDone`: a success)
+    failed = error?.phaseDone ? undefined : error;
   }
   process.stdout.write = write.out; process.stderr.write = write.err;
   writeFileSync(`${dir}/${id}.log`, said);
