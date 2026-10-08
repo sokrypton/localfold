@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "./harness.js";
-import { MODEL_BUNDLES, graphFamily } from "../src/bundles/manifests/index.js";
+import { MODEL_BUNDLES, graphFamily } from "../shared/bundles/manifests/index.js";
 import { sourceFiles } from "./helpers/source-files.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -53,7 +53,7 @@ describe("a delta family runs its base's graph", () => {
   // `chosen` and `row` for exactly that reason.
   it("no page or source file tests a resolved family name for a graph", () => {
     const offenders = [];
-    const files = [...sourceFiles(`${ROOT}src`), ...sourceFiles(`${ROOT}web`)];
+    const files = ["shared", "cpu", "webgpu", "web"].flatMap((tree) => sourceFiles(`${ROOT}${tree}`));
     const pattern = /\b(family|model|choice)\s*[!=]==\s*"(monomer|multimer)"/g;
     // ...over the CODE, not the comments. This rule is worth stating in prose
     // where it is broken most easily, and a gate that forbids describing it is

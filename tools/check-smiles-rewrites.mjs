@@ -26,12 +26,12 @@
  */
 
 import { readFileSync } from "node:fs";
-import { parseSmiles, molecularFormula } from "../src/chem/smiles.js";
-import { valenceProblems } from "../src/chem/kekulize.js";
-import { smallestRings, circuitRank } from "../src/chem/rings.js";
-import { chiralCentres } from "../src/chem/stereo.js";
-import { signedVolume } from "../src/chem/conformer.js";
-import { smilesComponent } from "../src/chem/component.js";
+import { parseSmiles, molecularFormula } from "../shared/chem/smiles.js";
+import { valenceProblems } from "../shared/chem/kekulize.js";
+import { smallestRings, circuitRank } from "../shared/chem/rings.js";
+import { chiralCentres } from "../shared/chem/stereo.js";
+import { signedVolume } from "../shared/chem/conformer.js";
+import { smilesComponent } from "../shared/chem/component.js";
 
 const DUMP = "oracle-dumps/rdkit-smiles.json";
 let dump;

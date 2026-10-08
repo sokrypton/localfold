@@ -26,16 +26,16 @@
  * fences and the weight setup, and no dispatches - leaves 7 ms of the 577. The
  * diffusion side's wins were host-side waste of exactly that kind; this stack
  * has none, so anything further has to come out of the kernels themselves, and
- * src/kernels/triangle/shaders.js already records several tiling attempts that lost.
+ * webgpu/kernels/triangle/shaders.js already records several tiling attempts that lost.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { buildTargetFeat, DIALECT } from "../../webgpu/af3/fold.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
 import { profileDevice } from "./profile.js";
-import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
-import { af3Dialect, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
-import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { memorySnapshot, setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
+import { af3Dialect, openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
+import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -111,7 +111,7 @@ export async function main(device, args) {
     // It defaults to f32 on a measurement taken when every kernel reading it
     // was a VECTOR one; most of them are staged matrix GEMMs now, and those
     // round their weights to halves on the way in whatever the buffer holds.
-    // See src/af3/trunk/pairformer-block-webgpu.js.
+    // See webgpu/af3/trunk/pairformer-block-webgpu.js.
     pairWeightPrecision: option(args, "pair-weights", undefined),
     accumulatePrecision: option(args, "accumulate", undefined),
   });

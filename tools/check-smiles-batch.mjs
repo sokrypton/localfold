@@ -24,10 +24,10 @@
  */
 
 import { readFileSync } from "node:fs";
-import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
-import { parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
-import { smilesComponent } from "../src/chem/component.js";
-import { featuriserDialect, dialectFor } from "../src/af3/dialect.js";
+import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
+import { parseCcdComponent } from "../shared/af3/featurise/ccd-component.js";
+import { smilesComponent } from "../shared/chem/component.js";
+import { featuriserDialect, dialectFor } from "../shared/af3/dialect.js";
 
 const SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
 

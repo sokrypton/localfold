@@ -21,7 +21,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 
-const MANIFESTS = new URL("../src/bundles/manifests/", import.meta.url);
+const MANIFESTS = new URL("../shared/bundles/manifests/", import.meta.url);
 const PAIRFORMER = "diffuser/evoformer/__layer_stack_no_per_layer_1"
   + "/trunk_pairformer/single_attention_q_projection/bias";
 const MSA = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack"
@@ -76,7 +76,7 @@ describe("a trunk's depth is the bundle's", () => {
     // now, but a bench legitimately walks a prefix and passes `allowPrefix` -
     // so the rule is that a LITERAL never reaches it, from anywhere. A count
     // read from the store or from a flag is fine; `48` is not.
-    const roots = ["../src/", "../web/", "../tools/gpu/"];
+    const roots = ["../shared/", "../cpu/", "../webgpu/", "../web/", "../tools/gpu/"];
     const offenders = [];
     let scanned = 0;
     const walk = (dir) => {

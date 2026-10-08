@@ -4,7 +4,7 @@
  *
  *     node tools/gpu-chrome.mjs tools/gpu/probe-tuning.js
  *
- * WHY IT EXISTS. src/runtime/device-profile.js resolves three ways: a
+ * WHY IT EXISTS. webgpu/runtime/device-profile.js resolves three ways: a
  * capability the API states, a measurement, or an architecture prior. The
  * prior is the weak one - it is a table, it can only name architectures
  * somebody has run, and docs/A100.md records three devices giving three
@@ -26,9 +26,9 @@
  * it - but "measured on one device" is what this file exists to widen.
  */
 import { createLinearShader, LINEAR_TILE_WIDE, LINEAR_TILE_TALL,
-  linearTileRows, linearTileColumns } from "../../src/kernels/transition.js";
-import { createAttentionRegisterFlashShader } from "../../src/kernels/attention.js";
-import { deviceProfile } from "../../src/runtime/device-profile.js";
+  linearTileRows, linearTileColumns } from "../../webgpu/kernels/transition.js";
+import { createAttentionRegisterFlashShader } from "../../webgpu/kernels/attention.js";
+import { deviceProfile } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -137,7 +137,7 @@ async function attentionArms(device, rounds, iterations) {
   device.queue.writeBuffer(mask, 0, new Float32Array(batch * queries).fill(1));
   const bias = device.createBuffer({ size: 4 * heads * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(bias, 0, new Float32Array(4 * heads));
-  // The `Parameters` struct in src/kernels/attention.js is sixteen u32.
+  // The `Parameters` struct in webgpu/kernels/attention.js is sixteen u32.
   const params = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const parameterValues = new Uint32Array(16);
   parameterValues.set([batch, queries, channels, heads, headDim, 0, 0]);

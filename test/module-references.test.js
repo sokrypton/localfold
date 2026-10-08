@@ -36,7 +36,7 @@ function stripCommentsAndStrings(source) {
   // `chainGeometryVerdict` without importing it. The regex stripper removed the
   // call, this check passed, and every AlphaFold 2 fold on the live page ended in
   // "chainGeometryVerdict is not defined". It hid real calls in
-  // src/af3/trunk/trunk-webgpu.js too.
+  // webgpu/af3/trunk/trunk-webgpu.js too.
   //
   // What this keeps that the regexes did not: CODE INSIDE `${...}`. A template's
   // literal text is prose or WGSL and is blanked; its expressions are JavaScript
@@ -120,7 +120,7 @@ function stripCommentsAndStrings(source) {
  * positive - `accel.js` reaches `useAccelerator` through
  * `const { useAccelerator } = await import("./ops.js")`, which this scanner's
  * import patterns do not model - and there is nothing to be done about it
- * here, because src/design/mpnn/ is a MIRROR: editing it is reverted by the
+ * here, because cpu/design/mpnn/ is a MIRROR: editing it is reverted by the
  * next `python3 tools/sync-mpnn.py`. And its exports would otherwise join
  * `projectExports`, so common names it ships (`linear`, `softmax`,
  * `layerNorm`) would start being looked for in every unrelated file.
@@ -128,7 +128,7 @@ function stripCommentsAndStrings(source) {
  * anything, and it is run by hand: the node test that ran it was removed
  * because a drifted ../mpnn is not a fault in this tree.
  */
-const VENDORED = join("src", "design", "mpnn");
+const VENDORED = join("cpu", "design", "mpnn");
 
 function walk(directory, out = []) {
   for (const entry of readdirSync(directory)) {
@@ -166,7 +166,7 @@ function visibleNames(source) {
   }
   // 🔴 CLASS METHODS COUNT AS DECLARATIONS. `async tensor(name) {` is a method
   // definition, and without this the scanner reads it as a call to an import
-  // that is not there - which is every store in src/bundles/.
+  // that is not there - which is every store in shared/bundles/.
   for (const match of source.matchAll(/^\s*(?:static\s+)?(?:async\s+)?#?([A-Za-z_$][\w$]*)\s*\([^()]*\)\s*\{/gm)) {
     names.add(match[1]);
   }
@@ -210,12 +210,12 @@ describe("the comment and string stripper", () => {
 describe("module references", () => {
   it("calls no exported name the file cannot see", () => {
     const sources = new Map();
-    for (const path of [...walk("src"), ...walk("web")]) {
+    for (const path of [...walk("shared"), ...walk("cpu"), ...walk("webgpu"), ...walk("web")]) {
       sources.set(path, stripCommentsAndStrings(readFileSync(path, "utf8")));
     }
     const projectExports = new Set();
     for (const [path, source] of sources) {
-      if (!path.startsWith("src")) continue;
+      if (path.startsWith("web")) continue;
       for (const name of exportedNames(source)) projectExports.add(name);
     }
 

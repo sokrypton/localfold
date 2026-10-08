@@ -8,7 +8,7 @@
  * were f16 already - and a fold cannot tell them apart. This asks the kernel
  * directly, on values chosen to be unrepresentable in f16.
  */
-import { WebGpuExecution } from "../../src/runtime/execution.js";
+import { WebGpuExecution } from "../../webgpu/runtime/execution.js";
 
 export async function main(device) {
   const execution = new WebGpuExecution(device);

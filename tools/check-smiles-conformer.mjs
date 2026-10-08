@@ -29,11 +29,11 @@
  */
 
 import { readFileSync } from "node:fs";
-import { parseSmiles } from "../src/chem/smiles.js";
-import { smallestRings } from "../src/chem/rings.js";
-import { chiralCentres } from "../src/chem/stereo.js";
-import { signedVolume } from "../src/chem/conformer.js";
-import { smilesComponent } from "../src/chem/component.js";
+import { parseSmiles } from "../shared/chem/smiles.js";
+import { smallestRings } from "../shared/chem/rings.js";
+import { chiralCentres } from "../shared/chem/stereo.js";
+import { signedVolume } from "../shared/chem/conformer.js";
+import { smilesComponent } from "../shared/chem/component.js";
 
 /**
  * 🔴 THE ANGLE BAR IS 9 DEGREES AND THAT IS NOT A CLIMBDOWN, IT IS THE RIGHT

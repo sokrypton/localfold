@@ -16,7 +16,7 @@ is written out below rather than derived, because a derived rule ("everything
 but test/") silently ships the next directory somebody adds.
 
 THE LAYOUT IS PRESERVED, exactly. The pages at the top, web/ and src/ beside
-them, because index.html says ./web/app.js and app.js says ../src/af2/model/... -
+them, because index.html says ./web/app.js and app.js says ../webgpu/af2/model/... -
 flattening any of that would mean rewriting import paths, and rewriting import
 paths is the build step this repository just got rid of.
 """
@@ -46,7 +46,7 @@ FILES = [".nojekyll", "index.html", "dev.html"]
 # rather than dropping its probe - so putting them back is one line here and the
 # gates come back with them.
 OPTIONAL = ["single.html", "proteinhunter.html"]
-DIRECTORIES = ["web", "src"]
+DIRECTORIES = ["web", "shared", "cpu", "webgpu"]
 
 # ...and never these, wherever they appear.
 # 🔴 `.ipynb_checkpoints` IS IN HERE BECAUSE THE SITE WAS SHIPPING THEM. A
@@ -143,7 +143,7 @@ def registry_mismatches() -> list[str]:
     one is read by a build and the other by a browser; they are checked here so
     that being two files cannot mean being two answers.
     """
-    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
+    index = (ROOT / "shared" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
     # ...a key is quoted when it is not a bare identifier, which
     # `ef2-fast-600m` is not. Matching only unquoted keys made this check
     # report a family as MISSING from the file it is defined in.
@@ -152,9 +152,9 @@ def registry_mismatches() -> list[str]:
     problems = []
     for family in sorted(in_py - in_js):
         problems.append(f"{family}: in tools/write_manifest_module.py but not in"
-                        " src/bundles/manifests/index.js")
+                        " shared/bundles/manifests/index.js")
     for family in sorted(in_js - in_py):
-        problems.append(f"{family}: in src/bundles/manifests/index.js but not in"
+        problems.append(f"{family}: in shared/bundles/manifests/index.js but not in"
                         " tools/write_manifest_module.py")
     for family in sorted(in_py & in_js):
         module = ROOT / BUNDLES[family]["module"]
@@ -175,7 +175,7 @@ def unpublished_families() -> set[str]:
     skipped instead, and the skip is PRINTED, because a bundle silently missing
     from a site is the failure mode this whole file exists to stop.
     """
-    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
+    index = (ROOT / "shared" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
     families = set()
     family = None
     for line in index.splitlines():
@@ -202,7 +202,7 @@ def remote_families() -> set[str]:
     Read out of index.js rather than duplicated here, for the reason
     registry_mismatches gives: two files may not mean two answers.
     """
-    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
+    index = (ROOT / "shared" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
     families = set()
     family = None
     for line in index.splitlines():
@@ -246,7 +246,7 @@ def unreachable_offers() -> list[str]:
     offered = set(re.findall(r'<option value="([\w-]+)"',
                              (ROOT / "index.html").read_text(encoding="utf-8")))
     hosted = remote_families()
-    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
+    index = (ROOT / "shared" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
     known = set(re.findall(r'^  "?([\w-]+)"?: \{$', index, re.MULTILINE))
     # An <option> that is not a model family at all - a sampler, a preset - is
     # not this check's business.
@@ -355,7 +355,7 @@ def manifest_mismatches(model: Path, module: Path) -> list[str]:
         # because int5 was the only packed dtype when it was written, and the
         # ESM-C bundle ships int3 - so a correct manifest was rejected with
         # "unknown dtype 'int3'" and advice to regenerate it, which would have
-        # produced the identical file. src/weights/dtype.js has decoded int1
+        # produced the identical file. shared/weights/dtype.js has decoded int1
         # through int7 the whole time; this is the second place that knew about
         # one width, after `BYTES` in that same file.
         packed = re.fullmatch(r"int([1-7])", dtype or "")
@@ -611,17 +611,16 @@ def build(include_model: bool) -> int:
     # `copytree`. Nothing imported them so nothing broke, and that is exactly
     # why it needs asserting rather than watching - a stray file in the deploy
     # has no symptom until it is somebody's stale code on the internet.
-    published = {p.relative_to(OUT / "src") for p in (OUT / "src").rglob("*.js")}
-    authored = {p.relative_to(ROOT / "src") for p in (ROOT / "src").rglob("*.js")
-                if not any(part.startswith(".") for part in p.parts)}
-    if published != authored:
-        extra = sorted(str(p) for p in published - authored)
-        missing = sorted(str(p) for p in authored - published)
-        for p in extra:
-            print(f"dist/src carries {p}, which is not a source file", file=sys.stderr)
-        for p in missing:
-            print(f"dist/src is missing {p}", file=sys.stderr)
-        return 1
+    for tree in ("shared", "cpu", "webgpu"):
+        published = {p.relative_to(OUT / tree) for p in (OUT / tree).rglob("*.js")}
+        authored = {p.relative_to(ROOT / tree) for p in (ROOT / tree).rglob("*.js")
+                    if not any(part.startswith(".") for part in p.parts)}
+        if published != authored:
+            for p in sorted(str(p) for p in published - authored):
+                print(f"dist/{tree} carries {p}, which is not a source file", file=sys.stderr)
+            for p in sorted(str(p) for p in authored - published):
+                print(f"dist/{tree} is missing {p}", file=sys.stderr)
+            return 1
 
     # 🔴 AND THE PAGE MUST NOT OFFER A MODEL THE SITE CANNOT SERVE, so the BUILD
     # takes the option out rather than a person remembering to. See

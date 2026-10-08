@@ -23,8 +23,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { hostPairReadouts } from "../src/af3/confidence/opendde-confidence.js";
-import { tmScoreD0 } from "../src/heads/tm-score.js";
+import { hostPairReadouts } from "../webgpu/af3/confidence/opendde-confidence.js";
+import { tmScoreD0 } from "../shared/heads/tm-score.js";
 
 const CHANNELS = 8;
 const BINS = 64;

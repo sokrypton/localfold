@@ -25,14 +25,14 @@
  * PLUS the whole MSA stack. The gap in the pair track alone is therefore wider
  * than 1.30x, and it is where any further work belongs.
  */
-import { EvoformerStackGpu } from "../../src/af2/evoformer/stack.js";
-import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
-import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
-import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { EvoformerStackGpu } from "../../webgpu/af2/evoformer/stack.js";
+import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { buildTargetFeat, DIALECT } from "../../webgpu/af3/fold.js";
+import { openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
+import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -61,7 +61,7 @@ export async function main(device, args) {
   //
   // It is not a correctness check and cannot be read as one; the checkers under
   // tools/gpu do that.
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
+  const { MODEL_BUNDLES, loadManifest } = await import("../../shared/bundles/manifests/index.js");
   const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(
     MODEL_BUNDLES.monomer.directory, await loadManifest("monomer")));
   // 🔴 THE QUERY-ONLY STACK, which is the fair one to compare. Both sides are

@@ -90,7 +90,7 @@ export function laneStridedLoops(text) {
 }
 
 describe("a barrier is never inside a lane-strided loop", () => {
-  const scanned = [...sources("src")].map((path) => ({
+  const scanned = ["shared", "cpu", "webgpu"].flatMap((tree) => [...sources(tree)]).map((path) => ({
     path, loops: laneStridedLoops(readFileSync(path, "utf8")),
   }));
   const loops = scanned.reduce((sum, file) => sum + file.loops.length, 0);

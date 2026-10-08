@@ -37,17 +37,17 @@
  * this tool's - `af3BatchFromA3m` splits on it and `chainIdentity()` numbers
  * them, the same path the page takes when a user pastes two chains.
  */
-import { foldBatch } from "../../src/af3/fold.js";
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
-import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { foldWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { foldBatch } from "../../webgpu/af3/fold.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
+import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
 import { assertChainGeometry } from "./chain-geometry.js";
 import { superpose, scoreSlice, modelAlphaCarbons, chainAssignments }
   from "./superpose.js";
 import { buildTemplate } from "../../web/template-source.js";
-import { mergeTemplateSlots } from "../../src/af3/featurise/template-input.js";
-import { multichainMaskFor, coverageOf } from "../../src/af3/featurise/template-features.js";
+import { mergeTemplateSlots } from "../../shared/af3/featurise/template-input.js";
+import { multichainMaskFor, coverageOf } from "../../shared/af3/featurise/template-features.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -109,7 +109,7 @@ export async function main(device, args) {
   // BOTH ends. `--per-chain-templates` is that arm; the default merges the
   // chains into ONE slot with `spanChains`, which is the only way the model is
   // told where the chains sit relative to each other. See
-  // `mergeTemplateSlots` in src/af3/featurise/template-input.js.
+  // `mergeTemplateSlots` in shared/af3/featurise/template-input.js.
   const templatePath = option(args, "template", "");
   const perChainTemplates = args.includes("--per-chain-templates");
   let templateSlots;

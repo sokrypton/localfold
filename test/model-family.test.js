@@ -18,7 +18,7 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES }
-  from "../src/bundles/manifests/index.js";
+  from "../shared/bundles/manifests/index.js";
 
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
 const page = readFileSync(new URL("../index.html", import.meta.url), "utf8");
@@ -283,7 +283,7 @@ describe("the trunk cache", () => {
 describe("?model= in the URL", () => {
   it("does not resolve of3 to openbind0", () => {
     // 🔴 THEY ARE DIFFERENT MODELS. OpenFold3's preview-2 and its v0.5.0
-    // release differ in forward conventions - see src/af3/dialect.js - so
+    // release differ in forward conventions - see shared/af3/dialect.js - so
     // quietly accepting one name for the other hands somebody a model they did
     // not ask for, which is the whole class of error this port guards against.
     const aliases = app.match(/const MODEL_ALIASES = \{([^}]*)\}/s);

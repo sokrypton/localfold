@@ -30,8 +30,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { readTensor } from "../src/weights/dtype.js";
-import { esmfold2Confidence } from "../src/esmfold2/confidence-reference.js";
+import { readTensor } from "../shared/weights/dtype.js";
+import { esmfold2Confidence } from "../cpu/esmfold2/confidence-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDir = join(ROOT, process.argv[2] ?? "model-ef2-600-head-f32");

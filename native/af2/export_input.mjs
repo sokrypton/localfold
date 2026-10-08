@@ -1,4 +1,4 @@
-// One AlphaFold 2 input for the native CUDA port: the page's own features (src/input/a3m-features.js,
+// One AlphaFold 2 input for the native CUDA port: the page's own features (shared/input/a3m-features.js,
 // the function the page and tools/gpu/fold-af2.js fold with), one set a pass, in native/af3's
 // model.idx/model.bin format.
 //
@@ -14,7 +14,7 @@
 // native/af2/fold folds with) or export_weights.py's directory (DeepMind's float32, for the oracles).
 import { readFileSync, writeFileSync, mkdirSync, openSync, readSync, writeSync, closeSync, renameSync } from "node:fs";
 import { Worker } from "node:worker_threads";
-import { makeA3mFeatures, planA3mRecycles, paddedCodeWords } from "../../src/input/a3m-features.js";
+import { makeA3mFeatures, planA3mRecycles, paddedCodeWords } from "../../shared/input/a3m-features.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -30,7 +30,7 @@ if ((bundleDir === "") === (weightsDir === "")) throw new Error("--bundle=<page 
 let tables, isMultimer;
 if (bundleDir !== "") {
   // the bundle's own residue geometry (float32 there), read with the page's reader
-  const { readTensor } = await import("../../src/weights/dtype.js");
+  const { readTensor } = await import("../../shared/weights/dtype.js");
   const manifest = JSON.parse(readFileSync(`${bundleDir}/manifest.json`, "utf8"));
   const read = (name) => {
     const r = manifest.tensors[name];
@@ -88,7 +88,7 @@ if (args.includes("--search") && sequence === "") throw new Error("--search need
 // numbering, asym/entity/sym ids), what the page passes a multimer
 const chains = sequence.split(":").filter(Boolean);
 // --search: the alignment from the ColabFold MMseqs2 server through the page's own client and merge
-// (src/input/mmseqs2-api.js): one chain's search, or a complex's - each distinct chain searched, the
+// (shared/input/mmseqs2-api.js): one chain's search, or a complex's - each distinct chain searched, the
 // paired block for distinct ones, and the merge the WEIGHTS read ("multimer": dense within an entity,
 // block-diagonal between; "monomer": block-diagonal throughout). It sends the sequences to
 // api.colabfold.com, so it is asked for, never assumed
@@ -106,7 +106,7 @@ if (pending) {
   ({ a3m, searchedHits } = pending);
 } else if (args.includes("--search")) {
   if (a3mPath !== "") throw new Error("--search and --a3m both name the alignment");
-  const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import("../../src/input/mmseqs2-api.js");
+  const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import("../../shared/input/mmseqs2-api.js");
   const multimer = isMultimer;
   const t0 = performance.now();
   const searched = chains.length === 1 ? await generateMmseqs2Msa(chains[0], {})
@@ -124,7 +124,7 @@ if (pending) {
     if (paths.length !== chains.length) throw new Error(`${paths.length} alignments for ${chains.length} chains`);
     const pairedPaths = option("paired-a3m", "").split(",");
     const paired = chains.map((_, index) => (pairedPaths[index] ? readFileSync(pairedPaths[index], "utf8") : ""));
-    const { mergeSearchedChains } = await import("../../src/input/mmseqs2-api.js");
+    const { mergeSearchedChains } = await import("../../shared/input/mmseqs2-api.js");
     a3m = mergeSearchedChains({
       sequences: chains,
       chainA3ms: paths.map((path) => readFileSync(path, "utf8")),
@@ -153,7 +153,7 @@ const passes = featureOptions.recycles + 1;
 const deep = passes > 1 && a3m.length > (1 << 20);
 // each recycle finished in a worker of its own, with its assignments given (the device's) or searched there
 const inWorkers = (plans, context, assignments) => Promise.all(plans.map((plan, k) => new Promise((resolve, reject) => {
-  const worker = new Worker(new URL("../../src/input/a3m-features-worker.mjs", import.meta.url),
+  const worker = new Worker(new URL("../../shared/input/a3m-features-worker.mjs", import.meta.url),
     { workerData: { plan, context, assignments: assignments?.[k] } });
   worker.once("message", resolve); worker.once("error", reject);
 })));
@@ -226,7 +226,7 @@ if (templateSpecs.length > 0 || searchChains.length > 0) {
   const offsets = chains.map((_, at) => chains.slice(0, at).reduce((n, c) => n + c.length, 0));
   const searchParts = [];
   if (searchChains.length > 0) {
-    const { fetchMmseqs2Templates } = await import("../../src/input/mmseqs2-api.js");
+    const { fetchMmseqs2Templates } = await import("../../shared/input/mmseqs2-api.js");
     for (const at of searchChains) {
       const best = (searchedHits.get(at) ?? [])[0];
       if (best === undefined) throw new Error(`the search found no template for chain ${at + 1}`);

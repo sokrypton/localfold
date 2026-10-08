@@ -8,8 +8,8 @@
  * this times the four `pipelines.get` calls on a cold cache, and then again on
  * a warm one, with nothing else in the process.
  */
-import { WebGpuExecution } from "../../src/runtime/execution.js";
-import { QueryOnlyTemplateGpu } from "../../src/af2/evoformer/template.js";
+import { WebGpuExecution } from "../../webgpu/runtime/execution.js";
+import { QueryOnlyTemplateGpu } from "../../webgpu/af2/evoformer/template.js";
 
 export async function main(device) {
   const execution = new WebGpuExecution(device);

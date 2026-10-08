@@ -44,10 +44,10 @@ const oracles = (option("oracles", option("sequence", "") === "" && option("job"
   .split(",").filter(Boolean);
 
 const { openAf3Store, trunkWeights, trunkDepths, confidenceWeights } =
-  await import(`${repo}/src/af3/weights/weights.js`);
+  await import(`${repo}/shared/af3/weights/weights.js`);
 const { diffusionWeights, atomReference, targetFeatureWeights } =
-  await import(`${repo}/src/af3/weights/diffusion-weights.js`);
-const { batchFromDump } = await import(`${repo}/src/af3/featurise/batch-from-dump.js`);
+  await import(`${repo}/shared/af3/weights/diffusion-weights.js`);
+const { batchFromDump } = await import(`${repo}/shared/af3/featurise/batch-from-dump.js`);
 
 mkdirSync(out, { recursive: true });
 const entries = [];         // [kind, name, typedArray | number]
@@ -86,7 +86,7 @@ const add = (name, value) => {
 const weightsOnly = args.includes("--weights-only"), noWeights = args.includes("--no-weights");
 let dialect;
 if (noWeights) {
-  const { dialectFor } = await import(`${repo}/src/af3/dialect.js`);
+  const { dialectFor } = await import(`${repo}/shared/af3/dialect.js`);
   const family = option("family", "");
   const manifest = family === "" ? JSON.parse(Buffer.from(await (await fetch(bundle)).arrayBuffer()).toString("utf8")) : null;
   dialect = dialectFor(family === "" ? manifest?.model?.name : family);
@@ -100,7 +100,7 @@ if (noWeights) {
   if (trunk.dialect.structuralTokens) {
     // OpenDDE: the structural-token expander, its refiner and its own confidence head
     const { structuralExpanderWeights, structuralRefinerWeights, openddeConfidenceWeights } =
-      await import(`${repo}/src/af3/weights/weights.js`);
+      await import(`${repo}/shared/af3/weights/weights.js`);
     add("expander", await structuralExpanderWeights(store));
     add("refiner", { blocks: await structuralRefinerWeights(store) });
     add("ddeConfidence", await openddeConfidenceWeights(store));
@@ -169,7 +169,7 @@ if (option("job", "") !== "") {
   jobUserCcd = job.userCcd ?? null;
   sequence = jobRequest.sequence;
   if (job.alignments !== undefined) {
-    const { mergeJobAlignments } = await import(`${repo}/src/input/chains.js`);
+    const { mergeJobAlignments } = await import(`${repo}/shared/input/chains.js`);
     const { alignment, msaColumnKinds } = mergeJobAlignments(job.alignments, jobRequest.chains, jobRequest.chainKinds);
     jobRequest.alignment = alignment;
     jobRequest.msaColumnKinds = msaColumnKinds;
@@ -182,11 +182,11 @@ if (option("job", "") !== "") {
     + ` ${(jobRequest.bonds ?? []).length} bonds${job.seed === undefined ? "" : `, seed ${job.seed}`}`);
 }
 if (sequence !== "") {
-  const { af3BatchFromA3m } = await import(`${repo}/src/af3/featurise/batch.js`);
-  const { featuriserDialect } = await import(`${repo}/src/af3/dialect.js`);
+  const { af3BatchFromA3m } = await import(`${repo}/shared/af3/featurise/batch.js`);
+  const { featuriserDialect } = await import(`${repo}/shared/af3/dialect.js`);
   // --a3m=<one path per chain, comma-separated> and --paired-a3m=<the same for the paired block>,
   // merged exactly as tools/gpu/fold.js and the page merge them; a single path is a monomer's
-  const { mergeRowAlignedChainA3ms } = await import(`${repo}/src/input/chains.js`);
+  const { mergeRowAlignedChainA3ms } = await import(`${repo}/shared/input/chains.js`);
   const texts = (spec) => (spec === "" ? null : spec.split(",").map((path) => readFileSync(path.trim(), "utf8")));
   const merge = (list) => (list === null ? null : (list.length === 1 ? list[0] : mergeRowAlignedChainA3ms(list)));
   const unpaired = texts(option("a3m", "")), paired = texts(option("paired-a3m", ""));
@@ -194,11 +194,11 @@ if (sequence !== "") {
   let alignment = jobRequest?.alignment ?? (unpaired === null && paired === null ? null
     : (paired === null && unpaired.length === 1 ? unpaired[0] : { paired: merge(paired), unpaired: merge(unpaired) }));
   // --search: the protein chains' alignments from the ColabFold MMseqs2 server, through the page's
-  // own client and merge (src/input/mmseqs2-api.js) - AF3's data pipeline step, as the page runs it;
+  // own client and merge (shared/input/mmseqs2-api.js) - AF3's data pipeline step, as the page runs it;
   // it sends the sequences to api.colabfold.com, so it is asked for, never assumed
   if (args.includes("--search") || args.includes("--search-templates")) {
     if (alignment !== null) throw new Error("--search and an alignment both name the MSA");
-    const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import(`${repo}/src/input/mmseqs2-api.js`);
+    const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import(`${repo}/shared/input/mmseqs2-api.js`);
     const allChains = sequence.split(":");
     const allKinds = jobRequest?.chainKinds ?? (option("kinds", "") === "" ? allChains.map(() => "protein") : option("kinds", "").split(","));
     // (the protein chains only, in order: without nucleic coverage the featuriser maps the alignment's
@@ -222,8 +222,8 @@ if (sequence !== "") {
   }
   // --ligands=GOL,ATP (CCD codes, fetched from the RCSB), --smiles=OCC(O)CO|..., --kinds=protein,dna
   // (one per ":"-chain), --modify=SEP@3[@chain] (the position as tools/gpu/probe-modified.js takes it, chain index from 0)
-  const { ccdUrl, parseCcdComponent, ligandChain } = await import(`${repo}/src/af3/featurise/ccd-component.js`);
-  const { nameSmilesLigands, smilesComponent } = await import(`${repo}/src/chem/component.js`);
+  const { ccdUrl, parseCcdComponent, ligandChain } = await import(`${repo}/shared/af3/featurise/ccd-component.js`);
+  const { nameSmilesLigands, smilesComponent } = await import(`${repo}/shared/chem/component.js`);
   // a job's own userCCD first (each data_ block one component), then the RCSB
   const userComponents = new Map();
   if (jobUserCcd) {
@@ -288,26 +288,26 @@ if (dialect?.chaiTokenEmbedding === true) {
 }
 add("batch", batch);
 // chai1's tokens read ESM2 3B, which native runs (src/esm2.cuh, --esm-bundle): each protein chain's token ids and
-// every token's row (src/af3/featurise/esm2-input.js) - unless the batch already carries the embeddings (a dump's)
+// every token's row (shared/af3/featurise/esm2-input.js) - unless the batch already carries the embeddings (a dump's)
 if (dialect?.chaiTokenEmbedding === true && batch.esmEmbeddings === undefined) {
-  const { esm2Inputs } = await import(`${repo}/src/af3/featurise/esm2-input.js`);
+  const { esm2Inputs } = await import(`${repo}/shared/af3/featurise/esm2-input.js`);
   const e = esm2Inputs(batch);
   add("esm.ids", e.ids); add("esm.chainLengths", e.chainLengths); add("esm.tokenRow", e.tokenRow);
 }
-// the distogram's contact bins per token pair (src/af3/featurise/contact-classes.js), as the page
+// the distogram's contact bins per token pair (shared/af3/featurise/contact-classes.js), as the page
 // reads contact_probs off the distogram: the bin count is the bundle's
 {
-  const { af3ContactClasses, af3ContactBins } = await import(`${repo}/src/af3/featurise/contact-classes.js`);
-  const { binEdges } = await import(`${repo}/src/af3/trunk/distogram-bins.js`);
+  const { af3ContactClasses, af3ContactBins } = await import(`${repo}/shared/af3/featurise/contact-classes.js`);
+  const { binEdges } = await import(`${repo}/shared/af3/trunk/distogram-bins.js`);
   const manifest = JSON.parse(Buffer.from(await (await fetch(bundle)).arrayBuffer()).toString("utf8"));
   const shape = manifest?.tensors?.["diffuser/distogram_head/half_logits/weights"]?.shape;
   if (shape) add("batch.contactBins", af3ContactBins(af3ContactClasses(batch, batch.tokens), batch.tokens, binEdges(shape[1])));
 }
 // OpenDDE's second token space: after the trunk each standard residue becomes a backbone and a
-// sidechain token, and the diffusion and its confidence head run on those (src/af3/fold.js)
+// sidechain token, and the diffusion and its confidence head run on those (webgpu/af3/fold.js)
 if (dialect.structuralTokens) {
-  const { structuralLayout, structuralBatch } = await import(`${repo}/src/af3/featurise/structural-tokens.js`);
-  const { structuralPairFeatures } = await import(`${repo}/src/af3/structure/structural-expander-reference.js`);
+  const { structuralLayout, structuralBatch } = await import(`${repo}/shared/af3/featurise/structural-tokens.js`);
+  const { structuralPairFeatures } = await import(`${repo}/cpu/af3/structure/structural-expander-reference.js`);
   const layout = structuralLayout(batch);
   const sb = structuralBatch(batch, layout);
   const features = structuralPairFeatures(layout, batch.asymId);
@@ -333,11 +333,11 @@ const templateSpecs = option("template", "").split(",").filter(Boolean);
 const TEMPLATES = 4;                    // the padded slot count every family folds with
 if (templateSpecs.length > TEMPLATES) throw new Error("at most four template slots");
 const { templateGeometry, multichainMaskFor, coverageOf } =
-  await import(`${repo}/src/af3/featurise/template-features.js`);
+  await import(`${repo}/shared/af3/featurise/template-features.js`);
 const slots = [];                       // {slot, mask}
 if (templateSpecs.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);
-  const { mergeTemplateSlots } = await import(`${repo}/src/af3/featurise/template-input.js`);
+  const { mergeTemplateSlots } = await import(`${repo}/shared/af3/featurise/template-input.js`);
   const chains = sequence.split(":");
   // which token each chain's residue occupies (a modified residue or ligand shifts them)
   const tokenOfResidue = new Int32Array(batch.chainOfResidue.length).fill(-1);
@@ -387,7 +387,7 @@ if ((jobRequest?.templates ?? []).some((t) => t.kind !== "upload") && !args.incl
 // from the server as the page fetches its one
 if (args.includes("--search-templates")) {
   if (templateSpecs.length > 0 || extraSlotParts.length > 0) throw new Error("--search-templates and other templates both name the slots");
-  const { fetchMmseqs2Templates } = await import(`${repo}/src/input/mmseqs2-api.js`);
+  const { fetchMmseqs2Templates } = await import(`${repo}/shared/input/mmseqs2-api.js`);
   const perChain = [...(searchedHits ?? new Map())].map(([at, found]) => [searchedProteinAt[at] ?? at, found.slice(0, TEMPLATES)]);
   const structures = await fetchMmseqs2Templates(perChain.flatMap(([, found]) => found.map((hit) => hit.target)));
   for (let k = 0; k < TEMPLATES; k += 1) {
@@ -409,7 +409,7 @@ if (args.includes("--search-templates")) {
 const searchChains = option("template-search-chains", "").split(",").filter(Boolean).map(Number);
 if (searchChains.length > 0) {
   if (searchedHits === null) throw new Error("--template-search-chains needs --search: the hits come from that search");
-  const { fetchMmseqs2Templates } = await import(`${repo}/src/input/mmseqs2-api.js`);
+  const { fetchMmseqs2Templates } = await import(`${repo}/shared/input/mmseqs2-api.js`);
   const hits = new Map([...searchedHits].map(([at, found]) => [searchedProteinAt[at] ?? at, found]));
   for (const chain of searchChains) {
     const best = (hits.get(chain) ?? [])[0];
@@ -421,7 +421,7 @@ if (searchChains.length > 0) {
 }
 if (extraSlotParts.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);
-  const { mergeTemplateSlots } = await import(`${repo}/src/af3/featurise/template-input.js`);
+  const { mergeTemplateSlots } = await import(`${repo}/shared/af3/featurise/template-input.js`);
   const chains = sequence.split(":");
   const tokenOfResidue = new Int32Array(batch.chainOfResidue.length).fill(-1);
   batch.residueOfToken.forEach((residue, token) => {
@@ -446,9 +446,9 @@ if (extraSlotParts.length > 0) {
   });
 }
 // rf3's chirality term reads the stereocentres - four dense atom slots and an ideal improper
-// dihedral each - as the page's fold does (src/af3/fold.js)
+// dihedral each - as the page's fold does (webgpu/af3/fold.js)
 if (dialect.chiralCentres === true) {
-  const { chiralCentres } = await import(`${repo}/src/af3/featurise/template-features.js`);
+  const { chiralCentres } = await import(`${repo}/shared/af3/featurise/template-features.js`);
   const chirals = chiralCentres(batch.aatype, batch.predDenseAtomMask, batch.tokens, batch.dense);
   add("chiral.centers", Int32Array.from(chirals.centers));
   add("chiral.angles", Float32Array.from(chirals.angles));
@@ -466,7 +466,7 @@ if (dialect.chiralCentres === true) {
   const width = dialect.boltz2TemplateFeatures ? 109 : dialect.rosettafold3TemplateFeatures ? 66
     : dialect.fusedTemplateLayout ? dialect.fusedTemplateLayout.distogramBins + 1 + 2 * dialect.fusedTemplateLayout.restypes + 4 : 0;
   const { fusedTemplateFeatures, fusedTemplateFeaturesSparse, sparseTemplateFeatures } =
-    fused ? await import(`${repo}/src/af3/featurise/template-fused-features.js`) : {};
+    fused ? await import(`${repo}/shared/af3/featurise/template-fused-features.js`) : {};
   if (slots.length > TEMPLATES) throw new Error(`${slots.length} template slots; every family folds with at most ${TEMPLATES}`);
   const passes = [];
   if (dialect.templateFeatureMeanOnePass === true) {
@@ -508,7 +508,7 @@ if (dialect.chiralCentres === true) {
       // the feature columns sparse - a row's nonzero (column, value) pairs, K the most any row has, the rest -1 - and
       // scattered back on the device into the dense matrix the projection reads: dense they were 108 floats a pair
       // in every pass, an empty one included (protenix2 at 1,020 tokens: a 1.3 GB input and 4.9 s of export)
-      // (the page's own sparse form - src/af3/trunk/template-webgpu.js, sparseTemplateFeatures - split into the
+      // (the page's own sparse form - webgpu/af3/trunk/template-webgpu.js, sparseTemplateFeatures - split into the
       // native port's columns and values)
       const gap = (pass.emptyAatype ?? 0) !== 0;
       const packed = pass.features !== undefined ? sparseTemplateFeatures(pass.features, width)
@@ -544,11 +544,11 @@ if (dialect.chiralCentres === true) {
   add("template.featureWidth", width);
   add("template.outerResidual", dialect.templateStackOuterResidual === true);
 }
-// The PDB's records as the page writes them (src/af3/fold.js toPdb: chains, HETATM ligands under
+// The PDB's records as the page writes them (webgpu/af3/fold.js toPdb: chains, HETATM ligands under
 // their codes, modified residues, CONECT), with each atom's dense slot as its x coordinate so the
 // native writer knows which coordinates go where.
 try {
-  const { toPdb } = await import(`${repo}/src/af3/structure/pdb.js`);
+  const { toPdb } = await import(`${repo}/shared/af3/structure/pdb.js`);
   const slots = new Float32Array(batch.tokens * batch.dense * 3);
   for (let i = 0; i < batch.tokens * batch.dense; i += 1) slots[i * 3] = i;
   writeFileSync(`${out}/template.pdb`, toPdb(batch, slots, null) + "\n");

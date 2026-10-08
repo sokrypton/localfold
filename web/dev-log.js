@@ -1,4 +1,4 @@
-import { memorySnapshot, memoryTotals } from "../src/runtime/device-memory.js";
+import { memorySnapshot, memoryTotals } from "../webgpu/runtime/device-memory.js";
 
 /**
  * What a fold spent, phase by phase, behind a footer button.
@@ -20,7 +20,7 @@ import { memorySnapshot, memoryTotals } from "../src/runtime/device-memory.js";
  * allocator already keeps.
  *
  * 🔴 THE MEMORY IS THE DEVICE'S OWN ACCOUNTING, NOT A GUESS. See
- * src/runtime/device-memory.js: `residentBytes` is what is on the device now,
+ * webgpu/runtime/device-memory.js: `residentBytes` is what is on the device now,
  * pooled buffers included, and `peakBytes` is the high-water mark. Both are
  * exact - the allocator counts every buffer before it creates it - and the
  * per-label breakdown is what says which tensor to blame.

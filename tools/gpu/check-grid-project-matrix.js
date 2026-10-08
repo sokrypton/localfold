@@ -21,13 +21,13 @@
  * compared against accumulates in f32.
  */
 import { createGridAttentionShaders, packGridAttentionWeights }
-  from "../../src/af3/trunk/grid-attention-webgpu.js";
+  from "../../webgpu/af3/trunk/grid-attention-webgpu.js";
 import {
   createGridProjectMatrixShader, createGridProjectOutMatrixShader,
   gridProjectMatrixDispatch, gridProjectMatrixFits, gridProjectOutMatrixDispatch,
-} from "../../src/af3/trunk/grid-project-matrix.js";
-import { stagedMatrixBlock } from "../../src/kernels/matrix-linear.js";
-import { deviceMatrixConfig, deviceTuning } from "../../src/runtime/device-profile.js";
+} from "../../webgpu/af3/trunk/grid-project-matrix.js";
+import { stagedMatrixBlock } from "../../webgpu/kernels/matrix-linear.js";
+import { deviceMatrixConfig, deviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

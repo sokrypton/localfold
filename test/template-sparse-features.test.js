@@ -1,12 +1,12 @@
-// The fused template embedder's features cross sparse (src/af3/trunk/template-webgpu.js, sparseTemplateFeatures):
+// The fused template embedder's features cross sparse (webgpu/af3/trunk/template-webgpu.js, sparseTemplateFeatures):
 // each row's nonzero (column, value) pairs in column order. The WebGPU shader and the native port both rebuild
 // the dense rows from them, so the sparse form must expand to EXACTLY the dense one - an empty slot's included,
 // which is written from its columns and never built dense.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fusedTemplateFeatures, fusedTemplateFeaturesSparse, sparseTemplateFeatures, SPARSE_PAD }
-  from "../src/af3/featurise/template-fused-features.js";
-import { PROTENIX2, BOLTZ2, ROSETTAFOLD3 } from "../src/af3/dialect.js";
+  from "../shared/af3/featurise/template-fused-features.js";
+import { PROTENIX2, BOLTZ2, ROSETTAFOLD3 } from "../shared/af3/dialect.js";
 
 function expand(packed, rows, width) {
   const K = packed[0], dense = new Float32Array(rows * width);

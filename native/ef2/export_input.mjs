@@ -1,5 +1,5 @@
-// One ESMFold2 input for the native CUDA port: the page's own features (src/esmfold2/featurise.js,
-// what src/esmfold2/fold.js folds with), in native/af3's model.idx/model.bin format.
+// One ESMFold2 input for the native CUDA port: the page's own features (shared/esmfold2/featurise.js,
+// what webgpu/esmfold2/fold.js folds with), in native/af3's model.idx/model.bin format.
 //
 //   node --js-float16array native/ef2/export_input.mjs <out dir> --sequence=<SEQ>[:<SEQ>...] [--kinds=protein,dna]
 //        [--ligands=GOL,ATP] [--smiles=OCC(O)CO|...] [--modify=SEP@3[@chain]]   |   --job=<AF3 job.json>
@@ -13,10 +13,10 @@
 //   m meta/tokens, meta/atoms, meta/lm_rows, meta/classes
 // and pdb.template beside them: the page's PDB records, each atom's index where its coordinates go
 import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
-import { featuriseForEsmfold2, languageModelInput } from "../../src/esmfold2/featurise.js";
-import { representativeAtoms } from "../../src/esmfold2/representative-atoms.js";
-import { toDensePositions } from "../../src/esmfold2/featurise.js";
-import { toPdb } from "../../src/af3/structure/pdb.js";
+import { featuriseForEsmfold2, languageModelInput } from "../../shared/esmfold2/featurise.js";
+import { representativeAtoms } from "../../shared/esmfold2/representative-atoms.js";
+import { toDensePositions } from "../../shared/esmfold2/featurise.js";
+import { toPdb } from "../../shared/af3/structure/pdb.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -31,8 +31,8 @@ if (!out || out.startsWith("--") || (sequence === "" && option("job", "") === ""
 // (built by src/chem), --modify (CODE@position[@chain], chain index from 0), or an AF3 job file read
 // by the page's own reader (web/job-json.js, web/entities.js: its ligands, glycans, modified residues
 // and bases, declared bonds and userCCD)
-const { ccdUrl, parseCcdComponent, ligandChain } = await import("../../src/af3/featurise/ccd-component.js");
-const { nameSmilesLigands, smilesComponent } = await import("../../src/chem/component.js");
+const { ccdUrl, parseCcdComponent, ligandChain } = await import("../../shared/af3/featurise/ccd-component.js");
+const { nameSmilesLigands, smilesComponent } = await import("../../shared/chem/component.js");
 let kinds = option("kinds", ""), jobRequest = null;
 const userComponents = new Map();
 if (option("job", "") !== "") {
@@ -85,12 +85,12 @@ const flt = (name, v) => entries.push(["t", name, v instanceof Float32Array ? v 
 int("residue_index", f.residueIndex); int("token_index", f.tokenIndex); int("asym_id", f.asymId);
 int("entity_id", f.entityId); int("sym_id", f.symId); int("mol_type", f.molType);
 int("res_type", f.residueType); int("input_ids", f.inputIds);
-// the page's contact rule (src/esmfold2/distogram-webgpu.js): per pair, how many distogram bins lie under
+// the page's contact rule (webgpu/esmfold2/distogram-webgpu.js): per pair, how many distogram bins lie under
 // its threshold - for the 128-bin distogram both published checkpoints carry, stamped, so the binary
 // refuses them against any other
 // (--fold-bundle=<dir>: the released models' 64-bin distogram is AlphaFold 3's grid, counted by AF3's rule)
 {
-  const { contactBinCountsByPair, contactBinCountsByPairBreaks } = await import("../../src/esmfold2/contacts.js");
+  const { contactBinCountsByPair, contactBinCountsByPairBreaks } = await import("../../shared/esmfold2/contacts.js");
   const bundleArg = process.argv.slice(2).find((a) => a.startsWith("--fold-bundle="))?.slice(14);
   const bins = bundleArg ? JSON.parse(readFileSync(`${bundleArg}/manifest.json`, "utf8")).trunk?.distogramBins ?? 128 : 128;
   if (bins !== 128 && bins !== 64) throw new Error(`a ${bins}-bin distogram: only 128 (2-52) and 64 (AF3's) are known`);

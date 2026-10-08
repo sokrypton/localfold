@@ -1,4 +1,4 @@
-// Does src/esmc/tower-reference.js compute ESM-C?
+// Does cpu/esmc/tower-reference.js compute ESM-C?
 //
 //     python3 tools/esmc/dump-esmc-oracle.py --sequence-length 59
 //     node tools/check-esmc-reference.js
@@ -23,7 +23,7 @@ import process from "node:process";
 import {
   applyRope, esmcAttention, esmcBlock, layerNorm, linear, sequenceIds, shimPair,
   shimSingle, towerStates,
-} from "../src/esmc/tower-reference.js";
+} from "../cpu/esmc/tower-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmc-600m-f32");

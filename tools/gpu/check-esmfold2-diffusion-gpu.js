@@ -1,4 +1,4 @@
-// Does src/esmfold2/diffusion-webgpu.js compute ESMFold2's whole denoise step?
+// Does webgpu/esmfold2/diffusion-webgpu.js compute ESMFold2's whole denoise step?
 //
 //     .venv-esm/bin/python tools/esmc/dump-esmfold2-trunk.py \
 //         --sequence-length 40 --esmc esmc-600m --out oracle-dumps/esmfold2-trunk-40-lm.json
@@ -19,12 +19,12 @@
 // downcast off, which should make the answer WORSE against this dump - that is
 // the control, and it is what says the narrowing is the model rather than a
 // concession.
-import { readTensor } from "../../src/weights/dtype.js";
-import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
-import { pipelineCacheForDevice } from "../../src/runtime/pipeline-cache.js";
-import { Esmfold2DenoiserGpu } from "../../src/esmfold2/diffusion-webgpu.js";
+import { readTensor } from "../../shared/weights/dtype.js";
+import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
+import { pipelineCacheForDevice } from "../../webgpu/runtime/pipeline-cache.js";
+import { Esmfold2DenoiserGpu } from "../../webgpu/esmfold2/diffusion-webgpu.js";
 import { atomDecoderWeights, atomEncoderWeights, denoiserWeights }
-  from "../../src/esmfold2/weights.js";
+  from "../../shared/esmfold2/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

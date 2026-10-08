@@ -20,15 +20,15 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { readTensor } from "../src/weights/dtype.js";
-import { transition, triangleMultiplication } from "../src/af3/trunk/pairformer-reference.js";
+import { readTensor } from "../shared/weights/dtype.js";
+import { transition, triangleMultiplication } from "../cpu/af3/trunk/pairformer-reference.js";
 import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
-} from "../src/esmfold2/pair-features-reference.js";
-import { atomDecoder, inputsEmbedder } from "../src/esmfold2/atom-transformer-reference.js";
-import { denoiseStep } from "../src/esmfold2/diffusion-reference.js";
+} from "../cpu/esmfold2/pair-features-reference.js";
+import { atomDecoder, inputsEmbedder } from "../cpu/esmfold2/atom-transformer-reference.js";
+import { denoiseStep } from "../cpu/esmfold2/diffusion-reference.js";
 import { centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
-         samplerStep, weightedRigidAlign } from "../src/esmfold2/sampler-reference.js";
+         samplerStep, weightedRigidAlign } from "../cpu/esmfold2/sampler-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const flag = (name, fallback) => {
@@ -126,7 +126,7 @@ const bonds = tokenBondEncoding(
   Float32Array.from(dump.features.token_bonds.values), n, channels,
   tensors["featuriser/tokenBonds"]);
 // 🔴 THE LANGUAGE MODEL'S PAIR COMES FROM THE DUMP. ESM-C's 36 blocks at 1152
-// channels are a GPU job; src/esmc/ has the WebGPU port and its own oracle. A
+// channels are a GPU job; webgpu/esmc/ has the WebGPU port and its own oracle. A
 // CPU fold that also ran the tower would take longer than this whole file and
 // would say nothing the tower's own checker does not.
 const lmPair = Float32Array.from(dump.block0.language_model.output);

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { af3Sources } from "./helpers/af3-source.js";
-import { DIALECTS } from "../src/af3/dialect.js";
+import { DIALECTS } from "../shared/af3/dialect.js";
 
 /**
  * A dialect flag reaches code by three routes, and this pins which.

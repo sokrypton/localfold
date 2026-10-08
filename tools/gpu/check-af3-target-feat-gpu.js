@@ -22,13 +22,13 @@
  * VALUES are irrelevant. Zeros are used to make that explicit; anything else
  * would work identically and would suggest it mattered.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
-import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
-import { Af3AtomEncoderGpu } from "../../src/af3/diffusion/atom-encoder-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";
+import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder-webgpu.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 const SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
 

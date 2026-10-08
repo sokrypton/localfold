@@ -14,7 +14,7 @@ serving path to fetch it, so the modules have to live under src/.
 🔴 A COPY WITHOUT A RECORD IS A FORK, and a fork nobody declared is the kind
 that gets edited in place and then silently diverges. So this tool exists
 instead of a one-off `cp`: it stamps the upstream commit into
-src/design/mpnn/SOURCE.md, and `--check` re-runs the copy into a scratch
+cpu/design/mpnn/SOURCE.md, and `--check` re-runs the copy into a scratch
 directory and diffs. Edit upstream and re-sync; never edit the mirror.
 
 🔴 AND NOTHING RUNS `--check` FOR YOU ANY MORE. It was a node test
@@ -41,7 +41,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-MODULES = ROOT / "src" / "design" / "mpnn"
+MODULES = ROOT / "cpu" / "design" / "mpnn"
 WASM = ROOT / "web" / "vendor" / "mpnn"
 PUBLIC = ROOT / "web" / "public" / "mpnn"
 
@@ -57,7 +57,7 @@ ENTRY = ["model.js", "pdb.js", "weights.js", "accel.js", "constants.js"]
 # structure as exact. The membrane models are the family left out; nothing on
 # this page can say a residue is in a bilayer.
 #
-# See DESIGNERS in src/design/designers.js, which is the same list and is what
+# See DESIGNERS in cpu/design/designers.js, which is the same list and is what
 # the page reads. The two are held together by test/designers.test.js.
 CHECKPOINTS = [
     "solublempnn_v_48_020.mpnn",
@@ -108,7 +108,7 @@ def source_note(source: Path, commit: str, names: list[str]) -> str:
         f"- commit: `{commit}`",
         "",
         "The modules below are the import closure of what",
-        "`src/design/mpnn-bridge.js` reaches. Upstream also ships `c6d.js`,",
+        "`cpu/design/mpnn-bridge.js` reaches. Upstream also ships `c6d.js`,",
         "`potts.js`, `search.js`, `trmrf.js` and `trmrfaccel.js`, which serve",
         "the Potts and trMRF features and are not mirrored.",
         "",

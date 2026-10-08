@@ -1,9 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "./harness.js";
-import { loadTriangleReferenceBundleFromFiles } from "../src/bundles/node.js";
-import { triangleMultiplicationOutgoingReference } from "../src/kernels/triangle/cpu-reference.js";
-import { errorMetrics } from "../src/kernels/triangle/types.js";
+import { loadTriangleReferenceBundleFromFiles } from "../shared/bundles/node.js";
+import { triangleMultiplicationOutgoingReference } from "../webgpu/kernels/triangle/cpu-reference.js";
+import { errorMetrics } from "../webgpu/kernels/triangle/types.js";
 import { ALPHAFOLD_REFERENCE_MANIFESTS } from "./alphafold-references.js";
 
 describe("official AlphaFold input references", () => {

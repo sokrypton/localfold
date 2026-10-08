@@ -33,7 +33,7 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 NATIVE = os.path.join(REPO, "native")
 WORK = os.environ.get("LOCALFOLD_NATIVE_WORK", "/tmp/localfold-native")
 AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
-# ...whose dialect has no working flow sampler (noFlowSampler, src/af3/dialect.js)
+# ...whose dialect has no working flow sampler (noFlowSampler, shared/af3/dialect.js)
 NO_FLOW_FAMILIES = ("rosettafold3", "chai1")
 NODE = ["node", "--js-float16array", "--max-old-space-size=24000"]
 OUT = sys.stdout
@@ -396,7 +396,7 @@ class Worker:
         family = job.get("family") or controls.get("model-family", "af3")
         # 🔴 AF2's FAMILY CARRIES ITS MODEL NUMBER (the page resolves the number box into `monomer-2`,
         # `multimer-5`): models 2-5 are published as deltas on model 1 and read as the page reads them
-        # (common.cuh's loadBundle --delta, bit-exact against src/bundles/delta-tensor-store.js)
+        # (common.cuh's loadBundle --delta, bit-exact against shared/bundles/delta-tensor-store.js)
         base, _, number = family.partition("-")
         af2_model = 1
         if base in ("monomer", "multimer"):
@@ -418,7 +418,7 @@ class Worker:
             raise Refused(f"the CUDA backend does not know the sampler {sampler!r}")
         if port == "af3" and sampler == "flow" and family in NO_FLOW_FAMILIES:
             # ...the page's own rule: rf3's walk collapses the backbone while pLDDT reads as if nothing were
-            # wrong, and chai-1 samples with its own second-order step (noFlowSampler, src/af3/dialect.js)
+            # wrong, and chai-1 samples with its own second-order step (noFlowSampler, shared/af3/dialect.js)
             raise Refused(f"{family} has no working flow sampler - set the sampler to Diffusion")
         emit("status", f"{family} on CUDA ({self.device}) · reading the job")
         emit("progress", 0.02)

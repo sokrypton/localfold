@@ -17,5 +17,5 @@
   that looked like one, and it is gone.
 - Describe public shapes in JSDoc, not in a type system the runtime cannot see.
 - AlphaFold 3's state, costs and already-tried dead ends are in `docs/AF3.md`.
-  Read it before touching `src/af3/`; several of its entries are things that
+  Read it before touching the AF3 trees (`shared/af3/`, `cpu/af3/`, `webgpu/af3/`); several of its entries are things that
   have been got wrong once already.

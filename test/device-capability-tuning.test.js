@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { matrixCapabilityTuning } from "../src/runtime/device-profile.js";
+import { matrixCapabilityTuning } from "../webgpu/runtime/device-profile.js";
 
 const device = (...features) => ({ features: new Set(features) });
 

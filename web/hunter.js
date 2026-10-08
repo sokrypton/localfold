@@ -1,7 +1,7 @@
 /**
  * Protein Hunter, in the page.
  *
- * The method is `src/design/hunter-loop.js`, which knows nothing about a DOM
+ * The method is `webgpu/design/hunter-loop.js`, which knows nothing about a DOM
  * and takes its two models as arguments. This file is the other half: it reads
  * the controls, supplies a real AF3 fold and a real MPNN design, and puts every
  * cycle on screen as it lands.
@@ -41,16 +41,16 @@
 import { getDevice } from "./model.js";
 import { createStructureViewer } from "./viewer.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
-import { runDesign } from "../src/design/hunter-loop.js";
-import { designChain, loadDesigner } from "../src/design/mpnn-bridge.js";
-import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../src/design/designers.js";
+import { runDesign } from "../webgpu/design/hunter-loop.js";
+import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
+import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../cpu/design/designers.js";
 import { createEntityList } from "./entity-ui.js";
-import { superposeCycle } from "../src/heads/superpose-pdb.js";
+import { superposeCycle } from "../shared/heads/superpose-pdb.js";
 import { followActiveFrame, updateScoresCard } from "./scores-card.js";
 import { NUCLEIC_TYPES, entitiesProblem, expandEntities,
   templateKind } from "./entities.js";
 import { describeCoverage, fetchStructure } from "./template-source.js";
-import { isAbortError } from "../src/runtime/abort.js";
+import { isAbortError } from "../webgpu/runtime/abort.js";
 
 const element = (id) => {
   const value = document.getElementById(id);
@@ -115,7 +115,7 @@ function progress(fraction) {
  * The chains of the complex, with the designed one first.
  *
  * The reference fixes the design chain as "A" and the targets as B, C, ...,
- * and `toPdb` in src/af3/fold.js names chains in exactly that order - so the
+ * and `toPdb` in webgpu/af3/fold.js names chains in exactly that order - so the
  * designed chain being index 0 is what makes "A" mean the binder in the PDB
  * that MPNN then reads.
  */
@@ -204,7 +204,7 @@ function syncDesignerNote() {
  * 🔴 AND EACH FRAME IS SUPERPOSED ONTO THE FIRST BEFORE IT GOES IN. AF3's
  * sampler randomly re-orients every fold, and `addFrame`'s own alignment needs
  * two frames with equal position counts - which a redesigned chain never has.
- * See src/heads/superpose-pdb.js.
+ * See shared/heads/superpose-pdb.js.
  */
 let referencePdb;
 
@@ -736,7 +736,7 @@ element("start-sequence").addEventListener("input", syncLengthControls);
 syncLengthControls();
 
 // The picker is built from the registry rather than written into the HTML, so
-// a family added to src/design/designers.js and mirrored by tools/sync-mpnn.py
+// a family added to cpu/design/designers.js and mirrored by tools/sync-mpnn.py
 // appears here with nothing else to remember.
 for (const name of DESIGNER_NAMES) {
   element("designer").append(Object.assign(document.createElement("option"), {

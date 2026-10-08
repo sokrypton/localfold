@@ -479,7 +479,7 @@ class Worker:
             raise Refused(f"the JAX backend does not know the sampler {sampler!r}")
         if sampler == "flow" and model == "rosettafold3":
             # ...the page's own rule: its walk collapses the backbone while pLDDT
-            # reads as if nothing were wrong (noFlowSampler, src/af3/dialect.js).
+            # reads as if nothing were wrong (noFlowSampler, shared/af3/dialect.js).
             raise Refused("rosettafold3 has no working flow sampler - set the sampler to"
                           " Diffusion")
         templated = [entity for entity in job.get("entities", [])

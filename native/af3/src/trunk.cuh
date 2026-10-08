@@ -1149,7 +1149,7 @@ inline void distogram(Trunk& t, float* logits) {
   if (distogramSymScale() != 1.f) scaleK<<<blocks(pairs * bins), 256, 0, STREAM>>>(logits, distogramSymScale(), pairs * bins);
 }
 // P(distance under the pair's contact threshold): the softmax mass of the first contactBins[ij]
-// bins (src/af3/featurise/contact-classes.js), masked
+// bins (shared/af3/featurise/contact-classes.js), masked
 __global__ void contactProbsK(const float* logits, const int* contactBins, const float* pairMask, float* out,
                               size_t pairs, int bins) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1162,7 +1162,7 @@ __global__ void contactProbsK(const float* logits, const int* contactBins, const
   out[ij] = pairMask[ij] * contact / total;
 }
 // --recycle-tolerance: the RMS change of the distance each pair's distogram predicts, the page's criterion
-// (src/af3/feature-convergence.js, expectedDistances and distanceChange): the expectation over the bin centres - the
+// (shared/af3/feature-convergence.js, expectedDistances and distanceChange): the expectation over the bin centres - the
 // open first and last bins at their breaks - written over `prev`, the squared change summed into acc
 __global__ void distogramChangeK(const float* logits, float* prev, double* acc, size_t pairs, int bins, bool first) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

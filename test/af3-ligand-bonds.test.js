@@ -29,10 +29,10 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import { af3Source } from "./helpers/af3-source.js";
-import { featuriseProtein } from "../src/af3/featurise/featurise.js";
+import { featuriseProtein } from "../shared/af3/featurise/featurise.js";
 import { paeMatrix } from "../web/prediction-results.js";
-import { toPdb } from "../src/af3/fold.js";
-import { ELEMENT_SYMBOLS, ligandChain } from "../src/af3/featurise/ccd-component.js";
+import { toPdb } from "../webgpu/af3/fold.js";
+import { ELEMENT_SYMBOLS, ligandChain } from "../shared/af3/featurise/ccd-component.js";
 
 // the first ligand token: one past the polymers
 const polymerStart = (batch) => batch.ligandSpans[0].from;
@@ -402,9 +402,9 @@ describe("a bond a job declares", () => {
   });
 
   it("is forwarded by the batch builder, which lists its fields by hand", () => {
-    // The literal in src/af3/featurise/batch.js is exactly the kind that loses
+    // The literal in shared/af3/featurise/batch.js is exactly the kind that loses
     // a key - it is how `modifications` went missing on the ESMFold2 path.
-    assert.ok(readSource("src/af3/featurise/batch.js").includes("bonds: options.bonds"));
+    assert.ok(readSource("shared/af3/featurise/batch.js").includes("bonds: options.bonds"));
   });
 });
 

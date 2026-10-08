@@ -15,16 +15,16 @@
  * NO DOM IN HERE. Progress arrives as a callback, because the two pages report
  * it differently and neither one's markup belongs in a module about weights.
  */
-import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
-import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
-import { tensorByteLength } from "../src/weights/dtype.js";
-import { ScriptTensorStore } from "../src/bundles/script-tensor-store.js";
+import { AlphaFoldFixture } from "../shared/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
+import { tensorByteLength } from "../shared/weights/dtype.js";
+import { ScriptTensorStore } from "../shared/bundles/script-tensor-store.js";
 import { MODEL_BUNDLES, bundleBaseUrl, graphFamily, loadManifest }
-  from "../src/bundles/manifests/index.js";
-import { DeltaTensorStore } from "../src/bundles/delta-tensor-store.js";
-import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+  from "../shared/bundles/manifests/index.js";
+import { DeltaTensorStore } from "../shared/bundles/delta-tensor-store.js";
+import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
 import { devUseDevice } from "./dev-log.js";
-import { withAbort } from "../src/runtime/abort.js";
+import { withAbort } from "../webgpu/runtime/abort.js";
 
 const stores = new Map();
 /** What `openStore` loads when no family is named, and the only one `?model=` overrides. */
@@ -37,7 +37,7 @@ const DEFAULT_FAMILY = "monomer";
  * the multimer FETCHED one, so they failed differently: a site without multimer
  * weights 404ed on model-multimer/manifest.json and died there, before a single
  * shard was asked for. Both tables are now modules - see
- * src/bundles/manifests/ - so neither can 404, and the first thing that can
+ * shared/bundles/manifests/ - so neither can 404, and the first thing that can
  * fail is a shard, which is a failure about weights rather than about metadata.
  *
  * Over http the shards are fetched directly. On a file:// page fetch does not
@@ -60,7 +60,7 @@ const DEFAULT_FAMILY = "monomer";
  * value with a slash in it, or one ending in `.json`. A bare family name is the
  * other reader's.
  *
- * @param {import("../src/bundles/manifests/index.js").ModelFamily} family
+ * @param {import("../shared/bundles/manifests/index.js").ModelFamily} family
  */
 export function openStore(onProgress, family = DEFAULT_FAMILY) {
   const bundle = MODEL_BUNDLES[family];
@@ -212,7 +212,7 @@ const loaded = new Map();
  * 🔴 NOTHING IS QUANTISED OR ROUNDED HERE. The shards arrive as int8 with a
  * float16 scale per 64-weight block wherever that is safe - see
  * tools/quantize_model.py, which keeps the structure module and the geometry
- * tables at float32 and records what each format costs - and src/bundles/
+ * tables at float32 and records what each format costs - and shared/bundles/
  * dtype.js dequantises them on the way in. The values that reach this function
  * are the ones the page used to spend most of a fold computing.
  *
@@ -244,7 +244,7 @@ const loaded = new Map();
  * still holds - a store the current fold is reading stays alive through its own
  * reference, and this only stops the NEXT fold from finding it.
  *
- * @param {import("../src/bundles/manifests/index.js").ModelFamily} family
+ * @param {import("../shared/bundles/manifests/index.js").ModelFamily} family
  */
 export function releaseModel(family) {
   loaded.delete(`${family}:msa`);

@@ -40,7 +40,7 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DEFAULT = "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"
 
 
-MANIFESTS = "/src/bundles/manifests/index.js"
+MANIFESTS = "/shared/bundles/manifests/index.js"
 REMOTE_LINE = re.compile(rb'^\s*remote:\s*"[^"]*",\s*$', re.MULTILINE)
 
 
@@ -70,7 +70,7 @@ def serve(local_weights=True):
                 source = open(os.path.join(REPO, MANIFESTS.lstrip("/")), "rb").read()
                 body = REMOTE_LINE.sub(b"", source)
                 # 🔴 AND IT RAISES RATHER THAN SERVING THE MODULE UNCHANGED. The
-                # src/ reorganisation moved this file to src/bundles/ and left
+                # src/ reorganisation moved this file to shared/bundles/ and left
                 # MANIFESTS naming the old path, so this branch simply stopped
                 # matching: no error, no missing page, just 150 MB off Hugging
                 # Face on every run of a check that exists to avoid it. The
@@ -346,7 +346,7 @@ def main():
                         help="a ligand given as a SMILES string rather than a"
                              " CCD code, e.g. 'OCC(O)CO' for glycerol. Its"
                              " conformer is BUILT rather than fetched - see"
-                             " src/chem/ and docs/SMILES.md - so unlike"
+                             " shared/chem/ and docs/SMILES.md - so unlike"
                              " --ligand it needs no network.")
     parser.add_argument("--ligand", default="",
                         help="a CCD code folded alongside the sequence, e.g. GOL."
@@ -1063,7 +1063,7 @@ def main():
               // The first version of this filtered the whole resource list by
               // name and reported a 1.2s "overlap" - which the unchanged tree
               // reproduced exactly, because both patterns were matching MODULE
-              // fetches from page load: `src/input/mmseqs2-api.js` is a match
+              // fetches from page load: `shared/input/mmseqs2-api.js` is a match
               // for /mmseqs/, and the local weights directory is probed before
               // the button is ever pressed. A span that starts at 66ms is not
               // a span of anything a click caused.
@@ -1299,7 +1299,7 @@ def main():
         print("weightPhases:", cdp.evaluate(ws, """(async () => {
           try {
             const m = await import('/web/af3-model.js');
-            const s = await import('/src/bundles/http-tensor-store.js');
+            const s = await import('/shared/bundles/http-tensor-store.js');
             const d = s.tensorDecodeStats || {};
             return JSON.stringify({ ...(m.af3LoadMilliseconds || {}),
               hostDecodeMs: Math.round(d.ms || 0), hostDecodeCalls: d.calls || 0 });

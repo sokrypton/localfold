@@ -8,7 +8,7 @@
  */
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { DeltaTensorStore } from "../src/bundles/delta-tensor-store.js";
+import { DeltaTensorStore } from "../shared/bundles/delta-tensor-store.js";
 
 const store = (tensors, extra = {}) => ({
   manifest: {

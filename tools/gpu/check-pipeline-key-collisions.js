@@ -34,17 +34,17 @@
  * collide in; it says nothing about whether either model folds well, and
  * `test:template` and `test:ligand` are what say that.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { buildTargetFeat, foldBatch } from "../../src/af3/fold.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { buildTargetFeat, foldBatch } from "../../webgpu/af3/fold.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
 import {
   af3Dialect, confidenceWeights, openAf3Store, openddeConfidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, trunkDepths, trunkWeights,
-} from "../../src/af3/weights/weights.js";
+} from "../../shared/af3/weights/weights.js";
 import { atomReference, diffusionWeights, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
-import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
+import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

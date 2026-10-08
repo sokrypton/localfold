@@ -38,7 +38,7 @@ LIMIT_MIB = 2048
 SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
 SNAPSHOT = """(async () => {
   const { getDevice } = await import('/web/model.js');
-  const { memorySnapshot } = await import('/src/runtime/device-memory.js');
+  const { memorySnapshot } = await import('/webgpu/runtime/device-memory.js');
   const s = memorySnapshot(await getDevice());
   const status = document.getElementById('status-message');
   return JSON.stringify({ mib: Math.round(s.residentBytes / 1048576),

@@ -21,22 +21,22 @@
  * activations on this side would compare two featurisers rather than two score
  * models. `tools/oracle/dump_af3_denoise.py` records what native was handed.
  */
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
 import {
   diffusionConditioning, diffusionHead, diffusionTransformer,
   atomDecoder, scalings,
-} from "../../src/af3/diffusion/diffusion-reference.js";
-import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
-import { Af3AtomDecoderGpu } from "../../src/af3/diffusion/atom-decoder-webgpu.js";
-import { Af3DiffusionConditioningGpu } from "../../src/af3/diffusion/diffusion-conditioning-webgpu.js";
-import { atomCrossAttentionEncoder as encodeCpu } from "../../src/af3/diffusion/atom-encoder-reference.js";
-import { Af3AtomEncoderGpu } from "../../src/af3/diffusion/atom-encoder-webgpu.js";
-import { layerNormSlow } from "../../src/af3/diffusion/atom-encoder-reference.js";
-import { linear } from "../../src/af3/trunk/pairformer-reference.js";
-import { af3Dialect, openAf3Store } from "../../src/af3/weights/weights.js";
-import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
+} from "../../cpu/af3/diffusion/diffusion-reference.js";
+import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
+import { Af3AtomDecoderGpu } from "../../webgpu/af3/diffusion/atom-decoder-webgpu.js";
+import { Af3DiffusionConditioningGpu } from "../../webgpu/af3/diffusion/diffusion-conditioning-webgpu.js";
+import { atomCrossAttentionEncoder as encodeCpu } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder-webgpu.js";
+import { layerNormSlow } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { linear } from "../../cpu/af3/trunk/pairformer-reference.js";
+import { af3Dialect, openAf3Store } from "../../shared/af3/weights/weights.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
 import { denseBondGeometry } from "./bond-geometry.js";
-import { atomReference, diffusionWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { atomReference, diffusionWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

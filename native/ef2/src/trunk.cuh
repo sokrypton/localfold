@@ -1,5 +1,5 @@
-// z_init, the recycle and the 24-block pair trunk, and the distogram (src/esmfold2/fold.js and
-// src/esmfold2/pair-features-reference.js are the reading):
+// z_init, the recycle and the 24-block pair trunk, and the distogram (webgpu/esmfold2/fold.js and
+// cpu/esmfold2/pair-features-reference.js are the reading):
 //
 //   z_init = z_init_1(s)[i] + z_init_2(s)[j] + rel_pos + token_bonds + lm_z
 //   z = 0;  num_loops + 1 times:  z = z_init + Linear(LN(z));  z = trunk(z)

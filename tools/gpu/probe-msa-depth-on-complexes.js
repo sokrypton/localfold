@@ -57,7 +57,7 @@
  * not landed, so an MSA sweep there would be measuring sampler noise. 80 is
  * where probe-flow-sigma-by-size.js found it landing.
  */
-import { generateMmseqs2ComplexMsa } from "../../src/input/mmseqs2-api.js";
+import { generateMmseqs2ComplexMsa } from "../../shared/input/mmseqs2-api.js";
 import { foldAf3, loadAf3Weights } from "../../web/af3-model.js";
 
 const option = (args, name, fallback) => {

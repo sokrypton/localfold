@@ -11,7 +11,7 @@
 // 🔴 THE TOTALS ARE NOT THE SHIPPED TOTALS. Profiling puts every dispatch in its
 // own compute pass so that tools/gpu/profile.js can time it; the shipped block
 // runs them in one. The SHARES are what this is for.
-import { EsmcBlockGpu } from "../../src/esmc/block-webgpu.js";
+import { EsmcBlockGpu } from "../../webgpu/esmc/block-webgpu.js";
 import { profileDevice } from "./profile.js";
 
 const option = (args, name, fallback) => {

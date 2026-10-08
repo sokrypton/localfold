@@ -12,7 +12,7 @@
  * weights by hand rather than through this loader.
  */
 import { describe, expect, it } from "./harness.js";
-import { diffusionWeights, targetFeatureWeights } from "../src/af3/weights/diffusion-weights.js";
+import { diffusionWeights, targetFeatureWeights } from "../shared/af3/weights/diffusion-weights.js";
 
 /** A store that answers every request with zeros and remembers what was asked. */
 function recordingStore(asked) {

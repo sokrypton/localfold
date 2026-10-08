@@ -5,35 +5,35 @@
  *       --steps=200 --model=/model-af3-int5/manifest.json
  *     node tools/gpu-chrome.mjs tools/gpu/fold.js --dump=/oracle-dumps/af3-6mrr.json
  *
- * --sequence folds what you type, through src/af3/featurise/featurise.js. --dump folds
+ * --sequence folds what you type, through shared/af3/featurise/featurise.js. --dump folds
  * AF3's own batch and reports the disagreement at every point where the two can
  * be compared, which is the only way the trunk can be checked against AF3's.
  *
- * WHAT IS HERE AND NOT IN src/af3/fold.js: argument parsing, the comparison
+ * WHAT IS HERE AND NOT IN webgpu/af3/fold.js: argument parsing, the comparison
  * against the dump, and the geometry report. The pipeline itself is shared with
  * the page, because the page has to run what was measured.
  */
-import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
-import { nameSmilesLigands, smilesComponent } from "../../src/chem/component.js";
-import { af3ContactClasses } from "../../src/af3/featurise/contact-classes.js";
-import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../src/heads/contact-threshold.js";
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
-import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
-import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
+import { memorySnapshot, setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
+import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
+import { nameSmilesLigands, smilesComponent } from "../../shared/chem/component.js";
+import { af3ContactClasses } from "../../shared/af3/featurise/contact-classes.js";
+import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../shared/heads/contact-threshold.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
+import { mergeRowAlignedChainA3ms } from "../../shared/input/chains.js";
+import { foldBatch, toPdb, backboneGeometry } from "../../webgpu/af3/fold.js";
 import { assertChainGeometry } from "./chain-geometry.js";
 import { bondGeometry } from "./bond-geometry.js";
 import { confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
-  from "../../src/af3/weights/weights.js";
-import { warmTrunkPipelines } from "../../src/af3/fold.js";
+  from "../../shared/af3/weights/weights.js";
+import { warmTrunkPipelines } from "../../webgpu/af3/fold.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
-import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
-import { dialectFor , featuriserDialect } from "../../src/af3/dialect.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
+import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
+import { dialectFor , featuriserDialect } from "../../shared/af3/dialect.js";
 import { profileDevice } from "./profile.js";
 import { profileBuffers } from "./buffer-profile.js";
 import { setDeviceTuning, deviceTuning, DEFAULT_TUNING }
-  from "../../src/runtime/device-profile.js";
+  from "../../webgpu/runtime/device-profile.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -54,8 +54,8 @@ function relativeRms(actual, expected) {
   return Math.sqrt(error / Math.max(scale, 1e-30));
 }
 
-import { batchFromDump } from "../../src/af3/featurise/batch-from-dump.js";
-export { batchFromDump } from "../../src/af3/featurise/batch-from-dump.js";
+import { batchFromDump } from "../../shared/af3/featurise/batch-from-dump.js";
+export { batchFromDump } from "../../shared/af3/featurise/batch-from-dump.js";
 
 
 export async function main(device, args) {
@@ -87,7 +87,7 @@ export async function main(device, args) {
   // and prints an N-CA of 27 A next to an ideal of 1.46, which reads as
   // corrupted weights rather than as the wrong flag. The flow reaches a
   // structure in eight because it is a different walk - see
-  // src/af3/diffusion/diffusion-sampler-webgpu.js - so say so rather than let the
+  // webgpu/af3/diffusion/diffusion-sampler-webgpu.js - so say so rather than let the
   // geometry report take the blame.
   if (samplerMode === "diffusion" && steps < 50) {
     console.log(`🔴 ${steps} steps of the DIFFUSION sampler will not converge -`
@@ -196,7 +196,7 @@ export async function main(device, args) {
     ? af3BatchFromA3m(sequenceArg, alignment, {
       maxSequences: Number(option(args, "max-msa", "512")),
       seed: Number(option(args, "seed", "20260831")),
-    // The padded template slot count; see src/af3/fold.js.
+    // The padded template slot count; see webgpu/af3/fold.js.
     ...(option(args, "templates", "") === "" ? {}
       : { templates: Number(option(args, "templates", "")) }),
       prefixRows: args.includes("--prefix-rows"),
@@ -615,7 +615,7 @@ export async function main(device, args) {
     // 🔴 THE ONLY EARLY STOP A TRUNK-ONLY RECYCLE CAN HAVE, in ANGSTROMS, on
     // the distances the distogram predicts - the same quantity and unit as
     // AF2's, whose ColabFold default is 0.5. 0 is off; see
-    // src/af3/feature-convergence.js and docs/AF3.md for what has actually
+    // shared/af3/feature-convergence.js and docs/AF3.md for what has actually
     // been measured, which is two inputs' worth and not a corpus.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     // The angstrom metric costs a softmax over every pair's bins each pass,
@@ -883,7 +883,7 @@ export async function main(device, args) {
     denoisedPdb: toPdb(batch, lastDenoised, result.scores?.plddt),
     // Per recycle, how far the trunk's single and pair moved from the pass
     // before. A trunk-only recycle produces no coordinates, so this is the only
-    // convergence signal there is - see src/af3/feature-convergence.js.
+    // convergence signal there is - see shared/af3/feature-convergence.js.
     recycleDeltas: result.recycleDeltas?.map((d) => ({
       pass: d.pass,
       pair: Number(d.pair.toExponential(3)),

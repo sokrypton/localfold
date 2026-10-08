@@ -24,7 +24,7 @@ track a few hundred rows at a time. The grid attention takes it happily - q, k,
 v and the gate are indexed `((row * N + i) * HEADS + head)`, row outermost, so
 a row chunk is a contiguous byte range and binding that SLICE makes the
 existing indexing address it with **no kernel change at all**. `run` in
-src/af3/trunk/pairformer-block-webgpu.js accepts a slice for this, and
+webgpu/af3/trunk/pairformer-block-webgpu.js accepts a slice for this, and
 `encodePairTrack` has a `rowChunk` that defaults to the whole track.
 
 🔴 **AND IT STOPS AT THE TRIANGLE, FOR TWO REASONS.** Its intermediates are
@@ -96,7 +96,7 @@ output IS before pricing its weights.
 
 🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
 allocator's snapshot cannot see a `Float32Array`, and until
-`src/runtime/device-memory.js` existed nothing counted the buffers created
+`webgpu/runtime/device-memory.js` existed nothing counted the buffers created
 outside the allocator - which are most of them by size. Host heap comes from
 `tools/gpu/probe-memory.js` (it forces a collection first, or the reading
 carries 300 MiB of garbage); device memory from `memorySnapshot(device)`,
@@ -216,7 +216,7 @@ confirm with `bench-trunk.js`.
 🔴 **ACTIVATIONS CAN BE STORED TWO HALVES TO A WORD, AND `pack2x16float` IS
 CORE WGSL.** Unlike the `f16` TYPE, it needs no device feature, so a tensor
 halves on hardware that cannot compute in half precision at all.
-`src/runtime/storage.js` is the whole mechanism and `execution.allocate`'s
+`webgpu/runtime/storage.js` is the whole mechanism and `execution.allocate`'s
 fourth argument is how a caller asks. A 59-residue fold at 512 MSA rows went
 **603.0 -> 396.4 MiB** across four tensors, for 0.043 pLDDT, and got 4.5%
 faster where the reader re-reads (the flash kernel's key and value); where it
@@ -875,7 +875,7 @@ feeding `diffusionSplitK`, `atomRowTile` and `diffusionTokenTile` read 2048,
 transformer's compile), and the denoiser call at 255 tokens came out 132 to 198
 ms with it. A clock warm-up and a third round did not steady it (4 to 2048
 again, fold weights loading beside it). The turing prior now pins all three -
-measured values and tables in `src/runtime/device-profile.js` - and the call
+measured values and tables in `webgpu/runtime/device-profile.js` - and the call
 holds at 126-133 ms. A CORRECT width would not have helped: ~640 workgroups
 says "no split" at 255 tokens and that was the slow arm; these GEMMs stream
 weights and want the workgroups for latency.
@@ -896,7 +896,7 @@ identical SPIR-V.
 
 🔴 **WHAT DOES PAY IS COMPILING WITHOUT UNROLLING FIRST - "TIERED" LOOP
 BOUNDS, THE TURING PRIOR.** The NVIDIA compiler unrolls every loop whose bound
-is a constant; `withRuntimeLoopBounds` in src/runtime/pipeline-cache.js makes
+is a constant; `withRuntimeLoopBounds` in webgpu/runtime/pipeline-cache.js makes
 each `i < CONST` bound opaque (`+ (arrayLength(&x) >> 31u)`, always zero), which
 compiles about 12x faster and runs up to 1.5x slower. `runtimeLoopBounds:
 "tiered"` hands out that kernel first and compiles the unrolled one behind it,
@@ -953,7 +953,7 @@ i.e. the turing prior). Nearly every kernel bakes the token count in as
 `const L: u32 = <n>u;`, so each new length was ~100 driver compiles. The cache
 now builds each kernel's first pipeline GENERIC: every module `u32` constant
 that code reads only in expressions is read from a uniform in bind group 1
-instead (`lengthPlan` in src/runtime/pipeline-cache.js; constants derived from
+instead (`lengthPlan` in webgpu/runtime/pipeline-cache.js; constants derived from
 them are inlined), and kernels whose text is otherwise identical share that
 pipeline at any length. The length-specific kernel still compiles behind the
 fold as the tiered upgrade. Refused, and compiled per length as before: a
@@ -1009,7 +1009,7 @@ The G4 (RTX PRO 6000 Blackwell, 48 vCPUs, `architecture: "blackwell"`) has the
 same shape at half the times - ampere's settings win warm (AF3 68 0.30 s a fold
 against 0.49; 255 0.85 against 1.18), the tiered compile wins AF3 255's first
 fold (1.77 s against 2.76) and AF2's cold run (1.55 against 2.09) - so it takes
-the lovelace prior. The table is in src/runtime/device-profile.js.
+the lovelace prior. The table is in webgpu/runtime/device-profile.js.
 
 🔴 **AND THEN IT BECAME EVERY DEVICE'S DEFAULT.** A Colab A100 (the ampere
 prior's own architecture, 12 vCPUs) shows the same trade: AF3 68 first fold
@@ -1037,7 +1037,7 @@ own architecture) and a G4; H100 was refused on Pro, and neither was measured.
 
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
-The shared vectorised linear (`src/esmc/block-webgpu.js`) tiles eight rows by
+The shared vectorised linear (`webgpu/esmc/block-webgpu.js`) tiles eight rows by
 256 columns, so a token-sized projection at 768 or 1152 channels ran 15 to 60
 workgroups a pass on a card that holds thousands. Each output sums k in the same
 order at any row tile, so two rows is more workgroups for the same bits - pLDDT
@@ -1177,11 +1177,11 @@ archive is 28 ms for a 2 MB alignment.
 
 🔴 **QUANTISED WEIGHTS CAN BE DECODED ON THE GPU, AND IT IS 3.7x.** The path to
 a resident f16 buffer used to be: decode int5 into float32 on the main thread,
-narrow the lot into a Float16Array, upload. `src/weights/quantised-upload.js`
+narrow the lot into a Float16Array, upload. `webgpu/weights/quantised-upload.js`
 uploads the CODES instead - an eighth of the bytes - and decodes them into the
 destination with one dispatch per tensor. 437 ms of host packing becomes 119 of
 compute for the diffusion transformer's 24 blocks, and a real page fold went
-**3.31 s to 2.30**. `src/af3/weights/device-weights.js` is the shared entry point;
+**3.31 s to 2.30**. `webgpu/af3/weights/device-weights.js` is the shared entry point;
 docs/AF3.md has the per-packer table.
 
 🔴 **AND BIT-IDENTITY WAS THE FIRST THING MEASURED, NOT THE LAST.** JavaScript
@@ -1201,7 +1201,7 @@ the host arm WARM and flattered the GPU by 234 ms of work it had itself caused.
 
 🔴 **AND `Float16Array.set` FROM A Float32Array IS NOT A MEMMOVE.** 8M elements
 measure 9.4 ms through `set`, 6.1 through a plain loop and 4.4 unrolled eight
-ways - bit-identical. `writeInto` in src/weights/float16.js is that loop, and
+ways - bit-identical. `writeInto` in shared/weights/float16.js is that loop, and
 it leaves same-element copies to `set`, which really is a memmove. On real
 shapes it is 26% of the narrowing rather than 52%: a block is forty tensors
 averaging 200k elements, so per-call overhead is a much larger share than the
@@ -1239,8 +1239,8 @@ new one is its output. The previous is read exactly once, into
 `embed.previous-msa-normalized`, by the first dispatch of the encoder; every
 later dispatch writes the new one. So they could be one buffer, ordered within
 the encoder, for 29.5 MiB of 365. It is not taken because it is an ownership
-change through TWO recycle loops (`src/af2/evoformer/input-embedder.js` and
-`src/af2/multimer/input-embedder.js`) for 8%, and `fold-af2.js`'s checksum
+change through TWO recycle loops (`webgpu/af2/evoformer/input-embedder.js` and
+`webgpu/af2/multimer/input-embedder.js`) for 8%, and `fold-af2.js`'s checksum
 (-2047044 at 512 rows and one recycle) is what would have to gate it.
 
 🔴 **SO THE EF2 RESULT DOES NOT GENERALISE, AND THE REASON IS INSTRUCTIVE.**
@@ -1290,7 +1290,7 @@ activation as `f16` whenever `hiddenChannels % 4 == 0`, which the MSA
 transition's 1024 and the pair transition's are, and the second matmul reads it
 through `storedElement` - an `unpack2x16float` expression. `subgroupMatrixLoad`
 cannot consume an expression. So taking the matrix path there means storing
-`hidden` unpacked, which src/runtime/storage.js records as 16 MiB at 512 MSA
+`hidden` unpacked, which webgpu/runtime/storage.js records as 16 MiB at 512 MSA
 rows for a BIT-IDENTICAL fold - a free win being given back. That is a real
 trade to weigh, not a number to quote.
 
@@ -2118,7 +2118,7 @@ is worth most of a morning if the first number is believed. Use `--repeats`.
 ### Ruled out with numbers
 
 - **`popErrorScope` is not a stall.** 428 of them in an OpenDDE fold summing to
-  3469 ms looks alarming, and 370 come from `src/runtime/validation.js` - which
+  3469 ms looks alarming, and 370 come from `webgpu/runtime/validation.js` - which
   is the DeferredValidation class, whose whole point is that the pops are held
   and settled together at a boundary that already synchronises. They resolve
   concurrently; the sum is not a wall. The other **58 calls come from 11 sites
@@ -2147,7 +2147,7 @@ a real T4 (`measuredWidth` 512):
 | `atomRowTile` | 316 | `outputRowTileFor(queryRows, workgroupTarget)` |
 | `diffusionNormSplit` | 526 | **nothing - no derivation exists** |
 
-`src/runtime/device.js` fires the occupancy measurement whenever
+`webgpu/runtime/device.js` fires the occupancy measurement whenever
 `diffusionSplitK` is null, and `deviceDerivationsAllowed` excludes only Apple,
 so an NVIDIA card with no prior derives all four. That leaves ONE candidate,
 and `tools/gpu/bench-normsplit.js` measures it at nothing: **-0.5% / +0.9% /

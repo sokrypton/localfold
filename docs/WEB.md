@@ -44,7 +44,7 @@ were phased, and dropping it puts a hole in the middle of a chain.
 `chosenFamily`'s guard read "Templates need AF3 or OpenBind-0", and for the
 monomer that was right for the wrong reason: its term exists, is
 oracle-checked against AF2's own module, and was reachable from nothing,
-because `src/af2/model/monomer.js` built its template call from a literal that
+because `webgpu/af2/model/monomer.js` built its template call from a literal that
 named neither `template` nor `useTemplateUnitVector`. See docs/AF2.md. With
 the driver forwarding, the page can offer it. Measured, 5CAJ chain A with its
 own crystal uploaded, one recycle, single sequence:
@@ -181,7 +181,7 @@ Measured with `tools/fold-in-page.py --timeline`, which reads resource timing:
 
 🔴 **AND A `--timeline` THAT FILTERS BY NAME ALONE MEASURES PAGE LOAD.** The
 first version reported a 1.2-second overlap - and the UNCHANGED tree reproduced
-it exactly, because `/mmseqs/` matches `src/input/mmseqs2-api.js` and the
+it exactly, because `/mmseqs/` matches `shared/input/mmseqs2-api.js` and the
 weights directory is probed before the button is pressed. Both spans started at
 66 ms, which is not a span of anything a click caused. It stamps
 `window.__foldClickedAt` at the click and ignores everything earlier.
@@ -1811,7 +1811,7 @@ Building LIG from its structure    → 126 residues + OC(=O)CCCC[C@@H]1SC[C...
 Four calciums from an `id` LIST, both phosphorylated residues by CCD code, a
 biotin built from SMILES rather than looked up, and a protein/DNA complex at 476
 tokens. And none of the nine appended **"NOT A CHAIN"**, which is the geometry
-rule `src/af3/chain-geometry.js` applies to every fold the page draws.
+rule `shared/af3/chain-geometry.js` applies to every fold the page draws.
 
 **The five that refuse are two gaps, both real.** Three carry `bondedAtomPairs`
 (`kras_g12c_sotorasib`, `rnaseb_glycosylated`, and the kitchen-sink
@@ -2667,7 +2667,7 @@ buy that.
 
 **Where Dawn IS the answer is where only the card was ever wanted** - the
 benches in `tools/gpu/`, CI on a Linux box - and that door already exists as
-`createNodeDevice` in `src/node.js`. It is now proven end to end rather than
+`createNodeDevice` in `webgpu/node.js`. It is now proven end to end rather than
 at the feature list: a real AF3 fold on a T4, **7.5 s**, mean pLDDT 70.1,
 backbone N-CA 1.45 / CA-C 1.54 / CA-CA 3.86 A, radius of gyration 10.9 A.
 
@@ -2759,10 +2759,10 @@ exposed by `allow_unsafe_apis`, which is already passed.
 ## `keepTrunkWeights` on a T4: measured, and it changes nothing - the fallback already keeps them
 
 🔴 **AND THE "GAP" WAS A MISREADING OF THE DEFAULT, WHICH IS THE WHOLE
-FINDING.** `src/runtime/device-profile.js` sets `keepTrunkWeights: true` in
+FINDING.** `webgpu/runtime/device-profile.js` sets `keepTrunkWeights: true` in
 ONE device block - `ampere` - and the `turing` prior does not, so it looked
 like every Colab T4 released and re-uploaded the trunk on each fold. It does
-not. The site that decides is `src/af3/fold.js`:
+not. The site that decides is `webgpu/af3/fold.js`:
 
     if ((deviceTuning(device).keepTrunkWeights
       ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device)))
@@ -3261,7 +3261,7 @@ allocation timeouts); the previous pass's TPU run folded end to end.
 
 The multimer was refused a template everywhere, on the grounds that its
 embedder is a different dialect and nothing built a slot for it. The embedder
-was always there - src/af2/multimer/template.js takes an atom37 slot over the
+was always there - webgpu/af2/multimer/template.js takes an atom37 slot over the
 WHOLE complex plus `asymId`, and model.js forwarded it every recycle - so what
 was missing was the slot:
 
@@ -3718,7 +3718,7 @@ floats, 35 MB at 261) and ran the distogram head over it in JavaScript
 the fold's own steps, so it delayed them rather than overlapping. With it
 switched off the page's AF2 fold at 255 residues was **2.6 s against 6.0**, the
 fold tool's own 2.5 at those settings. It is on the device now
-(`src/heads/distogram-webgpu.js`, monomer.js's `contacts` option): `L * L`
+(`webgpu/heads/distogram-webgpu.js`, monomer.js's `contacts` option): `L * L`
 probabilities come back, `probe-af2-contacts.js` holds them to the host function
 every pass (5-7e-7 at 58 residues, 1.0e-6 at 255; a kernel reading the forward
 pair twice fails at 0.14), and `fold-in-page.py --model monomer` still puts a
@@ -4049,7 +4049,7 @@ value ROUNDED TO FLOAT16 - what the delta was taken against - plus the delta),
 `whole` or `absent` by the delta's header. The native loader does the same on
 the device (`loadBundle(..., delta)`: a base record flagged to round, then the
 delta's accumulated in float32), and a dumped weight matches
-src/bundles/delta-tensor-store.js's reconstruction in every element (12,582,912
+shared/bundles/delta-tensor-store.js's reconstruction in every element (12,582,912
 of 12,582,912 for a transition stack, 512 of 512 for a bias). Against DeepMind's
 own float32 weights: model_3 on 5CAJ 1.883 Å / pLDDT 96.43 against 1.936 / 96.38,
 the multimer's model_2 on templated 1BRS 0.344 against 0.340, ipTM identical. A

@@ -341,7 +341,7 @@ describe("mixed ligands in one job", () => {
   });
 
   it("keeps every name inside the PDB's three characters", () => {
-    // 🔴 `src/af3/fold.js` writes the residue name with `.padEnd(3)` into a
+    // 🔴 `webgpu/af3/fold.js` writes the residue name with `.padEnd(3)` into a
     // fixed-width field, so a four-character name runs into the chain id - and
     // `LIG2` truncated back to `LIG` would put the collision straight back.
     const rows = [];

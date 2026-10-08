@@ -13,9 +13,9 @@
  *
  * The head cannot drive S > 1 yet; this drives the transformer directly.
  */
-import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { diffusionWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { diffusionWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

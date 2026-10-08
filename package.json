@@ -4,7 +4,7 @@
   "license": "Beerware",
   "type": "module",
   "description": "WebGPU protein structure prediction in the browser - AlphaFold 2 (monomer and multimer), AlphaFold 3, ESMFold2 and OpenDDE",
-  "//": "A published package AND this repository's dev manifest. Nothing here is needed to open the page or run the CPU tests: `files` ships src/ only, and everything under devDependencies belongs to one of the optional lanes below.",
+  "//": "A published package AND this repository's dev manifest. Nothing here is needed to open the page or run the CPU tests: `files` ships shared/, cpu/ and webgpu/ only, and everything under devDependencies belongs to one of the optional lanes below.",
   "homepage": "https://localfold.org",
   "repository": {
     "type": "git",
@@ -24,14 +24,18 @@
     "node": ">=22"
   },
   "files": [
-    "src",
+    "shared",
+    "cpu",
+    "webgpu",
     "README.md",
     "LICENSE"
   ],
   "exports": {
-    ".": "./src/index.js",
-    "./node": "./src/node.js",
-    "./src/*": "./src/*"
+    ".": "./webgpu/index.js",
+    "./node": "./webgpu/node.js",
+    "./shared/*": "./shared/*",
+    "./cpu/*": "./cpu/*",
+    "./webgpu/*": "./webgpu/*"
   },
   "peerDependencies": {
     "webgpu": "*"

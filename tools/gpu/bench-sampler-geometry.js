@@ -26,13 +26,13 @@
  * be skipped - a blank cell is not a pass.
  */
 import { confidenceWeights, openAf3Store, trunkWeights }
-  from "../../src/af3/weights/weights.js";
+  from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
-import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { foldBatch, toPdb } from "../../src/af3/fold.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
+import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { foldBatch, toPdb } from "../../webgpu/af3/fold.js";
+import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
 import { bondGeometry, parsePdbResidues } from "./bond-geometry.js";
 // 🔴 A NON-CHAIN IS NOT A BOND-LENGTH QUESTION and would pass every column
 // above: this repository has measured intellifold2 in flow returning a fold

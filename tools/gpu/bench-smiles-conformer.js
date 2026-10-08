@@ -17,13 +17,13 @@
  * this answers is not "is the GPU faster" but "how many molecules before it
  * is", which is what a screen cares about and a single fold does not.
  */
-import { parseSmiles } from "../../src/chem/smiles.js";
-import { chiralCentres } from "../../src/chem/stereo.js";
+import { parseSmiles } from "../../shared/chem/smiles.js";
+import { chiralCentres } from "../../shared/chem/stereo.js";
 import {
   distanceBounds, smoothBounds, embedBounds, refineCoordinates, planarQuadruples,
-} from "../../src/chem/conformer.js";
-import { refineOnDevice } from "../../src/chem/conformer-webgpu.js";
-import { hashOf } from "../../src/chem/component.js";
+} from "../../shared/chem/conformer.js";
+import { refineOnDevice } from "../../webgpu/chem/conformer-webgpu.js";
+import { hashOf } from "../../shared/chem/component.js";
 
 const LIGAND = "CC(=O)Oc1ccccc1C(=O)O";           // aspirin: 13 atoms, drug-sized
 

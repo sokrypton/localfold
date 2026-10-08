@@ -1,8 +1,8 @@
 import { describe, expect, it } from "./harness.js";
 import { confidenceJson, contactMapFor, matrixForViewer, modifiedPositions, predictionToPdb,
   recyclesToPdb, safeJobName, viewerTokens } from "../web/prediction-results.js";
-import { featuriseProtein } from "../src/af3/featurise/featurise.js";
-import { toPdb } from "../src/af3/fold.js";
+import { featuriseProtein } from "../shared/af3/featurise/featurise.js";
+import { toPdb } from "../webgpu/af3/fold.js";
 
 describe("browser prediction result formatting", () => {
   it("writes only present atom37 coordinates and pLDDT B-factors", () => {
@@ -96,11 +96,11 @@ describe("browser prediction result formatting", () => {
 });
 
 const { computeTmScores: computeTmScoresPinned } =
-  await import("../src/heads/confidence.js");
+  await import("../webgpu/heads/confidence.js");
 
 describe("TM and interface TM score calculation", () => {
   it("computes pTM and multi-chain ipTM from PAE logits", async() => {
-    const { computeTmScores } = await import("../src/heads/confidence.js");
+    const { computeTmScores } = await import("../webgpu/heads/confidence.js");
     const length = 20;
     const bins = 64;
     const breaks = Float32Array.from({ length: 63 }, (_, i) => i * 0.5);

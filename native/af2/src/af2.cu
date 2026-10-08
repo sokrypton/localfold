@@ -248,7 +248,7 @@ inline void paeChunked(const float* pair, int L, const std::function<void(const 
     onChunk(lg, r0, r);
   }
 }
-// --tolerance=<A>: the page's early stop (src/af2/model/recycle-convergence.js, ColabFold's compute_tol) -
+// --tolerance=<A>: the page's early stop (shared/af2/model/recycle-convergence.js, ColabFold's compute_tol) -
 // after each pass from the second on, the RMS change of every C-alpha pair distance against the last pass,
 // over the sequence mask; the fold stops when it is strictly below this. 0 runs every pass.
 static double TOLERANCE = 0;
@@ -631,7 +631,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 // its end returns while the driver releases this process's device (0.16 s of exit; native/af2/fold does)
 static bool DETACH = false;
 // --nearest=<out> (a serve job, with the job's input naming a search file): every recycle's nearest-centre search
-// of an alignment's featurisation on the device - src/input/a3m-features.js's nearestCentres, the page's
+// of an alignment's featurisation on the device - shared/input/a3m-features.js's nearestCentres, the page's
 // nearest-centres-webgpu.js in CUDA - written as the assignments, no fold. The search was ~160 ms of a deep
 // alignment's export a recycle in Node (5CAJ's 7907 rows), four times over on a Colab T4's two CPUs.
 // The file: int32 recycles, words; then per recycle int32 centres, rows, the centres' padded code words

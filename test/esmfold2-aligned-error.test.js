@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 
 import {
   alignedErrorFromDistogram, distogramMoments, FEATURES, WEIGHTS, MAX_ANGSTROMS,
-} from "../src/esmfold2/aligned-error.js";
+} from "../shared/esmfold2/aligned-error.js";
 
 const EDGES = { minimum: 2, maximum: 52 };
 const BINS = 128;

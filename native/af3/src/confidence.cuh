@@ -1,4 +1,4 @@
-// The confidence head: pLDDT, PAE, PDE. Transcribed from src/af3/confidence/confidence-reference.js.
+// The confidence head: pLDDT, PAE, PDE. Transcribed from cpu/af3/confidence/confidence-reference.js.
 // f32 throughout - the WebGPU head pins f32 too, for accuracy, and it is four blocks.
 #pragma once
 #include "trunk.cuh"
@@ -367,7 +367,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   else project(headNorm(pair, ln, pairs, C, "paeLogitsLn"), "paeLogits", "paeInterLogits");
   expectationK<<<blocks(pairs), 256, 0, STREAM>>>(logits, pae, pairMask, pairs, NB, dCentres, 0, 1.f);
   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's
-  // mean over the pairs it selects (ipTM: other chains only). src/heads/tm-score.js.
+  // mean over the pairs it selects (ipTM: other chains only). shared/heads/tm-score.js.
   {
     std::vector<float> seq = download(seqMask, n);
     const int* asym = M.i("batch.asymId");

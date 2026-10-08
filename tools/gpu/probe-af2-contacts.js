@@ -4,7 +4,7 @@
  *     node tools/gpu-chrome.mjs tools/gpu/probe-af2-contacts.js
  *     node tools/gpu-chrome.mjs tools/gpu/probe-af2-contacts.js --recycles=2
  *
- * WHY IT EXISTS. src/heads/distogram.js is covered by unit tests, but those
+ * WHY IT EXISTS. shared/heads/distogram.js is covered by unit tests, but those
  * are differential: they say the head computes a projection, a symmetrisation
  * and a softmax. They cannot catch the two things most likely to be wrong
  * about a head converted from someone else's checkpoint - a transposed weight
@@ -35,17 +35,17 @@
  *
  * 🔴 AND IT HOLDS THE DEVICE'S MAP TO THIS HOST FUNCTION. The page asks
  * monomer.js for `contacts` and the probabilities come from
- * src/heads/distogram-webgpu.js; every pass here asserts the two agree
+ * webgpu/heads/distogram-webgpu.js; every pass here asserts the two agree
  * (`deviceMaxAbsDiff`, bar 1e-4), so the AUC above scores both.
  *
  * 🔴 AND THE DIAGONAL IS EXCLUDED. Neighbours are in contact in any chain,
  * folded or not, so scoring them inflates every number and would hide exactly
  * the failure this is looking for. |i - j| >= 6, the usual short-range cut.
  */
-import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
-import { distogramContactProbabilities } from "../../src/heads/distogram.js";
+import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { AlphaFoldMonomerGpu } from "../../webgpu/af2/model/monomer.js";
+import { distogramContactProbabilities } from "../../shared/heads/distogram.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -87,7 +87,7 @@ export async function main(device, args) {
   // be asked about at all.
   const extraRows = Number(option(args, "extra", String(rows)));
 
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
+  const { MODEL_BUNDLES, loadManifest } = await import("../../shared/bundles/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
     MODEL_BUNDLES.monomer.directory, await loadManifest("monomer"));
   const fixture = AlphaFoldFixture.fromStore(store);
@@ -156,7 +156,7 @@ export async function main(device, args) {
       }
     }
     // 🔴 AND THE DEVICE'S MAP, WHICH IS THE ONE THE PAGE SHOWS. `contacts` is
-    // src/heads/distogram-webgpu.js over the same pass's pair; f32 against
+    // webgpu/heads/distogram-webgpu.js over the same pass's pair; f32 against
     // this function's f64 accumulators, so the bar is a rounding one.
     const device_ = recycle.contactProbs;
     const deviceMaxAbsDiff = device_ === undefined ? null

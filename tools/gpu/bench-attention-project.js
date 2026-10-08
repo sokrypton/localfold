@@ -34,8 +34,8 @@
  */
 import {
   createAttentionProjectShader, attentionProjectTileRows, attentionProjectTileColumns,
-} from "../../src/kernels/attention.js";
-import { float32ToFloat16Array } from "../../src/weights/float16.js";
+} from "../../webgpu/kernels/attention.js";
+import { float32ToFloat16Array } from "../../shared/weights/float16.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

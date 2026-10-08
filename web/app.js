@@ -21,12 +21,12 @@
  * keep working. What the reader downloads is separate and explicit - see the
  * two buttons at the foot of this file, which write what the model produced.
  */
-import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
-import { AlphaFoldUnifiedGpu } from "../src/af2/multimer/model.js";
+import { AlphaFoldMonomerGpu } from "../webgpu/af2/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../webgpu/af2/multimer/model.js";
 import { blankChainColumns, foldsAsSingleSequence, parseA3m }
-  from "../src/input/a3m.js";
-import { mergeJobAlignments } from "../src/input/chains.js";
-import { planRecycleReuse } from "../src/af2/model/recycle-convergence.js";
+  from "../shared/input/a3m.js";
+import { mergeJobAlignments } from "../shared/input/chains.js";
+import { planRecycleReuse } from "../shared/af2/model/recycle-convergence.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
 // AND more than one chain, so a first fold never reaches it - and stopping a
@@ -34,28 +34,28 @@ import { planRecycleReuse } from "../src/af2/model/recycle-convergence.js";
 // again. test/module-references.test.js now looks for the whole class.
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
   expandSearchedChains, planSearchReuse, searchCacheEntry }
-  from "../src/input/mmseqs2-api.js";
-import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
+  from "../shared/input/mmseqs2-api.js";
+import { isAbortError, throwIfAborted } from "../webgpu/runtime/abort.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
-  from "../src/runtime/device-memory.js";
+  from "../webgpu/runtime/device-memory.js";
 import { OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
   countsForFamily, diffusionScheduleFor,
   samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
-import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
-import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js";
-import { toPdb } from "../src/af3/fold.js";
-import { chainGeometryOf, chainGeometryVerdict } from "../src/af3/chain-geometry.js";
-import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
-import { smilesComponent } from "../src/chem/component.js";
-import { GpuBufferAllocator } from "../src/runtime/allocator.js";
+import { SAMPLER_PRESETS, foldEsmfold2 } from "../webgpu/esmfold2/fold.js";
+import { spreadOverAtoms, toDensePositions } from "../shared/esmfold2/featurise.js";
+import { toPdb } from "../webgpu/af3/fold.js";
+import { chainGeometryOf, chainGeometryVerdict } from "../shared/af3/chain-geometry.js";
+import { ccdUrl, parseCcdComponent } from "../shared/af3/featurise/ccd-component.js";
+import { smilesComponent } from "../shared/chem/component.js";
+import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
 import { getDevice, loadModel, releaseModel } from "./model.js";
-import { releaseAllWeights } from "../src/runtime/resident.js";
+import { releaseAllWeights } from "../webgpu/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
-  from "../src/bundles/manifests/index.js";
+  from "../shared/bundles/manifests/index.js";
 import { devAdopt, devBeginRun, devEndRun, devNote, devOnEntry, devSourceIs, devStatus,
   devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
@@ -78,13 +78,13 @@ import {
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
-import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
-import { RuntimeEstimator } from "../src/runtime/cost-model.js";
+import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
+import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
 import { colabRole, installColabBridge, onRemoteReady, remoteBackendChoice, remoteCommand, remoteLiveChoice,
   remoteEvents, remoteWebgpuReal,
   remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
 // A runtime page the Colab broker opened reads its weights through the broker;
-// see bundleBaseUrl in src/bundles/manifests/index.js.
+// see bundleBaseUrl in shared/bundles/manifests/index.js.
 if (new URLSearchParams(location.search).get("weights") === "proxy") {
   globalThis.__localfoldWeightsProxy = "/hf/";
 }
@@ -337,7 +337,7 @@ function rememberTermsAccepted() {
  * ignored looks exactly like one that worked, and the reader finds out from the
  * fold they get. `of3` is deliberately NOT an alias for `openbind`: OpenFold3's
  * preview-2 and its v0.5.0 release are different models with different forward
- * conventions (see src/af3/dialect.js), so quietly resolving one to the other
+ * conventions (see shared/af3/dialect.js), so quietly resolving one to the other
  * would hand somebody a model they did not ask for. `openbind` IS accepted,
  * because that is the name upstream publishes the blob under and the name this
  * page used before the release number was added - but it resolves to
@@ -664,7 +664,7 @@ const familyFromLabel = (label) => Object.keys(MODEL_LABELS)
 
 const MODEL_LABELS = {
   af3: "AlphaFold 3",
-  // Upstream's own name for this release. See src/af3/dialect.js for why the
+  // Upstream's own name for this release. See shared/af3/dialect.js for why the
   // number is not decoration.
   openbind0: "OpenBind-0",
   opendde: "OpenDDE",
@@ -2542,7 +2542,7 @@ function meanByChain(asymId, values) {
 
 function attachContactMap(frame, recycle) {
   // The probabilities come from the device (monomer.js's `contacts` option,
-  // src/heads/distogram-webgpu.js). 🔴 THEY WERE COMPUTED HERE, in JavaScript,
+  // webgpu/heads/distogram-webgpu.js). 🔴 THEY WERE COMPUTED HERE, in JavaScript,
   // from a host copy of the pair representation - on the main thread between
   // the fold's own steps, which made it 3.4 s of a 6.0 s AF2 fold at 261
   // residues and more on a slower CPU. A pass without them (the multimer, a
@@ -2732,7 +2732,7 @@ function syncModelControls() {
   // 🔴 RECYCLES AND SEED ARE SHOWN FOR EVERY MODEL, so the row keeps one order
   // whatever is chosen. AF3 recycles too - its embedder has always done
   // `pair += prev_embedding(LayerNorm(recycled pair))`, and the loop driving it
-  // is in src/af3/fold.js.
+  // is in webgpu/af3/fold.js.
   // The MSA controls belong to syncMode, which greys Max MSA out when the MSA
   // select reads None. Setting them here as well would give one pair of
   // controls two owners that disagree - so they are not touched here at all,
@@ -3885,11 +3885,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // pAE IMPROVES, 8.84 -> 7.97. A panel that looks BETTER on a failed fold is
   // the worst possible panel, because the fold somebody checks the PAE on is
   // the one they doubt - the same reason the per-residue certainty colour was
-  // measured and not shipped. `src/esmfold2/aligned-error.js` and
+  // measured and not shipped. `shared/esmfold2/aligned-error.js` and
   // `tools/pae-transfer.py` keep the estimator and the numbers; nothing draws
   // it until the inversion is fixed.
   // 🔴 AND THE PAE IS DRAWN NOW, because it is predicted rather than estimated.
-  // What used to be here was `src/esmfold2/aligned-error.js`, withheld with its
+  // What used to be here was `shared/esmfold2/aligned-error.js`, withheld with its
   // numbers: it ordered pairs WITHIN a fold at 0.746 against AlphaFold 3's real
   // PAE and INVERTED across folds at -0.867, so a failed fold scored better
   // than a good one. This is the head's own, on the same 0-32 scale as
@@ -5190,7 +5190,7 @@ async function fold(event) {
         }
       };
       // 🔴 THE UNITS ARE COSTS, NOT COUNTS, and that is what makes a clock
-      // possible. src/af2/model/*.js weight every step by what the cost model says it
+      // possible. webgpu/af2/model/*.js weight every step by what the cost model says it
       // costs, so `completed / total` is a fraction of the WORK - and the ratio
       // of elapsed time to work done is this machine's speed, whatever it is.
       // RuntimeEstimator holds that reasoning; a plan of one stage is enough for
@@ -5240,7 +5240,7 @@ async function fold(event) {
         ? { outerProductMeanFirst: true, positionScale: 20,
           chainAware: true, chainSequences: chains }
         : {};
-      // ...?graph=unified runs the MONOMER weights through src/af2/multimer/ instead.
+      // ...?graph=unified runs the MONOMER weights through webgpu/af2/multimer/ instead.
       // With its switches off that graph reproduces the monomer one bit for bit,
       // which is the check that the superset is right; a difference is a graph
       // bug rather than a weights bug.

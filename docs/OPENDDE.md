@@ -101,7 +101,7 @@ reported numbers. Both now come from one file. The altLoc rule matters too:
 
 ## The widths, which are the whole reason the loader changed
 
-Every width in `src/af3/weights/weights.js` used to be a number typed next to the
+Every width in `shared/af3/weights/weights.js` used to be a number typed next to the
 tensor it describes. A declared width is right for exactly one checkpoint and
 silent for every other: this bundle loads through `pairChannels: 128` without
 complaint and dispatches every kernel over a third of its own tensor.
@@ -128,7 +128,7 @@ tensor. Only `v_projection`'s own shape says so.
 
 ## The dialect
 
-`src/af3/dialect.js`. OpenDDE and OpenBind-0 are both OpenFold3 by lineage and
+`shared/af3/dialect.js`. OpenDDE and OpenBind-0 are both OpenFold3 by lineage and
 **disagree in opposite directions on the two flags they share**, which is the
 whole reason that table exists:
 
@@ -266,7 +266,7 @@ template embedder share every name and differ only in width; the diffusion
 shares 51 of 53; the confidence head shares nothing usable.
 
 So the port is a second token space threaded through the atom layouts, which
-is what `src/af3/featurise/structural-tokens.js` and `tools/gpu/fold-opendde.js` are. The
+is what `shared/af3/featurise/structural-tokens.js` and `tools/gpu/fold-opendde.js` are. The
 bundle is the whole model: 481 tensors, 655.8 M parameters, upstream's own
 published `parameter_count` exactly.
 
@@ -669,7 +669,7 @@ shapes. To get it back:
 on RMSD and TM cannot see a bond length.
 
 **The other three models must stay bit-identical**, and are the gate on any
-change to `src/af3/featurise/featurise.js`, which all of them share:
+change to `shared/af3/featurise/featurise.js`, which all of them share:
 
 | | |
 |---|---|

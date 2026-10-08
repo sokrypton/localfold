@@ -23,18 +23,18 @@
  * ignored, because a search that runs and is discarded is a minute of somebody
  * else's server for no reason.
  */
-import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
-import { readTensor } from "../src/weights/dtype.js";
-import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
+import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
+import { readTensor } from "../shared/weights/dtype.js";
+import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../shared/bundles/manifests/index.js";
 import {
   atomDecoderWeights, atomEncoderWeights, confidenceHeadWeights, denoiserWeights,
   featuriserWeights, trunkBlockWeights,
-} from "../src/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../src/esmfold2/language-pair-webgpu.js";
-import { EsmcTowerGpu } from "../src/esmc/tower-webgpu.js";
-import { SAMPLER_DEFAULTS, SAMPLER_PRESETS } from "../src/esmfold2/fold.js";
+} from "../shared/esmfold2/weights.js";
+import { SHIM_PAIR_TENSORS } from "../webgpu/esmfold2/language-pair-webgpu.js";
+import { EsmcTowerGpu } from "../webgpu/esmc/tower-webgpu.js";
+import { SAMPLER_DEFAULTS, SAMPLER_PRESETS } from "../webgpu/esmfold2/fold.js";
 import { churnFactors, noiseLevels, noiseSchedule }
-  from "../src/esmfold2/sampler-reference.js";
+  from "../cpu/esmfold2/sampler-reference.js";
 
 /** The ten tensors an ESM-C block holds, under the names its exporter writes. */
 const BLOCK_LEAVES = ["attn_norm/scale", "attn_norm/offset", "qkv/weights",
@@ -201,7 +201,7 @@ export function loadEsmfold2Weights(onProgress,
     // 🔴 AND IT CARRIES THE TWO HALVES A LAZY LOADER NEEDS. `source` hands the
     // bytes over undecoded so the GPU can dequantise them, and `decode` is the
     // synchronous host fallback a getter can call. See
-    // src/esmfold2/weights.js: without these the loaders behave exactly as they
+    // shared/esmfold2/weights.js: without these the loaders behave exactly as they
     // did, and with them the denoiser's 1.17 s of int5 decoding and 880 ms of
     // narrowing both stop happening on the main thread.
     const read = (name) => foldStore.tensor(name);
@@ -260,7 +260,7 @@ export function loadEsmfold2Weights(onProgress,
       confidenceWeights: confidence,
       language: {
         manifest: towerManifest.languageModel,
-        // ...what the language band in src/esmfold2/cost.js is priced on, taken
+        // ...what the language band in webgpu/esmfold2/cost.js is priced on, taken
         // from the store that already counted it rather than written down.
         megabytes: towerStore.totalBytes / 1048576,
         shared: towerShared,

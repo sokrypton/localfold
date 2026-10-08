@@ -471,7 +471,7 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, native=None):
         # fetches upstream in Python, streams the bytes to the page as they
         # arrive and keeps a copy on disk for the next request; the page asks
         # here only when the broker told it to (`weights=proxy`), and only for
-        # huggingface.co - see bundleBaseUrl in src/bundles/manifests/index.js.
+        # huggingface.co - see bundleBaseUrl in shared/bundles/manifests/index.js.
         def _weights_proxy(self, rest):
             import hashlib
             import shutil

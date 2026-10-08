@@ -5,8 +5,8 @@ import {
   residueIndexWithChainBreaks,
   splitComplexA3mByChain,
   validatedChainLengths,
-} from "../src/input/chains.js";
-import { parseA3m } from "../src/input/a3m.js";
+} from "../shared/input/chains.js";
+import { parseA3m } from "../shared/input/a3m.js";
 
 describe("monomer-model oligomer preprocessing", () => {
   it("adds ColabFold's 200-index offset at every physical chain boundary", () => {

@@ -27,9 +27,9 @@
  * download besides. It makes the numbers meaningless as biology and perfectly
  * good as a fingerprint, which is what a regression needs.
  *
- * 🔴 MULTIMER SHARES EVERY KERNEL AND HAD NO GATE AT ALL. src/af2/multimer/block.js
+ * 🔴 MULTIMER SHARES EVERY KERNEL AND HAD NO GATE AT ALL. webgpu/af2/multimer/block.js
  * builds its blocks from the same attention, transition and outer-product-mean
- * shaders src/af2/evoformer/block.js does, with its own dispatches - so a tile
+ * shaders webgpu/af2/evoformer/block.js does, with its own dispatches - so a tile
  * changed in one and not threaded through the other is a bug that only a
  * multimer fold can see. `--family=multimer` runs that path, through
  * AlphaFoldUnifiedGpu and the multimer regime the page passes (outer product
@@ -41,20 +41,20 @@
  * real protein and nothing else; `caca` is the number that a wrong kernel
  * cannot fake, so it is printed with its worst outlier.
  */
-import { memorySnapshot } from "../../src/runtime/device-memory.js";
-import { noteResidencyRefused, setMemoryBudget } from "../../src/runtime/device-memory.js";
-import { DEFAULT_TUNING, setDeviceTuning } from "../../src/runtime/device-profile.js";
-import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
-import { AlphaFoldUnifiedGpu } from "../../src/af2/multimer/model.js";
-import { setShaderSourceVerification } from "../../src/runtime/shader-source-cache.js";
-import { featureStats, resetFeatureStats } from "../../src/input/a3m-features.js";
+import { memorySnapshot } from "../../webgpu/runtime/device-memory.js";
+import { noteResidencyRefused, setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
+import { DEFAULT_TUNING, setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
+import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { AlphaFoldMonomerGpu } from "../../webgpu/af2/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../../webgpu/af2/multimer/model.js";
+import { setShaderSourceVerification } from "../../webgpu/runtime/shader-source-cache.js";
+import { featureStats, resetFeatureStats } from "../../shared/input/a3m-features.js";
 import { chainResidues, identityMap, templateSlotAtom37 }
-  from "../../src/af3/featurise/template-input.js";
+  from "../../shared/af3/featurise/template-input.js";
 import { superpose } from "./superpose.js";
-import { DeltaTensorStore } from "../../src/bundles/delta-tensor-store.js";
-import { MODEL_BUNDLES, graphFamily } from "../../src/bundles/manifests/index.js";
+import { DeltaTensorStore } from "../../shared/bundles/delta-tensor-store.js";
+import { MODEL_BUNDLES, graphFamily } from "../../shared/bundles/manifests/index.js";
 
 /**
  * One `--name=value` argument, or a bare `--name` as the empty string.
@@ -253,7 +253,7 @@ export async function main(device, args) {
   // ...the LOCAL bundle, by directory rather than through web/model.js's
   // loadModel: that resolves the monomer family to its remote base, and this
   // machine should not pull 227 MB to run a regression.
-  const { loadManifest } = await import("../../src/bundles/manifests/index.js");
+  const { loadManifest } = await import("../../shared/bundles/manifests/index.js");
   // 🔴 `--bundle=<directory>` READS THE manifest.json BESIDE THE SHARDS, which
   // is the ONLY way to fold a bundle the registry does not name - and AlphaFold
   // 2 ships five models where this repository has published one. It is the
@@ -267,7 +267,7 @@ export async function main(device, args) {
     : await HttpTensorStore.open(`${bundleDirectory}/manifest.json`);
   // 🔴 A DELTA BUNDLE IS HALF A MODEL AND SAYS SO. Its manifest carries a
   // `delta` header naming the family it is added to, so this opens that base as
-  // well - see src/bundles/delta-tensor-store.js. `--base=` overrides the
+  // well - see shared/bundles/delta-tensor-store.js. `--base=` overrides the
   // directory for a base that is not the registry's.
   if (store.manifest.delta !== undefined) {
     const header = store.manifest.delta;
@@ -597,7 +597,7 @@ export async function main(device, args) {
       .map(([key, value]) => [key, key === "calls" ? value : Math.round(value)])),
     packBy: Object.fromEntries(Object.entries(globalThis.__pk ?? {}).map(([k,v]) => [k, Math.round(v)]).sort((a,b)=>b[1]-a[1])),
     // What the fold left on the device, and in what - the totals alone cannot
-    // say which tensor to attack. See src/runtime/device-memory.js.
+    // say which tensor to attack. See webgpu/runtime/device-memory.js.
     deviceMemory: trimMemory(memorySnapshot(device)),
     meanPlddt: round(final.confidence.meanPlddt, 3),
     ptm: round(final.confidence.ptm, 4),

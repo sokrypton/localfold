@@ -13,9 +13,9 @@
 // machine drifts by up to 3.2x between runs and a two-minute sweep drifts
 // across its own shapes - see CLAUDE.md - so a sweep that runs all of one arm
 // and then all of the other is measuring the drift.
-import { Esmfold2TrunkGpu, PAIR_CHANNELS } from "../../src/esmfold2/trunk-webgpu.js";
+import { Esmfold2TrunkGpu, PAIR_CHANNELS } from "../../webgpu/esmfold2/trunk-webgpu.js";
 import { profileDevice } from "./profile.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

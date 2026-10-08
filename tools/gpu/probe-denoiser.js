@@ -55,17 +55,17 @@
  * which zeros satisfies perfectly, and the network predicts from the trunk
  * instead. That single call is the structure module; the loop is not.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
 import { buildTargetFeat, backboneGeometry, toPdb, normalFrom, DIALECT }
-  from "../../src/af3/fold.js";
-import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
-import { Af3DiffusionHeadGpu, scalings } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
-import { noiseLevels } from "../../src/af3/diffusion/diffusion-sampler-reference.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
+  from "../../webgpu/af3/fold.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { Af3DiffusionHeadGpu, scalings } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
+import { noiseLevels } from "../../cpu/af3/diffusion/diffusion-sampler-reference.js";
+import { openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
-import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
+import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;

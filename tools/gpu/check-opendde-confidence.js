@@ -18,12 +18,12 @@
  * ten seconds a fold behind a residual of NaN.
  */
 import { confidencePairInit, hostAtomReadouts, hostPairReadouts }
-  from "../../src/af3/confidence/opendde-confidence.js";
+  from "../../webgpu/af3/confidence/opendde-confidence.js";
 import { openddeAtomReadouts, openddePairInit, openddePairReadouts }
-  from "../../src/af3/confidence/opendde-confidence-webgpu.js";
-import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
-import { linear } from "../../src/af3/trunk/pairformer-reference.js";
-import { openAf3Store, openddeConfidenceWeights } from "../../src/af3/weights/weights.js";
+  from "../../webgpu/af3/confidence/opendde-confidence-webgpu.js";
+import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
+import { linear } from "../../cpu/af3/trunk/pairformer-reference.js";
+import { openAf3Store, openddeConfidenceWeights } from "../../shared/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

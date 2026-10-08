@@ -946,7 +946,7 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
 // rf3's chirality signal: per atom, d/dx of sum over its centres of (improper dihedral - ideal)^2,
 // a central difference in double over each of the atom's (centre, corner) entries - an inverted
 // index built once, so each atom sums its own terms (deterministic, no atomics). Transcribed from
-// src/af3/diffusion/chiral-gradient.js.
+// shared/af3/diffusion/chiral-gradient.js.
 __device__ double improperDihedral(const double* a, const double* b, const double* c, const double* d) {
   const double eps = 1e-6;
   double b0[3], b1[3], b2[3];

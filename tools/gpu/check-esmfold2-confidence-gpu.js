@@ -7,7 +7,7 @@
  *
  * 🔴 IT IS DIFFERENTIAL AGAINST A REFERENCE THAT IS ITSELF ORACLE-GATED, which
  * is the layering check-opendde-confidence.js uses: `check-esmfold2-confidence.js`
- * holds `src/esmfold2/confidence-reference.js` to Synthyra's own module at
+ * holds `cpu/esmfold2/confidence-reference.js` to Synthyra's own module at
  * 2.4e-7 to 8.7e-7, and this holds the device to that reference. A device
  * checker written straight against the dump would fold two questions - is the
  * arithmetic right, and does the GPU compute the arithmetic - into one number.
@@ -17,13 +17,13 @@
  * the pair handed to them and the readouts taken off their answer. The blocks
  * are in the comparison because a wrong pair going in is invisible otherwise.
  */
-import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
-import { Esmfold2TrunkGpu } from "../../src/esmfold2/trunk-webgpu.js";
-import { esmfold2Confidence } from "../../src/esmfold2/confidence-reference.js";
+import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
+import { Esmfold2TrunkGpu } from "../../webgpu/esmfold2/trunk-webgpu.js";
+import { esmfold2Confidence } from "../../cpu/esmfold2/confidence-reference.js";
 import { esmfold2ConfidencePairInit, esmfold2ConfidenceReadouts }
-  from "../../src/esmfold2/confidence-webgpu.js";
-import { layerNorm, linear } from "../../src/af3/trunk/pairformer-reference.js";
+  from "../../webgpu/esmfold2/confidence-webgpu.js";
+import { layerNorm, linear } from "../../cpu/af3/trunk/pairformer-reference.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

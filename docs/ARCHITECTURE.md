@@ -85,7 +85,7 @@ some of them optional". Each had its own `has*` predicate
 `hasBondTypes` in the embedder) that must ask the SOURCES map rather than the
 value — a rule that was a comment in five places rather than one function.
 ✅ **THAT HALF IS CLOSED**: `carriesTensor(weights, name)` in
-`src/weights/weight-sources.js`, beside the symbol it asks. Its gate counts
+`shared/weights/weight-sources.js`, beside the symbol it asks. Its gate counts
 DECODES through a getter and asserts zero, so the 7x bug - a presence test that
 unpacked a 768x1536 int5 tensor per block per sampler step - cannot come back
 silently. The ORDER lists themselves are still three copies.
@@ -97,7 +97,7 @@ was: walk a list, reserve an offset, sum a length, then walk it again and copy.
 Two of them had the optional-tensor bug; the others did not have optional
 tensors YET, which is not a property to rely on.
 
-All six now call `packNamedWeights` in `src/weights/weight-pack.js`, and the fix
+All six now call `packNamedWeights` in `shared/weights/weight-pack.js`, and the fix
 is structural rather than careful: **there is one `packing` array, it is a local
 variable, and both loops read it** - a caller cannot pass two lists because the
 signature does not have two. 🔴 **THE HELPER WAS NOT INVENTED**: the triangle
@@ -378,7 +378,7 @@ for a four-times-wider pair. No knob is currently wrong at a non-AF3 shape.
 
 ## The token transformer's shape comes off the bundle now
 
-`src/af3/weights/diffusion-weights.js` handed the token transformer
+`shared/af3/weights/diffusion-weights.js` handed the token transformer
 `channels: 768, heads: 16, dimension: 48, transitionFactor: 2,
 blocksPerSuperBlock: 4` as typed-in numbers. The comment two lines above them
 already records this literal being wrong twice for exactly that reason -
@@ -525,7 +525,7 @@ module filed under the wrong heading:
 
 Both of the first two are **leaves** - no relative imports of their own - so
 moving them could not create a new edge, and both cycles closed:
-`src/weights/dtype.js` and `src/heads/superpose-pdb.js`.
+`shared/weights/dtype.js` and `shared/heads/superpose-pdb.js`.
 
 🔴 **AND "reference" MEANS ONE THING NOW.** `src/reference/` held no CPU
 reference at all - it is `bundle.js`, `http-tensor-store.js`, `manifest.js`,
@@ -547,7 +547,7 @@ Closing it needed an **extraction, not a move**, and only ONE of the two
 directions had to go: `template-input.js` genuinely depends on af3's conformers
 and alphabet, so AF2 borrowing AF3's template featuriser stays and is honest.
 What left is the other way round - the seven symbols AF3 took out of AF2's
-attention kernel, now in **`src/kernels/attention-geometry.js`**:
+attention kernel, now in **`webgpu/kernels/attention-geometry.js`**:
 `ATTENTION_MATRIX_SUBGROUP_SIZE`, `ATTENTION_MATRIX_UNIT`,
 `attentionMatrixGeometry`, `paddedHead`, `strides`,
 `attentionMatrixStorageBytes` and `supportsAttentionMatrix`.
@@ -599,12 +599,12 @@ make the tree lie. The flat top level stays.
 
 ## Two tails: an editor's snapshots, and one more file in the wrong directory
 
-**`src/af3/feature-convergence.js` was AlphaFold 3's, filed under AlphaFold
+**`shared/af3/feature-convergence.js` was AlphaFold 3's, filed under AlphaFold
 2's graph.** 180 lines, a leaf, imported by `af3/fold.js` and by nothing else in
-`src/`. It is `src/af3/feature-convergence.js` now. Its neighbour
+`src/`. It is `shared/af3/feature-convergence.js` now. Its neighbour
 `recycle-convergence.js` stays where it is and that is not an oversight: it is
 imported by `model/monomer.js`, `model/query-only.js`, `multimer/model.js`,
-`af3/fold.js` and `src/index.js`, so it is genuinely shared and `src/model/` is
+`af3/fold.js` and `webgpu/index.js`, so it is genuinely shared and `src/model/` is
 as good a home as any.
 
 🔴 **AND `src/testing/` STAYS A ONE-FILE DIRECTORY, DELIBERATELY.** I listed it
@@ -760,7 +760,7 @@ still resolving `attention:flash-matrix-32-f32f32f32-4x32`, af3 6MRR
 
 🔴 **AND THE COMMENT-PATH GATE EARNED ITS KEEP AGAIN.** The rewriter fixed
 import specifiers and directory-shaped prose and missed two FULL FILE paths -
-`src/kernels/matrix-linear.js` and `src/kernels/attention-geometry.js` - named
+`webgpu/kernels/matrix-linear.js` and `webgpu/kernels/attention-geometry.js` - named
 in 22 comments across 13 files. `test/imports-resolve.test.js` failed on all of
 them by name. That gate was written this session after the af3 move left 129 of
 exactly this behind.
@@ -785,7 +785,7 @@ symptom would have been a published bundle the page could not find.
 index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text(...)
 ```
 
-There is no `src/bundles/manifests/index.js` literal anywhere in that line.
+There is no `shared/bundles/manifests/index.js` literal anywhere in that line.
 Five files did this - `build_site.py` (three times), `check_remote_bundle.py`,
 `export-js-weights.py`, `export_multimer_model.py`,
 `dump_reference_conformers.py` - and the new non-JS rule found none of them.
@@ -808,7 +808,7 @@ comment-path rule read python it has no exclusions for. py2Dmol's own tree
 because those are a different checkout's paths named here on purpose.
 
 Verified: `build_site.py` writes **dist/ 230 files, 23.1 MiB**, and
-`write_manifest_module.py af3` writes `src/bundles/manifests/af3.js`.
+`write_manifest_module.py af3` writes `shared/bundles/manifests/af3.js`.
 
 **The standing lesson.** Every rule added this session has been one file type
 behind the last mistake: imports, then comments, then python and yaml. The
@@ -874,7 +874,7 @@ CLAUDE.md's tool table is the index. **A doc naming a module that moved is worse
 than code doing it: code fails, a doc just misleads.**
 
 One of the 41 is the example worth keeping in mind.
-`src/kernels/attention-webgl2.js` and `src/kernels/triangle/webgl2.js` are 701
+`webgpu/kernels/attention-webgl2.js` and `webgpu/kernels/triangle/webgl2.js` are 701
 lines that **nothing imports**, and a scan for dead code finds them
 immediately. They are not dead: docs/DEVELOPING.md says they "exist for
 comparison, not as a fallback anything selects", with the measurement that
@@ -1088,7 +1088,7 @@ Three files were genuinely dead and are gone: `tools/serve-nocache.py`
 weight shards too, which is the 346 MiB re-download `serve.py` exists to avoid),
 `tools/gpu/_tune.js` (eight lines, superseded by `probe-tuning.js`), and
 `tools/gpu/gemm-matrix-staged.js` (a re-export shim left behind when the staged
-GEMM moved into `src/kernels/matrix-linear.js`; its three importers now name the
+GEMM moved into `webgpu/kernels/matrix-linear.js`; its three importers now name the
 real module).
 
 ### Which recorded numbers actually reproduced

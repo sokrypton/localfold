@@ -10,28 +10,28 @@
  * cloud at the wrong scale, and RMSD alone would not say which. The sequence
  * and the geometry come from the SAME deposition so they cannot disagree.
  */
-import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
+import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
 import { superpose, modelAlphaCarbons } from "./superpose.js";
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
 import { loadTrunkOracle, trunkOracleComparer } from "./trunk-oracle.js";
 import { batchFromDump } from "./fold.js";
 import { buildTemplate } from "../../web/template-source.js";
 import { foldBatch, toPdb, backboneGeometry, warmTrunkPipelines }
-  from "../../src/af3/fold.js";
-import { structuralLayout } from "../../src/af3/featurise/structural-tokens.js";
-import { STRUCTURAL_REFINER } from "../../src/af3/weights/weights.js";
+  from "../../webgpu/af3/fold.js";
+import { structuralLayout } from "../../shared/af3/featurise/structural-tokens.js";
+import { STRUCTURAL_REFINER } from "../../shared/af3/weights/weights.js";
 import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
-import { memorySnapshot } from "../../src/runtime/device-memory.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { memorySnapshot } from "../../webgpu/runtime/device-memory.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 import { profileDevice } from "./profile.js";
 import { profileBuffers } from "./buffer-profile.js";
-import { setMemoryBudget } from "../../src/runtime/device-memory.js";
+import { setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
 import {
   confidenceWeights, openAf3Store, openddeConfidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, trunkWeights,
-} from "../../src/af3/weights/weights.js";
+} from "../../shared/af3/weights/weights.js";
 import { atomReference, diffusionWeights, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -344,8 +344,8 @@ export async function main(device, args) {
     residentWeights: args.includes("--no-resident") ? false
       : args.includes("--resident") ? true : undefined,
     steps, recycles, seed: Number(option(args, "seed", "20260831")),
-    // OpenDDE runs src/af3/fold.js, so it inherits the trunk-only convergence
-    // criterion; 0 is off. See src/af3/feature-convergence.js.
+    // OpenDDE runs webgpu/af3/fold.js, so it inherits the trunk-only convergence
+    // criterion; 0 is off. See shared/af3/feature-convergence.js.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     mode: option(args, "mode", "diffusion"),
     // `--schedule=sigmaMax=40+rho=7` overrides the sampler's EDM schedule.

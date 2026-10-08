@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
  * EVERY SHIPPING MODULE PARSES.
  *
  * 🔴 THIS EXISTS BECAUSE A BROKEN MODULE WAS COMMITTED AND PUSHED. A comment in
- * src/kernels/triangle/shaders.js said `var<workgroup>` with backticks around it, and
+ * webgpu/kernels/triangle/shaders.js said `var<workgroup>` with backticks around it, and
  * the comment lives inside a JS template literal holding WGSL - so the
  * backticks closed the literal and the file stopped parsing. The whole suite
  * stayed green, because no test outside the GPU ones imports that file: the
@@ -20,7 +20,7 @@ import { pathToFileURL } from "node:url";
  * only that the file is loadable, which is the property that was missing.
  */
 const ROOT = resolve(import.meta.dirname, "..");
-const SOURCE = join(ROOT, "src");
+const SOURCES = ["shared", "cpu", "webgpu"].map((tree) => join(ROOT, tree));
 
 function javascriptFiles(directory) {
   const found = [];
@@ -40,9 +40,9 @@ function javascriptFiles(directory) {
   return found.sort();
 }
 
-const modules = javascriptFiles(SOURCE).map((path) => relative(ROOT, path));
+const modules = SOURCES.flatMap(javascriptFiles).map((path) => relative(ROOT, path));
 
-describe("every module under src/ loads", () => {
+describe("every module under shared/, cpu/ and webgpu/ loads", () => {
   it("finds modules to check at all, so an empty sweep cannot pass", () => {
     expect(modules.length > 20).toBe(true);
   });

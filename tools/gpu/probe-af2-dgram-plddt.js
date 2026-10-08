@@ -14,7 +14,7 @@
  * 🔴 THE DISTOGRAM COMES FROM THE HEAD THIS REPO ONLY JUST CONVERTED. AF2 has
  * always had one - it is what the contact map in every AlphaFold figure is
  * drawn from - and neither published bundle carried it until
- * tools/add_distogram_head.py added it. src/heads/distogram.js is the head;
+ * tools/add_distogram_head.py added it. shared/heads/distogram.js is the head;
  * one projection of the pair representation to 64 bins over 2-22 A,
  * symmetrised.
  *
@@ -27,10 +27,10 @@
  * context. Everything a feature might be built from later, rather than the
  * values of features chosen now.
  */
-import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
-import { distogramLogits } from "../../src/heads/distogram.js";
+import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { AlphaFoldMonomerGpu } from "../../webgpu/af2/model/monomer.js";
+import { distogramLogits } from "../../shared/heads/distogram.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -147,7 +147,7 @@ export async function main(device, args) {
 
   // ...the LOCAL bundle by directory, as tools/gpu/fold-af2.js does: loadModel
   // would resolve the monomer family to its remote and pull 227 MB.
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
+  const { MODEL_BUNDLES, loadManifest } = await import("../../shared/bundles/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
     MODEL_BUNDLES.monomer.directory, await loadManifest("monomer"));
   const fixture = AlphaFoldFixture.fromStore(store);

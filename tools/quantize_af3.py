@@ -85,7 +85,7 @@ def pack(codes, bits=BITS):
 
     One trailing byte of slack, so a reader may always take two bytes for a
     code that ends on the final one without walking off the buffer - which is
-    why the width is capped at nine in src/weights/dtype.js.
+    why the width is capped at nine in shared/weights/dtype.js.
 
     🔴 THE GROUP MUST PACK INTO WHOLE BYTES. 32 codes of 5 bits is exactly 20,
     of 3 bits exactly 12, of 6 bits exactly 24 - but 32 of 7 is 28 exactly too,
@@ -296,7 +296,7 @@ def main():
         "scaleDtype": "float16", "zeroDtype": "float16",
     }
     # 🔴 AND THE BUNDLE BLOCK IS REFRESHED, BECAUSE `bundle.bytes` IS THE SHARD
-    # CACHE'S KEY. `cacheToken` in src/bundles/http-tensor-store.js is
+    # CACHE'S KEY. `cacheToken` in shared/bundles/http-tensor-store.js is
     # `model-bytes-tensorCount`, and a manifest that carries the SOURCE's byte
     # count - or none at all, which falls back to 0 - gives two different
     # exports of one model the same token: a fresh manifest against a cached

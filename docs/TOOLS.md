@@ -54,30 +54,30 @@ Each exports `async function main(device, args)` and is run as
 - **`bond-geometry.js`** - Are a predicted structure's BONDS the right length - mainchain, sidechain, peptide and ligand, scored separately?
 - **`buffer-profile.js`** - Where a fold's time goes when it is NOT in a compute pass.
 - **`chain-geometry.js`** - The chain-geometry gate for the COMMAND-LINE tools.
-- **`check-af3-atom-decoder.js`** - AF3's atom decoder: GPU against src/af3/diffusion/diffusion-reference.js.
-- **`check-af3-atom-encoder.js`** - AF3's atom cross-attention encoder: GPU against src/af3/diffusion/atom-encoder-reference.js.
+- **`check-af3-atom-decoder.js`** - AF3's atom decoder: GPU against cpu/af3/diffusion/diffusion-reference.js.
+- **`check-af3-atom-encoder.js`** - AF3's atom cross-attention encoder: GPU against cpu/af3/diffusion/atom-encoder-reference.js.
 - **`check-af3-block-any.js`** - A pairformer block on the GPU against its CPU reference, for ANY bundle.
-- **`check-af3-block.js`** - AF3 pairformer blocks on the GPU, against src/af3/trunk/pairformer-reference.js.
+- **`check-af3-block.js`** - AF3 pairformer blocks on the GPU, against cpu/af3/trunk/pairformer-reference.js.
 - **`check-af3-confidence-oracle.js`** - The confidence head against af3-any-model's own, on ITS inputs.
-- **`check-af3-confidence.js`** - AF3's confidence head: GPU against src/af3/confidence/confidence-reference.js.
+- **`check-af3-confidence.js`** - AF3's confidence head: GPU against cpu/af3/confidence/confidence-reference.js.
 - **`check-af3-denoise.js`** - L3: one whole denoise step, against af3-any-model's own DiffusionModule.
-- **`check-af3-diffusion-conditioning.js`** - AF3's diffusion conditioning: GPU against src/af3/diffusion/diffusion-reference.js.
-- **`check-af3-diffusion-head.js`** - AF3's diffusion head, whole: GPU against src/af3/diffusion/diffusion-reference.js.
-- **`check-af3-diffusion-transformer.js`** - AF3's diffusion token transformer: GPU against src/af3/diffusion/diffusion-reference.js.
+- **`check-af3-diffusion-conditioning.js`** - AF3's diffusion conditioning: GPU against cpu/af3/diffusion/diffusion-reference.js.
+- **`check-af3-diffusion-head.js`** - AF3's diffusion head, whole: GPU against cpu/af3/diffusion/diffusion-reference.js.
+- **`check-af3-diffusion-transformer.js`** - AF3's diffusion token transformer: GPU against cpu/af3/diffusion/diffusion-reference.js.
 - **`check-af3-embedder-terms.js`** - AlphaFold 3's z_init, TERM BY TERM, against af3-any-model.
-- **`check-af3-embedder.js`** - AF3's embedder: GPU against src/af3/trunk/embedder-reference.js.
-- **`check-af3-grid-attention.js`** - AF3 triangle (grid) self-attention: GPU against src/af3/trunk/pairformer-reference.js.
-- **`check-af3-msa-attention.js`** - AF3's MSA attention: GPU against src/af3/trunk/msa-reference.js.
-- **`check-af3-msa-block.js`** - AF3's MSA blocks on the GPU, against src/af3/trunk/msa-reference.js.
-- **`check-af3-opm.js`** - AF3's outer product mean: GPU against src/af3/trunk/msa-reference.js.
+- **`check-af3-embedder.js`** - AF3's embedder: GPU against cpu/af3/trunk/embedder-reference.js.
+- **`check-af3-grid-attention.js`** - AF3 triangle (grid) self-attention: GPU against cpu/af3/trunk/pairformer-reference.js.
+- **`check-af3-msa-attention.js`** - AF3's MSA attention: GPU against cpu/af3/trunk/msa-reference.js.
+- **`check-af3-msa-block.js`** - AF3's MSA blocks on the GPU, against cpu/af3/trunk/msa-reference.js.
+- **`check-af3-opm.js`** - AF3's outer product mean: GPU against cpu/af3/trunk/msa-reference.js.
 - **`check-af3-sampler-gpu.js`** - AF3's diffusion sampler on the GPU: does it actually fold anything?
-- **`check-af3-single-attention.js`** - AF3 single-track attention: GPU against src/af3/trunk/pairformer-reference.js.
+- **`check-af3-single-attention.js`** - AF3 single-track attention: GPU against cpu/af3/trunk/pairformer-reference.js.
 - **`check-af3-target-feat-gpu.js`** - target_feat's atom encoder on the GPU, against the CPU reference.
 - **`check-af3-template-fused.js`** - The FUSED template embedder against af3-any-model's own, on protenix2.
-- **`check-af3-template.js`** - AF3's template embedder (empty-template path): GPU against src/af3/trunk/template-reference.js.
-- **`check-af3-transition.js`** - AF3's transition block: GPU against src/af3/trunk/pairformer-reference.js.
-- **`check-af3-triangle.js`** - AF3 triangle multiplication: GPU against src/af3/trunk/pairformer-reference.js.
-- **`check-af3-trunk.js`** - AF3's whole trunk on the GPU, against src/af3/trunk/trunk-reference.js.
+- **`check-af3-template.js`** - AF3's template embedder (empty-template path): GPU against cpu/af3/trunk/template-reference.js.
+- **`check-af3-transition.js`** - AF3's transition block: GPU against cpu/af3/trunk/pairformer-reference.js.
+- **`check-af3-triangle.js`** - AF3 triangle multiplication: GPU against cpu/af3/trunk/pairformer-reference.js.
+- **`check-af3-trunk.js`** - AF3's whole trunk on the GPU, against cpu/af3/trunk/trunk-reference.js.
 - **`check-attention-packing.js`** - What does packing the attention KEY cost, and what does packing the VALUE?
 - **`check-attention-project-matrix.js`** - Does AF2's matrix q/k/v/gate projection compute the vector one's answer?
 - **`check-attention-variants.js`** - Every flash-attention variant against the same input, on this device.
@@ -88,12 +88,12 @@ Each exports `async function main(device, args)` and is run as
 - **`check-difftx-batched.js`** - Does the batched path compute the same thing S times?
 - **`check-difftx-samples.js`** - Does the sample dimension leave the one-sample path alone?
 - **`check-difftx-splits.js`** - Does every K-split of the diffusion transformer compute the unsplit answer?
-- **`check-esmc-block.js`** - Does src/esmc/block-webgpu.js compute an ESM-C block?
-- **`check-esmc-tower.js`** - Does src/esmc/tower-webgpu.js compute ESM-C's 36 blocks and ESMFold2's mix?
+- **`check-esmc-block.js`** - Does webgpu/esmc/block-webgpu.js compute an ESM-C block?
+- **`check-esmc-tower.js`** - Does webgpu/esmc/tower-webgpu.js compute ESM-C's 36 blocks and ESMFold2's mix?
 - **`check-esmfold2-atom-stack.js`** - Does the sliding-window atom transformer compute what its reference does?
 - **`check-esmfold2-confidence-gpu.js`** - ESMFold2's confidence head on the device, against the host reference.
-- **`check-esmfold2-diffusion-gpu.js`** - Does src/esmfold2/diffusion-webgpu.js compute ESMFold2's whole denoise step?
-- **`check-esmfold2-trunk-gpu.js`** - Does src/esmfold2/trunk-webgpu.js compute ESMFold2's folding trunk?
+- **`check-esmfold2-diffusion-gpu.js`** - Does webgpu/esmfold2/diffusion-webgpu.js compute ESMFold2's whole denoise step?
+- **`check-esmfold2-trunk-gpu.js`** - Does webgpu/esmfold2/trunk-webgpu.js compute ESMFold2's folding trunk?
 - **`check-esmfold2-trunk-pack.js`** - Does the ESMFold2 trunk's DEVICE-decoded pair track compute the host one's answer?
 - **`check-evoformer-attention.js`** - AF2's evoformer attention on the GPU against a CPU reference.
 - **`check-evoformer-opm.js`** - AF2's outer product mean on the GPU against a CPU reference.
@@ -316,7 +316,7 @@ go through CDP, and the deploy.
 - **`check-batch-fields.js`** - OUR WHOLE FEATURISED BATCH against af3-any-model's own, field by field, for every dumped model.
 - **`check-bundle-vs-params.py`** - Is this bundle the weights af3-any-model loads, tensor by tensor?
 - **`check-colab-bridge.py`** - Two-way between the reader's page and the runtime that folds for it.
-- **`check-esmc-reference.js`** - Does src/esmc/tower-reference.js compute ESM-C?
+- **`check-esmc-reference.js`** - Does cpu/esmc/tower-reference.js compute ESM-C?
 - **`check-esmfold2-confidence.js`** - ESMFold2's confidence head against Synthyra's own, on the host.
 - **`check-esmfold2-diffusion.js`** - ESMFold2's diffusion module, module by module, against its own recorded calls.
 - **`check-esmfold2-featurise.js`** - Does LocalFold's featuriser produce the features ESMFold2 was handed?

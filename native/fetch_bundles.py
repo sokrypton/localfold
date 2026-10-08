@@ -11,7 +11,7 @@ which native/af3 reads as published (common.cuh's blob reader). AlphaFold 3's ow
 academic, non-commercial use under Google DeepMind's AF3 terms, and fetched only once those terms are accepted:
 LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3, or a yes at the prompt.
 
-Each name is a family key of src/bundles/manifests/index.js; its bundle (manifest.json and every shard
+Each name is a family key of shared/bundles/manifests/index.js; its bundle (manifest.json and every shard
 the manifest names) lands in the family's `directory` under the repository, so the native wrappers find
 it where they look (model-af3-int5/, model-esmfold2-int5/, ...). --suffix appends to that directory
 name, for keeping a fetched copy beside a local export. A file already present at its size is kept.
@@ -135,13 +135,13 @@ def main():
     repo = opts.get("into", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if "--af3-any-model" in sys.argv[1:]:
         return fetch_blobs(args, repo)
-    known = families(os.path.join(repo, "src", "bundles", "manifests", "index.js"))
+    known = families(os.path.join(repo, "shared", "bundles", "manifests", "index.js"))
     if not args:
         print("families:", " ".join(sorted(known)))
         return
     for name in args:
         if name not in known:
-            sys.exit(f"no family {name!r} in src/bundles/manifests/index.js")
+            sys.exit(f"no family {name!r} in shared/bundles/manifests/index.js")
         directory, remote = known[name]
         if not remote:
             sys.exit(f"{name} has no published remote")

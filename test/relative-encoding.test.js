@@ -1,6 +1,6 @@
 import { describe, expect, it } from "./harness.js";
-import { residueIdentity, widenRelativePositionWeight } from "../src/af2/multimer/input-embedder.js";
-import { residueIndexWithChainBreaks } from "../src/input/chains.js";
+import { residueIdentity, widenRelativePositionWeight } from "../webgpu/af2/multimer/input-embedder.js";
+import { residueIndexWithChainBreaks } from "../shared/input/chains.js";
 
 const MAX_RELATIVE = 32;
 const MAX_RELATIVE_CHAIN = 2;

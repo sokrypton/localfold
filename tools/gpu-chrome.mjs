@@ -186,7 +186,7 @@ try {
   // page does not get. A kernel that picks its shape from device.limits - the
   // diffusion transformer picks its token tile that way - would then be
   // measured in one configuration and shipped in another.
-  const { requestAlphaFoldDevice } = await import("/src/runtime/device.js");
+  const { requestAlphaFoldDevice } = await import("/webgpu/runtime/device.js");
   // 🔴 LOCALFOLD_PORTABLE_LIMITS ASKS THIS CARD TO BEHAVE AS THE WEAKEST ONE.
   // See PORTABLE_CEILINGS: this A100 offers 48 KiB of workgroup storage and
   // Metal offers 32, so a kernel that takes a bigger tile compiles here and
@@ -211,7 +211,7 @@ try {
   // 🔴 --no-prior MAKES THIS DEVICE ANSWER AS AN UNRECOGNISED ONE. Two
   // architectures have priors and every other GPU takes DEFAULT_TUNING; this is
   // how a machine that HAS a prior measures what the machines that do not are
-  // getting. See ignoreDevicePrior in src/runtime/device-profile.js.
+  // getting. See ignoreDevicePrior in webgpu/runtime/device-profile.js.
   // --no-prior alone drops every prior knob; --no-prior=a,b keeps those two AT
   // THE PRIOR'S OWN VALUES and drops the rest, which is how a sweep asks what
   // one knob is worth without having to spell an object on a command line.
@@ -225,20 +225,20 @@ try {
   // passes would time that instead. Named with --tune or --tune-json, it wins.
   if (/[/](bench|profile)-[^/]*$/.test(${JSON.stringify(modulePath)})
       && !${JSON.stringify(moduleArgs)}.some((a) => a.includes("runtimeLoopBounds"))) {
-    const { setDeviceTuning } = await import("/src/runtime/device-profile.js");
+    const { setDeviceTuning } = await import("/webgpu/runtime/device-profile.js");
     setDeviceTuning(device, { runtimeLoopBounds: false });
     console.log("[gpu-chrome] runtimeLoopBounds off for a benchmark");
   }
   const priorAs = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--prior="));
   if (priorAs !== undefined) {
-    const { useDevicePrior } = await import("/src/runtime/device-profile.js");
+    const { useDevicePrior } = await import("/webgpu/runtime/device-profile.js");
     useDevicePrior(device, priorAs.slice("--prior=".length));
     console.log("[gpu-chrome] answering with the " + priorAs.slice("--prior=".length) + " prior");
   }
   const priorArg = ${JSON.stringify(moduleArgs)}.find((a) => a === "--no-prior" || a.startsWith("--no-prior="));
   if (priorArg !== undefined) {
     const { ignoreDevicePrior, deviceTuning: deviceTuningOf }
-      = await import("/src/runtime/device-profile.js");
+      = await import("/webgpu/runtime/device-profile.js");
     const keep = priorArg.includes("=")
       ? priorArg.slice("--no-prior=".length).split(",").filter(Boolean) : [];
     ignoreDevicePrior(device, keep);
@@ -253,7 +253,7 @@ try {
     if (deviceTuningOf(device).diffusionSplitK === null
         && !${JSON.stringify(moduleArgs)}.some((a) => a.startsWith("--occupancy="))) {
       const { measureDeviceOccupancy, deviceOccupancyDetail }
-        = await import("/src/runtime/occupancy.js");
+        = await import("/webgpu/runtime/occupancy.js");
       const width = await measureDeviceOccupancy(device);
       console.log("[gpu-chrome] measured saturation: " + width + " workgroups  "
         + JSON.stringify(deviceOccupancyDetail(device)));
@@ -265,7 +265,7 @@ try {
   // other question: an unrecognised device with whatever units it has.
   if (${JSON.stringify(moduleArgs)}.includes("--default-tuning")) {
     const { ignoreDevicePrior, ignoreDeviceCapabilities }
-      = await import("/src/runtime/device-profile.js");
+      = await import("/webgpu/runtime/device-profile.js");
     ignoreDevicePrior(device, []);
     ignoreDeviceCapabilities(device);
     console.log("[gpu-chrome] prior AND capability tuning ignored");
@@ -275,7 +275,7 @@ try {
   // can only measure its own; this is how it asks what a narrower one gets.
   const occupancyArg = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--occupancy="));
   if (occupancyArg !== undefined) {
-    const { setDeviceOccupancy } = await import("/src/runtime/occupancy.js");
+    const { setDeviceOccupancy } = await import("/webgpu/runtime/occupancy.js");
     setDeviceOccupancy(device, Number(occupancyArg.slice("--occupancy=".length)));
     console.log("[gpu-chrome] answering as a device of "
       + occupancyArg.slice("--occupancy=".length) + " workgroups");
@@ -290,14 +290,14 @@ try {
   //     --tune-json={"matrixLinear":false}
   const tuneJson = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--tune-json="));
   if (tuneJson !== undefined) {
-    const { setDeviceTuning } = await import("/src/runtime/device-profile.js");
+    const { setDeviceTuning } = await import("/webgpu/runtime/device-profile.js");
     const patch = JSON.parse(tuneJson.slice("--tune-json=".length));
     setDeviceTuning(device, patch);
     console.log("[gpu-chrome] tuning patched with " + JSON.stringify(patch));
   }
   const f16Arg = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--f16="));
   if (f16Arg !== undefined) {
-    const { setHalfPrecision } = await import("/src/runtime/device-profile.js");
+    const { setHalfPrecision } = await import("/webgpu/runtime/device-profile.js");
     const wanted = f16Arg.slice("--f16=".length);
     if (wanted !== "on" && wanted !== "off") throw new Error("--f16 takes on or off, not " + wanted);
     setHalfPrecision(device, wanted === "on");

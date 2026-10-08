@@ -17,11 +17,11 @@
  * is not the sum of its awaits - several can be in flight - but the span from
  * the first request to the last settle, which is what `pipelineSpanMs` is.
  */
-import { blockUploadStats } from "../../src/weights/quantised-upload.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
-import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
-import { AlphaFoldUnifiedGpu } from "../../src/af2/multimer/model.js";
+import { blockUploadStats } from "../../webgpu/weights/quantised-upload.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
+import { AlphaFoldMonomerGpu } from "../../webgpu/af2/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../../webgpu/af2/multimer/model.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -98,7 +98,7 @@ export async function main(device, args) {
   const sequence = Array.from({ length },
     (_, i) => ALPHABET[i % ALPHABET.length]).join("");
 
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
+  const { MODEL_BUNDLES, loadManifest } = await import("../../shared/bundles/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
     MODEL_BUNDLES[family].directory, await loadManifest(family));
   const fixture = AlphaFoldFixture.fromStore(store);

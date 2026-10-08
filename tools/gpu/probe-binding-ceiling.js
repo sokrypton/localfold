@@ -43,8 +43,8 @@
  * repository is public and unlicensed, so this was written here rather than
  * taken.
  */
-import { WebGpuExecution } from "../../src/runtime/execution.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { WebGpuExecution } from "../../webgpu/runtime/execution.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 /**
  * The largest BINDING each labelled compute pass makes, watched at the WebGPU

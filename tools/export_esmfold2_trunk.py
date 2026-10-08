@@ -343,7 +343,7 @@ def main():
 
     # 🔴 THE INPUTS EMBEDDER, WHICH IS NOT AF3'S ATOM ENCODER. Sliding-window
     # self-attention over atoms with a 3D rotary embedding built from the
-    # reference conformer - see src/af3/diffusion/atom-encoder-reference.js. Reusing
+    # reference conformer - see cpu/af3/diffusion/atom-encoder-reference.js. Reusing
     # AF3's windowed pair-biased encoder would have been the obvious wrong move;
     # nothing in the shapes says they differ.
     atom = 'inputs_embedder.atom_attention_encoder'
@@ -407,7 +407,7 @@ def main():
         # predicted rep-atom distance falls in. Transposing it - which is what
         # every other matrix here wants - would silently make it a matmul
         # against the wrong axis, and `boundaries` beside it is the 127 edges
-        # of linspace(2, 52), the same grid src/esmfold2/distogram-webgpu.js
+        # of linspace(2, 52), the same grid webgpu/esmfold2/distogram-webgpu.js
         # already borrowed from this head while the head was absent.
         writer.add('confidence/distanceEmbedding', vector('dist_bin_pairwise_embed.weight')
                    if head['dist_bin_pairwise_embed.weight'].ndim == 1 else

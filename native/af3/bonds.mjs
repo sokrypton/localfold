@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
 const { bondGeometry, bondReport } = await import(`${repo}/tools/gpu/bond-geometry.js`);
-const { ccdUrl, parseCcdComponent } = await import(`${repo}/src/af3/featurise/ccd-component.js`);
+const { ccdUrl, parseCcdComponent } = await import(`${repo}/shared/af3/featurise/ccd-component.js`);
 const [pdbPath, codes = ""] = process.argv.slice(2);
 const conformers = JSON.parse(readFileSync(`${repo}/tools/oracle/reference-conformers.json`, "utf8"));
 const components = new Map();

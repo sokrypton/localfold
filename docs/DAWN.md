@@ -108,7 +108,7 @@ error, no lost device, nothing reaching JavaScript. Four arms name it:
 Flow aborts too, so it is not the sampler; dropping the matrix path does not
 help, so it is not the matrix kernels. It is `vulkan_enable_f16_on_nvidia`,
 which fits Dawn refusing f16 on NVIDIA by default pending a CTS investigation
-(crbug.com/42251215). **0.4.0 is pinned**, in the notebook and in `src/node.js`.
+(crbug.com/42251215). **0.4.0 is pinned**, in the notebook and in `webgpu/node.js`.
 If a future Dawn does this again, dropping f16 is a working fallback - it costs
 peak memory 590 MiB against 360 and a 7.2 s sampler against 2.8, and it folds.
 
@@ -133,7 +133,7 @@ thread is held, which is why the fold ceiling exists.
   would trade clamping for corruption.
 - **The subgroup-matrix path is not 7x slower.** That reading was 0.6.0's broken
   f16. On 0.4.0, alternated: trunk 1.3 s with it, 1.0 / 0.9 without. And it is
-  not evidence against `src/runtime/device-profile.js`'s `turing` prior either - that was
+  not evidence against `webgpu/runtime/device-profile.js`'s `turing` prior either - that was
   measured at 300 tokens where `grid.attend` is 15.4% of the pairformer, and
   this is a 58-mer. **Do not touch that table on the strength of a 58-mer.**
 - **Four wrong causes for the EF2 failure**, each eliminated by an arm rather

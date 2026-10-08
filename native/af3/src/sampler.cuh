@@ -1,5 +1,5 @@
 // AF3's EDM sampler around the denoiser, and the PDB the fold writes.
-// Transcribed from src/af3/diffusion/diffusion-sampler-reference.js.
+// Transcribed from cpu/af3/diffusion/diffusion-sampler-reference.js.
 #pragma once
 #include <charconv>
 #include "diffusion.cuh"
@@ -90,7 +90,7 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
 }
-// --flow: the page's Flow (src/af3/diffusion/diffusion-sampler-webgpu.js flowOnGpu, step "replace") in
+// --flow: the page's Flow (webgpu/af3/diffusion/diffusion-sampler-webgpu.js flowOnGpu, step "replace") in
 // place of AF3's diffusion - one draw at the top of a schedule that starts at 160 A (sigmaMax 10 sigma_data,
 // AF3's own sigmaMin and rho, whatever the model's dialect), then the state REPLACED by each prediction:
 // no centring, no rotation, no injected noise
@@ -402,7 +402,7 @@ struct FrameStreamer {
 // <stem>_confidences.json and <stem>_summary_confidences.json, as the page's archive writes them
 // (web/fold-archive.js): the per-atom pLDDTs in the PDB's atom order, the distogram's contact
 // probabilities, the PAE; and the scalar scores with their per-chain and per-chain-pair forms, the
-// TM ones reduced from the head's per-pair TM term (src/heads/tm-score.js)
+// TM ones reduced from the head's per-pair TM term (shared/heads/tm-score.js)
 inline void writeConfidences(const std::string& pdbPath, const std::vector<size_t>& order, int n, int dense,
                              const std::vector<float>& plddt, const std::vector<float>& pae,
                              const std::vector<float>& tmTerm, const std::vector<float>& contact,

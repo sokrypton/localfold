@@ -4,12 +4,12 @@ import {
   extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa,
   generateMmseqs2PairedMsa, mergeSearchedChains, planSearchReuse, readTarFiles,
   searchCacheEntry,
-} from "../src/input/mmseqs2-api.js";
-import { foldsAsSingleSequence, parseA3m } from "../src/input/a3m.js";
+} from "../shared/input/mmseqs2-api.js";
+import { foldsAsSingleSequence, parseA3m } from "../shared/input/a3m.js";
 import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES, SINGLE_SEQUENCE_FAMILIES, graphFamily }
-  from "../src/bundles/manifests/index.js";
+  from "../shared/bundles/manifests/index.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
-  from "../src/input/chains.js";
+  from "../shared/input/chains.js";
 
 function tar(files) {
   const chunks= [];

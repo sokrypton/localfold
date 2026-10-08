@@ -14,11 +14,11 @@
 //                                                                      per-block scales were folded away)
 //   p <native name> <length> x <rank> <dims> <dst> <dst strides> <scale> <off> <strides> <proj> <off> <strides>
 //      a per-block pair LayerNorm scale folded into its sibling projection (scale[c] * proj[c, h], one
-//      float32 multiply), per block or packed [C, BLOCKS, HEADS] (src/af3/weights/diffusion-weights.js)
+//      float32 multiply), per block or packed [C, BLOCKS, HEADS] (shared/af3/weights/diffusion-weights.js)
 // with every metadata line (`m ...`) copied as it is. A tensor found nowhere is an error, never a guess:
 // the port's exporter then does arithmetic the map cannot carry.
 import { readFileSync, writeFileSync, openSync, readSync } from "node:fs";
-import { readTensor } from "../src/weights/dtype.js";
+import { readTensor } from "../shared/weights/dtype.js";
 
 const [bundleDir, weightsDir, out] = process.argv.slice(2);
 if (!out) { console.error("usage: make_map.mjs <bundle dir> <exported weights dir> <out .map>"); process.exit(1); }

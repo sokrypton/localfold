@@ -27,16 +27,16 @@
 // was a two-number calibration that did not cross models. This one is different
 // in kind - `exp(-CCE)` is a likelihood in [0, 1] and needs no affine map - but
 // that is a reason to test it, not a reason to assume it.
-import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
-import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
-import { readTensor, readTensorAsFloat16 } from "../../src/weights/dtype.js";
-import { foldEsmfold2 } from "../../src/esmfold2/fold.js";
-import { CONTACT_ANGSTROMS, CONTACT_EDGES } from "../../src/esmfold2/distogram-webgpu.js";
+import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower-webgpu.js";
+import { readTensor, readTensorAsFloat16 } from "../../shared/weights/dtype.js";
+import { foldEsmfold2 } from "../../webgpu/esmfold2/fold.js";
+import { CONTACT_ANGSTROMS, CONTACT_EDGES } from "../../webgpu/esmfold2/distogram-webgpu.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
-} from "../../src/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../../src/esmfold2/language-pair-webgpu.js";
+} from "../../shared/esmfold2/weights.js";
+import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

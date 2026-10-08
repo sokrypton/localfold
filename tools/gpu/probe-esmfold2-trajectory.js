@@ -13,16 +13,16 @@
 // differ by a rigid motion far larger than anything the denoiser did. This
 // reports the frame-to-frame movement before and after superposition, which is
 // what says whether a viewer must fit them.
-import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
-import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
-import { readTensor, readTensorAsFloat16 } from "../../src/weights/dtype.js";
-import { foldEsmfold2 } from "../../src/esmfold2/fold.js";
-import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
+import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower-webgpu.js";
+import { readTensor, readTensorAsFloat16 } from "../../shared/weights/dtype.js";
+import { foldEsmfold2 } from "../../webgpu/esmfold2/fold.js";
+import { weightedRigidAlign } from "../../cpu/esmfold2/sampler-reference.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
-} from "../../src/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../../src/esmfold2/language-pair-webgpu.js";
+} from "../../shared/esmfold2/weights.js";
+import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

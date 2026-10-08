@@ -16,10 +16,10 @@
  * tile the dispatch does not match computes a fraction of the rows and reads as
  * a speedup.
  */
-import { createTriangleShaders } from "../../src/kernels/triangle/shaders.js";
+import { createTriangleShaders } from "../../webgpu/kernels/triangle/shaders.js";
 import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
-import { createStagedMatrixShader, stagedMatrixStorage } from "../../src/kernels/matrix-linear.js";
-import { deviceMatrixConfig, recordAdapter } from "../../src/runtime/device-profile.js";
+import { createStagedMatrixShader, stagedMatrixStorage } from "../../webgpu/kernels/matrix-linear.js";
+import { deviceMatrixConfig, recordAdapter } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

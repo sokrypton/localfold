@@ -1,5 +1,5 @@
 /**
- * AF3's MSA blocks on the GPU, against src/af3/trunk/msa-reference.js.
+ * AF3's MSA blocks on the GPU, against cpu/af3/trunk/msa-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-msa-block.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-msa-block.js --blocks=4
@@ -10,14 +10,14 @@
  * MSA track first and the pair track second, or the reverse, runs and returns
  * both representations.
  */
-import { msaAttention, msaBlock, outerProductMean } from "../../src/af3/trunk/msa-reference.js";
+import { msaAttention, msaBlock, outerProductMean } from "../../cpu/af3/trunk/msa-reference.js";
 import {
   gridSelfAttention, transition, triangleMultiplication,
-} from "../../src/af3/trunk/pairformer-reference.js";
-import { Af3MsaStackGpu } from "../../src/af3/trunk/msa-stack-webgpu.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { af3Dialect } from "../../src/af3/weights/weights.js";
-import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
+} from "../../cpu/af3/trunk/pairformer-reference.js";
+import { Af3MsaStackGpu } from "../../webgpu/af3/trunk/msa-stack-webgpu.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { af3Dialect } from "../../shared/af3/weights/weights.js";
+import { deviceTuning, setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 // 🔴 A DEFAULT, NOT A CONSTANT. This was hardcoded, so on a box that has the
 // int5 bundle and not the f32 one the checker 404s instead of running - and
@@ -27,7 +27,7 @@ import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack";
 // 🔴 THE OUTER PRODUCT'S INPUT IS A DIALECT AND HAS NO DEFAULT. AF3 takes it
-// off the PRE-update MSA and OpenDDE off the updated one, and src/af3/
+// off the PRE-update MSA and OpenDDE off the updated one, and cpu/af3/trunk/
 // msa-reference.js throws rather than guess - which is what this file was
 // doing by omission. AF3's answer here; `--msa-update-before-opm=false` is
 // OpenDDE's, and it is the arm that makes this checker reach that bundle.

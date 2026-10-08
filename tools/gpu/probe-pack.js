@@ -22,21 +22,21 @@
  * reads the trunk, and a trunk pass leaves the host idle - `bench-trunk.js`
  * reports 9.4 ms of encoding against 2948 of waiting - so in principle these
  * 494 ms could be hidden behind it entirely. What stops it is memory, not
- * ordering: `src/af3/fold.js` releases the trunk's ~350 MiB of resident weights
+ * ordering: `webgpu/af3/fold.js` releases the trunk's ~350 MiB of resident weights
  * BEFORE the sampler makes the transformer's 378 MiB resident, precisely so the
  * two never coexist. Packing during the trunk means holding those 378 MiB
  * somewhere - on the host if the upload is deferred, on the device if it is not
  * - and either way it is 378 MiB bought with 494 ms. Measured here so that the
  * trade can be made deliberately rather than discovered.
  */
-import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
-import { diffusionWeights } from "../../src/af3/weights/diffusion-weights.js";
-import { packBlockWeights } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
-import { packTransitionWeights } from "../../src/af3/trunk/transition-webgpu.js";
-import { packWeights as packTriangleWeights } from "../../src/kernels/triangle/weights.js";
-import { af3TriangleWeights } from "../../src/af3/trunk/triangle-webgpu.js";
-import { packGridAttentionWeights } from "../../src/af3/trunk/grid-attention-webgpu.js";
-import { packSingleAttentionWeights } from "../../src/af3/trunk/single-attention-webgpu.js";
+import { openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
+import { diffusionWeights } from "../../shared/af3/weights/diffusion-weights.js";
+import { packBlockWeights } from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
+import { packTransitionWeights } from "../../webgpu/af3/trunk/transition-webgpu.js";
+import { packWeights as packTriangleWeights } from "../../webgpu/kernels/triangle/weights.js";
+import { af3TriangleWeights } from "../../webgpu/af3/trunk/triangle-webgpu.js";
+import { packGridAttentionWeights } from "../../webgpu/af3/trunk/grid-attention-webgpu.js";
+import { packSingleAttentionWeights } from "../../webgpu/af3/trunk/single-attention-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

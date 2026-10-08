@@ -18,7 +18,7 @@
 // UNPROCESSED READS AS A SPEEDUP. Every round's result is compared to the
 // first: a shape whose grid does not cover its rows is faster and wrong, and
 // this repository has been fooled by exactly that.
-import { EsmcBlockGpu } from "../../src/esmc/block-webgpu.js";
+import { EsmcBlockGpu } from "../../webgpu/esmc/block-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

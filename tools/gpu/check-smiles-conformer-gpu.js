@@ -18,14 +18,14 @@
  * makes this differential rather than two independent answers that happen to
  * look alike.
  */
-import { parseSmiles } from "../../src/chem/smiles.js";
-import { chiralCentres } from "../../src/chem/stereo.js";
+import { parseSmiles } from "../../shared/chem/smiles.js";
+import { chiralCentres } from "../../shared/chem/stereo.js";
 import {
   distanceBounds, smoothBounds, embedBounds, refineCoordinates, planarQuadruples,
   signedVolume,
-} from "../../src/chem/conformer.js";
-import { refineOnDevice, MAX_ATOMS } from "../../src/chem/conformer-webgpu.js";
-import { hashOf } from "../../src/chem/component.js";
+} from "../../shared/chem/conformer.js";
+import { refineOnDevice, MAX_ATOMS } from "../../webgpu/chem/conformer-webgpu.js";
+import { hashOf } from "../../shared/chem/component.js";
 
 const CASES = [
   ["glycerol", "OCC(O)CO"],

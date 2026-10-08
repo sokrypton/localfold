@@ -29,15 +29,15 @@
  * across exactly those - a silently short mask would make every relRMS look
  * good by comparing padding with padding.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
 import { structuralBatch, structuralLayout }
-  from "../../src/af3/featurise/structural-tokens.js";
+  from "../../shared/af3/featurise/structural-tokens.js";
 import { expandStructural, structuralAttentionBias, structuralPairFeatures }
-  from "../../src/af3/structure/structural-expander-reference.js";
-import { Af3PairformerStackGpu } from "../../src/af3/trunk/pairformer-block-webgpu.js";
+  from "../../cpu/af3/structure/structural-expander-reference.js";
+import { Af3PairformerStackGpu } from "../../webgpu/af3/trunk/pairformer-block-webgpu.js";
 import {
   af3Dialect, openAf3Store, structuralExpanderWeights, structuralRefinerWeights,
-} from "../../src/af3/weights/weights.js";
+} from "../../shared/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

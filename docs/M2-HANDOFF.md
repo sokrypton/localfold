@@ -83,11 +83,11 @@ Measured on Colab T4s and one L4 (docs/PERF.md, "A Colab T4" and "A Colab L4"):
 Metal clamps an out-of-range write where Vulkan discards it (the 160-residue
 race). New or rewritten kernels on this branch:
 
-- `createAf3OpmVectorOutputShader` (src/af3/trunk/outer-product-mean-webgpu.js):
+- `createAf3OpmVectorOutputShader` (webgpu/af3/trunk/outer-product-mean-webgpu.js):
   rows are guarded; columns and the inner dimension are NOT, and the caller
   refuses shapes that do not divide (`pairChannels % 64`, `C^2 % 16`). Check
   that refusal holds for every bundle you fold.
-- the fused int5/int3 decode (src/weights/quantised-upload.js): one dispatch a
+- the fused int5/int3 decode (webgpu/weights/quantised-upload.js): one dispatch a
   recording, a workgroup per 512 slots, `slot < slots` guarded.
 - the deferred replay rides a wrapped `queue.submit` that re-installs itself if
   replaced (`ae36c4a`) - a second store's second fold read pLDDT 5.3 before
@@ -132,7 +132,7 @@ believed or re-recorded.
 
 Report back in the same shape the earlier rounds did: numbers per arm, same
 box, and which knob should become an Apple-prior entry in
-`src/runtime/device-profile.js` rather than a default change.
+`webgpu/runtime/device-profile.js` rather than a default change.
 
 ## 🔴 THE M2'S REPLY (2026-09-26)
 
@@ -218,7 +218,7 @@ correctly.
 `gridAttendTiled` (AF3's `grid.attend`) and `attentionTiled` (AF2's flash attentions) are the
 register-tiled vector kernels in docs/A100.md's last section - 1.32x to 1.46x on the A100's STOCK
 path, which is the path an M2 always runs (no matrix units at 16x16). They are set in the ampere prior
-only, because src/kernels/attention.js records a kernel on this part that got 4.7x SLOWER when a lane
+only, because webgpu/kernels/attention.js records a kernel on this part that got 4.7x SLOWER when a lane
 held two queries' registers, and this one holds sixteen scores and sixteen accumulators a lane.
 Worth one run each way:
 

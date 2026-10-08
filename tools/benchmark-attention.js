@@ -13,11 +13,11 @@ import { create, globals } from "webgpu";
 import {
   AttentionGpu,
 
-} from "../src/kernels/attention.js";
-import { requestAlphaFoldDevice } from "../src/runtime/device.js";
-import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
-import { FileTensorStore } from "../src/bundles/tensor-store.js";
-import { errorMetrics } from "../src/kernels/triangle/types.js";
+} from "../webgpu/kernels/attention.js";
+import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
+import { AlphaFoldFixture } from "../shared/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../shared/bundles/tensor-store.js";
+import { errorMetrics } from "../webgpu/kernels/triangle/types.js";
 
 const MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
 const VARIANTS = [

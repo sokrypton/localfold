@@ -24,12 +24,12 @@
  * is the LAST recycle's, and pairing it with a different number would be
  * comparing against a pass AF3 never took.
  */
-import { foldBatch, backboneGeometry } from "../../src/af3/fold.js";
+import { foldBatch, backboneGeometry } from "../../webgpu/af3/fold.js";
 import { batchFromDump } from "./fold.js";
 import { sidechainGeometry } from "./sidechain-geometry.js";
-import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
+import { confidenceWeights, openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

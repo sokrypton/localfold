@@ -8,7 +8,7 @@ written beside the weights: position scale 10 against 20, the outer product mean
 stack against before it, and which template embedder runs.
 
 The input is the page's own: `export_input.mjs` calls `makeA3mFeatures`
-(src/input/a3m-features.js), the function the page and `tools/gpu/fold-af2.js` fold with, once per
+(shared/input/a3m-features.js), the function the page and `tools/gpu/fold-af2.js` fold with, once per
 recycle. So a difference against the browser is the network's, never the featuriser's.
 
 ## Run
@@ -23,7 +23,7 @@ native/af2/fold 1brs.pdb --sequence=<A>:<D> --model=model_1_multimer_v3 --search
 ```
 
 `--search` gets the alignment from the ColabFold MMseqs2 server through the page's own client
-(src/input/mmseqs2-api.js). For a complex, each distinct chain is searched, the paired block is
+(shared/input/mmseqs2-api.js). For a complex, each distinct chain is searched, the paired block is
 added for distinct chains, and the merge follows the weights' regime: dense within an entity and
 block-diagonal between entities for the multimer, block-diagonal throughout for a monomer.
 Barnase-barstar from its two sequences folds to **0.584 A, ipTM 0.92**, against 17.4 A without an
@@ -32,7 +32,7 @@ api.colabfold.com, so it is a flag, never a default.
 
 `--model` is `model_1_ptm` (default) or `model_1_multimer_v3`, the two the page publishes whole
 (models 2-5 are published as int3 deltas on them: `af2 --bundle=../../model --delta=../../model-mono-3-delta
---map=maps/model_3_ptm.map` reads one as the page does, bit-exact against src/bundles/delta-tensor-store.js,
+--map=maps/model_3_ptm.map` reads one as the page does, bit-exact against shared/bundles/delta-tensor-store.js,
 and `make_map.py --delta` builds its map), and `fold` folds with the page's own weights: the int5 bundle (`model/`, `model-multimer/`, fetched
 once by `native/fetch_bundles.py`), read as it is - its codes decoded on the device - through
 `maps/<model>.map`. `make_map.py` builds a map (~/.venv-lfjax): the monomer's parameters are found in
@@ -160,7 +160,7 @@ rather than mapped (native/af3's loader).
 
 ## A deep alignment's featurisation (2026-10-08)
 
-The features are the page's own (src/input/a3m-features.js, through export_input.mjs). For 5CAJ's 7907-row
+The features are the page's own (shared/input/a3m-features.js, through export_input.mjs). For 5CAJ's 7907-row
 alignment one recycle's featurisation was ~440 ms in Node - parsing and encoding the A3M 185, the nearest-centre
 search 158, the rest ~95 - and the four recycles ran in four workers that **each parsed the whole A3M again**. Now
 the alignment is planned once (parse, encode, profile, every recycle's masking) and the workers take only a
@@ -168,7 +168,7 @@ recycle's search and finishing: byte-identical (5CAJ, 1TIM's 16469 rows and the 
 here and **1.58 -> 1.25 s (5CAJ) and 2.0 -> 1.4 s (1TIM) on two CPUs**, a Colab T4's.
 
 **And the nearest-centre search runs on the card where the machine has fewer cores than recycles** - the page's
-device search (src/input/nearest-centres-webgpu.js) in CUDA (`--nearest=<out>`, a serve job; the zero-byte count and
+device search (webgpu/input/nearest-centres-webgpu.js) in CUDA (`--nearest=<out>`, a serve job; the zero-byte count and
 the first-centre tie of the host loop, integers both ways). The exporter plans and writes the searches
 (`--search-out`), the AF2 server assigns them, and the exporter finishes from the assignments (`--assignments`), its
 plan held between the two requests by native/export_server.mjs's one process. Byte-identical; through a warm

@@ -33,9 +33,9 @@
  * The tolerances are test/evoformer-stack.gpu.test.js's, unchanged: the tiled
  * outer product mean shifts f32 summation order slightly over 48 blocks.
  */
-import { EvoformerStackGpu } from "../../src/af2/evoformer/stack.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { errorMetrics } from "../../src/kernels/triangle/types.js";
+import { EvoformerStackGpu } from "../../webgpu/af2/evoformer/stack.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { errorMetrics } from "../../webgpu/kernels/triangle/types.js";
 
 const MANIFEST = "/test/fixtures/evoformer/model1-query-59-stack/manifest.json";
 

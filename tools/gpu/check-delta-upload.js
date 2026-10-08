@@ -30,8 +30,8 @@
  * requires the reconstruction to be nearer that model than the base is; without
  * it a delta of zeros would pass everything above.
  */
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { planBlockUpload, runBlockUpload } from "../../src/weights/quantised-upload.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { planBlockUpload, runBlockUpload } from "../../webgpu/weights/quantised-upload.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

@@ -86,7 +86,7 @@ struct Entry { char kind; size_t offset, length; double value; int seg; size_t d
 // writes them) loads straight into a Model: its packed codes go to the device and are decoded there into
 // the float32 copy, so nothing is decoded on the host and no float32 file is ever written (ESMFold2's was
 // 2.9 GB from 0.35 GB of bundles, and a 2-vCPU Colab VM spent minutes making it). The decode is
-// src/weights/dtype.js's, to the bit: code * scale + zero in double, rounded once to float32.
+// shared/weights/dtype.js's, to the bit: code * scale + zero in double, rounded once to float32.
 struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, dst, first = 0; int kind, bits, block;
                int round16 = 0, accumulate = 0, addRec = -1; size_t rows = 0; int rowBlocks = 0; };
 // kind: 0 float32, 1 float16, 2 int8 (symmetric), 3 packed int<bits> (asymmetric), 4 zeros (a map's `z`),
@@ -97,7 +97,7 @@ struct BRec { int file; size_t byteOffset, scaleOffset, zeroOffset, elements, ds
 // 8 a map's `c` line: literal values (byteOffset indexes Segment::consts) - stock AlphaFold 3's frozen Fourier
 //   embedding, a constant of its source that DeepMind's af3.bin.zst does not carry;
 // first: the element of the bundle tensor this entry starts at (a map's slice of a stacked tensor)
-// round16 / accumulate / addRec: a DELTA bundle's `addTo` tensor (src/bundles/delta-tensor-store.js) - the
+// round16 / accumulate / addRec: a DELTA bundle's `addTo` tensor (shared/bundles/delta-tensor-store.js) - the
 // base's value rounded to float16, then the delta's decode added in float32 by the record addRec names
 // A map's `p` line: one PART of a gathered tensor - a grid of up to 6 axes walked over the destination
 // (dst + sum i_k * dstStride_k) and one or two sources (srcOff + sum i_k * srcStride_k, into a bundle
@@ -529,7 +529,7 @@ struct Model {
       addMeta(key + "#r", (double)shape.size());
       for (size_t k = 0; k < shape.size(); ++k) addMeta(key + "#" + std::to_string(k), shape[k]);
     }
-    // 🔴 A DELTA BUNDLE, READ AS THE PAGE READS ONE (src/bundles/delta-tensor-store.js): AlphaFold 2's
+    // 🔴 A DELTA BUNDLE, READ AS THE PAGE READS ONE (shared/bundles/delta-tensor-store.js): AlphaFold 2's
     // models 2-5 are published as int3 differences on model 1, and its header says what each tensor is -
     // `addTo` (the base's value ROUNDED TO FLOAT16, because that is what the delta was taken against, plus
     // the delta's decode), `whole` (the delta's own), `absent` (gone: model_3/4/5 have no template

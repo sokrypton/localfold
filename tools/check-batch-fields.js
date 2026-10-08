@@ -62,7 +62,7 @@
  * elsewhere (AF3 6MRR 83.084 -> 83.169); it does not have it in this gate.
  *
  * 🔴 AND IT GOES THROUGH `af3BatchFromA3m`, NOT STRAIGHT INTO THE
- * FEATURISER. src/af3/featurise/batch.js forwards the dialect to `featuriseProtein` field
+ * FEATURISER. shared/af3/featurise/batch.js forwards the dialect to `featuriseProtein` field
  * by field, and the first version of this tool skipped that step - so a
  * convention dropped from THAT list would have left this gate green while the
  * page and every fold tool silently featurised with another model's
@@ -77,11 +77,11 @@
  * convention nothing can see is a convention nobody is checking.
  */
 import { readFileSync } from "node:fs";
-import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
-import { mergeRowAlignedChainA3ms } from "../src/input/chains.js";
-import { parseCcdComponent, ligandChain } from "../src/af3/featurise/ccd-component.js";
-import { dialectFor, DIALECTS, featuriserDialect } from "../src/af3/dialect.js";
-import { structuralBatch, structuralLayout } from "../src/af3/featurise/structural-tokens.js";
+import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
+import { mergeRowAlignedChainA3ms } from "../shared/input/chains.js";
+import { parseCcdComponent, ligandChain } from "../shared/af3/featurise/ccd-component.js";
+import { dialectFor, DIALECTS, featuriserDialect } from "../shared/af3/dialect.js";
+import { structuralBatch, structuralLayout } from "../shared/af3/featurise/structural-tokens.js";
 
 const MODELS = ["alphafold3", "openbind0", "opendde", "boltz2", "protenix2", "chai1",
                 "intellifold2", "rosettafold3"];
@@ -232,7 +232,7 @@ const ABSENT = {
   is_water: "as is_protein", is_nonstandard_polymer_chain: "as is_protein",
   frames_mask: "the frame set is built in the confidence head, not the batch",
   // chai1's: ESM2 3B's output, which this port computes in the fold (native/af3/src/esm2.cuh, 3.3e-4 against the
-  // reference's tower) from the ids src/af3/featurise/esm2-input.js writes - an input to the model, not a feature
+  // reference's tower) from the ids shared/af3/featurise/esm2-input.js writes - an input to the model, not a feature
   esm_embeddings: "computed by the fold's own ESM2 tower, not the featuriser",
   residue_center_index: "derived from the dense layout at use",
   chiral_angles: "gated in check-atom-windows.js",
@@ -272,8 +272,8 @@ const falsify = (args.find((a) => a.startsWith("--falsify=")) ?? "").slice(10);
 async function jobInputs(file) {
   const { jobFromJson } = await import("../web/job-json.js");
   const { expandEntities } = await import("../web/entities.js");
-  const { mergeJobAlignments } = await import("../src/input/chains.js");
-  const { smilesComponent } = await import("../src/chem/component.js");
+  const { mergeJobAlignments } = await import("../shared/input/chains.js");
+  const { smilesComponent } = await import("../shared/chem/component.js");
   const job = jobFromJson(fixture(file));
   const request = expandEntities(job.entities);
   const merged = job.alignments === undefined ? null
@@ -327,7 +327,7 @@ function batchFor(dialect, target) {
   // 🔴 THROUGH `af3BatchFromA3m` AND `featuriserDialect`, NOT STRAIGHT INTO THE
   // FEATURISER. This called `featuriseProtein` with a hand-picked option list
   // at first, and that is the same allow-list shape it was written to catch:
-  // src/af3/featurise/batch.js forwards the dialect to the featuriser field by field, and
+  // shared/af3/featurise/batch.js forwards the dialect to the featuriser field by field, and
   // a gate that skips it would stay green while the PAGE and every fold tool
   // silently dropped a convention. The one path the shipped fold takes is the
   // one to measure.
@@ -562,7 +562,7 @@ for (const target of Object.keys(TARGETS)) {
     }
   }
   // 🔴 OpenDDE's SECOND TOKEN SPACE, which this port builds in
-  // src/af3/featurise/structural-tokens.js and which nothing compared for as long as it
+  // shared/af3/featurise/structural-tokens.js and which nothing compared for as long as it
   // existed. `structbook/*` is the mapping that DEFINES the space - which
   // parent residue each subtoken belongs to, its role, its twin - so if it is
   // wrong every stage after it is wrong on a shipped model.

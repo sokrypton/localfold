@@ -29,7 +29,7 @@
  * the model's opinion of it. A sigma that wrecks the geometry is wrong however
  * it scores.
  */
-import { generateMmseqs2ComplexMsa } from "../../src/input/mmseqs2-api.js";
+import { generateMmseqs2ComplexMsa } from "../../shared/input/mmseqs2-api.js";
 import { foldAf3, loadAf3Weights } from "../../web/af3-model.js";
 
 const option = (args, name, fallback) => {

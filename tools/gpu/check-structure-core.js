@@ -22,10 +22,10 @@
  * between invocations, so a number here cannot be compared with a number from a
  * separate run. See tools/gpu/bench-ab.js.
  */
-import { StructureCoreGpu } from "../../src/af2/structure/core.js";
-import { InvariantPointAttentionGpu } from "../../src/af2/structure/ipa.js";
-import { StructurePostAttentionGpu } from "../../src/af2/structure/iteration.js";
-import { errorMetrics } from "../../src/kernels/triangle/types.js";
+import { StructureCoreGpu } from "../../webgpu/af2/structure/core.js";
+import { InvariantPointAttentionGpu } from "../../webgpu/af2/structure/ipa.js";
+import { StructurePostAttentionGpu } from "../../webgpu/af2/structure/iteration.js";
+import { errorMetrics } from "../../webgpu/kernels/triangle/types.js";
 
 const HEADS = 12;
 const SCALAR_QK = 16;

@@ -22,8 +22,8 @@
  * numbers asym_id straight on from the last chain; a ligand entered first would
  * otherwise claim a chain index that the polymers still use.
  */
-import { parseSmiles } from "../src/chem/smiles.js";
-import { ligandName } from "../src/chem/component.js";
+import { parseSmiles } from "../shared/chem/smiles.js";
+import { ligandName } from "../shared/chem/component.js";
 import { cleanSequence, nucleicProblem, sequenceProblem } from "./sequence.js";
 
 /** The entity types this page can actually fold. */
@@ -120,7 +120,7 @@ export const NUCLEIC_TYPES = ["dna", "rna"];
  * magnesium, an EF-hand's calcium: these are the second thing anyone tries
  * after a protein, and they are the entries most likely to be typed wrong,
  * being one or two letters. They also did not work until the CCD reader learned
- * that a lone atom has no conformer - see src/af3/featurise/ccd-component.js.
+ * that a lone atom has no conformer - see shared/af3/featurise/ccd-component.js.
  *
  * The set follows what AlphaFold Server offers. That list is not published in a
  * form worth citing, so this is the commonly reported one; it is one array, and
@@ -379,7 +379,7 @@ export function entityProblem(entity) {
   }
   if (entity.type === "smiles") {
     // 🔴 PARSED HERE, WITH THE PARSER'S OWN MESSAGE. Every refusal in
-    // src/chem/smiles.js names what it could not read and where - "ring
+    // shared/chem/smiles.js names what it could not read and where - "ring
     // closure 1 never closed", "`*` (any atom) has no element" - and those
     // arrive while the field is in front of the reader rather than as a fold
     // that dies two minutes in. It also means there is exactly one definition

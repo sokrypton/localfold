@@ -14,7 +14,7 @@
  * this machine's; a phone is five to ten times slower and would make every
  * constant a lie. What travels is the RATIO between the pieces of work, which
  * is a property of the arithmetic rather than of the device, and
- * src/runtime/cost-model.js turns the fit below into relative units that the
+ * webgpu/runtime/cost-model.js turns the fit below into relative units that the
  * page scales by what it actually observes.
  *
  * The sweeps are a cross rather than a grid, which is what separability buys:
@@ -39,22 +39,22 @@
  *
  * So: to refit, INTERLEAVE the shapes the way tools/gpu/bench-ab.js interleaves
  * its arms, and take medians over several rounds. Until then the constants in
- * src/runtime/cost-model.js stay where they are, and the check that they are
+ * webgpu/runtime/cost-model.js stay where they are, and the check that they are
  * still good enough is tools/gpu/probe-progress-bar.js, which measures the bar
  * against the clock rather than the model against a bench.
  */
-import { EvoformerStackGpu } from "../../src/af2/evoformer/stack.js";
-import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { MODEL_BUNDLES, loadManifest } from "../../src/bundles/manifests/index.js";
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
-import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
+import { EvoformerStackGpu } from "../../webgpu/af2/evoformer/stack.js";
+import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { MODEL_BUNDLES, loadManifest } from "../../shared/bundles/manifests/index.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { buildTargetFeat, DIALECT } from "../../webgpu/af3/fold.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
+import { openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 import { targetFeatureWeights, diffusionWeights, atomReference }
-  from "../../src/af3/weights/diffusion-weights.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

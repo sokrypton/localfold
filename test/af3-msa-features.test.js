@@ -12,7 +12,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { af3MsaFromA3m, AF3_MSA_CODES, AF3_MSA_GAP } from "../src/af3/featurise/msa-features.js";
+import { af3MsaFromA3m, AF3_MSA_CODES, AF3_MSA_GAP } from "../shared/af3/featurise/msa-features.js";
 
 const QUERY = "ACDEFGHIKL";
 const a3m = (...rows) => rows.map((row, index) => `>seq${index}\n${row}`).join("\n") + "\n";
@@ -50,7 +50,7 @@ describe("af3MsaFromA3m", () => {
     // unknown.
     //
     // 🔴 ASSERTED ON THE TABLE, NOT THROUGH A3M TEXT, BECAUSE THE PARSER IS
-    // NARROWER THAN THE TABLE. src/input/a3m.js accepts only ACDEFGHIKLMNPQRST
+    // NARROWER THAN THE TABLE. shared/input/a3m.js accepts only ACDEFGHIKLMNPQRST
     // VWYX and the gap, so a row carrying any of these five is rejected before
     // this module sees it - for AlphaFold 2 as well, which is why widening it
     // is not something the AF3 path should do on its own. The entries are kept

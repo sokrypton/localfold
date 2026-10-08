@@ -16,8 +16,8 @@
  * rather than imported, because a reference sharing code with the thing it
  * checks tests nothing.
  */
-import { AttentionGpu, selectAttentionFlashKernel } from "../../src/kernels/attention.js";
-import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { AttentionGpu, selectAttentionFlashKernel } from "../../webgpu/kernels/attention.js";
+import { deviceTuning, setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

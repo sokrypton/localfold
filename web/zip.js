@@ -4,7 +4,7 @@
  * WHY THIS EXISTS. "Download All" writes an archive shaped like the AlphaFold 3
  * server's, and the upload box reads that same archive back. LocalFold deploys
  * as static files to Pages and has no bundler, so a dependency is not free -
- * and `src/input/mmseqs2-api.js` already sets the precedent, untarring the
+ * and `shared/input/mmseqs2-api.js` already sets the precedent, untarring the
  * MMseqs2 result by hand. A ZIP with no encryption, no spanning and no ZIP64 is
  * about a hundred lines.
  *

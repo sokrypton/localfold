@@ -123,7 +123,7 @@
  */
 
 import { idealBonds, oneLetter, parsePdbResidues } from "./bond-geometry.js";
-import { vanDerWaalsRadius } from "../../src/chem/geometry-tables.js";
+import { vanDerWaalsRadius } from "../../shared/chem/geometry-tables.js";
 
 /** Overlap past this, in angstroms, is a clash. MolProbity's cutoff. */
 const CLASH = 0.4;
@@ -133,7 +133,7 @@ const CLASH = 0.4;
  * BONDI'S REPORTED NORMAL PEPTIDE GEOMETRY AS A CLASH. The 0.4 A cutoff was
  * calibrated by the Richardson lab against THEIR radius set (Word et al.
  * 1999), where oxygen is 1.40 A; `vanDerWaalsRadius` in
- * src/chem/geometry-tables.js is Bondi's, where it is 1.52, and that table is
+ * shared/chem/geometry-tables.js is Bondi's, where it is 1.52, and that table is
  * right for what it does - it floors the conformer builder's non-bonded
  * distances - so the fix is a local set here, not an edit there.
  *

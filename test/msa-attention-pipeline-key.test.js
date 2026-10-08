@@ -26,7 +26,7 @@
  */
 import { describe, it, expect } from "./harness.js";
 import { createMsaAttentionShaders, msaAttentionKeyPart }
-  from "../src/af3/trunk/msa-attention-webgpu.js";
+  from "../webgpu/af3/trunk/msa-attention-webgpu.js";
 
 // The offsets only place weights inside one packed buffer; they are the same
 // for every arm here, so any difference below is the SHAPE and not the packing.

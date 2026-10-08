@@ -15,7 +15,7 @@
  * device, and there is no tensor-core path through it either. What it can be
  * is a STORAGE format, in core WGSL with no device feature, because a bf16 is
  * the top sixteen bits of an f32 - which is the same niche
- * `src/runtime/storage.js` already fills with `pack2x16float`.
+ * `webgpu/runtime/storage.js` already fills with `pack2x16float`.
  *
  * So the only question worth measuring is which of the two storage formats is
  * better, and where. This round-trips both over the value ranges an activation

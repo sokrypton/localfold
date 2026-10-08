@@ -6,7 +6,7 @@ import {
 } from "../web/fold-archive.js";
 import { safeJobName } from "../web/prediction-results.js";
 import { readZip, writeZip } from "../web/zip.js";
-import { mergeSearchedChains } from "../src/input/mmseqs2-api.js";
+import { mergeSearchedChains } from "../shared/input/mmseqs2-api.js";
 
 // Two residues per chain, one atom each, so the atom arrays are checkable by eye.
 function pdb(chains) {

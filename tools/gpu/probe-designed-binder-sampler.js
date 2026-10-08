@@ -80,7 +80,7 @@
  * the VHHs and 2 and 3 the S100A4s, so 2|3 is the native dimer and 0|2, 0|3,
  * 1|2, 1|3 are the four binder interfaces.
  */
-import { generateMmseqs2ComplexMsa } from "../../src/input/mmseqs2-api.js";
+import { generateMmseqs2ComplexMsa } from "../../shared/input/mmseqs2-api.js";
 import { foldAf3, loadAf3Weights } from "../../web/af3-model.js";
 
 const option = (args, name, fallback) => {

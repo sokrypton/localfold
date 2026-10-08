@@ -14,24 +14,24 @@
  * no alignment the MSA is the query alone, which is what AF3 itself produces
  * for a single-sequence input rather than a stub.
  */
-import { ccdUrl, parseCcdComponent, ligandChain } from "../src/af3/featurise/ccd-component.js";
-import { smilesComponent } from "../src/chem/component.js";
-import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
-import { featuriserDialect } from "../src/af3/dialect.js";
+import { ccdUrl, parseCcdComponent, ligandChain } from "../shared/af3/featurise/ccd-component.js";
+import { smilesComponent } from "../shared/chem/component.js";
+import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
+import { featuriserDialect } from "../shared/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
-  from "../src/af3/fold.js";
+  from "../webgpu/af3/fold.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
-  structuralRefinerWeights, trunkDepths, trunkWeights } from "../src/af3/weights/weights.js";
+  structuralRefinerWeights, trunkDepths, trunkWeights } from "../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../src/af3/weights/diffusion-weights.js";
-import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
+  from "../shared/af3/weights/diffusion-weights.js";
+import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
 import { AF3_FAMILIES, bundleBaseUrl, loadManifest }
-  from "../src/bundles/manifests/index.js";
-import { throwIfAborted } from "../src/runtime/abort.js";
+  from "../shared/bundles/manifests/index.js";
+import { throwIfAborted } from "../webgpu/runtime/abort.js";
 import { buildTemplate } from "./template-source.js";
-import { yieldToBrowser } from "../src/runtime/yield.js";
+import { yieldToBrowser } from "../webgpu/runtime/yield.js";
 import { af3Plan, af3TrunkStageSpans, RuntimeEstimator }
-  from "../src/runtime/cost-model.js";
+  from "../webgpu/runtime/cost-model.js";
 
 const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
 
@@ -102,7 +102,7 @@ export const AF3_COUNTS = {
   // A third option that is never the right pick is a way for a visitor to get a
   // worse fold, so the page does not offer it. The STEP is still there and
   // still reachable - `--mode=ode` on any fold tool - because the intellifold2
-  // square is real and worth understanding. See src/af3/fold.js.
+  // square is real and worth understanding. See webgpu/af3/fold.js.
   // 🔴 AND 200 IS ON THE DIAL BECAUSE IT IS WHAT AF3 WAS TRAINED WITH. The
   // powers-of-two ladder (20, 40, 80, 160, 320) never landed on it, so the
   // model's own setting was the one number the page could not select. 25 keeps
@@ -163,7 +163,7 @@ export const OPENDDE_SAMPLER_MODE = "diffusion";
  * nothing was wrong.
  *
  * `foldBatch` throws for these rather than switching silently; the page's job
- * is to not ask. See `noFlowSampler` in src/af3/dialect.js.
+ * is to not ask. See `noFlowSampler` in shared/af3/dialect.js.
  */
 export const NO_FLOW_SAMPLER_FAMILIES = ["rosettafold3", "chai1"];
 export const samplerModeFor = (family, asked) =>
@@ -518,7 +518,7 @@ export function fittedPdb(batch, positions, reference, slots, plddt, options = {
  * worth of work whatever was being folded. Measured, that ratio is 3.1 at 59
  * tokens and 15.3 at 256 - the trunk grows as L squared and the sampler barely
  * faster than linearly - so the bar raced through the trunk band and stalled on
- * anything long. src/runtime/cost-model.js has the fits and the measurements.
+ * anything long. webgpu/runtime/cost-model.js has the fits and the measurements.
  */
 function foldPlan({ tokens, rows, passes, calls, atoms }) {
   const plan = af3Plan({ tokens, rows, passes, calls, atoms });
@@ -648,7 +648,7 @@ export async function foldAf3(options) {
       // 🔴 AND IT IS BUILT, NOT FETCHED, WHICH IS THE WHOLE POINT. There is no
       // dictionary entry to look up: `smilesComponent` returns exactly what
       // `parseCcdComponent` returns, so nothing downstream can tell which
-      // producer made it. See src/chem/component.js.
+      // producer made it. See shared/chem/component.js.
       ligands.push(await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
       continue;
     }
@@ -1041,7 +1041,7 @@ export async function foldAf3(options) {
       iptm: result.iptm,
       // ...and one ipTM per interface, which the pooled one averages away on
       // more than two chains. Empty for a monomer; the same number as `iptm`
-      // for exactly two chains. See src/heads/tm-score.js.
+      // for exactly two chains. See shared/heads/tm-score.js.
       chainPairIptm: result.chainPairIptm,
       // ...and per chain: how well each one folded alone, and how well it sits
       // against the rest. Written into the archive's summary_confidences.

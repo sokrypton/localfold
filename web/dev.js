@@ -5,10 +5,10 @@
 // is not something a person folding a protein has any use for - but it IS what
 // the browser tests assert against, and it is the only coverage that runs a
 // real kernel in a real browser. So it moved rather than went away.
-import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
-import { triangleMultiplicationOutgoingReference } from "../src/kernels/triangle/cpu-reference.js";
-import { errorMetrics } from "../src/kernels/triangle/types.js";
-import { TriangleMultiplicationOutgoingGpu } from "../src/kernels/triangle/webgpu.js";
+import { createDeterministicTriangleInput } from "../webgpu/testing/deterministic-input.js";
+import { triangleMultiplicationOutgoingReference } from "../webgpu/kernels/triangle/cpu-reference.js";
+import { errorMetrics } from "../webgpu/kernels/triangle/types.js";
+import { TriangleMultiplicationOutgoingGpu } from "../webgpu/kernels/triangle/webgpu.js";
 
 const element = (id) => {
   const value = document.getElementById(id);

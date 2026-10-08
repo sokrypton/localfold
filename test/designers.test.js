@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "./harness.js";
-import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../src/design/designers.js";
+import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../cpu/design/designers.js";
 
 const path = (name) => fileURLToPath(new URL(name, import.meta.url));
 

@@ -16,7 +16,7 @@
  * `main.js`, `hunter.js`, `viewer.js` and `plddt.js`**, which is why this note is
  * in those four. Deleting any of them is a page that does not come back.
  */
-import { AlphaFoldQueryOnlyGpu } from "../src/af2/model/query-only.js";
+import { AlphaFoldQueryOnlyGpu } from "../webgpu/af2/model/query-only.js";
 import { getDevice, loadModel } from "./model.js";
 import { createStructureViewer } from "./viewer.js";
 import { correspondence } from "./align.js";
@@ -24,7 +24,7 @@ import { morphFrames, superposeOnto } from "./morph.js";
 import { confidenceJson, predictionToPdb, recyclesToPdb } from "./prediction-results.js";
 import { createMutationPanel, mutationName, residueAt, substitute, wasClick } from "./mutate.js";
 import { cleanSequence, complexSequenceProblem, sequenceChains } from "./sequence.js";
-import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
+import { isAbortError, throwIfAborted } from "../webgpu/runtime/abort.js";
 
 const element = (id) => {
   const value = document.getElementById(id);

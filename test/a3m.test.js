@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "./harness.js";
-import { blankChainColumns, parseA3m } from "../src/input/a3m.js";
+import { blankChainColumns, parseA3m } from "../shared/input/a3m.js";
 
 describe("A3M parser", () => {
   it("parses the uploaded homolog-rich alignment", async() => {

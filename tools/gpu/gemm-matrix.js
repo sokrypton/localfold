@@ -102,7 +102,7 @@ export function createMatrixLinearShader(options = {}) {
   // 🔴 THE TILE IS THE DEVICE'S, NOT A CONSTANT. An M2 offers 8x8x8 and this
   // file was written to it; an A100 offers 16x16x16 and NO f32 tile at all, so
   // a hardcoded eight is both the wrong shape and, in f32, an unsupported one.
-  // `deviceMatrixConfig` in src/runtime/device-profile.js resolves it.
+  // `deviceMatrixConfig` in webgpu/runtime/device-profile.js resolves it.
   const tile = options.tile ?? { M: 8, N: 8, K: 8 };
   const { M, N, K } = tile;
   if (![M, N, K].every((v) => Number.isInteger(v) && v > 0)) {

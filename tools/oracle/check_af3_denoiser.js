@@ -19,11 +19,11 @@
  */
 import { join } from "node:path";
 
-import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
-import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
-import { diffusionHead } from "../../src/af3/diffusion/diffusion-reference.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
+import { diffusionHead } from "../../cpu/af3/diffusion/diffusion-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
-import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
+import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";
 
 const HEAD = "diffuser/~/diffusion_head";
 const EVO = "diffuser/evoformer";

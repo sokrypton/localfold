@@ -1,4 +1,4 @@
-// Does src/esmc/tower-webgpu.js compute ESM-C's 36 blocks and ESMFold2's mix?
+// Does webgpu/esmc/tower-webgpu.js compute ESM-C's 36 blocks and ESMFold2's mix?
 //
 //     python3 tools/esmc/dump-esmc-oracle.py --sequence-length 59
 //     python3 tools/export_esmc_model.py
@@ -13,8 +13,8 @@
 // The export writes tensors in block order, so a sequential pass walks the
 // shards in order too and a window of three is enough - which is 144 MiB live
 // against 2190, the same shape of trade the tower itself makes with weights.
-import { readTensor, readTensorAsFloat16 } from "../../src/weights/dtype.js";
-import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
+import { readTensor, readTensorAsFloat16 } from "../../shared/weights/dtype.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower-webgpu.js";
 
 const WINDOW = 3;
 
@@ -37,7 +37,7 @@ function shardReader(base) {
 }
 
 // 🔴 DECODED BY THE PAGE'S OWN READER, WHICH IS WHY THIS WORKS ON THE int5
-// BUNDLE UNCHANGED. src/weights/dtype.js already understands `int5` - packed
+// BUNDLE UNCHANGED. shared/weights/dtype.js already understands `int5` - packed
 // codes, a float16 scale and a float16 zero per group of 32 - so pointing this
 // at model-esmc-600m-int5 measures the artefact that would actually ship rather
 // than a float32 stand-in for it. A checker with its own unpacker would be

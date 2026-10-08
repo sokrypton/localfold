@@ -1,4 +1,4 @@
-import { validatedChainLengths } from "../src/input/chains.js";
+import { validatedChainLengths } from "../shared/input/chains.js";
 
 const RESIDUE_NAMES = {
   A: "ALA", R: "ARG", N: "ASN", D: "ASP", C: "CYS", Q: "GLN", E: "GLU", G: "GLY", H: "HIS",
@@ -54,7 +54,7 @@ function atomLines(sequence, structure, plddt, chainLengths) {
           // trims back to the right name and every strict one reads by column:
           // the backbone is then not where N, CA and C are looked for, and a
           // viewer draws a structure with no backbone rather than refusing to
-          // open it. src/af3/fold.js has always written it the other way, which
+          // open it. webgpu/af3/fold.js has always written it the other way, which
           // is why only AlphaFold 2's files were wrong.
           `ATOM  ${String(serial).padStart(5)}  ${atomName.padEnd(3)} ${residueName} ${chainId}${String(within + 1).padStart(4)}    `
           + `${field(structure.atom37[offset], 8, 3)}${field(structure.atom37[offset + 1], 8, 3)}`

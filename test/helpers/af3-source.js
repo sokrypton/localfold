@@ -14,24 +14,25 @@ import { sourceFiles } from "./source-files.js";
  * module, not its directory - the directory is a fact about how the tree is
  * organised today and every one of these tests is about something else.
  */
-const ROOT = new URL("../../src/af3/", import.meta.url);
+// (AF3's sources are in three trees now - shared/af3, cpu/af3 and webgpu/af3 - and a basename is still unique across them)
+const ROOTS = ["shared", "cpu", "webgpu"].map((tree) => new URL(`../../${tree}/af3/`, import.meta.url));
 
-function byName(dir) {
+function byName(dirs) {
   const out = new Map();
-  for (const path of sourceFiles(dir)) {
+  for (const path of dirs.flatMap((dir) => sourceFiles(dir))) {
     const name = basename(path);
     // 🔴 A DUPLICATE BASENAME WOULD MAKE THIS AMBIGUOUS AND SILENT, so it
     // raises instead: two `template-features.js` under one tree and a caller
     // gets whichever the walk reached last.
     if (out.has(name)) {
-      throw new Error(`two files named ${name} under src/af3: ${out.get(name)} and ${path}`);
+      throw new Error(`two files named ${name} under shared/, cpu/ and webgpu/af3: ${out.get(name)} and ${path}`);
     }
     out.set(name, path);
   }
   return out;
 }
 
-const BY_NAME = byName(new URL(".", ROOT).pathname);
+const BY_NAME = byName(ROOTS.map((root) => root.pathname));
 
 /** Every AF3 source, basename -> text. */
 export function af3Sources() {
@@ -42,7 +43,7 @@ export function af3Sources() {
 export function af3Source(name) {
   const path = BY_NAME.get(name);
   if (path === undefined) {
-    throw new Error(`no ${name} under src/af3 (have ${BY_NAME.size} files)`);
+    throw new Error(`no ${name} under shared/, cpu/ or webgpu/af3 (have ${BY_NAME.size} files)`);
   }
   return readFileSync(path, "utf8");
 }

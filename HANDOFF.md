@@ -52,8 +52,8 @@ gitignored if that is picked up again. **They do have a real confidence head**,
 which is the only reason to want them.
 
 ### Smaller
-* Two cost models still exist side by side, `src/runtime/cost-model.js` and
-  `src/esmfold2/cost.js`. They share shape but no code. Least dangerous kind of
+* Two cost models still exist side by side, `webgpu/runtime/cost-model.js` and
+  `webgpu/esmfold2/cost.js`. They share shape but no code. Least dangerous kind of
   duplication - neither can corrupt a fold.
 * The language band's constants are a two-point fit and carry this machine's
   drift: a second run of the same three folds read 1972, 919 and 63 ms against

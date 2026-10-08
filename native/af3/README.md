@@ -78,7 +78,7 @@ rosettafold3 1.644 / 1.817 - one sample's seed band - and chai1's ligands better
 SEP 0.074 / 0.108).
 
 **Chai-1** (`maps/chai1.map`) folds through the same binary on af3-any-model's conventions (the
-`chai*` flags in src/af3/dialect.js), and takes two things nobody else does: ESM2 3B's embeddings,
+`chai*` flags in shared/af3/dialect.js), and takes two things nobody else does: ESM2 3B's embeddings,
 computed in the fold from af3-any-model's `lm/esm2.bin.zst` (`--esm-bundle=<its directory>`, within
 1.0e-2 of the float32 model, its int8 codes resident), and chai-lab's structure token-pair weights,
 which af3-any-model's converter drops and its chai1 blobs now carry (tools/export_chai1_structure_pair.py
@@ -1057,7 +1057,7 @@ runs. The reader gets an error either way, a late one instead of an early one.
 
 `--recycle-tolerance=<A>` stops recycling once two consecutive passes moved the distogram's predicted distances
 (the expectation over its bins, every pair) by less than that RMS - the criterion docs/AF3.md built for the page and
-ships at zero, ported as it stands (src/af3/feature-convergence.js; two passes and not one because GB1's trunk dips
+ships at zero, ported as it stands (shared/af3/feature-convergence.js; two passes and not one because GB1's trunk dips
 under 0.5 A and then moves 1.09). Each pass computes the distogram once more and reads one number back. **Off by
 default and not wired into the worker**: dropping recycles is a default for the page to decide, and the threshold is
 not calibrated (2026-10-07). At 0.5 A, 25 steps, a warm fold:

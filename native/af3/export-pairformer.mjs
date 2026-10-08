@@ -2,7 +2,7 @@
 //   node --js-float16array export48.mjs <out-dir> [manifest-url]
 import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
-const { openAf3Store, trunkWeights } = await import(`${repo}/src/af3/weights/weights.js`);
+const { openAf3Store, trunkWeights } = await import(`${repo}/shared/af3/weights/weights.js`);
 const out = process.argv[2];
 const url = process.argv[3] ?? "http://127.0.0.1:8791/model-af3-full-f32/manifest.json";
 mkdirSync(out, { recursive: true });

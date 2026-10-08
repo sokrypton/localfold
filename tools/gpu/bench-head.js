@@ -22,15 +22,15 @@
  * so single-run deltas below about 15 ms mean nothing and a bisect built on
  * them will confidently name the wrong pass.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
-import { normalFrom } from "../../src/af3/fold.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { diffusionWeights, atomReference } from "../../src/af3/weights/diffusion-weights.js";
-import { af3Dialect } from "../../src/af3/weights/weights.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
+import { normalFrom } from "../../webgpu/af3/fold.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { diffusionWeights, atomReference } from "../../shared/af3/weights/diffusion-weights.js";
+import { af3Dialect } from "../../shared/af3/weights/weights.js";
 import { profileDevice } from "./profile.js";
-import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { deviceTuning, setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 // 🔴 THE BUNDLE'S DIALECT, NOT AlphaFold 3's. This bench pinned ALPHAFOLD3, so
 // pointing it at protenix2 built its single conditioning 831 wide against an
 // 833 LayerNorm - and the two only differ by two zero columns, so before the

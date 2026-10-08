@@ -162,7 +162,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <!-- 🔴 THE SAME GRAPH, DIFFERENT PARAMETERS. OpenBind-0 runs
                        through foldWithAf3 exactly as AF3 does; what differs is
                        the bundle and the three dialect branches its weights
-                       were trained with. See src/af3/dialect.js. -->
+                       were trained with. See shared/af3/dialect.js. -->
                   <option value="openbind0">OpenBind-0</option>
                   <!-- 🔴 TWO TOKEN SPACES, AND NO CONFIDENCE HEAD. OpenDDE
                        re-tokenises each residue into a backbone and a sidechain
@@ -180,7 +180,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        Protenix-v2 concatenates its template features and
                        applies one projection where AF3 runs nine. Both are
                        read from the bundle rather than typed in - see
-                       src/af3/dialect.js and docs/AF3.md. -->
+                       shared/af3/dialect.js and docs/AF3.md. -->
                   <option value="boltz2">Boltz-2</option>
                   <option value="protenix2">Protenix-v2</option>
                   <!-- 🔴 THE SMALLEST DIALECT AND THE WIDEST BUNDLE. Its module
@@ -254,7 +254,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <!-- 🔴 ALL THREE MODELS RECYCLE. AF3's embedder has always done
                    `pair += prev_embedding(LayerNorm(recycled pair))`; what was
                    missing was the loop driving it, which is now in
-                   src/af3/fold.js. Each recycle is another whole trunk. -->
+                   webgpu/af3/fold.js. Each recycle is another whole trunk. -->
 
               <!-- ...and an id, like every other group here. The narrow layout
                    puts Model / Recycles / Seed on one line and the pairs below
@@ -1126,7 +1126,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                post says what OpenBind is; the source tree says how to build
                it. It also names the release we actually ported -
                openfold-3/releases/tag/v0.5.0 - which is the distinction
-               src/af3/dialect.js exists to keep straight. -->
+               shared/af3/dialect.js exists to keep straight. -->
           <a href="https://openbind.uk/news/blog-openbind-0-advancing-open-molecular-structure-prediction/"
              target="_blank" rel="noopener noreferrer">about OpenBind-0</a>
         </p>

@@ -19,8 +19,8 @@
  * So this is a survey and not a proposal: it reports the size of the prize and
  * where the constants sit, and every candidate still has to be read.
  */
-import { warmTrunkPipelines } from "../../src/af3/fold.js";
-import { openAf3Store, STRUCTURAL_REFINER } from "../../src/af3/weights/weights.js";
+import { warmTrunkPipelines } from "../../webgpu/af3/fold.js";
+import { openAf3Store, STRUCTURAL_REFINER } from "../../shared/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

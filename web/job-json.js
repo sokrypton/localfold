@@ -47,7 +47,7 @@
  * as a modified residue that reaches the model and not the request file. The
  * error names the field, because "unsupported job" sends the reader looking.
  */
-import { parseSmiles } from "../src/chem/smiles.js";
+import { parseSmiles } from "../shared/chem/smiles.js";
 import { NUCLEIC_TYPES, entitiesProblem, parseContact } from "./entities.js";
 
 /**
@@ -458,7 +458,7 @@ function readEntry(entry, index, state) {
     // refusal read "`smiles` names a ligand by structure, and this page folds
     // ligands by CCD code", which was true: a ligand reached the featuriser as
     // `parseCcdComponent`'s output and nothing else could produce one.
-    // `src/chem/` produces one. It is its own row type rather than a flag on
+    // `shared/chem/` produces one. It is its own row type rather than a flag on
     // this one, because a CCD code is upper-cased and upper-casing a SMILES
     // changes the molecule - `c1ccccc1` is benzene, `C1CCCCC1` is cyclohexane.
     if (body.smiles !== undefined && body.smiles !== null) {
@@ -490,7 +490,7 @@ function readEntry(entry, index, state) {
     // bonded by the job's bondedAtomPairs. Splitting them into separate rows
     // would fold the same atoms as separate molecules, so the row keeps them
     // together, comma-separated, and the featuriser builds the chain
-    // (src/af3/featurise/ccd-component.js, ligandChain).
+    // (shared/af3/featurise/ccd-component.js, ligandChain).
     const code = list.map((one) => String(one).trim().toUpperCase().replace(/^CCD_/, "")).join(",");
     return { type: "ligand", value: code, copies, modifications: [], ids: idsOf(body) };
   }

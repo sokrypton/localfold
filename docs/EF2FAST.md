@@ -8,7 +8,7 @@ fold from a single sequence in a browser. Everything before that is the port.
 
 🔴 **IT IS AF3's PAIRFORMER BLOCK WITH THE GRID ATTENTIONS AND THE SINGLE TRACK
 REMOVED, AND THAT IS MEASURED.** `tools/check-esmfold2-trunk.js` composes
-`src/af3/trunk/pairformer-reference.js`'s three surviving pieces 24 times and scores
+`cpu/af3/trunk/pairformer-reference.js`'s three surviving pieces 24 times and scores
 them against the values the native model recorded going into and coming out of
 its trunk at each of its four recycles: **relRMS 1.4e-6** against a 2e-4 bound.
 So the port needed no new arithmetic, only the weights in AF3's shapes -
@@ -43,7 +43,7 @@ projection is zero adds zero, so a zeroed AF3 block already IS ESMFold2's block
 and needs no graph code at all. It is also pure waste: `grid.attend` is the
 largest kernel in an AF3 trunk and this trunk runs 24 blocks four times over.
 `compilePairTrack`/`encodePairTrack` take a `gridAttention` flag (default true,
-so no existing caller moves) and `src/esmfold2/trunk-webgpu.js` sets it false.
+so no existing caller moves) and `webgpu/esmfold2/trunk-webgpu.js` sets it false.
 Worth **1.42x**, and `tools/gpu/check-esmfold2-trunk-gpu.js` runs both arms over
 the same weights at the same shapes and asserts **0 differing elements** - not a
 tolerance, because dropping passes from a track whose five updates each read the
@@ -119,7 +119,7 @@ self-attention** over atoms, half-window 64, whose only positional signal is a
 raw index, the diagonal is always allowed, the blocks are adaLN-Zero with
 **affine-free RMSNorm**, and q/k take a second affine-free RMSNorm before the
 rotation. Nothing in the shapes says any of this: both are "an atom transformer
-at 128 channels". `src/af3/diffusion/atom-encoder-reference.js`.
+at 128 channels". `cpu/af3/diffusion/atom-encoder-reference.js`.
 
 🔴 **THE DIFFUSION MODULE IS `structure_head`, AND ITS CONDITIONING IS PORTED.**
 345 tensors, and the shape of it: conditioning, then the SAME SWA atom encoder
@@ -436,9 +436,9 @@ encoder is 32-query / 128-key windowed attention biased by a pair
 representation; this is plain sliding-window self-attention whose only
 positional signal is a rotary embedding built from the REFERENCE CONFORMER.
 Both are "an atom transformer at 128 channels".
-`src/esmfold2/atom-transformer-webgpu.js` is four new shaders - `modulate`,
+`webgpu/esmfold2/atom-transformer-webgpu.js` is four new shaders - `modulate`,
 `prepare`, `attend`, `gated` - and everything that is a plain projection comes
-from `src/esmc/block-webgpu.js`, whose tiled GEMM and fused SwiGLU are exactly
+from `webgpu/esmc/block-webgpu.js`, whose tiled GEMM and fused SwiGLU are exactly
 the shapes `ffnUp` and `lin_swish` are packed in.
 
 🔴 **AND THE WINDOW IS RESOLVED ON THE HOST, BECAUSE IT IS OVER RANK.** Two
@@ -1226,7 +1226,7 @@ Reported as exactly that. **A recycle is not a phase; it is the seam between two
 trunk passes.** Measured on a 76-mer, the line now changes 7 times over 4 shapes
 where it changed 17 over 11.
 
-🔴 **AND THE BAR RUNS OFF A COST MODEL FITTED THIS SESSION**, `src/esmfold2/cost.js`:
+🔴 **AND THE BAR RUNS OFF A COST MODEL FITTED THIS SESSION**, `webgpu/esmfold2/cost.js`:
 
 | band | at 40 | at 150 | at 300 | the shape |
 |---|---|---|---|---|
@@ -1276,7 +1276,7 @@ GPU promise resolves as a MICROTASK, which returns control to the microtask
 queue and never to the browser - so a page that only moved a bar there would
 write it and never paint it. `yieldToBrowser` posts a MessageChannel message,
 which is a task and is not clamped to a second in a background tab the way
-`setTimeout` is. See src/runtime/yield.js.
+`setTimeout` is. See webgpu/runtime/yield.js.
 
 Measured in the page, 150 residues: **140 bar samples, largest jump 0.047**,
 monotonic from 0.01 to 1.00 - against 45 samples and a 0.53 leap before.
@@ -1391,7 +1391,7 @@ finished, long after the function's own `finally` has freed them. The failure wa
 which names the buffer and not the lifetime.
 
 🔴 **SO THE COLOUR SHIPS, AND THE PRE-SAMPLER ARM DOES NOT USE THE STRUCTURE.**
-`CERTAINTY` in src/esmfold2/distogram-webgpu.js: the mass within **2 A of the
+`CERTAINTY` in webgpu/esmfold2/distogram-webgpu.js: the mass within **2 A of the
 distogram's mode**, meaned over every pair at sequence separation above **3**
 whose predicted distance is under **12 A**. Ranked on realistic corruption rates
 (0 and 15%) by WORST fold, the two families are a tie -
@@ -1551,7 +1551,7 @@ protein chains**, so nothing in this file had ever borne on a ligand token.
 
 62% of that fold's contacts were ATP's internal pairs, so the precision a
 checker prints was mostly a statement about a conformer the model was HANDED.
-`partnerKeys` in src/esmfold2/distogram-webgpu.js replaces the arithmetic with
+`partnerKeys` in webgpu/esmfold2/distogram-webgpu.js replaces the arithmetic with
 two numbers per token - the asym id and the residue number - and the rule
 becomes "the same chain, and within `separation` RESIDUES". A ligand's atoms
 share one residue number, so a gap of zero drops the whole self-block; two
@@ -1797,7 +1797,7 @@ on the sugar - a silent 4 A error in the representative.
 
 🔴 **AND AF2 AND AF3'S CONFIDENCE IS NOT AFFECTED, BUT AF3's CONTACT MAP IS.**
 The report was "this affects all models". Half of it does. No AGGREGATION is at
-risk: `distogramContactProbabilities` in src/heads/distogram.js is per PAIR with
+risk: `distogramContactProbabilities` in shared/heads/distogram.js is per PAIR with
 no separation rule, `web/prediction-results.js` exports the matrix as it stands,
 and both models take their confidence from a confidence head - so ESMFold2 is
 the only one here that DERIVES a confidence from a distogram. But the THRESHOLD
@@ -1806,7 +1806,7 @@ exactly as ESMFold2 does, so its contact map wanted the same table. AF2 does
 not: monomer and multimer are protein-only, every pair is two residues, and 8 A
 is simply right there.
 
-🔴 **SO THE TABLE LIVES IN `src/heads/contact-threshold.js`, WHICH IS NEITHER
+🔴 **SO THE TABLE LIVES IN `shared/heads/contact-threshold.js`, WHICH IS NEITHER
 MODEL'S.** `contactAngstromsForClasses` takes two CLASSES - nucleic, ligand, or
 one of the twenty amino acids - and each model maps its own alphabet onto them.
 The two heads then disagree about one thing only, which is where a bin's edge
@@ -2165,7 +2165,7 @@ colour, because the fold somebody is staring at is the one they doubt". **A PAE
 panel that looks better on a failed fold is the same fault and worse**, because
 a PAE is what people check precisely when they suspect a fold. `alignedError` is
 opt-in on `foldEsmfold2` and nothing on the page passes it; the estimator, the
-fit and the numbers stay in `src/esmfold2/aligned-error.js` and
+fit and the numbers stay in `shared/esmfold2/aligned-error.js` and
 `tools/pae-transfer.py`.
 
 🔴 **AND THE CERTAINTY CAUGHT EVERY ONE OF THESE CASES, WHICH IS THE OTHER HALF
@@ -2220,7 +2220,7 @@ hardest target reads 8.84 against 12.71. **Report the MAP, not the number** -
 exists, and says so in the field beside it.
 
 🔴 **AND IT IS CARRIED TO EF2-fast NOW, WHICH IS THE POINT.**
-`src/esmfold2/aligned-error.js` is the estimator and
+`shared/esmfold2/aligned-error.js` is the estimator and
 `tools/gpu/probe-pae-esmfold2.js` collects the features. It is a **pAE** in the
 literal sense - a predicted aligned error - and the mechanism being a read-off
 rather than a head does not change what the matrix is. Nine sequences folded
@@ -2291,7 +2291,7 @@ link still works - the same shape as openbind0's rename, and for the same
 reason.
 
 🔴 **THE SOURCE DIRECTORY AND THE BUNDLE KEEP THEIR OLD NAMES**, as
-`src/af3/` does for openbind0: a path is not the model's name, and renaming
+the AF3 trees do for openbind0: a path is not the model's name, and renaming
 `model-esmfold2-int5` would move 366 MiB for nothing.
 
 🔴 **AND A RENAMED KEY BREAKS EVERY LOOKUP THAT WAS SPELLED OUT.**
@@ -2537,7 +2537,7 @@ own 0.99 / 7.06, and its median crystal RMSD is 2.53 against float32's 2.52.
 `tools/quantize_af3.py` records int5 group-32 asymmetric costing AF3 nothing
 either (0.66 A against float32's 0.69, inside the spread between diffusion
 seeds). Two models, two graphs, one packer, the same verdict - and LocalFold
-already has the GPU decoder for it (`src/weights/quantised-upload.js`).
+already has the GPU decoder for it (`webgpu/weights/quantised-upload.js`).
 
 🔴 **int4 IS THE EDGE AND int3 IS OVER IT**, which is again where AF3 lands.
 int4's worst case (13.17 A) is nearly twice the worst the sampler produces on
@@ -2785,7 +2785,7 @@ writes ONE shared table for the whole tower - 1024 entries of 4 float16 is
 **8 KB** - so decoding a weight is an index into it and a multiply by the
 group's scale, against int5's shift-mask-across-a-byte-boundary. LocalFold
 already expands quantised weights into a dense float16 buffer in one dispatch
-(`src/weights/quantised-upload.js`); this is that same dispatch with a simpler
+(`webgpu/weights/quantised-upload.js`); this is that same dispatch with a simpler
 body. It is not the same shader, but it is not a harder one.
 
 🔴 **AND THE ROTATION - QuIP#'s OTHER HALF - IS NOT WORTH IT HERE.** Multiplying
@@ -2860,7 +2860,7 @@ than for an error nothing will make. Five passes per block instead of one, and
 the whole 573M tower takes **70 seconds on an A100**.
 
 🔴 **AND NEITHER METHOD CHANGES THE STORAGE FORMAT, WHICH IS WHY THESE TWO AND
-NOT THE OTHERS.** Both emit exactly what `src/weights/quantised-upload.js`
+NOT THE OTHERS.** Both emit exactly what `webgpu/weights/quantised-upload.js`
 already decodes: asymmetric codes, one float16 scale and one float16 zero per
 group of 32. GPTQ's group axis lines up for free - LocalFold groups 32
 CONSECUTIVE elements of a row-major `(out, in)` tensor, which is 32 consecutive
@@ -3042,7 +3042,7 @@ about it.
 ## The confidence head this checkpoint never had
 
 biohub ships ESMFold2 with `confidence_head.enabled: false` and zero confidence
-tensors, which is what the certainty estimate and `src/esmfold2/aligned-error.js`
+tensors, which is what the certainty estimate and `shared/esmfold2/aligned-error.js`
 above exist for. Synthyra froze that trunk and trained a head on it - 780
 updates, 18.1 h, MIT with redistribution allowed - for the 300M and the 600M
 both. It is ported, gated and wired; nothing is published.
@@ -3175,7 +3175,7 @@ model-row tooltip and the `<option>` comment in index.html. What is KEPT is the
 archive's presence-driven branches (`scored`, `estimated_aligned_error`): no
 model on this page is headless today, so they are the rule rather than a live
 case, and the rule is what stops the next headless checkpoint labelling its
-column `atom_plddts`. `src/esmfold2/aligned-error.js` stays too, with its
+column `atom_plddts`. `shared/esmfold2/aligned-error.js` stays too, with its
 numbers - it is the record of a measured, declined estimator.
 
 ### Why the PAE map looks "sparse and detailed", and what their own numbers say

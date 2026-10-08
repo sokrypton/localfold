@@ -30,13 +30,13 @@
  * sides by position assumes the labelling is right, which is one of the things
  * being asked.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { featuriserDialect } from "../../src/af3/dialect.js";
-import { foldBatch, atomName } from "../../src/af3/fold.js";
-import { ccdUrl, parseCcdComponent, polymerResidue } from "../../src/af3/featurise/ccd-component.js";
-import { REFERENCE_CONFORMERS } from "../../src/af3/featurise/reference-conformers.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { foldWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { featuriserDialect } from "../../shared/af3/dialect.js";
+import { foldBatch, atomName } from "../../webgpu/af3/fold.js";
+import { ccdUrl, parseCcdComponent, polymerResidue } from "../../shared/af3/featurise/ccd-component.js";
+import { REFERENCE_CONFORMERS } from "../../shared/af3/featurise/reference-conformers.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

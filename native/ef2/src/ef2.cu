@@ -239,7 +239,7 @@ static int foldInput(const Opts& o, bool warm) {
   if (zi) { CK(cudaFree(zi)); zi = nullptr; }
   for (float* p : { ziRows, ziCols, sTok }) if (p) CK(cudaFree(p));
   if (tight) releaseScratch();
-  // the page's contact map off the trunk's distogram (src/esmfold2/distogram-webgpu.js: the softmax mass
+  // the page's contact map off the trunk's distogram (webgpu/esmfold2/distogram-webgpu.js: the softmax mass
   // under each pair's threshold, the bins the exporter counted) - for the confidences file, and with
   // --frames tapped to the page before the sampler runs, as the page shows its own
   std::vector<float> contacts;

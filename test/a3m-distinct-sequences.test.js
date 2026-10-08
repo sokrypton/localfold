@@ -16,7 +16,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { distinctSequenceCount, foldsAsSingleSequence, foundOnlyTheQuery, parseA3m }
-  from "../src/input/a3m.js";
+  from "../shared/input/a3m.js";
 
 const QUERY = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ";
 const HIT = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVA";

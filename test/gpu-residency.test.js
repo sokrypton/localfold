@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { WebGpuExecution } from "../src/runtime/execution.js";
+import { WebGpuExecution } from "../webgpu/runtime/execution.js";
 
 /**
  * KEEPING A TENSOR ON THE DEVICE IS A LIFETIME QUESTION, not an arithmetic one.

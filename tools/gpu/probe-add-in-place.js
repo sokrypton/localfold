@@ -17,7 +17,7 @@
  * the number of times it lands on the pair tensor is the difference between one
  * corrupted add a fold and forty-nine.
  */
-import { WebGpuExecution } from "../../src/runtime/execution.js";
+import { WebGpuExecution } from "../../webgpu/runtime/execution.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

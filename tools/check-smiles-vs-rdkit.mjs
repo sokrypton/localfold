@@ -45,9 +45,9 @@
  */
 
 import { readFileSync } from "node:fs";
-import { parseSmiles, molecularFormula } from "../src/chem/smiles.js";
-import { smallestRings } from "../src/chem/rings.js";
-import { valenceProblems } from "../src/chem/kekulize.js";
+import { parseSmiles, molecularFormula } from "../shared/chem/smiles.js";
+import { smallestRings } from "../shared/chem/rings.js";
+import { valenceProblems } from "../shared/chem/kekulize.js";
 
 const DUMP = "oracle-dumps/rdkit-smiles.json";
 

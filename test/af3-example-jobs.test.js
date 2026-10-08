@@ -84,7 +84,7 @@ const EXPECTED = {
                            modifications: ["5CM@5", "5CM@9", "5CM@13", "5CM@17"] },
   "modified_rna.json": { loads: ["rna:25x1"], modifications: ["PSU@13", "5MC@18", "OMG@4"] },
   // 🔴 AND THIS ONE LOADS NOW, WHERE IT USED TO BE A REFUSAL. Biotin arrives
-  // as a structure rather than a code and src/chem/ builds it a component; see
+  // as a structure rather than a code and shared/chem/ builds it a component; see
   // docs/SMILES.md. It is kept in the corpus precisely because it is the one
   // example job that exercises the new path.
   "streptavidin_biotin_smiles.json": { loads: ["protein:126x1", "smiles:1x1"] },

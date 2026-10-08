@@ -17,7 +17,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { planBlockUpload } from "../src/weights/quantised-upload.js";
+import { planBlockUpload } from "../webgpu/weights/quantised-upload.js";
 
 const record = (dtype, block, count) => ({
   dtype, block, shape: [count], byteOffset: 0,
@@ -65,7 +65,7 @@ describe("planning a packed upload", () => {
   // 🔴 TWO PACKINGS IN ONE PLAN GO TO THE HOST, WHICH IS THE BRANCH'S RULE MADE
   // SOFTER AND SAFER. It used to refuse the whole plan; this sends the odd
   // tensor to the host packer instead, so the caller still gets the right bytes
-  // - see the note at that branch in src/weights/quantised-upload.js. What both
+  // - see the note at that branch in webgpu/weights/quantised-upload.js. What both
   // versions guarantee is the thing that matters: no tensor is ever decoded
   // with another packing's shift.
   it("sends a second packing to the host rather than decoding it wrong", () => {

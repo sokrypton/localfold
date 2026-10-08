@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { DEFAULT_MANIFEST } from "../src/bundles/manifest.js";
+import { DEFAULT_MANIFEST } from "../shared/bundles/manifest.js";
 
 describe("DEFAULT_MANIFEST", () => {
   it("defines the expected AlphaFold model_1_ptm metadata", () => {
@@ -44,7 +44,7 @@ describe("DEFAULT_MANIFEST", () => {
     // says `first_break: 2.3125, last_break: 21.6875`, which is an exact
     // 0.3125 A grid; the manifest said 2 and 22 for a long time, which is the
     // same grid's CENTRE form misread as its break form and shifts every edge
-    // by up to a bin. See src/heads/distogram.js.
+    // by up to a bin. See shared/heads/distogram.js.
     expect(head.firstBreak).toBe(2.3125);
     expect(head.lastBreak).toBe(21.6875);
     // 🔴 IT NAMES TENSORS, IT DOES NOT CARRY BYTES. The head was 44 KB of
@@ -119,10 +119,10 @@ describe("the monomer deltas and the template single features", async () => {
   // delta must decide these four: model_2_ptm carries its own WHOLE, and
   // model_3/4/5_ptm, which have no template embedder, mark them absent - and
   // the store then drops the section, as it drops templateEmbedding.
-  const { DeltaTensorStore } = await import("../src/bundles/delta-tensor-store.js");
+  const { DeltaTensorStore } = await import("../shared/bundles/delta-tensor-store.js");
   const names = Object.values(DEFAULT_MANIFEST.templateSingle.parameters).flatMap((l) => Object.values(l));
   it("model_2 carries them whole", async () => {
-    const { MANIFEST } = await import("../src/bundles/manifests/monomer-2.js");
+    const { MANIFEST } = await import("../shared/bundles/manifests/monomer-2.js");
     for (const name of names) {
       expect(MANIFEST.delta.whole.includes(name)).toBe(true);
       expect(MANIFEST.tensors[name].dtype).toBe("float32");
@@ -130,7 +130,7 @@ describe("the monomer deltas and the template single features", async () => {
   });
   for (const k of [3, 4, 5]) {
     it(`model_${k} has none, and the store drops the section`, async () => {
-      const { MANIFEST } = await import(`../src/bundles/manifests/monomer-${k}.js`);
+      const { MANIFEST } = await import(`../shared/bundles/manifests/monomer-${k}.js`);
       for (const name of names) expect(MANIFEST.delta.absent.includes(name)).toBe(true);
       const store = new DeltaTensorStore({ manifest: DEFAULT_MANIFEST }, { manifest: MANIFEST });
       expect(store.manifest.templateSingle).toBe(undefined);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { MAX_ALANINE, objectiveOf, runDesign, withChain } from "../src/design/hunter-loop.js";
+import { MAX_ALANINE, objectiveOf, runDesign, withChain } from "../webgpu/design/hunter-loop.js";
 
 /**
  * A stub pair standing in for a GPU fold and an MPNN design.

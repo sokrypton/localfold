@@ -34,7 +34,7 @@
  *    is a third of the wall the device is being starved by its driver.
  */
 
-import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
+import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

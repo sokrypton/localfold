@@ -1,4 +1,4 @@
-// Does src/esmc/block-webgpu.js compute an ESM-C block?
+// Does webgpu/esmc/block-webgpu.js compute an ESM-C block?
 //
 //     python3 tools/esmc/dump-esmc-oracle.py --sequence-length 59
 //     python3 tools/export_esmc_model.py
@@ -13,8 +13,8 @@
 // 🔴 IT FETCHES ONE BLOCK'S SHARDS, NOT THE BUNDLE. The float32 export is
 // 2190 MiB and block 0 is 64 of them; pulling the whole thing to check one
 // block would make this checker something nobody runs.
-import { EsmcBlockGpu } from "../../src/esmc/block-webgpu.js";
-import { esmcBlock } from "../../src/esmc/tower-reference.js";
+import { EsmcBlockGpu } from "../../webgpu/esmc/block-webgpu.js";
+import { esmcBlock } from "../../cpu/esmc/tower-reference.js";
 
 // 🔴 THE SHARD IS FETCHED WHOLE AND SLICED, BECAUSE THE DEV SERVER IGNORES
 // Range. `python3 -m http.server` answers a ranged request with 200 and the

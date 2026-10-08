@@ -35,7 +35,7 @@
  */
 import { CHAIN_IDS, paeMatrix, safeJobName } from "./prediction-results.js";
 import { jobRequestJson } from "./job-json.js";
-import { coordinateAtoms } from "../src/heads/superpose-pdb.js";
+import { coordinateAtoms } from "../shared/heads/superpose-pdb.js";
 
 /**
  * 🔴 TWO DECIMALS, WHICH IS WHAT THE SERVER WRITES. Not cosmetic: `full_data`
@@ -175,7 +175,7 @@ export function fullDataJson({ confidence, alignedError, pdb, tokenChainIds, tok
   } else if (alignedError !== undefined) {
     // 🔴 A DIFFERENT KEY, BECAUSE IT IS A DIFFERENT PROVENANCE. This is
     // estimated from the distogram rather than predicted by a confidence head
-    // (src/esmfold2/aligned-error.js), and `pae` is the key a reader parses
+    // (shared/esmfold2/aligned-error.js), and `pae` is the key a reader parses
     // expecting the server's - the same care `atom_certainty` takes with the
     // B-factor column. It is still a predicted aligned error, and it is still
     // in angstroms; what it is not is this model's own head's opinion.
@@ -240,7 +240,7 @@ function asymOrder(confidence, chainCount) {
  * so an unfiltered maximum reports 1.00 for every chain and says nothing. The
  * rule is the one used everywhere else here - the same chain and within six
  * RESIDUES, which drops a ligand's whole self-block because its atoms share a
- * residue number. See ../src/heads/contact-threshold.js for why a token index
+ * residue number. See ../shared/heads/contact-threshold.js for why a token index
  * would not do.
  */
 export function chainPairMaxContact(contactProbs, tokenChainIds, tokenResIds, chains) {

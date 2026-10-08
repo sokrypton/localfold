@@ -1,5 +1,5 @@
 /**
- * AF3's atom cross-attention encoder: GPU against src/af3/diffusion/atom-encoder-reference.js.
+ * AF3's atom cross-attention encoder: GPU against cpu/af3/diffusion/atom-encoder-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-atom-encoder.js
  *
@@ -47,10 +47,10 @@
  * control is "some output moved well past its envelope", not "every one did":
  * demanding all three would fail on a correct implementation.
  */
-import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
-import { Af3AtomEncoderGpu } from "../../src/af3/diffusion/atom-encoder-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { ALPHAFOLD3, OPENBIND0, atomBlockDialect } from "../../src/af3/dialect.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder-webgpu.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { ALPHAFOLD3, OPENBIND0, atomBlockDialect } from "../../shared/af3/dialect.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";

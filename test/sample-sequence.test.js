@@ -1,9 +1,9 @@
 import { describe, expect, it } from "./harness.js";
 import {
   alanineBias, alanineFraction, designBias, omittedLetters, sampleSequence,
-} from "../src/design/sample-sequence.js";
-import { ALPHABET } from "../src/design/mpnn/constants.js";
-import { uniformFrom } from "../src/af3/fold.js";
+} from "../cpu/design/sample-sequence.js";
+import { ALPHABET } from "../cpu/design/mpnn/constants.js";
+import { uniformFrom } from "../webgpu/af3/fold.js";
 
 /** A deterministic stand-in for Math.random that cycles a fixed list. */
 const cycling = (values) => {

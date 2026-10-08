@@ -2,8 +2,8 @@
 //   node export.mjs <out-dir> [tokens] [manifest-url]
 import { writeFileSync, mkdirSync } from "node:fs";
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
-const { openAf3Store, trunkWeights } = await import(`${repo}/src/af3/weights/weights.js`);
-const { pairformerBlock } = await import(`${repo}/src/af3/trunk/pairformer-reference.js`);
+const { openAf3Store, trunkWeights } = await import(`${repo}/shared/af3/weights/weights.js`);
+const { pairformerBlock } = await import(`${repo}/cpu/af3/trunk/pairformer-reference.js`);
 
 const out = process.argv[2];
 const n = Number(process.argv[3] ?? 64);

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "./harness.js";
 import { resolve } from "node:path";
-import { loadTriangleReferenceBundleFromFiles } from "../src/bundles/node.js";
-import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
-import { triangleMultiplicationOutgoingReference } from "../src/kernels/triangle/cpu-reference.js";
-import { errorMetrics, validateTriangleInput } from "../src/kernels/triangle/types.js";
+import { loadTriangleReferenceBundleFromFiles } from "../shared/bundles/node.js";
+import { createDeterministicTriangleInput } from "../webgpu/testing/deterministic-input.js";
+import { triangleMultiplicationOutgoingReference } from "../webgpu/kernels/triangle/cpu-reference.js";
+import { errorMetrics, validateTriangleInput } from "../webgpu/kernels/triangle/types.js";
 
 describe("TriangleMultiplicationOutgoing CPU reference", () => {
   it("is deterministic and returns one value per pair channel", () => {

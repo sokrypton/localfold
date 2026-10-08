@@ -19,13 +19,13 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { readTensor } from "../src/weights/dtype.js";
-import { transition, triangleMultiplication } from "../src/af3/trunk/pairformer-reference.js";
+import { readTensor } from "../shared/weights/dtype.js";
+import { transition, triangleMultiplication } from "../cpu/af3/trunk/pairformer-reference.js";
 import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
-} from "../src/esmfold2/pair-features-reference.js";
-import { inputsEmbedder } from "../src/esmfold2/atom-transformer-reference.js";
-import { distogramLogits } from "../src/esmfold2/distogram-reference.js";
+} from "../cpu/esmfold2/pair-features-reference.js";
+import { inputsEmbedder } from "../cpu/esmfold2/atom-transformer-reference.js";
+import { distogramLogits } from "../cpu/esmfold2/distogram-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");
@@ -99,7 +99,7 @@ const shape = {
   // bfloat16; reproducing that would match the dump more closely and compute a
   // WORSE answer, and torch's bf16 accumulation is not reproducible here in any
   // case. The rope TABLE is still bf16, because that one is exact - see
-  // src/esmfold2/atom-transformer-reference.js.
+  // cpu/esmfold2/atom-transformer-reference.js.
   attentionPrecision: "f32",
 };
 const atomBlocks = [];

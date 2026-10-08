@@ -10,9 +10,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { chiralPositionGradients, improperDihedral } from "../src/af3/diffusion/chiral-gradient.js";
-import { chiralCentres, CHIRAL_ANGLE } from "../src/af3/featurise/template-features.js";
-import { featuriseProtein } from "../src/af3/featurise/featurise.js";
+import { chiralPositionGradients, improperDihedral } from "../shared/af3/diffusion/chiral-gradient.js";
+import { chiralCentres, CHIRAL_ANGLE } from "../shared/af3/featurise/template-features.js";
+import { featuriseProtein } from "../shared/af3/featurise/featurise.js";
 
 const SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNG";
 

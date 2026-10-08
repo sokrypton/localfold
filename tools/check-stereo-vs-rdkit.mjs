@@ -21,9 +21,9 @@
  */
 
 import { readFileSync } from "node:fs";
-import { parseSmiles } from "../src/chem/smiles.js";
-import { chiralCentres, doubleBondStereo } from "../src/chem/stereo.js";
-import { signedVolume } from "../src/chem/conformer.js";
+import { parseSmiles } from "../shared/chem/smiles.js";
+import { chiralCentres, doubleBondStereo } from "../shared/chem/stereo.js";
+import { signedVolume } from "../shared/chem/conformer.js";
 
 const DUMP = "oracle-dumps/rdkit-smiles.json";
 

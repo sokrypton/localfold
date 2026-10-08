@@ -1,6 +1,6 @@
 # AlphaFold 2 here: the template terms, the kernels, the alignment prep
 
-Monomer and multimer. `src/af2/evoformer/`, `src/af2/multimer/`.
+Monomer and multimer. `webgpu/af2/evoformer/`, `webgpu/af2/multimer/`.
 
 🔴 **AF2-MULTIMER'S TEMPLATE TERM RUNS ON EVERY RECYCLE AND NOTHING CHECKED
 IT.** `tools/oracle/template_reference.py` computed a numpy reference and wrote
@@ -18,7 +18,7 @@ AF2 itself, and the GPU is right:
 
 | against AF2, captured | masked | real template |
 |---|---|---|
-| `src/af2/multimer/template.js` | **6.5e-5** | **3.0e-4** |
+| `webgpu/af2/multimer/template.js` | **6.5e-5** | **3.0e-4** |
 | `tools/oracle/template_reference.py` | 1.0e-2 | 2.5e-1 |
 
 🔴 **SO THE numpy REFERENCE'S PAIR BLOCKS ARE WRONG, AND ITS BANNER SAYS SO.**
@@ -59,7 +59,7 @@ reports int8 quantisation as a fault - use `model.f32-backup`.
 version defaulted `asymId` to all zeros - every token in chain 0 - which is
 right for a monomer and silently lets a template speak across a complex's
 chains. AF3 had the identical bug, measured at relRMS 1.09. A template with no
-chain ids now raises, and `src/af2/multimer/model.js` hands the ids over from the
+chain ids now raises, and `webgpu/af2/multimer/model.js` hands the ids over from the
 feature set. Inter-chain templates are opt-in per slot there too, and moving
 the term by relRMS 7.3e-2 is what `tools/gpu/check-multimer-template.js`
 asserts, since AF2 has no oracle for something it does not do.
@@ -78,16 +78,16 @@ before the manifest was read.
 
 ## 🔴 THE MONOMER TERM WAS ORACLE-CHECKED AND WIRED TO NOTHING
 
-Everything above measures `src/af2/evoformer/template.js` against AF2's own
+Everything above measures `webgpu/af2/evoformer/template.js` against AF2's own
 module. None of it asks whether a template can REACH it, and the answer for the
-monomer driver was no: `src/af2/model/monomer.js` built its
+monomer driver was no: `webgpu/af2/model/monomer.js` built its
 `QueryOnlyTemplateGpu.run({...})` call from a literal that named neither
 `template` nor `useTemplateUnitVector`, so `recycleOptions.template` was
 accepted by the term, forwarded by the MULTIMER, and dropped on the floor here.
-The same literal in `src/af2/model/query-only.js`.
+The same literal in `webgpu/af2/model/query-only.js`.
 
 This is CLAUDE.md's allow-list trap for the third time at this seam - `predictA3m`
-dropping `pairHost` and killing the contact overlay, `src/af2/multimer/model.js`
+dropping `pairHost` and killing the contact overlay, `webgpu/af2/multimer/model.js`
 dropping the whole multimer regime - and it is the same fix: **forward the
 object**, or at minimum forward every field the callee reads.
 
@@ -115,7 +115,7 @@ AF3's featuriser builds a DENSE-24 slot - per-residue conformer order, whatever
 the CCD says that residue's atoms are - and AF2's template term reads **atom37**,
 a fixed table where slot 0 is N, 1 is CA, 2 is C, 3 is CB and 4 is O. The two
 are the same length only by coincidence and the same ORDER never.
-`templateSlotAtom37` in `src/af3/featurise/template-input.js` indexes by atom
+`templateSlotAtom37` in `shared/af3/featurise/template-input.js` indexes by atom
 NAME against that table and drops what the table does not name; a token no
 residue covers is left at the GAP restype with no atoms, which is what
 `AF2_ATOM37_MONOMER`'s consumers expect.
@@ -127,8 +127,8 @@ with the slot mapping perturbed. 🔴 Compare through `Math.fround`: the slot st
 is a `Float32Array` and a parsed PDB coordinate is a double, so an exact
 comparison fails on a correct conversion.
 
-🔴 **AND THE TABLE MOVED TO `src/af3/featurise/template-features.js`.** It was in
-`src/design/mpnn/constants.js`, and importing it from the featuriser is an
+🔴 **AND THE TABLE MOVED TO `shared/af3/featurise/template-features.js`.** It was in
+`cpu/design/mpnn/constants.js`, and importing it from the featuriser is an
 `af3 <-> design` cycle. It sits beside `AF2_ATOM37_MONOMER` now - the layout and
 the dialect that describes it in one file - and mpnn re-exports it.
 
@@ -293,7 +293,7 @@ Every optimisation in docs/A100.md went into AF3.
 🔴 **AND THE FIRST PLACE TO LOOK IS ACTIVATION PRECISION, WHICH IS MEASURED AND
 NOT GUESSED AT.** Their monomer defaults three storages to f16 -
 `triangleWholeStorage`, `msaStorage`, `pairStorage` - and `WebGpuExecution.allocate`
-here takes `storage = "f32"` with **no caller in `src/af2/evoformer/` or `src/af2/model/`
+here takes `storage = "f32"` with **no caller in `webgpu/af2/evoformer/` or `webgpu/af2/model/`
 passing anything else**. Every evoformer tensor in this path is f32. At 825
 residues that is:
 
@@ -438,7 +438,7 @@ corner tiles guarded, bit-exact: `fold-af2.js` returns -1805925 at TILE = 1, 8,
 
 Flat across a 64x range, and if anything the tiles lose. **The diagnosis was
 wrong**: those reads were already cache-served, exactly as
-src/af3/trunk/outer-product-mean-webgpu.js records for its own version of the same
+webgpu/af3/trunk/outer-product-mean-webgpu.js records for its own version of the same
 question ("staging the rows was tried and lost... those reads were cache-served
 anyway"). The kernel is issue-bound at 59% of the f32 ceiling, not starved of
 bandwidth. The code was reverted; what is left to try on it is a
@@ -483,7 +483,7 @@ because the shader no longer reads `p.heads` in its loop.
 ## AF2's triangle was not asking the device for its projection tile
 
 `trianglePairProjectTile` has been in the Ampere prior since the pairformer's
-own sweep chose 32x32 over src/kernels/triangle/shaders.js's 32x16. AF2's evoformer and
+own sweep chose 32x32 over webgpu/kernels/triangle/shaders.js's 32x16. AF2's evoformer and
 multimer blocks call the same `createTriangleShaders` and passed the default, so
 the pair track ran one tile in AF3 and another in AF2 **on the same device**.
 
@@ -544,7 +544,7 @@ priced at 8.3e-4 by the table above.
 shares, so the traffic per pair is `512 KiB / P` and the whole game is raising
 P. What caps P is that a workgroup stages every cell for every pair -
 `CELLS * P * 4` bytes, 16 KiB at P = 4 - which is why the sweep turned back up
-at 8. src/af3/trunk/outer-product-mean-webgpu.js chunks the same matrix for the same
+at 8. webgpu/af3/trunk/outer-product-mean-webgpu.js chunks the same matrix for the same
 reason (`OPM_CELL_CHUNK`, swept to 256 there), so AF2's was chunked to match:
 stage `CELL_CHUNK` cells at a time, keep the accumulators across the chunk loop,
 take P to 16.
@@ -644,7 +644,7 @@ of magnitude off its ceiling and each was invisible to a profile sorted by name.
 flops, and anything under a few percent of the device is this.**
 
 🔴 **AND THE MULTIMER'S COPIES ARE GONE RATHER THAN FIXED TWICE.** Both kernels
-were verbatim in `src/af2/multimer/block.js` with the same fault. This pair had
+were verbatim in `webgpu/af2/multimer/block.js` with the same fault. This pair had
 already been copied once, so the multimer imports the generators now.
 
 ### And 2.5 s of a one-pass fold is one-time cost, paid in whichever stack runs first
@@ -666,7 +666,7 @@ AlphaFold's default 3 recycles is 2%.
 
 The steady-state extra block is 735 ms against the profiler's 361 ms of GPU, so
 about half of even the warm number is host - `encodeExtraMsaBlock` packs and
-uploads its weights per block per pass, which src/runtime/execution.js's own note
+uploads its weights per block per pass, which webgpu/runtime/execution.js's own note
 already prices at "221 ms of packing paid once instead of four" for the main
 stack.
 
@@ -788,7 +788,7 @@ identical. The two are `rowScaleOffset` and `scaleIndex`, and the shared kernel
 refuses both at once.
 
 The denominator becomes its own pass, which is the move
-src/af3/trunk/outer-product-mean-webgpu.js already made for the same reason: the work
+webgpu/af3/trunk/outer-product-mean-webgpu.js already made for the same reason: the work
 is `pairs x sequences` either way, and a GEMM has nowhere to put a cooperative
 reduction. `opmMatrixContract` and `opmMatrixOutput` are separate knobs, which
 is what bisected the NaN in three runs.
@@ -893,7 +893,7 @@ is deleted is the inference.
 
 ### And the kernel: 1.69x, and none of it came from the units
 
-`src/kernels/attention-matrix.js` is that kernel, written from the published
+`webgpu/kernels/attention-matrix.js` is that kernel, written from the published
 algorithm rather than from their source, which carries no licence. It reached
 **69.3 ms against the register kernels' 116.9** across an 825-residue block's
 four attentions - inside the 1.66x-1.84x they report - and every step of getting
@@ -1232,7 +1232,7 @@ already issuing those workgroups, they were just writing the wrong place.
 **Two independent ports now agree to 0.06 pLDDT on the same input**, which is
 the strongest statement either of them can make about being right.
 
-🔴 **AND THE MULTIMER HAD ITS OWN COPY.** `src/af2/multimer/block.js` builds the same
+🔴 **AND THE MULTIMER HAD ITS OWN COPY.** `webgpu/af2/multimer/block.js` builds the same
 kernel from the same source with the same `linearGrid` dispatch, and carried the
 same missing term. Fixed identically - but **untested on this box**, which has
 only the monomer bundle: `--family=multimer` cannot load its weights here.
@@ -1299,7 +1299,7 @@ located it in the trunk rather than the structure module.
 
 The whole fix is `if (index >= arrayLength(&base)) { return; }`. `arrayLength` is
 exact because `dispatch` binds the tensor's own range, not the whole buffer.
-`src/runtime/elementwise.js` had the identical hole and is harmless only because
+`webgpu/runtime/elementwise.js` had the identical hole and is harmless only because
 its excess invocations all store the SAME value, which a `+=` does not.
 
 **The rule that replaces the old audit** is in `test/folded-grid-guard.test.js`,
@@ -1341,7 +1341,7 @@ with no error anywhere. The probe that exists to catch precisely this had been
 disabled by the same commit, in the same way, at the same time.
 
 🔴 **AND THE FIX WAS ALREADY WRITTEN, IN THE FILE NEXT DOOR.**
-`src/af2/multimer/model.js` forwards the whole options object and says why:
+`webgpu/af2/multimer/model.js` forwards the whole options object and says why:
 
 > *"This used to hand-copy five named options, which silently DROPPED the entire
 > multimer regime ... so every fold through this entry point ran multimer
@@ -1425,7 +1425,7 @@ Re-measure the arm you are comparing against, in the tree you are comparing in.
 | everything else | ~10 | 4% |
 
 The two MSA attention projections issue **16.8 TFLOP/s each, 47% of the 36.0
-this card's f16 vector path can reach** - and `src/kernels/matrix-linear.js`
+this card's f16 vector path can reach** - and `webgpu/kernels/matrix-linear.js`
 measures its staged matrix form at 28.2, on a K of 256 that satisfies every
 condition docs/A100.md sets for the units. That, not a better tile, is the next
 thing to try: 37.3 ms of q/k/v/gate and 21.9 of output projection, against a
@@ -1519,7 +1519,7 @@ rather than directly.
 
 It is a reduction over residues and an argmax over centres, so it is a kernel:
 one workgroup an extra row, the centres split across 64 lanes, a tree join.
-`src/input/nearest-centres-webgpu.js`.
+`webgpu/input/nearest-centres-webgpu.js`.
 
 🔴 **THE TIE RULE IS THE WHOLE RISK AND IT IS IN THE PACK, NOT IN A
 COMPARISON.** The host keeps the FIRST centre at an equal score. The join packs
@@ -1768,7 +1768,7 @@ distinct, 413 duplicates - 5.1%**. At the page's default 128:256 that is about
 **20 of 384 rows** spent on sequences the model has already seen.
 
 🔴 **AND THE CODEBASE ALREADY ARGUES THIS, ONE FILE OVER.**
-`deduplicateUnpairedAgainstPaired` in src/input/chains.js does exactly this for
+`deduplicateUnpairedAgainstPaired` in shared/input/chains.js does exactly this for
 the multimer's paired and unpaired blocks, with the reasoning written out - "it
 is not a tidiness pass, it is the MSA budget... a duplicate does not merely add
 nothing, it evicts a sequence that would have added something" - and with the
@@ -1840,7 +1840,7 @@ cannot differ, since `generateMmseqs2Msa` already refuses an A3M whose query is
 not what it asked about - so the guard costs the search path nothing and
 protects the two paths a reader controls.
 
-The decision is `foldsAsSingleSequence` in src/input/a3m.js rather than inline
+The decision is `foldsAsSingleSequence` in shared/input/a3m.js rather than inline
 in web/app.js, because node cannot import that file - it wants a DOM - and
 `test/a3m-distinct-sequences.test.js` covers the query-mismatch case, the
 complex's concatenated query, insertions, and gaps.
@@ -2083,9 +2083,9 @@ FIRST thing to fail, and what it is not worth is a longer complex.
 🔴 **AND WINDOWING THE TRIANGLE WOULD BE WORTH NOTHING, BECAUSE 2,047 IS A TIE
 OF TWENTY-EIGHT.** The table above names the triangle because the probe returned
 the first row of a sorted list, and reading it that way is how a session came to
-be spent asking whether `src/kernels/triangle/webgpu.js` could bind ranges. It cannot,
+be spent asking whether `webgpu/kernels/triangle/webgpu.js` could bind ranges. It cannot,
 and it does not matter twice over: that module is the STANDALONE kernel that
-`check-triangle.js` drives, and the fold's triangle is `src/af2/evoformer/block.js`
+`check-triangle.js` drives, and the fold's triangle is `webgpu/af2/evoformer/block.js`
 and its multimer twin, which dispatch through `execution.view()`-capable
 tensors and could be windowed. The reason not to is the count. Every dispatch
 binding an `L^2 * cZ` f32 tensor crosses 2 GiB at the same residue, and there
@@ -2360,7 +2360,7 @@ efficiency, and closing it completely does not reach JAX.
 
 🔴 **AND THE REMAINDER IS PRECISION - BUT NOT AS AN ACTIVATION-PACKING JOB, AND
 THE PARAGRAPH THAT USED TO STAND HERE WAS WRONG TWICE.** It said all 79
-activation allocations in `src/af2/evoformer/`, `src/af2/model/` and `src/af2/multimer/` are
+activation allocations in `webgpu/af2/evoformer/`, `webgpu/af2/model/` and `webgpu/af2/multimer/` are
 f32 because "a grep for a storage argument returns zero". The grep matched a
 LITERAL `"f16"`, and the storage is passed as a variable: parsing the calls
 instead, **16 of 102 pass a storage argument**, and they are the ones that
@@ -2673,7 +2673,7 @@ way no gate can see. The output is an ordinary bundle in a codec that already
 ships (int3, group 128, asymmetric - ESM-C's) plus a `delta` header listing
 which tensors are added, carried whole, or absent.
 
-`src/bundles/delta-tensor-store.js` reads one. It offers no `tensorSource`, and
+`shared/bundles/delta-tensor-store.js` reads one. It offers no `tensorSource`, and
 that absence is the interface: a source is "the codes are these bytes" and no
 shard holds this model's codes, so every weight is reconstructed on the host.
 Measured cost **1092 ms against 637** on a 59-residue fold - a fixed ~455 ms -
@@ -2849,7 +2849,7 @@ HOLDS: model_2 to model_5 now sit on the int5 base and fold the gate sequence at
 63.192 / 59.228 / 62.130 / 66.194.
 
 🔴 **AND `bundle.bytes` IS THE SHARD CACHE'S KEY, WHICH THIS NEARLY LOST.**
-`cacheToken` in src/bundles/http-tensor-store.js is `model-bytes-tensorCount`,
+`cacheToken` in shared/bundles/http-tensor-store.js is `model-bytes-tensorCount`,
 and `quantize_af3.py` was carrying the SOURCE manifest's bundle block through
 unchanged - so the packed AF2 bundle inherited `encoding: float32-le` and no
 byte count at all, which falls back to 0. Two different exports of one model
@@ -2943,7 +2943,7 @@ them the multimer's merge" - and the three tests BESIDE that table still read th
 name.
 
 **The rule, and where it lives.** `graphFamily` in
-`src/bundles/manifests/index.js` resolves a delta to its base. Everything decided
+`shared/bundles/manifests/index.js` resolves a delta to its base. Everything decided
 by the GRAPH goes through it - the driver, the pairing, the ranking; everything
 decided by the WEIGHTS keeps the resolved name - the shard cache key, the
 download stem, the label. `web/model.js`'s `?model=` override is the one test

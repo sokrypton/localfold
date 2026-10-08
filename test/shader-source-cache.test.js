@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   shaderSource, shaderSourceSet, setShaderSourceVerification, shaderSourceVerification,
-} from "../src/runtime/shader-source-cache.js";
+} from "../webgpu/runtime/shader-source-cache.js";
 
 // A device is only ever a WeakMap key here, so a bare object stands in for one.
 const device = () => ({});
@@ -60,7 +60,7 @@ test("a set is built once and verified as a whole", () => {
 });
 
 test("the pipeline cache compiles a shader without the constants it never reads", async () => {
-  const { stripUnusedConstants } = await import("../src/runtime/pipeline-cache.js");
+  const { stripUnusedConstants } = await import("../webgpu/runtime/pipeline-cache.js");
   const source = [
     "const TOKENS: u32 = 68u;",
     "const WIDE: u32 = TOKENS * 2u;",
@@ -77,7 +77,7 @@ test("the pipeline cache compiles a shader without the constants it never reads"
 });
 
 test("a kernel's length constants become uniforms only where WGSL allows it", async () => {
-  const { lengthPlan, lengthSkeleton, genericLengthSource } = await import("../src/runtime/pipeline-cache.js");
+  const { lengthPlan, lengthSkeleton, genericLengthSource } = await import("../webgpu/runtime/pipeline-cache.js");
   const at = (tokens) => [
     "const L: u32 = " + tokens + "u;",
     "const C: u32 = 128u;",

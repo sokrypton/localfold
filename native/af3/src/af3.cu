@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
       TAP().offer({{bytes, pairs}}, [path, pairs](const char* host, const std::vector<size_t>&) { writeWhole(path, host, pairs); });
     };
     // --recycle-tolerance: stop once two consecutive passes moved the distogram's predicted distances less than it
-    // (the page's rule, src/af3/feature-convergence.js shouldStopRecycling - one crossing is not enough, GB1's trunk
+    // (the page's rule, shared/af3/feature-convergence.js shouldStopRecycling - one crossing is not enough, GB1's trunk
     // dips under 0.5 A and then moves 1.09 A); off (0) by default, as on the page
     std::vector<double> changes;
     int passesRun = lastPass + 1;
@@ -494,7 +494,7 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> seeds;
     for (size_t k = 0; k < cn; ++k) seeds.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
     if (SAMPLER_FLOW && M.flag("trunk.dialect.noFlowSampler")) {
-      // the page's own rule (noFlowSampler, src/af3/dialect.js): this checkpoint's walk collapses the
+      // the page's own rule (noFlowSampler, shared/af3/dialect.js): this checkpoint's walk collapses the
       // backbone while its pLDDT reads as if nothing were wrong
       fprintf(stderr, "this checkpoint has no working flow sampler - fold it with diffusion\n"); return 1;
     }

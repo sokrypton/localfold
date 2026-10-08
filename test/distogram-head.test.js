@@ -11,7 +11,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { distogramBreaks, distogramContactProbabilities, distogramLogits,
-  FIRST_BREAK, LAST_BREAK } from "../src/heads/distogram.js";
+  FIRST_BREAK, LAST_BREAK } from "../shared/heads/distogram.js";
 
 const CHANNELS = 4;
 const BINS = 6;

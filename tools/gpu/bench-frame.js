@@ -24,9 +24,9 @@
  * paint. "Looks" is doing real work in that sentence: to settle it, instrument
  * onFrame in web/app.js and read the numbers off a real fold.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { toPdb, normalFrom } from "../../src/af3/fold.js";
-import { yieldToBrowser } from "../../src/runtime/yield.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { toPdb, normalFrom } from "../../webgpu/af3/fold.js";
+import { yieldToBrowser } from "../../webgpu/runtime/yield.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

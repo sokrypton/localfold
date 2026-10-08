@@ -5,7 +5,7 @@
  *       --model=/model-intellifold2-int5/manifest.json --sequence=<...> --budget=0
  *
  * 🔴 THE BUDGET IS ONLY AS GOOD AS WHAT IT COUNTS. `noteAllocation`
- * (src/runtime/device-memory.js) is called by the allocators this port owns,
+ * (webgpu/runtime/device-memory.js) is called by the allocators this port owns,
  * and the budget refuses a fold against that sum - but on an A100 the driver
  * reported 1.4-2.1x the tracked peak (IntelliFold-2 at 512 residues: 8.4 GB
  * against 4.0), and a T4 budgeted from its own size ran past the card and lost
@@ -14,7 +14,7 @@
  * accounting never hears of (named here, by label, at the moment of the live
  * peak) or memory held below WebGPU after a release, which no buffer explains.
  */
-import { memorySnapshot } from "../../src/runtime/device-memory.js";
+import { memorySnapshot } from "../../webgpu/runtime/device-memory.js";
 
 const option = (args, name) => args.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 

@@ -25,11 +25,11 @@
  */
 import { batchFromDump } from "./fold.js";
 import { sidechainGeometry } from "./sidechain-geometry.js";
-import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { diffusionWeights, atomReference } from "../../src/af3/weights/diffusion-weights.js";
-import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { diffusionWeights, atomReference } from "../../shared/af3/weights/diffusion-weights.js";
+import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

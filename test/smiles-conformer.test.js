@@ -2,14 +2,14 @@ import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
 
-import { parseSmiles } from "../src/chem/smiles.js";
-import { valenceProblems } from "../src/chem/kekulize.js";
-import { smallestRings } from "../src/chem/rings.js";
-import { chiralCentres, doubleBondStereo } from "../src/chem/stereo.js";
-import { distanceBounds, smoothBounds, signedVolume } from "../src/chem/conformer.js";
+import { parseSmiles } from "../shared/chem/smiles.js";
+import { valenceProblems } from "../shared/chem/kekulize.js";
+import { smallestRings } from "../shared/chem/rings.js";
+import { chiralCentres, doubleBondStereo } from "../shared/chem/stereo.js";
+import { distanceBounds, smoothBounds, signedVolume } from "../shared/chem/conformer.js";
 import { ligandName, nameSmilesLigands, smilesComponent }
-  from "../src/chem/component.js";
-import { bondLength, idealAngle } from "../src/chem/geometry-tables.js";
+  from "../shared/chem/component.js";
+import { bondLength, idealAngle } from "../shared/chem/geometry-tables.js";
 
 /**
  * 🔴 THE GEOMETRY GATE IS `tools/check-smiles-conformer.mjs`, NOT THIS FILE.
@@ -212,7 +212,7 @@ describe("the boundaries, and the promise that a conformer does not drift", () =
    * in-process check is two directories up; this is the stronger claim, that
    * nothing in the module reads a clock or a global.
    *
-   * Verified by inspection too: `src/chem/` contains no `Math.random`, no
+   * Verified by inspection too: `shared/chem/` contains no `Math.random`, no
    * `Date.now`, no `fetch`, no `process`, no `document`, and imports exactly
    * one thing from outside itself (`ELEMENT_SYMBOLS`). The seed is
    * `hashOf(smiles)`, which is FNV-1a over the string.
@@ -220,7 +220,7 @@ describe("the boundaries, and the promise that a conformer does not drift", () =
   it("reads no clock, no global and no network", () => {
     for (const file of ["smiles.js", "kekulize.js", "rings.js", "stereo.js",
                         "geometry-tables.js", "conformer.js", "component.js"]) {
-      const text = readFileSync(new URL(`../src/chem/${file}`, import.meta.url), "utf8");
+      const text = readFileSync(new URL(`../shared/chem/${file}`, import.meta.url), "utf8");
       // Comments are stripped first: several of them discuss `performance` and
       // a gate that matches its own prose is a gate that cannot be documented.
       const code = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
@@ -232,7 +232,7 @@ describe("the boundaries, and the promise that a conformer does not drift", () =
   });
 
   it("names at most 99 distinct ligands, in three characters each", () => {
-    // 🔴 THREE, BECAUSE `src/af3/fold.js` WRITES THE RESIDUE NAME WITH
+    // 🔴 THREE, BECAUSE `webgpu/af3/fold.js` WRITES THE RESIDUE NAME WITH
     // `.padEnd(3)` INTO A FIXED-WIDTH COLUMN. A fourth character runs into the
     // chain id, and `LIG2` truncated back to `LIG` puts the collision that
     // this naming exists to prevent straight back.

@@ -1,15 +1,15 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "./harness.js";
-import { chainMaskFor, designChain } from "../src/design/mpnn-bridge.js";
-import { DESIGNER_NAMES, DESIGNERS } from "../src/design/designers.js";
-import { Model, sequenceToString } from "../src/design/mpnn/model.js";
-import { NA_ALPHABET } from "../src/design/mpnn/na.js";
-import { ALPHABET } from "../src/design/mpnn/constants.js";
-import { Weights } from "../src/design/mpnn/weights.js";
-import { structureFromText } from "../src/design/mpnn/pdb.js";
-import { enableAcceleration } from "../src/design/mpnn/accel.js";
-import { uniformFrom } from "../src/af3/fold.js";
+import { chainMaskFor, designChain } from "../cpu/design/mpnn-bridge.js";
+import { DESIGNER_NAMES, DESIGNERS } from "../cpu/design/designers.js";
+import { Model, sequenceToString } from "../cpu/design/mpnn/model.js";
+import { NA_ALPHABET } from "../cpu/design/mpnn/na.js";
+import { ALPHABET } from "../cpu/design/mpnn/constants.js";
+import { Weights } from "../cpu/design/mpnn/weights.js";
+import { structureFromText } from "../cpu/design/mpnn/pdb.js";
+import { enableAcceleration } from "../cpu/design/mpnn/accel.js";
+import { uniformFrom } from "../webgpu/af3/fold.js";
 
 const path = (name) => fileURLToPath(new URL(name, import.meta.url));
 

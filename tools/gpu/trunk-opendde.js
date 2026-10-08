@@ -19,14 +19,14 @@
  * contacts at precision 0.9" has nothing to be good or bad against, and a
  * harness fault that flattered both would be invisible.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { buildTargetFeat } from "../../src/af3/fold.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
-import { af3ContactClasses } from "../../src/af3/featurise/contact-classes.js";
-import { memorySnapshot } from "../../src/runtime/device-memory.js";
-import { af3Dialect, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
-import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
-import { contactAngstromsForClasses } from "../../src/heads/contact-threshold.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { buildTargetFeat } from "../../webgpu/af3/fold.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { af3ContactClasses } from "../../shared/af3/featurise/contact-classes.js";
+import { memorySnapshot } from "../../webgpu/runtime/device-memory.js";
+import { af3Dialect, openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
+import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";
+import { contactAngstromsForClasses } from "../../shared/heads/contact-threshold.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

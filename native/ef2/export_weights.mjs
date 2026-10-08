@@ -12,7 +12,7 @@
 // inner-major linears), which is the point: those conversions are checked, and the CUDA side
 // reads them rather than converting again.
 import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
-import { readTensor } from "../../src/weights/dtype.js";
+import { readTensor } from "../../shared/weights/dtype.js";
 
 const args = process.argv.slice(2);
 const out = args.find((a) => !a.startsWith("--"));

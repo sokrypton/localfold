@@ -38,12 +38,12 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 
 def decode_bundle(bundle_dir, scratch, delta_dir=None):
     """the bundle decoded by the page's own reader: name -> float32 array (flat). With a delta bundle, the
-    model it reconstructs, as src/bundles/delta-tensor-store.js reconstructs it: `addTo` the base rounded
+    model it reconstructs, as shared/bundles/delta-tensor-store.js reconstructs it: `addTo` the base rounded
     to float16 plus the delta, `whole` the delta's own, `absent` gone, anything else the base's"""
     script = os.path.join(scratch, "decode_bundle.mjs")
     with open(script, "w") as f:
         f.write(f'''import {{ readFileSync, writeFileSync, openSync, writeSync, closeSync }} from "node:fs";
-import {{ readTensor }} from "{REPO}/src/weights/dtype.js";
+import {{ readTensor }} from "{REPO}/shared/weights/dtype.js";
 const [dir, out, deltaDir] = process.argv.slice(2);
 const read = (d) => {{
   const m = JSON.parse(readFileSync(`${{d}}/manifest.json`, "utf8")); const shards = new Map();

@@ -1,12 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "./harness.js";
 import { create, globals } from "webgpu";
-import { InputEmbedderGpu } from "../src/af2/evoformer/input-embedder.js";
-import { EvoformerStackGpu, ExtraMsaPairStackGpu } from "../src/af2/evoformer/stack.js";
-import { QueryOnlyTemplateGpu } from "../src/af2/evoformer/template.js";
-import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
-import { FileTensorStore } from "../src/bundles/tensor-store.js";
-import { ElementwiseAddGpu } from "../src/runtime/elementwise.js";
-import { errorMetrics } from "../src/kernels/triangle/types.js";
+import { InputEmbedderGpu } from "../webgpu/af2/evoformer/input-embedder.js";
+import { EvoformerStackGpu, ExtraMsaPairStackGpu } from "../webgpu/af2/evoformer/stack.js";
+import { QueryOnlyTemplateGpu } from "../webgpu/af2/evoformer/template.js";
+import { AlphaFoldFixture } from "../shared/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../shared/bundles/tensor-store.js";
+import { ElementwiseAddGpu } from "../webgpu/runtime/elementwise.js";
+import { errorMetrics } from "../webgpu/kernels/triangle/types.js";
 
 const enabled = process.env.LOCALFOLD_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
