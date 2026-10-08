@@ -1,11 +1,18 @@
 // --profile: CUPTI's activity API records every kernel's start and end on the device; a table
 // of GPU time by kernel name (and the share of the wall the device was busy) for the warm fold.
+// CUPTI is LOADED when --profile asks for it (dlopen), never linked: a fold needs no CUPTI, and a prebuilt binary
+// (the wheel) must not depend on a library only the profiler reads.
 #pragma once
 #include <cupti.h>
 #include <cxxabi.h>
+#include <dlfcn.h>
 #include <memory>
 
 namespace prof {
+inline CUptiResult (*getNextRecord)(uint8_t*, size_t, CUpti_Activity**) = nullptr;
+inline CUptiResult (*registerCallbacks)(CUpti_BuffersCallbackRequestFunc, CUpti_BuffersCallbackCompleteFunc) = nullptr;
+inline CUptiResult (*enable)(CUpti_ActivityKind) = nullptr;
+inline CUptiResult (*flushAll)(uint32_t) = nullptr;
 inline std::map<std::string, std::pair<double, int>> byName;   // name -> (ns, calls)
 inline uint64_t first = UINT64_MAX, last = 0; inline double busy = 0;
 inline bool on = false;
@@ -21,7 +28,7 @@ inline std::string shortName(const char* mangled) {
 }
 inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_t, size_t validSize) {
   CUpti_Activity* record = nullptr;
-  while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
+  while (getNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
     if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL || record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
       auto* k = (CUpti_ActivityKernel5*)record;
       if (!on) continue;
@@ -34,13 +41,21 @@ inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_
   free(buffer);
 }
 inline void init() {
-  cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted);
-  cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+  void* lib = dlopen("libcupti.so.12", RTLD_NOW | RTLD_GLOBAL);
+  if (!lib) lib = dlopen("libcupti.so", RTLD_NOW | RTLD_GLOBAL);
+  if (!lib) { fprintf(stderr, "--profile needs CUPTI (libcupti.so.12, the CUDA toolkit's extras/CUPTI/lib64): %s\n", dlerror()); exit(1); }
+  getNextRecord = (decltype(getNextRecord))dlsym(lib, "cuptiActivityGetNextRecord");
+  registerCallbacks = (decltype(registerCallbacks))dlsym(lib, "cuptiActivityRegisterCallbacks");
+  enable = (decltype(enable))dlsym(lib, "cuptiActivityEnable");
+  flushAll = (decltype(flushAll))dlsym(lib, "cuptiActivityFlushAll");
+  if (!getNextRecord || !registerCallbacks || !enable || !flushAll) { fprintf(stderr, "--profile: this CUPTI lacks the activity API\n"); exit(1); }
+  registerCallbacks(bufferRequested, bufferCompleted);
+  enable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
 }
-inline void start() { cuptiActivityFlushAll(0); byName.clear(); busy = 0; first = UINT64_MAX; last = 0; on = true; }
+inline void start() { flushAll(0); byName.clear(); busy = 0; first = UINT64_MAX; last = 0; on = true; }
 inline void stop(int top = 25) {
   CK(cudaDeviceSynchronize());
-  cuptiActivityFlushAll(0);
+  flushAll(0);
   on = false;
   std::vector<std::pair<std::string, std::pair<double, int>>> rows(byName.begin(), byName.end());
   std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });

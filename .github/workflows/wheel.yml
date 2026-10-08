@@ -1,0 +1,45 @@
+# The localfold wheel: the three native CUDA ports prebuilt for every current NVIDIA card (sm_75 to sm_120, PTX past
+# that), in one py3-none-manylinux_2_28_x86_64 wheel - `pip install` and run, no compiler. No GPU is needed to build
+# it; the test job installs it on a GPU-less runner and checks every binary loads and answers --help, which is what
+# proves the RPATH finds pip's cuBLAS. Run by hand, or by pushing a v* tag; publishing to PyPI is not done here.
+name: Build wheel
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (CUDA 12.8 in manylinux_2_28)
+        run: bash python/manylinux_build.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install into a fresh environment
+        run: |
+          python -m venv /tmp/lf && /tmp/lf/bin/pip install -q ./localfold-*.whl
+      - name: Every binary loads (cuBLAS through the RPATH) and answers --help
+        run: |
+          for p in af3 af2 ef2; do
+            bin=$(/tmp/lf/bin/python -c "import localfold; print(localfold.binary('$p'))")
+            ldd "$bin" | grep -E "cublas|not found"
+            ! ldd "$bin" | grep -q "not found"
+            /tmp/lf/bin/localfold-$p --help | head -3
+          done

@@ -137,3 +137,8 @@ cuda/featurise/fetch-weights
 cuda/featurise/standalone.o
 cuda/featurise/*.stamp
 cuda/featurise/*.building
+
+# the localfold wheel's build products (python/build_wheel.sh)
+python/dist/
+python/build/
+python/*.egg-info/

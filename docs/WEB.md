@@ -4398,3 +4398,19 @@ told the website's int5 bundles from af3-any-model's blobs of the same names, an
 gone. ESM-C and ESM2 3B live in `cuda/plm` as components (Chai-1 stays in the AF3 family; its network is AlphaFold 3's).
 Every fold is byte-identical across the renames and the move; `cuda/crosscheck.sh`, which compiled the ports with a
 bare nvcc line that cannot link the standalone object, builds through `cuda/build.sh` now.
+
+## 🔴 A wheel: `pip install localfold`, no compiler (2026-10-08)
+
+`.github/workflows/wheel.yml` builds one `py3-none-manylinux_2_28_x86_64` wheel carrying `localfold-af3`, `-af2` and
+`-ef2` compiled for sm_75, 80, 86, 89, 90, 100 and 120 with sm_120's PTX for anything newer (`python/manylinux_build.sh`:
+CUDA 12.8 from NVIDIA's RHEL 8 repository inside pypa's manylinux_2_28 image, then `python/build_wheel.sh`). No GPU
+is needed to build it; its test job installs it on a GPU-less runner and checks every binary loads and answers
+`--help`. Built here in that same container: **58 MB** (the binaries 34 / 55 / 59 MB stripped), glibc 2.27 at most,
+~8 minutes on 30 cores. cuBLAS is the one library not carried: the wheel depends on `nvidia-cublas-cu12>=12.8` and each
+binary's RPATH is `$ORIGIN/../../nvidia/cublas/lib`, verified by `ldd` from a fresh virtualenv. CUPTI is loaded by
+`--profile` when asked (dlopen) and no longer linked. Folded on this A100 from the installed wheel against this box's
+own sm_80 builds: ESMFold2 600M and 300M byte-identical, AlphaFold 3 and Chai-1 within 0.08 A, AF2 within 0.21 A;
+a confident multimer (1BRS with its crystal as a template) identical to three decimals (0.216 / 0.231 A against the
+crystal both ways), and only an undetermined single-sequence complex (pLDDT 36) wandering 8 A, which a different
+cuBLAS build is enough to do. 🔴 `workflow_dispatch` is offered only once the workflow is on the default branch;
+until then a `v*` tag runs it. Publishing to PyPI is not in it.
