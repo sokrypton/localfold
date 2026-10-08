@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-358 tools. `tools/fixtures/` is data and is not listed.
+359 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -293,7 +293,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (96)
+## `tools/` - everything else (97)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -339,6 +339,7 @@ go through CDP, and the deploy.
 - **`check-smiles-path.mjs`** - The same ligand from a CCD code and from a SMILES string folds the same way.
 - **`check-smiles-rewrites.mjs`** - The same molecule written a thousand different ways is still that molecule.
 - **`check-smiles-vs-rdkit.mjs`** - Does this port read a SMILES the way RDKit does? Formula, atoms, bonds, rings.
+- **`check-standalone.py`** - Gate the standalone ports: `cuda/<port>/<port> --job=... --out=...` against the two-step path it replaces.
 - **`check-stereo-vs-rdkit.mjs`** - Does a `@` in a SMILES mean the same hand here as it does to RDKit?
 - **`check-stock-flags.mjs`** - Does every model fold on the browser a VISITOR has?
 - **`check-template-path.mjs`** - Every AF3-lineage model's TEMPLATE actually moves its fold.

@@ -501,6 +501,6 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `esmfold2 <featurised dir> ...` and `esmfold2 - --serve=<dir>` as before
 int main(int argc, char** argv) {
-  if (argc < 2 || !strncmp(argv[1], "--", 2)) return lf::standalone::main("esmfold2", argc, argv, foldMain);
+  if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("esmfold2", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

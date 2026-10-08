@@ -9,7 +9,7 @@ featuriser binary's directory. Each case runs both ways - `cuda/featurise/<port>
 `cuda/<port>/<port> <dir> ...`, and the standalone command - and holds the two PDBs to the SAME BYTES, so a flag the
 standalone mode drops or misroutes (an input flag reaching the fold, af2's --recycles reaching only one of the
 two) is a difference here rather than a quietly different fold. Beside them: refusals come back as the page's
-sentence with a nonzero status, `--frames=` streams what the page draws, a weights home is honoured
+sentence with a nonzero status (an input flag the port does not read is one of them, never dropped), `--frames=` streams what the page draws, a weights home is honoured
 (LOCALFOLD_HOME), and with --network a searched alignment is kept as <out>.a3m.
 
 Needs the GPU and the weights the worker uses (fetched on first use).
@@ -70,7 +70,8 @@ def main():
         ("af2 multimer barnase-barstar (job)", "af2", [f"--job={JOBS}/barnase_barstar.json"], "model_1_multimer_v3",
          [f"--bundle={home}/model-multimer"], [f"--bundle={home}/model-multimer", "--fast"]),
         ("esmfold2 600M calmodulin (job, ions)", "esmfold2", [f"--job={JOBS}/calmodulin_4calcium.json"], "esmfold2-fast-600m",
-         [f"--fold-bundle={home}/model-esmfold2-int5"], [f"--fold-bundle={home}/model-esmfold2-int5", f"--esmc-bundle={home}/model-esmc-600m-int3", "--fast"]),
+         [f"--fold-bundle={home}/model-esmfold2-int5"], [f"--fold-bundle={home}/model-esmfold2-int5", f"--esmc-bundle={home}/model-esmc-600m-int3", "--fast",
+          "--steps=64"]),      # (the per-atom floor the worker applies: four calcium ions are four atom tokens)
         ("esmfold2 300M 6mrr, seed 7", "esmfold2", [f"--sequence={S6}", "--seed=7"], "esmfold2-fast-300m",
          [f"--fold-bundle={home}/model-ef2-fast-300m-int5"], [f"--fold-bundle={home}/model-ef2-fast-300m-int5", f"--esmc-bundle={home}/model-esmc-300m-int3", "--fast", "--seed=7"]),
     ]
@@ -93,6 +94,7 @@ def main():
             ("an unknown model", "af3", [f"--sequence={S6}", "--model=nope"], "no model nope"),
             ("a template on ESMFold2", "esmfold2", [f"--sequence={S6}", "--template=x.pdb:A"], "esmfold2 takes no --template"),
             ("a SMILES ligand on AF2", "af2", [f"--sequence={S6}", "--smiles=OCC(O)CO"], "af2 takes no --smiles"),
+            ("an alignment on fast ESMFold2", "esmfold2", [f"--sequence={S6}", "--a3m=x.a3m"], "reads no alignment"),
         ]:
             r = run([os.path.join(CUDA, port, port), *args, f"--out={work}/x.pdb"])
             said = r.stdout + r.stderr

@@ -742,6 +742,6 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `af3 <featurised dir> ...` and `af3 - --serve=<dir>` as before
 int main(int argc, char** argv) {
-  if (argc < 2 || !strncmp(argv[1], "--", 2)) return lf::standalone::main("af3", argc, argv, foldMain);
+  if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("af3", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

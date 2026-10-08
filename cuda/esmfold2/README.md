@@ -23,7 +23,94 @@ what the CUDA backend (cuda/worker.py) hands the page. The 300M checkpoint folds
 same binary (`--fold-bundle=model-ef2-fast-300m-int5 --esmc-bundle=model-esmc-300m-int3`; `cuda/esmfold2/fold
 x.pdb --model=esmfold2-fast-300m --job=<job.json>`).
 
-## Run
+## Guide
+
+### Quick start
+
+`--help` prints every option; with no arguments the binary prints a short usage.
+
+```
+bash cuda/build.sh esmfold2                     # once: the binary for this GPU (and the featuriser it links)
+cuda/esmfold2/esmfold2 --sequence=GWSTELEKHREEL... --out=6mrr.pdb
+cuda/esmfold2/esmfold2 --job=tools/fixtures/af3-jobs/calmodulin_4calcium.json --out=cam.pdb
+```
+
+ESMFold2 folds from the sequence alone - its language model (ESM-C) stands in for the alignment - so there is no
+search to wait for and nothing leaves the machine. One command runs the whole protocol in one process: the
+weights are downloaded the first time, the input is featurised (the page's own featuriser, natively) and the
+fold writes the structure and its confidences. Nothing else is installed or started - no Python, no Node.
+
+Needs an NVIDIA GPU (T4 and newer), the CUDA toolkit to build (`nvcc`, cuBLAS) and `g++`, and `curl` for the
+first download.
+
+### Models
+
+| `--model=` | | download |
+|---|---|---:|
+| `esmfold2-fast-600m` (default) | biohub's experimental ESMFold2 on ESM-C 600M, with Synthyra's confidence head - the website's ESMFold2 | 129 MB + 224 MB (ESM-C) |
+| `esmfold2-fast-300m` | its 300M sibling, the website's other ESMFold2 row | 129 MB + 130 MB |
+| `esmfold2-fast`, `esmfold2` | biohub's two released checkpoints on ESM-C 6B - local exports only, not downloaded (see "The released models" below) | |
+
+The weights carry their authors' licences; check them before use beyond research.
+
+### Input
+
+- `--job=<job.json>` - an AlphaFold 3 job file: proteins, DNA, RNA, ligands by CCD code or SMILES, ions, modified
+  residues and declared bonds.
+- or `--sequence=<A>:<B>:...` with
+  - `--kinds=protein,dna,rna` - each chain's kind (protein when absent),
+  - `--ligands=GOL,ATP` - by CCD code; `--smiles='CCO|c1ccccc1'` - by SMILES, `|`-separated,
+  - `--modify=SEP@3[@<chain>]` - modified residues, `CODE@position` (1-based).
+
+**No templates**, and **no alignment for the two fast models**: `esmfold2-fast-600m` and `-300m` read none, so a
+`--template` or `--a3m` is refused by name rather than ignored. The released `esmfold2-fast` reads an alignment's
+profile and `esmfold2` also runs its MSA encoder over it: `--a3m=<a.a3m>[,<b.a3m>]`, one per protein chain.
+
+### Fold options
+
+| flag | default | |
+|---|---|---|
+| `--out=<path>` | `fold.pdb` | |
+| `--seed=N` | 0 | the sampler's noise (a job's `modelSeeds` are not read) |
+| `--steps=N` | 15, or 64 with a ligand or modified residue | scheduled sampler steps (15 runs 11). 🔴 Per-atom tokens - a ligand, an ion, a modified residue - are torn apart at the checkpoint's 15 and whole at 64, so a job carrying one is raised to 64 unless you set `--steps` |
+| `--frames=<dir>` | | intermediate results as they land (below) |
+
+### Output
+
+For `--out=fold.pdb`:
+
+| file | |
+|---|---|
+| `fold.pdb` | the structure, B-factors are pLDDT |
+| `fold_confidences.json` | per-atom pLDDT, the PAE matrix, contact probabilities, token chain/residue ids - AlphaFold 3's layout |
+| `fold_summary_confidences.json` | pTM, ipTM (complexes), mean pLDDT |
+
+### Watching a fold
+
+`--frames=<dir>` writes intermediate results while it runs - what the website draws live: `contacts-00-of-01.u8`
+once the trunk is done (an n x n byte map of contact probability x 255) and `frame-SSSS-NNNN.pdb` for every sampler
+step (step SSSS of NNNN). Files land complete, so a viewer can poll the directory.
+
+### Weights
+
+Downloaded once into `model-esmfold2-int5/` and `model-esmc-600m-int3/` (300M: `model-ef2-fast-300m-int5/`,
+`model-esmc-300m-int3/`) in the checkout the binary was built in, or under `LOCALFOLD_HOME` when it is set
+(`~/.cache/localfold` for a binary copied out of its checkout). `cuda/featurise/fetch-weights ef2-fast-600m esmc`
+fetches without folding.
+
+### Limits and errors
+
+- ESMFold2 keeps two 256-channel float32 pairs, so it is the hungriest of the three per token: large inputs take
+  memory-saving paths on their own (see "How large a fold fits" below).
+- A refusal is one sentence, `Error: ...`, and a nonzero exit.
+
+### On Colab and the website
+
+The website's Colab backend folds with this binary: `cuda/worker.py` keeps the model resident (`esmfold2 - --serve=<dir>`)
+and streams the trunk's contacts and every sampler frame to the page. See docs/WEB.md.
+
+
+## Run, in detail
 
 ```
 cuda/esmfold2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
@@ -34,13 +121,6 @@ cuda/esmfold2/fold lig.pdb --sequence=<SEQ> "--smiles=OCC(O)CO"
 cuda/esmfold2/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json
 ```
 
-🔴 **ONE BINARY, ONE COMMAND, NOTHING ELSE TO RUN** (cuda/featurise/standalone.h): `cuda/esmfold2/esmfold2 --job=<job.json>
---out=<pdb>` (or `--sequence=`, and any input flag `fold` takes) fetches the model's published weights the first
-time (`cuda/featurise/fetch-weights`'s code, into the checkout or `LOCALFOLD_HOME`), featurises the input in the same
-process while the device starts - the featuriser's own object, so the input is byte for byte what
-`cuda/featurise/esmfold2-featurise` writes - and folds; a searched alignment is kept as `<out>.a3m`, and `--frames=<dir>` writes
-each intermediate result as it lands (what the page draws live). No Node, no Python, no script: `bash cuda/build.sh` builds it. `fold` is a wrapper over it; a featurised directory as the first argument,
-and `--serve`, are the resident server cuda/worker.py drives for the page, unchanged.
 
 The input options are cuda/af3's exporter's, resolved the same way:
 - `--kinds`: one per chain, protein, dna or rna.

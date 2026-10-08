@@ -13,20 +13,137 @@ bases, covalent bonds, templates, several seeds and samples, its own `userCCD` -
 ranking CSV, and on request the embeddings and the distogram. 6MRR folds in 0.45 s warm, a
 1044-token complex in 8.4 s; `--af3-defaults` runs AF3's own 10 recycles and 5 samples.
 
-## Build and run
+## Guide
+
+### Quick start
+
+`--help` prints every option; with no arguments the binary prints a short usage.
+
+```
+bash cuda/build.sh af3                          # once: the binary for this GPU (and the featuriser it links)
+cuda/af3/af3 --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json --out=kras.pdb
+cuda/af3/af3 --sequence=GWSTELEKHREEL... --model=boltz2 --search --out=6mrr.pdb
+```
+
+One command runs the whole protocol in one process: the model's weights are downloaded the first time, the
+input is read and featurised (the page's own featuriser, natively), the MSA search runs if asked, and the fold
+writes the structure and its confidences. Nothing else is installed or started - no Python, no Node. Folding
+the KRAS job above takes 1.6 s from command to PDB on an A100 once the weights are on disk.
+
+Needs an NVIDIA GPU (T4 and newer: sm_75, sm_80, sm_86, sm_89, ...), the CUDA toolkit to build (`nvcc`,
+cuBLAS), `g++`, and `curl` and `gzip` at run time (the weight download and the MMseqs2 search).
+
+### Models
+
+`--model=` picks the checkpoint. All eight run through this one binary on af3-any-model's published int8
+weights (huggingface.co/sokrypton/af3-any-model), each with its own conventions (shared/af3/dialect.js).
+
+| `--model=` | | download |
+|---|---|---:|
+| `af3` (default) | AlphaFold 3 - Google DeepMind's parameters, **academic non-commercial use only**: the first download asks you to accept the [terms](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md), or set `LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3` | 350 MB |
+| `boltz2` | Boltz-2 | 487 MB |
+| `chai1` | Chai-1 - also downloads ESM2 3B (2.5 GB), whose embeddings it reads | 312 MB |
+| `protenix2` | Protenix-2 | 292 MB |
+| `intellifold2` | IntelliFold-2 | 800 MB |
+| `rosettafold3` | RoseTTAFold3 (diffusion sampler only) | 352 MB |
+| `opendde` | OpenDDE | 541 MB |
+| `openbind0` | OpenBind-0 | 351 MB |
+
+Every set of weights carries its authors' licence; check it before use beyond research.
+
+### Input
+
+**An AlphaFold 3 job file** - `--job=<job.json>`, either dialect (AlphaFold Server's or the open one). It is the
+fullest form: proteins, DNA, RNA, ligands by CCD code or SMILES, ions, glycans (a ligand chain of several
+components), modified residues and bases, declared covalent bonds (`bondedAtomPairs`), alignments and
+templates carried inline, `userCCD`, and `modelSeeds` (every seed is folded). All fourteen of AlphaFold 3's own
+example jobs fold (`tools/fixtures/af3-jobs/`).
+
+**Or flags**, for the common cases:
+
+| flag | |
+|---|---|
+| `--sequence=<A>:<B>:...` | the chains, joined by `:` (a comma inside a sequence is one chain with an unknown residue) |
+| `--kinds=protein,dna,rna` | each chain's kind, in order (protein when absent) |
+| `--ligands=GOL,ATP` | ligands by CCD code, one copy each |
+| `--smiles='CCO\|c1ccccc1'` | ligands by SMILES, `\|`-separated: the conformer is built natively |
+| `--modify=SEP@3[@<chain>]` | modified residues or bases, `CODE@position` (1-based), comma-separated |
+
+**The alignment**: none (single sequence) by default;
+- `--search` - the protein chains' alignments from the ColabFold MMseqs2 server, the paired block included for a
+  complex. **It sends your sequences to api.colabfold.com**, which is why it is a flag. The alignment is kept
+  beside the structure as `<out>.a3m`, so a second fold can reuse it with `--a3m=`.
+- `--a3m=<a.a3m>[,<b.a3m>]` - one per protein chain; `--paired-a3m=` for a complex's paired rows.
+- `--max-msa=1024` - rows kept.
+
+**Templates** (up to four slots):
+- `--template=<file>:<chain>[@<query chain>]` - a PDB or mmCIF structure aligned to a query chain (0-based, 0 when
+  absent); `+` joins parts into one slot spanning several chains, `,` separates slots. Example:
+  `--template=1brs.pdb:A@0+1brs.pdb:D@1` gives one slot over both chains of a complex.
+- `--search-templates` - each protein chain's best four hits from the same MMseqs2 search, fetched and aligned.
+
+### Fold options
+
+| flag | default | |
+|---|---|---|
+| `--out=<path>` | `fold.pdb` | `.cif` writes mmCIF |
+| `--samples=N` | 1 | diffusion samples a seed, ranked by AlphaFold 3's ranking score |
+| `--seed=N`, `--seeds=a,b,c` | the job's `modelSeeds`, else 42 | |
+| `--recycles=N` | 3 | trunk recycles (N+1 passes) |
+| `--recycle-tolerance=<A>` | off | stop recycling once the prediction moves less than this |
+| `--steps=N` | 200 | diffusion steps |
+| `--flow` | | the page's Flow sampler instead of diffusion (not `rosettafold3`, `chai1`) |
+| `--af3-defaults` | | AlphaFold 3's own run settings: 10 recycles, 5 samples |
+| `--frames=<dir>` | | every intermediate result as it lands (below) |
+| `--save-embeddings`, `--save-distogram` | | what AlphaFold 3's flags of the same names write |
+
+### Output
+
+For `--out=fold.pdb`:
+
+| file | |
+|---|---|
+| `fold.pdb` (or `.cif`) | the structure (the best sample when there are several), B-factors are pLDDT |
+| `fold_confidences.json` | per-atom pLDDT, the PAE matrix, contact probabilities, token chain/residue ids - AlphaFold 3's layout |
+| `fold_summary_confidences.json` | pTM, ipTM, per-chain and chain-pair pTM/ipTM, min PAE, `has_clash`, `fraction_disordered`, `ranking_score` |
+| `fold_sample<k>.pdb` + its two JSONs | each sample, when `--samples` or several seeds |
+| `fold_ranking_scores.csv` | seed, sample, ranking score |
+| `fold.a3m` | the searched alignment (`--search`) |
+
+### Watching a fold
+
+`--frames=<dir>` writes each intermediate result while the fold runs - what the website draws live:
+`contacts-PP-of-NN.u8` after every trunk pass (an n x n byte map of contact probability x 255) and
+`frame-SSSS.pdb` for every diffusion step's prediction. Files land complete (written then renamed), so a viewer
+can poll the directory.
+
+### Weights
+
+Downloaded once into `af3am-<model>/` in the checkout the binary was built in, or under `LOCALFOLD_HOME` when it
+is set (`~/.cache/localfold` for a binary copied out of its checkout). The download is locked, so two folds
+asking at once share one, and an interrupted one leaves nothing that reads as finished. `cuda/featurise/fetch-weights --af3-any-model <model>`
+fetches without folding.
+
+### Limits and errors
+
+- Up to ~6,000 tokens on a 40 GB A100 and ~3,200 on a 16 GB T4; past what the card holds it refuses up front and
+  says the longest it takes (see "How large a fold fits" below).
+- A refusal is one sentence, `Error: ...`, and a nonzero exit: an unknown model, a job the reader cannot take,
+  Flow on a model without it, a flag the input cannot use.
+
+### On Colab and the website
+
+The website's Colab backend (`notebooks/localfold.ipynb`) folds with this binary: `cuda/worker.py` keeps each model
+resident (`af3 - --serve=<dir>`) and streams every trunk pass and diffusion frame to the page. See docs/WEB.md.
+
+
+## The `fold` wrapper, search and templates, in detail
 
 ```
 cuda/af3/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json -- --samples=5
 cuda/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
 ```
 
-🔴 **ONE BINARY, ONE COMMAND, NOTHING ELSE TO RUN** (cuda/featurise/standalone.h): `cuda/af3/af3 --job=<job.json>
---out=<pdb>` (or `--sequence=`, and any input flag `fold` takes) fetches the model's published weights the first
-time (`cuda/featurise/fetch-weights`'s code, into the checkout or `LOCALFOLD_HOME`), featurises the input in the same
-process while the device starts - the featuriser's own object, so the input is byte for byte what
-`cuda/featurise/af3-featurise` writes - and folds; a searched alignment is kept as `<out>.a3m`, and `--frames=<dir>` writes
-each intermediate result as it lands (what the page draws live). No Node, no Python, no script: `bash cuda/build.sh` builds it. `fold` is a wrapper over it; a featurised directory as the first argument,
-and `--serve`, are the resident server cuda/worker.py drives for the page, unchanged.
 
 `--search` gets the protein chains' alignments from the ColabFold MMseqs2 server - the page's own
 client and merge, the paired block included for a complex - instead of an A3M: barnase-barstar

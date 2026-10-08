@@ -421,15 +421,19 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   // --frames: the pass tap (see FRAMES_DIR) - host copies of what a pass's PDB needs, taken once
   std::vector<int> hAatype, hRi, hAsym; int hFirstAsym = 0;
   std::vector<double> passReference; double passCentre[3] = {};
-  const bool tapPasses = !FRAMES_DIR.empty() && !warm;
-  const bool tapContacts = tapPasses && M.has("w/distogram_head/half_logits/weights");
+  // every pass of a real fold is tapped: its line of stats is printed as it lands (mean pLDDT, pTM, ipTM, and how
+  // far the structure moved - caPairChange, the early stop's measure), and with --frames its files are written
+  const bool tapPasses = !warm, writeFrames = !FRAMES_DIR.empty();
+  const bool tapContacts = writeFrames && M.has("w/distogram_head/half_logits/weights");
+  std::vector<float> passMask = warm ? std::vector<float>() : std::vector<float>(M.f("seq_mask"), M.f("seq_mask") + L);
+  auto lastPassPos = std::make_shared<std::vector<float>>();
   if (tapPasses) {
     hAatype.resize(L); hRi.resize(L); hAsym.resize(L);
     CK(cudaMemcpy(hAatype.data(), Idev("aatype"), L * 4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(hRi.data(), Idev("residue_index"), L * 4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(hAsym.data(), Idev("asym_id"), L * 4, cudaMemcpyDeviceToHost));
     hFirstAsym = *std::min_element(hAsym.begin(), hAsym.end());
-    TAP().reserve(passes, (size_t)L * 37 * 3 * 4 + (size_t)L * 50 * 4 + pairs * 4 + pairs * 2 + 4 * 256);
+    TAP().reserve(passes, (size_t)L * 37 * 3 * 4 + (size_t)L * 50 * 4 + pairs * 4 + (writeFrames ? pairs * 2 : 0) + 4 * 256);
   }
   auto tapPass = [&](int pass) {
     if (!tapPasses) return;
@@ -439,10 +443,13 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       paeTmK<<<blocks(r), 256, 0, STREAM>>>(lg, r, d0, paeF + r0, tmF + r0);
     });
     else paeTmK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, paeF, tmF);
-    unsigned char* pae8 = scratch<unsigned char>("tap.pae8", pairs);
-    quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(paeF, pae8, pairs, 0.125f);
     std::vector<std::pair<const void*, size_t>> parts = {{so.pos37, (size_t)L * 37 * 3 * 4}, {plddtLogits, (size_t)L * 50 * 4},
-                                                         {tmF, pairs * 4}, {pae8, pairs}};
+                                                         {tmF, pairs * 4}};
+    if (writeFrames) {
+      unsigned char* pae8 = scratch<unsigned char>("tap.pae8", pairs);
+      quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(paeF, pae8, pairs, 0.125f);
+      parts.push_back({pae8, pairs});
+    }
     if (tapContacts && AF2_TIGHT) {
       std::vector<float> ch = contactsChunked(t.pair, L);
       float* cf = scratch<float>("tap.contact", pairs); unsigned char* c8 = scratch<unsigned char>("tap.contact8", pairs);
@@ -461,7 +468,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     char tag[32]; snprintf(tag, sizeof tag, "%02d-of-%02d", pass, passes);
     std::string base = FRAMES_DIR + "/", id = tag;
     const float* mask37 = M.f("c/atom37_mask");
-    TAP().offer(parts, [&, base, id, mask37](const char* host, const std::vector<size_t>& at) {
+    TAP().offer(parts, [&, base, id, mask37, pass](const char* host, const std::vector<size_t>& at) {
       const float* pos = (const float*)(host + at[0]); const float* pl = (const float*)(host + at[1]);
       const float* tm = (const float*)(host + at[2]);
       std::vector<float> plddt(L);
@@ -482,6 +489,14 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       };
       bool chains = false; for (int i = 1; i < L; ++i) chains |= hAsym[i] != hAsym[0];
       double ptm = tmScore(false), iptm = chains ? tmScore(true) : -1;
+      std::vector<float> now(pos, pos + (size_t)L * 37 * 3);
+      char said[160];
+      int n = snprintf(said, sizeof said, "  pass %d/%d: mean pLDDT %.2f  pTM %.4f", pass + 1, passes, mean, ptm);
+      if (iptm >= 0) n += snprintf(said + n, sizeof said - n, "  ipTM %.4f", iptm);
+      if (!lastPassPos->empty()) snprintf(said + n, sizeof said - n, "  moved %.2f A", caPairChange(*lastPassPos, now, passMask, L));
+      printf("%s\n", said); fflush(stdout);
+      *lastPassPos = std::move(now);
+      if (!writeFrames) return;
       // the atoms, superposed onto the first pass's (the page aligns its passes to the first)
       std::vector<double> pts; std::vector<std::pair<int, int>> which;
       for (int i = 0; i < L; ++i) {
@@ -561,7 +576,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   }
   CK(cudaStreamSynchronize(STREAM));
   double foldMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
-  if (tapPasses) TAP().drain();       // (every pass's files written before the fold says it is done)
+  if (tapPasses) TAP().drain();       // (every pass's line and files out before the fold says it is done)
   // the fold's own buffers (scratch is kept for the next fold, by name): a served process folds many
   auto release = [&] {
     for (float* p : {t.msa, t.extra, t.pair, t.pairMask, prevRow, prevPair, prevPos, single}) CK(cudaFree(p));
@@ -729,6 +744,6 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `af2 <featurised dir> ...` and `af2 - --serve=<dir>` as before
 int main(int argc, char** argv) {
-  if (argc < 2 || !strncmp(argv[1], "--", 2)) return lf::standalone::main("af2", argc, argv, foldMain);
+  if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("af2", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

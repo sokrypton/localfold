@@ -14,7 +14,123 @@ per recycle on a thread each, the page's merges and MMseqs2 search, its atom37 t
 difference against the browser is the network's, never the featuriser's, and no JavaScript runs on a fold.
 `export_input.mjs` stays as the reference it is held to.
 
-## Run
+## Guide
+
+### Quick start
+
+`--help` prints every option; with no arguments the binary prints a short usage.
+
+```
+bash cuda/build.sh af2                          # once: the binary for this GPU (and the featuriser it links)
+cuda/af2/af2 --sequence=GWSTELEKHREEL... --search --out=6mrr.pdb
+cuda/af2/af2 --sequence=<barnase>:<barstar> --model=model_1_multimer_v3 --search --out=1brs.pdb
+```
+
+One command runs the whole protocol in one process: the model's weights are downloaded the first time, the
+input is featurised (the page's own AlphaFold 2 features, natively), the MMseqs2 search runs if asked, and the
+fold writes the structure and its confidences. Nothing else is installed or started - no Python, no Node.
+
+Needs an NVIDIA GPU (T4 and newer), the CUDA toolkit to build (`nvcc`, cuBLAS), `g++`, and `curl` and `gzip` at
+run time.
+
+### Models
+
+| `--model=` | | download |
+|---|---|---:|
+| `model_1_ptm` (default), `model_2_ptm` | AlphaFold 2 monomer (pTM heads), with a template embedder | 74 MB, + 43 MB for model 2 |
+| `model_3_ptm`, `model_4_ptm`, `model_5_ptm` | the monomer's template-free models | 74 + 43 MB |
+| `model_1_multimer_v3` ... `model_5_multimer_v3` | AlphaFold-Multimer v3, all five with templates | 74 MB, + 43 MB for 2-5 |
+
+These are the website's own bundles: model 1 of each as int5, models 2-5 as 3-bit differences on it (read
+exactly as the page reconstructs them). AlphaFold 2's parameters are Google DeepMind's, released under CC BY 4.0.
+
+A complex can go through either: the multimer models were trained on complexes; a monomer model folds the
+chains joined with a residue-index gap, its alignment block-diagonal.
+
+### Input
+
+**Protein chains only.** AlphaFold 2 has no ligands, nucleic acids, modified residues or declared bonds - a job
+carrying any of them is refused by name rather than folded without it, and so are the flags (`--ligands`,
+`--smiles`, `--modify`, `--kinds`). For those, use cuda/af3 or cuda/esmfold2.
+
+- `--job=<job.json>` - an AlphaFold 3 job file whose sequences are all proteins (its copies become chains);
+- or `--sequence=<A>:<B>:...` - chains joined by `:`.
+
+**The alignment**: none (single sequence) by default;
+- `--search` - from the ColabFold MMseqs2 server: each distinct chain searched, the paired block added for a
+  complex, merged the way the chosen weights read it. **It sends your sequences to api.colabfold.com.** The
+  alignment is kept as `<out>.a3m`.
+- `--a3m=<a.a3m>[,<b.a3m>]` - one per chain (one file for a single chain); `--paired-a3m=` for a complex's paired rows.
+- `--max-msa=512`, `--max-extra=1024` - cluster centres and extra rows; `--seed=N` seeds which rows are sampled.
+
+**Templates** - one template slot, as AlphaFold 2 takes it:
+- `--template=<file>:<chain>[@<query chain>][+<file>:<chain>@<query chain>...]` - a PDB or mmCIF chain aligned to
+  a query chain (0-based), `+` adding another chain's part to the same slot: `--template=1brs.pdb:A@0+1brs.pdb:D@1`.
+  A monomer model takes a template on its one chain; models 3-5 of the monomer have no template embedder and refuse one.
+- `--template-search-chains=0,1` (with `--search`) - the search's best hit for each listed chain.
+
+### Fold options
+
+| flag | default | |
+|---|---|---|
+| `--out=<path>` | `fold.pdb` | |
+| `--recycles=N` | 3 | N+1 passes through the network |
+| `--tolerance=<A>` | off | stop early once a pass moves the structure less than this (the page's early stop) |
+| `--frames=<dir>` | | every pass's result as it lands (below) |
+
+### Output
+
+For `--out=fold.pdb`:
+
+| file | |
+|---|---|
+| `fold.pdb` | the structure, B-factors are pLDDT |
+| `fold_confidences.json` | per-atom pLDDT, the PAE matrix, contact probabilities, token chain/residue ids - AlphaFold 3's layout, so the same viewers read it |
+| `fold_summary_confidences.json` | pTM, ipTM (complexes), mean pLDDT |
+| `fold.a3m` | the searched alignment (`--search`) |
+
+### What it prints
+
+A line for every pass as it finishes - the recycles, so a run can be watched converging:
+
+```
+AF2 multimer: 199 residues, 1 MSA rows, 1 extra, 4 passes (loaded in 0.3 s)
+  pass 1/4: mean pLDDT 37.38  pTM 0.2177  ipTM 0.0871
+  pass 2/4: mean pLDDT 38.13  pTM 0.2012  ipTM 0.0789  moved 4.09 A
+  pass 3/4: mean pLDDT 39.90  pTM 0.2126  ipTM 0.0839  moved 4.77 A
+  pass 4/4: mean pLDDT 42.20  pTM 0.2591  ipTM 0.0906  moved 1.45 A
+mean pLDDT 42.20  pTM 0.2591  ipTM 0.0906  -> bb.pdb  (4 passes, 495.9 ms)
+```
+
+`moved` is how far the structure changed since the previous pass - the RMS change of every CA-CA distance, the
+same measure `--tolerance` stops on. The pass's confidences come off the device without the fold waiting for them,
+and the structure is byte-identical with or without them.
+
+### Watching a fold
+
+`--frames=<dir>` writes every pass while it runs - what the website draws live: `pass-PP-of-NN.pdb` (the
+structure), `pass-PP-of-NN.json` (its pLDDT and pTM/ipTM), `pae-PP-of-NN.u8` and `contacts-PP-of-NN.u8` (n x n byte
+maps). Files land complete, so a viewer can poll the directory.
+
+### Weights
+
+Downloaded once into `model/`, `model-multimer/` and `model-{mono,multi}-<N>-delta/` in the checkout the binary
+was built in, or under `LOCALFOLD_HOME` when it is set (`~/.cache/localfold` for a binary copied out of its
+checkout). `cuda/featurise/fetch-weights monomer multimer-3 ...` fetches without folding.
+
+### Limits and errors
+
+- Large inputs switch to memory-saving paths on their own when the whole form would not fit (see "How large a fold
+  fits" below); the answer is the same.
+- A refusal is one sentence, `Error: ...`, and a nonzero exit.
+
+### On Colab and the website
+
+The website's Colab backend folds with this binary: `cuda/worker.py` keeps the model resident (`af2 - --serve=<dir>`)
+and streams every pass to the page. See docs/WEB.md.
+
+
+## Run, in detail
 
 ```
 cuda/af2/fold ub.pdb --job=tools/fixtures/af3-jobs/ubiquitin_monomer.json --model=model_3_ptm   # any of the ten
@@ -26,13 +142,6 @@ cuda/af2/fold 1brs.pdb --sequence=<A>:<D> --model=model_1_multimer_v3 \
 cuda/af2/fold 1brs.pdb --sequence=<A>:<D> --model=model_1_multimer_v3 --search
 ```
 
-🔴 **ONE BINARY, ONE COMMAND, NOTHING ELSE TO RUN** (cuda/featurise/standalone.h): `cuda/af2/af2 --job=<job.json>
---out=<pdb>` (or `--sequence=`, and any input flag `fold` takes) fetches the model's published weights the first
-time (`cuda/featurise/fetch-weights`'s code, into the checkout or `LOCALFOLD_HOME`), featurises the input in the same
-process while the device starts - the featuriser's own object, so the input is byte for byte what
-`cuda/featurise/af2-featurise` writes - and folds; a searched alignment is kept as `<out>.a3m`, and `--frames=<dir>` writes
-each intermediate result as it lands (what the page draws live). No Node, no Python, no script: `bash cuda/build.sh` builds it. `fold` is a wrapper over it; a featurised directory as the first argument,
-and `--serve`, are the resident server cuda/worker.py drives for the page, unchanged.
 
 `--search` gets the alignment from the ColabFold MMseqs2 server through the page's own client
 (shared/input/mmseqs2-api.js). For a complex, each distinct chain is searched, the paired block is
