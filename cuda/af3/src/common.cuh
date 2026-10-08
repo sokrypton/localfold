@@ -1218,6 +1218,11 @@ template <class T> T* scratch(const std::string& name, size_t n) {
     // the graph's own; a recycle pass is captured once every buffer is sized)
     size_t bytes = std::max<size_t>(n, 1) * sizeof(T);
     cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+    if (p && capturing != cudaStreamCaptureStatusNone) {     // (the pass before the capture should have sized it)
+      fprintf(stderr, "scratch %s grows inside a graph capture (%zu -> %zu bytes): the pass before it did not size it\n",
+              name.c_str(), have, bytes);
+      fflush(stderr); _exit(1);
+    }
     if (p) { CK(cudaDeviceSynchronize()); CK(cudaFreeAsync(p, STREAM)); p = nullptr; }
     cudaError_t e = capturing != cudaStreamCaptureStatusNone ? cudaMalloc(&p, bytes)
                                                              : cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);

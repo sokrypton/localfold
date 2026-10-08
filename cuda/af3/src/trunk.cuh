@@ -353,7 +353,9 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     WITH_PT(t.p16, outerSumK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(left, right, t.pair, n, C));
     chaiRelEnc();
     size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
-    T* ln = scratch<T>("emb.prevln", per * C);
+    // (sized for the recycle passes, which take the branch below - whole where the card has the room: the trunk graph
+    // is captured on the first of them, and a buffer growing inside a capture killed Chai-1 at 988 tokens)
+    T* ln = scratch<T>("emb.prevln", (t.inPlaceRecycle || shortPair(pairs, C) ? per : pairs) * C);
     float* prev = scratch<float>("emb.prevproj", per * C);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);

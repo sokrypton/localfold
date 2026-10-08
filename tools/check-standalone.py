@@ -198,6 +198,18 @@ def main():
             print(f"{'ok  ' if ok else 'FAIL'} slow upload, {label} 5CAJ: "
                   + ("byte-identical to a fast one" if ok else "differs from a fast one: " + arms[1][-120:].decode(errors="replace")))
 
+        # 🔴 CHAI-1 PAST ~500 TOKENS DIED IN THE TRUNK'S GRAPH CAPTURE: its first pass takes a branch of its own, which
+        # sized a scratch buffer for 128 MB chunks, and the recycle passes - the first of them captured as a graph - want
+        # the whole pair where the card has the room, so the buffer grew inside the capture ("operation not permitted
+        # when stream is capturing"). Every gate folded it shorter. 1TIM's two chains and 6MRR: 562 tokens
+        long_seq = ":".join([seq_of("1tim-crystal.pdb", "A"), seq_of("1tim-crystal.pdb", "B"), seq_of("6mrr-crystal.pdb", "A")])
+        out = os.path.join(work, "chai-long.pdb")
+        r = run([binary("af3"), "--model=chai1", f"--sequence={long_seq}", "--steps=8", f"--out={out}"])
+        ok = r.returncode == 0 and os.path.exists(out)
+        failed += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} chai1 at {len(long_seq.replace(':', ''))} tokens folds (its recycle passes' buffers sized "
+              f"before the graph capture)" + ("" if ok else ": " + (r.stdout + r.stderr).strip()[-200:]))
+
         if network:
             out = os.path.join(work, "searched.pdb")
             standalone("af3", [f"--sequence={S6}", "--search"], out)
