@@ -307,6 +307,12 @@ What made them pay, each measured:
   channel-major product tile and normalises them on the way, so there is no f16 row buffer.
 - **Shared memory recycled.** The weight stages reuse the memory of rows already loaded into
   registers, so two blocks fit an SM: `triIn256K` 110 → 89 ms.
+- **Two blocks an SM again (2026-10-08).** `transitionUpK` was written for two 67.6 KB blocks an SM, and the
+  wave-sized chunking assumes it - but it had grown to 160 registers, so the REGISTERS held it to one
+  (Nsight Compute: occupancy 12.5%, the tensor pipe 48%), and nothing said so. `__launch_bounds__(256, 2)`
+  holds it to 128 with no spills: **680 → 603 ms of a 988-token fold**, 168 → 148 at 494, 46.0 → 41.9 at
+  261, byte-identical - and protenix2's (the same kernel through cuda/af3) 1,510 → 1,318, 373 → 323 and
+  99.5 → 90.5. The 16-column form, which needs fewer registers, was slower either way (712-724).
 - **Two row tiles a warp (2026-10-08).** Nsight Compute had `triIn256K` bound on shared memory at 988
   tokens (the shared wavefronts 68% of peak, the tensor pipe 57%), because each weight fragment it reads
   fed one warp's 16 rows. Four warps of two 16-row tiles - the same 128 rows, shared memory and grid -

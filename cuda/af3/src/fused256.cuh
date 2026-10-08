@@ -19,8 +19,14 @@
 // stages, ~49 KB where the 8-warp form is 67.6 KB. Every output's sum over k runs in the same order in all
 // forms, so they are byte-identical.
 // TG: the gated rows' type (bf16 for a second GEMM that accumulates straight into a bf16 pair)
-template <int C, int WARPS, int NC = 32, int XROUNDS = 1, class PT = float, class TG = half>
-__global__ void __launch_bounds__(WARPS * 32) transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
+// MINB: blocks an SM the registers are held to. The 8-warp form at 256 channels is 67.6 KB of shared memory, two
+// blocks an SM on an A100 - as transitionUpWaveRows and the launchers were written for - but it had grown to 160
+// registers, so the registers held it to ONE (Nsight Compute at 988 tokens: occupancy 12.5%, the tensor pipe 48%).
+// Held to 128 (no spills: LOCAL 0) it runs two: ESMFold2's 676 -> 601 ms of a 988-token fold, byte-identical.
+// Not past 256 channels (the rows' fragments alone are 96-128 registers there, and two blocks do not fit anyway).
+template <int C, int WARPS, int NC = 32, int XROUNDS = 1, class PT = float, class TG = half,
+          int MINB = (C <= 256 && WARPS == 8 && XROUNDS == 1) ? 2 : 1>
+__global__ void __launch_bounds__(WARPS * 32, MINB) transitionUpK(const float* __restrict__ x, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ W1t, TG* __restrict__ gated, size_t rows, int I) {
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, KS = C / 16;
   constexpr size_t STAGE = (size_t)2 * C * NC * 2;
