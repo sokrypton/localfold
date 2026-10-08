@@ -214,7 +214,10 @@ __global__ void triInGemmPackK(const half* __restrict__ Wpg, const half* __restr
   out[e] = v;
 }
 inline const half* triInGemmWeights(const std::string& key, const half* Wpg, const half* Wgl, int C) {
+  // (a derived weight: forgotten with the others - see Wbf in common.cuh for what a kept one cost)
   static std::map<std::string, half*> cache;
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : cache) CK(cudaFree(p)); cache.clear(); }); hooked = true; }
   auto it = cache.find(key);
   if (it != cache.end()) return it->second;
   size_t nel = (size_t)(C / 32 + C / 128) * C * 128;

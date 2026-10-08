@@ -125,7 +125,9 @@ inline void gemm(const float* X, const std::vector<std::string>& names, float* Y
 inline const float* Wf(const std::string& name) { return W("e/" + name); }
 // q | k | v's biases as one [3C], once a layer
 inline const float* qkvBias(int layer, int C) {
-  static std::map<int, float*> made;
+  static std::map<int, float*> made;     // (a derived weight: forgotten with the others)
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [l, p] : made) CK(cudaFree(p)); made.clear(); }); hooked = true; }
   float*& b = made[layer];
   if (!b) {
     CK(devMalloc(&b, 3 * (size_t)C * 4));

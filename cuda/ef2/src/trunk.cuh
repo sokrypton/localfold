@@ -232,7 +232,9 @@ __global__ void operandInterleavedK(const float* proj, const float* gate, half* 
 }
 // the triangle multiplication in output blocks (cuda/af3/src/triblocked.cuh), for a card short of room
 inline void triangleBlockedEf2(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
-  static std::map<std::pair<std::string, int>, half*> ops;
+  static std::map<std::pair<std::string, int>, half*> ops;     // (a derived weight: forgotten with the others)
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : ops) CK(cudaFree(p)); ops.clear(); }); hooked = true; }
   auto opOf = [&](int side) {
     auto key = std::make_pair(Tn, side);
     auto it = ops.find(key);

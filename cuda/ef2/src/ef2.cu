@@ -141,7 +141,9 @@ static int foldInput(const Opts& o, bool warm) {
   // the resident tower is idle until the next fold: on a card without room beside it for the trunk's three pairs
   // (z_init, z and the injection) it leaves the device, and the next fold reads it back (1,500 tokens on a T4 ran out
   // with it held: 6.4 GB of codes beside four 2.3 GB pairs)
-  if (residentTower && !roomFor(3 * (size_t)T * T * e.pair * 4, { "tower.w16" })) {
+  // (never in the warm-up: it runs while the tower is still being copied up, and freeing the copy under the upload
+  // killed the process - "cannot put a model.bin on the device" - whenever room was short and the upload slow)
+  if (residentTower && !warm && !roomFor(3 * (size_t)T * T * e.pair * 4, { "tower.w16" })) {
     releaseScratch({ "tower.", "esmc." });
     if (!streamZ) releaseScratch({ "shim." });     // (a streamed z_init reads shim.tokens later)
     say("tower parked off the device: %.2f GB\n", M.parkResident() / 1e9);

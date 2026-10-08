@@ -439,6 +439,16 @@ I tightened its bounds once to confirm it fails.
 
 ## Traps it cost
 
+- 🔴 **A slow upload folded a different protein.** The warm-up runs while the weights are still being copied up,
+  then forgets what it derived from them - but `Wbf`, the bf16 copy of each trunk block's transition that the
+  bf16-pair path (every input past 80 tokens) reads, was cached by name and never forgotten. On a cold page cache the
+  later blocks were copied before they had arrived, for good: 1BRS through ESMFold2 at pLDDT 28.6 and 13.2 A where
+  it is 94.1 and 0.58 A, the 600M model's 5CAJ 90.7 -> 63.6 and 1TIM 90.8 -> 50.6. It looked like nondeterminism (the
+  same command right one hour, wrong the next) and was found only by comparing against upstream right after its 26 GB
+  model had emptied the page cache. `LOCALFOLD_SLOW_UPLOAD_MS` makes the slow disk on demand, `test:standalone`
+  holds a slow upload byte-identical to a fast one, and `test/cuda-derived-caches.test.js` requires every cache of
+  device weights in this port's include graph to register a forget hook. The same warm-up also parked the ESM-C tower
+  under its own upload when room was short ("cannot put a model.bin on the device"); it no longer parks at all.
 - **The reference is not float32 on CUDA.** The model autocasts three stages to bf16 there, and
   `from_pretrained` discards `esmc_precision`, so ESM-C is always bf16. Casting after the load keeps
   bf16-rounded weights. Measured against that, ESM-C read 6.8e-3, and it reads 9.2e-7 against a real

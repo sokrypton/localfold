@@ -158,6 +158,34 @@ def main():
         failed += not ok
         print(f"{'ok  ' if ok else 'FAIL'} --ccd: a code the dictionary lacks is refused, not fetched")
 
+        # 🔴 A SLOW UPLOAD MUST FOLD WHAT A FAST ONE DOES. cuda/ef2 warms up while its weights are still arriving and
+        # then forgets whatever it derived from them; a derived cache that was not told to (Wbf, every bf16-pair block's
+        # transition) kept a copy of a half-uploaded block for good, so a cold page cache folded 1BRS at pLDDT 28 and
+        # 5CAJ through the 600M model at 64. LOCALFOLD_SLOW_UPLOAD_MS makes the slow disk on demand; every gate here
+        # otherwise runs warm and could not see it. And LOCALFOLD_BIG=1 beside it: the warm-up used to park the tower
+        # under its own upload and kill the process
+        def seq_of(pdb, chain):
+            three = dict(ALA="A", ARG="R", ASN="N", ASP="D", CYS="C", GLN="Q", GLU="E", GLY="G", HIS="H", ILE="I", LEU="L",
+                         LYS="K", MET="M", PHE="F", PRO="P", SER="S", THR="T", TRP="W", TYR="Y", VAL="V", MSE="M")
+            seen, out = set(), ""
+            for l in open(os.path.join(FIX, pdb)):
+                if l.startswith(("ATOM", "HETATM")) and l[12:16] == " CA " and l[21] == chain and l[22:27] not in seen:
+                    seen.add(l[22:27]); out += three.get(l[17:20], "X")
+            return out
+        S5 = seq_of("5caj-crystal.pdb", "A")
+        for model, extra_env in (("ef2-fast-600m", {}), ("ef2", {}), ("ef2", {"LOCALFOLD_BIG": "1"})):
+            arms = []
+            for slow in ("0", "400"):
+                out = os.path.join(work, f"slow-{model}-{slow}-{len(extra_env)}.pdb")
+                r = run([binary("ef2"), f"--sequence={S5}", f"--model={model}", "--seed=1", f"--out={out}"],
+                        dict(os.environ, LOCALFOLD_SLOW_UPLOAD_MS=slow, **extra_env))
+                arms.append(open(out, "rb").read() if r.returncode == 0 and os.path.exists(out) else (r.stdout + r.stderr)[-200:].encode())
+            ok = arms[0] == arms[1]
+            failed += not ok
+            label = model + (" (LOCALFOLD_BIG=1)" if extra_env else "")
+            print(f"{'ok  ' if ok else 'FAIL'} slow upload, {label} 5CAJ: "
+                  + ("byte-identical to a fast one" if ok else "differs from a fast one: " + arms[1][-120:].decode(errors="replace")))
+
         if network:
             out = os.path.join(work, "searched.pdb")
             standalone("af3", [f"--sequence={S6}", "--search"], out)

@@ -721,6 +721,9 @@ struct Model {
     BDecode* sdt[2] = {nullptr, nullptr};
     for (int k = 0; k < 2 && !s.srcRecs.empty(); ++k) if (devMalloc(&sdt[k], s.srcRecs.size() * sizeof(BDecode)) != cudaSuccess) return false;
     for (size_t fi = 0; fi < s.files.size(); ++fi) {
+      // LOCALFOLD_SLOW_UPLOAD_MS: every shard's upload delayed, the slow disk a cold page cache is, on demand - the
+      // warm-up then runs on weights still arriving, which is what forgetDerivedWeights() must undo (tools/check-standalone.py)
+      if (const char* d = getenv("LOCALFOLD_SLOW_UPLOAD_MS")) usleep((useconds_t)atoi(d) * 1000);
       int k = (int)(fi & 1);
       if (fi >= 2 && cudaEventSynchronize(done[k]) != cudaSuccess) return false;     // buffer k free again
       int fd = open(shardPath(s, s.files[fi]).c_str(), O_RDONLY);
@@ -972,6 +975,7 @@ struct Model {
           return false;
       }
       if (cudaEventRecord(ev[b], st) != cudaSuccess) return false;
+      if (const char* d = getenv("LOCALFOLD_SLOW_UPLOAD_MS")) usleep((useconds_t)atoi(d) * 1000);   // (as in bundleUp)
     }
     bool ok = cudaStreamSynchronize(st) == cudaSuccess;
     for (int b = 0; b < NB; ++b) { cudaFreeHost(stage[b]); cudaEventDestroy(ev[b]); }
@@ -1314,6 +1318,12 @@ __global__ void toHalfK(const float* x, half* y, size_t n) {
 inline unsigned blocks(size_t n, int t = 256) { return (unsigned)((n + t - 1) / t); }
 
 // Weights: device copies made on first use, f32 and (on request) f16.
+// every weight derived from the device copies forgotten - f16 mirrors and copies, weights built on the
+// device - after a warm-up that ran while a copy was still arriving (M.uploadAsync): they are rebuilt
+// from the finished copy on their next use. A port's own caches of derived weights register here.
+// (Not for cuda/af3 as it stands: TCACHE folds its conditioning weights once per process and keeps
+// the names, and OpenDDE's structural.cuh registers VIEWS into a file's copy, which this would free.)
+inline std::vector<std::function<void()>> FORGET_HOOKS;
 inline std::map<std::string, float*> WF;
 inline std::map<std::string, half*> WH;
 inline std::map<std::string, size_t> WLEN;
@@ -1428,7 +1438,13 @@ __global__ void toBf16WK(const float* in, __nv_bfloat16* out, size_t n) {
 }
 // a weight's bf16 copy (a GEMM whose operands and output are bf16: a product accumulated straight into a bf16 pair)
 inline const __nv_bfloat16* Wbf(const std::string& k) {
+  // 🔴 A DERIVED WEIGHT, FORGOTTEN WITH THE OTHERS: cuda/ef2 warms up while its weights are still arriving, and its
+  // bf16-pair trunk (every input past 80 tokens) reads each block's transition through this. Kept, a copy made from
+  // a half-uploaded block was that block's for good - 1BRS through ESMFold2 at pLDDT 28.6 and 13.2 A where it is 94.1
+  // and 0.58, and the 600M model's 5CAJ 90.7 -> 63.6, whenever the upload was slow (a cold page cache)
   static std::map<std::string, __nv_bfloat16*> cache;
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [n, p] : cache) CK(cudaFree(p)); cache.clear(); }); hooked = true; }
   auto it = cache.find(k);
   if (it != cache.end()) return it->second;
   const float* f = W(k); size_t n = lenW(k);
@@ -1461,12 +1477,6 @@ inline size_t compactWeights(int seg, const std::function<bool(const std::string
   }
   return freed;
 }
-// every weight derived from the device copies forgotten - f16 mirrors and copies, weights built on the
-// device - after a warm-up that ran while a copy was still arriving (M.uploadAsync): they are rebuilt
-// from the finished copy on their next use. A port's own caches of derived weights register here.
-// (Not for cuda/af3 as it stands: TCACHE folds its conditioning weights once per process and keeps
-// the names, and OpenDDE's structural.cuh registers VIEWS into a file's copy, which this would free.)
-inline std::vector<std::function<void()>> FORGET_HOOKS;
 inline void forgetDerivedWeights() {
   CK(cudaDeviceSynchronize());
   for (auto& [k, h] : WH) if (!WH_MIRROR.count(k)) CK(cudaFree(h));
