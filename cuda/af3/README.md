@@ -32,7 +32,7 @@ Both send the sequences to api.colabfold.com, so they are flags, never defaults.
 `fold` builds `af3` if it is missing, reads the model's weights as published - **af3-any-model's
 own int8 blob** for all eight (`af3am-<model>/`, fetched once by `cuda/fetch_bundles.py
 --af3-any-model` from huggingface.co/sokrypton/af3-any-model, the files its JAX backend reads), with
-its codes decoded on the device and `maps/<model>.map` naming each tensor's slice of it (below).
+its codes decoded on the device and a weight walk naming each tensor's slice of it (below).
 **AlphaFold 3's are Google DeepMind's parameters, hosted for academic, non-commercial use under its
 [AF3 terms](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)**: the
 first fetch asks you to accept them, or `LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3` says you have (the
@@ -47,27 +47,33 @@ its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 cd cuda/af3
 nvcc -O1 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -ldl -o af3
 ../featurise/af3-featurise in --no-weights --family=af3 --job=<job.json>    # or --sequence=<SEQ> [--a3m=...]
-./af3 in --bundle=../../af3am-af3 --map=maps/af3.map --fold --fast --out=fold.pdb
+./af3 in --bundle=../../af3am-af3 --family=af3 --fold --fast --out=fold.pdb
 python3 score.py fold.pdb ../../tools/fixtures/5caj-crystal.pdb A
 node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + every oracle
 ./af3 data                                   # f32 path, every stage against AF3
 ```
 
 The oracles want the float32 weights (`export-model.mjs weights --weights-only
---bundle=<f32 manifest>`, then `--weights=weights`), which are not published. A map is regenerated
-only when a bundle is re-exported: `node --js-float16array cuda/make_map.mjs model-<m>-int5
-<that bundle's --weights-only export> cuda/af3/maps/<m>.map` finds every native tensor in the
-decoded bundle - a slice of one bundle tensor, zeros, ones, or a per-block LayerNorm scale folded
-into its projection as the page's loader folds it - checked bit for bit, and fails on anything
-else. A fold through a map is byte-identical to one from the export it was made from (all seven).
+--bundle=<f32 manifest>`, then `--weights=weights`), which are not published.
+
+🔴 **NO MAP FILE: THE WEIGHTS ARE WALKED FROM THE BUNDLE** (cuda/featurise/af3_weights.h, the port of
+shared/af3/weights/weights.js and diffusion-weights.js, with the dialect table generated from
+shared/af3/dialect.js by tools/gen-native-featuriser-tables.mjs). `--family=<m>` names the dialect; the
+walk reads the bundle's tensor names and shapes and says which slice of which tensor each native weight
+is - zeros, ones, or a per-block LayerNorm scale folded into its projection as the page's loader folds
+it - so a re-exported bundle needs nothing regenerated. It replaced `cuda/af3/maps/*.map`, which a
+value search over a float32 export had written: the walk is line-for-line those maps but where the
+search took a coincidence (a zero or duplicate tensor matched under the wrong name, values identical or
+within 1e-21) and where dialect flags had gone stale (none read by the binary), and every family's 6MRR
+fold through it is byte-identical to the map's but OpenDDE's, 0.010 A rms away at the same pLDDT and pTM.
 
 🔴 **A BLOB IS READ AS IT IS PUBLISHED** (common.cuh's blob reader): one zstd stream of haiku records, its
-tensor names the ones LocalFold's bundles were exported under - so the same map reads either, checked on
+tensor names the ones LocalFold's bundles were exported under - so the same walk reads either, checked on
 all eight: every bundle tensor is in its blob at its shape but chai1's structure-pair three, which
 `tools/add_chai1_structure_to_blob.py` added to af3-any-model's chai1 blobs (commit 28141c7, every other
 record byte-identical), and AlphaFold 3's two Fourier tensors - a constant of its source, frozen from a
-fixed seed, which DeepMind's file does not carry - written into `maps/af3.map` as their values (a `c`
-line; `make_map.mjs` emits it for a stock AF3 bundle): one map reads the int5 bundle and the blob alike,
+fixed seed, which DeepMind's file does not carry - compiled in as their values (`cuda/featurise/af3_fourier.inc`,
+a `c` line the walk emits for stock AF3): one walk reads the int5 bundle and the blob alike,
 the bundle's fold byte-identical through it. Decompressed once, through the system's libzstd, into record-aligned shards
 beside it (`<blob>.raw/`, 256 MB each, an int8 tensor and its scales in one) so the upload streams them
 as it streams a bundle's: ESM2's 2.8 GB loads in 2.0 s warm at 1 GB of host memory. int8 is a float32
@@ -77,7 +83,7 @@ protenix2 1.536 / 1.514, intellifold2 1.564 / 1.551, openbind0 1.716 / 1.104, op
 rosettafold3 1.644 / 1.817 - one sample's seed band - and chai1's ligands better (GOL 0.021 / 0.053 A,
 SEP 0.074 / 0.108).
 
-**Chai-1** (`maps/chai1.map`) folds through the same binary on af3-any-model's conventions (the
+**Chai-1** (`--family=chai1`) folds through the same binary on af3-any-model's conventions (the
 `chai*` flags in shared/af3/dialect.js), and takes two things nobody else does: ESM2 3B's embeddings,
 computed in the fold from af3-any-model's `lm/esm2.bin.zst` (`--esm-bundle=<its directory>`, within
 1.0e-2 of the float32 model, its int8 codes resident), and chai-lab's structure token-pair weights,

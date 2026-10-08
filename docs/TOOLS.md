@@ -370,7 +370,7 @@ go through CDP, and the deploy.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the CPU: features in, a structure out.
 - **`fold-in-page.py`** - Drive a REAL fold in the real page, and report what the frames carry.
 - **`gate-folds.mjs`** - The folds every whole-model gate runs, and how a gate reads one of them.
-- **`gen-native-featuriser-tables.mjs`** - Generate cuda/featurise/tables.inc - the data the native featuriser reads, from the JavaScript it mirrors.
+- **`gen-native-featuriser-tables.mjs`** - Generate cuda/featurise/tables.inc and dialects.inc - the data the native featuriser and weight walk read, from the JavaScript they mirror.
 - **`gpu-chrome.mjs`** - Run a WebGPU module in headless Chrome and print what it returns.
 - **`heatmap-panel.py`** - Do the heatmap panel's tabs appear, and does OUR map format reach them?
 - **`index-tools.py`** - Every tool in this repository, with the one line it says about itself.

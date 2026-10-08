@@ -44,7 +44,7 @@ if [ -f "$repo/model-esmfold2-int5/manifest.json" ]; then
   for c in 6mrr 5caj 1brs gol-sep dna; do run ef2-$c "$out/esmfold2" "$in/ef2-$c" "${EF[@]}" --fast --warm=96,800 --out="$out/ef2-$c.pdb"; done
   run ef2-6mrr-f32 "$out/esmfold2" "$in/ef2-6mrr" "${EF[@]}" --out="$out/ef2-6mrr-f32.pdb"
 fi
-AW=(--bundle="$repo/model-af3-int5" --map="$N/af3/maps/af3.map")    # (the bundle as it is, through its map)
+AW=(--bundle="$repo/model-af3-int5" --family=af3)    # (the bundle as it is, through its weight walk)
 if [ -f "$repo/model-af3-int5/manifest.json" ]; then
   build af3 "--use_fast_math"
   ex3() { local d="$in/af3-$1"; shift; [ -f "$d/model.idx" ] || "$F/af3-featurise" "$d" --no-weights --family=af3 "$@" > /dev/null; }
@@ -53,8 +53,8 @@ if [ -f "$repo/model-af3-int5/manifest.json" ]; then
   for c in 6mrr 5caj-tmpl 1brs-tmpl gol; do run af3-$c "$out/af3" "$in/af3-$c" "${AW[@]}" --fold --fast --out="$out/af3-$c.pdb"; done
   run af3-6mrr-f32 "$out/af3" "$in/af3-6mrr" "${AW[@]}" --fold --steps=20 --out="$out/af3-6mrr-f32.pdb"
 fi
-M1=(--bundle="$repo/model" --map="$N/af2/maps/model_1_ptm.map")
-MM=(--bundle="$repo/model-multimer" --map="$N/af2/maps/model_1_multimer_v3.map")
+M1=(--bundle="$repo/model")
+MM=(--bundle="$repo/model-multimer")
 if [ -f "$repo/model/manifest.json" ]; then
   build af2 "--use_fast_math"
   ex2() { local d="$in/af2-$1" b="$2"; shift 2; [ -f "$d/model.idx" ] || "$F/af2-featurise" "$d" --bundle="$b" "$@" > /dev/null; }

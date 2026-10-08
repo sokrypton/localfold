@@ -8,7 +8,7 @@
 #
 # --model is model_N_ptm or model_N_multimer_v3, N 1 to 5: model 1 of each as the page publishes it whole, 2-5
 # as its deltas on model 1, read as the page reads them - the bundle (model/, model-multimer/,
-# fetched once by cuda/fetch_bundles.py) as it is, through maps/<model>.map. Input flags (--sequence, --a3m, --search, --template, --recycles,
+# fetched once by cuda/fetch_bundles.py) as it is, through the weight walk (cuda/featurise/af2_weights.h). Input flags (--sequence, --a3m, --search, --template, --recycles,
 # --max-msa, --max-extra, --seed, --job) go to the native featuriser (cuda/featurise/af2-featurise: the page's own
 # features, byte for byte, no JavaScript); flags after -- go to ./af2, which runs --fast.
 set -euo pipefail
@@ -36,7 +36,7 @@ case "$model" in
   *) echo "no published bundle for $model (model_1_ptm ... model_5_ptm, model_1_multimer_v3 ... model_5_multimer_v3)" >&2; exit 1 ;;
 esac
 [ -f "$bundle/manifest.json" ] || python3 "$repo/cuda/fetch_bundles.py" "$family" >&2
-wflags=(--bundle="$bundle" --map="$here/maps/$model.map")
+wflags=(--bundle="$bundle")
 number="${model:6:1}"
 if [ "$number" != 1 ]; then
   delta="$repo/model-$short-$number-delta"

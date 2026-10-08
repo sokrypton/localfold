@@ -416,7 +416,7 @@ int main(int argc, char** argv) {
   auto tStart = std::chrono::steady_clock::now();
   // the weights: one exported file, or the two bundles read as they are (decoded on the device)
   if (!weights.empty()) M.load(weights);
-  else { M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c", "", "", "blocks/"); }   // (int8 tower blocks stay resident)
+  else { M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c", nullptr, "", "blocks/"); }   // (int8 tower blocks stay resident)
   const int weightSegs = (int)M.segs.size();
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   { void* ws; CK(cudaMalloc(&ws, 64 << 20)); CB(cublasSetWorkspace(H, ws, 64 << 20)); }   // graph capture needs it

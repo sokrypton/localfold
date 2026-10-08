@@ -156,6 +156,10 @@ def cases(offline):
         ("chai1 6mrr + GOL + SEP3", {"family": "chai1", "controls": controls(**{"model-family": "chai1"}),
          "entities": [protein(S6), {"type": "ligand", "value": "GOL", "copies": 1}],
          "job": job([S6], ["GOL"], {0: [("SEP", 3)]})}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 9 + 6, None),
+        # every family's WEIGHT WALK (cuda/featurise/af3_weights.h) read from its own bundle - no map file
+        *[(f"{m} 6mrr", {"family": m, "controls": controls(**{"model-family": m}), "entities": [protein(S6)],
+           "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None)
+          for m in ("boltz2", "intellifold2", "rosettafold3")],
         ("refused: flow on chai1", {"family": "chai1",
          "controls": controls(**{"model-family": "chai1", "af3-mode": "flow"}), "entities": [protein(S6)],
          "job": job([S6])}, None, None, None, "Diffusion"),

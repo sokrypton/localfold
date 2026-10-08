@@ -4347,3 +4347,15 @@ job's SMILES biotin and the glycosylated RNase B through boltz2's conventions, b
 sink for ESMFold2 - came out with the A100 box's MD5s exactly, the SMILES conformer included, and every port folded a
 job JSON through its `fold` script: boltz2 the four AF3 jobs (KRAS 13.1 s with its first-fold start-up, the rest
 3.3-5.9 s), AF2's monomer and multimer, ESMFold2 calmodulin and the kitchen sink.
+
+🔴 **AND NO WEIGHT MAP EITHER (2026-10-08).** `cuda/af3/maps/*.map` and `cuda/af2/maps/*.map` cached, per model, which
+slice of which bundle tensor each native weight is - written offline by a VALUE search over a float32 export
+(`cuda/make_map.mjs`, `cuda/af2/make_map.py`), so a re-exported bundle meant regenerating them by hand. The ports now
+WALK the bundle at load (cuda/featurise/af3_weights.h ports shared/af3/weights/; af2_weights.h derives AF2's from the
+manifest's parameter paths), handed its tensor names and shapes by `common.cuh`'s `loadBundle`; `--family=` names the
+dialect where `--map=` named a file. AF2's walk is byte-identical to all ten maps. AF3's is line-for-line the eight
+maps but where the value search had matched a coincidence (a zero or duplicate tensor under another name - values
+identical, or within 1e-21) and where a map's dialect flags were stale (none read by the binary); every family's
+6MRR + GOL + SEP fold through it is byte-identical to the map's but OpenDDE's, 0.010 A rms away at the same pLDDT and
+pTM - the walk reads the tensors the page's loader reads, which the search did not always. `test:cuda` now folds
+boltz2, intellifold2 and rosettafold3 too, so every family's walk is exercised there.

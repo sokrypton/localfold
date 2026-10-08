@@ -15,8 +15,8 @@ echo "GPU: $(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader | hea
 for port in "${ports[@]}"; do
   case "$port" in
     esmfold2) python3 "$repo/cuda/fetch_bundles.py" ef2-fast-600m esmc ;;    # (read as they are: no export)
-    af3) python3 "$repo/cuda/fetch_bundles.py" af3 ;;                  # (read through cuda/af3/maps/af3.map)
-    af2) python3 "$repo/cuda/fetch_bundles.py" monomer multimer ;;     # (read through cuda/af2/maps/*.map)
+    af3) python3 "$repo/cuda/fetch_bundles.py" af3 ;;                  # (read through its weight walk)
+    af2) python3 "$repo/cuda/fetch_bundles.py" monomer multimer ;;     # (read through its weight walk)
     *) echo "unknown port $port (esmfold2, af3, af2)" >&2; exit 1 ;;
   esac
 done

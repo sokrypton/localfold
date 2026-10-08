@@ -36,13 +36,13 @@ api.colabfold.com, so it is a flag, never a default.
 
 `--model` is `model_1_ptm` (default) or `model_1_multimer_v3`, the two the page publishes whole
 (models 2-5 are published as int3 deltas on them: `af2 --bundle=../../model --delta=../../model-mono-3-delta
---map=maps/model_3_ptm.map` reads one as the page does, bit-exact against shared/bundles/delta-tensor-store.js,
-and `make_map.py --delta` builds its map), and `fold` folds with the page's own weights: the int5 bundle (`model/`, `model-multimer/`, fetched
-once by `cuda/fetch_bundles.py`), read as it is - its codes decoded on the device - through
-`maps/<model>.map`. `make_map.py` builds a map (~/.venv-lfjax): the monomer's parameters are found in
-the decoded bundle by value (within int5's half step, a tie settled by the manifest's names) and the
-multimer's are joined exactly, every checkpoint element's id run through the page's exporter and the
-reference's loader both; each native tensor is then strided parts of bundle tensors. The template
+` reads one as the page does, bit-exact against shared/bundles/delta-tensor-store.js), and `fold` folds with the page's own weights: the int5 bundle (`model/`, `model-multimer/`, fetched
+once by `cuda/fetch_bundles.py`), read as it is - its codes decoded on the device - through a
+WEIGHT WALK (cuda/featurise/af2_weights.h): the bundle's manifest names every tensor by its AlphaFold
+parameter path, and the walk derives from those names and shapes which strided parts of which bundle
+tensors make each native one (the triangle projections and gates concatenated, the IPA heads split, the
+22-row single projections cut to 21). It replaced `cuda/af2/maps/*.map`, written offline by a value
+search over the checkpoints, and is byte-identical to all ten. The template
 torsions' chi tables are compiled in (`src/chi_tables.cuh`). Chains are joined by `:`. `--template`
 takes `<structure>:<chain>[@<query chain>][+...]` (PDB or mmCIF), each part aligned to its chain by
 the page's own `buildTemplate` in the atom37 layout and merged into the one slot AF2 takes, as the

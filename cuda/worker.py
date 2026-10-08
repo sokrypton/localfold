@@ -11,7 +11,8 @@ stdout is one bridge event, `{"kind", "payload", "at"}` - `status`, `progress`, 
 esmfold2-featurise) reads it as the page's reader does and builds the page's input byte for byte
 (tools/check-native-featuriser.py holds them to the JavaScript); the template rows are resolved as the page resolves
 them (cuda/featurise/resolve-templates); the alignment search is the page's MMseqs2 client, natively; the weights are
-the published bundles the page folds with, read through cuda/*/maps. What this file adds is the plumbing between
+the published bundles the page folds with, read as published through each port's weight walk (cuda/featurise/af3_weights.h,
+af2_weights.h). What this file adds is the plumbing between
 them - nothing about a molecule is decided here.
 
 🔴 WHAT IT REFUSES, IT SAYS. A sampler, a model or an input a native port does not have is a refusal
@@ -491,7 +492,7 @@ class Worker:
             # chai-1's token features are ESM2 3B's, computed in the fold (cuda/af3/src/esm2.cuh)
             esm = [f"--esm-bundle={ensure_blob('esm2', log)}"] if family == "chai1" else []
             server = self.server_for(key, [binary("af3"), "-", f"--bundle={bundle}",
-                                           f"--map={os.path.join(CUDA, 'af3', 'maps', family + '.map')}", "--fold", "--fast",
+                                           f"--family={family}", "--fold", "--fast",
                                            *esm], residues)
             featurise([featuriser("af3-featurise"), inputs, "--no-weights", dialect, f"--job={job_path}",
                        f"--max-msa={requested}", *flags], "featurising", log)
@@ -525,7 +526,7 @@ class Worker:
             model = f"model_{af2_model}_ptm" if family == "monomer" else f"model_{af2_model}_multimer_v3"
             key = ("af2", family, af2_model)
             server = self.server_for(key, [binary("af2"), "-", f"--bundle={bundle}",
-                                           f"--map={os.path.join(CUDA, 'af2', 'maps', model + '.map')}", "--fast",
+                                           "--fast",
                                            *([f"--delta={delta}"] if delta else []), "--warm=64,8,8,0"], residues)
             export = [featuriser("af2-featurise"), inputs, f"--bundle={bundle}", f"--job={job_path}",
                       f"--max-msa={508 if requested == 512 else requested}", f"--max-extra={extra}", f"--seed={seed}", *flags]

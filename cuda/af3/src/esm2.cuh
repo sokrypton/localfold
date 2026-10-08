@@ -11,7 +11,7 @@
 // [in, out] int8 with a float32 scale per output channel, kept RESIDENT as their codes (2.7 GB, not 11) and each
 // expanded to float16 for its GEMM; biases and norms float16. q, k and v are three matrices there, expanded side
 // by side into one [in, 3C] so the attention's projection stays one GEMM.
-// Loaded under `e/` (Model::loadBundle(dir, "e", "", "", "esm2/blocks/")).
+// Loaded under `e/` (Model::loadBundle(dir, "e", nullptr, "", "esm2/blocks/")).
 #pragma once
 #include "common.cuh"
 

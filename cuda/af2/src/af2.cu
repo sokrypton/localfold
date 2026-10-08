@@ -2,7 +2,7 @@
 // checkpoints, as the reference runs them), from cuda/af2/export_input.mjs's features and
 // cuda/af2/export_weights.py's weights.
 //
-//   af2 <input dir> --bundle=<page bundle dir> --map=<maps/<model>.map> [--delta=<dir>] [--out=fold.pdb] [--recycles=N]
+//   af2 <input dir> --bundle=<page bundle dir> [--delta=<dir>] [--out=fold.pdb] [--recycles=N]
 //   af2 <input dir> --weights=<dir> [--oracle=<dir>] ...      (export_weights.py's: DeepMind's float32)
 //
 // With --oracle (cuda/af2/oracle.py's dump of the reference on this same input), pass 0 is checked
@@ -13,6 +13,7 @@
 #include "templates.cuh"
 #include "structure.cuh"
 #include "../../af3/src/profile.cuh"
+#include "../../featurise/af2_weights.h"   // the weight walk: the page's bundle read as published, no map
 
 static const char* RESTYPE3[21] = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU",
                                    "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK"};
@@ -631,12 +632,11 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 // its end returns while the driver releases this process's device (0.16 s of exit; cuda/af2/fold does)
 static bool DETACH = false;
 int main(int argc, char** argv) {
-  if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> --map=<file> | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
-  std::string weights, bundleDir, mapFile, deltaDir, oracle, out = "fold.pdb", warmShape, serveDir; int recycles = -1; bool profile = false, waitInput = false;
+  if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> [--delta=<dir>] | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
+  std::string weights, bundleDir, deltaDir, oracle, out = "fold.pdb", warmShape, serveDir; int recycles = -1; bool profile = false, waitInput = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--bundle=", 9)) bundleDir = argv[i] + 9;      // the page's published bundle, as it is,
-    else if (!strncmp(argv[i], "--map=", 6)) mapFile = argv[i] + 6;           // through maps/<model>.map
     else if (!strncmp(argv[i], "--delta=", 8)) deltaDir = argv[i] + 8;        // models 2-5: their delta on model 1
     else if (!strncmp(argv[i], "--oracle=", 9)) oracle = argv[i] + 9;
     else if (!strncmp(argv[i], "--out=", 6)) out = argv[i] + 6;
@@ -651,11 +651,22 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;   // stay up, folding each job dropped there
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
-  if (bundleDir.empty() != mapFile.empty()) { fprintf(stderr, "--bundle and --map go together\n"); return 1; }
-  if (weights.empty() == bundleDir.empty()) { fprintf(stderr, "--bundle=<dir> --map=<file>, or --weights=<dir>\n"); return 1; }
+  if (weights.empty() == bundleDir.empty()) { fprintf(stderr, "--bundle=<dir> [--delta=<dir>], or --weights=<dir>\n"); return 1; }
   auto t0 = std::chrono::steady_clock::now();
   if (!weights.empty()) M.load(weights);
-  else M.loadBundle(bundleDir, "", mapFile, deltaDir);
+  else                    // the page's bundle read as published, through the weight walk (cuda/featurise/af2_weights.h)
+    M.loadBundle(bundleDir, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
+      lf::Json manifest = lf::parseJson(lf::weights::readText(bundleDir + "/manifest.json"));
+      std::string deltaModel;
+      if (!deltaDir.empty()) {
+        const lf::Json dm = lf::parseJson(lf::weights::readText(deltaDir + "/manifest.json"));
+        const lf::Json* h = dm.get("delta");
+        const lf::Json* name = h ? h->get("model") : nullptr;
+        deltaModel = name && name->isString() ? name->s : "";
+      }
+      lf::weights::Shapes S; S.shape = shapes;
+      return lf::weights::af2WeightLines(manifest, S, deltaModel);
+    }, deltaDir);
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   bool tf32 = FAST && !getenv("AF2_NO_TF32");
   if (getenv("AF2_NO_FLASH")) FAST = false;

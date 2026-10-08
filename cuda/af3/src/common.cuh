@@ -437,11 +437,16 @@ struct Model {
   // a page bundle (its manifest.json and shards) under `prefix/`: every tensor as `prefix/<name>` with its
   // rank and dims (`#r`, `#k`), and the manifest's trunk/languageModel numbers as `meta/<key>` - the
   // entries cuda/esmfold2/export_weights.mjs wrote, from the same bytes
-  // With `map` (a port's .map, cuda/make_map.mjs), the entries are the map's instead: each `b` line a
-  // slice of a bundle tensor under the port's own name, each `z` zeros, each `m` metadata as it is.
-  void loadBundle(const std::string& dir, const std::string& prefix, const std::string& map = "",
+  // With `lines` (the port's WEIGHT WALK - cuda/featurise/af3_weights.h for the AF3 lineage, af2_weights.h for
+  // AlphaFold 2 - handed the bundle's tensor names and shapes), the entries are the walk's instead: each `b` line a
+  // slice of a bundle tensor under the port's own name, each `z` zeros, `p` derived (ones, a scale folded into a
+  // projection, a strided view), `c` literal values, each `m` metadata as it is. (These lines were once files,
+  // cuda/*/maps/*.map, written offline from a float32 export; the walk works them out from the bundle itself.)
+  using WeightLines = std::function<std::vector<std::string>(const std::map<std::string, std::vector<long long>>& shapes)>;
+  void loadBundle(const std::string& dir, const std::string& prefix, const WeightLines& lines = nullptr,
                   const std::string& delta = "", const std::string& residentPrefix = "") {
-    if (!delta.empty() && map.empty()) { fprintf(stderr, "a delta bundle is read through a map\n"); exit(1); }
+    const bool map = (bool)lines;
+    if (!delta.empty() && !map) { fprintf(stderr, "a delta bundle is read through a weight walk\n"); exit(1); }
     std::string blob = findBlob(dir);       // (af3-any-model's: a directory holding one *.bin.zst)
     std::string text = "{\"tensors\": {}}";
     if (blob.empty()) {
@@ -464,7 +469,8 @@ struct Model {
     const Json* tensors = m.get("tensors");
     if (!tensors) { fprintf(stderr, "%s/manifest.json has no tensors\n", dir.c_str()); exit(1); }
     std::map<std::string, int> fileIndex;
-    std::map<std::string, BRec> byName;      // (map mode) every bundle tensor, by its bundle name
+    std::map<std::string, BRec> byName;      // (walk mode) every bundle tensor, by its bundle name
+    std::map<std::string, std::vector<long long>> shapeOf;   // ...and its shape, for the walk
     std::map<std::string, BRec> deltaOf;     // (a delta) the record added to an addTo tensor's base
     size_t at = 0;
     // a manifest record as a BRec; `where` prefixes its file (a delta's shards live in another directory)
@@ -507,7 +513,7 @@ struct Model {
     }
     for (auto& [name, b, shape] : entries) {
       size_t n = b.elements;
-      if (!map.empty()) { byName[name] = b; continue; }
+      if (map) { byName[name] = b; shapeOf[name] = std::vector<long long>(shape.begin(), shape.end()); continue; }
       std::string key = prefix + "/" + name;
       if (index.count(key)) { fprintf(stderr, "%s is in two model directories\n", key.c_str()); exit(1); }
       // (int8 under the prefix, a bundle's or a blob's; packed codes - ESM-C 600M's int3 - decode into the float32 copy
@@ -549,7 +555,7 @@ struct Model {
         if (const Json* list = header->get(key)) for (auto& v : list->arr) out.push_back(v.str);
         return out;
       };
-      for (auto& name : names("absent")) byName.erase(name);
+      for (auto& name : names("absent")) { byName.erase(name); shapeOf.erase(name); }
       for (auto& name : names("whole")) {
         const Json* r = dt->get(name);
         if (!r) { fprintf(stderr, "%s: the delta's header names %s whole and holds no such tensor\n", delta.c_str(), name.c_str()); exit(1); }
@@ -575,9 +581,14 @@ struct Model {
       b.addRec = (int)pool.size() + 1;     // (b is pushed first, then d)
       pool.push_back(b); pool.push_back(d);
     };
-    if (!map.empty()) {
-      std::ifstream mf(map);
-      if (!mf) { fprintf(stderr, "no %s\n", map.c_str()); exit(1); }
+    if (map) {
+      std::vector<std::string> walked;
+      try { walked = lines(shapeOf); }
+      catch (const std::exception& e) { fprintf(stderr, "%s: %s\n", dir.c_str(), e.what()); exit(1); }
+      std::string joined;
+      for (auto& l : walked) joined += l + "\n";
+      std::istringstream mf(joined);
+      const std::string mapName = "the weight walk";
       std::string line; std::map<std::string, int> srcIndex;
       bool mapDelta = false;
       while (std::getline(mf, line)) {
@@ -585,7 +596,7 @@ struct Model {
         if (kind == 'm') { double v; in >> v; addMeta(name, v); continue; }
         if (kind == 'D') {          // this map is for a delta model: the one named, on the bundle it was made from
           if (delta.empty() || name != deltaModel) {
-            fprintf(stderr, "%s is for %s on a delta bundle; %s\n", map.c_str(), name.c_str(),
+            fprintf(stderr, "%s is for %s on a delta bundle; %s\n", mapName.c_str(), name.c_str(),
                     delta.empty() ? "no --delta was given" : ("the delta given is " + deltaModel).c_str());
             exit(1);
           }
@@ -598,7 +609,7 @@ struct Model {
           std::string source; size_t first; in >> source >> first >> n;
           auto it = byName.find(source);
           if (it == byName.end() || first + n > it->second.elements) {
-            fprintf(stderr, "%s: %s does not hold [%zu, %zu) of %s (another export of the bundle?)\n", map.c_str(),
+            fprintf(stderr, "%s: %s does not hold [%zu, %zu) of %s (another export of the bundle?)\n", mapName.c_str(),
                     dir.c_str(), first, first + n, source.c_str());
             exit(1);
           }
@@ -608,7 +619,7 @@ struct Model {
         else if (kind == 'c') {
           in >> n; std::vector<float> v(n);
           for (size_t k = 0; k < n && in; ++k) in >> v[k];
-          if (in.fail()) { fprintf(stderr, "%s: a malformed c line for %s\n", map.c_str(), name.c_str()); exit(1); }
+          if (in.fail()) { fprintf(stderr, "%s: a malformed c line for %s\n", mapName.c_str(), name.c_str()); exit(1); }
           b.kind = 8; b.file = -1; b.byteOffset = sg.consts.size(); sg.consts.push_back(std::move(v));
         }
         else if (kind == 'p') {
@@ -627,7 +638,7 @@ struct Model {
             long long slo = 0, shi = 0;
             for (int k = 0; k < g.rank; ++k) { in >> g.srcStride[q][k]; (g.srcStride[q][k] < 0 ? slo : shi) += g.srcStride[q][k] * (long long)(g.dims[k] - 1); }
             if (it == byName.end() || (long long)g.srcOff[q] + slo < 0 || (long long)g.srcOff[q] + shi >= (long long)it->second.elements) {
-              fprintf(stderr, "%s: %s does not hold that view of %s (another export of the bundle?)\n", map.c_str(), dir.c_str(), source.c_str());
+              fprintf(stderr, "%s: %s does not hold that view of %s (another export of the bundle?)\n", mapName.c_str(), dir.c_str(), source.c_str());
               exit(1);
             }
             if (!srcIndex.count(source)) {
@@ -638,17 +649,17 @@ struct Model {
             }
             g.src[q] = srcIndex[source];
           }
-          if (!okLine || in.fail()) { fprintf(stderr, "%s: a malformed p line for %s\n", map.c_str(), name.c_str()); exit(1); }
+          if (!okLine || in.fail()) { fprintf(stderr, "%s: a malformed p line for %s\n", mapName.c_str(), name.c_str()); exit(1); }
           auto it = index.find(name);
           if (it != index.end()) {
             if (it->second.seg != seg || it->second.rec < 0 || sg.recs[it->second.rec].kind != 5 || it->second.length != n) {
-              fprintf(stderr, "%s: %s is a p tensor and something else\n", map.c_str(), name.c_str()); exit(1);
+              fprintf(stderr, "%s: %s is a p tensor and something else\n", mapName.c_str(), name.c_str()); exit(1);
             }
             g.rec = it->second.rec; sg.parts.push_back(g); continue;
           }
           b.kind = 5; b.file = -1; g.rec = (int)sg.recs.size(); sg.parts.push_back(g);
         }
-        else { fprintf(stderr, "%s: a line of kind %c\n", map.c_str(), kind); exit(1); }
+        else { fprintf(stderr, "%s: a line of kind %c\n", mapName.c_str(), kind); exit(1); }
         if (index.count(name)) { fprintf(stderr, "%s is in two model directories\n", name.c_str()); exit(1); }
         b.elements = n;
         at = (at + 3) / 4 * 4;
@@ -657,7 +668,7 @@ struct Model {
         if (!bSource.empty() && deltaOf.count(bSource)) withDelta(bSource, b, sg.recs);
         else sg.recs.push_back(b);
       }
-      if (!delta.empty() && !mapDelta) { fprintf(stderr, "%s is not a map for a delta model (no D line)\n", map.c_str()); exit(1); }
+      if (!delta.empty() && !mapDelta) { fprintf(stderr, "%s is not a map for a delta model (no D line)\n", mapName.c_str()); exit(1); }
     }
     sg.deviceBytes = at * 4;
     for (auto& f : sg.files) { struct stat st; if (stat(shardPath(sg, f).c_str(), &st)) { fprintf(stderr, "no %s\n", shardPath(sg, f).c_str()); exit(1); } sg.bytes += (size_t)st.st_size; }
