@@ -4,9 +4,9 @@
 #   bash cuda/build.sh [af3] [af2] [esmfold2]      (all three when none is named)
 #   bash cuda/build.sh featurise                    (the featurisers alone: no GPU, no nvcc)
 #
-# The featurisers (cuda/featurise: af3-featurise, af2-featurise, esmfold2-featurise, resolve-templates - host C++,
-# no GPU, a job JSON in and each port's input out, byte for byte the page's) are built first and always, so a fold
-# needs no Node at all.
+# The featurisers (cuda/featurise: one binary linked as af3-featurise, af2-featurise, esmfold2-featurise and
+# resolve-templates - host C++, no GPU, a job JSON in and each port's input out, byte for byte the page's) are built
+# first and always, so a fold needs no Node at all.
 # Each port is compiled for the card nvidia-smi reports (sm_75 a T4, sm_89 an L4, sm_80 an A100), the three
 # in parallel, each to a temporary file moved into place only when whole - so native/<port>/<port> either
 # does not exist or is a finished binary, and a fold never starts on half of one. While it runs,
@@ -22,17 +22,18 @@ marker=/tmp/localfold-cuda-build log=/tmp/localfold-cuda-build.log
 echo $$ > "$marker"; trap 'rm -f "$marker"' EXIT
 : > "$log"
 pids=()
-# the featurisers, each from its sources (a header changed rebuilds every one) - g++, the host's only compiler need
+# the featurisers: ONE binary (cuda/featurise/featurise.cpp) linked as each tool's name, rebuilt when any of its
+# sources changed - g++, the host's only compiler need
 fstamp="$(cat "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
-for tool in af3 af2 esmfold2 resolve_templates; do
-  name="${tool/_/-}"; [ "$tool" = resolve_templates ] || name="$tool-featurise"
-  out="$here/featurise/$name"
-  if [ -x "$out" ] && [ "$(cat "$out.stamp" 2>/dev/null)" = "$fstamp" ]; then continue; fi
-  src="$here/featurise/${tool}_featurise.cpp"; [ "$tool" = resolve_templates ] && src="$here/featurise/resolve_templates.cpp"
-  ( g++ -std=c++17 -O2 -ffp-contract=off -pthread "$src" -o "$out.building" >> "$log" 2>&1 \
-    && mv "$out.building" "$out" && echo "$fstamp" > "$out.stamp" && echo "built $name" >> "$log" \
-    || { echo "FAILED $name" >> "$log"; exit 1; } ) &
+fbin="$here/featurise/featurise"
+if [ ! -x "$fbin" ] || [ "$(cat "$fbin.stamp" 2>/dev/null)" != "$fstamp" ]; then
+  ( g++ -std=c++17 -O2 -ffp-contract=off -pthread "$here/featurise/featurise.cpp" -o "$fbin.building" >> "$log" 2>&1 \
+    && mv "$fbin.building" "$fbin" && echo "$fstamp" > "$fbin.stamp" && echo "built the featurisers" >> "$log" \
+    || { echo "FAILED the featurisers" >> "$log"; exit 1; } ) &
   pids+=($!)
+fi
+for name in af3-featurise af2-featurise esmfold2-featurise resolve-templates chem-probe; do
+  ln -sfn featurise "$here/featurise/$name"
 done
 # (no GPU: the featurisers still build, the ports cannot)
 if [ "${ports[*]}" = featurise ]; then

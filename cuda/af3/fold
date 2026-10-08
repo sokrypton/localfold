@@ -50,8 +50,7 @@ if [ ! -x "$here/af3" ]; then
   (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af3.cu \
      -lcublas -lcublasLt -lcupti -ldl -o af3)
 fi
-[ -x "$repo/cuda/featurise/af3-featurise" ] || g++ -std=c++17 -O2 -ffp-contract=off -pthread "$repo/cuda/featurise/af3_featurise.cpp" \
-  -o "$repo/cuda/featurise/af3-featurise"
+[ -x "$repo/cuda/featurise/featurise" ] || bash "$repo/cuda/build.sh" featurise
 featurise=("$repo/cuda/featurise/af3-featurise")
 serve_dir="/tmp/af3-serve-$model-$(id -u)"
 server_up() { [ -f "$serve_dir/pid" ] && kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null; }

@@ -128,7 +128,8 @@ tools/_*.py
 # af3-any-model's published blobs, fetched for the CUDA ports (cuda/fetch_bundles.py --af3-any-model)
 /af3am-*
 
-# the native featurisers (cuda/featurise/build.sh)
+# the native featurisers (cuda/build.sh: one binary and the names linked to it)
+cuda/featurise/featurise
 cuda/featurise/*-featurise
 cuda/featurise/chem-probe
 cuda/featurise/resolve-templates

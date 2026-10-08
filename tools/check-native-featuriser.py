@@ -340,6 +340,21 @@ def main():
                 print(f"  ok   {tag}: identical (JS {js_s:.2f} s, native {nv_s:.2f} s)")
             if not a.keep and not problem:
                 shutil.rmtree(base, ignore_errors=True)
+    # the SMILES chemistry on its own: tools/fixtures/smiles-corpus.txt - the 74 molecules held to RDKit and 904
+    # RDKit re-writings of them, plus malformed strings - one line each, conformer coordinates included
+    if not a.network and (not a.only or a.only in "chem-smiles-corpus"):
+        corpus = open(os.path.join(FIX, "smiles-corpus.txt")).read()
+        js = subprocess.run(["node", os.path.join(REPO, "tools", "chem-probe.mjs")], input=corpus, capture_output=True, text=True)
+        nv = subprocess.run([os.path.join(REPO, "cuda", "featurise", "chem-probe")], input=corpus, capture_output=True, text=True)
+        la, lb, smiles = js.stdout.splitlines(), nv.stdout.splitlines(), corpus.splitlines()
+        bad = [k for k in range(max(len(la), len(lb))) if k >= len(la) or k >= len(lb) or la[k] != lb[k]]
+        if bad:
+            failed.append("chem-smiles-corpus")
+            k = bad[0]
+            print(f"  FAIL chem-smiles-corpus: {len(bad)} of {len(smiles)} differ, first {smiles[k] if k < len(smiles) else '?'}")
+        else:
+            passed += 1
+            print(f"  ok   chem-smiles-corpus: {len(la)} of {len(smiles)} identical ({sum(l.startswith('ERR') for l in la)} refusals)")
     for name, request, network in resolve_cases():
         if (a.only and a.only not in name) or bool(network) != a.network:
             continue

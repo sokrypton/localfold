@@ -4305,7 +4305,8 @@ Every CUDA fold used to start with Node: each port's exporter (`cuda/af3/export-
 `cuda/af2/export_input.mjs`, `cuda/esmfold2/export_input.mjs`) ran the page's own featuriser over the job, and
 `cuda/resolve_templates.mjs` resolved the template rows - kept resident by `cuda/export_server.mjs`, because loading
 their modules was most of an export. All four are C++ now, in `cuda/featurise` (`af3-featurise`, `af2-featurise`,
-`esmfold2-featurise`, `resolve-templates`, built by `cuda/build.sh` with g++ beside the ports), and `cuda/worker.py`
+`esmfold2-featurise`, `resolve-templates` - one binary linked as each name, built by `cuda/build.sh` with g++ beside
+the ports: four compiles of the same headers were ~60 s of CPU here and twice that on a two-core Colab VM, one is 26 s), and `cuda/worker.py`
 and the three `cuda/*/fold` scripts call them: **a job JSON goes in and a structure comes out with no JavaScript
 anywhere**, and a Colab runtime no longer installs Node.
 
@@ -4338,3 +4339,11 @@ eight residues a 64-bit word on a thread a recycle - an 8000-row, 255-residue al
 Node's 0.77, byte-identical - so that round trip, `cuda/export_server.mjs` and the exporter's two-phase
 `--search-out`/`--assignments` path are removed. `npm run test:cuda` passes unchanged through the native path, the
 real reader's page included.
+
+🔴 **AND IT IS THE SAME BYTES ON COLAB.** A fresh T4 runtime (Ubuntu 24.04, g++ 13.3, CUDA 13) cloned the branch,
+shadowed `node` with a stub that fails, and built the featurisers and all three ports with `cuda/build.sh` (534 s on
+its two cores, the ports' nvcc being nearly all of it); five featurised inputs - KRAS with sotorasib, the streptavidin
+job's SMILES biotin and the glycosylated RNase B through boltz2's conventions, barnase-barstar for AF2, the kitchen
+sink for ESMFold2 - came out with the A100 box's MD5s exactly, the SMILES conformer included, and every port folded a
+job JSON through its `fold` script: boltz2 the four AF3 jobs (KRAS 13.1 s with its first-fold start-up, the rest
+3.3-5.9 s), AF2's monomer and multimer, ESMFold2 calmodulin and the kitchen sink.

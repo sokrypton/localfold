@@ -67,7 +67,7 @@ warm=(); [ -z "$seq" ] || warm=(--warm="${#seq},$n,$e,$templates")
 exec 3< <("$here/af2" "$tmp" "${wflags[@]}" --fast --out="$out" --wait-input --detach-output "${warm[@]}" \
           "${flags[@]}" && rc=0 || rc=$?; echo "af2: exit $rc")
 featurise="$repo/cuda/featurise/af2-featurise"
-[ -x "$featurise" ] || g++ -std=c++17 -O2 -ffp-contract=off -pthread "$repo/cuda/featurise/af2_featurise.cpp" -o "$featurise"
+[ -x "$repo/cuda/featurise/featurise" ] || bash "$repo/cuda/build.sh" featurise
 if ! "$featurise" "$tmp" --bundle="$bundle" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
 # "af2: done" (its stdout then closes): the fold is written and af2 is only releasing the device

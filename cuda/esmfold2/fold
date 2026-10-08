@@ -58,7 +58,7 @@ warm=(); [ -z "$seq" ] || warm=(--warm="${#seq},$atoms")     # (a job's size is 
 exec 3< <("$here/esmfold2" "$tmp" "${wflags[@]}" --out="$out" --wait-input --detach-output "${warm[@]}" --fast "${flags[@]}" \
           && rc=0 || rc=$?; echo "ef2: exit $rc")     # (&& || survives set -e, which would skip the echo)
 featurise="$repo/cuda/featurise/esmfold2-featurise"
-[ -x "$featurise" ] || g++ -std=c++17 -O2 -ffp-contract=off -pthread "$repo/cuda/featurise/esmfold2_featurise.cpp" -o "$featurise"
+[ -x "$repo/cuda/featurise/featurise" ] || bash "$repo/cuda/build.sh" featurise
 if ! "$featurise" "$tmp" "${inputs[@]}" --fold-bundle="$fold_bundle"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
 # "ef2: done" (its stdout then closes): the fold is written and ef2 is only releasing the device
