@@ -383,7 +383,7 @@ static int foldMain(int argc, char** argv) {
   // the big-input paths when SHORT_PAIR_TIMES x the f32 pair does not fit the room (cuda/af3's common.cuh,
   // shortPair); LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
   SHORT_PAIR_TIMES = getenv("LOCALFOLD_SHORT_PAIR_TIMES") ? atof(getenv("LOCALFOLD_SHORT_PAIR_TIMES")) : 18;
-  std::string weights, foldBundle, esmcBundle, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, profile = false, stepsGiven = false; std::string warmShape, serveDir;
+  std::string weights, foldBundle, esmcBundle, oracle, out = "fold.pdb"; uint64_t seed = 0; SamplerSettings sampler; bool waitInput = false, waitForever = false, profile = false, stepsGiven = false; std::string warmShape, serveDir;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--fold-bundle=", 14)) foldBundle = argv[i] + 14;
@@ -397,6 +397,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-token-flash")) TOKEN_FLASH = false;
     else if (!strcmp(argv[i], "--atom-f32")) ATOM_BF16 = false;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
+    else if (!strcmp(argv[i], "--wait-input=0")) waitInput = waitForever = true;   // ...with no timeout (the standalone mode: its own featuriser)
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;    // T,A: fold a synthetic input of that size meanwhile
     else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strcmp(argv[i], "--detach-output")) DETACH = true;
@@ -487,7 +488,7 @@ static int foldMain(int argc, char** argv) {
     std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";
     for (int k = 0; access(idx.c_str(), R_OK) != 0; ++k) {
       if (access(failed.c_str(), F_OK) == 0) { fprintf(stderr, "ef2: the input's export failed\n"); return 1; }
-      if (k > 600000) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
+      if (k > 600000 && !waitForever) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
       usleep(1000);
     }
   }

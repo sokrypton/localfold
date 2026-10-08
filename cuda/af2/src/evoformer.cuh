@@ -763,10 +763,12 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     // planes [Lp][Lp], the pad rows and columns zero (written once: nothing else writes them)
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
-    static half* zeroed = nullptr; static size_t zeroedBytes = 0;
-    if (Lp != L && (a != zeroed || plane * C * 2 > zeroedBytes)) {
+    // (again whenever the layout, either buffer or a scratch give-back changes: one returned at the same address can
+    // hold another stage's data where this layout's pad is)
+    static half *zeroedA = nullptr, *zeroedB = nullptr; static int zeroedLp = 0; static uint64_t zeroedAt = ~0ull;
+    if (Lp != L && (a != zeroedA || b != zeroedB || Lp != zeroedLp || SCRATCH_RELEASES != zeroedAt)) {
       CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
-      zeroed = a; zeroedBytes = plane * C * 2;
+      zeroedA = a; zeroedB = b; zeroedLp = Lp; zeroedAt = SCRATCH_RELEASES;
     }
     // the five projections in row chunks of ~128 MB (whole, [pairs, 5C] was 0.78 GB at 783 residues):
     // a and b gated into their planes, the output gate kept [pairs, C] for the end

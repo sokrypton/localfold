@@ -164,7 +164,7 @@ def binary(port):
         time.sleep(3)
     if not os.access(path, os.X_OK):
         said = open(BUILD_LOG).read()[-600:] if os.path.exists(BUILD_LOG) else ""
-        raise Refused(f"cuda/{port}/{port} is not built on this runtime - run cuda/build.sh"
+        raise Refused(f"cuda/{port}/localfold-{port} is not built on this runtime - run cuda/build.sh"
                       + (f" (its last build said: {said.strip()})" if said.strip() else ""))
     return path
 

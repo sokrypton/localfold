@@ -137,10 +137,11 @@ inline void triangleFast(float* pair, const float* mask, int L, int C, const std
   half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
   // the pad, written once for a buffer and a padded size (nothing else writes it - but a buffer reused at
   // another size has data where this layout's pad is)
-  static half* zeroed = nullptr; static int zeroedLp = 0;
-  if (Lp != L && (a != zeroed || Lp != zeroedLp)) {
+  // (and a buffer given back and asked for again can return at the same address with another stage's data in it)
+  static half *zeroedA = nullptr, *zeroedB = nullptr; static int zeroedLp = 0; static uint64_t zeroedAt = ~0ull;
+  if (Lp != L && (a != zeroedA || b != zeroedB || Lp != zeroedLp || SCRATCH_RELEASES != zeroedAt)) {
     CK(cudaMemsetAsync(a, 0, plane * C * 2, STREAM)); CK(cudaMemsetAsync(b, 0, plane * C * 2, STREAM));
-    zeroed = a; zeroedLp = Lp;
+    zeroedA = a; zeroedB = b; zeroedLp = Lp; zeroedAt = SCRATCH_RELEASES;
   }
   triSplitHK<<<dim3((unsigned)((P + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, mask, a, b, P, C, L, Lp);
   float* prod = scratch<float>("ftri.prod", plane * C);

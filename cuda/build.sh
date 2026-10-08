@@ -8,7 +8,7 @@
 # resolve-templates - host C++, no GPU, a job JSON in and each port's input out, byte for byte the page's) are built
 # first and always, so a fold needs no Node at all.
 # Each port is compiled for the card nvidia-smi reports (sm_75 a T4, sm_89 an L4, sm_80 an A100), the three
-# in parallel, each to a temporary file moved into place only when whole - so native/<port>/<port> either
+# in parallel, each to a temporary file moved into place only when whole - so cuda/<port>/localfold-<port> either
 # does not exist or is a finished binary, and a fold never starts on half of one. While it runs,
 # /tmp/localfold-cuda-build holds this script's pid (cuda/worker.py waits on it rather than
 # refusing a fold that arrives mid-build); the log is /tmp/localfold-cuda-build.log. A port already
@@ -20,6 +20,9 @@
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(af3 af2 ef2)
+for port in "${ports[@]}"; do      # (named before anything is forked: a typo must not leave half a build running)
+  case "$port" in af3|af2|ef2|featurise) ;; *) echo "unknown port $port (af3, af2, ef2, featurise)" >&2; exit 1 ;; esac
+done
 cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
 arch="sm_$cc"; archflags="-arch=$arch"
 archs="${LOCALFOLD_CUDA_ARCHS:-}"

@@ -20,6 +20,7 @@
 // 🔴 NO LIBRARY, AS search.h: curl runs as a child, eight at a time (one connection to Hugging Face is ~21 MB/s
 // from here, eight 112 - AF3's 277 MB in 2.5 s against 13.5).
 #pragma once
+#include <dirent.h>
 #include <fcntl.h>
 #include <strings.h>
 #include <sys/file.h>
@@ -207,16 +208,37 @@ inline std::string blob(const std::string& root, const std::string& name) {
   return dest;
 }
 
+// 🔴 A BUNDLE REMEMBERS WHICH REMOTE IT CAME FROM (<dir>/.source). The registry pins each bundle to a commit, and a
+// re-pin that keeps the shard names (weights-NN...) would otherwise leave the old bytes in place forever - a whole
+// manifest never refetched, or an interrupted download's old shards kept under a new manifest. A different remote
+// empties the directory and fetches it again; a directory with no .source (fetched before it existed) is taken as is.
+inline void emptyBundleDir(const std::string& dest) {
+  if (DIR* d = opendir(dest.c_str())) {
+    while (dirent* e = readdir(d)) {
+      std::string n = e->d_name;
+      if (n == "." || n == ".." || n == ".fetch.lock") continue;
+      std::remove((dest + "/" + n).c_str());
+    }
+    closedir(d);
+  }
+}
 inline std::string bundle(const std::string& root, const std::string& key) {
   const BundleEntry* entry = nullptr;
   for (auto& b : bundleTable()) if (b.key == key) entry = &b;
   if (!entry) throw std::runtime_error("no bundle " + key + " in shared/bundles/manifests/index.js");
-  std::string dest = root + "/" + entry->directory, manifest = dest + "/manifest.json";
-  if (exists(manifest)) return dest;
+  std::string dest = root + "/" + entry->directory, manifest = dest + "/manifest.json", source = dest + "/.source";
+  auto current = [&] { return exists(manifest) && (!exists(source) || readFile(source) == entry->remote); };
+  if (current()) return dest;
   if (entry->remote.empty()) throw std::runtime_error(key + " has no published remote");
   makeDirs(dest);
   Lock lock(dest);
-  if (exists(manifest)) return dest;
+  if (current()) return dest;
+  if (exists(source) ? readFile(source) != entry->remote : exists(manifest)) {
+    printf("  %s: the registry pins another revision; fetching it afresh\n", key.c_str()); fflush(stdout);
+    emptyBundleDir(dest);
+  }
+  { FILE* f = fopen(source.c_str(), "wb"); if (!f) throw std::runtime_error("cannot write " + source);
+    fwrite(entry->remote.data(), 1, entry->remote.size(), f); fclose(f); }
   download(entry->remote + "manifest.json", manifest + ".fetching");
   Json m = parseJson(readFile(manifest + ".fetching"));
   std::set<std::string> files;
@@ -225,7 +247,7 @@ inline std::string bundle(const std::string& root, const std::string& key) {
   std::vector<std::function<void()>> jobs;
   size_t present = 0;
   for (auto& f : files) {
-    if (exists(dest + "/" + f)) { ++present; continue; }
+    if (exists(dest + "/" + f)) { ++present; continue; }      // (a shard of THIS remote: the directory was emptied otherwise)
     jobs.push_back([=] { download(entry->remote + f, dest + "/" + f); });
   }
   inParallel(jobs, [&](size_t done) { printf("  %s: shard (%zu/%zu)\n", key.c_str(), present + done, files.size()); fflush(stdout); });
@@ -272,7 +294,17 @@ inline std::string modelNames() {
   return "af3, boltz2, chai1, protenix2, intellifold2, rosettafold3, opendde, openbind0 (af3); model_1_ptm ... model_5_ptm, "
          "model_1_multimer_v3 ... model_5_multimer_v3 (af2); ef2-fast-600m, ef2-fast-300m, ef2-fast, ef2 (ef2)";
 }
+// which binary folds a model, by name alone - nothing fetched (a binary asks this before downloading anything)
+inline std::string portOf(const std::string& name) {
+  for (auto& m : af3Models()) if (m == name) return "af3";
+  bool monomer = name.size() == 11 && name.compare(0, 6, "model_") == 0 && name.compare(7, 4, "_ptm") == 0;
+  bool multimer = name.size() == 19 && name.compare(0, 6, "model_") == 0 && name.compare(7, 12, "_multimer_v3") == 0;
+  if ((monomer || multimer) && name[6] >= '1' && name[6] <= '5') return "af2";
+  if (name == "ef2-fast-600m" || name == "ef2-fast-300m" || name == "ef2" || name == "ef2-fast") return "ef2";
+  throw std::runtime_error("no model " + name + ": " + modelNames());
+}
 inline ModelWeights model(const std::string& root, const std::string& name) {
+  portOf(name);                                     // (an unknown name refused before anything is fetched)
   for (auto& m : af3Models())
     if (m == name) {
       ModelWeights w{"af3", {blob(root, name)}};

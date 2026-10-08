@@ -68,8 +68,8 @@ inline void featuriseAf2Into(const Args& args, const std::string& dir) {
 inline void featuriseEsmfold2Into(const Args& args, const std::string& dir) {
   Esmfold2Export out = exportEsmfold2(args);
   fetch::makeDirs(dir);
+  writeText(dir + "/pdb.template", out.pdb);       // (BEFORE the entries: model.idx is what releases a waiting fold)
   out.entries.write(dir);
-  writeText(dir + "/pdb.template", out.pdb);
   for (auto& line : out.said) printf("%s\n", line.c_str());
   fflush(stdout);
 }
@@ -127,7 +127,8 @@ inline std::string CLEAN_DIR, KEEP_A3M;
 inline std::atomic<bool> FEATURISED{false};
 inline void cleanUp() {
   for (int k = 0; !FEATURISED && k < 20000; ++k) usleep(1000);
-  if (CLEAN_DIR.empty()) return;
+  // (a featuriser still running - the fold died first - keeps its directory: deleting it under the thread is a race)
+  if (CLEAN_DIR.empty() || !FEATURISED) return;
   if (!KEEP_A3M.empty() && fetch::exists(CLEAN_DIR + "/search.a3m")) {
     std::string cp = "cp " + search::shellQuote(CLEAN_DIR + "/search.a3m") + " " + search::shellQuote(KEEP_A3M);
     if (system(cp.c_str()) == 0) fprintf(stderr, "the searched alignment -> %s\n", KEEP_A3M.c_str());
@@ -143,7 +144,8 @@ inline int featuriseAndFold(Run& run, const std::function<void(const std::string
   run.dir = tempDir();
   CLEAN_DIR = run.dir;
   std::string o = run.out;
-  KEEP_A3M = (o.size() > 4 && o.substr(o.size() - 4) == ".pdb" ? o.substr(0, o.size() - 4) : o) + ".a3m";
+  bool structure = o.size() > 4 && (o.substr(o.size() - 4) == ".pdb" || o.substr(o.size() - 4) == ".cif");
+  KEEP_A3M = (structure ? o.substr(0, o.size() - 4) : o) + ".a3m";
   std::atexit(cleanUp);
   std::string dir = run.dir;
   std::thread([featurise, dir] {
@@ -157,7 +159,7 @@ inline int featuriseAndFold(Run& run, const std::function<void(const std::string
   }).detach();
   std::vector<std::string> a = {argv0, run.dir};
   for (auto& f : foldArgs) a.push_back(f);
-  a.push_back("--wait-input");
+  a.push_back("--wait-input=0");       // (no timeout: the featuriser is this process's, and a search may queue for long)
   std::vector<char*> argv;
   for (auto& s : a) argv.push_back(s.data());
   argv.push_back(nullptr);

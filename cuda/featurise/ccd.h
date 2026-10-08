@@ -329,6 +329,11 @@ inline std::string readFile(const std::string& path) {
   s << f.rdbuf();
   return s.str();
 }
+inline std::string ccdQuote(const std::string& s) {     // a path for /bin/sh, whatever it holds
+  std::string out = "'";
+  for (char c : s) { if (c == '\'') out += "'\\''"; else out += c; }
+  return out + "'";
+}
 inline std::string ccdText(const std::string& code) {
   std::string u = ccdCode(code);
   const char* env = std::getenv("LOCALFOLD_CCD_DIR");
@@ -336,10 +341,10 @@ inline std::string ccdText(const std::string& code) {
   std::string path = dir + "/" + u + ".cif";
   struct stat st;
   if (stat(path.c_str(), &st) == 0 && st.st_size > 0) return readFile(path);
-  std::string mk = "mkdir -p '" + dir + "'";
+  std::string mk = "mkdir -p " + ccdQuote(dir);
   if (std::system(mk.c_str()) != 0) throw std::runtime_error("cannot create " + dir);
   std::string part = path + ".part" + std::to_string(::getpid());
-  std::string cmd = "curl -sS -L -o '" + part + "' -w '%{http_code}' https://files.rcsb.org/ligands/download/" + u + ".cif";
+  std::string cmd = "curl -sS -L -o " + ccdQuote(part) + " -w '%{http_code}' https://files.rcsb.org/ligands/download/" + u + ".cif";
   FILE* p = popen(cmd.c_str(), "r");
   if (!p) throw std::runtime_error("could not fetch " + u + ": curl did not start");
   char status[16] = {0};
@@ -369,7 +374,7 @@ inline const CcdFile& ccdFile(const std::string& path) {
   if (it != open.end()) return it->second;
   CcdFile f;
   if (path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0) {
-    FILE* p = popen(("gzip -dc '" + path + "'").c_str(), "r");
+    FILE* p = popen(("gzip -dc " + ccdQuote(path)).c_str(), "r");
     if (!p) throw std::runtime_error("cannot read " + path);
     char buf[1 << 16]; size_t n;
     while ((n = fread(buf, 1, sizeof buf, p)) > 0) f.inflated.append(buf, n);

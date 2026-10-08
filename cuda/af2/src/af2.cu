@@ -576,7 +576,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   }
   CK(cudaStreamSynchronize(STREAM));
   double foldMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
-  if (tapPasses) TAP().drain();       // (every pass's line and files out before the fold says it is done)
+  if (tapPasses) TAP().shrink((size_t)64 << 20);   // (every pass's line and files out before the fold says it is done)
   // the fold's own buffers (scratch is kept for the next fold, by name): a served process folds many
   auto release = [&] {
     for (float* p : {t.msa, t.extra, t.pair, t.pairMask, prevRow, prevPair, prevPos, single}) CK(cudaFree(p));
@@ -649,7 +649,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 static bool DETACH = false;
 static int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> [--delta=<dir>] | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
-  std::string weights, bundleDir, deltaDir, oracle, out = "fold.pdb", warmShape, serveDir; int recycles = -1; bool profile = false, waitInput = false;
+  std::string weights, bundleDir, deltaDir, oracle, out = "fold.pdb", warmShape, serveDir; int recycles = -1; bool profile = false, waitInput = false, waitForever = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--bundle=", 9)) bundleDir = argv[i] + 9;      // the page's published bundle, as it is,
@@ -662,6 +662,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--tolerance=", 12)) TOLERANCE = atof(argv[i] + 12);
     else if (!strncmp(argv[i], "--frames=", 9)) FRAMES_DIR = argv[i] + 9;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
+    else if (!strcmp(argv[i], "--wait-input=0")) waitInput = waitForever = true;   // ...with no timeout (the standalone mode: its own featuriser)
     else if (!strcmp(argv[i], "--detach-output")) DETACH = true;
     else if (!strncmp(argv[i], "--warm=", 7)) warmShape = argv[i] + 7;   // L,N,E,T: warm up at those shapes meanwhile
     else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;   // stay up, folding each job dropped there
@@ -729,7 +730,7 @@ static int foldMain(int argc, char** argv) {
     std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";
     for (int k = 0; access(idx.c_str(), R_OK) != 0; ++k) {
       if (access(failed.c_str(), F_OK) == 0) { fprintf(stderr, "af2: the input's export failed\n"); return 1; }
-      if (k > 600000) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
+      if (k > 600000 && !waitForever) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
       usleep(1000);
     }
   }

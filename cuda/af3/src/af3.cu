@@ -37,6 +37,9 @@ static int foldMain(int argc, char** argv) {
   bool af3Defaults = false, saveEmbeddings = false, saveDistogram = false;
   uint64_t seed = 42; std::string out = "fold.pdb", weightsDir, bundleDir, family, seedsArg, framesDir, esmBundle;
   bool waitInput = false;   // start up (CUDA, the weights on the device) while the input is still being exported
+  bool waitForever = false; // ...for as long as it takes: --wait-input=0, which the standalone mode passes - its featuriser
+                            // is a thread of this process that always ends in model.idx or model.failed, and an MMseqs2
+                            // queue can outlast any timeout
   std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
@@ -71,7 +74,11 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--esm-bundle=", 13)) esmBundle = argv[i] + 13; // chai-1's ESM2 3B (af3-any-model's lm/esm2.bin.zst)
     else if (!strncmp(argv[i], "--score-pdb=", 12)) return scorePdbMain(argv[i] + 12);
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;
+    else if (!strcmp(argv[i], "--wait-input=0")) { waitInput = true; waitForever = true; }   // (standalone: its own featuriser)
     else if (!strncmp(argv[i], "--serve=", 8)) serveDir = argv[i] + 8;
+    else if (!strcmp(argv[i], "--detach-output") || !strcmp(argv[i], "--oracle-target-feat") ||
+             !strncmp(argv[i], "--bench-", 8)) {}                                 // (read by their own loops below)
+    else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }     // (as af2 and ef2 refuse one)
   }
   auto t0 = std::chrono::steady_clock::now();
   // a batch: `af3 dir1,dir2,... --out=a.pdb,b.pdb` folds each input in this one process, the weights
@@ -86,6 +93,24 @@ static int foldMain(int argc, char** argv) {
     fprintf(stderr, "%zu inputs and %zu --out paths: a batch names one output per input\n", inputs.size(), outs.size()); return 1;
   }
   if (!bundleDir.empty() != !family.empty()) { fprintf(stderr, "--bundle and --family go together\n"); return 1; }
+  // 🔴 A BUNDLE THAT NAMES ITS MODEL DECIDES ITS DIALECT, as the page's af3Dialect does: several families' bundles
+  // walk cleanly under another's conventions (af3, openbind0 and intellifold2 each walk the other two), and a fold
+  // through the wrong one returns a structure, not an error. af3-any-model's blobs carry no manifest: --family is
+  // all there is for them, and the binaries and the worker pass the family the blob belongs to.
+  if (!bundleDir.empty()) {
+    std::ifstream mf(bundleDir + "/manifest.json");
+    if (mf) {
+      std::string text((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
+      Json manifest = Json::parse(text);
+      const Json* model = manifest.get("model");
+      const Json* name = model ? model->get("name") : nullptr;
+      try {
+        if (!name || name->t != Json::STR) throw std::runtime_error(bundleDir + "/manifest.json does not name its model, so its dialect cannot be derived");
+        std::string bundleIs = lf::weights::dialectNamed(name->str).t->name, asked = lf::weights::dialectNamed(family).t->name;
+        if (bundleIs != asked) throw std::runtime_error(bundleDir + " is a " + bundleIs + " bundle, and --family names " + asked);
+      } catch (const std::exception& e) { fprintf(stderr, "Error: %s\n", e.what()); return 1; }
+    }
+  }
   if (!weightsDir.empty()) M.load(weightsDir);      // the weights exported once (--weights-only)
   else if (!bundleDir.empty())                      // ...or read as published, through the family's weight walk
     M.loadBundle(bundleDir, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
@@ -155,7 +180,7 @@ static int foldMain(int argc, char** argv) {
     std::string failed = inputs[which] + "/model.failed";     // the wrapper's word that the export died
     for (int k = 0; access(idx.c_str(), R_OK) != 0; ++k) {
       if (access(failed.c_str(), F_OK) == 0) { fprintf(stderr, "af3: the input's export failed\n"); return 1; }
-      if (k > 600000) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
+      if (k > 600000 && !waitForever) { fprintf(stderr, "no %s after ten minutes\n", idx.c_str()); return 1; }
       usleep(1000);
     }
   }

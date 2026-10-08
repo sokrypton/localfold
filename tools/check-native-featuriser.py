@@ -289,7 +289,7 @@ def main():
     a = parser.parse_args()
     native = os.path.join(REPO, "cuda", "featurise", "af3-featurise")
     if not os.access(native, os.X_OK):
-        sys.exit(f"{native} is not built (cuda/featurise/build.sh)")
+        sys.exit(f"{native} is not built (bash cuda/build.sh featurise)")
     os.makedirs(WORK, exist_ok=True)
     ccd = [f"--ccd={os.path.abspath(a.ccd)}"] if a.ccd else []
     failed, passed, skipped = [], 0, 0

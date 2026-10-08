@@ -218,10 +218,12 @@ static std::vector<std::string> ccdFlag(const Run& run) {
   return {"--ccd=" + fetch::ccdPath(run.home)};
 }
 
+// the model's weights, by its --model name (fetch.h's one table) - its port checked by name FIRST, so a model asked
+// of the wrong binary is refused before AlphaFold 3's terms prompt or a download
 static fetch::ModelWeights weightsFor(const Run& run, const std::string& port) {
-  fetch::ModelWeights w = fetch::model(run.home, run.model);
-  if (w.port != port) throw std::runtime_error(run.model + " is folded by localfold-" + w.port + ", not localfold-" + port);
-  return w;
+  std::string owner = fetch::portOf(run.model);
+  if (owner != port) throw std::runtime_error(run.model + " is folded by localfold-" + owner + ", not localfold-" + port);
+  return fetch::model(run.home, run.model);
 }
 
 static int af3(Run& run, int (*fold)(int, char**), const char* argv0) {
@@ -251,12 +253,12 @@ static int af2(Run& run, int (*fold)(int, char**), const char* argv0) {
 }
 
 static int ef2(Run& run, int (*fold)(int, char**), const char* argv0) {
+  if (!run.args.option("a3m").empty() && (run.model == "ef2-fast-600m" || run.model == "ef2-fast-300m"))    // (before fetching)
+    throw std::runtime_error(run.model + " folds from the sequence alone (it reads no alignment): --a3m is for the released ef2-fast and ef2");
   fetch::ModelWeights w = weightsFor(run, "ef2");
   std::string trunk = w.dirs[0], tower = w.dirs[1];
   // (the experimental tier zeroes the alignment's features and has no MSA encoder: an alignment there is read by
-  // nothing, so it is refused rather than dropped; the released ef2-fast reads its profile, ef2 also encodes it)
-  if (!run.args.option("a3m").empty() && (run.model == "ef2-fast-600m" || run.model == "ef2-fast-300m"))
-    throw std::runtime_error(run.model + " folds from the sequence alone (it reads no alignment): --a3m is for the released ef2-fast and ef2");
+  // nothing, so it was refused above rather than dropped; the released ef2-fast reads its profile, ef2 also encodes it)
   std::vector<std::string> foldArgs = {"--fold-bundle=" + trunk, "--esmc-bundle=" + tower, "--fast"};
   std::string warm = ef2WarmShape(run.args);
   if (!warm.empty()) foldArgs.push_back("--warm=" + warm);

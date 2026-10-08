@@ -207,14 +207,17 @@ static int chemMain() {
 static int fetchMain(int argc, char** argv) {
   std::string root;
   std::vector<std::string> names;
+  bool help = false;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--weights-dir=", 14)) root = argv[i] + 14;
+    else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) help = true;
+    else if (argv[i][0] == '-') { fprintf(stderr, "Error: unknown flag %s (--weights-dir=<dir> takes an =)\n", argv[i]); return 2; }
     else names.push_back(argv[i]);
   }
-  if (names.empty()) {
+  if (names.empty() || help) {
     fprintf(stderr, "usage: fetch-weights [--weights-dir=<dir>] <model>|ccd ...\n  models: %s\n  ccd: wwPDB's whole chemical component dictionary, for folding offline\n",
             lf::fetch::modelNames().c_str());
-    return 2;
+    return help ? 0 : 2;
   }
   try {
     if (root.empty()) root = lf::fetch::home();

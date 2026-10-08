@@ -13,15 +13,18 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(ef2 af3 af2)
 echo "GPU: $(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader | head -1)"
 
-bash "$repo/cuda/build.sh" featurise          # (the fetcher is one of the featuriser's names)
+for port in "${ports[@]}"; do
+  case "$port" in ef2|af3|af2) ;; *) echo "unknown port $port (ef2, af3, af2)" >&2; exit 1 ;; esac
+done
+# built FIRST, and AF3's weights fetched LAST: its download asks for DeepMind's terms and refuses without them, which
+# must not leave the other ports unbuilt or unfetched
+bash "$repo/cuda/build.sh" "${ports[@]}"       # (the featurisers too: the fetcher is one of their names)
 fetch="$repo/cuda/featurise/fetch-weights"
 for port in "${ports[@]}"; do
   case "$port" in
-    ef2) "$fetch" ef2-fast-600m ;;              # (read as they are: no export)
-    af3) "$fetch" af3 ;;                                  # (read through its weight walk)
+    ef2) "$fetch" ef2-fast-600m ;;                        # (read as they are: no export)
     af2) "$fetch" model_1_ptm model_1_multimer_v3 ;;      # (read through its weight walk)
-    *) echo "unknown port $port (ef2, af3, af2)" >&2; exit 1 ;;
   esac
 done
-bash "$repo/cuda/build.sh" "${ports[@]}"
+for port in "${ports[@]}"; do [ "$port" != af3 ] || "$fetch" af3; done      # (read through its weight walk)
 echo "ready: ${ports[*]}"

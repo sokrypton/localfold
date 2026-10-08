@@ -8,7 +8,7 @@ Upstream runs in this process (its fastest kernel backend, `fused`, unless --bac
 diffusion sample, seed 1, the checkpoint's own step count (fast 15 scheduled / 11 run, full 14), and upstream's extra
 `lm_dropout` OFF - the port has none; the full model's own per-loop dropout (0.25, part of the architecture) runs on
 both. Upstream is timed warm (each case once untimed, then timed, CUDA synchronised); the port reports its own stage
-times after the weights are up. GPU memory is the whole PROCESS's as nvidia-smi sees it, for both - torch's
+times after the weights are up. GPU memory is the whole PROCESS's as nvidia-smi sees it, for both, each case's own peak - torch's
 allocator peak leaves out its context and cache. Each fold is scored by CA RMSD against its crystal (cuda/af3/score.py).
 
 🔴 THE FAST MODEL CANNOT GO THROUGH upstream's fold(): the 600M checkpoint ships without a confidence head and fold()
@@ -58,6 +58,9 @@ class GpuPeak:
             try: self.peak = max(self.peak, self.used())
             except Exception: pass
             time.sleep(0.02)
+    def reset(self):
+        """a new case: the peak restarts from what is held NOW (the weights), still above the starting level"""
+        self.peak = self.used()
     def gib(self):
         return (self.peak - self.base) / 1024
 
@@ -114,6 +117,7 @@ def upstream(args, cases, work):
                                             num_diffusion_samples=1, num_sampling_steps=args.steps, seed=1)
                     return out, out_chains
                 try:
+                    torch.cuda.empty_cache(); peak.reset()       # (each case's own peak, not the largest so far)
                     fold(); torch.cuda.synchronize()
                     t = time.time(); res = fold(); torch.cuda.synchronize(); ms = (time.time() - t) * 1000
                     pdb = os.path.join(work, f"up-{name}-{backend}-L{loops}.pdb")

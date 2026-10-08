@@ -7,6 +7,7 @@
 #include <cxxabi.h>
 #include <dlfcn.h>
 #include <memory>
+#include <string>
 
 namespace prof {
 inline CUptiResult (*getNextRecord)(uint8_t*, size_t, CUpti_Activity**) = nullptr;
@@ -41,9 +42,12 @@ inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_
   free(buffer);
 }
 inline void init() {
-  void* lib = dlopen("libcupti.so.12", RTLD_NOW | RTLD_GLOBAL);
+  // the CUPTI of the toolkit this was compiled with (12 here, 13 on Colab): its activity records are read through that
+  // toolkit's own struct layouts, which another major version need not keep
+  const std::string name = "libcupti.so." + std::to_string(CUDART_VERSION / 1000);
+  void* lib = dlopen(name.c_str(), RTLD_NOW | RTLD_GLOBAL);
   if (!lib) lib = dlopen("libcupti.so", RTLD_NOW | RTLD_GLOBAL);
-  if (!lib) { fprintf(stderr, "--profile needs CUPTI (libcupti.so.12, the CUDA toolkit's extras/CUPTI/lib64): %s\n", dlerror()); exit(1); }
+  if (!lib) { fprintf(stderr, "--profile needs CUPTI (%s, the CUDA toolkit's extras/CUPTI/lib64): %s\n", name.c_str(), dlerror()); exit(1); }
   getNextRecord = (decltype(getNextRecord))dlsym(lib, "cuptiActivityGetNextRecord");
   registerCallbacks = (decltype(registerCallbacks))dlsym(lib, "cuptiActivityRegisterCallbacks");
   enable = (decltype(enable))dlsym(lib, "cuptiActivityEnable");

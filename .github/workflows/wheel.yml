@@ -36,11 +36,12 @@ jobs:
         run: |
           python -m venv /tmp/lf && /tmp/lf/bin/pip install -q ./localfold-*.whl
       - name: Every binary loads (cuBLAS through the RPATH) and answers --help
+        shell: bash        # (-eo pipefail: a step's default sh does not fail on a pipeline or a `!`)
         run: |
           for p in af3 af2 ef2; do
             bin=$(/tmp/lf/bin/python -c "import localfold; print(localfold.binary('$p'))")
             ldd "$bin" | grep -E "cublas|not found"
-            ! ldd "$bin" | grep -q "not found"
+            if ldd "$bin" | grep -q "not found"; then echo "$bin: a library is not found" >&2; exit 1; fi
             /tmp/lf/bin/localfold-$p --help | head -3
           done
-          /tmp/lf/bin/localfold-fetch 2>&1 | head -2      # (usage: its models and the CCD)
+          /tmp/lf/bin/localfold-fetch --help | head -2      # (usage: its models and the CCD)

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Gate the standalone ports: `cuda/<port>/<port> --job=... --out=...` against the two-step path it replaces.
+"""Gate the standalone ports: `cuda/<port>/localfold-<port> --job=... --out=...` against the two-step path it replaces.
 
     python3 tools/check-standalone.py [--network]
 
 🔴 ONE PROCESS MUST FOLD WHAT TWO DID. The standalone mode (cuda/featurise/standalone.h) fetches the weights,
 featurises in its own process on a thread and folds; the resident server cuda/worker.py drives still takes the
 featuriser binary's directory. Each case runs both ways - `cuda/featurise/<port>-featurise <dir> ...` then
-`cuda/<port>/<port> <dir> ...`, and the standalone command - and holds the two PDBs to the SAME BYTES, so a flag the
+`cuda/<port>/localfold-<port> <dir> ...`, and the standalone command - and holds the two PDBs to the SAME BYTES, so a flag the
 standalone mode drops or misroutes (an input flag reaching the fold, af2's --recycles reaching only one of the
 two) is a difference here rather than a quietly different fold. Beside them: refusals come back as the page's
 sentence with a nonzero status (an input flag the port does not read is one of them, never dropped), a local
@@ -179,8 +179,9 @@ def main():
                 out = os.path.join(work, f"slow-{model}-{slow}-{len(extra_env)}.pdb")
                 r = run([binary("ef2"), f"--sequence={S5}", f"--model={model}", "--seed=1", f"--out={out}"],
                         dict(os.environ, LOCALFOLD_SLOW_UPLOAD_MS=slow, **extra_env))
-                arms.append(open(out, "rb").read() if r.returncode == 0 and os.path.exists(out) else (r.stdout + r.stderr)[-200:].encode())
-            ok = arms[0] == arms[1]
+                arms.append(open(out, "rb").read() if r.returncode == 0 and os.path.exists(out) else b"failed: " + (r.stdout + r.stderr)[-200:].encode())
+            ok = arms[0] == arms[1] and not arms[0].startswith(b"failed: ")
+            # (two arms failing alike are equal too: a fold must have happened for equality to mean anything)
             failed += not ok
             label = model + (" (LOCALFOLD_BIG=1)" if extra_env else "")
             print(f"{'ok  ' if ok else 'FAIL'} slow upload, {label} 5CAJ: "

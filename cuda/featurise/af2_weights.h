@@ -96,6 +96,14 @@ inline std::vector<std::string> af2WeightLines(const Json& manifest, const Shape
   std::map<std::string, std::string> ipa;          // leaf name -> bundle tensor
   for (auto& L : leaves)
     if (L.section == "structureModule" && L.path.find("invariant_point_attention/") != std::string::npos) ipa[L.path.substr(L.path.rfind("invariant_point_attention/") + 26)] = L.tensor;
+  // ALL of a section absent is a template-free model; SOME of it absent is a broken bundle - refused, as the page's
+  // DeltaTensorStore refuses it, rather than folded with a stage missing a tensor
+  std::map<std::string, std::pair<int, int>> presence;     // section -> (present, absent)
+  for (auto& L : leaves) (shapes.has(L.tensor) ? presence[L.section].first : presence[L.section].second)++;
+  for (auto& [section, n] : presence)
+    if (n.first && n.second)
+      throw std::runtime_error(section + " is only partly in this bundle (" + std::to_string(n.second) + " of " +
+                               std::to_string(n.first + n.second) + " tensors absent)");
   for (auto& L : leaves) {
     if (!shapes.has(L.tensor)) continue;            // (a delta model's absent tensors: a template-free model's template embedder)
     std::string path = L.path;

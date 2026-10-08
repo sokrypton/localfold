@@ -891,6 +891,12 @@ struct Model {
     if (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess) {
       fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
     }
+    // ...and its resident codes HERE, on this thread, not in the upload's: a warm-up running meanwhile must neither see
+    // them as parked (it would unpark them - a second allocation racing the upload's) nor measure free memory without
+    // them (shortPair's room is measured once, and was 6.4 GB too high under ESM-C 6B's tower)
+    if (s.residentBytes && !s.resident && devMalloc(&s.resident, s.residentBytes) != cudaSuccess) {
+      fprintf(stderr, "cannot put a model.bin's resident weights (%zu bytes) on the device\n", s.residentBytes); exit(1);
+    }
     pending[seg] = std::thread([&s] {
       if (!copyUp(s)) { fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1); }
     });
@@ -1104,7 +1110,10 @@ template <class T> T* upload(const T* h, size_t n) {
 inline std::map<std::string, std::pair<void*, size_t>> SCRATCH;
 // Every scratch buffer given back: between the trunk, the denoiser and the confidence head of a
 // large input, so each phase has the whole card (every phase asks for its buffers again).
+inline uint64_t SCRATCH_RELEASES = 0;   // bumped by every give-back: a buffer asked for again may come back at the SAME
+                                        // address holding another stage's data, so "same pointer" is not "same contents"
 inline void releaseScratch() {
+  ++SCRATCH_RELEASES;
   CK(cudaDeviceSynchronize());
   for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0}; }
 }
@@ -1152,7 +1161,7 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
       if (len && p[len - 1] == '.' ? !name.compare(0, len, p) : name == p) match = true;
     }
     if (!match) continue;
-    if (!synced) { CK(cudaDeviceSynchronize()); synced = true; }
+    if (!synced) { CK(cudaDeviceSynchronize()); synced = true; ++SCRATCH_RELEASES; }
     CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0};
   }
 }
@@ -1693,6 +1702,18 @@ struct AsyncTap {
     { std::lock_guard<std::mutex> lock(mu); queue.push_back({k, offsets, std::move(done)}); }
     cv.notify_one();
     return true;
+  }
+  // the slots given back when they hold more than `keep` bytes (after a fold, drained): a serve process must not carry
+  // one large fold's taps - 0.75 GB device and pinned host after 3000 residues and 20 recycles - into every job after
+  // it, and small ones are kept because pinning costs ~0.8 ms a MB to redo
+  void shrink(size_t keep) {
+    drain();
+    size_t held = 0; for (auto& sl : slots) held += sl.cap;
+    if (held <= keep) return;
+    for (auto& sl : slots) {
+      CK(cudaFree(sl.dev)); CK(cudaFreeHost(sl.host)); CK(cudaEventDestroy(sl.ready)); CK(cudaEventDestroy(sl.copied));
+    }
+    slots.clear();
   }
   // every offered job handed over (the end of a fold, before its outputs are declared written)
   void drain() {
