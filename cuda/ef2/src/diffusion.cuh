@@ -72,6 +72,38 @@ __global__ void adaCombineK(const float* an, const float* g, const float* gb, co
   size_t gi = (t / C) * ld + t % C;
   out[t] = an[t] / (1.f + expf(-(g[gi] + gb[t % C]))) + sh[gi];
 }
+// ...the LayerNorm (affine-free) and that combine in one pass: a block a row, its first warp taking the statistics
+// with layerNormK's arithmetic exactly, then all of the block writing the row (a warp a row put the whole combine on
+// T warps - 9 blocks at 68 tokens - and was slower than the two kernels)
+__global__ void adaLNK(const float* a, const float* g, const float* gb, const float* sh, float* out, size_t T, int C, int ld) {
+  __shared__ float stats[2];
+  size_t row = blockIdx.x;
+  const float* xr = a + row * C;
+  if (threadIdx.x < 32) {
+    int lane = threadIdx.x;
+    float s = 0;
+    for (int c = lane; c < C; c += 32) s += xr[c];
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    float mean = s / C, v = 0;
+    for (int c = lane; c < C; c += 32) { float d = xr[c] - mean; v += d * d; }
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
+    if (lane == 0) { stats[0] = mean; stats[1] = rsqrtf(v / C + 1e-5f); }
+  }
+  __syncthreads();
+  float mean = stats[0], inv = stats[1];
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    float n = __fmul_rn(xr[c] - mean, inv);
+    size_t gi = row * ld + c;
+    out[row * C + c] = __fadd_rn(n / (1.f + expf(-(g[gi] + gb[c]))), sh[gi]);
+  }
+}
+// a[t] += x[t] * sigmoid(g + gb): sigmoidMulK then addK in one pass, with their two roundings (no contraction)
+__global__ void gateAddK(float* a, const float* x, const float* g, const float* gb, size_t T, int C, int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= T * C) return;
+  float o = __fmul_rn(x[t], 1.f / (1.f + expf(-(g[(t / C) * ld + t % C] + gb[t % C]))));
+  a[t] = __fadd_rn(a[t], o);
+}
 __global__ void sigmoidMulK(float* x, const float* g, const float* gb, size_t T, int C, int ld) {   // x *= sigmoid(g (+ gb))
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= T * C) return;
@@ -267,10 +299,8 @@ inline void singleProjections(const Denoiser& d) {
 // adaLN: sigmoid(LN(s; scale) @ gate + gateBias) * LN(a) + LN(s; scale) @ shift, the projections from G
 inline void adaLN(const Denoiser& d, const float* a, float* out, int e, const std::string& B) {
   int T = d.T, C = d.Ct, ld = d.entries * C;
-  float* an = scratch<float>("ada.an", (size_t)T * C);
-  layerNorm(a, an, T, C, nullptr, nullptr);
-  adaCombineK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(an, d.G + (size_t)e * C, F(B + "gateBias"),
-                                                        d.G + (size_t)(e + 1) * C, out, T, C, ld);
+  adaLNK<<<(unsigned)T, 256, 0, STREAM>>>(a, d.G + (size_t)e * C, F(B + "gateBias"), d.G + (size_t)(e + 1) * C,
+                                                      out, T, C, ld);
 }
 
 inline void tokenBlock(const Denoiser& d, float* a, int b) {
@@ -314,8 +344,7 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(ctx, gt, nullptr, T, C, C);
   gemm(ctx, F(B + "attention/outWeights"), o, T, C, C);
   }
-  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), T, C, ld);
-  addK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, (size_t)T * C);
+  gateAddK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b) * C, F(B + "attention/outGateBias"), T, C, ld);
   // the conditioned transition
   adaLN(d, a, x, 4 * b + 2, B + "transition/adaln/");
   int Hd = (int)dimOf("f/" + B + "transition/outWeights", 0);
@@ -323,8 +352,7 @@ inline void tokenBlock(const Denoiser& d, float* a, int b) {
   gemm(x, F(B + "transition/swishWeights"), w, T, C, 2 * Hd);
   swigluK<<<blocks((size_t)T * Hd), 256, 0, STREAM>>>(w, g, T, Hd);
   gemm(g, F(B + "transition/outWeights"), o, T, Hd, C);
-  sigmoidMulK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
-  addK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, (size_t)T * C);
+  gateAddK<<<blocks((size_t)T * C), 256, 0, STREAM>>>(a, o, d.G + (size_t)(4 * nb + 2 * b + 1) * C, F(B + "transition/outGateBias"), T, C, ld);
 }
 
 // one denoiser call: x_noisy [A, 3] at the noise level in d.level -> x_denoised [A, 3]; nothing here
