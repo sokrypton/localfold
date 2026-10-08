@@ -3895,3 +3895,108 @@ atoms sit closer than 1 A (watched failing with the floor at 15: "18 bonds, clos
 atoms 0.258 A"); test/esmfold2-atomised-steps.test.js holds the page's floor and
 the worker's copy to one number. `tools/gpu/fold-esmfold2.js --smiles=` folds a
 SMILES ligand on the WebGPU port.
+
+## 🔴 Against upstream ESMFold2: time, memory, accuracy (2026-10-08)
+
+**The port is 1.6-5x faster than upstream's fastest path, on a third to two thirds of its memory, at the same
+accuracy once both read full-precision weights.** Upstream is biohub's `esm` at repo main, 3.4.1.post1 (`43b4548`,
+the speedups co-authored with Claude: the `fused` Triton kernels, the cuEquivariance backend, bf16 autocast),
+against `cuda/ef2/localfold-ef2` on this A100-SXM4-40GB. `tools/esmc/compare-upstream-esmfold2.py` produces every
+number below.
+
+**Same settings on both sides**: one diffusion sample, seed 1, the checkpoint's own sampler (fast 15 scheduled / 11
+run, full 14 clipped at sigma 256), and upstream's EXTRA `lm_dropout` off (the port has none; the full model's own
+per-loop 0.25 is architecture and runs on both). 🔴 Upstream's defaults differ and would not be a comparison:
+`fold()` samples 16 (fast) or 32 (full) structures and adds 0.3 LM dropout, and the full checkpoint's current config
+runs **20** loops where the port's bundle (exported from the older revision `8fc3ff4710`) says 3 - both loop counts
+are measured. Upstream is timed warm (once untimed, then timed, synchronised); the port reports its stage times after
+its weights are up, and featurises in parallel with that, so upstream's `fold()` figures (the full model) also carry
+6-100 ms of featurisation a single sequence and more with an alignment. Memory is the whole PROCESS's, from
+nvidia-smi, for both. One sample a target: read RMSD differences under ~0.1 A as noise.
+
+### ESMFold2-fast 600M (the website's)
+
+| target | tokens | upstream PyTorch | upstream cuEquivariance | upstream fused | **ours int5** (ships) | ours float32 |
+|---|---:|---:|---:|---:|---:|---:|
+| 6MRR | 68 | 434 ms | 426 | 456 | **89** | 220 |
+| 1BRS | 195 | 830 | 557 | 529 | **186** | 362 |
+| 5CAJ | 261 | 1,444 | 824 | 576 | **284** | 458 |
+| 1TIM | 494 | 5,813 | 2,108 | 1,292 | **760** | 934 |
+| 1TIM x4 | 988 | 65,581 | 7,779 | 4,712 | **2,962** | 3,122 |
+
+(The float32 column ran without the warm-up, so its small targets carry first launches.) Process GPU memory, 68 ->
+988 tokens: upstream fused 2.5 -> 19.1 GB, ours 5.0 -> 8.2 GB (ours sizes its buffers up front and grows less).
+Command to structure, cold: upstream ~18 s (imports and the model load), ours 0.8-1.6 s (4.0 s at 988 tokens).
+
+| CA RMSD to the crystal | upstream fused | ours int5 | ours float32 |
+|---|---:|---:|---:|
+| 6MRR | 1.52 | 1.47 | **0.85** |
+| 1BRS | 0.52 | 0.91 | **0.53** |
+| 5CAJ | 2.25 | 2.10 | **2.06** |
+| 1TIM | 1.30 | 1.52 | **1.22** |
+
+Upstream's three backends agree within 0.02 A, and its default 0.3 dropout changes little. The two complexes the
+int5 bundle loses are its quantisation (cuda/ef2/README.md: 1BRS 0.53 -> 0.92), not the port: on float32 weights
+the port matches or beats upstream on all four. The page ships int5 for its download; the native binaries could ship
+float32 (2.9 GB) or int8 instead.
+
+### ESMFold2 (the full, released model: ESM-C 6B, 48 trunk blocks, MSA encoder)
+
+| target | tokens | 3 loops: upstream fused -> ours | 20 loops: upstream fused -> ours |
+|---|---:|---:|---:|
+| 6MRR | 68 | 724 -> **188 ms** (3.9x) | 2,525 -> **533 ms** (4.7x) |
+| 1BRS | 195 | 908 -> **392** (2.3x) | 3,287 -> **1,403** (2.3x) |
+| 5CAJ | 261 | 1,207 -> **597** (2.0x) | 4,856 -> **2,388** (2.0x) |
+| 1TIM | 494 | 3,468 -> **1,650** (2.1x) | 15,552 -> **7,485** (2.1x) |
+| 1TIM x4 | 988 | 20,436 -> **6,429** (3.2x) | 100,320 -> **30,909** (3.2x) |
+| 5CAJ + alignment | 261 | 2,107 -> **622** (3.4x) | 6,147 -> **2,433** (2.5x) |
+| 1TIM + alignment | 494 | 6,575 -> **1,713** (3.8x) | 19,693 -> **7,582** (2.6x) |
+
+Process GPU memory: upstream 25.4 GB to load (ESM-C 6B in bf16) and 37 GB at 988 tokens; ours 8.3 -> 14.8 GB
+(the tower resident as int8). Upstream's model load alone is 10.5 s; ours is 1.6-4 s command to structure.
+
+| CA RMSD to the crystal | 3 loops: upstream / ours | 20 loops: upstream / ours |
+|---|---:|---:|
+| 6MRR | 1.63 / 1.63 | 1.71 / 1.66 |
+| 1BRS | 0.62 / 0.58 | 0.64 / 0.59 |
+| 5CAJ | 1.98 / 1.97 | 1.89 / 1.92 |
+| 1TIM | 1.34 / 1.23 | 1.37 / 1.31 |
+| 5CAJ + alignment | 1.96 / 1.96 | 1.91 / 1.95 |
+| 1TIM + alignment | 1.24 / 1.13 | 1.29 / 1.23 |
+
+### 🔴 The comparison found a bug of ours, and it looked like nondeterminism
+
+The first full-model run of 1BRS at 3 loops came back at **13.2 A, pLDDT 28.6** - the same command an hour later
+gave 0.58 A, and eight seeds 0.58-0.66. The binary warms up while its weights are still being copied up and then
+forgets what it derived from them; `Wbf`, the bf16 copy of each block's transition that the bf16-pair trunk reads
+past 80 tokens, was never forgotten, so a slow upload (here: the page cache emptied by upstream's 26 GB load) kept
+copies of blocks that had not arrived. The 600M model was exposed too (5CAJ 90.7 -> 63.6 pLDDT, 1TIM 90.8 -> 50.6
+under a slowed upload) - which is how its resident server on Colab starts. Two wrong theories cost an hour first: a
+fix to a cache cuda/ef2 never links (`triInGemmWeights` - the include graph said so) "worked" because the bug had
+stopped reproducing on its own, and uninitialized device memory, ruled out by folding after filling the card with
+NaN. **Fixed in `447ed96`**; `LOCALFOLD_SLOW_UPLOAD_MS` makes the slow disk on demand (pLDDT 26 unfixed, byte-identical
+fixed), `test:standalone` holds a slow upload to a fast one, and `test/cuda-derived-caches.test.js` requires every
+device-weight cache in cuda/ef2's include graph to register a forget hook. See cuda/ef2/README.md, "Traps it cost".
+
+### Upstream's own problems, met on the way
+
+- **The cuEquivariance path cannot run on the version it pins.** `esm/models/esmfold2/layers.py` calls
+  `attention_pair_bias(s=, q=, k=, v=, z=, ...)`, cuEquivariance 0.8.x's signature; its lock file pins 0.11.1 and
+  `>=0.8.1` admits 0.12, both of which renamed the arguments (`single_repr`, `pair_repr`), so the call raises
+  `TypeError ... unexpected keyword argument 's'` once an input is large enough to take that kernel (988 tokens
+  here). Measured on 0.8.1.
+- **The base install forces the CUDA 13 build on every Linux x86_64**: `cuequivariance-ops-torch-cu13` is a plain
+  dependency, which cannot load on a CUDA 12 driver (`libnvrtc.so.13`), and the non-torch `cuequivariance-ops-cu13`
+  then shadows a `cu12` build installed beside it. Both had to be removed by hand.
+- **`fold()` cannot drive the 600M experimental checkpoint**: it ships without a confidence head, and `fold()` reads
+  `plddt` unconditionally (`KeyError`).
+- **Not upstream's best environment, by necessity**: its locked fast setup is CUDA 13 with a prebuilt flash-attention
+  wheel; this box's driver (570) runs CUDA 12.8, so the run used torch 2.11+cu128, triton 3.6, xformers 0.0.35 and
+  cuEquivariance 0.8.1, without flash-attention's rotary kernel or Transformer Engine. Both touch only the ESM-C
+  tower, which is the port's "language model" stage: 9-64 ms of these folds.
+
+To reproduce: a Python 3.12 venv with `torch` from the cu128 index, `pip install "esm[fused,cueq12] @ git+https://github.com/evolutionaryscale/esm"`,
+then `pip uninstall cuequivariance-ops-torch-cu13 cuequivariance-ops-cu13` and `pip install cuequivariance==0.8.1
+cuequivariance-torch==0.8.1 cuequivariance-ops-cu12==0.8.1 cuequivariance-ops-torch-cu12==0.8.1 gemmi`, and `xformers`
+from the cu128 index; the fast checkpoint is biohub's `esmfold2-fast-600m` (`--fast-checkpoint=`), the full one
+`biohub/ESMFold2` (26 GB, fetched by `from_pretrained`).

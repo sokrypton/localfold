@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-359 tools. `tools/fixtures/` is data and is not listed.
+360 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -268,13 +268,14 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`template_reference.py`** - AF2-multimer's template embedder, in numpy.
 - **`triangle_reference.py`** - AF2's fused triangle multiplication on the toy pair, as a reference.
 
-## `tools/esmc/` - ESM-C and ESMFold2 export (19)
+## `tools/esmc/` - ESM-C and ESMFold2 export (20)
 
 The PyTorch side of the ESMFold2 port: fetching the checkpoint, probing it,
 and turning it into a bundle.
 
 - **`bundle_reader.py`** - Read a LocalFold weight bundle from Python, so a probe can price the artefact.
 - **`calibrate-esmc.py`** - Quantise ESM-C against real sequences: GPTQ, or an importance-weighted search.
+- **`compare-upstream-esmfold2.py`** - How does cuda/ef2 compare with upstream ESMFold2 (biohub's `esm` package) - time, memory and accuracy, same settings.
 - **`distil-esmc.py`** - Quantisation-aware distillation: train the tower to survive its own codes.
 - **`dump-esmc-oracle.py`** - Dump ESM-C's answers, so a WebGPU tower has something to be wrong against.
 - **`dump-esmfold2-trunk.py`** - Dump ESMFold2's folding trunk, so a WebGPU port has something to be wrong against.
