@@ -4257,3 +4257,44 @@ the stub's answer on the reader's screen; pointing the page back at `webgpu`
 fails it ("handed the CUDA worker no job"). `test:pending` starts its broker
 with `--cuda` and a stub that holds its fold, as a real one does. `test:cuda`'s
 page lane asserts there is no select.
+
+## 🔴 The runtime page and the JAX backend are gone (2026-10-08)
+
+With every reader's fold going to CUDA, two things had nothing reaching them,
+and both are removed.
+
+**The WebGPU relay.** tools/colab_backend.py used to open a headless Chrome on
+`index.html?role=runtime` and relay folds to the page's own WebGPU code through
+two mailboxes (`/in`+`/out` for commands, `/up`+`/down` for events), feed that
+page its weights through a proxy (`/hf/`, `weights=proxy`), budget it from the
+driver (`vram=`), warm a model when the reader picked one, and judge a quiet
+runtime by the page's poll (`runtimeSeen`) and the browser's DevTools endpoint
+(`browserAlive`). All of it is gone: the broker is now a server that serves the
+checkout and keeps one `cuda/worker.py`, numbering and holding its events for
+the reader (`/health`, `/in`, `/down`), and it names the card from
+`nvidia-smi` - 777 lines to 400. web/colab-bridge.js keeps only the reader's
+half (766 to 300 lines); web/app.js loses the runtime branches, the warm-up and
+the prediction-over-JSON path (a CUDA result is built on the reader by
+`cudaPrediction`, as it always was); the dev panel no longer adopts a runtime's
+rows, because nothing sends any. The notebook's setup shrinks to the repository
+clone - no Vulkan driver, no Chrome - and it says loudly when the runtime has
+no NVIDIA GPU.
+
+**The JAX backend.** `jax/worker.py`, its gate (`test:jax`,
+tools/check-jax-worker.py) and the notebook's `jax_backend` and
+`jax_cache_to_drive` options. `~/.venv-lfjax` stays on the A100 box: it is the
+af3-any-model environment the oracles and the AF2 map tools run in, which never
+depended on the worker. The worker is in git history (`cbf8c53`) if it is ever
+wanted back.
+
+**The gates.** `test:colab` is rewritten around `tools/colab_stub_worker.py`, a
+stand-in for cuda/worker.py that emits what the gate appends to a feed and holds
+its fold until a result: health, one fold at a time, numbered and stamped events,
+the watermark, the live feed (1-3 ms), the mailbox cap, Stop, a worker dying
+mid-fold, the reader's page end to end (no backend choice, all 11 controls in
+the job, typed arrays on the result, attaching mid-fold), a runtime with no
+CUDA, and the token. Watched failing with the 429 removed and with the typed
+arrays flattened. `test:pending` takes the same stub as its fixture; its leg
+telling a quiet runtime PAGE from a dead runtime BROWSER went with the page, and
+its dev-panel leg asserts what is left - the reader records none of its own
+phases. `test:cuda`'s page lane starts the broker without the browser flags.

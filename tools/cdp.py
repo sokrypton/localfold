@@ -112,8 +112,8 @@ LINUX_FLAGS = ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=n
 
 
 # 🔴 AND A CALLER MAY ADD TO THEM, because one machine's flags are not every
-# machine's. tools/colab_backend.py runs on a container with NO DISPLAY AT ALL,
-# where Chrome's own documentation adds `--disable-vulkan-surface`; the A100
+# machine's. A Colab container has NO DISPLAY AT ALL, where Chrome's own
+# documentation adds `--disable-vulkan-surface`; the A100
 # box these flags were written for runs headed, where a surface exists. Passing
 # them per caller keeps the shared list the shared list.
 def chrome_flags():

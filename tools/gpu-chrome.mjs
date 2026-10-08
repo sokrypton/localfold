@@ -135,7 +135,7 @@ const PLATFORM_FLAGS = SWIFTSHADER
      // Colab container has no display - so Vulkan init fails and Chrome falls
      // back to SwiftShader: `google / swiftshader`, and an occupancy sweep
      // that reads 4 workgroups because the times are exactly linear in the
-     // work. tools/colab_backend.py has passed it since it was written; this
+     // work. The Colab broker's own browser passed it when it had one; this
      // launcher did not, because the A100 box it was written for runs HEADED.
      //
      // ON NO DISPLAY, NOT ON LINUX, because that is the actual condition and

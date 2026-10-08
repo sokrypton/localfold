@@ -2,10 +2,9 @@
 
     python3 cuda/worker.py            # run from the repository root
 
-Started by tools/colab_backend.py (`--cuda`) and fed one job per line on stdin, exactly as
-jax/worker.py is; every line it prints on stdout is one bridge event, `{"kind", "payload", "at"}` -
-`status`, `progress` and `result` - so the reader's page follows a CUDA fold with the code that follows a
-WebGPU or a JAX one.
+Started by tools/colab_backend.py (`--cuda`) and fed one job per line on stdin; every line it prints on
+stdout is one bridge event, `{"kind", "payload", "at"}` - `status`, `progress`, `frame`, `contacts`,
+`scores` and `result` - which the broker numbers and the reader's page follows (web/colab-bridge.js).
 
 🔴 THE PAGE'S OWN INPUTS, THE PAGE'S OWN WEIGHTS. The job is the reader's AlphaFold 3 JSON (web/job-json.js
 writes it) and each port's exporter reads it with the page's reader; the template rows are resolved by the
@@ -87,8 +86,7 @@ def device_name():
 
 def die_with_parent():
     """Linux: a child gets SIGKILL when this worker goes, however it goes - Stop kills the worker (the
-    broker's way of ending a fold), and a binary left running would hold the card (jax/worker.py's
-    rule, for the same reason)."""
+    broker's way of ending a fold), and a binary left running would hold the card."""
     import ctypes
     import signal
     ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
@@ -192,8 +190,8 @@ def pdb_atoms(pdb):
 
 def token_plddt(atoms, chain_ids, res_ids):
     """One pLDDT a token from the atoms' own (the B factor column): a residue that is one token takes its
-    atoms' mean, a ligand or atomised residue - one token an atom - each atom's own (jax/worker.py's
-    rule, keyed on (chain, residue) in token order)."""
+    atoms' mean, a ligand or atomised residue - one token an atom - each atom's own (keyed on
+    (chain, residue) in token order)."""
     groups = {}
     for atom in atoms:
         groups.setdefault((atom["chain"], atom["res"]), []).append(atom["b"])

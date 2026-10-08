@@ -1,42 +1,28 @@
-"""LocalFold's own fold, on somebody else's GPU, reached over one URL.
+"""LocalFold's CUDA fold, on somebody else's GPU, reached over one URL.
 
-    python3 tools/colab_backend.py --port 8710            # serve and broker
-    python3 tools/colab_backend.py --port 8710 --token t  # a token of your own
+    python3 tools/colab_backend.py --port 8710 --cuda            # serve and broker
+    python3 tools/colab_backend.py --port 8710 --cuda --token t  # a token of your own
 
-It serves this checkout, opens a headless Chrome on it, and brokers between
-two copies of the same page: the one it opened - `index.html?role=runtime`,
-which folds - and the one a reader opens, `index.html?backend=colab`, which
-asks. Four routes carry that, all of them token-checked:
+It serves this checkout - the reader's page is `index.html?backend=colab` on
+it - and brokers between that page and one worker process, cuda/worker.py,
+which folds with LocalFold's native CUDA ports on the page's own weights and
+inputs. Three routes carry that, all of them token-checked:
 
     GET  /health            what the card is, and whether a fold is running
-    POST /in                the reader asks: {op: "fold"|"stop"|"ping"|"warm", payload}
-    GET  /out?since=N       the runtime page collects what has been asked
-    POST /up                the runtime page pushes what it says and draws
-    GET  /down?since=N      the reader receives it
+    POST /in                the reader asks: {op: "fold"|"stop"|"shutdown", payload}
+    GET  /down?since=N      the reader receives what the worker says
 
-With `--jax-dir`, a fold whose payload says `backend: "jax"` is not forwarded
-to the page: jax/worker.py runs it with af3-any-model and its events land
-in the same mailbox, so the reader follows either one with the same code. With
-`--cuda`, `backend: "cuda"` goes to cuda/worker.py the same way -
-LocalFold's CUDA ports, on the page's own weights.
+🔴 THERE IS NO BROWSER ON THIS SIDE ANY MORE. This used to open a headless
+Chrome on `index.html?role=runtime` and relay folds to the page's own WebGPU
+code; once every reader's fold went to CUDA nothing reached that page, and it
+was removed with its mailbox (`/up`, `/out`), its weights proxy and its warm-up
+(see docs/WEB.md, 2026-10-08). What the card is comes from the driver.
 
-🔴 THE POINT IS THAT THERE IS NO SECOND IMPLEMENTATION. The fold that runs
-here is web/app.js's own, in a real browser, from this checkout - the same
-code a visitor's laptop runs, on a card the laptop does not have. A Python
-re-implementation would be a second answer to every question this repository
-has already answered once, and the two would part company on the first
-modified residue.
-
-🔴 AND THIS PROCESS IS A POST OFFICE, NOT A DRIVER. It used to press the page's
-Fold button over CDP, scrape `#status-message` for the words "failed" and
-"stopped", read the structure out of the download button and collect the
-page's commentary by evaluating a splice every 250 ms - so the reader saw the
-fold as often as a busy page answered the debugger, which was reported as the
-bar sitting at "embedder · 1%" for a whole fold and everything arriving at the
-end. All of that is now web/colab-bridge.js, INSIDE the page, where an event
-is sent in the same task that made it and a command is a control being set
-rather than a mouse being imitated. What is left for CDP is the two things
-only it can do: start the browser and say what card it got.
+🔴 AND THIS PROCESS IS A POST OFFICE, NOT A DRIVER. The worker prints one
+bridge event per line - a status write, a bar fraction, a sampler frame, a
+contact map, the finished result - and each is numbered, stamped and held here
+until the reader asks for it. Nothing is decided about a molecule in Python:
+the worker's exporters read the job with the page's own reader.
 
 🔴 THE TOKEN IS NOT OPTIONAL. Colab's proxy makes the port reachable to
 whoever holds the notebook's URL, and anything that reaches it can spend the
@@ -44,14 +30,12 @@ GPU behind it - so every route checks the token before it reads a body, with
 `hmac.compare_digest` rather than `==`, which is the one line that stops the
 comparison leaking its answer in its timing.
 
-🔴 AND CORS STAYS WIDE, WHICH IS ONLY SAFE BECAUSE OF THE TOKEN. Both pages are
-same-origin with this server today, so nothing here needs it; it is kept for
-the page a reader might point at a runtime from their own laptop, and an
-allow-list of origins cannot be written for a URL that changes every session.
+🔴 AND CORS STAYS WIDE, WHICH IS ONLY SAFE BECAUSE OF THE TOKEN. The page is
+same-origin with this server today, so nothing here needs it; it is kept for a
+page a reader might point at a runtime from their own laptop, and an allow-list
+of origins cannot be written for a URL that changes every session.
 """
 import argparse
-import urllib.error
-import urllib.request
 import hmac
 import http.server
 import json
@@ -62,36 +46,35 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import cdp                                                   # noqa: E402
-
-WEIGHT_CACHE = os.environ.get("LOCALFOLD_WEIGHT_CACHE", "/tmp/localfold-weight-cache")
-def gpu_total_mib():
-    """The first GPU's total memory in MiB, from the driver, or None."""
-    try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=10).stdout.split()
-        return int(out[0]) if out else None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-
-
-# What may cache: the weight shards, as tools/serve.py names them.
-CACHEABLE = (".bin", ".safetensors", ".zst", ".gz")
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-# 🔴 TWO MAILBOXES AND ONE SEQUENCE EACH, WHICH IS THE WHOLE BROKER. `EVENTS`
-# is what the runtime page has said - status writes, bar fractions, sampler
-# frames, and the finished prediction - and `COMMANDS` is what readers have
-# asked of it. Both are append-only and both are read by WATERMARK: a caller
-# says what it has already applied and gets what came after, so a poll that
-# overlaps another, or a page reloaded mid-fold, repeats itself rather than
-# losing anything. Nothing is ever removed on read.
+
+def gpu_info():
+    """The first GPU as the driver names it - {name, memoryMiB} - or {} where there is none."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if not out:
+        return {}
+    name, _, memory = out[0].rpartition(",")
+    try:
+        return {"name": name.strip(), "memoryMiB": int(memory)}
+    except ValueError:
+        return {"name": out[0].strip()}
+
+
+# 🔴 ONE MAILBOX AND ONE SEQUENCE, WHICH IS THE WHOLE BROKER. `EVENTS` is what
+# the worker has said, append-only and read by WATERMARK: a caller says what it
+# has already applied and gets what came after, so a poll that overlaps another,
+# or a page reloaded mid-fold, repeats itself rather than losing anything.
+# Nothing is ever removed on read.
 EVENTS = []
-COMMANDS = []
 MAIL_LOCK = threading.Lock()
 # ...and notified on every arrival, so a reader's `/down?wait=` returns the moment there is something to
 # read rather than on its next poll (a 300 ms poll was most of a warm CUDA fold's click-to-result)
@@ -106,26 +89,14 @@ EVENT_BASE = 0
 EVENT_CAP = 4000
 
 # 🔴 ONE GPU, ONE FOLD. Two at once is not twice the throughput, it is two
-# folds that both take longer against a memory ceiling neither expected - and
-# the page cannot refuse for us, because a second Fold click on a running page
-# is how a fold gets STOPPED. The flag is raised when a fold command is
-# accepted and lowered by the runtime page's own `result`, which is the event
-# that says it has finished in every way a fold can finish.
+# folds that both take longer against a memory ceiling neither expected. The
+# flag is raised when a fold is accepted and lowered by the worker's `result`,
+# which is the event that says it has finished in every way a fold can finish -
+# including the worker dying, which `Worker._read` turns into one.
 FOLDING = {"on": False}
-# ...and which worker's fold is running (None: the page's), which is who a Stop is for.
-WORKER_FOLDING = {"on": None}
-# 🔴 AND WHEN THE RUNTIME PAGE LAST ASKED FOR ITS COMMANDS, which is the only
-# sign of life there is. A Colab runtime is recycled when the notebook is
-# closed or left idle, and a reader whose fold was mid-flight then polls a
-# broker that will never have another event for it - forever, because
-# `FOLDING` is raised by the broker and lowered by the page, so a page that
-# has gone takes the flag with it. The page's own poll is the heartbeat; no
-# second mechanism and nothing extra on the wire.
-LAST_SEEN = {"at": 0.0}
 # 🔴 AND A WAY TO END IT FROM THE PAGE. A reader who is done with the runtime
-# wants its GPU back, and the only thing that frees it is this process going
-# away: the browser it started holds the card for as long as it lives. The
-# notebook cell is blocked on the wait below, so setting this ends the cell.
+# wants its GPU back, and the worker holds the card for as long as it lives.
+# The notebook cell is blocked on the wait below, so setting this ends the cell.
 STOPPING = threading.Event()
 # 🔴 AND THE MACHINE ITSELF CAN BE RELEASED, WHICH IS NOT THE SAME THING.
 # Stopping this service frees the CARD; the Colab VM stays assigned until the
@@ -151,157 +122,14 @@ def unassign_runtime():
         return False
 
 
-ADAPTER_JS = """(async () => {
-  if (!navigator.gpu) return { webgpu: false, why: 'no navigator.gpu' };
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-  if (!adapter) return { webgpu: false, why: 'no adapter' };
-  const info = adapter.info
-    ?? (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
-  return {
-    webgpu: true,
-    vendor: info.vendor ?? null, architecture: info.architecture ?? null,
-    device: info.device ?? null, description: info.description ?? null,
-    /* 🔴 THE TWO THAT DECIDE WHETHER A NUMBER FROM HERE IS COMPARABLE WITH
-       docs/A100.md's. Without them the same fold is 1.95x slower, and a
-       backend that does not say which it had is a bench nobody can read. */
-    shaderF16: adapter.features.has('shader-f16'),
-    subgroupMatrix: adapter.features.has('chromium-experimental-subgroup-matrix'),
-    maxBufferSize: adapter.limits.maxBufferSize,
-    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
-  };
-})()"""
-
-class Backend:
-    """The headless Chrome this serves from, started once."""
-
-    def __init__(self, port, cdp_port, profile, token):
-        self.port = port
-        self.cdp_port = cdp_port
-        self.profile = profile
-        self.token = token
-        self.proc = None
-        self.ws = None
-        self._adapter = None
-
-    def alive(self):
-        """Is the BROWSER still there - which is not "is the page answering".
-
-        🔴 A BUSY PAGE STOPS POLLING, AND THAT IS NOT A DEAD RUNTIME. The
-        heartbeat is the page's own `/out` poll, so a fold that holds the main
-        thread - shader compilation, a long upload - stops it: measured at
-        **6.2 s** of silence from six seconds of deliberate 300 ms tasks, and
-        a real fold can hold it longer. A reader that gave up on that alone
-        would abort a fold that was working. The DevTools endpoint is served
-        by the browser PROCESS rather than by the page, so it answers while
-        the page is blocked and stops answering when the runtime is gone -
-        which is the difference the reader actually needs.
-        """
-        try:
-            with urllib.request.urlopen(
-                    f"http://127.0.0.1:{self.cdp_port}/json/version",
-                    timeout=2) as answer:
-                return answer.status == 200
-        except Exception:                                     # noqa: BLE001
-            return False
-
-    def start(self):
-        # cdp.py already carries the Linux flags this needs - Vulkan, the
-        # sandbox off (a runtime is root in a container), and the f16 feature
-        # docs/A100.md prices at 1.74x on a whole fold, and 0.60x peak
-        # memory. Headless is opt-in there because the A100 box runs headed;
-        # here there is no display at all.
-        os.environ.setdefault("LOCALFOLD_HEADLESS", "1")
-        # 🔴 `--disable-vulkan-surface`, WHICH THE SHARED FLAGS DO NOT CARRY.
-        # A surface is a thing you present TO, and this container has no
-        # display: Chrome's own Colab recipe passes it, and without it the
-        # first measured runtime came back on **SwiftShader** - vendor
-        # 'google', architecture 'swiftshader', no shader-f16, a 1 GiB buffer
-        # ceiling - which is the CPU wearing the card's clothes.
-        # `LOCALFOLD_KEEP_PROFILE=1` starts on the profile as it was left -
-        # its HTTP and shader caches included - instead of a wiped one, so a
-        # session that restores a saved profile pays what a returning visitor
-        # does rather than a first visit.
-        self.proc, self.ws = cdp.launch(self.cdp_port, self.profile,
-                                        keep=os.environ.get("LOCALFOLD_KEEP_PROFILE") == "1",
-                                        extra_args=["--disable-vulkan-surface"])
-        self.ws.call("Page.enable")
-        self.ws.call("Runtime.enable")
-        # 🔴 `role=runtime` IS THE PAGE BEING TOLD WHICH HALF IT IS, and the
-        # token rides beside it because every route this page calls checks
-        # one. web/colab-bridge.js reads both out of its own URL.
-        # ...and how much memory its GPU has, which no browser API reports.
-        # The page budgets from it on a runtime; see getDevice in web/model.js.
-        # `LOCALFOLD_VRAM_MIB` stands in for the driver's answer, so a big card
-        # can be made to budget like a small one (a T4 is 15360).
-        vram = int(os.environ.get("LOCALFOLD_VRAM_MIB") or 0) or gpu_total_mib()
-        self.ws.call("Page.navigate", url=(
-            f"http://127.0.0.1:{self.port}/index.html"
-            f"?role=runtime{'' if os.environ.get('LOCALFOLD_WEIGHT_PROXY') == '0' else '&weights=proxy'}"
-            f"{'' if vram is None else f'&vram={vram}'}"
-            f"&t={urllib.parse.quote(self.token)}"))
-        cdp.wait_for(self.ws, "!!window.__entityList", 180, "the page")
-        # 🔴 THE TERMS DIALOG WOULD OTHERWISE EAT THE CLICK. AlphaFold 3's
-        # parameters are gated behind an acknowledgement that opens in FRONT of
-        # `predict`, so without this the press opens a modal, nothing folds,
-        # and the wait runs to its timeout with the status line never moving.
-        # Whoever started this backend accepted them by starting it; the
-        # deploy-side gate (LOCALFOLD_ACCEPT_MODEL_TERMS) is untouched.
-        cdp.evaluate(self.ws, """(() => {
-          for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2',
-                             'protenix2', 'intellifold2', 'rosettafold3']) {
-            try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); }
-            catch (cause) { /* a runtime with no storage still folds AF2 */ }
-          }
-          return true;
-        })()""")
-        return self
-
-    def adapter(self):
-        """What the card is - the whole question this backend rests on.
-
-        🔴 ASKED ONCE AND REMEMBERED, AND NEVER ALLOWED TO THROW. It is read
-        over CDP from the page, so with the browser gone `/health` died
-        mid-response - "Remote end closed connection without response" - and
-        a reader trying to find out WHETHER the runtime was still there got
-        an error that looked like the broker had gone too. The card does not
-        change while the browser lives, so one answer is the answer.
-        """
-        if self._adapter is not None:
-            return self._adapter
-        try:
-            self._adapter = cdp.evaluate(self.ws, ADAPTER_JS)
-        except Exception as cause:                            # noqa: BLE001
-            return {"webgpu": None, "why": f"the page did not answer: {cause}"}
-        return self._adapter
-
-    def wait_for_bridge(self, seconds=60):
-        """...and that the page can REACH us, which is the other half.
-
-        🔴 A STARTUP CHECK THAT USES THE REAL ROUTE. The bridge announces
-        itself by POSTing `runtime-ready` to /up, so waiting for that event to
-        appear in the mailbox proves the page loaded, read its token and can
-        push - the three things every later event depends on. Waiting on a
-        page internal over CDP, which is what this used to do, proves only the
-        first and is exactly the pull this arrangement was built to stop
-        relying on.
-        """
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            with MAIL_LOCK:
-                if any(e.get("kind") == "runtime-ready" for e in EVENTS):
-                    return True
-            time.sleep(0.25)
-        return False
-
 def push_event(event):
-    """One event into the mailbox, as `/up` would put it there."""
+    """One event into the mailbox, stamped with its arrival beside the worker's own `at`."""
     global EVENT_BASE
     event["got"] = int(time.time() * 1000)
     with MAIL_LOCK:
         EVENTS.append(event)
         if event.get("kind") == "result":
             FOLDING["on"] = False
-            WORKER_FOLDING["on"] = None
         if len(EVENTS) > EVENT_CAP:
             drop = len(EVENTS) - EVENT_CAP // 2
             del EVENTS[:drop]
@@ -309,31 +137,26 @@ def push_event(event):
         MAIL.notify_all()
 
 
-class JaxWorker:
-    """A worker process (jax/worker.py, cuda/worker.py), started on its
-    first fold and kept for the next.
+class Worker:
+    """cuda/worker.py, started on its first fold and kept for the next.
 
     🔴 ITS LINES ARE EVENTS, ITS SEQ IS ITS OWN. The worker prints one bridge
-    event per line; they are numbered here, as the page numbers its own, so
-    the reader's sort-by-seq holds for them too. One fold runs at a time, so
-    the two numberings never interleave.
+    event per line; they are numbered here, so the reader's sort-by-seq holds.
+    `LOCALFOLD_CUDA_WORKER` stands a stub in for it, which is how
+    tools/check-colab-bridge.py and tools/check-model-pending.py test this path
+    with no card (tools/colab_stub_worker.py).
     """
 
-    def __init__(self, directory, script="jax/worker.py", stub="LOCALFOLD_JAX_WORKER", name="JAX"):
-        self.directory = directory
-        self.script, self.stub, self.name = script, stub, name
+    def __init__(self):
         self.proc = None
         self.seq = 0
         self.lock = threading.Lock()
 
     def _start(self):
-        # LOCALFOLD_JAX_WORKER (LOCALFOLD_CUDA_WORKER) stands a stub in for the
-        # real worker, which is how tools/check-colab-bridge.py tests this path
-        # with no GPU and no JAX.
-        worker = os.environ.get(self.stub) or os.path.join(REPO, self.script)
+        worker = os.environ.get("LOCALFOLD_CUDA_WORKER") or os.path.join(REPO, "cuda", "worker.py")
         self.proc = subprocess.Popen(
             [sys.executable, worker],
-            cwd=self.directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            cwd=REPO, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             text=True, bufsize=1)
         threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
 
@@ -343,7 +166,7 @@ class JaxWorker:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if event.get("kind") in ("jax-ready", "cuda-ready"):
+            if event.get("kind") == "cuda-ready":
                 continue
             with self.lock:
                 event["seq"] = self.seq
@@ -354,7 +177,7 @@ class JaxWorker:
             folding = FOLDING["on"]
         if folding and proc is self.proc:
             push_event({"kind": "result", "seq": self.seq, "at": int(time.time() * 1000),
-                        "payload": {"error": f"the {self.name} worker exited"}})
+                        "payload": {"error": "the CUDA worker exited"}})
 
     def fold(self, payload):
         with self.lock:
@@ -364,8 +187,8 @@ class JaxWorker:
             self.proc.stdin.flush()
 
     def stop(self):
-        """JAX cannot be interrupted mid-computation (nor a native binary from
-        outside it): the worker goes, and the next fold starts a new one."""
+        """A native binary cannot be interrupted from outside it: the worker goes, and
+        the next fold starts a new one."""
         with self.lock:
             proc, self.proc = self.proc, None
         if proc is not None:
@@ -374,27 +197,20 @@ class JaxWorker:
                     "payload": {"error": "stopped"}})
 
 
-def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
-    workers = {name: worker for name, worker in (("jax", jax), ("cuda", cuda)) if worker is not None}
+def serve(port, token, host="127.0.0.1", worker=None, gpu=None):
+    gpu = gpu or {}
+
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=REPO, **kw)
 
         # 🔴 NO-STORE ON THE PAGE'S OWN FILES, as tools/serve.py sends and for
         # the reason CLAUDE.md gives: SimpleHTTPRequestHandler sends no cache
-        # headers, so Chrome caches every ES module heuristically. Both browsers
-        # this serves keep a profile - the reader's is the user's own, and the
-        # runtime's survives under LOCALFOLD_KEEP_PROFILE or a wipe that races
-        # Chrome's exit - and a page holding last week's colab-bridge.js
-        # talking to a runtime on this week's is a fold that fails on the
-        # wire format. Measured: the runtime page ran a stale bridge module
-        # while this server was serving the new one. Weight shards are
-        # content-addressed (their URLs pin a commit) and cache for a year.
+        # headers, so Chrome caches every ES module heuristically, and a
+        # reader's page holding last week's colab-bridge.js talking to this
+        # week's broker is a fold that fails on the wire format.
         def end_headers(self):
-            if self.path.split("?")[0].endswith(CACHEABLE):
-                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
-            else:
-                self.send_header("Cache-Control", "no-store, must-revalidate")
+            self.send_header("Cache-Control", "no-store, must-revalidate")
             super().end_headers()
 
         def log_message(self, *a):
@@ -409,12 +225,10 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
         def _json(self, code, payload):
             body = json.dumps(payload).encode()
             # 🔴 COMPRESSED, BECAUSE ON COLAB THIS CROSSES THE INTERNET. A
-            # finished fold's result is ~5 MB of JSON (AF3 at 255 residues) and
-            # a trajectory frame a PDB's worth of text; gzip takes them 2.5x
-            # and 4-5x at its fastest level, ~0.1 s for a result here. Only
-            # where the client asked (a browser always does; urllib does not)
-            # and only for a body worth it - the 300 ms polls between events
-            # are a few hundred bytes.
+            # finished fold's result is megabytes of JSON and a trajectory frame
+            # a PDB's worth of text; gzip takes them 2.5x and 4-5x at its
+            # fastest level. Only where the client asked (a browser always does;
+            # urllib does not) and only for a body worth it.
             gzipped = len(body) > 65536 and "gzip" in self.headers.get("Accept-Encoding", "")
             if gzipped:
                 import gzip
@@ -440,22 +254,6 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
             self._cors()
             self.end_headers()
 
-        def _seen(self):
-            """Milliseconds since the runtime page last asked for commands."""
-            with MAIL_LOCK:
-                at = LAST_SEEN["at"]
-            return None if at == 0 else int((time.time() - at) * 1000)
-
-        def _alive(self, seen):
-            """Whether the BROWSER answers - asked only when the page is quiet.
-
-            None while the page is answering, because then the question is
-            already settled and the check costs a request.
-            """
-            if seen is not None and seen < 5000:
-                return None
-            return backend.alive()
-
         def _since(self):
             asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -463,98 +261,27 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
             except ValueError:
                 return 0
 
-        # 🔴 THE RUNTIME PAGE'S WEIGHTS COME THROUGH HERE. Headless Chrome on a
-        # Colab T4 (two vCPUs) fetched IntelliFold-2's 641 MB from Hugging Face
-        # at 29 MB/s - 22 s, and 55 s beside a fold's compiles - where curl on
-        # the same VM takes 6.8 s and Chrome reads the same files over loopback
-        # in 6.6. Its network stack is what the two cores cannot feed. So this
-        # fetches upstream in Python, streams the bytes to the page as they
-        # arrive and keeps a copy on disk for the next request; the page asks
-        # here only when the broker told it to (`weights=proxy`), and only for
-        # huggingface.co - see bundleBaseUrl in shared/bundles/manifests/index.js.
-        def _weights_proxy(self, rest):
-            import hashlib
-            import shutil
-            cache = os.path.join(WEIGHT_CACHE, hashlib.sha256(rest.encode()).hexdigest())
-            if os.path.exists(cache):
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(os.path.getsize(cache)))
-                self.end_headers()
-                with open(cache, "rb") as source:
-                    shutil.copyfileobj(source, self.wfile, 1 << 20)
-                return None
-            upstream = "https://huggingface.co/" + rest
-            try:
-                response = urllib.request.urlopen(
-                    urllib.request.Request(upstream, headers={"User-Agent": "localfold-broker"}),
-                    timeout=60)
-            except urllib.error.HTTPError as error:
-                return self._json(error.code, {"error": f"upstream {error.code} for {rest}"})
-            except OSError as error:
-                return self._json(502, {"error": f"upstream unreachable: {error}"})
-            os.makedirs(WEIGHT_CACHE, exist_ok=True)
-            partial = f"{cache}.{threading.get_ident()}.part"
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            length = response.headers.get("Content-Length")
-            if length is not None:
-                self.send_header("Content-Length", length)
-            self.end_headers()
-            wrote = 0
-            with open(partial, "wb") as copy:
-                while True:
-                    chunk = response.read(1 << 20)
-                    if not chunk:
-                        break
-                    copy.write(chunk)
-                    wrote += len(chunk)
-                    try:
-                        self.wfile.write(chunk)
-                    except OSError:
-                        break
-            # ...kept only when whole, so a torn download is fetched again.
-            if length is not None and wrote == int(length):
-                os.replace(partial, cache)
-            else:
-                os.remove(partial)
-            return None
-
         def do_GET(self):
             route = urllib.parse.urlparse(self.path).path
-            if route.startswith("/hf/"):
-                return self._weights_proxy(route[len("/hf/"):])
-            if route in ("/down", "/out", "/health") and not self._authorised():
+            if route in ("/down", "/health") and not self._authorised():
                 return self._json(403, {"error": "token"})
             # 🔴 A WATERMARK, NOT A QUEUE THE READER DRAINS. Two polls can
             # overlap and a page can be re-created by a reload, so nothing is
             # ever removed on read: `since` is what the caller has already
             # applied, which makes a repeated poll idempotent.
             if route == "/down":
+                asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 # 🔴 `head=1` IS THE WATERMARK WITHOUT THE STREAM. A reader
                 # opening a fold needs to know where the stream stands so it
-                # can ignore the last fold's events - and asking for that with
-                # `since=0` hands it every frame of the last fold to throw
-                # away, which on a 25-step sampler is megabytes.
-                asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                # can ignore the last fold's events - and asking with `since=0`
+                # hands it every frame of the last fold to throw away.
                 if asked.get("head", [""])[0] == "1":
-                    # 🔴 `_seen()` TAKES THE SAME LOCK, AND IT IS NOT
-                    # REENTRANT. Called from inside a `with MAIL_LOCK` this
-                    # deadlocked the whole broker - the first `head=1` request
-                    # never returned AND never released, so every later
-                    # request hung behind it and the gate timed out three arms
-                    # later, in a route that was innocent. Read it first.
-                    seen = self._seen()
-                    alive = self._alive(seen)
                     with MAIL_LOCK:
-                        head = {"events": [], "n": EVENT_BASE + len(EVENTS),
-                                "folding": FOLDING["on"], "runtimeSeen": seen,
-                                "browserAlive": alive}
-                    return self._json(200, head)
+                        return self._json(200, {"events": [], "n": EVENT_BASE + len(EVENTS),
+                                                "folding": FOLDING["on"]})
                 since = self._since()
                 # `wait=MS` (at most ten seconds): held until there is an event past `since`, so the reader
-                # need not poll; `waits` in the answer says this broker can, which a page talking to an older
-                # one needs to know before it stops sleeping between asks
+                # need not poll
                 wait = asked.get("wait", ["0"])[0]
                 wait = min(int(wait), 10000) / 1000 if wait.isdigit() else 0
                 with MAIL_LOCK:
@@ -566,41 +293,18 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
                     folding = FOLDING["on"]
                 # `from` says where the answer actually starts, which is only
                 # different from `since` for a caller that fell behind the cap.
-                seen = self._seen()
                 return self._json(200, {"events": events, "n": n, "waits": True,
-                                        "from": EVENT_BASE + first,
-                                        "folding": folding,
-                                        "runtimeSeen": seen,
-                                        "browserAlive": self._alive(seen)})
-            if route == "/out":
-                # 🔴 `head=1` IS A RUNTIME PAGE SAYING IT HAS JUST STARTED, and
-                # it exists because a reload replayed the SESSION. The page
-                # polled from zero, so every command the notebook had ever
-                # sent was obeyed again - measured: the heartbeat arm navigates
-                # that page away and back, and it came back and re-ran a fold
-                # from ten minutes earlier, 58 residues of it, weights and all.
-                # A page that has just loaded is not owed the past.
-                asked = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                head = asked.get("head", [""])[0] == "1"
-                since = self._since()
-                with MAIL_LOCK:
-                    LAST_SEEN["at"] = time.time()
-                    commands = [] if head else COMMANDS[since:]
-                    n = len(COMMANDS)
-                return self._json(200, {"commands": commands, "n": n})
+                                        "from": EVENT_BASE + first, "folding": folding})
             if route == "/health":
                 with MAIL_LOCK:
                     folding = FOLDING["on"]
-                seen = self._seen()
                 return self._json(200, {"ok": True, "busy": folding,
-                                        "runtimeSeen": seen,
-                                        "browserAlive": self._alive(seen),
                                         # ...so the page can say whether
                                         # Disconnect releases the MACHINE or
                                         # only stops the service on it.
                                         "colabRuntime": bool(RUNTIME_ADDR),
-                                        "backends": ["webgpu"] + list(workers),
-                                        "gpu": backend.adapter()})
+                                        "backends": ["cuda"] if worker is not None else [],
+                                        "gpu": gpu})
             return super().do_GET()
 
         def _body(self):
@@ -609,7 +313,7 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
 
         def do_POST(self):
             route = urllib.parse.urlparse(self.path).path
-            if route not in ("/up", "/in"):
+            if route != "/in":
                 return self._json(404, {"error": "no such route"})
             if not self._authorised():
                 return self._json(403, {"error": "token"})
@@ -617,84 +321,30 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
                 body = self._body()
             except ValueError as cause:
                 return self._json(400, {"error": f"not JSON: {cause}"})
-
-            # THE RUNTIME PAGE SPEAKING. Every event is stamped on arrival
-            # beside the page's own `at`, so a reader can say whether a fold
-            # was slow or the feed was - the question the CDP version could
-            # not answer, and the one that made this rewrite worth doing.
-            if route == "/up":
-                got = int(time.time() * 1000)
-                arrived = body.get("events") or []
-                global EVENT_BASE
-                with MAIL_LOCK:
-                    for event in arrived:
-                        if not isinstance(event, dict):
-                            continue
-                        event["got"] = got
-                        EVENTS.append(event)
-                        if event.get("kind") == "result":
-                            FOLDING["on"] = False
-                        # 🔴 AND A PAGE THAT HAS JUST LOADED IS NOT FOLDING.
-                        # The flag is raised when a command is accepted and
-                        # lowered by the page's own `result`, so a runtime
-                        # that died mid-fold - or was reloaded - took the flag
-                        # with it and every later fold was refused 429 for the
-                        # rest of the session. An announcement is that page
-                        # saying it has just started.
-                        if event.get("kind") == "runtime-ready":
-                            FOLDING["on"] = False
-                    if len(EVENTS) > EVENT_CAP:
-                        drop = len(EVENTS) - EVENT_CAP // 2
-                        del EVENTS[:drop]
-                        EVENT_BASE += drop
-                    n = EVENT_BASE + len(EVENTS)
-                    MAIL.notify_all()
-                return self._json(200, {"ok": True, "n": n})
-
-            # ...AND THE READER ASKING. `fold` is the only op that can collide
-            # with itself, and the refusal is here rather than in the page
-            # because a second Fold click on a running page STOPS the fold -
-            # the button is a toggle, so the page cannot tell us "busy" by
-            # refusing a press.
             op = body.get("op")
-            # 🔴 SHUTDOWN IS THE BROKER'S OWN, NOT THE PAGE'S. Every other op is
-            # forwarded to the runtime page and obeyed there; this one ends the
-            # service - the browser, the GPU it holds and this process - so it
-            # is answered here, after the answer has been written. What it
-            # cannot do is end the Colab RUNTIME: that machine belongs to the
-            # notebook, and only the notebook's own Runtime menu releases it.
+            # 🔴 SHUTDOWN ENDS THE SERVICE - the worker, the card it holds and
+            # this process - so it is answered here, after the answer has been
+            # written, and the machine is handed back on the way out (main).
             if op == "shutdown":
                 self._json(200, {"ok": True, "stopping": True,
                                  "unassign": bool(RUNTIME_ADDR)})
                 threading.Thread(target=lambda: (time.sleep(0.3),
                                                  STOPPING.set()), daemon=True).start()
                 return None
-            if op not in ("fold", "stop", "ping", "warm"):
+            if op == "stop":
+                if worker is not None and FOLDING["on"]:
+                    worker.stop()
+                return self._json(200, {"ok": True})
+            if op != "fold":
                 return self._json(400, {"error": f'unknown op "{op}"'})
-            payload = body.get("payload") or {}
-            wanted = payload.get("backend")
-            if op == "fold" and wanted in ("jax", "cuda"):
-                if wanted not in workers:
-                    return self._json(400, {"error": f"this runtime has no {'JAX' if wanted == 'jax' else 'CUDA'} backend"})
-                with MAIL_LOCK:
-                    if FOLDING["on"]:
-                        return self._json(429, {"error": "one GPU, one fold: try again"})
-                    FOLDING["on"] = True
-                    WORKER_FOLDING["on"] = wanted
-                workers[wanted].fold(payload)
-                return self._json(200, {"ok": True, "backend": wanted})
-            if op == "stop" and WORKER_FOLDING["on"] in workers:
-                name, WORKER_FOLDING["on"] = WORKER_FOLDING["on"], None
-                workers[name].stop()
-                return self._json(200, {"ok": True, "backend": name})
+            if worker is None:
+                return self._json(400, {"error": "this runtime has no CUDA backend"})
             with MAIL_LOCK:
-                if op == "fold" and FOLDING["on"]:
+                if FOLDING["on"]:
                     return self._json(429, {"error": "one GPU, one fold: try again"})
-                if op == "fold":
-                    FOLDING["on"] = True
-                COMMANDS.append({"seq": len(COMMANDS), "op": op,
-                                 "payload": body.get("payload")})
-                return self._json(200, {"ok": True, "seq": len(COMMANDS) - 1})
+                FOLDING["on"] = True
+            worker.fold(body.get("payload") or {})
+            return self._json(200, {"ok": True, "backend": "cuda"})
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     # 🔴 LOOPBACK, NOT EVERY INTERFACE. The tunnel client runs on this same
@@ -710,38 +360,25 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8710)
-    parser.add_argument("--cdp-port", type=int, default=9333)
     parser.add_argument("--token", default=None,
                         help="the shared secret; one is generated when absent")
-    parser.add_argument("--profile", default="/tmp/localfold-backend")
     parser.add_argument("--host", default="127.0.0.1",
                         help="what to bind; the tunnel reaches loopback")
-    parser.add_argument("--jax-dir", default=None,
-                        help="the ColabFold2 install directory: offers the JAX backend")
     parser.add_argument("--cuda", action="store_true",
                         help="offer the CUDA backend: cuda/ built (cuda/colab_setup.sh)")
     arguments = parser.parse_args()
 
     token = arguments.token or secrets.token_urlsafe(24)
-    backend = Backend(arguments.port, arguments.cdp_port, arguments.profile, token)
-    jax = JaxWorker(arguments.jax_dir) if arguments.jax_dir else None
-    cuda = JaxWorker(REPO, "cuda/worker.py", "LOCALFOLD_CUDA_WORKER", "CUDA") if arguments.cuda else None
-    httpd = serve(arguments.port, backend, token, arguments.host, jax, cuda)
+    worker = Worker() if arguments.cuda else None
+    gpu = gpu_info()
+    httpd = serve(arguments.port, token, arguments.host, worker, gpu)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {REPO} on {arguments.host}:{arguments.port}"
           + (" · Disconnect will release this Colab machine" if RUNTIME_ADDR
              else " · no Colab runtime here, Disconnect stops the service"),
           flush=True)
-    # 🔴 THE SERVER FIRST, THE PAGE SECOND. The page announces itself to /up
-    # the moment it loads, so a browser started before the socket is listening
-    # announces into a refused connection and the wait below times out on a
-    # runtime that is working perfectly.
-    backend.start()
-    if not backend.wait_for_bridge():
-        print("the page never announced itself: the bridge cannot reach /up",
-              flush=True)
     # One line, machine-readable, for the notebook cell that prints the handle.
-    print("BACKEND " + json.dumps({"token": token, "gpu": backend.adapter()}), flush=True)
+    print("BACKEND " + json.dumps({"token": token, "gpu": gpu}), flush=True)
     try:
         # Woken by Ctrl-C, or by a reader pressing Disconnect - see STOPPING.
         while not STOPPING.wait(timeout=3600):
@@ -750,23 +387,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # 🔴 THE BROWSER IS THIS PROCESS'S, AND IT DOES NOT DIE WITH IT.
-        # `cdp.launch` starts a headless Chrome that outlives a Ctrl-C and a
-        # SIGINT from a gate - found by counting processes after a green run:
-        # eight of them, on the profile this backend had just stopped using.
-        # In a Colab runtime the container takes them; on a developer's machine
-        # they are the "another browser on the machine" that makes the next
-        # measurement somebody else's.
-        for worker in (jax, cuda):
-            if worker is not None and worker.proc is not None:
-                worker.proc.kill()
-        if backend.proc is not None:
-            backend.proc.terminate()
-            try:
-                backend.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                backend.proc.kill()
-        # 🔴 THE BROWSER FIRST, THE MACHINE SECOND. Unassigning pulls the VM
+        if worker is not None and worker.proc is not None:
+            worker.proc.kill()
+        # 🔴 THE WORKER FIRST, THE MACHINE SECOND. Unassigning pulls the VM
         # out from under this process, so anything that has to happen on the
         # way out has to have happened already.
         if STOPPING.is_set() and unassign_runtime():

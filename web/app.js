@@ -56,8 +56,7 @@ import { releaseAllWeights } from "../webgpu/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../shared/bundles/manifests/index.js";
-import { devAdopt, devBeginRun, devEndRun, devNote, devOnEntry, devSourceIs, devStatus,
-  devUseDevice } from "./dev-log.js";
+import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
@@ -81,12 +80,7 @@ import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates }
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
 import { colabRole, installColabBridge, remoteBackendChoice, remoteCommand, remoteLiveChoice,
-  remoteEvents, remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
-// A runtime page the Colab broker opened reads its weights through the broker;
-// see bundleBaseUrl in shared/bundles/manifests/index.js.
-if (new URLSearchParams(location.search).get("weights") === "proxy") {
-  globalThis.__localfoldWeightsProxy = "/hf/";
-}
+  remoteEvents, remoteHead } from "./colab-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -131,13 +125,11 @@ function foldStem(fallback) {
 // on what the model still held. `set` is the same call the paste path makes.
 window.__entityList = entityList;
 
-// 🔴 AND THE FINISHED PREDICTION, FOR THE SAME REASON. A backend driving this
-// page headlessly (tools/colab_backend.py) could read the STRUCTURE out of the
-// download button and nothing else - so a remote fold arrived with no
-// alignment, no confidence and no scores card, which is most of what the page
-// shows about a fold. `lastPrediction` is a module binding; a function rather
-// than the value because it is REASSIGNED on every fold and a captured
-// reference would hand back the one before.
+// 🔴 AND THE FINISHED PREDICTION, FOR THE SAME REASON: a gate driving this page
+// (tools/check-cuda-worker.py, tools/check-model-pending.py) reads what the page
+// holds rather than what its download button writes. `lastPrediction` is a
+// module binding; a function rather than the value because it is REASSIGNED on
+// every fold and a captured reference would hand back the one before.
 window.__lastPrediction = () => lastPrediction;
 
 // 🔴 THE ENTITY LIST IS THE INPUT NOW, and everything below it still reads a
@@ -658,9 +650,6 @@ const MODEL_STEMS = {
 
 
 /** The family a prediction's own label names, where the label is one we write. */
-const familyFromLabel = (label) => Object.keys(MODEL_LABELS)
-  .find((family) => MODEL_LABELS[family] === label);
-
 const MODEL_LABELS = {
   af3: "AlphaFold 3",
   // Upstream's own name for this release. See shared/af3/dialect.js for why the
@@ -927,84 +916,6 @@ let foldContext = {};
 // one's resident weights - see the fold's first lines.
 let lastFoldedFamily;
 
-/**
- * The runtime's half: start `family`'s download and compiles.
- *
- * 🔴 AND THEN A THROWAWAY FOLD, BECAUSE THE TRUNK WARM LEFT A THIRD OF THE
- * COMPILE. `warmAf3Pipelines` builds the pairformer and the template embedder
- * from the manifest's shapes; the sampler, the atom encoder and decoder, the
- * conditioning and the confidence head have no compile-only path, and on a T4
- * they were the 6 s between a warmed first fold (12.1 s) and a warm one (6.2).
- * A real fold of a dummy sequence at the reader's length - two sampler steps,
- * one recycle - compiles every stage exactly as the fold will, and leaves this
- * model's weights resident for it. The fold waits for it (see `warmingFold`).
- */
-let warmingFold = null;
-// Set by a real fold: a warm-up that has not yet reached its dummy fold skips it
-// rather than make the reader's fold wait behind it.
-let warmSuperseded = false;
-window.__warmModel = (family, tokens) => {
-  const signal = new AbortController().signal;
-  const preload = startModelPreload(family, signal);
-  void preload.catch(() => {});
-  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(family);
-  const af2 = !ef2 && !isAf3Family(family);
-  if (!ef2) void getDevice().then((device) => warmAf3Pipelines(family, tokens, device)).catch(() => {});
-  const length = Number.isSafeInteger(tokens) && tokens >= 16 && tokens <= 1000 ? tokens : 64;
-  warmSuperseded = false;
-  const previous = warmingFold ?? Promise.resolve();
-  warmingFold = previous.then(async () => {
-    const device = await getDevice();
-    const weights = ef2 || af2 ? await preload : await loadAf3Weights(() => {}, family);
-    if (warmSuperseded) return;
-    // ...as a fold of this family would: the last one's weights go first.
-    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) releaseAllWeights(device);
-    lastFoldedFamily = family;
-    const residues = "ACDEFGHIKLMNPQRSTVWY".repeat(Math.ceil(length / 20)).slice(0, length);
-    if (af2) {
-      // ...and AlphaFold 2's, the multimer over two chains so its chain-aware
-      // regime is what compiles.
-      const model = weights;
-      const multimer = graphOf(family) === "multimer";
-      const chains = multimer
-        ? [residues.slice(0, length >> 1), residues.slice(length >> 1)] : [residues];
-      const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
-      await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device).predictA3m(
-        `>query\n${chains.join("")}\n`, model.weights, model.featureTables,
-        { recycles: 1, randomSeed: 1, maxMsaSequences, maxExtraSequences, tolerance: 0, signal,
-          chainLengths: chains.map((chain) => chain.length),
-          ...(multimer ? { outerProductMeanFirst: true, positionScale: 20, chainAware: true,
-                           chainSequences: chains } : {}) },
-        model.paeBreaks, () => {}, () => {});
-      return;
-    }
-    if (ef2) {
-      // ...and ESMFold2's, through the same entry point its fold takes, with
-      // the tower it builds: the language model, trunk, sampler and head all
-      // compile on the dummy.
-      const loaded = weights;
-      await foldEsmfold2(device, {
-        sequence: residues,
-        entities: { sequence: residues, chainKinds: ["protein"], ligands: [], modifications: [] },
-        shape: { ...loaded.shape, loops: 2 },
-        weights: loaded.weights, confidenceWeights: loaded.confidenceWeights,
-        tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
-                                   loaded.shape.pairChannels),
-        sampler: samplerPreset(), seed: 1, languageModel: usesLanguageModel(family),
-        languageModelMiB: loaded.language?.megabytes,
-      });
-      return;
-    }
-    await foldAf3({
-      // ...ONE recycle, not none: a pass that reads the last pass's pair and
-      // single compiles kernels a first pass does not, and the reader's fold
-      // has recycles.
-      sequence: residues, mode: "diffusion", calls: 2, recycles: 1, seed: 1, weights, device,
-      signal, chainKinds: ["protein"], onStatus: () => {}, onProgress: () => {},
-    });
-  }).catch((cause) => console.warn("warm-up fold:", cause));
-};
-
 const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
                        "msa-text", "max-msa", "recycles", "tolerance",
                        "af3-mode", "af3-count", "random-seed"];
@@ -1076,13 +987,10 @@ function applyInputs(inputs) {
   return true;
 }
 
-// 🔴 EXPOSED FOR THE COLAB BRIDGE, WHICH CANNOT IMPORT THIS FILE. web/app.js
-// imports web/colab-bridge.js, so the call the other way would be a cycle -
-// the same reason the runtime-stopped notice travels as a DOM event. The
-// runtime's page needs exactly these two: `read` is what the reader sends
-// when Fold is pressed on the other machine, `apply` is how this page puts
-// that form on before pressing its own button. Sharing them is what stops the
-// bridge growing a second, staler idea of what a fold is made of.
+// 🔴 EXPOSED FOR WHAT DRIVES THIS PAGE FROM OUTSIDE (tools/check-model-switch.py):
+// `read` is the form a fold is made of and `apply` puts one on, through the
+// same path a restored session takes - so a driver has no second, staler idea
+// of what a fold is made of.
 window.__foldInputs = { read: formInputs, apply: applyInputs };
 
 /** The last prediction, kept so it can be downloaded as it was computed. */
@@ -1104,25 +1012,7 @@ let viewer;
 let viewerObject;
 
 /** py2Dmol's own status line, so folding reports where fetching used to. */
-// 🔴 A TAP, NOT A SECOND FOLD PATH. When this page is the one a Colab runtime
-// is driving headlessly, the page a reader is looking at is somewhere else -
-// so the status line, the bar and every sampler frame have to travel. They
-// travel as the SAME calls the local fold already makes, handed to
-// web/colab-bridge.js here; there is no remote-only code path to keep in step
-// with the real one, which is the whole reason the runtime runs this page
-// rather than a port of it.
-//
-// `tapOut` PUSHES, in the task that made the event - it used to park it in an
-// array for tools/colab_backend.py to collect over CDP every 250 ms, and a
-// busy page answers a debugger when it feels like it: reported as the reader's
-// bar sitting at "embedder · 1%" for a whole fold. Off the runtime it is one
-// property read per status write and nothing else.
-function remoteTap(kind, payload) {
-  tapOut(kind, payload);
-}
-
 function status(text, isError = false) {
-  remoteTap("status", text);
   const node = document.getElementById("status-message");
   // 🔴 THE TIMELINE IS FED BEFORE THE EARLY RETURN, so a page whose status line
   // is missing still records. It costs one string compare a write, and only a
@@ -1361,7 +1251,6 @@ function startModelPreload(family, signal) {
 }
 
 function progress(fraction) {
-  remoteTap("progress", fraction);
   const bar = element("progress");
   if (fraction === null) {
     bar.dataset.state = "idle";
@@ -1807,14 +1696,7 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
       return res;
     };
     const origRender = viewer.render ? viewer.render.bind(viewer) : null;
-    // 🔴 A COLAB RUNTIME DRAWS NOTHING, the finished structure included. Its
-    // live frames already stop at `remoteTap` (drawLiveFrame); this is the
-    // rest - 60-140 ms of canvas a fold on an A100 box, on a page no one sees,
-    // on a CPU that also has the fold to run. The frames are still built, so
-    // anything that reads the viewer's objects reads what it always did.
-    if (origRender && colabRole() === "runtime") {
-      viewer.render = () => {};
-    } else if (origRender) {
+    if (origRender) {
       viewer.render = function(...args) {
         const res = origRender(...args);
         syncScoresCardToActiveFrame();
@@ -3098,12 +2980,6 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
    */
   let liveSampler = 0;
   const drawLiveFrame = (pdb, kind) => {
-    remoteTap("frame", pdb);
-    // 🔴 A COLAB RUNTIME PUSHES ITS FRAMES AND DRAWS NONE. Nobody looks at
-    // that page - the reader draws what it is sent - and on a T4's two vCPUs
-    // parsing and rendering every sampler step competed with the fold itself.
-    // The finished structure still loads into it, which its download needs.
-    if (colabRole() === "runtime") return;
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -3617,12 +3493,6 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   let colouring = false;
   const framePdbs = [];
   const drawLiveFrame = (pdb) => {
-    remoteTap("frame", pdb);
-    // 🔴 A COLAB RUNTIME PUSHES ITS FRAMES AND DRAWS NONE. Nobody looks at
-    // that page - the reader draws what it is sent - and on a T4's two vCPUs
-    // parsing and rendering every sampler step competed with the fold itself.
-    // The finished structure still loads into it, which its download needs.
-    if (colabRole() === "runtime") return;
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -4024,10 +3894,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
  * the token that server requires of every request - it is in the URL because
  * a page cannot be handed a header by whoever framed it.
  *
- * THE SAME SERVER RUNS A SECOND COPY OF THIS PAGE HEADLESSLY, at
- * `?role=runtime`, and that is the one that folds. The two talk through
- * web/colab-bridge.js: this page posts a command, that page pushes what it
- * says and draws. Neither knows anything about the other's machine.
+ * THE SAME SERVER KEEPS ONE WORKER, cuda/worker.py, and that is what folds:
+ * this page posts the job, the worker's events come back through
+ * web/colab-bridge.js, and this page draws them.
  *
  * Absent the parameter this returns null and nothing anywhere changes: the
  * website folds where it always did, in the reader's own browser.
@@ -4063,11 +3932,9 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // regime - and the answer is the same one: forward the object.
   //
   // 🔴 THE CONTROLS' OWN VALUES, NOT THE RESOLVED ONES. `msaMode()` maps
-  // "none" to "single" for the code below it; the runtime puts these back into
-  // the SELECTS, and a select silently refuses a value it has no option for -
-  // so "single" left the control empty there and the fold died with "unknown
-  // alignment mode". Raw values let the runtime's page resolve them with the
-  // same functions this one uses.
+  // "none" to "single" for the code below it, and the worker's exporters read
+  // the controls with this page's own functions - so they get what the selects
+  // said, and resolve it the way this page does.
   const { entities, controls } = formInputs();
   const request = { entities, controls };
   const label = MODEL_LABELS[family] ?? family;
@@ -4192,10 +4059,8 @@ async function followRemoteFold({ since, label, signal }) {
         + " page could apply them - the trajectory will have a gap");
     }
     since = state.n ?? since;
-    // 🔴 IN THE RUNTIME PAGE'S ORDER, NOT THE NETWORK'S. Events are pushed as
-    // they happen and several sends can be in flight at once - which is what
-    // keeps the feed live while that page is busy - so `seq` is the page's own
-    // count and this is where it is put back in order.
+    // 🔴 IN THE WORKER'S ORDER: `seq` is the broker's count of the worker's lines,
+    // and this is where a batch is put back in it.
     const batch = [...(state.events ?? [])]
       .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
     // 🔴 ONLY A BATCH'S LAST FRAME IS DRAWN AS IT ARRIVES. A warm CUDA fold is a tenth of a second, so its
@@ -4206,8 +4071,8 @@ async function followRemoteFold({ since, label, signal }) {
     // one a batch, and each is drawn.
     const lastFrame = batch.findLastIndex((said) => said.kind === "frame");
     for (const [at, said] of batch.entries()) {
-      // The page's own calls, replayed here: the same status writes, the same
-      // bar fractions, the same sampler frames, in the order they happened.
+      // The worker's events, applied through the page's own calls: the same status
+      // writes, bar fractions and sampler frames a local fold makes, in order.
       if (said.kind === "status") status(said.payload);
       else if (said.kind === "progress") progress(said.payload);
       else if (said.kind === "frame") {
@@ -4218,11 +4083,8 @@ async function followRemoteFold({ since, label, signal }) {
       }
       else if (said.kind === "contacts") showContacts(said.payload);
       else if (said.kind === "scores") showScores(said.payload);
-      // ...and the runtime's own timing rows, recorded on its card against its
-      // clock, rather than a reconstruction of them from over here.
-      else if (said.kind === "dev") devAdopt(said.payload);
       // 🔴 AND THE LAG IS RECORDED RATHER THAN ARGUED ABOUT. Each event
-      // carries the runtime page's own clock and the broker's arrival stamp,
+      // carries the worker's own clock and the broker's arrival stamp,
       // so "the fold was slow" and "the feed was slow" are two numbers. It is
       // what the pulled version could not tell apart.
       else if (said.kind === "result") { result = said.payload ?? {}; }
@@ -4231,52 +4093,27 @@ async function followRemoteFold({ since, label, signal }) {
       }
     }
     if (result !== undefined) break;
-    // 🔴 AND A RUNTIME THAT HAS GONE MUST NOT BE POLLED FOR EVER. Colab
-    // recycles a runtime when the notebook is closed or left idle, and the
-    // broker's busy flag is raised HERE and lowered by the runtime page - so a
-    // page that has gone takes the flag with it and this loop would wait out
-    // the rest of the session on a fold nobody is doing. `runtimeSeen` is how
-    // long it has been since that page asked for its commands, which it does
-    // three times a second.
-    // 🔴 A BUSY PAGE IS NOT A DEAD RUNTIME, AND THE FIRST VERSION OF THIS
-    // COULD NOT TELL THEM APART. The heartbeat is the runtime page's own
-    // command poll, which STOPS while that page holds its main thread -
-    // measured at 6.2 s from six seconds of deliberate long tasks, and a real
-    // fold (shader compilation, a big upload) can hold it longer. Giving up
-    // on silence alone would abort a fold that was working. `browserAlive` is
-    // the DevTools endpoint answering, which is the browser PROCESS rather
-    // than the page: gone means gone.
-    const quiet = state.runtimeSeen ?? 0;
-    if (quiet > 20000 && state.browserAlive === false) {
-      throw new Error("the runtime stopped answering - its notebook may have"
-        + " been closed or its runtime recycled; run the Colab cell again");
-    }
-    // ...and a page that is alive but silent for five minutes is a fold that
-    // has hung rather than one that is thinking. Long, because the cost of
-    // being wrong here is abandoning a fold somebody waited for.
-    if (quiet > 300000) {
-      throw new Error("the runtime's page has not spoken for five minutes -"
-        + " its fold may have hung; run the Colab cell again");
-    }
+    // 🔴 A RUNTIME THAT HAS GONE IS NOT POLLED FOR EVER: a closed notebook or a
+    // recycled VM takes the broker with it, and the next ask throws. A worker that
+    // dies mid-fold is a `result` with an error, which the broker writes itself.
     // (a broker that held the ask has already waited for the next event; an older one answered at once)
     if (!state.waits) await new Promise((done) => setTimeout(done, 300));
   }
-  // ...and the runtime's status line beside its error only where it adds
-  // something: a page that failed usually says the same thing twice.
+  // ...and the worker's status line beside its error only where it adds
+  // something: a fold that failed usually says the same thing twice.
   if (result.error) {
     throw new Error(result.status && !result.status.includes(result.error)
       && !result.error.includes(result.status) ? `${result.error} · ${result.status}` : result.error);
   }
 
-  // 🔴 A JAX FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
+  // 🔴 A CUDA FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
   // PREDICTION - there is no copy of this page on the other side to build one.
   // So it is built here, in the shape the AF3 path records (typed arrays, a
   // token layout, the context the archive and the session read), and it goes
   // through the same doors: loadIntoViewer for the picture, recordPrediction
   // for the downloads, the scores card and the saved session.
-  // ...and a CUDA fold the same way: cuda/worker.py sends the same fields.
-  const jax = result.jax === true ? jaxPrediction(result, stem, label, "JAX")
-    : result.cuda === true ? jaxPrediction(result, stem, label, "CUDA") : null;
+  if (result.cuda !== true) throw new Error("the runtime answered with something that is not a CUDA fold");
+  const cuda = cudaPrediction(result, stem, label);
 
   // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
   // fills the sequence strip, the download buttons and the scores card - the
@@ -4292,22 +4129,11 @@ async function followRemoteFold({ since, label, signal }) {
   // pass `{pdb, scores: {}}`, so a remote fold came back with no MSA panel, no
   // PAE plot and an empty scores card - the page looked like it had folded
   // nothing but coordinates, because it had been given nothing else.
-  // The runtime's prediction, revived BEFORE the viewer is loaded: its
-  // confidences are the ones the viewer draws (the readback no longer sends a
-  // second, untyped copy - see readBack in web/colab-bridge.js).
-  let remote = null;
-  if (jax === null && result.predJson) {
-    try {
-      remote = revivePrediction(result.predJson);
-    } catch (cause) {
-      console.warn("the runtime's prediction did not parse:", cause);
-    }
-  }
   await loadIntoViewer({
     stem, pdb: framePdbs[0] ?? result.pdb,
-    scores: jax?.scores ?? remote?.scores ?? result.scores ?? {},
+    scores: cuda.scores,
     a3m: result.a3m ?? undefined,
-    confidence: jax?.confidence ?? remote?.confidence ?? result.confidence,
+    confidence: cuda.confidence,
     length: result.length,
   });
   if (viewer !== undefined && Object.keys(camera).length > 0) {
@@ -4334,34 +4160,26 @@ async function followRemoteFold({ since, label, signal }) {
   // `lastPrediction` - both written by the LOCAL fold paths - so on a remote
   // fold the buttons were either a silent no-op or, worse, handed back
   // whatever this tab had folded BEFORE: the wrong structure, downloaded
-  // without a word. The runtime sends its whole prediction object and it is
-  // registered here under THIS page's stem, which is the name the viewer knows
-  // the object by and therefore the one `activePrediction` looks up.
-  if (jax !== null) {
-    recordPrediction(jax, jax.family);
-    void rememberSessionWhenSettled(lastPrediction);
-  } else if (remote !== null) {
-    remote.stem = stem;
-    // ...through the one funnel, so this path records what every other
-    // one does: the last prediction, the map entry, the downloads, and
-    // the page's claim on the object (see recordPrediction).
-    recordPrediction(remote, remote.family ?? familyFromLabel(remote.model));
-  }
-  // ...and the runtime's own summary, which already reads the way this page's
-  // status line does - it is the same code, on the other machine.
+  // without a word. The prediction built above is registered under THIS page's
+  // stem, which is the name the viewer knows the object by and therefore the
+  // one `activePrediction` looks up.
+  recordPrediction(cuda, cuda.family);
+  void rememberSessionWhenSettled(lastPrediction);
+  // ...and the worker's own summary line.
   status(result.status || `${label} · folded on the runtime`);
   progress(null);
 }
 
 /**
- * A JAX fold's result as this page's own prediction.
+ * A CUDA fold's result as this page's own prediction.
  *
- * The worker (jax/worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
+ * The worker (cuda/worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
  * contact probabilities, its token layout and the alignment it used; the rest
  * - the entities, the settings, the form - is this page's, taken now, because
  * the reader's form is what asked for this fold.
  */
-function jaxPrediction(result, stem, label, backend = "JAX") {
+function cudaPrediction(result, stem, label) {
+  const backend = "CUDA";
   const floats = (values) => (values == null ? undefined : Float32Array.from(values));
   const given = result.confidence ?? {};
   const confidence = {
@@ -4394,7 +4212,7 @@ function jaxPrediction(result, stem, label, backend = "JAX") {
     entities,
     inputs: { entities, controls },
     // ...the structures the worker used, one a fold chain, in the shape the
-    // archive writes - so a saved JAX fold reloads with its templates rather
+    // archive writes - so a saved CUDA fold reloads with its templates rather
     // than as a search, and its README does not say "templates: none".
     templates: result.templates ?? [],
     msas: result.msas ?? {},
@@ -4499,13 +4317,11 @@ async function fold(event) {
   const { signal } = controller;
   activeFold = controller;
   // 🔴 THE PAGE SAYS WHETHER IT IS FOLDING, because everything else is a
-  // proxy. A backend driving this page headlessly used to watch for a NEW
-  // object with frames, which is true of a first fold and FALSE of a second:
-  // a repeat fold reuses the stem, so the watcher waited out its whole timeout
-  // on a fold that had finished in a second (measured - status line
-  // "AlphaFold 3 · 13 residues · in 1 s (trunk reused)", watcher timed out).
-  // The button is no good either: it stays enabled throughout, being how you
-  // stop one. See tools/colab_backend.py.
+  // proxy. A driver that watched for a NEW object with frames was right on a
+  // first fold and WRONG on a second: a repeat fold reuses the stem, so it
+  // waited out its whole timeout on a fold that had finished in a second. The
+  // button is no good either: it stays enabled throughout, being how you stop
+  // one. The gates read this (tools/check-model-switch.py and others).
   window.__foldState = { running: true, since: Date.now() };
   // Whether this press computed anything; see the AF2 replay.
   let foldWasReplayed = false;
@@ -4587,10 +4403,6 @@ async function fold(event) {
     // kept between folds so the same model's next fold skips its packing, and
     // it was kept across a CHANGE of model too - four models in one page and
     // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
-    // ...and a warm-up fold still running is waited for, not raced: it is
-    // compiling what this fold needs and holds the GPU (see __warmModel).
-    warmSuperseded = true;
-    if (warmingFold !== null) await warmingFold;
     if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
       releaseAllWeights(await getDevice());
     }
@@ -5531,13 +5343,7 @@ async function fold(event) {
       // paging and reports nothing: without it the failure is not an error
       // message, it is a machine that stops responding. That is what the title
       // on the button says, in those words.
-      // ...but not on a Colab runtime: its button would be on a page nobody can
-      // click, and lifting the ceiling there was measured to lose the device -
-      // a T4 ran past its memory and every later fold on that runtime failed.
-      if (error instanceof GpuMemoryBudgetError && colabRole() === "runtime") {
-        status(`${describeBudget(error)} Too large for this runtime -`
-          + " try a shorter sequence or a smaller model.", true);
-      } else if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
+      if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
         statusWithAction(
           describeBudget(error),
           "Fold anyway",
@@ -6192,7 +5998,7 @@ element("download-all").addEventListener("click", async () => {
  * where it arrives.
  */
 async function rememberSessionWhenSettled(pred) {
-  if (!pred?.pdb || colabRole() === "runtime") return;   // see rememberSession
+  if (!pred?.pdb) return;
   const registry = window.py2dmol_viewers ?? {};
   const renderer = registry[Object.keys(registry)[0]]?.renderer;
   const count = () => renderer?.objectsData?.[pred.stem]?.frames?.length ?? 0;
@@ -6214,11 +6020,6 @@ async function rememberSessionWhenSettled(pred) {
 
 async function rememberSession(pred) {
   if (!pred?.pdb) return;
-  // 🔴 NOT ON A COLAB RUNTIME. Nobody reloads that page to get a fold back -
-  // the reader's own page saves what it was sent - and the save is the whole
-  // viewer session stringified and gzipped: 94-229 ms of main thread after each
-  // fold on an A100 box, twice that on a runtime's CPU, in the way of the next.
-  if (colabRole() === "runtime") return;
   try {
     // 🔴 py2Dmol BUILDS THIS, NOT US. `buildViewerState` is what its own Save
     // button writes, so the session carries every frame - the whole sampler
@@ -6654,21 +6455,10 @@ document.addEventListener("visibilitychange", () => {
 void offerSession();
 
 /**
- * 🔴 AND ON A COLAB RUNTIME THIS PAGE IS THE ONE FOLDING, WITH NOBODY LOOKING,
- * while the page a reader OPENED gets the badge that says so - both halves are
- * `installColabBridge`, because the one question "which half of this am I" has
- * one answer and should be asked once.
- * `?role=runtime` is the backend saying so: the bridge then announces itself,
- * pushes every status write, bar fraction and sampler frame as it happens, and
- * takes its instructions from the reader's page over the broker. Off that
- * runtime `installColabBridge` returns immediately and nothing here runs.
- * See web/colab-bridge.js.
+ * 🔴 AND ON A READER'S PAGE (`?backend=colab`) THE BADGE that says where Fold
+ * runs and offers the way back. Off Colab `installColabBridge` returns
+ * immediately and nothing here runs. See web/colab-bridge.js.
  */
-// 🔴 AND ON THE RUNTIME, THE DEV LOG IS THE THING WORTH SENDING: it is the one
-// record made where the work happened, with that card's memory in it. One hook,
-// beside the status tap, for the same reason - these are the page's own calls
-// and there is no second reporting path to keep in step.
-if (colabRole() === "runtime") devOnEntry((entry) => remoteTap("dev", entry));
 installColabBridge();
 // ...and if one is already under way on the runtime, follow it from here.
 void attachToRunningFold();

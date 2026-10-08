@@ -32,15 +32,11 @@ let device;
 let rows = [];
 /**
  * 🔴 WHOSE MACHINE THIS IS ABOUT, WHICH IS NOT ALWAYS THIS ONE. On a page
- * folding through a Colab runtime the phases, the memory and the user agent
- * that matter are the RUNTIME's - this browser draws and nothing else - and a
- * report headed with the reader's user agent and "device memory: not
- * measured" describes a machine that did no work. `devOnEntry` is how the
- * runtime's own log leaves that page and `devAdopt` is how it arrives here;
- * the page in between is told to stop recording its own.
+ * folding through a Colab runtime this browser draws and nothing else, so a
+ * report headed with the reader's user agent and "device memory: not measured"
+ * describes a machine that did no work - `devSourceIs` names the runtime
+ * instead, and the page stops recording its own phases (see status in app.js).
  */
-let listener;
-let adopting = false;
 let source;
 let runStartedAt = 0;
 let currentPhase;
@@ -73,36 +69,6 @@ function snapshot() {
   }
 }
 
-const emit = (entry) => {
-  if (listener === undefined || adopting) return;
-  try { listener(entry); } catch { /* a report must never break a fold */ }
-};
-
-/** Hear every entry as it is recorded - the door out of this page's log. */
-export function devOnEntry(fn) {
-  listener = fn;
-}
-
-/** ...and the door in. An entry recorded somewhere else, kept verbatim. */
-export function devAdopt(entry) {
-  if (entry === null || typeof entry !== "object") return;
-  adopting = true;
-  try {
-    if (entry.reset !== undefined) {
-      rows = [];
-      runStartedAt = performance.now();
-      currentPhase = undefined;
-      currentStartedAt = runStartedAt;
-      devNote(entry.reset);
-      return;
-    }
-    rows.push(entry);
-    if (rows.length > MAX_ROWS) rows.shift();
-  } finally {
-    adopting = false;
-  }
-}
-
 /**
  * Name the machine these rows came from, or undefined for this one.
  *
@@ -126,7 +92,6 @@ export function devBeginRun(label) {
   currentPhase = undefined;
   currentStartedAt = runStartedAt;
   currentStartPeak = snapshot()?.peakBytes ?? 0;
-  emit({ reset: label });
   devNote(label);
 }
 
@@ -151,7 +116,6 @@ function closePhase(at) {
   };
   rows.push(row);
   if (rows.length > MAX_ROWS) rows.shift();
-  emit(row);
 }
 
 /**
@@ -173,7 +137,6 @@ export function devNote(text) {
   const row = { note: String(text), atMs: Math.round(performance.now() - runStartedAt) };
   rows.push(row);
   if (rows.length > MAX_ROWS) rows.shift();
-  emit(row);
 }
 
 /** Close the last phase and note the total. Called when a fold ends. */

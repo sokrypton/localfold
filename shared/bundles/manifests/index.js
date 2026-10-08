@@ -476,19 +476,10 @@ export const AF3_FAMILIES = ["af3", "openbind0", "opendde", "boltz2", "protenix2
  *
  * @param {ModelFamily} family
  */
-const HUGGING_FACE = "https://huggingface.co/";
-
 export function bundleBaseUrl(family) {
   const bundle = MODEL_BUNDLES[family];
   if (bundle === undefined) throw new RangeError(`unknown model family ${family}`);
-  let base = bundle.remote ?? bundle.directory;
-  // 🔴 A COLAB RUNTIME PAGE READS ITS WEIGHTS THROUGH THE BROKER, whose Python
-  // fetches Hugging Face at curl's speed where the runtime's headless Chrome on
-  // two vCPUs could not (see _weights_proxy in tools/colab_backend.py). Set
-  // only on a page the broker opened with `weights=proxy`; a reader's own
-  // browser never takes this.
-  const proxy = globalThis.__localfoldWeightsProxy;
-  if (proxy && base.startsWith(HUGGING_FACE)) base = proxy + base.slice(HUGGING_FACE.length);
+  const base = bundle.remote ?? bundle.directory;
   return base.endsWith("/") ? base : `${base}/`;
 }
 

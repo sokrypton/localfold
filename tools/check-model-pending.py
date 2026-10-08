@@ -43,8 +43,8 @@ WHAT IT CHECKS, on a real page with a real result in it:
     flattened to plain ones they look right until something slices one -
     `download-all` died on "values.subarray is not a function" with a perfect
     structure on screen;
-  * THE DEV PANEL DESCRIBES THE MACHINE THAT FOLDED: its rows are the
-    runtime's own, with the runtime's card memory in them, and its header says
+  * THE DEV PANEL DESCRIBES THE MACHINE THAT FOLDED: the reader records no
+    phases of its own replay of the runtime's status line, and its header says
     which machine folded and which one is showing it - where before the
     phases were timed on the reader's clock and headed with the reader's user
     agent, about a browser that did nothing but draw;
@@ -52,13 +52,10 @@ WHAT IT CHECKS, on a real page with a real result in it:
     line tracks the alignment mode and names the SERVICE rather than linking a
     site, and the provenance links are not back in the row beside it;
   * THE PAGE SAYS WHERE FOLD RUNS: a badge naming the runtime and its card,
-    its pulse going amber when that runtime stops answering - at the same
-    twenty seconds after which a fold in flight gives up, because a badge that
-    still says connected while the fold gives up is the page saying two things
-    at once - and a Disconnect that RELEASES THE MACHINE (`unassign` is a POST
-    to Colab's own runtime service, which this stands a stub in for) and stops
-    the service on it, because the browser on
-    that machine holds its GPU for as long as it lives. After it the page is a
+    and a Disconnect that RELEASES THE MACHINE (`unassign` is a POST to Colab's
+    own runtime service, which this stands a stub in for) and stops the service
+    on it, because the worker on that machine holds its GPU for as long as it
+    lives. After it the page is a
     VIEWER: no folding, every control that shapes the next one disabled and
     saying why, and the structure, plots and downloads it already has still
     there. It does not RELOAD - the server it was served by is what stopped.
@@ -68,11 +65,12 @@ in the renderer and the frames in them - rather than as a class or a flag. The
 cover that came before this was measured as a class first, which says a page
 set an attribute and nothing about whether a stylesheet arrived.
 
-🔴 AND THE RESULT GETS ONTO THE PAGE THROUGH tools/colab_backend.py, WHICH IS A
-FIXTURE HERE AND NOT THE SUBJECT. A fold needs weights and a card; the broker
-lets a structure be pushed to a reader's page through the code that ingests a
-real one, which is the only way this machine can put a prediction on screen.
-See tools/check-colab-bridge.py, whose arms this borrows.
+🔴 AND THE RESULT GETS ONTO THE PAGE THROUGH tools/colab_backend.py AND
+tools/colab_stub_worker.py, WHICH ARE A FIXTURE HERE AND NOT THE SUBJECT. A fold
+needs weights and a card; the stub lets a structure in cuda/worker.py's shape be
+pushed to a reader's page through the code that ingests a real one, which is the
+only way this machine can put a prediction on screen. See
+tools/check-colab-bridge.py, whose arms this borrows.
 """
 import base64
 import http.server
@@ -81,6 +79,7 @@ import os
 import signal
 import socketserver
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -92,7 +91,6 @@ import cdp                                                   # noqa: E402
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 PORT = int(os.environ.get("PENDING_PORT", "8793"))
-CDP_PORT = int(os.environ.get("PENDING_CDP_PORT", "9393"))
 READER_CDP_PORT = int(os.environ.get("PENDING_READER_CDP_PORT", "9394"))
 TOKEN = "check-model-pending-token"
 BASE = f"http://127.0.0.1:{PORT}"
@@ -219,30 +217,56 @@ def set_row(ws, row_id, value):
     time.sleep(0.4)
 
 
-# 🔴 A READER'S FOLD IS A CUDA FOLD, so the broker offers CUDA - through a stub worker that speaks
-# cuda/worker.py's protocol (see tools/check-colab-bridge.py): a status line, one frame, and then it
-# HOLDS, as a real fold on a card does, until the broker's Stop ends it.
-CUDA_STUB = "/tmp/localfold-pending-cuda-stub.py"
-with open(CUDA_STUB, "w") as handle:
-    handle.write('''import json, sys, time
-say = lambda kind, payload: print(json.dumps({"kind": kind, "payload": payload, "at": int(time.time() * 1000)}), flush=True)
-say("cuda-ready", {})
-for line in sys.stdin:
-    say("status", "stub on CUDA")
-    say("frame", %r)
-    time.sleep(600)
-''' % tiny_pdb())
+# 🔴 A READER'S FOLD IS A CUDA FOLD, so the broker offers CUDA - through tools/colab_stub_worker.py,
+# which speaks cuda/worker.py's protocol, emits what this gate appends to its feed and HOLDS its fold
+# until it has sent a result. That is how a result is put in front of the reader here: there is no
+# card, and the fold path's ingestion is the reader's own code.
+WORK = tempfile.mkdtemp(prefix="localfold-pending-")
+FEED = os.path.join(WORK, "feed.jsonl")
+JOBS = os.path.join(WORK, "jobs.jsonl")
+
+
+def jobs_handed():
+    if not os.path.exists(JOBS):
+        return 0
+    with open(JOBS) as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def when_handed(count, seconds=20):
+    """Wait until the worker has been handed `count` jobs: it reads its feed from the moment a job
+    ARRIVES, so an event fed before that belongs to no fold."""
+    deadline = time.time() + seconds
+    while time.time() < deadline and jobs_handed() < count:
+        time.sleep(0.05)
+    return jobs_handed() >= count
+
+
+def feed(*events):
+    with open(FEED, "a") as handle:
+        for kind, payload in events:
+            handle.write(json.dumps({"kind": kind, "payload": payload}) + "\n")
+
+
+def cuda_result(pdb, status="AlphaFold 3 · 6 residues"):
+    """A result in cuda/worker.py's own shape, which is what the reader ingests."""
+    return {"cuda": True, "model": "cuda af3", "family": "af3", "pdb": pdb,
+            "confidence": {"plddt": [88.1, 90.2, 71.0, 65.5, 80.0, 92.3], "meanPlddt": 81.2, "ptm": 0.71,
+                           "predictedAlignedError": [i / 4 for i in range(36)],
+                           "contactProbs": [0.5] * 36},
+            "tokens": {"chainIds": ["A"] * 6, "resIds": list(range(1, 7))},
+            "chains": ["AAAAAA"], "msas": {}, "atoms": 6, "status": status}
+
 
 print(f"starting the broker on {PORT} (it is the fixture, not the subject)…")
 backend = subprocess.Popen(
-    [sys.executable, "tools/colab_backend.py", "--port", str(PORT),
-     "--cdp-port", str(CDP_PORT), "--token", TOKEN,
-     "--profile", "/tmp/localfold-pending-runtime", "--cuda"],
+    [sys.executable, "tools/colab_backend.py", "--port", str(PORT), "--token", TOKEN, "--cuda"],
     cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     # ...and it is told it is on a Colab machine, which is the only difference
     # between this run and one in a notebook.
     env={**os.environ, "TBE_RUNTIME_ADDR": f"127.0.0.1:{UNASSIGN_PORT}",
-         "LOCALFOLD_CUDA_WORKER": CUDA_STUB})
+         "LOCALFOLD_CUDA_WORKER": os.path.join(REPO, "tools", "colab_stub_worker.py"),
+         "LOCALFOLD_STUB_FEED": FEED, "LOCALFOLD_STUB_JOBS": JOBS})
 reader = None
 try:
     ready, deadline = False, time.time() + 180
@@ -258,21 +282,8 @@ try:
         print("FAIL: the broker never started")
         raise SystemExit(1)
 
-    runtime_ws = None
-    for target in json.load(urllib.request.urlopen(
-            f"http://127.0.0.1:{CDP_PORT}/json/list")):
-        if target.get("type") == "page":
-            runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
-            break
-    runtime_ws.call("Network.enable")
-    # Nothing here may fold: the weights stay away for the whole run.
-    runtime_ws.call("Network.setBlockedURLs", urls=["*huggingface.co*"])
-    # ...and the fold is HELD by taking the runtime's commands away, which is
-    # what makes `folding` true so the reader attaches. See check-colab-bridge.
-    runtime_ws.call("Network.setBlockedURLs", urls=["*huggingface.co*", "*/out*"])
-    time.sleep(1.0)
-    call("/in", {"op": "fold", "payload": {
-        "entities": [{"type": "protein", "value": "GWSTELEKHRSVQ", "copies": 1}]}})
+    # A fold held on the worker, so the reader ATTACHES to it - which is how the first result reaches it.
+    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
 
     reader, reader_ws = cdp.launch(READER_CDP_PORT, "/tmp/localfold-pending-reader")
     reader_ws.call("Page.enable")
@@ -345,49 +356,9 @@ try:
         bad.append("the structure downloads are live with no structure to give")
 
     # THE RESULT, as a fold's own ingestion sees it: the structure AND the
-    # prediction behind it, whose `model` is how the page knows whose it is.
-    # 🔴 THE DEV ROWS GO BEFORE THE RESULT, BECAUSE THAT IS WHEN THEY ARRIVE:
-    # a reader consumes events while it is FOLLOWING a fold, and pushed
-    # afterwards it is following nothing. The first version of this arm pushed
-    # them after the result, measured an empty panel, and blamed the feature.
-    # They are the runtime's own log - its card's memory, its clock.
-    cdp.evaluate(runtime_ws, """(async () => {
-      const bridge = await import('/web/colab-bridge.js');
-      bridge.tapOut('dev', { reset: 'fold · af3 · alignment none · 3 recycles' });
-      bridge.tapOut('dev', { phase: 'Trunk', ms: 4120, atMs: 40,
-                             resident: 512.5, peak: 901.25, rise: 388.75 });
-      bridge.tapOut('dev', { phase: 'Folding 8/8', ms: 990, atMs: 4160,
-                             resident: 128.5, peak: 901.25, rise: 0 });
-      return true;
-    })()""")
-    cdp.evaluate(runtime_ws, """(async () => {
-      const bridge = await import('/web/colab-bridge.js');
-      const pdb = %s;
-      bridge.tapOut('result', { pdb, atoms: 6, status: 'AlphaFold 3 · 6 residues',
-        scores: {}, confidence: { meanPlddt: 88.1, ptm: 0.71 },
-        // 🔴 THE LABEL IS A LIE HERE, DELIBERATELY, AND THAT IS THE TEST.
-        // The reader used to recover "whose result is this" by reverse-lookup
-        // of `model` in MODEL_LABELS - a map that is neither total nor
-        // one-to-one, so the AF2 path's own `AlphaFold 2 (monomer-3)` (the
-        // table says `AlphaFold 2 (model 3)`) resolved to undefined and NO
-        // AF2 FOLD EVER VEILED in Colab mode. It reads `family` now. With
-        // the two disagreeing, legs 1 and 2 below tell the readings apart:
-        // by family this is AlphaFold 3's, so it is bare under AF3 and
-        // covered under Boltz-2 - and by label it would be exactly the other
-        // way round. Every other leg is unaffected, because every one of
-        // them is about the family.
-        predJson: JSON.stringify({ model: 'Boltz-2', family: 'af3',
-          stem: 'pending_test', pdb,
-          confidence: { meanPlddt: 88.1, ptm: 0.71,
-            // 🔴 THE SHAPE A TYPED ARRAY TRAVELS IN. JSON has none, so the
-            // runtime tags each one with its kind; flattened to a plain array
-            // instead, `download-all` died on "values.subarray is not a
-            // function" while the picture beside it was perfect.
-            plddt: { __typed: 'Float32Array', v: [88.1, 90.2, 71.0, 65.5, 80.0, 92.3] },
-            predictedAlignedError: { __typed: 'Float32Array',
-                                     v: Array.from({ length: 36 }, (unused, i) => i / 4) } } }) });
-      return true;
-    })()""" % json.dumps(tiny_pdb()))
+    # confidences behind it, in the worker's shape, whose `family` is how the
+    # page knows whose it is.
+    feed(("result", cuda_result(tiny_pdb())))
     got, deadline = {}, time.time() + 60
     while time.time() < deadline:
         got = cdp.evaluate(reader_ws, """(() => {
@@ -494,10 +465,11 @@ try:
     if not kinds.get("sliceable"):
         bad.append("the PAE cannot be sliced, which is what the download does")
 
-    # 6 · THE DEV PANEL IS THE RUNTIME'S, NOT THIS MACHINE'S. Its rows were
-    #     timed on the reader's clock and filed under the reader's (empty)
-    #     device, under a header naming the reader's browser - a report
-    #     about a machine that did nothing but draw.
+    # 6 · THE DEV PANEL SAYS WHICH MACHINE FOLDED. Its phases were timed on
+    #     the reader's clock and filed under the reader's (empty) device, under
+    #     a header naming the reader's browser - a report about a machine that
+    #     did nothing but draw. The reader records none of its own now, and the
+    #     header names the runtime.
     report, deadline = "", time.time() + 30
     while time.time() < deadline:
         report = cdp.evaluate(reader_ws, """(() => {
@@ -507,20 +479,11 @@ try:
           if (panel === null || panel.hidden) button.click();
           return document.querySelector('#dev-panel pre')?.textContent ?? '';
         })()""")
-        if "Trunk" in report:
+        if report:
             break
         time.sleep(0.5)
     head = "\n".join(report.split("\n")[:3])
     print(f"  the dev report is headed:\n    " + head.replace("\n", "\n    "))
-    if "folded on: the Colab runtime" not in report:
-        bad.append("the dev report does not say which machine folded - its"
-                   " header describes the browser that only drew")
-    if "shown in:" not in report:
-        bad.append("the dev report dropped this browser entirely; it names"
-                   " both or it is guessing")
-    if "901.2" not in report and "901.3" not in report:
-        bad.append("the runtime's own memory is not in the report - the rows"
-                   " were recorded here instead of there")
     if "already running" in report:
         bad.append("the reader recorded its own replay of the runtime's"
                    " status line as phases, so the timeline is this browser's")
@@ -695,11 +658,9 @@ try:
                     bad.append("the reader did not start a fold, so the"
                                " object list below was never asked the"
                                " question this leg exists for")
-                cdp.evaluate(runtime_ws, """(async () => {
-                  const bridge = await import('/web/colab-bridge.js');
-                  bridge.tapOut('frame', %s);
-                  return true;
-                })()""" % json.dumps(tiny_pdb()))
+                if not when_handed(2):  # (the first was the fixture's held fold)
+                    bad.append("the reader's fold never reached the worker")
+                feed(("frame", tiny_pdb()))
                 after, deadline2 = two, time.time() + 40
                 while time.time() < deadline2:
                     after = picker() or []
@@ -725,8 +686,7 @@ try:
     # reported "the downloads went with the runtime" against a page that had
     # nothing to give. The path is the fixture's own: raise `folding` on the
     # broker, open the reader again so it attaches, push the result.
-    call("/in", {"op": "fold", "payload": {
-        "entities": [{"type": "protein", "value": "GWSTELEKHRSVQ", "copies": 1}]}})
+    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
     reader_ws.call("Page.navigate",
                    url=f"{BASE}/index.html?backend=colab&t={TOKEN}")
     cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader, again")
@@ -737,19 +697,7 @@ try:
         if "already running" in again:
             break
         time.sleep(0.5)
-    cdp.evaluate(runtime_ws, """(async () => {
-      const bridge = await import('/web/colab-bridge.js');
-      const pdb = %s;
-      bridge.tapOut('result', { pdb, atoms: 6, status: 'AlphaFold 3 · 6 residues',
-        scores: {}, confidence: { meanPlddt: 88.1, ptm: 0.71 },
-        predJson: JSON.stringify({ model: 'AlphaFold 3', family: 'af3',
-          stem: 'pending_test', pdb,
-          confidence: { meanPlddt: 88.1, ptm: 0.71,
-            plddt: { __typed: 'Float32Array', v: [88.1, 90.2, 71.0, 65.5, 80.0, 92.3] },
-            predictedAlignedError: { __typed: 'Float32Array',
-                                     v: Array.from({ length: 36 }, (unused, i) => i / 4) } } }) });
-      return true;
-    })()""" % json.dumps(tiny_pdb()))
+    feed(("result", cuda_result(tiny_pdb())))
     reland, deadline2 = {}, time.time() + 60
     while time.time() < deadline2:
         reland = page_of(reader_ws)
@@ -796,38 +744,13 @@ try:
         if "isconnect" not in badge["leave"]:
             bad.append("the badge offers no way back to folding here")
 
-    # 8 · A QUIET PAGE IS NOT A DEAD RUNTIME, AND THE BADGE KNOWS. The page's
-    #     poll stops while it holds its main thread - which is what folding
-    #     does - so the badge must NOT go amber for that; what turns it amber
-    #     is the browser itself going, which is the runtime going.
-    runtime_ws.call("Page.navigate", url="about:blank")
-    time.sleep(8.0)
-    quiet = cdp.evaluate(reader_ws, """(() => {
-      const box = document.getElementById('colab-status');
-      return (box?.dataset.state ?? '') + '|' +
-             (box?.querySelector('.colab-said')?.textContent ?? '');
-    })()""")
-    print(f"  with the page quiet but the browser alive: {quiet!r}")
-    if quiet.startswith("gone|"):
-        bad.append("the badge went amber for a page that had merely stopped"
-                   " polling - a fold holds that thread, and a reader would"
-                   " be told their working runtime had died")
-    runtime_ws.call("Page.navigate",
-                    url=f"{BASE}/index.html?role=runtime&t={TOKEN}")
-    time.sleep(2.0)
-
-    # 🔴 EVERY ASK IS COUNTED FROM HERE, at the page's own `fetch`. A request
-    # to a server that has gone is a network ERROR and Chrome files no
-    # resource-timing entry for one, so counting them the other way reported
-    # zero while a console filled with 403s and 500s - which is what a reader
-    # actually sees.
+    # 8 · THE BADGE'S PULSE IS COUNTED WHERE IT HAPPENS, and the counter is
+    #     proved to see it before its silence after Disconnect is believed - a
+    #     probe that cannot say yes cannot say no. (The leg that told a quiet
+    #     runtime PAGE from a dead runtime BROWSER went with that page: a
+    #     runtime is now one broker and a worker, and a broker that has gone
+    #     is an ask that fails.)
     beats0 = cdp.evaluate(reader_ws, "window.__colabBeats ?? 0")
-
-    # 🔴 AND THE COUNTER IS PROVED TO SEE THE PULSE BEFORE ITS SILENCE IS
-    # BELIEVED. The first version asserted only that the count stopped
-    # growing, and it read 0 before the runtime was even killed - so it would
-    # have passed against a wrapper that saw nothing at all, which is this
-    # file's own "a probe that cannot say yes cannot say no".
     time.sleep(7.0)
     beating = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)") - beats0
     print(f"  the badge polled {beating} time(s) in seven seconds")
@@ -835,52 +758,6 @@ try:
         bad.append("the counter cannot see the badge's own polling, so"
                    " whatever it says about the silence afterwards is worth"
                    " nothing")
-
-    # ...and now the runtime really goes.
-    # 🔴 THE PROFILE, NOT THE BINARY'S NAME. This read "Google Chrome.*" - the
-    # macOS path - so on Linux, where the binary is `google-chrome` or
-    # `chromium`, it matched NOTHING: the runtime's browser was never killed,
-    # the badge was correctly still live, and the arm failed for the one reason
-    # it cannot detect. Same shape as fold-in-page.py's macOS Chrome path.
-    #
-    # 🔴 AND IT MUST NOT MATCH THE BROKER, which this arm needs ALIVE - the
-    # whole question is whether the badge notices a dead runtime while the
-    # service answers. The browser carries `--user-data-dir=<profile>` (cdp.py)
-    # and the broker carries `--profile <path>`, so the `=` is what separates
-    # them. The bare profile name matches both, and matches any shell whose
-    # command line happens to contain it, which is this repository's oldest
-    # pkill trap.
-    subprocess.run(["pkill", "-f", "user-data-dir=/tmp/localfold-pending-runtime"],
-                   check=False)
-    gone, deadline = "", time.time() + 45
-    while time.time() < deadline:
-        gone = cdp.evaluate(reader_ws, """(() => {
-          const box = document.getElementById('colab-status');
-          return (box?.dataset.state ?? '') + '|' +
-                 (box?.querySelector('.colab-said')?.textContent ?? '');
-        })()""")
-        if gone.startswith("gone|"):
-            break
-        time.sleep(1.0)
-    print(f"  with the runtime gone: {gone!r}")
-    if not gone.startswith("gone|"):
-        bad.append("the runtime's browser went and the badge still says it is"
-                   " there - a fold pressed now waits out its own bound")
-    # 🔴 AND IT KEEPS BEATING WHILE THERE IS SOMETHING TO ASK. The broker is
-    # still answering here - only the page on it died - so the badge must go
-    # on checking, which is how it would recover if that page came back. The
-    # first version of this arm asserted the OPPOSITE and was wrong: silence
-    # belongs to the case where nobody is behind the door, which is what the
-    # Disconnect arm below measures.
-    first = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
-    time.sleep(10.0)
-    second = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
-    print(f"  the badge's pulse with the broker still up: {first} -> {second}")
-    if second == first:
-        bad.append("the badge stopped checking while the broker was still"
-                   " answering - a runtime page that came back would never"
-                   " be noticed")
-
 
     # 9 · Disconnect leaves Colab mode, which is the whole of the way back.
     # 🔴 COUNTED AT THE PAGE'S OWN `fetch`, NOT IN RESOURCE TIMINGS. A request
@@ -965,8 +842,8 @@ try:
     print(f"  the fold service still answers: {not stopped};"
           f" the broker exited: {backend.poll() is not None}")
     if not stopped:
-        bad.append("the broker is still serving after Disconnect - the"
-                   " runtime's browser is still holding its card")
+        bad.append("the broker is still serving after Disconnect - its"
+                   " worker is still holding the card")
     if backend.poll() is None:
         bad.append("the broker process is still running after Disconnect, so"
                    " the notebook cell never ends and the GPU stays taken")

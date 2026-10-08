@@ -1,55 +1,36 @@
-"""Two-way between the reader's page and the runtime that folds for it.
+"""The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:colab.
 
     python3 tools/check-colab-bridge.py
 
-🔴 THE TRANSPORT IS WHAT THIS PROVES, AND IT NEEDS NO GPU AND NO WEIGHTS -
-which is the point: the thing that broke in Colab was never the fold, it was
-the feed. tools/colab_backend.py brokers between two copies of index.html -
-`?role=runtime`, opened headlessly here, and `?backend=colab`, which a reader
-opens - and every route is exercised from the reader's side over plain HTTP.
+NO GPU AND NO WEIGHTS. It starts tools/colab_backend.py with
+tools/colab_stub_worker.py standing in for cuda/worker.py - the stub emits what
+this gate appends to its feed and holds its fold until it has sent a result -
+and drives every route from a reader's side, over plain HTTP and through a real
+reader's page (`index.html?backend=colab`) in a second browser. What it proves:
 
-WHAT IT CHECKS, in the order a session does them:
-
-  * the runtime page ANNOUNCES ITSELF by pushing `runtime-ready` to /up, which
-    is the page having loaded, read its token, and reached the broker;
-  * a command travels reader -> broker -> page and an answer travels back:
-    `ping` is the op that needs no card, and a `pong` carrying the page's own
-    clock is the round trip;
-  * EVERY EVENT CARRIES BOTH CLOCKS - the page's `at` and the broker's `got` -
-    so a slow feed can be told from a slow fold rather than argued about;
-  * the watermark is idempotent: the same `since` twice is the same answer,
-    and nothing is dropped between two polls;
-  * one GPU, one fold - a second `fold` while one is running is refused 429,
-    and the refusal lifts when the page reports a result;
-  * THE READER'S OWN PAGE does all of that for real: a second browser opens
-    `index.html?backend=colab`, is handed a sequence and clicked, offers no
-    backend to choose, hands the CUDA worker (a stub here) a job carrying
-    every control the reader set, and ends up showing what the worker said.
-    The weights stay blocked on the runtime page, so nothing here ever folds;
-  * THE FEED HOLDS WHILE THE PAGE IS BUSY - twenty events pushed from the
-    runtime page across six seconds of 300 ms blocking tasks, which is what a
-    fold does to a main thread. This is the regression guard for the fault the
-    bridge was written for;
-  * WHAT THE BROKER DROPS IS NOT DROPPED IN SILENCE: its mailbox is capped,
-    and a reader that has fallen behind the cap is told rather than left with
-    a gap in the trajectory it cannot see;
-  * A READER THAT ARRIVES MID-FOLD ATTACHES TO IT rather than sitting idle,
-    which is what a reload, a second window or the notebook's link opened
-    twice all are;
-  * A RUNTIME THAT GOES AWAY IS VISIBLE, AND A BUSY ONE IS NOT MISTAKEN FOR
-    IT: the runtime page's own command poll is the heartbeat, and it STOPS
-    while that page holds its main thread - which is what a fold does - so
-    silence alone would abort a fold that was working. `browserAlive`, the
-    DevTools endpoint the browser PROCESS serves, is what separates them, and
-    both states are driven here: the page navigated away (quiet, still alive)
-    and the browser killed (gone);
+  * /health says what the card is (the driver's name) and that CUDA is offered;
+  * one GPU, one fold - a second `fold` while one holds is refused 429, and the
+    refusal lifts when the worker's `result` arrives;
+  * every event is numbered (`seq`) and carries both clocks - `at` from the
+    worker, `got` from the broker - so a slow feed and a slow fold are two
+    numbers; the watermark is idempotent and `head=1` is the stream's head;
+  * THE FEED IS LIVE: a reader holding `/down?wait=` is answered within a
+    second of the worker speaking, not on its next poll;
+  * what the broker drops past its cap is not dropped in silence (`from`);
+  * Stop ends a held fold by ending the worker, and the next fold starts a new
+    one; a worker that dies mid-fold ends the fold with an error;
+  * THE READER'S OWN PAGE: no backend to choose, the Live box shown, the badge
+    naming the card; pressing Fold hands the worker a job carrying every
+    control the reader set; the worker's status, frames and result reach that
+    page's screen, its prediction's typed arrays are typed arrays, and the
+    reader did no model work of its own;
+  * a reader that opens the page MID-FOLD attaches to it;
+  * a runtime started without `--cuda` says so on the badge and refuses Fold;
   * and no route answers anything without the token.
 
-🔴 WHAT IT CANNOT COVER is a fold: no weights on a developer's machine and no
-card in CI. The fold command IS driven, with an empty entity list, so the
-command path and the result event are real - what the page reports is an
-error, which is the correct answer to that request and arrives by the same
-route a structure would.
+🔴 WHAT IT CANNOT COVER is a fold: the model never runs here, and what the
+reader ingests is a structure this gate wrote down. `npm run test:cuda` folds
+for real through the same broker and page.
 """
 import json
 import os
@@ -57,6 +38,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -66,40 +48,54 @@ import cdp                                                   # noqa: E402
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 PORT = int(os.environ.get("BRIDGE_PORT", "8791"))
-CDP_PORT = int(os.environ.get("BRIDGE_CDP_PORT", "9391"))
 READER_CDP_PORT = int(os.environ.get("BRIDGE_READER_CDP_PORT", "9392"))
-# 🔴 THE WEIGHTS ARE BLOCKED ON THE RUNTIME PAGE, which is what makes a REAL
-# fold safe to drive from a developer's machine: the fold starts, the page
-# reports that it cannot load the model, and everything that report is made of
-# travels the way a fold's would. Without this the arm downloads hundreds of
-# megabytes from huggingface to prove a transport.
-WEIGHTS = "*huggingface.co*"
-# 🔴 A STRUCTURE SMALL ENOUGH TO WRITE DOWN, because the frame path and the
-# ingestion at the end of a remote fold are the reader's own code and nothing
-# else here reaches them: no weights means no real frames, and a fold is the
-# one thing this gate cannot drive. Four alpha carbons is a structure to
-# py2Dmol - it draws a tube through them - and the third frame moves them, so
-# "the frames arrived" cannot be satisfied by one frame drawn three times.
-def tiny_pdb(shift):
-    rows = []
-    for i in range(4):
-        rows.append(
-            "ATOM  %5d  CA  ALA A%4d    %8.3f%8.3f%8.3f  1.00 50.00           C"
-            % (i + 1, i + 1, 3.8 * i + shift, 0.0, 0.0))
-    return "\n".join(rows) + "\nEND\n"
 TOKEN = "check-colab-bridge-token"
 BASE = f"http://127.0.0.1:{PORT}"
+WORK = tempfile.mkdtemp(prefix="localfold-bridge-check-")
+FEED = os.path.join(WORK, "feed.jsonl")
+JOBS = os.path.join(WORK, "jobs.jsonl")
+STUB = os.path.join(REPO, "tools", "colab_stub_worker.py")
+SEQUENCE = "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"
 
 bad = []
 
 
-def call(route, body=None, token=TOKEN, timeout=20):
-    url = f"{BASE}{route}"
+def tiny_pdb(shift=0.0):
+    """Four alpha carbons - a structure to py2Dmol, small enough to write down."""
+    rows = ["ATOM  %5d  CA  ALA A%4d    %8.3f%8.3f%8.3f  1.00 50.00           C"
+            % (i + 1, i + 1, 3.8 * i + shift, 0.0, 0.0) for i in range(4)]
+    return "\n".join(rows) + "\nEND\n"
+
+
+def cuda_result(pdb, status="AlphaFold 3 on CUDA (stub) · done"):
+    """A result in cuda/worker.py's own shape, which is what the page ingests."""
+    n = 4
+    return {"cuda": True, "model": "cuda af3", "family": "af3", "pdb": pdb,
+            "confidence": {"plddt": [50.0] * n, "meanPlddt": 50.0, "ptm": 0.5,
+                           "predictedAlignedError": [1.0] * (n * n), "contactProbs": [0.5] * (n * n)},
+            "tokens": {"chainIds": ["A"] * n, "resIds": list(range(1, n + 1))},
+            "chains": ["AAAA"], "msas": {}, "atoms": n, "status": status}
+
+
+def feed(*events):
+    with open(FEED, "a") as handle:
+        for kind, payload in events:
+            handle.write(json.dumps({"kind": kind, "payload": payload}) + "\n")
+
+
+def jobs():
+    if not os.path.exists(JOBS):
+        return []
+    with open(JOBS) as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def call(route, body=None, token=TOKEN, timeout=20, base=BASE):
+    url = f"{base}{route}"
     url += ("&" if "?" in route else "?") + f"t={token}" if token is not None else ""
     data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(
-        url, data=data, headers={"content-type": "application/json"},
-        method="POST" if body is not None else "GET")
+    request = urllib.request.Request(url, data=data, headers={"content-type": "application/json"},
+                                     method="POST" if body is not None else "GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as answer:
             return answer.status, json.loads(answer.read() or b"{}")
@@ -107,12 +103,15 @@ def call(route, body=None, token=TOKEN, timeout=20):
         return refused.code, json.loads(refused.read() or b"{}")
 
 
-def wait_for_event(kind, since=0, seconds=30):
-    """The reader's own loop: poll /down until `kind` turns up."""
-    deadline = time.time() + seconds
-    seen = []
+def head():
+    return call("/down?head=1")[1]
+
+
+def wait_for(kind, since, seconds=20):
+    """The reader's own loop: /down until `kind` turns up. Returns (event, n, everything seen)."""
+    deadline, seen = time.time() + seconds, []
     while time.time() < deadline:
-        code, said = call(f"/down?since={since}")
+        code, said = call(f"/down?since={since}&wait=2000")
         if code != 200:
             return None, since, seen
         since = said.get("n", since)
@@ -120,722 +119,293 @@ def wait_for_event(kind, since=0, seconds=30):
             seen.append(event)
             if event.get("kind") == kind:
                 return event, since, seen
-        time.sleep(0.2)
     return None, since, seen
 
 
-# 🔴 THE JAX BACKEND'S PATH, WITH A STUB WORKER. No JAX and no card here, so a
-# twenty-line stand-in speaks jax/worker.py's protocol - one job a line
-# in, one event a line out - and what is tested is the broker's half: that a
-# `backend: "jax"` fold goes to the worker and not to the page, that its events
-# reach /down numbered and stamped, that one fold still means one, and that
-# Stop ends a fold JAX cannot interrupt by ending the worker.
-JAX_DIR = tempfile.mkdtemp(prefix="localfold-jax-check-")
-STUB = os.path.join(JAX_DIR, "stub_worker.py")
-with open(STUB, "w") as handle:
-    handle.write('''import json, sys, time
-say = lambda kind, payload: print(json.dumps({"kind": kind, "payload": payload, "at": int(time.time() * 1000)}), flush=True)
-say("jax-ready", {})
-for line in sys.stdin:
-    job = json.loads(line)
-    say("status", "stub on JAX")
-    say("progress", 0.5)
-    say("frame", "ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00 90.00           C\\nEND\\n")
-    if job.get("hang"):
-        time.sleep(120)
-    say("result", {"pdb": "END\\n", "scores": {"mean_plddt": 90.0}, "status": "stub done"})
-''')
-# ...and the CUDA backend's (cuda/worker.py), the same protocol from another stub: what is
-# tested is that `backend: "cuda"` reaches IT and not the JAX worker or the page.
-# It also writes down every job it is handed, which is how the reader's arm reads what its Fold sent.
-CUDA_STUB = os.path.join(JAX_DIR, "cuda_stub_worker.py")
-CUDA_JOBS = os.path.join(JAX_DIR, "cuda_jobs.jsonl")
-with open(CUDA_STUB, "w") as handle:
-    handle.write(open(STUB).read().replace('"jax-ready"', '"cuda-ready"').replace("stub on JAX", "stub on CUDA")
-                 .replace('"stub done"', '"cuda stub done"')
-                 .replace("    job = json.loads(line)\n",
-                          f"    job = json.loads(line)\n    open({CUDA_JOBS!r}, 'a').write(line)\n"))
-
-print(f"starting the broker on {PORT} (a headless Chrome comes with it)…")
-backend = subprocess.Popen(
-    [sys.executable, "tools/colab_backend.py", "--port", str(PORT),
-     "--cdp-port", str(CDP_PORT), "--token", TOKEN,
-     "--profile", "/tmp/localfold-bridge-check", "--jax-dir", JAX_DIR, "--cuda"],
-    cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-    env=dict(os.environ, LOCALFOLD_JAX_WORKER=STUB, LOCALFOLD_CUDA_WORKER=CUDA_STUB))
-try:
-    ready, adapter = False, None
-    deadline = time.time() + 180
-    while time.time() < deadline and not ready:
-        line = backend.stdout.readline()
-        if line == "" and backend.poll() is not None:
+def start_broker(port, cuda=True, extra_env=None):
+    proc = subprocess.Popen(
+        [sys.executable, "tools/colab_backend.py", "--port", str(port), "--token", TOKEN,
+         *(["--cuda"] if cuda else [])],
+        cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        env=dict(os.environ, LOCALFOLD_CUDA_WORKER=STUB, LOCALFOLD_STUB_FEED=FEED,
+                 LOCALFOLD_STUB_JOBS=JOBS, **(extra_env or {})))
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        line = proc.stdout.readline()
+        if line == "" and proc.poll() is not None:
             break
         if line.startswith("BACKEND "):
-            adapter = json.loads(line[len("BACKEND "):]).get("gpu")
-            ready = True
-        elif line.strip():
-            print("  " + line.rstrip())
-    if not ready:
-        print("FAIL: the backend never printed its BACKEND line")
-        raise SystemExit(1)
-    print(f"  adapter: {adapter.get('vendor')} {adapter.get('architecture')}"
-          f" webgpu={adapter.get('webgpu')}")
+            return proc, json.loads(line[len("BACKEND "):])
+    raise SystemExit(f"FAIL: the broker on {port} never printed its BACKEND line")
 
-    # 1 · the page announced itself, which is the push direction at startup.
-    code, said = call("/down?since=0")
-    kinds = [event.get("kind") for event in said.get("events") or []]
-    print(f"  /down: {code}, {len(kinds)} event(s): {kinds[:4]}")
-    if "runtime-ready" not in kinds:
-        bad.append("the runtime page never pushed `runtime-ready` to /up -"
-                   " the page loaded but cannot reach the broker")
-    since = said.get("n", 0)
 
-    # 2 · a command out and an answer back, on the one op that needs no card.
-    sent = time.time()
-    code, said = call("/in", {"op": "ping"})
-    if code != 200:
-        bad.append(f"/in refused a ping: {code} {said}")
-    pong, since, _ = wait_for_event("pong", since, 20)
-    if pong is None:
-        bad.append("no `pong` came back: a command does not reach the runtime"
-                   " page, or its events do not reach the reader")
-    else:
-        print(f"  ping -> pong in {round((time.time() - sent) * 1000)} ms")
-        # 3 · both clocks, which is what makes a late feed measurable.
-        if pong.get("at") is None or pong.get("got") is None:
-            bad.append(f"an event carries only one clock: {sorted(pong)}")
-        else:
-            print(f"  clocks: page {pong['at']} broker {pong['got']}"
-                  f" (feed {pong['got'] - pong['at']} ms)")
-
-    # 4 · the watermark is idempotent and loses nothing.
-    code, first = call(f"/down?since={since}")
-    code, again = call(f"/down?since={since}")
-    if first.get("events") != again.get("events") or first.get("n") != again.get("n"):
-        bad.append("two polls at the same watermark gave different answers")
-    code, ahead = call(f"/down?since={first.get('n', since)}")
-    if ahead.get("n", 0) < first.get("n", 0):
-        bad.append("the watermark went backwards")
-    print(f"  watermark: idempotent at {since}, stream at {ahead.get('n')}")
-
-    # 5 · one GPU, one fold. The fold is driven with an EMPTY entity list, so
-    #     the page refuses it in its own words rather than loading weights.
-    code, said = call("/in", {"op": "fold", "payload": {"entities": [], "msa": "none"}})
-    if code != 200:
-        bad.append(f"/in refused the first fold: {code} {said}")
-    code, busy = call("/in", {"op": "fold", "payload": {"entities": []}})
-    if code != 429:
-        bad.append(f"a second fold while one is running answered {code},"
-                   " not 429 - one GPU cannot serve two")
-    else:
-        print(f"  second fold refused: {busy.get('error')}")
-    result, since, seen = wait_for_event("result", since, 60)
-    if result is None:
-        bad.append("the fold command never produced a `result` event - the"
-                   " runtime page took the command and said nothing back")
-    else:
-        payload = result.get("payload") or {}
-        print(f"  fold with no sequence -> {json.dumps(payload)[:120]}")
-        if not payload.get("error") and not payload.get("status"):
-            bad.append("the result of an impossible fold says neither an error"
-                       " nor a status, so a reader is told nothing")
-    code, after = call("/health")
-    if after.get("busy") is not False:
-        bad.append("the runtime is still marked busy after a result -"
-                   " every later fold would be refused 429")
-
-    # 6 · THE READER'S OWN PAGE, which no amount of curl can stand in for.
-    #     Everything above drives the wire; this drives web/app.js's
-    #     `foldOnBackend` in a real browser - the half that was REWRITTEN and
-    #     that a wire test would pass with in pieces.
-    print("  opening the reader's page…")
-    runtime_ws = None
-    reader = None
+def stop_broker(proc):
+    proc.send_signal(signal.SIGINT)
     try:
-        # The runtime's own browser, joined as a second debugger client, only
-        # to take the weights away. Everything else about that page is left
-        # exactly as the backend set it up.
-        for target in json.load(urllib.request.urlopen(
-                f"http://127.0.0.1:{CDP_PORT}/json/list")):
-            if target.get("type") == "page":
-                runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
-                break
-        runtime_ws.call("Network.enable")
-        # 🔴 AND IT STAYS BLOCKED FOR THE REST OF THE RUN. Unblocking at the
-        # end of this arm let a REPLAYED fold command - the reload bug the
-        # heartbeat arm exposed - fetch 681 MB of weights and actually fold,
-        # which then filled the viewer the arms below were reading and made a
-        # mutation pass. Nothing in this gate may ever fold.
-        runtime_ws.call("Network.setBlockedURLs", urls=[WEIGHTS])
-
-        reader, reader_ws = cdp.launch(READER_CDP_PORT, "/tmp/localfold-bridge-reader")
-        reader_ws.call("Page.enable")
-        reader_ws.call("Runtime.enable")
-        # 🔴 THE COLLECTOR GOES IN BEFORE THE PAGE DOES. A throw inside the
-        # rewritten transport would otherwise be a fold that quietly does
-        # nothing, which is the failure this arm exists to catch.
-        reader_ws.call("Page.addScriptToEvaluateOnNewDocument", source="""
-          window.__pageErrors = [];
-          addEventListener('error', (e) => window.__pageErrors.push(String(e.message)));
-          addEventListener('unhandledrejection',
-            (e) => window.__pageErrors.push('unhandled: ' + String(e.reason)));
-          // 🔴 AND WHETHER THE READER DID ANY MODEL WORK ITSELF. A fold that
-          // runs somewhere else must not ask this browser for a GPU or pull a
-          // weight shard - the whole point of the Colab mode, and invisible
-          // from the fold's own result, which arrives either way.
-          window.__readerGpu = 0;
-          if (navigator.gpu) {
-            const ask = navigator.gpu.requestAdapter.bind(navigator.gpu);
-            navigator.gpu.requestAdapter = (...a) => { window.__readerGpu += 1; return ask(...a); };
-          }
-          try { performance.setResourceTimingBufferSize(100000); } catch {}
-        """)
-        reader_ws.call("Page.navigate", url=(
-            f"http://127.0.0.1:{PORT}/index.html?backend=colab&t={TOKEN}"))
-        cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader's page")
-        # 🔴 THE TERMS DIALOG EATS THE CLICK ON A FRESH PROFILE, and it did:
-        # the first run of this arm reported a page that had been handed a
-        # sequence, had an enabled Fold button, was clicked, and then sat at
-        # "Ready. Paste a sequence and press Fold." with no command sent. The
-        # backend accepts them for the RUNTIME page; the reader's browser is a
-        # different profile and had accepted nothing.
-        cdp.evaluate(reader_ws, """(() => {
-          for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2',
-                             'protenix2', 'intellifold2', 'rosettafold3']) {
-            try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); }
-            catch (cause) { /* nothing to do */ }
-          }
-          return true;
-        })()""")
-        # A sequence and a press, which is all a person does - plus a form that
-        # is NOT the defaults in every control that has a choice, because the
-        # question below is whether a reader's settings reach the other machine.
-        #
-        # 🔴 THE SAMPLER GOES THROUGH ITS OWN CHANGE HANDLER AND THE COUNT IS
-        # PICKED FROM WHAT THAT LEAVES. Assigning both by hand builds a form the
-        # page itself could never produce - the count select is REBUILT per
-        # sampler, so a count from the other table is legitimately dropped on
-        # arrival and the arm would be asserting against an impossible state.
-        chosen = cdp.evaluate(reader_ws, """(() => {
-          const g = (id) => document.getElementById(id);
-          window.__entityList.set([{ type: 'protein',
-            value: 'GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK',
-            copies: 1, modifications: [] }]);
-          for (const [id, value] of [['msa-mode', 'none'], ['af3-mode', 'flow']]) {
-            g(id).value = value;
-            g(id).dispatchEvent(new Event('change', { bubbles: true }));
-          }
-          const counts = [...g('af3-count').options].map((o) => o.value);
-          const count = counts.find((v) => v !== g('af3-count').value) ?? counts[0];
-          const want = { 'af3-count': count, 'recycles': '1', 'random-seed': '7' };
-          for (const [id, value] of Object.entries(want)) g(id).value = value;
-          return { ...want, 'af3-mode': 'flow', 'msa-mode': 'none' };
-        })()""")
-        print(f"  the reader's form: {chosen}")
-        # 🔴 THERE IS NO BACKEND TO PICK: a reader's fold is a CUDA fold, and the badge offers no control.
-        if cdp.evaluate(reader_ws, "!!document.querySelector('#colab-status select')"):
-            bad.append("the badge offers a backend select - CUDA is not a choice")
-        cdp.wait_for(reader_ws, "!document.getElementById('predict').disabled", 60,
-                     "the reader's fold button")
-        cdp.evaluate(reader_ws, "(document.getElementById('predict').click(), true)")
-
-        # The job reaches the CUDA worker... and it is the one this click made, not the empty fold the
-        # arms above and below send over curl.
-        asked, deadline = None, time.time() + 30
-        while time.time() < deadline and asked is None:
-            if os.path.exists(CUDA_JOBS):
-                for line in open(CUDA_JOBS):
-                    job = json.loads(line)
-                    if job.get("entities"):
-                        asked = job
-            time.sleep(0.25)
-        if asked is None:
-            bad.append("pressing Fold on the reader's page handed the CUDA worker no job -"
-                       " foldOnBackend never asked")
-        else:
-            sent = asked.get("controls") or {}
-            print(f"  the reader asked CUDA: {len(asked.get('entities') or [])} entity,"
-                  f" {len(sent)} control(s), model {asked.get('family')}, job {bool(asked.get('job'))}")
-            if asked.get("backend") != "cuda":
-                bad.append(f"the reader's fold went to backend {asked.get('backend')!r}, not cuda")
-            # 🔴 EVERY CONTROL THE READER SET, NOT THE FIVE SOMEBODY LISTED.
-            # `foldOnBackend` named entities, model, steps, recycles and msa by
-            # hand and a fold is made of eleven controls, so the sampler, the
-            # seed, the MSA depth, the language model, the AF2 model number and
-            # AF2's early stop were DROPPED in silence - a reader who chose Flow
-            # and a seed got the runtime's defaults with nothing saying so.
-            missing = {k: v for k, v in chosen.items() if sent.get(k) != v}
-            if missing:
-                arrived = {k: sent.get(k) for k in chosen}
-                bad.append(f"the reader's form did not travel: wanted {chosen},"
-                           f" the job carried {arrived}")
-            if not asked.get("job") or not asked.get("family"):
-                bad.append("the CUDA job carried no AlphaFold 3 JSON or no resolved family")
-
-        # ...and the worker's answer reaches the reader's own screen: what is
-        # asserted is that its commentary ARRIVED and was applied, which is the bug.
-        seen, deadline = {}, time.time() + 120
-        while time.time() < deadline:
-            seen = cdp.evaluate(reader_ws, """(() => ({
-              lag: (window.__remoteLag || []).length,
-              worst: Math.max(0, ...(window.__remoteLag || [0])),
-              status: document.getElementById('status-message')?.textContent ?? '',
-              errors: window.__pageErrors || [],
-            }))()""")
-            if seen.get("lag", 0) > 0 and "folding on the runtime" not in seen.get("status", ""):
-                break
-            time.sleep(0.5)
-        print(f"  the reader applied {seen.get('lag')} event(s), worst feed"
-              f" {seen.get('worst')} ms, and reads: {seen.get('status')!r}")
-        if seen.get("lag", 0) == 0:
-            bad.append("the reader's page applied no events at all: the"
-                       " runtime spoke and nothing reached the screen")
-        if "folding on the runtime" in seen.get("status", ""):
-            bad.append("the reader's status line never moved off its own"
-                       " opening line - the runtime's words did not arrive")
-        if seen.get("errors"):
-            bad.append(f"the reader's page threw: {seen['errors'][:2]}")
-        work = cdp.evaluate(reader_ws, """(() => ({
-          gpu: window.__readerGpu,
-          shards: performance.getEntriesByType('resource').map((r) => r.name)
-            .filter((name) => /huggingface\\.co|\\/hf\\/|\\.bin(\\?|$)/.test(name)),
-        }))()""")
-        print(f"  the reader itself: {work['gpu']} WebGPU adapter request(s),"
-              f" {len(work['shards'])} weight file(s)")
-        if work["gpu"] or work["shards"]:
-            bad.append(f"the reader did model work of its own: {work['gpu']} adapter"
-                       f" request(s), weight files {work['shards'][:3]}")
-    finally:
-        if reader is not None:
-            reader.kill()
-
-    # 7 · AND THE FEED HOLDS UP WHILE THE PAGE IS BUSY, which is the whole
-    #     complaint. The runtime page is made to block its main thread in
-    #     300 ms chunks - what a fold does to it - with an event pushed before
-    #     each one. Every event must still arrive promptly, because it leaves
-    #     in the task that made it; a collected-and-drained feed cannot, which
-    #     is what "embedder · 1%" looked like from the reader's chair.
-    runtime_ws = None
-    try:
-        for target in json.load(urllib.request.urlopen(
-                f"http://127.0.0.1:{CDP_PORT}/json/list")):
-            if target.get("type") == "page":
-                runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
-                break
-        # 🔴 THE PAGE'S OWN MODULE INSTANCE, not a second copy: an ES module is
-        # cached by URL, so importing it here is the object web/app.js imports.
-        # Anything else would measure a transport nothing uses.
-        code, head = call("/down?head=1")
-        before = head.get("n", 0)
-        cdp.evaluate(runtime_ws, """(async () => {
-          const bridge = await import('/web/colab-bridge.js');
-          const spin = (ms) => { const end = performance.now() + ms;
-                                 while (performance.now() < end); };
-          (async () => {
-            for (let i = 0; i < 20; i += 1) {
-              bridge.tapOut('status', 'load ' + i);
-              spin(300);
-            }
-          })();
-          return true;
-        })()""", await_promise=True)
-        lags, arrived, deadline = [], [], time.time() + 40
-        seen = before
-        while time.time() < deadline and len(lags) < 20:
-            code, said = call(f"/down?since={seen}")
-            seen = said.get("n", seen)
-            for event in said.get("events") or []:
-                if str(event.get("payload", "")).startswith("load "):
-                    lags.append(event["got"] - event["at"])
-                    arrived.append(event.get("seq"))
-            time.sleep(0.2)
-        if len(lags) < 20:
-            bad.append(f"only {len(lags)} of 20 events arrived from a busy"
-                       " page - the feed stops when the fold gets going")
-        else:
-            worst = max(lags)
-            lags.sort()
-            print(f"  busy page (20 events across 6 s of 300 ms tasks):"
-                  f" feed p50 {lags[10]} ms, worst {worst} ms")
-            # A pushed event leaves before the block that follows it, so the
-            # bound is about the send and not about the page's tasks. A second
-            # is twenty times what this measures and still catches a feed that
-            # has gone back to being collected.
-            if worst > 1000:
-                bad.append(f"the worst event took {worst} ms to reach the"
-                           " broker from a busy page - the feed is being"
-                           " collected rather than pushed")
-            # 🔴 AND EVERY ONE OF THEM IS THERE, EXACTLY ONCE. Several sends
-            # are in flight at once, so the broker's order is the network's:
-            # what must hold is that nothing was dropped or doubled, and that
-            # the page's own `seq` is on each one - which is what the reader
-            # sorts by. Arrivals out of order are REPORTED rather than
-            # asserted: on loopback there are usually none, and the sort in
-            # web/app.js is for the Colab proxy, which is not this.
-            if sorted(arrived) != list(range(min(arrived), min(arrived) + 20)):
-                bad.append(f"the 20 events came back as seqs {sorted(arrived)}"
-                           " - one was dropped, doubled, or carries no seq")
-            out_of_order = sum(1 for a, b in zip(arrived, arrived[1:]) if b < a)
-            print(f"  seq: 20 distinct, {out_of_order} arrived out of order")
-    finally:
-        pass
-
-    # 8 · A RUNTIME THAT GOES AWAY IS VISIBLE - AND A BUSY ONE IS NOT MISTAKEN
-    #     FOR IT. Colab's ordinary ending is the notebook being closed or the
-    #     runtime recycled, and a reader mid-fold would otherwise poll a
-    #     broker that can never answer. The page's own command poll is the
-    #     heartbeat; the DevTools endpoint, served by the browser PROCESS, is
-    #     what separates "this page is busy" from "this machine is gone".
-    runtime_ws = None
-    try:
-        for target in json.load(urllib.request.urlopen(
-                f"http://127.0.0.1:{CDP_PORT}/json/list")):
-            if target.get("type") == "page":
-                runtime_ws = cdp.WS(target["webSocketDebuggerUrl"])
-                break
-        # 🔴 AFTER A SETTLE, because the arm above deliberately blocks that
-        # page's main thread for six seconds and its poll stops with it. The
-        # first version read the heartbeat straight afterwards and reported
-        # 6.2 s of silence as a heartbeat that was not beating - the arm
-        # measuring the arm before it.
-        time.sleep(1.5)
-        code, said = call("/health")
-        fresh = said.get("runtimeSeen")
-        if fresh is None or fresh > 3000:
-            bad.append(f"a live runtime page reads {fresh} ms since its last"
-                       " command poll - the heartbeat is not beating")
-        if said.get("browserAlive") not in (None, True):
-            bad.append(f"the browser reads {said.get('browserAlive')!r} while"
-                       " its page is answering")
-
-        # 🔴 THE BASELINE IS TAKEN HERE, not carried down from an arm above:
-        # the replay check below counted folds from earlier arms and reported
-        # the fix as broken. An arm's baseline is the state immediately
-        # before it - this file's own rule, relearned twice now.
-        code, head = call("/down?head=1")
-        since = head.get("n", since)
-
-        # (a) THE PAGE STOPS ANSWERING AND THE BROWSER DOES NOT. A page with
-        #     no `role` runs no bridge, which is what a page busy in a fold
-        #     looks like from here - and a reader must NOT give up on it.
-        runtime_ws.call("Page.navigate", url="about:blank")
-        quiet, alive, deadline = 0, None, time.time() + 20
-        while time.time() < deadline:
-            code, said = call("/health")
-            quiet, alive = said.get("runtimeSeen") or 0, said.get("browserAlive")
-            if quiet > 6000:
-                break
-            time.sleep(0.5)
-        print(f"  page quiet: {quiet} ms, browser alive: {alive}")
-        if quiet <= 6000:
-            bad.append("the heartbeat did not age while the page was away, so"
-                       " a reader cannot tell a dead runtime from a slow fold")
-        if alive is not True:
-            bad.append(f"the browser reads {alive!r} while it is running - a"
-                       " reader would abandon a fold whose page is merely"
-                       " busy, which is what a fold looks like")
-
-        # ...and back, which is also the bridge restarting by itself.
-        runtime_ws.call("Page.navigate", url=(
-            f"http://127.0.0.1:{PORT}/index.html?role=runtime&t={TOKEN}"))
-        back, deadline = None, time.time() + 60
-        while time.time() < deadline:
-            code, said = call("/health")
-            back = said.get("runtimeSeen")
-            if back is not None and back < 2000:
-                break
-            time.sleep(0.5)
-        print(f"  heartbeat: {fresh} ms fresh, {back} ms once the page is back")
-        if back is None or back > 2000:
-            bad.append(f"the heartbeat did not come back ({back} ms) after the"
-                       " runtime page reloaded - the bridge does not restart")
-        # 🔴 AND A RELOADED PAGE DOES NOT REPLAY THE SESSION. It polled from
-        # zero, so coming back it obeyed every command the notebook had ever
-        # sent: measured as a fold from an arm ten minutes earlier being run
-        # again, weights and all.
-        code, said = call(f"/down?since={since}")
-        since = said.get("n", since)
-        replayed = [e for e in (said.get("events") or [])
-                    if e.get("kind") in ("fold-begin", "result")]
-        if replayed:
-            bad.append(f"the reloaded runtime page replayed {len(replayed)}"
-                       " command event(s) - it starts from zero rather than"
-                       " from where the queue stands")
-
-    finally:
-        pass
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
-    # 9 · A READER THAT ARRIVES MID-FOLD ATTACHES TO IT. A Colab fold is
-    #     minutes long and the page in front of it is an ordinary tab, so
-    #     "only the page that pressed Fold is watching" is a reader who
-    #     reloads and sees nothing at all.
-    #
-    #     🔴 THE FOLD IS HELD BY TAKING /out AWAY FROM THE RUNTIME PAGE, not
-    #     by folding something slow: the broker raises `folding` when it
-    #     ACCEPTS the command, and a page that cannot collect its commands
-    #     never finishes it. That makes the state deterministic instead of a
-    #     race against a real fold's first seconds.
-    held = None
-    try:
-        for target in json.load(urllib.request.urlopen(
-                f"http://127.0.0.1:{CDP_PORT}/json/list")):
-            if target.get("type") == "page":
-                held = cdp.WS(target["webSocketDebuggerUrl"])
-                break
-        held.call("Network.enable")
-        held.call("Network.setBlockedURLs", urls=["*/out*"])
-        time.sleep(1.0)
-        code, said = call("/in", {"op": "fold", "payload": {
-            "entities": [{"type": "protein", "value": "GWSTELEKHRSVQ", "copies": 1}]}})
-        code, head = call("/down?head=1")
-        if not head.get("folding"):
-            bad.append("the broker does not say it is folding after accepting"
-                       " a fold command, so no reader can attach to one")
+def open_reader(ws, port=PORT):
+    ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=colab&t={TOKEN}")
+    cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.colab-said')", 120, "the reader's page")
+    # 🔴 A FRESH PROFILE HAS ACCEPTED NO MODEL TERMS, and the dialog eats the click.
+    cdp.evaluate(ws, """(() => {
+      for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2', 'protenix2', 'intellifold2', 'rosettafold3'])
+        try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); } catch (cause) {}
+      return true;
+    })()""")
 
-        late, late_ws = cdp.launch(READER_CDP_PORT + 1, "/tmp/localfold-bridge-late")
-        try:
-            late_ws.call("Page.enable")
-            late_ws.call("Page.addScriptToEvaluateOnNewDocument", source="""
-              window.__pageErrors = [];
-              addEventListener('error', (e) => window.__pageErrors.push(String(e.message)));
-              addEventListener('unhandledrejection',
-                (e) => window.__pageErrors.push('unhandled: ' + String(e.reason)));
-            """)
-            late_ws.call("Page.navigate", url=(
-                f"http://127.0.0.1:{PORT}/index.html?backend=colab&t={TOKEN}"))
-            cdp.wait_for(late_ws, "!!window.__entityList", 120, "the late reader")
-            attached, deadline = "", time.time() + 30
-            while time.time() < deadline:
-                attached = cdp.evaluate(late_ws,
-                    "document.getElementById('status-message')?.textContent ?? ''")
-                if "already running" in attached:
-                    break
-                time.sleep(0.5)
-            print(f"  a page opened mid-fold reads: {attached!r}")
-            if "already running" not in attached:
-                bad.append("a page opened while the runtime was folding sat"
-                           " idle - it did not attach to the fold")
 
-            # ...AND WHAT IT DOES WITH WHAT ARRIVES. Frames pushed from the
-            # runtime page must be DRAWN by the reader, and the `result` must
-            # be INGESTED - `loadIntoViewer`, the sequence strip, the download
-            # buttons - which is the reader's own code at the end of every
-            # remote fold and is otherwise reached only by folding.
-            for index in range(3):
-                cdp.evaluate(held, """(async () => {
-                  const bridge = await import('/web/colab-bridge.js');
-                  bridge.tapOut('status', 'sampler %d of 3');
-                  bridge.tapOut('progress', %f);
-                  bridge.tapOut('frame', %s);
-                  return true;
-                })()""" % (index + 1, (index + 1) / 3.0,
-                           json.dumps(tiny_pdb(index * 2.0))))
-                time.sleep(0.4)
-            drew, deadline = {}, time.time() + 30
-            while time.time() < deadline:
-                drew = cdp.evaluate(late_ws, """(() => {
-                  const reg = window.py2dmol_viewers || {};
-                  const r = reg[Object.keys(reg)[0]] &&
-                            reg[Object.keys(reg)[0]].renderer;
-                  const o = r && r.objectsData ? r.objectsData[r.currentObjectName] : null;
-                  return { frames: o && o.frames ? o.frames.length : 0,
-                           positions: o && o.frames && o.frames[0]
-                             ? (o.frames[0].coords || []).length : 0,
-                           status: document.getElementById('status-message')?.textContent ?? '',
-                           errors: window.__pageErrors || [] };
-                })()""")
-                if drew.get("frames", 0) >= 3 and drew.get("positions") == 4:
-                    break
-                time.sleep(0.5)
-            print(f"  it drew {drew.get('frames')} sampler frame(s) of"
-                  f" {drew.get('positions')} positions and reads:"
-                  f" {drew.get('status')!r}")
-            # 🔴 THE POSITION COUNT IS WHAT MAKES THIS ABOUT THE PUSHED
-            # FRAMES. "Three or more frames" was satisfied by a 58-residue
-            # fold that a replayed command had started, so the mutation it was
-            # written for walked straight through it.
-            if drew.get("frames", 0) < 3 or drew.get("positions") != 4:
-                bad.append(f"the attached reader drew {drew.get('frames')} of"
-                           f" 3 pushed frames at {drew.get('positions')}"
-                           " positions, not 4 - the sampler's walk does not"
-                           " reach the screen")
-
-            # 🔴 AND WHAT THE BROKER DROPS MUST NOT BE DROPPED IN SILENCE.
-            # A session is not one fold, so the mailbox is capped at 4,000 and
-            # loses its oldest - and a reader that has fallen behind that
-            # point has lost events it never applied. `from` says where the
-            # stream now starts; the flood below is what makes it move.
-            code, before_gap = call("/down?head=1")
-            code, flooded = call("/up", {"events": [
-                {"kind": "status", "payload": "flood %d" % i, "at": 0, "seq": 10000 + i}
-                for i in range(4100)]})
-            gap, deadline = 0, time.time() + 30
-            while time.time() < deadline:
-                gap = cdp.evaluate(late_ws, "window.__remoteGap || 0")
-                if gap > 0:
-                    break
-                time.sleep(0.5)
-            code, after_gap = call("/down?head=1")
-            print(f"  cap: {before_gap.get('n')} -> {after_gap.get('n')} events,"
-                  f" the attached reader noticed {gap} dropped")
-            if gap <= 0:
-                bad.append("the broker dropped its oldest events and the"
-                           " attached reader carried on as though nothing had"
-                           " happened - a gap in the trajectory, in silence")
-
-            cdp.evaluate(held, """(async () => {
-              const bridge = await import('/web/colab-bridge.js');
-              bridge.tapOut('result', { pdb: %s, atoms: 4, status: 'folded here',
-                                        scores: {}, predJson: null });
-              return true;
-            })()""" % json.dumps(tiny_pdb(4.0)))
-            ingested, deadline = {}, time.time() + 40
-            while time.time() < deadline:
-                ingested = cdp.evaluate(late_ws, """(() => {
-                  const reg = window.py2dmol_viewers || {};
-                  const r = reg[Object.keys(reg)[0]] &&
-                            reg[Object.keys(reg)[0]].renderer;
-                  const o = r && r.objectsData ? r.objectsData[r.currentObjectName] : null;
-                  return { status: document.getElementById('status-message')?.textContent ?? '',
-                           positions: o && o.frames && o.frames[0]
-                             ? (o.frames[0].coords || []).length : 0,
-                           errors: window.__pageErrors || [] };
-                })()""")
-                if "folded here" in ingested.get("status", ""):
-                    break
-                time.sleep(0.5)
-            print(f"  and ingested it: {ingested.get('status')!r},"
-                  f" {ingested.get('positions')} positions drawn")
-            if "folded here" not in ingested.get("status", ""):
-                bad.append("the runtime's finished fold never landed on the"
-                           " reader's page - `result` is not ingested")
-            if ingested.get("positions", 0) < 4:
-                bad.append(f"the ingested structure has"
-                           f" {ingested.get('positions')} positions, not 4 -"
-                           " loadIntoViewer got something it could not read")
-            if ingested.get("errors"):
-                bad.append(f"the attached reader threw: {ingested['errors'][:2]}")
-        finally:
-            late.kill()
-    finally:
-        if held is not None:
-            try:
-                held.call("Network.setBlockedURLs", urls=[])
-            except Exception:                                 # noqa: BLE001
-                pass
-    # The injected `result` above is what ended the held fold, so the broker
-    # must be idle again - which is also the rule that a session can fold
-    # twice.
-    code, after = call("/health")
-    if after.get("busy") is not False:
-        bad.append("the broker is still busy after the fold ended, so every"
-                   " later fold would be refused")
-
-    # 10 · THE BROWSER GOES, WHICH IS THE RUNTIME GOING. This is the state
-    #     a reader gives up on, and the only one.
-    # 🔴 THE BROWSER ONLY. `pkill -f localfold-bridge-check` also matches the
-    # BROKER, whose own command line carries that profile in `--profile` - so
-    # the first version killed the post office as well and the next request
-    # died on "connection refused", which is a different fault wearing this
-    # one's clothes.
-    #
-    # 🔴 AND THE BINARY'S NAME IS NOT THE WAY TO SEPARATE THEM. This read
-    # "Google Chrome.*" - the macOS path - so on Linux, where the binary is
-    # `google-chrome` or `chromium`, it matched NOTHING: the browser lived,
-    # `browserAlive` stayed None, and the arm failed saying a reader cannot
-    # tell a gone runtime from a busy one. It could; nothing had gone. What
-    # separates the two on BOTH platforms is the flag - the browser is given
-    # `--user-data-dir=<profile>` by cdp.launch and the broker takes
-    # `--profile <path>` - so the `=` does the work the binary name was doing.
-    subprocess.run(["pkill", "-f", "user-data-dir=/tmp/localfold-bridge-check"],
-                   check=False)
-    dead, deadline = None, time.time() + 30
-    while time.time() < deadline:
-        try:
-            code, said = call("/health")
-        except Exception as cause:                            # noqa: BLE001
-            bad.append(f"the broker went with the browser ({cause}) - the"
-                       " post office is not the thing being killed here")
-            break
-        dead = said.get("browserAlive")
-        if dead is False:
-            break
-        time.sleep(0.5)
-    print(f"  with the browser gone: browserAlive {dead}")
-    if dead is not False:
-        bad.append(f"the browser reads {dead!r} after it was killed - a"
-                   " reader cannot tell a gone runtime from a busy one")
-
-    # 10b · the JAX backend: routed to the worker, numbered, one at a time,
-    # and stoppable.
+print(f"starting the broker on {PORT} with the stub worker…")
+backend, announced = start_broker(PORT)
+reader = None
+try:
+    # 1 · what the card is, and what is offered.
     code, health = call("/health")
-    if "jax" not in (health.get("backends") or []):
-        bad.append(f"/health lists {health.get('backends')} with --jax-dir given")
-    _, head = call("/down?head=1")
-    code, said = call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}"}})
-    result, since_jax, seen = wait_for_event("result", head.get("n", 0), 30)
-    kinds = [event.get("kind") for event in seen]
-    seqs = [event.get("seq") for event in seen]
-    print(f"  jax fold: {code} -> {kinds}, seq {seqs}")
-    if result is None or (result.get("payload") or {}).get("status") != "stub done":
-        bad.append(f"a JAX fold did not come back through the worker: {kinds}")
-    if seqs != sorted(seqs) or any(event.get("got") is None for event in seen):
-        bad.append("the worker's events are not numbered in order and stamped on arrival")
-    call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}", "hang": True}})
-    wait_for_event("frame", since_jax, 30)
-    code, refused = call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}"}})
-    if code != 429:
-        bad.append(f"a second JAX fold during one answered {code}, not 429")
-    call("/in", {"op": "stop"})
-    stopped, since_jax, _ = wait_for_event("result", since_jax, 15)
-    _, head = call("/down?head=1")
-    print(f"  jax stop: {(stopped or {}).get('payload')}, folding {head.get('folding')}")
-    if (stopped or {}).get("payload", {}).get("error") != "stopped" or head.get("folding"):
-        bad.append("Stop did not end a JAX fold: the worker has to go, and the flag with it")
-    code, said = call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}"}})
-    again, since_jax, _ = wait_for_event("result", since_jax, 30)
-    if again is None or (again.get("payload") or {}).get("status") != "stub done":
-        bad.append("the JAX fold after a Stop did not run - the worker was not restarted")
-    print("  and the next JAX fold runs on a new worker")
+    print(f"  /health: backends {health.get('backends')}, gpu {health.get('gpu')}, colabRuntime {health.get('colabRuntime')}")
+    if code != 200 or health.get("backends") != ["cuda"]:
+        bad.append(f"/health answered {code} offering {health.get('backends')}, not ['cuda']")
+    if health.get("gpu") != announced.get("gpu"):
+        bad.append("/health and the BACKEND line name different cards")
 
-    # 10c · the CUDA backend: its own worker, its own Stop, and the other worker untouched.
-    if "cuda" not in (health.get("backends") or []):
-        bad.append(f"/health lists {health.get('backends')} with --cuda given")
+    # 2 · one GPU, one fold; numbered, stamped events; the watermark.
+    start = head().get("n", 0)
     code, said = call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
-    result, since_jax, seen = wait_for_event("result", since_jax, 30)
-    statuses = [event.get("payload") for event in seen if event.get("kind") == "status"]
-    print(f"  cuda fold: {code} -> {(result or {}).get('payload', {}).get('status')}, said {statuses}")
-    if result is None or (result.get("payload") or {}).get("status") != "cuda stub done" or "stub on CUDA" not in statuses:
-        bad.append(f"a CUDA fold did not come back through the CUDA worker: {statuses}")
-    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}", "hang": True}})
-    wait_for_event("frame", since_jax, 30)
-    call("/in", {"op": "stop"})
-    stopped, since_jax, _ = wait_for_event("result", since_jax, 15)
-    _, head = call("/down?head=1")
-    print(f"  cuda stop: {(stopped or {}).get('payload')}, folding {head.get('folding')}")
-    if (stopped or {}).get("payload", {}).get("error") != "stopped" or head.get("folding"):
-        bad.append("Stop did not end a CUDA fold")
-    code, said = call("/in", {"op": "fold", "payload": {"backend": "jax", "job": "{}"}})
-    again, since_jax, _ = wait_for_event("result", since_jax, 30)
-    if again is None or (again.get("payload") or {}).get("status") != "stub done":
-        bad.append("a JAX fold after a CUDA Stop did not run on the JAX worker")
-    print("  and a JAX fold after it still runs on the JAX worker")
+    if code != 200:
+        bad.append(f"a fold was refused {code}: {said}")
+    deadline = time.time() + 10
+    while time.time() < deadline and not jobs():
+        time.sleep(0.05)
+    if len(jobs()) != 1:
+        bad.append(f"the worker was handed {len(jobs())} job(s), not one")
+    code, busy = call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    if code != 429:
+        bad.append(f"a second fold while one holds answered {code}, not 429")
+    if not head().get("folding"):
+        bad.append("head=1 does not say a fold is running while one holds")
+    feed(("status", "stub · trunk"), ("progress", 0.5), ("frame", tiny_pdb()), ("result", cuda_result(tiny_pdb())))
+    result, n, seen = wait_for("result", start)
+    kinds = [event.get("kind") for event in seen]
+    print(f"  a fold: {kinds}, seq {[event.get('seq') for event in seen]}")
+    if kinds != ["status", "progress", "frame", "result"]:
+        bad.append(f"the fold's events arrived as {kinds}")
+    seqs = [event.get("seq") for event in seen]
+    if seqs != sorted(seqs) or len(set(seqs)) != len(seqs):
+        bad.append(f"the events are not numbered in order: {seqs}")
+    if any("at" not in event or "got" not in event for event in seen):
+        bad.append("an event is missing one of its two clocks (at, got)")
+    again = call(f"/down?since={n}")[1]
+    if again.get("events"):
+        bad.append("the watermark is not idempotent: a poll at the head returned events")
+    if head().get("folding"):
+        bad.append("the result did not lower the busy flag")
 
-    # 11 · and nothing answers without the token.
-    for route, body in (("/down?since=0", None), ("/out?since=0", None),
-                        ("/health", None), ("/up", {"events": []}),
-                        ("/in", {"op": "ping"})):
+    # 3 · THE FEED IS LIVE: a held ask is answered when the worker speaks.
+    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    time.sleep(0.5)
+    n = head().get("n", 0)
+    lags = []
+    for i in range(5):
+        answer = {}
+        reader_thread = threading.Thread(target=lambda: answer.update(call(f"/down?since={n}&wait=8000")[1]))
+        reader_thread.start()
+        time.sleep(0.3)
+        sent = time.time()
+        feed(("status", f"live {i}"))
+        reader_thread.join(10)
+        lags.append(time.time() - sent)
+        n = answer.get("n", n)
+    feed(("result", cuda_result(tiny_pdb())))
+    wait_for("result", n)
+    print(f"  the feed: answered {', '.join(f'{lag * 1000:.0f}' for lag in lags)} ms after the worker spoke")
+    if max(lags) > 1.0:
+        bad.append(f"a held /down?wait= answered {max(lags):.2f} s after the worker spoke - the feed is not live")
+
+    # 4 · what the broker drops is not dropped in silence.
+    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    time.sleep(0.3)
+    feed(*[("status", f"flood {i}") for i in range(4100)], ("result", cuda_result(tiny_pdb())))
+    deadline = time.time() + 30
+    while time.time() < deadline and head().get("folding"):
+        time.sleep(0.1)
+    flooded = call("/down?since=0")[1]
+    print(f"  after 4,100 events: a reader at 0 is told the stream starts at {flooded.get('from')} of {flooded.get('n')}")
+    if not flooded.get("from"):
+        bad.append("past the cap, a reader that fell behind is not told where the stream now starts")
+
+    # 5 · Stop ends a held fold, and the next fold is a new worker; a dead worker ends its fold.
+    n = head().get("n", 0)
+    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    time.sleep(0.3)
+    call("/in", {"op": "stop"})
+    stopped, n, _ = wait_for("result", n)
+    print(f"  Stop: {(stopped or {}).get('payload')}, folding {head().get('folding')}")
+    if (stopped or {}).get("payload", {}).get("error") != "stopped" or head().get("folding"):
+        bad.append("Stop did not end the held fold with 'stopped' and lower the flag")
+    before = len(jobs())
+    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    time.sleep(0.5)
+    if len(jobs()) != before + 1:
+        bad.append("the fold after a Stop never reached a worker")
+    feed(("__exit", None))
+    died, n, _ = wait_for("result", n)
+    print(f"  a worker that dies mid-fold: {(died or {}).get('payload')}")
+    if "exited" not in str((died or {}).get("payload", {}).get("error")) or head().get("folding"):
+        bad.append("a worker that died mid-fold did not end the fold with an error")
+
+    # 6 · THE READER'S OWN PAGE.
+    print("  opening the reader's page…")
+    reader, reader_ws = cdp.launch(READER_CDP_PORT, "/tmp/localfold-bridge-reader")
+    reader_ws.call("Page.enable")
+    reader_ws.call("Runtime.enable")
+    # 🔴 THE COLLECTOR GOES IN BEFORE THE PAGE DOES, and so does the count of model work: a fold that
+    # runs somewhere else must not ask this browser for a GPU or pull a weight shard.
+    reader_ws.call("Page.addScriptToEvaluateOnNewDocument", source="""
+      window.__pageErrors = [];
+      addEventListener('error', (e) => window.__pageErrors.push(String(e.message)));
+      addEventListener('unhandledrejection', (e) => window.__pageErrors.push('unhandled: ' + String(e.reason)));
+      window.__readerGpu = 0;
+      if (navigator.gpu) {
+        const ask = navigator.gpu.requestAdapter.bind(navigator.gpu);
+        navigator.gpu.requestAdapter = (...a) => { window.__readerGpu += 1; return ask(...a); };
+      }
+      try { performance.setResourceTimingBufferSize(100000); } catch {}
+    """)
+    open_reader(reader_ws)
+    time.sleep(1.5)
+    badge = cdp.evaluate(reader_ws, """(() => ({
+      said: document.querySelector('.colab-said')?.textContent ?? '',
+      select: !!document.querySelector('#colab-status select'),
+      live: !!document.querySelector('.colab-live input'),
+    }))()""")
+    print(f"  the badge: {badge}")
+    if badge["select"]:
+        bad.append("the badge offers a backend select - CUDA is not a choice")
+    if not badge["live"]:
+        bad.append("the badge offers no Live box on a runtime with CUDA")
+    card = (health.get("gpu") or {}).get("name")
+    if card and card not in badge["said"]:
+        bad.append(f"the badge reads {badge['said']!r}, not naming the card {card!r}")
+    # 🔴 A FORM THAT IS NOT THE DEFAULTS in every control with a choice, through the page's own change
+    # handlers, because the question is whether the reader's settings reach the worker.
+    chosen = cdp.evaluate(reader_ws, """(() => {
+      const g = (id) => document.getElementById(id);
+      window.__entityList.set([{ type: 'protein', value: %s, copies: 1, modifications: [] }]);
+      for (const [id, value] of [['msa-mode', 'none'], ['af3-mode', 'flow']]) {
+        g(id).value = value;
+        g(id).dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      const counts = [...g('af3-count').options].map((o) => o.value);
+      const count = counts.find((v) => v !== g('af3-count').value) ?? counts[0];
+      const want = { 'af3-count': count, 'recycles': '1', 'random-seed': '7' };
+      for (const [id, value] of Object.entries(want)) g(id).value = value;
+      return { ...want, 'af3-mode': 'flow', 'msa-mode': 'none' };
+    })()""" % json.dumps(SEQUENCE))
+    before = len(jobs())
+    cdp.wait_for(reader_ws, "!document.getElementById('predict').disabled", 60, "the reader's fold button")
+    cdp.evaluate(reader_ws, "(document.getElementById('predict').click(), true)")
+    deadline = time.time() + 30
+    while time.time() < deadline and len(jobs()) == before:
+        time.sleep(0.1)
+    asked = jobs()[-1] if len(jobs()) > before else None
+    if asked is None:
+        bad.append("pressing Fold on the reader's page handed the CUDA worker no job - foldOnBackend never asked")
+    else:
+        sent = asked.get("controls") or {}
+        print(f"  the reader asked CUDA: {len(asked.get('entities') or [])} entity, {len(sent)} control(s),"
+              f" model {asked.get('family')}, job {bool(asked.get('job'))}, frames {asked.get('frames')}")
+        if asked.get("backend") != "cuda":
+            bad.append(f"the reader's fold went to backend {asked.get('backend')!r}, not cuda")
+        # 🔴 EVERY CONTROL THE READER SET, NOT THE FIVE SOMEBODY LISTED - the allow-list trap.
+        missing = {k: (v, sent.get(k)) for k, v in chosen.items() if sent.get(k) != v}
+        if missing:
+            bad.append(f"the reader's form did not travel (wanted, carried): {missing}")
+        if not asked.get("job") or not asked.get("family"):
+            bad.append("the CUDA job carried no AlphaFold 3 JSON or no resolved family")
+    feed(("status", "stub · diffusion"), ("frame", tiny_pdb(0)), ("frame", tiny_pdb(2)),
+         ("result", cuda_result(tiny_pdb(4), "AlphaFold 3 on CUDA (stub) · done in 0.1 s")))
+    seen = {}
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        seen = cdp.evaluate(reader_ws, """(() => {
+          const p = window.__lastPrediction ? window.__lastPrediction() : null;
+          return {
+            status: document.getElementById('status-message')?.textContent ?? '',
+            lag: (window.__remoteLag || []).length,
+            pae: p?.confidence?.predictedAlignedError?.constructor?.name ?? null,
+            plddt: p?.confidence?.plddt?.constructor?.name ?? null,
+            model: p?.model ?? null,
+            errors: window.__pageErrors || [],
+          };
+        })()""")
+        if "done in 0.1 s" in seen.get("status", ""):
+            break
+        time.sleep(0.3)
+    print(f"  the reader reads {seen.get('status')!r} after {seen.get('lag')} event(s);"
+          f" its prediction: {seen.get('model')}, PAE {seen.get('pae')}, pLDDT {seen.get('plddt')}")
+    if "done in 0.1 s" not in seen.get("status", ""):
+        bad.append("the worker's result never reached the reader's status line")
+    # 🔴 A PREDICTION CROSSES AS JSON, WHICH HAS NO TYPED ARRAYS: `download-all` slices the PAE with
+    # `subarray`, and a plain array of the right numbers passes everything else.
+    if seen.get("pae") != "Float32Array" or seen.get("plddt") != "Float32Array":
+        bad.append(f"the reader's prediction holds PAE {seen.get('pae')} and pLDDT {seen.get('plddt')}, not Float32Array")
+    if seen.get("errors"):
+        bad.append(f"the reader's page threw: {seen['errors'][:2]}")
+    work = cdp.evaluate(reader_ws, """(() => ({
+      gpu: window.__readerGpu,
+      shards: performance.getEntriesByType('resource').map((r) => r.name)
+        .filter((name) => /huggingface\\.co|\\.bin(\\?|$)/.test(name)),
+    }))()""")
+    if work["gpu"] or work["shards"]:
+        bad.append(f"the reader did model work of its own: {work['gpu']} adapter request(s), {work['shards'][:3]}")
+
+    # 7 · a reader that opens the page MID-FOLD attaches to it.
+    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    time.sleep(0.3)
+    open_reader(reader_ws)
+    attached = ""
+    deadline = time.time() + 20
+    while time.time() < deadline and "already running" not in attached:
+        attached = cdp.evaluate(reader_ws, "document.getElementById('status-message')?.textContent ?? ''")
+        time.sleep(0.3)
+    feed(("frame", tiny_pdb(1)), ("result", cuda_result(tiny_pdb(3), "attached fold · done")))
+    landed = ""
+    deadline = time.time() + 20
+    while time.time() < deadline and "attached fold" not in landed:
+        landed = cdp.evaluate(reader_ws, "document.getElementById('status-message')?.textContent ?? ''")
+        time.sleep(0.3)
+    print(f"  a reader arriving mid-fold: {attached!r}, then {landed!r}")
+    if "already running" not in attached or "attached fold" not in landed:
+        bad.append("a reader that opened mid-fold did not attach to it and receive its result")
+
+    # 8 · a runtime with no CUDA says so and refuses.
+    bare, _ = start_broker(PORT + 2, cuda=False)
+    try:
+        refused = call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}}, base=f"http://127.0.0.1:{PORT + 2}")
+        open_reader(reader_ws, PORT + 2)
+        time.sleep(4)
+        said = cdp.evaluate(reader_ws, "document.querySelector('.colab-said')?.textContent ?? ''")
+        live = cdp.evaluate(reader_ws, "!!document.querySelector('.colab-live')")
+        print(f"  no --cuda: fold {refused}, badge {said!r}, Live box {live}")
+        if refused[0] != 400 or "no CUDA backend" not in refused[1].get("error", ""):
+            bad.append(f"a runtime with no CUDA answered a fold {refused}")
+        if "no CUDA backend" not in said or live:
+            bad.append(f"a runtime with no CUDA reads {said!r} with a Live box {live}")
+    finally:
+        stop_broker(bare)
+
+    # 9 · and nothing answers without the token.
+    for route, body in (("/down?since=0", None), ("/health", None), ("/in", {"op": "stop"})):
         code, _ = call(route, body, token=None)
         if code != 403:
             bad.append(f"{route} answered {code} with no token, not 403")
     print("  every route refuses a missing token")
 finally:
-    backend.send_signal(signal.SIGINT)
-    try:
-        backend.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        backend.kill()
+    if reader is not None:
+        reader.kill()
+    stop_broker(backend)
 
 print()
 for line in bad:

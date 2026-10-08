@@ -8,7 +8,7 @@
 cuda/worker.py over its own stdin protocol, one process for every case as the broker runs it,
 each job shaped as the page sends one (AlphaFold 3 JSON from the entity rows, the rows themselves, the
 form's controls), each fold scored against its deposited structure (cuda/af3/score.py) and held to a
-bar, and every result held to the fields the page ingests (web/app.js, jaxPrediction): a PDB, a pLDDT a
+bar, and every result held to the fields the page ingests (web/app.js, cudaPrediction): a PDB, a pLDDT a
 token, a PAE of tokens^2, the token layout, the chains. test:colab's CUDA arm is a stub and proves the
 broker's routing; this is the half that proves the worker folds.
 
@@ -184,9 +184,9 @@ def page_arm(bad):
     sys.path.insert(0, os.path.join(REPO, "tools"))
     import cdp
     import urllib.request
-    port, cdp_port, reader_port, token = 8893, 9395, 9396, "cuda-check"
-    broker = subprocess.Popen([sys.executable, "tools/colab_backend.py", "--port", str(port), "--cdp-port", str(cdp_port),
-                               "--token", token, "--profile", "/tmp/localfold-cuda-page-runtime", "--cuda"],
+    port, reader_port, token = 8893, 9396, "cuda-check"
+    broker = subprocess.Popen([sys.executable, "tools/colab_backend.py", "--port", str(port),
+                               "--token", token, "--cuda"],
                               cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     reader = None
     try:

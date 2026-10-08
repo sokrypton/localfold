@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-355 tools. `tools/fixtures/` is data and is not listed.
+354 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -293,7 +293,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (93)
+## `tools/` - everything else (92)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -315,7 +315,7 @@ go through CDP, and the deploy.
 - **`check-atom-windows.js`** - Our atom key window against af3-any-model's own, for every dumped model.
 - **`check-batch-fields.js`** - OUR WHOLE FEATURISED BATCH against af3-any-model's own, field by field, for every dumped model.
 - **`check-bundle-vs-params.py`** - Is this bundle the weights af3-any-model loads, tensor by tensor?
-- **`check-colab-bridge.py`** - Two-way between the reader's page and the runtime that folds for it.
+- **`check-colab-bridge.py`** - The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:colab.
 - **`check-cuda-worker.py`** - The CUDA backend's worker, folding for real: npm run test:cuda.
 - **`check-esmc-reference.js`** - Does cpu/esmc/tower.js compute ESM-C?
 - **`check-esmfold2-confidence.js`** - ESMFold2's confidence head against Synthyra's own, on the host.
@@ -326,7 +326,6 @@ go through CDP, and the deploy.
 - **`check-esmfold2-modules.js`** - One module of ESMFold2's trunk at a time, against its own recorded answer.
 - **`check-esmfold2-sampler.js`** - ESMFold2's EDM sampler, in the parts a port can actually be held to.
 - **`check-esmfold2-trunk.js`** - Does LocalFold's pairformer arithmetic compute ESMFold2's trunk?
-- **`check-jax-worker.py`** - The JAX backend's worker, folding for real on this machine's GPU.
 - **`check-job-archive.py`** - Does a fold archive describe the AlphaFold 3 job that was handed in?
 - **`check-ligand-path.mjs`** - Every AF3-lineage model folds a LIGAND, and its bonds are the right length.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
@@ -343,7 +342,7 @@ go through CDP, and the deploy.
 - **`check-stock-flags.mjs`** - Does every model fold on the browser a VISITOR has?
 - **`check-template-path.mjs`** - Every AF3-lineage model's TEMPLATE actually moves its fold.
 - **`check_remote_bundle.py`** - Is every shard a manifest names actually at the remote, at the right length?
-- **`colab_backend.py`** - LocalFold's own fold, on somebody else's GPU, reached over one URL.
+- **`colab_backend.py`** - LocalFold's CUDA fold, on somebody else's GPU, reached over one URL.
 - **`contact-map-dividers.py`** - Does the contact map get its chain divider lines while a fold is running?
 - **`convert_multimer_params.py`** - Normalise AF2 monomer OR multimer parameters onto one graph.
 - **`deploy.py`** - Push, deploy, and prove the site is serving what was pushed.

@@ -1,34 +1,20 @@
 /**
- * TWO WAY, BETWEEN THE PAGE A READER LOOKS AT AND THE ONE THAT FOLDS.
+ * THE READER'S PAGE, FOLDING ON A COLAB RUNTIME'S GPU.
  *
- * In a Colab runtime the GPU is on the machine that has no screen. WebGPU only
- * runs in a browser, so the runtime runs one headlessly on `index.html` - the
- * same page and the same fold, which is the whole reason this arrangement
- * exists rather than a port of the model into Python. What has to travel is
- * everything a person would have seen: the status line, the bar, every sampler
- * frame, the structure and the prediction behind it - and, in the other
- * direction, what they asked for.
+ * `notebooks/localfold.ipynb` runs tools/colab_backend.py on the runtime, which
+ * serves this checkout and keeps one worker process - cuda/worker.py, LocalFold's
+ * native CUDA ports on the page's own weights and inputs. The notebook's link
+ * opens `index.html?backend=colab&t=…` on that server; this page then sends each
+ * fold there and draws what the worker says as it says it: every status line,
+ * bar fraction, sampler frame and contact map, then the finished fold.
  *
- * 🔴 IT PUSHES. THE FIRST VERSION WAS PULLED OVER CDP AND THAT IS WHY IT WAS
- * NOT LIVE. `tools/colab_backend.py` used to collect `window.__remoteTap` by
- * evaluating a splice every 250 ms, so a reader saw the fold only as often as
- * a busy page answered the debugger: reported as the bar sitting at "embedder
- * · 1%" for a whole fold and the finished structure appearing at the end. A
- * push leaves at the MOMENT of the event, in the same task that made it - the
- * page has to be running to produce an event at all, so nothing is gained by
- * asking it again later.
+ * 🔴 THERE WAS A SECOND HALF, AND IT IS GONE. The runtime used to run this same
+ * page headlessly (`?role=runtime`) and fold with its WebGPU code on commands
+ * relayed through the broker; once every fold went to CUDA nothing reached it,
+ * and it was removed (docs/WEB.md, 2026-10-08).
  *
- * 🔴 AND THE COMMANDS COME BACK THE SAME WAY. The runtime page asks the broker
- * what has been requested, rather than the backend pretending to be a mouse
- * over CDP: the entity list, the model row and the Fold button are set from
- * INSIDE the page, by the same writes a person's click would make. CDP is left
- * with the two jobs only it can do - start the browser and say what card it
- * got.
- *
- * ROLES, BOTH FROM THE URL, so neither page needs a build of its own:
- *   ?role=runtime&t=…    the headless page on the runtime. Pushes, obeys.
- *   ?backend=colab&t=…   the reader's page. Asks, receives. (web/app.js)
- * Absent both, every function here is inert and index.html is what it was.
+ * Absent `?backend=colab`, every function here is inert and index.html is what
+ * it was: the website folds in the reader's own browser.
  */
 
 import { devSourceIs } from "./dev-log.js";
@@ -63,442 +49,8 @@ const ask = async (route, body) => {
   return said;
 };
 
-export const colabRole = () => {
-  const asked = new URLSearchParams(location.search);
-  if (asked.get("role") === "runtime") return "runtime";
-  if (asked.get("backend") === "colab") return "reader";
-  return null;
-};
-
-/* ------------------------------------------------------------------ the page
-   that folds: what it says, sent as it says it. */
-
-let pending = [];
-let seqOut = 0;
-
-/**
- * 🔴 NOT ONE REQUEST AT A TIME, WHICH IS WHERE THE FIRST VERSION OF THIS PUT
- * THE FAULT BACK. Holding the next batch until the last one RESOLVED needs the
- * main thread to run the response, and a page in the middle of a fold does not
- * give it up - so twenty events pushed across six seconds of 300 ms tasks
- * reached the broker at **p50 3.0 s, worst 5.7 s**, which is the pulled feed's
- * behaviour wearing a push's clothes. `tools/check-colab-bridge.py` measures
- * exactly that and holds it under a second.
- *
- * A send is STARTED in the task that made the event and nothing waits for its
- * answer. What that costs is ordering - several requests in flight can arrive
- * in any order - so every event carries a `seq` and the reader applies each
- * batch in it.
- */
-function flush() {
-  if (pending.length === 0) return;
-  const batch = pending;
-  pending = [];
-  // 🔴 A LOST BATCH IS A LOST PICTURE, NOT A LOST FOLD. The fold is running on
-  // this page and its result is read back at the end from what the page HAS;
-  // throwing here would take the fold down to save the commentary.
-  ask("/up", { events: batch }).catch((cause) => {
-    console.warn("colab bridge: an event batch did not send:", cause.message);
-  });
-}
-
-/**
- * One thing the page said, on its way out.
- *
- * Called by web/app.js's `remoteTap` for every status write, bar fraction and
- * sampler frame - the SAME calls a local fold makes, which is what keeps this
- * from being a second reporting path that can drift from the real one.
- *
- * 🔴 `at` IS THE PAGE'S OWN CLOCK and the broker stamps its arrival beside it,
- * so "produced late" and "delivered late" are two numbers rather than one
- * argument. That distinction is what the pulled version could not make.
- */
-export function tapOut(kind, payload) {
-  if (colabRole() !== "runtime") return;
-  pending.push({ kind, payload, at: Date.now(), seq: seqOut });
-  seqOut += 1;
-  // ...and sent at the END OF THIS TASK, not per event. A microtask runs
-  // before the task yields, so the rule above holds (the send starts in the
-  // task that made it), but a sampler step's status, bar and frame go as ONE
-  // request instead of three - on a T4's two vCPUs a fold's fetches were
-  // 547 ms of its main thread.
-  // 🔴 BUT NEVER LATER THAN 50 ms INSIDE ONE LONG TASK: a microtask waits for
-  // the task to end, and a page busy in one synchronous stretch held events
-  // for its whole length (test:colab measured 6 s). Past 50 ms the batch goes
-  // now, from the task that made it.
-  if (Date.now() - pending[0].at >= 50) { flush(); return; }
-  if (!flushQueued) {
-    flushQueued = true;
-    queueMicrotask(() => { flushQueued = false; flush(); });
-  }
-}
-let flushQueued = false;
-
-/* ------------------------------------------------- ...and what it is told to do */
-
-const idle = (ms) => new Promise((done) => setTimeout(done, ms));
-
-const statusText = () =>
-  document.getElementById("status-message")?.textContent ?? "";
-
-/**
- * 🔴 THE PAGE SAYS WHEN IT HAS FAILED, AND IT SAYS IT IN A CLASS.
- * `status(text, true)` marks the line `.error`, which is the same signal a
- * reader gets - where the word list this replaces ("stopped", "failed",
- * "refus") was a guess at the page's vocabulary, kept in another file, in
- * another language.
- */
-const failed = () =>
-  !!document.getElementById("status-message")?.classList.contains("error");
-
-/** Prediction fields a reader never reads: see readBack. */
-const RUNTIME_ONLY = new Set(["pair", "paeLogits", "lddtLogits", "finalRepresentation",
-                              "msaFirstRow"]);
-
-/** Is a fold running here? The page states it; everything else is a proxy. */
-const folding = () => !!(window.__foldState && window.__foldState.running);
-
-/**
- * The readback, which is the page's own download button and its own prediction.
- *
- * 🔴 THE WHOLE PREDICTION, AS A STRING, NOT FIELD BY FIELD. The archive the
- * download button writes reads `stem`, `model`, `settings`, `entities`,
- * `msas`, `msaOrigin`, `confidence`, `chainLengths` and more; naming them here
- * is the field-by-field rebuild this repository has been bitten by six times,
- * and it always fails silently - a zip with a piece missing.
- */
-async function readBack() {
-  const blobs = [];
-  const made = URL.createObjectURL;
-  URL.createObjectURL = (b) => { blobs.push(b); return made.call(URL, b); };
-  document.getElementById("download-pdb")?.click();
-  for (let tick = 0; tick < 40 && blobs.length === 0; tick += 1) await idle(100);
-  URL.createObjectURL = made;
-  const pdb = blobs[0] ? await blobs[0].text() : "";
-  const pred = (window.__lastPrediction && window.__lastPrediction()) || {};
-  // 🔴 A TYPED ARRAY HAS TO ARRIVE AS ONE. JSON has no typed arrays, so this
-  // used to flatten them to plain arrays - which LOOK right everywhere and
-  // then are not: `download-all` reached `matrixRows`, which slices the PAE
-  // with `values.subarray(...)`, and a remote fold's download died on
-  // "values.subarray is not a function" while the picture beside it was
-  // perfect. The kind travels with the numbers and `revivePrediction` puts it
-  // back, so what the reader holds is what a local fold would have held.
-  // 🔴 AND THE MODEL'S INTERMEDIATES STAY HERE. Each AF2 recycle carries its
-  // pair representation (L^2 x 128) and the PAE and lDDT LOGITS the finished
-  // numbers were read from; at 255 residues the prediction was 1 GB as JSON
-  // and every fold died on "Invalid string length" with the structure drawn.
-  // Nothing on the reader reads them - the archive writes the confidences, and
-  // the contact map was computed here from the pair - so they are not sent.
-  // ...and a typed array travels as its BYTES, base64: a float as JSON text
-  // is 10-18 characters and 5.3 as base64, and the broker and the reader each
-  // parse what is sent.
-  const predJson = encodePrediction(pred);
-  return {
-    predJson,
-    a3m: pred.a3m ?? null,
-    // 🔴 NOT A SECOND COPY OF THE CONFIDENCES. They are in `predJson`, filtered
-    // and typed; sent again here they went through a plain stringify, where a
-    // typed array becomes an object with a key per element and the PAE
-    // LOGITS rode along - 130 MiB of a 158 MiB event for one AF2 fold at 261
-    // residues, and fifteen seconds between "Done" and the reader seeing it.
-    confidence: null,
-    // 🔴 AND NOT A SECOND COPY OF THE SCORES EITHER: they are `pred.scores`,
-    // inside `predJson`, and the reader takes them from there. Sent twice they
-    // were 7.3 of an AF3 fold's 8.8 MB at 255 residues, over the internet.
-    scores: null,
-    chains: pred.chains ?? null,
-    length: pred.length ?? null,
-    status: statusText(),
-    pdb,
-    atoms: (pdb.match(/^ATOM|^HETATM/gm) || []).length,
-  };
-}
-
-/**
- * A fold, asked for from the other machine and pressed here.
- *
- * Every line of this was a `cdp.evaluate` string in tools/colab_backend.py.
- * It is the same code in the place it belongs: the page driving its own
- * controls, where a `#predict` that has not been wired yet is something to
- * wait for rather than a race nobody can see from outside.
- */
-async function runFold(request) {
-  if (folding()) {
-    return { error: "the runtime is already folding", status: statusText() };
-  }
-  const entities = request.entities ?? [{
-    type: "protein", value: request.sequence ?? "", copies: 1,
-    modifications: request.modifications ?? [],
-  }];
-  // 🔴 AN EMPTY REQUEST IS REFUSED HERE, NOT BY WAITING. With nothing to fold
-  // the page keeps `#predict` disabled - correctly - and the wait below would
-  // sit out its whole bound before saying so, with the reader watching a bar
-  // that means nothing. The page's own words are what a person would read.
-  if (entities.length === 0 || entities.every((e) => !String(e.value ?? "").trim())) {
-    return { error: "nothing to fold: the request carried no sequence",
-             status: statusText() };
-  }
-  // 🔴 THE PAGE'S OWN RESTORE PATH, NOT A SECOND ONE. This set four controls
-  // by hand and fired a `change` on each, which is a third idea of what a fold
-  // is made of beside the form and the saved session - and it was the stalest:
-  // the reader's sampler, seed, MSA depth, language model, AF2 model number
-  // and early stop never arrived, because nothing here named them.
-  // `window.__foldInputs.apply` is what a restored session goes through, so
-  // a control added to `FOLD_CONTROLS` lands here with no edit.
-  //
-  // 🔴 AND IT ASSIGNS WITHOUT DISPATCHING `change`, WHICH IS WHY IT IS THE
-  // RIGHT ONE. Those listeners bring the other controls into agreement and
-  // some of them EMPTY the page; firing one per control raced the next
-  // assignment. It calls the three syncs directly instead, in the listeners'
-  // own order, and fills the rebuilt selects afterwards.
-  //
-  // 🔴 AND A SHORT REQUEST STILL WORKS, which is not a fallback but the
-  // documented shape: `{op: "fold", payload: {sequence: "..."}}` is what a
-  // person types and what tools/check-colab-bridge.py sends. These four are
-  // DEFAULTS under whatever the reader's form supplied, so a full request
-  // overrides every one of them and a bare one folds as it always did.
-  const controls = {
-    "model-family": request.model ?? "af3",
-    recycles: String(request.recycles ?? 3),
-    "af3-count": String(request.steps ?? 25),
-    // 🔴 THE CONTROL'S OWN VALUE, NOT THE RESOLVED MODE. A select silently
-    // refuses a value it has no option for, and "single" is not one of them -
-    // it left the control empty and the fold died with "unknown alignment
-    // mode". What travels is what the reader's select said.
-    "msa-mode": request.msa ?? "none",
-    ...(request.controls ?? {}),
-  };
-  if (window.__foldInputs?.apply === undefined) {
-    return { error: "this runtime's page cannot take a form (no __foldInputs)",
-             status: statusText() };
-  }
-  window.__foldInputs.apply({ entities, controls });
-  // The button comes up when the page has wired it and the entity list reads
-  // as foldable; a minute is longer than either has ever taken and short
-  // enough that a request the page will never accept says so.
-  const button = document.getElementById("predict");
-  for (let tick = 0; tick < 120 && (button === null || button.disabled); tick += 1) {
-    await idle(500);
-  }
-  if (button === null || button.disabled) {
-    return { error: "the fold button never came up", status: statusText() };
-  }
-  // 🔴 THE PAGE'S OWN CLOCK ON BOTH SIDES OF THE PRESS. What says the fold
-  // ended is `__foldState.since` moving PAST the click, and two clocks
-  // agreeing is not something to rest a completion test on.
-  const pressed = Date.now();
-  button.click();
-  // 🔴 THIRTY MINUTES UNLESS ASKED, NOT FIVE. The reader sends no timeout,
-  // and five minutes ended IntelliFold-2 at 512 residues on a Colab T4 at 73%
-  // of its last trunk pass - legitimately slow, streaming its weights under the
-  // memory budget - while the reader watched the bar move. The reader already
-  // has a stop button and gives up on a runtime that stops answering; this is
-  // only the backstop for a page that hangs.
-  // 🔴 AND A FOLD THAT RUNS OUT OF TIME IS STOPPED, not left running behind
-  // its own error: it held the GPU and the next request was refused as
-  // "already folding".
-  const deadline = Date.now() + Math.min((request.timeout ?? 1800) * 1000, 1800_000);
-  for (;;) {
-    await idle(250);
-    const state = window.__foldState ?? null;
-    if (state !== null && state.running === false && state.since > pressed) break;
-    if (Date.now() > deadline) {
-      if (folding()) button.click();
-      return { error: "timed out", status: statusText() };
-    }
-  }
-  // 🔴 "READY" IS "IT CAN HAND ONE OVER", NOT "THE FOLD ENDED".
-  // `loadIntoViewer` clears the object's frames and re-adds them, so the
-  // moment after a fold is a settled status line over an EMPTY object and a
-  // download button that writes nothing. Ask for the artefact until it exists.
-  // 🔴 AND A FOLD THAT FAILED IS NOT WAITED FOR. The wait below exists for the
-  // window where `loadIntoViewer` has cleared the object's frames and not yet
-  // re-added them, which only happens on the way to a structure; a fold that
-  // died - no weights, no network, a refused allocation - has nothing coming,
-  // and waiting two minutes to say so is two minutes of a reader watching a
-  // bar that has already lost.
-  if (failed()) return { error: statusText(), status: statusText() };
-  const until = Date.now() + 120_000;
-  for (;;) {
-    const out = await readBack();
-    if (out.atoms > 0) return out;
-    if (failed()) return { ...out, error: statusText() };
-    if (Date.now() > until) return { ...out, error: "the page never produced a structure" };
-    await idle(500);
-  }
-}
-
-async function obey(command) {
-  const { op, payload } = command;
-  if (op === "ping") {
-    // The transport's own check, and the only op that needs no GPU: it is what
-    // tools/check-colab-bridge.py proves the two directions with.
-    tapOut("pong", { at: Date.now(), folding: folding(), status: statusText() });
-    return;
-  }
-  if (op === "warm") {
-    // The reader has picked a model: start its weights and pipelines here,
-    // unless a fold is already using the GPU. See warmRemoteModel in app.js.
-    if (!folding()) window.__warmModel?.(payload?.family, payload?.tokens);
-    return;
-  }
-  if (op === "stop") {
-    // 🔴 STOPPING IS THE SAME BUTTON. `predict` is a toggle - it is how a
-    // reader stops a fold - so there is no second control to keep in step.
-    document.getElementById("predict")?.click();
-    tapOut("stopped", { at: Date.now() });
-    return;
-  }
-  if (op === "fold") {
-    // 🔴 NOT AWAITED, OR NOTHING ELSE IS HEARD UNTIL THE FOLD ENDS - AND
-    // `stop` IS THE COMMAND THAT ONLY MATTERS DURING ONE. The loop below
-    // obeys in order and a fold is minutes long, so awaiting it here left the
-    // reader's Stop sitting in the mailbox until the fold it was meant to
-    // interrupt had finished on its own. A fold is a JOB; the loop goes on
-    // listening while it runs, and the broker refuses a second one.
-    tapOut("fold-begin", { at: Date.now() });
-    void (async () => {
-      let out;
-      try {
-        out = await runFold(payload ?? {});
-      } catch (cause) {
-        out = { error: String(cause && cause.message ? cause.message : cause) };
-      }
-      tapOut("result", out);
-    })();
-    return;
-  }
-  tapOut("status", `the runtime does not know the command "${op}"`);
-}
-
-/**
- * The runtime page's own loop: what has been asked of me since I last looked.
- *
- * A POLL AND NOT A SOCKET, because the broker is `http.server` and the thing
- * that would justify a socket - latency - is a tenth of a second against a
- * fold measured in minutes. What matters is that the EVENTS are pushed; a
- * command arriving 300 ms late is a button pressed 300 ms late.
- */
-async function serveCommands() {
-  // 🔴 FROM WHERE THE QUEUE STANDS NOW, NOT FROM ZERO. This page can be
-  // reloaded - by the backend, by a crash, by anything - and a watermark that
-  // restarts at zero obeys the whole session again: measured, a reloaded
-  // runtime page re-ran a fold from ten minutes earlier, downloaded the
-  // weights for it and reported it as the current one. What was asked before
-  // this page existed was asked of a page that has already answered.
-  let since = 0;
-  try {
-    const answer = await fetch(door("/out", "&head=1"));
-    if (answer.ok) since = (await answer.json()).n ?? 0;
-  } catch (cause) {
-    /* the first poll below will simply start at zero, which is the old
-       behaviour and is only wrong for a page that has been reloaded */
-  }
-  for (;;) {
-    try {
-      const answer = await fetch(door("/out", `&since=${since}`));
-      if (answer.ok) {
-        const said = await answer.json();
-        since = said.n ?? since;
-        for (const command of said.commands ?? []) await obey(command);
-      }
-    } catch (cause) {
-      // The broker restarting is not this page's problem to solve; it is one
-      // missed poll and the next one carries whatever was queued.
-    }
-    await idle(300);
-  }
-}
-
-/* ----------------------------------------------------- the reader's two doors */
-
-/**
- * The runtime's prediction, with its typed arrays back.
- *
- * 🔴 THE KINDS ARE NAMED RATHER THAN GUESSED, because guessing is what the
- * flattened form already did: "an array of numbers" is a Float32Array, a
- * Uint8Array or nothing in particular depending on which field it is, and
- * every reader downstream has its own opinion. The writer knows; it says.
- */
-const TYPED = {
-  Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-  Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array,
-};
-
-/**
- * The prediction as the string the bridge carries.
- *
- * 🔴 SHARED OBJECTS ARE SENT ONCE. JSON has no references, so every object
- * the prediction reaches twice was written out twice: an AF2 pass holds its
- * structure and confidences in its wrapper AND in its `pass`, and
- * `contactSource` is one of those passes again - 10 MB for an AF2 fold at 255
- * residues, two thirds of it repeats. The first appearance carries `__id`; a
- * later one is `{__ref: id}`, which `revivePrediction` puts back as the SAME
- * object, as the runtime held it. Typed arrays travel as their bytes, and the
- * model's intermediates (RUNTIME_ONLY) not at all.
- */
-export function encodePrediction(pred) {
-  const ids = new Map();
-  return JSON.stringify(pred, (key, value) => {
-    if (RUNTIME_ONLY.has(key)) return undefined;
-    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
-    const seen = ids.get(value);
-    if (seen !== undefined) return { __ref: seen };
-    const id = ids.size;
-    ids.set(value, id);
-    if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-      return { __typed: value.constructor.name, b64: bytesToBase64(value), __id: id };
-    }
-    return { __id: id, ...value };
-  });
-}
-
-/**
- * ...and back. `JSON.parse` revives children before parents and siblings in
- * order, so an object's first appearance is complete before any later
- * `{__ref}` to it is reached - one pass resolves them.
- */
-export function revivePrediction(json) {
-  const byId = new Map();
-  return JSON.parse(json, (key, value) => {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
-    if (value.__ref !== undefined && Object.keys(value).length === 1) {
-      if (!byId.has(value.__ref)) throw new Error(`prediction reference ${value.__ref} before its object`);
-      return byId.get(value.__ref);
-    }
-    const id = value.__id;
-    let revived = value;
-    const kind = TYPED[value.__typed];
-    if (kind !== undefined && typeof value.b64 === "string") {
-      const bytes = base64ToBytes(value.b64);
-      revived = new kind(bytes.buffer, bytes.byteOffset, bytes.byteLength / kind.BYTES_PER_ELEMENT);
-    } else if (kind !== undefined && Array.isArray(value.v)) {
-      revived = kind.from(value.v);
-    } else if (id !== undefined) {
-      delete value.__id;
-    }
-    if (id !== undefined) byId.set(id, revived);
-    return revived;
-  });
-}
-
-/** A typed array's bytes as base64, in chunks: `apply` has an argument limit. */
-export function bytesToBase64(view) {
-  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-  let binary = "";
-  for (let at = 0; at < bytes.length; at += 0x8000) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(at, at + 0x8000));
-  }
-  return btoa(binary);
-}
-
-/** ...and back, into a fresh buffer aligned for any element type. */
-export function base64ToBytes(text) {
-  const binary = atob(text);
-  const bytes = new Uint8Array(binary.length);
-  for (let at = 0; at < binary.length; at += 1) bytes[at] = binary.charCodeAt(at);
-  return bytes;
-}
+export const colabRole = () =>
+  new URLSearchParams(location.search).get("backend") === "colab" ? "reader" : null;
 
 /**
  * Where a reader's fold runs: LocalFold's native CUDA ports on the runtime
@@ -550,10 +102,10 @@ export async function remoteHead(signal) {
  * usually not in - and so a page served from anywhere gets it. Same rule as
  * py2Dmol's own tab strip.
  *
- * 🔴 AND THE HEARTBEAT IS THE ONE THE FOLD LOOP ALREADY USES: `runtimeSeen`
- * off `/down?head=1`, which is the runtime page's own command poll and costs
- * the broker nothing. `/health` is asked ONCE, for the card's name, because it
- * reaches over CDP to the browser on the other side.
+ * 🔴 AND THE HEARTBEAT IS THE BROKER ANSWERING `/down?head=1`, which costs it
+ * nothing: a runtime that has gone (a closed notebook, a recycled VM) takes the
+ * server with it, and three unanswered asks in a row say so. `/health` is
+ * asked until it answers once, for the card's name and what it offers.
  */
 function installColabStatus() {
   devSourceIs("the Colab runtime");
@@ -572,7 +124,7 @@ function installColabStatus() {
   leave.textContent = "Disconnect";
   // 🔴 IT STOPS THE SERVICE, WHICH IS WHAT FREES THE CARD. Walking away from
   // the runtime and leaving it folding for nobody is not disconnecting - the
-  // browser on that machine holds the GPU for as long as it lives. What this
+  // worker on that machine holds the GPU for as long as it lives. What this
   // CANNOT do is end the Colab runtime itself: that machine belongs to the
   // notebook, and only its own Runtime menu releases it. The title says so,
   // because a button that half-does what its name says is worse than one that
@@ -593,11 +145,9 @@ function installColabStatus() {
   if (actions === null) head.append(slot);
   else head.insertBefore(slot, actions);
 
-  // 🔴 ASKED UNTIL IT ANSWERS, AND THEN NOT AGAIN. `/health` reaches over CDP
-  // to the browser on the other side, so it is not a thing to poll - and a
-  // single attempt at load lost the race often enough to matter: the badge
-  // read "Colab runtime" with no card, which is the one word that separates a
-  // T4 from SwiftShader wearing its clothes.
+  // 🔴 ASKED UNTIL IT ANSWERS, AND THEN NOT AGAIN: the card does not change while
+  // the service lives, and a single attempt at load lost the race often enough
+  // that the badge read "Colab runtime" with no card.
   let card = "";
   let releases = false;
   let cudaOffered = null;
@@ -606,7 +156,7 @@ function installColabStatus() {
     try {
       const health = await (await fetch(door("/health"))).json();
       const gpu = health.gpu ?? {};
-      card = [gpu.vendor, gpu.architecture].filter(Boolean).join(" ");
+      card = gpu.name ?? "";
       // 🔴 AND WHETHER DISCONNECT RELEASES THE MACHINE OR ONLY STOPS THE
       // SERVICE ON IT. On Colab it is both; on a runtime somebody is hosting
       // by hand there is no machine to hand back, and a button that promises
@@ -670,16 +220,9 @@ function installColabStatus() {
       await nameTheCard();
       const head2 = await remoteHead();
       folding = !!head2.folding;
-      // 🔴 TWENTY SECONDS IS THE FOLD LOOP'S OWN BOUND, and the two must agree:
-      // a badge that still says connected while `followRemoteFold` is giving
-      // up is the page telling a reader two things at once.
-      // The badge asks the same question the fold loop does: silence alone is
-      // a page that is busy, and the browser being gone is a runtime that is.
-      const gone = (head2.runtimeSeen ?? 0) > 20000 && head2.browserAlive === false;
-      badge.dataset.state = gone ? "gone" : "live";
-      said.textContent = gone
-        ? "Colab runtime · not answering"
-        : `Colab runtime${card ? ` · ${card}` : ""}${cudaOffered === false ? " · no CUDA backend" : ""}`;
+      misses = 0;
+      badge.dataset.state = "live";
+      said.textContent = `Colab runtime${card ? ` · ${card}` : ""}${cudaOffered === false ? " · no CUDA backend" : ""}`;
       leave.textContent = folding ? "Stop & disconnect" : "Disconnect";
     } catch (cause) {
       badge.dataset.state = "gone";
@@ -698,8 +241,8 @@ function installColabStatus() {
 
   leave.addEventListener("click", async () => {
     leave.disabled = true;
-    // 🔴 THE FOLD FIRST, THEN THE SERVICE. Stopping the page mid-fold leaves
-    // the runtime's browser finishing a fold nobody will read.
+    // 🔴 THE FOLD FIRST, THEN THE SERVICE, so nothing is left finishing a fold
+    // nobody will read.
     if (folding) await remoteCommand("stop", null).catch(() => {});
     await remoteCommand("shutdown", null).catch(() => {});
     // 🔴 AND THIS PAGE DOES NOT RELOAD, because the server it was served BY is
@@ -751,16 +294,7 @@ function installColabStatus() {
   });
 }
 
-/** Start whichever half of this page is. Called once, by web/app.js. */
+/** The badge, on a reader's page. Called once, by web/app.js. */
 export function installColabBridge() {
-  if (colabRole() === "reader") {
-    installColabStatus();
-    return;
-  }
-  if (colabRole() !== "runtime") return;
-  // 🔴 ANNOUNCED, SO THE BACKEND KNOWS THE PAGE IS UP WITHOUT ASKING IT.
-  // `tools/colab_backend.py` waits for this rather than polling an internal
-  // over CDP, which is the one thing that used to tie startup to the debugger.
-  tapOut("runtime-ready", { at: Date.now(), href: location.href });
-  void serveCommands();
+  if (colabRole() === "reader") installColabStatus();
 }
