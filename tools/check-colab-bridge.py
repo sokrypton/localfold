@@ -126,7 +126,7 @@ def wait_for_event(kind, since=0, seconds=30):
 
 
 # 🔴 THE JAX BACKEND'S PATH, WITH A STUB WORKER. No JAX and no card here, so a
-# twenty-line stand-in speaks tools/jax_worker.py's protocol - one job a line
+# twenty-line stand-in speaks jax/worker.py's protocol - one job a line
 # in, one event a line out - and what is tested is the broker's half: that a
 # `backend: "jax"` fold goes to the worker and not to the page, that its events
 # reach /down numbered and stamped, that one fold still means one, and that
@@ -146,7 +146,7 @@ for line in sys.stdin:
         time.sleep(120)
     say("result", {"pdb": "END\\n", "scores": {"mean_plddt": 90.0}, "status": "stub done"})
 ''')
-# ...and the CUDA backend's (tools/native_worker.py), the same protocol from another stub: what is
+# ...and the CUDA backend's (cuda/worker.py), the same protocol from another stub: what is
 # tested is that `backend: "native"` reaches IT and not the JAX worker or the page.
 NATIVE_STUB = os.path.join(JAX_DIR, "native_stub_worker.py")
 with open(NATIVE_STUB, "w") as handle:

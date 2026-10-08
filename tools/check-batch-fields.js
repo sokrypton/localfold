@@ -231,7 +231,7 @@ const ABSENT = {
   is_protein: "derived from aatype at use, not stored",
   is_water: "as is_protein", is_nonstandard_polymer_chain: "as is_protein",
   frames_mask: "the frame set is built in the confidence head, not the batch",
-  // chai1's: ESM2 3B's output, which this port computes in the fold (native/af3/src/esm2.cuh, 3.3e-4 against the
+  // chai1's: ESM2 3B's output, which this port computes in the fold (cuda/af3/src/esm2.cuh, 3.3e-4 against the
   // reference's tower) from the ids shared/af3/featurise/esm2-input.js writes - an input to the model, not a feature
   esm_embeddings: "computed by the fold's own ESM2 tower, not the featuriser",
   residue_center_index: "derived from the dense layout at use",

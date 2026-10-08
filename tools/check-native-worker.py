@@ -5,14 +5,14 @@
     python3 tools/check-native-worker.py --no-page   # without the page arm (a headless Chrome, a broker)
     python3 tools/check-native-worker.py --only=6mrr  # just the cases whose name contains it
 
-tools/native_worker.py over its own stdin protocol, one process for every case as the broker runs it,
+cuda/worker.py over its own stdin protocol, one process for every case as the broker runs it,
 each job shaped as the page sends one (AlphaFold 3 JSON from the entity rows, the rows themselves, the
-form's controls), each fold scored against its deposited structure (native/af3/score.py) and held to a
+form's controls), each fold scored against its deposited structure (cuda/af3/score.py) and held to a
 bar, and every result held to the fields the page ingests (web/app.js, jaxPrediction): a PDB, a pLDDT a
 token, a PAE of tokens^2, the token layout, the chains. test:colab's CUDA arm is a stub and proves the
 broker's routing; this is the half that proves the worker folds.
 
-Needs the native ports built (native/colab_setup.sh, or each port's nvcc line) and the bundles on disk
+Needs the native ports built (cuda/colab_setup.sh, or each port's nvcc line) and the bundles on disk
 (a missing one is fetched). The refusals are cases too: a sampler, a model or an input the CUDA backend
 does not have must come back as a sentence naming it, never as some other fold.
 """
@@ -79,7 +79,7 @@ def cases(offline):
          "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 0.5, None, None),
         ("protenix2 6mrr", {"family": "protenix2", "controls": controls(**{"model-family": "protenix2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.0, 68, None),
-        # (past 80 tokens: protenix2's 256-channel pair track on its fused kernels, native/af3/src/fused256.cuh)
+        # (past 80 tokens: protenix2's 256-channel pair track on its fused kernels, cuda/af3/src/fused256.cuh)
         ("protenix2 5caj, its crystal uploaded", {"family": "protenix2", "controls": controls(**{"model-family": "protenix2"}),
          "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A", "filename": "5caj.pdb"})],
          "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 0.5, None, None),
@@ -109,7 +109,7 @@ def cases(offline):
          (f"{FIX}/1brs-crystal.pdb", "A,D"), 25.0, len(sa) + len(sd), None),
         ("esmfold2 6mrr", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
-        # (past 80 tokens: ESMFold2's 256-channel trunk on its fused kernels, native/af3/src/fused256.cuh)
+        # (past 80 tokens: ESMFold2's 256-channel trunk on its fused kernels, cuda/af3/src/fused256.cuh)
         ("esmfold2 5caj", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(s5)], "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 3.0, None, None),
         ("esmfold2 300M 6mrr", {"family": "ef2-fast-300m", "controls": controls(**{"model-family": "ef2"}),
@@ -170,7 +170,7 @@ def score(pdb_text, reference, chains):
     path = "/tmp/localfold-native-check.pdb"
     with open(path, "w") as handle:
         handle.write(pdb_text)
-    said = subprocess.run([sys.executable, os.path.join(REPO, "native", "af3", "score.py"), path, reference, chains],
+    said = subprocess.run([sys.executable, os.path.join(REPO, "cuda", "af3", "score.py"), path, reference, chains],
                           capture_output=True, text=True).stdout
     found = re.findall(r"CA RMSD ([0-9.]+) A", said)
     return float(found[0]) if found else None
@@ -293,7 +293,7 @@ def main():
     only = next((a[7:] for a in sys.argv if a.startswith("--only=")), None)   # (a substring of the case names)
     if only is not None:
         plan = [case for case in plan if only in case[0]]
-    worker = subprocess.Popen([sys.executable, os.path.join(REPO, "tools", "native_worker.py")], cwd=REPO,
+    worker = subprocess.Popen([sys.executable, os.path.join(REPO, "cuda", "worker.py")], cwd=REPO,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open("/tmp/localfold-native-check.log", "w"),
                               text=True, bufsize=1)
     first = json.loads(worker.stdout.readline())

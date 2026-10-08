@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# The native AlphaFold 3 in one command:
+#
+#   cuda/af3/fold <out.pdb> <input flags> [-- <fold flags>]
+#   cuda/af3/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json -- --samples=5
+#   cuda/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=5caj.a3m --template=5caj.pdb:A
+#   cuda/af3/fold 6mrr.pdb --model=protenix2 --sequence=<SEQ>
+#
+# --model=<name> picks the model (default af3): af3-any-model's own published int8 blob (af3am-<name>/, fetched
+# once by cuda/fetch_bundles.py --af3-any-model; chai1 with ESM2 3B's beside it), read through maps/<name>.map.
+# AlphaFold 3's are Google DeepMind's, for academic non-commercial use: the first fetch asks you to accept its
+# terms (or set LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3).
+#
+#   cuda/af3/fold --serve [--model=<name>]     then any number of ordinary fold commands, then
+#   cuda/af3/fold --stop  [--model=<name>]
+# keeps one af3 resident with the weights on the device and warm: each fold command then pays only
+# the export and a warm fold (6MRR: 0.65 s rather than 1.0)
+#   cuda/af3/fold --batch=<file> [--model=<name>] [-- <fold flags>]
+# folds every line of <file> - "<out.pdb> <input flags>" - in ONE af3 process: the weights load
+# once and every fold after the first runs warm (6MRR: 1.7 s a command, ~0.5 s a batch line).
+#
+# Input flags go to export-model.mjs (--sequence, --a3m, --paired-a3m, --job, --ligands, --smiles,
+# --modify, --kinds, --template, --bundle); fold flags to ./af3 (--samples, --recycles, --steps,
+# --seed, ...), which runs --fold --fast. Builds ./af3 if it is missing and exports each input to a
+# temporary directory.
+set -euo pipefail
+# the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
+gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"; echo "sm_${cc:-80}"; }
+here="$(cd "$(dirname "$0")" && pwd)"
+[ $# -ge 1 ] || { sed -n '2,17p' "$0"; exit 1; }
+batch=""; serve=""
+case "$1" in --batch=*) batch="${1#--batch=}"; out="" ;; --serve|--stop) serve="$1"; out="" ;; *) out="$1" ;; esac
+shift
+inputs=(); foldflags=(); model=af3
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--" ]; then shift; foldflags=("$@"); break; fi
+  case "$1" in --model=*) model="${1#--model=}" ;; *) inputs+=("$1") ;; esac
+  shift
+done
+repo="$(cd "$here/../.." && pwd)"
+map="$here/maps/$model.map"
+[ -f "$map" ] || { echo "no model $model (no $map)" >&2; exit 1; }
+ls "$repo/af3am-$model"/*.bin.zst >/dev/null 2>&1 || python3 "$repo/cuda/fetch_bundles.py" --af3-any-model "$model" >&2 || exit 1
+wflags=(--bundle="$repo/af3am-$model" --map="$map"); dialect=(--family="$model")
+if [ "$model" = chai1 ]; then
+  ls "$repo/af3am-esm2"/*.bin.zst >/dev/null 2>&1 || python3 "$repo/cuda/fetch_bundles.py" --af3-any-model esm2 >&2 || exit 1
+  wflags+=(--esm-bundle="$repo/af3am-esm2")
+fi
+if [ ! -x "$here/af3" ]; then
+  (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af3.cu \
+     -lcublas -lcublasLt -lcupti -ldl -o af3)
+fi
+node=(node --js-float16array --max-old-space-size=24000 "$here/export-model.mjs")
+serve_dir="/tmp/af3-serve-$model-$(id -u)"
+server_up() { [ -f "$serve_dir/pid" ] && kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null; }
+if [ "$serve" = --serve ]; then
+  server_up && { echo "already serving $model ($serve_dir)"; exit 0; }
+  mkdir -p "$serve_dir"; rm -f "$serve_dir"/*.job "$serve_dir"/*.done
+  nohup "$here/af3" - --serve="$serve_dir" "${wflags[@]}" --fold --fast "${foldflags[@]}" > "$serve_dir/server.log" 2>&1 &
+  echo $! > "$serve_dir/pid"
+  # and a resident exporter beside it: node's module loading was most of an export
+  mkdir -p "$serve_dir/exp"; rm -f "$serve_dir/exp"/*
+  nohup node --js-float16array --max-old-space-size=24000 "$repo/cuda/export_server.mjs" "$here/export-model.mjs" \
+    "$serve_dir/exp" > "$serve_dir/export.log" 2>&1 &
+  echo $! > "$serve_dir/export.pid"
+  until grep -q "af3: serving" "$serve_dir/server.log" 2>/dev/null && grep -q "export: serving" "$serve_dir/export.log" 2>/dev/null; do
+    kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null || { cat "$serve_dir/server.log" >&2; exit 1; }
+    kill -0 "$(cat "$serve_dir/export.pid")" 2>/dev/null || { cat "$serve_dir/export.log" >&2; exit 1; }
+    sleep 0.05
+  done
+  echo "serving $model ($serve_dir)"; exit 0
+fi
+if [ "$serve" = --stop ]; then
+  server_up || { echo "no $model server"; exit 0; }
+  echo quit > "$serve_dir/quit.tmp" && mv "$serve_dir/quit.tmp" "$serve_dir/~quit.job"
+  echo '["quit"]' > "$serve_dir/exp/quit.tmp" && mv "$serve_dir/exp/quit.tmp" "$serve_dir/exp/~quit.req"
+  while server_up; do sleep 0.05; done
+  echo "stopped $model"; exit 0
+fi
+if [ -z "$batch" ] && server_up; then   # a resident af3: export, hand it the job, wait for it
+  id="$(date +%s%N)-$$"; in="$serve_dir/in-$id"
+  trap 'rm -rf "$in" "$serve_dir/$id".*' EXIT
+  if kill -0 "$(cat "$serve_dir/export.pid" 2>/dev/null)" 2>/dev/null; then    # the resident exporter
+    node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' -- "$in" --no-weights "${dialect[@]}" "${inputs[@]}" \
+      > "$serve_dir/exp/$id.tmp"
+    mv "$serve_dir/exp/$id.tmp" "$serve_dir/exp/$id.req"
+    trap 'rm -rf "$in" "$serve_dir/$id".* "$serve_dir/exp/$id".*' EXIT
+    until [ -f "$serve_dir/exp/$id.ok" ] || [ -f "$serve_dir/exp/$id.err" ]; do sleep 0.002; done
+    [ -f "$serve_dir/exp/$id.err" ] && { cat "$serve_dir/exp/$id.err" >&2; exit 1; }
+  else
+    "${node[@]}" "$in" --no-weights "${dialect[@]}" "${inputs[@]}" || exit 1
+  fi
+  { echo "$in"; echo "--out=$out"; for f in "${foldflags[@]}"; do echo "$f"; done; } > "$serve_dir/$id.tmp"
+  mv "$serve_dir/$id.tmp" "$serve_dir/$id.job"
+  until [ -f "$serve_dir/$id.done" ]; do
+    server_up || { cat "$serve_dir/$id.log" 2>/dev/null; echo "the $model server stopped (its log: $serve_dir/server.log)" >&2; exit 1; }
+    sleep 0.005
+  done
+  cat "$serve_dir/$id.log"
+  exit "$(cat "$serve_dir/$id.done")"
+fi
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+# af3 with its output read to the end: on success its last line is "af3: done" and it closes
+# stdout, so this returns while the driver is still releasing its device memory (a quarter second);
+# without the line (an error) it waits for the exit status
+run_af3() {
+  local done=0 line
+  exec 4< <("$here/af3" "$1" "${wflags[@]}" --fold --fast --out="$2" --wait-input --detach-output "${foldflags[@]}" && rc=0 || rc=$?; echo "af3: exit $rc")
+  while IFS= read -r line <&4; do
+    case "$line" in "af3: done") done=1; break ;; "af3: exit "*) exec 4<&-; return "${line#af3: exit }" ;; *) printf '%s\n' "$line" ;; esac
+  done
+  exec 4<&-
+  [ $done = 1 ]
+}
+if [ -z "$batch" ]; then
+  # af3 starts first - the CUDA context and the weights' upload overlap the export - and waits for
+  # the input's index, which the exporter writes last
+  run_af3 "$tmp" "$out" &
+  pid=$!
+  # a failed export tells the waiting af3 so (killing $pid would reach only the subshell, leaving af3
+  # waiting on an input that will never come, holding this script's stdout open)
+  if ! "${node[@]}" "$tmp" --no-weights "${dialect[@]}" "${inputs[@]}"; then touch "$tmp/model.failed"; wait $pid; exit 1; fi
+  wait $pid
+  exit
+fi
+dirs=(); outs=(); lines=(); k=0
+while read -r line; do
+  [ -z "$line" ] && continue
+  case "$line" in \#*) continue ;; esac
+  eval "set -- $line"
+  dirs+=("$tmp/$k"); outs+=("$1"); lines+=("$line"); k=$((k + 1))
+done < "$batch"
+[ ${#dirs[@]} -gt 0 ] || { echo "no inputs in $batch" >&2; exit 1; }
+# af3 folds each input as soon as its export lands, while the later ones are still exporting
+run_af3 "$(IFS=,; echo "${dirs[*]}")" "$(IFS=,; echo "${outs[*]}")" &
+pid=$!
+for ((k = 0; k < ${#dirs[@]}; ++k)); do
+  eval "set -- ${lines[$k]}"
+  # (the inputs before a failed export still fold; af3 stops at the failed one, as it would at a bad fold)
+  if ! "${node[@]}" "${dirs[$k]}" --no-weights "${dialect[@]}" "${@:2}" "${inputs[@]}"; then
+    mkdir -p "${dirs[$k]}"; touch "${dirs[$k]}/model.failed"; wait $pid; exit 1
+  fi
+done
+wait $pid

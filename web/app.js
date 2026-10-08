@@ -4107,7 +4107,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   const label = MODEL_LABELS[family] ?? family;
   // 🔴 A JAX FOLD IS HANDED THE JOB AS AlphaFold 3 JSON, written by the same
   // module that writes the archive's request - so the entity conversion is
-  // this page's and not re-implemented in Python. See tools/jax_worker.py.
+  // this page's and not re-implemented in Python. See jax/worker.py.
   if (remoteBackendChoice() === "jax" || remoteBackendChoice() === "native") {
     request.backend = remoteBackendChoice();
     // ...and the sampler this page would fold with (samplerPlan): the steps as well as the start, because an
@@ -4171,7 +4171,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
 async function followRemoteFold({ since, label, signal }) {
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
   // 🔴 A REMOTE FOLD'S INTERMEDIATE CONTACT MAPS, AS A LOCAL ONE SHOWS THEM. The CUDA backend streams
-  // each trunk pass's map (tools/native_worker.py, `contacts`: a byte a pair); before the sampler has a
+  // each trunk pass's map (cuda/worker.py, `contacts`: a byte a pair); before the sampler has a
   // frame it goes to the panel as the local trunk's does, and every frame after it carries the latest.
   let liveContact;
   const draw = remoteFrameDrawer(stem, () => (liveContact === undefined ? undefined : { contact: liveContact }));
@@ -4310,7 +4310,7 @@ async function followRemoteFold({ since, label, signal }) {
   // token layout, the context the archive and the session read), and it goes
   // through the same doors: loadIntoViewer for the picture, recordPrediction
   // for the downloads, the scores card and the saved session.
-  // ...and a CUDA fold the same way: tools/native_worker.py sends the same fields.
+  // ...and a CUDA fold the same way: cuda/worker.py sends the same fields.
   const jax = result.jax === true ? jaxPrediction(result, stem, label, "JAX")
     : result.native === true ? jaxPrediction(result, stem, label, "CUDA") : null;
 
@@ -4392,7 +4392,7 @@ async function followRemoteFold({ since, label, signal }) {
 /**
  * A JAX fold's result as this page's own prediction.
  *
- * The worker (tools/jax_worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
+ * The worker (jax/worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
  * contact probabilities, its token layout and the alignment it used; the rest
  * - the entities, the settings, the form - is this page's, taken now, because
  * the reader's form is what asked for this fold.
@@ -5759,7 +5759,7 @@ reportModelFromUrl();
  */
 
 function applyJob(job) {
-  // (the page builds no chemistry a job defines itself; the native fold does - native/af3/fold)
+  // (the page builds no chemistry a job defines itself; the native fold does - cuda/af3/fold)
   if (job.userCcd !== undefined) {
     throw new Error("userCCD describes chemistry this page does not build - remove it to fold the rest");
   }

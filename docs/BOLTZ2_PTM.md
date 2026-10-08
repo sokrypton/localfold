@@ -141,7 +141,7 @@ against 0.04-0.10 for the other six - and the culprits were HY3 (1.12), P1L (1.0
 (0.82), where 5MC, the glycan, HEM and the SMILES ATP were all clean.
 
 Isolated on 6MRR with a proline introduced (`P..P..`), single sequence, bond rms of the modified
-residue (`native/af3/bonds.mjs`):
+residue (`cuda/af3/bonds.mjs`):
 
 | | AlphaFold 3 | boltz2 |
 |---|---:|---:|
@@ -164,7 +164,7 @@ residue (`native/af3/bonds.mjs`):
   the ring collapsed (C3, C4 and C5 within 0.4 Å of each other), while the same run's SEP@3 control is
   **0.121 / 0.113 / 0.046 Å** and every protein class is 0.008-0.051. So af3-any-model's boltz2 (0.70-0.99)
   and this port's (0.897) inherit it from Boltz-2 itself; there is no port defect to find here, and
-  boltz2 should not be expected to hold a hydroxyproline together. Scored with `native/af3/bonds.mjs`
+  boltz2 should not be expected to hold a hydroxyproline together. Scored with `cuda/af3/bonds.mjs`
   on gemmi's PDB of each mmCIF.
 
 **And the modified BASES the same way, with the batch exact.** After boltz2's batch was made exact

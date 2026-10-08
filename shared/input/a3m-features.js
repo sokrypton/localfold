@@ -401,7 +401,7 @@ export function makeA3mFeatures(a3mText, tables, options = {}) {
  * ONE recycle's features, exactly as `makeA3mFeatures(...)[index]`: every
  * recycle is planned (planning is cheap and seeded in sequence, so recycle k's
  * plan needs the k before it) and only `index` is searched and finished - so
- * independent workers can each take a recycle (native/af2/export_input.mjs).
+ * independent workers can each take a recycle (cuda/af2/export_input.mjs).
  */
 export function makeA3mFeatureRecycle(a3mText, tables, options, index) {
   const { plans, context } = planA3mFeatures(a3mText, tables, options);
@@ -410,7 +410,7 @@ export function makeA3mFeatureRecycle(a3mText, tables, options, index) {
 }
 
 /**
- * The three steps apart, for a caller that runs them in different places (native/af2/export_input.mjs: the
+ * The three steps apart, for a caller that runs them in different places (cuda/af2/export_input.mjs: the
  * plan once - parsing the A3M is the largest single cost of an export, and every recycle worker used to repeat
  * it - then each recycle's search and finish in a worker, or the search on the CUDA port's device). The
  * context holds only typed arrays and plain values, so it crosses to a worker as it is.

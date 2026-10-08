@@ -3117,7 +3117,7 @@ JAX**. WebGPU is this page's fold on the runtime's card; JAX is
 against, and the only one a TPU runtime can run: WebGPU reaches hardware only
 through a Vulkan/Metal/D3D12 driver, and a TPU has none.
 
-**The seam is the bridge, not the fold.** `tools/jax_worker.py` is one
+**The seam is the bridge, not the fold.** `jax/worker.py` is one
 long-lived process (a model is minutes of compile, so its weights and JAX's
 compile cache are kept) that takes a job a line on stdin and prints the bridge's
 own events on stdout - `status`, `progress`, `frame`, `result` - so the reader
@@ -4015,22 +4015,22 @@ The badge's picker now offers **CUDA** beside WebGPU and JAX, and defaults to it
 wherever the runtime offers it. It folds with `native/` - the CUDA ports of AF3
 (all seven AF3-lineage models), AlphaFold 2 (all five models, monomer and
 multimer) and ESMFold2 (600M and 300M) - on the page's own published bundles, read as they
-are (`native/*/maps`). The point is speed: a fold is a second or two on the card
+are (`cuda/*/maps`). The point is speed: a fold is a second or two on the card
 the runtime already has, with no compile minute and no second browser.
 
-**The pieces.** `tools/native_worker.py` speaks `tools/jax_worker.py`'s line
+**The pieces.** `cuda/worker.py` speaks `jax/worker.py`'s line
 protocol, so the broker (`tools/colab_backend.py --native`) relays it exactly as
 it relays JAX, and the page ingests the result through the same builder
 (`jaxPrediction`, labelled `(CUDA)`). The notebook's `cuda_backend` (on by
-default) installs Node 22 where the image is older, starts `native/build.sh` in
+default) installs Node 22 where the image is older, starts `cuda/build.sh` in
 the background - the three ports compiled in parallel for the card, atomically,
 stamped with the card and a hash of the sources - and starts the broker with
 `--native`; a CUDA fold that arrives mid-build waits on it, saying so.
 
 🔴 **NOTHING ABOUT A MOLECULE IS DECIDED IN THE WORKER.** Each exporter reads
-the reader's AF3 JSON with the page's own reader (`native/af2/export_input.mjs`
+the reader's AF3 JSON with the page's own reader (`cuda/af2/export_input.mjs`
 gained `--job`); template rows go through the page's `expandEntities` and
-`fetchStructure` (`native/resolve_templates.mjs`); a "from the MSA search"
+`fetchStructure` (`cuda/resolve_templates.mjs`); a "from the MSA search"
 template is the search's best hit per chain, as the page takes it
 (`--template-search-chains` on both exporters); AF2's templates are aligned and
 merged by the page's `buildTemplate`/`mergeAtom37Templates` instead of mapped by
@@ -4056,9 +4056,9 @@ the multimer's model_2 on templated 1BRS 0.344 against 0.340, ipTM identical. A
 delta model's map carries a `D <model>` line and refuses to load without that
 delta.
 
-**What the page needed from the ports.** native/af2 and native/ef2 wrote only a
+**What the page needed from the ports.** cuda/af2 and cuda/esmfold2 wrote only a
 PDB; both now write AlphaFold 3's `*_confidences.json` and
-`*_summary_confidences.json` beside it, as native/af3 always did - the expected
+`*_summary_confidences.json` beside it, as cuda/af3 always did - the expected
 PAE, pTM and ipTM, the token layout, and AF2's contact probabilities from its
 distogram where the weights carry the head (the page's multimer bundle does
 not). Without them a CUDA fold arrived with no PAE plot and no contact map.
@@ -4066,7 +4066,7 @@ not). Without them a CUDA fold arrived with no PAE plot and no contact map.
 **The AF3 lineage stays resident.** A cold AF3 fold of 6MRR is 0.92 s on the
 A100 of which the fold is 0.18 - the rest is the CUDA context and the weight
 upload - so the worker keeps one AF3-lineage model on the card through
-native/af3's own `--serve` mode (a served fold is byte-identical to a cold
+cuda/af3's own `--serve` mode (a served fold is byte-identical to a cold
 one), stops it before an AF2 or ESMFold2 fold so two models never share the
 card, and every child dies with the worker (`PR_SET_PDEATHSIG`), so a Stop -
 which kills the worker - leaves nothing holding the GPU.
@@ -4094,7 +4094,7 @@ all three, CUDA first.
 committed - only the repository handed in as a git bundle, since it fetches
 `main` - then a reader's page on the service it started: `/health` offers
 `webgpu` and `native`, the picker defaults to CUDA, and the first AF3 fold
-arrived while `native/build.sh` was still compiling, waited on it saying
+arrived while `cuda/build.sh` was still compiling, waited on it saying
 "compiling the CUDA ports for this card", fetched its bundle shard by shard and
 folded: **81 s** for that one, of which the fold is under two. Every other
 model's first fold is its download (Boltz-2 12 s, AF2 8.5, ESMFold2 and its
@@ -4154,7 +4154,7 @@ almost all of it was start-up paid on every fold:
 |---|---:|---:|---:|
 | before | 0.50 s | 1.01 s | 1.11 s |
 | AF2 and ESMFold2 resident (`--serve`) | 0.37 | 0.25 | 0.28 |
-| ...and the exporters resident (native/export_server.mjs) | **0.15** | **0.16** | **0.10** |
+| ...and the exporters resident (cuda/export_server.mjs) | **0.15** | **0.16** | **0.10** |
 
 - **AF2 and ESMFold2 stay resident, as AF3 did.** Their binaries started cold every fold - the CUDA
   context and the weight upload, ~0.75 s. All three now serve through one loop (common.cuh's
@@ -4164,7 +4164,7 @@ almost all of it was start-up paid on every fold:
   twelve folds (AF2 1242 MiB, ESMFold2 2808 MiB).
 - **The page-code steps stay loaded.** Every fold ran `node` twice - the template resolver (0.13 s, even
   for a job with no template) and the exporter (0.12-0.23 s, ~180 ms of it module loading).
-  native/export_server.mjs keeps an exporter loaded and imports it afresh a request (its dependencies
+  cuda/export_server.mjs keeps an exporter loaded and imports it afresh a request (its dependencies
   stay cached, its output is captured to the request's log); the resolver runs only when a row asks
   for a template. Every export of every `test:native` case is byte-identical to a cold run's, printed
   output included, with the jobs mixed in the order the gate runs them.
@@ -4200,7 +4200,7 @@ with AF2 and ESMFold2 niced, since a Colab VM has two cores and the first fold w
 rehearsed here on two cores (`taskset -c 0,1`), AF3 is ready at **45 s against 69** and the whole build at 48
 against 69. Not a lever: AF3's float32 trunk path, which the worker never runs, costs nothing to compile.
 
-**...and the first fold's download.** native/fetch_bundles.py fetched a bundle's shards one at a time: ~21 MB/s
+**...and the first fold's download.** cuda/fetch_bundles.py fetched a bundle's shards one at a time: ~21 MB/s
 to Hugging Face from here on one connection, 112 on eight - AF3's 277 MB in 2.5 s against 13.5. It fetches
 eight at once now, and takes a lock per bundle, so the notebook can start the default model's download
 beside the compile (the network beside the CPU) and a fold that arrives meanwhile waits for that download
@@ -4216,7 +4216,7 @@ result). On a 15 GB T4 the half-full rule keeps about two.
 
 **On the T4 itself**, profiled on Colab: a 262-residue AF3 fold is 4.0 s, 91% trunk, and its grid attention's
 flash kernel ran at 3.5-6 TFLOP/s - no cp.async and 64 KB of shared memory on Turing. A register-staged
-form (native/af3/README.md, "On a T4") is 2.1x on that kernel and 5-6.5% on the fold, with identical
+form (cuda/af3/README.md, "On a T4") is 2.1x on that kernel and 5-6.5% on the fold, with identical
 output; the T4 is power-capped, so a busier kernel lowers the clock for the rest (AF2: the flash kernels
 -1.6 s, the GEMMs +0.8 s, the fold -3%).
 

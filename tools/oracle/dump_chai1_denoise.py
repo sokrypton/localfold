@@ -14,7 +14,7 @@ against chai-lab's captured diffusion input.
 
 The trunk's outputs (single, pair, the diffusion's target_feat) come from oracle-dumps/af3-oracle-trunk-chai1.json,
 so the step sees the conditioning a real fold would. Writes oracle-dumps/af3-oracle-denoise-chai1.json (inputs and
-output, at NOISE) and af3-oracle-stages-chai1.json (the head's seams), the formats native/af3/export-model.mjs reads.
+output, at NOISE) and af3-oracle-stages-chai1.json (the head's seams), the formats cuda/af3/export-model.mjs reads.
 """
 import os, sys, json, pathlib
 os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")

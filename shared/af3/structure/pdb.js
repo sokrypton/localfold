@@ -109,7 +109,7 @@ function pdbTemplate(batch) {
   // 🔴 SIXTY-TWO, NOT TWENTY-SIX: a PDB chain is one character, and the 27th chain of a large
   // complex wrapped back onto A and was MERGED with it in every reader. Upper case, then lower case,
   // then digits - the convention viewers accept - before the format runs out (an mmCIF names them
-  // all; native/af3 writes one with --out=*.cif).
+  // all; cuda/af3 writes one with --out=*.cif).
   const CHAIN_CHARACTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const chainLetter = (token) => {
     const asym = batch.asymId === undefined ? 1 : batch.asymId[token];

@@ -1,7 +1,7 @@
 // One recycle's A3M features in a Node worker thread, from a plan the parent made once: that recycle's
 // nearest-centre search and finishing (searchA3mRecycle, finishA3mRecycle) - or, given its assignments (the
 // search run on the CUDA port's device), the finishing alone - its typed arrays transferred back rather than
-// copied (native/af2/export_input.mjs runs one a recycle). Node only - the page builds features on the device.
+// copied (cuda/af2/export_input.mjs runs one a recycle). Node only - the page builds features on the device.
 import { parentPort, workerData } from "node:worker_threads";
 import { searchA3mRecycle, finishA3mRecycle } from "./a3m-features.js";
 

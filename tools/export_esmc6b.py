@@ -13,7 +13,7 @@ page's int8 codec is a float16 scale per contiguous block of elements, so each m
 [out, in], `block` = in - which makes that per-output-channel scale exactly a per-block one: the codes are
 af3-any-model's byte for byte, the scales rounded once to float16. The names carry the transpose
 (`blocks/<n>/<matrix>/weightsT`), and the native port keeps them resident as codes (MODEL resident int8) and
-expands one layer at a time to float16 for its GEMMs (native/ef2/src/esmc.cuh).
+expands one layer at a time to float16 for its GEMMs (cuda/esmfold2/src/esmc.cuh).
 
 Everything else is float32: the embedding, the norms, and ESMFold2's shim (`language_model.*`, from the folding
 checkpoint - a shim is per model, the tower is shared). The residual scale is the architecture's: every branch

@@ -15,9 +15,9 @@ asks. Four routes carry that, all of them token-checked:
     GET  /down?since=N      the reader receives it
 
 With `--jax-dir`, a fold whose payload says `backend: "jax"` is not forwarded
-to the page: tools/jax_worker.py runs it with af3-any-model and its events land
+to the page: jax/worker.py runs it with af3-any-model and its events land
 in the same mailbox, so the reader follows either one with the same code. With
-`--native`, `backend: "native"` goes to tools/native_worker.py the same way -
+`--native`, `backend: "native"` goes to cuda/worker.py the same way -
 LocalFold's CUDA ports, on the page's own weights.
 
 🔴 THE POINT IS THAT THERE IS NO SECOND IMPLEMENTATION. The fold that runs
@@ -310,7 +310,7 @@ def push_event(event):
 
 
 class JaxWorker:
-    """A worker process (tools/jax_worker.py, tools/native_worker.py), started on its
+    """A worker process (jax/worker.py, cuda/worker.py), started on its
     first fold and kept for the next.
 
     🔴 ITS LINES ARE EVENTS, ITS SEQ IS ITS OWN. The worker prints one bridge
@@ -319,7 +319,7 @@ class JaxWorker:
     the two numberings never interleave.
     """
 
-    def __init__(self, directory, script="jax_worker.py", stub="LOCALFOLD_JAX_WORKER", name="JAX"):
+    def __init__(self, directory, script="jax/worker.py", stub="LOCALFOLD_JAX_WORKER", name="JAX"):
         self.directory = directory
         self.script, self.stub, self.name = script, stub, name
         self.proc = None
@@ -330,7 +330,7 @@ class JaxWorker:
         # LOCALFOLD_JAX_WORKER (LOCALFOLD_NATIVE_WORKER) stands a stub in for the
         # real worker, which is how tools/check-colab-bridge.py tests this path
         # with no GPU and no JAX.
-        worker = os.environ.get(self.stub) or os.path.join(REPO, "tools", self.script)
+        worker = os.environ.get(self.stub) or os.path.join(REPO, self.script)
         self.proc = subprocess.Popen(
             [sys.executable, worker],
             cwd=self.directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -719,13 +719,13 @@ def main():
     parser.add_argument("--jax-dir", default=None,
                         help="the ColabFold2 install directory: offers the JAX backend")
     parser.add_argument("--native", action="store_true",
-                        help="offer the CUDA backend: native/ built (native/colab_setup.sh)")
+                        help="offer the CUDA backend: cuda/ built (cuda/colab_setup.sh)")
     arguments = parser.parse_args()
 
     token = arguments.token or secrets.token_urlsafe(24)
     backend = Backend(arguments.port, arguments.cdp_port, arguments.profile, token)
     jax = JaxWorker(arguments.jax_dir) if arguments.jax_dir else None
-    native = JaxWorker(REPO, "native_worker.py", "LOCALFOLD_NATIVE_WORKER", "CUDA") if arguments.native else None
+    native = JaxWorker(REPO, "cuda/worker.py", "LOCALFOLD_NATIVE_WORKER", "CUDA") if arguments.native else None
     httpd = serve(arguments.port, backend, token, arguments.host, jax, native)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {REPO} on {arguments.host}:{arguments.port}"

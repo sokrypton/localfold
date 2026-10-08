@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-357 tools. `tools/fixtures/` is data and is not listed.
+355 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -293,7 +293,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (95)
+## `tools/` - everything else (93)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -371,10 +371,8 @@ go through CDP, and the deploy.
 - **`gpu-chrome.mjs`** - Run a WebGPU module in headless Chrome and print what it returns.
 - **`heatmap-panel.py`** - Do the heatmap panel's tabs appear, and does OUR map format reach them?
 - **`index-tools.py`** - Every tool in this repository, with the one line it says about itself.
-- **`jax_worker.py`** - The JAX backend: af3-any-model folding a LocalFold job, speaking the bridge.
 - **`mobile-layout.py`** - index.html at real phone widths: it must FIT, not merely not overflow.
 - **`model-terms.py`** - The model gate: the AlphaFold 3 terms dialog, and `?model=` in the URL.
-- **`native_worker.py`** - The CUDA backend: LocalFold's native ports folding a page's job, speaking the bridge.
 - **`negate-bundle-tensors.py`** - Negate NAMED tensors in a float32 bundle, in place.
 - **`pack_delta_model.py`** - Store one AlphaFold 2 model as a DELTA on another, at three bits a weight.
 - **`pae-from-distogram.py`** - Can a PAE matrix be estimated from a distogram and a structure?

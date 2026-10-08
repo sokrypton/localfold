@@ -17,7 +17,7 @@ describe("DEFAULT_MANIFEST", () => {
   it("carries the template single features, float32, in a section of their own", () => {
     // AF2 monomer turns a template's torsion angles into MSA rows through
     // these two layers; without them 5CAJ with its own crystal folds to 2.53 A
-    // against 0.22 (native/af2). A section of their own, so nothing that reads
+    // against 0.22 (cuda/af2). A section of their own, so nothing that reads
     // templateEmbedding meets them.
     const params = DEFAULT_MANIFEST.templateSingle.parameters;
     const shapes = {

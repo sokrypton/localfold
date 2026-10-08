@@ -125,5 +125,5 @@ tools/_*.py
 # by using the page rather than by developing it.
 /py2dmol_state_*.json
 /_merge_state.json
-# af3-any-model's published blobs, fetched for the CUDA ports (native/fetch_bundles.py --af3-any-model)
+# af3-any-model's published blobs, fetched for the CUDA ports (cuda/fetch_bundles.py --af3-any-model)
 /af3am-*

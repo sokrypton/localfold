@@ -503,7 +503,7 @@ export function base64ToBytes(text) {
 /**
  * Which implementation folds on the runtime: this page's WebGPU fold, run by
  * the runtime's headless copy of it, LocalFold's native CUDA ports (the same
- * weights and inputs, compiled for the card - tools/native_worker.py), or
+ * weights and inputs, compiled for the card - cuda/worker.py), or
  * af3-any-model on JAX (the reference, and the only one that reaches a TPU).
  * The badge offers the choice when the runtime was started with more than one;
  * see tools/colab_backend.py.
@@ -512,7 +512,7 @@ let backendChoice = "webgpu";
 export const remoteBackendChoice = () => backendChoice;
 // ...and whether a CUDA fold streams its intermediate results to this page while it runs (each trunk pass's
 // contact map, the sampler's frames, AF2's passes with their scores) - the reader's choice, on the badge,
-// because it is this page that draws them. Measured at under 1% of a fold (tools/native_worker.py).
+// because it is this page that draws them. Measured at under 1% of a fold (cuda/worker.py).
 let liveChoice = true;
 export const remoteLiveChoice = () => liveChoice;
 

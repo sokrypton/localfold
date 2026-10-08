@@ -5,7 +5,7 @@
 🔴 `test:colab` NEVER REACHES `Worker.fold`. Its worker is a stub, because that
 gate is about the feed - so a name clash in the worker's template bookkeeping
 crashed every templated JAX fold and was caught only by a TPU on Colab. This
-drives tools/jax_worker.py itself, over its own stdin/stdout protocol, against
+drives jax/worker.py itself, over its own stdin/stdout protocol, against
 af3-any-model installed here exactly as the notebook installs it on Colab:
 
     uv venv --python 3.13 ~/.venv-lfjax
@@ -163,7 +163,7 @@ def main():
         ("esmfold2 600M, 6MRR", mrr_job, mrr_rows, ef2,
          lambda r, d: None if d < 3 else f"{d:.2f} A - is the language model reaching it?", mrr),
         # 🔴 AND A SECOND ESMFold2 FOLD, BECAUSE THE FIRST ONE'S ROTARY TABLES WERE BAKED INTO THE
-        # LIVE SAMPLER'S CACHED STEP (see patch_staged in tools/jax_worker.py): any later fold of
+        # LIVE SAMPLER'S CACHED STEP (see patch_staged in jax/worker.py): any later fold of
         # another size died with "mul got incompatible shapes", and one of the SAME size folded
         # silently with the first molecule's conformer - the same-size arm is checked after the loop
         ("esmfold2 600M, barstar (another size)", barstar_job, barstar_rows, ef2,
@@ -179,7 +179,7 @@ def main():
     # runtime - which starts empty - folded all five.
     env = {**os.environ, "AF3_WEIGHTS_DIR": os.path.join(args.jax_dir, "weights")}
     def start():
-        return subprocess.Popen([args.python, os.path.join(ROOT, "tools/jax_worker.py")],
+        return subprocess.Popen([args.python, os.path.join(ROOT, "jax/worker.py")],
                                 cwd=args.jax_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, env=env)
 
