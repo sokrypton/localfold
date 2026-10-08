@@ -30,9 +30,9 @@ void triangleOut(const TP* prod, const float* sc, const float* of, const half* W
                  int L, int Lp) {
   triangleOutRun<256, WARPS, TP>(prod, sc, of, Wout, t2, pair, L, Lp);
 }
-template <int WARPS, class TA, int XROUNDS = 1>
+template <int WARPS, class TA, int XROUNDS = 1, int MT = 1>
 void triIn256Form(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
-  constexpr int C = 256, R = 16 * WARPS;
+  constexpr int C = 256, R = 16 * WARPS * MT;
   size_t pp = (size_t)np * np, smem = XROUNDS == 1 ? (size_t)R * (C + 8) * 2 : triIn256Smem<TA>(C, WARPS, XROUNDS);
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", C, {{"f/" + Tn + "projection", 2 * C, false},
                                                                    {"f/" + Tn + "gate", 2 * C, false}});
@@ -40,13 +40,26 @@ void triIn256Form(const float* pair, const float* mask, const std::string& Tn, T
   tileTriIn(Wh(pg), Fh(Tn + "gatingLinear"), C, 16, wt);
   WITH_PAIR_T(                    // (the pair f32, or bf16 under PAIR16: see trunk.cuh's EF2_P16)
     static bool attr = false;
-    if (!attr) { smemAttr((triIn256K<C, WARPS, TA, XROUNDS, false, PT>), (int)smem); attr = true; }
-    triIn256K<C, WARPS, TA, XROUNDS, false, PT><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+    if (!attr) { smemAttr((triIn256K<C, WARPS, TA, XROUNDS, false, PT, MT>), (int)smem); attr = true; }
+    triIn256K<C, WARPS, TA, XROUNDS, false, PT, MT><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       pair, mask, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"), wt, a, b, t2, n, np, cs));
 }
-// the 8-warp form where it fits, else the T4's
+// the 8-warp form where it fits, else the T4's - and where an SM holds two blocks of it, 4 warps of two 16-row tiles
+// each (the same 128 rows, shared memory and grid): each weight fragment then feeds two warps' worth of MMAs, the
+// kernel being shared-memory bound (Nsight Compute at 988 tokens: the shared wavefronts 68% -> 40% of peak).
+// triIn256K 742 -> 714 ms of a 988-token fold, 185.7 -> 178.0 at 494, 61.3 -> 59.8 at 261, flat at 195;
+// byte-identical (each output's k order unchanged). 8 warps of two tiles - one block an SM - lost (786): nothing
+// then overlaps a block's LN prologue. A part holding one block (an L4, an RTX card: ~100 KB an SM) would lose
+// half its warps, unmeasured, so it keeps the one-tile form. LOCALFOLD_TRIIN_FORM=1/2 forces it.
 template <class TA>
 void triIn256(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
-  if (fused256Big()) triIn256Form<8, TA>(pair, mask, Tn, a, b, t2, n, np, cs);
+  static const bool twoTiles = [] {
+    if (const char* e = getenv("LOCALFOLD_TRIIN_FORM")) return atoi(e) == 2;
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    return (size_t)perSm >= 2 * (TRI_IN256_SMEM + 1024);          // (1 KB a block the driver reserves)
+  }();
+  if (fused256Big() && twoTiles) triIn256Form<4, TA, 1, 2>(pair, mask, Tn, a, b, t2, n, np, cs);
+  else if (fused256Big()) triIn256Form<8, TA>(pair, mask, Tn, a, b, t2, n, np, cs);
   else triIn256Form<16, TA, 8>(pair, mask, Tn, a, b, t2, n, np, cs);
 }

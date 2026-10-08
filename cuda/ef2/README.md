@@ -307,6 +307,16 @@ What made them pay, each measured:
   channel-major product tile and normalises them on the way, so there is no f16 row buffer.
 - **Shared memory recycled.** The weight stages reuse the memory of rows already loaded into
   registers, so two blocks fit an SM: `triIn256K` 110 → 89 ms.
+- **Two row tiles a warp (2026-10-08).** Nsight Compute had `triIn256K` bound on shared memory at 988
+  tokens (the shared wavefronts 68% of peak, the tensor pipe 57%), because each weight fragment it reads
+  fed one warp's 16 rows. Four warps of two 16-row tiles - the same 128 rows, shared memory and grid -
+  feed two MMAs per fragment: **742 → 714 ms of a 988-token fold**, 185.7 → 178.0 at 494, 61.3 → 59.8
+  at 261, flat at 195, byte-identical. Only 4%, because what is left is not arithmetic: the shared
+  wavefronts fell to 40% and the tensor pipe rose only to 59%, the rest being each block's LN prologue
+  and the per-step a/b write-out with its two barriers. Eight warps of two tiles (one block an SM, so
+  nothing overlaps a block's prologue) lost at 786; the existing GEMM form (`triingemm.cuh`) reached 706
+  but its separate LN pass costs 141. Taken where an SM holds two blocks (an A100 or H100); an L4 or
+  RTX card holds one and keeps the one-tile form, unmeasured. `LOCALFOLD_TRIIN_FORM=1/2` forces it.
 - **Coalesced epilogue.** `triangleOutK` stages its output chunk and writes 16 bytes a thread:
   145 → 83 ms.
 - **But not always.** The same staging in `transitionUpK` cost it an SM's second block and was

@@ -383,7 +383,10 @@ template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int x
 // for 16. Every row is normed exactly as before (lnRowsToShared's per-row arithmetic), so byte-identical.
 // BIAS: AlphaFold 2's projections carry biases (triInK's layout: [4C, projection | gate in Wpg's order][C, the
 // gating linear's]); without it the kernel is the one AF3's lineage and ESMFold2 run
-template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false, class PT = float>
+// MT: a warp's row tiles of 16 (its LN'd rows held as MT tiles of A fragments): each weight fragment read from
+// shared memory then feeds MT MMAs where it fed one - the kernel was shared-memory bound (Nsight Compute at 988
+// tokens: the LSU's shared wavefronts 68% of peak, the tensor pipe 57%). Each output's k order is unchanged.
+template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false, class PT = float, int MT = 1>
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
     TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs,
@@ -392,7 +395,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   // (sw): the padded 48-byte rows kept ldmatrix conflict-free but serialised the cp.async writes ~6.7x
   // (ncu: 40% of the kernel's shared wavefronts excessive, all of them those four LDGSTS); swizzled,
   // both are conflict-free - 87.9 -> 84.7 ms of ESMFold2's 5CAJ trunk, byte-identical
-  constexpr int NC = 16, CH = NC / 2, R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, LDW = NC, KS = C / 16, LDT = R + 8;
+  static_assert(MT == 1 || XROUNDS == 1, "row tiles a warp, or rounds - not both");
+  constexpr int NC = 16, CH = NC / 2, R = 16 * WARPS * MT, NTH = 32 * WARPS, LDX = C + 8, LDW = NC, KS = C / 16, LDT = R + 8;
   auto sw = [](int k, int c) { return stageSw<NC>(k, c); };
   constexpr size_t STAGE = (size_t)2 * C * LDW * 2;
   // (the stages and the a/b staging take the rows' memory once the rows are fragments: the launch gives the
@@ -433,12 +437,14 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 #if LF_REG_STAGES
   RegStage<2 * ITER> next;            // (sm_75: the next step's tiles held in registers across this step's MMAs)
 #endif
-  uint32_t xa[KS][4];
+  uint32_t xa[MT][KS][4];
   if constexpr (XROUNDS == 1) {
     lnRowsToShared<C, R, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
     __syncthreads();
 #pragma unroll
-    for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+      for (int ks = 0; ks < KS; ++ks) ldsm4(xa[mt][ks], Xs + ((warp * MT + mt) * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
     __syncthreads();                    // every warp has its fragments: the stages take the rows' memory
     issue(0, 0);
   } else {
@@ -451,14 +457,18 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
       __syncthreads();
       if (warp * 16 / XR == rd) {
 #pragma unroll
-        for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 - rd * XR + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+        for (int ks = 0; ks < KS; ++ks) ldsm4(xa[0][ks], Xs + (warp * 16 - rd * XR + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
       }
       __syncthreads();                  // the round's warps have their fragments: the next round's rows go there
     }
   }
-  int lr0 = warp * 16 + g, lr1 = lr0 + 8;
-  size_t pr0 = pairOf(row0 + lr0), pr1 = pairOf(row0 + lr1);
-  float m0 = pr0 != SIZE_MAX ? mask[pr0] : 0.f, m1 = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
+  int lr0[MT], lr1[MT]; float m0[MT], m1[MT];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt) {
+    lr0[mt] = (warp * MT + mt) * 16 + g; lr1[mt] = lr0[mt] + 8;
+    size_t pr0 = pairOf(row0 + lr0[mt]), pr1 = pairOf(row0 + lr1[mt]);
+    m0[mt] = pr0 != SIZE_MAX ? mask[pr0] : 0.f; m1[mt] = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
+  }
   for (int j = 0; j < steps; ++j) {
     int st = j & 1;
 #if LF_REG_STAGES
@@ -470,46 +480,55 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     __syncthreads();
     bool gating = j >= abSteps;
     const half *w0 = W0(st), *w1 = W1(st);
-    float p[NC / 8][4] = {}, q[NC / 8][4] = {};
+    float p[MT][NC / 8][4] = {}, q[MT][NC / 8][4] = {};
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
       int k = ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), c = (lane >> 4) * 8;
       uint32_t f0[4];
       ldsm4t(f0, w0 + sw(k, c));
-      mma16816(p[0], xa[ks], f0[0], f0[1]); mma16816(p[1], xa[ks], f0[2], f0[3]);
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) { mma16816(p[mt][0], xa[mt][ks], f0[0], f0[1]); mma16816(p[mt][1], xa[mt][ks], f0[2], f0[3]); }
       uint32_t f1[4];
       ldsm4t(f1, w1 + sw(k, c));
-      mma16816(q[0], xa[ks], f1[0], f1[1]); mma16816(q[1], xa[ks], f1[2], f1[3]);
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) { mma16816(q[mt][0], xa[mt][ks], f1[0], f1[1]); mma16816(q[mt][1], xa[mt][ks], f1[2], f1[3]); }
     }
     if constexpr (BIAS) {
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
         int col = gating ? 4 * C + 2 * (j - abSteps) * NC + nt * 8 + tig * 2 : j * NC + nt * 8 + tig * 2;
         int qcol = gating ? col + NC : 2 * C + col;          // the second gating tile, or the gate's columns
         float b0 = bias[col], b1 = bias[col + 1], g0 = bias[qcol], g1 = bias[qcol + 1];
-        p[nt][0] += b0; p[nt][1] += b1; p[nt][2] += b0; p[nt][3] += b1;
-        q[nt][0] += g0; q[nt][1] += g1; q[nt][2] += g0; q[nt][3] += g1;
+        p[mt][nt][0] += b0; p[mt][nt][1] += b1; p[mt][nt][2] += b0; p[mt][nt][3] += b1;
+        q[mt][nt][0] += g0; q[mt][nt][1] += g1; q[mt][nt][2] += g0; q[mt][nt][3] += g1;
       }
     }
     if (gating) {
       int c0 = 2 * (j - abSteps) * NC;                         // p the first tile's columns, q the second's
 #pragma unroll
+      for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
         int c = c0 + nt * 8 + tig * 2;
-        if (row0 + lr0 < pp) *reinterpret_cast<half2*>(t2 + (row0 + lr0) * C + c) = __floats2half2_rn(p[nt][0], p[nt][1]);
-        if (row0 + lr1 < pp) *reinterpret_cast<half2*>(t2 + (row0 + lr1) * C + c) = __floats2half2_rn(p[nt][2], p[nt][3]);
-        if (row0 + lr0 < pp) *reinterpret_cast<half2*>(t2 + (row0 + lr0) * C + c + NC) = __floats2half2_rn(q[nt][0], q[nt][1]);
-        if (row0 + lr1 < pp) *reinterpret_cast<half2*>(t2 + (row0 + lr1) * C + c + NC) = __floats2half2_rn(q[nt][2], q[nt][3]);
+        size_t ra = row0 + lr0[mt], rb = row0 + lr1[mt];
+        if (ra < pp) *reinterpret_cast<half2*>(t2 + ra * C + c) = __floats2half2_rn(p[mt][nt][0], p[mt][nt][1]);
+        if (rb < pp) *reinterpret_cast<half2*>(t2 + rb * C + c) = __floats2half2_rn(p[mt][nt][2], p[mt][nt][3]);
+        if (ra < pp) *reinterpret_cast<half2*>(t2 + ra * C + c + NC) = __floats2half2_rn(q[mt][nt][0], q[mt][nt][1]);
+        if (rb < pp) *reinterpret_cast<half2*>(t2 + rb * C + c + NC) = __floats2half2_rn(q[mt][nt][2], q[mt][nt][3]);
       }
     } else {
       // column 2ch is a's channel ch, 2ch+1 b's: the thread's columns nt*8 + 2 tig are channel nt*4 + tig
 #pragma unroll
+      for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
       for (int nt = 0; nt < NC / 8; ++nt) {
         int ch = nt * 4 + tig;
-        Ta[ch * LDT + lr0] = TA(p[nt][0] * sigmH(q[nt][0]) * m0);
-        Tb[ch * LDT + lr0] = TA(p[nt][1] * sigmH(q[nt][1]) * m0);
-        Ta[ch * LDT + lr1] = TA(p[nt][2] * sigmH(q[nt][2]) * m1);
-        Tb[ch * LDT + lr1] = TA(p[nt][3] * sigmH(q[nt][3]) * m1);
+        Ta[ch * LDT + lr0[mt]] = TA(p[mt][nt][0] * sigmH(q[mt][nt][0]) * m0[mt]);
+        Tb[ch * LDT + lr0[mt]] = TA(p[mt][nt][1] * sigmH(q[mt][nt][1]) * m0[mt]);
+        Ta[ch * LDT + lr1[mt]] = TA(p[mt][nt][2] * sigmH(q[mt][nt][2]) * m1[mt]);
+        Tb[ch * LDT + lr1[mt]] = TA(p[mt][nt][3] * sigmH(q[mt][nt][3]) * m1[mt]);
       }
       __syncthreads();
 #pragma unroll
