@@ -1198,9 +1198,50 @@ inline double distogramChange(Trunk& t, int pass) {
   CK(cudaStreamSynchronize(STREAM));
   return pass == 0 ? -1 : std::sqrt(sum / pairs);
 }
+// 🔴 THE CONTACT THRESHOLDS, CUT AGAINST THIS MODEL'S OWN DISTOGRAM. The exporter sends each token's contact
+// class (shared/af3/featurise/contact-classes.js) and the bins are counted here, by the page's rule
+// (shared/heads/contact-threshold.js contactBinsByPair, af3ContactBins) over THIS bundle's bin count - which
+// differs by family (64; rosettafold3 65; OpenDDE 96). It used to be counted in the exporter against
+// AlphaFold 3's float32 bundle whatever folded, so OpenDDE's and rf3's contact maps were cut on a 64-bin grid.
+constexpr int CONTACT_CLASSES = 23;          // nucleic, ligand, the 20 amino acids in AF3 order, other protein
+inline float contactAngstroms(int a, int b) {
+  static const float LIGAND_PROTEIN[20] = {5, 8, 7, 7, 6, 7, 7, 5, 8, 6, 7, 7, 8, 8, 6, 6, 6, 7, 8, 6};
+  auto kind = [](int c) { return c == 0 ? 0 : c == 1 ? 1 : 2; };       // nucleic, ligand, protein
+  int ka = kind(a), kb = kind(b);
+  if (ka == 1 && kb == 2 && b >= 2 && b < 22) return LIGAND_PROTEIN[b - 2];
+  if (kb == 1 && ka == 2 && a >= 2 && a < 22) return LIGAND_PROTEIN[a - 2];
+  static const float BY_KIND[3][3] = {{9, 7, 10}, {7, 5, 7}, {10, 7, 8}};   // [nucleic, ligand, protein]^2
+  return BY_KIND[ka][kb];
+}
+__global__ void contactBinsK(const int* classes, const int* table, int* out, int n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * n) return;
+  out[t] = table[classes[t / n] * CONTACT_CLASSES + classes[t % n]];
+}
+inline const int* contactBinsDevice(int n, int bins) {
+  // AF3's distogram breaks (shared/af3/trunk/distogram-bins.js binEdges), as float32, for `bins` bins
+  std::vector<float> breaks(bins - 1);
+  for (int i = 0; i < bins - 1; ++i) breaks[i] = (float)(2.3125 + (21.6875 - 2.3125) * i / (double)(bins - 2));
+  double spacing = (double)breaks[bins - 2] - (double)breaks[bins - 3];
+  auto top = [&](int bin) { return bin < bins - 1 ? (double)breaks[bin] : (double)breaks[bins - 2] + spacing; };
+  std::vector<int> table(CONTACT_CLASSES * CONTACT_CLASSES);
+  for (int a = 0; a < CONTACT_CLASSES; ++a)
+    for (int b = 0; b < CONTACT_CLASSES; ++b) {
+      double angstroms = contactAngstroms(a, b);
+      int count = 0;
+      while (count <= bins - 1 && top(count) <= angstroms + 1e-3) ++count;
+      table[a * CONTACT_CLASSES + b] = count;
+    }
+  int* tableDev = scratch<int>("contact.table", table.size());
+  CK(cudaMemcpyAsync(tableDev, table.data(), table.size() * sizeof(int), cudaMemcpyHostToDevice, STREAM));
+  int* out = scratch<int>("contact.bins", (size_t)n * n);
+  contactBinsK<<<blocks((size_t)n * n), 256, 0, STREAM>>>(Idev("batch.contactClasses"), tableDev, out, n);
+  return out;
+}
 inline std::vector<float> contactProbabilities(Trunk& t) {
-  if (!M.has("batch.contactBins")) return {};
+  if (!M.has("batch.contactClasses")) return {};
   int bins = (int)M.meta("trunk.distogram.bins");
+  const int* contactBins = contactBinsDevice(t.n, bins);
   size_t pairs = (size_t)t.n * t.n;
   float* out = scratch<float>("disto.contact", pairs);
   if (shortPair(pairs, t.C)) {
@@ -1219,14 +1260,14 @@ inline std::vector<float> contactProbabilities(Trunk& t) {
       distogramHalf(rowsT, b, rows, C, bins);
       addK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, b, rows * bins);
       if (distogramSymScale() != 1.f) scaleK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, distogramSymScale(), rows * bins);
-      contactProbsK<<<blocks(rows), 256, 0, STREAM>>>(a, Idev("batch.contactBins") + r0 * n, t.pairMask + r0 * n,
+      contactProbsK<<<blocks(rows), 256, 0, STREAM>>>(a, contactBins + r0 * n, t.pairMask + r0 * n,
                                                       out + r0 * n, rows, bins);
     }
     return download(out, pairs);
   }
   float* logits = scratch<float>("disto.logits", pairs * bins);
   distogram(t, logits);
-  contactProbsK<<<blocks(pairs), 256, 0, STREAM>>>(logits, Idev("batch.contactBins"), t.pairMask, out, pairs, bins);
+  contactProbsK<<<blocks(pairs), 256, 0, STREAM>>>(logits, contactBins, t.pairMask, out, pairs, bins);
   return download(out, pairs);
 }
 

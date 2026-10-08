@@ -294,14 +294,12 @@ if (dialect?.chaiTokenEmbedding === true && batch.esmEmbeddings === undefined) {
   const e = esm2Inputs(batch);
   add("esm.ids", e.ids); add("esm.chainLengths", e.chainLengths); add("esm.tokenRow", e.tokenRow);
 }
-// the distogram's contact bins per token pair (shared/af3/featurise/contact-classes.js), as the page
-// reads contact_probs off the distogram: the bin count is the bundle's
+// each token's contact class (shared/af3/featurise/contact-classes.js); the binary counts the page's contact
+// thresholds in bins against its OWN distogram (cuda/af3/src/trunk.cuh, contactBinsDevice) - the bin count is the
+// model's (64, rf3 65, OpenDDE 96), and counting it here against one bundle cut every family on AF3's grid
 {
-  const { af3ContactClasses, af3ContactBins } = await import(`${repo}/shared/af3/featurise/contact-classes.js`);
-  const { binEdges } = await import(`${repo}/shared/af3/trunk/distogram-bins.js`);
-  const manifest = JSON.parse(Buffer.from(await (await fetch(bundle)).arrayBuffer()).toString("utf8"));
-  const shape = manifest?.tensors?.["diffuser/distogram_head/half_logits/weights"]?.shape;
-  if (shape) add("batch.contactBins", af3ContactBins(af3ContactClasses(batch, batch.tokens), batch.tokens, binEdges(shape[1])));
+  const { af3ContactClasses } = await import(`${repo}/shared/af3/featurise/contact-classes.js`);
+  add("batch.contactClasses", af3ContactClasses(batch, batch.tokens));
 }
 // OpenDDE's second token space: after the trunk each standard residue becomes a backbone and a
 // sidechain token, and the diffusion and its confidence head run on those (webgpu/af3/fold.js)

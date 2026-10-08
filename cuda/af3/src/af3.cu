@@ -323,7 +323,7 @@ int main(int argc, char** argv) {
     // --frames: each pass's contact map too (the page shows the trunk's after every recycle, before the
     // sampler has a structure), computed on the device, quantised to a byte a pair and tapped (AsyncTap):
     // contacts-PP-of-NN.u8, n*n bytes, probability * 255
-    const bool tapContacts = !framesDir.empty() && M.has("batch.contactBins");
+    const bool tapContacts = !framesDir.empty() && M.has("batch.contactClasses");
     // chai-1 counts its recycles as TOTAL passes (chai-lab's num_trunk_recycles, af3-any-model's num_trunk_passes),
     // where AlphaFold 3's are passes after the first: the page's 3 is chai-lab's own default of 3 passes
     const int lastPass = M.flag("trunk.dialect.recycleFromInit") ? std::max(1, recycles) - 1 : recycles;
@@ -335,7 +335,7 @@ int main(int argc, char** argv) {
       float* logits = scratch<float>("disto.logits", pairs * bins);
       distogram(t, logits);
       float* probs = scratch<float>("disto.contact", pairs);
-      contactProbsK<<<blocks(pairs), 256, 0, STREAM>>>(logits, Idev("batch.contactBins"), t.pairMask, probs, pairs, bins);
+      contactProbsK<<<blocks(pairs), 256, 0, STREAM>>>(logits, contactBinsDevice(t.n, bins), t.pairMask, probs, pairs, bins);
       unsigned char* bytes = scratch<unsigned char>("disto.contact8", pairs);
       quantiseK<<<blocks(pairs), 256, 0, STREAM>>>(probs, bytes, pairs, 1.f / 255);
       std::string path = framesDir + "/contacts-" + (pass < 10 ? "0" : "") + std::to_string(pass) + "-of-"
