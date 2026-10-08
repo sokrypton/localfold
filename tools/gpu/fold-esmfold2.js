@@ -31,6 +31,7 @@ import {
 import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair.js";
 import { weightedRigidAlign } from "../../cpu/esmfold2/sampler.js";
 import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
+import { nameSmilesLigands, smilesComponent } from "../../shared/chem/component.js";
 import { toDensePositions } from "../../shared/esmfold2/featurise.js";
 import { toPdb } from "../../webgpu/af3/fold.js";
 // 🔴 THE SHARED SCORER, NOT A SECOND COPY. `bondGeometry` reads each residue's
@@ -158,6 +159,8 @@ export async function main(device, args = []) {
   // RDKit rather than through mmCIF, and takes the ideal conformer for the same
   // reason.
   const ligandCodes = option(args, "ligands", "").split(",").filter((c) => c !== "");
+  // ...and a ligand by SMILES (`|`-separated), built by shared/chem as the page builds one.
+  const smilesList = option(args, "smiles", "").split("|").filter((c) => c !== "");
   // 🔴 CODE@POSITION, 1-BASED, AS THE PAGE COUNTS. `npm run test:modified`
   // folds a SEP@3 through seven AF3-lineage bundles and could not reach this
   // one - `probe-modified.js` opens an AF3 store and calls `foldBatch` - which
@@ -349,6 +352,8 @@ export async function main(device, args = []) {
     const text = await (await fetch(ccdUrl(code))).text();
     ligands.push(parseCcdComponent(text));
   }
+  const smilesNames = nameSmilesLigands(smilesList);
+  for (const [i, text] of smilesList.entries()) ligands.push(await smilesComponent(text, { code: smilesNames[i] }));
   // ...and a modified residue's component from the same place, for the reason
   // web/af3-model.js gives: the featuriser is synchronous, so a CODE has to
   // become ATOMS before it is called.

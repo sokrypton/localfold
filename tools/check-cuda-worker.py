@@ -17,6 +17,7 @@ Needs the native ports built (cuda/colab_setup.sh, or each port's nvcc line) and
 does not have must come back as a sentence naming it, never as some other fold.
 """
 import json
+import math
 import os
 import re
 import signal
@@ -49,8 +50,21 @@ def job(sequences, ligands=(), modifications=None):
             protein["modifications"] = [{"ptmType": code, "ptmPosition": at} for code, at in modifications[index]]
         entries.append({"protein": protein})
     for code in ligands:
-        entries.append({"ligand": {"id": next(ids), "ccdCodes": [code]}})
+        # a CCD code, or {"smiles": ...} - a structure the page builds with shared/chem
+        entries.append({"ligand": {"id": next(ids), **(code if isinstance(code, dict) else {"ccdCodes": [code]})}})
     return json.dumps({"name": "check", "modelSeeds": [1], "sequences": entries, "dialect": "alphafold3", "version": 1})
+
+
+BIOTIN = "OC(=O)CCCC[C@@H]1SC[C@@H]2NC(=O)N[C@H]12"
+
+
+def ligand_bonds(pdb):
+    """A ligand's bonds as the fold left them: every pair of its heavy atoms under 1.95 A, and the closest pair.
+    🔴 RMSD CANNOT SEE THIS - it is a protein's - and pLDDT reads high over a torn ligand: ESMFold2 at its
+    eleven default steps put biotin's atoms 0.2-0.7 A apart, 18-20 "bonds" for its 17, while its fold passed."""
+    atoms = [tuple(float(line[c:c + 8]) for c in (30, 38, 46)) for line in pdb.splitlines() if line.startswith("HETATM")]
+    pairs = [math.dist(atoms[i], atoms[j]) for i in range(len(atoms)) for j in range(i + 1, len(atoms))]
+    return sum(1 for d in pairs if d < 1.95), min(pairs) if pairs else None
 
 
 def controls(**over):
@@ -112,6 +126,19 @@ def cases(offline):
         # (past 80 tokens: ESMFold2's 256-channel trunk on its fused kernels, cuda/af3/src/fused256.cuh)
         ("esmfold2 5caj", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(s5)], "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 3.0, None, None),
+        # 🔴 A SMILES LIGAND, AND ITS BONDS: biotin (three stereocentres, two fused rings) built by shared/chem,
+        # through AF3 and ESMFold2 - and ESMFold2 tears any ligand at its eleven default steps, the vendor's own
+        # included, so these also hold the step floor for per-atom tokens (ESMFOLD2_ATOMISED_STEPS), CCD and
+        # SMILES alike. The bond check is the expected count and nothing closer than 1 A.
+        ("af3 6mrr + biotin (SMILES)", {"family": "af3", "controls": controls(),
+         "entities": [protein(S6), {"type": "smiles", "value": BIOTIN, "copies": 1}],
+         "job": job([S6], [{"smiles": BIOTIN}]), "ligandBonds": 17}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.5, 68 + 16, None),
+        ("esmfold2 6mrr + biotin (SMILES)", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
+         "entities": [protein(S6), {"type": "smiles", "value": BIOTIN, "copies": 1}],
+         "job": job([S6], [{"smiles": BIOTIN}]), "ligandBonds": 17}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 16, None),
+        ("esmfold2 6mrr + GOL", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
+         "entities": [protein(S6), {"type": "ligand", "value": "GOL", "copies": 1}],
+         "job": job([S6], ["GOL"]), "ligandBonds": 5}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 6, None),
         ("esmfold2 300M 6mrr", {"family": "ef2-fast-300m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         # the page's short schedule (web/af3-model.js diffusionScheduleFor), which the page resolves and sends:
@@ -300,6 +327,8 @@ def main():
     first = json.loads(worker.stdout.readline())
     bad = [] if first.get("kind") == "cuda-ready" else [f"the worker's first line was {first}, not cuda-ready"]
     for name, payload, reference, bar, tokens, refusal in plan:
+        payload = dict(payload)
+        expected_bonds = payload.pop("ligandBonds", None)
         started = time.time()
         worker.stdin.write(json.dumps(payload) + "\n")
         worker.stdin.flush()
@@ -356,6 +385,10 @@ def main():
             problems.append("the progress bar went backwards")
         if "stopping early" in name and "converged at" not in (result.get("status") or ""):
             problems.append("the page's early stop did not stop it (or did not say so)")
+        if expected_bonds is not None:
+            count, closest = ligand_bonds(result.get("pdb") or "")
+            if count != expected_bonds or closest is None or closest < 1.0:
+                problems.append(f"the ligand has {count} bonds (want {expected_bonds}), closest atoms {closest} A")
         rmsd = score(result.get("pdb") or "", *reference)
         if rmsd is None or rmsd > bar:
             problems.append(f"RMSD {rmsd} past {bar} A")

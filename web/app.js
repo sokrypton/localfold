@@ -42,7 +42,7 @@ import { OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
   countsForFamily, diffusionScheduleFor,
   samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
-import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
+import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, esmfold2StepsFor, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../webgpu/esmfold2/fold.js";
 import { spreadOverAtoms, toDensePositions } from "../shared/esmfold2/featurise.js";
@@ -3394,7 +3394,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
  * syncModelControls exists to prevent, and a preset table is exactly the kind
  * of thing that gains a value on the page before it gains one in the code.
  */
-function samplerPreset() {
+function samplerPreset({ atomised = false } = {}) {
   // 🔴 THE MODEL DECIDES THE MODE, NOT THE HIDDEN SELECT. Hiding a control does
   // not change its value - that is what put "unknown model esmfold2" in front
   // of somebody folding an oligomer - so this reads the model's own answer and
@@ -3407,10 +3407,12 @@ function samplerPreset() {
   // threw on it and the message named a sampler called `flow-`, which describes
   // the symptom and not the cause.
   const chosen = document.getElementById("af3-count")?.value;
-  const steps = chosen === undefined || chosen === ""
-    ? String(ESMFOLD2_COUNTS[mode]?.preferred ?? ESMFOLD2_COUNTS.diffusion.preferred)
-    : chosen;
-  const name = `${mode}-${steps}`;
+  const dial = chosen === undefined || chosen === ""
+    ? ESMFOLD2_COUNTS[mode]?.preferred ?? ESMFOLD2_COUNTS.diffusion.preferred
+    : Number(chosen);
+  // ...raised for a ligand or a modified residue, whose per-atom tokens eleven steps leave torn
+  // (ESMFOLD2_ATOMISED_STEPS)
+  const name = `${mode}-${esmfold2StepsFor(dial, { atomised })}`;
   if (SAMPLER_PRESETS[name] === undefined) {
     throw new Error(`no ESMFold2 sampler called ${name}; `
       + `known: ${Object.keys(SAMPLER_PRESETS).join(", ")}`);
@@ -3465,6 +3467,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     modifyWith.push({ chain: modification.chain, position: modification.position,
                       ...parseCcdComponent(await response.text()) });
   }
+  // ...and the sampler, decided once: the fold runs it and the archive records it
+  const sampler = samplerPreset({ atomised: ligands.length > 0 || modifyWith.length > 0 });
   throwIfAborted(signal);
   const loaded = await (modelLoad
     ?? loadEsmfold2Weights(undefined,
@@ -3611,7 +3615,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     confidenceWeights: loaded.confidenceWeights,
     tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
                                loaded.shape.pairChannels),
-    sampler: samplerPreset(),
+    sampler,
     seed: randomSeed(),
     // 🔴 THIS MODEL'S "SINGLE SEQUENCE". Without ESM-C it has no evolutionary
     // information at all - measured on a 76-mer, the fold moves 10.96 A, the
@@ -3843,7 +3847,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       seed: foldContext.settings?.seed,
       "trunk passes": recycleCount() + 1,
       "language model": plmLabel(),
-      sampler: samplerPreset(),
+      sampler,
       "diffusion steps": result.steps,
     },
     // ...and no alignment or template line, rather than "none", which reads as
@@ -3945,8 +3949,14 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   request.backend = remoteBackendChoice();
   // ...and the sampler this page would fold with (samplerPlan): the steps as well as the start, because an
   // empty dial is the family's preferred count here and would be the model's own default there
-  const { calls, schedule } = samplerPlan(family, ligandCodes ?? [], modifications ?? []);
-  request.schedule = { steps: calls, ...schedule };
+  // (ESMFold2's from its own table and floor - samplerPreset - where AlphaFold 3's table would be the wrong one)
+  if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
+    const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
+    request.schedule = { steps: Number(samplerPreset({ atomised }).split("-").pop()) };
+  } else {
+    const { calls, schedule } = samplerPlan(family, ligandCodes ?? [], modifications ?? []);
+    request.schedule = { steps: calls, ...schedule };
+  }
   // ...and whether it streams its intermediate results here (the badge's Live preview)
   request.frames = remoteLiveChoice();
   // ...the RESOLVED model, which is not the row's value where a second row

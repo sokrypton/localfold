@@ -83,6 +83,35 @@ export const ESMFOLD2_COUNTS = {
 export const ESMFOLD2_SAMPLER_MODE = "diffusion";
 
 /**
+ * 🔴 A LIGAND OR A MODIFIED RESIDUE TAKES AT LEAST 64 SCHEDULED STEPS (45 RUN),
+ * NOT THE CHECKPOINT'S 15 (11 RUN). A backbone is converged in eleven steps and
+ * a molecule made of per-atom tokens is not: biotin from its CCD code or its
+ * SMILES comes out with atoms 0.2-0.7 A apart and 18-20 "bonds" for its 17,
+ * on every seed - and so does the VENDOR's own ESMFold2 on the same checkpoint
+ * (esm 3.4.1, three seeds, 0.18-0.70 A), so it is the sampler and not either
+ * port. Scheduled steps, biotin, three seeds each on the WebGPU port:
+ *
+ * | scheduled (run) | biotin bonds | shortest |
+ * |---|---|---|
+ * | 15 (11) | 18-20 of 17 | 0.29-0.43 A |
+ * | 32 (23) | 19 of 17 | 0.51-0.70 A |
+ * | 64 (45) | **17 of 17** | **1.20-1.22 A** |
+ * | 200 (138) | 17 of 17 | 1.22 A |
+ *
+ * and the vendor at 64 and 200 is 17 of 17 at 1.23-1.80 A. Glycerol is placed
+ * the same at 11 and 45 (mean 1.42 A either way) and a phosphoserine is as good
+ * or better (bond ratio 0.949/0.985 at 11, 1.007/0.986 at 45, control 1.00).
+ * The cost is the sampler's: a warm 58-residue fold with a ligand 0.47 -> 0.93 s.
+ * cuda/worker.py applies the same floor to a job it is handed.
+ */
+export const ESMFOLD2_ATOMISED_STEPS = 64;
+
+/** The scheduled step count a fold runs: the dial's, raised to the floor above for per-atom tokens. */
+export function esmfold2StepsFor(asked, { atomised = false } = {}) {
+  return atomised ? Math.max(asked, ESMFOLD2_ATOMISED_STEPS) : asked;
+}
+
+/**
  * How many steps a preset ACTUALLY runs, which is not the number in its name.
  *
  * 🔴 `max_inference_sigma` DROPS EVERY SCHEDULE ENTRY ABOVE 256 AND PREPENDS

@@ -3851,3 +3851,47 @@ A warm 40-token fold was 0.63 s on the A100 (int5) and each of its 11 denoise st
 Warm folds: 40 tokens 0.63 -> 0.38 s, 150 1.16 -> 0.93, 262 2.13 -> 1.93. `check-esmc-tower.js` sits
 closer to its oracle split (worst block 2.6e-6 -> 1.7e-6 against 5e-5); `check-esmfold2-diffusion-gpu.js`
 1.43e-4 / 2.38e-4 either arm.
+
+## 🔴 Eleven steps tear a ligand; a fold with per-atom tokens takes 45 (2026-10-08)
+
+Found asking whether the CUDA backend folds a SMILES ligand. The AF3 lineage
+does (a SMILES glycerol at bond mean 1.454 A against the CCD's 1.459, a SMILES
+biotin with all 17 bonds at 1.23-1.76). ESMFold2 did not - and it was not the
+SMILES, and not the CUDA port, though both looked guilty first:
+
+| biotin, three seeds | bonds (of 17) | closest atoms |
+|---|---|---|
+| CUDA port, SMILES, 11 steps | 20 | 0.30-0.62 A |
+| WebGPU port, SMILES, 11 steps | 20 | 0.17-0.61 A |
+| WebGPU port, CCD `BTN`, 11 steps | 18-19 | 0.29-0.43 A |
+| **the vendor** (`esm` 3.4.1, same checkpoint), CCD and SMILES, 15 scheduled | 18-19 | 0.18-0.70 A |
+| WebGPU, 32 scheduled (23 run) | 19 | 0.51-0.70 A |
+| WebGPU, 64 scheduled (45 run) | **17** | **1.20-1.22 A** |
+| WebGPU 200 / vendor 64 and 200 | 17 | 1.22-1.24 A |
+
+So the checkpoint's own eleven-step sampler cannot hold a fused-ring ligand
+together, on either port or on the reference; a backbone is converged at eleven
+and a molecule made of per-atom tokens is not - AlphaFold 3's lesson
+(docs/AF3.md, bench-sampler-geometry) on a second model. Glycerol is placed the
+same at 11 and 45 (mean ~1.42 A) and a phosphoserine as well or better (bond
+ratio 0.949/0.985 -> 1.007/0.986, control 1.00).
+
+`ESMFOLD2_ATOMISED_STEPS` (web/esmfold2-model.js) is the floor: a job with a
+ligand or a modified residue samples at least 64 scheduled steps. The page
+applies it in `samplerPreset`, sends ESMFold2's own count to a runtime (it sent
+AlphaFold 3's table's, which the worker ignored), and cuda/worker.py now passes
+`--steps` to the ESMFold2 binary and mirrors the floor for a job no page sent.
+Cost: a warm 58-residue fold with a ligand 0.47 -> 0.93 s.
+
+🔴 THE FIRST READING BLAMED THE WRONG THING TWICE. One page fold of biotin came
+back whole, and it was a lucky sample read as the reference - three seeds of the
+same input through the tool were torn. And a "vendor torn too" first number read
+`coords[-n:]`, which on the vendor's PADDED atom axis is padding: glycerol at
+"13 bonds". The ligand is selected by `atom_attention_mask` and its chain.
+
+Gated: `npm run test:cuda` folds a SMILES biotin through AF3 and ESMFold2 and a
+CCD glycerol through ESMFold2, asserting the ligand's bond count and that no two
+atoms sit closer than 1 A (watched failing with the floor at 15: "18 bonds, closest
+atoms 0.258 A"); test/esmfold2-atomised-steps.test.js holds the page's floor and
+the worker's copy to one number. `tools/gpu/fold-esmfold2.js --smiles=` folds a
+SMILES ligand on the WebGPU port.

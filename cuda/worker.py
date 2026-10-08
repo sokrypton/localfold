@@ -30,6 +30,20 @@ import traceback
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 CUDA = os.path.join(REPO, "cuda")
+# ESMFold2's scheduled sampler steps: the checkpoint's own, and the floor for a job with per-atom tokens
+# (web/esmfold2-model.js, ESMFOLD2_COUNTS and ESMFOLD2_ATOMISED_STEPS - the page's numbers, mirrored)
+ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS = 15, 64
+
+
+def atomised_job(text):
+    """Whether an AlphaFold 3 job carries per-atom tokens: a ligand, or a modified residue or base."""
+    spec = json.loads(text)
+    spec = spec[0] if isinstance(spec, list) else spec
+    for entry in spec.get("sequences", []):
+        for kind, body in entry.items():
+            if kind == "ligand" or (isinstance(body, dict) and body.get("modifications")):
+                return True
+    return False
 WORK = os.environ.get("LOCALFOLD_CUDA_WORK", "/tmp/localfold-cuda")
 AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
 # ...whose dialect has no working flow sampler (noFlowSampler, shared/af3/dialect.js)
@@ -569,6 +583,14 @@ class Worker:
                                            "--warm=96,800"], residues)
             self.node([*NODE, os.path.join(CUDA, "esmfold2", "export_input.mjs"), inputs, f"--job={job_path}"], "featurising", log)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
+            # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's
+            # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45
+            # (web/esmfold2-model.js, ESMFOLD2_ATOMISED_STEPS) - applied here too, for a job no page sent
+            steps = int((job.get("schedule") or {}).get("steps") or 0)
+            if atomised_job(job["job"]):
+                steps = max(steps or ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS)
+            if steps:
+                fold.append(f"--steps={steps}")
             total = 0
         emit("progress", 0.15)
         emit("status", f"{family} on CUDA ({self.device}) · folding")
