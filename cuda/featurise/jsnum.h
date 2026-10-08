@@ -17,8 +17,19 @@ inline std::string jsNumber(double v) {
   std::string sign = v < 0 ? "-" : "";
   double a = std::fabs(v);
   char buf[64];
+#ifdef __APPLE__
+  // (std::to_chars for a double needs macOS 13.3's libc++, and the Metal port runs on 13.0: the fewest
+  // significant digits whose correctly rounded decimal reads back as the same double - which is what
+  // to_chars' shortest form is, since printf rounds to the nearest)
+  for (int p = 0; p < 17; ++p) {
+    snprintf(buf, sizeof buf, "%.*e", p, a);
+    if (strtod(buf, nullptr) == a) break;
+  }
+  std::string sci(buf);                           // d[.ddd]e[+-]XX
+#else
   auto r = std::to_chars(buf, buf + sizeof buf, a, std::chars_format::scientific);
   std::string sci(buf, r.ptr);                    // d[.ddd]e[+-]XX
+#endif
   size_t e = sci.find('e');
   std::string mant = sci.substr(0, e);
   int exp10 = std::atoi(sci.c_str() + e + 1);
