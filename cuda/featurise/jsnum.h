@@ -68,6 +68,50 @@ inline double jsParseFloat(const std::string& text) {
   return std::strtod(text.substr(start, i - start).c_str(), nullptr);
 }
 
+// Number.parseInt(text, 10): leading whitespace, a sign, the longest run of digits; NaN where there is none
+inline double jsParseInt(const std::string& text) {
+  size_t i = 0;
+  while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
+  bool negative = false;
+  if (i < text.size() && (text[i] == '+' || text[i] == '-')) negative = text[i++] == '-';
+  size_t start = i;
+  while (i < text.size() && std::isdigit((unsigned char)text[i])) ++i;
+  if (i == start) return NAN;
+  double v = std::strtod(text.substr(start, i - start).c_str(), nullptr);
+  return negative ? -v : v;
+}
+
+// Number(text): the whole string, trimmed, must be a number - "" and blanks are 0, anything else NaN
+inline double jsNumberOf(const std::string& text) {
+  size_t a = 0, b = text.size();
+  auto ws = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; };
+  while (a < b && ws(text[a])) ++a;
+  while (b > a && ws(text[b - 1])) --b;
+  std::string t = text.substr(a, b - a);
+  if (t.empty()) return 0;
+  if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) {
+    for (size_t i = 2; i < t.size(); ++i) if (!std::isxdigit((unsigned char)t[i])) return NAN;
+    return (double)std::stoull(t.substr(2), nullptr, 16);
+  }
+  size_t i = 0;
+  if (t[i] == '+' || t[i] == '-') ++i;
+  if (t.compare(i, std::string::npos, "Infinity") == 0) return t[0] == '-' ? -INFINITY : INFINITY;
+  size_t d = i;
+  while (i < t.size() && std::isdigit((unsigned char)t[i])) ++i;
+  bool any = i > d;
+  if (i < t.size() && t[i] == '.') { ++i; size_t f = i; while (i < t.size() && std::isdigit((unsigned char)t[i])) ++i; any = any || i > f; }
+  if (!any) return NAN;
+  if (i < t.size() && (t[i] == 'e' || t[i] == 'E')) {
+    ++i;
+    if (i < t.size() && (t[i] == '+' || t[i] == '-')) ++i;
+    size_t e = i;
+    while (i < t.size() && std::isdigit((unsigned char)t[i])) ++i;
+    if (i == e) return NAN;
+  }
+  if (i != t.size()) return NAN;
+  return std::strtod(t.c_str(), nullptr);
+}
+
 // Math.round: halves toward +Infinity
 inline double jsRound(double v) { double c = std::ceil(v); return c - 0.5 <= v ? c : c - 1.0; }   // Math.round, as V8 rounds
 

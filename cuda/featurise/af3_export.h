@@ -20,11 +20,10 @@
 #include "msa.h"
 #include "pdb.h"
 #include "tables.h"
+#include "templates.h"
 
 namespace lf {
 
-// the template stage (templates.h): fills the passes; unset, a job with a template is refused
-struct Af3TemplateInput;
 
 struct Args {
   std::vector<std::string> list;
@@ -84,10 +83,215 @@ struct Af3Export {
   std::vector<std::string> said;   // what the JavaScript exporter prints (the worker reads template coverage off it)
 };
 
-inline Af3Export exportAf3(const Args& args,
-                           const std::function<void(Af3Export&, const Batch&, const FamilyFlags&, const std::vector<std::string>& chains,
-                                                    const std::vector<std::vector<JobTemplate>>& jobTemplates,
-                                                    const Expanded* request)>& templates = nullptr) {
+// The exporter's template stage: --template slots and the job's own templates, each part by buildTemplate (every
+// chain's k-th in slot k, merged), rf3's stereocentres, then the embedder's passes - a repeat and an aatype each, and
+// either a fused embedder's sparse feature rows or the nine-projection embedder's geometry - and their totals
+struct TemplatePart { std::string text; bool hasChain = false; std::string chain; int queryChain = 0; std::string label;
+                      bool hasMapping = false; std::vector<std::pair<int, int>> mapping; };
+inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, const FamilyFlags& D, const std::vector<std::string>& chains,
+                         const std::vector<std::vector<JobTemplate>>& jobTemplates, const Expanded* request) {
+  Entries& E = out.entries;
+  const int TEMPLATES = 4;
+  int tokens = batch.tokens;
+  // which token each chain's residue occupies (a modified residue or ligand shifts them)
+  std::vector<int> tokenOfResidue(batch.chainOfResidue.size(), -1);
+  for (int t = 0; t < tokens; ++t) {
+    int r = batch.residueOfToken[t];
+    if (r >= 0 && tokenOfResidue[r] == -1) tokenOfResidue[r] = t;
+  }
+  std::vector<std::vector<int>> residuesOfChain;
+  for (size_t r = 0; r < batch.chainOfResidue.size(); ++r) {
+    int c = (int)batch.chainOfResidue[r];
+    if ((int)residuesOfChain.size() <= c) residuesOfChain.resize(c + 1);
+    residuesOfChain[c].push_back((int)r);
+  }
+  struct SlotMask { TemplateSlot slot; std::vector<float> mask; };
+  std::vector<SlotMask> slots;
+  auto buildPart = [&](const TemplatePart& p, int k) {
+    std::function<int(int)> tokenOf = [&, chain = p.queryChain](int residue) {
+      if (chain < 0 || chain >= (int)residuesOfChain.size() || residue < 0 || residue >= (int)residuesOfChain[chain].size()) return -1;
+      int r = residuesOfChain[chain][residue];
+      return r >= 0 && r < (int)tokenOfResidue.size() ? tokenOfResidue[r] : -1;
+    };
+    BuildOptions o;
+    o.text = p.text;
+    o.chain = p.hasChain ? &p.chain : nullptr;
+    o.query = p.queryChain >= 0 && p.queryChain < (int)chains.size() ? chains[p.queryChain] : "";
+    o.tokens = tokens;
+    o.tokenOf = &tokenOf;
+    o.mapping = p.hasMapping ? &p.mapping : nullptr;
+    Built b = buildTemplate(o);
+    out.said.push_back("template " + std::to_string(k) + ": " + p.label + " -> query chain " + std::to_string(p.queryChain) + ", "
+                       + std::to_string(b.residues) + "/" + std::to_string(b.of) + " residues" + (p.hasMapping ? " (the job's mapping)" : ""));
+    return b.slot;
+  };
+  // --template=<file>:<chain>[@<query chain>], comma-separated slots, "+"-joined parts sharing one
+  auto specs = splitNonEmpty(args.option("template"), ',');
+  if ((int)specs.size() > TEMPLATES) throw std::runtime_error("at most four template slots");
+  for (size_t k = 0; k < specs.size(); ++k) {
+    std::vector<TemplateSlot> parts;
+    for (auto& part : splitOn(specs[k], '+')) {
+      auto at = part.find('@');
+      std::string where = part.substr(0, at), target = at == std::string::npos ? "0" : part.substr(at + 1);
+      size_t cut = where.rfind(':');
+      TemplatePart p;
+      // (as the JavaScript slices it: with no ":", the path loses its last character and the chain is all of it)
+      std::string path = cut == std::string::npos ? where.substr(0, where.empty() ? 0 : where.size() - 1) : where.substr(0, cut);
+      std::string chainId = cut == std::string::npos ? where : where.substr(cut + 1);
+      p.text = readFile(path);
+      p.hasChain = !chainId.empty(); p.chain = chainId;
+      p.queryChain = (int)jsNumberOf(target);
+      p.label = path + " chain " + (p.hasChain ? chainId : "undefined");
+      parts.push_back(buildPart(p, (int)k));
+    }
+    TemplateSlot slot = parts.size() == 1 ? parts[0] : mergeTemplateSlots(parts);
+    bool spanChains = parts.size() > 1 && !args.has("no-span-chains");
+    std::vector<float> coverage = coverageOf(slot, tokens);
+    slots.push_back({slot, multichainMaskFor(batch.asymId, tokens, &coverage, spanChains)});
+  }
+  // a job's own templates: every chain's k-th in slot k, each with the job's mapping where it gives one
+  std::vector<std::vector<TemplatePart>> extra;
+  if (!jobTemplates.empty()) {
+    if (!specs.empty()) throw std::runtime_error("the job carries its templates; --template would replace them");
+    for (auto& list : jobTemplates) {
+      std::vector<TemplatePart> parts;
+      for (auto& t : list) {
+        TemplatePart p;
+        p.text = t.text; p.queryChain = t.chain; p.label = t.label; p.hasMapping = t.hasMapping; p.mapping = t.mapping;
+        parts.push_back(p);
+      }
+      extra.push_back(parts);
+    }
+  }
+  if (request)
+    for (auto& [chain, t] : request->templates)
+      if (t.kind != "upload" && !args.has("search-templates"))
+        throw std::runtime_error("chain " + std::to_string(chain) + ": the job asks for a template search - run with --search-templates,"
+                                 " or give the structure with --template=<file>:<chain>@<query chain>");
+  if (args.has("search-templates") || !args.option("template-search-chains").empty())
+    throw std::runtime_error("the native featuriser's template search is not built yet");
+  for (size_t k = 0; k < extra.size(); ++k) {
+    std::vector<TemplateSlot> parts;
+    for (auto& p : extra[k]) parts.push_back(buildPart(p, (int)k));
+    TemplateSlot slot = parts.size() == 1 ? parts[0] : mergeTemplateSlots(parts);
+    std::vector<float> coverage = coverageOf(slot, tokens);
+    slots.push_back({slot, multichainMaskFor(batch.asymId, tokens, &coverage, false)});
+  }
+  if (D.chiralCentres) addChiralCentres(E, batch);
+
+  bool fused = D.fusedDistogramBins > 0 || D.boltz2TemplateFeatures || D.rosettafold3TemplateFeatures;
+  int width = D.boltz2TemplateFeatures ? 109 : D.rosettafold3TemplateFeatures ? 66
+            : D.fusedDistogramBins > 0 ? D.fusedDistogramBins + 1 + 2 * D.fusedRestypes + 4 : 0;
+  if ((int)slots.size() > TEMPLATES)
+    throw std::runtime_error(std::to_string(slots.size()) + " template slots; every family folds with at most " + std::to_string(TEMPLATES));
+  // a real slot's dense feature rows (fusedTemplateFeatures with a template)
+  auto rowsFor = [&](const SlotMask& sm) {
+    if (D.boltz2TemplateFeatures) return boltz2Rows(sm.slot, sm.mask, tokens);
+    if (D.rosettafold3TemplateFeatures) return rosettafold3Rows(sm.slot, sm.mask, tokens);
+    if (D.fusedDistogramBins <= 0) throw std::runtime_error("dialect.fusedTemplateLayout has no default");
+    return protenixRows(sm.slot, sm.mask, tokens, D.fusedDistogramBins, D.fusedRestypes, width);
+  };
+  // the columns an empty slot sets (emptyTemplateColumns)
+  auto emptyColumns = [&](bool useGap) {
+    std::vector<int> columns;
+    if (useGap) {
+      if (D.emptyColumnsState != 2) throw std::runtime_error("dialect.emptyTemplateRestypeColumns has no default");
+      columns = D.emptyColumns;
+    } else if (D.fusedDistogramBins > 0 && D.emptyColumnsState != 1) {
+      columns = {D.fusedDistogramBins + 1, D.fusedDistogramBins + 1 + D.fusedRestypes};
+    }
+    return columns;
+  };
+  struct Pass { int repeat; bool real = false; size_t slot = 0; int emptyAatype = 0; bool mean = false; };
+  std::vector<Pass> passes;
+  std::vector<float> meanFeatures;            // the one-pass mean (rf3), dense, float32 as the JavaScript holds it
+  size_t pairs = (size_t)tokens * tokens;
+  if (D.templateFeatureMeanOnePass) {
+    std::vector<size_t> present;
+    for (size_t k = 0; k < slots.size(); ++k)
+      for (float v : slots[k].slot.atomMask) if (v > 0) { present.push_back(k); break; }
+    meanFeatures.assign(pairs * width, 0.0f);
+    if (present.empty()) {
+      for (int c : emptyColumns(false)) for (size_t r = 0; r < pairs; ++r) meanFeatures[r * width + c] = 1;
+    } else {
+      std::vector<float> row(width);
+      for (size_t at = 0; at < present.size(); ++at) {
+        FusedRows rows = rowsFor(slots[present[at]]);
+        for (size_t r = 0; r < pairs; ++r) {
+          std::fill(row.begin(), row.end(), 0.0f);
+          rows.fill((int)(r / tokens), (int)(r % tokens), row);
+          for (int c = 0; c < width; ++c)
+            meanFeatures[r * width + c] = at == 0 ? row[c] : (float)((double)meanFeatures[r * width + c] + row[c]);
+        }
+      }
+      for (auto& v : meanFeatures) v = (float)((double)v / present.size());
+    }
+    passes.push_back({TEMPLATES, false, 0, 0, true});
+  } else {
+    for (size_t k = 0; k < slots.size(); ++k) passes.push_back({1, true, k, 0, false});
+    int empty = TEMPLATES - (int)slots.size();
+    if (empty > 0 && D.emptyTemplateAatype >= 0) {
+      passes.push_back({1, false, 0, D.emptyTemplateAatype, false});
+      if (empty > 1) passes.push_back({empty - 1, false, 0, 0, false});
+    } else if (empty > 0) passes.push_back({empty, false, 0, 0, false});
+  }
+  for (size_t k = 0; k < passes.size(); ++k) {
+    const Pass& p = passes[k];
+    std::string q = "template." + std::to_string(k);
+    bool covered = !((D.templateVisibilityByCoverage || D.chaiTemplates) && !p.real && !p.mean);
+    E.m(q + ".repeat", covered ? p.repeat : 0);
+    if (p.real) {
+      const TemplateSlot& slot = slots[p.slot].slot;
+      std::vector<int> aatype = slot.aatype;
+      if (D.chaiTemplates)
+        for (int t = 0; t < tokens; ++t) {
+          bool any = false;
+          for (int a = 0; a < batch.dense; ++a) if (slot.atomMask[(size_t)t * batch.dense + a] > 0) { any = true; break; }
+          if (!any) aatype[t] = 21;
+        }
+      E.i(q + ".aatype", aatype);
+    } else {
+      E.i(q + ".aatype", std::vector<int>(tokens, p.mean ? 0 : p.emptyAatype));
+    }
+    if (fused) {
+      std::vector<int> idx;
+      std::vector<float> val;
+      int K = 1;
+      if (p.mean) {
+        sparseRows([&](size_t r, std::vector<float>& d) { std::copy(meanFeatures.begin() + r * width, meanFeatures.begin() + (r + 1) * width, d.begin()); },
+                   pairs, width, idx, val, K);
+      } else if (p.real) {
+        FusedRows rows = rowsFor(slots[p.slot]);
+        sparseRows([&](size_t r, std::vector<float>& d) { rows.fill((int)(r / tokens), (int)(r % tokens), d); }, pairs, width, idx, val, K);
+      } else {
+        // fusedTemplateFeaturesSparse(undefined, ...): every row the empty columns, sorted, value 1
+        std::vector<int> columns = emptyColumns(p.emptyAatype != 0);
+        std::sort(columns.begin(), columns.end());
+        K = std::max(1, (int)columns.size());
+        idx.assign(pairs * K, -1);
+        val.assign(pairs * K, 0.0f);
+        for (size_t r = 0; r < pairs; ++r)
+          for (int c = 0; c < (int)columns.size(); ++c) { idx[r * K + c] = columns[c]; val[r * K + c] = 1.0f; }
+      }
+      E.i(q + ".featuresIdx", idx);
+      E.t(q + ".featuresVal", val);
+      E.m(q + ".featuresK", K);
+    } else if (p.real) {
+      Geometry g = templateGeometry(slots[p.slot].slot, slots[p.slot].mask, tokens, D.chaiTemplates);
+      E.i(q + ".distogramBin", g.bin);
+      E.m(q + ".distogramBins", g.bins);
+      E.t(q + ".pseudoBetaMask2d", g.pseudoBetaMask2d);
+      E.t(q + ".unitVector", g.unitVector);
+      E.t(q + ".backboneMask2d", g.backboneMask2d);
+    }
+  }
+  E.m("template.passes", (double)passes.size());
+  E.m("template.templates", D.chaiTemplates ? std::max(1, (int)slots.size()) : TEMPLATES);
+  E.m("template.featureWidth", width);
+  E.flag("template.outerResidual", D.templateStackOuterResidual);
+}
+
+inline Af3Export exportAf3(const Args& args) {
   Af3Export out;
   Entries& E = out.entries;
   if (!args.has("no-weights")) throw std::runtime_error("the native featuriser writes the input alone: pass --no-weights");
@@ -260,72 +464,10 @@ inline Af3Export exportAf3(const Args& args,
   if (D.structuralTokens) addStructural(E, batch);
   out.tokens = batch.tokens;
 
-  // the template slots and the embedder's passes (templates.h), then rf3's stereocentres - in the exporter's order
+  // the template slots (templates.h, each part by the page's buildTemplate), rf3's stereocentres, then the embedder's
+  // passes - in the exporter's order
   std::vector<std::string> chains = splitOn(sequence, ':');
-  bool anyTemplate = !args.option("template").empty() || !jobTemplates.empty() || !args.option("template-search-chains").empty();
-  for (auto& t : request.templates) if (t.second.kind != "upload") anyTemplate = true;
-  if (templates) templates(out, batch, D, chains, jobTemplates, haveJob ? &request : nullptr);
-  else if (anyTemplate) throw std::runtime_error("the native featuriser's templates are not built yet");
-  else {
-    // no template: every slot empty (the exporter's passes for slots = [])
-    const int TEMPLATES = 4;
-    if (D.chiralCentres) addChiralCentres(E, batch);
-    bool fused = D.fusedDistogramBins > 0 || D.boltz2TemplateFeatures || D.rosettafold3TemplateFeatures;
-    int width = D.boltz2TemplateFeatures ? 109 : D.rosettafold3TemplateFeatures ? 66
-              : D.fusedDistogramBins > 0 ? D.fusedDistogramBins + 1 + 2 * D.fusedRestypes + 4 : 0;
-    struct Pass { int repeat; int emptyAatype; bool meanFeatures; };
-    std::vector<Pass> passes;
-    if (D.templateFeatureMeanOnePass) passes.push_back({TEMPLATES, 0, true});
-    else if (D.emptyTemplateAatype >= 0) { passes.push_back({1, D.emptyTemplateAatype, false}); passes.push_back({3, 0, false}); }
-    else passes.push_back({TEMPLATES, 0, false});
-    size_t pairs = (size_t)batch.tokens * batch.tokens;
-    for (size_t k = 0; k < passes.size(); ++k) {
-      const Pass& p = passes[k];
-      std::string q = "template." + std::to_string(k);
-      bool covered = !((D.templateVisibilityByCoverage || D.chaiTemplates) && !p.meanFeatures);
-      E.m(q + ".repeat", covered ? p.repeat : 0);
-      E.i(q + ".aatype", std::vector<int>(batch.tokens, p.meanFeatures ? 0 : p.emptyAatype));
-      if (!fused) continue;
-      // fusedTemplateFeaturesSparse(undefined, ...) / sparseTemplateFeatures of the mean pass's (all-empty) features
-      std::vector<int> columns;
-      if (p.meanFeatures) {
-        // fusedTemplateFeatures(undefined, ..., useGap false): emptyTemplateColumns(dialect, false)
-        if (D.fusedDistogramBins > 0 && D.emptyColumnsState != 1)
-          columns = {D.fusedDistogramBins + 1, D.fusedDistogramBins + 1 + D.fusedRestypes};
-      } else {
-        bool gap = p.emptyAatype != 0;
-        if (gap) {
-          if (D.emptyColumnsState != 2) throw std::runtime_error("dialect.emptyTemplateRestypeColumns has no default");
-          columns = D.emptyColumns;
-        } else if (D.fusedDistogramBins > 0 && D.emptyColumnsState != 1) {
-          columns = {D.fusedDistogramBins + 1, D.fusedDistogramBins + 1 + D.fusedRestypes};
-        }
-        std::sort(columns.begin(), columns.end());
-      }
-      int K = std::max(1, (int)columns.size());
-      std::vector<int> idx(pairs * K);
-      std::vector<float> val(pairs * K);
-      for (size_t r = 0; r < pairs; ++r)
-        for (int c = 0; c < K; ++c) {
-          bool real = c < (int)columns.size();
-          idx[r * K + c] = real ? columns[c] : -1;
-          val[r * K + c] = real ? 1.0f : 0.0f;
-        }
-      if (p.meanFeatures && !columns.empty()) {
-        // the dense mean of identical empty rows, re-sparsed: each listed column, in column order, value 1
-        std::vector<int> sorted = columns;
-        std::sort(sorted.begin(), sorted.end());
-        for (size_t r = 0; r < pairs; ++r) for (int c = 0; c < K; ++c) idx[r * K + c] = sorted[c];
-      }
-      E.i(q + ".featuresIdx", idx);
-      E.t(q + ".featuresVal", val);
-      E.m(q + ".featuresK", K);
-    }
-    E.m("template.passes", (double)passes.size());
-    E.m("template.templates", D.chaiTemplates ? 1 : TEMPLATES);
-    E.m("template.featureWidth", width);
-    E.flag("template.outerResidual", D.templateStackOuterResidual);
-  }
+  addTemplates(out, args, batch, D, chains, jobTemplates, haveJob ? &request : nullptr);
   try { out.pdb = pdbTemplateText(batch); }
   catch (const std::exception& e) { out.said.push_back(std::string("no PDB template (") + e.what() + "); the native writer will name residues itself"); }
   return out;

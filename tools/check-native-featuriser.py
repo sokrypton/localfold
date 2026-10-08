@@ -40,6 +40,19 @@ def protein(chain, sequence, **extra):
     return {"protein": {"id": chain, "sequence": sequence, **extra}}
 
 
+def chain_sequence(name, chain):
+    """A crystal's chain, one letter a residue, from its CA records"""
+    three = {"ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H",
+             "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+             "TYR": "Y", "VAL": "V"}
+    out, seen = [], set()
+    for line in open(os.path.join(FIX, f"{name}-crystal.pdb")):
+        if line.startswith("ATOM") and line[12:16].strip() == "CA" and line[21] == chain and line[22:27] not in seen:
+            seen.add(line[22:27])
+            out.append(three.get(line[17:20], "X"))
+    return "".join(out)
+
+
 def cases():
     """(name, port, job dict or None, extra args, families)"""
     out = [
@@ -52,6 +65,23 @@ def cases():
                                        {"dna": {"id": "C", "sequence": "ACGTTGCA"}}, {"rna": {"id": "D", "sequence": "ACGUU"}}]),
          [], AF3_FAMILIES),
         ("msa-test", "af3", job("t", [protein("A", TEST_QUERY)]), ["--a3m=@test.a3m"], AF3_FAMILIES),
+    ]
+    caj, brs_a, brs_d = chain_sequence("5caj", "A"), chain_sequence("1brs", "A"), chain_sequence("1brs", "D")
+    out += [
+        ("tmpl-5caj", "af3", job("t", [protein("A", caj)]), ["--template=@F/5caj-crystal.pdb:A@0"], AF3_FAMILIES),
+        # (a sequence the template does not match: the page's local alignment maps it; and a second, unrelated slot)
+        ("tmpl-aligned", "af3", job("t", [protein("A", caj[:40] + caj[52:150].replace("L", "I") + caj[160:])]),
+         ["--template=@F/5caj-crystal.pdb:A@0,@F/1qys-crystal.pdb:A@0"], AF3_FAMILIES),
+        ("tmpl-1brs-merged", "af3", job("t", [protein("A", brs_a), protein("D", brs_d)]),
+         ["--template=@F/1brs-crystal.pdb:A@0+@F/1brs-crystal.pdb:D@1"], AF3_FAMILIES),
+        ("tmpl-1brs-nospan", "af3", job("t", [protein("A", brs_a), protein("D", brs_d)]),
+         ["--template=@F/1brs-crystal.pdb:A@0+@F/1brs-crystal.pdb:D@1", "--no-span-chains"], AF3_FAMILIES),
+        # (a modified residue and a ligand shift every token after them)
+        ("tmpl-6mrr-sep-gol", "af3", job("t", [protein("A", SEQ_6MRR, modifications=[{"ptmType": "SEP", "ptmPosition": 3}]),
+                                               {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]),
+         ["--template=@F/6mrr-crystal.pdb:A@0"], AF3_FAMILIES),
+        ("tmpl-four", "af3", job("t", [protein("A", caj)]),
+         ["--template=" + ",".join(["@F/5caj-crystal.pdb:A@0"] * 4)], AF3_FAMILIES),
     ]
     if os.path.isdir(AF3_EXAMPLES):
         for name in sorted(os.listdir(AF3_EXAMPLES)):
@@ -146,7 +176,7 @@ def main():
             else:
                 job_path = os.path.join(base, "job.json")
                 json.dump(spec, open(job_path, "w"))
-            args = [x.replace("@test.a3m", os.path.join(FIX, "test.a3m")) for x in extra]
+            args = [x.replace("@test.a3m", os.path.join(FIX, "test.a3m")).replace("@F/", FIX + "/") for x in extra]
             common = ["--no-weights", f"--family={family}", f"--job={job_path}", "--max-msa=512", *args]
             js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "af3", "export-model.mjs"), base + "/js", *common],
                                          cwd=os.path.join(REPO, "cuda", "af3"))
