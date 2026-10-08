@@ -46,19 +46,9 @@ import { af3ContactBins } from "../featurise/contact-classes.js";
  * reading and it is the only stated source: OpenDDE's published config.json is
  * metadata and carries no distogram range. See docs/OPENDDE.md.
  */
-const NUM_BINS = 64;
-const FIRST_BREAK = 2.3125;
-const LAST_BREAK = 21.6875;
 const CONTACT_THRESHOLD = 8.0 + 1e-3;
-
-/** The distogram bin edges: 63 of them, evenly spaced. */
-export function binEdges(bins = NUM_BINS) {
-  const breaks = new Float32Array(bins - 1);
-  for (let index = 0; index < bins - 1; index += 1) {
-    breaks[index] = FIRST_BREAK + (LAST_BREAK - FIRST_BREAK) * index / (bins - 2);
-  }
-  return breaks;
-}
+import { NUM_BINS, binEdges } from "./distogram-bins.js";
+export { binEdges } from "./distogram-bins.js";
 
 /**
  * The distogram head.

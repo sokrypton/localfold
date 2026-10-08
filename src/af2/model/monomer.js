@@ -15,7 +15,7 @@ import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
 } from "./recycle-convergence.js";
 
-import { makeA3mFeaturesFor } from "../../input/a3m-features.js";
+import { makeA3mFeaturesFor } from "../../input/a3m-features-webgpu.js";
 
 /**
  * @typedef {import("../structure/module.js").StructureModuleResult} StructureModuleResult

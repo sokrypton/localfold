@@ -7,7 +7,7 @@
  */
 import { af3MsaFromA3m } from "./msa-features.js";
 import { featuriseProtein } from "./featurise.js";
-import { uniformFrom } from "../fold.js";
+import { uniformFrom } from "../random.js";
 
 /**
  * A sequence plus an A3M, as the batch AF3's graph is actually fed.

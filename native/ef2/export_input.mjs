@@ -14,9 +14,9 @@
 // and pdb.template beside them: the page's PDB records, each atom's index where its coordinates go
 import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 import { featuriseForEsmfold2, languageModelInput } from "../../src/esmfold2/featurise.js";
-import { representativeAtoms } from "../../src/esmfold2/fold.js";
+import { representativeAtoms } from "../../src/esmfold2/representative-atoms.js";
 import { toDensePositions } from "../../src/esmfold2/featurise.js";
-import { toPdb } from "../../src/af3/fold.js";
+import { toPdb } from "../../src/af3/structure/pdb.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -90,7 +90,7 @@ int("res_type", f.residueType); int("input_ids", f.inputIds);
 // refuses them against any other
 // (--fold-bundle=<dir>: the released models' 64-bin distogram is AlphaFold 3's grid, counted by AF3's rule)
 {
-  const { contactBinCountsByPair, contactBinCountsByPairBreaks } = await import("../../src/esmfold2/distogram-webgpu.js");
+  const { contactBinCountsByPair, contactBinCountsByPairBreaks } = await import("../../src/esmfold2/contacts.js");
   const bundleArg = process.argv.slice(2).find((a) => a.startsWith("--fold-bundle="))?.slice(14);
   const bins = bundleArg ? JSON.parse(readFileSync(`${bundleArg}/manifest.json`, "utf8")).trunk?.distogramBins ?? 128 : 128;
   if (bins !== 128 && bins !== 64) throw new Error(`a ${bins}-bin distogram: only 128 (2-52) and 64 (AF3's) are known`);

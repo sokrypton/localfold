@@ -47,7 +47,7 @@ const { openAf3Store, trunkWeights, trunkDepths, confidenceWeights } =
   await import(`${repo}/src/af3/weights/weights.js`);
 const { diffusionWeights, atomReference, targetFeatureWeights } =
   await import(`${repo}/src/af3/weights/diffusion-weights.js`);
-const { batchFromDump } = await import(`${repo}/tools/gpu/fold.js`);
+const { batchFromDump } = await import(`${repo}/src/af3/featurise/batch-from-dump.js`);
 
 mkdirSync(out, { recursive: true });
 const entries = [];         // [kind, name, typedArray | number]
@@ -298,7 +298,7 @@ if (dialect?.chaiTokenEmbedding === true && batch.esmEmbeddings === undefined) {
 // reads contact_probs off the distogram: the bin count is the bundle's
 {
   const { af3ContactClasses, af3ContactBins } = await import(`${repo}/src/af3/featurise/contact-classes.js`);
-  const { binEdges } = await import(`${repo}/src/af3/trunk/trunk-webgpu.js`);
+  const { binEdges } = await import(`${repo}/src/af3/trunk/distogram-bins.js`);
   const manifest = JSON.parse(Buffer.from(await (await fetch(bundle)).arrayBuffer()).toString("utf8"));
   const shape = manifest?.tensors?.["diffuser/distogram_head/half_logits/weights"]?.shape;
   if (shape) add("batch.contactBins", af3ContactBins(af3ContactClasses(batch, batch.tokens), batch.tokens, binEdges(shape[1])));
@@ -466,7 +466,7 @@ if (dialect.chiralCentres === true) {
   const width = dialect.boltz2TemplateFeatures ? 109 : dialect.rosettafold3TemplateFeatures ? 66
     : dialect.fusedTemplateLayout ? dialect.fusedTemplateLayout.distogramBins + 1 + 2 * dialect.fusedTemplateLayout.restypes + 4 : 0;
   const { fusedTemplateFeatures, fusedTemplateFeaturesSparse, sparseTemplateFeatures } =
-    fused ? await import(`${repo}/src/af3/trunk/template-webgpu.js`) : {};
+    fused ? await import(`${repo}/src/af3/featurise/template-fused-features.js`) : {};
   if (slots.length > TEMPLATES) throw new Error(`${slots.length} template slots; every family folds with at most ${TEMPLATES}`);
   const passes = [];
   if (dialect.templateFeatureMeanOnePass === true) {
@@ -548,7 +548,7 @@ if (dialect.chiralCentres === true) {
 // their codes, modified residues, CONECT), with each atom's dense slot as its x coordinate so the
 // native writer knows which coordinates go where.
 try {
-  const { toPdb } = await import(`${repo}/src/af3/fold.js`);
+  const { toPdb } = await import(`${repo}/src/af3/structure/pdb.js`);
   const slots = new Float32Array(batch.tokens * batch.dense * 3);
   for (let i = 0; i < batch.tokens * batch.dense; i += 1) slots[i * 3] = i;
   writeFileSync(`${out}/template.pdb`, toPdb(batch, slots, null) + "\n");

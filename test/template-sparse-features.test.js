@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fusedTemplateFeatures, fusedTemplateFeaturesSparse, sparseTemplateFeatures, SPARSE_PAD }
-  from "../src/af3/trunk/template-webgpu.js";
+  from "../src/af3/featurise/template-fused-features.js";
 import { PROTENIX2, BOLTZ2, ROSETTAFOLD3 } from "../src/af3/dialect.js";
 
 function expand(packed, rows, width) {

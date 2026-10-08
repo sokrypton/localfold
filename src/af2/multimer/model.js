@@ -24,7 +24,7 @@ import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
 } from "../model/recycle-convergence.js";
 
-import { makeA3mFeaturesFor } from "../../input/a3m-features.js";
+import { makeA3mFeaturesFor } from "../../input/a3m-features-webgpu.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
 import { encodeTemplateEmbedding, hasTemplateEmbedder } from "./template.js";
 

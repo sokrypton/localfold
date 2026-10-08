@@ -28,7 +28,7 @@
  * thing, and none of them is an error - which is exactly why the caller is
  * given `covered` to show rather than a boolean to ignore.
  */
-import { ONE_LETTER } from "../fold.js";
+import { ONE_LETTER } from "../structure/pdb.js";
 import { aatypeFor, conformerFor } from "./reference-conformers.js";
 import { ATOM37, NUM_DENSE } from "./template-features.js";
 import { coordinateAtoms } from "../../heads/superpose-pdb.js";
