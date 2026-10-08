@@ -32,7 +32,17 @@ if [ ! -x "$fbin" ] || [ "$(cat "$fbin.stamp" 2>/dev/null)" != "$fstamp" ]; then
     || { echo "FAILED the featurisers" >> "$log"; exit 1; } ) &
   pids+=($!)
 fi
-for name in af3-featurise af2-featurise esmfold2-featurise resolve-templates chem-probe; do
+# ...and the same code as an object each port links (cuda/featurise/standalone.cpp: `af3 --job=...` featurises in
+# its own process), by the same g++ with the same flags - so a standalone fold reads the featuriser's own bytes
+sobj="$here/featurise/standalone.o"
+if [ ! -f "$sobj" ] || [ "$(cat "$sobj.stamp" 2>/dev/null)" != "$fstamp" ]; then
+  rm -f "$sobj.stamp"
+  ( g++ -std=c++17 -O2 -ffp-contract=off -pthread -c "$here/featurise/standalone.cpp" -o "$sobj.building" >> "$log" 2>&1 \
+    && mv "$sobj.building" "$sobj" && echo "$fstamp" > "$sobj.stamp" \
+    || { echo "FAILED the standalone object" >> "$log"; echo failed > "$sobj.stamp"; exit 1; } ) &
+  pids+=($!)
+fi
+for name in af3-featurise af2-featurise esmfold2-featurise resolve-templates chem-probe fetch-weights; do
   ln -sfn featurise "$here/featurise/$name"
 done
 # (no GPU: the featurisers still build, the ports cannot)
@@ -51,13 +61,17 @@ for port in "${ports[@]}"; do
   # (the stamp is the card AND the sources - every port includes cuda/af3/src's shared headers - so a
   # checkout that changed a kernel rebuilds rather than keep the last binary)
   # (and the weight walks in cuda/featurise, which af3 and af2 include)
-  stamp="$arch $(cat "$here/$port"/src/*.cu* "$here"/af3/src/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc | sha256sum | cut -c1-16)"
+  stamp="$arch $(cat "$here/$port"/src/*.cu* "$here"/af3/src/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical
   # - and host -O3 was 40% of AF3's compile for no measurable run time; -O0 costs a fold 7%)
-  ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 -arch=$arch --default-stream per-thread $fast src/$port.cu \
-      -lcublas -lcublasLt -lcupti -ldl -o "$out.building" >> "$log" 2>&1 \
-    && mv "$out.building" "$out" && echo "$stamp" > "$out.arch" && echo "built $port for $arch" >> "$log" \
+  # (compiled to an object while standalone.o builds, then linked once it has)
+  ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 -arch=$arch --default-stream per-thread $fast -c src/$port.cu \
+      -o "$out.o" >> "$log" 2>&1 \
+    && until [ "$(cat "$sobj.stamp" 2>/dev/null)" = "$fstamp" ]; do
+         [ "$(cat "$sobj.stamp" 2>/dev/null)" != failed ] || { echo "FAILED $port: no standalone object" >> "$log"; exit 1; }; sleep 1; done \
+    && nvcc -arch=$arch "$out.o" "$sobj" -lcublas -lcublasLt -lcupti -ldl -o "$out.building" >> "$log" 2>&1 \
+    && rm -f "$out.o" && mv "$out.building" "$out" && echo "$stamp" > "$out.arch" && echo "built $port for $arch" >> "$log" \
     || { echo "FAILED $port for $arch" >> "$log"; exit 1; } ) &
   pids+=($!)
 done

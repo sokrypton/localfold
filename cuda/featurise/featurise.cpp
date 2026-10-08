@@ -4,6 +4,9 @@
 //   af2-featurise <out dir> (--bundle=<dir> | --weights=<dir>) (--job=<job.json> | --sequence=...)   (af2_export.h)
 //   esmfold2-featurise <out dir> (--job=<job.json> | --sequence=...)                              (esmfold2_export.h)
 //   resolve-templates <request.json> <out dir>                                                   (below)
+//   fetch-weights <name>...                                  the published weights (fetch.h): a registry bundle
+//                                                            (af3, monomer, multimer-3, ef2-fast-600m, esmc, ...)
+//                                                            or, with --af3-any-model, af3-any-model's int8 blob
 //   chem-probe < smiles.txt         each SMILES's component, one line, as tools/chem-probe.mjs prints the page's
 //
 // each the JavaScript it replaces (cuda/af3/export-model.mjs --no-weights, cuda/af2/export_input.mjs,
@@ -18,8 +21,7 @@
 #include <string>
 #include <vector>
 
-#include "af2_export.h"
-#include "esmfold2_export.h"
+#include "standalone.h"
 #include "json.h"
 #include "search.h"
 #include "templates.h"
@@ -32,22 +34,7 @@ static int af3Main(int argc, char** argv) {
     return 2;
   }
   try {
-    lf::Af3Export out = lf::exportAf3(args);
-    for (auto& line : out.said) printf("%s\n", line.c_str());
-    if (system(("mkdir -p '" + args.positional + "'").c_str()) != 0) throw std::runtime_error("cannot create " + args.positional);
-    if (!out.pdb.empty()) {
-      if (system(("mkdir -p '" + args.positional + "'").c_str()) != 0) throw std::runtime_error("cannot create " + args.positional);
-      FILE* f = fopen((args.positional + "/template.pdb").c_str(), "wb");
-      fwrite(out.pdb.data(), 1, out.pdb.size(), f);
-      fclose(f);
-    }
-    if (!out.searchA3m.empty()) {
-      FILE* f = fopen((args.positional + "/search.a3m").c_str(), "wb");
-      fwrite(out.searchA3m.data(), 1, out.searchA3m.size(), f);
-      fclose(f);
-    }
-    out.entries.write(args.positional);
-    printf("%zu entries, %.0f MiB, tokens %d\n", out.entries.list.size(), out.entries.words() * 4 / 1048576.0, out.tokens);
+    lf::featuriseAf3Into(args, args.positional);
   } catch (const lf::Refusal& e) {
     fprintf(stderr, "Error: %s\n", e.what());
     return 1;
@@ -66,15 +53,7 @@ static int af2Main(int argc, char** argv) {
     return 1;
   }
   try {
-    lf::Af2Export out = lf::exportAf2(args);
-    if (system(("mkdir -p '" + args.positional + "'").c_str()) != 0) throw std::runtime_error("cannot create " + args.positional);
-    if (!out.searchA3m.empty()) {
-      FILE* f = fopen((args.positional + "/search.a3m").c_str(), "wb");
-      fwrite(out.searchA3m.data(), 1, out.searchA3m.size(), f);
-      fclose(f);
-    }
-    out.entries.write(args.positional);
-    for (auto& line : out.said) printf("%s\n", line.c_str());
+    lf::featuriseAf2Into(args, args.positional);
   } catch (const std::exception& e) {
     fprintf(stderr, "Error: %s\n", e.what());
     return 1;
@@ -86,13 +65,7 @@ static int esmfold2Main(int argc, char** argv) {
   std::vector<std::string> list(argv + 1, argv + argc);
   lf::Args args(list);
   try {
-    lf::Esmfold2Export out = lf::exportEsmfold2(args);
-    if (system(("mkdir -p '" + args.positional + "'").c_str()) != 0) throw std::runtime_error("cannot create " + args.positional);
-    out.entries.write(args.positional);
-    FILE* f = fopen((args.positional + "/pdb.template").c_str(), "wb");
-    fwrite(out.pdb.data(), 1, out.pdb.size(), f);
-    fclose(f);
-    for (auto& line : out.said) printf("%s\n", line.c_str());
+    lf::featuriseEsmfold2Into(args, args.positional);
   } catch (const std::exception& e) {
     fprintf(stderr, "Error: %s\n", e.what());
     return 1;
@@ -228,6 +201,25 @@ static int chemMain() {
       std::cout << "\n";
     } catch (const std::exception& e) { std::cout << "ERR " << e.what() << "\n"; }
   }
+  return 0;
+}
+
+static int fetchMain(int argc, char** argv) {
+  bool blobs = false;
+  std::vector<std::string> names;
+  for (int i = 1; i < argc; ++i) {
+    if (!strcmp(argv[i], "--af3-any-model")) blobs = true;
+    else names.push_back(argv[i]);
+  }
+  if (names.empty()) { fprintf(stderr, "usage: fetch-weights [--af3-any-model] <name>...\n"); return 2; }
+  try {
+    std::string root = lf::fetch::home();
+    for (auto& n : names) blobs ? lf::fetch::blob(root, n) : lf::fetch::bundle(root, n);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "Error: %s\n", e.what());
+    return 1;
+  }
+  return 0;
 }
 
 int main(int argc, char** argv) {
@@ -240,6 +232,7 @@ int main(int argc, char** argv) {
   if (self == "esmfold2-featurise") return esmfold2Main(argc, argv);
   if (self == "resolve-templates") return resolveMain(argc, argv);
   if (self == "chem-probe") return chemMain();
-  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, esmfold2-featurise or resolve-templates (not %s)\n", self.c_str());
+  if (self == "fetch-weights") return fetchMain(argc, argv);
+  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, esmfold2-featurise, resolve-templates or fetch-weights (not %s)\n", self.c_str());
   return 2;
 }

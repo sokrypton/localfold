@@ -4,6 +4,7 @@
 //
 //   ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]
 //   ef2 <input dir> --fold-bundle=<dir> --esmc-bundle=<dir> ...   (the page's bundles, read as they are)
+#include "../../featurise/standalone_api.h"
 #include "esmc.cuh"
 #include "atoms.cuh"
 #include "trunk.cuh"
@@ -375,7 +376,7 @@ static int foldInput(const Opts& o, bool warm) {
 // --detach-output: on success the last line is "ef2: done" and stdout closes, so a caller reading it to
 // its end returns while the driver releases this process's device (0.14 s of exit; cuda/esmfold2/fold does)
 static bool DETACH = false;
-int main(int argc, char** argv) {
+static int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
   // the big-input paths when SHORT_PAIR_TIMES x the f32 pair does not fit the room (cuda/af3's common.cuh,
   // shortPair); LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
@@ -494,4 +495,12 @@ int main(int argc, char** argv) {
   int rc = foldInput(o, false);
   if (DETACH && rc == 0) { printf("ef2: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
   finish(rc);
+}
+
+// `esmfold2 --job=<job.json> --out=<pdb>` (any first argument that is a flag): the whole protocol in this one process -
+// the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
+// `esmfold2 <featurised dir> ...` and `esmfold2 - --serve=<dir>` as before
+int main(int argc, char** argv) {
+  if (argc < 2 || !strncmp(argv[1], "--", 2)) return lf::standalone::main("esmfold2", argc, argv, foldMain);
+  return foldMain(argc, argv);
 }

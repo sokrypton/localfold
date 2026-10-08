@@ -88,6 +88,8 @@
     "test:colab": "python3 tools/check-colab-bridge.py",
     "test:cuda": "python3 tools/check-cuda-worker.py",
     "test:featurise": "bash cuda/build.sh featurise && python3 tools/check-native-featuriser.py",
+    "//test:standalone": "One process must fold what two did: cuda/<port>/<port> --job=... (weights fetched, the input featurised in-process, the fold) against the featuriser binary then the port over its directory, held to the same PDB bytes - plus refusals, --frames, LOCALFOLD_HOME. Watched failing with ESMFold2's --seed dropped from the fold.",
+    "test:standalone": "bash cuda/build.sh && python3 tools/check-standalone.py",
     "test:switch": "python3 tools/check-model-switch.py",
   "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. \ud83d\udd34 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
     "test:tools": "python3 tools/index-tools.py"

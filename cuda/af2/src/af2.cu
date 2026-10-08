@@ -7,6 +7,7 @@
 //
 // With --oracle (cuda/af2/oracle.py's dump of the reference on this same input), pass 0 is checked
 // against it stage by stage.
+#include "../../featurise/standalone_api.h"
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
@@ -631,7 +632,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 // --detach-output: on success the last line is "af2: done" and stdout closes, so a caller reading it to
 // its end returns while the driver releases this process's device (0.16 s of exit; cuda/af2/fold does)
 static bool DETACH = false;
-int main(int argc, char** argv) {
+static int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> [--delta=<dir>] | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
   std::string weights, bundleDir, deltaDir, oracle, out = "fold.pdb", warmShape, serveDir; int recycles = -1; bool profile = false, waitInput = false;
   for (int i = 2; i < argc; ++i) {
@@ -722,4 +723,12 @@ int main(int argc, char** argv) {
   int rc = foldInput(oracle, out, recycles, profile, false, t0);
   if (DETACH && rc == 0) { printf("af2: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
   finish(rc);
+}
+
+// `af2 --job=<job.json> --out=<pdb>` (any first argument that is a flag): the whole protocol in this one process -
+// the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
+// `af2 <featurised dir> ...` and `af2 - --serve=<dir>` as before
+int main(int argc, char** argv) {
+  if (argc < 2 || !strncmp(argv[1], "--", 2)) return lf::standalone::main("af2", argc, argv, foldMain);
+  return foldMain(argc, argv);
 }

@@ -4,6 +4,7 @@
 //
 // Reads <data-dir>/model.{idx,bin} (export-model.mjs). Without --fast it runs the precise
 // path (f32 throughout) and checks every seam the oracle recorded; with --fast the f16 path.
+#include "../../featurise/standalone_api.h"
 #include <dirent.h>
 #include <future>
 #include "trunk.cuh"
@@ -17,7 +18,7 @@
 #include "../../featurise/af3_weights.h"   // the weight walk: the bundle read as published, no map
 #include "profile.cuh"
 
-int main(int argc, char** argv) {
+static int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
   // the big-input paths when 18x the f32 pair does not fit the room (common.cuh, shortPair);
   // LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
@@ -657,7 +658,7 @@ int main(int argc, char** argv) {
            fi + 1, ms(f0, f1), passesRun, diffMs, steps, samples,
            seedList.size() > 1 ? (" x " + std::to_string(seedList.size()) + " seeds").c_str() : "", confMs, ms(f0, f3));
     if (profiling) prof::stop(40);
-    if (fi == 0 && which == 0 && serveDir.empty()) unreadWeights();
+    if (fi == 0 && which == 0 && serveDir.empty() && getenv("LOCALFOLD_UNREAD")) unreadWeights();
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
     if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); }
     if (tight) releaseScratch();      // the next fold's trunk starts from the card it had
@@ -735,4 +736,12 @@ int main(int argc, char** argv) {
   }
   if (detach) { printf("af3: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
   return 0;
+}
+
+// `af3 --job=<job.json> --out=<pdb>` (any first argument that is a flag): the whole protocol in this one process -
+// the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
+// `af3 <featurised dir> ...` and `af3 - --serve=<dir>` as before
+int main(int argc, char** argv) {
+  if (argc < 2 || !strncmp(argv[1], "--", 2)) return lf::standalone::main("af3", argc, argv, foldMain);
+  return foldMain(argc, argv);
 }

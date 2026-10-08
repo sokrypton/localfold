@@ -3,75 +3,18 @@
 #
 #   cuda/af2/fold <out.pdb> --sequence=<SEQ>[:<SEQ>...] [--a3m=<path>] [--model=model_1_ptm] [-- <af2 flags>]
 #   cuda/af2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
-#   cuda/af2/fold 1brs.pdb --sequence=<A>:<B> --model=model_1_multimer_v3
+#   cuda/af2/fold 1brs.pdb --sequence=<A>:<B> --model=model_1_multimer_v3 --search
 #   cuda/af2/fold 5caj.pdb --sequence=<SEQ> --template=5caj.pdb:A       (1brs: --template=1brs.pdb:A+D)
 #
-# --model is model_N_ptm or model_N_multimer_v3, N 1 to 5: model 1 of each as the page publishes it whole, 2-5
-# as its deltas on model 1, read as the page reads them - the bundle (model/, model-multimer/,
-# fetched once by cuda/fetch_bundles.py) as it is, through the weight walk (cuda/featurise/af2_weights.h). Input flags (--sequence, --a3m, --search, --template, --recycles,
-# --max-msa, --max-extra, --seed, --job) go to the native featuriser (cuda/featurise/af2-featurise: the page's own
-# features, byte for byte, no JavaScript); flags after -- go to ./af2, which runs --fast.
+# A wrapper over the standalone binary, `cuda/af2/af2 --out=<out.pdb> <flags>` (cuda/featurise/standalone.h), which
+# it builds if it is missing: --model is model_N_ptm or model_N_multimer_v3, N 1 to 5 (2-5 the page's deltas on
+# model 1), its published bundle fetched once; the input featurised in the same process, the page's own features
+# byte for byte; a searched alignment kept as <out>.a3m.
 set -euo pipefail
-# the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
-gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"; echo "sm_${cc:-80}"; }
 here="$(cd "$(dirname "$0")" && pwd)"
-[ $# -ge 1 ] || { sed -n '2,14p' "$0"; exit 1; }
+[ $# -ge 1 ] || { sed -n '2,12p' "$0"; exit 1; }
 out="$1"; shift
-inputs=(); flags=(); model=model_1_ptm
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--" ]; then shift; flags=("$@"); break; fi
-  case "$1" in --model=*) model="${1#--model=}" ;; *) inputs+=("$1") ;; esac
-  shift
-done
-if [ ! -x "$here/af2" ]; then
-  (cd "$here" && nvcc -O1 -std=c++17 -arch="$(gpu_arch)" --default-stream per-thread --use_fast_math src/af2.cu \
-     -lcublas -lcublasLt -lcupti -ldl -o af2)
-fi
-repo="$(cd "$here/../.." && pwd)"
-# models 2-5 of each are published as deltas on model 1 and read as the page reads them (--delta: common.cuh's
-# loadBundle, bit-exact against shared/bundles/delta-tensor-store.js), as cuda/worker.py folds them
-case "$model" in
-  model_[1-5]_ptm) family=monomer; bundle="$repo/model"; short=mono ;;
-  model_[1-5]_multimer_v3) family=multimer; bundle="$repo/model-multimer"; short=multi ;;
-  *) echo "no published bundle for $model (model_1_ptm ... model_5_ptm, model_1_multimer_v3 ... model_5_multimer_v3)" >&2; exit 1 ;;
-esac
-[ -f "$bundle/manifest.json" ] || python3 "$repo/cuda/fetch_bundles.py" "$family" >&2
-wflags=(--bundle="$bundle")
-number="${model:6:1}"
-if [ "$number" != 1 ]; then
-  delta="$repo/model-$short-$number-delta"
-  [ -f "$delta/manifest.json" ] || python3 "$repo/cuda/fetch_bundles.py" "$family-$number" >&2
-  wflags+=(--delta="$delta")
-fi
-tmp="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-# af2 starts first and warms up - the CUDA context, the weights on the device, then the embedder and
-# one block of each stack on a synthetic input of the shapes the export will have, which loads every
-# kernel and makes every cuBLASLt plan - while the input is exported; it then waits for model.idx.
-# The shapes are a guess from the inputs (the alignment's depth before deduplication): a wrong guess
-# warms less, it never changes the fold
-seq=""; a3m=""; maxmsa=512; maxextra=1024; templates=0
-for a in "${inputs[@]}"; do
-  case "$a" in
-    --sequence=*) seq="${a#--sequence=}" ;; --a3m=*) a3m="${a#--a3m=}" ;;
-    --max-msa=*) maxmsa="${a#--max-msa=}" ;; --max-extra=*) maxextra="${a#--max-extra=}" ;;
-    --template=*) t="${a#--template=}"; templates=$(( $(tr -cd ',' <<< "$t" | wc -c) + 1 )) ;;
-  esac
-done
-seq="${seq//:/}"
-[ -n "$seq" ] || [ -z "$a3m" ] || seq="$(grep -m1 -v '^>' "$a3m" | tr -d 'a-z\r\n-')"
-depth=1; [ -z "$a3m" ] || depth=$(grep -c '^>' "$a3m")
-for a in "${inputs[@]}"; do [ "$a" != "--search" ] || depth=$(( maxmsa + maxextra )); done   # (a search is usually deep)
-n=$(( depth < maxmsa ? depth : maxmsa )); e=$(( depth - n )); e=$(( e > maxextra ? maxextra : e )); e=$(( e < 1 ? 1 : e ))
-# (a job's size is not known before it is featurised: no guess, no warm-up - which a length of 0 would refuse)
-warm=(); [ -z "$seq" ] || warm=(--warm="${#seq},$n,$e,$templates")
-exec 3< <("$here/af2" "$tmp" "${wflags[@]}" --fast --out="$out" --wait-input --detach-output "${warm[@]}" \
-          "${flags[@]}" && rc=0 || rc=$?; echo "af2: exit $rc")
-featurise="$repo/cuda/featurise/af2-featurise"
-[ -x "$repo/cuda/featurise/featurise" ] || bash "$repo/cuda/build.sh" featurise
-if ! "$featurise" "$tmp" --bundle="$bundle" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
-status=0
-# "af2: done" (its stdout then closes): the fold is written and af2 is only releasing the device
-while IFS= read -r line <&3; do
-  case "$line" in "af2: done") break ;; "af2: exit "*) status="${line#af2: exit }" ;; *) printf '%s\n' "$line" ;; esac
-done
-exit "$status"
+args=()
+for a in "$@"; do [ "$a" = "--" ] || args+=("$a"); done
+[ -x "$here/af2" ] || bash "$here/../build.sh" af2 >&2
+exec "$here/af2" --out="$out" "${args[@]}"

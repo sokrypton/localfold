@@ -34,6 +34,14 @@ cuda/esmfold2/fold lig.pdb --sequence=<SEQ> "--smiles=OCC(O)CO"
 cuda/esmfold2/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json
 ```
 
+🔴 **ONE BINARY, ONE COMMAND, NOTHING ELSE TO RUN** (cuda/featurise/standalone.h): `cuda/esmfold2/esmfold2 --job=<job.json>
+--out=<pdb>` (or `--sequence=`, and any input flag `fold` takes) fetches the model's published weights the first
+time (`cuda/featurise/fetch-weights`'s code, into the checkout or `LOCALFOLD_HOME`), featurises the input in the same
+process while the device starts - the featuriser's own object, so the input is byte for byte what
+`cuda/featurise/esmfold2-featurise` writes - and folds; a searched alignment is kept as `<out>.a3m`, and `--frames=<dir>` writes
+each intermediate result as it lands (what the page draws live). No Node, no Python, no script: `bash cuda/build.sh` builds it. `fold` is a wrapper over it; a featurised directory as the first argument,
+and `--serve`, are the resident server cuda/worker.py drives for the page, unchanged.
+
 The input options are cuda/af3's exporter's, resolved the same way:
 - `--kinds`: one per chain, protein, dna or rna.
 - `--ligands`: CCD codes, fetched from the RCSB.
@@ -46,7 +54,7 @@ All nine of AlphaFold 3's loadable example jobs fold. On the covalent KRAS/sotor
 the ligand's C25 is 1.73 Å: bonded, through the declared bond.
 
 `fold` builds `esmfold2` if it is missing and reads the page's own published bundles as they are - the int5
-trunk and the int3 ESM-C, fetched once by `cuda/fetch_bundles.py` from their Hugging Face remotes, 0.35 GB:
+trunk and the int3 ESM-C, fetched once by `cuda/featurise/fetch-weights` from their Hugging Face remotes, 0.35 GB:
 their codes go to the device and are decoded there (cuda/af3's `Model::loadBundle`; bit-identical to
 decoding them on the host, and the load is 127 against 241 ms for the float32 file).
 

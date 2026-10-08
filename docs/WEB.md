@@ -4359,3 +4359,30 @@ identical, or within 1e-21) and where a map's dialect flags were stale (none rea
 6MRR + GOL + SEP fold through it is byte-identical to the map's but OpenDDE's, 0.010 A rms away at the same pLDDT and
 pTM - the walk reads the tensors the page's loader reads, which the search did not always. `test:cuda` now folds
 boltz2, intellifold2 and rosettafold3 too, so every family's walk is exercised there.
+
+## 🔴 Each port is one binary: a job in, a structure out (2026-10-08)
+
+`cuda/af3/af3 --job=kras.json --out=kras.pdb --model=boltz2` is the whole protocol in one process, and so are
+`cuda/af2/af2` and `cuda/esmfold2/esmfold2`: any first argument that is a flag selects it (cuda/featurise/standalone.h),
+while a featurised directory first, and `--serve`, are the resident server the worker drives, unchanged. It fetches
+the model's published weights natively the first time (cuda/featurise/fetch.h - the registry's pinned remotes,
+generated into `bundles.inc` from shared/bundles/manifests/index.js, and af3-any-model's blobs, AlphaFold 3's only once
+its terms are accepted), featurises on a thread while CUDA starts and the weights go up, and folds. The KRAS job
+through boltz2 is 1.6 s command to PDB on the A100 with the weights on disk.
+
+🔴 **THE FEATURISER IS LINKED, NOT RECOMPILED.** `standalone.o` is built by g++ with the featuriser binary's own flags
+(`-O2 -ffp-contract=off`) and linked into each port, rather than included into the `.cu` - nvcc's host pass would be a
+second compiler configuration for code whose output is held to the byte, and would add the featuriser's headers to
+every port's compile. `npm run test:standalone` holds eight cases (four AF3-lineage models with a covalent ligand, a
+modified residue, a SMILES ligand and a template; AF2's model-3 delta and the multimer; ESMFold2 600M and 300M) to
+the same PDB bytes as the two-step path, and was watched failing with one flag dropped.
+
+🔴 **THE WORKER DOES NOT USE IT, ON PURPOSE.** It starts the model's resident server - context, weight upload, AF2's and
+ESMFold2's warm-up fold - while the featuriser binary searches MMseqs2 beside it; moving the featurisation into the
+server would serialise the two on every model's first fold. What changed there: it reads the featuriser's output
+live, so the page's status line now shows the search waiting (`MMseqs2 search · queued` / `running`), and it fetches
+weights through `cuda/featurise/fetch-weights`, the same code as the binaries. `cuda/fetch_bundles.py` is deleted -
+and with it the notebook's background prefetch, which downloaded `model-af3-int5`, a WebGPU bundle the CUDA port has
+not read since it moved to af3-any-model's blobs (and prefetching that blob instead would fetch DeepMind's weights
+before the page's terms dialog was accepted). `test:cuda` passes with a bundle moved aside and re-fetched by the
+worker mid-gate, byte-identical to the moved copy.

@@ -20,6 +20,14 @@ cuda/af3/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json --
 cuda/af3/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
 ```
 
+🔴 **ONE BINARY, ONE COMMAND, NOTHING ELSE TO RUN** (cuda/featurise/standalone.h): `cuda/af3/af3 --job=<job.json>
+--out=<pdb>` (or `--sequence=`, and any input flag `fold` takes) fetches the model's published weights the first
+time (`cuda/featurise/fetch-weights`'s code, into the checkout or `LOCALFOLD_HOME`), featurises the input in the same
+process while the device starts - the featuriser's own object, so the input is byte for byte what
+`cuda/featurise/af3-featurise` writes - and folds; a searched alignment is kept as `<out>.a3m`, and `--frames=<dir>` writes
+each intermediate result as it lands (what the page draws live). No Node, no Python, no script: `bash cuda/build.sh` builds it. `fold` is a wrapper over it; a featurised directory as the first argument,
+and `--serve`, are the resident server cuda/worker.py drives for the page, unchanged.
+
 `--search` gets the protein chains' alignments from the ColabFold MMseqs2 server - the page's own
 client and merge, the paired block included for a complex - instead of an A3M: barnase-barstar
 folds to 0.647 A (ipTM 0.93) from its two sequences, against 16.7 A without, the search 4.0 s.
@@ -30,7 +38,7 @@ alignment moves this target little: chain A by hand gives 1.836, and 0.289 witho
 Both send the sequences to api.colabfold.com, so they are flags, never defaults.
 
 `fold` builds `af3` if it is missing, reads the model's weights as published - **af3-any-model's
-own int8 blob** for all eight (`af3am-<model>/`, fetched once by `cuda/fetch_bundles.py
+own int8 blob** for all eight (`af3am-<model>/`, fetched once by `cuda/featurise/fetch-weights
 --af3-any-model` from huggingface.co/sokrypton/af3-any-model, the files its JAX backend reads), with
 its codes decoded on the device and a weight walk naming each tensor's slice of it (below).
 **AlphaFold 3's are Google DeepMind's parameters, hosted for academic, non-commercial use under its
@@ -390,7 +398,7 @@ before it are 1.2e-6 (`transformer.act`), and the transformer fed the oracle's o
 9.4e-4 (`TX_ORACLE_IN=1`; the WebGPU f32 path's whole step is 3.5e-3). The seams are compared
 whenever a stage oracle (`oracle-dumps/af3-oracle-stages-<model>.json`) was exported.
 
-After a first fold `af3` lists every weight family it never read; for these models the list is
+With `LOCALFOLD_UNREAD=1`, after a first fold `af3` lists every weight family it never read; for these models the list is
 only what should be there (heads not computed, alternative per-block forms, absent bonds and
 template geometry) - rf3's atom-block q/k norms and chirality term were found by it.
 

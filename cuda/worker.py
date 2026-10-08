@@ -109,50 +109,42 @@ def die_with_parent():
     ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
 
 
+def fetch_weights(what, args, log, env=None):
+    """The published weights fetched natively (cuda/featurise/fetch-weights, fetch.h) - piece by piece, each said, so a
+    slow download (one revision came at 0.9 MB/s on a Colab T4) reads as a download and not a hang."""
+    emit("status", f"fetching the {what} weights")
+    fetcher = subprocess.Popen([featuriser("fetch-weights"), *args], cwd=REPO, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=die_with_parent, env=env)
+    said = []
+    for line in fetcher.stdout:
+        said.append(line)
+        found = re.search(r"\((\d+)/(\d+)\)", line)
+        if found:
+            emit("status", f"fetching the {what} weights · part {found.group(1)} of {found.group(2)}")
+    if fetcher.wait() != 0:
+        raise RuntimeError(f"fetching {what} failed: {''.join(said[-4:])}")
+    log.append("".join(said))
+
+
 def ensure_bundle(family, directory, log):
-    """A bundle on disk, fetched from the registry's remote the first time - shard by shard, each said, so
-    a slow download (one revision came at 0.9 MB/s on a Colab T4) reads as a download and not a hang."""
+    """A registry bundle on disk (shared/bundles/manifests/index.js), fetched from its remote the first time."""
     if not os.path.exists(os.path.join(REPO, directory, "manifest.json")):
-        emit("status", f"fetching the {family} weights")
-        fetcher = subprocess.Popen([sys.executable, os.path.join(CUDA, "fetch_bundles.py"), family], cwd=REPO,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                   preexec_fn=die_with_parent)
-        said = []
-        for line in fetcher.stdout:
-            said.append(line)
-            found = re.search(r"\((\d+)/(\d+)\)", line)
-            if found:
-                emit("status", f"fetching the {family} weights · shard {found.group(1)} of {found.group(2)}")
-        if fetcher.wait() != 0:
-            raise RuntimeError(f"fetching {family} failed: {''.join(said[-4:])}")
-        log.append("".join(said))
+        fetch_weights(family, [family], log)
     return os.path.join(REPO, directory)
 
 
 def ensure_blob(name, log):
-    """af3-any-model's own published blob (cuda/fetch_bundles.py --af3-any-model): every AF3-lineage family's
-    weights, and chai-1's ESM2. AlphaFold 3's are Google DeepMind's, for academic non-commercial use: the page
-    folds only once its model-terms dialog has been accepted, which is the acceptance the fetcher asks for."""
+    """af3-any-model's own published blob: every AF3-lineage family's weights, and chai-1's ESM2. AlphaFold 3's are
+    Google DeepMind's, for academic non-commercial use: the page folds only once its model-terms dialog has been
+    accepted, which is the acceptance the fetcher asks for."""
     import glob
     directory = os.path.join(REPO, "af3am-" + name)
     if not glob.glob(os.path.join(directory, "*.bin.zst")):
-        emit("status", f"fetching the {name} weights")
         env = dict(os.environ)
         if name == "af3":
             accepted = {n.strip() for n in env.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",") if n.strip()}
             env["LOCALFOLD_ACCEPT_MODEL_TERMS"] = ",".join(sorted(accepted | {"alphafold3"}))
-        fetcher = subprocess.Popen([sys.executable, os.path.join(CUDA, "fetch_bundles.py"), "--af3-any-model", name],
-                                   cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                   preexec_fn=die_with_parent, env=env)
-        said = []
-        for line in fetcher.stdout:
-            said.append(line)
-            found = re.search(r"\((\d+)/(\d+)\)", line)
-            if found:
-                emit("status", f"fetching the {name} weights · part {found.group(1)} of {found.group(2)}")
-        if fetcher.wait() != 0:
-            raise RuntimeError(f"fetching {name} failed: {''.join(said[-4:])}")
-        log.append("".join(said))
+        fetch_weights(name, ["--af3-any-model", name], log, env)
     return directory
 
 
@@ -325,13 +317,20 @@ class Server:
                 self.proc.kill()
 
 
-def featurise(cmd, what, log):
-    """A native featuriser's run (cuda/featurise): its output kept; a refusal - the page's own sentence, which
-    every featuriser prints as `Error: <sentence>` - raised as one, anything else as the step that failed."""
-    proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, preexec_fn=die_with_parent)
-    said = proc.stdout + proc.stderr
+def featurise(cmd, what, log, on_line=None):
+    """A native featuriser's run (cuda/featurise): its output kept, and each line handed to `on_line` as it comes (the
+    MMseqs2 search says `search: queued` / `search: running` while it waits); a refusal - the page's own sentence,
+    which every featuriser prints as `Error: <sentence>` - raised as one, anything else as the step that failed."""
+    proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            preexec_fn=die_with_parent)
+    lines = []
+    for line in proc.stdout:
+        lines.append(line)
+        if on_line is not None:
+            on_line(line.rstrip("\n"))
+    said = "".join(lines)
     log.append(f"$ {' '.join(cmd)}\n{said}")
-    if proc.returncode != 0:
+    if proc.wait() != 0:
         first = re.search(r"^Error: (.+)$", said, re.M)
         if first:
             raise Refused(first.group(1))
@@ -483,6 +482,9 @@ class Worker:
         out_pdb = os.path.join(WORK, "fold.pdb")
         emit("status", f"{family} on CUDA ({self.device}) · featurising"
              + (" and searching the ColabFold MMseqs2 server" if mode == "search" else ""))
+        def live(line):          # the featuriser's own word while it works: the MMseqs2 search waits on a queue
+            if line.startswith("search: "):
+                emit("status", f"{family} on CUDA ({self.device}) · MMseqs2 search · {line[8:]}")
         # each port's resident server (Server: the model's weights stay on the card between folds) and this
         # job's flags for it
         if port == "af3":
@@ -495,7 +497,7 @@ class Worker:
                                            f"--family={family}", "--fold", "--fast",
                                            *esm], residues)
             featurise([featuriser("af3-featurise"), inputs, "--no-weights", dialect, f"--job={job_path}",
-                       f"--max-msa={requested}", *flags], "featurising", log)
+                       f"--max-msa={requested}", *flags], "featurising", log, live)
             steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
             fold = [f"--out={out_pdb}"]
             if sampler == "flow":
@@ -532,7 +534,7 @@ class Worker:
                       f"--max-msa={508 if requested == 512 else requested}", f"--max-extra={extra}", f"--seed={seed}", *flags]
             if recycles not in (None, ""):
                 export.append(f"--recycles={int(recycles)}")
-            featurise(export, "featurising", log)
+            featurise(export, "featurising", log, live)
             fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
             total = 0
         else:
@@ -542,7 +544,7 @@ class Worker:
             key = ("esmfold2", family)
             server = self.server_for(key, [binary("esmfold2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)
-            featurise([featuriser("esmfold2-featurise"), inputs, f"--job={job_path}"], "featurising", log)
+            featurise([featuriser("esmfold2-featurise"), inputs, f"--job={job_path}"], "featurising", log, live)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
             # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's
             # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45
