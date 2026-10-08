@@ -11,7 +11,7 @@ gate cannot see an error inside one of them.
 **The tree is split by backend**: `shared/` (input, chem, bundles, featurisers,
 weight loaders, dialects - what every backend reads), `cpu/` (the references and
 design), `webgpu/` (kernels, runtime, models - the page's), `cuda/` (the native
-ports, `af3`, `af2`, `ef2` (binaries `localfold-<port>`), their native featurisers in `cuda/featurise`, and `cuda/worker.py`) and `web/` (the page). A directory names the backend, so files carry no
+ports, `af3`, `af2`, `ef2` (binaries `localfold-<port>`), their native featurisers in `cuda/featurise`, and `cuda/worker.py`), `metal/` (the Apple-native port, just begun - see metal/README.md) and `web/` (the page). A directory names the backend, so files carry no
 `-webgpu`/`-reference` suffix: a stage's reference and its kernel share a name,
 `cpu/af3/trunk/embedder.js` beside `webgpu/af3/trunk/embedder.js`. Layering is
 shared <- cpu <- webgpu; the CUDA exporters import `shared/` and `cpu/` only.

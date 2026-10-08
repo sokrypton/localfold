@@ -145,3 +145,7 @@ python/*.egg-info/
 
 # wwPDB's whole chemical component dictionary (cuda/featurise/fetch-weights ccd)
 /ccd/
+
+# the Metal port (metal/build.sh): the kernel sources embedded as a string, and the binaries
+metal/kernels.inc
+metal/check/check-kernels
