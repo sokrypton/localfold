@@ -13,15 +13,29 @@ namespace lf {
 
 inline std::string padStart(const std::string& s, size_t n) { return s.size() >= n ? s : std::string(n - s.size(), ' ') + s; }
 inline std::string padEnd(const std::string& s, size_t n) { return s.size() >= n ? s : s + std::string(n - s.size(), ' '); }
-inline std::string toFixed(double v, int digits) {   // Number.prototype.toFixed for the values written here
-  char buf[64];
-  snprintf(buf, sizeof buf, "%.*f", digits, v);
+// Number.prototype.toFixed: the double's EXACT decimal value rounded at `digits`, a tie going up (away from zero in
+// magnitude, which is what "the larger n" means for the absolute value) - printf rounds a tie to even
+inline std::string toFixed(double v, int digits) {
+  if (!std::isfinite(v)) return std::isnan(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity");
+  bool negative = v < 0;
+  char buf[512];
+  snprintf(buf, sizeof buf, "%.80f", std::fabs(v));     // glibc prints the exact binary value
   std::string s(buf);
-  if (s.compare(0, 1, "-") == 0 && std::stod(s) == 0) s.erase(0, 1);   // (-0).toFixed(3) is "0.000"
-  return s;
+  size_t dot = s.find('.');
+  std::string whole = s.substr(0, dot), frac = s.substr(dot + 1);
+  bool up = frac[digits] >= '5';
+  std::string kept = whole + frac.substr(0, digits);
+  if (up) {
+    int i = (int)kept.size() - 1;
+    while (i >= 0) { if (kept[i] == '9') { kept[i] = '0'; --i; } else { ++kept[i]; break; } }
+    if (i < 0) kept = "1" + kept;
+  }
+  std::string intPart = kept.substr(0, kept.size() - digits), fracPart = kept.substr(kept.size() - digits);
+  std::string out = intPart + (digits > 0 ? "." + fracPart : "");
+  return (negative ? "-" : "") + out;     // (-0.0001).toFixed(3) is "-0.000" in JavaScript, and (-0).toFixed(3) "0.000"
 }
 
-inline std::string pdbTemplateText(const Batch& b) {
+inline std::string pdbText(const Batch& b, const std::vector<float>& positions) {
   static const std::map<char, std::string> THREE = {{'A', "ALA"}, {'R', "ARG"}, {'N', "ASN"}, {'D', "ASP"}, {'C', "CYS"},
     {'Q', "GLN"}, {'E', "GLU"}, {'G', "GLY"}, {'H', "HIS"}, {'I', "ILE"}, {'L', "LEU"}, {'K', "LYS"}, {'M', "MET"},
     {'F', "PHE"}, {'P', "PRO"}, {'S', "SER"}, {'T', "THR"}, {'W', "TRP"}, {'Y', "TYR"}, {'V', "VAL"}};
@@ -62,7 +76,8 @@ inline std::string pdbTemplateText(const Batch& b) {
       std::string head = std::string(ligand == componentOf.end() ? "ATOM  " : "HETATM") + padStart(std::to_string(serial), 5) + " "
         + (name.size() < 4 ? padEnd(" " + name, 4) : name.substr(0, 4)) + " " + padEnd(resName, 3) + " "
         + CHAINS[(b.asymId[token] - 1) % (int)CHAINS.size()] + padStart(std::to_string(b.residueIndex[token]), 4) + "    ";
-      lines.push_back(head + padStart(toFixed((double)(float)slot, 3), 8) + padStart(toFixed(0, 3), 8) + padStart(toFixed(0, 3), 8)
+      lines.push_back(head + padStart(toFixed(positions[slot * 3], 3), 8) + padStart(toFixed(positions[slot * 3 + 1], 3), 8)
+                      + padStart(toFixed(positions[slot * 3 + 2], 3), 8)
                       + "  1.00" + padStart(toFixed(0, 2), 6) + "          " + padStart(symbol, 2));
       ++serial;
     }
@@ -89,6 +104,13 @@ inline std::string pdbTemplateText(const Batch& b) {
   std::string out;
   for (size_t i = 0; i < lines.size(); ++i) out += (i ? "\n" : "") + lines[i];
   return out + "\n";
+}
+
+// the exporter's template.pdb: each atom's dense slot as its x coordinate
+inline std::string pdbTemplateText(const Batch& b) {
+  std::vector<float> slots((size_t)b.tokens * b.dense * 3, 0.0f);
+  for (size_t i = 0; i < (size_t)b.tokens * b.dense; ++i) slots[i * 3] = (float)i;
+  return pdbText(b, slots);
 }
 
 }  // namespace lf
