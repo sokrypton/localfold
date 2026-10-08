@@ -1,0 +1,180 @@
+"""The native featurisers against the JavaScript exporters they replace: byte for byte.
+
+    python3 tools/check-native-featuriser.py                 # the whole corpus, every family it names
+    python3 tools/check-native-featuriser.py --only=6mrr-sep # cases whose name contains it
+    python3 tools/check-native-featuriser.py --keep          # leave both outputs in /tmp/claude-1000/nf
+
+Each case runs the JavaScript exporter (cuda/af3/export-model.mjs --no-weights, cuda/af2/export_input.mjs,
+cuda/esmfold2/export_input.mjs) and the native one (cuda/featurise/*-featurise) on the same arguments and holds
+them to the SAME BYTES: model.idx's text, model.bin entry by entry, and the PDB records. The first entry that
+differs is named with its first differing element, because "the files differ" says nothing about where.
+
+🔴 A REFUSAL MUST BE THE SAME REFUSAL: a case either exporter refuses passes only when both refuse, in the same
+words - the page's sentence is the answer a reader sees, so the native port may not say something else.
+"""
+import argparse
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+NODE = ["node", "--js-float16array", "--max-old-space-size=24000"]
+WORK = "/tmp/claude-1000/nf"
+FIX = os.path.join(REPO, "tools", "fixtures")
+AF3_EXAMPLES = os.path.join(FIX, "af3-jobs")
+
+SEQ_6MRR = "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"
+TEST_QUERY = open(os.path.join(FIX, "test.a3m")).read().split(">")[1].splitlines()[1].strip()
+AF3_FAMILIES = ["af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1"]
+
+
+def job(name, sequences, **extra):
+    return {"name": name, "modelSeeds": [1], "dialect": "alphafold3", "version": 1, "sequences": sequences, **extra}
+
+
+def protein(chain, sequence, **extra):
+    return {"protein": {"id": chain, "sequence": sequence, **extra}}
+
+
+def cases():
+    """(name, port, job dict or None, extra args, families)"""
+    out = [
+        ("6mrr", "af3", job("t", [protein("A", SEQ_6MRR)]), [], AF3_FAMILIES),
+        ("6mrr-sep-gol", "af3", job("t", [protein("A", SEQ_6MRR, modifications=[{"ptmType": "SEP", "ptmPosition": 3}]),
+                                          {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], AF3_FAMILIES),
+        ("sep-end", "af3", job("t", [protein("A", "MKTAYIAKQRS", modifications=[{"ptmType": "SEP", "ptmPosition": 11}])]),
+         [], AF3_FAMILIES),
+        ("dimer-dna", "af3", job("t", [protein(["A", "B"], "MKTAYIAKQRQISFVKSHFSRQ"),
+                                       {"dna": {"id": "C", "sequence": "ACGTTGCA"}}, {"rna": {"id": "D", "sequence": "ACGUU"}}]),
+         [], AF3_FAMILIES),
+        ("msa-test", "af3", job("t", [protein("A", TEST_QUERY)]), ["--a3m=@test.a3m"], AF3_FAMILIES),
+    ]
+    if os.path.isdir(AF3_EXAMPLES):
+        for name in sorted(os.listdir(AF3_EXAMPLES)):
+            if name.endswith(".json"):
+                out.append((f"example-{name[:-5]}", "af3", os.path.join(AF3_EXAMPLES, name), [], ["af3", "boltz2", "rosettafold3"]))
+    return out
+
+
+def read_idx(path):
+    entries = []
+    for line in open(path).read().splitlines():
+        parts = line.split(" ")
+        if parts[0] == "m":
+            entries.append(("m", parts[1], " ".join(parts[2:])))
+        else:
+            entries.append((parts[0], parts[1], int(parts[2]), int(parts[3])))
+    return entries
+
+
+def compare(js_dir, native_dir):
+    """None when identical, else a sentence naming the first difference."""
+    for name in ("template.pdb", "pdb.template"):
+        a, b = os.path.join(js_dir, name), os.path.join(native_dir, name)
+        if os.path.exists(a) != os.path.exists(b):
+            return f"{name}: present on one side only"
+        if os.path.exists(a) and open(a, "rb").read() != open(b, "rb").read():
+            la, lb = open(a).read().splitlines(), open(b).read().splitlines()
+            for i, (x, y) in enumerate(zip(la, lb)):
+                if x != y:
+                    return f"{name} line {i + 1}: {x!r} against native {y!r}"
+            return f"{name}: {len(la)} lines against native {len(lb)}"
+    ia, ib = read_idx(os.path.join(js_dir, "model.idx")), read_idx(os.path.join(native_dir, "model.idx"))
+    ba, bb = open(os.path.join(js_dir, "model.bin"), "rb").read(), open(os.path.join(native_dir, "model.bin"), "rb").read()
+    for k, (x, y) in enumerate(zip(ia, ib)):
+        if x[0] != y[0] or x[1] != y[1]:
+            return f"entry {k}: {x[0]} {x[1]} against native {y[0]} {y[1]}"
+        if x[0] == "m":
+            if x[2] != y[2]:
+                return f"{x[1]}: {x[2]} against native {y[2]}"
+            continue
+        if x[3] != y[3]:
+            return f"{x[1]}: length {x[3]} against native {y[3]}"
+        ca, cb = ba[x[2] * 4:(x[2] + x[3]) * 4], bb[y[2] * 4:(y[2] + y[3]) * 4]
+        if ca != cb:
+            fmt = "f" if x[0] == "t" else "i"
+            va, vb = struct.unpack(f"<{x[3]}{fmt}", ca), struct.unpack(f"<{y[3]}{fmt}", cb)
+            diff = [i for i in range(x[3]) if struct.pack(f"<{fmt}", va[i]) != struct.pack(f"<{fmt}", vb[i])]
+            i = diff[0]
+            return f"{x[1]}: {len(diff)} of {x[3]} differ, first [{i}] {va[i]!r} against native {vb[i]!r}"
+    if len(ia) != len(ib):
+        extra = (ia if len(ia) > len(ib) else ib)[min(len(ia), len(ib))]
+        return f"{len(ia)} entries against native {len(ib)} (first unmatched: {extra[1]} on the {'JS' if len(ia) > len(ib) else 'native'} side)"
+    return None
+
+
+def run(cmd, cwd=REPO):
+    started = time.time()
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    return p.returncode, p.stdout + p.stderr, time.time() - started
+
+
+def refusal(said):
+    for line in said.splitlines():
+        if line.startswith("Error: ") or "Error: " in line[:40]:
+            return line.split("Error: ", 1)[1].strip()
+    return said.strip().splitlines()[-1] if said.strip() else ""
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--only", default="")
+    parser.add_argument("--family", default="")
+    parser.add_argument("--keep", action="store_true")
+    a = parser.parse_args()
+    native = os.path.join(REPO, "cuda", "featurise", "af3-featurise")
+    if not os.access(native, os.X_OK):
+        sys.exit(f"{native} is not built (cuda/featurise/build.sh)")
+    os.makedirs(WORK, exist_ok=True)
+    failed, passed, skipped = [], 0, 0
+    for name, port, spec, extra, families in cases():
+        if a.only and a.only not in name:
+            continue
+        for family in families:
+            if a.family and family != a.family:
+                continue
+            tag = f"{name}/{family}"
+            base = os.path.join(WORK, name.replace("/", "_") + "-" + family)
+            shutil.rmtree(base, ignore_errors=True)
+            os.makedirs(base)
+            if isinstance(spec, str):
+                job_path = spec
+            else:
+                job_path = os.path.join(base, "job.json")
+                json.dump(spec, open(job_path, "w"))
+            args = [x.replace("@test.a3m", os.path.join(FIX, "test.a3m")) for x in extra]
+            common = ["--no-weights", f"--family={family}", f"--job={job_path}", "--max-msa=512", *args]
+            js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "af3", "export-model.mjs"), base + "/js", *common],
+                                         cwd=os.path.join(REPO, "cuda", "af3"))
+            nv_code, nv_said, nv_s = run([native, base + "/native", *common])
+            if js_code != 0 or nv_code != 0:
+                if js_code != 0 and nv_code != 0 and refusal(js_said) == refusal(nv_said):
+                    print(f"  ok   {tag}: both refuse - {refusal(js_said)}")
+                    passed += 1
+                elif js_code != 0 and nv_code != 0:
+                    failed.append(tag)
+                    print(f"  FAIL {tag}: both refuse, differently\n         JS:     {refusal(js_said)}\n         native: {refusal(nv_said)}")
+                else:
+                    failed.append(tag)
+                    side, said = ("JS", js_said) if js_code != 0 else ("native", nv_said)
+                    print(f"  FAIL {tag}: only {side} refuses - {refusal(said)}")
+                continue
+            problem = compare(base + "/js", base + "/native")
+            if problem:
+                failed.append(tag)
+                print(f"  FAIL {tag}: {problem}")
+            else:
+                passed += 1
+                print(f"  ok   {tag}: identical (JS {js_s:.2f} s, native {nv_s:.2f} s)")
+            if not a.keep and not problem:
+                shutil.rmtree(base, ignore_errors=True)
+    print(f"\n{passed} identical, {len(failed)} differ" + (f": {', '.join(failed)}" if failed else ""))
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

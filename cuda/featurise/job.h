@@ -336,9 +336,51 @@ inline std::string ptmCode(const Json* type, const std::string& where) {
   return code;
 }
 
-inline Job jobFromJson(const std::string& text) {
+// A template the job carries inline (AF3's `templates` of a protein chain): the exporter lifts every one out
+// before the page's reader sees the job - up to four a chain, chain i's k-th in slot k - and builds them itself
+struct JobTemplate { std::string text; int chain = 0; std::string label; bool hasMapping = false; std::vector<std::pair<int, int>> mapping; };
+
+inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTemplate>>* lifted = nullptr) {
   Json parsed;
   try { parsed = parseJson(text); } catch (const std::exception& e) { throw Refusal(std::string("that is not JSON: ") + e.what()); }
+  if (lifted != nullptr) {          // cuda/af3/export-model.mjs: jobTemplates, then `delete body.templates`
+    Json* first = parsed.isArray() ? (parsed.a.empty() ? nullptr : &parsed.a[0]) : &parsed;
+    Json* seqs = nullptr;
+    if (first != nullptr && first->isObject()) for (auto& [k, v] : first->o) if (k == "sequences") seqs = &v;
+    int polymerCopy = 0;
+    if (seqs != nullptr && seqs->isArray()) for (auto& entry : seqs->a) {
+      if (!entry.isObject() || entry.o.empty()) continue;
+      auto& [kind, body] = entry.o[0];
+      if ((kind != "protein" && kind != "rna" && kind != "dna") || !body.isObject()) continue;
+      const Json* id = body.get("id");
+      int copies = id != nullptr && id->isArray() ? (int)id->a.size() : 1;
+      const Json* list = body.get("templates");
+      for (int c = 0; c < copies; ++c) {
+        if (list != nullptr && list->isArray())
+          for (size_t k = 0; k < std::min<size_t>(4, list->a.size()); ++k) {
+            const Json& t = list->a[k];
+            const Json* mmcif = t.get("mmcif");
+            if (mmcif == nullptr || !mmcif->isString())
+              throw std::runtime_error("template " + std::to_string(k) + " of chain " + std::to_string(polymerCopy) + ": give the mmCIF inline");
+            const Json* q = t.get("queryIndices");
+            const Json* ti = t.get("templateIndices");
+            if ((q == nullptr) != (ti == nullptr) || (q && (!q->isArray() || !ti->isArray() || q->a.size() != ti->a.size())))
+              throw std::runtime_error("template " + std::to_string(k) + " of chain " + std::to_string(polymerCopy)
+                                       + ": queryIndices and templateIndices are two lists of one length");
+            JobTemplate jt;
+            jt.text = mmcif->s; jt.chain = polymerCopy; jt.label = "job template " + std::to_string(k);
+            if (q) {
+              jt.hasMapping = true;
+              for (size_t i = 0; i < q->a.size(); ++i) jt.mapping.push_back({(int)jsToNumber(&q->a[i]), (int)jsToNumber(&ti->a[i])});
+            }
+            if (lifted->size() <= k) lifted->resize(k + 1);
+            (*lifted)[k].push_back(std::move(jt));
+          }
+        ++polymerCopy;
+      }
+      body.o.erase(std::remove_if(body.o.begin(), body.o.end(), [](auto& kv) { return kv.first == "templates"; }), body.o.end());
+    }
+  }
   std::vector<const Json*> jobs;
   if (parsed.isArray()) for (auto& j : parsed.a) jobs.push_back(&j);
   else jobs.push_back(&parsed);

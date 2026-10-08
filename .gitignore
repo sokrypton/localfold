@@ -127,3 +127,6 @@ tools/_*.py
 /_merge_state.json
 # af3-any-model's published blobs, fetched for the CUDA ports (cuda/fetch_bundles.py --af3-any-model)
 /af3am-*
+
+# the native featurisers (cuda/featurise/build.sh)
+cuda/featurise/*-featurise
