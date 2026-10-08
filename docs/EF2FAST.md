@@ -3898,8 +3898,9 @@ SMILES ligand on the WebGPU port.
 
 ## 🔴 Against upstream ESMFold2: time, memory, accuracy (2026-10-08)
 
-**The port is 1.6-5x faster than upstream's fastest path, on a third to two thirds of its memory, at the same
-accuracy once both read full-precision weights.** Upstream is biohub's `esm` at repo main, 3.4.1.post1 (`43b4548`,
+**The port is 1.6-5x faster than upstream's fastest path, at the same accuracy once both read full-precision
+weights - and on the full model in half to two thirds of its memory; on the 600M model upstream is lighter below
+~500 tokens and ours above.** Upstream is biohub's `esm` at repo main, 3.4.1.post1 (`43b4548`,
 the speedups co-authored with Claude: the `fused` Triton kernels, the cuEquivariance backend, bf16 autocast),
 against `cuda/ef2/localfold-ef2` on this A100-SXM4-40GB. `tools/esmc/compare-upstream-esmfold2.py` produces every
 number below.
@@ -3912,7 +3913,10 @@ runs **20** loops where the port's bundle (exported from the older revision `8fc
 are measured. Upstream is timed warm (once untimed, then timed, synchronised); the port reports its stage times after
 its weights are up, and featurises in parallel with that, so upstream's `fold()` figures (the full model) also carry
 6-100 ms of featurisation a single sequence and more with an alignment. Memory is the whole PROCESS's, from
-nvidia-smi, for both. One sample a target: read RMSD differences under ~0.1 A as noise.
+nvidia-smi, for both, and each target's own peak above where the process started. 🔴 The first version of this section read
+upstream's as a RUNNING maximum - every target carried the largest before it, and a sample begun before a reset
+wrote the previous peak back - which put the full model at 25-37 GB where it is 14-33; re-measured 2026-10-08 with
+both fixed in the tool. One sample a target: read RMSD differences under ~0.1 A as noise.
 
 ### ESMFold2-fast 600M (the website's)
 
@@ -3924,8 +3928,10 @@ nvidia-smi, for both. One sample a target: read RMSD differences under ~0.1 A as
 | 1TIM | 494 | 5,813 | 2,108 | 1,292 | **760** | 934 |
 | 1TIM x4 | 988 | 65,581 | 7,779 | 4,712 | **2,962** | 3,122 |
 
-(The float32 column ran without the warm-up, so its small targets carry first launches.) Process GPU memory, 68 ->
-988 tokens: upstream fused 2.5 -> 19.1 GB, ours 5.0 -> 8.2 GB (ours sizes its buffers up front and grows less).
+(The float32 column ran without the warm-up, so its small targets carry first launches.) Process GPU memory, 68 /
+195 / 261 / 494 / 988 tokens: upstream fused **2.5 / 3.0 / 3.5 / 5.8 / 16.5 GB**, ours int5 **4.9 / 5.1 / 5.2 / 5.1 /
+8.2** - ours sizes its buffers up front and grows less, so it is the heavier below ~500 tokens and half upstream's at
+988.
 Command to structure, cold: upstream ~18 s (imports and the model load), ours 0.8-1.6 s (4.0 s at 988 tokens).
 
 | CA RMSD to the crystal | upstream fused | ours int5 | ours float32 |
@@ -3952,8 +3958,10 @@ float32 (2.9 GB) or int8 instead.
 | 5CAJ + alignment | 261 | 2,107 -> **622** (3.4x) | 6,147 -> **2,433** (2.5x) |
 | 1TIM + alignment | 494 | 6,575 -> **1,713** (3.8x) | 19,693 -> **7,582** (2.6x) |
 
-Process GPU memory: upstream 25.4 GB to load (ESM-C 6B in bf16) and 37 GB at 988 tokens; ours 8.3 -> 14.8 GB
-(the tower resident as int8). Upstream's model load alone is 10.5 s; ours is 1.6-4 s command to structure.
+Process GPU memory, 68 / 195 / 261 / 494 / 988 tokens (the 3- and 20-loop peaks agree to 0.1 GB): upstream
+**14.1 / 14.6 / 15.2 / 18.4 / 33.0 GB** (ESM-C 6B in bf16, and a transient 25.4 GB while it loads), with the
+alignment 15.8 (5CAJ) and 20.0 (1TIM); ours **9.1 / 9.4 / 9.6 / 10.4 / 14.8**, with the alignment 10.6 and 12.0 (the
+tower resident as int8). Upstream's model load alone is 10.5 s; ours is 1.6-4 s command to structure.
 
 | CA RMSD to the crystal | 3 loops: upstream / ours | 20 loops: upstream / ours |
 |---|---:|---:|

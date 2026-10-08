@@ -47,7 +47,7 @@ def chain_seq(pdb, chain):
 class GpuPeak:
     """the process-level GPU memory peak, sampled every 20 ms (above the level when it started)"""
     def __init__(self):
-        self.base = self.used(); self.peak = self.base; self.stop = False
+        self.base = self.used(); self.peak = self.base; self.stop = False; self.generation = 0
         self.thread = threading.Thread(target=self.run, daemon=True); self.thread.start()
     @staticmethod
     def used():
@@ -55,12 +55,16 @@ class GpuPeak:
                                   capture_output=True, text=True).stdout.split()[0])
     def run(self):
         while not self.stop:
-            try: self.peak = max(self.peak, self.used())
+            try:
+                g = self.generation; u = self.used()
+                # (a sample begun before a reset() is dropped: nvidia-smi takes tens of ms, and a stale reading -
+                # the model load's, the previous case's - written back after the reset was the whole of the peak)
+                if g == self.generation: self.peak = max(self.peak, u)
             except Exception: pass
             time.sleep(0.02)
     def reset(self):
         """a new case: the peak restarts from what is held NOW (the weights), still above the starting level"""
-        self.peak = self.used()
+        self.generation += 1; self.peak = self.used()
     def gib(self):
         return (self.peak - self.base) / 1024
 
