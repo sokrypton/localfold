@@ -700,8 +700,9 @@ at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two an
   register-staged form's shape, swept with `LOCALFOLD_BENCH_ONE=1 --bench-grid=N`, where 64-key tiles win the bench
   by 8% at 510 tokens and lose or tie in the fold (9.43/10.45/10.85 s against 9.76/11.10/10.79, and slower at 261).
   The shipped forms are the best of their family there; what would move the T4 is a different algorithm, not a knob.
-- **Research: what the T4's grid-attention flash kernel spends its time on** (2026-10-07, five Colab rounds). Bench-only
-  ablations (`ABL` on flashGrid2R, `ONE abl ...` arms under `LOCALFOLD_BENCH_ONE=1 --bench-grid`) at 510 tokens: the
+- **Research: what the T4's grid-attention flash kernel spends its time on** (2026-10-07, five Colab rounds; the
+  `ABL`, `S32`, `PREF` and `MINB` forms named here were taken back out of the kernel afterwards - commit 0947029 has
+  them, with their `--bench-grid` arms). Bench-only ablations at 510 tokens: the
   whole kernel 6.33 ms, without P V 5.20, without Q K^T 4.88, without the max and exponentials 5.60, the MMAs alone
   (no softmax, no tile loads) 3.77 - which is itself ~3.6x off the tensor peak, so the units are fed, not starved of
   arithmetic: ~6 bytes of shared memory a score (bias 2, K 2, V 2) on a part with half an A100's shared bandwidth an
@@ -715,8 +716,8 @@ at 1,000, bit-identical; it is taken where an SM holds three (an L4 holds two an
   measurement, not a discovery. Also found and fixed on the way: the register-staged form stages its output in its
   one stage's memory, which four tiles overflow (an illegal access) - it is sized to the larger of the two now.
   The T4 drifts 30% across rounds (9.0 -> 11.9 s for one fold), so a kernel win under ~10% cannot be seen in its folds.
-- **A register-reduced flash kernel for the T4** (2026-10-07; `PREF`/`MINB` on flashGrid2R, arms in `--bench-grid`
-  under `LOCALFOLD_BENCH_ONE=1`). Without the register-held prefetch the shipped shape compiles to 159 registers
+- **A register-reduced flash kernel for the T4** (2026-10-07; `PREF`/`MINB` on flashGrid2R, since removed - commit
+  0947029). Without the register-held prefetch the shipped shape compiles to 159 registers
   (from 195: three blocks an SM instead of two, no spills, bit-identical), and 4 warps of one tile with 32-key tiles to
   80 (four blocks, every warp slot). **Occupancy was not the limit**: in AlphaFold 3 folds on the T4, three rounds
   interleaved, all within ±1% (510 tokens 10.92/11.06/11.16 s and 10.98/11.33/11.39 against 11.75/10.98/11.05; 261

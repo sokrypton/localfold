@@ -1211,6 +1211,12 @@ Verified on the M2 that the guard is inert where nothing over-dispatches:
 
 ## The traps that repeat
 
+🔴 **AND COLAB COMPILES THE NATIVE PORTS WITH CUDA 13; THIS BOX HAS 12.2.** A construct one accepts the other can
+misread without a word: an `else` followed directly by `#pragma unroll` compiled cleanly here and, built on a Colab
+T4, made an ablation arm read 6.8x faster than the kernel - past the T4's peak - until it was braced (native/af3's
+README, the T4 research). Brace every `if constexpr`/`else` body that a pragma opens, compile for sm_75 here before
+a T4 round, and treat a number past the hardware's peak as a broken measurement, never a discovery.
+
 🔴 **AND `gh` TALKS TO THE OTHER PORT BY DEFAULT, WHICH LOOKS LIKE A QUIET
 DEPLOY HISTORY.** This checkout has two remotes - `origin` is
 sokrypton/localfold and `upstream` is martin-steinegger/alphafold2-webgpu, which
