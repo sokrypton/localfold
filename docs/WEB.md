@@ -4093,7 +4093,7 @@ all three, CUDA first.
 **...and the notebook itself, on a fresh Colab T4 (2026-10-03).** The cell as
 committed - only the repository handed in as a git bundle, since it fetches
 `main` - then a reader's page on the service it started: `/health` offers
-`webgpu` and `native`, the picker defaults to CUDA, and the first AF3 fold
+`webgpu` and `native` (the id is `cuda` since 2026-10-08), the picker defaults to CUDA, and the first AF3 fold
 arrived while `cuda/build.sh` was still compiling, waited on it saying
 "compiling the CUDA ports for this card", fetched its bundle shard by shard and
 folded: **81 s** for that one, of which the fold is under two. Every other
