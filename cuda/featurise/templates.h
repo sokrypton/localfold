@@ -340,10 +340,21 @@ struct BuildOptions {
 };
 struct Built { TemplateSlot slot; int residues = 0, of = 0; std::string chain; };
 
+// /^\s*(data_|#|loop_|_)/m over the first 4096 characters, and an _atom_site. anywhere: an mmCIF, not a PDB
+// (a line scan rather than std::regex's multiline, which older libstdc++ lacks)
 inline bool looksLikeCif(const std::string& text) {
-  static const std::regex HEAD(R"(^\s*(data_|#|loop_|_))", std::regex::multiline);
   std::string head = text.substr(0, 4096);
-  return std::regex_search(head, HEAD) && text.find("_atom_site.") != std::string::npos;
+  bool start = false;
+  for (size_t at = 0; at < head.size() && !start; ) {
+    size_t i = at;
+    while (i < head.size() && std::isspace((unsigned char)head[i])) ++i;   // (\s also crosses line ends, as in JS)
+    if (i < head.size() && (head.compare(i, 5, "data_") == 0 || head[i] == '#' || head.compare(i, 5, "loop_") == 0 || head[i] == '_'))
+      start = true;
+    size_t nl = head.find('\n', at);
+    if (nl == std::string::npos) break;
+    at = nl + 1;
+  }
+  return start && text.find("_atom_site.") != std::string::npos;
 }
 
 inline Built buildTemplate(const BuildOptions& o) {
