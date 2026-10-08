@@ -28,7 +28,7 @@ if (!out || out.startsWith("--") || (sequence === "" && option("job", "") === ""
 }
 // what the page folds besides one protein chain, resolved as cuda/af3's exporter and the page do:
 // --kinds (one per ":"-chain: protein, dna, rna), --ligands (CCD codes, from the RCSB), --smiles
-// (built by src/chem), --modify (CODE@position[@chain], chain index from 0), or an AF3 job file read
+// (built by shared/chem), --modify (CODE@position[@chain], chain index from 0), or an AF3 job file read
 // by the page's own reader (web/job-json.js, web/entities.js: its ligands, glycans, modified residues
 // and bases, declared bonds and userCCD)
 const { ccdUrl, parseCcdComponent, ligandChain } = await import("../../shared/af3/featurise/ccd-component.js");

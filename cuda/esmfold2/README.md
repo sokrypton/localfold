@@ -34,7 +34,7 @@ cuda/esmfold2/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.js
 The input options are cuda/af3's exporter's, resolved the same way:
 - `--kinds`: one per chain, protein, dna or rna.
 - `--ligands`: CCD codes, fetched from the RCSB.
-- `--smiles`: built by src/chem.
+- `--smiles`: built by shared/chem.
 - `--modify`: `CODE@position[@chain]`, modified residues and bases.
 - `--job`: an AlphaFold 3 job file read by the page's own reader (`web/job-json.js`): its ligands,
   glycans, ions, modified residues and bases, declared bonds and `userCCD`.

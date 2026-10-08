@@ -1,7 +1,7 @@
 # AlphaFold 3 in CUDA
 
 A native CUDA/cuBLAS AlphaFold 3, transcribed stage by stage from this repository's CPU
-references under `src/af3/` (the specification) and checked against af3-any-model's own
+references under `cpu/af3/` (the specification) and checked against af3-any-model's own
 oracle dumps in `oracle-dumps/`, for all seven AF3-lineage families (AlphaFold 3, Protenix-2,
 Boltz-2, IntelliFold-2, RoseTTAFold3, OpenBind-0, OpenDDE). It takes what AlphaFold 3 takes - an
 AF3 job JSON in either dialect (all fourteen of AF3's example jobs fold), or a sequence with
