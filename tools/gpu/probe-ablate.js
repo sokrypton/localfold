@@ -19,8 +19,8 @@
  * rather than argued.
  */
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
-import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder-webgpu.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
+import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder.js";
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";
 import { ALPHAFOLD3, OPENBIND0 } from "../../shared/af3/dialect.js";

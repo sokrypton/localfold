@@ -42,9 +42,9 @@
  * at sigma = 16 (SIGMA_DATA) skip and out are both 1/2 - so a swapped pair of
  * scalings is invisible there and nowhere else.
  */
-import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
-import { sampleOnGpu } from "../../webgpu/af3/diffusion/diffusion-sampler-webgpu.js";
-import { atomCrossAttentionEncoder as encodeCpu } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder.js";
+import { sampleOnGpu } from "../../webgpu/af3/diffusion/diffusion-sampler.js";
+import { atomCrossAttentionEncoder as encodeCpu } from "../../cpu/af3/diffusion/atom-encoder.js";
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";
 

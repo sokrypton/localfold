@@ -29,7 +29,7 @@ import { EvoformerStackGpu } from "../../webgpu/af2/evoformer/stack.js";
 import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
-import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk.js";
 import { buildTargetFeat, DIALECT } from "../../webgpu/af3/fold.js";
 import { openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";

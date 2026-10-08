@@ -1,4 +1,4 @@
-// ESM-C's tower and ESMFold2's language-model shim (cpu/esmc/tower-reference.js is the reading):
+// ESM-C's tower and ESMFold2's language-model shim (cpu/esmc/tower.js is the reading):
 //
 //   h    = LN(x; attn_norm) @ qkv -> [q | k | v]
 //   q, k = LN(q; q_norm), LN(k; k_norm)      over the FULL width, no offset, before the heads exist

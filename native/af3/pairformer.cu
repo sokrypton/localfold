@@ -1,5 +1,5 @@
 // One AlphaFold 3 pairformer block in CUDA + cuBLAS, transcribed from
-// cpu/af3/trunk/pairformer-reference.js (the spec), checked against its output.
+// cpu/af3/trunk/pairformer.js (the spec), checked against its output.
 //
 //   block <data-dir> [--tokens=N] [--tf32] [--repeat=K]
 //

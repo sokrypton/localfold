@@ -1,6 +1,6 @@
 // The pair track - triangle multiplication, grid ("triangle") attention, transition -
 // shared by the pairformer, the MSA stack and the template stack. Transcribed from
-// cpu/af3/trunk/pairformer-reference.js; generic in channels, heads and head width.
+// cpu/af3/trunk/pairformer.js; generic in channels, heads and head width.
 #pragma once
 #include "common.cuh"
 

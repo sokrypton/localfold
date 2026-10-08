@@ -60,7 +60,7 @@ const REPLAY_RUN = 512;
  * of 32 and nothing else, written into the constants and into the shader's
  * `* 5u` and `& 31u`. ESM-C ships **int3 at a group of 128** - the only bundle
  * in the repository that is not int5 - so the whole of its 600M parameters had
- * to be decoded on the HOST, which `webgpu/esmc/tower-webgpu.js` measures at 1121
+ * to be decoded on the HOST, which `webgpu/esmc/tower.js` measures at 1121
  * ms of decode and 723 of narrowing across 36 blocks against 660 ms of GPU.
  *
  * Both are the same arithmetic at a different width. What a codec has to

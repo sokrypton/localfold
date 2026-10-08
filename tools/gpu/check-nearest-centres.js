@@ -16,7 +16,7 @@
  * check-esmfold2-trunk-pack.js keeps its own arm.
  */
 import { paddedCodeWords } from "../../shared/input/a3m-features.js";
-import { assignNearestCentres } from "../../webgpu/input/nearest-centres-webgpu.js";
+import { assignNearestCentres } from "../../webgpu/input/nearest-centres.js";
 
 /** The shipped host loop, copied. Keep this in step deliberately, never by import. */
 function hostAssign(centreWords, extraWords, words, centreCount, rows) {

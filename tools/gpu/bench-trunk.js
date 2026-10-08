@@ -30,7 +30,7 @@
  */
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../webgpu/af3/fold.js";
-import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk.js";
 import { profileDevice } from "./profile.js";
 import { memorySnapshot, setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
 import { af3Dialect, openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
@@ -111,7 +111,7 @@ export async function main(device, args) {
     // It defaults to f32 on a measurement taken when every kernel reading it
     // was a VECTOR one; most of them are staged matrix GEMMs now, and those
     // round their weights to halves on the way in whatever the buffer holds.
-    // See webgpu/af3/trunk/pairformer-block-webgpu.js.
+    // See webgpu/af3/trunk/pairformer-block.js.
     pairWeightPrecision: option(args, "pair-weights", undefined),
     accumulatePrecision: option(args, "accumulate", undefined),
   });

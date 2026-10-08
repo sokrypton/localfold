@@ -18,8 +18,8 @@
  */
 import { join } from "node:path";
 
-import { embed } from "../../cpu/af3/trunk/embedder-reference.js";
-import { msaBlock } from "../../cpu/af3/trunk/msa-reference.js";
+import { embed } from "../../cpu/af3/trunk/embedder.js";
+import { msaBlock } from "../../cpu/af3/trunk/msa.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
 
 const EVO = "diffuser/evoformer";

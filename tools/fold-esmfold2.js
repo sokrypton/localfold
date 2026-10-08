@@ -21,14 +21,14 @@ import { join } from "node:path";
 import process from "node:process";
 
 import { readTensor } from "../shared/weights/dtype.js";
-import { transition, triangleMultiplication } from "../cpu/af3/trunk/pairformer-reference.js";
+import { transition, triangleMultiplication } from "../cpu/af3/trunk/pairformer.js";
 import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
-} from "../cpu/esmfold2/pair-features-reference.js";
-import { atomDecoder, inputsEmbedder } from "../cpu/esmfold2/atom-transformer-reference.js";
-import { denoiseStep } from "../cpu/esmfold2/diffusion-reference.js";
+} from "../cpu/esmfold2/pair-features.js";
+import { atomDecoder, inputsEmbedder } from "../cpu/esmfold2/atom-transformer.js";
+import { denoiseStep } from "../cpu/esmfold2/diffusion.js";
 import { centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
-         samplerStep, weightedRigidAlign } from "../cpu/esmfold2/sampler-reference.js";
+         samplerStep, weightedRigidAlign } from "../cpu/esmfold2/sampler.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const flag = (name, fallback) => {

@@ -21,9 +21,9 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { packOuterProductMeanWeights } from "../webgpu/af3/trunk/outer-product-mean-webgpu.js";
-import { packGridAttentionWeights } from "../webgpu/af3/trunk/grid-attention-webgpu.js";
-import { packTransitionWeights } from "../webgpu/af3/trunk/transition-webgpu.js";
+import { packOuterProductMeanWeights } from "../webgpu/af3/trunk/outer-product-mean.js";
+import { packGridAttentionWeights } from "../webgpu/af3/trunk/grid-attention.js";
+import { packTransitionWeights } from "../webgpu/af3/trunk/transition.js";
 import { packNamedWeights } from "../shared/weights/weight-pack.js";
 
 /**
@@ -200,10 +200,10 @@ describe("carriesTensor, the presence rule that cost 7x", () => {
 
   it("is what the five former predicates now call", async () => {
     const { blockHasUpGate, blockHasKqNorm } =
-      await import("../webgpu/af3/diffusion/atom-encoder-webgpu.js");
+      await import("../webgpu/af3/diffusion/atom-encoder.js");
     const { txHasUpGate, txHasKqNorm } =
-      await import("../webgpu/af3/diffusion/diffusion-transformer-webgpu.js");
-    const { hasBondTypes } = await import("../webgpu/af3/trunk/embedder-webgpu.js");
+      await import("../webgpu/af3/diffusion/diffusion-transformer.js");
+    const { hasBondTypes } = await import("../webgpu/af3/trunk/embedder.js");
     const { SOURCES } = await import("../shared/weights/weight-sources.js");
     const block = { [SOURCES]: { ffwAToB: { count: 1 }, queryLayerNormScale: null } };
     assert.equal(blockHasUpGate(block), true);

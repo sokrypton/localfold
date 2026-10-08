@@ -33,8 +33,8 @@ import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
 import { structuralBatch, structuralLayout }
   from "../../shared/af3/featurise/structural-tokens.js";
 import { expandStructural, structuralAttentionBias, structuralPairFeatures }
-  from "../../cpu/af3/structure/structural-expander-reference.js";
-import { Af3PairformerStackGpu } from "../../webgpu/af3/trunk/pairformer-block-webgpu.js";
+  from "../../cpu/af3/structure/structural-expander.js";
+import { Af3PairformerStackGpu } from "../../webgpu/af3/trunk/pairformer-block.js";
 import {
   af3Dialect, openAf3Store, structuralExpanderWeights, structuralRefinerWeights,
 } from "../../shared/af3/weights/weights.js";

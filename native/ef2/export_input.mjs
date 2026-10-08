@@ -85,7 +85,7 @@ const flt = (name, v) => entries.push(["t", name, v instanceof Float32Array ? v 
 int("residue_index", f.residueIndex); int("token_index", f.tokenIndex); int("asym_id", f.asymId);
 int("entity_id", f.entityId); int("sym_id", f.symId); int("mol_type", f.molType);
 int("res_type", f.residueType); int("input_ids", f.inputIds);
-// the page's contact rule (webgpu/esmfold2/distogram-webgpu.js): per pair, how many distogram bins lie under
+// the page's contact rule (webgpu/esmfold2/distogram.js): per pair, how many distogram bins lie under
 // its threshold - for the 128-bin distogram both published checkpoints carry, stamped, so the binary
 // refuses them against any other
 // (--fold-bundle=<dir>: the released models' 64-bin distogram is AlphaFold 3's grid, counted by AF3's rule)

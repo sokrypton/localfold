@@ -129,7 +129,7 @@ const MAX_EXTRA_SEQUENCES = 1024;
 /**
  * The two padded, word-aligned code blocks the comparison reads.
  *
- * 🔴 SHARED WITH THE GPU PATH ON PURPOSE. webgpu/input/nearest-centres-webgpu.js
+ * 🔴 SHARED WITH THE GPU PATH ON PURPOSE. webgpu/input/nearest-centres.js
  * has to compare the SAME bytes for its answer to be the same answer, and a
  * second copy of this padding is a second chance to get 255-against-254 wrong.
  */
@@ -195,7 +195,7 @@ function nearestCentres(centerCodes, encoded, extras, centreCount, length) {
  * planned, then every nearest-centre search run, then every recycle finished.
  * The host path still runs one search per plan; the device path sends all of
  * them in ONE submit, which is where the round trips go. Splitting the loop is
- * the whole reason webgpu/input/nearest-centres-webgpu.js can batch.
+ * the whole reason webgpu/input/nearest-centres.js can batch.
  */
 function planA3mFeatures(a3mText, tables, options) {
   featureStats.calls += 1;

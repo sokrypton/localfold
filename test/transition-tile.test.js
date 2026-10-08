@@ -4,11 +4,11 @@
 // THEM. Every arm of tools/gpu/bench-transition.js is bit-identical - relRMS 0
 // across eight tile/chunk pairs - so a rule that re-tunes a stack changes only
 // its SPEED, silently, and no differential checker anywhere will say so. This
-// pins the table in transition-webgpu.js's STAGED_TILE_FLOATS note: the rule
+// pins the table in transition.js's STAGED_TILE_FLOATS note: the rule
 // generalised from the row count to the channel count to fix ESMFold2's trunk,
 // and the point of the generalisation is that only that row moves.
 import { describe, expect, it } from "./harness.js";
-import { transitionChunk, transitionRowTile } from "../webgpu/af3/trunk/transition-webgpu.js";
+import { transitionChunk, transitionRowTile } from "../webgpu/af3/trunk/transition.js";
 
 // stack, rows, channels, factor, expected tile, expected chunk
 const SHAPES = [

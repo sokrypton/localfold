@@ -869,7 +869,7 @@ tile is 4,672 bytes and fits anything, which is why a constant nobody priced
 survived five models.
 
 🔴 **AND IT IS IN TWO FILES, WHICH MADE THE FIRST HALF OF THE FIX LOOK LIKE NO
-FIX AT ALL.** `grid-attention-webgpu.js` and `webgpu/kernels/triangle/shaders.js` each
+FIX AT ALL.** `grid-attention.js` and `webgpu/kernels/triangle/shaders.js` each
 carry their own copy of that LayerNorm, and both come to **exactly** 16,960
 bytes at 512 channels - so fixing one left the error byte-for-byte identical and
 read as "the flag is not reaching the kernel". docs/ARCHITECTURE.md lists this
@@ -1146,7 +1146,7 @@ the same scopes. It is built now; see the template section.
 
 ### The template stack's width was a constant, and IntelliFold-2's is 256
 
-`const CHANNELS = 64` sat in BOTH template-reference.js and template-webgpu.js.
+`const CHANNELS = 64` sat in BOTH template.js and template.js.
 It is 64 in five checkpoints and **256 in if2**, whose template grid attention is
 8 heads of 32 against AF3's 4 of 16. `templateWeights` reads it now from the norm
 after the stack - `output_layer_norm/scale` for the nine-projection embedder and
@@ -1307,7 +1307,7 @@ the 1.12e-4 is approximation rather than error. Without an arm that genuinely
 gets f32 there is no way to tell those two apart.
 
 🔴 **AND THE TRUNK HAS THREE PAIR TRACKS, WHICH IS WHY THE FIRST PIN DID
-NOTHING.** `pairMatrixKernels` wired into `pairformer-block-webgpu.js` alone
+NOTHING.** `pairMatrixKernels` wired into `pairformer-block.js` alone
 moved an f32 request from 1.12e-4 to 1.11e-4: the MSA stack and the template
 embedder compile their own `compilePairTrack` and kept theirs. All three take
 the option now, and both of the other two had to learn to read it from the
@@ -1778,9 +1778,9 @@ After that:
 
 - **The model never saw it.** `fold.js` assembles the trunk's input as an object
   literal and did not name `bondMatrix`, so the embedder got `undefined` - which
-  is indistinguishable from a fold with no ligand. And `embedder-webgpu.js`, the
+  is indistinguishable from a fold with no ligand. And `embedder.js`, the
   one a browser fold runs, had neither the `bondEmbedding` weight nor the term,
-  while `embedder-reference.js` had both. `diffuser/evoformer/bond_embedding/
+  while `embedder.js` had both. `diffuser/evoformer/bond_embedding/
   weights` was in the shipped bundle, downloaded on every fold, multiplied by
   nothing. `tools/gpu/check-af3-embedder.js` passed throughout because its
   fixture carried no bond matrix either: **a feature absent from both sides of a
@@ -2128,7 +2128,7 @@ measurements is in each file.
   left is ~4 ms of genuine dense work and is no longer worth a kernel.
 - ~~**Templates raise** rather than compute.~~ Closed on the CPU 2026-09-04:
   `shared/af3/featurise/template-features.js` computes all six geometry features and
-  `template-reference.js` loops over real slots. Against AF3 on a 16-residue
+  `template.js` loops over real slots. Against AF3 on a 16-residue
   query with Top7 in slot 0 of four:
 
   | | relRMS |
@@ -2936,7 +2936,7 @@ working well. The binder's length is passed in now.
 `tools/oracle/dump_af3_trunk.py --template <pdb>[:CHAIN]` folds a query with a
 real structure as its template and captures the module's inputs and its
 per-slot outputs. That answers the objection at the top of
-`cpu/af3/trunk/template-reference.js` - "with no template the six geometry features
+`cpu/af3/trunk/template.js` - "with no template the six geometry features
 are identically zero, so nothing here can tell a correct implementation of them
 from a wrong one" - which was true and is the reason only the empty-slot path
 exists. See docs/AF3.md's template entry for the numbers.
@@ -3292,9 +3292,9 @@ trunk looks the way it does.
 ### 🔴 And `pairTransitionChunkBytes` never reached this track at all
 
 Chasing that starved dispatch found the reason a knob could not move it.
-`pairformer-block-webgpu.js` and `msa-stack-webgpu.js` both put
+`pairformer-block.js` and `msa-stack.js` both put
 `pairTransitionChunkBytes` into the options they hand `encodePairTrack`, and
-`pair-track-gpu.js` - the only caller of `transitionSplitChunkRows` - never read
+`pair-track.js` - the only caller of `transitionSplitChunkRows` - never read
 it, so the rule fell back to its own 64 MiB default. **Every AF3 and OpenDDE arm
 ever measured with that knob was measured at 64 MiB**, which is why the first
 sweep of 64, 128 and 256 moved the group count not at all and the pass by 0.4 ms
@@ -3769,7 +3769,7 @@ is what found the `rt_j`/`rt_i` order above. Dump it first.
 scopes mapped and 0 unmapped - as
 `oracle-dumps/af3-oracle-template-protenix2.json`: 76 tokens, the 108 feature
 columns and the module's output separately. `fusedTemplateEmbedding` in
-cpu/af3/trunk/template-reference.js is held to it by
+cpu/af3/trunk/template.js is held to it by
 `tools/gpu/check-af3-template-fused.js` at **relRMS 1.52e-7**, ours rms 12.4434
 against native's 12.4434.
 
@@ -4413,7 +4413,7 @@ Thirty-fold on three of the five, for nothing measurable. **A cost nobody has
 measured is not a reason; it is a measurement nobody has taken.**
 
 🔴 **AND THE SAME LINE IS IN THE TRUNK, WHERE IT IS LATENT.**
-`pairformer-block-webgpu.js` sizes its scratch by `pairChannels` too, and every
+`pairformer-block.js` sizes its scratch by `pairChannels` too, and every
 trunk shipped here has `heads * dimension == channels`, so it has never been
 wrong. Written the same way now, so the next checkpoint does not pay for it
 twice.
@@ -5590,7 +5590,7 @@ from the other side. So it is not "rf3 wants sigma0 16"; it is "rf3 wants
 sigma0 16 AT eight steps", and the page's flow preset is sixteen cycles.
 
 🔴 **AND 16 CANNOT BE THE GLOBAL DEFAULT**, which is why this is a dialect field
-and not a constant change: the note in diffusion-sampler-webgpu.js records that
+and not a constant change: the note in diffusion-sampler.js records that
 sigma0 = 16 COLLAPSES AlphaFold 3's protein, and probe-ligand-flow.js chose 160
 as the value safe for protein and ligand together. Two checkpoints, two optima.
 
@@ -6239,7 +6239,7 @@ residues rather than of a checkpoint. Past ~400 residues it breaks outright.
 worse fold**, so `index.html` no longer offers it and `AF3_COUNTS` has no row.
 
 What stays: `--mode=ode` on any fold tool, and the step in
-`diffusion-sampler-webgpu.js`. The intellifold2 square is real and nobody has
+`diffusion-sampler.js`. The intellifold2 square is real and nobody has
 explained it, so removing the code would throw away the question along with the
 option. `foldBatch` still validates the three modes and still throws on a
 fourth.

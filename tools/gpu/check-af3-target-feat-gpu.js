@@ -23,10 +23,10 @@
  * would work identically and would suggest it mattered.
  */
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder.js";
 import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";
-import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder-webgpu.js";
+import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder.js";
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";
 

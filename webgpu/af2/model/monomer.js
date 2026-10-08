@@ -4,7 +4,7 @@ import {
   encodeEvoformerBlock, encodeExtraMsaBlock,
 } from "../evoformer/block.js";
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
-import { encodeContactProbabilities } from "../../heads/distogram-webgpu.js";
+import { encodeContactProbabilities } from "../../heads/distogram.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
 import { settleReleasedMemory } from "../../runtime/allocator.js";
 import { af2Plan, planTotal } from "../../runtime/cost-model.js";
@@ -15,7 +15,7 @@ import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
 } from "../../../shared/af2/model/recycle-convergence.js";
 
-import { makeA3mFeaturesFor } from "../../input/a3m-features-webgpu.js";
+import { makeA3mFeaturesFor } from "../../input/a3m-features.js";
 
 /**
  * @typedef {import("../structure/module.js").StructureModuleResult} StructureModuleResult
@@ -412,7 +412,7 @@ export class AlphaFoldMonomerGpu {
         // It used to take `pairHost` and run the distogram head in JavaScript
         // on the main thread - 3.4 s of a 6.0 s fold at 261 residues. `contacts`
         // is the distogram head; `L * L` probabilities come back instead of
-        // `L * L * 128` floats. See webgpu/heads/distogram-webgpu.js.
+        // `L * L * 128` floats. See webgpu/heads/distogram.js.
         const contactTensor = recycleOptions.contacts === undefined ? undefined
           : await encodeContactProbabilities(execution, readbackEncoder,
             embedding.pairWithoutTemplates, recycleOptions.contacts, length);

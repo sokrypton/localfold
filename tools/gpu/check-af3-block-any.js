@@ -17,8 +17,8 @@
  * It is differential, not oracle: it says the GPU computes what the reference
  * computes, not that OpenDDE agrees.
  */
-import { pairformerBlock } from "../../cpu/af3/trunk/pairformer-reference.js";
-import { Af3PairformerStackGpu } from "../../webgpu/af3/trunk/pairformer-block-webgpu.js";
+import { pairformerBlock } from "../../cpu/af3/trunk/pairformer.js";
+import { Af3PairformerStackGpu } from "../../webgpu/af3/trunk/pairformer-block.js";
 import { af3Dialect, openAf3Store, pairformerBlockWeights } from "../../shared/af3/weights/weights.js";
 import { deviceTuning, setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
@@ -125,7 +125,7 @@ export async function main(device, args) {
   //     ...accumulate f16 (the default where f16 is)     8.3e-2
   //
   // The f16 triangle ACCUMULATOR is the loosest and it is a recorded trade, not
-  // a defect - see webgpu/af3/trunk/pair-track-gpu.js. A bound wide enough for it is
+  // a defect - see webgpu/af3/trunk/pair-track.js. A bound wide enough for it is
   // 0.15 and still catches a kernel that is actually wrong, because a wrong
   // kernel here is order one. `--bound=` overrides.
   //

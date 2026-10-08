@@ -30,7 +30,7 @@
  * 1e-3, which is half precision and not a fault. A tile that leaves rows
  * unwritten shows up far larger; that is still what the column is for.
  */
-import { createGridAttentionShaders } from "../../webgpu/af3/trunk/grid-attention-webgpu.js";
+import { createGridAttentionShaders } from "../../webgpu/af3/trunk/grid-attention.js";
 import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
 
 const option = (args, name, fallback) => {

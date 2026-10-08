@@ -26,7 +26,7 @@
  * null looks like when the instrument works. On an A100 the same knob is
  * worth 526 ms of a sampler.
  */
-import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
+import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer.js";
 import { deviceProfile } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {

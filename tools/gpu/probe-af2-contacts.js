@@ -35,7 +35,7 @@
  *
  * 🔴 AND IT HOLDS THE DEVICE'S MAP TO THIS HOST FUNCTION. The page asks
  * monomer.js for `contacts` and the probabilities come from
- * webgpu/heads/distogram-webgpu.js; every pass here asserts the two agree
+ * webgpu/heads/distogram.js; every pass here asserts the two agree
  * (`deviceMaxAbsDiff`, bar 1e-4), so the AUC above scores both.
  *
  * 🔴 AND THE DIAGONAL IS EXCLUDED. Neighbours are in contact in any chain,
@@ -156,7 +156,7 @@ export async function main(device, args) {
       }
     }
     // 🔴 AND THE DEVICE'S MAP, WHICH IS THE ONE THE PAGE SHOWS. `contacts` is
-    // webgpu/heads/distogram-webgpu.js over the same pass's pair; f32 against
+    // webgpu/heads/distogram.js over the same pass's pair; f32 against
     // this function's f64 accumulators, so the bar is a rounding one.
     const device_ = recycle.contactProbs;
     const deviceMaxAbsDiff = device_ === undefined ? null

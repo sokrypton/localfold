@@ -1,5 +1,5 @@
 /**
- * AF3's confidence head: GPU against cpu/af3/confidence/confidence-reference.js.
+ * AF3's confidence head: GPU against cpu/af3/confidence/confidence.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-confidence.js
  *
@@ -8,10 +8,10 @@
  * it as (384, 50) and broadcasting gives plausible per-residue numbers, so a
  * check that compares token-wise means would pass on it.
  */
-import { confidenceHead, distogramFeatures } from "../../cpu/af3/confidence/confidence-reference.js";
-import { linear } from "../../cpu/af3/trunk/pairformer-reference.js";
-import { pairformerBlock } from "../../cpu/af3/trunk/pairformer-reference.js";
-import { Af3ConfidenceHeadGpu } from "../../webgpu/af3/confidence/confidence-webgpu.js";
+import { confidenceHead, distogramFeatures } from "../../cpu/af3/confidence/confidence.js";
+import { linear } from "../../cpu/af3/trunk/pairformer.js";
+import { pairformerBlock } from "../../cpu/af3/trunk/pairformer.js";
+import { Af3ConfidenceHeadGpu } from "../../webgpu/af3/confidence/confidence.js";
 import { confidenceWeights, openAf3Store } from "../../shared/af3/weights/weights.js";
 
 const DIALECT = { swapTransposedBias: false };

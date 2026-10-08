@@ -2,7 +2,7 @@
 // backbone and a sidechain token (a ligand atom stays one), the expander maps the trunk's single
 // and pair onto those, a four-block refiner runs on them, and the diffusion and OpenDDE's own
 // confidence head run in that token space. Transcribed from webgpu/af3/fold.js
-// (expandToStructuralTokens), cpu/af3/structure/structural-expander-reference.js and
+// (expandToStructuralTokens), cpu/af3/structure/structural-expander.js and
 // webgpu/af3/confidence/opendde-confidence.js. The layout, the structural batch (sbatch.*) and the
 // pair features come from the exporter, which runs the page's own structural-tokens.js.
 #pragma once

@@ -18,8 +18,8 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import { ALPHAFOLD3, OPENDDE } from "../shared/af3/dialect.js";
-import { msaBlock } from "../cpu/af3/trunk/msa-reference.js";
-import { embed } from "../cpu/af3/trunk/embedder-reference.js";
+import { msaBlock } from "../cpu/af3/trunk/msa.js";
+import { embed } from "../cpu/af3/trunk/embedder.js";
 
 /** A deterministic pseudo-random array, so a difference is the branch. */
 function noise(length, seed) {

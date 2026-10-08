@@ -180,7 +180,7 @@ export function getDevice() {
     // overlapped the next on the card. 90% of a T4 was tried then, and
     // IntelliFold-2 at 768 residues ran past the card and lost the device. The
     // trunk now shares its stacks' scratch and settles freed memory at its
-    // stage boundaries (trunk-webgpu.js, settleReleasedMemory), which brought
+    // stage boundaries (trunk.js, settleReleasedMemory), which brought
     // that fold's driver peak to 8.7 GB against 9.0 live; 80% leaves the rest
     // for Chrome's and Dawn's own. Everywhere else the host-RAM guess stands.
     const asked = new URLSearchParams(location.search);

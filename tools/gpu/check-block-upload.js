@@ -17,7 +17,7 @@
 import { openAf3Store, SOURCES } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights } from "../../shared/af3/weights/diffusion-weights.js";
 import { BLOCK_ORDER, packBlockWeights }
-  from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
+  from "../../webgpu/af3/diffusion/diffusion-transformer.js";
 import { planBlockUpload, runBlockUpload } from "../../webgpu/weights/quantised-upload.js";
 import { writeInto } from "../../shared/weights/float16.js";
 

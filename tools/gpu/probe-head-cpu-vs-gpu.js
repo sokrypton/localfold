@@ -29,10 +29,10 @@
 import { batchFromDump } from "./fold.js";
 import { sidechainGeometry } from "./sidechain-geometry.js";
 import { normalFrom } from "../../webgpu/af3/fold.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
-import { diffusionHead } from "../../cpu/af3/diffusion/diffusion-reference.js";
-import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder.js";
+import { diffusionHead } from "../../cpu/af3/diffusion/diffusion.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head.js";
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../shared/af3/weights/diffusion-weights.js";

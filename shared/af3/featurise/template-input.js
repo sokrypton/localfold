@@ -3,7 +3,7 @@
  *
  * The output is one slot: `{aatype, atomPositions, atomMask}` over the QUERY's
  * tokens, in AF3's dense-24 layout. shared/af3/featurise/template-features.js turns that
- * into the six geometry features and webgpu/af3/trunk/template-webgpu.js embeds them.
+ * into the six geometry features and webgpu/af3/trunk/template.js embeds them.
  *
  * 🔴 THERE IS NO ATOM TABLE HERE, AND THAT IS THE POINT. AF3's dense layout is
  * exactly the order `conformerFor` lists a residue's atoms in - N, CA, C, O,

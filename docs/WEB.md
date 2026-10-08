@@ -3718,7 +3718,7 @@ floats, 35 MB at 261) and ran the distogram head over it in JavaScript
 the fold's own steps, so it delayed them rather than overlapping. With it
 switched off the page's AF2 fold at 255 residues was **2.6 s against 6.0**, the
 fold tool's own 2.5 at those settings. It is on the device now
-(`webgpu/heads/distogram-webgpu.js`, monomer.js's `contacts` option): `L * L`
+(`webgpu/heads/distogram.js`, monomer.js's `contacts` option): `L * L`
 probabilities come back, `probe-af2-contacts.js` holds them to the host function
 every pass (5-7e-7 at 58 residues, 1.0e-6 at 255; a kernel reading the forward
 pair twice fails at 0.14), and `fold-in-page.py --model monomer` still puts a
@@ -3925,7 +3925,7 @@ Three changes, found in this order:
    residues: 12.65 GB peak, 9.8 GB of it `af3-msa.scratch0-4`, and nothing
    after the trunk above 7.4 GB. The vector kernels already have a layout
    that needs three and a quarter (the grid by row chunks, the triangle by
-   channel quarters - `compact` in pair-track-gpu.js), but the matrix
+   channel quarters - `compact` in pair-track.js), but the matrix
    projections and attend need whole tensors, so it was never taken where
    they run (developer flags, and the Colab runtime). The trunk now takes
    the lean layout for both stacks (they share one pool) when
@@ -3994,14 +3994,14 @@ refused first, both in the TEMPLATE stage:
   so every scratch buffer was two or four times the track - rf3's was a 4 GiB
   buffer, which no NVIDIA card can even bind. Only the grid's q/k/v/gate
   chunks are that wide, so the grid now runs in as many row chunks as it takes
-  for them to fit a channel-wide buffer (`gridParts` in pair-track-gpu.js;
+  for them to fit a channel-wide buffer (`gridParts` in pair-track.js;
   quarters still for every stack whose attention is no wider than its track,
   which is every trunk). Bit-identical, and at 600 residues the template
   stage's peak drops 1183 -> 919 MiB (boltz2) and 1563 -> 772 (rf3).
 - **RoseTTAFold3's confidence global norm streams the device pair** instead of
   normalising a host copy: two 2 GiB arrays (the copy and the normalised one)
   at 2047 tokens, which the browser will not allocate. `streamGlobalNorm` in
-  confidence-webgpu.js does the same arithmetic in the same order over 256 MiB
+  confidence.js does the same arithmetic in the same order over 256 MiB
   pieces - three passes, sum, variance, normalise-and-upload - so it is
   bit-identical: `test:stock`'s rf3 signature 81.53424395815864 unchanged, and
   it now runs at every size, so the gate exercises it.

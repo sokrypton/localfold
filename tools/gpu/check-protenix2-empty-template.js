@@ -18,9 +18,9 @@
  * `evoformer/template_embedding` from the same trunk run. If the CPU matches,
  * the GPU path is the defect; if it does not, the empty-slot handling is.
  */
-import { fusedTemplateEmbedding } from "../../cpu/af3/trunk/template-reference.js";
+import { fusedTemplateEmbedding } from "../../cpu/af3/trunk/template.js";
 import { Af3TemplateEmbedderGpu, fusedTemplateFeatures }
-  from "../../webgpu/af3/trunk/template-webgpu.js";
+  from "../../webgpu/af3/trunk/template.js";
 import { openAf3Store, templateWeights, af3Dialect } from "../../shared/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {

@@ -632,7 +632,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 static bool DETACH = false;
 // --nearest=<out> (a serve job, with the job's input naming a search file): every recycle's nearest-centre search
 // of an alignment's featurisation on the device - shared/input/a3m-features.js's nearestCentres, the page's
-// nearest-centres-webgpu.js in CUDA - written as the assignments, no fold. The search was ~160 ms of a deep
+// nearest-centres.js in CUDA - written as the assignments, no fold. The search was ~160 ms of a deep
 // alignment's export a recycle in Node (5CAJ's 7907 rows), four times over on a Colab T4's two CPUs.
 // The file: int32 recycles, words; then per recycle int32 centres, rows, the centres' padded code words
 // [centres][words] and the extra rows' [rows][words] (paddedCodeWords). Out: per recycle int32 [rows].

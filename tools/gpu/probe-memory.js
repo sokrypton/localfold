@@ -17,7 +17,7 @@ import { openAf3Store, trunkWeights, confidenceWeights } from "../../shared/af3/
 import { targetFeatureWeights, diffusionWeights, atomReference } from "../../shared/af3/weights/diffusion-weights.js";
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../webgpu/af3/fold.js";
-import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk.js";
 import { memorySnapshot } from "../../webgpu/runtime/device-memory.js";
 
 const option = (args, name, fallback) => {

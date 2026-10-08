@@ -1,5 +1,5 @@
 // AF3's EDM sampler around the denoiser, and the PDB the fold writes.
-// Transcribed from cpu/af3/diffusion/diffusion-sampler-reference.js.
+// Transcribed from cpu/af3/diffusion/diffusion-sampler.js.
 #pragma once
 #include <charconv>
 #include "diffusion.cuh"
@@ -90,7 +90,7 @@ __global__ void eulerK(float* x, const float* noisy, const float* denoised, floa
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n3) x[i] = noisy[i] + scale * (noisy[i] - denoised[i]);
 }
-// --flow: the page's Flow (webgpu/af3/diffusion/diffusion-sampler-webgpu.js flowOnGpu, step "replace") in
+// --flow: the page's Flow (webgpu/af3/diffusion/diffusion-sampler.js flowOnGpu, step "replace") in
 // place of AF3's diffusion - one draw at the top of a schedule that starts at 160 A (sigmaMax 10 sigma_data,
 // AF3's own sigmaMin and rho, whatever the model's dialect), then the state REPLACED by each prediction:
 // no centring, no rotation, no injected noise

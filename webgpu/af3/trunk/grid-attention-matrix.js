@@ -23,7 +23,7 @@
  * measures 1.69x on exactly this shape.
  *
  * 🔴 WRITTEN BESIDE AF2'S KERNEL RATHER THAN SHARED WITH IT, WHICH IS THE SAME
- * CALL webgpu/af3/trunk/grid-attention-webgpu.js ALREADY MADE AND RECORDED. AF2's takes
+ * CALL webgpu/af3/trunk/grid-attention.js ALREADY MADE AND RECORDED. AF2's takes
  * a uniform for its shape, folds the 1/sqrt(d) scale into the query projection
  * and multiplies by the gate itself; AF3 has all three as a compile-time
  * constant, an explicit multiply in this pass, and the output projection. What

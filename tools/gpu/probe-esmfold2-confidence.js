@@ -28,15 +28,15 @@
 // in kind - `exp(-CCE)` is a likelihood in [0, 1] and needs no affine map - but
 // that is a reason to test it, not a reason to assume it.
 import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
-import { EsmcTowerGpu } from "../../webgpu/esmc/tower-webgpu.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower.js";
 import { readTensor, readTensorAsFloat16 } from "../../shared/weights/dtype.js";
 import { foldEsmfold2 } from "../../webgpu/esmfold2/fold.js";
-import { CONTACT_ANGSTROMS, CONTACT_EDGES } from "../../webgpu/esmfold2/distogram-webgpu.js";
+import { CONTACT_ANGSTROMS, CONTACT_EDGES } from "../../webgpu/esmfold2/distogram.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
 } from "../../shared/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair-webgpu.js";
+import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

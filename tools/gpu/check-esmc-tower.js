@@ -1,4 +1,4 @@
-// Does webgpu/esmc/tower-webgpu.js compute ESM-C's 36 blocks and ESMFold2's mix?
+// Does webgpu/esmc/tower.js compute ESM-C's 36 blocks and ESMFold2's mix?
 //
 //     python3 tools/esmc/dump-esmc-oracle.py --sequence-length 59
 //     python3 tools/export_esmc_model.py
@@ -14,7 +14,7 @@
 // shards in order too and a window of three is enough - which is 144 MiB live
 // against 2190, the same shape of trade the tower itself makes with weights.
 import { readTensor, readTensorAsFloat16 } from "../../shared/weights/dtype.js";
-import { EsmcTowerGpu } from "../../webgpu/esmc/tower-webgpu.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower.js";
 
 const WINDOW = 3;
 

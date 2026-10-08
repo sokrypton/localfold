@@ -21,7 +21,7 @@
  * compared against accumulates in f32.
  */
 import { createGridAttentionShaders, packGridAttentionWeights }
-  from "../../webgpu/af3/trunk/grid-attention-webgpu.js";
+  from "../../webgpu/af3/trunk/grid-attention.js";
 import {
   createGridProjectMatrixShader, createGridProjectOutMatrixShader,
   gridProjectMatrixDispatch, gridProjectMatrixFits, gridProjectOutMatrixDispatch,

@@ -12,7 +12,7 @@
  */
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference } from "../../shared/af3/weights/diffusion-weights.js";
-import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

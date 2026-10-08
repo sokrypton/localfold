@@ -14,15 +14,15 @@
 // reports the frame-to-frame movement before and after superposition, which is
 // what says whether a viewer must fit them.
 import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
-import { EsmcTowerGpu } from "../../webgpu/esmc/tower-webgpu.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower.js";
 import { readTensor, readTensorAsFloat16 } from "../../shared/weights/dtype.js";
 import { foldEsmfold2 } from "../../webgpu/esmfold2/fold.js";
-import { weightedRigidAlign } from "../../cpu/esmfold2/sampler-reference.js";
+import { weightedRigidAlign } from "../../cpu/esmfold2/sampler.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
 } from "../../shared/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair-webgpu.js";
+import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

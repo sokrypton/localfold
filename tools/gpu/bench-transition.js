@@ -31,7 +31,7 @@
  */
 import {
   createTransitionShader, createTransitionSplitShaders, packTransitionWeights,
-} from "../../webgpu/af3/trunk/transition-webgpu.js";
+} from "../../webgpu/af3/trunk/transition.js";
 import { stagedMatrixStorage } from "../../webgpu/kernels/matrix-linear.js";
 import { deviceMatrixConfig } from "../../webgpu/runtime/device-profile.js";
 
@@ -131,7 +131,7 @@ export async function main(device, args) {
     // meant before it existed.
     // `8:128@f16` narrows the two STAGED blocks; `8:128@f16+f16` narrows the
     // running sum as well, which is a different register story - see
-    // accumulatePrecision in webgpu/af3/trunk/transition-webgpu.js.
+    // accumulatePrecision in webgpu/af3/trunk/transition.js.
     // `8:128@f16+f16+f16` names the staged blocks, the running sum, and the
     // element the WEIGHT buffer holds - a third axis, and the one that decides
     // how many bytes each workgroup reads. See createTransitionShader.

@@ -21,15 +21,15 @@ import {
   readTensor, readTensorAsFloat16, tensorByteLength,
 } from "../../shared/weights/dtype.js";
 import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
-import { EsmcTowerGpu } from "../../webgpu/esmc/tower-webgpu.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower.js";
 import { foldEsmfold2, SAMPLER_PRESETS } from "../../webgpu/esmfold2/fold.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
   confidenceHeadWeights,
 } from "../../shared/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair-webgpu.js";
-import { weightedRigidAlign } from "../../cpu/esmfold2/sampler-reference.js";
+import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair.js";
+import { weightedRigidAlign } from "../../cpu/esmfold2/sampler.js";
 import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
 import { toDensePositions } from "../../shared/esmfold2/featurise.js";
 import { toPdb } from "../../webgpu/af3/fold.js";
@@ -43,7 +43,7 @@ import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 import { setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
 import {
   CONTACT_EDGES, contactAngstromsFor,
-} from "../../webgpu/esmfold2/distogram-webgpu.js";
+} from "../../webgpu/esmfold2/distogram.js";
 import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
 
 import { profileBuffers } from "./buffer-profile.js";
@@ -100,7 +100,7 @@ export function reader(bundle) {
   };
   // 🔴 WHERE THE BYTES ARE, WITHOUT DECODING ANY OF THEM - the same contract
   // HttpTensorStore.tensorSource has, so the GPU dequantiser can take these.
-  // See webgpu/esmc/tower-webgpu.js: the tower's four big matrices are 4.8 seconds
+  // See webgpu/esmc/tower.js: the tower's four big matrices are 4.8 seconds
   // of host int3 decoding on a first fold, and this is how they skip it.
   const source = async (name) => {
     const record = await recordFor(name);
@@ -172,7 +172,7 @@ export async function main(device, args = []) {
   const trunkPrecision = option(args, "trunk-precision", "");
   // The element the TRUNK's weight buffers hold, which is neither of the two
   // above and is what stagedMatrixDirectWeights needs - see the note on
-  // weightPrecision in webgpu/esmfold2/trunk-webgpu.js.
+  // weightPrecision in webgpu/esmfold2/trunk.js.
   const trunkWeights = option(args, "trunk-weights", "");
   for (const pair of (args ?? []).filter((a) => a.startsWith("--tune="))
        .flatMap((a) => a.slice("--tune=".length).split(",")).filter(Boolean)) {
@@ -207,7 +207,7 @@ export async function main(device, args = []) {
   // which is where this model's evolutionary information comes from.
   const noPlm = args.includes("--no-plm");
   // The element the denoiser's token blocks hold their weights in; see
-  // webgpu/esmfold2/diffusion-webgpu.js. Unset lets the fold choose.
+  // webgpu/esmfold2/diffusion.js. Unset lets the fold choose.
   const denoiserWeightElement = option(args, "denoiser-weights", "");
   // 🔴 FOLD TWICE, THE SECOND TIME REUSING THE TRUNK, which is the only way to
   // check that the saving is real and that the answer is the same one.
@@ -327,7 +327,7 @@ export async function main(device, args = []) {
     // 🔴 `towerShared` IS THE MODEL, AND THAT IS WHAT KEYS THE RESIDENCY. The
     // tower is constructed fresh per fold and cannot be the key; this object is
     // built once from the bundle and lives as long as it does. See
-    // residentBlocks in webgpu/esmc/tower-webgpu.js.
+    // residentBlocks in webgpu/esmc/tower.js.
     }, towerShared, { sequenceId, onBlock, weightKey: towerShared });
     return result.single;
   };

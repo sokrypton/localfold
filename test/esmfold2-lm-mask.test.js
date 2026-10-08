@@ -11,7 +11,7 @@ import { describe, expect, it } from "./harness.js";
 import {
   ESM_BOS, ESM_EOS, ESM_MASK, ESM_PAD, featuriseForEsmfold2, maskLanguageModelInput,
 } from "../shared/esmfold2/featurise.js";
-import { uniforms } from "../cpu/esmfold2/sampler-reference.js";
+import { uniforms } from "../cpu/esmfold2/sampler.js";
 
 /** The packed run the tower is handed: [BOS] A [EOS BOS] B [EOS]. */
 const packed = () => Int32Array.from([

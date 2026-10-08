@@ -1,6 +1,6 @@
 // The diffusion head - conditioning, the atom encoder, the 24-block conditioned transformer,
-// the atom decoder - and the sampler. Transcribed from cpu/af3/diffusion/diffusion-reference.js
-// and diffusion-sampler-reference.js.
+// the atom decoder - and the sampler. Transcribed from cpu/af3/diffusion/diffusion.js
+// and diffusion-sampler.js.
 #pragma once
 #include "atom.cuh"
 

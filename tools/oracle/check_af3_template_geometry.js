@@ -28,7 +28,7 @@
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 
-import { templateEmbedding } from "../../cpu/af3/trunk/template-reference.js";
+import { templateEmbedding } from "../../cpu/af3/trunk/template.js";
 import { chainResidues, identityMap, templateSlot } from "../../shared/af3/featurise/template-input.js";
 import {
   coverageOf, multichainMaskFor, templateGeometry,

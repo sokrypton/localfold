@@ -289,7 +289,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // gave a workgroup to each (query, head) and re-read every key and value for it. null takes it above 80
   // tokens, where it wins on the A100; true and false force either arm.
   diffusionFlashAttend: null,
-  // ...and its key splits; null derives them from the workgroup count (diffusion-transformer-webgpu.js).
+  // ...and its key splits; null derives them from the workgroup count (diffusion-transformer.js).
   diffusionFlashSplits: null,
   // 🔴 HOW MANY WORKGROUPS THE SINGLE PROJECTION AIMS AT. See
   // singleProjectSplits: 110 and a candidate list stopping at 3 are an M2's
@@ -401,10 +401,10 @@ export const DEFAULT_TUNING = Object.freeze({
   attentionTiled: null,
   esmfold2TokenRowTile: null,
   // ESMFold2's token projections split over K; null derives it from the workgroup count (see
-  // tokenKSplits in webgpu/esmfold2/diffusion-webgpu.js), 1 is the unsplit kernel.
+  // tokenKSplits in webgpu/esmfold2/diffusion.js), 1 is the unsplit kernel.
   esmfold2TokenKSplits: null,
   esmcRowTile: null,
-  // ESM-C's per-block projections split over K; null derives it (linearKSplits in webgpu/esmc/block-webgpu.js).
+  // ESM-C's per-block projections split over K; null derives it (linearKSplits in webgpu/esmc/block.js).
   esmcKSplits: null,
   // 🔴 TIERED ON EVERY DEVICE, because a first fold is mostly driver compile on
   // every NVIDIA part measured and most visitors fold once. Colab, driver cache
@@ -424,7 +424,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // fused kernel's own best tile - 1.13x at AF3's 128 channels, 2.77x at
   // ESMFold2's 256, 3.71x at OpenDDE's 384. It brings back the widened tensor
   // the fusion exists to avoid, chunked over rows. See
-  // webgpu/af3/trunk/transition-webgpu.js.
+  // webgpu/af3/trunk/transition.js.
   pairTransitionSplit: null,
   // 🔴 HOW BIG THE SPLIT TRANSITION'S WIDENED ACTIVATION MAY GET, in MiB; null
   // is 64. It is a SPEED knob as well as a memory one - a chunk is its own
@@ -892,7 +892,7 @@ const PRIORS = new Map([
     // count - about 4.8 GB a step at 256 tokens and 10.3 at 544, against a
     // 1.5 TB/s card. A crossover SHOULD exist; 175 was simply the wrong one.
     // ...and `maxGroups` halves the split while qkvg's split dispatch would pass ~2000 workgroups:
-    // 16 to 150 tokens, 8 to ~260, 4 above (see the rule in diffusion-transformer-webgpu.js).
+    // 16 to 150 tokens, 8 to ~260, 4 above (see the rule in diffusion-transformer.js).
     // ...and with the cap the 512-token crossover no longer holds: 4 splits beat none at 600 / 800 / 1000
     // tokens, 67 -> 60 / 87 -> 78 / 115 -> 105 ms a denoiser call (bench-head, 2026-10-04), so the
     // crossover is out of reach. `wideTile` 8 is ffw-wide's own token tile: 3.87 -> 2.67 ms a call at

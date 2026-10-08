@@ -20,8 +20,8 @@ import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
 import { batchFromDump } from "./fold.js";
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

@@ -1,4 +1,4 @@
-// The fused template embedder's features cross sparse (webgpu/af3/trunk/template-webgpu.js, sparseTemplateFeatures):
+// The fused template embedder's features cross sparse (webgpu/af3/trunk/template.js, sparseTemplateFeatures):
 // each row's nonzero (column, value) pairs in column order. The WebGPU shader and the native port both rebuild
 // the dense rows from them, so the sparse form must expand to EXACTLY the dense one - an empty slot's included,
 // which is written from its columns and never built dense.

@@ -1,6 +1,6 @@
 /**
  * AF3's template embedder (empty-template path): GPU against
- * cpu/af3/trunk/template-reference.js.
+ * cpu/af3/trunk/template.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-template.js
  *
@@ -8,8 +8,8 @@
  * number is the argument for the module existing at all: with four EMPTY slots
  * this is not a small residual correction.
  */
-import { templateEmbedding } from "../../cpu/af3/trunk/template-reference.js";
-import { Af3TemplateEmbedderGpu } from "../../webgpu/af3/trunk/template-webgpu.js";
+import { templateEmbedding } from "../../cpu/af3/trunk/template.js";
+import { Af3TemplateEmbedderGpu } from "../../webgpu/af3/trunk/template.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { af3Dialect } from "../../shared/af3/weights/weights.js";
 import { deviceTuning } from "../../webgpu/runtime/device-profile.js";
@@ -101,7 +101,7 @@ export async function main(device, args) {
   // port, not the width. Scaled by sqrt of the ratio, which is what a sum of
   // independent roundings does, and it is not a licence to raise the bound
   // further: the SHIPPED trunk pins `pairMatrixKernels: false` on this stage
-  // for exactly this reason (see webgpu/af3/trunk/trunk-webgpu.js).
+  // for exactly this reason (see webgpu/af3/trunk/trunk.js).
   const store = await HttpTensorStore.open(model);
 
   const layer = async (leaf, index) => {
@@ -159,7 +159,7 @@ export async function main(device, args) {
   const T = (name) => store.tensor(name);
   // 🔴 BOTH WIDTHS OFF THE BUNDLE, NOT OFF AlphaFold 3. `QUERY_CHANNELS = 128`
   // was typed in here and the stack's own width was a constant inside
-  // template-webgpu.js; OpenDDE's query is 384 and IntelliFold-2's stack is
+  // template.js; OpenDDE's query is 384 and IntelliFold-2's stack is
   // 256. This checker builds its weight dict by hand rather than through
   // `templateWeights` - the trap CLAUDE.md names - so it has to read them
   // itself, and these are the two tensors that state them.

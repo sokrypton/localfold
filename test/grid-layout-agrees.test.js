@@ -23,7 +23,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { packGridAttentionWeights } from "../webgpu/af3/trunk/grid-attention-webgpu.js";
+import { packGridAttentionWeights } from "../webgpu/af3/trunk/grid-attention.js";
 import { gridResidentEntries } from "../webgpu/af3/weights/pair-track-device-weights.js";
 import { SOURCES } from "../shared/weights/weight-sources.js";
 

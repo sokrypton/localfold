@@ -307,7 +307,7 @@ if (dialect?.chaiTokenEmbedding === true && batch.esmEmbeddings === undefined) {
 // sidechain token, and the diffusion and its confidence head run on those (webgpu/af3/fold.js)
 if (dialect.structuralTokens) {
   const { structuralLayout, structuralBatch } = await import(`${repo}/shared/af3/featurise/structural-tokens.js`);
-  const { structuralPairFeatures } = await import(`${repo}/cpu/af3/structure/structural-expander-reference.js`);
+  const { structuralPairFeatures } = await import(`${repo}/cpu/af3/structure/structural-expander.js`);
   const layout = structuralLayout(batch);
   const sb = structuralBatch(batch, layout);
   const features = structuralPairFeatures(layout, batch.asymId);
@@ -454,7 +454,7 @@ if (dialect.chiralCentres === true) {
   add("chiral.angles", Float32Array.from(chirals.angles));
   add("chiral.count", chirals.count);
 }
-// The template embedder's PASSES, built as the page's trunk builds them (template-webgpu.js): each
+// The template embedder's PASSES, built as the page's trunk builds them (template.js): each
 // a repeat weight and either - the fused embedder (protenix2, boltz2, rf3) - its feature columns,
 // or - the nine-projection one - an aatype and, for a real template, its geometry. Empty slots
 // fold into one or two passes (an empty slot carries the GAP restype in one slot under protenix's
@@ -508,7 +508,7 @@ if (dialect.chiralCentres === true) {
       // the feature columns sparse - a row's nonzero (column, value) pairs, K the most any row has, the rest -1 - and
       // scattered back on the device into the dense matrix the projection reads: dense they were 108 floats a pair
       // in every pass, an empty one included (protenix2 at 1,020 tokens: a 1.3 GB input and 4.9 s of export)
-      // (the page's own sparse form - webgpu/af3/trunk/template-webgpu.js, sparseTemplateFeatures - split into the
+      // (the page's own sparse form - webgpu/af3/trunk/template.js, sparseTemplateFeatures - split into the
       // native port's columns and values)
       const gap = (pass.emptyAatype ?? 0) !== 0;
       const packed = pass.features !== undefined ? sparseTemplateFeatures(pass.features, width)

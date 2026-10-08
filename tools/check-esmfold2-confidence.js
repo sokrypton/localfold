@@ -31,7 +31,7 @@ import { join } from "node:path";
 import process from "node:process";
 
 import { readTensor } from "../shared/weights/dtype.js";
-import { esmfold2Confidence } from "../cpu/esmfold2/confidence-reference.js";
+import { esmfold2Confidence } from "../cpu/esmfold2/confidence.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDir = join(ROOT, process.argv[2] ?? "model-ef2-600-head-f32");

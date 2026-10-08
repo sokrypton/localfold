@@ -21,7 +21,7 @@
  */
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
 import { buildTargetFeat } from "../../webgpu/af3/fold.js";
-import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk.js";
 import { af3ContactClasses } from "../../shared/af3/featurise/contact-classes.js";
 import { memorySnapshot } from "../../webgpu/runtime/device-memory.js";
 import { af3Dialect, openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";

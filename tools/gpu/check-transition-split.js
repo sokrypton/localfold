@@ -39,7 +39,7 @@
 import {
   createTransitionShader, createTransitionSplitShaders, packTransitionWeights,
   transitionRowTile, transitionSplitChunkRows,
-} from "../../webgpu/af3/trunk/transition-webgpu.js";
+} from "../../webgpu/af3/trunk/transition.js";
 import { stagedMatrixStorage } from "../../webgpu/kernels/matrix-linear.js";
 import { deviceMatrixConfig, deviceTuning } from "../../webgpu/runtime/device-profile.js";
 import { stagedMatrixBlock } from "../../webgpu/kernels/matrix-linear.js";

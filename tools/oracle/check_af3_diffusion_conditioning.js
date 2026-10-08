@@ -26,10 +26,10 @@
  */
 import { join } from "node:path";
 
-import { layerNormSlow } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
+import { layerNormSlow } from "../../cpu/af3/diffusion/atom-encoder.js";
 import { SIGMA_DATA, diffusionConditioning, noiseEmbedding }
-  from "../../cpu/af3/diffusion/diffusion-reference.js";
-import { linear } from "../../cpu/af3/trunk/pairformer-reference.js";
+  from "../../cpu/af3/diffusion/diffusion.js";
+import { linear } from "../../cpu/af3/trunk/pairformer.js";
 import { ROOT, captures, loadDump, loadTensors, report } from "./af3-bundle.js";
 
 const HEAD = "diffuser/~/diffusion_head";

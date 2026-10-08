@@ -28,7 +28,7 @@ import { confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
 import { warmTrunkPipelines } from "../../webgpu/af3/fold.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../shared/af3/weights/diffusion-weights.js";
-import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
+import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer.js";
 import { dialectFor , featuriserDialect } from "../../shared/af3/dialect.js";
 import { profileDevice } from "./profile.js";
 import { profileBuffers } from "./buffer-profile.js";
@@ -87,7 +87,7 @@ export async function main(device, args) {
   // and prints an N-CA of 27 A next to an ideal of 1.46, which reads as
   // corrupted weights rather than as the wrong flag. The flow reaches a
   // structure in eight because it is a different walk - see
-  // webgpu/af3/diffusion/diffusion-sampler-webgpu.js - so say so rather than let the
+  // webgpu/af3/diffusion/diffusion-sampler.js - so say so rather than let the
   // geometry report take the blame.
   if (samplerMode === "diffusion" && steps < 50) {
     console.log(`🔴 ${steps} steps of the DIFFUSION sampler will not converge -`
@@ -625,7 +625,7 @@ export async function main(device, args) {
     recycleDeltas: args.includes("--recycle-deltas"),
     // The pair track's scratch layout: `on` forces the lean one (vector
     // kernels, three and a quarter pair-sized buffers), `off` the matrix one;
-    // omitted, the device's budget decides. See trunk-webgpu.js.
+    // omitted, the device's budget decides. See trunk.js.
     leanPair: { on: true, off: false }[option(args, "lean-pair", "")],
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),

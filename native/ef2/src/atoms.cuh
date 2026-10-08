@@ -1,4 +1,4 @@
-// ESMFold2's sliding-window atom transformer with 3D RoPE (cpu/esmfold2/atom-transformer-reference.js
+// ESMFold2's sliding-window atom transformer with 3D RoPE (cpu/esmfold2/atom-transformer.js
 // is the reading): the inputs embedder, and the stacks the diffusion module's atom encoder and
 // decoder reuse.
 //

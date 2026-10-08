@@ -1,4 +1,4 @@
-// ESMFold2's contact and certainty classes and their bin counts - out of webgpu/esmfold2/distogram-webgpu.js (which
+// ESMFold2's contact and certainty classes and their bin counts - out of webgpu/esmfold2/distogram.js (which
 // re-exports them), so the CUDA port's exporter and the CPU references take them without the WebGPU head behind them.
 import { MOL_DNA, MOL_NONPOLYMER, MOL_PROTEIN, MOL_RNA } from "./featurise.js";
 import {

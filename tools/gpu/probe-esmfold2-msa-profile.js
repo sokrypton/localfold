@@ -37,14 +37,14 @@ import {
   readTensor, readTensorAsFloat16, tensorByteLength,
 } from "../../shared/weights/dtype.js";
 import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
-import { EsmcTowerGpu } from "../../webgpu/esmc/tower-webgpu.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower.js";
 import { foldEsmfold2 } from "../../webgpu/esmfold2/fold.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
 } from "../../shared/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair-webgpu.js";
-import { weightedRigidAlign } from "../../cpu/esmfold2/sampler-reference.js";
+import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair.js";
+import { weightedRigidAlign } from "../../cpu/esmfold2/sampler.js";
 import { AATYPE_CLASSES, UNKNOWN_AATYPE } from "../../shared/esmfold2/featurise.js";
 import { parseA3m } from "../../shared/input/a3m.js";
 

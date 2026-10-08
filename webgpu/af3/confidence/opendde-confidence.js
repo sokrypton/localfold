@@ -22,11 +22,11 @@
  * [0, 1] scaled by 100, PAE and PDE 64 over [0, 32] - and the reduction is a
  * softmax against bin CENTRES.
  */
-import { layerNorm, linear } from "../../../cpu/af3/trunk/pairformer-reference.js";
-import { tmAdjustedPae } from "../../../cpu/af3/confidence/ptm-reference.js";
-import { Af3PairformerStackGpu } from "../trunk/pairformer-block-webgpu.js";
+import { layerNorm, linear } from "../../../cpu/af3/trunk/pairformer.js";
+import { tmAdjustedPae } from "../../../cpu/af3/confidence/ptm.js";
+import { Af3PairformerStackGpu } from "../trunk/pairformer-block.js";
 import { openddeAtomReadouts, openddePairInit, openddePairReadouts }
-  from "./opendde-confidence-webgpu.js";
+  from "./opendde-pair-readouts.js";
 
 /** OpenDDE's distance bins: 3.25 to 52.0 in steps of 1.25, the last open. */
 const BIN_START = 3.25;

@@ -361,7 +361,7 @@ export async function main(device, args) {
     // reference's OpenDDE config says num_msa 1280, so a deep alignment reaches
     // its MSA stack 256 rows short and the difference appears at
     // `z_after_msa` and nowhere earlier.
-    // The MSA stack's first half alone; see msa-stack-webgpu.js.
+    // The MSA stack's first half alone; see msa-stack.js.
     stopAfterOpm: args.includes("--stop-after-opm"),
     ...(templateSlots === undefined ? {} : { templateSlots }),
     ...(option(args, "num-msa", "") === "" ? {}

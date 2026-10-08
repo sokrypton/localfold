@@ -1,4 +1,4 @@
-// The confidence head: pLDDT, PAE, PDE. Transcribed from cpu/af3/confidence/confidence-reference.js.
+// The confidence head: pLDDT, PAE, PDE. Transcribed from cpu/af3/confidence/confidence.js.
 // f32 throughout - the WebGPU head pins f32 too, for accuracy, and it is four blocks.
 #pragma once
 #include "trunk.cuh"

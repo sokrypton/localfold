@@ -17,7 +17,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { transition, triangleMultiplication } from "../cpu/af3/trunk/pairformer-reference.js";
+import { transition, triangleMultiplication } from "../cpu/af3/trunk/pairformer.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const dump = JSON.parse(readFileSync(

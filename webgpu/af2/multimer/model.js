@@ -7,7 +7,7 @@
  * multimer atom geometry, and outerProductMeanFirst / positionScale say which
  * regime to run. Everything else, including every kernel, is shared.
  */
-import { encodeContactProbabilities } from "../../heads/distogram-webgpu.js";
+import { encodeContactProbabilities } from "../../heads/distogram.js";
 import { ConfidenceHeadsGpu } from "../../heads/confidence.js";
 import { encodeInputEmbedder } from "./input-embedder.js";
 import {
@@ -24,7 +24,7 @@ import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
 } from "../../../shared/af2/model/recycle-convergence.js";
 
-import { makeA3mFeaturesFor } from "../../input/a3m-features-webgpu.js";
+import { makeA3mFeaturesFor } from "../../input/a3m-features.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
 import { encodeTemplateEmbedding, hasTemplateEmbedder } from "./template.js";
 
@@ -376,7 +376,7 @@ export class AlphaFoldUnifiedGpu {
         // 261 residues) and handed the copy to the structure module and the
         // confidence heads, which upload it again and take a device tensor.
         // `pairHost` still asks for it; `contacts` is the page's contact map,
-        // computed here (webgpu/heads/distogram-webgpu.js) - it was computed in
+        // computed here (webgpu/heads/distogram.js) - it was computed in
         // JavaScript from that copy, on the main thread, between passes.
         const pairReadback = recycleOptions.pairHost === true
           ? execution.createReadback(

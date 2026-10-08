@@ -21,12 +21,12 @@
  * denoiser and `headRun - gpu` is what the round trip costs inside it.
  */
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
-import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head.js";
 import { normalFrom } from "../../webgpu/af3/fold.js";
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference } from "../../shared/af3/weights/diffusion-weights.js";
-import { noiseLevels, randomAugmentation, samplerStep } from "../../cpu/af3/diffusion/diffusion-sampler-reference.js";
+import { noiseLevels, randomAugmentation, samplerStep } from "../../cpu/af3/diffusion/diffusion-sampler.js";
 import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";
 
 const option = (args, name, fallback) => {

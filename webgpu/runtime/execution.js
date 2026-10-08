@@ -50,10 +50,10 @@ const MAX_WORKGROUPS_PER_DIMENSION = 65_535;
  * `accumulator += delta`, elementwise, with the count baked in.
  *
  * 🔴 ONE DEFINITION, BECAUSE THERE WERE FOUR AND TWO OF THEM DISAGREED. The
- * same eleven lines were written in `af3/trunk/pair-track-gpu.js`,
- * `af3/diffusion/diffusion-head-webgpu.js`,
- * `af3/diffusion/diffusion-conditioning-webgpu.js` and
- * `esmfold2/diffusion-webgpu.js` - and the last bound them THE OTHER WAY ROUND,
+ * same eleven lines were written in `af3/trunk/pair-track.js`,
+ * `af3/diffusion/diffusion-head.js`,
+ * `af3/diffusion/diffusion-conditioning.js` and
+ * `esmfold2/diffusion.js` - and the last bound them THE OTHER WAY ROUND,
  * `0 = delta, 1 = accumulator`. Both compile. A pipeline from one with a bind
  * group built for the other writes the sum into the DELTA and leaves the
  * accumulator untouched, silently, which is the shape of bug that shows up as a
@@ -290,7 +290,7 @@ export class WebGpuExecution {
     // becoming 3.0.
     //
     // 🔴 AND A QUARTER OF THE CEILING IS THE LINE, the same rule
-    // webgpu/esmc/tower-webgpu.js takes. A device with room keeps everything; a
+    // webgpu/esmc/tower.js takes. A device with room keeps everything; a
     // 200 MiB one keeps nothing and streams as it always did, because filling a
     // tight ceiling with resident weights is exactly what makes the pooled
     // allocator evict something in flight - `--budget=200` reproduced that in

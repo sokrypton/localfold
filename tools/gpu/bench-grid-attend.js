@@ -34,7 +34,7 @@
  * The default is therefore the straight-through form. The arm stays because a
  * negative result that nobody can re-run is a rumour.
  */
-import { Af3GridSelfAttentionGpu } from "../../webgpu/af3/trunk/grid-attention-webgpu.js";
+import { Af3GridSelfAttentionGpu } from "../../webgpu/af3/trunk/grid-attention.js";
 
 const DIALECT = { swapTransposedBias: false };
 const CHANNELS = 128;

@@ -438,7 +438,7 @@ corner tiles guarded, bit-exact: `fold-af2.js` returns -1805925 at TILE = 1, 8,
 
 Flat across a 64x range, and if anything the tiles lose. **The diagnosis was
 wrong**: those reads were already cache-served, exactly as
-webgpu/af3/trunk/outer-product-mean-webgpu.js records for its own version of the same
+webgpu/af3/trunk/outer-product-mean.js records for its own version of the same
 question ("staging the rows was tried and lost... those reads were cache-served
 anyway"). The kernel is issue-bound at 59% of the f32 ceiling, not starved of
 bandwidth. The code was reverted; what is left to try on it is a
@@ -544,7 +544,7 @@ priced at 8.3e-4 by the table above.
 shares, so the traffic per pair is `512 KiB / P` and the whole game is raising
 P. What caps P is that a workgroup stages every cell for every pair -
 `CELLS * P * 4` bytes, 16 KiB at P = 4 - which is why the sweep turned back up
-at 8. webgpu/af3/trunk/outer-product-mean-webgpu.js chunks the same matrix for the same
+at 8. webgpu/af3/trunk/outer-product-mean.js chunks the same matrix for the same
 reason (`OPM_CELL_CHUNK`, swept to 256 there), so AF2's was chunked to match:
 stage `CELL_CHUNK` cells at a time, keep the accumulators across the chunk loop,
 take P to 16.
@@ -788,7 +788,7 @@ identical. The two are `rowScaleOffset` and `scaleIndex`, and the shared kernel
 refuses both at once.
 
 The denominator becomes its own pass, which is the move
-webgpu/af3/trunk/outer-product-mean-webgpu.js already made for the same reason: the work
+webgpu/af3/trunk/outer-product-mean.js already made for the same reason: the work
 is `pairs x sequences` either way, and a GEMM has nowhere to put a cooperative
 reduction. `opmMatrixContract` and `opmMatrixOutput` are separate knobs, which
 is what bisected the NaN in three runs.
@@ -1519,7 +1519,7 @@ rather than directly.
 
 It is a reduction over residues and an argmax over centres, so it is a kernel:
 one workgroup an extra row, the centres split across 64 lanes, a tree join.
-`webgpu/input/nearest-centres-webgpu.js`.
+`webgpu/input/nearest-centres.js`.
 
 🔴 **THE TIE RULE IS THE WHOLE RISK AND IT IS IN THE PACK, NOT IN A
 COMPARISON.** The host keeps the FIRST centre at an equal score. The join packs

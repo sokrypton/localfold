@@ -30,11 +30,11 @@ import {
   atomDecoderWeights, atomEncoderWeights, confidenceHeadWeights, denoiserWeights,
   featuriserWeights, trunkBlockWeights,
 } from "../shared/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../webgpu/esmfold2/language-pair-webgpu.js";
-import { EsmcTowerGpu } from "../webgpu/esmc/tower-webgpu.js";
+import { SHIM_PAIR_TENSORS } from "../webgpu/esmfold2/language-pair.js";
+import { EsmcTowerGpu } from "../webgpu/esmc/tower.js";
 import { SAMPLER_DEFAULTS, SAMPLER_PRESETS } from "../webgpu/esmfold2/fold.js";
 import { churnFactors, noiseLevels, noiseSchedule }
-  from "../cpu/esmfold2/sampler-reference.js";
+  from "../cpu/esmfold2/sampler.js";
 
 /** The ten tensors an ESM-C block holds, under the names its exporter writes. */
 const BLOCK_LEAVES = ["attn_norm/scale", "attn_norm/offset", "qkv/weights",

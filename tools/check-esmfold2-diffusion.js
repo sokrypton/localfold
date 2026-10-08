@@ -19,8 +19,8 @@ import process from "node:process";
 
 import { readTensor } from "../shared/weights/dtype.js";
 import { denoiseStep, diffusionConditioning, tokenTransformer }
-  from "../cpu/esmfold2/diffusion-reference.js";
-import { atomDecoder, inputsEmbedder } from "../cpu/esmfold2/atom-transformer-reference.js";
+  from "../cpu/esmfold2/diffusion.js";
+import { atomDecoder, inputsEmbedder } from "../cpu/esmfold2/atom-transformer.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 // 🔴 POSITIONAL ARGUMENTS SKIP FLAGS, because `--steps=2` in argv[2] was read

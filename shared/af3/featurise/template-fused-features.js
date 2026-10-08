@@ -1,6 +1,6 @@
 /**
  * The fused template embedder's feature columns (protenix2's 108, boltz2's 109, rosettafold3's 66), dense and
- * sparse - out of webgpu/af3/trunk/template-webgpu.js (which re-exports them): featurisation, which the CUDA port's
+ * sparse - out of webgpu/af3/trunk/template.js (which re-exports them): featurisation, which the CUDA port's
  * exporter and the page both build from, so it does not live beside the WebGPU embedder.
  */
 import { DGRAM_BINS, boltz2TemplateFeatures, rosettafold3TemplateFeatures, templateGeometry } from "./template-features.js";

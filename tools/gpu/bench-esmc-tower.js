@@ -18,7 +18,7 @@
 // UNPROCESSED READS AS A SPEEDUP. Every round's result is compared to the
 // first: a shape whose grid does not cover its rows is faster and wrong, and
 // this repository has been fooled by exactly that.
-import { EsmcBlockGpu } from "../../webgpu/esmc/block-webgpu.js";
+import { EsmcBlockGpu } from "../../webgpu/esmc/block.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -129,7 +129,7 @@ export async function main(device, args = []) {
     // tokens that is 19.1 GB in 218 ms, which is 87.6 GB/s against this M2's
     // ~100. The kernel is not slow at arithmetic; it is at the bandwidth limit
     // doing 300 times the reads it needs. Row tiling is the fix, and
-    // transition-webgpu.js already records what it is worth there: tiling by
+    // transition.js already records what it is worth there: tiling by
     // four took that kernel from 241 ms to 85.
     const weightBytes = (model * 3 * model + model * model
       + 2 * ffn * model + model * ffn) * 4;

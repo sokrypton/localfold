@@ -36,7 +36,7 @@ function stripCommentsAndStrings(source) {
   // `chainGeometryVerdict` without importing it. The regex stripper removed the
   // call, this check passed, and every AlphaFold 2 fold on the live page ended in
   // "chainGeometryVerdict is not defined". It hid real calls in
-  // webgpu/af3/trunk/trunk-webgpu.js too.
+  // webgpu/af3/trunk/trunk.js too.
   //
   // What this keeps that the regexes did not: CODE INSIDE `${...}`. A template's
   // literal text is prose or WGSL and is blanked; its expressions are JavaScript

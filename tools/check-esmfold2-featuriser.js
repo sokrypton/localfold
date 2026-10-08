@@ -21,8 +21,8 @@ import process from "node:process";
 import { readTensor } from "../shared/weights/dtype.js";
 import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
-} from "../cpu/esmfold2/pair-features-reference.js";
-import { inputsEmbedder } from "../cpu/esmfold2/atom-transformer-reference.js";
+} from "../cpu/esmfold2/pair-features.js";
+import { inputsEmbedder } from "../cpu/esmfold2/atom-transformer.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");

@@ -399,7 +399,7 @@ now - a default is what let the two drift.
 
 🔴 **AND THE BLOCK-LEVEL DIFFERENTIAL IS WHAT FOUND IT, NOT THE FOLD.** The
 per-kernel checkers all passed. `tools/gpu/check-af3-block-any.js` runs a whole
-pairformer block against `pairformer-reference.js` THROUGH THE LOADER, so the
+pairformer block against `pairformer.js` THROUGH THE LOADER, so the
 widths are the bundle's: it read **1.293** for OpenDDE against 3.7e-3 for
 AlphaFold 3, which is the difference between "assembled wrongly" and "rounding".
 `tools/gpu/probe-opendde-kernels.js` then attributed it, by running each of the

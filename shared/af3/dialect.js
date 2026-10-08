@@ -569,7 +569,7 @@ export const OPENDDE = Object.freeze({
  * OpenDDE builds the pair from `s_init` and its `left_single` is [384, 384];
  * this bundle's is **[447, 256]**, a target_feat-wide input, so it builds the
  * pair AlphaFold 3's way. The reference has no convention list for this - the
- * shape is the statement - which is why cpu/af3/trunk/embedder-reference.js reads the
+ * shape is the statement - which is why cpu/af3/trunk/embedder.js reads the
  * flag AND the shape and refuses to default either.
  *
  * Every width is the tensor's and none is written down here: 48 trunk blocks of
@@ -1136,7 +1136,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   // / clip(present.sum(), 1)`, then a single pass with "no per-template loop
   // and no template gating". Averaging over four padded SLOTS instead makes
   // one real template a QUARTER of what the checkpoint expects. See
-  // template-webgpu.js, and docs/AF3.md for what that cost the fold.
+  // template.js, and docs/AF3.md for what that cost the fold.
   templateFeatureMeanOnePass: true,
   boltz2TemplateFeatures: false,
   fusedTemplateLayout: null,

@@ -1,5 +1,5 @@
 /**
- * AF3's transition block: GPU against cpu/af3/trunk/pairformer-reference.js.
+ * AF3's transition block: GPU against cpu/af3/trunk/pairformer.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-transition.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-transition.js --track=single
@@ -9,8 +9,8 @@
  * the pair track's channel count equals the workgroup size, so its strided
  * loops run exactly one iteration, and the single track's does not.
  */
-import { transition } from "../../cpu/af3/trunk/pairformer-reference.js";
-import { Af3TransitionGpu } from "../../webgpu/af3/trunk/transition-webgpu.js";
+import { transition } from "../../cpu/af3/trunk/pairformer.js";
+import { Af3TransitionGpu } from "../../webgpu/af3/trunk/transition.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";

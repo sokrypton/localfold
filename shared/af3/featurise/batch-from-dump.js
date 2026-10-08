@@ -19,7 +19,7 @@ export function batchFromDump(dump) {
   // digit in what they fold, which is what the padding was worth.
   const subsets = Math.ceil((tokens * dense) / 32);
   const raw = (name) => dump.inputs[name].data;
-  // 🔴 count IS NOT DECORATION. convert() in atom-encoder-reference.js sizes its
+  // 🔴 count IS NOT DECORATION. convert() in atom-encoder.js sizes its
   // output from it, so a gather without one silently produces a zero-length
   // tensor - which reads downstream as a model that runs and folds a 17 A
   // spaghetti rather than as an error.

@@ -24,7 +24,7 @@ import {
   distanceBounds, smoothBounds, embedBounds, refineCoordinates, planarQuadruples,
   signedVolume,
 } from "../../shared/chem/conformer.js";
-import { refineOnDevice, MAX_ATOMS } from "../../webgpu/chem/conformer-webgpu.js";
+import { refineOnDevice, MAX_ATOMS } from "../../webgpu/chem/conformer.js";
 import { hashOf } from "../../shared/chem/component.js";
 
 const CASES = [

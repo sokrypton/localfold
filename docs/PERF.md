@@ -24,7 +24,7 @@ track a few hundred rows at a time. The grid attention takes it happily - q, k,
 v and the gate are indexed `((row * N + i) * HEADS + head)`, row outermost, so
 a row chunk is a contiguous byte range and binding that SLICE makes the
 existing indexing address it with **no kernel change at all**. `run` in
-webgpu/af3/trunk/pairformer-block-webgpu.js accepts a slice for this, and
+webgpu/af3/trunk/pairformer-block.js accepts a slice for this, and
 `encodePairTrack` has a `rowChunk` that defaults to the whole track.
 
 🔴 **AND IT STOPS AT THE TRIANGLE, FOR TWO REASONS.** Its intermediates are
@@ -489,7 +489,7 @@ ipTM on all seven models; `check-af3-confidence.js` and the confidence oracle
 
 🔴 **AND WITHOUT `shader-f16` THE FIRST FOLD PACKED 920 MiB OF WEIGHTS ON THE
 CPU.** `residentBlockOnDevice` and the zero-gate packer in
-diffusion-transformer-webgpu.js each returned undefined unless the precision
+diffusion-transformer.js each returned undefined unless the precision
 was f16 - the same refusal the pair track had until its fix, one stack later -
 so on a device with no `shader-f16`, which is every stock Chrome on NVIDIA, the
 diffusion transformer's weights fell back to the host SILENTLY: `hostPack`
@@ -1037,7 +1037,7 @@ own architecture) and a G4; H100 was refused on Pro, and neither was measured.
 
 ### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
 
-The shared vectorised linear (`webgpu/esmc/block-webgpu.js`) tiles eight rows by
+The shared vectorised linear (`webgpu/esmc/block.js`) tiles eight rows by
 256 columns, so a token-sized projection at 768 or 1152 channels ran 15 to 60
 workgroups a pass on a card that holds thousands. Each output sums k in the same
 order at any row tile, so two rows is more workgroups for the same bits - pLDDT
@@ -1063,7 +1063,7 @@ and the wide models ran the FUSED kernel, whose row tile halves as the channels
 double. OpenDDE's 384-channel transition was **291 ms of a 558 ms** trunk pass
 at 68 tokens, ~3 TFLOPS on the kernel AF3's 128 channels runs at ~15.
 
-`createVectorGemmShader` in transition-webgpu.js is a register-tiled vector
+`createVectorGemmShader` in transition.js is a register-tiled vector
 GEMM for exactly the split's two projections: 64 x 64 blocks on 256 lanes, 4 x 4
 a lane, 8 KiB of workgroup memory, f32 accumulation, the SwiGLU applied as
 `down` stages its operand - the same bindings and uniform as the matrix GEMM, so

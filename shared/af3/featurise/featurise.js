@@ -724,7 +724,7 @@ export function featuriseProtein(sequence, options = {}) {
   // 🔴 AND THE BOND ORDER IS A SECOND PLANE, WHICH NOTHING HERE BUILT. boltz2's
   // z-init reads TWO planes - the contact flag and the bond ORDER - and it is
   // the only family with `tokenBondsTypeEmbed`, so it is the only one that
-  // notices. `embedder-webgpu.js` and `confidence-webgpu.js` both read
+  // notices. `embedder.js` and `confidence.js` both read
   // `input.bondOrderMatrix`, `fold.js` forwards `batch.bondOrderMatrix`, and
   // the featuriser never set it: five consumers and no producer, so every bond
   // reached boltz2 with order 0 - "unspecified" - where the CCD says 1 or 2.

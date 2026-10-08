@@ -23,7 +23,7 @@ import { describe, expect, it } from "./harness.js";
 import {
   CERTAINTY, contactAngstromsFor, contactBinCountsByPair, createCertaintyShader,
   partnerKeys,
-} from "../webgpu/esmfold2/distogram-webgpu.js";
+} from "../webgpu/esmfold2/distogram.js";
 
 describe("the certainty's partner rule", () => {
   it("carries the asym id and the residue number, one pair per token", () => {

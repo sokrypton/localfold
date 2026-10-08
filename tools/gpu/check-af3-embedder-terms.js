@@ -17,8 +17,8 @@
  * confirms `bond_embedding` is rms 0.0000 on a protein with no ligand.
  */
 import { batchFromDump } from "./fold.js";
-import { relativeEncoding } from "../../cpu/af3/trunk/embedder-reference.js";
-import { linear } from "../../cpu/af3/trunk/pairformer-reference.js";
+import { relativeEncoding } from "../../cpu/af3/trunk/embedder.js";
+import { linear } from "../../cpu/af3/trunk/pairformer.js";
 import { openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {

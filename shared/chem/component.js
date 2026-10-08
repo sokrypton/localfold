@@ -38,7 +38,7 @@ import { ELEMENT_SYMBOLS } from "../af3/featurise/ccd-component.js";
  *   an alternative embedder
  * @param {(bounds: object, starts: Float64Array[], options: object) =>
  *   Promise<{coordinates: Float64Array, error: number}[]>} [options.refine]
- *   an alternative refiner - this is the seam `conformer-webgpu.js` uses, so
+ *   an alternative refiner - this is the seam `conformer.js` uses, so
  *   the GPU path is a parameter rather than a branch inside the chemistry, and
  *   the differential gate can run both over one set of bounds
  * @returns {{code: string, atoms: object[], bonds: object[], smiles: string,
@@ -92,7 +92,7 @@ export async function smilesComponent(smiles, options = {}) {
   // WHAT MOVED IT. At 100 atoms the CPU path spends 27.6 ms refining against
   // 7.9 embedding, 3.4 building bounds and 2.6 smoothing them - so the O(N^3)
   // triangle smoothing, which is the part that LOOKS like the expensive one,
-  // is 6% of it. `conformer-webgpu.js` refines every attempt in one dispatch.
+  // is 6% of it. `conformer.js` refines every attempt in one dispatch.
   let best = null;
   if (options.refine !== undefined) {
     const refined = await options.refine(bounds, starts, { planar, linear, chiral: centres });

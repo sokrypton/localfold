@@ -13,13 +13,13 @@
  * zero is about a quarter wrong from the first block.
  *
  * The template GEOMETRY features cannot be checked by this and are not
- * implemented; cpu/af3/trunk/template-reference.js raises on a real template rather
+ * implemented; cpu/af3/trunk/template.js raises on a real template rather
  * than running code no measurement covers.
  */
 import { join } from "node:path";
 
-import { embed } from "../../cpu/af3/trunk/embedder-reference.js";
-import { templateEmbedding } from "../../cpu/af3/trunk/template-reference.js";
+import { embed } from "../../cpu/af3/trunk/embedder.js";
+import { templateEmbedding } from "../../cpu/af3/trunk/template.js";
 import * as B from "./af3-bundle.js";
 
 const dump = await B.loadDump("oracle-dumps/af3-oracle-embed-f32.json");

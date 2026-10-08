@@ -22,8 +22,8 @@ import {
 } from "../../shared/af3/featurise/structural-tokens.js";
 import {
   expandStructural, structuralPairFeatures,
-} from "../../cpu/af3/structure/structural-expander-reference.js";
-import { Af3StructuralExpanderGpu } from "../../webgpu/af3/structure/structural-expander-webgpu.js";
+} from "../../cpu/af3/structure/structural-expander.js";
+import { Af3StructuralExpanderGpu } from "../../webgpu/af3/structure/structural-expander.js";
 import {
   openAf3Store, structuralExpanderWeights, structuralRefinerWeights,
 } from "../../shared/af3/weights/weights.js";

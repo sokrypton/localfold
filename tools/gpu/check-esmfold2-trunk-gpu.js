@@ -1,4 +1,4 @@
-// Does webgpu/esmfold2/trunk-webgpu.js compute ESMFold2's folding trunk?
+// Does webgpu/esmfold2/trunk.js compute ESMFold2's folding trunk?
 //
 //     .venv-esm/bin/python tools/esmc/dump-esmfold2-trunk.py --sequence-length 40
 //     python3 tools/export_esmfold2_trunk.py
@@ -27,9 +27,9 @@
 // matrices a block over 24 blocks is 37.7 MiB of zeros; a bundle carrying them
 // would be paying to say something this checker says for free.
 import { readTensor } from "../../shared/weights/dtype.js";
-import { Esmfold2TrunkGpu } from "../../webgpu/esmfold2/trunk-webgpu.js";
+import { Esmfold2TrunkGpu } from "../../webgpu/esmfold2/trunk.js";
 import { transition, triangleMultiplication }
-  from "../../cpu/af3/trunk/pairformer-reference.js";
+  from "../../cpu/af3/trunk/pairformer.js";
 import { deviceProfile, setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 const TRIANGLE = ["leftNormInputScale", "leftNormInputOffset", "centerNormScale",

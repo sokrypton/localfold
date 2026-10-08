@@ -11,12 +11,12 @@
  * with the widths taken from a real bundle, one update at a time, so a failing
  * BLOCK can be attributed to a kernel rather than bisected by hand.
  */
-import { af3TriangleMultiplication } from "../../webgpu/af3/trunk/triangle-webgpu.js";
-import { Af3GridSelfAttentionGpu } from "../../webgpu/af3/trunk/grid-attention-webgpu.js";
+import { af3TriangleMultiplication } from "../../webgpu/af3/trunk/triangle.js";
+import { Af3GridSelfAttentionGpu } from "../../webgpu/af3/trunk/grid-attention.js";
 import {
   gridSelfAttention, transition, triangleMultiplication,
-} from "../../cpu/af3/trunk/pairformer-reference.js";
-import { Af3TransitionGpu } from "../../webgpu/af3/trunk/transition-webgpu.js";
+} from "../../cpu/af3/trunk/pairformer.js";
+import { Af3TransitionGpu } from "../../webgpu/af3/trunk/transition.js";
 import { af3Dialect, openAf3Store, pairformerBlockWeights } from "../../shared/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {

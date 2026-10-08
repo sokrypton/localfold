@@ -421,7 +421,7 @@ function pairTrack(store, root, index) {
     // 🔴 RoseTTAFold3 ONLY: both of these are biased there and bias-free
     // everywhere else. Off the TENSORS rather than off the dialect, because a
     // checkpoint either carries them or does not - and null means the term
-    // does not exist rather than "assume zero". See pairformer-reference.js
+    // does not exist rather than "assume zero". See pairformer.js
     // for why the GATE's bias is the one that matters.
     gatingQueryBias: has(store, `${root}/pair_attention${which}/gating_query/bias`)
       ? at(`pair_attention${which}/gating_query/bias`) : null,
@@ -469,7 +469,7 @@ export async function embedderWeights(store) {
     positionActivations: await T("~_relative_encoding/position_activations/weights"),
     // 🔴 [1, 128] - ONE input feature, the contact matrix. It was in the
     // shipped bundle and read by nothing, so every fold downloaded it and
-    // multiplied it by no ligand bonds at all. See embedder-webgpu.js.
+    // multiplied it by no ligand bonds at all. See embedder.js.
     // (absent from chai1, whose token-pair stream has no bond column: af3-any-model skips _embed_bonds for it)
     ...(store.manifest?.tensors?.[`${EVO}/bond_embedding/weights`] === undefined
       ? { bondEmbedding: null } : { bondEmbedding: await T("bond_embedding/weights") }),

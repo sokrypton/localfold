@@ -1,5 +1,5 @@
 /**
- * AF3 pairformer blocks on the GPU, against cpu/af3/trunk/pairformer-reference.js.
+ * AF3 pairformer blocks on the GPU, against cpu/af3/trunk/pairformer.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-block.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-block.js --n=64 --blocks=8
@@ -14,8 +14,8 @@
  * (1.4e-7 at block 8 against 4.3e-7 at block 47), and the GPU should behave the
  * same way.
  */
-import { pairformerBlock } from "../../cpu/af3/trunk/pairformer-reference.js";
-import { Af3PairformerStackGpu } from "../../webgpu/af3/trunk/pairformer-block-webgpu.js";
+import { pairformerBlock } from "../../cpu/af3/trunk/pairformer.js";
+import { Af3PairformerStackGpu } from "../../webgpu/af3/trunk/pairformer-block.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";

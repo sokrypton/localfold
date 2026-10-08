@@ -10,7 +10,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { layerNorm, linear, transition } from "../cpu/af3/trunk/pairformer-reference.js";
+import { layerNorm, linear, transition } from "../cpu/af3/trunk/pairformer.js";
 
 const close = (actual, expected, tolerance = 1e-5) => {
   assert.equal(actual.length, expected.length, "length");

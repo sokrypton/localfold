@@ -15,7 +15,7 @@
  * 🔴 AND THE LANGUAGE MODEL IS THE FIRST THING, NOT THE LAST. ESM-C streams one
  * block's weights at a time and holds 2190 MiB if it does not, so it runs and
  * is released before the trunk allocates anything pair-sized. Its 37 hidden
- * states are never materialised at all - see webgpu/esmc/tower-webgpu.js.
+ * states are never materialised at all - see webgpu/esmc/tower.js.
  *
  * 🔴 AND `lm_shim(0)` IS NOT ZERO, so "fold without the language model" is not
  * a mode this offers. The shim's biases make the term non-zero for a zero
@@ -23,34 +23,34 @@
  * without ESM-C has no ESMFold2 to run.
  */
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, linearGrid }
-  from "../esmc/block-webgpu.js";
+  from "../esmc/block.js";
 import {
   featuriseForEsmfold2, languageModelInput, maskLanguageModelInput,
   MOL_DNA, MOL_RNA,
 } from "../../shared/esmfold2/featurise.js";
-import { EsmcTowerGpu } from "../esmc/tower-webgpu.js";
+import { EsmcTowerGpu } from "../esmc/tower.js";
 import { createAddShader } from "../runtime/execution.js";
 import { memoryBudgetBytes } from "../runtime/device-memory.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { yieldToBrowser } from "../runtime/yield.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { Esmfold2TrunkGpu } from "./trunk-webgpu.js";
-import { esmfold2ConfidenceFold } from "./confidence-webgpu.js";
-import { Esmfold2DenoiserGpu, atomConditioning } from "./diffusion-webgpu.js";
-import { buildRope } from "../../cpu/esmfold2/atom-transformer-reference.js";
-import { runInputsEmbedder } from "./atom-transformer-webgpu.js";
-import { encodeLanguagePair } from "./language-pair-webgpu.js";
-import { encodeContactMap, partnerKeys } from "./distogram-webgpu.js";
-import { linear } from "../../cpu/esmfold2/pair-features-reference.js";
+import { Esmfold2TrunkGpu } from "./trunk.js";
+import { esmfold2ConfidenceFold } from "./confidence.js";
+import { Esmfold2DenoiserGpu, atomConditioning } from "./diffusion.js";
+import { buildRope } from "../../cpu/esmfold2/atom-transformer.js";
+import { runInputsEmbedder } from "./atom-transformer.js";
+import { encodeLanguagePair } from "./language-pair.js";
+import { encodeContactMap, partnerKeys } from "./distogram.js";
+import { linear } from "../../cpu/esmfold2/pair-features.js";
 import { alignedErrorFromDistogram } from "../../shared/esmfold2/aligned-error.js";
 import {
   createBondShader, createRelativePositionShader, createZInitShader,
   relativeLayout, relativeRows,
-} from "./pair-features-webgpu.js";
+} from "./pair-features.js";
 import {
   centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
   samplerStep, uniforms,
-} from "../../cpu/esmfold2/sampler-reference.js";
+} from "../../cpu/esmfold2/sampler.js";
 import { ESMFOLD2_PHASES, esmfold2Plan, trunkPhase } from "./cost.js";
 
 /** The largest pair copied to the host; past it the browser refuses the array. */
@@ -884,14 +884,14 @@ export async function foldEsmfold2(device, options) {
 
     // 🔴 THE ELEMENT THE TOKEN TRANSFORMER'S WEIGHTS ARE HELD IN. Twelve
     // blocks are 459 MiB of a 799 MiB fold; see the note in
-    // webgpu/esmfold2/diffusion-webgpu.js for why this stack takes f16 and the
+    // webgpu/esmfold2/diffusion.js for why this stack takes f16 and the
     // atom stacks do not.
     await mark("conditioning", () => denoiser.prepare({
       shape: denoiserShape,
       // 🔴 AND THE CONDITIONING IS WRITTEN BACK INTO relPos. It is the last
       // pass that reads it, chunk by chunk, and the fold is at its fullest
       // exactly there - three pair-sized f32 tensors where two will do. See
-      // prepare() in webgpu/esmfold2/diffusion-webgpu.js for why the row chunking
+      // prepare() in webgpu/esmfold2/diffusion.js for why the row chunking
       // makes that safe. relPos stays in `held`, because it is now the
       // conditioning and the sampler reads it at every step.
       weights: weights.denoiser, features, sInputs, pair, relPos, reuseRelPos: true,

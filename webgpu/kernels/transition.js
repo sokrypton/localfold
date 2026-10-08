@@ -507,7 +507,7 @@ export function packTransitionWeights(input, weightPrecision = "f32") {
  *   - UNROLLING THE STAGING LOOPS' vec4 COMPONENT WRITES. `staged[j]` with `j`
  *     a loop variable is a dynamically indexed vector, which WGSL is entitled
  *     to put in spillable local memory - the trap src/af3/
- *     outer-product-mean-webgpu.js documents for accumulator arrays, and these
+ *     outer-product-mean.js documents for accumulator arrays, and these
  *     sit in the hot k loop. **16.69 and 16.39.** A four-iteration loop over a
  *     constant bound is not that case: the compiler already unrolls it and
  *     keeps the vector in registers, and writing it out by hand only loses the

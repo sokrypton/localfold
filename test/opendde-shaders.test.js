@@ -17,8 +17,8 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { createAtomBlockShaders, createAtomEncoderShaders } from "../webgpu/af3/diffusion/atom-encoder-webgpu.js";
-import { createGridAttentionShaders, packGridAttentionWeights } from "../webgpu/af3/trunk/grid-attention-webgpu.js";
+import { createAtomBlockShaders, createAtomEncoderShaders } from "../webgpu/af3/diffusion/atom-encoder.js";
+import { createGridAttentionShaders, packGridAttentionWeights } from "../webgpu/af3/trunk/grid-attention.js";
 import { ALPHAFOLD3, OPENDDE } from "../shared/af3/dialect.js";
 
 const ATOM_SHAPE = {

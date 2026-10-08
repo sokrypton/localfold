@@ -108,7 +108,7 @@ test("every relative import resolves to a file that exists", () => {
  * blind to them and that blindness cost 129 stale references in one afternoon.
  * The `src/af3` reorganisation rewrote import SPECIFIERS and `.md` files and
  * left every `src/af3/<file>.js` written inside a code comment pointing at a
- * path that no longer existed - in `dialect.js`, in `transition-webgpu.js`, in
+ * path that no longer existed - in `dialect.js`, in `transition.js`, in
  * 75 files. A comment naming a module the reader cannot open is the
  * "doc that disagrees with itself" failure this repository keeps paying for,
  * and it is mechanically checkable.

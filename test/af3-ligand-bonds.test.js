@@ -6,9 +6,9 @@
  *
  *   THE MODEL. `featurise.js` builds the contact matrix and `fold.js` handed
  *   the trunk an object built FIELD BY FIELD that did not name it, so the
- *   embedder saw `undefined`; and `embedder-webgpu.js` - the one a browser fold
+ *   embedder saw `undefined`; and `embedder.js` - the one a browser fold
  *   runs - had neither the `bondEmbedding` weight nor the term, while
- *   `embedder-reference.js` had both. `bond_embedding/weights` was downloaded
+ *   `embedder.js` had both. `bond_embedding/weights` was downloaded
  *   with every fold and multiplied by nothing. The pair track therefore carried
  *   no statement that any two ligand atoms are bonded.
  *
@@ -96,7 +96,7 @@ describe("a ligand's bonds reach the model", () => {
     // key thrown away - and `undefined` there is indistinguishable from a fold
     // with no ligand, which is what made it survive. Read out of the source,
     // because the alternative is running a fold.
-    const source = af3Source("fold.js");
+    const source = af3Source("webgpu:fold.js");
     const call = source.slice(source.indexOf("trunk = await trunkGpu.run({"),
                               source.indexOf("}, weights.trunk, weights.trunk.dialect"));
     assert.ok(/bondMatrix:\s*batch\.bondMatrix/.test(call),
@@ -106,13 +106,13 @@ describe("a ligand's bonds reach the model", () => {
   it("is applied by the GPU embedder, not only by the reference", () => {
     // The reference has had this term throughout; the GPU path is what a
     // browser fold runs, and it had neither the weight nor the arithmetic.
-    const gpu = af3Source("embedder-webgpu.js");
+    const gpu = af3Source("webgpu:embedder.js");
     assert.ok(/"bondEmbedding"/.test(gpu),
       "bondEmbedding is not in the GPU embedder's packed weight list");
     assert.ok(/bonds\[row\]\s*\*\s*weights\[W_BOND \+ c\]/.test(gpu),
       "the GPU pair init does not add the bond term");
     // ...and the weight has to be loadable, or packEmbedderWeights throws.
-    const weights = af3Source("weights.js");
+    const weights = af3Source("shared:weights.js");
     assert.ok(/bondEmbedding:\s*await T\("bond_embedding\/weights"\)/.test(weights),
       "embedderWeights does not read bond_embedding/weights");
   });

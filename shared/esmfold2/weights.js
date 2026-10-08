@@ -128,7 +128,7 @@ const TRIANGLE = ["leftNormInputScale", "leftNormInputOffset", "centerNormScale"
 const TRANSITION = ["inputLayerNormScale", "inputLayerNormOffset",
   "transition1", "transition2"];
 
-/** One trunk block, in the shapes webgpu/af3/trunk/pair-track-gpu.js wants. */
+/** One trunk block, in the shapes webgpu/af3/trunk/pair-track.js wants. */
 /**
  * One pair-only block, from `blocks/<layer>/...` or any other prefix.
  *

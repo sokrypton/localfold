@@ -20,7 +20,7 @@
  * drifts up to 3.2x between runs and, more to the point, a second process would
  * be a second random pair representation.
  */
-import { Esmfold2TrunkGpu } from "../../webgpu/esmfold2/trunk-webgpu.js";
+import { Esmfold2TrunkGpu } from "../../webgpu/esmfold2/trunk.js";
 import { blockUploadStats } from "../../webgpu/weights/quantised-upload.js";
 import { reader } from "./fold-esmfold2.js";
 import { trunkBlockWeights } from "../../shared/esmfold2/weights.js";

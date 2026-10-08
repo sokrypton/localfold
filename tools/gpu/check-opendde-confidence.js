@@ -20,9 +20,9 @@
 import { confidencePairInit, hostAtomReadouts, hostPairReadouts }
   from "../../webgpu/af3/confidence/opendde-confidence.js";
 import { openddeAtomReadouts, openddePairInit, openddePairReadouts }
-  from "../../webgpu/af3/confidence/opendde-confidence-webgpu.js";
+  from "../../webgpu/af3/confidence/opendde-pair-readouts.js";
 import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
-import { linear } from "../../cpu/af3/trunk/pairformer-reference.js";
+import { linear } from "../../cpu/af3/trunk/pairformer.js";
 import { openAf3Store, openddeConfidenceWeights } from "../../shared/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {

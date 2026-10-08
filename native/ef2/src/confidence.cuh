@@ -1,5 +1,5 @@
 // Synthyra's ESMFold2 confidence head (biohub ships the checkpoint without one; Synthyra trained it on
-// the same frozen trunk). cpu/esmfold2/confidence-reference.js and their ConfidenceHead are the reading:
+// the same frozen trunk). cpu/esmfold2/confidence.js and their ConfidenceHead are the reading:
 //
 //   s = LN(s_inputs);  z = LN(z_trunk) + rel_pos + bonds + s_to_z(s)_i + s_to_z_T(s)_j + prod_out(in1(s)_i * in2(s)_j)
 //   z += distance_embed[#(|x_rep_i - x_rep_j| > boundaries)]

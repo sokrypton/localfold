@@ -1,5 +1,5 @@
 /**
- * AF3's whole trunk on the GPU, against cpu/af3/trunk/trunk-reference.js.
+ * AF3's whole trunk on the GPU, against cpu/af3/trunk/trunk.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-trunk.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-trunk.js --n=256 --blocks=48 --no-check
@@ -14,13 +14,13 @@
  * a few pairformer blocks a random pair representation is chaotic: two CPU runs
  * differing by 1e-7 at the input diverge to ~6e-4. See tools/gpu/check-af3-block.js.
  */
-import { runTrunk } from "../../cpu/af3/trunk/trunk-reference.js";
+import { runTrunk } from "../../cpu/af3/trunk/trunk.js";
 import {
   fusedTemplateEmbedding, templateEmbedding,
-} from "../../cpu/af3/trunk/template-reference.js";
-import { emptyFusedFeatures } from "../../webgpu/af3/trunk/template-webgpu.js";
-import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
-import { binEdges as binEdgesOf } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+} from "../../cpu/af3/trunk/template.js";
+import { emptyFusedFeatures } from "../../webgpu/af3/trunk/template.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk.js";
+import { binEdges as binEdgesOf } from "../../webgpu/af3/trunk/trunk.js";
 import { af3Dialect, openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 import { deviceTuning } from "../../webgpu/runtime/device-profile.js";
 import { CLASS_PROTEIN } from "../../shared/heads/contact-threshold.js";

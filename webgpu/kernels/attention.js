@@ -963,7 +963,7 @@ fn store4(v: vec4<f32>) -> vec2<u32> {
   const lazyRescale = options.lazyRescale ?? false;
   const queriesPerLane = options.queriesPerLane ?? 1;
   // 🔴 THREE CONTRACTS OTHER CALLERS HAVE, EACH OFF BY DEFAULT SO AF2'S SHADERS ARE BYTE-IDENTICAL. AF3's
-  // denoiser (webgpu/af3/diffusion/diffusion-transformer-webgpu.js) scales the SCORE rather than the query
+  // denoiser (webgpu/af3/diffusion/diffusion-transformer.js) scales the SCORE rather than the query
   // (`scale`), applies its sigmoid gate in the output projection that follows (`gate: false` - no gate
   // binding, the attention written as it is), and keeps ONE key mask for every sample in its batch
   // (`sharedMask`). Its own kernel gave a workgroup to each (query, head) and re-read every key and value
@@ -1032,7 +1032,7 @@ fn store4(v: vec4<f32>) -> vec2<u32> {
   // 2 * head_dim/4 vectors a key needs was fetched by 64 lanes issuing 64
   // identical global loads. Staged, that is one load and 64 workgroup reads.
   // AF3's grid attention is the same kernel and the same fix, worth 1.9x there;
-  // see webgpu/af3/trunk/grid-attention-webgpu.js.
+  // see webgpu/af3/trunk/grid-attention.js.
   //
   // 🔴 THE MASK LOOKS LIKE THE FOURTH OPERAND OF THAT ARGUMENT AND STAGING IT
   // LOSES. It is indexed by the batch and the KEY, so all 64 lanes read the
@@ -1375,7 +1375,7 @@ ${terms((s) => `  let w${s} = exp(st${s}.x - top);`)}
  * workgroup reads for 64 multiply-adds and a rescale of all eight accumulators. Here a staged vec4 feeds
  * four dot products, the row max is reduced across a query row's eight lanes through workgroup memory,
  * the running sum stays per lane until one final reduction, and the output is rescaled once a 32-key
- * tile. AF3's grid.attend took the same change (webgpu/af3/trunk/grid-attention-webgpu.js) at 1.46x.
+ * tile. AF3's grid.attend took the same change (webgpu/af3/trunk/grid-attention.js) at 1.46x.
  *
  * Same bindings, uniform and semantics as the register kernel at `group: 1`: the query arrives
  * pre-scaled, the mask enters as 1e9 * (mask - 1), the logit is clamped to +-1e8, a key past the end

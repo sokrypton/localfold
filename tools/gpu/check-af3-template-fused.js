@@ -19,8 +19,8 @@
  * columns go IN; the featuriser that would build them is not written yet and
  * docs/AF3.md has its specification.
  */
-import { fusedTemplateEmbedding } from "../../cpu/af3/trunk/template-reference.js";
-import { Af3TemplateEmbedderGpu, emptyFusedFeatures } from "../../webgpu/af3/trunk/template-webgpu.js";
+import { fusedTemplateEmbedding } from "../../cpu/af3/trunk/template.js";
+import { Af3TemplateEmbedderGpu, emptyFusedFeatures } from "../../webgpu/af3/trunk/template.js";
 import { openAf3Store, templateWeights, af3Dialect } from "../../shared/af3/weights/weights.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-template-protenix2.json";

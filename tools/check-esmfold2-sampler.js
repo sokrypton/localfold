@@ -20,7 +20,7 @@ import { join } from "node:path";
 import process from "node:process";
 
 import { churnFactors, noiseLevels, noiseSchedule, samplerStep }
-  from "../cpu/esmfold2/sampler-reference.js";
+  from "../cpu/esmfold2/sampler.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const dumpPath = process.argv[2] ?? join(ROOT, "oracle-dumps", "esmfold2-trunk-40-lm.json");

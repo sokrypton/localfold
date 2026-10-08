@@ -83,7 +83,7 @@ Measured on Colab T4s and one L4 (docs/PERF.md, "A Colab T4" and "A Colab L4"):
 Metal clamps an out-of-range write where Vulkan discards it (the 160-residue
 race). New or rewritten kernels on this branch:
 
-- `createAf3OpmVectorOutputShader` (webgpu/af3/trunk/outer-product-mean-webgpu.js):
+- `createAf3OpmVectorOutputShader` (webgpu/af3/trunk/outer-product-mean.js):
   rows are guarded; columns and the inner dimension are NOT, and the caller
   refuses shapes that do not divide (`pairChannels % 64`, `C^2 % 16`). Check
   that refusal holds for every bundle you fold.

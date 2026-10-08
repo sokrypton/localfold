@@ -12,7 +12,7 @@
  *
  * It drives the SHIPPED kernel out of `createAtomEncoderShaders`, not a copy.
  */
-import { createAtomEncoderShaders } from "../../webgpu/af3/diffusion/atom-encoder-webgpu.js";
+import { createAtomEncoderShaders } from "../../webgpu/af3/diffusion/atom-encoder.js";
 import { chiralCentres } from "../../shared/af3/featurise/template-features.js";
 import { chiralPositionGradients } from "../../shared/af3/diffusion/chiral-gradient.js";
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";

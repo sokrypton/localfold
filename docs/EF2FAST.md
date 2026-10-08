@@ -8,7 +8,7 @@ fold from a single sequence in a browser. Everything before that is the port.
 
 🔴 **IT IS AF3's PAIRFORMER BLOCK WITH THE GRID ATTENTIONS AND THE SINGLE TRACK
 REMOVED, AND THAT IS MEASURED.** `tools/check-esmfold2-trunk.js` composes
-`cpu/af3/trunk/pairformer-reference.js`'s three surviving pieces 24 times and scores
+`cpu/af3/trunk/pairformer.js`'s three surviving pieces 24 times and scores
 them against the values the native model recorded going into and coming out of
 its trunk at each of its four recycles: **relRMS 1.4e-6** against a 2e-4 bound.
 So the port needed no new arithmetic, only the weights in AF3's shapes -
@@ -43,7 +43,7 @@ projection is zero adds zero, so a zeroed AF3 block already IS ESMFold2's block
 and needs no graph code at all. It is also pure waste: `grid.attend` is the
 largest kernel in an AF3 trunk and this trunk runs 24 blocks four times over.
 `compilePairTrack`/`encodePairTrack` take a `gridAttention` flag (default true,
-so no existing caller moves) and `webgpu/esmfold2/trunk-webgpu.js` sets it false.
+so no existing caller moves) and `webgpu/esmfold2/trunk.js` sets it false.
 Worth **1.42x**, and `tools/gpu/check-esmfold2-trunk-gpu.js` runs both arms over
 the same weights at the same shapes and asserts **0 differing elements** - not a
 tolerance, because dropping passes from a track whose five updates each read the
@@ -119,7 +119,7 @@ self-attention** over atoms, half-window 64, whose only positional signal is a
 raw index, the diagonal is always allowed, the blocks are adaLN-Zero with
 **affine-free RMSNorm**, and q/k take a second affine-free RMSNorm before the
 rotation. Nothing in the shapes says any of this: both are "an atom transformer
-at 128 channels". `cpu/af3/diffusion/atom-encoder-reference.js`.
+at 128 channels". `cpu/af3/diffusion/atom-encoder.js`.
 
 🔴 **THE DIFFUSION MODULE IS `structure_head`, AND ITS CONDITIONING IS PORTED.**
 345 tensors, and the shape of it: conditioning, then the SAME SWA atom encoder
@@ -436,9 +436,9 @@ encoder is 32-query / 128-key windowed attention biased by a pair
 representation; this is plain sliding-window self-attention whose only
 positional signal is a rotary embedding built from the REFERENCE CONFORMER.
 Both are "an atom transformer at 128 channels".
-`webgpu/esmfold2/atom-transformer-webgpu.js` is four new shaders - `modulate`,
+`webgpu/esmfold2/atom-transformer.js` is four new shaders - `modulate`,
 `prepare`, `attend`, `gated` - and everything that is a plain projection comes
-from `webgpu/esmc/block-webgpu.js`, whose tiled GEMM and fused SwiGLU are exactly
+from `webgpu/esmc/block.js`, whose tiled GEMM and fused SwiGLU are exactly
 the shapes `ffnUp` and `lin_swish` are packed in.
 
 🔴 **AND THE WINDOW IS RESOLVED ON THE HOST, BECAUSE IT IS OVER RANK.** Two
@@ -1391,7 +1391,7 @@ finished, long after the function's own `finally` has freed them. The failure wa
 which names the buffer and not the lifetime.
 
 🔴 **SO THE COLOUR SHIPS, AND THE PRE-SAMPLER ARM DOES NOT USE THE STRUCTURE.**
-`CERTAINTY` in webgpu/esmfold2/distogram-webgpu.js: the mass within **2 A of the
+`CERTAINTY` in webgpu/esmfold2/distogram.js: the mass within **2 A of the
 distogram's mode**, meaned over every pair at sequence separation above **3**
 whose predicted distance is under **12 A**. Ranked on realistic corruption rates
 (0 and 15%) by WORST fold, the two families are a tie -
@@ -1551,7 +1551,7 @@ protein chains**, so nothing in this file had ever borne on a ligand token.
 
 62% of that fold's contacts were ATP's internal pairs, so the precision a
 checker prints was mostly a statement about a conformer the model was HANDED.
-`partnerKeys` in webgpu/esmfold2/distogram-webgpu.js replaces the arithmetic with
+`partnerKeys` in webgpu/esmfold2/distogram.js replaces the arithmetic with
 two numbers per token - the asym id and the residue number - and the rule
 becomes "the same chain, and within `separation` RESIDUES". A ligand's atoms
 share one residue number, so a gap of zero drops the whole self-block; two
@@ -3345,7 +3345,7 @@ neither side supplies.** The only thing that could was running their PIPELINE,
 which chooses the arguments itself - and that is why an end-to-end native run is
 worth the transformers-5.13 venv it costs.
 
-The tensor already exists on our side: `diffusion-webgpu.js` takes `relPos`,
+The tensor already exists on our side: `diffusion.js` takes `relPos`,
 "the same relative-position encoding z_init used, on device", because the
 diffusion conditioning needs it. The fix is to pass it to the confidence head
 and add it to the pair init in the host reference and the WGSL alike, then
@@ -3641,7 +3641,7 @@ believe the rewrite before changing what it computes: 85.675 / 0.814972 and
 atomChecksum **693370**, identical to the kernel it replaced.
 
 **Two: the window is gone from the INPUTS EMBEDDER - and only there.**
-`atom-transformer-reference.js` defaults to dense too, so the CPU reference and
+`atom-transformer.js` defaults to dense too, so the CPU reference and
 the GPU agree on what the model is. `--atom-windowed=1` restores the old
 behaviour for comparison.
 

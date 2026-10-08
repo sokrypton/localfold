@@ -49,9 +49,9 @@ import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { MODEL_BUNDLES, loadManifest } from "../../shared/bundles/manifests/index.js";
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../webgpu/af3/fold.js";
-import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
-import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
 import { openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 import { targetFeatureWeights, diffusionWeights, atomReference }
   from "../../shared/af3/weights/diffusion-weights.js";

@@ -1,7 +1,7 @@
 /**
  * The six template GEOMETRY features, from a template's dense atoms.
  *
- * These are what `cpu/af3/trunk/template-reference.js` used to refuse to compute, and
+ * These are what `cpu/af3/trunk/template.js` used to refuse to compute, and
  * the reason it refused was good: with no template all six are identically
  * zero, so nothing here could tell a correct implementation from a wrong one.
  * `tools/oracle/dump_af3_trunk.py --template <pdb>` now produces a reference

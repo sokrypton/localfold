@@ -21,20 +21,20 @@
  * activations on this side would compare two featurisers rather than two score
  * models. `tools/oracle/dump_af3_denoise.py` records what native was handed.
  */
-import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head-webgpu.js";
+import { Af3DiffusionHeadGpu } from "../../webgpu/af3/diffusion/diffusion-head.js";
 import {
   diffusionConditioning, diffusionHead, diffusionTransformer,
   atomDecoder, scalings,
-} from "../../cpu/af3/diffusion/diffusion-reference.js";
-import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
-import { Af3AtomDecoderGpu } from "../../webgpu/af3/diffusion/atom-decoder-webgpu.js";
-import { Af3DiffusionConditioningGpu } from "../../webgpu/af3/diffusion/diffusion-conditioning-webgpu.js";
-import { atomCrossAttentionEncoder as encodeCpu } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
-import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder-webgpu.js";
-import { layerNormSlow } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
-import { linear } from "../../cpu/af3/trunk/pairformer-reference.js";
+} from "../../cpu/af3/diffusion/diffusion.js";
+import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer.js";
+import { Af3AtomDecoderGpu } from "../../webgpu/af3/diffusion/atom-decoder.js";
+import { Af3DiffusionConditioningGpu } from "../../webgpu/af3/diffusion/diffusion-conditioning.js";
+import { atomCrossAttentionEncoder as encodeCpu } from "../../cpu/af3/diffusion/atom-encoder.js";
+import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder.js";
+import { layerNormSlow } from "../../cpu/af3/diffusion/atom-encoder.js";
+import { linear } from "../../cpu/af3/trunk/pairformer.js";
 import { af3Dialect, openAf3Store } from "../../shared/af3/weights/weights.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
 import { denseBondGeometry } from "./bond-geometry.js";
 import { atomReference, diffusionWeights } from "../../shared/af3/weights/diffusion-weights.js";
 

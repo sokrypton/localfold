@@ -521,7 +521,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * time, and c_outer arrives in a uniform - so the shader is generated per
  * c_outer and the pipeline cache key carries it. AF3's outer product learned
  * the same thing the same way; see the note in
- * webgpu/af3/trunk/outer-product-mean-webgpu.js.
+ * webgpu/af3/trunk/outer-product-mean.js.
  *
  * 🔴 AND A CHUNK OF SEQUENCES IS STAGED, which is what the cells buy. A thread
  * that owned ONE cell re-read the same two 32-float slices as its 1023
@@ -1027,7 +1027,7 @@ export function opmMatrixContract(device, input) {
  * nowhere to put a cooperative reduction. It used to be computed inside
  * `opm.project-output`, once per pair per workgroup; the total work is the same
  * either way - `L^2 * sequences` mask products - and src/af3/
- * outer-product-mean-webgpu.js already made this exact move for the same reason
+ * outer-product-mean.js already made this exact move for the same reason
  * ("it is PAIRS x SEQUENCES multiply-adds in total, a thousandth of the
  * contraction's, so it is cheaper to compute once into a buffer than to carry").
  *
@@ -1101,7 +1101,7 @@ export function createOuterProductMeanMatrixOutputShader(geometry, residual) {
  * kernel. (The count behind the scale is a sum of 0/1 products, an exact
  * integer in any order.) A 64 x 64 block on 256 lanes, 4 x 4 adjacent outputs
  * a lane, the source panel padded to a stride of 68 - the layout of the split
- * transition's vector GEMM in webgpu/af3/trunk/transition-webgpu.js.
+ * transition's vector GEMM in webgpu/af3/trunk/transition.js.
  */
 export function createOuterProductMeanVectorOutputShader(residual) {
   const BM = 64, BN = 64, BK = 16, AS = BM + 4;

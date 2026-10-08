@@ -4,12 +4,12 @@
 // once per sampler step against a structure that starts as pure noise and ends
 // folded, and a flat or linear arrangement is exactly what py2Dmol's `svd3`
 // records meeting constantly in a viewer. The routine in
-// cpu/esmfold2/sampler-reference.js is that one's algorithm - the eigenvalue
+// cpu/esmfold2/sampler.js is that one's algorithm - the eigenvalue
 // floor, the unit-vector check, the orthonormal completion - and this pins the
 // behaviour those exist for, so a later "simplification" back to a bare
 // H^T H / sqrt / divide has something to fail.
 import { describe, expect, it } from "./harness.js";
-import { weightedRigidAlign } from "../cpu/esmfold2/sampler-reference.js";
+import { weightedRigidAlign } from "../cpu/esmfold2/sampler.js";
 
 /** Rotate `points` by the rotation taking x->y, y->-x (90 degrees about z). */
 function quarterTurn(points, atoms) {

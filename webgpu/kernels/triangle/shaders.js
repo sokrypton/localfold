@@ -98,7 +98,7 @@ const CONTRACT_TILE_DEFAULT = { rows: 32, columns: 32 };
  * The width these kernels fold a linear workgroup count at.
  *
  * 🔴 EXPORTED SO THE CALLERS CANNOT DRIFT FROM THE KERNEL. Three files dispatch
- * these shaders - webgpu/af3/trunk/pair-track-gpu.js, webgpu/af2/multimer/block.js and
+ * these shaders - webgpu/af3/trunk/pair-track.js, webgpu/af2/multimer/block.js and
  * webgpu/kernels/triangle/webgpu.js - and each had its own 32768 written out. The kernels
  * read `group.y + group.z * LINEAR_GRID_WIDTH`, so a caller splitting at a
  * different width addresses rows that do not exist and skips rows that do, with
@@ -228,7 +228,7 @@ export function createTriangleShaders(
   // NORMALIZE_ROWS rows a workgroup of 64, so eight lanes share a row's
   // reduction and the staging tile is NORMALIZE_ROWS * channels floats.
   // 🔴 PRICED AGAINST THE DEVICE, NOT TYPED IN - AND THIS IS THE SECOND COPY OF
-  // THIS TILE. `grid-attention-webgpu.js` has the same eight-row staged
+  // THIS TILE. `grid-attention.js` has the same eight-row staged
   // LayerNorm and the same arithmetic; both stage `rows * channels` floats plus
   // two 64-lane reductions and two per-row scalars, and both come to EXACTLY
   // 16,960 bytes at IntelliFold-2's 512 channels against WebGPU's guaranteed

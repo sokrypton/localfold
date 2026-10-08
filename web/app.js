@@ -2542,7 +2542,7 @@ function meanByChain(asymId, values) {
 
 function attachContactMap(frame, recycle) {
   // The probabilities come from the device (monomer.js's `contacts` option,
-  // webgpu/heads/distogram-webgpu.js). 🔴 THEY WERE COMPUTED HERE, in JavaScript,
+  // webgpu/heads/distogram.js). 🔴 THEY WERE COMPUTED HERE, in JavaScript,
   // from a host copy of the pair representation - on the main thread between
   // the fold's own steps, which made it 3.4 s of a 6.0 s AF2 fold at 261
   // residues and more on a slower CPU. A pass without them (the multimer, a

@@ -168,7 +168,7 @@ recycle's search and finishing: byte-identical (5CAJ, 1TIM's 16469 rows and the 
 here and **1.58 -> 1.25 s (5CAJ) and 2.0 -> 1.4 s (1TIM) on two CPUs**, a Colab T4's.
 
 **And the nearest-centre search runs on the card where the machine has fewer cores than recycles** - the page's
-device search (webgpu/input/nearest-centres-webgpu.js) in CUDA (`--nearest=<out>`, a serve job; the zero-byte count and
+device search (webgpu/input/nearest-centres.js) in CUDA (`--nearest=<out>`, a serve job; the zero-byte count and
 the first-centre tie of the host loop, integers both ways). The exporter plans and writes the searches
 (`--search-out`), the AF2 server assigns them, and the exporter finishes from the assignments (`--assignments`), its
 plan held between the two requests by native/export_server.mjs's one process. Byte-identical; through a warm

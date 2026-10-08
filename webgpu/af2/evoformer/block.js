@@ -1387,7 +1387,7 @@ export async function encodeEvoformerBlock(
  * writes visible to the next. webgpu/af2/evoformer/stack.js does exactly this between
  * blocks and says so; this does it between sub-layers.
  *
- * webgpu/af3/trunk/pair-track-gpu.js reached the same conclusion from the other side and
+ * webgpu/af3/trunk/pair-track.js reached the same conclusion from the other side and
  * counted its scratch down to five, one of which is shared - see
  * PAIR_SCRATCH_COUNT.
  */
@@ -1410,7 +1410,7 @@ export async function staged(execution, body) {
  * amplifies - which is the half of this question that matters, since the
  * triangle multiplication's two operands are read straight back out of the
  * pair and MULTIPLIED, so their rounding squares. See PAIR_SCRATCH_STORAGE in
- * webgpu/af3/trunk/pair-track-gpu.js, where exactly that cost 1200x on AF3.
+ * webgpu/af3/trunk/pair-track.js, where exactly that cost 1200x on AF3.
  */
 async function roundPair(execution, encoder, shape, pair, label) {
   if (shape.halfPair !== true || execution.warming) return;

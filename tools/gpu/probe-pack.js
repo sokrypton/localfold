@@ -31,12 +31,12 @@
  */
 import { openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights } from "../../shared/af3/weights/diffusion-weights.js";
-import { packBlockWeights } from "../../webgpu/af3/diffusion/diffusion-transformer-webgpu.js";
-import { packTransitionWeights } from "../../webgpu/af3/trunk/transition-webgpu.js";
+import { packBlockWeights } from "../../webgpu/af3/diffusion/diffusion-transformer.js";
+import { packTransitionWeights } from "../../webgpu/af3/trunk/transition.js";
 import { packWeights as packTriangleWeights } from "../../webgpu/kernels/triangle/weights.js";
-import { af3TriangleWeights } from "../../webgpu/af3/trunk/triangle-webgpu.js";
-import { packGridAttentionWeights } from "../../webgpu/af3/trunk/grid-attention-webgpu.js";
-import { packSingleAttentionWeights } from "../../webgpu/af3/trunk/single-attention-webgpu.js";
+import { af3TriangleWeights } from "../../webgpu/af3/trunk/triangle.js";
+import { packGridAttentionWeights } from "../../webgpu/af3/trunk/grid-attention.js";
+import { packSingleAttentionWeights } from "../../webgpu/af3/trunk/single-attention.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

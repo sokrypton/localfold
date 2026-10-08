@@ -22,7 +22,7 @@ import { chiralCentres } from "../../shared/chem/stereo.js";
 import {
   distanceBounds, smoothBounds, embedBounds, refineCoordinates, planarQuadruples,
 } from "../../shared/chem/conformer.js";
-import { refineOnDevice } from "../../webgpu/chem/conformer-webgpu.js";
+import { refineOnDevice } from "../../webgpu/chem/conformer.js";
 import { hashOf } from "../../shared/chem/component.js";
 
 const LIGAND = "CC(=O)Oc1ccccc1C(=O)O";           // aspirin: 13 atoms, drug-sized

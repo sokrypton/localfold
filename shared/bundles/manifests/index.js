@@ -290,7 +290,7 @@ export const MODEL_BUNDLES = {
   // nine separate feature projections (`template_pair_embedding_0..8`); this
   // one and boltz2 concatenate the features and apply a single `a_proj`. That
   // is read from the bundle rather than typed in - see
-  // `webgpu/af3/trunk/template-webgpu.js`.
+  // `webgpu/af3/trunk/template.js`.
   //
   // 404 tensors at int5 in eight shards, 334 MiB.
   protenix2: {

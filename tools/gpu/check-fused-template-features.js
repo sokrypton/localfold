@@ -62,12 +62,12 @@ export async function main(device, args) {
     const { boltz2TemplateFeatures } = await import("../../shared/af3/featurise/template-features.js");
     const { openAf3Store, templateWeights, af3Dialect } =
       await import("../../shared/af3/weights/weights.js");
-    const { fusedTemplateEmbedding } = await import("../../cpu/af3/trunk/template-reference.js");
+    const { fusedTemplateEmbedding } = await import("../../cpu/af3/trunk/template.js");
     const store = await openAf3Store(option(args, "model", `/model-${model}-f32/manifest.json`));
     store.prefetch();
     const dialect = af3Dialect(store);
     const weights = await templateWeights(store, dialect);
-    const { fusedTemplateFeatures } = await import("../../webgpu/af3/trunk/template-webgpu.js");
+    const { fusedTemplateFeatures } = await import("../../webgpu/af3/trunk/template.js");
     const templateForFeatures = {
       aatype: Int32Array.from(aatypeRaw.data),
       atomPositions: positions.data, atomMask: atomMask.data,
@@ -92,7 +92,7 @@ export async function main(device, args) {
     // exact says the featuriser and the arithmetic are right; it says nothing
     // about the kernels that ship, and boltz2's 5CAJ fold with a template lands
     // at 2.2 A where protenix2 and AF3 reach 0.2.
-    const { Af3TemplateEmbedderGpu } = await import("../../webgpu/af3/trunk/template-webgpu.js");
+    const { Af3TemplateEmbedderGpu } = await import("../../webgpu/af3/trunk/template.js");
     // 🔴 THE PINS GO THROUGH THE CONSTRUCTOR, NOT `--tune`. This checker builds
     // the embedder itself, so a `--tune=` on the command line reaches nothing
     // here - three arms of it read the identical 5.11e-4 and said only that

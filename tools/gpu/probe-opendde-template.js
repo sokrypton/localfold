@@ -19,7 +19,7 @@
  * four-slot arithmetic is checked in the fold, by
  * `fold-opendde.js --trunk-oracle=`.
  */
-import { templateEmbedding } from "../../cpu/af3/trunk/template-reference.js";
+import { templateEmbedding } from "../../cpu/af3/trunk/template.js";
 import { openAf3Store, templateWeights, af3Dialect } from "../../shared/af3/weights/weights.js";
 const option = (a,n,f) => a.find(x=>x.startsWith(`--${n}=`))?.slice(n.length+3) ?? f;
 export async function main(device, args) {

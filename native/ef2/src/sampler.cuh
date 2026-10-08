@@ -1,4 +1,4 @@
-// ESMFold2's EDM sampler (biohub's DiffusionStructureHead.sample, cpu/esmfold2/sampler-reference.js):
+// ESMFold2's EDM sampler (biohub's DiffusionStructureHead.sample, cpu/esmfold2/sampler.js):
 //   schedule: sigma_data (sMax^(1/p) + k/(n-1) (sMin^(1/p) - sMax^(1/p)))^p, k < n, then 0; the levels
 //             above max_sigma dropped and max_sigma prepended (15 scheduled -> 11 steps at 256)
 //   x = schedule[0] N(0, 1)

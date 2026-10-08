@@ -1,5 +1,5 @@
 /**
- * AF3 triangle multiplication: GPU against cpu/af3/trunk/pairformer-reference.js.
+ * AF3 triangle multiplication: GPU against cpu/af3/trunk/pairformer.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-triangle.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-triangle.js --n=48 --block=17
@@ -16,8 +16,8 @@
  * pair representation is not needed to find that, and would drag the whole
  * embedder in.
  */
-import { af3TriangleMultiplication } from "../../webgpu/af3/trunk/triangle-webgpu.js";
-import { triangleMultiplication } from "../../cpu/af3/trunk/pairformer-reference.js";
+import { af3TriangleMultiplication } from "../../webgpu/af3/trunk/triangle.js";
+import { triangleMultiplication } from "../../cpu/af3/trunk/pairformer.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";

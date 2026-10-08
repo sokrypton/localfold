@@ -32,7 +32,7 @@
  */
 import { SOURCES, bindable } from "../../../shared/weights/weight-sources.js";
 import { GRID_ORDER, OPTIONAL_GRID, QKVG, TRANSPOSED }
-  from "../trunk/grid-attention-webgpu.js";
+  from "../trunk/grid-attention.js";
 import { residentWeightBufferFilled } from "../../runtime/resident.js";
 import { planBlockUpload, runBlockUpload } from "../../weights/quantised-upload.js";
 import { writeInto } from "../../../shared/weights/float16.js";
@@ -253,7 +253,7 @@ export function gridResidentEntries(sources, width) {
   };
   // 🔴 THE HOST PACKER'S OWN LISTS, IMPORTED - NOT RETYPED. These were four
   // local copies of `GRID_ORDER`, `QKVG`, `TRANSPOSED` and `OPTIONAL_GRID`, and
-  // a term added to grid-attention-webgpu.js and not to them does not drop the
+  // a term added to grid-attention.js and not to them does not drop the
   // term: it points the shader's `W_GATE_BIAS` INSIDE the output projection, a
   // wrong answer on the resident path only. test/grid-layout-agrees.test.js is
   // the differential that made this safe to collapse - it was built FIRST, for

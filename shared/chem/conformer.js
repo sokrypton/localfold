@@ -27,7 +27,7 @@
  *                 left. This is the O(N^2)-per-step part.
  *
  * Steps 2 and 3 are the whole compute cost and both are data-parallel over
- * pairs, which is why `conformer-webgpu.js` exists beside this file. This one
+ * pairs, which is why `conformer.js` exists beside this file. This one
  * is the reference: it is what the differential gate holds the GPU to, and it
  * is what runs when there is no device.
  */
@@ -557,7 +557,7 @@ function ringAwareAngle(graph, sigma, pi, rings, centre, first, second) {
  * that back - the upper bounds by a shortest-path (Floyd-Warshall), the lower
  * ones by the matching rule that a lower cannot exceed the shortest way round.
  *
- * O(N^3), and the reason `conformer-webgpu.js` exists: at a 60-atom ligand
+ * O(N^3), and the reason `conformer.js` exists: at a 60-atom ligand
  * that is 216,000 relaxations, and it is the same inner loop for every one.
  */
 export function smoothBounds(bounds) {

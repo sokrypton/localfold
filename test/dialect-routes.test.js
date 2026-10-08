@@ -38,8 +38,8 @@ const SOURCE = af3Sources();
  * run and had been dead for as long as that flag existed. Following the list to
  * its new home is the fix; typing it here would be the bug this file names.
  */
-const copied = [...SOURCE.get("dialect.js")
-  .slice(SOURCE.get("dialect.js").indexOf("export function atomBlockDialect"))
+const copied = [...SOURCE.get("shared:dialect.js")
+  .slice(SOURCE.get("shared:dialect.js").indexOf("export function atomBlockDialect"))
   .split("\n}")[0]
   .matchAll(/^\s*([A-Za-z0-9_]+): dialect\.\1,$/gm)].map((m) => m[1]);
 
@@ -89,15 +89,15 @@ test("how a dialect flag reaches code", async (t) => {
     for (const flag of ["maskAtomActPerBlock", "chainedAtomLayerNorm",
                         "keyMaskedAtomAttention"]) {
       assert.deepEqual(routesOf(flag), [
-        "atom-decoder-webgpu.js:block",
-        "atom-encoder-reference.js:block",
-        "atom-encoder-webgpu.js:block",
+        "cpu:atom-encoder.js:block",
         // dialect.js is `atomBlockDialect`, the one place the list lives; the
         // loader spreads that object and keeps only its undefined guard, which
         // still names the flag on the block - and is worth keeping, because a
         // block that never got its flags is exactly what it catches.
-        "dialect.js:dialect",
-        "diffusion-weights.js:block",
+        "shared:dialect.js:dialect",
+        "shared:diffusion-weights.js:block",
+        "webgpu:atom-decoder.js:block",
+        "webgpu:atom-encoder.js:block",
       ], `${flag} no longer takes one route`);
     }
     // 🔴 AND `diffusionNoResidual` USED TO TAKE TWO, WHICH WAS THE FINDING THAT
@@ -108,14 +108,14 @@ test("how a dialect flag reaches code", async (t) => {
     // copied flag takes exactly one route. The loader keeps its own
     // `dialect.` read, which is the assignment and its undefined guard.
     assert.deepEqual(routesOf("diffusionNoResidual"), [
-      "atom-decoder-webgpu.js:block",
-      "atom-encoder-reference.js:block",
-      "atom-encoder-webgpu.js:block",
-      "dialect.js:dialect",
-      "diffusion-weights.js:block",
+      "cpu:atom-encoder.js:block",
+      "shared:dialect.js:dialect",
+      "shared:diffusion-weights.js:block",
       // ...and the loader's OWN `dialect.` read, which is the token
       // transformer's - that stack takes the flag directly, not off a block.
-      "diffusion-weights.js:dialect",
+      "shared:diffusion-weights.js:dialect",
+      "webgpu:atom-decoder.js:block",
+      "webgpu:atom-encoder.js:block",
     ]);
     // 🔴 THE RULE, RATHER THAN THE LIST: outside the loader, a copied flag is
     // read off the BLOCK and never off a dialect. That is what makes a fifth
@@ -124,8 +124,8 @@ test("how a dialect flag reaches code", async (t) => {
       // dialect.js is the list itself and diffusion-weights.js is the guard;
       // the rule is about every OTHER site.
       const outside = routesOf(flag).filter((r) =>
-        !r.startsWith("diffusion-weights.js") && !r.startsWith("dialect.js"));
-      assert.deepEqual([...new Set(outside.map((r) => r.split(":")[1]))], ["block"],
+        !r.startsWith("shared:diffusion-weights.js") && !r.startsWith("shared:dialect.js"));
+      assert.deepEqual([...new Set(outside.map((r) => r.split(":").at(-1)))], ["block"],
                        `${flag} is read off something other than the block: ${outside}`);
     }
   });
@@ -135,10 +135,10 @@ test("how a dialect flag reaches code", async (t) => {
   // copies the same value onto every block - which it does, and which nothing
   // said out loud until this.
   await t.test("the decoder's block-zero read is equivalent to a per-block one", () => {
-    const decoder = SOURCE.get("atom-decoder-webgpu.js");
+    const decoder = SOURCE.get("webgpu:atom-decoder.js");
     assert.ok(/weights\.blocks\[0\]\?\.diffusionNoResidual/.test(decoder),
               "the decoder no longer reads block zero - re-check this rule");
-    const loader = SOURCE.get("diffusion-weights.js");
+    const loader = SOURCE.get("shared:diffusion-weights.js");
     // The copy is inside the per-block builder, so every block gets it.
     assert.ok(/async function atomBlockWith\([^)]*dialect\)/.test(loader),
               "the per-block builder no longer takes the dialect");

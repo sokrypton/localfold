@@ -28,7 +28,7 @@
  * when the scalar work in its body changed, with each 5-6% worse at the
  * other's tile.
  */
-import { Af3GridSelfAttentionGpu } from "../../webgpu/af3/trunk/grid-attention-webgpu.js";
+import { Af3GridSelfAttentionGpu } from "../../webgpu/af3/trunk/grid-attention.js";
 import { supportsGridAttendMatrix } from "../../webgpu/af3/trunk/grid-attention-matrix.js";
 import { profileDevice } from "./profile.js";
 

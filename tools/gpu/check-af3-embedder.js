@@ -1,5 +1,5 @@
 /**
- * AF3's embedder: GPU against cpu/af3/trunk/embedder-reference.js.
+ * AF3's embedder: GPU against cpu/af3/trunk/embedder.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-embedder.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-embedder.js --chains=3
@@ -22,8 +22,8 @@
  * WHERE the term is added, not that it is zero - AF3's template embedder
  * contributes std 13.1 even with four empty slots.
  */
-import { embed } from "../../cpu/af3/trunk/embedder-reference.js";
-import { Af3EmbedderGpu } from "../../webgpu/af3/trunk/embedder-webgpu.js";
+import { embed } from "../../cpu/af3/trunk/embedder.js";
+import { Af3EmbedderGpu } from "../../webgpu/af3/trunk/embedder.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { af3Dialect } from "../../shared/af3/weights/weights.js";
 

@@ -32,20 +32,20 @@ const HOST_PAIR_MAX_BYTES = 1024 * 1024 * 1024;
 import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
   from "../../shared/af3/feature-convergence.js";
 import { af3ContactClasses } from "../../shared/af3/featurise/contact-classes.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder, targetFeatures } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
-import { Af3AtomEncoderGpu } from "./diffusion/atom-encoder-webgpu.js";
-import { Af3TrunkGpu } from "./trunk/trunk-webgpu.js";
-import { Af3ConfidenceHeadGpu } from "./confidence/confidence-webgpu.js";
-import { Af3PairformerStackGpu } from "./trunk/pairformer-block-webgpu.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
+import { atomCrossAttentionEncoder, targetFeatures } from "../../cpu/af3/diffusion/atom-encoder.js";
+import { Af3AtomEncoderGpu } from "./diffusion/atom-encoder.js";
+import { Af3TrunkGpu } from "./trunk/trunk.js";
+import { Af3ConfidenceHeadGpu } from "./confidence/confidence.js";
+import { Af3PairformerStackGpu } from "./trunk/pairformer-block.js";
 import { af3Dialect, pairformerBlockWeights, templateWeights } from "../../shared/af3/weights/weights.js";
-import { Af3TemplateEmbedderGpu } from "./trunk/template-webgpu.js";
-import { Af3StructuralExpanderGpu } from "./structure/structural-expander-webgpu.js";
+import { Af3TemplateEmbedderGpu } from "./trunk/template.js";
+import { Af3StructuralExpanderGpu } from "./structure/structural-expander.js";
 import { structuralAttentionBias, structuralPairFeatures }
-  from "../../cpu/af3/structure/structural-expander-reference.js";
+  from "../../cpu/af3/structure/structural-expander.js";
 import { structuralBatch, structuralLayout, structuralToResidue }
   from "../../shared/af3/featurise/structural-tokens.js";
-import { Af3DiffusionConditioningGpu } from "./diffusion/diffusion-conditioning-webgpu.js";
+import { Af3DiffusionConditioningGpu } from "./diffusion/diffusion-conditioning.js";
 import { openddeConfidence } from "./confidence/opendde-confidence.js";
 import {
   isStreamed, pauseStreamedWeights, releaseResidentWeights, releaseStreamedWeights,
@@ -56,8 +56,8 @@ import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../../shared/heads/tm-score.js";
-import { sampleOnGpu, flowOnGpu } from "./diffusion/diffusion-sampler-webgpu.js";
-import { Af3DiffusionHeadGpu } from "./diffusion/diffusion-head-webgpu.js";
+import { sampleOnGpu, flowOnGpu } from "./diffusion/diffusion-sampler.js";
+import { Af3DiffusionHeadGpu } from "./diffusion/diffusion-head.js";
 
 /**
  * 🔴 THE DIALECT IS NOT A PREFERENCE. A ported checkpoint turns on branches
@@ -261,7 +261,7 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
   // `stage` NOTIFIES, it does not wrap - see its definition in foldBatch.
   stage("structural-expand", { tokens: layout.tokens });
   // ...and its pair goes straight into the refiner below without a round trip;
-  // see the note on `keepPair` in structural-expander-webgpu.js.
+  // see the note on `keepPair` in structural-expander.js.
   const expanded = await new Af3StructuralExpanderGpu(device).run(
     layout, { single: trunk.single, pair: trunk.pair, targetFeat, asymId: batch.asymId,
               pairBuffer: trunkPairAllocation?.buffer },
@@ -970,7 +970,7 @@ async function foldHolding(device, batch, weights, options, held) {
       // plane was still arriving as zeros from HERE.
       bondOrderMatrix: batch.bondOrderMatrix,
       // ...and the chain ids, which the template embedder masks its geometry
-      // by. See the note at its call site in trunk-webgpu.js.
+      // by. See the note at its call site in trunk.js.
       asymId: batch.asymId,
       // 🔴 THE SLOTS ARE OVER TOKENS, NOT RESIDUES, and a fold with a ligand or
       // a modified residue has more of the first than the second. They are
@@ -999,10 +999,10 @@ async function foldHolding(device, batch, weights, options, held) {
       // The trunk's own seams, for a caller holding the reference's taps.
       ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
       // ...the MSA stack's first-half stop point, for bisecting one block
-      // against the oracle. See webgpu/af3/trunk/msa-stack-webgpu.js.
+      // against the oracle. See webgpu/af3/trunk/msa-stack.js.
       ...(options.stopAfterOpm === true ? { stopAfterOpm: true } : {}),
       // ...and the pair track's scratch layout, which the budget decides unless
-      // a caller forces it (the control arm; see trunk-webgpu.js).
+      // a caller forces it (the control arm; see trunk.js).
       ...(options.leanPair === undefined ? {} : { leanPair: options.leanPair }),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
       // Four of the trunk's five stages report nothing while they run, and on a

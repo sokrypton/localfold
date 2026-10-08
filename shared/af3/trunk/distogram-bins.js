@@ -1,4 +1,4 @@
-// The distogram's bins - out of webgpu/af3/trunk/trunk-webgpu.js (which re-exports them), so the featuriser's contact
+// The distogram's bins - out of webgpu/af3/trunk/trunk.js (which re-exports them), so the featuriser's contact
 // classes and the CUDA port's exporter take them without the WebGPU trunk behind them.
 export const NUM_BINS = 64;
 const FIRST_BREAK = 2.3125;

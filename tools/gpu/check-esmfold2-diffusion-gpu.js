@@ -1,4 +1,4 @@
-// Does webgpu/esmfold2/diffusion-webgpu.js compute ESMFold2's whole denoise step?
+// Does webgpu/esmfold2/diffusion.js compute ESMFold2's whole denoise step?
 //
 //     .venv-esm/bin/python tools/esmc/dump-esmfold2-trunk.py \
 //         --sequence-length 40 --esmc esmc-600m --out oracle-dumps/esmfold2-trunk-40-lm.json
@@ -22,7 +22,7 @@
 import { readTensor } from "../../shared/weights/dtype.js";
 import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../webgpu/runtime/pipeline-cache.js";
-import { Esmfold2DenoiserGpu } from "../../webgpu/esmfold2/diffusion-webgpu.js";
+import { Esmfold2DenoiserGpu } from "../../webgpu/esmfold2/diffusion.js";
 import { atomDecoderWeights, atomEncoderWeights, denoiserWeights }
   from "../../shared/esmfold2/weights.js";
 

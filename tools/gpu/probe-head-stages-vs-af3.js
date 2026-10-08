@@ -23,9 +23,9 @@
  * reference under the oracle keeps the comparison one step long.
  */
 import { batchFromDump } from "./fold.js";
-import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder-reference.js";
-import { diffusionHead } from "../../cpu/af3/diffusion/diffusion-reference.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder.js";
+import { diffusionHead } from "../../cpu/af3/diffusion/diffusion.js";
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference } from "../../shared/af3/weights/diffusion-weights.js";
 import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";

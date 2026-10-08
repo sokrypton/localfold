@@ -18,7 +18,7 @@
  *     af3-msa:59:128:64:128:0.00001:fast:false:msa:keyMask
  *     line 8 of 35: "const DIMENSION: u32 = 8u;" against "...= 32u;"
  *
- * Every kernel in msa-attention-webgpu.js is built from one `common` preamble,
+ * Every kernel in msa-attention.js is built from one `common` preamble,
  * so all of them embed HEADS and DIMENSION - even `keyMask`, thirteen lines
  * that read neither - while the stack keyed on the channel widths alone.
  * AlphaFold 3 and openbind0 are msaChannels 64 with 8 heads of dimension 8;
@@ -36,7 +36,7 @@
  */
 import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
 import { buildTargetFeat, foldBatch } from "../../webgpu/af3/fold.js";
-import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk-webgpu.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk.js";
 import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
 import {
   af3Dialect, confidenceWeights, openAf3Store, openddeConfidenceWeights,

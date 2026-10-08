@@ -1,4 +1,4 @@
-// ESMFold2's diffusion module (cpu/esmfold2/diffusion-reference.js and biohub's DiffusionModule are the
+// ESMFold2's diffusion module (cpu/esmfold2/diffusion.js and biohub's DiffusionModule are the
 // reading), one denoiser call:
 //
 //   conditioning: pair = [z_trunk | rel_pos] -> LN -> zProjection, + 2 transitions   (once a fold)

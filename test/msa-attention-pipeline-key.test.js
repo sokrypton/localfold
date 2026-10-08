@@ -3,7 +3,7 @@
  *
  * 🔴 THE COLLISION THIS GATES WAS REPORTED FROM A REAL RUN, and its shape is
  * the one this repository keeps paying for: a pipeline key that does not name
- * its shader. Every kernel in msa-attention-webgpu.js is built from one
+ * its shader. Every kernel in msa-attention.js is built from one
  * `common` preamble, so every one of them embeds `HEADS`, `DIMENSION` and
  * `WIDTH` - including `keyMask`, thirteen lines that read only `TOKENS` and
  * `SEQUENCES`. The MSA STACK keyed on the channel widths and not the head
@@ -26,7 +26,7 @@
  */
 import { describe, it, expect } from "./harness.js";
 import { createMsaAttentionShaders, msaAttentionKeyPart }
-  from "../webgpu/af3/trunk/msa-attention-webgpu.js";
+  from "../webgpu/af3/trunk/msa-attention.js";
 
 // The offsets only place weights inside one packed buffer; they are the same
 // for every arm here, so any difference below is the SHAPE and not the packing.
