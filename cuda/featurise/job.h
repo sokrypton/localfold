@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "ccd.h"
+#include "chem.h"
 #include "json.h"
 #include "jsnum.h"
 
@@ -170,7 +171,7 @@ inline std::optional<std::string> modificationProblem(const Modification& m, con
   return std::nullopt;
 }
 // a SMILES ligand's heavy-atom count, or a refusal in the parser's words (set by the SMILES module)
-inline std::function<int(const std::string&)> SMILES_ATOM_COUNT;
+inline int SMILES_ATOM_COUNT(const std::string& smiles) { return (int)chem::parseSmiles(smiles).atoms.size(); }
 inline std::optional<std::string> entityProblem(const Entity& e) {
   static const std::vector<std::string> types = {"protein", "dna", "rna", "ligand", "smiles", "contact"};
   if (std::find(types.begin(), types.end(), e.type) == types.end()) return "Unknown entity type " + e.type;
@@ -203,7 +204,6 @@ inline std::optional<std::string> entityProblem(const Entity& e) {
     return std::nullopt;
   }
   if (e.type == "smiles") {
-    if (!SMILES_ATOM_COUNT) return "a SMILES ligand is not read by the native featuriser yet";
     try {
       int atoms = SMILES_ATOM_COUNT(value);
       if (atoms > 150) return "That is " + std::to_string(atoms) + " heavy atoms; at most 150 here";
@@ -483,7 +483,6 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
           refuse(where + ": a ligand with both `smiles` and `ccdCodes` names itself twice, and this page cannot tell which was meant");
         std::string smiles = trimWs(jsString(body.get("smiles")));
         if (smiles.empty()) refuse(where + ": an empty `smiles`");
-        if (!SMILES_ATOM_COUNT) refuse(where + ": a SMILES ligand is not read by the native featuriser yet");
         try { SMILES_ATOM_COUNT(smiles); } catch (const std::exception& error) { refuse(where + ": `smiles` " + error.what()); }
         e.type = "smiles"; e.value = smiles;
         out.entities.push_back(e);

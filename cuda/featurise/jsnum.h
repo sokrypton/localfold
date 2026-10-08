@@ -69,6 +69,6 @@ inline double jsParseFloat(const std::string& text) {
 }
 
 // Math.round: halves toward +Infinity
-inline double jsRound(double v) { return std::floor(v + 0.5); }
+inline double jsRound(double v) { double c = std::ceil(v); return c - 0.5 <= v ? c : c - 1.0; }   // Math.round, as V8 rounds
 
 }  // namespace lf

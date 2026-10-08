@@ -23,8 +23,6 @@
 
 namespace lf {
 
-// a SMILES ligand's component (shared/chem/component.js smilesComponent) - set where the chemistry is linked in
-inline std::function<Component(const std::string& smiles, const std::string& code)> SMILES_COMPONENT;
 // the template stage (templates.h): fills the passes; unset, a job with a template is refused
 struct Af3TemplateInput;
 
@@ -202,8 +200,7 @@ inline Af3Export exportAf3(const Args& args,
         for (auto& c : l.codes) parts.push_back(components.get(c));
         o.ligands.push_back(ligandChain(parts));
       } else {
-        if (!SMILES_COMPONENT) throw std::runtime_error("a SMILES ligand is not read by the native featuriser yet");
-        o.ligands.push_back(SMILES_COMPONENT(l.smiles, l.code.empty() ? "LIG" : l.code));
+        o.ligands.push_back(chem::smilesComponent(l.smiles, l.code.empty() ? "LIG" : l.code));
       }
     }
     for (auto& m : request.modifications) o.modifications.push_back({m.chain, (int)m.position, components.get(m.code)});
@@ -214,13 +211,12 @@ inline Af3Export exportAf3(const Args& args,
   }
   for (auto& code : splitNonEmpty(args.option("ligands"), ',')) o.ligands.push_back(components.get(code));
   if (!args.option("smiles").empty()) {
-    if (!SMILES_COMPONENT) throw std::runtime_error("a SMILES ligand is not read by the native featuriser yet");
     auto list = splitNonEmpty(args.option("smiles"), '|');
     std::vector<std::string> seen;
     for (auto& s : list) {        // nameSmilesLigands: one name a distinct SMILES
       size_t at = std::find(seen.begin(), seen.end(), s) - seen.begin();
       if (at == seen.size()) seen.push_back(s);
-      o.ligands.push_back(SMILES_COMPONENT(s, ligandName(at)));
+      o.ligands.push_back(chem::smilesComponent(s, ligandName(at)));
     }
   }
   for (auto& spec : splitNonEmpty(args.option("modify"), ',')) {
