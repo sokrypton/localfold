@@ -53,6 +53,31 @@ def chain_sequence(name, chain):
     return "".join(out)
 
 
+def synthetic_a3m(name, query, rows, seed):
+    """A deterministic alignment for query: substitutions, gaps, insertions and a duplicated row, written to WORK"""
+    import random
+    rng = random.Random(seed)
+    letters = "ACDEFGHIKLMNPQRSTVWY"
+    out = [f">query\n{query}"]
+    previous = None
+    for r in range(rows):
+        if previous is not None and r % 7 == 3:
+            out.append(f">dup{r}\n{previous}")      # (deduplication must drop it)
+            continue
+        row = []
+        for c in query:
+            x = rng.random()
+            row.append("-" if x < 0.08 else rng.choice(letters) if x < 0.4 else c)
+            if rng.random() < 0.03:
+                row.append(rng.choice(letters).lower() * rng.randint(1, 3))
+        previous = "".join(row)
+        out.append(f">hit{r} desc {r}\n{previous}")
+    os.makedirs(WORK, exist_ok=True)
+    path = os.path.join(WORK, f"{name}.a3m")
+    open(path, "w").write("\n".join(out) + "\n")
+    return path
+
+
 def cases():
     """(name, port, job dict or None, extra args, families)"""
     out = [
@@ -82,6 +107,35 @@ def cases():
          ["--template=@F/6mrr-crystal.pdb:A@0"], AF3_FAMILIES),
         ("tmpl-four", "af3", job("t", [protein("A", caj)]),
          ["--template=" + ",".join(["@F/5caj-crystal.pdb:A@0"] * 4)], AF3_FAMILIES),
+    ]
+    # 🔴 THE NETWORK ARM (--network): both exporters search api.colabfold.com for the same queries - the server
+    # answers one query the same way twice, so the alignments, the pairing, the merge and the template hits must agree
+    out += [
+        ("net-search-6mrr", "af3", job("t", [protein("A", SEQ_6MRR)]), ["--search"], ["af3", "boltz2"], "network"),
+        ("net-search-1brs", "af3", job("t", [protein("A", brs_a), protein("D", brs_d)]), ["--search"], ["af3", "rosettafold3"], "network"),
+        ("net-search-templates", "af3", job("t", [protein("A", SEQ_6MRR)]), ["--search-templates"], ["af3", "protenix2"], "network"),
+        ("net-search-chain-template", "af3", job("t", [protein("A", brs_a), protein("D", brs_d)]),
+         ["--search", "--template-search-chains=1"], ["af3", "boltz2"], "network"),
+    ]
+    # AlphaFold 2 (cuda/af2/export_input.mjs): "families" are the bundles, monomer and multimer
+    sa, sd = synthetic_a3m("brs-a", brs_a, 300, 1), synthetic_a3m("brs-d", brs_d, 200, 2)
+    pa, pd = synthetic_a3m("brs-pa", brs_a, 60, 3), synthetic_a3m("brs-pd", brs_d, 60, 4)
+    m6 = synthetic_a3m("6mrr", SEQ_6MRR, 900, 5)
+    AF2 = ["monomer", "multimer"]
+    out += [
+        ("af2-6mrr", "af2", job("t", [protein("A", SEQ_6MRR)]), [], AF2),
+        ("af2-6mrr-msa", "af2", job("t", [protein("A", SEQ_6MRR)]), [f"--a3m={m6}", "--seed=7", "--recycles=2"], AF2),
+        ("af2-6mrr-shallow", "af2", job("t", [protein("A", SEQ_6MRR)]), [f"--a3m={m6}", "--max-msa=16", "--max-extra=40"], AF2),
+        ("af2-test59", "af2", job("t", [protein("A", TEST_QUERY)]), ["--a3m=@test.a3m", "--max-msa=508"], AF2),
+        ("af2-1brs", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [], AF2),
+        ("af2-1brs-a3ms", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [f"--a3m={sa},{sd}"], AF2),
+        ("af2-1brs-paired", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
+         [f"--a3m={sa},{sd}", f"--paired-a3m={pa},{pd}"], AF2),
+        ("af2-homodimer", "af2", job("t", [protein(["A", "B"], SEQ_6MRR)]), [f"--a3m={m6},{m6}"], AF2),
+        ("af2-5caj-template", "af2", job("t", [protein("A", caj)]), ["--template=@F/5caj-crystal.pdb:A"], AF2),
+        ("af2-1brs-template", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
+         ["--template=@F/1brs-crystal.pdb:A@0+@F/1brs-crystal.pdb:D@1"], AF2),
+        ("af2-ligand-refused", "af2", job("t", [protein("A", SEQ_6MRR), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], AF2),
     ]
     if os.path.isdir(AF3_EXAMPLES):
         for name in sorted(os.listdir(AF3_EXAMPLES)):
@@ -155,14 +209,18 @@ def main():
     parser.add_argument("--only", default="")
     parser.add_argument("--family", default="")
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--network", action="store_true", help="only the cases that search api.colabfold.com")
     a = parser.parse_args()
     native = os.path.join(REPO, "cuda", "featurise", "af3-featurise")
     if not os.access(native, os.X_OK):
         sys.exit(f"{native} is not built (cuda/featurise/build.sh)")
     os.makedirs(WORK, exist_ok=True)
     failed, passed, skipped = [], 0, 0
-    for name, port, spec, extra, families in cases():
+    for case in cases():
+        name, port, spec, extra, families = case[:5]
         if a.only and a.only not in name:
+            continue
+        if (len(case) > 5 and case[5] == "network") != a.network:
             continue
         for family in families:
             if a.family and family != a.family:
@@ -177,10 +235,16 @@ def main():
                 job_path = os.path.join(base, "job.json")
                 json.dump(spec, open(job_path, "w"))
             args = [x.replace("@test.a3m", os.path.join(FIX, "test.a3m")).replace("@F/", FIX + "/") for x in extra]
-            common = ["--no-weights", f"--family={family}", f"--job={job_path}", "--max-msa=512", *args]
-            js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "af3", "export-model.mjs"), base + "/js", *common],
-                                         cwd=os.path.join(REPO, "cuda", "af3"))
-            nv_code, nv_said, nv_s = run([native, base + "/native", *common])
+            if port == "af2":
+                bundle = os.path.join(REPO, "model" if family == "monomer" else "model-multimer")
+                common = [f"--bundle={bundle}", f"--job={job_path}", *args]
+                js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "af2", "export_input.mjs"), base + "/js", *common])
+                nv_code, nv_said, nv_s = run([native.replace("af3-featurise", "af2-featurise"), base + "/native", *common])
+            else:
+                common = ["--no-weights", f"--family={family}", f"--job={job_path}", "--max-msa=512", *args]
+                js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "af3", "export-model.mjs"), base + "/js", *common],
+                                             cwd=os.path.join(REPO, "cuda", "af3"))
+                nv_code, nv_said, nv_s = run([native, base + "/native", *common])
             if js_code != 0 or nv_code != 0:
                 if js_code != 0 and nv_code != 0 and refusal(js_said) == refusal(nv_said):
                     print(f"  ok   {tag}: both refuse - {refusal(js_said)}")

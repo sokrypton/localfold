@@ -108,8 +108,8 @@ struct Alignment {
   bool present = false;            // null alignment: no rows at all
   bool blocks = false;             // {paired, unpaired} rather than one text
   std::string single;
-  bool hasPaired = false, hasUnpaired = false;
-  std::string paired, unpaired;
+  bool hasPaired = false, hasUnpaired = false, hasUnpairedProfile = false;
+  std::string paired, unpaired, unpairedProfile;   // the profile's own rows: the search's block before deduplication
 };
 
 struct MsaRows {
@@ -153,7 +153,8 @@ inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const
   };
   Parsed paired = alignment.blocks ? parse(alignment.hasPaired, alignment.paired) : Parsed{};
   Parsed unpaired = alignment.blocks ? parse(alignment.hasUnpaired, alignment.unpaired) : parse(true, alignment.single);
-  const Parsed& unpairedProfile = unpaired;
+  Parsed profileBlock = alignment.blocks ? parse(alignment.hasUnpairedProfile, alignment.unpairedProfile) : Parsed{};
+  const Parsed& unpairedProfile = profileBlock.ok ? profileBlock : unpaired;
   int pairedBlock = !paired.ok ? 1 : paired.a.depth + 1;
   int pairedCrop = std::min(pairedBlock, std::max(1, maxSequences / 2));
   int unpairedCrop = !unpaired.ok ? 0 : std::min(unpaired.a.depth, maxSequences - pairedCrop);

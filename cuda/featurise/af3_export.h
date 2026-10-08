@@ -20,6 +20,7 @@
 #include "msa.h"
 #include "pdb.h"
 #include "tables.h"
+#include "search.h"
 #include "templates.h"
 
 namespace lf {
@@ -81,15 +82,19 @@ struct Af3Export {
   std::string pdb;          // template.pdb ("" when the writer could not)
   int tokens = 0;
   std::vector<std::string> said;   // what the JavaScript exporter prints (the worker reads template coverage off it)
+  std::string searchA3m;           // one chain's searched alignment, as the search returned it (search.a3m)
 };
 
 // The exporter's template stage: --template slots and the job's own templates, each part by buildTemplate (every
 // chain's k-th in slot k, merged), rf3's stereocentres, then the embedder's passes - a repeat and an aatype each, and
 // either a fused embedder's sparse feature rows or the nine-projection embedder's geometry - and their totals
+// what --search found: the template hits by search chain, and which fold chain each search chain is
+struct SearchState { bool searched = false; search::Hits hits; std::vector<int> proteinAt; };
+
 struct TemplatePart { std::string text; bool hasChain = false; std::string chain; int queryChain = 0; std::string label;
                       bool hasMapping = false; std::vector<std::pair<int, int>> mapping; };
 inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, const FamilyFlags& D, const std::vector<std::string>& chains,
-                         const std::vector<std::vector<JobTemplate>>& jobTemplates, const Expanded* request) {
+                         const std::vector<std::vector<JobTemplate>>& jobTemplates, const Expanded* request, const SearchState& found) {
   Entries& E = out.entries;
   const int TEMPLATES = 4;
   int tokens = batch.tokens;
@@ -168,8 +173,50 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
       if (t.kind != "upload" && !args.has("search-templates"))
         throw std::runtime_error("chain " + std::to_string(chain) + ": the job asks for a template search - run with --search-templates,"
                                  " or give the structure with --template=<file>:<chain>@<query chain>");
-  if (args.has("search-templates") || !args.option("template-search-chains").empty())
-    throw std::runtime_error("the native featuriser's template search is not built yet");
+  // --search-templates: each protein chain's best four hits from the same search, every chain's k-th in slot k
+  if (args.has("search-templates")) {
+    if (!specs.empty() || !extra.empty()) throw std::runtime_error("--search-templates and other templates both name the slots");
+    std::vector<std::pair<int, std::vector<search::Hit>>> perChain;
+    std::vector<std::string> targets;
+    for (auto& [at, hits] : found.hits) {
+      std::vector<search::Hit> best(hits.begin(), hits.begin() + std::min<size_t>(TEMPLATES, hits.size()));
+      perChain.push_back({at < (int)found.proteinAt.size() ? found.proteinAt[at] : at, best});
+      for (auto& h : best) targets.push_back(h.target);
+    }
+    auto structures = search::fetchTemplates(targets);
+    for (int k = 0; k < TEMPLATES; ++k) {
+      std::vector<TemplatePart> parts;
+      for (auto& [chain, hits] : perChain) {
+        if (k >= (int)hits.size()) continue;
+        auto it = structures.find(hits[k].id);
+        if (it == structures.end()) throw std::runtime_error("no structure came back for " + hits[k].target);
+        TemplatePart p;
+        p.text = it->second; p.hasChain = true; p.chain = hits[k].chain; p.queryChain = chain; p.label = "search hit " + hits[k].target;
+        parts.push_back(p);
+      }
+      if (!parts.empty()) extra.push_back(parts);
+    }
+    if (extra.empty()) out.said.push_back("search: no template hits");
+  }
+  // --template-search-chains: the page's "from the MSA search" - each listed chain's BEST hit, a slot of its own
+  auto searchChains = splitNonEmpty(args.option("template-search-chains"), ',');
+  if (!searchChains.empty()) {
+    if (!found.searched) throw std::runtime_error("--template-search-chains needs --search: the hits come from that search");
+    std::map<int, std::vector<search::Hit>> byChain;
+    for (auto& [at, hits] : found.hits) byChain[at < (int)found.proteinAt.size() ? found.proteinAt[at] : at] = hits;
+    for (auto& c : searchChains) {
+      int chain = (int)jsNumberOf(c);
+      auto it = byChain.find(chain);
+      if (it == byChain.end() || it->second.empty()) throw std::runtime_error("the search found no template for chain " + std::to_string(chain + 1));
+      const search::Hit& best = it->second[0];
+      auto structures = search::fetchTemplates({best.target});
+      auto st = structures.find(best.id);
+      if (st == structures.end()) throw std::runtime_error("no structure came back for " + best.target);
+      TemplatePart p;
+      p.text = st->second; p.hasChain = true; p.chain = best.chain; p.queryChain = chain; p.label = "search hit " + best.target;
+      extra.push_back({p});
+    }
+  }
   for (size_t k = 0; k < extra.size(); ++k) {
     std::vector<TemplateSlot> parts;
     for (auto& p : extra[k]) parts.push_back(buildPart(p, (int)k));
@@ -390,8 +437,39 @@ inline Af3Export exportAf3(const Args& args) {
       }
     }
   }
-  if (args.has("search") || args.has("search-templates"))
-    throw std::runtime_error("the native featuriser's MSA search is not built yet");
+  // --search: the protein chains' alignments from the ColabFold MMseqs2 server, the page's client and merge
+  SearchState found;
+  if (args.has("search") || args.has("search-templates")) {
+    if (alignment.present) throw std::runtime_error("--search and an alignment both name the MSA");
+    std::vector<std::string> allChains = splitOn(sequence, ':'), allKinds;
+    if (haveJob) allKinds = request.chainKinds;
+    else if (!args.option("kinds").empty()) allKinds = splitOn(args.option("kinds"), ',');
+    else allKinds.assign(allChains.size(), "protein");
+    std::vector<std::string> proteins;
+    for (size_t i = 0; i < allChains.size(); ++i)
+      if (i < allKinds.size() && allKinds[i] == "protein") { proteins.push_back(allChains[i]); found.proteinAt.push_back((int)i); }
+    if (proteins.empty()) throw std::runtime_error("--search: no protein chain to search for");
+    auto started = std::chrono::steady_clock::now();
+    auto say = [&](const std::string& m) { fprintf(stderr, "search: %s\n", m.c_str()); };
+    alignment.present = true;
+    if (proteins.size() == 1) {
+      search::Searched one = search::searchOne(proteins[0], say);
+      alignment.single = one.a3m;
+      found.hits = one.hits;
+      out.searchA3m = one.a3m;
+    } else {
+      search::ComplexSearched many = search::searchComplex(proteins, "af3", say);
+      alignment.blocks = true;
+      alignment.hasPaired = many.merged.hasPaired; alignment.paired = many.merged.paired;
+      alignment.hasUnpaired = true; alignment.unpaired = many.merged.unpaired;
+      alignment.hasUnpairedProfile = true; alignment.unpairedProfile = many.merged.unpairedProfile;
+      found.hits = many.hits;
+    }
+    found.searched = true;
+    char took[64];
+    snprintf(took, sizeof took, "%.1f", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+    out.said.push_back("search: " + std::to_string(proteins.size()) + " protein chain(s) from api.colabfold.com in " + took + " s");
+  }
 
   // the components: the request's (the page's own resolution), then --ligands / --modify
   FeaturiseOptions o;
@@ -467,7 +545,7 @@ inline Af3Export exportAf3(const Args& args) {
   // the template slots (templates.h, each part by the page's buildTemplate), rf3's stereocentres, then the embedder's
   // passes - in the exporter's order
   std::vector<std::string> chains = splitOn(sequence, ':');
-  addTemplates(out, args, batch, D, chains, jobTemplates, haveJob ? &request : nullptr);
+  addTemplates(out, args, batch, D, chains, jobTemplates, haveJob ? &request : nullptr, found);
   try { out.pdb = pdbTemplateText(batch); }
   catch (const std::exception& e) { out.said.push_back(std::string("no PDB template (") + e.what() + "); the native writer will name residues itself"); }
   return out;

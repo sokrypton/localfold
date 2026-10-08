@@ -112,7 +112,8 @@ inline std::optional<std::string> nucleicProblem(const std::string& s, const std
 // ---------------------------------------------------------------- web/entities.js
 struct Modification { std::string code; double position; };
 struct OptText { bool present = false; std::string text; };     // null / a string ("" is the asked-for none)
-struct EntityTemplate { std::string kind; };                     // "search" or "upload" (the exporter lifts uploads out)
+// a row's template: "search", or "upload" - an inline mmCIF and, where the job gives one, its residue mapping
+struct EntityTemplate { std::string kind; std::string text; bool hasMapping = false; std::vector<std::pair<int, int>> mapping; };
 struct Entity {
   std::string type, value;
   double copies = 1;
@@ -543,9 +544,30 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
       const Json* ust = body.get("useStructureTemplate");
       if (ust != nullptr && ust->kind == Json::Bool && ust->b) e.templ = EntityTemplate{"search"};
       else if (const Json* t = body.get("templates"); !Json::absent(t)) {
+        // readTemplates
         if (!t->isArray()) refuse(where + ": templates is not a list");
         if (t->a.size() > 1) refuse(where + ": " + std::to_string(t->a.size()) + " templates, and this page takes one per chain");
-        if (t->a.size() == 1) refuse(where + ": the native featuriser does not take an inline template yet");
+        if (t->a.size() == 1) {
+          const Json& tm = t->a[0];
+          if (!Json::absent(tm.get("mmcifPath")))
+            refuse(where + ": mmcifPath points at a file beside the JSON, which a page cannot read - inline the mmCIF or pick a template on the row");
+          checkKeys(tm, {"mmcif", "mmcifPath", "queryIndices", "templateIndices"}, where + " template");
+          EntityTemplate et{"upload"};
+          const Json *q = tm.get("queryIndices"), *ti = tm.get("templateIndices");
+          if (!Json::absent(q) || !Json::absent(ti)) {
+            if (!q || !ti || !q->isArray() || !ti->isArray() || q->a.size() != ti->a.size())
+              refuse(where + ": queryIndices and templateIndices are two lists of one length");
+            for (auto* list : {q, ti})
+              for (auto& v : list->a)
+                if (!v.isNumber() || !jsIsInteger(v.n) || v.n < 0) refuse(where + ": queryIndices and templateIndices hold whole numbers from 0");
+            et.hasMapping = true;
+            for (size_t k = 0; k < q->a.size(); ++k) et.mapping.push_back({(int)q->a[k].n, (int)ti->a[k].n});
+          }
+          const Json* mm = tm.get("mmcif");
+          if (!mm || !mm->isString() || trimWs(mm->s).empty()) refuse(where + ": a template with no mmcif in it");
+          et.text = mm->s;
+          e.templ = et;
+        }
       }
     }
     e.type = type->second.first;

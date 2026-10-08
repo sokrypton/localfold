@@ -17,10 +17,16 @@ int main(int argc, char** argv) {
   try {
     lf::Af3Export out = lf::exportAf3(args);
     for (auto& line : out.said) printf("%s\n", line.c_str());
+    if (system(("mkdir -p '" + args.positional + "'").c_str()) != 0) throw std::runtime_error("cannot create " + args.positional);
     if (!out.pdb.empty()) {
       if (system(("mkdir -p '" + args.positional + "'").c_str()) != 0) throw std::runtime_error("cannot create " + args.positional);
       FILE* f = fopen((args.positional + "/template.pdb").c_str(), "wb");
       fwrite(out.pdb.data(), 1, out.pdb.size(), f);
+      fclose(f);
+    }
+    if (!out.searchA3m.empty()) {
+      FILE* f = fopen((args.positional + "/search.a3m").c_str(), "wb");
+      fwrite(out.searchA3m.data(), 1, out.searchA3m.size(), f);
       fclose(f);
     }
     out.entries.write(args.positional);

@@ -174,6 +174,41 @@ inline double acos(double x) {
   return 2.0 * (df + w);
 }
 
+// Math.atan (fdlibm s_atan.c)
+inline double atan(double x) {
+  static const double atanhi[] = {words(0x3FDDAC67, 0x0561BB4F), words(0x3FE921FB, 0x54442D18), words(0x3FEF730B, 0xD281F69B),
+                                  words(0x3FF921FB, 0x54442D18)};
+  static const double atanlo[] = {words(0x3C7A2B7F, 0x222F65E2), words(0x3C81A626, 0x33145C07), words(0x3C700788, 0x7AF0CBBD),
+                                  words(0x3C91A626, 0x33145C07)};
+  static const double aT[] = {words(0x3FD55555, 0x5555550D), words(0xBFC99999, 0x9998EBC4), words(0x3FC24924, 0x920083FF),
+                              words(0xBFBC71C6, 0xFE231671), words(0x3FB745CD, 0xC54C206E), words(0xBFB3B0F2, 0xAF749A6D),
+                              words(0x3FB10D66, 0xA0D03D51), words(0xBFADDE2D, 0x52DEFD9A), words(0x3FA97B4B, 0x24760DEB),
+                              words(0xBFA2B444, 0x2C6A6C2F), words(0x3F90AD3A, 0xE322DA11)};
+  int32_t hx = hi(x), ix = hx & 0x7FFFFFFF;
+  int id;
+  if (ix >= 0x44100000) {
+    if (ix > 0x7FF00000 || (ix == 0x7FF00000 && lo(x) != 0)) return x + x;
+    return hx > 0 ? atanhi[3] + atanlo[3] : -atanhi[3] - atanlo[3];
+  }
+  if (ix < 0x3FDC0000) {
+    if (ix < 0x3E200000 && 1.0e300 + x > 1.0) return x;
+    id = -1;
+  } else {
+    x = std::fabs(x);
+    if (ix < 0x3FF30000) {
+      if (ix < 0x3FE60000) { id = 0; x = (2.0 * x - 1.0) / (2.0 + x); }
+      else { id = 1; x = (x - 1.0) / (x + 1.0); }
+    } else if (ix < 0x40038000) { id = 2; x = (x - 1.5) / (1.0 + 1.5 * x); }
+    else { id = 3; x = -1.0 / x; }
+  }
+  double z = x * x, w = z * z;
+  double s1 = z * (aT[0] + w * (aT[2] + w * (aT[4] + w * (aT[6] + w * (aT[8] + w * aT[10])))));
+  double s2 = w * (aT[1] + w * (aT[3] + w * (aT[5] + w * (aT[7] + w * aT[9]))));
+  if (id < 0) return x - x * (s1 + s2);
+  z = atanhi[id] - ((x * (s1 + s2) - atanlo[id]) - x);
+  return hx < 0 ? -z : z;
+}
+
 // Math.hypot (builtins/math.tq MathHypot)
 inline double hypot(std::initializer_list<double> values) {
   if (values.size() == 0) return 0;
