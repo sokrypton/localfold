@@ -6,5 +6,5 @@ BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
 
 
 def binary(name):
-    """The path of a bundled binary: "af3", "af2" or "ef2"."""
+    """The path of a bundled binary: "af3", "af2", "ef2" or "fetch"."""
     return os.path.join(BIN, f"localfold-{name}")

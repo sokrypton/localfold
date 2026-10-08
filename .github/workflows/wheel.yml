@@ -43,3 +43,4 @@ jobs:
             ! ldd "$bin" | grep -q "not found"
             /tmp/lf/bin/localfold-$p --help | head -3
           done
+          /tmp/lf/bin/localfold-fetch 2>&1 | head -2      # (usage: its models and the CCD)

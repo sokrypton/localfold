@@ -5,7 +5,8 @@
 //   ef2-featurise <out dir> (--job=<job.json> | --sequence=...)                              (esmfold2_export.h)
 //   resolve-templates <request.json> <out dir>                                                   (below)
 //   fetch-weights [--weights-dir=<dir>] <model>...          what each model's binary reads (fetch.h), by its --model
-//                                                            name (boltz2, model_3_ptm, esmfold2-fast-600m, ...)
+//                                                            name (boltz2, model_3_ptm, ef2-fast-600m, ...), and
+//                                                            `ccd`: wwPDB's whole component dictionary
 //   chem-probe < smiles.txt         each SMILES's component, one line, as tools/chem-probe.mjs prints the page's
 //
 // each the JavaScript it replaces (cuda/af3/export-model.mjs --no-weights, cuda/af2/export_input.mjs,
@@ -211,12 +212,16 @@ static int fetchMain(int argc, char** argv) {
     else names.push_back(argv[i]);
   }
   if (names.empty()) {
-    fprintf(stderr, "usage: fetch-weights [--weights-dir=<dir>] <model>...\n  models: %s\n", lf::fetch::modelNames().c_str());
+    fprintf(stderr, "usage: fetch-weights [--weights-dir=<dir>] <model>|ccd ...\n  models: %s\n  ccd: wwPDB's whole chemical component dictionary, for folding offline\n",
+            lf::fetch::modelNames().c_str());
     return 2;
   }
   try {
     if (root.empty()) root = lf::fetch::home();
-    for (auto& n : names) for (auto& d : lf::fetch::model(root, n).dirs) printf("%s: %s\n", n.c_str(), d.c_str());
+    for (auto& n : names) {
+      if (n == "ccd") { printf("ccd: %s\n", lf::fetch::ccd(root).c_str()); continue; }      // (the dictionary, whole)
+      for (auto& d : lf::fetch::model(root, n).dirs) printf("%s: %s\n", n.c_str(), d.c_str());
+    }
   } catch (const std::exception& e) {
     fprintf(stderr, "Error: %s\n", e.what());
     return 1;
@@ -234,7 +239,7 @@ int main(int argc, char** argv) {
   if (self == "ef2-featurise") return esmfold2Main(argc, argv);
   if (self == "resolve-templates") return resolveMain(argc, argv);
   if (self == "chem-probe") return chemMain();
-  if (self == "fetch-weights") return fetchMain(argc, argv);
+  if (self == "fetch-weights" || self == "localfold-fetch") return fetchMain(argc, argv);   // (the wheel's name for it)
   fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, ef2-featurise, resolve-templates or fetch-weights (not %s)\n", self.c_str());
   return 2;
 }

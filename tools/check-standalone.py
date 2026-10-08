@@ -9,7 +9,8 @@ featuriser binary's directory. Each case runs both ways - `cuda/featurise/<port>
 `cuda/<port>/<port> <dir> ...`, and the standalone command - and holds the two PDBs to the SAME BYTES, so a flag the
 standalone mode drops or misroutes (an input flag reaching the fold, af2's --recycles reaching only one of the
 two) is a difference here rather than a quietly different fold. Beside them: refusals come back as the page's
-sentence with a nonzero status (an input flag the port does not read is one of them, never dropped), `--frames=` streams what the page draws, a weights home is honoured
+sentence with a nonzero status (an input flag the port does not read is one of them, never dropped), a local
+CCD (--ccd) is the only source of its components, `--frames=` streams what the page draws, a weights home is honoured
 (--weights-dir), and with --network a searched alignment is kept as <out>.a3m.
 
 Needs the GPU and the weights the worker uses (fetched on first use).
@@ -132,6 +133,30 @@ def main():
         ok = r.returncode != 0 and "Error: " in r.stdout + r.stderr
         failed += not ok
         print(f"{'ok  ' if ok else 'FAIL'} --weights-dir unwritable: refused, not folded from elsewhere")
+
+        # --ccd: a local dictionary is the only source - a code it holds folds as the RCSB's does, a code it lacks
+        # is refused rather than fetched (here: a two-component dictionary made of the repository's fixtures)
+        tiny = os.path.join(work, "tiny-ccd.cif")
+        with open(tiny, "w") as handle:
+            for code in ("CA", "ATP"):
+                handle.write(open(os.path.join(FIX, "ccd", f"{code}.cif")).read())
+        empty = os.path.join(work, "empty-cache")
+        os.makedirs(empty)
+        env = dict(os.environ, LOCALFOLD_CCD_DIR=empty)
+        standalone("af3", [f"--job={JOBS}/calmodulin_4calcium.json", f"--ccd={tiny}", "--steps=20"], f"{work}/ccd.pdb", env)
+        bare = os.path.join(work, "weights-without-ccd")    # (the RCSB arm: a weights dir with no ccd/ beside it)
+        os.makedirs(bare)
+        os.symlink(os.path.join(REPO, "af3am-af3"), os.path.join(bare, "af3am-af3"))
+        standalone("af3", [f"--job={JOBS}/calmodulin_4calcium.json", "--steps=20", f"--weights-dir={bare}"], f"{work}/rcsb.pdb")
+        same = open(f"{work}/ccd.pdb", "rb").read() == open(f"{work}/rcsb.pdb", "rb").read()
+        ok = same and not os.listdir(empty)
+        failed += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} --ccd: calmodulin's calcium from a local dictionary, "
+              + ("byte-identical to the RCSB's, nothing cached" if ok else f"identical {same}, cached {os.listdir(empty)}"))
+        r = run([binary("af3"), f"--sequence={S6}", "--ligands=GOL", f"--ccd={tiny}", f"--out={work}/gol.pdb"], env)
+        ok = r.returncode != 0 and "GOL is not in the CCD" in r.stdout + r.stderr and not os.listdir(empty)
+        failed += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} --ccd: a code the dictionary lacks is refused, not fetched")
 
         if network:
             out = os.path.join(work, "searched.pdb")

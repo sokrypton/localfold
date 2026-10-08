@@ -142,3 +142,6 @@ cuda/featurise/*.building
 python/dist/
 python/build/
 python/*.egg-info/
+
+# wwPDB's whole chemical component dictionary (cuda/featurise/fetch-weights ccd)
+/ccd/

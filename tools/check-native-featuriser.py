@@ -3,6 +3,7 @@
     python3 tools/check-native-featuriser.py                 # the whole corpus, every family it names
     python3 tools/check-native-featuriser.py --only=6mrr-sep # cases whose name contains it
     python3 tools/check-native-featuriser.py --keep          # leave both outputs in /tmp/claude-1000/nf
+    python3 tools/check-native-featuriser.py --ccd=ccd/components.cif   # the native side reads a local CCD
 
 Each case runs the JavaScript exporter (cuda/af3/export-model.mjs --no-weights, cuda/af2/export_input.mjs,
 cuda/ef2/export_input.mjs) and the native one (cuda/featurise/*-featurise) on the same arguments and holds
@@ -11,6 +12,10 @@ differs is named with its first differing element, because "the files differ" sa
 
 🔴 A REFUSAL MUST BE THE SAME REFUSAL: a case either exporter refuses passes only when both refuse, in the same
 words - the page's sentence is the answer a reader sees, so the native port may not say something else.
+
+--ccd=<components.cif> hands the NATIVE featurisers wwPDB's whole dictionary (`cuda/featurise/fetch-weights ccd`) where
+the JavaScript still fetches each component from the RCSB: the two must still agree byte for byte, which is what
+says a local dictionary folds what the page folds.
 """
 import argparse
 import json
@@ -280,11 +285,13 @@ def main():
     parser.add_argument("--family", default="")
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--network", action="store_true", help="only the cases that search api.colabfold.com")
+    parser.add_argument("--ccd", default="", help="a local CCD the native side reads (components.cif)")
     a = parser.parse_args()
     native = os.path.join(REPO, "cuda", "featurise", "af3-featurise")
     if not os.access(native, os.X_OK):
         sys.exit(f"{native} is not built (cuda/featurise/build.sh)")
     os.makedirs(WORK, exist_ok=True)
+    ccd = [f"--ccd={os.path.abspath(a.ccd)}"] if a.ccd else []
     failed, passed, skipped = [], 0, 0
     for case in cases():
         name, port, spec, extra, families = case[:5]
@@ -308,7 +315,7 @@ def main():
             if port == "ef2":
                 common = [f"--job={job_path}", *args]
                 js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "ef2", "export_input.mjs"), base + "/js", *common])
-                nv_code, nv_said, nv_s = run([native.replace("af3-featurise", "ef2-featurise"), base + "/native", *common])
+                nv_code, nv_said, nv_s = run([native.replace("af3-featurise", "ef2-featurise"), base + "/native", *common, *ccd])
             elif port == "af2":
                 bundle = os.path.join(REPO, "model" if family == "monomer" else "model-multimer")
                 common = [f"--bundle={bundle}", f"--job={job_path}", *args]
@@ -318,7 +325,7 @@ def main():
                 common = ["--no-weights", f"--family={family}", f"--job={job_path}", "--max-msa=512", *args]
                 js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "af3", "export-model.mjs"), base + "/js", *common],
                                              cwd=os.path.join(REPO, "cuda", "af3"))
-                nv_code, nv_said, nv_s = run([native, base + "/native", *common])
+                nv_code, nv_said, nv_s = run([native, base + "/native", *common, *ccd])
             if js_code != 0 or nv_code != 0:
                 if js_code != 0 and nv_code != 0 and refusal(js_said) == refusal(nv_said):
                     print(f"  ok   {tag}: both refuse - {refusal(js_said)}")

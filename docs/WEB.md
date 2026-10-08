@@ -4414,3 +4414,23 @@ a confident multimer (1BRS with its crystal as a template) identical to three de
 crystal both ways), and only an undetermined single-sequence complex (pLDDT 36) wandering 8 A, which a different
 cuBLAS build is enough to do. 🔴 `workflow_dispatch` is offered only once the workflow is on the default branch;
 until then a `v*` tag runs it. Publishing to PyPI is not in it.
+
+## 🔴 Folding offline: the CCD as a file (`--ccd`, `fetch-weights ccd`) (2026-10-08)
+
+A CCD code was fetched from the RCSB a component at a time (cached in `~/.cache/localfold/ccd`), so a new ligand needed
+the network. `--ccd=<components.cif[.gz]>` now names a local dictionary - wwPDB's whole one, which AlphaFold 3 installs
+already carry - and `fetch-weights ccd` (`localfold-fetch ccd` in the wheel) downloads it into the weights directory
+uncompressed (519 MB, ~6 s; a lookup is ~0.1 s mapped, where inflating the 114 MB .gz is ~3 s), where the binaries and
+the worker read it by default. 🔴 **A RUN THAT READS A DICTIONARY READS THAT ALONE**: a code it lacks is refused, never
+fetched, and its blocks never enter the per-component cache, so a custom dictionary cannot leak into a later run.
+`test:featurise --ccd=ccd/components.cif` - the native side reading the dictionary, the JavaScript the RCSB - is 174 of
+174 byte-identical; `test:standalone` holds a two-component dictionary to the RCSB's fold (byte-identical, nothing
+cached) and a missing code to a refusal, and both arms went red with the dictionary ignored.
+
+🔴 **WHY NOT A SMILES MAP, WHICH WAS 2 MB**: prototyped first. wwPDB's SMILES for 51,556 components rebuild the same
+molecules (351 of 351 sampled graphs, 692 of 702 stereocentres - the ten others are the SMILES contradicting or omitting
+stereo the CCD's coordinates define, our conformer matching the SMILES every time), but not the CCD's atom NAMES
+(6 of 351), and those are read by the models: with element+counter names AlphaFold 3 with an alignment puts myoglobin's
+heme in the 180-degree-flipped orientation in 5 of 5 seeds (symmetry-aware 0.19 -> 6.27 A, the iron in place), and
+Boltz-2 from one sequence in 4 of 5; biotin and Protenix-2 are unaffected, and atom ORDER changed nothing anywhere. A
+map carrying names was 2.1 MB but still rebuilt conformers and charges; the dictionary itself changes nothing.

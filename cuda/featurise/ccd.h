@@ -1,17 +1,21 @@
 // A chemical component from the CCD, as shared/af3/featurise/ccd-component.js reads one: its heavy atoms with
 // ideal coordinates, its bonds, its parent - and the two reshapings the featuriser makes of one (a residue's
 // leaving atoms dropped, several bonded components as one ligand chain). Fetched from the RCSB, as the page
-// fetches it, into a cache (LOCALFOLD_CCD_DIR, default ~/.cache/localfold/ccd).
+// fetches it, into a cache (LOCALFOLD_CCD_DIR, default ~/.cache/localfold/ccd) - or, given a local CCD file
+// (--ccd=<components.cif[.gz]>, wwPDB's whole dictionary; `fetch-weights ccd` downloads it), read from that alone.
 #pragma once
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -348,6 +352,62 @@ inline std::string ccdText(const std::string& code) {
   }
   std::rename(part.c_str(), path.c_str());
   return readFile(path);
+}
+
+// A local CCD - wwPDB's components.cif, plain (mapped) or gzipped (decompressed once) - indexed by its data_ lines on
+// first use and kept for the process (a resident server reads it once). A code it lacks is refused: a run that names
+// a dictionary folds from that dictionary, never from the network behind it, and its blocks never enter the cache
+// above, so a custom dictionary cannot leak into a later run without it.
+struct CcdFile {
+  const char* data = nullptr; size_t size = 0;
+  std::string inflated;                              // (a .gz's text)
+  std::map<std::string, std::pair<size_t, size_t>> at;   // code -> [start, end) of its block
+};
+inline const CcdFile& ccdFile(const std::string& path) {
+  static std::map<std::string, CcdFile> open;
+  auto it = open.find(path);
+  if (it != open.end()) return it->second;
+  CcdFile f;
+  if (path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0) {
+    FILE* p = popen(("gzip -dc '" + path + "'").c_str(), "r");
+    if (!p) throw std::runtime_error("cannot read " + path);
+    char buf[1 << 16]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, p)) > 0) f.inflated.append(buf, n);
+    if (pclose(p) != 0) throw std::runtime_error(path + " did not decompress");
+    f.data = f.inflated.data(); f.size = f.inflated.size();
+  } else {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) throw std::runtime_error("cannot read the CCD " + path);
+    f.size = (size_t)st.st_size;
+    void* m = f.size ? mmap(nullptr, f.size, PROT_READ, MAP_PRIVATE, fd, 0) : nullptr;
+    ::close(fd);
+    if (m == MAP_FAILED) throw std::runtime_error("cannot map the CCD " + path);
+    f.data = (const char*)m;
+  }
+  std::string last; size_t lastAt = 0;
+  for (size_t i = 0; i + 5 <= f.size;) {
+    if ((i == 0 || f.data[i - 1] == '\n') && std::memcmp(f.data + i, "data_", 5) == 0) {
+      size_t e = i + 5; while (e < f.size && f.data[e] != '\n' && f.data[e] != '\r' && f.data[e] != ' ') ++e;
+      if (!last.empty()) f.at[last] = {lastAt, i};
+      last = std::string(f.data + i + 5, e - i - 5); lastAt = i;
+      i = e;
+    } else {
+      const void* nl = std::memchr(f.data + i, '\n', f.size - i);
+      if (!nl) break;
+      i = (const char*)nl - f.data + 1;
+    }
+  }
+  if (!last.empty()) f.at[last] = {lastAt, f.size};
+  if (f.at.empty()) throw std::runtime_error(path + " holds no data_ blocks: not a CCD (wwPDB's components.cif)");
+  return open.emplace(path, std::move(f)).first->second;
+}
+inline std::string ccdFileText(const std::string& path, const std::string& code) {
+  std::string u = ccdCode(code);
+  const CcdFile& f = ccdFile(path);
+  auto it = f.at.find(u);
+  if (it == f.at.end()) throw std::runtime_error(u + " is not in the CCD " + path);
+  return std::string(f.data + it->second.first, it->second.second - it->second.first);
 }
 
 }  // namespace lf

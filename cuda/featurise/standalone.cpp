@@ -7,7 +7,7 @@ namespace lf::standalone {
 
 // the featuriser's command line: the input directory first (its positional, as cuda/featurise/<port>-featurise
 // takes it), then the command's flags and the port's own
-static std::function<Args(const std::string&)> with(const std::vector<std::string>& list, std::initializer_list<std::string> extra) {
+static std::function<Args(const std::string&)> withAll(const std::vector<std::string>& list, const std::vector<std::string>& extra) {
   std::vector<std::string> flags = list;
   for (auto& e : extra) flags.push_back(e);
   return [flags](const std::string& dir) {
@@ -44,6 +44,9 @@ INPUT
   --ligands=GOL,ATP        ligands by CCD code
   --smiles='CCO|c1ccccc1'  ligands by SMILES, '|'-separated (the conformer is built here)
   --modify=SEP@3[@<chain>] modified residues or bases: CODE@position (1-based), comma-separated
+  --ccd=<components.cif>   read every CCD component from this local dictionary (wwPDB's components.cif, or .gz)
+                           instead of fetching each from the RCSB; `fetch-weights ccd` downloads one into the weights
+                           directory, which is then read by default
 
 ALIGNMENT (none by default: single sequence)
   --search                 the protein chains' alignments from the ColabFold MMseqs2 server, paired for a
@@ -171,6 +174,7 @@ INPUT
   --smiles='CCO|c1ccccc1'  ligands by SMILES, '|'-separated
   --modify=SEP@3[@<chain>] modified residues: CODE@position (1-based), comma-separated
   --a3m=<a.a3m>[,<b.a3m>]  the released ef2-fast and ef2 only; the fast 600M/300M read no alignment
+  --ccd=<components.cif>   read CCD components from this local dictionary instead of the RCSB (as localfold-af3)
   (no templates)
 
 FOLD
@@ -207,6 +211,13 @@ static void usage(const std::string& port, bool full) {
 }
 
 // the model's weights, by its --model name (fetch.h's one table), refused when it is another port's
+// the CCD a run reads: the one it names (--ccd), else the dictionary `fetch-weights ccd` put beside the weights,
+// else none (the RCSB, a component at a time)
+static std::vector<std::string> ccdFlag(const Run& run) {
+  if (!run.args.option("ccd").empty() || !fetch::exists(fetch::ccdPath(run.home))) return {};
+  return {"--ccd=" + fetch::ccdPath(run.home)};
+}
+
 static fetch::ModelWeights weightsFor(const Run& run, const std::string& port) {
   fetch::ModelWeights w = fetch::model(run.home, run.model);
   if (w.port != port) throw std::runtime_error(run.model + " is folded by localfold-" + w.port + ", not localfold-" + port);
@@ -220,7 +231,9 @@ static int af3(Run& run, int (*fold)(int, char**), const char* argv0) {
   foldArgs.push_back("--fold");
   foldArgs.push_back("--fast");
   for (auto& f : run.foldFlags()) foldArgs.push_back(f);
-  auto args = with(run.list, {"--no-weights", "--family=" + run.model});
+  std::vector<std::string> extra = {"--no-weights", "--family=" + run.model};
+  for (auto& f : ccdFlag(run)) extra.push_back(f);
+  auto args = withAll(run.list, extra);
   return featuriseAndFold(run, [args](const std::string& dir) { featuriseAf3Into(args(dir), dir); }, foldArgs, fold, argv0);
 }
 
@@ -233,7 +246,7 @@ static int af2(Run& run, int (*fold)(int, char**), const char* argv0) {
   std::string warm = af2WarmShape(run.args);
   if (!warm.empty()) foldArgs.push_back("--warm=" + warm);
   for (auto& f : run.foldFlags({"recycles"})) if (flagName(f) != "seed") foldArgs.push_back(f);   // (--seed: the alignment's)
-  auto args = with(run.list, {"--bundle=" + bundle});
+  auto args = withAll(run.list, {"--bundle=" + bundle});
   return featuriseAndFold(run, [args](const std::string& dir) { featuriseAf2Into(args(dir), dir); }, foldArgs, fold, argv0);
 }
 
@@ -258,7 +271,9 @@ static int ef2(Run& run, int (*fold)(int, char**), const char* argv0) {
     }
     if (atomised) foldArgs.push_back("--steps=64");
   }
-  auto args = with(run.list, {"--fold-bundle=" + trunk});
+  std::vector<std::string> extra = {"--fold-bundle=" + trunk};
+  for (auto& f : ccdFlag(run)) extra.push_back(f);
+  auto args = withAll(run.list, extra);
   return featuriseAndFold(run, [args](const std::string& dir) { featuriseEsmfold2Into(args(dir), dir); }, foldArgs, fold, argv0);
 }
 
@@ -266,10 +281,10 @@ static int ef2(Run& run, int (*fold)(int, char**), const char* argv0) {
 // name rather than dropped - a template handed to ESMFold2 must not fold as though it were not there
 static const std::set<std::string>& readsInput(const std::string& port) {
   static const std::set<std::string> AF3 = {"job", "sequence", "a3m", "paired-a3m", "search", "search-templates", "template",
-                                            "template-search-chains", "kinds", "ligands", "smiles", "modify", "max-msa", "no-span-chains"};
+                                            "template-search-chains", "kinds", "ligands", "smiles", "modify", "max-msa", "no-span-chains", "ccd"};
   static const std::set<std::string> AF2 = {"job", "sequence", "a3m", "paired-a3m", "search", "template", "template-search-chains",
                                             "max-msa", "max-extra"};
-  static const std::set<std::string> EF2 = {"job", "sequence", "a3m", "kinds", "ligands", "smiles", "modify"};
+  static const std::set<std::string> EF2 = {"job", "sequence", "a3m", "kinds", "ligands", "smiles", "modify", "ccd"};
   return port == "af3" ? AF3 : port == "af2" ? AF2 : EF2;
 }
 

@@ -16,6 +16,11 @@ Each command fetches its model's weights the first time (into `~/.cache/localfol
 featurises the input exactly as the [LocalFold website](https://localfold.org) does, and folds. `--help` lists every
 option.
 
+`localfold-fetch <model>` downloads a model's weights ahead of time, and `localfold-fetch ccd` wwPDB's whole chemical
+component dictionary (519 MB): ligands and modified residues are then read from it instead of being fetched from the
+RCSB one at a time - so once the weights and the dictionary are here, a fold needs no network. `--ccd=<components.cif>`
+names a dictionary you already have.
+
 | command | models (`--model=`) | takes |
 |---|---|---|
 | `localfold-af3` | `af3` (AlphaFold 3, default), `boltz2`, `chai1`, `protenix2`, `intellifold2`, `rosettafold3`, `opendde`, `openbind0` | proteins, DNA, RNA, ligands (CCD or SMILES), ions, glycans, modified residues, covalent bonds, alignments, templates |

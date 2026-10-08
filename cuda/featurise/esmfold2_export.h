@@ -27,7 +27,7 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
     throw std::runtime_error("usage: ef2-featurise <out dir> --sequence=<SEQ>[:<SEQ>...] [--kinds=protein,dna,...] [--ligands=GOL,ATP]"
                              " [--smiles=OCC(O)CO|...] [--modify=SEP@3[@chain]] | --job=<AF3 job.json>");
   std::string kinds = args.option("kinds");
-  ComponentSource components;
+  ComponentSource components(args);
   Expanded request;
   bool haveJob = false;
   if (!args.option("job").empty()) {

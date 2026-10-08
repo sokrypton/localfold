@@ -56,9 +56,12 @@ inline std::vector<std::string> splitNonEmpty(const std::string& s, char sep) { 
   return out;
 }
 
-// the job's userCCD (each data_ block a component), then the RCSB through the cache
+// the job's userCCD (each data_ block a component), then a local CCD when one is named (--ccd), else the RCSB
+// through the cache
 struct ComponentSource {
   std::map<std::string, Component> user;
+  std::string file;                  // --ccd=<components.cif[.gz]>
+  explicit ComponentSource(const Args& args) : file(args.option("ccd")) {}
   void addUserCcd(const std::string& text) {
     std::vector<size_t> starts;
     for (size_t at = 0; at < text.size(); at = text.find('\n', at), at = at == std::string::npos ? text.size() : at + 1)
@@ -73,7 +76,7 @@ struct ComponentSource {
   Component get(const std::string& code) const {
     auto it = user.find(upper(code));
     if (it != user.end()) return it->second;
-    return parseCcdComponent(ccdText(code));
+    return parseCcdComponent(file.empty() ? ccdText(code) : ccdFileText(file, code));
   }
 };
 
@@ -350,7 +353,7 @@ inline Af3Export exportAf3(const Args& args) {
   bool haveJob = !args.option("job").empty();
   Expanded request;
   std::vector<std::vector<JobTemplate>> jobTemplates;
-  ComponentSource components;
+  ComponentSource components(args);
   Alignment alignment;
   bool jobAlignment = false;
   std::vector<std::string> msaColumnKinds;

@@ -135,6 +135,13 @@ def model_weights(model, log):
     return dirs
 
 
+def local_ccd():
+    """wwPDB's whole component dictionary when `fetch-weights ccd` has put it beside the weights (the binaries'
+    default too): every component read from it, none fetched from the RCSB a component at a time."""
+    path = os.path.join(REPO, "ccd", "components.cif")
+    return [f"--ccd={path}"] if os.path.exists(path) else []
+
+
 BUILD_MARKER, BUILD_LOG = "/tmp/localfold-cuda-build", "/tmp/localfold-cuda-build.log"
 
 
@@ -485,7 +492,7 @@ class Worker:
                                            f"--family={family}", "--fold", "--fast",
                                            *esm], residues)
             featurise([featuriser("af3-featurise"), inputs, "--no-weights", dialect, f"--job={job_path}",
-                       f"--max-msa={requested}", *flags], "featurising", log, live)
+                       f"--max-msa={requested}", *flags, *local_ccd()], "featurising", log, live)
             steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
             fold = [f"--out={out_pdb}"]
             if sampler == "flow":
@@ -528,7 +535,7 @@ class Worker:
             key = ("ef2", family)
             server = self.server_for(key, [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)
-            featurise([featuriser("ef2-featurise"), inputs, f"--job={job_path}"], "featurising", log, live)
+            featurise([featuriser("ef2-featurise"), inputs, f"--job={job_path}", *local_ccd()], "featurising", log, live)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
             # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's
             # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45

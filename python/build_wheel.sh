@@ -26,11 +26,13 @@ for port in af3 af2 ef2; do
   install -m 755 "$repo/cuda/$port/localfold-$port" "$bin/localfold-$port"
   strip "$bin/localfold-$port"             # (host symbols only: the device code is the fatbinary's data)
 done
+# localfold-fetch: the featuriser binary under the name that runs its weight and CCD fetcher (no GPU, no cuBLAS)
+install -m 755 "$repo/cuda/featurise/featurise" "$bin/localfold-fetch"; strip "$bin/localfold-fetch"
 # what the wheel's tag promises: nothing newer than glibc 2.28, and cuBLAS found through the RPATH
 for f in "$bin"/localfold-*; do
   glibc="$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)"
   [ "$(printf '%s\n2.28\n' "$glibc" | sort -V | tail -1)" = 2.28 ] || { echo "$f needs glibc $glibc, past manylinux_2_28" >&2; exit 1; }
-  readelf -d "$f" | grep -q 'nvidia/cublas/lib' || { echo "$f has no RPATH to nvidia-cublas-cu12" >&2; exit 1; }
+  [ "$(basename "$f")" = localfold-fetch ] || readelf -d "$f" | grep -q 'nvidia/cublas/lib' || { echo "$f has no RPATH to nvidia-cublas-cu12" >&2; exit 1; }
   if readelf -d "$f" | grep NEEDED | grep -q cupti; then echo "$f links CUPTI" >&2; exit 1; fi
   echo "$(basename "$f"): glibc $glibc, $(du -m "$f" | cut -f1) MB"
 done

@@ -22,3 +22,7 @@ def af2():
 
 def ef2():
     _run("ef2")
+
+
+def fetch():
+    _run("fetch")

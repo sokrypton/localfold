@@ -234,6 +234,31 @@ inline std::string bundle(const std::string& root, const std::string& key) {
   return dest;
 }
 
+// ---------------------------------------------------------------- the CCD, whole
+// wwPDB's chemical component dictionary (every component, 51,000-odd, updated weekly), stored UNCOMPRESSED in
+// <root>/ccd/components.cif: a lookup in the plain file is ~0.1 s, where inflating the 114 MB .gz is ~3 s a run. A
+// binary given no --ccd reads this one when it is there (cuda/featurise/standalone.h), and the RCSB a component at
+// a time when it is not.
+inline const std::string CCD_URL = "https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz";
+inline std::string ccdPath(const std::string& root) { return root + "/ccd/components.cif"; }
+inline std::string ccd(const std::string& root) {
+  std::string dir = root + "/ccd", path = ccdPath(root);
+  if (exists(path)) return path;
+  makeDirs(dir);
+  Lock lock(dir);
+  if (exists(path)) return path;
+  printf("  ccd: components.cif.gz (wwPDB, ~114 MB)\n"); fflush(stdout);
+  download(CCD_URL, path + ".gz");
+  if (system(("gzip -dc " + search::shellQuote(path + ".gz") + " > " + search::shellQuote(path + ".part")).c_str()) != 0) {
+    std::remove((path + ".part").c_str());
+    throw std::runtime_error("components.cif.gz did not decompress");
+  }
+  std::remove((path + ".gz").c_str());
+  if (rename((path + ".part").c_str(), path.c_str()) != 0) throw std::runtime_error("cannot rename " + path + ".part");
+  printf("ccd -> %s\n", path.c_str()); fflush(stdout);
+  return path;
+}
+
 // ---------------------------------------------------------------- by model: what each binary reads
 // The AF3 lineage folds from af3-any-model's int8 blobs - not the registry's int5 bundles of the same names, which
 // are the website's - chai-1 with ESM2 3B beside its own; AlphaFold 2's model 1 of each whole and models 2-5 as

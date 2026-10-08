@@ -80,7 +80,7 @@ namespace standalone {
 inline const std::set<std::string>& inputFlags() {
   static const std::set<std::string> s = {"job", "sequence", "a3m", "paired-a3m", "search", "search-templates", "template",
                                           "template-search-chains", "kinds", "ligands", "smiles", "modify", "max-msa",
-                                          "max-extra", "no-span-chains"};
+                                          "max-extra", "no-span-chains", "ccd"};
   return s;
 }
 inline std::string flagName(const std::string& a) {

@@ -123,6 +123,22 @@ Downloaded once into `af3am-<model>/` in the directory `--weights-dir=<dir>` nam
 asking at once share one, and an interrupted one leaves nothing that reads as finished. `cuda/featurise/fetch-weights <model>`
 fetches without folding (it takes `--weights-dir` too).
 
+### Ligand and residue definitions (the CCD)
+
+A ligand, ion or modified residue named by its CCD code is read from wwPDB's chemical component dictionary. By
+default each component is fetched from the RCSB the first time it is used and cached in `~/.cache/localfold/ccd` -
+as the website does - so a new component needs the network once. To fold with none:
+- `cuda/featurise/fetch-weights ccd` (`localfold-fetch ccd` from the wheel) downloads the whole dictionary once into
+  the weights directory as `ccd/components.cif` (519 MB uncompressed, ~6 s), and every fold then reads it - no
+  `--ccd` needed;
+- or `--ccd=<components.cif>` names a dictionary you already have (AlphaFold 3 installs carry one; `.gz` works,
+  plain is ~30x faster to read).
+
+A run that reads a dictionary reads that alone: a code it lacks is refused (`Error: XYZ is not in the CCD ...`),
+never fetched from the network behind it, and its components never enter the per-component cache. Folds are
+byte-identical either way: the native featurisers reading the dictionary match the website's, which fetches from
+the RCSB, on every case of `npm run test:featurise` (`--ccd=ccd/components.cif`).
+
 ### Limits and errors
 
 - Up to ~6,000 tokens on a 40 GB A100 and ~3,200 on a 16 GB T4; past what the card holds it refuses up front and
