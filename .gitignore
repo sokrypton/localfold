@@ -125,7 +125,7 @@ tools/_*.py
 # by using the page rather than by developing it.
 /py2dmol_state_*.json
 /_merge_state.json
-# af3-any-model's published blobs, fetched for the CUDA ports (cuda/featurise/fetch-weights --af3-any-model)
+# af3-any-model's published blobs, fetched for the CUDA ports (cuda/featurise/fetch-weights <model>)
 /af3am-*
 
 # the native featurisers (cuda/build.sh: one binary and the names linked to it)

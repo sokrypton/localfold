@@ -109,43 +109,30 @@ def die_with_parent():
     ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
 
 
-def fetch_weights(what, args, log, env=None):
-    """The published weights fetched natively (cuda/featurise/fetch-weights, fetch.h) - piece by piece, each said, so a
-    slow download (one revision came at 0.9 MB/s on a Colab T4) reads as a download and not a hang."""
-    emit("status", f"fetching the {what} weights")
-    fetcher = subprocess.Popen([featuriser("fetch-weights"), *args], cwd=REPO, stdout=subprocess.PIPE,
+def model_weights(model, log):
+    """A model's weights on disk, by its --model name - what its binary reads (cuda/featurise/fetch-weights: fetch.h's one
+    table), downloaded the first time piece by piece, each said, so a slow download (one revision came at 0.9 MB/s on
+    a Colab T4) reads as a download and not a hang. AlphaFold 3's are Google DeepMind's, for academic non-commercial
+    use: the page folds only once its model-terms dialog has been accepted, which is the acceptance passed on."""
+    env = dict(os.environ)
+    if model == "af3":
+        accepted = {n.strip() for n in env.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",") if n.strip()}
+        env["LOCALFOLD_ACCEPT_MODEL_TERMS"] = ",".join(sorted(accepted | {"alphafold3"}))
+    fetcher = subprocess.Popen([featuriser("fetch-weights"), model], cwd=REPO, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=die_with_parent, env=env)
-    said = []
+    said, dirs = [], []
     for line in fetcher.stdout:
         said.append(line)
         found = re.search(r"\((\d+)/(\d+)\)", line)
         if found:
-            emit("status", f"fetching the {what} weights · part {found.group(1)} of {found.group(2)}")
+            emit("status", f"fetching the {model} weights · part {found.group(1)} of {found.group(2)}")
+        named = re.match(re.escape(model) + r": (/.+)$", line.rstrip("\n"))
+        if named:
+            dirs.append(named.group(1))
     if fetcher.wait() != 0:
-        raise RuntimeError(f"fetching {what} failed: {''.join(said[-4:])}")
+        raise RuntimeError(f"fetching {model} failed: {''.join(said[-4:])}")
     log.append("".join(said))
-
-
-def ensure_bundle(family, directory, log):
-    """A registry bundle on disk (shared/bundles/manifests/index.js), fetched from its remote the first time."""
-    if not os.path.exists(os.path.join(REPO, directory, "manifest.json")):
-        fetch_weights(family, [family], log)
-    return os.path.join(REPO, directory)
-
-
-def ensure_blob(name, log):
-    """af3-any-model's own published blob: every AF3-lineage family's weights, and chai-1's ESM2. AlphaFold 3's are
-    Google DeepMind's, for academic non-commercial use: the page folds only once its model-terms dialog has been
-    accepted, which is the acceptance the fetcher asks for."""
-    import glob
-    directory = os.path.join(REPO, "af3am-" + name)
-    if not glob.glob(os.path.join(directory, "*.bin.zst")):
-        env = dict(os.environ)
-        if name == "af3":
-            accepted = {n.strip() for n in env.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",") if n.strip()}
-            env["LOCALFOLD_ACCEPT_MODEL_TERMS"] = ",".join(sorted(accepted | {"alphafold3"}))
-        fetch_weights(name, ["--af3-any-model", name], log, env)
-    return directory
+    return dirs
 
 
 BUILD_MARKER, BUILD_LOG = "/tmp/localfold-cuda-build", "/tmp/localfold-cuda-build.log"
@@ -489,10 +476,11 @@ class Worker:
         # job's flags for it
         if port == "af3":
             # af3-any-model's own int8 blob, every family (AlphaFold 3's under DeepMind's academic terms)
-            bundle, dialect = ensure_blob(family, log), f"--family={family}"
+            weights = model_weights(family, log)
+            bundle, dialect = weights[0], f"--family={family}"
             key = ("af3", family)
-            # chai-1's token features are ESM2 3B's, computed in the fold (cuda/af3/src/esm2.cuh)
-            esm = [f"--esm-bundle={ensure_blob('esm2', log)}"] if family == "chai1" else []
+            # chai-1's token features are ESM2 3B's, computed in the fold (cuda/plm/esm2.cuh)
+            esm = [f"--esm-bundle={weights[1]}"] if len(weights) > 1 else []
             server = self.server_for(key, [binary("af3"), "-", f"--bundle={bundle}",
                                            f"--family={family}", "--fold", "--fast",
                                            *esm], residues)
@@ -520,12 +508,9 @@ class Worker:
             if templates and family == "monomer" and af2_model > 2:
                 raise Refused(f"AlphaFold 2's model {af2_model} has no template embedder (models 3, 4 and 5 are"
                               " template-free) - pick model 1 or 2, or drop the template")
-            bundle = ensure_bundle(family, "model" if family == "monomer" else "model-multimer", log)
-            delta = None
-            if af2_model > 1:
-                short = "mono" if family == "monomer" else "multi"
-                delta = ensure_bundle(f"{family}-{af2_model}", f"model-{short}-{af2_model}-delta", log)
             model = f"model_{af2_model}_ptm" if family == "monomer" else f"model_{af2_model}_multimer_v3"
+            weights = model_weights(model, log)       # (models 2-5: model 1's bundle and their delta on it)
+            bundle, delta = weights[0], (weights[1] if len(weights) > 1 else None)
             key = ("af2", family, af2_model)
             server = self.server_for(key, [binary("af2"), "-", f"--bundle={bundle}",
                                            "--fast",
@@ -539,8 +524,7 @@ class Worker:
             total = 0
         else:
             small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)
-            trunk = ensure_bundle(family, "model-ef2-fast-300m-int5" if small else "model-esmfold2-int5", log)
-            tower = ensure_bundle("esmc-300m" if small else "esmc", "model-esmc-300m-int3" if small else "model-esmc-600m-int3", log)
+            trunk, tower = model_weights("esmfold2-fast-300m" if small else "esmfold2-fast-600m", log)
             key = ("esmfold2", family)
             server = self.server_for(key, [binary("esmfold2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)

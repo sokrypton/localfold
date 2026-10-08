@@ -114,9 +114,7 @@ maps). Files land complete, so a viewer can poll the directory.
 
 ### Weights
 
-Downloaded once into `model/`, `model-multimer/` and `model-{mono,multi}-<N>-delta/` in the checkout the binary
-was built in, or under `LOCALFOLD_HOME` when it is set (`~/.cache/localfold` for a binary copied out of its
-checkout). `cuda/featurise/fetch-weights monomer multimer-3 ...` fetches without folding.
+Downloaded once into `model/`, `model-multimer/` and `model-{mono,multi}-<N>-delta/` in the directory `--weights-dir=<dir>` names, else in the checkout the binary was built in (`~/.cache/localfold` for a binary copied out of its checkout). `cuda/featurise/fetch-weights model_3_ptm ...` fetches without folding (it takes `--weights-dir` too).
 
 ### Limits and errors
 

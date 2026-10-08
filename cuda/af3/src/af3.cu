@@ -92,7 +92,7 @@ static int foldMain(int argc, char** argv) {
       lf::weights::Shapes S; S.shape = shapes;
       return lf::weights::af3WeightLines(family, S);
     });
-  // (its matrices stay resident as int8 codes and expand a layer at a time: src/esm2.cuh)
+  // (its matrices stay resident as int8 codes and expand a layer at a time: cuda/plm/esm2.cuh)
   const int esmSeg = (int)M.segs.size();
   if (!esmBundle.empty()) M.loadBundle(esmBundle, "e", nullptr, "", "esm2/blocks/");   // (af3-any-model's lm/esm2.bin.zst)
   const bool haveWeights = !weightsDir.empty() || !bundleDir.empty();

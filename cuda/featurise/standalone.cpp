@@ -79,9 +79,9 @@ OUTPUT (for --out=fold.pdb)
   fold_sample<k>.*, fold_ranking_scores.csv   with several samples or seeds
   fold.a3m                        the searched alignment
 
-ENVIRONMENT
-  LOCALFOLD_HOME                  where the weights are kept (the checkout by default)
-  LOCALFOLD_ACCEPT_MODEL_TERMS    alphafold3: accept DeepMind's terms without the prompt
+WEIGHTS
+  --weights-dir=<dir>             where the weights are kept, and downloaded to when absent (default below)
+  LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3   accept DeepMind's terms without the prompt
 
 A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/af3/README.md.
 )";
@@ -139,8 +139,8 @@ OUTPUT (for --out=fold.pdb)
   fold_summary_confidences.json   pTM, ipTM, mean pLDDT
   fold.a3m                        the searched alignment
 
-ENVIRONMENT
-  LOCALFOLD_HOME                  where the weights are kept (the checkout by default)
+WEIGHTS
+  --weights-dir=<dir>             where the weights are kept, and downloaded to when absent (default below)
 
 A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/af2/README.md.
 )";
@@ -186,8 +186,8 @@ OUTPUT (for --out=fold.pdb)
   fold_confidences.json           per-atom pLDDT, PAE, contact probabilities (AlphaFold 3's layout)
   fold_summary_confidences.json   pTM, ipTM, mean pLDDT
 
-ENVIRONMENT
-  LOCALFOLD_HOME                  where the weights are kept (the checkout by default)
+WEIGHTS
+  --weights-dir=<dir>             where the weights are kept, and downloaded to when absent (default below)
 
 A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/esmfold2/README.md.
 )";
@@ -196,7 +196,7 @@ static void usage(const std::string& port, bool full) {
   const char* help = port == "af3" ? AF3_HELP : port == "af2" ? AF2_HELP : EF2_HELP;
   if (full) {
     fputs(help, stdout);
-    printf("\nThe weights for this binary live under %s.\n", fetch::home().c_str());
+    printf("\nWithout --weights-dir the weights live under %s.\n", fetch::home().c_str());
     return;
   }
   // the short form: the help's first lines, up to the examples
@@ -206,12 +206,17 @@ static void usage(const std::string& port, bool full) {
   fprintf(stderr, "%s\n\nrun %s --help for every option\n", h.substr(0, cut).c_str(), port.c_str());
 }
 
+// the model's weights, by its --model name (fetch.h's one table), refused when it is another port's
+static fetch::ModelWeights weightsFor(const Run& run, const std::string& port) {
+  fetch::ModelWeights w = fetch::model(run.home, run.model);
+  if (w.port != port) throw std::runtime_error(run.model + " is folded by cuda/" + w.port + "/" + w.port + ", not " + port);
+  return w;
+}
+
 static int af3(Run& run, int (*fold)(int, char**), const char* argv0) {
-  static const std::set<std::string> MODELS = {"af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1"};
-  if (!MODELS.count(run.model))
-    throw std::runtime_error("no model " + run.model + " (af3, openbind0, opendde, boltz2, protenix2, intellifold2, rosettafold3, chai1)");
-  std::vector<std::string> foldArgs = {"--bundle=" + fetch::blob(run.home, run.model), "--family=" + run.model};
-  if (run.model == "chai1") foldArgs.push_back("--esm-bundle=" + fetch::blob(run.home, "esm2"));
+  fetch::ModelWeights w = weightsFor(run, "af3");
+  std::vector<std::string> foldArgs = {"--bundle=" + w.dirs[0], "--family=" + run.model};
+  if (w.dirs.size() > 1) foldArgs.push_back("--esm-bundle=" + w.dirs[1]);       // (chai-1's ESM2 3B)
   foldArgs.push_back("--fold");
   foldArgs.push_back("--fast");
   for (auto& f : run.foldFlags()) foldArgs.push_back(f);
@@ -220,15 +225,11 @@ static int af3(Run& run, int (*fold)(int, char**), const char* argv0) {
 }
 
 static int af2(Run& run, int (*fold)(int, char**), const char* argv0) {
-  const std::string& m = run.model;
-  bool monomer = m.size() == 11 && m.compare(0, 6, "model_") == 0 && m.compare(7, 4, "_ptm") == 0;
-  bool multimer = m.size() == 19 && m.compare(0, 6, "model_") == 0 && m.compare(7, 12, "_multimer_v3") == 0;
-  if ((!monomer && !multimer) || m[6] < '1' || m[6] > '5')
-    throw std::runtime_error("no published bundle for " + m + " (model_1_ptm ... model_5_ptm, model_1_multimer_v3 ... model_5_multimer_v3)");
-  std::string family = monomer ? "monomer" : "multimer", bundle = fetch::bundle(run.home, family);
+  fetch::ModelWeights w = weightsFor(run, "af2");
+  std::string bundle = w.dirs[0];
   std::vector<std::string> foldArgs = {"--bundle=" + bundle, "--fast"};
   // models 2-5 of each are published as deltas on model 1, read as the page reads them
-  if (m[6] != '1') foldArgs.push_back("--delta=" + fetch::bundle(run.home, family + "-" + m[6]));
+  if (w.dirs.size() > 1) foldArgs.push_back("--delta=" + w.dirs[1]);
   std::string warm = af2WarmShape(run.args);
   if (!warm.empty()) foldArgs.push_back("--warm=" + warm);
   for (auto& f : run.foldFlags({"recycles"})) if (flagName(f) != "seed") foldArgs.push_back(f);   // (--seed: the alignment's)
@@ -237,16 +238,8 @@ static int af2(Run& run, int (*fold)(int, char**), const char* argv0) {
 }
 
 static int esmfold2(Run& run, int (*fold)(int, char**), const char* argv0) {
-  std::string trunk, tower;
-  if (run.model == "esmfold2-fast-600m") { trunk = fetch::bundle(run.home, "ef2-fast-600m"); tower = fetch::bundle(run.home, "esmc"); }
-  else if (run.model == "esmfold2-fast-300m") { trunk = fetch::bundle(run.home, "ef2-fast-300m"); tower = fetch::bundle(run.home, "esmc-300m"); }
-  else if (run.model == "esmfold2" || run.model == "esmfold2-fast") {       // the released models: local exports
-    trunk = run.home + "/model-" + run.model + "-f32"; tower = run.home + "/model-esmc-6b-int8";
-    for (auto& b : {trunk, tower})
-      if (!fetch::exists(b + "/manifest.json")) throw std::runtime_error("no " + b + ": export it first (cuda/esmfold2/README.md, \"The released models\")");
-  } else {
-    throw std::runtime_error("--model=" + run.model + ": esmfold2-fast-600m, esmfold2-fast-300m, esmfold2-fast or esmfold2");
-  }
+  fetch::ModelWeights w = weightsFor(run, "esmfold2");
+  std::string trunk = w.dirs[0], tower = w.dirs[1];
   // (the experimental tier zeroes the alignment's features and has no MSA encoder: an alignment there is read by
   // nothing, so it is refused rather than dropped; the released esmfold2-fast reads its profile, esmfold2 also encodes it)
   if (!run.args.option("a3m").empty() && (run.model == "esmfold2-fast-600m" || run.model == "esmfold2-fast-300m"))

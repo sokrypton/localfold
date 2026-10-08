@@ -10,7 +10,7 @@ featuriser binary's directory. Each case runs both ways - `cuda/featurise/<port>
 standalone mode drops or misroutes (an input flag reaching the fold, af2's --recycles reaching only one of the
 two) is a difference here rather than a quietly different fold. Beside them: refusals come back as the page's
 sentence with a nonzero status (an input flag the port does not read is one of them, never dropped), `--frames=` streams what the page draws, a weights home is honoured
-(LOCALFOLD_HOME), and with --network a searched alignment is kept as <out>.a3m.
+(--weights-dir), and with --network a searched alignment is kept as <out>.a3m.
 
 Needs the GPU and the weights the worker uses (fetched on first use).
 """
@@ -112,21 +112,22 @@ def main():
         failed += not ok
         print(f"{'ok  ' if ok else 'FAIL'} --frames: {len(names)} files ({', '.join(names[:3])}, ...)")
 
-        # a weights home: LOCALFOLD_HOME names where the weights live (here: links to this checkout's)
-        alt = os.path.join(work, "home")
+        standalone("esmfold2", [f"--sequence={S6}", "--model=esmfold2-fast-300m"], f"{work}/standalone-300m.pdb")
+        # --weights-dir names where the weights live (here: links to this checkout's)
+        alt = os.path.join(work, "weights")
         os.makedirs(alt)
         for d in ("model-ef2-fast-300m-int5", "model-esmc-300m-int3"):
             os.symlink(os.path.join(REPO, d), os.path.join(alt, d))
         r = run([os.path.join(CUDA, "esmfold2", "esmfold2"), f"--sequence={S6}", "--model=esmfold2-fast-300m",
-                 f"--out={work}/h.pdb"], dict(os.environ, LOCALFOLD_HOME=alt))
-        ok = r.returncode == 0 and os.path.exists(f"{work}/h.pdb")
+                 f"--weights-dir={alt}", f"--out={work}/h.pdb"])
+        ok = r.returncode == 0 and open(f"{work}/h.pdb", "rb").read() == open(f"{work}/standalone-300m.pdb", "rb").read()
         failed += not ok
-        print(f"{'ok  ' if ok else 'FAIL'} LOCALFOLD_HOME: {'folded from ' + alt if ok else (r.stdout + r.stderr)[-300:]}")
-        r = run([os.path.join(CUDA, "esmfold2", "esmfold2"), f"--sequence={S6}", f"--out={work}/h2.pdb"],
-                dict(os.environ, LOCALFOLD_HOME="/nonexistent/localfold-home"))
+        print(f"{'ok  ' if ok else 'FAIL'} --weights-dir: {'the same fold from ' + alt if ok else (r.stdout + r.stderr)[-300:]}")
+        r = run([os.path.join(CUDA, "esmfold2", "esmfold2"), f"--sequence={S6}", "--weights-dir=/nonexistent/localfold-weights",
+                 f"--out={work}/h2.pdb"])
         ok = r.returncode != 0 and "Error: " in r.stdout + r.stderr
         failed += not ok
-        print(f"{'ok  ' if ok else 'FAIL'} LOCALFOLD_HOME unwritable: refused, not folded from elsewhere")
+        print(f"{'ok  ' if ok else 'FAIL'} --weights-dir unwritable: refused, not folded from elsewhere")
 
         if network:
             out = os.path.join(work, "searched.pdb")

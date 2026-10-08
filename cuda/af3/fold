@@ -7,7 +7,7 @@
 #   cuda/af3/fold 6mrr.pdb --model=protenix2 --sequence=<SEQ>
 #
 # --model=<name> picks the model (default af3): af3-any-model's own published int8 blob (af3am-<name>/, fetched
-# once by cuda/featurise/fetch-weights --af3-any-model; chai1 with ESM2 3B's beside it), read through its weight walk
+# once by cuda/featurise/fetch-weights; chai1 with ESM2 3B's beside it), read through its weight walk
 # (cuda/featurise/af3_weights.h). A single fold is the standalone binary, `cuda/af3/af3 --out=<out.pdb> <flags>`
 # (cuda/featurise/standalone.h: the weights fetched, the input featurised in the same process).
 # AlphaFold 3's are Google DeepMind's, for academic non-commercial use: the first fetch asks you to accept its
@@ -45,10 +45,9 @@ if [ -z "$batch" ] && [ -z "$serve" ] && ! { [ -f "/tmp/af3-serve-$model-$(id -u
   [ -x "$here/af3" ] || bash "$repo/cuda/build.sh" af3 >&2
   exec "$here/af3" --out="$out" --model="$model" "${inputs[@]}" "${foldflags[@]}"
 fi
-ls "$repo/af3am-$model"/*.bin.zst >/dev/null 2>&1 || "$repo/cuda/featurise/fetch-weights" --af3-any-model "$model" >&2 || exit 1
+"$repo/cuda/featurise/fetch-weights" "$model" >/dev/null || exit 1      # (chai1: ESM2 3B too; a no-op once here)
 wflags=(--bundle="$repo/af3am-$model" --family="$model"); dialect=(--family="$model")
 if [ "$model" = chai1 ]; then
-  ls "$repo/af3am-esm2"/*.bin.zst >/dev/null 2>&1 || "$repo/cuda/featurise/fetch-weights" --af3-any-model esm2 >&2 || exit 1
   wflags+=(--esm-bundle="$repo/af3am-esm2")
 fi
 [ -x "$here/af3" ] || bash "$repo/cuda/build.sh" af3 >&2

@@ -1,10 +1,13 @@
 // The published weights, fetched natively - what cuda/fetch_bundles.py did, so a fold needs no Python either.
 //
+//   lf::fetch::model(root, "boltz2")    what a model's binary reads, by the --model name: the one table of them
+//                                       (below), every port and cuda/worker.py going through it
 //   lf::fetch::bundle(root, "af3")      a registry bundle (shared/bundles/manifests/index.js, generated into
 //                                       bundles.inc): its manifest.json and every shard it names, into root/<directory>
 //   lf::fetch::blob(root, "boltz2")     af3-any-model's own int8 blob (huggingface.co/sokrypton/af3-any-model, pinned
 //                                       below) into root/af3am-<name>/ - the weights cuda/af3 folds the AF3 lineage with
 //
+// `root` is the weights directory: a command's --weights-dir, else home() below.
 // Each prints "  <name>: <file> (k/n)" as a piece lands and "<name> -> <dir>" when whole (cuda/worker.py turns the
 // first into the page's download status). 🔴 THE MANIFEST LAST: a bundle is "here" when its manifest.json is, so
 // it is written only once every shard it names is, and every file lands through a `.part` renamed when whole - an
@@ -72,11 +75,10 @@ inline void makeDirs(const std::string& dir) {
   if (system(("mkdir -p " + search::shellQuote(dir)).c_str()) != 0) throw std::runtime_error("cannot create " + dir);
 }
 
-// Where the weights live: LOCALFOLD_HOME when set; else the checkout this binary was built in (it sits at
-// <checkout>/cuda/<port>/<port> or <checkout>/cuda/featurise/<tool>), where every wrapper and the worker keep them;
-// else ~/.cache/localfold for a binary copied out of its checkout
+// Where the weights live by default (a command's --weights-dir names another): the checkout this binary was built in
+// (it sits at <checkout>/cuda/<port>/<port> or <checkout>/cuda/featurise/<tool>), where every wrapper and the worker
+// keep them; ~/.cache/localfold for a binary copied out of its checkout
 inline std::string home() {
-  if (const char* h = std::getenv("LOCALFOLD_HOME"); h && *h) return h;
   char self[4096];
   ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
   if (n > 0) {
@@ -87,7 +89,7 @@ inline std::string home() {
       return cuda.substr(0, cuda.size() - 5);
   }
   const char* user = std::getenv("HOME");
-  if (!user || !*user) throw std::runtime_error("no LOCALFOLD_HOME and no HOME to keep the weights under");
+  if (!user || !*user) throw std::runtime_error("no HOME to keep the weights under: name a directory with --weights-dir");
   return std::string(user) + "/.cache/localfold";
 }
 
@@ -230,6 +232,45 @@ inline std::string bundle(const std::string& root, const std::string& key) {
   if (rename((manifest + ".fetching").c_str(), manifest.c_str()) != 0) throw std::runtime_error("cannot rename " + manifest);
   printf("%s -> %s\n", key.c_str(), dest.c_str()); fflush(stdout);
   return dest;
+}
+
+// ---------------------------------------------------------------- by model: what each binary reads
+// The AF3 lineage folds from af3-any-model's int8 blobs - not the registry's int5 bundles of the same names, which
+// are the website's - chai-1 with ESM2 3B beside its own; AlphaFold 2's model 1 of each whole and models 2-5 as
+// their deltas on it; ESMFold2 a trunk and its ESM-C tower; the released ESMFold2 checkpoints only as local exports.
+struct ModelWeights { std::string port; std::vector<std::string> dirs; };
+inline const std::vector<std::string>& af3Models() {
+  static const std::vector<std::string> m = {"af3", "boltz2", "chai1", "protenix2", "intellifold2", "rosettafold3", "opendde", "openbind0"};
+  return m;
+}
+inline std::string modelNames() {
+  return "af3, boltz2, chai1, protenix2, intellifold2, rosettafold3, opendde, openbind0 (af3); model_1_ptm ... model_5_ptm, "
+         "model_1_multimer_v3 ... model_5_multimer_v3 (af2); esmfold2-fast-600m, esmfold2-fast-300m, esmfold2-fast, esmfold2 (esmfold2)";
+}
+inline ModelWeights model(const std::string& root, const std::string& name) {
+  for (auto& m : af3Models())
+    if (m == name) {
+      ModelWeights w{"af3", {blob(root, name)}};
+      if (name == "chai1") w.dirs.push_back(blob(root, "esm2"));
+      return w;
+    }
+  bool monomer = name.size() == 11 && name.compare(0, 6, "model_") == 0 && name.compare(7, 4, "_ptm") == 0;
+  bool multimer = name.size() == 19 && name.compare(0, 6, "model_") == 0 && name.compare(7, 12, "_multimer_v3") == 0;
+  if ((monomer || multimer) && name[6] >= '1' && name[6] <= '5') {
+    std::string family = monomer ? "monomer" : "multimer";
+    ModelWeights w{"af2", {bundle(root, family)}};
+    if (name[6] != '1') w.dirs.push_back(bundle(root, family + "-" + name[6]));
+    return w;
+  }
+  if (name == "esmfold2-fast-600m") return {"esmfold2", {bundle(root, "ef2-fast-600m"), bundle(root, "esmc")}};
+  if (name == "esmfold2-fast-300m") return {"esmfold2", {bundle(root, "ef2-fast-300m"), bundle(root, "esmc-300m")}};
+  if (name == "esmfold2" || name == "esmfold2-fast") {       // biohub's released checkpoints: exported locally
+    ModelWeights w{"esmfold2", {root + "/model-" + name + "-f32", root + "/model-esmc-6b-int8"}};
+    for (auto& d : w.dirs)
+      if (!exists(d + "/manifest.json")) throw std::runtime_error("no " + d + ": export it first (cuda/esmfold2/README.md, \"The released models\")");
+    return w;
+  }
+  throw std::runtime_error("no model " + name + ": " + modelNames());
 }
 
 }  // namespace lf::fetch

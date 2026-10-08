@@ -6,7 +6,8 @@
 //
 // Each port's main hands a command whose first argument is a flag here (its old first argument, a featurised
 // input directory, is still taken as it was - the resident server and the tests use it). This:
-//   1. fetches the model's published weights if they are not on disk (fetch.h: the page's own bytes),
+//   1. fetches the model's published weights if they are not on disk (fetch.h: the page's own bytes) - into
+//      --weights-dir=<dir> when given, else the checkout the binary was built in (~/.cache/localfold out of one),
 //   2. featurises the input IN THIS PROCESS on a thread - the page's featuriser, byte for byte (the same code as
 //      cuda/featurise/<port>-featurise, which tools/check-native-featuriser.py holds to the JavaScript) - into a
 //      temporary directory, while the port starts CUDA and puts the weights on the device (--wait-input),
@@ -95,15 +96,16 @@ struct Run {
   explicit Run(int argc, char** argv, const std::string& defaultModel) : list(argv + 1, argv + argc), args(list) {
     model = args.option("model", defaultModel);
     out = args.option("out", "fold.pdb");
-    home = fetch::home();
+    home = args.option("weights-dir");          // where the weights are (fetched into it when absent)
+    if (home.empty()) home = fetch::home();
   }
-  // the flags for the fold: the command's own, minus the featuriser's and this file's (--model; and the shared
+  // the flags for the fold: the command's own, minus the featuriser's and this file's (--model, --weights-dir; and the shared
   // ones the caller names)
   std::vector<std::string> foldFlags(const std::set<std::string>& alsoInput = {}) const {
     std::vector<std::string> f;
     for (auto& a : list) {
       std::string n = flagName(a);
-      if (n == "model" || (inputFlags().count(n) && !alsoInput.count(n))) continue;
+      if (n == "model" || n == "weights-dir" || (inputFlags().count(n) && !alsoInput.count(n))) continue;
       f.push_back(a);
     }
     return f;

@@ -13,7 +13,7 @@
 // by side into one [in, 3C] so the attention's projection stays one GEMM.
 // Loaded under `e/` (Model::loadBundle(dir, "e", nullptr, "", "esm2/blocks/")).
 #pragma once
-#include "common.cuh"
+#include "../af3/src/common.cuh"
 
 namespace esm2 {
 // a resident [in, out] int8 matrix (a blob's: a float32 scale per channel of `out` and per block of rows) expanded

@@ -4,9 +4,8 @@
 //   af2-featurise <out dir> (--bundle=<dir> | --weights=<dir>) (--job=<job.json> | --sequence=...)   (af2_export.h)
 //   esmfold2-featurise <out dir> (--job=<job.json> | --sequence=...)                              (esmfold2_export.h)
 //   resolve-templates <request.json> <out dir>                                                   (below)
-//   fetch-weights <name>...                                  the published weights (fetch.h): a registry bundle
-//                                                            (af3, monomer, multimer-3, ef2-fast-600m, esmc, ...)
-//                                                            or, with --af3-any-model, af3-any-model's int8 blob
+//   fetch-weights [--weights-dir=<dir>] <model>...          what each model's binary reads (fetch.h), by its --model
+//                                                            name (boltz2, model_3_ptm, esmfold2-fast-600m, ...)
 //   chem-probe < smiles.txt         each SMILES's component, one line, as tools/chem-probe.mjs prints the page's
 //
 // each the JavaScript it replaces (cuda/af3/export-model.mjs --no-weights, cuda/af2/export_input.mjs,
@@ -205,16 +204,19 @@ static int chemMain() {
 }
 
 static int fetchMain(int argc, char** argv) {
-  bool blobs = false;
+  std::string root;
   std::vector<std::string> names;
   for (int i = 1; i < argc; ++i) {
-    if (!strcmp(argv[i], "--af3-any-model")) blobs = true;
+    if (!strncmp(argv[i], "--weights-dir=", 14)) root = argv[i] + 14;
     else names.push_back(argv[i]);
   }
-  if (names.empty()) { fprintf(stderr, "usage: fetch-weights [--af3-any-model] <name>...\n"); return 2; }
+  if (names.empty()) {
+    fprintf(stderr, "usage: fetch-weights [--weights-dir=<dir>] <model>...\n  models: %s\n", lf::fetch::modelNames().c_str());
+    return 2;
+  }
   try {
-    std::string root = lf::fetch::home();
-    for (auto& n : names) blobs ? lf::fetch::blob(root, n) : lf::fetch::bundle(root, n);
+    if (root.empty()) root = lf::fetch::home();
+    for (auto& n : names) for (auto& d : lf::fetch::model(root, n).dirs) printf("%s: %s\n", n.c_str(), d.c_str());
   } catch (const std::exception& e) {
     fprintf(stderr, "Error: %s\n", e.what());
     return 1;

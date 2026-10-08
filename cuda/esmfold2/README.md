@@ -94,9 +94,9 @@ step (step SSSS of NNNN). Files land complete, so a viewer can poll the director
 ### Weights
 
 Downloaded once into `model-esmfold2-int5/` and `model-esmc-600m-int3/` (300M: `model-ef2-fast-300m-int5/`,
-`model-esmc-300m-int3/`) in the checkout the binary was built in, or under `LOCALFOLD_HOME` when it is set
-(`~/.cache/localfold` for a binary copied out of its checkout). `cuda/featurise/fetch-weights ef2-fast-600m esmc`
-fetches without folding.
+`model-esmc-300m-int3/`) in the directory `--weights-dir=<dir>` names, else in the checkout the binary was built in
+(`~/.cache/localfold` for a binary copied out of its checkout). `cuda/featurise/fetch-weights esmfold2-fast-600m`
+fetches without folding (it takes `--weights-dir` too).
 
 ### Limits and errors
 

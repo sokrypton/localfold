@@ -5,7 +5,7 @@
 //   ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]
 //   ef2 <input dir> --fold-bundle=<dir> --esmc-bundle=<dir> ...   (the page's bundles, read as they are)
 #include "../../featurise/standalone_api.h"
-#include "esmc.cuh"
+#include "shim.cuh"         // (ESM-C's tower is cuda/plm/esmc.cuh)
 #include "atoms.cuh"
 #include "trunk.cuh"
 #include "msa.cuh"

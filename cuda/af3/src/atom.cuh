@@ -3,7 +3,7 @@
 // Transcribed from src/af3/diffusion/{atom-conditioning,atom-encoder}-reference.js. f32.
 #pragma once
 #include "pairtrack.cuh"
-#include "esm2.cuh"
+#include "../../plm/esm2.cuh"
 
 // The adaptive LayerNorm's two forms: AlphaFold 3's sigmoid(scale) * LN(x; eps 1e-5) + shift, and chai-1's
 // (scale + 1) * LN(x; eps 0.1) + shift (af3-any-model diffusion_transformer.py's chai adaLN: the conditioning is
@@ -1162,7 +1162,7 @@ inline float* buildTargetFeat() {
     if (M.has("batch.esmEmbeddings")) {                       // (a dump's, computed by the reference)
       esm = Fdev("batch.esmEmbeddings"); E = (int)(M.len("batch.esmEmbeddings") / tokens);
     } else {
-      // ESM2 3B here (src/esm2.cuh): each protein chain alone, its rows gathered onto the tokens, zeros elsewhere
+      // ESM2 3B here (cuda/plm/esm2.cuh): each protein chain alone, its rows gathered onto the tokens, zeros elsewhere
       if (!M.has("esm.ids")) { fprintf(stderr, "chai-1 reads ESM2 embeddings: the input has neither them nor esm.ids\n"); exit(1); }
       if (!M.has("e/esm2/embed/weights")) { fprintf(stderr, "chai-1 reads ESM2: give af3 --esm-bundle=<a directory holding af3-any-model's lm/esm2.bin.zst>\n"); exit(1); }
       esm = esmEmbeddings(tokens, E);

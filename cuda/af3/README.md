@@ -119,10 +119,9 @@ can poll the directory.
 
 ### Weights
 
-Downloaded once into `af3am-<model>/` in the checkout the binary was built in, or under `LOCALFOLD_HOME` when it
-is set (`~/.cache/localfold` for a binary copied out of its checkout). The download is locked, so two folds
-asking at once share one, and an interrupted one leaves nothing that reads as finished. `cuda/featurise/fetch-weights --af3-any-model <model>`
-fetches without folding.
+Downloaded once into `af3am-<model>/` in the directory `--weights-dir=<dir>` names, else in the checkout the binary was built in (`~/.cache/localfold` for a binary copied out of its checkout). The download is locked, so two folds
+asking at once share one, and an interrupted one leaves nothing that reads as finished. `cuda/featurise/fetch-weights <model>`
+fetches without folding (it takes `--weights-dir` too).
 
 ### Limits and errors
 
@@ -156,7 +155,7 @@ Both send the sequences to api.colabfold.com, so they are flags, never defaults.
 
 `fold` builds `af3` if it is missing, reads the model's weights as published - **af3-any-model's
 own int8 blob** for all eight (`af3am-<model>/`, fetched once by `cuda/featurise/fetch-weights
---af3-any-model` from huggingface.co/sokrypton/af3-any-model, the files its JAX backend reads), with
+<model>` from huggingface.co/sokrypton/af3-any-model, the files its JAX backend reads), with
 its codes decoded on the device and a weight walk naming each tensor's slice of it (below).
 **AlphaFold 3's are Google DeepMind's parameters, hosted for academic, non-commercial use under its
 [AF3 terms](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)**: the

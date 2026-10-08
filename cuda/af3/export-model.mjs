@@ -287,7 +287,7 @@ if (dialect?.chaiTokenEmbedding === true) {
   delete batch.bondMatrix;
 }
 add("batch", batch);
-// chai1's tokens read ESM2 3B, which native runs (src/esm2.cuh, --esm-bundle): each protein chain's token ids and
+// chai1's tokens read ESM2 3B, which native runs (cuda/plm/esm2.cuh, --esm-bundle): each protein chain's token ids and
 // every token's row (shared/af3/featurise/esm2-input.js) - unless the batch already carries the embeddings (a dump's)
 if (dialect?.chaiTokenEmbedding === true && batch.esmEmbeddings === undefined) {
   const { esm2Inputs } = await import(`${repo}/shared/af3/featurise/esm2-input.js`);
