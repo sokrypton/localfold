@@ -19,12 +19,12 @@ static std::function<Args(const std::string&)> with(const std::vector<std::strin
 
 // what each port takes: the short form with no arguments, the whole reference with --help (cuda/<port>/README.md,
 // "Guide", says the same at more length)
-static const char* AF3_HELP = R"(af3 - AlphaFold 3 and the seven models of its lineage, natively: a job in, a structure out.
+static const char* AF3_HELP = R"(localfold-af3 - AlphaFold 3 and the seven models of its lineage, natively: a job in, a structure out.
 
-usage: af3 (--job=<job.json> | --sequence=<SEQ>[:<SEQ>...]) [--model=<model>] [--out=<path>] [options]
+usage: localfold-af3 (--job=<job.json> | --sequence=<SEQ>[:<SEQ>...]) [--model=<model>] [--out=<path>] [options]
 
-  af3 --job=kras.json --out=kras.pdb
-  af3 --sequence=MKV...:GSH... --model=boltz2 --search --samples=5 --out=complex.cif
+  localfold-af3 --job=kras.json --out=kras.pdb
+  localfold-af3 --sequence=MKV...:GSH... --model=boltz2 --search --samples=5 --out=complex.cif
 
 The weights are downloaded the first time, the input featurised in this process while the GPU starts, and the
 fold writes the structure and its confidences.
@@ -86,19 +86,19 @@ WEIGHTS
 A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/af3/README.md.
 )";
 
-static const char* AF2_HELP = R"(af2 - AlphaFold 2, monomer and multimer, natively: a job in, a structure out.
+static const char* AF2_HELP = R"(localfold-af2 - AlphaFold 2, monomer and multimer, natively: a job in, a structure out.
 
-usage: af2 (--job=<job.json> | --sequence=<SEQ>[:<SEQ>...]) [--model=<model>] [--out=<path>] [options]
+usage: localfold-af2 (--job=<job.json> | --sequence=<SEQ>[:<SEQ>...]) [--model=<model>] [--out=<path>] [options]
 
-  af2 --sequence=MKV... --search --out=fold.pdb
-  af2 --sequence=<A>:<B> --model=model_1_multimer_v3 --search --out=complex.pdb
+  localfold-af2 --sequence=MKV... --search --out=fold.pdb
+  localfold-af2 --sequence=<A>:<B> --model=model_1_multimer_v3 --search --out=complex.pdb
 
 The weights are downloaded the first time, the input featurised in this process while the GPU starts, and the
 fold prints a line per pass (pLDDT, pTM, ipTM, how far the structure moved) and writes the structure and its
 confidences.
 
 PROTEIN CHAINS ONLY: no ligands, nucleic acids, modified residues or covalent bonds - a job or flag carrying
-one is refused, not folded without it (cuda/af3 and cuda/esmfold2 take them).
+one is refused, not folded without it (localfold-af3 and localfold-ef2 take them).
 
 MODELS (--model=)
   model_1_ptm (default), model_2_ptm      the monomer, with a template embedder
@@ -145,22 +145,22 @@ WEIGHTS
 A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/af2/README.md.
 )";
 
-static const char* EF2_HELP = R"(esmfold2 - ESMFold2, natively: a sequence (or job) in, a structure out, no alignment needed.
+static const char* EF2_HELP = R"(localfold-ef2 - ESMFold2, natively: a sequence (or job) in, a structure out, no alignment needed.
 
-usage: esmfold2 (--job=<job.json> | --sequence=<SEQ>[:<SEQ>...]) [--model=<model>] [--out=<path>] [options]
+usage: localfold-ef2 (--job=<job.json> | --sequence=<SEQ>[:<SEQ>...]) [--model=<model>] [--out=<path>] [options]
 
-  esmfold2 --sequence=MKV... --out=fold.pdb
-  esmfold2 --job=calmodulin_4calcium.json --model=esmfold2-fast-300m --out=cam.pdb
+  localfold-ef2 --sequence=MKV... --out=fold.pdb
+  localfold-ef2 --job=calmodulin_4calcium.json --model=ef2-fast-300m --out=cam.pdb
 
 Its language model stands in for the alignment, so nothing leaves the machine. The weights are downloaded the
 first time, the input featurised in this process while the GPU starts, and the fold writes the structure and
 its confidences.
 
 MODELS (--model=)
-  esmfold2-fast-600m   the website's ESMFold2 (default): ESM-C 600M, 129 MB + 224 MB
-  esmfold2-fast-300m   its 300M sibling, 129 MB + 130 MB
-  esmfold2-fast, esmfold2
-                       the released checkpoints on ESM-C 6B, from local exports only (cuda/esmfold2/README.md)
+  ef2-fast-600m        the website's ESMFold2 (default): ESM-C 600M, 129 MB + 224 MB
+  ef2-fast-300m        its 300M sibling, 129 MB + 130 MB
+  ef2-fast, ef2
+                       the released checkpoints on ESM-C 6B, from local exports only (cuda/ef2/README.md)
 
 INPUT
   --job=<job.json>         an AlphaFold 3 job file: proteins, DNA, RNA, ligands (CCD or SMILES), ions, modified
@@ -170,7 +170,7 @@ INPUT
   --ligands=GOL,ATP        ligands by CCD code
   --smiles='CCO|c1ccccc1'  ligands by SMILES, '|'-separated
   --modify=SEP@3[@<chain>] modified residues: CODE@position (1-based), comma-separated
-  --a3m=<a.a3m>[,<b.a3m>]  the released esmfold2-fast and esmfold2 only; the fast 600M/300M read no alignment
+  --a3m=<a.a3m>[,<b.a3m>]  the released ef2-fast and ef2 only; the fast 600M/300M read no alignment
   (no templates)
 
 FOLD
@@ -189,7 +189,7 @@ OUTPUT (for --out=fold.pdb)
 WEIGHTS
   --weights-dir=<dir>             where the weights are kept, and downloaded to when absent (default below)
 
-A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/esmfold2/README.md.
+A refusal is one line, 'Error: ...', and a nonzero exit. More: cuda/ef2/README.md.
 )";
 
 static void usage(const std::string& port, bool full) {
@@ -203,13 +203,13 @@ static void usage(const std::string& port, bool full) {
   std::string h = help;
   size_t cut = h.find("\n\n", h.find("usage:"));
   cut = h.find("\n\n", cut + 2);
-  fprintf(stderr, "%s\n\nrun %s --help for every option\n", h.substr(0, cut).c_str(), port.c_str());
+  fprintf(stderr, "%s\n\nrun localfold-%s --help for every option\n", h.substr(0, cut).c_str(), port.c_str());
 }
 
 // the model's weights, by its --model name (fetch.h's one table), refused when it is another port's
 static fetch::ModelWeights weightsFor(const Run& run, const std::string& port) {
   fetch::ModelWeights w = fetch::model(run.home, run.model);
-  if (w.port != port) throw std::runtime_error(run.model + " is folded by cuda/" + w.port + "/" + w.port + ", not " + port);
+  if (w.port != port) throw std::runtime_error(run.model + " is folded by localfold-" + w.port + ", not localfold-" + port);
   return w;
 }
 
@@ -237,15 +237,15 @@ static int af2(Run& run, int (*fold)(int, char**), const char* argv0) {
   return featuriseAndFold(run, [args](const std::string& dir) { featuriseAf2Into(args(dir), dir); }, foldArgs, fold, argv0);
 }
 
-static int esmfold2(Run& run, int (*fold)(int, char**), const char* argv0) {
-  fetch::ModelWeights w = weightsFor(run, "esmfold2");
+static int ef2(Run& run, int (*fold)(int, char**), const char* argv0) {
+  fetch::ModelWeights w = weightsFor(run, "ef2");
   std::string trunk = w.dirs[0], tower = w.dirs[1];
   // (the experimental tier zeroes the alignment's features and has no MSA encoder: an alignment there is read by
-  // nothing, so it is refused rather than dropped; the released esmfold2-fast reads its profile, esmfold2 also encodes it)
-  if (!run.args.option("a3m").empty() && (run.model == "esmfold2-fast-600m" || run.model == "esmfold2-fast-300m"))
-    throw std::runtime_error(run.model + " folds from the sequence alone (it reads no alignment): --a3m is for the released esmfold2-fast and esmfold2");
+  // nothing, so it is refused rather than dropped; the released ef2-fast reads its profile, ef2 also encodes it)
+  if (!run.args.option("a3m").empty() && (run.model == "ef2-fast-600m" || run.model == "ef2-fast-300m"))
+    throw std::runtime_error(run.model + " folds from the sequence alone (it reads no alignment): --a3m is for the released ef2-fast and ef2");
   std::vector<std::string> foldArgs = {"--fold-bundle=" + trunk, "--esmc-bundle=" + tower, "--fast"};
-  std::string warm = esmfold2WarmShape(run.args);
+  std::string warm = ef2WarmShape(run.args);
   if (!warm.empty()) foldArgs.push_back("--warm=" + warm);
   for (auto& f : run.foldFlags()) foldArgs.push_back(f);
   // 🔴 THE PAGE'S FLOOR FOR PER-ATOM TOKENS: a ligand or a modified residue is torn at the checkpoint's 15 scheduled
@@ -279,14 +279,14 @@ int main(const char* port, int argc, char** argv, int (*fold)(int, char**)) {
     if (argc < 2) { usage(name, false); return 1; }
     for (int i = 1; i < argc; ++i)
       if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(name, true); return 0; }
-    Run run(argc, argv, name == "af3" ? "af3" : name == "af2" ? "model_1_ptm" : "esmfold2-fast-600m");
+    Run run(argc, argv, name == "af3" ? "af3" : name == "af2" ? "model_1_ptm" : "ef2-fast-600m");
     for (auto& a : run.list) {
       std::string n = flagName(a);
       if (inputFlags().count(n) && !readsInput(name).count(n)) throw std::runtime_error(name + " takes no --" + n);
     }
     if (name == "af3") return af3(run, fold, argv[0]);
     if (name == "af2") return af2(run, fold, argv[0]);
-    return esmfold2(run, fold, argv[0]);
+    return ef2(run, fold, argv[0]);
   } catch (const std::exception& e) {
     fprintf(stderr, "Error: %s\n", e.what());
     return 1;

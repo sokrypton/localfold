@@ -2,14 +2,14 @@
 //
 //   af3-featurise <out dir> --no-weights --family=<model> (--job=<job.json> | --sequence=...)    (af3_export.h)
 //   af2-featurise <out dir> (--bundle=<dir> | --weights=<dir>) (--job=<job.json> | --sequence=...)   (af2_export.h)
-//   esmfold2-featurise <out dir> (--job=<job.json> | --sequence=...)                              (esmfold2_export.h)
+//   ef2-featurise <out dir> (--job=<job.json> | --sequence=...)                              (esmfold2_export.h)
 //   resolve-templates <request.json> <out dir>                                                   (below)
 //   fetch-weights [--weights-dir=<dir>] <model>...          what each model's binary reads (fetch.h), by its --model
 //                                                            name (boltz2, model_3_ptm, esmfold2-fast-600m, ...)
 //   chem-probe < smiles.txt         each SMILES's component, one line, as tools/chem-probe.mjs prints the page's
 //
 // each the JavaScript it replaces (cuda/af3/export-model.mjs --no-weights, cuda/af2/export_input.mjs,
-// cuda/esmfold2/export_input.mjs, cuda/resolve_templates.mjs), byte for byte - tools/check-native-featuriser.py.
+// cuda/ef2/export_input.mjs, cuda/resolve_templates.mjs), byte for byte - tools/check-native-featuriser.py.
 // One binary because the four share almost every header: compiled four times they were ~60 s of CPU here and twice
 // that on a two-core Colab runtime, beside the ports' nvcc.
 //
@@ -231,10 +231,10 @@ int main(int argc, char** argv) {
   if (self == "featurise" && argc > 1) { self = argv[1]; --argc; ++argv; }
   if (self == "af3-featurise") return af3Main(argc, argv);
   if (self == "af2-featurise") return af2Main(argc, argv);
-  if (self == "esmfold2-featurise") return esmfold2Main(argc, argv);
+  if (self == "ef2-featurise") return esmfold2Main(argc, argv);
   if (self == "resolve-templates") return resolveMain(argc, argv);
   if (self == "chem-probe") return chemMain();
   if (self == "fetch-weights") return fetchMain(argc, argv);
-  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, esmfold2-featurise, resolve-templates or fetch-weights (not %s)\n", self.c_str());
+  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, ef2-featurise, resolve-templates or fetch-weights (not %s)\n", self.c_str());
   return 2;
 }

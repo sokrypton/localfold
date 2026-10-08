@@ -4,7 +4,7 @@
 #   cuda/crosscheck.sh <out dir>
 #
 # Each input is featurised here by the native featurisers (cuda/featurise, deterministic and byte for byte the
-# page's), each port built for this GPU (into <out>), and every fold's log line and PDB kept: compare two machines' <out> dirs with
+# page's), each port built for this GPU (cuda/build.sh), and every fold's log line and PDB kept in <out>: compare two machines' <out> dirs with
 # cuda/af3/score.py (CA RMSD between the two PDBs of a case) and the pLDDT/pTM lines. Every port reads
 # the page's published bundles as they are; a port whose bundle is not on disk is skipped.
 set -uo pipefail
@@ -18,8 +18,7 @@ run() {      # (shell timing: a Colab image has no /usr/bin/time)
   local name="$1" t0 rc; shift; t0=$(date +%s.%N)
   { echo "== $name"; "$@" 2>&1; rc=$?; echo "wall $(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $t0}") s"; echo "exit $rc"; } >> "$log" 2>&1
 }
-build() { (cd "$N/$1" && nvcc -O1 -std=c++17 -arch=$arch --default-stream per-thread $2 src/$1.cu -lcublas -lcublasLt -lcupti -ldl \
-          -o "$out/$1" 2>&1 | grep -E "error" >> "$log"); }
+build() { bash "$N/build.sh" "$1" >> "$log" 2>&1; }      # (cuda/<port>/localfold-<port>, the featuriser linked in)
 S6=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE
 seqof() { python3 - "$1" "$2" <<'EOF'
 import sys
@@ -37,34 +36,34 @@ in="$out/inputs"; mkdir -p "$in"
 
 EF=(--fold-bundle="$repo/model-esmfold2-int5" --esmc-bundle="$repo/model-esmc-600m-int3")    # (the bundles as they are)
 if [ -f "$repo/model-esmfold2-int5/manifest.json" ]; then
-  build esmfold2 ""
-  ex() { local d="$in/ef2-$1"; shift; [ -f "$d/model.idx" ] || "$F/esmfold2-featurise" "$d" "$@" > /dev/null; }
+  build ef2
+  ex() { local d="$in/ef2-$1"; shift; [ -f "$d/model.idx" ] || "$F/ef2-featurise" "$d" "$@" > /dev/null; }
   ex 6mrr --sequence=$S6; ex 5caj --sequence=$S5; ex 1brs --sequence=$SA:$SD
   ex gol-sep --sequence=$S6 --ligands=GOL --modify=SEP@3; ex dna --sequence=GCGATCGATCGC:GCGATCGATCGC --kinds=dna,dna
-  for c in 6mrr 5caj 1brs gol-sep dna; do run ef2-$c "$out/esmfold2" "$in/ef2-$c" "${EF[@]}" --fast --warm=96,800 --out="$out/ef2-$c.pdb"; done
-  run ef2-6mrr-f32 "$out/esmfold2" "$in/ef2-6mrr" "${EF[@]}" --out="$out/ef2-6mrr-f32.pdb"
+  for c in 6mrr 5caj 1brs gol-sep dna; do run ef2-$c "$N/ef2/localfold-ef2" "$in/ef2-$c" "${EF[@]}" --fast --warm=96,800 --out="$out/ef2-$c.pdb"; done
+  run ef2-6mrr-f32 "$N/ef2/localfold-ef2" "$in/ef2-6mrr" "${EF[@]}" --out="$out/ef2-6mrr-f32.pdb"
 fi
 AW=(--bundle="$repo/model-af3-int5" --family=af3)    # (the bundle as it is, through its weight walk)
 if [ -f "$repo/model-af3-int5/manifest.json" ]; then
-  build af3 "--use_fast_math"
+  build af3
   ex3() { local d="$in/af3-$1"; shift; [ -f "$d/model.idx" ] || "$F/af3-featurise" "$d" --no-weights --family=af3 "$@" > /dev/null; }
   ex3 6mrr --sequence=$S6; ex3 5caj-tmpl --sequence=$S5 --template="$FX/5caj-crystal.pdb:A"
   ex3 1brs-tmpl --sequence=$SA:$SD --template="$FX/1brs-crystal.pdb:A@0+$FX/1brs-crystal.pdb:D@1"; ex3 gol --sequence=$S6 --ligands=GOL
-  for c in 6mrr 5caj-tmpl 1brs-tmpl gol; do run af3-$c "$out/af3" "$in/af3-$c" "${AW[@]}" --fold --fast --out="$out/af3-$c.pdb"; done
-  run af3-6mrr-f32 "$out/af3" "$in/af3-6mrr" "${AW[@]}" --fold --steps=20 --out="$out/af3-6mrr-f32.pdb"
+  for c in 6mrr 5caj-tmpl 1brs-tmpl gol; do run af3-$c "$N/af3/localfold-af3" "$in/af3-$c" "${AW[@]}" --fold --fast --out="$out/af3-$c.pdb"; done
+  run af3-6mrr-f32 "$N/af3/localfold-af3" "$in/af3-6mrr" "${AW[@]}" --fold --steps=20 --out="$out/af3-6mrr-f32.pdb"
 fi
 M1=(--bundle="$repo/model")
 MM=(--bundle="$repo/model-multimer")
 if [ -f "$repo/model/manifest.json" ]; then
-  build af2 "--use_fast_math"
+  build af2
   ex2() { local d="$in/af2-$1" b="$2"; shift 2; [ -f "$d/model.idx" ] || "$F/af2-featurise" "$d" --bundle="$b" "$@" > /dev/null; }
   ex2 6mrr "$repo/model" --sequence=$S6; ex2 5caj-tmpl "$repo/model" --sequence=$S5 --template="$FX/5caj-crystal.pdb:A"
-  run af2-6mrr "$out/af2" "$in/af2-6mrr" "${M1[@]}" --fast --out="$out/af2-6mrr.pdb"
-  run af2-5caj-tmpl "$out/af2" "$in/af2-5caj-tmpl" "${M1[@]}" --fast --recycles=0 --out="$out/af2-5caj-tmpl.pdb"
-  run af2-6mrr-f32 "$out/af2" "$in/af2-6mrr" "${M1[@]}" --out="$out/af2-6mrr-f32.pdb"
+  run af2-6mrr "$N/af2/localfold-af2" "$in/af2-6mrr" "${M1[@]}" --fast --out="$out/af2-6mrr.pdb"
+  run af2-5caj-tmpl "$N/af2/localfold-af2" "$in/af2-5caj-tmpl" "${M1[@]}" --fast --recycles=0 --out="$out/af2-5caj-tmpl.pdb"
+  run af2-6mrr-f32 "$N/af2/localfold-af2" "$in/af2-6mrr" "${M1[@]}" --out="$out/af2-6mrr-f32.pdb"
   if [ -f "$repo/model-multimer/manifest.json" ]; then
     ex2 1brs-tmpl "$repo/model-multimer" --sequence=$SA:$SD --template="$FX/1brs-crystal.pdb:A+D"
-    run af2-1brs-tmpl "$out/af2" "$in/af2-1brs-tmpl" "${MM[@]}" --fast --out="$out/af2-1brs-tmpl.pdb"
+    run af2-1brs-tmpl "$N/af2/localfold-af2" "$in/af2-1brs-tmpl" "${MM[@]}" --fast --out="$out/af2-1brs-tmpl.pdb"
   fi
 fi
 echo done > "$out/DONE"

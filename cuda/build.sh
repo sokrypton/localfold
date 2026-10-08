@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build the native ports for this machine's GPU, and the native featurisers beside them:
 #
-#   bash cuda/build.sh [af3] [af2] [esmfold2]      (all three when none is named)
+#   bash cuda/build.sh [af3] [af2] [ef2]           (all three when none is named: cuda/<port>/localfold-<port>)
 #   bash cuda/build.sh featurise                    (the featurisers alone: no GPU, no nvcc)
 #
-# The featurisers (cuda/featurise: one binary linked as af3-featurise, af2-featurise, esmfold2-featurise and
+# The featurisers (cuda/featurise: one binary linked as af3-featurise, af2-featurise, ef2-featurise and
 # resolve-templates - host C++, no GPU, a job JSON in and each port's input out, byte for byte the page's) are built
 # first and always, so a fold needs no Node at all.
 # Each port is compiled for the card nvidia-smi reports (sm_75 a T4, sm_89 an L4, sm_80 an A100), the three
@@ -15,7 +15,7 @@
 # built for this card from these sources is left alone.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(af3 af2 esmfold2)
+ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(af3 af2 ef2)
 cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
 arch="sm_$cc"
 marker=/tmp/localfold-cuda-build log=/tmp/localfold-cuda-build.log
@@ -42,7 +42,7 @@ if [ ! -f "$sobj" ] || [ "$(cat "$sobj.stamp" 2>/dev/null)" != "$fstamp" ]; then
     || { echo "FAILED the standalone object" >> "$log"; echo failed > "$sobj.stamp"; exit 1; } ) &
   pids+=($!)
 fi
-for name in af3-featurise af2-featurise esmfold2-featurise resolve-templates chem-probe fetch-weights; do
+for name in af3-featurise af2-featurise ef2-featurise resolve-templates chem-probe fetch-weights; do
   ln -sfn featurise "$here/featurise/$name"
 done
 # (no GPU: the featurisers still build, the ports cannot)
@@ -53,11 +53,11 @@ if [ "${ports[*]}" = featurise ]; then
 fi
 if [ -z "$cc" ]; then for pid in "${pids[@]}"; do wait "$pid"; done; echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; fi
 for port in "${ports[@]}"; do
-  case "$port" in af3|af2) fast=--use_fast_math ;; esmfold2) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
+  case "$port" in af3|af2) fast=--use_fast_math ;; ef2) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
   # AF3 - the page's default model, so usually the first fold - at full priority and the others niced: a
   # Colab VM has two cores and three compiles, and the first fold waits only on its own port's binary
   prio=""; [ "$port" = af3 ] || prio="nice -n 10"
-  out="$here/$port/$port"
+  out="$here/$port/localfold-$port"
   # (the stamp is the card AND the sources - every port includes cuda/af3/src's shared headers - so a
   # checkout that changed a kernel rebuilds rather than keep the last binary)
   # (and the weight walks in cuda/featurise, which af3 and af2 include)

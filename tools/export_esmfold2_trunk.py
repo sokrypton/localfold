@@ -191,7 +191,7 @@ def main():
                     'msaMaxDepth': 1024, 'msaColumnMaskRate': 0.1}
     # The language model's shim, which is this checkpoint's and not the tower's: the full ESMFold2's twelve
     # differ from ESMFold2-Fast's in every tensor, so a folding bundle carries its own and the native port reads
-    # it before the ESM-C bundle's (cuda/esmfold2/src/ops.cuh shimKey). Laid out as tools/export_esmc6b.py lays it.
+    # it before the ESM-C bundle's (cuda/ef2/src/ops.cuh shimKey). Laid out as tools/export_esmc6b.py lays it.
     if 'language_model.base_z_combine' in source.keys():
         for leaf, name in SHIM_TENSORS:
             values = np.asarray(get('language_model.' + leaf), np.float32)

@@ -341,7 +341,7 @@ static int foldInput(const Opts& o, bool warm) {
   freeDenoiser(dn); if (tight) releaseScratch();
   say("sampler %.1f ms (%d steps)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stepsRun);
   if (!M.has("f/confidence/pae")) {
-    fprintf(stderr, "the weights carry no confidence head: export them from model-esmfold2-conf-f32 (see cuda/esmfold2/README.md)\n");
+    fprintf(stderr, "the weights carry no confidence head: export them from model-esmfold2-conf-f32 (see cuda/ef2/README.md)\n");
     return 1;
   }
   if (check && M.has("o/conf/plddt_per_atom")) {        // the head on the reference's own coordinates
@@ -374,7 +374,7 @@ static int foldInput(const Opts& o, bool warm) {
 }
 
 // --detach-output: on success the last line is "ef2: done" and stdout closes, so a caller reading it to
-// its end returns while the driver releases this process's device (0.14 s of exit; cuda/esmfold2/fold does)
+// its end returns while the driver releases this process's device (0.14 s of exit; cuda/ef2/fold does)
 static bool DETACH = false;
 static int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: ef2 <input dir> --weights=<dir> [--oracle=<dir>] [--out=fold.pdb] [--fast]\n"); return 1; }
@@ -411,7 +411,7 @@ static int foldMain(int argc, char** argv) {
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (weights.empty() == (foldBundle.empty() || esmcBundle.empty())) {
-    fprintf(stderr, "--weights=<dir> (cuda/esmfold2/export_weights.mjs), or --fold-bundle=<dir> and --esmc-bundle=<dir>\n");
+    fprintf(stderr, "--weights=<dir> (cuda/ef2/export_weights.mjs), or --fold-bundle=<dir> and --esmc-bundle=<dir>\n");
     return 1;
   }
   auto tStart = std::chrono::steady_clock::now();
@@ -501,6 +501,6 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `esmfold2 <featurised dir> ...` and `esmfold2 - --serve=<dir>` as before
 int main(int argc, char** argv) {
-  if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("esmfold2", argc, argv, foldMain);
+  if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("ef2", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

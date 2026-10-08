@@ -1,5 +1,5 @@
 // ESMFold2's building blocks, float32: the reference path every stage is held to biohub's own forward
-// with (cuda/esmfold2/oracle.py). Shared infrastructure - the exported model file, device weights,
+// with (cuda/ef2/oracle.py). Shared infrastructure - the exported model file, device weights,
 // scratch, cuBLAS - is cuda/af3's.
 #pragma once
 #include "../../af3/src/common.cuh"

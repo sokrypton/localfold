@@ -3,12 +3,12 @@ data*/
 /pairformer
 /pairformer16
 *.o
-/af3
 weights/
 /af3prof
 /af3t
 *.pdb
 *_confidences.json
 weights-*/
-af3.arch
-af3.building
+/localfold-af3
+localfold-af3.arch
+localfold-af3.building

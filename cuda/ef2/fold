@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# The native ESMFold2 (ef2-fast-600m) in one command:
+#
+#   cuda/ef2/fold <out.pdb> --sequence=<SEQ>[:<SEQ>...] [-- <localfold-ef2 flags>]
+#   cuda/ef2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
+#   cuda/ef2/fold cam.pdb --job=tools/fixtures/af3-jobs/calmodulin_4calcium.json --model=ef2-fast-300m
+#
+# A wrapper over the standalone binary, `cuda/ef2/localfold-ef2 --out=<out.pdb> <flags>` (cuda/featurise/standalone.h),
+# which it builds if it is missing: --model=ef2-fast-600m (the default: the experimental tier the page ships),
+# ef2-fast-300m (its 300M sibling), their published bundles fetched once - or one of the released models,
+# ef2-fast and ef2 (ESMFold2 itself, with its MSA encoder), from their local exports (README.md, "The released models").
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[ $# -ge 1 ] || { sed -n '2,11p' "$0"; exit 1; }
+out="$1"; shift
+args=()
+for a in "$@"; do [ "$a" = "--" ] || args+=("$a"); done
+[ -x "$here/localfold-ef2" ] || bash "$here/../build.sh" ef2 >&2
+exec "$here/localfold-ef2" --out="$out" "${args[@]}"

@@ -8,7 +8,7 @@ stdout is one bridge event, `{"kind", "payload", "at"}` - `status`, `progress`, 
 
 🔴 THE PAGE'S OWN INPUTS, THE PAGE'S OWN WEIGHTS - AND NO JAVASCRIPT. The job is the reader's AlphaFold 3 JSON
 (web/job-json.js writes it) and each port's native featuriser (cuda/featurise: af3-featurise, af2-featurise,
-esmfold2-featurise) reads it as the page's reader does and builds the page's input byte for byte
+ef2-featurise) reads it as the page's reader does and builds the page's input byte for byte
 (tools/check-native-featuriser.py holds them to the JavaScript); the template rows are resolved as the page resolves
 them (cuda/featurise/resolve-templates); the alignment search is the page's MMseqs2 client, natively; the weights are
 the published bundles the page folds with, read as published through each port's weight walk (cuda/featurise/af3_weights.h,
@@ -20,7 +20,7 @@ naming it (Refused), never a nearby setting run instead: Flow on rosettafold3 (t
 template on AlphaFold 2's template-free models.
 
 Ports: cuda/af3 (all seven AF3-lineage models), cuda/af2 (all five of each, monomer and multimer),
-cuda/esmfold2 (ESMFold2, 600M and 300M). Each must be built (cuda/colab_setup.sh); a bundle not on disk is fetched.
+cuda/ef2 (ESMFold2, 600M and 300M). Each must be built (cuda/colab_setup.sh); a bundle not on disk is fetched.
 """
 import json
 import os
@@ -150,7 +150,7 @@ def building():
 def binary(port):
     """A port's binary - waited for while cuda/build.sh is still compiling it (the notebook starts the
     build beside the service, so the first fold can arrive before it is done), refused if nothing is."""
-    path = os.path.join(CUDA, port, port)
+    path = os.path.join(CUDA, port, f"localfold-{port}")
     started = time.time()
     while not os.access(path, os.X_OK) and building():
         emit("status", f"compiling the CUDA ports for this card (once a runtime) · {time.time() - started:.0f} s")
@@ -383,7 +383,7 @@ class Worker:
         elif family in ("monomer", "multimer"):
             port = "af2"
         elif family in ("ef2-fast-600m", "ef2-fast-300m"):
-            port = "esmfold2"
+            port = "ef2"
         else:
             raise Refused(f"the CUDA backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
                           " and ESMFold2)")
@@ -410,7 +410,7 @@ class Worker:
 
         residues = sum(len(chain) for chain in polymer_chains(job["job"]))
         # the alignment, as the page's MSA row asked for it
-        mode = "none" if port == "esmfold2" else controls.get("msa-mode", "none")
+        mode = "none" if port == "ef2" else controls.get("msa-mode", "none")
         flags, a3m = [], None
         if mode == "search":
             flags.append("--search")
@@ -444,7 +444,7 @@ class Worker:
         if any((entity.get("template") or {}).get("kind") not in (None, "none") for entity in job.get("entities", [])):
             templates = json.loads(featurise([featuriser("resolve-templates"), request_path, os.path.join(WORK, "templates")],
                                              "resolving the templates", log).strip().splitlines()[-1] or "[]")
-        if templates and port == "esmfold2":
+        if templates and port == "ef2":
             raise Refused("ESMFold2 takes no template")
         searched = [t["chain"] for t in templates if t["kind"] == "search"]
         if searched and mode != "search":
@@ -524,11 +524,11 @@ class Worker:
             total = 0
         else:
             small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)
-            trunk, tower = model_weights("esmfold2-fast-300m" if small else "esmfold2-fast-600m", log)
-            key = ("esmfold2", family)
-            server = self.server_for(key, [binary("esmfold2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
+            trunk, tower = model_weights("ef2-fast-300m" if small else "ef2-fast-600m", log)
+            key = ("ef2", family)
+            server = self.server_for(key, [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)
-            featurise([featuriser("esmfold2-featurise"), inputs, f"--job={job_path}"], "featurising", log, live)
+            featurise([featuriser("ef2-featurise"), inputs, f"--job={job_path}"], "featurising", log, live)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
             # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's
             # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45
@@ -561,7 +561,7 @@ class Worker:
                         emit("progress", 0.15 + 0.15 * (index + 1) / passes)
                         emit("status", f"{family} on CUDA ({self.device}) · trunk pass {index + 1}/{passes}")
                 elif name.startswith("frame-"):
-                    # frame-SSSS.pdb (af3, its step count the job's) or frame-SSSS-NNNN.pdb (esmfold2)
+                    # frame-SSSS.pdb (af3, its step count the job's) or frame-SSSS-NNNN.pdb (ef2)
                     step = int(name[6:10])
                     steps = int(name[11:15]) if name[10] == "-" else total
                     emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)

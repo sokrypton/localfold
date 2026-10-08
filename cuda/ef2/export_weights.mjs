@@ -1,7 +1,7 @@
 // ESMFold2's weights for the native CUDA port: the folding bundle and the ESM-C tower, every tensor
 // decoded to float32 under its own bundle name, in cuda/af3's model.idx/model.bin format.
 //
-//   node cuda/esmfold2/export_weights.mjs cuda/esmfold2/weights \
+//   node cuda/ef2/export_weights.mjs cuda/ef2/weights \
 //        [--fold=model-esmfold2-trunk-f32] [--esmc=model-esmc-600m-f32]
 //
 // Entries:  t f/<name> ...   a folding-bundle tensor (blocks/3/pairTransition/transition1, ...)

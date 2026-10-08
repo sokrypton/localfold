@@ -6,7 +6,7 @@
 #   cuda/af2/fold 1brs.pdb --sequence=<A>:<B> --model=model_1_multimer_v3 --search
 #   cuda/af2/fold 5caj.pdb --sequence=<SEQ> --template=5caj.pdb:A       (1brs: --template=1brs.pdb:A+D)
 #
-# A wrapper over the standalone binary, `cuda/af2/af2 --out=<out.pdb> <flags>` (cuda/featurise/standalone.h), which
+# A wrapper over the standalone binary, `cuda/af2/localfold-af2 --out=<out.pdb> <flags>` (cuda/featurise/standalone.h), which
 # it builds if it is missing: --model is model_N_ptm or model_N_multimer_v3, N 1 to 5 (2-5 the page's deltas on
 # model 1), its published bundle fetched once; the input featurised in the same process, the page's own features
 # byte for byte; a searched alignment kept as <out>.a3m.
@@ -16,5 +16,5 @@ here="$(cd "$(dirname "$0")" && pwd)"
 out="$1"; shift
 args=()
 for a in "$@"; do [ "$a" = "--" ] || args+=("$a"); done
-[ -x "$here/af2" ] || bash "$here/../build.sh" af2 >&2
-exec "$here/af2" --out="$out" "${args[@]}"
+[ -x "$here/localfold-af2" ] || bash "$here/../build.sh" af2 >&2
+exec "$here/localfold-af2" --out="$out" "${args[@]}"

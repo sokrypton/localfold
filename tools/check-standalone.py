@@ -27,6 +27,10 @@ JOBS = os.path.join(FIX, "af3-jobs")
 S6 = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
 
 
+def binary(port):
+    return os.path.join(CUDA, port, f"localfold-{port}")
+
+
 def run(cmd, env=None):
     return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, env=env)
 
@@ -38,13 +42,13 @@ def two_step(port, featuriser_args, fold_args, out, work):
     f = run([os.path.join(CUDA, "featurise", f"{port}-featurise"), d, *featuriser_args])
     if f.returncode != 0:
         raise SystemExit(f"{port}-featurise failed: {f.stdout}{f.stderr}")
-    r = run([os.path.join(CUDA, port, port), d, *fold_args, f"--out={out}"])
+    r = run([binary(port), d, *fold_args, f"--out={out}"])
     if r.returncode != 0:
         raise SystemExit(f"{port} over the directory failed: {r.stdout[-800:]}{r.stderr[-800:]}")
 
 
 def standalone(port, args, out, env=None):
-    r = run([os.path.join(CUDA, port, port), *args, f"--out={out}"], env)
+    r = run([binary(port), *args, f"--out={out}"], env)
     if r.returncode != 0:
         raise SystemExit(f"standalone {port} failed: {r.stdout[-800:]}{r.stderr[-800:]}")
     return r
@@ -69,10 +73,10 @@ def main():
          [f"--bundle={home}/model", "--recycles=1"], [f"--bundle={home}/model", f"--delta={home}/model-mono-3-delta", "--fast", "--recycles=1"]),
         ("af2 multimer barnase-barstar (job)", "af2", [f"--job={JOBS}/barnase_barstar.json"], "model_1_multimer_v3",
          [f"--bundle={home}/model-multimer"], [f"--bundle={home}/model-multimer", "--fast"]),
-        ("esmfold2 600M calmodulin (job, ions)", "esmfold2", [f"--job={JOBS}/calmodulin_4calcium.json"], "esmfold2-fast-600m",
+        ("ef2 600M calmodulin (job, ions)", "ef2", [f"--job={JOBS}/calmodulin_4calcium.json"], "ef2-fast-600m",
          [f"--fold-bundle={home}/model-esmfold2-int5"], [f"--fold-bundle={home}/model-esmfold2-int5", f"--esmc-bundle={home}/model-esmc-600m-int3", "--fast",
           "--steps=64"]),      # (the per-atom floor the worker applies: four calcium ions are four atom tokens)
-        ("esmfold2 300M 6mrr, seed 7", "esmfold2", [f"--sequence={S6}", "--seed=7"], "esmfold2-fast-300m",
+        ("ef2 300M 6mrr, seed 7", "ef2", [f"--sequence={S6}", "--seed=7"], "ef2-fast-300m",
          [f"--fold-bundle={home}/model-ef2-fast-300m-int5"], [f"--fold-bundle={home}/model-ef2-fast-300m-int5", f"--esmc-bundle={home}/model-esmc-300m-int3", "--fast", "--seed=7"]),
     ]
     failed = 0
@@ -92,11 +96,11 @@ def main():
         for name, port, args, want in [
             ("a ligand on AF2", "af2", [f"--job={JOBS}/kras_g12c_sotorasib.json"], "AlphaFold 2 folds protein chains only"),
             ("an unknown model", "af3", [f"--sequence={S6}", "--model=nope"], "no model nope"),
-            ("a template on ESMFold2", "esmfold2", [f"--sequence={S6}", "--template=x.pdb:A"], "esmfold2 takes no --template"),
+            ("a template on ESMFold2", "ef2", [f"--sequence={S6}", "--template=x.pdb:A"], "ef2 takes no --template"),
             ("a SMILES ligand on AF2", "af2", [f"--sequence={S6}", "--smiles=OCC(O)CO"], "af2 takes no --smiles"),
-            ("an alignment on fast ESMFold2", "esmfold2", [f"--sequence={S6}", "--a3m=x.a3m"], "reads no alignment"),
+            ("an alignment on fast ESMFold2", "ef2", [f"--sequence={S6}", "--a3m=x.a3m"], "reads no alignment"),
         ]:
-            r = run([os.path.join(CUDA, port, port), *args, f"--out={work}/x.pdb"])
+            r = run([binary(port), *args, f"--out={work}/x.pdb"])
             said = r.stdout + r.stderr
             ok = r.returncode != 0 and "Error: " in said and (want is None or want in said)
             failed += not ok
@@ -112,18 +116,18 @@ def main():
         failed += not ok
         print(f"{'ok  ' if ok else 'FAIL'} --frames: {len(names)} files ({', '.join(names[:3])}, ...)")
 
-        standalone("esmfold2", [f"--sequence={S6}", "--model=esmfold2-fast-300m"], f"{work}/standalone-300m.pdb")
+        standalone("ef2", [f"--sequence={S6}", "--model=ef2-fast-300m"], f"{work}/standalone-300m.pdb")
         # --weights-dir names where the weights live (here: links to this checkout's)
         alt = os.path.join(work, "weights")
         os.makedirs(alt)
         for d in ("model-ef2-fast-300m-int5", "model-esmc-300m-int3"):
             os.symlink(os.path.join(REPO, d), os.path.join(alt, d))
-        r = run([os.path.join(CUDA, "esmfold2", "esmfold2"), f"--sequence={S6}", "--model=esmfold2-fast-300m",
+        r = run([binary("ef2"), f"--sequence={S6}", "--model=ef2-fast-300m",
                  f"--weights-dir={alt}", f"--out={work}/h.pdb"])
         ok = r.returncode == 0 and open(f"{work}/h.pdb", "rb").read() == open(f"{work}/standalone-300m.pdb", "rb").read()
         failed += not ok
         print(f"{'ok  ' if ok else 'FAIL'} --weights-dir: {'the same fold from ' + alt if ok else (r.stdout + r.stderr)[-300:]}")
-        r = run([os.path.join(CUDA, "esmfold2", "esmfold2"), f"--sequence={S6}", "--weights-dir=/nonexistent/localfold-weights",
+        r = run([binary("ef2"), f"--sequence={S6}", "--weights-dir=/nonexistent/localfold-weights",
                  f"--out={work}/h2.pdb"])
         ok = r.returncode != 0 and "Error: " in r.stdout + r.stderr
         failed += not ok

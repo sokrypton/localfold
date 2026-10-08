@@ -65,7 +65,7 @@ if (bundleDir !== "") {
 
 let sequence = option("sequence", "").trim().toUpperCase();
 // --job=<AF3 job.json>: the page's own reader (web/job-json.js, web/entities.js), as cuda/af3's and
-// cuda/esmfold2's exporters read one. AlphaFold 2 folds protein chains and nothing else, so anything else
+// cuda/ef2's exporters read one. AlphaFold 2 folds protein chains and nothing else, so anything else
 // in the job is refused by name rather than dropped
 if (option("job", "") !== "") {
   if (sequence !== "") throw new Error("--job and --sequence both name the input");

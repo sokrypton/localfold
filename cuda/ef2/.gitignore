@@ -1,0 +1,6 @@
+weights*/
+data*/
+*.o
+/localfold-ef2
+localfold-ef2.arch
+localfold-ef2.building

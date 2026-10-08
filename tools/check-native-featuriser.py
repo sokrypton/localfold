@@ -5,7 +5,7 @@
     python3 tools/check-native-featuriser.py --keep          # leave both outputs in /tmp/claude-1000/nf
 
 Each case runs the JavaScript exporter (cuda/af3/export-model.mjs --no-weights, cuda/af2/export_input.mjs,
-cuda/esmfold2/export_input.mjs) and the native one (cuda/featurise/*-featurise) on the same arguments and holds
+cuda/ef2/export_input.mjs) and the native one (cuda/featurise/*-featurise) on the same arguments and holds
 them to the SAME BYTES: model.idx's text, model.bin entry by entry, and the PDB records. The first entry that
 differs is named with its first differing element, because "the files differ" says nothing about where.
 
@@ -139,24 +139,24 @@ def cases():
          ["--template=@F/1brs-crystal.pdb:A@0+@F/1brs-crystal.pdb:D@1"], AF2),
         ("af2-ligand-refused", "af2", job("t", [protein("A", SEQ_6MRR), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], AF2),
     ]
-    # ESMFold2 (cuda/esmfold2/export_input.mjs)
-    EF = ["esmfold2"]
+    # ESMFold2 (cuda/ef2/export_input.mjs)
+    EF = ["ef2"]
     out += [
-        ("ef2-6mrr", "esmfold2", job("t", [protein("A", SEQ_6MRR)]), [], EF),
-        ("ef2-6mrr-sep-gol", "esmfold2", job("t", [protein("A", SEQ_6MRR, modifications=[{"ptmType": "SEP", "ptmPosition": 3}]),
+        ("ef2-6mrr", "ef2", job("t", [protein("A", SEQ_6MRR)]), [], EF),
+        ("ef2-6mrr-sep-gol", "ef2", job("t", [protein("A", SEQ_6MRR, modifications=[{"ptmType": "SEP", "ptmPosition": 3}]),
                                                    {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], EF),
-        ("ef2-dimer-dna", "esmfold2", job("t", [protein(["A", "B"], "MKTAYIAKQRQISFVKSHFSRQ"),
+        ("ef2-dimer-dna", "ef2", job("t", [protein(["A", "B"], "MKTAYIAKQRQISFVKSHFSRQ"),
                                                 {"dna": {"id": "C", "sequence": "ACGTTGCA"}}, {"rna": {"id": "D", "sequence": "ACGUU"}}]),
          [], EF),
-        ("ef2-biotin-smiles", "esmfold2", job("t", [protein("A", SEQ_6MRR),
+        ("ef2-biotin-smiles", "ef2", job("t", [protein("A", SEQ_6MRR),
                                                     {"ligand": {"id": "B", "smiles": "OC(=O)CCCC[C@@H]1SC[C@@H]2NC(=O)N[C@H]12"}}]), [], EF),
-        ("ef2-1brs-a3m", "esmfold2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [f"--a3m={sa},{sd}"], EF),
+        ("ef2-1brs-a3m", "ef2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [f"--a3m={sa},{sd}"], EF),
     ]
     if os.path.isdir(AF3_EXAMPLES):
         for name in sorted(os.listdir(AF3_EXAMPLES)):
             if name.endswith(".json"):
                 out.append((f"example-{name[:-5]}", "af3", os.path.join(AF3_EXAMPLES, name), [], ["af3", "boltz2", "rosettafold3"]))
-                out.append((f"ef2-example-{name[:-5]}", "esmfold2", os.path.join(AF3_EXAMPLES, name), [], ["esmfold2"]))
+                out.append((f"ef2-example-{name[:-5]}", "ef2", os.path.join(AF3_EXAMPLES, name), [], ["ef2"]))
     return out
 
 
@@ -305,10 +305,10 @@ def main():
                 job_path = os.path.join(base, "job.json")
                 json.dump(spec, open(job_path, "w"))
             args = [x.replace("@test.a3m", os.path.join(FIX, "test.a3m")).replace("@F/", FIX + "/") for x in extra]
-            if port == "esmfold2":
+            if port == "ef2":
                 common = [f"--job={job_path}", *args]
-                js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "esmfold2", "export_input.mjs"), base + "/js", *common])
-                nv_code, nv_said, nv_s = run([native.replace("af3-featurise", "esmfold2-featurise"), base + "/native", *common])
+                js_code, js_said, js_s = run([*NODE, os.path.join(REPO, "cuda", "ef2", "export_input.mjs"), base + "/js", *common])
+                nv_code, nv_said, nv_s = run([native.replace("af3-featurise", "ef2-featurise"), base + "/native", *common])
             elif port == "af2":
                 bundle = os.path.join(REPO, "model" if family == "monomer" else "model-multimer")
                 common = [f"--bundle={bundle}", f"--job={job_path}", *args]

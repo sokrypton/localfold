@@ -21,8 +21,8 @@ ranking CSV, and on request the embeddings and the distogram. 6MRR folds in 0.45
 
 ```
 bash cuda/build.sh af3                          # once: the binary for this GPU (and the featuriser it links)
-cuda/af3/af3 --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json --out=kras.pdb
-cuda/af3/af3 --sequence=GWSTELEKHREEL... --model=boltz2 --search --out=6mrr.pdb
+cuda/af3/localfold-af3 --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json --out=kras.pdb
+cuda/af3/localfold-af3 --sequence=GWSTELEKHREEL... --model=boltz2 --search --out=6mrr.pdb
 ```
 
 One command runs the whole protocol in one process: the model's weights are downloaded the first time, the
@@ -133,7 +133,7 @@ fetches without folding (it takes `--weights-dir` too).
 ### On Colab and the website
 
 The website's Colab backend (`notebooks/localfold.ipynb`) folds with this binary: `cuda/worker.py` keeps each model
-resident (`af3 - --serve=<dir>`) and streams every trunk pass and diffusion frame to the page. See docs/WEB.md.
+resident (`localfold-af3 - --serve=<dir>`) and streams every trunk pass and diffusion frame to the page. See docs/WEB.md.
 
 
 ## The `fold` wrapper, search and templates, in detail
@@ -153,7 +153,7 @@ does (5CAJ: its own chain B found, 1.864 A with the alignment - a crystal templa
 alignment moves this target little: chain A by hand gives 1.836, and 0.289 without the alignment).
 Both send the sequences to api.colabfold.com, so they are flags, never defaults.
 
-`fold` builds `af3` if it is missing, reads the model's weights as published - **af3-any-model's
+`fold` builds `localfold-af3` if it is missing, reads the model's weights as published - **af3-any-model's
 own int8 blob** for all eight (`af3am-<model>/`, fetched once by `cuda/featurise/fetch-weights
 <model>` from huggingface.co/sokrypton/af3-any-model, the files its JAX backend reads), with
 its codes decoded on the device and a weight walk naming each tensor's slice of it (below).
@@ -168,13 +168,13 @@ against 95.20). A job JSON to a PDB is 1.5 s of wall clock (KRAS with sotorasib)
 its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 
 ```
+bash cuda/build.sh af3                       # localfold-af3, the featuriser linked in (cuda/featurise/standalone.o)
 cd cuda/af3
-nvcc -O1 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -ldl -o af3
 ../featurise/af3-featurise in --no-weights --family=af3 --job=<job.json>    # or --sequence=<SEQ> [--a3m=...]
-./af3 in --bundle=../../af3am-af3 --family=af3 --fold --fast --out=fold.pdb
+./localfold-af3 in --bundle=../../af3am-af3 --family=af3 --fold --fast --out=fold.pdb
 python3 score.py fold.pdb ../../tools/fixtures/5caj-crystal.pdb A
 node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + every oracle
-./af3 data                                   # f32 path, every stage against AF3
+./localfold-af3 data                         # f32 path, every stage against AF3
 ```
 
 The oracles want the float32 weights (`export-model.mjs weights --weights-only
@@ -556,7 +556,7 @@ tokens 8.11 -> 7.87 s. The T4's register-staged form keeps 64 (48 is slower ther
 
 ## Kernels the three ports share
 
-cuda/af2 and cuda/esmfold2 include this directory's headers, and where two ports had written the same kernel
+cuda/af2 and cuda/ef2 include this directory's headers, and where two ports had written the same kernel
 it now lives here once:
 
 | kernel | was | now |
@@ -1083,7 +1083,7 @@ the first choice and padded the fused kernels' rows for nothing (68 tokens: 96^2
   256 a block), the rest read from whatever memory the buffer landed in - a fold that depended on
   the memory layout, invisible until the layout changed.
 - **What is left at the floor is the weights, twice**: the file's f32 device copy and, on `--fast`,
-  its f16 mirror (3.8 GB in use at "trunk built" with 0.04 of scratch). cuda/esmfold2 drops the ESM-C
+  its f16 mirror (3.8 GB in use at "trunk built" with 0.04 of scratch). cuda/ef2 drops the ESM-C
   tower's f32 copy after mirroring (`compactWeights`, 2.2 GB) because its tower reads only the mirror.
   cuda/af3 cannot do that blind: layer-norm scales, biases and the f32 conditioning GEMMs read the f32
   copy, and a path a first fold did not take (templates, an alignment, a ligand) may read one later -
@@ -1133,7 +1133,7 @@ card spare; fixed then, so a warm fold decides as a cold one does, and a second 
 where a card fraction could not). The ordinary paths peak at 14-15x the f32 pair beyond what is resident by then
 (AlphaFold 3 32.7 GB at 2000 tokens on a 2.05 GB pair, OpenDDE 16.3 GB at 765 on 0.90). On this A100 the room
 reads 32-35 GB, so the line is ~1940 tokens for AlphaFold 3, ~1090 for OpenDDE, ~930 for IntelliFold-2 and ~1360
-at 256 channels. `LOCALFOLD_SHORT_PAIR_TIMES=0` is the old rule; cuda/af2 and cuda/esmfold2 keep it until measured.
+at 256 channels. `LOCALFOLD_SHORT_PAIR_TIMES=0` is the old rule; cuda/af2 and cuda/ef2 keep it until measured.
 One fold, 25 steps, single sequence, the two rules (2026-10-07):
 
 | | tokens | old rule | free-memory rule | peak |

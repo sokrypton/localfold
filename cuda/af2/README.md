@@ -22,8 +22,8 @@ difference against the browser is the network's, never the featuriser's, and no 
 
 ```
 bash cuda/build.sh af2                          # once: the binary for this GPU (and the featuriser it links)
-cuda/af2/af2 --sequence=GWSTELEKHREEL... --search --out=6mrr.pdb
-cuda/af2/af2 --sequence=<barnase>:<barstar> --model=model_1_multimer_v3 --search --out=1brs.pdb
+cuda/af2/localfold-af2 --sequence=GWSTELEKHREEL... --search --out=6mrr.pdb
+cuda/af2/localfold-af2 --sequence=<barnase>:<barstar> --model=model_1_multimer_v3 --search --out=1brs.pdb
 ```
 
 One command runs the whole protocol in one process: the model's weights are downloaded the first time, the
@@ -51,7 +51,7 @@ chains joined with a residue-index gap, its alignment block-diagonal.
 
 **Protein chains only.** AlphaFold 2 has no ligands, nucleic acids, modified residues or declared bonds - a job
 carrying any of them is refused by name rather than folded without it, and so are the flags (`--ligands`,
-`--smiles`, `--modify`, `--kinds`). For those, use cuda/af3 or cuda/esmfold2.
+`--smiles`, `--modify`, `--kinds`). For those, use cuda/af3 or cuda/ef2.
 
 - `--job=<job.json>` - an AlphaFold 3 job file whose sequences are all proteins (its copies become chains);
 - or `--sequence=<A>:<B>:...` - chains joined by `:`.
@@ -124,7 +124,7 @@ Downloaded once into `model/`, `model-multimer/` and `model-{mono,multi}-<N>-del
 
 ### On Colab and the website
 
-The website's Colab backend folds with this binary: `cuda/worker.py` keeps the model resident (`af2 - --serve=<dir>`)
+The website's Colab backend folds with this binary: `cuda/worker.py` keeps the model resident (`localfold-af2 - --serve=<dir>`)
 and streams every pass to the page. See docs/WEB.md.
 
 

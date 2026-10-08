@@ -1,6 +1,6 @@
 # ESMFold2 in CUDA
 
-A native CUDA/cuBLAS ESMFold2 (`esmfold2-fast-600m`), held stage by stage to the references on
+A native CUDA/cuBLAS ESMFold2 (`ef2-fast-600m`: biohub's `esmfold2-fast-600m`), held stage by stage to the references on
 exactly the same input:
 - the trunk and sampler to biohub's own forward (the `esm` package's `EsmFold2ExperimentalModel`);
 - the confidence head to Synthyra's `ConfidenceHead`, out of their own bundle. biohub ships the
@@ -13,15 +13,15 @@ It runs:
 - the distogram, the diffusion module and its EDM sampler (11 steps);
 - the confidence head: pLDDT, PAE, pTM and ipTM.
 
-The input is the page's own, built natively: `cuda/featurise/esmfold2-featurise` is `export_input.mjs` in C++ -
+The input is the page's own, built natively: `cuda/featurise/ef2-featurise` is `export_input.mjs` in C++ -
 `featuriseForEsmfold2` and `languageModelInput` (shared/esmfold2/featurise.js) over the AF3 featuriser, its
 ligands, SMILES and modified residues included - writing the same files byte for byte
 (`tools/check-native-featuriser.py`), and the PDB is the page's writer's records. No JavaScript runs on a fold.
 Beside it every fold writes AlphaFold 3's `<stem>_confidences.json` (the expected PAE, `token_plddts`,
 the token layout) and `<stem>_summary_confidences.json` (pTM, ipTM, mean pLDDT), as cuda/af3 does -
 what the CUDA backend (cuda/worker.py) hands the page. The 300M checkpoint folds through the
-same binary (`--fold-bundle=model-ef2-fast-300m-int5 --esmc-bundle=model-esmc-300m-int3`; `cuda/esmfold2/fold
-x.pdb --model=esmfold2-fast-300m --job=<job.json>`).
+same binary (`--fold-bundle=model-ef2-fast-300m-int5 --esmc-bundle=model-esmc-300m-int3`; `cuda/ef2/fold
+x.pdb --model=ef2-fast-300m --job=<job.json>`).
 
 ## Guide
 
@@ -31,8 +31,8 @@ x.pdb --model=esmfold2-fast-300m --job=<job.json>`).
 
 ```
 bash cuda/build.sh esmfold2                     # once: the binary for this GPU (and the featuriser it links)
-cuda/esmfold2/esmfold2 --sequence=GWSTELEKHREEL... --out=6mrr.pdb
-cuda/esmfold2/esmfold2 --job=tools/fixtures/af3-jobs/calmodulin_4calcium.json --out=cam.pdb
+cuda/ef2/localfold-ef2 --sequence=GWSTELEKHREEL... --out=6mrr.pdb
+cuda/ef2/localfold-ef2 --job=tools/fixtures/af3-jobs/calmodulin_4calcium.json --out=cam.pdb
 ```
 
 ESMFold2 folds from the sequence alone - its language model (ESM-C) stands in for the alignment - so there is no
@@ -47,9 +47,9 @@ first download.
 
 | `--model=` | | download |
 |---|---|---:|
-| `esmfold2-fast-600m` (default) | biohub's experimental ESMFold2 on ESM-C 600M, with Synthyra's confidence head - the website's ESMFold2 | 129 MB + 224 MB (ESM-C) |
-| `esmfold2-fast-300m` | its 300M sibling, the website's other ESMFold2 row | 129 MB + 130 MB |
-| `esmfold2-fast`, `esmfold2` | biohub's two released checkpoints on ESM-C 6B - local exports only, not downloaded (see "The released models" below) | |
+| `ef2-fast-600m` (default) | biohub's experimental ESMFold2 on ESM-C 600M, with Synthyra's confidence head - the website's ESMFold2 | 129 MB + 224 MB (ESM-C) |
+| `ef2-fast-300m` | its 300M sibling, the website's other ESMFold2 row | 129 MB + 130 MB |
+| `ef2-fast`, `ef2` | biohub's two released checkpoints (ESMFold2-Fast and ESMFold2) on ESM-C 6B - local exports only, not downloaded (see "The released models" below) | |
 
 The weights carry their authors' licences; check them before use beyond research.
 
@@ -62,9 +62,9 @@ The weights carry their authors' licences; check them before use beyond research
   - `--ligands=GOL,ATP` - by CCD code; `--smiles='CCO|c1ccccc1'` - by SMILES, `|`-separated,
   - `--modify=SEP@3[@<chain>]` - modified residues, `CODE@position` (1-based).
 
-**No templates**, and **no alignment for the two fast models**: `esmfold2-fast-600m` and `-300m` read none, so a
-`--template` or `--a3m` is refused by name rather than ignored. The released `esmfold2-fast` reads an alignment's
-profile and `esmfold2` also runs its MSA encoder over it: `--a3m=<a.a3m>[,<b.a3m>]`, one per protein chain.
+**No templates**, and **no alignment for the two fast models**: `ef2-fast-600m` and `-300m` read none, so a
+`--template` or `--a3m` is refused by name rather than ignored. The released `ef2-fast` reads an alignment's
+profile and `ef2` also runs its MSA encoder over it: `--a3m=<a.a3m>[,<b.a3m>]`, one per protein chain.
 
 ### Fold options
 
@@ -95,7 +95,7 @@ step (step SSSS of NNNN). Files land complete, so a viewer can poll the director
 
 Downloaded once into `model-esmfold2-int5/` and `model-esmc-600m-int3/` (300M: `model-ef2-fast-300m-int5/`,
 `model-esmc-300m-int3/`) in the directory `--weights-dir=<dir>` names, else in the checkout the binary was built in
-(`~/.cache/localfold` for a binary copied out of its checkout). `cuda/featurise/fetch-weights esmfold2-fast-600m`
+(`~/.cache/localfold` for a binary copied out of its checkout). `cuda/featurise/fetch-weights ef2-fast-600m`
 fetches without folding (it takes `--weights-dir` too).
 
 ### Limits and errors
@@ -106,19 +106,19 @@ fetches without folding (it takes `--weights-dir` too).
 
 ### On Colab and the website
 
-The website's Colab backend folds with this binary: `cuda/worker.py` keeps the model resident (`esmfold2 - --serve=<dir>`)
+The website's Colab backend folds with this binary: `cuda/worker.py` keeps the model resident (`localfold-ef2 - --serve=<dir>`)
 and streams the trunk's contacts and every sampler frame to the page. See docs/WEB.md.
 
 
 ## Run, in detail
 
 ```
-cuda/esmfold2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
-cuda/esmfold2/fold 1brs.pdb --sequence=<A>:<D>                  # chains joined by ':'
-cuda/esmfold2/fold gol.pdb --sequence=<SEQ> --ligands=GOL --modify=SEP@3
-cuda/esmfold2/fold dna.pdb --sequence=GCGATCGATCGC:GCGATCGATCGC --kinds=dna,dna
-cuda/esmfold2/fold lig.pdb --sequence=<SEQ> "--smiles=OCC(O)CO"
-cuda/esmfold2/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json
+cuda/ef2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
+cuda/ef2/fold 1brs.pdb --sequence=<A>:<D>                  # chains joined by ':'
+cuda/ef2/fold gol.pdb --sequence=<SEQ> --ligands=GOL --modify=SEP@3
+cuda/ef2/fold dna.pdb --sequence=GCGATCGATCGC:GCGATCGATCGC --kinds=dna,dna
+cuda/ef2/fold lig.pdb --sequence=<SEQ> "--smiles=OCC(O)CO"
+cuda/ef2/fold kras.pdb --job=tools/fixtures/af3-jobs/kras_g12c_sotorasib.json
 ```
 
 
@@ -133,7 +133,7 @@ The input options are cuda/af3's exporter's, resolved the same way:
 All nine of AlphaFold 3's loadable example jobs fold. On the covalent KRAS/sotorasib job, Cys12 SG to
 the ligand's C25 is 1.73 Å: bonded, through the declared bond.
 
-`fold` builds `esmfold2` if it is missing and reads the page's own published bundles as they are - the int5
+`fold` builds `localfold-ef2` if it is missing and reads the page's own published bundles as they are - the int5
 trunk and the int3 ESM-C, fetched once by `cuda/featurise/fetch-weights` from their Hugging Face remotes, 0.35 GB:
 their codes go to the device and are decoded there (cuda/af3's `Model::loadBundle`; bit-identical to
 decoding them on the host, and the load is 127 against 241 ms for the float32 file).
@@ -141,9 +141,9 @@ decoding them on the host, and the load is 127 against 241 ms for the float32 fi
 The quantisation costs accuracy, measured on the gate's cases: 6MRR 0.84 -> 1.42 A (pLDDT 78.3 -> 77.2),
 1BRS 0.53 -> 0.92 A, ligand bonds 0.047 -> 0.115 A rms, nucleic 0.036 -> 0.063, KRAS pLDDT 88.1 -> 83.7
 with the covalent SG-C25 still bonded (1.79 A). The float32 export (`export_weights.mjs`, 2.9 GB, from
-the unpublished float32 bundles) is what the oracle checks below use, through `esmfold2 --weights=`. It then starts `esmfold2` while the input is exported. `esmfold2`
+the unpublished float32 bundles) is what the oracle checks below use, through `localfold-ef2 --weights=`. It then starts `localfold-ef2` while the input is exported. `esmfold2`
 uploads the weights and, during the upload, warms up on a synthetic input of up to 96 tokens. It folds
-with `--fast`; flags after `--` go to `esmfold2` (`--seed=`, `--steps=`, `--inputs-window=`).
+with `--fast`; flags after `--` go to `localfold-ef2` (`--seed=`, `--steps=`, `--inputs-window=`).
 
 The weights come from two float32 bundles: `model-esmc-600m-f32`, and `model-esmfold2-conf-f32`.
 The second is biohub's trunk plus Synthyra's head:
@@ -153,15 +153,15 @@ python3 tools/export_esmfold2_trunk.py --esmfold2 esmfold2-fast-600m --out model
     --confidence ~/.cache/huggingface/hub/models--Synthyra--ESMFold2-600/snapshots/*/model.safetensors
 ```
 
-`esmfold2` refuses weights without a head, as the page does.
+`localfold-ef2` refuses weights without a head, as the page does.
 
 ## The released models: ESMFold2-Fast and ESMFold2
 
 The same binary folds biohub's two released checkpoints, which the page does not ship (their tower is ESM-C 6B):
 
 ```
-cuda/esmfold2/fold 6mrr.pdb --model=esmfold2-fast --sequence=GWSTELEKHREEL...
-cuda/esmfold2/fold 6mrr.pdb --model=esmfold2 --sequence=GWSTELEKHREEL... --a3m=<one A3M per protein chain>
+cuda/ef2/fold 6mrr.pdb --model=ef2-fast --sequence=GWSTELEKHREEL...
+cuda/ef2/fold 6mrr.pdb --model=ef2 --sequence=GWSTELEKHREEL... --a3m=<one A3M per protein chain>
 ```
 
 What they add over the experimental tier:
@@ -230,7 +230,7 @@ and its loader always takes ESM-C in bf16, so neither is a float32 reference. Th
 every seam, then runs Synthyra's head on the fold's own trunk pair and coordinates.
 
 `--float32-attention` neutralises the one bf16 cast the module makes whatever the model's dtype: q, k
-and v of every atom attention. That is the control `esmfold2 --atom-f32` is held to. 6MRR:
+and v of every atom attention. That is the control `localfold-ef2 --atom-f32` is held to. 6MRR:
 
 | seam | float32 | `--fast` |
 |---|---:|---:|
@@ -359,7 +359,7 @@ The fold's own compute is 0.09 and 0.40 s of that. The rest:
   261 tokens cost 0.2 s. The warm-up loads kernel modules and cuBLAS plans, and 96 tokens is already
   in the fused kernels' range.
 
-- **`fold` returns once the PDB is written.** On success `esmfold2 --detach-output` prints `ef2: done` and
+- **`fold` returns once the PDB is written.** On success `localfold-ef2 --detach-output` prints `ef2: done` and
   closes stdout, and the driver releases the device after the wrapper has returned (0.14 s), as
   cuda/af3's does.
 
@@ -392,8 +392,8 @@ Peak device memory at 783 tokens (5CAJ's chain three times), `--fast`: **15.9 �
 ## Gate
 
 ```
-python3 cuda/esmfold2/gate.py            # folds against gate-baseline.json, oracles against their bounds
-python3 cuda/esmfold2/gate.py --write
+python3 cuda/ef2/gate.py            # folds against gate-baseline.json, oracles against their bounds
+python3 cuda/ef2/gate.py --write
 ```
 
 The folds run on the published bundles (as `fold` does); the oracle checks on the float32 export.
@@ -415,8 +415,8 @@ distance must stay under 2.2 Å, which is bonded and not merely near.
 The gate also checks every `data-*/` that has an `oracle-f32att/`, in both precisions:
 
 ```
-cuda/featurise/esmfold2-featurise cuda/esmfold2/data-x --sequence=...
-~/venv_ef2/bin/python cuda/esmfold2/oracle.py cuda/esmfold2/data-x --out cuda/esmfold2/data-x/oracle-f32att --float32-attention
+cuda/featurise/ef2-featurise cuda/ef2/data-x --sequence=...
+~/venv_ef2/bin/python cuda/ef2/oracle.py cuda/ef2/data-x --out cuda/ef2/data-x/oracle-f32att --float32-attention
 ```
 
 I tightened its bounds once to confirm it fails.

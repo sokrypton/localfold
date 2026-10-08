@@ -1,4 +1,4 @@
-// Element-wise and row kernels every port had its own copy of (cuda/af2, cuda/esmfold2, cuda/af3 - the same
+// Element-wise and row kernels every port had its own copy of (cuda/af2, cuda/ef2, cuda/af3 - the same
 // computation under the same name, renamed variables apart), here once. Included by common.cuh.
 #pragma once
 

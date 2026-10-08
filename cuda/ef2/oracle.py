@@ -1,7 +1,7 @@
 """ESMFold2's own forward (the `esm` package, biohub's EsmFold2ExperimentalModel) on the native port's
 OWN input: the oracle every CUDA stage is held to.
 
-    ~/venv_ef2/bin/python cuda/esmfold2/oracle.py cuda/esmfold2/data-6mrr --out cuda/esmfold2/data-6mrr/oracle
+    ~/venv_ef2/bin/python cuda/ef2/oracle.py cuda/ef2/data-6mrr --out cuda/ef2/data-6mrr/oracle
 
 It builds the feature dict the model's forward takes from exactly the arrays export_input.mjs wrote
 (no featurisation of its own - the conformer included, so a difference is the network's), runs the

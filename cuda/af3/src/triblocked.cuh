@@ -1,4 +1,4 @@
-// The triangle multiplication in output blocks on f16 operands, shared by cuda/af2 and cuda/esmfold2 (each
+// The triangle multiplication in output blocks on f16 operands, shared by cuda/af2 and cuda/ef2 (each
 // includes it after its own ltGemm): the f32 port of the same scheme is cuda/af3's triangleBlocked.
 #pragma once
 // ---------------------------------------------------------------- the triangle multiplication in blocks

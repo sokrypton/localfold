@@ -209,7 +209,7 @@ inline float hostHalf(const unsigned char* p) { __half_raw r; r.x = (unsigned sh
 // pointers, faults). runs: the file's byte ranges and where each lands, in file order.
 struct Run { size_t src, dst, bytes; };
 // data: the file mapped, only once the host reads an entry (f()): a large file goes to the device by
-// pread into pinned buffers - a mapping of the 2.9 GB cuda/esmfold2 weights cost ~300 ms of page faults to
+// pread into pinned buffers - a mapping of the 2.9 GB cuda/ef2 weights cost ~300 ms of page faults to
 // read and 275 ms more to tear down when the process exited, after its PDB was written
 struct Segment { const float* data; size_t bytes; float* device; std::map<std::string, void*> halfMirrors;
                  int fd = -1;
@@ -436,7 +436,7 @@ struct Model {
   }
   // a page bundle (its manifest.json and shards) under `prefix/`: every tensor as `prefix/<name>` with its
   // rank and dims (`#r`, `#k`), and the manifest's trunk/languageModel numbers as `meta/<key>` - the
-  // entries cuda/esmfold2/export_weights.mjs wrote, from the same bytes
+  // entries cuda/ef2/export_weights.mjs wrote, from the same bytes
   // With `lines` (the port's WEIGHT WALK - cuda/featurise/af3_weights.h for the AF3 lineage, af2_weights.h for
   // AlphaFold 2 - handed the bundle's tensor names and shapes), the entries are the walk's instead: each `b` line a
   // slice of a bundle tensor under the port's own name, each `z` zeros, `p` derived (ones, a scale folded into a
@@ -1383,7 +1383,7 @@ inline std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirro
 // a file's f16 copy, made once per GROUP - the first f16 read of any of its weights converts every
 // float tensor of that group in ONE launch (it was ~800 allocations and conversions, one a weight, in
 // the first fold); each tensor starts on 16 bytes, as its own allocation did, for the vector loads.
-// A group is a name's first '/'-separated part ("" without one): cuda/esmfold2's file holds the folding
+// A group is a name's first '/'-separated part ("" without one): cuda/ef2's file holds the folding
 // bundle (f/) and ESM-C (c/), which reads only its f32 copy - mirroring it too was 1.2 GB never read
 inline std::string halfGroup(const std::string& k) { size_t at = k.find('/'); return at == std::string::npos ? "" : k.substr(0, at); }
 inline std::map<std::string, half*> WH_AT;

@@ -1,9 +1,9 @@
-// cuda/esmfold2/export_input.mjs, natively: ESMFold2's input for the CUDA port - the page's own features
+// cuda/ef2/export_input.mjs, natively: ESMFold2's input for the CUDA port - the page's own features
 // (shared/esmfold2/featurise.js featuriseForEsmfold2 over AF3's featuriser with ESMFold2's conventions, its
 // language-model input, representative-atoms.js, contacts.js' bin counts), the alignment block as biohub's esm builds
 // it, and pdb.template - the page's PDB records with each atom's index where its coordinates go.
 //
-//   esmfold2-featurise <out dir> (--job=<AF3 job.json> | --sequence=<A:B> [--kinds= --ligands= --smiles= --modify=])
+//   ef2-featurise <out dir> (--job=<AF3 job.json> | --sequence=<A:B> [--kinds= --ligands= --smiles= --modify=])
 //                      [--a3m=<one a protein chain>] [--fold-bundle=<dir>]
 #pragma once
 #include <cmath>
@@ -24,7 +24,7 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
   Esmfold2Export out;
   std::string sequence = upper(trimWs(args.option("sequence")));
   if (args.positional.empty() || (sequence.empty() && args.option("job").empty()))
-    throw std::runtime_error("usage: esmfold2-featurise <out dir> --sequence=<SEQ>[:<SEQ>...] [--kinds=protein,dna,...] [--ligands=GOL,ATP]"
+    throw std::runtime_error("usage: ef2-featurise <out dir> --sequence=<SEQ>[:<SEQ>...] [--kinds=protein,dna,...] [--ligands=GOL,ATP]"
                              " [--smiles=OCC(O)CO|...] [--modify=SEP@3[@chain]] | --job=<AF3 job.json>");
   std::string kinds = args.option("kinds");
   ComponentSource components;

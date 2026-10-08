@@ -76,7 +76,7 @@ inline void makeDirs(const std::string& dir) {
 }
 
 // Where the weights live by default (a command's --weights-dir names another): the checkout this binary was built in
-// (it sits at <checkout>/cuda/<port>/<port> or <checkout>/cuda/featurise/<tool>), where every wrapper and the worker
+// (it sits at <checkout>/cuda/<port>/localfold-<port> or <checkout>/cuda/featurise/<tool>), where every wrapper and the worker
 // keep them; ~/.cache/localfold for a binary copied out of its checkout
 inline std::string home() {
   char self[4096];
@@ -245,7 +245,7 @@ inline const std::vector<std::string>& af3Models() {
 }
 inline std::string modelNames() {
   return "af3, boltz2, chai1, protenix2, intellifold2, rosettafold3, opendde, openbind0 (af3); model_1_ptm ... model_5_ptm, "
-         "model_1_multimer_v3 ... model_5_multimer_v3 (af2); esmfold2-fast-600m, esmfold2-fast-300m, esmfold2-fast, esmfold2 (esmfold2)";
+         "model_1_multimer_v3 ... model_5_multimer_v3 (af2); ef2-fast-600m, ef2-fast-300m, ef2-fast, ef2 (ef2)";
 }
 inline ModelWeights model(const std::string& root, const std::string& name) {
   for (auto& m : af3Models())
@@ -262,12 +262,13 @@ inline ModelWeights model(const std::string& root, const std::string& name) {
     if (name[6] != '1') w.dirs.push_back(bundle(root, family + "-" + name[6]));
     return w;
   }
-  if (name == "esmfold2-fast-600m") return {"esmfold2", {bundle(root, "ef2-fast-600m"), bundle(root, "esmc")}};
-  if (name == "esmfold2-fast-300m") return {"esmfold2", {bundle(root, "ef2-fast-300m"), bundle(root, "esmc-300m")}};
-  if (name == "esmfold2" || name == "esmfold2-fast") {       // biohub's released checkpoints: exported locally
-    ModelWeights w{"esmfold2", {root + "/model-" + name + "-f32", root + "/model-esmc-6b-int8"}};
+  if (name == "ef2-fast-600m") return {"ef2", {bundle(root, "ef2-fast-600m"), bundle(root, "esmc")}};
+  if (name == "ef2-fast-300m") return {"ef2", {bundle(root, "ef2-fast-300m"), bundle(root, "esmc-300m")}};
+  if (name == "ef2" || name == "ef2-fast") {       // biohub's released ESMFold2 and ESMFold2-Fast: exported locally
+    ModelWeights w{"ef2", {root + "/model-" + std::string(name == "ef2" ? "esmfold2" : "esmfold2-fast") + "-f32",
+                           root + "/model-esmc-6b-int8"}};
     for (auto& d : w.dirs)
-      if (!exists(d + "/manifest.json")) throw std::runtime_error("no " + d + ": export it first (cuda/esmfold2/README.md, \"The released models\")");
+      if (!exists(d + "/manifest.json")) throw std::runtime_error("no " + d + ": export it first (cuda/ef2/README.md, \"The released models\")");
     return w;
   }
   throw std::runtime_error("no model " + name + ": " + modelNames());

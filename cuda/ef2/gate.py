@@ -1,17 +1,17 @@
 """The native ESMFold2's regression gate, two arms:
 
-  folds    - real targets through cuda/esmfold2/fold (--fast), scored against the deposited structure
+  folds    - real targets through cuda/ef2/fold (--fast), scored against the deposited structure
              (cuda/af3/score.py: CA RMSD after superposition, the chain check). Each case's
              signature (CA RMSD, mean pLDDT, pTM) is held to gate-baseline.json.
-  oracles  - every cuda/esmfold2/data-*/ that carries an oracle-f32att/ (oracle.py --float32-attention:
+  oracles  - every cuda/ef2/data-*/ that carries an oracle-f32att/ (oracle.py --float32-attention:
              biohub's forward with its bf16 atom attention neutralised, Synthyra's confidence head),
              run in float32 (--atom-f32) and in --fast: the last trunk pass, the first denoiser call
              and the per-atom pLDDT held to it - 1e-5 in float32 (they are 1e-7..1e-6), 5e-3 in --fast.
              The data directories are gitignored and built by hand (export_input.mjs + oracle.py).
 
-    python3 cuda/esmfold2/gate.py                 # both arms against the baseline
-    python3 cuda/esmfold2/gate.py --write         # re-record the fold baseline
-    python3 cuda/esmfold2/gate.py --only=folds    # one arm (or a case name)
+    python3 cuda/ef2/gate.py                 # both arms against the baseline
+    python3 cuda/ef2/gate.py --write         # re-record the fold baseline
+    python3 cuda/ef2/gate.py --only=folds    # one arm (or a case name)
 
 A baseline is this machine's: a fold does not reproduce to the digit on another GPU.
 """

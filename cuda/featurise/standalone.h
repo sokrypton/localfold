@@ -1,8 +1,8 @@
 // One port, one command: a job in, a structure out, nothing else to run.
 //
-//   af3      --job=kras.json --out=kras.pdb [--model=boltz2] [--samples=5 ...]
-//   af2      --sequence=<A>:<B> --model=model_1_multimer_v3 --search --out=1brs.pdb
-//   esmfold2 --job=calmodulin.json --out=cam.pdb [--model=esmfold2-fast-300m]
+//   localfold-af3 --job=kras.json --out=kras.pdb [--model=boltz2] [--samples=5 ...]
+//   localfold-af2 --sequence=<A>:<B> --model=model_1_multimer_v3 --search --out=1brs.pdb
+//   localfold-ef2 --job=calmodulin.json --out=cam.pdb [--model=ef2-fast-300m]
 //
 // Each port's main hands a command whose first argument is a flag here (its old first argument, a featurised
 // input directory, is still taken as it was - the resident server and the tests use it). This:
@@ -193,8 +193,8 @@ inline std::string af2WarmShape(const Args& args) {
   return std::to_string(residues.size()) + "," + std::to_string(n) + "," + std::to_string(e) + "," + std::to_string(templates);
 }
 
-// an esmfold2 warm-up shape: T,A - tokens = residues, atoms = their heavy atoms
-inline std::string esmfold2WarmShape(const Args& args) {
+// an ef2 warm-up shape: T,A - tokens = residues, atoms = their heavy atoms
+inline std::string ef2WarmShape(const Args& args) {
   std::string seq = args.option("sequence");
   static const std::string HEAVY = "A5R11N8D8C6Q9E9G4H10I8L8K9M8F11P7S6T7W14Y12V7";
   int tokens = 0, atoms = 1;

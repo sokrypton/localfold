@@ -4056,7 +4056,7 @@ the multimer's model_2 on templated 1BRS 0.344 against 0.340, ipTM identical. A
 delta model's map carries a `D <model>` line and refuses to load without that
 delta.
 
-**What the page needed from the ports.** cuda/af2 and cuda/esmfold2 wrote only a
+**What the page needed from the ports.** cuda/af2 and cuda/ef2 wrote only a
 PDB; both now write AlphaFold 3's `*_confidences.json` and
 `*_summary_confidences.json` beside it, as cuda/af3 always did - the expected
 PAE, pTM and ipTM, the token layout, and AF2's contact probabilities from its
@@ -4302,10 +4302,10 @@ phases. `test:cuda`'s page lane starts the broker without the browser flags.
 ## The CUDA backend featurises natively: no JavaScript on a fold (2026-10-08)
 
 Every CUDA fold used to start with Node: each port's exporter (`cuda/af3/export-model.mjs --no-weights`,
-`cuda/af2/export_input.mjs`, `cuda/esmfold2/export_input.mjs`) ran the page's own featuriser over the job, and
+`cuda/af2/export_input.mjs`, `cuda/ef2/export_input.mjs`) ran the page's own featuriser over the job, and
 `cuda/resolve_templates.mjs` resolved the template rows - kept resident by `cuda/export_server.mjs`, because loading
 their modules was most of an export. All four are C++ now, in `cuda/featurise` (`af3-featurise`, `af2-featurise`,
-`esmfold2-featurise`, `resolve-templates` - one binary linked as each name, built by `cuda/build.sh` with g++ beside
+`ef2-featurise`, `resolve-templates` - one binary linked as each name, built by `cuda/build.sh` with g++ beside
 the ports: four compiles of the same headers were ~60 s of CPU here and twice that on a two-core Colab VM, one is 26 s), and `cuda/worker.py`
 and the three `cuda/*/fold` scripts call them: **a job JSON goes in and a structure comes out with no JavaScript
 anywhere**, and a Colab runtime no longer installs Node.
@@ -4362,8 +4362,8 @@ boltz2, intellifold2 and rosettafold3 too, so every family's walk is exercised t
 
 ## 🔴 Each port is one binary: a job in, a structure out (2026-10-08)
 
-`cuda/af3/af3 --job=kras.json --out=kras.pdb --model=boltz2` is the whole protocol in one process, and so are
-`cuda/af2/af2` and `cuda/esmfold2/esmfold2`: any first argument that is a flag selects it (cuda/featurise/standalone.h),
+`cuda/af3/localfold-af3 --job=kras.json --out=kras.pdb --model=boltz2` is the whole protocol in one process, and so are
+`cuda/af2/localfold-af2` and `cuda/ef2/localfold-ef2`: any first argument that is a flag selects it (cuda/featurise/standalone.h),
 while a featurised directory first, and `--serve`, are the resident server the worker drives, unchanged. It fetches
 the model's published weights natively the first time (cuda/featurise/fetch.h - the registry's pinned remotes,
 generated into `bundles.inc` from shared/bundles/manifests/index.js, and af3-any-model's blobs, AlphaFold 3's only once
@@ -4386,3 +4386,15 @@ and with it the notebook's background prefetch, which downloaded `model-af3-int5
 not read since it moved to af3-any-model's blobs (and prefetching that blob instead would fetch DeepMind's weights
 before the page's terms dialog was accepted). `test:cuda` passes with a bundle moved aside and re-fetched by the
 worker mid-gate, byte-identical to the moved copy.
+
+## 🔴 `localfold-af3`, `localfold-af2`, `localfold-ef2`; the language models in `cuda/plm` (2026-10-08)
+
+The three binaries are named for a PATH - `cuda/af3/localfold-af3`, `cuda/af2/localfold-af2`, `cuda/ef2/localfold-ef2` -
+with a later `pip install localfold` in mind, and the ESMFold2 port is `cuda/ef2` beside `af3` and `af2`, its models
+`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2` (the keys the page and the worker already used; biohub's own
+checkpoint names stay where they name a checkpoint). Each takes `--help`; `--weights-dir=<dir>` replaces
+`LOCALFOLD_HOME`; `cuda/featurise/fetch-weights <model>` fetches by the same names, so `--af3-any-model` - which only
+told the website's int5 bundles from af3-any-model's blobs of the same names, and nothing native reads the former - is
+gone. ESM-C and ESM2 3B live in `cuda/plm` as components (Chai-1 stays in the AF3 family; its network is AlphaFold 3's).
+Every fold is byte-identical across the renames and the move; `cuda/crosscheck.sh`, which compiled the ports with a
+bare nvcc line that cannot link the standalone object, builds through `cuda/build.sh` now.

@@ -1,6 +1,6 @@
 weights*/
 data*/
-af2
-af2.arch
-af2.building
 *.o
+/localfold-af2
+localfold-af2.arch
+localfold-af2.building

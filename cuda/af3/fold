@@ -8,7 +8,7 @@
 #
 # --model=<name> picks the model (default af3): af3-any-model's own published int8 blob (af3am-<name>/, fetched
 # once by cuda/featurise/fetch-weights; chai1 with ESM2 3B's beside it), read through its weight walk
-# (cuda/featurise/af3_weights.h). A single fold is the standalone binary, `cuda/af3/af3 --out=<out.pdb> <flags>`
+# (cuda/featurise/af3_weights.h). A single fold is the standalone binary, `cuda/af3/localfold-af3 --out=<out.pdb> <flags>`
 # (cuda/featurise/standalone.h: the weights fetched, the input featurised in the same process).
 # AlphaFold 3's are Google DeepMind's, for academic non-commercial use: the first fetch asks you to accept its
 # terms (or set LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3).
@@ -42,22 +42,22 @@ case "$model" in af3|openbind0|opendde|boltz2|protenix2|intellifold2|rosettafold
   *) echo "no model $model (af3, openbind0, opendde, boltz2, protenix2, intellifold2, rosettafold3, chai1)" >&2; exit 1 ;; esac
 [ -x "$repo/cuda/featurise/featurise" ] || bash "$repo/cuda/build.sh" featurise
 if [ -z "$batch" ] && [ -z "$serve" ] && ! { [ -f "/tmp/af3-serve-$model-$(id -u)/pid" ] && kill -0 "$(cat "/tmp/af3-serve-$model-$(id -u)/pid")" 2>/dev/null; }; then
-  [ -x "$here/af3" ] || bash "$repo/cuda/build.sh" af3 >&2
-  exec "$here/af3" --out="$out" --model="$model" "${inputs[@]}" "${foldflags[@]}"
+  [ -x "$here/localfold-af3" ] || bash "$repo/cuda/build.sh" af3 >&2
+  exec "$here/localfold-af3" --out="$out" --model="$model" "${inputs[@]}" "${foldflags[@]}"
 fi
 "$repo/cuda/featurise/fetch-weights" "$model" >/dev/null || exit 1      # (chai1: ESM2 3B too; a no-op once here)
 wflags=(--bundle="$repo/af3am-$model" --family="$model"); dialect=(--family="$model")
 if [ "$model" = chai1 ]; then
   wflags+=(--esm-bundle="$repo/af3am-esm2")
 fi
-[ -x "$here/af3" ] || bash "$repo/cuda/build.sh" af3 >&2
+[ -x "$here/localfold-af3" ] || bash "$repo/cuda/build.sh" af3 >&2
 featurise=("$repo/cuda/featurise/af3-featurise")
 serve_dir="/tmp/af3-serve-$model-$(id -u)"
 server_up() { [ -f "$serve_dir/pid" ] && kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null; }
 if [ "$serve" = --serve ]; then
   server_up && { echo "already serving $model ($serve_dir)"; exit 0; }
   mkdir -p "$serve_dir"; rm -f "$serve_dir"/*.job "$serve_dir"/*.done
-  nohup "$here/af3" - --serve="$serve_dir" "${wflags[@]}" --fold --fast "${foldflags[@]}" > "$serve_dir/server.log" 2>&1 &
+  nohup "$here/localfold-af3" - --serve="$serve_dir" "${wflags[@]}" --fold --fast "${foldflags[@]}" > "$serve_dir/server.log" 2>&1 &
   echo $! > "$serve_dir/pid"
   until grep -q "af3: serving" "$serve_dir/server.log" 2>/dev/null; do
     kill -0 "$(cat "$serve_dir/pid")" 2>/dev/null || { cat "$serve_dir/server.log" >&2; exit 1; }
@@ -90,7 +90,7 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # without the line (an error) it waits for the exit status
 run_af3() {
   local done=0 line
-  exec 4< <("$here/af3" "$1" "${wflags[@]}" --fold --fast --out="$2" --wait-input --detach-output "${foldflags[@]}" && rc=0 || rc=$?; echo "af3: exit $rc")
+  exec 4< <("$here/localfold-af3" "$1" "${wflags[@]}" --fold --fast --out="$2" --wait-input --detach-output "${foldflags[@]}" && rc=0 || rc=$?; echo "af3: exit $rc")
   while IFS= read -r line <&4; do
     case "$line" in "af3: done") done=1; break ;; "af3: exit "*) exec 4<&-; return "${line#af3: exit }" ;; *) printf '%s\n' "$line" ;; esac
   done

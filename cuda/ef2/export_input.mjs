@@ -1,7 +1,7 @@
 // One ESMFold2 input for the native CUDA port: the page's own features (shared/esmfold2/featurise.js,
 // what webgpu/esmfold2/fold.js folds with), in cuda/af3's model.idx/model.bin format.
 //
-//   node --js-float16array cuda/esmfold2/export_input.mjs <out dir> --sequence=<SEQ>[:<SEQ>...] [--kinds=protein,dna]
+//   node --js-float16array cuda/ef2/export_input.mjs <out dir> --sequence=<SEQ>[:<SEQ>...] [--kinds=protein,dna]
 //        [--ligands=GOL,ATP] [--smiles=OCC(O)CO|...] [--modify=SEP@3[@chain]]   |   --job=<AF3 job.json>
 //
 // Entries (i int32, t float32):

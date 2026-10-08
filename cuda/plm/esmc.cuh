@@ -8,10 +8,10 @@
 //   x    = x + swiglu(LN(x; ffn_norm) @ fc1) @ fc2
 //
 // esmcTower hands every hidden state to its caller - the embedding, each block's, and the last one after the final
-// LayerNorm - which is what ESMFold2's shim mixes (cuda/esmfold2/src/shim.cuh). Weights under "c/" (the ESM-C
-// bundle, or ESM-C 6B's resident int8 codes); its float32 building blocks are cuda/esmfold2's ops.cuh.
+// LayerNorm - which is what ESMFold2's shim mixes (cuda/ef2/src/shim.cuh). Weights under "c/" (the ESM-C
+// bundle, or ESM-C 6B's resident int8 codes); its float32 building blocks are cuda/ef2's ops.cuh.
 #pragma once
-#include "../esmfold2/src/ops.cuh"
+#include "../ef2/src/ops.cuh"
 
 __global__ void embedK(const int* ids, const float* table, float* x, int rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
