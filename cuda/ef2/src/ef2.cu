@@ -431,6 +431,11 @@ static int foldMain(int argc, char** argv) {
   // is forgotten after it. The warm fold needs only the shapes - it loads every kernel module and
   // cuBLAS plan. 6MRR's cold trunk is 128 ms against 39 warm.
   bool warming = !warmShape.empty();
+  // ...and only while there is something to hide behind: an input already written (a sequence featurises in
+  // milliseconds, beside ~200 ms of CUDA context) folds now, its own first fold doing what the warm-up would - the
+  // warm-up's ~175 ms cost more than the cold kernels it saves (6MRR 0.78 -> 0.74 s command to structure, 5CAJ
+  // 1.08 -> 1.01, 1TIM 1.56 -> 1.52, byte-identical). A search or a dictionary fetch still in flight keeps it
+  if (warming && waitInput && serveDir.empty() && access((std::string(argv[1]) + "/model.idx").c_str(), R_OK) == 0) warming = false;
   for (int sgi = 0; sgi < weightSegs; ++sgi) { if (warming) M.uploadAsync(sgi); else M.upload(sgi); }
   if (warming) {
     int wt = 0, wa = 0;

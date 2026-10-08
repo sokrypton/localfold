@@ -173,12 +173,23 @@ def main():
                     seen.add(l[22:27]); out += three.get(l[17:20], "X")
             return out
         S5 = seq_of("5caj-crystal.pdb", "A")
+        # 🔴 THROUGH THE TWO-STEP PATH WITH --warm, because the standalone binary now skips its warm-up when the input is
+        # already written (a sequence is) - which would leave these arms folding with no warm-up at all, passing for
+        # want of the thing they test. The worker's resident server always warms, so this is the path that ships it
+        dirs = {}
+        for line in run([os.path.join(CUDA, "featurise", "fetch-weights"), "ef2-fast-600m", "ef2"]).stdout.splitlines():
+            name, _, d = line.partition(": ")
+            if d: dirs.setdefault(name, []).append(d)
         for model, extra_env in (("ef2-fast-600m", {}), ("ef2", {}), ("ef2", {"LOCALFOLD_BIG": "1"})):
             arms = []
+            trunk, tower = dirs[model]
+            inputs = os.path.join(work, f"slow-in-{model}")
+            shutil.rmtree(inputs, ignore_errors=True)
+            run([os.path.join(CUDA, "featurise", "ef2-featurise"), inputs, f"--sequence={S5}", f"--fold-bundle={trunk}"])
             for slow in ("0", "400"):
                 out = os.path.join(work, f"slow-{model}-{slow}-{len(extra_env)}.pdb")
-                r = run([binary("ef2"), f"--sequence={S5}", f"--model={model}", "--seed=1", f"--out={out}"],
-                        dict(os.environ, LOCALFOLD_SLOW_UPLOAD_MS=slow, **extra_env))
+                r = run([binary("ef2"), inputs, f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast", "--warm=96,800",
+                         "--seed=1", f"--out={out}"], dict(os.environ, LOCALFOLD_SLOW_UPLOAD_MS=slow, **extra_env))
                 arms.append(open(out, "rb").read() if r.returncode == 0 and os.path.exists(out) else b"failed: " + (r.stdout + r.stderr)[-200:].encode())
             ok = arms[0] == arms[1] and not arms[0].startswith(b"failed: ")
             # (two arms failing alike are equal too: a fold must have happened for equality to mean anything)
