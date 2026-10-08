@@ -630,7 +630,7 @@ function installColabStatus() {
       runtimeWebgpu = gpu.webgpu !== false && gpu.vendor !== "google"
         && !/swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
       const offered = health.backends ?? [];
-      if ((offered.includes("jax") || offered.includes("native")) && !badge.querySelector("select")) {
+      if ((offered.includes("jax") || offered.includes("cuda")) && !badge.querySelector("select")) {
         const pick = document.createElement("select");
         pick.className = "colab-backend";
         pick.title = "CUDA: LocalFold's native ports, compiled for the runtime's card -"
@@ -638,7 +638,7 @@ function installColabStatus() {
           + " own fold, on the runtime's GPU. JAX: af3-any-model, the reference"
           + " implementation - a minute of compile on its first fold, and the one that"
           + " runs on a TPU.";
-        const choices = [["native", "CUDA"], ["webgpu", "WebGPU"], ["jax", "JAX"]]
+        const choices = [["cuda", "CUDA"], ["webgpu", "WebGPU"], ["jax", "JAX"]]
           .filter(([value]) => value === "webgpu" || offered.includes(value));
         for (const [value, text] of choices) {
           const option = document.createElement("option");
@@ -660,7 +660,7 @@ function installColabStatus() {
           || /swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
         // ...and where the CUDA backend is offered it is the default: it is the
         // same fold as WebGPU's, minutes faster on the card the runtime has.
-        const fallback = offered.includes("native") ? "native" : software ? "jax" : "webgpu";
+        const fallback = offered.includes("cuda") ? "cuda" : software ? "jax" : "webgpu";
         let stored = null;
         try { stored = localStorage.getItem("localfold.colabBackend"); }
         catch (cause) { /* remembered for this page only */ }
@@ -677,7 +677,7 @@ function installColabStatus() {
         badge.insertBefore(pick, leave);
         // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it is
         // set here, per fold, by whoever is watching - and shown only for the backend it applies to
-        if (offered.includes("native")) {
+        if (offered.includes("cuda")) {
           const live = document.createElement("label");
           live.className = "colab-live";
           live.title = "Live preview: stream a CUDA fold's intermediate results as it runs - each trunk"
@@ -694,7 +694,7 @@ function installColabStatus() {
             catch (cause) { /* remembered for this page only */ }
           });
           live.append(box, document.createTextNode(" Live"));
-          const showLive = () => { live.hidden = pick.value !== "native"; };
+          const showLive = () => { live.hidden = pick.value !== "cuda"; };
           pick.addEventListener("change", showLive);
           showLive();
           badge.insertBefore(live, leave);

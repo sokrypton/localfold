@@ -86,7 +86,7 @@ reads them out of chai-lab, tools/add_chai1_structure_to_blob.py adds them). Aga
 is 2e-7 to 6e-7 on 6MRR and **5.4e-7 on 5CAJ with its crystal as template**; denoise 4.4e-7,
 confidence 1e-6. 6MRR from its sequence folds at 0.92-1.93 A over five samples (chai-lab
 0.95-1.78); 5CAJ at 2.32 A, 2.28 with its template - the N-terminal tag and the doubly-modelled
-165-169 loop, 0.46 / 0.39 A over the best 90%. The CUDA worker folds it (`test:native` has four
+165-169 loop, 0.46 / 0.39 A over the best 90%. The CUDA worker folds it (`test:cuda` has four
 cases); the page does not offer it, having no WebGPU forward for it yet.
 
 Where this port leaves af3-any-model for chai-lab, measured each time:
@@ -450,7 +450,7 @@ add passes. ESMFold2's port already had fused kernels for a 256-channel track th
 in narrow steps (two blocks an SM where cuda/af3's 128-channel ones would need 255 registers); they now
 live in src/fused256.cuh and protenix2 takes them from 80 tokens - triangle in, the f16 contraction,
 triangle out, and the transition's widening ahead of cuBLAS's second GEMM: **trunk 1259 -> 1180 ms (6.4%)
-at 262 tokens**, templated 5CAJ 0.191 A either way (`test:native` holds it). At 384 and 512 channels the
+at 262 tokens**, templated 5CAJ 0.191 A either way (`test:cuda` holds it). At 384 and 512 channels the
 same kernels fit one block an SM and LOSE (2160 against 1925 ms, 3360 against 2821), so those stay unfused.
 On an L4 they pay more than on the A100, at one block an SM: protenix2's trunk **5.13 -> 4.12 s** at 262
 tokens, ESMFold2's (whose they were) 1.60 -> 1.07.

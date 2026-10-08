@@ -17,7 +17,7 @@ asks. Four routes carry that, all of them token-checked:
 With `--jax-dir`, a fold whose payload says `backend: "jax"` is not forwarded
 to the page: jax/worker.py runs it with af3-any-model and its events land
 in the same mailbox, so the reader follows either one with the same code. With
-`--native`, `backend: "native"` goes to cuda/worker.py the same way -
+`--cuda`, `backend: "cuda"` goes to cuda/worker.py the same way -
 LocalFold's CUDA ports, on the page's own weights.
 
 🔴 THE POINT IS THAT THERE IS NO SECOND IMPLEMENTATION. The fold that runs
@@ -327,7 +327,7 @@ class JaxWorker:
         self.lock = threading.Lock()
 
     def _start(self):
-        # LOCALFOLD_JAX_WORKER (LOCALFOLD_NATIVE_WORKER) stands a stub in for the
+        # LOCALFOLD_JAX_WORKER (LOCALFOLD_CUDA_WORKER) stands a stub in for the
         # real worker, which is how tools/check-colab-bridge.py tests this path
         # with no GPU and no JAX.
         worker = os.environ.get(self.stub) or os.path.join(REPO, self.script)
@@ -343,7 +343,7 @@ class JaxWorker:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if event.get("kind") in ("jax-ready", "native-ready"):
+            if event.get("kind") in ("jax-ready", "cuda-ready"):
                 continue
             with self.lock:
                 event["seq"] = self.seq
@@ -374,8 +374,8 @@ class JaxWorker:
                     "payload": {"error": "stopped"}})
 
 
-def serve(port, backend, token, host="127.0.0.1", jax=None, native=None):
-    workers = {name: worker for name, worker in (("jax", jax), ("native", native)) if worker is not None}
+def serve(port, backend, token, host="127.0.0.1", jax=None, cuda=None):
+    workers = {name: worker for name, worker in (("jax", jax), ("cuda", cuda)) if worker is not None}
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=REPO, **kw)
@@ -673,7 +673,7 @@ def serve(port, backend, token, host="127.0.0.1", jax=None, native=None):
                 return self._json(400, {"error": f'unknown op "{op}"'})
             payload = body.get("payload") or {}
             wanted = payload.get("backend")
-            if op == "fold" and wanted in ("jax", "native"):
+            if op == "fold" and wanted in ("jax", "cuda"):
                 if wanted not in workers:
                     return self._json(400, {"error": f"this runtime has no {'JAX' if wanted == 'jax' else 'CUDA'} backend"})
                 with MAIL_LOCK:
@@ -718,15 +718,15 @@ def main():
                         help="what to bind; the tunnel reaches loopback")
     parser.add_argument("--jax-dir", default=None,
                         help="the ColabFold2 install directory: offers the JAX backend")
-    parser.add_argument("--native", action="store_true",
+    parser.add_argument("--cuda", action="store_true",
                         help="offer the CUDA backend: cuda/ built (cuda/colab_setup.sh)")
     arguments = parser.parse_args()
 
     token = arguments.token or secrets.token_urlsafe(24)
     backend = Backend(arguments.port, arguments.cdp_port, arguments.profile, token)
     jax = JaxWorker(arguments.jax_dir) if arguments.jax_dir else None
-    native = JaxWorker(REPO, "cuda/worker.py", "LOCALFOLD_NATIVE_WORKER", "CUDA") if arguments.native else None
-    httpd = serve(arguments.port, backend, token, arguments.host, jax, native)
+    cuda = JaxWorker(REPO, "cuda/worker.py", "LOCALFOLD_CUDA_WORKER", "CUDA") if arguments.cuda else None
+    httpd = serve(arguments.port, backend, token, arguments.host, jax, cuda)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {REPO} on {arguments.host}:{arguments.port}"
           + (" · Disconnect will release this Colab machine" if RUNTIME_ADDR
@@ -757,7 +757,7 @@ def main():
         # In a Colab runtime the container takes them; on a developer's machine
         # they are the "another browser on the machine" that makes the next
         # measurement somebody else's.
-        for worker in (jax, native):
+        for worker in (jax, cuda):
             if worker is not None and worker.proc is not None:
                 worker.proc.kill()
         if backend.proc is not None:

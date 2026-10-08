@@ -357,7 +357,7 @@ a block at a time and adds it into z, in the stored form's block size and order:
 neither z_init nor the language model's pair (two 256-channel f32 pairs) is kept. The **triangle
 multiplication goes in output blocks** (`triangleBlockedEf2`, on cuda/af3/src/triblocked.cuh, shared
 with cuda/af2) where the whole form would not fit with room to spare. `LOCALFOLD_BIG=1` forces both;
-6MRR 1.422 A either way, and check-native-worker passes under it. A simulated T4 folds 1,600 residues.
+6MRR 1.422 A either way, and check-cuda-worker passes under it. A simulated T4 folds 1,600 residues.
 On the same short card the pair transition normalises a chunk of rows at a time (the whole f16 normalised
 pair was 2.95 GB at 2,400), the confidence head's last call normalises the trunk's z in place and parks its
 residual in pinned host memory while its blocks run (two 256-channel pairs fewer), and the distogram goes a

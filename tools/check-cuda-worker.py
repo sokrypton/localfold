@@ -1,9 +1,9 @@
-"""The CUDA backend's worker, folding for real: npm run test:native.
+"""The CUDA backend's worker, folding for real: npm run test:cuda.
 
-    python3 tools/check-native-worker.py             # every case (two go to api.colabfold.com)
-    python3 tools/check-native-worker.py --offline   # without the search cases
-    python3 tools/check-native-worker.py --no-page   # without the page arm (a headless Chrome, a broker)
-    python3 tools/check-native-worker.py --only=6mrr  # just the cases whose name contains it
+    python3 tools/check-cuda-worker.py             # every case (two go to api.colabfold.com)
+    python3 tools/check-cuda-worker.py --offline   # without the search cases
+    python3 tools/check-cuda-worker.py --no-page   # without the page arm (a headless Chrome, a broker)
+    python3 tools/check-cuda-worker.py --only=6mrr  # just the cases whose name contains it
 
 cuda/worker.py over its own stdin protocol, one process for every case as the broker runs it,
 each job shaped as the page sends one (AlphaFold 3 JSON from the entity rows, the rows themselves, the
@@ -167,7 +167,7 @@ def cases(offline):
 
 
 def score(pdb_text, reference, chains):
-    path = "/tmp/localfold-native-check.pdb"
+    path = "/tmp/localfold-cuda-check.pdb"
     with open(path, "w") as handle:
         handle.write(pdb_text)
     said = subprocess.run([sys.executable, os.path.join(REPO, "cuda", "af3", "score.py"), path, reference, chains],
@@ -177,16 +177,16 @@ def score(pdb_text, reference, chains):
 
 
 def page_arm(bad):
-    """The website's half: a real broker (tools/colab_backend.py --native), a reader's page on it, the
+    """The website's half: a real broker (tools/colab_backend.py --cuda), a reader's page on it, the
     backend picker set to CUDA, a sequence and Fold - and what the page made of the answer: the status
     line the worker wrote, a prediction in the page's own shape (its PAE a typed array of tokens^2, the
     model labelled CUDA), and no WebGPU device asked for in the reader's browser."""
     sys.path.insert(0, os.path.join(REPO, "tools"))
     import cdp
     import urllib.request
-    port, cdp_port, reader_port, token = 8893, 9395, 9396, "native-check"
+    port, cdp_port, reader_port, token = 8893, 9395, 9396, "cuda-check"
     broker = subprocess.Popen([sys.executable, "tools/colab_backend.py", "--port", str(port), "--cdp-port", str(cdp_port),
-                               "--token", token, "--profile", "/tmp/localfold-native-page-runtime", "--native"],
+                               "--token", token, "--profile", "/tmp/localfold-cuda-page-runtime", "--cuda"],
                               cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     reader = None
     try:
@@ -195,10 +195,10 @@ def page_arm(bad):
             if line.startswith("BACKEND ") or time.time() > deadline:
                 break
         health = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/health?t={token}"))
-        if "native" not in health.get("backends", []):
-            bad.append(f"page: /health offers {health.get('backends')} with --native")
+        if "cuda" not in health.get("backends", []):
+            bad.append(f"page: /health offers {health.get('backends')} with --cuda")
             return
-        reader, ws = cdp.launch(reader_port, "/tmp/localfold-native-page-reader")
+        reader, ws = cdp.launch(reader_port, "/tmp/localfold-cuda-page-reader")
         ws.call("Page.enable")
         ws.call("Runtime.enable")
         ws.call("Page.addScriptToEvaluateOnNewDocument", source="""
@@ -213,7 +213,7 @@ def page_arm(bad):
           for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2', 'protenix2', 'intellifold2', 'rosettafold3'])
             try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); } catch (cause) {}
           const pick = document.querySelector('.colab-backend');
-          pick.value = 'native'; pick.dispatchEvent(new Event('change', { bubbles: true }));
+          pick.value = 'cuda'; pick.dispatchEvent(new Event('change', { bubbles: true }));
           return true;
         })()""")
         # the badge's Live preview: present for CUDA, and off means the finished fold only
@@ -294,10 +294,10 @@ def main():
     if only is not None:
         plan = [case for case in plan if only in case[0]]
     worker = subprocess.Popen([sys.executable, os.path.join(REPO, "cuda", "worker.py")], cwd=REPO,
-                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open("/tmp/localfold-native-check.log", "w"),
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open("/tmp/localfold-cuda-check.log", "w"),
                               text=True, bufsize=1)
     first = json.loads(worker.stdout.readline())
-    bad = [] if first.get("kind") == "native-ready" else [f"the worker's first line was {first}, not native-ready"]
+    bad = [] if first.get("kind") == "cuda-ready" else [f"the worker's first line was {first}, not cuda-ready"]
     for name, payload, reference, bar, tokens, refusal in plan:
         started = time.time()
         worker.stdin.write(json.dumps(payload) + "\n")
@@ -329,8 +329,8 @@ def main():
         c = result.get("confidence") or {}
         n = len(c.get("plddt") or [])
         problems = []
-        if result.get("native") is not True:
-            problems.append("not marked native")
+        if result.get("cuda") is not True:
+            problems.append("not marked cuda")
         if len(c.get("predictedAlignedError") or []) != n * n:
             problems.append(f"PAE {len(c.get('predictedAlignedError') or [])} for {n} tokens")
         if len((result.get("tokens") or {}).get("chainIds") or []) != n:
@@ -366,9 +366,9 @@ def main():
     if "--no-page" not in sys.argv:
         page_arm(bad)
     if bad:
-        print("\n" + "\n".join(bad) + "\n\nnative worker: FAILED (its log: /tmp/localfold-native-check.log)")
+        print("\n" + "\n".join(bad) + "\n\ncuda worker: FAILED (its log: /tmp/localfold-cuda-check.log)")
         sys.exit(1)
-    print("\nnative worker: ok")
+    print("\ncuda worker: ok")
 
 
 if __name__ == "__main__":

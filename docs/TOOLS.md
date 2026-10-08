@@ -316,6 +316,7 @@ go through CDP, and the deploy.
 - **`check-batch-fields.js`** - OUR WHOLE FEATURISED BATCH against af3-any-model's own, field by field, for every dumped model.
 - **`check-bundle-vs-params.py`** - Is this bundle the weights af3-any-model loads, tensor by tensor?
 - **`check-colab-bridge.py`** - Two-way between the reader's page and the runtime that folds for it.
+- **`check-cuda-worker.py`** - The CUDA backend's worker, folding for real: npm run test:cuda.
 - **`check-esmc-reference.js`** - Does cpu/esmc/tower.js compute ESM-C?
 - **`check-esmfold2-confidence.js`** - ESMFold2's confidence head against Synthyra's own, on the host.
 - **`check-esmfold2-diffusion.js`** - ESMFold2's diffusion module, module by module, against its own recorded calls.
@@ -331,7 +332,6 @@ go through CDP, and the deploy.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
-- **`check-native-worker.py`** - The CUDA backend's worker, folding for real: npm run test:native.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
 - **`check-smiles-batch.mjs`** - A SMILES ligand featurises to the SAME BATCH its CCD code does, field by field.

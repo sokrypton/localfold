@@ -4019,13 +4019,13 @@ are (`cuda/*/maps`). The point is speed: a fold is a second or two on the card
 the runtime already has, with no compile minute and no second browser.
 
 **The pieces.** `cuda/worker.py` speaks `jax/worker.py`'s line
-protocol, so the broker (`tools/colab_backend.py --native`) relays it exactly as
+protocol, so the broker (`tools/colab_backend.py --cuda`) relays it exactly as
 it relays JAX, and the page ingests the result through the same builder
 (`jaxPrediction`, labelled `(CUDA)`). The notebook's `cuda_backend` (on by
 default) installs Node 22 where the image is older, starts `cuda/build.sh` in
 the background - the three ports compiled in parallel for the card, atomically,
 stamped with the card and a hash of the sources - and starts the broker with
-`--native`; a CUDA fold that arrives mid-build waits on it, saying so.
+`--cuda`; a CUDA fold that arrives mid-build waits on it, saying so.
 
 🔴 **NOTHING ABOUT A MOLECULE IS DECIDED IN THE WORKER.** Each exporter reads
 the reader's AF3 JSON with the page's own reader (`cuda/af2/export_input.mjs`
@@ -4071,7 +4071,7 @@ one), stops it before an AF2 or ESMFold2 fold so two models never share the
 card, and every child dies with the worker (`PR_SET_PDEATHSIG`), so a Stop -
 which kills the worker - leaves nothing holding the GPU.
 
-**Measured on a Colab T4 (2026-10-03), `npm run test:native` there:** the build
+**Measured on a Colab T4 (2026-10-03), `npm run test:cuda` there:** the build
 is 134 s for all three ports (hidden behind the service starting); every fold
 within 0.01 Å of the A100's - AF3 6MRR 0.624, 5CAJ with its crystal 0.231,
 protenix2 0.645, OpenDDE 1.183, AF2 6MRR 1.903, AF2 5CAJ templated 0.216, the
@@ -4081,7 +4081,7 @@ multimer's 1BRS 0.282, ESMFold2 1.467, AF3 1BRS from a searched MSA 0.59, AF2
 ESMFold2 and its tower 50); a later one is ~2 s; the reader's page, click to
 ingested result, 2.8-3.4 s for AF3, AF2 and ESMFold2.
 
-**Gates.** `npm run test:native` (tools/check-native-worker.py): the real worker
+**Gates.** `npm run test:cuda` (tools/check-cuda-worker.py): the real worker
 over its own protocol on this A100 - every fold scored against its crystal,
 every result held to the fields the page ingests, four refusals, two searched
 cases (`--offline` skips them), AF2's early stop, and a real reader's page
@@ -4135,7 +4135,7 @@ and ipTM equal its final confidences exactly; a streamed contact map is within
 one byte of the final file's. It is the reader's to turn off, on the page:
 the badge's **Live** checkbox beside the backend picker (shown for CUDA,
 remembered per browser), sent as `frames` with each fold - it decides what that
-page draws, so it lives there and not in the notebook. `test:native`
+page draws, so it lives there and not in the notebook. `test:cuda`
 holds every port to what it streams and the reader's viewer to frames carrying
 their contact maps and PAE.
 
@@ -4166,7 +4166,7 @@ almost all of it was start-up paid on every fold:
   for a job with no template) and the exporter (0.12-0.23 s, ~180 ms of it module loading).
   cuda/export_server.mjs keeps an exporter loaded and imports it afresh a request (its dependencies
   stay cached, its output is captured to the request's log); the resolver runs only when a row asks
-  for a template. Every export of every `test:native` case is byte-identical to a cold run's, printed
+  for a template. Every export of every `test:cuda` case is byte-identical to a cold run's, printed
   output included, with the jobs mixed in the order the gate runs them.
 
 Then the reader's page, click to result for a warm fold: **0.50 s for 0.1 s of fold.**
@@ -4189,7 +4189,7 @@ Then the reader's page, click to result for a warm fold: **0.50 s for 0.1 s of f
 | ESMFold2, Live on | 0.50 | **0.25** |
 
 A change of model still pays its weights once (~1 s here); the first fold on a runtime still pays the
-build and the bundle download. `test:native` reports click-to-result now, not that plus its own 1 s
+build and the bundle download. `test:cuda` reports click-to-result now, not that plus its own 1 s
 settle, and takes `--only=<substring>`.
 
 **The first build, cut where it is spent.** nvcc's `-O` is the HOST code's optimisation level (the device

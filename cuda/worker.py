@@ -2,7 +2,7 @@
 
     python3 cuda/worker.py            # run from the repository root
 
-Started by tools/colab_backend.py (`--native`) and fed one job per line on stdin, exactly as
+Started by tools/colab_backend.py (`--cuda`) and fed one job per line on stdin, exactly as
 jax/worker.py is; every line it prints on stdout is one bridge event, `{"kind", "payload", "at"}` -
 `status`, `progress` and `result` - so the reader's page follows a CUDA fold with the code that follows a
 WebGPU or a JAX one.
@@ -31,7 +31,7 @@ import traceback
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 CUDA = os.path.join(REPO, "cuda")
-WORK = os.environ.get("LOCALFOLD_CUDA_WORK", "/tmp/localfold-native")
+WORK = os.environ.get("LOCALFOLD_CUDA_WORK", "/tmp/localfold-cuda")
 AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
 # ...whose dialect has no working flow sampler (noFlowSampler, shared/af3/dialect.js)
 NO_FLOW_FAMILIES = ("rosettafold3", "chai1")
@@ -141,7 +141,7 @@ def ensure_blob(name, log):
     return directory
 
 
-BUILD_MARKER, BUILD_LOG = "/tmp/localfold-native-build", "/tmp/localfold-native-build.log"
+BUILD_MARKER, BUILD_LOG = "/tmp/localfold-cuda-build", "/tmp/localfold-cuda-build.log"
 
 
 def building():
@@ -652,7 +652,7 @@ class Worker:
             confidence["iptm"] = summary["iptm"]
         mean = confidence["meanPlddt"]
         return {
-            "native": True, "model": f"native {port}", "family": family,
+            "cuda": True, "model": f"cuda {port}", "family": family,
             "pdb": pdb, "confidence": confidence,
             "tokens": {"chainIds": chain_ids, "resIds": res_ids},
             "chains": polymer_chains(job["job"]), "msas": {},
@@ -663,7 +663,7 @@ class Worker:
 
 
 def main():
-    emit("native-ready", {"at": int(time.time() * 1000)})
+    emit("cuda-ready", {"at": int(time.time() * 1000)})
     worker = Worker()
     for line in sys.stdin:
         if not line.strip():

@@ -6,8 +6,8 @@
 # Each port is compiled for the card nvidia-smi reports (sm_75 a T4, sm_89 an L4, sm_80 an A100), the three
 # in parallel, each to a temporary file moved into place only when whole - so native/<port>/<port> either
 # does not exist or is a finished binary, and a fold never starts on half of one. While it runs,
-# /tmp/localfold-native-build holds this script's pid (cuda/worker.py waits on it rather than
-# refusing a fold that arrives mid-build); the log is /tmp/localfold-native-build.log. A port already
+# /tmp/localfold-cuda-build holds this script's pid (cuda/worker.py waits on it rather than
+# refusing a fold that arrives mid-build); the log is /tmp/localfold-cuda-build.log. A port already
 # built for this card from these sources is left alone.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -15,7 +15,7 @@ ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(af3 af2 esmfold2)
 cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
 [ -n "$cc" ] || { echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; }
 arch="sm_$cc"
-marker=/tmp/localfold-native-build log=/tmp/localfold-native-build.log
+marker=/tmp/localfold-cuda-build log=/tmp/localfold-cuda-build.log
 echo $$ > "$marker"; trap 'rm -f "$marker"' EXIT
 : > "$log"
 pids=()

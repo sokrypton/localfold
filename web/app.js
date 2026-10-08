@@ -4108,14 +4108,14 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // 🔴 A JAX FOLD IS HANDED THE JOB AS AlphaFold 3 JSON, written by the same
   // module that writes the archive's request - so the entity conversion is
   // this page's and not re-implemented in Python. See jax/worker.py.
-  if (remoteBackendChoice() === "jax" || remoteBackendChoice() === "native") {
+  if (remoteBackendChoice() === "jax" || remoteBackendChoice() === "cuda") {
     request.backend = remoteBackendChoice();
     // ...and the sampler this page would fold with (samplerPlan): the steps as well as the start, because an
     // empty dial is the family's preferred count here and would be the model's own default there
     const { calls, schedule } = samplerPlan(family, ligandCodes ?? [], modifications ?? []);
     request.schedule = { steps: calls, ...schedule };
     // ...and, for CUDA, whether it streams its intermediate results here (the badge's Live preview)
-    if (request.backend === "native") request.frames = remoteLiveChoice();
+    if (request.backend === "cuda") request.frames = remoteLiveChoice();
     // ...the RESOLVED model, which is not the row's value where a second row
     // picks it: the PLM row turns "ef2" into the 600M or 300M checkpoint.
     request.family = family;
@@ -4137,7 +4137,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
     }
   }
   status(`${label} · folding on the runtime${request.backend === "jax" ? " with JAX"
-    : request.backend === "native" ? " with CUDA" : ""}…`);
+    : request.backend === "cuda" ? " with CUDA" : ""}…`);
   progress("waiting");
   // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
   // every event of the session, so a reader that started at zero would replay
@@ -4312,7 +4312,7 @@ async function followRemoteFold({ since, label, signal }) {
   // for the downloads, the scores card and the saved session.
   // ...and a CUDA fold the same way: cuda/worker.py sends the same fields.
   const jax = result.jax === true ? jaxPrediction(result, stem, label, "JAX")
-    : result.native === true ? jaxPrediction(result, stem, label, "CUDA") : null;
+    : result.cuda === true ? jaxPrediction(result, stem, label, "CUDA") : null;
 
   // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
   // fills the sequence strip, the download buttons and the scores card - the
