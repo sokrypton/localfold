@@ -4229,3 +4229,31 @@ First fold of 6MRR through the worker: AF3 1.00 -> 0.75 s, AF2 0.94 -> 0.65, ESM
 reader's page 1.52 -> 1.27, 1.00 -> 0.75, 1.01 -> 0.77. (A warm-up run AFTER the job is ready only adds:
 ESMFold2's launch-to-result 0.94 s cold against 1.03-1.10 warmed.)
 
+
+## 🔴 CUDA is the only Colab backend a reader's page uses (2026-10-08)
+
+The badge's backend picker is gone. Every fold a reader starts on a Colab page
+goes to the CUDA worker (`remoteBackendChoice` in web/colab-bridge.js returns
+`"cuda"`, and nothing on the page can change it), and the notebook builds and
+offers CUDA on every runtime - its `cuda_backend` box is gone with the picker.
+**A runtime that cannot do CUDA refuses rather than folding somewhere slower**:
+the badge reads `Colab runtime · <card> · no CUDA backend`, the Live box is not
+offered, and Fold ends on the broker's own sentence, "this runtime has no CUDA
+backend" (checked by hand with a broker started without `--cuda`). A CPU or TPU
+runtime is told to change runtime type.
+
+The reader's half of the model warm-up went with it: it asked the runtime's
+WebGPU page to start a model's download and compiles, which only a WebGPU fold
+could use. What is still there and is reached by nothing on the page: the
+runtime page's WebGPU fold relay (`obey` in colab-bridge.js, with
+`window.__warmModel` and the broker's `warm` op), and the JAX worker behind
+`--jax-dir` (`jax_backend` still installs it, for a fold sent to the service
+with `backend: "jax"`). `test:colab` and `test:pending` still drive the relay
+over plain HTTP as their fixture.
+
+The gates follow. `test:colab`'s reader arm presses Fold and reads the job the
+CUDA stub was handed - 11 controls, the resolved family, the job JSON - and
+the stub's answer on the reader's screen; pointing the page back at `webgpu`
+fails it ("handed the CUDA worker no job"). `test:pending` starts its broker
+with `--cuda` and a stub that holds its fold, as a real one does. `test:cuda`'s
+page lane asserts there is no select.

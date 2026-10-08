@@ -80,9 +80,8 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
-import { colabRole, installColabBridge, onRemoteReady, remoteBackendChoice, remoteCommand, remoteLiveChoice,
-  remoteEvents, remoteWebgpuReal,
-  remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
+import { colabRole, installColabBridge, remoteBackendChoice, remoteCommand, remoteLiveChoice,
+  remoteEvents, remoteHead, revivePrediction, tapOut } from "./colab-bridge.js";
 // A runtime page the Colab broker opened reads its weights through the broker;
 // see bundleBaseUrl in shared/bundles/manifests/index.js.
 if (new URLSearchParams(location.search).get("weights") === "proxy") {
@@ -927,38 +926,6 @@ let foldContext = {};
 // The family the page last folded, so a change of model can release the last
 // one's resident weights - see the fold's first lines.
 let lastFoldedFamily;
-
-/**
- * 🔴 A COLAB RUNTIME SITS IDLE WHILE THE READER CHOOSES, AND A T4's COLD FOLD
- * IS NEARLY ALL WAITING. Measured on one (68 residues, empty caches): the
- * compiler busy 16.5 s of AF3's 22.5, 43.8 of OpenDDE's 50.5, 63.9 of
- * IntelliFold-2's 73.6 - whose 612 MB also took 57 s to arrive. So the reader
- * tells the runtime which model it has picked, the moment it picks it, and the
- * runtime starts that model's download and pipeline compiles while the
- * sequence is still being typed. The loaders keep their promises, so the fold
- * takes what is already under way. WebGPU only: a JAX fold starts its own
- * worker. See `warmModel`, which is what the runtime runs.
- */
-let warmedRemotely;
-function warmRemoteModel(family) {
-  if (remoteBackend() === null || remoteBackendChoice() !== "webgpu" || !remoteWebgpuReal()) return;
-  // 🔴 NOT AlphaFold 3 BEFORE ITS TERMS ARE ACCEPTED. The warm-up runs a real
-  // fold of a dummy sequence, and this page runs nothing of AF3's until the
-  // reader has agreed to DeepMind's parameter terms (agreeModelTerms) - a
-  // runtime warming it ahead of that would be the one place it did. A reader
-  // who accepted before is warmed as soon as they connect; one accepting now
-  // folds on the next click, and the fold's own path compiles what it needs.
-  if (family === "af3" && !termsAccepted()) return;
-  if (family === warmedRemotely) return;
-  warmedRemotely = family;
-  const tokens = entityList.read().reduce((sum, entity) =>
-    sum + (POLYMER_TYPES.includes(entity.type) ? String(entity.value ?? "").length * entity.copies : 0), 0);
-  void remoteCommand("warm", { family, tokens: tokens || 100 }).catch(() => {});
-}
-
-// ...and once the runtime has said what GPU it has, or the reader switches to
-// WebGPU, the model already chosen is warmed.
-onRemoteReady(() => { try { warmRemoteModel(chosenFamily()); } catch (cause) { /* nothing chosen yet */ } });
 
 /**
  * The runtime's half: start `family`'s download and compiles.
@@ -2665,7 +2632,6 @@ function setFoldButton(state) {
 function syncModelControls() {
   const family = chosenFamily();
   const af3 = isAf3Family(family);
-  warmRemoteModel(family);
   // 🔴 THE MODEL NUMBER IS AF2's ALONE, and the test is the ROW's value rather
   // than the resolved family - `chosenFamily` has already folded the number
   // into it, so asking the resolved one whether to show the control that
@@ -4105,39 +4071,37 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   const { entities, controls } = formInputs();
   const request = { entities, controls };
   const label = MODEL_LABELS[family] ?? family;
-  // 🔴 A JAX FOLD IS HANDED THE JOB AS AlphaFold 3 JSON, written by the same
-  // module that writes the archive's request - so the entity conversion is
-  // this page's and not re-implemented in Python. See jax/worker.py.
-  if (remoteBackendChoice() === "jax" || remoteBackendChoice() === "cuda") {
-    request.backend = remoteBackendChoice();
-    // ...and the sampler this page would fold with (samplerPlan): the steps as well as the start, because an
-    // empty dial is the family's preferred count here and would be the model's own default there
-    const { calls, schedule } = samplerPlan(family, ligandCodes ?? [], modifications ?? []);
-    request.schedule = { steps: calls, ...schedule };
-    // ...and, for CUDA, whether it streams its intermediate results here (the badge's Live preview)
-    if (request.backend === "cuda") request.frames = remoteLiveChoice();
-    // ...the RESOLVED model, which is not the row's value where a second row
-    // picks it: the PLM row turns "ef2" into the 600M or 300M checkpoint.
-    request.family = family;
-    request.job = jobInputJson({ name: safeJobName(entityList.header() ?? "fold"),
-      seed: Number(controls["random-seed"]) || 1, entities });
-    // ...and an uploaded alignment travels with the job, because the worker is
-    // on the other machine and the file is on this one. A pasted one is in
-    // `controls["msa-text"]` already; a searched one the worker fetches itself.
-    // An archive holds one alignment a chain and a Map of paired ones, which
-    // JSON cannot carry; a bare a3m is the text in the box.
-    if (msaMode() === "upload" && uploadedMsas?.inline !== undefined) {
-      throw new Error("the job's own alignments fold on this machine only - fold it here, or set the MSA to search");
-    }
-    if (msaMode() === "upload") {
-      request.msas = uploadedMsas?.chains > 0
-        ? { unpaired: uploadedMsas.chainA3ms,
-            paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index) ?? "") }
-        : { merged: uploadedMsas?.merged ?? uploadedA3m };
-    }
+  // 🔴 EVERY REMOTE FOLD IS A CUDA FOLD (remoteBackendChoice), HANDED THE JOB AS
+  // AlphaFold 3 JSON, written by the same module that writes the archive's
+  // request - so the entity conversion is this page's and not re-implemented
+  // in Python. See cuda/worker.py.
+  request.backend = remoteBackendChoice();
+  // ...and the sampler this page would fold with (samplerPlan): the steps as well as the start, because an
+  // empty dial is the family's preferred count here and would be the model's own default there
+  const { calls, schedule } = samplerPlan(family, ligandCodes ?? [], modifications ?? []);
+  request.schedule = { steps: calls, ...schedule };
+  // ...and whether it streams its intermediate results here (the badge's Live preview)
+  request.frames = remoteLiveChoice();
+  // ...the RESOLVED model, which is not the row's value where a second row
+  // picks it: the PLM row turns "ef2" into the 600M or 300M checkpoint.
+  request.family = family;
+  request.job = jobInputJson({ name: safeJobName(entityList.header() ?? "fold"),
+    seed: Number(controls["random-seed"]) || 1, entities });
+  // ...and an uploaded alignment travels with the job, because the worker is
+  // on the other machine and the file is on this one. A pasted one is in
+  // `controls["msa-text"]` already; a searched one the worker fetches itself.
+  // An archive holds one alignment a chain and a Map of paired ones, which
+  // JSON cannot carry; a bare a3m is the text in the box.
+  if (msaMode() === "upload" && uploadedMsas?.inline !== undefined) {
+    throw new Error("the job's own alignments fold on this machine only - fold it here, or set the MSA to search");
   }
-  status(`${label} · folding on the runtime${request.backend === "jax" ? " with JAX"
-    : request.backend === "cuda" ? " with CUDA" : ""}…`);
+  if (msaMode() === "upload") {
+    request.msas = uploadedMsas?.chains > 0
+      ? { unpaired: uploadedMsas.chainA3ms,
+          paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index) ?? "") }
+      : { merged: uploadedMsas?.merged ?? uploadedA3m };
+  }
+  status(`${label} · folding on the runtime with CUDA…`);
   progress("waiting");
   // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
   // every event of the session, so a reader that started at zero would replay

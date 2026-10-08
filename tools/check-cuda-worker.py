@@ -177,8 +177,8 @@ def score(pdb_text, reference, chains):
 
 
 def page_arm(bad):
-    """The website's half: a real broker (tools/colab_backend.py --cuda), a reader's page on it, the
-    backend picker set to CUDA, a sequence and Fold - and what the page made of the answer: the status
+    """The website's half: a real broker (tools/colab_backend.py --cuda), a reader's page on it - no
+    backend picker, CUDA is where its folds go - a sequence and Fold - and what the page made of the answer: the status
     line the worker wrote, a prediction in the page's own shape (its PAE a typed array of tokens^2, the
     model labelled CUDA), and no WebGPU device asked for in the reader's browser."""
     sys.path.insert(0, os.path.join(REPO, "tools"))
@@ -208,14 +208,15 @@ def page_arm(bad):
             navigator.gpu.requestAdapter = (...a) => { window.__readerGpu += 1; return ask(...a); };
           }""")
         ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=colab&t={token}")
-        cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.colab-backend')", 120, "the reader's page")
+        cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.colab-live')", 120, "the reader's page")
         cdp.evaluate(ws, """(() => {
           for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2', 'protenix2', 'intellifold2', 'rosettafold3'])
             try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); } catch (cause) {}
-          const pick = document.querySelector('.colab-backend');
-          pick.value = 'cuda'; pick.dispatchEvent(new Event('change', { bubbles: true }));
           return true;
         })()""")
+        # ...and nothing to choose: the page offers no backend control at all
+        if cdp.evaluate(ws, "!!document.querySelector('#colab-status select')"):
+            bad.append("page: the badge offers a backend select - CUDA is not a choice")
         # the badge's Live preview: present for CUDA, and off means the finished fold only
         live = cdp.evaluate(ws, "(() => { const l = document.querySelector('.colab-live'); return l ? { shown: !l.hidden, on: l.querySelector('input').checked } : null; })()")
         if not live or not live["shown"] or not live["on"]:

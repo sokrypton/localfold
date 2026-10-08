@@ -501,30 +501,17 @@ export function base64ToBytes(text) {
 }
 
 /**
- * Which implementation folds on the runtime: this page's WebGPU fold, run by
- * the runtime's headless copy of it, LocalFold's native CUDA ports (the same
- * weights and inputs, compiled for the card - cuda/worker.py), or
- * af3-any-model on JAX (the reference, and the only one that reaches a TPU).
- * The badge offers the choice when the runtime was started with more than one;
- * see tools/colab_backend.py.
+ * Where a reader's fold runs: LocalFold's native CUDA ports on the runtime
+ * (cuda/worker.py), always. There is no choice on the page - a runtime the
+ * notebook could not build CUDA on refuses the fold by saying so (see
+ * tools/colab_backend.py), rather than folding somewhere slower in silence.
  */
-let backendChoice = "webgpu";
-export const remoteBackendChoice = () => backendChoice;
+export const remoteBackendChoice = () => "cuda";
 // ...and whether a CUDA fold streams its intermediate results to this page while it runs (each trunk pass's
 // contact map, the sampler's frames, AF2's passes with their scores) - the reader's choice, on the badge,
 // because it is this page that draws them. Measured at under 1% of a fold (cuda/worker.py).
 let liveChoice = true;
 export const remoteLiveChoice = () => liveChoice;
-
-// 🔴 WHETHER THE RUNTIME HAS A REAL GPU IS NOT KNOWN UNTIL /health ANSWERS, and
-// the choice above says "webgpu" until then - so anything that acts on it early
-// (the model warm-up) waits for this. A TPU runtime's WebGPU is SwiftShader: a
-// warm-up there downloads weights and compiles on the CPU beside JAX.
-let runtimeWebgpu = null;
-const readyListeners = [];
-export const remoteWebgpuReal = () => runtimeWebgpu === true;
-export function onRemoteReady(listener) { readyListeners.push(listener); }
-const announceReady = () => { for (const listener of readyListeners) listener(); };
 
 /** Ask the runtime for something. Returns the command's sequence number. */
 export const remoteCommand = (op, payload) => ask("/in", { op, payload });
@@ -613,6 +600,7 @@ function installColabStatus() {
   // T4 from SwiftShader wearing its clothes.
   let card = "";
   let releases = false;
+  let cudaOffered = null;
   const nameTheCard = async () => {
     if (card !== "") return;
     try {
@@ -624,81 +612,31 @@ function installColabStatus() {
       // by hand there is no machine to hand back, and a button that promises
       // one either way is wrong half the time.
       releases = health.colabRuntime === true;
-      // 🔴 THE CHOICE APPEARS ONLY WHERE IT EXISTS. A runtime started without
-      // `--jax-dir` has one backend, and a select with one option is a control
-      // that pretends there is something to decide.
-      runtimeWebgpu = gpu.webgpu !== false && gpu.vendor !== "google"
-        && !/swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
-      const offered = health.backends ?? [];
-      if ((offered.includes("jax") || offered.includes("cuda")) && !badge.querySelector("select")) {
-        const pick = document.createElement("select");
-        pick.className = "colab-backend";
-        pick.title = "CUDA: LocalFold's native ports, compiled for the runtime's card -"
-          + " the page's own weights and inputs, and the fastest. WebGPU: this page's"
-          + " own fold, on the runtime's GPU. JAX: af3-any-model, the reference"
-          + " implementation - a minute of compile on its first fold, and the one that"
-          + " runs on a TPU.";
-        const choices = [["cuda", "CUDA"], ["webgpu", "WebGPU"], ["jax", "JAX"]]
-          .filter(([value]) => value === "webgpu" || offered.includes(value));
-        for (const [value, text] of choices) {
-          const option = document.createElement("option");
-          option.value = value;
-          option.textContent = text;
-          // 🔴 NO ADAPTER AT ALL IS NOT A SLOW CARD - a fold there fails. Offered
-          // disabled, with the reason, rather than hidden: the reader should see
-          // why their usual backend is not available on this runtime.
-          if (value === "webgpu" && gpu.webgpu === false) {
-            option.disabled = true;
-            option.textContent = "WebGPU (no GPU on this runtime)";
-          }
-          pick.append(option);
-        }
-        // 🔴 WHERE WebGPU HAS NO CARD, JAX IS THE DEFAULT. A TPU runtime (or any
-        // without a GPU driver) gives WebGPU SwiftShader - the CPU, minutes a
-        // fold - and the TPU sits idle; only JAX reaches it.
-        const software = gpu.webgpu === false || gpu.vendor === "google"
-          || /swiftshader|llvmpipe/i.test(gpu.architecture ?? "");
-        // ...and where the CUDA backend is offered it is the default: it is the
-        // same fold as WebGPU's, minutes faster on the card the runtime has.
-        const fallback = offered.includes("cuda") ? "cuda" : software ? "jax" : "webgpu";
-        let stored = null;
-        try { stored = localStorage.getItem("localfold.colabBackend"); }
-        catch (cause) { /* remembered for this page only */ }
-        pick.value = choices.some(([value]) => value === stored) ? stored : fallback;
-        if (gpu.webgpu === false && pick.value === "webgpu") pick.value = fallback === "webgpu" ? "jax" : fallback;
-        if (pick.value === "") pick.value = "webgpu";
-        backendChoice = pick.value;
-        pick.addEventListener("change", () => {
-          backendChoice = pick.value;
-          announceReady();
-          try { localStorage.setItem("localfold.colabBackend", pick.value); }
+      // 🔴 NO CUDA, NO FOLD - AND THE BADGE SAYS SO BEFORE THE READER TRIES. The
+      // notebook builds the CUDA ports on every runtime it starts; one with no
+      // NVIDIA card (a TPU, a CPU runtime) offers none, and the broker refuses
+      // the fold with the same sentence.
+      cudaOffered = (health.backends ?? []).includes("cuda");
+      if (cudaOffered && !badge.querySelector(".colab-live")) {
+        // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it
+        // is set here, per fold, by whoever is watching
+        const live = document.createElement("label");
+        live.className = "colab-live";
+        live.title = "Live preview: stream a CUDA fold's intermediate results as it runs - each trunk"
+          + " pass's contact map, the sampler's frames, AlphaFold 2's passes with their scores. Off, the"
+          + " page shows the finished fold only. Measured at under 1% of a fold.";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        try { box.checked = localStorage.getItem("localfold.colabLive") !== "off"; }
+        catch (cause) { box.checked = true; }
+        liveChoice = box.checked;
+        box.addEventListener("change", () => {
+          liveChoice = box.checked;
+          try { localStorage.setItem("localfold.colabLive", box.checked ? "on" : "off"); }
           catch (cause) { /* remembered for this page only */ }
         });
-        badge.insertBefore(pick, leave);
-        // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it is
-        // set here, per fold, by whoever is watching - and shown only for the backend it applies to
-        if (offered.includes("cuda")) {
-          const live = document.createElement("label");
-          live.className = "colab-live";
-          live.title = "Live preview: stream a CUDA fold's intermediate results as it runs - each trunk"
-            + " pass's contact map, the sampler's frames, AlphaFold 2's passes with their scores. Off, the"
-            + " page shows the finished fold only. Measured at under 1% of a fold.";
-          const box = document.createElement("input");
-          box.type = "checkbox";
-          try { box.checked = localStorage.getItem("localfold.colabLive") !== "off"; }
-          catch (cause) { box.checked = true; }
-          liveChoice = box.checked;
-          box.addEventListener("change", () => {
-            liveChoice = box.checked;
-            try { localStorage.setItem("localfold.colabLive", box.checked ? "on" : "off"); }
-            catch (cause) { /* remembered for this page only */ }
-          });
-          live.append(box, document.createTextNode(" Live"));
-          const showLive = () => { live.hidden = pick.value !== "cuda"; };
-          pick.addEventListener("change", showLive);
-          showLive();
-          badge.insertBefore(live, leave);
-        }
+        live.append(box, document.createTextNode(" Live"));
+        badge.insertBefore(live, leave);
       }
       leave.title = releases
         ? "Stop folding here and release this Colab machine: the service"
@@ -709,7 +647,6 @@ function installColabStatus() {
       // ...and the timing report is headed with it, because the rows in it
       // were recorded on that card and not on this one.
       if (card !== "") devSourceIs(`the Colab runtime · ${card}`);
-      announceReady();
     } catch (cause) { /* the pulse below is what matters; this is its name */ }
   };
 
@@ -742,7 +679,7 @@ function installColabStatus() {
       badge.dataset.state = gone ? "gone" : "live";
       said.textContent = gone
         ? "Colab runtime · not answering"
-        : `Colab runtime${card ? ` · ${card}` : ""}`;
+        : `Colab runtime${card ? ` · ${card}` : ""}${cudaOffered === false ? " · no CUDA backend" : ""}`;
       leave.textContent = folding ? "Stop & disconnect" : "Disconnect";
     } catch (cause) {
       badge.dataset.state = "gone";

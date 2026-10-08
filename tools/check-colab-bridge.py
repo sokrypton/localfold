@@ -22,11 +22,10 @@ WHAT IT CHECKS, in the order a session does them:
   * one GPU, one fold - a second `fold` while one is running is refused 429,
     and the refusal lifts when the page reports a result;
   * THE READER'S OWN PAGE does all of that for real: a second browser opens
-    `index.html?backend=colab`, is handed a sequence and clicked, and what it
-    ends up showing must be what the runtime said. The weights are blocked on
-    the runtime page first, so the fold fails in seconds instead of pulling
-    hundreds of megabytes - the transport is what is being measured, and a
-    failure travels the same way a structure does;
+    `index.html?backend=colab`, is handed a sequence and clicked, offers no
+    backend to choose, hands the CUDA worker (a stub here) a job carrying
+    every control the reader set, and ends up showing what the worker said.
+    The weights stay blocked on the runtime page, so nothing here ever folds;
   * THE FEED HOLDS WHILE THE PAGE IS BUSY - twenty events pushed from the
     runtime page across six seconds of 300 ms blocking tasks, which is what a
     fold does to a main thread. This is the regression guard for the fault the
@@ -148,10 +147,14 @@ for line in sys.stdin:
 ''')
 # ...and the CUDA backend's (cuda/worker.py), the same protocol from another stub: what is
 # tested is that `backend: "cuda"` reaches IT and not the JAX worker or the page.
+# It also writes down every job it is handed, which is how the reader's arm reads what its Fold sent.
 CUDA_STUB = os.path.join(JAX_DIR, "cuda_stub_worker.py")
+CUDA_JOBS = os.path.join(JAX_DIR, "cuda_jobs.jsonl")
 with open(CUDA_STUB, "w") as handle:
     handle.write(open(STUB).read().replace('"jax-ready"', '"cuda-ready"').replace("stub on JAX", "stub on CUDA")
-                 .replace('"stub done"', '"cuda stub done"'))
+                 .replace('"stub done"', '"cuda stub done"')
+                 .replace("    job = json.loads(line)\n",
+                          f"    job = json.loads(line)\n    open({CUDA_JOBS!r}, 'a').write(line)\n"))
 
 print(f"starting the broker on {PORT} (a headless Chrome comes with it)…")
 backend = subprocess.Popen(
@@ -329,43 +332,32 @@ try:
           return { ...want, 'af3-mode': 'flow', 'msa-mode': 'none' };
         })()""")
         print(f"  the reader's form: {chosen}")
-        # 🔴 THE BACKEND PICKER OFFERS ALL THREE AND DEFAULTS TO CUDA, which this broker was started with -
-        # and this arm is about the WebGPU relay, so it picks WebGPU as a reader would, through the control.
-        cdp.wait_for(reader_ws, "!!document.querySelector('.colab-backend')", 60, "the backend picker")
-        picker = cdp.evaluate(reader_ws, """(() => {
-          const pick = document.querySelector('.colab-backend');
-          const offered = [...pick.options].map((o) => o.value), first = pick.value;
-          pick.value = 'webgpu';
-          pick.dispatchEvent(new Event('change', { bubbles: true }));
-          return { offered, first };
-        })()""")
-        print(f"  the backend picker offers {picker['offered']}, defaulting to {picker['first']}")
-        if sorted(picker["offered"]) != ["cuda", "jax", "webgpu"] or picker["first"] != "cuda":
-            bad.append(f"the picker offers {picker['offered']} defaulting to {picker['first']}; want all three, CUDA first")
+        # 🔴 THERE IS NO BACKEND TO PICK: a reader's fold is a CUDA fold, and the badge offers no control.
+        if cdp.evaluate(reader_ws, "!!document.querySelector('#colab-status select')"):
+            bad.append("the badge offers a backend select - CUDA is not a choice")
         cdp.wait_for(reader_ws, "!document.getElementById('predict').disabled", 60,
                      "the reader's fold button")
         cdp.evaluate(reader_ws, "(document.getElementById('predict').click(), true)")
 
-        # The command reaches the broker... and it is the one this click made,
-        # not the empty fold the arm above sent over curl.
+        # The job reaches the CUDA worker... and it is the one this click made, not the empty fold the
+        # arms above and below send over curl.
         asked, deadline = None, time.time() + 30
         while time.time() < deadline and asked is None:
-            code, said = call("/out?since=0")
-            for command in said.get("commands") or []:
-                if command.get("op") != "fold":
-                    continue
-                if (command.get("payload") or {}).get("entities"):
-                    asked = command
+            if os.path.exists(CUDA_JOBS):
+                for line in open(CUDA_JOBS):
+                    job = json.loads(line)
+                    if job.get("entities"):
+                        asked = job
             time.sleep(0.25)
         if asked is None:
-            bad.append("pressing Fold on the reader's page put no `fold`"
-                       " command in the broker - foldOnBackend never asked")
+            bad.append("pressing Fold on the reader's page handed the CUDA worker no job -"
+                       " foldOnBackend never asked")
         else:
-            payload = asked.get("payload") or {}
-            entities = payload.get("entities") or []
-            sent = payload.get("controls") or {}
-            print(f"  the reader asked: {asked['op']}, {len(entities)} entity,"
-                  f" {len(sent)} control(s), model {sent.get('model-family')}")
+            sent = asked.get("controls") or {}
+            print(f"  the reader asked CUDA: {len(asked.get('entities') or [])} entity,"
+                  f" {len(sent)} control(s), model {asked.get('family')}, job {bool(asked.get('job'))}")
+            if asked.get("backend") != "cuda":
+                bad.append(f"the reader's fold went to backend {asked.get('backend')!r}, not cuda")
             # 🔴 EVERY CONTROL THE READER SET, NOT THE FIVE SOMEBODY LISTED.
             # `foldOnBackend` named entities, model, steps, recycles and msa by
             # hand and a fold is made of eleven controls, so the sampler, the
@@ -376,39 +368,12 @@ try:
             if missing:
                 arrived = {k: sent.get(k) for k in chosen}
                 bad.append(f"the reader's form did not travel: wanted {chosen},"
-                           f" the command carried {arrived}")
+                           f" the job carried {arrived}")
+            if not asked.get("job") or not asked.get("family"):
+                bad.append("the CUDA job carried no AlphaFold 3 JSON or no resolved family")
 
-            # ...AND IT IS PUT ON THE RUNTIME'S OWN FORM. Travelling is half of
-            # it: the runtime applies these to the page it folds with, and the
-            # select that holds the diffusion count is REBUILT by the sampler
-            # sync that runs during the apply - so a single-pass apply assigns
-            # the count and then overwrites it with the model's preferred one,
-            # and the fold runs at a step count nobody asked for. Read off the
-            # page that folds, which is the only place that can say.
-            landed, deadline = {}, time.time() + 60
-            while time.time() < deadline:
-                landed = cdp.evaluate(runtime_ws, """(() => {
-                  const g = (id) => document.getElementById(id);
-                  const out = {};
-                  for (const id of ['af3-count', 'af3-mode', 'recycles',
-                                    'random-seed', 'msa-mode']) {
-                    out[id] = g(id)?.value;
-                  }
-                  return out;
-                })()""") or {}
-                if all(landed.get(k) == v for k, v in chosen.items()):
-                    break
-                time.sleep(0.5)
-            print(f"  the runtime's form: {landed}")
-            wrong = {k: (v, landed.get(k)) for k, v in chosen.items()
-                     if landed.get(k) != v}
-            if wrong:
-                bad.append("the runtime folded with a different form than the"
-                           f" reader asked for (asked, got): {wrong}")
-
-        # ...and the runtime's answer reaches the reader's own screen. The
-        # fold cannot succeed with the weights blocked; what is asserted is
-        # that its commentary ARRIVED and was applied, which is the bug.
+        # ...and the worker's answer reaches the reader's own screen: what is
+        # asserted is that its commentary ARRIVED and was applied, which is the bug.
         seen, deadline = {}, time.time() + 120
         while time.time() < deadline:
             seen = cdp.evaluate(reader_ws, """(() => ({

@@ -219,15 +219,30 @@ def set_row(ws, row_id, value):
     time.sleep(0.4)
 
 
+# 🔴 A READER'S FOLD IS A CUDA FOLD, so the broker offers CUDA - through a stub worker that speaks
+# cuda/worker.py's protocol (see tools/check-colab-bridge.py): a status line, one frame, and then it
+# HOLDS, as a real fold on a card does, until the broker's Stop ends it.
+CUDA_STUB = "/tmp/localfold-pending-cuda-stub.py"
+with open(CUDA_STUB, "w") as handle:
+    handle.write('''import json, sys, time
+say = lambda kind, payload: print(json.dumps({"kind": kind, "payload": payload, "at": int(time.time() * 1000)}), flush=True)
+say("cuda-ready", {})
+for line in sys.stdin:
+    say("status", "stub on CUDA")
+    say("frame", %r)
+    time.sleep(600)
+''' % tiny_pdb())
+
 print(f"starting the broker on {PORT} (it is the fixture, not the subject)…")
 backend = subprocess.Popen(
     [sys.executable, "tools/colab_backend.py", "--port", str(PORT),
      "--cdp-port", str(CDP_PORT), "--token", TOKEN,
-     "--profile", "/tmp/localfold-pending-runtime"],
+     "--profile", "/tmp/localfold-pending-runtime", "--cuda"],
     cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     # ...and it is told it is on a Colab machine, which is the only difference
     # between this run and one in a notebook.
-    env={**os.environ, "TBE_RUNTIME_ADDR": f"127.0.0.1:{UNASSIGN_PORT}"})
+    env={**os.environ, "TBE_RUNTIME_ADDR": f"127.0.0.1:{UNASSIGN_PORT}",
+         "LOCALFOLD_CUDA_WORKER": CUDA_STUB})
 reader = None
 try:
     ready, deadline = False, time.time() + 180

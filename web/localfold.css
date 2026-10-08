@@ -1218,7 +1218,6 @@
    width and centres the badge in it, and gives it up entirely when the head
    wraps on a narrow screen. */
 .colab-live { display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
-.colab-live[hidden] { display: none; }
 .colab-live input { margin: 0; }
 
 .colab-status-slot {
