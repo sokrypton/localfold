@@ -332,7 +332,9 @@ def main():
                              " `cleanSequence`, which keeps only amino-acid"
                              " letters, so `A12:SG - B1:C25` came back"
                              " `A:SGB:C` the moment the reader clicked away."
-                             " Third row type to walk into that branch.")
+                             " Third row type to walk into that branch. The"
+                             " page gets a glycerol as chain B first, so the"
+                             " fold after it can place the bond.")
     parser.add_argument("--smiles-ui", action="store_true",
                         help="set the SMILES row by DRIVING THE CONTROLS - pick"
                              " the type from the dropdown, type into the box,"
@@ -720,13 +722,31 @@ def main():
             # `cleanSequence` strips. Setting it through the entity list's API
             # cannot see that; typing it and clicking away is what a reader
             # does.
+            #
+            # 🔴 AND THE BOND MUST NAME ATOMS THAT EXIST, BECAUSE THE FOLD RUNS
+            # AFTER: the page resolves a contact to the tokens carrying its
+            # atoms and refuses one it cannot place. This probe used to type the
+            # placeholder's `A12:SG - B1:C25` onto a page with ONE chain, so its
+            # UI half passed and its fold died on "bond 1 to: no chain 1" - the
+            # page right, the probe wrong. Chain B is a glycerol row added
+            # first, and the contact names atoms the two chains have.
             print("contact ui:", cdp.evaluate(ws, """(() => {
-              const want = 'A12:SG - B1:C25';
-              document.getElementById('add-entity')?.click();
+              const want = 'A12:CA - B1:C1';
               // Re-queried after every mutation, never held: a type change and
               // a blur both re-render the list, so an element captured before
               // one is detached afterwards. See the note on --smiles-ui.
               const last = () => [...document.querySelectorAll('.entity-row')].pop();
+              document.getElementById('add-entity')?.click();
+              {
+                const select = last().querySelector('.entity-type');
+                select.value = 'ligand';
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+                const box = last().querySelector('textarea.entity-value, input.entity-value');
+                box.value = 'GOL';
+                box.dispatchEvent(new Event('input', { bubbles: true }));
+                box.dispatchEvent(new Event('blur', { bubbles: true }));
+              }
+              document.getElementById('add-entity')?.click();
               const setType = (value) => {
                 const select = last().querySelector('.entity-type');
                 select.value = value;
