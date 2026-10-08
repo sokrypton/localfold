@@ -87,6 +87,7 @@
   "//test:colab": "The Colab bridge, with no GPU and no weights: tools/colab_backend.py with tools/colab_stub_worker.py standing in for cuda/worker.py, every route driven from the reader's side and through a real reader's page. It starts a Chrome, so it is not in the node lane.",
     "test:colab": "python3 tools/check-colab-bridge.py",
     "test:cuda": "python3 tools/check-cuda-worker.py",
+    "test:featurise": "bash cuda/build.sh featurise && python3 tools/check-native-featuriser.py",
     "test:switch": "python3 tools/check-model-switch.py",
   "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. \ud83d\udd34 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
     "test:tools": "python3 tools/index-tools.py"

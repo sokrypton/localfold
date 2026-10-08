@@ -5,13 +5,14 @@
 #   cuda/esmfold2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
 #   cuda/esmfold2/fold 6mrr.pdb --model=esmfold2 --sequence=GWSTELEKHREEL... [--a3m=<path>[,<path>...]]
 #
-# --model=esmfold2-fast-600m (the default: the experimental tier the page ships), or one of the released models,
+# --model=esmfold2-fast-600m (the default: the experimental tier the page ships), esmfold2-fast-300m (its 300M
+# sibling, the page's other ESMFold2 row), or one of the released models,
 # esmfold2-fast and esmfold2 (with its MSA encoder), from their local bundles (see README.md, "The released models").
 #
 # The weights are exported once (cuda/esmfold2/export_weights.mjs, from the float32 bundles on disk:
 # model-esmfold2-trunk-f32 and model-esmc-600m-f32) into cuda/esmfold2/weights; the input goes through the
-# page's featuriser (export_input.mjs) while ef2 starts up and warms up; flags after -- go to ./esmfold2,
-# which runs --fast.
+# native featuriser (cuda/featurise/esmfold2-featurise: the page's own, byte for byte, no JavaScript) while ef2
+# starts up and warms up; flags after -- go to ./esmfold2, which runs --fast.
 set -euo pipefail
 # the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
 gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"; echo "sm_${cc:-80}"; }
@@ -33,12 +34,16 @@ case "$model" in
     [ -f "$repo/model-esmfold2-int5/manifest.json" ] && [ -f "$repo/model-esmc-600m-int3/manifest.json" ] ||
       python3 "$repo/cuda/fetch_bundles.py" ef2-fast-600m esmc
     fold_bundle="$repo/model-esmfold2-int5"; esmc_bundle="$repo/model-esmc-600m-int3" ;;
+  esmfold2-fast-300m)
+    [ -f "$repo/model-ef2-fast-300m-int5/manifest.json" ] && [ -f "$repo/model-esmc-300m-int3/manifest.json" ] ||
+      python3 "$repo/cuda/fetch_bundles.py" ef2-fast-300m esmc-300m
+    fold_bundle="$repo/model-ef2-fast-300m-int5"; esmc_bundle="$repo/model-esmc-300m-int3" ;;
   esmfold2|esmfold2-fast)
     fold_bundle="$repo/model-$model-f32"; esmc_bundle="$repo/model-esmc-6b-int8"
     for b in "$fold_bundle" "$esmc_bundle"; do
       [ -f "$b/manifest.json" ] || { echo "no $b: export it first (cuda/esmfold2/README.md, \"The released models\")" >&2; exit 1; }
     done ;;
-  *) echo "--model=$model: esmfold2-fast-600m, esmfold2-fast or esmfold2" >&2; exit 1 ;;
+  *) echo "--model=$model: esmfold2-fast-600m, esmfold2-fast-300m, esmfold2-fast or esmfold2" >&2; exit 1 ;;
 esac
 wflags=(--fold-bundle="$fold_bundle" --esmc-bundle="$esmc_bundle")
 tmp="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
@@ -52,7 +57,9 @@ atoms=$(awk -v s="$seq" 'BEGIN { split("A5 R11 N8 D8 C6 Q9 E9 G4 H10 I8 L8 K9 M8
 warm=(); [ -z "$seq" ] || warm=(--warm="${#seq},$atoms")     # (a job's size is not known before its export)
 exec 3< <("$here/esmfold2" "$tmp" "${wflags[@]}" --out="$out" --wait-input --detach-output "${warm[@]}" --fast "${flags[@]}" \
           && rc=0 || rc=$?; echo "ef2: exit $rc")     # (&& || survives set -e, which would skip the echo)
-if ! node --js-float16array "$here/export_input.mjs" "$tmp" "${inputs[@]}" --fold-bundle="$fold_bundle"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
+featurise="$repo/cuda/featurise/esmfold2-featurise"
+[ -x "$featurise" ] || g++ -std=c++17 -O2 -ffp-contract=off -pthread "$repo/cuda/featurise/esmfold2_featurise.cpp" -o "$featurise"
+if ! "$featurise" "$tmp" "${inputs[@]}" --fold-bundle="$fold_bundle"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
 # "ef2: done" (its stdout then closes): the fold is written and ef2 is only releasing the device
 while IFS= read -r line <&3; do

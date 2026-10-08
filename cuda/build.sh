@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Build the native ports for this machine's GPU:
+# Build the native ports for this machine's GPU, and the native featurisers beside them:
 #
 #   bash cuda/build.sh [af3] [af2] [esmfold2]      (all three when none is named)
+#   bash cuda/build.sh featurise                    (the featurisers alone: no GPU, no nvcc)
 #
+# The featurisers (cuda/featurise: af3-featurise, af2-featurise, esmfold2-featurise, resolve-templates - host C++,
+# no GPU, a job JSON in and each port's input out, byte for byte the page's) are built first and always, so a fold
+# needs no Node at all.
 # Each port is compiled for the card nvidia-smi reports (sm_75 a T4, sm_89 an L4, sm_80 an A100), the three
 # in parallel, each to a temporary file moved into place only when whole - so native/<port>/<port> either
 # does not exist or is a finished binary, and a fold never starts on half of one. While it runs,
@@ -13,12 +17,30 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(af3 af2 esmfold2)
 cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
-[ -n "$cc" ] || { echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; }
 arch="sm_$cc"
 marker=/tmp/localfold-cuda-build log=/tmp/localfold-cuda-build.log
 echo $$ > "$marker"; trap 'rm -f "$marker"' EXIT
 : > "$log"
 pids=()
+# the featurisers, each from its sources (a header changed rebuilds every one) - g++, the host's only compiler need
+fstamp="$(cat "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
+for tool in af3 af2 esmfold2 resolve_templates; do
+  name="${tool/_/-}"; [ "$tool" = resolve_templates ] || name="$tool-featurise"
+  out="$here/featurise/$name"
+  if [ -x "$out" ] && [ "$(cat "$out.stamp" 2>/dev/null)" = "$fstamp" ]; then continue; fi
+  src="$here/featurise/${tool}_featurise.cpp"; [ "$tool" = resolve_templates ] && src="$here/featurise/resolve_templates.cpp"
+  ( g++ -std=c++17 -O2 -ffp-contract=off -pthread "$src" -o "$out.building" >> "$log" 2>&1 \
+    && mv "$out.building" "$out" && echo "$fstamp" > "$out.stamp" && echo "built $name" >> "$log" \
+    || { echo "FAILED $name" >> "$log"; exit 1; } ) &
+  pids+=($!)
+done
+# (no GPU: the featurisers still build, the ports cannot)
+if [ "${ports[*]}" = featurise ]; then
+  status=0; for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+  [ $status = 0 ] || { echo "featuriser build failed - $log:" >&2; tail -20 "$log" >&2; }
+  exit $status
+fi
+if [ -z "$cc" ]; then for pid in "${pids[@]}"; do wait "$pid"; done; echo "no NVIDIA GPU (nvidia-smi says nothing)" >&2; exit 1; fi
 for port in "${ports[@]}"; do
   case "$port" in af3|af2) fast=--use_fast_math ;; esmfold2) fast="" ;; *) echo "unknown port $port" >&2; exit 1 ;; esac
   # AF3 - the page's default model, so usually the first fold - at full priority and the others niced: a

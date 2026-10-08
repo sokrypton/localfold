@@ -13,12 +13,15 @@ It runs:
 - the distogram, the diffusion module and its EDM sampler (11 steps);
 - the confidence head: pLDDT, PAE, pTM and ipTM.
 
-The input is the page's own: `export_input.mjs` calls `featuriseForEsmfold2` and
-`languageModelInput` (shared/esmfold2/featurise.js), and the PDB is the page's writer's records.
+The input is the page's own, built natively: `cuda/featurise/esmfold2-featurise` is `export_input.mjs` in C++ -
+`featuriseForEsmfold2` and `languageModelInput` (shared/esmfold2/featurise.js) over the AF3 featuriser, its
+ligands, SMILES and modified residues included - writing the same files byte for byte
+(`tools/check-native-featuriser.py`), and the PDB is the page's writer's records. No JavaScript runs on a fold.
 Beside it every fold writes AlphaFold 3's `<stem>_confidences.json` (the expected PAE, `token_plddts`,
 the token layout) and `<stem>_summary_confidences.json` (pTM, ipTM, mean pLDDT), as cuda/af3 does -
 what the CUDA backend (cuda/worker.py) hands the page. The 300M checkpoint folds through the
-same binary (`--fold-bundle=model-ef2-fast-300m-int5 --esmc-bundle=model-esmc-300m-int3`).
+same binary (`--fold-bundle=model-ef2-fast-300m-int5 --esmc-bundle=model-esmc-300m-int3`; `cuda/esmfold2/fold
+x.pdb --model=esmfold2-fast-300m --job=<job.json>`).
 
 ## Run
 
@@ -324,7 +327,7 @@ distance must stay under 2.2 Å, which is bonded and not merely near.
 The gate also checks every `data-*/` that has an `oracle-f32att/`, in both precisions:
 
 ```
-node --js-float16array cuda/esmfold2/export_input.mjs cuda/esmfold2/data-x --sequence=...
+cuda/featurise/esmfold2-featurise cuda/esmfold2/data-x --sequence=...
 ~/venv_ef2/bin/python cuda/esmfold2/oracle.py cuda/esmfold2/data-x --out cuda/esmfold2/data-x/oracle-f32att --float32-attention
 ```
 

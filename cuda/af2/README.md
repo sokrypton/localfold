@@ -7,13 +7,17 @@ converts them at load (`alphafold3/af2/convert.py`). What differs between the tw
 written beside the weights: position scale 10 against 20, the outer product mean after the MSA
 stack against before it, and which template embedder runs.
 
-The input is the page's own: `export_input.mjs` calls `makeA3mFeatures`
-(shared/input/a3m-features.js), the function the page and `tools/gpu/fold-af2.js` fold with, once per
-recycle. So a difference against the browser is the network's, never the featuriser's.
+The input is the page's own, built natively: `cuda/featurise/af2-featurise` is `export_input.mjs` in C++ -
+`makeA3mFeatures` (shared/input/a3m-features.js, the function the page and `tools/gpu/fold-af2.js` fold with), once
+per recycle on a thread each, the page's merges and MMseqs2 search, its atom37 templates - and writes the same
+`model.idx`/`model.bin` byte for byte (`tools/check-native-featuriser.py`: 22 cases on both bundles). So a
+difference against the browser is the network's, never the featuriser's, and no JavaScript runs on a fold.
+`export_input.mjs` stays as the reference it is held to.
 
 ## Run
 
 ```
+cuda/af2/fold ub.pdb --job=tools/fixtures/af3-jobs/ubiquitin_monomer.json --model=model_3_ptm   # any of the ten
 cuda/af2/fold 6mrr.pdb --sequence=GWSTELEKHREEL...
 cuda/af2/fold 5caj.pdb --sequence=<SEQ> --a3m=oracle-dumps/5caj-a.a3m
 cuda/af2/fold 5caj.pdb --sequence=<SEQ> --template=tools/fixtures/5caj-crystal.pdb:A
@@ -160,6 +164,11 @@ rather than mapped (cuda/af3's loader).
 
 ## A deep alignment's featurisation (2026-10-08)
 
+🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre
+search eight residues a 64-bit word and every recycle on its own thread - an 8000-row, 255-residue alignment
+0.50 s against Node's 0.77, byte-identical - so the worker no longer sends the search to the card and the
+`--nearest` round trip below is history. The record of the Node path:
+
 The features are the page's own (shared/input/a3m-features.js, through export_input.mjs). For 5CAJ's 7907-row
 alignment one recycle's featurisation was ~440 ms in Node - parsing and encoding the A3M 185, the nearest-centre
 search 158, the rest ~95 - and the four recycles ran in four workers that **each parsed the whole A3M again**. Now
@@ -219,7 +228,7 @@ a reordered sum from a defect. Those
 directories are gitignored and built by hand:
 
 ```
-node cuda/af2/export_input.mjs cuda/af2/data-x --sequence=... [--template=...] --recycles=0 \
+cuda/featurise/af2-featurise cuda/af2/data-x --sequence=... [--template=...] --recycles=0 \
     --weights=cuda/af2/weights-model_1_ptm
 ~/.venv-lfjax/bin/python cuda/af2/oracle.py cuda/af2/data-x --weights cuda/af2/weights-model_1_ptm \
     --model model_1_ptm --out cuda/af2/data-x/oracle

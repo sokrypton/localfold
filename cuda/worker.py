@@ -6,11 +6,13 @@ Started by tools/colab_backend.py (`--cuda`) and fed one job per line on stdin; 
 stdout is one bridge event, `{"kind", "payload", "at"}` - `status`, `progress`, `frame`, `contacts`,
 `scores` and `result` - which the broker numbers and the reader's page follows (web/colab-bridge.js).
 
-🔴 THE PAGE'S OWN INPUTS, THE PAGE'S OWN WEIGHTS. The job is the reader's AlphaFold 3 JSON (web/job-json.js
-writes it) and each port's exporter reads it with the page's reader; the template rows are resolved by the
-page's expandEntities and fetchStructure (cuda/resolve_templates.mjs); the alignment search is the page's
-MMseqs2 client; the weights are the published bundles the page folds with, read through cuda/*/maps.
-What this file adds is the plumbing between them - nothing about a molecule is decided here.
+🔴 THE PAGE'S OWN INPUTS, THE PAGE'S OWN WEIGHTS - AND NO JAVASCRIPT. The job is the reader's AlphaFold 3 JSON
+(web/job-json.js writes it) and each port's native featuriser (cuda/featurise: af3-featurise, af2-featurise,
+esmfold2-featurise) reads it as the page's reader does and builds the page's input byte for byte
+(tools/check-native-featuriser.py holds them to the JavaScript); the template rows are resolved as the page resolves
+them (cuda/featurise/resolve-templates); the alignment search is the page's MMseqs2 client, natively; the weights are
+the published bundles the page folds with, read through cuda/*/maps. What this file adds is the plumbing between
+them - nothing about a molecule is decided here.
 
 🔴 WHAT IT REFUSES, IT SAYS. A sampler, a model or an input a native port does not have is a refusal
 naming it (Refused), never a nearby setting run instead: Flow on rosettafold3 (the page's own rule), a
@@ -48,7 +50,7 @@ WORK = os.environ.get("LOCALFOLD_CUDA_WORK", "/tmp/localfold-cuda")
 AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
 # ...whose dialect has no working flow sampler (noFlowSampler, shared/af3/dialect.js)
 NO_FLOW_FAMILIES = ("rosettafold3", "chai1")
-NODE = ["node", "--js-float16array", "--max-old-space-size=24000"]
+FEATURISE = os.path.join(CUDA, "featurise")
 OUT = sys.stdout
 
 
@@ -177,6 +179,19 @@ def binary(port):
         said = open(BUILD_LOG).read()[-600:] if os.path.exists(BUILD_LOG) else ""
         raise Refused(f"cuda/{port}/{port} is not built on this runtime - run cuda/build.sh"
                       + (f" (its last build said: {said.strip()})" if said.strip() else ""))
+    return path
+
+
+def featuriser(name):
+    """A native featuriser (cuda/featurise/<name>) - waited for while cuda/build.sh compiles it, refused if nothing
+    is building it."""
+    path = os.path.join(FEATURISE, name)
+    started = time.time()
+    while not os.access(path, os.X_OK) and building():
+        emit("status", f"compiling the native featurisers (once a runtime) · {time.time() - started:.0f} s")
+        time.sleep(1)
+    if not os.access(path, os.X_OK):
+        raise Refused(f"cuda/featurise/{name} is not built on this runtime - run cuda/build.sh")
     return path
 
 
@@ -309,50 +324,18 @@ class Server:
                 self.proc.kill()
 
 
-class Exporter:
-    """One of the page-code exporters (cuda/*/export*.mjs, cuda/resolve_templates.mjs) kept loaded between
-    folds by cuda/export_server.mjs: loading their modules was most of a run (~180 ms of AF3's 230 ms
-    export, a Node start for the rest). `run` takes the command a plain run would have been."""
-
-    def __init__(self, script, cwd):
-        self.dir = os.path.join(WORK + "-export", os.path.basename(os.path.dirname(script)) + "-"
-                                + os.path.basename(script))
-        shutil.rmtree(self.dir, ignore_errors=True)
-        os.makedirs(self.dir)
-        self.log = open(os.path.join(self.dir, "server.log"), "w")
-        self.proc = subprocess.Popen([*NODE, os.path.join(CUDA, "export_server.mjs"), script, self.dir], cwd=cwd,
-                                     stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
-        self.count = 0
-        while "export: serving" not in open(self.log.name).read():
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"{script} did not start: " + open(self.log.name).read()[-400:])
-            time.sleep(0.01)
-
-    def run(self, cmd, what, log):
-        """A step, for a command [*NODE or "node", script, *args]: its output kept; a failure says the step."""
-        args = cmd[cmd.index(next(c for c in cmd if c.endswith(".mjs"))) + 1:]
-        self.count += 1
-        base = os.path.join(self.dir, f"{self.count:06d}")
-        with open(base + ".tmp", "w") as handle:
-            json.dump(args, handle)
-        os.rename(base + ".tmp", base + ".req")
-        while not (os.path.exists(base + ".ok") or os.path.exists(base + ".err")):
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"{what} failed: its exporter exited - " + open(self.log.name).read()[-400:])
-            time.sleep(0.002)
-        said = open(base + ".log").read()
-        log.append(f"$ {' '.join(cmd)}\n{said}")
-        if os.path.exists(base + ".err"):
-            thrown = open(base + ".err").read()
-            log.append(thrown)
-            # 🔴 A STEP THAT THREW SAID WHY IN ONE SENTENCE, written for a person (the page's own readers and
-            # featurisers - "AlphaFold 2 folds protein chains only"): that sentence is the answer, and the
-            # stack under it is not
-            first = re.match(r"^\w*Error: (.+)$", thrown, re.M)
-            if first:
-                raise Refused(first.group(1))
-            raise RuntimeError(f"{what} failed: " + "\n".join(thrown.strip().splitlines()[:4]))
-        return said
+def featurise(cmd, what, log):
+    """A native featuriser's run (cuda/featurise): its output kept; a refusal - the page's own sentence, which
+    every featuriser prints as `Error: <sentence>` - raised as one, anything else as the step that failed."""
+    proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, preexec_fn=die_with_parent)
+    said = proc.stdout + proc.stderr
+    log.append(f"$ {' '.join(cmd)}\n{said}")
+    if proc.returncode != 0:
+        first = re.search(r"^Error: (.+)$", said, re.M)
+        if first:
+            raise Refused(first.group(1))
+        raise RuntimeError(f"{what} failed: " + "\n".join(said.strip().splitlines()[-4:]))
+    return said
 
 
 def streaming(job):
@@ -372,14 +355,6 @@ class Worker:
     def __init__(self):
         self.device = device_name()
         self.servers = {}                # key -> Server, least recently used first
-        self.exporters = {}
-
-    def node(self, cmd, what, log, cwd=REPO):
-        """A page-code step (`cmd` a Node command), through its resident exporter."""
-        script = next(c for c in cmd if c.endswith(".mjs"))
-        if script not in self.exporters or self.exporters[script].proc.poll() is not None:
-            self.exporters[script] = Exporter(script, cwd)
-        return self.exporters[script].run(cmd, what, log)
 
     def evict(self, keep, everything=False):
         """Idle servers stopped, least recently used first: all of them (`everything`), or until the card is
@@ -480,9 +455,8 @@ class Worker:
         # template with no kind, or "none", is no template; a Node start is 0.13 s of a 0.5 s warm fold)
         templates = []
         if any((entity.get("template") or {}).get("kind") not in (None, "none") for entity in job.get("entities", [])):
-            templates = json.loads(self.node(["node", os.path.join(CUDA, "resolve_templates.mjs"), request_path,
-                                        os.path.join(WORK, "templates")], "resolving the templates", log)
-                                   .strip().splitlines()[-1] or "[]")
+            templates = json.loads(featurise([featuriser("resolve-templates"), request_path, os.path.join(WORK, "templates")],
+                                             "resolving the templates", log).strip().splitlines()[-1] or "[]")
         if templates and port == "esmfold2":
             raise Refused("ESMFold2 takes no template")
         searched = [t["chain"] for t in templates if t["kind"] == "search"]
@@ -519,9 +493,8 @@ class Worker:
             server = self.server_for(key, [binary("af3"), "-", f"--bundle={bundle}",
                                            f"--map={os.path.join(CUDA, 'af3', 'maps', family + '.map')}", "--fold", "--fast",
                                            *esm], residues)
-            export = [*NODE, os.path.join(CUDA, "af3", "export-model.mjs"), inputs, "--no-weights",
-                      dialect, f"--job={job_path}", f"--max-msa={requested}", *flags]
-            self.node(export, "featurising", log, cwd=os.path.join(CUDA, "af3"))
+            featurise([featuriser("af3-featurise"), inputs, "--no-weights", dialect, f"--job={job_path}",
+                       f"--max-msa={requested}", *flags], "featurising", log)
             steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
             fold = [f"--out={out_pdb}"]
             if sampler == "flow":
@@ -554,24 +527,11 @@ class Worker:
             server = self.server_for(key, [binary("af2"), "-", f"--bundle={bundle}",
                                            f"--map={os.path.join(CUDA, 'af2', 'maps', model + '.map')}", "--fast",
                                            *([f"--delta={delta}"] if delta else []), "--warm=64,8,8,0"], residues)
-            export = [*NODE, os.path.join(CUDA, "af2", "export_input.mjs"), inputs, f"--bundle={bundle}",
-                      f"--job={job_path}", f"--max-msa={508 if requested == 512 else requested}",
-                      f"--max-extra={extra}", f"--seed={seed}", *flags]
+            export = [featuriser("af2-featurise"), inputs, f"--bundle={bundle}", f"--job={job_path}",
+                      f"--max-msa={508 if requested == 512 else requested}", f"--max-extra={extra}", f"--seed={seed}", *flags]
             if recycles not in (None, ""):
                 export.append(f"--recycles={int(recycles)}")
-            # 🔴 A DEEP ALIGNMENT'S NEAREST-CENTRE SEARCH ON THE CARD WHERE THE MACHINE HAS FEWER CORES THAN
-            # RECYCLES: the exporter runs a recycle's search in a worker of its own, so with the cores it is
-            # parallel and free, and on a Colab T4's two CPUs it serialises - there it goes to the AF2 server
-            # (--nearest) between the exporter's two requests, the features byte-identical (export_input.mjs).
-            # Measured: 5CAJ's 7907 rows 0.99 -> 0.82-0.92 s on two CPUs, and ~20 ms of round trips slower with
-            # thirty, where it is not used. The exporter skips it for a shallow alignment (no search file)
-            passes = (int(recycles) if recycles not in (None, "") else 3) + 1
-            search = os.path.join(inputs, "nearest.search") if len(os.sched_getaffinity(0)) < passes else None
-            self.node([*export, f"--search-out={search}"] if search else export, "featurising", log)
-            if search and os.path.exists(search):
-                assigned = search[:-len(".search")] + ".assign"
-                server.fold(search, [f"--nearest={assigned}"])
-                self.node([*export, f"--assignments={assigned}"], "featurising", log)
+            featurise(export, "featurising", log)
             fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
             total = 0
         else:
@@ -581,7 +541,7 @@ class Worker:
             key = ("esmfold2", family)
             server = self.server_for(key, [binary("esmfold2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)
-            self.node([*NODE, os.path.join(CUDA, "esmfold2", "export_input.mjs"), inputs, f"--job={job_path}"], "featurising", log)
+            featurise([featuriser("esmfold2-featurise"), inputs, f"--job={job_path}"], "featurising", log)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
             # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's
             # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45

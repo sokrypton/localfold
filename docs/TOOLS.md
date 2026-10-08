@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-355 tools. `tools/fixtures/` is data and is not listed.
+358 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -293,7 +293,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (93)
+## `tools/` - everything else (96)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -331,6 +331,7 @@ go through CDP, and the deploy.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
+- **`check-native-featuriser.py`** - The native featurisers against the JavaScript exporters they replace: byte for byte.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
 - **`check-smiles-batch.mjs`** - A SMILES ligand featurises to the SAME BATCH its CCD code does, field by field.
@@ -342,6 +343,7 @@ go through CDP, and the deploy.
 - **`check-stock-flags.mjs`** - Does every model fold on the browser a VISITOR has?
 - **`check-template-path.mjs`** - Every AF3-lineage model's TEMPLATE actually moves its fold.
 - **`check_remote_bundle.py`** - Is every shard a manifest names actually at the remote, at the right length?
+- **`chem-probe.mjs`** - The page's chemistry over SMILES on stdin, one line each - cuda/featurise/chem_probe.cpp's twin, for tools/check-native-featuriser.py.
 - **`colab_backend.py`** - LocalFold's CUDA fold, on somebody else's GPU, reached over one URL.
 - **`colab_stub_worker.py`** - A stand-in for cuda/worker.py that a gate drives, so the Colab broker and the reader's page are tested with no card.
 - **`contact-map-dividers.py`** - Does the contact map get its chain divider lines while a fold is running?
@@ -368,6 +370,7 @@ go through CDP, and the deploy.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the CPU: features in, a structure out.
 - **`fold-in-page.py`** - Drive a REAL fold in the real page, and report what the frames carry.
 - **`gate-folds.mjs`** - The folds every whole-model gate runs, and how a gate reads one of them.
+- **`gen-native-featuriser-tables.mjs`** - Generate cuda/featurise/tables.inc - the data the native featuriser reads, from the JavaScript it mirrors.
 - **`gpu-chrome.mjs`** - Run a WebGPU module in headless Chrome and print what it returns.
 - **`heatmap-panel.py`** - Do the heatmap panel's tabs appear, and does OUR map format reach them?
 - **`index-tools.py`** - Every tool in this repository, with the one line it says about itself.

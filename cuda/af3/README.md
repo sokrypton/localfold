@@ -36,9 +36,9 @@ its codes decoded on the device and `maps/<model>.map` naming each tensor's slic
 **AlphaFold 3's are Google DeepMind's parameters, hosted for academic, non-commercial use under its
 [AF3 terms](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)**: the
 first fetch asks you to accept them, or `LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3` says you have (the
-CUDA worker sets it, the page having asked). Then `fold` featurises the input with the repository's own featuriser into a
-temporary directory (0.2 s, while `af3` starts) and folds it (`--fold --fast`); everything after
-`--` goes to `af3`. An alignment keeps a seeded 1024 of its rows, AF3's own `num_msa`
+CUDA worker sets it, the page having asked). Then `fold` featurises the input with the **native featuriser**
+(`cuda/featurise/af3-featurise`, below) into a temporary directory (10-200 ms, while `af3` starts) and folds it
+(`--fold --fast`); everything after `--` goes to `af3`. **No JavaScript runs anywhere on that path.** An alignment keeps a seeded 1024 of its rows, AF3's own `num_msa`
 (`--max-msa=N` to change it: 512 is 3.6% less trunk on 5CAJ's 7907-row search, pLDDT 95.08
 against 95.20). A job JSON to a PDB is 1.5 s of wall clock (KRAS with sotorasib), 6MRR from
 its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
@@ -46,7 +46,7 @@ its sequence 1.0 s, 5CAJ with its alignment 1.7 s. By hand:
 ```
 cd cuda/af3
 nvcc -O1 -std=c++17 -arch=sm_80 --default-stream per-thread --use_fast_math src/af3.cu -lcublas -lcublasLt -lcupti -ldl -o af3
-node --js-float16array export-model.mjs in --no-weights --family=af3 --sequence=<SEQ> [--a3m=...]
+../featurise/af3-featurise in --no-weights --family=af3 --job=<job.json>    # or --sequence=<SEQ> [--a3m=...]
 ./af3 in --bundle=../../af3am-af3 --map=maps/af3.map --fold --fast --out=fold.pdb
 python3 score.py fold.pdb ../../tools/fixtures/5caj-crystal.pdb A
 node --js-float16array --max-old-space-size=24000 export-model.mjs data   # + every oracle
@@ -234,19 +234,32 @@ tokens x 5 samples' diffusion 1202 -> 1154 ms); `--samples` batched through the 
 Start-up: model.bin mapped and copied to the device in one transfer; every fused weight
 concatenated on the device. A first fold is within 5-15% of a warm one.
 
+## The input, natively (cuda/featurise)
+
+`af3-featurise` is `export-model.mjs --no-weights` in C++ - the page's own featuriser, every convention of every
+family, written to the same `model.idx`/`model.bin`/`template.pdb` **byte for byte**: the job reader (both
+dialects, every refusal in the page's words), CCD components (the RCSB through `~/.cache/localfold/ccd`, or the
+job's `userCCD`), SMILES ligands (shared/chem's parser and distance-geometry conformer, with V8's own `Math` so
+the conformer is the page's to the last bit), glycans, modified residues and bases, declared bonds, inline
+alignments and A3Ms, the MMseqs2 search and its templates (`--search`, `--search-templates`: curl and gzip, no
+library), templates (PDB or mmCIF, the page's alignment or the job's mapping) through every family's embedder,
+OpenDDE's structural tokens, rf3's stereocentres and chai-1's ESM2 inputs. `tools/check-native-featuriser.py`
+holds it to the JavaScript (171 cases over every family, AF3's own example jobs among them; `--network` for the
+searches). `export-model.mjs` stays as that reference, and as the tool for the weights and the oracles.
+
+```
+../featurise/af3-featurise data-gol --no-weights --family=af3 --sequence=<SEQ> --ligands=GOL     # CCD codes
+../featurise/af3-featurise data-sep --no-weights --family=af3 --sequence=<SEQ> --modify=SEP@3
+../featurise/af3-featurise data-dna --no-weights --family=af3 --sequence=<SEQ>:GCGATCGC:GCGATCGC --kinds=protein,dna,dna
+../featurise/af3-featurise data-smi --no-weights --family=af3 --sequence=<SEQ> --smiles='OCC(O)CO'
+../featurise/af3-featurise data-ab --no-weights --family=af3 --sequence=<A>:<B> --a3m=a.a3m,b.a3m [--paired-a3m=pa.a3m,pb.a3m]
+../featurise/af3-featurise data-job --no-weights --family=af3 --job=../../tools/fixtures/af3-jobs/kras_g12c_sotorasib.json
+node bonds.mjs fold.pdb GOL        # bond lengths by class, ideals from the CCD
+```
+
 ## Ligands, modified residues, nucleic acids
 
-```
-node ... export-model.mjs data-gol --sequence=<SEQ> --ligands=GOL          # CCD codes (RCSB)
-node ... export-model.mjs data-sep --sequence=<SEQ> --modify=SEP@3         # as probe-modified.js
-node ... export-model.mjs data-dna --sequence=<SEQ>:GCGATCGC:GCGATCGC --kinds=protein,dna,dna
-node ... export-model.mjs data-smi --sequence=<SEQ> --smiles='OCC(O)CO'
-node ... export-model.mjs data-ab --sequence=<A>:<B> --a3m=a.a3m,b.a3m [--paired-a3m=pa.a3m,pb.a3m]
-node bonds.mjs fold.pdb GOL        # bond lengths by class, ideals from the CCD
-node ... export-model.mjs data-job --job=../../tools/fixtures/af3-jobs/kras_g12c_sotorasib.json
-```
-
-`--job` reads an AlphaFold 3 job JSON (either dialect) with the page's own reader
+`--job` reads an AlphaFold 3 job JSON (either dialect) as the page's own reader does
 (`web/job-json.js`, `web/entities.js`): chains and their kinds, CCD and SMILES ligands, modified
 residues AND modified bases (a base's parent through its chain's alphabet and the component's CCD
 parent), a ligand of several components as one chain (a glycan: `ccdCodes` [NAG, NAG, BMA, MAN,
@@ -305,8 +318,8 @@ a command, of which the fold is
 
 `cuda/af3/fold --serve` starts one `af3` (`--serve=DIR`) that keeps the weights on the device and
 every kernel and cuBLAS plan warm; until `cuda/af3/fold --stop`, every ordinary `fold` command
-for that model has its input exported by a resident exporter too (`export-model.mjs --serve`,
-node's module loading being most of an export) and hands it to the server as a job (per-job
+for that model featurises its input (the native featuriser starts in milliseconds, where the Node exporter it
+replaced needed a resident process of its own) and hands it to the server as a job (per-job
 `--samples`, `--steps`, `--recycles`, `--seed`) - 6MRR 0.53 s a command, against 1.00 s starting
 both each time. The outputs are byte-identical either way.
 

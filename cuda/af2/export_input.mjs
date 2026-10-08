@@ -14,7 +14,7 @@
 // cuda/af2/fold folds with) or export_weights.py's directory (DeepMind's float32, for the oracles).
 import { readFileSync, writeFileSync, mkdirSync, openSync, readSync, writeSync, closeSync, renameSync } from "node:fs";
 import { Worker } from "node:worker_threads";
-import { makeA3mFeatures, planA3mRecycles, paddedCodeWords } from "../../shared/input/a3m-features.js";
+import { makeA3mFeatures, planA3mRecycles } from "../../shared/input/a3m-features.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -93,18 +93,7 @@ const chains = sequence.split(":").filter(Boolean);
 // block-diagonal between; "monomer": block-diagonal throughout). It sends the sequences to
 // api.colabfold.com, so it is asked for, never assumed
 let a3m, searchedHits = null;       // (--search's template hits, by chain)
-// --search-out=<file> / --assignments=<file>: the nearest-centre search on the CUDA port's device, in two
-// requests to this exporter (cuda/export_server.mjs, which keeps one process): the first plans, writes the
-// searches (the AF2 server's --nearest job) and stops; the second takes the assignments back and finishes. What
-// the first made - the alignment (a network search's included) and the plan - waits between them here, by output
-// directory. A shallow alignment (below the workers' threshold) finishes in the first, writing no search file.
-const searchOut = option("search-out", ""), assignmentsPath = option("assignments", "");
-globalThis.AF2_PENDING ??= new Map();
-const pending = assignmentsPath !== "" ? globalThis.AF2_PENDING.get(out) : undefined;
-if (assignmentsPath !== "" && !pending) throw new Error(`--assignments: no search was planned for ${out}`);
-if (pending) {
-  ({ a3m, searchedHits } = pending);
-} else if (args.includes("--search")) {
+if (args.includes("--search")) {
   if (a3mPath !== "") throw new Error("--search and --a3m both name the alignment");
   const { generateMmseqs2Msa, generateMmseqs2ComplexMsa } = await import("../../shared/input/mmseqs2-api.js");
   const multimer = isMultimer;
@@ -151,42 +140,16 @@ const featureOptions = {
 // functions, in the same order. A shallow alignment is not worth a worker's start-up
 const passes = featureOptions.recycles + 1;
 const deep = passes > 1 && a3m.length > (1 << 20);
-// each recycle finished in a worker of its own, with its assignments given (the device's) or searched there
-const inWorkers = (plans, context, assignments) => Promise.all(plans.map((plan, k) => new Promise((resolve, reject) => {
+// each recycle searched and finished in a worker of its own
+const inWorkers = (plans, context) => Promise.all(plans.map((plan) => new Promise((resolve, reject) => {
   const worker = new Worker(new URL("../../shared/input/a3m-features-worker.mjs", import.meta.url),
-    { workerData: { plan, context, assignments: assignments?.[k] } });
+    { workerData: { plan, context } });
   worker.once("message", resolve); worker.once("error", reject);
 })));
-let features;
-if (pending) {
-  globalThis.AF2_PENDING.delete(out);
-  const raw = new Int32Array(readFileSync(assignmentsPath).buffer.slice(0));
-  const assignments = []; let at = 0;
-  for (const plan of pending.plans) { assignments.push(Uint16Array.from(raw.subarray(at, at + plan.extras.length))); at += plan.extras.length; }
-  if (at !== raw.length) throw new Error(`--assignments: ${raw.length} rows for a plan of ${at}`);
-  features = await inWorkers(pending.plans, pending.context, assignments);
-} else if (searchOut !== "" && deep) {
+const features = deep ? await (async () => {
   const { plans, context } = planA3mRecycles(a3m, tables, featureOptions);
-  const searches = plans.map((plan) => paddedCodeWords(plan.centerCodes, context.encoded, plan.extras,
-                                                       plan.centers.length, context.length));
-  const head = new Int32Array([searches.length, searches[0].words]);
-  const parts = [head];
-  searches.forEach((search, k) => {
-    parts.push(new Int32Array([plans[k].centers.length, search.rows]), search.centreWords, search.extraWords);
-  });
-  mkdirSync(out, { recursive: true });
-  writeFileSync(`${searchOut}.tmp`, Buffer.concat(parts.map((p) => Buffer.from(p.buffer, p.byteOffset, p.byteLength))));
-  renameSync(`${searchOut}.tmp`, searchOut);
-  globalThis.AF2_PENDING.set(out, { a3m, searchedHits, plans, context });
-  console.log(`search: ${plans.length} recycles' nearest-centre searches -> ${searchOut}`);
-  // (the exporter's request ends here, as a success: cuda/export_server.mjs reads `phaseDone`)
-  throw Object.assign(new Error("the searches are written; finish with --assignments"), { phaseDone: true });
-} else {
-  features = deep ? await (async () => {
-    const { plans, context } = planA3mRecycles(a3m, tables, featureOptions);
-    return inWorkers(plans, context);
-  })() : makeA3mFeatures(a3m, tables, featureOptions);
-}
+  return inWorkers(plans, context);
+})() : makeA3mFeatures(a3m, tables, featureOptions);
 const first = features[0];
 const L = first.aatype.length;
 

@@ -131,3 +131,6 @@ tools/_*.py
 # the native featurisers (cuda/featurise/build.sh)
 cuda/featurise/*-featurise
 cuda/featurise/chem-probe
+cuda/featurise/resolve-templates
+cuda/featurise/*.stamp
+cuda/featurise/*.building

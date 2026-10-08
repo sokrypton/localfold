@@ -630,71 +630,6 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 // --detach-output: on success the last line is "af2: done" and stdout closes, so a caller reading it to
 // its end returns while the driver releases this process's device (0.16 s of exit; cuda/af2/fold does)
 static bool DETACH = false;
-// --nearest=<out> (a serve job, with the job's input naming a search file): every recycle's nearest-centre search
-// of an alignment's featurisation on the device - shared/input/a3m-features.js's nearestCentres, the page's
-// nearest-centres.js in CUDA - written as the assignments, no fold. The search was ~160 ms of a deep
-// alignment's export a recycle in Node (5CAJ's 7907 rows), four times over on a Colab T4's two CPUs.
-// The file: int32 recycles, words; then per recycle int32 centres, rows, the centres' padded code words
-// [centres][words] and the extra rows' [rows][words] (paddedCodeWords). Out: per recycle int32 [rows].
-// The score is the count of agreeing residues (zero bytes of the XOR, the exact form); a tie keeps the FIRST
-// centre - integers both ways, so the assignments are the host loop's to the row.
-__global__ void nearestCentresK(const uint32_t* centres, const uint32_t* extras, int nCentres, int words, int* out) {
-  extern __shared__ uint32_t row[];
-  const int r = blockIdx.x;
-  for (int w = threadIdx.x; w < words; w += blockDim.x) row[w] = extras[(size_t)r * words + w];
-  __syncthreads();
-  int best = 0x7fffffff, bestScore = -1;
-  for (int c = threadIdx.x; c < nCentres; c += blockDim.x) {
-    const uint32_t* cw = centres + (size_t)c * words;
-    int score = 0;
-    for (int w = 0; w < words; ++w) {
-      uint32_t d = cw[w] ^ row[w];
-      score += __popc(~(((d & 0x7f7f7f7fu) + 0x7f7f7f7fu) | d) & 0x80808080u);
-    }
-    if (score > bestScore) { bestScore = score; best = c; }      // (ascending c: the first of a thread's ties)
-  }
-  __shared__ int sScore[256], sBest[256];
-  sScore[threadIdx.x] = bestScore; sBest[threadIdx.x] = best;
-  __syncthreads();
-  for (int o = blockDim.x / 2; o; o >>= 1) {
-    if (threadIdx.x < o) {
-      int s2 = sScore[threadIdx.x + o], b2 = sBest[threadIdx.x + o];
-      if (s2 > sScore[threadIdx.x] || (s2 == sScore[threadIdx.x] && b2 < sBest[threadIdx.x])) {
-        sScore[threadIdx.x] = s2; sBest[threadIdx.x] = b2;
-      }
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) out[r] = sBest[0];
-}
-static int nearestJob(const std::string& in, const std::string& outPath) {
-  FILE* f = fopen(in.c_str(), "rb");
-  if (!f) { fprintf(stderr, "nearest: cannot read %s\n", in.c_str()); return 1; }
-  auto rd = [&](void* p, size_t n) { if (fread(p, 1, n, f) != n) { fprintf(stderr, "nearest: %s is short\n", in.c_str()); exit(1); } };
-  int32_t recycles, words; rd(&recycles, 4); rd(&words, 4);
-  std::vector<int32_t> all;
-  for (int k = 0; k < recycles; ++k) {
-    int32_t centres, rows; rd(&centres, 4); rd(&rows, 4);
-    std::vector<uint32_t> cw((size_t)centres * words), ew((size_t)rows * words);
-    rd(cw.data(), cw.size() * 4); rd(ew.data(), ew.size() * 4);
-    std::vector<int32_t> a(rows);
-    if (rows > 0) {
-      uint32_t* dc = upload(cw.data(), cw.size()); uint32_t* de = upload(ew.data(), ew.size());
-      int* da = dallocT<int>(rows);
-      nearestCentresK<<<rows, 256, words * 4, STREAM>>>(dc, de, centres, words, da);
-      CK(cudaMemcpyAsync(a.data(), da, rows * 4, cudaMemcpyDeviceToHost, STREAM));
-      CK(cudaStreamSynchronize(STREAM));
-      CK(cudaFree(dc)); CK(cudaFree(de)); CK(cudaFree(da));
-    }
-    all.insert(all.end(), a.begin(), a.end());
-  }
-  fclose(f);
-  std::string tmp = outPath + ".tmp";
-  FILE* o = fopen(tmp.c_str(), "wb"); fwrite(all.data(), 4, all.size(), o); fclose(o);
-  rename(tmp.c_str(), outPath.c_str());
-  printf("nearest: %d recycles, %zu rows\n", recycles, all.size());
-  return 0;
-}
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> --map=<file> | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
   std::string weights, bundleDir, mapFile, deltaDir, oracle, out = "fold.pdb", warmShape, serveDir; int recycles = -1; bool profile = false, waitInput = false;
@@ -748,7 +683,6 @@ int main(int argc, char** argv) {
     const double tolerance0 = TOLERANCE;
     serveJobs(serveDir, "af2", [&](const std::string& input, const std::vector<std::string>& flags) {
       std::string jobOut = "fold.pdb"; int jobRecycles = -1; TOLERANCE = tolerance0; FRAMES_DIR.clear();
-      for (auto& f : flags) if (!f.compare(0, 10, "--nearest=")) return nearestJob(input, f.substr(10));
       for (auto& f : flags) {
         if (!f.compare(0, 6, "--out=")) jobOut = f.substr(6);
         else if (!f.compare(0, 11, "--recycles=")) jobRecycles = atoi(f.c_str() + 11);

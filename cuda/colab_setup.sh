@@ -3,20 +3,14 @@
 #
 #   bash cuda/colab_setup.sh [esmfold2] [af3] [af2]    (all three when none is named)
 #
-# Node 22 if the machine's is older (the input exporters run the page's own featurisers), the bundles
-# from the registry's `remote:` URLs (cuda/fetch_bundles.py) - the weights the page folds with, read
-# as they are, decoded on the device - and each port built for this GPU (nvidia-smi's compute
-# capability). Idempotent: a bundle already on disk is not fetched again.
+# The bundles from the registry's `remote:` URLs (cuda/fetch_bundles.py) - the weights the page folds with, read
+# as they are, decoded on the device - each port built for this GPU (nvidia-smi's compute capability), and the
+# native featurisers beside them (cuda/featurise: no Node - a job is featurised in C++, byte for byte the page's).
+# Idempotent: a bundle already on disk is not fetched again.
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(esmfold2 af3 af2)
 echo "GPU: $(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader | head -1)"
-
-major="$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || echo 0)"
-if [ "${major:-0}" -lt 22 ]; then
-  echo "node $(node -v 2>/dev/null || echo none) -> 22"
-  curl -fsSL https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz | tar -xJ -C /usr/local --strip-components=1
-fi
 
 for port in "${ports[@]}"; do
   case "$port" in

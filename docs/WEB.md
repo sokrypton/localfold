@@ -4298,3 +4298,43 @@ arrays flattened. `test:pending` takes the same stub as its fixture; its leg
 telling a quiet runtime PAGE from a dead runtime BROWSER went with the page, and
 its dev-panel leg asserts what is left - the reader records none of its own
 phases. `test:cuda`'s page lane starts the broker without the browser flags.
+
+## The CUDA backend featurises natively: no JavaScript on a fold (2026-10-08)
+
+Every CUDA fold used to start with Node: each port's exporter (`cuda/af3/export-model.mjs --no-weights`,
+`cuda/af2/export_input.mjs`, `cuda/esmfold2/export_input.mjs`) ran the page's own featuriser over the job, and
+`cuda/resolve_templates.mjs` resolved the template rows - kept resident by `cuda/export_server.mjs`, because loading
+their modules was most of an export. All four are C++ now, in `cuda/featurise` (`af3-featurise`, `af2-featurise`,
+`esmfold2-featurise`, `resolve-templates`, built by `cuda/build.sh` with g++ beside the ports), and `cuda/worker.py`
+and the three `cuda/*/fold` scripts call them: **a job JSON goes in and a structure comes out with no JavaScript
+anywhere**, and a Colab runtime no longer installs Node.
+
+🔴 **THEY ARE THE PAGE'S FEATURISERS, BYTE FOR BYTE.** `npm run test:featurise` (tools/check-native-featuriser.py)
+runs each JavaScript exporter and its native twin on the same job and compares `model.idx`, `model.bin` entry by
+entry and the PDB records, and a refusal to the same sentence: 173 cases - all eight AF3-lineage families, AF2 on both
+bundles, ESMFold2; AF3's thirteen example jobs; glycans, ions, modified residues and bases, declared bonds, SMILES,
+inline alignments and A3Ms, paired alignments, templates by alignment and by the job's own mapping, merged across
+chains, OpenDDE's structural tokens, rf3's stereocentres and one-pass template mean, chai-1's ESM2 inputs - and a
+`--network` arm whose MMseqs2 searches (one chain, the paired 1BRS complex, searched templates) and RCSB fetch
+agree with the page's. The JavaScript exporters stay, as the reference the gate holds them to.
+
+Three things had to be exact for that, and each is worth knowing before touching the C++:
+
+- 🔴 **glibc is not V8.** V8's `Math.sin`, `cos`, `asin`, `acos` and `atan` are fdlibm 5.3 and differ from glibc's
+  in the last place on 3-8% of arguments (measured on 200,000 each); a distance-geometry conformer turns one ulp into
+  a different molecule. `cuda/featurise/jsmath.h` ports V8's, with its Kahan-summed `hypot` and its `round`
+  (ceil, less one unless ceil - 1/2 <= x), all 0 of 200,000 apart from Node; everything compiles with
+  `-ffp-contract=off`, since a fused multiply-add is a different rounding. A SMILES conformer is then the page's to
+  the last bit: 74 of 74 corpus molecules and 904 of 904 RDKit re-writings.
+- 🔴 **A Float32Array rounds where it is written.** Every accumulator the page keeps in one - an alignment's profile,
+  AF2's cluster counts, rf3's template mean - is rounded at each store in the C++ too; summing in double and rounding
+  once differs in the last place.
+- 🔴 **The exporter's walk is the format.** `export-model.mjs` writes every typed array under the batch object in key
+  order, a plain number array as float32, and an EMPTY array of anything as a float32 entry of length zero (so
+  `batch.ligandSpans` is in the index of a fold with no ligand); `cuda/featurise/entries.h` reproduces that walk.
+
+AF2's nearest-centre search went to the card on a two-CPU runtime (`--nearest`, docs/AF2.md); the native search is
+eight residues a 64-bit word on a thread a recycle - an 8000-row, 255-residue alignment featurises in 0.50 s against
+Node's 0.77, byte-identical - so that round trip, `cuda/export_server.mjs` and the exporter's two-phase
+`--search-out`/`--assignments` path are removed. `npm run test:cuda` passes unchanged through the native path, the
+real reader's page included.

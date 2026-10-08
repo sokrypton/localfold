@@ -6,10 +6,11 @@
 #   cuda/af2/fold 1brs.pdb --sequence=<A>:<B> --model=model_1_multimer_v3
 #   cuda/af2/fold 5caj.pdb --sequence=<SEQ> --template=5caj.pdb:A       (1brs: --template=1brs.pdb:A+D)
 #
-# --model is model_1_ptm or model_1_multimer_v3: the two the page publishes whole (its other four of
-# each are deltas against these), read as the page reads them - the bundle (model/, model-multimer/,
+# --model is model_N_ptm or model_N_multimer_v3, N 1 to 5: model 1 of each as the page publishes it whole, 2-5
+# as its deltas on model 1, read as the page reads them - the bundle (model/, model-multimer/,
 # fetched once by cuda/fetch_bundles.py) as it is, through maps/<model>.map. Input flags (--sequence, --a3m, --search, --template, --recycles,
-# --max-msa, --max-extra, --seed) go to export_input.mjs; flags after -- go to ./af2, which runs --fast.
+# --max-msa, --max-extra, --seed, --job) go to the native featuriser (cuda/featurise/af2-featurise: the page's own
+# features, byte for byte, no JavaScript); flags after -- go to ./af2, which runs --fast.
 set -euo pipefail
 # the GPU's own architecture (sm_80 an A100, sm_75 a T4, ...); sm_80 when nvidia-smi cannot say
 gpu_arch() { local cc; cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"; echo "sm_${cc:-80}"; }
@@ -27,13 +28,21 @@ if [ ! -x "$here/af2" ]; then
      -lcublas -lcublasLt -lcupti -ldl -o af2)
 fi
 repo="$(cd "$here/../.." && pwd)"
+# models 2-5 of each are published as deltas on model 1 and read as the page reads them (--delta: common.cuh's
+# loadBundle, bit-exact against shared/bundles/delta-tensor-store.js), as cuda/worker.py folds them
 case "$model" in
-  model_1_ptm) family=monomer; bundle="$repo/model" ;;
-  model_1_multimer_v3) family=multimer; bundle="$repo/model-multimer" ;;
-  *) echo "no published bundle for $model (model_1_ptm, model_1_multimer_v3)" >&2; exit 1 ;;
+  model_[1-5]_ptm) family=monomer; bundle="$repo/model"; short=mono ;;
+  model_[1-5]_multimer_v3) family=multimer; bundle="$repo/model-multimer"; short=multi ;;
+  *) echo "no published bundle for $model (model_1_ptm ... model_5_ptm, model_1_multimer_v3 ... model_5_multimer_v3)" >&2; exit 1 ;;
 esac
 [ -f "$bundle/manifest.json" ] || python3 "$repo/cuda/fetch_bundles.py" "$family" >&2
 wflags=(--bundle="$bundle" --map="$here/maps/$model.map")
+number="${model:6:1}"
+if [ "$number" != 1 ]; then
+  delta="$repo/model-$short-$number-delta"
+  [ -f "$delta/manifest.json" ] || python3 "$repo/cuda/fetch_bundles.py" "$family-$number" >&2
+  wflags+=(--delta="$delta")
+fi
 tmp="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # af2 starts first and warms up - the CUDA context, the weights on the device, then the embedder and
 # one block of each stack on a synthetic input of the shapes the export will have, which loads every
@@ -53,9 +62,13 @@ seq="${seq//:/}"
 depth=1; [ -z "$a3m" ] || depth=$(grep -c '^>' "$a3m")
 for a in "${inputs[@]}"; do [ "$a" != "--search" ] || depth=$(( maxmsa + maxextra )); done   # (a search is usually deep)
 n=$(( depth < maxmsa ? depth : maxmsa )); e=$(( depth - n )); e=$(( e > maxextra ? maxextra : e )); e=$(( e < 1 ? 1 : e ))
-exec 3< <("$here/af2" "$tmp" "${wflags[@]}" --fast --out="$out" --wait-input --detach-output --warm="${#seq},$n,$e,$templates" \
+# (a job's size is not known before it is featurised: no guess, no warm-up - which a length of 0 would refuse)
+warm=(); [ -z "$seq" ] || warm=(--warm="${#seq},$n,$e,$templates")
+exec 3< <("$here/af2" "$tmp" "${wflags[@]}" --fast --out="$out" --wait-input --detach-output "${warm[@]}" \
           "${flags[@]}" && rc=0 || rc=$?; echo "af2: exit $rc")
-if ! node --js-float16array "$here/export_input.mjs" "$tmp" --bundle="$bundle" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
+featurise="$repo/cuda/featurise/af2-featurise"
+[ -x "$featurise" ] || g++ -std=c++17 -O2 -ffp-contract=off -pthread "$repo/cuda/featurise/af2_featurise.cpp" -o "$featurise"
+if ! "$featurise" "$tmp" --bundle="$bundle" "${inputs[@]}"; then touch "$tmp/model.failed"; cat <&3; exit 1; fi
 status=0
 # "af2: done" (its stdout then closes): the fold is written and af2 is only releasing the device
 while IFS= read -r line <&3; do

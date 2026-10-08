@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -160,14 +161,31 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
     const Plan& p = plans[k];
     int centres = (int)p.centers.size(), extras = (int)p.extras.size();
     // nearestCentres: the centre agreeing with the row at the most residues (a masked centre residue agrees with none)
+    // (eight residues a 64-bit word, as paddedCodeWords lays them out: a centre's masked residue and its padding are
+    // 255, a row's padding 254, so neither ever matches - and a word's matching bytes counted at once)
+    int stride = (length + 7) / 8 * 8, words = stride / 8;
+    std::vector<uint64_t> centreWords((size_t)centres * words), extraWords((size_t)std::max(1, extras) * words);
+    {
+      std::vector<uint8_t> padded((size_t)centres * stride, 255);
+      for (int c = 0; c < centres; ++c)
+        for (int r = 0; r < length; ++r) { uint8_t code = p.centerCodes[(size_t)c * length + r]; if (code <= 20) padded[(size_t)c * stride + r] = code; }
+      std::memcpy(centreWords.data(), padded.data(), padded.size());
+      std::vector<uint8_t> rows((size_t)extras * stride, 254);
+      for (int e = 0; e < extras; ++e) std::memcpy(&rows[(size_t)e * stride], &encoded[(size_t)p.extras[e] * length], length);
+      if (extras) std::memcpy(extraWords.data(), rows.data(), rows.size());
+    }
     std::vector<int> assignments(extras);
     for (int e = 0; e < extras; ++e) {
-      const uint8_t* row = &encoded[(size_t)p.extras[e] * length];
+      const uint64_t* row = &extraWords[(size_t)e * words];
       int best = 0, bestScore = -1;
       for (int c = 0; c < centres; ++c) {
-        const uint8_t* centre = &p.centerCodes[(size_t)c * length];
+        const uint64_t* centre = &centreWords[(size_t)c * words];
         int score = 0;
-        for (int r = 0; r < length; ++r) score += centre[r] <= 20 && centre[r] == row[r];
+        for (int w = 0; w < words; ++w) {
+          uint64_t d = centre[w] ^ row[w];
+          uint64_t zeros = ~(((d & 0x7f7f7f7f7f7f7f7fULL) + 0x7f7f7f7f7f7f7f7fULL) | d) & 0x8080808080808080ULL;
+          score += __builtin_popcountll(zeros);
+        }
         if (score > bestScore) { bestScore = score; best = c; }
       }
       assignments[e] = best;

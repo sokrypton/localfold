@@ -17,8 +17,8 @@
 import { writeFileSync, mkdirSync, readFileSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 
 const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
-// (kept loaded between requests by cuda/export_server.mjs, which imports this file again for each:
-// what must happen once a process is guarded on a global, as the fetch shim below is)
+// (the fetch shim is installed once a process, guarded on a global: this file may be imported more than once -
+// tools that load it as a module do)
 const args = process.argv.slice(2);
 const out = args.find((a) => !a.startsWith("--")) ?? `${repo}/cuda/af3/data`;
 const option = (name, fallback) =>

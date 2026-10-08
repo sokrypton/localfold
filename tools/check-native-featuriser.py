@@ -121,11 +121,13 @@ def cases():
     sa, sd = synthetic_a3m("brs-a", brs_a, 300, 1), synthetic_a3m("brs-d", brs_d, 200, 2)
     pa, pd = synthetic_a3m("brs-pa", brs_a, 60, 3), synthetic_a3m("brs-pd", brs_d, 60, 4)
     m6 = synthetic_a3m("6mrr", SEQ_6MRR, 900, 5)
+    deep = synthetic_a3m("deep-5caj", caj, 8000, 9)      # (past 1 MiB: the JavaScript exporter's worker-thread path)
     AF2 = ["monomer", "multimer"]
     out += [
         ("af2-6mrr", "af2", job("t", [protein("A", SEQ_6MRR)]), [], AF2),
         ("af2-6mrr-msa", "af2", job("t", [protein("A", SEQ_6MRR)]), [f"--a3m={m6}", "--seed=7", "--recycles=2"], AF2),
         ("af2-6mrr-shallow", "af2", job("t", [protein("A", SEQ_6MRR)]), [f"--a3m={m6}", "--max-msa=16", "--max-extra=40"], AF2),
+        ("af2-deep", "af2", job("t", [protein("A", caj)]), [f"--a3m={deep}"], ["monomer"]),
         ("af2-test59", "af2", job("t", [protein("A", TEST_QUERY)]), ["--a3m=@test.a3m", "--max-msa=508"], AF2),
         ("af2-1brs", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [], AF2),
         ("af2-1brs-a3ms", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [f"--a3m={sa},{sd}"], AF2),
@@ -156,6 +158,60 @@ def cases():
                 out.append((f"example-{name[:-5]}", "af3", os.path.join(AF3_EXAMPLES, name), [], ["af3", "boltz2", "rosettafold3"]))
                 out.append((f"ef2-example-{name[:-5]}", "esmfold2", os.path.join(AF3_EXAMPLES, name), [], ["esmfold2"]))
     return out
+
+
+def resolve_cases():
+    """(name, request, network) for resolve-templates against cuda/resolve_templates.mjs"""
+    caj = open(os.path.join(FIX, "5caj-crystal.pdb")).read()
+    upload = {"kind": "upload", "text": caj, "source": "A", "filename": "5caj.pdb"}
+    return [
+        ("resolve-upload", {"entities": [
+            {"type": "protein", "value": "MKTAYIAKQR", "copies": 2, "template": upload},
+            {"type": "dna", "value": "ACGT", "copies": 1},
+            {"type": "protein", "value": "MKTAYIAKQR", "copies": 1, "template": {"kind": "search"}},
+            {"type": "ligand", "value": "GOL", "copies": 1},
+            {"type": "protein", "value": "GGGG", "copies": 1, "template": {"kind": "pdb", "source": ""}},
+            {"type": "protein", "value": "GGGG", "copies": 1, "template": {"kind": "upload", "text": caj}}]}, False),
+        ("resolve-pdb", {"entities": [{"type": "protein", "value": "MKTAYIAKQR", "copies": 1,
+                                       "template": {"kind": "pdb", "source": "1QYS_A"}}]}, True),
+        # 🔴 AlphaFold DB ANSWERS NODE'S fetch WITH 403 (and serves curl and a browser), so the JavaScript resolver
+        # cannot be this case's reference from a command line: the native side is checked on its own output
+        ("resolve-afdb", {"entities": [{"type": "protein", "value": "MKTAYIAKQR", "copies": 1,
+                                        "template": {"kind": "afdb", "source": "P69905"}}]}, "native-only"),
+    ]
+
+
+def check_resolve(name, request, network):
+    base = os.path.join(WORK, name)
+    shutil.rmtree(base, ignore_errors=True)
+    os.makedirs(base)
+    path = os.path.join(base, "request.json")
+    json.dump(request, open(path, "w"))
+    nv = run([os.path.join(REPO, "cuda", "featurise", "resolve-templates"), path, base + "/native"])
+    if network == "native-only":
+        if nv[0] != 0:
+            return f"native exit {nv[0]} ({refusal(nv[1])})"
+        [entry] = json.loads(nv[1].strip().splitlines()[-1])
+        text = open(entry["file"]).read()
+        atoms = sum(line.startswith("ATOM") for line in text.splitlines())
+        if entry["kind"] != "afdb" or atoms < 100 or entry["source"] != request["entities"][0]["template"]["source"]:
+            return f"{entry} with {atoms} ATOM records"
+        return None
+    js = run(["node", os.path.join(REPO, "cuda", "resolve_templates.mjs"), path, base + "/js"])
+    if js[0] != 0 or nv[0] != 0:
+        if js[0] != 0 and nv[0] != 0 and refusal(js[1]) == refusal(nv[1]):
+            return None
+        return f"JS exit {js[0]} ({refusal(js[1])}), native exit {nv[0]} ({refusal(nv[1])})"
+    a = json.loads(js[1].strip().splitlines()[-1].replace(base + "/js", "@"))
+    b = json.loads(nv[1].strip().splitlines()[-1].replace(base + "/native", "@"))
+    if a != b:
+        return f"{a} against native {b}"
+    for entry in a:
+        if "file" in entry:
+            fa, fb = entry["file"].replace("@", base + "/js"), entry["file"].replace("@", base + "/native")
+            if open(fa, "rb").read() != open(fb, "rb").read():
+                return f"{entry['file']} differs"
+    return None
 
 
 def read_idx(path):
@@ -284,6 +340,16 @@ def main():
                 print(f"  ok   {tag}: identical (JS {js_s:.2f} s, native {nv_s:.2f} s)")
             if not a.keep and not problem:
                 shutil.rmtree(base, ignore_errors=True)
+    for name, request, network in resolve_cases():
+        if (a.only and a.only not in name) or bool(network) != a.network:
+            continue
+        problem = check_resolve(name, request, network)
+        if problem:
+            failed.append(name)
+            print(f"  FAIL {name}: {problem}")
+        else:
+            passed += 1
+            print(f"  ok   {name}: " + ("the native resolver fetched it (no JavaScript reference)" if network == "native-only" else "identical"))
     print(f"\n{passed} identical, {len(failed)} differ" + (f": {', '.join(failed)}" if failed else ""))
     sys.exit(1 if failed else 0)
 
