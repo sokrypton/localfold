@@ -274,9 +274,15 @@ inline bool wideFits(int C) {
 // the input kernel's forms: 8 warps holding all their rows, else 16 warps norming their rows 32 at a time
 // (TRIIN_ROUNDED: a T4 at 256 channels, where 8 warps' rows are 67.6 KB), else 4 warps. A row's
 // arithmetic does not depend on the form, so all three are byte-identical.
-constexpr int TRIIN_ROUNDED = 16, TRIIN_XROUNDS = 8;
+// TRIIN_TWO_TILES (a form's tag, not a warp count): 4 warps of two 16-row tiles each - 8 warps' 128 rows, shared
+// memory and grid, each weight fragment feeding two MMAs (the kernel is shared-memory bound: cuda/ef2/README.md,
+// 742 -> 714 ms of ESMFold2's 988-token fold). Where an SM holds two of its blocks, at 256 channels
+constexpr int TRIIN_ROUNDED = 16, TRIIN_XROUNDS = 8, TRIIN_TWO_TILES = 2;
+constexpr int triInWarpsOf(int form) { return form == TRIIN_TWO_TILES ? 4 : form; }
+constexpr int triInRowsOf(int form) { return form == TRIIN_TWO_TILES ? 128 : 16 * form; }
 constexpr size_t wideTriInSmemW(int C, int warps) {
-  return warps == TRIIN_ROUNDED ? triIn256Smem<__nv_bfloat16>(C, warps, TRIIN_XROUNDS) : triIn256Smem<__nv_bfloat16>(C, warps);
+  return warps == TRIIN_ROUNDED ? triIn256Smem<__nv_bfloat16>(C, warps, TRIIN_XROUNDS)
+       : warps == TRIIN_TWO_TILES ? triIn256Smem<__nv_bfloat16>(C, 8) : triIn256Smem<__nv_bfloat16>(C, warps);
 }
 inline int wideTriInWarps(int C) {
   static const int forced = getenv("LOCALFOLD_TRIIN_WARPS") ? atoi(getenv("LOCALFOLD_TRIIN_WARPS")) : 0;
@@ -287,7 +293,11 @@ inline int wideTriInWarps(int C) {
   // (past 256 channels 8 warps' rows are one block an SM - ~100 KB at 384, 133 at 512 - and 4 are faster on an A100:
   // OpenDDE's trunk 1476 -> 1449 ms at 261 tokens, IntelliFold-2's 2323 -> 2301; level at 256)
   if (C > 256) return 4;
-  if (fitsSmem(wideTriInSmemW(C, 8))) return 8;
+  if (fitsSmem(wideTriInSmemW(C, 8))) {
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    return (size_t)perSm >= 2 * (wideTriInSmemW(C, 8) + 1024) ? TRIIN_TWO_TILES : 8;
+  }
   return fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED)) ? TRIIN_ROUNDED : 4;
 }
 // (the output kernel as triangleOutRun launches it: the bf16 tile at 16-column stages, either product type)
@@ -315,12 +325,15 @@ template <class F> void wideWidth(int C, F f) {
 template <class F> void wideWarps(int C, F f) {
   int w = wideTriInWarps(C);
   if (w == 8) f(std::integral_constant<int, 8>{});
+  else if (w == TRIIN_TWO_TILES) f(std::integral_constant<int, TRIIN_TWO_TILES>{});
   else if (w == TRIIN_ROUNDED) f(std::integral_constant<int, TRIIN_ROUNDED>{});
   else f(std::integral_constant<int, 4>{});
 }
 // triIn256K's template for a warp count (the rounded form at TRIIN_ROUNDED)
 template <int CC, int WI, class TA, class PT = float> constexpr auto triIn256For() {
-  if constexpr (WI == TRIIN_ROUNDED) return triIn256K<CC, WI, TA, TRIIN_XROUNDS, false, PT>; else return triIn256K<CC, WI, TA, 1, false, PT>;
+  if constexpr (WI == TRIIN_ROUNDED) return triIn256K<CC, WI, TA, TRIIN_XROUNDS, false, PT>;
+  else if constexpr (WI == TRIIN_TWO_TILES) return triIn256K<CC, 4, TA, 1, false, PT, 2>;
+  else return triIn256K<CC, WI, TA, 1, false, PT>;
 }
 inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
   static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
@@ -569,7 +582,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
               static bool attr = false;
               constexpr auto kern = triIn256For<CC, WI, __nv_bfloat16, PT>();
               if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-              kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
+              kern<<<(unsigned)((cs + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
                 pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, ab, bb, t2, n, np, cs, nullptr));
           });
           triContractBf16(outgoing, np, cs, C, alpha, ab, bb, pb);
@@ -587,7 +600,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
             static bool attr = false;
             constexpr auto kern = triIn256For<CC, WI, half, PT>();
             if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-            kern<<<(unsigned)((cs + 16 * WI - 1) / (16 * WI)), 32 * WI, wideTriInSmemW(CC, WI), STREAM>>>(
+            kern<<<(unsigned)((cs + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
               pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a, b, t2, n, np, cs, nullptr));
         });
         contract();
