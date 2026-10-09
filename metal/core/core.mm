@@ -624,9 +624,8 @@ void layerNorm(const half* x, half* y, size_t rows, int C, const float* s, const
   layerNormRun(nullptr, x, nullptr, y, rows, C, s, o, eps, ldx, ldy);
 }
 void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset) {
-  if (C % 8 || C > 256) die("centerNorm: %d channels (a multiple of 8, at most 256)", C);
   size_t P = (size_t)L * L;
-  run("lf_center_norm", grid1d((P + 31) / 32, 1), 256, CenterNormArgs{prod, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset});
+  run(C % 8 || C > 256 ? "lf_center_norm_wide" : "lf_center_norm", grid1d((P + 31) / 32, 1), 256, CenterNormArgs{prod, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset});
 }
 void toHalf(const float* x, half* y, size_t n) { run1d("lf_to_half", (n + 3) / 4, ConvArgs{x, y, n}); }
 void toFloat(const half* x, float* y, size_t n) { run1d("lf_to_float", (n + 3) / 4, ConvBackArgs{x, y, n}); }

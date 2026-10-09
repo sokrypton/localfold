@@ -698,3 +698,117 @@ kernel void af3_atom_attention_mma(constant AtomAttnArgs& a [[buffer(0)]], uint3
 }
 template [[host_name("af3_atom_attention_mma16")]] kernel void af3_atom_attention_mma<16>(constant AtomAttnArgs&, uint3, uint, uint, uint);
 template [[host_name("af3_atom_attention_mma32")]] kernel void af3_atom_attention_mma<32>(constant AtomAttnArgs&, uint3, uint, uint, uint);
+kernel void af3_reembed_bin(LF_ARGS(ReembedBinArgs)) {
+  uint ij = (uint)LF_INDEX;
+  if (ij >= a.n * a.n) return;
+  uint i = lf_udiv(ij, a.n), j = ij - i * a.n;
+  float sq = 1e-10f;
+  for (int k = 0; k < 3; ++k) { float d = a.beta[i * 3 + k] - a.beta[j * 3 + k]; sq += d * d; }
+  float distance = sqrt(sq);
+  int bin = 0;
+  for (int e = 0; e < 63; ++e) if (distance > 2.f + 20.f * e / 62) ++bin;
+  a.bin[ij] = bin;
+}
+kernel void af3_reembed_pair(LF_ARGS(ReembedPairArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.n * a.n * a.C) return;
+  uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+  int o = a.orders ? (int)a.orders[ij] : 0;
+  if (o < 0 || o >= 7) o = 0;
+  a.pair[t] += a.right[i * a.C + c] + a.left[j * a.C + c] + a.Wd[a.bin[ij] * a.C + c] * a.pairMask[ij] +
+               (a.bonds ? a.bonds[ij] * a.wBond[c] : 0.f) + a.wBondType[o * a.C + c] + a.unspecified[c];
+}
+kernel void af3_outer_prod(LF_ARGS(OuterProdArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.rows * a.n * a.C) return;
+  uint ij = lf_udiv((uint)t, a.C), e = (uint)t - ij * a.C, ii = lf_udiv(ij, a.n), j = ij - ii * a.n;
+  a.out[t] = (half)(a.a[(a.i0 + ii) * a.C + e] * a.b[j * a.C + e]);
+}
+
+// ---------------------------------------------------------------- rosettafold3
+kernel void af3_kq_norm(constant KqNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  ulong row = ((ulong)tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.rows) return;
+  for (int side = 0; side < 2; ++side) {
+    device half* x = side ? a.k + row * a.ldk : a.q + row * a.ldq;
+    device const float* sc = side ? a.ks : a.qs; device const float* of = side ? a.ko : a.qo;
+    float s = 0.f;
+    for (uint c = lane; c < a.Wd; c += 32) s += (float)x[c] + (side || !a.qBias ? 0.f : a.qBias[c]);
+    float mean = simd_sum(s) / a.Wd, v = 0.f;
+    for (uint c = lane; c < a.Wd; c += 32) { float d = (float)x[c] + (side || !a.qBias ? 0.f : a.qBias[c]) - mean; v += d * d; }
+    float inv = rsqrt(simd_sum(v) / a.Wd + 1e-5f);
+    for (uint c = lane; c < a.Wd; c += 32)
+      x[c] = (half)(((float)x[c] + (side || !a.qBias ? 0.f : a.qBias[c]) - mean) * inv * sc[c] + of[c]);
+  }
+}
+// (float, where the reference's is double - Metal has none; the step is 1e-3 rather than 1e-4 for it)
+inline float lf_improper(float3 a, float3 b, float3 c, float3 d) {
+  const float eps = 1e-6f;
+  float3 b0 = a - b, b1 = c - b, b2 = d - c;
+  float3 n = b1 / (length(b1) + eps);
+  float3 v = b0 - dot(b0, n) * n, w = b2 - dot(b2, n) * n;
+  return atan2(dot(cross(n, v), w) + eps, dot(v, w) + eps);
+}
+kernel void af3_chiral_grad(LF_ARGS(ChiralGradArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.atoms * a.ns) return;
+  ulong k = t / a.atoms, atom = t - k * a.atoms;
+  device const float* x = a.positions + k * a.atoms * 3;
+  float3 g = float3(0.f);
+  const float step = 1e-3f;
+  for (int e = a.offsets[atom]; e < a.offsets[atom + 1]; ++e) {
+    int centre = a.entries[e] >> 2, corner = a.entries[e] & 3;
+    float ideal = a.angles[centre];
+    if (ideal == 0.f) continue;
+    float3 p[4];
+    for (int q = 0; q < 4; ++q) { ulong at = (ulong)a.centers[centre * 4 + q] * 3; p[q] = float3(x[at], x[at + 1], x[at + 2]); }
+    for (int d = 0; d < 3; ++d) {
+      float keep = p[corner][d];
+      p[corner][d] = keep + step; float up = lf_improper(p[0], p[1], p[2], p[3]) - ideal;
+      p[corner][d] = keep - step; float down = lf_improper(p[0], p[1], p[2], p[3]) - ideal;
+      p[corner][d] = keep;
+      float derivative = (up * up - down * down) / (2.f * step);
+      if (isfinite(derivative)) g[d] += derivative;
+    }
+  }
+  a.grads[t * 3] = g.x; a.grads[t * 3 + 1] = g.y; a.grads[t * 3 + 2] = g.z;
+}
+kernel void af3_masked_sum(constant MaskedSumArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ng [[threadgroups_per_grid]],
+                           uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[2][8];
+  float acc = 0.f, live = 0.f;
+  ulong total = a.rows * a.C;
+  for (ulong i = (ulong)tg.x * 256 + tid; i < total; i += (ulong)ng.x * 256) {
+    ulong r = i / a.C;
+    if (!(a.mask[r] > 0.f)) continue;
+    float v = a.x[i];
+    if (a.pass) { v -= a.stat[0]; v *= v; }
+    acc += v;
+    if (i - r * a.C == 0) live += 1.f;
+  }
+  acc = simd_sum(acc); live = simd_sum(live);
+  if (lane == 0) { red[0][sg] = acc; red[1][sg] = live; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float s = 0.f, l = 0.f;
+    for (int k = 0; k < 8; ++k) { s += red[0][k]; l += red[1][k]; }
+    a.partial[tg.x * 2] = s; a.partial[tg.x * 2 + 1] = l;
+  }
+}
+kernel void af3_global_stat(constant GlobalStatArgs& a [[buffer(0)]], uint tid [[thread_index_in_threadgroup]]) {
+  if (tid) return;
+  float total = 0.f, live = 0.f;
+  for (uint k = 0; k < a.parts; ++k) { total += a.partial[k * 2]; live += a.partial[k * 2 + 1]; }
+  float count = max(live * a.vendorWidth, 1.f);
+  if (a.pass == 0) a.stat[0] = total / count;
+  else {
+    float variance = total + (float)(a.vendorWidth - a.C) * live * a.stat[0] * a.stat[0];
+    a.stat[1] = rsqrt(variance / count + 1e-5f);
+  }
+}
+kernel void af3_apply_norm(LF_ARGS(ApplyNormArgs)) {
+  ulong t = LF_INDEX;
+  if (t < a.n) a.x[t] = (a.x[t] - a.stat[0]) * a.stat[1];
+}

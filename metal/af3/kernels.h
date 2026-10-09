@@ -125,3 +125,22 @@ struct ConfPairInitArgs { DP(float) pair; CP(float) left; CP(float) right; CP(in
 struct ExpectationArgs { CP(float) logits; DP(float) out; CP(float) mask; CP(float) centres; u64 rows; uint bins, symmetricN; float scale; uint pad; };
 struct InterChainArgs { DP(float) logits; CP(float) inter; CP(int) asym; uint n, bins; };
 struct ClampArgs { DP(float) x; u64 n; float limit; uint pad; };
+// boltz2's re-embedded confidence pair: its own 64-bin distance embedding (2..22 A), the bond and bond-order terms
+struct ReembedBinArgs { CP(float) beta; DP(int) bin; uint n, pad; };
+struct ReembedPairArgs { DP(float) pair; CP(float) left; CP(float) right; CP(int) bin; CP(float) pairMask; CP(float) Wd; CP(float) bonds;
+                         CP(float) orders; CP(float) wBond; CP(float) wBondType; CP(float) unspecified; uint n, C; };
+// out[(i - i0) n + j][e] = a[i][e] b[j][e], rows i0.. (half: a GEMM's input)
+struct OuterProdArgs { CP(float) a; CP(float) b; DP(half) out; uint i0, rows, n, C; };
+
+// ---------------------------------------------------------------- rosettafold3
+// q (with its bias) and k LayerNormed over each row's heads x dimension, scale and offset (rf3's kq_norm), in place
+struct KqNormArgs { DP(half) q; DP(half) k; CP(float) qBias; CP(float) qs; CP(float) qo; CP(float) ks; CP(float) ko; u64 rows;
+                    uint ldq, ldk, Wd, pad; };
+// d/dx of the sum over an atom's chirality centres of (improper dihedral - ideal)^2, by central differences
+struct ChiralGradArgs { CP(float) positions; CP(int) centers; CP(float) angles; CP(int) offsets; CP(int) entries; DP(float) grads;
+                        u64 atoms; uint ns, pad; };
+// a masked LayerNorm over a WHOLE tensor (rf3's confidence inputs): per-threadgroup partial sums (and live rows), then
+// the statistics over `vendorWidth` columns (the missing ones zero), then applied
+struct MaskedSumArgs { CP(float) x; CP(float) mask; DP(float) partial; CP(float) stat; u64 rows; uint C, pass; };
+struct GlobalStatArgs { CP(float) partial; DP(float) stat; uint parts, C, vendorWidth, pass; };
+struct ApplyNormArgs { DP(float) x; CP(float) stat; u64 n; };

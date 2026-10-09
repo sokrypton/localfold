@@ -127,7 +127,9 @@ static void embed(Trunk& t) {
     ln(t.prevPair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     lin(pn, E + "prevEmbedding", prev, pairs, C, C);
   }
+  if (t.pass == 0) { seam("dbg_left", left, (size_t)n * C); seam("dbg_prev", prev, pairs * C); seam("dbg_tf", t.targetFeat, (size_t)n * t.F); }
   run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, prev, t.pair, (uint)n, (uint)C});
+  if (t.pass == 0) seam("dbg_outer", t.pair, pairs * C);
   run1d("af3_relenc", pairs * C, RelEncArgs{relIdx(), W(E + "positionActivations"), t.pair, (uint)n, (uint)C});
   const bool bonds = M.has("batch.bondMatrix") && hasW(E + "bondEmbedding"), types = hasW(E + "tokenBondsTypeEmbed");
   if (bonds || types)
@@ -137,7 +139,9 @@ static void embed(Trunk& t) {
                         types ? W(E + "tokenBondsTypeEmbed") : nullptr, types ? W(E + "contactEncodingUnspecified") : nullptr,
                         pairs, (uint)C, 0});
   releaseScratch({"emb.prev"});
+  if (t.pass == 0) seam("z_init_generic", t.pair, pairs * C);
   templateEmbedding(t);
+  if (t.pass == 0) seam("z_after_template", t.pair, pairs * C);
   // the MSA: its features projected, plus the target's projection broadcast over the rows
   float* fromTarget = scratch<float>("emb.fromTarget", (size_t)n * t.Cm);
   lin(t.targetFeat, E + "extraMsaTargetFeat", fromTarget, n, t.F, t.Cm);
@@ -262,6 +266,7 @@ void runTrunk(Trunk& t) {
   }
   for (int k = 0; k < msaBlocks; ++k) msaBlock(t, k);
   if (zIn) add(t.pair, zIn, pairs * t.C);
+  if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
   releaseScratch({"msaatt.", "opm.", "trunk.zBeforeMsa"});
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
   for (int k = 0; k < blocks; ++k) pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k));

@@ -22,6 +22,10 @@ inline bool flag(const std::string& k) { return M.meta(k, 0) != 0; }
 inline int metaI(const std::string& k) { return (int)M.meta(k); }
 inline std::string num(long long k) { return std::to_string(k); }
 
+// a stage's output handed to a checker (main.mm: LOCALFOLD_SAVE_SEAMS=<dir> writes each as <name>.f32), or nothing
+extern void (*SEAM)(const char* name, const float* d, size_t n);
+inline void seam(const char* name, const float* d, size_t n) { if (SEAM) SEAM(name, d, n); }
+
 // ---------------------------------------------------------------- operations (ops.mm)
 // Y = alpha X W (+ beta Y) (+ bias) for a named weight [in][out], its size checked; operands multiplied in half
 void lin(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, float beta = 0.f,

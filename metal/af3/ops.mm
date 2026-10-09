@@ -1,6 +1,8 @@
 // metal/af3's shared pieces: a named weight's GEMM, LayerNorm by names, the derived weights.
 #include "af3.h"
 
+void (*SEAM)(const char*, const float*, size_t) = nullptr;
+
 static void checkSize(const std::string& w, int in, int out) {
   if (lenW(w) != (size_t)in * out) die("%s has %zu elements, not %d x %d", w.c_str(), lenW(w), in, out);
 }

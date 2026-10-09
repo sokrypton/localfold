@@ -217,13 +217,18 @@ static void transformer(float* act, const float* cond) {
   for (int b = 0; b < D.nblocks; ++b) {
     std::string B = blockName(b);
     const float* g = gNorm + (size_t)b * 4 * C; const float* z = gRaw + (size_t)b * 2 * C;
-    if (hasW(B + ".queryLayerNormScale")) die("rf3's transformer q/k LayerNorm is not in the native port yet");
     adaLn(act, g, g + C, x, nullptr, rows, C, n, D.ldn);
     if (noResidual) copy(pre, act, rows * C * 4);
     linW(x, qkvgWeight(B, C, Wd, false), qkvg, prows, C, 4 * Wd, nullptr, "transformer qkvg");
     Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = Dh; at.rows = NS; at.scale = 1.f / sqrtf((float)Dh);
     at.bias = D.bias[b]; at.biasStride = D.stride; at.qBias = W(B + ".qBias");
     if (!D.masks.ones) { at.mask = D.masks.seq; at.maskB = 0; at.maskK = 1; }
+    if (hasW(B + ".queryLayerNormScale")) {     // rf3: q (its bias inside) and k normalised per token row
+      run("af3_kq_norm", grid1d((rows + 7) / 8, 1), 256,
+          KqNormArgs{qkvg, qkvg + Wd, W(B + ".qBias"), W(B + ".queryLayerNormScale"), W(B + ".queryLayerNormOffset"),
+                     W(B + ".keyLayerNormScale"), W(B + ".keyLayerNormOffset"), rows, (uint)(4 * Wd), (uint)(4 * Wd), (uint)Wd, 0});
+      at.qBias = nullptr;
+    }
     attention(at);
     lin(o, B + ".Transition2", att, prows, Wd, C);
     run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, z, rows, (uint)C, (uint)n, (uint)D.ldr, 0});

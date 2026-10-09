@@ -122,7 +122,8 @@ int foldInput(const std::string& dir, Options o) {
         char row[96]; snprintf(row, sizeof row, "%llu,%d,%.17g", (unsigned long long)sd, sk, score);
         ranking.push_back(row);
       }
-      if (!std::isfinite(score)) die("sample %d: ranking score %f is not finite", sk, score);
+      if (!std::isfinite(score) || !std::isfinite(ck.meanPlddt) || ck.ptm < -1)
+        die("sample %d: the fold is not finite (pLDDT %f, pTM %f) - a NaN upstream", sk, ck.meanPlddt, ck.ptm);
       if (score > bestScore) { bestScore = score; best = std::move(ck); bestX = std::move(xk); bestS = ss; bestSeed = sd; bestSample = sk; }
     }
   }
@@ -191,6 +192,7 @@ int foldMain(int argc, char** argv) {
       usleep(1000);
     }
   }
+  if (getenv("LOCALFOLD_SAVE_SEAMS")) SEAM = saveSeam;
   int code = foldInput(argv[1], o);
   if (detach) { printf("af3: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
   return code;

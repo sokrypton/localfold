@@ -63,7 +63,6 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
   size_t q1 = (size_t)sh.subsets * sh.queries, qRows = q1 * NS, kRows = (size_t)sh.subsets * sh.keys * NS;
   int Wd = heads * D;
   if (D > 32 || sh.keys > 128) die("atom attention: %d keys of a head %d wide", sh.keys, D);
-  if (hasW(B + ".queryLayerNormScale")) die("rf3's atom q/k LayerNorm is not in the native port yet");
   float* pre = nullptr;
   if (st.noResidual) { pre = scratch<float>("ab.pre", qRows * C); copy(pre, act, qRows * C * 4); }
   half* xq = scratch<half>("ab.xq", qRows * C); half* xk = scratch<half>("ab.xk", qRows * C);
@@ -80,6 +79,13 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
        nullptr, "atom q gate");
   linW(xk, concatColumns(B + ".kv", C, {{B + ".kProjection", Wd, false}, {B + ".vProjection", Wd, false}}), kvAtom, qRows, C, 2 * Wd,
        nullptr, "atom k v");
+  const float* qBias = W(B + ".qBias");
+  if (hasW(B + ".queryLayerNormScale")) {       // rf3: q (its bias inside) and k normalised per atom row
+    run("af3_kq_norm", grid1d((qRows + 7) / 8, 1), 256,
+        KqNormArgs{qg, kvAtom, qBias, W(B + ".queryLayerNormScale"), W(B + ".queryLayerNormOffset"), W(B + ".keyLayerNormScale"),
+                   W(B + ".keyLayerNormOffset"), qRows, (uint)(2 * Wd), (uint)(2 * Wd), (uint)Wd, 0});
+    qBias = M.derived<float>("zeros:" + num(Wd), Wd, [](float*) {});
+  }
   half* kv = scratch<half>("ab.kv", kRows * 2 * Wd);
   uint chunks = (uint)(2 * Wd * 2 / 16);
   run1d("af3_gather_rows", kRows * chunks, GatherRowsArgs{(const uchar*)kvAtom, st.queriesToKeys.idx, st.queriesToKeys.mask, (uchar*)kv,
@@ -89,7 +95,7 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
   const bool mma = !scalarAttention && sh.queries == 32 && sh.keys == 128 && (D == 16 || D == 32);
   run(mma ? (D == 16 ? "af3_atom_attention_mma16" : "af3_atom_attention_mma32") : "af3_atom_attention",
       Grid{(uint32_t)(sh.subsets * NS), (uint32_t)heads, 1}, 128,
-      AtomAttnArgs{qg, W(B + ".qBias"), kv, st.qMask, st.kMask, bc.pairLogits, gathered, (uint)sh.queries, (uint)sh.keys,
+      AtomAttnArgs{qg, qBias, kv, st.qMask, st.kMask, bc.pairLogits, gathered, (uint)sh.queries, (uint)sh.keys,
                    (uint)heads, (uint)D, (uint)sh.subsets, st.keyMasked ? 1u : 0u});
   float* attention = scratch<float>("ab.attention", qRows * C);
   lin(gathered, B + ".Transition2", attention, qRows, Wd, C);
@@ -233,6 +239,22 @@ EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, co
   releaseScratch({"enc.", "apl.", "ada."});
   return o;
 }
+// rf3's chirality centres inverted: each atom's (centre, corner) entries, built once an input
+struct ChiralIndex { const int* offsets; const int* entries; const void* input; };
+static ChiralIndex CHIRAL{};
+static const ChiralIndex& chiralIndex(size_t atoms) {
+  const int* centers = M.hostI("chiral.centers");
+  if (CHIRAL.input == (const void*)M.i("chiral.centers")) return CHIRAL;
+  int count = (int)M.meta("chiral.count");
+  std::vector<int> offsets(atoms + 1, 0), entries((size_t)count * 4);
+  for (int i = 0; i < count * 4; ++i) offsets[centers[i] + 1]++;
+  for (size_t a = 0; a < atoms; ++a) offsets[a + 1] += offsets[a];
+  std::vector<int> fillAt(offsets.begin(), offsets.end() - 1);
+  for (int i = 0; i < count * 4; ++i) entries[fillAt[centers[i]]++] = i;    // (centre << 2) | corner
+  if (CHIRAL.offsets) { release(CHIRAL.offsets); release(CHIRAL.entries); }
+  CHIRAL = {uploadNew(offsets.data(), offsets.size()), uploadNew(entries.data(), std::max<size_t>(1, entries.size())), M.i("chiral.centers")};
+  return CHIRAL;
+}
 // The encoder's per-step part: the activation from (scaled) positions, the blocks, the per-token aggregation
 void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions) {
   AtomShape sh = atomShape();
@@ -241,8 +263,25 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
   Gather t2q = gatherOf("batch.tokenAtomsToQueries"), q2t = gatherOf("batch.queriesToTokenAtoms");
   float* act = scratch<float>(E + ".act", qRows * C);
   bool maskPerBlock = flag(E + ".blocks.0.maskAtomActPerBlock");
-  if (atomPositions && hasW(E + ".atomChiralToFeatures")) die("rf3's chirality term is not in the native port yet");
-  if (atomPositions) {
+  bool chiral = atomPositions && hasW(E + ".atomChiralToFeatures");
+  if (chiral) {
+    // rf3's: the positions' projection and the chirality gradient's beside it, masked, added to the start
+    for (int k = 0; k < NS; ++k) copy(act + k * q1 * C, o.qStart, q1 * C * 4);
+    float* gp = scratch<float>("enc.gp", qRows * 3);
+    convert(t2q, atomPositions, gp, 3, atoms, NS);
+    float* positional = scratch<float>("enc.positional", qRows * C);
+    lin(gp, E + ".atomPositionsToFeatures", positional, qRows, 3, C);
+    if (!M.has("chiral.centers")) die("this bundle reads chirality centres the input lacks: export it again");
+    const ChiralIndex& ch = chiralIndex(atoms);
+    float* grads = scratch<float>("enc.chiralGrads", atoms * NS * 3);
+    run1d("af3_chiral_grad", atoms * NS, ChiralGradArgs{atomPositions, M.i("chiral.centers"), M.f("chiral.angles"), ch.offsets, ch.entries,
+                                                        grads, atoms, (uint)NS, 0});
+    float* gc = scratch<float>("enc.gc", qRows * 3);
+    convert(t2q, grads, gc, 3, atoms, NS);
+    lin(gc, E + ".atomChiralToFeatures", positional, qRows, 3, C, 1.f);
+    scaleRows(positional, o.qMask, qRows, C, q1);
+    add(act, positional, qRows * C);
+  } else if (atomPositions) {
     if (lenW(E + ".atomPositionsToFeatures") != (size_t)3 * C) die("encoder: the positions projection is not 3 x C");
     run1d("af3_encoder_start", qRows * C, EncoderStartArgs{o.qStart, atomPositions, t2q.idx, t2q.mask, W(E + ".atomPositionsToFeatures"),
                                                           o.qMask, act, qRows, q1, atoms, (uint)C, 0});

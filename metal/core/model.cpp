@@ -2,6 +2,8 @@
 // one buffer.
 #include "model.h"
 #include "json.h"
+#include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -159,7 +161,141 @@ Src record(const std::string& where, const std::string& name, const Json& r) {
   } else die("%s: unsupported dtype %s", name.c_str(), dtype.c_str());
   return x;
 }
+// ---------------------------------------------------------------- af3-any-model blobs
+// A blob (<model>.bin.zst) is a stream of records - [scope, name, dtype, shape, bytes] - decompressed once into
+// `<blob>.raw/NNN` shards of at most 256 MB, cut at record boundaries (never before an int8 tensor's `__q_scale`), with
+// `done` listing them: the cache cuda/af3 and the legacy port keep too. zstd is linked into the port binaries
+// (metal/build.sh): its functions are found in the process itself.
+struct ZIn { const void* src; size_t size, pos; };
+struct ZOut { void* dst; size_t size, pos; };
+std::vector<std::string> blobShards(const std::string& blob) {
+  std::string dir = blob + ".raw";
+  auto listed = [&]() {
+    std::vector<std::string> out; std::ifstream done(dir + "/done"); std::string f;
+    while (done >> f) out.push_back(dir + "/" + f);
+    return out;
+  };
+  if (auto have = listed(); !have.empty()) return have;
+  void* self = dlopen(nullptr, RTLD_NOW);
+  auto sym = [&](const char* n) { void* f = dlsym(self, n); if (!f) die("reading %s needs zstd, and this binary has no %s", blob.c_str(), n); return f; };
+  auto create = (void* (*)())sym("ZSTD_createDStream");
+  auto init = (size_t (*)(void*))sym("ZSTD_initDStream");
+  auto step = (size_t (*)(void*, ZOut*, ZIn*))sym("ZSTD_decompressStream");
+  auto isError = (unsigned (*)(size_t))sym("ZSTD_isError");
+  auto errName = (const char* (*)(size_t))sym("ZSTD_getErrorName");
+  auto freeStream = (size_t (*)(void*))sym("ZSTD_freeDStream");
+  FILE* in = fopen(blob.c_str(), "rb");
+  if (!in) die("cannot read %s", blob.c_str());
+  std::string tmp = dir + ".part." + std::to_string(getpid());
+  mkdir(tmp.c_str(), 0755);
+  const size_t SHARD = (size_t)256 << 20;
+  std::vector<char> pending; std::vector<std::string> names; FILE* out = nullptr; size_t inShard = 0;
+  auto emit = [&](bool all) {
+    size_t at = 0;
+    for (;;) {
+      if (pending.size() - at < 20) break;
+      int32_t h[5]; memcpy(h, pending.data() + at, 20);
+      size_t len = 20 + (size_t)h[0] + h[1] + h[2] + 4 * (size_t)h[3] + (size_t)(uint32_t)h[4];
+      if (pending.size() - at < len) break;
+      std::string nm(pending.data() + at + 20 + h[0], (size_t)h[1]);
+      bool scale = nm.size() > 9 && !nm.compare(nm.size() - 9, 9, "__q_scale");
+      if (!out || (inShard > 0 && inShard + len > SHARD && !scale)) {
+        if (out) fclose(out);
+        char file[16]; snprintf(file, sizeof file, "%03zu", names.size()); names.push_back(file);
+        out = fopen((tmp + "/" + file).c_str(), "wb"); inShard = 0;
+        if (!out) die("cannot write %s/%s", tmp.c_str(), file);
+      }
+      fwrite(pending.data() + at, 1, len, out); inShard += len; at += len;
+    }
+    pending.erase(pending.begin(), pending.begin() + at);
+    if (all && !pending.empty()) die("%s: a truncated record", blob.c_str());
+  };
+  void* ds = create(); init(ds);
+  std::vector<char> ib(1 << 20), ob(1 << 22);
+  size_t got, last = 0;
+  auto take = [&](ZIn& zi) {
+    ZOut zo{ob.data(), ob.size(), 0};
+    last = step(ds, &zo, &zi);
+    if (isError(last)) die("%s: %s", blob.c_str(), errName(last));
+    pending.insert(pending.end(), ob.data(), ob.data() + zo.pos);
+    if (pending.size() > ((size_t)64 << 20)) emit(false);
+    return zo.pos;
+  };
+  while ((got = fread(ib.data(), 1, ib.size(), in)) > 0) { ZIn zi{ib.data(), got, 0}; while (zi.pos < zi.size) take(zi); }
+  while (last != 0) { ZIn zi{nullptr, 0, 0}; if (take(zi) == 0) break; }
+  freeStream(ds); fclose(in);
+  if (last != 0) die("%s: a truncated stream", blob.c_str());
+  emit(true);
+  if (out) fclose(out);
+  { std::ofstream done(tmp + "/done"); for (auto& n : names) done << n << "\n"; }
+  if (rename(tmp.c_str(), dir.c_str())) die("cannot write %s", dir.c_str());
+  return listed();
+}
+// the one *.bin.zst a directory holds, or "" when the directory is a bundle (a manifest.json)
+std::string findBlob(const std::string& dir) {
+  struct stat st;
+  if (!stat((dir + "/manifest.json").c_str(), &st)) return "";
+  std::vector<std::string> found;
+  if (DIR* d = opendir(dir.c_str())) {
+    while (dirent* e = readdir(d)) { std::string n = e->d_name; if (n.size() > 8 && n.compare(n.size() - 8, 8, ".bin.zst") == 0) found.push_back(n); }
+    closedir(d);
+  }
+  if (found.size() != 1) die("%s holds %s and no manifest.json", dir.c_str(), found.empty() ? "no *.bin.zst" : "more than one *.bin.zst");
+  return dir + "/" + found[0];
+}
+// every tensor of a decompressed blob as a source: float32, float16, bfloat16, or int8 with its float32 scales
+std::map<std::string, Src> blobSources(const std::string& blob) {
+  struct Rec { std::string dtype; std::vector<long long> shape; size_t offset, bytes; std::string file; };
+  std::map<std::string, Rec> recs;
+  for (const std::string& shard : blobShards(blob)) {
+    FILE* f = fopen(shard.c_str(), "rb");
+    if (!f) die("cannot read %s", shard.c_str());
+    size_t at = 0;
+    for (;;) {
+      int32_t h[5];
+      if (fread(h, 4, 5, f) != 5) break;
+      std::string scope(h[0], 0), name(h[1], 0), dtype(h[2], 0);
+      std::vector<int32_t> shape(h[3]);
+      if (fread(scope.data(), 1, h[0], f) != (size_t)h[0] || fread(name.data(), 1, h[1], f) != (size_t)h[1] ||
+          fread(dtype.data(), 1, h[2], f) != (size_t)h[2] || fread(shape.data(), 4, h[3], f) != (size_t)h[3])
+        die("%s: a truncated record", shard.c_str());
+      at += 20 + h[0] + h[1] + h[2] + 4 * (size_t)h[3];
+      recs[scope + "/" + name] = {dtype, std::vector<long long>(shape.begin(), shape.end()), at, (size_t)(uint32_t)h[4], shard};
+      at += (size_t)(uint32_t)h[4];
+      fseek(f, (long)at, SEEK_SET);
+    }
+    fclose(f);
+  }
+  std::map<std::string, Src> out;
+  for (auto& [name, r] : recs) {
+    if (!name.compare(0, 9, "__meta__/")) continue;
+    if (name.size() > 9 && !name.compare(name.size() - 9, 9, "__q_scale")) continue;
+    Src x; x.e = {}; x.file = r.file; x.shape = r.shape;
+    size_t n = 1; for (long long d : r.shape) n *= (size_t)d;
+    x.e.n = n; x.e.src = r.offset;
+    if (r.dtype == "float32") x.e.kind = 0;
+    else if (r.dtype == "float16") x.e.kind = 1;
+    else if (r.dtype == "uint16") x.e.kind = 7;
+    else if (r.dtype == "int8") {
+      auto sc = recs.find(name + "__q_scale");
+      if (sc == recs.end() || sc->second.dtype != "float32" || r.shape.empty() || sc->second.file != r.file)
+        die("%s: int8 with no float32 __q_scale beside it", name.c_str());
+      const auto& ss = sc->second.shape;
+      if (ss.back() != r.shape.back() || (ss.size() != 1 && ss.size() != 2)) die("%s: a __q_scale of an unknown layout", name.c_str());
+      x.e.kind = 6; x.e.scale = sc->second.offset; x.e.block = (uint)r.shape.back();
+      x.e.zero = n / x.e.block; x.e.bits = ss.size() == 1 ? 1 : (uint)ss[0];
+    } else die("%s: unsupported blob dtype %s", name.c_str(), r.dtype.c_str());
+    out[name] = x;
+  }
+  return out;
+}
+
 std::map<std::string, Src> sources(const std::string& dir, const std::string& deltaDir, std::map<std::string, double>* meta) {
+  std::string blob = findBlob(dir);
+  if (!blob.empty()) {
+    if (!deltaDir.empty()) die("a delta over an af3-any-model blob");
+    return blobSources(blob);
+  }
   Json m = readJson(dir + "/manifest.json");
   if (meta)
     for (const char* block : {"trunk", "languageModel"})

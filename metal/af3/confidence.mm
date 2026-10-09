@@ -3,22 +3,79 @@
 #include "af3.h"
 #include <cmath>
 
+// boltz2's re-embedded pair and single (after LN_z and the relative encoding): right[i] + left[j] off the normalised
+// s_inputs, its own distance embedding, the bond terms, and the outer product of two s_inputs projections
+static void boltz2Reembed(float* pair, float* single, const Trunk& t, const float* pseudoBeta, int C, int Cs, int F) {
+  const std::string R = "confidence.reembed.";
+  int n = t.n; size_t pairs = (size_t)n * n;
+  float* sIn = scratch<float>("conf.sInputs", (size_t)n * F);
+  ln(t.targetFeat, sIn, n, F, R + "sInputsNormScale", R + "sInputsNormOffset");
+  ln(t.single, single, n, Cs, R + "sNormScale", R + "sNormOffset");
+  lin(sIn, R + "sInputToS", single, n, F, Cs, 1.f);
+  ln(t.pair, pair, pairs, C, R + "zNormScale", R + "zNormOffset");
+  if (lenW(R + "relPosProject") != (size_t)139 * C) die("relPosProject is not 139 x %d", C);
+  RelIdx r{M.i("batch.features.residueIndex"), M.i("batch.features.tokenIndex"), M.i("batch.features.asymId"),
+           M.i("batch.features.entityId"), M.i("batch.features.symId")};
+  run1d("af3_relenc", pairs * C, RelEncArgs{r, W(R + "relPosProject"), pair, (uint)n, (uint)C});
+  float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
+  float* p1 = scratch<float>("conf.p1", (size_t)n * C); float* p2 = scratch<float>("conf.p2", (size_t)n * C);
+  lin(sIn, R + "leftTargetFeatProject", left, n, F, C);
+  lin(sIn, R + "rightTargetFeatProject", right, n, F, C);
+  lin(sIn, R + "sToZProdIn1", p1, n, F, C);
+  lin(sIn, R + "sToZProdIn2", p2, n, F, C);
+  if (lenW(R + "distogramFeatProject") != (size_t)64 * C) die("the reembed distogram is not 64 bins");
+  int* bins = scratch<int>("conf.bin", pairs);
+  run1d("af3_reembed_bin", pairs, ReembedBinArgs{pseudoBeta, bins, (uint)n, 0});
+  run1d("af3_reembed_pair", pairs * C,
+        ReembedPairArgs{pair, left, right, bins, t.pairMask, W(R + "distogramFeatProject"), M.has("batch.bondMatrix") ? M.f("batch.bondMatrix") : nullptr,
+                        M.has("batch.bondOrderMatrix") ? M.f("batch.bondOrderMatrix") : nullptr, W(R + "tokenBondsProject"),
+                        W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), (uint)n, (uint)C});
+  int rowsPer = std::max<int>(1, (int)(((size_t)16 << 20) / ((size_t)n * C)));
+  half* prod = scratch<half>("conf.prod", (size_t)std::min(rowsPer, n) * n * C);
+  for (int i0 = 0; i0 < n; i0 += rowsPer) {
+    int rr = std::min(rowsPer, n - i0);
+    run1d("af3_outer_prod", (size_t)rr * n * C, OuterProdArgs{p1, p2, prod, (uint)i0, (uint)rr, (uint)n, (uint)C});
+    lin(prod, R + "sToZProdOut", pair + (size_t)i0 * n * C, (size_t)rr * n, C, C, 1.f);
+  }
+}
+
+// rf3's parameter-free LayerNorm over a whole tensor's real rows, the statistics over `vendorWidth` columns
+static void maskedGlobalNorm(float* x, const float* rowMask, size_t rows, int C, int vendorWidth) {
+  const int parts = 256;
+  float* partial = scratch<float>("conf.gnPartial", parts * 2); float* stat = scratch<float>("conf.gnStat", 2);
+  for (uint pass = 0; pass < 2; ++pass) {
+    run("af3_masked_sum", Grid{(uint32_t)parts, 1, 1}, 256, MaskedSumArgs{x, rowMask, partial, stat, rows, (uint)C, pass});
+    run("af3_global_stat", Grid{1, 1, 1}, 32, GlobalStatArgs{partial, stat, (uint)parts, (uint)C, (uint)vendorWidth, pass});
+  }
+  run1d("af3_apply_norm", rows * C, ApplyNormArgs{x, stat, rows * C});
+}
+
 ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta) {
   const std::string P = "confidence";
   int n = t.n, C = metaI(P + ".pairChannels"), Cs = metaI(P + ".singleChannels"), F = metaI(P + ".targetFeatWidth");
   int dense = metaI("batch.dense");
   size_t pairs = (size_t)n * n;
-  if (flag("trunk.dialect.reembedConfidencePair")) die("boltz2's re-embedded confidence pair is not in the native port yet");
-  if (flag("trunk.dialect.confidenceGlobalNorm")) die("rf3's confidence normalisation is not in the native port yet");
   if (flag("trunk.dialect.chaiConfidence")) die("chai-1's confidence head is not in the native port yet");
   bool caDgram = flag("trunk.dialect.confidenceCaDgram");
   float* pair = scratch<float>("conf.pair", pairs * C);
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
+  if (flag("trunk.dialect.reembedConfidencePair")) boltz2Reembed(pair, single, t, pseudoBeta, C, Cs, F);
+  else {
   copy(pair, t.pair, pairs * C * 4);
   copy(single, t.single, (size_t)n * Cs * 4);
+  const float* tf = t.targetFeat;
+  if (flag("trunk.dialect.confidenceGlobalNorm")) {
+    // rf3 normalises every detached trunk input over the whole tensor first (target_feat over the vendor's 449 columns)
+    float* tfn = scratch<float>("conf.targetFeat", (size_t)n * F);
+    copy(tfn, t.targetFeat, (size_t)n * F * 4);
+    maskedGlobalNorm(pair, t.pairMask, pairs, C, C);
+    maskedGlobalNorm(single, t.seqMask, n, Cs, Cs);
+    maskedGlobalNorm(tfn, t.seqMask, n, F, 449);
+    tf = tfn;
+  }
   float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
-  lin(t.targetFeat, P + ".leftTargetFeatProject", left, n, F, C);
-  lin(t.targetFeat, P + ".rightTargetFeatProject", right, n, F, C);
+  lin(tf, P + ".leftTargetFeatProject", left, n, F, C);
+  lin(tf, P + ".rightTargetFeatProject", right, n, F, C);
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
   if (bins != (caDgram ? 40 : 39)) die("the confidence distogram has %d bins", bins);
   int* binOf = scratch<int>("conf.bin", pairs); float* sqOf = scratch<float>("conf.sq", pairs);
@@ -30,6 +87,7 @@ ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta) {
     float* sn = scratch<float>("conf.singleNorm", (size_t)n * Cs);
     ln(single, sn, n, Cs, P + ".inputSingleNormScale", P + ".inputSingleNormOffset");
     copy(single, sn, (size_t)n * Cs * 4);
+  }
   }
   int nb = 0; while (M.has(P + ".blocks." + num(nb) + ".singleChannels")) ++nb;
   for (int k = 0; k < nb; ++k) pairformerBlock(pair, single, t.masks, n, C, Cs, P + ".blocks." + num(k));
