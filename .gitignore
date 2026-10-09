@@ -152,3 +152,5 @@ metal/legacy/build/
 metal/*/localfold-*
 metal/legacy/*/localfold-*
 metal/**/*.combined
+metal/build/
+metal/*/localfold-*
