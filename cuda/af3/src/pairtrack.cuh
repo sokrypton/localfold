@@ -296,7 +296,11 @@ inline int wideTriInWarps(int C) {
   if (fitsSmem(wideTriInSmemW(C, 8))) {
     int dev, perSm = 0; CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-    return (size_t)perSm >= 2 * (wideTriInSmemW(C, 8) + 1024) ? TRIIN_TWO_TILES : 8;
+    if ((size_t)perSm >= 2 * (wideTriInSmemW(C, 8) + 1024)) return TRIIN_TWO_TILES;
+    // one 8-warp block an SM (~100 KB at 256 channels: an RTX PRO 6000): the rounded form fits two - measured there
+    // through ESMFold2's same kernel, 457 -> 428 ms at 988 tokens and 4490 -> 3882 at 2,964 (cuda/ef2/src/fused256.cuh)
+    if (C == 256 && fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED))) return TRIIN_ROUNDED;
+    return 8;
   }
   return fitsSmem(wideTriInSmemW(C, TRIIN_ROUNDED)) ? TRIIN_ROUNDED : 4;
 }

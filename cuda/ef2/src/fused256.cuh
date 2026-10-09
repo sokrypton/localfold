@@ -34,7 +34,7 @@ template <int WARPS, class TA, int XROUNDS = 1, int MT = 1>
 void triIn256Form(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs,
                   RectMap rm = {}) {
   constexpr int C = 256, R = 16 * WARPS * MT;
-  size_t pp = rm.J ? rm.size : (size_t)np * np, smem = XROUNDS == 1 ? (size_t)R * (C + 8) * 2 : triIn256Smem<TA>(C, WARPS, XROUNDS);
+  size_t pp = rm.J ? rm.size : (size_t)np * np, smem = XROUNDS == 1 ? std::max((size_t)R * (C + 8) * 2, triIn256Smem<TA>(C, WARPS * MT)) : triIn256Smem<TA>(C, WARPS, XROUNDS);
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", C, {{"f/" + Tn + "projection", 2 * C, false},
                                                                    {"f/" + Tn + "gate", 2 * C, false}});
   half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
@@ -61,7 +61,12 @@ void triIn256(const float* pair, const float* mask, const std::string& Tn, TA* a
     CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
     return (size_t)perSm >= 2 * (TRI_IN256_SMEM + 1024);          // (1 KB a block the driver reserves)
   }();
+  // ...and where an SM holds ONE 8-warp block (~100 KB: an RTX PRO 6000, an L4), the T4's 16-warp form, its rows normed
+  // in rounds, which fits two: measured on Colab's RTX PRO 6000 - 457 -> 428 ms of ESMFold2's 988-token fold, 4490 ->
+  // 3882 at 2,964 tokens (the 8-warp form at one block an SM, Nsight Compute: the tensor pipe at 60%); byte-identical.
+  // LOCALFOLD_TRIIN_FORM=1 forces the 8-warp form, 2 the two-tile one
+  static const bool form1 = getenv("LOCALFOLD_TRIIN_FORM") && atoi(getenv("LOCALFOLD_TRIIN_FORM")) == 1;
   if (fused256Big() && twoTiles) triIn256Form<4, TA, 1, 2>(pair, mask, Tn, a, b, t2, n, np, cs, rm);
-  else if (fused256Big()) triIn256Form<8, TA>(pair, mask, Tn, a, b, t2, n, np, cs, rm);
+  else if (fused256Big() && form1) triIn256Form<8, TA>(pair, mask, Tn, a, b, t2, n, np, cs, rm);
   else triIn256Form<16, TA, 8>(pair, mask, Tn, a, b, t2, n, np, cs, rm);
 }
