@@ -125,7 +125,14 @@ ports' elementwise kernels index with `t / C`, `r / L`, `r % L` on 64-bit values
 routine here. ESMFold2's four (`swigluHK`, `centerNormHK` - inside its channel loop -, `gateMulAddHK`, `triSplitHK`)
 were 8.2 s of a 19.3 s trunk at 261 tokens, ~8x their bandwidth. Rewritten with the division done once, in 32 bits
 (`metal/ef2/*.kernel.cu`, `metal/af3/{gateMulAddHK,centerNormHK}.kernel.cu`), they are 2.1 s: **the trunk 19.35 ->
-13.37 s**, the same digits. Look for this first in any kernel that is slower than its bytes.
+13.37 s**, the same digits. Look for this first in any kernel that is slower than its bytes. (AF2's `triGateTK`, the same: 1263 -> 514 ms.)
+
+Then ESMFold2 took AF3's fusions (`metal/ef2/fast.cuh.patch`): the transition's SwiGLU in its first GEMM, the
+triangle's gate in its projection's GEMM (a and b written channel-major by the GEMM: ESMFold2 interleaves them by
+channel as AF3 does) and its gated residual in the gating linear's GEMM (the output projection f16 for it); and
+`centerNormHK` a lane a pair with the rows written through a half tile (663 -> 471 ms). **ESMFold2's trunk at 261
+tokens: 19.35 -> 11.9 s**, 5CAJ's pLDDT 90.82 -> 90.84. `LOCALFOLD_UNFUSED_SWIGLU=1`, `LOCALFOLD_UNFUSED_TRIGATE=1`
+are the controls.
 
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):

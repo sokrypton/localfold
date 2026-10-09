@@ -1,6 +1,103 @@
-# swigluHK's launch at four channels a thread (metal/ef2/swigluHK.kernel.cu)
+# The pair transition's SwiGLU in its first GEMM's epilogue (lf::gemmSwiglu over the weight with a's and b's columns
+# interleaved, as metal/af3/pairtrack.cuh.patch takes AF3's), where the port writes the 2I-wide widening and runs
+# swigluHK over it; the fallback's swigluHK at four channels a thread (metal/ef2/swigluHK.kernel.cu).
+# LOCALFOLD_UNFUSED_SWIGLU=1 is the control.
 @@@ old
+inline void transitionFast(float* pair, size_t P, int C, const std::string& Tn) {
+@@@ new
+__global__ void interleaveHalvesEfK(const half* w, half* out, int rows, int I) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)rows * 2 * I) return;
+  unsigned r = (unsigned)(t / (2u * I)), c = (unsigned)(t - (size_t)r * 2u * I), k = c / 2;
+  out[t] = w[(size_t)r * 2 * I + ((c & 1) ? I + k : k)];
+}
+// (a derived weight, forgotten with the others after a warm-up that ran while the weights were still arriving)
+inline const half* swigluPairsEf(const std::string& name, int rows, int I) {
+  static std::map<std::string, half*> made;
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& kv : made) CK(cudaFree(kv.second)); made.clear(); }); hooked = true; }
+  auto it = made.find(name);
+  if (it != made.end()) return it->second;
+  half* out = dallocT<half>((size_t)rows * 2 * I);
+  interleaveHalvesEfK<<<blocks((size_t)rows * 2 * I), 256, 0, STREAM>>>(Fh(name), out, rows, I);
+  return made[name] = out;
+}
+inline void transitionFast(float* pair, size_t P, int C, const std::string& Tn) {
+@@@ end
+@@@ old
+    ltGemm(xn + (chunked ? 0 : r0 * C), Fh(Tn + "transition1"), h, true, r, C, 2 * I, nullptr, false, 0.f);
     swigluHK<<<blocks(r * I), 256, 0, STREAM>>>(h, g, r, I);
 @@@ new
-    swigluHK<<<blocks((r * I + 3) / 4), 256, 0, STREAM>>>(h, g, r, I);
+    static const bool fuseSwiglu = !getenv("LOCALFOLD_UNFUSED_SWIGLU");
+    if (fuseSwiglu) lf::gemmSwiglu(xn + (chunked ? 0 : r0 * C), swigluPairsEf(Tn + "transition1", C, I), g, r, C, I);
+    else {
+      ltGemm(xn + (chunked ? 0 : r0 * C), Fh(Tn + "transition1"), h, true, r, C, 2 * I, nullptr, false, 0.f);
+      swigluHK<<<blocks((r * I + 3) / 4), 256, 0, STREAM>>>(h, g, r, I);
+    }
+@@@ end
+
+# The unfused triangle (the path Metal takes): the projection's GEMM gates in its epilogue and writes a and b channel-major
+# itself (lf::gemmTriGate), and the gating linear's GEMM adds its gated product into the pair (lf::gemmGatedAdd) - as
+# metal/af3/pairtrack.cuh.patch takes AF3's - where the port writes a 5C-wide projection, splits it in triSplitHK and adds
+# in gateMulAddHK. The output projection is f16 for it. LOCALFOLD_UNFUSED_TRIGATE=1 is the control.
+@@@ old
+inline void triangleFusedIn(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing);
+@@@ new
+// (Metal) the triangle's projection and gate as one weight for lf::gemmTriGate: channel c's (pa, pb, ga, gb) at columns
+// 4c..4c+3 - ESMFold2 interleaves a and b by channel as AF3 does - built once, a derived weight
+__global__ void triGateEfK(const half* proj, const half* gate, half* out, int rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)rows * 4 * C) return;
+  unsigned r = (unsigned)(t / (4u * C)), col = (unsigned)(t - (size_t)r * 4u * C), c = col / 4, k = col % 4;
+  out[t] = k < 2 ? proj[(size_t)r * 2 * C + 2 * c + k] : gate[(size_t)r * 2 * C + 2 * c + k - 2];
+}
+inline const half* triGateEf(const std::string& Tn, int C) {
+  static std::map<std::string, half*> made;
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& kv : made) CK(cudaFree(kv.second)); made.clear(); }); hooked = true; }
+  auto it = made.find(Tn);
+  if (it != made.end()) return it->second;
+  half* out = dallocT<half>((size_t)C * 4 * C);
+  triGateEfK<<<blocks((size_t)C * 4 * C), 256, 0, STREAM>>>(Fh(Tn + "projection"), Fh(Tn + "gate"), out, C, C);
+  return made[Tn] = out;
+}
+inline void triangleFusedIn(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing);
+@@@ end
+@@@ old
+  half* pg = scratch<half>("ftri.pg", P * 5 * C);
+  ltGemm(xn, Fh(Tn + "projection"), pg, true, P, C, 2 * C, nullptr, false, 0.f, 0, 5 * C);
+  ltGemm(xn, Fh(Tn + "gate"), pg + 2 * C, true, P, C, 2 * C, nullptr, false, 0.f, 0, 5 * C);
+  ltGemm(xn, Fh(Tn + "gatingLinear"), pg + 4 * C, true, P, C, C, nullptr, false, 0.f, 0, 5 * C);
+@@@ new
+  static const bool fuseTri = !getenv("LOCALFOLD_UNFUSED_TRIGATE");
+  half* pg = nullptr;
+  if (!fuseTri) {
+    pg = scratch<half>("ftri.pg", P * 5 * C);
+    ltGemm(xn, Fh(Tn + "projection"), pg, true, P, C, 2 * C, nullptr, false, 0.f, 0, 5 * C);
+    ltGemm(xn, Fh(Tn + "gate"), pg + 2 * C, true, P, C, 2 * C, nullptr, false, 0.f, 0, 5 * C);
+    ltGemm(xn, Fh(Tn + "gatingLinear"), pg + 4 * C, true, P, C, C, nullptr, false, 0.f, 0, 5 * C);
+  }
+@@@ end
+@@@ old
+  triSplitHK<<<dim3((unsigned)((P + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, mask, a, b, P, C, L, Lp);
+@@@ new
+  if (fuseTri) lf::gemmTriGate(xn, triGateEf(Tn, C), mask, a, b, 0, P, C, plane, L, Lp);
+  else triSplitHK<<<dim3((unsigned)((P + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, mask, a, b, P, C, L, Lp);
+@@@ end
+@@@ old
+  float* out = scratch<float>("ftri.out", P * C);
+  ltGemm(cn, Fh(Tn + "outputProjection"), out, false, P, C, C, nullptr, false, 0.f);
+  gateMulAddHK<<<blocks(P * C), 256, 0, STREAM>>>(pair, out, pg + 4 * C, P, C, 5 * C);
+}
+@@@ new
+  if (fuseTri) {     // the output projection in f16, and the gate's GEMM adds its gated product into the pair itself
+    half* outH = scratch<half>("ftri.outh", P * C);
+    ltGemm(cn, Fh(Tn + "outputProjection"), outH, true, P, C, C, nullptr, false, 0.f);
+    lf::gemmGatedAdd(xn, Fh(Tn + "gatingLinear"), outH, pair, P, C, C);
+    return;
+  }
+  float* out = scratch<float>("ftri.out", P * C);
+  ltGemm(cn, Fh(Tn + "outputProjection"), out, false, P, C, C, nullptr, false, 0.f);
+  gateMulAddHK<<<blocks(P * C), 256, 0, STREAM>>>(pair, out, pg + 4 * C, P, C, 5 * C);
+}
 @@@ end
