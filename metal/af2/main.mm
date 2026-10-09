@@ -141,6 +141,7 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
   int ran = passes; double converged = -1;
   double tf = now();
   for (int pass = 0; pass < passes; ++pass) {
+    const double passStart = now();
     if (pass == 0 && profiling()) profileStart();
     embed(t, pass, prevRow, prevPair, prevPos);
     if (multimer) templateEmbedding(t.pair, t.pairMask, L);
@@ -174,7 +175,8 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
     char said[200];
     int n = snprintf(said, sizeof said, "  pass %d/%d: mean pLDDT %.2f  pTM %.4f", pass + 1, passes, mean, ptm);
     if (iptm >= 0) n += snprintf(said + n, sizeof said - n, "  ipTM %.4f", iptm);
-    if (!lastPos.empty()) snprintf(said + n, sizeof said - n, "  moved %.2f A", caPairChange(lastPos, pos, seqMask, L));
+    if (!lastPos.empty()) n += snprintf(said + n, sizeof said - n, "  moved %.2f A", caPairChange(lastPos, pos, seqMask, L));
+    snprintf(said + n, sizeof said - n, "  %.1f ms", ms(passStart));      // (the pass's own time: the dev report reads it)
     printf("%s\n", said); fflush(stdout);
     if (!FRAMES_DIR.empty()) {
       char tag[32]; snprintf(tag, sizeof tag, "%02d-of-%02d", pass, passes);

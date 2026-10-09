@@ -92,6 +92,42 @@ def flat_matrix(text, key):
     return text[:start] + "null" + text[end:], flat
 
 
+JOB_STARTED = [0.0]        # (the job's start, which each step's `at` is counted from)
+
+
+def dev(phase, ms, sub=False, begin=None):
+    """One row of the page's timing report (web/dev-log.js): a step this worker timed, as it ends - so a fold that
+    fails or is stopped still has the rows up to there. `sub` rows break the row above them down (the binary's own
+    stage times) and are not added to the total."""
+    at = {} if begin is None else {"at": round((begin - JOB_STARTED[0]) * 1000)}
+    emit("dev", {"phase": phase, "ms": round(ms, 1), **at, **({"sub": True} if sub else {})})
+
+
+def fold_breakdown(said, fold_ms):
+    """The fold's stages as its binary printed them (metal/<port> and cuda/<port>): AF3's trunk, diffusion and
+    confidence, ESMFold2's language model, embedder, trunk, sampler and confidence, AF2's passes - and what is left
+    of the fold's time beside them (reading the input, writing the structure)."""
+    rows = []
+    found = re.search(r"fold: trunk ([\d.]+) ms \((\d+) passes\), diffusion ([\d.]+) ms \((\d+) steps x (\d+)\), "
+                      r"confidence ([\d.]+) ms", said)
+    if found:
+        trunk, passes, diffusion, steps, samples, confidence = found.groups()
+        rows += [(f"trunk ({passes} pass{'es' if passes != '1' else ''})", float(trunk)),
+                 (f"diffusion ({steps} steps x {samples} sample{'s' if samples != '1' else ''})", float(diffusion)),
+                 ("confidence", float(confidence))]
+    for name in ("language model", "inputs embedder", "trunk", "sampler", "confidence"):
+        line = re.search(rf"^{name} ([\d.]+) ms(?: \((\d+) steps\))?$", said, re.M)
+        if line and not found:
+            rows.append((f"{name} ({line.group(2)} steps)" if line.group(2) else name, float(line.group(1))))
+    for line in re.finditer(r"^  pass (\d+)/(\d+):.*?  ([\d.]+) ms$", said, re.M):
+        rows.append((f"pass {line.group(1)}/{line.group(2)}", float(line.group(3))))
+    if rows:
+        rest = fold_ms - sum(ms for _, ms in rows)
+        if rest > 0:
+            rows.append(("reading the input, writing the structure", rest))
+    return rows
+
+
 class Refused(Exception):
     """A job this backend does not run, said as such rather than approximated."""
 
@@ -293,8 +329,13 @@ class Server:
         shutil.rmtree(self.dir, ignore_errors=True)
         os.makedirs(self.dir)
         self.log = open(os.path.join(self.dir, "server.log"), "w")
+        # (AF2_STARTUP / EF2_STARTUP: their weights' load time in the log, as AF3 prints its own)
+        env = {**os.environ, "AF2_STARTUP": "1", "EF2_STARTUP": "1"}
+        self.started = time.time()
+        self.ready = None              # when it said it was serving: its weights are up
+        self.reported = False          # (its load time in the report once, with the fold that waited for it)
         self.proc = subprocess.Popen([*command, f"--serve={self.dir}"], cwd=REPO, stdout=self.log,
-                                     stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
+                                     stderr=subprocess.STDOUT, preexec_fn=die_with_parent, env=env)
         # 🔴 NOT WAITED FOR: the worker starts a model's server BEFORE it featurises the job, so the CUDA
         # context, the weights' upload and AF2's and ESMFold2's warm-up fold (--warm: every kernel, weight copy
         # and cuBLAS plan loaded) run beside the exporter or the MSA search; a job dropped meanwhile is taken
@@ -324,11 +365,15 @@ class Server:
                     seen.add(name)
                     on_file(name, os.path.join(frames, name))
         while not os.path.exists(base + ".done"):
+            if self.ready is None and "serving" in open(self.log.name).read():
+                self.ready = time.time()
             if self.proc.poll() is not None:
                 raise RuntimeError(f"the {self.key[0]} server exited: " + open(self.log.name).read()[-400:])
             collect()
             time.sleep(0.005)
         collect()
+        if self.ready is None:         # (up and done between two polls)
+            self.ready = time.time()
         shutil.rmtree(frames, ignore_errors=True)
         said = open(base + ".log").read()
         if int(open(base + ".done").read().strip() or 1) != 0:
@@ -441,6 +486,7 @@ class Worker:
         emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · reading the job")
         emit("progress", 0.02)
         started = time.time()
+        JOB_STARTED[0] = started
         shutil.rmtree(WORK, ignore_errors=True)
         inputs = os.path.join(WORK, "in")
         os.makedirs(WORK)
@@ -482,12 +528,15 @@ class Worker:
         elif mode != "none":
             raise Refused(f"the {NATIVE_NAME} backend does not know the MSA mode {mode!r}")
 
+        dev("reading the job", (time.time() - started) * 1000, begin=started)
         # the templates, resolved by the page's own code - where a row asks for one (templateKind: a row's
         # template with no kind, or "none", is no template; a Node start is 0.13 s of a 0.5 s warm fold)
         templates = []
         if any((entity.get("template") or {}).get("kind") not in (None, "none") for entity in job.get("entities", [])):
+            at = time.time()
             templates = json.loads(featurise([featuriser("resolve-templates"), request_path, os.path.join(WORK, "templates")],
                                              "resolving the templates", log).strip().splitlines()[-1] or "[]")
+            dev("resolving the templates", (time.time() - at) * 1000, begin=at)
         if templates and port == "ef2":
             raise Refused("ESMFold2 takes no template")
         searched = [t["chain"] for t in templates if t["kind"] == "search"]
@@ -520,7 +569,9 @@ class Worker:
         # job's flags for it
         if port == "af3":
             # af3-any-model's own int8 blob, every family (AlphaFold 3's under DeepMind's academic terms)
+            at = time.time()
             weights = model_weights(family, log)
+            dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
             bundle, dialect = weights[0], f"--family={family}"
             key = ("af3", family)
             # chai-1's token features are ESM2 3B's, computed in the fold (cuda/plm/esm2.cuh)
@@ -528,8 +579,10 @@ class Worker:
             server = self.server_for(key, [binary("af3"), "-", f"--bundle={bundle}",
                                            f"--family={family}", "--fold", "--fast",
                                            *esm], residues)
+            at = time.time()
             featurise([featuriser("af3-featurise"), inputs, "--no-weights", dialect, f"--job={job_path}",
                        f"--max-msa={requested}", *flags, *local_ccd()], "featurising", log, live)
+            dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
             steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
             fold = [f"--out={out_pdb}"]
             if sampler == "flow":
@@ -553,7 +606,9 @@ class Worker:
                 raise Refused(f"AlphaFold 2's model {af2_model} has no template embedder (models 3, 4 and 5 are"
                               " template-free) - pick model 1 or 2, or drop the template")
             model = f"model_{af2_model}_ptm" if family == "monomer" else f"model_{af2_model}_multimer_v3"
+            at = time.time()
             weights = model_weights(model, log)       # (models 2-5: model 1's bundle and their delta on it)
+            dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
             bundle, delta = weights[0], (weights[1] if len(weights) > 1 else None)
             key = ("af2", family, af2_model)
             server = self.server_for(key, [binary("af2"), "-", f"--bundle={bundle}",
@@ -563,16 +618,22 @@ class Worker:
                       f"--max-msa={508 if requested == 512 else requested}", f"--max-extra={extra}", f"--seed={seed}", *flags]
             if recycles not in (None, ""):
                 export.append(f"--recycles={int(recycles)}")
+            at = time.time()
             featurise(export, "featurising", log, live)
+            dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
             fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
             total = 0
         else:
             small = family == "ef2-fast-300m"       # (the same port: it reads its widths off the bundle)
+            at = time.time()
             trunk, tower = model_weights("ef2-fast-300m" if small else "ef2-fast-600m", log)
+            dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
             key = ("ef2", family)
             server = self.server_for(key, [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)
+            at = time.time()
             featurise([featuriser("ef2-featurise"), inputs, f"--job={job_path}", *local_ccd()], "featurising", log, live)
+            dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
             fold = [f"--out={out_pdb}", f"--seed={seed}"]
             # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's
             # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45
@@ -612,13 +673,36 @@ class Worker:
                     if steps:
                         emit("progress", 0.3 + 0.7 * step / steps)
                         emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · diffusion {step}/{steps}")
+        submitted = time.time()
         said = server.fold(inputs, fold, on_file)
+        done = time.time()
         log.append(said)
+        # the model's load, once (it ran beside the featuriser), any wait for it, and the fold with its stages
+        # (the model loads BESIDE the steps above, so what the fold paid is the wait; the load itself is shown under
+        # it, outside the total)
+        if not server.reported:
+            server.reported = True
+            if server.ready > submitted:
+                dev("waiting for the model to load", (server.ready - submitted) * 1000, begin=submitted)
+            dev("the model loading onto the GPU, beside the steps above", (server.ready - server.started) * 1000, sub=True,
+                begin=server.started)
+            weights_line = re.search(r"^weights(?: up)?:? ([\d.]+) ms", open(server.log.name).read(), re.M)
+            if weights_line:
+                dev("of which its weights", float(weights_line.group(1)), sub=True, begin=server.started)
+        fold_began = max(submitted, server.ready)
+        fold_ms = (done - fold_began) * 1000
+        dev("folding", fold_ms, begin=fold_began)
+        offset = fold_began
+        for name, ms in fold_breakdown(said, fold_ms):        # (in the order the binary ran them)
+            dev(name, ms, sub=True, begin=offset)
+            offset += ms / 1000
+        collect_started = time.time()
         self.evict(key)
         if not any("pLDDT" in line for line in said.splitlines()):
             raise RuntimeError("the fold printed no confidence line")
         emit("progress", 1.0)
         result = self.collect(out_pdb, family, port, job, time.time() - started)
+        dev("reading the result (structure, PAE, contacts)", (time.time() - collect_started) * 1000, begin=collect_started)
         result["a3m"] = a3m
         if mode == "search" and os.path.exists(os.path.join(inputs, "search.a3m")):
             result["a3m"] = open(os.path.join(inputs, "search.a3m")).read()

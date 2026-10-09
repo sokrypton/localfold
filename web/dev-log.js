@@ -39,6 +39,7 @@ let rows = [];
  */
 let source;
 let runStartedAt = 0;
+let runEndedAt = 0;
 let currentPhase;
 let currentStartedAt = 0;
 let currentStartPeak = 0;
@@ -89,6 +90,7 @@ export function devUseDevice(value) {
 export function devBeginRun(label) {
   rows = [];
   runStartedAt = performance.now();
+  runEndedAt = 0;
   currentPhase = undefined;
   currentStartedAt = runStartedAt;
   currentStartPeak = snapshot()?.peakBytes ?? 0;
@@ -131,6 +133,18 @@ export function devStatus(text) {
   currentStartPeak = snapshot()?.peakBytes ?? 0;
 }
 
+/**
+ * A phase timed somewhere else - by the native worker, where the fold ran - with its own duration: `sub` breaks
+ * the phase before it down (its stages, as the binary printed them) and is shown indented, outside the total.
+ */
+export function devPhase(phase, ms, sub = false, atMs = undefined) {
+  if (phase === undefined || !Number.isFinite(ms)) return;
+  // (`atMs`: when the step began, by the worker's clock from the job's start - not when its row arrived here)
+  rows.push({ phase: String(phase), ms: Math.round(ms), sub,
+              atMs: Number.isFinite(atMs) ? Math.round(atMs) : Math.round(performance.now() - runStartedAt) });
+  if (rows.length > MAX_ROWS) rows.shift();
+}
+
 /** A one-off line that is not a phase - a size, a score, a setting. */
 export function devNote(text) {
   if (text === undefined) return;
@@ -141,7 +155,8 @@ export function devNote(text) {
 
 /** Close the last phase and note the total. Called when a fold ends. */
 export function devEndRun(note) {
-  closePhase(performance.now());
+  runEndedAt = performance.now();
+  closePhase(runEndedAt);
   currentPhase = undefined;
   devNote(note ?? "done");
 }
@@ -160,7 +175,7 @@ export function devReport() {
       ? [`user agent: ${agent}`]
       : [`folded on: ${source}`, `shown in: ${agent}`]),
     source !== undefined
-      ? "device memory: the runtime's, in the rows below"
+      ? "device memory: the fold's machine's, not reported here"
       : (memory === undefined ? "device memory: not measured"
         : `device memory: ${memory.resident} MiB held, ${memory.peak} MiB peak`),
     "",
@@ -174,10 +189,16 @@ export function devReport() {
     lines.push(`${String(row.atMs).padStart(7)} ${String(row.ms).padStart(9)}`
       + `${(row.resident === undefined ? "" : `${row.resident}`).padStart(7)}`
       + `${(row.rise === undefined ? "" : `+${row.rise}`).padStart(7)}`
-      + `${(row.peak === undefined ? "" : `${row.peak}`).padStart(8)}   ${row.phase}`);
+      + `${(row.peak === undefined ? "" : `${row.peak}`).padStart(8)}   ${row.sub ? "    " : ""}${row.phase}`);
   }
-  const total = rows.reduce((sum, row) => sum + (row.ms ?? 0), 0);
+  // (a sub-row breaks the row above it down, so it is not counted twice)
+  const total = rows.reduce((sum, row) => sum + (row.sub ? 0 : (row.ms ?? 0)), 0);
   lines.push("", `total in phases: ${(total / 1000).toFixed(2)} s`);
+  // ...and the whole of it as the reader waited, click to result: what the phases do not cover is the page's own
+  // work and, for a native fold, the trip between it and the worker
+  if (runEndedAt > runStartedAt) {
+    lines.push(`click to result: ${((runEndedAt - runStartedAt) / 1000).toFixed(2)} s`);
+  }
   // ...and the breakdown below is read off THIS device, so it is left out
   // where the fold happened on another one rather than shown as a row of
   // zeros belonging to nothing.

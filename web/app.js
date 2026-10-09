@@ -56,7 +56,7 @@ import { releaseAllWeights } from "../webgpu/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../shared/bundles/manifests/index.js";
-import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
+import { devBeginRun, devEndRun, devNote, devPhase, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
@@ -4093,6 +4093,9 @@ async function followRemoteFold({ since, label, signal }) {
       }
       else if (said.kind === "contacts") showContacts(said.payload);
       else if (said.kind === "scores") showScores(said.payload);
+      // ...and the worker's own timing of each step, as it ends, into the timing report (web/dev-log.js)
+      else if (said.kind === "dev") devPhase(said.payload?.phase, said.payload?.ms, said.payload?.sub === true,
+        said.payload?.at);
       // 🔴 AND THE LAG IS RECORDED RATHER THAN ARGUED ABOUT. Each event
       // carries the worker's own clock and the broker's arrival stamp,
       // so "the fold was slow" and "the feed was slow" are two numbers. It is
