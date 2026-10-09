@@ -69,7 +69,13 @@ struct Runtime {
   std::vector<id<MTLBuffer>> cbKeep;           // released when the command buffer is done
   id<MTLCommandBuffer> lastCommitted = nil;
   int encoded = 0, encodedInEncoder = 0;
-  bool capturing = false;
+  // a graph capture belongs to the thread that began it (cudaStreamCaptureModeThreadLocal, the mode every port uses):
+  // another thread's work - a weight upload beside a warm-up - runs as it is, not into that thread's graph. It was
+  // global, so an upload issued during the warm-up sampler's capture went into the graph and its event records were
+  // dropped, and the decode buffer they guarded was overwritten before its decode ran: ESMFold2's folding weights
+  // came out wrong a few times in a hundred (1QYS 13.5 A or NaN against 0.865), under load or on a slow first run
+  bool captureActive = false; std::thread::id captureThread;
+  bool capturingHere() const { return captureActive && std::this_thread::get_id() == captureThread; }
   // the command buffers committed and not yet complete, by commit order (their completion handlers remove them)
   std::mutex inflightMu; std::condition_variable inflightDone; std::set<long> pending; long committedSeq = 0;
   std::mutex gpuErrorMu; std::string gpuError;   // the first command buffer to fail (commit's completion handler)
@@ -244,12 +250,17 @@ struct Runtime {
   void dispatch(id<MTLComputePipelineState> pso, const void* args, size_t argBytes, MTLSize grid, MTLSize block,
                 size_t smem, const std::string& label = "") {
     if (grid.width == 0 || grid.height == 0 || grid.depth == 0) return;
-    if (capturing) {
+    if (capturingHere()) {
       Op op{}; op.kind = 0; op.pso = pso; op.args.assign((const unsigned char*)args, (const unsigned char*)args + argBytes);
       op.grid = grid; op.block = block; op.smem = smem; op.label = label;
       capture->push_back(std::move(op));
       return;
     }
+    // a pipeline's thread limit falls as its kernel takes registers, and Metal does not run a dispatch past it - no error,
+    // the output left as it was - so the dispatch is refused here, naming the kernel
+    if (block.width * block.height * block.depth > pso.maxTotalThreadsPerThreadgroup)
+      die("a dispatch of " + std::to_string(block.width * block.height * block.depth) + " threads a threadgroup to a kernel that takes at most " +
+          std::to_string(pso.maxTotalThreadsPerThreadgroup) + (label.empty() ? std::string("") : " (" + label + ")"));
     ensureEncoder();
     ++stats.dispatches;
     [enc setComputePipelineState:pso];
@@ -279,7 +290,7 @@ struct Runtime {
     size_t threads = ((dst | src) & 15) == 0 ? std::max<size_t>(bytes / 16, 16) : bytes;
     size_t groups = (threads + 255) / 256;
     MTLSize grid = groups > 65535 ? MTLSizeMake(65535, (groups + 65534) / 65535, 1) : MTLSizeMake(groups, 1, 1);
-    if (capturing) {
+    if (capturingHere()) {
       Op op{}; op.kind = 1; op.dst = dst; op.src = src; op.bytes = bytes; capture->push_back(op); return;
     }
     dispatch(shimPipeline("lf_copy"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
@@ -290,7 +301,7 @@ struct Runtime {
     size_t threads = (dst & 15) == 0 ? std::max<size_t>(bytes / 16, 16) : bytes;
     size_t groups = (threads + 255) / 256;
     MTLSize grid = groups > 65535 ? MTLSizeMake(65535, (groups + 65534) / 65535, 1) : MTLSizeMake(groups, 1, 1);
-    if (capturing) {
+    if (capturingHere()) {
       Op op{}; op.kind = 2; op.dst = dst; op.bytes = bytes; op.value = value; capture->push_back(op); return;
     }
     dispatch(shimPipeline("lf_fill"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
@@ -446,7 +457,7 @@ void launch(int index, std::initializer_list<std::string> targs, KArgs& args) {
         std::to_string(pso.staticThreadgroupMemoryLength + L.smem) + " bytes of threadgroup memory; this GPU has " +
         std::to_string(r.dev.maxThreadgroupMemoryLength));
   r.dispatch(pso, args.bytes.data(), args.bytes.size(), MTLSizeMake(L.grid.x, L.grid.y, L.grid.z),
-             MTLSizeMake(L.block.x, L.block.y, L.block.z), L.smem, (r.profiling || r.capturing) ? std::string(PORT_KERNELS[index].name) : "");
+             MTLSizeMake(L.block.x, L.block.y, L.block.z), L.smem, (r.profiling || r.capturingHere()) ? std::string(PORT_KERNELS[index].name) : "");
 }
 void* hostView(const void* device) { return R().host(device); }
 void profileStart() {
@@ -499,19 +510,19 @@ cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t bytes, cudaMemcpy
   switch (kind) {
     case cudaMemcpyHostToHost: memcpy(dst, src, bytes); break;
     case cudaMemcpyDeviceToHost:
-      if (r.capturing) die("a device-to-host copy inside a captured graph");
+      if (r.capturingHere()) die("a device-to-host copy inside a captured graph");
       r.sync();
       memcpy(dst, r.host(src, bytes, "cudaMemcpy source"), bytes);
       break;
     case cudaMemcpyHostToDevice:
-      if (!r.capturing && r.idle()) { memcpy(r.host(dst, bytes, "cudaMemcpy destination"), src, bytes); break; }
+      if (!r.capturingHere() && r.idle()) { memcpy(r.host(dst, bytes, "cudaMemcpy destination"), src, bytes); break; }
       {   // staged: the bytes now, the copy in stream order
         id<MTLBuffer> stage = [r.dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared];
         // (a nil one has GPU address 0, and the copy would read zeros there in silence: a fold of the wrong input)
         if (!stage) die("out of memory staging a " + std::to_string(bytes) + "-byte copy to the device");
         ++r.stats.staged;
         r.host(dst, bytes, "cudaMemcpy destination");
-        if (r.capturing) {
+        if (r.capturingHere()) {
           Op op{}; op.kind = 1; op.dst = (uint64_t)dst; op.src = stage.gpuAddress; op.bytes = bytes; op.keep.push_back(stage);
           r.capture->push_back(op);
         } else {
@@ -559,7 +570,7 @@ cudaError_t cudaMemsetAsync(void* p, int value, size_t bytes, cudaStream_t) {
   ++r.stats.memsetCalls;
   std::lock_guard<std::recursive_mutex> l(r.mu);
   void* h = r.host(p, bytes, "cudaMemset");
-  if (!r.capturing && r.idle()) { memset(h, value, bytes); return cudaSuccess; }
+  if (!r.capturingHere() && r.idle()) { memset(h, value, bytes); return cudaSuccess; }
   r.fill((uint64_t)p, value, bytes);
   return cudaSuccess;
 }
@@ -620,7 +631,7 @@ cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned) { return cudaEven
 cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) {
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
-  if (r.capturing) return cudaSuccess;
+  if (r.capturingHere()) return cudaSuccess;
   ++r.stats.commitsEvent;
   r.commit();
   e->cb = r.lastCommitted;
@@ -664,21 +675,21 @@ struct LfGraph_ { std::vector<Op> ops; };
 cudaError_t cudaStreamBeginCapture(cudaStream_t, cudaStreamCaptureMode) {
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
-  r.capturing = true;
+  r.captureActive = true; r.captureThread = std::this_thread::get_id();
   r.capture = new std::vector<Op>();
   return cudaSuccess;
 }
 cudaError_t cudaStreamEndCapture(cudaStream_t, cudaGraph_t* g) {
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
-  r.capturing = false;
+  r.captureActive = false;
   ++r.stats.captures; r.stats.capturedOps += r.capture->size();
   *g = new LfGraph_{std::move(*r.capture)};
   delete r.capture; r.capture = nullptr;
   return cudaSuccess;
 }
 cudaError_t cudaStreamIsCapturing(cudaStream_t, cudaStreamCaptureStatus* s) {
-  *s = R().capturing ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
+  *s = R().capturingHere() ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
   return cudaSuccess;
 }
 // (an executable graph is its own copy: the ports destroy the graph once it is instantiated)
@@ -761,7 +772,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   std::lock_guard<std::recursive_mutex> l(r.mu);
   // LOCALFOLD_CHECK_GEMM=<calls>: the first calls recomputed on the host (sampled entries, double) and compared
   static int checks = getenv("LOCALFOLD_CHECK_GEMM") ? atoi(getenv("LOCALFOLD_CHECK_GEMM")) : 0;
-  bool check = checks > 0 && !r.capturing && (!a.ptrs || a.beta == 0.f);
+  bool check = checks > 0 && !r.capturingHere() && (!a.ptrs || a.beta == 0.f);
   std::vector<unsigned char> cBefore;
   if (check) {
     --checks;
@@ -807,7 +818,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
   MTLSize grid = MTLSizeMake((a.m + bm - 1) / bm, (a.n + bn - 1) / bn, batch);
   char label[96]; snprintf(label, sizeof label, "gemm %s %dx%dx%d%s", name.c_str() + 8, a.m, a.n, a.k, batch > 1 ? " batched" : "");
-  r.dispatch(r.shimInstance(name, decl), &a, sizeof a, grid, MTLSizeMake(128, 1, 1), 0, (r.profiling || r.capturing) ? std::string(label) : "");
+  r.dispatch(r.shimInstance(name, decl), &a, sizeof a, grid, MTLSizeMake(128, 1, 1), 0, (r.profiling || r.capturingHere()) ? std::string(label) : "");
 }
 float scalar(const void* p, cublasComputeType_t compute) {
   if (compute == CUBLAS_COMPUTE_16F) return (float)*(const __half*)p;
