@@ -5,6 +5,10 @@
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
+inline float lf_erf(float x) {     // (Abramowitz and Stegun 7.1.26, |error| < 1.5e-7: Metal has no erf)
+  float s = sign(x), t = 1.f / (1.f + 0.3275911f * fabs(x));
+  return s * (1.f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x));
+}
 inline uint lf_udiv(uint a, uint d) {
   if (a >= (1u << 24)) return a / d;
   uint q = (uint)((float)a * (1.f / (float)d));
@@ -267,7 +271,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               if (g.beta != 0.f) v += g.beta * (float)c[t];
               if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[col] : ((device const float*)g.bias)[col];
               if (g.epilogue & 2) v = max(v, 0.f);
-              if (g.epilogue & 32) v = 0.5f * v * (1.f + precise::tanh(0.7978845608f * (v + 0.044715f * v * v * v)));
+              if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f));   // (GELU, erf's)
             }
             if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) e[t] = v;   // (in place: the output's type)
             else o[t] = (TC)v;
@@ -317,7 +321,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         if (g.beta != 0.f) v += g.beta * lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
         if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[i] : ((device const float*)g.bias)[i];
         if (g.epilogue & 2) v = max(v, 0.f);
-        if (g.epilogue & 32) v = 0.5f * v * (1.f + precise::tanh(0.7978845608f * (v + 0.044715f * v * v * v)));
+        if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f));   // (GELU, erf's)
         lf_st(D, (ulong)i + (ulong)j * g.ldd, v);
       }
     }

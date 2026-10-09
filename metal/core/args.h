@@ -21,6 +21,7 @@ typedef unsigned char uchar;
 
 // ---------------------------------------------------------------- core (metal/core/common.metal)
 struct CopyArgs { DP(uchar) dst; CP(uchar) src; u64 bytes; };
+struct Copy2DArgs { DP(uchar) dst; CP(uchar) src; u64 dpitch, spitch, width, height; };
 struct FillArgs { DP(uchar) dst; u64 bytes; uint value; uint pad; };
 // a bundle tensor decoded on the device (metal/core/weights.mm): kind 0 float32, 1 float16, 3 intN asymmetric
 // (code * scale + zero a group, scale and zero float16); out16 writes float16, else float32

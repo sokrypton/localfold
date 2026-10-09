@@ -69,7 +69,7 @@ core_objs+=("$build/gemm-source.o")
 for port in "${ports[@]}"; do
   pdir="$here/$port"
   [ -d "$pdir" ] || { echo "no metal/$port" >&2; exit 1; }
-  metals=("$here/core/args.h"); [ -f "$pdir/args.h" ] && metals+=("$pdir/args.h")
+  metals=("$here/core/args.h"); [ -f "$pdir/kernels.h" ] && metals+=("$pdir/kernels.h")
   metals+=("$here/core/common.metal")
   for m in "$pdir"/*.metal; do [ -f "$m" ] && metals+=("$m"); done
   embed "PORT_SOURCE" "${metals[@]}" > "$build/$port-source.cpp"

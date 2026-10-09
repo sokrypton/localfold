@@ -44,6 +44,12 @@ kernel void lf_copy(LF_ARGS(CopyArgs)) {
     a.dst[i] = a.src[i];
   }
 }
+kernel void lf_copy2d(LF_ARGS(Copy2DArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.width * a.height) return;
+  ulong y = t / a.width, x = t - y * a.width;
+  a.dst[y * a.dpitch + x] = a.src[y * a.spitch + x];
+}
 kernel void lf_fill(LF_ARGS(FillArgs)) {
   ulong i = LF_INDEX;
   uchar v = (uchar)a.value;

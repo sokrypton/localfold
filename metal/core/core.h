@@ -38,6 +38,8 @@ std::vector<std::pair<std::string, size_t>> scratchList();
 
 void fill(void* p, int byte, size_t bytes);                       // in stream order
 void copy(void* dst, const void* src, size_t bytes);              // device to device, in stream order
+// rows of `width` bytes, `height` of them, pitches apart (a strided copy, in stream order)
+void copy2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height);
 void upload(void* dst, const void* src, size_t bytes);            // host to device, in stream order
 template <class T> T* uploadNew(const T* src, size_t n) { T* d = allocT<T>(n ? n : 1); if (n) upload(d, src, n * sizeof(T)); return d; }
 void download(void* dst, const void* src, size_t bytes);          // waits for the queue
@@ -74,6 +76,7 @@ struct Gemm {
   const void* X; DT tx = F32; int ldx = 0; bool transX = false;
   const void* W; DT tw = F32; int ldw = 0; bool transW = false;
   void* Y; DT ty = F32; int ldy = 0;
+  const void* Yin = nullptr;                 // beta's input, if not Y itself (same type and leading dimension)
   size_t rows; int in, out;
   float alpha = 1.f, beta = 0.f;
   const void* bias = nullptr; DT tbias = F32; bool relu = false, gelu = false;

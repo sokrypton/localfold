@@ -16,6 +16,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -200,11 +201,19 @@ struct Device {
     }
     return lib;
   }
-  id<MTLComputePipelineState> kernel(const char* name) {
+  // the pipelines by name (pipeMu: the precompiling thread inserts beside the encoding one)
+  std::mutex pipeMu, specMu;
+  std::shared_future<void> precompiling;
+  id<MTLComputePipelineState> cached(const std::string& name) {
+    std::lock_guard<std::mutex> g(pipeMu);
     auto it = pipelines.find(name);
-    if (it != pipelines.end()) return it->second;
+    return it == pipelines.end() ? nil : it->second;
+  }
+  void remember(const std::string& name, id<MTLComputePipelineState> p) { std::lock_guard<std::mutex> g(pipeMu); pipelines[name] = p; }
+  id<MTLComputePipelineState> kernel(const char* name) {
+    if (id<MTLComputePipelineState> p = cached(name)) return p;
     id<MTLComputePipelineState> p = pipelineOf(portLib(), name);
-    pipelines[name] = p;
+    remember(name, p);
     return p;
   }
   std::string cacheDir() {
@@ -213,7 +222,7 @@ struct Device {
     mkdir(base.c_str(), 0755); mkdir((base + "/localfold").c_str(), 0755); mkdir((base + "/localfold/metal").c_str(), 0755);
     return base + "/localfold/metal";
   }
-  void loadSpecs() {
+  void loadSpecs() {      // (specMu held)
     if (specsLoaded) return;
     specsLoaded = true;
     char name[96]; snprintf(name, sizeof name, "/native-%s-%016zx.specs", portName.c_str(), std::hash<std::string>()(GEMM_SOURCE));
@@ -237,38 +246,40 @@ struct Device {
       specDecls[line.substr(0, tab)] = line.substr(tab + 1);
     }
   }
-  // every instance a previous run used, compiled together in parallel chunks (the compiler is single-threaded)
+  // every instance a previous run used, compiled on threads of their own while the caller loads weights - in parallel
+  // chunks, the compiler being single-threaded
   void precompile() {
-    std::lock_guard<std::recursive_mutex> l(mu);
-    loadSpecs();
     std::vector<std::pair<std::string, std::string>> todo;
-    for (auto& [n, d] : specDecls) if (!pipelines.count(n)) todo.push_back({n, d});
+    {
+      std::lock_guard<std::mutex> g(specMu);
+      loadSpecs();
+      for (auto& [n, d] : specDecls) if (!cached(n)) todo.push_back({n, d});
+    }
     if (todo.empty()) return;
-    size_t chunks = std::min<size_t>(8, (todo.size() + 7) / 8);
-    std::vector<std::vector<id<MTLComputePipelineState>>> made(chunks);
-    std::vector<std::thread> threads;
-    for (size_t c = 0; c < chunks; ++c)
-      threads.emplace_back([&, c] { @autoreleasepool {
-        std::string src = GEMM_SOURCE;
-        for (size_t i = c; i < todo.size(); i += chunks) src += "\n" + todo[i].second;
-        id<MTLLibrary> l = compile(src, "the cached instances");
-        for (size_t i = c; i < todo.size(); i += chunks) made[c].push_back(pipelineOf(l, todo[i].first));
-      } });
-    for (auto& t : threads) t.join();
-    for (size_t c = 0; c < chunks; ++c)
-      for (size_t i = c, k = 0; i < todo.size(); i += chunks, ++k) pipelines[todo[i].first] = made[c][k];
+    precompiling = std::async(std::launch::async, [this, todo] {
+      size_t chunks = std::min<size_t>(8, (todo.size() + 7) / 8);
+      std::vector<std::thread> threads;
+      for (size_t c = 0; c < chunks; ++c)
+        threads.emplace_back([&, c] { @autoreleasepool {
+          std::string src = GEMM_SOURCE;
+          for (size_t i = c; i < todo.size(); i += chunks) src += "\n" + todo[i].second;
+          id<MTLLibrary> l = compile(src, "the cached instances");
+          for (size_t i = c; i < todo.size(); i += chunks) remember(todo[i].first, pipelineOf(l, todo[i].first));
+        } });
+      for (auto& t : threads) t.join();
+    }).share();
   }
   id<MTLComputePipelineState> instance(const std::string& name, const std::string& decl) {
-    auto it = pipelines.find(name);
-    if (it != pipelines.end()) return it->second;
-    loadSpecs();
-    if (specDecls.count(name)) { precompile(); it = pipelines.find(name); if (it != pipelines.end()) return it->second; }
+    if (id<MTLComputePipelineState> p = cached(name)) return p;
+    if (precompiling.valid()) { precompiling.wait(); if (id<MTLComputePipelineState> p = cached(name)) return p; }
     auto t0 = std::chrono::steady_clock::now();
     id<MTLComputePipelineState> p = pipelineOf(compile(std::string(GEMM_SOURCE) + "\n" + decl + "\n", name), name);
     if (getenv("LOCALFOLD_METAL_VERBOSE"))
       fprintf(stderr, "metal: compiled %s in %.0f ms\n", name.c_str(),
               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-    pipelines[name] = p;
+    remember(name, p);
+    std::lock_guard<std::mutex> g(specMu);
+    loadSpecs();
     if (!knownSpecs.count(name)) {
       knownSpecs.insert(name); specDecls[name] = decl;
       std::ofstream out(specsPath, std::ios::app);
@@ -390,6 +401,11 @@ void copy(void* dst, const void* src, size_t bytes) {
   CopyArgs a{(uchar*)dst, (const uchar*)src, bytes};
   run1d("lf_copy", ((((uint64_t)dst | (uint64_t)src) & 15) == 0 ? std::max<size_t>(bytes / 16, 16) : bytes), a);
 }
+void copy2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
+  if (!width || !height) return;
+  Copy2DArgs a{(uchar*)dst, (const uchar*)src, dpitch, spitch, width, height};
+  run1d("lf_copy2d", width * height, a);
+}
 void upload(void* dst, const void* src, size_t bytes) {
   if (!bytes) return;
   Device& d = D();
@@ -418,19 +434,23 @@ void sync() { D().sync(); }
 void setSource(const char* portName, const char* source) {
   Device& d = D();
   d.portName = portName; d.portSource = source;
-  // the port's kernels compiled on a thread of their own while the caller loads weights
+  // the port's kernels, and the GEMM instances a previous run used, compiled on threads of their own while the caller
+  // loads weights
   std::thread([] { @autoreleasepool { D().portLib(); } }).detach();
+  d.precompile();
 }
 void dispatch(const char* kernel, const void* args, size_t argBytes, Grid groups, uint32_t threads, size_t smem, const char* label) {
   Device& d = D();
+  id<MTLComputePipelineState> p = d.kernel(kernel);
   std::lock_guard<std::recursive_mutex> l(d.mu);
-  d.dispatch(d.kernel(kernel), args, argBytes, groups, threads, smem, label ? label : kernel);
+  d.dispatch(p, args, argBytes, groups, threads, smem, label ? label : kernel);
 }
 void dispatchInstance(const std::string& name, const std::string& decl, const void* args, size_t argBytes, Grid groups,
                       uint32_t threads, size_t smem, const char* label) {
   Device& d = D();
+  id<MTLComputePipelineState> p = d.instance(name, decl);
   std::lock_guard<std::recursive_mutex> l(d.mu);
-  d.dispatch(d.instance(name, decl), args, argBytes, groups, threads, smem, label ? label : name.c_str());
+  d.dispatch(p, args, argBytes, groups, threads, smem, label ? label : name.c_str());
 }
 void precompile() { D().precompile(); }
 
@@ -489,7 +509,7 @@ void gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
 void gemm(const Gemm& g) {
   if (!g.rows || !g.out || g.batch <= 0) return;
   GemmArgs a{};
-  a.A = (uint64_t)g.W; a.B = (uint64_t)g.X; a.C = (uint64_t)g.Y; a.D = (uint64_t)g.Y;
+  a.A = (uint64_t)g.W; a.B = (uint64_t)g.X; a.C = (uint64_t)(g.Yin ? g.Yin : g.Y); a.D = (uint64_t)g.Y;
   a.m = g.out; a.n = (int)g.rows; a.k = g.in;
   a.lda = g.ldw ? g.ldw : (g.transW ? g.in : g.out);
   a.ldb = g.ldx ? g.ldx : (g.transX ? (int)g.rows : g.in);
