@@ -275,6 +275,9 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
   }
   __syncthreads();
   // A fragments of m16n8k16: a0 (row g, k 2tig..+1), a1 (row g+8, ...), a2 (row g, k+8), a3 (row g+8, k+8)
+  // (the centre norm's scale folded into Wout's rows and its offset into an output bias, the tile then read by
+  // ldmatrix.trans - four 8x8 matrices an instruction for these 2-byte loads and the scale/offset reads - was measured:
+  // -1% of this kernel at 988 tokens in AF3, +3.7% in ESMFold2's 256-channel one; not taken)
   int ra = warp * 16 + g, rb = ra + 8;
   float ma = stat[ra], ia = stat[R + ra], mb = stat[rb], ib = stat[R + rb];
   auto nrm = [&](int r, float m, float inv, int k) { return ((float)Ps[k * LDP + r] - m) * inv * nsc[k] + nsc[C + k]; };
