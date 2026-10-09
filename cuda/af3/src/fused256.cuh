@@ -565,7 +565,7 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
   constexpr int R = 16 * WARPS;
   size_t P = (size_t)L * L;
   half* wt = scratch<half>("triout.wt", (size_t)C * C);
-  tileColumns(Wout, C, C, 0, C, f32 || ob ? 32 : 16, wt);
+  tileColumns(Wout, C, C, 0, C, f32 || (ob && sizeof(TP) == 4) ? 32 : 16, wt);
   if (f32 && !ob) {
     constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32>();
     WITH_PAIR_T(
@@ -582,7 +582,18 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
         if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP, true, PT>), (int)smem); attr = true; }
         triangleOutK<C, WARPS, float, 32, TP, true, PT><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
           prod, sc, of, wt, t2, pair, L, Lp, ob));
-    } else { fprintf(stderr, "triangleOutRun: an output bias takes an f32 product (AF2's)\n"); exit(1); }
+    } else {
+      // ...or a bf16 product (AF2's streaming triangle on an A100, as AF3's: its narrow path's product is bf16 too) - the
+      // bf16 tile at 16-column stages, the bias in the same epilogue
+      constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
+      constexpr bool vec = sizeof(TP) == 2;
+      size_t rows = vec ? (size_t)Lp * Lp : P;
+      WITH_PAIR_T(
+        static bool attr = false;
+        if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, true, PT>), (int)smem); attr = true; }
+        triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, true, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
+          prod, sc, of, wt, t2, pair, L, Lp, ob));
+    }
   } else {
     constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
     constexpr bool vec = sizeof(TP) == 2;                       // the padded rows (triangleOutK's VEC)

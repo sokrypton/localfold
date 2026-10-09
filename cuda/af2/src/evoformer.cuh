@@ -685,6 +685,42 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   // as cuda/af3 has them and as AlphaFold 2's own trunk runs (global_config.bfloat16): the output kernel then
   // stages half the product and takes its persistent form. AF2_TRI_F32=1 keeps the f32 product.
   static const bool triBf16 = !getenv("AF2_TRI_F32");
+  // 🔴 ON AN SM WITH AN A100's SHARED MEMORY, cuda/af3's streaming kernels as AF3 runs them at 128 channels: the input
+  // kernel at two row tiles a warp (biased), a bf16 contraction, and the output kernel streaming its weight 16 columns
+  // a stage with the bias in its epilogue - where the narrow output kernel holds the whole weight at one block an SM.
+  // LOCALFOLD_TRI128=narrow|wide forces either (as cuda/af3's pairtrack.cuh)
+  static const bool wide128 = [] {
+    if (const char* e = getenv("LOCALFOLD_TRI128")) return std::string(e) == "wide";
+    int dev, perSm = 0, major = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+    return perSm >= 160 * 1024 && major >= 8;
+  }();
+  if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && wide128 && L >= 80 && fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8))) {
+    int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
+    TriFused w = triFusedWeights(T, blk, C);
+    half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
+    tileTriIn(w.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+    __nv_bfloat16* a = scratch<__nv_bfloat16>("ftri.abf", plane * C); __nv_bfloat16* b = scratch<__nv_bfloat16>("ftri.bbf", plane * C);
+    half* t2 = scratch<half>("ftri.t2", plane * C);
+    const size_t smem = triIn256Smem<__nv_bfloat16>(128, 8);
+    WITH_PAIR_T(
+      static bool attr = false;
+      if (!attr) { smemAttr((triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2>), (int)smem); attr = true; }
+      triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
+        pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
+    __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
+    const float one = 1.f, zero = 0.f;
+    if (outgoing)
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16BF, Lp, plane, a, CUDA_R_16BF, Lp,
+                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    else
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16BF, Lp, plane, b, CUDA_R_16BF, Lp,
+                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    triangleOutRun<128, 4, __nv_bfloat16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                          PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk));
+    return;
+  }
   if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && triFusedFits<__nv_bfloat16>()) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     TriFused w = triFusedWeights(T, blk, C);
