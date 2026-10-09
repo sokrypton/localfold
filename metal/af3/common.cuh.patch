@@ -1,0 +1,23 @@
+# (Metal) a dropped f32 weight copy served by a hook rather than refused: af3.cu.patch drops the f32 copy of every large
+# weight once its f16 mirror exists, and the hook rebuilds one from the mirror for the few code paths that read f32.
+@@@ old
+struct Model {
+@@@ new
+inline std::function<const float*(const std::string&)> DROPPED_F32;
+struct Model {
+@@@ end
+@@@ old
+    if (e.devOffset == DROPPED) { fprintf(stderr, "%s: its f32 device copy was dropped (read its f16 mirror)\n", k.c_str()); exit(1); }
+@@@ new
+    if (e.devOffset == DROPPED && DROPPED_F32) return DROPPED_F32(k);
+    if (e.devOffset == DROPPED) { fprintf(stderr, "%s: its f32 device copy was dropped (read its f16 mirror)\n", k.c_str()); exit(1); }
+@@@ end
+@@@ old
+inline void releaseConcatCopies() {
+  if (CONCAT_FREE.empty()) return;
+@@@ new
+inline std::function<void()> RELEASE_REBUILT;      // (Metal: af3.cu.patch's rebuilt f32 copies, given back here too)
+inline void releaseConcatCopies() {
+  if (RELEASE_REBUILT) RELEASE_REBUILT();
+  if (CONCAT_FREE.empty()) return;
+@@@ end

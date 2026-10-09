@@ -94,6 +94,14 @@ And in `flashGridMetal`: K and V staged four halves a load (3109 -> 2630 ms at 2
 statistics summed while loading, by all eight rows of threads where one row did it alone (613 -> 365 ms).
 `layerNormK` is at the M2's bandwidth already (~95 GB/s), and a pair-bias read two halves at a time moved nothing.
 
+**Memory: every weight held once.** The CUDA port keeps each weight tensor as float32 *and* its f16 mirror - 2.51 GB
+for AF3's int5 bundle before the trunk starts, of which the mirror is 0.85. `metal/af3/af3.cu.patch` drops the float
+copy of every tensor of 64 K elements or more once its mirror exists (1.33 GB); the few paths that read one as float -
+mostly a concatenation's parts, read once - get a copy rebuilt from the mirror, given back at the next phase boundary.
+Not the input embedder's (bisected by prefix: their rounding took IntelliFold-2's pLDDT down 0.8 on every seed while
+the structure did not move) and not the confidence head's. At 255 tokens: 2.51 -> 1.18 GB in use before the trunk, the
+fold's peak 4.95 -> 3.85 GB. `LOCALFOLD_KEEP_F32=1` is the control.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):
 
