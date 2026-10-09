@@ -233,12 +233,25 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
     if (!(g.epilogue & 128) && j0 + TR <= g.n && i0 + TC_ <= g.m) {
       if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) {   // (the accumulator is the output's type)
-        if (g.epilogue == 0 && g.alpha == 1.f && g.beta == 0.f) {      // a plain product: the accumulators themselves
+        if ((g.epilogue & ~6) == 0 && g.alpha == 1.f && g.beta == 0.f) {   // a plain product (a bias, a ReLU): the
+          const int sn3 = ((lane / 8) % 2) * 4 + (lane % 2) * 2;            // accumulators themselves, adjusted in place
           _Pragma("clang loop unroll(full)")
           for (int a = 0; a < FR; ++a)
             _Pragma("clang loop unroll(full)")
-            for (int b = 0; b < FC; ++b)
+            for (int b = 0; b < FC; ++b) {
+              if (g.epilogue) {
+                thread auto& e = acc[a][b].thread_elements();
+                _Pragma("clang loop unroll(full)")
+                for (int t = 0; t < 2; ++t) {
+                  const int col = i0 + sc + b * 8 + sn3 + t;
+                  float v = (float)e[t];
+                  if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[col] : ((device const float*)g.bias)[col];
+                  if (g.epilogue & 2) v = max(v, 0.f);
+                  e[t] = v;
+                }
+              }
               simdgroup_store(acc[a][b], D + (ulong)(j0 + sr + a * 8) * g.ldd + i0 + sc + b * 8, (ulong)g.ldd);
+            }
           return;
         }
       }
