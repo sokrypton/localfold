@@ -185,6 +185,13 @@ int foldInput(const std::string& dir, Options o) {
       }
     }
   }
+  if (getenv("AF3_MEM")) {                    // the scratch the trunk held, largest first
+    auto v = scratchList();
+    std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second > y.second; });
+    printf("memory: trunk scratch %.0f MB, peak %.0f MB (live %.0f):", scratchHeld() / 1e6, peakAllocated() / 1e6, peakLive() / 1e6);
+    for (size_t k = 0; k < v.size() && k < 12; ++k) printf(" %s %.0f", v[k].first.c_str(), v[k].second / 1e6);
+    printf("\n");
+  }
   releaseScratch({"pr.", "grid.", "tr.", "st."});
   std::vector<float> contact = contactProbabilities(t);
   mt::sync();
@@ -229,6 +236,8 @@ int foldInput(const std::string& dir, Options o) {
     if (profiling()) profileReport("diffusion", getenv("AF3_PROFILE_TOP") ? atoi(getenv("AF3_PROFILE_TOP")) : 30);
     if (getenv("AF3_STAGES")) reportStages();
     diffMs += ms(s0);
+    if (c0 + cn == runs.size())                 // the sampler's, after its last batch: the confidence head's pair track
+      releaseScratch({"diffusion.", "dc.", "dt.", "dn.", "dec.", "enc.", "ab.", "ada.", "apl.", "pt.", "sample."});   // needs the room
     for (size_t k = 0; k < cn; ++k) {
       double s1 = now();
       std::vector<float> xk(xs.begin() + k * atoms3, xs.begin() + (k + 1) * atoms3);
@@ -272,8 +281,14 @@ int foldInput(const std::string& dir, Options o) {
          passesRun, diffMs, o.steps, (int)runs.size(), confMs, ms(t0));
   (void)d0;
   mt::sync();
-  if (getenv("AF3_MEM")) printf("memory: allocated %.0f MB now, peak %.0f MB, scratch %.0f MB\n", allocated() / 1e6, peakAllocated() / 1e6,
-                                scratchHeld() / 1e6);
+  if (getenv("AF3_MEM")) {
+    auto v = scratchList();
+    std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second > y.second; });
+    printf("memory: allocated %.0f MB now, peak %.0f MB (%.0f with released buffers in flight), scratch %.0f MB:", allocated() / 1e6,
+           peakAllocated() / 1e6, peakLive() / 1e6, scratchHeld() / 1e6);
+    for (size_t k = 0; k < v.size() && k < 16; ++k) printf(" %s %.0f", v[k].first.c_str(), v[k].second / 1e6);
+    printf("\n");
+  }
   freeDiffusion();
   if (structural) freeStructural(st);
   freeTrunk(t);
@@ -328,7 +343,7 @@ int foldMain(int argc, char** argv) {
   ADA_RAW = flag("trunk.dialect.chaiAtomStack");      // (chai-1's adaptive LayerNorm: its folded weights are built now)
   prepareWeights();
   printf("weights: %.0f ms\n", ms(t0));
-  if (getenv("AF3_MEM")) { mt::sync(); printf("memory: weights %.0f MB, allocated %.0f MB\n", M.weightBytes() / 1e6, allocated() / 1e6); }
+  if (getenv("AF3_MEM")) { mt::sync(); printf("memory: weights %.0f MB, allocated %.0f MB, live peak %.0f MB\n", M.weightBytes() / 1e6, allocated() / 1e6, peakLive() / 1e6); }
   if (waitInput) {      // the featuriser writes model.idx last (by a rename), or model.failed
     std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";
     while (access(idx.c_str(), R_OK) != 0) {

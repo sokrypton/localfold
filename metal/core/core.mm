@@ -45,7 +45,7 @@ struct Device {
   id<MTLDevice> dev;
   id<MTLCommandQueue> queue;
   std::map<uint64_t, Alloc> allocs;
-  size_t held = 0, peak = 0;
+  size_t held = 0, peak = 0, buried = 0, peakLive = 0;     // (live: held and the graveyard's, still resident)
   id<MTLCommandBuffer> cb = nil;
   id<MTLComputeCommandEncoder> enc = nil;
   std::vector<id<MTLBuffer>> keep;           // staged and argument buffers, alive until this command buffer is done
@@ -92,12 +92,16 @@ struct Device {
   void* alloc(size_t bytes) {
     std::lock_guard<std::recursive_mutex> l(mu);
     size_t n = std::max<size_t>((bytes + 255) & ~(size_t)255, 256);
+    // released buffers the work in flight may still read are kept until it is done; past a bound, wait for it rather
+    // than hold both (a 522-token trunk pass held 0.9 GB of them beside its own 1.9). LOCALFOLD_BURIED_MB: the bound
+    static const size_t bound = (size_t)(getenv("LOCALFOLD_BURIED_MB") ? atof(getenv("LOCALFOLD_BURIED_MB")) : 128) << 20;
+    if (buried >= bound) sync();
     id<MTLBuffer> b = [dev newBufferWithLength:n options:MTLResourceStorageModeShared];
     if (!b) die("out of memory: %.2f GB asked for with %.2f GB held", bytes / 1e9, held / 1e9);
     ++stats.allocs;
     uint64_t addr = b.gpuAddress;
     allocs[addr] = {b, addr, n};
-    held += n; peak = std::max(peak, held);
+    held += n; peak = std::max(peak, held); peakLive = std::max(peakLive, held + buried);
     if (enc) [enc useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     return (void*)addr;
   }
@@ -109,7 +113,7 @@ struct Device {
     auto it = allocs.find((uint64_t)p);
     if (it == allocs.end()) die("release of a pointer that is not an allocation's start");
     held -= it->second.size;
-    if (!idle()) graveyard.push_back({committedSeq + (cb ? 1 : 0), it->second.buf});   // (work issued may read it)
+    if (!idle()) { graveyard.push_back({committedSeq + (cb ? 1 : 0), it->second.buf}); buried += it->second.size; }   // (work issued may read it)
     allocs.erase(it);
   }
   void* host(const void* p, size_t bytes = 0) {
@@ -161,7 +165,11 @@ struct Device {
     if (graveyard.empty()) return;
     long oldest;
     { std::lock_guard<std::mutex> g(inflightMu); oldest = pending.empty() ? LONG_MAX : *pending.begin(); }
-    graveyard.erase(std::remove_if(graveyard.begin(), graveyard.end(), [&](auto& e) { return e.first < oldest; }), graveyard.end());
+    graveyard.erase(std::remove_if(graveyard.begin(), graveyard.end(), [&](auto& e) {
+      if (e.first >= oldest) return false;
+      buried -= e.second.length;
+      return true;
+    }), graveyard.end());
   }
   void sync() {
     std::lock_guard<std::recursive_mutex> l(mu);
@@ -354,6 +362,7 @@ void* host(const void* p) { std::lock_guard<std::recursive_mutex> l(D().mu); ret
 bool isDevice(const void* p) { std::lock_guard<std::recursive_mutex> l(D().mu); return D().find((uint64_t)p) != nullptr; }
 size_t allocated() { return D().held; }
 size_t peakAllocated() { return D().peak; }
+size_t peakLive() { return D().peakLive; }
 void resetPeak() { D().peak = D().held; }
 void* scratchBytes(const std::string& name, size_t bytes) {
   Device& d = D();
@@ -409,7 +418,7 @@ void unmapFile(void* p) {
   std::lock_guard<std::recursive_mutex> l(d.mu);
   auto it = d.allocs.find((uint64_t)p);
   if (it == d.allocs.end()) die("unmapFile of a pointer that is not a mapping");
-  if (!d.idle()) d.graveyard.push_back({d.committedSeq + (d.cb ? 1 : 0), it->second.buf});
+  if (!d.idle()) { d.graveyard.push_back({d.committedSeq + (d.cb ? 1 : 0), it->second.buf}); d.buried += it->second.buf.length; }
   d.allocs.erase(it);
 }
 Grid grid1d(size_t n, uint32_t threads) {

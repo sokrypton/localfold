@@ -28,6 +28,7 @@ void* host(const void* p);                  // the bytes behind a device pointer
 bool isDevice(const void* p);
 size_t allocated();                         // bytes held now
 size_t peakAllocated();
+size_t peakLive();           // (and the released buffers work in flight kept)
 void resetPeak();
 // named working buffers, grown as asked and kept until released (a fold asks for the same ones every block)
 void* scratchBytes(const std::string& name, size_t bytes);

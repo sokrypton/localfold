@@ -115,12 +115,22 @@ through a float32 copy), the rest float32. A weight read only through a derived 
 projection and gate, an attention's q|k|v|g, a SwiGLU interleaving, the token transformer's folded conditioning - gets
 its own allocation at load, the derived form is built up front (`metal/af3/weights.mm`) and the source given back
 (`Model::retire`). ESMFold2 gives its language model back once it has run (not under `--serve`) and interleaves its
-tower's weights in place. Scratch buffers are named and grown as asked; each stage gives its own back when it is done.
+tower's weights in place. Scratch buffers are named and grown as asked; each stage gives its own back when it is done,
+and the pair track's stages, which run one after another, share theirs (one buffer is the grid attention's q|k|v|g or
+the triangle's planes). The sampler's scratch is given back before the confidence head builds its own.
+
+🔴 **A RELEASED BUFFER IS STILL RESIDENT UNTIL THE WORK ISSUED BEFORE IT IS DONE**, and the host runs far ahead of the
+GPU: a 522-token trunk pass held 0.9 GB of released buffers beside its own 1.9, invisible to the allocation count and
+exactly the gap to the process footprint. Past 128 MB of them (`LOCALFOLD_BURIED_MB`) the allocator waits for the GPU
+instead - no measurable cost (5CAJ self-template 31.7 / 31.9 s against 31.8 / 41.0 without). `AF3_MEM=1` prints both
+peaks and the scratch by name.
 
 | peak | before | now |
 |---|---|---|
 | AF3 6MRR: allocation / process footprint | 2.21 / 2.28 GB | 0.85 / 1.14 GB |
 | ESMFold2 5CAJ: allocation / footprint | 2.90 / 2.92 GB | 1.70 / 2.23 GB |
+| AF3, 522 tokens, one pass: footprint | 2.96 GB | 2.00 GB |
+| AF3, 1044 tokens, one pass: allocation / footprint | 9.0 / 11.3 GB | 5.2 / 5.3 GB |
 
 ## Traps, each paid for
 
