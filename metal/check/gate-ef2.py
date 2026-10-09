@@ -19,7 +19,7 @@ gate.BASELINE = os.path.join(gate.HERE, "gate-baseline.json")
 gate.TMP = os.environ.get("GATE_TMP", "/tmp/metal-ef2-gate")
 gate.oracle_cases = lambda: []
 cases = gate.fold_cases
-WEIGHTS = os.environ.get("LOCALFOLD_WEIGHTS", os.path.expanduser("~/.cache/localfold/weights"))   # (the checkout's esmfold2 export has no confidence head)
+WEIGHTS = os.environ.get("LOCALFOLD_WEIGHTS", os.path.expanduser("~/.cache/localfold"))   # (the checkout's esmfold2 export has no confidence head)
 gate.fold_cases = lambda: [(c[0], c[1] + ["--fast", f"--weights-dir={WEIGHTS}"], *c[2:]) for c in cases()]
 print("A100 baseline: " + ", ".join(f"{k} {v.get('rmsd')} / {v.get('plddt')}" for k, v in sorted(a100.items())))
 gate.main()

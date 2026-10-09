@@ -1,5 +1,6 @@
-# The localfold wheel: the three native CUDA ports prebuilt for every current NVIDIA card (sm_75 to sm_120, PTX past
-# that), in one py3-none-manylinux_2_28_x86_64 wheel - `pip install` and run, no compiler. No GPU is needed to build
+# The localfold wheels: the three native CUDA ports prebuilt for every current NVIDIA card (sm_75 to sm_120, PTX past
+# that), in one py3-none-manylinux_2_28_x86_64 wheel - `pip install` and run, no compiler - and the same three on
+# Metal for Apple silicon (metal/: the CUDA ports translated) in a py3-none-macosx_13_0_arm64 one. pip picks by platform. No GPU is needed to build
 # it; the test job installs it on a GPU-less runner and checks every binary loads and answers --help, which is what
 # proves the RPATH finds pip's cuBLAS. Run by hand, or by pushing a v* tag; publishing to PyPI is not done here.
 name: Build wheel
@@ -45,3 +46,23 @@ jobs:
             /tmp/lf/bin/localfold-$p --help | head -3
           done
           /tmp/lf/bin/localfold-fetch --help | head -2      # (usage: its models and the CCD)
+
+  build-macos:
+    runs-on: macos-14            # Apple silicon (arm64); no GPU is needed to build - the kernels compile on first use
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build (Metal, macOS 13+ arm64)
+        run: bash python/build_wheel_macos.sh dist
+      - name: Install into a fresh environment, every binary answers --help
+        shell: bash
+        run: |
+          python -m venv /tmp/lf && /tmp/lf/bin/pip install -q dist/localfold-*-macosx_13_0_arm64.whl
+          for p in af3 af2 ef2; do /tmp/lf/bin/localfold-$p --help | head -1; done
+          /tmp/lf/bin/localfold-fetch --help | head -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos
+          path: dist/*.whl

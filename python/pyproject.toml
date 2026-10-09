@@ -1,5 +1,7 @@
-# The localfold wheel: the native CUDA ports, prebuilt for every current NVIDIA card - no compiler needed to run them.
-# Built by .github/workflows/wheel.yml (python/build_wheel.sh): the binaries are compiled into localfold/bin first.
+# The localfold wheels: the native ports prebuilt - no compiler needed to run them. Two platform wheels, one package:
+# manylinux_2_28_x86_64 carries the CUDA ports for every current NVIDIA card (python/build_wheel.sh, run by
+# .github/workflows/wheel.yml), macosx_13_0_arm64 the same ports on Metal for Apple silicon
+# (python/build_wheel_macos.sh). pip picks by platform; the binaries are compiled into localfold/bin first.
 [build-system]
 requires = ["setuptools>=68", "wheel>=0.40"]
 build-backend = "setuptools.build_meta"
@@ -7,13 +9,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "localfold"
 version = "0.1.0"
-description = "AlphaFold 3 (and its lineage), AlphaFold 2 and ESMFold2 as native CUDA binaries: a job JSON in, a structure out."
+description = "AlphaFold 3 (and its lineage), AlphaFold 2 and ESMFold2 as native binaries - CUDA on Linux, Metal on Apple silicon: a job JSON in, a structure out."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Beerware" }
 authors = [{ name = "Sergey Ovchinnikov" }]
-# cuBLAS is the one GPU library the binaries do not carry: NVIDIA's own wheel, found through each binary's RPATH
-dependencies = ["nvidia-cublas-cu12>=12.8"]
+# cuBLAS is the one GPU library the CUDA binaries do not carry: NVIDIA's own wheel, found through each binary's RPATH
+# (the Metal binaries link only the system's frameworks)
+dependencies = ['nvidia-cublas-cu12>=12.8; sys_platform == "linux"']
 
 [project.urls]
 Homepage = "https://localfold.org"
