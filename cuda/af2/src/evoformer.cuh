@@ -16,7 +16,14 @@ struct Trunk {
   bool opmFirst;
   // all ones (no padding, no absent row): the flash kernel then skips the mask altogether
   bool msaOnes = false, extraOnes = false, pairOnes = false;
+  float* msa16 = nullptr;       // the main stack's MSA in bf16 while its blocks run (MSA16), else null
 };
+// MSA16: the main stack's MSA held in bf16 through its blocks (AlphaFold 2's own precision, global_config.bfloat16):
+// its LayerNorms read half the bytes and its three residual adds - the row and column attention's output projections
+// and the transition's second layer, bf16 GEMMs accumulating in place - read and write half; converted in before the
+// blocks and out after them (af2.cu). Set where every block's MSA path has a bf16 form: --fast, every MSA row live,
+// no template rows, 8 heads of 32 on an Ampere part
+inline bool MSA16 = false;
 
 // ---------------------------------------------------------------- the embedder
 // relpos [L, L, 73] one-hot, as _relative_encoding builds it
@@ -389,6 +396,21 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       }
       bias = b;
     }
+    if (MSA16 && msa == t.msa16) {
+      using B16 = __nv_bfloat16;
+      B16* m16 = reinterpret_cast<B16*>(msa);
+      AttnW w = attnWeights(R + "/attention", blk, C);
+      int Wp = w.H * w.Dp, stride = (L + 7) / 8 * 8;
+      half* xn = scratch<half>("frow.xn", rows * C);
+      layerNormVK<256, B16, half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(m16, xn, rows, P(R + "/query_norm/scale", blk),
+                                                                                P(R + "/query_norm/offset", blk));
+      half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
+      ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
+      B16* o = scratch<B16>("fatt.o16", rows * Wp);
+      flashGrid2RRun<32, 2, 48, 2, 2, false, false, B16>(qkvg, bias, stride, o, L, w.H, rowsN, 1.f / sqrtf((float)w.D), nullptr);
+      ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(R + "/attention/output_b", blk), false, 1.f, 0, 0, true);
+      return;
+    }
     bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
     half* xn = scratch<half>("frow.xn", rows * C);
     layerNormH(msa, xn, rows, C, R + "/query_norm", blk);
@@ -412,6 +434,23 @@ inline void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
                                const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string A = S + "msa_column_attention";
+  if (MSA16 && msa == t.msa16) {
+    // (as attentionCoreAcross, its MSA, output and output projection bf16)
+    using B16 = __nv_bfloat16;
+    B16* m16 = reinterpret_cast<B16*>(msa);
+    AttnW w = attnWeights(A + "/attention", blk, C);
+    int Wp = w.H * w.Dp, stride = (rowsN + 7) / 8 * 8;
+    half* xn = scratch<half>("fcol.xn", rows * C);
+    layerNormVK<256, B16, half><<<(unsigned)((rows + 7) / 8), 256, 0, STREAM>>>(m16, xn, rows, P(A + "/query_norm/scale", blk),
+                                                                              P(A + "/query_norm/offset", blk));
+    half* qkvg = scratch<half>("fatt.qkvg", (rows + 128) * 4 * Wp);
+    ltGemm(xn, w.qkvg, qkvg, true, rows, C, 4 * Wp, w.qkvgBias, false, 0.f);
+    B16* o = scratch<B16>("fatt.o16", rows * Wp);
+    flashGrid2RRun<32, 2, 48, 2, 2, true, false, B16>(qkvg, nullptr, stride, o, rowsN, w.H, L, 1.f / sqrtf((float)w.D), nullptr,
+                                                     (size_t)4 * Wp, (size_t)L * 4 * Wp, (size_t)Wp, (size_t)L * Wp);
+    ltGemm(o, bf16Of(w.out, (size_t)Wp * C), m16, false, rows, Wp, C, P(A + "/attention/output_b", blk), false, 1.f, 0, 0, true);
+    return;
+  }
   if (FAST && t.msaOnes) {
     half* xn = scratch<half>("fcol.xn", rows * C);
     layerNormH(msa, xn, rows, C, A + "/query_norm", blk);
@@ -485,6 +524,22 @@ inline void transition(float* x, size_t rows, int C, const std::string& T, int b
     // over 5CAJ's 576 calls against 117.8 for the LN plus this GEMM it replaced, and 181.6 at two tiles a
     // warp. At 256 channels its m16-a-warp MMAs read each weight fragment for one MMA; cuBLAS does better.)
     size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)(I + 8))));
+    if (MSA16 && C == 256 && I == 4 * C) {     // (the MSA16 stack's MSA: every GEMM bf16, the residual in place)
+      using B16 = __nv_bfloat16;
+      B16* x16 = reinterpret_cast<B16*>(x);
+      B16* xh = scratch<B16>("ftr.xn16", chunk * C);
+      B16* mh = augmentedInputBf16("ftr.mid16" + std::to_string(I), chunk, I);
+      const B16* w1 = bf16Of(PH(T + "/transition1/weights", blk), (size_t)C * I);
+      const B16* w2 = bf16Of(augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C), (size_t)(I + 8) * C);
+      for (size_t r0 = 0; r0 < rows; r0 += chunk) {
+        size_t r = std::min(chunk, rows - r0);
+        layerNormVK<256, B16, B16><<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(x16 + r0 * C, xh, r, P(T + "/input_layer_norm/scale", blk),
+                                                                              P(T + "/input_layer_norm/offset", blk));
+        ltGemm(xh, w1, mh, false, r, C, I, P(T + "/transition1/bias", blk), true, 0.f, 0, I + 8, true);
+        ltGemm(mh, w2, x16 + r0 * C, false, r, I + 8, C, nullptr, false, 1.f, 0, 0, true);
+      }
+      return;
+    }
     half* xh = scratch<half>("ftr.xn", chunk * C);
     half* mh = augmentedInput("ftr.mid" + std::to_string(I), chunk, I);     // [rows, I+8], a 1 at column I
     const half* w2 = augmentedWeight(T + "/transition2/weights", blk, P(T + "/transition2/bias", blk), I, C);
@@ -534,7 +589,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
   if (FAST) {
     half* lt = scratch<half>("fopm.left", rows * O); half* rt = scratch<half>("fopm.right", rows * O);
     static const bool lnFused = !getenv("LOCALFOLD_LNGEMM") || atoi(getenv("LOCALFOLD_LNGEMM"));
-    if (lnFused && (C == 256 || C == 64)) {
+    if ((lnFused || (MSA16 && msa == t.msa16)) && (C == 256 || C == 64)) {
       // the LayerNorm and both projections in one pass over the MSA (lnGemm): the LN'd MSA never written, read twice -
       // 5CAJ with its 7,907-row alignment 1382 -> 1354 ms of GPU a fold, 0.014 A. (The same kernel for the row
       // attention's q/k/v/gate, 1024 columns, loses - 130 ms against the LN's 31 and cuBLAS's 80: its two-tile warps
@@ -546,7 +601,8 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       CK(cudaMemcpyAsync(bb, P(Op + "/left_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
       CK(cudaMemcpyAsync(bb + O, P(Op + "/right_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
       const float *s0 = P(Op + "/layer_norm_input/scale", blk), *o0 = P(Op + "/layer_norm_input/offset", blk);
-      if (C == 256) lnGemm<256>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+      if (MSA16 && msa == t.msa16) lnGemm<256, __nv_bfloat16>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+      else if (C == 256) lnGemm<256>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
       else lnGemm<64>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
     } else {
       half* xn = scratch<half>("fopm.xn", rows * C);
@@ -554,7 +610,7 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       ltGemm(xn, PH(Op + "/left_projection/weights", blk), lt, true, rows, C, O, P(Op + "/left_projection/bias", blk), false, 0.f);
       ltGemm(xn, PH(Op + "/right_projection/weights", blk), rt, true, rows, C, O, P(Op + "/right_projection/bias", blk), false, 0.f);
     }
-    bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
+    bool ones = msa == t.msa || msa == t.msa16 ? t.msaOnes : t.extraOnes;
     if (!ones) {
       scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(lt, msaMask, rows, O);
       scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(rt, msaMask, rows, O);
@@ -1098,7 +1154,7 @@ inline void triangleAttention(float* pair, const float* pairMask, int L, int C, 
 // one Evoformer iteration of a stack: S is "evoformer/evoformer_iteration/" or ".../extra_msa_stack/"
 inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
   const std::string S = extraStack ? "evoformer/extra_msa_stack/" : "evoformer/evoformer_iteration/";
-  float* msa = extraStack ? t.extra : t.msa;
+  float* msa = extraStack ? t.extra : MSA16 ? t.msa16 : t.msa;
   int rowsN = extraStack ? t.E : t.N + t.T, C = extraStack ? 64 : 256;
   const float* mask = extraStack ? t.extraMask : t.msaMask;
   std::string R = S + "msa_row_attention_with_pair_bias/attention/query_w";

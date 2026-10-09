@@ -29,19 +29,33 @@ inline const void* biasFor(const float* bias, int n, bool asHalf) {
   toHalfK<<<blocks(n), 256, 0, STREAM>>>(bias, h, n);
   return copies[bias] = h;
 }
-inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t rows, int in, int out, const float* biasF,
-                   bool relu, float beta, int ldx = 0, int ldy = 0) {
+__global__ void toBf16FK(const float* x, __nv_bfloat16* y, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = __float2bfloat16(x[i]);
+}
+// bf16: X, Wt and Y all bf16 (cuBLASLt takes no f16-in, bf16-out GEMM) - the bf16 MSA's (MSA16); the bias a bf16 copy
+inline const void* biasForBf16(const float* bias, int n) {
+  if (!bias) return nullptr;
+  static std::map<const float*, __nv_bfloat16*> copies;
+  auto it = copies.find(bias);
+  if (it != copies.end()) return it->second;
+  __nv_bfloat16* h = wpool<__nv_bfloat16>(n);
+  toBf16FK<<<blocks(n), 256, 0, STREAM>>>(bias, h, n);
+  return copies[bias] = h;
+}
+inline void ltGemm(const void* X, const void* Wt, void* Y, bool yHalf, size_t rows, int in, int out, const float* biasF,
+                   bool relu, float beta, int ldx = 0, int ldy = 0, bool bf16 = false) {
   if (ldx == 0) ldx = in;
   if (ldy == 0) ldy = out;
   if (!LT) CB(cublasLtCreate(&LT));
-  const void* bias = biasFor(biasF, out, yHalf);
+  const void* bias = bf16 ? biasForBf16(biasF, out) : biasFor(biasF, out, yHalf);
   if (getenv("AF2_LT_SHAPES") && beta != 0.f && biasF) {
     static std::map<std::tuple<size_t, int, int>, int> seen;
     if (seen[std::make_tuple(rows, in, out)]++ == 0) fprintf(stderr, "beta+bias GEMM %zu x %d x %d\n", rows, in, out);
   }
-  static std::map<std::tuple<size_t, int, int, bool, int, bool, int, int>, LtPlan> plans;
+  static std::map<std::tuple<size_t, int, int, bool, int, bool, int, int, bool>, LtPlan> plans;
   int epi = bias ? (relu ? 2 : 1) : (relu ? 3 : 0);
-  auto key = std::make_tuple(rows, in, out, yHalf, epi, beta != 0.f, ldx, ldy);
+  auto key = std::make_tuple(rows, in, out, yHalf, epi, beta != 0.f, ldx, ldy, bf16);
   auto it = plans.find(key);
   if (it == plans.end()) {
     LtPlan p{};
@@ -52,9 +66,10 @@ inline void ltGemm(const half* X, const half* Wt, void* Y, bool yHalf, size_t ro
     // (the bias takes the output's type: this cuBLASLt refuses an f32 bias beside an f16 output, so an
     // f16 copy of it is handed over below)
     // col-major: C^T (out x rows) = W^T (out x in) X^T (in x rows)
-    CB(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16F, out, in, out));
-    CB(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16F, in, (uint64_t)rows, ldx));
-    CB(cublasLtMatrixLayoutCreate(&p.c, yHalf ? CUDA_R_16F : CUDA_R_32F, out, (uint64_t)rows, ldy));
+    const cudaDataType ab = bf16 ? CUDA_R_16BF : CUDA_R_16F;
+    CB(cublasLtMatrixLayoutCreate(&p.a, ab, out, in, out));
+    CB(cublasLtMatrixLayoutCreate(&p.b, ab, in, (uint64_t)rows, ldx));
+    CB(cublasLtMatrixLayoutCreate(&p.c, bf16 ? CUDA_R_16BF : yHalf ? CUDA_R_16F : CUDA_R_32F, out, (uint64_t)rows, ldy));
     cublasLtMatmulPreference_t pref; CB(cublasLtMatmulPreferenceCreate(&pref));
     size_t ws = 0;
     CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
@@ -189,7 +204,7 @@ inline void layerNormH(const float* x, half* y, size_t rows, int C, const std::s
 // memory and held as A fragments, W (tileColumns' 16-column tiles) streamed through two stages; columns [0, split) to
 // out0 (rows of split), the rest to out1 (rows of N - split) - the outer product mean's left and right projections in
 // one pass over the MSA
-template <int C, int WARPS, int MT>
+template <int C, int WARPS, int MT, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ x, size_t rows, const float* __restrict__ lnS,
     const float* __restrict__ lnO, const half* __restrict__ Wt, const float* __restrict__ bias, int N, int split,
     half* __restrict__ out0, half* __restrict__ out1) {
@@ -201,8 +216,8 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
   auto Ws = [&](int st) { return (half*)(smem + st * STAGE); };
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t row0 = (size_t)blockIdx.x * R;
-  lnRowsToShared<C, R, WARPS, float>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
-                                     lnS, lnO, Xs, LDX, warp, lane);
+  lnRowsToShared<C, R, WARPS, PT>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
+                                  lnS, lnO, Xs, LDX, warp, lane);
   __syncthreads();
   uint32_t xa[MT][KS][4];
 #pragma unroll
@@ -253,14 +268,14 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
     __syncthreads();                                 // (the stage this read is the next issue's)
   }
 }
-template <int C>
+template <int C, class PT = float>
 inline void lnGemm(const float* x, size_t rows, const float* lnS, const float* lnO, const half* Wt, const float* bias, int N,
                    int split, half* out0, half* out1) {
   constexpr int WARPS = 4, MT = 2, R = 16 * WARPS * MT;
   constexpr size_t smem = (size_t)R * (C + 8) * 2;
   static bool attr = false;
-  if (!attr) { smemAttr((lnGemmK<C, WARPS, MT>), (int)smem); attr = true; }
-  lnGemmK<C, WARPS, MT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1);
+  if (!attr) { smemAttr((lnGemmK<C, WARPS, MT, PT>), (int)smem); attr = true; }
+  lnGemmK<C, WARPS, MT, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1);
 }
 // out [rows] of a [Bt, n, ...] attention -> y[...] += out transposed back ([n, Bt] -> [Bt, n])
 __global__ void swapAddK(float* y, const float* x, int A, int B, int C) {     // y[b][a] += x[a][b]
@@ -389,6 +404,36 @@ __global__ void onesColumnK(half* x, size_t rows, int K) {     // x [rows, K+8]:
   x[(t / 8) * (K + 8) + K + t % 8] = __float2half(t % 8 == 0 ? 1.f : 0.f);
 }
 // a [rows, K+8] f16 buffer whose last 8 columns are (1, 0, ...), kept per (name, size)
+// a half weight's bf16 copy (MSA16), made once
+__global__ void halfToBf16K(const half* in, __nv_bfloat16* out, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16(__half2float(in[i]));
+}
+inline const __nv_bfloat16* bf16Of(const half* w, size_t n) {
+  static std::map<const half*, __nv_bfloat16*> copies;
+  auto it = copies.find(w);
+  if (it != copies.end()) return it->second;
+  __nv_bfloat16* b = wpool<__nv_bfloat16>(n);
+  halfToBf16K<<<blocks(n), 256, 0, STREAM>>>(w, b, n);
+  return copies[w] = b;
+}
+__global__ void onesColumnBf16K(__nv_bfloat16* x, size_t rows, int K) {     // as onesColumnK, in bf16
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * 8) return;
+  size_t r = t / 8; int c = (int)(t % 8);
+  x[r * (K + 8) + K + c] = __float2bfloat16(c == 0 ? 1.f : 0.f);
+}
+inline __nv_bfloat16* augmentedInputBf16(const std::string& name, size_t rows, int K) {
+  static std::map<std::string, std::pair<__nv_bfloat16*, size_t>> bufs;
+  auto& [p, have] = bufs[name];
+  if (have < rows) {
+    if (p) CK(cudaFree(p));
+    p = dallocT<__nv_bfloat16>(rows * (K + 8));
+    onesColumnBf16K<<<blocks(rows * 8), 256, 0, STREAM>>>(p, rows, K);
+    have = rows;
+  }
+  return p;
+}
 inline half* augmentedInput(const std::string& name, size_t rows, int K) {
   static std::map<std::string, std::pair<half*, size_t>> bufs;
   auto& [p, have] = bufs[name];

@@ -67,20 +67,24 @@ __global__ void centerNormHK(const float* prod, half* out, size_t pairs, int C, 
   }
 }
 
-template <int C>
-__global__ void layerNormVK(const float* __restrict__ x, half* __restrict__ y, size_t rows, const float* __restrict__ scale,
+// TI, TO: the rows' and the output's types (a bf16 MSA in, a bf16 transition input out: cuda/af2's MSA16)
+template <int C, class TI = float, class TO = half>
+__global__ void layerNormVK(const TI* __restrict__ x, TO* __restrict__ y, size_t rows, const float* __restrict__ scale,
                             const float* __restrict__ offset) {
   constexpr int VEC = C >= 128 ? 4 : C / 32, STEPS = C / (32 * VEC);
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (row >= rows) return;
-  const float* xr = x + row * C;
+  const TI* xr = x + row * C;
   float v[STEPS][VEC];
   float s = 0;
 #pragma unroll
   for (int k = 0; k < STEPS; ++k) {
     int c = (k * 32 + lane) * VEC;
-    if constexpr (VEC == 4) { float4 q = *reinterpret_cast<const float4*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w; }
+    if constexpr (!std::is_same_v<TI, float>) {          // (a bf16 row: VEC elements, 2 VEC bytes)
+#pragma unroll
+      for (int u = 0; u < VEC; u += 2) { float2 q = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(xr + c + u)); v[k][u] = q.x; v[k][u + 1] = q.y; }
+    } else if constexpr (VEC == 4) { float4 q = *reinterpret_cast<const float4*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; v[k][2] = q.z; v[k][3] = q.w; }
     else { float2 q = *reinterpret_cast<const float2*>(xr + c); v[k][0] = q.x; v[k][1] = q.y; }
 #pragma unroll
     for (int u = 0; u < VEC; ++u) s += v[k][u];
@@ -98,9 +102,11 @@ __global__ void layerNormVK(const float* __restrict__ x, half* __restrict__ y, s
     int c = (k * 32 + lane) * VEC;
 #pragma unroll
     for (int u = 0; u < VEC; u += 2)
-      *reinterpret_cast<half2*>(y + row * C + c + u) =
-          __floats2half2_rn((v[k][u] - mean) * inv * scale[c + u] + offset[c + u],
-                            (v[k][u + 1] - mean) * inv * scale[c + u + 1] + offset[c + u + 1]);
+    {
+      float a = (v[k][u] - mean) * inv * scale[c + u] + offset[c + u], b = (v[k][u + 1] - mean) * inv * scale[c + u + 1] + offset[c + u + 1];
+      if constexpr (std::is_same_v<TO, half>) *reinterpret_cast<half2*>(y + row * C + c + u) = __floats2half2_rn(a, b);
+      else *reinterpret_cast<__nv_bfloat162*>(y + row * C + c + u) = __floats2bfloat162_rn(a, b);
+    }
   }
 }
 // the outer product mean's permute and residual (cuda/af2 and cuda/af3 each had both)

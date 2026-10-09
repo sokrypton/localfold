@@ -618,9 +618,10 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
 // NB: no bias at all (AF2's MSA column attention): the scores start at zero and no bias tile is loaded
 // ONE: one stage, the next tile held in registers across the tile's compute and stored between two barriers -
 // a T4's form (no cp.async; two stages are 39 KB, one block of 4 warps an SM there, one is three)
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
+// OT: the output's type - f16, or bf16 (cuda/af2's bf16 MSA, whose output projection then reads bf16)
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half>
 __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
-    int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
+    int biasStride, OT* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride, int sw) {
   // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is
   // (n * 4W, 4W, n * W, W); AF2's attention ACROSS a tensor's leading axis passes its own
@@ -896,10 +897,14 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
       float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
       // staged in the warp's own slice of the (now idle) stage memory, written below as whole rows
       half* Ys = (half*)smem + (size_t)(threadIdx.x >> 5) * (16 * MT) * (D + 8);
-      *reinterpret_cast<half2*>(Ys + (mt * 16 + g) * (D + 8) + e) =
-          __floats2half2_rn(o[mt][et][0] / l0 * sigm(a.x), o[mt][et][1] / l0 * sigm(a.y));
-      *reinterpret_cast<half2*>(Ys + (mt * 16 + g + 8) * (D + 8) + e) =
-          __floats2half2_rn(o[mt][et][2] / l1 * sigm(b2.x), o[mt][et][3] / l1 * sigm(b2.y));
+      auto cv = [](float x, float y) {
+        if constexpr (std::is_same_v<OT, half>) return __floats2half2_rn(x, y); else return __floats2bfloat162_rn(x, y);
+      };
+      using OT2 = decltype(cv(0.f, 0.f));
+      *reinterpret_cast<OT2*>(Ys + (mt * 16 + g) * (D + 8) + e) =
+          cv(o[mt][et][0] / l0 * sigm(a.x), o[mt][et][1] / l0 * sigm(a.y));
+      *reinterpret_cast<OT2*>(Ys + (mt * 16 + g + 8) * (D + 8) + e) =
+          cv(o[mt][et][2] / l1 * sigm(b2.x), o[mt][et][3] / l1 * sigm(b2.y));
     }
   }
   // the warp's 16 MT rows of this head, 2 D bytes each, as 16-byte stores (D / 8 lanes a row) rather than
@@ -937,8 +942,8 @@ inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_F
 // 6,000 tokens and 12% behind at 1,000: past the L2 (66% busy in Nsight Compute) the kernel is latency-bound at 168
 // registers a thread, three blocks an SM; key tiles of 32, 64 or 80 are 2-5% behind 48 at 6,000 too)
 inline int GRID_SWIZZLE = getenv("LOCALFOLD_GRID_SWIZZLE") ? atoi(getenv("LOCALFOLD_GRID_SWIZZLE")) : -1;
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
-void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half>
+void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int n, int heads, size_t rows, float scale,
                     const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
                     size_t outPosStride = 0) {
   constexpr int BQ = 16 * MT * WARPS;
@@ -948,9 +953,9 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, i
   // tiles a warp overflowed it, an illegal access)
   const int bytes = std::max((ONE ? 1 : 2) * (int)fa2Stage<D, WARPS, BK, MT, RR>(), WARPS * RR * 16 * MT * (D + 8) * 2);
   static bool attr = false;
-  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE>), bytes); attr = true; }
+  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
-  flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
+  flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
                                                                               rowStride, posStride, outRowStride, outPosStride, GRID_SWIZZLE >= 0 ? GRID_SWIZZLE : n >= 3500 ? 4 : 0);
 }
 inline int flash2R1Tile() {

@@ -351,6 +351,19 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     }
     if (check) checkOracle("extra stack pair", t.pair, pairs * 128, "o/extra/pair");
     mark("extra stack"); memReport("extra stack");
+    // the main stack's MSA in bf16 through its blocks (MSA16, evoformer.cuh)
+    {
+      static const int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+      std::string q = "evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w";
+      std::string qc = "evoformer/evoformer_iteration/msa_column_attention/attention/query_w";
+      MSA16 = FAST && !check && t.msaOnes && major >= 8 && !flashRegStaged() && !getenv("LOCALFOLD_MSA_F32") &&
+              dimW(q, 2) * dimW(q, 3) == 256 && dimW(q, 3) == 32 && dimW(qc, 3) == 32;
+      if (MSA16) {
+        size_t n16 = (size_t)(t.N + t.T) * L * 256;
+        t.msa16 = reinterpret_cast<float*>(scratch<__nv_bfloat16>("msa16", n16));
+        toBf16FK<<<blocks(n16), 256, 0, STREAM>>>(t.msa, reinterpret_cast<__nv_bfloat16*>(t.msa16), n16);
+      }
+    }
     for (int b = 0; b < mainBlocks; ++b) {
       if (b == 1) mark("evoformer 0");
       if (b == 2) mark("evoformer 1");
@@ -359,6 +372,11 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
         checkOracle("evoformer block 0 msa", t.msa, (size_t)t.N * L * 256, "o/evo1/msa");
         checkOracle("evoformer block 0 pair", t.pair, pairs * 128, "o/evo1/pair");
       }
+    }
+    if (MSA16) {
+      size_t n16 = (size_t)(t.N + t.T) * L * 256;
+      pairBf16ToF32K<<<blocks(n16), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.msa16), t.msa, n16);
+      MSA16 = false; t.msa16 = nullptr;
     }
     // a bf16 pair converted once into the recycled pair, which every reader after the stacks takes
     if (AF2_P16) pairBf16ToF32K<<<blocks(pairs * 128), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), prevPair, pairs * 128);
