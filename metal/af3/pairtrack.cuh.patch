@@ -36,15 +36,16 @@
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
 @@@ new
-// (Metal) a transition's first weight [in][2I] with a's and b's columns interleaved - a_0 b_0 a_1 b_1 ... - for
-// lf::gemmSwiglu, whose epilogue reads a lane's adjacent pair. Derived on the device once per weight and registered with
+// (Metal) a transition's first weight [in][2I] with a's and b's columns interleaved in blocks of 8 - a_0..a_7 b_0..b_7 ... - for
+// lf::gemmSwiglu, whose epilogue pairs two 8 x 8 matrices. Derived on the device once per weight and registered with
 // FORGET_HOOKS: a weight derived during a warm-up that ran while the bundle was still uploading is rebuilt after it.
 __global__ void interleaveHalvesK(const half* w, half* out, int rows, int I) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)rows * 2 * I) return;
-  size_t r = t / (2 * I); int c = (int)(t % (2 * I));
-  int k = c / 2;
-  out[t] = w[r * 2 * I + ((c & 1) ? I + k : k)];
+  unsigned r = (unsigned)(t / (2u * I)), c = (unsigned)(t - (size_t)r * 2u * I);
+  // (in blocks of 8: columns 16m..16m+7 are a_8m.., 16m+8..16m+15 their b - the GEMM's SwiGLU pairs two 8 x 8 matrices)
+  unsigned m = c / 16, q = c % 16;
+  out[t] = w[(size_t)r * 2 * I + (q < 8 ? 8 * m + q : I + 8 * m + q - 8)];
 }
 // (and the triangle's [projection | gate] weight [C][4C], halves interleaved by channel, reordered so channel c's pa pb
 // ga gb are columns 4c..4c+3 - for lf::gemmTriGate)

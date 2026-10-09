@@ -186,7 +186,9 @@ an f32 512 x 4624 x 128**, interleaved - the scalar stores were a third of a K-1
 (bias, residual, the gated add) load C and aux as matrices and do their arithmetic in place, which measured level with
 the scalar path: their loads, not their stores, are what costs. AF3 at 255 tokens 31.1 -> 28.6 s. A bias
 and a ReLU are applied to the accumulators in place before that store (no load): AF2's biased q/k/v/gate projection
-3245 -> 2477 ms, its GPU 16.38 -> 15.15 s. `LOCALFOLD_GEMM_SCALAR_STORE=1` is the control.
+3245 -> 2477 ms, its GPU 16.38 -> 15.15 s. And SwiGLU's weight is interleaved in blocks of 8 (a_0..a_7 b_0..b_7 ...) rather than
+column by column, so two of a simdgroup's 8 x 8 accumulators hold an a and its b at the same lane and element and the
+result is a matrix to store: AF3's 1024 x 68121 x 128 1943 -> 1838 ms, ESMFold2's ~1%. `LOCALFOLD_GEMM_SCALAR_STORE=1` is the control.
 
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):

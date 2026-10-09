@@ -808,6 +808,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // too few threadgroups for the device: narrower columns
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
   while (tc > 16 && groups(tc) < 64) tc /= 2;
+  if ((a.epilogue & 128) && tc < 32) tc = 32;     // (SwiGLU's blocks of 8 pair two 8-column matrices a simdgroup)
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);   // (an arm: one tile everywhere)
   int bm = tc, bn = tr;
   auto esize = [](cudaDataType t) { return t == CUDA_R_32F ? 4 : 2; };
@@ -854,8 +855,9 @@ void lf::gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair
   if (bias) { a.bias = (uint64_t)bias; a.epilogue |= 4; }
   gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, a, 1);
 }
-// gated[r][k] = silu(a) b, (a, b) = (X W)[r][2k, 2k+1]: W's columns interleaved a_0 b_0 a_1 b_1 ... (metal/af3/patch)
+// gated[r][k] = silu(a) b: W's columns interleaved in blocks of 8 - a_0..a_7 b_0..b_7 a_8.. (metal/af3/pairtrack.cuh.patch)
 void lf::gemmSwiglu(const void* X, const void* Wpairs, void* gated, size_t rows, int in, int hidden) {
+  if (hidden % 8) { fprintf(stderr, "gemmSwiglu: a hidden width of %d is not a multiple of 8\n", hidden); exit(1); }
   GemmArgs a{(uint64_t)Wpairs, (uint64_t)X, (uint64_t)gated, (uint64_t)gated, 0, 0, 0, 0, 0, 2 * hidden, (int)rows, in,
              2 * hidden, in, hidden, hidden, 0, 0, 0, 128, 0, 1.f, 0.f};
   gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, a, 1);

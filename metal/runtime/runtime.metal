@@ -231,6 +231,26 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   // them on 512 x 68121 x 128). Not SwiGLU (its output is half as wide) nor a bf16 output; EP bit 16 turns it off
   // (LOCALFOLD_GEMM_SCALAR_STORE=1, the control).
   if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
+    if ((g.epilogue & 128) && j0 + TR <= g.n && i0 + TC_ <= g.m) {     // SwiGLU (blocks of 8): an 8 x 8 output a pair
+      if constexpr (FC % 2 == 0) {
+        _Pragma("clang loop unroll(full)")
+        for (int a = 0; a < FR; ++a)
+          _Pragma("clang loop unroll(full)")
+          for (int b = 0; b < FC; b += 2) {
+            thread auto& ea = acc[a][b].thread_elements();
+            thread auto& eb = acc[a][b + 1].thread_elements();
+            simdgroup_matrix<TC, 8, 8> om;
+            thread auto& o = om.thread_elements();
+            _Pragma("clang loop unroll(full)")
+            for (int t = 0; t < 2; ++t) {
+              float va = g.alpha * (float)ea[t], vb = g.alpha * (float)eb[t];
+              o[t] = (TC)(va / (1.f + exp(-va)) * vb);
+            }
+            simdgroup_store(om, D + (ulong)(j0 + sr + a * 8) * g.ldd + (i0 + sc + b * 8) / 2, (ulong)g.ldd);
+          }
+        return;
+      }
+    }
     if (!(g.epilogue & 128) && j0 + TR <= g.n && i0 + TC_ <= g.m) {
       if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) {   // (the accumulator is the output's type)
         if ((g.epilogue & ~6) == 0 && g.alpha == 1.f && g.beta == 0.f) {   // a plain product (a bias, a ReLU): the
@@ -301,11 +321,19 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       thread auto& e = acc[a][b].thread_elements();
       int j = j0 + sr + a * 8 + sm;
       if (j >= g.n) continue;
-      if (g.epilogue & 128) {      // SwiGLU over adjacent pairs: columns (2k, 2k+1) are (a_k, b_k), D gets silu(a) b at k
-        int i = i0 + sc + b * 8 + sn;
-        if (i + 1 < g.m) {
-          float va = g.alpha * e[0], vb = g.alpha * e[1];
-          lf_st(D, (ulong)(i / 2) + (ulong)j * g.ldd, va / (1.f + exp(-va)) * vb);
+      if (g.epilogue & 128) {      // SwiGLU in blocks of 8: columns 16m..16m+7 are a_8m.., 16m+8..16m+15 their b - so matrix
+        if constexpr (FC % 2 == 0) {   // b (even) and b + 1 hold an a and its b at the same lane and element; D gets silu(a) b
+          if ((b & 1) == 0) {
+            thread auto& eb = acc[a][b | 1].thread_elements();
+            _Pragma("clang loop unroll(full)")
+            for (int t = 0; t < 2; ++t) {
+              int i = i0 + sc + b * 8 + sn + t;
+              if (i + 8 < g.m) {
+                float va = g.alpha * (float)e[t], vb = g.alpha * (float)eb[t];
+                lf_st(D, (ulong)((i >> 4) * 8 + (i & 7)) + (ulong)j * g.ldd, va / (1.f + exp(-va)) * vb);
+              }
+            }
+          }
         }
         continue;
       }

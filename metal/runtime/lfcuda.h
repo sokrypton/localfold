@@ -316,7 +316,8 @@ void launch(int kernel, std::initializer_list<std::string> targs, KArgs& args);
 // W [in][out] as cuBLAS's ports hand it). For host patches (metal/<owner>/patch) that fuse a gate's pass away.
 void gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair, size_t rows, int in, int out,
                   const float* bias = nullptr);   // (bias: the gate's, f32)
-// gated[r][k] = silu(a) * b where (a, b) = (X W)[r][2k, 2k+1]: W [in][2 hidden] with a's and b's columns interleaved (half)
+// gated[r][k] = silu(a) * b: W [in][2 hidden] with a's and b's columns interleaved in blocks of 8 - a_0..a_7 b_0..b_7
+// a_8..a_15 b_8..b_15 ... (half; hidden a multiple of 8)
 void gemmSwiglu(const void* X, const void* Wpairs, void* gated, size_t rows, int in, int hidden);
 // the triangle's projection and gate: a[c][q], b[c][q] = proj * mask * sigmoid(gate) at the padded position q of each row,
 // W [C][4C] with channel c's (pa, pb, ga, gb) at columns 4c..4c+3

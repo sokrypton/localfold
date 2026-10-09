@@ -8,8 +8,10 @@ inline void transitionFast(float* pair, size_t P, int C, const std::string& Tn) 
 __global__ void interleaveHalvesEfK(const half* w, half* out, int rows, int I) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)rows * 2 * I) return;
-  unsigned r = (unsigned)(t / (2u * I)), c = (unsigned)(t - (size_t)r * 2u * I), k = c / 2;
-  out[t] = w[(size_t)r * 2 * I + ((c & 1) ? I + k : k)];
+  unsigned r = (unsigned)(t / (2u * I)), c = (unsigned)(t - (size_t)r * 2u * I);
+  // (in blocks of 8: columns 16m..16m+7 are a_8m.., 16m+8..16m+15 their b - the GEMM's SwiGLU pairs two 8 x 8 matrices)
+  unsigned m = c / 16, q = c % 16;
+  out[t] = w[(size_t)r * 2 * I + (q < 8 ? 8 * m + q : I + 8 * m + q - 8)];
 }
 // (a derived weight, forgotten with the others after a warm-up that ran while the weights were still arriving)
 inline const half* swigluPairsEf(const std::string& name, int rows, int I) {
