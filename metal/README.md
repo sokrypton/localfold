@@ -104,6 +104,9 @@ What won, natively:
 
 What was tried and **lost**, so nobody repeats it blind:
 
+- **The flash attention reading K and V straight from the device** (`simdgroup_load` from device memory, no staging and
+  no barrier, the last tile staged): both arms fell to about half - 0.72 / 0.67 against 1.33 TFLOP/s at 261 tokens - the
+  second path cost the kernel its registers. It is register-bound, as its comment says.
 - **A 72-row GEMM tile** (simdgroups 1 x 4) so 68 tokens pad to 72, not 80: 0.181 against 0.189 ms on 3072 x 768, level
   on the conditioning, worse on 768 columns (no 16-column tile) - about 2% of a step, not worth a second layout.
 
