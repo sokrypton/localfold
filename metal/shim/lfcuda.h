@@ -312,6 +312,9 @@ struct KArgs {
   void finish() { bytes.resize((bytes.size() + align - 1) / align * align); }
 };
 void launch(int kernel, std::initializer_list<std::string> targs, KArgs& args);
+// the runtime's own GEMM with a gated residual in its epilogue: pair[r][o] += aux[r][o] * sigmoid(X W) (X, W, aux half;
+// W [in][out] as cuBLAS's ports hand it). For host patches (metal/<owner>/patch) that fuse a gate's pass away.
+void gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair, size_t rows, int in, int out);
 // a template argument as the Metal source spells it
 template <class T> std::string tname();
 template <> inline std::string tname<float>() { return "float"; }

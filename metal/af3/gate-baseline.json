@@ -42,8 +42,8 @@
  "af3-kitchen-sink": {
   "ligand": 0.045,
   "nucleic": 0.056,
-  "plddt": 74.3,
-  "ptm": "0.7316",
+  "plddt": 75.44,
+  "ptm": "0.7537",
   "rmsd": null
  },
  "boltz2-6mrr": {

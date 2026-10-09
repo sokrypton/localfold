@@ -1,0 +1,15 @@
+# The unfused triangle multiplication's tail (the path Metal takes): the gate's GEMM adds its gated product into the pair
+# in its epilogue (lf::gemmGatedAdd), where the CUDA port writes the gate and adds it in gatedAddK - a pass and a tensor
+# fewer. Blocks are exact text: when cuda/ changes them the build stops and names the block.
+@@@ old
+    linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
+    WITH_PAIR_T(gatedAddK<T, PT><<<blocks(rows * C), 256, 0, STREAM>>>(pairRow(into(pair), r0, C), t1, t2, rows * C));
+@@@ new
+    static const bool fuseGate = !getenv("LOCALFOLD_UNFUSED_GATE");   // (the control arm: the CUDA port's two passes)
+    if constexpr (std::is_same_v<T, half>) if (!PAIR16 && fuseGate) {
+      lf::gemmGatedAdd(norm + r0 * C, Wh(pre + ".gatingLinear"), t1, into(pair) + r0 * C, rows, C, C);
+      continue;
+    }
+    linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
+    WITH_PAIR_T(gatedAddK<T, PT><<<blocks(rows * C), 256, 0, STREAM>>>(pairRow(into(pair), r0, C), t1, t2, rows * C));
+@@@ end

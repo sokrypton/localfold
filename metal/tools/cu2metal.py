@@ -728,6 +728,15 @@ class Port:
                     last = im.end()
                 src = (src[:last] + "// ---- injected: metal/" + owner + "/inject/" + os.path.relpath(path, CUDA) + "\n" +
                        open(inject).read() + "\n// ---- end of injection\n" + src[last:])
+            patch = os.path.join(REPO, "metal", owner, "patch", os.path.relpath(path, CUDA) + ".patch")
+            if os.path.exists(patch):              # (exact old -> new blocks; a block that no longer matches stops the build)
+                text = open(patch).read()
+                for blk in re.finditer(r"^@@@ old\n(.*?)^@@@ new\n(.*?)^@@@ end\n", text, re.M | re.S):
+                    old, new = blk.group(1), blk.group(2)
+                    if src.count(old) != 1:
+                        raise SystemExit(f"metal/{owner}/patch/{os.path.relpath(path, CUDA)}.patch: a block matches "
+                                         f"{src.count(old)} times in {path}, not once - the CUDA source moved:\n{old}")
+                    src = src.replace(old, new, 1)
             m = mask(src)
             items = items_of(m, 0, len(m))
             self.parsed[path] = (src, m, [(it, classify(it, m)) for it in items])

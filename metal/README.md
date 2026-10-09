@@ -57,6 +57,13 @@ tiles resident to hide their loads. Interleaved on an M2: 0.73-0.85x the time on
 projections, 0.83-0.89x on the pair track's GEMMs, 0.84x on a 4096-cube in f16, and in f32 (AF2's) 0.62-0.95x. Bit
 for bit the same answer: the k order of the accumulation does not change. `LOCALFOLD_GEMM_BK=16|32` is the arm.
 
+And: **the triangle's gated residual in the gate GEMM's epilogue** (`lf::gemmGatedAdd`, applied by
+`metal/af3/patch/af3/src/pairtrack.cuh.patch`): `gatedAddK`'s pass and the gate tensor gone, 19.99 -> 19.74 s of GPU at
+255 tokens; `LOCALFOLD_UNFUSED_GATE=1` is the control. The gate is now f32 where the port rounded it to f16, and
+**`af3-kitchen-sink` moved 74.30 -> 75.44** - that case is bimodal under any rounding change (a two-pass LayerNorm took it
+to 75.37), so its baseline was re-recorded; every other case read its digits. A **patch** is an exact old -> new block
+applied to a CUDA source at translation; a block that no longer matches stops the build and names itself.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/check/bench-gemm`, the runtime's GEMM
 alone - `metal/check/build-bench-gemm.sh` builds it):
 

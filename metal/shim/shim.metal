@@ -66,6 +66,7 @@ struct GemmArgs {
   int m, n, k, lda, ldb, ldc, ldd;
   int ta, tb, ptrs, epilogue, biasType;
   float alpha, beta;
+  ulong aux; int ldaux, auxPad;      // epilogue 64: D += aux * sigmoid(alpha X W) (aux half, D float)
 };
 // Tiles: BM x BN of C a threadgroup (four simdgroups, 2 x 2), BK of k a step. A and B are staged in threadgroup
 // memory in the type the multiply takes (half for f16 inputs, float otherwise - bf16's range is float's), along
@@ -193,6 +194,11 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         int i = i0 + sc + b * 8 + sn + t;
         if (i >= g.m) continue;
         float v = g.alpha * e[t];
+        if (g.epilogue & 64) {      // a gated residual: the GEMM is the gate, aux the gated values, D the residual
+          v = (float)((device const half*)g.aux)[(ulong)i + (ulong)j * g.ldaux] * (1.f / (1.f + exp(-v)));
+          lf_st(D, (ulong)i + (ulong)j * g.ldd, lf_ldf(C + (ulong)i + (ulong)j * g.ldc) + v);
+          continue;
+        }
         if (g.beta != 0.f) v += g.beta * lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
         if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[i] : ((device const float*)g.bias)[i];
         if (g.epilogue & 2) v = max(v, 0.f);

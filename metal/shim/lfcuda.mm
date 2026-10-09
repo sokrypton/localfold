@@ -759,6 +759,7 @@ struct GemmArgs {
   int32_t m, n, k, lda, ldb, ldc, ldd;
   int32_t ta, tb, ptrs, epilogue, biasType;
   float alpha, beta;
+  uint64_t aux = 0; int32_t ldaux = 0, auxPad = 0;
 };
 double hostElement(cudaDataType t, const void* base, size_t i) {
   if (t == CUDA_R_32F) return ((const float*)base)[i];
@@ -772,7 +773,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   std::lock_guard<std::recursive_mutex> l(r.mu);
   // LOCALFOLD_CHECK_GEMM=<calls>: the first calls recomputed on the host (sampled entries, double) and compared
   static int checks = getenv("LOCALFOLD_CHECK_GEMM") ? atoi(getenv("LOCALFOLD_CHECK_GEMM")) : 0;
-  bool check = checks > 0 && !r.capturingHere() && (!a.ptrs || a.beta == 0.f);
+  bool check = checks > 0 && !r.capturingHere() && (!a.ptrs || a.beta == 0.f) && !(a.epilogue & 64);
   std::vector<unsigned char> cBefore;
   if (check) {
     --checks;
@@ -827,6 +828,16 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   char label[96]; snprintf(label, sizeof label, "gemm %s %dx%dx%d%s", name.c_str() + 8, a.m, a.n, a.k, batch > 1 ? " batched" : "");
   r.dispatch(r.shimInstance(name, decl), &a, sizeof a, grid, MTLSizeMake(128, 1, 1), 0, (r.profiling || r.capturingHere()) ? std::string(label) : "");
 }
+}  // namespace
+// pair[r][o] += aux[r][o] * sigmoid(sum_k X[r][k] W[k][o]): a gate's GEMM adding its gated product into an f32 residual in
+// its own epilogue, where cuBLAS's ports write the gate and add it in a pass of their own (metal/af3/patch)
+void lf::gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair, size_t rows, int in, int out) {
+  GemmArgs a{(uint64_t)W, (uint64_t)X, (uint64_t)pair, (uint64_t)pair, 0, 0, 0, 0, 0, out, (int)rows, in, out, in, out, out,
+             0, 0, 0, 64, 0, 1.f, 0.f};
+  a.aux = (uint64_t)aux; a.ldaux = out;
+  gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, a, 1);
+}
+namespace {
 float scalar(const void* p, cublasComputeType_t compute) {
   if (compute == CUBLAS_COMPUTE_16F) return (float)*(const __half*)p;
   return *(const float*)p;
