@@ -2,9 +2,9 @@
 ligand and an atomised modified residue, DNA and modified bases, AF3's kitchen sink, a glycan, 5CAJ and
 barnase-barstar with their crystals as templates - folded by metal/af3/localfold-af3 and scored the same way.
 
-    python3 metal/check/gate-af3.py                   # against metal/af3/gate-baseline.json (this Mac's)
-    python3 metal/check/gate-af3.py --write           # re-record it
-    python3 metal/check/gate-af3.py --only=boltz2,af3-6mrr
+    python3 metal/af3/gate.py                   # against metal/af3/gate-baseline.json (this Mac's)
+    python3 metal/af3/gate.py --write           # re-record it
+    python3 metal/af3/gate.py --only=boltz2,af3-6mrr
 
 Each case is held to this Mac's own baseline (0.05 A, 0.5 pLDDT, as the CUDA gate holds its) and REPORTED beside the
 A100's (cuda/af3/gate-baseline.json): a fold does not reproduce to the digit on another GPU, so the A100's numbers

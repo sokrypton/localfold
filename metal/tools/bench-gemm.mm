@@ -1,6 +1,6 @@
-// The runtime's GEMM (metal/shim/shim.metal) on its own: the shapes a fold runs, timed, and checked against the
+// The runtime's GEMM (metal/runtime/runtime.metal) on its own: the shapes a fold runs, timed, and checked against the
 // host. A development tool for tuning the tiles.
-//   metal/check/bench-gemm [m,n,k,ta,tb ...]
+//   metal/tools/bench-gemm [m,n,k,ta,tb ...]
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <chrono>
@@ -9,8 +9,8 @@
 #include <random>
 #include <string>
 #include <vector>
-#include "../shim/lfcuda.h"
-namespace lf { extern const char* SHIM_SOURCE; void profileStart(); void profileStop(int); }
+#include "../runtime/lfcuda.h"
+namespace lf { extern const char* RUNTIME_SOURCE; void profileStart(); void profileStop(int); }
 int main(int argc, char** argv) { @autoreleasepool {
   struct Case { int m, n, k, ta, tb; };
   std::vector<Case> cases = {{3072, 80, 768, 0, 0}, {768, 80, 1536, 0, 0}, {73728, 68, 392, 0, 0}, {768, 80, 768, 0, 0},

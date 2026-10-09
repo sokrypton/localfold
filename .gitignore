@@ -147,7 +147,6 @@ python/*.egg-info/
 /ccd/
 
 # the Metal port (metal/build.sh): the kernel sources embedded as a string, and the binaries
-metal/kernels.inc
-metal/check/check-kernels
 metal/build/
 metal/*/localfold-*
+metal/**/*.combined

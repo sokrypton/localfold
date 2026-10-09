@@ -1,3 +1,5 @@
+# Metal kernels and helpers added to cuda/af3/src/fusedtriangle.cuh (CUDA syntax, translated with it), after its includes
+@@@ insert
 // out[h][row] = (LN(x[row]) W)[h] - fusedtriangle.cuh's lnHeadsK (tensor cores, 49 KB of shared memory) as one
 // simdgroup a row: LN as lnRowsToShared computes it (eps 1e-5, rounded to half as it stages it), then the N dot
 // products of the row with W's columns, each a simdgroup sum.
@@ -24,3 +26,5 @@ __global__ void lnHeadsMetal(const float* x, const float* lnScale, const float* 
     if (lane == 0) out[(size_t)h * rows + row] = a;
   }
 }
+
+@@@ end

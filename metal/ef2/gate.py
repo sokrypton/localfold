@@ -2,7 +2,7 @@
 command and baseline pointed at metal/ef2 (metal/ef2/fold runs metal/ef2/localfold-ef2 --fast; the weights are the
 checkout's bundles). The oracle arm needs biohub's forward and is not run here. The A100's baseline is printed beside.
 
-    python3 metal/check/gate-ef2.py [--write] [--only=6mrr,...]
+    python3 metal/ef2/gate.py [--write] [--only=6mrr,...]
 """
 import json
 import os

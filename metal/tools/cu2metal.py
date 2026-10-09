@@ -4,12 +4,12 @@
     python3 metal/tools/cu2metal.py --root=cuda/af3/src/af3.cu --out=metal/build/af3
 
 The CUDA sources stay the one source of truth for every model's conventions; this turns them into
-  - HOST code (<out>/gen/<path under cuda/>): the same files, compiled as Objective-C++ against metal/shim's
+  - HOST code (<out>/gen/<path under cuda/>): the same files, compiled as Objective-C++ against metal/runtime's
     cuda_runtime.h / cublas_v2.h / cuda_fp16.h, with every __global__ kernel replaced by a host stub that packs
     its arguments and dispatches its Metal twin, every `k<<<grid, block, smem, stream>>>(args)` rewritten to
     `(lf::setLaunch(grid, block, smem, stream), k(args))`, and every device-only function removed;
   - DEVICE code (<out>/kernels.metal): every kernel and device function as Metal Shading Language, through
-    metal/shim/prelude.metal's CUDA vocabulary (threadIdx, __syncthreads, __shfl_xor_sync, atomicAdd, half,
+    metal/runtime/prelude.metal's CUDA vocabulary (threadIdx, __syncthreads, __shfl_xor_sync, atomicAdd, half,
     bfloat16...). Every kernel becomes a TEMPLATE (a dummy parameter where CUDA had none), so nothing compiles
     until a launch asks for it: the runtime appends one explicit instantiation per specialisation used.
   - a kernel table (<out>/gen/lf_kernels.inc): the stubs' index into it, each kernel's Metal name and struct.
@@ -705,37 +705,38 @@ class Port:
         self.walk(self.root, set())
         self.parsed = {}
         self.port = os.path.basename(os.path.dirname(os.path.dirname(self.root)))
-        # overrides belong to the port that OWNS the CUDA file they patch (cuda/<owner>/...): cuda/af2 includes cuda/af3's
-        # headers, and metal/af3's overrides of those apply to it too
+        # A port's changes to the CUDA sources sit flat in metal/<owner>/, named by what they change:
+        #   <function>.host.h    a host function replaced
+        #   <kernel>.kernel.cu   a kernel's body replaced (below, where kernels are emitted)
+        #   <file>.patch         exact old -> new blocks, and `insert` blocks placed after the file's includes
+        #   <file>               the whole file replaced
+        # They belong to the port that OWNS the CUDA file (cuda/<owner>/...): cuda/af2 includes cuda/af3's headers, and
+        # metal/af3's changes to those apply to it too.
         self.host_overrides = {}       # (owner, function name) -> text
         for owner in sorted(os.listdir(os.path.join(REPO, "metal"))):
-            hdir = os.path.join(REPO, "metal", owner, "host")
-            if os.path.isdir(hdir):
-                for f in sorted(os.listdir(hdir)):
-                    if f.endswith(".h"):
-                        self.host_overrides[(owner, f[:-2])] = open(os.path.join(hdir, f)).read()
+            odir = os.path.join(REPO, "metal", owner)
+            if os.path.isdir(odir):
+                for f in sorted(os.listdir(odir)):
+                    if f.endswith(".host.h"):
+                        self.host_overrides[(owner, f[:-len(".host.h")])] = open(os.path.join(odir, f)).read()
         for path in self.files:
             src = open(path).read()
-            replacement = os.path.join(REPO, "metal", "replace", os.path.relpath(path, CUDA))
-            if os.path.exists(replacement):        # (a hand-written Metal version of the whole file)
-                src = open(replacement).read()
             owner = os.path.relpath(path, CUDA).split(os.sep)[0]
-            inject = os.path.join(REPO, "metal", owner, "inject", os.path.relpath(path, CUDA))
-            if os.path.exists(inject):             # (Metal kernels and helpers added to the file, CUDA syntax)
-                # after the file's own includes, before anything that may call them
-                last = 0
-                for im in re.finditer(r"^\s*#\s*include\b[^\n]*\n", src, re.M):
-                    last = im.end()
-                src = (src[:last] + "// ---- injected: metal/" + owner + "/inject/" + os.path.relpath(path, CUDA) + "\n" +
-                       open(inject).read() + "\n// ---- end of injection\n" + src[last:])
-            patch = os.path.join(REPO, "metal", owner, "patch", os.path.relpath(path, CUDA) + ".patch")
-            if os.path.exists(patch):              # (exact old -> new blocks; a block that no longer matches stops the build)
-                text = open(patch).read()
-                for blk in re.finditer(r"^@@@ old\n(.*?)^@@@ new\n(.*?)^@@@ end\n", text, re.M | re.S):
-                    old, new = blk.group(1), blk.group(2)
-                    if src.count(old) != 1:
-                        raise SystemExit(f"metal/{owner}/patch/{os.path.relpath(path, CUDA)}.patch: a block matches "
-                                         f"{src.count(old)} times in {path}, not once - the CUDA source moved:\n{old}")
+            here = os.path.join("metal", owner, os.path.basename(path))
+            if os.path.exists(os.path.join(REPO, here)):     # (a hand-written Metal version of the whole file)
+                src = open(os.path.join(REPO, here)).read()
+            if os.path.exists(os.path.join(REPO, here + ".patch")):
+                text = open(os.path.join(REPO, here + ".patch")).read()
+                for blk in re.finditer(r"^@@@ (old|insert)\n(.*?)^(?:@@@ new\n(.*?))?^@@@ end\n", text, re.M | re.S):
+                    if blk.group(1) == "insert":       # after the file's own includes, before anything that may call it
+                        last = 0
+                        for im in re.finditer(r"^\s*#\s*include\b[^\n]*\n", src, re.M):
+                            last = im.end()
+                        src = src[:last] + f"// ---- inserted by {here}.patch\n" + blk.group(2) + "// ---- end\n" + src[last:]
+                        continue
+                    old, new = blk.group(2), blk.group(3) or ""
+                    if src.count(old) != 1:            # (the CUDA source moved: stop, and say which block)
+                        raise SystemExit(f"{here}.patch: a block matches {src.count(old)} times in {path}, not once:\n{old}")
                     src = src.replace(old, new, 1)
             m = mask(src)
             items = items_of(m, 0, len(m))
@@ -809,10 +810,10 @@ class Port:
         index = len(self.kernels)
         msl = name
         struct = f"{name}__a{index}"
-        # a hand-written body (metal/<port>/kernels/<name>.cu, CUDA syntax, translated as the original is) replaces
+        # a hand-written body (metal/<port>/<name>.kernel.cu, CUDA syntax, translated as the original is) replaces
         # the CUDA one; the signature and the argument struct stay the translator's
         owner = os.path.relpath(path, CUDA).split(os.sep)[0]
-        ofile = os.path.join(REPO, "metal", owner, "kernels", name + ".cu")
+        ofile = os.path.join(REPO, "metal", owner, name + ".kernel.cu")
         override = os.path.exists(ofile)
         obody = None
         if override:

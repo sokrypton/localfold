@@ -37,7 +37,7 @@ extern const KernelInfo PORT_KERNELS[];
 extern const int PORT_KERNEL_COUNT;
 extern const char* PORT_SOURCE;
 extern const char* PORT_NAME;
-extern const char* SHIM_SOURCE;
+extern const char* RUNTIME_SOURCE;
 }
 
 namespace {
@@ -61,7 +61,7 @@ struct Runtime {
   std::recursive_mutex mu;
   id<MTLDevice> dev;
   id<MTLCommandQueue> queue;
-  id<MTLLibrary> shimLib;
+  id<MTLLibrary> runtimeLib;
   std::map<uint64_t, Alloc> allocs;
   size_t allocated = 0, peak = 0;
   id<MTLCommandBuffer> cb = nil;
@@ -81,7 +81,7 @@ struct Runtime {
   std::mutex gpuErrorMu; std::string gpuError;   // the first command buffer to fail (commit's completion handler)
   std::vector<Op>* capture = nullptr;
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
-  std::map<std::string, id<MTLComputePipelineState>> shimPipelines;
+  std::map<std::string, id<MTLComputePipelineState>> runtimePipelines;
   std::set<std::string> knownSpecs;
   std::string specsPath;
   bool specsLoaded = false;
@@ -103,7 +103,7 @@ struct Runtime {
       if (![dev supportsFamily:MTLGPUFamilyMetal3] || ![dev supportsFamily:MTLGPUFamilyApple7])
         die(std::string("this GPU (") + dev.name.UTF8String + ") is not an Apple-silicon GPU with Metal 3; LocalFold needs an M1 or later");
       queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
-      shimLib = compile(lf::SHIM_SOURCE, "the runtime's kernels");
+      runtimeLib = compile(lf::RUNTIME_SOURCE, "the runtime's kernels");
     }
   }
 
@@ -226,25 +226,25 @@ struct Runtime {
 
   // a runtime kernel that is a template (the GEMM): its explicit instantiation compiled with the runtime's source on
   // first use, as the port's kernels are
-  id<MTLComputePipelineState> shimInstance(const std::string& host, const std::string& decl) {
-    auto it = shimPipelines.find(host);
-    if (it != shimPipelines.end()) return it->second;
+  id<MTLComputePipelineState> runtimeInstance(const std::string& host, const std::string& decl) {
+    auto it = runtimePipelines.find(host);
+    if (it != runtimePipelines.end()) return it->second;
     auto t0 = std::chrono::steady_clock::now();
-    id<MTLLibrary> lib = compile(std::string(lf::SHIM_SOURCE) + "\n" + decl + "\n", host);
+    id<MTLLibrary> lib = compile(std::string(lf::RUNTIME_SOURCE) + "\n" + decl + "\n", host);
     stats.compileMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     id<MTLComputePipelineState> p = pipelineOf(lib, host);
-    shimPipelines[host] = p;
+    runtimePipelines[host] = p;
     return p;
   }
-  id<MTLComputePipelineState> shimPipeline(const std::string& name) {
-    auto it = shimPipelines.find(name);
-    if (it != shimPipelines.end()) return it->second;
-    id<MTLFunction> f = [shimLib newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
+  id<MTLComputePipelineState> runtimePipeline(const std::string& name) {
+    auto it = runtimePipelines.find(name);
+    if (it != runtimePipelines.end()) return it->second;
+    id<MTLFunction> f = [runtimeLib newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
     if (!f) die("no runtime kernel " + name);
     NSError* e = nil;
     id<MTLComputePipelineState> p = [dev newComputePipelineStateWithFunction:f error:&e];
     if (!p) die("runtime kernel " + name + ": " + e.localizedDescription.UTF8String);
-    shimPipelines[name] = p;
+    runtimePipelines[name] = p;
     return p;
   }
   void dispatch(id<MTLComputePipelineState> pso, const void* args, size_t argBytes, MTLSize grid, MTLSize block,
@@ -293,7 +293,7 @@ struct Runtime {
     if (capturingHere()) {
       Op op{}; op.kind = 1; op.dst = dst; op.src = src; op.bytes = bytes; capture->push_back(op); return;
     }
-    dispatch(shimPipeline("lf_copy"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
+    dispatch(runtimePipeline("lf_copy"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
   }
   void fill(uint64_t dst, int value, size_t bytes) {
     ++stats.fills;
@@ -304,7 +304,7 @@ struct Runtime {
     if (capturingHere()) {
       Op op{}; op.kind = 2; op.dst = dst; op.bytes = bytes; op.value = value; capture->push_back(op); return;
     }
-    dispatch(shimPipeline("lf_fill"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
+    dispatch(runtimePipeline("lf_fill"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
   }
 
   // ---- the port's kernels
@@ -554,7 +554,7 @@ static void copy2d(void* dst, size_t dpitch, const void* src, size_t spitch, siz
   struct { uint64_t dst, src, dpitch, spitch, width, height; uint32_t value, fill; } a =
     {(uint64_t)dst, (uint64_t)src, dpitch, spitch, width, height, (uint32_t)value, fill ? 1u : 0u};
   MTLSize grid = MTLSizeMake((width + 255) / 256, std::min<size_t>(height, 65535), (height + 65534) / 65535);
-  r.dispatch(r.shimPipeline("lf_copy2d"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
+  r.dispatch(r.runtimePipeline("lf_copy2d"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
 }
 cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height,
                               cudaMemcpyKind kind, cudaStream_t s) {
@@ -813,7 +813,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   if (vec) a.biasType |= 256;
   if (getenv("LF_GEMM_DEBUG")) fprintf(stderr, "gemm %dx%dx%d ta %d tb %d tile %dx%d vec %d batch %d\n", a.m, a.n, a.k, a.ta, a.tb, tr, tc, (int)vec, batch);
   auto mtype = [](cudaDataType t) { return t == CUDA_R_32F ? "float" : t == CUDA_R_16F ? "half" : "lf_bf16s"; };
-  // the k step: 16 for a whole 64 x 64 tile, 32 otherwise. Measured interleaved (AB=1 metal/check/bench-gemm) on an M2:
+  // the k step: 16 for a whole 64 x 64 tile, 32 otherwise. Measured interleaved (AB=1 metal/tools/bench-gemm) on an M2:
   // 16 is 0.73-0.85x the time on the triangle's tall K-128 projections (512 x 68121 x 128), 0.83-0.89x on the pair
   // track's 2048 x 4624 x 256 and 256 x 4624 x 1024, 0.84x on a 4096-cube - half the threadgroup memory, more tiles
   // resident to hide the loads - and 1.09x on a 64 x 32 tile, 1.08-1.21x on the 16-column ones
@@ -826,7 +826,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
   MTLSize grid = MTLSizeMake((a.m + bm - 1) / bm, (a.n + bn - 1) / bn, batch);
   char label[96]; snprintf(label, sizeof label, "gemm %s %dx%dx%d%s", name.c_str() + 8, a.m, a.n, a.k, batch > 1 ? " batched" : "");
-  r.dispatch(r.shimInstance(name, decl), &a, sizeof a, grid, MTLSizeMake(128, 1, 1), 0, (r.profiling || r.capturingHere()) ? std::string(label) : "");
+  r.dispatch(r.runtimeInstance(name, decl), &a, sizeof a, grid, MTLSizeMake(128, 1, 1), 0, (r.profiling || r.capturingHere()) ? std::string(label) : "");
 }
 }  // namespace
 // pair[r][o] += aux[r][o] * sigmoid(sum_k X[r][k] W[k][o]): a gate's GEMM adding its gated product into an f32 residual in
@@ -932,7 +932,7 @@ cublasStatus_t cublasSscal(cublasHandle_t, int n, const float* alpha, float* x, 
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
   struct { uint64_t x; int32_t n, inc; float alpha; } a = {(uint64_t)x, n, incx, *alpha};
-  r.dispatch(r.shimPipeline("lf_scal"), &a, sizeof a, MTLSizeMake((n + 255) / 256, 1, 1), MTLSizeMake(256, 1, 1), 0);
+  r.dispatch(r.runtimePipeline("lf_scal"), &a, sizeof a, MTLSizeMake((n + 255) / 256, 1, 1), MTLSizeMake(256, 1, 1), 0);
   return CUBLAS_STATUS_SUCCESS;
 }
 

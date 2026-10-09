@@ -1,4 +1,4 @@
-#include "../shim/lfcuda.h"
+#include "../runtime/lfcuda.h"
 namespace lf {
 extern const KernelInfo PORT_KERNELS[] = {{"none", "none", 0, 2}};
 extern const int PORT_KERNEL_COUNT = 1;

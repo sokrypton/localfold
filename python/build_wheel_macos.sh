@@ -27,7 +27,7 @@ for port in af3 af2 ef2; do
 done
 # each port's list of the kernel specialisations its folds use, where this machine's folds have recorded one for these
 # very kernels (~/.cache/localfold/metal, named by the kernels' hash): shipped, a user's first fold compiles them all up
-# front and in parallel instead of one at a time as each is first reached (run metal/check/gate-*.py first to fill it)
+# front and in parallel instead of one at a time as each is first reached (run metal/<port>/gate.py first to fill it)
 mkdir -p "$bin/metal-specs"; rm -f "$bin"/metal-specs/*.specs
 for port in af3 af2 ef2; do
   name="$(LOCALFOLD_METAL_SPECS_NAME=1 "$bin/localfold-$port")"

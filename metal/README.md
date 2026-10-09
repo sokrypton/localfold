@@ -24,9 +24,9 @@ The CUDA gates' own cases, scored against crystals, with this Mac's baseline in 
 and the A100's printed beside each case:
 
 ```
-python3 metal/check/gate-af3.py [--write] [--only=<case>]     # 14 cases: seven models, ligand, modified residue, DNA,
-python3 metal/check/gate-af2.py [--write]                      #   kitchen sink, glycan, templates; AF2 5; ESMFold2 8
-python3 metal/check/gate-ef2.py [--write]
+python3 metal/af3/gate.py [--write] [--only=<case>]     # 14 cases: seven models, ligand, modified residue, DNA,
+python3 metal/af2/gate.py [--write]                      #   kitchen sink, glycan, templates; AF2 5; ESMFold2 8
+python3 metal/ef2/gate.py [--write]
 ```
 
 | on an M2 (macOS 13.2) | Metal | A100 (cuda/) |
@@ -58,14 +58,14 @@ projections, 0.83-0.89x on the pair track's GEMMs, 0.84x on a 4096-cube in f16, 
 for bit the same answer: the k order of the accumulation does not change. `LOCALFOLD_GEMM_BK=16|32` is the arm.
 
 And: **the triangle's gated residual in the gate GEMM's epilogue** (`lf::gemmGatedAdd`, applied by
-`metal/af3/patch/af3/src/pairtrack.cuh.patch`): `gatedAddK`'s pass and the gate tensor gone, 19.99 -> 19.74 s of GPU at
+`metal/af3/pairtrack.cuh.patch`): `gatedAddK`'s pass and the gate tensor gone, 19.99 -> 19.74 s of GPU at
 255 tokens; `LOCALFOLD_UNFUSED_GATE=1` is the control. The gate is now f32 where the port rounded it to f16, and
 **`af3-kitchen-sink` moved 74.30 -> 75.44** - that case is bimodal under any rounding change (a two-pass LayerNorm took it
 to 75.37), so its baseline was re-recorded; every other case read its digits. A **patch** is an exact old -> new block
 applied to a CUDA source at translation; a block that no longer matches stops the build and names itself.
 
-What was tried for speed and **lost**, so nobody repeats it blind (all `metal/check/bench-gemm`, the runtime's GEMM
-alone - `metal/check/build-bench-gemm.sh` builds it):
+What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
+alone - `metal/tools/build-bench-gemm.sh` builds it):
 
 - **MPS (`MPSMatrixMultiplication`) in place of `lf_gemm`.** Standalone it looked 1.8x on 3072 x 272 x 768; through the
   runtime, timed the same way as ours, it was 1.18 against 1.25 TFLOP/s and its error 5e-4 against 2e-4. On the
@@ -83,24 +83,40 @@ alone - `metal/check/build-bench-gemm.sh` builds it):
 
 `metal/tools/cu2metal.py` reads a port's `cuda/<port>/src` and writes `metal/build/<port>`:
 
-- **Host code** (`.cu`/`.cuh`) compiled as Objective-C++ against `metal/shim/include`: each `__global__` becomes a stub
+- **Host code** (`.cu`/`.cuh`) compiled as Objective-C++ against `metal/runtime/include`: each `__global__` becomes a stub
   that packs its arguments and calls `lf::launch`; `<<<g, b, smem, s>>>` becomes `(lf::setLaunch(...), k(args))`.
-- **Device code** into one Metal source with `metal/shim/prelude.metal` (CUDA's builtins, atomics, shuffles, half and
+- **Device code** into one Metal source with `metal/runtime/prelude.metal` (CUDA's builtins, atomics, shuffles, half and
   bf16, `lf_f64` for a double the host reads). Every kernel becomes a template instantiated lazily by name.
-- `metal/shim/lfcuda.mm` is the CUDA runtime and cuBLAS on Metal: `cudaMalloc` returns a buffer's GPU address, one
+- `metal/runtime/lfcuda.mm` is the CUDA runtime and cuBLAS on Metal: `cudaMalloc` returns a buffer's GPU address, one
   queue with a serial compute encoder, graph capture as a recorded op list, events, and `lf_gemm`
-  (`metal/shim/shim.metal`) on the 8x8 simdgroup matrices.
+  (`metal/runtime/runtime.metal`) on the 8x8 simdgroup matrices.
 
-Where a kernel cannot translate as it is (inline PTX, more than Apple's 32 KB of threadgroup memory) the port names a
-replacement, and nothing in `cuda/` changes:
+## Layout
 
-| | replaces |
+`metal/` sits beside `webgpu/` and `cuda/` and is laid out like them:
+
+```
+metal/
+  build.sh            builds metal/<port>/localfold-<port>
+  runtime/            the CUDA runtime and cuBLAS on Metal (lfcuda.mm), the CUDA vocabulary in Metal (prelude.metal),
+                      the runtime's own kernels and GEMM (runtime.metal), the CUDA headers the host code includes
+  tools/              cu2metal.py (the translator), msl-check, the GEMM bench
+  af3/ af2/ ef2/      one per port, flat, like cuda/<port>/: fold, gate.py, gate-baseline.json, defaults.env,
+                      and the port's changes to its CUDA sources
+```
+
+A port's changes are named by what they change, and nothing in `cuda/` is edited:
+
+| in `metal/<port>/` | what it does |
 |---|---|
-| `metal/<port>/kernels/<name>.cu` | a kernel's body (e.g. af3's `atomAttentionMMA`, ef2's `swaWindowK` at 96 keys) |
-| `metal/<port>/host/<name>.h` | a host function (af3's flash dispatchers onto `flashGridMetal`) |
-| `metal/<port>/inject/<path>` | inserted after a file's includes (af3's `flashGridMetal`, `lnHeadsMetal`) |
-| `metal/replace/<path>` | a whole file (af3's CUPTI profiler) |
-| `metal/<port>/defaults.env` | environment defaults: the CUDA port's own switches to its unfused paths |
+| `<file>.patch` | exact `old` -> `new` blocks applied to `cuda/<port>/src/<file>`, and `insert` blocks placed after its includes (af3's `flashGridMetal` and `lnHeadsMetal` kernels, the fused gate and SwiGLU in `pairtrack.cuh`). A block that no longer matches stops the build and names itself |
+| `<kernel>.kernel.cu` | a kernel's body (af3's `atomAttentionMMA`, ef2's `swaWindowK` at 96 keys) - where it cannot translate, or needs more than Apple's 32 KB of threadgroup memory |
+| `<function>.host.h` | a host function (af3's flash dispatchers onto `flashGridMetal`) |
+| `<file>` | a whole file (af3's `profile.cuh`, the CUPTI profiler) |
+| `defaults.env` | environment defaults: the CUDA port's own switches to its unfused paths |
+
+A change belongs to the port that owns the CUDA file: cuda/af2 and cuda/ef2 include cuda/af3's headers, and metal/af3's
+changes to those apply to them too.
 
 ## Traps, each paid for
 
@@ -128,7 +144,7 @@ against 0.865, ~3% of runs, only under load or on a slow first run - and every r
 buffers, NaN-poisoned threadgroup memory, shader validation, barrier audits) said, correctly, that no kernel was at
 fault. Found with stage checksums and then per-tensor weight sums: 71 of 1183 tensors differed, a shard's worth. Fixed:
 0 of 90 under the same two-process stress where 1 in ~35 failed before. **A CUDA API's thread semantics are part of
-what the shim must emulate, not only its arithmetic.**
+what the runtime must emulate, not only its arithmetic.**
 
 🔴 **`MTLCreateSystemDefaultDevice()` RETURNS nil TO A COMMAND-LINE PROCESS**, saying so only on stderr - sometimes.
 `MTLCopyAllDevices()` does not. Under the sandbox there is no device at all.
@@ -139,7 +155,7 @@ uses more registers): no error, the output untouched.
 ## The prototype (before the translation)
 
 Two hand-written kernels against WebGPU on an M2 at 256 tokens, which is what started this: `grid.attend` 4.3 ms
-against 12.2, `pair-transition` 9.8 against 19.2 (`metal/kernels/`, `metal/check/check-kernels`). Leaving WebGPU is
+against 12.2, `pair-transition` 9.8 against 19.2 (removed once the translation folded; commit 278adfde has them). Leaving WebGPU is
 1.2-1.7x of it; the 8x8 matrix units, with the softmax in registers, the rest.
 
 ## Next

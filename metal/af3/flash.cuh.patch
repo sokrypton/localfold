@@ -1,3 +1,5 @@
+# Metal kernels and helpers added to cuda/af3/src/flash.cuh (CUDA syntax, translated with it), after its includes
+@@@ insert
 // The grid attention on Apple's 8x8 simdgroup matrices - every form cuda/af3/src/flash.cuh's tensor-core kernels
 // take (flashGridHalf, flashGrid2R, flashSplitHalf: dense or strided rows, a key mask or none, a pair bias or none),
 // in one kernel, which metal/af3/host/flash*.h route them to.
@@ -194,3 +196,5 @@ inline void flashGridMetalAny(int D, const half* qkvg, const half* bias, int bia
     default: fprintf(stderr, "flashGridMetal: no kernel for head width %d\n", D); exit(1);
   }
 }
+
+@@@ end

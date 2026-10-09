@@ -2,7 +2,7 @@
 its baseline pointed at metal/af2 (metal/af2/fold runs metal/af2/localfold-af2; metal/af2/gate-baseline.json is this
 Mac's). The A100's baseline (cuda/af2/gate-baseline.json) is printed beside it for reference.
 
-    python3 metal/check/gate-af2.py [--write] [--only=6mrr,...]
+    python3 metal/af2/gate.py [--write] [--only=6mrr,...]
 """
 import json
 import os
