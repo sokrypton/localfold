@@ -111,6 +111,18 @@ void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr);
 
+// ---------------------------------------------------------------- gated flash attention
+// out = softmax(q k^T scale + bias + mask) v * sigmoid(g), per batch row and head; D 8, 16, 32, 48 or 64. Dense
+// layouts by default ([rows][n][4W] in, [rows][n][W] out); strides for an attention ACROSS a tensor's leading axis
+struct Attention {
+  const half* qkvg; half* out; int n, heads, D; size_t rows; float scale;
+  int64_t rowStride = 0, posStride = 0, outRowStride = 0, outPosStride = 0;     // (0: the dense layout's)
+  const half* bias = nullptr; int biasStride = 0;                               // [H][n][biasStride], log2 units
+  const float* mask = nullptr; int64_t r0 = 0; bool maskTransposed = false;
+  const float* qBias = nullptr;
+};
+void attention(const Attention& a);
+
 // ---------------------------------------------------------------- common kernels (metal/core/common.metal)
 void layerNorm(const float* x, float* y, size_t rows, int C, const float* scale, const float* offset, float eps = 1e-5f,
                int ldx = 0, int ldy = 0);

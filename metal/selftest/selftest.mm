@@ -144,6 +144,56 @@ int main() {
     report("triangle gate b", relRms(refB, std::vector<float>(b.begin(), b.end())), 5e-3);
   }
 
+  printf("attention\n");
+  for (auto cfg : std::vector<std::tuple<int, int, int, int, bool, bool, bool>>{
+         {3, 37, 4, 32, true, false, false}, {2, 70, 8, 8, false, true, false}, {2, 130, 2, 16, true, true, false},
+         {3, 37, 4, 32, true, true, true}, {1, 261, 16, 48, true, false, false}, {2, 64, 4, 64, false, false, false}}) {
+    int B = std::get<0>(cfg), n = std::get<1>(cfg), H = std::get<2>(cfg), D = std::get<3>(cfg);
+    bool withBias = std::get<4>(cfg), withMask = std::get<5>(cfg), strided = std::get<6>(cfg);
+    int W = H * D;
+    // qkvg [B][n][4W] dense, or strided: [n][B][4W] (an attention across the leading axis)
+    auto qkvg = randv((size_t)B * n * 4 * W, 0.7f);
+    auto bias = randv((size_t)H * n * n, 2.f);
+    std::vector<float> mask((size_t)B * n, 1.f);
+    if (withMask) for (size_t i = 0; i < mask.size(); ++i) mask[i] = (i * 7 + 3) % 5 ? 1.f : 0.f;
+    std::vector<float> qb = randv(W, 0.3f);
+    float scale = 1.f / sqrtf((float)D);
+    auto at = [&](int b, int p, int role, int c) -> float {
+      size_t row = strided ? (size_t)p * B + b : (size_t)b * n + p;
+      return (float)(half)qkvg[row * 4 * W + role * W + c];
+    };
+    std::vector<double> ref((size_t)B * n * W);
+    for (int b = 0; b < B; ++b) for (int h = 0; h < H; ++h) for (int q = 0; q < n; ++q) {
+      std::vector<double> sc(n); double mx = -1e300;
+      for (int k = 0; k < n; ++k) {
+        double dot = 0;
+        for (int d = 0; d < D; ++d) dot += ((double)at(b, q, 0, h * D + d) + qb[h * D + d]) * at(b, k, 1, h * D + d);
+        double v = dot * scale + (withBias ? (double)(float)(half)(bias[((size_t)h * n + q) * n + k] * 1.4426950408889634f) / 1.4426950408889634 : 0.0);
+        if (withMask && mask[(size_t)b * n + k] == 0.f) v -= 1e9 / 1.4426950408889634;
+        sc[k] = v; mx = std::max(mx, v);
+      }
+      double sum = 0; for (auto& v : sc) { v = exp(v - mx); sum += v; }
+      for (int d = 0; d < D; ++d) {
+        double o = 0; for (int k = 0; k < n; ++k) o += sc[k] * at(b, k, 2, h * D + d);
+        size_t row = strided ? (size_t)q * B + b : (size_t)b * n + q;
+        ref[row * W + h * D + d] = o / sum / (1 + exp(-(double)at(b, q, 3, h * D + d)));
+      }
+    }
+    std::vector<half> bh((size_t)H * n * n);
+    for (size_t i = 0; i < bh.size(); ++i) bh[i] = (half)(bias[i] * 1.4426950408889634f);
+    half* dq = uploadNew(toH(qkvg).data(), qkvg.size()); half* db = uploadNew(bh.data(), bh.size());
+    float* dm = uploadNew(mask.data(), mask.size()); float* dqb = uploadNew(qb.data(), qb.size());
+    half* dout = allocT<half>((size_t)B * n * W);
+    Attention A{}; A.qkvg = dq; A.out = dout; A.n = n; A.heads = H; A.D = D; A.rows = B; A.scale = scale; A.qBias = dqb;
+    if (withBias) { A.bias = db; A.biasStride = n; }
+    if (withMask) A.mask = dm;
+    if (strided) { A.rowStride = 4 * W; A.posStride = (int64_t)B * 4 * W; A.outRowStride = W; A.outPosStride = (int64_t)B * W; }
+    attention(A);
+    auto h = download(dout, (size_t)B * n * W);
+    char l[96]; snprintf(l, sizeof l, "B %d n %d H %d D %d%s%s%s", B, n, H, D, withBias ? " bias" : "", withMask ? " mask" : "", strided ? " strided" : "");
+    report(l, relRms(ref, std::vector<float>(h.begin(), h.end())), 5e-3);
+  }
+
   printf("LayerNorm\n");
   for (int C : {256, 1152, 389, 128, 1536}) {
     size_t R = 77;

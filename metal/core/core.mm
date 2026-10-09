@@ -552,6 +552,24 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, ha
   gemmRun(F16, F16, F16, g, 1, false, false, "triangle gate");
 }
 
+// ---------------------------------------------------------------- attention
+void attention(const Attention& t) {
+  if (!t.rows || !t.n) return;
+  int W = t.heads * t.D;
+  AttnArgs a{};
+  a.qkvg = t.qkvg; a.out = t.out; a.bias = t.bias; a.mask = t.mask; a.qBias = t.qBias;
+  a.posStride = t.posStride ? t.posStride : 4 * W;
+  a.rowStride = t.rowStride ? t.rowStride : (int64_t)t.n * a.posStride;
+  a.outPosStride = t.outPosStride ? t.outPosStride : W;
+  a.outRowStride = t.outRowStride ? t.outRowStride : (int64_t)t.n * a.outPosStride;
+  a.r0 = t.r0; a.n = t.n; a.heads = t.heads; a.biasStride = t.biasStride; a.maskT = t.maskTransposed; a.scale = t.scale;
+  const char* k = t.D == 8 ? "lf_attention_8" : t.D == 16 ? "lf_attention_16" : t.D == 32 ? "lf_attention_32"
+                : t.D == 48 ? "lf_attention_48" : t.D == 64 ? "lf_attention_64" : nullptr;
+  if (!k) die("attention: no kernel for a head %d wide", t.D);
+  if (t.rows > 65535 * 64) die("attention: %zu rows", t.rows);
+  dispatch(k, &a, sizeof a, Grid{(uint32_t)((t.n + 63) / 64), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0, "attention");
+}
+
 // ---------------------------------------------------------------- common kernels
 static void layerNormRun(const float* x, const half* xh, float* y, half* yh, size_t rows, int C, const float* scale,
                          const float* offset, float eps, int ldx, int ldy) {

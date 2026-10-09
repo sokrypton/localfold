@@ -22,6 +22,14 @@ class Model {
   // float32 copy is made of it), float32 otherwise; the manifest's trunk / languageModel numbers as meta/<key>
   void loadBundle(const std::string& dir, const std::string& prefix,
                   const std::function<bool(const std::string&, size_t)>& asHalf = nullptr);
+  // a bundle through a WEIGHT WALK (cuda/featurise's af2_weights.h / af3_weights.h): the port's own tensors as `lines`
+  // describe them - `b` a slice of a bundle tensor, `z` zeros, `c` literal values, `p` gathered parts (a strided view,
+  // a product, integers, ones), `m` metadata - and with `deltaDir` the bundle read as a delta model's base (its
+  // `addTo` tensors the base rounded to float16 plus the delta, `whole` the delta's, `absent` gone)
+  void loadBundleWalk(const std::string& dir, const std::vector<std::string>& lines, const std::string& deltaDir = "",
+                      const std::function<bool(const std::string&, size_t)>& asHalf = nullptr);
+  // the tensors a bundle holds, by name and shape (a delta's absent ones gone): what a walk is worked out from
+  static std::map<std::string, std::vector<long long>> bundleShapes(const std::string& dir, const std::string& deltaDir = "");
   // an input directory; unloadInput() forgets it
   void loadInput(const std::string& dir);
   void unloadInput();
