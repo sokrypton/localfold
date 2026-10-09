@@ -22,7 +22,10 @@
 // every reader after the trunk takes bf16 rows - the distogram's contacts, the streamed diffusion preparation and the
 // confidence head - so the f32 pair is never made. Not for OpenDDE (its expander reads f32). foldFits sizes a
 // fold by it.
+// LOCALFOLD_WIDEN_PAIR=1: widened as before (the control arm: the structure must not move - tools/check-standalone.py)
 inline bool pairStays16(int n, int C, bool fast) {
+  static const bool widen = getenv("LOCALFOLD_WIDEN_PAIR") != nullptr;
+  if (widen) return false;
   size_t pairs = (size_t)n * n;
   Trunk probe{}; probe.n = n; probe.C = C;
   return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair(pairs, C) &&

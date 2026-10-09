@@ -198,6 +198,25 @@ def main():
             print(f"{'ok  ' if ok else 'FAIL'} slow upload, {label} 5CAJ: "
                   + ("byte-identical to a fast one" if ok else "differs from a fast one: " + arms[1][-120:].decode(errors="replace")))
 
+        # 🔴 THE BIG-INPUT PATH KEEPS THE PAIR bf16 PAST THE TRUNK (cuda/af3/README.md, "7,900 tokens on a 40 GB A100"):
+        # the distogram, the streamed diffusion preparation and the confidence head read bf16 rows there, and nothing
+        # else folds that path below thousands of tokens. LOCALFOLD_BIG=1 runs it at any size, and its structure is the
+        # same path's with the pair widened (LOCALFOLD_WIDEN_PAIR=1) to the byte - the diffusion reads exactly the values
+        # the widening made - so a defect in any of those readers shows as a coordinate, and the confidence head must
+        # still produce one. The three heads it took: AF3's, boltz2's re-embedding and rf3's global norm
+        for model in ("af3", "boltz2", "rosettafold3"):
+            coords = []
+            for widen in (True, False):
+                out = os.path.join(work, f"big-{model}-{int(widen)}.pdb")
+                env = dict(os.environ, LOCALFOLD_BIG="1", **({"LOCALFOLD_WIDEN_PAIR": "1"} if widen else {}))
+                r = run([binary("af3"), f"--model={model}", f"--sequence={S6}", "--seed=1", f"--out={out}"], env)
+                coords.append([l[30:54] for l in open(out) if l.startswith(("ATOM", "HETATM"))]
+                              if r.returncode == 0 and os.path.exists(out) else None)
+            ok = coords[0] is not None and coords[0] == coords[1]
+            failed += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} {model} on the big-input path, the pair bf16 past the trunk: "
+                  + ("the widened pair's coordinates" if ok else "differs from the widened pair's, or did not fold"))
+
         # 🔴 CHAI-1 PAST ~500 TOKENS DIED IN THE TRUNK'S GRAPH CAPTURE: its first pass takes a branch of its own, which
         # sized a scratch buffer for 128 MB chunks, and the recycle passes - the first of them captured as a graph - want
         # the whole pair where the card has the room, so the buffer grew inside the capture ("operation not permitted
