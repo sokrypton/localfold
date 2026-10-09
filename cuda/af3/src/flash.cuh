@@ -612,11 +612,14 @@ template <int D> __device__ __forceinline__ int fa2Kv(int r, int c) {
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ constexpr size_t fa2Stage() {
   return (size_t)RR * 2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
 }
+// (4 warps a block - every shipped form - asks the compiler for three blocks an SM, which it reached anyway at 168 registers:
+// its schedule moves, --bench-grid 1.20 -> 1.19 ms at 1,000 tokens, 4.60 -> 4.51 at 2,000, 40.1 -> 39.4 at 6,000, byte-
+// identical; four blocks spill, 4-8% slower)
 // NB: no bias at all (AF2's MSA column attention): the scores start at zero and no bias tile is loaded
 // ONE: one stage, the next tile held in registers across the tile's compute and stored between two barriers -
 // a T4's form (no cp.async; two stages are 39 KB, one block of 4 warps an SM there, one is three)
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
-__global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
+__global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride, int sw) {
   // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is
