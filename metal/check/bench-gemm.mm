@@ -39,8 +39,11 @@ int main(int argc, char** argv) { @autoreleasepool {
         want += (double)(float)(c.ta ? A[k + (size_t)i * lda] : A[i + (size_t)k * lda]) * (double)(float)(c.tb ? B[j + (size_t)k * ldb] : B[k + (size_t)j * ldb]);
       double got = (float)C[i + (size_t)j * c.m]; err += (got - want) * (got - want); nrm += want * want;
     }
-    int reps = std::max(3, (int)(2e9 / (2.0 * c.m * c.n * c.k)));
-    reps = std::min(reps, 200);
+    // (at least 100 calls, after 100 to warm the clocks: a GPU left idle runs its first calls at a fraction of speed)
+    int reps = std::max(100, (int)(2e9 / (2.0 * c.m * c.n * c.k)));
+    reps = std::min(reps, 400);
+    for (int r = 0; r < 100; ++r) run();
+    cudaDeviceSynchronize();
     if (getenv("GPU_TIME")) lf::profileStart();
     auto t0 = std::chrono::steady_clock::now();
     for (int r = 0; r < reps; ++r) run();
