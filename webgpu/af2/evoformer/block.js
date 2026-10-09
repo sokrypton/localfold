@@ -216,6 +216,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 export const GLOBAL_ATTENTION_FLASH_LANES = 64;
 export function createGlobalAttentionFlashShader(headDim) {
   if (!Number.isInteger(headDim) || headDim < 1) throw new RangeError(`global attention head width ${headDim}`);
+  // (every loop bound a LITERAL: a bound naming a constant is made opaque for a device's first fold
+  // (runtimeLoopBounds "tiered", pipeline-cache.js), and the opaque and unrolled kernels round differently - the
+  // first fold and the next disagreed, which fold-af2.js --repeat refuses)
   return `${GLOBAL_ATTENTION_COMMON}
 const LANES: u32 = ${GLOBAL_ATTENTION_FLASH_LANES}u;
 const HEAD_DIM: u32 = ${headDim}u;
@@ -235,7 +238,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
   let live = column < p.length && head < p.heads;
   var q: array<f32, HEAD_DIM>;
   var accumulated: array<f32, HEAD_DIM>;
-  for (var d = 0u; d < HEAD_DIM; d += 1u) {
+  for (var d = 0u; d < ${headDim}u; d += 1u) {
     q[d] = select(0.0, query[(column * p.heads + head) * HEAD_DIM + d], live);
     accumulated[d] = 0.0;
   }
@@ -244,13 +247,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
     for (var sequence = local; sequence < p.sequences; sequence += LANES) {
       let row = (column * p.sequences + sequence) * HEAD_DIM;
       var logit = 0.0;
-      for (var d = 0u; d < HEAD_DIM; d += 1u) { logit += q[d] * keys[row + d]; }
+      for (var d = 0u; d < ${headDim}u; d += 1u) { logit += q[d] * keys[row + d]; }
       if (mask[sequence * p.length + column] == 0.0) { logit = -1e9; }
       let next_maximum = max(maximum, logit);
       let previous_scale = exp(maximum - next_maximum);
       let weight = exp(logit - next_maximum);
       denominator = denominator * previous_scale + weight;
-      for (var d = 0u; d < HEAD_DIM; d += 1u) {
+      for (var d = 0u; d < ${headDim}u; d += 1u) {
         accumulated[d] = accumulated[d] * previous_scale + weight * values[row + d];
       }
       maximum = next_maximum;
@@ -258,13 +261,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
   }
   part_max[local] = maximum;
   part_den[local] = denominator;
-  for (var d = 0u; d < HEAD_DIM; d += 1u) { part_acc[local * HEAD_DIM + d] = accumulated[d]; }
+  for (var d = 0u; d < ${headDim}u; d += 1u) { part_acc[local * HEAD_DIM + d] = accumulated[d]; }
   workgroupBarrier();
   if (live && local < HEAD_DIM) {
     var top = -1e30;
-    for (var t = 0u; t < LANES; t += 1u) { top = max(top, part_max[t]); }
+    for (var t = 0u; t < ${GLOBAL_ATTENTION_FLASH_LANES}u; t += 1u) { top = max(top, part_max[t]); }
     var den = 0.0; var num = 0.0;
-    for (var t = 0u; t < LANES; t += 1u) {
+    for (var t = 0u; t < ${GLOBAL_ATTENTION_FLASH_LANES}u; t += 1u) {
       let w = exp(part_max[t] - top);
       den += part_den[t] * w;
       num += part_acc[t * HEAD_DIM + local] * w;
