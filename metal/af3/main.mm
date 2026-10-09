@@ -185,7 +185,7 @@ int foldInput(const std::string& dir, Options o) {
       }
     }
   }
-  releaseScratch({"tri.", "grid.", "tr.", "st."});
+  releaseScratch({"pr.", "grid.", "tr.", "st."});
   std::vector<float> contact = contactProbabilities(t);
   mt::sync();
   double trunkMs = ms(f0);

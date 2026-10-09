@@ -6,6 +6,11 @@
 #include <cmath>
 
 static int round8(int n) { return (n + 7) / 8 * 8; }
+// The pair track's working tensors are shared by name across its stages, which run one after another: a pair-sized half
+// buffer for each stage's normalised input (pr.x) and two for its intermediates (pr.h1, pr.h2), and one large buffer
+// that is the grid attention's q|k|v|g or the triangle's two planes and their product (pr.big). Held per stage they
+// were twice the room: 4.0 against 2.0 GB at 1044 tokens.
+static void* bigBuffer(size_t bytes) { return scratchBytes("pr.big", bytes); }
 
 half* biasLayout(const float* raw, const std::string& name, int n, int heads, int stride, bool swap) {
   half* bias = scratch<half>(name, (size_t)heads * n * stride);
@@ -26,16 +31,13 @@ const half* triGateWeight(const std::string& pre, int C) {
 void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into) {
   size_t P = (size_t)n * n;
   int np = round8(n); size_t plane = (size_t)np * np;
-  half* xn = scratch<half>("tri.xn", P * C);
+  half* xn = scratch<half>("pr.x", P * C);
   ln(pair, xn, P, C, pre + ".leftNormInputScale", pre + ".leftNormInputOffset");
-  half* a = scratch<half>("tri.a", plane * C); half* b = scratch<half>("tri.b", plane * C);
-  static half *zeroedA = nullptr, *zeroedB = nullptr; static size_t zeroedSize = 0;
-  if (np != n && (a != zeroedA || b != zeroedB || plane * C != zeroedSize)) {      // the padding is written by nothing
-    fill(a, 0, plane * C * 2); fill(b, 0, plane * C * 2);
-    zeroedA = a; zeroedB = b; zeroedSize = plane * C;
-  }
+  char* big = (char*)bigBuffer(plane * C * 8);         // a and b (half) and their product (float)
+  half* a = (half*)big; half* b = a + plane * C;
+  if (np != n) fill(a, 0, plane * C * 4);              // (the padding is written by nothing here, and pr.big is shared)
   gemmTriGate(xn, triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np);
-  float* prod = scratch<float>("tri.prod", plane * C);
+  float* prod = (float*)(big + plane * C * 4);
   {   // per channel: outgoing prod[i][j] = sum_k a[i][k] b[j][k]; incoming sum_k b[k][i] a[k][j]
     Gemm g{}; g.tx = F16; g.tw = F16; g.ty = F32; g.rows = np; g.in = np; g.out = np; g.ldx = g.ldw = g.ldy = np;
     g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.alpha = divide ? 1.f / n : 1.f;
@@ -44,9 +46,9 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
     else { g.X = b; g.transX = true; g.W = a; }
     gemm(g);
   }
-  half* cn = scratch<half>("tri.cn", P * C);
+  half* cn = scratch<half>("pr.h1", P * C);
   centerNorm(prod, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
-  half* outH = scratch<half>("tri.outh", P * C);
+  half* outH = scratch<half>("pr.h2", P * C);
   linH(cn, pre + ".outputProjection", outH, P, C, C);
   gemmGatedAdd(xn, Wh(pre + ".gatingLinear"), outH, into ? into : pair, P, C, C);
 }
@@ -58,15 +60,15 @@ void gridAttention(float* pair, const Masks& m, int n, int C, const std::string&
                    bool untransposed) {
   int heads = metaI(pre + ".heads"), D = metaI(pre + ".dimension"), Wd = heads * D;
   size_t P = (size_t)n * n;
-  half* xn = scratch<half>("grid.xn", P * C);
+  half* xn = scratch<half>("pr.x", P * C);
   ln(pair, xn, P, C, pre + ".actNormScale", pre + ".actNormOffset");
   float* raw = scratch<float>("grid.raw", P * heads);
   lin(xn, pre + ".pairBiasProjection", raw, P, C, heads);
   int stride = round8(n);
   half* bias = biasLayout(raw, "grid.bias", n, heads, stride, tr && swap);
-  half* qkvg = scratch<half>("grid.qkvg", P * 4 * Wd);
+  half* qkvg = (half*)bigBuffer(P * 4 * Wd * 2);
   linW(xn, qkvgWeight(pre, C, Wd, true), qkvg, P, C, 4 * Wd, qkvgBias(pre, Wd), "grid qkvg");
-  half* o = scratch<half>("grid.o", P * Wd);
+  half* o = scratch<half>("pr.h1", P * Wd);
   Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = D; at.rows = n; at.scale = 1.f / sqrtf((float)D);
   at.bias = bias; at.biasStride = stride;
   if (!m.ones) { at.mask = m.pair; at.maskB = tr ? 1 : n; at.maskK = tr ? n : 1; }
@@ -152,7 +154,7 @@ void singleTrack(float* single, const float* pair, const Masks& m, int n, int C,
   if (parallel) { s0 = scratch<float>("st.s0", (size_t)n * Cs); copy(s0, single, (size_t)n * Cs * 4); }
   int heads = metaI(A + ".heads"), d = metaI(A + ".dimension"), Wd = heads * d;
   size_t P = (size_t)n * n;
-  half* pln = scratch<half>("st.pln", P * C);
+  half* pln = scratch<half>("pr.x", P * C);
   ln(pair, pln, P, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
   float* raw = scratch<float>("st.raw", P * heads);
   lin(pln, B + ".singlePairLogitsProjection", raw, P, C, heads);
