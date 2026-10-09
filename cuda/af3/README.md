@@ -1346,8 +1346,38 @@ and the norm's live-row count, a single GPU thread looping over every pair, move
 `foldFits` sizes a fold on this path at **1.15x the f32 pair** (measured 1.16 at the edge, the trunk's bf16 pair and
 the blocked triangle's f16 operand being its floor), so it admits ~7,700 tokens on 40 GB and, by the same rule,
 **~10,900 on an 80 GB card and ~12,000 on Colab's 96 GB RTX PRO 6000** - not measured there. The trunk is the time:
-a pass is 9 minutes at 7,904 tokens, ~18 at 10,000 (the grid attention's flash kernel half of it, at ~40% of the
-tensor cores' peak with heads 32 wide: its exponentials cost as much as its matrix work).
+a pass was 9 minutes at 7,904 tokens (the grid attention's flash kernel half of it, at ~40% of the tensor cores' peak
+with heads 32 wide: its exponentials cost as much as its matrix work) - see the next section for what it is now.
+
+### 🔴 A big fold's speed: 1.9x at 7,657 tokens (2026-10-09)
+
+The same 7,657-token fold (31 chains of 1TIM, one pass, 100 steps, this 40 GB A100), against the commit before:
+
+| | before (e03ca8e) | now |
+|---|---:|---:|
+| trunk pass | 524.7 s | **325.9 s** |
+| diffusion, 100 steps | 136.5 s | **21.2 s** |
+| confidence | 36.8 s | **25.8 s** |
+| whole fold | 701 s | **376 s** |
+
+pLDDT 32.76 against 32.79, CA-CA median 3.682 both, the structures 0.549 A apart over 7,657 alpha carbons (a
+single-sequence complex at pLDDT 33). Every big-input path checked against the ordinary one at 5CAJ under
+`LOCALFOLD_BIG=1` (0.003-0.005 A) and at 2,964 tokens (0.111 A, CA-CA identical). What moved:
+
+- **the blocked triangle on the whole form's kernels** (`triangleBlockedFused`, `RectMap`): triIn256K over the whole
+  plane for b alone and over each block's rectangle for a and its gating rows, a bf16 contraction, triangleOutK over
+  the rectangle - where the blocks ran an LN, a GEMM and a transposing gate a chunk and five passes on the way out.
+- **the contraction past 1e10 multiply-adds a channel on cuBLASLt's single-matrix pick** (`bf16Gemms`): cuBLAS 12's
+  batched heuristic turns to 64x64 tiles there, 80-150 TFLOP/s against 260-277 - 92 s of a 6,916-token pass.
+- **the chunked grid attention's chunks as wide as what is free** (to 256 rows), and a block order that shares the
+  bias tile past 3,500 tokens (byte-identical).
+- **the streamed diffusion's biases in one tensor-core kernel** (`pairBiasSuperK`): projected and laid out together,
+  the f32 flat chunk never made - the layout alone was 173 ms of a 213 ms step at 2,964 tokens.
+- **the template stack's 16-wide attention on flashGrid2R** (1.35-1.75x).
+
+The flash kernel itself is now two thirds of a pass (163 of 247 s at 6,916 tokens) and did not move: three warps a
+block, key tiles of 32-80 and a bias-sharing order are all level or behind at 6,000 tokens - in Nsight Compute it is
+latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a pass is ~12 minutes by n^3.
 
 ### 🔴 Past the card: refused up front (folding there is on a branch)
 

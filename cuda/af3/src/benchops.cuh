@@ -121,6 +121,16 @@ inline void benchGrid(int n) {
     printf("  2R no-bias against zero bias: %zu of %zu outputs differ\n", differ, a.size());
     CK(cudaFree(zb));
   }
+  {   // the block order (GRID_SWIZZLE): the same blocks in another order, so the same bytes
+    int was = GRID_SWIZZLE;
+    GRID_SWIZZLE = 0; flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr);
+    GRID_SWIZZLE = 4; flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr);
+    GRID_SWIZZLE = was;
+    std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
+    CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+    size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
+    printf("  2R swizzled against in order: %zu of %zu outputs differ\n", differ, a.size());
+  }
   for (int rr : {2, 3}) {   // RR rows a block share one bias tile: the same arithmetic, so the same bytes
     flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr);
     if (rr == 2) flashGrid2RRun<32, 4, 48, 2, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr);
