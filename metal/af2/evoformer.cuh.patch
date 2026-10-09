@@ -1,0 +1,68 @@
+# The FAST triangle (the path Metal takes) as AF3's and ESMFold2's: the projection's GEMM gates in its epilogue and writes
+# a and b channel-major itself (lf::gemmTriGate), and the gating linear's GEMM adds its gated product into the pair
+# (lf::gemmGatedAdd) - both with AF2's biases - where the port writes the 5C-wide projection, splits it in triGateTK,
+# copies the output gate aside and adds in gateMulAddHK. The output projection is f16 for it.
+# LOCALFOLD_UNFUSED_TRIGATE=1 is the control.
+@@@ insert
+// (Metal) AF2's [pa | pb | ga | gb | gating] columns (C each) as lf::gemmTriGate takes them - channel c's (pa, pb, ga, gb)
+// at 4c..4c+3 - and the gating linear apart, with their biases; derived once a block, forgotten with the others
+__global__ void triGateAf2K(const half* w5, const float* b5, half* w4, float* b4, half* wg, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)C * 5 * C) return;
+  unsigned r = (unsigned)(t / (5u * C)), col = (unsigned)(t - (size_t)r * 5u * C);
+  if (col < 4u * C) {
+    unsigned c = col / 4, k = col % 4;
+    w4[t - (size_t)r * C] = w5[(size_t)r * 5 * C + k * C + c];
+    if (r == 0) b4[col] = b5[k * C + c];
+  } else wg[(size_t)r * C + col - 4 * C] = w5[t];
+}
+struct TriW4 { half* w4; float* b4; half* wg; };
+inline TriW4 triWeights4(const TriW& w, const std::string& T, int blk, int C) {
+  static std::map<std::pair<std::string, int>, TriW4> made;
+  static bool hooked = false;
+  if (!hooked) {
+    hooked = true;
+    FORGET_HOOKS.push_back([] { for (auto& kv : made) { CK(cudaFree(kv.second.w4)); CK(cudaFree(kv.second.b4)); CK(cudaFree(kv.second.wg)); } made.clear(); });
+  }
+  auto it = made.find({T, blk});
+  if (it != made.end()) return it->second;
+  TriW4 o{dallocT<half>((size_t)C * 4 * C), dallocT<float>((size_t)4 * C), dallocT<half>((size_t)C * C)};
+  triGateAf2K<<<blocks((size_t)C * 5 * C), 256, 0, STREAM>>>(w.w5, w.b5, o.w4, o.b4, o.wg, C);
+  return made[{T, blk}] = o;
+}
+@@@ end
+@@@ old
+    for (size_t p0 = 0; p0 < pairs; p0 += chunk) {
+      size_t r = std::min(chunk, pairs - p0);
+      ltGemm(xn + p0 * C, w.w5, pg, true, r, C, 5 * C, w.b5, false, 0.f);
+      triGateTK<<<dim3((unsigned)((r + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, pairMask, a, b, r, C, L, Lp, p0);
+      CK(cudaMemcpy2DAsync(og + p0 * C, C * 2, pg + 4 * C, 5 * C * 2, C * 2, r, cudaMemcpyDeviceToDevice, STREAM));
+    }
+@@@ new
+    static const bool fuseTri = !getenv("LOCALFOLD_UNFUSED_TRIGATE");
+    const TriW4 w4 = fuseTri ? triWeights4(w, T, blk, C) : TriW4{};
+    for (size_t p0 = 0; p0 < pairs; p0 += chunk) {
+      size_t r = std::min(chunk, pairs - p0);
+      if (fuseTri) { lf::gemmTriGate(xn + p0 * C, w4.w4, pairMask, a, b, p0, r, C, plane, L, Lp, w4.b4); continue; }
+      ltGemm(xn + p0 * C, w.w5, pg, true, r, C, 5 * C, w.b5, false, 0.f);
+      triGateTK<<<dim3((unsigned)((r + 31) / 32), C / 32), dim3(32, 8), 0, STREAM>>>(pg, pairMask, a, b, r, C, L, Lp, p0);
+      CK(cudaMemcpy2DAsync(og + p0 * C, C * 2, pg + 4 * C, 5 * C * 2, C * 2, r, cudaMemcpyDeviceToDevice, STREAM));
+    }
+@@@ end
+@@@ old
+    half* cn = xn;                // (the normalised input is spent)
+    centerNormHK<<<(unsigned)((pairs + 31) / 32), 256, (size_t)C * 33 * 4, STREAM>>>(prod, cn, pairs, C,
+      P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk), L, Lp);
+    float* out = scratch<float>("ftri.out", pairs * C);
+@@@ new
+    half* cn = fuseTri ? scratch<half>("ftri.cn", pairs * C) : xn;    // (fused: the gate's GEMM reads xn after this)
+    centerNormHK<<<(unsigned)((pairs + 31) / 32), 256, (size_t)C * 33 * 4, STREAM>>>(prod, cn, pairs, C,
+      P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk), L, Lp);
+    if (fuseTri) {
+      half* outH = scratch<half>("ftri.outh", pairs * C);
+      ltGemm(cn, w.out, outH, true, pairs, C, C, P(T + "/output_projection/bias", blk), false, 0.f);
+      lf::gemmGatedAdd(xn, w4.wg, outH, pair, pairs, C, C, w.b5 + 4 * C);
+      return;
+    }
+    float* out = scratch<float>("ftri.out", pairs * C);
+@@@ end

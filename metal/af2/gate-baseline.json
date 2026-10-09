@@ -1,8 +1,8 @@
 {
  "1brs-multimer": {
-  "plddt": 39.23,
-  "ptm": "0.2056",
-  "rmsd": 15.791
+  "plddt": 39.15,
+  "ptm": "0.2038",
+  "rmsd": 16.236
  },
  "1brs-multimer-template": {
   "plddt": 95.58,
@@ -10,9 +10,9 @@
   "rmsd": 0.272
  },
  "5caj-seq": {
-  "plddt": 31.21,
-  "ptm": "0.2062",
-  "rmsd": 19.565
+  "plddt": 31.31,
+  "ptm": "0.2061",
+  "rmsd": 19.804
  },
  "5caj-template": {
   "plddt": 97.23,

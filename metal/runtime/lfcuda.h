@@ -314,13 +314,14 @@ struct KArgs {
 void launch(int kernel, std::initializer_list<std::string> targs, KArgs& args);
 // the runtime's own GEMM with a gated residual in its epilogue: pair[r][o] += aux[r][o] * sigmoid(X W) (X, W, aux half;
 // W [in][out] as cuBLAS's ports hand it). For host patches (metal/<owner>/patch) that fuse a gate's pass away.
-void gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair, size_t rows, int in, int out);
+void gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair, size_t rows, int in, int out,
+                  const float* bias = nullptr);   // (bias: the gate's, f32)
 // gated[r][k] = silu(a) * b where (a, b) = (X W)[r][2k, 2k+1]: W [in][2 hidden] with a's and b's columns interleaved (half)
 void gemmSwiglu(const void* X, const void* Wpairs, void* gated, size_t rows, int in, int hidden);
 // the triangle's projection and gate: a[c][q], b[c][q] = proj * mask * sigmoid(gate) at the padded position q of each row,
 // W [C][4C] with channel c's (pa, pb, ga, gb) at columns 4c..4c+3
 void gemmTriGate(const void* X, const void* W, const float* mask, void* a, void* b, size_t r0, size_t rows, int C,
-                 size_t pairs, int n, int np);
+                 size_t pairs, int n, int np, const float* bias = nullptr);   // (bias: the [4C] reordered, f32)
 // a template argument as the Metal source spells it
 template <class T> std::string tname();
 template <> inline std::string tname<float>() { return "float"; }

@@ -200,12 +200,17 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       _Pragma("clang loop unroll(full)")
       for (int b = 0; b < FC; ++b) {
         thread auto& e = acc[a][b].thread_elements();
-        float g0 = simd_shuffle_xor((float)e[0], 1), g1 = simd_shuffle_xor((float)e[1], 1);
+        float e0 = e[0], e1 = e[1];
+        if (g.epilogue & 4) {     // (the projection's and gate's biases, f32, by this lane's own columns: AF2's)
+          int col = i0 + sc + b * 8 + sn1;
+          e0 += ((device const float*)g.bias)[col]; e1 += ((device const float*)g.bias)[col + 1];
+        }
+        float g0 = simd_shuffle_xor(e0, 1), g1 = simd_shuffle_xor(e1, 1);
         if ((lane & 1) == 0) {
           int jl = sr + a * 8 + sm1, il = sc + b * 8 + sn1, jg = j0 + jl;
           float m = jg < g.n ? mask[g.tgR0 + jg] : 0.f;
-          Sab[(il / 4) * TR + jl] = (half)(e[0] * m / (1.f + exp(-g0)));
-          Sab[(TC_ / 4 + il / 4) * TR + jl] = (half)(e[1] * m / (1.f + exp(-g1)));
+          Sab[(il / 4) * TR + jl] = (half)(e0 * m / (1.f + exp(-g0)));
+          Sab[(TC_ / 4 + il / 4) * TR + jl] = (half)(e1 * m / (1.f + exp(-g1)));
         }
       }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -243,6 +248,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         if (i >= g.m) continue;
         float v = g.alpha * e[t];
         if (g.epilogue & 64) {      // a gated residual: the GEMM is the gate, aux the gated values, D the residual
+          if (g.epilogue & 4) v += ((device const float*)g.bias)[i];      // (the gate's bias, f32: AF2's)
           v = (float)((device const half*)g.aux)[(ulong)i + (ulong)j * g.ldaux] * (1.f / (1.f + exp(-v)));
           lf_st(D, (ulong)i + (ulong)j * g.ldd, lf_ldf(C + (ulong)i + (ulong)j * g.ldc) + v);
           continue;

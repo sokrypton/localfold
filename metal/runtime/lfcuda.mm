@@ -842,10 +842,11 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
 }  // namespace
 // pair[r][o] += aux[r][o] * sigmoid(sum_k X[r][k] W[k][o]): a gate's GEMM adding its gated product into an f32 residual in
 // its own epilogue, where cuBLAS's ports write the gate and add it in a pass of their own (metal/af3/patch)
-void lf::gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair, size_t rows, int in, int out) {
+void lf::gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair, size_t rows, int in, int out, const float* bias) {
   GemmArgs a{(uint64_t)W, (uint64_t)X, (uint64_t)pair, (uint64_t)pair, 0, 0, 0, 0, 0, out, (int)rows, in, out, in, out, out,
              0, 0, 0, 64, 0, 1.f, 0.f};
   a.aux = (uint64_t)aux; a.ldaux = out;
+  if (bias) { a.bias = (uint64_t)bias; a.epilogue |= 4; }
   gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, a, 1);
 }
 // gated[r][k] = silu(a) b, (a, b) = (X W)[r][2k, 2k+1]: W's columns interleaved a_0 b_0 a_1 b_1 ... (metal/af3/patch)
@@ -857,11 +858,12 @@ void lf::gemmSwiglu(const void* X, const void* Wpairs, void* gated, size_t rows,
 // the triangle's projection and gate in one GEMM: a[c][q], b[c][q] (channel-major over the padded positions) from
 // X [rows][C] and W [C][4C] with channel c's (pa, pb, ga, gb) at columns 4c..4c+3 (metal/af3/pairtrack.cuh.patch)
 void lf::gemmTriGate(const void* X, const void* W, const float* mask, void* a, void* b, size_t r0, size_t rows, int C,
-                     size_t pairs, int n, int np) {
+                     size_t pairs, int n, int np, const float* bias) {
   GemmArgs g{(uint64_t)W, (uint64_t)X, (uint64_t)a, (uint64_t)a, 0, 0, 0, 0, 0, 4 * C, (int)rows, C, 4 * C, C, 4 * C,
              4 * C, 0, 0, 0, 256, 0, 1.f, 0.f};
   g.aux = (uint64_t)mask; g.aux2 = (uint64_t)a; g.aux3 = (uint64_t)b;
   g.tgR0 = (int64_t)r0; g.tgPairs = (int64_t)pairs; g.tgN = n; g.tgNp = np; g.tgC = C;
+  if (bias) { g.bias = (uint64_t)bias; g.epilogue |= 4; }
   gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, g, 1);
 }
 namespace {
