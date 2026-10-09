@@ -227,7 +227,7 @@ struct Device {
   void loadSpecs() {      // (specMu held)
     if (specsLoaded) return;
     specsLoaded = true;
-    char name[96]; snprintf(name, sizeof name, "/native-%s-%016zx.specs", portName.c_str(), std::hash<std::string>()(GEMM_SOURCE));
+    std::string name = "/" + specsName(portName.c_str());
     specsPath = cacheDir() + name;
     struct stat st;
     if (stat(specsPath.c_str(), &st) != 0) {     // a first run: the list a wheel ships beside the binary
@@ -461,6 +461,10 @@ void download(void* dst, const void* src, size_t bytes) {
 void sync() { D().sync(); }
 
 // ---------------------------------------------------------------- kernels
+std::string specsName(const char* port) {
+  char name[96]; snprintf(name, sizeof name, "native-%s-%016zx.specs", port, std::hash<std::string>()(GEMM_SOURCE));
+  return name;
+}
 void setSource(const char* portName, const char* source) {
   Device& d = D();
   d.portName = portName; d.portSource = source;

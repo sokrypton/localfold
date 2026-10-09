@@ -67,33 +67,3 @@ void writeConfidences(const std::string& pdb, int T, const Confidence& conf, con
   fclose(f);
 }
 
-// the rotation taking `moving` onto `fixed` (both centred), Horn's quaternion: the frames' superposition
-void bestRotation(const std::vector<double>& moving, const std::vector<double>& fixed, double R[9]) {
-  double S[3][3] = {};
-  for (size_t i = 0; i + 2 < moving.size(); i += 3)
-    for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) S[a][b] += moving[i + a] * fixed[i + b];
-  double N[4][4] = {
-    {S[0][0] + S[1][1] + S[2][2], S[1][2] - S[2][1], S[2][0] - S[0][2], S[0][1] - S[1][0]},
-    {S[1][2] - S[2][1], S[0][0] - S[1][1] - S[2][2], S[0][1] + S[1][0], S[2][0] + S[0][2]},
-    {S[2][0] - S[0][2], S[0][1] + S[1][0], -S[0][0] + S[1][1] - S[2][2], S[1][2] + S[2][1]},
-    {S[0][1] - S[1][0], S[2][0] + S[0][2], S[1][2] + S[2][1], -S[0][0] - S[1][1] + S[2][2]}};
-  double V[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
-  for (int sweep = 0; sweep < 50; ++sweep) {
-    double off = 0; for (int p = 0; p < 4; ++p) for (int q = p + 1; q < 4; ++q) off += N[p][q] * N[p][q];
-    if (off < 1e-22) break;
-    for (int p = 0; p < 4; ++p) for (int q = p + 1; q < 4; ++q) {
-      if (std::fabs(N[p][q]) < 1e-300) continue;
-      double theta = (N[q][q] - N[p][p]) / (2 * N[p][q]);
-      double t = (theta >= 0 ? 1 : -1) / (std::fabs(theta) + std::sqrt(theta * theta + 1)), c = 1 / std::sqrt(t * t + 1), sn = t * c;
-      for (int k = 0; k < 4; ++k) { double a = N[k][p], b = N[k][q]; N[k][p] = c * a - sn * b; N[k][q] = sn * a + c * b; }
-      for (int k = 0; k < 4; ++k) { double a = N[p][k], b = N[q][k]; N[p][k] = c * a - sn * b; N[q][k] = sn * a + c * b; }
-      for (int k = 0; k < 4; ++k) { double a = V[k][p], b = V[k][q]; V[k][p] = c * a - sn * b; V[k][q] = sn * a + c * b; }
-    }
-  }
-  int best = 0; for (int k = 1; k < 4; ++k) if (N[k][k] > N[best][best]) best = k;
-  double w = V[0][best], x = V[1][best], y = V[2][best], z = V[3][best];
-  double R0[9] = {w * w + x * x - y * y - z * z, 2 * (x * y - w * z), 2 * (x * z + w * y),
-                  2 * (x * y + w * z), w * w - x * x + y * y - z * z, 2 * (y * z - w * x),
-                  2 * (x * z - w * y), 2 * (y * z + w * x), w * w - x * x - y * y + z * z};
-  for (int k = 0; k < 9; ++k) R[k] = R0[k];
-}

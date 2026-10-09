@@ -1,4 +1,4 @@
-"""The Metal port's AF3 gate: cuda/af3/gate.py's cases - every AF3-lineage model on 6MRR from its sequence, a
+"""The native Metal AF3 gate: cuda/af3/gate.py's cases - every AF3-lineage model on 6MRR from its sequence, a
 ligand and an atomised modified residue, DNA and modified bases, AF3's kitchen sink, a glycan, 5CAJ and
 barnase-barstar with their crystals as templates - folded by metal/af3/localfold-af3 and scored the same way.
 
@@ -30,7 +30,6 @@ import gate as cuda_gate   # noqa: E402  (its cases and its scoring)
 BIN = os.path.join(REPO, "metal", "af3", "localfold-af3")
 FEATURISE = os.path.join(REPO, "cuda", "featurise", "af3-featurise")
 BASELINE = os.path.join(HERE, "gate-baseline.json")
-LEGACY = os.path.join(REPO, "metal", "legacy", "af3", "gate-baseline.json")
 A100 = cuda_gate.BASELINE
 TMP = os.environ.get("GATE_TMP", os.path.join(tempfile.gettempdir(), "metal-af3-gate"))
 AF3_BUNDLE = os.path.join(REPO, "model-af3-int5")

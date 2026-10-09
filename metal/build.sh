@@ -36,28 +36,25 @@ PY
 # built once
 zstd_lib="$build/zstd/libzstd-dec.a"
 if [ ! -f "$zstd_lib" ]; then
-  if [ -f "$here/legacy/build/zstd/libzstd-dec.a" ]; then mkdir -p "$build/zstd"; cp "$here/legacy/build/zstd/libzstd-dec.a" "$zstd_lib"
-  else
-    zdir="$build/zstd"; mkdir -p "$zdir"
-    [ -f "$zdir/zstd.tar.gz" ] || curl -sL -o "$zdir/zstd.tar.gz" https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
-    echo "8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1  $zdir/zstd.tar.gz" | shasum -a 256 -c - >/dev/null \
-      || { echo "zstd-1.5.6.tar.gz: checksum mismatch" >&2; exit 1; }
-    tar xzf "$zdir/zstd.tar.gz" -C "$zdir"
-    zsrc="$zdir/zstd-1.5.6/lib"; objs=()
-    for c in common/debug.c common/entropy_common.c common/error_private.c common/fse_decompress.c common/xxhash.c \
-             common/zstd_common.c decompress/huf_decompress.c decompress/zstd_ddict.c decompress/zstd_decompress.c \
-             decompress/zstd_decompress_block.c; do
-      o="$zdir/$(basename "$c" .c).o"
-      clang -O2 -DZSTD_DISABLE_ASM -DZSTD_MULTITHREAD=0 -I "$zsrc" -I "$zsrc/common" -c "$zsrc/$c" -o "$o"
-      objs+=("$o")
-    done
-    ar rcs "$zstd_lib" "${objs[@]}"
-  fi
+  zdir="$build/zstd"; mkdir -p "$zdir"
+  [ -f "$zdir/zstd.tar.gz" ] || curl -sL -o "$zdir/zstd.tar.gz" https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+  echo "8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1  $zdir/zstd.tar.gz" | shasum -a 256 -c - >/dev/null \
+    || { echo "zstd-1.5.6.tar.gz: checksum mismatch" >&2; exit 1; }
+  tar xzf "$zdir/zstd.tar.gz" -C "$zdir"
+  zsrc="$zdir/zstd-1.5.6/lib"; objs=()
+  for c in common/debug.c common/entropy_common.c common/error_private.c common/fse_decompress.c common/xxhash.c \
+           common/zstd_common.c decompress/huf_decompress.c decompress/zstd_ddict.c decompress/zstd_decompress.c \
+           decompress/zstd_decompress_block.c; do
+    o="$zdir/$(basename "$c" .c).o"
+    clang -O2 -DZSTD_DISABLE_ASM -DZSTD_MULTITHREAD=0 -I "$zsrc" -I "$zsrc/common" -c "$zsrc/$c" -o "$o"
+    objs+=("$o")
+  done
+  ar rcs "$zstd_lib" "${objs[@]}"
 fi
 
 # the core, once
 core_objs=()
-for f in core.mm model.cpp; do
+for f in core.mm model.cpp host.cpp; do
   o="$build/core-${f%.*}.o"
   clang++ "${flags[@]}" $opt -I "$here/core" -x objective-c++ -c "$here/core/$f" -o "$o"
   core_objs+=("$o")

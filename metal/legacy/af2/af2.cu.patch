@@ -1,9 +1,0 @@
-# (Metal) no warm-up fold, as metal/ef2/ef2.cu.patch: the kernels come compiled from the specialisations list at start-up,
-# so a warm fold is a second fold run first. LOCALFOLD_WARM=1 is the control.
-@@@ old
-  if (!warmShape.empty()) {
-    int wl = 0, wn = 1, we = 1, wt = 0;
-@@@ new
-  if (!warmShape.empty() && getenv("LOCALFOLD_WARM")) {
-    int wl = 0, wn = 1, we = 1, wt = 0;
-@@@ end

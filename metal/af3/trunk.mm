@@ -327,3 +327,25 @@ std::vector<float> contactProbabilities(Trunk& t) {
   releaseScratch({"disto.", "contact."});
   return c;
 }
+// the distance each pair's distogram predicts: the expectation over the bin centres, the open first and last bins at
+// their breaks (shared/af3/feature-convergence.js expectedDistances) - --recycle-tolerance's measure
+std::vector<float> expectedDistances(Trunk& t) {
+  int bins = metaI("trunk.distogram.bins");
+  size_t pairs = (size_t)t.n * t.n;
+  float* logits = scratch<float>("disto.logits", pairs * bins);
+  distogram(t, logits);
+  std::vector<float> l = download(logits, pairs * bins), out(pairs);
+  const float fb = 2.3125f, lb = 21.6875f;
+  for (size_t ij = 0; ij < pairs; ++ij) {
+    const float* r = &l[ij * bins];
+    float mx = -INFINITY; for (int b = 0; b < bins; ++b) mx = std::max(mx, r[b]);
+    double total = 0, weighted = 0;
+    for (int b = 0; b < bins; ++b) {
+      float centre = b == 0 ? fb : b == bins - 1 ? lb : fb + (lb - fb) * (b - 0.5f) / (bins - 2);
+      double p = std::exp(r[b] - mx); total += p; weighted += p * centre;
+    }
+    out[ij] = total > 0 ? (float)(weighted / total) : 0.f;
+  }
+  releaseScratch({"disto."});
+  return out;
+}

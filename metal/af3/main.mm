@@ -6,6 +6,7 @@
 //   localfold-af3 --job=<job.json> --out=<pdb> [--model=boltz2] ...      (featurised in this process)
 #include "af3.h"
 #include "af3_weights.h"
+#include "host.h"
 #include "output.h"
 #include "standalone_api.h"
 #include <unistd.h>
@@ -27,8 +28,57 @@ void saveSeam(const char* name, const float* d, size_t n) {
 }
 uint64_t sampleSeed(uint64_t seed, int k) { return seed + ((uint64_t)k << 32); }
 
+// --frames=DIR: each sampler step's prediction - the denoised positions, the picture the page draws - written to
+// DIR/frame-SSSS.pdb through the input's template.pdb, superposed onto the first frame written (the prediction moves as
+// it settles, not as the walk rotates it); at most 25 a fold, evenly spaced and always the last step
+struct FrameWriter {
+  static constexpr int MAX = 25;
+  std::string dir; int stride = 1, steps = 0, written = 0;
+  std::vector<std::string> lines; std::vector<size_t> slots;
+  std::vector<double> reference; double refCentre[3] = {};
+  static bool isAtom(const std::string& l) { return l.size() >= 66 && (!l.compare(0, 4, "ATOM") || !l.compare(0, 6, "HETATM")); }
+  bool start(const std::string& inputDir, const std::string& d, int totalSteps) {
+    std::ifstream tf(inputDir + "/template.pdb");
+    if (!tf) { fprintf(stderr, "frames: no %s/template.pdb, none written\n", inputDir.c_str()); return false; }
+    for (std::string l; std::getline(tf, l);) {
+      lines.push_back(l);
+      if (isAtom(l)) slots.push_back((size_t)std::lround(std::stod(l.substr(30, 8))));
+    }
+    dir = d; steps = totalSteps; stride = std::max(1, (steps + MAX - 1) / MAX);
+    return true;
+  }
+  void offer(const float* device, int step) {
+    if (dir.empty() || !(step % stride == 0 || step == steps)) return;
+    size_t top = 0; for (size_t s : slots) top = std::max(top, s + 1);
+    std::vector<float> x = download(device, top * 3);
+    std::vector<double> pts(slots.size() * 3);
+    double c[3] = {};
+    for (size_t a = 0; a < slots.size(); ++a)
+      for (int d = 0; d < 3; ++d) { pts[a * 3 + d] = x[slots[a] * 3 + d]; c[d] += pts[a * 3 + d] / slots.size(); }
+    for (size_t a = 0; a < slots.size(); ++a) for (int d = 0; d < 3; ++d) pts[a * 3 + d] -= c[d];
+    if (reference.empty()) { reference = pts; for (int d = 0; d < 3; ++d) refCentre[d] = c[d]; }
+    double R[9]; bestRotation(pts, reference, R);
+    std::string out; char buf[32]; size_t a = 0;
+    for (auto& line : lines) {
+      if (a < slots.size() && isAtom(line)) {
+        const double* p = &pts[a * 3];
+        out += line.substr(0, 30);
+        for (int d = 0; d < 3; ++d) {
+          snprintf(buf, sizeof buf, "%8.3f", R[d * 3] * p[0] + R[d * 3 + 1] * p[1] + R[d * 3 + 2] * p[2] + refCentre[d]);
+          out += buf;
+        }
+        out += line.substr(54); out += '\n'; ++a;
+      } else { out += line; out += '\n'; }
+    }
+    char name[64]; snprintf(name, sizeof name, "/frame-%04d.pdb", step);
+    writeWhole(dir + name, out.data(), out.size());
+    ++written;
+  }
+};
+
 struct Options {
-  std::string out = "fold.pdb", seedsArg;
+  std::string out = "fold.pdb", seedsArg, frames;
+  double recycleTolerance = 0;
   int steps = 200, recycles = 3, samples = 1, msaCap = 1024;
   uint64_t seed = 42; bool seedGiven = false;
 };
@@ -97,13 +147,40 @@ int foldInput(const std::string& dir, Options o) {
   saveSeam("target_feat", tf, (size_t)n * F);
   Trunk t = makeTrunk(tf, o.msaCap);
   releaseScratch({"targetFeat"});
-  for (int pass = 0; pass <= o.recycles; ++pass) {
+  // --frames: each pass's contact map too (the page shows the trunk's after every recycle), a byte a pair;
+  // --recycle-tolerance: stop once two consecutive passes moved the distogram's predicted distances less than it (the
+  // page's rule, shared/af3/feature-convergence.js: one crossing is not enough)
+  const int lastPass = o.recycles;
+  int passesRun = lastPass + 1;
+  std::vector<float> lastDistances; std::vector<double> changes;
+  for (int pass = 0; pass <= lastPass; ++pass) {
     if (pass == 0 && profiling()) profileStart();
     runTrunk(t);
     if (pass == 0) {
       saveSeam("trunk_out_pair", t.pair, (size_t)n * n * t.C);
       saveSeam("single", t.single, (size_t)n * t.Cs);
       if (profiling()) profileReport("trunk pass", 30);
+    }
+    if (!o.frames.empty() && M.has("batch.contactClasses")) {
+      std::vector<float> c = contactProbabilities(t);
+      std::vector<unsigned char> c8(c.size());
+      for (size_t k = 0; k < c.size(); ++k) c8[k] = (unsigned char)std::min(255.f, std::max(0.f, std::rint(c[k] * 255.f)));
+      char name[64]; snprintf(name, sizeof name, "/contacts-%02d-of-%02d.u8", pass, lastPass + 1);
+      writeWhole(o.frames + name, c8.data(), c8.size());
+    }
+    if (o.recycleTolerance > 0 && pass < lastPass) {
+      std::vector<float> d = expectedDistances(t);
+      if (!lastDistances.empty()) {
+        double sum = 0; for (size_t k = 0; k < d.size(); ++k) { double e = d[k] - lastDistances[k]; sum += e * e; }
+        changes.push_back(std::sqrt(sum / d.size()));
+      } else changes.push_back(-1);
+      lastDistances = d;
+      size_t k = changes.size();
+      if (k >= 3 && changes[k - 1] < o.recycleTolerance && changes[k - 2] < o.recycleTolerance) {
+        printf("trunk: converged at %.2f A after %d passes\n", changes[k - 1], pass + 1);
+        passesRun = pass + 1;
+        break;
+      }
     }
   }
   releaseScratch({"tri.", "grid.", "tr.", "st."});
@@ -143,7 +220,9 @@ int foldInput(const std::string& dir, Options o) {
     double s0 = now();
     if (profiling()) profileStart();
     if (structural && c0 > 0) M.swapPrefix("batch.", "sbatch.");      // (the structural tokens again, for this batch)
-    std::vector<float> xs = sample(o.steps, batch, mask);
+    FrameWriter frames;
+    if (!o.frames.empty() && c0 == 0) frames.start(dir, o.frames, o.steps);     // (the first batch's first sample)
+    std::vector<float> xs = sample(o.steps, batch, mask, [&](const float* d, int step, int) { frames.offer(d, step); });
     if (structural) M.swapPrefix("batch.", "sbatch.");                 // (back to the residues, for the files)
     if (profiling()) profileReport("diffusion", 30);
     if (getenv("AF3_STAGES")) reportStages();
@@ -188,7 +267,7 @@ int foldInput(const std::string& dir, Options o) {
   if (o.out != "/dev/null") writeConfidenceFiles(o.out, order, n, dense, best, contact, bestScore, bestS);
   printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", best.meanPlddt, best.ptm, best.iptm, o.out.c_str());
   printf("fold: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d), confidence %.1f ms, total %.1f ms\n", trunkMs,
-         o.recycles + 1, diffMs, o.steps, (int)runs.size(), confMs, ms(t0));
+         passesRun, diffMs, o.steps, (int)runs.size(), confMs, ms(t0));
   (void)d0;
   mt::sync();
   freeDiffusion();
@@ -205,6 +284,7 @@ int foldMain(int argc, char** argv) {
   std::string bundleDir, family;
   Options o;
   bool af3Defaults = false, waitInput = false, detach = false, setR = false, setS = false;
+  std::string serveDir;
   for (int i = 2; i < argc; ++i) {
     const char* a = argv[i];
     if (!strncmp(a, "--bundle=", 9)) bundleDir = a + 9;
@@ -216,6 +296,9 @@ int foldMain(int argc, char** argv) {
     else if (!strncmp(a, "--msa=", 6)) o.msaCap = atoi(a + 6);
     else if (!strncmp(a, "--seed=", 7)) { o.seed = strtoull(a + 7, nullptr, 10); o.seedGiven = true; }
     else if (!strncmp(a, "--seeds=", 8)) o.seedsArg = a + 8;
+    else if (!strncmp(a, "--frames=", 9)) o.frames = a + 9;
+    else if (!strncmp(a, "--recycle-tolerance=", 20)) o.recycleTolerance = atof(a + 20);
+    else if (!strncmp(a, "--serve=", 8)) serveDir = a + 8;
     else if (!strcmp(a, "--flow")) SAMPLER.flow = true;
     else if (!strncmp(a, "--sigma-max=", 12)) SAMPLER.sigmaMax = atof(a + 12);
     else if (!strcmp(a, "--af3-defaults")) af3Defaults = true;
@@ -244,12 +327,35 @@ int foldMain(int argc, char** argv) {
     }
   }
   if (getenv("LOCALFOLD_SAVE_SEAMS")) SEAM = saveSeam;
+  if (!serveDir.empty()) {
+    // the job's flags: --out, --samples, --steps, --flow, --sigma-max, --frames, --recycles, --seed, --seeds
+    const Options o0 = o; const SamplerOptions s0 = SAMPLER;
+    serveJobs("af3", serveDir, [&](const std::string& input, const std::vector<std::string>& flags) {
+      Options j = o0; SAMPLER = s0; j.out = "fold.pdb"; j.frames.clear();
+      for (auto& f : flags) {
+        const char* a = f.c_str();
+        if (!strncmp(a, "--out=", 6)) j.out = a + 6;
+        else if (!strncmp(a, "--samples=", 10)) j.samples = atoi(a + 10);
+        else if (!strncmp(a, "--steps=", 8)) j.steps = atoi(a + 8);
+        else if (!strcmp(a, "--flow")) SAMPLER.flow = true;
+        else if (!strncmp(a, "--sigma-max=", 12)) SAMPLER.sigmaMax = atof(a + 12);
+        else if (!strncmp(a, "--frames=", 9)) j.frames = a + 9;
+        else if (!strncmp(a, "--recycles=", 11)) j.recycles = atoi(a + 11);
+        else if (!strncmp(a, "--recycle-tolerance=", 20)) j.recycleTolerance = atof(a + 20);
+        else if (!strncmp(a, "--seed=", 7)) { j.seed = strtoull(a + 7, nullptr, 10); j.seedGiven = true; }
+        else if (!strncmp(a, "--seeds=", 8)) j.seedsArg = a + 8;
+      }
+      return foldInput(input, j);
+    });
+    return 0;
+  }
   int code = foldInput(argv[1], o);
   if (detach) { printf("af3: done\n"); fflush(stdout); fflush(stderr); fclose(stdout); }
   return code;
 }
 
 int main(int argc, char** argv) {
+  if (getenv("LOCALFOLD_METAL_SPECS_NAME")) { printf("%s\n", specsName("af3").c_str()); return 0; }
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("af3", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

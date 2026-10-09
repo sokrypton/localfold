@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# metal/af3/fold <out.pdb> <flags>: cuda/af3/fold's interface over the native Metal binary
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+out="$1"; shift
+args=()
+for a in "$@"; do [ "$a" = "--" ] || args+=("$a"); done
+[ -x "$here/localfold-af3" ] || bash "$here/../build.sh" af3 >&2
+exec "$here/localfold-af3" --out="$out" "${args[@]}"

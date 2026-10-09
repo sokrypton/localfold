@@ -4,6 +4,7 @@
 //
 //   localfold-ef2 <input dir> --fold-bundle=<dir> --esmc-bundle=<dir> [--out=fold.pdb] [--seed=N] [--steps=N]
 #include "ef2.h"
+#include "host.h"
 #include "standalone_api.h"
 #include <dirent.h>
 #include <fcntl.h>
@@ -150,37 +151,6 @@ int foldInput(const Opts& o) {
   return 0;
 }
 
-// --serve=<dir>: stay up, folding each <id>.job dropped there (its first line the input directory, then its flags),
-// its output in <id>.log and its exit code in <id>.done
-void serveJobs(const std::string& dir, const std::function<int(const std::string&, const std::vector<std::string>&)>& fold) {
-  printf("ef2: serving %s\n", dir.c_str()); fflush(stdout);
-  for (;;) {
-    std::string id;
-    if (DIR* d = opendir(dir.c_str())) {
-      std::vector<std::string> jobs;
-      while (dirent* e = readdir(d)) {
-        std::string file = e->d_name;
-        if (file.size() > 4 && file.substr(file.size() - 4) == ".job") jobs.push_back(file.substr(0, file.size() - 4));
-      }
-      closedir(d);
-      if (!jobs.empty()) { std::sort(jobs.begin(), jobs.end()); id = jobs[0]; }
-    }
-    if (id.empty()) { usleep(2000); continue; }
-    std::string base = dir + "/" + id;
-    std::ifstream job(base + ".job");
-    std::string input, line; std::getline(job, input);
-    std::vector<std::string> flags; while (std::getline(job, line)) if (!line.empty()) flags.push_back(line);
-    job.close(); unlink((base + ".job").c_str());
-    if (input == "quit") { printf("ef2: stopped\n"); return; }
-    fflush(stdout); fflush(stderr);
-    int saved = dup(1), savedErr = dup(2), log = open((base + ".log").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    dup2(log, 1); dup2(log, 2); close(log);
-    int code = fold(input, flags);
-    fflush(stdout); fflush(stderr); dup2(saved, 1); dup2(savedErr, 2); close(saved); close(savedErr);
-    FILE* df = fopen((base + ".done.tmp").c_str(), "w"); fprintf(df, "%d\n", code); fclose(df);
-    rename((base + ".done.tmp").c_str(), (base + ".done").c_str());
-  }
-}
 
 bool DETACH = false;
 int foldMain(int argc, char** argv) {
@@ -220,7 +190,7 @@ int foldMain(int argc, char** argv) {
   M.loadBundle(esmcBundle, "c", asHalf);
   if (getenv("EF2_STARTUP")) { mt::sync(); printf("weights up %.0f ms\n", ms(tStart)); }
   if (!serveDir.empty()) {
-    serveJobs(serveDir, [&](const std::string& input, const std::vector<std::string>& flags) {
+    serveJobs("ef2", serveDir, [&](const std::string& input, const std::vector<std::string>& flags) {
       Opts j = o; j.dir = input; j.out = "fold.pdb"; j.frames.clear();
       for (auto& f : flags) {
         if (!f.compare(0, 6, "--out=")) j.out = f.substr(6);
@@ -253,6 +223,7 @@ int foldMain(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (getenv("LOCALFOLD_METAL_SPECS_NAME")) { printf("%s\n", specsName("ef2").c_str()); return 0; }
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("ef2", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

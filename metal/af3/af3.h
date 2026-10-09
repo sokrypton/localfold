@@ -5,6 +5,7 @@
 #pragma once
 #include "core.h"
 #include "kernels.h"
+#include "host.h"
 #include "model.h"
 #include <functional>
 #include <string>
@@ -83,6 +84,7 @@ void runTrunk(Trunk& t);
 // the distogram's logits [n * n * bins] (symmetrised), and the page's contact map [n * n] on the host
 void distogram(Trunk& t, float* logits);
 std::vector<float> contactProbabilities(Trunk& t);
+std::vector<float> expectedDistances(Trunk& t);      // each pair's predicted distance (the early stop's measure)
 
 // ---------------------------------------------------------------- target_feat (atom.mm)
 float* buildTargetFeat();

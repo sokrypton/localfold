@@ -96,6 +96,9 @@ void Model::loadBundle(const std::string& dir, const std::string& prefix,
     rec.e.src = r.get("byteOffset") ? (u64)r.get("byteOffset")->num : 0;
     if (dtype == "float32") rec.e.kind = 0;
     else if (dtype == "float16") rec.e.kind = 1;
+    else if (dtype == "int8") {   // symmetric: a code a byte and a float16 scale a block
+      rec.e.kind = 2; rec.e.bits = 8; rec.e.block = (uint)r.get("block")->num; rec.e.scale = (u64)r.get("scaleOffset")->num;
+    }
     else if (dtype.size() == 4 && !dtype.compare(0, 3, "int") && dtype[3] >= '1' && dtype[3] <= '7') {
       rec.e.kind = 3; rec.e.bits = dtype[3] - '0';
       rec.e.block = (uint)r.get("block")->num;
@@ -164,6 +167,9 @@ Src record(const std::string& where, const std::string& name, const Json& r) {
   x.e.src = r.get("byteOffset") ? (u64)r.get("byteOffset")->num : 0;
   if (dtype == "float32") x.e.kind = 0;
   else if (dtype == "float16") x.e.kind = 1;
+  else if (dtype == "int8") {   // symmetric: a code a byte and a float16 scale a block
+    x.e.kind = 2; x.e.bits = 8; x.e.block = (uint)r.get("block")->num; x.e.scale = (u64)r.get("scaleOffset")->num;
+  }
   else if (dtype.size() == 4 && !dtype.compare(0, 3, "int") && dtype[3] >= '1' && dtype[3] <= '7') {
     x.e.kind = 3; x.e.bits = dtype[3] - '0'; x.e.block = (uint)r.get("block")->num;
     x.e.scale = (u64)r.get("scaleOffset")->num;
@@ -176,7 +182,7 @@ Src record(const std::string& where, const std::string& name, const Json& r) {
 // ---------------------------------------------------------------- af3-any-model blobs
 // A blob (<model>.bin.zst) is a stream of records - [scope, name, dtype, shape, bytes] - decompressed once into
 // `<blob>.raw/NNN` shards of at most 256 MB, cut at record boundaries (never before an int8 tensor's `__q_scale`), with
-// `done` listing them: the cache cuda/af3 and the legacy port keep too. zstd is linked into the port binaries
+// `done` listing them: the cache cuda/af3 keeps too. zstd is linked into the port binaries
 // (metal/build.sh): its functions are found in the process itself.
 struct ZIn { const void* src; size_t size, pos; };
 struct ZOut { void* dst; size_t size, pos; };

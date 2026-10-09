@@ -4,6 +4,7 @@
 #pragma once
 #include "core.h"
 #include "kernels.h"
+#include "host.h"
 #include "model.h"
 #include <string>
 #include <vector>
@@ -83,4 +84,3 @@ Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInput
 void writePdb(const std::string& templatePath, const std::string& out, const std::vector<float>& x,
               const std::vector<float>* bfactor = nullptr);
 void writeConfidences(const std::string& pdb, int T, const Confidence& conf, const std::vector<float>& contacts);
-void bestRotation(const std::vector<double>& moving, const std::vector<double>& fixed, double R[9]);

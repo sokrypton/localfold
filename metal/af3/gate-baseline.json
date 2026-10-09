@@ -1,55 +1,55 @@
 {
  "af3-1brs-template": {
-  "plddt": 95.18,
-  "ptm": "0.9398",
-  "rmsd": 0.454
+  "plddt": 95.16,
+  "ptm": "0.9393",
+  "rmsd": 0.457
  },
  "af3-5caj-template": {
-  "plddt": 95.57,
+  "plddt": 95.58,
   "ptm": "0.9560",
   "rmsd": 0.205
  },
  "af3-6mrr": {
-  "plddt": 86.15,
-  "ptm": "0.7507",
-  "rmsd": 0.768
+  "plddt": 86.16,
+  "ptm": "0.7509",
+  "rmsd": 0.771
  },
  "af3-6mrr-gol-sep3": {
   "ligand": 0.047,
-  "plddt": 89.88,
-  "ptm": "0.8272",
+  "plddt": 89.86,
+  "ptm": "0.8268",
   "rmsd": 1.492
  },
  "af3-dna-5cm": {
   "ligand": 0.043,
   "nucleic": 0.045,
-  "plddt": 92.73,
-  "ptm": "0.8299",
+  "plddt": 92.72,
+  "ptm": "0.8297",
   "rmsd": null
  },
  "af3-dna-duplex": {
   "nucleic": 0.048,
   "plddt": 91.66,
-  "ptm": "0.1856",
+  "ptm": "0.1855",
   "rmsd": null
  },
  "af3-glycan": {
   "ligand": 0.023,
-  "plddt": 44.61,
-  "ptm": "0.4201",
+  "plddt": 44.41,
+  "ptm": "0.4214",
   "rmsd": null
  },
  "af3-kitchen-sink": {
-  "ligand": 0.047,
-  "nucleic": 0.056,
-  "plddt": 74.87,
-  "ptm": "0.7350",
+  "ligand": 0.046,
+  "nucleic": 0.057,
+  "plddt": 75.37,
+  "ptm": "0.7527",
   "rmsd": null
  },
  "boltz2-6mrr": {
   "plddt": 97.02,
-  "ptm": "0.8085",
-  "rmsd": 0.577
+  "ptm": "0.8084",
+  "rmsd": 0.578
  },
  "intellifold2-6mrr": {
   "plddt": 85.19,
@@ -57,23 +57,23 @@
   "rmsd": 1.539
  },
  "openbind0-6mrr": {
-  "plddt": 84.7,
-  "ptm": "0.8128",
-  "rmsd": 1.756
+  "plddt": 84.69,
+  "ptm": "0.8125",
+  "rmsd": 1.759
  },
  "opendde-6mrr": {
   "plddt": 91.82,
   "ptm": "0.7784",
-  "rmsd": 1.454
+  "rmsd": 1.457
  },
  "protenix2-6mrr": {
-  "plddt": 87.55,
-  "ptm": "0.8799",
+  "plddt": 87.56,
+  "ptm": "0.8801",
   "rmsd": 1.561
  },
  "rosettafold3-6mrr": {
-  "plddt": 81.43,
-  "ptm": "0.8036",
-  "rmsd": 1.706
+  "plddt": 81.4,
+  "ptm": "0.8037",
+  "rmsd": 1.699
  }
 }

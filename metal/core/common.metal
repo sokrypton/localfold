@@ -78,6 +78,7 @@ kernel void lf_decode(constant DecodeArgs& a [[buffer(0)]], uint3 tg [[threadgro
     float v;
     if (d.kind == 0) v = lf_f32_at(a.raw + d.src + 4 * i);
     else if (d.kind == 1) v = lf_half_at(a.raw + d.src + 2 * i);
+    else if (d.kind == 2) v = (float)(char)a.raw[d.src + i] * lf_half_at(a.raw + d.scale + 2 * (i / d.block));   // symmetric int8
     else if (d.kind == 6) {      // an af3-any-model blob's int8: a float32 scale per channel of the last axis (`block` of
                                  // them) and per block of rows (`bits` blocks of the `zero` rows)
       ulong row = i / d.block, col = i - row * d.block, g = (d.zero + d.bits - 1) / d.bits;

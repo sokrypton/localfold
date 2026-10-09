@@ -65,6 +65,9 @@ template <class A> void run1d(const char* kernel, size_t n, const A& a) {
 void dispatchInstance(const std::string& name, const std::string& decl, const void* args, size_t argBytes, Grid groups,
                       uint32_t threads, size_t smem = 0, const char* label = nullptr);
 void precompile();                          // the instances a previous run used, compiled now in parallel
+// the name of the list of GEMM instances a port's folds use (~/.cache/localfold/metal/<name>; a wheel ships one beside
+// the binaries, in metal-specs/): LOCALFOLD_METAL_SPECS_NAME=1 localfold-<port> prints it
+std::string specsName(const char* port);
 
 // ---------------------------------------------------------------- GEMM
 // Y[rows, out] = alpha X[rows, in] W[in, out] (+ beta Y) (+ bias) (relu / gelu), row-major. X transposed: stored
