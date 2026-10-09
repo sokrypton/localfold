@@ -96,8 +96,23 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   // (vector staging: the host's word, or for a pointer array - whose pointers the host cannot see - the leading dimensions'
   // (bit 512) and this entry's own pointers' alignment)
   const bool vec = (g.biasType & 256) || ((g.biasType & 512) && ((ulong)A % (8 * sizeof(TA))) == 0 && ((ulong)B % (8 * sizeof(TB))) == 0);
+  // a whole tile (the common case): staged without a bounds check an element (6% of a K-256 projection's time)
+  const bool whole = vec && j0 + TR <= g.n && i0 + TC_ <= g.m && g.k % BK == 0;
   for (int k0 = 0; k0 < g.k; k0 += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (whole) {
+      constexpr int XO = TRB ? BK : TR, XI = TRB ? TR : BK, WO = TRA ? TC_ : BK, WI = TRA ? BK : TC_;
+      _Pragma("clang loop unroll(full)")
+      for (int c = tid; c < XO * (XI / 8); c += 128) {
+        int o = c / (XI / 8), in = (c % (XI / 8)) * 8;
+        lf_stage8<TB, T>(Xs + o * XROW + in, B + (TRB ? (long)(j0 + in) + (long)(k0 + o) * g.ldb : (long)(k0 + in) + (long)(j0 + o) * g.ldb));
+      }
+      _Pragma("clang loop unroll(full)")
+      for (int c = tid; c < WO * (WI / 8); c += 128) {
+        int o = c / (WI / 8), in = (c % (WI / 8)) * 8;
+        lf_stage8<TA, T>(Ws + o * WROW + in, A + (TRA ? (long)(k0 + in) + (long)(i0 + o) * g.lda : (long)(i0 + in) + (long)(k0 + o) * g.lda));
+      }
+    } else {
     {   // X = op(B)^T: element (j, k) = TRB ? B[j + k ldb] : B[k + j ldb]; staged a chunk of 8 along the contiguous axis,
         // 16 bytes where the whole chunk is inside the matrix (and VEC says it is aligned), element by element where not
       constexpr int OUTER = TRB ? BK : TR, INNER = TRB ? TR : BK;
@@ -126,6 +141,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         if (vec && ob < olim && ib + 8 <= ilim) lf_stage8<TA, T>(dst, src);
         else for (int e = 0; e < 8; ++e) dst[e] = (ob < olim && ib + e < ilim) ? (T)lf_ldf(src + e) : (T)0;
       }
+    }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     _Pragma("clang loop unroll(full)")
@@ -327,3 +343,65 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     }
 }
 // (instantiated on first use by the runtime: lf_gemm<TA, TB, TC, TR, TC_, TRA, TRB>, host name lf_gemm_...)
+
+// ---------------------------------------------------------------- an experiment (metal/bench): the plain half GEMM alone,
+// D[n][m] = X[n][k] W[k][m] row-major, TR x TC a threadgroup of SGR x SGC simdgroups, BK a step - no epilogues, whole
+// tiles only (the bench's shapes divide)
+template <int TR, int TC_, int BK, int SGR, int SGC, bool HACC>
+kernel void lf_gemm_x(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr int NT = 32 * SGR * SGC, PAD = 8, XROW = BK + PAD, WROW = TC_ + PAD;
+  constexpr int WR = TR / SGR, WC = TC_ / SGC, FR = WR / 8, FC = WC / 8;
+  threadgroup half Xs[TR * XROW];
+  threadgroup half Ws[BK * WROW];
+  device const half* W = (device const half*)g.A;
+  device const half* X = (device const half*)g.B;
+  device half* D = (device half*)g.D;
+  const int j0 = grp.y * TR, i0 = grp.x * TC_;
+  const int sr = (sg / SGC) * WR, sc = (sg % SGC) * WC;
+  typedef metal::conditional_t<HACC, simdgroup_half8x8, simdgroup_float8x8> ACC;
+  ACC acc[FR][FC];
+  _Pragma("clang loop unroll(full)")
+  for (int a = 0; a < FR; ++a)
+    _Pragma("clang loop unroll(full)")
+    for (int b = 0; b < FC; ++b) acc[a][b] = ACC(0);
+  for (int k0 = 0; k0 < g.k; k0 += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (int c = tid; c < TR * (BK / 8); c += NT) {
+      int o = c / (BK / 8), in = (c % (BK / 8)) * 8;
+      device const half* src = X + (long)(j0 + o) * g.ldb + k0 + in;
+      *(threadgroup half4*)(Xs + o * XROW + in) = *(device const half4*)src;
+      *(threadgroup half4*)(Xs + o * XROW + in + 4) = *(device const half4*)(src + 4);
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int c = tid; c < BK * (TC_ / 8); c += NT) {
+      int o = c / (TC_ / 8), in = (c % (TC_ / 8)) * 8;
+      device const half* src = W + (long)(k0 + o) * g.lda + i0 + in;
+      *(threadgroup half4*)(Ws + o * WROW + in) = *(device const half4*)src;
+      *(threadgroup half4*)(Ws + o * WROW + in + 4) = *(device const half4*)(src + 4);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (int kk = 0; kk < BK; kk += 8) {
+      simdgroup_half8x8 xm[FR], wm[FC];
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a) simdgroup_load(xm[a], Xs + (sr + a * 8) * XROW + kk, XROW);
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < FC; ++b) simdgroup_load(wm[b], Ws + kk * WROW + sc + b * 8, WROW);
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a)
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) simdgroup_multiply_accumulate(acc[a][b], xm[a], wm[b], acc[a][b]);
+    }
+  }
+  _Pragma("clang loop unroll(full)")
+  for (int a = 0; a < FR; ++a)
+    _Pragma("clang loop unroll(full)")
+    for (int b = 0; b < FC; ++b) {
+      simdgroup_half8x8 o;
+      if constexpr (HACC) o = acc[a][b];
+      else { thread auto& e = acc[a][b].thread_elements(); thread auto& f = o.thread_elements(); f[0] = (half)e[0]; f[1] = (half)e[1]; }
+      simdgroup_store(o, D + (long)(j0 + sr + a * 8) * g.ldd + i0 + sc + b * 8, (ulong)g.ldd);
+    }
+}

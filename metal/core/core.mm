@@ -64,7 +64,6 @@ struct Device {
   std::set<std::string> knownSpecs; std::string specsPath; bool specsLoaded = false;
   std::map<std::string, std::string> specDecls;
   // profiling
-  bool profiling = getenv("LOCALFOLD_PROFILE") && atoi(getenv("LOCALFOLD_PROFILE"));
   bool profileOn = false;
   std::vector<std::pair<std::string, id<MTLCommandBuffer>>> profiled;
   Stats stats;
@@ -455,6 +454,7 @@ void dispatchInstance(const std::string& name, const std::string& decl, const vo
 void precompile() { D().precompile(); }
 
 // ---------------------------------------------------------------- GEMM
+int GEMM_EXTRA_EP = 0;
 namespace {
 void gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool accFloat, const char* label) {
   if (a.m <= 0 || a.n <= 0 || batch <= 0) return;
@@ -485,11 +485,12 @@ void gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
              a.A % (8 * esize(ta_)) == 0 && a.B % (8 * esize(tb_)) == 0;
   if (vec) a.biasType |= 256;
   int bk = (tc >= 48 && tr >= 48) || (tc == 32 && tr >= 80) ? 16 : 32;
+  if (const char* e = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(e);
   static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") && strcmp(getenv("LOCALFOLD_GEMM_FLOAT_ACC"), "0") != 0;
   const bool hacc = !floatAcc && !accFloat && ta_ == F16 && tb_ == F16 && tc_ == F16;
   const bool hmma = halfMma && !(ta_ == F16 && tb_ == F16);     // (half staging of an f32 operand)
   auto mtype = [](DT t) { return t == F32 ? "float" : "half"; };
-  int ep = (a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0) | (hmma ? 32 : 0);
+  int ep = (a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0) | (hmma ? 32 : 0) | GEMM_EXTRA_EP;
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
                       std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " +
                       std::to_string(bk) + ", " + std::to_string(ep);
@@ -576,10 +577,10 @@ void add(float* y, const float* x, size_t n, float a) { run1d("lf_add", (n + 3) 
 void addBias(float* y, const float* b, size_t rows, int C, int act) { run1d("lf_add_bias", rows * C, BiasArgs{y, b, rows, C, act}); }
 
 // ---------------------------------------------------------------- profiling
-bool profiling() { return D().profiling; }
+bool profiling() { const char* e = getenv("LOCALFOLD_PROFILE"); return e && atoi(e); }
 void profileStart() {
   Device& d = D();
-  if (!d.profiling) return;
+  if (!profiling()) return;
   d.sync(); d.profiled.clear(); d.profileOn = true;
 }
 void profileReport(const char* stage, int top) {

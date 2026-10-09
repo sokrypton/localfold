@@ -85,6 +85,7 @@ struct Gemm {
   const char* label = nullptr;
 };
 void gemm(const Gemm& g);
+extern int GEMM_EXTRA_EP;     // (an arm: bits ORed into every GEMM instance's EP - metal/bench)
 // shorthands: f32 or f16 X, a weight, Y f32 or f16
 inline void gemm(const float* X, const half* W, float* Y, size_t rows, int in, int out, float beta = 0.f) {
   Gemm g{}; g.X = X; g.tx = F32; g.W = W; g.tw = F16; g.Y = Y; g.ty = F32; g.rows = rows; g.in = in; g.out = out;
