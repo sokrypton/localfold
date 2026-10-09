@@ -72,6 +72,10 @@ inline void benchOps(int nTok, int S = 1) {
   time("ffw2 GEMM 1536->768", [&] { linear<half, float>(gated, att, n, I, C, B + ".ffwTransition2"); });
   time("empty kernel", [&] { addK<<<1, 32, 0, STREAM>>>(att, att, 0); });
 }
+__global__ void halfToFloatScaledK(const half* in, float* out, size_t n, float sc) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __half2float(in[i]) * sc;
+}
 // --bench-grid=N: the pair track's grid attention alone at N tokens (4 heads of 32, every row,
 // no mask), the arms interleaved and each the median of several rounds of 10 launches
 inline void benchGrid(int n) {
@@ -120,6 +124,25 @@ inline void benchGrid(int n) {
     size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
     printf("  2R no-bias against zero bias: %zu of %zu outputs differ\n", differ, a.size());
     CK(cudaFree(zb));
+  }
+  {   // the 2R kernel's output against the f32-score reference's (scores, softmax and sums all f32)
+    float* outF = dalloc(rows * n * Wd);
+    float* qF = dalloc(rows * n * 4 * Wd); float* bF = dalloc((size_t)heads * n * stride);
+    halfToFloatScaledK<<<blocks(rows * n * 4 * Wd), 256, 0, STREAM>>>(qkvg, qF, rows * n * 4 * Wd, 1.f);
+    halfToFloatScaledK<<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(bias, bF, (size_t)heads * n * stride, 1.f / LOG2E);
+    dim3 g((n + 63) / 64, (unsigned)(rows * heads));
+    float* ones = dalloc((size_t)n * n);
+    { std::vector<float> h((size_t)n * n, 1.f); CK(cudaMemcpy(ones, h.data(), h.size() * 4, cudaMemcpyHostToDevice)); }
+    flashGridF32<32><<<g, 64, 0, STREAM>>>(qF, bF, stride, ones, outF, n, heads, 0, false, 0.17f);
+    CK(cudaFree(qF)); CK(cudaFree(bF)); CK(cudaFree(ones));
+    std::vector<float> ref(rows * n * Wd); CK(cudaMemcpy(ref.data(), outF, ref.size() * 4, cudaMemcpyDeviceToHost));
+    auto rel = [&](const char* name, auto run) {
+      run(); std::vector<half> b2(rows * n * Wd); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+      double num = 0, den = 0; for (size_t i = 0; i < b2.size(); ++i) { double y = __half2float(b2[i]); num += (y - ref[i]) * (y - ref[i]); den += (double)ref[i] * ref[i]; }
+      printf("  %-14s relRMS %.3e from the f32-score reference\n", name, std::sqrt(num / std::max(den, 1e-30)));
+    };
+    rel("2R", [&] { flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr); });
+    CK(cudaFree(outF));
   }
   {   // the block order (GRID_SWIZZLE): the same blocks in another order, so the same bytes
     int was = GRID_SWIZZLE;

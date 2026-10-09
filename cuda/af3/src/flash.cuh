@@ -614,7 +614,7 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
 }
 // (4 warps a block - every shipped form - asks the compiler for three blocks an SM, which it reached anyway at 168 registers:
 // its schedule moves, --bench-grid 1.20 -> 1.19 ms at 1,000 tokens, 4.60 -> 4.51 at 2,000, 40.1 -> 39.4 at 6,000, byte-
-// identical; four blocks spill, 4-8% slower)
+// identical; four blocks spill, 4-8% slower; 32-key tiles at four or five blocks an SM are 3% and 40% behind at 4,000)
 // NB: no bias at all (AF2's MSA column attention): the scores start at zero and no bias tile is loaded
 // ONE: one stage, the next tile held in registers across the tile's compute and stored between two barriers -
 // a T4's form (no cp.async; two stages are 39 KB, one block of 4 warps an SM there, one is three)
@@ -790,18 +790,29 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
     __syncthreads();
     const half *K = Kst(st), *V = Vst(st), *B = Bst(st);
     uint32_t sh[MT][BK / 8][2];
+    // the bias tile straight into the score accumulators' layout by ldmatrix - an 8x8 matrix's thread t holds row t / 4,
+    // columns 2 (t % 4) and one more, which is an m16n8 accumulator's - four of them (two key tiles of 8, rows g and
+    // g + 8) an instruction, where 32-bit loads took one a pair (24 a warp a tile against 6): --bench-grid 17.80 -> 17.45
+    // ms at 4,000 tokens (256 rows), the fold's grid attention -1.1% at 2,964 tokens and +0.7% at 988; byte-identical
+    static_assert(BK % 16 == 0, "key tiles in pairs of 8");
+    if constexpr (!NB) {
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        const half* rowp = B + (warp * 16 * MT + mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * LDB + (lane >> 4) * 8;
+#pragma unroll
+        for (int nt = 0; nt < BK / 8; nt += 2) {
+          uint32_t r4[4];
+          ldsm4(r4, rowp + nt * 8);
+          sh[mt][nt][0] = r4[0]; sh[mt][nt][1] = r4[1]; sh[mt][nt + 1][0] = r4[2]; sh[mt][nt + 1][1] = r4[3];
+        }
+      }
+    }
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
-      const half* hb0 = B + (warp * 16 * MT + mt * 16 + g) * LDB;
-      const half* hb1 = hb0 + 8 * LDB;
 #pragma unroll
       for (int nt = 0; nt < BK / 8; ++nt) {
         int jj = nt * 8 + tig * 2;
         if constexpr (NB) { sh[mt][nt][0] = 0u; sh[mt][nt][1] = 0u; }
-        else {
-          sh[mt][nt][0] = *reinterpret_cast<const uint32_t*>(hb0 + jj);
-          sh[mt][nt][1] = *reinterpret_cast<const uint32_t*>(hb1 + jj);
-        }
         if (tile == tiles - 1) {
           int jg = tile * BK + jj;
           if (jg >= n) { sh[mt][nt][0] = (sh[mt][nt][0] & 0xFFFF0000u) | 0xFC00u; sh[mt][nt][1] = (sh[mt][nt][1] & 0xFFFF0000u) | 0xFC00u; }
@@ -846,6 +857,10 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
       uint32_t pa[MT][4];
 #pragma unroll
       for (int mt = 0; mt < MT; ++mt) {
+        // (a quarter to all of these on the FMA pipe instead of the MUFU - 2^x as a cubic in f16, 2^round(x) laid into
+        // the exponent; relRMS 3.5-4.0e-4 from the f32 reference against 3.3e-4 - was measured 1-14% SLOWER at 1,000
+        // and 4,000 tokens: the MUFU is busy as often as the tensor pipe, but neither binds, and the cubic's nine
+        // instructions a pair cost more issue than the MUFU's waits)
         pa[mt][0] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t][0]), hn[mt][0])));
         pa[mt][1] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t][1]), hn[mt][1])));
         pa[mt][2] = ex2h2(asU32(__hsub2(asH2(sh[mt][2 * t + 1][0]), hn[mt][0])));
