@@ -122,9 +122,10 @@ def wait_for(kind, since, seconds=20):
     return None, since, seen
 
 
-def start_broker(port, cuda=True, extra_env=None, local=False):
+def start_broker(port, cuda=True, extra_env=None, local=False, token=TOKEN):
     proc = subprocess.Popen(
-        [sys.executable, "python/localfold/server.py", "--port", str(port), "--token", TOKEN,
+        [sys.executable, "python/localfold/server.py", "--port", str(port),
+         *(["--token", token] if token else []),
          *(["--native"] if cuda else []), *(["--local"] if local else [])],
         cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         env=dict(os.environ, LOCALFOLD_WORKER=STUB, LOCALFOLD_STUB_FEED=FEED,
@@ -398,9 +399,18 @@ try:
 
     # 8b · the reader's own machine (`localfold serve`, --local): the badge says so and offers no Disconnect -
     # the page's Stop ends a fold, and the server is stopped where it was started
-    mine, _ = start_broker(PORT + 3, local=True)
+    mine, _ = start_broker(PORT + 3, local=True, token=None)
     try:
-        open_reader(reader_ws, PORT + 3)
+        # ...with no token at all (the plain link `localfold serve` opens), and no wildcard for other pages to read it
+        import urllib.request
+        answer = urllib.request.urlopen(f"http://127.0.0.1:{PORT + 3}/health")
+        local_health = json.load(answer)
+        wildcard = answer.headers.get("Access-Control-Allow-Origin")
+        print(f"  --local, no token: /health {local_health.get('local')}, Access-Control-Allow-Origin {wildcard!r}")
+        if local_health.get("local") is not True or wildcard is not None:
+            bad.append(f"a local server without a token: /health {local_health}, wildcard {wildcard!r}")
+        reader_ws.call("Page.navigate", url=f"http://127.0.0.1:{PORT + 3}/index.html?backend=native")
+        cdp.wait_for(reader_ws, "!!window.__entityList && !!document.querySelector('.native-said')", 120, "the local page")
         time.sleep(4)
         badge = cdp.evaluate(reader_ws, """(() => { const b = document.getElementById('native-status');
           const leave = b?.querySelector('button');

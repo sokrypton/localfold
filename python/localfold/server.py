@@ -4,7 +4,8 @@
     python3 python/localfold/server.py --native --local --open       # the same from a checkout
     python3 python/localfold/server.py --port 8710 --native --token t   # a token of your own (Colab's notebook)
 
-It serves the page - the reader's page is `index.html?backend=native&t=<token>` on it - and brokers between that
+It serves the page - the reader's page is `index.html?backend=native&t=<token>` on it (with no token on the reader's
+own machine, --local) - and brokers between that
 page and one worker process, python/localfold/worker.py, which folds with the native port this machine has:
 metal/ on Apple silicon, cuda/ on an NVIDIA card (Colab's runtime is one). Instead of the page's WebGPU code: twice
 the speed on an M2, every model, no binding ceiling and no weights in the browser. /health says which (`native`).
@@ -248,6 +249,9 @@ def serve(port, token, host="127.0.0.1", worker=None, gpu=None, local=False):
             pass
 
         def _cors(self):
+            # (not for a local server: its page is same-origin, and the wildcard would let any other page read it)
+            if local:
+                return
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers",
                              "content-type, x-localfold-token")
@@ -274,6 +278,8 @@ def serve(port, token, host="127.0.0.1", worker=None, gpu=None, local=False):
             self.wfile.write(body)
 
         def _authorised(self):
+            if token is None:           # (a local server started without one: the reader's own machine, on loopback)
+                return True
             given = self.headers.get("X-LocalFold-Token", "")
             if not given:
                 query = urllib.parse.urlparse(self.path).query
@@ -397,7 +403,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8710)
     parser.add_argument("--token", default=None,
-                        help="the shared secret; one is generated when absent")
+                        help="the shared secret; one is generated when absent - except with --local, which needs none")
     parser.add_argument("--host", default="127.0.0.1",
                         help="what to bind; the tunnel reaches loopback")
     parser.add_argument("--native", "--cuda", dest="native", action="store_true",
@@ -405,10 +411,15 @@ def main():
                              "metal/build.sh, cuda/build.sh); --cuda is its old name")
     parser.add_argument("--open", action="store_true", help="open the page in the default browser")
     parser.add_argument("--local", action="store_true",
-                        help="this is the reader's own machine (localfold serve): the page offers no Disconnect")
+                        help="this is the reader's own machine (localfold serve): no token unless --token names one,"
+                             " and the page offers no Disconnect")
     arguments = parser.parse_args()
 
-    token = arguments.token or secrets.token_urlsafe(24)
+    # 🔴 A LOCAL SERVER TAKES NO TOKEN, BY CHOICE: on the reader's own machine the link stays plain
+    # (http://127.0.0.1:8710/index.html?backend=native). Anything else on this machine that can reach loopback - a
+    # page open in the browser included - can then ask it for a fold; Colab's port is reachable from outside, so a
+    # runtime keeps its token.
+    token = arguments.token or (None if arguments.local else secrets.token_urlsafe(24))
     worker = Worker() if arguments.native else None
     gpu = gpu_info()
     httpd = serve(arguments.port, token, arguments.host, worker, gpu, local=arguments.local)
@@ -419,7 +430,8 @@ def main():
           flush=True)
     # One line, machine-readable, for the notebook cell that prints the handle.
     print("BACKEND " + json.dumps({"token": token, "gpu": gpu}), flush=True)
-    url = f"http://{'127.0.0.1' if arguments.host in ('0.0.0.0', '') else arguments.host}:{arguments.port}/index.html?backend=native&t={token}"
+    url = (f"http://{'127.0.0.1' if arguments.host in ('0.0.0.0', '') else arguments.host}:{arguments.port}"
+           f"/index.html?backend=native" + (f"&t={token}" if token else ""))
     print(f"open {url}", flush=True)
     if arguments.open:
         import webbrowser

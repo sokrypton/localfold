@@ -8,8 +8,8 @@ localfold/server.py, and every fold it asks for goes to localfold/worker.py - th
 Metal on Apple silicon and CUDA on Linux - instead of the browser's WebGPU. The weights are the binaries' own,
 fetched once into ~/.cache/localfold (or --weights-dir), and the page holds none.
 
-A token generated at start is in the link it opens; every request to the server carries it, so another page in the
-same browser cannot spend this machine's GPU. The page's Stop ends a fold; Ctrl-C stops the server.
+The link is plain - no token: it is this machine's own server on loopback (`--token` asks for one). The page's Stop
+ends a fold; Ctrl-C stops the server.
 """
 import argparse
 import os
@@ -74,7 +74,7 @@ def main(argv=None):
     parser.add_argument("--weights-dir", default=os.path.join(os.path.expanduser("~"), ".cache", "localfold"),
                         help="where the models' weights are kept (default ~/.cache/localfold)")
     parser.add_argument("--no-open", action="store_true", help="do not open the browser")
-    parser.add_argument("--token", default=None, help="the shared secret (default: a new one each start)")
+    parser.add_argument("--token", default=None, help="a shared secret every request must carry (default: none)")
     arguments = parser.parse_args(argv)
 
     cache = os.path.abspath(os.path.expanduser(arguments.weights_dir))

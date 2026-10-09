@@ -33,8 +33,9 @@ import { devSourceIs } from "./dev-log.js";
  * it is not where it lives.
  */
 const TOKEN = new URLSearchParams(location.search).get("t") ?? "";
+// (no token on the reader's own machine: `localfold serve` asks for none)
 const door = (route, extra = "") =>
-  `${route}?t=${encodeURIComponent(TOKEN)}${extra}`;
+  `${route}?t=${encodeURIComponent(TOKEN)}${extra}`.replace("?t=&", "?").replace(/\?t=$/, "");
 
 const ask = async (route, body) => {
   const answer = await fetch(door(route), {

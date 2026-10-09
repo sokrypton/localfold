@@ -46,7 +46,7 @@ binary by `build.sh`; the GEMM's is `args.h + gemm.metal`, compiled per (types, 
 every fold to these ports instead of the browser's WebGPU - python/localfold/server.py and worker.py, the same
 broker and worker Colab's runtime runs, driving metal/ here and cuda/ on NVIDIA. From a checkout:
 `python3 python/localfold/server.py --native --local --open`. The page says where it folds ("Local server · Apple M2 ·
-Metal"); a token in the link it opens is on every request.
+Metal"); its link is plain, with no token - it is this machine's own server on loopback.
 
 `python3 tools/check-native-worker.py --offline --no-af3` (`npm run test:native`) holds it here: every case of the
 CUDA backend's gate - 21 folds over every family but AlphaFold 3 itself (whose weights need DeepMind's terms), the
