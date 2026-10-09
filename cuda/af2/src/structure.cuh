@@ -101,6 +101,38 @@ __global__ void ipaOutputsK(const float* attn, const float* vs, const float* vp,
     f[Hh * Cs + 4 * Hh * Pv + h * C2 + c] = s;
   }
 }
+// ipaOutputsK's pair term, a block a QUERY for every head at once: each act2d element is read once and feeds all Hh
+// heads' sums (a block a (query, head) read the query's pair row once per head - 12 times, ~1.5 GB a call at 494
+// residues). Each sum runs over k in the same order with the same arithmetic, so the outputs are the same bytes.
+constexpr int IPA_MAX_HEADS = 16, IPA_KT = 256;
+__global__ void ipaPairTermK(const float* attn, const float* act2d, float* final_, int L, int Hh, int Cs, int Pv, int C2) {
+  __shared__ float as[IPA_MAX_HEADS][IPA_KT];
+  int q = blockIdx.x, c = threadIdx.x;
+  int Fw = Hh * Cs + 4 * Hh * Pv + Hh * C2;
+  float acc[IPA_MAX_HEADS];
+#pragma unroll
+  for (int h = 0; h < IPA_MAX_HEADS; ++h) acc[h] = 0.f;
+  for (int k0 = 0; k0 < L; k0 += IPA_KT) {
+    int kt = min(IPA_KT, L - k0);
+    __syncthreads();
+    for (int t = threadIdx.x; t < Hh * kt; t += blockDim.x) {
+      int h = t / kt, k = t % kt;
+      as[h][k] = attn[((size_t)q * Hh + h) * L + k0 + k];
+    }
+    __syncthreads();
+    if (c < C2)
+#pragma unroll 8
+      for (int k = 0; k < kt; ++k) {
+        float v = act2d[((size_t)q * L + k0 + k) * C2 + c];
+#pragma unroll
+        for (int h = 0; h < IPA_MAX_HEADS; ++h) if (h < Hh) acc[h] += as[h][k] * v;
+      }
+  }
+  if (c < C2) {
+    float* f = final_ + (size_t)q * Fw;
+    for (int h = 0; h < Hh; ++h) f[Hh * Cs + 4 * Hh * Pv + h * C2 + c] = acc[h];
+  }
+}
 // a pair position's LayerNorm statistics, by layerNormK's own arithmetic (two passes, a warp a row)
 __global__ void lnStatsK(const float* x, float2* stats, size_t rows, int C) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -271,7 +303,10 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
     linearB(act, I + "v_point_projection/point_projection", -1, proj, L, C, Hh * 3 * Pv);
     pointsToGlobalK<<<blocks((size_t)L * Hh * Pv), 256, 0, STREAM>>>(proj, rig, vp, L, Hh, Pv);
     ipaWeightsK<<<(unsigned)(((size_t)L * Hh + 7) / 8), 256, 0, STREAM>>>(qs, ks, qp, kp, b2d, pw, seqMask, attn, L, Hh, Cs, Pq);
-    ipaOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, vs, vp, act2d, rig, fin, L, Hh, Cs, Pv, C2);
+    // (the pair term apart, a block a query: see ipaPairTermK)
+    const bool pairApart = act2d && Hh <= IPA_MAX_HEADS && C2 <= 1024;
+    ipaOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, vs, vp, pairApart ? nullptr : act2d, rig, fin, L, Hh, Cs, Pv, C2);
+    if (pairApart) ipaPairTermK<<<L, (C2 + 31) / 32 * 32, 0, STREAM>>>(attn, act2d, fin, L, Hh, Cs, Pv, C2);
     if (lean) ipaPairOutputsK<<<L * Hh, 128, 0, STREAM>>>(attn, pair, stats, P(S + "pair_layer_norm/scale"),
                                                          P(S + "pair_layer_norm/offset"), fin, L, Hh, Cs, Pv, C2);
     linearB(fin, I + "output_projection", -1, upd, L, Fw, C);
