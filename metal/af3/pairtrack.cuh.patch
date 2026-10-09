@@ -143,7 +143,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
 @@@ new
 template <int C, class PT>
 __global__ void lnBiasMetal(const float* x, const float* sc, const float* of, const half* Wp, half* norm, half* bias,
-                            size_t rows, int n, int stride, int heads, bool swap, float scale) {
+                            size_t rows, int n, int stride, int heads, bool swap, float scale, bool trNorm) {
   constexpr int K = C / 32;
   const int lane = threadIdx.x & 31;
   const size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -154,12 +154,14 @@ __global__ void lnBiasMetal(const float* x, const float* sc, const float* of, co
   for (int k = 0; k < K; ++k) { v[k] = (float)xr[lane + 32 * k]; s += v[k]; ss += v[k] * v[k]; }
   for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
   float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+  const int pi = (int)(row / (size_t)n), pj = (int)(row - (size_t)pi * n);
+  // (trNorm: the column direction's rows, norm[(j, i)] = LN(pair[(i, j)]) - the gather pass it otherwise takes)
+  half* nrow = norm + (trNorm ? (size_t)pj * n + pi : row) * C;
   for (int k = 0; k < K; ++k) {
     half hv = __float2half((v[k] - mean) * inv * sc[lane + 32 * k] + of[lane + 32 * k]);
-    norm[row * C + lane + 32 * k] = hv;
+    nrow[lane + 32 * k] = hv;
     v[k] = (float)hv;
   }
-  const int pi = (int)(row / (size_t)n), pj = (int)(row - (size_t)pi * n);
   const int bi = swap ? pj : pi, bj = swap ? pi : pj;
   if (heads == 4) {   // the four sums in one butterfly: 6 shuffles where four reductions take 20
     float a[4];
@@ -206,8 +208,9 @@ __global__ void lnBiasMetal(const float* x, const float* sc, const float* of, co
       half* bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
       WITH_PAIR_T(lnBiasMetal<128, PT><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
         pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(pre + ".pairBiasProjection"), norm, bias, pairs,
-        n, stride, heads, tr && swapBias, LOG2E));
+        n, stride, heads, tr && swapBias, LOG2E, tr && !noNormT));
       biasDone = true;
+      normTransposed = tr && !noNormT;
     }
     if (!headMajor && !biasDone) {
       lnPairRows<T>(pair, 0, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");

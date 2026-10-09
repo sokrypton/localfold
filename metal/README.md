@@ -77,7 +77,9 @@ And **the unfused grid attention's pair bias in one kernel** (`lnBiasMetal`, `me
 simdgroup a pair row takes its LayerNorm (layerNormK's arithmetic: `norm` is the same bytes) and the four heads'
 logits - reduced together in one butterfly, 6 shuffles where four reductions took 20 - and writes them into the flash
 kernel's bias layout. layerNormK + a 4-column GEMM (a 32-column tile, 7/8 padding) + biasLayoutK were 1176 ms at 255
-tokens; now 950. GPU 16.98 -> 16.81 s. `LOCALFOLD_UNFUSED_BIAS=1` is the control.
+tokens; now 950. GPU 16.98 -> 16.81 s. `LOCALFOLD_UNFUSED_BIAS=1` is the control. In the column direction it writes `norm` transposed
+as well, so gatherTransposedK's pass (169 ms) is gone: 16.81 -> 16.61 s, the same digits (`LOCALFOLD_GRID_NORM_T=0`,
+the port's own switch, is the control).
 
 🔴 **rosettafold3-6mrr AND af3-glycan SWING UNDER ANY ROUNDING CHANGE.** rf3's RMSD went 1.699 -> 1.764 -> 1.706 over
 two changes that each move the other cases' digits only, and glycan's pLDDT 44.35 -> 45.30 -> 44.63; seed by seed
