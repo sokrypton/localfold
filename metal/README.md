@@ -205,6 +205,9 @@ alone - `metal/tools/build-bench-gemm.sh` builds it):
 - **Double-buffered GEMM tiles** (the next k step staged into a second buffer before this one's multiply, one barrier
   a step where there are two): correct and 1.13-1.37x the time on every shape measured, interleaved. As with the
   register prefetch, Apple's GPUs hide latency with resident threadgroups, and the second buffer costs them.
+- **Eight simdgroups to a threadgroup** (a 128 x 64 tile, each simdgroup still 32 x 32 - the staged tiles serving twice
+  the multiplies): 1.04x the time on three trunk shapes. For scale, this M2's simdgroup_matrix peak with nothing but
+  multiply-accumulates in registers is **3.5 TFLOP/s** (half or float accumulators alike); the GEMMs run at 2.2-2.7.
 - **Bigger GEMM tiles now that the accumulators are half** (`LOCALFOLD_GEMM_TILE=RxC`, an arm in the runtime): 64 x 128
   is 0.33 TFLOP/s where 64 x 64 is 1.71 on 512 x 68121 x 128, 128 x 64 0.16 - spilled registers, half accumulators or
   not. 32 x 64 ties the 48 x 64 the diffusion's 272 rows take.
