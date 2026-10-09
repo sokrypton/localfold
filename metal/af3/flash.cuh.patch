@@ -17,7 +17,7 @@ __global__ void flashGridMetal(const half* qkvg, const half* bias, int biasStrid
                                size_t posStride, size_t outRowStride, size_t outPosStride, int rowsHere) {
   constexpr int BK = 16, QB = 32;
   threadgroup half Qs[QB * D];
-  threadgroup half Ks[D * BK];      // [d][key]
+  threadgroup half Ks[BK * D];      // [key][d], loaded transposed
   threadgroup half Vs[BK * D];      // [key][d]
   const int warp = _c.warp, lane = _c.lane, tid = threadIdx.x;
   const size_t b = blockIdx.y;
@@ -53,16 +53,14 @@ __global__ void flashGridMetal(const half* qkvg, const half* bias, int biasStrid
       for (int t = tid * 4; t < BK * D; t += 128 * 4) {
         int jj = t / D, e = t % D, j = min(j0 + jj, n - 1);
         device const half* kp = base + (size_t)j * posStride;
-        half4 kv = *(device const half4*)(kp + Wd + e);
-        Ks[(e + 0) * BK + jj] = kv.x; Ks[(e + 1) * BK + jj] = kv.y;
-        Ks[(e + 2) * BK + jj] = kv.z; Ks[(e + 3) * BK + jj] = kv.w;
+        *(threadgroup half4*)(Ks + t) = *(device const half4*)(kp + Wd + e);
         *(threadgroup half4*)(Vs + t) = *(device const half4*)(kp + 2 * Wd + e);
       }
     } else
     for (int t = tid; t < BK * D; t += 128) {
       int jj = t / D, e = t % D, j = min(j0 + jj, n - 1);
       device const half* kp = base + (size_t)j * posStride;
-      Ks[e * BK + jj] = kp[Wd + e];
+      Ks[t] = kp[Wd + e];
       Vs[t] = kp[2 * Wd + e];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -74,7 +72,7 @@ __global__ void flashGridMetal(const half* qkvg, const half* bias, int biasStrid
       _Pragma("clang loop unroll(full)")
       for (int dt = 0; dt < D / 8; ++dt) {
         simdgroup_half8x8 Kt;
-        simdgroup_load(Kt, Ks, BK, ulong2(kt * 8, dt * 8));
+        simdgroup_load(Kt, Ks + kt * 8 * D + dt * 8, D, ulong2(0, 0), true);
         simdgroup_multiply_accumulate(S[kt], Qm[dt], Kt, S[kt]);
       }
       thread auto& e = S[kt].thread_elements();

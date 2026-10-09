@@ -104,7 +104,7 @@ transformer, `atom.cuh.patch` for the atom blocks): swigluK's 30 passes a step g
 two changes that each move the other cases' digits only, and glycan's pLDDT 44.35 -> 45.30 -> 44.63; seed by seed
 the arms agree (above). A MOVED on those two alone, with every other case in its digits, is that and not a defect.
 
-And in `flashGridMetal`: K and V staged four halves a load (3109 -> 2630 ms at 255 tokens). center_norm's
+And in `flashGridMetal`: K and V staged four halves a load (3109 -> 2630 ms at 255 tokens), and K staged row-major as V is - a vector store, not four scalar ones transposing it - and transposed by its simdgroup load (2611 -> 2482). center_norm's
 statistics summed while loading, by all eight rows of threads where one row did it alone (613 -> 365 ms).
 `layerNormK` is at the M2's bandwidth already (~95 GB/s), and a pair-bias read two halves at a time moved nothing.
 
