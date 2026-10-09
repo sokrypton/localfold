@@ -95,3 +95,41 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     triGateK<T><<<dim3((unsigned)((rows + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(
       pgOut, mask, a, b, r0, rows, C, cs, n, np);
 @@@ end
+
+# center_norm's statistics: every thread sums its own channels while it loads them, and the eight partial sums are
+# combined, where the port has one row of 32 threads walk all C channels out of shared memory while seven wait; and
+# a pair's row index is divided out once, not once a channel.
+@@@ old
+  for (int c = ty; c < C; c += 8) {
+    size_t local = i0 + tx;
+    unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
+    T_[c * 33 + tx] = local < rows ? prod[(size_t)c * pairs + (size_t)i * np + (p - i * (unsigned)n)] : 0.f;
+  }
+  __syncthreads();
+  if (ty == 0) {
+    float s = 0, ss = 0;
+    for (int c = 0; c < C; ++c) { float v = T_[c * 33 + tx]; s += v; ss += v * v; }
+    float m = s / C; mean[tx] = m; inv[tx] = rsqrtf(ss / C - m * m + 1e-5f);
+  }
+  __syncthreads();
+@@@ new
+  __shared__ float part[2 * 8 * 32];
+  {
+    size_t local = i0 + tx;
+    unsigned p = (unsigned)(r0 + local), i = p / (unsigned)n;
+    size_t at = (size_t)i * np + (p - i * (unsigned)n);
+    float s = 0, ss = 0;
+    for (int c = ty; c < C; c += 8) {
+      float v = local < rows ? prod[(size_t)c * pairs + at] : 0.f;
+      T_[c * 33 + tx] = v; s += v; ss += v * v;
+    }
+    part[ty * 32 + tx] = s; part[256 + ty * 32 + tx] = ss;
+  }
+  __syncthreads();
+  if (ty == 0) {
+    float s = 0, ss = 0;
+    for (int k = 0; k < 8; ++k) { s += part[k * 32 + tx]; ss += part[256 + k * 32 + tx]; }
+    float m = s / C; mean[tx] = m; inv[tx] = rsqrtf(ss / C - m * m + 1e-5f);
+  }
+  __syncthreads();
+@@@ end
