@@ -426,5 +426,5 @@ finally:
 print()
 for line in bad:
     print("FAIL: " + line)
-print("remote bridge: " + ("FAILED" if bad else "ok"))
+print("native bridge: " + ("FAILED" if bad else "ok"))
 raise SystemExit(1 if bad else 0)
