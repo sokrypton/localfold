@@ -4000,7 +4000,7 @@ above was taken before that commit, warm. The full model was not run there: its 
 
 Its bundles exported on the VM from the same sources as this box's (biohub/ESMFold2-Fast at `c6c7958d63`, its
 safetensors' SHA-256 equal to ours; af3-any-model's `lm/esmc.bin.zst`, unpacked by its own loader's steps) -
-`--model=fast-released`, both sides warm, one sample, 3 loops (the port's bundle) and 20 (the checkpoint's config):
+`--model=ef2-fast`, both sides warm, one sample, 3 loops (the port's bundle) and 20 (the checkpoint's config):
 
 | target | tokens | loops | upstream PyTorch | cuEquivariance | fused | **ours, warm** |
 |---|---:|---:|---:|---:|---:|---:|
@@ -4052,5 +4052,6 @@ device-weight cache in cuda/ef2's include graph to register a forget hook. See c
 To reproduce: a Python 3.12 venv with `torch` from the cu128 index, `pip install "esm[fused,cueq12] @ git+https://github.com/evolutionaryscale/esm"`,
 then `pip uninstall cuequivariance-ops-torch-cu13 cuequivariance-ops-cu13` and `pip install cuequivariance==0.8.1
 cuequivariance-torch==0.8.1 cuequivariance-ops-cu12==0.8.1 cuequivariance-ops-torch-cu12==0.8.1 gemmi`, and `xformers`
-from the cu128 index; the fast checkpoint is biohub's `esmfold2-fast-600m` (`--fast-checkpoint=`), the full one
+from the cu128 index; `--model` takes localfold-ef2's names (`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2`), each defaulting to its
+upstream checkpoint (`--checkpoint=` overrides: biohub's `ESMFold2-Experimental-Fast-base600M-step1500k` for the site's), the full one
 `biohub/ESMFold2` (26 GB, fetched by `from_pretrained`).
