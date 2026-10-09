@@ -3972,6 +3972,30 @@ tower resident as int8). Upstream's model load alone is 10.5 s; ours is 1.6-4 s 
 | 5CAJ + alignment | 1.96 / 1.96 | 1.91 / 1.95 |
 | 1TIM + alignment | 1.24 / 1.13 | 1.29 / 1.23 |
 
+### ESMFold2-fast 600M on Colab's RTX PRO 6000 (2026-10-09)
+
+The same tool on a G4 session (RTX PRO 6000 Blackwell, sm_120, CUDA 13.0), upstream installed by
+`pip install "esm[fused,cueq] @ git+https://github.com/evolutionaryscale/esm"` - torch 2.11.0+cu130, triton 3.6,
+cuEquivariance 0.12.0, no flash-attention or xformers - and the port **timed warm too** (`localfold-ef2 warm`: its
+resident server folds each case three times and the third is read; see below why the one-shot column is not that):
+
+| target | tokens | upstream PyTorch | upstream cuEquivariance | upstream fused | **ours, warm** | ours, one-shot |
+|---|---:|---:|---:|---:|---:|---:|
+| 6MRR | 68 | 169 ms | 175 | 178 | **46** (3.9x fused) | 198 |
+| 1BRS | 195 | 427 | 259 | 228 | **104** (2.2x) | 246 |
+| 5CAJ | 261 | 772 | 371 | 312 | **165** (1.9x) | 309 |
+| 1TIM | 494 | 3,335 | 1,365 | 784 | **501** (1.6x) | 642 |
+| 1TIM x4 | 988 | 19,249 | (fails) | 2,829 | **1,876** (1.5x) | 2,002 |
+
+Against upstream's plain PyTorch 3.7-10x, against its cuEquivariance backend 2.2-3.8x (which still dies at 988
+tokens, now on 0.12.0 - "unexpected keyword argument 's'"), against its fused backend 1.5-3.9x. CA RMSD as on the
+A100 (ours 1.47 / 0.91 / 2.10 / 1.52 A, upstream 1.51 / 0.52 / 2.22 / 1.30). 🔴 **On this card upstream is far
+closer than on the A100** (6MRR 178 ms against the A100's 456; its torch, triton and CUDA are two years newer
+there), and the port's lead is now the small inputs and the 988-token one. 🔴 **AND THE ONE-SHOT COLUMN IS COLD**:
+since b7118c9 a standalone fold skips its warm-up when the input is already written (it saves wall time, command to
+structure), so its stage times carry every kernel's first launch - 6MRR's 198 ms against 46 warm; the A100 table
+above was taken before that commit, warm. The full model was not run there: its bundle is a local export.
+
 ### 🔴 The comparison found a bug of ours, and it looked like nondeterminism
 
 The first full-model run of 1BRS at 3 loops came back at **13.2 A, pLDDT 28.6** - the same command an hour later

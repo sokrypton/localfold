@@ -142,6 +142,57 @@ def upstream(args, cases, work):
     return rows
 
 
+def ours_warm(args, cases, work):
+    """the port timed WARM, as upstream is: its resident server (--serve, the Colab worker's mode) folds each case
+    three times and the third fold's stage times are read - a one-shot binary since b7118c9 skips its warm-up when the
+    input is already written, so its stage times carry every kernel's first launch (6MRR's trunk 128 ms cold, 39 warm)"""
+    binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
+    model = "ef2-fast-600m" if args.model == "fast" else "ef2"
+    r = subprocess.run([os.path.join(ROOT, "cuda", "featurise", "fetch-weights"), model], capture_output=True, text=True)
+    dirs = re.findall(re.escape(model) + r": (/\S+)", r.stdout + r.stderr)
+    if len(dirs) != 2:
+        return [dict(side="localfold-ef2 warm", target=n, loops=l, error="fetch-weights: " + (r.stdout + r.stderr)[-160:])
+                for l in args.loop_list for n, *_ in cases]
+    serve = os.path.join(work, "serve"); os.makedirs(serve, exist_ok=True)
+    log = open(os.path.join(serve, "server.log"), "w")
+    proc = subprocess.Popen([binary, "-", f"--fold-bundle={dirs[0]}", f"--esmc-bundle={dirs[1]}", "--fast", "--warm=96,800",
+                             f"--serve={serve}"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+    rows, count = [], 0
+    def job(inputs, flags):
+        nonlocal count
+        count += 1
+        base = os.path.join(serve, f"{count:06d}")
+        open(base + ".tmp", "w").write("\n".join([inputs, *flags]) + "\n"); os.rename(base + ".tmp", base + ".job")
+        while not os.path.exists(base + ".done"):
+            if proc.poll() is not None: raise RuntimeError(open(log.name).read()[-300:])
+            time.sleep(0.005)
+        return int(open(base + ".done").read().strip() or 1), open(base + ".log").read()
+    try:
+        for loops in args.loop_list:
+            for name, chains, seqs, a3ms in cases:
+                inputs = os.path.join(work, f"in-{name}")
+                f = subprocess.run([os.path.join(ROOT, "cuda", "featurise", "ef2-featurise"), inputs, "--sequence=" + ":".join(seqs)],
+                                   capture_output=True, text=True)
+                if f.returncode != 0 or a3ms:
+                    rows.append(dict(side="localfold-ef2 warm", target=name, loops=loops, error=(f.stdout + f.stderr)[-160:] or "alignment"))
+                    continue
+                pdb = os.path.join(work, f"lfw-{name}-L{loops}.pdb")
+                peak = GpuPeak()
+                for k in range(3):
+                    code, said = job(inputs, [f"--out={pdb}", "--seed=1"])
+                peak.stop = True
+                stages = {m.group(1): float(m.group(2)) for m in re.finditer(r"^([a-z][a-z ]+?) ([0-9.]+) ms", said, re.M)}
+                rows.append(dict(side="localfold-ef2 warm", target=name, loops=loops, ms=sum(stages.values()), gib=peak.gib(),
+                                 rmsd=rmsd(pdb, name, chains) if code == 0 else None,
+                                 **({} if code == 0 else {"error": said.strip()[-160:]})))
+                print(json.dumps(rows[-1]), flush=True)
+        open(os.path.join(serve, "zzzzzz.tmp"), "w").write("quit\n"); os.rename(os.path.join(serve, "zzzzzz.tmp"), os.path.join(serve, "zzzzzz.job"))
+        proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None: proc.kill()
+    return rows
+
+
 def ours(args, cases, work):
     binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
     rows = []
@@ -173,6 +224,7 @@ def main():
     p.add_argument("--full-checkpoint", default="biohub/ESMFold2")
     p.add_argument("--no-msa", action="store_true", help="skip the alignment cases (the full model only reads them)")
     p.add_argument("--only", default="", help="targets whose name contains this")
+    p.add_argument("--ours-only", action="store_true", help="skip upstream (no esm package needed)")
     args = p.parse_args()
     args.loop_list = [int(x) for x in (args.loops or "3").split(",")]
     args.steps = 15 if args.model == "fast" else 14
@@ -182,7 +234,8 @@ def main():
         cases += [(n + "+msa", dict(TARGETS)[n], [chain_seq(n, c) for c in dict(TARGETS)[n]], A3M[n]) for n in A3M]
     cases = [c for c in cases if args.only in c[0]]
     work = tempfile.mkdtemp(prefix="compare-ef2-")
-    rows = upstream(args, cases, work) + ours(args, cases, work)
+    rows = (upstream(args, cases, work) if not args.ours_only else []) + ours(args, cases, work)
+    if args.model == "fast": rows += ours_warm(args, cases, work)
     print(f"\n{'target':10s} {'loops':>5s}  " + "  ".join(f"{s:>28s}" for s in sorted({r['side'] for r in rows})))
     for name, *_ in cases:
         for loops in args.loop_list:
