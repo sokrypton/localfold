@@ -159,7 +159,7 @@ int foldInput(const std::string& dir, Options o) {
     if (pass == 0) {
       saveSeam("trunk_out_pair", t.pair, (size_t)n * n * t.C);
       saveSeam("single", t.single, (size_t)n * t.Cs);
-      if (profiling()) profileReport("trunk pass", 30);
+      if (profiling()) profileReport("trunk pass", getenv("AF3_PROFILE_TOP") ? atoi(getenv("AF3_PROFILE_TOP")) : 30);
     }
     if (!o.frames.empty() && M.has("batch.contactClasses")) {
       std::vector<float> c = contactProbabilities(t);
@@ -224,7 +224,7 @@ int foldInput(const std::string& dir, Options o) {
     if (!o.frames.empty() && c0 == 0) frames.start(dir, o.frames, o.steps);     // (the first batch's first sample)
     std::vector<float> xs = sample(o.steps, batch, mask, [&](const float* d, int step, int) { frames.offer(d, step); });
     if (structural) M.swapPrefix("batch.", "sbatch.");                 // (back to the residues, for the files)
-    if (profiling()) profileReport("diffusion", 30);
+    if (profiling()) profileReport("diffusion", getenv("AF3_PROFILE_TOP") ? atoi(getenv("AF3_PROFILE_TOP")) : 30);
     if (getenv("AF3_STAGES")) reportStages();
     diffMs += ms(s0);
     for (size_t k = 0; k < cn; ++k) {
@@ -270,6 +270,8 @@ int foldInput(const std::string& dir, Options o) {
          passesRun, diffMs, o.steps, (int)runs.size(), confMs, ms(t0));
   (void)d0;
   mt::sync();
+  if (getenv("AF3_MEM")) printf("memory: allocated %.0f MB now, peak %.0f MB, scratch %.0f MB\n", allocated() / 1e6, peakAllocated() / 1e6,
+                                scratchHeld() / 1e6);
   freeDiffusion();
   if (structural) freeStructural(st);
   freeTrunk(t);
@@ -316,9 +318,12 @@ int foldMain(int argc, char** argv) {
   {   // the bundle read as published, through the family's weight walk
     lf::weights::Shapes S; S.shape = Model::bundleShapes(bundleDir);
     std::vector<std::string> lines = lf::weights::af3WeightLines(family, S);
-    M.loadBundleWalk(bundleDir, lines, "", [](const std::string&, size_t elements) { return elements >= 16384; });
+    M.loadBundleWalk(bundleDir, lines, "", [](const std::string&, size_t elements) { return elements >= 16384; },
+                     derivedSource);
   }
+  prepareWeights();
   printf("weights: %.0f ms\n", ms(t0));
+  if (getenv("AF3_MEM")) { mt::sync(); printf("memory: weights %.0f MB, allocated %.0f MB\n", M.weightBytes() / 1e6, allocated() / 1e6); }
   if (waitInput) {      // the featuriser writes model.idx last (by a rename), or model.failed
     std::string idx = std::string(argv[1]) + "/model.idx", failed = std::string(argv[1]) + "/model.failed";
     while (access(idx.c_str(), R_OK) != 0) {

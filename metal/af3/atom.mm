@@ -104,7 +104,7 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
   adaLn(st.noResidual ? pre : act, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1);
   int I = C * 2;
   half* gated = scratch<half>("ab.gated", qRows * I);
-  gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", Wh(B + ".ffwTransition1"), C, I), gated, qRows, C, I);
+  gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", C, I), gated, qRows, C, I);
   if (hasW(B + ".ffwAToB")) {          // boltz2's up-gate: silu(a) b u
     half* u = scratch<half>("ab.up", qRows * I);
     linH(tn, B + ".ffwAToB", u, qRows, C, I);

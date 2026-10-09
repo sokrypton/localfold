@@ -5,6 +5,7 @@
 #include "core.h"
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ struct Tensor {
   size_t n = 0;
   int segment = -1;
   bool madeF32 = false;      // (a float32 copy made on demand from the float16 tensor)
+  bool owned = false;        // (its own allocation: given back when it is retired)
 };
 class Model {
  public:
@@ -26,8 +28,11 @@ class Model {
   // describe them - `b` a slice of a bundle tensor, `z` zeros, `c` literal values, `p` gathered parts (a strided view,
   // a product, integers, ones), `m` metadata - and with `deltaDir` the bundle read as a delta model's base (its
   // `addTo` tensors the base rounded to float16 plus the delta, `whole` the delta's, `absent` gone)
+  // `own(name)`: a tensor given an allocation of its own - one the port will read only through a derived form, so
+  // retire() can give its bytes back at once
   void loadBundleWalk(const std::string& dir, const std::vector<std::string>& lines, const std::string& deltaDir = "",
-                      const std::function<bool(const std::string&, size_t)>& asHalf = nullptr);
+                      const std::function<bool(const std::string&, size_t)>& asHalf = nullptr,
+                      const std::function<bool(const std::string&)>& own = nullptr);
   // the tensors a bundle holds, by name and shape (a delta's absent ones gone): what a walk is worked out from
   static std::map<std::string, std::vector<long long>> bundleShapes(const std::string& dir, const std::string& deltaDir = "");
   // an input directory; unloadInput() forgets it
@@ -56,6 +61,11 @@ class Model {
     derivedW[key] = p;
     return p;
   }
+  // a weight read only through a form derived from it (an interleaving, a concatenation): retired - its bytes given back
+  // at once where it has its own allocation, at the next compact() where it shares one; reading it after is an error
+  // that names it (its name, length and shape are kept)
+  void retire(const std::string& name);
+  void compact();
   // every entry `from<k>` exchanged with `to<k>` (moved where there is no `to<k>`): one batch put in place of another
   // (OpenDDE's structural tokens: sbatch.* for batch.* and back)
   void swapPrefix(const std::string& to, const std::string& from);
@@ -66,6 +76,9 @@ class Model {
  private:
   const Tensor& at(const std::string& name) const;
   std::map<std::string, Tensor> t;
+  struct Block { char* base = nullptr; size_t bytes = 0; };
+  std::vector<Block> blocks;            // a weight walk's allocations, which compact() rebuilds without retired tensors
+  std::set<std::string> retired;
   std::map<std::string, double> metaV;
   std::map<std::string, void*> derivedW;
   std::vector<void*> inputBuffers;

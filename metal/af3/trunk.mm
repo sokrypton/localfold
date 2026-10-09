@@ -127,9 +127,7 @@ static void embed(Trunk& t) {
     ln(t.prevPair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     lin(pn, E + "prevEmbedding", prev, pairs, C, C);
   }
-  if (t.pass == 0) { seam("dbg_left", left, (size_t)n * C); seam("dbg_prev", prev, pairs * C); seam("dbg_tf", t.targetFeat, (size_t)n * t.F); }
   run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, prev, t.pair, (uint)n, (uint)C});
-  if (t.pass == 0) seam("dbg_outer", t.pair, pairs * C);
   run1d("af3_relenc", pairs * C, RelEncArgs{relIdx(), W(E + "positionActivations"), t.pair, (uint)n, (uint)C});
   const bool bonds = M.has("batch.bondMatrix") && hasW(E + "bondEmbedding"), types = hasW(E + "tokenBondsTypeEmbed");
   if (bonds || types)

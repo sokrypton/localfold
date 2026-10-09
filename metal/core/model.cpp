@@ -20,6 +20,73 @@ const Tensor& Model::at(const std::string& name) const {
   if (it == t.end()) die("no tensor %s", name.c_str());
   return it->second;
 }
+void Model::retire(const std::string& name) {
+  auto it = t.find(name);
+  if (it == t.end() || retired.count(name)) return;
+  retired.insert(name);
+  Tensor& x = it->second;
+  if (!x.owned) return;
+  for (const void* p : {(const void*)x.f16, (const void*)x.f32}) if (p) release(p);   // (its own, and any conversion)
+  weightHeld -= x.n * (x.f16 && !x.madeF32 ? 2 : 4);
+  x.f16 = nullptr; x.f32 = nullptr; x.i32 = nullptr; x.madeF32 = false;
+}
+// The walk's allocations rebuilt without the retired tensors (the live ones copied over in stream order, the old
+// allocations given back once the work issued so far is done), and every retired tensor's own copies released
+void Model::compact() {
+  if (retired.empty()) return;
+  auto inBlock = [&](const void* p, const Block& b) { return (const char*)p >= b.base && (const char*)p < b.base + b.bytes; };
+  // a retired tensor's own copies (an on-demand conversion: its own allocation), before the blocks are rebuilt
+  for (auto& name : retired) {
+    auto it = t.find(name);
+    if (it == t.end()) continue;
+    Tensor& x = it->second;
+    if (x.owned) continue;
+    for (const void* p : {(const void*)x.f16, (const void*)x.f32}) {
+      if (!p) continue;
+      bool owned = false;
+      for (auto& b : blocks) owned |= inBlock(p, b);
+      if (!owned) release(p);       // (an on-demand conversion: its own allocation)
+    }
+  }
+  for (auto& b : blocks) {
+    bool dead = false;      // (a block holding nothing retired is left where it is)
+    for (auto& name : retired) {
+      const Tensor& x = t.at(name);
+      for (const void* p : {(const void*)x.f16, (const void*)x.f32, (const void*)x.i32}) dead |= p && inBlock(p, b);
+    }
+    if (!dead) continue;
+    struct Live { Tensor* x; const char* from; size_t bytes; };
+    std::vector<Live> live;
+    size_t bytes = 0;
+    for (auto& [name, x] : t) {
+      const void* p = x.f16 ? (const void*)x.f16 : x.f32 ? (const void*)x.f32 : (const void*)x.i32;
+      if (x.f16 && x.f32) p = inBlock(x.f16, b) ? (const void*)x.f16 : (const void*)x.f32;
+      if (!p || !inBlock(p, b) || retired.count(name)) continue;
+      size_t n = x.n * (p == (const void*)x.f16 ? 2 : 4);
+      bytes = (bytes + 31) / 32 * 32;
+      live.push_back({&x, (const char*)p, n});
+      bytes += n;
+    }
+    char* base = bytes ? (char*)alloc(bytes) : nullptr;
+    size_t at = 0;
+    for (auto& l : live) {
+      at = (at + 31) / 32 * 32;
+      copy(base + at, l.from, l.bytes);
+      if ((const void*)l.from == (const void*)l.x->f16) l.x->f16 = (half*)(base + at);
+      else { if (l.x->i32 == (const int*)l.from) l.x->i32 = (int*)(base + at); if (l.x->f32 == (const float*)l.from) l.x->f32 = (float*)(base + at); }
+      at += l.bytes;
+    }
+    weightHeld -= b.bytes; weightHeld += bytes;
+    release(b.base);
+    b = {base, bytes};
+  }
+  for (auto& name : retired) {
+    auto it = t.find(name);
+    if (it == t.end()) continue;
+    Tensor& x = it->second;
+    x.f16 = nullptr; x.f32 = nullptr; x.i32 = nullptr; x.madeF32 = false;      // (its name, length and shape kept)
+  }
+}
 double Model::meta(const std::string& name) const {
   auto it = metaV.find(name);
   if (it == metaV.end()) die("no metadata %s", name.c_str());
@@ -31,8 +98,10 @@ int64_t Model::dim(const std::string& name, int k) const {
   if (k < 0 || k >= (int)x.shape.size()) die("%s has no dimension %d", name.c_str(), k);
   return x.shape[k];
 }
+static void dieRetired(const std::string& name) { die("%s was retired once its derived form was built, and is read again", name.c_str()); }
 const float* Model::f(const std::string& name) {
   Tensor& x = const_cast<Tensor&>(at(name));
+  if (!x.f32 && !x.f16 && !x.i32 && retired.count(name)) dieRetired(name);
   if (x.f32) return x.f32;
   if (!x.f16) die("%s is not a float tensor", name.c_str());
   x.f32 = allocT<float>(x.n);
@@ -42,6 +111,7 @@ const float* Model::f(const std::string& name) {
 }
 const half* Model::h(const std::string& name) {
   Tensor& x = const_cast<Tensor&>(at(name));
+  if (!x.f32 && !x.f16 && !x.i32 && retired.count(name)) dieRetired(name);
   if (x.f16) return x.f16;
   if (!x.f32) die("%s is not a float tensor", name.c_str());
   x.f16 = allocT<half>(x.n);
@@ -369,11 +439,12 @@ std::map<std::string, std::vector<long long>> Model::bundleShapes(const std::str
 }
 
 void Model::loadBundleWalk(const std::string& dir, const std::vector<std::string>& lines, const std::string& deltaDir,
-                           const std::function<bool(const std::string&, size_t)>& asHalf) {
+                           const std::function<bool(const std::string&, size_t)>& asHalf,
+                           const std::function<bool(const std::string&)>& own) {
   std::map<std::string, Src> src = sources(dir, deltaDir, &metaV);
   struct Part { char op; int rank; i64 dims[6], ds[6], s[2][6]; i64 dst, off[2]; std::string from[2]; };
   struct Target { std::string name; size_t n = 0; char kind = 0; std::string from; size_t first = 0; std::vector<float> consts;
-                  std::vector<Part> parts; bool isInt = false, half = false; size_t at = 0; };
+                  std::vector<Part> parts; bool isInt = false, half = false, owned = false; void* own = nullptr; size_t at = 0; };
   std::vector<Target> targets;
   std::map<std::string, size_t> targetOf;
   auto target = [&](const std::string& name, size_t n) -> Target& {
@@ -416,19 +487,32 @@ void Model::loadBundleWalk(const std::string& dir, const std::vector<std::string
       if (p.op == 'i') t.isInt = true;
     } else die("the weight walk: a line of kind %c", kind);
   }
-  // the destinations: float32 tensors in one allocation; float16 ones gathered in float32 scratch at the same element
-  // offsets, then converted into theirs in one pass
-  size_t n32 = 0, n16 = 0;
+  // the destinations: float32 tensors in one allocation, float16 ones in another - a slice decoded straight into its
+  // half (no float32 copy of it is ever made), the half tensors built from parts or literals first and contiguous, so
+  // they alone are assembled in float32 scratch and converted in one pass
+  size_t n32 = 0, n16 = 0, nStaged = 0;
   for (auto& t : targets) {
     t.half = asHalf && !t.isInt && asHalf(t.name, t.n);
-    size_t& at = t.half ? n16 : n32;
-    at = (at + 7) / 8 * 8; t.at = at; at += t.n;
+    t.owned = own && t.kind == 'b' && !t.isInt && own(t.name);       // (a slice decoded straight into its own allocation)
+    if (t.owned) t.own = alloc(t.n * (t.half ? 2 : 4));
   }
+  for (int pass = 0; pass < 3; ++pass)
+    for (auto& t : targets) {
+      if (t.owned) continue;
+      bool staged = t.half && (t.kind == 'p' || t.kind == 'c');
+      if (pass != (t.half ? (staged ? 0 : 1) : 2)) continue;
+      size_t& at = t.half ? n16 : n32;
+      at = (at + 7) / 8 * 8; t.at = at; at += t.n;
+      if (staged) nStaged = n16;
+    }
   float* base32 = n32 ? (float*)alloc(n32 * 4) : nullptr;
   half* base16 = n16 ? (half*)alloc(n16 * 2) : nullptr;
-  float* temp16 = n16 ? (float*)alloc(n16 * 4) : nullptr;
+  float* temp16 = nStaged ? (float*)alloc(nStaged * 4) : nullptr;
+  if (base32) blocks.push_back({(char*)base32, n32 * 4});
+  if (base16) blocks.push_back({(char*)base16, n16 * 2});
   weightHeld += n32 * 4 + n16 * 2;
-  auto dstOf = [&](const Target& t) { return t.half ? temp16 + t.at : base32 + t.at; };
+  for (auto& t : targets) if (t.owned) weightHeld += t.n * (t.half ? 2 : 4);
+  auto dstOf = [&](const Target& t) { return t.half ? temp16 + t.at : base32 + t.at; };    // (a staged half's float32 home)
   // the sources the parts gather from, whole, into scratch
   std::map<std::string, float*> scratchOf;
   size_t nScratch = 0;
@@ -443,7 +527,15 @@ void Model::loadBundleWalk(const std::string& dir, const std::vector<std::string
     if (s.hasDelta) { DecodeEntry d = s.de; d.dst = (u64)dst; d.first = first; d.n = n; d.out16 = 0; d.flags = 2; entries.push_back({s.dfile, d}); }
   };
   for (auto& [name, at] : scratchAt) decodeInto(src[name], scratchBase + at, 0, src[name].e.n);
-  for (auto& t : targets) if (t.kind == 'b') decodeInto(src[t.from], dstOf(t), t.first, t.n);
+  for (auto& t : targets) {
+    if (t.kind != 'b') continue;
+    if (!t.half) { decodeInto(src[t.from], t.owned ? (float*)t.own : base32 + t.at, t.first, t.n); continue; }
+    // straight into float16: the slice rounded once (a delta's base rounded, then the delta added and rounded)
+    const Src& sr = src[t.from];
+    DecodeEntry e = sr.e; e.dst = (u64)(t.owned ? (half*)t.own : base16 + t.at); e.first = t.first; e.n = t.n; e.out16 = 1; e.flags = 0;
+    entries.push_back({sr.file, e});
+    if (sr.hasDelta) { DecodeEntry d = sr.de; d.dst = e.dst; d.first = t.first; d.n = t.n; d.out16 = 1; d.flags = 2; entries.push_back({sr.dfile, d}); }
+  }
   decodeAll(entries);
   // zeros (the allocations are zeroed), literal values, and the parts
   for (auto& t : targets) if (t.kind == 'c') upload(dstOf(t), t.consts.data(), t.n * 4);
@@ -463,12 +555,12 @@ void Model::loadBundleWalk(const std::string& dir, const std::vector<std::string
     dispatch("lf_gather", &a, sizeof a, Grid{64, (uint32_t)cnt, 1}, 256, 0, "weight gather");
     release(table);
   }
-  if (n16) toHalf(temp16, base16, n16);
+  if (nStaged) toHalf(temp16, base16, nStaged);
   // the tensors, with their shapes from the walk's own metadata
   for (auto& t : targets) {
-    Tensor x; x.n = t.n; x.segment = -1;
-    if (t.half) x.f16 = base16 + t.at;
-    else { x.f32 = base32 + t.at; if (t.isInt) x.i32 = (int*)x.f32; }
+    Tensor x; x.n = t.n; x.segment = -1; x.owned = t.owned;
+    if (t.half) x.f16 = t.owned ? (half*)t.own : base16 + t.at;
+    else { x.f32 = t.owned ? (float*)t.own : base32 + t.at; if (t.isInt) x.i32 = (int*)x.f32; }
     auto r = metaV.find(t.name + "#r");
     if (r != metaV.end()) for (int k = 0; k < (int)r->second; ++k) x.shape.push_back((int64_t)metaV[t.name + "#" + std::to_string(k)]);
     else x.shape = {(int64_t)t.n};

@@ -63,8 +63,10 @@ const half* concatColumns(const std::string& key, int C, const std::vector<Part>
     }
   });
 }
-const half* swigluPairs(const std::string& key, const half* w, int rows, int I) {
-  return M.derived<half>("swiglu:" + key, (size_t)rows * 2 * I, [&](half* out) {
+const half* swigluPairs(const std::string& name, int rows, int I) {
+  return M.derived<half>("swiglu:" + name, (size_t)rows * 2 * I, [&](half* out) {
+    if (lenW(name) != (size_t)rows * 2 * I) die("%s has %zu elements, not %d x %d", name.c_str(), lenW(name), rows, 2 * I);
+    const half* w = Wh(name);
     run1d("af3_interleave8", (size_t)rows * 2 * I, Interleave8Args{w, w + I, out, (uint)rows, (uint)I, (uint)(2 * I), 0});
   });
 }

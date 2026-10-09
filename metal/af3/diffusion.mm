@@ -17,7 +17,7 @@ static void plainTransition(float* x, size_t rows, int C, const std::string& P) 
   int I = (int)(lenW(P + ".ffwTransition1") / (2 * (size_t)C));
   size_t chunk = std::min(rows, std::max<size_t>(64, CHUNK / (2 * (size_t)I)));
   half* xn = scratch<half>("pt.xn", chunk * C); half* g = scratch<half>("pt.g", chunk * I);
-  const half* wp = swigluPairs(P + ".ffwTransition1", Wh(P + ".ffwTransition1"), C, I);
+  const half* wp = swigluPairs(P + ".ffwTransition1", C, I);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
     ln(x + r0 * C, xn, r, C, P + ".ffwLayerNormScale", P + ".ffwLayerNormOffset");
@@ -123,9 +123,9 @@ static float* singleConditioning(float level) {
 static std::string blockName(int b) {
   return "diffusion.transformer.superBlocks." + num(b / D.perSuper) + ".blocks." + num(b % D.perSuper);
 }
-static void prepareTransformer(int n) {
+void transformerWeights() {
   const std::string T = "diffusion.transformer";
-  int C = metaI(T + ".channels"), Cc = metaI(T + ".condChannels"), Cz = metaI(T + ".pairChannels"), heads = metaI(T + ".heads");
+  int C = metaI(T + ".channels"), Cc = metaI(T + ".condChannels");
   D.perSuper = metaI(T + ".blocksPerSuperBlock");
   int sbs = 0; while (hasW(T + ".superBlocks." + num(sbs) + ".pairLogitsProjection")) ++sbs;
   D.nblocks = sbs * D.perSuper;
@@ -162,6 +162,11 @@ static void prepareTransformer(int n) {
       for (int slot = 0; slot < 2; ++slot)
         copy(out + b * 2 * C + slot * C, W(blockName(b) + (slot ? ".ffw" : ".") + "AdaptiveZeroCondBias"), (size_t)C * 4);
   });
+}
+static void prepareTransformer(int n) {
+  const std::string T = "diffusion.transformer";
+  int Cz = metaI(T + ".pairChannels"), heads = metaI(T + ".heads");
+  transformerWeights();
   // every block's pair bias, from the (fold-constant) pair conditioning
   size_t pairs = (size_t)n * n;
   D.stride = round8(n);
@@ -233,7 +238,7 @@ static void transformer(float* act, const float* cond) {
     lin(o, B + ".Transition2", att, prows, Wd, C);
     run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, z, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
     adaLn(noResidual ? pre : act, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn);
-    gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", Wh(B + ".ffwTransition1"), C, I), gated, prows, C, I);
+    gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", C, I), gated, prows, C, I);
     if (hasW(B + ".ffwAToB")) {          // boltz2's up-gate
       half* u = scratch<half>("dt.up", rows * I);
       linH(tn, B + ".ffwAToB", u, rows, C, I);

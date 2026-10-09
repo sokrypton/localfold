@@ -48,8 +48,8 @@ void scale(float* x, size_t n, float s, bool relu = false);
 // derived weights: columns concatenated (a part [C][width], or stored [width][C] if transposed; no name: zeros)
 struct Part { std::string name; int width; bool transposed; };
 const half* concatColumns(const std::string& key, int C, const std::vector<Part>& parts);
-// [rows][2I] = [a | b] -> gemmSwiglu's interleaving
-const half* swigluPairs(const std::string& key, const half* w, int rows, int I);
+// a named [rows][2I] = [a | b] weight -> gemmSwiglu's interleaving (the source read only when it is built)
+const half* swigluPairs(const std::string& name, int rows, int I);
 // an attention's q | k | v | gate as one [C][4W] weight (the grid attention stores q, k and the gate transposed),
 // and its GEMM bias where the gate has one (zeros elsewhere)
 const half* qkvgWeight(const std::string& pre, int C, int Wd, bool transposedQkg);
@@ -59,6 +59,7 @@ const float* qkvgBias(const std::string& pre, int Wd);
 // pairMask [n * n] (a real buffer; every update reads it), seqMask [n], `ones` every token real (no attention mask)
 struct Masks { const float* pair; const float* seq; bool ones; };
 void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide);
+const half* triGateWeight(const std::string& pre, int C);     // the projection and gate as gemmTriGate's one weight
 void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap);
 void transition(float* x, size_t rows, int C, const std::string& pre);
 void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre);
@@ -129,6 +130,13 @@ void prepareDiffusion(const float* trunkSingle, const float* trunkPair, const fl
 std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
                           const std::function<void(const float*, int, int)>& onStep = nullptr);
 void freeDiffusion();
+void transformerWeights();     // the token transformer's folded conditioning weights (built once; prepareWeights)
+
+// ---------------------------------------------------------------- derived weights up front (weights.mm)
+// every weight a port reads through a derived form built now, at load, and its source retired and the allocations
+// compacted - the sources and their derived copies were both held otherwise (~0.6 GB of AF3's)
+void prepareWeights();
+bool derivedSource(const std::string& name);     // a weight read only through a derived form: its own allocation at load
 void reportStages();     // (AF3_STAGES=1: the denoiser's stages timed, a sync between them)
 
 // ---------------------------------------------------------------- the confidence head (confidence.mm)

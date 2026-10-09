@@ -15,6 +15,11 @@ half* biasLayout(const float* raw, const std::string& name, int n, int heads, in
 }
 
 // ---------------------------------------------------------------- triangle multiplication
+const half* triGateWeight(const std::string& pre, int C) {
+  return M.derived<half>("trigate:" + pre, (size_t)C * 4 * C, [&](half* out) {
+    run1d("af3_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Wh(pre + ".projection"), Wh(pre + ".gate"), out, (uint)C, (uint)C});
+  });
+}
 // LN -> one GEMM gating a and b into channel-major padded planes (gemmTriGate; AF3 interleaves a and b by channel) ->
 // the planes' batched product (/ n under triangleMulDivideByLength) -> the centre LayerNorm back to rows -> the
 // output projection -> the gating linear's GEMM adding the gated product into the pair (gemmGatedAdd)
@@ -29,10 +34,7 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
     fill(a, 0, plane * C * 2); fill(b, 0, plane * C * 2);
     zeroedA = a; zeroedB = b; zeroedSize = plane * C;
   }
-  const half* w4 = M.derived<half>("trigate:" + pre, (size_t)C * 4 * C, [&](half* out) {
-    run1d("af3_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Wh(pre + ".projection"), Wh(pre + ".gate"), out, (uint)C, (uint)C});
-  });
-  gemmTriGate(xn, w4, m.pair, a, b, 0, P, C, plane, n, np);
+  gemmTriGate(xn, triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np);
   float* prod = scratch<float>("tri.prod", plane * C);
   {   // per channel: outgoing prod[i][j] = sum_k a[i][k] b[j][k]; incoming sum_k b[k][i] a[k][j]
     Gemm g{}; g.tx = F16; g.tw = F16; g.ty = F32; g.rows = np; g.in = np; g.out = np; g.ldx = g.ldw = g.ldy = np;
@@ -81,7 +83,7 @@ void transition(float* x, size_t rows, int C, const std::string& pre) {
   size_t chunk = std::min(rows, std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I)));
   half* xn = scratch<half>("tr.xn", chunk * C);
   half* g = scratch<half>("tr.g", chunk * I);
-  const half* wp = swigluPairs(pre + ".transition1", Wh(pre + ".transition1"), C, I);
+  const half* wp = swigluPairs(pre + ".transition1", C, I);
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
     ln(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
