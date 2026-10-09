@@ -52,7 +52,7 @@ way - so an 8 GB Mac folds what a larger one does, slower (AF3's trunk 7.5 s the
 
 ## How fast
 
-On this M2 (10-core GPU), 2026-10-10, the whole job unless said:
+On this M2 (10-core GPU), 2026-10-09, the whole job unless said:
 
 | | time | peak memory |
 |---|---|---|
