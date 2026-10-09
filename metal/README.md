@@ -42,6 +42,14 @@ And seam by seam against WebGPU's f32 path, under `LOCALFOLD_STOCK_FLAGS=1` (see
 protenix2 8.4e-7, intellifold2 1.1e-6 at `trunk_out_pair`; ESMFold2's language pair 1.5e-4, z_init 4.6e-5 (against
 `--atom-windowed=1`, WebGPU's default is unwindowed), one denoiser call 6.8e-6 through the atom encoder.
 
+## On a Mac short of memory
+
+The ports take their big-input paths (the pair in chunks, parked in host memory, scratch given back between stages)
+when a fold would not fit the room the device reports - on Metal, the working set macOS recommends, about two thirds
+of the RAM. Forced at any size with `LOCALFOLD_BIG=1`, all three fold the same on Metal as on their ordinary paths:
+AF3 6MRR pLDDT 86.15 / 0.776 A against 86.14 / 0.778, ESMFold2 77.10 / 1.360 against 77.11 / 1.363, AF2 84.59 either
+way - so an 8 GB Mac folds what a larger one does, slower (AF3's trunk 7.5 s there against 1.2).
+
 ## How fast
 
 On this M2 (10-core GPU), 2026-10-09, the whole job unless said:
