@@ -808,6 +808,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // too few threadgroups for the device: narrower columns
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
   while (tc > 16 && groups(tc) < 64) tc /= 2;
+  if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);   // (an arm: one tile everywhere)
   int bm = tc, bn = tr;
   auto esize = [](cudaDataType t) { return t == CUDA_R_32F ? 4 : 2; };
   bool vec = !a.ptrs && a.lda % 8 == 0 && a.ldb % 8 == 0 && (a.sa % 8 == 0) && (a.sb % 8 == 0) &&

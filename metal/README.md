@@ -177,6 +177,9 @@ alone - `metal/tools/build-bench-gemm.sh` builds it):
 - **`flashGridMetal`'s tiles and accumulator** (255 tokens, its 488 calls): keys 32 at a time 2611 -> 2958 ms, 8 at a
   time 2710, 64 queries a threadgroup (eight simdgroups sharing a staged key tile) 2859, and the output accumulated in
   half 2637. Keys 16 at a time over 32 queries with a float accumulator is where it sits.
+- **Bigger GEMM tiles now that the accumulators are half** (`LOCALFOLD_GEMM_TILE=RxC`, an arm in the runtime): 64 x 128
+  is 0.33 TFLOP/s where 64 x 64 is 1.71 on 512 x 68121 x 128, 128 x 64 0.16 - spilled registers, half accumulators or
+  not. 32 x 64 ties the 48 x 64 the diffusion's 272 rows take.
 - **MPS (`MPSMatrixMultiplication`) in place of `lf_gemm`.** Standalone it looked 1.8x on 3072 x 272 x 768; through the
   runtime, timed the same way as ours, it was 1.18 against 1.25 TFLOP/s and its error 5e-4 against 2e-4. On the
   triangle's tall K-128 projections it loses outright. The GEMM is at MPS's level already.
