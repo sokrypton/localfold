@@ -1,0 +1,7 @@
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
+void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
+                    const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
+                    size_t outPosStride = 0) {
+  flashGridMetalRun<D>(qkvg, NB ? nullptr : bias, stride, nullptr, out, n, heads, 0, rows, false, scale, qBias,
+                       rowStride, posStride, outRowStride, outPosStride);
+}

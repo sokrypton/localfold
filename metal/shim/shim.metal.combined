@@ -79,7 +79,7 @@ inline float lf_ldf(device const float* p) { return *p; }
 inline float lf_ldf(device const half* p) { return (float)*p; }
 inline float lf_ldf(device const lf_bf16s* p) { return as_type<float>((uint)p->v << 16); }
 template <typename S, typename T> inline void lf_stage8(threadgroup T* dst, device const S* src) {
-  _Pragma("clang loop unroll(full)")
+  #pragma unroll
   for (int e = 0; e < 8; ++e) dst[e] = (T)lf_ldf(src + e);
 }
 template <> inline void lf_stage8<half, half>(threadgroup half* dst, device const half* src) {
@@ -90,15 +90,11 @@ template <> inline void lf_stage8<float, float>(threadgroup float* dst, device c
   *(threadgroup float4*)dst = *(device const float4*)src;
   *(threadgroup float4*)(dst + 4) = *(device const float4*)(src + 4);
 }
-// Computed as C^T = X W, X = op(B)^T (n x k), W = op(A)^T (k x m): cuBLAS's column-major non-transposed product
-// is then row-major activations times row-major weights, both staged along their contiguous axis and loaded as
-// 8 x 8 matrices WITHOUT the transposing load (a transposed operand stages the other way and takes it). A tile is
-// TR rows of X (n) by TC columns of W (m); each lane's two output elements are adjacent in C.
-template <typename TA, typename TB, typename TC, int TR, int TC_, bool TRA, bool TRB>
+template <typename TA, typename TB, typename TC, int BM, int BN, bool TRA, bool TRB>
 kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
-  typedef typename lf_mma<TA, TB>::type T;
+  typedef typename lf_mma<TA, TB>::type T;           // the staged type: both operands half, else float
   constexpr int BK = 32, PAD = 8;
   const uint z = grp.z;
   device const TA* A; device const TB* B; device TC* D; device const TC* C;
@@ -113,84 +109,91 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     D = (device TC*)g.D + (long)z * g.sd;
     C = (device const TC*)g.C + (long)z * g.sc;
   }
-  const int j0 = grp.y * TR, i0 = grp.x * TC_;      // (grid x over m, y over n)
-  // X tile: [j][k] when B is not transposed (contiguous k), else [k][j]; W tile: [k][i] when A is not transposed
-  // (contiguous i), else [i][k]
-  constexpr int XROW = TRB ? TR + PAD : BK + PAD, WROW = TRA ? BK + PAD : TC_ + PAD;
-  threadgroup T Xs[(TRB ? BK : TR) * XROW];
-  threadgroup T Ws[(TRA ? TC_ : BK) * WROW];
-  constexpr int WR = TR / 2, WC = TC_ / 2, FR = WR / 8, FC = WC / 8;
-  const int sr = (sg / 2) * WR, sc = (sg % 2) * WC;
-  simdgroup_float8x8 acc[FR][FC];
-  _Pragma("clang loop unroll(full)")
-  for (int a = 0; a < FR; ++a)
-    _Pragma("clang loop unroll(full)")
-    for (int b = 0; b < FC; ++b) acc[a][b] = simdgroup_float8x8(0);
-  const bool vec = g.biasType & 256;
+  const int i0 = grp.x * BM, j0 = grp.y * BN;
+  // A staged [k][i] (contiguous i: not transposed) or [i][k] (transposed); B [j][k] (not transposed) or [k][j]
+  constexpr int AROW = TRA ? BK + PAD : BM + PAD, BROW = TRB ? BN + PAD : BK + PAD;
+  threadgroup T As[(TRA ? BM : BK) * AROW];
+  threadgroup T Bs[(TRB ? BK : BN) * BROW];
+  constexpr int WM = BM / 2, WN = BN / 2, FM = WM / 8, FN = WN / 8;
+  const int si = (sg / 2) * WM, sj = (sg % 2) * WN;
+  simdgroup_float8x8 acc[FM][FN];
+  #pragma unroll
+  for (int a = 0; a < FM; ++a)
+    #pragma unroll
+    for (int b = 0; b < FN; ++b) acc[a][b] = simdgroup_float8x8(0);
+  const bool full = i0 + BM <= g.m && j0 + BN <= g.n;
+  const bool vec = g.biasType & 256;                  // (host: every row start of A and B 8-element aligned)
   for (int k0 = 0; k0 < g.k; k0 += BK) {
+    const bool kfull = k0 + BK <= g.k;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    {   // X = op(B)^T: element (j, k) = TRB ? B[j + k ldb] : B[k + j ldb]; staged a chunk of 8 along the contiguous axis,
-        // 16 bytes where the whole chunk is inside the matrix (and VEC says it is aligned), element by element where not
-      constexpr int OUTER = TRB ? BK : TR, INNER = TRB ? TR : BK;
-      const long ld = g.ldb;
-      _Pragma("clang loop unroll(full)")
-      for (int c = tid; c < OUTER * (INNER / 8); c += 128) {
-        int o = c / (INNER / 8), in = (c % (INNER / 8)) * 8;
-        int ob = TRB ? k0 + o : j0 + o, ib = TRB ? j0 + in : k0 + in;           // (outer, inner) in the matrix
-        int olim = TRB ? g.k : g.n, ilim = TRB ? g.n : g.k;
-        device const TB* src = B + (long)ib + (long)ob * ld;
-        threadgroup T* dst = Xs + o * XROW + in;
-        if (vec && ob < olim && ib + 8 <= ilim) lf_stage8<TB, T>(dst, src);
-        else for (int e = 0; e < 8; ++e) dst[e] = (ob < olim && ib + e < ilim) ? (T)lf_ldf(src + e) : (T)0;
-      }
-    }
-    {   // W = op(A)^T: element (k, i) = TRA ? A[k + i lda] : A[i + k lda]
-      constexpr int OUTER = TRA ? TC_ : BK, INNER = TRA ? BK : TC_;
+    // ---- A: BM x BK
+    {
+      constexpr int OUTER = TRA ? BM : BK, INNER = TRA ? BK : BM;   // rows of the staged tile, contiguous run
       const long ld = g.lda;
-      _Pragma("clang loop unroll(full)")
-      for (int c = tid; c < OUTER * (INNER / 8); c += 128) {
-        int o = c / (INNER / 8), in = (c % (INNER / 8)) * 8;
-        int ob = TRA ? i0 + o : k0 + o, ib = TRA ? k0 + in : i0 + in;
-        int olim = TRA ? g.m : g.k, ilim = TRA ? g.k : g.m;
-        device const TA* src = A + (long)ib + (long)ob * ld;
-        threadgroup T* dst = Ws + o * WROW + in;
-        if (vec && ob < olim && ib + 8 <= ilim) lf_stage8<TA, T>(dst, src);
-        else for (int e = 0; e < 8; ++e) dst[e] = (ob < olim && ib + e < ilim) ? (T)lf_ldf(src + e) : (T)0;
+      if (vec && full && kfull) {
+        for (int c = tid; c < OUTER * (INNER / 8); c += 128) {
+          int o = c / (INNER / 8), in = (c % (INNER / 8)) * 8;
+          device const TA* src = TRA ? A + (long)(k0 + in) + (long)(i0 + o) * ld : A + (long)(i0 + in) + (long)(k0 + o) * ld;
+          lf_stage8<TA, T>(As + o * AROW + in, src);
+        }
+      } else {
+        for (int c = tid; c < OUTER * INNER; c += 128) {
+          int o = c / INNER, in = c % INNER;
+          int i = TRA ? i0 + o : i0 + in, k = TRA ? k0 + in : k0 + o;
+          As[o * AROW + in] = (i < g.m && k < g.k) ? (T)lf_ldf(TRA ? A + (long)k + (long)i * ld : A + (long)i + (long)k * ld) : (T)0;
+        }
+      }
+    }
+    // ---- B: BK x BN
+    {
+      constexpr int OUTER = TRB ? BK : BN, INNER = TRB ? BN : BK;
+      const long ld = g.ldb;
+      if (vec && full && kfull) {
+        for (int c = tid; c < OUTER * (INNER / 8); c += 128) {
+          int o = c / (INNER / 8), in = (c % (INNER / 8)) * 8;
+          device const TB* src = TRB ? B + (long)(j0 + in) + (long)(k0 + o) * ld : B + (long)(k0 + in) + (long)(j0 + o) * ld;
+          lf_stage8<TB, T>(Bs + o * BROW + in, src);
+        }
+      } else {
+        for (int c = tid; c < OUTER * INNER; c += 128) {
+          int o = c / INNER, in = c % INNER;
+          int k = TRB ? k0 + o : k0 + in, j = TRB ? j0 + in : j0 + o;
+          Bs[o * BROW + in] = (k < g.k && j < g.n) ? (T)lf_ldf(TRB ? B + (long)j + (long)k * ld : B + (long)k + (long)j * ld) : (T)0;
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    _Pragma("clang loop unroll(full)")
+    #pragma unroll
     for (int kk = 0; kk < BK; kk += 8) {
-      simdgroup_matrix<T, 8, 8> xm[FR], wm[FC];
-      _Pragma("clang loop unroll(full)")
-      for (int a = 0; a < FR; ++a) {
-        if (TRB) simdgroup_load(xm[a], Xs + kk * XROW + sr + a * 8, XROW, ulong2(0, 0), true);
-        else simdgroup_load(xm[a], Xs + (sr + a * 8) * XROW + kk, XROW);
+      simdgroup_matrix<T, 8, 8> am[FM], bm[FN];
+      #pragma unroll
+      for (int a = 0; a < FM; ++a) {
+        if (TRA) simdgroup_load(am[a], As + (si + a * 8) * AROW + kk, AROW);
+        else simdgroup_load(am[a], As + kk * AROW + si + a * 8, AROW, ulong2(0, 0), true);
       }
-      _Pragma("clang loop unroll(full)")
-      for (int b = 0; b < FC; ++b) {
-        if (TRA) simdgroup_load(wm[b], Ws + (sc + b * 8) * WROW + kk, WROW, ulong2(0, 0), true);
-        else simdgroup_load(wm[b], Ws + kk * WROW + sc + b * 8, WROW);
+      #pragma unroll
+      for (int b = 0; b < FN; ++b) {
+        if (TRB) simdgroup_load(bm[b], Bs + kk * BROW + sj + b * 8, BROW);
+        else simdgroup_load(bm[b], Bs + (sj + b * 8) * BROW + kk, BROW, ulong2(0, 0), true);
       }
-      _Pragma("clang loop unroll(full)")
-      for (int a = 0; a < FR; ++a)
-        _Pragma("clang loop unroll(full)")
-        for (int b = 0; b < FC; ++b) simdgroup_multiply_accumulate(acc[a][b], xm[a], wm[b], acc[a][b]);
+      #pragma unroll
+      for (int a = 0; a < FM; ++a)
+        #pragma unroll
+        for (int b = 0; b < FN; ++b) simdgroup_multiply_accumulate(acc[a][b], am[a], bm[b], acc[a][b]);
     }
   }
-  // a lane's elements: X row (j) sm, W columns (i) sn and sn + 1 - adjacent in C
   const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
-  _Pragma("clang loop unroll(full)")
-  for (int a = 0; a < FR; ++a)
-    _Pragma("clang loop unroll(full)")
-    for (int b = 0; b < FC; ++b) {
+  #pragma unroll
+  for (int a = 0; a < FM; ++a)
+    #pragma unroll
+    for (int b = 0; b < FN; ++b) {
       thread auto& e = acc[a][b].thread_elements();
-      int j = j0 + sr + a * 8 + sm;
-      if (j >= g.n) continue;
-      _Pragma("clang loop unroll(full)")
+      int i = i0 + si + a * 8 + sm;
+      if (i >= g.m) continue;
+      #pragma unroll
       for (int t = 0; t < 2; ++t) {
-        int i = i0 + sc + b * 8 + sn + t;
-        if (i >= g.m) continue;
+        int j = j0 + sj + b * 8 + sn + t;
+        if (j >= g.n) continue;
         float v = g.alpha * e[t];
         if (g.beta != 0.f) v += g.beta * lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
         if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[i] : ((device const float*)g.bias)[i];
@@ -200,4 +203,20 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       }
     }
 }
-// (instantiated on first use by the runtime: lf_gemm<TA, TB, TC, TR, TC_, TRA, TRB>, host name lf_gemm_...)
+#define LF_GEMM1(TA, TB, TC, N, BM, BN, RA, RB) \
+  template [[host_name("lf_gemm_" N "_" #BM "x" #BN "_" #RA #RB)]] kernel void lf_gemm<TA, TB, TC, BM, BN, RA, RB>(constant GemmArgs&, uint3, uint, uint, uint);
+#define LF_GEMMT(TA, TB, TC, N, BM, BN) \
+  LF_GEMM1(TA, TB, TC, N, BM, BN, false, false) LF_GEMM1(TA, TB, TC, N, BM, BN, false, true) \
+  LF_GEMM1(TA, TB, TC, N, BM, BN, true, false) LF_GEMM1(TA, TB, TC, N, BM, BN, true, true)
+#define LF_GEMM(TA, TB, TC, N) LF_GEMMT(TA, TB, TC, N, 64, 64) LF_GEMMT(TA, TB, TC, N, 64, 32) LF_GEMMT(TA, TB, TC, N, 32, 64)
+LF_GEMM(float, float, float, "f32_f32_f32")
+LF_GEMM(float, float, half, "f32_f32_f16")
+LF_GEMM(float, float, lf_bf16s, "f32_f32_bf16")
+LF_GEMM(half, half, float, "f16_f16_f32")
+LF_GEMM(half, half, half, "f16_f16_f16")
+LF_GEMM(half, half, lf_bf16s, "f16_f16_bf16")
+LF_GEMM(lf_bf16s, lf_bf16s, float, "bf16_bf16_f32")
+LF_GEMM(lf_bf16s, lf_bf16s, half, "bf16_bf16_f16")
+LF_GEMM(lf_bf16s, lf_bf16s, lf_bf16s, "bf16_bf16_bf16")
+LF_GEMM(half, float, float, "f16_f32_f32")
+LF_GEMM(float, half, float, "f32_f16_f32")

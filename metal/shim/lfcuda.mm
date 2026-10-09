@@ -50,6 +50,7 @@ struct Op {        // a captured graph's step
   id<MTLComputePipelineState> pso; std::vector<unsigned char> args; MTLSize grid, block; size_t smem;
   uint64_t dst, src; size_t bytes; int value;
   std::vector<id<MTLBuffer>> keep;
+  std::string label;
 };
 
 struct Runtime {
@@ -63,7 +64,7 @@ struct Runtime {
   id<MTLComputeCommandEncoder> enc = nil;
   std::vector<id<MTLBuffer>> cbKeep;           // released when the command buffer is done
   id<MTLCommandBuffer> lastCommitted = nil;
-  int encoded = 0;
+  int encoded = 0, encodedInEncoder = 0;
   bool capturing = false;
   std::vector<Op>* capture = nullptr;
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
@@ -71,6 +72,11 @@ struct Runtime {
   std::set<std::string> knownSpecs;
   std::string specsPath;
   bool specsLoaded = false;
+  // LOCALFOLD_METAL_STATS: where the host's time goes (printed at exit)
+  struct Stats { double launchMs = 0, syncMs = 0, compileMs = 0; long launches = 0, syncs = 0, staged = 0, encoders = 0,
+                 directCopies = 0, commits = 0, allocs = 0, commitsThreshold = 0, commitsEvent = 0, idleChecks = 0, graphLaunches = 0, graphOps = 0, dispatches = 0, captures = 0, capturedOps = 0, copies = 0, fills = 0, gemms = 0, memsetCalls = 0, memcpyCalls = 0; } stats;
+  bool statsOn = getenv("LOCALFOLD_METAL_STATS") != nullptr;
+  bool untracked = getenv("LF_UNTRACKED") != nullptr;
   // profiling: GPU time per kernel name
   bool profiling = false;
   std::map<std::string, std::pair<double, int>> profile;
@@ -120,7 +126,9 @@ struct Runtime {
   void* malloc_(size_t bytes) {
     std::lock_guard<std::recursive_mutex> l(mu);
     size_t n = std::max<size_t>((bytes + 255) & ~(size_t)255, 256);
-    id<MTLBuffer> b = [dev newBufferWithLength:n options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b = [dev newBufferWithLength:n options:MTLResourceStorageModeShared |
+                       (untracked ? MTLResourceHazardTrackingModeUntracked : 0)];
+    ++stats.allocs;
     if (!b) return nullptr;
     uint64_t addr = b.gpuAddress;
     allocs[addr] = {b, addr, bytes};
@@ -143,6 +151,8 @@ struct Runtime {
     if (enc) return;
     if (!cb) cb = [queue commandBufferWithUnretainedReferences];
     enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    ++stats.encoders;
+    encodedInEncoder = 0;
     std::vector<id<MTLResource>> all;
     all.reserve(allocs.size());
     for (auto& [_, a] : allocs) all.push_back(a.buf);
@@ -157,6 +167,7 @@ struct Runtime {
       [cb addCompletedHandler:^(id<MTLCommandBuffer>) { keep.clear(); }];
     }
     [cb commit];
+    ++stats.commits;
     lastCommitted = cb;
     cb = nil;
     encoded = 0;
@@ -164,14 +175,29 @@ struct Runtime {
   void sync() {
     std::lock_guard<std::recursive_mutex> l(mu);
     commit();
+    ++stats.syncs;
     if (lastCommitted) {
+      auto t0 = std::chrono::steady_clock::now();
       [lastCommitted waitUntilCompleted];
+      stats.syncMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       if (lastCommitted.error) die(std::string("the GPU failed: ") + lastCommitted.error.localizedDescription.UTF8String);
       lastCommitted = nil;
     }
   }
   bool idle() { return !cb && (!lastCommitted || lastCommitted.status >= MTLCommandBufferStatusCompleted); }
 
+  // a runtime kernel that is a template (the GEMM): its explicit instantiation compiled with the runtime's source on
+  // first use, as the port's kernels are
+  id<MTLComputePipelineState> shimInstance(const std::string& host, const std::string& decl) {
+    auto it = shimPipelines.find(host);
+    if (it != shimPipelines.end()) return it->second;
+    auto t0 = std::chrono::steady_clock::now();
+    id<MTLLibrary> lib = compile(std::string(lf::SHIM_SOURCE) + "\n" + decl + "\n", host);
+    stats.compileMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    id<MTLComputePipelineState> p = pipelineOf(lib, host);
+    shimPipelines[host] = p;
+    return p;
+  }
   id<MTLComputePipelineState> shimPipeline(const std::string& name) {
     auto it = shimPipelines.find(name);
     if (it != shimPipelines.end()) return it->second;
@@ -188,11 +214,12 @@ struct Runtime {
     if (grid.width == 0 || grid.height == 0 || grid.depth == 0) return;
     if (capturing) {
       Op op{}; op.kind = 0; op.pso = pso; op.args.assign((const unsigned char*)args, (const unsigned char*)args + argBytes);
-      op.grid = grid; op.block = block; op.smem = smem;
+      op.grid = grid; op.block = block; op.smem = smem; op.label = label;
       capture->push_back(std::move(op));
       return;
     }
     ensureEncoder();
+    ++stats.dispatches;
     [enc setComputePipelineState:pso];
     if (argBytes <= 4096) [enc setBytes:args length:std::max<size_t>(argBytes, 4) atIndex:0];
     else {
@@ -201,16 +228,20 @@ struct Runtime {
       [enc setBuffer:b offset:0 atIndex:0];
     }
     [enc setThreadgroupMemoryLength:std::max<size_t>((smem + 15) & ~(size_t)15, 16) atIndex:0];
+    // (untracked buffers: the order between this dispatch and the last is the barrier's)
+    if (encodedInEncoder++ && untracked) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:block];
     if (profiling && !label.empty()) {      // (a command buffer a dispatch: its GPU time is the kernel's)
       id<MTLCommandBuffer> mine = cb;
       commit();
       profiled.push_back({label, mine});
     } else if (++encoded >= 256) {
+      ++stats.commitsThreshold;
       commit();                             // (let the GPU start while the host encodes the rest)
     }
   }
   void copy(uint64_t dst, uint64_t src, size_t bytes) {
+    ++stats.copies;
     struct { uint64_t dst, src, bytes; } a = {dst, src, bytes};
     size_t threads = ((dst | src) & 15) == 0 ? std::max<size_t>(bytes / 16, 16) : bytes;
     size_t groups = (threads + 255) / 256;
@@ -221,6 +252,7 @@ struct Runtime {
     dispatch(shimPipeline("lf_copy"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
   }
   void fill(uint64_t dst, int value, size_t bytes) {
+    ++stats.fills;
     struct { uint64_t dst, bytes; uint32_t value; uint32_t pad; } a = {dst, bytes, (uint32_t)value, 0};
     size_t threads = (dst & 15) == 0 ? std::max<size_t>(bytes / 16, 16) : bytes;
     size_t groups = (threads + 255) / 256;
@@ -295,6 +327,7 @@ struct Runtime {
                        ">(constant " + k.structName + "<" + targs + ">&, threadgroup char*, uint3, uint3, uint3, uint3, uint, uint, uint);";
     auto t0 = std::chrono::steady_clock::now();
     id<MTLLibrary> lib = compile(std::string(lf::PORT_SOURCE) + "\n" + inst + "\n", std::string("kernel ") + k.name + "<" + targs + ">");
+    stats.compileMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     id<MTLComputePipelineState> p = pipelineOf(lib, host);
     if (getenv("LOCALFOLD_METAL_VERBOSE"))
       fprintf(stderr, "metal: compiled %s<%s> in %.0f ms\n", k.name, targs.c_str(),
@@ -310,7 +343,16 @@ struct Runtime {
 };
 
 Runtime& R() {
-  static Runtime* r = new Runtime();
+  static Runtime* r = [] {
+    Runtime* rt = new Runtime();
+    if (rt->statsOn) atexit([] {
+      auto& s = R().stats;
+      fprintf(stderr, "metal stats: %ld launches %.1f ms encoding, %ld syncs %.1f ms waiting, %ld commits, %ld encoders, "
+              "%ld staged copies, %ld allocations, %zu live, compiles %.0f ms; commits by threshold %ld, by event %ld; %ld dispatches, %ld graph launches of %ld ops, %ld captures of %ld ops; copies %ld fills %ld gemms %ld memcpy %ld memset %ld\n", s.launches, s.launchMs, s.syncs, s.syncMs,
+              s.commits, s.encoders, s.staged, s.allocs, R().allocs.size(), s.compileMs, s.commitsThreshold, s.commitsEvent, s.dispatches, s.graphLaunches, s.graphOps, s.captures, s.capturedOps, s.copies, s.fills, s.gemms, s.memcpyCalls, s.memsetCalls);
+    });
+    return rt;
+  }();
   return *r;
 }
 thread_local lf::Launch CURRENT;
@@ -322,6 +364,9 @@ void setLaunchRaw(dim3 grid, dim3 block, size_t smem) { CURRENT = {grid, block, 
 void launch(int index, std::initializer_list<std::string> targs, KArgs& args) {
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
+  auto t0 = std::chrono::steady_clock::now();
+  struct Done { Runtime& r; std::chrono::steady_clock::time_point t0;
+    ~Done() { ++r.stats.launches; r.stats.launchMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } done{r, t0};
   std::string ta;
   for (auto& t : targs) ta += (ta.empty() ? "" : ", ") + t;
   if (ta.empty()) ta = "0";
@@ -338,7 +383,7 @@ void launch(int index, std::initializer_list<std::string> targs, KArgs& args) {
         std::to_string(pso.staticThreadgroupMemoryLength + L.smem) + " bytes of threadgroup memory; this GPU has " +
         std::to_string(r.dev.maxThreadgroupMemoryLength));
   r.dispatch(pso, args.bytes.data(), args.bytes.size(), MTLSizeMake(L.grid.x, L.grid.y, L.grid.z),
-             MTLSizeMake(L.block.x, L.block.y, L.block.z), L.smem, r.profiling ? std::string(PORT_KERNELS[index].name) : "");
+             MTLSizeMake(L.block.x, L.block.y, L.block.z), L.smem, (r.profiling || r.capturing) ? std::string(PORT_KERNELS[index].name) : "");
 }
 void* hostView(const void* device) { return R().host(device); }
 void profileStart() {
@@ -386,6 +431,7 @@ cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t bytes, cudaMemcpy
   if (bytes == 0) return cudaSuccess;
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
+  ++r.stats.memcpyCalls;
   kind = resolveKind(dst, src, kind);
   switch (kind) {
     case cudaMemcpyHostToHost: memcpy(dst, src, bytes); break;
@@ -398,6 +444,7 @@ cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t bytes, cudaMemcpy
       if (!r.capturing && r.idle()) { memcpy(r.host(dst, bytes, "cudaMemcpy destination"), src, bytes); break; }
       {   // staged: the bytes now, the copy in stream order
         id<MTLBuffer> stage = [r.dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared];
+        ++r.stats.staged;
         r.host(dst, bytes, "cudaMemcpy destination");
         if (r.capturing) {
           Op op{}; op.kind = 1; op.dst = (uint64_t)dst; op.src = stage.gpuAddress; op.bytes = bytes; op.keep.push_back(stage);
@@ -422,15 +469,29 @@ cudaError_t cudaMemcpy(void* dst, const void* src, size_t bytes, cudaMemcpyKind 
   if (kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToDevice) {}   // (ordered; nothing on the host waits)
   return cudaSuccess;
 }
+static void copy2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, int value, bool fill) {
+  Runtime& r = R();
+  std::lock_guard<std::recursive_mutex> l(r.mu);
+  if (width == 0 || height == 0) return;
+  r.host(dst, (height - 1) * dpitch + width, "cudaMemcpy2D destination");
+  if (!fill) r.host(src, (height - 1) * spitch + width, "cudaMemcpy2D source");
+  struct { uint64_t dst, src, dpitch, spitch, width, height; uint32_t value, fill; } a =
+    {(uint64_t)dst, (uint64_t)src, dpitch, spitch, width, height, (uint32_t)value, fill ? 1u : 0u};
+  MTLSize grid = MTLSizeMake((width + 255) / 256, std::min<size_t>(height, 65535), (height + 65534) / 65535);
+  r.dispatch(r.shimPipeline("lf_copy2d"), &a, sizeof a, grid, MTLSizeMake(256, 1, 1), 0);
+}
 cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height,
                               cudaMemcpyKind kind, cudaStream_t s) {
-  for (size_t r = 0; r < height; ++r)
+  kind = resolveKind(dst, src, kind);
+  if (kind == cudaMemcpyDeviceToDevice) { copy2d(dst, dpitch, src, spitch, width, height, 0, false); return cudaSuccess; }
+  for (size_t r = 0; r < height; ++r)       // (host on one side: row by row, each as a 1-D copy does)
     cudaMemcpyAsync((char*)dst + r * dpitch, (const char*)src + r * spitch, width, kind, s);
   return cudaSuccess;
 }
 cudaError_t cudaMemsetAsync(void* p, int value, size_t bytes, cudaStream_t) {
   if (bytes == 0) return cudaSuccess;
   Runtime& r = R();
+  ++r.stats.memsetCalls;
   std::lock_guard<std::recursive_mutex> l(r.mu);
   void* h = r.host(p, bytes, "cudaMemset");
   if (!r.capturing && r.idle()) { memset(h, value, bytes); return cudaSuccess; }
@@ -438,8 +499,8 @@ cudaError_t cudaMemsetAsync(void* p, int value, size_t bytes, cudaStream_t) {
   return cudaSuccess;
 }
 cudaError_t cudaMemset(void* p, int value, size_t bytes) { return cudaMemsetAsync(p, value, bytes, nullptr); }
-cudaError_t cudaMemset2DAsync(void* p, size_t pitch, int value, size_t width, size_t height, cudaStream_t s) {
-  for (size_t r = 0; r < height; ++r) cudaMemsetAsync((char*)p + r * pitch, value, width, s);
+cudaError_t cudaMemset2DAsync(void* p, size_t pitch, int value, size_t width, size_t height, cudaStream_t) {
+  copy2d(p, pitch, nullptr, 0, width, height, value, true);
   return cudaSuccess;
 }
 cudaError_t cudaMemGetInfo(size_t* free, size_t* total) {
@@ -495,6 +556,7 @@ cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) {
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
   if (r.capturing) return cudaSuccess;
+  ++r.stats.commitsEvent;
   r.commit();
   e->cb = r.lastCommitted;
   e->host = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -541,6 +603,7 @@ cudaError_t cudaStreamEndCapture(cudaStream_t, cudaGraph_t* g) {
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
   r.capturing = false;
+  ++r.stats.captures; r.stats.capturedOps += r.capture->size();
   *g = new LfGraph_{std::move(*r.capture)};
   delete r.capture; r.capture = nullptr;
   return cudaSuccess;
@@ -555,8 +618,9 @@ cudaError_t cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t g, cudaGraph
 cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t) {
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
+  ++r.stats.graphLaunches; r.stats.graphOps += exec->ops.size();
   for (auto& op : exec->ops) {
-    if (op.kind == 0) r.dispatch(op.pso, op.args.data(), op.args.size(), op.grid, op.block, op.smem);
+    if (op.kind == 0) r.dispatch(op.pso, op.args.data(), op.args.size(), op.grid, op.block, op.smem, r.profiling ? op.label : "");
     else if (op.kind == 1) {
       if (!op.keep.empty()) { r.ensureEncoder(); for (auto& k : op.keep) [r.enc useResource:k usage:MTLResourceUsageRead]; }
       r.copy(op.dst, op.src, op.bytes);
@@ -620,9 +684,35 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   if (a.m <= 0 || a.n <= 0 || batch <= 0) return;
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
-  std::string name = std::string("lf_gemm_") + typeTag(ta_) + "_" + typeTag(tb_) + "_" + typeTag(tc_);
-  MTLSize grid = MTLSizeMake((a.m + 63) / 64, (a.n + 63) / 64, batch);
-  r.dispatch(r.shimPipeline(name), &a, sizeof a, grid, MTLSizeMake(128, 1, 1), 0, r.profiling ? "gemm" : "");
+  ++r.stats.gemms;
+  // the tile: 64 x 64, or narrower along a short side (more threadgroups for a skinny product)
+  // the tile: TR rows along n by TC columns along m. A short n (up to 128) in ONE tile row - every weight read once -
+  // rounded up to 16; the columns then as many as keep a simdgroup's accumulators at 16 or fewer (TR/16 x TC/16)
+  int tr = 64, tc = 64;
+  if (a.n <= 128) {
+    tr = (a.n + 15) / 16 * 16;
+    tc = tr <= 64 ? 64 : 32;
+  } else if (a.m <= 48) {
+    tr = 64; tc = 32;
+  }
+  // too few threadgroups for the device: narrower columns
+  auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
+  while (tc > 16 && groups(tc) < 64) tc /= 2;
+  int bm = tc, bn = tr;
+  auto esize = [](cudaDataType t) { return t == CUDA_R_32F ? 4 : 2; };
+  bool vec = !a.ptrs && a.lda % 8 == 0 && a.ldb % 8 == 0 && (a.sa % 8 == 0) && (a.sb % 8 == 0) &&
+             a.A % (8 * esize(ta_)) == 0 && a.B % (8 * esize(tb_)) == 0;
+  if (vec) a.biasType |= 256;
+  if (getenv("LF_GEMM_DEBUG")) fprintf(stderr, "gemm %dx%dx%d ta %d tb %d tile %dx%d vec %d batch %d\n", a.m, a.n, a.k, a.ta, a.tb, tr, tc, (int)vec, batch);
+  auto mtype = [](cudaDataType t) { return t == CUDA_R_32F ? "float" : t == CUDA_R_16F ? "half" : "lf_bf16s"; };
+  std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
+                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false");
+  std::string name = std::string("lf_gemm_") + typeTag(ta_) + "_" + typeTag(tb_) + "_" + typeTag(tc_) + "_" +
+                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N");
+  std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
+  MTLSize grid = MTLSizeMake((a.m + bm - 1) / bm, (a.n + bn - 1) / bn, batch);
+  char label[96]; snprintf(label, sizeof label, "gemm %s %dx%dx%d%s", name.c_str() + 8, a.m, a.n, a.k, batch > 1 ? " batched" : "");
+  r.dispatch(r.shimInstance(name, decl), &a, sizeof a, grid, MTLSizeMake(128, 1, 1), 0, (r.profiling || r.capturing) ? std::string(label) : "");
 }
 float scalar(const void* p, cublasComputeType_t compute) {
   if (compute == CUBLAS_COMPUTE_16F) return (float)*(const __half*)p;

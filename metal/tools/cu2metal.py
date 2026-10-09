@@ -560,6 +560,8 @@ def local_references(body, shared, pointers):
     pointer into a buffer, thread otherwise."""
     def repl(m):
         base = m.group(4)
+        if m.group(2).strip() in ("auto", "const auto") or re.search(r"\b(thread|device|threadgroup|constant)\s*$", m.group(1)):
+            return m.group(0)
         space = "threadgroup" if base in shared else ("device" if base in pointers else "thread")
         return f"{m.group(1)}{space} {m.group(2)}& {m.group(3)} = {base}"
     return re.sub(r"((?:^|[;{}])\s*)((?:const\s+)?[A-Za-z_][\w:<>]*)\s*&\s*([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)(?=\s*\[)", repl, body, flags=re.M)
@@ -611,6 +613,9 @@ class Port:
         self.device_items = []   # (file, text) in order
         self.problems = []
 
+    def source(self, path):
+        return self.parsed[path][0] if hasattr(self, "parsed") and path in self.parsed else open(path).read()
+
     def walk(self, path, seen):
         path = os.path.abspath(path)
         if path in seen:
@@ -626,8 +631,26 @@ class Port:
     def run(self):
         self.walk(self.root, set())
         self.parsed = {}
+        self.port = os.path.basename(os.path.dirname(os.path.dirname(self.root)))
+        self.host_overrides = {}
+        hdir = os.path.join(REPO, "metal", self.port, "host")
+        if os.path.isdir(hdir):
+            for f in sorted(os.listdir(hdir)):
+                if f.endswith(".h"):
+                    self.host_overrides[f[:-2]] = open(os.path.join(hdir, f)).read()
         for path in self.files:
             src = open(path).read()
+            replacement = os.path.join(REPO, "metal", "replace", os.path.relpath(path, CUDA))
+            if os.path.exists(replacement):        # (a hand-written Metal version of the whole file)
+                src = open(replacement).read()
+            inject = os.path.join(REPO, "metal", self.port, "inject", os.path.relpath(path, CUDA))
+            if os.path.exists(inject):             # (Metal kernels and helpers added to the file, CUDA syntax)
+                # after the file's own includes, before anything that may call them
+                last = 0
+                for im in re.finditer(r"^\s*#\s*include\b[^\n]*\n", src, re.M):
+                    last = im.end()
+                src = (src[:last] + "// ---- injected: metal/" + self.port + "/inject/" + os.path.relpath(path, CUDA) + "\n" +
+                       open(inject).read() + "\n// ---- end of injection\n" + src[last:])
             m = mask(src)
             items = items_of(m, 0, len(m))
             self.parsed[path] = (src, m, [(it, classify(it, m)) for it in items])
@@ -651,6 +674,20 @@ class Port:
                     pieces.append("")
                 elif kind == "devvar":
                     pieces.append(re.sub(r"\b__constant__\b|\b__device__\b", "", text))
+                elif kind == "other" and it.kind == "def" and "(" in it.header and self.host_overrides:
+                    try:
+                        hname = parse_signature(it.header)[1]
+                    except Exception:
+                        hname = None
+                    if hname in self.host_overrides:
+                        # (a host function of the Metal build's own, metal/<port>/host/<name>.h: every overload of the
+                        # name replaced by the file, once)
+                        pieces.append(f"// {hname}: metal/{self.port}/host/{hname}.h\n" + self.host_overrides.pop(hname))
+                        self.replaced_host = getattr(self, "replaced_host", set()) | {hname}
+                    elif hname in getattr(self, "replaced_host", set()):
+                        pieces.append("")
+                    else:
+                        pieces.append(text)
                 else:
                     pieces.append(text)
             pieces.append(src[last:])
@@ -658,9 +695,9 @@ class Port:
         for path, host in host_out.items():
             rel = os.path.relpath(path, CUDA)
             dst = os.path.join(self.out, "gen", rel)
-            replacement = os.path.join(REPO, "metal", "replace", rel)
-            if os.path.exists(replacement):          # (a hand-written Metal version of the whole file)
-                host = open(replacement).read()
+            # libzstd: on a Mac it is linked into the binary itself (metal/build.sh), where dlsym finds it
+            host = re.sub(r'dlopen\("libzstd\.so\.1",\s*RTLD_NOW\)', "dlopen(nullptr, RTLD_NOW)", host)
+            host = re.sub(r'dlopen\("libzstd\.so",\s*RTLD_NOW\)', "dlopen(nullptr, RTLD_NOW)", host)
             # std::to_chars for a float needs macOS 13.3's libc++: lf::to_chars (lfcuda.h) prints as it does
             host = re.sub(r"\bstd::to_chars\s*\(", "lf::to_chars(", host)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -958,6 +995,10 @@ class Port:
 
     def common_body(self, body, names=()):
         body = self.dev_text(body)
+        # CUDA's `#pragma unroll` unrolls a constant-count loop fully; Metal's compiler takes the bare pragma as a hint,
+        # and an array of matrix registers indexed by a loop it did not unroll goes to memory (5-10x slower)
+        body = re.sub(r"#\s*pragma\s+unroll\s+(\d+)\s*$", r'_Pragma("clang loop unroll_count(\1)")', body, flags=re.M)
+        body = re.sub(r"#\s*pragma\s+unroll\s*$", r'_Pragma("clang loop unroll(full)")', body, flags=re.M)
         body, lambdas = lower_lambdas(body, names)
         body = rewrite_casts(body)
         body = vector_element_casts(body)
