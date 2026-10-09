@@ -18,6 +18,19 @@
 #include "../../featurise/af3_weights.h"   // the weight walk: the bundle read as published, no map
 #include "profile.cuh"
 
+// Whether the fold's pair stays bf16 PAST the trunk too (af3.cu's TRUNK_PAIR16): on a card short of room, where
+// every reader after the trunk takes bf16 rows - the distogram's contacts, the streamed diffusion preparation and the
+// confidence head - so the f32 pair is never made. Not for OpenDDE (its expander reads f32), boltz2 (its head
+// re-embeds the pair) or rf3 (its global norm). foldFits sizes a fold by it.
+inline bool pairStays16(int n, int C, bool fast) {
+  size_t pairs = (size_t)n * n;
+  Trunk probe{}; probe.n = n; probe.C = C;
+  return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair(pairs, C) &&
+         !M.flag("trunk.dialect.structuralTokens") && !M.flag("trunk.dialect.reembedConfidencePair") &&
+         !M.flag("trunk.dialect.confidenceGlobalNorm") && hasW("diffusion.encoder.embedTrunkPairCond") &&
+         shortPair(pairs, (int)M.meta("diffusion.conditioning.pairChannels")) && (int)M.meta("confidence.pairChannels") == C;
+}
+
 static int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af3 <data-dir> [--fast] [--stages] [--repeat=N]\n"); return 1; }
   // the big-input paths when 18x the f32 pair does not fit the room (common.cuh, shortPair);
@@ -318,8 +331,9 @@ static int foldMain(int argc, char** argv) {
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
   if (oracleTargetFeat)
     targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
-  if (!foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"))) return 1;
-  t = makeTrunk(targetFeat.data(), msaCap);
+  if (!foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
+                doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
+  t = makeTrunk(targetFeat.data(), msaCap, doFold && fast);
   memReport("trunk built");
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
@@ -414,7 +428,15 @@ static int foldMain(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
-    pairToF32(t);                     // (a bf16 trunk's pair, for the heads, the sampler and the confidence head)
+    memReport("trunk: passes done");
+    // 🔴 THE PAIR STAYS bf16 PAST THE TRUNK on a card short of room, where every reader after it takes bf16 rows
+    // (the distogram's contacts, the streamed diffusion preparation, the confidence head): the f32 pair it was widened
+    // into was the fold's largest tensor past the trunk - 18.4 GB at 6,000 tokens, 51 at 10,000 - and the widening
+    // held both at once. Not for OpenDDE (its expander reads f32), boltz2 (its head re-embeds the pair) or rf3 (its
+    // global norm), nor --save-embeddings
+    TRUNK_PAIR16 = t.p16 && !saveEmbeddings && pairStays16(t.n, t.C, fast);
+    if (!TRUNK_PAIR16) pairToF32(t);  // (a bf16 trunk's pair, for the heads, the sampler and the confidence head)
+    else if (t.prevPair) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }   // (pairToF32's other half)
     releaseConcatCopies(); memReport("trunk");
     auto f1 = clock();
     if (STAGES) {     // the trunk's stages, then the diffusion's below
@@ -477,7 +499,11 @@ static int foldMain(int argc, char** argv) {
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
     if (!structural && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
-        parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); dP = nullptr; }
+        parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4) + diffusionPrepBytes(pairs))) {
+      // (the room asked for is the pair's AND what the preparation will hold beside it - asked for the pair alone, a
+      // 6,916-token fold kept its 12.2 GB bf16 pair on the device and ran out in the preparation)
+      parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); dP = nullptr;
+    }
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
     // ...and the pair-sized tensors only the preparation reads, given back before the steps: the
     // transformer's and the encoder's pair LayerNorms and the per-super-block logits (1.4 GB at 1048
@@ -495,7 +521,9 @@ static int foldMain(int argc, char** argv) {
       // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
       // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
       releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj", "pt." });
-      if (!structural && t.pair && parkWorthIt(pairs * t.C * 4)) { parkToHost(t.pair, pairs * t.C * 4); df.trunkPair = nullptr; }
+      if (!structural && t.pair && parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4))) {
+        parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); df.trunkPair = nullptr;
+      }
     }
     releaseConcatCopies(); memReport("diffusion prepared");
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
@@ -610,7 +638,7 @@ static int foldMain(int argc, char** argv) {
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
-        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * 4);    // (parked for the sampler)
+        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * (TRUNK_PAIR16 ? 2 : 4));    // (parked for the sampler)
         // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
         bool last = c0 + k + 1 == runs.size();
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,

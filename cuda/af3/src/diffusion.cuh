@@ -191,10 +191,21 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
     // each chunk copied up, and `trunkPair` a base the chunk's own row offsets land inside
     const bool fromHost = streamed && !trunkPair;
     if (fromHost && !PARK_HOST) { fprintf(stderr, "the conditioning has no trunk pair\n"); exit(1); }
-    float* trunkRows = fromHost ? scratch<float>("dc.trunkRows", per * Czt) : nullptr;
+    // ...and a bf16 one (TRUNK_PAIR16), parked or on the device, is widened a chunk of rows at a time
+    if (TRUNK_PAIR16 && !streamed) { fprintf(stderr, "the conditioning reads a bf16 trunk pair only streamed\n"); exit(1); }
+    const bool rows16 = streamed && TRUNK_PAIR16;
+    const __nv_bfloat16* dev16 = rows16 && trunkPair ? reinterpret_cast<const __nv_bfloat16*>(trunkPair) : nullptr;
+    float* trunkRows = fromHost || rows16 ? scratch<float>("dc.trunkRows", per * Czt) : nullptr;
+    __nv_bfloat16* stage16 = rows16 && fromHost ? scratch<__nv_bfloat16>("dc.trunkRows16", per * Czt) : nullptr;
     for (size_t p0 = 0; p0 < pairs; p0 += per) {
       size_t r = std::min(per, pairs - p0);
-      if (fromHost) {
+      if (rows16) {
+        const __nv_bfloat16* src = dev16 ? dev16 + p0 * Czt : stage16;
+        if (!dev16) CK(cudaMemcpyAsync(stage16, reinterpret_cast<const __nv_bfloat16*>(PARK_HOST) + p0 * Czt, r * Czt * 2,
+                                       cudaMemcpyHostToDevice, STREAM));
+        pairRowsF32K<<<blocks(r * Czt), 256, 0, STREAM>>>(src, trunkRows, r * Czt);
+        trunkPair = trunkRows - p0 * Czt;
+      } else if (fromHost) {
         CK(cudaMemcpyAsync(trunkRows, PARK_HOST + p0 * Czt, r * Czt * 4, cudaMemcpyHostToDevice, STREAM));
         trunkPair = trunkRows - p0 * Czt;
       }
@@ -689,7 +700,9 @@ inline void prepareTransformer(const float* pairCond, int n) {
     const int nSB = (tc.nblocks + perSuper - 1) / perSuper;
     const size_t sbBytes = (size_t)perSuper * heads * n * tc.stride * 2, pnBytes = given ? 0 : pairs * Cz * 2;
     size_t held = 0;
-    for (auto& [k, v] : SCRATCH) if (!k.compare(0, 5, "dt.bh") || k == "dt.pn16") held += v.second;
+    // (what is held counts toward what is needed only for what the need includes: a streamed preparation's pn16 is
+    // handed in, not part of the need, and counting it admitted 12.2 GB of biases that did not fit at 6,916 tokens)
+    for (auto& [k, v] : SCRATCH) if (!k.compare(0, 5, "dt.bh") || (!given && k == "dt.pn16")) held += v.second;
     auto fits = [&](size_t need) { return roomFor(need > held ? need - held : 0); };
     int kept = fits((size_t)tc.nblocks * heads * n * tc.stride * 2) ? nSB : 0;
     if (kept < nSB) while (kept + 1 < nSB && fits((size_t)(kept + 2) * sbBytes + pnBytes)) ++kept;   // kept + the shared set
@@ -1031,6 +1044,14 @@ inline void dtap(const char* name, const float* d, size_t n) {
   if (capturing != cudaStreamCaptureStatusNone) return;
   if (M.has(k) && M.len(k) == n) check((std::string("  ") + name).c_str(), d, n, k);
 }
+// what a streamed preparation holds that is pair-sized: the transformer's f16 LayerNorm'd pair, the encoder's pair
+// projection, and the one super block of biases a lazy transformer keeps (a step remakes the rest)
+inline size_t diffusionPrepBytes(size_t pairs) {
+  const std::string T = "diffusion.transformer";
+  size_t Cz = (size_t)M.meta("diffusion.conditioning.pairChannels"), Cp = (size_t)M.meta("diffusion.encoder.pairChannels");
+  size_t heads = (size_t)M.meta(T + ".heads"), perSuper = (size_t)M.meta(T + ".blocksPerSuperBlock");
+  return pairs * (Cz * 2 + Cp * 4 + perSuper * heads * 2);
+}
 inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat,
                                       const float* seqMask, int n) {
   DiffusionFold f{ trunkSingle, trunkPair, targetFeat, seqMask, n, {}, {} };
@@ -1057,7 +1078,7 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
     PAIR_CHUNK_SINK = nullptr;
     // the chunk loop's working rows given back before the encoder and decoder prepare beside tp and pn16
     // (0.9 GB at 1530 tokens, which is what they ran out of)
-    releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.trunkRows", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj",
+    releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.trunkRows", "dc.trunkRows16", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj",
                      "enc.tpln", "pt." });
     ENC_TP_GIVEN = tp;
     f.enc = prepareEncoder(E, "atomReference", trunkSingle, nullptr);

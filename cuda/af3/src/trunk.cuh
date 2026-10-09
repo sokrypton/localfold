@@ -177,11 +177,15 @@ struct Trunk {
 // scratch measured 0.63x the pair (11.6 GB beside an 18.4 GB pair at 6000 tokens on 40 GB), and more on a card
 // short of shared memory, whose unfused kernels hold more: 1.8x the pair and a 20th of the card spare admit
 // 6000 tokens on 40 GB, and 3200 but not 3500 on a simulated T4 - as measured. Scratch held counts as free.
-inline bool foldFits(int n, int C) {
+// stays16: the pair stays bf16 past the trunk (af3.cu's pairStays16) - the f32 pair and its widening never exist, and
+// the fold's floor is the trunk's bf16 pair beside the blocked triangle's f16 operand: PAIR16_FIT_TIMES of the f32
+// pair, measured (below)
+constexpr double PAIR16_FIT_TIMES = 1.15;
+inline bool foldFits(int n, int C, bool stays16 = false) {
   if (getenv("LOCALFOLD_NO_FOLD_FITS")) return true;     // (to find a ceiling by experiment)
   size_t f, t; deviceMemInfo(&f, &t);
   for (auto& [name, slot] : SCRATCH) f += slot.second;
-  double perPair = C * 4 * 1.8;
+  double perPair = C * 4 * (stays16 ? PAIR16_FIT_TIMES : 1.8);
   size_t need = (size_t)((double)n * n * perPair) + t / 20;
   if (need <= f) return true;
   int most = f > t / 20 ? (int)std::sqrt((double)(f - t / 20) / perPair) : 0;
@@ -222,7 +226,9 @@ inline void pairToF32(Trunk& t) {
   if (t.prevPair) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }
   t.p16 = false;
 }
-inline Trunk makeTrunk(const float* targetFeatHost, int msaCap) {
+// wantPair16: the fold will hold its pair in bf16 where every stack takes it (af3.cu's want16) - allocated so here, never
+// as an f32 pair first: that pair was 24.5 GB at 6,916 tokens, a transient peak, and 51 GB at 10,000 does not allocate
+inline Trunk makeTrunk(const float* targetFeatHost, int msaCap, bool wantPair16 = false) {
   Trunk t{};
   t.n = (int)M.meta("batch.tokens");
   t.C = (int)M.meta("trunk.embedder.pairChannels");
@@ -233,13 +239,16 @@ inline Trunk makeTrunk(const float* targetFeatHost, int msaCap) {
   t.swap = M.flag("trunk.dialect.swapTransposedBias");
   t.divide = M.flag("trunk.dialect.triangleMulDivideByLength");
   size_t pairs = (size_t)t.n * t.n;
-  t.pair = dalloc(pairs * t.C); t.single = dalloc((size_t)t.n * t.Cs);
+  t.p16 = wantPair16 && pair16Eligible(t);
+  const size_t e = t.p16 ? 2 : 4;
+  auto pairAlloc = [&] { return t.p16 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(pairs * t.C)) : dalloc(pairs * t.C); };
+  t.pair = pairAlloc(); t.single = dalloc((size_t)t.n * t.Cs);
   t.msa = dalloc((size_t)t.S * t.n * t.Cm);
   // on a card short of room the recycled pair is the pair itself, re-embedded in place (embed): no second
   // pair-sized tensor - 9 GB at 4192 tokens - and the first pass starts from a zeroed pair
   t.inPlaceRecycle = shortPair(pairs, t.C);
-  t.prevPair = t.inPlaceRecycle ? nullptr : dalloc(pairs * t.C); t.prevSingle = dalloc((size_t)t.n * t.Cs);
-  CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pairs * t.C * 4));
+  t.prevPair = t.inPlaceRecycle ? nullptr : pairAlloc(); t.prevSingle = dalloc((size_t)t.n * t.Cs);
+  CK(cudaMemset(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pairs * t.C * e));
   CK(cudaMemset(t.prevSingle, 0, (size_t)t.n * t.Cs * 4));
   t.targetFeat = upload(targetFeatHost, (size_t)t.n * t.F);
   std::vector<float> seq(M.f("batch.seqMask"), M.f("batch.seqMask") + t.n), pm(pairs);
@@ -1247,19 +1256,21 @@ inline std::vector<float> contactProbabilities(Trunk& t) {
   size_t pairs = (size_t)t.n * t.n;
   float* out = scratch<float>("disto.contact", pairs);
   if (shortPair(pairs, t.C)) {
-    if (t.p16) { fprintf(stderr, "contact probabilities: a bf16 pair on a card short of room\n"); exit(1); }
     // on a card short of room in blocks of rows: a row's symmetrised logit is its own half-logit plus the
     // transposed pair's, so each block projects its rows and the column entries gathered from the pair -
     // never the [pairs, bins] logits whole (9.2 GB at 6000 tokens, twice)
     int n = t.n, C = t.C;
     size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(C, bins))));
-    float* rowsT = scratch<float>("disto.rowsT", R * n * C);
+    float* rowsT = scratch<float>("disto.rowsT", (R * n * C * (t.p16 ? 2 : 4) + 3) / 4);   // (bf16 under p16)
     float* a = scratch<float>("disto.half", R * n * bins); float* b = scratch<float>("disto.halfT", R * n * bins);
     for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
       size_t r = std::min(R, (size_t)n - r0), rows = r * n;
-      distogramHalf(t.pair + r0 * n * C, a, rows, C, bins);
-      gatherTransposedK<<<blocks(rows * C * 4 / 16), 256, 0, STREAM>>>(t.pair, rowsT, n, C, r0, r, 4);
-      distogramHalf(rowsT, b, rows, C, bins);
+      const int e = t.p16 ? 2 : 4;
+      const float* own = t.p16 ? reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(t.pair) + r0 * n * C)
+                               : t.pair + r0 * n * C;
+      distogramHalfP(own, t.p16, a, rows, C, bins);
+      gatherTransposedK<<<blocks(rows * C * e / 16), 256, 0, STREAM>>>(t.pair, rowsT, n, C, r0, r, e);
+      distogramHalfP(rowsT, t.p16, b, rows, C, bins);
       addK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, b, rows * bins);
       if (distogramSymScale() != 1.f) scaleK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, distogramSymScale(), rows * bins);
       contactProbsK<<<blocks(rows), 256, 0, STREAM>>>(a, contactBins + r0 * n, t.pairMask + r0 * n,

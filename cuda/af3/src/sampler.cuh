@@ -452,25 +452,41 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
   for (int i = 0; i < n; ++i) if (seq[i] > 0 && std::find(chains.begin(), chains.end(), asym[i]) == chains.end()) chains.push_back(asym[i]);
   std::sort(chains.begin(), chains.end());
   int nc = (int)chains.size();
-  // max over anchors of the mean over the selected pairs (NaN when nothing is selected)
-  auto reduce = [&](const std::function<bool(int, int)>& selects) {
-    double best = -1e30; bool any = false;
+  // 🔴 ONE PASS OVER THE PAIRS, NOT ONE A CHAIN PAIR: every chain's pTM and ipTM and every chain pair's ipTM is a max over
+  // anchors i of the mean of tmTerm[i][j] over the j it selects, and each selection is "j in chain b" or its complement -
+  // so each anchor's row summed per chain once (in j order) answers them all. It rescanned the n^2 pairs through a
+  // std::function for each of the nc^2 chain pairs: minutes past ~5,000 tokens in tens of chains
+  std::vector<int> chainOf(n, -1);
+  for (int i = 0; i < n; ++i) chainOf[i] = (int)(std::find(chains.begin(), chains.end(), asym[i]) - chains.begin());
+  std::vector<double> rowSum((size_t)n * nc, 0.0); std::vector<int> chainCount(nc, 0);
+  for (int j = 0; j < n; ++j) if (seq[j] > 0 && chainOf[j] < nc) chainCount[chainOf[j]]++;
+  if (!tmTerm.empty())
     for (int i = 0; i < n; ++i) {
-      double total = 0; int count = 0;
-      for (int j = 0; j < n; ++j) {
-        if (!(seq[i] > 0 && seq[j] > 0) || !selects(i, j)) continue;
-        total += tmTerm[(size_t)i * n + j]; ++count;
-      }
-      if (count) { any = true; best = std::max(best, total / count); }
+      if (!(seq[i] > 0)) continue;
+      double* r = rowSum.data() + (size_t)i * nc;
+      for (int j = 0; j < n; ++j) if (seq[j] > 0 && chainOf[j] < nc) r[chainOf[j]] += tmTerm[(size_t)i * n + j];
     }
-    return any ? best : NAN;
+  // max over the anchors of chain `from` (or every chain but it, `others`) of their mean over chain `to`'s pairs (or
+  // over every chain but `to`'s, `notTo`); NaN when nothing is selected
+  auto best = [&](int from, bool others, int to, bool notTo) {
+    double top = -1e30; bool any = false;
+    for (int i = 0; i < n; ++i) {
+      if (!(seq[i] > 0) || chainOf[i] >= nc || (others ? chainOf[i] == from : chainOf[i] != from)) continue;
+      const double* r = rowSum.data() + (size_t)i * nc;
+      double total = 0; int count = 0;
+      if (notTo) { for (int b = 0; b < nc; ++b) if (b != to) { total += r[b]; count += chainCount[b]; } }
+      else { total = r[to]; count = chainCount[to]; }
+      if (count) { any = true; top = std::max(top, total / count); }
+    }
+    return any ? top : NAN;
   };
+  auto maxNan = [](double x, double y) { return std::isnan(x) ? y : std::isnan(y) ? x : std::max(x, y); };
   auto num = [](FILE* f, double v) { if (std::isfinite(v)) fprintf(f, "%.2f", v); else fprintf(f, "null"); };
   std::vector<double> chainPtm(nc, NAN), chainIptm(nc, NAN);
-  for (int a = 0; a < nc; ++a) {
-    int c = chains[a];
-    chainPtm[a] = reduce([&](int i, int j) { return asym[i] == c && asym[j] == c; });
-    chainIptm[a] = reduce([&](int i, int j) { return (asym[i] == c) != (asym[j] == c); });
+  for (int a = 0; a < nc && !tmTerm.empty(); ++a) {
+    chainPtm[a] = best(a, false, a, false);
+    // (asym[i] == c) != (asym[j] == c): anchors in c over the other chains, and anchors elsewhere over c
+    chainIptm[a] = maxNan(best(a, false, a, true), best(a, true, a, false));
   }
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
   fprintf(f, "{\n  \"chain_ids\": [");
@@ -483,8 +499,7 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
       for (int b = 0; b < nc; ++b) {
         if (b) fprintf(f, ", ");
         if (a == b) { num(f, chainPtm[a]); continue; }        // the diagonal is the chain's own pTM
-        int ca = chains[a], cb = chains[b];
-        num(f, reduce([&](int i, int j) { return (asym[i] == ca && asym[j] == cb) || (asym[i] == cb && asym[j] == ca); }));
+        num(f, maxNan(best(a, false, b, false), best(b, false, a, false)));
       }
       fprintf(f, "]");
     }
@@ -493,8 +508,7 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
   if (!contact.empty()) {      // the strongest predicted contact within and between chains, sequence neighbours out
     std::vector<double> mx((size_t)nc * nc, -1);
     for (int i = 0; i < n; ++i) for (int j = i + 1; j < n; ++j) {
-      int a = (int)(std::find(chains.begin(), chains.end(), asym[i]) - chains.begin());
-      int b = (int)(std::find(chains.begin(), chains.end(), asym[j]) - chains.begin());
+      int a = chainOf[i], b = chainOf[j];
       if (a >= nc || b >= nc || (a == b && std::abs(res[i] - res[j]) <= 6)) continue;
       double v = contact[(size_t)i * n + j];
       if (v > mx[(size_t)a * nc + b]) mx[(size_t)a * nc + b] = mx[(size_t)b * nc + a] = v;

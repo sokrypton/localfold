@@ -1307,6 +1307,42 @@ per-channel ones stay under 2^32 to 65,536 tokens. The fixed cost at this size i
 itself (18.4 GB in f32) and the blocked triangle's fixed operand (9.2 GB), which must be whole: a
 2-D tiling would read pair entries earlier tiles had written.
 
+### 🔴 7,900 tokens on a 40 GB A100: the pair stays bf16 past the trunk (2026-10-09)
+
+**7,904 tokens folds on this 40 GB card** (one pass and 4 steps for the measurement: 41.2 GB peak in the trunk, 36.1 in
+the diffusion, 23.3 in the confidence head; a trunk pass 9.0 minutes), where 6,000 was the ceiling. The trunk's pair
+was already bf16; past the trunk it was widened to f32 (`pairToF32`) for the distogram, the diffusion and the
+confidence head - 18.4 GB at 6,000 tokens, 51 GB at 10,000, and the widening held both copies at once. On a card
+short of room (`pairStays16`) it stays bf16 and every reader takes bf16 rows: the distogram's contacts (a gathered
+bf16 transpose), the streamed diffusion preparation (each chunk widened as it is copied, from the device or from the
+parked pair), and the confidence head (its pair bf16, its blocks under `PAIR16`, its heads widening a chunk of rows).
+**The structure is byte-identical** (the diffusion reads exactly the values the widening made); the confidence head
+storing its pair in bf16 moves PAE by at most 0.12 A and pLDDT by 0.06 on 6MRR under `LOCALFOLD_BIG=1`. Every fold
+off the big-input path is byte-identical. Not yet for boltz2 (its head re-embeds the pair), rf3 (its global norm) or
+OpenDDE (its expander) - those widen as before. What it took beside that, each found by folding past the old line:
+
+- **the confidence heads' logits a chunk at a time**: `[pairs, 64]` f32 is TWICE a 128-channel f32 pair (25.6 GB at
+  10,000), held whole only to be reduced to the PAE, the PDE and the pTM term - now each chunk's logits are reduced
+  as they are made. Exact for the PAE and pTM and the pre-symmetrised PDE; AF3's PDE symmetrises after the projection
+  (l_ij + l_ji), taken chunked through linearity as W (LN(z_ij) + LN(z_ji)) - 0.0008 A of rounding, and the PDE
+  reaches no output file.
+- **the trunk's pair allocated bf16 from the start** (`makeTrunk`): it was allocated f32, zeroed, then swapped -
+  a 24.5 GB transient at 6,916 tokens, and 51 GB at 10,000, which does not allocate at all.
+- **the pair parked before the diffusion when the PREPARATION does not fit beside it** (`diffusionPrepBytes`: the
+  f16 LayerNorm'd pair, the encoder's projection, a super block of biases), not when the pair alone does not: asked
+  for the pair alone, 6,916 tokens kept its 12.2 GB pair on the device and ran out in the preparation.
+- **the bias cache counting only what its need includes**: a streamed preparation's handed-in f16 pair (12.2 GB) was
+  counted as room toward the biases and admitted ones that did not fit.
+- **the summary file in one pass over the pairs**: every chain's and chain pair's pTM/ipTM rescanned all n^2 pairs
+  through a `std::function` - minutes at 6,916 tokens in 28 chains. Now each anchor's row is summed per chain once;
+  every summary checked byte-identical (calmodulin's five chains, TetR+DNA's four, RNase B's two, 1BRS, 1TIM).
+
+`foldFits` sizes a fold on this path at **1.15x the f32 pair** (measured 1.16 at the edge, the trunk's bf16 pair and
+the blocked triangle's f16 operand being its floor), so it admits ~7,700 tokens on 40 GB and, by the same rule,
+**~10,900 on an 80 GB card and ~12,000 on Colab's 96 GB RTX PRO 6000** - not measured there. The trunk is the time:
+a pass is 9 minutes at 7,904 tokens, ~18 at 10,000 (the grid attention's flash kernel half of it, at ~40% of the
+tensor cores' peak with heads 32 wide: its exponentials cost as much as its matrix work).
+
 ### 🔴 Past the card: refused up front (folding there is on a branch)
 
 A fold that would not fit the card is refused **before anything is allocated**, with the longest this card

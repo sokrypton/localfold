@@ -1192,6 +1192,9 @@ inline void scratchReportOOM(const char* what, size_t bytes) {
 // pinned buffer for the process, grown as needed; parking frees the device copy and unparking makes a new
 // one (callers take the new pointer).
 inline float* PARK_HOST = nullptr; inline size_t PARK_HAVE = 0;
+// the trunk's pair kept in bf16 past the trunk (af3.cu, a card short of room): wherever it is - on the device or
+// parked - its readers take bf16 rows, so the f32 pair (51 GB at 10,000 tokens) never exists
+inline bool TRUNK_PAIR16 = false;
 inline bool parkWorthIt(size_t bytes) { return !roomFor(bytes); }
 inline void parkToHost(float*& dev, size_t bytes) {
   if (PARK_HAVE < bytes) {
