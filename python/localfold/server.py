@@ -426,6 +426,7 @@ def main():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {SITE} on {arguments.host}:{arguments.port}"
           + (" · Disconnect will release this Colab machine" if RUNTIME_ADDR
+             else " · Ctrl-C stops it" if arguments.local
              else " · no Colab runtime here, Disconnect stops the service"),
           flush=True)
     # One line, machine-readable, for the notebook cell that prints the handle.
