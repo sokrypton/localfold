@@ -30,3 +30,22 @@
     M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c", nullptr, "", "blocks/");   // (int8 tower blocks stay resident)
   }
 @@@ end
+# (Metal) the trunk's working buffers given back when it is done (ftr., ftri., trunk.xn, and the language model's shim.),
+# where the port keeps them for a next fold - they sat beside the sampler's and the confidence head's, 0.85 GB at 261
+# tokens. LOCALFOLD_KEEP_SCRATCH=1 is the control.
+@@@ old
+  mem("trunk");
+  if (zi) { CK(cudaFree(zi)); zi = nullptr; }
+@@@ new
+  if (!tight && !getenv("LOCALFOLD_KEEP_SCRATCH")) releaseScratch({"ftr.", "ftri.", "trunk.xn", "shim."});
+  mem("trunk");
+  if (zi) { CK(cudaFree(zi)); zi = nullptr; }
+@@@ end
+# ...and the sampler's (dc., dtr., tb., dn., atom. - confidence.cuh reads none of them) before the confidence head, which
+# was the fold's peak with them held
+@@@ old
+  mem("sampler");
+@@@ new
+  if (!getenv("LOCALFOLD_KEEP_SCRATCH")) releaseScratch({"dc.", "dtr.", "tb.", "dn.", "atom."});
+  mem("sampler");
+@@@ end

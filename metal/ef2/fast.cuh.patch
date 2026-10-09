@@ -101,3 +101,10 @@ inline void triangleFusedIn(float* pair, const float* mask, int L, int C, const 
   gateMulAddHK<<<blocks(P * C), 256, 0, STREAM>>>(pair, out, pg + 4 * C, P, C, 5 * C);
 }
 @@@ end
+# (the widening's buffer only where the unfused SwiGLU writes it: 0.18 GB at 261 tokens the fused path never touched)
+@@@ old
+  half* h = scratch<half>("ftr.h", std::min(P, chunk) * 2 * I); half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
+@@@ new
+  half* h = getenv("LOCALFOLD_UNFUSED_SWIGLU") ? scratch<half>("ftr.h", std::min(P, chunk) * 2 * I) : nullptr;
+  half* g = scratch<half>("ftr.g", std::min(P, chunk) * I);
+@@@ end

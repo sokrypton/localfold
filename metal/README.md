@@ -120,7 +120,10 @@ writing it, the f32 copy never made): the tower's matrices and the folding bundl
 allocation **5.05 -> 4.04 GB**, footprint 5.69 -> 4.10, the same digits. 🔴 A float copy rebuilt from a half-only
 tensor is a DERIVED weight: one rebuilt during the warm-up (which runs while the weights are still arriving) was garbage
 and became the fold's - pLDDT 71.4 - until it was forgotten with the others (FORGET_HOOKS). AlphaFold 3's published bundle takes
-the same load (`metal/af3/af3.cu.patch`): at 68 tokens, where the start-up is the peak, 3.35 -> 2.25 GB.
+the same load (`metal/af3/af3.cu.patch`): at 68 tokens, where the start-up is the peak, 3.35 -> 2.25 GB. And ESMFold2 gives
+back its trunk's scratch when the trunk is done and its sampler's before the confidence head (`metal/ef2/ef2.cu.patch`),
+and no longer allocates the widening the fused SwiGLU never writes: **5CAJ's peak 5.05 -> 3.10 GB** over this work, the
+same digits.
 
 🔴 **A `size_t` DIVISION AN ELEMENT IS EMULATED ON APPLE'S GPUS, AND IT COST ESMFold2 A THIRD OF ITS TRUNK.** The CUDA
 ports' elementwise kernels index with `t / C`, `r / L`, `r % L` on 64-bit values - free on NVIDIA, a software
