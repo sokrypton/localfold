@@ -31,7 +31,7 @@ import { packNamedWeights } from "../../../shared/weights/weight-pack.js";
 import {
   createStagedMatrixShader, directWeightsAllowed, stagedMatrixStorage,
 } from "../../kernels/matrix-linear.js";
-import { deviceMatrixConfig, deviceTuning } from "../../runtime/device-profile.js";
+import { deviceMatrixConfig, deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 
@@ -1168,8 +1168,14 @@ export function splitTransitionConfig(device, channels, { f32Only = false } = {}
   if (config === null) {
     if (channels < VECTOR_SPLIT_MIN_CHANNELS) return false;
     if (channels % VECTOR_GEMM_BLOCK.columns !== 0) return false;
+    // 🔴 THE f16 SWITCH, NOT THE FEATURE BIT. Asked as `features.has`, --f16=off
+    // could not reach this scratch, so an "f32" trunk on a 256-channel model
+    // rounded its widened transition to f16: protenix2's pair transition alone,
+    // one MSA block, stock flags, against the native f32 port (metal/) - 3.13e-5
+    // asked that way, 1.31e-7 now. (With matrix units the MATRIX split runs,
+    // which is f16 by construction and which no switch reaches: 5.25e-4 there.)
     return { vector: true,
-             storage: !f32Only && device.features.has("shader-f16") ? "f16" : "f32", ...rows };
+             storage: !f32Only && halfPrecisionAvailable(device) ? "f16" : "f32", ...rows };
   }
   const answer = {
     result: tuning.stagedMatrixResult ?? config.resultComponentType,
