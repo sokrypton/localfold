@@ -618,6 +618,10 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
 // NB: no bias at all (AF2's MSA column attention): the scores start at zero and no bias tile is loaded
 // ONE: one stage, the next tile held in registers across the tile's compute and stored between two barriers -
 // a T4's form (no cp.async; two stages are 39 KB, one block of 4 warps an SM there, one is three)
+// (FP8 attention, emulated on the A100 - q, k and v rounded through e4m3 before the kernel and P before P V: 5CAJ with its
+// alignment 0.016 A from this kernel's fold, 1TIM's two chains 1.129 -> 1.133 A against the crystal, pLDDT within 0.04 -
+// so an e4m3 kernel on an FP8 part (m16n8k32: half the MMAs) would keep the folds; not written: it wants V transposed
+// (no 8-bit ldmatrix.trans) and P's fragments permuted with V's keys)
 // OT: the output's type - f16, or bf16 (cuda/af2's bf16 MSA, whose output projection then reads bf16)
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half>
 __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
