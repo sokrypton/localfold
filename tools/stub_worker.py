@@ -15,7 +15,7 @@ line on stdout, `ready` first - and decides nothing itself:
   * a line `{"kind": "__exit"}` makes it exit mid-fold, which is how a gate asks
     what the broker does with a worker that dies.
 
-Used by tools/check-remote-bridge.py and tools/check-model-pending.py.
+Used by tools/check-native-bridge.py and tools/check-model-pending.py.
 """
 import json
 import os

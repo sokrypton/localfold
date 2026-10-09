@@ -79,8 +79,8 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
-import { remoteRole, installRemoteBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
-  remoteLiveChoice, remoteEvents, remoteHead } from "./remote-bridge.js";
+import { nativeRole, installNativeBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
+  remoteLiveChoice, remoteEvents, remoteHead } from "./native-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -1023,7 +1023,7 @@ function status(text, isError = false) {
   // the runtime's phases against this browser's clock and file them under this
   // browser's (empty) device - the rows that arrive as `dev` events are the
   // real ones, taken where the work happened.
-  if (remoteRole() !== "reader") devStatus(text);
+  if (nativeRole() !== "reader") devStatus(text);
   if (node === null) return;
   node.textContent = text;
   node.classList.toggle("error", isError);
@@ -3893,20 +3893,20 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
  * 🔴 THE PAGE IS SERVED BY THE THING THAT FOLDS, so this is SAME-ORIGIN and
  * there is no CORS question at all: python/localfold/server.py - `localfold serve`
  * on the reader's own machine, or the Colab notebook's cell on a runtime - serves
- * this page, and the link it prints opens index.html on it. `?backend=remote` is
+ * this page, and the link it prints opens index.html on it. `?backend=native` is
  * the server saying which of the two should do the work, and `t` is
  * the token that server requires of every request - it is in the URL because
  * a page cannot be handed a header by whoever framed it.
  *
  * THE SAME SERVER KEEPS ONE WORKER, python/localfold/worker.py, and that is what
  * folds - with metal/ on a Mac, cuda/ on an NVIDIA card: this page posts the job,
- * the worker's events come back through web/remote-bridge.js, and this page draws them.
+ * the worker's events come back through web/native-bridge.js, and this page draws them.
  *
  * Absent the parameter this returns null and nothing anywhere changes: the
  * website folds where it always did, in the reader's own browser.
  */
 function remoteBackend() {
-  return remoteRole() === "reader" ? {} : null;
+  return nativeRole() === "reader" ? {} : null;
 }
 
 /**
@@ -4259,7 +4259,7 @@ function nativePrediction(result, stem, label) {
  * one runs is refused by the broker with its own words.
  */
 async function attachToRunningFold() {
-  if (remoteRole() !== "reader") return;
+  if (nativeRole() !== "reader") return;
   try {
     const head = await remoteHead();
     if (!head.folding) return;
@@ -6468,11 +6468,11 @@ document.addEventListener("visibilitychange", () => {
 void offerSession();
 
 /**
- * 🔴 AND ON A READER'S PAGE (`?backend=remote`) THE BADGE that says where Fold
- * runs and offers the way back. Otherwise `installRemoteBridge` returns
- * immediately and nothing here runs. See web/remote-bridge.js.
+ * 🔴 AND ON A READER'S PAGE (`?backend=native`) THE BADGE that says where Fold
+ * runs and offers the way back. Otherwise `installNativeBridge` returns
+ * immediately and nothing here runs. See web/native-bridge.js.
  */
-installRemoteBridge();
+installNativeBridge();
 // ...and if one is already under way on the runtime, follow it from here.
 void attachToRunningFold();
 
@@ -6485,7 +6485,7 @@ syncDownloads();
 document.addEventListener("py2dmol-frame-change", syncDownloads);
 
 // 🔴 THE BRIDGE SAYS WHEN THE RUNTIME HAS BEEN STOPPED, on an event rather
-// than by calling in: web/remote-bridge.js is imported BY this file, so a call
+// than by calling in: web/native-bridge.js is imported BY this file, so a call
 // the other way would be a cycle. One listener, and the page is a viewer.
 document.addEventListener("localfold-runtime-stopped", (event) => {
   retireFolding(event.detail?.why ?? "the fold service has been stopped");

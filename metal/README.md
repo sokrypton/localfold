@@ -45,7 +45,7 @@ binary by `build.sh`; the GEMM's is `args.h + gemm.metal`, compiled per (types, 
 `localfold serve` (python/localfold/serve.py, in the wheel) serves the website's own page on 127.0.0.1 and sends
 every fold to these ports instead of the browser's WebGPU - python/localfold/server.py and worker.py, the same
 broker and worker Colab's runtime runs, driving metal/ here and cuda/ on NVIDIA. From a checkout:
-`python3 python/localfold/server.py --native --open`. The page says where it folds ("Local server · Apple M2 ·
+`python3 python/localfold/server.py --native --local --open`. The page says where it folds ("Local server · Apple M2 ·
 Metal"); a token in the link it opens is on every request.
 
 `python3 tools/check-native-worker.py --offline --no-af3` (`npm run test:native`) holds it here: every case of the

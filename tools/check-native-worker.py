@@ -14,7 +14,7 @@ python/localfold/worker.py over its own stdin protocol, one process for every ca
 each job shaped as the page sends one (AlphaFold 3 JSON from the entity rows, the rows themselves, the
 form's controls), each fold scored against its deposited structure (cuda/af3/score.py) and held to a
 bar, and every result held to the fields the page ingests (web/app.js, cudaPrediction): a PDB, a pLDDT a
-token, a PAE of tokens^2, the token layout, the chains. test:remote's CUDA arm is a stub and proves the
+token, a PAE of tokens^2, the token layout, the chains. test:bridge's CUDA arm is a stub and proves the
 broker's routing; this is the half that proves the worker folds.
 
 Needs the native ports built (cuda/colab_setup.sh, or each port's nvcc line) and the bundles on disk
@@ -248,24 +248,24 @@ def page_arm(bad):
             const ask = navigator.gpu.requestAdapter.bind(navigator.gpu);
             navigator.gpu.requestAdapter = (...a) => { window.__readerGpu += 1; return ask(...a); };
           }""")
-        ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=remote&t={token}")
-        cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.remote-live')", 120, "the reader's page")
+        ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=native&t={token}")
+        cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.native-live')", 120, "the reader's page")
         cdp.evaluate(ws, """(() => {
           for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2', 'protenix2', 'intellifold2', 'rosettafold3'])
             try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); } catch (cause) {}
           return true;
         })()""")
         # ...and nothing to choose: the page offers no backend control at all
-        if cdp.evaluate(ws, "!!document.querySelector('#remote-status select')"):
+        if cdp.evaluate(ws, "!!document.querySelector('#native-status select')"):
             bad.append("page: the badge offers a backend select - CUDA is not a choice")
         # the badge's Live preview: present for CUDA, and off means the finished fold only
-        live = cdp.evaluate(ws, "(() => { const l = document.querySelector('.remote-live'); return l ? { shown: !l.hidden, on: l.querySelector('input').checked } : null; })()")
+        live = cdp.evaluate(ws, "(() => { const l = document.querySelector('.native-live'); return l ? { shown: !l.hidden, on: l.querySelector('input').checked } : null; })()")
         if not live or not live["shown"] or not live["on"]:
             bad.append(f"page: the Live preview box is {live} - want it shown and on for CUDA")
         lineage = "protenix2" if "--no-af3" in sys.argv else "af3"
         for family, tokens, streamed in ((lineage, 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True),
                                          (lineage, 68, False)):
-            cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.remote-live input');
+            cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.native-live input');
               if (b.checked !== {'true' if streamed else 'false'}) b.click(); return b.checked; }})()""")
             cdp.evaluate(ws, f"""(() => {{
               const g = (id) => document.getElementById(id);

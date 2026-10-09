@@ -1,10 +1,10 @@
 """LocalFold's page, folding on a native port - this machine's GPU, or a runtime's reached over one URL.
 
     localfold serve                                                  # (the wheel) this machine, the browser opened
-    python3 python/localfold/server.py --native --open               # the same from a checkout
+    python3 python/localfold/server.py --native --local --open       # the same from a checkout
     python3 python/localfold/server.py --port 8710 --native --token t   # a token of your own (Colab's notebook)
 
-It serves the page - the reader's page is `index.html?backend=remote&t=<token>` on it - and brokers between that
+It serves the page - the reader's page is `index.html?backend=native&t=<token>` on it - and brokers between that
 page and one worker process, python/localfold/worker.py, which folds with the native port this machine has:
 metal/ on Apple silicon, cuda/ on an NVIDIA card (Colab's runtime is one). Instead of the page's WebGPU code: twice
 the speed on an M2, every model, no binding ceiling and no weights in the browser. /health says which (`native`).
@@ -162,7 +162,7 @@ class Worker:
     🔴 ITS LINES ARE EVENTS, ITS SEQ IS ITS OWN. The worker prints one bridge
     event per line; they are numbered here, so the reader's sort-by-seq holds.
     `LOCALFOLD_WORKER` stands a stub in for it, which is how
-    tools/check-remote-bridge.py and tools/check-model-pending.py test this path
+    tools/check-native-bridge.py and tools/check-model-pending.py test this path
     with no card (tools/stub_worker.py).
     """
 
@@ -228,7 +228,7 @@ def kill_group(proc):
         proc.kill()
 
 
-def serve(port, token, host="127.0.0.1", worker=None, gpu=None):
+def serve(port, token, host="127.0.0.1", worker=None, gpu=None, local=False):
     gpu = gpu or {}
 
     class Handler(http.server.SimpleHTTPRequestHandler):
@@ -238,7 +238,7 @@ def serve(port, token, host="127.0.0.1", worker=None, gpu=None):
         # 🔴 NO-STORE ON THE PAGE'S OWN FILES, as tools/serve.py sends and for
         # the reason CLAUDE.md gives: SimpleHTTPRequestHandler sends no cache
         # headers, so Chrome caches every ES module heuristically, and a
-        # reader's page holding last week's remote-bridge.js talking to this
+        # reader's page holding last week's native-bridge.js talking to this
         # week's broker is a fold that fails on the wire format.
         def end_headers(self):
             self.send_header("Cache-Control", "no-store, must-revalidate")
@@ -334,6 +334,9 @@ def serve(port, token, host="127.0.0.1", worker=None, gpu=None):
                                         # Disconnect releases the MACHINE or
                                         # only stops the service on it.
                                         "colabRuntime": bool(RUNTIME_ADDR),
+                                        # ...or the reader's own machine (`localfold serve`): the page then offers
+                                        # no Disconnect - its Stop ends a fold, and Ctrl-C ends the server
+                                        "local": local,
                                         "backends": ["native"] if worker is not None else [],
                                         # (which native port folds: cuda/ or metal/)
                                         "native": NATIVE if worker is not None else None,
@@ -401,12 +404,14 @@ def main():
                         help="offer this machine's native backend: metal/ on a Mac, cuda/ elsewhere (built: "
                              "metal/build.sh, cuda/build.sh); --cuda is its old name")
     parser.add_argument("--open", action="store_true", help="open the page in the default browser")
+    parser.add_argument("--local", action="store_true",
+                        help="this is the reader's own machine (localfold serve): the page offers no Disconnect")
     arguments = parser.parse_args()
 
     token = arguments.token or secrets.token_urlsafe(24)
     worker = Worker() if arguments.native else None
     gpu = gpu_info()
-    httpd = serve(arguments.port, token, arguments.host, worker, gpu)
+    httpd = serve(arguments.port, token, arguments.host, worker, gpu, local=arguments.local)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"serving {SITE} on {arguments.host}:{arguments.port}"
           + (" · Disconnect will release this Colab machine" if RUNTIME_ADDR
@@ -414,7 +419,7 @@ def main():
           flush=True)
     # One line, machine-readable, for the notebook cell that prints the handle.
     print("BACKEND " + json.dumps({"token": token, "gpu": gpu}), flush=True)
-    url = f"http://{'127.0.0.1' if arguments.host in ('0.0.0.0', '') else arguments.host}:{arguments.port}/index.html?backend=remote&t={token}"
+    url = f"http://{'127.0.0.1' if arguments.host in ('0.0.0.0', '') else arguments.host}:{arguments.port}/index.html?backend=native&t={token}"
     print(f"open {url}", flush=True)
     if arguments.open:
         import webbrowser

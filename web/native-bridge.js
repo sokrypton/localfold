@@ -5,7 +5,7 @@
  * python/localfold/worker.py, LocalFold's native ports (metal/ on a Mac, cuda/ on
  * an NVIDIA card) on the page's own weights and inputs. It runs on the reader's
  * own machine (`localfold serve`, from the wheel) or on a Colab runtime
- * (`notebooks/localfold.ipynb`). Its link opens `index.html?backend=remote&t=…`;
+ * (`notebooks/localfold.ipynb`). Its link opens `index.html?backend=native&t=…`;
  * this page then sends each fold there and draws what the worker says as it says
  * it: every status line, bar fraction, sampler frame and contact map, then the
  * finished fold.
@@ -15,7 +15,8 @@
  * relayed through the broker; once every fold went to CUDA nothing reached it,
  * and it was removed (docs/WEB.md, 2026-10-08).
  *
- * Absent `?backend=remote` (or the older `?backend=colab`), every function here is inert and index.html is what
+ * Absent `?backend=native` (or the older `?backend=colab`) - the page folding on the native backend, wherever its
+ * server runs - every function here is inert and index.html is what
  * it was: the website folds in the reader's own browser.
  */
 
@@ -51,8 +52,8 @@ const ask = async (route, body) => {
   return said;
 };
 
-export const remoteRole = () =>
-  ["remote", "colab"].includes(new URLSearchParams(location.search).get("backend")) ? "reader" : null;
+export const nativeRole = () =>
+  ["native", "colab"].includes(new URLSearchParams(location.search).get("backend")) ? "reader" : null;
 
 /**
  * Where a reader's fold runs: LocalFold's native CUDA ports on the runtime
@@ -100,7 +101,7 @@ export async function remoteHead(signal) {
 /**
  * SAY THAT THIS PAGE IS FOLDING SOMEWHERE ELSE, AND OFFER THE WAY BACK.
  *
- * 🔴 NOTHING ON THE PAGE SAID SO. `?backend=remote` is in the URL and the fold
+ * 🔴 NOTHING ON THE PAGE SAID SO. `?backend=native` is in the URL and the fold
  * happens on a machine the reader cannot see - so a tab left open after the
  * notebook was closed looks exactly like a tab that folds here, and the first
  * news of the difference is a fold that goes nowhere. The badge is the one
@@ -115,16 +116,16 @@ export async function remoteHead(signal) {
  * server with it, and three unanswered asks in a row say so. `/health` is
  * asked until it answers once, for the card's name and what it offers.
  */
-function installRemoteStatus() {
+function installNativeStatus() {
   devSourceIs("the remote runtime");
   const head = document.querySelector(".page-head-fold") ?? document.body;
   const badge = document.createElement("div");
-  badge.id = "remote-status";
-  badge.className = "remote-status";
+  badge.id = "native-status";
+  badge.className = "native-status";
   const dot = document.createElement("span");
-  dot.className = "remote-dot";
+  dot.className = "native-dot";
   const said = document.createElement("span");
-  said.className = "remote-said";
+  said.className = "native-said";
   said.textContent = "Remote runtime";
   const leave = document.createElement("button");
   leave.type = "button";
@@ -140,6 +141,9 @@ function installRemoteStatus() {
   leave.title = "Stop the fold service on the runtime and free its GPU. This"
     + " page then folds in your browser. The notebook itself stays open -"
     + " Runtime > Disconnect and delete runtime releases the machine.";
+  // (hidden until /health says where the server is: on the reader's own machine it is not offered - the page's
+  // own Stop ends a fold there, and the server is stopped where it was started, with Ctrl-C)
+  leave.hidden = true;
   badge.append(dot, said, leave);
   // 🔴 IN THE MIDDLE, IN ITS OWN SLOT, rather than appended to the head. The
   // head is `space-between` with a title and the actions, so a third child
@@ -147,7 +151,7 @@ function installRemoteStatus() {
   // A stretching slot between them takes the leftover width and centres the
   // badge in it; the buttons do not move.
   const slot = document.createElement("div");
-  slot.className = "remote-status-slot";
+  slot.className = "native-status-slot";
   slot.append(badge);
   const actions = head.querySelector(".fold-actions");
   if (actions === null) head.append(slot);
@@ -171,9 +175,10 @@ function installRemoteStatus() {
       // by hand there is no machine to hand back, and a button that promises
       // one either way is wrong half the time.
       releases = health.colabRuntime === true;
-      // ...and WHERE it is: Colab, or this reader's own machine (`localfold serve` binds 127.0.0.1)
-      place = releases ? "Colab runtime" : ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname)
-        ? "Local server" : "Remote runtime";
+      // ...and WHERE it is: Colab, this reader's own machine (`localfold serve`, which says so), or a runtime
+      // somebody hosts
+      place = releases ? "Colab runtime" : health.local === true ? "Local server" : "Remote runtime";
+      leave.hidden = place === "Local server";
       if (health.native === "metal") nativeName = "Metal";
       // 🔴 NO CUDA, NO FOLD - AND THE BADGE SAYS SO BEFORE THE READER TRIES. The
       // notebook builds the CUDA ports on every runtime it starts; one with no
@@ -181,23 +186,23 @@ function installRemoteStatus() {
       // the fold with the same sentence.
       // (an older server says "cuda" for what this one calls "native")
       nativeOffered = (health.backends ?? []).some((b) => b === "native" || b === "cuda");
-      if (nativeOffered && !badge.querySelector(".remote-live")) {
+      if (nativeOffered && !badge.querySelector(".native-live")) {
         // 🔴 LIVE PREVIEW, ON THE PAGE AND NOT IN THE NOTEBOOK: it decides what this page draws, so it
         // is set here, per fold, by whoever is watching
         const live = document.createElement("label");
-        live.className = "remote-live";
+        live.className = "native-live";
         live.title = "Live preview: stream a CUDA fold's intermediate results as it runs - each trunk"
           + " pass's contact map, the sampler's frames, AlphaFold 2's passes with their scores. Off, the"
           + " page shows the finished fold only. Measured at under 1% of a fold.";
         const box = document.createElement("input");
         box.type = "checkbox";
-        try { box.checked = (localStorage.getItem("localfold.remoteLive")
+        try { box.checked = (localStorage.getItem("localfold.nativeLive")
           ?? localStorage.getItem("localfold.colabLive")) !== "off"; }
         catch (cause) { box.checked = true; }
         liveChoice = box.checked;
         box.addEventListener("change", () => {
           liveChoice = box.checked;
-          try { localStorage.setItem("localfold.remoteLive", box.checked ? "on" : "off"); }
+          try { localStorage.setItem("localfold.nativeLive", box.checked ? "on" : "off"); }
           catch (cause) { /* remembered for this page only */ }
         });
         live.append(box, document.createTextNode(" Live"));
@@ -230,7 +235,7 @@ function installRemoteStatus() {
     // badge was visibly updating - so what a gate (or a reader in the
     // console) can read is the pulse's own count, which cannot be wrong
     // about whether the pulse is running.
-    window.__remoteBeats = (window.__remoteBeats ?? 0) + 1;
+    window.__nativeBeats = (window.__nativeBeats ?? 0) + 1;
     try {
       await nameTheCard();
       const head2 = await remoteHead();
@@ -280,14 +285,16 @@ function installRemoteStatus() {
     document.dispatchEvent(new CustomEvent("localfold-runtime-stopped", {
       detail: { why: place === "Local server"
         ? "the local server was stopped from this page - run `localfold serve` again to fold natively"
-        : `the ${place.toLowerCase()} was stopped from this page - open its link again to fold` },
+        : place === "Colab runtime"
+          ? "the Colab runtime was stopped from this page - open the notebook's link again to fold"
+          : `the ${place.toLowerCase()} was stopped from this page - open its link again to fold` },
     }));
     badge.dataset.state = "gone";
     badge.textContent = "";
     const dot2 = document.createElement("span");
-    dot2.className = "remote-dot";
+    dot2.className = "native-dot";
     const gone = document.createElement("span");
-    gone.className = "remote-said";
+    gone.className = "native-said";
     gone.textContent = releases ? "Colab runtime · released" : `${place} · stopped`;
     badge.append(dot2, gone);
     const line = document.getElementById("status-message");
@@ -316,6 +323,6 @@ function installRemoteStatus() {
 }
 
 /** The badge, on a reader's page. Called once, by web/app.js. */
-export function installRemoteBridge() {
-  if (remoteRole() === "reader") installRemoteStatus();
+export function installNativeBridge() {
+  if (nativeRole() === "reader") installNativeStatus();
 }

@@ -2518,7 +2518,7 @@ each frame into a viewer nobody looks at. Two changes:
   still loads, which its download button reads;
 - **the bridge sends a task's events as one request**, by microtask, and a batch
   older than 50 ms goes at once (a long synchronous stretch must not hold the
-  feed - `test:remote`'s busy-page arm failed at 6 s with the microtask alone).
+  feed - `test:bridge`'s busy-page arm failed at 6 s with the microtask alone).
 
 The warm-up dummy also takes one recycle now, so a recycled pass's kernels
 compile. T4, 68 residues:

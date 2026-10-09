@@ -1,12 +1,12 @@
-"""The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:remote.
+"""The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:bridge.
 
-    python3 tools/check-remote-bridge.py
+    python3 tools/check-native-bridge.py
 
 NO GPU AND NO WEIGHTS. It starts python/localfold/server.py with
 tools/stub_worker.py standing in for python/localfold/worker.py - the stub emits what
 this gate appends to its feed and holds its fold until it has sent a result -
 and drives every route from a reader's side, over plain HTTP and through a real
-reader's page (`index.html?backend=remote`) in a second browser. What it proves:
+reader's page (`index.html?backend=native`) in a second browser. What it proves:
 
   * /health says what the card is (the driver's name) and that CUDA is offered;
   * one GPU, one fold - a second `fold` while one holds is refused 429, and the
@@ -49,7 +49,7 @@ import cdp                                                   # noqa: E402
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 PORT = int(os.environ.get("BRIDGE_PORT", "8791"))
 READER_CDP_PORT = int(os.environ.get("BRIDGE_READER_CDP_PORT", "9392"))
-TOKEN = "check-remote-bridge-token"
+TOKEN = "check-native-bridge-token"
 BASE = f"http://127.0.0.1:{PORT}"
 WORK = tempfile.mkdtemp(prefix="localfold-bridge-check-")
 FEED = os.path.join(WORK, "feed.jsonl")
@@ -122,10 +122,10 @@ def wait_for(kind, since, seconds=20):
     return None, since, seen
 
 
-def start_broker(port, cuda=True, extra_env=None):
+def start_broker(port, cuda=True, extra_env=None, local=False):
     proc = subprocess.Popen(
         [sys.executable, "python/localfold/server.py", "--port", str(port), "--token", TOKEN,
-         *(["--native"] if cuda else [])],
+         *(["--native"] if cuda else []), *(["--local"] if local else [])],
         cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         env=dict(os.environ, LOCALFOLD_WORKER=STUB, LOCALFOLD_STUB_FEED=FEED,
                  LOCALFOLD_STUB_JOBS=JOBS, **(extra_env or {})))
@@ -148,8 +148,8 @@ def stop_broker(proc):
 
 
 def open_reader(ws, port=PORT):
-    ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=remote&t={TOKEN}")
-    cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.remote-said')", 120, "the reader's page")
+    ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=native&t={TOKEN}")
+    cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.native-said')", 120, "the reader's page")
     # 🔴 A FRESH PROFILE HAS ACCEPTED NO MODEL TERMS, and the dialog eats the click.
     cdp.evaluate(ws, """(() => {
       for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2', 'protenix2', 'intellifold2', 'rosettafold3'])
@@ -276,9 +276,9 @@ try:
     open_reader(reader_ws)
     time.sleep(1.5)
     badge = cdp.evaluate(reader_ws, """(() => ({
-      said: document.querySelector('.remote-said')?.textContent ?? '',
-      select: !!document.querySelector('#remote-status select'),
-      live: !!document.querySelector('.remote-live input'),
+      said: document.querySelector('.native-said')?.textContent ?? '',
+      select: !!document.querySelector('#native-status select'),
+      live: !!document.querySelector('.native-live input'),
     }))()""")
     print(f"  the badge: {badge}")
     if badge["select"]:
@@ -386,8 +386,8 @@ try:
         refused = call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}}, base=f"http://127.0.0.1:{PORT + 2}")
         open_reader(reader_ws, PORT + 2)
         time.sleep(4)
-        said = cdp.evaluate(reader_ws, "document.querySelector('.remote-said')?.textContent ?? ''")
-        live = cdp.evaluate(reader_ws, "!!document.querySelector('.remote-live')")
+        said = cdp.evaluate(reader_ws, "document.querySelector('.native-said')?.textContent ?? ''")
+        live = cdp.evaluate(reader_ws, "!!document.querySelector('.native-live')")
         print(f"  no --native: fold {refused}, badge {said!r}, Live box {live}")
         if refused[0] != 400 or "no native backend" not in refused[1].get("error", ""):
             bad.append(f"a runtime with no CUDA answered a fold {refused}")
@@ -395,6 +395,22 @@ try:
             bad.append(f"a runtime with no CUDA reads {said!r} with a Live box {live}")
     finally:
         stop_broker(bare)
+
+    # 8b · the reader's own machine (`localfold serve`, --local): the badge says so and offers no Disconnect -
+    # the page's Stop ends a fold, and the server is stopped where it was started
+    mine, _ = start_broker(PORT + 3, local=True)
+    try:
+        open_reader(reader_ws, PORT + 3)
+        time.sleep(4)
+        badge = cdp.evaluate(reader_ws, """(() => { const b = document.getElementById('native-status');
+          const leave = b?.querySelector('button');
+          return { said: b?.querySelector('.native-said')?.textContent ?? '',
+                   leave: leave ? !leave.hidden && leave.offsetParent !== null : false }; })()""")
+        print(f"  --local: badge {badge['said']!r}, Disconnect shown {badge['leave']}")
+        if not badge["said"].startswith("Local server") or badge["leave"]:
+            bad.append(f"a local server's badge reads {badge['said']!r} with Disconnect shown {badge['leave']}")
+    finally:
+        stop_broker(mine)
 
     # 9 · and nothing answers without the token.
     for route, body in (("/down?since=0", None), ("/health", None), ("/in", {"op": "stop"})):

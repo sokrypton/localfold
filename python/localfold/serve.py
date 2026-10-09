@@ -9,7 +9,7 @@ Metal on Apple silicon and CUDA on Linux - instead of the browser's WebGPU. The 
 fetched once into ~/.cache/localfold (or --weights-dir), and the page holds none.
 
 A token generated at start is in the link it opens; every request to the server carries it, so another page in the
-same browser cannot spend this machine's GPU. Ctrl-C, or Disconnect on the page, stops it.
+same browser cannot spend this machine's GPU. The page's Stop ends a fold; Ctrl-C stops the server.
 """
 import argparse
 import os
@@ -89,7 +89,7 @@ def main(argv=None):
     port = free_port(arguments.host, arguments.port)
     # (imported now: the server reads where it serves from the environment above)
     from . import server
-    sys.argv = ["localfold serve", "--native", "--host", arguments.host, "--port", str(port),
+    sys.argv = ["localfold serve", "--native", "--local", "--host", arguments.host, "--port", str(port),
                 *(["--token", arguments.token] if arguments.token else []),
                 *([] if arguments.no_open else ["--open"])]
     server.main()

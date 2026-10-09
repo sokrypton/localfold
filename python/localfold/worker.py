@@ -4,7 +4,7 @@
 
 Started by python/localfold/server.py (`--native`) and fed one job per line on stdin; every line it prints on
 stdout is one bridge event, `{"kind", "payload", "at"}` - `status`, `progress`, `frame`, `contacts`,
-`scores` and `result` - which the broker numbers and the reader's page follows (web/remote-bridge.js).
+`scores` and `result` - which the broker numbers and the reader's page follows (web/native-bridge.js).
 
 🔴 THE PAGE'S OWN INPUTS, THE PAGE'S OWN WEIGHTS - AND NO JAVASCRIPT. The job is the reader's AlphaFold 3 JSON
 (web/job-json.js writes it) and each port's native featuriser (cuda/featurise: af3-featurise, af2-featurise,
@@ -370,7 +370,7 @@ def featurise(cmd, what, log, on_line=None):
 
 def streaming(job):
     """Whether a fold streams its intermediate results: the reader's own choice, the page's Live preview
-    (web/remote-bridge.js), sent as `frames` - on unless it says false."""
+    (web/native-bridge.js), sent as `frames` - on unless it says false."""
     return job.get("frames", True) is not False
 
 
