@@ -46,8 +46,19 @@ __global__ void flashGridMetal(const half* qkvg, const half* bias, int biasStrid
   const int ib = i < n ? i : n - 1;
   device const half* brow = NB ? (device const half*)nullptr : bias + ((size_t)h * n + ib) * biasStride;
   float m = -INFINITY, l = 0.f;
+  const bool vec4 = (rowStride % 4 == 0) && (posStride % 4 == 0) && (Wd % 4 == 0) && (D % 4 == 0);
   for (int j0 = 0; j0 < n; j0 += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (vec4) {     // four halves a load (the strides are in fours): a quarter of the load instructions
+      for (int t = tid * 4; t < BK * D; t += 128 * 4) {
+        int jj = t / D, e = t % D, j = min(j0 + jj, n - 1);
+        device const half* kp = base + (size_t)j * posStride;
+        half4 kv = *(device const half4*)(kp + Wd + e);
+        Ks[(e + 0) * BK + jj] = kv.x; Ks[(e + 1) * BK + jj] = kv.y;
+        Ks[(e + 2) * BK + jj] = kv.z; Ks[(e + 3) * BK + jj] = kv.w;
+        *(threadgroup half4*)(Vs + t) = *(device const half4*)(kp + 2 * Wd + e);
+      }
+    } else
     for (int t = tid; t < BK * D; t += 128) {
       int jj = t / D, e = t % D, j = min(j0 + jj, n - 1);
       device const half* kp = base + (size_t)j * posStride;
