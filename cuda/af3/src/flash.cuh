@@ -1053,6 +1053,14 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
       // blocks an SM - --bench-grid on an A100 1.036 against 1.211 ms at 524 tokens, 7.23 against 7.80 at 1044,
       // level at 262; an L4 (99 KB a block) 0.566 against 0.747 at 262. A T4's register-staged form keeps 64
       // (48 is 1.45 against 1.22 ms there)
+      // the template stack's 16-wide heads, unmasked (a pair track's rows): flashGrid2R's two tiles a warp and f16 scores,
+      // as the 32-wide ones - --bench-grid16 0.737 -> 0.549 ms at 500 tokens, 41.8 -> 30.4 at 2,000, 61.5 -> 35.1 at
+      // 6,000 (256 rows); output relRMS 3.7e-4 from the f32-score kernel's (the 32-wide form's was 3.9e-4)
+      if constexpr (D == 16) {
+        if (!flashRegStaged() && !mask && rows >= 32) {   // (unmasked, r0 and tr unread)
+          flashGrid2RRun<16, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias); break;
+        }
+      }
       if constexpr (D == 32) {
         if (!flashRegStaged()) { flashGridHalfAt<D, 4, 48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias); break; }
         if (!mask && flash2R1Strided(qkvg, bias, stride, out, n, heads, rows, scale, qBias)) break;

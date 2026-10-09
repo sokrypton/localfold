@@ -226,6 +226,7 @@ static int foldMain(int argc, char** argv) {
 
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-ops=", 12)) { const char* a = argv[i] + 12; const char* x = strchr(a, 'x'); benchOps(atoi(a), x ? atoi(x + 1) : 1); return 0; }
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-grid=", 13)) { benchGrid(atoi(argv[i] + 13)); return 0; }
+  for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-grid16=", 15)) { benchGrid16(atoi(argv[i] + 15)); return 0; }
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-tri=", 12)) { benchTri(atoi(argv[i] + 12)); return 0; }
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--bench-trans=", 14)) { benchTrans(atoi(argv[i] + 14)); return 0; }
   // One denoiser call on AF3's own inputs, against AF3's own output.

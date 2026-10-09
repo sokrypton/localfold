@@ -179,6 +179,48 @@ inline void benchGrid(int n) {
     printf("  %-16s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);
   }
 }
+// --bench-grid16=N: the template stack's grid attention (4 heads of 16, every row, no mask) - the shipped kernel against
+// flashGrid2R's forms at D 16, each output's relRMS from the shipped one's, then the arms timed interleaved
+inline void benchGrid16(int n) {
+  const int heads = 4, D = 16, Wd = heads * D, stride = (n + 7) / 8 * 8;
+  size_t rows = getenv("LOCALFOLD_BENCH_ROWS") ? atoi(getenv("LOCALFOLD_BENCH_ROWS")) : n;
+  half* qkvg = dallocT<half>(rows * n * 4 * Wd); half* out = dallocT<half>(rows * n * Wd); half* out2 = dallocT<half>(rows * n * Wd);
+  half* bias = dallocT<half>((size_t)heads * n * stride);
+  { std::vector<half> h(std::max(rows * n * 4 * Wd, (size_t)heads * n * stride));
+    uint64_t s = 1; for (auto& v : h) { s = s * 6364136223846793005ull + 1442695040888963407ull; v = __float2half(((s >> 40) / 16777216.f - 0.5f)); }
+    CK(cudaMemcpy(qkvg, h.data(), rows * n * 4 * Wd * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bias, h.data(), (size_t)heads * n * stride * 2, cudaMemcpyHostToDevice)); }
+  std::vector<std::pair<std::string, std::function<void(half*)>>> arms = {
+    {"shipped", [&](half* o) { flashGridHalfLaunch<16>(qkvg, bias, stride, nullptr, o, n, heads, 0, rows, false, 0.25f); }},
+    {"2R w2 bk48 rr2", [&](half* o) { flashGrid2RRun<16, 2, 48, 2, 2>(qkvg, bias, stride, o, n, heads, rows, 0.25f, nullptr); }},
+    {"2R w2 bk64 rr2", [&](half* o) { flashGrid2RRun<16, 2, 64, 2, 2>(qkvg, bias, stride, o, n, heads, rows, 0.25f, nullptr); }},
+    {"2R w4 bk64 rr1", [&](half* o) { flashGrid2RRun<16, 4, 64, 2, 1>(qkvg, bias, stride, o, n, heads, rows, 0.25f, nullptr); }},
+    {"2R w2 bk96 rr2", [&](half* o) { flashGrid2RRun<16, 2, 96, 2, 2>(qkvg, bias, stride, o, n, heads, rows, 0.25f, nullptr); }},
+  };
+  arms[0].second(out);
+  std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
+  CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost));
+  for (size_t k = 1; k < arms.size(); ++k) {
+    arms[k].second(out2); CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
+    double num = 0, den = 0; for (size_t i = 0; i < a.size(); ++i) { double x = __half2float(a[i]), y = __half2float(b2[i]); num += (x - y) * (x - y); den += x * x; }
+    printf("  %-16s relRMS %.3e from the shipped kernel\n", arms[k].first.c_str(), std::sqrt(num / std::max(den, 1e-30)));
+  }
+  std::vector<std::vector<float>> t(arms.size());
+  cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+  for (int round = 0; round < 7; ++round)
+    for (size_t k = 0; k < arms.size(); ++k) {
+      arms[k].second(out2); cudaEventRecord(e0, STREAM);
+      for (int i = 0; i < 10; ++i) arms[k].second(out2);
+      cudaEventRecord(e1, STREAM); cudaEventSynchronize(e1);
+      float ms; cudaEventElapsedTime(&ms, e0, e1); t[k].push_back(ms / 10);
+    }
+  double flops = (double)rows * n * n * heads * D * 4;
+  for (size_t k = 0; k < arms.size(); ++k) {
+    std::sort(t[k].begin(), t[k].end());
+    printf("  %-16s %7.3f ms  %5.1f TFLOP/s\n", arms[k].first.c_str(), t[k][3], flops / t[k][3] / 1e9);
+  }
+}
 // --bench-trans=N: the pair transition (C 128, I 512) alone over N*N rows, each form against the
 // shipped one on the same input (relRMS of the update), then the forms timed interleaved
 inline void benchTrans(int n) {
