@@ -16,18 +16,18 @@ py="${PYTHON:-python3}"
 [ "$(uname -m)" = arm64 ] || { echo "build_wheel_macos.sh builds the arm64 wheel on Apple silicon" >&2; exit 1; }
 export MACOSX_DEPLOYMENT_TARGET=13.0
 # a fresh build: the deployment target is a compile flag, so nothing built without it is kept
-rm -f "$repo"/metal/{af3,af2,ef2}/localfold-* "$repo/cuda/featurise/featurise"
+rm -f "$repo"/metal/legacy/{af3,af2,ef2}/localfold-* "$repo/cuda/featurise/featurise"
 bash "$repo/cuda/build.sh" featurise
-bash "$repo/metal/build.sh" af3 af2 ef2
+bash "$repo/metal/legacy/build.sh" af3 af2 ef2
 bin="$here/localfold/bin"
 rm -f "$bin"/localfold-*
 for port in af3 af2 ef2; do
-  install -m 755 "$repo/metal/$port/localfold-$port" "$bin/localfold-$port"
+  install -m 755 "$repo/metal/legacy/$port/localfold-$port" "$bin/localfold-$port"
   strip -x "$bin/localfold-$port"
 done
 # each port's list of the kernel specialisations its folds use, where this machine's folds have recorded one for these
 # very kernels (~/.cache/localfold/metal, named by the kernels' hash): shipped, a user's first fold compiles them all up
-# front and in parallel instead of one at a time as each is first reached (run metal/<port>/gate.py first to fill it)
+# front and in parallel instead of one at a time as each is first reached (run metal/legacy/<port>/gate.py first to fill it)
 mkdir -p "$bin/metal-specs"; rm -f "$bin"/metal-specs/*.specs
 for port in af3 af2 ef2; do
   name="$(LOCALFOLD_METAL_SPECS_NAME=1 "$bin/localfold-$port")"

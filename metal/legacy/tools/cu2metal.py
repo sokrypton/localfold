@@ -23,7 +23,7 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 CUDA = os.path.join(REPO, "cuda")
 
 
@@ -713,8 +713,8 @@ class Port:
         # They belong to the port that OWNS the CUDA file (cuda/<owner>/...): cuda/af2 includes cuda/af3's headers, and
         # metal/af3's changes to those apply to it too.
         self.host_overrides = {}       # (owner, function name) -> text
-        for owner in sorted(os.listdir(os.path.join(REPO, "metal"))):
-            odir = os.path.join(REPO, "metal", owner)
+        for owner in sorted(os.listdir(os.path.join(REPO, "metal", "legacy"))):
+            odir = os.path.join(REPO, "metal", "legacy", owner)
             if os.path.isdir(odir):
                 for f in sorted(os.listdir(odir)):
                     if f.endswith(".host.h"):
@@ -722,7 +722,7 @@ class Port:
         for path in self.files:
             src = open(path).read()
             owner = os.path.relpath(path, CUDA).split(os.sep)[0]
-            here = os.path.join("metal", owner, os.path.basename(path))
+            here = os.path.join("metal", "legacy", owner, os.path.basename(path))
             if os.path.exists(os.path.join(REPO, here)):     # (a hand-written Metal version of the whole file)
                 src = open(os.path.join(REPO, here)).read()
             if os.path.exists(os.path.join(REPO, here + ".patch")):
@@ -813,7 +813,7 @@ class Port:
         # a hand-written body (metal/<port>/<name>.kernel.cu, CUDA syntax, translated as the original is) replaces
         # the CUDA one; the signature and the argument struct stay the translator's
         owner = os.path.relpath(path, CUDA).split(os.sep)[0]
-        ofile = os.path.join(REPO, "metal", owner, name + ".kernel.cu")
+        ofile = os.path.join(REPO, "metal", "legacy", owner, name + ".kernel.cu")
         override = os.path.exists(ofile)
         obody = None
         if override:

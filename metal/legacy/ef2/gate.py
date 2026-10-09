@@ -9,12 +9,12 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.path.join(REPO, "cuda", "ef2"))
 import gate  # noqa: E402
 
 a100 = json.load(open(gate.BASELINE)) if os.path.exists(gate.BASELINE) else {}
-gate.HERE = os.path.join(REPO, "metal", "ef2")
+gate.HERE = os.path.join(REPO, "metal", "legacy", "ef2")
 gate.BASELINE = os.path.join(gate.HERE, "gate-baseline.json")
 gate.TMP = os.environ.get("GATE_TMP", "/tmp/metal-ef2-gate")
 gate.oracle_cases = lambda: []

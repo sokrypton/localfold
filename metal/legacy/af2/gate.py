@@ -9,12 +9,12 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.path.join(REPO, "cuda", "af2"))
 import gate  # noqa: E402
 
 a100 = json.load(open(gate.BASELINE)) if os.path.exists(gate.BASELINE) else {}
-gate.HERE = os.path.join(REPO, "metal", "af2")
+gate.HERE = os.path.join(REPO, "metal", "legacy", "af2")
 gate.BASELINE = os.path.join(gate.HERE, "gate-baseline.json")
 gate.TMP = os.environ.get("GATE_TMP", "/tmp/metal-af2-gate")
 print("A100 baseline: " + ", ".join(f"{k} {v.get('rmsd')} / {v.get('plddt')}" for k, v in sorted(a100.items())))

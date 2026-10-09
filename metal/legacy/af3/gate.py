@@ -23,13 +23,13 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.path.join(REPO, "cuda", "af3"))
 import gate as cuda_gate   # noqa: E402  (its cases and its scoring)
 
-BIN = os.path.join(REPO, "metal", "af3", "localfold-af3")
+BIN = os.path.join(REPO, "metal", "legacy", "af3", "localfold-af3")
 FEATURISE = os.path.join(REPO, "cuda", "featurise", "af3-featurise")
-BASELINE = os.path.join(REPO, "metal", "af3", "gate-baseline.json")
+BASELINE = os.path.join(REPO, "metal", "legacy", "af3", "gate-baseline.json")
 A100 = cuda_gate.BASELINE
 TMP = os.environ.get("GATE_TMP", os.path.join(tempfile.gettempdir(), "metal-af3-gate"))
 AF3_BUNDLE = os.path.join(REPO, "model-af3-int5")

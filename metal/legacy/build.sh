@@ -9,7 +9,7 @@
 # command-line tools are needed: the Metal source is compiled at run time.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-repo="$(dirname "$here")"
+repo="$(dirname "$(dirname "$here")")"
 ports=("$@"); [ ${#ports[@]} -gt 0 ] || ports=(af3 af2 ef2)
 flags=(-std=c++17 -fobjc-arc -Wno-deprecated-declarations -Wno-unused-result -framework Metal -framework Foundation)
 opt="${LOCALFOLD_METAL_OPT:--O2}"
@@ -88,5 +88,5 @@ for port in "${ports[@]}"; do
     "$out/gen/$port/src/$port.cu" "$out/lfport.mm" "$here/runtime/lfcuda.mm" -x none "$sobj" -Wl,-force_load,"$zstd_lib" -Wl,-export_dynamic \
     -o "$here/$port/localfold-$port.building"
   mv "$here/$port/localfold-$port.building" "$here/$port/localfold-$port"
-  echo "built metal/$port/localfold-$port"
+  echo "built metal/legacy/$port/localfold-$port"
 done
