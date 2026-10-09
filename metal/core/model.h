@@ -56,6 +56,9 @@ class Model {
     derivedW[key] = p;
     return p;
   }
+  // every entry `from<k>` exchanged with `to<k>` (moved where there is no `to<k>`): one batch put in place of another
+  // (OpenDDE's structural tokens: sbatch.* for batch.* and back)
+  void swapPrefix(const std::string& to, const std::string& from);
   // the float32 copies of half tensors made on demand: dropped (a stage that read them is done)
   void dropFloatCopies(const std::string& prefix);
   size_t weightBytes() const { return weightHeld; }

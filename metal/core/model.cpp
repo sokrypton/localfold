@@ -55,6 +55,18 @@ const int* Model::i(const std::string& name) {
 }
 const float* Model::hostF(const std::string& name) { const float* p = f(name); sync(); return (const float*)host(p); }
 const int* Model::hostI(const std::string& name) { const int* p = i(name); sync(); return (const int*)host(p); }
+void Model::swapPrefix(const std::string& to, const std::string& from) {
+  auto swapIn = [&](auto& m) {
+    std::vector<std::string> keys;
+    for (auto& [name, v] : m) if (!name.compare(0, from.size(), from)) keys.push_back(name.substr(from.size()));
+    for (auto& k : keys) {
+      auto a = m.find(to + k), b = m.find(from + k);
+      if (a == m.end()) { m[to + k] = b->second; m.erase(b); }
+      else std::swap(a->second, b->second);
+    }
+  };
+  swapIn(t); swapIn(metaV);
+}
 void Model::dropFloatCopies(const std::string& prefix) {
   for (auto& [name, x] : t)
     if (!name.rfind(prefix, 0) && x.madeF32) { release(x.f32); x.f32 = nullptr; x.madeF32 = false; }

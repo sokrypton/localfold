@@ -111,7 +111,7 @@ void singleTrack(float* single, const float* pair, const Masks& m, int n, int C,
   ln(pair, pln, P, C, B + ".singlePairLogitsNormScale", B + ".singlePairLogitsNormOffset");
   float* raw = scratch<float>("st.raw", P * heads);
   lin(pln, B + ".singlePairLogitsProjection", raw, P, C, heads);
-  if (extraBias) die("singleTrack: an extra bias is not in the native port yet");
+  if (extraBias) run1d("af3_add_bias_heads", P * heads, AddBiasHeadsArgs{raw, extraBias, P, (uint)heads, 0});   // (OpenDDE)
   int stride = round8(n);
   half* bias = biasLayout(raw, "st.bias", n, heads, stride, false);
   half* nrm = scratch<half>("st.nrm", (size_t)n * Cs);

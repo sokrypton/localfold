@@ -33,13 +33,53 @@ struct Options {
   uint64_t seed = 42; bool seedGiven = false;
 };
 
+// OpenDDE's head on the structural tokens, mapped back to the residues: atoms through residueAtomGather, pairs through
+// each residue's representative (backbone) subtoken. xk (the structural atoms) is replaced by the residues' atoms.
+ConfidenceOut structuralConfidence(const Structural& st, const float* coords, std::vector<float>& xk, int nRes, int dense,
+                                   const std::vector<int>& resAsym) {
+  DdeConfidence dc = ddeConfidence(st, coords, dense, nRes);
+  int nD = st.n;
+  const int* gather = M.hostI("structural.residueAtomGather"); const int* rep = M.hostI("structural.residueRepToken");
+  ConfidenceOut ck;
+  std::vector<float> xr((size_t)nRes * dense * 3, 0.f);
+  ck.plddt.assign((size_t)nRes * dense, 0.f);
+  for (size_t a = 0; a < (size_t)nRes * dense; ++a) {
+    if (gather[a] < 0) continue;
+    for (int d = 0; d < 3; ++d) xr[a * 3 + d] = xk[(size_t)gather[a] * 3 + d];
+    ck.plddt[a] = dc.plddt[gather[a]];
+  }
+  xk = std::move(xr);
+  ck.pae.resize((size_t)nRes * nRes); ck.pde.resize((size_t)nRes * nRes);
+  std::vector<float> term((size_t)nRes * nRes);
+  for (int i = 0; i < nRes; ++i)
+    for (int j = 0; j < nRes; ++j) {
+      size_t from = (size_t)rep[i] * nD + rep[j], to = (size_t)i * nRes + j;
+      ck.pae[to] = dc.pae[from]; ck.pde[to] = dc.pde[from]; term[to] = dc.tmTerm[from];
+    }
+  auto reduce = [&](bool interOnly) {
+    double bestTm = -1e30; bool any = false;
+    for (int i = 0; i < nRes; ++i) {
+      double tot = 0; int cnt = 0;
+      for (int j = 0; j < nRes; ++j) { if (interOnly && resAsym[i] == resAsym[j]) continue; tot += term[(size_t)i * nRes + j]; ++cnt; }
+      if (cnt) { any = true; bestTm = std::max(bestTm, tot / cnt); }
+    }
+    return any ? bestTm : NAN;
+  };
+  ck.ptm = reduce(false); ck.iptm = reduce(true);
+  ck.tmTerm = term;
+  const float* am = M.hostF("batch.refMask");
+  double sum = 0, count = 0;
+  for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
+  ck.meanPlddt = sum / std::max(count, 1.0);
+  return ck;
+}
+
 int foldInput(const std::string& dir, Options o) {
   double t0 = now();
   M.loadInput(dir);
   setOutputInput(dir);
   int n = (int)M.meta("batch.tokens"), dense = metaI("batch.dense");
   ADA_RAW = flag("trunk.dialect.chaiAtomStack");
-  if (flag("trunk.dialect.structuralTokens")) die("OpenDDE's structural tokens are not in the native port yet");
   // the seeds: --seeds, else the job's modelSeeds, else the one seed
   std::vector<uint64_t> seeds;
   uint64_t seed = !o.seedGiven && M.has("job.seed") ? (uint64_t)M.meta("job.seed") : o.seed;
@@ -70,12 +110,20 @@ int foldInput(const std::string& dir, Options o) {
   std::vector<float> contact = contactProbabilities(t);
   mt::sync();
   double trunkMs = ms(f0);
+  // OpenDDE: the expander and refiner, then the diffusion and its confidence head on the structural tokens (the
+  // structural batch swapped in for them, and back out for the files)
+  const bool structural = flag("trunk.dialect.structuralTokens");
+  Structural st{};
+  int nD = n;
+  std::vector<int> resAsym(M.hostI("batch.asymId"), M.hostI("batch.asymId") + n);
+  if (structural) { st = expandStructural(t); M.swapPrefix("batch.", "sbatch."); nD = st.n; }
   // the diffusion: every (seed, sample) through the denoiser together, up to ten a batch
   double d0 = now();
-  prepareDiffusion(t.single, t.pair, t.targetFeat, t.masks, n);
-  std::vector<float> mask(M.hostF("batch.refMask"), M.hostF("batch.refMask") + (size_t)n * dense);
-  std::vector<int> pbIdx(M.hostI("batch.tokenAtomsToPseudoBeta.indices"), M.hostI("batch.tokenAtomsToPseudoBeta.indices") + n);
-  std::vector<float> pbMask(M.hostF("batch.tokenAtomsToPseudoBeta.mask"), M.hostF("batch.tokenAtomsToPseudoBeta.mask") + n);
+  if (structural) prepareDiffusion(st.single, st.pair, st.targetFeat, st.masks, nD);
+  else prepareDiffusion(t.single, t.pair, t.targetFeat, t.masks, n);
+  std::vector<float> mask(M.hostF("batch.refMask"), M.hostF("batch.refMask") + (size_t)nD * dense);
+  std::vector<int> pbIdx(M.hostI("batch.tokenAtomsToPseudoBeta.indices"), M.hostI("batch.tokenAtomsToPseudoBeta.indices") + nD);
+  std::vector<float> pbMask(M.hostF("batch.tokenAtomsToPseudoBeta.mask"), M.hostF("batch.tokenAtomsToPseudoBeta.mask") + nD);
   bool caDgram = flag("trunk.dialect.confidenceCaDgram");
   if (SAMPLER.flow && flag("trunk.dialect.noFlowSampler")) die("this checkpoint has no working flow sampler - fold it with diffusion");
   std::vector<std::pair<uint64_t, int>> runs;
@@ -94,20 +142,22 @@ int foldInput(const std::string& dir, Options o) {
     for (size_t k = 0; k < cn; ++k) batch.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
     double s0 = now();
     if (profiling()) profileStart();
+    if (structural && c0 > 0) M.swapPrefix("batch.", "sbatch.");      // (the structural tokens again, for this batch)
     std::vector<float> xs = sample(o.steps, batch, mask);
+    if (structural) M.swapPrefix("batch.", "sbatch.");                 // (back to the residues, for the files)
     if (profiling()) profileReport("diffusion", 30);
     if (getenv("AF3_STAGES")) reportStages();
     diffMs += ms(s0);
     for (size_t k = 0; k < cn; ++k) {
       double s1 = now();
       std::vector<float> xk(xs.begin() + k * atoms3, xs.begin() + (k + 1) * atoms3);
-      std::vector<float> beta((size_t)n * 3);
-      for (int r = 0; r < n; ++r)
+      std::vector<float> beta((size_t)nD * 3);
+      for (int r = 0; r < nD; ++r)
         for (int a = 0; a < 3; ++a)
           beta[r * 3 + a] = caDgram ? xk[((size_t)r * dense + 1) * 3 + a] : pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
       float* dBeta = scratch<float>("main.beta", beta.size());
       upload(dBeta, beta.data(), beta.size() * 4);
-      ConfidenceOut ck = confidenceHead(t, dBeta);
+      ConfidenceOut ck = structural ? structuralConfidence(st, dBeta, xk, t.n, dense, resAsym) : confidenceHead(t, dBeta);
       confMs += ms(s1);
       Scores ss = structureScores(xk);
       double score = rankingScore(ck.ptm, ck.iptm, ss);
@@ -142,6 +192,7 @@ int foldInput(const std::string& dir, Options o) {
   (void)d0;
   mt::sync();
   freeDiffusion();
+  if (structural) freeStructural(st);
   freeTrunk(t);
   releaseScratch();
   M.unloadInput();

@@ -812,3 +812,64 @@ kernel void af3_apply_norm(LF_ARGS(ApplyNormArgs)) {
   ulong t = LF_INDEX;
   if (t < a.n) a.x[t] = (a.x[t] - a.stat[0]) * a.stat[1];
 }
+
+// ---------------------------------------------------------------- OpenDDE's structural tokens
+kernel void af3_gather_parent(LF_ARGS(GatherParentArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.n * a.C) return;
+  uint i = lf_udiv((uint)t, a.C), c = (uint)t - i * a.C;
+  a.out[t] = a.src[(ulong)a.parent[i] * a.C + c] + (a.roleEmb ? a.roleEmb[a.role[i] * a.C + c] : 0.f);
+}
+kernel void af3_silu(LF_ARGS(SiluInPlaceArgs)) {
+  ulong t = LF_INDEX;
+  if (t < a.n) a.x[t] = lf_silu(a.x[t]);
+}
+kernel void af3_single_struct(LF_ARGS(SingleStructArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.n * a.C) return;
+  uint i = lf_udiv((uint)t, a.C), c = (uint)t - i * a.C;
+  a.out[t] = a.a[t] + a.b[t] + a.roleEmb[a.role[i] * a.C + c];
+}
+kernel void af3_gather_pair_sorted(LF_ARGS(GatherPairSortedArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.rows * a.C) return;
+  ulong r = t / a.C; uint c = (uint)(t - r * a.C);
+  int ij = a.order[r], i = ij / (int)a.n, j = ij - i * (int)a.n;
+  a.out[t] = (half)a.pair[((ulong)a.parent[i] * a.nRes + a.parent[j]) * a.C + c];
+}
+kernel void af3_scatter_pair(LF_ARGS(ScatterPairArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.rows * a.C) return;
+  ulong r = t / a.C; uint c = (uint)(t - r * a.C);
+  int ij = a.order[r], i = ij / (int)a.n, j = ij - i * (int)a.n;
+  a.pair[(ulong)ij * a.C + c] = a.trunkPair[((ulong)a.parent[i] * a.nRes + a.parent[j]) * a.C + c] + a.projected[t] +
+                                a.eSame[a.sameParent[ij] * a.C + c] + a.eTwin[a.twin[ij] * a.C + c] + a.ePrev[a.prev[ij] * a.C + c] +
+                                a.eNext[a.next[ij] * a.C + c] + a.eType[a.type[ij] * a.C + c];
+}
+kernel void af3_attn_bias(LF_ARGS(AttnBiasArgs)) {
+  ulong ij = LF_INDEX;
+  if (ij >= a.pairs) return;
+  a.bias[ij] = a.bSame[0] * a.sameParent[ij] + a.bTwin[0] * a.twin[ij] + a.bPrev[0] * a.prev[ij] + a.bNext[0] * a.next[ij] + a.bType[a.type[ij]];
+}
+kernel void af3_add_bias_heads(LF_ARGS(AddBiasHeadsArgs)) {
+  ulong t = LF_INDEX;
+  if (t < a.pairs * a.heads) a.raw[t] += a.bias[t / a.heads];
+}
+kernel void af3_dde_pair_init(LF_ARGS(DdePairInitArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.n * a.n * a.C) return;
+  uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+  float sq = 0.f;
+  for (int k = 0; k < 3; ++k) { float d = a.coords[i * 3 + k] - a.coords[j * 3 + k]; sq += d * d; }
+  float distance = sqrt(max(1e-10f, sq));
+  int bin = (int)floor((distance - 3.25f) / 1.25f);
+  if (distance < 3.25f) bin = -1;
+  if (bin >= (int)a.bins) bin = a.bins - 1;
+  a.pair[t] += a.s1[j * a.C + c] + a.s2[i * a.C + c] + (bin >= 0 ? a.Wd[bin * a.C + c] : 0.f) + distance * a.Wraw[c];
+}
+kernel void af3_slot_major(LF_ARGS(SlotMajorArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.slots * a.C * a.bins) return;
+  uint b = (uint)(t % a.bins); ulong r = t / a.bins; uint c = (uint)(r % a.C), slot = (uint)(r / a.C);
+  a.out[(ulong)c * a.slots * a.bins + slot * a.bins + b] = (half)a.w[t];
+}

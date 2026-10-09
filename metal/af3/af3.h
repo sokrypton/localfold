@@ -132,3 +132,10 @@ void reportStages();     // (AF3_STAGES=1: the denoiser's stages timed, a sync b
 // ---------------------------------------------------------------- the confidence head (confidence.mm)
 struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
 ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta);
+
+// ---------------------------------------------------------------- OpenDDE's structural tokens (structural.mm)
+struct Structural { int n; float *single, *pair, *targetFeat, *bias, *seqMask, *pairMask; Masks masks; };
+Structural expandStructural(const Trunk& t);     // reads the residue batch: before sbatch.* is swapped in
+void freeStructural(Structural& s);
+struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm; };
+DdeConfidence ddeConfidence(const Structural& st, const float* coords, int dense, int tmTokens);

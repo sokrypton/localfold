@@ -144,3 +144,22 @@ struct ChiralGradArgs { CP(float) positions; CP(int) centers; CP(float) angles; 
 struct MaskedSumArgs { CP(float) x; CP(float) mask; DP(float) partial; CP(float) stat; u64 rows; uint C, pass; };
 struct GlobalStatArgs { CP(float) partial; DP(float) stat; uint parts, C, vendorWidth, pass; };
 struct ApplyNormArgs { DP(float) x; CP(float) stat; u64 n; };
+
+// ---------------------------------------------------------------- OpenDDE's structural tokens
+// out[i] = src[parent[i]] (+ roleEmb[role[i]])
+struct GatherParentArgs { CP(float) src; CP(int) parent; CP(int) role; CP(float) roleEmb; DP(float) out; uint n, C; };
+struct SiluInPlaceArgs { DP(float) x; u64 n; };
+struct SingleStructArgs { DP(float) out; CP(float) a; CP(float) b; CP(int) role; CP(float) roleEmb; uint n, C; };
+// the residue pair under each structural pair, in matrix-group order (half: the GEMMs' input)
+struct GatherPairSortedArgs { CP(float) pair; CP(int) order; CP(int) parent; DP(half) out; u64 rows; uint n, nRes, C, pad; };
+// pair[ij] = the residue pair + projected + the five boolean features' embeddings
+struct ScatterPairArgs { DP(float) pair; CP(float) trunkPair; CP(int) parent; CP(float) projected; CP(int) order; CP(int) sameParent;
+                         CP(int) twin; CP(int) prev; CP(int) next; CP(int) type; CP(float) eSame; CP(float) eTwin; CP(float) ePrev;
+                         CP(float) eNext; CP(float) eType; u64 rows; uint n, nRes, C, pad; };
+struct AttnBiasArgs { DP(float) bias; CP(int) sameParent; CP(int) twin; CP(int) prev; CP(int) next; CP(int) type; CP(float) bSame;
+                      CP(float) bTwin; CP(float) bPrev; CP(float) bNext; CP(float) bType; u64 pairs; };
+struct AddBiasHeadsArgs { DP(float) raw; CP(float) bias; u64 pairs; uint heads, pad; };          // raw[ij][h] += bias[ij]
+// OpenDDE's confidence pair: + s1[j] + s2[i] + the distance's bin embedding and its raw projection
+struct DdePairInitArgs { DP(float) pair; CP(float) s1; CP(float) s2; CP(float) coords; CP(float) Wd; CP(float) Wraw; uint n, C, bins, pad; };
+// plddt_weight [slot][c][bin] -> [c][slot bins + bin]
+struct SlotMajorArgs { CP(float) w; DP(half) out; uint slots, C, bins, pad; };
