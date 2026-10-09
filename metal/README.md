@@ -140,3 +140,6 @@ against 12.2, `pair-transition` 9.8 against 19.2 (`metal/kernels/`, `metal/check
 2. The trunk at large inputs: at 255 tokens the triangle's K-128 projections run at ~1 TFLOP/s.
 3. Memory: an AF3 fold holds ~2.5 GB of decoded weights before it starts (f32 and f16 copies).
 4. An M5: its GPU's matrix hardware through Metal 4's tensor APIs.
+5. Intel Macs are not covered: every fast path here (`lf_gemm`, `flashGridMetal`, `atomAttentionMMA`, `lnHeadsMetal`)
+   is built on `simdgroup_matrix`, which Metal offers only on Apple-silicon GPUs, so an Intel Mac's AMD or Intel GPU
+   would need scalar fallbacks for each, and the binaries an x86_64 slice. Untestable on the machine this was built on.

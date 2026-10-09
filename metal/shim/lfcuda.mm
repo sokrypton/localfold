@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
+#include <condition_variable>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -68,6 +70,8 @@ struct Runtime {
   id<MTLCommandBuffer> lastCommitted = nil;
   int encoded = 0, encodedInEncoder = 0;
   bool capturing = false;
+  // the command buffers committed and not yet complete, by commit order (their completion handlers remove them)
+  std::mutex inflightMu; std::condition_variable inflightDone; std::set<long> pending; long committedSeq = 0;
   std::mutex gpuErrorMu; std::string gpuError;   // the first command buffer to fail (commit's completion handler)
   std::vector<Op>* capture = nullptr;
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
@@ -172,11 +176,15 @@ struct Runtime {
     // every command buffer reports a failure, not only the last before a sync: one committed mid-stream (every 256
     // dispatches) that fails - out of memory under another process's load, the GPU's watchdog - skips its work, and
     // unchecked the fold would carry on from the skipped work's buffers as if it had run
+    long seq;
+    { std::lock_guard<std::mutex> g(inflightMu); seq = ++committedSeq; pending.insert(seq); }
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
       if (done.error) {
         std::lock_guard<std::mutex> g(gpuErrorMu);
         if (gpuError.empty()) gpuError = done.error.localizedDescription.UTF8String;
       }
+      { std::lock_guard<std::mutex> g(inflightMu); pending.erase(seq); }
+      inflightDone.notify_all();
     }];
     [cb commit];
     ++stats.commits;
@@ -195,10 +203,20 @@ struct Runtime {
       if (lastCommitted.error) die(std::string("the GPU failed: ") + lastCommitted.error.localizedDescription.UTF8String);
       lastCommitted = nil;
     }
+    // ...and EVERY command buffer done, not just the last: Metal may finish one it sees no dependency on before an
+    // earlier one, and a host read after a sync must see all of them
+    waitThrough(LONG_MAX);
     std::lock_guard<std::mutex> g(gpuErrorMu);
     if (!gpuError.empty()) die("the GPU failed: " + gpuError);
   }
-  bool idle() { return !cb && (!lastCommitted || lastCommitted.status >= MTLCommandBufferStatusCompleted); }
+  // idle: nothing encoded and nothing in flight - every committed command buffer completed (the last alone completing
+  // says nothing of an earlier one Metal ran beside it), so a host write straight into a buffer cannot race the GPU
+  bool idle() { std::lock_guard<std::mutex> g(inflightMu); return !cb && pending.empty(); }
+  // every command buffer committed at or before `seq` complete (an event's wait: the work before its record)
+  void waitThrough(long seq) {
+    std::unique_lock<std::mutex> g(inflightMu);
+    inflightDone.wait(g, [&] { return pending.empty() || *pending.begin() > seq; });
+  }
 
   // a runtime kernel that is a template (the GEMM): its explicit instantiation compiled with the runtime's source on
   // first use, as the port's kernels are
@@ -596,7 +614,7 @@ cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
 cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned) { return cudaSuccess; }
 cudaError_t cudaStreamQuery(cudaStream_t) { return R().idle() ? cudaSuccess : cudaErrorNotReady; }
 
-struct LfEvent_ { id<MTLCommandBuffer> cb = nil; double host = 0; };
+struct LfEvent_ { id<MTLCommandBuffer> cb = nil; double host = 0; long seq = 0; };   // seq: the commits before it
 cudaError_t cudaEventCreate(cudaEvent_t* e) { *e = new LfEvent_(); return cudaSuccess; }
 cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned) { return cudaEventCreate(e); }
 cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) {
@@ -606,15 +624,19 @@ cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) {
   ++r.stats.commitsEvent;
   r.commit();
   e->cb = r.lastCommitted;
+  { std::lock_guard<std::mutex> g(r.inflightMu); e->seq = r.committedSeq; }
   e->host = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
   return cudaSuccess;
 }
 cudaError_t cudaEventSynchronize(cudaEvent_t e) {
   if (e->cb) [e->cb waitUntilCompleted];
+  R().waitThrough(e->seq);                   // (and every command buffer committed before it)
   return cudaSuccess;
 }
 cudaError_t cudaEventQuery(cudaEvent_t e) {
-  return !e->cb || e->cb.status >= MTLCommandBufferStatusCompleted ? cudaSuccess : cudaErrorNotReady;
+  Runtime& r = R();
+  std::lock_guard<std::mutex> g(r.inflightMu);
+  return r.pending.empty() || *r.pending.begin() > e->seq ? cudaSuccess : cudaErrorNotReady;
 }
 cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t a, cudaEvent_t b) {
   cudaEventSynchronize(a); cudaEventSynchronize(b);
