@@ -120,6 +120,13 @@ tensor is a DERIVED weight: one rebuilt during the warm-up (which runs while the
 and became the fold's - pLDDT 71.4 - until it was forgotten with the others (FORGET_HOOKS). AlphaFold 3's published bundle takes
 the same load (`metal/af3/af3.cu.patch`): at 68 tokens, where the start-up is the peak, 3.35 -> 2.25 GB.
 
+🔴 **A `size_t` DIVISION AN ELEMENT IS EMULATED ON APPLE'S GPUS, AND IT COST ESMFold2 A THIRD OF ITS TRUNK.** The CUDA
+ports' elementwise kernels index with `t / C`, `r / L`, `r % L` on 64-bit values - free on NVIDIA, a software
+routine here. ESMFold2's four (`swigluHK`, `centerNormHK` - inside its channel loop -, `gateMulAddHK`, `triSplitHK`)
+were 8.2 s of a 19.3 s trunk at 261 tokens, ~8x their bandwidth. Rewritten with the division done once, in 32 bits
+(`metal/ef2/*.kernel.cu`, `metal/af3/{gateMulAddHK,centerNormHK}.kernel.cu`), they are 2.1 s: **the trunk 19.35 ->
+13.37 s**, the same digits. Look for this first in any kernel that is slower than its bytes.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):
 

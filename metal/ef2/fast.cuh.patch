@@ -1,0 +1,6 @@
+# swigluHK's launch at four channels a thread (metal/ef2/swigluHK.kernel.cu)
+@@@ old
+    swigluHK<<<blocks(r * I), 256, 0, STREAM>>>(h, g, r, I);
+@@@ new
+    swigluHK<<<blocks((r * I + 3) / 4), 256, 0, STREAM>>>(h, g, r, I);
+@@@ end

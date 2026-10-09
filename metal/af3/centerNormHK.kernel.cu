@@ -6,11 +6,13 @@
   for (int half_ = 0; half_ < 2; ++half_) {
     size_t r0 = (size_t)blockIdx.x * 32 + half_ * 16;
     __syncthreads();
+    // (a pair's place in the padded plane divided out once, in 32 bits - not a size_t division a channel, which Apple's
+    // GPUs emulate)
+    const unsigned rr = (unsigned)(r0 + lane), ii = rr / (unsigned)L;
+    const size_t q = (size_t)ii * Lp + (rr - ii * (unsigned)L), plane = (size_t)Lp * Lp;
+    const bool live = lane < 16 && r0 + lane < pairs;
     for (int c = warp; c < C; c += nw) {
-      if (lane < 16) {
-        size_t r = r0 + lane;
-        tile[c * 17 + lane] = r < pairs ? prod[(size_t)c * Lp * Lp + (r / L) * Lp + r % L] : 0.f;
-      }
+      if (lane < 16) tile[c * 17 + lane] = live ? prod[(size_t)c * plane + q] : 0.f;
     }
     __syncthreads();
     for (int row = warp; row < 16; row += nw) {
