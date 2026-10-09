@@ -10,7 +10,7 @@
 # Each port is compiled for the card nvidia-smi reports (sm_75 a T4, sm_89 an L4, sm_80 an A100), the three
 # in parallel, each to a temporary file moved into place only when whole - so cuda/<port>/localfold-<port> either
 # does not exist or is a finished binary, and a fold never starts on half of one. While it runs,
-# /tmp/localfold-cuda-build holds this script's pid (cuda/worker.py waits on it rather than
+# /tmp/localfold-cuda-build holds this script's pid (python/localfold/worker.py waits on it rather than
 # refusing a fold that arrives mid-build); the log is /tmp/localfold-cuda-build.log. A port already
 # built for this card from these sources is left alone.
 #

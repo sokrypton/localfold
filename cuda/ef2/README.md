@@ -19,7 +19,7 @@ ligands, SMILES and modified residues included - writing the same files byte for
 (`tools/check-native-featuriser.py`), and the PDB is the page's writer's records. No JavaScript runs on a fold.
 Beside it every fold writes AlphaFold 3's `<stem>_confidences.json` (the expected PAE, `token_plddts`,
 the token layout) and `<stem>_summary_confidences.json` (pTM, ipTM, mean pLDDT), as cuda/af3 does -
-what the CUDA backend (cuda/worker.py) hands the page. The 300M checkpoint folds through the
+what the CUDA backend (python/localfold/worker.py) hands the page. The 300M checkpoint folds through the
 same binary (`--fold-bundle=model-ef2-fast-300m-int5 --esmc-bundle=model-esmc-300m-int3`; `cuda/ef2/fold
 x.pdb --model=ef2-fast-300m --job=<job.json>`).
 
@@ -122,7 +122,7 @@ the RCSB, on every case of `npm run test:featurise` (`--ccd=ccd/components.cif`)
 
 ### On Colab and the website
 
-The website's Colab backend folds with this binary: `cuda/worker.py` keeps the model resident (`localfold-ef2 - --serve=<dir>`)
+The website's Colab backend folds with this binary: `python/localfold/worker.py` keeps the model resident (`localfold-ef2 - --serve=<dir>`)
 and streams the trunk's contacts and every sampler frame to the page. See docs/WEB.md.
 
 
@@ -484,7 +484,7 @@ a block at a time and adds it into z, in the stored form's block size and order:
 neither z_init nor the language model's pair (two 256-channel f32 pairs) is kept. The **triangle
 multiplication goes in output blocks** (`triangleBlockedEf2`, on cuda/af3/src/triblocked.cuh, shared
 with cuda/af2) where the whole form would not fit with room to spare. `LOCALFOLD_BIG=1` forces both;
-6MRR 1.422 A either way, and check-cuda-worker passes under it. A simulated T4 folds 1,600 residues.
+6MRR 1.422 A either way, and check-native-worker passes under it. A simulated T4 folds 1,600 residues.
 On the same short card the pair transition normalises a chunk of rows at a time (the whole f16 normalised
 pair was 2.95 GB at 2,400), the confidence head's last call normalises the trunk's z in place and parks its
 residual in pinned host memory while its blocks run (two 256-channel pairs fewer), and the distogram goes a

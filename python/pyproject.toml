@@ -27,9 +27,12 @@ localfold-af3 = "localfold.cli:af3"
 localfold-af2 = "localfold.cli:af2"
 localfold-ef2 = "localfold.cli:ef2"
 localfold-fetch = "localfold.cli:fetch"
+localfold-serve = "localfold.cli:serve"
+localfold = "localfold.cli:main"
 
 [tool.setuptools]
 packages = ["localfold"]
 
 [tool.setuptools.package-data]
-localfold = ["bin/localfold-*", "bin/metal-specs/*.specs"]
+# (site/: the website, built by tools/build_site.py, which `localfold serve` serves)
+localfold = ["bin/localfold-*", "bin/metal-specs/*.specs", "site/**/*"]

@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-360 tools. `tools/fixtures/` is data and is not listed.
+359 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (195)
 
@@ -294,7 +294,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (97)
+## `tools/` - everything else (96)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -316,8 +316,6 @@ go through CDP, and the deploy.
 - **`check-atom-windows.js`** - Our atom key window against af3-any-model's own, for every dumped model.
 - **`check-batch-fields.js`** - OUR WHOLE FEATURISED BATCH against af3-any-model's own, field by field, for every dumped model.
 - **`check-bundle-vs-params.py`** - Is this bundle the weights af3-any-model loads, tensor by tensor?
-- **`check-colab-bridge.py`** - The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:colab.
-- **`check-cuda-worker.py`** - The CUDA backend's worker, folding for real: npm run test:cuda.
 - **`check-esmc-reference.js`** - Does cpu/esmc/tower.js compute ESM-C?
 - **`check-esmfold2-confidence.js`** - ESMFold2's confidence head against Synthyra's own, on the host.
 - **`check-esmfold2-diffusion.js`** - ESMFold2's diffusion module, module by module, against its own recorded calls.
@@ -333,8 +331,10 @@ go through CDP, and the deploy.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
 - **`check-native-featuriser.py`** - The native featurisers against the JavaScript exporters they replace: byte for byte.
+- **`check-native-worker.py`** - The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
+- **`check-remote-bridge.py`** - The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:remote.
 - **`check-smiles-batch.mjs`** - A SMILES ligand featurises to the SAME BATCH its CCD code does, field by field.
 - **`check-smiles-conformer.mjs`** - Is the conformer this port builds a real molecule? Bonds, angles, rings, hands.
 - **`check-smiles-path.mjs`** - The same ligand from a CCD code and from a SMILES string folds the same way.
@@ -346,8 +346,6 @@ go through CDP, and the deploy.
 - **`check-template-path.mjs`** - Every AF3-lineage model's TEMPLATE actually moves its fold.
 - **`check_remote_bundle.py`** - Is every shard a manifest names actually at the remote, at the right length?
 - **`chem-probe.mjs`** - The page's chemistry over SMILES on stdin, one line each - cuda/featurise/chem_probe.cpp's twin, for tools/check-native-featuriser.py.
-- **`colab_backend.py`** - LocalFold's CUDA fold, on somebody else's GPU, reached over one URL.
-- **`colab_stub_worker.py`** - A stand-in for cuda/worker.py that a gate drives, so the Colab broker and the reader's page are tested with no card.
 - **`contact-map-dividers.py`** - Does the contact map get its chain divider lines while a fold is running?
 - **`convert_multimer_params.py`** - Normalise AF2 monomer OR multimer parameters onto one graph.
 - **`deploy.py`** - Push, deploy, and prove the site is serving what was pushed.
@@ -390,6 +388,7 @@ go through CDP, and the deploy.
 - **`replay_alphafold_triangle_reference.py`** - Replay a captured bundle through the official AF2 Haiku operator on CPU.
 - **`score_fold.py`** - Score a fold from tools/gpu/fold.js against a reference structure.
 - **`serve.py`** - Serve the checkout with caching turned off.
+- **`stub_worker.py`** - A stand-in for python/localfold/worker.py that a gate drives, so the broker (python/localfold/server.py) and the reader's page are tested with no card.
 - **`sync-mpnn.py`** - Mirror the MPNN port from its own checkout into this one.
 - **`sync-py2dmol.py`** - Mirror py2Dmol's built bundles from its own checkout into this one.
 - **`toy-oracle.html`** - toy oracle: AF2-multimer vs LocalFold

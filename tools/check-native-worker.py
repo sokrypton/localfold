@@ -1,15 +1,20 @@
-"""The CUDA backend's worker, folding for real: npm run test:cuda.
+"""The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
 
-    python3 tools/check-cuda-worker.py             # every case (two go to api.colabfold.com)
-    python3 tools/check-cuda-worker.py --offline   # without the search cases
-    python3 tools/check-cuda-worker.py --no-page   # without the page arm (a headless Chrome, a broker)
-    python3 tools/check-cuda-worker.py --only=6mrr  # just the cases whose name contains it
+    python3 tools/check-native-worker.py             # every case (two go to api.colabfold.com)
+    python3 tools/check-native-worker.py --offline   # without the search cases
+    python3 tools/check-native-worker.py --no-page   # without the page arm (a headless Chrome, a broker)
+    python3 tools/check-native-worker.py --only=6mrr  # just the cases whose name contains it
+    python3 tools/check-native-worker.py --no-af3     # without AlphaFold 3 itself (whose weights need DeepMind's terms)
 
-cuda/worker.py over its own stdin protocol, one process for every case as the broker runs it,
+🔴 AND ON A MAC IT HOLDS THE METAL PORTS: python/localfold/worker.py drives metal/<port> there (NATIVE), the page names the
+backend Metal, and a case may carry a Metal bar of its own (METAL_BARS) where Metal's sampling lands elsewhere on a
+target - each one the Metal gate's own number (metal/af3/gate.py), never a widening for convenience.
+
+python/localfold/worker.py over its own stdin protocol, one process for every case as the broker runs it,
 each job shaped as the page sends one (AlphaFold 3 JSON from the entity rows, the rows themselves, the
 form's controls), each fold scored against its deposited structure (cuda/af3/score.py) and held to a
 bar, and every result held to the fields the page ingests (web/app.js, cudaPrediction): a PDB, a pLDDT a
-token, a PAE of tokens^2, the token layout, the chains. test:colab's CUDA arm is a stub and proves the
+token, a PAE of tokens^2, the token layout, the chains. test:remote's CUDA arm is a stub and proves the
 broker's routing; this is the half that proves the worker folds.
 
 Needs the native ports built (cuda/colab_setup.sh, or each port's nvcc line) and the bundles on disk
@@ -26,6 +31,11 @@ import sys
 import time
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+NATIVE = "metal" if sys.platform == "darwin" else "cuda"
+NATIVE_NAME = {"metal": "Metal", "cuda": "CUDA"}[NATIVE]
+# a case's bar on Metal where it differs from the A100's: Metal's sampling lands elsewhere on these targets, at the
+# Metal gate's own numbers (metal/af3/gate-baseline.json) and the CUDA-translated port's before it
+METAL_BARS = {"protenix2 6mrr": 1.6}      # (1.561 in metal/af3/gate.py; the A100 0.499)
 FIX = os.path.join(REPO, "tools", "fixtures")
 S6 = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
 THREE = dict(ALA="A", ARG="R", ASN="N", ASP="D", CYS="C", GLN="Q", GLU="E", GLY="G", HIS="H", ILE="I", LEU="L",
@@ -208,7 +218,7 @@ def score(pdb_text, reference, chains):
 
 
 def page_arm(bad):
-    """The website's half: a real broker (tools/colab_backend.py --cuda), a reader's page on it - no
+    """The website's half: a real broker (python/localfold/server.py --native), a reader's page on it - no
     backend picker, CUDA is where its folds go - a sequence and Fold - and what the page made of the answer: the status
     line the worker wrote, a prediction in the page's own shape (its PAE a typed array of tokens^2, the
     model labelled CUDA), and no WebGPU device asked for in the reader's browser."""
@@ -216,8 +226,8 @@ def page_arm(bad):
     import cdp
     import urllib.request
     port, reader_port, token = 8893, 9396, "cuda-check"
-    broker = subprocess.Popen([sys.executable, "tools/colab_backend.py", "--port", str(port),
-                               "--token", token, "--cuda"],
+    broker = subprocess.Popen([sys.executable, "python/localfold/server.py", "--port", str(port),
+                               "--token", token, "--native"],
                               cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     reader = None
     try:
@@ -226,8 +236,8 @@ def page_arm(bad):
             if line.startswith("BACKEND ") or time.time() > deadline:
                 break
         health = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/health?t={token}"))
-        if "cuda" not in health.get("backends", []):
-            bad.append(f"page: /health offers {health.get('backends')} with --cuda")
+        if "native" not in health.get("backends", []) or health.get("native") != NATIVE:
+            bad.append(f"page: /health offers {health.get('backends')} / {health.get('native')} with --native")
             return
         reader, ws = cdp.launch(reader_port, "/tmp/localfold-cuda-page-reader")
         ws.call("Page.enable")
@@ -238,22 +248,24 @@ def page_arm(bad):
             const ask = navigator.gpu.requestAdapter.bind(navigator.gpu);
             navigator.gpu.requestAdapter = (...a) => { window.__readerGpu += 1; return ask(...a); };
           }""")
-        ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=colab&t={token}")
-        cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.colab-live')", 120, "the reader's page")
+        ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=remote&t={token}")
+        cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.remote-live')", 120, "the reader's page")
         cdp.evaluate(ws, """(() => {
           for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2', 'protenix2', 'intellifold2', 'rosettafold3'])
             try { localStorage.setItem('localfold.modelTerms.' + key, 'accepted'); } catch (cause) {}
           return true;
         })()""")
         # ...and nothing to choose: the page offers no backend control at all
-        if cdp.evaluate(ws, "!!document.querySelector('#colab-status select')"):
+        if cdp.evaluate(ws, "!!document.querySelector('#remote-status select')"):
             bad.append("page: the badge offers a backend select - CUDA is not a choice")
         # the badge's Live preview: present for CUDA, and off means the finished fold only
-        live = cdp.evaluate(ws, "(() => { const l = document.querySelector('.colab-live'); return l ? { shown: !l.hidden, on: l.querySelector('input').checked } : null; })()")
+        live = cdp.evaluate(ws, "(() => { const l = document.querySelector('.remote-live'); return l ? { shown: !l.hidden, on: l.querySelector('input').checked } : null; })()")
         if not live or not live["shown"] or not live["on"]:
             bad.append(f"page: the Live preview box is {live} - want it shown and on for CUDA")
-        for family, tokens, streamed in (("af3", 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True), ("af3", 68, False)):
-            cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.colab-live input');
+        lineage = "protenix2" if "--no-af3" in sys.argv else "af3"
+        for family, tokens, streamed in ((lineage, 68, True), ("monomer", 68, True), ("ef2-fast-600m", 68, True),
+                                         (lineage, 68, False)):
+            cdp.evaluate(ws, f"""(() => {{ const b = document.querySelector('.remote-live input');
               if (b.checked !== {'true' if streamed else 'false'}) b.click(); return b.checked; }})()""")
             cdp.evaluate(ws, f"""(() => {{
               const g = (id) => document.getElementById(id);
@@ -268,7 +280,7 @@ def page_arm(bad):
             started = time.time()
             cdp.evaluate(ws, "(document.getElementById('predict').click(), true)")
             cdp.wait_for(ws, """(() => { const t = document.getElementById('status-message').textContent;
-              return / on CUDA .* done in |failed|refused|Error|error/.test(t); })()""", 300, f"a CUDA fold of {family}")
+              return / on (CUDA|Metal) .* done in |failed|refused|Error|error/.test(t); })()""", 300, f"a native fold of {family}")
             seconds = time.time() - started           # (click to the result's status line, as a reader waits)
             time.sleep(1.0)
             got = cdp.evaluate(ws, """(() => {
@@ -289,9 +301,9 @@ def page_arm(bad):
             })()""")
             print(f"page: {family:14s} live {'on ' if streamed else 'off'} {seconds:5.2f} s  {got['frames']:2d} frames {got['mapped']}  {got['status'][:70]}")
             problems = []
-            if " on CUDA " not in got["status"] or "done in" not in got["status"]:
+            if f" on {NATIVE_NAME} " not in got["status"] or "done in" not in got["status"]:
                 problems.append(f"status {got['status']!r}")
-            if not (got["model"] or "").endswith("(CUDA)"):
+            if not (got["model"] or "").endswith(f"({NATIVE_NAME})"):
                 problems.append(f"model {got['model']!r}")
             if got["pae"] != tokens * tokens or not got["paeTyped"] or got["plddt"] != tokens:
                 problems.append(f"PAE {got['pae']} (typed {got['paeTyped']}), pLDDT {got['plddt']}")
@@ -300,7 +312,7 @@ def page_arm(bad):
             if not streamed:
                 if got["frames"] > 1:
                     problems.append(f"Live preview off and the viewer still holds {got['frames']} frames")
-            elif family in ("af3", "ef2-fast-600m") and (got["frames"] < 5 or got["mapped"]["contact"] < 5):
+            elif family in ("af3", "protenix2", "ef2-fast-600m") and (got["frames"] < 5 or got["mapped"]["contact"] < 5):
                 problems.append(f"the viewer holds {got['frames']} frames, {got['mapped']['contact']} with a contact map")
             if streamed and family == "monomer" and (got["mapped"]["pae"] < 1 or got["mapped"]["contact"] < 1):
                 problems.append(f"the viewer's AF2 passes carry {got['mapped']} - no streamed PAE or contacts")
@@ -325,11 +337,15 @@ def main():
     only = next((a[7:] for a in sys.argv if a.startswith("--only=")), None)   # (a substring of the case names)
     if only is not None:
         plan = [case for case in plan if only in case[0]]
-    worker = subprocess.Popen([sys.executable, os.path.join(REPO, "cuda", "worker.py")], cwd=REPO,
+    if "--no-af3" in sys.argv:
+        plan = [case for case in plan if case[1]["family"] != "af3"]
+    plan = [(name, payload, reference, METAL_BARS.get(name, bar) if NATIVE == "metal" else bar, tokens, refusal)
+            for name, payload, reference, bar, tokens, refusal in plan]
+    worker = subprocess.Popen([sys.executable, os.path.join(REPO, "python", "localfold", "worker.py")], cwd=REPO,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open("/tmp/localfold-cuda-check.log", "w"),
                               text=True, bufsize=1)
     first = json.loads(worker.stdout.readline())
-    bad = [] if first.get("kind") == "cuda-ready" else [f"the worker's first line was {first}, not cuda-ready"]
+    bad = [] if first.get("kind") == "ready" else [f"the worker's first line was {first}, not ready"]
     for name, payload, reference, bar, tokens, refusal in plan:
         payload = dict(payload)
         expected_bonds = payload.pop("ligandBonds", None)
@@ -363,8 +379,8 @@ def main():
         c = result.get("confidence") or {}
         n = len(c.get("plddt") or [])
         problems = []
-        if result.get("cuda") is not True:
-            problems.append("not marked cuda")
+        if result.get("native") != NATIVE:
+            problems.append(f"marked native {result.get('native')!r}, not {NATIVE!r}")
         if len(c.get("predictedAlignedError") or []) != n * n:
             problems.append(f"PAE {len(c.get('predictedAlignedError') or [])} for {n} tokens")
         if len((result.get("tokens") or {}).get("chainIds") or []) != n:
@@ -404,9 +420,9 @@ def main():
     if "--no-page" not in sys.argv:
         page_arm(bad)
     if bad:
-        print("\n" + "\n".join(bad) + "\n\ncuda worker: FAILED (its log: /tmp/localfold-cuda-check.log)")
+        print("\n" + "\n".join(bad) + "\n\nnative worker: FAILED (its log: /tmp/localfold-cuda-check.log)")
         sys.exit(1)
-    print("\ncuda worker: ok")
+    print("\nnative worker: ok")
 
 
 if __name__ == "__main__":

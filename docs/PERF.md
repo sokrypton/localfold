@@ -2184,7 +2184,7 @@ tokens), which is the resolution this question needed and never had.
 thing you present TO and a Colab container has no display, so Vulkan never came
 up and Chrome fell back to **SwiftShader** - which answers `requestAdapter`
 perfectly happily. `tools/cdp.py` has carried the flag for
-`tools/colab_backend.py` since that file was written, and its own note says why
+`python/localfold/server.py` since that file was written, and its own note says why
 the shared list does not: the A100 box these flags were written on runs HEADED,
 where a surface exists. So the PAGE was always on the GPU and the BENCH
 LAUNCHER was not, on any box with no display.
@@ -2209,7 +2209,7 @@ every arm looked hung and two rounds of harness debugging went into a flag. The
 Turing section below is NOT affected: it reports the adapter offering
 `shader-f16` AND `chromium-experimental-subgroup-matrix`, and SwiftShader offers
 neither, so those runs had the card. Nor is any user's fold - the notebook folds
-through `colab_backend.py`.
+through `python/localfold/server.py`.
 
 **It is refused now, not warned about.** `gpu-chrome` exits 2 on a software
 adapter unless `--allow-software` is passed, and names both usual causes (no
@@ -2259,7 +2259,7 @@ best of everything tried on this kernel, and a prior copied from a neighbour
 would have shipped a regression to every Colab user.
 
 🔴 **AND THE WHOLE-FOLD MEASUREMENT SAID THE OPPOSITE, WITH ITS OWN CONTROL
-DISPROVING IT.** Folding a 154-residue protein through `tools/colab_backend.py`
+DISPROVING IT.** Folding a 154-residue protein through `python/localfold/server.py`
 reported Ampere's prior **19% FASTER** (3826/3644 ms against 3147/3043) - and
 the same unrecognised configuration re-run at the end of that session came back
 at 4063/3998/4021, a **31% drift**. An A/B whose control moves further than its
@@ -2518,7 +2518,7 @@ each frame into a viewer nobody looks at. Two changes:
   still loads, which its download button reads;
 - **the bridge sends a task's events as one request**, by microtask, and a batch
   older than 50 ms goes at once (a long synchronous stretch must not hold the
-  feed - `test:colab`'s busy-page arm failed at 6 s with the microtask alone).
+  feed - `test:remote`'s busy-page arm failed at 6 s with the microtask alone).
 
 The warm-up dummy also takes one recycle now, so a recycled pass's kernels
 compile. T4, 68 residues:

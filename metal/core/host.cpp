@@ -47,7 +47,11 @@ void bestRotation(const std::vector<double>& moving, const std::vector<double>& 
 void serveJobs(const char* port, const std::string& dir,
                const std::function<int(const std::string&, const std::vector<std::string>&)>& fold) {
   printf("%s: serving %s\n", port, dir.c_str()); fflush(stdout);
+  // (a server outlives nothing: macOS has no PR_SET_PDEATHSIG, so when whoever started it - python/localfold/worker.py, which a
+  // page's Stop kills - is gone, it is re-parented and stops, giving the GPU's memory back)
+  const pid_t parent = getppid();
   for (;;) {
+    if (getppid() != parent) { printf("%s: its parent is gone, stopping\n", port); return; }
     std::string id;
     if (DIR* d = opendir(dir.c_str())) {
       std::vector<std::string> jobs;

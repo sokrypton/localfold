@@ -25,7 +25,7 @@ WHAT IT CHECKS, on a real page with a real result in it:
   * NONE OF IT REACHES AN ORDINARY PAGE: no badge, no retired controls, no
     "folded on:" in the dev report and no download row, on the page that folds
     in the reader's own browser - every rule here is conditioned on
-    `?backend=colab` and this is what says so;
+    `?backend=remote` and this is what says so;
   * a result that lands is ON SCREEN, and the first fold makes one object;
   * moving the model row changes NOTHING on screen - the fold, its panels and
     its downloads stay, because the row says what to fold next and the panels
@@ -65,12 +65,12 @@ in the renderer and the frames in them - rather than as a class or a flag. The
 cover that came before this was measured as a class first, which says a page
 set an attribute and nothing about whether a stylesheet arrived.
 
-🔴 AND THE RESULT GETS ONTO THE PAGE THROUGH tools/colab_backend.py AND
-tools/colab_stub_worker.py, WHICH ARE A FIXTURE HERE AND NOT THE SUBJECT. A fold
-needs weights and a card; the stub lets a structure in cuda/worker.py's shape be
+🔴 AND THE RESULT GETS ONTO THE PAGE THROUGH python/localfold/server.py AND
+tools/stub_worker.py, WHICH ARE A FIXTURE HERE AND NOT THE SUBJECT. A fold
+needs weights and a card; the stub lets a structure in python/localfold/worker.py's shape be
 pushed to a reader's page through the code that ingests a real one, which is the
 only way this machine can put a prediction on screen. See
-tools/check-colab-bridge.py, whose arms this borrows.
+tools/check-remote-bridge.py, whose arms this borrows.
 """
 import base64
 import http.server
@@ -217,8 +217,8 @@ def set_row(ws, row_id, value):
     time.sleep(0.4)
 
 
-# 🔴 A READER'S FOLD IS A CUDA FOLD, so the broker offers CUDA - through tools/colab_stub_worker.py,
-# which speaks cuda/worker.py's protocol, emits what this gate appends to its feed and HOLDS its fold
+# 🔴 A READER'S FOLD IS A CUDA FOLD, so the broker offers CUDA - through tools/stub_worker.py,
+# which speaks python/localfold/worker.py's protocol, emits what this gate appends to its feed and HOLDS its fold
 # until it has sent a result. That is how a result is put in front of the reader here: there is no
 # card, and the fold path's ingestion is the reader's own code.
 WORK = tempfile.mkdtemp(prefix="localfold-pending-")
@@ -249,8 +249,8 @@ def feed(*events):
 
 
 def cuda_result(pdb, status="AlphaFold 3 · 6 residues"):
-    """A result in cuda/worker.py's own shape, which is what the reader ingests."""
-    return {"cuda": True, "model": "cuda af3", "family": "af3", "pdb": pdb,
+    """A result in python/localfold/worker.py's own shape, which is what the reader ingests."""
+    return {"native": "cuda", "model": "cuda af3", "family": "af3", "pdb": pdb,
             "confidence": {"plddt": [88.1, 90.2, 71.0, 65.5, 80.0, 92.3], "meanPlddt": 81.2, "ptm": 0.71,
                            "predictedAlignedError": [i / 4 for i in range(36)],
                            "contactProbs": [0.5] * 36},
@@ -260,12 +260,12 @@ def cuda_result(pdb, status="AlphaFold 3 · 6 residues"):
 
 print(f"starting the broker on {PORT} (it is the fixture, not the subject)…")
 backend = subprocess.Popen(
-    [sys.executable, "tools/colab_backend.py", "--port", str(PORT), "--token", TOKEN, "--cuda"],
+    [sys.executable, "python/localfold/server.py", "--port", str(PORT), "--token", TOKEN, "--native"],
     cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     # ...and it is told it is on a Colab machine, which is the only difference
     # between this run and one in a notebook.
     env={**os.environ, "TBE_RUNTIME_ADDR": f"127.0.0.1:{UNASSIGN_PORT}",
-         "LOCALFOLD_CUDA_WORKER": os.path.join(REPO, "tools", "colab_stub_worker.py"),
+         "LOCALFOLD_WORKER": os.path.join(REPO, "tools", "stub_worker.py"),
          "LOCALFOLD_STUB_FEED": FEED, "LOCALFOLD_STUB_JOBS": JOBS})
 reader = None
 try:
@@ -283,7 +283,7 @@ try:
         raise SystemExit(1)
 
     # A fold held on the worker, so the reader ATTACHES to it - which is how the first result reaches it.
-    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
 
     reader, reader_ws = cdp.launch(READER_CDP_PORT, "/tmp/localfold-pending-reader")
     reader_ws.call("Page.enable")
@@ -293,7 +293,7 @@ try:
       addEventListener('error', (e) => window.__pageErrors.push(String(e.message)));
     """)
     # 🔴 FIRST, THE ORDINARY PAGE - the one this all has to stay out of. Every
-    # rule below is conditioned on `?backend=colab`, and a badge, a disabled
+    # rule below is conditioned on `?backend=remote`, and a badge, a disabled
     # Fold button or a "folded on:" header appearing on localfold.org would be
     # today's work leaking onto the page that folds in your own browser.
     reader_ws.call("Page.navigate", url=f"{BASE}/index.html")
@@ -302,7 +302,7 @@ try:
       const button = document.getElementById('dev-toggle');
       if (button !== null) button.click();
       return {
-        badge: document.getElementById('colab-status') === null ? 'none' : 'there',
+        badge: document.getElementById('remote-status') === null ? 'none' : 'there',
         fold: !!document.getElementById('predict')?.disabled,
         model: !!document.getElementById('model-family')?.disabled,
         downloads: getComputedStyle(document.getElementById('downloads')).display,
@@ -331,7 +331,7 @@ try:
         bad.append(f"the ordinary page threw: {plain['errors'][:2]}")
 
     reader_ws.call("Page.navigate",
-                   url=f"{BASE}/index.html?backend=colab&t={TOKEN}")
+                   url=f"{BASE}/index.html?backend=remote&t={TOKEN}")
     cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader's page")
     attached, deadline = "", time.time() + 30
     while time.time() < deadline:
@@ -598,7 +598,7 @@ try:
         bad.append("the restore-then-fold leg did not run at all")
     else:
         reader_ws.call("Page.navigate",
-                       url=f"{BASE}/index.html?backend=colab&t={TOKEN}")
+                       url=f"{BASE}/index.html?backend=remote&t={TOKEN}")
         cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader, for the restore")
         offered, deadline2 = False, time.time() + 30
         while time.time() < deadline2:
@@ -686,9 +686,9 @@ try:
     # reported "the downloads went with the runtime" against a page that had
     # nothing to give. The path is the fixture's own: raise `folding` on the
     # broker, open the reader again so it attaches, push the result.
-    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
     reader_ws.call("Page.navigate",
-                   url=f"{BASE}/index.html?backend=colab&t={TOKEN}")
+                   url=f"{BASE}/index.html?backend=remote&t={TOKEN}")
     cdp.wait_for(reader_ws, "!!window.__entityList", 120, "the reader, again")
     again, deadline2 = "", time.time() + 30
     while time.time() < deadline2:
@@ -712,11 +712,11 @@ try:
 
     # 7 · THE BADGE: where Fold runs, and whether it is still there.
     badge = cdp.evaluate(reader_ws, """(() => {
-      const box = document.getElementById('colab-status');
+      const box = document.getElementById('remote-status');
       if (box === null) return null;
       return { state: box.dataset.state ?? '',
-               says: box.querySelector('.colab-said')?.textContent ?? '',
-               dot: getComputedStyle(box.querySelector('.colab-dot')).backgroundColor,
+               says: box.querySelector('.remote-said')?.textContent ?? '',
+               dot: getComputedStyle(box.querySelector('.remote-dot')).backgroundColor,
                leave: box.querySelector('button')?.textContent ?? '' };
     })()""")
     print(f"  the badge: {badge}")
@@ -750,9 +750,9 @@ try:
     #     runtime PAGE from a dead runtime BROWSER went with that page: a
     #     runtime is now one broker and a worker, and a broker that has gone
     #     is an ask that fails.)
-    beats0 = cdp.evaluate(reader_ws, "window.__colabBeats ?? 0")
+    beats0 = cdp.evaluate(reader_ws, "window.__remoteBeats ?? 0")
     time.sleep(7.0)
-    beating = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)") - beats0
+    beating = cdp.evaluate(reader_ws, "(window.__remoteBeats ?? 0)") - beats0
     print(f"  the badge polled {beating} time(s) in seven seconds")
     if beating == 0:
         bad.append("the counter cannot see the badge's own polling, so"
@@ -776,7 +776,7 @@ try:
         return real.apply(window, args);
       };
       window.__counting = true;
-      document.getElementById('colab-status').querySelector('button').click();
+      document.getElementById('remote-status').querySelector('button').click();
       return true;
     })()""")
     # 🔴 THE PAGE MUST NOT RELOAD, because the server it was served BY is what
@@ -785,10 +785,10 @@ try:
     after, deadline = {}, time.time() + 40
     while time.time() < deadline:
         after = cdp.evaluate(reader_ws, """(() => {
-          const badge = document.getElementById('colab-status');
+          const badge = document.getElementById('remote-status');
           return {
             url: location.search,
-            badge: badge?.querySelector('.colab-said')?.textContent ?? 'gone',
+            badge: badge?.querySelector('.remote-said')?.textContent ?? 'gone',
             button: badge?.querySelector('button') == null ? 'gone' : 'still here',
             fold: !!document.getElementById('predict')?.disabled,
             model: !!document.getElementById('model-family')?.disabled,
@@ -802,7 +802,7 @@ try:
             break
         time.sleep(0.5)
     print(f"  after Disconnect: {after}")
-    if "backend=colab" in after.get("url", ""):
+    if "backend=remote" in after.get("url", ""):
         bad.append(f"Disconnect left the page on {after.get('url')!r}, so it"
                    " would ask a stopped runtime for the next fold")
     if not after.get("alive"):
@@ -858,11 +858,11 @@ try:
     # `GET /down?t=&head=1 403` and then 500 after 500, because the pulse ran
     # on for the life of the tab. Three samples: a few beats may be in flight
     # or spent finding out, and then it must be still.
-    beats_a = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
+    beats_a = cdp.evaluate(reader_ws, "(window.__remoteBeats ?? 0)")
     time.sleep(16.0)
-    beats_b = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
+    beats_b = cdp.evaluate(reader_ws, "(window.__remoteBeats ?? 0)")
     time.sleep(12.0)
-    beats_c = cdp.evaluate(reader_ws, "(window.__colabBeats ?? 0)")
+    beats_c = cdp.evaluate(reader_ws, "(window.__remoteBeats ?? 0)")
     print(f"  the pulse after Disconnect: {beats_a} -> {beats_b} -> {beats_c}")
     if beats_c != beats_b:
         bad.append(f"the page is still beating after Disconnect"

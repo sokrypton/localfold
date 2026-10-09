@@ -1,10 +1,10 @@
-"""The CUDA backend: LocalFold's native ports folding a page's job, speaking the bridge.
+"""The native backend: LocalFold's native ports folding a page's job, speaking the bridge.
 
-    python3 cuda/worker.py            # run from the repository root
+    python3 python/localfold/worker.py            # (run by python/localfold/server.py, which feeds it)
 
-Started by tools/colab_backend.py (`--cuda`) and fed one job per line on stdin; every line it prints on
+Started by python/localfold/server.py (`--native`) and fed one job per line on stdin; every line it prints on
 stdout is one bridge event, `{"kind", "payload", "at"}` - `status`, `progress`, `frame`, `contacts`,
-`scores` and `result` - which the broker numbers and the reader's page follows (web/colab-bridge.js).
+`scores` and `result` - which the broker numbers and the reader's page follows (web/remote-bridge.js).
 
 🔴 THE PAGE'S OWN INPUTS, THE PAGE'S OWN WEIGHTS - AND NO JAVASCRIPT. The job is the reader's AlphaFold 3 JSON
 (web/job-json.js writes it) and each port's native featuriser (cuda/featurise: af3-featurise, af2-featurise,
@@ -21,6 +21,12 @@ template on AlphaFold 2's template-free models.
 
 Ports: cuda/af3 (all seven AF3-lineage models), cuda/af2 (all five of each, monomer and multimer),
 cuda/ef2 (ESMFold2, 600M and 300M). Each must be built (cuda/colab_setup.sh); a bundle not on disk is fetched.
+
+🔴 AND ON A MAC THE SAME WORKER DRIVES metal/<port>: the Metal ports take the CUDA ports' flags and speak the same
+--serve protocol (metal/core/host.cpp), so what differs is where the binaries are, how the GPU is named and how full it
+is - NATIVE below. An installed wheel (`localfold serve`, python/localfold/serve.py) points the binaries, the
+featurisers and the weights at its own files through LOCALFOLD_BIN_DIR, LOCALFOLD_FEATURISE_DIR and
+LOCALFOLD_WEIGHTS_DIR.
 """
 import json
 import os
@@ -31,8 +37,14 @@ import sys
 import time
 import traceback
 
-REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+# the checkout (python/localfold/ is two below it) - or, installed, whatever `localfold serve` says
+REPO = os.environ.get("LOCALFOLD_REPO") or os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 CUDA = os.path.join(REPO, "cuda")
+# the native backend this machine has: Apple's GPU through metal/, NVIDIA's through cuda/
+NATIVE = "metal" if sys.platform == "darwin" else "cuda"
+NATIVE_NAME = {"metal": "Metal", "cuda": "CUDA"}[NATIVE]
+BIN_DIR = os.environ.get("LOCALFOLD_BIN_DIR")             # (a wheel's binaries: localfold-<port> side by side)
+WEIGHTS_DIR = os.environ.get("LOCALFOLD_WEIGHTS_DIR")     # (where fetch-weights keeps the bundles; else the checkout)
 # ESMFold2's scheduled sampler steps: the checkpoint's own, and the floor for a job with per-atom tokens
 # (web/esmfold2-model.js, ESMFOLD2_COUNTS and ESMFOLD2_ATOMISED_STEPS - the page's numbers, mirrored)
 ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS = 15, 64
@@ -47,11 +59,11 @@ def atomised_job(text):
             if kind == "ligand" or (isinstance(body, dict) and body.get("modifications")):
                 return True
     return False
-WORK = os.environ.get("LOCALFOLD_CUDA_WORK", "/tmp/localfold-cuda")
+WORK = os.environ.get("LOCALFOLD_WORK") or os.environ.get("LOCALFOLD_CUDA_WORK") or f"/tmp/localfold-{NATIVE}"
 AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
 # ...whose dialect has no working flow sampler (noFlowSampler, shared/af3/dialect.js)
 NO_FLOW_FAMILIES = ("rosettafold3", "chai1")
-FEATURISE = os.path.join(CUDA, "featurise")
+FEATURISE = os.environ.get("LOCALFOLD_FEATURISE_DIR") or os.path.join(CUDA, "featurise")
 OUT = sys.stdout
 
 
@@ -84,8 +96,14 @@ class Refused(Exception):
     """A job this backend does not run, said as such rather than approximated."""
 
 
-def card_use():
-    """(used, total) MiB of device memory on the card, from nvidia-smi."""
+def card_use(servers=()):
+    """(used, total) MiB of device memory on the card, from nvidia-smi - on a Mac, whose GPU shares the machine's
+    memory, the resident memory of the model servers against the machine's"""
+    if NATIVE == "metal":
+        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout) >> 20
+        pids = [str(s.proc.pid) for s in servers if s.proc.poll() is None]
+        rss = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(pids)], capture_output=True, text=True).stdout if pids else ""
+        return sum(int(v) for v in rss.split()) >> 10, total
     out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
                          capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
     used, total = (int(v) for v in out[0].split(","))
@@ -93,6 +111,13 @@ def card_use():
 
 
 def device_name():
+    if NATIVE == "metal":
+        try:
+            chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
+                                  timeout=10).stdout.strip()
+            return chip or "Apple GPU"
+        except (OSError, subprocess.SubprocessError):
+            return "Apple GPU"
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                              capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
@@ -103,7 +128,11 @@ def device_name():
 
 def die_with_parent():
     """Linux: a child gets SIGKILL when this worker goes, however it goes - Stop kills the worker (the
-    broker's way of ending a fold), and a binary left running would hold the card."""
+    broker's way of ending a fold), and a binary left running would hold the card. macOS has no such call: the
+    broker kills the worker's whole process group instead (python/localfold/server.py), and a Metal server whose
+    parent is gone stops itself (metal/core/host.cpp)."""
+    if sys.platform != "linux":
+        return
     import ctypes
     import signal
     ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
@@ -118,7 +147,8 @@ def model_weights(model, log):
     if model == "af3":
         accepted = {n.strip() for n in env.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",") if n.strip()}
         env["LOCALFOLD_ACCEPT_MODEL_TERMS"] = ",".join(sorted(accepted | {"alphafold3"}))
-    fetcher = subprocess.Popen([featuriser("fetch-weights"), model], cwd=REPO, stdout=subprocess.PIPE,
+    where = [f"--weights-dir={WEIGHTS_DIR}"] if WEIGHTS_DIR else []
+    fetcher = subprocess.Popen([featuriser("fetch-weights"), *where, model], cwd=REPO, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=die_with_parent, env=env)
     said, dirs = [], []
     for line in fetcher.stdout:
@@ -138,7 +168,7 @@ def model_weights(model, log):
 def local_ccd():
     """wwPDB's whole component dictionary when `fetch-weights ccd` has put it beside the weights (the binaries'
     default too): every component read from it, none fetched from the RCSB a component at a time."""
-    path = os.path.join(REPO, "ccd", "components.cif")
+    path = os.path.join(WEIGHTS_DIR or REPO, "ccd", "components.cif")
     return [f"--ccd={path}"] if os.path.exists(path) else []
 
 
@@ -157,7 +187,11 @@ def building():
 def binary(port):
     """A port's binary - waited for while cuda/build.sh is still compiling it (the notebook starts the
     build beside the service, so the first fold can arrive before it is done), refused if nothing is."""
-    path = os.path.join(CUDA, port, f"localfold-{port}")
+    path = os.path.join(BIN_DIR, f"localfold-{port}") if BIN_DIR else os.path.join(REPO, NATIVE, port, f"localfold-{port}")
+    if NATIVE == "metal":
+        if not os.access(path, os.X_OK):
+            raise Refused(f"{path} is not built - run bash metal/build.sh {port}")
+        return path
     started = time.time()
     while not os.access(path, os.X_OK) and building():
         emit("status", f"compiling the CUDA ports for this card (once a runtime) · {time.time() - started:.0f} s")
@@ -173,6 +207,8 @@ def featuriser(name):
     """A native featuriser (cuda/featurise/<name>) - waited for while cuda/build.sh compiles it, refused if nothing
     is building it."""
     path = os.path.join(FEATURISE, name)
+    if NATIVE == "metal" and not os.access(path, os.X_OK):
+        raise Refused(f"{path} is not built - run bash cuda/build.sh featurise")
     started = time.time()
     while not os.access(path, os.X_OK) and building():
         emit("status", f"compiling the native featurisers (once a runtime) · {time.time() - started:.0f} s")
@@ -334,7 +370,7 @@ def featurise(cmd, what, log, on_line=None):
 
 def streaming(job):
     """Whether a fold streams its intermediate results: the reader's own choice, the page's Live preview
-    (web/colab-bridge.js), sent as `frames` - on unless it says false."""
+    (web/remote-bridge.js), sent as `frames` - on unless it says false."""
     return job.get("frames", True) is not False
 
 
@@ -355,7 +391,7 @@ class Worker:
         at most half full. `keep` (the model about to fold, or just folded) is never one."""
         for key in [k for k in self.servers if k != keep]:
             if not everything:
-                used, total = card_use()
+                used, total = card_use(self.servers.values())
                 if used <= total // 2:
                     return
             self.servers.pop(key).close()
@@ -367,7 +403,8 @@ class Worker:
         if server is not None and server.proc.poll() is not None:
             server = None
         if server is None:
-            emit("status", f"{key[1]} on CUDA ({self.device}) · loading the weights onto the card")
+            emit("status", f"{key[1]} on {NATIVE_NAME} ({self.device}) · loading the weights onto the "
+                 + ("GPU" if NATIVE == "metal" else "card"))
             server = Server(key, command)
         self.servers[key] = server
         return server
@@ -392,16 +429,16 @@ class Worker:
         elif family in ("ef2-fast-600m", "ef2-fast-300m"):
             port = "ef2"
         else:
-            raise Refused(f"the CUDA backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
+            raise Refused(f"the {NATIVE_NAME} backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2"
                           " and ESMFold2)")
         sampler = controls.get("af3-mode", "diffusion")
         if port == "af3" and sampler not in ("diffusion", "flow"):
-            raise Refused(f"the CUDA backend does not know the sampler {sampler!r}")
+            raise Refused(f"the {NATIVE_NAME} backend does not know the sampler {sampler!r}")
         if port == "af3" and sampler == "flow" and family in NO_FLOW_FAMILIES:
             # ...the page's own rule: rf3's walk collapses the backbone while pLDDT reads as if nothing were
             # wrong, and chai-1 samples with its own second-order step (noFlowSampler, shared/af3/dialect.js)
             raise Refused(f"{family} has no working flow sampler - set the sampler to Diffusion")
-        emit("status", f"{family} on CUDA ({self.device}) · reading the job")
+        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · reading the job")
         emit("progress", 0.02)
         started = time.time()
         shutil.rmtree(WORK, ignore_errors=True)
@@ -443,7 +480,7 @@ class Worker:
             else:
                 raise Refused(f"the MSA mode is {mode!r} but no alignment came with the job")
         elif mode != "none":
-            raise Refused(f"the CUDA backend does not know the MSA mode {mode!r}")
+            raise Refused(f"the {NATIVE_NAME} backend does not know the MSA mode {mode!r}")
 
         # the templates, resolved by the page's own code - where a row asks for one (templateKind: a row's
         # template with no kind, or "none", is no template; a Node start is 0.13 s of a 0.5 s warm fold)
@@ -459,7 +496,7 @@ class Worker:
                           " structure instead")
         named = [t for t in templates if t["kind"] != "search"]
         if named:
-            emit("status", f"{family} on CUDA · templates {', '.join(t['source'] for t in named)}")
+            emit("status", f"{family} on {NATIVE_NAME} · templates {', '.join(t['source'] for t in named)}")
         if port == "af3":
             if named:
                 flags.append("--template=" + ",".join(f"{t['file']}:{t['chainId'] or ''}@{t['chain']}" for t in named))
@@ -474,11 +511,11 @@ class Worker:
         requested = int(depth[0]) if depth[0].isdigit() else 512
         extra = int(depth[1]) if len(depth) > 1 and depth[1].isdigit() else 1024
         out_pdb = os.path.join(WORK, "fold.pdb")
-        emit("status", f"{family} on CUDA ({self.device}) · featurising"
+        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · featurising"
              + (" and searching the ColabFold MMseqs2 server" if mode == "search" else ""))
         def live(line):          # the featuriser's own word while it works: the MMseqs2 search waits on a queue
             if line.startswith("search: "):
-                emit("status", f"{family} on CUDA ({self.device}) · MMseqs2 search · {line[8:]}")
+                emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · MMseqs2 search · {line[8:]}")
         # each port's resident server (Server: the model's weights stay on the card between folds) and this
         # job's flags for it
         if port == "af3":
@@ -547,7 +584,7 @@ class Worker:
                 fold.append(f"--steps={steps}")
             total = 0
         emit("progress", 0.15)
-        emit("status", f"{family} on CUDA ({self.device}) · folding")
+        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · folding")
         on_file = None
         if streaming(job):
             # 🔴 WHAT EACH PORT STREAMS, AS WebGPU AND JAX STREAM IT - unless the page's Live preview is off:
@@ -560,13 +597,13 @@ class Worker:
                     emit("frame", open(path).read())
                     emit_scores(json.load(open(path[:-4] + ".json")), os.path.join(os.path.dirname(path), f"pae-{tag.group(0)}.u8"), passes)
                     emit("progress", 0.15 + 0.85 * (index + 1) / passes)
-                    emit("status", f"{family} on CUDA ({self.device}) · pass {index + 1}/{passes}")
+                    emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · pass {index + 1}/{passes}")
                 elif name.startswith("contacts-"):
                     index, passes = int(tag.group(1)), int(tag.group(2))
                     emit_contacts(path, index, passes)
                     if port != "af2":
                         emit("progress", 0.15 + 0.15 * (index + 1) / passes)
-                        emit("status", f"{family} on CUDA ({self.device}) · trunk pass {index + 1}/{passes}")
+                        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · trunk pass {index + 1}/{passes}")
                 elif name.startswith("frame-"):
                     # frame-SSSS.pdb (af3, its step count the job's) or frame-SSSS-NNNN.pdb (ef2)
                     step = int(name[6:10])
@@ -574,7 +611,7 @@ class Worker:
                     emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
                     if steps:
                         emit("progress", 0.3 + 0.7 * step / steps)
-                        emit("status", f"{family} on CUDA ({self.device}) · diffusion {step}/{steps}")
+                        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · diffusion {step}/{steps}")
         said = server.fold(inputs, fold, on_file)
         log.append(said)
         self.evict(key)
@@ -626,18 +663,18 @@ class Worker:
             confidence["iptm"] = summary["iptm"]
         mean = confidence["meanPlddt"]
         return {
-            "cuda": True, "model": f"cuda {port}", "family": family,
+            "native": NATIVE, "model": f"{NATIVE} {port}", "family": family,
             "pdb": pdb, "confidence": confidence,
             "tokens": {"chainIds": chain_ids, "resIds": res_ids},
             "chains": polymer_chains(job["job"]), "msas": {},
             "atoms": len(pdb_atoms(pdb)),
-            "status": f"{family} on CUDA ({self.device}) · done in {seconds:.1f} s · pLDDT {mean:.1f}",
+            "status": f"{family} on {NATIVE_NAME} ({self.device}) · done in {seconds:.1f} s · pLDDT {mean:.1f}",
             "_raw": raw,
         }
 
 
 def main():
-    emit("cuda-ready", {"at": int(time.time() * 1000)})
+    emit("ready", {"at": int(time.time() * 1000), "native": NATIVE})
     worker = Worker()
     for line in sys.stdin:
         if not line.strip():

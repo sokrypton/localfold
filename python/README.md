@@ -13,6 +13,18 @@ localfold-af2 --sequence=MKV...:GSH... --search --out=dimer.pdb
 localfold-ef2 --sequence=MKV... --out=fold.pdb                # ESMFold2: no alignment needed
 ```
 
+Or the whole website, on this machine, folding with its GPU:
+
+```
+localfold serve                      # opens http://127.0.0.1:8710 - the LocalFold page, every fold native
+```
+
+`localfold serve` serves the [LocalFold website](https://localfold.org)'s own page on 127.0.0.1 and sends every fold
+it asks for to these native ports instead of the browser's WebGPU: about twice as fast on an Apple M2, every model
+(chai-1 and OpenDDE included), folds past the browser's buffer limits, and no weights loaded into a browser tab. The
+link it opens carries a token that every request must present, so no other page can use the GPU; Ctrl-C or
+Disconnect on the page stops it. `--port`, `--no-open` and `--weights-dir` are its options.
+
 Each command fetches its model's weights the first time (into `~/.cache/localfold`, or `--weights-dir=<dir>`),
 featurises the input exactly as the [LocalFold website](https://localfold.org) does, and folds. `--help` lists every
 option.

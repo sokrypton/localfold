@@ -2070,8 +2070,8 @@ keeping. The row itself is hidden when nothing at all is available.
 nothing about whether a stylesheet arrived, so the structure box is
 screenshotted before and after the switch, the `::after` is asked for its
 content and its paint, and the card for its display. To get a prediction onto
-a page without weights it borrows `tools/colab_backend.py` as a FIXTURE - the
-held fold of `check-colab-bridge.py`, with a `result` whose `predJson` names
+a page without weights it borrows `python/localfold/server.py` as a FIXTURE - the
+held fold of `check-remote-bridge.py`, with a `result` whose `predJson` names
 its model - which is the only way this machine can put a real ingestion on
 screen. Two mutations: the model row changing in silence (six arms red) and
 the veil's rule removed from the stylesheet (the drawn-mark arms red, the
@@ -2079,9 +2079,9 @@ class arm green, which is exactly why the pixels are measured).
 
 ## Folding somewhere else, and a page that is not dead while it happens
 
-`tools/colab_backend.py` runs this page in a headless Chrome on a Colab
+`python/localfold/server.py` runs this page in a headless Chrome on a Colab
 runtime and serves it to a reader's browser, which asks it to fold
-(`?backend=colab&t=…`, `remoteBackend`/`foldOnBackend` in `web/app.js`). The
+(`?backend=remote&t=…`, `remoteBackend`/`foldOnBackend` in `web/app.js`). The
 first version answered `POST /fold` with the finished structure. That is
 correct and it is also **a page that sits blank for the whole fold**: no
 progress bar, no status line, no sampler frames - every one of which the page
@@ -2089,7 +2089,7 @@ was drawing perfectly, on the other machine, where nobody could see it.
 
 🔴 **WHAT TRAVELS IS THE PAGE'S OWN CALLS, NOT A SECOND FOLD PATH.**
 `remoteTap(kind, payload)` is called from `status()`, `progress()` and both
-`drawLiveFrame` closures, and hands each event to `web/colab-bridge.js`. The
+`drawLiveFrame` closures, and hands each event to `web/remote-bridge.js`. The
 reader's page replays them in order: `status` → `status()`, `progress` →
 `progress()`, `frame` → a frame appended to the viewer. There is no
 remote-only rendering path to keep in step with the real one, which is the
@@ -2132,7 +2132,7 @@ nothing has yet arrived out of order; the sort is for the Colab proxy, which is
 not loopback.
 
 🔴 **AND THE COMMANDS COME BACK THE SAME WAY - TWO MAILBOXES, ONE BROKER.**
-`tools/colab_backend.py` is a post office: `EVENTS` is what the runtime page
+`python/localfold/server.py` is a post office: `EVENTS` is what the runtime page
 has said, `COMMANDS` is what readers have asked, both append-only and both
 read by watermark, so an overlapping poll or a reload re-applies rather than
 losing anything. The reader posts `/in {op, payload}` and reads `/down?since=`;
@@ -2142,7 +2142,7 @@ the runtime page reads `/out?since=` and posts `/up`. `fold`, `stop` and
 **WHAT LEFT THE BACKEND WITH IT**: the `#predict` click, the status-line word
 list that decided a fold had failed, the download-button readback, the
 `__foldState` watch and the three tap drains - about 180 lines of CDP driving
-a page by imitation. All of it is in `web/colab-bridge.js` now, where setting
+a page by imitation. All of it is in `web/remote-bridge.js` now, where setting
 a control is setting a control. **CDP keeps the two jobs only it can do**:
 start the browser, and say what card it got.
 
@@ -2286,7 +2286,7 @@ console filled. A wrapper on `window.fetch` installed over CDP read zero as
 well, while the badge was visibly updating - it sees the page's own `fetch`
 calls in an isolated probe (3 in ten seconds) and not the module's here, and I
 did not chase why. What cannot be wrong about whether the pulse is running is
-the pulse counting itself: `window.__colabBeats`, which a reader can also read
+the pulse counting itself: `window.__remoteBeats`, which a reader can also read
 in their own console. **And the arm now proves it can see a beat before it
 believes a silence** - it read 0 before the runtime was even killed, which
 would have passed against an instrument that saw nothing at all.
@@ -2353,7 +2353,7 @@ consumes events inside `followRemoteFold`; outside one it is following
 nothing. That is right for a fold's own commentary and is worth knowing before
 the next thing is sent that way.
 
-🔴 **AND THE PAGE NOW SAYS WHERE FOLD RUNS.** `?backend=colab` is in the URL
+🔴 **AND THE PAGE NOW SAYS WHERE FOLD RUNS.** `?backend=remote` is in the URL
 and the fold happens on a machine the reader cannot see, so a tab left open
 after the notebook was closed looks exactly like a tab that folds here - and
 the first news of the difference was a fold that went nowhere. The badge in the
@@ -2378,13 +2378,13 @@ and a button offered over a prediction nobody filled looks identical from the
 outside - so the gate clicks PDB in Colab mode and counts what comes back:
 **478 bytes, 6 atoms** of the structure the runtime produced.
 
-`npm run test:colab` (`tools/check-colab-bridge.py`) is the gate, and it needs
+`npm run test:remote` (`tools/check-remote-bridge.py`) is the gate, and it needs
 **no GPU and no weights**. Over the wire: the announcement, a `ping` answered as
 a `pong` (202-414 ms), both clocks, the watermark's idempotence, the 429, and a
 token refusal on all five routes.
 
 **AND TWO ARMS THAT NEEDED MORE THAN CURL.** The READER'S OWN PAGE is opened in
-a second browser at `?backend=colab`, handed a sequence and clicked - with the
+a second browser at `?backend=remote`, handed a sequence and clicked - with the
 WEIGHTS BLOCKED on the runtime page (`Network.setBlockedURLs`, `*huggingface.co*`)
 so the fold fails in seconds rather than pulling hundreds of megabytes. The
 command arrives carrying its entity and its model, and the runtime's `Failed to
@@ -2451,7 +2451,7 @@ been acted on. The page states it instead: `window.__foldState = {running,
 since}`, written at the top of `fold()` and in its `finally`, compared against
 a click time taken from **the page's own clock**. Two blocking folds back to
 back now answer in 11.7 s and 1.05 s. That watch lives in `runFold`
-(`web/colab-bridge.js`) now, where both clocks are the same one.
+(`web/remote-bridge.js`) now, where both clocks are the same one.
 
 ## The Colab setup minute, measured on a T4 - and the three ways of cutting it that do not work
 
@@ -2717,7 +2717,7 @@ same measurement on a T4, through Dawn in node, with and without
 | backbone CA-CA | 3.86 A | 3.86 A |
 
 **1.52x, and the structure is identical.** The Colab path does get this:
-`cdp.py`'s `LINUX_FLAGS` carry the toggle and `colab_backend.py` launches
+`cdp.py`'s `LINUX_FLAGS` carry the toggle and `python/localfold/server.py` launches
 through it. (An earlier note in that file priced f16 at 1.95x; that number
 belongs to `keepTrunkWeights` and has been corrected.)
 
@@ -2824,7 +2824,7 @@ that instead.
 ## Cold start on a T4: 23 s, and four ways of shortening it that do not
 
 Measured end to end, cold, through the notebook's own SETUP and then
-`tools/colab_backend.py` to the `BACKEND` line the link is built from:
+`python/localfold/server.py` to the `BACKEND` line the link is built from:
 
 | | |
 |---|---:|
@@ -3157,7 +3157,7 @@ AF2 multimer or ESMFold2.
 - **A protein chain must carry `templates: []`** even when the alignment is
   searched: the MMseqs2 fill supplies alignments only.
 - **Stop kills the worker** - JAX cannot be interrupted mid-computation - and
-  the next JAX fold starts a new one and recompiles. `test:colab` holds that
+  the next JAX fold starts a new one and recompiles. `test:remote` holds that
   with a stub worker (`LOCALFOLD_JAX_WORKER`), watched failing with the kill
   removed.
 
@@ -3167,7 +3167,7 @@ Colab TPU v5e 44 s cold, pLDDT 84.9, every frame streamed to the reader.
 
 ### Every model through the JAX backend, on the reader's page (an L4, 2026-09-27)
 
-Driven through `index.html?backend=colab` in a real browser - the model row,
+Driven through `index.html?backend=remote` in a real browser - the model row,
 the MSA row, Fold, then the scores card and the archive download read back:
 
 | case | result |
@@ -3386,12 +3386,12 @@ always has: it was reported mid-run and then overwritten by "done", so a
 template that arrived looked like one that did not. 🔴 Its first version
 crashed every templated fold - the new list was called `named`, which the loop
 beside it already uses for a template's display name - and only the TPU run
-caught it, because `test:colab`'s stub worker never reaches `fold()`.
+caught it, because `test:remote`'s stub worker never reaches `fold()`.
 
 ### The sixth pass: the JAX worker folds on this machine, as a gate
 
 Every JAX check so far needed a Colab VM, because the only local exercise of the
-worker - `test:colab` - uses a STUB that never reaches `Worker.fold`. That is
+worker - `test:remote` - uses a STUB that never reaches `Worker.fold`. That is
 how a name clash in the fifth pass's template bookkeeping crashed every
 templated JAX fold until a TPU run caught it.
 
@@ -3413,7 +3413,7 @@ templated folds with `'str' object has no attribute 'append'`.
 ### The seventh pass: every family through the page, locally - and ESMFold2 without its language model
 
 With the worker local, the whole reader-page suite runs here: the broker
-(`tools/colab_backend.py --jax-dir ~/lfjax`, started from the venv's Python)
+(`python/localfold/server.py --jax-dir ~/lfjax`, started from the venv's Python)
 and a reader page, every family end to end. **16 of 16** and the template
 suite **7 of 7** - after one thing about this box:
 
@@ -3512,7 +3512,7 @@ result in the page, COLD (fresh browser profile, empty weight and compile
 caches) and WARM (again, another seed so WebGPU cannot replay its cached
 answer), on 6MRR (68 residues) and 5CAJ chain A (261), single sequence. Every
 fold is scored against its crystal, because a fast wrong fold is not a win.
-The harness is a reader page driving `tools/colab_backend.py`, exactly as a
+The harness is a reader page driving `python/localfold/server.py`, exactly as a
 Colab user's page does. The first pass mostly measured defects, so these came
 first:
 
@@ -3759,14 +3759,14 @@ them at twice the price:
   cached per batch, byte-identical, 77-88 -> 47-54 ms.
 
 **And the reader does none of the work - measured, then made a gate.** A reader
-page (`?backend=colab`) instrumented for WebGPU and weight traffic, folding
+page (`?backend=remote`) instrumented for WebGPU and weight traffic, folding
 through a runtime: AF3, AF3 with a SMILES ligand, AF2 monomer and multimer,
 ESMFold2, OpenDDE, and AF3 on 5CAJ with a 128-row search and an uploaded
 template (255/255). Across all of them and a 20 s idle after load the reader
 **never requested a WebGPU adapter, created no pipeline, buffer or submit, and
 fetched no weight file**; its JavaScript was 50-490 ms a fold, and 0.9-1.8 s
 with an alignment, all of it py2Dmol drawing the structure and the MSA.
-`test:colab`'s reader arm now asserts it (adapter requests and `.bin` /
+`test:remote`'s reader arm now asserts it (adapter requests and `.bin` /
 huggingface / `/hf/` fetches both zero), and fails on a reader made to ask for
 an adapter and one shard.
 
@@ -3790,13 +3790,13 @@ fold at 255 residues, 8.9 for ESMFold2, 12.0 for AF2. Most of it was repeats.
 and JSON has no references, so every object the prediction reaches twice was
 written twice: an AF2 pass holds its structure and confidences in its wrapper
 AND in `pass`, and `contactSource` is one of those passes again.
-`encodePrediction` (web/colab-bridge.js) now writes a repeated object or typed
+`encodePrediction` (web/remote-bridge.js) now writes a repeated object or typed
 array as `{__ref}` to its first appearance and `revivePrediction` relinks it,
 so the reader holds the same shared objects the runtime did; the reader takes
 `scores` from the prediction. **4.80 / 4.85 / 6.95 MB.** Checked end to end: a
 remote AF2 and AF3 fold's "download all" archive still carries `pae`,
 `contact_probs` and `atom_plddts` (AF2's from `contactSource`, a reference now),
-and test:colab, test:pending and the bridge payload test (which asserts the
+and test:remote, test:pending and the bridge payload test (which asserts the
 identities come back) pass.
 
 🔴 **AND THE BROKER NOW SENDS `Cache-Control: no-store`, BECAUSE THE RUNTIME
@@ -3804,7 +3804,7 @@ PAGE RAN A STALE MODULE WHILE MEASURING THIS.** The broker served the repo
 through `SimpleHTTPRequestHandler`, which sends no cache headers - CLAUDE.md's
 `python3 -m http.server` trap - and a runtime whose profile survived (a wipe
 that raced Chrome's exit; `LOCALFOLD_KEEP_PROFILE`) imported last session's
-`colab-bridge.js` while the server held the new one: the first measurement of
+`remote-bridge.js` while the server held the new one: the first measurement of
 this change read the old sizes exactly. The reader's browser is the user's own
 and caches the same way, so a returning reader could hold a bridge that cannot
 read the new wire format. Everything but weight shards is `no-store` now, as
@@ -3963,7 +3963,7 @@ Three changes, found in this order:
    undefined), since resuming uploads it. The piecewise readback stays for
    the cases that still read one.
 
-**And on a real Colab T4, through the page** (reader `?backend=colab`, the
+**And on a real Colab T4, through the page** (reader `?backend=remote`, the
 runtime budgeting 80% of the card, single sequence, recycles 0, diffusion 25):
 
 | job | time | driver peak | status line |
@@ -4018,8 +4018,8 @@ multimer) and ESMFold2 (600M and 300M) - on the page's own published bundles, re
 are (`cuda/*/maps`). The point is speed: a fold is a second or two on the card
 the runtime already has, with no compile minute and no second browser.
 
-**The pieces.** `cuda/worker.py` speaks `jax/worker.py`'s line
-protocol, so the broker (`tools/colab_backend.py --cuda`) relays it exactly as
+**The pieces.** `python/localfold/worker.py` speaks `jax/worker.py`'s line
+protocol, so the broker (`python/localfold/server.py --cuda`) relays it exactly as
 it relays JAX, and the page ingests the result through the same builder
 (`jaxPrediction`, labelled `(CUDA)`). The notebook's `cuda_backend` (on by
 default) installs Node 22 where the image is older, starts `cuda/build.sh` in
@@ -4071,7 +4071,7 @@ one), stops it before an AF2 or ESMFold2 fold so two models never share the
 card, and every child dies with the worker (`PR_SET_PDEATHSIG`), so a Stop -
 which kills the worker - leaves nothing holding the GPU.
 
-**Measured on a Colab T4 (2026-10-03), `npm run test:cuda` there:** the build
+**Measured on a Colab T4 (2026-10-03), `npm run test:native` there:** the build
 is 134 s for all three ports (hidden behind the service starting); every fold
 within 0.01 Å of the A100's - AF3 6MRR 0.624, 5CAJ with its crystal 0.231,
 protenix2 0.645, OpenDDE 1.183, AF2 6MRR 1.903, AF2 5CAJ templated 0.216, the
@@ -4081,12 +4081,12 @@ multimer's 1BRS 0.282, ESMFold2 1.467, AF3 1BRS from a searched MSA 0.59, AF2
 ESMFold2 and its tower 50); a later one is ~2 s; the reader's page, click to
 ingested result, 2.8-3.4 s for AF3, AF2 and ESMFold2.
 
-**Gates.** `npm run test:cuda` (tools/check-cuda-worker.py): the real worker
+**Gates.** `npm run test:native` (tools/check-native-worker.py): the real worker
 over its own protocol on this A100 - every fold scored against its crystal,
 every result held to the fields the page ingests, four refusals, two searched
 cases (`--offline` skips them), AF2's early stop, and a real reader's page
 folding AF3, AF2 and ESMFold2 through a real broker with its browser asking for
-no GPU (`--no-page` skips it). `npm run test:colab` gained a CUDA arm on a stub
+no GPU (`--no-page` skips it). `npm run test:remote` gained a CUDA arm on a stub
 worker - routing, Stop, the JAX worker untouched - and checks the picker offers
 all three, CUDA first.
 
@@ -4135,7 +4135,7 @@ and ipTM equal its final confidences exactly; a streamed contact map is within
 one byte of the final file's. It is the reader's to turn off, on the page:
 the badge's **Live** checkbox beside the backend picker (shown for CUDA,
 remembered per browser), sent as `frames` with each fold - it decides what that
-page draws, so it lives there and not in the notebook. `test:cuda`
+page draws, so it lives there and not in the notebook. `test:native`
 holds every port to what it streams and the reader's viewer to frames carrying
 their contact maps and PAE.
 
@@ -4166,7 +4166,7 @@ almost all of it was start-up paid on every fold:
   for a job with no template) and the exporter (0.12-0.23 s, ~180 ms of it module loading).
   cuda/export_server.mjs keeps an exporter loaded and imports it afresh a request (its dependencies
   stay cached, its output is captured to the request's log); the resolver runs only when a row asks
-  for a template. Every export of every `test:cuda` case is byte-identical to a cold run's, printed
+  for a template. Every export of every `test:native` case is byte-identical to a cold run's, printed
   output included, with the jobs mixed in the order the gate runs them.
 
 Then the reader's page, click to result for a warm fold: **0.50 s for 0.1 s of fold.**
@@ -4189,7 +4189,7 @@ Then the reader's page, click to result for a warm fold: **0.50 s for 0.1 s of f
 | ESMFold2, Live on | 0.50 | **0.25** |
 
 A change of model still pays its weights once (~1 s here); the first fold on a runtime still pays the
-build and the bundle download. `test:cuda` reports click-to-result now, not that plus its own 1 s
+build and the bundle download. `test:native` reports click-to-result now, not that plus its own 1 s
 settle, and takes `--only=<substring>`.
 
 **The first build, cut where it is spent.** nvcc's `-O` is the HOST code's optimisation level (the device
@@ -4233,7 +4233,7 @@ ESMFold2's launch-to-result 0.94 s cold against 1.03-1.10 warmed.)
 ## 🔴 CUDA is the only Colab backend a reader's page uses (2026-10-08)
 
 The badge's backend picker is gone. Every fold a reader starts on a Colab page
-goes to the CUDA worker (`remoteBackendChoice` in web/colab-bridge.js returns
+goes to the CUDA worker (`remoteBackendChoice` in web/remote-bridge.js returns
 `"cuda"`, and nothing on the page can change it), and the notebook builds and
 offers CUDA on every runtime - its `cuda_backend` box is gone with the picker.
 **A runtime that cannot do CUDA refuses rather than folding somewhere slower**:
@@ -4245,17 +4245,17 @@ runtime is told to change runtime type.
 The reader's half of the model warm-up went with it: it asked the runtime's
 WebGPU page to start a model's download and compiles, which only a WebGPU fold
 could use. What is still there and is reached by nothing on the page: the
-runtime page's WebGPU fold relay (`obey` in colab-bridge.js, with
+runtime page's WebGPU fold relay (`obey` in remote-bridge.js, with
 `window.__warmModel` and the broker's `warm` op), and the JAX worker behind
 `--jax-dir` (`jax_backend` still installs it, for a fold sent to the service
-with `backend: "jax"`). `test:colab` and `test:pending` still drive the relay
+with `backend: "jax"`). `test:remote` and `test:pending` still drive the relay
 over plain HTTP as their fixture.
 
-The gates follow. `test:colab`'s reader arm presses Fold and reads the job the
+The gates follow. `test:remote`'s reader arm presses Fold and reads the job the
 CUDA stub was handed - 11 controls, the resolved family, the job JSON - and
 the stub's answer on the reader's screen; pointing the page back at `webgpu`
 fails it ("handed the CUDA worker no job"). `test:pending` starts its broker
-with `--cuda` and a stub that holds its fold, as a real one does. `test:cuda`'s
+with `--cuda` and a stub that holds its fold, as a real one does. `test:native`'s
 page lane asserts there is no select.
 
 ## 🔴 The runtime page and the JAX backend are gone (2026-10-08)
@@ -4263,16 +4263,16 @@ page lane asserts there is no select.
 With every reader's fold going to CUDA, two things had nothing reaching them,
 and both are removed.
 
-**The WebGPU relay.** tools/colab_backend.py used to open a headless Chrome on
+**The WebGPU relay.** python/localfold/server.py used to open a headless Chrome on
 `index.html?role=runtime` and relay folds to the page's own WebGPU code through
 two mailboxes (`/in`+`/out` for commands, `/up`+`/down` for events), feed that
 page its weights through a proxy (`/hf/`, `weights=proxy`), budget it from the
 driver (`vram=`), warm a model when the reader picked one, and judge a quiet
 runtime by the page's poll (`runtimeSeen`) and the browser's DevTools endpoint
 (`browserAlive`). All of it is gone: the broker is now a server that serves the
-checkout and keeps one `cuda/worker.py`, numbering and holding its events for
+checkout and keeps one `python/localfold/worker.py`, numbering and holding its events for
 the reader (`/health`, `/in`, `/down`), and it names the card from
-`nvidia-smi` - 777 lines to 400. web/colab-bridge.js keeps only the reader's
+`nvidia-smi` - 777 lines to 400. web/remote-bridge.js keeps only the reader's
 half (766 to 300 lines); web/app.js loses the runtime branches, the warm-up and
 the prediction-over-JSON path (a CUDA result is built on the reader by
 `cudaPrediction`, as it always was); the dev panel no longer adopts a runtime's
@@ -4287,8 +4287,8 @@ af3-any-model environment the oracles and the AF2 map tools run in, which never
 depended on the worker. The worker is in git history (`cbf8c53`) if it is ever
 wanted back.
 
-**The gates.** `test:colab` is rewritten around `tools/colab_stub_worker.py`, a
-stand-in for cuda/worker.py that emits what the gate appends to a feed and holds
+**The gates.** `test:remote` is rewritten around `tools/stub_worker.py`, a
+stand-in for python/localfold/worker.py that emits what the gate appends to a feed and holds
 its fold until a result: health, one fold at a time, numbered and stamped events,
 the watermark, the live feed (1-3 ms), the mailbox cap, Stop, a worker dying
 mid-fold, the reader's page end to end (no backend choice, all 11 controls in
@@ -4297,7 +4297,7 @@ CUDA, and the token. Watched failing with the 429 removed and with the typed
 arrays flattened. `test:pending` takes the same stub as its fixture; its leg
 telling a quiet runtime PAGE from a dead runtime BROWSER went with the page, and
 its dev-panel leg asserts what is left - the reader records none of its own
-phases. `test:cuda`'s page lane starts the broker without the browser flags.
+phases. `test:native`'s page lane starts the broker without the browser flags.
 
 ## The CUDA backend featurises natively: no JavaScript on a fold (2026-10-08)
 
@@ -4306,7 +4306,7 @@ Every CUDA fold used to start with Node: each port's exporter (`cuda/af3/export-
 `cuda/resolve_templates.mjs` resolved the template rows - kept resident by `cuda/export_server.mjs`, because loading
 their modules was most of an export. All four are C++ now, in `cuda/featurise` (`af3-featurise`, `af2-featurise`,
 `ef2-featurise`, `resolve-templates` - one binary linked as each name, built by `cuda/build.sh` with g++ beside
-the ports: four compiles of the same headers were ~60 s of CPU here and twice that on a two-core Colab VM, one is 26 s), and `cuda/worker.py`
+the ports: four compiles of the same headers were ~60 s of CPU here and twice that on a two-core Colab VM, one is 26 s), and `python/localfold/worker.py`
 and the three `cuda/*/fold` scripts call them: **a job JSON goes in and a structure comes out with no JavaScript
 anywhere**, and a Colab runtime no longer installs Node.
 
@@ -4337,7 +4337,7 @@ Three things had to be exact for that, and each is worth knowing before touching
 AF2's nearest-centre search went to the card on a two-CPU runtime (`--nearest`, docs/AF2.md); the native search is
 eight residues a 64-bit word on a thread a recycle - an 8000-row, 255-residue alignment featurises in 0.50 s against
 Node's 0.77, byte-identical - so that round trip, `cuda/export_server.mjs` and the exporter's two-phase
-`--search-out`/`--assignments` path are removed. `npm run test:cuda` passes unchanged through the native path, the
+`--search-out`/`--assignments` path are removed. `npm run test:native` passes unchanged through the native path, the
 real reader's page included.
 
 🔴 **AND IT IS THE SAME BYTES ON COLAB.** A fresh T4 runtime (Ubuntu 24.04, g++ 13.3, CUDA 13) cloned the branch,
@@ -4357,7 +4357,7 @@ dialect where `--map=` named a file. AF2's walk is byte-identical to all ten map
 maps but where the value search had matched a coincidence (a zero or duplicate tensor under another name - values
 identical, or within 1e-21) and where a map's dialect flags were stale (none read by the binary); every family's
 6MRR + GOL + SEP fold through it is byte-identical to the map's but OpenDDE's, 0.010 A rms away at the same pLDDT and
-pTM - the walk reads the tensors the page's loader reads, which the search did not always. `test:cuda` now folds
+pTM - the walk reads the tensors the page's loader reads, which the search did not always. `test:native` now folds
 boltz2, intellifold2 and rosettafold3 too, so every family's walk is exercised there.
 
 ## 🔴 Each port is one binary: a job in, a structure out (2026-10-08)
@@ -4384,7 +4384,7 @@ live, so the page's status line now shows the search waiting (`MMseqs2 search ·
 weights through `cuda/featurise/fetch-weights`, the same code as the binaries. `cuda/fetch_bundles.py` is deleted -
 and with it the notebook's background prefetch, which downloaded `model-af3-int5`, a WebGPU bundle the CUDA port has
 not read since it moved to af3-any-model's blobs (and prefetching that blob instead would fetch DeepMind's weights
-before the page's terms dialog was accepted). `test:cuda` passes with a bundle moved aside and re-fetched by the
+before the page's terms dialog was accepted). `test:native` passes with a bundle moved aside and re-fetched by the
 worker mid-gate, byte-identical to the moved copy.
 
 ## 🔴 `localfold-af3`, `localfold-af2`, `localfold-ef2`; the language models in `cuda/plm` (2026-10-08)

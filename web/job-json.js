@@ -133,7 +133,7 @@ export function jobRequestJson({ name, seed, entities }) {
 
 /**
  * The job as AlphaFold 3's own open-source JSON, which is what run_alphafold.py
- * and the CUDA backend's exporters read (cuda/worker.py) - the server dialect's reader
+ * and the CUDA backend's exporters read (python/localfold/worker.py) - the server dialect's reader
  * there takes version 1 only, and this page writes 3.
  */
 export function jobInputJson({ name, seed, entities }) {

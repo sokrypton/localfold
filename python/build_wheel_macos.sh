@@ -46,6 +46,10 @@ for f in "$bin"/localfold-*; do   # (the binaries; metal-specs/ is data)
   if otool -L "$f" | tail -n +2 | grep -vE '^\s*/(System/Library|usr/lib)/'; then echo "$f links outside the system" >&2; exit 1; fi
   echo "$(basename "$f"): macOS $minos, $(du -m "$f" | cut -f1) MB"
 done
+# the website `localfold serve` serves: tools/build_site.py's dist/, the page as Pages publishes it
+python3 "$repo/tools/build_site.py" > /dev/null
+rm -rf "$here/localfold/site"; cp -R "$repo/dist" "$here/localfold/site"
+echo "site: $(find "$here/localfold/site" -type f | wc -l | tr -d ' ') files, $(du -sm "$here/localfold/site" | cut -f1) MB"
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 # (in a venv of its own: a Homebrew or system Python refuses a pip install outside one, PEP 668)
 "$py" -m venv "$work/venv"; py="$work/venv/bin/python"

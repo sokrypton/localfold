@@ -1,12 +1,12 @@
-"""The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:colab.
+"""The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:remote.
 
-    python3 tools/check-colab-bridge.py
+    python3 tools/check-remote-bridge.py
 
-NO GPU AND NO WEIGHTS. It starts tools/colab_backend.py with
-tools/colab_stub_worker.py standing in for cuda/worker.py - the stub emits what
+NO GPU AND NO WEIGHTS. It starts python/localfold/server.py with
+tools/stub_worker.py standing in for python/localfold/worker.py - the stub emits what
 this gate appends to its feed and holds its fold until it has sent a result -
 and drives every route from a reader's side, over plain HTTP and through a real
-reader's page (`index.html?backend=colab`) in a second browser. What it proves:
+reader's page (`index.html?backend=remote`) in a second browser. What it proves:
 
   * /health says what the card is (the driver's name) and that CUDA is offered;
   * one GPU, one fold - a second `fold` while one holds is refused 429, and the
@@ -25,11 +25,11 @@ reader's page (`index.html?backend=colab`) in a second browser. What it proves:
     page's screen, its prediction's typed arrays are typed arrays, and the
     reader did no model work of its own;
   * a reader that opens the page MID-FOLD attaches to it;
-  * a runtime started without `--cuda` says so on the badge and refuses Fold;
+  * a runtime started without `--native` says so on the badge and refuses Fold;
   * and no route answers anything without the token.
 
 🔴 WHAT IT CANNOT COVER is a fold: the model never runs here, and what the
-reader ingests is a structure this gate wrote down. `npm run test:cuda` folds
+reader ingests is a structure this gate wrote down. `npm run test:native` folds
 for real through the same broker and page.
 """
 import json
@@ -49,12 +49,12 @@ import cdp                                                   # noqa: E402
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 PORT = int(os.environ.get("BRIDGE_PORT", "8791"))
 READER_CDP_PORT = int(os.environ.get("BRIDGE_READER_CDP_PORT", "9392"))
-TOKEN = "check-colab-bridge-token"
+TOKEN = "check-remote-bridge-token"
 BASE = f"http://127.0.0.1:{PORT}"
 WORK = tempfile.mkdtemp(prefix="localfold-bridge-check-")
 FEED = os.path.join(WORK, "feed.jsonl")
 JOBS = os.path.join(WORK, "jobs.jsonl")
-STUB = os.path.join(REPO, "tools", "colab_stub_worker.py")
+STUB = os.path.join(REPO, "tools", "stub_worker.py")
 SEQUENCE = "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"
 
 bad = []
@@ -68,9 +68,9 @@ def tiny_pdb(shift=0.0):
 
 
 def cuda_result(pdb, status="AlphaFold 3 on CUDA (stub) · done"):
-    """A result in cuda/worker.py's own shape, which is what the page ingests."""
+    """A result in python/localfold/worker.py's own shape, which is what the page ingests."""
     n = 4
-    return {"cuda": True, "model": "cuda af3", "family": "af3", "pdb": pdb,
+    return {"native": "cuda", "model": "cuda af3", "family": "af3", "pdb": pdb,
             "confidence": {"plddt": [50.0] * n, "meanPlddt": 50.0, "ptm": 0.5,
                            "predictedAlignedError": [1.0] * (n * n), "contactProbs": [0.5] * (n * n)},
             "tokens": {"chainIds": ["A"] * n, "resIds": list(range(1, n + 1))},
@@ -124,10 +124,10 @@ def wait_for(kind, since, seconds=20):
 
 def start_broker(port, cuda=True, extra_env=None):
     proc = subprocess.Popen(
-        [sys.executable, "tools/colab_backend.py", "--port", str(port), "--token", TOKEN,
-         *(["--cuda"] if cuda else [])],
+        [sys.executable, "python/localfold/server.py", "--port", str(port), "--token", TOKEN,
+         *(["--native"] if cuda else [])],
         cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        env=dict(os.environ, LOCALFOLD_CUDA_WORKER=STUB, LOCALFOLD_STUB_FEED=FEED,
+        env=dict(os.environ, LOCALFOLD_WORKER=STUB, LOCALFOLD_STUB_FEED=FEED,
                  LOCALFOLD_STUB_JOBS=JOBS, **(extra_env or {})))
     deadline = time.time() + 60
     while time.time() < deadline:
@@ -148,8 +148,8 @@ def stop_broker(proc):
 
 
 def open_reader(ws, port=PORT):
-    ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=colab&t={TOKEN}")
-    cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.colab-said')", 120, "the reader's page")
+    ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/index.html?backend=remote&t={TOKEN}")
+    cdp.wait_for(ws, "!!window.__entityList && !!document.querySelector('.remote-said')", 120, "the reader's page")
     # 🔴 A FRESH PROFILE HAS ACCEPTED NO MODEL TERMS, and the dialog eats the click.
     cdp.evaluate(ws, """(() => {
       for (const key of ['alphafold3', 'openbind0', 'opendde', 'boltz2', 'protenix2', 'intellifold2', 'rosettafold3'])
@@ -165,14 +165,14 @@ try:
     # 1 · what the card is, and what is offered.
     code, health = call("/health")
     print(f"  /health: backends {health.get('backends')}, gpu {health.get('gpu')}, colabRuntime {health.get('colabRuntime')}")
-    if code != 200 or health.get("backends") != ["cuda"]:
+    if code != 200 or health.get("backends") != ["native"]:
         bad.append(f"/health answered {code} offering {health.get('backends')}, not ['cuda']")
     if health.get("gpu") != announced.get("gpu"):
         bad.append("/health and the BACKEND line name different cards")
 
     # 2 · one GPU, one fold; numbered, stamped events; the watermark.
     start = head().get("n", 0)
-    code, said = call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    code, said = call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
     if code != 200:
         bad.append(f"a fold was refused {code}: {said}")
     deadline = time.time() + 10
@@ -180,7 +180,7 @@ try:
         time.sleep(0.05)
     if len(jobs()) != 1:
         bad.append(f"the worker was handed {len(jobs())} job(s), not one")
-    code, busy = call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    code, busy = call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
     if code != 429:
         bad.append(f"a second fold while one holds answered {code}, not 429")
     if not head().get("folding"):
@@ -203,7 +203,7 @@ try:
         bad.append("the result did not lower the busy flag")
 
     # 3 · THE FEED IS LIVE: a held ask is answered when the worker speaks.
-    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
     time.sleep(0.5)
     n = head().get("n", 0)
     lags = []
@@ -224,7 +224,7 @@ try:
         bad.append(f"a held /down?wait= answered {max(lags):.2f} s after the worker spoke - the feed is not live")
 
     # 4 · what the broker drops is not dropped in silence.
-    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
     time.sleep(0.3)
     feed(*[("status", f"flood {i}") for i in range(4100)], ("result", cuda_result(tiny_pdb())))
     deadline = time.time() + 30
@@ -237,7 +237,7 @@ try:
 
     # 5 · Stop ends a held fold, and the next fold is a new worker; a dead worker ends its fold.
     n = head().get("n", 0)
-    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
     time.sleep(0.3)
     call("/in", {"op": "stop"})
     stopped, n, _ = wait_for("result", n)
@@ -245,7 +245,7 @@ try:
     if (stopped or {}).get("payload", {}).get("error") != "stopped" or head().get("folding"):
         bad.append("Stop did not end the held fold with 'stopped' and lower the flag")
     before = len(jobs())
-    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
     time.sleep(0.5)
     if len(jobs()) != before + 1:
         bad.append("the fold after a Stop never reached a worker")
@@ -276,9 +276,9 @@ try:
     open_reader(reader_ws)
     time.sleep(1.5)
     badge = cdp.evaluate(reader_ws, """(() => ({
-      said: document.querySelector('.colab-said')?.textContent ?? '',
-      select: !!document.querySelector('#colab-status select'),
-      live: !!document.querySelector('.colab-live input'),
+      said: document.querySelector('.remote-said')?.textContent ?? '',
+      select: !!document.querySelector('#remote-status select'),
+      live: !!document.querySelector('.remote-live input'),
     }))()""")
     print(f"  the badge: {badge}")
     if badge["select"]:
@@ -316,7 +316,7 @@ try:
         sent = asked.get("controls") or {}
         print(f"  the reader asked CUDA: {len(asked.get('entities') or [])} entity, {len(sent)} control(s),"
               f" model {asked.get('family')}, job {bool(asked.get('job'))}, frames {asked.get('frames')}")
-        if asked.get("backend") != "cuda":
+        if asked.get("backend") != "native":
             bad.append(f"the reader's fold went to backend {asked.get('backend')!r}, not cuda")
         # 🔴 EVERY CONTROL THE READER SET, NOT THE FIVE SOMEBODY LISTED - the allow-list trap.
         missing = {k: (v, sent.get(k)) for k, v in chosen.items() if sent.get(k) != v}
@@ -362,7 +362,7 @@ try:
         bad.append(f"the reader did model work of its own: {work['gpu']} adapter request(s), {work['shards'][:3]}")
 
     # 7 · a reader that opens the page MID-FOLD attaches to it.
-    call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}})
+    call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}})
     time.sleep(0.3)
     open_reader(reader_ws)
     attached = ""
@@ -383,15 +383,15 @@ try:
     # 8 · a runtime with no CUDA says so and refuses.
     bare, _ = start_broker(PORT + 2, cuda=False)
     try:
-        refused = call("/in", {"op": "fold", "payload": {"backend": "cuda", "job": "{}"}}, base=f"http://127.0.0.1:{PORT + 2}")
+        refused = call("/in", {"op": "fold", "payload": {"backend": "native", "job": "{}"}}, base=f"http://127.0.0.1:{PORT + 2}")
         open_reader(reader_ws, PORT + 2)
         time.sleep(4)
-        said = cdp.evaluate(reader_ws, "document.querySelector('.colab-said')?.textContent ?? ''")
-        live = cdp.evaluate(reader_ws, "!!document.querySelector('.colab-live')")
-        print(f"  no --cuda: fold {refused}, badge {said!r}, Live box {live}")
-        if refused[0] != 400 or "no CUDA backend" not in refused[1].get("error", ""):
+        said = cdp.evaluate(reader_ws, "document.querySelector('.remote-said')?.textContent ?? ''")
+        live = cdp.evaluate(reader_ws, "!!document.querySelector('.remote-live')")
+        print(f"  no --native: fold {refused}, badge {said!r}, Live box {live}")
+        if refused[0] != 400 or "no native backend" not in refused[1].get("error", ""):
             bad.append(f"a runtime with no CUDA answered a fold {refused}")
-        if "no CUDA backend" not in said or live:
+        if "no native backend" not in said or live:
             bad.append(f"a runtime with no CUDA reads {said!r} with a Live box {live}")
     finally:
         stop_broker(bare)
@@ -410,5 +410,5 @@ finally:
 print()
 for line in bad:
     print("FAIL: " + line)
-print("colab bridge: " + ("FAILED" if bad else "ok"))
+print("remote bridge: " + ("FAILED" if bad else "ok"))
 raise SystemExit(1 if bad else 0)

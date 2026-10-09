@@ -102,7 +102,7 @@ export const ESMFOLD2_SAMPLER_MODE = "diffusion";
  * the same at 11 and 45 (mean 1.42 A either way) and a phosphoserine is as good
  * or better (bond ratio 0.949/0.985 at 11, 1.007/0.986 at 45, control 1.00).
  * The cost is the sampler's: a warm 58-residue fold with a ligand 0.47 -> 0.93 s.
- * cuda/worker.py applies the same floor to a job it is handed.
+ * python/localfold/worker.py applies the same floor to a job it is handed.
  */
 export const ESMFOLD2_ATOMISED_STEPS = 64;
 

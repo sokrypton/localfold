@@ -141,6 +141,7 @@ cuda/featurise/*.building
 # the localfold wheel's build products (python/build_wheel.sh)
 python/dist/
 python/build/
+python/localfold/site/
 python/*.egg-info/
 
 # wwPDB's whole chemical component dictionary (cuda/featurise/fetch-weights ccd)

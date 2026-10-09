@@ -19,7 +19,7 @@ refusal is cheap; an answer that is wrong and confident is not.
 
 ## What is verified, and on what
 
-Everything below is a Colab **T4** through `tools/colab_backend.py --runtime
+Everything below is a Colab **T4** through `python/localfold/server.py --runtime
 node`, driven from the reader's side over HTTP.
 
 | | |
@@ -185,7 +185,7 @@ containing a model.
 
     colab new --session x --gpu T4
     # clone main, run the notebook's own SETUP, upload this branch's files
-    python3 tools/colab_backend.py --port 8710 --token T --runtime node
+    python3 python/localfold/server.py --port 8710 --token T --runtime node
     # then drive /in and /down from the reader's side; see the runs above
 
 `--runtime chrome` still works and is the fallback for a machine with no usable
@@ -254,10 +254,10 @@ runtime.
 
 🔴 **AND THE CONTROL SAYS WHICH HALF OF THIS IS THIS BRANCH'S. IT IS THE BIG
 HALF.** `git diff origin/main..dawn` over the Colab surface:
-`web/colab-bridge.js` is **IDENTICAL**, `foldOnBackend` in web/app.js is
+`web/remote-bridge.js` is **IDENTICAL**, `foldOnBackend` in web/app.js is
 **identical in the part that matters** - the same five-field request, the same
 `templates` parameter accepted and never forwarded - `tools/colab_runtime.mjs`
-is **new**, and `colab_backend.py` on main **has no `--runtime` flag at all**:
+is **new**, and `python/localfold/server.py` on main **has no `--runtime` flag at all**:
 chrome was the only path there. So:
 
 | | on `main` | on `dawn`, default `--runtime node` |
@@ -300,7 +300,7 @@ Same T4, same 58-mer, AF3 at 4 steps, the arms node refused:
 🔴 **AND THE SEARCH ARM TOOK TWO TRIES TO READ, BOTH TIMES THE PROBE'S FAULT.**
 First it was sent `msa: "mmseqs2"` and came back `unknown alignment mode` - the
 select's values are `none`, `search`, `paste`, `upload` and `mmseqs2` is the
-LABEL, which web/colab-bridge.js's own comment warns about one line above where
+LABEL, which web/remote-bridge.js's own comment warns about one line above where
 it sets the control. Then with `search` it folded and the status line read
 **"single sequence"** - which looked like the search being dropped and is
 `singleSequenceIfOnlyQuery` working correctly, because the 58-mer under test was
@@ -322,7 +322,7 @@ derived from one of them.
 
 🔴 **AND A PROBE THAT SENT `msa: "mmseqs2"` GOT `unknown alignment mode` AND
 THAT WAS THE PROBE.** The select's values are `none`, `search`, `paste`,
-`upload`; `mmseqs2` is the LABEL. web/colab-bridge.js's own comment warns that
+`upload`; `mmseqs2` is the LABEL. web/remote-bridge.js's own comment warns that
 a select silently refuses a value it has no option for, one line above where it
 sets this one.
 

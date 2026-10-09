@@ -1184,12 +1184,12 @@
    in web/app.js. */
 
 /* WHERE FOLD RUNS, AND WHETHER IT IS STILL THERE.
-   Only ever on a page opened from the notebook's link (?backend=colab), and
-   built by web/colab-bridge.js rather than marked up, so a page that folds in
+   Only ever on a page opened from the notebook's link (?backend=remote), and
+   built by web/remote-bridge.js rather than marked up, so a page that folds in
    this browser carries nothing of it. The dot is the pulse: green while the
    runtime page is collecting its commands, amber once it has stopped - which
    is the same twenty seconds after which a fold in flight gives up. */
-.colab-status {
+.remote-status {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -1201,31 +1201,31 @@
   color: #374151;
   white-space: nowrap;
 }
-.colab-dot {
+.remote-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #9ca3af;
   flex: 0 0 auto;
 }
-.colab-status[data-state="live"] .colab-dot { background: #22c55e; }
-.colab-status[data-state="gone"] .colab-dot { background: #f59e0b; }
-.colab-status[data-state="gone"] { border-color: #fcd34d; background: #fffbeb; }
+.remote-status[data-state="live"] .remote-dot { background: #22c55e; }
+.remote-status[data-state="gone"] .remote-dot { background: #f59e0b; }
+.remote-status[data-state="gone"] { border-color: #fcd34d; background: #fffbeb; }
 
 /* ...and it sits BETWEEN the title and the actions, in a slot of its own: the
    head is `space-between`, so a third child would push Fold and Add entity
    out of the place a reader has already learnt. The slot takes the leftover
    width and centres the badge in it, and gives it up entirely when the head
    wraps on a narrow screen. */
-.colab-live { display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
-.colab-live input { margin: 0; }
+.remote-live { display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
+.remote-live input { margin: 0; }
 
-.colab-status-slot {
+.remote-status-slot {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
   justify-content: center;
 }
 @media (max-width: 948px) {
-  .colab-status-slot { flex: 1 1 100%; justify-content: flex-start; }
+  .remote-status-slot { flex: 1 1 100%; justify-content: flex-start; }
 }

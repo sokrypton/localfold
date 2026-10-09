@@ -1,11 +1,11 @@
-"""A stand-in for cuda/worker.py that a gate drives, so the Colab broker and the reader's page are tested with no card.
+"""A stand-in for python/localfold/worker.py that a gate drives, so the broker (python/localfold/server.py) and the reader's page are tested with no card.
 
-    LOCALFOLD_CUDA_WORKER=tools/colab_stub_worker.py \
+    LOCALFOLD_WORKER=tools/stub_worker.py \
     LOCALFOLD_STUB_FEED=/tmp/feed.jsonl LOCALFOLD_STUB_JOBS=/tmp/jobs.jsonl \
-        python3 tools/colab_backend.py --cuda ...
+        python3 python/localfold/server.py --native ...
 
 It speaks the worker's protocol - one job a line on stdin, one bridge event a
-line on stdout, `cuda-ready` first - and decides nothing itself:
+line on stdout, `ready` first - and decides nothing itself:
 
   * every job it is handed is appended to `LOCALFOLD_STUB_JOBS`, which is how a
     gate reads what the reader's Fold actually sent;
@@ -15,7 +15,7 @@ line on stdout, `cuda-ready` first - and decides nothing itself:
   * a line `{"kind": "__exit"}` makes it exit mid-fold, which is how a gate asks
     what the broker does with a worker that dies.
 
-Used by tools/check-colab-bridge.py and tools/check-model-pending.py.
+Used by tools/check-remote-bridge.py and tools/check-model-pending.py.
 """
 import json
 import os
@@ -30,7 +30,7 @@ def say(kind, payload):
 def main():
     feed = os.environ["LOCALFOLD_STUB_FEED"]
     jobs = os.environ.get("LOCALFOLD_STUB_JOBS")
-    say("cuda-ready", {})
+    say("ready", {})
     for line in sys.stdin:
         if not line.strip():
             continue

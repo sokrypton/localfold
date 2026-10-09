@@ -36,6 +36,10 @@ for f in "$bin"/localfold-*; do
   if readelf -d "$f" | grep NEEDED | grep -q cupti; then echo "$f links CUPTI" >&2; exit 1; fi
   echo "$(basename "$f"): glibc $glibc, $(du -m "$f" | cut -f1) MB"
 done
+# the website `localfold serve` serves: tools/build_site.py's dist/, the page as Pages publishes it
+python3 "$repo/tools/build_site.py" > /dev/null
+rm -rf "$here/localfold/site"; cp -R "$repo/dist" "$here/localfold/site"
+echo "site: $(find "$here/localfold/site" -type f | wc -l | tr -d ' ') files, $(du -sm "$here/localfold/site" | cut -f1) MB"
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 "$py" -m pip wheel --no-deps -w "$work" "$here"
 "$py" -m pip install -q "wheel>=0.40"

@@ -124,7 +124,7 @@ Downloaded once into `model/`, `model-multimer/` and `model-{mono,multi}-<N>-del
 
 ### On Colab and the website
 
-The website's Colab backend folds with this binary: `cuda/worker.py` keeps the model resident (`localfold-af2 - --serve=<dir>`)
+The website's Colab backend folds with this binary: `python/localfold/worker.py` keeps the model resident (`localfold-af2 - --serve=<dir>`)
 and streams every pass to the page. See docs/WEB.md.
 
 
@@ -297,9 +297,9 @@ the first-centre tie of the host loop, integers both ways). The exporter plans a
 (`--search-out`), the AF2 server assigns them, and the exporter finishes from the assignments (`--assignments`), its
 plan held between the two requests by cuda/export_server.mjs's one process. Byte-identical; through a warm
 exporter on two CPUs 5CAJ 0.99 -> 0.82-0.92 s and 1TIM 1.04 -> 0.92-0.99, and with thirty cores ~20 ms slower (the
-round trips), which is why cuda/worker.py takes it only below as many cores as recycles
+round trips), which is why python/localfold/worker.py takes it only below as many cores as recycles
 (`sched_getaffinity`, so a VM's or a `taskset`'s limit counts). A shallow alignment never takes it. Exercised end to
-end by the gate's searched AF2 case on two CPUs (`taskset -c 0,1 python3 tools/check-cuda-worker.py --no-page`).
+end by the gate's searched AF2 case on two CPUs (`taskset -c 0,1 python3 tools/check-native-worker.py --no-page`).
 
 ## Memory
 
@@ -373,7 +373,7 @@ gated add). It now runs cuda/af3's fused kernels (src/fusedtriangle.cuh: `triInK
 their raw-pointer launchers, with a BIAS option those kernels gained (AF3's own instantiations unchanged,
 byte-identical folds) and the weights re-laid once (AF3 interleaves a and b's columns where AF2 stores the
 halves one after the other: `interleaveTriK`). a and b in f16 and the product in f32, as AF2's path had
-them. 262 tokens with 512 alignment rows: 1.80 -> 1.71 s on an A100; every `test:cuda` AF2 case at its
+them. 262 tokens with 512 alignment rows: 1.80 -> 1.71 s on an A100; every `test:native` AF2 case at its
 previous RMSD. The template stack's 64-channel triangle keeps the unfused path.
 
 ...and the pair stacks' transition (128 channels) on cuda/af3's fused transition, in a ReLU-with-bias form
@@ -417,7 +417,7 @@ On a card short of room (`shortPair`) AlphaFold 2 takes cuda/af3's approach - ea
 it alone used, and what is read once is taken in chunks of rows rather than held whole - and the levers
 that cost time engage only when the whole form would not fit with an eighth of the card to spare
 (`roomFor`). A fold that fits runs exactly as before (6MRR byte-identical); `LOCALFOLD_BIG=1` forces every
-path at any size, and the whole of `tools/check-cuda-worker.py` passes under it.
+path at any size, and the whole of `tools/check-native-worker.py` passes under it.
 
 - **the recycled pair re-embedded in place**: every term of a row (the outer sum, the previous positions'
   distogram, the LayerNorm'd old row, the relative encoding) reads only that row, so no second pair.

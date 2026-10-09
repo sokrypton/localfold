@@ -79,8 +79,8 @@ import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
-import { colabRole, installColabBridge, remoteBackendChoice, remoteCommand, remoteLiveChoice,
-  remoteEvents, remoteHead } from "./colab-bridge.js";
+import { remoteRole, installRemoteBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
+  remoteLiveChoice, remoteEvents, remoteHead } from "./remote-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -126,7 +126,7 @@ function foldStem(fallback) {
 window.__entityList = entityList;
 
 // 🔴 AND THE FINISHED PREDICTION, FOR THE SAME REASON: a gate driving this page
-// (tools/check-cuda-worker.py, tools/check-model-pending.py) reads what the page
+// (tools/check-native-worker.py, tools/check-model-pending.py) reads what the page
 // holds rather than what its download button writes. `lastPrediction` is a
 // module binding; a function rather than the value because it is REASSIGNED on
 // every fold and a captured reference would hand back the one before.
@@ -1023,7 +1023,7 @@ function status(text, isError = false) {
   // the runtime's phases against this browser's clock and file them under this
   // browser's (empty) device - the rows that arrive as `dev` events are the
   // real ones, taken where the work happened.
-  if (colabRole() !== "reader") devStatus(text);
+  if (remoteRole() !== "reader") devStatus(text);
   if (node === null) return;
   node.textContent = text;
   node.classList.toggle("error", isError);
@@ -3891,22 +3891,22 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
  * WHERE THIS FOLD HAPPENS, AND HOW TO ASK.
  *
  * 🔴 THE PAGE IS SERVED BY THE THING THAT FOLDS, so this is SAME-ORIGIN and
- * there is no CORS question at all: `notebooks/localfold.ipynb` runs
- * tools/colab_backend.py on the runtime, that server serves this checkout,
- * and the link that cell prints opens index.html on it. `?backend=colab` is
- * the cell saying which of the two machines should do the work, and `t` is
+ * there is no CORS question at all: python/localfold/server.py - `localfold serve`
+ * on the reader's own machine, or the Colab notebook's cell on a runtime - serves
+ * this page, and the link it prints opens index.html on it. `?backend=remote` is
+ * the server saying which of the two should do the work, and `t` is
  * the token that server requires of every request - it is in the URL because
  * a page cannot be handed a header by whoever framed it.
  *
- * THE SAME SERVER KEEPS ONE WORKER, cuda/worker.py, and that is what folds:
- * this page posts the job, the worker's events come back through
- * web/colab-bridge.js, and this page draws them.
+ * THE SAME SERVER KEEPS ONE WORKER, python/localfold/worker.py, and that is what
+ * folds - with metal/ on a Mac, cuda/ on an NVIDIA card: this page posts the job,
+ * the worker's events come back through web/remote-bridge.js, and this page draws them.
  *
  * Absent the parameter this returns null and nothing anywhere changes: the
  * website folds where it always did, in the reader's own browser.
  */
 function remoteBackend() {
-  return colabRole() === "reader" ? {} : null;
+  return remoteRole() === "reader" ? {} : null;
 }
 
 /**
@@ -3945,7 +3945,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // 🔴 EVERY REMOTE FOLD IS A CUDA FOLD (remoteBackendChoice), HANDED THE JOB AS
   // AlphaFold 3 JSON, written by the same module that writes the archive's
   // request - so the entity conversion is this page's and not re-implemented
-  // in Python. See cuda/worker.py.
+  // in Python. See python/localfold/worker.py.
   request.backend = remoteBackendChoice();
   // ...and the sampler this page would fold with (samplerPlan): the steps as well as the start, because an
   // empty dial is the family's preferred count here and would be the model's own default there
@@ -3978,7 +3978,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
           paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index) ?? "") }
       : { merged: uploadedMsas?.merged ?? uploadedA3m };
   }
-  status(`${label} · folding on the runtime with CUDA…`);
+  status(`${label} · folding on the runtime with ${remoteBackendName()}…`);
   progress("waiting");
   // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
   // every event of the session, so a reader that started at zero would replay
@@ -4012,7 +4012,7 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
 async function followRemoteFold({ since, label, signal }) {
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
   // 🔴 A REMOTE FOLD'S INTERMEDIATE CONTACT MAPS, AS A LOCAL ONE SHOWS THEM. The CUDA backend streams
-  // each trunk pass's map (cuda/worker.py, `contacts`: a byte a pair); before the sampler has a
+  // each trunk pass's map (python/localfold/worker.py, `contacts`: a byte a pair); before the sampler has a
   // frame it goes to the panel as the local trunk's does, and every frame after it carries the latest.
   let liveContact;
   const draw = remoteFrameDrawer(stem, () => (liveContact === undefined ? undefined : { contact: liveContact }));
@@ -4116,14 +4116,17 @@ async function followRemoteFold({ since, label, signal }) {
       && !result.error.includes(result.status) ? `${result.error} · ${result.status}` : result.error);
   }
 
-  // 🔴 A CUDA FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
+  // 🔴 A NATIVE FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
   // PREDICTION - there is no copy of this page on the other side to build one.
   // So it is built here, in the shape the AF3 path records (typed arrays, a
   // token layout, the context the archive and the session read), and it goes
   // through the same doors: loadIntoViewer for the picture, recordPrediction
   // for the downloads, the scores card and the saved session.
-  if (result.cuda !== true) throw new Error("the runtime answered with something that is not a CUDA fold");
-  const cuda = cudaPrediction(result, stem, label);
+  // (an older worker marked it `cuda: true`; this one says which native port folded it)
+  if (result.native === undefined && result.cuda !== true) {
+    throw new Error("the runtime answered with something that is not a native fold");
+  }
+  const cuda = nativePrediction(result, stem, label);
 
   // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
   // fills the sequence strip, the download buttons and the scores card - the
@@ -4181,15 +4184,15 @@ async function followRemoteFold({ since, label, signal }) {
 }
 
 /**
- * A CUDA fold's result as this page's own prediction.
+ * A native fold's result as this page's own prediction.
  *
- * The worker (cuda/worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
+ * The worker (python/localfold/worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
  * contact probabilities, its token layout and the alignment it used; the rest
  * - the entities, the settings, the form - is this page's, taken now, because
  * the reader's form is what asked for this fold.
  */
-function cudaPrediction(result, stem, label) {
-  const backend = "CUDA";
+function nativePrediction(result, stem, label) {
+  const backend = result.native === "metal" ? "Metal" : "CUDA";
   const floats = (values) => (values == null ? undefined : Float32Array.from(values));
   const given = result.confidence ?? {};
   const confidence = {
@@ -4256,7 +4259,7 @@ function cudaPrediction(result, stem, label) {
  * one runs is refused by the broker with its own words.
  */
 async function attachToRunningFold() {
-  if (colabRole() !== "reader") return;
+  if (remoteRole() !== "reader") return;
   try {
     const head = await remoteHead();
     if (!head.folding) return;
@@ -6465,11 +6468,11 @@ document.addEventListener("visibilitychange", () => {
 void offerSession();
 
 /**
- * 🔴 AND ON A READER'S PAGE (`?backend=colab`) THE BADGE that says where Fold
- * runs and offers the way back. Off Colab `installColabBridge` returns
- * immediately and nothing here runs. See web/colab-bridge.js.
+ * 🔴 AND ON A READER'S PAGE (`?backend=remote`) THE BADGE that says where Fold
+ * runs and offers the way back. Otherwise `installRemoteBridge` returns
+ * immediately and nothing here runs. See web/remote-bridge.js.
  */
-installColabBridge();
+installRemoteBridge();
 // ...and if one is already under way on the runtime, follow it from here.
 void attachToRunningFold();
 
@@ -6482,7 +6485,7 @@ syncDownloads();
 document.addEventListener("py2dmol-frame-change", syncDownloads);
 
 // 🔴 THE BRIDGE SAYS WHEN THE RUNTIME HAS BEEN STOPPED, on an event rather
-// than by calling in: web/colab-bridge.js is imported BY this file, so a call
+// than by calling in: web/remote-bridge.js is imported BY this file, so a call
 // the other way would be a cycle. One listener, and the page is a viewer.
 document.addEventListener("localfold-runtime-stopped", (event) => {
   retireFolding(event.detail?.why ?? "the fold service has been stopped");

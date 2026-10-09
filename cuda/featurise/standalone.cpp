@@ -264,7 +264,7 @@ static int ef2(Run& run, int (*fold)(int, char**), const char* argv0) {
   if (!warm.empty()) foldArgs.push_back("--warm=" + warm);
   for (auto& f : run.foldFlags()) foldArgs.push_back(f);
   // 🔴 THE PAGE'S FLOOR FOR PER-ATOM TOKENS: a ligand or a modified residue is torn at the checkpoint's 15 scheduled
-  // steps (11 run) and whole at 64 (web/esmfold2-model.js ESMFOLD2_ATOMISED_STEPS; cuda/worker.py applies it too)
+  // steps (11 run) and whole at 64 (web/esmfold2-model.js ESMFOLD2_ATOMISED_STEPS; python/localfold/worker.py applies it too)
   if (run.args.option("steps").empty()) {
     bool atomised = !run.args.option("ligands").empty() || !run.args.option("smiles").empty() || !run.args.option("modify").empty();
     if (!run.args.option("job").empty()) {

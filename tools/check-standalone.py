@@ -4,7 +4,7 @@
     python3 tools/check-standalone.py [--network]
 
 🔴 ONE PROCESS MUST FOLD WHAT TWO DID. The standalone mode (cuda/featurise/standalone.h) fetches the weights,
-featurises in its own process on a thread and folds; the resident server cuda/worker.py drives still takes the
+featurises in its own process on a thread and folds; the resident server python/localfold/worker.py drives still takes the
 featuriser binary's directory. Each case runs both ways - `cuda/featurise/<port>-featurise <dir> ...` then
 `cuda/<port>/localfold-<port> <dir> ...`, and the standalone command - and holds the two PDBs to the SAME BYTES, so a flag the
 standalone mode drops or misroutes (an input flag reaching the fold, af2's --recycles reaching only one of the
