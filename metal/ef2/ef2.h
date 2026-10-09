@@ -62,7 +62,8 @@ struct Denoiser {
   int T, A, Cz, Ct, heads, tokenBlocks, Si, atomBlocks;
   float sigma;
   Atoms atoms;
-  std::vector<half*> biases;       // a token block's pair bias, [H, T, T]
+  std::vector<half*> biases;       // a token block's pair bias, [H][T][stride] in log2 units
+  int stride;
   const float* sInputs;
   float* single; float* snScaled; float* G; float* scales; float* level;
   int entries;

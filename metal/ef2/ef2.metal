@@ -371,11 +371,12 @@ kernel void ef2_bias_softmax(constant BiasSoftmaxArgs& a [[buffer(0)]], uint3 tg
   float inv = 1.f / tot;
   for (uint j = tid; j < a.T; j += 256) s[j] *= inv;
 }
-kernel void ef2_pair_to_heads(LF_ARGS(PairToHeadsArgs)) {    // [P, H] -> [H, P]
+// [T * T, H] -> the attention's bias [H][T][stride] in log2 units (the stride padded even, its pad zero)
+kernel void ef2_pair_to_heads(LF_ARGS(PairToHeadsArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.P * a.H) return;
-  uint p = lf_udiv((uint)t, a.H), h = (uint)t - p * a.H;
-  a.out[(ulong)h * a.P + p] = (half)a.pb[t];
+  uint p = lf_udiv((uint)t, a.H), h = (uint)t - p * a.H, i = lf_udiv(p, a.T), j = p - i * a.T;
+  a.out[((ulong)h * a.T + i) * a.stride + j] = (half)(a.pb[t] * M_LOG2E_F);
 }
 kernel void ef2_gather_tokens(LF_ARGS(GatherTokensArgs)) {
   uint t = (uint)LF_INDEX;

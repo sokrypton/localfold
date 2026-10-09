@@ -49,6 +49,7 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
   for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
   // each token block's pair bias, [H, T, T] in half (the pair itself is not kept)
   half* pn = scratch<half>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
+  d.stride = (T + 7) / 8 * 8;
   for (int b = 0; b < d.tokenBlocks; ++b) {
     std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
     for (size_t p0 = 0; p0 < P; p0 += chunk) {
@@ -56,8 +57,8 @@ Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sInputs) {
       layerNorm(pair + p0 * Cz, pn, n, Cz, F(B + "pairNormScale"), F(B + "pairNormOffset"));
       lin(pn, "f/" + B + "pairBiasWeights", pb + p0 * d.heads, n, Cz, d.heads);
     }
-    half* h = allocT<half>(P * d.heads);
-    run1d("ef2_pair_to_heads", P * d.heads, PairToHeadsArgs{pb, h, P, (uint)d.heads, 0});
+    half* h = allocT<half>((size_t)d.heads * T * d.stride);
+    run1d("ef2_pair_to_heads", P * d.heads, PairToHeadsArgs{pb, h, P, (uint)d.heads, (uint)T, (uint)d.stride, 0});
     d.biases.push_back(h);
   }
   releaseScratch({"dc.joined", "dc.jn", "dc.pair", "dc.pn", "dc.pb", "dtr."});
@@ -111,12 +112,6 @@ static const half* qkvgWeight(int b, int C) {
     copy2d(w + 3 * C, 4 * C * 2, Fh(B + "gateWeights"), C * 2, C * 2, C);
   });
 }
-static const float* qkvgBias(int b, int C) {
-  return M.derived<float>("ef2.qkvgb." + std::to_string(b), (size_t)4 * C, [&](float* w) {
-    fill(w, 0, (size_t)4 * C * 4);
-    copy(w, F("diffusion/tokenBlocks/" + std::to_string(b) + "/attention/queryBias"), (size_t)C * 4);
-  });
-}
 
 static void conditioningSingle(const Denoiser& d) {
   int T = d.T, Ct = d.Ct;
@@ -156,25 +151,18 @@ static void tokenBlock(const Denoiser& d, float* a, int b) {
   std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/";
   half* x = scratch<half>("tb.x", (size_t)T * C);
   adaLN(d, a, x, 4 * b, B + "attention/adaln/");
-  float* qkvg = scratch<float>("tb.qkvg", (size_t)T * 4 * C);
+  // q | k | v | gate in one GEMM (half, the attention's layout), then the flash kernel: the query bias, QK^T, the pair
+  // bias, the softmax, PV and the gate - no [H, T, T] scores
+  half* qkvg = scratch<half>("tb.qkvg", (size_t)T * 4 * C);
   {
-    Gemm g{}; g.X = x; g.tx = F16; g.W = qkvgWeight(b, C); g.tw = F16; g.Y = qkvg; g.rows = T; g.in = C; g.out = 4 * C;
-    g.bias = qkvgBias(b, C); g.label = "token qkvg";
+    Gemm g{}; g.X = x; g.tx = F16; g.W = qkvgWeight(b, C); g.tw = F16; g.Y = qkvg; g.ty = F16; g.rows = T; g.in = C; g.out = 4 * C;
+    g.accFloat = true; g.label = "token qkvg";
     gemm(g);
   }
-  float* S = scratch<float>("tb.scores", (size_t)Hh * T * T); float* ctx = scratch<float>("tb.ctx", (size_t)T * C);
-  {
-    Gemm g{}; g.X = qkvg; g.ldx = 4 * C; g.sx = D; g.W = qkvg + C; g.transW = true; g.ldw = 4 * C; g.sw = D; g.half = true;
-    g.Y = S; g.ldy = T; g.sy = (int64_t)T * T; g.rows = T; g.in = D; g.out = T; g.batch = Hh; g.label = "token scores";
-    gemm(g);
-  }
-  run("ef2_bias_softmax", grid1d((size_t)Hh * T, 1), 256, BiasSoftmaxArgs{S, d.biases[b], (uint)T, 1.f / sqrtf((float)D)});
-  {
-    Gemm g{}; g.X = S; g.ldx = T; g.sx = (int64_t)T * T; g.W = qkvg + 2 * C; g.ldw = 4 * C; g.sw = D; g.half = true;
-    g.Y = ctx; g.ldy = C; g.sy = D; g.rows = T; g.in = T; g.out = D; g.batch = Hh; g.label = "token context";
-    gemm(g);
-  }
-  run1d("ef2_sigmoid_mul", (size_t)T * C, SigmoidMulArgs{ctx, qkvg + 3 * C, nullptr, (uint)T, (uint)C, (uint)(4 * C), 0});
+  half* ctx = scratch<half>("tb.ctx", (size_t)T * C);
+  Attention at{}; at.qkvg = qkvg; at.out = ctx; at.n = T; at.heads = Hh; at.D = D; at.rows = 1; at.scale = 1.f / sqrtf((float)D);
+  at.bias = d.biases[b]; at.biasStride = d.stride; at.qBias = F(B + "attention/queryBias");
+  attention(at);
   float* o = scratch<float>("tb.o", (size_t)T * C);
   lin(ctx, "f/" + B + "attention/outWeights", o, T, C, C);
   run1d("ef2_sigmoid_mul", (size_t)T * C,

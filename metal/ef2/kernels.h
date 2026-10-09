@@ -47,7 +47,7 @@ struct AdaCombineArgs { CP(float) an; CP(float) g; CP(float) gb; CP(float) sh; D
 struct SigmoidMulArgs { DP(float) x; CP(float) g; CP(float) gb; uint T, C, ld, pad; };
 struct ScaleCopiesArgs { CP(float) x; CP(float) scales; DP(float) out; uint rows, C, n, pad; };
 struct BiasSoftmaxArgs { DP(float) S; CP(half) bias; uint T; float scale; };
-struct PairToHeadsArgs { CP(float) pb; DP(half) out; u64 P; uint H, pad; };
+struct PairToHeadsArgs { CP(float) pb; DP(half) out; u64 P; uint H, T, stride, pad; };
 struct GatherTokensArgs { CP(float) perToken; CP(int) atomToToken; CP(float) mask; DP(float) q; uint A, C; };
 struct EdmArgs { CP(float) xNoisy; CP(float) r; DP(float) out; CP(float) level; uint n, pad; };
 
