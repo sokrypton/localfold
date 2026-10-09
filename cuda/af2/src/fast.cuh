@@ -185,6 +185,83 @@ inline void layerNormH(const float* x, half* y, size_t rows, int C, const std::s
   else if (C == 256) layerNormVK<256><<<grid, 256, 0, STREAM>>>(x, y, rows, sc, of);
   else layerNormTK<half><<<grid, 256, 0, STREAM>>>(x, y, rows, C, sc, of);
 }
+// LN(x) W + b in one kernel (the LN'd rows never written): R = 16 WARPS MT rows a block LayerNorm'd into shared
+// memory and held as A fragments, W (tileColumns' 16-column tiles) streamed through two stages; columns [0, split) to
+// out0 (rows of split), the rest to out1 (rows of N - split) - the outer product mean's left and right projections in
+// one pass over the MSA
+template <int C, int WARPS, int MT>
+__global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ x, size_t rows, const float* __restrict__ lnS,
+    const float* __restrict__ lnO, const half* __restrict__ Wt, const float* __restrict__ bias, int N, int split,
+    half* __restrict__ out0, half* __restrict__ out1) {
+  constexpr int NC = 16, R = 16 * WARPS * MT, LDX = C + 8, KS = C / 16, NTH = 32 * WARPS;
+  constexpr size_t STAGE = (size_t)C * NC * 2;
+  static_assert(2 * STAGE <= (size_t)R * LDX * 2, "the stages fit in the rows' memory");
+  extern __shared__ __align__(16) unsigned char smem[];
+  half* Xs = (half*)smem;
+  auto Ws = [&](int st) { return (half*)(smem + st * STAGE); };
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  const size_t row0 = (size_t)blockIdx.x * R;
+  lnRowsToShared<C, R, WARPS, float>(x, [&](int r) { size_t row = row0 + r; return row < rows ? row : SIZE_MAX; },
+                                     lnS, lnO, Xs, LDX, warp, lane);
+  __syncthreads();
+  uint32_t xa[MT][KS][4];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) ldsm4(xa[mt][ks], Xs + ((warp * MT + mt) * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+  __syncthreads();                                   // every warp has its fragments: the stages take the rows' memory
+  constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
+  auto issue = [&](int n, int st) {
+    half* w = Ws(st);
+#pragma unroll
+    for (int it = 0; it < ITER; ++it) {
+      const int t = it * NTH + (int)threadIdx.x;
+      if ((C * (NC / 8)) % NTH != 0 && t >= C * (NC / 8)) break;
+      int k = t / (NC / 8), c = (t % (NC / 8)) * 8;
+      cpAsync16(w + stageSw<NC>(k, c), Wt + ((size_t)n * C + k) * NC + c, true);
+    }
+    cpCommit();
+  };
+  const int tiles = N / NC;
+  issue(0, 0);
+  for (int n = 0; n < tiles; ++n) {
+    int st = n & 1;
+    if (n + 1 < tiles) { issue(n + 1, st ^ 1); cpWait<1>(); }
+    else cpWait<0>();
+    __syncthreads();
+    const half* w = Ws(st);
+    float acc[MT][2][4] = {};
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {
+      uint32_t f[4];
+      ldsm4t(f, w + stageSw<NC>(ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (lane >> 4) * 8));
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) { mma16816(acc[mt][0], xa[mt][ks], f[0], f[1]); mma16816(acc[mt][1], xa[mt][ks], f[2], f[3]); }
+    }
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        int col = n * NC + nt * 8 + tig * 2;
+        float b0 = bias ? bias[col] : 0.f, b1 = bias ? bias[col + 1] : 0.f;
+        half* o = col < split ? out0 + col : out1 + (col - split);
+        int ld = col < split ? split : N - split;
+        size_t ra = row0 + (warp * MT + mt) * 16 + g, rb = ra + 8;
+        if (ra < rows) *reinterpret_cast<half2*>(o + ra * ld) = __floats2half2_rn(acc[mt][nt][0] + b0, acc[mt][nt][1] + b1);
+        if (rb < rows) *reinterpret_cast<half2*>(o + rb * ld) = __floats2half2_rn(acc[mt][nt][2] + b0, acc[mt][nt][3] + b1);
+      }
+    __syncthreads();                                 // (the stage this read is the next issue's)
+  }
+}
+template <int C>
+inline void lnGemm(const float* x, size_t rows, const float* lnS, const float* lnO, const half* Wt, const float* bias, int N,
+                   int split, half* out0, half* out1) {
+  constexpr int WARPS = 4, MT = 2, R = 16 * WARPS * MT;
+  constexpr size_t smem = (size_t)R * (C + 8) * 2;
+  static bool attr = false;
+  if (!attr) { smemAttr((lnGemmK<C, WARPS, MT>), (int)smem); attr = true; }
+  lnGemmK<C, WARPS, MT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1);
+}
 // out [rows] of a [Bt, n, ...] attention -> y[...] += out transposed back ([n, Bt] -> [Bt, n])
 __global__ void swapAddK(float* y, const float* x, int A, int B, int C) {     // y[b][a] += x[a][b]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

@@ -389,9 +389,9 @@ inline void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa,
       }
       bias = b;
     }
+    bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
     half* xn = scratch<half>("frow.xn", rows * C);
     layerNormH(msa, xn, rows, C, R + "/query_norm", blk);
-    bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
     attentionCore(xn, rowsN, L, C, R + "/attention", blk, ones ? nullptr : msaMask, bias, msa, false);
     return;
   }
@@ -532,11 +532,28 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
   if (FAST) {
-    half* xn = scratch<half>("fopm.xn", rows * C);
-    layerNormH(msa, xn, rows, C, Op + "/layer_norm_input", blk);
     half* lt = scratch<half>("fopm.left", rows * O); half* rt = scratch<half>("fopm.right", rows * O);
-    ltGemm(xn, PH(Op + "/left_projection/weights", blk), lt, true, rows, C, O, P(Op + "/left_projection/bias", blk), false, 0.f);
-    ltGemm(xn, PH(Op + "/right_projection/weights", blk), rt, true, rows, C, O, P(Op + "/right_projection/bias", blk), false, 0.f);
+    static const bool lnFused = !getenv("LOCALFOLD_LNGEMM") || atoi(getenv("LOCALFOLD_LNGEMM"));
+    if (lnFused && (C == 256 || C == 64)) {
+      // the LayerNorm and both projections in one pass over the MSA (lnGemm): the LN'd MSA never written, read twice -
+      // 5CAJ with its 7,907-row alignment 1382 -> 1354 ms of GPU a fold, 0.014 A. (The same kernel for the row
+      // attention's q/k/v/gate, 1024 columns, loses - 130 ms against the LN's 31 and cuBLAS's 80: its two-tile warps
+      // reach ~100 TFLOP/s where cuBLAS reaches 167, the transition's note below found the same)
+      half* wt = scratch<half>("fopm.wt", (size_t)C * 2 * O);
+      tileColumns(PH(Op + "/left_projection/weights", blk), C, O, 0, O, 16, wt);
+      tileColumns(PH(Op + "/right_projection/weights", blk), C, O, 0, O, 16, wt + (size_t)C * O);
+      float* bb = scratch<float>("fopm.bias", 2 * O);
+      CK(cudaMemcpyAsync(bb, P(Op + "/left_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
+      CK(cudaMemcpyAsync(bb + O, P(Op + "/right_projection/bias", blk), O * 4, cudaMemcpyDeviceToDevice, STREAM));
+      const float *s0 = P(Op + "/layer_norm_input/scale", blk), *o0 = P(Op + "/layer_norm_input/offset", blk);
+      if (C == 256) lnGemm<256>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+      else lnGemm<64>(msa, rows, s0, o0, wt, bb, 2 * O, O, lt, rt);
+    } else {
+      half* xn = scratch<half>("fopm.xn", rows * C);
+      layerNormH(msa, xn, rows, C, Op + "/layer_norm_input", blk);
+      ltGemm(xn, PH(Op + "/left_projection/weights", blk), lt, true, rows, C, O, P(Op + "/left_projection/bias", blk), false, 0.f);
+      ltGemm(xn, PH(Op + "/right_projection/weights", blk), rt, true, rows, C, O, P(Op + "/right_projection/bias", blk), false, 0.f);
+    }
     bool ones = msa == t.msa ? t.msaOnes : t.extraOnes;
     if (!ones) {
       scaleRowsHK<<<blocks(rows * O), 256, 0, STREAM>>>(lt, msaMask, rows, O);
