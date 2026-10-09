@@ -1,0 +1,15 @@
+# (Metal) the folding bundle's weights held once, as f16, as the ESM-C tower's already are on --fast: the f32 copy of
+# every large tensor of the f/ segment dropped once its mirror exists (metal/af3/common.cuh.patch,
+# dropLargeFloatCopies), a later f32 read served from the mirror. LOCALFOLD_KEEP_F32=1 is the control.
+@@@ old
+      dropped = compactWeights(M.at("c/blocks/0/qkv/weights").seg, towerHalf);
+    }
+@@@ new
+      dropped = compactWeights(M.at("c/blocks/0/qkv/weights").seg, towerHalf);
+    }
+    if (!getenv("LOCALFOLD_KEEP_F32"))
+      dropped += dropLargeFloatCopies(M.at("f/blocks/0/pairTransition/transition1").seg,
+                                      [](const std::string& n) {     // (not the confidence head's: its f16
+                                        // rounding took 5CAJ's pLDDT 90.85 -> 74.36 with the structure unmoved)
+                                        return n.rfind("c/", 0) == 0 || n.rfind("f/confidence", 0) == 0; });
+@@@ end

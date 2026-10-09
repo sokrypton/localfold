@@ -21,3 +21,46 @@ inline void releaseConcatCopies() {
   if (RELEASE_REBUILT) RELEASE_REBUILT();
   if (CONCAT_FREE.empty()) return;
 @@@ end
+
+# ...and the dropping itself, for any port (cuda/ef2 includes this file): a file segment's f16 mirrors made, the f32 copy
+# of each tensor of 64 K elements or more given back unless `keepF32` names it, and a later f32 read served from the
+# mirror - a copy rebuilt once, given back at the next phase boundary (releaseConcatCopies), W()'s cached pointer
+# forgotten with it so a later read rebuilds it
+@@@ old
+inline void forgetDerivedWeights() {
+@@@ new
+__global__ void halfToFloatWK(const half* h, float* f, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) f[i] = __half2float(h[i]);
+}
+inline std::map<std::string, float*> REBUILT_F32;
+inline size_t dropLargeFloatCopies(int seg, const std::function<bool(const std::string&)>& keepF32) {
+  constexpr size_t DROP_MIN = 65536;
+  std::set<std::string> groups;
+  for (auto& [name, e] : M.index)
+    if (e.seg == seg && e.kind == 't' && e.devOffset != Model::DROPPED && groups.insert(halfGroup(name)).second) Wh(name);
+  if (groups.empty()) return 0;
+  size_t freed = compactWeights(seg, [&](const std::string& n) {
+    bool d = M.len(n) >= DROP_MIN && !keepF32(n);
+    if (d && getenv("LOCALFOLD_MEM_DROPPED")) fprintf(stderr, "  f32 dropped: %s\n", n.c_str());
+    return d;
+  });
+  DROPPED_F32 = [](const std::string& k) -> const float* {
+    auto it = REBUILT_F32.find(k);
+    if (it != REBUILT_F32.end()) return it->second;
+    const half* h = Wh(k); size_t n = M.len(k);
+    float* f = dallocT<float>(n);
+    halfToFloatWK<<<blocks(n), 256, 0, STREAM>>>(h, f, n);
+    if (getenv("LOCALFOLD_MEM_REBUILT")) fprintf(stderr, "  f32 rebuilt from f16: %s (%.1f MB)\n", k.c_str(), n * 4 / 1e6);
+    return REBUILT_F32[k] = f;
+  };
+  RELEASE_REBUILT = [] {
+    if (REBUILT_F32.empty()) return;
+    CK(cudaDeviceSynchronize());
+    for (auto& [k, f] : REBUILT_F32) { CK(cudaFree(f)); WF.erase(k); }
+    REBUILT_F32.clear();
+  };
+  return freed;
+}
+inline void forgetDerivedWeights() {
+@@@ end

@@ -109,6 +109,11 @@ The process's peak footprint at 255 tokens: **5.03 -> 3.29 GB** with the weights
 time; two seeds of six samples (two batches through one preparation) give byte-identical ranking scores to the control.
 `LOCALFOLD_KEEP_SCRATCH=1` is the control.
 
+ESMFold2 takes the same weights change for its folding bundle (`metal/ef2/ef2.cu.patch`; the ESM-C tower's matrices
+were already dropped on `--fast`) - 0.68 GB less through the fold at 261 tokens - but **not its confidence head**:
+its f16 rounding took 5CAJ's pLDDT 90.85 -> 74.36 with the structure unmoved (bisected by prefix). Its peak is still
+the start-up's, 5.05 GB, where every weight is float32 and its mirror is being made.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):
 

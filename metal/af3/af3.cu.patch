@@ -2,46 +2,17 @@
 # (2.51 GB for AF3's 424 M parameters, of which the mirror is 0.85): every tensor of 64 K elements or more loses its
 # f32 copy once the mirror is made. The few paths that read one of those as f32 (the diffusion conditioning's float
 # GEMMs, concatenations built from parts) get a copy rebuilt from the mirror, once - f16's rounding on a weight that
-# is int5 to begin with. LOCALFOLD_KEEP_F32=1 is the control.
+# is int5 to begin with (metal/af3/common.cuh.patch, dropLargeFloatCopies). LOCALFOLD_KEEP_F32=1 is the control.
 @@@ insert
-__global__ void halfToFloatWK(const half* h, float* f, size_t n) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) f[i] = __half2float(h[i]);
-}
 inline size_t dropFloatCopies(int segs) {
-  constexpr size_t DROP_MIN = 65536;
   size_t freed = 0;
-  for (int seg = 0; seg < segs; ++seg) {
-    std::set<std::string> groups;
-    for (auto& [name, e] : M.index)
-      if (e.seg == seg && e.kind == 't' && e.devOffset != Model::DROPPED && groups.insert(halfGroup(name)).second) Wh(name);
-    if (groups.empty()) continue;
-    // (not the input embedder's - z_init and the single from target_feat, a few MB: their f16 rounding took
-    // IntelliFold-2's pLDDT down 0.8 on every seed while the structure did not move, bisected by prefix - and not the
-    // confidence head's, which reads float throughout)
-    freed += compactWeights(seg, [](const std::string& n) {
-      return M.len(n) >= DROP_MIN && n.rfind("trunk.embedder.", 0) != 0 && n.rfind("confidence.", 0) != 0;
+  // (not the input embedder's - z_init and the single from target_feat, a few MB: their f16 rounding took
+  // IntelliFold-2's pLDDT down 0.8 on every seed while the structure did not move, bisected by prefix - and not the
+  // confidence head's, which reads float throughout)
+  for (int seg = 0; seg < segs; ++seg)
+    freed += dropLargeFloatCopies(seg, [](const std::string& n) {
+      return n.rfind("trunk.embedder.", 0) == 0 || n.rfind("confidence.", 0) == 0;
     });
-  }
-  // a rebuilt copy lives until the next phase boundary (releaseConcatCopies): most are a concatenation's or a folded
-  // weight's parts, read once - 542 MB of them at 255 tokens, kept, where a phase holds a few. W()'s cache of the
-  // pointer is forgotten with it, so a later read rebuilds it.
-  static std::map<std::string, float*> rebuilt;
-  DROPPED_F32 = [](const std::string& k) -> const float* {
-    auto it = rebuilt.find(k);
-    if (it != rebuilt.end()) return it->second;
-    const half* h = Wh(k); size_t n = M.len(k);
-    float* f = dallocT<float>(n);
-    halfToFloatWK<<<blocks(n), 256, 0, STREAM>>>(h, f, n);
-    if (getenv("LOCALFOLD_MEM")) fprintf(stderr, "  f32 rebuilt from f16: %s (%.1f MB)\n", k.c_str(), n * 4 / 1e6);
-    return rebuilt[k] = f;
-  };
-  RELEASE_REBUILT = [] {
-    if (rebuilt.empty()) return;
-    CK(cudaDeviceSynchronize());
-    for (auto& [k, f] : rebuilt) { CK(cudaFree(f)); WF.erase(k); }
-    rebuilt.clear();
-  };
   return freed;
 }
 @@@ end

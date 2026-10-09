@@ -414,6 +414,7 @@ Runtime& R() {
     Runtime* rt = new Runtime();
     if (rt->statsOn) atexit([] {
       auto& s = R().stats;
+      fprintf(stderr, "metal stats: peak allocated %.2f GB\n", R().peak / 1e9);
       fprintf(stderr, "metal stats: %ld launches %.1f ms encoding, %ld syncs %.1f ms waiting, %ld commits, %ld encoders, "
               "%ld staged copies, %ld allocations, %zu live, compiles %.0f ms; commits by threshold %ld, by event %ld; %ld dispatches, %ld graph launches of %ld ops, %ld captures of %ld ops; copies %ld fills %ld gemms %ld memcpy %ld memset %ld\n", s.launches, s.launchMs, s.syncs, s.syncMs,
               s.commits, s.encoders, s.staged, s.allocs, R().allocs.size(), s.compileMs, s.commitsThreshold, s.commitsEvent, s.dispatches, s.graphLaunches, s.graphOps, s.captures, s.capturedOps, s.copies, s.fills, s.gemms, s.memcpyCalls, s.memsetCalls);
