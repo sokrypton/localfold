@@ -133,7 +133,12 @@ were 8.2 s of a 19.3 s trunk at 261 tokens, ~8x their bandwidth. Rewritten with 
 6.5 ms a call with its indices in 32 bits - 1.2 without them - so `a / d` by a runtime `d` is a software routine at any
 width. `lf_udiv` (metal/runtime/prelude.metal) divides through a float reciprocal with one correction, exact below 2^24:
 `opmAddK` 1450 -> 277 ms, AF2's 5CAJ fold 18.29 -> 17.11 s, the same digits. An override that divides an element
-should use it. (AF2's `triGateTK`, the same: 1263 -> 514 ms.) And AF2's FAST triangle takes the
+should use it.
+
+`lnHeadsMetal` (the pair's LayerNorm and its 16 heads' logits, AF3's single attention and AF2's) ran at a fifth of its
+bandwidth however its sums were reduced or its outputs written - the LayerNorm alone was 84 ms of its 341: one simdgroup
+a row holding N dot products in ~90 registers. On 8x8 simdgroup matrices instead (a simdgroup LayerNorms 8 rows into
+threadgroup memory and multiplies them by the staged weight) it is **124 ms**. (AF2's `triGateTK`, the same: 1263 -> 514 ms.) And AF2's FAST triangle takes the
 fused GEMMs too (`metal/af2/evoformer.cuh.patch`, the gate and the gated residual with AF2's biases, which the two
 epilogues now add): 5CAJ with its template 18.51 -> 17.57 s, the same digits. AF2's two folds 15-20 A from their
 crystals (5caj-seq, 1brs-multimer) swing under any rounding change and were re-recorded.
