@@ -4018,6 +4018,26 @@ card come within 1.25-1.4x of ours. Our trunk on it (988 tokens, 4 passes, 1,977
 triangleOutK 22%, transitionUpK 20%, the contraction and the transition's second GEMM 31% - the three fused kernels
 run at one block an SM on its ~100 KB of shared memory (triIn256K's two-tile form needs two), unmeasured otherwise.
 
+### FP8 for the triangle's contraction on Ada and Blackwell (2026-10-09)
+
+Where the card has FP8 tensor instructions (compute capability 8.9 on: an L4, the RTX PRO 6000; an A100 has none),
+the triangle multiplication's two operands are written e4m3 and contracted by cuBLASLt's FP8 GEMM into the bf16
+product (`fp8Tensor`, `triContractTN`; `LOCALFOLD_FP8=0` keeps bf16). An FP8 GEMM takes only the layout with the
+contracted index contiguous in both operands, which the outgoing triangle has and the incoming one does not, so the
+incoming triangle's input kernel reads the pair TRANSPOSED (`RectMap::T`) and both run as the outgoing GEMM; the plane
+is padded to 16 (an FP8 GEMM's leading dimensions). No scale: the operands sit well inside e4m3's range.
+
+On the RTX PRO 6000 the GEMM is 1.7-1.9x bf16's (0.84 against 1.42 ms at np 992, 18.1 against 33.9 at 2,976):
+ESMFold2-fast 600M's trunk **-7% at 988 tokens and -17.6% at 2,964** (21.0 -> 17.3 s of GPU), AlphaFold 3's trunk -4%
+and -8.5% (its contraction is a smaller share beside the grid attention). Accuracy, emulated on the A100 first (the
+operands rounded through e4m3 into the bf16 GEMM) and then measured there: ESMFold2 within 0.02 A on 1BRS / 5CAJ /
+1TIM (0.903 / 2.091 / 1.535 against 0.906 / 2.104 / 1.517), AlphaFold 3 0.009-0.022 A between the forms on 5CAJ with
+its alignment, 1BRS templated and 1TIM with alignments, 5CAJ self-templated 0.171 A both ways on the 6000.
+🔴 **NOT THE WEIGHTS**: the same rounding of the transition's second weight (one e4m3 scale for the tensor) put
+1BRS / 5CAJ / 1TIM at 12.8 / 14.7 / 22.6 A - the operands' errors average out over a contraction of ~1,000 terms, a
+weight's repeat in every row. The transition's hidden rows alone were harmless (within 0.02 A), but its GEMM's FP8
+form needs FP8 weights too, so it stays bf16.
+
 ### 🔴 The comparison found a bug of ours, and it looked like nondeterminism
 
 The first full-model run of 1BRS at 3 loops came back at **13.2 A, pLDDT 28.6** - the same command an hour later

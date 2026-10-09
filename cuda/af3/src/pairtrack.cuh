@@ -642,9 +642,43 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     if (FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && wide && !(C == 128 && skipFused("triangle"))) {
       // LN, the projection, the gate and the gating linear in one kernel (writing the padding), the f16
       // contraction into f32, then the centre norm, the output projection, the gate and the residual
-      half* t2 = scratch<half>("tri.t2whole", cs * C);
+      // FP8 operands where the card has FP8 tensor instructions (fp8Tensor, at 128 and 256 channels): both directions in
+      // the outgoing layout - the incoming one's input kernel reading the pair transposed (RectMap's T) - through an e4m3
+      // GEMM into the bf16 product, on a plane padded to 16 (an FP8 GEMM's leading dimensions)
+      // (LOCALFOLD_TRI_TN=1: the same layouts in bf16 - the check of the transposed form on a card without FP8)
+      static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
+      const bool f8 = TRI_BF16 && bf16Tensor() && fp8Tensor() && C <= 256, tn = f8 || (TRI_BF16 && bf16Tensor() && tnBf16 && C <= 256);
+      const int np8 = (n + 15) / 16 * 16; const size_t cs8 = (size_t)np8 * np8;
+      half* t2 = scratch<half>("tri.t2whole", (tn ? cs8 : cs) * C);
       half* wt = scratch<half>("tri.wt256", triInTileHalves(C));
       tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
+      if (tn) {
+        auto run = [&](auto tag) {
+        using F8 = decltype(tag);
+        F8* a8 = scratch<F8>("tri.a8", cs8 * C); F8* b8 = scratch<F8>("tri.b8", cs8 * C);
+        __nv_bfloat16* pb = scratch<__nv_bfloat16>("tri.pbf", cs8 * C);
+        RectMap rm; rm.T = !outgoing;
+        wideWidth(C, [&](auto width) {
+          constexpr int CC = decltype(width)::value, WO = 4;
+          wideWarps(C, [&](auto warps) {
+            constexpr int WI = decltype(warps)::value;
+            WITH_PAIR_T(
+              static bool attr = false;
+              constexpr auto kern = triIn256For<CC, WI, F8, PT>();
+              if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+              kern<<<(unsigned)((cs8 + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+                pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), wt, a8, b8, t2, n, np8, cs8, nullptr, rm));
+          });
+          // (incoming P[i][j] = sum_k a[k][j] b[k][i]: with the transposed operands, sum_k b'[i][k] a'[j][k])
+          if (outgoing) triContractTN(np8, cs8, C, alpha, a8, b8, pb, f8);
+          else triContractTN(np8, cs8, C, alpha, b8, a8, pb, f8);
+          triangleOutRun<CC, WO, __nv_bfloat16>(pb, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                                Wh(pre + ".outputProjection"), t2, into(pair), n, np8);
+        });
+        };
+        if (f8) run(__nv_fp8_e4m3{}); else run(__nv_bfloat16{});
+        return;
+      }
       if (TRI_BF16 && bf16Tensor()) {
         // as the 128-channel path: a, b and the product in bf16, the product half the bytes both ways
         __nv_bfloat16* ab = scratch<__nv_bfloat16>("tri.abf", cs * C);

@@ -147,8 +147,31 @@ template <class TA, class TP>
 inline void triangle256As(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing,
                           cudaDataType ta, cudaDataType tp) {
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
-  TA* a = scratch<TA>("ftri.a", plane * C); TA* b = scratch<TA>("ftri.b", plane * C);
   half* t2 = scratch<half>("ftri.t2", plane * C);
+  if constexpr (std::is_same_v<TA, __nv_bfloat16> && std::is_same_v<TP, __nv_bfloat16>) {
+    // FP8 operands where the card has FP8 tensor instructions (fp8Tensor): both directions in the outgoing layout - the
+    // incoming one's input kernel reading the pair transposed (RectMap's T) - through an e4m3 GEMM into the bf16 product.
+    // LOCALFOLD_TRI_TN=1 takes the same layouts in bf16 (the check of the transposed form on a card without FP8)
+    static const bool tn = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
+    if (fp8Tensor() || tn) {
+      const bool f8 = fp8Tensor();
+      // (an FP8 GEMM's leading dimensions are whole multiples of 16 elements: the padded plane to 16, not 8)
+      Lp = (L + 15) / 16 * 16; plane = (size_t)Lp * Lp;
+      t2 = scratch<half>("ftri.t2", plane * C);
+      void* a = f8 ? (void*)scratch<__nv_fp8_e4m3>("ftri.a8", plane * C) : (void*)scratch<TA>("ftri.a", plane * C);
+      void* b = f8 ? (void*)scratch<__nv_fp8_e4m3>("ftri.b8", plane * C) : (void*)scratch<TA>("ftri.b", plane * C);
+      RectMap rm; rm.T = !outgoing;
+      if (f8) triIn256<__nv_fp8_e4m3>(pair, mask, Tn, (__nv_fp8_e4m3*)a, (__nv_fp8_e4m3*)b, t2, L, Lp, plane, rm);
+      else triIn256<TA>(pair, mask, Tn, (TA*)a, (TA*)b, t2, L, Lp, plane, rm);
+      TP* prod = scratch<TP>("ftri.prod", plane * C);
+      // (incoming P[i][j] = sum_k a[k][j] b[k][i]: with a', b' the transposed operands, sum_k b'[i][k] a'[j][k])
+      if (outgoing) triContractTN(Lp, plane, C, 1.f, a, b, prod, f8);
+      else triContractTN(Lp, plane, C, 1.f, b, a, prod, f8);
+      triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp);
+      return;
+    }
+  }
+  TA* a = scratch<TA>("ftri.a", plane * C); TA* b = scratch<TA>("ftri.b", plane * C);
   triIn256<TA>(pair, mask, Tn, a, b, t2, L, Lp, plane);
   TP* prod = scratch<TP>("ftri.prod", plane * C);
   if constexpr (std::is_same_v<TA, __nv_bfloat16>) {   // cuda/af3's contraction, a cached plan at every size
@@ -212,7 +235,8 @@ inline void transition256(float* pair, size_t P, int C, const std::string& Tn) {
       B16* rows = reinterpret_cast<B16*>(pair) + r0 * C;
       transitionUpK<256, WU, 32, 1, B16, B16><<<(unsigned)((r + R - 1) / R), 32 * WU, smem, STREAM>>>(
         reinterpret_cast<float*>(rows), F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"), w1t, g, r, I);
-      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, (int)r, I, &one, Wbf("f/" + Tn + "transition2"), CUDA_R_16BF, C, g,
+      const __nv_bfloat16* w2 = Wbf("f/" + Tn + "transition2");
+      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_N, C, (int)r, I, &one, w2, CUDA_R_16BF, C, g,
                       CUDA_R_16BF, I, &one, rows, CUDA_R_16BF, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
     return;

@@ -70,6 +70,63 @@ inline void bf16Gemms(cublasOperation_t ta, cublasOperation_t tb, int m, int nn,
   CB(cublasGemmStridedBatchedEx(H, ta, tb, m, nn, k, &alpha, A, CUDA_R_16BF, lda, sA, B, CUDA_R_16BF, ldb, sB, &zero,
     Cm, CUDA_R_16BF, ldc, sC, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
+#include <cuda_fp8.h>
+// FP8 tensor instructions (Ada and Blackwell: compute capability 8.9 on; an A100 has none). LOCALFOLD_FP8=0 keeps bf16
+inline bool fp8Tensor() {
+  static const bool on = [] {
+    if (getenv("LOCALFOLD_FP8") && !atoi(getenv("LOCALFOLD_FP8"))) return false;
+    int d, ma, mi; CK(cudaGetDevice(&d));
+    CK(cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, d)); CK(cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, d));
+    return ma * 10 + mi >= 89;
+  }();
+  return on;
+}
+// The contraction in the OUTGOING layout for either direction (the incoming one's operands written transposed, RectMap's
+// T): p[c][i][j] = sum_k a[c][i][k] b[c][j][k], the contracted index contiguous in both - the only layout an FP8 GEMM
+// takes. fp8: a and b e4m3 (unscaled: the operands sit well inside its range - folds within 0.03 A of bf16's, emulated),
+// through cuBLASLt into a bf16 product; else bf16 (bf16Gemms)
+inline void triContractTN(int np, size_t cs, int C, float alpha, const void* a, const void* b, __nv_bfloat16* p, bool fp8) {
+  if (!fp8) {
+    bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, alpha, (const __nv_bfloat16*)b, np, cs, (const __nv_bfloat16*)a, np, cs, p, np, cs, C);
+    return;
+  }
+  struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la, lb, lc; cublasLtMatmulAlgo_t algo; size_t ws; };
+  static cublasLtHandle_t lt = nullptr;
+  static std::map<std::tuple<int, size_t, int>, Plan> plans;
+  if (!lt) CB(cublasLtCreate(&lt));
+  auto key = std::make_tuple(np, cs, C);
+  auto it = plans.find(key);
+  if (it == plans.end()) {
+    Plan pl{};
+    CB(cublasLtMatmulDescCreate(&pl.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+    CB(cublasLtMatmulDescSetAttribute(pl.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
+    CB(cublasLtMatmulDescSetAttribute(pl.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
+    int batch = C; long long stride = (long long)cs;
+    auto layout = [&](cudaDataType t) {
+      cublasLtMatrixLayout_t l; CB(cublasLtMatrixLayoutCreate(&l, t, np, np, np));
+      CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch)));
+      CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof(stride)));
+      return l;
+    };
+    pl.la = layout(CUDA_R_8F_E4M3); pl.lb = layout(CUDA_R_8F_E4M3); pl.lc = layout(CUDA_R_16BF);
+    cublasLtMatmulPreference_t pref; CB(cublasLtMatmulPreferenceCreate(&pref));
+    cublasLtMatmulHeuristicResult_t res[4]; int got = 0;
+    for (size_t ws : { (size_t)0, (size_t)32 << 20 }) {      // (no workspace where one suffices: a CUDA graph captures it as it is)
+      CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+      if (cublasLtMatmulAlgoGetHeuristic(lt, pl.op, pl.la, pl.lb, pl.lc, pl.lc, pref, 4, res, &got) == CUBLAS_STATUS_SUCCESS && got) {
+        pl.algo = res[0].algo; pl.ws = res[0].workspaceSize; break;
+      }
+    }
+    CB(cublasLtMatmulPreferenceDestroy(pref));
+    if (!got) { fprintf(stderr, "no cuBLASLt FP8 algorithm for the contraction at np %d\n", np); exit(1); }
+    it = plans.emplace(key, pl).first;
+  }
+  const Plan& pl = it->second;
+  const float zero = 0.f;
+  void* ws = pl.ws ? scratch<unsigned char>("tri.fp8ws", pl.ws) : nullptr;
+  CB(cublasLtMatmul(lt, pl.op, &alpha, b, pl.la, a, pl.lb, &zero, p, pl.lc, p, pl.lc, &pl.algo, ws, pl.ws, STREAM));
+}
 inline void triContractBf16(bool outgoing, int np, size_t cs, int C, float alpha, const __nv_bfloat16* a,
                             const __nv_bfloat16* b, __nv_bfloat16* p, bool planAll = false) {
   const float zero = 0.f;
