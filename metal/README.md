@@ -193,4 +193,4 @@ uses more registers): no error, the output untouched.
 2. Fusions the CUDA port has: the gated residual into the next adaptive LayerNorm, the trunk's transition and
    triangle kernels.
 3. An int8-weight GEMM for ESM2 3B (its matrices are expanded to half a GEMM at a time).
-4. An M5: its GPU's matrix hardware through Metal 4's tensor APIs.
+4. An M5: its GPU's matrix hardware through Metal 4's tensor APIs - docs/M5-HANDOFF.md is the brief for that pass.
