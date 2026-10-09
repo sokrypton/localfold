@@ -35,6 +35,9 @@ class Model {
                       const std::function<bool(const std::string&)>& own = nullptr);
   // the tensors a bundle holds, by name and shape (a delta's absent ones gone): what a walk is worked out from
   static std::map<std::string, std::vector<long long>> bundleShapes(const std::string& dir, const std::string& deltaDir = "");
+  // a bundle given back whole: its tensors (and their conversions), and every derived weight made from one of them (a
+  // derived key is "<what>:<tensor name>") - a model read once, ESMFold2's language model, in a process that folds once
+  void unloadBundle(const std::string& prefix);
   // an input directory; unloadInput() forgets it
   void loadInput(const std::string& dir);
   void unloadInput();
@@ -78,6 +81,7 @@ class Model {
   std::map<std::string, Tensor> t;
   struct Block { char* base = nullptr; size_t bytes = 0; };
   std::vector<Block> blocks;            // a weight walk's allocations, which compact() rebuilds without retired tensors
+  std::map<std::string, std::vector<void*>> bundleAllocs;     // loadBundle's allocations by prefix (unloadBundle)
   std::set<std::string> retired;
   std::map<std::string, double> metaV;
   std::map<std::string, void*> derivedW;

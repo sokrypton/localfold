@@ -30,6 +30,8 @@ extern bool HALF_GEMM;            // every float32 GEMM's operands rounded to ha
 RelIdx relIdx();
 // a weight interleaved for gemmSwiglu: [rows][2I] = [a | b] -> blocks of 8 (a_0..a_7 b_0..b_7 a_8..)
 const half* swigluPairs(const std::string& key, const half* w, int rows, int I);
+// ...interleaved in the tensor's own memory, for a weight read by nothing else
+const half* swigluPairsInPlace(const std::string& name, int rows, int I);
 // two weights [rows][I] each -> the same interleaving, a from the first and b from the second
 const half* swigluPairs2(const std::string& key, const half* a, const half* b, int rows, int I);
 

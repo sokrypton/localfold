@@ -1,5 +1,6 @@
 // metal/ef2's shared pieces: a named weight's GEMM, the relative-position indices, derived weights.
 #include "ef2.h"
+#include <set>
 
 bool HALF_GEMM = true;
 
@@ -28,6 +29,20 @@ const half* swigluPairs(const std::string& key, const half* w, int rows, int I) 
   return M.derived<half>("swiglu:" + key, (size_t)rows * 2 * I, [&](half* out) {
     run1d("ef2_interleave8", (size_t)rows * 2 * I, Interleave8Args{w, w + I, out, (uint)rows, (uint)I, (uint)(2 * I), 0});
   });
+}
+// ...in the tensor's own memory (read by nothing else): interleaved through a temporary the size of one, so the
+// original and its interleaving are never both held - the language model's 36 fc1 weights were 0.5 GB twice
+const half* swigluPairsInPlace(const std::string& name, int rows, int I) {
+  static std::set<std::string> done;
+  half* w = const_cast<half*>(M.h(name));
+  if (done.insert(name).second) {
+    size_t n = (size_t)rows * 2 * I;
+    half* tmp = allocT<half>(n);
+    run1d("ef2_interleave8", n, Interleave8Args{w, w + I, tmp, (uint)rows, (uint)I, (uint)(2 * I), 0});
+    copy(w, tmp, n * 2);
+    release(tmp);
+  }
+  return w;
 }
 const half* swigluPairs2(const std::string& key, const half* a, const half* b, int rows, int I) {
   return M.derived<half>("swiglu2:" + key, (size_t)rows * 2 * I, [&](half* out) {

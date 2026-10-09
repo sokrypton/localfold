@@ -26,6 +26,7 @@ void mem(const char* at) {
   printf("  memory %-22s %6.2f GB held (scratch %.2f, weights %.2f)\n", at, allocated() / 1e9, scratchHeld() / 1e9, M.weightBytes() / 1e9);
 }
 
+bool KEEP_TOWER = false;      // (--serve: the next job reads it again)
 int foldInput(const Opts& o) {
   SamplerSettings sampler = o.sampler;
   if (M.has("meta/samplerSteps")) {          // (a bundle that states its sampler; the command's --steps still wins)
@@ -50,6 +51,7 @@ int foldInput(const Opts& o) {
   if (o.profile) profileReport("language model");
   printf("language model %.1f ms\n", ms(t0));
   releaseScratch({"esmc.", "shim."});
+  if (!KEEP_TOWER) M.unloadBundle("c");      // (read once: a process that folds once gives it back - 1.2 GB of ESM-C 600M)
   if (getenv("EF2_SAVE_LMZ")) {
     auto h = download(lmZ, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_LMZ"), "wb"); fwrite(h.data(), 4, h.size(), f); fclose(f);
   }
@@ -190,6 +192,7 @@ int foldMain(int argc, char** argv) {
   M.loadBundle(esmcBundle, "c", asHalf);
   if (getenv("EF2_STARTUP")) { mt::sync(); printf("weights up %.0f ms\n", ms(tStart)); }
   if (!serveDir.empty()) {
+    KEEP_TOWER = true;
     serveJobs("ef2", serveDir, [&](const std::string& input, const std::vector<std::string>& flags) {
       Opts j = o; j.dir = input; j.out = "fold.pdb"; j.frames.clear();
       for (auto& f : flags) {

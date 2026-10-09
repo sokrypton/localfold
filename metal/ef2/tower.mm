@@ -37,7 +37,7 @@ static void esmcBlock(const Esmc& e, float* x, const int* seq, int layer) {
   lin(ctx, B + "attn_out/weights", x, R, C, C, 1.f, nullptr, 1.f / e.residualScale);
   layerNorm(x, xn, R, C, M.f(B + "ffn_norm/scale"), M.f(B + "ffn_norm/offset"));
   half* g = scratch<half>("esmc.g", R * e.ffn);
-  gemmSwiglu(xn, swigluPairs(B + "fc1", M.h(B + "fc1/weights"), C, e.ffn), g, R, C, e.ffn);
+  gemmSwiglu(xn, swigluPairsInPlace(B + "fc1/weights", C, e.ffn), g, R, C, e.ffn);
   lin(g, B + "fc2/weights", x, R, e.ffn, C, 1.f, nullptr, 1.f / e.residualScale);
 }
 

@@ -125,6 +125,27 @@ const int* Model::i(const std::string& name) {
 }
 const float* Model::hostF(const std::string& name) { const float* p = f(name); sync(); return (const float*)host(p); }
 const int* Model::hostI(const std::string& name) { const int* p = i(name); sync(); return (const int*)host(p); }
+void Model::unloadBundle(const std::string& prefix) {
+  auto it = bundleAllocs.find(prefix);
+  if (it == bundleAllocs.end()) die("no bundle %s to unload", prefix.c_str());
+  const std::string p = prefix + "/";
+  for (auto x = t.begin(); x != t.end();) {
+    if (x->first.compare(0, p.size(), p)) { ++x; continue; }
+    Tensor& v = x->second;
+    // a tensor holding both forms holds one conversion made on demand: the float32 one where madeF32 says so, else
+    // the float16 one
+    if (v.f32 && v.f16) release(v.madeF32 ? (const void*)v.f32 : (const void*)v.f16);
+    weightHeld -= v.n * (v.madeF32 || !v.f32 ? 2 : 4);
+    x = t.erase(x);
+  }
+  for (void* b : it->second) release(b);
+  bundleAllocs.erase(it);
+  for (auto d = derivedW.begin(); d != derivedW.end();) {
+    size_t colon = d->first.find(':');      // (a derived weight's key is "<what>:<the tensor it was made from>")
+    if (colon != std::string::npos && !d->first.compare(colon + 1, p.size(), p)) { release(d->second); d = derivedW.erase(d); }
+    else ++d;
+  }
+}
 void Model::swapPrefix(const std::string& to, const std::string& from) {
   auto swapIn = [&](auto& m) {
     std::vector<std::string> keys;
@@ -191,6 +212,7 @@ void Model::loadBundle(const std::string& dir, const std::string& prefix,
   char* base32 = bytes32 ? (char*)alloc(bytes32) : nullptr;
   char* base16 = bytes16 ? (char*)alloc(bytes16) : nullptr;
   weightHeld += bytes32 + bytes16;
+  for (char* b : {base32, base16}) if (b) bundleAllocs[prefix].push_back(b);
   for (auto& rec : recs) {
     Tensor& x = t[rec.name];
     if (rec.out16) { x.f16 = (half*)(base16 + rec.e.dst); rec.e.dst = (u64)x.f16; }
