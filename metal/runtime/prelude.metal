@@ -44,6 +44,16 @@ struct LfCtx {
 
 // ---------------------------------------------------------------- warp shuffles
 // (the mask is ignored: every shuffle here is over a full, converged warp, as in the CUDA ports)
+// a 32-bit unsigned division by a runtime divisor, as a float reciprocal and one correction: Apple's GPUs have no integer
+// divider - `a / d` is a software routine, and two of them an element made AF2's opmAddK 5.8x its bandwidth. Exact for
+// a < 2^24 (the float estimate is then within one either way); past it the plain division.
+inline uint lf_udiv(uint a, uint d) {
+  if (a >= (1u << 24)) return a / d;
+  uint q = (uint)((float)a * (1.f / (float)d));
+  if (q * d > a) --q;
+  else if ((q + 1) * d <= a) ++q;
+  return q;
+}
 template <typename T> inline T lf_shfl_xor(T v, int m) { return simd_shuffle_xor(v, (ushort)m); }
 template <typename T> inline T lf_shfl(T v, int src) { return simd_shuffle(v, (ushort)(src & 31)); }
 template <typename T> inline T lf_shfl_down(T v, int d) { return simd_shuffle_down(v, (ushort)d); }
