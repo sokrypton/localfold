@@ -1318,8 +1318,12 @@ bf16 transpose), the streamed diffusion preparation (each chunk widened as it is
 parked pair), and the confidence head (its pair bf16, its blocks under `PAIR16`, its heads widening a chunk of rows).
 **The structure is byte-identical** (the diffusion reads exactly the values the widening made); the confidence head
 storing its pair in bf16 moves PAE by at most 0.12 A and pLDDT by 0.06 on 6MRR under `LOCALFOLD_BIG=1`. Every fold
-off the big-input path is byte-identical. Not yet for boltz2 (its head re-embeds the pair), rf3 (its global norm) or
-OpenDDE (its expander) - those widen as before. What it took beside that, each found by folding past the old line:
+off the big-input path is byte-identical. Not yet for boltz2 (its head re-embeds the pair) or OpenDDE (its expander) -
+those widen as before. **rf3 takes it too, and its trunk is bf16 now at every size**: its grid attention's biases
+(gating query, output projection) kept it on an f32 pair, though the unfused kernels its biased heads run take a bf16
+pair (the output bias added in f32, the sum laid in by `addGridK<PT>`); its global norm takes one as well. 6MRR 1.767
+-> 1.780 A at pLDDT 81.42 -> 81.43, 5CAJ self-templated 0.075 A both ways, the trunk 1507 -> 1430 ms at 494 tokens -
+and the norm's live-row count, a single GPU thread looping over every pair, moved into its parallel pass. What it took beside that, each found by folding past the old line:
 
 - **the confidence heads' logits a chunk at a time**: `[pairs, 64]` f32 is TWICE a 128-channel f32 pair (25.6 GB at
   10,000), held whole only to be reduced to the PAE, the PDE and the pTM term - now each chunk's logits are reduced

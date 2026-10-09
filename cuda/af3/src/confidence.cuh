@@ -69,24 +69,31 @@ inline bool CONF_HALF = false;   // the head's four pairformer blocks in f16
 // rf3's parameter-free LayerNorm over a WHOLE tensor, real rows only (mask per row), the mean
 // and variance over `vendorWidth` columns (wider than C: the extra ones zero, each adding mean^2).
 // Deterministic: per-block partials, then one block sums them in order.
-__global__ void maskedSumK(const float* x, const float* mask, size_t rows, int C, const double* mean, double* partial) {
-  __shared__ double red[256];
-  double acc = 0;
+// (the pair's element type PT: a bf16 confidence pair, TRUNK_PAIR16; the live rows counted in the same pass - one
+// thread counting them over every pair was a serial loop of tokens^2)
+template <class PT = float>
+__global__ void maskedSumK(const float* x, const float* mask, size_t rows, int C, const double* mean, double* partial,
+                           double* livePartial) {
+  __shared__ double red[256], liveRed[256];
+  double acc = 0, live = 0;
   for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < rows * C; i += (size_t)gridDim.x * blockDim.x) {
     if (!(mask[i / C] > 0)) continue;
-    double v = x[i];
+    if (i % C == 0) live += 1;
+    double v = pairLd<PT>(x, i);
     if (mean) { v -= *mean; v *= v; }
     acc += v;
   }
-  red[threadIdx.x] = acc; __syncthreads();
-  for (int w = blockDim.x / 2; w; w >>= 1) { if (threadIdx.x < w) red[threadIdx.x] += red[threadIdx.x + w]; __syncthreads(); }
-  if (threadIdx.x == 0) partial[blockIdx.x] = red[0];
+  red[threadIdx.x] = acc; liveRed[threadIdx.x] = live; __syncthreads();
+  for (int w = blockDim.x / 2; w; w >>= 1) {
+    if (threadIdx.x < w) { red[threadIdx.x] += red[threadIdx.x + w]; liveRed[threadIdx.x] += liveRed[threadIdx.x + w]; }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { partial[blockIdx.x] = red[0]; livePartial[blockIdx.x] = liveRed[0]; }
 }
-__global__ void globalStatK(const double* partial, int parts, const float* mask, size_t rows, int C, int vendorWidth,
+__global__ void globalStatK(const double* partial, const double* livePartial, int parts, int C, int vendorWidth,
                             double* stat, int which) {
   if (threadIdx.x || blockIdx.x) return;
-  double total = 0; for (int k = 0; k < parts; ++k) total += partial[k];
-  double live = 0; for (size_t r = 0; r < rows; ++r) live += mask[r] > 0;
+  double total = 0, live = 0; for (int k = 0; k < parts; ++k) { total += partial[k]; live += livePartial[k]; }
   double count = fmax(live * vendorWidth, 1.0);
   if (which == 0) stat[0] = total / count;                      // the mean
   else {                                                        // 1 / std
@@ -94,18 +101,21 @@ __global__ void globalStatK(const double* partial, int parts, const float* mask,
     stat[1] = 1.0 / sqrt(variance / count + 1e-5);
   }
 }
+template <class PT = float>
 __global__ void applyGlobalNormK(float* x, size_t n, const double* stat) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) x[i] = (float)((x[i] - stat[0]) * stat[1]);
+  if (i < n) pairSt<PT>(x, i, (float)((pairLd<PT>(x, i) - stat[0]) * stat[1]));
 }
+template <class PT = float>
 inline void maskedGlobalNorm(float* x, const float* rowMask, size_t rows, int C, int vendorWidth) {
   const int parts = 512;
   double* partial = scratch<double>("gn.partial", parts); double* stat = scratch<double>("gn.stat", 2);
-  maskedSumK<<<parts, 256, 0, STREAM>>>(x, rowMask, rows, C, nullptr, partial);
-  globalStatK<<<1, 1, 0, STREAM>>>(partial, parts, rowMask, rows, C, vendorWidth, stat, 0);
-  maskedSumK<<<parts, 256, 0, STREAM>>>(x, rowMask, rows, C, stat, partial);
-  globalStatK<<<1, 1, 0, STREAM>>>(partial, parts, rowMask, rows, C, vendorWidth, stat, 1);
-  applyGlobalNormK<<<blocks(rows * C), 256, 0, STREAM>>>(x, rows * C, stat);
+  double* live = scratch<double>("gn.live", parts);
+  maskedSumK<PT><<<parts, 256, 0, STREAM>>>(x, rowMask, rows, C, nullptr, partial, live);
+  globalStatK<<<1, 1, 0, STREAM>>>(partial, live, parts, C, vendorWidth, stat, 0);
+  maskedSumK<PT><<<parts, 256, 0, STREAM>>>(x, rowMask, rows, C, stat, partial, live);
+  globalStatK<<<1, 1, 0, STREAM>>>(partial, live, parts, C, vendorWidth, stat, 1);
+  applyGlobalNormK<PT><<<blocks(rows * C), 256, 0, STREAM>>>(x, rows * C, stat);
 }
 __global__ void clampK(float* x, float limit, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = fminf(limit, fmaxf(-limit, x[i]));
@@ -285,10 +295,9 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   bool reembed = M.flag("trunk.dialect.reembedConfidencePair");
   bool inPlace = consumeTrunkPair && !reembed;                 // (boltz2 builds its pair from the trunk's: no aliasing)
   // a bf16 trunk pair (TRUNK_PAIR16, a card short of room): the head's pair is bf16 too, its blocks run under PAIR16
-  // and its heads widen a chunk of rows at a time (af3.cu keeps it only for a head that takes it: no re-embedding,
-  // no global norm)
+  // and its heads widen a chunk of rows at a time (af3.cu keeps it only for a head that takes it: no re-embedding)
   const bool p16 = TRUNK_PAIR16;
-  if (p16 && (reembed || M.flag("trunk.dialect.confidenceGlobalNorm") || !shortPair(pairs, C))) {
+  if (p16 && (reembed || !shortPair(pairs, C))) {
     fprintf(stderr, "the confidence head was handed a bf16 pair it does not take\n"); exit(1);
   }
   const size_t pairBytes = pairs * C * (p16 ? 2 : 4);
@@ -304,7 +313,8 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
     // vendor's 449 columns, two wider than ours)
     float* tf = scratch<float>("conf.targetFeat", (size_t)n * F);
     CK(cudaMemcpyAsync(tf, targetFeat, (size_t)n * F * 4, cudaMemcpyDeviceToDevice, STREAM));
-    maskedGlobalNorm(pair, pairMask, pairs, C, C);
+    if (p16) maskedGlobalNorm<__nv_bfloat16>(pair, pairMask, pairs, C, C);
+    else maskedGlobalNorm(pair, pairMask, pairs, C, C);
     maskedGlobalNorm(single, seqMask, n, Cs, Cs);
     maskedGlobalNorm(tf, seqMask, n, F, 449);
     targetFeat = tf;

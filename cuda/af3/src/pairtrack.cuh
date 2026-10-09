@@ -1101,8 +1101,11 @@ inline bool pairBf16Ok(int n, int C, const std::string& B0) {
   bool narrow = FUSED_TRIANGLE && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
   bool wide = FUSED_WIDE && FUSED_TRIANGLE && n >= FUSED_WIDE_MIN_TOKENS && fitsSmem(wideTriFitsSmem(128));
   std::string A = B0 + ".pairAttention1";
-  bool grid = FUSED_GRID && gridFusedFits() && !hasW(A + ".gatingQueryBias") && !hasW(A + ".outputProjectionBias") &&
-              (int)M.meta(A + ".heads") * (int)M.meta(A + ".dimension") == 128 && (int)M.meta(A + ".heads") <= 16;
+  // (a grid attention with biases - rf3's gating query and output projection - runs the unfused kernels, which take a
+  // bf16 pair as the wide tracks' do: the output bias is added in f32 and the sum laid into the pair by addGridK<PT>)
+  const bool biased = hasW(A + ".gatingQueryBias") || hasW(A + ".outputProjectionBias");
+  bool grid = biased || (FUSED_GRID && gridFusedFits() &&
+              (int)M.meta(A + ".heads") * (int)M.meta(A + ".dimension") == 128 && (int)M.meta(A + ".heads") <= 16);
   int I = (int)(lenW(B0 + ".pairTransition.transition1") / (2 * (size_t)C));
   bool tr = FUSED_TRANSITION && fitsSmem((size_t)16 * 4 * 2 * (128 + 8) * 2 + 2 * ftStage<128, 16>()) && I % 16 == 0;
   return (narrow || wide) && grid && tr;
