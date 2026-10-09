@@ -372,6 +372,13 @@ void launch(int index, std::initializer_list<std::string> targs, KArgs& args) {
   if (ta.empty()) ta = "0";
   id<MTLComputePipelineState> pso = r.kernel(index, ta);
   Launch L = CURRENT;
+  static bool trace = getenv("LOCALFOLD_METAL_TRACE") != nullptr;
+  if (trace) {
+    static std::set<std::string> seen;
+    std::string key = std::string(PORT_KERNELS[index].name) + "<" + ta + ">";
+    if (seen.insert(key).second) fprintf(stderr, "trace: %s grid %u,%u,%u block %u,%u,%u smem %zu\n", key.c_str(),
+                                         L.grid.x, L.grid.y, L.grid.z, L.block.x, L.block.y, L.block.z, L.smem);
+  }
   // (an overridden kernel lays out its own threadgroup memory within the device's: the host asked for the CUDA layout)
   if (PORT_KERNELS[index].status == 1) L.smem = std::min<size_t>(L.smem, r.dev.maxThreadgroupMemoryLength - pso.staticThreadgroupMemoryLength);
   size_t threads = (size_t)L.block.x * L.block.y * L.block.z;
@@ -680,10 +687,30 @@ struct GemmArgs {
   int32_t ta, tb, ptrs, epilogue, biasType;
   float alpha, beta;
 };
+double hostElement(cudaDataType t, const void* base, size_t i) {
+  if (t == CUDA_R_32F) return ((const float*)base)[i];
+  if (t == CUDA_R_16F) return (float)((const __half*)base)[i];
+  return (float)((const __nv_bfloat16*)base)[i];
+}
+void gemmCheck(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, const GemmArgs& a, int batch, const std::vector<unsigned char>& cBefore);
 void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int batch) {
   if (a.m <= 0 || a.n <= 0 || batch <= 0) return;
   Runtime& r = R();
   std::lock_guard<std::recursive_mutex> l(r.mu);
+  // LOCALFOLD_CHECK_GEMM=<calls>: the first calls recomputed on the host (sampled entries, double) and compared
+  static int checks = getenv("LOCALFOLD_CHECK_GEMM") ? atoi(getenv("LOCALFOLD_CHECK_GEMM")) : 0;
+  bool check = checks > 0 && !r.capturing && (!a.ptrs || a.beta == 0.f);
+  std::vector<unsigned char> cBefore;
+  if (check) {
+    --checks;
+    r.sync();
+    size_t es = tc_ == CUDA_R_32F ? 4 : 2;
+    size_t span = ((size_t)(batch - 1) * a.sc + (size_t)(a.n - 1) * a.ldc + a.m) * es;
+    cBefore.resize(span);
+    if (a.beta != 0.f) memcpy(cBefore.data(), r.host((void*)a.C), span);
+  }
+  struct Run { cudaDataType ta_, tb_, tc_; GemmArgs a; int batch; bool check; std::vector<unsigned char>* cb; Runtime& r;
+    ~Run() { if (check) { r.sync(); gemmCheck(ta_, tb_, tc_, a, batch, *cb); } } } run{ta_, tb_, tc_, a, batch, check, &cBefore, r};
   ++r.stats.gemms;
   // the tile: 64 x 64, or narrower along a short side (more threadgroups for a skinny product)
   // the tile: TR rows along n by TC columns along m. A short n (up to 128) in ONE tile row - every weight read once -
@@ -720,6 +747,41 @@ float scalar(const void* p, cublasComputeType_t compute) {
 }
 }  // namespace
 
+namespace {
+void gemmCheck(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, const GemmArgs& g, int batch, const std::vector<unsigned char>& cBefore) {
+  Runtime& r = R();
+  const void* A = r.host((void*)g.A); const void* B = r.host((void*)g.B); const void* D = r.host((void*)g.D);
+  double err = 0, nrm = 0; int bad = 0;
+  uint64_t seed = 12345;
+  for (int s = 0; s < 64; ++s) {
+    seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+    int z = (int)((seed >> 33) % batch), i = (int)((seed >> 13) % g.m), j = (int)((seed >> 40) % g.n);
+    if (g.ptrs) {   // the operands through the device arrays of pointers, batch z's own (strides 0)
+      A = r.host((void*)((const uint64_t*)r.host((void*)g.A))[z]);
+      B = r.host((void*)((const uint64_t*)r.host((void*)g.B))[z]);
+      D = r.host((void*)((const uint64_t*)r.host((void*)g.D))[z]);
+      z = 0;
+    }
+    double v = 0;
+    for (int k = 0; k < g.k; ++k) {
+      size_t ai = (size_t)z * g.sa + (g.ta ? (size_t)k + (size_t)i * g.lda : (size_t)i + (size_t)k * g.lda);
+      size_t bi = (size_t)z * g.sb + (g.tb ? (size_t)j + (size_t)k * g.ldb : (size_t)k + (size_t)j * g.ldb);
+      v += hostElement(ta_, A, ai) * hostElement(tb_, B, bi);
+    }
+    v *= g.alpha;
+    size_t ci = (size_t)z * g.sc + (size_t)i + (size_t)j * g.ldc;
+    if (g.beta != 0.f) v += g.beta * hostElement(tc_, cBefore.data(), ci);
+    if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (double)(float)((const __half*)r.host((void*)g.bias))[i] : ((const float*)r.host((void*)g.bias))[i];
+    if (g.epilogue & 2) v = std::max(v, 0.0);
+    size_t di = (size_t)z * g.sd + (size_t)i + (size_t)j * g.ldd;
+    double got = hostElement(tc_, D, di);
+    if (!std::isfinite(got)) ++bad;
+    err += (got - v) * (got - v); nrm += v * v;
+  }
+  fprintf(stderr, "  gemm check %s%s%s %dx%dx%d ta %d tb %d batch %d alpha %g beta %g epi %d: relRMS %.3e%s\n", typeTag(ta_), typeTag(tb_),
+          typeTag(tc_), g.m, g.n, g.k, g.ta, g.tb, batch, g.alpha, g.beta, g.epilogue, std::sqrt(err / std::max(nrm, 1e-300)), bad ? " NONFINITE" : "");
+}
+}  // namespace
 cublasStatus_t cublasSgemm(cublasHandle_t, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
                            const float* alpha, const float* A, int lda, const float* B, int ldb, const float* beta, float* C, int ldc) {
   GemmArgs a{(uint64_t)A, (uint64_t)B, (uint64_t)C, (uint64_t)C, 0, 0, 0, 0, 0, m, n, k, lda, ldb, ldc, ldc,

@@ -382,7 +382,8 @@ export async function foldEsmfold2(device, options) {
 
   try {
     // ---- the language model, first and released before anything pair-sized.
-    const lmPair = keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4, storage));
+    const lmPair = keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4,
+      storage | (options.onLanguagePair !== undefined ? GPUBufferUsage.COPY_SRC : 0)));
     // 🔴 THE LANGUAGE MODEL CAN BE TURNED OFF, WHICH IS THIS MODEL'S "SINGLE
     // SEQUENCE". AF2 and AF3 can be run without their alignment; the analogue
     // here is running without the protein language model, since ESM-C is where
@@ -421,6 +422,19 @@ export async function foldEsmfold2(device, options) {
     if (reuse === undefined) await mark("language pair", () => encodeLanguagePair(
       { device, allocator, cache, submit },
       { tokens, channels, single, weights: weights.shim, destination: lmPair }));
+    // `onLanguagePair(pair)`: the language model's pair term [tokens, tokens, channels] read back - a comparison
+    // aid (the native ports write theirs with EF2_SAVE_LMZ), only when asked
+    if (reuse === undefined && options.onLanguagePair !== undefined) {
+      const back = allocator.allocate("esmfold2.lm-pair-rb", pairs * channels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      const encoder = device.createCommandEncoder({ label: "esmfold2.lm-pair-rb" });
+      encoder.copyBufferToBuffer(lmPair.buffer, 0, back.buffer, 0, pairs * channels * 4);
+      device.queue.submit([encoder.finish()]);
+      await back.buffer.mapAsync(GPUMapMode.READ);
+      options.onLanguagePair(new Float32Array(back.buffer.getMappedRange().slice(0)), single);
+      back.buffer.unmap();
+      back.release();
+    }
 
     // ---- the inputs embedder, whose pooled output is most of `s_inputs`.
     const atomShape = {
@@ -555,6 +569,7 @@ export async function foldEsmfold2(device, options) {
       device.queue.submit([encoder.finish()]);
       await back.buffer.mapAsync(GPUMapMode.READ);
       embedderZInit = new Float32Array(back.buffer.getMappedRange().slice(0));
+      options.onZInit?.(embedderZInit);
       back.buffer.unmap();
       back.release();
     }
@@ -660,6 +675,18 @@ export async function foldEsmfold2(device, options) {
       recycleScratch.release();
     }
     held.splice(held.indexOf(recycleScratch), 1);
+    // `onTrunkPair(pair)`: the trunk's output pair read back - a comparison aid (EF2_SAVE_PAIR), only when asked
+    if (options.onTrunkPair !== undefined) {
+      const back = allocator.allocate("esmfold2.pair-rb", pairs * channels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      const encoder = device.createCommandEncoder({ label: "esmfold2.pair-rb" });
+      encoder.copyBufferToBuffer(pair.buffer, 0, back.buffer, 0, pairs * channels * 4);
+      device.queue.submit([encoder.finish()]);
+      await back.buffer.mapAsync(GPUMapMode.READ);
+      options.onTrunkPair(new Float32Array(back.buffer.getMappedRange().slice(0)));
+      back.buffer.unmap();
+      back.release();
+    }
 
     // 🔴 z_init IS DEAD WHEN THE LOOP ENDS AND THE FOLD'S PEAK IS AFTER IT.
     // `z = z_init + pair_loop_proj(z)` is its only reader, once a loop; it was
@@ -925,6 +952,7 @@ export async function foldEsmfold2(device, options) {
       const noisy = new Float32Array(x.length);
       for (let i = 0; i < noisy.length; i += 1) noisy[i] = x[i] + epsilon * draw();
       const denoised = await denoiser.denoise(noisy, tHat);
+      options.onDenoise?.(step, noisy, denoised, tHat);     // (a comparison aid: one denoiser call's input and output)
       x = samplerStep(noisy, denoised, features.mask, atoms, tHat,
                       schedule[step + 1], settings.stepScale);
       // 🔴 SCORED ON THE DENOISED PREDICTION, WHICH IS WHAT IS DRAWN. The

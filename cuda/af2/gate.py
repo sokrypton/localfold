@@ -78,7 +78,8 @@ def run_fold(name, inputs, ref):
         os.remove(pdb)
     p = subprocess.run([os.path.join(HERE, "fold"), pdb, *inputs], capture_output=True, text=True)
     text = p.stdout + p.stderr
-    m = re.search(r"mean pLDDT ([\d.]+)\s+pTM ([\d.nan]+)", text)
+    # the FINAL line (each pass prints its own "  pass k/n: mean pLDDT ..." first, and the first of those is not the fold)
+    m = re.search(r"^mean pLDDT ([\d.]+)\s+pTM ([\d.nan]+)", text, re.M)
     if p.returncode or not m or not os.path.exists(pdb):
         return {"error": text.strip().splitlines()[-1] if text.strip() else f"exit {p.returncode}"}
     s = subprocess.run([sys.executable, os.path.join(REPO, "cuda", "af3", "score.py"), pdb, *ref],

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# metal/ef2/fold <out.pdb> <flags>: cuda/ef2/fold's interface over the Metal binary
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+out="$1"; shift
+args=()
+for a in "$@"; do [ "$a" = "--" ] || args+=("$a"); done
+[ -x "$here/localfold-ef2" ] || bash "$here/../build.sh" ef2 >&2
+exec "$here/localfold-ef2" --out="$out" "${args[@]}"

@@ -77,7 +77,7 @@ for port in "${ports[@]}"; do
     echo 'static void portDefaults() __attribute__((constructor));'
     echo 'static void portDefaults() {'
     if [ -f "$here/$port/defaults.env" ]; then
-      grep -v '^#' "$here/$port/defaults.env" | grep '=' | while IFS='=' read -r k v; do echo "  setenv(\"$k\", \"$v\", 0);"; done
+      { grep -v '^#' "$here/$port/defaults.env" | grep '=' || true; } | while IFS='=' read -r k v; do echo "  setenv(\"$k\", \"$v\", 0);"; done
     fi
     echo '}' 
     # (the port's hand-written Metal kernels, appended to the translation)

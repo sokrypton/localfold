@@ -103,9 +103,10 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   const uint z = grp.z;
   device const TA* A; device const TB* B; device TC* D; device const TC* C;
   if (g.ptrs) {
-    A = ((device const device TA* const*)g.A)[z];
-    B = ((device const device TB* const*)g.B)[z];
-    D = ((device device TC* const*)g.D)[z];
+    // (the arrays themselves are in device memory: the address space goes on the OUTER pointer)
+    A = (device const TA*)((device const ulong*)g.A)[z];
+    B = (device const TB*)((device const ulong*)g.B)[z];
+    D = (device TC*)((device const ulong*)g.D)[z];
     C = (device const TC*)D;
   } else {
     A = (device const TA*)g.A + (long)z * g.sa;

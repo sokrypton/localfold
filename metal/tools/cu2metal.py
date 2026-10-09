@@ -74,6 +74,71 @@ def mask(src):
     return "".join(out)
 
 
+def strip_comments(src):
+    """The source with its comments removed (strings kept): a body joined onto one line as a macro must not have a
+    `//` comment swallow the rest of it."""
+    m = mask(src)
+    out = []
+    for c, mc in zip(src, m):
+        # (the mask turns a comment's characters to spaces and a string's to 'x': a non-space masked to a space was a
+        # comment)
+        out.append(" " if mc == " " and not c.isspace() else c)
+    return "".join(out)
+
+
+def live_names(text):
+    """The variables declared in `text` that are still in scope at its end: a stack of brace scopes, each holding what
+    it declared (every declarator of a declaration, `float m[H], l[H], acc[H][D];` included)."""
+    m = mask(text)
+    scopes = [set()]
+    stmt_start = 0
+    i = 0
+    def declare(stmt):
+        st = stmt.strip()
+        if not st or st.startswith("#"):
+            return
+        st = re.sub(r"^(for|while|if|switch)\s*\(", "", st)
+        dm = re.match(r"(?:(?:const|constexpr|static|thread|device|threadgroup|unsigned|signed|volatile)\s+)*"
+                      r"([A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?)\s*([*&]\s*)*(.*)$", st, re.S)
+        if not dm or dm.group(1) in KEYWORDS - {"auto", "int", "float", "uint", "bool", "char", "short", "long", "ulong",
+                                                  "ushort", "uchar", "half", "half2", "float2", "float3", "float4", "int2",
+                                                  "int3", "int4", "uint2", "uint4", "unsigned", "signed"}:
+            return
+        rest = dm.group(3)
+        if not rest or rest[0] in "(=+-[.<>!" or "=" == rest.strip()[:1]:
+            return
+        for decl in split_commas(rest):
+            nm = re.match(r"\s*[*&]*\s*([A-Za-z_]\w*)\s*(\[|=|$|\{|\()", decl)
+            if nm and nm.group(1) not in KEYWORDS:
+                scopes[-1].add(nm.group(1))
+    while i < len(m):
+        c = m[i]
+        if c == "{":
+            declare(m[stmt_start:i])
+            scopes.append(set()); stmt_start = i + 1
+        elif c == "}":
+            if len(scopes) > 1:
+                scopes.pop()
+            stmt_start = i + 1
+        elif c == ";":
+            declare(m[stmt_start:i]); stmt_start = i + 1
+        elif c == "(":
+            # a for-statement's init declares into the scope the loop body opens: count it into the current one
+            close = match(m, i, "(", ")")
+            head = m[stmt_start:i]
+            if re.search(r"\b(for|if|while|switch)\s*$", head):
+                # (a loop's or condition's own declarations end with its statement: never a lambda's capture)
+                i = close + 1
+                stmt_start = i
+                continue
+            i = close
+        i += 1
+    names = set()
+    for sc in scopes:
+        names |= sc
+    return names
+
+
 def match(m, i, open_c, close_c):
     """Index of the bracket closing the one at m[i]."""
     depth = 0
@@ -437,7 +502,7 @@ def lower_lambdas(body, ctx_names=()):
         ret = rm.group(3)
         bo = k + rm.end() - 1
         bc = match(body, bo, "{", "}")
-        inner = body[bo + 1:bc].strip()
+        inner = strip_comments(body[bo + 1:bc]).strip()
         semi = body.find(";", bc)
         # substitute parameters
         def subst(text):
@@ -460,14 +525,22 @@ def lower_lambdas(body, ctx_names=()):
         elif len(rets) > 1 or (rets and not re.search(r"return\s+([^;]*);\s*$", inner)):
             # a helper function: the captured names (declared before the lambda, used in it) passed by value
             before = body[:m.start()]
-            declared = set(re.findall(r"\b[A-Za-z_][\w:<>]*[\s*&]+([A-Za-z_]\w*)\s*(?:=|;|,|\[|\))", before)) | set(ctx_names)
+            declared = live_names(before) | set(ctx_names)
             used_ids = set(re.findall(r"\b([A-Za-z_]\w*)\b", inner))
             pnames = {p[1] for p in params if p[1]}
             caps = sorted((declared & used_ids) - pnames - KEYWORDS)
             fname = f"_lf_lambda_{name}_{len(LAMBDA_HELPERS)}"
             tps = [f"typename _C{i}" for i in range(len(caps))]
-            fps = (["thread const LfCtx& _c"] + [f"_C{i} {c}" for i, c in enumerate(caps)] +
-                   [f"{'thread ' if '&' in t else ''}{t} {n}" for t, n, _ in params if n])
+            pps = []
+            for pi, (t, n, _) in enumerate(params):
+                if not n:
+                    continue
+                if "*" in t:                          # (a pointer parameter: any address space)
+                    tps.append(f"typename _LP{pi}")
+                    pps.append(f"_LP{pi} {n}")
+                else:
+                    pps.append(f"{'thread ' if '&' in t else ''}{t} {n}")
+            fps = ["thread const LfCtx& _c"] + [f"_C{i} {c}" for i, c in enumerate(caps)] + pps
             tmpl = f"template <{', '.join(tps)}>\n" if tps else ""
             LAMBDA_HELPERS.append(f"{tmpl}inline auto {fname}({', '.join(fps)}) {{{inner}}}\n")
             args_ = ", ".join(["_c"] + caps + [f"{p[1]}_lfarg" for p in params if p[1]])
@@ -632,24 +705,28 @@ class Port:
         self.walk(self.root, set())
         self.parsed = {}
         self.port = os.path.basename(os.path.dirname(os.path.dirname(self.root)))
-        self.host_overrides = {}
-        hdir = os.path.join(REPO, "metal", self.port, "host")
-        if os.path.isdir(hdir):
-            for f in sorted(os.listdir(hdir)):
-                if f.endswith(".h"):
-                    self.host_overrides[f[:-2]] = open(os.path.join(hdir, f)).read()
+        # overrides belong to the port that OWNS the CUDA file they patch (cuda/<owner>/...): cuda/af2 includes cuda/af3's
+        # headers, and metal/af3's overrides of those apply to it too
+        self.host_overrides = {}       # (owner, function name) -> text
+        for owner in sorted(os.listdir(os.path.join(REPO, "metal"))):
+            hdir = os.path.join(REPO, "metal", owner, "host")
+            if os.path.isdir(hdir):
+                for f in sorted(os.listdir(hdir)):
+                    if f.endswith(".h"):
+                        self.host_overrides[(owner, f[:-2])] = open(os.path.join(hdir, f)).read()
         for path in self.files:
             src = open(path).read()
             replacement = os.path.join(REPO, "metal", "replace", os.path.relpath(path, CUDA))
             if os.path.exists(replacement):        # (a hand-written Metal version of the whole file)
                 src = open(replacement).read()
-            inject = os.path.join(REPO, "metal", self.port, "inject", os.path.relpath(path, CUDA))
+            owner = os.path.relpath(path, CUDA).split(os.sep)[0]
+            inject = os.path.join(REPO, "metal", owner, "inject", os.path.relpath(path, CUDA))
             if os.path.exists(inject):             # (Metal kernels and helpers added to the file, CUDA syntax)
                 # after the file's own includes, before anything that may call them
                 last = 0
                 for im in re.finditer(r"^\s*#\s*include\b[^\n]*\n", src, re.M):
                     last = im.end()
-                src = (src[:last] + "// ---- injected: metal/" + self.port + "/inject/" + os.path.relpath(path, CUDA) + "\n" +
+                src = (src[:last] + "// ---- injected: metal/" + owner + "/inject/" + os.path.relpath(path, CUDA) + "\n" +
                        open(inject).read() + "\n// ---- end of injection\n" + src[last:])
             m = mask(src)
             items = items_of(m, 0, len(m))
@@ -679,10 +756,11 @@ class Port:
                         hname = parse_signature(it.header)[1]
                     except Exception:
                         hname = None
-                    if hname in self.host_overrides:
-                        # (a host function of the Metal build's own, metal/<port>/host/<name>.h: every overload of the
+                    owner = os.path.relpath(path, CUDA).split(os.sep)[0]
+                    if (owner, hname) in self.host_overrides:
+                        # (a host function of the Metal build's own, metal/<owner>/host/<name>.h: every overload of the
                         # name replaced by the file, once)
-                        pieces.append(f"// {hname}: metal/{self.port}/host/{hname}.h\n" + self.host_overrides.pop(hname))
+                        pieces.append(f"// {hname}: metal/{owner}/host/{hname}.h\n" + self.host_overrides.pop((owner, hname)))
                         self.replaced_host = getattr(self, "replaced_host", set()) | {hname}
                     elif hname in getattr(self, "replaced_host", set()):
                         pieces.append("")
@@ -695,6 +773,8 @@ class Port:
         for path, host in host_out.items():
             rel = os.path.relpath(path, CUDA)
             dst = os.path.join(self.out, "gen", rel)
+            # /dev/shm is Linux's: the system's temporary directory (lf::tmpDir, lfcuda.h)
+            host = re.sub(r'"/dev/shm/([^"]*)"', r'(std::string(lf::tmpDir()) + "/\1")', host)
             # libzstd: on a Mac it is linked into the binary itself (metal/build.sh), where dlsym finds it
             host = re.sub(r'dlopen\("libzstd\.so\.1",\s*RTLD_NOW\)', "dlopen(nullptr, RTLD_NOW)", host)
             host = re.sub(r'dlopen\("libzstd\.so",\s*RTLD_NOW\)', "dlopen(nullptr, RTLD_NOW)", host)
@@ -722,9 +802,8 @@ class Port:
         struct = f"{name}__a{index}"
         # a hand-written body (metal/<port>/kernels/<name>.cu, CUDA syntax, translated as the original is) replaces
         # the CUDA one; the signature and the argument struct stay the translator's
-        port = os.path.basename(os.path.dirname(self.root)) if os.path.basename(self.root).endswith(".cu") else ""
-        port = os.path.basename(os.path.dirname(os.path.dirname(self.root)))
-        ofile = os.path.join(REPO, "metal", port, "kernels", name + ".cu")
+        owner = os.path.relpath(path, CUDA).split(os.sep)[0]
+        ofile = os.path.join(REPO, "metal", owner, "kernels", name + ".cu")
         override = os.path.exists(ofile)
         obody = None
         if override:
@@ -879,9 +958,11 @@ class Port:
             if re.search(r"\b(constexpr|const)\b", mt) and "(" not in mt.split("=")[0]:
                 if re.search(r"\bstd::|\bstring\b", mt.split("=")[0]):
                     return names
-                m4 = re.search(r"(\w+)\s*(\[[^\]]*\])?\s*=", mt)
-                if m4:
-                    names.add(m4.group(1))
+                # every declarator: `constexpr int A = 1, B = 2;`
+                for decl in split_commas(mt.rstrip().rstrip(";")):
+                    m4 = re.search(r"(\w+)\s*(\[[^\]]*\])?\s*=", decl)
+                    if m4:
+                        names.add(m4.group(1))
             return names
         cands = []
         for path in self.files:
@@ -1058,8 +1139,14 @@ class Port:
             if "*" in t:
                 t = re.sub(r"\bdouble\b", "lf_f64", t)
                 mt = device_ptr_type(t)
-                members.append(f"  {mt} {pname};")
-                locals_.append(f"  {mt} {pname} = _lf_a.{pname};")
+                if t.count("*") > 1:
+                    # (a pointer to pointers: Metal takes none in a kernel's argument struct, so its address travels as
+                    # an integer and is cast back here)
+                    members.append(f"  ulong {pname};")
+                    locals_.append(f"  {mt} {pname} = ({mt})_lf_a.{pname};")
+                else:
+                    members.append(f"  {mt} {pname};")
+                    locals_.append(f"  {mt} {pname} = _lf_a.{pname};")
             elif re.search(r"\bdouble\b", t):
                 members.append(f"  lf_f64 {pname};")
                 locals_.append(f"  float {pname} = (float)_lf_a.{pname};")
@@ -1067,7 +1154,7 @@ class Port:
                 members.append(f"  {t} {pname};")
                 locals_.append(f"  {t} {pname} = _lf_a.{pname};")
         body = shared_in_place(k["body"])
-        body, lambdas = self.common_body(body, [p[1] for p in k["ps"] if p[1]])
+        body, lambdas = self.common_body(body, [p[1] for p in k["ps"] if p[1]] + [t[2] for t in k["tps"] if t[0] == "value"])
         shared = set(re.findall(r"\bthreadgroup\s+[\w:<> ]+?\s+(\w+)\s*\[", body)) | set(re.findall(r"threadgroup\s+[\w:<> ]+\*\s*(\w+)\s*=", body))
         pointers = {p[1] for p in k["ps"] if p[1] and "*" in p[0]}
         body = local_references(body, shared, pointers)

@@ -104,7 +104,7 @@ template <typename T> inline T lf_shfl_xor_w(thread const LfCtx& c, T v, int m, 
 
 // A double the HOST reads or writes (a kernel argument, a buffer): CUDA's 8 bytes, kept as the double's bits.
 // Metal has no double arithmetic, so a kernel computes in float and converts at the edge (exact from float).
-struct lf_f64 {
+struct alignas(8) lf_f64 {   // (8-aligned: a host double in an argument struct sits on 8 bytes)
   uint lo, hi;
   lf_f64() = default;
   lf_f64(float f) { set(f); }
@@ -124,8 +124,10 @@ struct lf_f64 {
     return as_type<float>((s << 31) | ((uint)fe << 23) | m);
   }
   float get() const device { lf_f64 t = *this; return t.get(); }
+  float get() const constant { lf_f64 t = *this; return t.get(); }
   operator float() const thread { return get(); }
   operator float() const device { return get(); }
+  operator float() const constant { return get(); }
   void operator=(float f) device { lf_f64 t; t.set(f); lo = t.lo; hi = t.hi; }
   void operator=(float f) thread { set(f); }
   void operator+=(float f) device { float v = get() + f; lf_f64 t; t.set(v); lo = t.lo; hi = t.hi; }

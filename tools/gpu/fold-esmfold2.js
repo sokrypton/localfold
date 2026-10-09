@@ -373,7 +373,29 @@ export async function main(device, args = []) {
   // nothing here could say which side of the bus the difference was on. It
   // wraps the device rather than the kernels; see tools/gpu/buffer-profile.js.
   const buffers = args.includes("--buffers") ? profileBuffers(device) : null;
+  // --compare-lm=<url>: a native port's language-model pair (EF2_SAVE_LMZ, raw float32 [T, T, P]) against this one
+  const compareLm = option(args, "compare-lm", "");
+  // --compare-zi=<url> / --compare-pair=<url>: z_init (+ "<url>.s": s_inputs) and the trunk's pair against a native port's
+  const fetchF32 = async (u) => new Float32Array(await (await fetch(u)).arrayBuffer());
+  const relRms = (a, b) => { let e = 0, n = 0; for (let i = 0; i < a.length; i += 1) { const d = a[i] - b[i]; e += d * d; n += a[i] * a[i]; }
+    return Math.sqrt(e / n).toExponential(3) + ` (${a.length} against ${b.length})`; };
+  const nativeLm = compareLm === "" ? null : new Float32Array(await (await fetch(compareLm)).arrayBuffer());
+  const cmpZi = option(args, "compare-zi", ""), cmpPair = option(args, "compare-pair", "");
+  // --dump-denoise=<step>: that denoiser call's level, input and output, in the report (a native port replays them)
+  const dumpDenoiseStep = option(args, "dump-denoise", "");
+  let denoiseDump = null;
   const result = await foldEsmfold2(device, {
+    ...(dumpDenoiseStep === "" ? {} : { onDenoise: (step, noisy, denoised, tHat) => {
+      if (step === Number(dumpDenoiseStep)) denoiseDump = { step, tHat, noisy: Array.from(noisy), denoised: Array.from(denoised) };
+    } }),
+    ...(cmpZi === "" ? {} : { onZInit: async (z) => console.log(`z_init against ${cmpZi}: relRMS ${relRms(z, await fetchF32(cmpZi))}`) }),
+    ...(cmpPair === "" ? {} : { onTrunkPair: async (z) => console.log(`trunk pair against ${cmpPair}: relRMS ${relRms(z, await fetchF32(cmpPair))}`) }),
+    ...(nativeLm === null ? {} : { onLanguagePair: (pair) => {
+      let err = 0, nrm = 0;
+      for (let i = 0; i < pair.length; i += 1) { const d = pair[i] - nativeLm[i]; err += d * d; nrm += pair[i] * pair[i]; }
+      console.log(`language pair against ${compareLm}: relRMS ${Math.sqrt(err / nrm).toExponential(3)}`
+        + ` (${pair.length} against ${nativeLm.length} values)`);
+    } }),
     sequence, allocator, seed, sampler,
     ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
     entities: entitiesFor(),
@@ -420,6 +442,8 @@ export async function main(device, args = []) {
       updates.set(phase, (updates.get(phase) ?? 0) + 1);
     },
   });
+  if (denoiseDump !== null) console.log("DENOISE_DUMP " + JSON.stringify(denoiseDump));
+  if (cmpZi !== "") console.log(`s_inputs against ${cmpZi}.s: relRMS ${relRms(result.sInputs, await fetchF32(cmpZi + ".s"))}`);
 
   if (buffers !== null) {
     const traffic = buffers.report();

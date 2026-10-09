@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# metal/af2/fold <out.pdb> <flags>: cuda/af2/fold's interface over the Metal binary (what metal/check/gate-af2.py runs)
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+out="$1"; shift
+args=()
+for a in "$@"; do [ "$a" = "--" ] || args+=("$a"); done
+[ -x "$here/localfold-af2" ] || bash "$here/../build.sh" af2 >&2
+exec "$here/localfold-af2" --out="$out" "${args[@]}"

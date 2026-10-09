@@ -356,6 +356,13 @@ inline std::to_chars_result to_chars(char* first, char* last, double v) {
 }
 template <class I, typename std::enable_if<std::is_integral<I>::value, int>::type = 0>
 inline std::to_chars_result to_chars(char* first, char* last, I v) { return std::to_chars(first, last, v); }
+// where a Linux build would use /dev/shm: $TMPDIR (macOS's per-user temporary directory), else /tmp
+inline const char* tmpDir() {
+  const char* t = getenv("TMPDIR");
+  static std::string dir = (t && *t) ? std::string(t) : std::string("/tmp");
+  while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+  return dir.c_str();
+}
 // the host memory behind a device pointer (unified memory: the same bytes), for tools and tests
 void* hostView(const void* device);
 }  // namespace lf

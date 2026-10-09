@@ -1,0 +1,47 @@
+{
+ "1brs-complex": {
+  "plddt": 94.45,
+  "ptm": "0.9673",
+  "rmsd": 0.911
+ },
+ "1qys": {
+  "plddt": 83.81,
+  "ptm": "0.8792",
+  "rmsd": 0.865
+ },
+ "5caj": {
+  "plddt": 90.85,
+  "ptm": "0.9446",
+  "rmsd": 2.104
+ },
+ "6mrr": {
+  "plddt": 77.1,
+  "ptm": "0.7360",
+  "rmsd": 1.362
+ },
+ "6mrr-gol-sep3": {
+  "ligand": 0.052,
+  "plddt": 80.1,
+  "ptm": "0.7881",
+  "rmsd": 1.678
+ },
+ "dna-duplex": {
+  "nucleic": 0.064,
+  "plddt": 57.58,
+  "ptm": "0.1594",
+  "rmsd": null
+ },
+ "kras-sotorasib": {
+  "covalent": 1.52,
+  "ligand": 0.025,
+  "plddt": 83.75,
+  "ptm": "0.9100",
+  "rmsd": null
+ },
+ "rna-hairpin": {
+  "nucleic": 0.062,
+  "plddt": 60.07,
+  "ptm": "0.0622",
+  "rmsd": null
+ }
+}
