@@ -31,10 +31,10 @@
     swiglu<T>(wide, gated, r, I);
 @@@ end
 
-# (the interleaved weight lf::gemmSwiglu reads, defined just before the transition that uses it)
+# (the derived weights lf::gemmSwiglu and lf::gemmTriGate read, defined before the triangle and the transition)
 @@@ old
 template <class T>
-void transition(float* x, size_t rows, int C, int factor, const std::string& pre) {
+void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
 @@@ new
 // (Metal) a transition's first weight [in][2I] with a's and b's columns interleaved - a_0 b_0 a_1 b_1 ... - for
 // lf::gemmSwiglu, whose epilogue reads a lane's adjacent pair. Derived on the device once per weight and registered with
@@ -45,6 +45,24 @@ __global__ void interleaveHalvesK(const half* w, half* out, int rows, int I) {
   size_t r = t / (2 * I); int c = (int)(t % (2 * I));
   int k = c / 2;
   out[t] = w[r * 2 * I + ((c & 1) ? I + k : k)];
+}
+// (and the triangle's [projection | gate] weight [C][4C], halves interleaved by channel, reordered so channel c's pa pb
+// ga gb are columns 4c..4c+3 - for lf::gemmTriGate)
+__global__ void triGateColumnsK(const half* w, half* out, int rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)rows * 4 * C) return;
+  size_t r = t / (4 * C); int col = (int)(t % (4 * C)), c = col / 4, k = col % 4;
+  out[t] = w[r * 4 * C + (k < 2 ? 2 * c + k : 2 * C + 2 * c + k - 2)];
+}
+inline const half* triGateColumns(const std::string& name, int C) {
+  static std::map<std::string, half*> made;
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& kv : made) CK(cudaFree(kv.second)); made.clear(); }); hooked = true; }
+  auto it = made.find(name);
+  if (it != made.end()) return it->second;
+  half* out = dallocT<half>((size_t)C * 4 * C);
+  triGateColumnsK<<<blocks((size_t)C * 4 * C), 256, 0, STREAM>>>(Wh(name), out, C, C);
+  return made[name] = out;
 }
 inline const half* swigluPairs(const std::string& name, int rows, int I) {
   static std::map<std::string, half*> made;
@@ -57,5 +75,23 @@ inline const half* swigluPairs(const std::string& name, int rows, int I) {
   return made[name] = out;
 }
 template <class T>
-void transition(float* x, size_t rows, int C, int factor, const std::string& pre) {
+void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
+@@@ end
+
+# The unfused triangle's input side: the projection's GEMM gates in its epilogue and writes a and b channel-major itself
+# (lf::gemmTriGate, over the weight reordered so channel c's pa pb ga gb are columns 4c..4c+3), where the port writes the
+# 4C-wide [projection | gate] and runs triGateK over it. LOCALFOLD_UNFUSED_TRIGATE=1 is the control.
+@@@ old
+    linear<T, T>(norm + r0 * C, pgOut, rows, C, 4 * C, pg);
+    triGateK<T><<<dim3((unsigned)((rows + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(
+      pgOut, mask, a, b, r0, rows, C, cs, n, np);
+@@@ new
+    static const bool fuseTriGate = !getenv("LOCALFOLD_UNFUSED_TRIGATE");
+    if constexpr (std::is_same_v<T, half>) if (fuseTriGate) {
+      lf::gemmTriGate(norm + r0 * C, triGateColumns(pg, C), mask, a, b, r0, rows, C, cs, n, np);
+      continue;
+    }
+    linear<T, T>(norm + r0 * C, pgOut, rows, C, 4 * C, pg);
+    triGateK<T><<<dim3((unsigned)((rows + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(
+      pgOut, mask, a, b, r0, rows, C, cs, n, np);
 @@@ end

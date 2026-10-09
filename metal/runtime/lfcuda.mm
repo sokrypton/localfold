@@ -760,6 +760,7 @@ struct GemmArgs {
   int32_t ta, tb, ptrs, epilogue, biasType;
   float alpha, beta;
   uint64_t aux = 0; int32_t ldaux = 0, auxPad = 0;
+  uint64_t aux2 = 0, aux3 = 0; int64_t tgR0 = 0, tgPairs = 0; int32_t tgN = 0, tgNp = 0, tgC = 0, tgPad = 0;
 };
 double hostElement(cudaDataType t, const void* base, size_t i) {
   if (t == CUDA_R_32F) return ((const float*)base)[i];
@@ -773,7 +774,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   std::lock_guard<std::recursive_mutex> l(r.mu);
   // LOCALFOLD_CHECK_GEMM=<calls>: the first calls recomputed on the host (sampled entries, double) and compared
   static int checks = getenv("LOCALFOLD_CHECK_GEMM") ? atoi(getenv("LOCALFOLD_CHECK_GEMM")) : 0;
-  bool check = checks > 0 && !r.capturingHere() && (!a.ptrs || a.beta == 0.f) && !(a.epilogue & (64 | 128));
+  bool check = checks > 0 && !r.capturingHere() && (!a.ptrs || a.beta == 0.f) && !(a.epilogue & (64 | 128 | 256));
   std::vector<unsigned char> cBefore;
   if (check) {
     --checks;
@@ -820,9 +821,9 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   int bk = tc == 64 && tr >= 48 ? 16 : 32;
   if (const char* k = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(k) == 16 ? 16 : 32;       // (an arm: 16 or 32 everywhere)
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
-                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(bk);
+                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(bk) + ", " + std::to_string(a.epilogue & 256 ? 1 : 0);
   std::string name = std::string("lf_gemm_") + typeTag(ta_) + "_" + typeTag(tb_) + "_" + typeTag(tc_) + "_" +
-                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + (bk == 32 ? "" : "_k" + std::to_string(bk));
+                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + (bk == 32 ? "" : "_k" + std::to_string(bk)) + (a.epilogue & 256 ? "_trigate" : "");
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
   MTLSize grid = MTLSizeMake((a.m + bm - 1) / bm, (a.n + bn - 1) / bn, batch);
   char label[96]; snprintf(label, sizeof label, "gemm %s %dx%dx%d%s", name.c_str() + 8, a.m, a.n, a.k, batch > 1 ? " batched" : "");
@@ -842,6 +843,16 @@ void lf::gemmSwiglu(const void* X, const void* Wpairs, void* gated, size_t rows,
   GemmArgs a{(uint64_t)Wpairs, (uint64_t)X, (uint64_t)gated, (uint64_t)gated, 0, 0, 0, 0, 0, 2 * hidden, (int)rows, in,
              2 * hidden, in, hidden, hidden, 0, 0, 0, 128, 0, 1.f, 0.f};
   gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, a, 1);
+}
+// the triangle's projection and gate in one GEMM: a[c][q], b[c][q] (channel-major over the padded positions) from
+// X [rows][C] and W [C][4C] with channel c's (pa, pb, ga, gb) at columns 4c..4c+3 (metal/af3/pairtrack.cuh.patch)
+void lf::gemmTriGate(const void* X, const void* W, const float* mask, void* a, void* b, size_t r0, size_t rows, int C,
+                     size_t pairs, int n, int np) {
+  GemmArgs g{(uint64_t)W, (uint64_t)X, (uint64_t)a, (uint64_t)a, 0, 0, 0, 0, 0, 4 * C, (int)rows, C, 4 * C, C, 4 * C,
+             4 * C, 0, 0, 0, 256, 0, 1.f, 0.f};
+  g.aux = (uint64_t)mask; g.aux2 = (uint64_t)a; g.aux3 = (uint64_t)b;
+  g.tgR0 = (int64_t)r0; g.tgPairs = (int64_t)pairs; g.tgN = n; g.tgNp = np; g.tgC = C;
+  gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, g, 1);
 }
 namespace {
 float scalar(const void* p, cublasComputeType_t compute) {

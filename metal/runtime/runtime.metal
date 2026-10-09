@@ -67,6 +67,9 @@ struct GemmArgs {
   int ta, tb, ptrs, epilogue, biasType;
   float alpha, beta;
   ulong aux; int ldaux, auxPad;      // epilogue 64: D += aux * sigmoid(alpha X W) (aux half, D float)
+  // EP 1, the triangle's gate (aux the row mask, aux2/aux3 a and b): columns (4c .. 4c+3) are channel c's projection
+  // and gate halves, and a[c][q] = pa m sigmoid(ga), b[c][q] = pb m sigmoid(gb) at the padded position q of row tgR0 + j
+  ulong aux2, aux3; long tgR0, tgPairs; int tgN, tgNp, tgC, tgPad;
 };
 // Tiles: BM x BN of C a threadgroup (four simdgroups, 2 x 2), BK of k a step. A and B are staged in threadgroup
 // memory in the type the multiply takes (half for f16 inputs, float otherwise - bf16's range is float's), along
@@ -95,7 +98,7 @@ template <> inline void lf_stage8<float, float>(threadgroup float* dst, device c
 // is then row-major activations times row-major weights, both staged along their contiguous axis and loaded as
 // 8 x 8 matrices WITHOUT the transposing load (a transposed operand stages the other way and takes it). A tile is
 // TR rows of X (n) by TC columns of W (m); each lane's two output elements are adjacent in C.
-template <typename TA, typename TB, typename TC, int TR, int TC_, bool TRA, bool TRB, int BK = 32>
+template <typename TA, typename TB, typename TC, int TR, int TC_, bool TRA, bool TRB, int BK = 32, int EP = 0>
 kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
@@ -121,6 +124,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   constexpr int XROW = TRB ? TR + PAD : BK + PAD, WROW = TRA ? BK + PAD : TC_ + PAD;
   threadgroup T Xs[(TRB ? BK : TR) * XROW];
   threadgroup T Ws[(TRA ? TC_ : BK) * WROW];
+  threadgroup half Sab[EP == 1 ? 2 * (TC_ / 4) * TR : 1];     // (EP 1: the gated a and b, channel-major, for the store)
   constexpr int WR = TR / 2, WC = TC_ / 2, FR = WR / 8, FC = WC / 8;
   const int sr = (sg / 2) * WR, sc = (sg % 2) * WC;
   simdgroup_float8x8 acc[FR][FC];
@@ -179,6 +183,34 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         _Pragma("clang loop unroll(full)")
         for (int b = 0; b < FC; ++b) simdgroup_multiply_accumulate(acc[a][b], xm[a], wm[b], acc[a][b]);
     }
+  }
+  if (EP == 1) {   // the triangle's gate: lane (bit 0 clear) holds (pa, pb), its neighbour (ga, gb) of the same channel
+    const int sm1 = (lane / 16) * 4 + (lane % 8) / 2, sn1 = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
+    device const float* mask = (device const float*)g.aux;
+    _Pragma("clang loop unroll(full)")
+    for (int a = 0; a < FR; ++a)
+      _Pragma("clang loop unroll(full)")
+      for (int b = 0; b < FC; ++b) {
+        thread auto& e = acc[a][b].thread_elements();
+        float g0 = simd_shuffle_xor((float)e[0], 1), g1 = simd_shuffle_xor((float)e[1], 1);
+        if ((lane & 1) == 0) {
+          int jl = sr + a * 8 + sm1, il = sc + b * 8 + sn1, jg = j0 + jl;
+          float m = jg < g.n ? mask[g.tgR0 + jg] : 0.f;
+          Sab[(il / 4) * TR + jl] = (half)(e[0] * m / (1.f + exp(-g0)));
+          Sab[(TC_ / 4 + il / 4) * TR + jl] = (half)(e[1] * m / (1.f + exp(-g1)));
+        }
+      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device half* outA = (device half*)g.aux2; device half* outB = (device half*)g.aux3;
+    for (int t = tid; t < (TC_ / 4) * TR; t += 128) {      // channel-major, a channel's rows consecutive
+      int cl = t / TR, jl = t % TR, jg = j0 + jl, c = i0 / 4 + cl;
+      if (jg >= g.n || c >= g.tgC) continue;
+      uint p = (uint)(g.tgR0 + jg), r = p / (uint)g.tgN;
+      ulong q = (ulong)r * g.tgNp + (p - r * (uint)g.tgN);
+      outA[(ulong)c * g.tgPairs + q] = Sab[cl * TR + jl];
+      outB[(ulong)c * g.tgPairs + q] = Sab[(TC_ / 4 + cl) * TR + jl];
+    }
+    return;
   }
   // a lane's elements: X row (j) sm, W columns (i) sn and sn + 1 - adjacent in C
   const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
