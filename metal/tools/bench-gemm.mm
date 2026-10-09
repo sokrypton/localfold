@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <chrono>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -37,8 +38,13 @@ int main(int argc, char** argv) { @autoreleasepool {
     float one = 1, zero = 0, betav = getenv("BETA") ? 1.f : 0.f;
     if (out32) { cudaFree(dC); cudaMalloc(&dC, nc * 4); cudaMemset(dC, 0, nc * 4); }
     int lda = c.ta ? c.k : c.m, ldb = c.tb ? c.n : c.k;
-    auto run = [&] { cublasGemmEx(h, c.ta ? CUBLAS_OP_T : CUBLAS_OP_N, c.tb ? CUBLAS_OP_T : CUBLAS_OP_N, c.m, c.n, c.k, &one, dA, ty, lda,
+    std::function<void()> run = [&] { cublasGemmEx(h, c.ta ? CUBLAS_OP_T : CUBLAS_OP_N, c.tb ? CUBLAS_OP_T : CUBLAS_OP_N, c.m, c.n, c.k, &one, dA, ty, lda,
                                   dB, ty, ldb, &betav, dC, tyc, c.m, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP); };
+    // GATED=1: the runtime's gated residual (lf::gemmGatedAdd: an f32 pair += aux * sigmoid(X W)), timings only
+    if (getenv("GATED")) {
+      void *aux, *pr; cudaMalloc(&aux, nc * 2); cudaMalloc(&pr, nc * 4); cudaMemset(aux, 0, nc * 2); cudaMemset(pr, 0, nc * 4);
+      run = [&, aux, pr] { lf::gemmGatedAdd(dB, dA, aux, (float*)pr, c.n, c.k, c.m); };
+    }
     run(); cudaDeviceSynchronize();
     std::vector<__half> C(nc); std::vector<float> Cf(nc);
     if (f32) { cudaMemcpy(Cf.data(), dC, nc * 4, cudaMemcpyDeviceToHost); for (size_t i = 0; i < nc; ++i) C[i] = __half(Cf[i]); }
