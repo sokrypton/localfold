@@ -49,3 +49,11 @@
   if (!getenv("LOCALFOLD_KEEP_SCRATCH")) releaseScratch({"dc.", "dtr.", "tb.", "dn.", "atom."});
   mem("sampler");
 @@@ end
+# (Metal) no warm-up fold: on CUDA it loads kernel modules and cuBLAS plans while the weights go up; here the kernels come
+# compiled from the specialisations list at start-up, and the warm fold was 3.1 s of a 68-token fold's 5.3 (2.0 without,
+# the same stage times and the same digits). LOCALFOLD_WARM=1 is the control.
+@@@ old
+  bool warming = !warmShape.empty();
+@@@ new
+  bool warming = !warmShape.empty() && getenv("LOCALFOLD_WARM");
+@@@ end

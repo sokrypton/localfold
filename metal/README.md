@@ -153,6 +153,12 @@ channel as AF3 does) and its gated residual in the gating linear's GEMM (the out
 tokens: 19.35 -> 11.9 s**, 5CAJ's pLDDT 90.82 -> 90.84. `LOCALFOLD_UNFUSED_SWIGLU=1`, `LOCALFOLD_UNFUSED_TRIGATE=1`
 are the controls.
 
+**No warm-up fold** (`metal/ef2/ef2.cu.patch`, `metal/af2/af2.cu.patch`). On CUDA the standalone binaries fold a small
+warm input while the weights go up, to load kernel modules and cuBLAS plans; here the kernels come compiled from the
+specialisations list at start-up, so the warm fold was a second fold run first - 3.1 s of ESMFold2's 5.3 on 6MRR
+(**2.0 s without**, the same stage times and digits), ~0.1-0.2 s of AF2's. 5CAJ through ESMFold2 loads in 0.49 s where
+it was 5.34. `LOCALFOLD_WARM=1` is the control.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):
 
