@@ -48,16 +48,43 @@ __global__ void ipaWeightsK(const float* qs, const float* ks, const float* qp, c
   float* row = attn + ((size_t)q * Hh + h) * L;     // [q, h, k]
   float mx = -INFINITY;
   float w = pw[h];
+  // the query's scalars and points held in registers, read once (they were read again for every key); the
+  // keys' scalars as float4s where 16-byte aligned - the same products in the same order
+  constexpr int CS_MAX = 32, PQ_MAX = 8;
+  const bool fast = Cs <= CS_MAX && Pq <= PQ_MAX && Cs % 4 == 0;
+  float qv[CS_MAX], qpt[PQ_MAX * 3];
+  if (fast) {
+#pragma unroll
+    for (int c = 0; c < CS_MAX; ++c) qv[c] = c < Cs ? qs[((size_t)q * Hh + h) * Cs + c] : 0.f;
+#pragma unroll
+    for (int e = 0; e < PQ_MAX * 3; ++e) qpt[e] = e < Pq * 3 ? qp[((size_t)q * Hh + h) * Pq * 3 + e] : 0.f;
+  }
   for (int k = lane; k < L; k += 32) {
     float d2 = 0;
-    for (int p = 0; p < Pq; ++p)
-      for (int a = 0; a < 3; ++a) {
-        float d = qp[(((size_t)q * Hh + h) * Pq + p) * 3 + a] - kp[(((size_t)k * Hh + h) * Pq + p) * 3 + a];
-        d2 += d * d;
-      }
-    float s = -0.5f * w * d2;
     float sc = 0;
-    for (int c = 0; c < Cs; ++c) sc += qs[((size_t)q * Hh + h) * Cs + c] * ks[((size_t)k * Hh + h) * Cs + c];
+    if (fast) {
+      const float* kpk = kp + ((size_t)k * Hh + h) * Pq * 3;
+#pragma unroll
+      for (int p = 0; p < PQ_MAX; ++p)
+        if (p < Pq)
+#pragma unroll
+          for (int a = 0; a < 3; ++a) { float d = qpt[p * 3 + a] - kpk[p * 3 + a]; d2 += d * d; }
+      const float4* ksk = reinterpret_cast<const float4*>(ks + ((size_t)k * Hh + h) * Cs);
+#pragma unroll
+      for (int c4 = 0; c4 < CS_MAX / 4; ++c4)
+        if (c4 * 4 < Cs) {
+          float4 v = ksk[c4];
+          sc += qv[c4 * 4] * v.x; sc += qv[c4 * 4 + 1] * v.y; sc += qv[c4 * 4 + 2] * v.z; sc += qv[c4 * 4 + 3] * v.w;
+        }
+    } else {
+      for (int p = 0; p < Pq; ++p)
+        for (int a = 0; a < 3; ++a) {
+          float d = qp[(((size_t)q * Hh + h) * Pq + p) * 3 + a] - kp[(((size_t)k * Hh + h) * Pq + p) * 3 + a];
+          d2 += d * d;
+        }
+      for (int c = 0; c < Cs; ++c) sc += qs[((size_t)q * Hh + h) * Cs + c] * ks[((size_t)k * Hh + h) * Cs + c];
+    }
+    float s = -0.5f * w * d2;
     s += sc + b2d[((size_t)q * L + k) * Hh + h];
     s -= 1e5f * (1.f - seqMask[q] * seqMask[k]);
     s *= sqrtf(1.f / 3.f);
