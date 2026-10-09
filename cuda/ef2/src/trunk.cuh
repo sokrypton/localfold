@@ -251,6 +251,35 @@ inline void triangleBlockedEf2(float* pair, const float* mask, int L, int C, con
                  Fh(Tn + "gatingLinear"), nullptr };
   triangleBlockedHalf(pair, mask, L, C, w, outgoing, (size_t)64 << 20);
 }
+// the blocks on the whole form's streaming kernels (cuda/af3's triangleBlockedFused): the input kernel over the whole
+// plane for b alone, then over each block's rectangle for a and its gating rows, a bf16 contraction, and the output
+// kernel over the rectangle - where triangleBlockedHalf ran an LN, a GEMM and a transposing gate a chunk and five passes
+// on the way out. 2,470 tokens forced big: the fold's GPU time 43.3 -> 24.3 s (the whole form 20.3); 5CAJ forced big
+// 0.023 A from the whole form (the old blocks 0.025)
+inline void triangleBlockedFusedEf2(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+  using B16 = __nv_bfloat16;
+  const int Lp = (L + 7) / 8 * 8; const size_t plane = (size_t)Lp * Lp;
+  B16* b = scratch<B16>("trib.bbf", plane * C);
+  int width = (int)std::max<size_t>(8, std::min<size_t>(Lp, ((size_t)64 << 20) / C / Lp / 8 * 8));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)Lp * C * 6, spare = f > t / 16 ? f - t / 16 : 0;       // a, its gating rows, the product
+    width = (int)std::max<size_t>(width, std::min<size_t>(Lp, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+  }
+  B16* a = scratch<B16>("trib.abf", (size_t)width * Lp * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * Lp * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * Lp * C);
+  triIn256<B16>(pair, mask, Tn, nullptr, b, nullptr, L, Lp, plane);
+  for (int k0 = 0; k0 < L; k0 += width) {
+    int w = std::min(width, Lp - k0);
+    RectMap rm = outgoing ? RectMap{k0, Lp, 0, (size_t)w * Lp} : RectMap{0, w, k0, (size_t)Lp * w};
+    triIn256<B16>(pair, mask, Tn, a, nullptr, t2, L, Lp, plane, rm);
+    if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, w, Lp, 1.f, b, Lp, plane, a, Lp, rm.size, prod, Lp, rm.size, C);
+    else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, w, Lp, Lp, 1.f, a, w, rm.size, b, Lp, plane, prod, w, rm.size, C);
+    triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp, rm);
+  }
+  releaseScratch({ "trib." });
+}
 inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b) {
   std::string B = prefix + "/" + std::to_string(b) + "/";
   // on a card short of room, the triangles in output blocks where the whole forms would not fit with room
@@ -259,8 +288,14 @@ inline void trunkBlock(float* pair, const float* mask, int L, int C, const std::
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     if (!roomFor(5 * plane * C * 2, { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.pg", "ftri.cn", "ftri.out" })) {
       releaseScratch({ "ftri." });
-      triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
-      triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+      static const bool fusedBlocks = !getenv("LOCALFOLD_TRIB_FUSED") || atoi(getenv("LOCALFOLD_TRIB_FUSED"));
+      if (fusedBlocks && FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Fits() && EF2_TRI_BF16 && bf16Mma()) {
+        triangleBlockedFusedEf2(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
+        triangleBlockedFusedEf2(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+      } else {
+        triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
+        triangleBlockedEf2(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
+      }
       if (FUSED256 && C == 256 && L >= FUSED256_MIN_TOKENS && fused256Fits()) transition256(pair, (size_t)L * L, C, B + "pairTransition/");
       else transitionFast(pair, (size_t)L * L, C, B + "pairTransition/");
       return;

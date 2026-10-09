@@ -27,13 +27,14 @@ void transitionUp(const float* x, const float* sc, const float* of, const half* 
 }
 template <int WARPS, class TP>
 void triangleOut(const TP* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
-                 int L, int Lp) {
-  triangleOutRun<256, WARPS, TP>(prod, sc, of, Wout, t2, pair, L, Lp);
+                 int L, int Lp, RectMap rm = {}) {
+  triangleOutRun<256, WARPS, TP>(prod, sc, of, Wout, t2, pair, L, Lp, nullptr, rm);
 }
 template <int WARPS, class TA, int XROUNDS = 1, int MT = 1>
-void triIn256Form(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
+void triIn256Form(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs,
+                  RectMap rm = {}) {
   constexpr int C = 256, R = 16 * WARPS * MT;
-  size_t pp = (size_t)np * np, smem = XROUNDS == 1 ? (size_t)R * (C + 8) * 2 : triIn256Smem<TA>(C, WARPS, XROUNDS);
+  size_t pp = rm.J ? rm.size : (size_t)np * np, smem = XROUNDS == 1 ? (size_t)R * (C + 8) * 2 : triIn256Smem<TA>(C, WARPS, XROUNDS);
   std::string pg = concatColumns("f/" + Tn + "projectionGate~", C, {{"f/" + Tn + "projection", 2 * C, false},
                                                                    {"f/" + Tn + "gate", 2 * C, false}});
   half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
@@ -42,7 +43,7 @@ void triIn256Form(const float* pair, const float* mask, const std::string& Tn, T
     static bool attr = false;
     if (!attr) { smemAttr((triIn256K<C, WARPS, TA, XROUNDS, false, PT, MT>), (int)smem); attr = true; }
     triIn256K<C, WARPS, TA, XROUNDS, false, PT, MT><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-      pair, mask, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"), wt, a, b, t2, n, np, cs));
+      pair, mask, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"), wt, a, b, t2, n, np, cs, nullptr, rm));
 }
 // the 8-warp form where it fits, else the T4's - and where an SM holds two blocks of it, 4 warps of two 16-row tiles
 // each (the same 128 rows, shared memory and grid): each weight fragment then feeds two warps' worth of MMAs, the
@@ -52,14 +53,15 @@ void triIn256Form(const float* pair, const float* mask, const std::string& Tn, T
 // then overlaps a block's LN prologue. A part holding one block (an L4, an RTX card: ~100 KB an SM) would lose
 // half its warps, unmeasured, so it keeps the one-tile form. LOCALFOLD_TRIIN_FORM=1/2 forces it.
 template <class TA>
-void triIn256(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs) {
+void triIn256(const float* pair, const float* mask, const std::string& Tn, TA* a, TA* b, half* t2, int n, int np, size_t cs,
+              RectMap rm = {}) {
   static const bool twoTiles = [] {
     if (const char* e = getenv("LOCALFOLD_TRIIN_FORM")) return atoi(e) == 2;
     int dev, perSm = 0; CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
     return (size_t)perSm >= 2 * (TRI_IN256_SMEM + 1024);          // (1 KB a block the driver reserves)
   }();
-  if (fused256Big() && twoTiles) triIn256Form<4, TA, 1, 2>(pair, mask, Tn, a, b, t2, n, np, cs);
-  else if (fused256Big()) triIn256Form<8, TA>(pair, mask, Tn, a, b, t2, n, np, cs);
-  else triIn256Form<16, TA, 8>(pair, mask, Tn, a, b, t2, n, np, cs);
+  if (fused256Big() && twoTiles) triIn256Form<4, TA, 1, 2>(pair, mask, Tn, a, b, t2, n, np, cs, rm);
+  else if (fused256Big()) triIn256Form<8, TA>(pair, mask, Tn, a, b, t2, n, np, cs, rm);
+  else triIn256Form<16, TA, 8>(pair, mask, Tn, a, b, t2, n, np, cs, rm);
 }
