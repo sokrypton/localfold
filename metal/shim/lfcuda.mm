@@ -795,6 +795,13 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   } else if (a.m <= 48) {
     tr = 64; tc = 32;
   }
+  // a 48-row tile where 64-row tiles would waste over a tenth of the rows on padding and 48 wastes less: 272 rows (AF3's
+  // diffusion at 255 tokens) are 320 in 64s and 288 in 48s - 0.91-0.96x the time there, 0.87x at 140 rows, and neutral
+  // where it does not apply. An 80-row tile lost (1.06-1.16x at 4624 rows), and so did 48 for a 2% saving (1000 rows)
+  if (a.n > 128 && tr == 64) {
+    long pad64 = (long)((a.n + 63) / 64) * 64 - a.n, pad48 = (long)((a.n + 47) / 48) * 48 - a.n;
+    if (pad64 * 10 > a.n && pad48 < pad64) tr = 48;
+  }
   // too few threadgroups for the device: narrower columns
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
   while (tc > 16 && groups(tc) < 64) tc /= 2;
@@ -809,7 +816,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // 16 is 0.73-0.85x the time on the triangle's tall K-128 projections (512 x 68121 x 128), 0.83-0.89x on the pair
   // track's 2048 x 4624 x 256 and 256 x 4624 x 1024, 0.84x on a 4096-cube - half the threadgroup memory, more tiles
   // resident to hide the loads - and 1.09x on a 64 x 32 tile, 1.08-1.21x on the 16-column ones
-  int bk = tr == 64 && tc == 64 ? 16 : 32;
+  int bk = tc == 64 && tr >= 48 ? 16 : 32;
   if (const char* k = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(k) == 16 ? 16 : 32;       // (an arm: 16 or 32 everywhere)
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
                       std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(bk);
