@@ -20,13 +20,13 @@
 
 // Whether the fold's pair stays bf16 PAST the trunk too (af3.cu's TRUNK_PAIR16): on a card short of room, where
 // every reader after the trunk takes bf16 rows - the distogram's contacts, the streamed diffusion preparation and the
-// confidence head - so the f32 pair is never made. Not for OpenDDE (its expander reads f32) or boltz2 (its head
-// re-embeds the pair). foldFits sizes a fold by it.
+// confidence head - so the f32 pair is never made. Not for OpenDDE (its expander reads f32). foldFits sizes a
+// fold by it.
 inline bool pairStays16(int n, int C, bool fast) {
   size_t pairs = (size_t)n * n;
   Trunk probe{}; probe.n = n; probe.C = C;
   return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair(pairs, C) &&
-         !M.flag("trunk.dialect.structuralTokens") && !M.flag("trunk.dialect.reembedConfidencePair") &&
+         !M.flag("trunk.dialect.structuralTokens") &&
          hasW("diffusion.encoder.embedTrunkPairCond") &&
          shortPair(pairs, (int)M.meta("diffusion.conditioning.pairChannels")) && (int)M.meta("confidence.pairChannels") == C;
 }
@@ -432,8 +432,7 @@ static int foldMain(int argc, char** argv) {
     // 🔴 THE PAIR STAYS bf16 PAST THE TRUNK on a card short of room, where every reader after it takes bf16 rows
     // (the distogram's contacts, the streamed diffusion preparation, the confidence head): the f32 pair it was widened
     // into was the fold's largest tensor past the trunk - 18.4 GB at 6,000 tokens, 51 at 10,000 - and the widening
-    // held both at once. Not for OpenDDE (its expander reads f32) or boltz2 (its head re-embeds the pair), nor
-    // --save-embeddings
+    // held both at once. Not for OpenDDE (its expander reads f32), nor --save-embeddings
     TRUNK_PAIR16 = t.p16 && !saveEmbeddings && pairStays16(t.n, t.C, fast);
     if (!TRUNK_PAIR16) pairToF32(t);  // (a bf16 trunk's pair, for the heads, the sampler and the confidence head)
     else if (t.prevPair) { CK(cudaFree(t.prevPair)); t.prevPair = nullptr; }   // (pairToF32's other half)

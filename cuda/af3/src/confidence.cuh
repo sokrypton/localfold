@@ -137,6 +137,7 @@ __global__ void reembedBinK(const float* beta, int* binOut, int n) {
   for (int e = 0; e < 63; ++e) if (distance > 2.0 + 20.0 * e / 62) ++bin;
   binOut[ij] = bin;
 }
+template <class PT = float>
 __global__ void reembedPairK(float* pair, const float* left, const float* right, const int* bins, const float* pairMask,
                              const float* Wd, const float* bonds, const float* orders, const float* wBond,
                              const float* wBondType, const float* unspecified, int n, int C) {
@@ -148,7 +149,7 @@ __global__ void reembedPairK(float* pair, const float* left, const float* right,
   if (o < 0 || o >= 7) o = 0;
   float v = right[(size_t)i * C + c] + left[(size_t)j * C + c] + Wd[(size_t)bin * C + c] * pairMask[ij]
           + (bonds ? bonds[ij] * wBond[c] : 0.f) + wBondType[(size_t)o * C + c] + unspecified[c];
-  pair[t] += v;
+  pairSt<PT>(pair, t, pairLd<PT>(pair, t) + v);
 }
 // prod[i][j][e] = a[i][e] b[j][e], rows i0.. of a chunk
 __global__ void outerProductRowsK(const float* a, const float* b, float* out, int i0, int rowsI, int n, int C) {
@@ -201,19 +202,24 @@ __global__ void interChainLogitsK(float* logits, const float* inter, const int* 
   size_t ij = t / bins; int i = (int)(ij / n), j = (int)(ij % n);
   if (asym[i] != asym[j]) logits[t] = inter[t];
 }
+// p16: the pair and the trunk's pair bf16 (TRUNK_PAIR16) - and `pair` may BE the trunk's pair: its only read is the
+// row-wise LayerNorm, which a warp does row by row, reading a row before writing it
 inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, const float* trunkSingle,
-                          const float* targetFeat, const float* pseudoBeta, const float* pairMask, int n, int C, int Cs, int F) {
+                          const float* targetFeat, const float* pseudoBeta, const float* pairMask, int n, int C, int Cs, int F,
+                          bool p16 = false) {
   const std::string R = "confidence.reembed.";
   size_t pairs = (size_t)n * n;
   float* sIn = scratch<float>("conf.sInputs", (size_t)n * F);
   layerNorm2<float, float>(targetFeat, sIn, n, F, R + "sInputsNormScale", R + "sInputsNormOffset");
   layerNorm2<float, float>(trunkSingle, single, n, Cs, R + "sNormScale", R + "sNormOffset");
   linear<float, float>(sIn, single, n, F, Cs, R + "sInputToS", false, 1.f);
-  layerNorm2<float, float>(trunkPair, pair, pairs, C, R + "zNormScale", R + "zNormOffset");
+  if (p16) layerNorm2<__nv_bfloat16, __nv_bfloat16>(reinterpret_cast<const __nv_bfloat16*>(trunkPair),
+                                                    reinterpret_cast<__nv_bfloat16*>(pair), pairs, C, R + "zNormScale", R + "zNormOffset");
+  else layerNorm2<float, float>(trunkPair, pair, pairs, C, R + "zNormScale", R + "zNormOffset");
   if (lenW(R + "relPosProject") != (size_t)139 * C) { fprintf(stderr, "relPosProject is not 139 x %d\n", C); exit(1); }
-  relativeEncodingK<<<blocks(pairs * C), 256, 0, STREAM>>>(
+  WITH_PT(p16, relativeEncodingK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(
     Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
-    Idev("batch.features.entityId"), Idev("batch.features.symId"), W(R + "relPosProject"), pair, n, C, 32, 2);
+    Idev("batch.features.entityId"), Idev("batch.features.symId"), W(R + "relPosProject"), pair, n, C, 32, 2));
   float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
   float* p1 = scratch<float>("conf.p1", (size_t)n * C); float* p2 = scratch<float>("conf.p2", (size_t)n * C);
   linear<float, float>(sIn, left, n, F, C, R + "leftTargetFeatProject");
@@ -223,17 +229,21 @@ inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, co
   if (lenW(R + "distogramFeatProject") != (size_t)64 * C) { fprintf(stderr, "the reembed distogram is not 64 bins\n"); exit(1); }
   int* bins = scratch<int>("conf.bin", pairs);
   reembedBinK<<<blocks(pairs), 256, 0, STREAM>>>(pseudoBeta, bins, n);
-  reembedPairK<<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, bins, pairMask, W(R + "distogramFeatProject"),
+  WITH_PT(p16, reembedPairK<PT><<<blocks(pairs * C), 256, 0, STREAM>>>(pair, left, right, bins, pairMask, W(R + "distogramFeatProject"),
     M.has("batch.bondMatrix") ? Fdev("batch.bondMatrix") : nullptr,
     M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
-    W(R + "tokenBondsProject"), W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), n, C);
+    W(R + "tokenBondsProject"), W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), n, C));
   // the outer product of the two s_inputs projections through sToZProdOut, in row chunks
   int rowsPer = std::max<int>(1, (int)(CHUNK / ((size_t)n * C)));
   float* prod = scratch<float>("conf.prod", (size_t)std::min(rowsPer, n) * n * C);
   for (int i0 = 0; i0 < n; i0 += rowsPer) {
     int r = std::min(rowsPer, n - i0);
     outerProductRowsK<<<blocks((size_t)r * n * C), 256, 0, STREAM>>>(p1, p2, prod, i0, r, n, C);
-    linear<float, float>(prod, pair + (size_t)i0 * n * C, (size_t)r * n, C, C, R + "sToZProdOut", false, 1.f);
+    if (!p16) { linear<float, float>(prod, pair + (size_t)i0 * n * C, (size_t)r * n, C, C, R + "sToZProdOut", false, 1.f); continue; }
+    float* out = scratch<float>("conf.prodOut", (size_t)std::min(rowsPer, n) * n * C);   // (a bf16 pair: added through f32)
+    linear<float, float>(prod, out, (size_t)r * n, C, C, R + "sToZProdOut");
+    pairAddK<__nv_bfloat16, float><<<blocks((size_t)r * n * C), 256, 0, STREAM>>>(
+      reinterpret_cast<float*>(reinterpret_cast<__nv_bfloat16*>(pair) + (size_t)i0 * n * C), out, (size_t)r * n * C);
   }
 }
 struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
@@ -293,18 +303,20 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   bool caDgram = M.flag("trunk.dialect.confidenceCaDgram");
   size_t pairs = (size_t)n * n;
   bool reembed = M.flag("trunk.dialect.reembedConfidencePair");
-  bool inPlace = consumeTrunkPair && !reembed;                 // (boltz2 builds its pair from the trunk's: no aliasing)
+  // (boltz2 builds its pair from the trunk's: in f32 into a pair of its own; in bf16 in place when it may, its one
+  // read of the trunk's pair being a row-wise LayerNorm)
+  bool inPlace = consumeTrunkPair && (!reembed || TRUNK_PAIR16);
   // a bf16 trunk pair (TRUNK_PAIR16, a card short of room): the head's pair is bf16 too, its blocks run under PAIR16
   // and its heads widen a chunk of rows at a time (af3.cu keeps it only for a head that takes it: no re-embedding)
   const bool p16 = TRUNK_PAIR16;
-  if (p16 && (reembed || !shortPair(pairs, C))) {
+  if (p16 && !shortPair(pairs, C)) {
     fprintf(stderr, "the confidence head was handed a bf16 pair it does not take\n"); exit(1);
   }
   const size_t pairBytes = pairs * C * (p16 ? 2 : 4);
   float* pair = inPlace ? const_cast<float*>(trunkPair) : scratch<float>("conf.pair", pairBytes / 4);
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
   if (reembed) {
-    boltz2Reembed(pair, single, trunkPair, trunkSingle, targetFeat, pseudoBeta, pairMask, n, C, Cs, F);
+    boltz2Reembed(pair, single, trunkPair, trunkSingle, targetFeat, pseudoBeta, pairMask, n, C, Cs, F, p16);
   } else {
   if (!inPlace) CK(cudaMemcpyAsync(pair, trunkPair, pairBytes, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(single, trunkSingle, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
