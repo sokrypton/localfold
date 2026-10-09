@@ -124,14 +124,16 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   constexpr int XROW = TRB ? TR + PAD : BK + PAD, WROW = TRA ? BK + PAD : TC_ + PAD;
   threadgroup T Xs[(TRB ? BK : TR) * XROW];
   threadgroup T Ws[(TRA ? TC_ : BK) * WROW];
-  threadgroup half Sab[EP == 1 ? 2 * (TC_ / 4) * TR : 1];     // (EP 1: the gated a and b, channel-major, for the store)
+  threadgroup half Sab[(EP & 7) == 1 ? 2 * (TC_ / 4) * TR : 1];     // (EP 1: the gated a and b, channel-major, for the store)
   constexpr int WR = TR / 2, WC = TC_ / 2, FR = WR / 8, FC = WC / 8;
   const int sr = (sg / 2) * WR, sc = (sg % 2) * WC;
-  simdgroup_float8x8 acc[FR][FC];
+  // (EP bit 8: accumulated in half - the all-half GEMMs, lfcuda.mm's gemm)
+  typedef metal::conditional_t<(EP & 8) != 0, simdgroup_half8x8, simdgroup_float8x8> ACC;
+  ACC acc[FR][FC];
   _Pragma("clang loop unroll(full)")
   for (int a = 0; a < FR; ++a)
     _Pragma("clang loop unroll(full)")
-    for (int b = 0; b < FC; ++b) acc[a][b] = simdgroup_float8x8(0);
+    for (int b = 0; b < FC; ++b) acc[a][b] = ACC(0);
   const bool vec = g.biasType & 256;
   for (int k0 = 0; k0 < g.k; k0 += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -184,7 +186,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         for (int b = 0; b < FC; ++b) simdgroup_multiply_accumulate(acc[a][b], xm[a], wm[b], acc[a][b]);
     }
   }
-  if (EP == 1) {   // the triangle's gate: lane (bit 0 clear) holds (pa, pb), its neighbour (ga, gb) of the same channel
+  if ((EP & 7) == 1) {   // the triangle's gate: lane (bit 0 clear) holds (pa, pb), its neighbour (ga, gb) of the same channel
     const int sm1 = (lane / 16) * 4 + (lane % 8) / 2, sn1 = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
     device const float* mask = (device const float*)g.aux;
     _Pragma("clang loop unroll(full)")

@@ -820,10 +820,16 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // resident to hide the loads - and 1.09x on a 64 x 32 tile, 1.08-1.21x on the 16-column ones
   int bk = tc == 64 && tr >= 48 ? 16 : 32;
   if (const char* k = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(k) == 16 ? 16 : 32;       // (an arm: 16 or 32 everywhere)
+  // an all-half GEMM accumulates in half: 0.85x the time on the trunk's K-128 projections (512, 128 and 1024 x 68121 x
+  // 128, interleaved on an M2) for a relRMS of 1.7e-3 against 2.4e-4 - bfloat16's rounding, the precision AF3 runs at.
+  // Accumulating each k step in half and adding it to a float accumulator (6.6e-4) won nothing. A GEMM writing float
+  // (a residual) keeps float. LOCALFOLD_GEMM_FLOAT_ACC=1 is the control arm.
+  static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") != nullptr;
+  const bool hacc = !floatAcc && ta_ == CUDA_R_16F && tb_ == CUDA_R_16F && tc_ == CUDA_R_16F;
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
-                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(bk) + ", " + std::to_string(a.epilogue & 256 ? 1 : 0);
+                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(bk) + ", " + std::to_string((a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0));
   std::string name = std::string("lf_gemm_") + typeTag(ta_) + "_" + typeTag(tb_) + "_" + typeTag(tc_) + "_" +
-                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + (bk == 32 ? "" : "_k" + std::to_string(bk)) + (a.epilogue & 256 ? "_trigate" : "");
+                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + (bk == 32 ? "" : "_k" + std::to_string(bk)) + (a.epilogue & 256 ? "_trigate" : "") + (hacc ? "_h" : "");
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
   MTLSize grid = MTLSizeMake((a.m + bm - 1) / bm, (a.n + bn - 1) / bn, batch);
   char label[96]; snprintf(label, sizeof label, "gemm %s %dx%dx%d%s", name.c_str() + 8, a.m, a.n, a.k, batch > 1 ? " batched" : "");

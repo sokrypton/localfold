@@ -64,6 +64,19 @@ And: **the triangle's gated residual in the gate GEMM's epilogue** (`lf::gemmGat
 to 75.37), so its baseline was re-recorded; every other case read its digits. A **patch** is an exact old -> new block
 applied to a CUDA source at translation; a block that no longer matches stops the build and names itself.
 
+And: **an all-half GEMM accumulates in half** (`simdgroup_half8x8`). 0.85x the time on the trunk's K-128 projections,
+interleaved, for a relRMS of 1.7e-3 where float accumulation gives 2.4e-4 - bfloat16's rounding, which is what AF3
+runs at. GPU at 255 tokens 18.04 -> 17.31 s. A GEMM writing float (a residual) keeps float. Accumulating each k step
+in half and adding it to a float accumulator (6.6e-4) won nothing: the win is the accumulator's registers. On
+rosettafold3-6mrr the two arms agree to 0.01 A seed by seed (1.005/1.006, 1.672/1.671, 1.859/1.854, 1.770/1.782), and
+the gate's own seed moved 1.699 -> 1.764; that case and af3-glycan (44.35 -> 45.30, toward the A100's 47.42) were
+re-recorded. **AlphaFold 2 keeps float** (`metal/af2/defaults.env`): its no-alignment multimer moved 0.75 pLDDT, and
+its reference is a float model. `LOCALFOLD_GEMM_FLOAT_ACC=1` is the control.
+
+And in `flashGridMetal`: K and V staged four halves a load (3109 -> 2630 ms at 255 tokens). center_norm's
+statistics summed while loading, by all eight rows of threads where one row did it alone (613 -> 365 ms).
+`layerNormK` is at the M2's bandwidth already (~95 GB/s), and a pair-bias read two halves at a time moved nothing.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):
 
