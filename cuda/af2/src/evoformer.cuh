@@ -636,6 +636,7 @@ __global__ void triSplitK(const float* proj, const float* gate, const float* mas
   if (c2 < C) a[(size_t)c2 * L * L + ij] = v; else b[(size_t)(c2 - C) * L * L + ij] = v;
 }
 #include "../../af3/src/triblocked.cuh"
+#include "../../af3/src/tricontract.cuh"   // (bf16Gemms: past 1e10 multiply-adds a channel, the one-channel pick)
 // one operand's [projection | gate] (C, 2C) f16 and its 2C bias, side 0 = a (the first C columns), 1 = b
 __global__ void operand2K(const float* proj, const float* gate, const float* pb, const float* gb, half* w, float* bias,
                           int C, int side) {
@@ -710,13 +711,8 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
         pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
     __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
-    const float one = 1.f, zero = 0.f;
-    if (outgoing)
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16BF, Lp, plane, a, CUDA_R_16BF, Lp,
-                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    else
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16BF, Lp, plane, b, CUDA_R_16BF, Lp,
-                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, 1.f, b, Lp, plane, a, Lp, plane, prod, Lp, plane, C);
+    else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, 1.f, a, Lp, plane, b, Lp, plane, prod, Lp, plane, C);
     triangleOutRun<128, 4, __nv_bfloat16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
                                           PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk));
     return;
@@ -729,13 +725,8 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     triInRaw<__nv_bfloat16, true>(pair, pairMask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk),
                                   w.wpg, PH(T + "/gating_linear/weights", blk), w.bias, a, b, t2, L, Lp, plane);
     __nv_bfloat16* prod = scratch<__nv_bfloat16>("ftri.pbf", plane * C);
-    const float one = 1.f, zero = 0.f;
-    if (outgoing)
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, &one, b, CUDA_R_16BF, Lp, plane, a, CUDA_R_16BF, Lp,
-                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    else
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, &one, a, CUDA_R_16BF, Lp, plane, b, CUDA_R_16BF, Lp,
-                                    plane, &zero, prod, CUDA_R_16BF, Lp, plane, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, Lp, Lp, 1.f, b, Lp, plane, a, Lp, plane, prod, Lp, plane, C);
+    else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, Lp, Lp, Lp, 1.f, a, Lp, plane, b, Lp, plane, prod, Lp, plane, C);
     triOutRaw<__nv_bfloat16, true>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
                                    PH(T + "/output_projection/weights", blk), P(T + "/output_projection/bias", blk), t2, pair, L, Lp,
                                    plane);

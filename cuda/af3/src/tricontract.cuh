@@ -12,11 +12,69 @@ inline bool TRI_LT_TILE = true;
 // planAll (ESMFold2, whose single trunk pass has no CUDA graph to hide host time): a cached cuBLASLt plan
 // at every np - cuBLASLt's own first candidate outside the 128x128 window - because cuBLAS's per-call
 // choice for a bf16 batched GEMM cost ~60 us of host a call (ESMFold2 at 261 tokens: 11.5 ms of idle GPU)
+// A bf16 batched GEMM (bf16 out, f32 accumulation), as cublasGemmStridedBatchedEx - but past 1e10 multiply-adds a
+// channel with the algorithm cuBLASLt's heuristic picks for ONE channel's GEMM, run over the batch: there cuBLAS 12's
+// batched heuristic (A100) turns to 64x64 tiles at 80-150 TFLOP/s, where the single-matrix pick (a 256x128 or 128x256
+// tile, 15 stages) runs the whole batch at 260-277 - a 6,916-token fold's blocks (6928 x 872 x 6928, 128 channels) 135
+// -> 39 ms, np 5000 whole 88 -> 29 ms per 32 channels, level at np 2976. A plan a shape, cached; the choice is
+// cuBLASLt's own list, never a timing
+inline void bf16Gemms(cublasOperation_t ta, cublasOperation_t tb, int m, int nn, int k, float alpha,
+                      const __nv_bfloat16* A, int lda, long long sA, const __nv_bfloat16* B, int ldb, long long sB,
+                      __nv_bfloat16* Cm, int ldc, long long sC, int batch) {
+  const float zero = 0.f;
+  if ((double)m * nn * k >= 1e10) {
+    struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la, lb, lc; cublasLtMatmulAlgo_t algo; bool ok; };
+    static cublasLtHandle_t lt = nullptr;
+    static std::map<std::tuple<int, int, int, int, int, int, int, int, long long, long long, long long, int>, Plan> plans;
+    if (!lt) CB(cublasLtCreate(&lt));
+    auto key = std::make_tuple((int)ta, (int)tb, m, nn, k, lda, ldb, ldc, sA, sB, sC, batch);
+    auto it = plans.find(key);
+    if (it == plans.end()) {
+      Plan pl{};
+      CB(cublasLtMatmulDescCreate(&pl.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+      CB(cublasLtMatmulDescSetAttribute(pl.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
+      CB(cublasLtMatmulDescSetAttribute(pl.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
+      auto layout = [&](int rows, int cols, int ld, long long stride, int count) {
+        cublasLtMatrixLayout_t l; CB(cublasLtMatrixLayoutCreate(&l, CUDA_R_16BF, rows, cols, ld));
+        if (count > 1) {
+          CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &count, sizeof(count)));
+          CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof(stride)));
+        }
+        return l;
+      };
+      const int ar = ta == CUBLAS_OP_N ? m : k, ac = ta == CUBLAS_OP_N ? k : m;
+      const int br = tb == CUBLAS_OP_N ? k : nn, bc = tb == CUBLAS_OP_N ? nn : k;
+      cublasLtMatrixLayout_t a1 = layout(ar, ac, lda, 0, 1), b1 = layout(br, bc, ldb, 0, 1), c1 = layout(m, nn, ldc, 0, 1);
+      pl.la = layout(ar, ac, lda, sA, batch); pl.lb = layout(br, bc, ldb, sB, batch); pl.lc = layout(m, nn, ldc, sC, batch);
+      cublasLtMatmulPreference_t pref; CB(cublasLtMatmulPreferenceCreate(&pref));
+      size_t ws = 0;     // no workspace: captured in a CUDA graph as it is
+      CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+      cublasLtMatmulHeuristicResult_t res[8]; int got = 0;
+      CB(cublasLtMatmulAlgoGetHeuristic(lt, pl.op, a1, b1, c1, c1, pref, 8, res, &got));
+      for (int i = 0; i < got && !pl.ok; ++i) {
+        cublasLtMatmulHeuristicResult_t chk;
+        if (res[i].state == CUBLAS_STATUS_SUCCESS &&
+            cublasLtMatmulAlgoCheck(lt, pl.op, pl.la, pl.lb, pl.lc, pl.lc, &res[i].algo, &chk) == CUBLAS_STATUS_SUCCESS &&
+            chk.workspaceSize == 0) { pl.algo = res[i].algo; pl.ok = true; }
+      }
+      CB(cublasLtMatmulPreferenceDestroy(pref));
+      cublasLtMatrixLayoutDestroy(a1); cublasLtMatrixLayoutDestroy(b1); cublasLtMatrixLayoutDestroy(c1);
+      it = plans.emplace(key, pl).first;
+    }
+    if (it->second.ok) {          // (no candidate valid over the batch: cuBLAS's own pick, below)
+      const Plan& pl = it->second;
+      CB(cublasLtMatmul(lt, pl.op, &alpha, A, pl.la, B, pl.lb, &zero, Cm, pl.lc, Cm, pl.lc, &pl.algo, nullptr, 0, STREAM));
+      return;
+    }
+  }
+  CB(cublasGemmStridedBatchedEx(H, ta, tb, m, nn, k, &alpha, A, CUDA_R_16BF, lda, sA, B, CUDA_R_16BF, ldb, sB, &zero,
+    Cm, CUDA_R_16BF, ldc, sC, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
 inline void triContractBf16(bool outgoing, int np, size_t cs, int C, float alpha, const __nv_bfloat16* a,
                             const __nv_bfloat16* b, __nv_bfloat16* p, bool planAll = false) {
   const float zero = 0.f;
   const bool window = TRI_LT_TILE && np >= 200 && np <= 352;
-  if (window || planAll) {
+  if (window || (planAll && (double)np * np * np < 1e10)) {
     struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t l; cublasLtMatmulAlgo_t algo; bool ok; };
     static cublasLtHandle_t lt = nullptr;
     static std::map<std::tuple<int, bool, int, size_t>, Plan> plans;     // the plan holds the batch and its stride
@@ -56,12 +114,8 @@ inline void triContractBf16(bool outgoing, int np, size_t cs, int C, float alpha
       return;
     }
   }
-  if (outgoing)
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, &alpha, b, CUDA_R_16BF, np, cs, a,
-      CUDA_R_16BF, np, cs, &zero, p, CUDA_R_16BF, np, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-  else
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_T, np, np, np, &alpha, a, CUDA_R_16BF, np, cs, b,
-      CUDA_R_16BF, np, cs, &zero, p, CUDA_R_16BF, np, cs, C, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, alpha, b, np, cs, a, np, cs, p, np, cs, C);
+  else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, np, np, np, alpha, a, np, cs, b, np, cs, p, np, cs, C);
 }
 
 

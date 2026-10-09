@@ -618,7 +618,7 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
 __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, half* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
-    size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
+    size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride, int sw) {
   // strides in elements: a grid row's qkvg, a position's within it, and the output's - the dense layout is
   // (n * 4W, 4W, n * W, W); AF2's attention ACROSS a tensor's leading axis passes its own
   constexpr int BQ = 16 * MT * WARPS, LDK = fa2Ldk<D>(), LDB = BK + 8, NT = WARPS * RR * 32, NTR = WARPS * 32;
@@ -631,12 +631,22 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
   auto Bst = [&](int s) { return (half*)(smem + s * STAGE) + RR * 2 * BK * LDK; };
   int warp = tr >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t rowsHere = rowsTotal, perHead = (rowsHere + RR - 1) / RR;
-  size_t b = blockIdx.y; int h = (int)(b / perHead); size_t rl = (b % perHead) * RR + rg;
+  // sw > 0: the blocks of one head walk sw row groups across each query tile before the next tile, so the resident
+  // blocks share a bias tile (n x 64 halves, re-read from HBM by every row group once a head's bias outgrows L2) as
+  // well as their rows' K and V; 0: the query tiles of one row group, then the next (K/V shared, bias not)
+  size_t b, qt;
+  if (sw > 0) {
+    const size_t nq = gridDim.x, L = (size_t)blockIdx.y * nq + blockIdx.x, perHeadBlocks = perHead * nq;
+    const size_t r = L % perHeadBlocks, group = r / ((size_t)sw * nq), within = r % ((size_t)sw * nq);
+    const size_t left = perHead - group * sw, gsz = left < (size_t)sw ? left : (size_t)sw;
+    b = (L / perHeadBlocks) * perHead + group * sw + within % gsz; qt = within / gsz;
+  } else { b = blockIdx.y; qt = blockIdx.x; }
+  int h = (int)(b / perHead); size_t rl = (b % perHead) * RR + rg;
   const bool live = RR == 1 || rl < rowsHere;                        // a last block's spare row computes, stores nothing
   if (!live) rl = rowsHere - 1;
   const int Wd = heads * D, W4 = 4 * Wd;
   const half* base = qkvg + rl * rowStride + h * D;
-  int q0 = blockIdx.x * BQ;
+  int q0 = (int)qt * BQ;
   constexpr int KV_CHUNKS = BK * (D / 8), B_CHUNKS = BQ * (BK / 8);
   static_assert(B_CHUNKS % NT == 0, "a bias tile is a whole number of chunks a thread");
   const half* biasHead = bias + (size_t)h * n * biasStride;
@@ -902,6 +912,10 @@ __global__ void __launch_bounds__(WARPS * RR * 32) flashGrid2R(const half* __res
 // keys where the third stage costs a block an SM - three warps a scheduler already overlap one warp's
 // softmax with another's MMAs.
 inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
+// the blocks' order (flashGrid2R's sw): four row groups a query tile once a head's bias (n^2 halves) is past ~24 MB of
+// L2 - --bench-grid at 256 rows 75.6 -> 72.3 ms at 8,000 tokens, 42.5 -> 40.3 at 6,000, level at 3,000 and ~1% behind
+// at 1,000; byte-identical (the same blocks, another order). LOCALFOLD_GRID_SWIZZLE=<sw> forces one, 0 off
+inline int GRID_SWIZZLE = getenv("LOCALFOLD_GRID_SWIZZLE") ? atoi(getenv("LOCALFOLD_GRID_SWIZZLE")) : -1;
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
                     const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
@@ -916,7 +930,7 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, i
   if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
   flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
-                                                                              rowStride, posStride, outRowStride, outPosStride);
+                                                                              rowStride, posStride, outRowStride, outPosStride, GRID_SWIZZLE >= 0 ? GRID_SWIZZLE : n >= 3500 ? 4 : 0);
 }
 inline int flash2R1Tile() {
   static const int v = getenv("LOCALFOLD_FLASH_2R1") ? atoi(getenv("LOCALFOLD_FLASH_2R1")) : 48;

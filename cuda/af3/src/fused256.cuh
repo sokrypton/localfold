@@ -166,6 +166,10 @@ size_t transitionUpChunkRows(size_t smem, size_t budgetRows) {
 }
 
 // ---------------------------------------------------------------- the triangle's output side
+// RectMap: the kernels' rows as a RECTANGLE of the padded pair space (triangleBlocked's blocks) - rows [i0, i0 + size / J),
+// columns [j0, j0 + J), q = (i - i0) J + (j - j0) a row's own index, and every operand and output plane `size` long; J 0:
+// the whole padded plane, as before
+struct RectMap { int i0 = 0, J = 0, j0 = 0; size_t size = 0; };
 // prod: channel-major [C][Lp][Lp] f32 (the padded contraction's output); t2: the gating linear's raw
 // output, [Lp * Lp][C] f16 (triInK's); pair: [L * L][C] f32. A block is 16 WARPS pairs: the product
 // tile is staged channel-major (stride R + 1: the per-row reductions read a column, conflict-free), the
@@ -186,7 +190,7 @@ __host__ __device__ constexpr size_t triangleOutSmem() {
 template <int C, int WARPS, class TT = float, int NC = 32, class TP = float, bool BIAS = false, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     const float* __restrict__ cnOffset, const half* __restrict__ Woutt, const half* __restrict__ t2,
-    float* __restrict__ pair, int L, int Lp, const float* __restrict__ ob = nullptr) {   // ob: AF2's output bias
+    float* __restrict__ pair, int L, int Lp, const float* __restrict__ ob = nullptr, RectMap rm = {}) {   // ob: AF2's output bias
   // Woutt: Wout's NC-column tiles (tileColumns), the stages unpadded and swizzled (stageSw)
   // VEC (a 16-bit product into a 16-bit tile - ESMFold2's and protenix2's bf16): the block's rows are the
   // PADDED pair space, so eight consecutive rows are 16 contiguous, aligned bytes of a channel and the tile
@@ -205,14 +209,15 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
   for (int c = threadIdx.x; c < C; c += NTH) { nsc[c] = cnScale[c]; nsc[C + c] = cnOffset[c]; }
   auto Ws = [&](int s) { return (half*)(smem + s * STAGE); };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
-  const size_t P = (size_t)L * L, plane = (size_t)Lp * Lp;
+  const size_t P = (size_t)L * L, plane = rm.J ? rm.size : (size_t)Lp * Lp;
+  const unsigned Jr = rm.J ? (unsigned)rm.J : (unsigned)Lp;
   size_t row0 = (size_t)blockIdx.x * R;
   auto padded = [&](size_t r) { unsigned u = (unsigned)r, i = u / (unsigned)L; return (size_t)i * Lp + (u - i * L); };
   // a row's pair (the unpadded index) and its padded index, in whichever space the rows are
   auto pairAt = [&](size_t row) -> size_t {
     if constexpr (VEC) {
       if (row >= plane) return SIZE_MAX;
-      unsigned u = (unsigned)row, i = u / (unsigned)Lp, j = u - i * (unsigned)Lp;
+      unsigned u = (unsigned)row, iq = u / Jr, i = rm.i0 + iq, j = rm.j0 + (u - iq * Jr);
       return i < (unsigned)L && j < (unsigned)L ? (size_t)i * L + j : SIZE_MAX;
     } else return row < P ? row : SIZE_MAX;
   };
@@ -396,7 +401,9 @@ template <int C, int WARPS, class TA = half, int XROUNDS = 1, bool BIAS = false,
 __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
     TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs,
-    const float* __restrict__ bias = nullptr) {
+    const float* __restrict__ bias = nullptr, RectMap rm = {}) {
+  // rm: a rectangle's rows (RectMap), its planes `size` long; a null a, b or t2 is not written (the blocks' passes each
+  // want one operand)
   // the weight stage is unpadded, [k][NC], its two 16-byte halves swapped on rows with bit 2 of k set
   // (sw): the padded 48-byte rows kept ldmatrix conflict-free but serialised the cp.async writes ~6.7x
   // (ncu: 40% of the kernel's shared wavefronts excessive, all of them those four LDGSTS); swizzled,
@@ -407,10 +414,12 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   constexpr size_t STAGE = (size_t)2 * C * LDW * 2;
   // (the stages and the a/b staging take the rows' memory once the rows are fragments: the launch gives the
   // larger of the two - at 8 warps the rows, at 4 the stages, triIn256Smem)
-  const size_t pp = (size_t)np * np;
+  const size_t pp = rm.J ? rm.size : (size_t)np * np;
+  if (rm.J) cs = rm.size;
+  const unsigned Jr = rm.J ? (unsigned)rm.J : (unsigned)np;
   auto pairOf = [&](size_t q) -> size_t {
     if (q >= pp) return SIZE_MAX;
-    unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
+    unsigned u = (unsigned)q, iq = u / Jr, i = rm.i0 + iq, j = rm.j0 + (u - iq * Jr);
     return i < (unsigned)n && j < (unsigned)n ? (size_t)i * n + j : SIZE_MAX;
   };
   extern __shared__ __align__(16) unsigned char smem[];
@@ -423,7 +432,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   size_t row0 = (size_t)blockIdx.x * R;
   // the gating linear's steps take TWO of its tiles, one a stage (w1 idles there otherwise): four accumulator
   // chains a step where they had two, and half the steps (ncu had the kernel waiting on its MMA chains)
-  const int abSteps = C / CH, steps = abSteps + C / NC / 2;
+  const int abSteps = C / CH, steps = abSteps + (t2 ? C / NC / 2 : 0);   // (no t2: the gating linear skipped)
   constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
   // step j's two weight tiles, each 16-byte piece handed to op(index, its place in stage st, its source)
   auto stage = [&](int j, int st, auto&& op) {
@@ -519,6 +528,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
       for (int nt = 0; nt < NC / 8; ++nt) {
         int c = c0 + nt * 8 + tig * 2;
         size_t ra = row0 + lr0[mt], rb = row0 + lr1[mt];
+        if (!t2) continue;
         if (ra < pp) *reinterpret_cast<half2*>(t2 + ra * C + c) = __floats2half2_rn(p[mt][nt][0], p[mt][nt][1]);
         if (rb < pp) *reinterpret_cast<half2*>(t2 + rb * C + c) = __floats2half2_rn(p[mt][nt][2], p[mt][nt][3]);
         if (ra < pp) *reinterpret_cast<half2*>(t2 + ra * C + c + NC) = __floats2half2_rn(q[mt][nt][0], q[mt][nt][1]);
@@ -545,8 +555,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
         size_t row = row0 + r;
         if (row < cs) {
           size_t at = (size_t)(j * CH + ch) * cs + row;
-          *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + ch * LDT + r);
-          *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + ch * LDT + r);
+          if (a) *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + ch * LDT + r);
+          if (b) *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + ch * LDT + r);
         }
       }
     }
@@ -560,7 +570,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 // the triangle's output side, launched: the bf16 tile at 16-column stages (LOCALFOLD_TRIOUT_F32=1: the float tile)
 template <int C, int WARPS, class TP = float>
 void triangleOutRun(const TP* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
-                    int L, int Lp, const float* ob = nullptr) {
+                    int L, int Lp, const float* ob = nullptr, RectMap rm = {}) {
+  if (rm.J && (ob || sizeof(TP) != 2)) { fprintf(stderr, "triangleOutRun: a rectangle wants the bf16 product, no bias\n"); exit(1); }
   static const bool f32 = getenv("LOCALFOLD_TRIOUT_F32") != nullptr;
   constexpr int R = 16 * WARPS;
   size_t P = (size_t)L * L;
@@ -597,11 +608,11 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
   } else {
     constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
     constexpr bool vec = sizeof(TP) == 2;                       // the padded rows (triangleOutK's VEC)
-    size_t rows = vec ? (size_t)Lp * Lp : P;
+    size_t rows = rm.J ? rm.size : vec ? (size_t)Lp * Lp : P;
     WITH_PAIR_T(
       static bool attr = false;
       if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT>), (int)smem); attr = true; }
-      triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp));
+      triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp, nullptr, rm));
   }
 }
 
