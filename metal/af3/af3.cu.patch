@@ -54,3 +54,21 @@ inline size_t dropFloatCopies(int segs) {
     if (getenv("LOCALFOLD_MEM")) fprintf(stderr, "  memory f32 weight copies dropped: %.2f GB\n", freed / 1e9);
   }
 @@@ end
+# (Metal) the trunk's working buffers given back when it is done, where the CUDA port keeps them for the next fold's
+# trunk: they sat beside the diffusion's own (0.86 GB at 255 tokens), and memory is what a Mac is short of. The
+# confidence head's pairformer takes the ones it uses again. LOCALFOLD_KEEP_SCRATCH=1 is the control.
+@@@ old
+    releaseConcatCopies(); memReport("trunk");
+@@@ new
+    releaseConcatCopies();
+    if (!getenv("LOCALFOLD_KEEP_SCRATCH"))
+      releaseScratch({"tri.", "trib.", "grid.", "tr.", "opm.", "tmpl.", "msaatt.", "emb.", "st."});
+    memReport("trunk");
+@@@ end
+# (Metal) ...and the pair-sized tensors only the diffusion's preparation reads, given back before its steps at every
+# size, where the CUDA port does so only for a large input (`tight`). LOCALFOLD_KEEP_SCRATCH=1 is the control.
+@@@ old
+    if (tight) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln", "enc.tp", "enc.h1", "enc.h2" });
+@@@ new
+    if (tight || !getenv("LOCALFOLD_KEEP_SCRATCH")) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln", "enc.tp", "enc.h1", "enc.h2" });
+@@@ end

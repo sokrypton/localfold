@@ -102,6 +102,13 @@ Not the input embedder's (bisected by prefix: their rounding took IntelliFold-2'
 the structure did not move) and not the confidence head's. At 255 tokens: 2.51 -> 1.18 GB in use before the trunk, the
 fold's peak 4.95 -> 3.85 GB. `LOCALFOLD_KEEP_F32=1` is the control.
 
+And the scratch: the trunk's working buffers (`tri.`, `grid.`, `tr.`, `opm.` ...) given back when the trunk is done,
+where the port keeps them for a next fold's trunk - they sat beside the diffusion's own - and the pair-sized tensors only
+the diffusion's preparation reads given back before its steps at every size (the port does so only for a large input).
+The process's peak footprint at 255 tokens: **5.03 -> 3.29 GB** with the weights change, the same digits, the same
+time; two seeds of six samples (two batches through one preparation) give byte-identical ranking scores to the control.
+`LOCALFOLD_KEEP_SCRATCH=1` is the control.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):
 
