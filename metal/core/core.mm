@@ -497,7 +497,10 @@ void gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   // the tile: TR rows along n by TC columns along m. A short n (up to 128) in ONE tile row - every weight read once -
   // rounded up to 16; the columns then as many as keep a simdgroup's accumulators at 16 or fewer
   int tr = 64, tc = 64;
-  if (a.n <= 128) { tr = (a.n + 15) / 16 * 16; tc = tr <= 64 ? 64 : 32; }
+  // (80 rows take 64 columns too where there are 40 tiles of them: a simdgroup's 40 x 32 reloads fewer fragments a
+  // multiply - 0.187 against 0.254 ms on 3072 x 80 x 768, 1.70 against 2.00 on 73728 x 80 x 384, interleaved - and
+  // narrower weights keep 32, whose extra threadgroups win there: 0.102 against 0.118 ms on 768 x 80 x 768)
+  if (a.n <= 128) { tr = (a.n + 15) / 16 * 16; tc = tr <= 64 || (tr <= 80 && a.m >= 40 * 64) ? 64 : 32; }
   else if (a.m <= 48) { tr = 64; tc = 32; }
   // 48-row tiles where 64 would waste over a tenth of the rows on padding and 48 wastes less
   if (a.n > 128 && tr == 64) {

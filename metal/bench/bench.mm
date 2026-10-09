@@ -1,5 +1,6 @@
 // metal/bench: GEMM arms timed against each other, interleaved (this laptop's clock drifts over minutes).
-//   metal/bench/localfold-bench <out> <rows> <in> [arms: EP bits, comma-separated, default 0,64; 1000 + B a K step of B]
+//   metal/bench/localfold-bench <out> <rows> <in> [arms: EP bits, comma-separated, default 0,64; 1000 + B a K step of B;
+//                               100000 + R * 1000 + C an R x C tile]
 //                               [types: hhh|hhf|fhf]
 #include "core.h"
 #include <algorithm>
@@ -93,8 +94,11 @@ int main(int argc, char** argv) {
   for (int round = 0; round < 7; ++round)
     for (size_t k = 0; k < arms.size(); ++k) {
       // (an arm of 1000 + B: the core GEMM with a K step of B - LOCALFOLD_GEMM_BK, read at every call)
-      if (arms[k] >= 1000) setenv("LOCALFOLD_GEMM_BK", std::to_string(arms[k] - 1000).c_str(), 1);
+      // (an arm of 100000 + R * 1000 + C: an R x C tile - LOCALFOLD_GEMM_TILE, read at every call)
+      if (arms[k] >= 1000 && arms[k] < 100000) setenv("LOCALFOLD_GEMM_BK", std::to_string(arms[k] - 1000).c_str(), 1);
       else unsetenv("LOCALFOLD_GEMM_BK");
+      if (arms[k] >= 100000) setenv("LOCALFOLD_GEMM_TILE", (std::to_string((arms[k] - 100000) / 1000) + "x" + std::to_string(arms[k] % 1000)).c_str(), 1);
+      else unsetenv("LOCALFOLD_GEMM_TILE");
       GEMM_EXTRA_EP = arms[k] < 0 || arms[k] >= 1000 ? 0 : arms[k];
       fill(Y, 0, rows * out * (ty == F16 ? 2 : 4));
       auto runOnce = [&] {
