@@ -820,6 +820,8 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   if ((a.epilogue & 128) && tc < 32) tc = 32;     // (SwiGLU's blocks of 8 pair two 8-column matrices a simdgroup)
   if (a.epilogue & 256) tc = 64;     // (the triangle's gate: a simdgroup's four 8-column blocks are one group of channels)
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);   // (an arm: one tile everywhere)
+  // (a simdgroup takes half the tile each way in 8 x 8 matrices: anything else computes part of its tile and says nothing)
+  if (tr % 16 || tc % 16 || tr < 16 || tc < 16) { fprintf(stderr, "gemm: no %d x %d tile\n", tr, tc); exit(1); }
   int bm = tc, bn = tr;
   auto esize = [](cudaDataType t) { return t == CUDA_R_32F ? 4 : 2; };
   bool vec = !a.ptrs && a.lda % 8 == 0 && a.ldb % 8 == 0 && (a.sa % 8 == 0) && (a.sb % 8 == 0) &&
