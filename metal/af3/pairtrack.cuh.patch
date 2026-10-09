@@ -133,3 +133,92 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   }
   __syncthreads();
 @@@ end
+
+# The unfused grid attention's pair bias: one simdgroup a pair row does its LayerNorm (layerNormK's arithmetic, so
+# `norm` is the same bytes), the heads' logits as simdgroup sums, and writes them straight into the flash kernel's
+# bias layout - where the port runs layerNormK, a 4-column GEMM into `raw` (a 32-column tile, 7/8 of it padding)
+# and biasLayoutK. LOCALFOLD_UNFUSED_BIAS=1 is the control.
+@@@ old
+// Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
+@@@ new
+template <int C, class PT>
+__global__ void lnBiasMetal(const float* x, const float* sc, const float* of, const half* Wp, half* norm, half* bias,
+                            size_t rows, int n, int stride, int heads, bool swap, float scale) {
+  constexpr int K = C / 32;
+  const int lane = threadIdx.x & 31;
+  const size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= rows) return;
+  const PT* xr = reinterpret_cast<const PT*>(x) + row * C;
+  float v[K];
+  float s = 0.f, ss = 0.f;
+  for (int k = 0; k < K; ++k) { v[k] = (float)xr[lane + 32 * k]; s += v[k]; ss += v[k] * v[k]; }
+  for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); ss += __shfl_xor_sync(~0u, ss, o); }
+  float mean = s / C, inv = rsqrtf(ss / C - mean * mean + 1e-5f);
+  for (int k = 0; k < K; ++k) {
+    half hv = __float2half((v[k] - mean) * inv * sc[lane + 32 * k] + of[lane + 32 * k]);
+    norm[row * C + lane + 32 * k] = hv;
+    v[k] = (float)hv;
+  }
+  const int pi = (int)(row / (size_t)n), pj = (int)(row - (size_t)pi * n);
+  const int bi = swap ? pj : pi, bj = swap ? pi : pj;
+  if (heads == 4) {   // the four sums in one butterfly: 6 shuffles where four reductions take 20
+    float a[4];
+    for (int h = 0; h < 4; ++h) {
+      a[h] = 0.f;
+      for (int k = 0; k < K; ++k) a[h] += v[k] * (float)Wp[(size_t)(lane + 32 * k) * 4 + h];
+    }
+    const bool u16 = lane & 16, u8 = lane & 8;
+    float r0 = __shfl_xor_sync(~0u, u16 ? a[0] : a[2], 16), r1 = __shfl_xor_sync(~0u, u16 ? a[1] : a[3], 16);
+    float b0 = (u16 ? a[2] : a[0]) + r0, b1 = (u16 ? a[3] : a[1]) + r1;      // heads (u16 ? 2 : 0) + {0, 1}
+    float c = (u8 ? b1 : b0) + __shfl_xor_sync(~0u, u8 ? b0 : b1, 8);        // head (u16 ? 2 : 0) + (u8 ? 1 : 0)
+    c += __shfl_xor_sync(~0u, c, 4); c += __shfl_xor_sync(~0u, c, 2); c += __shfl_xor_sync(~0u, c, 1);
+    const int h = (u16 ? 2 : 0) + (u8 ? 1 : 0);
+    half* brow = bias + ((size_t)h * n + bi) * stride;
+    if ((lane & 7) == 0) brow[bj] = __float2half(scale * c);
+    if (bj == n - 1 && (lane & 7) < stride - n) brow[n + (lane & 7)] = __float2half(0.f);    // (the padding columns)
+    return;
+  }
+  for (int h = 0; h < heads; ++h) {
+    float a = 0.f;
+    for (int k = 0; k < K; ++k) a += v[k] * (float)Wp[(size_t)(lane + 32 * k) * heads + h];
+    for (int o = 16; o; o >>= 1) a += __shfl_xor_sync(~0u, a, o);
+    half* brow = bias + ((size_t)h * n + bi) * stride;
+    if (lane == 0) brow[bj] = __float2half(scale * a);
+    if (bj == n - 1 && lane < stride - n) brow[n + lane] = __float2half(0.f);    // (the padding columns)
+  }
+}
+// Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
+@@@ end
+@@@ old
+  bool headMajor = false, normTransposed = false;
+@@@ new
+  bool headMajor = false, normTransposed = false, biasDone = false;
+@@@ end
+@@@ old
+    if (!headMajor) {
+      lnPairRows<T>(pair, 0, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
+      linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
+    }
+@@@ new
+    static const bool fuseBias = !getenv("LOCALFOLD_UNFUSED_BIAS");
+    if constexpr (std::is_same_v<T, half>) if (!headMajor && fuseBias && C == 128) {
+      int stride = (n + 7) / 8 * 8;
+      half* bias = scratch<half>("grid.bias", (size_t)heads * n * stride);
+      WITH_PAIR_T(lnBiasMetal<128, PT><<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(
+        pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(pre + ".pairBiasProjection"), norm, bias, pairs,
+        n, stride, heads, tr && swapBias, LOG2E));
+      biasDone = true;
+    }
+    if (!headMajor && !biasDone) {
+      lnPairRows<T>(pair, 0, norm, pairs, C, pre + ".actNormScale", pre + ".actNormOffset");
+      linear<T, float>(norm, raw, pairs, C, heads, pre + ".pairBiasProjection");
+    }
+@@@ end
+@@@ old
+  if (headMajor)
+    biasLayoutHeadMajorK<T><<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(
+@@@ new
+  if (biasDone) {}
+  else if (headMajor)
+    biasLayoutHeadMajorK<T><<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(
+@@@ end

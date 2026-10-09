@@ -34,9 +34,9 @@
   "rmsd": null
  },
  "af3-glycan": {
-  "ligand": 0.023,
-  "plddt": 45.3,
-  "ptm": "0.4289",
+  "ligand": 0.024,
+  "plddt": 44.63,
+  "ptm": "0.4190",
   "rmsd": null
  },
  "af3-kitchen-sink": {
@@ -72,8 +72,8 @@
   "rmsd": 1.561
  },
  "rosettafold3-6mrr": {
-  "plddt": 81.41,
-  "ptm": "0.8035",
-  "rmsd": 1.764
+  "plddt": 81.43,
+  "ptm": "0.8036",
+  "rmsd": 1.706
  }
 }

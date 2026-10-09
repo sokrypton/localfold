@@ -73,6 +73,16 @@ the gate's own seed moved 1.699 -> 1.764; that case and af3-glycan (44.35 -> 45.
 re-recorded. **AlphaFold 2 keeps float** (`metal/af2/defaults.env`): its no-alignment multimer moved 0.75 pLDDT, and
 its reference is a float model. `LOCALFOLD_GEMM_FLOAT_ACC=1` is the control.
 
+And **the unfused grid attention's pair bias in one kernel** (`lnBiasMetal`, `metal/af3/pairtrack.cuh.patch`): a
+simdgroup a pair row takes its LayerNorm (layerNormK's arithmetic: `norm` is the same bytes) and the four heads'
+logits - reduced together in one butterfly, 6 shuffles where four reductions took 20 - and writes them into the flash
+kernel's bias layout. layerNormK + a 4-column GEMM (a 32-column tile, 7/8 padding) + biasLayoutK were 1176 ms at 255
+tokens; now 950. GPU 16.98 -> 16.81 s. `LOCALFOLD_UNFUSED_BIAS=1` is the control.
+
+🔴 **rosettafold3-6mrr AND af3-glycan SWING UNDER ANY ROUNDING CHANGE.** rf3's RMSD went 1.699 -> 1.764 -> 1.706 over
+two changes that each move the other cases' digits only, and glycan's pLDDT 44.35 -> 45.30 -> 44.63; seed by seed
+the arms agree (above). A MOVED on those two alone, with every other case in its digits, is that and not a defect.
+
 And in `flashGridMetal`: K and V staged four halves a load (3109 -> 2630 ms at 255 tokens). center_norm's
 statistics summed while loading, by all eight rows of threads where one row did it alone (613 -> 365 ms).
 `layerNormK` is at the M2's bandwidth already (~95 GB/s), and a pair-bias read two halves at a time moved nothing.
@@ -80,6 +90,9 @@ statistics summed while loading, by all eight rows of threads where one row did 
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):
 
+- **`flashGridMetal`'s tiles and accumulator** (255 tokens, its 488 calls): keys 32 at a time 2611 -> 2958 ms, 8 at a
+  time 2710, 64 queries a threadgroup (eight simdgroups sharing a staged key tile) 2859, and the output accumulated in
+  half 2637. Keys 16 at a time over 32 queries with a float accumulator is where it sits.
 - **MPS (`MPSMatrixMultiplication`) in place of `lf_gemm`.** Standalone it looked 1.8x on 3072 x 272 x 768; through the
   runtime, timed the same way as ours, it was 1.18 against 1.25 TFLOP/s and its error 5e-4 against 2e-4. On the
   triangle's tall K-128 projections it loses outright. The GEMM is at MPS's level already.
