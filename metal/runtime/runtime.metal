@@ -122,9 +122,14 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   // X tile: [j][k] when B is not transposed (contiguous k), else [k][j]; W tile: [k][i] when A is not transposed
   // (contiguous i), else [i][k]
   constexpr int XROW = TRB ? TR + PAD : BK + PAD, WROW = TRA ? BK + PAD : TC_ + PAD;
-  threadgroup T Xs[(TRB ? BK : TR) * XROW];
-  threadgroup T Ws[(TRA ? TC_ : BK) * WROW];
-  threadgroup half Sab[(EP & 7) == 1 ? 2 * (TC_ / 4) * TR : 1];     // (EP 1: the gated a and b, channel-major, for the store)
+  // (EP 1's gated a and b, staged channel-major for the store, reuse the tiles' memory once the k loop is done: in a
+  // buffer of their own they cost a 64 x 64 tile its occupancy)
+  constexpr int XSZ = (TRB ? BK : TR) * XROW, WSZ = (TRA ? TC_ : BK) * WROW;
+  constexpr int SABSZ = (EP & 7) == 1 ? (2 * (TC_ / 4) * TR * 2 + sizeof(T) - 1) / sizeof(T) : 0;
+  threadgroup T tgm[XSZ + WSZ > SABSZ ? XSZ + WSZ : SABSZ];
+  threadgroup T* Xs = tgm;
+  threadgroup T* Ws = tgm + XSZ;
+  threadgroup half* Sab = (threadgroup half*)tgm;
   constexpr int WR = TR / 2, WC = TC_ / 2, FR = WR / 8, FC = WC / 8;
   const int sr = (sg / 2) * WR, sc = (sg % 2) * WC;
   // (EP bit 8: accumulated in half - the all-half GEMMs, lfcuda.mm's gemm)
@@ -187,6 +192,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     }
   }
   if ((EP & 7) == 1) {   // the triangle's gate: lane (bit 0 clear) holds (pa, pb), its neighbour (ga, gb) of the same channel
+    threadgroup_barrier(mem_flags::mem_threadgroup);    // (every simdgroup done with the tiles Sab overlays)
     const int sm1 = (lane / 16) * 4 + (lane % 8) / 2, sn1 = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
     device const float* mask = (device const float*)g.aux;
     _Pragma("clang loop unroll(full)")
