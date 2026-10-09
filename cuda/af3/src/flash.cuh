@@ -915,6 +915,9 @@ inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_F
 // the blocks' order (flashGrid2R's sw): four row groups a query tile once a head's bias (n^2 halves) is past ~24 MB of
 // L2 - --bench-grid at 256 rows 75.6 -> 72.3 ms at 8,000 tokens, 42.5 -> 40.3 at 6,000, level at 3,000 and ~1% behind
 // at 1,000; byte-identical (the same blocks, another order). LOCALFOLD_GRID_SWIZZLE=<sw> forces one, 0 off
+// (three warps a block - 96 queries, K and V a third less L2 traffic a score, still 12 warps an SM - measured level at
+// 6,000 tokens and 12% behind at 1,000: past the L2 (66% busy in Nsight Compute) the kernel is latency-bound at 168
+// registers a thread, three blocks an SM; key tiles of 32, 64 or 80 are 2-5% behind 48 at 6,000 too)
 inline int GRID_SWIZZLE = getenv("LOCALFOLD_GRID_SWIZZLE") ? atoi(getenv("LOCALFOLD_GRID_SWIZZLE")) : -1;
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,

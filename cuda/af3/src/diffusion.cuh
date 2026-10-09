@@ -598,14 +598,25 @@ __global__ void flatToBiasHalfK(const float* flat, half* out, int block, int nbl
   int j = (int)(t % stride); size_t rest = t / stride; int i = (int)(rest % n), h = (int)(rest / n);
   out[t] = __float2half(j < n ? flat[((size_t)i * n + j) * nblocks * heads + block * heads + h] * LOG2E : 0.f);
 }
-// the same over rows [i0, i0 + ri) of i, from a flat chunk holding only those rows
-__global__ void flatToBiasHalfRowsK(const float* flat, half* out, int block, int nblocks, int heads, int n, int stride,
-                                    int i0, int ri) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)heads * ri * stride) return;
-  int j = (int)(t % stride); size_t rest = t / stride; int ii = (int)(rest % ri), h = (int)(rest / ri);
-  out[((size_t)h * n + i0 + ii) * stride + j] =
-    __float2half(j < n ? flat[((size_t)ii * n + j) * nblocks * heads + block * heads + h] * LOG2E : 0.f);
+// every block of a super block at once over rows [i0, i0 + ri): the flat chunk's (i, j) rows (ps * heads floats, all its
+// blocks' heads) read whole through a 32-row tile, each block's [h][i][stride] written 32 columns a warp - where a thread
+// an output read one float of a 256-byte row, a launch a block (173 of a step's ~213 ms at 2,964 tokens streamed)
+struct SuperBias { half* p[8]; };
+__global__ void flatToBiasSuperK(const float* __restrict__ flat, SuperBias out, int ps, int heads, int n, int stride, int i0) {
+  extern __shared__ float tileS[];                  // [32][ps * heads + 1]
+  const int PH = ps * heads, LD = PH + 1, ii = blockIdx.y, j0 = blockIdx.x * 32;
+  for (int t = threadIdx.x; t < 32 * PH; t += blockDim.x) {
+    int jj = t / PH, c = t % PH, j = j0 + jj;
+    tileS[jj * LD + c] = j < n ? flat[((size_t)ii * n + j) * PH + c] : 0.f;
+  }
+  __syncthreads();
+  for (int t = threadIdx.x; t < 32 * PH; t += blockDim.x) {
+    int c = t / 32, jj = t % 32, j = j0 + jj;
+    if (j >= stride) continue;
+    int b = c / heads, h = c % heads;
+    if (!out.p[b]) continue;
+    out.p[b][((size_t)h * n + i0 + ii) * stride + j] = __float2half(tileS[jj * LD + c] * LOG2E);
+  }
 }
 // layerNormSlowK into f16, no offset: the two-pass variance, the module's convention
 __global__ void layerNormSlowHalfK(const float* in, half* out, size_t rows, int C, const float* scale) {
@@ -793,9 +804,14 @@ inline void refreshSuperBlockBias(int sb, int n) {
   for (int i0 = 0; i0 < n; i0 += ri) {
     int r = std::min(ri, n - i0); size_t rows = (size_t)r * n;
     linear<half, float>(tc.pn16 + (size_t)i0 * n * Cz, flatc, rows, Cz, ps * heads, w);
-    for (int b = sb * ps; b < std::min(tc.nblocks, (sb + 1) * ps); ++b)
-      flatToBiasHalfRowsK<<<blocks((size_t)heads * r * tc.stride), 256, 0, STREAM>>>(flatc, tc.biasHalf[b], b % ps,
-                                                                                ps, heads, n, tc.stride, i0, r);
+    SuperBias sp{};
+    if (ps > 8) { fprintf(stderr, "a super block of %d blocks (8 at most)\n", ps); exit(1); }
+    for (int b = sb * ps; b < (sb + 1) * ps; ++b) sp.p[b % ps] = b < tc.nblocks ? tc.biasHalf[b] : nullptr;
+    // (a last super block short of ps blocks: its missing blocks' heads are computed and not stored)
+    const int smem = 32 * (ps * heads + 1) * 4;
+    static int granted = 0;
+    if (smem > 48 * 1024 && smem > granted) { smemAttr(flatToBiasSuperK, smem); granted = smem; }
+    flatToBiasSuperK<<<dim3((unsigned)((tc.stride + 31) / 32), (unsigned)r), 256, smem, STREAM>>>(flatc, sp, ps, heads, n, tc.stride, i0);
   }
 }
 template <class T>
