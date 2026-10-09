@@ -19,7 +19,8 @@ Trunk makeTrunk(const float* targetFeat, int msaCap) {
   size_t pairs = (size_t)t.n * t.n;
   t.pair = allocT<float>(pairs * t.C); t.single = allocT<float>((size_t)t.n * t.Cs);
   t.msa = allocT<float>((size_t)t.S * t.n * t.Cm);
-  t.prevPair = allocT<float>(pairs * t.C); t.prevSingle = allocT<float>((size_t)t.n * t.Cs);
+  fill(t.pair, 0, pairs * t.C * 4);     // (the recycled pair before the first pass: read in place, embed())
+  t.prevSingle = allocT<float>((size_t)t.n * t.Cs);
   t.targetFeat = allocT<float>((size_t)t.n * t.F);
   copy(t.targetFeat, targetFeat, (size_t)t.n * t.F * 4);
   std::vector<float> seq(M.hostF("batch.seqMask"), M.hostF("batch.seqMask") + t.n), pm(pairs);
@@ -35,7 +36,7 @@ Trunk makeTrunk(const float* targetFeat, int msaCap) {
 }
 void freeTrunk(Trunk& t) {
   for (const void* p : {(const void*)t.pair, (const void*)t.single, (const void*)t.msa, (const void*)t.targetFeat, (const void*)t.pairMask,
-                        (const void*)t.seqMask, (const void*)t.msaMask, (const void*)t.prevPair, (const void*)t.prevSingle,
+                        (const void*)t.seqMask, (const void*)t.msaMask, (const void*)t.prevSingle,
                         (const void*)t.msaRows, (const void*)t.deletion})
     if (p) release(p);
   t = Trunk{};
@@ -128,7 +129,6 @@ static void embed(Trunk& t) {
     run1d("af3_chai_relenc", pairs * C, ChaiRelEncArgs{relIdx(), W(E + "positionActivations"), W(E + "positionActivationsBias"), t.pair,
                                                        (uint)n, (uint)C});
   };
-  float* prev = scratch<float>("emb.prev", pairs * C);
   half* pn = scratch<half>("emb.prevln", pairs * C);
   if (chai && t.pass == 0) {
     run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, nullptr, t.pair, (uint)n, (uint)C});
@@ -136,9 +136,11 @@ static void embed(Trunk& t) {
     ln(t.pair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     lin(pn, E + "prevEmbedding", t.pair, pairs, C, C, 1.f);
   } else {
-    ln(t.prevPair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
-    lin(pn, E + "prevEmbedding", prev, pairs, C, C);
-    run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, prev, t.pair, (uint)n, (uint)C});
+    // (the recycled pair is t.pair itself, zero before the first pass: its term projected back over it - a row reads only
+    // its own normalised row - and the outer sum added in place; a copy of it and an f32 term were two pairs more)
+    ln(t.pair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
+    lin(pn, E + "prevEmbedding", t.pair, pairs, C, C);
+    run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, t.pair, t.pair, (uint)n, (uint)C});
   }
   if (chai) { if (t.pass > 0) chaiRelEnc(); }      // (the first pass added it before the recycle term)
   else run1d("af3_relenc", pairs * C, RelEncArgs{relIdx(), W(E + "positionActivations"), t.pair, (uint)n, (uint)C});
@@ -149,7 +151,7 @@ static void embed(Trunk& t) {
                         types && M.has("batch.bondOrderMatrix") ? Fb("batch.bondOrderMatrix") : nullptr,
                         types ? W(E + "tokenBondsTypeEmbed") : nullptr, types ? W(E + "contactEncodingUnspecified") : nullptr,
                         pairs, (uint)C, 0});
-  releaseScratch({"emb.prev"});
+  releaseScratch({"emb.prevln"});
   if (t.pass == 0) seam("z_init_generic", t.pair, pairs * C);
   templateEmbedding(t);
   if (t.pass == 0) seam("z_after_template", t.pair, pairs * C);
@@ -331,7 +333,7 @@ static void msaBlock(Trunk& t, int k) {
 void runTrunk(Trunk& t) {
   size_t pairs = (size_t)t.n * t.n;
   // the recycled state: the last pass's pair and single (zero before the first)
-  if (t.pass > 0) { copy(t.prevPair, t.pair, pairs * t.C * 4); copy(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4); }
+  if (t.pass > 0) copy(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4);     // (the pair is recycled in place: embed())
   embed(t);
   releaseScratch({"emb."});
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + num(msaBlocks) + ".pairChannels")) ++msaBlocks;
@@ -346,6 +348,7 @@ void runTrunk(Trunk& t) {
   releaseScratch({"msaatt.", "opm.", "trunk.zBeforeMsa"});
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
   for (int k = 0; k < blocks; ++k) pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k));
+  releaseScratch({"pr.", "grid.", "tr.", "st."});     // (the next pass's embedder and MSA stack would hold theirs beside it)
 }
 
 // ---------------------------------------------------------------- the distogram

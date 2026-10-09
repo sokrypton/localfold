@@ -192,7 +192,6 @@ int foldInput(const std::string& dir, Options o) {
     for (size_t k = 0; k < v.size() && k < 12; ++k) printf(" %s %.0f", v[k].first.c_str(), v[k].second / 1e6);
     printf("\n");
   }
-  releaseScratch({"pr.", "grid.", "tr.", "st."});
   std::vector<float> contact = contactProbabilities(t);
   mt::sync();
   double trunkMs = ms(f0);

@@ -80,7 +80,7 @@ struct Trunk {
   int n, S, C, Cs, Cm, F;                 // tokens, MSA rows, pair, single, msa channels, target_feat width
   float *pair, *single, *msa, *targetFeat, *pairMask, *seqMask, *msaMask, *deletion;
   int* msaRows;
-  float *prevPair, *prevSingle;
+  float* prevSingle;                      // (the pair recycles in place)
   Masks masks;
   int pass = 0;
 };

@@ -107,6 +107,9 @@ What was tried and **lost**, so nobody repeats it blind:
 - **The flash attention reading K and V straight from the device** (`simdgroup_load` from device memory, no staging and
   no barrier, the last tile staged): both arms fell to about half - 0.72 / 0.67 against 1.33 TFLOP/s at 261 tokens - the
   second path cost the kernel its registers. It is register-bound, as its comment says.
+- **The diffusion transformer's gated residual and the next adaLN in one kernel** (cuda/ef2's fusion on `opus-55-opt`,
+  48 launches a step fewer): byte-identical and level - 2.49 / 2.47 / 2.47 against 2.49 / 2.43 / 2.46 s at 68 tokens,
+  0.7% at 261. Launches from one serial encoder cost almost nothing here; on CUDA the gain was the launches.
 - **A 72-row GEMM tile** (simdgroups 1 x 4) so 68 tokens pad to 72, not 80: 0.181 against 0.189 ms on 3072 x 768, level
   on the conditioning, worse on 768 columns (no 16-column tile) - about 2% of a step, not worth a second layout.
 
@@ -127,7 +130,10 @@ its own allocation at load, the derived form is built up front (`metal/af3/weigh
 (`Model::retire`). ESMFold2 gives its language model back once it has run (not under `--serve`) and interleaves its
 tower's weights in place. Scratch buffers are named and grown as asked; each stage gives its own back when it is done,
 and the pair track's stages, which run one after another, share theirs (one buffer is the grid attention's q|k|v|g or
-the triangle's planes). The sampler's scratch is given back before the confidence head builds its own.
+the triangle's planes) and give it back at the end of each pass. The sampler's scratch is given back before the
+confidence head builds its own. The pair recycles in place (its recycle term projected back over itself, a row reading
+only its own normalised row): a copy of it and an f32 term were two pairs more, 1.1 GB at 1044 tokens. (From cuda/af3's
+big-input work on `opus-55-opt`, whose pair stays bf16 past the trunk; its launch fusions were measured here and lost.)
 
 🔴 **A RELEASED BUFFER IS STILL RESIDENT UNTIL THE WORK ISSUED BEFORE IT IS DONE**, and the host runs far ahead of the
 GPU: a 522-token trunk pass held 0.9 GB of released buffers beside its own 1.9, invisible to the allocation count and
@@ -141,6 +147,7 @@ peaks and the scratch by name.
 | ESMFold2 5CAJ: allocation / footprint | 2.90 / 2.92 GB | 1.70 / 2.23 GB |
 | AF3, 522 tokens, one pass: footprint | 2.96 GB | 2.00 GB |
 | AF3, 1044 tokens, one pass: allocation / footprint | 9.0 / 11.3 GB | 5.2 / 5.3 GB |
+| AF3, 1044 tokens, two passes: footprint | | 4.7 GB |
 
 ## Traps, each paid for
 
