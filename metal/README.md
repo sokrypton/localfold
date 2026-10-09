@@ -71,7 +71,9 @@ in half and adding it to a float accumulator (6.6e-4) won nothing: the win is th
 rosettafold3-6mrr the two arms agree to 0.01 A seed by seed (1.005/1.006, 1.672/1.671, 1.859/1.854, 1.770/1.782), and
 the gate's own seed moved 1.699 -> 1.764; that case and af3-glycan (44.35 -> 45.30, toward the A100's 47.42) were
 re-recorded. **AlphaFold 2 keeps float** (`metal/af2/defaults.env`): its no-alignment multimer moved 0.75 pLDDT, and
-its reference is a float model. `LOCALFOLD_GEMM_FLOAT_ACC=1` is the control.
+its reference is a float model. `LOCALFOLD_GEMM_FLOAT_ACC=1` is the control. Extending it to the half-input, float-output GEMMs at k <= 128
+(the residual's updates) was 0.94x on them and **crashed** intellifold2, openbind0, opendde and two ESMFold2 cases:
+one of those sums overflowed half to inf and host code downstream segfaulted - so a float output keeps float.
 
 And **the unfused grid attention's pair bias in one kernel** (`lnBiasMetal`, `metal/af3/pairtrack.cuh.patch`): a
 simdgroup a pair row takes its LayerNorm (layerNormK's arithmetic: `norm` is the same bytes) and the four heads'
