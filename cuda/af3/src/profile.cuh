@@ -17,6 +17,11 @@ inline CUptiResult (*flushAll)(uint32_t) = nullptr;
 inline std::map<std::string, std::pair<double, int>> byName;   // name -> (ns, calls)
 inline uint64_t first = UINT64_MAX, last = 0; inline double busy = 0;
 inline bool on = false;
+// LOCALFOLD_PROF_GAPS=<n>: every kernel's span kept too, and the n longest stretches the device sat idle printed with
+// the kernels either side - where a wall clock's time goes that no kernel's does (host work, a synchronisation)
+struct Span { uint64_t start, end; std::string name; };
+inline std::vector<Span> spans;
+inline const int GAPS = getenv("LOCALFOLD_PROF_GAPS") ? atoi(getenv("LOCALFOLD_PROF_GAPS")) : 0;
 inline void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxRecords) {
   *size = 8 << 20; *buffer = (uint8_t*)aligned_alloc(8, *size); *maxRecords = 0;
 }
@@ -36,6 +41,7 @@ inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_
       auto& e = byName[shortName(k->name)];
       e.first += (double)(k->end - k->start); e.second += 1;
       busy += (double)(k->end - k->start);
+      if (GAPS) spans.push_back({k->start, k->end, shortName(k->name)});
       first = std::min<uint64_t>(first, k->start); last = std::max<uint64_t>(last, k->end);
     }
   }
@@ -56,7 +62,7 @@ inline void init() {
   registerCallbacks(bufferRequested, bufferCompleted);
   enable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
 }
-inline void start() { flushAll(0); byName.clear(); busy = 0; first = UINT64_MAX; last = 0; on = true; }
+inline void start() { flushAll(0); byName.clear(); spans.clear(); busy = 0; first = UINT64_MAX; last = 0; on = true; }
 inline void stop(int top = 25) {
   CK(cudaDeviceSynchronize());
   flushAll(0);
@@ -68,5 +74,20 @@ inline void stop(int top = 25) {
   for (int i = 0; i < (int)rows.size() && i < top; ++i)
     printf("  %8.2f ms %5.1f%% %7d  %s\n", rows[i].second.first / 1e6, 100 * rows[i].second.first / busy,
            rows[i].second.second, rows[i].first.substr(0, 90).c_str());
+  if (GAPS && spans.size() > 1) {
+    std::sort(spans.begin(), spans.end(), [](const Span& a, const Span& b) { return a.start < b.start; });
+    struct Gap { double ns; size_t at; };
+    std::vector<Gap> gaps; uint64_t reach = spans[0].end; double idle = 0;
+    for (size_t i = 1; i < spans.size(); ++i) {
+      if (spans[i].start > reach) { gaps.push_back({(double)(spans[i].start - reach), i}); idle += spans[i].start - reach; }
+      reach = std::max(reach, spans[i].end);
+    }
+    std::sort(gaps.begin(), gaps.end(), [](const Gap& a, const Gap& b) { return a.ns > b.ns; });
+    double small = 0; for (auto& g : gaps) if (g.ns < 100000) small += g.ns;
+    printf("idle %.1f ms in %zu gaps (%.1f ms of them under 0.1 ms each); the longest:\n", idle / 1e6, gaps.size(), small / 1e6);
+    for (int i = 0; i < (int)gaps.size() && i < GAPS; ++i)
+      printf("  %7.2f ms at +%7.1f ms  after %s  before %s\n", gaps[i].ns / 1e6, (spans[gaps[i].at].start - first) / 1e6,
+             spans[gaps[i].at - 1].name.substr(0, 50).c_str(), spans[gaps[i].at].name.substr(0, 50).c_str());
+  }
 }
 }  // namespace prof
