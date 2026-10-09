@@ -571,8 +571,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 template <int C, int WARPS, class TP = float>
 void triangleOutRun(const TP* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
                     int L, int Lp, const float* ob = nullptr, RectMap rm = {}) {
-  if (rm.J && (ob || sizeof(TP) != 2)) { fprintf(stderr, "triangleOutRun: a rectangle wants the bf16 product, no bias\n"); exit(1); }
   static const bool f32 = getenv("LOCALFOLD_TRIOUT_F32") != nullptr;
+  if (rm.J && (sizeof(TP) != 2 || f32)) { fprintf(stderr, "triangleOutRun: a rectangle wants the bf16 product and tile\n"); exit(1); }
   constexpr int R = 16 * WARPS;
   size_t P = (size_t)L * L;
   half* wt = scratch<half>("triout.wt", (size_t)C * C);
@@ -598,12 +598,12 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
       // bf16 tile at 16-column stages, the bias in the same epilogue
       constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();
       constexpr bool vec = sizeof(TP) == 2;
-      size_t rows = vec ? (size_t)Lp * Lp : P;
+      size_t rows = rm.J ? rm.size : vec ? (size_t)Lp * Lp : P;
       WITH_PAIR_T(
         static bool attr = false;
         if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, true, PT>), (int)smem); attr = true; }
         triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, true, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-          prod, sc, of, wt, t2, pair, L, Lp, ob));
+          prod, sc, of, wt, t2, pair, L, Lp, ob, rm));
     }
   } else {
     constexpr size_t smem = triangleOutSmem<C, WARPS, __nv_bfloat16, 16, TP>();

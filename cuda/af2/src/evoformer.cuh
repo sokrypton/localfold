@@ -666,6 +666,59 @@ inline void triangleBlocked2(float* pair, const float* mask, int L, int C, const
                  PH(T + "/gating_linear/weights", blk), P(T + "/gating_linear/bias", blk) };
   triangleBlockedHalf(pair, mask, L, C, w, outgoing, AF2_CHUNK);
 }
+// 🔴 ON AN SM WITH AN A100's SHARED MEMORY, cuda/af3's streaming kernels as AF3 runs them at 128 channels (below)
+inline bool af2Wide128() {
+  static const bool wide128 = [] {
+    if (const char* e = getenv("LOCALFOLD_TRI128")) return std::string(e) == "wide";
+    int dev, perSm = 0, major = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+    return perSm >= 160 * 1024 && major >= 8;
+  }();
+  return wide128;
+}
+// the blocks on those streaming kernels (cuda/af3's triangleBlockedFused): the biased input kernel over the whole plane
+// for b alone, then over each block's rectangle for a and its gating rows, a bf16 contraction, and the output kernel
+// (its bias in the epilogue) over the rectangle - where triangleBlockedHalf ran an LN, a GEMM and a transposing gate a
+// chunk and five passes on the way out, its f16 contraction on cuBLAS's 64-wide batched tiles
+inline void triangleBlockedFused2(float* pair, const float* mask, int L, int C, const std::string& T, int blk, bool outgoing) {
+  using B16 = __nv_bfloat16;
+  const int Lp = (L + 7) / 8 * 8; const size_t plane = (size_t)Lp * Lp;
+  TriFused tw = triFusedWeights(T, blk, C);
+  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
+  tileTriIn(tw.wpg, PH(T + "/gating_linear/weights", blk), C, 16, wt);
+  B16* b = scratch<B16>("trib.bbf", plane * C);
+  int width = (int)std::max<size_t>(8, std::min<size_t>(Lp, AF2_CHUNK / C / Lp / 8 * 8));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)Lp * C * 6, spare = f > t / 16 ? f - t / 16 : 0;       // a, its gating rows, the product
+    width = (int)std::max<size_t>(width, std::min<size_t>(Lp, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+  }
+  B16* a = scratch<B16>("trib.abf", (size_t)width * Lp * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * Lp * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * Lp * C);
+  const size_t smem = triIn256Smem<B16>(128, 8);
+  WITH_PAIR_T(
+    static bool attr = false;
+    if (!attr) { smemAttr((triIn256K<128, 4, B16, 1, true, PT, 2>), (int)smem); attr = true; }
+    auto in = [&](RectMap rm, size_t rows, B16* ao, B16* bo, half* t2o) {
+      triIn256K<128, 4, B16, 1, true, PT, 2><<<(unsigned)((rows + 127) / 128), 128, smem, STREAM>>>(
+        pair, mask, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, ao, bo, t2o, L, Lp, plane,
+        tw.bias, rm);
+    };
+    in(RectMap{}, plane, nullptr, b, nullptr);
+    for (int k0 = 0; k0 < L; k0 += width) {
+      int w = std::min(width, Lp - k0);
+      RectMap rm = outgoing ? RectMap{k0, Lp, 0, (size_t)w * Lp} : RectMap{0, w, k0, (size_t)Lp * w};
+      in(rm, rm.size, a, nullptr, t2);
+      if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, Lp, w, Lp, 1.f, b, Lp, plane, a, Lp, rm.size, prod, Lp, rm.size, C);
+      else bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, w, Lp, Lp, 1.f, a, w, rm.size, b, Lp, plane, prod, w, rm.size, C);
+      triangleOutRun<128, 4, B16>(prod, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk),
+                                  PH(T + "/output_projection/weights", blk), t2, pair, L, Lp, P(T + "/output_projection/bias", blk), rm);
+    }
+  );
+  releaseScratch({ "trib." });
+}
 // the triangle's whole-form buffers (both precisions'): what a pass already holds counts toward its room
 #define TRI_FAST_HELD { "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf" }
 inline void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk,
@@ -678,7 +731,11 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     if (!roomFor(5 * plane * C * 2, TRI_FAST_HELD)) {
       releaseScratch({ "ftri." });
       needF32Pair("af2 blocked triangle");
-      triangleBlocked2(pair, pairMask, L, C, T, blk, outgoing);
+      static const bool fusedBlocks = !getenv("LOCALFOLD_TRIB_FUSED") || atoi(getenv("LOCALFOLD_TRIB_FUSED"));
+      if (fusedBlocks && FUSED_TRIANGLE && C == 128 && !getenv("AF2_TRI_F32") && af2Wide128() && L >= 80 &&
+          fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8)))
+        triangleBlockedFused2(pair, pairMask, L, C, T, blk, outgoing);
+      else triangleBlocked2(pair, pairMask, L, C, T, blk, outgoing);
       return;
     }
   }
@@ -690,14 +747,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   // kernel at two row tiles a warp (biased), a bf16 contraction, and the output kernel streaming its weight 16 columns
   // a stage with the bias in its epilogue - where the narrow output kernel holds the whole weight at one block an SM.
   // LOCALFOLD_TRI128=narrow|wide forces either (as cuda/af3's pairtrack.cuh)
-  static const bool wide128 = [] {
-    if (const char* e = getenv("LOCALFOLD_TRI128")) return std::string(e) == "wide";
-    int dev, perSm = 0, major = 0; CK(cudaGetDevice(&dev));
-    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-    CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
-    return perSm >= 160 * 1024 && major >= 8;
-  }();
-  if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && wide128 && L >= 80 && fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8))) {
+  if (FAST && FUSED_TRIANGLE && C == 128 && triBf16 && af2Wide128() && L >= 80 && fitsSmem(triIn256Smem<__nv_bfloat16>(128, 8))) {
     int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
     TriFused w = triFusedWeights(T, blk, C);
     half* wt = scratch<half>("ftri.wt", triInTileHalves(C));
