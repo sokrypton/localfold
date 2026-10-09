@@ -1379,7 +1379,11 @@ The flash kernel itself is now two thirds of a pass (163 of 247 s at 6,916 token
 block, key tiles of 32-80 and a bias-sharing order are all level or behind at 6,000 tokens - in Nsight Compute it is
 latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a pass is ~12 minutes by n^3.
 
-### 🔴 10,127 tokens on Colab's RTX PRO 6000: 7.4 minutes (2026-10-09)
+### 🔴 10,127 tokens on Colab's RTX PRO 6000: 7.4 minutes, 6.9 with FP8 (2026-10-09)
+
+(With the triangle's contraction in FP8 - docs/EF2FAST.md, "FP8 for the triangle's contraction" - the same fold's
+trunk pass is 362 s and the whole fold 414 s.)
+
 
 **Measured**, not by the rule: 41 chains of 1TIM, 10,127 tokens, on a G4 session's RTX PRO 6000 Blackwell Server
 Edition (sm_120, 96 GB, CUDA 13.0 building this branch at 7d5682c in 106 s) - one pass and 100 steps:

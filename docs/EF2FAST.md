@@ -4033,6 +4033,12 @@ and -8.5% (its contraction is a smaller share beside the grid attention). Accura
 operands rounded through e4m3 into the bf16 GEMM) and then measured there: ESMFold2 within 0.02 A on 1BRS / 5CAJ /
 1TIM (0.903 / 2.091 / 1.535 against 0.906 / 2.104 / 1.517), AlphaFold 3 0.009-0.022 A between the forms on 5CAJ with
 its alignment, 1BRS templated and 1TIM with alignments, 5CAJ self-templated 0.171 A both ways on the 6000.
+**And on the big-input (blocked) path too** (`triangleBlockedTN`, `triangleBlockedTNEf2`): b and each block's a e4m3,
+the incoming triangle's block a block of z^T's rows (RectMap::T on a rectangle). In bf16 (`LOCALFOLD_TRI_TN=1`) it is
+byte-identical to the old blocks on the A100 (5CAJ and 988 tokens, both ports). On the 6000 forced big: AlphaFold 3's
+2,964-token trunk 13.03 -> 12.04 s, 5CAJ self-templated 0.171 -> 0.170 A; ESMFold2 988 tokens 2,108 -> 2,002 ms of
+GPU. **AlphaFold 3 at 10,127 tokens with FP8: trunk pass 389 -> 362 s, the whole fold (one pass, 100 steps) 443 ->
+414 s.**
 🔴 **NOT THE WEIGHTS**: the same rounding of the transition's second weight (one e4m3 scale for the tensor) put
 1BRS / 5CAJ / 1TIM at 12.8 / 14.7 / 22.6 A - the operands' errors average out over a contraction of ~1,000 terms, a
 weight's repeat in every row. The transition's hidden rows alone were harmless (within 0.02 A), but its GEMM's FP8

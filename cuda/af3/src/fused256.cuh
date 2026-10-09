@@ -169,7 +169,7 @@ size_t transitionUpChunkRows(size_t smem, size_t budgetRows) {
 // RectMap: the kernels' rows as a RECTANGLE of the padded pair space (triangleBlocked's blocks) - rows [i0, i0 + size / J),
 // columns [j0, j0 + J), q = (i - i0) J + (j - j0) a row's own index, and every operand and output plane `size` long; J 0:
 // the whole padded plane, as before
-// T (the input kernel, the whole plane only): its rows read the pair TRANSPOSED - row (u, v) takes pair (v, u) - so the
+// T (the input kernel): its rows read the pair TRANSPOSED - row (u, v) takes pair (v, u) - so the
 // incoming triangle's operands come out with the contraction's index contiguous, as the outgoing one's do (an FP8 GEMM
 // takes only that layout); its t2 rows still land at their own pair's place, where the output kernel reads them
 struct RectMap { int i0 = 0, J = 0, j0 = 0; size_t size = 0; bool T = false; };
@@ -435,7 +435,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   // (a t2 row's place: its own pair's padded row - transposed under rm.T)
   auto t2Row = [&](size_t q) -> size_t {
     if (!rm.T) return q;
-    unsigned u = (unsigned)q, iq = u / Jr; return (size_t)(u - iq * Jr) * Jr + iq;
+    unsigned u = (unsigned)q, iq = u / Jr; return (size_t)(u - iq * Jr) * (pp / Jr) + iq;
   };
   extern __shared__ __align__(16) unsigned char smem[];
   half* Xs = XROUNDS == 1 ? (half*)smem : (half*)(smem + 2 * STAGE + (size_t)2 * CH * LDT * sizeof(TA));

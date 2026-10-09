@@ -85,16 +85,15 @@ inline bool fp8Tensor() {
 // T): p[c][i][j] = sum_k a[c][i][k] b[c][j][k], the contracted index contiguous in both - the only layout an FP8 GEMM
 // takes. fp8: a and b e4m3 (unscaled: the operands sit well inside its range - folds within 0.03 A of bf16's, emulated),
 // through cuBLASLt into a bf16 product; else bf16 (bf16Gemms)
-inline void triContractTN(int np, size_t cs, int C, float alpha, const void* a, const void* b, __nv_bfloat16* p, bool fp8) {
-  if (!fp8) {
-    bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, alpha, (const __nv_bfloat16*)b, np, cs, (const __nv_bfloat16*)a, np, cs, p, np, cs, C);
-    return;
-  }
+// C (m x n, bf16, column-major, ld ldc) = A^T B, A k x m (ld lda) and B k x n (ld ldb) e4m3 - the one layout (TN) an
+// FP8 GEMM takes, batched over `batch` at the given strides; f32 accumulation. A plan a shape, cached
+inline void fp8GemmTN(int m, int n, int k, float alpha, const void* A, int lda, long long sA, const void* B, int ldb,
+                      long long sB, __nv_bfloat16* Cm, int ldc, long long sC, int batch) {
   struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la, lb, lc; cublasLtMatmulAlgo_t algo; size_t ws; };
   static cublasLtHandle_t lt = nullptr;
-  static std::map<std::tuple<int, size_t, int>, Plan> plans;
+  static std::map<std::tuple<int, int, int, int, long long, int, long long, int, long long, int>, Plan> plans;
   if (!lt) CB(cublasLtCreate(&lt));
-  auto key = std::make_tuple(np, cs, C);
+  auto key = std::make_tuple(m, n, k, lda, sA, ldb, sB, ldc, sC, batch);
   auto it = plans.find(key);
   if (it == plans.end()) {
     Plan pl{};
@@ -102,14 +101,14 @@ inline void triContractTN(int np, size_t cs, int C, float alpha, const void* a, 
     cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
     CB(cublasLtMatmulDescSetAttribute(pl.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
     CB(cublasLtMatmulDescSetAttribute(pl.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
-    int batch = C; long long stride = (long long)cs;
-    auto layout = [&](cudaDataType t) {
-      cublasLtMatrixLayout_t l; CB(cublasLtMatrixLayoutCreate(&l, t, np, np, np));
+    auto layout = [&](cudaDataType t, int rows, int cols, int ld, long long stride) {
+      cublasLtMatrixLayout_t l; CB(cublasLtMatrixLayoutCreate(&l, t, rows, cols, ld));
       CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch)));
       CB(cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof(stride)));
       return l;
     };
-    pl.la = layout(CUDA_R_8F_E4M3); pl.lb = layout(CUDA_R_8F_E4M3); pl.lc = layout(CUDA_R_16BF);
+    pl.la = layout(CUDA_R_8F_E4M3, k, m, lda, sA); pl.lb = layout(CUDA_R_8F_E4M3, k, n, ldb, sB);
+    pl.lc = layout(CUDA_R_16BF, m, n, ldc, sC);
     cublasLtMatmulPreference_t pref; CB(cublasLtMatmulPreferenceCreate(&pref));
     cublasLtMatmulHeuristicResult_t res[4]; int got = 0;
     for (size_t ws : { (size_t)0, (size_t)32 << 20 }) {      // (no workspace where one suffices: a CUDA graph captures it as it is)
@@ -119,13 +118,20 @@ inline void triContractTN(int np, size_t cs, int C, float alpha, const void* a, 
       }
     }
     CB(cublasLtMatmulPreferenceDestroy(pref));
-    if (!got) { fprintf(stderr, "no cuBLASLt FP8 algorithm for the contraction at np %d\n", np); exit(1); }
+    if (!got) { fprintf(stderr, "no cuBLASLt FP8 algorithm for %d x %d x %d\n", m, n, k); exit(1); }
     it = plans.emplace(key, pl).first;
   }
   const Plan& pl = it->second;
   const float zero = 0.f;
   void* ws = pl.ws ? scratch<unsigned char>("tri.fp8ws", pl.ws) : nullptr;
-  CB(cublasLtMatmul(lt, pl.op, &alpha, b, pl.la, a, pl.lb, &zero, p, pl.lc, p, pl.lc, &pl.algo, ws, pl.ws, STREAM));
+  CB(cublasLtMatmul(lt, pl.op, &alpha, A, pl.la, B, pl.lb, &zero, Cm, pl.lc, Cm, pl.lc, &pl.algo, ws, pl.ws, STREAM));
+}
+inline void triContractTN(int np, size_t cs, int C, float alpha, const void* a, const void* b, __nv_bfloat16* p, bool fp8) {
+  if (!fp8) {
+    bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, alpha, (const __nv_bfloat16*)b, np, cs, (const __nv_bfloat16*)a, np, cs, p, np, cs, C);
+    return;
+  }
+  fp8GemmTN(np, np, np, alpha, b, np, (long long)cs, a, np, (long long)cs, p, np, (long long)cs, C);
 }
 inline void triContractBf16(bool outgoing, int np, size_t cs, int C, float alpha, const __nv_bfloat16* a,
                             const __nv_bfloat16* b, __nv_bfloat16* p, bool planAll = false) {

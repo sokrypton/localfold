@@ -280,7 +280,46 @@ inline void triangleBlockedEf2(float* pair, const float* mask, int L, int C, con
 // kernel over the rectangle - where triangleBlockedHalf ran an LN, a GEMM and a transposing gate a chunk and five passes
 // on the way out. 2,470 tokens forced big: the fold's GPU time 43.3 -> 24.3 s (the whole form 20.3); 5CAJ forced big
 // 0.023 A from the whole form (the old blocks 0.025)
+// ...in FP8 where the card has FP8 tensor instructions, both directions in the outgoing GEMM's layout (as cuda/af3's
+// triangleBlockedTN: the incoming operands read transposed, the plane and blocks padded to 16); LOCALFOLD_TRI_TN=1 the
+// same layouts in bf16
+template <class TQ>
+inline void triangleBlockedTNEf2(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+  using B16 = __nv_bfloat16;
+  constexpr bool F8 = sizeof(TQ) == 1;
+  const int Lp = (L + 15) / 16 * 16; const size_t plane = (size_t)Lp * Lp;
+  TQ* b = scratch<TQ>("trib.bq", plane * C);
+  int width = (int)std::max<size_t>(16, std::min<size_t>(Lp, ((size_t)64 << 20) / C / Lp / 16 * 16));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)Lp * C * (sizeof(TQ) + 4), spare = f > t / 16 ? f - t / 16 : 0;
+    width = (int)std::max<size_t>(width, std::min<size_t>(Lp, std::min<size_t>(spare / perRow, 1024) / 16 * 16));
+  }
+  TQ* a = scratch<TQ>("trib.aq", (size_t)width * Lp * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * Lp * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * Lp * C);
+  auto gemm = [&](int m, int nn, const TQ* A, int lda, long long sA, const TQ* B, long long sB, int ldc, long long sC) {
+    if constexpr (F8) fp8GemmTN(m, nn, Lp, 1.f, A, lda, sA, B, Lp, sB, prod, ldc, sC, C);
+    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, nn, Lp, 1.f, A, lda, sA, B, Lp, sB, prod, ldc, sC, C);
+  };
+  RectMap whole; whole.T = !outgoing;
+  triIn256<TQ>(pair, mask, Tn, nullptr, b, nullptr, L, Lp, plane, whole);
+  for (int k0 = 0; k0 < L; k0 += width) {
+    int w = std::min(width, Lp - k0);
+    const size_t rs = (size_t)w * Lp;
+    RectMap rin{k0, Lp, 0, rs}; rin.T = !outgoing;
+    triIn256<TQ>(pair, mask, Tn, a, nullptr, t2, L, Lp, plane, rin);
+    if (outgoing) gemm(Lp, w, b, Lp, (long long)plane, a, (long long)rs, Lp, (long long)rs);
+    else gemm(w, Lp, a, Lp, (long long)rs, b, (long long)plane, w, (long long)rs);
+    triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp,
+                   outgoing ? rin : RectMap{0, w, k0, rs});
+  }
+  releaseScratch({ "trib." });
+}
 inline void triangleBlockedFusedEf2(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+  static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
+  if (fp8Tensor()) { triangleBlockedTNEf2<__nv_fp8_e4m3>(pair, mask, L, C, Tn, outgoing); return; }
+  if (tnBf16) { triangleBlockedTNEf2<__nv_bfloat16>(pair, mask, L, C, Tn, outgoing); return; }
   using B16 = __nv_bfloat16;
   const int Lp = (L + 7) / 8 * 8; const size_t plane = (size_t)Lp * Lp;
   B16* b = scratch<B16>("trib.bbf", plane * C);

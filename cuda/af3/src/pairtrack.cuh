@@ -463,8 +463,78 @@ inline bool blockedFused(int n, int C) {
          (C == 128 || C == 256 || (FUSED_WIDER && (C == 384 || C == 512))) && fitsSmem(wideTriFitsSmem(C)) &&
          !(C == 128 && skipFused("triangle"));
 }
+// ...and FP8 where the card has FP8 tensor instructions (fp8Tensor): b and each block's a e4m3, both directions in the
+// outgoing GEMM's layout (TN) - the incoming one's operands read transposed (RectMap::T: b' whole, a' a block of
+// z^T's rows, which are z's columns), its t2 rows landing at their own pair's place in the block - on a plane and blocks
+// padded to 16 (an FP8 GEMM's leading dimensions). LOCALFOLD_TRI_TN=1 runs the same layouts in bf16 (bf16Gemms)
+template <class TQ>
+inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
+                              bool divideByLength) {
+  using B16 = __nv_bfloat16;
+  constexpr bool F8 = sizeof(TQ) == 1;
+  const int np = (n + 15) / 16 * 16; const size_t cs = (size_t)np * np;
+  const float alpha = divideByLength ? 1.f / n : 1.f;
+  std::string pg = projectionGate(pre, C);
+  half* wt = scratch<half>("trib.wt", triInTileHalves(C));
+  tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
+  TQ* b = scratch<TQ>("trib.bq", cs * C);
+  int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)np * C * (sizeof(TQ) + 4), spare = f > t / 16 ? f - t / 16 : 0;   // a, the product, t2
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 16 * 16));
+  }
+  TQ* a = scratch<TQ>("trib.aq", (size_t)width * np * C);
+  B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
+  half* t2 = scratch<half>("trib.t2", (size_t)width * np * C);
+  const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
+  auto gemm = [&](int m, int nn, const TQ* A, int lda, long long sA, const TQ* B, long long sB, int ldc, long long sC) {
+    if constexpr (F8) fp8GemmTN(m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
+    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
+  };
+  wideWidth(C, [&](auto cw) {
+    constexpr int CC = decltype(cw)::value, WO = 4;
+    wideWarps(C, [&](auto warps) {
+      constexpr int WI = decltype(warps)::value;
+      WITH_PAIR_T(
+        static bool attr = false;
+        constexpr auto kern = triIn256For<CC, WI, TQ, PT>();
+        if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+        auto in = [&](RectMap rm, size_t rows, TQ* ao, TQ* bo, half* t2o) {
+          kern<<<(unsigned)((rows + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+            pair, mask, lnS, lnO, wt, ao, bo, t2o, n, np, cs, nullptr, rm);
+        };
+        RectMap whole; whole.T = !outgoing;
+        in(whole, cs, nullptr, b, nullptr);
+        for (int k0 = 0; k0 < n; k0 += width) {
+          int w = std::min(width, np - k0);
+          const size_t rs = (size_t)w * np;
+          if (outgoing) {
+            // p[i][j] (i in the block) = sum_k a[i][k] b[j][k]
+            RectMap rm{k0, np, 0, rs};
+            in(rm, rs, a, nullptr, t2);
+            gemm(np, w, b, np, (long long)cs, a, (long long)rs, np, (long long)rs);
+            triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                        Wh(pre + ".outputProjection"), t2, into(pair), n, np, nullptr, rm);
+          } else {
+            // p[i][j] (j in the block) = sum_k a[k][j] b[k][i] = sum_k a'[j][k] b'[i][k], a' z^T's rows j (z's columns)
+            RectMap rin{k0, np, 0, rs}; rin.T = true;
+            in(rin, rs, a, nullptr, t2);
+            gemm(w, np, a, np, (long long)rs, b, (long long)cs, w, (long long)rs);
+            triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                        Wh(pre + ".outputProjection"), t2, into(pair), n, np, nullptr, RectMap{0, w, k0, rs});
+          }
+        }
+      );
+    });
+  });
+  releaseScratch({ "trib." });
+}
 inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
                                  bool divideByLength, int np) {
+  static const bool tnBf16 = getenv("LOCALFOLD_TRI_TN") && atoi(getenv("LOCALFOLD_TRI_TN"));
+  if (C <= 256 && fp8Tensor()) { triangleBlockedTN<__nv_fp8_e4m3>(pair, mask, n, C, pre, outgoing, divideByLength); return; }
+  if (C <= 256 && tnBf16) { triangleBlockedTN<__nv_bfloat16>(pair, mask, n, C, pre, outgoing, divideByLength); return; }
   using B16 = __nv_bfloat16;
   const size_t cs = (size_t)np * np;
   const float alpha = divideByLength ? 1.f / n : 1.f;
