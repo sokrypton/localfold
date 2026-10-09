@@ -618,6 +618,57 @@ __global__ void flatToBiasSuperK(const float* __restrict__ flat, SuperBias out, 
     out.p[b][((size_t)h * n + i0 + ii) * stride + j] = __float2half(tileS[jj * LD + c] * LOG2E);
   }
 }
+// the projection and the layout in one kernel (CZ input channels, O = ps * heads outputs): 64 consecutive pairs of row
+// i0 + ii a block, their f16 LayerNorm'd rows and the weight staged, a warp's 16 pairs x O outputs on the tensor cores,
+// then each block's [h][i][stride] written 64 columns at a time - the f32 flat chunk never written or read (the
+// projection and flatToBiasSuperK moved 42.7 GB a super block at 6,916 tokens, this 18.3)
+template <int CZ, int O>
+__global__ void __launch_bounds__(128) pairBiasSuperK(const half* __restrict__ pn, const half* __restrict__ Wt, SuperBias out,
+                                                      int heads, int n, int stride, int i0) {
+  constexpr int LDA = CZ + 8, LDW = O + 8, LDO = 64 + 8, KS = CZ / 16, NT = O / 8;
+  static_assert(CZ % 16 == 0 && O % 16 == 0, "whole MMA tiles");
+  extern __shared__ __align__(16) unsigned char smem[];
+  half* As = (half*)smem; half* Ws = As + 64 * LDA; half* Os = (half*)smem;          // Os takes As once it is fragments
+  const int ii = blockIdx.y, j0 = blockIdx.x * 64, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  for (int t = threadIdx.x; t < 64 * (CZ / 8); t += 128) {
+    int r = t / (CZ / 8), c = (t % (CZ / 8)) * 8, j = j0 + r;
+    cpAsync16(As + r * LDA + c, pn + ((size_t)ii * n + (j < n ? j : 0)) * CZ + c, j < n);
+  }
+  for (int t = threadIdx.x; t < CZ * (O / 8); t += 128) {
+    int k = t / (O / 8), c = (t % (O / 8)) * 8;
+    cpAsync16(Ws + k * LDW + c, Wt + (size_t)k * O + c, true);
+  }
+  cpCommit(); cpWait<0>(); __syncthreads();
+  float acc[NT][4] = {};
+#pragma unroll
+  for (int ks = 0; ks < KS; ++ks) {
+    uint32_t xa[4];
+    ldsm4(xa, As + (warp * 16 + (lane & 15)) * LDA + ks * 16 + (lane >> 4) * 8);
+#pragma unroll
+    for (int n2 = 0; n2 < O / 16; ++n2) {
+      uint32_t fb[4];
+      ldsm4t(fb, Ws + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDW + n2 * 16 + (lane >> 4) * 8);
+      mma16816(acc[2 * n2], xa, fb[0], fb[1]);
+      mma16816(acc[2 * n2 + 1], xa, fb[2], fb[3]);
+    }
+  }
+  __syncthreads();                                   // every warp's fragments are taken: As becomes the output stage
+  const int r0 = warp * 16 + g, r1 = r0 + 8;
+  const bool l0 = j0 + r0 < n, l1 = j0 + r1 < n;
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    int o = nt * 8 + tig * 2;
+    Os[o * LDO + r0] = __float2half(l0 ? acc[nt][0] * LOG2E : 0.f); Os[(o + 1) * LDO + r0] = __float2half(l0 ? acc[nt][1] * LOG2E : 0.f);
+    Os[o * LDO + r1] = __float2half(l1 ? acc[nt][2] * LOG2E : 0.f); Os[(o + 1) * LDO + r1] = __float2half(l1 ? acc[nt][3] * LOG2E : 0.f);
+  }
+  __syncthreads();
+  for (int t = threadIdx.x; t < O * 8; t += 128) {
+    int o = t / 8, c = (t % 8) * 8, j = j0 + c;
+    int b = o / heads, h = o % heads;
+    if (j >= stride || !out.p[b]) continue;
+    *reinterpret_cast<uint4*>(out.p[b] + ((size_t)h * n + i0 + ii) * stride + j) = *reinterpret_cast<const uint4*>(Os + o * LDO + c);
+  }
+}
 // layerNormSlowK into f16, no offset: the two-pass variance, the module's convention
 __global__ void layerNormSlowHalfK(const float* in, half* out, size_t rows, int C, const float* scale) {
   size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -799,14 +850,19 @@ inline void refreshSuperBlockBias(int sb, int n) {
   TransformerCache& tc = TCACHE;
   int ps = tc.perSuper, heads = tc.heads, Cz = tc.Cz;
   int ri = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * std::max(Cz, ps * heads))));
-  float* flatc = scratch<float>("dt.flat", (size_t)ri * n * ps * heads);
   std::string w = "diffusion.transformer.superBlocks." + std::to_string(sb) + ".pairLogitsProjection";
+  SuperBias sp{};
+  if (ps > 8) { fprintf(stderr, "a super block of %d blocks (8 at most)\n", ps); exit(1); }
+  for (int b = sb * ps; b < (sb + 1) * ps; ++b) sp.p[b % ps] = b < tc.nblocks ? tc.biasHalf[b] : nullptr;
+  if (Cz == 128 && ps * heads == 64 && tc.stride % 8 == 0) {   // (AF3's: 128 channels, 4 blocks of 16 heads)
+    constexpr int smem = (64 * (128 + 8) + 128 * (64 + 8)) * 2;
+    pairBiasSuperK<128, 64><<<dim3((unsigned)((tc.stride + 63) / 64), (unsigned)n), 128, smem, STREAM>>>(tc.pn16, Wh(w), sp, heads, n, tc.stride, 0);
+    return;
+  }
+  float* flatc = scratch<float>("dt.flat", (size_t)ri * n * ps * heads);
   for (int i0 = 0; i0 < n; i0 += ri) {
     int r = std::min(ri, n - i0); size_t rows = (size_t)r * n;
     linear<half, float>(tc.pn16 + (size_t)i0 * n * Cz, flatc, rows, Cz, ps * heads, w);
-    SuperBias sp{};
-    if (ps > 8) { fprintf(stderr, "a super block of %d blocks (8 at most)\n", ps); exit(1); }
-    for (int b = sb * ps; b < (sb + 1) * ps; ++b) sp.p[b % ps] = b < tc.nblocks ? tc.biasHalf[b] : nullptr;
     // (a last super block short of ps blocks: its missing blocks' heads are computed and not stored)
     const int smem = 32 * (ps * heads + 1) * 4;
     static int granted = 0;
