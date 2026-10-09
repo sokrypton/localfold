@@ -275,6 +275,9 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
   }
   __syncthreads();
   // A fragments of m16n8k16: a0 (row g, k 2tig..+1), a1 (row g+8, ...), a2 (row g, k+8), a3 (row g+8, k+8)
+  // (the gate computed here instead of read - sigmoid(LN(pair row) Wg) on a second set of A fragments, the input kernel
+  // writing no t2 - was measured on the A100: the input kernel -1% (256 channels) / -17% (128), this one +31% / +41%,
+  // the folds +4.7% / +1.4%; not taken)
   // (the centre norm's scale folded into Wout's rows and its offset into an output bias, the tile then read by
   // ldmatrix.trans - four 8x8 matrices an instruction for these 2-byte loads and the scale/offset reads - was measured:
   // -1% of this kernel at 988 tokens in AF3, +3.7% in ESMFold2's 256-channel one; not taken)
