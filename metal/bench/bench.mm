@@ -59,8 +59,33 @@ static int attnBench(int argc, char** argv) {
   return 0;
 }
 
+// `ln <rows> <C>`: a LayerNorm, float32 in and float16 out, against the widest kernel (LOCALFOLD_LN_WIDE): GB/s moved
+static int lnBench(int argc, char** argv) {
+  size_t rows = strtoull(argv[2], nullptr, 10); int C = atoi(argv[3]);
+  std::vector<float> x(rows * C), sc(C, 1.f), of(C, 0.f);
+  for (size_t i = 0; i < x.size(); ++i) x[i] = (float)((i * 2654435761u) % 1000) / 1000.f - 0.5f;
+  float* dx = uploadNew(x.data(), x.size()); float* ds = uploadNew(sc.data(), C); float* dof = uploadNew(of.data(), C);
+  half* dy = allocT<half>(rows * C);
+  double bytes = rows * C * 6.0;
+  std::vector<double> t[2];
+  for (int round = 0; round < 7; ++round)
+    for (int arm = 0; arm < 2; ++arm) {
+      if (arm) setenv("LOCALFOLD_LN_WIDE", "1", 1); else unsetenv("LOCALFOLD_LN_WIDE");
+      double t0 = now();
+      for (int r = 0; r < 10; ++r) layerNorm(dx, dy, rows, C, ds, dof, 1e-5f, 0, 0);
+      sync();
+      if (round) t[arm].push_back((now() - t0) / 10);
+    }
+  for (int arm = 0; arm < 2; ++arm) {
+    std::sort(t[arm].begin(), t[arm].end());
+    printf("  %-8s %8.3f ms  %6.1f GB/s\n", arm ? "widest" : "fitted", t[arm][3] * 1e3, bytes / t[arm][3] / 1e9);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && !strcmp(argv[1], "attn")) { setSource("bench", PORT_SOURCE); return attnBench(argc, argv); }
+  if (argc > 1 && !strcmp(argv[1], "ln")) { setSource("bench", PORT_SOURCE); return lnBench(argc, argv); }
   if (argc < 4) { fprintf(stderr, "usage: localfold-bench <out> <rows> <in> [arms] [hhh|hhf|fhf] [reps]\n"); return 1; }
   setSource("bench", PORT_SOURCE);
   int out = atoi(argv[1]); size_t rows = strtoull(argv[2], nullptr, 10); int in = atoi(argv[3]);

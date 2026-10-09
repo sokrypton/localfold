@@ -98,7 +98,14 @@ What won, natively:
 - **The diffusion transformer's 96 conditioning projections folded into two GEMMs** (the per-block LayerNorm scales
   folded into the weights, the biases as GEMM biases).
 
+- **LayerNorm's row array sized to the row** (`lf_layernorm4_<V>`, `lf_center_norm_<NK>`): one sized for the widest row
+  took a 128-channel row's occupancy - 42.6 against 83.5 GB/s on 68121 x 128 (`localfold-bench ln`), the trunk 6-7% at
+  261 tokens. `LOCALFOLD_LN_WIDE=1` is the control.
+
 What was tried and **lost**, so nobody repeats it blind:
+
+- **A 72-row GEMM tile** (simdgroups 1 x 4) so 68 tokens pad to 72, not 80: 0.181 against 0.189 ms on 3072 x 768, level
+  on the conditioning, worse on 768 columns (no 16-column tile) - about 2% of a step, not worth a second layout.
 
 - **Split K for the skinny GEMMs** (partial products a K slice, then one reduction applying the epilogue): 0.395
   against 0.334 ms on 3072 x 68 x 768, and the trunk slower. These GEMMs are not short of threadgroups.

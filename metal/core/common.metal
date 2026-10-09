@@ -146,14 +146,15 @@ kernel void lf_layernorm(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[thr
     else a.y[row * a.ldy + c] = n;
   }
 }
-// C a multiple of 4 up to 1536: the row held in registers, read once, four channels a load
+// C a multiple of 4 up to 1536: the row held in registers, read once, four channels a load - MAXV of them a lane, the
+// fewest that hold the row (an array sized for the widest row cost a 128-channel one its occupancy)
+template <int MAXV>
 kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                           uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]]) {
   ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   const int C4 = a.C / 4;
-  constexpr int MAXV = 12;
   float4 r[MAXV];
   float s = 0;
   const bool aligned = (a.ldx & 3) == 0;
@@ -186,6 +187,9 @@ kernel void lf_layernorm4(constant LayerNormArgs& a [[buffer(0)]], uint3 tg [[th
   }
 }
 
+#define LF_LN4(V) template [[host_name("lf_layernorm4_" #V)]] kernel void lf_layernorm4<V>(constant LayerNormArgs&, uint3, uint3, uint, uint);
+LF_LN4(1) LF_LN4(2) LF_LN4(4) LF_LN4(8) LF_LN4(12)
+
 // ---------------------------------------------------------------- conversions and elementwise (four a thread)
 kernel void lf_to_half(LF_ARGS(ConvArgs)) {
   ulong i = LF_INDEX * 4;
@@ -212,32 +216,34 @@ kernel void lf_add_bias(LF_ARGS(BiasArgs)) {
 // the triangle's centre LayerNorm: the channel-major product [C][Lp * Lp] to pair rows [pairs][C] in half. A lane a pair,
 // eight simdgroups splitting the channels, every value in registers, the two-pass statistics through a 1 KB tile, the
 // rows written coalesced through a half tile (C a multiple of 8, at most 256)
+// (NK: the channels a lane holds, C / 8 - at C 128 the registers and the tile sized for 256 took the core's occupancy)
+template <int NK>
 kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                             uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
   threadgroup float part[256];
-  threadgroup half T[32 * (256 + 8)];
+  threadgroup half T[32 * (8 * NK + 8)];
   const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 8;
   const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * 32;
   const uint rr = (uint)(r0 + lane), ii = lf_udiv(rr, a.L);
   const ulong q = (ulong)ii * a.Lp + (rr - ii * a.L), plane = (ulong)a.Lp * a.Lp;
   const bool live = r0 + lane < a.pairs;
-  float v[32];
+  float v[NK];
   float s = 0.f;
-  for (uint k = 0; k < 32; ++k) if (k < nk) { v[k] = live ? a.prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
+  for (uint k = 0; k < NK; ++k) if (k < nk) { v[k] = live ? a.prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
   part[grp * 32 + lane] = s;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float S = 0.f;
   for (int g = 0; g < 8; ++g) S += part[g * 32 + lane];
   const float mean = S / C;
   float d2 = 0.f;
-  for (uint k = 0; k < 32; ++k) if (k < nk) { float d = v[k] - mean; d2 += d * d; }
+  for (uint k = 0; k < NK; ++k) if (k < nk) { float d = v[k] - mean; d2 += d * d; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   part[grp * 32 + lane] = d2;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float V = 0.f;
   for (int g = 0; g < 8; ++g) V += part[g * 32 + lane];
   const float inv = rsqrt(V / C + 1e-5f);
-  for (uint k = 0; k < 32; ++k) if (k < nk) {
+  for (uint k = 0; k < NK; ++k) if (k < nk) {
     uint c = grp + 8 * k;
     T[lane * ld + c] = (half)((v[k] - mean) * inv * a.scale[c] + a.offset[c]);
   }
@@ -248,6 +254,8 @@ kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[
     for (uint c = lane; c < C; c += 32) a.out[r * C + c] = T[row * ld + c];
   }
 }
+template [[host_name("lf_center_norm_16")]] kernel void lf_center_norm<16>(constant CenterNormArgs&, uint3, uint3, uint);
+template [[host_name("lf_center_norm_32")]] kernel void lf_center_norm<32>(constant CenterNormArgs&, uint3, uint3, uint);
 // ...for any width (OpenDDE's 384, IntelliFold-2's 512): the channels streamed twice for the statistics and once for
 // the output, written in place of the transpose through threadgroup memory
 kernel void lf_center_norm_wide(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],

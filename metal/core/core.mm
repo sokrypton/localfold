@@ -628,7 +628,11 @@ static void layerNormRun(const float* x, const half* xh, float* y, half* yh, siz
   // a simdgroup a row, eight a threadgroup
   size_t groups = (rows + 7) / 8;
   Grid g = groups <= 65535 ? Grid{(uint32_t)groups, 1, 1} : Grid{65535, (uint32_t)((groups + 65534) / 65535), 1};
-  dispatch(C % 4 == 0 && C <= 1024 ? "lf_layernorm4" : "lf_layernorm", &a, sizeof a, g, 256, 0, "layernorm");
+  int v = (C / 4 + 31) / 32;
+  const bool wide = getenv("LOCALFOLD_LN_WIDE") != nullptr;     // (the control: every row in the widest kernel)
+  const char* k = C % 4 || C > 1536 ? "lf_layernorm" : wide || v > 8 ? "lf_layernorm4_12" : v > 4 ? "lf_layernorm4_8"
+                : v > 2 ? "lf_layernorm4_4" : v > 1 ? "lf_layernorm4_2" : "lf_layernorm4_1";
+  dispatch(k, &a, sizeof a, g, 256, 0, "layernorm");
 }
 void layerNorm(const float* x, float* y, size_t rows, int C, const float* s, const float* o, float eps, int ldx, int ldy) {
   layerNormRun(x, nullptr, y, nullptr, rows, C, s, o, eps, ldx, ldy);
@@ -641,7 +645,7 @@ void layerNorm(const half* x, half* y, size_t rows, int C, const float* s, const
 }
 void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset) {
   size_t P = (size_t)L * L;
-  run(C % 8 || C > 256 ? "lf_center_norm_wide" : "lf_center_norm", grid1d((P + 31) / 32, 1), 256, CenterNormArgs{prod, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset});
+  run(C % 8 || C > 256 ? "lf_center_norm_wide" : C > 128 || getenv("LOCALFOLD_LN_WIDE") ? "lf_center_norm_32" : "lf_center_norm_16", grid1d((P + 31) / 32, 1), 256, CenterNormArgs{prod, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset});
 }
 void toHalf(const float* x, half* y, size_t n) { run1d("lf_to_half", (n + 3) / 4, ConvArgs{x, y, n}); }
 void toFloat(const half* x, float* y, size_t n) { run1d("lf_to_float", (n + 3) / 4, ConvBackArgs{x, y, n}); }
