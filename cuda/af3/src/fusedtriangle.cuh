@@ -931,7 +931,16 @@ void gridOutAt(const half* gathered, const half* Wout, const float* ob, float* p
     gridOutK<C, WD, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wout, pair, n, q0, rows, tr, ob));
 }
 inline void gridOutRaw(const half* gathered, const half* Wout, const float* ob, float* pair, int n, size_t q0, size_t rows, bool tr) {
-  switch (warpsFitting(warpsFor(rows, {GO_WARPS, 4, 2}), {GO_WARPS, 4, 2}, gridOutSmem)) {
+  // 4 warps where an SM holds three of their blocks (an A100's 164 KB): the 8-warp block's 166 registers a thread and
+  // 70 KB held one block an SM, the kernel latency-bound at 41% of the memory's bandwidth - 212 -> 149 ms of a 988-token
+  // fold, byte-identical. A part with ~100 KB an SM holds one block of either and keeps the eight
+  static const bool four = [] {
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    return (size_t)perSm >= 3 * (gridOutSmem(4) + 1024);
+  }();
+  switch (four && fitsSmem(gridOutSmem(4)) && (rows + 63) / 64 >= (size_t)MIN_BLOCKS ? 4
+          : warpsFitting(warpsFor(rows, {GO_WARPS, 4, 2}), {GO_WARPS, 4, 2}, gridOutSmem)) {
     case 2: gridOutAt<2>(gathered, Wout, ob, pair, n, q0, rows, tr); break;
     case 4: gridOutAt<4>(gathered, Wout, ob, pair, n, q0, rows, tr); break;
     default: gridOutAt<GO_WARPS>(gathered, Wout, ob, pair, n, q0, rows, tr);

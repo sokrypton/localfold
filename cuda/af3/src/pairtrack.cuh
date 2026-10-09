@@ -1010,9 +1010,10 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias);
         half* gathered = scratch<half>("grid.gathered", pairs * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
-        // (a bf16 pair: cuBLAS takes no f16-in, bf16-out GEMM, so the projection goes to f16 and one pass adds it)
-        if (!tr && PAIR16) rowOut16(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection");
-        else if (!tr) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
+        // (a bf16 pair takes the output kernel in both directions, adding its f32 accumulators into the pair: the
+        // GEMM into f16 and an add pass - cuBLAS takes no f16-in, bf16-out GEMM - were 0.8% more of a 988-token trunk,
+        // and an f16 rounding more; 5CAJ with its alignment 0.009 A, 1BRS templated 0.008 A from that form)
+        if (!tr && !PAIR16) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, 0, pairs, tr);
         return;
       }
@@ -1048,8 +1049,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
         half* gathered = scratch<half>("grid.gathered", std::min(R, (size_t)n) * n * Wd);
         flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
-        if (!tr && PAIR16) rowOut16(gathered, pairRow(into(pair), r0 * n, C), prs, Wd, C, pre + ".outputProjection");
-        else if (!tr) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
+        if (!tr && !PAIR16) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr);
       }
       releaseScratch({ "grid.qkvg", "grid.gathered" });   // (the next triangle's blocks size themselves by what is free)
