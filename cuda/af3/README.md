@@ -1379,6 +1379,31 @@ The flash kernel itself is now two thirds of a pass (163 of 247 s at 6,916 token
 block, key tiles of 32-80 and a bias-sharing order are all level or behind at 6,000 tokens - in Nsight Compute it is
 latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a pass is ~12 minutes by n^3.
 
+### 🔴 10,127 tokens on Colab's RTX PRO 6000: 7.4 minutes (2026-10-09)
+
+**Measured**, not by the rule: 41 chains of 1TIM, 10,127 tokens, on a G4 session's RTX PRO 6000 Blackwell Server
+Edition (sm_120, 96 GB, CUDA 13.0 building this branch at 7d5682c in 106 s) - one pass and 100 steps:
+
+| | 10,127 tokens, RTX PRO 6000 | 7,657 tokens, this A100 |
+|---|---:|---:|
+| trunk pass | 388.8 s | 325.9 s |
+| diffusion, 100 steps | 20.3 s | 21.2 s |
+| confidence | 30.3 s | 25.8 s |
+| whole fold | **442.8 s** | 376.1 s |
+| device peak | **83.7 GB** (sampled) | - |
+
+The stages' own peaks: 61.8 GB with the template stack's f32 activation (26.3 GB) beside the pair, 78.9 GB in the
+diffusion (its f16 LayerNorm'd pair 26.3 GB and the biases), 33.6 GB in the confidence head. CA-CA median 3.661 A,
+pLDDT 33.3 - the same picture as 7,657 tokens on the A100 (3.682, 32.8) for a single-sequence complex.
+
+**The card is ~1.6x an A100 on this code**: the grid attention's flash kernel runs at **234 TFLOP/s** there against
+117 here (--bench-grid at 4,000 tokens; 209 at 1,000), and its every arm keeps its A100 ranking (2 warps, 48-key
+tiles, two rows a block); a 988-token fold's trunk is 3.06 s against 4.99, a 2,964-token pass 12.1 s against 21.0.
+6MRR folds to 1.227 / 0.610 / 0.620 A at seeds 1-3 (the A100: 1.233 / 0.609). Its SM has ~100 KB of shared memory,
+so two choices tuned at 164 KB were measured there: the 128-channel triangle's streaming kernels win on it too
+(trunk -3.8% at 988 tokens, now taken from 96 KB an SM), and the 4-warp grid output kernel LOSES (252 -> 320 ms at 988
+tokens: one block an SM either way), so it keeps 8 warps there as its rule says.
+
 ### 🔴 Past the card: refused up front (folding there is on a branch)
 
 A fold that would not fit the card is refused **before anything is allocated**, with the longest this card

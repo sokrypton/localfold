@@ -673,7 +673,7 @@ inline bool af2Wide128() {
     int dev, perSm = 0, major = 0; CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
     CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
-    return perSm >= 160 * 1024 && major >= 8;
+    return perSm >= 96 * 1024 && major >= 8;     // (an RTX PRO 6000's ~100 KB too: cuda/af3's pairtrack.cuh)
   }();
   return wide128;
 }

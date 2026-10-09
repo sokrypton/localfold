@@ -621,13 +621,15 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     // kernel at two row tiles a warp, and the output kernel streaming its weight 16 columns a stage (four blocks an SM)
     // where triOutPK holds the whole 128 x 128 weight (one block an SM, 255 registers, the tensor pipe at 10%). The
     // triangle's kernels 339 -> 313 ms at 494 tokens, the trunk -1.6% there and -1% at 261; 5CAJ with its alignment
-    // 1.970 -> 1.967 A, self-templated 0.206 -> 0.207, boltz2/rf3/openbind0 within rounding. A part with less shared
-    // memory an SM (an L4: 100 KB) keeps the narrow kernels, unmeasured. LOCALFOLD_TRI128=narrow|wide forces either
+    // 1.970 -> 1.967 A, self-templated 0.206 -> 0.207, boltz2/rf3/openbind0 within rounding. ...and on a part with
+    // ~100 KB an SM too, measured on Colab's RTX PRO 6000 (sm_120): the triangle's two kernels 742 -> 615 ms of a
+    // 988-token fold, the trunk 3185 -> 3063 ms, and -1% of a 2,964-token pass. A T4 (64 KB) keeps the narrow ones; an
+    // L4 (100 KB) takes the streaming ones, unmeasured. LOCALFOLD_TRI128=narrow|wide forces either
     static const bool wide128 = [] {
       if (const char* e = getenv("LOCALFOLD_TRI128")) return std::string(e) == "wide";
       int dev, perSm = 0; CK(cudaGetDevice(&dev));
       CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-      return perSm >= 160 * 1024 && bf16Tensor();
+      return perSm >= 96 * 1024 && bf16Tensor();
     }();
     bool narrowFused = C == 128 && !wide128 && (TRI_BF16 ? triFusedFits<__nv_bfloat16>() : triFusedFits<float>());
     // (384 and 512 channels - OpenDDE, IntelliFold-2 - too: their unfused triangle was the LN, a [C, 4C] GEMM, the gate,
