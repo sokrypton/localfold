@@ -113,13 +113,16 @@ was WebGPU's split pair transition and grid attention on the matrix units - f16 
 cannot reach - and with `LOCALFOLD_STOCK_FLAGS=1` (no matrix units) the whole trunk agrees to 8.4e-7. The bisection
 also found WebGPU's vector split ignoring `--f16=off` (fixed).
 
-🔴 **OPEN: TWICE, THE FIRST RUN AFTER A REBUILD FOLDED WRONG, AND IT HAS NOT REPRODUCED.** ESMFold2's RNA hairpin read
-pLDDT 51.59 against 60.07, and 1QYS 13.5 A at pLDDT 89.8 against 0.865 / 83.8 - a confident fold of something else -
-each once, each the case right after `build.sh`, each correct on every later run. Not reproduced by a cold specs cache,
-nor by defeating the system's shader cache (`newLibraryWithSource` salted) four times over. Ruled out by reading: the
-background compile of cached specialisations (pipelines published after the join), buffers allocated into an open
-encoder (declared to it), the event emulation (a record commits the open command buffer), temporary input
-directories (`mkdtemp`). A gate run right after a rebuild that moves is worth running once more before believing.
+🔴 **OPEN: ESMFold2 FOLDS 1QYS WRONG A FEW TIMES IN A HUNDRED, UNDER LOAD.** 13.543 A (the same wrong structure every
+time) or NaN, against 0.865 bit-identical on every other run; seen right after a rebuild (twice, once the RNA hairpin)
+and with two folds running at once (`/tmp/stress.sh`-style: two processes, 1-2 bad in ~60). Ruled out, each by an
+experiment rather than a reading: a read past a buffer's end (64 KB of NaN slack after every allocation - identical),
+uninitialised threadgroup memory (every core's filled with NaN before every dispatch - identical), Metal's shader
+validation (clean), a failed command buffer (now reported, none was), the warm-up's derived weights (the upload
+slowed 0-300 ms a piece - identical), and by audit: no early return before a barrier and no barrier in a
+thread-indexed loop in any translated kernel. Fixed on the way, whether or not it was the cause: idle, sync and event
+waits now cover every earlier command buffer (they trusted the last one to imply the rest). Four processes at once
+on 16 GB do not fail - they never finish (blocked in the GPU driver's submit: the working set oversubscribed).
 
 🔴 **`MTLCreateSystemDefaultDevice()` RETURNS nil TO A COMMAND-LINE PROCESS**, saying so only on stderr - sometimes.
 `MTLCopyAllDevices()` does not. Under the sandbox there is no device at all.
