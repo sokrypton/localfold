@@ -732,10 +732,16 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   if (vec) a.biasType |= 256;
   if (getenv("LF_GEMM_DEBUG")) fprintf(stderr, "gemm %dx%dx%d ta %d tb %d tile %dx%d vec %d batch %d\n", a.m, a.n, a.k, a.ta, a.tb, tr, tc, (int)vec, batch);
   auto mtype = [](cudaDataType t) { return t == CUDA_R_32F ? "float" : t == CUDA_R_16F ? "half" : "lf_bf16s"; };
+  // the k step: 16 for a whole 64 x 64 tile, 32 otherwise. Measured interleaved (AB=1 metal/check/bench-gemm) on an M2:
+  // 16 is 0.73-0.85x the time on the triangle's tall K-128 projections (512 x 68121 x 128), 0.83-0.89x on the pair
+  // track's 2048 x 4624 x 256 and 256 x 4624 x 1024, 0.84x on a 4096-cube - half the threadgroup memory, more tiles
+  // resident to hide the loads - and 1.09x on a 64 x 32 tile, 1.08-1.21x on the 16-column ones
+  int bk = tr == 64 && tc == 64 ? 16 : 32;
+  if (const char* k = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(k) == 16 ? 16 : 32;       // (an arm: 16 or 32 everywhere)
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
-                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false");
+                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(bk);
   std::string name = std::string("lf_gemm_") + typeTag(ta_) + "_" + typeTag(tb_) + "_" + typeTag(tc_) + "_" +
-                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N");
+                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + (bk == 32 ? "" : "_k" + std::to_string(bk));
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
   MTLSize grid = MTLSizeMake((a.m + bm - 1) / bm, (a.n + bn - 1) / bn, batch);
   char label[96]; snprintf(label, sizeof label, "gemm %s %dx%dx%d%s", name.c_str() + 8, a.m, a.n, a.k, batch > 1 ? " batched" : "");

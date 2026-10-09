@@ -52,6 +52,11 @@ AF3 6MRR (68 tokens, 200 steps) folds in 6.4 s warm against WebGPU's 12.0 (cold 
 later, 1.19 - same binary. A ratio taken across that gap is a ratio of clocks. Interleave arms, and re-measure the
 control before believing a win.
 
+What **won**: the GEMM's k step at 16 for a whole 64 x 64 tile, where it was 32 - half the threadgroup memory, so more
+tiles resident to hide their loads. Interleaved on an M2: 0.73-0.85x the time on the triangle's tall K-128
+projections, 0.83-0.89x on the pair track's GEMMs, 0.84x on a 4096-cube in f16, and in f32 (AF2's) 0.62-0.95x. Bit
+for bit the same answer: the k order of the accumulation does not change. `LOCALFOLD_GEMM_BK=16|32` is the arm.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/check/bench-gemm`, the runtime's GEMM
 alone - `metal/check/build-bench-gemm.sh` builds it):
 
@@ -107,6 +112,14 @@ were read 4 bytes late: ESMFold2's pTM printed 1.0 on every fold and garbage on 
 was WebGPU's split pair transition and grid attention on the matrix units - f16 by construction, which `--f16=off`
 cannot reach - and with `LOCALFOLD_STOCK_FLAGS=1` (no matrix units) the whole trunk agrees to 8.4e-7. The bisection
 also found WebGPU's vector split ignoring `--f16=off` (fixed).
+
+🔴 **OPEN: TWICE, THE FIRST RUN AFTER A REBUILD FOLDED WRONG, AND IT HAS NOT REPRODUCED.** ESMFold2's RNA hairpin read
+pLDDT 51.59 against 60.07, and 1QYS 13.5 A at pLDDT 89.8 against 0.865 / 83.8 - a confident fold of something else -
+each once, each the case right after `build.sh`, each correct on every later run. Not reproduced by a cold specs cache,
+nor by defeating the system's shader cache (`newLibraryWithSource` salted) four times over. Ruled out by reading: the
+background compile of cached specialisations (pipelines published after the join), buffers allocated into an open
+encoder (declared to it), the event emulation (a record commits the open command buffer), temporary input
+directories (`mkdtemp`). A gate run right after a rebuild that moves is worth running once more before believing.
 
 🔴 **`MTLCreateSystemDefaultDevice()` RETURNS nil TO A COMMAND-LINE PROCESS**, saying so only on stderr - sometimes.
 `MTLCopyAllDevices()` does not. Under the sandbox there is no device at all.

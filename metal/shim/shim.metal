@@ -94,12 +94,12 @@ template <> inline void lf_stage8<float, float>(threadgroup float* dst, device c
 // is then row-major activations times row-major weights, both staged along their contiguous axis and loaded as
 // 8 x 8 matrices WITHOUT the transposing load (a transposed operand stages the other way and takes it). A tile is
 // TR rows of X (n) by TC columns of W (m); each lane's two output elements are adjacent in C.
-template <typename TA, typename TB, typename TC, int TR, int TC_, bool TRA, bool TRB>
+template <typename TA, typename TB, typename TC, int TR, int TC_, bool TRA, bool TRB, int BK = 32>
 kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
   typedef typename lf_mma<TA, TB>::type T;
-  constexpr int BK = 32, PAD = 8;
+  constexpr int PAD = 8;
   const uint z = grp.z;
   device const TA* A; device const TB* B; device TC* D; device const TC* C;
   if (g.ptrs) {

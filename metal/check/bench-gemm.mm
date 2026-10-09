@@ -19,19 +19,26 @@ int main(int argc, char** argv) { @autoreleasepool {
   std::mt19937 rng(1);
   for (auto c : cases) {
     size_t na = (size_t)c.m * c.k, nb = (size_t)c.k * c.n, nc = (size_t)c.m * c.n;
+    // F32=1: every operand float (AF2's GEMMs), else half
+    const bool f32 = getenv("F32") != nullptr; const size_t es = f32 ? 4 : 2;
+    const cudaDataType ty = f32 ? CUDA_R_32F : CUDA_R_16F;
     std::vector<__half> A(na), B(nb);
     for (auto& x : A) x = __half(std::uniform_real_distribution<float>(-1, 1)(rng));
     for (auto& x : B) x = __half(std::uniform_real_distribution<float>(-1, 1)(rng));
-    __half *dA, *dB, *dC;
-    cudaMalloc(&dA, na * 2); cudaMalloc(&dB, nb * 2); cudaMalloc(&dC, nc * 2);
-    cudaMemcpy(dA, A.data(), na * 2, cudaMemcpyHostToDevice); cudaMemcpy(dB, B.data(), nb * 2, cudaMemcpyHostToDevice);
+    std::vector<float> Af(A.begin(), A.end()), Bf(B.begin(), B.end());
+    void *dA, *dB, *dC;
+    cudaMalloc(&dA, na * es); cudaMalloc(&dB, nb * es); cudaMalloc(&dC, nc * es);
+    cudaMemcpy(dA, f32 ? (void*)Af.data() : (void*)A.data(), na * es, cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, f32 ? (void*)Bf.data() : (void*)B.data(), nb * es, cudaMemcpyHostToDevice);
     cublasHandle_t h; cublasCreate(&h);
     float one = 1, zero = 0;
     int lda = c.ta ? c.k : c.m, ldb = c.tb ? c.n : c.k;
-    auto run = [&] { cublasGemmEx(h, c.ta ? CUBLAS_OP_T : CUBLAS_OP_N, c.tb ? CUBLAS_OP_T : CUBLAS_OP_N, c.m, c.n, c.k, &one, dA, CUDA_R_16F, lda,
-                                  dB, CUDA_R_16F, ldb, &zero, dC, CUDA_R_16F, c.m, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP); };
+    auto run = [&] { cublasGemmEx(h, c.ta ? CUBLAS_OP_T : CUBLAS_OP_N, c.tb ? CUBLAS_OP_T : CUBLAS_OP_N, c.m, c.n, c.k, &one, dA, ty, lda,
+                                  dB, ty, ldb, &zero, dC, ty, c.m, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP); };
     run(); cudaDeviceSynchronize();
-    std::vector<__half> C(nc); cudaMemcpy(C.data(), dC, nc * 2, cudaMemcpyDeviceToHost);
+    std::vector<__half> C(nc); std::vector<float> Cf(nc);
+    if (f32) { cudaMemcpy(Cf.data(), dC, nc * 4, cudaMemcpyDeviceToHost); for (size_t i = 0; i < nc; ++i) C[i] = __half(Cf[i]); }
+    else cudaMemcpy(C.data(), dC, nc * 2, cudaMemcpyDeviceToHost);
     double err = 0, nrm = 0;
     for (int s = 0; s < 64; ++s) {
       int i = (int)(rng() % c.m), j = (int)(rng() % c.n); double want = 0;
@@ -44,11 +51,16 @@ int main(int argc, char** argv) { @autoreleasepool {
     reps = std::min(reps, 400);
     for (int r = 0; r < 100; ++r) run();
     cudaDeviceSynchronize();
-    // AB=1: arm 0 against arm 1 - LF_GEMM_ARM set to 0 and 1 around blocks of calls, interleaved in one process (wire
-    // the variant under test to read it in lfcuda.mm's gemm). Two runs of anything here can differ 2x in clocks; two
-    // arms interleaved like this agree to ~1%.
+    // AB=1: arm 0 against arm 1 - LF_GEMM_ARM set to 0 and 1 around blocks of calls, interleaved in one process, each
+    // arm warmed first (wire the variant under test to read it in lfcuda.mm's gemm). Two runs of anything here can
+    // differ 2x in clocks; two arms interleaved like this agree to a few percent.
     if (getenv("AB")) {
       double t[2] = {0, 0};
+      for (int arm = 0; arm < 2; ++arm) {     // (each arm's kernel compiled and its clocks up before any timing)
+        setenv("LF_GEMM_ARM", arm ? "1" : "0", 1);
+        for (int r = 0; r < 20; ++r) run();
+        cudaDeviceSynchronize();
+      }
       for (int round = 0; round < 8; ++round)
         for (int arm = 0; arm < 2; ++arm) {
           setenv("LF_GEMM_ARM", arm ? "1" : "0", 1);
