@@ -179,6 +179,14 @@ specialisations list at start-up, so the warm fold was a second fold run first -
 (**2.0 s without**, the same stage times and digits), ~0.1-0.2 s of AF2's. 5CAJ through ESMFold2 loads in 0.49 s where
 it was 5.34. `LOCALFOLD_WARM=1` is the control.
 
+**The GEMM's epilogue stores whole 8 x 8 matrices** (`simdgroup_store`) for an interior tile, where it stored a lane's
+two elements at a time with bounds checks. A plain product (no bias, alpha 1, beta 0, the accumulator the output's
+type) stores its accumulators themselves: **0.65x the time on 512 x 68121 x 128, 0.82x on 1024 x 68121 x 256, 0.58x on
+an f32 512 x 4624 x 128**, interleaved - the scalar stores were a third of a K-128 projection. The other epilogues
+(bias, residual, the gated add) load C and aux as matrices and do their arithmetic in place, which measured level with
+the scalar path: their loads, not their stores, are what costs. AF3 at 255 tokens 31.1 -> 28.6 s; AF2's biased GEMMs
+gain nothing. `LOCALFOLD_GEMM_SCALAR_STORE=1` is the control.
+
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):
 

@@ -225,6 +225,60 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
     }
     return;
   }
+  // A whole interior tile is written as 8 x 8 matrices: C and a gated residual's aux loaded the same way, the epilogue's
+  // arithmetic on each lane's two elements (the same for every matrix of the shape), the result stored whole. The scalar
+  // stores below, an element at a time with bounds checks, were a third of a K-128 projection's time (0.66x without
+  // them on 512 x 68121 x 128). Not SwiGLU (its output is half as wide) nor a bf16 output; EP bit 16 turns it off
+  // (LOCALFOLD_GEMM_SCALAR_STORE=1, the control).
+  if constexpr ((EP & 16) == 0 && (metal::is_same_v<TC, half> || metal::is_same_v<TC, float>)) {
+    if (!(g.epilogue & 128) && j0 + TR <= g.n && i0 + TC_ <= g.m) {
+      if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) {   // (the accumulator is the output's type)
+        if (g.epilogue == 0 && g.alpha == 1.f && g.beta == 0.f) {      // a plain product: the accumulators themselves
+          _Pragma("clang loop unroll(full)")
+          for (int a = 0; a < FR; ++a)
+            _Pragma("clang loop unroll(full)")
+            for (int b = 0; b < FC; ++b)
+              simdgroup_store(acc[a][b], D + (ulong)(j0 + sr + a * 8) * g.ldd + i0 + sc + b * 8, (ulong)g.ldd);
+          return;
+        }
+      }
+      const int sn2 = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
+      _Pragma("clang loop unroll(full)")
+      for (int a = 0; a < FR; ++a)
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; ++b) {
+          const ulong j = (ulong)(j0 + sr + a * 8), i = (ulong)(i0 + sc + b * 8);
+          thread auto& e = acc[a][b].thread_elements();
+          simdgroup_matrix<TC, 8, 8> om, cm;
+          simdgroup_matrix<half, 8, 8> xm;
+          const bool gated = g.epilogue & 64;
+          if (gated || g.beta != 0.f) simdgroup_load(cm, C + j * g.ldc + i, (ulong)g.ldc);
+          if (gated) simdgroup_load(xm, (device const half*)g.aux + j * g.ldaux + i, (ulong)g.ldaux);
+          thread auto& o = om.thread_elements();
+          thread auto& c = cm.thread_elements();
+          thread auto& x = xm.thread_elements();
+          _Pragma("clang loop unroll(full)")
+          for (int t = 0; t < 2; ++t) {
+            const int col = (int)i + sn2 + t;
+            float v = g.alpha * (float)e[t];
+            if (gated) {
+              if (g.epilogue & 4) v += ((device const float*)g.bias)[col];
+              v = (float)c[t] + (float)x[t] * (1.f / (1.f + exp(-v)));
+            } else {
+              if (g.beta != 0.f) v += g.beta * (float)c[t];
+              if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[col] : ((device const float*)g.bias)[col];
+              if (g.epilogue & 2) v = max(v, 0.f);
+              if (g.epilogue & 32) v = 0.5f * v * (1.f + precise::tanh(0.7978845608f * (v + 0.044715f * v * v * v)));
+            }
+            if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) e[t] = v;   // (in place: the output's type)
+            else o[t] = (TC)v;
+          }
+          if constexpr (metal::is_same_v<TC, half> == ((EP & 8) != 0)) simdgroup_store(acc[a][b], D + j * g.ldd + i, (ulong)g.ldd);
+          else simdgroup_store(om, D + j * g.ldd + i, (ulong)g.ldd);
+        }
+      return;
+    }
+  }
   // a lane's elements: X row (j) sm, W columns (i) sn and sn + 1 - adjacent in C
   const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
   _Pragma("clang loop unroll(full)")

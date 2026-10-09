@@ -832,10 +832,12 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // (not a float output, even at k <= 128: 0.94x on the residual's GEMMs, and IntelliFold-2 and ESMFold2 overflowed
   // one of them to inf and crashed downstream)
   const bool hacc = !floatAcc && ta_ == CUDA_R_16F && tb_ == CUDA_R_16F && tc_ == CUDA_R_16F;
+  static const bool scalarStore = getenv("LOCALFOLD_GEMM_SCALAR_STORE") != nullptr;
+  const bool sstore = scalarStore || (getenv("LF_GEMM_ARM") && atoi(getenv("LF_GEMM_ARM")) == 1);   // (an A/B arm)
   std::string targs = std::string(mtype(ta_)) + ", " + mtype(tb_) + ", " + mtype(tc_) + ", " + std::to_string(tr) + ", " +
-                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(bk) + ", " + std::to_string((a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0));
+                      std::to_string(tc) + ", " + (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(bk) + ", " + std::to_string((a.epilogue & 256 ? 1 : 0) | (hacc ? 8 : 0) | (sstore ? 16 : 0));
   std::string name = std::string("lf_gemm_") + typeTag(ta_) + "_" + typeTag(tb_) + "_" + typeTag(tc_) + "_" +
-                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + (bk == 32 ? "" : "_k" + std::to_string(bk)) + (a.epilogue & 256 ? "_trigate" : "") + (hacc ? "_h" : "");
+                     std::to_string(tr) + "x" + std::to_string(tc) + "_" + (a.ta ? "T" : "N") + (a.tb ? "T" : "N") + (bk == 32 ? "" : "_k" + std::to_string(bk)) + (a.epilogue & 256 ? "_trigate" : "") + (hacc ? "_h" : "") + (sstore ? "_ss" : "");
   if (getenv("LF_GEMM_DEBUG")) fprintf(stderr, "  -> %s\n", name.c_str());
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
   MTLSize grid = MTLSizeMake((a.m + bm - 1) / bm, (a.n + bn - 1) / bn, batch);

@@ -34,9 +34,9 @@
   "rmsd": null
  },
  "af3-glycan": {
-  "ligand": 0.024,
-  "plddt": 45.63,
-  "ptm": "0.4445",
+  "ligand": 0.023,
+  "plddt": 44.61,
+  "ptm": "0.4201",
   "rmsd": null
  },
  "af3-kitchen-sink": {
