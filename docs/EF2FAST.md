@@ -3996,6 +3996,28 @@ since b7118c9 a standalone fold skips its warm-up when the input is already writ
 structure), so its stage times carry every kernel's first launch - 6MRR's 198 ms against 46 warm; the A100 table
 above was taken before that commit, warm. The full model was not run there: its bundle is a local export.
 
+### ESMFold2-Fast (the released one, ESM-C 6B) on Colab's RTX PRO 6000 (2026-10-09)
+
+Its bundles exported on the VM from the same sources as this box's (biohub/ESMFold2-Fast at `c6c7958d63`, its
+safetensors' SHA-256 equal to ours; af3-any-model's `lm/esmc.bin.zst`, unpacked by its own loader's steps) -
+`--model=fast-released`, both sides warm, one sample, 3 loops (the port's bundle) and 20 (the checkpoint's config):
+
+| target | tokens | loops | upstream PyTorch | cuEquivariance | fused | **ours, warm** |
+|---|---:|---:|---:|---:|---:|---:|
+| 6MRR | 68 | 3 / 20 | 190 / 425 ms | 198 / 475 | 199 / 482 | **95 / 192** |
+| 1BRS | 195 | 3 / 20 | 512 / 1,826 | 311 / 914 | 272 / 680 | **175 / 505** |
+| 5CAJ | 261 | 3 / 20 | 934 / 3,765 | 451 / 1,507 | 362 / 1,058 | **252 / 850** |
+| 1TIM | 494 | 3 / 20 | 4,017 / 18,763 | 1,666 / 6,952 | 954 / 3,434 | **667 / 2,778** |
+| 1TIM x4 | 988 | 3 / 20 | 23,592 / 115,255 | (fails) | 3,457 / 13,883 | **2,313 / 10,818** |
+
+Against the fused backend 1.4-2.1x at 3 loops and 1.24-2.5x at 20; against cuEquivariance 1.8-2.5x; against plain
+PyTorch 2.0-10.7x. CA RMSD level (ours 1.66 / 0.56 / 1.91 / 1.05 A at 3 loops, upstream 1.67 / 0.62 / 1.82 / 1.21).
+Process memory: upstream 14.0 / 14.4 / 14.6 / 17.8 / 30.1 GB (fused), ours one-shot 8.2 / 8.8 / 9.3 / 10.0 / 15.1.
+🔴 **Here the port's lead is smallest**: at 20 loops a fold is the trunk, where upstream's Triton kernels on this
+card come within 1.25-1.4x of ours. Our trunk on it (988 tokens, 4 passes, 1,977 ms of GPU): triIn256K 28%,
+triangleOutK 22%, transitionUpK 20%, the contraction and the transition's second GEMM 31% - the three fused kernels
+run at one block an SM on its ~100 KB of shared memory (triIn256K's two-tile form needs two), unmeasured otherwise.
+
 ### 🔴 The comparison found a bug of ours, and it looked like nondeterminism
 
 The first full-model run of 1BRS at 3 loops came back at **13.2 A, pLDDT 28.6** - the same command an hour later
