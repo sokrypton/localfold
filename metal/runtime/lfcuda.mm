@@ -819,7 +819,9 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // 16 is 0.73-0.85x the time on the triangle's tall K-128 projections (512 x 68121 x 128), 0.83-0.89x on the pair
   // track's 2048 x 4624 x 256 and 256 x 4624 x 1024, 0.84x on a 4096-cube - half the threadgroup memory, more tiles
   // resident to hide the loads - and 1.09x on a 64 x 32 tile, 1.08-1.21x on the 16-column ones
-  int bk = tc == 64 && tr >= 48 ? 16 : 32;
+  // ...and 16 for a 32-column tile of 80 rows or more (a short n in one tile row: AF3's diffusion at 68 tokens), 0.88x on
+  // 3072 x 80 x 768 and 0.91x on 73728 x 68 x 392 - where its 80 x 16 tiles stay at 32 (1.0-1.2x the other way)
+  int bk = (tc == 64 && tr >= 48) || (tc == 32 && tr >= 80) ? 16 : 32;
   if (const char* k = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(k) == 16 ? 16 : 32;       // (an arm: 16 or 32 everywhere)
   // an all-half GEMM accumulates in half: 0.85x the time on the trunk's K-128 projections (512, 128 and 1024 x 68121 x
   // 128, interleaved on an M2) for a relRMS of 1.7e-3 against 2.4e-4 - bfloat16's rounding, the precision AF3 runs at.

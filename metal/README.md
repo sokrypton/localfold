@@ -55,7 +55,9 @@ control before believing a win.
 What **won**: the GEMM's k step at 16 for a whole 64 x 64 tile, where it was 32 - half the threadgroup memory, so more
 tiles resident to hide their loads. Interleaved on an M2: 0.73-0.85x the time on the triangle's tall K-128
 projections, 0.83-0.89x on the pair track's GEMMs, 0.84x on a 4096-cube in f16, and in f32 (AF2's) 0.62-0.95x. Bit
-for bit the same answer: the k order of the accumulation does not change. `LOCALFOLD_GEMM_BK=16|32` is the arm.
+for bit the same answer: the k order of the accumulation does not change. `LOCALFOLD_GEMM_BK=16|32` is the arm. The
+same for a 32-column tile of 80 rows or more (a short n in one tile row - AF3's diffusion at 68 tokens): 0.88x on
+3072 x 80 x 768, 0.91x on 73728 x 68 x 392, the 68-token diffusion 4979 -> 4725 ms; its 80 x 16 tiles stay at 32.
 
 And: **the triangle's gated residual in the gate GEMM's epilogue** (`lf::gemmGatedAdd`, applied by
 `metal/af3/pairtrack.cuh.patch`): `gatedAddK`'s pass and the gate tensor gone, 19.99 -> 19.74 s of GPU at
