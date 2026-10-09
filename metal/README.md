@@ -40,6 +40,19 @@ metal/
 A port's Metal source is `core/args.h + <port>/kernels.h + core/common.metal + <port>/*.metal`, embedded in the
 binary by `build.sh`; the GEMM's is `args.h + gemm.metal`, compiled per (types, tile, epilogue) instance on demand.
 
+## The website on this machine: `localfold serve`
+
+`localfold serve` (python/localfold/serve.py, in the wheel) serves the website's own page on 127.0.0.1 and sends
+every fold to these ports instead of the browser's WebGPU - python/localfold/server.py and worker.py, the same
+broker and worker Colab's runtime runs, driving metal/ here and cuda/ on NVIDIA. From a checkout:
+`python3 python/localfold/server.py --native --open`. The page says where it folds ("Local server · Apple M2 ·
+Metal"); a token in the link it opens is on every request.
+
+`python3 tools/check-native-worker.py --offline --no-af3` (`npm run test:native`) holds it here: every case of the
+CUDA backend's gate - 21 folds over every family but AlphaFold 3 itself (whose weights need DeepMind's terms), the
+refusals, and a real page folding three families through the server - passes on the M2, one bar at Metal's own
+number (protenix2 6MRR, 1.6 A). A warm fold on the page: AF2 6MRR 2.0 s click to result, ESMFold2 7.2, protenix2 4.9.
+
 ## Is it right? The gates
 
 The CUDA gates' cases, scored against crystals, with this Mac's baseline in `metal/<port>/gate-baseline.json`

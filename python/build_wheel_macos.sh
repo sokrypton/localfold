@@ -47,7 +47,7 @@ for f in "$bin"/localfold-*; do   # (the binaries; metal-specs/ is data)
   echo "$(basename "$f"): macOS $minos, $(du -m "$f" | cut -f1) MB"
 done
 # the website `localfold serve` serves: tools/build_site.py's dist/, the page as Pages publishes it
-python3 "$repo/tools/build_site.py" > /dev/null
+python3 "$repo/tools/build_site.py" --skip-local-bundles > /dev/null
 rm -rf "$here/localfold/site"; cp -R "$repo/dist" "$here/localfold/site"
 echo "site: $(find "$here/localfold/site" -type f | wc -l | tr -d ' ') files, $(du -sm "$here/localfold/site" | cut -f1) MB"
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
