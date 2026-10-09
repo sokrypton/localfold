@@ -3,6 +3,15 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 #define UNROLL _Pragma("clang loop unroll(full)")
+// a 32-bit division by a runtime divisor without the integer divider Apple's GPUs lack (the prelude's lf_udiv: a float
+// reciprocal and one correction, exact below 2^24)
+inline uint lf_udiv(uint a, uint d) {
+  if (a >= (1u << 24)) return a / d;
+  uint q = (uint)((float)a * (1.f / (float)d));
+  if (q * d > a) --q;
+  else if ((q + 1) * d <= a) ++q;
+  return q;
+}
 
 // ---------------------------------------------------------------- copies and fills (cudaMemcpyAsync, cudaMemsetAsync)
 struct CopyArgs { device uchar* dst; device const uchar* src; ulong bytes; };
@@ -191,34 +200,48 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
         for (int b = 0; b < FC; ++b) simdgroup_multiply_accumulate(acc[a][b], xm[a], wm[b], acc[a][b]);
     }
   }
-  if ((EP & 7) == 1) {   // the triangle's gate: lane (bit 0 clear) holds (pa, pb), its neighbour (ga, gb) of the same channel
+  if ((EP & 7) == 1) {   // the triangle's gate: columns in blocks of 8 - 8 channels' pa, then their ga, pb and gb - so a
+    // simdgroup's four 8 x 8 accumulators hold one channel's four values at the same lane and element: every lane gates
+    // its own (no shuffle, no idle half), and a and b go to Sab channel-major as whole matrices, stored transposed
     threadgroup_barrier(mem_flags::mem_threadgroup);    // (every simdgroup done with the tiles Sab overlays)
     const int sm1 = (lane / 16) * 4 + (lane % 8) / 2, sn1 = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
     device const float* mask = (device const float*)g.aux;
-    _Pragma("clang loop unroll(full)")
-    for (int a = 0; a < FR; ++a)
+    if constexpr (FC % 4 == 0) {
       _Pragma("clang loop unroll(full)")
-      for (int b = 0; b < FC; ++b) {
-        thread auto& e = acc[a][b].thread_elements();
-        float e0 = e[0], e1 = e[1];
-        if (g.epilogue & 4) {     // (the projection's and gate's biases, f32, by this lane's own columns: AF2's)
-          int col = i0 + sc + b * 8 + sn1;
-          e0 += ((device const float*)g.bias)[col]; e1 += ((device const float*)g.bias)[col + 1];
-        }
-        float g0 = simd_shuffle_xor(e0, 1), g1 = simd_shuffle_xor(e1, 1);
-        if ((lane & 1) == 0) {
-          int jl = sr + a * 8 + sm1, il = sc + b * 8 + sn1, jg = j0 + jl;
-          float m = jg < g.n ? mask[g.tgR0 + jg] : 0.f;
-          Sab[(il / 4) * TR + jl] = (half)(e0 * m / (1.f + exp(-g0)));
-          Sab[(TC_ / 4 + il / 4) * TR + jl] = (half)(e1 * m / (1.f + exp(-g1)));
+      for (int a = 0; a < FR; ++a) {
+        const int jg = j0 + sr + a * 8 + sm1;
+        const float m = jg < g.n ? mask[g.tgR0 + jg] : 0.f;
+        _Pragma("clang loop unroll(full)")
+        for (int b = 0; b < FC; b += 4) {
+          thread auto& pa = acc[a][b].thread_elements();
+          thread auto& ga = acc[a][b + 1].thread_elements();
+          thread auto& pb = acc[a][b + 2].thread_elements();
+          thread auto& gb = acc[a][b + 3].thread_elements();
+          simdgroup_half8x8 ma, mb;
+          thread auto& oa = ma.thread_elements();
+          thread auto& ob = mb.thread_elements();
+          _Pragma("clang loop unroll(full)")
+          for (int t = 0; t < 2; ++t) {
+            float vpa = pa[t], vga = ga[t], vpb = pb[t], vgb = gb[t];
+            if (g.epilogue & 4) {     // (the projection's and gate's biases, f32, in the same order: AF2's)
+              device const float* bias = (device const float*)g.bias + i0 + sc + b * 8 + sn1 + t;
+              vpa += bias[0]; vga += bias[8]; vpb += bias[16]; vgb += bias[24];
+            }
+            oa[t] = (half)(vpa * m / (1.f + exp(-vga)));
+            ob[t] = (half)(vpb * m / (1.f + exp(-vgb)));
+          }
+          const int cl0 = (sc + b * 8) / 4;     // (the tile's channel of this block's first: 8 a 32 columns)
+          simdgroup_store(ma, Sab + cl0 * TR + sr + a * 8, TR, ulong2(0, 0), true);
+          simdgroup_store(mb, Sab + (TC_ / 4 + cl0) * TR + sr + a * 8, TR, ulong2(0, 0), true);
         }
       }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device half* outA = (device half*)g.aux2; device half* outB = (device half*)g.aux3;
     for (int t = tid; t < (TC_ / 4) * TR; t += 128) {      // channel-major, a channel's rows consecutive
       int cl = t / TR, jl = t % TR, jg = j0 + jl, c = i0 / 4 + cl;
       if (jg >= g.n || c >= g.tgC) continue;
-      uint p = (uint)(g.tgR0 + jg), r = p / (uint)g.tgN;
+      uint p = (uint)(g.tgR0 + jg), r = lf_udiv(p, (uint)g.tgN);      // (no integer divider: prelude)
       ulong q = (ulong)r * g.tgNp + (p - r * (uint)g.tgN);
       outA[(ulong)c * g.tgPairs + q] = Sab[cl * TR + jl];
       outB[(ulong)c * g.tgPairs + q] = Sab[(TC_ / 4 + cl) * TR + jl];

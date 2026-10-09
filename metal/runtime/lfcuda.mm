@@ -808,7 +808,8 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // too few threadgroups for the device: narrower columns
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
   while (tc > 16 && groups(tc) < 64) tc /= 2;
-  if ((a.epilogue & 128) && tc < 32) tc = 32;     // (SwiGLU's blocks of 8 pair two 8-column matrices a simdgroup)
+  if ((a.epilogue & 128) && tc < 32) tc = 32;
+  if (a.epilogue & 256) tc = 64;     // (the triangle's gate: a simdgroup's four 8-column blocks are one group of channels)     // (SwiGLU's blocks of 8 pair two 8-column matrices a simdgroup)
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);   // (an arm: one tile everywhere)
   int bm = tc, bn = tr;
   auto esize = [](cudaDataType t) { return t == CUDA_R_32F ? 4 : 2; };

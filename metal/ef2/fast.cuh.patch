@@ -50,7 +50,7 @@ inline void triangleFusedIn(float* pair, const float* mask, int L, int C, const 
 __global__ void triGateEfK(const half* proj, const half* gate, half* out, int rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)rows * 4 * C) return;
-  unsigned r = (unsigned)(t / (4u * C)), col = (unsigned)(t - (size_t)r * 4u * C), c = col / 4, k = col % 4;
+  unsigned r = (unsigned)(t / (4u * C)), col = (unsigned)(t - (size_t)r * 4u * C), kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8, k = kind == 1 ? 2 : kind == 2 ? 1 : kind;   // (blocks of 8: pa ga pb gb)
   out[t] = k < 2 ? proj[(size_t)r * 2 * C + 2 * c + k] : gate[(size_t)r * 2 * C + 2 * c + k - 2];
 }
 inline const half* triGateEf(const std::string& Tn, int C) {

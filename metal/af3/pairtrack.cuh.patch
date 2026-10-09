@@ -52,7 +52,7 @@ __global__ void interleaveHalvesK(const half* w, half* out, int rows, int I) {
 __global__ void triGateColumnsK(const half* w, half* out, int rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)rows * 4 * C) return;
-  size_t r = t / (4 * C); int col = (int)(t % (4 * C)), c = col / 4, k = col % 4;
+  size_t r = t / (4 * C); int col = (int)(t % (4 * C)), kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8, k = kind == 1 ? 2 : kind == 2 ? 1 : kind;   // (blocks of 8: pa ga pb gb)
   out[t] = w[r * 4 * C + (k < 2 ? 2 * c + k : 2 * C + 2 * c + k - 2)];
 }
 inline const half* triGateColumns(const std::string& name, int C) {

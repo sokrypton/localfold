@@ -11,7 +11,7 @@ __global__ void triGateAf2K(const half* w5, const float* b5, half* w4, float* b4
   if (t >= (size_t)C * 5 * C) return;
   unsigned r = (unsigned)(t / (5u * C)), col = (unsigned)(t - (size_t)r * 5u * C);
   if (col < 4u * C) {
-    unsigned c = col / 4, k = col % 4;
+    unsigned kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8, k = kind == 1 ? 2 : kind == 2 ? 1 : kind;   // (blocks of 8: pa ga pb gb)
     w4[t - (size_t)r * C] = w5[(size_t)r * 5 * C + k * C + c];
     if (r == 0) b4[col] = b5[k * C + c];
   } else wg[(size_t)r * C + col - 4 * C] = w5[t];
