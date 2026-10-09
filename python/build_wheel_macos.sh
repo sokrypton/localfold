@@ -25,10 +25,21 @@ for port in af3 af2 ef2; do
   install -m 755 "$repo/metal/$port/localfold-$port" "$bin/localfold-$port"
   strip -x "$bin/localfold-$port"
 done
+# each port's list of the kernel specialisations its folds use, where this machine's folds have recorded one for these
+# very kernels (~/.cache/localfold/metal, named by the kernels' hash): shipped, a user's first fold compiles them all up
+# front and in parallel instead of one at a time as each is first reached (run metal/check/gate-*.py first to fill it)
+mkdir -p "$bin/metal-specs"; rm -f "$bin"/metal-specs/*.specs
+for port in af3 af2 ef2; do
+  name="$(LOCALFOLD_METAL_SPECS_NAME=1 "$bin/localfold-$port")"
+  if [ -f "$HOME/.cache/localfold/metal/$name" ]; then
+    cp "$HOME/.cache/localfold/metal/$name" "$bin/metal-specs/$name"
+    echo "$port: $(wc -l < "$bin/metal-specs/$name" | tr -d ' ') kernel specialisations shipped"
+  else echo "$port: no recorded specialisations for $name - its first fold compiles each kernel as it is reached"; fi
+done
 # localfold-fetch: the featuriser binary under the name that runs its weight and CCD fetcher
 install -m 755 "$repo/cuda/featurise/featurise" "$bin/localfold-fetch"; strip -x "$bin/localfold-fetch"
 # what the wheel's tag promises: arm64, nothing newer than macOS 13, and nothing outside the system
-for f in "$bin"/localfold-*; do
+for f in "$bin"/localfold-*; do   # (the binaries; metal-specs/ is data)
   arch="$(lipo -archs "$f")"; [ "$arch" = arm64 ] || { echo "$f is $arch, not arm64" >&2; exit 1; }
   minos="$(otool -l "$f" | awk '/LC_BUILD_VERSION/ { found = 1 } found && /minos/ { print $2; exit }')"
   [ "$(printf '%s\n13.0\n' "$minos" | sort -V | tail -1)" = 13.0 ] || { echo "$f needs macOS $minos, past 13.0" >&2; exit 1; }

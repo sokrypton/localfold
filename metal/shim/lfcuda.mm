@@ -14,6 +14,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "lfcuda.h"
+#include <mach-o/dyld.h>
+#include <sys/stat.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -275,6 +277,18 @@ struct Runtime {
     size_t h = std::hash<std::string>()(lf::PORT_SOURCE);
     char name[64]; snprintf(name, sizeof name, "/%s-%016zx.specs", lf::PORT_NAME, h);
     specsPath = dir + name;
+    // a first run: the list a wheel ships beside the binary (bin/metal-specs/<port>-<hash>.specs, the specialisations
+    // its build's folds used), so even a first fold compiles its kernels up front and in parallel
+    struct stat st;
+    if (stat(specsPath.c_str(), &st) != 0) {
+      char exe[4096]; uint32_t size = sizeof exe;
+      if (_NSGetExecutablePath(exe, &size) == 0) {
+        std::string bundled = std::string(exe);
+        bundled = bundled.substr(0, bundled.rfind('/')) + "/metal-specs" + name;
+        std::ifstream src(bundled);
+        if (src) { std::ofstream dst(specsPath); dst << src.rdbuf(); }
+      }
+    }
     std::ifstream in(specsPath);
     std::string line, inst;
     std::vector<std::string> names;
@@ -295,13 +309,18 @@ struct Runtime {
       size_t k = 0;
       while (std::getline(lines, line)) { parts[k % chunks] += line + "\n"; partNames[k % chunks].push_back(names[k]); ++k; }
     }
-    std::vector<id<MTLLibrary>> libs(chunks);
+    // ...and each chunk's pipelines made on its own thread too: a pipeline is where the GPU's own compiler runs, and on
+    // a cold system cache that was most of an AF3 first fold's ~10 s of compiling, one pipeline at a time
+    std::vector<std::vector<id<MTLComputePipelineState>>> made(chunks);
     std::vector<std::thread> threads;
     for (size_t c = 0; c < chunks; ++c)
-      threads.emplace_back([&, c] { @autoreleasepool { libs[c] = compile(std::string(lf::PORT_SOURCE) + parts[c], "the cached kernels"); } });
+      threads.emplace_back([&, c] { @autoreleasepool {
+        id<MTLLibrary> lib = compile(std::string(lf::PORT_SOURCE) + parts[c], "the cached kernels");
+        for (auto& n : partNames[c]) made[c].push_back(pipelineOf(lib, n));
+      } });
     for (auto& t : threads) t.join();
     for (size_t c = 0; c < chunks; ++c)
-      for (auto& n : partNames[c]) pipelines[n] = pipelineOf(libs[c], n);
+      for (size_t i = 0; i < partNames[c].size(); ++i) pipelines[partNames[c][i]] = made[c][i];
   }
   id<MTLComputePipelineState> pipelineOf(id<MTLLibrary> lib, const std::string& host) {
     id<MTLFunction> f = [lib newFunctionWithName:[NSString stringWithUTF8String:host.c_str()]];
@@ -342,6 +361,12 @@ struct Runtime {
   }
 };
 
+// LOCALFOLD_METAL_SPECS_NAME=1: print this binary's specialisation list's file name and exit (python/build_wheel_macos.sh)
+__attribute__((constructor)) static void printSpecsName() {
+  if (!getenv("LOCALFOLD_METAL_SPECS_NAME")) return;
+  printf("%s-%016zx.specs\n", lf::PORT_NAME, std::hash<std::string>()(lf::PORT_SOURCE));
+  exit(0);
+}
 Runtime& R() {
   static Runtime* r = [] {
     Runtime* rt = new Runtime();

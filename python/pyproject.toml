@@ -32,4 +32,4 @@ localfold-fetch = "localfold.cli:fetch"
 packages = ["localfold"]
 
 [tool.setuptools.package-data]
-localfold = ["bin/localfold-*"]
+localfold = ["bin/localfold-*", "bin/metal-specs/*.specs"]
