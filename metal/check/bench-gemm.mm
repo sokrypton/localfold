@@ -44,6 +44,24 @@ int main(int argc, char** argv) { @autoreleasepool {
     reps = std::min(reps, 400);
     for (int r = 0; r < 100; ++r) run();
     cudaDeviceSynchronize();
+    // AB=1: arm 0 against arm 1 - LF_GEMM_ARM set to 0 and 1 around blocks of calls, interleaved in one process (wire
+    // the variant under test to read it in lfcuda.mm's gemm). Two runs of anything here can differ 2x in clocks; two
+    // arms interleaved like this agree to ~1%.
+    if (getenv("AB")) {
+      double t[2] = {0, 0};
+      for (int round = 0; round < 8; ++round)
+        for (int arm = 0; arm < 2; ++arm) {
+          setenv("LF_GEMM_ARM", arm ? "1" : "0", 1);
+          auto a0 = std::chrono::steady_clock::now();
+          for (int r = 0; r < reps / 4 + 1; ++r) run();
+          cudaDeviceSynchronize();
+          t[arm] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count() / (reps / 4 + 1);
+        }
+      unsetenv("LF_GEMM_ARM");
+      printf("%6d x %6d x %5d  arm0 %8.3f ms  arm1 %8.3f ms  arm1/arm0 %.3f\n", c.m, c.n, c.k, t[0] / 8, t[1] / 8, t[1] / t[0]);
+      cudaFree(dA); cudaFree(dB); cudaFree(dC);
+      continue;
+    }
     if (getenv("GPU_TIME")) lf::profileStart();
     auto t0 = std::chrono::steady_clock::now();
     for (int r = 0; r < reps; ++r) run();

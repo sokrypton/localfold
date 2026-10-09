@@ -62,6 +62,10 @@ alone - `metal/check/build-bench-gemm.sh` builds it):
   at a long stride are uncoalesced, and every configuration lost (1.46 against 1.66 TFLOP/s at best).
 - **Register prefetch** (the next k-step's tiles read while this one multiplies): correct and slower everywhere -
   4096-cube 2.43 -> 1.48. Apple GPUs hide latency with occupancy, and the registers cost more of it than they saved.
+- **The epilogue.** Storing a lane's pair as one `half2`, or staging a half tile through threadgroup memory so a row
+  leaves in whole 16-byte pieces: 0.99-1.03x and 1.05x SLOWER, interleaved (`AB=1 metal/build/bench-gemm`). 🔴 The
+  measurement that sent me there was wrong: skipping the stores of 15 of 16 matrices read 2.5x faster, because the
+  compiler then deleted the multiplies feeding them. A K-128 GEMM is slow in its k-loop, not its stores.
 
 ## How the translation works
 
