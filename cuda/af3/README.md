@@ -1382,7 +1382,9 @@ latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a
 ### 🔴 10,127 tokens on Colab's RTX PRO 6000: 7.4 minutes, 6.9 with FP8 (2026-10-09)
 
 (With the triangle's contraction in FP8 - docs/EF2FAST.md, "FP8 for the triangle's contraction" - the same fold's
-trunk pass is 362 s and the whole fold 414 s.)
+trunk pass is 362 s and the whole fold 414 s. The grid attention in FP8 as well - flash.cuh's flash8, e4m3 MMAs with
+k and v written e4m3 by the projection - takes a 2,964-token trunk pass 11.18 -> 9.82 s and a 988-token one 750 -> 707
+ms on the same card, 5CAJ, 1BRS and 1TIM self-templated within 0.001 A of the f16 folds; 10,127 tokens not re-measured.)
 
 
 **Measured**, not by the rule: 41 chains of 1TIM, 10,127 tokens, on a G4 session's RTX PRO 6000 Blackwell Server

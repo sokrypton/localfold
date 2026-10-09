@@ -1213,6 +1213,17 @@ inline void unparkFromHost(float*& dev, size_t bytes) {
   dev = dallocT<float>(bytes / 4);
   CK(cudaMemcpyAsync(dev, PARK_HOST, bytes, cudaMemcpyHostToDevice, STREAM));
 }
+#include <cuda_fp8.h>
+// FP8 tensor instructions (Ada and Blackwell: compute capability 8.9 on; an A100 has none). LOCALFOLD_FP8=0 keeps bf16
+inline bool fp8Tensor() {
+  static const bool on = [] {
+    if (getenv("LOCALFOLD_FP8") && !atoi(getenv("LOCALFOLD_FP8"))) return false;
+    int d, ma, mi; CK(cudaGetDevice(&d));
+    CK(cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, d)); CK(cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, d));
+    return ma * 10 + mi >= 89;
+  }();
+  return on;
+}
 template <class T> T* scratch(const std::string& name, size_t n) {
   auto& [p, have] = SCRATCH[name];
   if (have < n * sizeof(T)) {

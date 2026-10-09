@@ -70,17 +70,6 @@ inline void bf16Gemms(cublasOperation_t ta, cublasOperation_t tb, int m, int nn,
   CB(cublasGemmStridedBatchedEx(H, ta, tb, m, nn, k, &alpha, A, CUDA_R_16BF, lda, sA, B, CUDA_R_16BF, ldb, sB, &zero,
     Cm, CUDA_R_16BF, ldc, sC, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
-#include <cuda_fp8.h>
-// FP8 tensor instructions (Ada and Blackwell: compute capability 8.9 on; an A100 has none). LOCALFOLD_FP8=0 keeps bf16
-inline bool fp8Tensor() {
-  static const bool on = [] {
-    if (getenv("LOCALFOLD_FP8") && !atoi(getenv("LOCALFOLD_FP8"))) return false;
-    int d, ma, mi; CK(cudaGetDevice(&d));
-    CK(cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, d)); CK(cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, d));
-    return ma * 10 + mi >= 89;
-  }();
-  return on;
-}
 // The contraction in the OUTGOING layout for either direction (the incoming one's operands written transposed, RectMap's
 // T): p[c][i][j] = sum_k a[c][i][k] b[c][j][k], the contracted index contiguous in both - the only layout an FP8 GEMM
 // takes. fp8: a and b e4m3 (unscaled: the operands sit well inside its range - folds within 0.03 A of bf16's, emulated),

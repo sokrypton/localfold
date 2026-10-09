@@ -618,10 +618,7 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
 // NB: no bias at all (AF2's MSA column attention): the scores start at zero and no bias tile is loaded
 // ONE: one stage, the next tile held in registers across the tile's compute and stored between two barriers -
 // a T4's form (no cp.async; two stages are 39 KB, one block of 4 warps an SM there, one is three)
-// (FP8 attention, emulated on the A100 - q, k and v rounded through e4m3 before the kernel and P before P V: 5CAJ with its
-// alignment 0.016 A from this kernel's fold, 1TIM's two chains 1.129 -> 1.133 A against the crystal, pLDDT within 0.04 -
-// so an e4m3 kernel on an FP8 part (m16n8k32: half the MMAs) would keep the folds; not written: it wants V transposed
-// (no 8-bit ldmatrix.trans) and P's fragments permuted with V's keys)
+// (an FP8 part runs flash8 below instead, through the pair track: e4m3 MMAs, half of these)
 // OT: the output's type - f16, or bf16 (cuda/af2's bf16 MSA, whose output projection then reads bf16)
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half>
 __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
@@ -991,6 +988,267 @@ template <int D, int WARPS, bool MASKED, int BK = FA_BK, bool REG = false, int M
     smemAttr((flashGridHalf<D, WARPS, MASKED, BK, REG, MINB, false, F16S>), (int)((REG ? 1 : 2) * faStage<D, WARPS, BK>()));
     done = true;
   }
+}
+// FP8 (e4m3) grid attention where the card has FP8 tensor instructions (fp8Tensor): the unmasked, dense 32-wide form
+// flashGrid2R takes, its Q K^T and P V in m16n8k32 e4m3 MMAs (half the f16 form's MMAs). Q is rounded to e4m3 as it is
+// loaded (scale, log2(e) and a query bias folded in first), K and V by the projection (gridInK's kv8) into K8 and V8
+// [row][pos][W], V then by fp8VtK into Vt8 [row][W][NK] - transposed, since there is no 8-bit ldmatrix.trans, each 32-key group in vPerm's order so a
+// thread's P accumulators are already an m16n8k32 A fragment, the keys padded to 64 with zeros. P = 2^(s - m + 8), in
+// [0, 256] (e4m3's range used), rounded to e4m3; l summed from the rounded P by an MMA against ones, so it normalises
+// what P V summed. Emulated on the A100 first (q, k, v and P rounded through e4m3: 5CAJ 0.016 A from the f16 fold);
+// On Colab's RTX PRO 6000 (--bench-grid, 256 rows): 249 / 301 TFLOP/s at 1,000 / 4,000 tokens against flashGrid2R's
+// 207 / 230, output relRMS 3.5e-2 from the f32-score reference (2R's 3.2e-4). In the fold the attention is 262 -> 208 ms
+// of a 988-token trunk (+18 of fp8VtK) and 6.43 -> 4.88 s at 2,964 (+0.17): the trunk 750 -> 707 ms and 11.18 -> 9.82
+// s; 5CAJ self-templated 0.171 -> 0.170 A, 1BRS 0.485 both, 1TIM 1.007 -> 1.006 (chunked, LOCALFOLD_BIG=1, the same),
+// a single-sequence 68-mer 0.054 A from the f16 fold. 🔴 Its block asks for two an SM (__launch_bounds__ ..., 2): Q
+// rounded to e4m3 in the kernel took it to 97 registers, ONE 12-warp block an SM, and 30% slower than the same kernel
+// reading a pre-rounded Q at 80. LOCALFOLD_FP8_ATTN=0 keeps flashGrid2R. (CUDA 12.8 on: the f16-accumulating e4m3 MMA)
+#ifndef LF_FP8_ATTN
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8))
+#define LF_FP8_ATTN 1
+#else
+#define LF_FP8_ATTN 0
+#endif
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890 && LF_FP8_ATTN
+#define LF_FP8_DEVICE 1
+#else
+#define LF_FP8_DEVICE 0
+#endif
+__host__ __device__ inline int vPerm(int p) {     // the physical key at logical position p of a 32-key group
+  int hi = p >= 16 ? 16 : 0, r = p - hi, t = r / 4, b = r % 4;
+  return hi + (b < 2 ? 2 * t + b : 8 + 2 * t + b - 2);
+}
+#if LF_FP8_DEVICE
+__device__ __forceinline__ void mma8h(uint32_t* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+    : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void mma8f(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+    : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t e4m3x2(uint32_t h) {    // two f16 -> two e4m3 in the low 16 bits (lo, hi)
+  unsigned short d; asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(d) : "r"(h)); return d;
+}
+#endif
+// Vt8 [row][W][NK] from V8 [row][pos][W] (both e4m3): a block a 64-key group of one row, the group staged transposed
+// (rows of 65 bytes: a lane's sixteen dims land in eight banks) in vPerm's order, padding zero
+__global__ void __launch_bounds__(256) fp8VtK(const uint8_t* __restrict__ V8, uint8_t* __restrict__ Vt8, int n, int NK, int W) {
+  constexpr int LD = 65;
+  extern __shared__ __align__(16) unsigned char vs[];             // [W][LD]
+  const size_t r = blockIdx.y; const int k0 = blockIdx.x * 64, W16 = W / 16;
+  for (int u = threadIdx.x; u < 64 * W16; u += 256) {
+    int lk = u / W16, c = (u % W16) * 16, pos = k0 + lk;
+    uint4 v = pos < n ? *reinterpret_cast<const uint4*>(V8 + (r * n + pos) * (size_t)W + c) : make_uint4(0, 0, 0, 0);
+    int g = lk & 31, p = (lk & 32) + (g & 16) + ((g & 15) < 8 ? ((g & 7) >> 1) * 4 + (g & 1) : ((g & 7) >> 1) * 4 + 2 + (g & 1));
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) vs[(c + i) * LD + p] = b[i];
+  }
+  __syncthreads();
+  for (int u = threadIdx.x; u < W * 4; u += 256) {
+    int hd = u >> 2, p0 = (u & 3) * 16;
+    uint32_t w[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      uint32_t x = 0;
+#pragma unroll
+      for (int b = 0; b < 4; ++b) x |= (uint32_t)vs[hd * LD + p0 + q * 4 + b] << (8 * b);
+      w[q] = x;
+    }
+    *reinterpret_cast<uint4*>(Vt8 + (r * W + hd) * (size_t)NK + k0 + p0) = make_uint4(w[0], w[1], w[2], w[3]);
+  }
+}
+template <int WARPS, int BK, int MT, int RR>
+__global__ void __launch_bounds__(WARPS * RR * 32, 2) flash8(const half* __restrict__ qkvg, const uint8_t* __restrict__ K8,
+    const uint8_t* __restrict__ Vt8, const half* __restrict__ bias, int biasStride, half* __restrict__ out, int n, int NK,
+    int heads, size_t rows, float scale, const float* __restrict__ qBias) {
+#if LF_FP8_DEVICE
+  constexpr int D = 32, BQ = 16 * MT * WARPS, NT = WARPS * RR * 32, NTR = WARPS * 32, LDB = BK + 8;
+  constexpr int KROW = D, VROW = BK;                                  // bytes: a key's row, a dim's row of the tile
+  constexpr int KT = BK * KROW, VT = D * VROW;                        // a tile's K and V bytes, per grid row
+  constexpr size_t STAGE = (size_t)RR * (KT + VT) + (size_t)BQ * LDB * 2;
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int rg = (int)threadIdx.x / NTR, tr = (int)threadIdx.x % NTR;
+  const int warp = tr >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+  const size_t perHead = (rows + RR - 1) / RR;
+  const size_t b = blockIdx.y; const int h = (int)(b / perHead); size_t rl = (b % perHead) * RR + rg;
+  const bool live = rl < rows; if (!live) rl = rows - 1;
+  const int W = heads * D;
+  const int q0 = blockIdx.x * BQ;
+  auto Kst = [&](int s) { return smem + s * STAGE + (size_t)rg * (KT + VT); };
+  auto Vst = [&](int s) { return Kst(s) + KT; };
+  auto Bst = [&](int s) { return (half*)(smem + s * STAGE + (size_t)RR * (KT + VT)); };
+  // K rows 32 bytes: chunk c (0/1) of row r at c ^ ((r >> 2) & 1); V rows BK bytes: chunk c at c ^ ((r >> 1) & (BK/16 - 1))
+  auto kOff = [](int r, int c) { return r * KROW + ((c ^ ((r >> 2) & 1)) << 4); };
+  auto vOff = [](int r, int c) { return r * VROW + ((c ^ ((r >> 1) & (BK / 16 - 1))) << 4); };
+  const uint8_t* kRow = K8 + (rl * n) * (size_t)W + h * D;              // + key * W
+  const uint8_t* vRow = Vt8 + ((rl * heads + h) * (size_t)D) * NK;      // + dim * NK + key
+  const half* base = qkvg + (rl * n) * (size_t)(4 * W) + h * D;         // + pos * 4W: q, then (+3W) the gate
+  const half* biasHead = bias + (size_t)h * n * biasStride;
+  auto issue = [&](int j0, int st) {
+    uint8_t* Ks = Kst(st); uint8_t* Vs = Vst(st); half* Bs = Bst(st);
+    for (int u = tr; u < BK * 2; u += NTR) {                          // K: BK rows x 2 chunks
+      int r = u >> 1, c = u & 1, key = j0 + r;
+      cpAsync16(Ks + kOff(r, c), kRow + (size_t)(key < n ? key : 0) * W + c * 16, key < n);
+    }
+    for (int u = tr; u < D * (BK / 16); u += NTR) {                   // V: D rows x BK/16 chunks (padding is zero)
+      int r = u / (BK / 16), c = u % (BK / 16);
+      cpAsync16(Vs + vOff(r, c), vRow + (size_t)r * NK + j0 + c * 16, true);
+    }
+    for (int u = threadIdx.x; u < BQ * (BK / 8); u += NT) {           // bias: BQ rows x BK/8 chunks
+      int qi = u / (BK / 8), c = (u % (BK / 8)) * 8, i = q0 + qi;
+      bool ok = i < n && j0 + c < n;
+      cpAsync16(Bs + qi * LDB + c, ok ? biasHead + (size_t)i * biasStride + j0 + c : biasHead, ok);
+    }
+    cpCommit();
+  };
+  // Q fragments: a0 row g bytes 4tig.., a1 row g+8, a2 row g bytes 16+4tig.., a3 row g+8
+  const float qs = scale * LOG2E;
+  auto q4 = [&](int i, int e) -> uint32_t {
+    if (i >= n) return 0u;
+    const half* p = base + (size_t)i * (4 * W) + e;
+    float2 a = __half22float2(*reinterpret_cast<const half2*>(p)), c = __half22float2(*reinterpret_cast<const half2*>(p + 2));
+    if (qBias) { a.x += qBias[h * D + e]; a.y += qBias[h * D + e + 1]; c.x += qBias[h * D + e + 2]; c.y += qBias[h * D + e + 3]; }
+    half2 lo = __floats2half2_rn(a.x * qs, a.y * qs), hi = __floats2half2_rn(c.x * qs, c.y * qs);
+    return e4m3x2(*reinterpret_cast<uint32_t*>(&lo)) | e4m3x2(*reinterpret_cast<uint32_t*>(&hi)) << 16;
+  };
+  uint32_t qa[MT][4];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt) {
+    int i0 = q0 + warp * 16 * MT + mt * 16 + g, i1 = i0 + 8;
+    qa[mt][0] = q4(i0, 4 * tig); qa[mt][1] = q4(i1, 4 * tig); qa[mt][2] = q4(i0, 16 + 4 * tig); qa[mt][3] = q4(i1, 16 + 4 * tig);
+  }
+  float o[MT][D / 8][4] = {}, lsum[MT][4] = {};
+  float mx[MT][2];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt) mx[mt][0] = mx[mt][1] = -INFINITY;
+  const int tiles = (n + BK - 1) / BK;
+  issue(0, 0);
+  for (int tile = 0; tile < tiles; ++tile) {
+    int st = tile & 1;
+    if (tile + 1 < tiles) { issue((tile + 1) * BK, st ^ 1); cpWait<1>(); } else cpWait<0>();
+    __syncthreads();
+    const uint8_t* Ks = Kst(st); const uint8_t* Vs = Vst(st); const half* Bs = Bst(st);
+    uint32_t sh[MT][BK / 8][2];                                        // the scores, starting from the bias
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      const half* rowp = Bs + (warp * 16 * MT + mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * LDB + (lane >> 4) * 8;
+#pragma unroll
+      for (int nt = 0; nt < BK / 8; nt += 2) {
+        uint32_t r4[4]; ldsm4(r4, rowp + nt * 8);
+        sh[mt][nt][0] = r4[0]; sh[mt][nt][1] = r4[1]; sh[mt][nt + 1][0] = r4[2]; sh[mt][nt + 1][1] = r4[3];
+      }
+      if (tile == tiles - 1)
+#pragma unroll
+        for (int nt = 0; nt < BK / 8; ++nt) {
+          int jg = tile * BK + nt * 8 + tig * 2;
+          if (jg >= n) { sh[mt][nt][0] = (sh[mt][nt][0] & 0xFFFF0000u) | 0xFC00u; sh[mt][nt][1] = (sh[mt][nt][1] & 0xFFFF0000u) | 0xFC00u; }
+          if (jg + 1 >= n) { sh[mt][nt][0] = (sh[mt][nt][0] & 0xFFFFu) | 0xFC000000u; sh[mt][nt][1] = (sh[mt][nt][1] & 0xFFFFu) | 0xFC000000u; }
+        }
+    }
+    // S += Q K^T: two 8-key tiles an ldmatrix (keys x 16-byte halves of their 32 dims)
+#pragma unroll
+    for (int nt = 0; nt < BK / 8; nt += 2) {
+      uint32_t kb[4];
+      int qm = lane >> 3, key = nt * 8 + (qm >> 1) * 8 + (lane & 7);
+      ldsm4(kb, Ks + kOff(key, qm & 1));
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) { mma8h(sh[mt][nt], qa[mt], kb[0], kb[1]); mma8h(sh[mt][nt + 1], qa[mt], kb[2], kb[3]); }
+    }
+    // the running max (rounded to f16, as the f16 kernel's), the rescale; P = 2^(s - (m - 8))
+    __half2 hn[MT][2];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      __half2 x0 = *reinterpret_cast<__half2*>(&sh[mt][0][0]), x1 = *reinterpret_cast<__half2*>(&sh[mt][0][1]);
+#pragma unroll
+      for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, *reinterpret_cast<__half2*>(&sh[mt][nt][0])); x1 = __hmax2(x1, *reinterpret_cast<__half2*>(&sh[mt][nt][1])); }
+      float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
+      t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
+      t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+      float n0 = __half2float(__float2half(fmaxf(mx[mt][0], t0))), n1 = __half2float(__float2half(fmaxf(mx[mt][1], t1)));
+      float c0 = exp2f(mx[mt][0] - n0), c1 = exp2f(mx[mt][1] - n1);
+      mx[mt][0] = n0; mx[mt][1] = n1;
+#pragma unroll
+      for (int et = 0; et < D / 8; ++et) { o[mt][et][0] *= c0; o[mt][et][1] *= c0; o[mt][et][2] *= c1; o[mt][et][3] *= c1; }
+      lsum[mt][0] *= c0; lsum[mt][1] *= c0; lsum[mt][2] *= c1; lsum[mt][3] *= c1;
+      hn[mt][0] = __float2half2_rn(n0 - 8.f); hn[mt][1] = __float2half2_rn(n1 - 8.f);
+    }
+    // O += P V, 32 keys an MMA
+#pragma unroll
+    for (int t = 0; t < BK / 32; ++t) {
+      uint32_t pa[MT][4];
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        auto e = [&](int nt, int hr) {
+          __half2 d = __hsub2(*reinterpret_cast<__half2*>(&sh[mt][nt][hr]), hn[mt][hr]);
+          return e4m3x2(ex2h2(*reinterpret_cast<uint32_t*>(&d)));
+        };
+        pa[mt][0] = e(4 * t, 0) | (e(4 * t + 1, 0) << 16);
+        pa[mt][1] = e(4 * t, 1) | (e(4 * t + 1, 1) << 16);
+        pa[mt][2] = e(4 * t + 2, 0) | (e(4 * t + 3, 0) << 16);
+        pa[mt][3] = e(4 * t + 2, 1) | (e(4 * t + 3, 1) << 16);
+        mma8f(lsum[mt], pa[mt], 0x38383838u, 0x38383838u);           // (e4m3 1.0 = 0x38)
+      }
+#pragma unroll
+      for (int et = 0; et < D / 8; et += 2) {
+        uint32_t vb[4];
+        int qm = lane >> 3, dim = et * 8 + (qm >> 1) * 8 + (lane & 7);
+        ldsm4(vb, Vs + vOff(dim, t * 2 + (qm & 1)));
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) { mma8f(o[mt][et], pa[mt], vb[0], vb[1]); mma8f(o[mt][et + 1], pa[mt], vb[2], vb[3]); }
+      }
+    }
+    __syncthreads();
+  }
+  // out = O / l * sigmoid(gate)
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt) {
+    int i0 = q0 + warp * 16 * MT + mt * 16 + g, i1 = i0 + 8;
+    float l0 = lsum[mt][0], l1 = lsum[mt][2];
+#pragma unroll
+    for (int et = 0; et < D / 8; ++et) {
+      int e = et * 8 + tig * 2;
+      if (live && i0 < n) {
+        float2 a = __half22float2(*reinterpret_cast<const half2*>(base + (size_t)i0 * (4 * W) + 3 * W + e));
+        *reinterpret_cast<half2*>(out + (rl * n + i0) * (size_t)W + h * D + e) =
+          __floats2half2_rn(o[mt][et][0] / l0 / (1.f + __expf(-a.x)), o[mt][et][1] / l0 / (1.f + __expf(-a.y)));
+      }
+      if (live && i1 < n) {
+        float2 a = __half22float2(*reinterpret_cast<const half2*>(base + (size_t)i1 * (4 * W) + 3 * W + e));
+        *reinterpret_cast<half2*>(out + (rl * n + i1) * (size_t)W + h * D + e) =
+          __floats2half2_rn(o[mt][et][2] / l1 / (1.f + __expf(-a.x)), o[mt][et][3] / l1 / (1.f + __expf(-a.y)));
+      }
+    }
+  }
+#endif
+}
+// will flash8Run take this attention: an FP8 card, a binary whose flash8 was compiled for one (not an older
+// architecture's PTX run by the driver, where the kernel is empty), and LOCALFOLD_FP8_ATTN not 0
+inline bool fp8Attn() {
+  static const bool on = [] {
+    if (!LF_FP8_ATTN || !fp8Tensor()) return false;
+    if (getenv("LOCALFOLD_FP8_ATTN") && !atoi(getenv("LOCALFOLD_FP8_ATTN"))) return false;
+    cudaFuncAttributes a; CK(cudaFuncGetAttributes(&a, flash8<4, 64, 1, 3>));
+    return a.ptxVersion >= 89;
+  }();
+  return on;
+}
+// the attention from qkvg's q and gate (f16, [row][pos][4W]) and K8, V8 (e4m3, [row][pos][W] - gridInK's kv8)
+inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, const half* bias, int stride, half* out, int n,
+                      int heads, size_t rows, float scale, const float* qBias) {
+  constexpr int WARPS = 4, BK = 64, MT = 1, RR = 3, BQ = 16 * MT * WARPS;
+  const int W = heads * 32, NK = (n + 63) / 64 * 64;
+  uint8_t* Vt8 = scratch<uint8_t>("attn.vt8", rows * (size_t)W * NK);
+  static int vtAttr = 0;
+  if (65 * W > vtAttr) { smemAttr(fp8VtK, 65 * W); vtAttr = 65 * W; }
+  fp8VtK<<<dim3(NK / 64, (unsigned)rows), 256, 65 * W, STREAM>>>(V8, Vt8, n, NK, W);
+  const int bytes = 2 * (RR * (BK * 32 + 32 * BK) + BQ * (BK + 8) * 2);
+  static bool attr = false;
+  if (!attr) { smemAttr((flash8<WARPS, BK, MT, RR>), bytes); attr = true; }
+  dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
+  flash8<WARPS, BK, MT, RR><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias);
 }
 inline int FLASH_WARPS_OVERRIDE = 0;
 // F16S (flashGridHalf): the unmasked kernel's scores in f16 - LOCALFOLD_FLASH_F16S=1 (being measured)

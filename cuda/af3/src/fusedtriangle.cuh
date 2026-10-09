@@ -696,7 +696,8 @@ template <int C, int NQ, int WARPS, class PT = float>
 __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ pair, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wq, half* __restrict__ out, int n, size_t q0,
     size_t rows, bool tr, const half* __restrict__ Wb, half* __restrict__ bias, int heads, int stride, bool swap,
-    const float* __restrict__ qb = nullptr) {   // qb: a bias on the NQ projected columns (AF2's gate bias), or none
+    const float* __restrict__ qb = nullptr,      // qb: a bias on the NQ projected columns (AF2's gate bias), or none
+    uint8_t* __restrict__ kv8 = nullptr) {       // kv8: k and v written e4m3 here instead (flash8's K8, then V8, rows x NQ/4 each)
   constexpr int R = 16 * WARPS, NTH = 32 * WARPS, LDX = C + 8, NC = 64, LDW = NC + 8, KS = C / 16;
   extern __shared__ __align__(16) unsigned char smem[];
   half* Xs = (half*)smem;
@@ -773,11 +774,29 @@ __global__ void __launch_bounds__(WARPS * 32) gridInK(const float* __restrict__ 
       *reinterpret_cast<half2*>(Ys + (g + 8) * LDX + c) = __floats2half2_rn(acc[nt][2], acc[nt][3]);
     }
     __syncwarp();
+    constexpr int WQ = NQ / 4;
+    if (kv8 && j * NC >= WQ && j * NC < 3 * WQ) {        // k or v: e4m3, 8 bytes a lane
+      uint8_t* dst = kv8 + (j * NC < 2 * WQ ? (size_t)0 : rows * WQ) + (j * NC) % WQ;
+      auto e2 = [](uint32_t h) -> uint32_t {
+        __half2_raw r; r.x = (unsigned short)(h & 0xFFFF); r.y = (unsigned short)(h >> 16);
+        return __nv_cvt_halfraw2_to_fp8x2(r, __NV_SATFINITE, __NV_E4M3);
+      };
+#pragma unroll
+      for (int i = 0; i < 16 * (NC / 8) / 32; ++i) {
+        int r = i * (32 / (NC / 8)) + lane / (NC / 8), c = (lane % (NC / 8)) * 8;
+        size_t row = row0 + warp * 16 + r;
+        if (row < rows) {
+          uint4 h = *reinterpret_cast<const uint4*>(Ys + r * LDX + c);
+          *reinterpret_cast<uint2*>(dst + row * WQ + c) = make_uint2(e2(h.x) | e2(h.y) << 16, e2(h.z) | e2(h.w) << 16);
+        }
+      }
+    } else {
 #pragma unroll
     for (int i = 0; i < 16 * (NC / 8) / 32; ++i) {
       int r = i * (32 / (NC / 8)) + lane / (NC / 8), c = (lane % (NC / 8)) * 8;
       size_t row = row0 + warp * 16 + r;
       if (row < rows) *reinterpret_cast<uint4*>(out + row * NQ + j * NC + c) = *reinterpret_cast<const uint4*>(Ys + r * LDX + c);
+    }
     }
     __syncwarp();
 #if LF_REG_STAGES
@@ -894,32 +913,33 @@ constexpr int GI_WARPS = 8, GO_WARPS = 8;
 // the launchers on raw pointers (AF2 calls these with its own weights and biases), then AF3's by name
 template <int WARPS>
 void gridInAt(const float* pair, const float* lnScale, const float* lnOffset, const half* Wq, const float* qb, half* out,
-              int n, size_t q0, size_t rows, bool tr, const half* Wb, half* bias, int heads, int stride, bool swap) {
+              int n, size_t q0, size_t rows, bool tr, const half* Wb, half* bias, int heads, int stride, bool swap,
+              uint8_t* kv8 = nullptr) {
   constexpr int C = 128, NQ = 512, R = 16 * WARPS;
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * C * (64 + 8) * 2 + (size_t)C * 24 * 2;
   WITH_PAIR_T(
     static bool attr = false;
     if (!attr) { smemAttr((gridInK<C, NQ, WARPS, PT>), (int)smem); attr = true; }
     gridInK<C, NQ, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
-      pair, lnScale, lnOffset, Wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, qb));
+      pair, lnScale, lnOffset, Wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, qb, kv8));
 }
 inline size_t gridInSmem(int warps) { return (size_t)16 * warps * (128 + 8) * 2 + (size_t)2 * 128 * (64 + 8) * 2 + (size_t)128 * 24 * 2; }
 inline size_t gridOutSmem(int warps) { return (size_t)128 * (128 + 8) * 2 + (size_t)16 * warps * (128 + 8) * 2; }
 inline bool gridFusedFits() { return fitsSmem(gridInSmem(2)) && fitsSmem(gridOutSmem(2)); }
 inline void gridInRaw(const float* pair, const float* lnScale, const float* lnOffset, const half* Wq, const float* qb,
                       half* out, int n, size_t q0, size_t rows, bool tr, const half* Wb = nullptr, half* bias = nullptr,
-                      int heads = 0, int stride = 0, bool swap = false) {
+                      int heads = 0, int stride = 0, bool swap = false, uint8_t* kv8 = nullptr) {
   switch (warpsFitting(warpsFor(rows, {GI_WARPS, 4, 2}), {GI_WARPS, 4, 2}, gridInSmem)) {
-    case 2: gridInAt<2>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
-    case 4: gridInAt<4>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap); break;
-    default: gridInAt<GI_WARPS>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap);
+    case 2: gridInAt<2>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, kv8); break;
+    case 4: gridInAt<4>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, kv8); break;
+    default: gridInAt<GI_WARPS>(pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, kv8);
   }
 }
 inline void gridIn128(const float* pair, const std::string& pre, const std::string& wq, half* out, int n, size_t q0,
                       size_t rows, bool tr, const half* Wb = nullptr, half* bias = nullptr, int heads = 0,
-                      int stride = 0, bool swap = false) {
+                      int stride = 0, bool swap = false, uint8_t* kv8 = nullptr) {
   gridInRaw(pair, W(pre + ".actNormScale"), W(pre + ".actNormOffset"), Wh(wq), nullptr, out, n, q0, rows, tr, Wb, bias,
-            heads, stride, swap);
+            heads, stride, swap, kv8);
 }
 template <int WARPS>
 void gridOutAt(const half* gathered, const half* Wout, const float* ob, float* pair, int n, size_t q0, size_t rows, bool tr) {

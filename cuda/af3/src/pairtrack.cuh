@@ -1104,6 +1104,10 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       std::string qkvg = qkvgWeight(pre, C, Wd, true);
       std::string wb = paddedColumns(pre + ".pairBiasProjection", C, heads, 16);
       float scale = 1.f / sqrtf((float)D);
+      // FP8 attention where the card has it (flash8Run): k and v written e4m3 by the projection, the f16 kernel's
+      // k and v never written
+      const bool f8 = D == 32 && (MASK_ALL_ONES || !mask) && fp8Attn();
+      const size_t f8Row = f8 ? (size_t)3 * Wd : 0;          // (k8, v8 and the transposed v: bytes an element)
       // 🔴 every row in one pass whenever the card has the room for it (what its buffers already hold
       // counted, so every pass decides alike): whole is 3.3% of the trunk faster at 262 tokens and 4.8% at
       // 1048 (465 against 481 ms, 7.82 against 8.20 s on an A100) for 1.13 GB the chunks do not hold - it
@@ -1112,14 +1116,17 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // (the room asked for includes the triangle multiplication's whole form, five planes, which these
       // buffers would otherwise starve into its blocked form - see cuda/af2's twin)
       size_t triPlane = (size_t)((n + 7) / 8 * 8) * ((n + 7) / 8 * 8);
-      if (roomFor(((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + 5 * triPlane * C * 2,
-                  {"grid.qkvg", "grid.gathered", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole"})) {
+      if (roomFor(((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
+                  {"grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf",
+                   "tri.pbf", "tri.t2whole"})) {
         // every row in one pass (this card has the memory): the bias written by the same kernel
         CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // the padding columns
         half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);
-        gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias);
+        uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", pairs * 2 * Wd) : nullptr;
+        gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias, kv8);
         half* gathered = scratch<half>("grid.gathered", pairs * Wd);
-        flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
+        if (f8) flash8Run(qkvgOut, kv8, kv8 + pairs * Wd, bias, stride, gathered, n, heads, n, scale, nullptr);
+        else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
         // (a bf16 pair takes the output kernel in both directions, adding its f32 accumulators into the pair: the
         // GEMM into f16 and an add pass - cuBLAS takes no f16-in, bf16-out GEMM - were 0.8% more of a 988-token trunk,
         // and an f16 rounding more; 5CAJ with its alignment 0.009 A, 1BRS templated 0.008 A from that form)
@@ -1150,19 +1157,21 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // token pass (LOCALFOLD_BIG=1 keeps the 64M-element chunks, so a small input still crosses chunk boundaries)
       if (!BIG_FORCED) {
         size_t f, t; deviceMemInfo(&f, &t);
-        size_t perRow = (size_t)n * 5 * Wd * 2, spare = f > t / 16 ? f - t / 16 : 0;
+        size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row), spare = f > t / 16 ? f - t / 16 : 0;
         R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, 256)));
       }
       for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
         size_t rows = std::min(R, (size_t)n - r0), prs = rows * n;
         half* qkvgOut = scratch<half>("grid.qkvg", (std::min(R, (size_t)n) * n + 128) * 4 * Wd);   // padding: the last query block
-        gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr);
+        uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", std::min(R, (size_t)n) * n * 2 * Wd) : nullptr;
+        gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr, nullptr, nullptr, 0, 0, false, kv8);
         half* gathered = scratch<half>("grid.gathered", std::min(R, (size_t)n) * n * Wd);
-        flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
+        if (f8) flash8Run(qkvgOut, kv8, kv8 + prs * Wd, bias, stride, gathered, n, heads, rows, scale, nullptr);
+        else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
         if (!tr && !PAIR16) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr);
       }
-      releaseScratch({ "grid.qkvg", "grid.gathered" });   // (the next triangle's blocks size themselves by what is free)
+      releaseScratch({ "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });   // (the next triangle's blocks size themselves by what is free)
       return;
     }
   }

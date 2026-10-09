@@ -78,6 +78,13 @@ __global__ void halfToFloatScaledK(const half* in, float* out, size_t n, float s
 }
 // --bench-grid=N: the pair track's grid attention alone at N tokens (4 heads of 32, every row,
 // no mask), the arms interleaved and each the median of several rounds of 10 launches
+// (the bench's K8 and V8: qkvg's k and v rounded to e4m3, as gridInK's kv8 writes them)
+__global__ void benchKv8K(const half* qkvg, uint8_t* kv8, size_t prs, int W) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= prs * 2 * W) return;
+  size_t which = t / (prs * W), e = t % (prs * W), row = e / W; int c = (int)(e % W);
+  kv8[t] = __nv_cvt_halfraw_to_fp8(*reinterpret_cast<const __half_raw*>(qkvg + row * 4 * W + (1 + which) * W + c), __NV_SATFINITE, __NV_E4M3);
+}
 inline void benchGrid(int n) {
   const int heads = 4, D = 32, Wd = heads * D, stride = (n + 7) / 8 * 8;
   size_t rows = getenv("LOCALFOLD_BENCH_ROWS") ? atoi(getenv("LOCALFOLD_BENCH_ROWS")) : n;   // fewer grid rows: a long n
@@ -142,6 +149,12 @@ inline void benchGrid(int n) {
       printf("  %-14s relRMS %.3e from the f32-score reference\n", name, std::sqrt(num / std::max(den, 1e-30)));
     };
     rel("2R", [&] { flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out2, n, heads, rows, 0.17f, nullptr); });
+    if (fp8Attn()) {
+      uint8_t* kv8 = dallocT<uint8_t>(rows * n * 2 * Wd);
+      benchKv8K<<<blocks(rows * n * 2 * Wd), 256, 0, STREAM>>>(qkvg, kv8, rows * n, Wd);
+      rel("fp8", [&] { flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out2, n, heads, rows, 0.17f, nullptr); });
+      CK(cudaFree(kv8));
+    }
     CK(cudaFree(outF));
   }
   {   // the block order (GRID_SWIZZLE): the same blocks in another order, so the same bytes
@@ -164,6 +177,8 @@ inline void benchGrid(int n) {
     printf("  2R rr%d against rr1: %zu of %zu outputs differ\n", rr, differ, a.size());
   }
   }
+  uint8_t* kv8 = nullptr;
+  if (fp8Attn()) { kv8 = dallocT<uint8_t>(rows * n * 2 * Wd); benchKv8K<<<blocks(rows * n * 2 * Wd), 256, 0, STREAM>>>(qkvg, kv8, rows * n, Wd); }
   std::vector<std::pair<std::string, std::function<void()>>> arms = {
     {"grid w4 cp.async", [&] { flashGridHalfRun<32, 4, FA_BK, false>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
     {"grid w4 reg", [&] { flashGridHalfRun<32, 4, FA_BK, true>(qkvg, bias, stride, nullptr, out, n, heads, 0, rows, false, 0.17f, nullptr); }},
@@ -173,6 +188,7 @@ inline void benchGrid(int n) {
     {"2R w4 bk48 mt2", [&] { flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk48 rr2", [&] { flashGrid2RRun<32, 4, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk48 rr3", [&] { flashGrid2RRun<32, 4, 48, 2, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"fp8 (when the card has it)", [&] { if (kv8) flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk32 rr2", [&] { flashGrid2RRun<32, 4, 32, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk64 rr2", [&] { flashGrid2RRun<32, 4, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w2 bk48 rr2", [&] { flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
