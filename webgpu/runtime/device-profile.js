@@ -1211,6 +1211,19 @@ const PRIORS = new Map([
     // GEMM with the model's deepest K onto units that exist) rather than a
     // tuned constant, but re-sweep before trusting it on another Apple part.
     opmMatrixContract: true,
+    // 🔴 THE MSA ROW ATTENTION'S PAIR BIAS WITH ITS LAYER NORM, WHICH THE A100 DECLINED AT 0.2-0.9% OF A BLOCK
+    // (docs/AF2.md). Here the separate `pair-normalize` - a workgroup a pair row, twelve barriers for 128 channels -
+    // is slow AND erratic: profile-af2-block.js, two rounds a shape, pair-normalize + pair-bias against the fused
+    // kernel, and the block:
+    //
+    //   length x rows   unfused ms      fused ms      block, unfused -> fused
+    //   59  x 128       0.23 / 0.51     0.12 / 0.17   20.25 / 20.59 -> 20.50 / 20.18
+    //   150 x 256       6.79 / 9.45     0.39 / 0.37   130.8 / 136.8 -> 125.9 / 123.3
+    //   255 x 512       2.06 / 3.52     0.75 / 0.85   547.4 / 470.5 -> 543.1 / 470.0
+    //
+    // (and 25.8 ms of a 498 ms block once at 255 x 512). The fused arm never loses. It regroups the statistics, so it
+    // is not bit-identical: 6MRR RMSD and pLDDT below, in the commit that set this.
+    fusedPairBias: true,
   }],
 ], );
 
