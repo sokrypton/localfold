@@ -34,16 +34,16 @@
   "rmsd": null
  },
  "af3-glycan": {
-  "ligand": 0.024,
-  "plddt": 44.63,
-  "ptm": "0.4190",
+  "ligand": 0.023,
+  "plddt": 45.6,
+  "ptm": "0.4438",
   "rmsd": null
  },
  "af3-kitchen-sink": {
-  "ligand": 0.045,
+  "ligand": 0.047,
   "nucleic": 0.056,
-  "plddt": 75.44,
-  "ptm": "0.7537",
+  "plddt": 74.87,
+  "ptm": "0.7350",
   "rmsd": null
  },
  "boltz2-6mrr": {

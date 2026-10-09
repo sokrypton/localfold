@@ -83,7 +83,10 @@ tokens; now 950. GPU 16.98 -> 16.81 s. `LOCALFOLD_UNFUSED_BIAS=1` is the control
 as well, so gatherTransposedK's pass (169 ms) is gone: 16.81 -> 16.61 s, the same digits (`LOCALFOLD_GRID_NORM_T=0`,
 the port's own switch, is the control).
 
-🔴 **rosettafold3-6mrr AND af3-glycan SWING UNDER ANY ROUNDING CHANGE.** rf3's RMSD went 1.699 -> 1.764 -> 1.706 over
+And **the diffusion's transitions take the SwiGLU in their GEMM** too (`metal/af3/diffusion.cuh.patch` for the token
+transformer, `atom.cuh.patch` for the atom blocks): swigluK's 30 passes a step gone, ~0.8 ms of a 69 ms step.
+
+🔴 **rosettafold3-6mrr, af3-glycan AND af3-kitchen-sink SWING UNDER ANY ROUNDING CHANGE.** rf3's RMSD went 1.699 -> 1.764 -> 1.706 over
 two changes that each move the other cases' digits only, and glycan's pLDDT 44.35 -> 45.30 -> 44.63; seed by seed
 the arms agree (above). A MOVED on those two alone, with every other case in its digits, is that and not a defect.
 

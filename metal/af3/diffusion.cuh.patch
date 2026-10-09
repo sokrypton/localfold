@@ -1,0 +1,18 @@
+# The diffusion transformer's transition: its first GEMM writes silu(a) b from its accumulators (lf::gemmSwiglu, as
+# atom.cuh.patch and pairtrack.cuh.patch take it), where the port writes the 2I-wide widening and runs swigluK over it.
+# Over the padded rows, as the GEMMs on either side run. Not the up-gated form. LOCALFOLD_UNFUSED_SWIGLU=1 is the control.
+@@@ old
+    linear<T, T>(tn, wide, prows, C, up ? 3 * I : 2 * I, w1);
+    swiglu<T>(wide, gated, rows, I, up);
+@@@ new
+    static const bool fuseSwiglu = !getenv("LOCALFOLD_UNFUSED_SWIGLU");
+    bool fused = false;
+    if constexpr (std::is_same_v<T, half>) if (fuseSwiglu && !up) {
+      lf::gemmSwiglu(tn, swigluPairs(w1, C, I), gated, prows, C, I);
+      fused = true;
+    }
+    if (!fused) {
+      linear<T, T>(tn, wide, prows, C, up ? 3 * I : 2 * I, w1);
+      swiglu<T>(wide, gated, rows, I, up);
+    }
+@@@ end
