@@ -148,7 +148,9 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
   for (int a = 0; a < FR; ++a)
     _Pragma("clang loop unroll(full)")
     for (int b = 0; b < FC; ++b) acc[a][b] = ACC(0);
-  const bool vec = g.biasType & 256;
+  // (vector staging: the host's word, or for a pointer array - whose pointers the host cannot see - the leading dimensions'
+  // (bit 512) and this entry's own pointers' alignment)
+  const bool vec = (g.biasType & 256) || ((g.biasType & 512) && ((ulong)A % (8 * sizeof(TA))) == 0 && ((ulong)B % (8 * sizeof(TB))) == 0);
   for (int k0 = 0; k0 < g.k; k0 += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {   // X = op(B)^T: element (j, k) = TRB ? B[j + k ldb] : B[k + j ldb]; staged a chunk of 8 along the contiguous axis,

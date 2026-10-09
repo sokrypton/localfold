@@ -827,6 +827,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   bool vec = !a.ptrs && a.lda % 8 == 0 && a.ldb % 8 == 0 && (a.sa % 8 == 0) && (a.sb % 8 == 0) &&
              a.A % (8 * esize(ta_)) == 0 && a.B % (8 * esize(tb_)) == 0;
   if (vec) a.biasType |= 256;
+  else if (a.ptrs && a.lda % 8 == 0 && a.ldb % 8 == 0) a.biasType |= 512;   // (a pointer array: the kernel checks its pointers)
   if (getenv("LF_GEMM_DEBUG")) fprintf(stderr, "gemm %dx%dx%d ta %d tb %d tile %dx%d vec %d batch %d\n", a.m, a.n, a.k, a.ta, a.tb, tr, tc, (int)vec, batch);
   auto mtype = [](cudaDataType t) { return t == CUDA_R_32F ? "float" : t == CUDA_R_16F ? "half" : "lf_bf16s"; };
   // the k step: 16 for a whole 64 x 64 tile, 32 otherwise. Measured interleaved (AB=1 metal/tools/bench-gemm) on an M2:
