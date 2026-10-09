@@ -52,16 +52,16 @@ way - so an 8 GB Mac folds what a larger one does, slower (AF3's trunk 7.5 s the
 
 ## How fast
 
-On this M2 (10-core GPU), 2026-10-09, the whole job unless said:
+On this M2 (10-core GPU), 2026-10-10, the whole job unless said:
 
 | | time | peak memory |
 |---|---|---|
-| AF3 6MRR (68 tokens, 200 steps) | fold 6.1 s (WebGPU: 12.0 warm) | 2.3 GB |
-| AF3 at 255 tokens (200 steps) | ~31 s: trunk 15.9, diffusion 14.5 (was ~75 s on 2026-10-08) | 3.3 GB |
+| AF3 6MRR (68 tokens, 200 steps) | fold 6.2 s (WebGPU: 12.0 warm) | 2.3 GB |
+| AF3 at 255 tokens (200 steps) | ~28 s: trunk 14.0, diffusion 13.4 (was ~75 s on 2026-10-08) | 3.3 GB |
 | ESMFold2 6MRR | 2.0 s | |
-| ESMFold2 5CAJ (261 tokens) | 14.8 s: trunk 12.1 (was 19.4) | 3.2 GB |
+| ESMFold2 5CAJ (261 tokens) | 13.6 s: trunk 11.0 (was 19.4) | 3.1 GB |
 | AF2 6MRR | 1.5 s | |
-| AF2 5CAJ + template (4 passes) | 16.5 s | 1.7 GB |
+| AF2 5CAJ + template (4 passes) | 14.4 s | 1.7 GB |
 
 Profile any fold with `--profile` (every kernel its own command buffer: an upper bound) and count with
 `LOCALFOLD_METAL_STATS=1` (which also prints the peak allocation); `LOCALFOLD_MEM=1` reports memory a phase.
