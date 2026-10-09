@@ -113,16 +113,15 @@ was WebGPU's split pair transition and grid attention on the matrix units - f16 
 cannot reach - and with `LOCALFOLD_STOCK_FLAGS=1` (no matrix units) the whole trunk agrees to 8.4e-7. The bisection
 also found WebGPU's vector split ignoring `--f16=off` (fixed).
 
-🔴 **OPEN: ESMFold2 FOLDS 1QYS WRONG A FEW TIMES IN A HUNDRED, UNDER LOAD.** 13.543 A (the same wrong structure every
-time) or NaN, against 0.865 bit-identical on every other run; seen right after a rebuild (twice, once the RNA hairpin)
-and with two folds running at once (`/tmp/stress.sh`-style: two processes, 1-2 bad in ~60). Ruled out, each by an
-experiment rather than a reading: a read past a buffer's end (64 KB of NaN slack after every allocation - identical),
-uninitialised threadgroup memory (every core's filled with NaN before every dispatch - identical), Metal's shader
-validation (clean), a failed command buffer (now reported, none was), the warm-up's derived weights (the upload
-slowed 0-300 ms a piece - identical), and by audit: no early return before a barrier and no barrier in a
-thread-indexed loop in any translated kernel. Fixed on the way, whether or not it was the cause: idle, sync and event
-waits now cover every earlier command buffer (they trusted the last one to imply the rest). Four processes at once
-on 16 GB do not fail - they never finish (blocked in the GPU driver's submit: the working set oversubscribed).
+🔴 **A GRAPH CAPTURE IS THE CAPTURING THREAD'S - CUDA's `cudaStreamCaptureModeThreadLocal` - AND THIS RUNTIME'S WAS
+GLOBAL.** ESMFold2 uploads its weights on a thread while a warm-up fold runs, and the warm-up's sampler captures a
+graph; an upload step in that window went into the graph and its event record was dropped, so the wait guarding a
+decode buffer returned at once and the next shard overwrote it before its decode ran. 1QYS folded at 13.5 A or to NaN
+against 0.865, ~3% of runs, only under load or on a slow first run - and every ruled-out arm before it (NaN slack past
+buffers, NaN-poisoned threadgroup memory, shader validation, barrier audits) said, correctly, that no kernel was at
+fault. Found with stage checksums and then per-tensor weight sums: 71 of 1183 tensors differed, a shard's worth. Fixed:
+0 of 90 under the same two-process stress where 1 in ~35 failed before. **A CUDA API's thread semantics are part of
+what the shim must emulate, not only its arithmetic.**
 
 🔴 **`MTLCreateSystemDefaultDevice()` RETURNS nil TO A COMMAND-LINE PROCESS**, saying so only on stderr - sometimes.
 `MTLCopyAllDevices()` does not. Under the sandbox there is no device at all.
