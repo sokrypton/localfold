@@ -307,6 +307,15 @@ What made them pay, each measured:
   channel-major product tile and normalises them on the way, so there is no f16 row buffer.
 - **Shared memory recycled.** The weight stages reuse the memory of rows already loaded into
   registers, so two blocks fit an SM: `triIn256K` 110 → 89 ms.
+- **The diffusion conditioning streamed past the card (2026-10-09).** 3,952 tokens folded its trunk (153 s) and ran
+  out preparing the diffusion: the conditioning pair was built whole in f32 (16 GB at that size) before each token
+  block's bias was projected from it. Every step there is row-wise - [z | rel_pos], its norm, the projection, the
+  two transitions, each block's norm and bias projection - so where the pair and the biases do not fit (`roomFor`,
+  or `LOCALFOLD_BIG=1`) each chunk of rows goes through all of them and into every block's bias at once. **3,952
+  tokens folds** (183 s, pLDDT 64.5, 27.3 GB at the preparation); every input that fitted before takes the old path,
+  byte-identical (and at 6MRR and 5CAJ the streamed one is too: one chunk). The next limit is the recycle's own
+  state - `z`, the injection and the language model's pair are 256-channel f32 pairs (25 GB each at 4,940) - so
+  ESMFold2 stops near 4,000 tokens on 40 GB, where the AlphaFold 3 lineage now folds 7,900.
 - **Two blocks an SM again (2026-10-08).** `transitionUpK` was written for two 67.6 KB blocks an SM, and the
   wave-sized chunking assumes it - but it had grown to 160 registers, so the REGISTERS held it to one
   (Nsight Compute: occupancy 12.5%, the tensor pipe 48%), and nothing said so. `__launch_bounds__(256, 2)`

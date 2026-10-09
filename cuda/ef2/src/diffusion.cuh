@@ -154,6 +154,18 @@ __global__ void pairToHeadsK(const float* pb, B* out, size_t P, int Hh) {   // [
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < P * Hh) out[(t % Hh) * P + t / Hh] = (B)pb[t];
 }
+// a chunk of pairs [p0, p0 + n) of [P, H] laid into a block's bias: the flash layout's rows, or [H, P]
+template <class B>
+__global__ void pairRowsToHeadsK(const float* pb, B* out, size_t p0, size_t n, size_t P, int Hh) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n * Hh) out[(t % Hh) * P + p0 + t / Hh] = (B)pb[t];
+}
+__global__ void pairRowsToFlashBiasK(const float* pb, half* out, size_t p0, size_t n, int T, int Hh, int stride) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n * Hh) return;
+  int h = (int)(t % Hh); size_t p = p0 + t / Hh; int i = (int)(p / T), j = (int)(p % T);
+  out[((size_t)h * T + i) * stride + j] = __float2half(pb[t] * 1.4426950408889634f);
+}
 // [T * T, H] -> the flash kernel's [H, T, stride] f16, log2(e)-scaled (the padding columns stay as cleared)
 __global__ void pairToFlashBiasK(const float* pb, half* out, int T, int Hh, int stride) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -212,6 +224,47 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   // row chunks of 64 MB: neither [z | rel_pos] nor a normalised copy of the pair is ever whole
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (8 * (size_t)Cz));
   float* joined = scratch<float>("dc.joined", chunk * 2 * Cz);
+  d.biasHalf = FAST;
+  int D = d.Ct / d.heads;
+  d.flashBias = FAST && TOKEN_FLASH && (D == 16 || D == 32 || D == 48 || D == 64);
+  d.stride = (T + 7) / 8 * 8;
+  // 🔴 STREAMED where the conditioning pair does not fit: every step below is row-wise - [z | rel_pos], its norm, the
+  // projection, the two transitions, each block's norm and bias projection - so each chunk of rows goes through all of
+  // them and into every block's bias at once, and the f32 pair [P, Cz] (16 GB at 3,952 tokens, where ESMFold2 ran out)
+  // never exists. Elsewhere the whole-pair path below, unchanged (its GEMMs chunked as before: the streamed one's
+  // transitions see other chunk boundaries, so it rounds differently)
+  // (the question includes every block's bias, which both paths allocate: asked without them, 3,952 tokens took the
+  // whole-pair path and ran out allocating the biases beside the 16 GB pair)
+  const size_t biasBytes = (size_t)d.tokenBlocks * d.heads * (d.flashBias ? (size_t)T * d.stride : P) * (d.biasHalf ? 2 : 4);
+  if (BIG_FORCED || !roomFor(P * Cz * 4 + P * d.heads * 4 + biasBytes)) {
+    if (check) { fprintf(stderr, "the oracle check wants the whole conditioning pair\n"); exit(1); }
+    for (int b = 0; b < d.tokenBlocks; ++b) {
+      if (d.flashBias) {
+        half* h = dallocT<half>((size_t)d.heads * T * d.stride);
+        CK(cudaMemsetAsync(h, 0, (size_t)d.heads * T * d.stride * 2, STREAM));
+        d.biases.push_back(h);
+      } else if (d.biasHalf) d.biases.push_back(dallocT<half>(P * d.heads));
+      else d.biases.push_back(dalloc(P * d.heads));
+    }
+    float* rows = scratch<float>("dc.rows", chunk * Cz);
+    float* pn = scratch<float>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pbRows", chunk * d.heads);
+    for (size_t p0 = 0; p0 < P; p0 += chunk) {
+      size_t n = std::min(chunk, P - p0);
+      joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz);
+      layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
+      gemm(joined, F("diffusion/zProjection"), rows, n, 2 * Cz, Cz);
+      for (int l = 0; l < 2; ++l) transitionLayer(rows, n, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
+      for (int b = 0; b < d.tokenBlocks; ++b) {
+        std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
+        layerNorm(rows, pn, n, Cz, F(B + "pairNormScale"), F(B + "pairNormOffset"));
+        gemm(pn, F(B + "pairBiasWeights"), pb, n, Cz, d.heads);
+        if (d.flashBias) pairRowsToFlashBiasK<<<blocks(n * d.heads), 256, 0, STREAM>>>(pb, (half*)d.biases[b], p0, n, T, d.heads, d.stride);
+        else if (d.biasHalf) pairRowsToHeadsK<half><<<blocks(n * d.heads), 256, 0, STREAM>>>(pb, (half*)d.biases[b], p0, n, P, d.heads);
+        else pairRowsToHeadsK<float><<<blocks(n * d.heads), 256, 0, STREAM>>>(pb, (float*)d.biases[b], p0, n, P, d.heads);
+      }
+    }
+    releaseScratch({ "dc.joined", "dc.rows", "dc.pn", "dc.pbRows", "dtr." });
+  } else {
   float* pair = scratch<float>("dc.pair", P * Cz);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
     size_t n = std::min(chunk, P - p0);
@@ -221,10 +274,6 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   }
   for (int l = 0; l < 2; ++l) transitionLayer(pair, P, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
   if (check) checkOracle("diffusion conditioning pair", pair, P * Cz, "o/cond/pair");
-  d.biasHalf = FAST;
-  int D = d.Ct / d.heads;
-  d.flashBias = FAST && TOKEN_FLASH && (D == 16 || D == 32 || D == 48 || D == 64);
-  d.stride = (T + 7) / 8 * 8;
   float* pn = scratch<float>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pb", P * d.heads);
   for (int b = 0; b < d.tokenBlocks; ++b) {
     std::string B = "diffusion/tokenBlocks/" + std::to_string(b) + "/attention/";
@@ -244,6 +293,7 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
     d.biases.push_back(bias);
   }
   if ((size_t)P * Cz * 4 > ((size_t)128 << 20)) releaseScratch();     // the joined and projected pairs (a large input)
+  }
   d.atoms = prepareAtoms(A, "diffusionAtomEncoder");
   int Ct = d.Ct, nb = d.tokenBlocks;
   d.entries = 6 * nb;
