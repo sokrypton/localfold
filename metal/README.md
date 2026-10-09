@@ -1,6 +1,6 @@
 # LocalFold on Metal
 
-The Apple-native port: **AlphaFold 3's lineage (seven models), AlphaFold 2 (monomer and multimer, models 1-5) and
+The Apple-native port: **AlphaFold 3's lineage (all eight models, chai-1 with its ESM2 3B), AlphaFold 2 (monomer and multimer, models 1-5) and
 ESMFold2, written for Metal** - no CUDA translation, no patches. Each port reads the same featurised input as
 `cuda/<port>` (`cuda/featurise`, linked in) and the same published weights, and folds to the same structures; the
 arithmetic is chosen for Apple's GPUs (8 x 8 simdgroup matrices, unified memory, no integer divider).
@@ -46,7 +46,7 @@ The CUDA gates' cases, scored against crystals, with this Mac's baseline in `met
 (0.05 A and 0.5 pLDDT) and the A100's printed beside each case:
 
 ```
-python3 metal/af3/gate.py [--write] [--only=<case or model>]   # 14: seven models, ligand + phosphoserine, DNA,
+python3 metal/af3/gate.py [--write] [--only=<case or model>]   # 16: eight models, ligand + phosphoserine, DNA,
 python3 metal/af2/gate.py [--write]                             #   methylated DNA, kitchen sink, glycan, templates
 python3 metal/ef2/gate.py [--write]                             # AF2 5, ESMFold2 8
 ```
@@ -61,12 +61,14 @@ On an M2 (10-core GPU), 2026-10-09: every case passes. Against the CUDA-translat
 | AF3 5CAJ / 1BRS self-template | 0.205 / 0.457 A | 0.205 / 0.454 |
 | AF2 6MRR / 5CAJ + template / 1BRS multimer + template | 1.899 / 0.216 / 0.272 A | 1.900 / 0.216 / 0.272 |
 | ESMFold2 6MRR / 1QYS / 5CAJ / 1BRS | 1.353 / 0.865 / 2.105 / 0.912 A | 1.362 / 0.865 / 2.104 / 0.911 |
+| chai-1 6MRR / + GOL and SEP@3 (ligand bonds) | 0.976 / 1.744 A (0.075) | 1.020 / 1.733 (0.077) |
 
 The AF3 trunk's pair after one pass agreed with the translated port's at relRMS 8.5e-4 (single 5.6e-4) on the first
 build. `LOCALFOLD_SAVE_SEAMS=<dir>` writes AF3's stage outputs as `.f32` files for exactly that kind of comparison.
 
-Not ported: chai-1 (its token features need ESM2 3B, which was not on this machine to check against), and ESMFold2's
-released-model extras (the parcae recycle and the MSA encoder). Each refuses by name.
+chai-1's ESM2 3B tower (`metal/af3/esm2.mm`) keeps its int8 matrices resident as their codes, read where they lie in
+the mapped blob and expanded to half a GEMM at a time: the whole chai-1 fold peaks at 1.4 GB. Not ported: ESMFold2's
+released-model extras (the parcae recycle and the MSA encoder), which nothing serves; each refuses by name.
 
 ## How fast
 
@@ -108,10 +110,17 @@ What was tried and **lost**, so nobody repeats it blind:
 
 ## Memory
 
-Every weight held once, in the precision it is used in: large tensors decoded straight to float16 at load (no float32
-copy is made of them; one is built on demand where a kernel reads float, and cached), the rest float32. AF3's int5
-bundle is ~1.2 GB on the device. Scratch buffers are named and grown as asked; each stage gives its own back when it
-is done.
+Every weight held once, in the precision it is used in: large tensors decoded straight to float16 at load (never
+through a float32 copy), the rest float32. A weight read only through a derived form - a triangle's interleaved
+projection and gate, an attention's q|k|v|g, a SwiGLU interleaving, the token transformer's folded conditioning - gets
+its own allocation at load, the derived form is built up front (`metal/af3/weights.mm`) and the source given back
+(`Model::retire`). ESMFold2 gives its language model back once it has run (not under `--serve`) and interleaves its
+tower's weights in place. Scratch buffers are named and grown as asked; each stage gives its own back when it is done.
+
+| peak | before | now |
+|---|---|---|
+| AF3 6MRR: allocation / process footprint | 2.21 / 2.28 GB | 0.85 / 1.14 GB |
+| ESMFold2 5CAJ: allocation / footprint | 2.90 / 2.92 GB | 1.70 / 2.23 GB |
 
 ## Traps, each paid for
 
@@ -143,5 +152,5 @@ uses more registers): no error, the output untouched.
 1. The skinny GEMMs (a single sample's diffusion): weights read at ~25 GB/s where the M2 has ~100.
 2. Fusions the CUDA port has: the gated residual into the next adaptive LayerNorm, the trunk's transition and
    triangle kernels.
-3. chai-1 and ESMFold2's released-model extras.
+3. An int8-weight GEMM for ESM2 3B (its matrices are expanded to half a GEMM at a time).
 4. An M5: its GPU's matrix hardware through Metal 4's tensor APIs.

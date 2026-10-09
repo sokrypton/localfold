@@ -561,7 +561,11 @@ kernel void af3_conf_bin(LF_ARGS(ConfBinArgs)) {
   float sq = 0.f;
   for (int k = 0; k < 3; ++k) { float d = a.beta[i * 3 + k] - a.beta[j * 3 + k]; sq += d * d; }
   int bin = -1;
-  if (a.caBins) {       // rf3's: how many of `bins - 1` evenly spaced bounds the distance is past
+  if (a.chaiBins) {     // chai-1's: 16 bins, how many of 15 evenly spaced bounds from 3.375 to 21.375 the distance is past
+    float distance = sqrt(sq + 1e-10f);
+    bin = 0;
+    for (uint at = 0; at < a.bins - 1; ++at) bin += distance > 3.375f + at * (18.f / (a.bins - 2));
+  } else if (a.caBins) {       // rf3's: how many of `bins - 1` evenly spaced bounds the distance is past
     float distance = sqrt(sq + 1e-10f);
     bin = 0;
     for (uint at = 0; at < a.bins - 1; ++at) if (distance > a.dmin + at * ((a.dmax - a.dmin) / (a.bins - 1))) ++bin;
@@ -580,7 +584,7 @@ kernel void af3_conf_pair_init(LF_ARGS(ConfPairInitArgs)) {
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
   float v = a.left[j * a.C + c] + a.right[i * a.C + c];
   int bin = a.bin[ij];
-  if (bin >= 0) v += a.Wd[bin * a.C + c] * a.pairMask[ij];
+  if (bin >= 0) v += a.Wd[bin * a.C + c] * (a.unmasked ? 1.f : a.pairMask[ij]);
   if (!a.caBins && a.Wdist) v += sqrt(a.sq[ij] + 1e-10f) * a.Wdist[c];
   a.pair[t] += v;
 }
@@ -872,4 +876,163 @@ kernel void af3_slot_major(LF_ARGS(SlotMajorArgs)) {
   if (t >= (ulong)a.slots * a.C * a.bins) return;
   uint b = (uint)(t % a.bins); ulong r = t / a.bins; uint c = (uint)(r % a.C), slot = (uint)(r / a.C);
   a.out[(ulong)c * a.slots * a.bins + slot * a.bins + b] = (half)a.w[t];
+}
+
+// ---------------------------------------------------------------- ESM2 3B
+kernel void af3_expand8(LF_ARGS(Expand8Args)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.rows * a.out) return;
+  uint row = lf_udiv((uint)t, a.out), col = (uint)t - row * a.out;
+  device const uchar* s = a.scales + 4 * ((ulong)lf_udiv(row, a.g) * a.out + col);
+  float scale = as_type<float>((uint)s[0] | ((uint)s[1] << 8) | ((uint)s[2] << 16) | ((uint)s[3] << 24));
+  a.w[(ulong)row * a.ld + a.col0 + col] = (half)((float)(char)a.codes[t] * scale);
+}
+kernel void af3_esm_embed(LF_ARGS(EsmEmbedArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.rows * a.C) return;
+  uint r = lf_udiv((uint)t, a.C), c = (uint)t - r * a.C;
+  a.x[t] = a.table[(ulong)a.ids[r] * a.C + c] * a.scale;
+}
+kernel void af3_esm_pack(LF_ARGS(EsmPackArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.rows * a.C) return;
+  uint r = lf_udiv((uint)t, a.C), c = (uint)t - r * a.C, d = c & 63;
+  device const float* row = a.qkv + (ulong)r * 3 * a.C;
+  device half* out = a.qkvg + (ulong)r * 4 * a.C;
+  for (int which = 0; which < 2; ++which) {       // q and k: rotated
+    float x = row[which * a.C + c], y;
+    float co = a.cosT[r * 32 + (d & 31)], si = a.sinT[r * 32 + (d & 31)];
+    if (d < 32) { y = row[which * a.C + c + 32]; out[which * a.C + c] = (half)(x * co - y * si); }
+    else { y = row[which * a.C + c - 32]; out[which * a.C + c] = (half)(y * si + x * co); }
+  }
+  out[2 * a.C + c] = (half)row[2 * a.C + c];
+  out[3 * a.C + c] = (half)30.f;                  // (sigmoid(30) is 1 to within 1e-13: no gate)
+}
+kernel void af3_gather_esm(LF_ARGS(GatherEsmArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.tokens * a.E) return;
+  uint token = lf_udiv((uint)t, a.E), e = (uint)t - token * a.E;
+  int r = a.tokenRow[token];
+  a.out[t] = r < 0 ? 0.f : a.rows[(ulong)r * a.E + e];
+}
+
+// ---------------------------------------------------------------- chai-1
+kernel void af3_chai_relenc(LF_ARGS(ChaiRelEncArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.n * a.n * a.C) return;
+  uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+  bool sameChain = a.r.asym[i] == a.r.asym[j];
+  int rss = sameChain ? clamp(a.r.ri[i] - a.r.ri[j] + 33, 0, 65) : 66;
+  int rts = sameChain && a.r.ri[i] == a.r.ri[j] ? clamp(a.r.ti[i] - a.r.ti[j] + 32, 0, 65) : 66;
+  a.pair[t] += a.bias[c] + a.W[rss * a.C + c] + a.W[(67 + rts) * a.C + c];
+}
+kernel void af3_chai_msa_embed(LF_ARGS(ChaiMsaEmbedArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.count * a.C) return;
+  uint row = lf_udiv((uint)t, a.C), c = (uint)t - row * a.C, s = lf_udiv(row, a.n), token = row - s * a.n;
+  int first = -1; bool paired = false;           // (the row covers tokens of more than one chain)
+  for (uint k = 0; k < a.n && !paired; ++k)
+    if (a.msaMask[s * a.n + k] != 0.f) { if (first < 0) first = a.asym[k]; else if (a.asym[k] != first) paired = true; }
+  float d = a.del[row];
+  int code = a.rows[row];
+  if (a.isLigand && a.isLigand[token]) code = s == 0 ? 20 : 31;      // (chai's query row: unknown, the rest: its mask class)
+  float v = a.bias[c] + (paired ? a.W[c] : 0.f) + a.W[(1 + (s == 0 ? 4 : 2)) * a.C + c] +
+            atan(d / 3.f) * (2.f / M_PI_F) * a.W[7 * a.C + c] + clamp(d, 0.f, 1.f) * a.W[8 * a.C + c] +
+            (code >= 0 && code < 32 ? a.W[(9 + code) * a.C + c] : 0.f);
+  a.msa[t] = v + a.fromSingle[token * a.C + c];
+}
+kernel void af3_group_major(LF_ARGS(GroupMajorArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.S * a.n * a.G * a.K) return;
+  uint k = (uint)(t % a.K); ulong r = t / a.K; uint i = (uint)(r % a.n); r /= a.n; uint s = (uint)(r % a.S), g = (uint)(r / a.S);
+  a.out[t] = a.x[(((ulong)s * a.n + i) * a.G + g) * a.K + k];
+}
+kernel void af3_grouped_permute(LF_ARGS(GroupedPermuteArgs)) {
+  ulong t = LF_INDEX;
+  ulong per = (ulong)a.G * a.K * a.K;
+  if (t >= (ulong)a.bi * a.n * per) return;
+  uint l = (uint)(t % a.K); ulong r = t / a.K; uint k = (uint)(r % a.K); r /= a.K; uint g = (uint)(r % a.G); r /= a.G;
+  uint j = (uint)(r % a.n), i = (uint)(r / a.n);
+  a.out[t] = a.P[(ulong)g * ((ulong)a.bi * a.K * a.n * a.K) + (((ulong)i * a.K + k) * a.n + j) * a.K + l];
+}
+kernel void af3_scale_h(LF_ARGS(ScaleHArgs)) {
+  ulong t = LF_INDEX;
+  if (t < a.n) a.y[t] = a.s * (float)a.x[t];
+}
+kernel void af3_chai_atom_pair(LF_ARGS(ChaiAtomPairArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.subsets * a.queries * a.keys * a.Cp) return;
+  ulong rest = t / a.Cp; uint c = (uint)(t - rest * a.Cp);
+  uint key = (uint)(rest % a.keys); ulong qi = rest / a.keys;
+  uint s = (uint)(qi / a.queries);
+  ulong ki = (ulong)s * a.keys + key;
+  float v = a.row[qi * a.Cp + c] + a.col[ki * a.Cp + c];
+  if (a.tp && a.tqMask[qi] != 0.f && a.tkMask[ki] != 0.f) v += a.tp[((ulong)a.tqIdx[qi] * a.tokens + a.tkIdx[ki]) * a.Cp + c];
+  bool valid = a.qUid[qi] == a.kUid[ki];
+  float d0 = a.qPos[qi * 3] - a.kPos[ki * 3], d1 = a.qPos[qi * 3 + 1] - a.kPos[ki * 3 + 1], d2 = a.qPos[qi * 3 + 2] - a.kPos[ki * 3 + 2];
+  float sq = d0 * d0 + d1 * d1 + d2 * d2;
+  const float edges[10] = {0.f, 1.f, 4.f, 9.f, 16.f, 25.f, 36.f, 64.f, 144.f, 256.f};
+  int idx = 0;
+  for (int e = 0; e < 10; ++e) idx += sq > edges[e];
+  if (!valid) idx = 11;
+  v += a.bf[c] + a.Wf[idx * a.Cp + c] + a.Wf[12 * a.Cp + c] / (1.f + sq) + (valid ? a.Wf[13 * a.Cp + c] : 0.f);
+  a.pair[t] = v;
+}
+kernel void af3_same_ref_mask(LF_ARGS(SameRefMaskArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.subsets * a.heads * a.queries * a.keys) return;
+  uint key = (uint)(t % a.keys); ulong rest = t / a.keys; uint q = (uint)(rest % a.queries); rest /= a.queries;
+  uint s = (uint)(rest / a.heads);
+  ulong qi = (ulong)s * a.queries + q, ki = (ulong)s * a.keys + key;
+  if (!(a.tqMask[qi] != 0.f && a.tkMask[ki] != 0.f && a.qUid[qi] == a.kUid[ki])) a.pl[t] = -1e9f;
+}
+kernel void af3_add_const(LF_ARGS(AddConstArgs)) {
+  ulong t = LF_INDEX;
+  if (t < a.n) a.x[t] += a.v;
+}
+kernel void af3_chai_token_feat(LF_ARGS(ChaiTokenFeatArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.tokens * a.C) return;
+  uint token = lf_udiv((uint)t, a.C), c = (uint)t - token * a.C;
+  int aa = a.aatype[token];
+  float v = a.bt[c] + (aa >= 0 && aa < 31 ? a.Wt[aa * a.C + c] : 0.f);
+  for (int k = 0; k < 31; ++k) v += a.profile[token * 31 + k] * a.Wp[k * a.C + c];
+  v += a.delMean[token] * a.Wp[31 * a.C + c];
+  a.out[t] = v;
+}
+kernel void af3_chai_struct_pair(LF_ARGS(ChaiStructPairArgs)) {
+  uint width = a.Czt + a.Cz;
+  ulong t = LF_INDEX;
+  if (t >= a.rows * width) return;
+  ulong row = t / width; uint c = (uint)(t - row * width);
+  ulong ij = a.p0 + row;
+  if (c < a.Czt) { a.out[t] = a.trunkPair[ij * a.Czt + c]; return; }
+  c -= a.Czt;
+  uint i = (uint)(ij / a.n), j = (uint)(ij - (ulong)i * a.n);
+  bool sameChain = a.asym[i] == a.asym[j];
+  int rss = sameChain ? clamp(a.ri[i] - a.ri[j] + 33, 0, 65) : 66;
+  int rts = sameChain && a.ri[i] == a.ri[j] ? clamp(a.ti[i] - a.ti[j] + 32, 0, 65) : 66;
+  int relEntity = a.entityRank[i] - a.entityRank[j];
+  int rchain = relEntity != 0 ? 5 : clamp(a.symRank[i] - a.symRank[j] + 2, 0, 4);
+  int rent = clamp(relEntity + 1, 0, 2);
+  float v = a.bias[c] + a.Wp[5 * a.Cz + c] + a.Wp[155 * a.Cz + c] + a.Wp[162 * a.Cz + c] + a.Wp[(6 + rchain) * a.Cz + c] +
+            a.Wp[(12 + rent) * a.Cz + c] + a.Wp[(15 + rss) * a.Cz + c] + a.Wp[(82 + rts) * a.Cz + c];
+  if (a.bonds) v += a.bonds[ij] * a.Wb[c];
+  a.out[t] = v;
+}
+kernel void af3_chai_euler(LF_ARGS(ChaiEulerArgs)) {
+  ulong i = LF_INDEX;
+  if (i >= a.n) return;
+  float g = (a.noisy[i] - a.d1[i]) / a.tHat;
+  a.g1[i] = g; a.x[i] = a.noisy[i] + a.dt * g;
+}
+kernel void af3_chai_correct(LF_ARGS(ChaiCorrectArgs)) {
+  ulong i = LF_INDEX;
+  if (i < a.n) a.x[i] += a.dt * ((a.x[i] - a.d2[i]) / a.level + a.g1[i]) * 0.5f;
+}
+kernel void af3_plddt37(LF_ARGS(Plddt37Args)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.n * a.dense * a.bins) return;
+  uint b = (uint)(t % a.bins); ulong slot = t / a.bins; ulong token = slot / a.dense;
+  a.out[t] = a.p37[(token * 37 + a.idx[slot]) * a.bins + b];
 }

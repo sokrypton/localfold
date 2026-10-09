@@ -99,6 +99,8 @@ static void templateEmbedding(Trunk& t) {
     if (outer) add(act, before, pairs * Ct);
     float* actn = scratch<float>("tmpl.actn", pairs * Ct);
     ln(act, actn, pairs, Ct, P + "outputLayerNormScale", P + "outputLayerNormOffset");
+    if (flag("trunk.dialect.chaiTemplates") && M.has(S + "pseudoBetaMask2d"))      // chai: masked by its own coverage
+      scaleRows(actn, M.f(S + "pseudoBetaMask2d"), pairs, Ct, pairs);
     add(summed, actn, pairs * Ct, repeat);
   }
   scale(summed, pairs * Ct, 1.f / (1e-7f + templates), true);     // divided by every slot (not the real ones), relu
@@ -110,7 +112,6 @@ static void templateEmbedding(Trunk& t) {
 static void embed(Trunk& t) {
   int n = t.n, C = t.C; size_t pairs = (size_t)n * n;
   const std::string E = "trunk.embedder.";
-  if (flag("trunk.dialect.recycleFromInit") || flag("trunk.dialect.chaiMsaFeatures")) die("chai-1 is not in the native port yet");
   float* left = scratch<float>("emb.left", (size_t)n * C); float* right = scratch<float>("emb.right", (size_t)n * C);
   const float* pairSource = t.targetFeat; int sourceWidth = t.F;
   if (flag("trunk.dialect.pairInitFromSingle")) {        // OpenDDE: the pair from s_init
@@ -120,15 +121,27 @@ static void embed(Trunk& t) {
   }
   lin(pairSource, E + "leftSingle", left, n, sourceWidth, C);
   lin(pairSource, E + "rightSingle", right, n, sourceWidth, C);
-  // pair = left[i] + right[j] + prevEmbedding(LN(prev pair)) - not zero on the first pass
+  // pair = left[i] + right[j] + prevEmbedding(LN(prev pair)) - not zero on the first pass. chai-1's first pass recycles
+  // z_init itself (left + right + its relative encoding)
+  const bool chai = flag("trunk.dialect.recycleFromInit");
+  auto chaiRelEnc = [&]() {
+    run1d("af3_chai_relenc", pairs * C, ChaiRelEncArgs{relIdx(), W(E + "positionActivations"), W(E + "positionActivationsBias"), t.pair,
+                                                       (uint)n, (uint)C});
+  };
   float* prev = scratch<float>("emb.prev", pairs * C);
-  {
-    half* pn = scratch<half>("emb.prevln", pairs * C);
+  half* pn = scratch<half>("emb.prevln", pairs * C);
+  if (chai && t.pass == 0) {
+    run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, nullptr, t.pair, (uint)n, (uint)C});
+    chaiRelEnc();
+    ln(t.pair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
+    lin(pn, E + "prevEmbedding", t.pair, pairs, C, C, 1.f);
+  } else {
     ln(t.prevPair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     lin(pn, E + "prevEmbedding", prev, pairs, C, C);
+    run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, prev, t.pair, (uint)n, (uint)C});
   }
-  run1d("af3_outer_sum", pairs * C, OuterSumArgs{left, right, prev, t.pair, (uint)n, (uint)C});
-  run1d("af3_relenc", pairs * C, RelEncArgs{relIdx(), W(E + "positionActivations"), t.pair, (uint)n, (uint)C});
+  if (chai) { if (t.pass > 0) chaiRelEnc(); }      // (the first pass added it before the recycle term)
+  else run1d("af3_relenc", pairs * C, RelEncArgs{relIdx(), W(E + "positionActivations"), t.pair, (uint)n, (uint)C});
   const bool bonds = M.has("batch.bondMatrix") && hasW(E + "bondEmbedding"), types = hasW(E + "tokenBondsTypeEmbed");
   if (bonds || types)
     run1d("af3_bond_embed", pairs * C,
@@ -140,6 +153,25 @@ static void embed(Trunk& t) {
   if (t.pass == 0) seam("z_init_generic", t.pair, pairs * C);
   templateEmbedding(t);
   if (t.pass == 0) seam("z_after_template", t.pair, pairs * C);
+  auto buildSingle = [&]() {      // the single: target_feat projected, plus the recycled single's (chai's first: s_init's)
+    lin(t.targetFeat, E + "singleActivations", t.single, n, t.F, t.Cs);
+    half* sln = scratch<half>("emb.prevsln", (size_t)n * t.Cs);
+    ln(chai && t.pass == 0 ? t.single : t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale", E + "prevSingleEmbeddingNormOffset");
+    lin(sln, E + "prevSingleEmbedding", t.single, n, t.Cs, t.Cs, 1.f);
+  };
+  if (flag("trunk.dialect.chaiMsaFeatures")) {
+    // chai-1: the single first, then the MSA's 41 features through a biased linear plus the single's projection
+    buildSingle();
+    float* fromSingle = scratch<float>("emb.fromTarget", (size_t)n * t.Cm);
+    lin(t.single, E + "extraMsaTargetFeat", fromSingle, n, t.Cs, t.Cm);
+    size_t rows = (size_t)t.S * n;
+    if (lenW(E + "msaActivations") != (size_t)41 * t.Cm) die("chai's msa features are not 41 wide");
+    run1d("af3_chai_msa_embed", rows * t.Cm,
+          ChaiMsaEmbedArgs{t.msaRows, t.deletion, t.msaMask, M.i("batch.features.asymId"), M.has("batch.isLigand") ? M.i("batch.isLigand") : nullptr,
+                           W(E + "msaActivations"), W(E + "msaActivationsBias"), fromSingle, t.msa, rows, (uint)n, (uint)t.Cm});
+    ++t.pass;
+    return;
+  }
   // the MSA: its features projected, plus the target's projection broadcast over the rows
   float* fromTarget = scratch<float>("emb.fromTarget", (size_t)n * t.Cm);
   lin(t.targetFeat, E + "extraMsaTargetFeat", fromTarget, n, t.F, t.Cm);
@@ -148,11 +180,7 @@ static void embed(Trunk& t) {
   if (msaWidth != 34 && msaWidth != 35) die("msa feature width %d", msaWidth);
   run1d("af3_msa_embed", rows * t.Cm, MsaEmbedArgs{t.msaRows, t.deletion, W(E + "msaActivations"), fromTarget, t.msa, rows, (uint)n,
                                                    (uint)t.Cm, (uint)msaWidth, flag("trunk.dialect.msaPairedQueryRow") ? 1u : 0u});
-  // the single: target_feat projected, plus the recycled single's
-  lin(t.targetFeat, E + "singleActivations", t.single, n, t.F, t.Cs);
-  half* sln = scratch<half>("emb.prevsln", (size_t)n * t.Cs);
-  ln(t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale", E + "prevSingleEmbeddingNormOffset");
-  lin(sln, E + "prevSingleEmbedding", t.single, n, t.Cs, t.Cs, 1.f);
+  buildSingle();
   ++t.pass;
 }
 
@@ -161,7 +189,6 @@ static void embed(Trunk& t) {
 static void outerProductMean(Trunk& t, const std::string& pre) {
   int L = t.n, S = t.S, Cm = t.Cm, C = t.C;
   int O = metaI(pre + ".outerChannels");
-  if (M.has(pre + ".groups")) die("chai-1's grouped outer product is not in the native port yet");
   size_t rows = (size_t)S * L;
   half* xn = scratch<half>("opm.xn", rows * Cm);
   ln(t.msa, xn, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
@@ -221,12 +248,16 @@ static void msaAttention(Trunk& t, const std::string& pre) {
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
   lin(pln, pre + ".pairLogits", flat, pairs, C, heads);
   float* keyMask = scratch<float>("msaatt.keymask", n);
-  run1d("af3_key_mask", n, KeyMaskArgs{t.msaMask, keyMask, (uint)S, (uint)n});
+  // chai: the logits masked by the TOKEN mask, not by the alignment's coverage; the values zeroed instead
+  const bool chaiMask = flag("trunk.dialect.chaiMsaFeatures");
+  if (chaiMask) copy(keyMask, t.seqMask, (size_t)n * 4);
+  else run1d("af3_key_mask", n, KeyMaskArgs{t.msaMask, keyMask, (uint)S, (uint)n});
   int ldw = (n + 7) / 8 * 8;
   half* w = scratch<half>("msaatt.w", (size_t)heads * n * ldw);
   run("af3_msa_weights", Grid{(uint32_t)(heads * n), 1, 1}, 256, MsaWeightsArgs{flat, keyMask, w, (uint)n, (uint)heads, (uint)ldw, 0});
   half* v = scratch<half>("msaatt.v", rows * Wd);
   linH(xn, pre + ".vProjection", v, rows, Cm, Wd);
+  if (chaiMask) run1d("af3_scale_rows_h", rows * Wd, ScaleRowsHArgs{v, t.msaMask, rows, (uint)Wd, 0});
   half* vh = scratch<half>("msaatt.vh", (size_t)S * ldw * Wd);
   run1d("af3_msa_v_heads", (size_t)S * ldw * Wd, MsaVHeadsArgs{v, vh, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
   // per head: O_h [n][S d] = W_h [n][ldw] V_h [ldw][S d]
@@ -239,8 +270,55 @@ static void msaAttention(Trunk& t, const std::string& pre) {
   run1d("af3_msa_from_heads", rows * Wd, MsaFromHeadsArgs{oh, gate, gated, (uint)S, (uint)n, (uint)heads, (uint)d});
   lin(gated, pre + ".outputProjection", t.msa, rows, Wd, Cm, 1.f);
 }
+// chai-1's GROUPED outer product: L, R = LN(m) Wl, Wr reshaped [S][n][G][K], masked; P[i,j,g,k,l] = sum_s L[s,i,g,k]
+// R[s,j,g,l] - NOT divided by any count; P = LN(P; eps 0.1) over its G K K; pair += P Wout + b. float32 throughout: the
+// sum grows with the alignment's depth before the norm
+static void linF(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr) {
+  if (lenW(w) != (size_t)in * out) die("%s has %zu elements, not %d x %d", w.c_str(), lenW(w), in, out);
+  Gemm g{}; g.X = X; g.W = W(w); g.Y = Y; g.rows = rows; g.in = in; g.out = out; g.bias = bias; g.label = w.c_str();
+  gemm(g);
+}
+static void groupedOuterProduct(Trunk& t, const std::string& pre) {
+  int n = t.n, S = t.S, Cm = t.Cm, C = t.C;
+  int O = metaI(pre + ".outerChannels"), G = metaI(pre + ".groups"), K = O / G, per = G * K * K;
+  size_t rows = (size_t)S * n;
+  float* lnM = scratch<float>("gopm.ln", rows * Cm);
+  ln(t.msa, lnM, rows, Cm, pre + ".layerNormInputScale", pre + ".layerNormInputOffset");
+  float* L = scratch<float>("gopm.left", rows * O); float* R = scratch<float>("gopm.right", rows * O);
+  linF(lnM, pre + ".leftProjection", L, rows, Cm, O);
+  linF(lnM, pre + ".rightProjection", R, rows, Cm, O);
+  scaleRows(L, t.msaMask, rows, O, rows);
+  scaleRows(R, t.msaMask, rows, O, rows);
+  float* Lg = scratch<float>("gopm.lg", rows * O); float* Rg = scratch<float>("gopm.rg", rows * O);
+  run1d("af3_group_major", rows * O, GroupMajorArgs{L, Lg, (uint)S, (uint)n, (uint)G, (uint)K});
+  run1d("af3_group_major", rows * O, GroupMajorArgs{R, Rg, (uint)S, (uint)n, (uint)G, (uint)K});
+  int Bi = (int)std::max<size_t>(1, std::min<size_t>(n, ((size_t)16 << 20) / ((size_t)n * per * 2 + (size_t)n * C)));
+  float* Pm = scratch<float>("gopm.P", (size_t)Bi * n * per); float* Pp = scratch<float>("gopm.Pp", (size_t)Bi * n * per);
+  float* Pn = scratch<float>("gopm.Pn", (size_t)Bi * n * per);
+  float* X = scratch<float>("gopm.X", (size_t)Bi * n * C);
+  for (int i0 = 0; i0 < n; i0 += Bi) {
+    int bi = std::min(Bi, n - i0);
+    // per group: P_g [(i, k)][(j, l)] = sum_s Lg[s][(i, k)] Rg[s][(j, l)]
+    { Gemm g{}; g.X = Lg + (size_t)i0 * K; g.transX = true; g.ldx = n * K; g.sx = (int64_t)S * n * K; g.W = Rg; g.ldw = n * K;
+      g.sw = (int64_t)S * n * K; g.Y = Pm; g.sy = (int64_t)bi * K * n * K; g.rows = (size_t)bi * K; g.in = S; g.out = n * K; g.batch = G;
+      g.label = "grouped opm"; gemm(g); }
+    run1d("af3_grouped_permute", (size_t)bi * n * per, GroupedPermuteArgs{Pm, Pp, (uint)bi, (uint)n, (uint)G, (uint)K});
+    layerNorm(Pp, Pn, (size_t)bi * n, per, W(pre + ".productNormScale"), W(pre + ".productNormOffset"), 0.1f);
+    linF(Pn, pre + ".outputW", X, (size_t)bi * n, per, C, W(pre + ".outputB"));
+    add(t.pair + (size_t)i0 * n * C, X, (size_t)bi * n * C);
+  }
+}
 static void msaBlock(Trunk& t, int k) {
   std::string B = "trunk.msaBlocks." + num(k);
+  if (flag("trunk.dialect.groupedOuterProduct")) {
+    // chai-1: z += grouped OPM(m); m += attention(m, z); m += transition(m); then the pair track in two parallel stages
+    groupedOuterProduct(t, B + ".outerProductMean");
+    msaAttention(t, B + ".msaAttention1");
+    transition(t.msa, (size_t)t.S * t.n, t.Cm, B + ".msaTransition");
+    parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "oit");
+    parallelPairUpdates(t.pair, t.masks, t.n, t.C, B, "rc");
+    return;
+  }
   bool updateFirst = flag("trunk.dialect.msaUpdateBeforeOuterProduct");     // (OpenDDE, boltz2)
   if (!updateFirst) outerProductMean(t, B + ".outerProductMean");
   msaAttention(t, B + ".msaAttention1");
@@ -273,7 +351,15 @@ void runTrunk(Trunk& t) {
 // ---------------------------------------------------------------- the distogram
 static void distogramHalf(const float* pair, float* half_, size_t rows, int C, int bins) {
   const std::string D = "trunk.distogram.";
-  if (hasW(D + "hidden")) die("chai-1's distogram head is not in the native port yet");
+  if (hasW(D + "hidden")) {      // chai-1's MLP head: LN, gelu(z W1 + b1), W2 + b2
+    int Hd = (int)lenW(D + "hiddenBias");
+    half* lnP = scratch<half>("disto.ln", rows * C); half* h = scratch<half>("disto.hidden", rows * Hd);
+    ln(pair, lnP, rows, C, D + "inputLayerNormScale", D + "inputLayerNormOffset");
+    Gemm g{}; g.X = lnP; g.tx = F16; g.W = Wh(D + "hidden"); g.tw = F16; g.Y = h; g.ty = F16; g.rows = rows; g.in = C; g.out = Hd;
+    g.bias = W(D + "hiddenBias"); g.gelu = true; g.accFloat = true; gemm(g);
+    lin(h, D + "halfLogits", half_, rows, Hd, bins, 0.f, Wopt(D + "halfLogitsBias"));
+    return;
+  }
   lin(pair, D + "halfLogits", half_, rows, C, bins, 0.f, Wopt(D + "halfLogitsBias"));
 }
 void distogram(Trunk& t, float* logits) {

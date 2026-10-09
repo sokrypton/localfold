@@ -58,11 +58,16 @@ const float* qkvgBias(const std::string& pre, int Wd);
 // ---------------------------------------------------------------- the pair track (pairtrack.mm)
 // pairMask [n * n] (a real buffer; every update reads it), seqMask [n], `ones` every token real (no attention mask)
 struct Masks { const float* pair; const float* seq; bool ones; };
-void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide);
+// (into: where the residual goes, when not the input itself - chai-1's parallel block)
+void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into = nullptr);
 const half* triGateWeight(const std::string& pre, int C);     // the projection and gate as gemmTriGate's one weight
-void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap);
-void transition(float* x, size_t rows, int C, const std::string& pre);
+void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, float* into = nullptr,
+                   bool untransposed = false);
+void transition(float* x, size_t rows, int C, const std::string& pre, float* into = nullptr);
 void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre);
+// chai-1's parallel pair track: every update reads the stage's input and adds into the pair (z = z0 + f1(z0) + ...);
+// `which` a string of updates in order - o, i (the triangles), r, c (the grid attentions), t (the transition)
+void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which);
 void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias = nullptr);
 void pairformerBlock(float* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B,
@@ -89,6 +94,8 @@ std::vector<float> expectedDistances(Trunk& t);      // each pair's predicted di
 
 // ---------------------------------------------------------------- target_feat (atom.mm)
 float* buildTargetFeat();
+extern float* TARGET_FEAT_STRUCTURE;     // chai-1: the diffusion module's own projection of the token features
+float* esmEmbeddings(int tokens, int& E);   // esm2.mm: ESM2 3B over each protein chain, gathered onto the tokens
 
 // ---------------------------------------------------------------- the atoms (atom.mm)
 // Diffusion samples in flight through the denoiser's per-step path: every per-sample tensor is NS copies,
@@ -116,6 +123,8 @@ std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size
                                    const AtomShape& sh);
 AtomBlockCache prepareAtomBlock(const std::string& B, const float* qCond, size_t qRows, int C, float* pairLogits);
 struct AtomStep { Gather queriesToKeys; const float *qMask, *kMask; bool keyMasked, noResidual; };
+// chai-1: a block's logits -1e9 wherever the two atoms are not both real and in one reference space
+void sameRefMask(float* pl, const float* qUid, const float* kUid, int heads, const AtomShape& sh);
 void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh, int C, int heads, int D,
                          const std::string& B);
 // the adaptive LayerNorm: ADA(scale) LN(x) + shift, scale and shift shared every `period` rows

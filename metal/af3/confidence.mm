@@ -2,6 +2,7 @@
 // pairformer blocks, then pLDDT, PAE, PDE and the TM terms (cuda/af3/src/confidence.cuh is the reading).
 #include "af3.h"
 #include <cmath>
+#include <cstring>
 
 // boltz2's re-embedded pair and single (after LN_z and the relative encoding): right[i] + left[j] off the normalised
 // s_inputs, its own distance embedding, the bond terms, and the outer product of two s_inputs projections
@@ -55,7 +56,6 @@ ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta) {
   int n = t.n, C = metaI(P + ".pairChannels"), Cs = metaI(P + ".singleChannels"), F = metaI(P + ".targetFeatWidth");
   int dense = metaI("batch.dense");
   size_t pairs = (size_t)n * n;
-  if (flag("trunk.dialect.chaiConfidence")) die("chai-1's confidence head is not in the native port yet");
   bool caDgram = flag("trunk.dialect.confidenceCaDgram");
   float* pair = scratch<float>("conf.pair", pairs * C);
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
@@ -77,11 +77,12 @@ ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta) {
   lin(tf, P + ".leftTargetFeatProject", left, n, F, C);
   lin(tf, P + ".rightTargetFeatProject", right, n, F, C);
   int bins = (int)(lenW(P + ".distogramFeatProject") / C);
-  if (bins != (caDgram ? 40 : 39)) die("the confidence distogram has %d bins", bins);
+  const bool chai = flag("trunk.dialect.chaiConfidence");     // chai-1's 16-bin distance embedding, unmasked
+  if (bins != (chai ? 16 : caDgram ? 40 : 39)) die("the confidence distogram has %d bins", bins);
   int* binOf = scratch<int>("conf.bin", pairs); float* sqOf = scratch<float>("conf.sq", pairs);
-  run1d("af3_conf_bin", pairs, ConfBinArgs{pseudoBeta, binOf, sqOf, (uint)n, (uint)bins, 3.25f, 50.75f, caDgram ? 1u : 0u, 0});
+  run1d("af3_conf_bin", pairs, ConfBinArgs{pseudoBeta, binOf, sqOf, (uint)n, (uint)bins, 3.25f, 50.75f, caDgram ? 1u : 0u, chai ? 1u : 0u});
   run1d("af3_conf_pair_init", pairs * C, ConfPairInitArgs{pair, left, right, binOf, sqOf, t.pairMask, W(P + ".distogramFeatProject"),
-                                                          Wopt(P + ".distanceFeatProject"), (uint)n, (uint)C, caDgram ? 1u : 0u, 0});
+                                                          Wopt(P + ".distanceFeatProject"), (uint)n, (uint)C, caDgram ? 1u : 0u, chai ? 1u : 0u});
   if (hasW(P + ".inputSingleNormScale")) {     // the trunk single clamped to +-512 and LayerNormed first (protenix2)
     run1d("af3_clamp", (size_t)n * Cs, ClampArgs{single, (u64)n * Cs, 512.f, 0});
     float* sn = scratch<float>("conf.singleNorm", (size_t)n * Cs);
@@ -159,7 +160,28 @@ ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta) {
   if (hasW(P + ".plddtLnScale")) ln(single, sln, n, Cs, P + ".plddtLnScale", P + ".plddtLnOffset");
   else toHalf(single, sln, (size_t)n * Cs);
   float* pl = scratch<float>("conf.plddtLogits", (size_t)n * dense * PB);
-  lin(sln, P + ".plddtLogits", pl, n, Cs, dense * PB);
+  if (flag("trunk.dialect.chaiConfidence")) {
+    // chai-1 predicts pLDDT over the 37 ATOM37 slots and gathers each dense slot's by its atom NAME (no match: slot 0)
+    static const char* ATOM37[37] = {"N", "CA", "C", "CB", "O", "CG", "CG1", "CG2", "OG", "OG1", "SG", "CD", "CD1", "CD2", "ND1", "ND2",
+      "OD1", "OD2", "SD", "CE", "CE1", "CE2", "CE3", "NE", "NE1", "NE2", "OE1", "OE2", "CH2", "NH1", "NH2", "OH", "CZ", "CZ2", "CZ3",
+      "NZ", "OXT"};
+    const int* chars = M.hostI("batch.refAtomNameChars");
+    std::vector<int> idx((size_t)n * dense, 0);
+    for (size_t a = 0; a < idx.size(); ++a)
+      for (int k = 0; k < 37; ++k) {
+        bool same = true;
+        for (int c = 0; c < 4; ++c) {
+          int want = c < (int)strlen(ATOM37[k]) ? ATOM37[k][c] - 32 : 0;
+          if (chars[a * 4 + c] != want) { same = false; break; }
+        }
+        if (same) { idx[a] = k; break; }
+      }
+    int* dIdx = scratch<int>("conf.atom37", idx.size());
+    upload(dIdx, idx.data(), idx.size() * 4);
+    float* p37 = scratch<float>("conf.plddt37", (size_t)n * 37 * PB);
+    lin(sln, P + ".plddtLogits", p37, n, Cs, 37 * PB);
+    run1d("af3_plddt37", (size_t)n * dense * PB, Plddt37Args{p37, dIdx, pl, (uint)n, (uint)dense, (uint)PB, 0});
+  } else lin(sln, P + ".plddtLogits", pl, n, Cs, dense * PB);
   float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);
   run1d("af3_expectation", (size_t)n * dense, ExpectationArgs{pl, plddt, nullptr, dpc, (u64)n * dense, (uint)PB, 0, 100.f, 0});
   out.plddt = download(plddt, (size_t)n * dense);

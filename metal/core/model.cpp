@@ -454,6 +454,34 @@ void decodeAll(std::vector<std::pair<std::string, DecodeEntry>>& entries) {
 }
 }  // namespace
 
+const Model::Int8Matrix& Model::int8(const std::string& name) const {
+  auto it = int8s.find(name);
+  if (it == int8s.end()) die("no resident int8 matrix %s", name.c_str());
+  return it->second;
+}
+void Model::loadBlobResident(const std::string& dir, const std::string& prefix, const std::string& residentPrefix) {
+  std::string blob = findBlob(dir);
+  if (blob.empty()) die("%s is not an af3-any-model blob directory", dir.c_str());
+  std::map<std::string, Src> src = blobSources(blob);
+  std::map<std::string, const uchar*> mapped;
+  std::vector<std::string> lines;
+  for (auto& [name, x] : src) {
+    if (x.e.kind == 6 && !name.compare(0, residentPrefix.size(), residentPrefix)) {
+      auto m = mapped.find(x.file);
+      if (m == mapped.end()) {
+        size_t n; void* p = mapFile(x.file, &n);
+        residentMaps.push_back(p);
+        m = mapped.emplace(x.file, (const uchar*)p).first;
+      }
+      int8s[prefix + "/" + name] = {m->second + x.e.src, m->second + x.e.scale, (size_t)x.e.zero, (int)x.e.block, (int)x.e.bits};
+      continue;
+    }
+    lines.push_back("b " + prefix + "/" + name + " " + name + " 0 " + std::to_string(x.e.n));
+    lines.push_back("m " + prefix + "/" + name + "#r " + std::to_string(x.shape.size()));
+    for (size_t k = 0; k < x.shape.size(); ++k) lines.push_back("m " + prefix + "/" + name + "#" + std::to_string(k) + " " + std::to_string(x.shape[k]));
+  }
+  loadBundleWalk(dir, lines);
+}
 std::map<std::string, std::vector<long long>> Model::bundleShapes(const std::string& dir, const std::string& deltaDir) {
   std::map<std::string, std::vector<long long>> out;
   for (auto& [n, s] : sources(dir, deltaDir, nullptr)) out[n] = s.shape;

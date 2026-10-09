@@ -117,10 +117,10 @@ struct EulerArgs { DP(float) x; CP(float) noisy; CP(float) den; u64 n; float sca
 
 // ---------------------------------------------------------------- the confidence head
 // each pair's distogram bin (-1: none) and squared distance, once a pair
-struct ConfBinArgs { CP(float) beta; DP(int) bin; DP(float) sq; uint n, bins; float dmin, dmax; uint caBins, pad; };
+struct ConfBinArgs { CP(float) beta; DP(int) bin; DP(float) sq; uint n, bins; float dmin, dmax; uint caBins, chaiBins; };
 // pair[i][j] += left[j] + right[i] + Wd[bin] mask (+ protenix2's distance term)
 struct ConfPairInitArgs { DP(float) pair; CP(float) left; CP(float) right; CP(int) bin; CP(float) sq; CP(float) pairMask; CP(float) Wd;
-                          CP(float) Wdist; uint n, C, caBins, pad; };
+                          CP(float) Wdist; uint n, C, caBins, unmasked; };
 // the expectation over bins of softmax(logits) . centres (symmetricN: logits[ij] + logits[ji]), times scale (mask)
 struct ExpectationArgs { CP(float) logits; DP(float) out; CP(float) mask; CP(float) centres; u64 rows; uint bins, symmetricN; float scale; uint pad; };
 struct InterChainArgs { DP(float) logits; CP(float) inter; CP(int) asym; uint n, bins; };
@@ -163,3 +163,45 @@ struct AddBiasHeadsArgs { DP(float) raw; CP(float) bias; u64 pairs; uint heads, 
 struct DdePairInitArgs { DP(float) pair; CP(float) s1; CP(float) s2; CP(float) coords; CP(float) Wd; CP(float) Wraw; uint n, C, bins, pad; };
 // plddt_weight [slot][c][bin] -> [c][slot bins + bin]
 struct SlotMajorArgs { CP(float) w; DP(half) out; uint slots, C, bins, pad; };
+
+// ---------------------------------------------------------------- ESM2 3B (chai-1's token features)
+// a resident int8 [rows][out] matrix (a float32 scale per output channel and block of g rows, any alignment) expanded to
+// half into columns [col0, col0 + out) of a [rows][ld] matrix
+struct Expand8Args { CP(uchar) codes; CP(uchar) scales; DP(half) w; uint rows, out, g, ld, col0, pad; };
+struct EsmEmbedArgs { CP(int) ids; CP(float) table; DP(float) x; uint rows, C; float scale; uint pad; };
+// q and k rotated (channel d with d + 32 of each 64-wide head, the table's cos and sin a row), packed into the flash
+// kernel's [rows][q | k | v | gate] half layout with the gate open
+struct EsmPackArgs { CP(float) qkv; CP(float) cosT; CP(float) sinT; DP(half) qkvg; uint rows, C; };
+struct GatherEsmArgs { CP(float) rows; CP(int) tokenRow; DP(float) out; uint tokens, E; };
+
+// ---------------------------------------------------------------- chai-1
+// its relative encoding: two 67-class one-hots (residue and token separation) through a BIASED linear, added
+struct ChaiRelEncArgs { RelIdx r; CP(float) W; CP(float) bias; DP(float) pair; uint n, C; };
+// its MSA features (41 columns: is_paired, source one-hot 6, deletion value, has deletion, one-hot 32) through a biased
+// linear, plus the single's projection
+struct ChaiMsaEmbedArgs { CP(int) rows; CP(float) del; CP(float) msaMask; CP(int) asym; CP(int) isLigand; CP(float) W; CP(float) bias;
+                          CP(float) fromSingle; DP(float) msa; u64 count; uint n, C; };
+// the grouped outer product: [S][n][G K] -> [G][S][n][K]; P_g [(i, k)][(j, l)] (bi rows i) -> [(i, j)][(g, k, l)]
+struct GroupMajorArgs { CP(float) x; DP(float) out; uint S, n, G, K; };
+struct GroupedPermuteArgs { CP(float) P; DP(float) out; uint bi, n, G, K; };
+struct ScaleHArgs { CP(half) x; DP(float) y; u64 n; float s; uint pad; };       // y = s x (chai's missing output projection)
+// chai-1's atom-pair term: [one_hot(#(|d|^2 > e^2), 12; 11 across reference spaces) | 1 / (1 + |d|^2) | valid] through a
+// biased linear, beside the row and column terms and the trunk pair
+struct ChaiAtomPairArgs { CP(float) row; CP(float) col; CP(float) qPos; CP(float) kPos; CP(float) qUid; CP(float) kUid; CP(float) Wf;
+                          CP(float) bf; CP(float) tp; CP(int) tqIdx; CP(float) tqMask; CP(int) tkIdx; CP(float) tkMask; DP(float) pair;
+                          uint subsets, queries, keys, Cp, tokens, pad; };
+// chai-1's atom attention mask: both atoms real and in one reference space, else -1e9 in the logits
+struct SameRefMaskArgs { DP(float) pl; CP(float) qUid; CP(float) tqMask; CP(float) kUid; CP(float) tkMask; uint subsets, heads, queries, keys; };
+struct AddConstArgs { DP(float) x; u64 n; float v; uint pad; };
+// chai-1's token features: one_hot(aatype, 31) W + b + [profile 31 | deletion mean] W'
+struct ChaiTokenFeatArgs { CP(int) aatype; CP(float) profile; CP(float) delMean; CP(float) Wt; CP(float) bt; CP(float) Wp; DP(float) out; uint tokens, C; };
+// chai-1's diffusion pair input beside the trunk pair: its structure token-pair features through their projection's
+// structure half, plus a bond term (rows [p0, p0 + rows))
+struct ChaiStructPairArgs { CP(float) trunkPair; CP(int) ri; CP(int) ti; CP(int) asym; CP(int) entityRank; CP(int) symRank; CP(float) Wp;
+                            CP(float) bias; CP(float) bonds; CP(float) Wb; DP(float) out; u64 p0, rows; uint n, Czt, Cz, pad; };
+// chai-1's sampler: x' = noisy + dt g1 (g1 = (noisy - D) / tHat, kept); the second-order correction x += dt ((x - D2) /
+// level + g1) / 2
+struct ChaiEulerArgs { DP(float) x; DP(float) g1; CP(float) noisy; CP(float) d1; u64 n; float tHat, dt; };
+struct ChaiCorrectArgs { DP(float) x; CP(float) d2; CP(float) g1; u64 n; float level, dt; };
+// chai-1's pLDDT: each dense slot's logits gathered from its ATOM37 slot's (by atom name)
+struct Plddt37Args { CP(float) p37; CP(int) idx; DP(float) out; uint n, dense, bins, pad; };

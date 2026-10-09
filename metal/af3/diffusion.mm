@@ -3,6 +3,7 @@
 // depend on the noise level is prepared once a fold; a denoiser call runs every in-flight sample (NS) as one batch.
 #include "af3.h"
 #include <cmath>
+#include <algorithm>
 #include <map>
 #include <random>
 
@@ -48,19 +49,38 @@ static void prepareConditioning(const float* trunkSingle, const float* trunkPair
   int Cz = metaI(P + ".pairChannels"), Cs = metaI(P + ".seqChannels");
   int Czt = metaI(P + ".trunkPairChannels"), Cst = metaI(P + ".trunkSingleChannels"), F = metaI(P + ".targetFeatWidth");
   const int rel = 139;
-  if (flag("trunk.dialect.chaiDiffusionConditioning")) die("chai-1's diffusion conditioning is not in the native port yet");
   size_t pairs = (size_t)n * n;
   // [trunk pair | relative one-hot] under AF3; the relative encoding projected first under some (relpeProjection), and
   // the trunk pair LayerNormed and projected too (zTrunkProjection: OpenDDE, protenix2)
+  const bool chai = flag("trunk.dialect.chaiDiffusionConditioning");
   bool split = hasW(P + ".zTrunkProjection"), relpe = !split && hasW(P + ".relpeProjection");
-  int width = split ? 2 * Cz : relpe ? Czt + Cz : Czt + rel;
+  int width = chai ? Czt + Cz : split ? 2 * Cz : relpe ? Czt + Cz : Czt + rel;
+  // (chai's: the entity and symmetry ids as dense ranks, torch.unique's inverse)
+  auto denseRank = [&](const char* key) {
+    const int* h = M.hostI(key); size_t m = M.len(key);
+    std::vector<int> sorted(h, h + m); std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+    std::vector<int> rank(m);
+    for (size_t k = 0; k < m; ++k) rank[k] = (int)(std::lower_bound(sorted.begin(), sorted.end(), h[k]) - sorted.begin());
+    int* d = scratch<int>(std::string("dc.rank.") + key, m);
+    upload(d, rank.data(), m * 4);
+    return (const int*)d;
+  };
+  const int* entityRank = chai ? denseRank("batch.features.entityId") : nullptr;
+  const int* symRank = chai ? denseRank("batch.features.symId") : nullptr;
   size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / std::max(width, rel + Czt)));
   float* f2 = scratch<float>("dc.f2", per * width);
   half* f2n = scratch<half>("dc.f2n", per * width);
   D.pairCond = scratch<float>("dc.pair", pairs * Cz);
   for (size_t p0 = 0; p0 < pairs; p0 += per) {
     size_t r = std::min(per, pairs - p0);
-    if (!split && !relpe) {
+    if (chai) {
+      run1d("af3_chai_struct_pair", r * width,
+            ChaiStructPairArgs{trunkPair, M.i("batch.features.residueIndex"), M.i("batch.features.tokenIndex"), M.i("batch.features.asymId"),
+                               entityRank, symRank, W(P + ".structurePairWeights"), W(P + ".structurePairBias"),
+                               M.has("batch.bondMatrix") ? M.f("batch.bondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, p0, r,
+                               (uint)n, (uint)Czt, (uint)Cz, 0});
+    } else if (!split && !relpe) {
       run1d("af3_pair_features", r * width, PairFeatArgs{trunkPair, relIdx(), f2, p0, r, (uint)n, (uint)Czt});
     } else {
       float* relRows = scratch<float>("dc.rel", per * rel);
@@ -81,6 +101,11 @@ static void prepareConditioning(const float* trunkSingle, const float* trunkPair
     lin(f2n, P + ".pairCondInitialProjection", D.pairCond + p0 * Cz, r, width, Cz);
   }
   for (int k = 0; k < 2; ++k) plainTransition(D.pairCond, pairs, Cz, P + ".pairTransitions." + num(k));
+  if (chai) {     // chai closes the pair track with an affine LayerNorm
+    float* tmp = scratch<float>("dc.fnorm", pairs * Cz);
+    ln(D.pairCond, tmp, pairs, Cz, P + ".pairCondFinalNormScale", P + ".pairCondFinalNormOffset");
+    copy(D.pairCond, tmp, pairs * Cz * 4);
+  }
   // [trunk single | target_feat]; the openfold3 lineage pads two always-zero columns (unknown DNA, after the restype
   // and profile blocks) - free before a linear, not before this LayerNorm
   bool pad = flag("trunk.dialect.padSingleCondUnknownDna");
@@ -132,12 +157,11 @@ void transformerWeights() {
   D.ldn = D.nblocks * 4 * C; D.ldr = D.nblocks * 2 * C;
   // every block's adaptive-LN projections folded: LN_s(cond) W = LN0(cond) diag(s) W -> [scale | shift | ffw scale |
   // ffw shift] per block over LN0(cond), and [zero gate | ffw zero gate] per block over cond; the biases as GEMM biases
-  if (ADA_RAW) die("chai-1's transformer is not in the native port yet");
   D.wNorm = M.derived<half>("difftx.wNorm", (size_t)Cc * D.ldn, [&](half* out) {
     for (int b = 0; b < D.nblocks; ++b)
       for (int slot = 0; slot < 2; ++slot) {
         std::string pre = blockName(b) + (slot ? ".ffw" : ".");
-        const float* s = W(pre + "SingleCondLayerNormScale");
+        const float* s = ADA_RAW ? nullptr : W(pre + "SingleCondLayerNormScale");     // (chai: the conditioning raw)
         run1d("af3_fold_cond", (size_t)Cc * C, FoldCondArgs{s, Wh(pre + "SingleCondScaleWeights"), out, (uint)Cc, (uint)C, (uint)D.ldn,
                                                              (uint)(b * 4 * C + slot * 2 * C)});
         run1d("af3_fold_cond", (size_t)Cc * C, FoldCondArgs{s, Wh(pre + "SingleCondBias"), out, (uint)Cc, (uint)C, (uint)D.ldn,
@@ -155,7 +179,10 @@ void transformerWeights() {
   D.bNorm = M.derived<float>("difftx.bNorm", D.ldn, [&](float* out) {
     for (int b = 0; b < D.nblocks; ++b)
       for (int slot = 0; slot < 2; ++slot)
-        copy(out + b * 4 * C + slot * 2 * C, W(blockName(b) + (slot ? ".ffw" : ".") + "SingleCondScaleBias"), (size_t)C * 4);
+        if (ADA_RAW) {      // chai: the scale's + 1 as its bias
+          std::vector<float> ones((size_t)C, 1.f);
+          upload(out + b * 4 * C + slot * 2 * C, ones.data(), (size_t)C * 4);
+        } else copy(out + b * 4 * C + slot * 2 * C, W(blockName(b) + (slot ? ".ffw" : ".") + "SingleCondScaleBias"), (size_t)C * 4);
   });
   D.bRaw = M.derived<float>("difftx.bRaw", D.ldr, [&](float* out) {
     for (int b = 0; b < D.nblocks; ++b)
@@ -199,7 +226,7 @@ static void transformer(float* act, const float* cond) {
   if (pn != (size_t)n && zeroedC != cn) { fill(cn, 0, pn * Cc * 2); fill(ch, 0, pn * Cc * 2); zeroedC = cn; }
   layerNorm(cond, cn, n, Cc, nullptr, nullptr);
   toHalf(cond, ch, (size_t)n * Cc);
-  linW(cn, D.wNorm, gNorm, pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning");
+  linW(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning");    // (chai: raw)
   linW(ch, D.wRaw, gRaw, pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates");
   bool noResidual = flag(Tn + ".noResidual");
   float* pre = noResidual ? scratch<float>("dt.pre", rows * C) : nullptr;
@@ -235,7 +262,7 @@ static void transformer(float* act, const float* cond) {
       at.qBias = nullptr;
     }
     attention(at);
-    lin(o, B + ".Transition2", att, prows, Wd, C);
+    lin(o, B + ".Transition2", att, prows, Wd, C, 0.f, nullptr, ADA_RAW ? 2.f : 1.f);   // (chai's zero gate weights: 0.5 undone)
     run1d("af3_gated_res_strided", rows * C, GatedResStridedArgs{act, att, z, rows, (uint)C, (uint)n, (uint)D.ldr, 0});
     adaLn(noResidual ? pre : act, g + 2 * C, g + 3 * C, tn, nullptr, rows, C, n, D.ldn);
     gemmSwiglu(tn, swigluPairs(B + ".ffwTransition1", C, I), gated, prows, C, I);
@@ -258,8 +285,17 @@ static void prepareDecoder() {
   size_t qRows = (size_t)sh.subsets * sh.queries;
   int nblocks = 0; while (M.has(Dd + ".blocks." + num(nblocks) + ".qProjection")) ++nblocks;
   std::vector<float*> logits = atomPairLogits(Dd, D.enc.pair, qRows * sh.keys, Cp, nblocks, D.decHeads, sh);
+  const float* cond = D.enc.qCond;
+  if (flag("trunk.dialect.chaiAtomStack")) {
+    // chai conditions its decoder on a second, affine LayerNorm of the encoder's conditioning, and restricts its
+    // attention to one reference space as the encoder does
+    float* c2 = scratch<float>("dec.cond", qRows * D.decC);
+    ln(D.enc.qCond, c2, qRows, D.decC, Dd + ".postAtomCondLayerNormScale", Dd + ".postAtomCondLayerNormOffset");
+    cond = c2;
+    for (float* pl : logits) sameRefMask(pl, D.enc.qUid, D.enc.kUid, D.decHeads, sh);
+  }
   D.decBlocks.clear();
-  for (int b = 0; b < nblocks; ++b) D.decBlocks.push_back(prepareAtomBlock(Dd + ".blocks." + num(b), D.enc.qCond, qRows, D.decC, logits[b]));
+  for (int b = 0; b < nblocks; ++b) D.decBlocks.push_back(prepareAtomBlock(Dd + ".blocks." + num(b), cond, qRows, D.decC, logits[b]));
   releaseScratch({"apl.", "ada."});
 }
 static float* atomDecoder(const float* tokenAct) {
@@ -357,6 +393,67 @@ static double noiseSchedule(double t, double sigmaData, double sigmaMin, double 
   return sigmaData * std::pow(hi + t * (lo - hi), rho);
 }
 SamplerOptions SAMPLER;
+// the augmentation's rotation and translation for every (step, sample), from each sample's seeded stream
+static std::vector<float> rotations(int steps, const std::vector<uint64_t>& seeds) {
+  int ns = (int)seeds.size();
+  std::vector<float> rot((size_t)std::max(steps, 1) * ns * 12);
+  for (int k = 0; k < ns; ++k) {
+    std::mt19937_64 gen(seeds[k]); std::normal_distribution<double> normal(0.0, 1.0);
+    for (int s = 0; s < steps; ++s) {
+      double v0[3] = {normal(gen), normal(gen), normal(gen)}, v1[3] = {normal(gen), normal(gen), normal(gen)};
+      auto norm = [](const double* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+      double e0[3], e1[3], e2[3], s0 = 1 / std::max(1e-10, norm(v0));
+      for (int d = 0; d < 3; ++d) e0[d] = v0[d] * s0;
+      double dot = v1[0] * e0[0] + v1[1] * e0[1] + v1[2] * e0[2], w[3];
+      for (int d = 0; d < 3; ++d) w[d] = v1[d] - e0[d] * dot;
+      double s1 = 1 / std::max(1e-10, norm(w));
+      for (int d = 0; d < 3; ++d) e1[d] = w[d] * s1;
+      e2[0] = e0[1] * e1[2] - e0[2] * e1[1]; e2[1] = e0[2] * e1[0] - e0[0] * e1[2]; e2[2] = e0[0] * e1[1] - e0[1] * e1[0];
+      float* r = &rot[((size_t)s * ns + k) * 12];
+      for (int d = 0; d < 3; ++d) { r[d] = (float)e0[d]; r[3 + d] = (float)e1[d]; r[6 + d] = (float)e2[d]; }
+      for (int d = 0; d < 3; ++d) r[9 + d] = (float)normal(gen);
+    }
+  }
+  return rot;
+}
+// chai-1's sampler (af3-any-model diffusion_head.py, chai1.py's): its schedule (sigma_max 80, rho 7) at the N MIDPOINTS
+// t = (2k + 1) / 2N; per transition the augmentation, churn min(80 / N, sqrt 2 - 1) only where 4e-4 <= sigma_prev <= 80,
+// noise 1.003 sqrt(max(1e-6, tHat^2 - sigma_prev^2)), and its second-order step - by default ONE call a step, the
+// correction's denoised structure taken as the first's, which makes the step x = noisy + 2 dt g1 (cuda/af3's
+// measurement: the same bonds for half the calls); CHAI_SECOND_ORDER=1 is chai-lab's two calls
+static void sampleChai(int steps, int ns, size_t atoms, float* dX, const uint64_t* dSeeds, const float* dMask,
+                       const std::vector<uint64_t>& seeds, const std::function<void(const float*, int, int)>& onStep) {
+  int N = steps, T = N - 1;
+  size_t all3 = atoms * 3 * ns;
+  static const bool secondOrder = getenv("CHAI_SECOND_ORDER") && atoi(getenv("CHAI_SECOND_ORDER"));
+  std::vector<double> levels(N);
+  for (int k = 0; k < N; ++k) levels[k] = noiseSchedule((2.0 * k + 1) / (2.0 * N), 16, 0.0004, 80, 7);
+  const double churn = std::min(80.0 / N, std::sqrt(2.0) - 1.0);
+  std::vector<float> rot = rotations(T, seeds);
+  float* dRot = uploadNew(rot.data(), rot.size());
+  float* dIn = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
+  float* dG = scratch<float>("sample.grad", all3); float* dNoisy = scratch<float>("sample.noisyKeep", all3);
+  run1d("af3_initial_noise", all3, InitNoiseArgs{dX, dSeeds, atoms * 3, all3, (float)levels[0], 0});
+  for (int s = 1; s <= T; ++s) {
+    double prev = levels[s - 1], level = levels[s], tHat = prev * (1 + (prev >= 4e-4 && prev <= 80 ? churn : 0)), dt = level - tHat;
+    double injected = 1.003 * std::sqrt(std::max(1e-6, tHat * tHat - prev * prev));
+    run("af3_centroid", Grid{(uint32_t)ns, 1, 1}, 1024, CentroidArgs{dX, dMask, dC, atoms});
+    run1d("af3_augment", atoms * ns, AugmentArgs{dX, dIn, dMask, dC, dRot + (size_t)(s - 1) * ns * 12, dSeeds, atoms, atoms * ns, (uint)s,
+                                                 (float)injected});
+    copy(dNoisy, dIn, all3 * 4);
+    const float* d1 = denoise(dIn, (float)tHat);
+    if (onStep) onStep(d1, s, T);
+    if (!secondOrder) {
+      run1d("af3_chai_euler", all3, ChaiEulerArgs{dX, dG, dNoisy, d1, all3, (float)tHat, (float)(2 * dt)});
+      continue;
+    }
+    run1d("af3_chai_euler", all3, ChaiEulerArgs{dX, dG, dNoisy, d1, all3, (float)tHat, (float)dt});
+    copy(dIn, dX, all3 * 4);
+    const float* d2 = denoise(dIn, (float)level);
+    run1d("af3_chai_correct", all3, ChaiCorrectArgs{dX, d2, dG, all3, (float)level, (float)dt});
+  }
+  release(dRot);
+}
 // every sample's positions, sample-major [ns][atoms][3]. AF3's sampler: each step centres the real atoms, rotates by a
 // random rotation, translates by a unit normal, injects noise and takes the Euler step - the per-atom Gaussians a
 // counter hash of (seed, step, element), the augmentation's twelve a step from the host's seeded stream
@@ -371,7 +468,6 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
     gamma0 = M.meta(S + "gamma0"); gammaMin = M.meta(S + "gammaMin"); noiseScale = M.meta(S + "noiseScale");
     stepScale = M.meta(S + "stepScale"); rho = M.meta(S + "rho"); sigmaMin = M.meta(S + "sigmaMin"); sigmaMax = M.meta(S + "sigmaMax");
   }
-  if (flag("trunk.dialect.chaiSampler")) die("chai-1's sampler is not in the native port yet");
   float* dX = allocT<float>(all3);
   uint64_t* dSeeds = uploadNew(seeds.data(), ns);
   float* dMask = uploadNew(mask.data(), atoms);
@@ -385,27 +481,12 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
       if (onStep) onStep(d, step, steps);
       copy(dX, d, all3 * 4);
     }
+  } else if (flag("trunk.dialect.chaiSampler")) {
+    sampleChai(steps, ns, atoms, dX, dSeeds, dMask, seeds, onStep);
   } else {
     if (SAMPLER.sigmaMax > 0) sigmaMax = SAMPLER.sigmaMax;
     for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, sigmaMin, sigmaMax, rho);
-    std::vector<float> rot((size_t)steps * ns * 12);
-    for (int k = 0; k < ns; ++k) {
-      std::mt19937_64 gen(seeds[k]); std::normal_distribution<double> normal(0.0, 1.0);
-      for (int s = 0; s < steps; ++s) {
-        double v0[3] = {normal(gen), normal(gen), normal(gen)}, v1[3] = {normal(gen), normal(gen), normal(gen)};
-        auto norm = [](const double* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
-        double e0[3], e1[3], e2[3], s0 = 1 / std::max(1e-10, norm(v0));
-        for (int d = 0; d < 3; ++d) e0[d] = v0[d] * s0;
-        double dot = v1[0] * e0[0] + v1[1] * e0[1] + v1[2] * e0[2], w[3];
-        for (int d = 0; d < 3; ++d) w[d] = v1[d] - e0[d] * dot;
-        double s1 = 1 / std::max(1e-10, norm(w));
-        for (int d = 0; d < 3; ++d) e1[d] = w[d] * s1;
-        e2[0] = e0[1] * e1[2] - e0[2] * e1[1]; e2[1] = e0[2] * e1[0] - e0[0] * e1[2]; e2[2] = e0[0] * e1[1] - e0[1] * e1[0];
-        float* r = &rot[((size_t)s * ns + k) * 12];
-        for (int d = 0; d < 3; ++d) { r[d] = (float)e0[d]; r[3 + d] = (float)e1[d]; r[6 + d] = (float)e2[d]; }
-        for (int d = 0; d < 3; ++d) r[9 + d] = (float)normal(gen);
-      }
-    }
+    std::vector<float> rot = rotations(steps, seeds);
     float* dRot = uploadNew(rot.data(), rot.size());
     float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
     run1d("af3_initial_noise", all3, InitNoiseArgs{dX, dSeeds, n3, all3, (float)levels[0], 0});

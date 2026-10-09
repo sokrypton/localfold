@@ -35,6 +35,15 @@ TMP = os.environ.get("GATE_TMP", os.path.join(tempfile.gettempdir(), "metal-af3-
 AF3_BUNDLE = os.path.join(REPO, "model-af3-int5")
 
 
+# chai-1, which the CUDA gate does not fold (its ESM2 3B tower is 2.7 GB more to fetch): a plain protein, and a ligand
+# beside an atomised modified residue - its reference-space attention masks are what that reaches. Recorded 2026-10-09
+# against the CUDA-translated port this replaced: 0.976 / 1.020 A, pLDDT 82.72 / 83.26; with GOL and SEP@3 1.744 /
+# 1.733 A, ligand bonds 0.075 / 0.077 A
+EXTRA = [("chai1-6mrr", "chai1", [f"--sequence={cuda_gate.SEQ_6MRR}"], [], [os.path.join(REPO, "tools", "fixtures", "6mrr-crystal.pdb")]),
+         ("chai1-6mrr-gol-sep3", "chai1", [f"--sequence={cuda_gate.SEQ_6MRR}", "--ligands=GOL", "--modify=SEP@3"], [],
+          [os.path.join(REPO, "tools", "fixtures", "6mrr-crystal.pdb"), "A"], "GOL,SEP")]
+
+
 def fold_command(name, model, inputs, fold, pdb):
     if model == "af3":
         data = os.path.join(TMP, name + ".input")
@@ -83,7 +92,7 @@ def main():
     base = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
     a100 = json.load(open(A100)) if os.path.exists(A100) else {}
     failed = 0
-    for case in cuda_gate.cases():
+    for case in cuda_gate.cases() + EXTRA:
         name, model, inputs, fold, ref = case[:5]
         codes = case[5] if len(case) > 5 else None
         if only and model not in only and name not in only:

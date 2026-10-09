@@ -150,7 +150,9 @@ int foldInput(const std::string& dir, Options o) {
   // --frames: each pass's contact map too (the page shows the trunk's after every recycle), a byte a pair;
   // --recycle-tolerance: stop once two consecutive passes moved the distogram's predicted distances less than it (the
   // page's rule, shared/af3/feature-convergence.js: one crossing is not enough)
-  const int lastPass = o.recycles;
+  // chai-1 counts its recycles as TOTAL passes (chai-lab's num_trunk_recycles), where AlphaFold 3's are passes after the
+  // first: the page's 3 is chai-lab's own default of 3 passes
+  const int lastPass = flag("trunk.dialect.recycleFromInit") ? std::max(1, o.recycles) - 1 : o.recycles;
   int passesRun = lastPass + 1;
   std::vector<float> lastDistances; std::vector<double> changes;
   for (int pass = 0; pass <= lastPass; ++pass) {
@@ -197,7 +199,7 @@ int foldInput(const std::string& dir, Options o) {
   // the diffusion: every (seed, sample) through the denoiser together, up to ten a batch
   double d0 = now();
   if (structural) prepareDiffusion(st.single, st.pair, st.targetFeat, st.masks, nD);
-  else prepareDiffusion(t.single, t.pair, t.targetFeat, t.masks, n);
+  else prepareDiffusion(t.single, t.pair, flag("trunk.dialect.chaiTokenEmbedding") ? TARGET_FEAT_STRUCTURE : t.targetFeat, t.masks, n);
   std::vector<float> mask(M.hostF("batch.refMask"), M.hostF("batch.refMask") + (size_t)nD * dense);
   std::vector<int> pbIdx(M.hostI("batch.tokenAtomsToPseudoBeta.indices"), M.hostI("batch.tokenAtomsToPseudoBeta.indices") + nD);
   std::vector<float> pbMask(M.hostF("batch.tokenAtomsToPseudoBeta.mask"), M.hostF("batch.tokenAtomsToPseudoBeta.mask") + nD);
@@ -283,7 +285,7 @@ int foldInput(const std::string& dir, Options o) {
 
 int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: localfold-af3 <input dir> --bundle=<dir> --family=<model> [--out=fold.pdb]\n"); return 1; }
-  std::string bundleDir, family;
+  std::string bundleDir, family, esmBundle;
   Options o;
   bool af3Defaults = false, waitInput = false, detach = false, setR = false, setS = false;
   std::string serveDir;
@@ -291,6 +293,7 @@ int foldMain(int argc, char** argv) {
     const char* a = argv[i];
     if (!strncmp(a, "--bundle=", 9)) bundleDir = a + 9;
     else if (!strncmp(a, "--family=", 9)) family = a + 9;
+    else if (!strncmp(a, "--esm-bundle=", 13)) esmBundle = a + 13;     // chai-1's ESM2 3B (af3-any-model's lm/esm2.bin.zst)
     else if (!strncmp(a, "--out=", 6)) o.out = a + 6;
     else if (!strncmp(a, "--steps=", 8)) o.steps = atoi(a + 8);
     else if (!strncmp(a, "--recycles=", 11)) { o.recycles = atoi(a + 11); setR = true; }
@@ -321,6 +324,8 @@ int foldMain(int argc, char** argv) {
     M.loadBundleWalk(bundleDir, lines, "", [](const std::string&, size_t elements) { return elements >= 16384; },
                      derivedSource);
   }
+  if (!esmBundle.empty()) M.loadBlobResident(esmBundle, "e", "esm2/blocks/");   // (its matrices resident as int8 codes)
+  ADA_RAW = flag("trunk.dialect.chaiAtomStack");      // (chai-1's adaptive LayerNorm: its folded weights are built now)
   prepareWeights();
   printf("weights: %.0f ms\n", ms(t0));
   if (getenv("AF3_MEM")) { mt::sync(); printf("memory: weights %.0f MB, allocated %.0f MB\n", M.weightBytes() / 1e6, allocated() / 1e6); }

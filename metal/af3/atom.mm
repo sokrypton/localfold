@@ -5,6 +5,7 @@
 #include <cmath>
 
 int NS = 1;
+float* TARGET_FEAT_STRUCTURE = nullptr;
 bool ADA_RAW = false;
 
 Gather gatherOf(const std::string& name) {
@@ -36,7 +37,12 @@ static float* perAtomConditioning(const std::string& ref, int rows) {
 // scale = LN_s(cond) W + b and shift = LN_s(cond) W' for one adaptive LayerNorm (chai: the conditioning as it is,
 // scale = cond W + 1)
 static void adaCond(const float* cond, size_t rows, int C, int condC, const std::string& w, float* sc, float* sh) {
-  if (ADA_RAW) die("chai-1's adaptive LayerNorm is not in the native port yet");
+  if (ADA_RAW) {      // chai: the conditioning as it is, scale = cond Ws + 1 (no bias), shift = cond Wb
+    lin(cond, w + "SingleCondScaleWeights", sc, rows, condC, C);
+    run1d("af3_add_const", rows * C, AddConstArgs{sc, rows * C, 1.f, 0});
+    lin(cond, w + "SingleCondBias", sh, rows, condC, C);
+    return;
+  }
   float* cn = scratch<float>("ada.cn", rows * condC);
   ln(cond, cn, rows, condC, w + "SingleCondLayerNormScale", "");
   lin(cn, w + "SingleCondScaleWeights", sc, rows, condC, C, 0.f, W(w + "SingleCondScaleBias"));
@@ -98,7 +104,8 @@ void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& b
       AtomAttnArgs{qg, qBias, kv, st.qMask, st.kMask, bc.pairLogits, gathered, (uint)sh.queries, (uint)sh.keys,
                    (uint)heads, (uint)D, (uint)sh.subsets, st.keyMasked ? 1u : 0u});
   float* attention = scratch<float>("ab.attention", qRows * C);
-  lin(gathered, B + ".Transition2", attention, qRows, Wd, C);
+  if (hasW(B + ".Transition2")) lin(gathered, B + ".Transition2", attention, qRows, Wd, C);
+  else run1d("af3_scale_h", qRows * C, ScaleHArgs{gathered, attention, qRows * C, 2.f, 0});    // (chai: none, its gate's 0.5 undone)
   run1d("af3_gated_residual", qRows * C, GatedResidualArgs{act, attention, bc.zg, qRows * C, q1 * C});
   half* tn = scratch<half>("ab.tn", qRows * C);
   adaLn(st.noResidual ? pre : act, bc.ffwScale, bc.ffwShift, tn, nullptr, qRows, C, q1);
@@ -145,6 +152,11 @@ std::vector<float*> atomPairLogits(const std::string& P, const float* pair, size
   return out;
 }
 
+void sameRefMask(float* pl, const float* qUid, const float* kUid, int heads, const AtomShape& sh) {
+  Gather tq = gatherOf("batch.tokensToQueries"), tk = gatherOf("batch.tokensToKeys");
+  size_t per = (size_t)sh.subsets * heads * sh.queries * sh.keys;
+  run1d("af3_same_ref_mask", per, SameRefMaskArgs{pl, qUid, tq.mask, kUid, tk.mask, (uint)sh.subsets, (uint)heads, (uint)sh.queries, (uint)sh.keys});
+}
 // The encoder's per-fold part: everything but the activation. trunkSingle [tokens][Cs] and trunkPair [tokens^2][Cz] may
 // be null (target_feat).
 EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, const float* trunkSingle, const float* trunkPair) {
@@ -153,7 +165,7 @@ EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, co
   o.C = metaI(E + ".channels"); int Cp = metaI(E + ".pairChannels");
   o.heads = metaI(E + ".heads"); o.D = metaI(E + ".dimension"); o.perToken = metaI(E + ".perTokenChannels");
   int C = o.C;
-  if (flag("trunk.dialect.chaiAtomStack")) die("chai-1's atom stack is not in the native port yet");
+  const bool chai = flag("trunk.dialect.chaiAtomStack");
   size_t atoms = (size_t)sh.tokens * sh.dense, qRows = (size_t)sh.subsets * sh.queries, kRows = (size_t)sh.subsets * sh.keys;
   Gather t2q = gatherOf("batch.tokenAtomsToQueries"), q2k = gatherOf("batch.queriesToKeys");
   if ((size_t)t2q.count != qRows || (size_t)q2k.count != kRows) die("atom gathers %d/%d against %zu/%zu rows", t2q.count, q2k.count, qRows, kRows);
@@ -163,7 +175,7 @@ EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, co
   o.qMask = scratch<float>(E + ".qMask", qRows);
   convert(t2q, M.f("batch.refMask"), o.qMask, 1);
   o.qStart = o.qCond;
-  if (flag("trunk.dialect.preTrunkQuery") && trunkSingle) {
+  if (flag("trunk.dialect.preTrunkQuery") && (trunkSingle || chai)) {
     // the queries start from the per-atom features alone (rf3, boltz2); every adaptive LN reads the full conditioning
     o.qStart = scratch<float>(E + ".qStart", qRows * C);
     copy(o.qStart, o.qCond, qRows * C * 4);
@@ -178,6 +190,11 @@ EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, co
     float* perQuery = scratch<float>("enc.perQuery", qRows * C);
     convert(gatherOf("batch.tokensToQueries"), proj, perQuery, C);
     add(o.qCond, perQuery, qRows * C);
+  }
+  if (chai) {     // chai: cond = LN(a [+ the trunk term]), affine-free, before the mask
+    float* nrm = scratch<float>("enc.condLn", qRows * C);
+    layerNorm(o.qCond, nrm, qRows, C, nullptr, nullptr);
+    copy(o.qCond, nrm, qRows * C * 4);
   }
   scaleRows(o.qCond, o.qMask, qRows, C, qRows);
   o.kCond = scratch<float>(E + ".kCond", kRows * C);
@@ -217,11 +234,23 @@ EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, co
   size_t pairRows = qRows * sh.keys;
   o.pair = scratch<float>(E + ".pair", pairRows * Cp);
   Gather tq = gatherOf("batch.tokensToQueries"), tk = gatherOf("batch.tokensToKeys");
-  run1d("af3_atom_pair", pairRows * Cp,
-        AtomPairArgs{row, col, qPos, kPos, o.qUid, o.kUid, o.kMask, W(E + ".embedPairOffsets"), W(E + ".embedPairDistances"),
-                     W(E + ".embedPairOffsetsValid"), tp, tq.idx, tq.mask, tk.idx, tk.mask, o.pair, (uint)sh.subsets, (uint)sh.queries,
-                     (uint)sh.keys, (uint)Cp, (uint)sh.tokens, flag("trunk.dialect.maskPaddedKeys") ? 1u : 0u});
-  {   // the pair MLP: pair += mlp3(relu(mlp2(relu(mlp1(relu(pair))))))
+  if (chai)
+    run1d("af3_chai_atom_pair", pairRows * Cp,
+          ChaiAtomPairArgs{row, col, qPos, kPos, o.qUid, o.kUid, W(E + ".embedAtomPairFeat"), W(E + ".embedAtomPairFeatBias"), tp, tq.idx,
+                           tq.mask, tk.idx, tk.mask, o.pair, (uint)sh.subsets, (uint)sh.queries, (uint)sh.keys, (uint)Cp, (uint)sh.tokens, 0});
+  else
+    run1d("af3_atom_pair", pairRows * Cp,
+          AtomPairArgs{row, col, qPos, kPos, o.qUid, o.kUid, o.kMask, W(E + ".embedPairOffsets"), W(E + ".embedPairDistances"),
+                       W(E + ".embedPairOffsetsValid"), tp, tq.idx, tq.mask, tk.idx, tk.mask, o.pair, (uint)sh.subsets, (uint)sh.queries,
+                       (uint)sh.keys, (uint)Cp, (uint)sh.tokens, flag("trunk.dialect.maskPaddedKeys") ? 1u : 0u});
+  if (chai) {     // chai's pair MLP: two layers, no relu on its input
+    half* h1 = scratch<half>("enc.h1", pairRows * Cp); float* f = scratch<float>("enc.hf", pairRows * Cp);
+    half* p16 = scratch<half>("enc.h2", pairRows * Cp);
+    toHalf(o.pair, p16, pairRows * Cp);
+    lin(p16, E + ".pairMlp1", f, pairRows, Cp, Cp);
+    run1d("af3_relu_h", pairRows * Cp, ReluHArgs{f, h1, pairRows * Cp});
+    lin(h1, E + ".pairMlp2", o.pair, pairRows, Cp, Cp, 1.f);
+  } else {   // the pair MLP: pair += mlp3(relu(mlp2(relu(mlp1(relu(pair))))))
     half* h1 = scratch<half>("enc.h1", pairRows * Cp); half* h2 = scratch<half>("enc.h2", pairRows * Cp);
     float* f = scratch<float>("enc.hf", pairRows * Cp);
     run1d("af3_relu_h", pairRows * Cp, ReluHArgs{o.pair, h1, pairRows * Cp});
@@ -233,6 +262,8 @@ EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, co
   }
   int nblocks = 0; while (M.has(E + ".blocks." + num(nblocks) + ".qProjection")) ++nblocks;
   std::vector<float*> logits = atomPairLogits(E, o.pair, pairRows, Cp, nblocks, o.heads, sh);
+  if (chai)     // chai: attention within one reference space (one residue, or one ligand)
+    for (float* pl : logits) sameRefMask(pl, o.qUid, o.kUid, o.heads, sh);
   for (int b = 0; b < nblocks; ++b) o.blocks.push_back(prepareAtomBlock(E + ".blocks." + num(b), o.qCond, qRows, C, logits[b]));
   o.keyMasked = flag(E + ".blocks.0.keyMaskedAtomAttention");
   o.noResidual = flag(E + ".blocks.0.diffusionNoResidual");
@@ -306,7 +337,37 @@ void encoderStep(const std::string& E, EncoderOut& o, const float* atomPositions
 // ---------------------------------------------------------------- target_feat
 float* buildTargetFeat() {
   int tokens = (int)M.meta("batch.tokens");
-  if (flag("trunk.dialect.chaiTokenEmbedding")) die("chai-1's token features are not in the native port yet");
+  if (flag("trunk.dialect.chaiTokenEmbedding")) {
+    // chai-1: s_cat = [pooled atoms | token features (+ ESM2 3B's projection)]; the trunk's target_feat = s_cat W_trunk
+    // and the diffusion module's = s_cat W_structure (TARGET_FEAT_STRUCTURE)
+    const std::string P = "targetFeat.encoder.chaiToken.";
+    EncoderOut e = prepareEncoder("targetFeat.encoder", "targetFeat.reference", nullptr, nullptr);
+    encoderStep("targetFeat.encoder", e, nullptr);
+    int Cp = e.perToken, C = (int)lenW(P + "tokenFeatureBias");
+    float* feat = scratch<float>("tf.token", (size_t)tokens * C);
+    run1d("af3_chai_token_feat", (size_t)tokens * C,
+          ChaiTokenFeatArgs{M.i("batch.aatype"), M.f("batch.profile"), M.f("batch.deletionMean"), W(P + "tokenFeatureWeights"),
+                            W(P + "tokenFeatureBias"), W(P + "msaProfileWeights"), feat, (uint)tokens, (uint)C});
+    int E = 0;
+    const float* esm;
+    if (M.has("batch.esmEmbeddings")) { esm = M.f("batch.esmEmbeddings"); E = (int)(M.len("batch.esmEmbeddings") / tokens); }
+    else {
+      if (!M.has("esm.ids")) die("chai-1 reads ESM2 embeddings: the input has neither them nor esm.ids");
+      if (!M.hasInt8("e/esm2/blocks/q/0/weights")) die("chai-1 reads ESM2: give --esm-bundle=<a directory holding af3-any-model's lm/esm2.bin.zst>");
+      esm = esmEmbeddings(tokens, E);
+    }
+    lin(esm, P + "esmWeights", feat, tokens, E, C, 1.f);
+    float* cat = scratch<float>("tf.cat", (size_t)tokens * (Cp + C));
+    run1d("af3_concat_pad", (size_t)tokens * (Cp + C), ConcatPadArgs{e.tokenAct, feat, cat, (uint)tokens, (uint)Cp, (uint)C, -1, -1, 0});
+    int out = (int)(lenW(P + "singleProjInTrunk") / (Cp + C));
+    float* tf = scratch<float>("targetFeat", (size_t)tokens * out);
+    lin(cat, P + "singleProjInTrunk", tf, tokens, Cp + C, out);
+    if (TARGET_FEAT_STRUCTURE) release(TARGET_FEAT_STRUCTURE);
+    TARGET_FEAT_STRUCTURE = allocT<float>((size_t)tokens * out);      // (read by the diffusion, after the trunk)
+    lin(cat, P + "singleProjInStructure", TARGET_FEAT_STRUCTURE, tokens, Cp + C, out);
+    releaseScratch({"targetFeat.encoder.", "targetFeat.reference.", "ab.", "enc.", "tf.", "esm."});
+    return tf;
+  }
   EncoderOut e = prepareEncoder("targetFeat.encoder", "targetFeat.reference", nullptr, nullptr);
   encoderStep("targetFeat.encoder", e, nullptr);
   float* tf;

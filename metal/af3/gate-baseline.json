@@ -51,6 +51,17 @@
   "ptm": "0.8084",
   "rmsd": 0.578
  },
+ "chai1-6mrr": {
+  "plddt": 82.72,
+  "ptm": "0.7514",
+  "rmsd": 0.976
+ },
+ "chai1-6mrr-gol-sep3": {
+  "ligand": 0.075,
+  "plddt": 83.24,
+  "ptm": "0.7782",
+  "rmsd": 1.744
+ },
  "intellifold2-6mrr": {
   "plddt": 85.19,
   "ptm": "0.7007",

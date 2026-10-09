@@ -33,6 +33,13 @@ class Model {
   void loadBundleWalk(const std::string& dir, const std::vector<std::string>& lines, const std::string& deltaDir = "",
                       const std::function<bool(const std::string&, size_t)>& asHalf = nullptr,
                       const std::function<bool(const std::string&)>& own = nullptr);
+  // an af3-any-model blob under `prefix/`, its int8 matrices under `residentPrefix` kept RESIDENT as their codes - read
+  // where they lie in the mapped shards, never decoded whole (ESM2 3B: 2.7 GB of codes, 5.4 as float16) - and every
+  // other tensor decoded to float32, its shape as `<name>#r`, `<name>#k` metadata
+  void loadBlobResident(const std::string& dir, const std::string& prefix, const std::string& residentPrefix);
+  struct Int8Matrix { const uchar* codes; const uchar* scales; size_t rows; int cols, rowBlocks; };   // (scales: float32,
+  bool hasInt8(const std::string& name) const { return int8s.count(name) > 0; }                         //  any alignment)
+  const Int8Matrix& int8(const std::string& name) const;
   // the tensors a bundle holds, by name and shape (a delta's absent ones gone): what a walk is worked out from
   static std::map<std::string, std::vector<long long>> bundleShapes(const std::string& dir, const std::string& deltaDir = "");
   // a bundle given back whole: its tensors (and their conversions), and every derived weight made from one of them (a
@@ -82,6 +89,8 @@ class Model {
   struct Block { char* base = nullptr; size_t bytes = 0; };
   std::vector<Block> blocks;            // a weight walk's allocations, which compact() rebuilds without retired tensors
   std::map<std::string, std::vector<void*>> bundleAllocs;     // loadBundle's allocations by prefix (unloadBundle)
+  std::map<std::string, Int8Matrix> int8s;
+  std::vector<void*> residentMaps;      // (the shards the resident matrices are read from, mapped for the process)
   std::set<std::string> retired;
   std::map<std::string, double> metaV;
   std::map<std::string, void*> derivedW;

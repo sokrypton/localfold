@@ -23,7 +23,7 @@ const half* triGateWeight(const std::string& pre, int C) {
 // LN -> one GEMM gating a and b into channel-major padded planes (gemmTriGate; AF3 interleaves a and b by channel) ->
 // the planes' batched product (/ n under triangleMulDivideByLength) -> the centre LayerNorm back to rows -> the
 // output projection -> the gating linear's GEMM adding the gated product into the pair (gemmGatedAdd)
-void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide) {
+void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into) {
   size_t P = (size_t)n * n;
   int np = round8(n); size_t plane = (size_t)np * np;
   half* xn = scratch<half>("tri.xn", P * C);
@@ -48,13 +48,14 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
   centerNorm(prod, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
   half* outH = scratch<half>("tri.outh", P * C);
   linH(cn, pre + ".outputProjection", outH, P, C, C);
-  gemmGatedAdd(xn, Wh(pre + ".gatingLinear"), outH, pair, P, C, C);
+  gemmGatedAdd(xn, Wh(pre + ".gatingLinear"), outH, into ? into : pair, P, C, C);
 }
 
 // ---------------------------------------------------------------- grid attention
 // rows of the pair (tr: its columns) attend along themselves, biased by LN(pair) projected per head - the column
 // direction's bias read transposed where the dialect swaps it (swapTransposedBias)
-void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap) {
+void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, float* into,
+                   bool untransposed) {
   int heads = metaI(pre + ".heads"), D = metaI(pre + ".dimension"), Wd = heads * D;
   size_t P = (size_t)n * n;
   half* xn = scratch<half>("grid.xn", P * C);
@@ -70,13 +71,26 @@ void gridAttention(float* pair, const Masks& m, int n, int C, const std::string&
   at.bias = bias; at.biasStride = stride;
   if (!m.ones) { at.mask = m.pair; at.maskB = tr ? 1 : n; at.maskK = tr ? n : 1; }
   if (tr) { at.rowStride = 4 * Wd; at.posStride = (int64_t)n * 4 * Wd; at.outRowStride = Wd; at.outPosStride = (int64_t)n * Wd; }
+  // (untransposed: the column direction's output kept at (r, j), chai's - its ending-node update at (i, j) is AF3's at (j, i))
+  if (tr && untransposed) { at.outRowStride = 0; at.outPosStride = 0; }
   attention(at);
-  lin(o, pre + ".outputProjection", pair, P, Wd, C, 1.f, Wopt(pre + ".outputProjectionBias"));
+  // chai-1's confidence blocks: each direction's output projection plus its transposed twin, summed once (their two
+  // applications cancel to one at inference - af3-any-model's dual_output)
+  if (!pre.compare(0, 11, "confidence.") && hasW(pre + ".outputProjectionTransposed")) {
+    const half* w = M.derived<half>("dual:" + pre, (size_t)Wd * C, [&](half* out) {
+      float* sum = allocT<float>((size_t)Wd * C);
+      copy(sum, W(pre + ".outputProjection"), (size_t)Wd * C * 4);
+      add(sum, W(pre + ".outputProjectionTransposed"), (size_t)Wd * C);
+      toHalf(sum, out, (size_t)Wd * C);
+      release(sum);
+    });
+    linW(o, w, into ? into : pair, P, Wd, C, 1.f, Wopt(pre + ".outputProjectionBias"), 1.f, "grid output");
+  } else lin(o, pre + ".outputProjection", into ? into : pair, P, Wd, C, 1.f, Wopt(pre + ".outputProjectionBias"));
 }
 
 // ---------------------------------------------------------------- transition
 // LN -> SwiGLU in the first GEMM's epilogue -> the second GEMM adding into x; in row chunks
-void transition(float* x, size_t rows, int C, const std::string& pre) {
+void transition(float* x, size_t rows, int C, const std::string& pre, float* into) {
   size_t w1 = lenW(pre + ".transition1");
   if (w1 % (2 * (size_t)C)) die("%s.transition1 has %zu elements, not %d x 2I", pre.c_str(), w1, C);
   int I = (int)(w1 / (2 * (size_t)C));
@@ -88,7 +102,7 @@ void transition(float* x, size_t rows, int C, const std::string& pre) {
     size_t r = std::min(chunk, rows - r0);
     ln(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
     gemmSwiglu(xn, wp, g, r, C, I);
-    lin(g, pre + ".transition2", x + r0 * C, r, I, C, 1.f);
+    lin(g, pre + ".transition2", (into ? into : x) + r0 * C, r, I, C, 1.f);
   }
 }
 
@@ -102,11 +116,40 @@ void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& p
   transition(pair, (size_t)n * n, C, pre + ".pairTransition");
 }
 
+// chai-1's parallel updates: the stage's input kept (par.base); the first update runs on the pair itself (it IS the input
+// then), every later one reads the kept input and adds its residual into the pair; the ending-node attention's residual
+// untransposed
+void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which) {
+  bool swap = flag("trunk.dialect.swapTransposedBias"), divide = flag("trunk.dialect.triangleMulDivideByLength");
+  size_t P = (size_t)n * n;
+  float* base = scratch<float>("par.base", P * C);
+  copy(base, pair, P * C * 4);
+  bool first = true;
+  for (const char* u = which; *u; ++u) {
+    bool inPlace = first && *u != 'c';
+    first = false;
+    float* in = inPlace ? pair : base;
+    float* into = inPlace ? nullptr : pair;
+    switch (*u) {
+      case 'o': triangle(in, m, n, C, pre + ".triangleMultiplicationOutgoing", true, divide, into); break;
+      case 'i': triangle(in, m, n, C, pre + ".triangleMultiplicationIncoming", false, divide, into); break;
+      case 'r': gridAttention(in, m, n, C, pre + ".pairAttention1", false, swap, into); break;
+      case 'c': gridAttention(in, m, n, C, pre + ".pairAttention2", true, swap, into, true); break;
+      case 't': transition(in, P, C, pre + ".pairTransition", into); break;
+    }
+  }
+}
+
 // ---------------------------------------------------------------- the single track
 // attention over the tokens biased by the pair (LN, a projection to the heads), then the transition
 void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias) {
   const std::string A = B + ".singleAttention";
+  // chai-1's parallel block: the gate is sigmoid(g + 1) (its gating linear's bias, a constant) and the transition reads
+  // the block's INPUT single: s = s0 + attention(s0) + transition(s0)
+  const bool parallel = flag("trunk.dialect.parallelPairformer");
+  float* s0 = nullptr;
+  if (parallel) { s0 = scratch<float>("st.s0", (size_t)n * Cs); copy(s0, single, (size_t)n * Cs * 4); }
   int heads = metaI(A + ".heads"), d = metaI(A + ".dimension"), Wd = heads * d;
   size_t P = (size_t)n * n;
   half* pln = scratch<half>("st.pln", P * C);
@@ -119,17 +162,28 @@ void singleTrack(float* single, const float* pair, const Masks& m, int n, int C,
   half* nrm = scratch<half>("st.nrm", (size_t)n * Cs);
   ln(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
   half* qkvg = scratch<half>("st.qkvg", (size_t)n * 4 * Wd);
-  linW(nrm, qkvgWeight(A, Cs, Wd, false), qkvg, n, Cs, 4 * Wd, nullptr, "single qkvg");
+  const float* gateBias = !parallel ? nullptr : M.derived<float>("gateOne:" + num(Wd), (size_t)4 * Wd, [&](float* b) {
+    std::vector<float> v((size_t)4 * Wd, 0.f);
+    for (int k = 3 * Wd; k < 4 * Wd; ++k) v[k] = 1.f;
+    upload(b, v.data(), v.size() * 4);
+  });
+  linW(nrm, qkvgWeight(A, Cs, Wd, false), qkvg, n, Cs, 4 * Wd, gateBias, "single qkvg");
   half* o = scratch<half>("st.o", (size_t)n * Wd);
   Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = d; at.rows = 1; at.scale = 1.f / sqrtf((float)d);
   at.bias = bias; at.biasStride = stride; at.qBias = W(A + ".qBias");
   if (!m.ones) { at.mask = m.seq; at.maskB = 0; at.maskK = 1; }
   attention(at);
   lin(o, A + ".outputProjection", single, n, Wd, Cs, 1.f);
-  transition(single, n, Cs, B + ".singleTransition");
+  if (parallel) transition(s0, n, Cs, B + ".singleTransition", single);
+  else transition(single, n, Cs, B + ".singleTransition");
 }
 void pairformerBlock(float* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B, const float* extraBias) {
-  if (flag("trunk.dialect.parallelPairformer")) die("chai-1's parallel pairformer is not in the native port yet");
+  if (flag("trunk.dialect.parallelPairformer")) {
+    // the single track reads the pair ENTERING the block, kept by the parallel updates
+    parallelPairUpdates(pair, m, n, C, B, "oirct");
+    singleTrack(single, scratch<float>("par.base", (size_t)n * n * C), m, n, C, Cs, B, extraBias);
+    return;
+  }
   pairUpdates(pair, m, n, C, B);
   singleTrack(single, pair, m, n, C, Cs, B, extraBias);
 }
