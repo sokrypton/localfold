@@ -9,10 +9,12 @@
   const int s = blockIdx.x, h = blockIdx.y, warp = _c.warp, lane = _c.lane;
   const int Wd = heads * D, W2 = 2 * Wd, ss = s % subsets;
   const float qs = scale * 1.4426950408889634f;
-  for (int t = threadIdx.x; t < KEYS * D; t += 64) {
+  // (four halves a load: D and the row strides are multiples of 4)
+  for (int t = threadIdx.x * 4; t < KEYS * D; t += 64 * 4) {
     int key = t / D, e = t % D;
     size_t row = ((size_t)s * KEYS + key) * W2 + h * D + e;
-    Ks[t] = kv[row]; Vs[t] = kv[row + Wd];
+    *(threadgroup half4*)(Ks + t) = *(device const half4*)(kv + row);
+    *(threadgroup half4*)(Vs + t) = *(device const half4*)(kv + row + Wd);
   }
   for (int t = threadIdx.x; t < 32 * D; t += 64) {
     int q = t / D, e = t % D;
