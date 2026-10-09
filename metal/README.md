@@ -44,9 +44,19 @@ protenix2 8.4e-7, intellifold2 1.1e-6 at `trunk_out_pair`; ESMFold2's language p
 
 ## How fast
 
-AF3 6MRR (68 tokens, 200 steps) folds in 6.4 s warm against WebGPU's 12.0 (cold 7.4 against 23.3); ESMFold2 6MRR in
-3.2 s for the whole job. At 255 tokens an AF3 fold is ~75 s, half trunk and half diffusion. Profile any fold with
-`--profile` (every kernel its own command buffer: an upper bound) and count with `LOCALFOLD_METAL_STATS=1`.
+On this M2 (10-core GPU), 2026-10-09, the whole job unless said:
+
+| | time | peak memory |
+|---|---|---|
+| AF3 6MRR (68 tokens, 200 steps) | fold 6.1 s (WebGPU: 12.0 warm) | 2.3 GB |
+| AF3 at 255 tokens (200 steps) | ~31 s: trunk 15.9, diffusion 14.5 (was ~75 s on 2026-10-08) | 3.3 GB |
+| ESMFold2 6MRR | 2.0 s | |
+| ESMFold2 5CAJ (261 tokens) | 14.8 s: trunk 12.1 (was 19.4) | 3.2 GB |
+| AF2 6MRR | 1.5 s | |
+| AF2 5CAJ + template (4 passes) | 16.5 s | 1.7 GB |
+
+Profile any fold with `--profile` (every kernel its own command buffer: an upper bound) and count with
+`LOCALFOLD_METAL_STATS=1` (which also prints the peak allocation); `LOCALFOLD_MEM=1` reports memory a phase.
 
 🔴 **THIS MACHINE THROTTLES, AND A BENCH CANNOT SEE IT.** The same 4096-cube GEMM read 2.43 TFLOP/s and, hours of load
 later, 1.19 - same binary. A ratio taken across that gap is a ratio of clocks. Interleave arms, and re-measure the
