@@ -825,7 +825,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // 128, interleaved on an M2) for a relRMS of 1.7e-3 against 2.4e-4 - bfloat16's rounding, the precision AF3 runs at.
   // Accumulating each k step in half and adding it to a float accumulator (6.6e-4) won nothing. A GEMM writing float
   // (a residual) keeps float. LOCALFOLD_GEMM_FLOAT_ACC=1 is the control arm.
-  static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") != nullptr;
+  static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") && strcmp(getenv("LOCALFOLD_GEMM_FLOAT_ACC"), "0") != 0;
   // (not a float output, even at k <= 128: 0.94x on the residual's GEMMs, and IntelliFold-2 and ESMFold2 overflowed
   // one of them to inf and crashed downstream)
   const bool hacc = !floatAcc && ta_ == CUDA_R_16F && tb_ == CUDA_R_16F && tc_ == CUDA_R_16F;

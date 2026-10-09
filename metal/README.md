@@ -70,8 +70,10 @@ runs at. GPU at 255 tokens 18.04 -> 17.31 s. A GEMM writing float (a residual) k
 in half and adding it to a float accumulator (6.6e-4) won nothing: the win is the accumulator's registers. On
 rosettafold3-6mrr the two arms agree to 0.01 A seed by seed (1.005/1.006, 1.672/1.671, 1.859/1.854, 1.770/1.782), and
 the gate's own seed moved 1.699 -> 1.764; that case and af3-glycan (44.35 -> 45.30, toward the A100's 47.42) were
-re-recorded. **AlphaFold 2 keeps float** (`metal/af2/defaults.env`): its no-alignment multimer moved 0.75 pLDDT, and
-its reference is a float model. `LOCALFOLD_GEMM_FLOAT_ACC=1` is the control. Extending it to the half-input, float-output GEMMs at k <= 128
+re-recorded. AlphaFold 2 too, after a first version kept it float: its three real folds (6MRR, and 5CAJ and 1BRS
+with templates) read the same digits either way and 5CAJ with its template folds 5.7% faster (19.65 -> 18.54 s,
+interleaved); only the two folds 15-20 A from their crystals moved (pLDDT 31-39), and one of those was re-recorded.
+`LOCALFOLD_GEMM_FLOAT_ACC=1` is the control. Extending it to the half-input, float-output GEMMs at k <= 128
 (the residual's updates) was 0.94x on them and **crashed** intellifold2, openbind0, opendde and two ESMFold2 cases:
 one of those sums overflowed half to inf and host code downstream segfaulted - so a float output keeps float.
 
