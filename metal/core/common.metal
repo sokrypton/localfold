@@ -366,6 +366,7 @@ kernel void lf_attention(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgr
 }
 template [[host_name("lf_attention_8")]] kernel void lf_attention<8>(constant AttnArgs&, uint3, uint, uint, uint);
 template [[host_name("lf_attention_16")]] kernel void lf_attention<16>(constant AttnArgs&, uint3, uint, uint, uint);
+template [[host_name("lf_attention_24")]] kernel void lf_attention<24>(constant AttnArgs&, uint3, uint, uint, uint);
 template [[host_name("lf_attention_32")]] kernel void lf_attention<32>(constant AttnArgs&, uint3, uint, uint, uint);
 template [[host_name("lf_attention_48")]] kernel void lf_attention<48>(constant AttnArgs&, uint3, uint, uint, uint);
 template [[host_name("lf_attention_64")]] kernel void lf_attention<64>(constant AttnArgs&, uint3, uint, uint, uint);

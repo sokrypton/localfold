@@ -596,7 +596,7 @@ void attention(const Attention& t) {
   a.r0 = t.r0; a.n = t.n; a.heads = t.heads; a.biasStride = t.biasStride; a.scale = t.scale;
   a.maskB = t.maskB || t.maskK ? t.maskB : t.n; a.maskK = t.maskB || t.maskK ? t.maskK : 1;
   a.pad0 = GEMM_EXTRA_EP;      // (an experiment's switch: metal/bench)
-  const char* k = t.D == 8 ? "lf_attention_8" : t.D == 16 ? "lf_attention_16" : t.D == 32 ? "lf_attention_32"
+  const char* k = t.D == 8 ? "lf_attention_8" : t.D == 16 ? "lf_attention_16" : t.D == 24 ? "lf_attention_24" : t.D == 32 ? "lf_attention_32"
                 : t.D == 48 ? "lf_attention_48" : t.D == 64 ? "lf_attention_64" : nullptr;
   if (!k) die("attention: no kernel for a head %d wide", t.D);
   if (t.rows > 65535 * 64) die("attention: %zu rows", t.rows);

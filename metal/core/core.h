@@ -112,7 +112,7 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half*
                  size_t pairs, int n, int np, const float* bias = nullptr);
 
 // ---------------------------------------------------------------- gated flash attention
-// out = softmax(q k^T scale + bias + mask) v * sigmoid(g), per batch row and head; D 8, 16, 32, 48 or 64. Dense
+// out = softmax(q k^T scale + bias + mask) v * sigmoid(g), per batch row and head; D 8, 16, 24, 32, 48 or 64. Dense
 // layouts by default ([rows][n][4W] in, [rows][n][W] out); strides for an attention ACROSS a tensor's leading axis
 struct Attention {
   const half* qkvg; half* out; int n, heads, D; size_t rows; float scale;

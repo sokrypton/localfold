@@ -1,5 +1,6 @@
 // metal/bench: GEMM arms timed against each other, interleaved (this laptop's clock drifts over minutes).
-//   metal/bench/localfold-bench <out> <rows> <in> [arms: EP bits, comma-separated, default 0,64] [types: hhh|hhf|fhf]
+//   metal/bench/localfold-bench <out> <rows> <in> [arms: EP bits, comma-separated, default 0,64; 1000 + B a K step of B]
+//                               [types: hhh|hhf|fhf]
 #include "core.h"
 #include <algorithm>
 #include <cmath>
@@ -91,7 +92,10 @@ int main(int argc, char** argv) {
   std::vector<std::vector<double>> times(arms.size());
   for (int round = 0; round < 7; ++round)
     for (size_t k = 0; k < arms.size(); ++k) {
-      GEMM_EXTRA_EP = arms[k] < 0 ? 0 : arms[k];
+      // (an arm of 1000 + B: the core GEMM with a K step of B - LOCALFOLD_GEMM_BK, read at every call)
+      if (arms[k] >= 1000) setenv("LOCALFOLD_GEMM_BK", std::to_string(arms[k] - 1000).c_str(), 1);
+      else unsetenv("LOCALFOLD_GEMM_BK");
+      GEMM_EXTRA_EP = arms[k] < 0 || arms[k] >= 1000 ? 0 : arms[k];
       fill(Y, 0, rows * out * (ty == F16 ? 2 : 4));
       auto runOnce = [&] {
         if (arms[k] < 0) {        // a negative arm: lf_gemm_x, its shape from LF_X=TR,TC,BK,SGR,SGC,HACC
