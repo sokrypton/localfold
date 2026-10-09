@@ -68,6 +68,7 @@ struct Runtime {
   id<MTLCommandBuffer> lastCommitted = nil;
   int encoded = 0, encodedInEncoder = 0;
   bool capturing = false;
+  std::mutex gpuErrorMu; std::string gpuError;   // the first command buffer to fail (commit's completion handler)
   std::vector<Op>* capture = nullptr;
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
   std::map<std::string, id<MTLComputePipelineState>> shimPipelines;
@@ -168,6 +169,15 @@ struct Runtime {
       cbKeep.clear();
       [cb addCompletedHandler:^(id<MTLCommandBuffer>) { keep.clear(); }];
     }
+    // every command buffer reports a failure, not only the last before a sync: one committed mid-stream (every 256
+    // dispatches) that fails - out of memory under another process's load, the GPU's watchdog - skips its work, and
+    // unchecked the fold would carry on from the skipped work's buffers as if it had run
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      if (done.error) {
+        std::lock_guard<std::mutex> g(gpuErrorMu);
+        if (gpuError.empty()) gpuError = done.error.localizedDescription.UTF8String;
+      }
+    }];
     [cb commit];
     ++stats.commits;
     lastCommitted = cb;
@@ -185,6 +195,8 @@ struct Runtime {
       if (lastCommitted.error) die(std::string("the GPU failed: ") + lastCommitted.error.localizedDescription.UTF8String);
       lastCommitted = nil;
     }
+    std::lock_guard<std::mutex> g(gpuErrorMu);
+    if (!gpuError.empty()) die("the GPU failed: " + gpuError);
   }
   bool idle() { return !cb && (!lastCommitted || lastCommitted.status >= MTLCommandBufferStatusCompleted); }
 
@@ -226,6 +238,7 @@ struct Runtime {
     if (argBytes <= 4096) [enc setBytes:args length:std::max<size_t>(argBytes, 4) atIndex:0];
     else {
       id<MTLBuffer> b = [dev newBufferWithBytes:args length:argBytes options:MTLResourceStorageModeShared];
+      if (!b) die("out of memory for a kernel's arguments (" + std::to_string(argBytes) + " bytes)");
       cbKeep.push_back(b);
       [enc setBuffer:b offset:0 atIndex:0];
     }
@@ -476,6 +489,8 @@ cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t bytes, cudaMemcpy
       if (!r.capturing && r.idle()) { memcpy(r.host(dst, bytes, "cudaMemcpy destination"), src, bytes); break; }
       {   // staged: the bytes now, the copy in stream order
         id<MTLBuffer> stage = [r.dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared];
+        // (a nil one has GPU address 0, and the copy would read zeros there in silence: a fold of the wrong input)
+        if (!stage) die("out of memory staging a " + std::to_string(bytes) + "-byte copy to the device");
         ++r.stats.staged;
         r.host(dst, bytes, "cudaMemcpy destination");
         if (r.capturing) {
