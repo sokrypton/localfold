@@ -13,3 +13,20 @@
                                         // rounding took 5CAJ's pLDDT 90.85 -> 74.36 with the structure unmoved)
                                         return n.rfind("c/", 0) == 0 || n.rfind("f/confidence", 0) == 0; });
 @@@ end
+# ...and at load, where the start-up's peak was: the tower's four matrices a block (towerHalf, on --fast) and the folding
+# bundle's large tensors but its confidence head's decoded straight into f16 (metal/af3/common.cuh.patch, HALF_ONLY),
+# never into a float32 copy beside the mirror made from it
+@@@ old
+  else { M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c", nullptr, "", "blocks/"); }   // (int8 tower blocks stay resident)
+@@@ new
+  else {
+    if (FAST && !getenv("LOCALFOLD_KEEP_F32")) {
+      HALF_ONLY = [](const std::string& n, size_t elements) {
+        if (n.rfind("c/", 0) == 0) return towerHalf(n);
+        return n.rfind("f/confidence", 0) != 0 && elements >= 65536;
+      };
+      installMirrorRebuild();
+    }
+    M.loadBundle(foldBundle, "f"); M.loadBundle(esmcBundle, "c", nullptr, "", "blocks/");   // (int8 tower blocks stay resident)
+  }
+@@@ end

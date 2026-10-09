@@ -111,8 +111,13 @@ time; two seeds of six samples (two batches through one preparation) give byte-i
 
 ESMFold2 takes the same weights change for its folding bundle (`metal/ef2/ef2.cu.patch`; the ESM-C tower's matrices
 were already dropped on `--fast`) - 0.68 GB less through the fold at 261 tokens - but **not its confidence head**:
-its f16 rounding took 5CAJ's pLDDT 90.85 -> 74.36 with the structure unmoved (bisected by prefix). Its peak is still
-the start-up's, 5.05 GB, where every weight is float32 and its mirror is being made.
+its f16 rounding took 5CAJ's pLDDT 90.85 -> 74.36 with the structure unmoved (bisected by prefix). And its peak was
+the start-up's, 5.05 GB, every weight float32 beside the mirror being made from it - so those tensors are now **decoded
+straight into f16 at load** (`HALF_ONLY`, `metal/af3/common.cuh.patch`: a half buffer a segment, the decode kernel
+writing it, the f32 copy never made): the tower's matrices and the folding bundle's large tensors. 5CAJ's peak
+allocation **5.05 -> 4.04 GB**, footprint 5.69 -> 4.10, the same digits. 🔴 A float copy rebuilt from a half-only
+tensor is a DERIVED weight: one rebuilt during the warm-up (which runs while the weights are still arriving) was garbage
+and became the fold's - pLDDT 71.4 - until it was forgotten with the others (FORGET_HOOKS).
 
 What was tried for speed and **lost**, so nobody repeats it blind (all `metal/tools/bench-gemm`, the runtime's GEMM
 alone - `metal/tools/build-bench-gemm.sh` builds it):

@@ -4,6 +4,7 @@
 struct Model {
 @@@ new
 inline std::function<const float*(const std::string&)> DROPPED_F32;
+inline std::function<bool(const std::string&, size_t)> HALF_ONLY;    // (Metal: loadBundle decodes these into f16 only)
 struct Model {
 @@@ end
 @@@ old
@@ -34,17 +35,18 @@ __global__ void halfToFloatWK(const half* h, float* f, size_t n) {
   if (i < n) f[i] = __half2float(h[i]);
 }
 inline std::map<std::string, float*> REBUILT_F32;
-inline size_t dropLargeFloatCopies(int seg, const std::function<bool(const std::string&)>& keepF32) {
-  constexpr size_t DROP_MIN = 65536;
-  std::set<std::string> groups;
-  for (auto& [name, e] : M.index)
-    if (e.seg == seg && e.kind == 't' && e.devOffset != Model::DROPPED && groups.insert(halfGroup(name)).second) Wh(name);
-  if (groups.empty()) return 0;
-  size_t freed = compactWeights(seg, [&](const std::string& n) {
-    bool d = M.len(n) >= DROP_MIN && !keepF32(n);
-    if (d && getenv("LOCALFOLD_MEM_DROPPED")) fprintf(stderr, "  f32 dropped: %s\n", n.c_str());
-    return d;
-  });
+inline void installMirrorRebuild() {
+  // 🔴 A DERIVED WEIGHT: a rebuilt copy made during a warm-up that ran while the weights were still arriving (cuda/ef2)
+  // is garbage, and kept it was the real fold's - 5CAJ through ESMFold2 at pLDDT 71.4 where it is 90.8. Forgotten with
+  // the others (FORGET_HOOKS), and rebuilt from the finished mirror on its next read.
+  static bool hooked = false;
+  if (!hooked) {
+    hooked = true;
+    FORGET_HOOKS.push_back([] {
+      for (auto& [k, f] : REBUILT_F32) { CK(cudaFree(f)); WF.erase(k); }
+      REBUILT_F32.clear();
+    });
+  }
   DROPPED_F32 = [](const std::string& k) -> const float* {
     auto it = REBUILT_F32.find(k);
     if (it != REBUILT_F32.end()) return it->second;
@@ -60,7 +62,137 @@ inline size_t dropLargeFloatCopies(int seg, const std::function<bool(const std::
     for (auto& [k, f] : REBUILT_F32) { CK(cudaFree(f)); WF.erase(k); }
     REBUILT_F32.clear();
   };
+}
+inline size_t dropLargeFloatCopies(int seg, const std::function<bool(const std::string&)>& keepF32) {
+  constexpr size_t DROP_MIN = 65536;
+  std::set<std::string> groups;
+  for (auto& [name, e] : M.index)
+    if (e.seg == seg && e.kind == 't' && e.devOffset != Model::DROPPED && groups.insert(halfGroup(name)).second) Wh(name);
+  if (groups.empty()) return 0;
+  size_t freed = compactWeights(seg, [&](const std::string& n) {
+    bool d = M.len(n) >= DROP_MIN && !keepF32(n);
+    if (d && getenv("LOCALFOLD_MEM_DROPPED")) fprintf(stderr, "  f32 dropped: %s\n", n.c_str());
+    return d;
+  });
+  installMirrorRebuild();
   return freed;
 }
 inline void forgetDerivedWeights() {
+@@@ end
+
+# (Metal) a bundle's chosen tensors decoded straight into f16 at load (HALF_ONLY, set by the port before loadBundle),
+# never into the f32 copy: the start-up's peak was every weight as float32 beside the f16 mirror made from it. A
+# half-only tensor's f32 is served, if anything reads it, by the DROPPED_F32 hook (rebuilt from its f16).
+@@@ old
+struct Entry { char kind; size_t offset, length; double value; int seg; size_t devOffset = 0; int rec = -1; };
+@@@ new
+struct Entry { char kind; size_t offset, length; double value; int seg; size_t devOffset = 0; int rec = -1;
+               size_t halfOff = ~(size_t)0; };     // (Metal: where a half-only tensor sits in its segment's halfDevice)
+@@@ end
+@@@ old
+               int round16 = 0, accumulate = 0, addRec = -1; size_t rows = 0; int rowBlocks = 0; };
+@@@ new
+               int round16 = 0, accumulate = 0, addRec = -1; size_t rows = 0; int rowBlocks = 0; int halfDst = 0; };
+@@@ end
+@@@ old
+__global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, float* out) {
+@@@ new
+__global__ void bundleDecodeK(const unsigned char* raw, const BDecode* table, float* out, half* outH) {
+@@@ end
+@@@ old
+    if (d.flags & 1) v = __half2float(__float2half_rn(v));
+    out[d.dst + o] = (d.flags & 2) ? __fadd_rn(out[d.dst + o], v) : v;
+@@@ new
+    if (d.flags & 1) v = __half2float(__float2half_rn(v));
+    if (d.flags & 4) { outH[d.dst + o] = __float2half_rn(v); continue; }     // (Metal: a half-only tensor)
+    out[d.dst + o] = (d.flags & 2) ? __fadd_rn(out[d.dst + o], v) : v;
+@@@ end
+@@@ old
+                 std::vector<std::vector<float>> consts;   // (a map's `c` lines, kind 8)
+               };
+@@@ new
+                 std::vector<std::vector<float>> consts;   // (a map's `c` lines, kind 8)
+                 half* halfDevice = nullptr; size_t halfElems = 0;   // (Metal: the half-only tensors, HALF_ONLY)
+               };
+@@@ end
+@@@ old
+      at = (at + 3) / 4 * 4;
+      Entry e{'t', 0, n, 0, seg}; e.devOffset = at; e.rec = (int)sg.recs.size(); b.dst = at; at += n;
+      index[key] = e;
+      sg.recs.push_back(b);
+@@@ new
+      if (HALF_ONLY && halfEligible(b) && HALF_ONLY(key, n)) {    // (Metal) decoded straight into f16, never into the f32 copy
+        Entry e{'t', 0, n, 0, seg}; e.devOffset = DROPPED; e.halfOff = sg.halfElems; e.rec = (int)sg.recs.size();
+        b.dst = sg.halfElems; b.halfDst = 1; sg.halfElems += (n + 7) / 8 * 8;
+        index[key] = e;
+        sg.recs.push_back(b);
+        addMeta(key + "#r", (double)shape.size());
+        for (size_t k = 0; k < shape.size(); ++k) addMeta(key + "#" + std::to_string(k), shape[k]);
+        continue;
+      }
+      at = (at + 3) / 4 * 4;
+      Entry e{'t', 0, n, 0, seg}; e.devOffset = at; e.rec = (int)sg.recs.size(); b.dst = at; at += n;
+      index[key] = e;
+      sg.recs.push_back(b);
+@@@ end
+@@@ old
+                           b.round16 | (b.accumulate << 1), b.rowBlocks});
+@@@ new
+                           b.round16 | (b.accumulate << 1) | (b.halfDst << 2), b.rowBlocks});
+@@@ end
+@@@ old
+st>>>(raw[k], dt[k] + t0, s.device);
+@@@ new
+st>>>(raw[k], dt[k] + t0, s.device, s.halfDevice);
+@@@ end
+@@@ old
+st>>>(raw[k], sdt[k] + t0, scratch);
+@@@ new
+st>>>(raw[k], sdt[k] + t0, scratch, nullptr);
+@@@ end
+@@@ old
+    float* scratch = nullptr;
+    if (s.scratchElems && devMalloc(&scratch, s.scratchElems * 4) != cudaSuccess) return false;
+@@@ new
+    float* scratch = nullptr;
+    if (s.scratchElems && devMalloc(&scratch, s.scratchElems * 4) != cudaSuccess) return false;
+    if (s.halfElems && !s.halfDevice && devMalloc(&s.halfDevice, s.halfElems * 2) != cudaSuccess) return false;
+@@@ end
+@@@ old
+  // the device copy of an entry: one allocation and one copy per file
+  const float* dev(const std::string& k) {
+@@@ new
+  // (Metal) a segment's device copy made, as dev() makes it, without reading an entry (a half-only one has none)
+  void ensureUp(int seg) {
+    Segment& s = segs[seg];
+    if (!s.device && (devMalloc(&s.device, std::max<size_t>(s.deviceBytes, 4)) != cudaSuccess || !copyUp(s))) {
+      fprintf(stderr, "cannot put a model.bin (%zu bytes) on the device\n", s.bytes); exit(1);
+    }
+  }
+  static bool halfEligible(const BRec& b) {
+    return (b.kind <= 3 || b.kind == 6 || b.kind == 7) && !b.round16 && !b.accumulate && b.addRec < 0;
+  }
+  // the device copy of an entry: one allocation and one copy per file
+  const float* dev(const std::string& k) {
+@@@ end
+@@@ old
+  const Entry& e0 = M.at(k);
+  Segment& s = M.segs[e0.seg];
+  std::string group = halfGroup(k);
+  void*& mirror = s.halfMirrors[group];
+  if (!mirror) {
+    M.dev(k);
+@@@ new
+  const Entry& e0 = M.at(k);
+  Segment& s = M.segs[e0.seg];
+  if (e0.halfOff != ~(size_t)0) { M.ensureUp(e0.seg); return s.halfDevice + e0.halfOff; }   // (Metal: half-only)
+  std::string group = halfGroup(k);
+  void*& mirror = s.halfMirrors[group];
+  if (!mirror) {
+    M.ensureUp(e0.seg);
+@@@ end
+@@@ old
+      if (e.seg != e0.seg || e.kind != 't' || halfGroup(name) != group) continue;
+@@@ new
+      if (e.seg != e0.seg || e.kind != 't' || halfGroup(name) != group || e.devOffset == Model::DROPPED) continue;
 @@@ end
