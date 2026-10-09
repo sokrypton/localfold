@@ -4346,7 +4346,7 @@ async function fold(event) {
   // will actually do rather than what a hidden control still says.
   devBeginRun(`fold · ${element("model-family").value}`
     + ` · alignment ${msaMode()}`
-    + ` · ${element("recycles").value} recycles`);
+    + ` · ${element("recycles").value} recycles`, MODEL_LABELS[element("model-family").value]);
   // 🔴 THE LAST FOLD'S NUMBERS GO BEFORE THIS ONE STARTS. The card kept showing
   // a mean pLDDT and a pTM for a structure that was no longer being computed,
   // for as long as the new fold took - which is worse than an empty panel,
