@@ -31,10 +31,14 @@ int main(int argc, char** argv) { @autoreleasepool {
     cudaMemcpy(dA, f32 ? (void*)Af.data() : (void*)A.data(), na * es, cudaMemcpyHostToDevice);
     cudaMemcpy(dB, f32 ? (void*)Bf.data() : (void*)B.data(), nb * es, cudaMemcpyHostToDevice);
     cublasHandle_t h; cublasCreate(&h);
-    float one = 1, zero = 0;
+    // OUT32=1: an f32 output from f16 operands (a residual's GEMM); BETA=1: accumulated into it (timings only)
+    const bool out32 = getenv("OUT32") != nullptr;
+    const cudaDataType tyc = out32 ? CUDA_R_32F : ty;
+    float one = 1, zero = 0, betav = getenv("BETA") ? 1.f : 0.f;
+    if (out32) { cudaFree(dC); cudaMalloc(&dC, nc * 4); cudaMemset(dC, 0, nc * 4); }
     int lda = c.ta ? c.k : c.m, ldb = c.tb ? c.n : c.k;
     auto run = [&] { cublasGemmEx(h, c.ta ? CUBLAS_OP_T : CUBLAS_OP_N, c.tb ? CUBLAS_OP_T : CUBLAS_OP_N, c.m, c.n, c.k, &one, dA, ty, lda,
-                                  dB, ty, ldb, &zero, dC, ty, c.m, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP); };
+                                  dB, ty, ldb, &betav, dC, tyc, c.m, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP); };
     run(); cudaDeviceSynchronize();
     std::vector<__half> C(nc); std::vector<float> Cf(nc);
     if (f32) { cudaMemcpy(Cf.data(), dC, nc * 4, cudaMemcpyDeviceToHost); for (size_t i = 0; i < nc; ++i) C[i] = __half(Cf[i]); }

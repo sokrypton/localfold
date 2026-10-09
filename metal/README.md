@@ -75,7 +75,11 @@ tiles resident to hide their loads. Interleaved on an M2: 0.73-0.85x the time on
 projections, 0.83-0.89x on the pair track's GEMMs, 0.84x on a 4096-cube in f16, and in f32 (AF2's) 0.62-0.95x. Bit
 for bit the same answer: the k order of the accumulation does not change. `LOCALFOLD_GEMM_BK=16|32` is the arm. The
 same for a 32-column tile of 80 rows or more (a short n in one tile row - AF3's diffusion at 68 tokens): 0.88x on
-3072 x 80 x 768, 0.91x on 73728 x 68 x 392, the 68-token diffusion 4979 -> 4725 ms; its 80 x 16 tiles stay at 32.
+3072 x 80 x 768, 0.91x on 73728 x 68 x 392, the 68-token diffusion 4979 -> 4725 ms; its 80 x 16 tiles stay at 32. And 48-column tiles where 64-column ones waste over a tenth of the columns, at a k step of 16:
+the triangle's contraction at 255 tokens (264 wide: 320 in 64s, 288 in 48s) 1404 -> 1267 ms. 🔴 After the narrowing
+for small grids, which halves 64 -> 32 -> 16 and would halve a 48 into 24 and 12 - a 24-column tile compiles and
+computes 8 of each simdgroup's 12 columns (AF2's template folds 19 A off), a 12 does not compile.
+`LOCALFOLD_GEMM_COL48=0` is the control.
 
 And: **the triangle's gated residual in the gate GEMM's epilogue** (`lf::gemmGatedAdd`, applied by
 `metal/af3/pairtrack.cuh.patch`): `gatedAddK`'s pass and the gate tensor gone, 19.99 -> 19.74 s of GPU at

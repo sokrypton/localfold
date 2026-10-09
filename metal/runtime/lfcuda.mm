@@ -808,8 +808,17 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // too few threadgroups for the device: narrower columns
   auto groups = [&](int c) { return (long)((a.m + c - 1) / c) * ((a.n + tr - 1) / tr) * batch; };
   while (tc > 16 && groups(tc) < 64) tc /= 2;
-  if ((a.epilogue & 128) && tc < 32) tc = 32;
-  if (a.epilogue & 256) tc = 64;     // (the triangle's gate: a simdgroup's four 8-column blocks are one group of channels)     // (SwiGLU's blocks of 8 pair two 8-column matrices a simdgroup)
+  // ...and the same for the columns: 48-column tiles where 64-column ones waste over a tenth of them on padding (the
+  // triangle's contraction at 255 tokens is 264 wide: 320 in 64s, 288 in 48s; 0.90x, at a k step of 16) - not SwiGLU's
+  // or the triangle gate's, whose epilogues pair a simdgroup's 8-column blocks. After the narrowing above, which would
+  // halve a 48 into tiles no kernel has (24, 12). LOCALFOLD_GEMM_COL48=0 is the control.
+  static const bool col48 = !getenv("LOCALFOLD_GEMM_COL48") || atoi(getenv("LOCALFOLD_GEMM_COL48"));
+  if (col48 && tc == 64 && !(a.epilogue & (128 | 256))) {
+    long pad64 = (long)((a.m + 63) / 64) * 64 - a.m, pad48 = (long)((a.m + 47) / 48) * 48 - a.m;
+    if (pad64 * 10 > a.m && pad48 < pad64) tc = 48;
+  }
+  if ((a.epilogue & 128) && tc < 32) tc = 32;     // (SwiGLU's blocks of 8 pair two 8-column matrices a simdgroup)
+  if (a.epilogue & 256) tc = 64;     // (the triangle's gate: a simdgroup's four 8-column blocks are one group of channels)
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tr, &tc);   // (an arm: one tile everywhere)
   int bm = tc, bn = tr;
   auto esize = [](cudaDataType t) { return t == CUDA_R_32F ? 4 : 2; };
@@ -824,7 +833,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   // resident to hide the loads - and 1.09x on a 64 x 32 tile, 1.08-1.21x on the 16-column ones
   // ...and 16 for a 32-column tile of 80 rows or more (a short n in one tile row: AF3's diffusion at 68 tokens), 0.88x on
   // 3072 x 80 x 768 and 0.91x on 73728 x 68 x 392 - where its 80 x 16 tiles stay at 32 (1.0-1.2x the other way)
-  int bk = (tc == 64 && tr >= 48) || (tc == 32 && tr >= 80) ? 16 : 32;
+  int bk = (tc >= 48 && tr >= 48) || (tc == 32 && tr >= 80) ? 16 : 32;
   if (const char* k = getenv("LOCALFOLD_GEMM_BK")) bk = atoi(k) == 16 ? 16 : 32;       // (an arm: 16 or 32 everywhere)
   // an all-half GEMM accumulates in half: 0.85x the time on the trunk's K-128 projections (512, 128 and 1024 x 68121 x
   // 128, interleaved on an M2) for a relRMS of 1.7e-3 against 2.4e-4 - bfloat16's rounding, the precision AF3 runs at.
