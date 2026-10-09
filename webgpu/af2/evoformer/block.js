@@ -203,41 +203,76 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 }
 
-export const GLOBAL_ATTENTION_FLASH_SHADER = `${GLOBAL_ATTENTION_COMMON}
+/**
+ * The global column attention's softmax over the sequences, a workgroup a (column, head).
+ *
+ * 🔴 IT RAN ONE THREAD A WORKGROUP. `@workgroup_size(1)` over (length, heads) is 2,040 threads at 255 residues -
+ * each walking all 1,024 extra sequences in turn - and its accumulator was `array<f32, 32>` indexed by a RUNTIME
+ * head width, which the compiler cannot keep in registers. 19.1 ms of a 326 ms extra-MSA block on an M2 at 255
+ * residues and 1,024 rows (tools/gpu/profile-af2-block.js --stack=extra). Now 64 lanes take the sequences in a
+ * stride, each with its own online softmax, and combine through workgroup memory; the head width is a constant of
+ * the shader (and of its pipeline key). The sum is regrouped, so it is a reordering and not bit-identical.
+ */
+export const GLOBAL_ATTENTION_FLASH_LANES = 64;
+export function createGlobalAttentionFlashShader(headDim) {
+  if (!Number.isInteger(headDim) || headDim < 1) throw new RangeError(`global attention head width ${headDim}`);
+  return `${GLOBAL_ATTENTION_COMMON}
+const LANES: u32 = ${GLOBAL_ATTENTION_FLASH_LANES}u;
+const HEAD_DIM: u32 = ${headDim}u;
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> keys: array<f32>;
 @group(0) @binding(2) var<storage, read> values: array<f32>;
 @group(0) @binding(3) var<storage, read> mask: array<f32>;
 @group(0) @binding(4) var<uniform> p: Parameters;
 @group(0) @binding(5) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let column = id.x; let head = id.y;
-  if (column >= p.length || head >= p.heads) { return; }
-  var maximum = -1e30; var denominator = 0.0;
-  var accumulated: array<f32, 32>;
-  for (var d = 0u; d < p.head_dim; d += 1u) { accumulated[d] = 0.0; }
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-    var logit = 0.0;
-    for (var d = 0u; d < p.head_dim; d += 1u) {
-      logit += query[(column * p.heads + head) * p.head_dim + d]
-        * keys[(column * p.sequences + sequence) * p.head_dim + d];
-    }
-    if (mask[sequence * p.length + column] == 0.0) { logit = -1e9; }
-    let next_maximum = max(maximum, logit);
-    let previous_scale = exp(maximum - next_maximum);
-    let weight = exp(logit - next_maximum);
-    denominator = denominator * previous_scale + weight;
-    for (var d = 0u; d < p.head_dim; d += 1u) {
-      accumulated[d] = accumulated[d] * previous_scale
-        + weight * values[(column * p.sequences + sequence) * p.head_dim + d];
-    }
-    maximum = next_maximum;
+var<workgroup> part_max: array<f32, LANES>;
+var<workgroup> part_den: array<f32, LANES>;
+var<workgroup> part_acc: array<f32, ${GLOBAL_ATTENTION_FLASH_LANES * headDim}>;
+@compute @workgroup_size(${GLOBAL_ATTENTION_FLASH_LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) local: u32) {
+  let column = group.x; let head = group.y;
+  // (no return before the barrier: the guard below is uniform across the workgroup, and the dispatch is exact)
+  let live = column < p.length && head < p.heads;
+  var q: array<f32, HEAD_DIM>;
+  var accumulated: array<f32, HEAD_DIM>;
+  for (var d = 0u; d < HEAD_DIM; d += 1u) {
+    q[d] = select(0.0, query[(column * p.heads + head) * HEAD_DIM + d], live);
+    accumulated[d] = 0.0;
   }
-  for (var d = 0u; d < p.head_dim; d += 1u) {
-    output[(column * p.heads + head) * p.head_dim + d] = accumulated[d] / denominator;
+  var maximum = -1e30; var denominator = 0.0;
+  if (live) {
+    for (var sequence = local; sequence < p.sequences; sequence += LANES) {
+      let row = (column * p.sequences + sequence) * HEAD_DIM;
+      var logit = 0.0;
+      for (var d = 0u; d < HEAD_DIM; d += 1u) { logit += q[d] * keys[row + d]; }
+      if (mask[sequence * p.length + column] == 0.0) { logit = -1e9; }
+      let next_maximum = max(maximum, logit);
+      let previous_scale = exp(maximum - next_maximum);
+      let weight = exp(logit - next_maximum);
+      denominator = denominator * previous_scale + weight;
+      for (var d = 0u; d < HEAD_DIM; d += 1u) {
+        accumulated[d] = accumulated[d] * previous_scale + weight * values[row + d];
+      }
+      maximum = next_maximum;
+    }
+  }
+  part_max[local] = maximum;
+  part_den[local] = denominator;
+  for (var d = 0u; d < HEAD_DIM; d += 1u) { part_acc[local * HEAD_DIM + d] = accumulated[d]; }
+  workgroupBarrier();
+  if (live && local < HEAD_DIM) {
+    var top = -1e30;
+    for (var t = 0u; t < LANES; t += 1u) { top = max(top, part_max[t]); }
+    var den = 0.0; var num = 0.0;
+    for (var t = 0u; t < LANES; t += 1u) {
+      let w = exp(part_max[t] - top);
+      den += part_den[t] * w;
+      num += part_acc[t * HEAD_DIM + local] * w;
+    }
+    output[(column * p.heads + head) * HEAD_DIM + local] = num / den;
   }
 }`;
+}
 
 /**
  * The global column attention's gated output projection.
@@ -780,7 +815,7 @@ async function encodeGlobalAttention(
     execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
     execution.pipelines.get(`block:global-attention:query:${shape.cM}:${w.heads}:${headDim}`,
       createGlobalAttentionQueryShader(shape.cM, w.heads, headDim)),
-    execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
+    execution.pipelines.get(`block:global-attention:flash:${headDim}`, createGlobalAttentionFlashShader(headDim)),
     // ...the SHAPE is in the key because the kernel is generated for it; see
     // createGlobalAttentionOutputShader.
     execution.pipelines.get(

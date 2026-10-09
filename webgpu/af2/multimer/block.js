@@ -83,7 +83,7 @@ import { SOURCES } from "../../../shared/bundles/alphafold-fixture.js";
 import { WebGpuExecution } from "../../runtime/execution.js";
 import { shapedKnob } from "../../runtime/device-profile.js";
 import {
-  GLOBAL_ATTENTION_FLASH_SHADER, GLOBAL_ATTENTION_KV_SHADER,
+  createGlobalAttentionFlashShader, GLOBAL_ATTENTION_KV_SHADER,
   createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
 } from "../evoformer/block.js";
 import { deviceTuning } from "../../runtime/device-profile.js";
@@ -463,7 +463,7 @@ async function encodeGlobalAttention(
     execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
     execution.pipelines.get(`block:global-attention:query:${shape.cM}:${w.heads}:${headDim}`,
       createGlobalAttentionQueryShader(shape.cM, w.heads, headDim)),
-    execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
+    execution.pipelines.get(`block:global-attention:flash:${headDim}`, createGlobalAttentionFlashShader(headDim)),
     execution.pipelines.get(
       `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}`
         + `:${shape.cM}:${w.heads}:${headDim}`,

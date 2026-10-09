@@ -157,8 +157,12 @@ export async function main(device, args) {
   const cM = extra ? 64 : 256;
 
   const { MODEL_BUNDLES, loadManifest } = await import("../../shared/bundles/manifests/index.js");
-  const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(
-    MODEL_BUNDLES.monomer.directory, await loadManifest("monomer")));
+  // `--bundle=<directory>` opens that bundle's own manifest.json, as fold-af2.js does (a checkout whose ./model/ is
+  // an older export lacks the extra stack's tensors)
+  const bundleDirectory = option(args, "bundle", "").replace(/\/$/, "");
+  const fixture = AlphaFoldFixture.fromStore(bundleDirectory === ""
+    ? await HttpTensorStore.fromManifest(MODEL_BUNDLES.monomer.directory, await loadManifest("monomer"))
+    : await HttpTensorStore.open(`${bundleDirectory}/manifest.json`));
   const blockWeights = extra ? await fixture.extraStackWeights() : await fixture.mainStackWeights();
 
   // 🔴 SYNTHETIC ACTIVATIONS, WHICH IS SOUND FOR TIMING AND ONLY FOR TIMING.
