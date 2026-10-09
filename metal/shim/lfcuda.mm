@@ -773,7 +773,7 @@ void gemm(cudaDataType ta_, cudaDataType tb_, cudaDataType tc_, GemmArgs a, int 
   std::lock_guard<std::recursive_mutex> l(r.mu);
   // LOCALFOLD_CHECK_GEMM=<calls>: the first calls recomputed on the host (sampled entries, double) and compared
   static int checks = getenv("LOCALFOLD_CHECK_GEMM") ? atoi(getenv("LOCALFOLD_CHECK_GEMM")) : 0;
-  bool check = checks > 0 && !r.capturingHere() && (!a.ptrs || a.beta == 0.f) && !(a.epilogue & 64);
+  bool check = checks > 0 && !r.capturingHere() && (!a.ptrs || a.beta == 0.f) && !(a.epilogue & (64 | 128));
   std::vector<unsigned char> cBefore;
   if (check) {
     --checks;
@@ -836,6 +836,12 @@ void lf::gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair
              0, 0, 0, 64, 0, 1.f, 0.f};
   a.aux = (uint64_t)aux; a.ldaux = out;
   gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, a, 1);
+}
+// gated[r][k] = silu(a) b, (a, b) = (X W)[r][2k, 2k+1]: W's columns interleaved a_0 b_0 a_1 b_1 ... (metal/af3/patch)
+void lf::gemmSwiglu(const void* X, const void* Wpairs, void* gated, size_t rows, int in, int hidden) {
+  GemmArgs a{(uint64_t)Wpairs, (uint64_t)X, (uint64_t)gated, (uint64_t)gated, 0, 0, 0, 0, 0, 2 * hidden, (int)rows, in,
+             2 * hidden, in, hidden, hidden, 0, 0, 0, 128, 0, 1.f, 0.f};
+  gemm(CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, a, 1);
 }
 namespace {
 float scalar(const void* p, cublasComputeType_t compute) {

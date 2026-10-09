@@ -13,3 +13,49 @@
     linear<T, T>(norm + r0 * C, t2, rows, C, C, pre + ".gatingLinear");
     WITH_PAIR_T(gatedAddK<T, PT><<<blocks(rows * C), 256, 0, STREAM>>>(pairRow(into(pair), r0, C), t1, t2, rows * C));
 @@@ end
+
+# The unfused pair transition: its first GEMM writes silu(a) b straight from its accumulators (lf::gemmSwiglu, over the
+# weight with a's and b's columns interleaved), where the port writes the 2I-wide widening and runs swigluK over it.
+# LOCALFOLD_UNFUSED_SWIGLU=1 is the control.
+@@@ old
+    linear<T, T>(xn, wide, r, C, 2 * I, pre + ".transition1");
+    swiglu<T>(wide, gated, r, I);
+@@@ new
+    static const bool fuseSwiglu = !getenv("LOCALFOLD_UNFUSED_SWIGLU");
+    if constexpr (std::is_same_v<T, half>) if (fuseSwiglu) {
+      lf::gemmSwiglu(xn, swigluPairs(pre + ".transition1", C, I), gated, r, C, I);
+      linearIntoPairRows<T>(gated, into(x), r0, r, I, C, pre + ".transition2");
+      continue;
+    }
+    linear<T, T>(xn, wide, r, C, 2 * I, pre + ".transition1");
+    swiglu<T>(wide, gated, r, I);
+@@@ end
+
+# (the interleaved weight lf::gemmSwiglu reads, defined just before the transition that uses it)
+@@@ old
+template <class T>
+void transition(float* x, size_t rows, int C, int factor, const std::string& pre) {
+@@@ new
+// (Metal) a transition's first weight [in][2I] with a's and b's columns interleaved - a_0 b_0 a_1 b_1 ... - for
+// lf::gemmSwiglu, whose epilogue reads a lane's adjacent pair. Derived on the device once per weight and registered with
+// FORGET_HOOKS: a weight derived during a warm-up that ran while the bundle was still uploading is rebuilt after it.
+__global__ void interleaveHalvesK(const half* w, half* out, int rows, int I) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)rows * 2 * I) return;
+  size_t r = t / (2 * I); int c = (int)(t % (2 * I));
+  int k = c / 2;
+  out[t] = w[r * 2 * I + ((c & 1) ? I + k : k)];
+}
+inline const half* swigluPairs(const std::string& name, int rows, int I) {
+  static std::map<std::string, half*> made;
+  static bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& kv : made) CK(cudaFree(kv.second)); made.clear(); }); hooked = true; }
+  auto it = made.find(name);
+  if (it != made.end()) return it->second;
+  half* out = dallocT<half>((size_t)rows * 2 * I);
+  interleaveHalvesK<<<blocks((size_t)rows * 2 * I), 256, 0, STREAM>>>(Wh(name), out, rows, I);
+  return made[name] = out;
+}
+template <class T>
+void transition(float* x, size_t rows, int C, int factor, const std::string& pre) {
+@@@ end

@@ -315,6 +315,8 @@ void launch(int kernel, std::initializer_list<std::string> targs, KArgs& args);
 // the runtime's own GEMM with a gated residual in its epilogue: pair[r][o] += aux[r][o] * sigmoid(X W) (X, W, aux half;
 // W [in][out] as cuBLAS's ports hand it). For host patches (metal/<owner>/patch) that fuse a gate's pass away.
 void gemmGatedAdd(const void* X, const void* W, const void* aux, float* pair, size_t rows, int in, int out);
+// gated[r][k] = silu(a) * b where (a, b) = (X W)[r][2k, 2k+1]: W [in][2 hidden] with a's and b's columns interleaved (half)
+void gemmSwiglu(const void* X, const void* Wpairs, void* gated, size_t rows, int in, int hidden);
 // a template argument as the Metal source spells it
 template <class T> std::string tname();
 template <> inline std::string tname<float>() { return "float"; }

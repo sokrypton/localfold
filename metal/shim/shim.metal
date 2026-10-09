@@ -189,6 +189,14 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
       thread auto& e = acc[a][b].thread_elements();
       int j = j0 + sr + a * 8 + sm;
       if (j >= g.n) continue;
+      if (g.epilogue & 128) {      // SwiGLU over adjacent pairs: columns (2k, 2k+1) are (a_k, b_k), D gets silu(a) b at k
+        int i = i0 + sc + b * 8 + sn;
+        if (i + 1 < g.m) {
+          float va = g.alpha * e[0], vb = g.alpha * e[1];
+          lf_st(D, (ulong)(i / 2) + (ulong)j * g.ldd, va / (1.f + exp(-va)) * vb);
+        }
+        continue;
+      }
       _Pragma("clang loop unroll(full)")
       for (int t = 0; t < 2; ++t) {
         int i = i0 + sc + b * 8 + sn + t;
