@@ -43,3 +43,28 @@ inline size_t dropFloatCopies(int segs) {
 @@@ new
     if (tight || !getenv("LOCALFOLD_KEEP_SCRATCH")) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln", "enc.tp", "enc.h1", "enc.h2" });
 @@@ end
+# (Metal) ...and at load: the published bundle's large tensors decoded straight into f16, never into a float32 copy
+# (the start-up held both, the mirror made from the copy)
+@@@ old
+  else if (!bundleDir.empty())                      // ...or read as published, through the family's weight walk
+    M.loadBundle(bundleDir, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
+      lf::weights::Shapes S; S.shape = shapes;
+      return lf::weights::af3WeightLines(family, S);
+    });
+@@@ new
+  else if (!bundleDir.empty()) {                    // ...or read as published, through the family's weight walk
+    // (Metal) the large tensors decoded straight into f16 (HALF_ONLY, metal/af3/common.cuh.patch) - but the input
+    // embedder's and the confidence head's, which read float (dropFloatCopies, below, says why)
+    if (!getenv("LOCALFOLD_KEEP_F32")) {
+      HALF_ONLY = [](const std::string& n, size_t elements) {
+        return elements >= 65536 && n.rfind("trunk.embedder.", 0) != 0 && n.rfind("confidence.", 0) != 0;
+      };
+      installMirrorRebuild();
+    }
+    M.loadBundle(bundleDir, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
+      lf::weights::Shapes S; S.shape = shapes;
+      return lf::weights::af3WeightLines(family, S);
+    });
+    HALF_ONLY = nullptr;
+  }
+@@@ end

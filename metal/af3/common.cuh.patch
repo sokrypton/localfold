@@ -196,3 +196,23 @@ st>>>(raw[k], sdt[k] + t0, scratch, nullptr);
 @@@ new
       if (e.seg != e0.seg || e.kind != 't' || halfGroup(name) != group || e.devOffset == Model::DROPPED) continue;
 @@@ end
+@@@ old
+        at = (at + 3) / 4 * 4;
+        Entry e{'t', 0, n, 0, seg}; e.devOffset = at; e.rec = (int)sg.recs.size(); b.dst = at; at += n;
+        index[name] = e;
+        if (!bSource.empty() && deltaOf.count(bSource)) withDelta(bSource, b, sg.recs);
+        else sg.recs.push_back(b);
+@@@ new
+        if (HALF_ONLY && halfEligible(b) && !(!bSource.empty() && deltaOf.count(bSource)) && HALF_ONLY(name, n)) {
+          Entry e{'t', 0, n, 0, seg}; e.devOffset = DROPPED; e.halfOff = sg.halfElems; e.rec = (int)sg.recs.size();   // (Metal: f16 only)
+          b.dst = sg.halfElems; b.halfDst = 1; sg.halfElems += (n + 7) / 8 * 8;
+          index[name] = e;
+          sg.recs.push_back(b);
+          continue;
+        }
+        at = (at + 3) / 4 * 4;
+        Entry e{'t', 0, n, 0, seg}; e.devOffset = at; e.rec = (int)sg.recs.size(); b.dst = at; at += n;
+        index[name] = e;
+        if (!bSource.empty() && deltaOf.count(bSource)) withDelta(bSource, b, sg.recs);
+        else sg.recs.push_back(b);
+@@@ end
