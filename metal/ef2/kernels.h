@@ -19,7 +19,6 @@ struct PairJoinArgs { CP(float) s; DP(half) out; uint T, i0, bi, C; };
 struct ZInitArgs { CP(float) rows; CP(float) cols; RelIdx rel; CP(float) bonds; CP(float) wBond; CP(float) lmZ; DP(float) z; uint T, C; };
 // the triangle's projection and gate as gemmTriGate's one weight: channel c's (pa ga pb gb) in blocks of 8
 struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C; };
-struct CenterNormArgs { CP(float) prod; DP(half) out; u64 pairs; uint C, L, Lp, pad; CP(float) scale; CP(float) offset; };
 struct FillFArgs { DP(float) out; u64 n; float v; uint pad; };
 struct SymRowsArgs { CP(float) z; DP(float) out; u64 p0, cnt; uint T, C; };
 struct ContactsArgs { CP(float) logits; CP(int) contactBins; DP(float) out; u64 pairs; uint bins, pad; };

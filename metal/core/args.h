@@ -42,13 +42,15 @@ struct LayerNormArgs {      // a simdgroup a row; scale/offset may be null; x f3
 struct AddArgs { DP(float) y; CP(float) x; u64 n; float a; uint pad; };   // y += a x
 struct BiasArgs { DP(float) y; CP(float) b; u64 rows; int C; int act; };  // y += b per column, act 1 relu 2 gelu(erf)
 
+// the triangle's centre LayerNorm: the channel-major product [C][Lp * Lp] to pair rows [pairs][C], half
+struct CenterNormArgs { CP(float) prod; DP(half) out; u64 pairs; uint C, L, Lp, pad; CP(float) scale; CP(float) offset; };
 // gated flash attention (metal/core/common.metal, lf_attention): per batch row b and head h, the queries' and keys'
 // q | k | v | g at qkvg + b rowStride + position posStride (+ 0, W, 2W, 3W, then h D); out at b outRowStride +
 // position outPosStride + h D. bias [H][n][biasStride] in log2 units, shared by every row; mask the key's,
-// mask[(r0 + b) n + key] or (maskT) mask[key n + r0 + b]; qBias [W] added to the query
+// mask[(r0 + b) maskB + key maskK]; qBias [W] added to the query
 struct AttnArgs { CP(half) qkvg; DP(half) out; CP(half) bias; CP(float) mask; CP(float) qBias;
-                  i64 rowStride, posStride, outRowStride, outPosStride, r0;
-                  int n, heads, biasStride, maskT; float scale; int pad; };
+                  i64 rowStride, posStride, outRowStride, outPosStride, r0, maskB, maskK;
+                  int n, heads, biasStride, pad0; float scale; int pad; };
 
 // ---------------------------------------------------------------- GEMM (metal/core/gemm.metal)
 struct GemmArgs {

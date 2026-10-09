@@ -196,110 +196,171 @@ kernel void lf_add_bias(LF_ARGS(BiasArgs)) {
   a.y[t] = v;
 }
 
+// the triangle's centre LayerNorm: the channel-major product [C][Lp * Lp] to pair rows [pairs][C] in half. A lane a pair,
+// eight simdgroups splitting the channels, every value in registers, the two-pass statistics through a 1 KB tile, the
+// rows written coalesced through a half tile (C a multiple of 8, at most 256)
+kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float part[256];
+  threadgroup half T[32 * (256 + 8)];
+  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 8;
+  const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * 32;
+  const uint rr = (uint)(r0 + lane), ii = lf_udiv(rr, a.L);
+  const ulong q = (ulong)ii * a.Lp + (rr - ii * a.L), plane = (ulong)a.Lp * a.Lp;
+  const bool live = r0 + lane < a.pairs;
+  float v[32];
+  float s = 0.f;
+  for (uint k = 0; k < 32; ++k) if (k < nk) { v[k] = live ? a.prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
+  part[grp * 32 + lane] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float S = 0.f;
+  for (int g = 0; g < 8; ++g) S += part[g * 32 + lane];
+  const float mean = S / C;
+  float d2 = 0.f;
+  for (uint k = 0; k < 32; ++k) if (k < nk) { float d = v[k] - mean; d2 += d * d; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  part[grp * 32 + lane] = d2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float V = 0.f;
+  for (int g = 0; g < 8; ++g) V += part[g * 32 + lane];
+  const float inv = rsqrt(V / C + 1e-5f);
+  for (uint k = 0; k < 32; ++k) if (k < nk) {
+    uint c = grp + 8 * k;
+    T[lane * ld + c] = (half)((v[k] - mean) * inv * a.scale[c] + a.offset[c]);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint row = grp; row < 32; row += 8) {
+    ulong r = r0 + row;
+    if (r >= a.pairs) break;
+    for (uint c = lane; c < C; c += 32) a.out[r * C + c] = T[row * ld + c];
+  }
+}
 // ---------------------------------------------------------------- gated flash attention
-// A threadgroup is 64 queries of one (row, head), four simdgroups of 16; keys in tiles of 32 staged in threadgroup
-// memory. Scores and P V on 8 x 8 simdgroup matrices (half in, float accumulated), the softmax online in the log2
+// A threadgroup is 32 queries of one (row, head), four simdgroups of 8; keys in tiles of 16 staged in threadgroup memory
+// - the smallest of each measured fastest (0.94 TFLOP/s at 16 queries and 32 keys, 0.75 at 32 queries, 0.64 at 64 keys,
+// 1.22 here, on a 195-residue triangle attention: the kernel is bound by its registers, not its loads). Scores and P V on 8 x 8 simdgroup matrices (half in, float accumulated), the softmax online in the log2
 // domain (the query carries scale log2e, the bias is log2-scaled already). A lane holds row sm of each 8 x 8 matrix,
 // columns sn and sn + 1; a row's four lanes differ in lane bits 0 and 3.
-template <int D>
+#define LF_UNROLL _Pragma("clang loop unroll(full)")
+template <int D, int KT = 16, int QR = 1>
 kernel void lf_attention(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                          uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int QB = 64, KT = 32, LD = D + 8, DF = D / 8;
+  constexpr int QB = 32 * QR, LD = D + 8, DF = D / 8, D8 = D / 8, KF = KT / 8;
   threadgroup half Qs[QB * LD];
   threadgroup half Ks[KT * LD];
   threadgroup half Vs[KT * LD];
   const int b = tg.y, h = tg.z, q0 = tg.x * QB, n = a.n, W = a.heads * D;
   device const half* base = a.qkvg + (long)b * a.rowStride + h * D;
   const float qs = a.scale * M_LOG2E_F;
-  for (int e = tid; e < QB * D; e += 128) {
-    int qi = e / D, d = e - qi * D, q = q0 + qi;
-    float v = q < n ? (float)base[(long)q * a.posStride + d] + (a.qBias ? a.qBias[h * D + d] : 0.f) : 0.f;
-    Qs[qi * LD + d] = (half)(v * qs);
+  // the queries (scaled, the query bias added), eight halves a load
+  for (int e = tid; e < QB * D8; e += 128) {
+    int qi = e / D8, d = (e - qi * D8) * 8, q = q0 + qi;
+    half4 v0 = half4(0), v1 = half4(0);
+    if (q < n) {
+      device const half* src = base + (long)q * a.posStride + d;
+      float4 f0 = float4(*(device const half4*)src), f1 = float4(*(device const half4*)(src + 4));
+      if (a.qBias) { f0 += *(device const float4*)(a.qBias + h * D + d); f1 += *(device const float4*)(a.qBias + h * D + d + 4); }
+      v0 = half4(f0 * qs); v1 = half4(f1 * qs);
+    }
+    *(threadgroup half4*)(Qs + qi * LD + d) = v0;
+    *(threadgroup half4*)(Qs + qi * LD + d + 4) = v1;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  simdgroup_half8x8 qf[2][DF];
-  for (int r = 0; r < 2; ++r)
-    for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[r][dk], Qs + (sg * 16 + r * 8) * LD + dk * 8, LD);
+  simdgroup_half8x8 qf[QR][DF];
+  LF_UNROLL for (int r = 0; r < QR; ++r)
+    LF_UNROLL for (int dk = 0; dk < DF; ++dk) simdgroup_load(qf[r][dk], Qs + (sg * 8 * QR + r * 8) * LD + dk * 8, LD);
   const int sm = (lane / 16) * 4 + (lane % 8) / 2, sn = ((lane / 8) % 2) * 4 + (lane % 2) * 2;
-  float m[2] = {-1e30f, -1e30f}, l[2] = {0.f, 0.f};
-  simdgroup_float8x8 o[2][DF];
-  for (int r = 0; r < 2; ++r) for (int c = 0; c < DF; ++c) o[r][c] = simdgroup_float8x8(0);
+  float m[QR], l[QR];
+  LF_UNROLL for (int r = 0; r < QR; ++r) { m[r] = -1e30f; l[r] = 0.f; }
+  simdgroup_float8x8 o[QR][DF];
+  LF_UNROLL for (int r = 0; r < QR; ++r) LF_UNROLL for (int c = 0; c < DF; ++c) o[r][c] = simdgroup_float8x8(0);
   const long bq = (long)(a.r0 + b);
+  device const half* brow[QR];
+  LF_UNROLL for (int r = 0; r < QR; ++r) {
+    const int q = min(q0 + (int)sg * 8 * QR + r * 8 + sm, n - 1);
+    brow[r] = a.bias ? a.bias + ((long)h * n + q) * a.biasStride : nullptr;
+  }
   for (int k0 = 0; k0 < n; k0 += KT) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int e = tid; e < KT * D; e += 128) {
-      int kj = e / D, d = e - kj * D, k = k0 + kj;
-      bool live = k < n;
-      Ks[kj * LD + d] = live ? base[(long)k * a.posStride + W + d] : (half)0;
-      Vs[kj * LD + d] = live ? base[(long)k * a.posStride + 2 * W + d] : (half)0;
+    for (int e = tid; e < KT * D8; e += 128) {
+      int kj = e / D8, d = (e - kj * D8) * 8, k = k0 + kj;
+      half4 k0v = half4(0), k1v = half4(0), v0 = half4(0), v1 = half4(0);
+      if (k < n) {
+        device const half* src = base + (long)k * a.posStride + d;
+        k0v = *(device const half4*)(src + W); k1v = *(device const half4*)(src + W + 4);
+        v0 = *(device const half4*)(src + 2 * W); v1 = *(device const half4*)(src + 2 * W + 4);
+      }
+      *(threadgroup half4*)(Ks + kj * LD + d) = k0v; *(threadgroup half4*)(Ks + kj * LD + d + 4) = k1v;
+      *(threadgroup half4*)(Vs + kj * LD + d) = v0; *(threadgroup half4*)(Vs + kj * LD + d + 4) = v1;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_float8x8 s[2][4];
-    for (int r = 0; r < 2; ++r) for (int j = 0; j < 4; ++j) s[r][j] = simdgroup_float8x8(0);
-    for (int j = 0; j < 4; ++j)
-      for (int dk = 0; dk < DF; ++dk) {
+    simdgroup_float8x8 s[QR][KF];
+    LF_UNROLL for (int r = 0; r < QR; ++r) LF_UNROLL for (int j = 0; j < KF; ++j) s[r][j] = simdgroup_float8x8(0);
+    LF_UNROLL for (int j = 0; j < KF; ++j)
+      LF_UNROLL for (int dk = 0; dk < DF; ++dk) {
         simdgroup_half8x8 kt;
         simdgroup_load(kt, Ks + (j * 8) * LD + dk * 8, LD, ulong2(0, 0), true);
-        for (int r = 0; r < 2; ++r) simdgroup_multiply_accumulate(s[r][j], qf[r][dk], kt, s[r][j]);
+        LF_UNROLL for (int r = 0; r < QR; ++r) simdgroup_multiply_accumulate(s[r][j], qf[r][dk], kt, s[r][j]);
       }
     // the bias, the mask and the keys past n; each row's new maximum
-    float mk[4][2];
-    for (int j = 0; j < 4; ++j)
-      for (int t = 0; t < 2; ++t) {
+    const bool whole = k0 + KT <= n;
+    float mk[KF][2];
+    LF_UNROLL for (int j = 0; j < KF; ++j)
+      LF_UNROLL for (int t = 0; t < 2; ++t) {
         int k = k0 + j * 8 + sn + t;
         float v = 0.f;
-        if (k >= n) v = -1e30f;
-        else if (a.mask) v = a.mask[a.maskT ? (long)k * n + bq : bq * n + k] > 0.f ? 0.f : -1e9f;
+        if (!whole && k >= n) v = -1e30f;
+        else if (a.mask) v = a.mask[bq * a.maskB + (long)k * a.maskK] > 0.f ? 0.f : -1e9f;
         mk[j][t] = v;
       }
-    simdgroup_half8x8 p[2][4];
-    for (int r = 0; r < 2; ++r) {
-      const int q = q0 + sg * 16 + r * 8 + sm;
-      device const half* brow = a.bias ? a.bias + ((long)h * n + min(q, n - 1)) * a.biasStride : nullptr;
+    simdgroup_half8x8 p[QR][KF];
+    const bool bias2 = (a.biasStride & 1) == 0;     // (the bias's rows padded even: a lane's two in one load)
+    LF_UNROLL for (int r = 0; r < QR; ++r) {
       float rowMax = -1e30f;
-      for (int j = 0; j < 4; ++j) {
+      LF_UNROLL for (int j = 0; j < KF; ++j) {
         thread auto& e = s[r][j].thread_elements();
-        for (int t = 0; t < 2; ++t) {
-          int k = k0 + j * 8 + sn + t;
-          float v = e[t] + mk[j][t] + (brow && k < n ? (float)brow[k] : 0.f);
-          e[t] = v;
-          rowMax = max(rowMax, v);
+        const int k = k0 + j * 8 + sn;
+        float2 bv = float2(0.f);
+        if (brow[r]) {
+          if (bias2 && (whole || k + 1 < n)) bv = float2(*(device const half2*)(brow[r] + k));
+          else { bv.x = whole || k < n ? (float)brow[r][k] : 0.f; bv.y = whole || k + 1 < n ? (float)brow[r][k + 1] : 0.f; }
         }
+        e[0] += mk[j][0] + bv.x; e[1] += mk[j][1] + bv.y;
+        rowMax = max(rowMax, max(e[0], e[1]));
       }
       rowMax = max(rowMax, simd_shuffle_xor(rowMax, (ushort)1));
       rowMax = max(rowMax, simd_shuffle_xor(rowMax, (ushort)8));
       float mn = max(m[r], rowMax), corr = exp2(m[r] - mn), sum = 0.f;
-      for (int j = 0; j < 4; ++j) {
+      LF_UNROLL for (int j = 0; j < KF; ++j) {
         thread auto& e = s[r][j].thread_elements();
         thread auto& pe = p[r][j].thread_elements();
-        for (int t = 0; t < 2; ++t) { float pv = exp2(e[t] - mn); sum += pv; pe[t] = (half)pv; }
+        LF_UNROLL for (int t = 0; t < 2; ++t) { float pv = exp2(e[t] - mn); sum += pv; pe[t] = (half)pv; }
       }
       sum += simd_shuffle_xor(sum, (ushort)1);
       sum += simd_shuffle_xor(sum, (ushort)8);
       l[r] = l[r] * corr + sum; m[r] = mn;
-      for (int c = 0; c < DF; ++c) { thread auto& oe = o[r][c].thread_elements(); oe[0] *= corr; oe[1] *= corr; }
+      LF_UNROLL for (int c = 0; c < DF; ++c) { thread auto& oe = o[r][c].thread_elements(); oe[0] *= corr; oe[1] *= corr; }
     }
-    for (int j = 0; j < 4; ++j)
-      for (int c = 0; c < DF; ++c) {
+    LF_UNROLL for (int j = 0; j < KF; ++j)
+      LF_UNROLL for (int c = 0; c < DF; ++c) {
         simdgroup_half8x8 vf;
         simdgroup_load(vf, Vs + (j * 8) * LD + c * 8, LD);
-        for (int r = 0; r < 2; ++r) simdgroup_multiply_accumulate(o[r][c], p[r][j], vf, o[r][c]);
+        LF_UNROLL for (int r = 0; r < QR; ++r) simdgroup_multiply_accumulate(o[r][c], p[r][j], vf, o[r][c]);
       }
   }
   // out = O / l * sigmoid(gate)
-  for (int r = 0; r < 2; ++r) {
-    const int q = q0 + sg * 16 + r * 8 + sm;
+  LF_UNROLL for (int r = 0; r < QR; ++r) {
+    const int q = q0 + sg * 8 * QR + r * 8 + sm;
     if (q >= n) continue;
     device const half* g = base + (long)q * a.posStride + 3 * W;
     device half* out = a.out + (long)b * a.outRowStride + (long)q * a.outPosStride + h * D;
     const float inv = 1.f / l[r];
-    for (int c = 0; c < DF; ++c) {
+    LF_UNROLL for (int c = 0; c < DF; ++c) {
       thread auto& oe = o[r][c].thread_elements();
-      for (int t = 0; t < 2; ++t) {
-        int d = c * 8 + sn + t;
-        out[d] = (half)(oe[t] * inv * lf_sigmoid((float)g[d]));
-      }
+      const int d = c * 8 + sn;
+      half2 gv = *(device const half2*)(g + d);
+      *(device half2*)(out + d) = half2(half(oe[0] * inv * lf_sigmoid((float)gv.x)), half(oe[1] * inv * lf_sigmoid((float)gv.y)));
     }
   }
 }

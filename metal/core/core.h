@@ -118,7 +118,8 @@ struct Attention {
   const half* qkvg; half* out; int n, heads, D; size_t rows; float scale;
   int64_t rowStride = 0, posStride = 0, outRowStride = 0, outPosStride = 0;     // (0: the dense layout's)
   const half* bias = nullptr; int biasStride = 0;                               // [H][n][biasStride], log2 units
-  const float* mask = nullptr; int64_t r0 = 0; bool maskTransposed = false;
+  // the key's mask, mask[(r0 + b) maskB + key maskK] (0 strides: [rows][n], maskB n and maskK 1)
+  const float* mask = nullptr; int64_t r0 = 0, maskB = 0, maskK = 0;
   const float* qBias = nullptr;
 };
 void attention(const Attention& a);
@@ -130,6 +131,8 @@ void layerNorm(const float* x, half* y, size_t rows, int C, const float* scale, 
                int ldx = 0, int ldy = 0);
 void layerNorm(const half* x, half* y, size_t rows, int C, const float* scale, const float* offset, float eps = 1e-5f,
                int ldx = 0, int ldy = 0);
+// the triangle's centre LayerNorm: a channel-major product [C][Lp * Lp] (padded planes) to pair rows [L * L][C] in half
+void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset);
 void toHalf(const float* x, half* y, size_t n);
 void toFloat(const half* x, float* y, size_t n);
 void add(float* y, const float* x, size_t n, float a = 1.f);      // y += a x

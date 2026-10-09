@@ -104,6 +104,8 @@ struct Device {
   void release(const void* p) {
     if (!p) return;
     std::lock_guard<std::recursive_mutex> l(mu);
+    static const bool syncRelease = getenv("LOCALFOLD_SYNC_RELEASE") != nullptr;    // (debugging: lifetimes)
+    if (syncRelease) sync();
     auto it = allocs.find((uint64_t)p);
     if (it == allocs.end()) die("release of a pointer that is not an allocation's start");
     held -= it->second.size;
@@ -127,7 +129,8 @@ struct Device {
     all.reserve(allocs.size() + keep.size());
     for (auto& [_, a] : allocs) all.push_back(a.buf);
     for (auto& b : keep) all.push_back(b);
-    for (auto& [t, b] : graveyard) all.push_back(b);
+    // (not the graveyard's: released buffers are read by no new work, and one named resident by a command buffer still in
+    // flight when the graveyard frees it is an "Invalid Resource" failure of that command buffer, though it never reads it)
     if (!all.empty()) [enc useResources:all.data() count:all.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite];
   }
   void commit() {
@@ -292,6 +295,16 @@ struct Device {
     if (threads > pso.maxTotalThreadsPerThreadgroup)
       die("a dispatch of %u threads a threadgroup to a kernel that takes at most %lu (%s)", threads,
           (unsigned long)pso.maxTotalThreadsPerThreadgroup, label ? label : "?");
+    // LOCALFOLD_CHECK_ARGS=1: every 8-byte word of the arguments that points into a RELEASED buffer is a use after
+    // release (debugging: the graveyard keeps it alive only until the work issued before the release is done)
+    static const bool checkArgs = getenv("LOCALFOLD_CHECK_ARGS") != nullptr;
+    if (checkArgs)
+      for (size_t o = 0; o + 8 <= argBytes; o += 8) {
+        uint64_t v; memcpy(&v, (const char*)args + o, 8);
+        for (auto& [tag, b] : graveyard)
+          if (v >= b.gpuAddress && v < b.gpuAddress + b.length)
+            die("%s: argument word %zu points into a released buffer (%lu bytes)", label ? label : "?", o / 8, (unsigned long)b.length);
+      }
     ensureEncoder();
     ++stats.dispatches;
     [enc setComputePipelineState:pso];
@@ -304,6 +317,24 @@ struct Device {
     }
     if (smem) [enc setThreadgroupMemoryLength:(smem + 15) & ~(size_t)15 atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    // LOCALFOLD_SYNC_EACH=1: every dispatch waited for and checked, a failure named by its kernel (debugging)
+    static const bool syncEach = getenv("LOCALFOLD_SYNC_EACH") != nullptr;
+    if (syncEach) {
+      id<MTLCommandBuffer> mine = cb;
+      commit();
+      [mine waitUntilCompleted];
+      if (mine.error) die("the GPU failed in %s: %s", label ? label : "?", mine.error.localizedDescription.UTF8String);
+      return;
+    }
+    static const bool commitEach = getenv("LOCALFOLD_COMMIT_EACH") != nullptr;
+    if (commitEach) {                       // (each its own command buffer, unwaited: a failure named by its kernel)
+      std::string lab = label ? label : "?";
+      [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.error) fprintf(stderr, "the GPU failed in %s: %s\n", lab.c_str(), done.error.localizedDescription.UTF8String);
+      }];
+      commit();
+      return;
+    }
     if (profileOn && label) {               // (a command buffer a dispatch: its GPU time is the kernel's)
       id<MTLCommandBuffer> mine = cb;
       commit();
@@ -562,12 +593,15 @@ void attention(const Attention& t) {
   a.rowStride = t.rowStride ? t.rowStride : (int64_t)t.n * a.posStride;
   a.outPosStride = t.outPosStride ? t.outPosStride : W;
   a.outRowStride = t.outRowStride ? t.outRowStride : (int64_t)t.n * a.outPosStride;
-  a.r0 = t.r0; a.n = t.n; a.heads = t.heads; a.biasStride = t.biasStride; a.maskT = t.maskTransposed; a.scale = t.scale;
+  a.r0 = t.r0; a.n = t.n; a.heads = t.heads; a.biasStride = t.biasStride; a.scale = t.scale;
+  a.maskB = t.maskB || t.maskK ? t.maskB : t.n; a.maskK = t.maskB || t.maskK ? t.maskK : 1;
+  a.pad0 = GEMM_EXTRA_EP;      // (an experiment's switch: metal/bench)
   const char* k = t.D == 8 ? "lf_attention_8" : t.D == 16 ? "lf_attention_16" : t.D == 32 ? "lf_attention_32"
                 : t.D == 48 ? "lf_attention_48" : t.D == 64 ? "lf_attention_64" : nullptr;
   if (!k) die("attention: no kernel for a head %d wide", t.D);
   if (t.rows > 65535 * 64) die("attention: %zu rows", t.rows);
-  dispatch(k, &a, sizeof a, Grid{(uint32_t)((t.n + 63) / 64), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0, "attention");
+  const int QB = 32;
+  dispatch(k, &a, sizeof a, Grid{(uint32_t)((t.n + QB - 1) / QB), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0, "attention");
 }
 
 // ---------------------------------------------------------------- common kernels
@@ -588,6 +622,11 @@ void layerNorm(const float* x, half* y, size_t rows, int C, const float* s, cons
 }
 void layerNorm(const half* x, half* y, size_t rows, int C, const float* s, const float* o, float eps, int ldx, int ldy) {
   layerNormRun(nullptr, x, nullptr, y, rows, C, s, o, eps, ldx, ldy);
+}
+void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset) {
+  if (C % 8 || C > 256) die("centerNorm: %d channels (a multiple of 8, at most 256)", C);
+  size_t P = (size_t)L * L;
+  run("lf_center_norm", grid1d((P + 31) / 32, 1), 256, CenterNormArgs{prod, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset});
 }
 void toHalf(const float* x, half* y, size_t n) { run1d("lf_to_half", (n + 3) / 4, ConvArgs{x, y, n}); }
 void toFloat(const half* x, float* y, size_t n) { run1d("lf_to_float", (n + 3) / 4, ConvBackArgs{x, y, n}); }

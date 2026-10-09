@@ -109,45 +109,6 @@ kernel void ef2_fill(LF_ARGS(FillFArgs)) {
   ulong t = LF_INDEX;
   if (t < a.n) a.out[t] = a.v;
 }
-// the triangle's centre LayerNorm: the channel-major product [C][Lp * Lp] to pair rows [pairs][C] in half. A lane a pair,
-// eight simdgroups splitting the channels, every value in registers, the two-pass statistics through a 1 KB tile, the
-// rows written coalesced through a half tile (C a multiple of 8, at most 256)
-kernel void ef2_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
-                            uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
-  threadgroup float part[256];
-  threadgroup half T[32 * (256 + 8)];
-  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 8;
-  const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * 32;
-  const uint rr = (uint)(r0 + lane), ii = lf_udiv(rr, a.L);
-  const ulong q = (ulong)ii * a.Lp + (rr - ii * a.L), plane = (ulong)a.Lp * a.Lp;
-  const bool live = r0 + lane < a.pairs;
-  float v[32];
-  float s = 0.f;
-  for (uint k = 0; k < 32; ++k) if (k < nk) { v[k] = live ? a.prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
-  part[grp * 32 + lane] = s;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float S = 0.f;
-  for (int g = 0; g < 8; ++g) S += part[g * 32 + lane];
-  const float mean = S / C;
-  float d2 = 0.f;
-  for (uint k = 0; k < 32; ++k) if (k < nk) { float d = v[k] - mean; d2 += d * d; }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  part[grp * 32 + lane] = d2;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float V = 0.f;
-  for (int g = 0; g < 8; ++g) V += part[g * 32 + lane];
-  const float inv = rsqrt(V / C + 1e-5f);
-  for (uint k = 0; k < 32; ++k) if (k < nk) {
-    uint c = grp + 8 * k;
-    T[lane * ld + c] = (half)((v[k] - mean) * inv * a.scale[c] + a.offset[c]);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint row = grp; row < 32; row += 8) {
-    ulong r = r0 + row;
-    if (r >= a.pairs) break;
-    for (uint c = lane; c < C; c += 32) a.out[r * C + c] = T[row * ld + c];
-  }
-}
 // pair positions [p0, p0 + cnt) of z + z^T
 kernel void ef2_sym_rows(LF_ARGS(SymRowsArgs)) {
   ulong t = LF_INDEX;

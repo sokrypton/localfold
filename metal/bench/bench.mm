@@ -11,7 +11,54 @@
 extern const char* PORT_SOURCE;
 using namespace mt;
 
+// `attn <n> <heads> <D> <rows> [strided] [arms]`: the flash attention, arms through GEMM_EXTRA_EP (the kernel reads it as
+// AttnArgs.pad0 - an experiment's switch)
+static int attnBench(int argc, char** argv) {
+  int n = atoi(argv[2]), H = atoi(argv[3]), D = atoi(argv[4]), rows = atoi(argv[5]);
+  bool strided = argc > 6 && atoi(argv[6]);
+  std::vector<int> arms;
+  { std::string a = argc > 7 ? argv[7] : "0"; size_t p = 0;
+    while (p <= a.size()) { size_t q = a.find(',', p); if (q == std::string::npos) q = a.size(); arms.push_back(atoi(a.substr(p, q - p).c_str())); p = q + 1; } }
+  int W = H * D;
+  size_t qn = (size_t)rows * n * 4 * W;
+  int bs = (n + 7) / 8 * 8;
+  std::vector<half> q(qn), b((size_t)H * n * bs);
+  for (size_t i = 0; i < qn; ++i) q[i] = (half)((float)((i * 2654435761u) % 1000) / 1000.f - 0.5f);
+  for (size_t i = 0; i < b.size(); ++i) b[i] = (half)((float)((i * 40503u) % 1000) / 500.f - 1.f);
+  half* dq = uploadNew(q.data(), qn); half* db = uploadNew(b.data(), b.size()); half* dout = allocT<half>((size_t)rows * n * W);
+  Attention A{}; A.qkvg = dq; A.out = dout; A.n = n; A.heads = H; A.D = D; A.rows = rows; A.scale = 1.f / sqrtf((float)D);
+  A.bias = db; A.biasStride = bs;
+  if (strided) { A.rowStride = 4 * W; A.posStride = (int64_t)rows * 4 * W; A.outRowStride = W; A.outPosStride = (int64_t)rows * W; }
+  double flops = 4.0 * rows * H * (double)n * n * D;
+  std::vector<std::vector<double>> times(arms.size());
+  std::vector<half> first;
+  for (int round = 0; round < 7; ++round)
+    for (size_t k = 0; k < arms.size(); ++k) {
+      GEMM_EXTRA_EP = arms[k] & 1;
+      A.biasStride = arms[k] & 2 ? n : bs;       // (arm bit 2: the bias's rows unpadded, n apart)
+      attention(A); sync();
+      if (round == 0) {
+        std::vector<half> o = download(dout, (size_t)rows * n * W);
+        if (k == 0) first = o;
+        double num = 0, den = 0;
+        for (size_t i = 0; i < o.size(); ++i) { double d = (double)o[i] - (double)first[i]; num += d * d; den += (double)first[i] * first[i]; }
+        if (sqrt(num / std::max(den, 1e-30)) > 1e-2) printf("  arm %d: WRONG (relRMS %.2e against the first)\n", arms[k], sqrt(num / den));
+      }
+      double t0 = now();
+      for (int r = 0; r < 10; ++r) attention(A);
+      sync();
+      if (round) times[k].push_back((now() - t0) / 10);
+    }
+  for (size_t k = 0; k < arms.size(); ++k) {
+    std::sort(times[k].begin(), times[k].end());
+    double t = times[k][times[k].size() / 2];
+    printf("  arm %-4d %8.3f ms  %5.2f TFLOP/s\n", arms[k], t * 1e3, flops / t / 1e12);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc > 1 && !strcmp(argv[1], "attn")) { setSource("bench", PORT_SOURCE); return attnBench(argc, argv); }
   if (argc < 4) { fprintf(stderr, "usage: localfold-bench <out> <rows> <in> [arms] [hhh|hhf|fhf] [reps]\n"); return 1; }
   setSource("bench", PORT_SOURCE);
   int out = atoi(argv[1]); size_t rows = strtoull(argv[2], nullptr, 10); int in = atoi(argv[3]);

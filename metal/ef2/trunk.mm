@@ -47,8 +47,7 @@ static void triangle(float* pair, const float* mask, int L, int C, const std::st
     gemm(g);
   }
   half* cn = scratch<half>("ftri.cn", P * C);
-  run("ef2_center_norm", grid1d((P + 31) / 32, 1), 256,
-      CenterNormArgs{prod, cn, P, (uint)C, (uint)L, (uint)Lp, 0, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset")});
+  centerNorm(prod, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
   half* outH = scratch<half>("ftri.outh", P * C);
   linH(cn, "f/" + Tn + "outputProjection", outH, P, C, C);
   gemmGatedAdd(xn, Fh(Tn + "gatingLinear"), outH, pair, P, C, C);
