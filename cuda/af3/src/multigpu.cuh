@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
@@ -29,6 +30,7 @@ inline int RANK = 0, WORLD = 1;
 struct Slot { char name[48]; size_t bytes; cudaIpcMemHandle_t handle[MAX_RANKS]; };
 struct Shm {
   std::atomic<int> arrived, generation, abort, slots;
+  int pid[MAX_RANKS];                 // every rank's process, so a barrier notices one that died without exiting
   Slot slot[MAX_SLOTS];
 };
 inline Shm* SHM = nullptr;
@@ -43,12 +45,24 @@ inline void finish() {
   if (RANK == 0) for (pid_t p : CHILDREN) { int st = 0; waitpid(p, &st, 0); }
 }
 
+// a peer gone without passing through exit (a signal, the OOM killer): rank 0 reaps its children; another rank sees rank 0
+// gone through its parent pid (and PR_SET_PDEATHSIG kills it when rank 0 dies anyway)
+inline bool peerDied() {
+  if (RANK == 0) {
+    for (pid_t p : CHILDREN) { int st; if (waitpid(p, &st, WNOHANG) == p) return true; }
+    return false;
+  }
+  return getppid() != SHM->pid[0];
+}
 inline void barrier() {
   if (WORLD == 1) return;
   const int gen = SHM->generation.load();
   if (SHM->arrived.fetch_add(1) == WORLD - 1) { SHM->arrived.store(0); SHM->generation.fetch_add(1); return; }
-  while (SHM->generation.load() == gen) {
-    if (SHM->abort.load()) { fprintf(stderr, "rank %d: a peer failed\n", RANK); fflush(stderr); _exit(1); }
+  for (long spin = 0; SHM->generation.load() == gen; ++spin) {
+    if (SHM->abort.load() || (spin % 4096 == 4095 && peerDied())) {
+      SHM->abort.store(1);
+      fprintf(stderr, "rank %d: a peer failed\n", RANK); fflush(stderr); _exit(1);
+    }
     usleep(20);
   }
 }
@@ -89,15 +103,18 @@ inline void launch(int world) {
   SHM = (Shm*)mmap(nullptr, sizeof(Shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   close(fd); unlink(path.c_str());               // (the mapping outlives the name)
   new (SHM) Shm();
+  SHM->pid[0] = getpid();
+  const std::string runId = std::to_string(getpid());        // (the run's id, taken before any rank exists)
   for (int r = 1; r < world; ++r) {
     pid_t p = fork();
-    if (p == 0) { RANK = r; CHILDREN.clear(); break; }
+    if (p == 0) { RANK = r; CHILDREN.clear(); prctl(PR_SET_PDEATHSIG, SIGKILL); if (getppid() != SHM->pid[0]) _exit(1); break; }
     CHILDREN.push_back(p);
   }
+  SHM->pid[RANK] = getpid();
   atexit(onExit);
   // (the standalone front end reads these: rank 0 alone featurises and fetches, cuda/featurise/standalone.h)
   setenv("LOCALFOLD_RANK", std::to_string(RANK).c_str(), 1);
-  setenv("LOCALFOLD_MG_ID", std::to_string(RANK == 0 ? getpid() : getppid()).c_str(), 1);
+  setenv("LOCALFOLD_MG_ID", runId.c_str(), 1);
   int dev = RANK;
   if (const char* m = getenv("LOCALFOLD_GPU_MAP")) {       // "0,0" or "0,1,2,3"
     std::vector<int> map; for (const char* s = m; *s;) { map.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s) ++s; }
@@ -105,6 +122,14 @@ inline void launch(int world) {
     dev = map[RANK];
   }
   CK(cudaSetDevice(dev));
+  // CUDA IPC maps another GPU's memory only where the two can reach each other (NVLink, or PCIe peer-to-peer)
+  std::vector<int> devs; for (int r = 0; r < world; ++r) devs.push_back(r);
+  if (const char* mp = getenv("LOCALFOLD_GPU_MAP")) { devs.clear(); for (const char* s = mp; *s;) { devs.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s) ++s; } }
+  for (int r = 0; r < world; ++r) {
+    int ok = 1;
+    if (devs[r] != dev) CK(cudaDeviceCanAccessPeer(&ok, dev, devs[r]));
+    if (!ok) { fprintf(stderr, "GPU %d cannot reach GPU %d's memory (no peer-to-peer): one fold cannot span them\n", dev, devs[r]); exit(1); }
+  }
   if (RANK != 0) { fflush(stdout); if (!freopen("/dev/null", "w", stdout)) {} }   // (rank 0 reports)
 }
 

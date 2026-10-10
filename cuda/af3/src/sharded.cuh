@@ -65,10 +65,12 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   std::string pg = projectionGate(pre, C);
   half* wt = scratch<half>("trib.wt", triInTileHalves(C));
   tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
-  // the rows of b this rank owns ([C][rows][np], shared), then every rank's into the whole b ([C][np][np])
+  // the rows of b this rank owns ([C][rows][np], shared); each block of a then meets every rank's in turn - a ring
+  // (one rank's b staged at a time, never the whole b: np^2 x C, 25.6 GB of bf16 at 10,000 tokens), each filling its
+  // rows' columns of the block's product
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
   mg::Shared& bmine = mg::shared("sh.bmine" + std::to_string(C), (size_t)maxShare * np * C * sizeof(TQ));
-  TQ* b = scratch<TQ>("trib.bq", cs * C);
+  TQ* bstage = mg::WORLD > 1 ? scratch<TQ>("trib.bstage", (size_t)maxShare * np * C) : nullptr;
   int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
   {
     size_t f, t; deviceMemInfo(&f, &t);
@@ -80,9 +82,10 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
   half* t2 = scratch<half>("trib.t2", (size_t)width * np * C);
   const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
-  auto gemm = [&](int m, int nn, const TQ* A, int lda, long long sA, const TQ* B, long long sB, int ldc, long long sC) {
-    if constexpr (F8) fp8GemmTN(m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
-    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, nn, np, alpha, A, lda, sA, B, np, sB, prod, ldc, sC, C);
+  // the block's product's columns for one rank's rows of b: prod[c][r][qlo + j] = sum_k a[c][r][k] B[c][j][k]
+  auto gemmQ = [&](int m, int w, const TQ* B, size_t rs, B16* out) {
+    if constexpr (F8) fp8GemmTN(m, w, np, alpha, B, np, (long long)m * np, a, np, (long long)rs, out, np, (long long)rs, C);
+    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, w, np, alpha, B, np, (long long)m * np, a, np, (long long)rs, out, np, (long long)rs, C);
   };
   wideWidth(C, [&](auto cw) {
     constexpr int CC = decltype(cw)::value, WO = 4;
@@ -97,27 +100,31 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
             base, mask, lnS, lnO, wt, ao, bo, t2o, n, np, cs, nullptr, rm);
         };
         if (hi > lo) in(RectMap{lo, np, 0, (size_t)(hi - lo) * np}, (size_t)(hi - lo) * np, nullptr, (TQ*)bmine.local, nullptr);
-        mg::fence();
-        for (int r = 0; r < mg::WORLD; ++r) {       // rank r's rows of every channel's plane
-          int rlo, rhi; rowsOf(n, r, rlo, rhi);
-          if (rhi <= rlo) continue;
-          const size_t rb = (size_t)(rhi - rlo) * np * sizeof(TQ);
-          CK(cudaMemcpy2DAsync((char*)b + (size_t)rlo * np * sizeof(TQ), cs * sizeof(TQ), bmine.peer[r], rb, rb, C,
-                               cudaMemcpyDefault, STREAM));
-        }
-        mg::fence();
+        mg::fence();                                  // (every rank's b rows written before any is read)
         for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
           int w = std::min(width, hi - k0);
           const size_t rs = (size_t)w * np;
           RectMap rm{k0, np, 0, rs};
           in(rm, rs, a, nullptr, t2);
-          gemm(np, w, b, np, (long long)cs, a, (long long)rs, np, (long long)rs);
+          for (int q = 0; q < mg::WORLD; ++q) {       // rank q's rows of b: the product's columns [qlo, qhi)
+            const int r = (mg::RANK + q) % mg::WORLD;
+            int qlo, qhi; rowsOf(n, r, qlo, qhi);
+            const int m = qhi - qlo;
+            if (m <= 0) continue;
+            const TQ* B = (const TQ*)bmine.local;
+            if (r != mg::RANK) {
+              CK(cudaMemcpyAsync(bstage, bmine.peer[r], (size_t)m * np * C * sizeof(TQ), cudaMemcpyDefault, STREAM));
+              B = bstage;
+            }
+            gemmQ(m, w, B, rs, prod + qlo);
+          }
           triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                       Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, rm);
         }
       );
     });
   });
+  mg::fence();                                    // (no rank rewrites its b rows while another may still copy them)
   releaseScratch({ "trib." });
 }
 template <class T>
@@ -216,14 +223,8 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
   mg::Shared& bmine = mg::shared(std::string("sh.bg") + (sizeof(T) == 2 ? "16." : "32.") + std::to_string(C), (size_t)maxShare * np * C * sizeof(T));
   if (hi > lo) operands({lo, hi - lo, 0, np}, (T*)bmine.local, 1);
-  T* b = scratch<T>("trib.b", cs * C);
-  mg::fence();
-  for (int r = 0; r < mg::WORLD; ++r) {
-    int rlo, rhi; rowsOf(n, r, rlo, rhi);
-    if (rhi <= rlo) continue;
-    const size_t rb = (size_t)(rhi - rlo) * np * sizeof(T);
-    CK(cudaMemcpy2DAsync((char*)b + (size_t)rlo * np * sizeof(T), cs * sizeof(T), bmine.peer[r], rb, rb, C, cudaMemcpyDefault, STREAM));
-  }
+  // (a ring, as triangleOn: one rank's b staged at a time against each block of a)
+  T* bstage = mg::WORLD > 1 ? scratch<T>("trib.bstage", (size_t)maxShare * np * C) : nullptr;
   mg::fence();
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
   {
@@ -239,8 +240,19 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
     int w = std::min(width, hi - k0);
     TriRect r{k0, w, 0, np};
     operands(r, a, 0);
-    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, np, w, np, &alpha, b, cudaType<T>(), np, cs, a,
-      cudaType<T>(), np, r.size(), &zero, prod, CUDA_R_32F, np, r.size(), C, CUBLAS_COMPUTE_32F, algo));
+    for (int q = 0; q < mg::WORLD; ++q) {           // rank q's rows of b: the product's columns [qlo, qhi)
+      const int rk = (mg::RANK + q) % mg::WORLD;
+      int qlo, qhi; rowsOf(n, rk, qlo, qhi);
+      const int m = qhi - qlo;
+      if (m <= 0) continue;
+      const T* B = (const T*)bmine.local;
+      if (rk != mg::RANK) {
+        CK(cudaMemcpyAsync(bstage, bmine.peer[rk], (size_t)m * np * C * sizeof(T), cudaMemcpyDefault, STREAM));
+        B = bstage;
+      }
+      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, m, w, np, &alpha, B, cudaType<T>(), np, (long long)m * np, a,
+        cudaType<T>(), np, r.size(), &zero, prod + qlo, CUDA_R_32F, np, r.size(), C, CUBLAS_COMPUTE_32F, algo));
+    }
     for (size_t q0 = 0; q0 < r.size(); q0 += per) {
       size_t cnt = std::min(per, r.size() - q0);
       rectCenterNormK<T><<<(unsigned)((cnt + 31) / 32), dim3(32, 8), 0, STREAM>>>(prod, ln, q0, cnt, C, r.size(),
@@ -252,6 +264,7 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
       WITH_PAIR_T(rectGatedAddK<T, PT><<<blocks(cnt * C), 256, 0, STREAM>>>(into(pair), t1, t2, r, q0, cnt, n, C));
     }
   }
+  mg::fence();                                    // (no rank rewrites its b rows while another may still copy them)
   releaseScratch({ "trib." });
 }
 // bias[h][i][j] (or [h][j][i] when swapped) = scale * raw[q][h] for the pairs p0 + q, raw pair-major (a linear's)
@@ -338,7 +351,8 @@ inline void pairUpdates(const mg::Shared& z, const mg::Shared& zT, const float* 
   int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
   auto att = [&](const mg::Shared& s, const std::string& p, bool sw) {
     if constexpr (std::is_same_v<T, half>) {
-      if (C == 128 && heads * D == 128 && D == 32 && !hasW(p + ".gatingQueryBias") && !hasW(p + ".outputProjectionBias")) {
+      if (FUSED_GRID && !skipFused("grid") && gridFusedFits() && !RESIDUAL_UNTRANSPOSED && C == 128 && heads * D == 128 && D == 32 &&
+          !hasW(p + ".gatingQueryBias") && !hasW(p + ".outputProjectionBias")) {
         rowAttention(s, mask, n, C, heads, D, p, sw); return;
       }
     }

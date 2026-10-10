@@ -263,7 +263,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
 #pragma unroll
     for (int k = 0; k < B_PER; ++k) {
       bool ok = bRow[k] && (!last || j0 + bC[k] < n);
-      cpAsync16(B + bOff[k], ok ? bSrc[k] + j0 : biasHead, ok);
+      cpAsync16(B + bOff[k], ok ? bSrc[k] + j0 : bias, ok);
     }
     if (MASKED && threadIdx.x < BK) {
       int j = j0 + threadIdx.x;
@@ -1181,7 +1181,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, 2) flash8(const half* __restr
     for (int u = threadIdx.x; u < BQ * (BK / 8); u += NT) {           // bias: BQ rows x BK/8 chunks
       int qi = u / (BK / 8), c = (u % (BK / 8)) * 8, i = q0 + qi;
       bool ok = i < n && j0 + c < n;
-      cpAsync16(Bs + qi * LDB + c, ok ? biasHead + (size_t)i * biasStride + j0 + c : biasHead, ok);
+      cpAsync16(Bs + qi * LDB + c, ok ? biasHead + (size_t)i * biasStride + j0 + c : bias, ok);
     }
     cpCommit();
   };
@@ -1398,6 +1398,9 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // ...and ONE row only: with the samples as rows (--samples=5) the grid kernel has the blocks it
   // lacked, and the split loses at every size measured - 11.1 against 8.2 us at 68 tokens and five
   // rows, 27.0 against 13.4 at 150, 15.7 against 8.8 at 192 and two rows (a tie at 68 and two)
+  if (FLASH_QHI && D == 32 && flashRegStaged()) {        // (flash2R1Strided below computes every query)
+    fprintf(stderr, "flashGridHalfLaunch: a query range does not take the register-staged 32-wide form\n"); exit(1);
+  }
   if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && !FLASH_QHI && rows == 1 && n <= 192 && heads * ((n + 63) / 64) < 4 * 108 &&
       fitsSmem(4 * 2 * fsStage<D>())) {        // (the split's four warps' own buffers: 67 KB at D 48, past a T4's 64)
     flashSplitHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);

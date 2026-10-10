@@ -455,18 +455,6 @@ static int foldMain(int argc, char** argv) {
     CK(cudaDeviceSynchronize());
     if (mg::WORLD > 1 && !sharded(t)) {   // the trunk done on every rank: the others leave, rank 0 folds on alone
       mg::SPLIT = nullptr;
-      if (sharded(t)) {                  // every rank's rows onto rank 0, into a whole pair
-        const size_t row = (size_t)t.n * t.C * 2;
-        float* whole = mg::RANK == 0 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)t.n * t.n * t.C)) : nullptr;
-        mg::fence();
-        if (mg::RANK == 0)
-          for (int r = 0; r < mg::WORLD; ++r) {
-            int lo, hi; sh::rowsOf(t.n, r, lo, hi); const int rn = sh::storedRows(t.n, r);
-            if (rn) CK(cudaMemcpyAsync((char*)whole + (size_t)lo * row, t.zS->peer[r], (size_t)rn * row, cudaMemcpyDefault, STREAM));
-          }
-        mg::fence();
-        if (mg::RANK == 0) { t.pair = whole; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.inPlaceRecycle = true; }
-      }
       mg::barrier();
       if (mg::RANK != 0) { mg::finish(); exit(0); }
       mg::finish();
@@ -632,13 +620,13 @@ static int foldMain(int argc, char** argv) {
           if (rn) CK(cudaMemcpyAsync((char*)whole + (size_t)lo * row, t.zS->peer[r], (size_t)rn * row, cudaMemcpyDefault, STREAM));
         }
       mg::fence();
-      mg::barrier();
+      mg::release({ "" });               // (every shared buffer, collectively: rank 0's pair is whole and its own now)
       if (mg::RANK != 0) { mg::finish(); exit(0); }
       mg::finish();
       mg::WORLD = 1;
       t.pair = whole; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.inPlaceRecycle = true;
+      df.trunkPair = nullptr;
       sh::DLO = -1; sh::DROWS = 0;
-      mg::release({ "" });               // (every shared buffer: the others have left, and the pair is whole here)
       // the pair as the one-GPU fold would hold it past here (bf16 only where pairStays16 keeps it so)
       if (!pairStays16(t.n, t.C, fast)) { pairToF32(t); TRUNK_PAIR16 = false; }
       contact = contactProbabilities(t);
@@ -873,7 +861,16 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `af3 <featurised dir> ...` and `af3 - --serve=<dir>` as before
 int main(int argc, char** argv) {
-  mg::launch(mg::gpusArg(argc, argv));     // --gpus=N|all: one fold across several GPUs (before any CUDA call: multigpu.cuh)
+  {
+    const int world = mg::gpusArg(argc, argv);   // --gpus=N|all: one fold across several GPUs (before any CUDA call: multigpu.cuh)
+    if (world > 1)
+      for (int i = 1; i < argc; ++i)
+        if (!strncmp(argv[i], "--serve", 7) || !strncmp(argv[i], "--folds=", 8) || !strncmp(argv[i], "--repeat=", 9) ||
+            !strncmp(argv[i], "--save-", 7) || !strncmp(argv[i], "--frames", 8) || !strncmp(argv[i], "--recycle-tolerance", 19)) {
+          fprintf(stderr, "several GPUs fold one job at a time: no %s\n", argv[i]); return 1;
+        }
+    mg::launch(world);
+  }
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("af3", argc, argv, foldMain);
   return foldMain(argc, argv);
 }
