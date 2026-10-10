@@ -576,6 +576,19 @@ void gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   if (a.m <= 0 || a.n <= 0 || batch <= 0) return;
   ++D().stats.gemms;
   if (ta_ == F16 && tb_ == F16 && tensorWanted()) { gemmTensorRun(tc_, a, batch, accFloat, label); return; }
+  // a float X the caller lets be staged in half (lf_gemm's hmma rounds it to half on the way in): rounded to half here
+  // instead, into one reused buffer (stream order keeps it), and the product on the matrix units.
+  // LOCALFOLD_GEMM_X_HALF=0 the control
+  static const bool xHalf = !getenv("LOCALFOLD_GEMM_X_HALF") || atoi(getenv("LOCALFOLD_GEMM_X_HALF")) != 0;
+  if (xHalf && ta_ == F16 && tb_ == F32 && halfMma && !a.ptrs && tensorWanted()) {
+    const size_t span = (size_t)(batch - 1) * a.sb + (a.tb ? (size_t)(a.k - 1) * a.ldb + a.n : (size_t)(a.n - 1) * a.ldb + a.k);
+    static half* xh = nullptr; static size_t xhCap = 0;
+    if (span > xhCap) { if (xh) release(xh); xhCap = span + span / 4; xh = allocT<half>(xhCap); }
+    toHalf((const float*)a.B, xh, span);
+    a.B = (uint64_t)xh;
+    gemmTensorRun(tc_, a, batch, accFloat, label);
+    return;
+  }
   // the tile: TR rows along n by TC columns along m. A short n (up to 128) in ONE tile row - every weight read once -
   // rounded up to 16; the columns then as many as keep a simdgroup's accumulators at 16 or fewer
   int tr = 64, tc = 64;
