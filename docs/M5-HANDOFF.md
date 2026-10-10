@@ -626,3 +626,20 @@ outliers. What remains, all bandwidth or scalar work:
     visitor may pay more).
   - Weight upload 0.15 s (309 MiB), on-device weight decode 0.17 s.
   - The rest is the GPU's first run.
+- **afb2c16a / b8d90f29, the outer product mean's permute gone (AF2, AF3).**
+  - **What**: the product GEMM's vector epilogue stores [(i, c)][(j, e)] straight to [(i, j)][(c, e)] (EP bit 4096,
+    gemmOpmPermuted), and the 133 MB block buffer is no longer allocated. Byte-identical.
+  - **AF2 with the 1500-row MSA**: a profiled pass 4162 -> 4038 ms (the permute's 109 ms, minus 38 more in the
+    product), wall 4128-4158 -> 4065-4122 ms.
+  - **AF3**: 1315.8 -> 1303.9 ms a pass.
+- **A sweep of every model's non-GEMM kernels (255 tokens) after all of the above**: the remaining outliers.
+  - **chai-1, the best one left (~9% of its trunk)**: LayerNorm is 258 ms of a 2215 ms pass, because its parallel
+    updates normalise the same input five times a block with different affine terms. One affine-free norm, with each
+    consumer's weight folded by its γ (W' = diag(γ) W) and bias by β (b' = βW), would remove four of the five. That is
+    nine GEMMs and their biases, and gemmSwiglu has no bias yet. Not done.
+  - **chai-1's per-block pair copy**: 58.7 ms (2.7%).
+  - **The centre norms**: 62 ms a pass at C 128, ~100 at C 256, 290-365 at C 384-512 (the wide kernel at ~60 GB/s; its
+    register-resident rewrite lost).
+  - **ESMFold2's ef2_swa**: 52.5 ms of 2.47 s.
+  - **The small-fold diffusion step** (68 tokens, 8.2 ms of GPU): its GEMMs at 5-8 TFLOP/s, adaLN 0.85 ms (66
+    launches at 12.9 us). Its fusion was level in both earlier attempts.
