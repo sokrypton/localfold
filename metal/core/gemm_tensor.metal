@@ -10,49 +10,62 @@
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
-// Operands as matmul2d sees them: left X = op(B)^T (n x k), right W = op(A)^T (k x m), destination D (n x m), each a
-// tensor over the GEMM's own pointers - extents innermost first, the leading dimension a stride, a transposed operand
-// the descriptor's transpose flag over its stored layout. A tile is TM rows of D (n) by TN columns (m), SG simdgroups.
-// the next LayerNorm, emitted by a 64 x 128 tile's epilogue (EP bit 64; lf_gemm_tensor_dual's lnOut): nv the tile's new
-// values a thread holds, 4 adjacent columns an entry as the epilogue wrote them; g.lnOut [rows][128] half
+// the next LayerNorm, emitted by a tile's epilogue that holds whole rows (EP bit 64; lf_gemm_tensor_dual's lnOut): a
+// 64 x 128 or a 32 x 256 float destination over 4 simdgroups, its new values read back from D where each
+// thread wrote its own (4 adjacent columns an entry); g.lnOut [rows][TN] half (and g.lnOut2, a second norm of the same rows).
+// As probed on the M5: a row is 4 lanes' (lane ^ 1, ^ 8) in each of TN / 64 simdgroups (64 x 128: sg ^ 1; 32 x 256:
+// all four), 16 columns a lane; element e's row + 8 at e bit 2, the other row pair at bit 5. Summed in the lane,
+// across the 4 lanes by shuffles, then the simdgroups' parts through threadgroup memory in a fixed order -
+// deterministic. part: [2 statistics][4 simdgroups][64 rows], 512 floats
+// a thread's tile values at element e, read back from D where it just wrote them (cheaper than holding 16 float4s)
 template <typename CT>
-inline void lf_emit_ln(thread CT& cg, thread const float4* nv, threadgroup float* part, uint tid, constant GemmArgs& g, int i0, int j0) {
-  // the next LayerNorm over the tile's rows (the host's promise: m == TN, the whole row in this tile). A row's 128
-  // columns are 4 lanes' (lane ^ 1, ^ 8) in each of two simdgroups (sg ^ 1), 16 columns a lane (as probed on the M5:
-  // element e's row + 8 at e bit 2, + 32 at bit 5; columns + 32 at bits 3-4): summed in the lane, across the 4 lanes by
-  // shuffles, then the two simdgroups' halves through threadgroup memory in a fixed order - deterministic
-  // (part: [2 statistics][2 simdgroup halves][64 rows])
-  const uint sg = tid / 32, half_ = sg & 1;
+inline float4 lf_ln_at(thread CT& cg, device const float* D, constant GemmArgs& g, int i0, int j0, uint16_t e) {
+  const auto ix = cg.get_multidimensional_index(e);
+  const int j = min(j0 + ix[1], g.n - 1);
+  return *(device const float4*)(D + (ulong)(i0 + ix[0]) + (ulong)j * g.ldd);
+}
+template <int TN, typename CT>
+inline void lf_emit_ln(thread CT& cg, device const float* D, threadgroup float* part, uint tid, constant GemmArgs& g, int i0, int j0) {
+  constexpr uint NS = TN / 64;
+  static_assert(TN == 128 || TN == 256, "the emitted LayerNorm is probed for 64 x 128 and 32 x 256");
+  const uint sg = tid / 32, first = sg & ~(NS - 1), lane = tid & 31;
   float s4[4] = {0, 0, 0, 0};
   _Pragma("clang loop unroll(full)")
-  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) s4[((e >> 2) & 1) | ((e >> 4) & 2)] += nv[e / 4].x + nv[e / 4].y + nv[e / 4].z + nv[e / 4].w;
+  for (uint16_t e = 0; e < cg.get_capacity(); e += 4) { const float4 v = lf_ln_at(cg, D, g, i0, j0, e); s4[((e >> 2) & 1) | ((e >> 4) & 2)] += v.x + v.y + v.z + v.w; }
   int rowOf[4];
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < 64; e += 4) if (((e >> 3) & 3) == 0) rowOf[((e >> 2) & 1) | ((e >> 4) & 2)] = cg.get_multidimensional_index(e)[1];
-  const uint lane = tid & 31;
   for (int q = 0; q < 4; ++q) {
     s4[q] += simd_shuffle_xor(s4[q], 1);
     s4[q] += simd_shuffle_xor(s4[q], 8);
-    if ((lane & 9) == 0) part[(0 * 2 + half_) * 64 + rowOf[q]] = s4[q];
+    if ((lane & 9) == 0) part[(0 * 4 + sg) * 64 + rowOf[q]] = s4[q];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float mean[4];
-  for (int q = 0; q < 4; ++q) mean[q] = (part[(0 * 2 + 0) * 64 + rowOf[q]] + part[(0 * 2 + 1) * 64 + rowOf[q]]) / 128;
+  for (int q = 0; q < 4; ++q) {
+    float t = 0;
+    for (uint k = 0; k < NS; ++k) t += part[(0 * 4 + first + k) * 64 + rowOf[q]];
+    mean[q] = t / TN;
+  }
   float v4[4] = {0, 0, 0, 0};
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < cg.get_capacity(); e += 4) {
     const int q = ((e >> 2) & 1) | ((e >> 4) & 2);
-    const float4 d = nv[e / 4] - mean[q];
+    const float4 d = lf_ln_at(cg, D, g, i0, j0, e) - mean[q];
     v4[q] += dot(d, d);
   }
   for (int q = 0; q < 4; ++q) {
     v4[q] += simd_shuffle_xor(v4[q], 1);
     v4[q] += simd_shuffle_xor(v4[q], 8);
-    if ((lane & 9) == 0) part[(1 * 2 + half_) * 64 + rowOf[q]] = v4[q];
+    if ((lane & 9) == 0) part[(1 * 4 + sg) * 64 + rowOf[q]] = v4[q];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float inv[4];
-  for (int q = 0; q < 4; ++q) inv[q] = rsqrt((part[(1 * 2 + 0) * 64 + rowOf[q]] + part[(1 * 2 + 1) * 64 + rowOf[q]]) / 128 + g.lnEps);
+  for (int q = 0; q < 4; ++q) {
+    float t = 0;
+    for (uint k = 0; k < NS; ++k) t += part[(1 * 4 + first + k) * 64 + rowOf[q]];
+    inv[q] = rsqrt(t / TN + g.lnEps);
+  }
   device half* out = (device half*)g.lnOut;
   device const float* sc = (device const float*)g.lnScale; device const float* of = (device const float*)g.lnOffset;
   _Pragma("clang loop unroll(full)")
@@ -62,19 +75,23 @@ inline void lf_emit_ln(thread CT& cg, thread const float4* nv, threadgroup float
     const int i = i0 + ix[0], j = j0 + ix[1];
     if (j >= g.n) continue;
     const int q = ((e >> 2) & 1) | ((e >> 4) & 2);
-    const float4 x = (nv[e / 4] - mean[q]) * inv[q];
+    const float4 x = (lf_ln_at(cg, D, g, i0, j0, e) - mean[q]) * inv[q];
     float4 y = x;
     if (sc) y *= *(device const float4*)(sc + i);
     if (of) y += *(device const float4*)(of + i);
-    *(device half4*)(out + (ulong)i + (ulong)j * 128) = half4(y);
+    *(device half4*)(out + (ulong)i + (ulong)j * TN) = half4(y);
     if (g.lnOut2) {
       float4 y2 = x;
       if (g.lnScale2) y2 *= *(device const float4*)((device const float*)g.lnScale2 + i);
       if (g.lnOffset2) y2 += *(device const float4*)((device const float*)g.lnOffset2 + i);
-      *(device half4*)((device half*)g.lnOut2 + (ulong)i + (ulong)j * 128) = half4(y2);
+      *(device half4*)((device half*)g.lnOut2 + (ulong)i + (ulong)j * TN) = half4(y2);
     }
-  }}
+  }
+}
 
+// Operands as matmul2d sees them: left X = op(B)^T (n x k), right W = op(A)^T (k x m), destination D (n x m), each a
+// tensor over the GEMM's own pointers - extents innermost first, the leading dimension a stride, a transposed operand
+// the descriptor's transpose flag over its stored layout. A tile is TM rows of D (n) by TN columns (m), SG simdgroups.
 template <typename TA, typename TB, typename TC, int TM, int TN, bool TRA, bool TRB, int EP = 0>
 kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
@@ -137,12 +154,11 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
   // 4 adjacent columns at e..e+3 (the 64 x 64 and 64 x 128 layouts probed on the M5), read and written 4 at a time -
   // the host's promise: the leading dimensions and pointers 4-element aligned, m a multiple of 4
   if constexpr ((EP & 128) != 0) {
-    static_assert(TM == 64 && (TN == 64 || TN == 128), "the vector epilogue is laid out for 64 x 64 and 64 x 128 tiles");
-    static_assert((EP & 64) == 0 || (TN == 128 && !metal::is_same_v<TACC, half>), "the emitted LayerNorm: 64 x 128, float");
-    float4 nv[(EP & 64) ? 16 : 1];
+    static_assert((TM == 64 && (TN == 64 || TN == 128)) || (TM == 32 && TN == 256),
+                  "the vector epilogue is laid out for 64 x 64, 64 x 128 and 32 x 256 tiles");
+    static_assert((EP & 64) == 0 || (TM * TN == 8192 && !metal::is_same_v<TACC, half>), "the emitted LayerNorm: 64 x 128 or 32 x 256, float");
     _Pragma("clang loop unroll(full)")
     for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
-      if constexpr ((EP & 64) != 0) nv[e / 4] = float4(0);
       if (!c.is_valid_element(e)) continue;
       const auto ix = c.get_multidimensional_index(e);
       const int i = i0 + ix[0], j = j0 + ix[1];
@@ -157,7 +173,8 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         if (g.epilogue & 4) v += bv;
         const float4 ax = float4(*(device const half4*)((device const half*)g.aux + (ulong)i + (ulong)j * g.ldaux));
         const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-        *(device vec<TC, 4>*)dp = vec<TC, 4>(cv + ax * fast::divide(1.f, 1.f + fast::exp(-v)));
+        const float4 r = cv + ax * fast::divide(1.f, 1.f + fast::exp(-v));
+        *(device vec<TC, 4>*)dp = vec<TC, 4>(r);
         continue;
       }
       if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
@@ -165,9 +182,8 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       if (g.epilogue & 2) v = max(v, 0.f);
       if (g.epilogue & 32) for (int t = 0; t < 4; ++t) v[t] = 0.5f * v[t] * (1.f + lf_erf(v[t] * 0.70710678118654752f));
       *(device vec<TC, 4>*)dp = vec<TC, 4>(v);
-      if constexpr ((EP & 64) != 0) nv[e / 4] = v;
     }
-    if constexpr ((EP & 64) != 0) { threadgroup float part[256]; lf_emit_ln(c, nv, part, tid, g, i0, j0); }
+    if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN>(c, (device const float*)D, part, tid, g, i0, j0); }
     return;
   }
   // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1, beta 0, the output in the
@@ -290,12 +306,9 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
   device float* D = (device float*)g.D;
   device const float* bg = (g.epilogue & 4) ? (device const float*)g.bias : nullptr;
   device const float* bv = (device const float*)g.aux3;
-  constexpr int CAP4 = 16;
-  float4 nv[CAP4];
   const bool ln = g.lnOut != 0;
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < cg.get_capacity(); e += 4) {
-    nv[e / 4] = float4(0);
     if (!cg.is_valid_element(e)) continue;
     const auto ix = cg.get_multidimensional_index(e);
     const int i = i0 + ix[0], j = j0 + ix[1];
@@ -307,10 +320,9 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
     device float4* dp = (device float4*)(D + (ulong)i + (ulong)j * g.ldd);
     const float4 r = *dp + v2 * (1.f / (1.f + fast::exp(-v1)));
     *dp = r;
-    nv[e / 4] = r;
   }
-  threadgroup float part[256];
-  if (ln) lf_emit_ln(cg, nv, part, tid, g, i0, j0);
+  threadgroup float part[512];
+  if (ln) lf_emit_ln<TN>(cg, (device const float*)D, part, tid, g, i0, j0);
 }
 // (instantiated on first use: lf_gemm_tensor_dual<64, 128>, host name gemmt_dual_64x128)
 

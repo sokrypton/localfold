@@ -88,8 +88,8 @@ struct Gemm {
   int batch = 1; int64_t sx = 0, sw = 0, sy = 0;
   bool half = false, accFloat = false;
   const char* label = nullptr;
-  // the next LayerNorm (lnScale, lnOffset), emitted into lnOut [rows][128] half where the matrix units run a float output
-  // 128 wide in 64 x 128 tiles - gemm() returns true; false: not written, the caller's LayerNorm still to run
+  // the next LayerNorm (lnScale, lnOffset), emitted into lnOut [rows][out] half where the matrix units run a float output
+  // 128 or 256 wide (64 x 128 or 32 x 256 tiles) - gemm() returns true; false: not written, the caller's LayerNorm still to run
   ::half* lnOut = nullptr; const float* lnScale = nullptr; const float* lnOffset = nullptr; float lnEps = 1e-5f;
   ::half* lnOut2 = nullptr; const float* lnScale2 = nullptr; const float* lnOffset2 = nullptr;   // (a second norm, same eps)
 };
@@ -114,8 +114,10 @@ inline void gemm(const float* X, const float* W, float* Y, size_t rows, int in, 
 // columns interleaved in blocks of 8 (a_0..a_7 b_0..b_7 a_8..: swigluPairs); the triangle's projection and gate -
 // W [C][4C], channel c's (pa ga pb gb) in blocks of 8 (triGatePairs) - writing a and b channel-major into padded
 // planes [C][np * np] (rows r0.. of the n * n pairs)
-void gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, size_t rows, int in, int out,
-                  const float* bias = nullptr);
+// (lnOut: as Gemm::lnOut - the updated pair's next LayerNorm, where the matrix units take it; true if written)
+bool gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, size_t rows, int in, int out,
+                  const float* bias = nullptr, half* lnOut = nullptr, const float* lnScale = nullptr,
+                  const float* lnOffset = nullptr, float lnEps = 1e-5f);
 // the triangle's tail in one pass: pair += (Xv Wv + biasV, rounded to half) sigmoid(Xg Wg + biasG) - on the matrix
 // units one kernel, the value never written; elsewhere (or LOCALFOLD_GATED_DUAL=0) Xv Wv into vTmp, then gemmGatedAdd
 // lnOut: where the fused kernel runs and out is 128, it also writes LayerNorm(the updated pair) (lnScale, lnOffset) to lnOut

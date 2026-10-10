@@ -560,7 +560,11 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // 64 rows and everything the epilogue touches is 4-element aligned
   static const bool vecWanted = !getenv("LOCALFOLD_GEMM_VEC") || atoi(getenv("LOCALFOLD_GEMM_VEC")) != 0;
   auto al4 = [](uint64_t p, int64_t ld) { return p % 16 == 0 && ld % 4 == 0; };
-  const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) && tm == 64 && a.m % 4 == 0 && !a.ptrs &&
+  // (a 256-wide output whose next LayerNorm is wanted: 32 x 256 tiles, a whole row each)
+  static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
+  if (a.lnOut && lnWanted && a.m == 256 && a.n > 128 && !tri && !getenv("LOCALFOLD_GEMM_TILE")) { tm = 32; tn = 256; }
+  const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) && (tm == 64 || (tm == 32 && tn == 256)) &&
+                     a.m % 4 == 0 && !a.ptrs &&
                      al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & 64) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc)) &&
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
   if (vecEp && tn < 64) tn = 64;
@@ -569,8 +573,8 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if (tri && tn % 32) die("gemm: the triangle gate wants a tile 32 columns wide or more, not %d", tn);
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
   // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one 64 x 128 tile wide
-  static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
-  const bool lnEmit = a.lnOut && lnWanted && vecEp && tm == 64 && tn == 128 && a.m == 128 && tc_ == F32 && !hacc && batch == 1 &&
+  const bool lnEmit = a.lnOut && lnWanted && vecEp && ((tm == 64 && tn == 128) || (tm == 32 && tn == 256)) && a.m == tn &&
+                      tc_ == F32 && !hacc && batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
   if (!lnEmit) a.lnOut = a.lnOut2 = 0;
@@ -677,14 +681,16 @@ bool gemm(const Gemm& g) {
                  a.lnOut2 = (uint64_t)g.lnOut2; a.lnScale2 = (uint64_t)g.lnScale2; a.lnOffset2 = (uint64_t)g.lnOffset2; }
   return gemmRun(g.tw, g.tx, g.ty, a, g.batch, g.half, g.accFloat, g.label);
 }
-void gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, size_t rows, int in, int out, const float* bias) {
+bool gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, size_t rows, int in, int out, const float* bias,
+                  half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
   a.epilogue = 64; a.alpha = 1.f;
   a.aux = (uint64_t)aux; a.ldaux = out;
   if (bias) { a.bias = (uint64_t)bias; a.epilogue |= 4; }
-  gemmRun(F16, F16, F32, a, 1, false, false, "gated add");
+  if (lnOut) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
+  return gemmRun(F16, F16, F32, a, 1, false, false, "gated add");
 }
 bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
                       int out, const float* biasG, const float* biasV, half* vTmp, const char* label,
@@ -711,8 +717,7 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
   }
   { Gemm g{}; g.X = Xv; g.tx = F16; g.W = Wv; g.tw = F16; g.Y = vTmp; g.ty = F16; g.rows = rows; g.in = in; g.out = out;
     g.bias = biasV; g.accFloat = true; g.label = "triangle output"; gemm(g); }
-  gemmGatedAdd(Xg, Wg, vTmp, pair, rows, in, out, biasG);
-  return false;
+  return gemmGatedAdd(Xg, Wg, vTmp, pair, rows, in, out, biasG, lnOut, lnScale, lnOffset, lnEps);
 }
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden) {
   if (hidden % 8) die("gemmSwiglu: a hidden width of %d is not a multiple of 8", hidden);

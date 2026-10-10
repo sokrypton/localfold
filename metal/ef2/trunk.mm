@@ -31,11 +31,28 @@ static const half* triGate(const std::string& Tn, int C) {
     run1d("ef2_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Fh(Tn + "projection"), Fh(Tn + "gate"), out, (uint)C, (uint)C});
   });
 }
-static void triangle(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {
+// the pair's next LayerNorm where the previous update's GEMM already wrote it (Gemm::lnOut, gemmGatedAdd's): the pair,
+// the norm's name (its Scale / Offset prefix) and the buffer, taken by the next update of the same; a miss drops it.
+// LOCALFOLD_LN_EMIT=0: none emitted
+static struct { const float* x = nullptr; std::string norm; half* buf = nullptr; } emitted;
+static half* takeEmitted(const float* x, const std::string& norm) {
+  const bool hit = emitted.x == x && emitted.norm == norm;
+  emitted.x = nullptr;
+  return hit ? emitted.buf : nullptr;
+}
+// where an update's GEMM emits the next norm: whichever of ftri.xn and eln.b its own input is not
+static half* lnTarget(size_t P, int C, const half* inUse) {
+  half* a = scratch<half>("ftri.xn", P * C);
+  return inUse == a ? scratch<half>("eln.b", P * C) : a;
+}
+static void triangle(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing, const std::string& next) {
   size_t P = (size_t)L * L;
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
-  half* xn = scratch<half>("ftri.xn", P * C);
-  layerNorm(pair, xn, P, C, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"));
+  half* xn = takeEmitted(pair, Tn + "leftNormInput");
+  if (!xn) {
+    xn = scratch<half>("ftri.xn", P * C);
+    layerNorm(pair, xn, P, C, F(Tn + "leftNormInputScale"), F(Tn + "leftNormInputOffset"));
+  }
   half* a = scratch<half>("ftri.a", plane * C); half* b = scratch<half>("ftri.b", plane * C);
   // the pad is written by nothing: zeroed once for a buffer and a size
   static half *zeroedA = nullptr, *zeroedB = nullptr; static int zeroedLp = 0;
@@ -56,28 +73,41 @@ static void triangle(float* pair, const float* mask, int L, int C, const std::st
   half* cn = scratch<half>("ftri.cn", P * C);
   centerNorm(prod, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
   half* outH = scratch<half>("ftri.outh", P * C);
-  gemmGatedAddDual(xn, Fh(Tn + "gatingLinear"), cn, Fh(Tn + "outputProjection"), pair, P, C, C, nullptr, nullptr, outH,
-                   "triangle output and gated add");
+  half* lnOut = next.empty() ? nullptr : lnTarget(P, C, xn);
+  if (gemmGatedAddDual(xn, Fh(Tn + "gatingLinear"), cn, Fh(Tn + "outputProjection"), pair, P, C, C, nullptr, nullptr, outH,
+                       "triangle output and gated add", lnOut, lnOut ? F(next + "Scale") : nullptr, lnOut ? F(next + "Offset") : nullptr))
+    emitted = {pair, next, lnOut};
 }
-static void transition(float* pair, size_t P, int C, const std::string& Tn) {
+static void transition(float* pair, size_t P, int C, const std::string& Tn, const std::string& next) {
   int I = dimOf("f/" + Tn + "transition2", 0);
   size_t chunk = std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I));
   size_t rows = std::min(P, chunk);
   half* xn = scratch<half>("ftr.xn", rows * C);
   half* g = scratch<half>("ftr.g", rows * I);
   const half* w1 = swigluPairs(Tn + "transition1", Fh(Tn + "transition1"), C, I);
+  // (a row's norm is its own: the emitted input and the emitted output both go a chunk of rows at a time)
+  half* in = takeEmitted(pair, Tn + "inputLayerNorm");
+  half* lnOut = next.empty() ? nullptr : lnTarget(P, C, in);
+  bool all = lnOut != nullptr;
   for (size_t r0 = 0; r0 < P; r0 += chunk) {
     size_t r = std::min(chunk, P - r0);
-    layerNorm(pair + r0 * C, xn, r, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
-    gemmSwiglu(xn, w1, g, r, C, I);
-    lin(g, "f/" + Tn + "transition2", pair + r0 * C, r, I, C, 1.f);
+    const half* x = in ? in + r0 * C : xn;
+    if (!in) layerNorm(pair + r0 * C, xn, r, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
+    gemmSwiglu(x, w1, g, r, C, I);
+    Gemm G{}; G.X = g; G.tx = F16; G.W = Fh(Tn + "transition2"); G.tw = F16; G.Y = pair + r0 * C; G.rows = r; G.in = I; G.out = C;
+    G.beta = 1.f; G.label = lnOut ? "transition2, next norm" : "transition2";
+    if (lnOut) { G.lnOut = lnOut + r0 * C; G.lnScale = F(next + "Scale"); G.lnOffset = F(next + "Offset"); }
+    all = gemm(G) && all;
   }
+  if (all) emitted = {pair, next, lnOut};
 }
-void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b) {
+void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
   std::string B = prefix + "/" + std::to_string(b) + "/";
-  triangle(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true);
-  triangle(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false);
-  transition(pair, (size_t)L * L, C, B + "pairTransition/");
+  // (each update's last GEMM emitting the next one's norm - the next block's first where it follows directly)
+  triangle(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true, B + "triangleMultiplicationIncoming/leftNormInput");
+  triangle(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false, B + "pairTransition/inputLayerNorm");
+  transition(pair, (size_t)L * L, C, B + "pairTransition/",
+             nextFollows ? prefix + "/" + std::to_string(b + 1) + "/triangleMultiplicationOutgoing/leftNormInput" : "");
 }
 
 void foldingTrunk(int T, int C, const float* zi, float* z, int loops) {
@@ -98,7 +128,7 @@ void foldingTrunk(int T, int C, const float* zi, float* z, int loops) {
       g.beta = 1.f; g.rows = r; g.in = C; g.out = C; g.label = "recycle";
       gemm(g);
     }
-    for (int b = 0; b < blocks; ++b) trunkBlock(z, mask, T, C, "blocks", b);
+    for (int b = 0; b < blocks; ++b) trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocks);
   }
 }
 

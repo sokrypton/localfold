@@ -42,7 +42,8 @@ void languageModel(const Esmc& e, const int* ids, const int* seq, const int* tok
 
 // ---------------------------------------------------------------- the trunk (trunk.mm)
 void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z);
-void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b);
+// nextFollows: block b + 1 runs next on this pair, nothing between (its first norm is emitted by this block)
+void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows = false);
 void foldingTrunk(int T, int C, const float* zInit, float* z, int loops);
 // the page's contact map: the softmax mass under each pair's threshold - [T * T] on the host
 std::vector<float> contactMap(const float* z, int T, int C);
