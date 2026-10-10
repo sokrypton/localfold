@@ -246,7 +246,9 @@ int foldInput(const std::string& dir, Options o) {
           beta[r * 3 + a] = caDgram ? xk[((size_t)r * dense + 1) * 3 + a] : pbMask[r] ? xk[(size_t)pbIdx[r] * 3 + a] : 0.f;
       float* dBeta = scratch<float>("main.beta", beta.size());
       upload(dBeta, beta.data(), beta.size() * 4);
+      if (profiling()) profileStart();
       ConfidenceOut ck = structural ? structuralConfidence(st, dBeta, xk, t.n, dense, resAsym) : confidenceHead(t, dBeta);
+      if (profiling()) profileReport("confidence", getenv("AF3_PROFILE_TOP") ? atoi(getenv("AF3_PROFILE_TOP")) : 30);
       confMs += ms(s1);
       Scores ss = structureScores(xk);
       double score = rankingScore(ck.ptm, ck.iptm, ss);
