@@ -239,9 +239,15 @@ inline void release(const std::vector<std::string>& prefixes) {
 // idle while the slowest rank and the host catch up: ~5,000 such gaps in a 2,964-token trunk pass, 12% of one rank's
 // time. The flag buffer is a shared buffer like any other; the abort flag (/dev/shm) is mapped in, so a rank that
 // failed releases the others' waits (the watchdog ends them).
-struct DevFlags { int* peer[MAX_RANKS]; int world, rank; const volatile int* abort; };
-__global__ void arriveAndWaitK(DevFlags f, int gen) {
+// The generation is counted ON THE DEVICE (gen, this rank's own), so a fence captured in a CUDA graph is a new fence at
+// every replay - every rank replays the same sequence, so their counts stay together.
+struct DevFlags { int* peer[MAX_RANKS]; int* gen; int world, rank; const volatile int* abort; };
+__global__ void arriveAndWaitK(DevFlags f) {
   const int t = threadIdx.x;
+  __shared__ int gs;
+  if (t == 0) gs = *f.gen + 1;
+  __syncthreads();
+  const int gen = gs;
   __threadfence_system();
   if (t < f.world) ((volatile int*)f.peer[t])[f.rank] = gen;
   __threadfence_system();
@@ -250,6 +256,7 @@ __global__ void arriveAndWaitK(DevFlags f, int gen) {
     while (mine[t] < gen && !*f.abort) __nanosleep(64);
   }
   __syncthreads();
+  if (t == 0) *f.gen = gen;
   __threadfence_system();
 }
 inline DevFlags devFlags() {
@@ -264,6 +271,7 @@ inline DevFlags devFlags() {
     CK(cudaHostGetDevicePointer(&dshm, (void*)SHM, 0));
     void* ab = (char*)dshm + ((char*)&SHM->abort - (char*)SHM);
     for (int r = 0; r < WORLD; ++r) f.peer[r] = (int*)s.peer[r];
+    CK(cudaMalloc(&f.gen, sizeof(int))); CK(cudaMemset(f.gen, 0, sizeof(int))); CK(cudaDeviceSynchronize());
     f.world = WORLD; f.rank = RANK; f.abort = (const volatile int*)ab;
     barrier();                           // (every rank's flags zeroed before any rank arrives)
     made = true;
@@ -272,8 +280,7 @@ inline DevFlags devFlags() {
 }
 inline void fence() {
   if (WORLD == 1 || SIM) return;
-  static int gen = 0;
-  arriveAndWaitK<<<1, 32, 0, STREAM>>>(devFlags(), ++gen);
+  arriveAndWaitK<<<1, 32, 0, STREAM>>>(devFlags());
   CK(cudaGetLastError());
 }
 // ...and on the host, where the HOST then reads what the others wrote (a synchronous copy off a peer's buffer)

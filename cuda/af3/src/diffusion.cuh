@@ -1313,6 +1313,40 @@ inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& l
   // (71.5 against 69.9 ms, 101.3 against 98.1), interleaved on an A100.
 }
 // D(x; sigma): positions [NS][tokens*dense][3] in, the denoised positions out.
+// several GPUs, the diffusion's tokens split: the atom subsets holding this rank's tokens' atoms ([s0, s1)), and the
+// reach of one atom block's key window in subsets (a subset's keys are query rows of its neighbours) - so a rank runs
+// its encoder and decoder blocks on its own subsets and a halo of `reach` a block, with nothing exchanged inside them
+struct AtomRange { int s0, s1, reach; };
+inline AtomRange atomRangeFor(int tlo, int thi) {
+  AtomShape sh = atomShape();
+  const int* t2q = M.i("batch.tokenAtomsToQueries.indices"); const float* t2qm = M.f("batch.tokenAtomsToQueries.mask");
+  const size_t q1 = (size_t)sh.subsets * sh.queries;
+  long qmin = -1, qmax = -1;
+  for (size_t q = 0; q < q1; ++q)
+    if (t2qm[q] != 0 && t2q[q] >= tlo * sh.dense && t2q[q] < thi * sh.dense) { if (qmin < 0) qmin = (long)q; qmax = (long)q; }
+  static int reach = -1;
+  if (reach < 0) {
+    const int* q2k = M.i("batch.queriesToKeys.indices"); const float* q2km = M.f("batch.queriesToKeys.mask");
+    reach = 0;
+    for (int s = 0; s < sh.subsets; ++s)
+      for (int k = 0; k < sh.keys; ++k) {
+        const size_t i = (size_t)s * sh.keys + k;
+        if (q2km[i] != 0) reach = std::max(reach, std::abs(q2k[i] / sh.queries - s));
+      }
+  }
+  if (qmin < 0) return { 0, 1, reach };       // (no atoms here: one subset, computed and unread)
+  return { (int)(qmin / sh.queries), (int)(qmax / sh.queries) + 1, reach };
+}
+// every other rank's tokens' rows of a per-atom tensor ([tokens * dense][3] f32), read straight from it
+__global__ void gatherAtomRowsK(PeerAct pa, float* __restrict__ x, int n, int dense) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * dense * 3) return;
+  const int token = (int)(t / ((size_t)dense * 3));
+  int r = 0;
+  while (r + 1 < pa.world && token >= pa.lo[r + 1]) ++r;
+  if (r == pa.rank) return;
+  x[t] = pa.p[r][t];
+}
 inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float noiseLevel) {
   int n = f.n, dense = (int)M.meta("batch.dense");
   size_t atoms = (size_t)n * dense, total = atoms * NS;
@@ -1326,7 +1360,18 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   const float* atomMask = Fdev("batch.refMask");
   float* scaled = scratch<float>("dn.scaled", total * 3);
   scalePositionsK<<<blocks(total * 3), 256, 0, STREAM>>>(positionsNoisy, atomMask, scaled, total, atoms, noiseParams);
+  // (the tokens split: the atom blocks on this rank's subsets and their halo - the encoder's wide enough that the
+  // decoder's halo is right after it, the decoder's that this rank's own subsets are)
+  const bool tok = sh::DLO >= 0 && NS == 1 && DIFF_HALF && mg::WORLD > 1;
+  AtomRange ar{};
+  if (tok) {
+    int tlo, thi; sh::rowsOf(n, mg::RANK, tlo, thi); thi = std::min(thi, n);
+    ar = atomRangeFor(tlo, thi);
+    const int halo = ar.reach * (int)(f.enc.blocks.size() + f.dec.blocks.size()), subsets = atomShape().subsets;
+    ATOM_S0 = std::max(0, ar.s0 - halo); ATOM_S1 = std::min(subsets, ar.s1 + halo);
+  }
   encoderStep("diffusion.encoder", f.enc, scaled); stage("d.encoder");
+  ATOM_S0 = ATOM_S1 = 0;
   int Cs = (int)M.meta("diffusion.seqChannels"), perToken = (int)M.meta("diffusion.perTokenChannels");
   float* snProj = scratch<float>("dn.snProj", (size_t)n * perToken);
   if (!f.usePre) {
@@ -1348,7 +1393,24 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   dtap("transformer.out", act, rows * perToken);
   float* actn = scratch<float>("dn.actn", rows * perToken);
   layerNormSlow(act, actn, rows, perToken, W("diffusion.outputNormScale"), Wopt("diffusion.outputNormOffset"));
-  float* upd = atomDecoder(actn, f.enc, f.dec); stage("d.decoder");
+  if (tok) {
+    const int halo = ar.reach * (int)f.dec.blocks.size(), subsets = atomShape().subsets;
+    ATOM_S0 = std::max(0, ar.s0 - halo); ATOM_S1 = std::min(subsets, ar.s1 + halo);
+  }
+  float* upd = atomDecoder(actn, f.enc, f.dec);
+  ATOM_S0 = ATOM_S1 = 0;
+  if (tok) {                     // every rank's tokens' atoms' updates
+    mg::Shared& uS = mg::shared("sh.dn.upd", atoms * 3 * 4);
+    int tlo, thi; sh::rowsOf(n, mg::RANK, tlo, thi); thi = std::min(thi, n);
+    if (thi > tlo) CK(cudaMemcpyAsync((float*)uS.local + (size_t)tlo * dense * 3, upd + (size_t)tlo * dense * 3,
+                                      (size_t)(thi - tlo) * dense * 3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    mg::fence();
+    PeerAct pa{}; pa.world = mg::WORLD; pa.rank = mg::RANK;
+    for (int r = 0; r < mg::WORLD; ++r) { int a, e; sh::rowsOf(n, r, a, e); pa.lo[r] = a; pa.p[r] = (const float*)uS.peer[r]; }
+    gatherAtomRowsK<<<blocks(atoms * 3), 256, 0, STREAM>>>(pa, upd, n, dense);
+    mg::fence();
+  }
+  stage("d.decoder");
   dtap("decoder.update", upd, total * 3);
   float* out = scratch<float>("dn.out", total * 3);
   denoiseOutK<<<blocks(total * 3), 256, 0, STREAM>>>(positionsNoisy, upd, atomMask, out, total, atoms, noiseParams);

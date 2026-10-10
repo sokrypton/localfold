@@ -361,10 +361,11 @@ static int foldMain(int argc, char** argv) {
   // of them (asked before anything is allocated, so every rank answers alike) AND it is short or batches several
   // samples; else sharded - its tokens split over the ranks with one sample (diffusionTransformer), which on fences
   // that stay on the device costs a block one exchange of k and v: a simulated rank of 8 runs 2,964 tokens' 25 steps
-  // in 207 ms against 525 whole. (LOCALFOLD_MG_SHARD_DIFFUSION=1 or 0 forces either.)
+  // in 207 ms against 525 whole, and 988 tokens' 200 steps in 555 against 1,116 (on a box the fences add a few us
+  // each, 24 a step - hence not below 512). (LOCALFOLD_MG_SHARD_DIFFUSION=1 or 0 forces either.)
   const char* shardDiff = getenv("LOCALFOLD_MG_SHARD_DIFFUSION");
   const bool oneSample = seedList.size() * samples == 1;
-  const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 1024 || !oneSample) &&
+  const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 512 || !oneSample) &&
     foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true);
   t = makeTrunk(targetFeat.data(), msaCap, doFold && fast);
   if (mg::WORLD > 1) {
@@ -594,6 +595,7 @@ static int foldMain(int argc, char** argv) {
     if (sharded(t)) {                    // the diffusion's conditioning and token attention on this rank's rows
       if (structural) { fprintf(stderr, "a sharded pair: not OpenDDE\n"); return 1; }
       sh::DLO = t.shardLo; sh::DROWS = t.shardRows; dP = pairBase(t);
+      GRAPHS = !noGraphs;      // (the steps' graphs: its fences count their generations on the device)
     }
     mg::tick("to the diffusion");
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
@@ -674,6 +676,7 @@ static int foldMain(int argc, char** argv) {
       mg::tick("whole pair freed");
     }
     if (sharded(t)) {
+      GRAPHS = false;
       releaseScratch();                // (the sampler's: the heads allocate theirs beside the slab)
       mg::tick("scratch released");
       df.trunkPair = nullptr;
