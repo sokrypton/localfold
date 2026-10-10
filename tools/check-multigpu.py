@@ -8,6 +8,8 @@ smoke test, which checks correctness and nothing about speed):
   python3 tools/check-multigpu.py --sizes=4,12,24      # complexes of 4, 12, 24 copies of 1TIM's chain (247 a copy)
   python3 tools/check-multigpu.py --big=41             # and one fold of 41 copies (10,127 tokens) on every GPU
   python3 tools/check-multigpu.py --gpu-map=0,0 --gpus=2 --sizes=4 --skip-build   # the smoke test on one GPU
+  python3 tools/check-multigpu.py --sizes=12,24 --sim  # and each size as ONE simulated rank of N (LOCALFOLD_MG_SIMULATE):
+                                                       # a rank's compute alone - the measured fold minus it is the interconnect
 
 Correctness: 5CAJ chain A and the 1TIM dimer, each self-templated, folded on one GPU and on N; both scored against
 their crystal, and the N-GPU fold against the one-GPU fold (the sharded trunk reorders sums - a few thousandths of
@@ -65,6 +67,7 @@ class Peak:
 def fold(args, gpus, flags, out, env_extra=None):
     env = dict(os.environ, LOCALFOLD_ACCEPT_MODEL_TERMS="alphafold3")
     if args.gpu_map and gpus > 1: env["LOCALFOLD_GPU_MAP"] = args.gpu_map
+    if args.times and gpus > 1: env["LOCALFOLD_MG_TIMES"] = "1"
     env.update(env_extra or {})
     cmd = [str(BIN)] + flags + [f"--out={out}"] + ([f"--gpus={gpus}"] if gpus > 1 else [])
     t0 = time.time()
@@ -78,6 +81,8 @@ def fold(args, gpus, flags, out, env_extra=None):
            "peak_mib": dict(sorted(pk.peak.items()))}
     if m: res.update(trunk_ms=float(m[1]), diffusion_ms=float(m[2]), confidence_ms=float(m[3]), total_ms=float(m[4]))
     if p: res.update(plddt=float(p[1]), ptm=float(p[2]))
+    phases = re.findall(r"^  mg (.+?)\s+([\d.]+) ms$", log, re.M)
+    if phases: res["phases_ms"] = [[k.strip(), float(v)] for k, v in phases]
     if not res["ok"]: res["error"] = log.strip().splitlines()[-5:]
     return res
 
@@ -96,6 +101,8 @@ def main():
     ap.add_argument("--big", type=int, default=0, help="also one fold of this many copies on every GPU, 100 steps")
     ap.add_argument("--full", action="store_true", help="scaling folds at 100 steps and 3 recycles, not 25 and 0")
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--sim", action="store_true", help="also each size as one simulated rank of N (compute alone, no interconnect)")
+    ap.add_argument("--times", action="store_true", help="LOCALFOLD_MG_TIMES=1: every phase past the trunk, in the report")
     ap.add_argument("--out", default="multigpu-out")
     args = ap.parse_args()
     most = args.gpus or gpu_count()
@@ -132,6 +139,12 @@ def main():
             r.update(copies=copies, tokens=copies * len(TIM))
             report["scaling"].append(r)
             print(json.dumps(r)[:400], flush=True)
+            if args.sim and g > 1:     # (one process on GPU 0 standing for rank 0 of g: its fold is wrong, its times are a rank's)
+                r = fold(args, g, [f"--sequence={seq}", "--seed=1"] + speed, out / f"tim{copies}-{g}-sim.pdb",
+                         {"LOCALFOLD_MG_SIMULATE": "1", "CUDA_VISIBLE_DEVICES": "0"})
+                r.update(copies=copies, tokens=copies * len(TIM), simulated=True)
+                report["scaling"].append(r)
+                print(json.dumps(r)[:400], flush=True)
     if args.big:
         seq = ":".join([TIM] * args.big)
         r = fold(args, most, [f"--sequence={seq}", "--seed=1", "--steps=100", "--recycles=0"], out / f"tim{args.big}-{most}.pdb")
@@ -144,12 +157,16 @@ def main():
     for c in report["correctness"]:
         lines.append(f"| {c['case']} | {c.get('one_vs_crystal')} | {c.get('many_vs_crystal')} | {c.get('many_vs_one')} | "
                      f"{c['one'].get('plddt')} / {c['many'].get('plddt')} |")
-    lines += ["", "## Scaling", "", "| tokens | GPUs | trunk ms | diffusion ms | confidence ms | total ms | peak MiB a GPU | ok |",
-              "|---:|---:|---:|---:|---:|---:|---|---|"]
+    lines += ["", "## Scaling", "", "(sim: one simulated rank of N on one GPU - a rank's compute without the interconnect)", "",
+              "| tokens | GPUs | trunk ms | diffusion ms | confidence ms | total ms | wall s | x vs 1 GPU | peak MiB a GPU | ok |",
+              "|---:|---|---:|---:|---:|---:|---:|---:|---|---|"]
+    one = {r["tokens"]: r.get("total_ms") for r in report["scaling"] if r["gpus"] == 1 and r.get("total_ms")}
     for r in report["scaling"]:
         pk = max(r["peak_mib"].values()) if r["peak_mib"] else None
-        lines.append(f"| {r['tokens']} | {r['gpus']} | {r.get('trunk_ms')} | {r.get('diffusion_ms')} | {r.get('confidence_ms')} | "
-                     f"{r.get('total_ms')} | {pk} | {r['ok']} |")
+        x = f"{one[r['tokens']] / r['total_ms']:.2f}" if r.get("total_ms") and one.get(r["tokens"]) else ""
+        g = f"{r['gpus']} sim" if r.get("simulated") else str(r["gpus"])
+        lines.append(f"| {r['tokens']} | {g} | {r.get('trunk_ms')} | {r.get('diffusion_ms')} | {r.get('confidence_ms')} | "
+                     f"{r.get('total_ms')} | {r.get('wall_s')} | {x} | {pk} | {r['ok']} |")
     (out / "multigpu-report.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
