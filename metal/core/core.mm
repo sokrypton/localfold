@@ -281,14 +281,14 @@ struct Device {
       for (auto& t : todo) if (!isTensor(t.first)) groups[0].push_back(t); else if (tensorOps) groups[1].push_back(t);
       std::vector<std::thread> threads;
       for (int tensor = 0; tensor < 2; ++tensor) {
-        const auto& todo = groups[tensor];
-        size_t chunks = std::min<size_t>(tensor ? 4 : 8, (todo.size() + 7) / 8);
+        const std::vector<std::pair<std::string, std::string>>* list = &groups[tensor];   // (groups outlives the threads)
+        const size_t chunks = std::min<size_t>(tensor ? 4 : 8, (list->size() + 7) / 8);
         for (size_t c = 0; c < chunks; ++c)
-          threads.emplace_back([&, c, tensor] { @autoreleasepool {
+          threads.emplace_back([this, list, chunks, c, tensor] { @autoreleasepool {
             std::string src = tensor ? TENSOR_SOURCE : GEMM_SOURCE;
-            for (size_t i = c; i < todo.size(); i += chunks) src += "\n" + todo[i].second;
+            for (size_t i = c; i < list->size(); i += chunks) src += "\n" + (*list)[i].second;
             id<MTLLibrary> l = compile(src, "the cached instances", tensor);
-            for (size_t i = c; i < todo.size(); i += chunks) remember(todo[i].first, pipelineOf(l, todo[i].first));
+            for (size_t i = c; i < list->size(); i += chunks) remember((*list)[i].first, pipelineOf(l, (*list)[i].first));
           } });
       }
       for (auto& t : threads) t.join();
@@ -655,6 +655,10 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, ha
 }
 
 // ---------------------------------------------------------------- attention
+// from 256 keys, heads 32 wide or more: below, lf_attention's registers win. Measured on an M5 (8-core GPU), interleaved,
+// lf_attention -> tensor: n 261 H 4 D 32 x 261 rows 4.68 -> 4.18 ms, n 512 3.83 -> 2.86, n 1044 2.06 -> 1.60; level at D 48
+// and 64; worse at D 16 (n 261: 3.06 -> 3.77) and at n 68 (0.153 -> 0.182)
+static const int ATTN_TENSOR_MIN_N = 256;
 void attention(const Attention& t) {
   if (!t.rows || !t.n) return;
   int W = t.heads * t.D;
@@ -667,6 +671,21 @@ void attention(const Attention& t) {
   a.r0 = t.r0; a.n = t.n; a.heads = t.heads; a.biasStride = t.biasStride; a.scale = t.scale;
   a.maskB = t.maskB || t.maskK ? t.maskB : t.n; a.maskK = t.maskB || t.maskK ? t.maskK : 1;
   a.pad0 = GEMM_EXTRA_EP;      // (an experiment's switch: metal/bench)
+  // the matrix units (gemm_tensor.metal's lf_attention_tensor) where they win: LOCALFOLD_ATTN_TENSOR=0 keeps lf_attention,
+  // =1 takes the tensor kernel at any length (the bench's arms); by default from ATTN_TENSOR_MIN_N keys
+  if (D().tensorOps && (t.D == 16 || t.D == 32 || t.D == 48 || t.D == 64)) {
+    const char* e = getenv("LOCALFOLD_ATTN_TENSOR");
+    const bool on = e ? strcmp(e, "0") != 0 : t.n >= ATTN_TENSOR_MIN_N && t.D >= 32;
+    if (on) {
+      const int TQB = 64;
+      std::string name = "gemmt_attn_" + std::to_string(t.D);
+      std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_attention_tensor<" + std::to_string(t.D) +
+                         ">(constant AttnArgs&, uint3, uint, uint, uint);";
+      dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)((t.n + TQB - 1) / TQB), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0,
+                       "attention");
+      return;
+    }
+  }
   const char* k = t.D == 8 ? "lf_attention_8" : t.D == 16 ? "lf_attention_16" : t.D == 24 ? "lf_attention_24" : t.D == 32 ? "lf_attention_32"
                 : t.D == 48 ? "lf_attention_48" : t.D == 64 ? "lf_attention_64" : nullptr;
   if (!k) die("attention: no kernel for a head %d wide", t.D);
