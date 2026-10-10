@@ -26,31 +26,65 @@ inline int maxStored(int n) { int m = 0; for (int r = 0; r < mg::WORLD; ++r) m =
 inline size_t elem() { return PAIR16 ? 2 : 4; }
 inline float* baseOf(void* slab, int lo, int n, int C) { return (float*)((char*)slab - (size_t)lo * n * C * elem()); }
 
-// dst[(j) * n + i0 + i] = src[i * cols + j]: a staged block of the pair (rows x cols pairs, `bytes` a pair), transposed
-__global__ void transposeBlockK(const uint4* __restrict__ src, uint4* __restrict__ dst, int rows, int cols, int n, int i0,
-                                int vecs) {
+// every rank's slab, for a kernel that reads them directly (peer access over NVLink or PCIe peer-to-peer, which
+// multigpu.cuh requires): base pointer and first row each
+struct PeerSlabs { const uint4* p[mg::MAX_RANKS]; int lo[mg::MAX_RANKS], rows[mg::MAX_RANKS]; int world; };
+inline PeerSlabs peerSlabs(const mg::Shared& z, int n) {
+  PeerSlabs ps{};
+  ps.world = mg::WORLD;
+  for (int r = 0; r < mg::WORLD; ++r) { int hi; rowsOf(n, r, ps.lo[r], hi); ps.rows[r] = storedRows(n, r); ps.p[r] = (const uint4*)z.peer[r]; }
+  return ps;
+}
+// zT[j][i] = z[i][lo + j] for this rank's columns j and every row i, read straight from the rank holding row i - one
+// kernel over every peer at once (a staged copy a peer, one after another on one stream, ran the 7 peers of 8 x A100
+// in series: the transposes were most of what kept the transition at 2.6x on eight GPUs)
+__global__ void transposeP2PK(PeerSlabs ps, uint4* __restrict__ zT, int n, int lo, int cols, int vecs) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)rows * cols * vecs) return;
-  size_t p = t / vecs; int v = (int)(t % vecs);
-  int i = (int)(p / cols), j = (int)(p % cols);
-  dst[((size_t)j * n + i0 + i) * vecs + v] = src[p * vecs + v];
+  if (t >= (size_t)n * cols * vecs) return;
+  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int j = (int)(rest % cols), i = (int)(rest / cols);
+  int p = 0;
+  while (p + 1 < ps.world && i >= ps.lo[p + 1]) ++p;
+  zT[((size_t)j * n + i) * vecs + v] = ps.p[p][((size_t)(i - ps.lo[p]) * n + lo + j) * vecs + v];
 }
 // zT (this rank's rows of z^T: z's columns [lo, hi)) from every rank's slab of z
 inline void transpose(const mg::Shared& z, const mg::Shared& zT, int n, int C) {
   const size_t pb = (size_t)C * elem(); const int vecs = (int)(pb / 16);
   int lo, hi; rowsOf(n, mg::RANK, lo, hi); const int cols = storedRows(n, mg::RANK);
-  char* stage = scratch<char>("sh.tstage", std::max<size_t>(1, (size_t)maxStored(n) * cols * pb));
-  mg::fence();
-  for (int p = 0; p < mg::WORLD; ++p) {
-    int plo, phi; rowsOf(n, p, plo, phi); const int rows = storedRows(n, p);
-    if (!rows || !cols) continue;
-    // rank p's rows, this rank's columns: rows x cols pairs, its slab's rows from plo
-    CK(cudaMemcpy2DAsync(stage, (size_t)cols * pb, (const char*)z.peer[p] + (size_t)lo * pb, (size_t)n * pb,
-                         (size_t)cols * pb, rows, cudaMemcpyDefault, STREAM));
-    transposeBlockK<<<blocks((size_t)rows * cols * vecs), 256, 0, STREAM>>>((const uint4*)stage, (uint4*)zT.local, rows,
-                                                                        cols, n, plo, vecs);
+  mg::fence();                                    // (every rank's z written)
+  if (cols) transposeP2PK<<<blocks((size_t)n * cols * vecs), 256, 0, STREAM>>>(peerSlabs(z, n), (uint4*)zT.local, n, lo, cols, vecs);
+  mg::fence();                                    // (no rank rewrites its z while another still reads it)
+}
+
+// The triangle's ring: a block of a against every rank's rows of b - this rank's own first, then each peer's staged
+// on a copy stream while the GEMM before it runs (two staging buffers where the room allows, else one, in series).
+// gemm(m, B, qlo) enqueues the block's product columns [qlo, qlo + m) on STREAM
+template <class T, class G>
+inline void ringOver(const mg::Shared& bmine, int n, int np, int C, T* const* stages, int nstage, G gemm) {
+  static cudaStream_t cs = [] { cudaStream_t s; CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)); return s; }();
+  static cudaEvent_t ready[2], used[2];
+  static bool made = false;
+  if (!made) { for (int k = 0; k < 2; ++k) { CK(cudaEventCreateWithFlags(&ready[k], cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&used[k], cudaEventDisableTiming)); } made = true; }
+  int lo, hi; rowsOf(n, mg::RANK, lo, hi);
+  if (hi > lo) gemm(hi - lo, (const T*)bmine.local, lo);
+  std::vector<int> order;
+  for (int q = 1; q < mg::WORLD; ++q) { const int r = (mg::RANK + q) % mg::WORLD; int a, b; rowsOf(n, r, a, b); if (b > a) order.push_back(r); }
+  if (order.empty()) return;
+  for (int k = 0; k < nstage; ++k) CK(cudaEventRecord(used[k], STREAM));    // (a buffer's last reader: an earlier GEMM)
+  auto issue = [&](int k) {
+    const int r = order[k], slot = k % nstage; int a, b; rowsOf(n, r, a, b);
+    CK(cudaStreamWaitEvent(cs, used[slot], 0));
+    CK(cudaMemcpyAsync(stages[slot], bmine.peer[r], (size_t)(b - a) * np * C * sizeof(T), cudaMemcpyDefault, cs));
+    CK(cudaEventRecord(ready[slot], cs));
+  };
+  issue(0);
+  for (int k = 0; k < (int)order.size(); ++k) {
+    if (nstage == 2 && k + 1 < (int)order.size()) issue(k + 1);
+    const int slot = k % nstage; int a, b; rowsOf(n, order[k], a, b);
+    CK(cudaStreamWaitEvent(STREAM, ready[slot], 0));
+    gemm(b - a, (const T*)stages[slot], a);
+    CK(cudaEventRecord(used[slot], STREAM));
+    if (nstage == 1 && k + 1 < (int)order.size()) issue(k + 1);
   }
-  mg::fence();
 }
 
 // the triangle multiplication's outgoing form on a slab (z, or z^T with the incoming weights)
@@ -70,7 +104,10 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   // rows' columns of the block's product
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
   mg::Shared& bmine = mg::shared("sh.bmine" + std::to_string(C), (size_t)maxShare * np * C * sizeof(TQ));
-  TQ* bstage = mg::WORLD > 1 ? scratch<TQ>("trib.bstage", (size_t)maxShare * np * C) : nullptr;
+  const size_t stageElems = (size_t)maxShare * np * C;
+  TQ* stages[2] = { mg::WORLD > 1 ? scratch<TQ>("trib.bstage", stageElems) : nullptr, nullptr };
+  if (mg::WORLD > 2 && roomFor(stageElems * sizeof(TQ) * 2)) stages[1] = scratch<TQ>("trib.bstage2", stageElems);
+  const int nstage = stages[1] ? 2 : 1;
   int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
   {
     size_t f, t; deviceMemInfo(&f, &t);
@@ -106,18 +143,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
           const size_t rs = (size_t)w * np;
           RectMap rm{k0, np, 0, rs};
           in(rm, rs, a, nullptr, t2);
-          for (int q = 0; q < mg::WORLD; ++q) {       // rank q's rows of b: the product's columns [qlo, qhi)
-            const int r = (mg::RANK + q) % mg::WORLD;
-            int qlo, qhi; rowsOf(n, r, qlo, qhi);
-            const int m = qhi - qlo;
-            if (m <= 0) continue;
-            const TQ* B = (const TQ*)bmine.local;
-            if (r != mg::RANK) {
-              CK(cudaMemcpyAsync(bstage, bmine.peer[r], (size_t)m * np * C * sizeof(TQ), cudaMemcpyDefault, STREAM));
-              B = bstage;
-            }
-            gemmQ(m, w, B, rs, prod + qlo);
-          }
+          ringOver<TQ>(bmine, n, np, C, stages, nstage, [&](int m, const TQ* B, int qlo) { gemmQ(m, w, B, rs, prod + qlo); });
           triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                       Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, rm);
         }
@@ -224,7 +250,10 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
   mg::Shared& bmine = mg::shared(std::string("sh.bg") + (sizeof(T) == 2 ? "16." : "32.") + std::to_string(C), (size_t)maxShare * np * C * sizeof(T));
   if (hi > lo) operands({lo, hi - lo, 0, np}, (T*)bmine.local, 1);
   // (a ring, as triangleOn: one rank's b staged at a time against each block of a)
-  T* bstage = mg::WORLD > 1 ? scratch<T>("trib.bstage", (size_t)maxShare * np * C) : nullptr;
+  const size_t stageElems = (size_t)maxShare * np * C;
+  T* stages[2] = { mg::WORLD > 1 ? scratch<T>("trib.bstage", stageElems) : nullptr, nullptr };
+  if (mg::WORLD > 2 && roomFor(stageElems * sizeof(T) * 2)) stages[1] = scratch<T>("trib.bstage2", stageElems);
+  const int nstage = stages[1] ? 2 : 1;
   mg::fence();
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
   {
@@ -240,19 +269,10 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
     int w = std::min(width, hi - k0);
     TriRect r{k0, w, 0, np};
     operands(r, a, 0);
-    for (int q = 0; q < mg::WORLD; ++q) {           // rank q's rows of b: the product's columns [qlo, qhi)
-      const int rk = (mg::RANK + q) % mg::WORLD;
-      int qlo, qhi; rowsOf(n, rk, qlo, qhi);
-      const int m = qhi - qlo;
-      if (m <= 0) continue;
-      const T* B = (const T*)bmine.local;
-      if (rk != mg::RANK) {
-        CK(cudaMemcpyAsync(bstage, bmine.peer[rk], (size_t)m * np * C * sizeof(T), cudaMemcpyDefault, STREAM));
-        B = bstage;
-      }
+    ringOver<T>(bmine, n, np, C, stages, nstage, [&](int m, const T* B, int qlo) {
       CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, m, w, np, &alpha, B, cudaType<T>(), np, (long long)m * np, a,
         cudaType<T>(), np, r.size(), &zero, prod + qlo, CUDA_R_32F, np, r.size(), C, CUBLAS_COMPUTE_32F, algo));
-    }
+    });
     for (size_t q0 = 0; q0 < r.size(); q0 += per) {
       size_t cnt = std::min(per, r.size() - q0);
       rectCenterNormK<T><<<(unsigned)((cnt + 31) / 32), dim3(32, 8), 0, STREAM>>>(prod, ln, q0, cnt, C, r.size(),

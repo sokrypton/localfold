@@ -668,6 +668,7 @@ static int foldMain(int argc, char** argv) {
       std::vector<int> pbI(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
       std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
       const bool ca = M.flag("trunk.dialect.confidenceCaDgram");
+      auto sc0 = clock();
       for (size_t k = 0; k < cn; ++k) {
         const float* xk = xs.data() + k * mask.size() * 3;
         std::vector<float> beta((size_t)nD * 3);
@@ -679,6 +680,7 @@ static int foldMain(int argc, char** argv) {
         CK(cudaFree(dBeta));
       }
       if (contact.empty()) contact = contactProbabilitiesSharded(t);    // (made off the whole pair where it was gathered)
+      confMs += ms(sc0, clock()); s0 += clock() - sc0;   // (the confidence head's time its own, not the sampler's)
       mg::release({ "" });
       if (mg::RANK != 0) { mg::finish(); exit(0); }
       mg::finish();
