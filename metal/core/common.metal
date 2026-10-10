@@ -315,21 +315,18 @@ kernel void lf_center_norm_wide(constant CenterNormArgs& a [[buffer(0)]], uint3 
   const uint rr = (uint)(r0 + lane), ii = lf_udiv(rr, a.L);
   const ulong q = (ulong)ii * a.Lp + (rr - ii * a.L), plane = (ulong)a.Lp * a.Lp;
   const bool live = r0 + lane < a.pairs;
-  float s = 0.f;
-  for (uint c = grp; c < C; c += 8) s += live ? a.prod[c * plane + q] : 0.f;
-  part[grp * 32 + lane] = s;
+  // the statistics in ONE read of the product (the output is the second): sums shifted by the pair's channel 0, so the
+  // variance is no difference of large numbers - mean = K + s1 / C, var = s2 / C - (s1 / C)^2
+  threadgroup float part2[256];
+  const float K = live ? a.prod[q] : 0.f;
+  float s1 = 0.f, s2 = 0.f;
+  for (uint c = grp; c < C; c += 8) { const float d = (live ? a.prod[c * plane + q] : 0.f) - K; s1 += d; s2 += d * d; }
+  part[grp * 32 + lane] = s1; part2[grp * 32 + lane] = s2;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  float S = 0.f;
-  for (int g = 0; g < 8; ++g) S += part[g * 32 + lane];
-  const float mean = S / C;
-  float d2 = 0.f;
-  for (uint c = grp; c < C; c += 8) { float d = (live ? a.prod[c * plane + q] : 0.f) - mean; d2 += d * d; }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  part[grp * 32 + lane] = d2;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float V = 0.f;
-  for (int g = 0; g < 8; ++g) V += part[g * 32 + lane];
-  const float inv = rsqrt(V / C + 1e-5f);
+  float S1 = 0.f, S2 = 0.f;
+  for (int g = 0; g < 8; ++g) { S1 += part[g * 32 + lane]; S2 += part2[g * 32 + lane]; }
+  const float m1 = S1 / C, mean = K + m1;
+  const float inv = rsqrt(max(S2 / C - m1 * m1, 0.f) + 1e-5f);
   if (!live) return;
   for (uint c = grp; c < C; c += 8) a.out[(r0 + lane) * C + c] = (half)((a.prod[c * plane + q] - mean) * inv * a.scale[c] + a.offset[c]);
 }
