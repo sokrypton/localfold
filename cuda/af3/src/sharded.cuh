@@ -109,6 +109,24 @@ __global__ void pullPlanesK(PeerPlanes pp, uint4* __restrict__ a, uint4* __restr
   const size_t src = ((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs + v;
   a[t] = pp.p[r][src]; b[t] = pp.q[r][src];
 }
+// ...the operands exchanged e4m3 (LOCALFOLD_MG_FP8_EXCHANGE=1: half the bytes of the largest exchange there is) and
+// widened to bf16 here for the GEMM - 8 values a thread, vecs8 = np / 8 a row
+__device__ __forceinline__ uint4 widen8(uint2 s) {
+  const __nv_fp8_e4m3* e = reinterpret_cast<const __nv_fp8_e4m3*>(&s);
+  __align__(16) __nv_bfloat16 o[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) o[k] = __float2bfloat16(float(e[k]));
+  return *reinterpret_cast<const uint4*>(o);
+}
+__global__ void pullPlanes8K(PeerPlanes pp, uint4* __restrict__ a, uint4* __restrict__ b, int q0, int gc, int np, int vecs8) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)gc * np * vecs8) return;
+  const int v = (int)(t % vecs8); const size_t rest = t / vecs8; const int i = (int)(rest % np), c = (int)(rest / np);
+  const int r = ownerOf(pp, i);
+  const size_t src = ((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs8 + v;
+  a[t] = widen8(reinterpret_cast<const uint2*>(pp.p[r])[src]);
+  b[t] = widen8(reinterpret_cast<const uint2*>(pp.q[r])[src]);
+}
 __global__ void pushRowsK(PeerPlanes pp, const uint4* __restrict__ prod, int q0, int gc, int np, int vecs) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)gc * np * vecs) return;
@@ -161,11 +179,15 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
   const size_t mine = (size_t)maxShare * np * C;
-  const std::string tag = std::to_string(C) + (F8 ? "f8" : "");
+  // (LOCALFOLD_MG_FP8_EXCHANGE=1: a and b written e4m3 for the exchange, widened back to bf16 as they are pulled - the
+  // FP8 path's own operand precision, which folds within 0.03 A of bf16's; off by default until a box measures it)
+  static const bool X8 = getenv("LOCALFOLD_MG_FP8_EXCHANGE") && atoi(getenv("LOCALFOLD_MG_FP8_EXCHANGE"));
+  const bool x8 = X8 && !F8;
+  const std::string tag = std::to_string(C) + (F8 ? "f8" : x8 ? "x8" : "");
   // this rank's rows' a and b ([C][rows][np], read by every rank) and its rows' product ([C][rows][np], written by
   // every rank)
-  mg::Shared& aS = mg::shared("sh.ta" + tag, mine * sizeof(TQ));
-  mg::Shared& bS = mg::shared("sh.tb" + tag, mine * sizeof(TQ));
+  mg::Shared& aS = mg::shared("sh.ta" + tag, mine * (x8 ? 1 : sizeof(TQ)));
+  mg::Shared& bS = mg::shared("sh.tb" + tag, mine * (x8 ? 1 : sizeof(TQ)));
   mg::Shared& pS = mg::shared("sh.tp" + std::to_string(C), mine * sizeof(B16));
   half* t2 = scratch<half>("trib.t2", (size_t)std::max(rows, 1) * np * C);
   if (F8 && incoming) { fprintf(stderr, "sharded triangle: the FP8 GEMM takes the outgoing (TN) form only\n"); exit(1); }
@@ -205,12 +227,19 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
     wideWarps(C, [&](auto warps) {
       constexpr int WI = decltype(warps)::value;
       WITH_PAIR_T(
-        static bool attr = false;
+        static bool attr = false, attr8 = false;
         constexpr auto kern = triIn256For<CC, WI, TQ, PT>();
-        if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-        if (rows > 0)
-          kern<<<(unsigned)(((size_t)rows * np + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+        constexpr auto kern8 = triIn256For<CC, WI, __nv_fp8_e4m3, PT>();
+        const unsigned grid = (unsigned)(((size_t)rows * np + triInRowsOf(WI) - 1) / triInRowsOf(WI));
+        if (rows > 0 && !x8) {
+          if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+          kern<<<grid, 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
             base, mask, lnS, lnO, wt, (TQ*)aS.local, (TQ*)bS.local, t2, n, np, cs, nullptr, mineRm);
+        } else if (rows > 0) {
+          if (!attr8) { smemAttr(kern8, (int)wideTriInSmemW(CC, WI)); attr8 = true; }
+          kern8<<<grid, 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+            base, mask, lnS, lnO, wt, (__nv_fp8_e4m3*)aS.local, (__nv_fp8_e4m3*)bS.local, t2, n, np, cs, nullptr, mineRm);
+        }
         mg::fence();                                  // (every rank's a and b written before any is read)
         CK(cudaEventRecord(fenced, STREAM));
         CK(cudaStreamWaitEvent(pullS, fenced, 0)); CK(cudaStreamWaitEvent(pushS, fenced, 0));
@@ -218,7 +247,8 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         for (int q0 = c0; q0 < c1; q0 += g, ++q) {
           const int gc = std::min(g, c1 - q0), sl = q % 2;
           if (q >= 2) CK(cudaStreamWaitEvent(pullS, gemmed[sl], 0));     // (group q - 2's GEMM done with these planes)
-          pullPlanesK<<<blocks((size_t)gc * np * vecsA), 256, 0, pullS>>>(abPlanes, (uint4*)aAll[sl], (uint4*)bAll[sl], q0, gc, np, vecsA);
+          if (x8) pullPlanes8K<<<blocks((size_t)gc * np * (np / 8)), 256, 0, pullS>>>(abPlanes, (uint4*)aAll[sl], (uint4*)bAll[sl], q0, gc, np, np / 8);
+          else pullPlanesK<<<blocks((size_t)gc * np * vecsA), 256, 0, pullS>>>(abPlanes, (uint4*)aAll[sl], (uint4*)bAll[sl], q0, gc, np, vecsA);
           CK(cudaEventRecord(pulled[sl], pullS));
           CK(cudaStreamWaitEvent(STREAM, pulled[sl], 0));
           if (q >= 2) CK(cudaStreamWaitEvent(STREAM, pushed[sl], 0));    // (group q - 2's pushes done reading this product)
