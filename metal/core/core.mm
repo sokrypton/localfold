@@ -540,11 +540,19 @@ void gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tm, &tn);
   const bool triReg = tri && (a.epilogue & 512);
   if (triReg) { tm = 64; tn = 128; }      // (the layout lf_tri_quarters wrote: 32 channels a tile)
+  // the general epilogues in registers, 4 columns at a time (LOCALFOLD_GEMM_VEC=0 the control): where the tile is
+  // 64 rows and everything the epilogue touches is 4-element aligned
+  static const bool vecWanted = !getenv("LOCALFOLD_GEMM_VEC") || atoi(getenv("LOCALFOLD_GEMM_VEC")) != 0;
+  auto al4 = [](uint64_t p, int64_t ld) { return p % 16 == 0 && ld % 4 == 0; };
+  const bool vecEp = vecWanted && !plain && !tri && !(a.epilogue & (128 | 256)) && tm == 64 && a.m % 4 == 0 && !a.ptrs &&
+                     al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & 64) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc)) &&
+                     (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
+  if (vecEp && tn < 64) tn = 64;
   // (a staged epilogue holds the tile in threadgroup memory: 32 KB on Apple's GPUs, some of it the operation's own)
-  while (!plain && !tri && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
+  while (!plain && !tri && !vecEp && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
   if (tri && tn % 32) die("gemm: the triangle gate wants a tile 32 columns wide or more, not %d", tn);
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
-  const int ep = (tri ? 1 : 0) | (plain ? 2 : 0) | (hacc ? 8 : 0) | (triReg ? 16 : 0);
+  const int ep = (tri ? 1 : 0) | (plain ? 2 : 0) | (hacc ? 8 : 0) | (triReg ? 16 : 0) | (vecEp ? 128 : 0);
   const char* tcs = tc_ == F32 ? "float" : "half";
   std::string targs = std::string("half, half, ") + tcs + ", " + std::to_string(tm) + ", " + std::to_string(tn) + ", " +
                       (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(ep);

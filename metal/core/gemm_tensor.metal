@@ -71,6 +71,38 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
     }
     return;
   }
+  // EP bit 128, the general epilogues (alpha, beta, a bias, ReLU, GELU, the gated residual) in registers: a thread holds
+  // 4 adjacent columns at e..e+3 (the 64 x 64 and 64 x 128 layouts probed on the M5), read and written 4 at a time -
+  // the host's promise: the leading dimensions and pointers 4-element aligned, m a multiple of 4
+  if constexpr ((EP & 128) != 0) {
+    static_assert(TM == 64 && (TN == 64 || TN == 128), "the vector epilogue is laid out for 64 x 64 and 64 x 128 tiles");
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < c.get_capacity(); e += 4) {
+      if (!c.is_valid_element(e)) continue;
+      const auto ix = c.get_multidimensional_index(e);
+      const int i = i0 + ix[0], j = j0 + ix[1];
+      if (j >= g.n || i >= g.m) continue;
+      // (lf_gemm's order of operations, so the results match the staged path's bit for bit)
+      float4 v = g.alpha * float4((float)c[e], (float)c[e + 1], (float)c[e + 2], (float)c[e + 3]);
+      const float4 bv = !(g.epilogue & 4) ? float4(0)
+                        : (g.biasType & 255) == 2 ? float4(*(device const half4*)((device const half*)g.bias + i))
+                                                  : *(device const float4*)((device const float*)g.bias + i);
+      device TC* dp = D + (ulong)i + (ulong)j * g.ldd;
+      if (g.epilogue & 64) {      // a gated residual: D = C + aux * sigmoid(v)
+        if (g.epilogue & 4) v += bv;
+        const float4 ax = float4(*(device const half4*)((device const half*)g.aux + (ulong)i + (ulong)j * g.ldaux));
+        const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+        *(device vec<TC, 4>*)dp = vec<TC, 4>(cv + ax * (1.f / (1.f + exp(-v))));
+        continue;
+      }
+      if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+      if (g.epilogue & 4) v += bv;
+      if (g.epilogue & 2) v = max(v, 0.f);
+      if (g.epilogue & 32) for (int t = 0; t < 4; ++t) v[t] = 0.5f * v[t] * (1.f + lf_erf(v[t] * 0.70710678118654752f));
+      *(device vec<TC, 4>*)dp = vec<TC, 4>(v);
+    }
+    return;
+  }
   // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1, beta 0, the output in the
   // accumulator's type) - adjusted in place and stored by the tensor (bounds against D's extents), no staging tile
   if constexpr ((EP & 2) != 0) {
