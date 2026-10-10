@@ -689,3 +689,47 @@ outliers. What remains, all bandwidth or scalar work:
   output tile for the triangle's projection.
 - **WebGPU's contraction (`tri.contract`, 288 ms a pass)** runs at ~1.5 TFLOP/s against the probe's 2.0 for an f32
   staged GEMM, so a rewrite would be worth at most ~1.3x on it (~2% of a pass). Its tiles stop at 32 x 32. Not done.
+
+### 2026-10-10, night: the residual streams in half (a real project), and what else a sweep left
+
+- **What decided the project**: after the evening pass, every kernel left in a boltz2 trunk pass was compute-bound
+  (the K-128 GEMMs at 9-10 TFLOP/s against 12.2 on 4096 square, the triangle contractions at 10.5), bandwidth-bound
+  on the f32 pair (the updates' last GEMMs, 30% of the pass), or attention (16%). The f32 pair's reads and writes
+  were the one large thing a change of representation could halve. Bench, `BENCH_BETA=1` (beta 1, the residual read
+  back): 128 x 65025 x 128 adding into a float residual 0.698 ms, into a half one 0.468; 128 x 65025 x 512 1.214 ->
+  0.992. A float tile for a half output costs nothing (0.467-0.497 against 0.469-0.478), so the half residual keeps
+  float sums.
+- **Numerics first, by simulation** (the pair rounded through f16 on the host after every update, the LN emit off so
+  every norm read the rounded values; not committed):
+  - 6MRR, six AF3-family models: CA RMSD to f32 0.002-0.045 A, pLDDT unchanged.
+  - 5CAJ single sequence (pLDDT 30-60, chaotic): half 0.10-4.12 A from f32, against an f32-vs-f32 noise floor (the
+    LN emit on/off) of 0.00-3.72 A on the same models. bf16 (the top 16 bits, which would have kept the macOS 13
+    floor) was 3.2-15.1 A: out.
+  - The pair's largest value: boltz2 774, rosettafold3 2042, opendde 4466, intellifold2 5483, protenix2 8434,
+    openbind0 12664 - the same at 68 and 255 tokens. Half's limit is 65504; the stores saturate.
+  - AF2 (MSA and pair): the MSA to ~500, the pair to ~1300. On tools/fixtures/test.a3m (a real 8076-row UniRef
+    alignment, pLDDT 96.22) 0.003 A, the same as the two f32 kernel families' difference.
+- **12f9074d, AF3**: the pairformer stack over a half pair (chai-1's parallel blocks too). boltz2 5CAJ trunk (2
+  passes) 2387-2434 -> 2267-2288 ms; at 510 tokens 5619 / 5810 -> 5343 / 5532 (-4.9%); chai-1 -3% (its trunk is
+  mostly K-256 GEMMs). Releasing the f32 pair for the stack and re-allocating it after was tried for memory and gave
+  nothing: the 1020-token fold peaks in the MSA stack and the confidence head (6223 MB either way).
+- **c8eea1c2, AF2**: the whole evoformer over half activations. 5CAJ with the 1500-row MSA 4125 / 4236 -> 3941 / 4052
+  ms (-4.5%; LayerNorm 362 -> 240, the MSA attentions' outputs 261 -> 194); the gate's folds -7 to -8% (one run
+  each). **Correction to that commit's message**: its "6MRR 652-671 -> 487 ms" was single runs across processes; the
+  gate's own 6MRR timings (342 -> 338 ms) say level. The 1BRS multimer single sequence (pLDDT 39, 15.8 A from the
+  crystal) moved 4.4 A against an f32 floor of 0.3-1.0 A - and stayed exactly as far from the crystal (15.914 against
+  15.812 A). Its templated twin, 0.272 A either way.
+- **1a4274eb, ESMFold2**: the folding blocks over a half z. 5CAJ trunk 2609 / 2679 -> 2534 / 2602 ms; the gated add
+  374 -> 278.
+- **532fed18**: plain products over a short K (<= 128) on 32 x 256 tiles - AF3's grid qkvg 119 -> 111 ms a pass,
+  byte-identical. The SwiGLU GEMM (staged epilogue) is level on that tile and 64 x 256 does not fit; the triangle
+  gate's register layout is 64 x 128's. `LOCALFOLD_GEMM_WIDE=0` the control.
+- **The WebGPU side is at its ALU ceiling, measured**: `probe-alu.js`'s vec4 11.3 TFLOP/s was dead lanes -
+  `probe-alu-lanes.js` (stock Chrome, the M5): f32 2.6-2.9 TFLOP/s with every component live, f16 3.8-5.2. The WGSL
+  GEMMs' ~2.0 f32 is 70-75% of that; only f16 arithmetic (declined before for accuracy) is a lever there.
+- **Attention, not attempted again**: v1 (K and V staged by the threadgroup) lost to v2/v3; the remaining design (both
+  products across four simdgroups, P through threadgroup memory) is v1's shape with the tensor ops, and MPP refuses a
+  cooperative left input across simdgroups. It is 16% of a 255-token trunk and 37% at 1020.
+- **Diffusion at 255 tokens** (boltz2: 19.8 ms a step, 45% of a default fold): its GEMMs are ~12 ms a step at 10.4
+  TFLOP/s and the rest is adaLN, gated residuals and the atom attentions at 20-65 us a dispatch, fused before and
+  level. Nothing structural left there either.

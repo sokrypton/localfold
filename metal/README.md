@@ -164,6 +164,15 @@ confidence head builds its own. The pair recycles in place (its recycle term pro
 only its own normalised row): a copy of it and an f32 term were two pairs more, 1.1 GB at 1044 tokens. (From cuda/af3's
 big-input work on `opus-55-opt`, whose pair stays bf16 past the trunk; its launch fusions were measured here and lost.)
 
+**Where the matrix units run, the trunks' residual streams are half** (`LOCALFOLD_HALF_PAIR=0` the control): AF3's
+pairformer stack, AF2's whole evoformer (the MSA, the extra MSA and the pair) and ESMFold2's folding blocks each take a
+half copy on entry and hand float back on exit, so every stage outside them is unchanged. Every residual is summed in
+float and rounded once on its store (saturating at 65504; the largest values seen are ~13000, openbind0's pair); every
+norm reads the stored half values. The updates' last GEMMs are bandwidth-bound on the residual, so it is speed - AF3
+-5 to -6% a trunk pass, AF2 -4.5 to -8%, ESMFold2 -2.5 to -3.6% - not memory: the stack holds the half copy beside the
+float one, inside peaks set elsewhere (the MSA stack, the confidence head). bf16 was 3-15 A off on the low-confidence
+folds where half sat at the f32 noise floor; docs/M5-HANDOFF.md has the numbers.
+
 🔴 **A RELEASED BUFFER IS STILL RESIDENT UNTIL THE WORK ISSUED BEFORE IT IS DONE**, and the host runs far ahead of the
 GPU: a 522-token trunk pass held 0.9 GB of released buffers beside its own 1.9, invisible to the allocation count and
 exactly the gap to the process footprint. Past 128 MB of them (`LOCALFOLD_BURIED_MB`) the allocator waits for the GPU
@@ -217,5 +226,5 @@ uses more registers): no error, the output untouched.
    attention from 48 keys at heads 16-64 wide (v3, the online softmax in cooperative tensors). Left: heads 8 and 24
    wide (AF2's extra MSA, AF3's single attention) on lf_attention, and attention itself at 6-7 TFLOP/s against the
    GEMMs' 10-12 - 37% of a 1020-token trunk. docs/M5-HANDOFF.md's last sections have the numbers and what lost.
-5. The pair LayerNorm emitted by the previous GEMM's epilogue (Gemm::lnOut; AF3 and AF2, 128-wide pairs, the matrix
-   units): ESMFold2's 256-wide pair is left - a row spans two 64 x 128 tiles, so it wants a 32 x 256 destination.
+5. The pair LayerNorm emitted by the previous GEMM's epilogue (Gemm::lnOut, the matrix units): done for the 128-wide
+   pairs on 64 x 128 tiles and the 256-wide on 32 x 256 (05c066c5).

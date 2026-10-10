@@ -1,6 +1,7 @@
 // Native AlphaFold 2 on Metal: the stages' declarations (metal/af2/*.mm). cuda/af2 is the reading - af3-any-model's AF2
 // multimer graph, one graph for monomer and multimer checkpoints - on metal/core: the Evoformer's projections f16
-// with f32 accumulation, attention on the core's flash kernel, residual streams f32.
+// with f32 accumulation, attention on the core's flash kernel, residual streams f32 (the evoformer's half where the
+// matrix units run: main.mm).
 #pragma once
 #include "core.h"
 #include "kernels.h"

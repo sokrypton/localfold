@@ -6,7 +6,8 @@
 // A triangle: LN -> one GEMM gating a and b into channel-major planes (gemmTriGate) -> the planes' product, a
 // batched GEMM -> the centre LayerNorm back to rows -> the output projection -> the gate's GEMM adding its gated
 // product into the pair (gemmGatedAdd). A transition: LN -> SwiGLU in the first GEMM's epilogue -> the second GEMM
-// adding into the pair. The pair is float32; everything between is float16.
+// adding into the pair. The pair is float32 (a half copy through the blocks where the matrix units run); everything
+// between is float16.
 #include "ef2.h"
 #include <type_traits>
 
