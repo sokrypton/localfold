@@ -283,7 +283,7 @@ alternated; block ms, the stack of 48 in brackets):
 
 A profile of boltz2's 255-token 5CAJ trunk pass found two leftovers:
 
-- **Half-output GEMMs that asked for float accumulation** (`linW`'s half outputs: the grid's qkvg and kin) were taking
+- **Half-output GEMMs that asked for float accumulation** (`linW`'s half outputs, such as the grid's qkvg) were taking
   a float cooperative tensor, which forced the staged path and a 64 x 64 tile. The matrix units sum a run wider than
   half and round once, so a half output now always takes a half destination. 512 x 65025 x 128 + bias: 1.41 -> 0.86
   ms. In the fold, grid qkvg went from 234 to 115 ms a pass, with CA coordinates identical to the PDB's 0.001 A.
