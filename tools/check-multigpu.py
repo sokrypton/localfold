@@ -8,6 +8,7 @@ smoke test, which checks correctness and nothing about speed):
   python3 tools/check-multigpu.py --sizes=4,12,24      # complexes of 4, 12, 24 copies of 1TIM's chain (247 a copy)
   python3 tools/check-multigpu.py --big=41             # and one fold of 41 copies (10,127 tokens) on every GPU
   python3 tools/check-multigpu.py --gpu-map=0,0 --gpus=2 --sizes=4 --skip-build   # the smoke test on one GPU
+  python3 tools/check-multigpu.py --model=boltz2 --sizes=  # the correctness half for another model
   python3 tools/check-multigpu.py --sizes=12,24 --sim  # and each size as ONE simulated rank of N (LOCALFOLD_MG_SIMULATE):
                                                        # a rank's compute alone - the measured fold minus it is the interconnect
 
@@ -69,7 +70,8 @@ def fold(args, gpus, flags, out, env_extra=None):
     if args.gpu_map and gpus > 1: env["LOCALFOLD_GPU_MAP"] = args.gpu_map
     if args.times and gpus > 1: env["LOCALFOLD_MG_TIMES"] = "1"
     env.update(env_extra or {})
-    cmd = [str(BIN)] + flags + [f"--out={out}"] + ([f"--gpus={gpus}"] if gpus > 1 else [])
+    cmd = [str(BIN)] + flags + [f"--out={out}"] + ([f"--gpus={gpus}"] if gpus > 1 else []) + \
+          ([f"--model={args.model}"] if args.model else [])
     t0 = time.time()
     with Peak() as pk:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=ROOT)
@@ -103,6 +105,7 @@ def main():
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--sim", action="store_true", help="also each size as one simulated rank of N (compute alone, no interconnect)")
     ap.add_argument("--times", action="store_true", help="LOCALFOLD_MG_TIMES=1: every phase past the trunk, in the report")
+    ap.add_argument("--model", default="", help="an AF3-lineage model other than alphafold3 (boltz2, protenix2, ...)")
     ap.add_argument("--out", default="multigpu-out")
     args = ap.parse_args()
     most = args.gpus or gpu_count()

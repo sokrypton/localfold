@@ -1253,10 +1253,10 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
     // encoder's pair projection and the transformer's f16 LayerNorm'd pair, never the f32 pair whole
     // (9 GB at 4192 tokens, beside the trunk's)
     int Cp = (int)M.meta(E + ".pairChannels");
-    // (several GPUs on a sharded pair: tp whole on every rank - the atom windows read arbitrary token pairs - its rows
-    // made here and the rest all-gathered; pn16 only this rank's rows, from which its query rows' biases are made)
-    mg::Shared* tpS = shardedPair ? &mg::shared("sh.enc.tp", pairs * Cp * 4) : nullptr;
-    float* tp = shardedPair ? (float*)tpS->local : scratch<float>("enc.tp", pairs * Cp);
+    // (several GPUs on a sharded pair: tp's rows and pn16's this rank's own - the encoder's atom pairs read the other
+    // ranks' rows of tp straight from them, ENC_TP_ROWS; its query rows' biases are made from pn16)
+    mg::Shared* tpS = shardedPair ? &mg::shared("sh.enc.tp", std::max<size_t>((size_t)sh::maxStored(n) * n, 1) * Cp * 4) : nullptr;
+    float* tp = shardedPair ? (float*)tpS->local - (size_t)sh::DLO * n * Cp : scratch<float>("enc.tp", pairs * Cp);  // (by global pair)
     const size_t pnFirst = shardedPair ? (size_t)sh::DLO * n : 0;
     half* pn16 = scratch<half>("dt.pn16", (shardedPair ? std::max<size_t>((size_t)sh::DROWS * n, 1) : pairs) * Cz);
     PAIR_CHUNK_SINK = [&](const float* chunk, size_t p0, size_t r) {
@@ -1268,17 +1268,18 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
     };
     diffusionConditioning(trunkSingle, trunkPair, targetFeat, SIGMA_DATA, n);
     PAIR_CHUNK_SINK = nullptr;
-    if (shardedPair)            // every rank's rows of tp
-      mg::gather(*tpS, tp, [&](int r) { return r == mg::RANK ? (size_t)0 : (size_t)sh::storedRows(n, r) * n * Cp * 4; },
-                 [&](int r) { int a, b; sh::rowsOf(n, r, a, b); return (size_t)a * n * Cp * 4; },
-                 [&](int r) { int a, b; sh::rowsOf(n, r, a, b); return (size_t)a * n * Cp * 4; });
+    if (shardedPair) {          // every rank's rows of tp, where the encoder reads them
+      mg::fence();
+      ENC_TP_ROWS.world = mg::WORLD;
+      for (int r = 0; r < mg::WORLD; ++r) { int a, b; sh::rowsOf(n, r, a, b); ENC_TP_ROWS.lo[r] = a; ENC_TP_ROWS.p[r] = (const float*)tpS->peer[r]; }
+    }
     // the chunk loop's working rows given back before the encoder and decoder prepare beside tp and pn16
     // (0.9 GB at 1530 tokens, which is what they ran out of)
     releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.trunkRows", "dc.trunkRows16", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj",
                      "enc.tpln", "pt." });
     ENC_TP_GIVEN = tp;
     f.enc = prepareEncoder(E, "atomReference", trunkSingle, nullptr);
-    ENC_TP_GIVEN = nullptr;
+    ENC_TP_GIVEN = nullptr; ENC_TP_ROWS = TokenPairRows{};
     if (shardedPair) mg::release({ "sh.enc.tp" });   // (read by the encoder's preparation alone, folded into its atom pairs)
     f.dec = prepareDecoder(f.enc);
     PN16_GIVEN = pn16;

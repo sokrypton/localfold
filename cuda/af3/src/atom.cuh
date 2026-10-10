@@ -670,9 +670,20 @@ inline void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockC
 
 // pair[q][k] = row[q] + col[k] + valid * (offsets W + dist / (1 + |d|^2) + Wvalid)
 //              (+ the trunk pair, gathered per token pair)
+// the trunk pair's projection the encoder adds, by token row: whole on one GPU (world 1); with several, each rank's rows in
+// its own buffer, read straight from the rank holding them (the atom windows reach a band of token pairs, not all N^2 -
+// gathering the whole of it was 6.6 GB a rank at 10,127 tokens on 8, the fold's largest buffer past the trunk)
+struct TokenPairRows {
+  const float* p[16] = {}; int lo[16] = {}; int world = 0;
+  __device__ __forceinline__ const float* at(int i, int j, int tokens, int Cp) const {
+    int r = 0; while (r + 1 < world && i >= lo[r + 1]) ++r;
+    return p[r] + ((size_t)(i - lo[r]) * tokens + j) * Cp;
+  }
+};
+inline TokenPairRows wholeTokenPair(const float* tp) { TokenPairRows t; t.p[0] = tp; t.world = tp ? 1 : 0; return t; }
 __global__ void atomPairK(const float* row, const float* col, const float* qPos, const float* kPos,
                           const float* qUid, const float* kUid, const float* kMask, const float* Woff,
-                          const float* Wdist, const float* Wvalid, const float* trunkPair,
+                          const float* Wdist, const float* Wvalid, TokenPairRows trunkPair,
                           const int* tqIdx, const float* tqMask, const int* tkIdx, const float* tkMask,
                           float* pair, int subsets, int queries, int keys, int Cp, int tokens, bool maskPadded) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -687,8 +698,7 @@ __global__ void atomPairK(const float* row, const float* col, const float* qPos,
   float sq = d0 * d0 + d1 * d1 + d2 * d2;
   float off = d0 * Woff[c] + d1 * Woff[Cp + c] + d2 * Woff[2 * Cp + c];
   if (valid) v += (off + Wdist[c] / (1.f + sq)) + Wvalid[c];
-  if (trunkPair && tqMask[qi] != 0 && tkMask[ki] != 0)
-    v += trunkPair[((size_t)tqIdx[qi] * tokens + tkIdx[ki]) * Cp + c];
+  if (trunkPair.world && tqMask[qi] != 0 && tkMask[ki] != 0) v += trunkPair.at(tqIdx[qi], tkIdx[ki], tokens, Cp)[c];
   pair[t] = v;
 }
 // chai-1's atom-pair term in place of AF3's offset/distance/valid one (af3-any-model atom_cross_attention.py):
@@ -835,6 +845,7 @@ struct EncoderOut {
 
 // trunkSingle [tokens][Cs] and trunkPair [tokens^2][Cz] may be null (target_feat).
 inline float* ENC_TP_GIVEN = nullptr;
+inline TokenPairRows ENC_TP_ROWS;       // (several GPUs: every rank's rows of it, prepareDiffusion's)
 inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, const float* trunkSingle,
                                  const float* trunkPair) {
   AtomShape sh = atomShape();
@@ -932,7 +943,8 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
       sh.tokens);
   else
     atomPairK<<<blocks(pairRows * Cp), 256, 0, STREAM>>>(row, col, qPos, kPos, qUid, kUid, o.kMask,
-      W(E + ".embedPairOffsets"), W(E + ".embedPairDistances"), W(E + ".embedPairOffsetsValid"), tp,
+      W(E + ".embedPairOffsets"), W(E + ".embedPairDistances"), W(E + ".embedPairOffsetsValid"),
+      ENC_TP_ROWS.world ? ENC_TP_ROWS : wholeTokenPair(tp),
       tq.idx, tq.mask, tk.idx, tk.mask, o.pair, sh.subsets, sh.queries, sh.keys, Cp, sh.tokens,
       M.flag("trunk.dialect.maskPaddedKeys"));
   float* h1 = scratch<float>("enc.h1", pairRows * Cp); float* h2 = scratch<float>("enc.h2", pairRows * Cp);
