@@ -477,3 +477,9 @@ Near morning:
   read every step by GEMMs too small to saturate the bus (768 x 80 x 768: ~30 us whatever K, 38 GB/s; 3072 x 80 x
   768: 96 GB/s). What would move it: int8-resident weights with a dequantising GEMM (README's Next 3, ESM2's case), or
   more samples a batch (NS > 1 amortises every weight read).
+- **Lost: the triangle's product in half** (scaled by 1/n so long chains stay in range, the centre norm's eps by
+  1/n^2: the same norm). First it was NaN: the product accumulated into a half destination before alpha, and 255
+  terms' sums overflowed. With float accumulation it works, but it saves 13 ms of a 1.21 s pass (the centre norm 65
+  -> 58, the contractions 76 -> 69) for 0.07 A of drift. Not kept.
+- **Lost: attention at head width 8** on the matrix units. MPP wants K dynamic or a multiple of 16, and AF2's extra
+  MSA is 1.6% of an MSA fold.
