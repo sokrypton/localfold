@@ -594,3 +594,12 @@ outliers. What remains, all bandwidth or scalar work:
   - 8 x 8 matrix-unit attention: only a flagged browser reaches it, and Apple's units are 8 x 8 where the kernel
     declares 16 x 16.
   - Moving the diffusion sampler onto the GPU: a step's GPU is 93-96% busy already.
+- **Lost (WebGPU, the M5): grid.project as a register-blocked GEMM.** 128 rows a workgroup, a lane 8 x 2 channels'
+  (q, k, v, gate), the activations staged in f16.
+  - **The arithmetic**: with the weights also staged in f16 and multiplied in f16, the transposed direction's f16 arm
+    reads relRMS **2.06e-2** against the old kernel's 5.2e-3, deterministic. That is the weights' rounding: staged in
+    f32 it is 9.1e-4.
+  - **The time**: with f32 weights the arithmetic is f32, and an f32 WGSL GEMM here is ~2.0 TFLOP/s. grid.project went
+    474 -> 448 ms a pass (-5%), the trunk inside the drift.
+  - **The same ceiling decides the pair transition**: it already runs its 25.6 GFLOP at 2.06 effective, and its f16
+    arm was declined on the M2 for accuracy. Not attempted.

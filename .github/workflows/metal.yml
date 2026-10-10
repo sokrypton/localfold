@@ -1,0 +1,37 @@
+# The Metal ports and the macOS wheel built on every push to `metal`, on a runner whose SDK is older than the one the
+# M5 develops against - the build a newer SDK cannot check. fbd35863 is why: MTLGPUFamilyApple10 and
+# MTLLanguageVersion4_0 are named only in the macOS 26 SDK, so the M5's commits built there and nowhere else, and an M2
+# found it a day later. No GPU here (the kernels compile on first use); this is the compile, the link, the wheel's own
+# checks (arm64, macOS 13, system libraries only) and every binary answering --help from a fresh install.
+name: Metal build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [metal]
+    paths:
+      - "metal/**"
+      - "cuda/featurise/**"
+      - "python/**"
+      - ".github/workflows/metal.yml"
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: The SDK this builds against
+        run: xcrun --show-sdk-version
+      - name: The selftest and the bench (the core with every port's kernels embedded)
+        run: bash metal/build.sh selftest bench
+      - name: The wheel (the three ports, macOS 13+ arm64)
+        run: bash python/build_wheel_macos.sh dist
+      - name: Install into a fresh environment, every binary answers --help
+        shell: bash
+        run: |
+          python -m venv /tmp/lf && /tmp/lf/bin/pip install -q dist/localfold-*-macosx_13_0_arm64.whl
+          for p in af3 af2 ef2; do /tmp/lf/bin/localfold-$p --help | head -1; done
+          /tmp/lf/bin/localfold-fetch --help | head -1
