@@ -94,6 +94,15 @@ On the M2, warm, the fold alone unless said:
 | ESMFold2 6MRR / 5CAJ | 0.3 / 0.8 s | |
 | AF2 6MRR / 5CAJ + template | 1.2 / 3.9 s | 14.4 s translated |
 
+On an M5 (8-core GPU, macOS 26.6), warm, the matrix units on (gemm_tensor.metal) against the M5's own old kernels:
+
+| | M2 | M5, old kernels | M5, matrix units |
+|---|---|---|---|
+| AF3 6MRR (68 tokens, 3 recycles, 200 steps) | 6.1 s | 3.79 s | 1.97 s |
+| a diffusion step, 68 tokens | 24 ms | 15.3 ms | 7.5 ms |
+| AF3 trunk pass, 255 tokens | 3.9 s | 2.64 s | 1.65 s |
+| GEMM, 4096 square | 2.93 TFLOP/s | 3.05 | 12.0 |
+
 Profile any fold with `LOCALFOLD_PROFILE=1` (every labelled dispatch its own command buffer: an upper bound, good for
 proportions) and AF3's denoiser by stage with `AF3_STAGES=1` (a sync between stages: real time).
 
@@ -193,4 +202,6 @@ uses more registers): no error, the output untouched.
 2. Fusions the CUDA port has: the gated residual into the next adaptive LayerNorm, the trunk's transition and
    triangle kernels.
 3. An int8-weight GEMM for ESM2 3B (its matrices are expanded to half a GEMM at a time).
-4. An M5: its GPU's matrix hardware through Metal 4's tensor APIs - docs/M5-HANDOFF.md is the brief for that pass.
+4. An M5: its GPU's matrix hardware through Metal 4's tensor APIs - done for the half GEMMs and the long attentions
+   (`core/gemm_tensor.metal`, chosen at run time on an Apple10 GPU); docs/M5-HANDOFF.md's last section has the numbers
+   and what is left (f32-operand GEMMs, narrow-head attention).

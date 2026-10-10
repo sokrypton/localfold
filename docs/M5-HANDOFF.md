@@ -182,3 +182,82 @@ explanation), Step 2's table with an M5 column, what Step 3 built and what it is
 interleaved, with the gates' numbers), and Step 4's arms. Update `metal/README.md`'s tables where the M5 changes them,
 naming the machine (an M2 number and an M5 number side by side, never one replacing the other). Commit on `metal`
 with the numbers in each commit message. Do not push.
+
+## The M5's reply
+
+Measured on an Apple M5 (8-core GPU, macOS 26.6, Xcode 27.0, Metal Toolchain 27A266a), 2026-10-09. Two commits on
+`metal`: the GEMM on the matrix units, then the flash attention on them (and a fix to the first). Not pushed.
+
+### Step 1 - correctness: every case passes, nothing re-recorded
+
+All 29 gate cases pass against the M2's baselines, on the old kernels and again on the final build with the matrix
+units on: ESMFold2 8/8, AF2 5/5, AF3 lineage 16/16 (chai-1's two included; `model-af3-int5/` fetched from the
+registry's pinned Hugging Face remote with the user's permission). Nothing moved past the bars, so `--write` was not
+run. The final build, against the M2: AF3 6MRR **0.768 A / 86.15** (M2 0.771 / 86.16), 5CAJ self-template **0.205**
+(0.205), 1BRS **0.454** (0.457), protenix2 1.561 (1.561), boltz2 0.577 (0.578), intellifold2 1.539 (1.539),
+rosettafold3 1.702 (1.699), openbind0 1.757 (1.759), opendde 1.453 (1.457), chai1 0.979 / 1.743 (0.976 / 1.744). The
+largest moves are the unconfident folds the bars expect to move: AF2 5CAJ from its sequence (pLDDT 31) 19.804 ->
+20.109 A, AF2 1BRS multimer without a template (pLDDT 39) 15.855 -> 15.798.
+
+The matrix units accumulate wider than lf_gemm's half accumulator even for a half destination - against the host
+reference the selftest's SwiGLU goes 2.5e-3 -> 3.9e-4 and the triangle gate 1.2e-3 -> 3.0e-4 - which is why nothing
+moved the other way. `npm test`, `test:native` and `test:bridge` were not run in this pass.
+
+### Step 2 - the existing choices, re-measured (old kernels on the M5)
+
+| measurement | M2 | M5, lf_gemm / lf_attention | M5, matrix units |
+|---|---|---|---|
+| GEMM peak, 4096 square | 2.93 TFLOP/s | 3.05 | **12.0** (64 x 128 tile) |
+| transformer q/k/v/g, 3072 x 80 x 768 | 0.19 ms | 0.162 | **0.064** |
+| trunk K-128 projection, 512 x 68121 x 128 | 3.44 ms, 2.60 TFLOP/s | 3.08 ms, 2.90 | **0.93 ms, 9.6** (half out); 1.68 (f32 out) |
+| grid attention, 261 tokens | 6.84 ms, 1.33 TFLOP/s | 4.68 ms, 1.94 | **4.18 ms, 2.18** |
+| LayerNorm, 68121 x 128 | 83.5 GB/s fitted, 42.6 widest | 132.3 / 92.4 | (not a matrix kernel) |
+| AF3 6MRR, 200 steps | 6.1 s: trunk 1.17, diffusion 4.90 | 3.79 s: 0.69, 3.07 | **1.93-2.01 s: 0.41-0.49, 1.50** |
+| a diffusion step, 68 tokens | 24 ms | 15.3 ms | **7.5 ms** |
+| AF3 trunk pass, 255 tokens (5CAJ self-template) | 3.9 s | 2.64 s | **1.65 s** |
+| memory, 1044 tokens | 4.7 GB | not measured | not measured |
+
+On the old kernels nothing in the tile rule inverted: the M2's arms (K step 16/32, 64 x 64, 48 x 64, 80 x 64) are
+within 2% of each other here, as there. LayerNorm still wants its row array sized to the row (1.43x). The attention is
+still register-bound in the sense the README means; it was not re-tried with direct-from-device K/V loads. The M5's
+threadgroup memory is still 32 KB.
+
+### Step 3 - the matrix units
+
+`metal/core/gemm_tensor.metal`, compiled at MSL 4.0 in a library of its own and chosen at run time on an Apple10 GPU
+under macOS 26 - every other GPU and OS keeps the old kernels, and the wheel's macOS 13 floor stands.
+
+- **The GEMM** (`lf_gemm_tensor`): matmul2d over the GEMM's own pointers (`tensor_inline`, leading dimensions as
+  strides, a transpose as the descriptor's flag), every lf_gemm epilogue - plain products stored by the cooperative
+  tensor, the rest on a tile staged in threadgroup memory with lf_gemm's arithmetic. Half x half instances only; an
+  f32-operand GEMM keeps lf_gemm. Interleaved, old -> new: 4096 square 3.0 -> 12.0 TFLOP/s; 3072 x 80 x 768 0.162 ->
+  0.064 ms; 73728 x 80 x 384 1.59 -> 0.77; 512 x 68121 x 128 3.11 -> 0.93; 128 x 68121 x 512 3.07 -> 0.99; 264^3
+  0.046 -> 0.030. Ragged tiles need no padding here: matmul2d bounds-checks against the tensor's extents.
+- **The attention** (`lf_attention_tensor`): S and P.V on matmul2d, a simdgroup's 16 queries on their own. A smaller
+  win, taken only where it measured: heads 32 wide from 256 keys (n 261 1.12x, 512 1.34x, 1044 1.29x); level at D 48
+  and 64, worse at D 16 and at 68 tokens.
+- **Whole folds**, alternated: AF3 6MRR 3.79 -> 1.97 s; boltz2 6MRR 5.02 -> 2.35; protenix2 6MRR 5.11 -> 2.42;
+  boltz2 5CAJ (255 tokens, 2 passes, 50 steps) 9.49 -> 5.17 with the GEMM, 5.04 with the attention as well.
+- Controls: `LOCALFOLD_GEMM_TENSOR=0`, `LOCALFOLD_ATTN_TENSOR=0` (=1 forces the attention at any length).
+  `metal/bench`: arm 1000000 (+ R*1000 + C a tile) is the tensor GEMM, `attn` arm bit 4 the tensor attention.
+
+Traps paid for, for the next agent:
+- **matmul2d's default mode OVERWRITES its destination** (`mode::multiply`), whatever the header's comment
+  ("C = A*B + C") says. An accumulation across tiles wants `matmul2d_descriptor::mode::multiply_accumulate`.
+- **`reduce_rows` wants a single simdgroup's scope**, so a row-wise softmax splits the queries by simdgroup.
+- **The header's own examples do not compile**: there is no `get_mask` (it is `is_valid_element`), `store` wants
+  the cooperative tensor's element type exactly, and `get_destination_cooperative_tensor` needs `template` when the
+  op's type is dependent.
+- **Compiling at run time works**: `newLibraryWithSource` with `MTLLanguageVersion4_0` finds
+  `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` with no other setup, ~100 ms an instance.
+
+Not done: f32-operand GEMMs on the units (matmul2d takes float x half and float x float; not measured), the
+remaining shapes of the attention (D 8, 16, 24), and the 1044-token memory row.
+
+### Step 4 - the WebGPU side
+
+Chrome 154 on the M5 offers **the same as on the M2**: subgroup matrices of 8 x 8 x 8 only (f16 and f32), and only
+with `--enable-unsafe-webgpu` - a stock Chrome offers none (`LOCALFOLD_STOCK_FLAGS=1`: `subgroupMatrixAvailable:
+false`). Those are Metal's simdgroup matrices, not the M5's matrix units, which nothing in WebGPU reaches. So the
+`metal-3` prior's matrix knobs are no closer to paying here than on the M2. The `fusedPairBias` / `attentionProjectMatrix`
+/ `matrixLinear` arms were not re-run in this pass.
