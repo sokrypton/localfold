@@ -322,3 +322,60 @@ All 29 gates pass.
 Still open: the diffusion transformer's attention (one row, 16 heads, about 0.1 ms a call) fills only 64
 threadgroups and barely moved (124 -> 117 ms over 50 steps). Splitting its keys across simdgroups is the remaining
 lever there.
+
+(That last item turned out to be the q bias: the diffusion attention carries one, which kept it on v1. v3 takes it
+now, below.)
+
+### Overnight, 2026-10-10: nine more commits
+
+Every one gated (all 29 pass), measured interleaved, pushed. boltz2 5CAJ (255 tokens, 1 recycle, 50 steps):
+**4.30 -> 3.78 s**. The README's M5 table has the current headline numbers.
+
+| commit | what | measured |
+|---|---|---|
+| 78bb6f03 | the triangle gate in registers: the weight permuted to quarters (`lf_tri_quarters`) so every thread holds a channel's pa, ga, pb, gb | gate 214 -> 163 ms a trunk pass |
+| 0f109fe3 | attention v3: the online softmax in cooperative tensors (`map_iterator` for the row statistics, P as a cooperative left input), no threadgroup memory | n 255 D 32 1.87 -> 1.63 ms |
+| b763aa15 | v3 takes a q bias (Q + bias staged once per simdgroup) | diffusion attention 116 -> 70 ms over 50 steps |
+| 893cc30b | the general GEMM epilogues (alpha, beta, bias, GELU, gated residual) in registers, 4 columns at a time | output projections 51 -> 43 ms; 64 x 128 tiles for float outputs |
+| f5cc698e, ca6c6dc4 | the triangle zeroes only its planes' padding; the bias layout as a tiled transpose; padZero's index in 32 bits | 31 + 29 ms a pass at 255 tokens; 140 + 104 ms at 510 |
+| 0e29920f | v3's output epilogue 4 columns at a time | n 255 D 32 1.66 -> 1.38 ms |
+| 274b76ec | a float X allowed half staging goes to the matrix units | ESMFold2's sampler 347 -> 265 ms |
+| 878ac60d | fast exp and divide in the hot epilogues | triangle gate 166 -> 131, SwiGLU 132 -> 119 ms |
+
+Also e2ffe387: ESMFold2 crashed on `--out=/dev/null` (wrote through a null `FILE*`); fixed as AF3's main does it.
+
+The layouts these lean on, probed on the M5 (`get_multidimensional_index`, kept in the comments where used):
+- A 64 x 128 destination over 4 simdgroups gives a thread 4 adjacent columns, repeated every 32 columns, on rows r, r +
+  8, r + 32, r + 40. Element e + 8 is column + 32, and column + 8 lives in lane ^ 8.
+- A 64 x 64 destination, and attention's 16 x D output, keep the same 4-adjacent-column groups.
+- The half logits are compatible as P.V's left input; logits -> rows and output -> the logits' rows map by iterator.
+
+What **lost** or did nothing, so nobody repeats it blind:
+- **SwiGLU in registers** (a shuffle pairs a with b in lane ^ 8): 131 -> 154 ms. Then staging only the gated half
+  tile, 8 KB: 146. The SwiGLU GEMM is compute-bound at 9-10 TFLOP/s; its epilogue was never the cost.
+- **The triangle gate staged transposed** (8 KB, each channel's 64 rows written as one run): 166 -> 185 ms. Its
+  scattered 2-byte stores were cheaper than the staging.
+- **Fusing the diffusion transformer's gated residuals and boltz2's up-gate multiply into their GEMMs' epilogues**
+  (2400 + 1200 dispatches fewer over 50 steps): level. At 255 rows those GEMMs fill only 24-48 threadgroups, and the
+  epilogue's reads sit on their critical path.
+- **matmul2d's relaxed precision**: 12.2 TFLOP/s either way on 4096 square.
+- **A half exp2 for P in v3**: 1.652 against 1.657 ms. **A runtime branch between two softmax variants in v3**: 2x
+  slower. The kernel lives on its registers.
+- **v3's bias read as half4 from device** rather than `cooperative_tensor::load`: 2% slower at D 32, 3% faster at D 64.
+- **Bigger v3 tiles**: 16 x 64 is best at D >= 32 (32 x 32 is 4% better at D 32 only), 16 x 32 at D 16.
+- **Smaller tiles for the diffusion GEMMs** (768-3072 x 256): 64 x 128 is already best or within 3%.
+- **A fast `lf_sigmoid` for AF3's small diffusion kernels** (adaLN, the gated residuals): unchanged. They are
+  latency-bound, about 20 us a dispatch.
+- **A concurrent encoder**: a serial dispatch boundary costs about 2.7 us on the M5 (measured: 1000 tiny dispatches
+  take 2.7 ms serial, 0.3 concurrent). That is about 1 ms of a 68-token step's 8.8, and only part of it is free to
+  overlap. It would need dependency tracking; not done.
+- **The pair LayerNorm emitted by the previous GEMM's epilogue** (its tile covers all 128 channels): about 3% of a
+  trunk pass at best, for a second 279 MB buffer at 1044 tokens and every pair update re-plumbed. Not done.
+
+Where the time is now (boltz2 5CAJ, profiled, a trunk pass of 1.27 s GPU): attention 199 ms, the triangle gate 131,
+LayerNorm 156 (bandwidth), SwiGLU 119 and qkvg 116 (both near peak), the gated add 114 (bandwidth). At 68 tokens a
+diffusion step is weight-bandwidth- and latency-bound: about 370 MB of transformer weights read a step, 381
+dispatches. Batching samples would amortize the weights.
+
+**Caution for profiling small folds**: `LOCALFOLD_PROFILE=1` gives every dispatch its own command buffer. At 68
+tokens that turns a 1.76 s diffusion into 5.46 s; use it for proportions only.
