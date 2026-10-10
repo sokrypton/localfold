@@ -54,6 +54,16 @@ inline void transpose(const mg::Shared& z, const mg::Shared& zT, int n, int C) {
   if (cols) transposeP2PK<<<blocks((size_t)n * cols * vecs), 256, 0, STREAM>>>(peerSlabs(z, n), (uint4*)zT.local, n, lo, cols, vecs);
   mg::fence();                                    // (no rank rewrites its z while another still reads it)
 }
+// transposeP2PK's way back, pushed: this rank's rows [j0, j0 + cols) of z^T (zT, from row j0) written into column
+// j0.. of every row i of z, in the slab of the rank holding row i (the writes contiguous along j)
+__global__ void pushTransposeK(PeerSlabs ps, const uint4* __restrict__ zT, int n, int j0, int cols, int vecs) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * cols * vecs) return;
+  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int j = (int)(rest % cols), i = (int)(rest / cols);
+  int p = 0;
+  while (p + 1 < ps.world && i >= ps.lo[p + 1]) ++p;
+  ((uint4*)ps.p[p])[((size_t)(i - ps.lo[p]) * n + j0 + j) * vecs + v] = zT[((size_t)j * n + i) * vecs + v];
+}
 
 // The triangle's ring: a block of a against every rank's rows of b - this rank's own first, then each peer's staged
 // on a copy stream while the GEMM before it runs (two staging buffers where the room allows, else one, in series).
@@ -197,9 +207,14 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   // channels a group, two groups' planes (a, b and the product) held: group q + 1's pulls (a copy stream) and group
   // q - 1's pushes (another) run beside group q's GEMM - a quarter of the channels a group where there are enough,
   // fewer where the room is short
-  // (small folds one or two groups: a quarter of a rank's channels is a GEMM too small to fill the card - at 988
-  // tokens four groups of four planes ran the contraction at 70% of one group's rate, with little exchange to hide)
-  const int groups = np >= 4096 ? 4 : np >= 2048 ? 2 : 1;
+  // (small folds one group: a quarter of a rank's channels is a GEMM too small to fill the card - at 988 tokens four
+  // groups of four planes ran the contraction at 70% of one group's rate, and there the exchange outlasts the GEMM,
+  // so a group's pulls have nothing to hide behind. Past 2,048 the exchange and the GEMM are of a size - 0.74 GB and
+  // ~3.4 ms a triangle at 2,964 on 8 - and the exposed first pull and last push shrink as 1/groups: four groups
+  // cost a simulated rank nothing there against one or two, eight 0.26% at 5,928 against four)
+  // (LOCALFOLD_MG_TRI_GROUPS=k sets it, for a box to sweep)
+  static const int G_SET = getenv("LOCALFOLD_MG_TRI_GROUPS") ? atoi(getenv("LOCALFOLD_MG_TRI_GROUPS")) : 0;
+  const int groups = G_SET > 0 ? G_SET : np >= 4096 ? 8 : np >= 2048 ? 4 : 1;
   int g = std::max(1, (cg + groups - 1) / groups);
   while (g > 1 && !roomFor((size_t)2 * g * plane * (2 * sizeof(TQ) + sizeof(B16)))) g = (g + 1) / 2;
   TQ* aAll[2] = {}; TQ* bAll[2] = {}; B16* pAll[2] = {};
@@ -282,8 +297,15 @@ inline void triangleSharded(const mg::Shared& z, const float* mask, int n, int C
 }
 
 // row attention on a slab (z; or z^T, with the bias's swap flipped - column attention)
+// With `from` (column attention: z is the z^T slab, `from` the pair z), the transposes are folded in: z^T pulled from
+// `from` a chunk at a time on a copy stream beside the input pass over the chunk before, and each chunk of rows, once
+// attended and through the pair transition `transitionPre` (pointwise, so on z^T as well as z), pushed back into
+// `from`'s rows on another while the next chunk attends. A rank pushes only its own columns and pulls only its own,
+// so no fence is needed between the two. (Where the input pass does not fit whole: the same pull and push, whole and
+// unoverlapped, so every rank meets the same fences.)
 inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, int heads, int D, const std::string& pre,
-                         bool swap) {
+                         bool swap, const mg::Shared* from = nullptr, const std::string& transitionPre = "",
+                         int transitionFactor = 0) {
   const int Wd = heads * D;
   if (!(C == 128 && Wd == 128 && heads <= 16 && D == 32) || hasW(pre + ".gatingQueryBias") || hasW(pre + ".outputProjectionBias")) {
     fprintf(stderr, "sharded pair: the grid attention's fused 128-channel form only (%s)\n", pre.c_str()); exit(1);
@@ -305,7 +327,36 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   // simulated rank's 3.0 s trunk at 2,964 tokens on 8); else the bias alone, in chunks, and the projections per chunk
   const bool whole = !f8 && rowsHere && roomFor((pairsHere + 128) * 4 * Wd * 2);
   half* qkvgAll = whole ? scratch<half>("grid.qkvg", (pairsHere + 128) * 4 * Wd) : nullptr;
-  if (whole) gridIn128(base, pre, qkvg, qkvgAll, n, (size_t)lo * n, pairsHere, false, Wh(wb), bias, heads, stride, swap);
+  const bool folded = from && whole;
+  // (a chunk a quarter-million pairs or more, up to four: at 988 tokens on 8 a rank's 124 rows in four chunks left
+  // the attention and the transition a quarter-filled card, +14 ms of a 218 ms simulated pass; at 2,964 four cost nothing)
+  const int chunks = (int)std::clamp<size_t>(pairsHere / 262144, 1, 4);
+  static cudaStream_t pullS = nullptr, pushS = nullptr;
+  static std::vector<cudaEvent_t> evs;
+  auto ev = [&](size_t k) {
+    while (evs.size() <= k) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); evs.push_back(e); }
+    return evs[k];
+  };
+  const int vecs = (int)((size_t)C * elem() / 16);
+  if (from && !folded) {     // (the same fences as the folded form: a rank's choice is its own)
+    mg::fence();
+    if (rowsHere) transposeP2PK<<<blocks((size_t)n * rowsHere * vecs), 256, 0, STREAM>>>(peerSlabs(*from, n), (uint4*)z.local, n, lo, rowsHere, vecs);
+  }
+  if (folded) {
+    if (!pullS) { CK(cudaStreamCreateWithFlags(&pullS, cudaStreamNonBlocking)); CK(cudaStreamCreateWithFlags(&pushS, cudaStreamNonBlocking)); }
+    mg::fence();                                  // (every rank's z written)
+    CK(cudaEventRecord(ev(0), STREAM)); CK(cudaStreamWaitEvent(pullS, ev(0), 0));
+    const int P = (rowsHere + chunks - 1) / chunks;
+    const PeerSlabs ps = peerSlabs(*from, n);
+    size_t k = 1;
+    for (int j0 = 0; j0 < rowsHere; j0 += P, ++k) {
+      const int cols = std::min(P, rowsHere - j0);
+      transposeP2PK<<<blocks((size_t)n * cols * vecs), 256, 0, pullS>>>(ps, (uint4*)z.local + (size_t)j0 * n * vecs, n, lo + j0, cols, vecs);
+      CK(cudaEventRecord(ev(k), pullS)); CK(cudaStreamWaitEvent(STREAM, ev(k), 0));
+      gridIn128(base, pre, qkvg, qkvgAll + (size_t)j0 * n * 4 * Wd, n, (size_t)(lo + j0) * n, (size_t)cols * n, false, Wh(wb),
+                bias, heads, stride, swap);
+    }
+  } else if (whole) gridIn128(base, pre, qkvg, qkvgAll, n, (size_t)lo * n, pairsHere, false, Wh(wb), bias, heads, stride, swap);
   else {
     size_t per = std::max<size_t>(1, std::min(pairsHere, CHUNK / 16));
     float* raw = scratch<float>("grid.raw16", per * 16);
@@ -328,6 +379,9 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
     size_t perRow = (size_t)n * 5 * Wd * 2, spare = f > t / 16 ? f - t / 16 : 0;
     R = std::max<size_t>(R, std::min<size_t>(rowsHere, std::min<size_t>(spare / perRow, 256)));
   }
+  if (folded) R = std::min<size_t>(R, (rowsHere + chunks - 1) / chunks);    // (chunks enough that most pushes hide)
+  const PeerSlabs back = folded ? peerSlabs(*from, n) : PeerSlabs{};   // (lo: rows of z, as the pulls')
+  size_t pushes = 0;
   for (size_t r0 = lo; r0 < (size_t)(lo + rowsHere); r0 += R) {
     size_t rows = std::min(R, (size_t)(lo + rowsHere) - r0), prs = rows * n;
     half* qkvgOut = whole ? qkvgAll + (r0 - lo) * n * 4 * Wd : scratch<half>("grid.qkvg", (std::min<size_t>(R, rowsHere) * n + 128) * 4 * Wd);
@@ -337,6 +391,23 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
     if (f8) flash8Run(qkvgOut, kv8, kv8 + prs * Wd, bias, stride, gathered, n, heads, rows, scale, nullptr);
     else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, false, scale);
     gridOut128(gathered, pre + ".outputProjection", into(base), n, r0 * n, prs, false);
+    if (folded) {
+      transition<half>(pairRow((float*)z.local, (r0 - lo) * n, C), prs, C, transitionFactor, transitionPre);
+      cudaEvent_t e = ev(64 + pushes++);
+      CK(cudaEventRecord(e, STREAM)); CK(cudaStreamWaitEvent(pushS, e, 0));
+      pushTransposeK<<<blocks((size_t)n * rows * vecs), 256, 0, pushS>>>(back, (const uint4*)z.local + (r0 - lo) * n * vecs, n,
+                                                                       (int)r0, (int)rows, vecs);
+    }
+  }
+  if (folded) {
+    CK(cudaEventRecord(ev(63), pushS)); CK(cudaStreamWaitEvent(STREAM, ev(63), 0));
+    mg::fence();                                  // (every rank's columns home)
+  } else if (from) {
+    if (rowsHere) {
+      transition<half>((float*)z.local, (size_t)rowsHere * n, C, transitionFactor, transitionPre);
+      pushTransposeK<<<blocks((size_t)n * rowsHere * vecs), 256, 0, STREAM>>>(peerSlabs(*from, n), (const uint4*)z.local, n, lo, rowsHere, vecs);
+    }
+    mg::fence();
   }
   releaseIfShort(n, C, { "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });
 }
@@ -487,13 +558,14 @@ inline void pairUpdates(const mg::Shared& z, const mg::Shared& zT, const float* 
     triangleGenericOn<T>(s, mask, n, C, p, divide);
   };
   int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
+  auto fusedAtt = [&](const std::string& p) {
+    if constexpr (std::is_same_v<T, half>)
+      return FUSED_GRID && !skipFused("grid") && gridFusedFits() && !RESIDUAL_UNTRANSPOSED && C == 128 && heads * D == 128 &&
+             D == 32 && !hasW(p + ".gatingQueryBias") && !hasW(p + ".outputProjectionBias");
+    return false;
+  };
   auto att = [&](const mg::Shared& s, const std::string& p, bool sw) {
-    if constexpr (std::is_same_v<T, half>) {
-      if (FUSED_GRID && !skipFused("grid") && gridFusedFits() && !RESIDUAL_UNTRANSPOSED && C == 128 && heads * D == 128 && D == 32 &&
-          !hasW(p + ".gatingQueryBias") && !hasW(p + ".outputProjectionBias")) {
-        rowAttention(s, mask, n, C, heads, D, p, sw); return;
-      }
-    }
+    if constexpr (std::is_same_v<T, half>) if (fusedAtt(p)) { rowAttention(s, mask, n, C, heads, D, p, sw); return; }
     rowAttentionGeneric<T>(s, mask, n, C, heads, D, p, sw);
   };
   tri(z, pre + ".triangleMultiplicationOutgoing"); stage("tri.out");
@@ -508,6 +580,14 @@ inline void pairUpdates(const mg::Shared& z, const mg::Shared& zT, const float* 
   }
   stage("tri.in");
   att(z, pre + ".pairAttention1", false); stage("grid.row");
+  // (the transposes and the transition inside: rowAttention's `from`; LOCALFOLD_MG_FOLD_TRANSPOSES=0 the plain
+  // transposes, to measure what the overlap is worth over a real interconnect)
+  static const bool FOLD = !getenv("LOCALFOLD_MG_FOLD_TRANSPOSES") || atoi(getenv("LOCALFOLD_MG_FOLD_TRANSPOSES"));
+  if (FOLD && fusedAtt(pre + ".pairAttention2")) {
+    rowAttention(zT, mask, n, C, heads, D, pre + ".pairAttention2", !swap, &z, pre + ".pairTransition", transitionFactor);
+    stage("grid.col+transition");
+    return;
+  }
   transpose(z, zT, n, C);
   att(zT, pre + ".pairAttention2", !swap); stage("grid.col");
   transpose(zT, z, n, C);

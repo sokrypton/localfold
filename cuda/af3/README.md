@@ -1475,7 +1475,26 @@ the remainder.
 
 Not seen here, and what the next box should measure: NVLink's share - the two transposes a block (2 x 7/8 of a slab,
 ~2.5 ms a block at 2,964 tokens), the triangle's pulls and pushes (overlapped with its GEMMs, which may or may not hide
-them), the fences' latency (~25 a diffusion step). On the box: `sudo nvidia-smi -pm 1` first (persistence mode - run5's
+them), the fences' latency (~25 a diffusion step).
+
+Both exchanges now hide behind compute where there is compute to hide them behind (2026-10-10, before the box):
+- **the transposes are folded into the column attention**: z^T is pulled a chunk at a time on a copy stream while the
+  fused input pass runs over the chunk before, and each attended chunk goes through the pair transition (pointwise,
+  so on z^T as well as z) and is PUSHED back into its owners' rows while the next chunk attends - a rank pulls and
+  pushes only its own columns, so the fence between the two transposes goes (6 fences a column attention to 4).
+  Chunks of a quarter-million pairs, up to four (988 tokens on 8: one, where four cost a simulated rank 14 ms of 218;
+  2,964: four, at no cost). Bit-identical to the plain transposes (0.000 A) on 2 and 3 ranks, host and device
+  fences, AF3, boltz2, protenix2 (rf3's biased attention and IntelliFold-2's 512 channels keep the generic form and
+  its plain transposes). `LOCALFOLD_MG_FOLD_TRANSPOSES=0` is the plain arm.
+- **the triangle's channel groups**: 1 / 4 / 8 below 2,048 / to 4,096 / past it (was 1 / 2 / 4). In simulation the
+  exchange is a local copy, so the group count was chosen as though it were free; over NVLink at ~250 GB/s a 2,964-
+  token triangle on 8 moves ~0.74 GB a rank (~3 ms) beside a ~3.4 ms GEMM, and the unhidden first pull and last push
+  shrink as 1/groups. Simulated cost: none at 2,964 (1, 2, 4 within 0.3%), 0.26% at 5,928 for 8 against 4; at 988 two
+  groups cost 2.8% and the exchange outlasts the GEMM, so it stays one. `LOCALFOLD_MG_TRI_GROUPS=k` sweeps it.
+On the box, after the run below: the 2,964-token fold with `LOCALFOLD_MG_FOLD_TRANSPOSES=0` against the default, and
+`LOCALFOLD_MG_TRI_GROUPS=1,2,4,8` - each a minute.
+
+On the box: `sudo nvidia-smi -pm 1` first (persistence mode - run5's
 start-up, outside the fold's own clock, grew 6.0 -> 10.0 s from one GPU to eight, the likeliest cause each GPU's cold
 initialisation), then `python3 tools/check-multigpu.py --sizes=4,12,24 --big=41 --sim --times` (correctness on 1 vs 8, scaling
 over 1/2/4/8, the 10,127-token fold; `--sim` adds each size as one simulated rank of N on one of the box's GPUs, so the
