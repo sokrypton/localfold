@@ -290,9 +290,8 @@ void triangleMultiplication(float* pair, const float* pairMask, int L, int C, co
   half* cn = scratch<half>("tri.cn", pairs * C);
   centerNorm(prod, cn, L, Lp, C, P(T + "/center_norm/scale", blk), P(T + "/center_norm/offset", blk));
   half* outH = scratch<half>("tri.outh", pairs * C);
-  { Gemm g{}; g.X = cn; g.tx = F16; g.W = PH(T + "/output_projection/weights", blk); g.tw = F16; g.Y = outH; g.ty = F16; g.rows = pairs;
-    g.in = C; g.out = C; g.bias = P(T + "/output_projection/bias", blk); g.label = "triangle output"; gemm(g); }
-  gemmGatedAdd(xn, PH(T + "/gating_linear/weights", blk), outH, pair, pairs, C, C, P(T + "/gating_linear/bias", blk));
+  gemmGatedAddDual(xn, PH(T + "/gating_linear/weights", blk), cn, PH(T + "/output_projection/weights", blk), pair, pairs, C, C,
+                   P(T + "/gating_linear/bias", blk), P(T + "/output_projection/bias", blk), outH, "triangle output and gated add");
 }
 // the triangle attention: the starting node attends along a row, the ending node along a column (across the pair's
 // leading axis: its bias the projection transposed, its key's mask pairMask[k][j])

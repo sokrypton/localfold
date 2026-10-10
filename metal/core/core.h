@@ -112,6 +112,10 @@ inline void gemm(const float* X, const float* W, float* Y, size_t rows, int in, 
 // planes [C][np * np] (rows r0.. of the n * n pairs)
 void gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, size_t rows, int in, int out,
                   const float* bias = nullptr);
+// the triangle's tail in one pass: pair += (Xv Wv + biasV, rounded to half) sigmoid(Xg Wg + biasG) - on the matrix
+// units one kernel, the value never written; elsewhere (or LOCALFOLD_GATED_DUAL=0) Xv Wv into vTmp, then gemmGatedAdd
+void gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
+                      int out, const float* biasG, const float* biasV, half* vTmp, const char* label = nullptr);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden);
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr);

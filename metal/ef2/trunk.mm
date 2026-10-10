@@ -49,8 +49,8 @@ static void triangle(float* pair, const float* mask, int L, int C, const std::st
   half* cn = scratch<half>("ftri.cn", P * C);
   centerNorm(prod, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
   half* outH = scratch<half>("ftri.outh", P * C);
-  linH(cn, "f/" + Tn + "outputProjection", outH, P, C, C);
-  gemmGatedAdd(xn, Fh(Tn + "gatingLinear"), outH, pair, P, C, C);
+  gemmGatedAddDual(xn, Fh(Tn + "gatingLinear"), cn, Fh(Tn + "outputProjection"), pair, P, C, C, nullptr, nullptr, outH,
+                   "triangle output and gated add");
 }
 static void transition(float* pair, size_t P, int C, const std::string& Tn) {
   int I = dimOf("f/" + Tn + "transition2", 0);

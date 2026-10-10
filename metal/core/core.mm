@@ -671,6 +671,29 @@ void gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, si
   if (bias) { a.bias = (uint64_t)bias; a.epilogue |= 4; }
   gemmRun(F16, F16, F32, a, 1, false, false, "gated add");
 }
+void gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
+                      int out, const float* biasG, const float* biasV, half* vTmp, const char* label) {
+  static const bool dual = !getenv("LOCALFOLD_GATED_DUAL") || atoi(getenv("LOCALFOLD_GATED_DUAL")) != 0;
+  auto a16 = [](const void* p) { return ((uint64_t)p & 15) == 0; };
+  // (at in <= 128: at ESMFold2's 256 the two accumulators' registers cost more than the round trip saves - 417 against
+  // 404 ms a trunk pass)
+  if (dual && tensorWanted() && out % 128 == 0 && in % 8 == 0 && in <= 128 && a16(pair) && a16(biasG) && a16(biasV) && rows < ((size_t)1 << 31)) {
+    GemmArgs a{};
+    a.A = (uint64_t)Wg; a.B = (uint64_t)Xg; a.C = a.D = (uint64_t)pair;
+    a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
+    a.alpha = 1.f; a.epilogue = biasG ? 4 : 0; a.bias = (uint64_t)biasG;
+    a.aux = (uint64_t)Xv; a.ldaux = in; a.aux2 = (uint64_t)Wv; a.aux3 = (uint64_t)biasV;
+    ++D().stats.gemms;
+    dispatchInstance("gemmt_dual_64x128",
+                     "template [[host_name(\"gemmt_dual_64x128\")]] kernel void lf_gemm_tensor_dual<64, 128>(constant GemmArgs&, uint3, uint);",
+                     &a, sizeof a, Grid{(uint32_t)(out / 128), (uint32_t)((rows + 63) / 64), 1}, 128, 0,
+                     label ? label : "gated add, dual");
+    return;
+  }
+  { Gemm g{}; g.X = Xv; g.tx = F16; g.W = Wv; g.tw = F16; g.Y = vTmp; g.ty = F16; g.rows = rows; g.in = in; g.out = out;
+    g.bias = biasV; g.accFloat = true; g.label = "triangle output"; gemm(g); }
+  gemmGatedAdd(Xg, Wg, vTmp, pair, rows, in, out, biasG);
+}
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden) {
   if (hidden % 8) die("gemmSwiglu: a hidden width of %d is not a multiple of 8", hidden);
   GemmArgs a{};

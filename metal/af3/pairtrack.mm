@@ -49,8 +49,8 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
   half* cn = scratch<half>("pr.h1", P * C);
   centerNorm(prod, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
   half* outH = scratch<half>("pr.h2", P * C);
-  linH(cn, pre + ".outputProjection", outH, P, C, C);
-  gemmGatedAdd(xn, Wh(pre + ".gatingLinear"), outH, into ? into : pair, P, C, C);
+  gemmGatedAddDual(xn, Wh(pre + ".gatingLinear"), cn, Wh(pre + ".outputProjection"), into ? into : pair, P, C, C, nullptr, nullptr, outH,
+                   "triangle output and gated add");
 }
 
 // ---------------------------------------------------------------- grid attention
