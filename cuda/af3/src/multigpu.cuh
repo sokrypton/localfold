@@ -31,6 +31,7 @@ struct Slot { char name[48]; size_t bytes; cudaIpcMemHandle_t handle[MAX_RANKS];
 struct Shm {
   std::atomic<int> arrived, generation, abort, slots;
   int pid[MAX_RANKS];                 // every rank's process, so a barrier notices one that died without exiting
+  int vote[MAX_RANKS];                // (release: whether each rank has the room to keep what it gives back)
   Slot slot[MAX_SLOTS];
 };
 inline Shm* SHM = nullptr;
@@ -180,13 +181,78 @@ inline void launch(int world) {
 inline int rowBegin(int n, int r) { int q = n / WORLD, m = n % WORLD; return r * q + std::min(r, m); }
 inline int rowEnd(int n, int r) { return rowBegin(n, r + 1); }
 
-// A buffer every rank holds `bytes` of, named so each rank finds its peers' copies: local is this rank's, peer[r]
-// rank r's (peer[RANK] == local). Collective: every rank asks for the same name, in the same order, at the same size.
 struct Shared {
   void* local = nullptr; void* peer[MAX_RANKS] = {}; size_t bytes = 0; int world = 1;
+  int seg = -1;                        // (the segment it lies in, below)
   template <class T> T* at(int r) const { return (T*)peer[r]; }
 };
 inline std::map<std::string, Shared>& sharedBuffers() { static std::map<std::string, Shared> m; return m; }
+// Shared buffers live in SEGMENTS - one device allocation a rank, every peer's opened once - several buffers to one where
+// they are small enough, and a buffer given back is kept, mapped, for the next of about its size (the pool): opening a
+// peer's allocation is ~3 ms of driver time with 8 ranks at once (1 with 2) whatever its size, closing one ~1.5, so a
+// buffer an allocation of its own, made and given back, cost every rank ~35 ms of a GPU left idle - ~1.6 s a fold at
+// 2,964 tokens on 8 x A100, a third of one at 988.
+struct Segment { void* local = nullptr; void* peer[MAX_RANKS] = {}; size_t size = 0, used = 0; int live = 0; bool dead = false; };
+inline std::vector<Segment>& segments() { static std::vector<Segment> v; return v; }
+inline std::vector<Shared>& sharedPool() { static std::vector<Shared> p; return p; }
+// every segment holding nothing named given back - its kept buffers dropped from the pool, every rank's imports of its
+// peers' closed, then (after a barrier, so no peer still maps it) its own freed (collective)
+inline void freeIdle() {
+  auto& sg = segments(); auto& pl = sharedPool();
+  for (size_t i = 0; i < pl.size();) { if (!sg[pl[i].seg].live) pl.erase(pl.begin() + i); else ++i; }
+  for (auto& g : sg)
+    if (!g.dead && !g.live)
+      for (int r = 0; r < WORLD; ++r) if (r != RANK && g.peer[r]) { if (!SIM) CK(cudaIpcCloseMemHandle(g.peer[r])); g.peer[r] = nullptr; }
+  if (WORLD > 1) barrier();
+  for (auto& g : sg) if (!g.dead && !g.live) { CK(cudaFree(g.local)); g.dead = true; }
+}
+// whether every rank has `bytes` free and a margin (collective: each rank's answer in the shared mapping)
+inline bool everyRankHas(size_t bytes) {
+  size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
+  const bool mine = f >= bytes;
+  if (WORLD == 1 || SIM) return mine;
+  SHM->vote[RANK] = mine;
+  barrier();
+  bool all = true; for (int r = 0; r < WORLD; ++r) all = all && SHM->vote[r];
+  barrier();                             // (every vote read before the next writes them)
+  return all;
+}
+constexpr size_t SEGMENT = (size_t)1 << 30, SEGMENT_ALIGN = 4096;
+// a new segment of `bytes` on every rank, each peer's opened (collective)
+inline int openSegment(size_t bytes, const std::string& name) {
+  Segment g; g.size = bytes;
+  if (cudaMalloc(&g.local, std::max<size_t>(bytes, 256)) != cudaSuccess) {
+    size_t f = 0, t = 0; cudaGetLastError(); cudaMemGetInfo(&f, &t);
+    fprintf(stderr, "rank %d: out of device memory for the shared buffer %s (%.2f GB; %.2f of %.2f GB free)\n", RANK,
+            name.c_str(), bytes / 1e9, f / 1e9, t / 1e9);
+    exit(1);
+  }
+  if (SIM) { for (int r = 0; r < WORLD; ++r) g.peer[r] = g.local; segments().push_back(g); return (int)segments().size() - 1; }
+  int idx;
+  if (RANK == 0) {
+    idx = SHM ? SHM->slots.fetch_add(1) : 0;
+    if (idx >= MAX_SLOTS) { fprintf(stderr, "mg: more than %d shared segments\n", MAX_SLOTS); exit(1); }
+    if (SHM) { snprintf(SHM->slot[idx].name, sizeof(SHM->slot[idx].name), "%s", name.c_str()); SHM->slot[idx].bytes = bytes; }
+  }
+  barrier();
+  if (WORLD > 1) {
+    idx = -1;
+    for (int i = 0, k = SHM->slots.load(); i < k; ++i) if (name == SHM->slot[i].name) idx = i;
+    if (idx < 0 || SHM->slot[idx].bytes != bytes) { fprintf(stderr, "rank %d: shared buffer %s disagrees\n", RANK, name.c_str()); exit(1); }
+    CK(cudaIpcGetMemHandle(&SHM->slot[idx].handle[RANK], g.local));
+  }
+  barrier();
+  for (int r = 0; r < WORLD; ++r) {
+    if (r == RANK) { g.peer[r] = g.local; continue; }
+    CK(cudaIpcOpenMemHandle(&g.peer[r], SHM->slot[idx].handle[r], cudaIpcMemLazyEnablePeerAccess));
+  }
+  barrier();
+  segments().push_back(g);
+  return (int)segments().size() - 1;
+}
+// A buffer every rank holds `bytes` of, named so each rank finds its peers' copies: local is this rank's, peer[r]
+// rank r's (peer[RANK] == local). Collective: every rank asks for the same name, in the same order, at the same size -
+// so every rank's pool, segments and choices below are alike.
 inline Shared& shared(const std::string& name, size_t bytes) {
   auto& m = sharedBuffers();
   auto it = m.find(name);
@@ -198,51 +264,67 @@ inline Shared& shared(const std::string& name, size_t bytes) {
     }
     return it->second;
   }
-  Shared s; s.bytes = bytes; s.world = WORLD;
-  if (cudaMalloc(&s.local, std::max<size_t>(bytes, 256)) != cudaSuccess) {
-    size_t f = 0, t = 0; cudaGetLastError(); cudaMemGetInfo(&f, &t);
-    fprintf(stderr, "rank %d: out of device memory for the shared buffer %s (%.2f GB; %.2f of %.2f GB free)\n", RANK,
-            name.c_str(), bytes / 1e9, f / 1e9, t / 1e9);
-    exit(1);
+  auto& sg = segments();
+  // one given back and kept: the smallest that holds `bytes` and is not much larger
+  auto& pl = sharedPool();
+  int best = -1;
+  for (int i = 0; i < (int)pl.size(); ++i)
+    if (pl[i].bytes >= bytes && pl[i].bytes <= bytes + bytes / 4 + (16u << 20) && (best < 0 || pl[i].bytes < pl[best].bytes)) best = i;
+  Shared s;
+  if (best >= 0) { s = pl[best]; pl.erase(pl.begin() + best); }
+  else {
+    const size_t want = (std::max<size_t>(bytes, 1) + SEGMENT_ALIGN - 1) / SEGMENT_ALIGN * SEGMENT_ALIGN;
+    int k = -1;
+    if (want <= SEGMENT / 2)          // (the tail of a shared segment; a large buffer a segment of its own)
+      for (int i = 0; i < (int)sg.size() && k < 0; ++i) if (!sg[i].dead && sg[i].size == SEGMENT && sg[i].size - sg[i].used >= want) k = i;
+    if (k < 0) {
+      const size_t size = want <= SEGMENT / 2 ? SEGMENT : want;
+      // (what the pool keeps is given back first where any rank is short of room for the new segment: a 10,127-token
+      // fold's confidence slabs did not fit beside the diffusion's 6.6 GB encoder pair, kept)
+      bool idle = false; for (auto& g : sg) idle = idle || (!g.dead && !g.live);
+      if (idle && !everyRankHas(size + ((size_t)1 << 30))) freeIdle();
+      k = openSegment(size, "seg" + std::to_string(sg.size()));
+    }
+    Segment& g = sg[k];
+    s.seg = k; s.bytes = want; s.world = WORLD;
+    s.local = (char*)g.local + g.used;
+    for (int r = 0; r < WORLD; ++r) s.peer[r] = (char*)g.peer[r] + g.used;
+    g.used += want;
   }
-  if (SIM) { for (int r = 0; r < WORLD; ++r) s.peer[r] = s.local; return m.emplace(name, s).first->second; }
-  int idx;
-  if (RANK == 0) {
-    idx = SHM ? SHM->slots.fetch_add(1) : 0;
-    if (idx >= MAX_SLOTS) { fprintf(stderr, "mg: more than %d shared buffers\n", MAX_SLOTS); exit(1); }
-    if (SHM) { snprintf(SHM->slot[idx].name, sizeof(SHM->slot[idx].name), "%s", name.c_str()); SHM->slot[idx].bytes = bytes; }
-  }
-  barrier();
-  if (WORLD > 1) {
-    idx = -1;
-    for (int i = 0, k = SHM->slots.load(); i < k; ++i) if (name == SHM->slot[i].name) idx = i;
-    if (idx < 0 || SHM->slot[idx].bytes != bytes) { fprintf(stderr, "rank %d: shared buffer %s disagrees\n", RANK, name.c_str()); exit(1); }
-    CK(cudaIpcGetMemHandle(&SHM->slot[idx].handle[RANK], s.local));
-  }
-  barrier();
-  for (int r = 0; r < WORLD; ++r) {
-    if (r == RANK) { s.peer[r] = s.local; continue; }
-    CK(cudaIpcOpenMemHandle(&s.peer[r], SHM->slot[idx].handle[r], cudaIpcMemLazyEnablePeerAccess));
-  }
-  barrier();
+  static const bool diag = getenv("LOCALFOLD_MG_FENCE_TIMES") != nullptr;
+  if (diag && RANK == 0) fprintf(stderr, "  shared %-16s %9.1f MB %s seg %d\n", name.c_str(), bytes / 1e6, best >= 0 ? "(pool)" : "NEW", s.seg);
+  ++sg[s.seg].live;
   return m.emplace(name, s).first->second;
 }
 
-// Shared buffers whose names start with one of `prefixes` given back: every rank's imports of its peers' closed, then
-// (after a barrier, so no peer still maps it) its own freed. Collective while the ranks run; after the others have
-// left (rank 0 alone, WORLD 1) it closes and frees without meeting anyone. The name is not asked for again.
-inline void release(const std::vector<std::string>& prefixes) {
+// Shared buffers whose names start with one of `prefixes` given back (collective while the ranks run; after the others
+// have left - rank 0 alone, WORLD 1 - it meets no one). KEEP: kept in the pool for the next shared() of about their size,
+// where every rank has a quarter of its card free with them held - else, and with FREE, every segment left holding
+// nothing named given back (every rank's imports of its peers' closed, then - after a barrier, so no peer still maps it
+// - its own freed), the pool's buffers in those with it. FINAL: the ranks part at once - none closes a peer's segment
+// (the others exit; the driver frees theirs), rank 0 frees its own. The name is not asked for again.
+enum ReleaseMode { KEEP, FREE, FINAL };
+inline void release(const std::vector<std::string>& prefixes, ReleaseMode mode = KEEP) {
   auto& m = sharedBuffers();
+  auto& pl = sharedPool();
+  auto& sg = segments();
   auto match = [&](const std::string& k) { for (auto& p : prefixes) if (!k.compare(0, p.size(), p)) return true; return false; };
   bool any = false; for (auto& [k, s] : m) any = any || match(k);
   if (WORLD > 1) { CK(cudaStreamSynchronize(STREAM)); barrier(); }
   else if (any) CK(cudaStreamSynchronize(STREAM));
-  for (auto& [k, s] : m)
-    if (match(k)) for (int r = 0; r < s.world; ++r) if (r != RANK && s.peer[r]) { if (!SIM) CK(cudaIpcCloseMemHandle(s.peer[r])); s.peer[r] = nullptr; }
-  barrier();
   for (auto it = m.begin(); it != m.end();) {
-    if (match(it->first)) { CK(cudaFree(it->second.local)); it = m.erase(it); } else ++it;
+    if (match(it->first)) { --sg[it->second.seg].live; pl.push_back(it->second); it = m.erase(it); } else ++it;
   }
+  if (mode == FINAL) {
+    if (RANK == 0) for (auto& g : sg) if (!g.dead && (m.empty() || !g.live)) { CK(cudaFree(g.local)); g.dead = true; }
+    pl.clear();
+    return;
+  }
+  if (mode == KEEP && WORLD > 1) {
+    size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
+    if (everyRankHas(t / 4)) return;
+  }
+  freeIdle();
 }
 // The fences, on the DEVICE: each rank's stream writes its arrival (a generation) into every rank's flags and waits
 // until every rank's has arrived in its own - so what each rank's stream did before its fence is done and visible to
@@ -290,11 +372,40 @@ inline DevFlags devFlags() {
   return f;
 }
 inline void hostFence();
+// (DIAG LOCALFOLD_MG_FENCE_TIMES=1: every rank's time inside its fences, reported at each tick - not under a capture)
+inline std::vector<std::pair<cudaEvent_t, cudaEvent_t>> FENCE_EV;
+inline void fenceByStage(const char* name);
 inline void fence() {
   if (WORLD == 1 || SIM) return;
   if (SHARED_DEVICE) { hostFence(); return; }
+  static const bool ft = getenv("LOCALFOLD_MG_FENCE_TIMES") != nullptr;
+  if (ft && STAGES) STAGE_HOOK = fenceByStage;
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  if (ft) CK(cudaStreamIsCapturing(STREAM, &cap));
+  cudaEvent_t a = nullptr, b = nullptr;
+  if (ft && cap == cudaStreamCaptureStatusNone) { CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b)); CK(cudaEventRecord(a, STREAM)); }
   arriveAndWaitK<<<1, 32, 0, STREAM>>>(devFlags());
   CK(cudaGetLastError());
+  if (a) { CK(cudaEventRecord(b, STREAM)); FENCE_EV.push_back({ a, b }); }
+}
+inline std::map<std::string, std::pair<double, int>> FENCE_BY_STAGE;
+inline void fenceByStage(const char* name) {
+  double tot = 0;
+  for (auto& [a, b] : FENCE_EV) { float m = 0; CK(cudaEventElapsedTime(&m, a, b)); tot += m; CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b)); }
+  auto& e = FENCE_BY_STAGE[name]; e.first += tot; e.second += (int)FENCE_EV.size();
+  FENCE_EV.clear();
+}
+inline void fenceTimes(const char* what) {
+  for (auto& [k, v] : FENCE_BY_STAGE)
+    fprintf(stderr, "  rank %d stage %-22s %5d fences %8.1f ms waiting of %8.1f -> working %8.1f\n", RANK, k.c_str(), v.second, v.first,
+            STAGE_MS[k], STAGE_MS[k] - v.first);
+  FENCE_BY_STAGE.clear();
+  if (FENCE_EV.empty()) return;
+  CK(cudaDeviceSynchronize());
+  double tot = 0, mx = 0;
+  for (auto& [a, b] : FENCE_EV) { float m = 0; CK(cudaEventElapsedTime(&m, a, b)); tot += m; mx = std::max(mx, (double)m); CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b)); }
+  fprintf(stderr, "  rank %d %-24s %5zu fences, %8.1f ms waiting (longest %.2f)\n", RANK, what, FENCE_EV.size(), tot, mx);
+  FENCE_EV.clear();
 }
 // ...and on the host, where the HOST then reads what the others wrote (a synchronous copy off a peer's buffer)
 inline void hostFence() {
@@ -313,6 +424,7 @@ inline void tick(const char* what) {
   if (WORLD > 1) barrier();
   auto now = std::chrono::steady_clock::now();
   if (RANK == 0) fprintf(stderr, "  mg %-30s %9.1f ms\n", what, std::chrono::duration<double, std::milli>(now - last).count());
+  fenceTimes(what);
   last = now;
 }
 
@@ -322,10 +434,21 @@ inline void tick(const char* what) {
 template <class F1, class F2, class F3>
 inline void gather(const Shared& src, void* dst, F1 bytesOf, F2 srcOff, F3 dstOff) {
   fence();
-  for (int r = 0; r < WORLD; ++r) {
+  static const bool ft = getenv("LOCALFOLD_MG_FENCE_TIMES") != nullptr;
+  static double hostMs = 0, devMs = 0; static int calls = 0;
+  cudaEvent_t e0 = nullptr, e1 = nullptr;
+  if (ft) { CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); CK(cudaEventRecord(e0, STREAM)); }
+  auto h0 = std::chrono::steady_clock::now();
+  for (int k = 0; k < WORLD; ++k) {              // (from this rank on: all reading rank 0 first ran at a quarter the rate)
+    const int r = (RANK + k) % WORLD;
     size_t b = bytesOf(r);
     if (!b) continue;
     CK(cudaMemcpyAsync((char*)dst + dstOff(r), (const char*)src.peer[r] + srcOff(r), b, cudaMemcpyDefault, STREAM));
+  }
+  if (ft) {
+    hostMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+    CK(cudaEventRecord(e1, STREAM)); CK(cudaEventSynchronize(e1)); float m = 0; CK(cudaEventElapsedTime(&m, e0, e1)); devMs += m;
+    if (++calls % 48 == 0) fprintf(stderr, "  rank %d gather: %d calls, host enqueue %.1f ms, device %.1f ms\n", RANK, calls, hostMs, devMs);
   }
   fence();
 }

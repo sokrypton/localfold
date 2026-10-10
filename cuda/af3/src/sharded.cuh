@@ -28,10 +28,14 @@ inline float* baseOf(void* slab, int lo, int n, int C) { return (float*)((char*)
 
 // every rank's slab, for a kernel that reads them directly (peer access over NVLink or PCIe peer-to-peer, which
 // multigpu.cuh requires): base pointer and first row each
-struct PeerSlabs { const uint4* p[mg::MAX_RANKS]; int lo[mg::MAX_RANKS], rows[mg::MAX_RANKS]; int world; };
+// (every exchange kernel walks the rows from this rank's own first row, wrapping - `rot`: walked from row 0 by every
+// rank at once, all eight GPUs read one peer, then the next, and an all-to-all of 268 MB a rank on 8 x A100 ran at
+// 56 GB/s a GPU against 120 rotated; the copy engines' 64 against 233)
+struct PeerSlabs { const uint4* p[mg::MAX_RANKS]; int lo[mg::MAX_RANKS], rows[mg::MAX_RANKS]; int world, rot; };
 inline PeerSlabs peerSlabs(const mg::Shared& z, int n) {
   PeerSlabs ps{};
   ps.world = mg::WORLD;
+  { int hi; rowsOf(n, mg::RANK, ps.rot, hi); }
   for (int r = 0; r < mg::WORLD; ++r) { int hi; rowsOf(n, r, ps.lo[r], hi); ps.rows[r] = storedRows(n, r); ps.p[r] = (const uint4*)z.peer[r]; }
   return ps;
 }
@@ -41,7 +45,7 @@ inline PeerSlabs peerSlabs(const mg::Shared& z, int n) {
 __global__ void transposeP2PK(PeerSlabs ps, uint4* __restrict__ zT, int n, int lo, int cols, int vecs) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * cols * vecs) return;
-  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int j = (int)(rest % cols), i = (int)(rest / cols);
+  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int j = (int)(rest % cols), i = (int)((rest / cols + ps.rot) % n);
   int p = 0;
   while (p + 1 < ps.world && i >= ps.lo[p + 1]) ++p;
   zT[((size_t)j * n + i) * vecs + v] = ps.p[p][((size_t)(i - ps.lo[p]) * n + lo + j) * vecs + v];
@@ -59,7 +63,7 @@ inline void transpose(const mg::Shared& z, const mg::Shared& zT, int n, int C) {
 __global__ void pushTransposeK(PeerSlabs ps, const uint4* __restrict__ zT, int n, int j0, int cols, int vecs) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * cols * vecs) return;
-  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int j = (int)(rest % cols), i = (int)(rest / cols);
+  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int j = (int)(rest % cols), i = (int)((rest / cols + ps.rot) % n);
   int p = 0;
   while (p + 1 < ps.world && i >= ps.lo[p + 1]) ++p;
   ((uint4*)ps.p[p])[((size_t)(i - ps.lo[p]) * n + j0 + j) * vecs + v] = zT[((size_t)j * n + i) * vecs + v];
@@ -101,9 +105,11 @@ inline void ringOver(const mg::Shared& bmine, int n, int np, int C, T* const* st
 // thread): a group's a and b planes pulled - planes [gc][np][np] from rank r's [C][rows_r][np] at channels q0.. - and
 // its product's rows pushed into each rank's [C][rows_r][np]. As copies they were 3W a group, ~9,700 a 2,964-token
 // trunk pass, each ~17 us of launch the GPU sat idle for.
-struct PeerPlanes { uint4* p[mg::MAX_RANKS]; uint4* q[mg::MAX_RANKS]; int lo[mg::MAX_RANKS], rows[mg::MAX_RANKS]; int world; };
+// (rows walked from this rank's own, as PeerSlabs's)
+struct PeerPlanes { uint4* p[mg::MAX_RANKS]; uint4* q[mg::MAX_RANKS]; int lo[mg::MAX_RANKS], rows[mg::MAX_RANKS]; int world, rot; };
 inline PeerPlanes peerPlanes(const mg::Shared& a, const mg::Shared* b, int n) {
   PeerPlanes pp{}; pp.world = mg::WORLD;
+  { int hi; rowsOf(n, mg::RANK, pp.rot, hi); }
   for (int r = 0; r < mg::WORLD; ++r) {
     int lo, hi; rowsOf(n, r, lo, hi); pp.lo[r] = lo; pp.rows[r] = hi - lo;
     pp.p[r] = (uint4*)a.peer[r]; pp.q[r] = b ? (uint4*)b->peer[r] : nullptr;
@@ -114,10 +120,10 @@ __device__ __forceinline__ int ownerOf(const PeerPlanes& pp, int i) { int r = 0;
 __global__ void pullPlanesK(PeerPlanes pp, uint4* __restrict__ a, uint4* __restrict__ b, int q0, int gc, int np, int vecs) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)gc * np * vecs) return;
-  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int i = (int)(rest % np), c = (int)(rest / np);
+  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int i = (int)((rest % np + pp.rot) % np), c = (int)(rest / np);
   const int r = ownerOf(pp, i);
-  const size_t src = ((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs + v;
-  a[t] = pp.p[r][src]; b[t] = pp.q[r][src];
+  const size_t src = ((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs + v, d = ((size_t)c * np + i) * vecs + v;
+  a[d] = pp.p[r][src]; b[d] = pp.q[r][src];
 }
 // ...the operands exchanged e4m3 (LOCALFOLD_MG_FP8_EXCHANGE=1: half the bytes of the largest exchange there is) and
 // widened to bf16 here for the GEMM - 8 values a thread, vecs8 = np / 8 a row
@@ -131,18 +137,18 @@ __device__ __forceinline__ uint4 widen8(uint2 s) {
 __global__ void pullPlanes8K(PeerPlanes pp, uint4* __restrict__ a, uint4* __restrict__ b, int q0, int gc, int np, int vecs8) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)gc * np * vecs8) return;
-  const int v = (int)(t % vecs8); const size_t rest = t / vecs8; const int i = (int)(rest % np), c = (int)(rest / np);
+  const int v = (int)(t % vecs8); const size_t rest = t / vecs8; const int i = (int)((rest % np + pp.rot) % np), c = (int)(rest / np);
   const int r = ownerOf(pp, i);
-  const size_t src = ((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs8 + v;
-  a[t] = widen8(reinterpret_cast<const uint2*>(pp.p[r])[src]);
-  b[t] = widen8(reinterpret_cast<const uint2*>(pp.q[r])[src]);
+  const size_t src = ((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs8 + v, d = ((size_t)c * np + i) * vecs8 + v;
+  a[d] = widen8(reinterpret_cast<const uint2*>(pp.p[r])[src]);
+  b[d] = widen8(reinterpret_cast<const uint2*>(pp.q[r])[src]);
 }
 __global__ void pushRowsK(PeerPlanes pp, const uint4* __restrict__ prod, int q0, int gc, int np, int vecs) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)gc * np * vecs) return;
-  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int i = (int)(rest % np), c = (int)(rest / np);
+  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int i = (int)((rest % np + pp.rot) % np), c = (int)(rest / np);
   const int r = ownerOf(pp, i);
-  pp.p[r][((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs + v] = prod[t];
+  pp.p[r][((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs + v] = prod[((size_t)c * np + i) * vecs + v];
 }
 
 // every other rank's rows of the attention's bias (columns where swapped: the rows of z^T), read straight from it - the
@@ -151,10 +157,11 @@ __global__ void gatherBiasK(PeerPlanes pp, uint4* __restrict__ bias, int heads, 
   const int vecs = stride / 8;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)heads * n * vecs) return;
-  const int v = (int)(t % vecs), i = (int)((t / vecs) % n);
+  const int v = (int)(t % vecs), h = (int)(t / vecs / n), i = (int)((t / vecs % n + pp.rot) % n);
   const int r = swap ? (v * 8 < n ? ownerOf(pp, v * 8) : rank) : ownerOf(pp, i);
   if (r == rank) return;
-  bias[t] = pp.p[r][t];
+  const size_t at = ((size_t)h * n + i) * vecs + v;
+  bias[at] = pp.p[r][at];
 }
 
 // a sharded op's scratch given back after it only where the card is short: giving back drains the device
@@ -511,8 +518,8 @@ inline void rowAttentionGeneric(const mg::Shared& z, const float* mask, int n, i
   }
   mg::fence();
   const size_t e = sizeof(T);
-  for (int r = 0; r < mg::WORLD; ++r) {
-    if (r == mg::RANK) continue;
+  for (int k = 1; k < mg::WORLD; ++k) {          // (from the next rank on: rot)
+    const int r = (mg::RANK + k) % mg::WORLD;
     int rlo, rhi; rowsOf(n, r, rlo, rhi); rhi = std::min(rhi, n);
     if (rhi <= rlo) continue;
     for (int h = 0; h < heads; ++h) {

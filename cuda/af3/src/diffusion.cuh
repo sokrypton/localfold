@@ -890,7 +890,7 @@ __global__ void gatherKvK(PeerRows pr, half* __restrict__ qkvg, int n, int Wd) {
   const int per = 2 * Wd / 8;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * per) return;
-  const int row = (int)(t / per), v = (int)(t % per);
+  const int row = (int)((t / per + pr.lo[pr.rank]) % n), v = (int)(t % per);     // (from this rank's own rows: sharded.cuh's rot)
   int r = 0;
   while (r + 1 < pr.world && row >= pr.lo[r + 1]) ++r;
   if (r == pr.rank) return;
@@ -903,7 +903,7 @@ __global__ void gatherActK(PeerAct pa, float* __restrict__ act, int n, int C) {
   const int per = C / 4;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * per) return;
-  const int row = (int)(t / per), v = (int)(t % per);
+  const int row = (int)((t / per + pa.lo[pa.rank]) % n), v = (int)(t % per);     // (from this rank's own rows)
   int r = 0;
   while (r + 1 < pa.world && row >= pa.lo[r + 1]) ++r;
   if (r == pa.rank) return;
@@ -1027,8 +1027,8 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       FLASH_QLO = FLASH_QHI = FLASH_BIAS_ROWS = 0;
       if (shardedQ && !tok) {   // every rank's query rows of o, each sample's
         mg::fence();
-        for (int r = 0; r < mg::WORLD; ++r) {
-          if (r == mg::RANK) continue;
+        for (int k = 1; k < mg::WORLD; ++k) {     // (from the next rank on: every rank reading one peer at once was 3.6x slower)
+          const int r = (mg::RANK + k) % mg::WORLD;
           int rlo, rhi; sh::rowsOf(n, r, rlo, rhi); const int rn = sh::storedRows(n, r);
           if (!rn) continue;
           CK(cudaMemcpy2DAsync(o + (size_t)rlo * Wd, (size_t)n * Wd * sizeof(T), (const T*)oS->peer[r] + (size_t)rlo * Wd,
@@ -1358,11 +1358,12 @@ inline AtomRange atomRangeFor(int tlo, int thi) {
 __global__ void gatherAtomRowsK(PeerAct pa, float* __restrict__ x, int n, int dense) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * dense * 3) return;
-  const int token = (int)(t / ((size_t)dense * 3));
+  const int token = (int)((t / ((size_t)dense * 3) + pa.lo[pa.rank]) % n);       // (from this rank's own tokens)
   int r = 0;
   while (r + 1 < pa.world && token >= pa.lo[r + 1]) ++r;
   if (r == pa.rank) return;
-  x[t] = pa.p[r][t];
+  const size_t at = (size_t)token * dense * 3 + t % ((size_t)dense * 3);
+  x[at] = pa.p[r][at];
 }
 inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float noiseLevel) {
   int n = f.n, dense = (int)M.meta("batch.dense");

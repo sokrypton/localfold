@@ -1810,6 +1810,7 @@ inline void check(const char* label, const float* d, size_t n, const std::string
 }
 inline bool STAGES = false;
 inline std::map<std::string, double> STAGE_MS;
+inline void (*STAGE_HOOK)(const char*) = nullptr;   // (DIAG: multigpu.cuh's fence waits by stage)
 inline void stage(const char* name) {
   static auto last = std::chrono::steady_clock::now();
   // a launch that never ran (too much shared memory, a bad grid) reports nothing by itself: ask at
@@ -1821,6 +1822,7 @@ inline void stage(const char* name) {
   CK(cudaStreamSynchronize(STREAM));
   auto now = std::chrono::steady_clock::now();
   if (name) STAGE_MS[name] += std::chrono::duration<double, std::milli>(now - last).count();
+  if (name && STAGE_HOOK) STAGE_HOOK(name);
   last = now;
 }
 #include "elementwise.cuh"    // the element-wise kernels every port shares

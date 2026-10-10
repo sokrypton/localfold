@@ -944,8 +944,8 @@ void msaAttentionSharded(Trunk& t, const std::string& pre) {
   }
   // every rank's columns of the MSA
   mg::fence();
-  for (int r = 0; r < mg::WORLD; ++r) {
-    if (r == mg::RANK) continue;
+  for (int k = 1; k < mg::WORLD; ++k) {          // (from the next rank on: sharded.cuh's rot)
+    const int r = (mg::RANK + k) % mg::WORLD;
     int rlo, rhi; sh::rowsOf(n, r, rlo, rhi); const int rn = sh::storedRows(n, r);
     if (!rn) continue;
     CK(cudaMemcpy2DAsync(t.msa + (size_t)rlo * Cm, (size_t)n * Cm * 4,

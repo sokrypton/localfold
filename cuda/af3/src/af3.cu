@@ -47,7 +47,7 @@ static void pairOntoRank0(Trunk& t) {
       if (rn) CK(cudaMemcpyAsync((char*)whole + (size_t)lo * row, t.zS->peer[r], (size_t)rn * row, cudaMemcpyDefault, STREAM));
     }
   mg::fence();
-  mg::release({ "" });               // (every shared buffer, collectively: rank 0's pair is whole and its own now)
+  mg::release({ "" }, mg::FINAL);   // (every shared buffer: rank 0's pair is whole and its own now, the others leave)
   if (mg::RANK != 0) mg::leave();
   mg::finish();
   mg::WORLD = 1;
@@ -522,7 +522,8 @@ static int foldMain(int argc, char** argv) {
       const size_t row = (size_t)t.n * t.C * 2;
       float* whole = reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)t.n * t.n * t.C));
       mg::fence();
-      for (int r = 0; r < mg::WORLD; ++r) {
+      for (int k = 0; k < mg::WORLD; ++k) {     // (from this rank on: sharded.cuh's rot)
+        const int r = (mg::RANK + k) % mg::WORLD;
         int lo, hi; sh::rowsOf(t.n, r, lo, hi); const int rn = sh::storedRows(t.n, r);
         if (rn) CK(cudaMemcpyAsync((char*)whole + (size_t)lo * row, t.zS->peer[r], (size_t)rn * row, cudaMemcpyDefault, STREAM));
       }
@@ -740,7 +741,7 @@ static int foldMain(int argc, char** argv) {
       if (contact.empty()) contact = contactProbabilitiesSharded(t);    // (made off the whole pair where it was gathered)
       mg::tick("contacts");
       confMs += ms(sc0, clock()); s0 += clock() - sc0;   // (the confidence head's time its own, not the sampler's)
-      mg::release({ "" });
+      mg::release({ "" }, mg::FINAL);   // (the others leave: nothing closed, rank 0's own freed)
       mg::tick("shared buffers released");
       if (mg::RANK != 0) mg::leave();
       mg::finish();
