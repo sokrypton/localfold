@@ -672,13 +672,13 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, ha
 }
 
 // ---------------------------------------------------------------- attention
-// The matrix units' kernels (gemm_tensor.metal) where they win. lf_attention_tensor2 (v2: simdgroups on their own, ~5 KB
-// of threadgroup memory) from 48 keys at heads 32 wide or more and from 112 at 16; lf_attention_tensor (v1) where there
-// is a q bias, from 168 keys. Measured on an M5 (8-core GPU), interleaved, H 4 x n rows, lf_attention / v1 / v2 ms:
-// n 255 D 32 3.88 / 3.06 / 1.87, D 64 6.84 / 5.81 / 3.19, D 16 2.51 / 2.73 / 1.68; n 128 D 32 0.53 / 0.47 / 0.30;
-// n 64 D 32 0.092 / 0.101 / 0.077; n 48 D 32 0.069 / 0.076 / 0.065; but n 32 D 32 0.032 / 0.044 / 0.038 and n 96 D 16
-// 0.169 / 0.234 / 0.181 - lf_attention's registers below those. v2's key tile 64 unless that leaves the last one half
-// empty or less (n 255 D 32: 1.86 at 64 against 2.07 at 32, 2.33 at 128; n 160: 0.68 at 64 against 0.66 at 32)
+// The matrix units' kernels (gemm_tensor.metal) where they win: lf_attention_tensor3 (v3: the online softmax in
+// registers, no threadgroup memory) from 48 keys; lf_attention_tensor (v1) where there is a q bias, from 168 keys.
+// Measured on an M5 (8-core GPU), interleaved, H 4 x n rows, lf_attention / v2 / v3 ms:
+// n 255 D 32 3.86 / 1.87 / 1.63, D 64 6.83 / 3.15 / 2.90, D 16 2.50 / 1.69 / 1.61; n 384 D 32 x 128 rows 4.31 / 1.93
+// / 1.58; n 128 D 32 0.53 / 0.30 / 0.26; n 64 D 32 0.093 / 0.077 / 0.074; n 48 D 32 0.227 / 0.216 / 0.118; but n 32
+// D 32 0.032 / 0.038 / 0.035 - lf_attention's registers below 48. (v1 against those: n 255 D 32 3.06, n 128 0.47.)
+// The key tile 64 unless that leaves the last one half empty or less, and 32 at D 16 (n 255: 1.61 against 1.74)
 static const int ATTN_TENSOR_MIN_N = 168;
 void attention(const Attention& t) {
   if (!t.rows || !t.n) return;
@@ -693,19 +693,22 @@ void attention(const Attention& t) {
   a.maskB = t.maskB || t.maskK ? t.maskB : t.n; a.maskK = t.maskB || t.maskK ? t.maskK : 1;
   a.pad0 = GEMM_EXTRA_EP;      // (an experiment's switch: metal/bench)
   // LOCALFOLD_ATTN_TENSOR=0 keeps lf_attention, =1 takes a tensor kernel at any length (the bench's arms);
-  // LOCALFOLD_ATTN_V2=0 keeps v1 where v2 would run, =1 v2 at any length; LOCALFOLD_ATTN_TILE=QxK the tile
+  // LOCALFOLD_ATTN_V2=0 keeps v1 where v3 would run, =1 v2, =3 v3 at any length; LOCALFOLD_ATTN_TILE=QxK the tile
   if (D().tensorOps && (t.D == 16 || t.D == 32 || t.D == 48 || t.D == 64)) {
     const char* e = getenv("LOCALFOLD_ATTN_TENSOR");
     const char* v2 = getenv("LOCALFOLD_ATTN_V2");
-    const bool v2auto = t.n >= (t.D >= 32 ? 48 : 112);
+    const bool v2auto = t.n >= 48;
     const bool two = !t.qBias && (v2 ? atoi(v2) != 0 : !e || strcmp(e, "0") != 0 ? v2auto : false);
+    const int ver = two ? (v2 && atoi(v2) < 3 ? 2 : 3) : 1;
     const bool on = e ? strcmp(e, "0") != 0 : two || (t.n >= ATTN_TENSOR_MIN_N && t.D >= 32);
     if (on) {
       int TQB = 64, TKT = 32;
-      if (two) { TQB = 16; TKT = t.n % 64 == 0 || t.n % 64 > 32 ? 64 : 32; }   // (v2's first number: queries a simdgroup)
+      if (two) { TQB = 16; TKT = (t.n % 64 == 0 || t.n % 64 > 32) && !(ver == 3 && t.D == 16) ? 64 : 32; }   // (v2's first number: queries a simdgroup)
       if (const char* tt = getenv("LOCALFOLD_ATTN_TILE")) sscanf(tt, "%dx%d", &TQB, &TKT);
-      std::string name = std::string(two ? "gemmt_attn2_" : "gemmt_attn_") + std::to_string(t.D) + "_" + std::to_string(TQB) + "x" + std::to_string(TKT);
-      std::string decl = "template [[host_name(\"" + name + "\")]] kernel void " + (two ? "lf_attention_tensor2<" : "lf_attention_tensor<") +
+      const char* stem = ver == 3 ? "gemmt_attn3_" : ver == 2 ? "gemmt_attn2_" : "gemmt_attn_";
+      const char* fn = ver == 3 ? "lf_attention_tensor3<" : ver == 2 ? "lf_attention_tensor2<" : "lf_attention_tensor<";
+      std::string name = std::string(stem) + std::to_string(t.D) + "_" + std::to_string(TQB) + "x" + std::to_string(TKT);
+      std::string decl = "template [[host_name(\"" + name + "\")]] kernel void " + fn +
                          std::to_string(t.D) + ", " + std::to_string(TQB) + ", " + std::to_string(TKT) + ">(constant AttnArgs&, uint3, uint, uint, uint);";
       const int qb = two ? 4 * TQB : TQB;
       dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)((t.n + qb - 1) / qb), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0,

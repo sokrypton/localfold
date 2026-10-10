@@ -379,3 +379,92 @@ kernel void lf_attention_tensor2(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
     }
 }
 // (instantiated on first use: lf_attention_tensor2<D, QS, KT>, host name gemmt_attn2_<D>_<QS>x<KT>)
+
+// ---------------------------------------------------------------- v3: the online softmax in registers
+// v2's products, with nothing in threadgroup memory: the bias tile loaded straight into a half destination tensor of
+// the logits' layout, the row maximum and sum (and the rescale) kept in the logits' row-reduction tensors and mapped
+// onto the logits' and the output's elements by their iterators, and P handed to the second product as a cooperative
+// left input. (Compatibilities probed on the M5: the half logits as P.V's left input; logits -> rows; output -> the
+// logits' rows.)
+template <int D, int QS = 16, int KT = 64>
+kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  using namespace mpp::tensor_ops;
+  constexpr int QB = 4 * QS;
+  const int b = tg.y, h = tg.z, n = a.n, W = a.heads * D, qa = tg.x * QB + sg * QS;
+  device const half* base = a.qkvg + (long)b * a.rowStride + h * D;
+  const float qs = a.scale * M_LOG2E_F;
+  typedef dextents<int32_t, 2> E2;
+  const int32_t ps = (int32_t)a.posStride;
+  tensor<device half, E2, tensor_inline> tQ((device half*)base, E2(D, n), array<int32_t, 2>{1, ps});
+  tensor<device half, E2, tensor_inline> tK((device half*)base + W, E2(D, n), array<int32_t, 2>{1, ps});
+  tensor<device half, E2, tensor_inline> tV((device half*)base + 2 * W, E2(D, n), array<int32_t, 2>{1, ps});
+  tensor<device half, E2, tensor_inline> tB((device half*)(a.bias ? a.bias + (long)h * n * a.biasStride : a.qkvg), E2(n, n),
+                                            array<int32_t, 2>{1, (int32_t)a.biasStride});
+  constexpr auto dS = matmul2d_descriptor(QS, KT, D, false, true, false);
+  constexpr auto dO = matmul2d_descriptor(QS, D, KT, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<dS, execution_simdgroup> opS;
+  matmul2d<dO, execution_simdgroup> opO;
+  auto mQ = tQ.slice(0, qa);
+  auto mK0 = tK.slice(0, 0); auto mV0 = tV.slice(0, 0);
+  auto S = opS.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
+  auto Sh = opS.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK0), half>();
+  auto Bh = opS.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK0), half>();
+  auto M = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
+  auto L = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
+  auto C = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
+  auto R = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
+  auto P0 = opO.template get_left_input_cooperative_tensor<half, half, float>(Sh);
+  auto O = opO.template get_destination_cooperative_tensor<decltype(P0), decltype(mV0), float>();
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t e = 0; e < O.get_capacity(); ++e) if (O.is_valid_element(e)) O[e] = 0.f;
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t e = 0; e < M.get_capacity(); ++e) if (M.is_valid_element(e)) { M[e] = -1e30f; L[e] = 0.f; }
+  const long bq = (long)(a.r0 + b);
+  for (int k0 = 0; k0 < n; k0 += KT) {
+    auto mK = tK.slice(0, k0); auto mV = tV.slice(0, k0);
+    opS.run(mQ, mK, S);
+    if (a.bias) Bh.load(tB.slice(k0, qa));
+    const bool tail = k0 + KT > n;
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < S.get_capacity(); ++e)
+      if (S.is_valid_element(e)) {
+        float v = S[e] * qs + (a.bias ? (float)Bh[e] : 0.f);
+        if (tail || a.mask) {
+          const int k = k0 + S.get_multidimensional_index(e)[0];
+          if (k >= n) v = -INFINITY;
+          else if (a.mask && !(a.mask[bq * a.maskB + (long)k * a.maskK] > 0.f)) v += -1e9f;
+        }
+        S[e] = v;
+      }
+    reduce_rows(S, R, reduction_operation::max, -INFINITY);
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < M.get_capacity(); ++e)
+      if (M.is_valid_element(e)) { const float mn = max(M[e], R[e]); C[e] = exp2(M[e] - mn); M[e] = mn; }
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < S.get_capacity(); ++e)
+      if (S.is_valid_element(e)) {
+        const float pv = exp2(S[e] - *M.map_iterator(S.get_iterator(e)));
+        S[e] = pv; Sh[e] = (half)pv;
+      }
+    reduce_rows(S, R, reduction_operation::sum, 0.f);
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < L.get_capacity(); ++e) if (L.is_valid_element(e)) L[e] = L[e] * C[e] + R[e];
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < O.get_capacity(); ++e) if (O.is_valid_element(e)) O[e] *= *C.map_iterator(O.get_iterator(e));
+    auto P = opO.template get_left_input_cooperative_tensor<half, half, float>(Sh);
+    opO.run(P, mV, O);
+  }
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t e = 0; e < O.get_capacity(); ++e)
+    if (O.is_valid_element(e)) {
+      auto ix = O.get_multidimensional_index(e);
+      const int d = ix[0], q = qa + ix[1];
+      if (q >= n) continue;
+      const float g = (float)base[(long)q * a.posStride + 3 * W + d];
+      a.out[(long)b * a.outRowStride + (long)q * a.outPosStride + h * D + d] =
+          (half)(O[e] / *L.map_iterator(O.get_iterator(e)) * (1.f / (1.f + exp(-g))));
+    }
+}
+// (instantiated on first use: lf_attention_tensor3<D, QS, KT>, host name gemmt_attn3_<D>_<QS>x<KT>)
