@@ -420,3 +420,23 @@ More that **lost**:
   level. They are latency-bound, about 20-65 us a dispatch.
 
 Fixed on the way: ESMFold2 crashed on `--out=/dev/null` (e2ffe387).
+
+Later still:
+- **a567d5f3**: `singleConditioning` is batched with the look-ahead too: K levels' noise projections, then the
+  transitions over K n rows. boltz2 6MRR's diffusion: 1.736 -> 1.556 s. AF3's: 1.383 -> 1.286 s. Byte-identical.
+- **d6bc7230**: chai-1's sampler hands the denoiser its plan as well. chai1 6MRR's diffusion: 1.019 -> 0.933 s.
+- `npm run test:native` (offline, without AF3 and the page arm) and `test:bridge` pass on the M5 with all of this.
+
+And more that **lost**:
+- **The single-conditioning embedding (snProj) in the look-ahead too**: level.
+- **adaLN as float4s in registers with a fast sigmoid**: diffusion 3.693 -> 3.669 s at 261 tokens (under 1%), and the
+  fast sigmoid moves the numbers. Not kept.
+- **v3 with its keys split over the four simdgroups** (flash-decoding's split, for the diffusion's one-row
+  attention): correct, and 2x on a 261-key bench row, but level in the fold.
+- **A v4 on 4-simdgroup tiles** (64 queries x 64 keys, both products cooperative): MPP refuses it. "Input cooperative
+  tensors require a single SIMD group", so P could only go through threadgroup memory, which is v1's design.
+- **Concurrent transformer branches**: only `diffusionNoResidual` dialects have independent attention and transition
+  branches, and AF3, boltz2 and protenix2 do not.
+
+Measuring at night: the M5's times drift with heat by 5-20% across back-to-back folds (one 261-token trunk ran
+4.86 then 5.92 s, unchanged). Every number here alternates the arms; trust no single pair.
