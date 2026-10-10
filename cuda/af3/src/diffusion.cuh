@@ -1198,6 +1198,7 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
     ENC_TP_GIVEN = tp;
     f.enc = prepareEncoder(E, "atomReference", trunkSingle, nullptr);
     ENC_TP_GIVEN = nullptr;
+    if (shardedPair) mg::release({ "sh.enc.tp" });   // (read by the encoder's preparation alone, folded into its atom pairs)
     f.dec = prepareDecoder(f.enc);
     PN16_GIVEN = pn16;
     prepareTransformer(nullptr, n);

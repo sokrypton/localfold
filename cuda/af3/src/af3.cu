@@ -477,6 +477,11 @@ static int foldMain(int argc, char** argv) {
     // (the distogram's contacts, the streamed diffusion preparation, the confidence head): the f32 pair it was widened
     // into was the fold's largest tensor past the trunk - 18.4 GB at 6,000 tokens, 51 at 10,000 - and the widening
     // held both at once. Not for OpenDDE (its expander reads f32), nor --save-embeddings
+    if (sharded(t)) {     // what only the trunk read, given back before the diffusion: z^T, the template stack's slabs, the
+                          // exchange buffers, the MSA (the slab itself the diffusion reads, and rank 0 gathers after it)
+      mg::release({ "sh.zT", "sh.tz", "sh.bmine", "sh.bg", "sh.bias", "sh.st.o", "trunk.msa" });
+      t.zTS = nullptr; t.msa = nullptr;
+    }
     TRUNK_PAIR16 = t.p16 && !saveEmbeddings && (pairStays16(t.n, t.C, fast) || sharded(t));
     if (sharded(t) && (saveEmbeddings || saveDistogram)) { fprintf(stderr, "a sharded pair: no --save-embeddings or --save-distogram yet\n"); return 1; }
     if (!TRUNK_PAIR16) pairToF32(t);  // (a bf16 trunk's pair, for the heads, the sampler and the confidence head)
@@ -633,6 +638,7 @@ static int foldMain(int argc, char** argv) {
       mg::WORLD = 1;
       t.pair = whole; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.inPlaceRecycle = true;
       sh::DLO = -1; sh::DROWS = 0;
+      mg::release({ "" });               // (every shared buffer: the others have left, and the pair is whole here)
       // the pair as the one-GPU fold would hold it past here (bf16 only where pairStays16 keeps it so)
       if (!pairStays16(t.n, t.C, fast)) { pairToF32(t); TRUNK_PAIR16 = false; }
       contact = contactProbabilities(t);

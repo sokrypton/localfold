@@ -115,7 +115,7 @@ inline int rowEnd(int n, int r) { return rowBegin(n, r + 1); }
 // A buffer every rank holds `bytes` of, named so each rank finds its peers' copies: local is this rank's, peer[r]
 // rank r's (peer[RANK] == local). Collective: every rank asks for the same name, in the same order, at the same size.
 struct Shared {
-  void* local = nullptr; void* peer[MAX_RANKS] = {}; size_t bytes = 0;
+  void* local = nullptr; void* peer[MAX_RANKS] = {}; size_t bytes = 0; int world = 1;
   template <class T> T* at(int r) const { return (T*)peer[r]; }
 };
 inline std::map<std::string, Shared>& sharedBuffers() { static std::map<std::string, Shared> m; return m; }
@@ -130,7 +130,7 @@ inline Shared& shared(const std::string& name, size_t bytes) {
     }
     return it->second;
   }
-  Shared s; s.bytes = bytes;
+  Shared s; s.bytes = bytes; s.world = WORLD;
   CK(cudaMalloc(&s.local, std::max<size_t>(bytes, 256)));
   int idx;
   if (RANK == 0) {
@@ -154,6 +154,22 @@ inline Shared& shared(const std::string& name, size_t bytes) {
   return m.emplace(name, s).first->second;
 }
 
+// Shared buffers whose names start with one of `prefixes` given back: every rank's imports of its peers' closed, then
+// (after a barrier, so no peer still maps it) its own freed. Collective while the ranks run; after the others have
+// left (rank 0 alone, WORLD 1) it closes and frees without meeting anyone. The name is not asked for again.
+inline void release(const std::vector<std::string>& prefixes) {
+  auto& m = sharedBuffers();
+  auto match = [&](const std::string& k) { for (auto& p : prefixes) if (!k.compare(0, p.size(), p)) return true; return false; };
+  bool any = false; for (auto& [k, s] : m) any = any || match(k);
+  if (WORLD > 1) { CK(cudaStreamSynchronize(STREAM)); barrier(); }
+  else if (any) CK(cudaStreamSynchronize(STREAM));
+  for (auto& [k, s] : m)
+    if (match(k)) for (int r = 0; r < s.world; ++r) if (r != RANK && s.peer[r]) { CK(cudaIpcCloseMemHandle(s.peer[r])); s.peer[r] = nullptr; }
+  barrier();
+  for (auto it = m.begin(); it != m.end();) {
+    if (match(it->first)) { CK(cudaFree(it->second.local)); it = m.erase(it); } else ++it;
+  }
+}
 // the stream drained and every rank at the same point: what each wrote to its shared buffers is visible to the others
 inline void fence() {
   if (WORLD == 1) return;

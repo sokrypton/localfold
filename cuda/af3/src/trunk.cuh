@@ -262,6 +262,10 @@ inline Trunk makeTrunk(const float* targetFeatHost, int msaCap, bool wantPair16 
     // several GPUs on a sharded pair: this rank's slab and its z^T twin (shared), the MSA shared for its all-gathers,
     // the recycled pair the pair itself
     if (!t.p16) { fprintf(stderr, "a sharded pair is bf16: fold with --fast\n"); exit(1); }
+    // every rank at least one 16-row share (each holding real rows): a rank with none would launch empty grids
+    if (mg::WORLD > (t.n + 15) / 16) {
+      fprintf(stderr, "%d tokens fold on at most %d GPUs (a GPU takes rows 16 at a time)\n", t.n, (t.n + 15) / 16); exit(1);
+    }
     int lo, hi; sh::rowsOf(t.n, mg::RANK, lo, hi);
     const size_t slab = (size_t)sh::maxStored(t.n) * t.n * t.C * e;
     t.zS = &mg::shared("sh.z", slab); t.zTS = &mg::shared("sh.zT", slab);
