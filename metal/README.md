@@ -106,7 +106,7 @@ On an M5 (8-core GPU, macOS 26.6), warm, the matrix units on (gemm_tensor.metal)
 | weights load, AF3's int5 bundle (warm) | | 178 ms | 96 ms |
 
 (As of 523aaed3. The matrix units' column: the half GEMMs on matmul2d with their epilogues in registers, attention v3
-- the online softmax in cooperative tensors - from 48 keys, the triangle gate in registers, fast math in those
+(the online softmax in cooperative tensors) from 48 keys, the triangle gate in registers, fast math in those
 epilogues, the bundle decoder's and the MSA kernels' indices in 32 bits, the diffusion's conditioning batched over
 noise levels; docs/M5-HANDOFF.md's last sections have each step's numbers and what lost.)
 
