@@ -337,6 +337,21 @@ static int foldMain(int argc, char** argv) {
   if (!foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
                 doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
   t = makeTrunk(targetFeat.data(), msaCap, doFold && fast);
+  if (mg::WORLD > 1) {
+    // several GPUs (LOCALFOLD_GPUS, multigpu.cuh): the trunk pair in a buffer every rank can read, the pair updates'
+    // work split between them; the rest of the fold on rank 0
+    if (M.flag("trunk.dialect.parallelPairformer") || M.flag("trunk.dialect.structuralTokens") || !serveDir.empty() ||
+        folds != 1 || repeat != 1 || !doFold) {
+      fprintf(stderr, "several GPUs fold one job at a time, and not chai-1 or OpenDDE yet\n"); return 1;
+    }
+    const size_t pc = (size_t)t.n * t.n * t.C;
+    mg::Shared& sp = mg::shared("trunk.pair", pc * 4);          // (f32's room: the pair may be held either way)
+    CK(cudaFree(t.pair)); t.pair = (float*)sp.local;
+    CK(cudaMemset(t.pair, 0, pc * 4));
+    mg::SPLIT = &sp;
+    GRAPHS = false;                                             // (a capture cannot hold a host barrier)
+    printf("trunk: the pair updates over %d GPUs\n", mg::WORLD);
+  }
   memReport("trunk built");
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
@@ -431,6 +446,13 @@ static int foldMain(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
+    if (mg::WORLD > 1) {                 // the trunk done on every rank: the others leave, rank 0 folds on alone
+      mg::SPLIT = nullptr;
+      mg::barrier();
+      if (mg::RANK != 0) { mg::finish(); exit(0); }
+      mg::finish();
+      mg::WORLD = 1;
+    }
     memReport("trunk: passes done");
     // 🔴 THE PAIR STAYS bf16 PAST THE TRUNK on a card short of room, where every reader after it takes bf16 rows
     // (the distogram's contacts, the streamed diffusion preparation, the confidence head): the f32 pair it was widened
@@ -797,6 +819,7 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `af3 <featurised dir> ...` and `af3 - --serve=<dir>` as before
 int main(int argc, char** argv) {
+  if (const char* g = getenv("LOCALFOLD_GPUS")) mg::launch(atoi(g));     // (before any CUDA call: multigpu.cuh)
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("af3", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

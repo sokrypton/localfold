@@ -205,9 +205,10 @@ inline bool pair16Eligible(const Trunk& t) {
 inline void usePair16(Trunk& t, bool on) {
   size_t pc = (size_t)t.n * t.n * t.C, e = on ? 2 : 4;
   if (on != t.p16 || !t.pair) {
-    if (t.pair) CK(cudaFree(t.pair));
+    const bool shared = mg::splitting(t.pair);     // (several GPUs: the shared pair has f32's room, and is kept)
+    if (t.pair && !shared) CK(cudaFree(t.pair));
     if (t.prevPair) CK(cudaFree(t.prevPair));
-    t.pair = on ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(pc)) : dalloc(pc);
+    if (!shared) t.pair = on ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(pc)) : dalloc(pc);
     t.prevPair = t.inPlaceRecycle ? nullptr : on ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(pc)) : dalloc(pc);
     t.p16 = on;
   }

@@ -1379,6 +1379,23 @@ The flash kernel itself is now two thirds of a pass (163 of 247 s at 6,916 token
 block, key tiles of 32-80 and a bias-sharing order are all level or behind at 6,000 tokens - in Nsight Compute it is
 latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a pass is ~12 minutes by n^3.
 
+### Several GPUs on one fold (in progress, 2026-10-10)
+
+`LOCALFOLD_GPUS=N cuda/af3/localfold-af3 ...` folds one job across N GPUs: one process a GPU (multigpu.cuh - CUDA IPC
+buffers, a host barrier under /dev/shm, explicit peer copies, so NVLink and plain PCIe boxes both work), each with
+the port's single-device state unchanged. **Phase 1 (this):** every rank holds the whole trunk pair; each pair
+update - both triangle multiplications (their blocked forms), row and column grid attention (their chunked forms)
+and the transition - computes this rank's share of its output rows or columns and the others' shares are copied in.
+The rest of the trunk runs whole on every rank (deterministic, so the copies stay identical); diffusion and confidence
+run on rank 0 after the trunk. CUDA graphs are off (a capture cannot hold a host barrier); chai-1, OpenDDE, `--serve`
+and repeated folds are refused by name. **Phase 2 (next):** the pair stored sharded - each rank its rows only, the
+triangle's `b` streamed between ranks, column work through all-to-all transposes - so a fold may exceed one card.
+
+Checked with the ranks sharing this one A100 (`LOCALFOLD_GPU_MAP=0,0`): 5CAJ self-templated 0.003 A from the
+single-GPU fold on 2 ranks (rf3 0.008); 1TIM dimer on 3 ranks, pLDDT/pTM/ipTM identical; 6MRR boltz2 0.022 A,
+intellifold2 0.007, protenix2 0.062. Speed is not measurable here (the ranks share one card and meet at every
+exchange); that waits on a real multi-GPU box.
+
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)
 
 Volta has no m16n8k8/k16 MMA, no `ldmatrix`, no `tanh.approx` and no f16 `ex2`, which every fused kernel here is

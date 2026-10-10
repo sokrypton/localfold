@@ -3,6 +3,7 @@
 // cpu/af3/trunk/pairformer.js; generic in channels, heads and head width.
 #pragma once
 #include "common.cuh"
+#include "multigpu.cuh"
 
 // Where a pair update adds its residual: its own input (nullptr, every model) or, for chai-1's parallel
 // block (trunk.cuh's parallelPairUpdates), the block's running sum - so an update reads the pair ENTERING the
@@ -506,8 +507,9 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
         };
         RectMap whole; whole.T = !outgoing;
         in(whole, cs, nullptr, b, nullptr);
-        for (int k0 = 0; k0 < n; k0 += width) {
-          int w = std::min(width, np - k0);
+        int lo, hi; mg::myShare(pair, np, 16, lo, hi);       // (multi-GPU: this rank's blocks)
+        for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
+          int w = std::min(width, hi - k0);
           const size_t rs = (size_t)w * np;
           if (outgoing) {
             // p[i][j] (i in the block) = sum_k a[i][k] b[j][k]
@@ -529,6 +531,7 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
     });
   });
   releaseScratch({ "trib." });
+  if (mg::splitting(pair)) mg::exchange(!outgoing, n, C, PAIR16 ? 2 : 4, np, 16);
 }
 inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
                                  bool divideByLength, int np) {
@@ -567,8 +570,9 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
             pair, mask, lnS, lnO, wt, ao, bo, t2o, n, np, cs, nullptr, rm);
         };
         in(RectMap{}, cs, nullptr, b, nullptr);
-        for (int k0 = 0; k0 < n; k0 += width) {
-          int w = std::min(width, np - k0);
+        int lo, hi; mg::myShare(pair, np, 8, lo, hi);        // (multi-GPU: this rank's blocks)
+        for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
+          int w = std::min(width, hi - k0);
           RectMap rm = outgoing ? RectMap{k0, np, 0, (size_t)w * np} : RectMap{0, w, k0, (size_t)np * w};
           in(rm, rm.size, a, nullptr, t2);
           if (outgoing) bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, w, np, alpha, b, np, cs, a, np, rm.size, prod, np, rm.size, C);
@@ -580,6 +584,7 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
     });
   });
   releaseScratch({ "trib." });
+  if (mg::splitting(pair)) mg::exchange(!outgoing, n, C, PAIR16 ? 2 : 4, np, 8);
 }
 template <class T>
 void triangleBlocked(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
@@ -619,8 +624,9 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   T* a = scratch<T>("trib.a", (size_t)width * np * C);
   float* prod = scratch<float>("trib.prod", (size_t)width * np * C);
   T* t1 = scratch<T>("trib.t1", per * C); T* t2 = scratch<T>("trib.t2", per * C);
-  for (int k0 = 0; k0 < n; k0 += width) {
-    int w = std::min(width, np - k0);
+  int lo, hi; mg::myShare(pair, np, 8, lo, hi);              // (multi-GPU: this rank's blocks)
+  for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
+    int w = std::min(width, hi - k0);
     TriRect r = outgoing ? TriRect{k0, w, 0, np} : TriRect{0, np, k0, w};
     operands(r, a, 0);
     if (outgoing)          // (as the whole contraction, with w output rows)
@@ -643,6 +649,7 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   // given back at once: the fixed operand is a plane, and the next stage (the MSA attention, the grid
   // attention) peaks beside the pair too - at these sizes a reallocation a call is nothing
   releaseScratch({ "trib." });
+  if (mg::splitting(pair)) mg::exchange(!outgoing, n, C, PAIR16 ? 2 : 4, np, 8);
 }
 template <class T>
 void triangle(float* pair, const float* mask, int n, int C, const std::string& pre, bool outgoing,
@@ -661,10 +668,11 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   // product and gate, five planes, would not fit with room to spare)
   // (whichever form runs gives back the other's buffers first: scratch outlives the call, so a whole form
   // taken while there was room would otherwise sit beside the blocks of the next call, which had none)
-  if (shortPair(pairs, C) || TIGHT_STACK) {
+  if (shortPair(pairs, C) || TIGHT_STACK || mg::splitting(pair)) {
     // (TIGHT_STACK: a narrower stack - the template's 64 channels - on a trunk short of room, where its own pair is
     // under the threshold but the card is not: its whole form, 1.5 GB at 1530 tokens, was what ran out)
-    if (TIGHT_STACK || !roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
+    // (multi-GPU: the blocked form, whose blocks the ranks share)
+    if (TIGHT_STACK || mg::splitting(pair) || !roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
       releaseScratch({ "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" });
       triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
       return;
@@ -1116,7 +1124,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // (the room asked for includes the triangle multiplication's whole form, five planes, which these
       // buffers would otherwise starve into its blocked form - see cuda/af2's twin)
       size_t triPlane = (size_t)((n + 7) / 8 * 8) * ((n + 7) / 8 * 8);
-      if (roomFor(((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
+      if (!mg::splitting(pair) && roomFor(((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
                   {"grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf",
                    "tri.pbf", "tri.t2whole"})) {
         // every row in one pass (this card has the memory): the bias written by the same kernel
@@ -1160,8 +1168,9 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row), spare = f > t / 16 ? f - t / 16 : 0;
         R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, 256)));
       }
-      for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
-        size_t rows = std::min(R, (size_t)n - r0), prs = rows * n;
+      int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);          // (multi-GPU: this rank's rows or columns)
+      for (size_t r0 = glo; r0 < (size_t)ghi; r0 += R) {
+        size_t rows = std::min(R, (size_t)ghi - r0), prs = rows * n;
         half* qkvgOut = scratch<half>("grid.qkvg", (std::min(R, (size_t)n) * n + 128) * 4 * Wd);   // padding: the last query block
         uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", std::min(R, (size_t)n) * n * 2 * Wd) : nullptr;
         gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr, nullptr, nullptr, 0, 0, false, kv8);
@@ -1172,6 +1181,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr);
       }
       releaseScratch({ "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });   // (the next triangle's blocks size themselves by what is free)
+      if (mg::splitting(pair)) mg::exchange(tr, n, C, PAIR16 ? 2 : 4, n, 1);
       return;
     }
   }
@@ -1218,8 +1228,9 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;
   size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
   float scale = 1.f / sqrtf((float)D);
-  for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
-    size_t rows = std::min(R, (size_t)n - r0), prs = rows * n;
+  int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);            // (multi-GPU: this rank's rows or columns)
+  for (size_t r0 = glo; r0 < (size_t)ghi; r0 += R) {
+    size_t rows = std::min(R, (size_t)ghi - r0), prs = rows * n;
     const T* act = streamNorm ? nullptr : norm + r0 * n * C;
     if (streamNorm) {
       T* g = scratch<T>("grid.act", prs * C);
@@ -1282,6 +1293,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
     if (outBias) addBiasK<<<blocks(prs * C), 256, 0, STREAM>>>(o, outBias, prs, C);
     WITH_PAIR_T(addGridK<PT, float><<<blocks(prs * C / 4), 256, 0, STREAM>>>(into(pair), o, n, C, r0, rows, tr && !RESIDUAL_UNTRANSPOSED));
   }
+  if (mg::splitting(pair)) mg::exchange(tr && !RESIDUAL_UNTRANSPOSED, n, C, PAIR16 ? 2 : 4, n, 1);
 }
 
 // Whether a pairformer stack can hold its pair in bf16 (PAIR16): every update it would run has a bf16 form - the
@@ -1325,6 +1337,11 @@ void pairUpdates(float* pair, const float* mask, int n, int C, const std::string
   gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); stage("grid.row");
   gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); stage("grid.col");
   if (releaseBetween) releaseScratch({ "grid." });
-  transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition"); stage("transition");
+  if (mg::splitting(pair)) {       // (multi-GPU: this rank's rows, then the others')
+    int lo, hi; mg::myShare(pair, n, 1, lo, hi);
+    transition<T>(pairRow(pair, (size_t)lo * n, C), (size_t)(hi - lo) * n, C, transitionFactor, pre + ".pairTransition");
+    mg::exchange(false, n, C, PAIR16 ? 2 : 4, n, 1);
+  } else transition<T>(pair, (size_t)n * n, C, transitionFactor, pre + ".pairTransition");
+  stage("transition");
   if (releaseBetween) releaseScratch({ "tr." });
 }
