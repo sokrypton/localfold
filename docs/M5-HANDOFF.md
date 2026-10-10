@@ -491,3 +491,16 @@ Near morning:
   writes rows 32 apart). With 64 floats a lane and a 128-channel transposing tile: 344 -> 329 ms a pass at 255
   tokens, because the registers cost occupancy. Not kept. IntelliFold-2 at 255 tokens is 7.5 s a trunk pass: its
   C 512 GEMMs run at 11-11.5 TFLOP/s, so it is simply big.
+- **4f4cb7c1**: chai-1's grouped outer product's permutes in 32-bit index arithmetic. 13.0 -> 1.0 ms a trunk pass at
+  68 tokens. Byte-identical.
+
+A sweep of every model's heaviest non-GEMM kernels at 255 tokens (5CAJ, one pass) finds no more 64-bit-division
+outliers. What remains, all bandwidth or scalar work:
+- the centre norms: 55-111 ms a pass at C 128-256, and 295-370 at OpenDDE's and IntelliFold-2's 384-512 (the wide
+  kernel; a register-resident one did not pay, above);
+- **chai-1's parallel pairformer copies the pair every block** (`copy(base, pair)`: `lf_copy` 66 ms a pass at 255
+  tokens, about 4%). Ping-pong buffers would remove it, but the first update must then run out of place (its last
+  GEMM reading C = the input and writing D = the other buffer; `lf_gemm_tensor_dual` reads D today). Not done;
+- **ESMFold2's atom windowed attention** (`ef2_swa`: scalar float, 54 ms over the sampler's 11 steps, about 1.6% of a
+  fold). Its K and V rows are gathered through `valid[]`, so the matrix units would need them staged. A fast exp
+  changed nothing.
