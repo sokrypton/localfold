@@ -1063,7 +1063,7 @@ __global__ void __launch_bounds__(256) fp8VtK(const uint8_t* __restrict__ V8, ui
 template <int WARPS, int BK, int MT, int RR>
 __global__ void __launch_bounds__(WARPS * RR * 32, 2) flash8(const half* __restrict__ qkvg, const uint8_t* __restrict__ K8,
     const uint8_t* __restrict__ Vt8, const half* __restrict__ bias, int biasStride, half* __restrict__ out, int n, int NK,
-    int heads, size_t rows, float scale, const float* __restrict__ qBias) {
+    int heads, size_t rows, float scale, const float* __restrict__ qBias, int sw) {
 #if LF_FP8_DEVICE
   constexpr int D = 32, BQ = 16 * MT * WARPS, NT = WARPS * RR * 32, NTR = WARPS * 32, LDB = BK + 8;
   constexpr int KROW = D, VROW = BK;                                  // bytes: a key's row, a dim's row of the tile
@@ -1073,10 +1073,20 @@ __global__ void __launch_bounds__(WARPS * RR * 32, 2) flash8(const half* __restr
   const int rg = (int)threadIdx.x / NTR, tr = (int)threadIdx.x % NTR;
   const int warp = tr >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
   const size_t perHead = (rows + RR - 1) / RR;
-  const size_t b = blockIdx.y; const int h = (int)(b / perHead); size_t rl = (b % perHead) * RR + rg;
+  // sw > 0: flashGrid2R's block order - one head's blocks walk sw row groups across each query tile, so the resident
+  // blocks share a bias tile once a head's bias is past the L2 (205 MB a head at 10,127 tokens, the 6000's L2 128):
+  // that fold's trunk pass 350 -> 296 s, byte-identical (--bench-grid at 8,000 tokens: sw 4 309 TFLOP/s against 0's 301)
+  unsigned b = blockIdx.y, qt = blockIdx.x;                          // (32-bit: a block count fits, and 64-bit spilled)
+  if (sw > 0) {
+    const unsigned nq = gridDim.x, ph = (unsigned)perHead, L = blockIdx.y * nq + blockIdx.x, phb = ph * nq;
+    const unsigned r = L % phb, group = r / (sw * nq), within = r % (sw * nq), left = ph - group * sw;
+    const unsigned gsz = left < (unsigned)sw ? left : (unsigned)sw;
+    b = (L / phb) * ph + group * sw + within % gsz; qt = within / gsz;
+  }
+  const int h = (int)(b / (unsigned)perHead); size_t rl = (size_t)(b % (unsigned)perHead) * RR + rg;
   const bool live = rl < rows; if (!live) rl = rows - 1;
   const int W = heads * D;
-  const int q0 = blockIdx.x * BQ;
+  const int q0 = (int)qt * BQ;
   auto Kst = [&](int s) { return smem + s * STAGE + (size_t)rg * (KT + VT); };
   auto Vst = [&](int s) { return Kst(s) + KT; };
   auto Bst = [&](int s) { return (half*)(smem + s * STAGE + (size_t)RR * (KT + VT)); };
@@ -1235,6 +1245,7 @@ inline bool fp8Attn() {
   }();
   return on;
 }
+inline int FP8_SWIZZLE = getenv("LOCALFOLD_FP8_SWIZZLE") ? atoi(getenv("LOCALFOLD_FP8_SWIZZLE")) : -1;
 // the attention from qkvg's q and gate (f16, [row][pos][4W]) and K8, V8 (e4m3, [row][pos][W] - gridInK's kv8)
 inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, const half* bias, int stride, half* out, int n,
                       int heads, size_t rows, float scale, const float* qBias) {
@@ -1248,7 +1259,8 @@ inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, co
   static bool attr = false;
   if (!attr) { smemAttr((flash8<WARPS, BK, MT, RR>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
-  flash8<WARPS, BK, MT, RR><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias);
+  flash8<WARPS, BK, MT, RR><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias,
+                                                                  FP8_SWIZZLE >= 0 ? FP8_SWIZZLE : n >= 3500 ? 4 : 0);
 }
 inline int FLASH_WARPS_OVERRIDE = 0;
 // F16S (flashGridHalf): the unmasked kernel's scores in f16 - LOCALFOLD_FLASH_F16S=1 (being measured)

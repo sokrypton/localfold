@@ -1384,7 +1384,10 @@ latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a
 (With the triangle's contraction in FP8 - docs/EF2FAST.md, "FP8 for the triangle's contraction" - the same fold's
 trunk pass is 362 s and the whole fold 414 s. The grid attention in FP8 as well - flash.cuh's flash8, e4m3 MMAs with
 k and v written e4m3 by the projection - takes a 2,964-token trunk pass 11.18 -> 9.82 s and a 988-token one 750 -> 707
-ms on the same card, 5CAJ, 1BRS and 1TIM self-templated within 0.001 A of the f16 folds; 10,127 tokens not re-measured.)
+ms on the same card, 5CAJ, 1BRS and 1TIM self-templated within 0.001 A of the f16 folds - and, with flashGrid2R's block
+order (a head's bias is 205 MB there, past the L2), the 10,127-token fold's trunk pass 362 -> **296 s** and the fold 414 ->
+**343 s**, CA-CA median 3.665 A. AlphaFold 2's triangle attention takes the same kernel: a 988-residue multimer's attention
+967 -> 773 ms (+65 of the transpose), 5CAJ self-templated 0.206 A either way.)
 
 
 **Measured**, not by the rule: 41 chains of 1TIM, 10,127 tokens, on a G4 session's RTX PRO 6000 Blackwell Server

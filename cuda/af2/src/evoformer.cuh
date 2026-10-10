@@ -1069,6 +1069,9 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
   CK(cudaMemsetAsync(bias, 0, (size_t)H * L * stride * 2, STREAM));                // the padding columns
   const float* mask = pairOnes ? nullptr : pairMask;
   float scale = 1.f / sqrtf((float)w.D);
+  // FP8 attention where the card has it (cuda/af3's flash8Run): k and v written e4m3 by the projection
+  const bool f8 = w.Dp == 32 && !mask && fp8Attn();
+  const size_t f8Row = f8 ? (size_t)3 * Wp : 0;            // (k8, v8 and the transposed v: bytes an element)
   // every row in one pass whenever the card has the room for its q/k/v/gate and output (what they already
   // hold counted, so each pass decides alike) - not below a fixed 32nd of the card: at 1,566 residues
   // 17.43 -> 16.43 s, at 2,088 35.80 -> 34.19 s (peak 7.9 -> 10.7 and 12.0 -> 17.1 GB on 40 GB); the
@@ -1077,12 +1080,14 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
   // stay held while it runs, and starved of them it blocks - at 2,610 residues the one-pass grid took the
   // memory and the fold went 63.7 -> 104.4 s
   size_t triPlane = (size_t)((L + 7) / 8 * 8) * ((L + 7) / 8 * 8);
-  if (roomFor(((pairs + 128) * 4 * Wp + pairs * Wp) * 2 + 5 * triPlane * C * 2,
-              {"fatt.qkvg", "fatt.o", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf"})) {
+  if (roomFor(((pairs + 128) * 4 * Wp + pairs * Wp) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
+              {"fatt.qkvg", "fatt.o", "fatt.kv8", "attn.vt8", "ftri.a", "ftri.b", "ftri.t2", "ftri.prod", "ftri.xn", "ftri.og", "ftri.out", "ftri.abf", "ftri.bbf", "ftri.pbf"})) {
     half* qkvg = scratch<half>("fatt.qkvg", (pairs + 128) * 4 * Wp);
-    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr);
+    uint8_t* kv8 = f8 ? scratch<uint8_t>("fatt.kv8", pairs * 2 * Wp) : nullptr;
+    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, 0, pairs, tr, Wb, bias, H, stride, tr, kv8);
     half* o = scratch<half>("fatt.o", pairs * Wp);
-    flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, 0, L, tr, scale);
+    if (f8) flash8Run(qkvg, kv8, kv8 + pairs * Wp, bias, stride, o, L, H, L, scale, nullptr);
+    else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, 0, L, tr, scale);
     // (the row direction's GEMM accumulates into an f32 pair; a bf16 pair takes gridOutK in both directions -
     // an f16 product and an add pass were 6-10 ms slower a 494-residue fold)
     if (!tr && !PAIR16) ltGemm(o, w.out, pair, false, pairs, Wp, C, ob, false, 1.f);
@@ -1102,10 +1107,12 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, int
   size_t R = std::max<size_t>(1, std::min<size_t>(L, AF2_CHUNK / ((size_t)L * 4 * Wp)));
   half* qkvg = scratch<half>("fatt.qkvg", (R * L + 128) * 4 * Wp);
   half* o = scratch<half>("fatt.o", R * L * Wp);
+  uint8_t* kv8 = f8 ? scratch<uint8_t>("fatt.kv8", R * L * 2 * Wp) : nullptr;
   for (size_t b0 = 0; b0 < (size_t)L; b0 += R) {
     size_t bc = std::min(R, (size_t)L - b0), rows = bc * L;
-    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, b0 * L, rows, tr);
-    flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, b0, bc, tr, scale);
+    gridInRaw(pair, lnS, lnO, w.qkvg, w.qkvgBias, qkvg, L, b0 * L, rows, tr, nullptr, nullptr, 0, 0, false, kv8);
+    if (f8) flash8Run(qkvg, kv8, kv8 + rows * Wp, bias, stride, o, L, H, bc, scale, nullptr);
+    else flashGrid<half>(qkvg, bias, stride, mask, o, L, H, w.Dp, b0, bc, tr, scale);
     if (!tr && !PAIR16) ltGemm(o, w.out, pair + b0 * L * C, false, rows, Wp, C, ob, false, 1.f);
     else gridOutRaw(o, w.out, ob, pair, L, b0 * L, rows, tr);
   }
