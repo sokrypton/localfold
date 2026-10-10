@@ -748,8 +748,11 @@ void attention(const Attention& t) {
                          std::to_string(t.D) + ", " + std::to_string(TQB) + ", " + std::to_string(TKT) +
                          (ver == 3 ? (t.qBias ? ", true" : ", false") : "") + ">(constant AttnArgs&, uint3, uint, uint, uint);";
       const int qb = two ? 4 * TQB : TQB;
+      std::string lab = "attention";
+      if (D().profileOn) lab += " v" + std::to_string(ver) + " n " + std::to_string(t.n) + " H " + std::to_string(t.heads) + " D " +
+                                std::to_string(t.D) + " x " + std::to_string(t.rows);
       dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)((t.n + qb - 1) / qb), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0,
-                       "attention");
+                       lab.c_str());
       return;
     }
   }
@@ -758,7 +761,9 @@ void attention(const Attention& t) {
   if (!k) die("attention: no kernel for a head %d wide", t.D);
   if (t.rows > 65535 * 64) die("attention: %zu rows", t.rows);
   const int QB = 32;
-  dispatch(k, &a, sizeof a, Grid{(uint32_t)((t.n + QB - 1) / QB), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0, "attention");
+  std::string lab = "attention";
+  if (D().profileOn) lab += " lf n " + std::to_string(t.n) + " H " + std::to_string(t.heads) + " D " + std::to_string(t.D) + " x " + std::to_string(t.rows);
+  dispatch(k, &a, sizeof a, Grid{(uint32_t)((t.n + QB - 1) / QB), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0, lab.c_str());
 }
 
 // ---------------------------------------------------------------- common kernels
