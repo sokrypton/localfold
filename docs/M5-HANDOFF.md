@@ -278,3 +278,23 @@ alternated; block ms, the stack of 48 in brackets):
   `--enable-unsafe-webgpu`, which no visitor has, two rounds, and inside the drift this file warns about. **Not
   changed**: a 2% flagged-only gain does not earn a second Apple entry. Worth one more interleaved round if the
   flag ever ships.
+
+### After the report - two more (144d2be2)
+
+A profile of boltz2's 255-token 5CAJ trunk pass found two leftovers:
+
+- **Half-output GEMMs that asked for float accumulation** (`linW`'s half outputs: the grid's qkvg and kin) were taking
+  a float cooperative tensor, which forced the staged path and a 64 x 64 tile. The matrix units sum a run wider than
+  half and round once, so a half output now always takes a half destination. 512 x 65025 x 128 + bias: 1.41 -> 0.86
+  ms. In the fold, grid qkvg went from 234 to 115 ms a pass, with CA coordinates identical to the PDB's 0.001 A.
+- **Tensor attention's cutoff, 256 -> 168 keys.** 5CAJ's 255 tokens sat just under the old one. n 255 D 32: 3.87 ->
+  3.06 ms; n 192: 1.68 -> 1.39; n 168: 1.35 -> 1.20. It still loses at 160 (D 64 1.74 -> 1.87: a 64-query block
+  half empty). Wider tiles lose: n 255 D 32 at 64 x 32 takes 3.06 ms, 64 x 64 takes 3.56, 128 x 32 takes 4.43
+  (`LOCALFOLD_ATTN_TILE`).
+
+boltz2 5CAJ fold: 5.11 -> 4.83 s from the GEMM alone (interleaved x3). All 29 gates pass. AF3 6MRR in the gate:
+1.97 -> 1.77 s.
+
+What the trunk pass spends now (255 tokens, 1.78 s GPU): attention 24%, the triangle gate 12%, layernorm 8%, the
+pair transition's SwiGLU 7%, gated add 6%, qkvg 6%. The attention runs at 2.8 TFLOP/s against the GEMMs' 10. A
+rewrite of it (softmax in registers rather than threadgroup rows, the bias tile shared) is the next big item.
