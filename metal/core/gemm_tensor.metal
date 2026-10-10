@@ -385,19 +385,14 @@ kernel void lf_attention_tensor2(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
 // the logits' layout, the row maximum and sum (and the rescale) kept in the logits' row-reduction tensors and mapped
 // onto the logits' and the output's elements by their iterators, and P handed to the second product as a cooperative
 // left input. (Compatibilities probed on the M5: the half logits as P.V's left input; logits -> rows; output -> the
-// logits' rows.)
-template <int D, int QS = 16, int KT = 64>
-kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
-                                 uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]]) {
+// logits' rows.) A q bias stages the simdgroup's Q + bias once, in half, in threadgroup memory (QBIAS instances).
+template <int D, int QS, int KT, class MQ>
+METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa, device const half* base) {
   using namespace mpp::tensor_ops;
-  constexpr int QB = 4 * QS;
-  const int b = tg.y, h = tg.z, n = a.n, W = a.heads * D, qa = tg.x * QB + sg * QS;
-  device const half* base = a.qkvg + (long)b * a.rowStride + h * D;
+  const int n = a.n, W = a.heads * D;
   const float qs = a.scale * M_LOG2E_F;
   typedef dextents<int32_t, 2> E2;
   const int32_t ps = (int32_t)a.posStride;
-  tensor<device half, E2, tensor_inline> tQ((device half*)base, E2(D, n), array<int32_t, 2>{1, ps});
   tensor<device half, E2, tensor_inline> tK((device half*)base + W, E2(D, n), array<int32_t, 2>{1, ps});
   tensor<device half, E2, tensor_inline> tV((device half*)base + 2 * W, E2(D, n), array<int32_t, 2>{1, ps});
   tensor<device half, E2, tensor_inline> tB((device half*)(a.bias ? a.bias + (long)h * n * a.biasStride : a.qkvg), E2(n, n),
@@ -406,15 +401,14 @@ kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
   constexpr auto dO = matmul2d_descriptor(QS, D, KT, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<dS, execution_simdgroup> opS;
   matmul2d<dO, execution_simdgroup> opO;
-  auto mQ = tQ.slice(0, qa);
   auto mK0 = tK.slice(0, 0); auto mV0 = tV.slice(0, 0);
-  auto S = opS.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
-  auto Sh = opS.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK0), half>();
-  auto Bh = opS.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK0), half>();
-  auto M = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
-  auto L = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
-  auto C = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
-  auto R = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
+  auto S = opS.template get_destination_cooperative_tensor<MQ, decltype(mK0), float>();
+  auto Sh = opS.template get_destination_cooperative_tensor<MQ, decltype(mK0), half>();
+  auto Bh = opS.template get_destination_cooperative_tensor<MQ, decltype(mK0), half>();
+  auto M = opS.template get_row_reduction_destination_cooperative_tensor<MQ, decltype(mK0), float>();
+  auto L = opS.template get_row_reduction_destination_cooperative_tensor<MQ, decltype(mK0), float>();
+  auto C = opS.template get_row_reduction_destination_cooperative_tensor<MQ, decltype(mK0), float>();
+  auto R = opS.template get_row_reduction_destination_cooperative_tensor<MQ, decltype(mK0), float>();
   auto P0 = opO.template get_left_input_cooperative_tensor<half, half, float>(Sh);
   auto O = opO.template get_destination_cooperative_tensor<decltype(P0), decltype(mV0), float>();
   _Pragma("clang loop unroll(full)")
@@ -467,4 +461,29 @@ kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
           (half)(O[e] / *L.map_iterator(O.get_iterator(e)) * (1.f / (1.f + exp(-g))));
     }
 }
-// (instantiated on first use: lf_attention_tensor3<D, QS, KT>, host name gemmt_attn3_<D>_<QS>x<KT>)
+template <int D, int QS = 16, int KT = 64, bool QBIAS = false>
+kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  const int b = tg.y, h = tg.z, n = a.n, qa = tg.x * 4 * QS + sg * QS;
+  device const half* base = a.qkvg + (long)b * a.rowStride + h * D;
+  typedef dextents<int32_t, 2> E2;
+  if constexpr (QBIAS) {
+    threadgroup half Qs[4 * QS * D];
+    threadgroup half* Qm = Qs + sg * QS * D;
+    constexpr int D4 = D / 4;
+    for (int e = lane; e < QS * D4; e += 32) {
+      const int qi = e / D4, d = (e - qi * D4) * 4, q = qa + qi;
+      half4 v = half4(0);
+      if (q < n) v = half4(float4(*(device const half4*)(base + (long)q * a.posStride + d)) + *(device const float4*)(a.qBias + h * D + d));
+      *(threadgroup half4*)(Qm + qi * D + d) = v;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    tensor<threadgroup half, E2, tensor_inline> tQ(Qm, E2(D, QS), array<int32_t, 2>{1, D});
+    lf_attn3_body<D, QS, KT>(a, tQ, b, h, qa, base);
+  } else {
+    tensor<device half, E2, tensor_inline> tQ((device half*)base, E2(D, n), array<int32_t, 2>{1, (int32_t)a.posStride});
+    lf_attn3_body<D, QS, KT>(a, tQ.slice(0, qa), b, h, qa, base);
+  }
+}
+// (instantiated on first use: lf_attention_tensor3<D, QS, KT, QBIAS>, host name gemmt_attn3[q]_<D>_<QS>x<KT>)

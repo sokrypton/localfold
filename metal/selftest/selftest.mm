@@ -174,7 +174,8 @@ int main() {
   printf("attention\n");
   for (auto cfg : std::vector<std::tuple<int, int, int, int, bool, bool, bool>>{
          {3, 37, 4, 32, true, false, false}, {2, 70, 8, 8, false, true, false}, {2, 130, 2, 16, true, true, false},
-         {3, 37, 4, 32, true, true, true}, {1, 261, 16, 48, true, false, false}, {2, 64, 4, 64, false, false, false}}) {
+         {3, 37, 4, 32, true, true, true}, {1, 261, 16, 48, true, false, false}, {2, 64, 4, 64, false, false, false},
+         {2, 100, 4, 32, true, true, true}}) {
     int B = std::get<0>(cfg), n = std::get<1>(cfg), H = std::get<2>(cfg), D = std::get<3>(cfg);
     bool withBias = std::get<4>(cfg), withMask = std::get<5>(cfg), strided = std::get<6>(cfg);
     int W = H * D;

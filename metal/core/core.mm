@@ -697,19 +697,24 @@ void attention(const Attention& t) {
   if (D().tensorOps && (t.D == 16 || t.D == 32 || t.D == 48 || t.D == 64)) {
     const char* e = getenv("LOCALFOLD_ATTN_TENSOR");
     const char* v2 = getenv("LOCALFOLD_ATTN_V2");
-    const bool v2auto = t.n >= 48;
-    const bool two = !t.qBias && (v2 ? atoi(v2) != 0 : !e || strcmp(e, "0") != 0 ? v2auto : false);
-    const int ver = two ? (v2 && atoi(v2) < 3 ? 2 : 3) : 1;
+    // the version: LOCALFOLD_ATTN_V2 unset - v3 from 48 keys (where the tensor kernels are on); 0 - v1; 1 or 2 - v2
+    // (no q bias: v1 there); 3 - v3
+    const int mode = v2 ? atoi(v2) : -1;
+    const bool tensorOn = !e || strcmp(e, "0") != 0;
+    int ver = mode < 0 ? (tensorOn && t.n >= 48 ? 3 : 1) : mode == 0 ? 1 : mode < 3 ? 2 : 3;
+    if (ver == 2 && t.qBias) ver = 1;
+    const bool two = ver > 1;
     const bool on = e ? strcmp(e, "0") != 0 : two || (t.n >= ATTN_TENSOR_MIN_N && t.D >= 32);
     if (on) {
       int TQB = 64, TKT = 32;
       if (two) { TQB = 16; TKT = (t.n % 64 == 0 || t.n % 64 > 32) && !(ver == 3 && t.D == 16) ? 64 : 32; }   // (v2's first number: queries a simdgroup)
       if (const char* tt = getenv("LOCALFOLD_ATTN_TILE")) sscanf(tt, "%dx%d", &TQB, &TKT);
-      const char* stem = ver == 3 ? "gemmt_attn3_" : ver == 2 ? "gemmt_attn2_" : "gemmt_attn_";
+      const char* stem = ver == 3 ? (t.qBias ? "gemmt_attn3q_" : "gemmt_attn3_") : ver == 2 ? "gemmt_attn2_" : "gemmt_attn_";
       const char* fn = ver == 3 ? "lf_attention_tensor3<" : ver == 2 ? "lf_attention_tensor2<" : "lf_attention_tensor<";
       std::string name = std::string(stem) + std::to_string(t.D) + "_" + std::to_string(TQB) + "x" + std::to_string(TKT);
       std::string decl = "template [[host_name(\"" + name + "\")]] kernel void " + fn +
-                         std::to_string(t.D) + ", " + std::to_string(TQB) + ", " + std::to_string(TKT) + ">(constant AttnArgs&, uint3, uint, uint, uint);";
+                         std::to_string(t.D) + ", " + std::to_string(TQB) + ", " + std::to_string(TKT) +
+                         (ver == 3 ? (t.qBias ? ", true" : ", false") : "") + ">(constant AttnArgs&, uint3, uint, uint, uint);";
       const int qb = two ? 4 * TQB : TQB;
       dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)((t.n + qb - 1) / qb), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0,
                        "attention");
