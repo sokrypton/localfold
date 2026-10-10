@@ -1233,6 +1233,13 @@ const PRIORS = new Map([
     // in halves and takes the q.k dot four products at a time in f16; the softmax statistics and the output stay f32.
     gridAttendTiled: true,
     gridAttendTiledHalf: true,
+    // 🔴 THE TRIANGLE'S PROJECTION TILE AT 32x32, AMPERE'S, MEASURED ON AN M5 UNDER STOCK FLAGS. bench-triangle-project
+    // at 255 tokens: project 5.06 -> 4.79 ms, project-out 3.26 -> 2.91, contract untouched, relRMS 0 (the tile
+    // reorders no sum). AF3 int5's 255-token trunk pass, three rounds interleaved: tri.project-out 278 / 292 / 295 ->
+    // 234 / 239 / 239 ms, tri.project 342 / 359 / 364 -> 335 / 342 / 344, the pass's GPU 3179 / 3305 / 3344 -> 3197 /
+    // 3259 / 3301. A wider output tile (outColumns 64) took project-out 10-18 ms further and the pass did not follow.
+    // Not measured on an M2.
+    trianglePairProjectTile: { rows: 32, columns: 32 },
   }],
 ], );
 
