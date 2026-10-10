@@ -230,6 +230,10 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
             _Pragma("clang loop unroll(full)")
             for (int t = 0; t < 2; ++t) {
               float va = g.alpha * (float)ea[t], vb = g.alpha * (float)eb[t];
+              if (g.epilogue & 4) {      // (a folded LayerNorm's bias, f32, in the interleaved order)
+                const int i = i0 + sc + b * 8 + ((lane / 8) % 2) * 4 + (lane % 2) * 2 + t;
+                va += ((device const float*)g.bias)[i]; vb += ((device const float*)g.bias)[i + 8];
+              }
               o[t] = (TC)(va / (1.f + exp(-va)) * vb);
             }
             simdgroup_store(om, D + (ulong)(j0 + sr + a * 8) * g.ldd + (i0 + sc + b * 8) / 2, (ulong)g.ldd);
@@ -316,6 +320,7 @@ kernel void lf_gemm(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_
               int i = i0 + sc + b * 8 + sn + t;
               if (i + 8 < g.m) {
                 float va = g.alpha * (float)e[t], vb = g.alpha * (float)eb[t];
+                if (g.epilogue & 4) { va += ((device const float*)g.bias)[i]; vb += ((device const float*)g.bias)[i + 8]; }
                 lf_st(D, (ulong)((i >> 4) * 8 + (i & 7)) + (ulong)j * g.ldd, va / (1.f + exp(-va)) * vb);
               }
             }

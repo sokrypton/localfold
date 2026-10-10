@@ -732,12 +732,13 @@ bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, 
   gemmTensorRun(F16, a, 1, true, "opm product, permuted");
   return true;
 }
-void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden) {
+void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias) {
   if (hidden % 8) die("gemmSwiglu: a hidden width of %d is not a multiple of 8", hidden);
   GemmArgs a{};
   a.A = (uint64_t)Wpairs; a.B = (uint64_t)X; a.C = a.D = (uint64_t)gated;
   a.m = 2 * hidden; a.n = (int)rows; a.k = in; a.lda = 2 * hidden; a.ldb = in; a.ldc = a.ldd = hidden;
   a.epilogue = 128; a.alpha = 1.f;
+  if (bias) { a.bias = (uint64_t)bias; a.epilogue |= 4; }     // (f32, in the pairs' interleaved order: a folded norm's)
   gemmRun(F16, F16, F16, a, 1, false, false, "swiglu");
 }
 bool triQuartersApply(int C) {

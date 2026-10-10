@@ -149,6 +149,12 @@ void gridAttention(float* pair, const Masks& m, int n, int C, const std::string&
 }
 
 // ---------------------------------------------------------------- transition
+// chai's transitions on the shared norm: the affine folded into the weights (LOCALFOLD_FOLD_TRANSITION=0, the control: an
+// affine pass over the rows first)
+static bool foldTransition() {
+  static const bool on = !getenv("LOCALFOLD_FOLD_TRANSITION") || atoi(getenv("LOCALFOLD_FOLD_TRANSITION")) != 0;
+  return on;
+}
 // LN -> SwiGLU in the first GEMM's epilogue -> the second GEMM adding into x; in row chunks
 void transition(float* x, size_t rows, int C, const std::string& pre, float* into, const std::string& next1,
                 const std::string& next2) {
@@ -162,13 +168,19 @@ void transition(float* x, size_t rows, int C, const std::string& pre, float* int
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
     half* in = r0 == 0 && r == rows ? takeEmitted(x, pre + ".inputLayerNorm") : nullptr;
-    if (const half* xs = in ? nullptr : sharedNorm(x)) {    // (chai's shared input norm: this norm's affine on its rows)
-      run1d("af3_affine_h", r * C, AffineHArgs{xs + r0 * C, xn, W(pre + ".inputLayerNormScale"), Wopt(pre + ".inputLayerNormOffset"),
-                                              (u64)(r * C), (uint)C, 0});
-      in = xn;
+    const half* xs = in ? nullptr : sharedNorm(x);
+    if (xs && foldTransition()) {     // (chai's shared input norm: this norm's affine folded into the SwiGLU's weights)
+      Folded f = foldNorm("tr:" + pre, wp, C, 2 * I, pre + ".inputLayerNorm", nullptr);
+      gemmSwiglu(xs + r0 * C, f.w, g, r, C, I, f.b);
+    } else {
+      if (xs) {      // (the control: the affine on its rows)
+        run1d("af3_affine_h", r * C, AffineHArgs{xs + r0 * C, xn, W(pre + ".inputLayerNormScale"), Wopt(pre + ".inputLayerNormOffset"),
+                                                (u64)(r * C), (uint)C, 0});
+        in = xn;
+      }
+      if (!in) { ln(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset"); in = xn; }
+      gemmSwiglu(in, wp, g, r, C, I);
     }
-    if (!in) { ln(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset"); in = xn; }
-    gemmSwiglu(in, wp, g, r, C, I);
     // the pair's next norms (next1 into pr.x, next2 into pr.x2 - both free once the SwiGLU has read its input)
     if (!next1.empty() && !into && r == rows && C == 128 && hasW(next1 + "Scale") && (next2.empty() || hasW(next2 + "Scale"))) {
       Gemm G{}; G.X = g; G.tx = F16; G.W = Wh(pre + ".transition2"); G.tw = F16; G.Y = x; G.rows = r; G.in = I; G.out = C;

@@ -129,7 +129,7 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
 // leading dimensions ldl, ldr), stored permuted into X [(i, j)][(c, e)] by the epilogue - on the matrix units only
 // (false: nothing run, the caller's GEMM and permute; LOCALFOLD_OPM_PERMUTED=0 the control)
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S);
-void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden);
+void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias = nullptr);
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);
 // the matrix units' layout of that weight (and bias): each 128 columns 32 channels' pa, then ga, pb, gb - where

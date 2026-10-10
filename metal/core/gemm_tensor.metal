@@ -258,6 +258,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         const int j = j0 + jl, i = i0 + il;
         if (j >= g.n || i + 8 >= g.m) continue;
         float va = g.alpha * (float)tile[jl * TN + il], vb = g.alpha * (float)tile[jl * TN + il + 8];
+        if (g.epilogue & 4) { va += ((device const float*)g.bias)[i]; vb += ((device const float*)g.bias)[i + 8]; }
         lf_st(D, (ulong)((i >> 4) * 8 + (i & 7)) + (ulong)j * g.ldd, fast::divide(va, 1.f + fast::exp(-va)) * vb);
       }
       return;
