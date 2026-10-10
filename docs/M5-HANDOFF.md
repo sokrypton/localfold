@@ -379,3 +379,44 @@ dispatches. Batching samples would amortize the weights.
 
 **Caution for profiling small folds**: `LOCALFOLD_PROFILE=1` gives every dispatch its own command buffer. At 68
 tokens that turns a 1.76 s diffusion into 5.46 s; use it for proportions only.
+
+### Overnight, continued: loading, the MSA kernels, small folds
+
+The gate's folds carry one MSA row and warm weights, which hid a family of bugs: **64-bit integer division**. The
+GPU emulates it slowly. Several kernels split a 64-bit thread index into coordinates with `/` and `%` on `ulong`
+once per element. Each fix below keeps the 64-bit path for ranges past 2^32 (none at these sizes) and is
+byte-identical against HEAD's binary.
+
+| commit | kernel | measured |
+|---|---|---|
+| 54f7cd24 | `lf_decode` (the bundle decoder) | weights load: AF3 int5 178 -> 96 ms, boltz2 ~360 -> ~200, protenix2 455 -> 175 |
+| 4269f04f | `lf_gather` (the weight walk's parts); `lf_copy2d` 16 bytes a thread | ESMFold2 loads in 0.13 s, not 0.36; its sampler's copy2d 25.8 -> 2.4 ms |
+| 3197fce0 | `af2_opm_permute`, `af3_msa_v_heads`, `af3_opm_permute`, the OPMs' left operands | AF2 with a 1500-row MSA: 4.79 -> 4.35 s a pass; boltz2's trunk pass with it 1.68 -> 1.43 s |
+| 2eadafef | the AF3 MSA attention's head permutes, 16 bytes a thread | 46 -> 26 ms a pass |
+| ca6c6dc4 | `lf_pad_zero` | 104 -> 14 ms a pass at 510 tokens |
+
+The MSA numbers come from a synthetic alignment: 1500 random variants of 5CAJ, 30% substituted. Any real a3m will do;
+the gate has none offline.
+
+Also:
+- **b0dd3f5b, the diffusion transformer's conditioning for K noise levels at once.** It depends on the level
+  alone, and the sampler knows its levels, so at a short n the two conditioning GEMMs read their 170 MB of
+  weights once for K steps. AF3 6MRR: 1.71 -> 1.64 s, byte-identical.
+- **274b76ec, a float X allowed half staging goes to the matrix units.** ESMFold2's sampler: 347 -> 265 ms.
+- **fb6c1a71**: the profile now labels each attention by version and shape.
+
+Where a big fold spends its time (boltz2, 1020 tokens, a trunk pass of 30.8 s; the fold 71 s, peak 5.96 GB):
+attention 37% (11.4 s, 6.5 TFLOP/s), LayerNorm 8%, the triangle gate 7%, SwiGLU 6%, the gated add 6%, qkvg 6%, the
+two triangle contractions 11% at 10.5 TFLOP/s.
+
+More that **lost**:
+- **Attention v3 software-pipelined** (the next tile's Q.K issued before this tile's softmax, two logit tensors):
+  11-20% slower. **Its row statistics by hand** (two shuffles over lanes ^ 1 and ^ 8, rather than `reduce_rows` and
+  `map_iterator`): level. **P written straight into a left-input tensor** (it shares the logits' layout): level.
+  The kernel is bound by occupancy and its serial tile chain; the MPP helpers cost nothing extra.
+- **LayerNorm, 4 rows a simdgroup** (every load issued before the first reduction): 2-12% on a cold bench, level in
+  folds, where the pair arrives from cache.
+- **AF3's per-step diffusion kernels in 32-bit division** (`af3_gather_rows`, the encoder and decoder broadcasts):
+  level. They are latency-bound, about 20-65 us a dispatch.
+
+Fixed on the way: ESMFold2 crashed on `--out=/dev/null` (e2ffe387).
