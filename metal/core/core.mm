@@ -526,9 +526,12 @@ bool tensorWanted() {
 }
 void gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* label) {
   static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") && strcmp(getenv("LOCALFOLD_GEMM_FLOAT_ACC"), "0") != 0;
-  const bool hacc = !floatAcc && !accFloat && tc_ == F16;      // (lf_gemm's choice: the all-half GEMMs accumulate in half)
+  // a half output takes a half destination even where the caller asked for float accumulation: the matrix units sum a
+  // whole run wider than half and round once on the way out (6MRR's and 5CAJ's folds unchanged to the PDB's 0.001 A;
+  // 512 x 65025 x 128 with a bias 0.86 ms against 1.41 into a float destination - the float tile's register cost)
+  const bool hacc = !floatAcc && tc_ == F16;
   const bool tri = a.epilogue & 256;
-  const bool plain = !tri && (a.epilogue & ~6) == 0 && a.alpha == 1.f && a.beta == 0.f && (tc_ == F16) == hacc;
+  const bool plain = !tri && (a.epilogue & ~6) == 0 && a.alpha == 1.f && a.beta == 0.f;
   // the tile: TM rows along n by TN columns along m. A short n (up to 128) in one tile row, rounded up to 16, 64 columns
   // where the weight is wide enough to fill the GPU (3072 x 80 x 768: 0.064 ms at 80 x 64 against 0.078 at 80 x 128) and
   // 32 where not (768 x 80 x 768: 0.062 against 0.075); a taller n 64 x 128 (512 x 68121 x 128 half: 0.93 ms against
@@ -655,10 +658,11 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, ha
 }
 
 // ---------------------------------------------------------------- attention
-// from 256 keys, heads 32 wide or more: below, lf_attention's registers win. Measured on an M5 (8-core GPU), interleaved,
-// lf_attention -> tensor: n 261 H 4 D 32 x 261 rows 4.68 -> 4.18 ms, n 512 3.83 -> 2.86, n 1044 2.06 -> 1.60; level at D 48
-// and 64; worse at D 16 (n 261: 3.06 -> 3.77) and at n 68 (0.153 -> 0.182)
-static const int ATTN_TENSOR_MIN_N = 256;
+// from 168 keys, heads 32 wide or more: below, lf_attention's registers win. Measured on an M5 (8-core GPU), interleaved,
+// lf_attention -> tensor: n 261 H 4 D 32 x 261 rows 4.68 -> 4.18 ms, n 512 3.83 -> 2.86, n 1044 2.06 -> 1.60; n 255 D 32
+// 3.87 -> 3.06, D 64 6.82 -> 5.86; n 192 D 32 1.68 -> 1.39; n 168 D 32 1.35 -> 1.20, D 64 2.36 -> 2.24; level at n 200-208
+// D 64; worse at n 160 (D 64 1.74 -> 1.87: a query block 64 tall half empty), at D 16 (n 261: 3.06 -> 3.77) and n 68-96
+static const int ATTN_TENSOR_MIN_N = 168;
 void attention(const Attention& t) {
   if (!t.rows || !t.n) return;
   int W = t.heads * t.D;
@@ -677,10 +681,11 @@ void attention(const Attention& t) {
     const char* e = getenv("LOCALFOLD_ATTN_TENSOR");
     const bool on = e ? strcmp(e, "0") != 0 : t.n >= ATTN_TENSOR_MIN_N && t.D >= 32;
     if (on) {
-      const int TQB = 64;
-      std::string name = "gemmt_attn_" + std::to_string(t.D);
+      int TQB = 64, TKT = 32;
+      if (const char* tt = getenv("LOCALFOLD_ATTN_TILE")) sscanf(tt, "%dx%d", &TQB, &TKT);
+      std::string name = "gemmt_attn_" + std::to_string(t.D) + "_" + std::to_string(TQB) + "x" + std::to_string(TKT);
       std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_attention_tensor<" + std::to_string(t.D) +
-                         ">(constant AttnArgs&, uint3, uint, uint, uint);";
+                         ", " + std::to_string(TQB) + ", " + std::to_string(TKT) + ">(constant AttnArgs&, uint3, uint, uint, uint);";
       dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)((t.n + TQB - 1) / TQB), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0,
                        "attention");
       return;

@@ -5,7 +5,7 @@
 //
 // The product is matmul2d's, into a cooperative tensor of the accumulator's type (half where EP bit 8 asks, as lf_gemm's
 // all-half instances accumulate, else float). A plain product - a bias, a ReLU, alpha 1 and beta 0, the output in the
-// accumulator's type - is adjusted in place and stored by the tensor itself; every other epilogue stages the tile in
+// accumulator's type or converted on the way out - is adjusted in place and stored from the tensor; every other epilogue stages the tile in
 // threadgroup memory and applies lf_gemm's arithmetic to it an element at a time, coalesced along the output's row.
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -50,7 +50,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
   // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1, beta 0, the output in the
   // accumulator's type) - adjusted in place and stored by the tensor (bounds against D's extents), no staging tile
   if constexpr ((EP & 2) != 0) {
-    static_assert(metal::is_same_v<TC, TACC> && (EP & 1) == 0, "a plain product is stored in the accumulator's type");
+    static_assert((EP & 1) == 0, "a plain product has no triangle gate");
     {
       if (g.epilogue) {
         _Pragma("clang loop unroll(full)")
@@ -63,9 +63,19 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
             c[e] = (TACC)v;
           }
       }
-      tensor<device TC, E2, tensor_inline> tD(D, E2(g.m, g.n), array<int32_t, 2>{1, g.ldd});
-      auto mD = tD.slice(i0, j0);
-      c.store(mD);
+      if constexpr (metal::is_same_v<TC, TACC>) {
+        tensor<device TC, E2, tensor_inline> tD(D, E2(g.m, g.n), array<int32_t, 2>{1, g.ldd});
+        auto mD = tD.slice(i0, j0);
+        c.store(mD);
+      } else {   // (the tensor stores only its own type: a float accumulator into a half output an element at a time)
+        _Pragma("clang loop unroll(full)")
+        for (uint16_t e = 0; e < c.get_capacity(); ++e)
+          if (c.is_valid_element(e)) {
+            const auto ix = c.get_multidimensional_index(e);
+            const int i = i0 + ix[0], j = j0 + ix[1];
+            if (i < g.m && j < g.n) D[(ulong)i + (ulong)j * g.ldd] = (TC)c[e];
+          }
+      }
     }
   } else {
   // every other epilogue: the tile staged, then lf_gemm's arithmetic an element at a time
@@ -241,4 +251,4 @@ kernel void lf_attention_tensor(constant AttnArgs& a [[buffer(0)]], uint3 tg [[t
       a.out[(long)b * a.outRowStride + (long)q * a.outPosStride + h * D + d] = (half)(O[e] / L[ix[1]] * (1.f / (1.f + exp(-g))));
     }
 }
-// (instantiated on first use: lf_attention_tensor<D>, host name gemmt_attn_<D>)
+// (instantiated on first use: lf_attention_tensor<D, QB, KT>, host name gemmt_attn_<D>_<QB>x<KT>)
