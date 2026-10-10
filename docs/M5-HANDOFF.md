@@ -504,3 +504,17 @@ outliers. What remains, all bandwidth or scalar work:
 - **ESMFold2's atom windowed attention** (`ef2_swa`: scalar float, 54 ms over the sampler's 11 steps, about 1.6% of a
   fold). Its K and V rows are gathered through `valid[]`, so the matrix units would need them staged. A fast exp
   changed nothing.
+
+### Morning summary (2026-10-10)
+
+- **Head of `metal`**: eb5ccd1c and its docs. All 29 gates, the selftest, `test:native` (offline, no AF3, no page) and
+  `test:bridge` pass on it.
+- **Folds vs the start of the night**, alternated: 10-21% faster across AF3, boltz2, chai1, AF2 (with and without an
+  MSA) and ESMFold2. Weights load 1.7-2.6x faster. The table is under "The night, end to end".
+- **What carried it**: attention v3 (the online softmax in cooperative tensors, about 2.8x the original kernel), the
+  triangle gate and the GEMM epilogues in registers, fast math in those epilogues, and the 64-bit-division class of
+  bug in the loader, MSA and permute kernels. Also the diffusion conditioning batched across noise levels, and the
+  triangle's tail as one dual GEMM.
+- **What is left**, each needing a real project: int8-resident weights with a dequantising GEMM (the small-fold floor
+  is weight reads); the pair LayerNorm emitted by the previous GEMM's epilogue (~3%); and attention itself (6-7
+  TFLOP/s; MPP's single-simdgroup rule for cooperative inputs blocks the obvious bigger tiles).
