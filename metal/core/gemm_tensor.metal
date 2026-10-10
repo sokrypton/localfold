@@ -66,8 +66,8 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       const float m = mask[g.tgR0 + jg];
       uint p = (uint)(g.tgR0 + jg), r = lf_udiv(p, (uint)g.tgN);
       ulong q = (ulong)r * g.tgNp + (p - r * (uint)g.tgN);
-      outA[(ulong)ch * g.tgPairs + q] = (half)(vpa * m / (1.f + exp(-vga)));
-      outB[(ulong)ch * g.tgPairs + q] = (half)(vpb * m / (1.f + exp(-vgb)));
+      outA[(ulong)ch * g.tgPairs + q] = (half)fast::divide(vpa * m, 1.f + fast::exp(-vga));
+      outB[(ulong)ch * g.tgPairs + q] = (half)fast::divide(vpb * m, 1.f + fast::exp(-vgb));
     }
     return;
   }
@@ -92,7 +92,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         if (g.epilogue & 4) v += bv;
         const float4 ax = float4(*(device const half4*)((device const half*)g.aux + (ulong)i + (ulong)j * g.ldaux));
         const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-        *(device vec<TC, 4>*)dp = vec<TC, 4>(cv + ax * (1.f / (1.f + exp(-v))));
+        *(device vec<TC, 4>*)dp = vec<TC, 4>(cv + ax * fast::divide(1.f, 1.f + fast::exp(-v)));
         continue;
       }
       if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
@@ -169,7 +169,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         const int j = j0 + jl, i = i0 + il;
         if (j >= g.n || i + 8 >= g.m) continue;
         float va = g.alpha * (float)tile[jl * TN + il], vb = g.alpha * (float)tile[jl * TN + il + 8];
-        lf_st(D, (ulong)((i >> 4) * 8 + (i & 7)) + (ulong)j * g.ldd, va / (1.f + exp(-va)) * vb);
+        lf_st(D, (ulong)((i >> 4) * 8 + (i & 7)) + (ulong)j * g.ldd, fast::divide(va, 1.f + fast::exp(-va)) * vb);
       }
       return;
     }
@@ -179,7 +179,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       float v = g.alpha * (float)tile[t];
       if (g.epilogue & 64) {      // a gated residual: the GEMM is the gate, aux the gated values, D the residual
         if (g.epilogue & 4) v += ((device const float*)g.bias)[i];
-        v = (float)((device const half*)g.aux)[(ulong)i + (ulong)j * g.ldaux] * (1.f / (1.f + exp(-v)));
+        v = (float)((device const half*)g.aux)[(ulong)i + (ulong)j * g.ldaux] * fast::divide(1.f, 1.f + fast::exp(-v));
         lf_st(D, (ulong)i + (ulong)j * g.ldd, lf_ldf(C + (ulong)i + (ulong)j * g.ldc) + v);
         continue;
       }
@@ -471,7 +471,7 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
     _Pragma("clang loop unroll(full)")
     for (uint16_t e = 0; e < S.get_capacity(); ++e)
       if (S.is_valid_element(e)) {
-        const float pv = exp2(S[e] - *M.map_iterator(S.get_iterator(e)));
+        const float pv = fast::exp2(S[e] - *M.map_iterator(S.get_iterator(e)));
         S[e] = pv; Sh[e] = (half)pv;
       }
     reduce_rows(S, R, reduction_operation::sum, 0.f);
@@ -493,7 +493,7 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
         if (q >= n) continue;
         const float4 g = float4(*(device const half4*)(base + (long)q * a.posStride + 3 * W + d));
         const float il = 1.f / *L.map_iterator(O.get_iterator(e));
-        const float4 o = float4(O[e], O[e + 1], O[e + 2], O[e + 3]) * il * (1.f / (1.f + exp(-g)));
+        const float4 o = float4(O[e], O[e + 1], O[e + 2], O[e + 3]) * il * fast::divide(1.f, 1.f + fast::exp(-g));
         *(device half4*)(a.out + (long)b * a.outRowStride + (long)q * a.outPosStride + h * D + d) = half4(o);
       }
     return;
