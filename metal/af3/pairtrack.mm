@@ -14,8 +14,8 @@ static void* bigBuffer(size_t bytes) { return scratchBytes("pr.big", bytes); }
 
 half* biasLayout(const float* raw, const std::string& name, int n, int heads, int stride, bool swap) {
   half* bias = scratch<half>(name, (size_t)heads * n * stride);
-  run1d("af3_bias_layout", (size_t)heads * n * stride,
-        BiasLayoutArgs{raw, bias, (uint)n, (uint)stride, (uint)heads, swap ? 1u : 0u, (uint)heads, 0, (float)M_LOG2E, 0});
+  const BiasLayoutArgs a{raw, bias, (uint)n, (uint)stride, (uint)heads, swap ? 1u : 0u, (uint)heads, 0, (float)M_LOG2E, 0};
+  run("af3_bias_layout", Grid{(uint32_t)((stride + 31) / 32), (uint32_t)((n + 31) / 32), 1}, 256, a);
   return bias;
 }
 

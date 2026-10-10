@@ -116,13 +116,30 @@ kernel void af3_scatter_rows(LF_ARGS(ScatterRowsArgs)) {
 }
 
 // ---------------------------------------------------------------- attention biases
-kernel void af3_bias_layout(LF_ARGS(BiasLayoutArgs)) {
-  ulong t = LF_INDEX;
-  if (t >= (ulong)a.heads * a.n * a.stride) return;
-  uint r = lf_udiv((uint)t, a.stride), j = (uint)t - r * a.stride, h = lf_udiv(r, a.n), i = r - h * a.n;
-  float v = 0.f;
-  if (j < a.n) v = a.scale * a.raw[(a.swap ? (ulong)j * a.n + i : (ulong)i * a.n + j) * a.ld + a.off + h];
-  a.bias[t] = (half)v;
+// a 32 x 32 tile of (i, j) a threadgroup through threadgroup memory: the raw scores read along their own rows (one
+// thread an element, the swapped direction's reads were n x ld floats apart: 140 -> 31 ms a trunk pass at 510 tokens),
+// every head in turn (the later heads' lines cached)
+kernel void af3_bias_layout(constant BiasLayoutArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float tile[32][33];
+  const uint j0 = tg.x * 32, i0 = tg.y * 32, tx = tid & 31, ty = tid >> 5;     // 32 x 8 threads
+  for (uint h = 0; h < a.heads; ++h) {
+    // read: the source row s0 + r, column c0 + tx - (i, j) unswapped, (j, i) swapped
+    const uint s0 = a.swap ? j0 : i0, c0 = a.swap ? i0 : j0;
+    for (uint r = ty; r < 32; r += 8) {
+      const uint sr = s0 + r, sc = c0 + tx;
+      tile[r][tx] = sr < a.n && sc < a.n ? a.raw[((ulong)sr * a.n + sc) * a.ld + a.off + h] : 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = ty; r < 32; r += 8) {
+      const uint i = i0 + r, j = j0 + tx;
+      if (i < a.n && j < a.stride) {
+        const float v = j < a.n ? (a.swap ? tile[tx][r] : tile[r][tx]) : 0.f;
+        a.bias[((ulong)h * a.n + i) * a.stride + j] = (half)(a.scale * v);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
 }
 
 // ---------------------------------------------------------------- the MSA stack

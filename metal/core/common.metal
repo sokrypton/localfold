@@ -51,14 +51,15 @@ kernel void lf_copy2d(LF_ARGS(Copy2DArgs)) {
   a.dst[y * a.dpitch + x] = a.src[y * a.spitch + x];
 }
 kernel void lf_pad_zero(LF_ARGS(PadZeroArgs)) {
-  ulong i = LF_INDEX;
-  const ulong per = (ulong)a.np * a.np - (ulong)a.n * a.n;
-  if (i >= a.planes * per) return;
-  const ulong pl = i / per, r = i - pl * per, tail = (ulong)(a.np - a.n) * a.np;
-  ulong pos;
-  if (r < tail) pos = (ulong)a.n * a.np + r;                                    // rows n..np-1, whole
-  else { const ulong k = r - tail, w = a.np - a.n; pos = (k / w) * a.np + a.n + k % w; }   // rows ..n-1, columns n..
-  a.dst[pl * a.np * a.np + pos] = 0.h;
+  // (32-bit index arithmetic: the GPU's 64-bit division is slow - 104 ms a trunk pass at 510 tokens with it)
+  const uint i = (uint)LF_INDEX, np = a.np, n = a.n, w = np - n;
+  const uint per = np * np - n * n;
+  if ((ulong)i >= a.planes * per) return;
+  const uint pl = i / per, r = i - pl * per, tail = w * np;
+  uint pos;
+  if (r < tail) pos = n * np + r;                                    // rows n..np-1, whole
+  else { const uint k = r - tail, kr = k / w; pos = kr * np + n + (k - kr * w); }   // rows ..n-1, columns n..
+  a.dst[(ulong)pl * np * np + pos] = 0.h;
 }
 
 kernel void lf_tri_quarters(LF_ARGS(TriQuartersArgs)) {

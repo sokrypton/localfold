@@ -204,7 +204,7 @@ static void prepareTransformer(int n) {
   for (int b = 0; b < D.nblocks; ++b) {
     if (b % D.perSuper == 0) lin(pn, T + ".superBlocks." + num(b / D.perSuper) + ".pairLogitsProjection", flat, pairs, Cz, D.perSuper * heads);
     D.bias[b] = scratch<half>("dt.bias" + num(b), (size_t)heads * n * D.stride);
-    run1d("af3_bias_layout", (size_t)heads * n * D.stride,
+    run("af3_bias_layout", Grid{(uint32_t)((D.stride + 31) / 32), (uint32_t)((n + 31) / 32), 1}, 256,
           BiasLayoutArgs{flat, D.bias[b], (uint)n, (uint)D.stride, (uint)heads, 0, (uint)(D.perSuper * heads), (uint)((b % D.perSuper) * heads),
                          (float)M_LOG2E, 0});
   }
