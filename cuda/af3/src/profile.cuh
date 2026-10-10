@@ -45,7 +45,10 @@ inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_
       first = std::min<uint64_t>(first, k->start); last = std::max<uint64_t>(last, k->end);
     } else if (on && GAPS && record->kind == CUPTI_ACTIVITY_KIND_MEMCPY) {   // (copies: idle to a kernel table, not to a gap)
       auto* m = (CUpti_ActivityMemcpy5*)record;
-      spans.push_back({m->start, m->end, "[copy]"});
+      static const char* kinds[] = { "?", "HtoD", "DtoH", "HtoA", "AtoH", "AtoA", "AtoD", "DtoA", "DtoD", "HtoH", "PtoP" };
+      const int kd = m->copyKind < 11 ? (int)m->copyKind : 0;
+      const char* sz = m->bytes < (1 << 12) ? "<4K" : m->bytes < (1 << 20) ? "<1M" : m->bytes < (64 << 20) ? "<64M" : ">64M";
+      spans.push_back({m->start, m->end, std::string("[copy ") + kinds[kd] + " " + sz + "]"});
       copyNs += (double)(m->end - m->start);
     } else if (on && GAPS && record->kind == CUPTI_ACTIVITY_KIND_MEMCPY2) {
       auto* m = (CUpti_ActivityMemcpyPtoP4*)record;

@@ -1426,6 +1426,54 @@ pinned host memory where the card was short (9 GB each at 5,928 tokens, eight at
 diffusion's preparation - it is freed there now. At 741 tokens the diffusion goes 429 -> 267 ms on 2 ranks and 932 ->
 530 on 4, every structure identical to the digit. The 10,127-token fold on all eight was not run to the end.
 
+#### Toward N times faster on N GPUs, measured on ONE (2026-10-10)
+
+`LOCALFOLD_MG_SIMULATE=1` with `--gpus=N` runs rank 0 of N alone on this one GPU - every peer's buffer its own, a
+peer copy a copy on the card, a fence nothing - so the fold is wrong and its TIMES are one rank's compute at the real
+shapes in the real memory (one rank of 8 on this 40 GB A100 is one rank of the rented 8 x A100 exactly). What it cannot
+see is the interconnect. Against the box: at 2,964 tokens a simulated rank of 8 computed the trunk in 3.44 s where the
+box took 6.17, so ~2.7 s of that were exchanges and their synchronisation - and the per-rank compute itself was 6.0x.
+What came of measuring that way, each change gated against the one-GPU fold on 2 and 3 ranks sharing this A100
+(5CAJ self-templated 0.003-0.009 A, the 1TIM dimer 0.014-0.015, boltz2 0.026, protenix2 0.002, rf3 0.006-0.009, if2 0.014):
+
+- **The triangle split by CHANNEL, not row.** Its contraction is independent per channel, so a rank pulls its
+  channels' whole a and b planes from every rank, runs the one-GPU GEMM shape, and pushes each rank its rows of the
+  product. The row ring received (W-1)/W of the whole b a triangle (1.97 GB at 2,964 tokens on 8; 0.74 now) and its
+  371-row stages filled cuBLAS's 256-row tiles to 72%. The incoming form then runs on z itself (the GEMM's operands
+  turned): two of a block's four transposes gone. Channel groups pipeline - a group's pulls and the last's pushes,
+  both kernels reading or writing peers directly, beside its GEMM on two more streams.
+- **Fences on the device** (`arriveAndWaitK`): a stream writes its arrival into every rank's flags and waits for
+  theirs - no drain, no host round trip, their generation counted on the device so CUDA graphs can hold them. A
+  watchdog thread a rank ends the process when a peer dies (a fence waits in a kernel, where no host loop would see).
+- **Fewer, larger things**: the attention's bias fused into its input pass where a rank's rows fit; every exchange
+  that was a copy a peer a kernel reading them all (the triangle's were ~9,700 copies a 2,964-token pass, the bias's
+  ~2,700, each ~17 us of launch the GPU waited through); a sharded op's scratch held across blocks (giving it back
+  synchronised the device four times a block).
+- **The diffusion split by TOKEN** (one sample, from 512 tokens - `LOCALFOLD_MG_SHARD_DIFFUSION=0/1` forces):
+  every per-token step on a rank's own rows, k and v gathered a block; the atom encoder and decoder on a rank's own
+  subsets and a halo of one key window's reach a block (nothing exchanged inside them); the steps as CUDA graphs.
+  Before, every rank ran the per-token GEMMs - as much time as the attention - for every token.
+- **10,127 tokens fit eight 40 GB ranks** (the trunk peaks at 31.9 GB a rank, a pass 86.6 s); boltz2 and rf3 fold
+  again - their confidence heads have no sharded form, so their pair is gathered to rank 0 for it (refused up front
+  where it would not fit one GPU).
+
+| simulated rank of 8 (this A100) | one GPU | rank of 8 | x |
+|---|---:|---:|---:|
+| 2,964 tokens, trunk pass | 20.76 s | 2.83 s | 7.3 |
+| 2,964 tokens, 200 steps | 4.12 s | 1.07 s | 3.9 |
+| 2,964 tokens, confidence | 1.74 s | 0.34 s | 5.1 |
+| 2,964 tokens, default fold (4 passes, 200 steps) | ~89 s | ~12.9 s | ~6.9 |
+| 5,928 tokens, trunk pass | 152.8 s (the box) | 18.3 s | 8.4 |
+| 988 tokens, default fold | 6.28 s | 1.47 s | 4.3 |
+
+Not seen here, and what the next box should measure: NVLink's share - the two transposes a block (2 x 7/8 of a slab,
+~2.5 ms a block at 2,964 tokens), the triangle's pulls and pushes (overlapped with its GEMMs, which may or may not hide
+them), the fences' latency (~25 a diffusion step). On the box: `sudo nvidia-smi -pm 1` first (persistence mode - run5's
+start-up, outside the fold's own clock, grew 6.0 -> 10.0 s from one GPU to eight, the likeliest cause each GPU's cold
+initialisation), then `python3 tools/check-multigpu.py --sizes=4,12,24 --big=41` (correctness on 1 vs 8, scaling over
+1/2/4/8, and the 10,127-token fold), and `--full` for the default 3 recycles and 200 steps. `LOCALFOLD_MG_TIMES=1` prints
+each phase past the trunk; `--profile` with `LOCALFOLD_PROF_GAPS=20` the kernels, the copies and the idle by what ended it.
+
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)
 
 Volta has no m16n8k8/k16 MMA, no `ldmatrix`, no `tanh.approx` and no f16 `ex2`, which every fused kernel here is
