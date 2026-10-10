@@ -987,16 +987,27 @@ kernel void af3_chai_msa_embed(LF_ARGS(ChaiMsaEmbedArgs)) {
 }
 kernel void af3_group_major(LF_ARGS(GroupMajorArgs)) {
   ulong t = LF_INDEX;
-  if (t >= (ulong)a.S * a.n * a.G * a.K) return;
-  uint k = (uint)(t % a.K); ulong r = t / a.K; uint i = (uint)(r % a.n); r /= a.n; uint s = (uint)(r % a.S), g = (uint)(r / a.S);
+  const ulong total = (ulong)a.S * a.n * a.G * a.K;
+  if (t >= total) return;
+  uint k, i, s, g;   // (32-bit division where the index fits: the 64-bit one is slow)
+  if (total <= 0xffffffffull) {
+    uint r = lf_udiv((uint)t, a.K); k = (uint)t - r * a.K; uint r2 = lf_udiv(r, a.n); i = r - r2 * a.n; g = lf_udiv(r2, a.S); s = r2 - g * a.S;
+  } else { k = (uint)(t % a.K); ulong r = t / a.K; i = (uint)(r % a.n); r /= a.n; s = (uint)(r % a.S); g = (uint)(r / a.S); }
   a.out[t] = a.x[(((ulong)s * a.n + i) * a.G + g) * a.K + k];
 }
 kernel void af3_grouped_permute(LF_ARGS(GroupedPermuteArgs)) {
   ulong t = LF_INDEX;
   ulong per = (ulong)a.G * a.K * a.K;
-  if (t >= (ulong)a.bi * a.n * per) return;
-  uint l = (uint)(t % a.K); ulong r = t / a.K; uint k = (uint)(r % a.K); r /= a.K; uint g = (uint)(r % a.G); r /= a.G;
-  uint j = (uint)(r % a.n), i = (uint)(r / a.n);
+  const ulong total = (ulong)a.bi * a.n * per;
+  if (t >= total) return;
+  uint l, k, g, j, i;   // (32-bit division where the index fits: the 64-bit one is slow)
+  if (total <= 0xffffffffull) {
+    uint r = lf_udiv((uint)t, a.K); l = (uint)t - r * a.K; uint r2 = lf_udiv(r, a.K); k = r - r2 * a.K;
+    uint r3 = lf_udiv(r2, a.G); g = r2 - r3 * a.G; i = lf_udiv(r3, a.n); j = r3 - i * a.n;
+  } else {
+    l = (uint)(t % a.K); ulong r = t / a.K; k = (uint)(r % a.K); r /= a.K; g = (uint)(r % a.G); r /= a.G;
+    j = (uint)(r % a.n); i = (uint)(r / a.n);
+  }
   a.out[t] = a.P[(ulong)g * ((ulong)a.bi * a.K * a.n * a.K) + (((ulong)i * a.K + k) * a.n + j) * a.K + l];
 }
 kernel void af3_scale_h(LF_ARGS(ScaleHArgs)) {
