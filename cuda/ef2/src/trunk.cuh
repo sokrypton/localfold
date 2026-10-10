@@ -188,7 +188,7 @@ inline void triangle256As(float* pair, const float* mask, int L, int C, const st
   triangleOut<4>(prod, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"), Fh(Tn + "outputProjection"), t2, pair, L, Lp);
 }
 inline bool bf16Mma() {          // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
-  static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+  static int major = ccMajor();
   return major >= 8;
 }
 inline void triangle256(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing) {

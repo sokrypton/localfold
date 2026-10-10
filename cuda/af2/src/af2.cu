@@ -353,7 +353,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     mark("extra stack"); memReport("extra stack");
     // the main stack's MSA in bf16 through its blocks (MSA16, evoformer.cuh)
     {
-      static const int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+      static const int major = ccMajor();
       std::string q = "evoformer/evoformer_iteration/msa_row_attention_with_pair_bias/attention/query_w";
       std::string qc = "evoformer/evoformer_iteration/msa_column_attention/attention/query_w";
       MSA16 = FAST && !check && t.msaOnes && major >= 8 && !flashRegStaged() && !getenv("LOCALFOLD_MSA_F32") &&

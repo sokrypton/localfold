@@ -177,8 +177,7 @@ static int foldMain(int argc, char** argv) {
                  b + (2 << 20), CUDA_R_32F, 256, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, 512, 256, 128, &one, b, CUDA_R_32F, 512, b + (1 << 20), CUDA_R_32F, 128, &zero,
                  b + (2 << 20), CUDA_R_32F, 512, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    int cc = 0; cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, 0);
-    if (cc >= 8)      // (bf16: the fused triangle's contraction, Ampere on - a T4 runs the unfused path)
+    if (ccMajor() >= 8)      // (bf16: the fused triangle's contraction, Ampere on - a T4 runs the unfused path)
       cublasGemmStridedBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N, 96, 96, 96, &one, b, CUDA_R_16BF, 96, 9216, b + (1 << 20),
                                  CUDA_R_16BF, 96, 9216, &zero, b + (2 << 20), CUDA_R_16BF, 96, 9216, 8, CUBLAS_COMPUTE_32F,
                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP);

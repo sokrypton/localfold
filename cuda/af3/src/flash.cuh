@@ -20,12 +20,39 @@ inline bool MASK_ALL_ONES = false;
 // fragments (a0 a1 / b0 the first eight k, a2 a3 / b1 the second - the accumulation order the k16
 // instruction uses), and a copy is a 16-byte load and shared store (the kernels' barriers already
 // order it: commit and wait become nothing)
+// Volta (sm_70, a V100) has neither m16n8k8 nor ldmatrix: the m16n8k8 below is computed from the operand fragments by
+// warp shuffles (each thread gathers its two rows of A from its own quad and its two columns of B from the quads that
+// hold them, f32 sums) - the same fragments and results as the instruction, without the tensor cores. Not inlined:
+// a call each, where inlined into the unrolled kernels the device code grew ~50x and cicc ran past 35 minutes
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+__device__ __noinline__ void mma1688Emu(float* acc, uint32_t a0, uint32_t a1, uint32_t b) {
+  const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    uint32_t ar0 = __shfl_sync(~0u, a0, g * 4 + s), ar1 = __shfl_sync(~0u, a1, g * 4 + s);
+    uint32_t bc0 = __shfl_sync(~0u, b, (2 * t) * 4 + s), bc1 = __shfl_sync(~0u, b, (2 * t + 1) * 4 + s);
+    float2 x0 = __half22float2(*reinterpret_cast<__half2*>(&ar0)), x1 = __half22float2(*reinterpret_cast<__half2*>(&ar1));
+    float2 y0 = __half22float2(*reinterpret_cast<__half2*>(&bc0)), y1 = __half22float2(*reinterpret_cast<__half2*>(&bc1));
+    acc[0] = fmaf(x0.x, y0.x, fmaf(x0.y, y0.y, acc[0])); acc[1] = fmaf(x0.x, y1.x, fmaf(x0.y, y1.y, acc[1]));
+    acc[2] = fmaf(x1.x, y0.x, fmaf(x1.y, y0.y, acc[2])); acc[3] = fmaf(x1.x, y1.x, fmaf(x1.y, y1.y, acc[3]));
+  }
+}
+__device__ __noinline__ void mma1688hEmu(uint32_t* d, uint32_t a0, uint32_t a1, uint32_t b) {
+  float2 r0 = __half22float2(*reinterpret_cast<__half2*>(&d[0])), r1 = __half22float2(*reinterpret_cast<__half2*>(&d[1]));
+  float acc[4] = {r0.x, r0.y, r1.x, r1.y};
+  mma1688Emu(acc, a0, a1, b);
+  __half2 h0 = __floats2half2_rn(acc[0], acc[1]), h1 = __floats2half2_rn(acc[2], acc[3]);
+  d[0] = *reinterpret_cast<uint32_t*>(&h0); d[1] = *reinterpret_cast<uint32_t*>(&h1);
+}
+#endif
 __device__ __forceinline__ void mma16816(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#elif __CUDA_ARCH__ < 750
+  mma1688Emu(d, a[0], a[1], b0); mma1688Emu(d, a[2], a[3], b1);
 #else
   asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
                "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
@@ -40,6 +67,8 @@ __device__ __forceinline__ void mma16816h(uint32_t* d, const uint32_t* a, uint32
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
                : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#elif __CUDA_ARCH__ < 750
+  mma1688hEmu(d, a[0], a[1], b0); mma1688hEmu(d, a[2], a[3], b1);
 #else
   asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};"
                : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(b0));
@@ -88,15 +117,47 @@ template <int N> __device__ __forceinline__ void cpWait() {
   asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
 #endif
 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+__device__ __noinline__ void ldsm4Emu(uint32_t* r, uint32_t a) {
+  const int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int m = 0; m < 4; ++m) {
+    uint32_t row = __shfl_sync(~0u, a, 8 * m + (lane >> 2)) + (lane & 3) * 4;
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(r[m]) : "r"(row) : "memory");
+  }
+}
+__device__ __noinline__ void ldsm4tEmu(uint32_t* r, uint32_t a) {
+  const int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int m = 0; m < 4; ++m) {
+    uint32_t r0 = __shfl_sync(~0u, a, 8 * m + 2 * (lane & 3)) + (lane >> 2) * 2;
+    uint32_t r1 = __shfl_sync(~0u, a, 8 * m + 2 * (lane & 3) + 1) + (lane >> 2) * 2;
+    unsigned short lo, hi;
+    asm volatile("ld.shared.b16 %0, [%1];" : "=h"(lo) : "r"(r0) : "memory");
+    asm volatile("ld.shared.b16 %0, [%1];" : "=h"(hi) : "r"(r1) : "memory");
+    r[m] = (uint32_t)lo | ((uint32_t)hi << 16);
+  }
+}
+#endif
+// (Volta: the rows' addresses shuffled from the lanes that name them, then 32-bit shared loads - or, transposed, two
+// 16-bit loads from consecutive rows - giving each thread the registers ldmatrix gives it)
 __device__ __forceinline__ void ldsm4(uint32_t* r, const void* p) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  ldsm4Emu(r, a);
+#else
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");
+#endif
 }
 __device__ __forceinline__ void ldsm4t(uint32_t* r, const void* p) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  ldsm4tEmu(r, a);
+#else
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");
+#endif
 }
 
 constexpr int FA_BK = 64;
@@ -109,7 +170,13 @@ template <int D, int WARPS, int BK = FA_BK> __host__ __device__ constexpr size_t
 // (a protein with no padding - the mask is all ones), so no mask is loaded or added and only the
 // last tile masks the keys past n (3-7% of this kernel).
 __device__ __forceinline__ uint32_t ex2h2(uint32_t x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750                     // (Volta: no f16 ex2 - two f32 ones)
+  float2 v = __half22float2(*reinterpret_cast<__half2*>(&x));
+  __half2 h = __floats2half2_rn(exp2f(v.x), exp2f(v.y));
+  return *reinterpret_cast<uint32_t*>(&h);
+#else
   uint32_t y; asm("ex2.approx.f16x2 %0, %1;" : "=r"(y) : "r"(x)); return y;
+#endif
 }
 constexpr uint32_t ONES_H2 = 0x3C003C00u;      // half2(1, 1)
 // REG: the next key tile staged in REGISTERS while this one is computed, then stored into the one shared
@@ -1271,8 +1338,7 @@ inline bool FLASH_SPLIT = true;
 inline bool flashRegStaged() {
   static int v = [] {
     if (const char* e = getenv("LOCALFOLD_FLASH_REG")) return atoi(e);
-    int dev, major; CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
-    return major < 8 ? 1 : 0;
+    return ccMajor() < 8 ? 1 : 0;
   }();
   return v != 0;
 }

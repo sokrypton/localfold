@@ -340,7 +340,7 @@ template <int CC, int WI, class TA, class PT = float> constexpr auto triIn256For
   else return triIn256K<CC, WI, TA, 1, false, PT>;
 }
 inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
-  static int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+  static int major = ccMajor();
   return major >= 8;
 }
 

@@ -1379,6 +1379,19 @@ The flash kernel itself is now two thirds of a pass (163 of 247 s at 6,916 token
 block, key tiles of 32-80 and a bias-sharing order are all level or behind at 6,000 tokens - in Nsight Compute it is
 latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a pass is ~12 minutes by n^3.
 
+### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)
+
+Volta has no m16n8k8/k16 MMA, no `ldmatrix`, no `tanh.approx` and no f16 `ex2`, which every fused kernel here is
+written on. Below `__CUDA_ARCH__` 750 flash.cuh computes the MMA from the fragments by warp shuffles and loads
+`ldmatrix`'s registers by shuffled addresses (both `__noinline__`: inlined into the unrolled kernels, cicc ran past
+35 minutes; called, the build is 5.4). Checked on the A100 by building `LOCALFOLD_CUDA_ARCHS=70` (the compute_70 PTX
+the driver compiles here - a V100 itself runs its own SASS, no JIT) and running with `LOCALFOLD_EMULATE_CC=70
+LOCALFOLD_SMEM_LIMIT=98304`, which makes every host-side choice a V100's (`ccOf` in common.cuh): 5CAJ self-templated
+0.171 A against the crystal, 0.009 A from the native fold; 6MRR 0.165 A from it. 🔴 It is SLOW: that trunk is 10.7 s
+against 0.47 on the same card, 80% in flashGrid2R, fusedTransitionK, triInK and gridInK - a V100 would want m8n8k4
+helpers (its own tensor-core instruction) or cuBLAS paths in place of those four. AF2 and ESMFold2 share the helpers
+and have not been built for sm_70.
+
 ### 🔴 10,127 tokens on Colab's RTX PRO 6000: 7.4 minutes, 6.9 with FP8 (2026-10-09)
 
 (With the triangle's contraction in FP8 - docs/EF2FAST.md, "FP8 for the triangle's contraction" - the same fold's

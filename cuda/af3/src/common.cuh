@@ -1214,13 +1214,24 @@ inline void unparkFromHost(float*& dev, size_t bytes) {
   CK(cudaMemcpyAsync(dev, PARK_HOST, bytes, cudaMemcpyHostToDevice, STREAM));
 }
 #include <cuda_fp8.h>
+// The device's compute capability (major * 10 + minor), which every host-side choice of kernel family reads -
+// LOCALFOLD_EMULATE_CC=<cc> answers as an older card, to rehearse its paths on this one (=70: a V100's, with the
+// binary built for compute_70 so the driver runs the sm_70 device code here; pair it with LOCALFOLD_SMEM_LIMIT)
+inline int ccOf() {
+  static const int cc = [] {
+    if (const char* e = getenv("LOCALFOLD_EMULATE_CC")) return atoi(e);
+    int d, ma, mi; CK(cudaGetDevice(&d));
+    CK(cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, d)); CK(cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, d));
+    return ma * 10 + mi;
+  }();
+  return cc;
+}
+inline int ccMajor() { return ccOf() / 10; }
 // FP8 tensor instructions (Ada and Blackwell: compute capability 8.9 on; an A100 has none). LOCALFOLD_FP8=0 keeps bf16
 inline bool fp8Tensor() {
   static const bool on = [] {
     if (getenv("LOCALFOLD_FP8") && !atoi(getenv("LOCALFOLD_FP8"))) return false;
-    int d, ma, mi; CK(cudaGetDevice(&d));
-    CK(cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, d)); CK(cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, d));
-    return ma * 10 + mi >= 89;
+    return ccOf() >= 89;
   }();
   return on;
 }
@@ -1557,7 +1568,11 @@ __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x))
 // (~4e-3 relative). The transition, triangle-input and triangle-output kernels' sigmoids (ncu: 11-18% of
 // their stall samples); a 5CAJ fold moves 0.006 A rms
 __device__ __forceinline__ float sigmH(float x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750                     // (Volta: no tanh.approx)
+  return 1.f / (1.f + __expf(-x));
+#else
   float t; asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(0.5f * x)); return fmaf(0.5f, t, 0.5f);
+#endif
 }
 
 // The fast path's remaining f32 GEMMs (the conditioning, the atom blocks' aggregation and

@@ -743,10 +743,9 @@ inline void triangleBlocked2(float* pair, const float* mask, int L, int C, const
 inline bool af2Wide128() {
   static const bool wide128 = [] {
     if (const char* e = getenv("LOCALFOLD_TRI128")) return std::string(e) == "wide";
-    int dev, perSm = 0, major = 0; CK(cudaGetDevice(&dev));
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-    CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
-    return perSm >= 96 * 1024 && major >= 8;     // (an RTX PRO 6000's ~100 KB too: cuda/af3's pairtrack.cuh)
+    return perSm >= 96 * 1024 && ccMajor() >= 8;     // (an RTX PRO 6000's ~100 KB too: cuda/af3's pairtrack.cuh)
   }();
   return wide128;
 }
@@ -1186,7 +1185,7 @@ inline void evoformerBlock(Trunk& t, bool extraStack, int blk) {
 inline bool af2Pair16Ok(int L) {
   // (Ampere on: a T4 has no f32 -> bf16 conversion instruction, and there the bf16 pair was 1-3% SLOWER - its
   // biased float-tile triangle output 1237 -> 1520 ms a 494-residue fold, gridOutK in both directions 563 -> 780)
-  static const int major = [] { int d, m; CK(cudaGetDevice(&d)); CK(cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d)); return m; }();
+  static const int major = ccMajor();
   if (major < 8 || !FAST || getenv("LOCALFOLD_PAIR_F32") || shortPair((size_t)L * L, 128) || !FUSED_TRIANGLE || !FUSED_GRID_AF2) return false;
   bool tri = triFusedFits<__nv_bfloat16>() || triFusedFits<float>() ||
              (L >= 80 && fitsSmem(std::max(triIn256Smem<half>(128, 8), triangleOutSmem<128, 4, float, 32, float>())));
