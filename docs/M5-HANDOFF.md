@@ -561,3 +561,36 @@ outliers. What remains, all bandwidth or scalar work:
     The exponentials are not what bounds it.
   - **What is left is kernel work**: the vector GEMMs' tiling at the M5's instruction rate, and grid.attend's
     barrier-heavy tile.
+- **05c066c5, ESMFold2: the emitted LayerNorm on 32 x 256 tiles.**
+  - The tile: a 32 x 256 destination over 4 simdgroups. Probed: a row is 4 lanes (^ 1, ^ 8) in each of the four
+    simdgroups, with the same 4-adjacent-column groups. A GEMM whose 256-wide output wants its next norm takes this
+    tile.
+  - The tile's own cost: level at 256 x 65025 x 256 (0.900 against 0.903 ms) and 5% slower at 256 x 43690 x 1024.
+  - The epilogue reads the tile's values back from D, where each thread just wrote its own, instead of holding 16
+    float4 registers:
+    - the gated add, a pass: 419 ms (registers) -> 369 ms;
+    - AF3's trunk against the register version: 5.05 / 4.94 -> 4.77 / 4.79 s.
+  - The trunk: 2604 -> 2474 ms of GPU time, and the fold's wall time 3.22 / 3.27 -> 3.15 / 3.18 s.
+- **ea79ad2e, WebGPU: grid.attend's tiled form with f16 tiles, in the metal-3 prior.**
+  - **What**: q, k, v and P are staged in f16, and the q.k dot is taken in f16 four products at a time. The softmax
+    statistics and the output stay f32.
+  - **Gain**: grid.attend 668 / 690 -> 491 / 505 ms per 255-token trunk pass (-26%), the pass's GPU time -3.5%.
+  - **Where it applies**: the tiled form only (an M2 never ran it). Its f32 tiles are level with the untiled kernel,
+    and 8x4 tiles are 2.5x worse.
+  - **Accuracy**: check-af3-grid-attention (new `--model=` and `--tiled-half`) gives 4.6e-3 / 5.2e-3, the untiled
+    kernel's own f16 figures. 6MRR pLDDT is 85.168 against 85.170 with the knob off.
+- **The WebGPU ceiling on this part, measured** (`tools/gpu/probe-register-gemm.js`):
+  - A WGSL GEMM with workgroup-staged tiles reaches 2.8-2.9 TFLOP/s in f16 and 2.0 in f32.
+  - A subgroup-shuffle design reaches 0.7-1.7.
+  - The trunk's kernels already run at 1.4-2.1, so a rewrite is worth at most ~1.4x a kernel.
+  - **Trap**: lanes writing single components of one workgroup vec4 race on Metal (a read-modify-write of the vector).
+- **WebGPU, also level**:
+  - AF2's `attentionTiled`: inert on the f16 path.
+  - The ampere prior wholesale.
+  - `--pair-weights`, `--accumulate`, `--staged` and `--weights` at f16.
+  - What remains is per-kernel. In AF2's block (255 x 256): opm.contract 20 ms, then the MSA attentions and their
+    projections at 10-12 each.
+- **Not done**:
+  - 8 x 8 matrix-unit attention: only a flagged browser reaches it, and Apple's units are 8 x 8 where the kernel
+    declares 16 x 16.
+  - Moving the diffusion sampler onto the GPU: a step's GPU is 93-96% busy already.
