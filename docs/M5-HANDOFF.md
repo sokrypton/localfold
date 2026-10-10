@@ -298,3 +298,27 @@ boltz2 5CAJ fold: 5.11 -> 4.83 s from the GEMM alone (interleaved x3). All 29 ga
 What the trunk pass spends now (255 tokens, 1.78 s GPU): attention 24%, the triangle gate 12%, layernorm 8%, the
 pair transition's SwiGLU 7%, gated add 6%, qkvg 6%. The attention runs at 2.8 TFLOP/s against the GEMMs' 10. A
 rewrite of it (softmax in registers rather than threadgroup rows, the bias tile shared) is the next big item.
+
+### The attention rewrite (d45e9e0f)
+
+`lf_attention_tensor2` is the rewrite. Each simdgroup runs on its own and reads Q, K and V straight from the qkvg
+buffer through device tensors, so the key loop has no staging and no threadgroup barrier. The bias and mask tile goes
+through P's own half tile. That leaves about 5 KB of threadgroup memory, against v1's 13. **Occupancy was the cost,
+not the barriers**: dropping only the barriers gained 5%; an extra 8 KB float bias tile made it 40% slower.
+
+| H 4 x n rows | lf_attention | v1 | v2 |
+|---|---|---|---|
+| n 255 D 32 | 3.88 ms | 3.06 | **1.87** |
+| n 255 D 64 | 6.84 | 5.81 | **3.19** |
+| n 255 D 16 | 2.51 | 2.73 | **1.68** |
+| n 128 D 32 | 0.53 | 0.47 | **0.30** |
+| n 64 D 32 | 0.092 | 0.101 | **0.077** |
+| n 32 D 32 | **0.032** | 0.044 | 0.038 |
+
+v2 runs from 48 keys at D >= 32 and from 112 at D 16; v1 stays only for a q bias. On boltz2 folds (1 recycle, 50
+steps, interleaved), 255 tokens: 4.64 -> 4.30 s, trunk attention 424 -> 260 ms a pass. 510 tokens: 20.5 -> 17.4 s.
+All 29 gates pass.
+
+Still open: the diffusion transformer's attention (one row, 16 heads, about 0.1 ms a call) fills only 64
+threadgroups and barely moved (124 -> 117 ms over 50 steps). Splitting its keys across simdgroups is the remaining
+lever there.
