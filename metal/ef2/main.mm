@@ -145,7 +145,7 @@ int foldInput(const Opts& o) {
     if (chains) printf("  ipTM %.4f", conf.iptm); }
   printf("\n");
   writePdb(o.dir + "/pdb.template", o.out, coords, &bf);
-  writeConfidences(o.out, T, conf, contacts);
+  if (o.out != "/dev/null") writeConfidences(o.out, T, conf, contacts);   // (as af3's: no <stem>_*.json beside /dev/null)
   printf("-> %s\n", o.out.c_str());
   mt::sync();
   for (const void* p : {(const void*)z, (const void*)sInputs, (const void*)xd}) release(p);

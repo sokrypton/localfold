@@ -47,6 +47,7 @@ void writeConfidences(const std::string& pdb, int T, const Confidence& conf, con
   bool chains = false; for (int t = 1; t < T; ++t) chains |= asym[t] != asym[0];
   int first = *std::min_element(asym.begin(), asym.end());
   FILE* f = fopen((stem + "_confidences.json").c_str(), "w");
+  if (!f) die("cannot write %s_confidences.json", stem.c_str());
   {
     std::string j = "{\"pae\": ";
     appendMatrix2(j, conf.pae.data(), T);
@@ -62,6 +63,7 @@ void writeConfidences(const std::string& pdb, int T, const Confidence& conf, con
   fprintf(f, "]}\n");
   fclose(f);
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
+  if (!f) die("cannot write %s_summary_confidences.json", stem.c_str());
   if (chains) fprintf(f, "{\"ptm\": %.4f, \"iptm\": %.4f, \"mean_plddt\": %.2f}\n", conf.ptm, conf.iptm, 100 * conf.meanPlddt);
   else fprintf(f, "{\"ptm\": %.4f, \"iptm\": null, \"mean_plddt\": %.2f}\n", conf.ptm, 100 * conf.meanPlddt);
   fclose(f);
