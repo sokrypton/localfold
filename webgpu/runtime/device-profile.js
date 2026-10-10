@@ -397,6 +397,8 @@ export const DEFAULT_TUNING = Object.freeze({
   gridAttendMatrix: null,
   // grid.attend's register-tiled vector form (a 4x4 score block a lane) where the matrix form is off.
   gridAttendTiled: null,
+  // ...its tiles and q.k products in f16, on a device with shader-f16 and a stack not pinned to f32 (true is on)
+  gridAttendTiledHalf: null,
   // AF2's flash attention in the same register-tiled form (webgpu/kernels/attention.js), on the f32 path.
   attentionTiled: null,
   esmfold2TokenRowTile: null,
@@ -1224,6 +1226,13 @@ const PRIORS = new Map([
     // (and 25.8 ms of a 498 ms block once at 255 x 512). The fused arm never loses. It regroups the statistics, so it
     // is not bit-identical: 6MRR RMSD and pLDDT below, in the commit that set this.
     fusedPairBias: true,
+    // 🔴 THE TILED grid.attend WITH ITS TILES IN f16, MEASURED ON AN M5 UNDER STOCK FLAGS - no Apple part had run the
+    // tiled form (it was ampere's). AF3 int5, 255 tokens, a trunk pass, two rounds interleaved: grid.attend 668 / 690
+    // ms untiled -> 491 / 505 tiled in f16 (the f32 tiled form is level with the untiled one, 635 / 660), the whole
+    // pass's GPU time 3443 / 3554 -> 3323 / 3413. Tiles of 8x4 are 2.5x WORSE (1616). The f16 arm stages q, k, v and P
+    // in halves and takes the q.k dot four products at a time in f16; the softmax statistics and the output stay f32.
+    gridAttendTiled: true,
+    gridAttendTiledHalf: true,
   }],
 ], );
 

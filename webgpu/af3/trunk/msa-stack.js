@@ -15,7 +15,7 @@
  * The five pair updates are shared with the pairformer stack; see
  * webgpu/af3/trunk/pair-track.js.
  */
-import { deviceTuning, shapedKnob } from "../../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable, shapedKnob } from "../../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
@@ -141,6 +141,8 @@ export class Af3MsaStackGpu {
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
       attendTiled: deviceTuning(this.device).gridAttendTiled ?? false,
+      attendTiledHalf: pairMatrixKernels && deviceTuning(this.device).gridAttendTiledHalf === true
+        && halfPrecisionAvailable(this.device),
       attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,

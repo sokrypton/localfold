@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-360 tools. `tools/fixtures/` is data and is not listed.
+361 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (195)
+## `tools/gpu/` - the WebGPU lane (196)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -184,6 +184,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-platform.js`** - What this browser offers a numerical workload, beside WebGPU itself.
 - **`probe-progress-bar.js`** - Does the bar move at the speed the fold actually runs at?
 - **`probe-recycles-on-complexes.js`** - Do recycles help a COMPLEX, or entrench a wrong interface?
+- **`probe-register-gemm.js`** - How far a WGSL GEMM gets on this device's vector units, at the shapes AF3's pair transition runs - the ceiling the trunk's instruction-bound kernels are measured against.
 - **`probe-residual-binding-ceiling.js`** - How long a chain can `addInPlace` still bind, and what happens past it.
 - **`probe-round-to-half.js`** - Does `execution.roundToHalf` actually round, and is a fold's pair track already f16-valued?
 - **`probe-sampler-overhead.js`** - What a sampler STEP costs that the denoiser call does not.

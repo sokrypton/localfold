@@ -53,7 +53,8 @@ function relativeRms(actual, expected) {
 export async function main(device, args) {
   const n = Number(option(args, "n", "24"));
   const block = Number(option(args, "block", "0"));
-  const store = await HttpTensorStore.open(MANIFEST);
+  // (--model= another bundle - both sides read it, so an int5 one checks the kernels against its own weights)
+  const store = await HttpTensorStore.open(option(args, "model", MANIFEST));
   const runner = new Af3GridSelfAttentionGpu(device);
 
   const layer = async (leaf) => {
@@ -138,12 +139,14 @@ export async function main(device, args) {
       for (const draw of draws) {
         const run = await runner.run(
           draw.pair, mask, { n, channels: CHANNELS, transpose }, weights, DIALECT,
-          { stagedPrecision, attendTiled: option(args, "tiled", "") === "" ? args.includes("--tiled") : option(args, "tiled", "") });
+          { stagedPrecision, attendTiled: option(args, "tiled", "") === "" ? args.includes("--tiled") : option(args, "tiled", ""),
+            // --tiled-half: the tiled form's f16 tiles (gridAttendTiledHalf), held to the f16 bound on both arms
+            attendTiledHalf: args.includes("--tiled-half") });
         relRms = Math.max(relRms, relativeRms(run.output, draw.expected));
         elapsedMilliseconds = run.elapsedMilliseconds;
         memory = run.memory;
       }
-      const bound = bounds[stagedPrecision];
+      const bound = args.includes("--tiled-half") ? bounds.f16 : bounds[stagedPrecision];
       if (relRms > bound) failed += 1;
       results[`${module}/${stagedPrecision}`] = {
         transpose, stagedPrecision, seeds, relRms, bound,
