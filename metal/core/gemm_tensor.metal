@@ -482,6 +482,22 @@ METAL_FUNC void lf_attn3_body(constant AttnArgs& a, MQ mQ, int b, int h, int qa,
     auto P = opO.template get_left_input_cooperative_tensor<half, half, float>(Sh);
     opO.run(P, mV, O);
   }
+  // out = O / l * sigmoid(gate): a thread holds 4 adjacent columns at e..e+3 (probed on the M5 at D 16-64), so the
+  // gate is read and the output written 4 at a time where the strides keep them 8-byte aligned
+  if (((a.posStride | a.outPosStride | a.outRowStride) & 3) == 0) {
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < O.get_capacity(); e += 4)
+      if (O.is_valid_element(e)) {
+        auto ix = O.get_multidimensional_index(e);
+        const int d = ix[0], q = qa + ix[1];
+        if (q >= n) continue;
+        const float4 g = float4(*(device const half4*)(base + (long)q * a.posStride + 3 * W + d));
+        const float il = 1.f / *L.map_iterator(O.get_iterator(e));
+        const float4 o = float4(O[e], O[e + 1], O[e + 2], O[e + 3]) * il * (1.f / (1.f + exp(-g)));
+        *(device half4*)(a.out + (long)b * a.outRowStride + (long)q * a.outPosStride + h * D + d) = half4(o);
+      }
+    return;
+  }
   _Pragma("clang loop unroll(full)")
   for (uint16_t e = 0; e < O.get_capacity(); ++e)
     if (O.is_valid_element(e)) {
