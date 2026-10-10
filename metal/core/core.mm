@@ -658,10 +658,13 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, ha
 }
 
 // ---------------------------------------------------------------- attention
-// from 168 keys, heads 32 wide or more: below, lf_attention's registers win. Measured on an M5 (8-core GPU), interleaved,
-// lf_attention -> tensor: n 261 H 4 D 32 x 261 rows 4.68 -> 4.18 ms, n 512 3.83 -> 2.86, n 1044 2.06 -> 1.60; n 255 D 32
-// 3.87 -> 3.06, D 64 6.82 -> 5.86; n 192 D 32 1.68 -> 1.39; n 168 D 32 1.35 -> 1.20, D 64 2.36 -> 2.24; level at n 200-208
-// D 64; worse at n 160 (D 64 1.74 -> 1.87: a query block 64 tall half empty), at D 16 (n 261: 3.06 -> 3.77) and n 68-96
+// The matrix units' kernels (gemm_tensor.metal) where they win. lf_attention_tensor2 (v2: simdgroups on their own, ~5 KB
+// of threadgroup memory) from 48 keys at heads 32 wide or more and from 112 at 16; lf_attention_tensor (v1) where there
+// is a q bias, from 168 keys. Measured on an M5 (8-core GPU), interleaved, H 4 x n rows, lf_attention / v1 / v2 ms:
+// n 255 D 32 3.88 / 3.06 / 1.87, D 64 6.84 / 5.81 / 3.19, D 16 2.51 / 2.73 / 1.68; n 128 D 32 0.53 / 0.47 / 0.30;
+// n 64 D 32 0.092 / 0.101 / 0.077; n 48 D 32 0.069 / 0.076 / 0.065; but n 32 D 32 0.032 / 0.044 / 0.038 and n 96 D 16
+// 0.169 / 0.234 / 0.181 - lf_attention's registers below those. v2's key tile 64 unless that leaves the last one half
+// empty or less (n 255 D 32: 1.86 at 64 against 2.07 at 32, 2.33 at 128; n 160: 0.68 at 64 against 0.66 at 32)
 static const int ATTN_TENSOR_MIN_N = 168;
 void attention(const Attention& t) {
   if (!t.rows || !t.n) return;
@@ -675,18 +678,23 @@ void attention(const Attention& t) {
   a.r0 = t.r0; a.n = t.n; a.heads = t.heads; a.biasStride = t.biasStride; a.scale = t.scale;
   a.maskB = t.maskB || t.maskK ? t.maskB : t.n; a.maskK = t.maskB || t.maskK ? t.maskK : 1;
   a.pad0 = GEMM_EXTRA_EP;      // (an experiment's switch: metal/bench)
-  // the matrix units (gemm_tensor.metal's lf_attention_tensor) where they win: LOCALFOLD_ATTN_TENSOR=0 keeps lf_attention,
-  // =1 takes the tensor kernel at any length (the bench's arms); by default from ATTN_TENSOR_MIN_N keys
+  // LOCALFOLD_ATTN_TENSOR=0 keeps lf_attention, =1 takes a tensor kernel at any length (the bench's arms);
+  // LOCALFOLD_ATTN_V2=0 keeps v1 where v2 would run, =1 v2 at any length; LOCALFOLD_ATTN_TILE=QxK the tile
   if (D().tensorOps && (t.D == 16 || t.D == 32 || t.D == 48 || t.D == 64)) {
     const char* e = getenv("LOCALFOLD_ATTN_TENSOR");
-    const bool on = e ? strcmp(e, "0") != 0 : t.n >= ATTN_TENSOR_MIN_N && t.D >= 32;
+    const char* v2 = getenv("LOCALFOLD_ATTN_V2");
+    const bool v2auto = t.n >= (t.D >= 32 ? 48 : 112);
+    const bool two = !t.qBias && (v2 ? atoi(v2) != 0 : !e || strcmp(e, "0") != 0 ? v2auto : false);
+    const bool on = e ? strcmp(e, "0") != 0 : two || (t.n >= ATTN_TENSOR_MIN_N && t.D >= 32);
     if (on) {
       int TQB = 64, TKT = 32;
+      if (two) { TQB = 16; TKT = t.n % 64 == 0 || t.n % 64 > 32 ? 64 : 32; }   // (v2's first number: queries a simdgroup)
       if (const char* tt = getenv("LOCALFOLD_ATTN_TILE")) sscanf(tt, "%dx%d", &TQB, &TKT);
-      std::string name = "gemmt_attn_" + std::to_string(t.D) + "_" + std::to_string(TQB) + "x" + std::to_string(TKT);
-      std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_attention_tensor<" + std::to_string(t.D) +
-                         ", " + std::to_string(TQB) + ", " + std::to_string(TKT) + ">(constant AttnArgs&, uint3, uint, uint, uint);";
-      dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)((t.n + TQB - 1) / TQB), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0,
+      std::string name = std::string(two ? "gemmt_attn2_" : "gemmt_attn_") + std::to_string(t.D) + "_" + std::to_string(TQB) + "x" + std::to_string(TKT);
+      std::string decl = "template [[host_name(\"" + name + "\")]] kernel void " + (two ? "lf_attention_tensor2<" : "lf_attention_tensor<") +
+                         std::to_string(t.D) + ", " + std::to_string(TQB) + ", " + std::to_string(TKT) + ">(constant AttnArgs&, uint3, uint, uint, uint);";
+      const int qb = two ? 4 * TQB : TQB;
+      dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)((t.n + qb - 1) / qb), (uint32_t)t.rows, (uint32_t)t.heads}, 128, 0,
                        "attention");
       return;
     }

@@ -252,3 +252,106 @@ kernel void lf_attention_tensor(constant AttnArgs& a [[buffer(0)]], uint3 tg [[t
     }
 }
 // (instantiated on first use: lf_attention_tensor<D, QB, KT>, host name gemmt_attn_<D>_<QB>x<KT>)
+
+// ---------------------------------------------------------------- v2: simdgroups on their own, little threadgroup memory
+// The same arithmetic as lf_attention_tensor, but nothing staged by the threadgroup: each simdgroup's two products read
+// Q, K and V straight from the qkvg buffer through device tensors (the caches share them between the simdgroups), the
+// scale applied to the logits in float, so the key loop has no threadgroup barrier; and the bias tile goes through the
+// same threadgroup half tile P later takes, read 8 keys a lane. Threadgroup memory: QB x KT halves for P and 4 QB floats
+// - occupancy is what this kernel runs on (an extra 8 KB float bias tile: 2.90 -> 4.06 ms at n 255 D 32). No q bias
+// (the host keeps lf_attention_tensor for those).
+template <int D, int QS = 16, int KT = 32>
+kernel void lf_attention_tensor2(constant AttnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  using namespace mpp::tensor_ops;
+  constexpr int QB = 4 * QS, L8 = KT / 8;
+  threadgroup half Ps[QB * KT];
+  threadgroup float mrow[QB], lrow[QB], crow[QB], red[QB];
+  const int b = tg.y, h = tg.z, n = a.n, W = a.heads * D, r0 = sg * QS, qa = tg.x * QB + r0;
+  device const half* base = a.qkvg + (long)b * a.rowStride + h * D;
+  const float qs = a.scale * M_LOG2E_F;
+  threadgroup float* M = mrow + r0; threadgroup float* L = lrow + r0; threadgroup float* Cr = crow + r0; threadgroup float* Rd = red + r0;
+  if (lane < (uint)QS) { M[lane] = -1e30f; L[lane] = 0.f; }
+  typedef dextents<int32_t, 2> E2;
+  threadgroup half* Pm = Ps + r0 * KT;
+  const int32_t ps = (int32_t)a.posStride;
+  tensor<device half, E2, tensor_inline> tQ((device half*)base, E2(D, n), array<int32_t, 2>{1, ps});
+  tensor<device half, E2, tensor_inline> tK((device half*)base + W, E2(D, n), array<int32_t, 2>{1, ps});
+  tensor<device half, E2, tensor_inline> tV((device half*)base + 2 * W, E2(D, n), array<int32_t, 2>{1, ps});
+  tensor<threadgroup half, E2, tensor_inline> tP(Pm, E2(KT, QS), array<int32_t, 2>{1, KT});
+  constexpr auto dS = matmul2d_descriptor(QS, KT, D, false, true, false);
+  constexpr auto dO = matmul2d_descriptor(QS, D, KT, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<dS, execution_simdgroup> opS;
+  matmul2d<dO, execution_simdgroup> opO;
+  auto mQ = tQ.slice(0, qa);
+  auto mK0 = tK.slice(0, 0); auto mV0 = tV.slice(0, 0);
+  auto O = opO.template get_destination_cooperative_tensor<decltype(tP), decltype(mV0), float>();
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t e = 0; e < O.get_capacity(); ++e) if (O.is_valid_element(e)) O[e] = 0.f;
+  const long bq = (long)(a.r0 + b);
+  const bool vb = a.bias && (a.biasStride & 7) == 0;
+  for (int k0 = 0; k0 < n; k0 += KT) {
+    auto mK = tK.slice(0, k0); auto mV = tV.slice(0, k0);
+    // the bias, the mask and the keys past n into P's tile, in half (the -1e30 sentinel as -inf, -1e9 as -65504 -
+    // either leaves exp2 at zero beside a real logit)
+    for (int e = lane; e < QS * L8; e += 32) {
+      const int ql = e / L8, kl = (e - ql * L8) * 8, q = min(qa + ql, n - 1), k = k0 + kl;
+      device const half* bp = a.bias + ((long)h * n + q) * a.biasStride + k;
+      half4 x0 = half4(0), x1 = half4(0);
+      if (vb && k + 8 <= n) { x0 = *(device const half4*)bp; x1 = *(device const half4*)(bp + 4); }
+      else if (a.bias) for (int t = 0; t < 4; ++t) { x0[t] = k + t < n ? bp[t] : 0.h; x1[t] = k + 4 + t < n ? bp[4 + t] : 0.h; }
+      for (int t = 0; t < 4; ++t) {
+        if (k + t >= n) x0[t] = -INFINITY;
+        else if (a.mask && !(a.mask[bq * a.maskB + (long)(k + t) * a.maskK] > 0.f)) x0[t] = -65504.h;
+        if (k + 4 + t >= n) x1[t] = -INFINITY;
+        else if (a.mask && !(a.mask[bq * a.maskB + (long)(k + 4 + t) * a.maskK] > 0.f)) x1[t] = -65504.h;
+      }
+      *(threadgroup half4*)(Pm + ql * KT + kl) = x0; *(threadgroup half4*)(Pm + ql * KT + kl + 4) = x1;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    auto S = opS.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+    opS.run(mQ, mK, S);
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < S.get_capacity(); ++e)
+      if (S.is_valid_element(e)) {
+        auto ix = S.get_multidimensional_index(e);
+        S[e] = S[e] * qs + (float)Pm[ix[1] * KT + ix[0]];      // (the bias already in log2 units, as lf_attention adds it)
+      }
+    auto R = opS.template get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+    reduce_rows(S, R, reduction_operation::max, -INFINITY);
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < R.get_capacity(); ++e) if (R.is_valid_element(e)) Rd[R.get_multidimensional_index(e)[0]] = R[e];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < (uint)QS) { float mn = max(M[lane], Rd[lane]); Cr[lane] = exp2(M[lane] - mn); M[lane] = mn; }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < S.get_capacity(); ++e)
+      if (S.is_valid_element(e)) {
+        auto ix = S.get_multidimensional_index(e);
+        const float pv = exp2(S[e] - M[ix[1]]);
+        S[e] = pv;
+        Pm[ix[1] * KT + ix[0]] = (half)pv;
+      }
+    reduce_rows(S, R, reduction_operation::sum, 0.f);
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < O.get_capacity(); ++e) if (O.is_valid_element(e)) O[e] *= Cr[O.get_multidimensional_index(e)[1]];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < R.get_capacity(); ++e) if (R.is_valid_element(e)) Rd[R.get_multidimensional_index(e)[0]] = R[e];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < (uint)QS) L[lane] = L[lane] * Cr[lane] + Rd[lane];
+    opO.run(tP, mV, O);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t e = 0; e < O.get_capacity(); ++e)
+    if (O.is_valid_element(e)) {
+      auto ix = O.get_multidimensional_index(e);
+      const int d = ix[0], q = qa + ix[1];
+      if (q >= n) continue;
+      const float g = (float)base[(long)q * a.posStride + 3 * W + d];
+      a.out[(long)b * a.outRowStride + (long)q * a.outPosStride + h * D + d] = (half)(O[e] / L[ix[1]] * (1.f / (1.f + exp(-g))));
+    }
+}
+// (instantiated on first use: lf_attention_tensor2<D, QS, KT>, host name gemmt_attn2_<D>_<QS>x<KT>)

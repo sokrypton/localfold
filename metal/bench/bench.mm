@@ -39,6 +39,7 @@ static int attnBench(int argc, char** argv) {
     for (size_t k = 0; k < arms.size(); ++k) {
       GEMM_EXTRA_EP = arms[k] & 1;
       setenv("LOCALFOLD_ATTN_TENSOR", arms[k] & 4 ? "1" : "0", 1);      // (arm bit 4: the matrix units' kernel)
+      setenv("LOCALFOLD_ATTN_V2", arms[k] & 8 ? "1" : "0", 1);          // (arm bit 8: its v2)
       A.biasStride = arms[k] & 2 ? n : bs;       // (arm bit 2: the bias's rows unpadded, n apart)
       attention(A); sync();
       if (round == 0) {
