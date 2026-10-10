@@ -118,7 +118,12 @@ void gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
                       int out, const float* biasG, const float* biasV, half* vTmp, const char* label = nullptr);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden);
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
-                 size_t pairs, int n, int np, const float* bias = nullptr);
+                 size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);
+// the matrix units' layout of that weight (and bias): each 128 columns 32 channels' pa, then ga, pb, gb - where
+// triQuartersApply(C), a port builds its weight so once (triQuarters, into its own derived tensor) and passes
+// quartered; otherwise gemmTriGate rearranges the blocks-of-8 weight itself every call
+bool triQuartersApply(int C);
+void triQuarters(const half* W8, half* out, const float* bias8, float* outBias, int C);
 
 // ---------------------------------------------------------------- gated flash attention
 // out = softmax(q k^T scale + bias + mask) v * sigmoid(g), per batch row and head; D 8, 16, 24, 32, 48 or 64. Dense

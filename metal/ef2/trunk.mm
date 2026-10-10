@@ -20,6 +20,13 @@ void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* 
 // the triangle's projection and gate as one weight for gemmTriGate: channel c's (pa ga pb gb) in blocks of 8 - ESMFold2
 // interleaves a and b by channel (column 2c is a's, 2c + 1 b's)
 static const half* triGate(const std::string& Tn, int C) {
+  if (triQuartersApply(C))      // (the matrix units' quarters, built once through a blocks-of-8 temporary)
+    return M.derived<half>("trigateQ:" + Tn, (size_t)C * 4 * C, [&](half* out) {
+      half* w8 = allocT<half>((size_t)C * 4 * C);
+      run1d("ef2_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Fh(Tn + "projection"), Fh(Tn + "gate"), w8, (uint)C, (uint)C});
+      triQuarters(w8, out, nullptr, nullptr, C);
+      release(w8);
+    });
   return M.derived<half>("trigate:" + Tn, (size_t)C * 4 * C, [&](half* out) {
     run1d("ef2_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Fh(Tn + "projection"), Fh(Tn + "gate"), out, (uint)C, (uint)C});
   });
@@ -36,7 +43,7 @@ static void triangle(float* pair, const float* mask, int L, int C, const std::st
     fill(a, 0, plane * C * 2); fill(b, 0, plane * C * 2);
     zeroedA = a; zeroedB = b; zeroedLp = Lp;
   }
-  gemmTriGate(xn, triGate(Tn, C), mask, a, b, 0, P, C, plane, L, Lp);
+  gemmTriGate(xn, triGate(Tn, C), mask, a, b, 0, P, C, plane, L, Lp, nullptr, triQuartersApply(C));
   // per channel: outgoing prod[j][i] = sum_k a[j][k] b[i][k]; incoming sum_k b[k][j] a[k][i]
   float* prod = scratch<float>("ftri.prod", plane * C);
   {

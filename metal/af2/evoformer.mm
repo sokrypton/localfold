@@ -258,6 +258,17 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
 struct TriW { const half* w4; const float* b4; };
 static TriW triWeights(const std::string& T, int blk, int C) {
   std::string key = T + "#" + std::to_string(blk);
+  if (triQuartersApply(C)) {    // (the matrix units' quarters, built once through a blocks-of-8 temporary)
+    half* w4 = M.derived<half>("tri4q:" + key, (size_t)C * 4 * C, [](half*) {});
+    float* b4 = M.derived<float>("tri4qb:" + key, (size_t)4 * C, [&](float* b) {
+      half* w8 = allocT<half>((size_t)C * 4 * C); float* b8 = allocT<float>((size_t)4 * C);
+      run1d("af2_trigate_weight", (size_t)C * 4 * C, TriGateW2Args{PH(T + "/projection/weights", blk), PH(T + "/gate/weights", blk),
+            P(T + "/projection/bias", blk), P(T + "/gate/bias", blk), w8, b8, (uint)C, 0});
+      triQuarters(w8, w4, b8, b, C);
+      release(w8); release(b8);
+    });
+    return {w4, b4};
+  }
   half* w4 = M.derived<half>("tri4:" + key, (size_t)C * 4 * C, [](half*) {});
   float* b4 = M.derived<float>("tri4b:" + key, (size_t)4 * C, [&](float* b) {
     run1d("af2_trigate_weight", (size_t)C * 4 * C, TriGateW2Args{PH(T + "/projection/weights", blk), PH(T + "/gate/weights", blk),
@@ -278,7 +289,7 @@ void triangleMultiplication(float* pair, const float* pairMask, int L, int C, co
     zeroedA = a; zeroedB = b; zeroedPlane = plane * C;
   }
   TriW w = triWeights(T, blk, C);
-  gemmTriGate(xn, w.w4, pairMask, a, b, 0, pairs, C, plane, L, Lp, w.b4);
+  gemmTriGate(xn, w.w4, pairMask, a, b, 0, pairs, C, plane, L, Lp, w.b4, triQuartersApply(C));
   float* prod = scratch<float>("tri.prod", plane * C);
   {
     Gemm g{}; g.tx = F16; g.tw = F16; g.ty = F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;

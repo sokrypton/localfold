@@ -21,6 +21,13 @@ half* biasLayout(const float* raw, const std::string& name, int n, int heads, in
 
 // ---------------------------------------------------------------- triangle multiplication
 const half* triGateWeight(const std::string& pre, int C) {
+  if (triQuartersApply(C))      // (the matrix units' quarters, built once through a blocks-of-8 temporary)
+    return M.derived<half>("trigateQ:" + pre, (size_t)C * 4 * C, [&](half* out) {
+      half* w8 = allocT<half>((size_t)C * 4 * C);
+      run1d("af3_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Wh(pre + ".projection"), Wh(pre + ".gate"), w8, (uint)C, (uint)C});
+      triQuarters(w8, out, nullptr, nullptr, C);
+      release(w8);
+    });
   return M.derived<half>("trigate:" + pre, (size_t)C * 4 * C, [&](half* out) {
     run1d("af3_trigate_weight", (size_t)C * 4 * C, TriGateWArgs{Wh(pre + ".projection"), Wh(pre + ".gate"), out, (uint)C, (uint)C});
   });
@@ -36,7 +43,7 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
   char* big = (char*)bigBuffer(plane * C * 8);         // a and b (half) and their product (float)
   half* a = (half*)big; half* b = a + plane * C;
   padZero(a, 2 * (size_t)C, n, np);                   // (the padding is written by nothing here, and pr.big is shared)
-  gemmTriGate(xn, triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np);
+  gemmTriGate(xn, triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np, nullptr, triQuartersApply(C));
   float* prod = (float*)(big + plane * C * 4);
   {   // per channel: outgoing prod[i][j] = sum_k a[i][k] b[j][k]; incoming sum_k b[k][i] a[k][j]
     Gemm g{}; g.tx = F16; g.tw = F16; g.ty = F32; g.rows = np; g.in = np; g.out = np; g.ldx = g.ldw = g.ldy = np;

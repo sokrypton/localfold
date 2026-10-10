@@ -702,8 +702,15 @@ void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int
   a.epilogue = 128; a.alpha = 1.f;
   gemmRun(F16, F16, F16, a, 1, false, false, "swiglu");
 }
+bool triQuartersApply(int C) {
+  static const bool reg = !getenv("LOCALFOLD_TRI_REG") || atoi(getenv("LOCALFOLD_TRI_REG")) != 0;
+  return reg && C % 32 == 0 && tensorWanted();
+}
+void triQuarters(const half* W8, half* out, const float* bias8, float* outBias, int C) {
+  run1d("lf_tri_quarters", (size_t)C * 4 * C, TriQuartersArgs{W8, out, bias8, bias8 ? outBias : nullptr, (uint64_t)C, (uint)C, 0});
+}
 void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, half* outB, size_t r0, size_t rows, int C,
-                 size_t pairs, int n, int np, const float* bias) {
+                 size_t pairs, int n, int np, const float* bias, bool quartered) {
   GemmArgs g{};
   g.A = (uint64_t)W; g.B = (uint64_t)X; g.C = g.D = (uint64_t)outA;
   g.m = 4 * C; g.n = (int)rows; g.k = C; g.lda = 4 * C; g.ldb = C; g.ldc = g.ldd = 4 * C;
@@ -714,8 +721,10 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, ha
   // on the matrix units the weight in quarters (lf_tri_quarters, every call into one buffer - 0.01 ms, and no cache
   // keyed by an address a later model's weights may reuse) and the gate in registers (epilogue 512): no staging tile.
   // LOCALFOLD_TRI_REG=0 the control
-  static const bool reg = !getenv("LOCALFOLD_TRI_REG") || atoi(getenv("LOCALFOLD_TRI_REG")) != 0;
-  if (reg && C % 32 == 0 && tensorWanted()) {
+  if (quartered) {
+    if (!triQuartersApply(C)) die("gemmTriGate: a quartered weight off the matrix units");
+    g.epilogue |= 512;
+  } else if (triQuartersApply(C)) {
     static half* qw = nullptr; static float* qb = nullptr; static size_t qC = 0;
     if ((size_t)C > qC) { qw = allocT<half>((size_t)C * 4 * C); qb = allocT<float>((size_t)4 * C); qC = C; }
     run1d("lf_tri_quarters", (size_t)C * 4 * C, TriQuartersArgs{W, qw, bias, bias ? qb : nullptr, (uint64_t)C, (uint)C, 0});
