@@ -643,3 +643,19 @@ outliers. What remains, all bandwidth or scalar work:
   - **ESMFold2's ef2_swa**: 52.5 ms of 2.47 s.
   - **The small-fold diffusion step** (68 tokens, 8.2 ms of GPU): its GEMMs at 5-8 TFLOP/s, adaLN 0.85 ms (66
     launches at 12.9 us). Its fusion was level in both earlier attempts.
+- **deb63630, chai-1: one affine-free LayerNorm a block for its parallel updates.** The trunk went 7.04-7.21 ->
+  6.62-6.84 s at 255 tokens (-5.4%).
+  - **Before**: the five updates and the single track's pair-bias norm each normalised the same input (6 LNs a block),
+    and the input was copied so the updates could add into the pair.
+  - **Now**: xhat is taken once and each norm's affine is folded into its consumers' weights (`foldNorm`: diag(scale) W,
+    bias + offset W, in the derived weight's own column order). The transition, whose SwiGLU has no bias, takes the
+    affine on xhat. The copy is gone.
+  - **The one cost**: the q/k/v/gate GEMM gains a bias, 292 -> 335 ms a pass. The vector epilogue for that bias was
+    level.
+  - **Trap**: the first affine kernel used a 64-bit `t % C`, which took the whole gain back. 32-bit fixed it.
+- **4bc0c781, the wide centre norm's statistics in one read** (shifted sums: mean = K + s1/C, var = s2/C - (s1/C)^2):
+  two reads of the product where there were three. IntelliFold-2: 338 -> 230 ms a pass.
+- **Not done, and why**:
+  - ESMFold2's `ef2_swa`: 52 ms of a 2.47 s trunk (2%).
+  - The small-fold adaLN fusion: level twice before.
+  - ESMFold2's C 256 centre norm already reads once and runs at ~110 GB/s.
