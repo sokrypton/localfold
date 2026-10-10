@@ -506,6 +506,12 @@ static void sampleChai(int steps, int ns, size_t atoms, float* dX, const uint64_
   float* dIn = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
   float* dG = scratch<float>("sample.grad", all3); float* dNoisy = scratch<float>("sample.noisyKeep", all3);
   run1d("af3_initial_noise", all3, InitNoiseArgs{dX, dSeeds, atoms * 3, all3, (float)levels[0], 0});
+  D.plan.clear(); D.planAt = 0;      // (the levels the denoiser will see, in order, for conditioningAhead)
+  for (int s = 1; s <= T; ++s) {
+    const double prev = levels[s - 1];
+    D.plan.push_back((float)(prev * (1 + (prev >= 4e-4 && prev <= 80 ? churn : 0))));
+    if (secondOrder) D.plan.push_back((float)levels[s]);
+  }
   for (int s = 1; s <= T; ++s) {
     double prev = levels[s - 1], level = levels[s], tHat = prev * (1 + (prev >= 4e-4 && prev <= 80 ? churn : 0)), dt = level - tHat;
     double injected = 1.003 * std::sqrt(std::max(1e-6, tHat * tHat - prev * prev));
