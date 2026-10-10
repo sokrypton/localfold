@@ -548,6 +548,7 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   const size_t slab = (size_t)sh::maxStored(n) * n * C * 2;
   mg::Shared& cz = mg::shared("sh.cz", slab);
   mg::Shared& czT = mg::shared("sh.czT", slab);
+  mg::tick("conf: slabs shared");
   float* pair = (float*)cz.local;
   float* base = (float*)((__nv_bfloat16*)cz.local - hf * C);
   if (hp) CK(cudaMemcpyAsync(pair, trunkZ.local, hp * C * 2, cudaMemcpyDeviceToDevice, STREAM));
@@ -569,6 +570,7 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
     CK(cudaMemcpyAsync(single, sn, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   }
   foldDualOutputs();
+  mg::tick("conf: pair initialised");
   int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
   bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
   const bool was16 = PAIR16;
@@ -576,9 +578,12 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   for (int k = 0; k < nb; ++k) {
     const std::string B = P + ".blocks." + std::to_string(k);
     sh::pairUpdates<half>(cz, czT, pairMask, n, C, B, swap, divide, 4);
+    mg::tick("conf: block pair");
     singleTrack<half>(single, pair, seqMask, n, C, Cs, B, nullptr, lo);
+    mg::tick("conf: block single");
   }
   sh::transpose(cz, czT, n, C);              // (the PDE's transposed rows)
+  mg::tick("conf: transposed");
   PAIR16 = was16;
   releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
   const int NB = 64; double step = 31.0 / (NB - 2);
@@ -634,6 +639,7 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
     expectationK<<<blocks(cnt), 256, 0, STREAM>>>(logits, tm + r0, nullptr, cnt, NB, dPerBin, 0, 1.f);
   }
   CK(cudaFree(dCentres)); CK(cudaFree(dPerBin));
+  mg::tick("conf: heads");
   ConfidenceOut out;
   mg::fence();
   if (mg::RANK == 0) {
@@ -649,6 +655,8 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
     confidenceTm(out, std::move(term), seqMask, n);
     confidencePlddt(out, single, n, Cs, headNorm);
   }
+  mg::tick("conf: gathered, pTM, pLDDT");
   mg::release({ "sh.cz", "sh.c." });       // (collective: the next sample's head makes its own)
+  mg::tick("conf: released");
   return out;
 }

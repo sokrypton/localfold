@@ -48,7 +48,7 @@ static void pairOntoRank0(Trunk& t) {
     }
   mg::fence();
   mg::release({ "" });               // (every shared buffer, collectively: rank 0's pair is whole and its own now)
-  if (mg::RANK != 0) { mg::finish(); exit(0); }
+  if (mg::RANK != 0) mg::leave();
   mg::finish();
   mg::WORLD = 1;
   t.pair = whole; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.msa = nullptr; t.inPlaceRecycle = true;
@@ -483,7 +483,7 @@ static int foldMain(int argc, char** argv) {
     if (mg::WORLD > 1 && !sharded(t)) {   // the trunk done on every rank: the others leave, rank 0 folds on alone
       mg::SPLIT = nullptr;
       mg::barrier();
-      if (mg::RANK != 0) { mg::finish(); exit(0); }
+      if (mg::RANK != 0) mg::leave();
       mg::finish();
       mg::WORLD = 1;
     }
@@ -496,6 +496,7 @@ static int foldMain(int argc, char** argv) {
                           // exchange buffers, the MSA (the slab itself the diffusion reads, and rank 0 gathers after it)
       mg::release({ "sh.zT", "sh.tz", "sh.bmine", "sh.bg", "sh.bias", "sh.st.o", "trunk.msa" });
       t.zTS = nullptr; t.msa = nullptr;
+      mg::tick("trunk");
     }
     // ...and where the whole fold fits one GPU, every rank gathers the whole pair and runs the diffusion alone - the same
     // fold on each, nothing exchanged, its steps' graphs on - then frees it and takes its rows of the confidence head
@@ -513,6 +514,7 @@ static int foldMain(int argc, char** argv) {
       keptLo = t.shardLo; keptRows = t.shardRows;
       t.pair = whole; t.shardLo = -1; t.shardRows = 0;        // (the whole pair's view; the slab stays in t.zS)
       GRAPHS = !noGraphs;
+      mg::tick("whole pair gathered");
     }
     TRUNK_PAIR16 = t.p16 && !saveEmbeddings && (pairStays16(t.n, t.C, fast) || sharded(t));
     if (sharded(t) && (saveEmbeddings || saveDistogram)) { fprintf(stderr, "a sharded pair: no --save-embeddings or --save-distogram yet\n"); return 1; }
@@ -580,7 +582,7 @@ static int foldMain(int argc, char** argv) {
     // on a card short of room the trunk's pair waits in host memory from here to the confidence head: the
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
-    if (!structural && !sharded(t) && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
+    if (!structural && !sharded(t) && keptLo < 0 && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
         parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4) + diffusionPrepBytes(pairs))) {
       // (the room asked for is the pair's AND what the preparation will hold beside it - asked for the pair alone, a
       // 6,916-token fold kept its 12.2 GB bf16 pair on the device and ran out in the preparation)
@@ -590,7 +592,13 @@ static int foldMain(int argc, char** argv) {
       if (structural) { fprintf(stderr, "a sharded pair: not OpenDDE\n"); return 1; }
       sh::DLO = t.shardLo; sh::DROWS = t.shardRows; dP = pairBase(t);
     }
+    mg::tick("to the diffusion");
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
+    mg::tick("diffusion prepared");
+    // (several GPUs, the diffusion run whole on each: the gathered pair is read by nothing past its preparation - the
+    // confidence head reads this rank's slab - so it goes now, not parked to the host where the card is short: on 8
+    // ranks that was 8 x 9 GB pinned at once at 5928 tokens)
+    if (keptLo >= 0) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(t.pair)); t.pair = nullptr; df.trunkPair = nullptr; }
     // ...and the pair-sized tensors only the preparation reads, given back before the steps: the
     // transformer's and the encoder's pair LayerNorms and the per-super-block logits (1.4 GB at 1048
     // tokens, held through every step). Not the conditioning's chunk buffers (dc.f2*, pt.*): they are
@@ -607,7 +615,7 @@ static int foldMain(int argc, char** argv) {
       // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
       // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
       releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj", "pt." });
-      if (!structural && !sharded(t) && t.pair && parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4))) {
+      if (!structural && !sharded(t) && keptLo < 0 && t.pair && parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4))) {
         parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); df.trunkPair = nullptr;
       }
     }
@@ -651,19 +659,20 @@ static int foldMain(int argc, char** argv) {
     std::vector<float> xs = sample(steps, seeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
     }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
+    mg::tick("sampler");
     FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
     // several GPUs on a sharded pair, past the sampler: the confidence head of every sample and the contacts on held
     // rows (collective, rank 0's results); then the others leave and rank 0 writes the fold with the whole pair never
     // held anywhere
     std::vector<ConfidenceOut> shardedConf;
     if (keptLo >= 0) {                 // (the diffusion ran whole on every rank: its pair given back, the slab's view again)
-      CK(cudaStreamSynchronize(STREAM));
-      CK(cudaFree(t.pair));
       t.pair = (float*)t.zS->local; t.shardLo = keptLo; t.shardRows = keptRows; t.p16 = true;
       GRAPHS = false;
+      mg::tick("whole pair freed");
     }
     if (sharded(t)) {
       releaseScratch();                // (the sampler's: the heads allocate theirs beside the slab)
+      mg::tick("scratch released");
       df.trunkPair = nullptr;
       std::vector<int> pbI(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
       std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
@@ -680,11 +689,14 @@ static int foldMain(int argc, char** argv) {
         CK(cudaFree(dBeta));
       }
       if (contact.empty()) contact = contactProbabilitiesSharded(t);    // (made off the whole pair where it was gathered)
+      mg::tick("contacts");
       confMs += ms(sc0, clock()); s0 += clock() - sc0;   // (the confidence head's time its own, not the sampler's)
       mg::release({ "" });
-      if (mg::RANK != 0) { mg::finish(); exit(0); }
+      mg::tick("shared buffers released");
+      if (mg::RANK != 0) mg::leave();
       mg::finish();
       mg::WORLD = 1;
+      mg::tick("the other ranks exited");
       t.pair = nullptr; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.msa = nullptr;
       sh::DLO = -1; sh::DROWS = 0;
     }

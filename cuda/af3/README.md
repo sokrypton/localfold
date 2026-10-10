@@ -1413,6 +1413,19 @@ exchange); that waits on a real multi-GPU box - `python3 tools/check-multigpu.py
 1TIM dimer on one GPU against every GPU, and times complexes of 4/12/24 1TIM chains on 1, 2, 4, 8 GPUs with every GPU's
 peak memory (`--big=41` adds a 10,127-token fold on all of them), writing a markdown report.
 
+**Measured on a rented 8 x A100-SXM4-40GB (NVLink), 2026-10-10, at `f408f48`** (25 steps, no recycles; the confidence
+head sharded by then, its time still counted in the diffusion's): 2,964 tokens - trunk 20.56 s on one GPU, 13.38 on 2,
+8.39 on 4, 6.17 on 8 (3.3x); 5,928 tokens - trunk 152.8 s against 30.5 on 8 (**5.0x**), the whole fold 169.4 against
+65.4 (2.6x); 2 GPUs ran out of memory at that size. What kept the fold at 2.6x was after
+the trunk: diffusion and confidence 14.8 s on one GPU and **23.9 on eight**, plus 11 s between them against 1.9.
+Two causes, both found here with the ranks sharing this card (`LOCALFOLD_MG_TIMES=1` makes every rank meet at named
+points after the trunk and rank 0 print each phase): rank 0 **waited for the other ranks to exit** - their CUDA
+teardown, one after another, 0.17 s on 2 ranks and 0.42 on 4 at 741 tokens, in the fold's time - and they now leave at
+once (`mg::leave`, `_exit`) and are reaped as rank 0 itself exits; and every rank parked its **gathered whole pair** in
+pinned host memory where the card was short (9 GB each at 5,928 tokens, eight at once), when nothing reads it past the
+diffusion's preparation - it is freed there now. At 741 tokens the diffusion goes 429 -> 267 ms on 2 ranks and 932 ->
+530 on 4, every structure identical to the digit. The 10,127-token fold on all eight was not run to the end.
+
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)
 
 Volta has no m16n8k8/k16 MMA, no `ldmatrix`, no `tanh.approx` and no f16 `ex2`, which every fused kernel here is

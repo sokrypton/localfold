@@ -38,12 +38,17 @@ inline bool FINISHED = false;
 inline std::vector<pid_t> CHILDREN;
 
 inline void abortAll() { if (SHM) SHM->abort.store(1); }
-inline void onExit() { if (WORLD > 1 && !FINISHED) abortAll(); }
-// every rank calls this at the end of a fold that succeeded; any other exit tells the others to stop
-inline void finish() {
-  FINISHED = true;
-  if (RANK == 0) for (pid_t p : CHILDREN) { int st = 0; waitpid(p, &st, 0); }
+// (rank 0 reaps the ranks that left only as it exits itself: their CUDA teardown runs beside the rest of its fold)
+inline void onExit() {
+  if (WORLD > 1 && !FINISHED) abortAll();
+  if (FINISHED) for (pid_t p : CHILDREN) { int st = 0; waitpid(p, &st, 0); }
 }
+// every rank calls this at the end of a fold that succeeded; any other exit tells the others to stop
+inline void finish() { FINISHED = true; }
+// a rank other than 0 at the end of its part of a fold that succeeded: gone at once, without waiting on its CUDA
+// teardown (the driver frees its memory as the process ends; rank 0 waited for that, in its fold's time - 0.4 s at
+// 741 tokens on 4 ranks sharing one A100)
+[[noreturn]] inline void leave() { finish(); fflush(stdout); fflush(stderr); _exit(0); }
 
 // a peer gone without passing through exit (a signal, the OOM killer): rank 0 reaps its children; another rank sees rank 0
 // gone through its parent pid (and PR_SET_PDEATHSIG kills it when rank 0 dies anyway)
@@ -200,6 +205,19 @@ inline void fence() {
   if (WORLD == 1) return;
   CK(cudaStreamSynchronize(STREAM));
   barrier();
+}
+
+// LOCALFOLD_MG_TIMES=1: every rank drained and met at named points, rank 0 printing the time since the last one (what
+// a phase costs across the ranks; the meeting itself adds a sync, so off by default)
+inline void tick(const char* what) {
+  static const bool on = getenv("LOCALFOLD_MG_TIMES") != nullptr;
+  if (!on) return;
+  static auto last = std::chrono::steady_clock::now();
+  CK(cudaStreamSynchronize(STREAM));
+  if (WORLD > 1) barrier();
+  auto now = std::chrono::steady_clock::now();
+  if (RANK == 0) fprintf(stderr, "  mg %-30s %9.1f ms\n", what, std::chrono::duration<double, std::milli>(now - last).count());
+  last = now;
 }
 
 // Every rank's `bytesOf(r)` bytes at offset `srcOff(r)` of its shared buffer `src`, gathered into this rank's `dst`
