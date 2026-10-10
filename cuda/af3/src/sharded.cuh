@@ -64,7 +64,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
   // the rows of b this rank owns ([C][rows][np], shared), then every rank's into the whole b ([C][np][np])
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
-  mg::Shared& bmine = mg::shared("sh.bmine", (size_t)maxShare * np * C * sizeof(TQ));
+  mg::Shared& bmine = mg::shared("sh.bmine" + std::to_string(C), (size_t)maxShare * np * C * sizeof(TQ));
   TQ* b = scratch<TQ>("trib.bq", cs * C);
   int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
   {
@@ -135,7 +135,7 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   const int rowsHere = storedRows(n, mg::RANK);
   float* base = baseOf(z.local, lo, n, C);
   const int stride = (n + 7) / 8 * 8;
-  mg::Shared& biasS = mg::shared("sh.bias", (size_t)heads * n * stride * 2);
+  mg::Shared& biasS = mg::shared("sh.bias" + std::to_string(heads), (size_t)heads * n * stride * 2);
   half* bias = (half*)biasS.local;
   std::string qkvg = qkvgWeight(pre, C, Wd, true);
   std::string wb = paddedColumns(pre + ".pairBiasProjection", C, heads, 16);
@@ -211,7 +211,7 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
     }
   };
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
-  mg::Shared& bmine = mg::shared(std::string("sh.bg") + (sizeof(T) == 2 ? "16" : "32"), (size_t)maxShare * np * C * sizeof(T));
+  mg::Shared& bmine = mg::shared(std::string("sh.bg") + (sizeof(T) == 2 ? "16." : "32.") + std::to_string(C), (size_t)maxShare * np * C * sizeof(T));
   if (hi > lo) operands({lo, hi - lo, 0, np}, (T*)bmine.local, 1);
   T* b = scratch<T>("trib.b", cs * C);
   mg::fence();
@@ -270,7 +270,7 @@ inline void rowAttentionGeneric(const mg::Shared& z, const float* mask, int n, i
   float* pair = baseOf(z.local, lo, n, C);
   constexpr bool fast = std::is_same_v<T, half>;
   const int stride = (n + 7) / 8 * 8;
-  mg::Shared& biasS = mg::shared(std::string("sh.biasg") + (fast ? "16" : "32"), (size_t)heads * n * stride * sizeof(T));
+  mg::Shared& biasS = mg::shared(std::string("sh.biasg") + (fast ? "16." : "32.") + std::to_string(heads), (size_t)heads * n * stride * sizeof(T));
   T* bias = (T*)biasS.local;
   CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * sizeof(T), STREAM));
   const size_t pairsHere = (size_t)rowsHere * n;
@@ -354,19 +354,4 @@ inline void pairUpdates(const mg::Shared& z, const mg::Shared& zT, const float* 
   stage("transition");
 }
 
-// phase 2's check while the rest of the trunk still holds the whole pair: this rank's rows cut from the replicated
-// pair into its slab, `work(z, zT, lo)` on the slab, and every rank's rows gathered back (mg::exchange)
-template <class F>
-inline void viaShards(float* pair, int n, int C, F work) {
-  const size_t slabBytes = (size_t)maxStored(n) * n * C * elem();
-  mg::Shared& z = mg::shared("sh.z", slabBytes);
-  mg::Shared& zT = mg::shared("sh.zT", slabBytes);
-  int lo, hi; rowsOf(n, mg::RANK, lo, hi);
-  const size_t row = (size_t)n * C * elem();
-  const int rowsHere = storedRows(n, mg::RANK);
-  if (rowsHere) CK(cudaMemcpyAsync(z.local, (char*)pair + (size_t)lo * row, (size_t)rowsHere * row, cudaMemcpyDefault, STREAM));
-  work(z, zT, lo);
-  if (rowsHere) CK(cudaMemcpyAsync((char*)pair + (size_t)lo * row, z.local, (size_t)rowsHere * row, cudaMemcpyDefault, STREAM));
-  mg::exchange(false, n, C, elem(), padded(n), 16);
-}
 }  // namespace sh

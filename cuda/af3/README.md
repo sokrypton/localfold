@@ -1388,12 +1388,19 @@ update - both triangle multiplications (their blocked forms), row and column gri
 and the transition - computes this rank's share of its output rows or columns and the others' shares are copied in.
 The rest of the trunk runs whole on every rank (deterministic, so the copies stay identical); diffusion and confidence
 run on rank 0 after the trunk. CUDA graphs are off (a capture cannot hold a host barrier); chai-1, OpenDDE, `--serve`
-and repeated folds are refused by name. **Phase 2 (next):** the pair stored sharded - each rank its rows only, the
-triangle's `b` streamed between ranks, column work through all-to-all transposes - so a fold may exceed one card.
+and repeated folds are refused by name. **Phase 2 (`LOCALFOLD_MG_SHARDED=1`): the trunk on a sharded pair** - each rank
+holds only its rows (shares of the 16-padded length), through the embedding (in-place recycle), the template stack
+(its own 64-channel tensor sharded too), the MSA stack (outer product mean on held rows; the pair-weighted MSA
+attention for held tokens, then the MSA's columns all-gathered) and every pairformer block (sharded.cuh: the triangle
+outgoing against an all-gathered `b`, the incoming as the outgoing form on z^T, row attention with an all-gathered
+bias, column attention as row attention on z^T with the bias flipped, all-to-all transposes between; the single track
+on held query rows, its output all-gathered). After the last pass rank 0 gathers the pair and folds on alone - the
+diffusion and the confidence head are not sharded yet, so rank 0 still needs the whole pair's memory past the trunk.
 
-Checked with the ranks sharing this one A100 (`LOCALFOLD_GPU_MAP=0,0`): 5CAJ self-templated 0.003 A from the
-single-GPU fold on 2 ranks (rf3 0.008); 1TIM dimer on 3 ranks, pLDDT/pTM/ipTM identical; 6MRR boltz2 0.022 A,
-intellifold2 0.007, protenix2 0.062. Speed is not measurable here (the ranks share one card and meet at every
+Checked with the ranks sharing this one A100 (`LOCALFOLD_GPU_MAP=0,0`): phase 1 - 5CAJ self-templated 0.003 A from
+the single-GPU fold on 2 ranks (rf3 0.008); 1TIM dimer on 3 ranks, pLDDT/pTM/ipTM identical; 6MRR boltz2 0.022 A,
+intellifold2 0.007, protenix2 0.062. Phase 2 - 5CAJ self-templated 0.009 A on 2 and 3 ranks (boltz2 0.026, protenix2
+0.002, rf3 0.004); a 59-residue query with 1,024 MSA rows 0.007 A on 2 and 3. Speed is not measurable here (the ranks share one card and meet at every
 exchange); that waits on a real multi-GPU box.
 
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)

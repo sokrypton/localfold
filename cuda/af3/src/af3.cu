@@ -334,7 +334,7 @@ static int foldMain(int argc, char** argv) {
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
   if (oracleTargetFeat)
     targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
-  if (!foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
+  if (!(mg::WORLD > 1 && sh::ON) && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
                 doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
   t = makeTrunk(targetFeat.data(), msaCap, doFold && fast);
   if (mg::WORLD > 1) {
@@ -344,13 +344,20 @@ static int foldMain(int argc, char** argv) {
         folds != 1 || repeat != 1 || !doFold) {
       fprintf(stderr, "several GPUs fold one job at a time, and not chai-1 or OpenDDE yet\n"); return 1;
     }
+    GRAPHS = false;                                             // (a capture cannot hold a host barrier)
+    if (sh::ON) {
+      // phase 2: the pair sharded by rows (makeTrunk gave each rank its slab); the trunk on slabs, its pair gathered
+      // onto rank 0 after the last pass
+      if (!framesDir.empty() || recycleTolerance > 0) { fprintf(stderr, "a sharded pair: no --frames or --recycle-tolerance yet\n"); return 1; }
+      printf("trunk: the pair sharded over %d GPUs, %d rows here\n", mg::WORLD, t.shardRows);
+    } else {
     const size_t pc = (size_t)t.n * t.n * t.C;
     mg::Shared& sp = mg::shared("trunk.pair", pc * 4);          // (f32's room: the pair may be held either way)
     CK(cudaFree(t.pair)); t.pair = (float*)sp.local;
     CK(cudaMemset(t.pair, 0, pc * 4));
     mg::SPLIT = &sp;
-    GRAPHS = false;                                             // (a capture cannot hold a host barrier)
     printf("trunk: the pair updates over %d GPUs\n", mg::WORLD);
+    }
   }
   memReport("trunk built");
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
@@ -448,6 +455,18 @@ static int foldMain(int argc, char** argv) {
     CK(cudaDeviceSynchronize());
     if (mg::WORLD > 1) {                 // the trunk done on every rank: the others leave, rank 0 folds on alone
       mg::SPLIT = nullptr;
+      if (sharded(t)) {                  // every rank's rows onto rank 0, into a whole pair
+        const size_t row = (size_t)t.n * t.C * 2;
+        float* whole = mg::RANK == 0 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)t.n * t.n * t.C)) : nullptr;
+        mg::fence();
+        if (mg::RANK == 0)
+          for (int r = 0; r < mg::WORLD; ++r) {
+            int lo, hi; sh::rowsOf(t.n, r, lo, hi); const int rn = sh::storedRows(t.n, r);
+            if (rn) CK(cudaMemcpyAsync((char*)whole + (size_t)lo * row, t.zS->peer[r], (size_t)rn * row, cudaMemcpyDefault, STREAM));
+          }
+        mg::fence();
+        if (mg::RANK == 0) { t.pair = whole; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.inPlaceRecycle = true; }
+      }
       mg::barrier();
       if (mg::RANK != 0) { mg::finish(); exit(0); }
       mg::finish();
