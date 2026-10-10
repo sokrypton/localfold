@@ -483,3 +483,11 @@ Near morning:
   -> 58, the contractions 76 -> 69) for 0.07 A of drift. Not kept.
 - **Lost: attention at head width 8** on the matrix units. MPP wants K dynamic or a multiple of 16, and AF2's extra
   MSA is 1.6% of an MSA fold.
+- **169c0d82, the triangle gate's quartered weight built once per model.** Each port builds it as its own derived
+  tensor, instead of core rearranging it every call (that guarded against a stale cache, on a misdiagnosis).
+  IntelliFold-2 (C 512): `lf_tri_quarters` was 18 ms of a 547 ms pass at 68 tokens; its trunk is now 2.21 -> 2.15 s.
+  Byte-identical.
+- **Lost: a register-resident centre norm for C 384-512** (`lf_center_norm_wide` reads the product three times and
+  writes rows 32 apart). With 64 floats a lane and a 128-channel transposing tile: 344 -> 329 ms a pass at 255
+  tokens, because the registers cost occupancy. Not kept. IntelliFold-2 at 255 tokens is 7.5 s a trunk pass: its
+  C 512 GEMMs run at 11-11.5 TFLOP/s, so it is simply big.
