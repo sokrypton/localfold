@@ -40,6 +40,10 @@ static int attnBench(int argc, char** argv) {
       GEMM_EXTRA_EP = arms[k] & 1;
       setenv("LOCALFOLD_ATTN_TENSOR", arms[k] & 4 ? "1" : "0", 1);      // (arm bit 4: the matrix units' kernel)
       setenv("LOCALFOLD_ATTN_V2", arms[k] & 32 ? "3" : arms[k] & 8 ? "1" : "0", 1);   // (arm bit 8: its v2; 32: v3)
+      if (arms[k] & 64) setenv("LOCALFOLD_ATTN_TILE", "32x32", 1);           // (arm bits 64/128/256: v3's tile)
+      else if (arms[k] & 128) setenv("LOCALFOLD_ATTN_TILE", "16x32", 1);
+      else if (arms[k] & 256) setenv("LOCALFOLD_ATTN_TILE", "16x64", 1);
+      else unsetenv("LOCALFOLD_ATTN_TILE");
       A.biasStride = arms[k] & 2 ? n : bs;       // (arm bit 2: the bias's rows unpadded, n apart)
       attention(A); sync();
       if (round == 0) {

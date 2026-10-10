@@ -92,31 +92,38 @@ inline float lf_half_at(device const uchar* p) { return (float)as_type<half>((us
 inline float lf_f32_at(device const uchar* p) {
   return as_type<float>((uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24));
 }
+// (the index arithmetic in 32 bits where the entry's indices fit - always, in practice: the GPU's 64-bit division made
+// this kernel ~2 GB/s, 300 ms of boltz2's load)
+template <typename IX>
+inline float lf_decode_at(constant DecodeArgs& a, thread const DecodeEntry& d, IX i) {
+  if (d.kind == 0) return lf_f32_at(a.raw + d.src + 4 * (ulong)i);
+  if (d.kind == 1) return lf_half_at(a.raw + d.src + 2 * (ulong)i);
+  if (d.kind == 2) return (float)(char)a.raw[d.src + i] * lf_half_at(a.raw + d.scale + 2 * (ulong)(i / (IX)d.block));   // symmetric int8
+  if (d.kind == 6) {             // an af3-any-model blob's int8: a float32 scale per channel of the last axis (`block` of
+                                 // them) and per block of rows (`bits` blocks of the `zero` rows)
+    IX row = i / (IX)d.block, col = i - row * (IX)d.block, g = (IX)((d.zero + d.bits - 1) / d.bits);
+    float scale = lf_f32_at(a.raw + d.scale + 4 * (ulong)((row / g) * (IX)d.block + col));
+    return (float)(char)a.raw[d.src + i] * scale;
+  }
+  if (d.kind == 7) {             // bfloat16
+    uint h = (uint)a.raw[d.src + 2 * (ulong)i] | ((uint)a.raw[d.src + 2 * (ulong)i + 1] << 8);
+    return as_type<float>(h << 16);
+  }
+  IX g = i / (IX)d.block;
+  ulong bit = (ulong)i * d.bits, byte = bit >> 3;
+  uint sh = (uint)(bit & 7);
+  uint word = a.raw[d.src + byte];
+  if (sh + d.bits > 8) word |= (uint)a.raw[d.src + byte + 1] << 8;
+  uint code = (word >> sh) & ((1u << d.bits) - 1);
+  return fma((float)code, lf_half_at(a.raw + d.scale + 2 * (ulong)g), lf_half_at(a.raw + d.zero + 2 * (ulong)g));
+}
 kernel void lf_decode(constant DecodeArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                       uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
   DecodeEntry d = a.table[tg.y];
+  const bool small = d.first + d.n <= 0xffffffffull;
   for (ulong o = (ulong)tg.x * 256 + tid; o < d.n; o += (ulong)ng.x * 256) {
     ulong i = d.first + o;
-    float v;
-    if (d.kind == 0) v = lf_f32_at(a.raw + d.src + 4 * i);
-    else if (d.kind == 1) v = lf_half_at(a.raw + d.src + 2 * i);
-    else if (d.kind == 2) v = (float)(char)a.raw[d.src + i] * lf_half_at(a.raw + d.scale + 2 * (i / d.block));   // symmetric int8
-    else if (d.kind == 6) {      // an af3-any-model blob's int8: a float32 scale per channel of the last axis (`block` of
-                                 // them) and per block of rows (`bits` blocks of the `zero` rows)
-      ulong row = i / d.block, col = i - row * d.block, g = (d.zero + d.bits - 1) / d.bits;
-      float scale = lf_f32_at(a.raw + d.scale + 4 * ((row / g) * d.block + col));
-      v = (float)(char)a.raw[d.src + i] * scale;
-    } else if (d.kind == 7) {    // bfloat16
-      uint h = (uint)a.raw[d.src + 2 * i] | ((uint)a.raw[d.src + 2 * i + 1] << 8);
-      v = as_type<float>(h << 16);
-    } else {
-      ulong g = i / d.block, bit = i * d.bits, byte = bit >> 3;
-      uint sh = (uint)(bit & 7);
-      uint word = a.raw[d.src + byte];
-      if (sh + d.bits > 8) word |= (uint)a.raw[d.src + byte + 1] << 8;
-      uint code = (word >> sh) & ((1u << d.bits) - 1);
-      v = fma((float)code, lf_half_at(a.raw + d.scale + 2 * g), lf_half_at(a.raw + d.zero + 2 * g));
-    }
+    float v = small ? lf_decode_at<uint>(a, d, (uint)i) : lf_decode_at<ulong>(a, d, i);
     if (d.flags & 1) v = (float)(half)v;
     if (d.out16) {
       device half* p = (device half*)d.dst + o;
