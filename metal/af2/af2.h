@@ -47,8 +47,11 @@ struct Trunk {
 void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPair, const float* prevPos);
 void evoformerBlock(Trunk& t, bool extraStack, int blk);
 // the pair modules, shared with the template stacks
-void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool outgoing);
-void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool starting, bool pairOnes);
+// nextNorm: the next update's pair norm, emitted by this one's last GEMM where the matrix units run it
+void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool outgoing,
+                            const std::string& nextNorm = "");
+void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool starting, bool pairOnes,
+                       const std::string& nextNorm = "");
 void transition(float* x, size_t rows, int C, const std::string& T, int blk);
 
 // templates (templates.mm)
