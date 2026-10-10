@@ -8,6 +8,26 @@ kernel void af3_concat_part(LF_ARGS(ConcatPartArgs)) {
   uint c = lf_udiv(t, a.width), o = t - c * a.width;
   a.dst[c * a.total + a.off + o] = a.transposed ? a.src[o * a.C + c] : a.src[t];
 }
+kernel void af3_affine_h(LF_ARGS(AffineHArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.n) return;
+  // (32-bit: a transition chunk's rows x C stay under 2^32 - a 64-bit modulo is the GPU's slow division)
+  const uint u = (uint)t, c = u - lf_udiv(u, a.C) * a.C;
+  a.y[t] = (half)((float)a.x[t] * a.scale[c] + (a.offset ? a.offset[c] : 0.f));
+}
+kernel void af3_fold_rows(LF_ARGS(FoldRowsArgs)) {
+  uint t = (uint)LF_INDEX;
+  if (t >= a.in * a.out_) return;
+  uint k = lf_udiv(t, a.out_);
+  a.out[t] = (half)(a.scale[k] * (float)a.w[t]);
+}
+kernel void af3_fold_bias(LF_ARGS(FoldBiasArgs)) {
+  uint o = (uint)LF_INDEX;
+  if (o >= a.out_) return;
+  float s = a.extra ? a.extra[o] : 0.f;
+  if (a.offset) for (uint k = 0; k < a.in; ++k) s += a.offset[k] * (float)a.w[(ulong)k * a.out_ + o];
+  a.bias[o] = s;
+}
 kernel void af3_interleave8(LF_ARGS(Interleave8Args)) {
   uint t = (uint)LF_INDEX, W = 2 * a.I;
   if (t >= a.rows * W) return;

@@ -53,6 +53,11 @@ const half* swigluPairs(const std::string& name, int rows, int I);
 // an attention's q | k | v | gate as one [C][4W] weight (the grid attention stores q, k and the gate transposed),
 // and its GEMM bias where the gate has one (zeros elsewhere)
 const half* qkvgWeight(const std::string& pre, int C, int Wd, bool transposedQkg);
+// a LayerNorm's affine (norm + "Scale", norm + "Offset") folded into the [in][out] weight w that reads its output - in w's
+// own column order, so a derived (interleaved, quartered) weight folds as it is: LN(x) w = xhat (diag(scale) w) +
+// offset w. extra: a bias w already had (or null). Derived once, under key
+struct Folded { const half* w = nullptr; const float* b = nullptr; };
+Folded foldNorm(const std::string& key, const half* w, int in, int out, const std::string& norm, const float* extra);
 const float* qkvgBias(const std::string& pre, int Wd);
 
 // ---------------------------------------------------------------- the pair track (pairtrack.mm)

@@ -8,6 +8,12 @@
 struct ConcatPartArgs { CP(half) src; DP(half) dst; uint C, width, total, off, transposed, pad; };
 // a weight interleaved for gemmSwiglu: out [rows][2I] in blocks of 8 - a_0..a_7 b_0..b_7 a_8.. - a and b rows lda apart
 struct Interleave8Args { CP(half) a; CP(half) b; DP(half) out; uint rows, I, lda, pad; };
+// a LayerNorm's affine folded into the weight that consumes it: out[k][o] = scale[k] w[k][o]; bias[o] = extra[o] +
+// sum_k offset[k] w[k][o] (offset, extra optional)
+// y[r][c] = x[r][c] scale[c] + offset[c] (half; offset optional): a LayerNorm's affine on its normalised rows
+struct AffineHArgs { CP(half) x; DP(half) y; CP(float) scale; CP(float) offset; u64 n; uint C, pad; };
+struct FoldRowsArgs { CP(half) w; CP(float) scale; DP(half) out; uint in, out_, pad0, pad1; };
+struct FoldBiasArgs { CP(half) w; CP(float) offset; CP(float) extra; DP(float) bias; uint in, out_, pad0, pad1; };
 // the triangle's projection and gate (a and b interleaved by channel) as gemmTriGate's weight: (pa ga pb gb) in 8s
 struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; uint rows, C; };
 // x[r][c] (*)= scale

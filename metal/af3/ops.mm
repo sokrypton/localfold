@@ -70,6 +70,16 @@ const half* swigluPairs(const std::string& name, int rows, int I) {
     run1d("af3_interleave8", (size_t)rows * 2 * I, Interleave8Args{w, w + I, out, (uint)rows, (uint)I, (uint)(2 * I), 0});
   });
 }
+Folded foldNorm(const std::string& key, const half* w, int in, int out, const std::string& norm, const float* extra) {
+  Folded f;
+  f.w = M.derived<half>("fold:" + key, (size_t)in * out, [&](half* o) {
+    run1d("af3_fold_rows", (size_t)in * out, FoldRowsArgs{w, W(norm + "Scale"), o, (uint)in, (uint)out, 0, 0});
+  });
+  f.b = M.derived<float>("foldb:" + key, (size_t)out, [&](float* o) {
+    run1d("af3_fold_bias", (size_t)out, FoldBiasArgs{w, Wopt(norm + "Offset"), extra, o, (uint)in, (uint)out, 0, 0});
+  });
+  return f;
+}
 const half* qkvgWeight(const std::string& pre, int C, int Wd, bool tr) {
   return concatColumns(pre + ".qkvg", C, {{pre + ".qProjection", Wd, tr}, {pre + ".kProjection", Wd, tr},
                                           {pre + ".vProjection", Wd, false}, {pre + ".gatingQuery", Wd, tr}});

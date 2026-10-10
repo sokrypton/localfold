@@ -53,6 +53,13 @@ static half* pairLn(const float* pair, size_t P, int C, const std::string& norm)
   ln(pair, xn, P, C, norm + "Scale", norm + "Offset");
   return xn;
 }
+// chai-1's parallel updates all read one input, so its affine-free LayerNorm is taken once a block (parallelPairUpdates)
+// and each update's own scale and offset are folded into the weights that read it (foldNorm): the input and, during the
+// first (in-place) update, the pair itself. LOCALFOLD_FOLD_NORM=0 is the control
+static struct { const float* src[2] = {nullptr, nullptr}; half* xhat = nullptr; } shared;
+static const half* sharedNorm(const float* x) {
+  return shared.xhat && x && (x == shared.src[0] || x == shared.src[1]) ? shared.xhat : nullptr;
+}
 // where an update's GEMM emits the next norm: whichever of pr.x and pr.x2 its own input is not
 static half* lnTarget(size_t P, int C, const half* inUse) {
   half* x1 = scratch<half>("pr.x", P * C);
@@ -62,11 +69,17 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
               const std::string& nextNorm) {
   size_t P = (size_t)n * n;
   int np = round8(n); size_t plane = (size_t)np * np;
-  half* xn = pairLn(pair, P, C, pre + ".leftNormInput");
+  const half* xs = sharedNorm(pair);
+  half* xn = xs ? (half*)xs : pairLn(pair, P, C, pre + ".leftNormInput");
+  Folded tg, gl;
+  if (xs) {
+    tg = foldNorm("tg:" + pre, triGateWeight(pre, C), C, 4 * C, pre + ".leftNormInput", nullptr);
+    gl = foldNorm("gl:" + pre, Wh(pre + ".gatingLinear"), C, C, pre + ".leftNormInput", nullptr);
+  }
   char* big = (char*)bigBuffer(plane * C * 8);         // a and b (half) and their product (float)
   half* a = (half*)big; half* b = a + plane * C;
   padZero(a, 2 * (size_t)C, n, np);                   // (the padding is written by nothing here, and pr.big is shared)
-  gemmTriGate(xn, triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np, nullptr, triQuartersApply(C));
+  gemmTriGate(xn, xs ? tg.w : triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np, xs ? tg.b : nullptr, triQuartersApply(C));
   float* prod = (float*)(big + plane * C * 4);
   {   // per channel: outgoing prod[i][j] = sum_k a[i][k] b[j][k]; incoming sum_k b[k][i] a[k][j]
     Gemm g{}; g.tx = F16; g.tw = F16; g.ty = F32; g.rows = np; g.in = np; g.out = np; g.ldx = g.ldw = g.ldy = np;
@@ -80,7 +93,8 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
   centerNorm(prod, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
   half* outH = scratch<half>("pr.h2", P * C);
   half* lnOut = !nextNorm.empty() && !into && hasW(nextNorm + "Scale") ? lnTarget(P, C, xn) : nullptr;
-  if (gemmGatedAddDual(xn, Wh(pre + ".gatingLinear"), cn, Wh(pre + ".outputProjection"), into ? into : pair, P, C, C, nullptr, nullptr, outH,
+  if (gemmGatedAddDual(xn, xs ? gl.w : Wh(pre + ".gatingLinear"), cn, Wh(pre + ".outputProjection"), into ? into : pair, P, C, C,
+                       xs ? gl.b : nullptr, nullptr, outH,
                        "triangle output and gated add", lnOut, lnOut ? W(nextNorm + "Scale") : nullptr,
                        lnOut ? Wopt(nextNorm + "Offset") : nullptr))
     emit(0, pair, nextNorm, lnOut);
@@ -93,13 +107,19 @@ void gridAttention(float* pair, const Masks& m, int n, int C, const std::string&
                    bool untransposed, const std::string& nextNorm) {
   int heads = metaI(pre + ".heads"), D = metaI(pre + ".dimension"), Wd = heads * D;
   size_t P = (size_t)n * n;
-  half* xn = pairLn(pair, P, C, pre + ".actNorm");
+  const half* xs = sharedNorm(pair);
+  half* xn = xs ? (half*)xs : pairLn(pair, P, C, pre + ".actNorm");
   float* raw = scratch<float>("grid.raw", P * heads);
-  lin(xn, pre + ".pairBiasProjection", raw, P, C, heads);
+  Folded fb, fq;
+  if (xs) {
+    fb = foldNorm("gb:" + pre, Wh(pre + ".pairBiasProjection"), C, heads, pre + ".actNorm", nullptr);
+    fq = foldNorm("gq:" + pre, qkvgWeight(pre, C, Wd, true), C, 4 * Wd, pre + ".actNorm", qkvgBias(pre, Wd));
+    linW(xn, fb.w, raw, P, C, heads, 0.f, fb.b, 1.f, "grid bias projection");
+  } else lin(xn, pre + ".pairBiasProjection", raw, P, C, heads);
   int stride = round8(n);
   half* bias = biasLayout(raw, "grid.bias", n, heads, stride, tr && swap);
   half* qkvg = (half*)bigBuffer(P * 4 * Wd * 2);
-  linW(xn, qkvgWeight(pre, C, Wd, true), qkvg, P, C, 4 * Wd, qkvgBias(pre, Wd), "grid qkvg");
+  linW(xn, xs ? fq.w : qkvgWeight(pre, C, Wd, true), qkvg, P, C, 4 * Wd, xs ? fq.b : qkvgBias(pre, Wd), "grid qkvg");
   half* o = scratch<half>("pr.h1", P * Wd);
   Attention at{}; at.qkvg = qkvg; at.out = o; at.n = n; at.heads = heads; at.D = D; at.rows = n; at.scale = 1.f / sqrtf((float)D);
   at.bias = bias; at.biasStride = stride;
@@ -142,6 +162,11 @@ void transition(float* x, size_t rows, int C, const std::string& pre, float* int
   for (size_t r0 = 0; r0 < rows; r0 += chunk) {
     size_t r = std::min(chunk, rows - r0);
     half* in = r0 == 0 && r == rows ? takeEmitted(x, pre + ".inputLayerNorm") : nullptr;
+    if (const half* xs = in ? nullptr : sharedNorm(x)) {    // (chai's shared input norm: this norm's affine on its rows)
+      run1d("af3_affine_h", r * C, AffineHArgs{xs + r0 * C, xn, W(pre + ".inputLayerNormScale"), Wopt(pre + ".inputLayerNormOffset"),
+                                              (u64)(r * C), (uint)C, 0});
+      in = xn;
+    }
     if (!in) { ln(x + r0 * C, xn, r, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset"); in = xn; }
     gemmSwiglu(in, wp, g, r, C, I);
     // the pair's next norms (next1 into pr.x, next2 into pr.x2 - both free once the SwiGLU has read its input)
@@ -175,8 +200,16 @@ void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& p
 void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which) {
   bool swap = flag("trunk.dialect.swapTransposedBias"), divide = flag("trunk.dialect.triangleMulDivideByLength");
   size_t P = (size_t)n * n;
-  float* base = scratch<float>("par.base", P * C);
-  copy(base, pair, P * C * 4);
+  static const bool fold = !getenv("LOCALFOLD_FOLD_NORM") || atoi(getenv("LOCALFOLD_FOLD_NORM")) != 0;
+  shared = {};
+  // (folded, every update reads the input only through its norm - so no kept copy: they all take the pair, whose
+  // xhat is the block's input whatever the updates before have added)
+  float* base = fold ? pair : scratch<float>("par.base", P * C);
+  if (fold) {
+    shared.xhat = scratch<half>("par.xhat", P * C);
+    layerNorm(pair, shared.xhat, P, C, nullptr, nullptr);
+    shared.src[0] = pair;
+  } else copy(base, pair, P * C * 4);
   bool first = true;
   for (const char* u = which; *u; ++u) {
     bool inPlace = first && *u != 'c';
@@ -205,9 +238,13 @@ void singleTrack(float* single, const float* pair, const Masks& m, int n, int C,
   if (parallel) { s0 = scratch<float>("st.s0", (size_t)n * Cs); copy(s0, single, (size_t)n * Cs * 4); }
   int heads = metaI(A + ".heads"), d = metaI(A + ".dimension"), Wd = heads * d;
   size_t P = (size_t)n * n;
-  half* pln = pairLn(pair, P, C, B + ".singlePairLogitsNorm");
+  const half* xs = sharedNorm(pair);
+  half* pln = xs ? (half*)xs : pairLn(pair, P, C, B + ".singlePairLogitsNorm");
   float* raw = scratch<float>("st.raw", P * heads);
-  lin(pln, B + ".singlePairLogitsProjection", raw, P, C, heads);
+  if (xs) {
+    Folded f = foldNorm("sp:" + B, Wh(B + ".singlePairLogitsProjection"), C, heads, B + ".singlePairLogitsNorm", nullptr);
+    linW(pln, f.w, raw, P, C, heads, 0.f, f.b, 1.f, "pair logits");
+  } else lin(pln, B + ".singlePairLogitsProjection", raw, P, C, heads);
   if (extraBias) run1d("af3_add_bias_heads", P * heads, AddBiasHeadsArgs{raw, extraBias, P, (uint)heads, 0});   // (OpenDDE)
   int stride = round8(n);
   half* bias = biasLayout(raw, "st.bias", n, heads, stride, false);
@@ -234,7 +271,9 @@ void pairformerBlock(float* pair, float* single, const Masks& m, int n, int C, i
   if (flag("trunk.dialect.parallelPairformer")) {
     // the single track reads the pair ENTERING the block, kept by the parallel updates
     parallelPairUpdates(pair, m, n, C, B, "oirct");
-    singleTrack(single, scratch<float>("par.base", (size_t)n * n * C), m, n, C, Cs, B, extraBias);
+    // (folded, the pair's xhat is the block input's; otherwise the kept copy)
+    singleTrack(single, shared.xhat ? pair : scratch<float>("par.base", (size_t)n * n * C), m, n, C, Cs, B, extraBias);
+    shared = {};
     return;
   }
   // (the transition emits the single track's pair norm and the next block's first, where the caller names that block)
