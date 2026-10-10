@@ -8,6 +8,7 @@
 // product into the pair (gemmGatedAdd). A transition: LN -> SwiGLU in the first GEMM's epilogue -> the second GEMM
 // adding into the pair. The pair is float32; everything between is float16.
 #include "ef2.h"
+#include <type_traits>
 
 void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z) {
   float* rows = scratch<float>("zi.rows", (size_t)T * C); float* cols = scratch<float>("zi.cols", (size_t)T * C);
@@ -34,8 +35,8 @@ static const half* triGate(const std::string& Tn, int C) {
 // the pair's next LayerNorm where the previous update's GEMM already wrote it (Gemm::lnOut, gemmGatedAdd's): the pair,
 // the norm's name (its Scale / Offset prefix) and the buffer, taken by the next update of the same; a miss drops it.
 // LOCALFOLD_LN_EMIT=0: none emitted
-static struct { const float* x = nullptr; std::string norm; half* buf = nullptr; } emitted;
-static half* takeEmitted(const float* x, const std::string& norm) {
+static struct { const void* x = nullptr; std::string norm; half* buf = nullptr; } emitted;
+static half* takeEmitted(const void* x, const std::string& norm) {
   const bool hit = emitted.x == x && emitted.norm == norm;
   emitted.x = nullptr;
   return hit ? emitted.buf : nullptr;
@@ -45,7 +46,9 @@ static half* lnTarget(size_t P, int C, const half* inUse) {
   half* a = scratch<half>("ftri.xn", P * C);
   return inUse == a ? scratch<half>("eln.b", P * C) : a;
 }
-static void triangle(float* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing, const std::string& next) {
+// (the pair float, or half where foldingTrunk keeps a half copy for the blocks)
+template <class T>
+static void triangle(T* pair, const float* mask, int L, int C, const std::string& Tn, bool outgoing, const std::string& next) {
   size_t P = (size_t)L * L;
   int Lp = (L + 7) / 8 * 8; size_t plane = (size_t)Lp * Lp;
   half* xn = takeEmitted(pair, Tn + "leftNormInput");
@@ -78,7 +81,8 @@ static void triangle(float* pair, const float* mask, int L, int C, const std::st
                        "triangle output and gated add", lnOut, lnOut ? F(next + "Scale") : nullptr, lnOut ? F(next + "Offset") : nullptr))
     emitted = {pair, next, lnOut};
 }
-static void transition(float* pair, size_t P, int C, const std::string& Tn, const std::string& next) {
+template <class T>
+static void transition(T* pair, size_t P, int C, const std::string& Tn, const std::string& next) {
   int I = dimOf("f/" + Tn + "transition2", 0);
   size_t chunk = std::max<size_t>(64, ((size_t)128 << 20) / (3 * (size_t)I));
   size_t rows = std::min(P, chunk);
@@ -94,20 +98,25 @@ static void transition(float* pair, size_t P, int C, const std::string& Tn, cons
     const half* x = in ? in + r0 * C : xn;
     if (!in) layerNorm(pair + r0 * C, xn, r, C, F(Tn + "inputLayerNormScale"), F(Tn + "inputLayerNormOffset"));
     gemmSwiglu(x, w1, g, r, C, I);
-    Gemm G{}; G.X = g; G.tx = F16; G.W = Fh(Tn + "transition2"); G.tw = F16; G.Y = pair + r0 * C; G.rows = r; G.in = I; G.out = C;
+    Gemm G{}; G.X = g; G.tx = F16; G.W = Fh(Tn + "transition2"); G.tw = F16; G.Y = pair + r0 * C;
+    G.ty = std::is_same<T, half>::value ? F16 : F32; G.rows = r; G.in = I; G.out = C;
     G.beta = 1.f; G.label = lnOut ? "transition2, next norm" : "transition2";
     if (lnOut) { G.lnOut = lnOut + r0 * C; G.lnScale = F(next + "Scale"); G.lnOffset = F(next + "Offset"); }
     all = gemm(G) && all;
   }
   if (all) emitted = {pair, next, lnOut};
 }
-void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
+template <class T>
+static void trunkBlockT(T* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
   std::string B = prefix + "/" + std::to_string(b) + "/";
   // (each update's last GEMM emitting the next one's norm - the next block's first where it follows directly)
   triangle(pair, mask, L, C, B + "triangleMultiplicationOutgoing/", true, B + "triangleMultiplicationIncoming/leftNormInput");
   triangle(pair, mask, L, C, B + "triangleMultiplicationIncoming/", false, B + "pairTransition/inputLayerNorm");
   transition(pair, (size_t)L * L, C, B + "pairTransition/",
              nextFollows ? prefix + "/" + std::to_string(b + 1) + "/triangleMultiplicationOutgoing/leftNormInput" : "");
+}
+void trunkBlock(float* pair, const float* mask, int L, int C, const std::string& prefix, int b, bool nextFollows) {
+  trunkBlockT(pair, mask, L, C, prefix, b, nextFollows);
 }
 
 void foldingTrunk(int T, int C, const float* zi, float* z, int loops) {
@@ -128,7 +137,18 @@ void foldingTrunk(int T, int C, const float* zi, float* z, int loops) {
       g.beta = 1.f; g.rows = r; g.in = C; g.out = C; g.label = "recycle";
       gemm(g);
     }
-    for (int b = 0; b < blocks; ++b) trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocks);
+    // The blocks over a half pair: their updates end in bandwidth-bound GEMMs that read and write it, and half moves half
+    // the bytes. Where the matrix units run (their kernels take a half residual); every residual is summed in float and
+    // rounded once, every norm reads the half values; the recycle and everything after read z back in float.
+    // LOCALFOLD_HALF_PAIR=0 the control
+    static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+    if (halfWanted && matrixUnits() && C % 8 == 0) {
+      half* zh = scratch<half>("trunk.zh", P * C);
+      toHalf(z, zh, P * C);
+      for (int b = 0; b < blocks; ++b) trunkBlockT(zh, mask, T, C, "blocks", b, b + 1 < blocks);
+      toFloat(zh, z, P * C);
+    } else
+      for (int b = 0; b < blocks; ++b) trunkBlock(z, mask, T, C, "blocks", b, b + 1 < blocks);
   }
 }
 
