@@ -129,6 +129,9 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
 // leading dimensions ldl, ldr), stored permuted into X [(i, j)][(c, e)] by the epilogue - on the matrix units only
 // (false: nothing run, the caller's GEMM and permute; LOCALFOLD_OPM_PERMUTED=0 the control)
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S);
+// the outer product's output projection adding into the pair: pair[r] += (bias + X[r] W) / (1e-3 + norm[r]) - on the
+// matrix units only (the vector epilogue, EP bit 8192); false: nothing run, the caller's own GEMM and add
+bool gemmOpmOut(const half* X, const half* W, float* pair, const float* bias, const float* norm, size_t rows, int in, int out);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden, const float* bias = nullptr);
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);

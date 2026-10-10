@@ -183,6 +183,12 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         *(device vec<TC, 4>*)(D + ((((ulong)ii * L + jj) * O + cc) * O + ee)) = vec<TC, 4>(v);
         continue;
       }
+      if (g.epilogue & 8192) {    // the outer product's normalised add: D = C + (bias + v) / (1e-3 + aux[j]) (af2_opm_add's order)
+        const float s = 1e-3f + ((device const float*)g.aux)[j];
+        const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
+        *(device vec<TC, 4>*)dp = vec<TC, 4>(cv + (bv + v) / s);
+        continue;
+      }
       if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
       if (g.epilogue & 4) v += bv;
       if (g.epilogue & 2) v = max(v, 0.f);

@@ -43,6 +43,7 @@ struct Trunk {
   float* pairMask;              // [L, L]
   bool opmFirst;
   bool msaOnes = false, extraOnes = false, pairOnes = false;     // all ones: no mask read
+  const float* normOf[2] = {};  // the outer product's mask norm, per stack (main, extra): the mask it was taken of this pass
 };
 void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPair, const float* prevPos);
 void evoformerBlock(Trunk& t, bool extraStack, int blk);

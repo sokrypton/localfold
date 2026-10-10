@@ -62,6 +62,7 @@ void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPair, c
   const std::string E = "evoformer/";
   int L = t.L, N = t.N;
   std::string f = "f" + std::to_string(pass) + "/";
+  t.normOf[0] = t.normOf[1] = nullptr;      // (the masks are written for this pass below)
   const int* aatype = Ii("aatype");
   float* tf = scratch<float>("emb.tf", (size_t)L * 21);
   run1d("af2_target_feat", (size_t)L * 21, TargetFeatArgs{aatype, tf, (uint)L, 0});
@@ -233,8 +234,14 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     run1d("af2_scale_rows_h", rows * O, ScaleRowsHArgs{lt, msaMask, rows, (uint)O, 0});
     run1d("af2_scale_rows_h", rows * O, ScaleRowsHArgs{rt, msaMask, rows, (uint)O, 0});
   }
-  float* norm = scratch<float>("opm.norm", (size_t)L * L);
-  run1d("af2_mask_norm", (size_t)L * L, MaskNormArgs{msaMask, norm, (uint)rowsN, (uint)L});
+  // the mask norm, once a stack a pass: every block of a stack reads the same mask (LOCALFOLD_OPM_NORM_ONCE=0: each block)
+  static const bool once = !getenv("LOCALFOLD_OPM_NORM_ONCE") || atoi(getenv("LOCALFOLD_OPM_NORM_ONCE")) != 0;
+  const int slot = msaMask == t.extraMask;
+  float* norm = scratch<float>(slot ? "opm.norm.extra" : "opm.norm", (size_t)L * L);
+  if (!once || t.normOf[slot] != msaMask) {
+    run1d("af2_mask_norm", (size_t)L * L, MaskNormArgs{msaMask, norm, (uint)rowsN, (uint)L});
+    t.normOf[slot] = msaMask;
+  }
   const half* Wout = PH(Op + "/output_w", blk);        // [O * O][128]
   if (rowsN <= 128) {
     // the SHALLOW form for an alignment of few rows: the output projection folded into the right operand first -
@@ -283,6 +290,9 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
         g.ty = F16; g.rows = (size_t)bi * O; g.in = rowsN; g.out = L * O; g.accFloat = true; g.label = "opm product"; gemm(g); }
       run1d("af2_opm_permute", (size_t)bi * L * O * (O / 8), OpmPermuteArgs{Pm, X, (uint)bi, (uint)L, (uint)O, 0});
     }
+    // (on the matrix units the add in the output GEMM's epilogue - no Y)
+    if (gemmOpmOut(X, Wout, t.pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L, (size_t)bi * L, O * O, 128))
+      continue;
     { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = 128; g.label = "opm output"; gemm(g); }
     run1d("af2_opm_add", (size_t)bi * L * 128, OpmAddArgs{t.pair, Y, P(Op + "/output_b", blk), norm, (u64)i0, (uint)bi, (uint)L, 128, 0});
   }
