@@ -797,6 +797,17 @@ void attention(const Attention& t) {
     if (on) {
       int TQB = 64, TKT = 32;
       if (two) { TQB = 16; TKT = (t.n % 64 == 0 || t.n % 64 > 32) && !(ver == 3 && t.D == 16) ? 64 : 32; }   // (v2's first number: queries a simdgroup)
+      // v3 at head width 32: 32 x 32 tiles (128 queries a threadgroup) where they pad no worse - their own cost is ~7%
+      // less a useful element - and leave enough threadgroups. Measured on an M5 (bench attn, interleaved), 16x64 ->
+      // 32x32 ms: n 255 x 4 heads x 255 rows 1.36 -> 1.27; 255 x 8 x 512 5.44 -> 5.02; 512 x 4 x 128 2.36 -> 2.30;
+      // 1020 x 4 x 64 4.61 -> 4.54; and the losers the rule refuses: 300 (pads 384 queries) 2.43 -> 2.67, 160 and 192
+      // 3%, 128 x 4 x 128 (512 threadgroups) 0.41 -> 0.46. LOCALFOLD_ATTN_TILE overrides
+      static const bool wide32 = !getenv("LOCALFOLD_ATTN_WIDE") || atoi(getenv("LOCALFOLD_ATTN_WIDE")) != 0;
+      if (wide32 && ver == 3 && t.D == 32 && !t.qBias) {
+        auto up = [](long x, long m) { return (x + m - 1) / m * m; };
+        const double w32 = 0.93 * up(t.n, 128) * up(t.n, 32), w16 = (double)up(t.n, 64) * up(t.n, TKT);
+        if (w32 < w16 && (long)up(t.n, 128) / 128 * (long)t.rows * t.heads >= 1500) { TQB = 32; TKT = 32; }
+      }
       if (const char* tt = getenv("LOCALFOLD_ATTN_TILE")) sscanf(tt, "%dx%d", &TQB, &TKT);
       const char* stem = ver == 3 ? (t.qBias ? "gemmt_attn3q_" : "gemmt_attn3_") : ver == 2 ? "gemmt_attn2_" : "gemmt_attn_";
       const char* fn = ver == 3 ? "lf_attention_tensor3<" : ver == 2 ? "lf_attention_tensor2<" : "lf_attention_tensor<";
