@@ -261,7 +261,9 @@ static void msaAttention(Trunk& t, const std::string& pre) {
   linH(xn, pre + ".vProjection", v, rows, Cm, Wd);
   if (chaiMask) run1d("af3_scale_rows_h", rows * Wd, ScaleRowsHArgs{v, t.msaMask, rows, (uint)Wd, 0});
   half* vh = scratch<half>("msaatt.vh", (size_t)S * ldw * Wd);
-  run1d("af3_msa_v_heads", (size_t)S * ldw * Wd, MsaVHeadsArgs{v, vh, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
+  const bool v8 = d % 8 == 0 && (size_t)S * ldw * Wd < ((size_t)1 << 32);     // (16 bytes a thread)
+  if (v8) run1d("af3_msa_v_heads8", (size_t)S * ldw * Wd / 8, MsaVHeadsArgs{v, vh, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
+  else run1d("af3_msa_v_heads", (size_t)S * ldw * Wd, MsaVHeadsArgs{v, vh, (uint)S, (uint)n, (uint)heads, (uint)d, (uint)ldw, 0});
   // per head: O_h [n][S d] = W_h [n][ldw] V_h [ldw][S d]
   half* oh = scratch<half>("msaatt.oh", rows * Wd);
   { Gemm g{}; g.X = w; g.tx = F16; g.sx = (int64_t)n * ldw; g.W = vh; g.tw = F16; g.sw = (int64_t)ldw * S * d; g.Y = oh; g.ty = F16;
@@ -269,7 +271,8 @@ static void msaAttention(Trunk& t, const std::string& pre) {
   half* gate = scratch<half>("msaatt.gate", rows * Wd);
   linH(xn, pre + ".gatingQuery", gate, rows, Cm, Wd);
   half* gated = scratch<half>("msaatt.gated", rows * Wd);
-  run1d("af3_msa_from_heads", rows * Wd, MsaFromHeadsArgs{oh, gate, gated, (uint)S, (uint)n, (uint)heads, (uint)d});
+  if (v8) run1d("af3_msa_from_heads8", rows * Wd / 8, MsaFromHeadsArgs{oh, gate, gated, (uint)S, (uint)n, (uint)heads, (uint)d});
+  else run1d("af3_msa_from_heads", rows * Wd, MsaFromHeadsArgs{oh, gate, gated, (uint)S, (uint)n, (uint)heads, (uint)d});
   lin(gated, pre + ".outputProjection", t.msa, rows, Wd, Cm, 1.f);
 }
 // chai-1's GROUPED outer product: L, R = LN(m) Wl, Wr reshaped [S][n][G][K], masked; P[i,j,g,k,l] = sum_s L[s,i,g,k]

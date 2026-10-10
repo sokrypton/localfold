@@ -192,6 +192,24 @@ kernel void af3_msa_from_heads(LF_ARGS(MsaFromHeadsArgs)) {
   uint si = lf_udiv((uint)t, W), c = (uint)t - si * W, s = lf_udiv(si, a.n), i = si - s * a.n, h = c / a.d, e = c - h * a.d;
   a.out[t] = (half)((float)a.o[(((ulong)h * a.n + i) * a.S + s) * a.d + e] * lf_sigmoid((float)a.gate[t]));
 }
+// the two above, 8 channels (16 bytes) a thread where d is a multiple of 8 (a half a thread moved ~12 GB/s)
+kernel void af3_msa_v_heads8(LF_ARGS(MsaVHeadsArgs)) {
+  const uint d8 = a.d / 8;
+  const uint t = (uint)LF_INDEX;
+  if ((ulong)t >= (ulong)a.S * a.np * a.heads * d8) return;
+  uint r = lf_udiv(t, d8), e8 = t - r * d8, r2 = lf_udiv(r, a.S), s = r - r2 * a.S, h = lf_udiv(r2, a.np), j = r2 - h * a.np;
+  ((device uint4*)a.out)[t] = j < a.n ? *(device const uint4*)(a.v + ((ulong)s * a.n + j) * a.heads * a.d + h * a.d + e8 * 8) : uint4(0);
+}
+kernel void af3_msa_from_heads8(LF_ARGS(MsaFromHeadsArgs)) {
+  const uint W8 = a.heads * a.d / 8, d8 = a.d / 8;
+  const uint t = (uint)LF_INDEX;
+  if ((ulong)t >= (ulong)a.S * a.n * W8) return;
+  uint si = lf_udiv(t, W8), c8 = t - si * W8, s = lf_udiv(si, a.n), i = si - s * a.n, h = lf_udiv(c8, d8), e8 = c8 - h * d8;
+  device const half4* o = (device const half4*)(a.o + (((ulong)h * a.n + i) * a.S + s) * a.d + e8 * 8);
+  device const half4* g = (device const half4*)(a.gate + (ulong)t * 8);
+  device half4* out = (device half4*)(a.out + (ulong)t * 8);
+  for (int k = 0; k < 2; ++k) out[k] = half4(float4(o[k]) * (1.f / (1.f + exp(-float4(g[k])))));
+}
 kernel void af3_mask_norm(LF_ARGS(MaskNormArgs)) {
   uint t = (uint)LF_INDEX;
   if (t >= a.L * a.L) return;
