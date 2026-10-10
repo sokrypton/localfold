@@ -671,9 +671,29 @@ static int foldMain(int argc, char** argv) {
       TAP().reserve(FrameStreamer::planned(steps), mask.size() * 3 * 4);
       frames.start(framesDir, mask.size() * 3, steps);
     }
-    std::vector<float> xs = sample(steps, seeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
+    // several GPUs with the diffusion whole on every rank and several samples a batch: the samples DEALT, sample k on
+    // rank k % N (each its own seed, so the same walk as in the batch), the coordinates gathered after - every rank
+    // ran every sample before, the whole batch's diffusion on each
+    const bool dealt = keptLo >= 0 && mg::WORLD > 1 && cn > 1;
+    std::vector<uint64_t> mySeeds;
+    for (size_t k = 0; k < cn; ++k) if (!dealt || (int)(k % mg::WORLD) == mg::RANK) mySeeds.push_back(seeds[k]);
+    NS = (int)mySeeds.size();
+    std::vector<float> xs = NS ? sample(steps, mySeeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
-    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
+    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); }) : std::vector<float>();
+    if (dealt) {
+      const size_t per = mask.size() * 3;
+      mg::Shared& xS = mg::shared("sh.xs", perBatch * per * 4);
+      for (size_t k = 0, j = 0; k < cn; ++k)
+        if ((int)(k % mg::WORLD) == mg::RANK)
+          CK(cudaMemcpyAsync((float*)xS.local + k * per, xs.data() + (j++) * per, per * 4, cudaMemcpyHostToDevice, STREAM));
+      mg::fence(); mg::hostFence();
+      xs.assign(cn * per, 0.f);
+      for (size_t k = 0; k < cn; ++k)
+        CK(cudaMemcpy(xs.data() + k * per, (const float*)xS.peer[k % mg::WORLD] + k * per, per * 4, cudaMemcpyDefault));
+      mg::hostFence();           // (no rank writes its slots again before every rank has read them)
+      NS = (int)cn;
+    }
     mg::tick("sampler");
     FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
     // several GPUs on a sharded pair, past the sampler: the confidence head of every sample and the contacts on held
