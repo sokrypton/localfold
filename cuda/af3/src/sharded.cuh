@@ -196,7 +196,10 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   // channels a group, two groups' planes (a, b and the product) held: group q + 1's pulls (a copy stream) and group
   // q - 1's pushes (another) run beside group q's GEMM - a quarter of the channels a group where there are enough,
   // fewer where the room is short
-  int g = std::max(1, (cg + 3) / 4);
+  // (small folds one or two groups: a quarter of a rank's channels is a GEMM too small to fill the card - at 988
+  // tokens four groups of four planes ran the contraction at 70% of one group's rate, with little exchange to hide)
+  const int groups = np >= 4096 ? 4 : np >= 2048 ? 2 : 1;
+  int g = std::max(1, (cg + groups - 1) / groups);
   while (g > 1 && !roomFor((size_t)2 * g * plane * (2 * sizeof(TQ) + sizeof(B16)))) g = (g + 1) / 2;
   TQ* aAll[2] = {}; TQ* bAll[2] = {}; B16* pAll[2] = {};
   for (int k = 0; k < 2 && cg; ++k) {
