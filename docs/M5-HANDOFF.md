@@ -471,3 +471,9 @@ Near morning:
   8 KB threadgroup tile per hidden chunk, never written to memory). 209 ms against SwiGLU 118 + transition2 77 a
   pass. The three accumulators and two barriers a chunk cost more than the 132 MB round trip saved. The raw
   `transition1` would also have had to stay unretired, since `prepareWeights` retires it once interleaved.
+- **Lost (again): the diffusion's gated residuals and boltz2's up-gate multiply in their GEMMs' epilogues**, re-tried
+  in the small-fold regime. Byte-identical, 72 dispatches a step fewer, and level at 16 and 68 tokens. A step at 16
+  tokens costs 6.0 ms against 7.6 at 68, but that floor is not dispatches. It is the transformer's ~311 MB of weights
+  read every step by GEMMs too small to saturate the bus (768 x 80 x 768: ~30 us whatever K, 38 GB/s; 3072 x 80 x
+  768: 96 GB/s). What would move it: int8-resident weights with a dequantising GEMM (README's Next 3, ESM2's case), or
+  more samples a batch (NS > 1 amortises every weight read).
