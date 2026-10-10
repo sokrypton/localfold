@@ -1473,8 +1473,10 @@ start-up, outside the fold's own clock, grew 6.0 -> 10.0 s from one GPU to eight
 initialisation), then `python3 tools/check-multigpu.py --sizes=4,12,24 --big=41 --sim --times` (correctness on 1 vs 8, scaling
 over 1/2/4/8, the 10,127-token fold; `--sim` adds each size as one simulated rank of N on one of the box's GPUs, so the
 measured fold minus it IS the interconnect's cost, size by size; `--times` the phases past the trunk), and `--full` for
-the default 3 recycles and 200 steps. (Ranks SHARING one GPU - `--gpu-map=0,0`, how this box checks correctness - are
-slow by construction now: a fence waits in a kernel, and two contexts on one card take turns by time slice.) `LOCALFOLD_MG_TIMES=1` prints
+the default 3 recycles and 200 steps. (Ranks SHARING one GPU - `--gpu-map=0,0`, how this box checks correctness - fence on the
+host: a fence waiting in a kernel would hold the card while the peer it waits for needs it, and two contexts on one
+card take turns by time slice - a 3-rank trunk was 14.4 s against 0.4. `LOCALFOLD_MG_DEVICE_FENCES=1` keeps them on
+the device there, to check them.) `LOCALFOLD_MG_TIMES=1` prints
 each phase past the trunk; `--profile` with `LOCALFOLD_PROF_GAPS=20` the kernels, the copies and the idle by what ended it.
 
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)

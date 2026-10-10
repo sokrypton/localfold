@@ -604,7 +604,7 @@ static int foldMain(int argc, char** argv) {
     if (sharded(t)) {                    // the diffusion's conditioning and token attention on this rank's rows
       if (structural) { fprintf(stderr, "a sharded pair: not OpenDDE\n"); return 1; }
       sh::DLO = t.shardLo; sh::DROWS = t.shardRows; dP = pairBase(t);
-      GRAPHS = !noGraphs;      // (the steps' graphs: its fences count their generations on the device)
+      GRAPHS = !noGraphs && !mg::SHARED_DEVICE;   // (the steps' graphs: their fences count generations on the device)
       if (DIFF_HALF && oneSample && !M.flag("diffusion.transformer.noResidual")) diffusionSharedBuffers(nD);
     }
     mg::tick("to the diffusion");

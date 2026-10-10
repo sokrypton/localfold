@@ -39,6 +39,10 @@ inline Shm* SHM = nullptr;
 // the real shapes and its real memory, which is what a box of N GPUs is short of when it is not N times faster - so
 // the per-rank work can be measured and tuned on one GPU. (The interconnect is the part it cannot see.)
 inline bool SIM = false;
+// ranks SHARING a GPU (LOCALFOLD_GPU_MAP=0,0 - how a one-GPU box checks a fold): their fences on the host, since a fence
+// waiting in a kernel holds the card while the peer it waits for needs it (two contexts on one card take turns by time
+// slice: a 3-rank trunk 14.4 s against 0.4); LOCALFOLD_MG_DEVICE_FENCES=1 keeps them on the device there
+inline bool SHARED_DEVICE = false;
 inline bool FINISHED = false;
 inline std::vector<pid_t> CHILDREN;
 
@@ -157,6 +161,8 @@ inline void launch(int world) {
     std::vector<int> map; for (const char* s = m; *s;) { map.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s) ++s; }
     if ((int)map.size() < world) { fprintf(stderr, "LOCALFOLD_GPU_MAP names %zu devices for %d ranks\n", map.size(), world); exit(1); }
     dev = map[RANK];
+    for (int a = 0; a < world; ++a) for (int b = a + 1; b < world; ++b) SHARED_DEVICE = SHARED_DEVICE || map[a] == map[b];
+    if (getenv("LOCALFOLD_MG_DEVICE_FENCES")) SHARED_DEVICE = false;
   }
   CK(cudaSetDevice(dev));
   // CUDA IPC maps another GPU's memory only where the two can reach each other (NVLink, or PCIe peer-to-peer)
@@ -283,8 +289,10 @@ inline DevFlags devFlags() {
   }
   return f;
 }
+inline void hostFence();
 inline void fence() {
   if (WORLD == 1 || SIM) return;
+  if (SHARED_DEVICE) { hostFence(); return; }
   arriveAndWaitK<<<1, 32, 0, STREAM>>>(devFlags());
   CK(cudaGetLastError());
 }
