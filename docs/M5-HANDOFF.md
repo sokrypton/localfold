@@ -603,3 +603,26 @@ outliers. What remains, all bandwidth or scalar work:
     474 -> 448 ms a pass (-5%), the trunk inside the drift.
   - **The same ceiling decides the pair transition**: it already runs its 25.6 GFLOP at 2.06 effective, and its f16
     arm was declined on the M2 for accuracy. Not attempted.
+- **27fb5876, CI**: `.github/workflows/metal.yml` builds the selftest, the bench and the macOS wheel (with the wheel's
+  own checks and each binary's `--help` from a fresh install) on every push to `metal` that touches metal/,
+  cuda/featurise/ or python/. It runs on macos-14, an older SDK than the M5's, which is the build fbd35863's failure
+  needed. The first run passed.
+- **81c63e24, attention v3: 32 x 32 tiles at head width 32 where they pad no worse.** The trunk's attention went
+  186 / 187 -> 175 / 178 ms a pass (5CAJ, profiled).
+  - **What bounds the kernel**: timed with the softmax removed, the 16 x 64 tile's two products run at 7.2 TFLOP/s and
+    a 32 x 32 tile's at 9.6, so it is the products and not the softmax (12%).
+  - **Why 32 x 32 lost before**: it takes 128 queries a threadgroup, so it pads more at some lengths (300: +10%) and
+    starves at small grids (128 x 4 x 128: +12%). D 48 and 64 lose everywhere.
+- **Lost, with numbers**:
+  - **Concurrent dispatch** (a concurrent encoder, a buffer barrier after every dispatch): 6MRR diffusion 1520-1538 ->
+    1533-1540 ms. The chain is serial, so the barriers cost what the serial boundaries did.
+  - **Int8-resident weights, not built**: its premise was the small fold's weight reads. Benched, the diffusion's
+    skinny GEMMs (3072 x 80 x 768: 46-54 us) run at 7-8 TFLOP/s on the matrix units, so they are not weight-bound.
+  - **80 x 32 tiles for those GEMMs**: 7% faster in the bench and 3.5% SLOWER in the fold (diffusion 1515-1529 ->
+    1573-1577 ms).
+  - **The row sums from the half P tile**: level.
+- **A WebGPU first fold on the M5** (6MRR, stock): 3.79 s against 1.98 for the second.
+  - Shader compile busy time 0.15 s (macOS's own shader cache may survive Chrome's wiped profile, so a real first
+    visitor may pay more).
+  - Weight upload 0.15 s (309 MiB), on-device weight decode 0.17 s.
+  - The rest is the GPU's first run.
