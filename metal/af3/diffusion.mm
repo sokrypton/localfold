@@ -40,6 +40,10 @@ struct Diffusion {
   std::vector<half*> bias;
   const half *wNorm, *wRaw;
   float *bNorm, *bRaw;
+  // the transformer's conditioning for upcoming noise levels, batched (conditioningAhead): the sampler's plan of
+  // levels, the levels held and their two GEMMs' outputs, slot k at k pn rows
+  std::vector<float> plan; size_t planAt = 0;
+  std::vector<float> held; float *heldNorm = nullptr, *heldRaw = nullptr;
 };
 static Diffusion D;
 
@@ -210,24 +214,61 @@ static void prepareTransformer(int n) {
   }
   releaseScratch({"dt.pn", "dt.flat"});
 }
-static void transformer(float* act, const float* cond) {
+// The transformer's conditioning depends on the noise level alone, and the sampler knows its levels: at a short n the
+// two conditioning GEMMs (73728 and 36864 columns at boltz2's 24 blocks) are bound by reading their 170 MB of weights,
+// so the next K levels' conditionings run as ONE pair of GEMMs, K pn rows - the weights read once for K steps. Only
+// where the rows are few (pn <= 128: past that the GEMMs are compute-bound) and K x the outputs fit 256 MB.
+// AF3_COND_AHEAD=0 the control.
+static void conditioningAhead(float level) {
+  static const bool on = !getenv("AF3_COND_AHEAD") || atoi(getenv("AF3_COND_AHEAD")) != 0;
+  if (!on || D.plan.empty() || std::find(D.held.begin(), D.held.end(), level) != D.held.end()) return;
+  auto it = std::find(D.plan.begin() + std::min(D.planAt, D.plan.size()), D.plan.end(), level);
+  if (it == D.plan.end()) return;
+  D.planAt = (size_t)(it - D.plan.begin());
+  const std::string Tn = "diffusion.transformer";
+  const int n = D.n, Cc = metaI(Tn + ".condChannels");
+  const size_t pn = ((size_t)n + 15) / 16 * 16, per = pn * (D.ldn + D.ldr) * 4;
+  const size_t K = std::min<size_t>({16, ((size_t)256 << 20) / per, D.plan.size() - D.planAt});
+  if (pn > 128 || K < 2) return;
+  D.held.assign(D.plan.begin() + D.planAt, D.plan.begin() + D.planAt + K);
+  D.heldNorm = scratch<float>("dt.heldNorm", K * pn * D.ldn);
+  D.heldRaw = scratch<float>("dt.heldRaw", K * pn * D.ldr);
+  half* cn = scratch<half>("dt.heldCn", K * pn * Cc);
+  half* ch = scratch<half>("dt.heldCh", K * pn * Cc);
+  if (pn != (size_t)n) { fill(cn, 0, K * pn * Cc * 2); fill(ch, 0, K * pn * Cc * 2); }
+  for (size_t k = 0; k < K; ++k) {
+    const float* cond = singleConditioning(D.held[k]);
+    layerNorm(cond, cn + k * pn * Cc, n, Cc, nullptr, nullptr);
+    toHalf(cond, ch + k * pn * Cc, (size_t)n * Cc);
+  }
+  linW(ADA_RAW ? ch : cn, D.wNorm, D.heldNorm, K * pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning, ahead");
+  linW(ch, D.wRaw, D.heldRaw, K * pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates, ahead");
+}
+static void transformer(float* act, const float* cond, float level) {
   const std::string Tn = "diffusion.transformer";
   int n = D.n, C = metaI(Tn + ".channels"), Cc = metaI(Tn + ".condChannels");
   int heads = metaI(Tn + ".heads"), Dh = metaI(Tn + ".dimension"), Wd = heads * Dh, factor = metaI(Tn + ".transitionFactor");
   size_t rows = (size_t)n * NS;
-  // every block's conditioning, two GEMMs
+  // every block's conditioning, two GEMMs - or the slot conditioningAhead holds for this level
   // (the conditioning GEMMs too on 16-row tiles: [LN0(cond) | cond] in half, the padding rows zero)
   size_t pn = ((size_t)n + 15) / 16 * 16;
-  float* gNorm = scratch<float>("dt.gNorm", pn * D.ldn);
-  float* gRaw = scratch<float>("dt.gRaw", pn * D.ldr);
-  half* cn = scratch<half>("dt.cn", pn * Cc);
-  half* ch = scratch<half>("dt.ch", pn * Cc);
-  static const void* zeroedC = nullptr;
-  if (pn != (size_t)n && zeroedC != cn) { fill(cn, 0, pn * Cc * 2); fill(ch, 0, pn * Cc * 2); zeroedC = cn; }
-  layerNorm(cond, cn, n, Cc, nullptr, nullptr);
-  toHalf(cond, ch, (size_t)n * Cc);
-  linW(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning");    // (chai: raw)
-  linW(ch, D.wRaw, gRaw, pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates");
+  float* gNorm; float* gRaw;
+  auto slot = std::find(D.held.begin(), D.held.end(), level);
+  if (slot != D.held.end()) {
+    gNorm = D.heldNorm + (size_t)(slot - D.held.begin()) * pn * D.ldn;
+    gRaw = D.heldRaw + (size_t)(slot - D.held.begin()) * pn * D.ldr;
+  } else {
+    gNorm = scratch<float>("dt.gNorm", pn * D.ldn);
+    gRaw = scratch<float>("dt.gRaw", pn * D.ldr);
+    half* cn = scratch<half>("dt.cn", pn * Cc);
+    half* ch = scratch<half>("dt.ch", pn * Cc);
+    static const void* zeroedC = nullptr;
+    if (pn != (size_t)n && zeroedC != cn) { fill(cn, 0, pn * Cc * 2); fill(ch, 0, pn * Cc * 2); zeroedC = cn; }
+    layerNorm(cond, cn, n, Cc, nullptr, nullptr);
+    toHalf(cond, ch, (size_t)n * Cc);
+    linW(ADA_RAW ? ch : cn, D.wNorm, gNorm, pn, Cc, D.ldn, 0.f, D.bNorm, 1.f, "transformer conditioning");    // (chai: raw)
+    linW(ch, D.wRaw, gRaw, pn, Cc, D.ldr, 0.f, D.bRaw, 1.f, "transformer zero gates");
+  }
   bool noResidual = flag(Tn + ".noResidual");
   float* pre = noResidual ? scratch<float>("dt.pre", rows * C) : nullptr;
   // the GEMMs run on the rows rounded up to 16: a ragged last tile takes the GEMM's bounds-checked paths (68 rows: 0.31
@@ -355,6 +396,7 @@ static float* denoise(const float* x, float level) {
   int n = D.n, dense = metaI("batch.dense");
   size_t atoms = (size_t)n * dense, total = atoms * NS;
   float d = level * level + 256.f, skip = 256.f / d, outS = level * 16.f / sqrtf(d), in = 1.f / sqrtf(d);
+  conditioningAhead(level);
   float* single = singleConditioning(level);
   stage("conditioning");
   const float* atomMask = M.f("batch.refMask");
@@ -376,7 +418,7 @@ static float* denoise(const float* x, float level) {
   copy(act, D.enc.tokenAct, rows * perToken * 4);
   run1d("af3_add_broadcast", rows * perToken, AddBroadcastArgs{act, snProj, (u64)n * perToken, rows * perToken});
   stage("snproj");
-  transformer(act, single);
+  transformer(act, single, level);
   stage("transformer");
   float* actn = scratch<float>("dn.actn", rows * perToken);
   ln(act, actn, rows, perToken, "diffusion.outputNormScale", "diffusion.outputNormOffset");
@@ -476,6 +518,8 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
     // the page's Flow: one draw at the top of a schedule from 160 A, then the state REPLACED by each prediction
     for (int k = 0; k <= steps; ++k) levels[k] = noiseSchedule((double)k / steps, 16, 0.0004, 10, 7);
     run1d("af3_initial_noise", all3, InitNoiseArgs{dX, dSeeds, n3, all3, (float)levels[0], 0});
+    D.plan.clear(); D.planAt = 0;
+    for (int step = 1; step <= steps; ++step) D.plan.push_back((float)levels[step - 1]);
     for (int step = 1; step <= steps; ++step) {
       const float* d = denoise(dX, (float)levels[step - 1]);
       if (onStep) onStep(d, step, steps);
@@ -490,6 +534,9 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
     float* dRot = uploadNew(rot.data(), rot.size());
     float* dNoisy = scratch<float>("sample.noisy", all3); float* dC = scratch<float>("sample.centroid", 3 * ns);
     run1d("af3_initial_noise", all3, InitNoiseArgs{dX, dSeeds, n3, all3, (float)levels[0], 0});
+    D.plan.clear(); D.planAt = 0;      // (the levels the denoiser will see, for conditioningAhead)
+    for (int step = 1; step <= steps; ++step)
+      D.plan.push_back((float)(levels[step - 1] * (1 + (levels[step] > gammaMin ? gamma0 : 0))));
     for (int step = 1; step <= steps; ++step) {
       double previous = levels[step - 1], level = levels[step];
       float tHat = (float)(previous * (1 + (level > gammaMin ? gamma0 : 0)));
@@ -505,6 +552,7 @@ std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const s
   }
   std::vector<float> out = download(dX, all3);
   release(dX); release(dSeeds); release(dMask);
+  D.plan.clear(); D.planAt = 0; D.held.clear();
   NS = 1;
   return out;
 }
