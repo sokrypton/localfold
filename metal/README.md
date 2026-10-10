@@ -205,10 +205,15 @@ uses more registers): no error, the output untouched.
 
 ## Next
 
-1. The skinny GEMMs (a single sample's diffusion): weights read at ~25 GB/s where the M2 has ~100.
+1. The skinny GEMMs (a single sample's diffusion): weights read at ~25 GB/s where the M2 has ~100. On the M5 (matrix
+   units) 38-96 GB/s: a 68-token step is ~311 MB of transformer weights, and its floor (6.0 ms at 16 tokens, 7.6 at
+   68) is those reads - not the dispatches (72 fewer a step: level). Int8-resident weights (3.) or more samples a batch
+   are what move it.
 2. Fusions the CUDA port has: the gated residual into the next adaptive LayerNorm, the trunk's transition and
    triangle kernels.
 3. An int8-weight GEMM for ESM2 3B (its matrices are expanded to half a GEMM at a time).
-4. An M5: its GPU's matrix hardware through Metal 4's tensor APIs - done for the half GEMMs and the long attentions
-   (`core/gemm_tensor.metal`, chosen at run time on an Apple10 GPU); docs/M5-HANDOFF.md's last section has the numbers
-   and what is left (f32-operand GEMMs, narrow-head attention).
+4. An M5: its GPU's matrix hardware through Metal 4's tensor APIs - done (`core/gemm_tensor.metal`, chosen at run
+   time on an Apple10 GPU): the half GEMMs with their epilogues in registers, the f32-X GEMMs that allow half staging,
+   attention from 48 keys at heads 16-64 wide (v3, the online softmax in cooperative tensors). Left: heads 8 and 24
+   wide (AF2's extra MSA, AF3's single attention) on lf_attention, and attention itself at 6-7 TFLOP/s against the
+   GEMMs' 10-12 - 37% of a 1020-token trunk. docs/M5-HANDOFF.md's last sections have the numbers and what lost.
