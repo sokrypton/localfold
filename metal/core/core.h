@@ -125,6 +125,13 @@ bool gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, si
 bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
                       int out, const float* biasG, const float* biasV, half* vTmp, const char* label = nullptr,
                       half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr, float lnEps = 1e-5f);
+// (and both into a half pair: the matrix units' kernels only - the sum in float, rounded once on the store)
+bool gemmGatedAdd(const half* X, const half* W, const half* aux, half* pair, size_t rows, int in, int out,
+                  const float* bias = nullptr, half* lnOut = nullptr, const float* lnScale = nullptr,
+                  const float* lnOffset = nullptr, float lnEps = 1e-5f);
+bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, half* pair, size_t rows, int in,
+                      int out, const float* biasG, const float* biasV, half* vTmp, const char* label = nullptr,
+                      half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr, float lnEps = 1e-5f);
 // the outer product's block P[(i, c)][(j, e)] = sum_s l[s][i0 + i][c] r[s][j][e] (lt, rt transposed: [S][L * O] with
 // leading dimensions ldl, ldr), stored permuted into X [(i, j)][(c, e)] by the epilogue - on the matrix units only
 // (false: nothing run, the caller's GEMM and permute; LOCALFOLD_OPM_PERMUTED=0 the control)
@@ -171,6 +178,7 @@ void addBias(float* y, const float* b, size_t rows, int C, int act = 0);   // ac
 // ---------------------------------------------------------------- profiling (LOCALFOLD_PROFILE=1)
 // every labelled dispatch its own command buffer, its GPU time summed by label: an upper bound, for proportions
 bool profiling();
+bool matrixUnits();      // the matrix units' kernels run here (an Apple10 GPU on macOS 26; LOCALFOLD_GEMM_TENSOR=0 not)
 void profileStart();
 void profileReport(const char* stage, int top = 20);
 

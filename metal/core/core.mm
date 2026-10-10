@@ -545,7 +545,10 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // a half output takes a half destination even where the caller asked for float accumulation: the matrix units sum a
   // whole run wider than half and round once on the way out (6MRR's and 5CAJ's folds unchanged to the PDB's 0.001 A;
   // 512 x 65025 x 128 with a bias 0.86 ms against 1.41 into a float destination - the float tile's register cost)
-  const bool hacc = !floatAcc && tc_ == F16;
+  // An epilogue that adds into a half output (beta, the gated residual, the normalised add - the half pair) keeps the
+  // float tile: the update is summed into the residual before the one rounding (128 x 65025 x 128 with beta: 0.467-0.497
+  // ms against 0.469-0.478, level)
+  const bool hacc = !floatAcc && tc_ == F16 && a.beta == 0.f && !(a.epilogue & (64 | 8192));
   const bool tri = a.epilogue & 256;
   const bool plain = !tri && (a.epilogue & ~6) == 0 && a.alpha == 1.f && a.beta == 0.f;
   // the tile: TM rows along n by TN columns along m. A short n (up to 128) in one tile row, rounded up to 16, 64 columns
@@ -576,7 +579,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
   // the next LayerNorm emitted by the epilogue (Gemm::lnOut): a float output whose rows are one 64 x 128 tile wide
   const bool lnEmit = a.lnOut && lnWanted && vecEp && ((tm == 64 && tn == 128) || (tm == 32 && tn == 256)) && a.m == tn &&
-                      tc_ == F32 && !hacc && batch == 1 &&
+                      !hacc && batch == 1 &&
                       a.lnOut % 16 == 0 && a.lnScale % 16 == 0 && a.lnOffset % 16 == 0 &&
                       a.lnOut2 % 16 == 0 && a.lnScale2 % 16 == 0 && a.lnOffset2 % 16 == 0;
   if (!lnEmit) a.lnOut = a.lnOut2 = 0;
@@ -683,8 +686,8 @@ bool gemm(const Gemm& g) {
                  a.lnOut2 = (uint64_t)g.lnOut2; a.lnScale2 = (uint64_t)g.lnScale2; a.lnOffset2 = (uint64_t)g.lnOffset2; }
   return gemmRun(g.tw, g.tx, g.ty, a, g.batch, g.half, g.accFloat, g.label);
 }
-bool gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, size_t rows, int in, int out, const float* bias,
-                  half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+static bool gatedAdd(const half* X, const half* W, const half* aux, void* pair, DT tp, size_t rows, int in, int out, const float* bias,
+                     half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
   GemmArgs a{};
   a.A = (uint64_t)W; a.B = (uint64_t)X; a.C = a.D = (uint64_t)pair;
   a.m = out; a.n = (int)rows; a.k = in; a.lda = out; a.ldb = in; a.ldc = a.ldd = out;
@@ -692,11 +695,19 @@ bool gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, si
   a.aux = (uint64_t)aux; a.ldaux = out;
   if (bias) { a.bias = (uint64_t)bias; a.epilogue |= 4; }
   if (lnOut) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
-  return gemmRun(F16, F16, F32, a, 1, false, false, "gated add");
+  return gemmRun(F16, F16, tp, a, 1, false, false, "gated add");
 }
-bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
-                      int out, const float* biasG, const float* biasV, half* vTmp, const char* label,
-                      half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+bool gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, size_t rows, int in, int out, const float* bias,
+                  half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+  return gatedAdd(X, W, aux, pair, F32, rows, in, out, bias, lnOut, lnScale, lnOffset, lnEps);
+}
+bool gemmGatedAdd(const half* X, const half* W, const half* aux, half* pair, size_t rows, int in, int out, const float* bias,
+                  half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+  return gatedAdd(X, W, aux, pair, F16, rows, in, out, bias, lnOut, lnScale, lnOffset, lnEps);
+}
+static bool gatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, void* pair, DT tp, size_t rows, int in,
+                         int out, const float* biasG, const float* biasV, half* vTmp, const char* label,
+                         half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
   static const bool lnWanted = !getenv("LOCALFOLD_LN_EMIT") || atoi(getenv("LOCALFOLD_LN_EMIT")) != 0;
   static const bool dual = !getenv("LOCALFOLD_GATED_DUAL") || atoi(getenv("LOCALFOLD_GATED_DUAL")) != 0;
   auto a16 = [](const void* p) { return ((uint64_t)p & 15) == 0; };
@@ -711,7 +722,12 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
     const bool ln = lnOut && lnWanted && out == 128 && a16(lnOut) && a16(lnScale) && a16(lnOffset);
     if (ln) { a.lnOut = (uint64_t)lnOut; a.lnScale = (uint64_t)lnScale; a.lnOffset = (uint64_t)lnOffset; a.lnEps = lnEps; }
     ++D().stats.gemms;
-    dispatchInstance("gemmt_dual_64x128",
+    if (tp == F16)
+      dispatchInstance("gemmt_dualh_64x128",
+                       "template [[host_name(\"gemmt_dualh_64x128\")]] kernel void lf_gemm_tensor_dual<64, 128, half>(constant GemmArgs&, uint3, uint);",
+                       &a, sizeof a, Grid{(uint32_t)(out / 128), (uint32_t)((rows + 63) / 64), 1}, 128, 0,
+                       label ? label : "gated add, dual");
+    else dispatchInstance("gemmt_dual_64x128",
                      "template [[host_name(\"gemmt_dual_64x128\")]] kernel void lf_gemm_tensor_dual<64, 128>(constant GemmArgs&, uint3, uint);",
                      &a, sizeof a, Grid{(uint32_t)(out / 128), (uint32_t)((rows + 63) / 64), 1}, 128, 0,
                      label ? label : "gated add, dual");
@@ -719,7 +735,17 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
   }
   { Gemm g{}; g.X = Xv; g.tx = F16; g.W = Wv; g.tw = F16; g.Y = vTmp; g.ty = F16; g.rows = rows; g.in = in; g.out = out;
     g.bias = biasV; g.accFloat = true; g.label = "triangle output"; gemm(g); }
-  return gemmGatedAdd(Xg, Wg, vTmp, pair, rows, in, out, biasG, lnOut, lnScale, lnOffset, lnEps);
+  return gatedAdd(Xg, Wg, vTmp, pair, tp, rows, in, out, biasG, lnOut, lnScale, lnOffset, lnEps);
+}
+bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
+                      int out, const float* biasG, const float* biasV, half* vTmp, const char* label,
+                      half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+  return gatedAddDual(Xg, Wg, Xv, Wv, pair, F32, rows, in, out, biasG, biasV, vTmp, label, lnOut, lnScale, lnOffset, lnEps);
+}
+bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, half* pair, size_t rows, int in,
+                      int out, const float* biasG, const float* biasV, half* vTmp, const char* label,
+                      half* lnOut, const float* lnScale, const float* lnOffset, float lnEps) {
+  return gatedAddDual(Xg, Wg, Xv, Wv, pair, F16, rows, in, out, biasG, biasV, vTmp, label, lnOut, lnScale, lnOffset, lnEps);
 }
 bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S) {
   static const bool on = !getenv("LOCALFOLD_OPM_PERMUTED") || atoi(getenv("LOCALFOLD_OPM_PERMUTED")) != 0;
@@ -894,6 +920,7 @@ void addBias(float* y, const float* b, size_t rows, int C, int act) { run1d("lf_
 
 // ---------------------------------------------------------------- profiling
 bool profiling() { const char* e = getenv("LOCALFOLD_PROFILE"); return e && atoi(e); }
+bool matrixUnits() { return tensorWanted(); }
 void profileStart() {
   Device& d = D();
   if (!profiling()) return;

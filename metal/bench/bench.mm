@@ -3,6 +3,8 @@
 //                               100000 + R * 1000 + C an R x C tile; 1000000 the matrix units' GEMM, + R * 1000 + C
 //                               its R x C tile]
 //                               [types: hhh|hhf|fhf]
+//                               (BENCH_BETA=1: beta 1, float accumulation - the output read back and added into, as a
+//                               residual stream's GEMMs do)
 #include "core.h"
 #include <algorithm>
 #include <cmath>
@@ -105,6 +107,7 @@ int main(int argc, char** argv) {
   void* X = alloc(rows * in * (tx == F16 ? 2 : 4)); void* W = alloc((size_t)in * out * (tw == F16 ? 2 : 4));
   void* Y = alloc(rows * out * (ty == F16 ? 2 : 4));
   Gemm g{}; g.X = X; g.tx = tx; g.W = W; g.tw = tw; g.Y = Y; g.ty = ty; g.rows = rows; g.in = in; g.out = out; g.half = true;
+  if (getenv("BENCH_BETA")) { g.beta = 1.f; g.accFloat = true; }
   double flops = 2.0 * rows * in * out;
   {   // inputs: values, not whatever the allocation held
     std::vector<float> xs(rows * in), ws((size_t)in * out);

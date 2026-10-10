@@ -43,6 +43,9 @@ void ln(const float* x, float* y, size_t rows, int C, const std::string& scale, 
 void ln(const float* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset) {
   layerNorm(x, y, rows, C, scale.empty() ? nullptr : W(scale), offset.empty() ? nullptr : Wopt(offset));
 }
+void ln(const half* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset) {
+  layerNorm(x, y, rows, C, scale.empty() ? nullptr : W(scale), offset.empty() ? nullptr : Wopt(offset));
+}
 void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period) {
   run1d("af3_scale_rows", rows * C, ScaleRowsArgs{x, mask, rows, (uint)C, (uint)period});
 }

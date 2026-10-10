@@ -17,15 +17,16 @@
 // all four), 16 columns a lane; element e's row + 8 at e bit 2, the other row pair at bit 5. Summed in the lane,
 // across the 4 lanes by shuffles, then the simdgroups' parts through threadgroup memory in a fixed order -
 // deterministic. part: [2 statistics][4 simdgroups][64 rows], 512 floats
-// a thread's tile values at element e, read back from D where it just wrote them (cheaper than holding 16 float4s)
-template <typename CT>
-inline float4 lf_ln_at(thread CT& cg, device const float* D, constant GemmArgs& g, int i0, int j0, uint16_t e) {
+// a thread's tile values at element e, read back from D where it just wrote them (cheaper than holding 16 float4s) - in
+// D's own type, so a half output (the half pair) is normalised as it was stored
+template <typename CT, typename TD>
+inline float4 lf_ln_at(thread CT& cg, device const TD* D, constant GemmArgs& g, int i0, int j0, uint16_t e) {
   const auto ix = cg.get_multidimensional_index(e);
   const int j = min(j0 + ix[1], g.n - 1);
-  return *(device const float4*)(D + (ulong)(i0 + ix[0]) + (ulong)j * g.ldd);
+  return float4(*(device const vec<TD, 4>*)(D + (ulong)(i0 + ix[0]) + (ulong)j * g.ldd));
 }
-template <int TN, typename CT>
-inline void lf_emit_ln(thread CT& cg, device const float* D, threadgroup float* part, uint tid, constant GemmArgs& g, int i0, int j0) {
+template <int TN, typename CT, typename TD>
+inline void lf_emit_ln(thread CT& cg, device const TD* D, threadgroup float* part, uint tid, constant GemmArgs& g, int i0, int j0) {
   constexpr uint NS = TN / 64;
   static_assert(TN == 128 || TN == 256, "the emitted LayerNorm is probed for 64 x 128 and 32 x 256");
   const uint sg = tid / 32, first = sg & ~(NS - 1), lane = tid & 31;
@@ -88,6 +89,11 @@ inline void lf_emit_ln(thread CT& cg, device const float* D, threadgroup float* 
     }
   }
 }
+
+// a vector epilogue's 4 results stored in the output's type - a half output saturating at half's largest finite value
+// (the half pair: a residual past it is clamped, not turned into infinity)
+template <typename T> inline vec<T, 4> lf_out4(float4 v) { return vec<T, 4>(v); }
+template <> inline half4 lf_out4<half>(float4 v) { return half4(clamp(v, -65504.f, 65504.f)); }
 
 // Operands as matmul2d sees them: left X = op(B)^T (n x k), right W = op(A)^T (k x m), destination D (n x m), each a
 // tensor over the GEMM's own pointers - extents innermost first, the leading dimension a stride, a transposed operand
@@ -174,7 +180,7 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         const float4 ax = float4(*(device const half4*)((device const half*)g.aux + (ulong)i + (ulong)j * g.ldaux));
         const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
         const float4 r = cv + ax * fast::divide(1.f, 1.f + fast::exp(-v));
-        *(device vec<TC, 4>*)dp = vec<TC, 4>(r);
+        *(device vec<TC, 4>*)dp = lf_out4<TC>(r);
         continue;
       }
       if (g.epilogue & 4096) {    // the outer product's permuted store: D row (i, c), column (j, e) -> [(i, j)][(c, e)]
@@ -186,16 +192,16 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
       if (g.epilogue & 8192) {    // the outer product's normalised add: D = C + (bias + v) / (1e-3 + aux[j]) (af2_opm_add's order)
         const float s = 1e-3f + ((device const float*)g.aux)[j];
         const float4 cv = float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
-        *(device vec<TC, 4>*)dp = vec<TC, 4>(cv + (bv + v) / s);
+        *(device vec<TC, 4>*)dp = lf_out4<TC>(cv + (bv + v) / s);
         continue;
       }
       if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
       if (g.epilogue & 4) v += bv;
       if (g.epilogue & 2) v = max(v, 0.f);
       if (g.epilogue & 32) for (int t = 0; t < 4; ++t) v[t] = 0.5f * v[t] * (1.f + lf_erf(v[t] * 0.70710678118654752f));
-      *(device vec<TC, 4>*)dp = vec<TC, 4>(v);
+      *(device vec<TC, 4>*)dp = lf_out4<TC>(v);
     }
-    if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN>(c, (device const float*)D, part, tid, g, i0, j0); }
+    if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN>(c, (device const TC*)D, part, tid, g, i0, j0); }
     return;
   }
   // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1, beta 0, the output in the
@@ -294,7 +300,8 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
 // float as gemmGatedAdd's) and v = Xv Wv (+ its bias), rounded to half as the projection's half output was - so the
 // value never leaves the registers. A = Wg, B = Xg, C = D = the pair, bias the gate's; aux = Xv (ldaux), aux2 = Wv
 // ([k][m], dense), aux3 its bias or 0. A 64 x 128 tile over 4 simdgroups: a thread's 4 adjacent columns at e..e+3.
-template <int TM = 64, int TN = 128>
+// TP the pair's type: float, or half (the pairformer's half pair - the sum in float, rounded once on the store).
+template <int TM = 64, int TN = 128, typename TP = float>
 kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]]) {
   using namespace mpp::tensor_ops;
@@ -316,7 +323,7 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
   for (uint16_t e = 0; e < cv.get_capacity(); ++e) if (cv.is_valid_element(e)) cv[e] = 0.h;
   op.run(mXg, mWg, cg);
   op.run(mXv, mWv, cv);
-  device float* D = (device float*)g.D;
+  device TP* D = (device TP*)g.D;
   device const float* bg = (g.epilogue & 4) ? (device const float*)g.bias : nullptr;
   device const float* bv = (device const float*)g.aux3;
   const bool ln = g.lnOut != 0;
@@ -330,14 +337,14 @@ kernel void lf_gemm_tensor_dual(constant GemmArgs& g [[buffer(0)]], uint3 grp [[
     if (bg) v1 += *(device const float4*)(bg + i);
     float4 v2 = float4((float)cv[e], (float)cv[e + 1], (float)cv[e + 2], (float)cv[e + 3]);
     if (bv) v2 = float4(half4(v2 + *(device const float4*)(bv + i)));
-    device float4* dp = (device float4*)(D + (ulong)i + (ulong)j * g.ldd);
-    const float4 r = *dp + v2 * (1.f / (1.f + fast::exp(-v1)));
-    *dp = r;
+    device vec<TP, 4>* dp = (device vec<TP, 4>*)(D + (ulong)i + (ulong)j * g.ldd);
+    const float4 r = float4(*dp) + v2 * (1.f / (1.f + fast::exp(-v1)));
+    *dp = lf_out4<TP>(r);
   }
   threadgroup float part[512];
-  if (ln) lf_emit_ln<TN>(cg, (device const float*)D, part, tid, g, i0, j0);
+  if (ln) lf_emit_ln<TN>(cg, (device const TP*)D, part, tid, g, i0, j0);
 }
-// (instantiated on first use: lf_gemm_tensor_dual<64, 128>, host name gemmt_dual_64x128)
+// (instantiated on first use: lf_gemm_tensor_dual<64, 128>, host name gemmt_dual_64x128; <64, 128, half> gemmt_dualh_64x128)
 
 // ---------------------------------------------------------------- the gated flash attention on the matrix units
 // core/common.metal's lf_attention (the same AttnArgs, layouts, mask and bias conventions, the same arithmetic: queries

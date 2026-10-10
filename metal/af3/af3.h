@@ -42,6 +42,7 @@ void linW(const half* X, const half* w, half* Y, size_t rows, int in, int out, c
 // LayerNorm by weight names (an empty or absent offset: none)
 void ln(const float* x, float* y, size_t rows, int C, const std::string& scale, const std::string& offset);
 void ln(const float* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset);
+void ln(const half* x, half* y, size_t rows, int C, const std::string& scale, const std::string& offset);
 void scaleRows(float* x, const float* mask, size_t rows, int C, size_t period);
 void scale(float* x, size_t n, float s, bool relu = false);
 
@@ -81,6 +82,21 @@ void singleTrack(float* single, const float* pair, const Masks& m, int n, int C,
                  const float* extraBias = nullptr);
 // nextB: the block that follows directly, nothing touching the pair between (its first norm emitted by this one)
 void pairformerBlock(float* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B,
+                     const float* extraBias = nullptr, const std::string& nextB = "");
+// the same over a half pair (the trunk's pairformer stack where halfPair(): every residual summed in float and rounded
+// once on its store, every norm read from the half values)
+void triangle(half* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, half* into = nullptr,
+              const std::string& nextNorm = "");
+void gridAttention(half* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, half* into = nullptr,
+                   bool untransposed = false, const std::string& nextNorm = "");
+void transition(half* x, size_t rows, int C, const std::string& pre, half* into = nullptr, const std::string& next1 = "",
+                const std::string& next2 = "");
+void pairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1 = "",
+                 const std::string& next2 = "");
+void parallelPairUpdates(half* pair, const Masks& m, int n, int C, const std::string& pre, const char* which);
+void singleTrack(float* single, const half* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
+                 const float* extraBias = nullptr);
+void pairformerBlock(half* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B,
                      const float* extraBias = nullptr, const std::string& nextB = "");
 // raw [pairs][heads] -> [heads][n][stride] half, log2-scaled (swap: (i, j) read at (j, i))
 half* biasLayout(const float* raw, const std::string& name, int n, int heads, int stride, bool swap);

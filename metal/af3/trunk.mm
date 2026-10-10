@@ -354,9 +354,23 @@ void runTrunk(Trunk& t) {
   if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
   releaseScratch({"msaatt.", "opm.", "trunk.zBeforeMsa"});
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
-  for (int k = 0; k < blocks; ++k)
-    pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
-                    k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
+  // The stack over a half pair: its pair updates are bandwidth-bound GEMMs that read and write the pair, and half moves
+  // half the bytes (128 x 65025 x 128 adding into the pair: 0.70 ms float, 0.47 half). Where the matrix units run (their
+  // kernels take a half residual); every residual is summed in float and rounded once, every norm reads the half
+  // values. LOCALFOLD_HALF_PAIR=0 the control.
+  // (Pair values seen: up to ~13000 - openbind0 - against half's 65504; the stores saturate rather than overflow.)
+  static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+  if (halfWanted && matrixUnits() && t.C % 8 == 0) {
+    half* zh = scratch<half>("pr.zh", pairs * t.C);
+    toHalf(t.pair, zh, pairs * t.C);
+    for (int k = 0; k < blocks; ++k)
+      pairformerBlock(zh, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
+                      k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
+    toFloat(zh, t.pair, pairs * t.C);
+  } else
+    for (int k = 0; k < blocks; ++k)
+      pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
+                      k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
   releaseScratch({"pr.", "grid.", "tr.", "st."});     // (the next pass's embedder and MSA stack would hold theirs beside it)
 }
 
