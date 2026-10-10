@@ -217,3 +217,5 @@ uses more registers): no error, the output untouched.
    attention from 48 keys at heads 16-64 wide (v3, the online softmax in cooperative tensors). Left: heads 8 and 24
    wide (AF2's extra MSA, AF3's single attention) on lf_attention, and attention itself at 6-7 TFLOP/s against the
    GEMMs' 10-12 - 37% of a 1020-token trunk. docs/M5-HANDOFF.md's last sections have the numbers and what lost.
+5. The pair LayerNorm emitted by the previous GEMM's epilogue (Gemm::lnOut; AF3 and AF2, 128-wide pairs, the matrix
+   units): ESMFold2's 256-wide pair is left - a row spans two 64 x 128 tiles, so it wants a 32 x 256 destination.

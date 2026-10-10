@@ -518,3 +518,46 @@ outliers. What remains, all bandwidth or scalar work:
 - **What is left**, each needing a real project: int8-resident weights with a dequantising GEMM (the small-fold floor
   is weight reads); the pair LayerNorm emitted by the previous GEMM's epilogue (~3%); and attention itself (6-7
   TFLOP/s; MPP's single-simdgroup rule for cooperative inputs blocks the obvious bigger tiles).
+
+### 2026-10-10, daytime: the emitted LayerNorm, and what the WebGPU side has left
+
+- **fbd35863 (from the M2)**: `MTLGPUFamilyApple10` and `MTLLanguageVersion4_0` by value. The macOS 26 SDK is the only
+  one that names them, so the M2's SDK 13.3 could not build a1a0d4f5's tensor path. Checked against this SDK's headers
+  (1010, `4 << 16`). Rebuilt here: the selftest and all 29 gates pass. **Host code must build on an old SDK**: a Metal
+  name newer than macOS 13 goes by value, and the `@available` check stays.
+- **A fresh install's first fold** (the kernel source salted so neither cache could answer, 5CAJ): AF3 9.22 -> 9.52 s
+  with the wheel's kernel list and 10.52 without; AF2 4.10 -> 4.35 / 5.07; ESMFold2 3.26 -> 3.56 / 4.39. That is
+  0.3 s with the list. A `.metallib` built offline would need the full Xcode at wheel-build time; not done.
+- **3e8d4600, AF3: the pair's next LayerNorm emitted by the previous update's GEMM.**
+  - The trunk is 4.95 -> 4.78 s at 255 tokens (4 passes, alternated). In a profiled pass, layernorm went from
+    161 ms / 551 dispatches to 30 / 215.
+  - The emitters are the triangle's fused tail, the grid attention's output projection and the transition's second
+    GEMM. The transition writes two norms from the same statistics.
+  - The statistics come from shuffles plus one threadgroup exchange, deterministic. The probe:
+    - Each pair row of a 64 x 128 float destination is held by 4 lanes (lane ^ 1, ^ 8) in each of two simdgroups
+      (sg ^ 1).
+    - Element bit 2 is row + 8 and bit 5 is row + 32; bits 3-4 are column + 32.
+  - The first version reduced through an 8 KB threadgroup table with 3 barriers. That cost the tail +42 ms against
+    -52 saved.
+  - The cost is a second pair-sized half buffer (279 MB at 1044 tokens). `LOCALFOLD_LN_EMIT=0` is the control.
+- **a1e26132, AF2: the same, plus the triangle attention's duplicate LN.** The bias's LN(pair) was the queries' LN,
+  computed twice. Single sequence 1023-1039 -> 963-979 ms (-5.6%). With the 1500-row MSA it is level: that fold's
+  LayerNorm is mostly the MSA's 256-wide rows.
+- **Lost: the diffusion's gated residuals and boltz2's up-gate in their GEMMs' epilogues, at 255 tokens too.**
+  Byte-identical. boltz2 4104/3936 -> 4126/3927 ms, chai1 2390/2386 -> 2342/2355, protenix2 level. Now measured
+  at 16, 68 and 255 tokens.
+- **ESMFold2 is not covered**: its pair is 256 wide, two 64 x 128 tiles a row, so no epilogue sees a whole row.
+  LayerNorm is 8.6% of its trunk (221 ms a pass at 255). A 32 x 256 destination with its own probed layout is the
+  way in. Not done.
+- **WebGPU on the M5**, stock Chrome (`LOCALFOLD_STOCK_FLAGS=1`, adapter `apple / metal-3`, so the M2's prior):
+  - **The baseline**: AF3's 255-token trunk pass is 3.34 s against Metal's ~1.2.
+  - **Profiled per pass**: pair-transition 669 ms, grid.attend 638, grid.project 476, tri.project 340, tri.contract
+    288, tri.project-out 277. That is 1.4-2 TFLOP/s a kernel.
+  - **`probe-alu.js`**: f32 2.77 TFLOP/s scalar and 11.3 vec4; f16 3.66 and 14.3. **f16 is only 1.3x here**, against
+    1.7x on the M2, so half arithmetic is a smaller lever than on the part this code was tuned on.
+  - **The trunk's precision options**: `--pair-weights`, `--accumulate`, `--staged` and `--weights` at f16 are level
+    or slower (two rounds, interleaved).
+  - **`exp2` in log2 units** in the tiled grid.attend: 638/666 against 641/682 ms, level (about 1%), so not committed.
+    The exponentials are not what bounds it.
+  - **What is left is kernel work**: the vector GEMMs' tiling at the M5's instruction rate, and grid.attend's
+    barrier-heavy tile.
