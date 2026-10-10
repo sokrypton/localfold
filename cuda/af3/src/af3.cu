@@ -867,7 +867,7 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `af3 <featurised dir> ...` and `af3 - --serve=<dir>` as before
 int main(int argc, char** argv) {
-  if (const char* g = getenv("LOCALFOLD_GPUS")) mg::launch(atoi(g));     // (before any CUDA call: multigpu.cuh)
+  mg::launch(mg::gpusArg(argc, argv));     // --gpus=N|all: one fold across several GPUs (before any CUDA call: multigpu.cuh)
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("af3", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

@@ -145,3 +145,4 @@ python/*.egg-info/
 
 # wwPDB's whole chemical component dictionary (cuda/featurise/fetch-weights ccd)
 /ccd/
+.localfold-fetch.lock

@@ -14,7 +14,8 @@
 #include "pairtrack.cuh"
 
 namespace sh {
-inline bool ON = getenv("LOCALFOLD_MG_SHARDED") && atoi(getenv("LOCALFOLD_MG_SHARDED"));
+// (the default with several GPUs; LOCALFOLD_MG_SHARDED=0 keeps phase 1, the pair replicated and its updates' work split)
+inline bool ON = !getenv("LOCALFOLD_MG_SHARDED") || atoi(getenv("LOCALFOLD_MG_SHARDED"));
 // the diffusion's pair rows on this rank - the trunk's slab carried into it (DLO -1: the whole pair, one GPU)
 inline int DLO = -1, DROWS = 0;
 inline int padded(int n) { return (n + 15) / 16 * 16; }

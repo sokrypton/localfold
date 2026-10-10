@@ -1381,14 +1381,16 @@ latency-bound at 168 registers a thread with the L2 66% busy. At 10,000 tokens a
 
 ### Several GPUs on one fold (in progress, 2026-10-10)
 
-`LOCALFOLD_GPUS=N cuda/af3/localfold-af3 ...` folds one job across N GPUs: one process a GPU (multigpu.cuh - CUDA IPC
+`cuda/af3/localfold-af3 --gpus=N|all ...` (or `LOCALFOLD_GPUS=N`) folds one job across N GPUs: one process a GPU (multigpu.cuh - CUDA IPC
 buffers, a host barrier under /dev/shm, explicit peer copies, so NVLink and plain PCIe boxes both work), each with
 the port's single-device state unchanged. **Phase 1 (this):** every rank holds the whole trunk pair; each pair
 update - both triangle multiplications (their blocked forms), row and column grid attention (their chunked forms)
 and the transition - computes this rank's share of its output rows or columns and the others' shares are copied in.
 The rest of the trunk runs whole on every rank (deterministic, so the copies stay identical); diffusion and confidence
 run on rank 0 after the trunk. CUDA graphs are off (a capture cannot hold a host barrier); chai-1, OpenDDE, `--serve`
-and repeated folds are refused by name. **Phase 2 (`LOCALFOLD_MG_SHARDED=1`): the trunk on a sharded pair** - each rank
+and repeated folds are refused by name. Rank 0 alone featurises and fetches (the others wait on a lock and fold from its
+input directory), so a search runs once. **Phase 2 - the default with several GPUs (`LOCALFOLD_MG_SHARDED=0` keeps
+phase 1): the trunk on a sharded pair** - each rank
 holds only its rows (shares of the 16-padded length), through the embedding (in-place recycle), the template stack
 (its own 64-channel tensor sharded too), the MSA stack (outer product mean on held rows; the pair-weighted MSA
 attention for held tokens, then the MSA's columns all-gathered) and every pairformer block (sharded.cuh: the triangle
@@ -1407,7 +1409,9 @@ the single-GPU fold on 2 ranks (rf3 0.008); 1TIM dimer on 3 ranks, pLDDT/pTM/ipT
 intellifold2 0.007, protenix2 0.062. Phase 2 - 5CAJ self-templated 0.009 A on 2 and 3 ranks (boltz2 0.026, protenix2
 0.002, rf3 0.004); a 59-residue query with 1,024 MSA rows 0.007 A on 2 and 3; with the diffusion sharded too the
 same: 5CAJ 0.009 A on 2 and 3 ranks, boltz2 0.022, protenix2 0.002, rf3 0.009, the MSA fold 0.007. Speed is not measurable here (the ranks share one card and meet at every
-exchange); that waits on a real multi-GPU box.
+exchange); that waits on a real multi-GPU box - `python3 tools/check-multigpu.py` there builds, checks 5CAJ and the
+1TIM dimer on one GPU against every GPU, and times complexes of 4/12/24 1TIM chains on 1, 2, 4, 8 GPUs with every GPU's
+peak memory (`--big=41` adds a 10,127-token fold on all of them), writing a markdown report.
 
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)
 

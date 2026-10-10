@@ -1,5 +1,7 @@
 // A port as one command - see standalone.h. Compiled by g++ with the featuriser's own flags (cuda/build.sh), so the
 // input a standalone fold reads is byte for byte what cuda/featurise/<port>-featurise writes.
+#include <sys/file.h>
+#include <fcntl.h>
 #include "standalone.h"
 #include "standalone_api.h"
 
@@ -223,7 +225,12 @@ static std::vector<std::string> ccdFlag(const Run& run) {
 static fetch::ModelWeights weightsFor(const Run& run, const std::string& port) {
   std::string owner = fetch::portOf(run.model);
   if (owner != port) throw std::runtime_error(run.model + " is folded by localfold-" + owner + ", not localfold-" + port);
-  return fetch::model(run.home, run.model);
+  // (several GPUs, a process each: one fetches while the others wait on the lock, then find the weights there)
+  int lock = mgRank() >= 0 ? open((run.home + "/.localfold-fetch.lock").c_str(), O_CREAT | O_RDWR, 0644) : -1;
+  if (lock >= 0) flock(lock, LOCK_EX);
+  fetch::ModelWeights w = fetch::model(run.home, run.model);
+  if (lock >= 0) { flock(lock, LOCK_UN); close(lock); }
+  return w;
 }
 
 static int af3(Run& run, int (*fold)(int, char**), const char* argv0) {

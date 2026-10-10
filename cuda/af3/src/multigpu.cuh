@@ -11,6 +11,7 @@
 // input and writes the outputs; the others fold silently. A rank that dies takes the others down (the shared abort
 // flag), rather than leaving them at a barrier.
 #include "common.cuh"
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -52,6 +53,31 @@ inline void barrier() {
   }
 }
 
+// the GPUs this process may use, counted without the CUDA runtime (which must not start before the fork):
+// CUDA_VISIBLE_DEVICES's entries where it is set, else the driver's /proc entries
+inline int visibleGpus() {
+  if (const char* v = getenv("CUDA_VISIBLE_DEVICES")) {
+    int k = 0; for (const char* s = v; *s; ++s) if (*s != ',' && (s == v || s[-1] == ',')) ++k;
+    return k;
+  }
+  int k = 0;
+  if (DIR* d = opendir("/proc/driver/nvidia/gpus")) {
+    while (dirent* e = readdir(d)) if (e->d_name[0] != '.') ++k;
+    closedir(d);
+  }
+  return k;
+}
+// --gpus=N | --gpus=all (or LOCALFOLD_GPUS) from the command line, the flag taken out of it
+inline int gpusArg(int& argc, char** argv) {
+  int world = getenv("LOCALFOLD_GPUS") ? atoi(getenv("LOCALFOLD_GPUS")) : 1;
+  for (int i = 1; i < argc; ++i) {
+    if (strncmp(argv[i], "--gpus=", 7)) continue;
+    world = !strcmp(argv[i] + 7, "all") ? visibleGpus() : atoi(argv[i] + 7);
+    for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+    --argc; --i;
+  }
+  return std::max(world, 1);
+}
 // before any CUDA call: fork world - 1 ranks, choose each one's device
 inline void launch(int world) {
   WORLD = world;
@@ -69,6 +95,9 @@ inline void launch(int world) {
     CHILDREN.push_back(p);
   }
   atexit(onExit);
+  // (the standalone front end reads these: rank 0 alone featurises and fetches, cuda/featurise/standalone.h)
+  setenv("LOCALFOLD_RANK", std::to_string(RANK).c_str(), 1);
+  setenv("LOCALFOLD_MG_ID", std::to_string(RANK == 0 ? getpid() : getppid()).c_str(), 1);
   int dev = RANK;
   if (const char* m = getenv("LOCALFOLD_GPU_MAP")) {       // "0,0" or "0,1,2,3"
     std::vector<int> map; for (const char* s = m; *s;) { map.push_back(atoi(s)); while (*s && *s != ',') ++s; if (*s) ++s; }
