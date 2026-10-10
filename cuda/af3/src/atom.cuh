@@ -1034,8 +1034,11 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
     // the start, the positions gathered to queries, their three-row projection, the query mask and
     // the add, in one pass (a K = 3 GEMM wrote its whole output at a fraction of the bandwidth)
     if (lenW(E + ".atomPositionsToFeatures") != (size_t)3 * C) { fprintf(stderr, "encoder: positions projection is not 3 x C\n"); exit(1); }
-    encoderStartK<<<blocks(qRows * C), 256, 0, STREAM>>>(o.qStart, atomPositions, t2q.idx, t2q.mask,
-      W(E + ".atomPositionsToFeatures"), o.qMask, act, qRows, C, q1, atoms);
+    // (the diffusion's tokens split: this rank's subsets and their halo only - ATOM_S0/S1)
+    const bool part = ATOM_S1 > ATOM_S0 && NS == 1;
+    const size_t r0 = part ? (size_t)ATOM_S0 * sh.queries : 0, R = part ? (size_t)(ATOM_S1 - ATOM_S0) * sh.queries : qRows;
+    encoderStartK<<<blocks(R * C), 256, 0, STREAM>>>(o.qStart + r0 * C, atomPositions, t2q.idx + r0, t2q.mask + r0,
+      W(E + ".atomPositionsToFeatures"), o.qMask + r0, act + r0 * C, R, C, q1, atoms);
   } else {
     for (int k = 0; k < NS; ++k)
       CK(cudaMemcpyAsync(act + k * q1 * C, o.qStart, q1 * C * 4, cudaMemcpyDeviceToDevice, STREAM));
@@ -1067,7 +1070,11 @@ inline void encoderStep(const std::string& E, EncoderOut& o, const float* atomPo
   scaleByRowK<<<blocks(qRows * C), 256, 0, STREAM>>>(act, o.qMask, qRows, C, q1);
   o.skip = act;
   float* projected = scratch<float>("enc.aggr", qRows * o.perToken);
-  linear<float, float>(act, projected, qRows, C, o.perToken, E + ".projectAtomFeaturesForAggr");
+  {
+    const bool part = ATOM_S1 > ATOM_S0 && NS == 1;
+    const size_t r0 = part ? (size_t)ATOM_S0 * sh.queries : 0, R = part ? (size_t)(ATOM_S1 - ATOM_S0) * sh.queries : qRows;
+    linear<float, float>(act + r0 * C, projected + r0 * o.perToken, R, C, o.perToken, E + ".projectAtomFeaturesForAggr");
+  }
   // the gather back to token atoms fused into the mean: the gathered tensor was atoms x 768 floats
   // a sample, written and read again every step (96 MB at 261 tokens and five samples)
   o.tokenAct = scratch<float>(E + ".tokenAct", (size_t)sh.tokens * NS * o.perToken);

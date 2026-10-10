@@ -1163,8 +1163,11 @@ inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const De
   linear<float, float>(tokenAct, proj, (size_t)sh.tokens * NS, d.perToken, C, Dd + ".projectTokenFeaturesForBroadcast");
   // broadcast to token atoms, gather to queries, add the skip and mask: one pass, nothing between
   float* act = scratch<float>("dec.act", qRows * C);
-  broadcastSkipK<<<blocks(qRows * C), 256, 0, STREAM>>>(proj, t2q.idx, t2q.mask, enc.skip, enc.qMask, act, qRows, C,
-                                                       q1, sh.tokens, sh.dense);
+  // (the diffusion's tokens split: this rank's subsets and their halo only - ATOM_S0/S1)
+  const bool part = ATOM_S1 > ATOM_S0 && NS == 1;
+  const size_t r0 = part ? (size_t)ATOM_S0 * sh.queries : 0, R = part ? (size_t)(ATOM_S1 - ATOM_S0) * sh.queries : qRows;
+  broadcastSkipK<<<blocks(R * C), 256, 0, STREAM>>>(proj, t2q.idx + r0, t2q.mask + r0, enc.skip + r0 * C, enc.qMask + r0,
+                                                   act + r0 * C, R, C, q1, sh.tokens, sh.dense);
   AtomStep st{ gatherOf("batch.queriesToKeys"), enc.qMask, enc.kMask, M.flag(Dd + ".blocks.0.keyMaskedAtomAttention"),
                M.flag(Dd + ".blocks.0.diffusionNoResidual") };
   bool maskPerBlock = M.flag(Dd + ".blocks.0.maskAtomActPerBlock");
@@ -1176,8 +1179,8 @@ inline float* atomDecoder(const float* tokenAct, const EncoderOut& enc, const De
   // with N = 3 the projection read the normalised rows at a fraction of the bandwidth
   float* upd = scratch<float>("dec.upd", qRows * 3);
   if (lenW(Dd + ".atomFeaturesToPositionUpdate") != (size_t)C * 3) { fprintf(stderr, "decoder: position update is not C x 3\n"); exit(1); }
-  maskLnProject3K<<<(unsigned)((qRows + 7) / 8), 256, 0, STREAM>>>(act, enc.qMask, q1, qRows, C,
-    W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd);
+  maskLnProject3K<<<(unsigned)((R + 7) / 8), 256, 0, STREAM>>>(act + r0 * C, enc.qMask + r0, q1, R, C,
+    W(Dd + ".atomFeaturesLayerNormScale"), Wopt(Dd + ".atomFeaturesLayerNormOffset"), W(Dd + ".atomFeaturesToPositionUpdate"), upd + r0 * 3);
   float* out = scratch<float>("dec.out", atoms * NS * 3);
   convert(q2t, upd, out, 3, q1, NS);
   return out;
