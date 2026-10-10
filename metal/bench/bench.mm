@@ -1,6 +1,7 @@
 // metal/bench: GEMM arms timed against each other, interleaved (this laptop's clock drifts over minutes).
 //   metal/bench/localfold-bench <out> <rows> <in> [arms: EP bits, comma-separated, default 0,64; 1000 + B a K step of B;
-//                               100000 + R * 1000 + C an R x C tile]
+//                               100000 + R * 1000 + C an R x C tile; 1000000 the matrix units' GEMM, + R * 1000 + C
+//                               its R x C tile]
 //                               [types: hhh|hhf|fhf]
 #include "core.h"
 #include <algorithm>
@@ -122,7 +123,12 @@ int main(int argc, char** argv) {
       // (an arm of 100000 + R * 1000 + C: an R x C tile - LOCALFOLD_GEMM_TILE, read at every call)
       if (arms[k] >= 1000 && arms[k] < 100000) setenv("LOCALFOLD_GEMM_BK", std::to_string(arms[k] - 1000).c_str(), 1);
       else unsetenv("LOCALFOLD_GEMM_BK");
-      if (arms[k] >= 100000) setenv("LOCALFOLD_GEMM_TILE", (std::to_string((arms[k] - 100000) / 1000) + "x" + std::to_string(arms[k] % 1000)).c_str(), 1);
+      // (an arm of 1000000: the matrix units' GEMM, gemm_tensor.metal; 1000000 + R * 1000 + C an R x C tile of it. Every
+      // other arm is lf_gemm's - LOCALFOLD_GEMM_TENSOR=0 - so an old arm keeps its meaning on an M5)
+      const bool tensorArm = arms[k] >= 1000000;
+      setenv("LOCALFOLD_GEMM_TENSOR", tensorArm ? "1" : "0", 1);
+      const int tile = tensorArm ? arms[k] - 1000000 : arms[k] >= 100000 ? arms[k] - 100000 : 0;
+      if (tile) setenv("LOCALFOLD_GEMM_TILE", (std::to_string(tile / 1000) + "x" + std::to_string(tile % 1000)).c_str(), 1);
       else unsetenv("LOCALFOLD_GEMM_TILE");
       GEMM_EXTRA_EP = arms[k] < 0 || arms[k] >= 1000 ? 0 : arms[k];
       fill(Y, 0, rows * out * (ty == F16 ? 2 : 4));
@@ -155,7 +161,7 @@ int main(int argc, char** argv) {
   for (size_t k = 0; k < arms.size(); ++k) {
     std::sort(times[k].begin(), times[k].end());
     double t = times[k][times[k].size() / 2];
-    printf("  EP+%-4d %8.3f ms  %5.2f TFLOP/s  (relRMS against the first arm %.1e)%s\n", arms[k], t * 1e3, flops / t / 1e12, err[k],
+    printf("  EP+%-7d %8.3f ms  %5.2f TFLOP/s  (relRMS against the first arm %.1e)%s\n", arms[k], t * 1e3, flops / t / 1e12, err[k],
            err[k] > 1e-2 ? "  WRONG" : "");
   }
   return 0;

@@ -1,0 +1,129 @@
+// metal/core's GEMM on the matrix units (Apple10, the M5's "neural accelerators"): Metal 4's tensor operations
+// (MetalPerformancePrimitives' matmul2d), the same arguments and the same epilogues as gemm.metal's lf_gemm. Compiled
+// at Metal Shading Language 4.0 in a library of its own (core.mm: tensor instances) and chosen at run time - an older
+// GPU or OS keeps lf_gemm. (args.h and gemm.metal are prepended by metal/build.sh: lf_erf, lf_udiv, lf_ldf, lf_st)
+//
+// The product is matmul2d's, into a cooperative tensor of the accumulator's type (half where EP bit 8 asks, as lf_gemm's
+// all-half instances accumulate, else float). A plain product - a bias, a ReLU, alpha 1 and beta 0, the output in the
+// accumulator's type - is adjusted in place and stored by the tensor itself; every other epilogue stages the tile in
+// threadgroup memory and applies lf_gemm's arithmetic to it an element at a time, coalesced along the output's row.
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Operands as matmul2d sees them: left X = op(B)^T (n x k), right W = op(A)^T (k x m), destination D (n x m), each a
+// tensor over the GEMM's own pointers - extents innermost first, the leading dimension a stride, a transposed operand
+// the descriptor's transpose flag over its stored layout. A tile is TM rows of D (n) by TN columns (m), SG simdgroups.
+template <typename TA, typename TB, typename TC, int TM, int TN, bool TRA, bool TRB, int EP = 0>
+kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+  using namespace mpp::tensor_ops;
+  constexpr int SG = 4, NT = 32 * SG;
+  typedef metal::conditional_t<(EP & 8) != 0, half, float> TACC;
+  const uint z = grp.z;
+  device TA* A; device TB* B; device TC* D; device const TC* C;
+  if (g.ptrs) {
+    A = (device TA*)((device const ulong*)g.A)[z];
+    B = (device TB*)((device const ulong*)g.B)[z];
+    D = (device TC*)((device const ulong*)g.D)[z];
+    C = (device const TC*)D;
+  } else {
+    A = (device TA*)g.A + (long)z * g.sa;
+    B = (device TB*)g.B + (long)z * g.sb;
+    D = (device TC*)g.D + (long)z * g.sd;
+    C = (device const TC*)g.C + (long)z * g.sc;
+  }
+  const int j0 = grp.y * TM, i0 = grp.x * TN;
+  typedef dextents<int32_t, 2> E2;
+  // X: element (j, k) = TRB ? B[j + k ldb] : B[k + j ldb]
+  tensor<device TB, E2, tensor_inline> tX(B, TRB ? E2(g.n, g.k) : E2(g.k, g.n), array<int32_t, 2>{1, g.ldb});
+  // W: element (k, i) = TRA ? A[k + i lda] : A[i + k lda]
+  tensor<device TA, E2, tensor_inline> tW(A, TRA ? E2(g.k, g.m) : E2(g.m, g.k), array<int32_t, 2>{1, g.lda});
+  constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), TRB, TRA, false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  auto mX = TRB ? tX.slice(j0, 0) : tX.slice(0, j0);
+  auto mW = TRA ? tW.slice(0, i0) : tW.slice(i0, 0);
+  auto c = op.template get_destination_cooperative_tensor<decltype(mX), decltype(mW), TACC>();
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) c[e] = TACC(0);
+  op.run(mX, mW, c);
+
+  // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1, beta 0, the output in the
+  // accumulator's type) - adjusted in place and stored by the tensor (bounds against D's extents), no staging tile
+  if constexpr ((EP & 2) != 0) {
+    static_assert(metal::is_same_v<TC, TACC> && (EP & 1) == 0, "a plain product is stored in the accumulator's type");
+    {
+      if (g.epilogue) {
+        _Pragma("clang loop unroll(full)")
+        for (uint16_t e = 0; e < c.get_capacity(); ++e)
+          if (c.is_valid_element(e)) {
+            const int col = i0 + c.get_multidimensional_index(e)[0];
+            float v = (float)c[e];
+            if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[col] : ((device const float*)g.bias)[col];
+            if (g.epilogue & 2) v = max(v, 0.f);
+            c[e] = (TACC)v;
+          }
+      }
+      tensor<device TC, E2, tensor_inline> tD(D, E2(g.m, g.n), array<int32_t, 2>{1, g.ldd});
+      auto mD = tD.slice(i0, j0);
+      c.store(mD);
+    }
+  } else {
+  // every other epilogue: the tile staged, then lf_gemm's arithmetic an element at a time
+  threadgroup TACC tile[TM * TN];
+  {
+    tensor<threadgroup TACC, extents<int32_t, TN, TM>, tensor_inline> tT(tile, extents<int32_t, TN, TM>());
+    c.store(tT);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if constexpr ((EP & 1) != 0) {   // the triangle's gate: columns in blocks of 8 - 8 channels' pa, then their ga, pb, gb
+    device const float* mask = (device const float*)g.aux;
+    device half* outA = (device half*)g.aux2; device half* outB = (device half*)g.aux3;
+    constexpr int CH = TN / 4;
+    for (int t = tid; t < CH * TM; t += NT) {      // channel-major, a channel's rows consecutive
+      const int cl = t / TM, jl = t % TM, jg = j0 + jl, ch = i0 / 4 + cl;
+      if (jg >= g.n || ch >= g.tgC) continue;
+      const int base = (cl / 8) * 32 + cl % 8;
+      float vpa = (float)tile[jl * TN + base], vga = (float)tile[jl * TN + base + 8];
+      float vpb = (float)tile[jl * TN + base + 16], vgb = (float)tile[jl * TN + base + 24];
+      if (g.epilogue & 4) {
+        device const float* bias = (device const float*)g.bias + i0 + base;
+        vpa += bias[0]; vga += bias[8]; vpb += bias[16]; vgb += bias[24];
+      }
+      const float m = mask[g.tgR0 + jg];
+      uint p = (uint)(g.tgR0 + jg), r = lf_udiv(p, (uint)g.tgN);
+      ulong q = (ulong)r * g.tgNp + (p - r * (uint)g.tgN);
+      outA[(ulong)ch * g.tgPairs + q] = (half)(vpa * m / (1.f + exp(-vga)));
+      outB[(ulong)ch * g.tgPairs + q] = (half)(vpb * m / (1.f + exp(-vgb)));
+    }
+    return;
+  } else {
+    if (g.epilogue & 128) {      // SwiGLU in blocks of 8: columns 16m..16m+7 are a_8m.., 16m+8..16m+15 their b
+      for (int t = tid; t < TM * (TN / 2); t += NT) {
+        const int jl = t / (TN / 2), h = t % (TN / 2), il = (h / 8) * 16 + h % 8;
+        const int j = j0 + jl, i = i0 + il;
+        if (j >= g.n || i + 8 >= g.m) continue;
+        float va = g.alpha * (float)tile[jl * TN + il], vb = g.alpha * (float)tile[jl * TN + il + 8];
+        lf_st(D, (ulong)((i >> 4) * 8 + (i & 7)) + (ulong)j * g.ldd, va / (1.f + exp(-va)) * vb);
+      }
+      return;
+    }
+    for (int t = tid; t < TM * TN; t += NT) {
+      const int jl = t / TN, il = t % TN, j = j0 + jl, i = i0 + il;
+      if (j >= g.n || i >= g.m) continue;
+      float v = g.alpha * (float)tile[t];
+      if (g.epilogue & 64) {      // a gated residual: the GEMM is the gate, aux the gated values, D the residual
+        if (g.epilogue & 4) v += ((device const float*)g.bias)[i];
+        v = (float)((device const half*)g.aux)[(ulong)i + (ulong)j * g.ldaux] * (1.f / (1.f + exp(-v)));
+        lf_st(D, (ulong)i + (ulong)j * g.ldd, lf_ldf(C + (ulong)i + (ulong)j * g.ldc) + v);
+        continue;
+      }
+      if (g.beta != 0.f) v += g.beta * lf_ldf(C + (ulong)i + (ulong)j * g.ldc);
+      if (g.epilogue & 4) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[i] : ((device const float*)g.bias)[i];
+      if (g.epilogue & 2) v = max(v, 0.f);
+      if (g.epilogue & 32) v = 0.5f * v * (1.f + lf_erf(v * 0.70710678118654752f));   // (GELU, erf's)
+      lf_st(D, (ulong)i + (ulong)j * g.ldd, v);
+    }
+  }
+  }
+}
+// (instantiated on first use by the runtime: lf_gemm_tensor<TA, TB, TC, TM, TN, TRA, TRB, EP>, host name gemmt_...)

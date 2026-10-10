@@ -62,6 +62,10 @@ done
 embed "mt::GEMM_SOURCE" "$here/core/args.h" "$here/core/gemm.metal" | sed 's/extern const char\* mt::GEMM_SOURCE;/namespace mt { extern const char* GEMM_SOURCE; }/' > "$build/gemm-source.cpp"
 clang++ -std=c++17 -c "$build/gemm-source.cpp" -o "$build/gemm-source.o"
 core_objs+=("$build/gemm-source.o")
+embed "mt::TENSOR_SOURCE" "$here/core/args.h" "$here/core/gemm.metal" "$here/core/gemm_tensor.metal" \
+  | sed 's/extern const char\* mt::TENSOR_SOURCE;/namespace mt { extern const char* TENSOR_SOURCE; }/' > "$build/tensor-source.cpp"
+clang++ -std=c++17 -c "$build/tensor-source.cpp" -o "$build/tensor-source.o"
+core_objs+=("$build/tensor-source.o")
 
 for port in "${ports[@]}"; do
   pdir="$here/$port"
