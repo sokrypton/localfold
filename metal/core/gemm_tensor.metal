@@ -47,6 +47,30 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
   for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) c[e] = TACC(0);
   op.run(mX, mW, c);
 
+  // EP bit 16, the triangle's gate in registers: the weight in quarters (core's lf_tri_quarters - a 128-column tile 32
+  // channels' pa, ga, pb, gb), and a thread holds 4 adjacent columns every 32 on its rows, element e's column + 32 at
+  // e + 8 (matmul2d's 64 x 128 destination over 4 simdgroups, as probed on the M5; the selftest checks it)
+  if constexpr ((EP & 16) != 0) {
+    static_assert(TM == 64 && TN == 128, "the register gate is laid out for 64 x 128 tiles");
+    device const float* mask = (device const float*)g.aux;
+    device half* outA = (device half*)g.aux2; device half* outB = (device half*)g.aux3;
+    device const float* bias = (g.epilogue & 4) ? (device const float*)g.bias + i0 : nullptr;
+    _Pragma("clang loop unroll(full)")
+    for (uint16_t e = 0; e < c.get_capacity(); ++e) {
+      if (((e >> 3) & 3) != 0 || !c.is_valid_element(e)) continue;
+      const auto ix = c.get_multidimensional_index(e);
+      const int col = ix[0], jg = j0 + ix[1], ch = i0 / 4 + col;
+      if (jg >= g.n || ch >= g.tgC) continue;
+      float vpa = (float)c[e], vga = (float)c[e + 8], vpb = (float)c[e + 16], vgb = (float)c[e + 24];
+      if (bias) { vpa += bias[col]; vga += bias[col + 32]; vpb += bias[col + 64]; vgb += bias[col + 96]; }
+      const float m = mask[g.tgR0 + jg];
+      uint p = (uint)(g.tgR0 + jg), r = lf_udiv(p, (uint)g.tgN);
+      ulong q = (ulong)r * g.tgNp + (p - r * (uint)g.tgN);
+      outA[(ulong)ch * g.tgPairs + q] = (half)(vpa * m / (1.f + exp(-vga)));
+      outB[(ulong)ch * g.tgPairs + q] = (half)(vpb * m / (1.f + exp(-vgb)));
+    }
+    return;
+  }
   // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1, beta 0, the output in the
   // accumulator's type) - adjusted in place and stored by the tensor (bounds against D's extents), no staging tile
   if constexpr ((EP & 2) != 0) {

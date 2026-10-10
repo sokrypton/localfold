@@ -142,6 +142,33 @@ int main() {
     auto a = download(dA, plane * C), b = download(dB, plane * C);
     report("triangle gate a", relRms(refA, std::vector<float>(a.begin(), a.end())), 5e-3);
     report("triangle gate b", relRms(refB, std::vector<float>(b.begin(), b.end())), 5e-3);
+  }  {   // the triangle's gate with a bias (AF2's), C 128: two 128-column tiles
+    int n = 37, np = 40, C = 128; size_t P = (size_t)n * n, plane = (size_t)np * np;
+    auto X = randv(P * C), proj = randv((size_t)C * 2 * C, 0.1f), gate = randv((size_t)C * 2 * C, 0.1f), mask = randv(P), bias4 = randv((size_t)4 * C);
+    std::vector<float> W4((size_t)C * 4 * C);      // channel c's (pa ga pb gb) in blocks of 8
+    for (int r = 0; r < C; ++r) for (int col = 0; col < 4 * C; ++col) {
+      int kind = (col % 32) / 8, c = 8 * (col / 32) + col % 8, k = kind == 1 ? 2 : kind == 2 ? 1 : kind;
+      W4[(size_t)r * 4 * C + col] = k < 2 ? proj[(size_t)r * 2 * C + 2 * c + k] : gate[(size_t)r * 2 * C + 2 * c + k - 2];
+    }
+    std::vector<double> refA(plane * C, 0), refB(plane * C, 0);
+    for (size_t p = 0; p < P; ++p) for (int c = 0; c < C; ++c) {
+      double pa = 0, pb = 0, ga = 0, gb = 0;
+      { int base = (c / 8) * 32 + c % 8; pa = bias4[base]; ga = bias4[base + 8]; pb = bias4[base + 16]; gb = bias4[base + 24]; }
+      for (int k = 0; k < C; ++k) {
+        double x = (float)(half)X[p * C + k];
+        pa += x * (float)(half)proj[(size_t)k * 2 * C + 2 * c]; pb += x * (float)(half)proj[(size_t)k * 2 * C + 2 * c + 1];
+        ga += x * (float)(half)gate[(size_t)k * 2 * C + 2 * c]; gb += x * (float)(half)gate[(size_t)k * 2 * C + 2 * c + 1];
+      }
+      size_t q = (p / n) * np + p % n;
+      refA[(size_t)c * plane + q] = pa * mask[p] / (1 + exp(-ga)); refB[(size_t)c * plane + q] = pb * mask[p] / (1 + exp(-gb));
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(W4).data(), W4.size()); float* dm = uploadNew(mask.data(), P);
+    half* dA = allocT<half>(plane * C); half* dB = allocT<half>(plane * C);
+    float* dbias = uploadNew(bias4.data(), bias4.size());
+    gemmTriGate(dX, dW, dm, dA, dB, 0, P, C, plane, n, np, dbias);
+    auto a = download(dA, plane * C), b = download(dB, plane * C);
+    report("triangle gate a, bias", relRms(refA, std::vector<float>(a.begin(), a.end())), 5e-3);
+    report("triangle gate b, bias", relRms(refB, std::vector<float>(b.begin(), b.end())), 5e-3);
   }
 
   printf("attention\n");

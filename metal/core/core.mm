@@ -538,11 +538,13 @@ void gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // 1.20 at 64 x 64; 4096 square 12.0 TFLOP/s against 9.5). Measured on an M5 (8-core GPU), interleaved.
   int tm = a.n <= 128 ? (a.n + 15) / 16 * 16 : 64, tn = a.n <= 128 ? (a.m >= 40 * 64 ? 64 : 32) : (a.m >= 128 ? 128 : 64);
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tm, &tn);
+  const bool triReg = tri && (a.epilogue & 512);
+  if (triReg) { tm = 64; tn = 128; }      // (the layout lf_tri_quarters wrote: 32 channels a tile)
   // (a staged epilogue holds the tile in threadgroup memory: 32 KB on Apple's GPUs, some of it the operation's own)
   while (!plain && !tri && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
   if (tri && tn % 32) die("gemm: the triangle gate wants a tile 32 columns wide or more, not %d", tn);
   if (tm % 16 || tn % 16 || tm < 16 || tn < 16) die("gemm: no %d x %d tensor tile", tm, tn);
-  const int ep = (tri ? 1 : 0) | (plain ? 2 : 0) | (hacc ? 8 : 0);
+  const int ep = (tri ? 1 : 0) | (plain ? 2 : 0) | (hacc ? 8 : 0) | (triReg ? 16 : 0);
   const char* tcs = tc_ == F32 ? "float" : "half";
   std::string targs = std::string("half, half, ") + tcs + ", " + std::to_string(tm) + ", " + std::to_string(tn) + ", " +
                       (a.ta ? "true" : "false") + ", " + (a.tb ? "true" : "false") + ", " + std::to_string(ep);
@@ -654,6 +656,18 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, ha
   g.aux = (uint64_t)mask; g.aux2 = (uint64_t)outA; g.aux3 = (uint64_t)outB;
   g.tgR0 = (int64_t)r0; g.tgPairs = (int64_t)pairs; g.tgN = n; g.tgNp = np; g.tgC = C;
   if (bias) { g.bias = (uint64_t)bias; g.epilogue |= 4; }
+  // on the matrix units the weight in quarters (lf_tri_quarters, every call into one buffer - 0.01 ms, and no cache
+  // keyed by an address a later model's weights may reuse) and the gate in registers (epilogue 512): no staging tile.
+  // LOCALFOLD_TRI_REG=0 the control
+  static const bool reg = !getenv("LOCALFOLD_TRI_REG") || atoi(getenv("LOCALFOLD_TRI_REG")) != 0;
+  if (reg && C % 32 == 0 && tensorWanted()) {
+    static half* qw = nullptr; static float* qb = nullptr; static size_t qC = 0;
+    if ((size_t)C > qC) { qw = allocT<half>((size_t)C * 4 * C); qb = allocT<float>((size_t)4 * C); qC = C; }
+    run1d("lf_tri_quarters", (size_t)C * 4 * C, TriQuartersArgs{W, qw, bias, bias ? qb : nullptr, (uint64_t)C, (uint)C, 0});
+    g.A = (uint64_t)qw;
+    if (bias) g.bias = (uint64_t)qb;
+    g.epilogue |= 512;
+  }
   gemmRun(F16, F16, F16, g, 1, false, false, "triangle gate");
 }
 

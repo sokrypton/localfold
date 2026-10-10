@@ -50,6 +50,16 @@ kernel void lf_copy2d(LF_ARGS(Copy2DArgs)) {
   ulong y = t / a.width, x = t - y * a.width;
   a.dst[y * a.dpitch + x] = a.src[y * a.spitch + x];
 }
+kernel void lf_tri_quarters(LF_ARGS(TriQuartersArgs)) {
+  ulong i = LF_INDEX;
+  const uint W4 = 4 * a.C;
+  if (i >= a.rows * W4) return;
+  const uint nc = (uint)(i % W4), t = nc / 128, p = (nc % 128) / 32, ch = t * 32 + nc % 32;
+  const uint oc = (ch / 8) * 32 + p * 8 + ch % 8;
+  a.dst[i] = a.src[i - nc + oc];
+  if (a.srcf && i < W4) a.dstf[nc] = a.srcf[oc];
+}
+
 kernel void lf_fill(LF_ARGS(FillArgs)) {
   ulong i = LF_INDEX;
   uchar v = (uchar)a.value;
