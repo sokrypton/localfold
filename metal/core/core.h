@@ -38,6 +38,7 @@ size_t scratchHeld();
 std::vector<std::pair<std::string, size_t>> scratchList();
 
 void fill(void* p, int byte, size_t bytes);                       // in stream order
+void padZero(half* planes, size_t count, int n, int np);   // zero [count] [np][np] planes' padding past n x n
 void copy(void* dst, const void* src, size_t bytes);              // device to device, in stream order
 // rows of `width` bytes, `height` of them, pitches apart (a strided copy, in stream order)
 void copy2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height);

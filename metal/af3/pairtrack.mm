@@ -35,7 +35,7 @@ void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre,
   ln(pair, xn, P, C, pre + ".leftNormInputScale", pre + ".leftNormInputOffset");
   char* big = (char*)bigBuffer(plane * C * 8);         // a and b (half) and their product (float)
   half* a = (half*)big; half* b = a + plane * C;
-  if (np != n) fill(a, 0, plane * C * 4);              // (the padding is written by nothing here, and pr.big is shared)
+  padZero(a, 2 * (size_t)C, n, np);                   // (the padding is written by nothing here, and pr.big is shared)
   gemmTriGate(xn, triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np);
   float* prod = (float*)(big + plane * C * 4);
   {   // per channel: outgoing prod[i][j] = sum_k a[i][k] b[j][k]; incoming sum_k b[k][i] a[k][j]

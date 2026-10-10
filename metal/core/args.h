@@ -25,6 +25,8 @@ struct Copy2DArgs { DP(uchar) dst; CP(uchar) src; u64 dpitch, spitch, width, hei
 struct FillArgs { DP(uchar) dst; u64 bytes; uint value; uint pad; };
 // the triangle gate's weight [rows][4C] (and bias [4C]) from blocks of 8 (pa ga pb gb) to quarters: each 128 columns
 // 32 channels' pa, then their ga, pb, gb - the matrix units' register epilogue (a thread holds a column every 32)
+// zero only the padding of planes x [np][np] half planes holding n x n: rows n.. and, in rows ..n, columns n..
+struct PadZeroArgs { DP(half) dst; u64 planes; uint n, np; };
 struct TriQuartersArgs { CP(half) src; DP(half) dst; CP(float) srcf; DP(float) dstf; u64 rows; uint C; uint pad; };
 // a bundle tensor decoded on the device (metal/core/weights.mm): kind 0 float32, 1 float16, 3 intN asymmetric
 // (code * scale + zero a group, scale and zero float16); out16 writes float16, else float32

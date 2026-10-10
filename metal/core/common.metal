@@ -50,6 +50,17 @@ kernel void lf_copy2d(LF_ARGS(Copy2DArgs)) {
   ulong y = t / a.width, x = t - y * a.width;
   a.dst[y * a.dpitch + x] = a.src[y * a.spitch + x];
 }
+kernel void lf_pad_zero(LF_ARGS(PadZeroArgs)) {
+  ulong i = LF_INDEX;
+  const ulong per = (ulong)a.np * a.np - (ulong)a.n * a.n;
+  if (i >= a.planes * per) return;
+  const ulong pl = i / per, r = i - pl * per, tail = (ulong)(a.np - a.n) * a.np;
+  ulong pos;
+  if (r < tail) pos = (ulong)a.n * a.np + r;                                    // rows n..np-1, whole
+  else { const ulong k = r - tail, w = a.np - a.n; pos = (k / w) * a.np + a.n + k % w; }   // rows ..n-1, columns n..
+  a.dst[pl * a.np * a.np + pos] = 0.h;
+}
+
 kernel void lf_tri_quarters(LF_ARGS(TriQuartersArgs)) {
   ulong i = LF_INDEX;
   const uint W4 = 4 * a.C;

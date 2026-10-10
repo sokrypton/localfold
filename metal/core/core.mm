@@ -452,6 +452,11 @@ void fill(void* p, int byte, size_t bytes) {
   FillArgs a{(uchar*)p, bytes, (uint)(byte & 255), 0};
   run1d("lf_fill", (((uint64_t)p & 15) == 0 ? std::max<size_t>(bytes / 16, 16) : bytes), a);
 }
+void padZero(half* planes, size_t count, int n, int np) {
+  if (np <= n || !count) return;
+  const size_t per = (size_t)np * np - (size_t)n * n;
+  run1d("lf_pad_zero", count * per, PadZeroArgs{planes, (uint64_t)count, (uint)n, (uint)np});
+}
 void copy(void* dst, const void* src, size_t bytes) {
   if (!bytes) return;
   CopyArgs a{(uchar*)dst, (const uchar*)src, bytes};
