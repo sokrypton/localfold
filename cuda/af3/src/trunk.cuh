@@ -195,7 +195,7 @@ inline float* pairBase(const Trunk& t) {
 // the fold's floor is the trunk's bf16 pair beside the blocked triangle's f16 operand: PAIR16_FIT_TIMES of the f32
 // pair, measured (below)
 constexpr double PAIR16_FIT_TIMES = 1.15;
-inline bool foldFits(int n, int C, bool stays16 = false) {
+inline bool foldFits(int n, int C, bool stays16 = false, bool quiet = false) {
   if (getenv("LOCALFOLD_NO_FOLD_FITS")) return true;     // (to find a ceiling by experiment)
   size_t f, t; deviceMemInfo(&f, &t);
   for (auto& [name, slot] : SCRATCH) f += slot.second;
@@ -203,6 +203,7 @@ inline bool foldFits(int n, int C, bool stays16 = false) {
   size_t need = (size_t)((double)n * n * perPair) + t / 20;
   if (need <= f) return true;
   int most = f > t / 20 ? (int)std::sqrt((double)(f - t / 20) / perPair) : 0;
+  if (quiet) return false;
   fprintf(stderr, "%d tokens do not fit this card: the fold needs ~%.1f GB of it and %.1f GB is free - it folds up to "
           "~%d tokens\n", n, need / 1e9, f / 1e9, most);
   return false;
