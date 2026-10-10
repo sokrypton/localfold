@@ -177,6 +177,12 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         *(device vec<TC, 4>*)dp = vec<TC, 4>(r);
         continue;
       }
+      if (g.epilogue & 4096) {    // the outer product's permuted store: D row (i, c), column (j, e) -> [(i, j)][(c, e)]
+        const uint O = (uint)g.tgC, L = (uint)g.tgN;
+        const uint ii = lf_udiv((uint)j, O), cc = (uint)j - ii * O, jj = lf_udiv((uint)i, O), ee = (uint)i - jj * O;
+        *(device vec<TC, 4>*)(D + ((((ulong)ii * L + jj) * O + cc) * O + ee)) = vec<TC, 4>(v);
+        continue;
+      }
       if (g.beta != 0.f) v += g.beta * float4(*(device const vec<TC, 4>*)(C + (ulong)i + (ulong)j * g.ldc));
       if (g.epilogue & 4) v += bv;
       if (g.epilogue & 2) v = max(v, 0.f);

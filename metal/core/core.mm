@@ -567,6 +567,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
                      a.m % 4 == 0 && !a.ptrs &&
                      al4(a.D, a.ldd) && al4(a.D + 0, a.sd) && (a.beta == 0.f && !(a.epilogue & 64) ? true : al4(a.C, a.ldc) && al4(a.C, a.sc)) &&
                      (!(a.epilogue & 64) || al4(a.aux, a.ldaux)) && (!(a.epilogue & 4) || a.bias % 16 == 0);
+  if ((a.epilogue & 4096) && !vecEp) die("gemm: the permuted store needs the vector epilogue's alignment");
   if (vecEp && tn < 64) tn = 64;
   // (a staged epilogue holds the tile in threadgroup memory: 32 KB on Apple's GPUs, some of it the operation's own)
   while (!plain && !tri && !vecEp && tm * tn * (hacc ? 2 : 4) > 16384 && tn > 16) tn /= 2;
@@ -718,6 +719,18 @@ bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half
   { Gemm g{}; g.X = Xv; g.tx = F16; g.W = Wv; g.tw = F16; g.Y = vTmp; g.ty = F16; g.rows = rows; g.in = in; g.out = out;
     g.bias = biasV; g.accFloat = true; g.label = "triangle output"; gemm(g); }
   return gemmGatedAdd(Xg, Wg, vTmp, pair, rows, in, out, biasG, lnOut, lnScale, lnOffset, lnEps);
+}
+bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S) {
+  static const bool on = !getenv("LOCALFOLD_OPM_PERMUTED") || atoi(getenv("LOCALFOLD_OPM_PERMUTED")) != 0;
+  const int rows = bi * O, cols = L * O;
+  if (!on || !tensorWanted() || O % 4 || rows <= 128 || cols % 4 || ((uint64_t)X & 15)) return false;
+  GemmArgs a{};
+  a.A = (uint64_t)rt; a.B = (uint64_t)lt; a.C = a.D = (uint64_t)X;
+  a.m = cols; a.n = rows; a.k = S; a.lda = ldr; a.ldb = ldl; a.ldc = a.ldd = cols;
+  a.ta = 0; a.tb = 1; a.alpha = 1.f; a.epilogue = 4096; a.tgC = O; a.tgN = L;
+  ++D().stats.gemms;
+  gemmTensorRun(F16, a, 1, true, "opm product, permuted");
+  return true;
 }
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden) {
   if (hidden % 8) die("gemmSwiglu: a hidden width of %d is not a multiple of 8", hidden);

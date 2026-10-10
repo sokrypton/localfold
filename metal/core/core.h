@@ -125,6 +125,10 @@ bool gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, si
 bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
                       int out, const float* biasG, const float* biasV, half* vTmp, const char* label = nullptr,
                       half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr, float lnEps = 1e-5f);
+// the outer product's block P[(i, c)][(j, e)] = sum_s l[s][i0 + i][c] r[s][j][e] (lt, rt transposed: [S][L * O] with
+// leading dimensions ldl, ldr), stored permuted into X [(i, j)][(c, e)] by the epilogue - on the matrix units only
+// (false: nothing run, the caller's GEMM and permute; LOCALFOLD_OPM_PERMUTED=0 the control)
+bool gemmOpmPermuted(const half* lt, int ldl, const half* rt, int ldr, half* X, int bi, int L, int O, int S);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden);
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);
