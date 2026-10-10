@@ -31,6 +31,7 @@ void linearB(const half* X, const std::string& w, int block, float* Y, size_t ro
              float beta = 0.f);
 void layerNormW(const float* x, float* y, size_t rows, int C, const std::string& w, int block = -1);
 void layerNormW(const float* x, half* y, size_t rows, int C, const std::string& w, int block = -1);
+void layerNormW(const half* x, half* y, size_t rows, int C, const std::string& w, int block = -1);
 
 struct Trunk {
   int L, N, E;                  // residues, MSA rows, extra MSA rows
@@ -44,6 +45,7 @@ struct Trunk {
   bool opmFirst;
   bool msaOnes = false, extraOnes = false, pairOnes = false;     // all ones: no mask read
   const float* normOf[2] = {};  // the outer product's mask norm, per stack (main, extra): the mask it was taken of this pass
+  struct { half *msa = nullptr, *extra = nullptr, *pair = nullptr; } h;   // the evoformer's half activations, where used
 };
 void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPair, const float* prevPos);
 void evoformerBlock(Trunk& t, bool extraStack, int blk);

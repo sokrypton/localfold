@@ -5,6 +5,7 @@
 #include "af2.h"
 #include <cmath>
 #include <map>
+#include <type_traits>
 
 void linearB(const float* X, const std::string& w, int block, float* Y, size_t rows, int in, int out, bool relu, float beta) {
   Gemm g{}; g.X = X; g.tx = F32; g.W = PH(w + "/weights", block); g.tw = F16; g.half = true; g.Y = Y; g.rows = rows; g.in = in;
@@ -22,24 +23,38 @@ void layerNormW(const float* x, float* y, size_t rows, int C, const std::string&
 void layerNormW(const float* x, half* y, size_t rows, int C, const std::string& w, int block) {
   layerNorm(x, y, rows, C, P(w + "/scale", block), P(w + "/offset", block));
 }
-// a linear whose weight and bias are named apart (an attention's output_w / output_b, gating_w / gating_b)
-static void linearWB(const half* X, const std::string& w, const std::string& b, int blk, float* Y, size_t rows, int in, int out,
+void layerNormW(const half* x, half* y, size_t rows, int C, const std::string& w, int block) {
+  layerNorm(x, y, rows, C, P(w + "/scale", block), P(w + "/offset", block));
+}
+// the residual's type: the evoformer's activations are float, or half where halfActivations() (main.mm)
+template <class T> constexpr DT dtOf() { return std::is_same<T, half>::value ? F16 : F32; }
+// a linear whose weight and bias are named apart (an attention's output_w / output_b, gating_w / gating_b), into a float or
+// a half Y
+template <class T>
+static void linearWB(const half* X, const std::string& w, const std::string& b, int blk, T* Y, size_t rows, int in, int out,
                      float beta) {
-  Gemm g{}; g.X = X; g.tx = F16; g.W = PH(w, blk); g.tw = F16; g.Y = Y; g.rows = rows; g.in = in; g.out = out; g.bias = P(b, blk);
-  g.beta = beta; g.label = w.c_str();
+  Gemm g{}; g.X = X; g.tx = F16; g.W = PH(w, blk); g.tw = F16; g.Y = Y; g.ty = dtOf<T>(); g.rows = rows; g.in = in; g.out = out;
+  g.bias = P(b, blk); g.beta = beta; g.label = w.c_str();
+  gemm(g);
+}
+// a named linear adding into a half residual (linearB's half twin: Y += X W + bias)
+static void linearB(const half* X, const std::string& w, int block, half* Y, size_t rows, int in, int out, bool relu, float beta) {
+  Gemm g{}; g.X = X; g.tx = F16; g.W = PH(w + "/weights", block); g.tw = F16; g.Y = Y; g.ty = F16; g.rows = rows; g.in = in;
+  g.out = out; g.bias = P(w + "/bias", block); g.relu = relu; g.beta = beta; g.label = w.c_str();
   gemm(g);
 }
 // the pair's next LayerNorm where the previous update's GEMM already wrote it (Gemm::lnOut, gemmGatedAddDual's): the
 // pair, the norm (its weight's name and block) and the buffer, taken by pairLn of the same; a miss drops it.
 // LOCALFOLD_LN_EMIT=0: none emitted
-static struct { const float* x = nullptr; std::string norm; half* buf = nullptr; } emitted;
+static struct { const void* x = nullptr; std::string norm; half* buf = nullptr; } emitted;
 static std::string normKey(const std::string& w, int blk) { return w + "#" + std::to_string(blk); }
-static half* takeEmitted(const float* x, const std::string& w, int blk) {
+static half* takeEmitted(const void* x, const std::string& w, int blk) {
   const bool hit = emitted.x == x && emitted.norm == normKey(w, blk);
   emitted.x = nullptr;
   return hit ? emitted.buf : nullptr;
 }
-static half* pairLn(const float* pair, size_t pairs, int C, const std::string& w, int blk, const char* scratchName) {
+template <class T>
+static half* pairLn(const T* pair, size_t pairs, int C, const std::string& w, int blk, const char* scratchName) {
   if (half* b = takeEmitted(pair, w, blk)) return b;
   half* xn = scratch<half>(scratchName, pairs * C);
   layerNormW(pair, xn, pairs, C, w, blk);
@@ -121,8 +136,9 @@ static AttnW attnWeights(const std::string& A, int blk, int C) {
   return {w, b, H, D};
 }
 // xn [Bt][n][C] (or the leading axis attended, `across`: xn [n][Bt][C]) -> the residual += attention's output projection
+template <class T>
 static void attend(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const half* bias, const float* mask,
-                   int64_t maskB, int64_t maskK, float* residual, bool across, const std::string& nextNorm = "", int nextBlk = 0) {
+                   int64_t maskB, int64_t maskK, T* residual, bool across, const std::string& nextNorm = "", int nextBlk = 0) {
   AttnW w = attnWeights(A, blk, C);
   size_t rows = (size_t)Bt * n; int W = w.H * w.D;
   half* qkvg = scratch<half>("att.qkvg", rows * 4 * W);
@@ -136,7 +152,7 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
   attention(at);
   if (!nextNorm.empty() && C == 128) {     // (the residual's next norm emitted by the output projection)
     half* lnOut = lnTarget(rows, C, xn);
-    Gemm g{}; g.X = o; g.tx = F16; g.W = PH(A + "/output_w", blk); g.tw = F16; g.Y = residual; g.rows = rows; g.in = W; g.out = C;
+    Gemm g{}; g.X = o; g.tx = F16; g.W = PH(A + "/output_w", blk); g.tw = F16; g.Y = residual; g.ty = dtOf<T>(); g.rows = rows; g.in = W; g.out = C;
     g.bias = P(A + "/output_b", blk); g.beta = 1.f; g.label = "attention output, next norm";
     g.lnOut = lnOut; g.lnScale = P(nextNorm + "/scale", nextBlk); g.lnOffset = P(nextNorm + "/offset", nextBlk);
     if (gemm(g)) emitted = {residual, normKey(nextNorm, nextBlk), lnOut};
@@ -145,7 +161,8 @@ static void attend(const half* xn, int Bt, int n, int C, const std::string& A, i
   linearWB(o, A + "/output_w", A + "/output_b", blk, residual, rows, W, C, 1.f);
 }
 // a pair bias [H][L][L] (log2 units, + 1e9 (mask - 1) where a mask is given) from LN(pair) W
-static half* pairBias(const float* pair, int L, int C, const std::string& normW, const std::string& projW, int blk, int H,
+template <class T>
+static half* pairBias(const T* pair, int L, int C, const std::string& normW, const std::string& projW, int blk, int H,
                       const float* pairMask, bool transposed, half** normed = nullptr) {
   size_t pairs = (size_t)L * L;
   half* pn = pairLn(pair, pairs, C, normW, blk, "bias.pn");
@@ -159,16 +176,19 @@ static half* pairBias(const float* pair, int L, int C, const std::string& normW,
 }
 
 // ---------------------------------------------------------------- the block's modules
-static void msaRowAttention(Trunk& t, const std::string& S, int blk, float* msa, int rowsN, int C, const float* msaMask, bool ones) {
+template <class T>
+static void msaRowAttention(Trunk& t, const std::string& S, int blk, T* msa, const T* pair, int rowsN, int C, const float* msaMask,
+                            bool ones) {
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string R = S + "msa_row_attention_with_pair_bias";
   int H = (int)dimW(R + "/attention/query_w", 2);
-  half* bias = pairBias(t.pair, L, 128, R + "/feat_2d_norm", R + "/feat_2d_weights", blk, H, t.pairOnes ? nullptr : t.pairMask, false);
+  half* bias = pairBias(pair, L, 128, R + "/feat_2d_norm", R + "/feat_2d_weights", blk, H, t.pairOnes ? nullptr : t.pairMask, false);
   half* xn = scratch<half>("row.xn", rows * C);
   layerNormW(msa, xn, rows, C, R + "/query_norm", blk);
   attend(xn, rowsN, L, C, R + "/attention", blk, bias, ones ? nullptr : msaMask, L, 1, msa, false);
 }
-static void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* msa, int rowsN, int C, const float* msaMask, bool ones) {
+template <class T>
+static void msaColumnAttention(Trunk& t, const std::string& S, int blk, T* msa, int rowsN, int C, const float* msaMask, bool ones) {
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string A = S + "msa_column_attention";
   half* xn = scratch<half>("col.xn", rows * C);
@@ -176,7 +196,8 @@ static void msaColumnAttention(Trunk& t, const std::string& S, int blk, float* m
   // across the sequences: batch row = the column i, positions the sequences s; the key's mask msaMask[s][i]
   attend(xn, L, rowsN, C, A + "/attention", blk, nullptr, ones ? nullptr : msaMask, 1, L, msa, true);
 }
-static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, float* msa, int rowsN, int C, const float* msaMask) {
+template <class T>
+static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, T* msa, int rowsN, int C, const float* msaMask) {
   int L = t.L; size_t rows = (size_t)rowsN * L;
   std::string A = S + "msa_column_global_attention";
   int H = (int)dimW(A + "/attention/query_w", 2), D = (int)dimW(A + "/attention/query_w", 3), W = H * D;
@@ -200,7 +221,8 @@ static void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, fl
   run1d("af2_global_gate", rows * W, GlobalGateArgs{avg, gate, gated, (uint)rowsN, (uint)L, (uint)W, 0});
   linearWB(gated, A + "/attention/output_w", A + "/attention/output_b", blk, msa, rows, W, C, 1.f);
 }
-void transition(float* x, size_t rows, int C, const std::string& T, int blk) {
+template <class X>
+static void transitionT(X* x, size_t rows, int C, const std::string& T, int blk) {
   half* emittedIn = takeEmitted(x, T + "/input_layer_norm", blk);
   int I = (int)dimW(T + "/transition1/weights", blk < 0 ? 1 : 2);
   size_t chunk = std::min(rows, std::max<size_t>(32768, ((size_t)128 << 20) / (2 * (size_t)I)));
@@ -216,8 +238,17 @@ void transition(float* x, size_t rows, int C, const std::string& T, int blk) {
     linearB(mid, T + "/transition2", blk, x + r0 * C, r, I, C, false, 1.f);
   }
 }
+void transition(float* x, size_t rows, int C, const std::string& T, int blk) { transitionT(x, rows, C, T, blk); }
+// pair[(i0 + i)][j] += (bias + Y) / (1e-3 + norm), float or half
+static void opmAdd(float* pair, const float* Y, const float* bias, const float* norm, int i0, int bi, int L) {
+  run1d("af2_opm_add", (size_t)bi * L * 128, OpmAddArgs{pair, Y, bias, norm, (u64)i0, (uint)bi, (uint)L, 128, 0});
+}
+static void opmAdd(half* pair, const float* Y, const float* bias, const float* norm, int i0, int bi, int L) {
+  run1d("af2_opm_add_h", (size_t)bi * L * 128, OpmAddHArgs{pair, Y, bias, norm, (u64)i0, (uint)bi, (uint)L, 128, 0});
+}
 // the outer product mean: pair[i][j] += (sum_s l[s][i] (x) r[s][j] @ W + b) / (1e-3 + norm[i][j])
-static void outerProductMean(Trunk& t, const std::string& S, int blk, const float* msa, int rowsN, int C, const float* msaMask,
+template <class A>
+static void outerProductMean(Trunk& t, const std::string& S, int blk, const A* msa, A* pair, int rowsN, int C, const float* msaMask,
                              bool ones) {
   int L = t.L; size_t rows = (size_t)rowsN * L; const int O = 32;
   std::string Op = S + "outer_product_mean";
@@ -260,7 +291,7 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       run1d("af2_tile_bias", (size_t)L * 128, TileBiasArgs{P(Op + "/output_b", blk), bt, (uint)L, 128, inv, 0});
       for (int i0 = 0; i0 < L; i0 += Bi) {
         int bi = std::min(Bi, L - i0);
-        Gemm g{}; g.X = Lt + (size_t)i0 * K; g.tx = F16; g.W = T; g.tw = F16; g.Y = t.pair + (size_t)i0 * L * 128; g.beta = 1.f;
+        Gemm g{}; g.X = Lt + (size_t)i0 * K; g.tx = F16; g.W = T; g.tw = F16; g.Y = pair + (size_t)i0 * L * 128; g.ty = dtOf<A>(); g.beta = 1.f;
         g.rows = bi; g.in = K; g.out = L * 128; g.bias = bt; g.label = "opm shallow";
         gemm(g);
       }
@@ -271,7 +302,7 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       int bi = std::min(Bi, L - i0);
       Gemm g{}; g.X = Lt + (size_t)i0 * K; g.tx = F16; g.W = T; g.tw = F16; g.Y = Y; g.rows = bi; g.in = K; g.out = L * 128; g.label = "opm shallow";
       gemm(g);
-      run1d("af2_opm_add", (size_t)bi * L * 128, OpmAddArgs{t.pair, Y, P(Op + "/output_b", blk), norm, (u64)i0, (uint)bi, (uint)L, 128, 0});
+      opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
     }
     return;
   }
@@ -291,10 +322,10 @@ static void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
       run1d("af2_opm_permute", (size_t)bi * L * O * (O / 8), OpmPermuteArgs{Pm, X, (uint)bi, (uint)L, (uint)O, 0});
     }
     // (on the matrix units the add in the output GEMM's epilogue - no Y)
-    if (gemmOpmOut(X, Wout, t.pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L, (size_t)bi * L, O * O, 128))
+    if (gemmOpmOut(X, Wout, pair + (size_t)i0 * L * 128, P(Op + "/output_b", blk), norm + (size_t)i0 * L, (size_t)bi * L, O * O, 128))
       continue;
     { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = 128; g.label = "opm output"; gemm(g); }
-    run1d("af2_opm_add", (size_t)bi * L * 128, OpmAddArgs{t.pair, Y, P(Op + "/output_b", blk), norm, (u64)i0, (uint)bi, (uint)L, 128, 0});
+    opmAdd(pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L);
   }
 }
 // the triangle multiplication: LN -> one GEMM gating a and b into channel-major padded planes (gemmTriGate, with AF2's
@@ -321,8 +352,9 @@ static TriW triWeights(const std::string& T, int blk, int C) {
   });
   return {w4, b4};
 }
-void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool outgoing,
-                            const std::string& nextNorm) {
+template <class X>
+static void triangleMultiplicationT(X* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool outgoing,
+                                    const std::string& nextNorm) {
   size_t pairs = (size_t)L * L;
   std::string T = S + (outgoing ? "triangle_multiplication_outgoing" : "triangle_multiplication_incoming");
   half* xn = pairLn(pair, pairs, C, T + "/left_norm_input", blk, "tri.xn");
@@ -352,10 +384,15 @@ void triangleMultiplication(float* pair, const float* pairMask, int L, int C, co
                        lnOut, lnOut ? P(nextNorm + "/scale", blk) : nullptr, lnOut ? P(nextNorm + "/offset", blk) : nullptr))
     emitted = {pair, normKey(nextNorm, blk), lnOut};
 }
+void triangleMultiplication(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool outgoing,
+                            const std::string& nextNorm) {
+  triangleMultiplicationT(pair, pairMask, L, C, S, blk, outgoing, nextNorm);
+}
 // the triangle attention: the starting node attends along a row, the ending node along a column (across the pair's
 // leading axis: its bias the projection transposed, its key's mask pairMask[k][j])
-void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool starting, bool pairOnes,
-                       const std::string& nextNorm) {
+template <class X>
+static void triangleAttentionT(X* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool starting, bool pairOnes,
+                               const std::string& nextNorm) {
   std::string A = S + (starting ? "triangle_attention_starting_node" : "triangle_attention_ending_node");
   int H = (int)dimW(A + "/attention/query_w", 2);
   half* xn = nullptr;     // (the bias's LN(pair) is the query's: the same norm)
@@ -363,24 +400,33 @@ void triangleAttention(float* pair, const float* pairMask, int L, int C, const s
   if (starting) attend(xn, L, L, C, A + "/attention", blk, bias, pairOnes ? nullptr : pairMask, L, 1, pair, false, nextNorm, blk);
   else attend(xn, L, L, C, A + "/attention", blk, bias, pairOnes ? nullptr : pairMask, 1, L, pair, true, nextNorm, blk);
 }
+void triangleAttention(float* pair, const float* pairMask, int L, int C, const std::string& S, int blk, bool starting, bool pairOnes,
+                       const std::string& nextNorm) {
+  triangleAttentionT(pair, pairMask, L, C, S, blk, starting, pairOnes, nextNorm);
+}
 
-// one Evoformer iteration of a stack: S is "evoformer/evoformer_iteration/" or ".../extra_msa_stack/"
-void evoformerBlock(Trunk& t, bool extraStack, int blk) {
+// one Evoformer iteration of a stack: S is "evoformer/evoformer_iteration/" or ".../extra_msa_stack/"; over the float
+// activations, or their half copies where main.mm made them (Trunk::h)
+template <class T>
+static void evoformerBlockT(Trunk& t, bool extraStack, int blk, T* msa, T* pair) {
   const std::string S = extraStack ? "evoformer/extra_msa_stack/" : "evoformer/evoformer_iteration/";
-  float* msa = extraStack ? t.extra : t.msa;
   int rowsN = extraStack ? t.E : t.N + t.T, C = extraStack ? 64 : 256;
   const float* mask = extraStack ? t.extraMask : t.msaMask;
   bool ones = extraStack ? t.extraOnes : t.msaOnes;
-  if (t.opmFirst) outerProductMean(t, S, blk, msa, rowsN, C, mask, ones);
-  msaRowAttention(t, S, blk, msa, rowsN, C, mask, ones);
+  if (t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones);
+  msaRowAttention(t, S, blk, msa, (const T*)pair, rowsN, C, mask, ones);
   if (extraStack) msaColumnGlobalAttention(t, S, blk, msa, rowsN, C, mask);
   else msaColumnAttention(t, S, blk, msa, rowsN, C, mask, ones);
-  transition(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk);
-  if (!t.opmFirst) outerProductMean(t, S, blk, msa, rowsN, C, mask, ones);
+  transitionT(msa, (size_t)rowsN * t.L, C, S + "msa_transition", blk);
+  if (!t.opmFirst) outerProductMean(t, S, blk, (const T*)msa, pair, rowsN, C, mask, ones);
   // (each update's last GEMM emitting the next one's norm)
-  triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, true, S + "triangle_multiplication_incoming/left_norm_input");
-  triangleMultiplication(t.pair, t.pairMask, t.L, 128, S, blk, false, S + "triangle_attention_starting_node/query_norm");
-  triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, true, t.pairOnes, S + "triangle_attention_ending_node/query_norm");
-  triangleAttention(t.pair, t.pairMask, t.L, 128, S, blk, false, t.pairOnes, S + "pair_transition/input_layer_norm");
-  transition(t.pair, (size_t)t.L * t.L, 128, S + "pair_transition", blk);
+  triangleMultiplicationT(pair, t.pairMask, t.L, 128, S, blk, true, S + "triangle_multiplication_incoming/left_norm_input");
+  triangleMultiplicationT(pair, t.pairMask, t.L, 128, S, blk, false, S + "triangle_attention_starting_node/query_norm");
+  triangleAttentionT(pair, t.pairMask, t.L, 128, S, blk, true, t.pairOnes, S + "triangle_attention_ending_node/query_norm");
+  triangleAttentionT(pair, t.pairMask, t.L, 128, S, blk, false, t.pairOnes, S + "pair_transition/input_layer_norm");
+  transitionT(pair, (size_t)t.L * t.L, 128, S + "pair_transition", blk);
+}
+void evoformerBlock(Trunk& t, bool extraStack, int blk) {
+  if (t.h.pair) evoformerBlockT(t, extraStack, blk, extraStack ? t.h.extra : t.h.msa, t.h.pair);
+  else evoformerBlockT(t, extraStack, blk, extraStack ? t.extra : t.msa, t.pair);
 }

@@ -22,6 +22,7 @@ struct GateBiasArgs { CP(float) gb; DP(float) out; uint W, pad; };
 struct ScaleRowsHArgs { DP(half) x; CP(float) mask; u64 rows; uint C, pad; };
 struct OpmPermuteArgs { CP(half) Pm; DP(half) X; uint bi, L, O, pad; };
 struct OpmAddArgs { DP(float) pair; CP(float) Y; CP(float) bias; CP(float) norm; u64 i0; uint bi, L, C, pad; };
+struct OpmAddHArgs { DP(half) pair; CP(float) Y; CP(float) bias; CP(float) norm; u64 i0; uint bi, L, C, pad; };
 struct OpmLeftArgs { CP(half) lt; DP(half) out; uint S, L, O; float scale; };
 struct TileBiasArgs { CP(float) bias; DP(float) out; uint L, C; float scale; uint pad; };
 struct MaskNormArgs { CP(float) mask; DP(float) norm; uint S, L; };

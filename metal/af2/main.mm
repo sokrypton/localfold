@@ -147,8 +147,24 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
     if (multimer) templateEmbedding(t.pair, t.pairMask, L);
     else if (monomerTemplates) templateEmbeddingMonomer(t.pair, t.pairMask, L, templates);
     if (t.T > 0) templateRows(L, t.T, multimer, t.msa + (size_t)t.N * L * 256, t.msaMask + (size_t)t.N * L);
+    // The evoformer over half activations: its residual updates are GEMMs that read and write the MSA and the pair, and
+    // half moves half the bytes. Where the matrix units run (their kernels take a half residual); every residual is
+    // summed in float and rounded once, every norm reads the half values. The heads read the pair and the MSA's first row
+    // back in float. LOCALFOLD_HALF_PAIR=0 the control. (Seen: the MSA to ~500, the pair to ~1300, half's limit 65504.)
+    static const bool halfWanted = !getenv("LOCALFOLD_HALF_PAIR") || atoi(getenv("LOCALFOLD_HALF_PAIR")) != 0;
+    if (halfWanted && matrixUnits()) {
+      size_t mn = (size_t)(t.N + t.T) * L * 256, en = (size_t)t.E * L * 64;
+      t.h.msa = scratch<half>("evo.msa", mn); toHalf(t.msa, t.h.msa, mn);
+      t.h.pair = scratch<half>("evo.pair", pairs * 128); toHalf(t.pair, t.h.pair, pairs * 128);
+      if (extraBlocks && t.E) { t.h.extra = scratch<half>("evo.extra", en); toHalf(t.extra, t.h.extra, en); }
+    }
     for (int b = 0; b < extraBlocks; ++b) evoformerBlock(t, true, b);
     for (int b = 0; b < mainBlocks; ++b) evoformerBlock(t, false, b);
+    if (t.h.pair) {
+      toFloat(t.h.msa, t.msa, (size_t)L * 256);       // (the first row: the single and the recycled row read it)
+      toFloat(t.h.pair, t.pair, pairs * 128);
+      t.h = {};
+    }
     linearB(t.msa, "evoformer/single_activations", -1, single, L, 256, 384);
     so = structureModule(single, t.pair, L, positionScale);
     // the recycled state: the evoformer's first MSA row and pair, the final atom37 positions

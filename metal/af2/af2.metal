@@ -127,6 +127,15 @@ kernel void af2_opm_add(LF_ARGS(OpmAddArgs)) {
   ulong i = a.i0 + ii;
   a.pair[(i * a.L + j) * a.C + f] += (a.bias[f] + a.Y[t]) / (1e-3f + a.norm[i * a.L + j]);
 }
+// (the same into a half pair - the evoformer's half activations: summed in float, rounded once, saturating)
+kernel void af2_opm_add_h(LF_ARGS(OpmAddHArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= (ulong)a.bi * a.L * a.C) return;
+  uint ij = lf_udiv((uint)t, a.C), f = (uint)t - ij * a.C, ii = lf_udiv(ij, a.L), j = ij - ii * a.L;
+  ulong i = a.i0 + ii;
+  device half* p = a.pair + (i * a.L + j) * a.C + f;
+  *p = (half)clamp((float)*p + (a.bias[f] + a.Y[t]) / (1e-3f + a.norm[i * a.L + j]), -65504.f, 65504.f);
+}
 // lt [s][i][c] -> [i][c][s] (scaled): the shallow outer product's left operand
 kernel void af2_opm_left(LF_ARGS(OpmLeftArgs)) {
   ulong t = LF_INDEX;
