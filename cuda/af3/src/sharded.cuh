@@ -187,19 +187,167 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   releaseScratch({ "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });
 }
 
+
+// ---- the generic forms (any width, an f32 or bf16 pair: the template stack's 64 channels, rf3's biased attention,
+// the 256-channel models), after triangleBlocked's and gridAttention's own generic paths
+template <class T>
+inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int C, const std::string& pre, bool divideByLength) {
+  const int np = padded(n); const size_t cs = (size_t)np * np;
+  int lo, hi; rowsOf(n, mg::RANK, lo, hi);
+  float* pair = baseOf(z.local, lo, n, C);
+  std::string pgOf[2] = { operandWeight(pre, C, 0), operandWeight(pre, C, 1) };
+  float alpha = divideByLength ? 1.f / n : 1.f, zero = 0.f;
+  auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  size_t per = std::max<size_t>(32, CHUNK / (4 * C));
+  float* m = scratch<float>("trib.mask", per);
+  T* ln = scratch<T>("trib.ln", per * C); T* pgOut = scratch<T>("trib.pg", per * 2 * C);
+  auto operands = [&](const TriRect& r, T* out, int side) {
+    for (size_t q0 = 0; q0 < r.size(); q0 += per) {
+      size_t cnt = std::min(per, r.size() - q0);
+      WITH_PAIR_T(rectLayerNormK<T, PT><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, m, r, q0, cnt, n, C,
+        W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset")));
+      linear<T, T>(ln, pgOut, cnt, C, 2 * C, pgOf[side]);
+      rectGateK<T><<<dim3((unsigned)((cnt + 31) / 32), (C + 31) / 32), dim3(32, 8), 0, STREAM>>>(pgOut, m, out, q0, cnt, C, r.size());
+    }
+  };
+  int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
+  mg::Shared& bmine = mg::shared(std::string("sh.bg") + (sizeof(T) == 2 ? "16" : "32"), (size_t)maxShare * np * C * sizeof(T));
+  if (hi > lo) operands({lo, hi - lo, 0, np}, (T*)bmine.local, 1);
+  T* b = scratch<T>("trib.b", cs * C);
+  mg::fence();
+  for (int r = 0; r < mg::WORLD; ++r) {
+    int rlo, rhi; rowsOf(n, r, rlo, rhi);
+    if (rhi <= rlo) continue;
+    const size_t rb = (size_t)(rhi - rlo) * np * sizeof(T);
+    CK(cudaMemcpy2DAsync((char*)b + (size_t)rlo * np * sizeof(T), cs * sizeof(T), bmine.peer[r], rb, rb, C, cudaMemcpyDefault, STREAM));
+  }
+  mg::fence();
+  int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
+  {
+    size_t f, t; deviceMemInfo(&f, &t);
+    size_t perRow = (size_t)np * C * (sizeof(T) + 4), spare = f > t / 16 ? f - t / 16 : 0;
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+  }
+  width = std::min(width, std::max(8, hi - lo));
+  T* a = scratch<T>("trib.a", (size_t)width * np * C);
+  float* prod = scratch<float>("trib.prod", (size_t)width * np * C);
+  T* t1 = scratch<T>("trib.t1", per * C); T* t2 = scratch<T>("trib.t2", per * C);
+  for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
+    int w = std::min(width, hi - k0);
+    TriRect r{k0, w, 0, np};
+    operands(r, a, 0);
+    CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, np, w, np, &alpha, b, cudaType<T>(), np, cs, a,
+      cudaType<T>(), np, r.size(), &zero, prod, CUDA_R_32F, np, r.size(), C, CUBLAS_COMPUTE_32F, algo));
+    for (size_t q0 = 0; q0 < r.size(); q0 += per) {
+      size_t cnt = std::min(per, r.size() - q0);
+      rectCenterNormK<T><<<(unsigned)((cnt + 31) / 32), dim3(32, 8), 0, STREAM>>>(prod, ln, q0, cnt, C, r.size(),
+        W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
+      linear<T, T>(ln, t1, cnt, C, C, pre + ".outputProjection");
+      WITH_PAIR_T(rectLayerNormK<T, PT><<<(unsigned)((cnt + 7) / 8), 256, 0, STREAM>>>(pair, mask, ln, nullptr, r, q0, cnt, n, C,
+        W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset")));
+      linear<T, T>(ln, t2, cnt, C, C, pre + ".gatingLinear");
+      WITH_PAIR_T(rectGatedAddK<T, PT><<<blocks(cnt * C), 256, 0, STREAM>>>(into(pair), t1, t2, r, q0, cnt, n, C));
+    }
+  }
+  releaseScratch({ "trib." });
+}
+// bias[h][i][j] (or [h][j][i] when swapped) = scale * raw[q][h] for the pairs p0 + q, raw pair-major (a linear's)
+template <class TB>
+__global__ void biasFromFlatRowsK(const float* raw, TB* bias, size_t p0, size_t cnt, int n, int stride, int heads, bool swap,
+                                  float scale) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)heads * cnt) return;
+  size_t q = t / heads; int h = (int)(t % heads);
+  size_t p = p0 + q, a = p / n, b = p % n, i = swap ? b : a, j = swap ? a : b;
+  bias[((size_t)h * n + i) * stride + j] = fromF<TB>(scale * raw[t]);
+}
+template <class T>
+inline void rowAttentionGeneric(const mg::Shared& z, const float* mask, int n, int C, int heads, int D, const std::string& pre,
+                                bool swap) {
+  const int Wd = heads * D;
+  int lo, hi; rowsOf(n, mg::RANK, lo, hi);
+  const int rowsHere = storedRows(n, mg::RANK);
+  float* pair = baseOf(z.local, lo, n, C);
+  constexpr bool fast = std::is_same_v<T, half>;
+  const int stride = (n + 7) / 8 * 8;
+  mg::Shared& biasS = mg::shared(std::string("sh.biasg") + (fast ? "16" : "32"), (size_t)heads * n * stride * sizeof(T));
+  T* bias = (T*)biasS.local;
+  CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * sizeof(T), STREAM));
+  const size_t pairsHere = (size_t)rowsHere * n;
+  size_t per = std::max<size_t>(1, std::min(std::max<size_t>(pairsHere, 1), CHUNK / C));
+  T* lnc = scratch<T>("grid.normChunk", per * C);
+  float* raw = scratch<float>("grid.rawbias", per * heads);
+  for (size_t q0 = 0; q0 < pairsHere; q0 += per) {
+    size_t r = std::min(per, pairsHere - q0);
+    lnPairRows<T>((float*)z.local, q0, lnc, r, C, pre + ".actNormScale", pre + ".actNormOffset");
+    linear<T, float>(lnc, raw, r, C, heads, pre + ".pairBiasProjection");
+    biasFromFlatRowsK<T><<<blocks((size_t)heads * r), 256, 0, STREAM>>>(raw, bias, (size_t)lo * n + q0, r, n, stride, heads, swap,
+                                                                        fast ? LOG2E : 1.f);
+  }
+  mg::fence();
+  const size_t e = sizeof(T);
+  for (int r = 0; r < mg::WORLD; ++r) {
+    if (r == mg::RANK) continue;
+    int rlo, rhi; rowsOf(n, r, rlo, rhi); rhi = std::min(rhi, n);
+    if (rhi <= rlo) continue;
+    for (int h = 0; h < heads; ++h) {
+      const size_t plane = (size_t)h * n * stride * e;
+      if (!swap) CK(cudaMemcpyAsync((char*)bias + plane + (size_t)rlo * stride * e, (const char*)biasS.peer[r] + plane +
+                                    (size_t)rlo * stride * e, (size_t)(rhi - rlo) * stride * e, cudaMemcpyDefault, STREAM));
+      else CK(cudaMemcpy2DAsync((char*)bias + plane + (size_t)rlo * e, (size_t)stride * e, (const char*)biasS.peer[r] + plane +
+                                (size_t)rlo * e, (size_t)stride * e, (size_t)(rhi - rlo) * e, n, cudaMemcpyDefault, STREAM));
+    }
+  }
+  mg::fence();
+  std::string qkvg = qkvgWeight(pre, C, Wd, true);
+  const float* gateBias = hasW(pre + ".gatingQueryBias") ? W(pre + ".gatingQueryBias") : nullptr;
+  const float* outBias = hasW(pre + ".outputProjectionBias") ? W(pre + ".outputProjectionBias") : nullptr;
+  const float scale = 1.f / sqrtf((float)D);
+  size_t R = std::max<size_t>(1, std::min<size_t>(std::max(rowsHere, 1), CHUNK / ((size_t)n * 4 * Wd)));
+  for (size_t r0 = lo; r0 < (size_t)(lo + rowsHere); r0 += R) {
+    size_t rows = std::min(R, (size_t)(lo + rowsHere) - r0), prs = rows * n;
+    T* act = scratch<T>("grid.act", std::min<size_t>(R, rowsHere) * n * C);
+    lnPairRows<T>((float*)z.local, (r0 - lo) * n, act, prs, C, pre + ".actNormScale", pre + ".actNormOffset");
+    T* qkvgOut = scratch<T>("grid.qkvg", (std::min<size_t>(R, rowsHere) * n + 128) * 4 * Wd);
+    linear<T, T>(act, qkvgOut, prs, C, 4 * Wd, qkvg);
+    if (gateBias) addGateBiasK<T><<<blocks(prs * Wd), 256, 0, STREAM>>>(qkvgOut, gateBias, prs, Wd);
+    T* gathered = scratch<T>("grid.gathered", std::min<size_t>(R, rowsHere) * n * Wd);
+    flashGrid<T>(qkvgOut, bias, stride, MASK_ALL_ONES && fast ? nullptr : mask, gathered, n, heads, D, r0, rows, false, scale);
+    float* o = scratch<float>("grid.o", std::min<size_t>(R, rowsHere) * n * C);
+    linear<T, float>(gathered, o, prs, Wd, C, pre + ".outputProjection");
+    if (outBias) addBiasK<<<blocks(prs * C), 256, 0, STREAM>>>(o, outBias, prs, C);
+    WITH_PAIR_T(addGridK<PT, float><<<blocks(prs * C / 4), 256, 0, STREAM>>>(into(pair), o, n, C, r0, rows, false));
+  }
+  releaseScratch({ "grid." });
+}
 // A pairformer block's pair updates on the sharded pair z (this rank's slab), zT a slab-sized buffer for z^T
 template <class T>
 inline void pairUpdates(const mg::Shared& z, const mg::Shared& zT, const float* mask, int n, int C, const std::string& pre,
                         bool swap, bool divide, int transitionFactor) {
-  if (!PAIR16) { fprintf(stderr, "sharded pair: the bf16 pair only\n"); exit(1); }
-  triangleSharded<T>(z, mask, n, C, pre + ".triangleMultiplicationOutgoing", divide); stage("tri.out");
-  transpose(z, zT, n, C);
-  triangleSharded<T>(zT, mask, n, C, pre + ".triangleMultiplicationIncoming", divide); stage("tri.in");
-  transpose(zT, z, n, C);
+  // the fused forms where they apply (the 128/256-channel streaming triangle on a bf16 pair, the 128-channel 4 x 32
+  // grid attention without biases), the generic ones otherwise
+  auto tri = [&](const mg::Shared& s, const std::string& p) {
+    if constexpr (std::is_same_v<T, half>) {
+      if (PAIR16 && (C == 128 || C == 256) && blockedFused(n, C)) { triangleSharded<T>(s, mask, n, C, p, divide); return; }
+    }
+    triangleGenericOn<T>(s, mask, n, C, p, divide);
+  };
   int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
-  rowAttention(z, mask, n, C, heads, D, pre + ".pairAttention1", false); stage("grid.row");
+  auto att = [&](const mg::Shared& s, const std::string& p, bool sw) {
+    if constexpr (std::is_same_v<T, half>) {
+      if (C == 128 && heads * D == 128 && D == 32 && !hasW(p + ".gatingQueryBias") && !hasW(p + ".outputProjectionBias")) {
+        rowAttention(s, mask, n, C, heads, D, p, sw); return;
+      }
+    }
+    rowAttentionGeneric<T>(s, mask, n, C, heads, D, p, sw);
+  };
+  tri(z, pre + ".triangleMultiplicationOutgoing"); stage("tri.out");
   transpose(z, zT, n, C);
-  rowAttention(zT, mask, n, C, heads, D, pre + ".pairAttention2", !swap); stage("grid.col");
+  tri(zT, pre + ".triangleMultiplicationIncoming"); stage("tri.in");
+  transpose(zT, z, n, C);
+  att(z, pre + ".pairAttention1", false); stage("grid.row");
+  transpose(z, zT, n, C);
+  att(zT, pre + ".pairAttention2", !swap); stage("grid.col");
   transpose(zT, z, n, C);
   const int rowsHere = storedRows(n, mg::RANK);
   if (rowsHere) transition<T>((float*)z.local, (size_t)rowsHere * n, C, transitionFactor, pre + ".pairTransition");
