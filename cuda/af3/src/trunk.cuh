@@ -2,6 +2,7 @@
 // Transcribed from src/af3/trunk/{embedder,template,msa,pairformer,trunk}-reference.js.
 #pragma once
 #include "pairtrack.cuh"
+#include "sharded.cuh"
 
 // acc += work - base (an update run on a copy of its input, added as a difference: chai-1's parallel blocks)
 template <class T>
@@ -1103,7 +1104,8 @@ void pairformerBlockAt(float* pair, float* single, const float* pairMask, const 
                    extraBias); stage("single");
     return;
   }
-  pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, shortPair((size_t)n * n, C));
+  if (sh::ON && mg::splitting(pair)) sh::pairUpdatesViaShards<T>(pair, pairMask, n, C, B, swap, divide, 4);   // (phase 2's check)
+  else pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, shortPair((size_t)n * n, C));
   singleTrack<T>(single, pair, seqMask, n, C, Cs, B, extraBias); stage("single");
 }
 template <class T>
