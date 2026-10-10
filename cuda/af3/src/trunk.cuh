@@ -1439,6 +1439,44 @@ inline std::vector<float> contactProbabilities(Trunk& t) {
   return download(out, pairs);
 }
 
+// ...on a sharded pair (several GPUs): this rank's rows, their transposed rows the same rows of z^T (one all-to-all
+// transpose of the trunk's slab), every rank's probabilities read onto rank 0. Collective; rank 0's result
+inline std::vector<float> contactProbabilitiesSharded(Trunk& t) {
+  if (!M.has("batch.contactClasses")) return {};
+  const int n = t.n, C = t.C, bins = (int)M.meta("trunk.distogram.bins");
+  const int* contactBins = contactBinsDevice(n, bins);
+  const size_t slab = (size_t)sh::maxStored(n) * n * C * 2, hp = heldPairs(t), hf = heldFirst(t);
+  mg::Shared& zT = mg::shared("sh.ct.zT", slab);
+  mg::Shared& outS = mg::shared("sh.ct.out", std::max<size_t>((size_t)sh::maxStored(n) * n, 1) * 4);
+  const bool was16 = PAIR16;
+  PAIR16 = true;
+  sh::transpose(*t.zS, zT, n, C);
+  PAIR16 = was16;
+  size_t R = std::max<size_t>(1, std::min<size_t>(std::max(t.shardRows, 1), CHUNK / ((size_t)n * std::max(C, bins))));
+  float* a = scratch<float>("disto.half", R * n * bins); float* b = scratch<float>("disto.halfT", R * n * bins);
+  for (size_t r0 = 0; r0 < (size_t)t.shardRows; r0 += R) {
+    size_t r = std::min(R, (size_t)t.shardRows - r0), rows = r * n;
+    distogramHalfP(reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(t.pair) + r0 * n * C), true, a, rows, C, bins);
+    distogramHalfP(reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(zT.local) + r0 * n * C), true, b, rows, C, bins);
+    addK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, b, rows * bins);
+    if (distogramSymScale() != 1.f) scaleK<<<blocks(rows * bins), 256, 0, STREAM>>>(a, distogramSymScale(), rows * bins);
+    contactProbsK<<<blocks(rows), 256, 0, STREAM>>>(a, contactBins + hf + r0 * n, t.pairMask + hf + r0 * n,
+                                                    (float*)outS.local + r0 * n, rows, bins);
+  }
+  (void)hp;
+  std::vector<float> out;
+  mg::fence();
+  if (mg::RANK == 0) {
+    out.resize((size_t)n * n);
+    for (int r = 0; r < mg::WORLD; ++r) {
+      int rlo, rhi; sh::rowsOf(n, r, rlo, rhi); const size_t cnt = (size_t)sh::storedRows(n, r) * n;
+      if (cnt) CK(cudaMemcpy(out.data() + (size_t)rlo * n, outS.peer[r], cnt * 4, cudaMemcpyDefault));
+    }
+  }
+  mg::release({ "sh.ct." });
+  return out;
+}
+
 // The whole trunk pass. `onSeam(name, ptr, n)` sees the oracle's seams.
 template <class T>
 void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size_t)>& onSeam) {

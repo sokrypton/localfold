@@ -635,14 +635,33 @@ static int foldMain(int argc, char** argv) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
     }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); });
     FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
+    // several GPUs on a sharded pair, past the sampler: the confidence head of every sample and the contacts on held
+    // rows (collective, rank 0's results); then the others leave and rank 0 writes the fold with the whole pair never
+    // held anywhere
+    std::vector<ConfidenceOut> shardedConf;
     if (sharded(t)) {
-      // the diffusion done on every rank: every rank's rows onto rank 0, into a whole pair, for the contacts and the
-      // confidence head; the others leave
-      pairOntoRank0(t);
+      releaseScratch();                // (the sampler's: the heads allocate theirs beside the slab)
       df.trunkPair = nullptr;
-      // the pair as the one-GPU fold would hold it past here (bf16 only where pairStays16 keeps it so)
-      if (!pairStays16(t.n, t.C, fast)) { pairToF32(t); TRUNK_PAIR16 = false; }
-      contact = contactProbabilities(t);
+      std::vector<int> pbI(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
+      std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
+      const bool ca = M.flag("trunk.dialect.confidenceCaDgram");
+      for (size_t k = 0; k < cn; ++k) {
+        const float* xk = xs.data() + k * mask.size() * 3;
+        std::vector<float> beta((size_t)nD * 3);
+        for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)
+          beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
+        float* dBeta = upload(beta.data(), beta.size());
+        shardedConf.push_back(confidenceSharded(*t.zS, t.shardLo, t.shardRows, t.single, t.targetFeat, dBeta, t.seqMask,
+                                                t.pairMask, t.n));
+        CK(cudaFree(dBeta));
+      }
+      contact = contactProbabilitiesSharded(t);
+      mg::release({ "" });
+      if (mg::RANK != 0) { mg::finish(); exit(0); }
+      mg::finish();
+      mg::WORLD = 1;
+      t.pair = nullptr; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.msa = nullptr;
+      sh::DLO = -1; sh::DROWS = 0;
     }
     // the steps' precomputed conditioning (steps x tokens rows, 5 GB at 100 steps and 10761 tokens) is read by
     // nothing after the sampler - the next batch makes its own - and held to the end it left the confidence
@@ -717,12 +736,15 @@ static int foldMain(int argc, char** argv) {
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
         ck.meanPlddt = sum / std::max(count, 1.0);
       } else {
+        if (!shardedConf.empty()) { ck = std::move(shardedConf[k]); }      // (made on every GPU above)
+        else {
         if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * (TRUNK_PAIR16 ? 2 : 4));    // (parked for the sampler)
         // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
         bool last = c0 + k + 1 == runs.size();
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
                             last && shortPair((size_t)t.n * t.n, t.C));
         releaseConcatCopies(); memReport("confidence");
+        }
       }
       CK(cudaFree(dBeta));
       confMs += ms(s1, clock());

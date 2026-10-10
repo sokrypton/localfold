@@ -38,9 +38,9 @@ __global__ void confidenceBinK(const float* beta, int n, int bins, float dmin, f
 template <class PT = float>
 __global__ void confidencePairInitK(float* pair, const float* left, const float* right, const int* binOf,
                                     const float* sqOf, const float* pairMask, const float* Wd, int n, int C,
-                                    const float* Wdist, bool caBins, bool unmasked = false) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)n * n * C) return;
+                                    const float* Wdist, bool caBins, bool unmasked = false, size_t t0 = 0, size_t tEnd = 0) {
+  size_t t = t0 + (size_t)blockIdx.x * blockDim.x + threadIdx.x;     // ([t0, tEnd): a sharded pair's held rows)
+  if (t >= (tEnd ? tEnd : (size_t)n * n * C)) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / n), j = (int)(ij % n);
   float v = left[(size_t)j * C + c] + right[(size_t)i * C + c];
   int bin = binOf[ij];
@@ -294,6 +294,54 @@ inline void foldDualOutputs() {
     }
   CK(cudaStreamSynchronize(STREAM));
 }
+// pTM and ipTM off the PAE logits' per-pair expected TM terms: the best anchor's mean over the pairs it selects
+// (ipTM: other chains only). shared/heads/tm-score.js. out.tmTerm takes the terms
+inline void confidenceTm(ConfidenceOut& out, std::vector<float> term, const float* seqMask, int n) {
+  std::vector<float> seq = download(seqMask, n);
+  const int* asym = M.i("batch.asymId");
+  auto reduce = [&](bool interOnly) {
+    double best = -1e30; bool any = false;
+    for (int i = 0; i < n; ++i) {
+      double tot = 0; int cnt = 0;
+      for (int j = 0; j < n; ++j) {
+        if (!(seq[i] > 0 && seq[j] > 0) || (interOnly && asym[i] == asym[j])) continue;
+        tot += term[(size_t)i * n + j]; ++cnt;
+      }
+      if (cnt) { any = true; best = std::max(best, tot / cnt); }
+    }
+    return any ? best : NAN;
+  };
+  out.ptm = reduce(false); out.iptm = reduce(true);
+  out.tmTerm = std::move(term);
+}
+// pLDDT off the head's single (and its mean over real atoms); headNorm the head's LayerNorm-or-none
+template <class HN>
+inline void confidencePlddt(ConfidenceOut& out, const float* single, int n, int Cs, HN&& headNorm) {
+  const std::string P = "confidence";
+  const int dense = (int)M.meta("batch.dense");
+  const int PB = 50;
+  std::vector<float> pc(PB);
+  for (int b = 0; b < PB; ++b) pc[b] = 0.5f / PB + (float)b / PB;
+  float* dpc = upload(pc.data(), PB);
+  float* slnBuf = scratch<float>("conf.sln", (size_t)n * Cs);
+  const float* sln = headNorm(single, slnBuf, n, Cs, "plddtLn");
+  float* pl = scratch<float>("conf.plddtLogits", (size_t)n * dense * PB);
+  if (M.flag("trunk.dialect.chaiConfidence")) {
+    // chai-1 predicts pLDDT over the 37 ATOM37 slots and gathers each dense slot's by its atom NAME (no match: slot 0)
+    float* p37 = scratch<float>("conf.plddt37", (size_t)n * 37 * PB);
+    linear<float, float>(sln, p37, n, Cs, 37 * PB, P + ".plddtLogits");
+    gatherPlddt37K<<<blocks((size_t)n * dense * PB), 256, 0, STREAM>>>(p37, atom37Index(n, dense), pl, n, dense, PB);
+  } else
+    linear<float, float>(sln, pl, n, Cs, dense * PB, P + ".plddtLogits");
+  float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);
+  expectationK<<<blocks((size_t)n * dense), 256, 0, STREAM>>>(pl, plddt, nullptr, (size_t)n * dense, PB, dpc, 0, 100.f);
+  out.plddt = download(plddt, (size_t)n * dense);
+  CK(cudaFree(dpc));
+  const float* mask = M.f("batch.refMask");
+  double sum = 0, count = 0;
+  for (size_t i = 0; i < out.plddt.size(); ++i) if (mask[i]) { sum += out.plddt[i]; count += 1; }
+  out.meanPlddt = sum / std::max(count, 1.0);
+}
 inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSingle, const float* targetFeat,
                                     const float* pseudoBeta, const float* seqMask, const float* pairMask, int n,
                                     bool consumeTrunkPair = false) {
@@ -472,50 +520,135 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   }
   // pTM and ipTM off the PAE logits: per pair the expected TM term, then the best anchor's
   // mean over the pairs it selects (ipTM: other chains only). shared/heads/tm-score.js.
-  {
-    std::vector<float> seq = download(seqMask, n);
-    const int* asym = M.i("batch.asymId");
-    std::vector<float> term = download(tmTerm, pairs);
-    CK(cudaFree(dPerBin));
-    auto reduce = [&](bool interOnly) {
-      double best = -1e30; bool any = false;
-      for (int i = 0; i < n; ++i) {
-        double tot = 0; int cnt = 0;
-        for (int j = 0; j < n; ++j) {
-          if (!(seq[i] > 0 && seq[j] > 0) || (interOnly && asym[i] == asym[j])) continue;
-          tot += term[(size_t)i * n + j]; ++cnt;
-        }
-        if (cnt) { any = true; best = std::max(best, tot / cnt); }
-      }
-      return any ? best : NAN;
-    };
-    out.ptm = reduce(false); out.iptm = reduce(true);
-    out.tmTerm = std::move(term);
-  }
-  const int PB = 50;
-  std::vector<float> pc(PB);
-  for (int b = 0; b < PB; ++b) pc[b] = 0.5f / PB + (float)b / PB;
-  float* dpc = upload(pc.data(), PB);
-  float* slnBuf = scratch<float>("conf.sln", (size_t)n * Cs);
-  const float* sln = headNorm(single, slnBuf, n, Cs, "plddtLn");
-  float* pl = scratch<float>("conf.plddtLogits", (size_t)n * dense * PB);
-  if (M.flag("trunk.dialect.chaiConfidence")) {
-    // chai-1 predicts pLDDT over the 37 ATOM37 slots and gathers each dense slot's by its atom NAME (no match: slot 0)
-    float* p37 = scratch<float>("conf.plddt37", (size_t)n * 37 * PB);
-    linear<float, float>(sln, p37, n, Cs, 37 * PB, P + ".plddtLogits");
-    gatherPlddt37K<<<blocks((size_t)n * dense * PB), 256, 0, STREAM>>>(p37, atom37Index(n, dense), pl, n, dense, PB);
-  } else
-    linear<float, float>(sln, pl, n, Cs, dense * PB, P + ".plddtLogits");
-  float* plddt = scratch<float>("conf.plddt", (size_t)n * dense);
-  expectationK<<<blocks((size_t)n * dense), 256, 0, STREAM>>>(pl, plddt, nullptr, (size_t)n * dense, PB, dpc, 0, 100.f);
-  out.plddt = download(plddt, (size_t)n * dense);
+  CK(cudaFree(dPerBin));
+  confidenceTm(out, download(tmTerm, pairs), seqMask, n);
+  confidencePlddt(out, single, n, Cs, headNorm);
   out.pae = download(pae, pairs);
   out.pde = download(pde, pairs);
-  CK(cudaFree(dCentres)); CK(cudaFree(dpc));
-  // the mean over real atoms
-  const float* mask = M.f("batch.refMask");
-  double sum = 0, count = 0;
-  for (size_t i = 0; i < out.plddt.size(); ++i) if (mask[i]) { sum += out.plddt[i]; count += 1; }
-  out.meanPlddt = sum / std::max(count, 1.0);
+  CK(cudaFree(dCentres));
+  return out;
+}
+
+// Several GPUs on a sharded pair (sharded.cuh): the head on this rank's rows - its pair a copy of the trunk's slab, its
+// blocks sh::pairUpdates and the sharded single track, its PAE and PDE heads over held rows (the PDE's transposed
+// rows the same rows of z^T, one all-to-all transpose), every rank's rows of PAE, PDE and the TM terms read onto rank 0
+// over the peers' buffers. Collective; the result is rank 0's (the others' carry nothing). The AF3 lineage's head
+// without re-embedding or a global norm (not boltz2 or rf3 yet), in f16 (--fast)
+inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int rowsHere, const float* trunkSingle,
+                                       const float* targetFeat, const float* pseudoBeta, const float* seqMask,
+                                       const float* pairMask, int n) {
+  const std::string P = "confidence";
+  int C = (int)M.meta(P + ".pairChannels"), Cs = (int)M.meta(P + ".singleChannels"), F = (int)M.meta(P + ".targetFeatWidth");
+  const bool caDgram = M.flag("trunk.dialect.confidenceCaDgram"), chai = M.flag("trunk.dialect.chaiConfidence");
+  if (M.flag("trunk.dialect.reembedConfidencePair") || M.flag("trunk.dialect.confidenceGlobalNorm") || chai || !CONF_HALF ||
+      hasW(P + ".interHalfDistanceLogits") || hasW(P + ".paeInterLogits")) {
+    fprintf(stderr, "a sharded confidence head: the AF3 lineage's plain head in f16 only (not boltz2, rf3 or chai-1 yet)\n"); exit(1);
+  }
+  const size_t pairs = (size_t)n * n, hp = (size_t)rowsHere * n, hf = (size_t)lo * n;
+  const size_t slab = (size_t)sh::maxStored(n) * n * C * 2;
+  mg::Shared& cz = mg::shared("sh.cz", slab);
+  mg::Shared& czT = mg::shared("sh.czT", slab);
+  float* pair = (float*)cz.local;
+  float* base = (float*)((__nv_bfloat16*)cz.local - hf * C);
+  if (hp) CK(cudaMemcpyAsync(pair, trunkZ.local, hp * C * 2, cudaMemcpyDeviceToDevice, STREAM));
+  float* single = scratch<float>("conf.single", (size_t)n * Cs);
+  CK(cudaMemcpyAsync(single, trunkSingle, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+  float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
+  linear<float, float>(targetFeat, left, n, F, C, P + ".leftTargetFeatProject");
+  linear<float, float>(targetFeat, right, n, F, C, P + ".rightTargetFeatProject");
+  int bins = (int)(lenW(P + ".distogramFeatProject") / C);
+  if (bins != (caDgram ? 40 : 39)) { fprintf(stderr, "confidence distogram has %d bins\n", bins); exit(1); }
+  int* binOf = scratch<int>("conf.bin", pairs); float* sqOf = scratch<float>("conf.sq", pairs);
+  confidenceBinK<<<blocks(pairs), 256, 0, STREAM>>>(pseudoBeta, n, bins, 3.25f, 50.75f, caDgram, binOf, sqOf, false);
+  if (hp) confidencePairInitK<__nv_bfloat16><<<blocks(hp * C), 256, 0, STREAM>>>(base, left, right, binOf, sqOf, pairMask,
+    W(P + ".distogramFeatProject"), n, C, Wopt(P + ".distanceFeatProject"), caDgram, false, hf * C, (hf + hp) * C);
+  if (hasW(P + ".inputSingleNormScale")) {
+    clampK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, 512.f, (size_t)n * Cs);
+    float* sn = scratch<float>("conf.singleNorm", (size_t)n * Cs);
+    layerNorm2<float, float>(single, sn, n, Cs, P + ".inputSingleNormScale", P + ".inputSingleNormOffset");
+    CK(cudaMemcpyAsync(single, sn, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+  }
+  foldDualOutputs();
+  int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
+  bool swap = M.flag("trunk.dialect.swapTransposedBias"), divide = M.flag("trunk.dialect.triangleMulDivideByLength");
+  const bool was16 = PAIR16;
+  PAIR16 = true;
+  for (int k = 0; k < nb; ++k) {
+    const std::string B = P + ".blocks." + std::to_string(k);
+    sh::pairUpdates<half>(cz, czT, pairMask, n, C, B, swap, divide, 4);
+    singleTrack<half>(single, pair, seqMask, n, C, Cs, B, nullptr, lo);
+  }
+  sh::transpose(cz, czT, n, C);              // (the PDE's transposed rows)
+  PAIR16 = was16;
+  releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
+  const int NB = 64; double step = 31.0 / (NB - 2);
+  std::vector<float> centres(NB);
+  for (int b = 0; b < NB - 1; ++b) centres[b] = (float)(b * step + step / 2);
+  centres[NB - 1] = (float)(centres[NB - 2] + step);
+  float* dCentres = upload(centres.data(), NB);
+  double d0;
+  {
+    std::vector<float> seq = download(seqMask, n);
+    int real = 0; for (float v : seq) real += v > 0;
+    d0 = 1.24 * std::cbrt(std::max(real, 19) - 15.0) - 1.8;
+  }
+  std::vector<float> perBin(NB);
+  for (int b = 0; b < NB; ++b) perBin[b] = (float)(1 / (1 + (double)centres[b] * centres[b] / (d0 * d0)));
+  float* dPerBin = upload(perBin.data(), NB);
+  auto headNorm = [&](const float* x, float* buf, size_t rows, int Cx, const std::string& name) -> const float* {
+    if (!hasW(P + "." + name + "Scale")) return x;
+    layerNorm2<float, float>(x, buf, rows, Cx, P + "." + name + "Scale", P + "." + name + "Offset");
+    return buf;
+  };
+  const bool preSym = M.flag("trunk.dialect.preSymmetrisedPde");
+  const size_t held = (size_t)sh::maxStored(n) * n;
+  mg::Shared& pdeS = mg::shared("sh.c.pde", std::max<size_t>(held, 1) * 4);
+  mg::Shared& paeS = mg::shared("sh.c.pae", std::max<size_t>(held, 1) * 4);
+  mg::Shared& tmS = mg::shared("sh.c.tm", std::max<size_t>(held, 1) * 4);
+  float *pde = (float*)pdeS.local, *pae = (float*)paeS.local, *tm = (float*)tmS.local;
+  const size_t rowsPer = std::max<size_t>(1, std::min(std::max<size_t>(hp, 1), CHUNK / C));
+  float* ln = scratch<float>("conf.ln", rowsPer * C);
+  float* ln2 = scratch<float>("conf.ln2", rowsPer * C);
+  float* own = scratch<float>("conf.own", rowsPer * C);
+  float* trn = scratch<float>("conf.symT", rowsPer * C);
+  float* logits = scratch<float>("conf.logits", rowsPer * NB);
+  for (size_t r0 = 0; r0 < hp; r0 += rowsPer) {
+    size_t cnt = std::min(rowsPer, hp - r0);
+    ownRowsK<__nv_bfloat16><<<blocks(cnt * C), 256, 0, STREAM>>>(pair, own, r0, cnt, C);
+    ownRowsK<__nv_bfloat16><<<blocks(cnt * C), 256, 0, STREAM>>>((const float*)czT.local, trn, r0, cnt, C);
+    // the PDE: AF3 symmetrises after the projection (W LN(z_ij) + W LN(z_ji), through linearity one projection of the
+    // summed norms), protenix2 before it (LN(z_ij + z_ji) W) - the one-GPU head's chunked forms
+    const float* xn;
+    if (preSym) {
+      addK<<<blocks(cnt * C), 256, 0, STREAM>>>(trn, own, cnt * C);
+      xn = headNorm(trn, ln, cnt, C, "logitsLn");
+    } else {
+      xn = headNorm(own, ln, cnt, C, "logitsLn");
+      if (xn != ln) { CK(cudaMemcpyAsync(ln, xn, cnt * C * 4, cudaMemcpyDeviceToDevice, STREAM)); xn = ln; }
+      addK<<<blocks(cnt * C), 256, 0, STREAM>>>(ln, headNorm(trn, ln2, cnt, C, "logitsLn"), cnt * C);
+    }
+    linear<float, float>(xn, logits, cnt, C, NB, P + ".leftHalfDistanceLogits");
+    expectationK<<<blocks(cnt), 256, 0, STREAM>>>(logits, pde + r0, pairMask + hf + r0, cnt, NB, dCentres, 0, 1.f);
+    linear<float, float>(headNorm(own, ln, cnt, C, "paeLogitsLn"), logits, cnt, C, NB, P + ".paeLogits");
+    expectationK<<<blocks(cnt), 256, 0, STREAM>>>(logits, pae + r0, pairMask + hf + r0, cnt, NB, dCentres, 0, 1.f);
+    expectationK<<<blocks(cnt), 256, 0, STREAM>>>(logits, tm + r0, nullptr, cnt, NB, dPerBin, 0, 1.f);
+  }
+  CK(cudaFree(dCentres)); CK(cudaFree(dPerBin));
+  ConfidenceOut out;
+  mg::fence();
+  if (mg::RANK == 0) {
+    std::vector<float> term(pairs);
+    out.pae.resize(pairs); out.pde.resize(pairs);
+    for (int r = 0; r < mg::WORLD; ++r) {
+      int rlo, rhi; sh::rowsOf(n, r, rlo, rhi); const size_t cntR = (size_t)sh::storedRows(n, r) * n;
+      if (!cntR) continue;
+      CK(cudaMemcpy(out.pae.data() + (size_t)rlo * n, paeS.peer[r], cntR * 4, cudaMemcpyDefault));
+      CK(cudaMemcpy(out.pde.data() + (size_t)rlo * n, pdeS.peer[r], cntR * 4, cudaMemcpyDefault));
+      CK(cudaMemcpy(term.data() + (size_t)rlo * n, tmS.peer[r], cntR * 4, cudaMemcpyDefault));
+    }
+    confidenceTm(out, std::move(term), seqMask, n);
+    confidencePlddt(out, single, n, Cs, headNorm);
+  }
+  mg::release({ "sh.cz", "sh.c." });       // (collective: the next sample's head makes its own)
   return out;
 }
