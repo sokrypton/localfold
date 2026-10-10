@@ -659,3 +659,33 @@ outliers. What remains, all bandwidth or scalar work:
   - ESMFold2's `ef2_swa`: 52 ms of a 2.47 s trunk (2%).
   - The small-fold adaLN fusion: level twice before.
   - ESMFold2's C 256 centre norm already reads once and runs at ~110 GB/s.
+
+### 2026-10-10, evening: another pass (a fresh profile of every model at 255 tokens)
+
+- **What the profile says is left on Metal**: GEMMs and attention. A boltz2 trunk pass is 1180 ms of GPU time.
+  - The 65025-row GEMMs run at 9-10 TFLOP/s (SwiGLU 9.3, the triangle gate 9.1, grid qkvg 9.8).
+  - The pair-wide output GEMMs are bandwidth-bound at 100-125 GB/s (grid output 2.7 TFLOP/s, transition2 5.7): the
+    f32 pair is read and written in each.
+  - The trunk's wall time matches its GPU time (1.19-1.24 s against 1.18), so there is no host stall to recover.
+  - The centre norms (`lf_center_norm_16/32`) move 6 bytes an element at ~105 GB/s and the wide one 10 at ~150, so they
+    are at bandwidth too. The product in half, the one way to fewer bytes, lost before (above).
+- **09529291, chai-1's transitions take their norm's affine folded into the SwiGLU weights.** `gemmSwiglu` takes an
+  optional f32 bias in the interleaved order (all three SwiGLU epilogues); `af3_affine_h` (36 ms a pass) is gone.
+  - chai-1 5CAJ trunk, alternating past a compile: 5 of 6 rounds faster, by ~0.5%. The SwiGLU with its bias is 4 ms
+    slower a pass, and the weight folding moves into the first pass.
+  - Control: `LOCALFOLD_FOLD_TRANSITION=0`.
+- **AF2: the outer product's mask norm once a stack, and its add in the output GEMM.**
+  - `af2_mask_norm` (a 255 x 255 count over every MSA row) ran in every block, but the mask is the same for a stack's
+    blocks. Now once a stack a pass: 52 runs to 2, -16 ms. Control: `LOCALFOLD_OPM_NORM_ONCE=0`.
+  - `pair += (bias + Y) / (1e-3 + norm)` is the output GEMM's vector epilogue (EP bit 8192, `gemmOpmOut`, the matrix
+    units only; `LOCALFOLD_OPM_ADD=0` the control): the GEMM 88 -> 104-107 ms, and `af2_opm_add` (39-41 ms) and the f32
+    Y gone.
+  - Together -37 ms a pass with the 1500-row MSA (-0.9%), byte-identical PDBs. The wall clock drifted more than that
+    across four alternating rounds (+33 / 0 / -38 / -29 ms), so the number is the kernels' sum.
+- **7883939c, WebGPU: the triangle's projection tile at 32 x 32 in the metal-3 prior** (ampere's). On the M5 in stock
+  Chrome, `tri.project-out` 278-295 -> 234-239 ms a 255-token pass and `tri.project` -2 to -6%, relRMS 0. The pass's
+  GPU time is lower in two rounds of three, by ~1.3%. Not measured on an M2.
+- **Level on WebGPU, not taken**: `pairTransitionSplit` at 128 channels, `triangleProjectOutColumns` 64, and a wider
+  output tile for the triangle's projection.
+- **WebGPU's contraction (`tri.contract`, 288 ms a pass)** runs at ~1.5 TFLOP/s against the probe's 2.0 for an f32
+  staged GEMM, so a rewrite would be worth at most ~1.3x on it (~2% of a pass). Its tiles stop at 32 x 32. Not done.
