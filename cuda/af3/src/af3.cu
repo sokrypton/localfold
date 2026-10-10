@@ -355,6 +355,11 @@ static int foldMain(int argc, char** argv) {
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
   if (oracleTargetFeat)
     targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
+  if (mg::WORLD > 1 && SHORT_PAIR_TIMES > 0) {    // (one room for every rank's short-of-room choices: common.cuh)
+    SHORT_PAIR_ROOM = std::max<size_t>(1, mg::minOverRanks(shortPairRoomHere()));
+    if (getenv("LOCALFOLD_MEM") && mg::RANK == 0)
+      fprintf(stderr, "  memory room for the ordinary paths %.2f GB, every rank's least\n", SHORT_PAIR_ROOM / 1e9);
+  }
   if (!(mg::WORLD > 1 && sh::ON) && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
                 doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
   // several GPUs on a sharded pair: the diffusion runs whole on every rank (oneCardPast) where the fold would fit one

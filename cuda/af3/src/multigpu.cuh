@@ -32,6 +32,7 @@ struct Shm {
   std::atomic<int> arrived, generation, abort, slots;
   int pid[MAX_RANKS];                 // every rank's process, so a barrier notices one that died without exiting
   int vote[MAX_RANKS];                // (release: whether each rank has the room to keep what it gives back)
+  size_t value[MAX_RANKS];            // (minOverRanks)
   Slot slot[MAX_SLOTS];
 };
 inline Shm* SHM = nullptr;
@@ -205,6 +206,15 @@ inline void freeIdle() {
       for (int r = 0; r < WORLD; ++r) if (r != RANK && g.peer[r]) { if (!SIM) CK(cudaIpcCloseMemHandle(g.peer[r])); g.peer[r] = nullptr; }
   if (WORLD > 1) barrier();
   for (auto& g : sg) if (!g.dead && !g.live) { CK(cudaFree(g.local)); g.dead = true; }
+}
+// the least of every rank's `v` (collective)
+inline size_t minOverRanks(size_t v) {
+  if (WORLD == 1 || SIM) return v;
+  SHM->value[RANK] = v;
+  barrier();
+  for (int r = 0; r < WORLD; ++r) v = std::min(v, SHM->value[r]);
+  barrier();
+  return v;
 }
 // whether every rank has `bytes` free and a margin (collective: each rank's answer in the shared mapping)
 inline bool everyRankHas(size_t bytes) {

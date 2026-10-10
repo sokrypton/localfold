@@ -1133,17 +1133,26 @@ inline bool tightPair(size_t pairs, int C) { return pairs * C * 4 > ((size_t)128
 // 12.8 s at 765. AF2 and ESMFold2 (0) keep the 64th until measured. Under it the trunk gives each stage's scratch
 // back between stages, which costs the recycles their graph and a reallocation a pass.
 inline double SHORT_PAIR_TIMES = 0;
+// several GPUs: the room every rank decides by, the least of theirs taken at one point of the fold (af3.cu) - each
+// measuring its own at its own first ask, 10,127 tokens on 8 x A100 had rank 0 at 26.1 GB and the rest at 29.3, and a
+// rank that alone takes the short-of-room paths (the trunk not captured, its exchange buffers given back - collective)
+// leaves the others waiting at a meeting it never comes to
+inline size_t SHORT_PAIR_ROOM = 0;
+inline size_t shortPairRoomHere() {
+  size_t f, t; deviceMemInfo(&f, &t);
+  for (auto& [name, slot] : SCRATCH) f += slot.second;
+  return f > t / 20 ? f - t / 20 : 0;
+}
 inline bool shortPair(size_t pairs, int C) {
   if (BIG_FORCED) return true;
   if (SHORT_PAIR_TIMES > 0) {
-    static const size_t room = [] {
-      size_t f, t; deviceMemInfo(&f, &t);
-      for (auto& [name, slot] : SCRATCH) f += slot.second;
-      size_t r = f > t / 20 ? f - t / 20 : 0;
+    static size_t own = 0;
+    if (!SHORT_PAIR_ROOM && !own) {
+      own = shortPairRoomHere();
       if (getenv("LOCALFOLD_MEM")) fprintf(stderr, "  memory room for the ordinary paths %.2f GB (a pair up to %.2f GB)\n",
-                                           r / 1e9, r / 1e9 / SHORT_PAIR_TIMES);
-      return r;
-    }();
+                                           own / 1e9, own / 1e9 / SHORT_PAIR_TIMES);
+    }
+    const size_t room = SHORT_PAIR_ROOM ? SHORT_PAIR_ROOM : own;
     return (double)pairs * C * 4 * SHORT_PAIR_TIMES > (double)room;
   }
   static const size_t card = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t; }();
