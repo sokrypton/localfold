@@ -440,3 +440,23 @@ And more that **lost**:
 
 Measuring at night: the M5's times drift with heat by 5-20% across back-to-back folds (one 261-token trunk ran
 4.86 then 5.92 s, unchanged). Every number here alternates the arms; trust no single pair.
+
+### The night, end to end
+
+Start of the night (cddc61ac) against 523aaed3, both binaries built from their trees and alternated: a warm-up round,
+then two measured rounds, averaged. Fold times as each port prints them; ESMFold2 wall-clock, because the old binary
+crashes on `--out=/dev/null`.
+
+| case | before | after | |
+|---|---|---|---|
+| boltz2 5CAJ, 255 tokens (1 recycle, 50 steps) | 4.51 s | 3.87 s | -14% |
+| boltz2 6MRR, its defaults (4 passes, 200 steps) | 2.30 s | 2.02 s | -12% |
+| chai1 6MRR | 2.04 s | 1.84 s | -10% |
+| AF3 6MRR (the gate's) | 1.81 s | 1.62 s | -10% |
+| AF3 5CAJ with its template, 261 tokens | 10.16 s | 8.86 s | -13% |
+| AF2 5CAJ with a 1500-row MSA, 1 pass | 5.86 s | 4.62 s | -21% |
+| AF2 1BRS multimer (the gate's, 4 passes) | 3.29 s | 2.68 s | -19% |
+| ESMFold2 5CAJ, wall | 4.09 s | 3.41 s | -17% |
+
+Weights load before -> after: AF3 bundle 178 -> 96 ms, boltz2 ~350 -> ~200, chai1 ~480 -> ~385, AF2 0.15 -> 0.06 s,
+ESMFold2 0.26 -> 0.11 s.

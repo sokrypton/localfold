@@ -98,15 +98,17 @@ On an M5 (8-core GPU, macOS 26.6), warm, the matrix units on (gemm_tensor.metal)
 
 | | M2 | M5, old kernels | M5, matrix units |
 |---|---|---|---|
-| AF3 6MRR (68 tokens, 3 recycles, 200 steps) | 6.1 s | 3.79 s | 1.70 s |
-| a diffusion step, 68 tokens | 24 ms | 15.3 ms | 6.9 ms |
+| AF3 6MRR (68 tokens, 3 recycles, 200 steps) | 6.1 s | 3.79 s | 1.62 s |
+| a diffusion step, 68 tokens | 24 ms | 15.3 ms | 6.4 ms |
 | AF3 trunk pass, 261 tokens (5CAJ with its template) | 3.9 s | 2.64 s | 1.17 s |
 | attention, 255 keys, 4 heads of 32, 255 rows | | 3.88 ms | 1.37 ms |
 | GEMM, 4096 square | 2.93 TFLOP/s | 3.05 | 12.0 |
+| weights load, AF3's int5 bundle (warm) | | 178 ms | 96 ms |
 
-(As of 878ac60d. The matrix units' column: the half GEMMs on matmul2d with their epilogues in registers, attention v3 -
-the online softmax in cooperative tensors - from 48 keys, the triangle gate in registers, fast math in those epilogues;
-docs/M5-HANDOFF.md's last sections have each step's numbers and what lost.)
+(As of 523aaed3. The matrix units' column: the half GEMMs on matmul2d with their epilogues in registers, attention v3 -
+the online softmax in cooperative tensors - from 48 keys, the triangle gate in registers, fast math in those epilogues, the bundle decoder's and the MSA kernels' indices in
+32 bits, the diffusion's conditioning batched over noise levels; docs/M5-HANDOFF.md's last sections have each step's
+numbers and what lost.)
 
 Profile any fold with `LOCALFOLD_PROFILE=1` (every labelled dispatch its own command buffer: an upper bound, good for
 proportions) and AF3's denoiser by stage with `AF3_STAGES=1` (a sync between stages: real time).
