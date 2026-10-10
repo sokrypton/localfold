@@ -1505,6 +1505,46 @@ card take turns by time slice - a 3-rank trunk was 14.4 s against 0.4. `LOCALFOL
 the device there, to check them.) `LOCALFOLD_MG_TIMES=1` prints
 each phase past the trunk; `--profile` with `LOCALFOLD_PROF_GAPS=20` the kernels, the copies and the idle by what ended it.
 
+#### Measured on a second rented 8 x A100-SXM4-40GB (NVLink, NVSwitch), 2026-10-10 evening
+
+Total fold time, one trunk pass and 25 steps (10,127 tokens: 100); 1 GPU from the start of the evening, the rest at
+`ebb6653` (the 2- and 4-GPU lanes ran side by side on disjoint GPUs):
+
+| tokens | 1 GPU | 2 | 4 | 8 | best |
+|---:|---:|---:|---:|---:|---:|
+| 988 | 1.66 s | 1.78 | **1.13** | 1.23 | 1.5x on 4 |
+| 2,964 | 23.2 s | 14.1 | 7.87 | **4.91** | 4.7x on 8 |
+| 5,928 | 169 s | out of memory | 47.2 | **25.6** | 6.6x on 8 |
+| 10,127 | does not fit | | | **114.8** (trunk 97.0, 86.9 simulated) | |
+| 12,103 | | | | out of memory (rank 0, a 1.17 GB buffer in the trunk) | |
+
+The evening began at 2.10 / 6.13 / 32.1 s on 8 and the 10,127-token fold out of memory. Self-templated 5CAJ and the
+1TIM dimer stay 0.009 / 0.006 A from one GPU (boltz2 0.008 / 0.009). What the box showed that one card cannot:
+
+- **Every exchange walked the peers from rank 0**, so all eight GPUs read one peer at once: an all-to-all of 268 MB a
+  rank ran at 56-64 GB/s a GPU, against 233 for copy-engine copies and 120-147 for kernels with each rank starting at
+  its own rows (`rot` in sharded.cuh; copy loops start at the next rank). Worth 2-10% of a trunk pass: past ~2,000
+  tokens the trunk was not bandwidth-bound - `LOCALFOLD_MG_FOLD_TRANSPOSES=0`, `LOCALFOLD_MG_TRI_GROUPS=1/2/4/8` and
+  `LOCALFOLD_MG_FP8_EXCHANGE=1` all landed within 3,856-3,936 ms of each other at 2,964 tokens.
+- **Opening a peer's buffer (`cudaIpcOpenMemHandle`) costs ~3 ms of driver time with 8 ranks at once** (1 with 2, 1.7
+  with 4) whatever its size, closing ~1.5: ~35 ms of GPU idle a shared buffer on every rank, ~1.6 s a 2,964-token fold
+  (Nsight Systems: 790 ms of rank 0's idle inside them). Simulation opens nothing, so never saw it. Shared buffers now
+  live in 1 GB segments (one open for several), a buffer given back is kept mapped for the next of about its size, and
+  the pool is freed only where some rank is short (collectively: multigpu.cuh, `release`, `freeIdle`).
+- **Rank skew at small sizes**: at 988 tokens ~45% of a trunk pass is ranks waiting at fences (no rank consistently
+  last); at 2,964, 3%. `LOCALFOLD_MG_FENCE_TIMES=1` reports every rank's fence waits by `--stages` stage.
+- boltz2's confidence head is sharded now (it ran on rank 0 with the pair gathered: 24 s of a 5,928-token fold, 4.5 now),
+  the encoder's trunk-pair projection is read from the rank holding each row (the 6.6 GB a rank all-gather at 10,127
+  tokens is gone), and on a card short of room the template stack's buffers are given back after it (the MSA stack
+  37.4 -> 28.3 GB a rank at 10,127). Every rank's short-of-room choices now take one room, the least of theirs.
+
+boltz2 at its defaults (200 steps, 3 recycles), ours: 988 tokens 7.9 / 7.1 / 3.9 / **3.4 s** on 1/2/4/8 GPUs; 2,964
+112 / 63.6 / 35.0 / **19.6 s**; 5,928 out of memory on 1 and 2, 212.5 / **111.6 s** on 4/8. Against the
+`anthropics/uplifting-biomolecular-modeling` boltz2 kit (`--mode big --n_gpu P`, warm, the confidence head not in its
+times) on the same box: 988 tokens 16.2 s on one GPU (`fast`), 59.5 s on 8; 2,964 out of memory on one 40 GB GPU in
+both modes, 99.1 s on 8; 5,928 251.6 s on 8. Its row-sharded pair is ours; its triangle is a ring (each rank receives
+the whole projected b whatever P, for results independent of P), NCCL rather than IPC, and no device-side fences.
+
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)
 
 Volta has no m16n8k8/k16 MMA, no `ldmatrix`, no `tanh.approx` and no f16 `ex2`, which every fused kernel here is
