@@ -259,5 +259,22 @@ remaining shapes of the attention (D 8, 16, 24), and the 1044-token memory row.
 Chrome 154 on the M5 offers **the same as on the M2**: subgroup matrices of 8 x 8 x 8 only (f16 and f32), and only
 with `--enable-unsafe-webgpu` - a stock Chrome offers none (`LOCALFOLD_STOCK_FLAGS=1`: `subgroupMatrixAvailable:
 false`). Those are Metal's simdgroup matrices, not the M5's matrix units, which nothing in WebGPU reaches. So the
-`metal-3` prior's matrix knobs are no closer to paying here than on the M2. The `fusedPairBias` / `attentionProjectMatrix`
-/ `matrixLinear` arms were not re-run in this pass.
+`metal-3` prior's matrix knobs are no closer to paying here than on the M2.
+
+The arms (`profile-af2-block.js --bundle=/model-af2-monomer-int5 --length=150 --sequences=256`, two rounds each,
+alternated; block ms, the stack of 48 in brackets):
+
+| arm | Chrome | round 1 | round 2 |
+|---|---|---|---|
+| `fusedPairBias=false` | stock | 79.40 (3811) | 79.36 (3809) |
+| `fusedPairBias=true` (the prior) | stock | 78.44 (3765) | 78.51 (3769) |
+| prior (`matrixLinear` and `attentionProjectMatrix` false) | flagged | 75.84 (3640) | 76.49 (3672) |
+| `matrixLinear=true` | flagged | 74.19 (3561) | 75.07 (3603) |
+| `attentionProjectMatrix=true` | flagged | 78.10 (3749) | 78.01 (3745) |
+
+- `fusedPairBias` still wins (1.1%): the prior holds.
+- `attentionProjectMatrix=true` still loses (2-3%): the prior holds.
+- `matrixLinear=true` reads **1.9% faster** on the M5 where it lost on the M2 - but only with
+  `--enable-unsafe-webgpu`, which no visitor has, two rounds, and inside the drift this file warns about. **Not
+  changed**: a 2% flagged-only gain does not earn a second Apple entry. Worth one more interleaved round if the
+  flag ever ships.
