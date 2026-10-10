@@ -88,8 +88,12 @@ struct Gemm {
   int batch = 1; int64_t sx = 0, sw = 0, sy = 0;
   bool half = false, accFloat = false;
   const char* label = nullptr;
+  // the next LayerNorm (lnScale, lnOffset), emitted into lnOut [rows][128] half where the matrix units run a float output
+  // 128 wide in 64 x 128 tiles - gemm() returns true; false: not written, the caller's LayerNorm still to run
+  ::half* lnOut = nullptr; const float* lnScale = nullptr; const float* lnOffset = nullptr; float lnEps = 1e-5f;
+  ::half* lnOut2 = nullptr; const float* lnScale2 = nullptr; const float* lnOffset2 = nullptr;   // (a second norm, same eps)
 };
-void gemm(const Gemm& g);
+bool gemm(const Gemm& g);
 extern int GEMM_EXTRA_EP;     // (an arm: bits ORed into every GEMM instance's EP - metal/bench)
 // shorthands: f32 or f16 X, a weight, Y f32 or f16
 inline void gemm(const float* X, const half* W, float* Y, size_t rows, int in, int out, float beta = 0.f) {
@@ -114,8 +118,11 @@ void gemmGatedAdd(const half* X, const half* W, const half* aux, float* pair, si
                   const float* bias = nullptr);
 // the triangle's tail in one pass: pair += (Xv Wv + biasV, rounded to half) sigmoid(Xg Wg + biasG) - on the matrix
 // units one kernel, the value never written; elsewhere (or LOCALFOLD_GATED_DUAL=0) Xv Wv into vTmp, then gemmGatedAdd
-void gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
-                      int out, const float* biasG, const float* biasV, half* vTmp, const char* label = nullptr);
+// lnOut: where the fused kernel runs and out is 128, it also writes LayerNorm(the updated pair) (lnScale, lnOffset) to lnOut
+// in half - the next update's input - and returns true (false: the caller's LayerNorm still to run)
+bool gemmGatedAddDual(const half* Xg, const half* Wg, const half* Xv, const half* Wv, float* pair, size_t rows, int in,
+                      int out, const float* biasG, const float* biasV, half* vTmp, const char* label = nullptr,
+                      half* lnOut = nullptr, const float* lnScale = nullptr, const float* lnOffset = nullptr, float lnEps = 1e-5f);
 void gemmSwiglu(const half* X, const half* Wpairs, half* gated, size_t rows, int in, int hidden);
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
                  size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);

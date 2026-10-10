@@ -66,4 +66,6 @@ struct GemmArgs {
   float alpha, beta;
   u64 aux; int ldaux, auxPad;      // epilogue 64: D = C + aux * sigmoid(alpha X W)
   u64 aux2, aux3; i64 tgR0, tgPairs; int tgN, tgNp, tgC, tgPad;   // the triangle's gate (epilogue 256)
+  u64 lnOut, lnScale, lnOffset; float lnEps; int lnPad;            // the next LayerNorm, emitted (EP bit 64; the dual)
+  u64 lnOut2, lnScale2, lnOffset2;                                  // (and a second norm of the same rows, or 0)
 };

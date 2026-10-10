@@ -91,7 +91,8 @@ ConfidenceOut confidenceHead(const Trunk& t, const float* pseudoBeta) {
   }
   }
   int nb = 0; while (M.has(P + ".blocks." + num(nb) + ".singleChannels")) ++nb;
-  for (int k = 0; k < nb; ++k) pairformerBlock(pair, single, t.masks, n, C, Cs, P + ".blocks." + num(k));
+  for (int k = 0; k < nb; ++k)
+    pairformerBlock(pair, single, t.masks, n, C, Cs, P + ".blocks." + num(k), nullptr, k + 1 < nb ? P + ".blocks." + num(k + 1) : "");
   // the error bins: 64 up to 31 A, the last one step past the second-to-last
   const int NB = 64; double step = 31.0 / (NB - 2);
   std::vector<float> centres(NB);

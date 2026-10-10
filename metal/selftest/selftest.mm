@@ -117,6 +117,68 @@ int main() {
     gemmGatedAdd(dX, dW, dA, dY, R, K, O);
     report("gated add", relRms(ref, download(dY, R * O)), 1e-3);
   }
+  {   // the next LayerNorm emitted by the epilogue (two norms of the same rows): Y += X W, then LN(Y) twice - where the
+      // matrix units take it (elsewhere gemm() says it did not, and the case is skipped)
+    size_t R = 300; int K = 256, O = 128;
+    auto X = randv(R * K), W = randv((size_t)K * O, 0.1f), Y0 = randv(R * O), s1 = randv(O), o1 = randv(O), s2 = randv(O), o2 = randv(O);
+    std::vector<double> y(R * O), ref1(R * O), ref2(R * O);
+    for (size_t r = 0; r < R; ++r) {
+      double m = 0, v = 0;
+      for (int o = 0; o < O; ++o) {
+        double t = 0; for (int k = 0; k < K; ++k) t += (double)(float)(half)X[r * K + k] * (float)(half)W[(size_t)k * O + o];
+        y[r * O + o] = Y0[r * O + o] + t; m += y[r * O + o];
+      }
+      m /= O;
+      for (int o = 0; o < O; ++o) v += (y[r * O + o] - m) * (y[r * O + o] - m);
+      double inv = 1 / sqrt(v / O + 1e-5);
+      for (int o = 0; o < O; ++o) {
+        ref1[r * O + o] = (y[r * O + o] - m) * inv * s1[o] + o1[o];
+        ref2[r * O + o] = (y[r * O + o] - m) * inv * s2[o] + o2[o];
+      }
+    }
+    half* dX = uploadNew(toH(X).data(), X.size()); half* dW = uploadNew(toH(W).data(), W.size());
+    float* dY = uploadNew(Y0.data(), Y0.size());
+    float *ds1 = uploadNew(s1.data(), O), *do1 = uploadNew(o1.data(), O), *ds2 = uploadNew(s2.data(), O), *do2 = uploadNew(o2.data(), O);
+    half* dN1 = allocT<half>(R * O); half* dN2 = allocT<half>(R * O);
+    Gemm g{}; g.X = dX; g.tx = F16; g.W = dW; g.tw = F16; g.Y = dY; g.rows = R; g.in = K; g.out = O; g.beta = 1.f;
+    g.lnOut = dN1; g.lnScale = ds1; g.lnOffset = do1; g.lnOut2 = dN2; g.lnScale2 = ds2; g.lnOffset2 = do2;
+    if (gemm(g)) {
+      report("emitted LayerNorm: the output", relRms(y, download(dY, R * O)), 1e-3);
+      auto h1 = download(dN1, R * O), h2 = download(dN2, R * O);
+      report("emitted LayerNorm: the first norm", relRms(ref1, std::vector<float>(h1.begin(), h1.end())), 3e-3);
+      report("emitted LayerNorm: the second norm", relRms(ref2, std::vector<float>(h2.begin(), h2.end())), 3e-3);
+    } else printf("  emitted LayerNorm: not taken here (no matrix units)\n");
+  }
+  {   // ...and by the triangle's fused tail: pair += Xv Wv sigmoid(Xg Wg), then LN(pair)
+    size_t R = 300; int K = 128, O = 128;
+    auto Xg = randv(R * K), Wg = randv((size_t)K * O, 0.1f), Xv = randv(R * K), Wv = randv((size_t)K * O, 0.1f), Y0 = randv(R * O);
+    auto s1 = randv(O), o1 = randv(O);
+    std::vector<double> y(R * O), ref(R * O);
+    for (size_t r = 0; r < R; ++r) {
+      double m = 0, v = 0;
+      for (int o = 0; o < O; ++o) {
+        double a = 0, b = 0;
+        for (int k = 0; k < K; ++k) {
+          a += (double)(float)(half)Xg[r * K + k] * (float)(half)Wg[(size_t)k * O + o];
+          b += (double)(float)(half)Xv[r * K + k] * (float)(half)Wv[(size_t)k * O + o];
+        }
+        y[r * O + o] = Y0[r * O + o] + (double)(float)(half)b / (1 + exp(-a)); m += y[r * O + o];
+      }
+      m /= O;
+      for (int o = 0; o < O; ++o) v += (y[r * O + o] - m) * (y[r * O + o] - m);
+      double inv = 1 / sqrt(v / O + 1e-5);
+      for (int o = 0; o < O; ++o) ref[r * O + o] = (y[r * O + o] - m) * inv * s1[o] + o1[o];
+    }
+    half* dXg = uploadNew(toH(Xg).data(), Xg.size()); half* dWg = uploadNew(toH(Wg).data(), Wg.size());
+    half* dXv = uploadNew(toH(Xv).data(), Xv.size()); half* dWv = uploadNew(toH(Wv).data(), Wv.size());
+    float* dY = uploadNew(Y0.data(), Y0.size()); half* tmp = allocT<half>(R * O); half* dN = allocT<half>(R * O);
+    float *ds1 = uploadNew(s1.data(), O), *do1 = uploadNew(o1.data(), O);
+    if (gemmGatedAddDual(dXg, dWg, dXv, dWv, dY, R, K, O, nullptr, nullptr, tmp, nullptr, dN, ds1, do1)) {
+      report("emitted LayerNorm, the triangle's tail: the pair", relRms(y, download(dY, R * O)), 2e-3);
+      auto h = download(dN, R * O);
+      report("emitted LayerNorm, the triangle's tail: the norm", relRms(ref, std::vector<float>(h.begin(), h.end())), 3e-3);
+    } else printf("  emitted LayerNorm, the triangle's tail: not taken here (no matrix units)\n");
+  }
   {   // the triangle's gate: n x n pairs, C channels, planes padded to np
     int n = 37, np = 40, C = 64; size_t P = (size_t)n * n, plane = (size_t)np * np;
     auto X = randv(P * C), proj = randv((size_t)C * 2 * C, 0.1f), gate = randv((size_t)C * 2 * C, 0.1f), mask = randv(P);

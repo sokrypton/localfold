@@ -350,7 +350,9 @@ void runTrunk(Trunk& t) {
   if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
   releaseScratch({"msaatt.", "opm.", "trunk.zBeforeMsa"});
   int blocks = 0; while (M.has("trunk.pairformerBlocks." + num(blocks) + ".singleChannels")) ++blocks;
-  for (int k = 0; k < blocks; ++k) pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k));
+  for (int k = 0; k < blocks; ++k)
+    pairformerBlock(t.pair, t.single, t.masks, t.n, t.C, t.Cs, "trunk.pairformerBlocks." + num(k), nullptr,
+                    k + 1 < blocks ? "trunk.pairformerBlocks." + num(k + 1) : "");
   releaseScratch({"pr.", "grid.", "tr.", "st."});     // (the next pass's embedder and MSA stack would hold theirs beside it)
 }
 

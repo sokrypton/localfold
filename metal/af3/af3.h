@@ -59,19 +59,24 @@ const float* qkvgBias(const std::string& pre, int Wd);
 // pairMask [n * n] (a real buffer; every update reads it), seqMask [n], `ones` every token real (no attention mask)
 struct Masks { const float* pair; const float* seq; bool ones; };
 // (into: where the residual goes, when not the input itself - chai-1's parallel block)
-void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into = nullptr);
+void triangle(float* pair, const Masks& m, int n, int C, const std::string& pre, bool outgoing, bool divide, float* into = nullptr,
+              const std::string& nextNorm = "");
 const half* triGateWeight(const std::string& pre, int C);     // the projection and gate as gemmTriGate's one weight
 void gridAttention(float* pair, const Masks& m, int n, int C, const std::string& pre, bool tr, bool swap, float* into = nullptr,
-                   bool untransposed = false);
-void transition(float* x, size_t rows, int C, const std::string& pre, float* into = nullptr);
-void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre);
+                   bool untransposed = false, const std::string& nextNorm = "");
+// next1, next2: the pair's next norms, emitted by the second GEMM (pairtrack.mm's pairLn takes them)
+void transition(float* x, size_t rows, int C, const std::string& pre, float* into = nullptr, const std::string& next1 = "",
+                const std::string& next2 = "");
+void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1 = "",
+                 const std::string& next2 = "");
 // chai-1's parallel pair track: every update reads the stage's input and adds into the pair (z = z0 + f1(z0) + ...);
 // `which` a string of updates in order - o, i (the triangles), r, c (the grid attentions), t (the transition)
 void parallelPairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const char* which);
 void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias = nullptr);
+// nextB: the block that follows directly, nothing touching the pair between (its first norm emitted by this one)
 void pairformerBlock(float* pair, float* single, const Masks& m, int n, int C, int Cs, const std::string& B,
-                     const float* extraBias = nullptr);
+                     const float* extraBias = nullptr, const std::string& nextB = "");
 // raw [pairs][heads] -> [heads][n][stride] half, log2-scaled (swap: (i, j) read at (j, i))
 half* biasLayout(const float* raw, const std::string& name, int n, int heads, int stride, bool swap);
 
