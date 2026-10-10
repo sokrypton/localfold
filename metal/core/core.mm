@@ -556,6 +556,11 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // 32 where not (768 x 80 x 768: 0.062 against 0.075); a taller n 64 x 128 (512 x 68121 x 128 half: 0.93 ms against
   // 1.20 at 64 x 64; 4096 square 12.0 TFLOP/s against 9.5). Measured on an M5 (8-core GPU), interleaved.
   int tm = a.n <= 128 ? (a.n + 15) / 16 * 16 : 64, tn = a.n <= 128 ? (a.m >= 40 * 64 ? 64 : 32) : (a.m >= 128 ? 128 : 64);
+  // a plain product over a short K (up to 128) and a tall n: 32 x 256 tiles, the activations read half as often
+  // (512 x 65025 x 128 half: 0.819 ms against 0.893 at 64 x 128; 1024 wide 1.689 against 1.851; at K 256 it loses,
+  // 2.960 against 2.886). LOCALFOLD_GEMM_WIDE=0 the control
+  static const bool wideWanted = !getenv("LOCALFOLD_GEMM_WIDE") || atoi(getenv("LOCALFOLD_GEMM_WIDE")) != 0;
+  if (wideWanted && plain && a.n > 128 && a.k <= 128 && a.m % 256 == 0) { tm = 32; tn = 256; }
   if (const char* t = getenv("LOCALFOLD_GEMM_TILE")) sscanf(t, "%dx%d", &tm, &tn);
   const bool triReg = tri && (a.epilogue & 512);
   if (triReg) { tm = 64; tn = 128; }      // (the layout lf_tri_quarters wrote: 32 channels a tile)
