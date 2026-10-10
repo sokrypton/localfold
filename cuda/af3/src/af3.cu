@@ -67,6 +67,7 @@ static int foldMain(int argc, char** argv) {
     if (un.find(",triangle,") != std::string::npos) FUSED_TRIANGLE = false;
     if (un.find(",transition,") != std::string::npos) FUSED_TRANSITION = false;
   }
+  bool noGraphs = false;     // (--no-graphs: GRAPHS stays off where several GPUs turn it back on)
   bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1; double recycleTolerance = 0;   // 3 recycles: the page's default
   // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
   // 5 diffusion samples - where the command does not set them; the plain defaults are the page's
@@ -86,7 +87,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
     else if (!strcmp(argv[i], "--fold")) doFold = true;
-    else if (!strcmp(argv[i], "--no-graphs")) GRAPHS = false;
+    else if (!strcmp(argv[i], "--no-graphs")) { GRAPHS = false; noGraphs = true; }
     else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strcmp(argv[i], "--chai-second-order")) CHAI_SECOND_ORDER = true;     // chai-lab's two calls a step
     else if (!strcmp(argv[i], "--no-flash-split")) FLASH_SPLIT = false;
@@ -491,11 +492,27 @@ static int foldMain(int argc, char** argv) {
     // (the distogram's contacts, the streamed diffusion preparation, the confidence head): the f32 pair it was widened
     // into was the fold's largest tensor past the trunk - 18.4 GB at 6,000 tokens, 51 at 10,000 - and the widening
     // held both at once. Not for OpenDDE (its expander reads f32), nor --save-embeddings
-    if (sharded(t) && oneCardPast) pairOntoRank0(t);    // (the rest of the fold fits one GPU: rank 0's, alone)
     if (sharded(t)) {     // what only the trunk read, given back before the diffusion: z^T, the template stack's slabs, the
                           // exchange buffers, the MSA (the slab itself the diffusion reads, and rank 0 gathers after it)
       mg::release({ "sh.zT", "sh.tz", "sh.bmine", "sh.bg", "sh.bias", "sh.st.o", "trunk.msa" });
       t.zTS = nullptr; t.msa = nullptr;
+    }
+    // ...and where the whole fold fits one GPU, every rank gathers the whole pair and runs the diffusion alone - the same
+    // fold on each, nothing exchanged, its steps' graphs on - then frees it and takes its rows of the confidence head
+    // (the sharded diffusion meets at every block of every step: at 988 tokens on 8 x A100 158 ms became 2.0 s)
+    int keptLo = -1, keptRows = 0;
+    if (sharded(t) && oneCardPast) {
+      const size_t row = (size_t)t.n * t.C * 2;
+      float* whole = reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)t.n * t.n * t.C));
+      mg::fence();
+      for (int r = 0; r < mg::WORLD; ++r) {
+        int lo, hi; sh::rowsOf(t.n, r, lo, hi); const int rn = sh::storedRows(t.n, r);
+        if (rn) CK(cudaMemcpyAsync((char*)whole + (size_t)lo * row, t.zS->peer[r], (size_t)rn * row, cudaMemcpyDefault, STREAM));
+      }
+      mg::fence();
+      keptLo = t.shardLo; keptRows = t.shardRows;
+      t.pair = whole; t.shardLo = -1; t.shardRows = 0;        // (the whole pair's view; the slab stays in t.zS)
+      GRAPHS = !noGraphs;
     }
     TRUNK_PAIR16 = t.p16 && !saveEmbeddings && (pairStays16(t.n, t.C, fast) || sharded(t));
     if (sharded(t) && (saveEmbeddings || saveDistogram)) { fprintf(stderr, "a sharded pair: no --save-embeddings or --save-distogram yet\n"); return 1; }
@@ -639,6 +656,12 @@ static int foldMain(int argc, char** argv) {
     // rows (collective, rank 0's results); then the others leave and rank 0 writes the fold with the whole pair never
     // held anywhere
     std::vector<ConfidenceOut> shardedConf;
+    if (keptLo >= 0) {                 // (the diffusion ran whole on every rank: its pair given back, the slab's view again)
+      CK(cudaStreamSynchronize(STREAM));
+      CK(cudaFree(t.pair));
+      t.pair = (float*)t.zS->local; t.shardLo = keptLo; t.shardRows = keptRows; t.p16 = true;
+      GRAPHS = false;
+    }
     if (sharded(t)) {
       releaseScratch();                // (the sampler's: the heads allocate theirs beside the slab)
       df.trunkPair = nullptr;
@@ -655,7 +678,7 @@ static int foldMain(int argc, char** argv) {
                                                 t.pairMask, t.n));
         CK(cudaFree(dBeta));
       }
-      contact = contactProbabilitiesSharded(t);
+      if (contact.empty()) contact = contactProbabilitiesSharded(t);    // (made off the whole pair where it was gathered)
       mg::release({ "" });
       if (mg::RANK != 0) { mg::finish(); exit(0); }
       mg::finish();
