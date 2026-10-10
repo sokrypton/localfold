@@ -966,7 +966,9 @@ __global__ void addBiasHeadsK(float* pl, const float* bias, size_t pairs, int he
 }
 template <class T>
 void singleTrack(float* single, const float* pair, const float* seqMask, int n, int C, int Cs,
-                 const std::string& B, const float* extraBias = nullptr) {
+                 const std::string& B, const float* extraBias = nullptr, int shardLo = -1) {
+  // shardLo >= 0: several GPUs on a sharded pair (sharded.cuh) - `pair` is this rank's slab, rows from shardLo; the
+  // query-row blocks are this rank's rows, their outputs all-gathered
   // a bf16 pair (PAIR16) is read here only for the pair logits; everything else is the f32 single
   const bool pair16 = PAIR16;
   struct F32Scope { bool was; F32Scope() : was(PAIR16) { PAIR16 = false; } ~F32Scope() { PAIR16 = was; } } f32Scope;
@@ -992,24 +994,29 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   // On a card short of room, in blocks of query rows: each block's pair logits from its own pair rows, its
   // scores, softmax and values - the [heads, n, n] logits, probabilities and pair logits never whole
   // (6.9 GB at 6000 tokens). The softmax is a row's alone and the projection is per pair position.
-  if (shortPair(pairs, C) && !extraBias) {
+  const bool sharded = shardLo >= 0;
+  if (sharded && extraBias) { fprintf(stderr, "sharded pair: no extra single-attention bias\n"); exit(1); }
+  if ((shortPair(pairs, C) && !extraBias) || sharded) {
     int R = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)heads * n)));
+    const int qlo = sharded ? shardLo : 0, qhi = sharded ? shardLo + sh::storedRows(n, mg::RANK) : n;
     float* pl = scratch<float>("st.pl", (size_t)heads * R * n);
     float* logits = scratch<float>("st.logits", (size_t)heads * R * n);
     T* P = scratch<T>("st.P", (size_t)heads * R * n);
     T* nrm = scratch<T>("st.nrm", (size_t)n * Cs);
     T* qkvg = scratch<T>("st.qkvg", (size_t)n * 4 * Wd);
-    T* o = scratch<T>("st.o", (size_t)n * Wd);
+    mg::Shared* oS = sharded ? &mg::shared("sh.st.o", (size_t)n * Wd * sizeof(T)) : nullptr;
+    T* o = sharded ? (T*)oS->local : scratch<T>("st.o", (size_t)n * Wd);
     layerNorm2<float, T>(single, nrm, n, Cs, A + ".layerNormScale", A + ".layerNormOffset");
     linear<T, T>(nrm, qkvg, n, Cs, 4 * Wd, qkvgWeight(A, Cs, Wd, false));
     addQBiasK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(qkvg, W(A + ".qBias"), n, Wd);
     const float one = 1.f, zero = 0.f;
     auto algo = std::is_same_v<T, float> ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
     float* flat = nullptr; T* ln = nullptr;
-    for (int i0 = 0; i0 < n; i0 += R) {
-      int r = std::min(R, n - i0); size_t rows = (size_t)r * n;
-      const float* prow = pair16 ? reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(pair) + (size_t)i0 * n * C)
-                                 : pair + (size_t)i0 * n * C;       // (a bf16 pair's rows are C halves)
+    for (int i0 = qlo; i0 < qhi; i0 += R) {
+      int r = std::min(R, qhi - i0); size_t rows = (size_t)r * n;
+      const size_t pr = (size_t)(i0 - qlo) * n * C;                  // (the slab's rows from qlo)
+      const float* prow = pair16 ? reinterpret_cast<const float*>(reinterpret_cast<const __nv_bfloat16*>(pair) + pr)
+                                 : pair + pr;                        // (a bf16 pair's rows are C halves)
       bool fusedHeads = false;
       if constexpr (std::is_same_v<T, half>)
         if (C == 128 && heads == 16) {
@@ -1037,6 +1044,10 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
          qkvg + 2 * Wd, cudaType<T>(), 4 * Wd, d, P, cudaType<T>(), n, rows, &zero, o + (size_t)i0 * Wd, cudaType<T>(),
          Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
     }
+    if (sharded)       // every rank's rows of o
+      mg::gather(*oS, o, [&](int r2) { return r2 == mg::RANK ? (size_t)0 : (size_t)sh::storedRows(n, r2) * Wd * sizeof(T); },
+                 [&](int r2) { int a0, a1; sh::rowsOf(n, r2, a0, a1); return (size_t)a0 * Wd * sizeof(T); },
+                 [&](int r2) { int a0, a1; sh::rowsOf(n, r2, a0, a1); return (size_t)a0 * Wd * sizeof(T); });
     gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
     linear<T, float>(o, single, n, Wd, Cs, A + ".outputProjection", false, 1.f);
     singleTransition();
@@ -1104,8 +1115,14 @@ void pairformerBlockAt(float* pair, float* single, const float* pairMask, const 
                    extraBias); stage("single");
     return;
   }
-  if (sh::ON && mg::splitting(pair)) sh::pairUpdatesViaShards<T>(pair, pairMask, n, C, B, swap, divide, 4);   // (phase 2's check)
-  else pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, shortPair((size_t)n * n, C));
+  if (sh::ON && mg::splitting(pair)) {           // (phase 2's check: the block on this rank's slab, gathered back)
+    sh::viaShards(pair, n, C, [&](const mg::Shared& z, const mg::Shared& zT, int lo) {
+      sh::pairUpdates<T>(z, zT, pairMask, n, C, B, swap, divide, 4);
+      singleTrack<T>(single, (const float*)z.local, seqMask, n, C, Cs, B, extraBias, lo); stage("single");
+    });
+    return;
+  }
+  pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, shortPair((size_t)n * n, C));
   singleTrack<T>(single, pair, seqMask, n, C, Cs, B, extraBias); stage("single");
 }
 template <class T>

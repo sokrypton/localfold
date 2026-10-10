@@ -207,10 +207,9 @@ inline void pairUpdates(const mg::Shared& z, const mg::Shared& zT, const float* 
 }
 
 // phase 2's check while the rest of the trunk still holds the whole pair: this rank's rows cut from the replicated
-// pair, the sharded updates, and every rank's rows gathered back (mg::exchange)
-template <class T>
-inline void pairUpdatesViaShards(float* pair, const float* mask, int n, int C, const std::string& pre, bool swap, bool divide,
-                                 int transitionFactor) {
+// pair into its slab, `work(z, zT, lo)` on the slab, and every rank's rows gathered back (mg::exchange)
+template <class F>
+inline void viaShards(float* pair, int n, int C, F work) {
   const size_t slabBytes = (size_t)maxStored(n) * n * C * elem();
   mg::Shared& z = mg::shared("sh.z", slabBytes);
   mg::Shared& zT = mg::shared("sh.zT", slabBytes);
@@ -218,7 +217,7 @@ inline void pairUpdatesViaShards(float* pair, const float* mask, int n, int C, c
   const size_t row = (size_t)n * C * elem();
   const int rowsHere = storedRows(n, mg::RANK);
   if (rowsHere) CK(cudaMemcpyAsync(z.local, (char*)pair + (size_t)lo * row, (size_t)rowsHere * row, cudaMemcpyDefault, STREAM));
-  pairUpdates<T>(z, zT, mask, n, C, pre, swap, divide, transitionFactor);
+  work(z, zT, lo);
   if (rowsHere) CK(cudaMemcpyAsync((char*)pair + (size_t)lo * row, z.local, (size_t)rowsHere * row, cudaMemcpyDefault, STREAM));
   mg::exchange(false, n, C, elem(), padded(n), 16);
 }
