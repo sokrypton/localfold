@@ -87,42 +87,55 @@ inline void ringOver(const mg::Shared& bmine, int n, int np, int C, T* const* st
   }
 }
 
-// the triangle multiplication's outgoing form on a slab (z, or z^T with the incoming weights)
+// the triangle multiplication's outgoing form on a slab (z, or z^T with the incoming weights), its contraction split by
+// CHANNEL: p[c][i][j] = sum_k a[c][i][k] b[c][j][k] is independent in c, so rank s takes its share of the channels over
+// EVERY row - each rank builds a, b and the gate for its own rows (one pass of the input kernel), rank s pulls its
+// channels' planes of every rank's a and b (whole np x np planes), contracts them in one full-size batched GEMM, and
+// pushes each rank its rows of the product; each rank then runs the output kernel on its rows. A rank receives
+// 2 (W-1)/W n^2 C/W of operands and (W-1)/W of its rows' product where the ring it replaces received (W-1)/W of the
+// whole b - 1.97 GB a triangle against 0.74 at 2,964 tokens on 8 - and the GEMMs are the one-GPU shape, where the
+// ring's 371-row stages filled cuBLAS's 256-row tiles to 72%. Channels go a group at a time where the planes do not
+// all fit (a rank's own choice: nothing meets between groups).
 template <class TQ>
-inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, const std::string& pre, bool divideByLength) {
+// INCOMING (bf16): the incoming form on z itself, p[c][i][j] = sum_k a[c][k][j] b[c][k][i] - the planes a rank gathers
+// are whole, so only the GEMM's operands turn (no z^T: two of a block's four transposes gone)
+inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, const std::string& pre, bool divideByLength,
+                       bool incoming = false) {
   using B16 = __nv_bfloat16;
   constexpr bool F8 = sizeof(TQ) == 1;
-  const int np = padded(n); const size_t cs = (size_t)np * np;
+  const int np = padded(n); const size_t cs = (size_t)np * np, plane = (size_t)np * np;
   const float alpha = divideByLength ? 1.f / n : 1.f;
   int lo, hi; rowsOf(n, mg::RANK, lo, hi);
+  const int rows = hi - lo;
   float* base = baseOf(z.local, lo, n, C);
   std::string pg = projectionGate(pre, C);
   half* wt = scratch<half>("trib.wt", triInTileHalves(C));
   tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
-  // the rows of b this rank owns ([C][rows][np], shared); each block of a then meets every rank's in turn - a ring
-  // (one rank's b staged at a time, never the whole b: np^2 x C, 25.6 GB of bf16 at 10,000 tokens), each filling its
-  // rows' columns of the block's product
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
-  mg::Shared& bmine = mg::shared("sh.bmine" + std::to_string(C), (size_t)maxShare * np * C * sizeof(TQ));
-  const size_t stageElems = (size_t)maxShare * np * C;
-  TQ* stages[2] = { mg::WORLD > 1 ? scratch<TQ>("trib.bstage", stageElems) : nullptr, nullptr };
-  if (mg::WORLD > 2 && roomFor(stageElems * sizeof(TQ) * 2)) stages[1] = scratch<TQ>("trib.bstage2", stageElems);
-  const int nstage = stages[1] ? 2 : 1;
-  int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
-  {
-    size_t f, t; deviceMemInfo(&f, &t);
-    size_t perRow = (size_t)np * C * (sizeof(TQ) + 4), spare = f > t / 16 ? f - t / 16 : 0;
-    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 16 * 16));
-  }
-  width = std::min(width, std::max(16, hi - lo));
-  TQ* a = scratch<TQ>("trib.aq", (size_t)width * np * C);
-  B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
-  half* t2 = scratch<half>("trib.t2", (size_t)width * np * C);
+  const size_t mine = (size_t)maxShare * np * C;
+  const std::string tag = std::to_string(C) + (F8 ? "f8" : "");
+  // this rank's rows' a and b ([C][rows][np], read by every rank) and its rows' product ([C][rows][np], written by
+  // every rank)
+  mg::Shared& aS = mg::shared("sh.ta" + tag, mine * sizeof(TQ));
+  mg::Shared& bS = mg::shared("sh.tb" + tag, mine * sizeof(TQ));
+  mg::Shared& pS = mg::shared("sh.tp" + std::to_string(C), mine * sizeof(B16));
+  half* t2 = scratch<half>("trib.t2", (size_t)std::max(rows, 1) * np * C);
+  if (F8 && incoming) { fprintf(stderr, "sharded triangle: the FP8 GEMM takes the outgoing (TN) form only\n"); exit(1); }
+  int c0, c1; mg::shareOf(C, 1, mg::RANK, c0, c1);
+  const int cg = c1 - c0;
+  // channels a group: as many whole planes (a, b and the product) as the room takes
+  int g = std::max(1, cg);
+  while (g > 1 && !roomFor((size_t)g * plane * (2 * sizeof(TQ) + sizeof(B16)))) g = (g + 1) / 2;
+  TQ* aAll = cg ? scratch<TQ>("trib.aall", (size_t)g * plane) : nullptr;
+  TQ* bAll = cg ? scratch<TQ>("trib.ball", (size_t)g * plane) : nullptr;
+  B16* pAll = cg ? scratch<B16>("trib.pall", (size_t)g * plane) : nullptr;
   const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
-  // the block's product's columns for one rank's rows of b: prod[c][r][qlo + j] = sum_k a[c][r][k] B[c][j][k]
-  auto gemmQ = [&](int m, int w, const TQ* B, size_t rs, B16* out) {
-    if constexpr (F8) fp8GemmTN(m, w, np, alpha, B, np, (long long)m * np, a, np, (long long)rs, out, np, (long long)rs, C);
-    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, m, w, np, alpha, B, np, (long long)m * np, a, np, (long long)rs, out, np, (long long)rs, C);
+  const RectMap mineRm{lo, np, 0, (size_t)rows * np};
+  // (at function scope: an if constexpr inside the generic lambdas below does not discard its other branch)
+  auto gemmAll = [&](int gc) {
+    if constexpr (F8) fp8GemmTN(np, np, np, alpha, bAll, np, (long long)plane, aAll, np, (long long)plane, pAll, np, (long long)plane, gc);
+    else if (incoming) bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, np, np, np, alpha, aAll, np, (long long)plane, bAll, np, (long long)plane, pAll, np, (long long)plane, gc);
+    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, alpha, bAll, np, (long long)plane, aAll, np, (long long)plane, pAll, np, (long long)plane, gc);
   };
   wideWidth(C, [&](auto cw) {
     constexpr int CC = decltype(cw)::value, WO = 4;
@@ -132,32 +145,45 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         static bool attr = false;
         constexpr auto kern = triIn256For<CC, WI, TQ, PT>();
         if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
-        auto in = [&](RectMap rm, size_t rows, TQ* ao, TQ* bo, half* t2o) {
-          kern<<<(unsigned)((rows + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
-            base, mask, lnS, lnO, wt, ao, bo, t2o, n, np, cs, nullptr, rm);
-        };
-        if (hi > lo) in(RectMap{lo, np, 0, (size_t)(hi - lo) * np}, (size_t)(hi - lo) * np, nullptr, (TQ*)bmine.local, nullptr);
-        mg::fence();                                  // (every rank's b rows written before any is read)
-        for (int k0 = lo; k0 < std::min(hi, n); k0 += width) {
-          int w = std::min(width, hi - k0);
-          const size_t rs = (size_t)w * np;
-          RectMap rm{k0, np, 0, rs};
-          in(rm, rs, a, nullptr, t2);
-          ringOver<TQ>(bmine, n, np, C, stages, nstage, [&](int m, const TQ* B, int qlo) { gemmQ(m, w, B, rs, prod + qlo); });
-          triangleOutRun<CC, WO, B16>(prod, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
-                                      Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, rm);
+        if (rows > 0)
+          kern<<<(unsigned)(((size_t)rows * np + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+            base, mask, lnS, lnO, wt, (TQ*)aS.local, (TQ*)bS.local, t2, n, np, cs, nullptr, mineRm);
+        mg::fence();                                  // (every rank's a and b written before any is read)
+        for (int q0 = c0; q0 < c1; q0 += g) {
+          const int gc = std::min(g, c1 - q0);
+          for (int r = 0; r < mg::WORLD; ++r) {       // every rank's rows of these channels' a and b planes
+            int rlo, rhi; rowsOf(n, r, rlo, rhi);
+            const size_t rr = (size_t)(rhi - rlo) * np;
+            if (!rr) continue;
+            CK(cudaMemcpy2DAsync(aAll + (size_t)rlo * np, plane * sizeof(TQ), (const TQ*)aS.peer[r] + (size_t)q0 * rr, rr * sizeof(TQ),
+                                 rr * sizeof(TQ), gc, cudaMemcpyDefault, STREAM));
+            CK(cudaMemcpy2DAsync(bAll + (size_t)rlo * np, plane * sizeof(TQ), (const TQ*)bS.peer[r] + (size_t)q0 * rr, rr * sizeof(TQ),
+                                 rr * sizeof(TQ), gc, cudaMemcpyDefault, STREAM));
+          }
+          gemmAll(gc);
+          for (int r = 0; r < mg::WORLD; ++r) {       // each rank its rows of the product
+            int rlo, rhi; rowsOf(n, r, rlo, rhi);
+            const size_t rr = (size_t)(rhi - rlo) * np;
+            if (!rr) continue;
+            CK(cudaMemcpy2DAsync((B16*)pS.peer[r] + (size_t)q0 * rr, rr * sizeof(B16), pAll + (size_t)rlo * np, plane * sizeof(B16),
+                                 rr * sizeof(B16), gc, cudaMemcpyDefault, STREAM));
+          }
         }
+        mg::fence();                                  // (every rank's product rows here; no rank reads a or b any more)
+        if (rows > 0)
+          triangleOutRun<CC, WO, B16>((const B16*)pS.local, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                      Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, mineRm);
       );
     });
   });
-  mg::fence();                                    // (no rank rewrites its b rows while another may still copy them)
   releaseScratch({ "trib." });
 }
 template <class T>
-inline void triangleSharded(const mg::Shared& z, const float* mask, int n, int C, const std::string& pre, bool divide) {
+inline void triangleSharded(const mg::Shared& z, const float* mask, int n, int C, const std::string& pre, bool divide,
+                            bool incoming = false) {
   if (C > 256) { fprintf(stderr, "sharded pair: the triangle takes 128 or 256 channels, not %d\n", C); exit(1); }
-  if (fp8Tensor()) triangleOn<__nv_fp8_e4m3>(z, mask, n, C, pre, divide);
-  else triangleOn<__nv_bfloat16>(z, mask, n, C, pre, divide);
+  if (fp8Tensor()) triangleOn<__nv_fp8_e4m3>(z, mask, n, C, pre, divide, incoming);
+  else triangleOn<__nv_bfloat16>(z, mask, n, C, pre, divide, incoming);
 }
 
 // row attention on a slab (z; or z^T, with the bias's swap flipped - column attention)
@@ -379,9 +405,16 @@ inline void pairUpdates(const mg::Shared& z, const mg::Shared& zT, const float* 
     rowAttentionGeneric<T>(s, mask, n, C, heads, D, p, sw);
   };
   tri(z, pre + ".triangleMultiplicationOutgoing"); stage("tri.out");
-  transpose(z, zT, n, C);
-  tri(zT, pre + ".triangleMultiplicationIncoming"); stage("tri.in");
-  transpose(zT, z, n, C);
+  // the incoming form straight on z where the fused bf16 triangle runs (no transposes); else as the outgoing form on z^T
+  bool direct = false;
+  if constexpr (std::is_same_v<T, half>) direct = PAIR16 && (C == 128 || C == 256) && blockedFused(n, C) && !fp8Tensor();
+  if (direct) triangleSharded<T>(z, mask, n, C, pre + ".triangleMultiplicationIncoming", divide, true);
+  else {
+    transpose(z, zT, n, C);
+    tri(zT, pre + ".triangleMultiplicationIncoming");
+    transpose(zT, z, n, C);
+  }
+  stage("tri.in");
   att(z, pre + ".pairAttention1", false); stage("grid.row");
   transpose(z, zT, n, C);
   att(zT, pre + ".pairAttention2", !swap); stage("grid.col");

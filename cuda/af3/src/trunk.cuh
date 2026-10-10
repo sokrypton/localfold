@@ -1465,7 +1465,7 @@ inline std::vector<float> contactProbabilitiesSharded(Trunk& t) {
   }
   (void)hp;
   std::vector<float> out;
-  mg::fence();
+  mg::fence(); mg::hostFence();
   if (mg::RANK == 0) {
     out.resize((size_t)n * n);
     for (int r = 0; r < mg::WORLD; ++r) {

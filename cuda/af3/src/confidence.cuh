@@ -641,7 +641,7 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   CK(cudaFree(dCentres)); CK(cudaFree(dPerBin));
   mg::tick("conf: heads");
   ConfidenceOut out;
-  mg::fence();
+  mg::fence(); mg::hostFence();
   if (mg::RANK == 0) {
     std::vector<float> term(pairs);
     out.pae.resize(pairs); out.pde.resize(pairs);

@@ -15,7 +15,7 @@ inline CUptiResult (*registerCallbacks)(CUpti_BuffersCallbackRequestFunc, CUpti_
 inline CUptiResult (*enable)(CUpti_ActivityKind) = nullptr;
 inline CUptiResult (*flushAll)(uint32_t) = nullptr;
 inline std::map<std::string, std::pair<double, int>> byName;   // name -> (ns, calls)
-inline uint64_t first = UINT64_MAX, last = 0; inline double busy = 0;
+inline uint64_t first = UINT64_MAX, last = 0; inline double busy = 0, copyNs = 0;
 inline bool on = false;
 // LOCALFOLD_PROF_GAPS=<n>: every kernel's span kept too, and the n longest stretches the device sat idle printed with
 // the kernels either side - where a wall clock's time goes that no kernel's does (host work, a synchronisation)
@@ -43,6 +43,14 @@ inline void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer, size_
       busy += (double)(k->end - k->start);
       if (GAPS) spans.push_back({k->start, k->end, shortName(k->name)});
       first = std::min<uint64_t>(first, k->start); last = std::max<uint64_t>(last, k->end);
+    } else if (on && GAPS && record->kind == CUPTI_ACTIVITY_KIND_MEMCPY) {   // (copies: idle to a kernel table, not to a gap)
+      auto* m = (CUpti_ActivityMemcpy5*)record;
+      spans.push_back({m->start, m->end, "[copy]"});
+      copyNs += (double)(m->end - m->start);
+    } else if (on && GAPS && record->kind == CUPTI_ACTIVITY_KIND_MEMCPY2) {
+      auto* m = (CUpti_ActivityMemcpyPtoP4*)record;
+      spans.push_back({m->start, m->end, "[peer copy]"});
+      copyNs += (double)(m->end - m->start);
     }
   }
   free(buffer);
@@ -61,8 +69,9 @@ inline void init() {
   if (!getNextRecord || !registerCallbacks || !enable || !flushAll) { fprintf(stderr, "--profile: this CUPTI lacks the activity API\n"); exit(1); }
   registerCallbacks(bufferRequested, bufferCompleted);
   enable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+  if (GAPS) { enable(CUPTI_ACTIVITY_KIND_MEMCPY); enable(CUPTI_ACTIVITY_KIND_MEMCPY2); }
 }
-inline void start() { flushAll(0); byName.clear(); spans.clear(); busy = 0; first = UINT64_MAX; last = 0; on = true; }
+inline void start() { flushAll(0); byName.clear(); spans.clear(); busy = 0; copyNs = 0; first = UINT64_MAX; last = 0; on = true; }
 inline void stop(int top = 25) {
   CK(cudaDeviceSynchronize());
   flushAll(0);
@@ -88,6 +97,14 @@ inline void stop(int top = 25) {
     for (int i = 0; i < (int)gaps.size() && i < GAPS; ++i)
       printf("  %7.2f ms at +%7.1f ms  after %s  before %s\n", gaps[i].ns / 1e6, (spans[gaps[i].at].start - first) / 1e6,
              spans[gaps[i].at - 1].name.substr(0, 50).c_str(), spans[gaps[i].at].name.substr(0, 50).c_str());
+    // (copies counted as busy here: their own time, then the idle summed by the kernel or copy that ended it)
+    std::map<std::string, std::pair<double, int>> before;
+    for (auto& g : gaps) { auto& e = before[spans[g.at].name]; e.first += g.ns; e.second++; }
+    std::vector<std::pair<std::string, std::pair<double, int>>> bs(before.begin(), before.end());
+    std::sort(bs.begin(), bs.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
+    printf("copies %.1f ms; idle by what ended it:\n", copyNs / 1e6);
+    for (int i = 0; i < (int)bs.size() && i < GAPS; ++i)
+      printf("  %8.2f ms %6d  %s\n", bs[i].second.first / 1e6, bs[i].second.second, bs[i].first.substr(0, 70).c_str());
   }
 }
 }  // namespace prof

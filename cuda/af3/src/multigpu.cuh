@@ -34,6 +34,11 @@ struct Shm {
   Slot slot[MAX_SLOTS];
 };
 inline Shm* SHM = nullptr;
+// LOCALFOLD_MG_SIMULATE=1 with --gpus=N: no fork - this one process is rank 0 of N, every peer's buffer its own (a
+// peer copy becomes a copy on this card, a barrier nothing). The results are wrong; the TIMES are one rank's compute at
+// the real shapes and its real memory, which is what a box of N GPUs is short of when it is not N times faster - so
+// the per-rank work can be measured and tuned on one GPU. (The interconnect is the part it cannot see.)
+inline bool SIM = false;
 inline bool FINISHED = false;
 inline std::vector<pid_t> CHILDREN;
 
@@ -50,17 +55,36 @@ inline void finish() { FINISHED = true; }
 // 741 tokens on 4 ranks sharing one A100)
 [[noreturn]] inline void leave() { finish(); fflush(stdout); fflush(stderr); _exit(0); }
 
-// a peer gone without passing through exit (a signal, the OOM killer): rank 0 reaps its children; another rank sees rank 0
-// gone through its parent pid (and PR_SET_PDEATHSIG kills it when rank 0 dies anyway)
-inline bool peerDied() {
-  if (RANK == 0) {
-    for (pid_t p : CHILDREN) { int st; if (waitpid(p, &st, WNOHANG) == p) return true; }
-    return false;
-  }
-  return getppid() != SHM->pid[0];
+// a peer gone without passing through exit (a signal, the OOM killer, an error): rank 0's watchdog reaps its children
+// (one that left with status 0 has finished its part); another rank sees rank 0 gone through its parent pid (and
+// PR_SET_PDEATHSIG kills it when rank 0 dies anyway)
+inline std::atomic<bool> CHILD_FAILED{false};
+inline bool peerDied() { return RANK == 0 ? CHILD_FAILED.load() : getppid() != SHM->pid[0]; }
+// Every rank's watchdog thread: the fences are on the DEVICE (fence() below), so a rank waiting for a peer that died
+// sits in a kernel, not in a host loop that could notice - this thread notices instead and ends the process (a
+// peer's failure, or the abort flag another rank set) rather than leave it waiting for ever.
+inline void watchdog() {
+  std::thread([] {
+    std::vector<pid_t> live = CHILDREN;
+    for (;;) {
+      usleep(20000);
+      if (RANK == 0)
+        for (size_t k = 0; k < live.size();) {
+          int st = 0;
+          if (waitpid(live[k], &st, WNOHANG) == live[k]) {
+            if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) CHILD_FAILED.store(true);
+            live.erase(live.begin() + k);
+          } else ++k;
+        }
+      if ((SHM->abort.load() || peerDied()) && !FINISHED) {
+        SHM->abort.store(1);
+        fprintf(stderr, "rank %d: a peer failed\n", RANK); fflush(stderr); _exit(1);
+      }
+    }
+  }).detach();
 }
 inline void barrier() {
-  if (WORLD == 1) return;
+  if (WORLD == 1 || SIM) return;
   const int gen = SHM->generation.load();
   if (SHM->arrived.fetch_add(1) == WORLD - 1) { SHM->arrived.store(0); SHM->generation.fetch_add(1); return; }
   for (long spin = 0; SHM->generation.load() == gen; ++spin) {
@@ -102,6 +126,13 @@ inline void launch(int world) {
   WORLD = world;
   if (world <= 1) return;
   if (world > MAX_RANKS) { fprintf(stderr, "at most %d GPUs\n", MAX_RANKS); exit(1); }
+  if (getenv("LOCALFOLD_MG_SIMULATE")) {
+    SIM = true;
+    fprintf(stderr, "mg: SIMULATING rank 0 of %d on one GPU (LOCALFOLD_MG_SIMULATE): times only, the fold is wrong\n", world);
+    setenv("LOCALFOLD_RANK", "0", 1);
+    CK(cudaSetDevice(getenv("LOCALFOLD_GPU_MAP") ? atoi(getenv("LOCALFOLD_GPU_MAP")) : 0));
+    return;
+  }
   std::string path = "/dev/shm/localfold-mg-" + std::to_string(getpid());
   int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
   if (fd < 0 || ftruncate(fd, sizeof(Shm)) != 0) { perror("mg shared mapping"); exit(1); }
@@ -117,6 +148,7 @@ inline void launch(int world) {
   }
   SHM->pid[RANK] = getpid();
   atexit(onExit);
+  watchdog();
   // (the standalone front end reads these: rank 0 alone featurises and fetches, cuda/featurise/standalone.h)
   setenv("LOCALFOLD_RANK", std::to_string(RANK).c_str(), 1);
   setenv("LOCALFOLD_MG_ID", runId.c_str(), 1);
@@ -162,6 +194,7 @@ inline Shared& shared(const std::string& name, size_t bytes) {
   }
   Shared s; s.bytes = bytes; s.world = WORLD;
   CK(cudaMalloc(&s.local, std::max<size_t>(bytes, 256)));
+  if (SIM) { for (int r = 0; r < WORLD; ++r) s.peer[r] = s.local; return m.emplace(name, s).first->second; }
   int idx;
   if (RANK == 0) {
     idx = SHM ? SHM->slots.fetch_add(1) : 0;
@@ -194,14 +227,57 @@ inline void release(const std::vector<std::string>& prefixes) {
   if (WORLD > 1) { CK(cudaStreamSynchronize(STREAM)); barrier(); }
   else if (any) CK(cudaStreamSynchronize(STREAM));
   for (auto& [k, s] : m)
-    if (match(k)) for (int r = 0; r < s.world; ++r) if (r != RANK && s.peer[r]) { CK(cudaIpcCloseMemHandle(s.peer[r])); s.peer[r] = nullptr; }
+    if (match(k)) for (int r = 0; r < s.world; ++r) if (r != RANK && s.peer[r]) { if (!SIM) CK(cudaIpcCloseMemHandle(s.peer[r])); s.peer[r] = nullptr; }
   barrier();
   for (auto it = m.begin(); it != m.end();) {
     if (match(it->first)) { CK(cudaFree(it->second.local)); it = m.erase(it); } else ++it;
   }
 }
-// the stream drained and every rank at the same point: what each wrote to its shared buffers is visible to the others
+// The fences, on the DEVICE: each rank's stream writes its arrival (a generation) into every rank's flags and waits
+// until every rank's has arrived in its own - so what each rank's stream did before its fence is done and visible to
+// the others when any of them moves past it. A host fence (the stream drained, then a host barrier) leaves every GPU
+// idle while the slowest rank and the host catch up: ~5,000 such gaps in a 2,964-token trunk pass, 12% of one rank's
+// time. The flag buffer is a shared buffer like any other; the abort flag (/dev/shm) is mapped in, so a rank that
+// failed releases the others' waits (the watchdog ends them).
+struct DevFlags { int* peer[MAX_RANKS]; int world, rank; const volatile int* abort; };
+__global__ void arriveAndWaitK(DevFlags f, int gen) {
+  const int t = threadIdx.x;
+  __threadfence_system();
+  if (t < f.world) ((volatile int*)f.peer[t])[f.rank] = gen;
+  __threadfence_system();
+  if (t < f.world) {
+    const volatile int* mine = f.peer[f.rank];
+    while (mine[t] < gen && !*f.abort) __nanosleep(64);
+  }
+  __syncthreads();
+  __threadfence_system();
+}
+inline DevFlags devFlags() {
+  static DevFlags f{};
+  static bool made = false;
+  if (!made) {
+    Shared& s = shared("mg.flags", MAX_RANKS * sizeof(int));
+    CK(cudaMemset(s.local, 0, MAX_RANKS * sizeof(int)));
+    CK(cudaDeviceSynchronize());
+    void* dshm = nullptr;                // (the whole mapping, page-aligned as it is)
+    CK(cudaHostRegister((void*)SHM, sizeof(Shm), cudaHostRegisterMapped | cudaHostRegisterPortable));
+    CK(cudaHostGetDevicePointer(&dshm, (void*)SHM, 0));
+    void* ab = (char*)dshm + ((char*)&SHM->abort - (char*)SHM);
+    for (int r = 0; r < WORLD; ++r) f.peer[r] = (int*)s.peer[r];
+    f.world = WORLD; f.rank = RANK; f.abort = (const volatile int*)ab;
+    barrier();                           // (every rank's flags zeroed before any rank arrives)
+    made = true;
+  }
+  return f;
+}
 inline void fence() {
+  if (WORLD == 1 || SIM) return;
+  static int gen = 0;
+  arriveAndWaitK<<<1, 32, 0, STREAM>>>(devFlags(), ++gen);
+  CK(cudaGetLastError());
+}
+// ...and on the host, where the HOST then reads what the others wrote (a synchronous copy off a peer's buffer)
+inline void hostFence() {
   if (WORLD == 1) return;
   CK(cudaStreamSynchronize(STREAM));
   barrier();
