@@ -47,8 +47,18 @@ kernel void lf_copy(LF_ARGS(CopyArgs)) {
 kernel void lf_copy2d(LF_ARGS(Copy2DArgs)) {
   ulong t = LF_INDEX;
   if (t >= a.width * a.height) return;
-  ulong y = t / a.width, x = t - y * a.width;
+  ulong y, x;      // (32-bit division where it fits: the 64-bit one is slow)
+  if (t <= 0xffffffffull && a.width <= 0xffffffffull) { uint y32 = (uint)t / (uint)a.width; y = y32; x = (uint)t - y32 * (uint)a.width; }
+  else { y = t / a.width; x = t - y * a.width; }
   a.dst[y * a.dpitch + x] = a.src[y * a.spitch + x];
+}
+kernel void lf_copy2d16(LF_ARGS(Copy2DArgs)) {     // (pitches and width in 16-byte units)
+  ulong t = LF_INDEX;
+  if (t >= a.width * a.height) return;
+  ulong y, x;
+  if (t <= 0xffffffffull && a.width <= 0xffffffffull) { uint y32 = (uint)t / (uint)a.width; y = y32; x = (uint)t - y32 * (uint)a.width; }
+  else { y = t / a.width; x = t - y * a.width; }
+  ((device uint4*)a.dst)[y * a.dpitch + x] = ((device const uint4*)a.src)[y * a.spitch + x];
 }
 kernel void lf_pad_zero(LF_ARGS(PadZeroArgs)) {
   // (32-bit index arithmetic: the GPU's 64-bit division is slow - 104 ms a trunk pass at 510 tokens with it)
@@ -138,11 +148,21 @@ kernel void lf_decode(constant DecodeArgs& a [[buffer(0)]], uint3 tg [[threadgro
 kernel void lf_gather(constant GatherArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                       uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
   GatherPart p = a.parts[tg.y];
+  const bool small = p.n <= 0xffffffffull;     // (the index split in 32 bits where it fits: 64-bit division is slow)
   for (ulong o = (ulong)tg.x * 256 + tid; o < p.n; o += (ulong)ng.x * 256) {
-    ulong r = o; long d = 0, x = 0, y = 0;
-    for (int k = p.rank - 1; k >= 0; --k) {
-      long i = (long)(r % (ulong)p.dims[k]); r /= (ulong)p.dims[k];
-      d += i * p.ds[k]; x += i * p.s0[k]; y += i * p.s1[k];
+    long d = 0, x = 0, y = 0;
+    if (small) {
+      uint r = (uint)o;
+      for (int k = p.rank - 1; k >= 0; --k) {
+        const uint dk = (uint)p.dims[k], q = r / dk; const long i = (long)(r - q * dk); r = q;
+        d += i * p.ds[k]; x += i * p.s0[k]; y += i * p.s1[k];
+      }
+    } else {
+      ulong r = o;
+      for (int k = p.rank - 1; k >= 0; --k) {
+        long i = (long)(r % (ulong)p.dims[k]); r /= (ulong)p.dims[k];
+        d += i * p.ds[k]; x += i * p.s0[k]; y += i * p.s1[k];
+      }
     }
     float v;
     if (p.op == 'o') v = 1.f;

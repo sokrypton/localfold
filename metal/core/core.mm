@@ -464,6 +464,12 @@ void copy(void* dst, const void* src, size_t bytes) {
 }
 void copy2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
   if (!width || !height) return;
+  // 16 bytes a thread where everything is 16-byte aligned (a byte a thread: 0.24 ms a call in ESMFold2's sampler)
+  if ((((uint64_t)dst | (uint64_t)src | dpitch | spitch | width) & 15) == 0) {
+    Copy2DArgs a{(uchar*)dst, (const uchar*)src, dpitch / 16, spitch / 16, width / 16, height};
+    run1d("lf_copy2d16", width / 16 * height, a);
+    return;
+  }
   Copy2DArgs a{(uchar*)dst, (const uchar*)src, dpitch, spitch, width, height};
   run1d("lf_copy2d", width * height, a);
 }
