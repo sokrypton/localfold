@@ -476,7 +476,10 @@ static int foldMain(int argc, char** argv) {
       // at 3 from ~200 tokens, so the graph is taken where it measured a gain)
       // ...and not where a pass gives its stages' scratch back (runTrunk, shortPair), which a capture
       // cannot do
-      if (!GRAPHS || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
+      // (several GPUs on a sharded pair: the pass captured too - its fences count their generations on the device - where
+      // the ranks have a GPU each; a rank's kernels are an eighth as long, so the launches are a larger share)
+      const bool shardGraph = sharded(t) && !noGraphs && !mg::SHARED_DEVICE;
+      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
         recyclePass(); afterPass(pass); if (converged(pass)) break; continue;
       }
       if (!trunkGraph) {

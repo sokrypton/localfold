@@ -151,7 +151,8 @@ __global__ void gatherBiasK(PeerPlanes pp, uint4* __restrict__ bias, int heads, 
 // (releaseScratch's synchronize), four times a block, each a bubble the size of the host's re-enqueue - with a rank's
 // kernels an eighth as long, the GPU sat 14% idle; held, the next block reuses the same buffers
 inline void releaseIfShort(int n, int C, std::initializer_list<const char*> names) {
-  if (!roomFor((size_t)4 * maxStored(n) * n * C * 2)) releaseScratch(names);
+  cudaStreamCaptureStatus cap; CK(cudaStreamIsCapturing(STREAM, &cap));
+  if (cap == cudaStreamCaptureStatusNone && !roomFor((size_t)4 * maxStored(n) * n * C * 2)) releaseScratch(names);
 }
 // the triangle multiplication's outgoing form on a slab (z, or z^T with the incoming weights), its contraction split by
 // CHANNEL: p[c][i][j] = sum_k a[c][i][k] b[c][j][k] is independent in c, so rank s takes its share of the channels over
