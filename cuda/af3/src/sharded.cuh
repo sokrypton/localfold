@@ -87,6 +87,54 @@ inline void ringOver(const mg::Shared& bmine, int n, int np, int C, T* const* st
   }
 }
 
+// The channel-split triangle's exchanges as kernels reading or writing every rank's buffers directly (16 bytes a
+// thread): a group's a and b planes pulled - planes [gc][np][np] from rank r's [C][rows_r][np] at channels q0.. - and
+// its product's rows pushed into each rank's [C][rows_r][np]. As copies they were 3W a group, ~9,700 a 2,964-token
+// trunk pass, each ~17 us of launch the GPU sat idle for.
+struct PeerPlanes { uint4* p[mg::MAX_RANKS]; uint4* q[mg::MAX_RANKS]; int lo[mg::MAX_RANKS], rows[mg::MAX_RANKS]; int world; };
+inline PeerPlanes peerPlanes(const mg::Shared& a, const mg::Shared* b, int n) {
+  PeerPlanes pp{}; pp.world = mg::WORLD;
+  for (int r = 0; r < mg::WORLD; ++r) {
+    int lo, hi; rowsOf(n, r, lo, hi); pp.lo[r] = lo; pp.rows[r] = hi - lo;
+    pp.p[r] = (uint4*)a.peer[r]; pp.q[r] = b ? (uint4*)b->peer[r] : nullptr;
+  }
+  return pp;
+}
+__device__ __forceinline__ int ownerOf(const PeerPlanes& pp, int i) { int r = 0; while (r + 1 < pp.world && i >= pp.lo[r + 1]) ++r; return r; }
+__global__ void pullPlanesK(PeerPlanes pp, uint4* __restrict__ a, uint4* __restrict__ b, int q0, int gc, int np, int vecs) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)gc * np * vecs) return;
+  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int i = (int)(rest % np), c = (int)(rest / np);
+  const int r = ownerOf(pp, i);
+  const size_t src = ((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs + v;
+  a[t] = pp.p[r][src]; b[t] = pp.q[r][src];
+}
+__global__ void pushRowsK(PeerPlanes pp, const uint4* __restrict__ prod, int q0, int gc, int np, int vecs) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)gc * np * vecs) return;
+  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int i = (int)(rest % np), c = (int)(rest / np);
+  const int r = ownerOf(pp, i);
+  pp.p[r][((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs + v] = prod[t];
+}
+
+// every other rank's rows of the attention's bias (columns where swapped: the rows of z^T), read straight from it - the
+// planes [heads][n][stride] f16; ownership turns on 16-row boundaries, so no 16-byte piece straddles two ranks
+__global__ void gatherBiasK(PeerPlanes pp, uint4* __restrict__ bias, int heads, int n, int stride, bool swap, int rank) {
+  const int vecs = stride / 8;
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)heads * n * vecs) return;
+  const int v = (int)(t % vecs), i = (int)((t / vecs) % n);
+  const int r = swap ? (v * 8 < n ? ownerOf(pp, v * 8) : rank) : ownerOf(pp, i);
+  if (r == rank) return;
+  bias[t] = pp.p[r][t];
+}
+
+// a sharded op's scratch given back after it only where the card is short: giving back drains the device
+// (releaseScratch's synchronize), four times a block, each a bubble the size of the host's re-enqueue - with a rank's
+// kernels an eighth as long, the GPU sat 14% idle; held, the next block reuses the same buffers
+inline void releaseIfShort(int n, int C, std::initializer_list<const char*> names) {
+  if (!roomFor((size_t)4 * maxStored(n) * n * C * 2)) releaseScratch(names);
+}
 // the triangle multiplication's outgoing form on a slab (z, or z^T with the incoming weights), its contraction split by
 // CHANNEL: p[c][i][j] = sum_k a[c][i][k] b[c][j][k] is independent in c, so rank s takes its share of the channels over
 // EVERY row - each rank builds a, b and the gate for its own rows (one pass of the input kernel), rank s pulls its
@@ -123,19 +171,34 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   if (F8 && incoming) { fprintf(stderr, "sharded triangle: the FP8 GEMM takes the outgoing (TN) form only\n"); exit(1); }
   int c0, c1; mg::shareOf(C, 1, mg::RANK, c0, c1);
   const int cg = c1 - c0;
-  // channels a group: as many whole planes (a, b and the product) as the room takes
-  int g = std::max(1, cg);
-  while (g > 1 && !roomFor((size_t)g * plane * (2 * sizeof(TQ) + sizeof(B16)))) g = (g + 1) / 2;
-  TQ* aAll = cg ? scratch<TQ>("trib.aall", (size_t)g * plane) : nullptr;
-  TQ* bAll = cg ? scratch<TQ>("trib.ball", (size_t)g * plane) : nullptr;
-  B16* pAll = cg ? scratch<B16>("trib.pall", (size_t)g * plane) : nullptr;
+  // channels a group, two groups' planes (a, b and the product) held: group q + 1's pulls (a copy stream) and group
+  // q - 1's pushes (another) run beside group q's GEMM - a quarter of the channels a group where there are enough,
+  // fewer where the room is short
+  int g = std::max(1, (cg + 3) / 4);
+  while (g > 1 && !roomFor((size_t)2 * g * plane * (2 * sizeof(TQ) + sizeof(B16)))) g = (g + 1) / 2;
+  TQ* aAll[2] = {}; TQ* bAll[2] = {}; B16* pAll[2] = {};
+  for (int k = 0; k < 2 && cg; ++k) {
+    aAll[k] = scratch<TQ>("trib.aall" + std::to_string(k), (size_t)g * plane);
+    bAll[k] = scratch<TQ>("trib.ball" + std::to_string(k), (size_t)g * plane);
+    pAll[k] = scratch<B16>("trib.pall" + std::to_string(k), (size_t)g * plane);
+  }
+  static cudaStream_t pullS = nullptr, pushS = nullptr;
+  static cudaEvent_t fenced, pulled[2], gemmed[2], pushed[2];
+  if (!pullS) {
+    CK(cudaStreamCreateWithFlags(&pullS, cudaStreamNonBlocking)); CK(cudaStreamCreateWithFlags(&pushS, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&fenced, cudaEventDisableTiming));
+    for (int k = 0; k < 2; ++k)
+      for (cudaEvent_t* e : { &pulled[k], &gemmed[k], &pushed[k] }) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+  }
   const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
   const RectMap mineRm{lo, np, 0, (size_t)rows * np};
+  const PeerPlanes abPlanes = peerPlanes(aS, &bS, n), pPlanes = peerPlanes(pS, nullptr, n);
+  const int vecsA = (int)((size_t)np * sizeof(TQ) / 16), vecsP = (int)((size_t)np * sizeof(B16) / 16);
   // (at function scope: an if constexpr inside the generic lambdas below does not discard its other branch)
-  auto gemmAll = [&](int gc) {
-    if constexpr (F8) fp8GemmTN(np, np, np, alpha, bAll, np, (long long)plane, aAll, np, (long long)plane, pAll, np, (long long)plane, gc);
-    else if (incoming) bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, np, np, np, alpha, aAll, np, (long long)plane, bAll, np, (long long)plane, pAll, np, (long long)plane, gc);
-    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, alpha, bAll, np, (long long)plane, aAll, np, (long long)plane, pAll, np, (long long)plane, gc);
+  auto gemmAll = [&](int gc, const TQ* A, const TQ* Bm, B16* P) {
+    if constexpr (F8) fp8GemmTN(np, np, np, alpha, Bm, np, (long long)plane, A, np, (long long)plane, P, np, (long long)plane, gc);
+    else if (incoming) bf16Gemms(CUBLAS_OP_N, CUBLAS_OP_T, np, np, np, alpha, A, np, (long long)plane, Bm, np, (long long)plane, P, np, (long long)plane, gc);
+    else bf16Gemms(CUBLAS_OP_T, CUBLAS_OP_N, np, np, np, alpha, Bm, np, (long long)plane, A, np, (long long)plane, P, np, (long long)plane, gc);
   };
   wideWidth(C, [&](auto cw) {
     constexpr int CC = decltype(cw)::value, WO = 4;
@@ -149,26 +212,24 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
           kern<<<(unsigned)(((size_t)rows * np + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
             base, mask, lnS, lnO, wt, (TQ*)aS.local, (TQ*)bS.local, t2, n, np, cs, nullptr, mineRm);
         mg::fence();                                  // (every rank's a and b written before any is read)
-        for (int q0 = c0; q0 < c1; q0 += g) {
-          const int gc = std::min(g, c1 - q0);
-          for (int r = 0; r < mg::WORLD; ++r) {       // every rank's rows of these channels' a and b planes
-            int rlo, rhi; rowsOf(n, r, rlo, rhi);
-            const size_t rr = (size_t)(rhi - rlo) * np;
-            if (!rr) continue;
-            CK(cudaMemcpy2DAsync(aAll + (size_t)rlo * np, plane * sizeof(TQ), (const TQ*)aS.peer[r] + (size_t)q0 * rr, rr * sizeof(TQ),
-                                 rr * sizeof(TQ), gc, cudaMemcpyDefault, STREAM));
-            CK(cudaMemcpy2DAsync(bAll + (size_t)rlo * np, plane * sizeof(TQ), (const TQ*)bS.peer[r] + (size_t)q0 * rr, rr * sizeof(TQ),
-                                 rr * sizeof(TQ), gc, cudaMemcpyDefault, STREAM));
-          }
-          gemmAll(gc);
-          for (int r = 0; r < mg::WORLD; ++r) {       // each rank its rows of the product
-            int rlo, rhi; rowsOf(n, r, rlo, rhi);
-            const size_t rr = (size_t)(rhi - rlo) * np;
-            if (!rr) continue;
-            CK(cudaMemcpy2DAsync((B16*)pS.peer[r] + (size_t)q0 * rr, rr * sizeof(B16), pAll + (size_t)rlo * np, plane * sizeof(B16),
-                                 rr * sizeof(B16), gc, cudaMemcpyDefault, STREAM));
-          }
+        CK(cudaEventRecord(fenced, STREAM));
+        CK(cudaStreamWaitEvent(pullS, fenced, 0)); CK(cudaStreamWaitEvent(pushS, fenced, 0));
+        int q = 0;
+        for (int q0 = c0; q0 < c1; q0 += g, ++q) {
+          const int gc = std::min(g, c1 - q0), sl = q % 2;
+          if (q >= 2) CK(cudaStreamWaitEvent(pullS, gemmed[sl], 0));     // (group q - 2's GEMM done with these planes)
+          pullPlanesK<<<blocks((size_t)gc * np * vecsA), 256, 0, pullS>>>(abPlanes, (uint4*)aAll[sl], (uint4*)bAll[sl], q0, gc, np, vecsA);
+          CK(cudaEventRecord(pulled[sl], pullS));
+          CK(cudaStreamWaitEvent(STREAM, pulled[sl], 0));
+          if (q >= 2) CK(cudaStreamWaitEvent(STREAM, pushed[sl], 0));    // (group q - 2's pushes done reading this product)
+          gemmAll(gc, aAll[sl], bAll[sl], pAll[sl]);
+          CK(cudaEventRecord(gemmed[sl], STREAM));
+          CK(cudaStreamWaitEvent(pushS, gemmed[sl], 0));
+          pushRowsK<<<blocks((size_t)gc * np * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sl], q0, gc, np, vecsP);
+          CK(cudaEventRecord(pushed[sl], pushS));
         }
+        if (q) { CK(cudaStreamWaitEvent(STREAM, pushed[(q - 1) % 2], 0)); CK(cudaStreamWaitEvent(STREAM, pulled[(q - 1) % 2], 0)); }
+        if (q > 1) CK(cudaStreamWaitEvent(STREAM, pushed[q % 2], 0));
         mg::fence();                                  // (every rank's product rows here; no rank reads a or b any more)
         if (rows > 0)
           triangleOutRun<CC, WO, B16>((const B16*)pS.local, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
@@ -176,7 +237,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
       );
     });
   });
-  releaseScratch({ "trib." });
+  releaseIfShort(n, C, { "trib." });
 }
 template <class T>
 inline void triangleSharded(const mg::Shared& z, const float* mask, int n, int C, const std::string& pre, bool divide,
@@ -202,31 +263,29 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   std::string qkvg = qkvgWeight(pre, C, Wd, true);
   std::string wb = paddedColumns(pre + ".pairBiasProjection", C, heads, 16);
   const float scale = 1.f / sqrtf((float)D);
-  // this rank's rows' bias, in chunks of pairs
   CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));
   const size_t pairsHere = (size_t)rowsHere * n;
-  size_t per = std::max<size_t>(1, std::min(pairsHere, CHUNK / 16));
-  float* raw = scratch<float>("grid.raw16", per * 16);
-  for (size_t q0 = 0; q0 < pairsHere; q0 += per) {
-    size_t r = std::min(per, pairsHere - q0);
-    lnHeads128<16>(pairRow((float*)z.local, q0, C), pre + ".actNormScale", pre + ".actNormOffset", wb, raw, r);
-    biasFromRawRowsK<half><<<blocks((size_t)heads * r), 256, 0, STREAM>>>(raw, bias, (size_t)lo * n + q0, r, n, stride,
-                                                                        heads, swap, LOG2E);
+  const bool f8 = (MASK_ALL_ONES || !mask) && fp8Attn();
+  // this rank's rows' bias: where every held row's q, k, v and gate fit, ONE input pass writes them and the bias
+  // together (the one-GPU form's fusion - the separate LayerNorm-and-project pass and its layout kernel were 65 ms of a
+  // simulated rank's 3.0 s trunk at 2,964 tokens on 8); else the bias alone, in chunks, and the projections per chunk
+  const bool whole = !f8 && rowsHere && roomFor((pairsHere + 128) * 4 * Wd * 2);
+  half* qkvgAll = whole ? scratch<half>("grid.qkvg", (pairsHere + 128) * 4 * Wd) : nullptr;
+  if (whole) gridIn128(base, pre, qkvg, qkvgAll, n, (size_t)lo * n, pairsHere, false, Wh(wb), bias, heads, stride, swap);
+  else {
+    size_t per = std::max<size_t>(1, std::min(pairsHere, CHUNK / 16));
+    float* raw = scratch<float>("grid.raw16", per * 16);
+    for (size_t q0 = 0; q0 < pairsHere; q0 += per) {
+      size_t r = std::min(per, pairsHere - q0);
+      lnHeads128<16>(pairRow((float*)z.local, q0, C), pre + ".actNormScale", pre + ".actNormOffset", wb, raw, r);
+      biasFromRawRowsK<half><<<blocks((size_t)heads * r), 256, 0, STREAM>>>(raw, bias, (size_t)lo * n + q0, r, n, stride,
+                                                                          heads, swap, LOG2E);
+    }
   }
   // every rank's: rows of each head's plane, or columns when swapped
   mg::fence();
-  for (int r = 0; r < mg::WORLD; ++r) {
-    if (r == mg::RANK) continue;
-    int rlo, rhi; rowsOf(n, r, rlo, rhi); rhi = std::min(rhi, n);
-    if (rhi <= rlo) continue;
-    for (int h = 0; h < heads; ++h) {
-      const size_t plane = (size_t)h * n * stride * 2;
-      if (!swap) CK(cudaMemcpyAsync((char*)bias + plane + (size_t)rlo * stride * 2, (const char*)biasS.peer[r] + plane +
-                                    (size_t)rlo * stride * 2, (size_t)(rhi - rlo) * stride * 2, cudaMemcpyDefault, STREAM));
-      else CK(cudaMemcpy2DAsync((char*)bias + plane + (size_t)rlo * 2, (size_t)stride * 2, (const char*)biasS.peer[r] + plane +
-                                (size_t)rlo * 2, (size_t)stride * 2, (size_t)(rhi - rlo) * 2, n, cudaMemcpyDefault, STREAM));
-    }
-  }
+  gatherBiasK<<<blocks((size_t)heads * n * (stride / 8)), 256, 0, STREAM>>>(peerPlanes(biasS, nullptr, n), (uint4*)bias, heads, n,
+                                                                          stride, swap, mg::RANK);
   mg::fence();
   // this rank's rows, in chunks
   size_t R = std::max<size_t>(1, std::min<size_t>(std::max(rowsHere, 1), CHUNK / ((size_t)n * 4 * Wd)));
@@ -235,18 +294,17 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
     size_t perRow = (size_t)n * 5 * Wd * 2, spare = f > t / 16 ? f - t / 16 : 0;
     R = std::max<size_t>(R, std::min<size_t>(rowsHere, std::min<size_t>(spare / perRow, 256)));
   }
-  const bool f8 = (MASK_ALL_ONES || !mask) && fp8Attn();
   for (size_t r0 = lo; r0 < (size_t)(lo + rowsHere); r0 += R) {
     size_t rows = std::min(R, (size_t)(lo + rowsHere) - r0), prs = rows * n;
-    half* qkvgOut = scratch<half>("grid.qkvg", (std::min<size_t>(R, rowsHere) * n + 128) * 4 * Wd);
+    half* qkvgOut = whole ? qkvgAll + (r0 - lo) * n * 4 * Wd : scratch<half>("grid.qkvg", (std::min<size_t>(R, rowsHere) * n + 128) * 4 * Wd);
     uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", std::min<size_t>(R, rowsHere) * n * 2 * Wd) : nullptr;
-    gridIn128(base, pre, qkvg, qkvgOut, n, r0 * n, prs, false, nullptr, nullptr, 0, 0, false, kv8);
+    if (!whole) gridIn128(base, pre, qkvg, qkvgOut, n, r0 * n, prs, false, nullptr, nullptr, 0, 0, false, kv8);
     half* gathered = scratch<half>("grid.gathered", std::min<size_t>(R, rowsHere) * n * Wd);
     if (f8) flash8Run(qkvgOut, kv8, kv8 + prs * Wd, bias, stride, gathered, n, heads, rows, scale, nullptr);
     else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, false, scale);
     gridOut128(gathered, pre + ".outputProjection", into(base), n, r0 * n, prs, false);
   }
-  releaseScratch({ "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });
+  releaseIfShort(n, C, { "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });
 }
 
 
@@ -311,7 +369,7 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
     }
   }
   mg::fence();                                    // (no rank rewrites its b rows while another may still copy them)
-  releaseScratch({ "trib." });
+  releaseIfShort(n, C, { "trib." });
 }
 // bias[h][i][j] (or [h][j][i] when swapped) = scale * raw[q][h] for the pairs p0 + q, raw pair-major (a linear's)
 template <class TB>
@@ -380,7 +438,7 @@ inline void rowAttentionGeneric(const mg::Shared& z, const float* mask, int n, i
     if (outBias) addBiasK<<<blocks(prs * C), 256, 0, STREAM>>>(o, outBias, prs, C);
     WITH_PAIR_T(addGridK<PT, float><<<blocks(prs * C / 4), 256, 0, STREAM>>>(into(pair), o, n, C, r0, rows, false));
   }
-  releaseScratch({ "grid." });
+  releaseIfShort(n, C, { "grid." });
 }
 // A pairformer block's pair updates on the sharded pair z (this rank's slab), zT a slab-sized buffer for z^T
 template <class T>

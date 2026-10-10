@@ -883,6 +883,32 @@ inline void refreshSuperBlockBias(int sb, int n) {
                                                                                                rowsB);
   }
 }
+// several GPUs, the tokens split (one sample): every other rank's rows of k and v (qkvg's columns [Wd, 3Wd)) read
+// straight from the rank that projected them - one kernel over every peer
+struct PeerRows { const half* p[mg::MAX_RANKS]; int lo[mg::MAX_RANKS]; int world, rank; };
+__global__ void gatherKvK(PeerRows pr, half* __restrict__ qkvg, int n, int Wd) {
+  const int per = 2 * Wd / 8;
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * per) return;
+  const int row = (int)(t / per), v = (int)(t % per);
+  int r = 0;
+  while (r + 1 < pr.world && row >= pr.lo[r + 1]) ++r;
+  if (r == pr.rank) return;
+  const size_t off = (size_t)row * 4 * Wd + Wd + (size_t)v * 8;
+  *(uint4*)(qkvg + off) = *(const uint4*)(pr.p[r] + off);
+}
+// ...and every other rank's rows of the transformer's output (f32 [n][C]), for the decoder
+struct PeerAct { const float* p[mg::MAX_RANKS]; int lo[mg::MAX_RANKS]; int world, rank; };
+__global__ void gatherActK(PeerAct pa, float* __restrict__ act, int n, int C) {
+  const int per = C / 4;
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)n * per) return;
+  const int row = (int)(t / per), v = (int)(t % per);
+  int r = 0;
+  while (r + 1 < pa.world && row >= pa.lo[r + 1]) ++r;
+  if (r == pa.rank) return;
+  *(float4*)(act + (size_t)row * C + v * 4) = *(const float4*)(pa.p[r] + (size_t)row * C + v * 4);
+}
 template <class T>
 void diffusionTransformer(float* act, const float* cond, const float* mask, int n) {
   const std::string Tn = "diffusion.transformer";
@@ -895,14 +921,23 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   size_t rows = (size_t)n * NS;                    // every sample's tokens; the conditioning is shared
   // every block's conditioning, two GEMMs over [x | 1] (the biases are the weights' last row)
   int Ca = (Cc + 1 + 7) / 8 * 8;
+  // several GPUs on a sharded pair, one sample: the TOKENS split - each rank runs every per-token step (the adaptive
+  // norms, the projections, the transitions, the conditioning's GEMMs) on its own rows [lo, lo + held) and its query
+  // rows of the attention, gathering only every other rank's k and v a block; the output's rows gathered at the end.
+  // (Before: only the attention's queries split, and the per-token GEMMs - as much time again - ran whole on every
+  // rank: the transformer 1.6x faster on eight.) lo is a multiple of 16; the GEMMs take the padded share.
+  const bool tok = sh::DLO >= 0 && NS == 1 && std::is_same_v<T, half> && mg::WORLD > 1;
+  int tlo = 0, thi = n; if (tok) sh::rowsOf(n, mg::RANK, tlo, thi);
+  const int held = tok ? sh::DROWS : n;              // this rank's real rows
+  auto at = [&](auto* p, size_t ld) { return tok ? p + (size_t)tlo * ld : p; };
   T* gNorm = scratch<T>("dt.gNorm", (size_t)n * ldn);
   T* gRaw = scratch<T>("dt.gRaw", (size_t)n * ldr);
-  {
+  if (held) {
     T* cn = scratch<T>("dt.cn", (size_t)n * Ca);
     T* condT = scratch<T>("dt.condT", (size_t)n * Ca);
-    layerNormPlainOnesK<T><<<(unsigned)((n + 7) / 8), 256, 0, STREAM>>>(cond, cn, condT, n, Cc, Ca);
-    linear<T, T>(ADA_RAW ? condT : cn, gNorm, n, Ca, ldn, tc.wNorm);      // (chai: the raw conditioning)
-    linear<T, T>(condT, gRaw, n, Ca, ldr, tc.wRaw);
+    layerNormPlainOnesK<T><<<(unsigned)((held + 7) / 8), 256, 0, STREAM>>>(at(cond, Cc), at(cn, Ca), at(condT, Ca), held, Cc, Ca);
+    linear<T, T>(ADA_RAW ? at(condT, Ca) : at(cn, Ca), at(gNorm, ldn), held, Ca, ldn, tc.wNorm);      // (chai: the raw conditioning)
+    linear<T, T>(at(condT, Ca), at(gRaw, ldr), held, Ca, ldr, tc.wRaw);
   }
   // the key mask once per sample (the flash kernel reads it per row of its batch)
   const float* maskRows = mask;
@@ -912,8 +947,14 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     maskRows = mr;
   }
   size_t prows = std::is_same_v<T, half> ? padRows16(rows) : rows;   // the fast path's GEMM rows
+  const size_t grows = tok ? (size_t)(thi - tlo) : prows;              // ...this rank's
+  const int krows = tok ? held : (int)rows;                            // the row-wise kernels' rows
   T* x = scratch<T>("dt.x", prows * C);
-  T* qkvg = scratch<T>("dt.qkvg", (prows + 128) * 4 * Wd);
+  // (split tokens: two shared qkvg buffers, block b's in b % 2 - a peer still reading block b's k and v when this rank
+  // writes block b + 1's touches the other, and block b + 2's waits behind block b + 1's fence)
+  mg::Shared* qS[2] = { nullptr, nullptr };
+  if (tok) for (int k = 0; k < 2; ++k) qS[k] = &mg::shared("sh.dt.qkvg" + std::to_string(k), (prows + 128) * 4 * Wd * sizeof(T));
+  T* qkvg = tok ? (T*)qS[0]->local : scratch<T>("dt.qkvg", (prows + 128) * 4 * Wd);
   // (the precise path's alone: the f16 path's flash kernel holds no [heads, n, n] logits)
   float* logits = std::is_same_v<T, half> ? nullptr : scratch<float>("dt.logits", (size_t)heads * pairs);
   T* P = std::is_same_v<T, half> ? nullptr : scratch<T>("dt.P", (size_t)heads * pairs);
@@ -930,6 +971,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   T* proj = scratch<T>("dt.proj", prows * C);
   zeroOnce(x, prows * C * sizeof(T)); zeroOnce(o, prows * Wd * sizeof(T));
   zeroOnce(tn, prows * C * sizeof(T)); zeroOnce(gated, prows * I * sizeof(T));
+  if (tok) for (int k = 0; k < 2; ++k) zeroOnce(qS[k]->local, (prows + 128) * 4 * Wd * sizeof(T));
 
   // rf3's block wiring: the transition reads the block's INPUT (both still add to act)
   bool noResidual = M.flag(Tn + ".noResidual");
@@ -941,14 +983,23 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     const T* g = gNorm + (size_t)b * 4 * C; const T* z = gRaw + (size_t)b * 2 * C;
     // the previous block's transition residual, fused with this block's first adaptive LN
     const T* zPrev = b > 0 ? gRaw + (size_t)(b - 1) * 2 * C + C : nullptr;
-    gatedAddAdaLn<T>(act, b > 0 ? proj : nullptr, zPrev, ldr, g, g + C, ldn, x, (int)rows, C, n);
+    if (tok) qkvg = (T*)qS[b % 2]->local;
+    if (krows) gatedAddAdaLn<T>(at(act, C), b > 0 ? at(proj, C) : nullptr, zPrev ? at(zPrev, ldr) : nullptr, ldr, at(g, ldn),
+                                at(g + C, ldn), ldn, at(x, C), krows, C, n);
     if (noResidual) CK(cudaMemcpyAsync(pre, act, rows * C * 4, cudaMemcpyDeviceToDevice, STREAM));
-    { std::string wq = qkvgWeight(B, C, Wd, false); linear<T, T>(x, qkvg, prows, C, 4 * Wd, wq); }
+    { std::string wq = qkvgWeight(B, C, Wd, false); if (grows) linear<T, T>(at(x, C), at(qkvg, 4 * Wd), grows, C, 4 * Wd, wq); }
     bool kqNorm = hasW(B + ".queryLayerNormScale");
-    if (kqNorm) {
-      addQBiasTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), (int)rows, Wd);
-      kqNormK<T><<<(unsigned)rows, 256, 0, STREAM>>>(qkvg, W(B + ".queryLayerNormScale"), W(B + ".queryLayerNormOffset"),
+    if (kqNorm && krows) {
+      addQBiasTK<T><<<blocks((size_t)krows * Wd), 256, 0, STREAM>>>(at(qkvg, 4 * Wd), W(B + ".qBias"), krows, Wd);
+      kqNormK<T><<<(unsigned)krows, 256, 0, STREAM>>>(at(qkvg, 4 * Wd), W(B + ".queryLayerNormScale"), W(B + ".queryLayerNormOffset"),
                                                     W(B + ".keyLayerNormScale"), W(B + ".keyLayerNormOffset"), Wd);
+    }
+    if (tok) {                  // every other rank's k and v of this block
+      mg::fence();
+      PeerRows pr{}; pr.world = mg::WORLD; pr.rank = mg::RANK;
+      for (int r = 0; r < mg::WORLD; ++r) { int a, e; sh::rowsOf(n, r, a, e); pr.lo[r] = a; pr.p[r] = (const half*)qS[b % 2]->peer[r]; }
+      if constexpr (std::is_same_v<T, half>)
+        gatherKvK<<<blocks((size_t)n * (2 * Wd / 8)), 256, 0, STREAM>>>(pr, qkvg, n, Wd);
     }
     if constexpr (std::is_same_v<T, half>) {
       // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate;
@@ -959,7 +1010,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
         flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, MASK_ALL_ONES ? nullptr : maskRows, o, n, heads, D, 0, NS, false,
                         1.f / sqrtf((float)D), kqNorm ? nullptr : W(B + ".qBias"));
       FLASH_QLO = FLASH_QHI = FLASH_BIAS_ROWS = 0;
-      if (shardedQ) {           // every rank's query rows of o, each sample's
+      if (shardedQ && !tok) {   // every rank's query rows of o, each sample's
         mg::fence();
         for (int r = 0; r < mg::WORLD; ++r) {
           if (r == mg::RANK) continue;
@@ -983,21 +1034,34 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       gateTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(o, qkvg, (int)rows, Wd);
     }
     // (chai has no gating query: its zero weights gate by exactly 0.5, undone here)
-    linear<T, T>(o, att, prows, Wd, C, B + ".Transition2", false, 0.f, ADA_RAW ? 2.f : 1.f);
+    if (grows) linear<T, T>(at(o, Wd), at(att, C), grows, Wd, C, B + ".Transition2", false, 0.f, ADA_RAW ? 2.f : 1.f);
     if (noResidual) {
+      if (tok) { fprintf(stderr, "split diffusion tokens: not rf3's block wiring\n"); exit(1); }
       gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, (T*)nullptr, (int)rows, C, n);
       gatedAddAdaLn<T>(pre, (const T*)nullptr, (const T*)nullptr, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
-    } else {
-      gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
+    } else if (krows) {
+      gatedAddAdaLn<T>(at(act, C), at(att, C), at(z, ldr), ldr, at(g + 2 * C, ldn), at(g + 3 * C, ldn), ldn, at(tn, C), krows, C, n);
     }
     bool up; std::string w1 = upGatedTransition1(B, C, I, up);
-    linear<T, T>(tn, wide, prows, C, up ? 3 * I : 2 * I, w1);
-    swiglu<T>(wide, gated, rows, I, up);
-    linear<T, T>(gated, proj, prows, I, C, B + ".ffwTransition2");
+    if (grows) {
+      linear<T, T>(at(tn, C), at(wide, (size_t)(up ? 3 : 2) * I), grows, C, up ? 3 * I : 2 * I, w1);
+      swiglu<T>(at(wide, (size_t)(up ? 3 : 2) * I), at(gated, I), krows, I, up);
+      linear<T, T>(at(gated, I), at(proj, C), grows, I, C, B + ".ffwTransition2");
+    }
   }
   // the last block's transition residual
-  addGatedStridedK<T><<<blocks(rows * C), 256, 0, STREAM>>>(act, proj, gRaw + (size_t)(tc.nblocks - 1) * 2 * C + C, ldr,
-                                                         rows, C, n);
+  if (krows)
+    addGatedStridedK<T><<<blocks((size_t)krows * C), 256, 0, STREAM>>>(at(act, C), at(proj, C), at(gRaw + (size_t)(tc.nblocks - 1) * 2 * C + C, ldr),
+                                                                      ldr, krows, C, n);
+  if (tok) {                    // every rank's rows of the output, for the decoder
+    mg::Shared& aS = mg::shared("sh.dt.act", (size_t)n * C * 4);
+    if (held) CK(cudaMemcpyAsync((float*)aS.local + (size_t)tlo * C, act + (size_t)tlo * C, (size_t)held * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    mg::fence();
+    PeerAct pa{}; pa.world = mg::WORLD; pa.rank = mg::RANK;
+    for (int r = 0; r < mg::WORLD; ++r) { int a, e; sh::rowsOf(n, r, a, e); pa.lo[r] = a; pa.p[r] = (const float*)aS.peer[r]; }
+    gatherActK<<<blocks((size_t)n * (C / 4)), 256, 0, STREAM>>>(pa, act, n, C);
+    mg::fence();                // (no rank rewrites its rows before every other has read them)
+  }
 }
 
 // ---------------------------------------------------------------- the decoder

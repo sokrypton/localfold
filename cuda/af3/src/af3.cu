@@ -357,11 +357,14 @@ static int foldMain(int argc, char** argv) {
     targetFeat.assign(M.f("oracle.trunk.stages.target_feat"), M.f("oracle.trunk.stages.target_feat") + (size_t)tokens * tfWidth);
   if (!(mg::WORLD > 1 && sh::ON) && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
                 doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
-  // several GPUs on a sharded pair: where the whole fold would fit one of them (asked before anything is allocated, so
-  // every rank answers alike), the diffusion and the confidence head run on rank 0 alone - their sharded forms meet
-  // at every block of every step, which costs more than it saves on a fold that fits
-  // (LOCALFOLD_MG_SHARD_DIFFUSION=1: the sharded diffusion even so - its check on a fold that fits)
-  const bool oneCardPast = mg::WORLD > 1 && sh::ON && !getenv("LOCALFOLD_MG_SHARD_DIFFUSION") &&
+  // several GPUs on a sharded pair: the diffusion runs whole on every rank (oneCardPast) where the fold would fit one
+  // of them (asked before anything is allocated, so every rank answers alike) AND it is short or batches several
+  // samples; else sharded - its tokens split over the ranks with one sample (diffusionTransformer), which on fences
+  // that stay on the device costs a block one exchange of k and v: a simulated rank of 8 runs 2,964 tokens' 25 steps
+  // in 207 ms against 525 whole. (LOCALFOLD_MG_SHARD_DIFFUSION=1 or 0 forces either.)
+  const char* shardDiff = getenv("LOCALFOLD_MG_SHARD_DIFFUSION");
+  const bool oneSample = seedList.size() * samples == 1;
+  const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 1024 || !oneSample) &&
     foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true);
   t = makeTrunk(targetFeat.data(), msaCap, doFold && fast);
   if (mg::WORLD > 1) {
