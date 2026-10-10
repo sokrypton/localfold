@@ -43,7 +43,7 @@ struct Diffusion {
   // the transformer's conditioning for upcoming noise levels, batched (conditioningAhead): the sampler's plan of
   // levels, the levels held and their two GEMMs' outputs, slot k at k pn rows
   std::vector<float> plan; size_t planAt = 0;
-  std::vector<float> held; float *heldNorm = nullptr, *heldRaw = nullptr;
+  std::vector<float> held; float *heldNorm = nullptr, *heldRaw = nullptr, *heldSingle = nullptr;
 };
 static Diffusion D;
 
@@ -148,6 +148,32 @@ static float* singleConditioning(float level) {
   return single;
 }
 
+// singleConditioning for K levels at once: the K noise projections added to K copies of the base, then the
+// transitions and the final norm - row-wise - over all K n rows (at a short n those were K launches of 68-row work)
+static void singleConditioningBatch(const float* levels, size_t K, float* out) {
+  const std::string P = "diffusion.conditioning";
+  int n = D.n, Cs = metaI(P + ".seqChannels");
+  size_t nc = lenW(P + ".fourierWeight");
+  float* e = scratch<float>("dc.emb", nc);
+  float* en = scratch<float>("dc.embn", nc);
+  float* projs = scratch<float>("dc.noiseprojK", K * Cs);
+  for (size_t k = 0; k < K; ++k) {
+    run1d("af3_fourier", nc, FourierArgs{W(P + ".fourierWeight"), W(P + ".fourierBias"), e, (uint)nc, levels[k]});
+    ln(e, en, 1, (int)nc, P + ".noiseEmbeddingInitialNormScale", P + ".noiseEmbeddingInitialNormOffset");
+    lin(en, P + ".noiseEmbeddingInitialProjection", projs + k * Cs, 1, (int)nc, Cs);
+  }
+  for (size_t k = 0; k < K; ++k) {
+    copy(out + k * n * Cs, D.singleBase, (size_t)n * Cs * 4);
+    addBias(out + k * n * Cs, projs + k * Cs, n, Cs);
+  }
+  for (int t = 0; t < 2; ++t) plainTransition(out, K * n, Cs, P + ".singleTransitions." + num(t));
+  if (hasW(P + ".singleCondFinalNormScale")) {
+    float* tmp = scratch<float>("dc.sfnormK", K * n * Cs);
+    ln(out, tmp, K * n, Cs, P + ".singleCondFinalNormScale", P + ".singleCondFinalNormOffset");
+    copy(out, tmp, K * n * Cs * 4);
+  }
+}
+
 // ---------------------------------------------------------------- the token transformer
 static std::string blockName(int b) {
   return "diffusion.transformer.superBlocks." + num(b / D.perSuper) + ".blocks." + num(b % D.perSuper);
@@ -229,15 +255,17 @@ static void conditioningAhead(float level) {
   const int n = D.n, Cc = metaI(Tn + ".condChannels");
   const size_t pn = ((size_t)n + 15) / 16 * 16, per = pn * (D.ldn + D.ldr) * 4;
   const size_t K = std::min<size_t>({16, ((size_t)256 << 20) / per, D.plan.size() - D.planAt});
-  if (pn > 128 || K < 2) return;
+  if (pn > 128 || K < 2 || metaI("diffusion.conditioning.seqChannels") != Cc) return;
   D.held.assign(D.plan.begin() + D.planAt, D.plan.begin() + D.planAt + K);
   D.heldNorm = scratch<float>("dt.heldNorm", K * pn * D.ldn);
   D.heldRaw = scratch<float>("dt.heldRaw", K * pn * D.ldr);
+  D.heldSingle = scratch<float>("dt.heldSingle", K * n * Cc);
   half* cn = scratch<half>("dt.heldCn", K * pn * Cc);
   half* ch = scratch<half>("dt.heldCh", K * pn * Cc);
   if (pn != (size_t)n) { fill(cn, 0, K * pn * Cc * 2); fill(ch, 0, K * pn * Cc * 2); }
+  singleConditioningBatch(D.held.data(), K, D.heldSingle);      // (the denoiser reads its slot too: heldSingleFor)
   for (size_t k = 0; k < K; ++k) {
-    const float* cond = singleConditioning(D.held[k]);
+    const float* cond = D.heldSingle + k * n * Cc;
     layerNorm(cond, cn + k * pn * Cc, n, Cc, nullptr, nullptr);
     toHalf(cond, ch + k * pn * Cc, (size_t)n * Cc);
   }
@@ -397,7 +425,9 @@ static float* denoise(const float* x, float level) {
   size_t atoms = (size_t)n * dense, total = atoms * NS;
   float d = level * level + 256.f, skip = 256.f / d, outS = level * 16.f / sqrtf(d), in = 1.f / sqrtf(d);
   conditioningAhead(level);
-  float* single = singleConditioning(level);
+  auto heldAt = std::find(D.held.begin(), D.held.end(), level);
+  float* single = heldAt != D.held.end() ? D.heldSingle + (size_t)(heldAt - D.held.begin()) * n * metaI("diffusion.conditioning.seqChannels")
+                                         : singleConditioning(level);
   stage("conditioning");
   const float* atomMask = M.f("batch.refMask");
   float* scaled = scratch<float>("dn.scaled", total * 3);
