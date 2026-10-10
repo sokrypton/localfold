@@ -113,9 +113,10 @@ kernel void af2_opm_permute(LF_ARGS(OpmPermuteArgs)) {
   ulong t = LF_INDEX;
   uint O8 = a.O / 8;
   if (t >= (ulong)a.bi * a.L * a.O * O8) return;
-  ulong r = t / O8; uint e8 = (uint)(t - r * O8);
-  uint c = (uint)(r % a.O); r /= a.O;
-  uint j = (uint)(r % a.L), i = (uint)(r / a.L);
+  // (32-bit division - the host's block keeps t under 2^32 - the 64-bit one held this to ~16 GB/s)
+  uint r = lf_udiv((uint)t, O8), e8 = (uint)t - r * O8;
+  uint r2 = lf_udiv(r, a.O), c = r - r2 * a.O;
+  uint i = lf_udiv(r2, a.L), j = r2 - i * a.L;
   ((device uint4*)a.X)[t] = ((device const uint4*)a.Pm)[(((ulong)i * a.O + c) * ((ulong)a.L * a.O) + (ulong)j * a.O) / 8 + e8];
 }
 // pair[i][j] += (bias + Y) / (1e-3 + norm[i][j]), rows i0..
@@ -129,8 +130,11 @@ kernel void af2_opm_add(LF_ARGS(OpmAddArgs)) {
 // lt [s][i][c] -> [i][c][s] (scaled): the shallow outer product's left operand
 kernel void af2_opm_left(LF_ARGS(OpmLeftArgs)) {
   ulong t = LF_INDEX;
-  if (t >= (ulong)a.S * a.L * a.O) return;
-  uint s = (uint)(t % a.S); ulong r = t / a.S; uint c = (uint)(r % a.O), i = (uint)(r / a.O);
+  const ulong total = (ulong)a.S * a.L * a.O;
+  if (t >= total) return;
+  uint s, c, i;      // (32-bit division where the index fits: the 64-bit one is slow)
+  if (total <= 0xffffffffull) { uint r = lf_udiv((uint)t, a.S); s = (uint)t - r * a.S; i = lf_udiv(r, a.O); c = r - i * a.O; }
+  else { s = (uint)(t % a.S); ulong r = t / a.S; c = (uint)(r % a.O); i = (uint)(r / a.O); }
   a.out[t] = (half)((float)a.lt[((ulong)s * a.L + i) * a.O + c] * a.scale);
 }
 kernel void af2_tile_bias(LF_ARGS(TileBiasArgs)) {      // [L][C] of bias[c] scale
