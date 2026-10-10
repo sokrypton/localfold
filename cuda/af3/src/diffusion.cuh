@@ -3,6 +3,7 @@
 // and diffusion-sampler.js.
 #pragma once
 #include "atom.cuh"
+#include "sharded.cuh"
 
 constexpr float SIGMA_DATA = 16.f;
 
@@ -197,8 +198,11 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
     const __nv_bfloat16* dev16 = rows16 && trunkPair ? reinterpret_cast<const __nv_bfloat16*>(trunkPair) : nullptr;
     float* trunkRows = fromHost || rows16 ? scratch<float>("dc.trunkRows", per * Czt) : nullptr;
     __nv_bfloat16* stage16 = rows16 && fromHost ? scratch<__nv_bfloat16>("dc.trunkRows16", per * Czt) : nullptr;
-    for (size_t p0 = 0; p0 < pairs; p0 += per) {
-      size_t r = std::min(per, pairs - p0);
+    // (several GPUs on a sharded pair: this rank's rows only, sh::DLO..; streamed, off the bf16 slab's base)
+    const size_t pBeg = sh::DLO >= 0 ? (size_t)sh::DLO * n : 0, pEnd = sh::DLO >= 0 ? pBeg + (size_t)sh::DROWS * n : pairs;
+    if (sh::DLO >= 0 && !rows16) { fprintf(stderr, "a sharded pair's conditioning is streamed off its bf16 rows\n"); exit(1); }
+    for (size_t p0 = pBeg; p0 < pEnd; p0 += per) {
+      size_t r = std::min(per, pEnd - p0);
       if (rows16) {
         const __nv_bfloat16* src = dev16 ? dev16 + p0 * Czt : stage16;
         if (!dev16) CK(cudaMemcpyAsync(stage16, reinterpret_cast<const __nv_bfloat16*>(PARK_HOST) + p0 * Czt, r * Czt * 2,
@@ -602,7 +606,9 @@ __global__ void flatToBiasHalfK(const float* flat, half* out, int block, int nbl
 // blocks' heads) read whole through a 32-row tile, each block's [h][i][stride] written 32 columns a warp - where a thread
 // an output read one float of a 256-byte row, a launch a block (173 of a step's ~213 ms at 2,964 tokens streamed)
 struct SuperBias { half* p[8]; };
-__global__ void flatToBiasSuperK(const float* __restrict__ flat, SuperBias out, int ps, int heads, int n, int stride, int i0) {
+__global__ void flatToBiasSuperK(const float* __restrict__ flat, SuperBias out, int ps, int heads, int n, int stride, int i0,
+                                 int planeRows = 0) {
+  // planeRows: the rows a head's plane holds (0: n) - a sharded pair's held query rows
   extern __shared__ float tileS[];                  // [32][ps * heads + 1]
   const int PH = ps * heads, LD = PH + 1, ii = blockIdx.y, j0 = blockIdx.x * 32;
   for (int t = threadIdx.x; t < 32 * PH; t += blockDim.x) {
@@ -615,7 +621,7 @@ __global__ void flatToBiasSuperK(const float* __restrict__ flat, SuperBias out, 
     if (j >= stride) continue;
     int b = c / heads, h = c % heads;
     if (!out.p[b]) continue;
-    out.p[b][((size_t)h * n + i0 + ii) * stride + j] = __float2half(tileS[jj * LD + c] * LOG2E);
+    out.p[b][((size_t)h * (planeRows ? planeRows : n) + i0 + ii) * stride + j] = __float2half(tileS[jj * LD + c] * LOG2E);
   }
 }
 // the projection and the layout in one kernel (CZ input channels, O = ps * heads outputs): 64 consecutive pairs of row
@@ -624,7 +630,7 @@ __global__ void flatToBiasSuperK(const float* __restrict__ flat, SuperBias out, 
 // projection and flatToBiasSuperK moved 42.7 GB a super block at 6,916 tokens, this 18.3)
 template <int CZ, int O>
 __global__ void __launch_bounds__(128) pairBiasSuperK(const half* __restrict__ pn, const half* __restrict__ Wt, SuperBias out,
-                                                      int heads, int n, int stride, int i0) {
+                                                      int heads, int n, int stride, int i0, int planeRows = 0) {
   constexpr int LDA = CZ + 8, LDW = O + 8, LDO = 64 + 8, KS = CZ / 16, NT = O / 8;
   static_assert(CZ % 16 == 0 && O % 16 == 0, "whole MMA tiles");
   extern __shared__ __align__(16) unsigned char smem[];
@@ -666,7 +672,8 @@ __global__ void __launch_bounds__(128) pairBiasSuperK(const half* __restrict__ p
     int o = t / 8, c = (t % 8) * 8, j = j0 + c;
     int b = o / heads, h = o % heads;
     if (j >= stride || !out.p[b]) continue;
-    *reinterpret_cast<uint4*>(out.p[b] + ((size_t)h * n + i0 + ii) * stride + j) = *reinterpret_cast<const uint4*>(Os + o * LDO + c);
+    *reinterpret_cast<uint4*>(out.p[b] + ((size_t)h * (planeRows ? planeRows : n) + i0 + ii) * stride + j) =
+      *reinterpret_cast<const uint4*>(Os + o * LDO + c);
   }
 }
 // layerNormSlowK into f16, no offset: the two-pass variance, the module's convention
@@ -760,13 +767,14 @@ inline void prepareTransformer(const float* pairCond, int n) {
     // block's biases did not fit, so all six super blocks were remade at every step (diffusion 4.2 s at 3,000
     // tokens, 75.6 s at 4,000)
     const int nSB = (tc.nblocks + perSuper - 1) / perSuper;
-    const size_t sbBytes = (size_t)perSuper * heads * n * tc.stride * 2, pnBytes = given ? 0 : pairs * Cz * 2;
+    const int heldRows = sh::DLO >= 0 ? sh::DROWS : n;
+    const size_t sbBytes = (size_t)perSuper * heads * heldRows * tc.stride * 2, pnBytes = given ? 0 : pairs * Cz * 2;
     size_t held = 0;
     // (what is held counts toward what is needed only for what the need includes: a streamed preparation's pn16 is
     // handed in, not part of the need, and counting it admitted 12.2 GB of biases that did not fit at 6,916 tokens)
     for (auto& [k, v] : SCRATCH) if (!k.compare(0, 5, "dt.bh") || (!given && k == "dt.pn16")) held += v.second;
     auto fits = [&](size_t need) { return roomFor(need > held ? need - held : 0); };
-    int kept = fits((size_t)tc.nblocks * heads * n * tc.stride * 2) ? nSB : 0;
+    int kept = fits((size_t)tc.nblocks * heads * heldRows * tc.stride * 2) ? nSB : 0;
     if (kept < nSB) while (kept + 1 < nSB && fits((size_t)(kept + 2) * sbBytes + pnBytes)) ++kept;   // kept + the shared set
     bool lazy = kept < nSB;
     if (given || lazy) {
@@ -785,9 +793,10 @@ inline void prepareTransformer(const float* pairCond, int n) {
       tc.perSuper = perSuper; tc.heads = heads; tc.Cz = Cz;
       tc.pairLogits.assign(tc.nblocks, nullptr);
       tc.biasHalf.assign(tc.nblocks, nullptr);
+      const int rowsB = sh::DLO >= 0 ? sh::DROWS : n;            // (a sharded pair: this rank's query rows)
       for (int b = 0; b < tc.nblocks; ++b)
         tc.biasHalf[b] = scratch<half>(b / perSuper < kept ? "dt.bh" + std::to_string(b) : "dt.bhL" + std::to_string(b % perSuper),
-                                       (size_t)heads * n * tc.stride);
+                                       (size_t)heads * std::max(rowsB, 1) * tc.stride);
       tc.n = n; tc.ready = true; tc.kept = kept;
       for (int sb = 0; sb < kept; ++sb) refreshSuperBlockBias(sb, n);    // the kept super blocks' biases now
       if (!lazy) { releaseScratch({ "dt.pn16" }); tc.pn16 = nullptr; }  // every one kept: the f16 pair given back
@@ -854,20 +863,24 @@ inline void refreshSuperBlockBias(int sb, int n) {
   SuperBias sp{};
   if (ps > 8) { fprintf(stderr, "a super block of %d blocks (8 at most)\n", ps); exit(1); }
   for (int b = sb * ps; b < (sb + 1) * ps; ++b) sp.p[b % ps] = b < tc.nblocks ? tc.biasHalf[b] : nullptr;
+  // (several GPUs on a sharded pair: this rank's query rows, pn16 holding them from 0, each plane rowsB high)
+  const int rowsB = sh::DLO >= 0 ? sh::DROWS : n;
   if (Cz == 128 && ps * heads == 64 && tc.stride % 8 == 0) {   // (AF3's: 128 channels, 4 blocks of 16 heads)
     constexpr int smem = (64 * (128 + 8) + 128 * (64 + 8)) * 2;
-    pairBiasSuperK<128, 64><<<dim3((unsigned)((tc.stride + 63) / 64), (unsigned)n), 128, smem, STREAM>>>(tc.pn16, Wh(w), sp, heads, n, tc.stride, 0);
+    if (rowsB) pairBiasSuperK<128, 64><<<dim3((unsigned)((tc.stride + 63) / 64), (unsigned)rowsB), 128, smem, STREAM>>>(
+                 tc.pn16, Wh(w), sp, heads, n, tc.stride, 0, rowsB);
     return;
   }
   float* flatc = scratch<float>("dt.flat", (size_t)ri * n * ps * heads);
-  for (int i0 = 0; i0 < n; i0 += ri) {
-    int r = std::min(ri, n - i0); size_t rows = (size_t)r * n;
+  for (int i0 = 0; i0 < rowsB; i0 += ri) {
+    int r = std::min(ri, rowsB - i0); size_t rows = (size_t)r * n;
     linear<half, float>(tc.pn16 + (size_t)i0 * n * Cz, flatc, rows, Cz, ps * heads, w);
     // (a last super block short of ps blocks: its missing blocks' heads are computed and not stored)
     const int smem = 32 * (ps * heads + 1) * 4;
     static int granted = 0;
     if (smem > 48 * 1024 && smem > granted) { smemAttr(flatToBiasSuperK, smem); granted = smem; }
-    flatToBiasSuperK<<<dim3((unsigned)((tc.stride + 31) / 32), (unsigned)r), 256, smem, STREAM>>>(flatc, sp, ps, heads, n, tc.stride, i0);
+    flatToBiasSuperK<<<dim3((unsigned)((tc.stride + 31) / 32), (unsigned)r), 256, smem, STREAM>>>(flatc, sp, ps, heads, n, tc.stride, i0,
+                                                                                               rowsB);
   }
 }
 template <class T>
@@ -904,7 +917,11 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   // (the precise path's alone: the f16 path's flash kernel holds no [heads, n, n] logits)
   float* logits = std::is_same_v<T, half> ? nullptr : scratch<float>("dt.logits", (size_t)heads * pairs);
   T* P = std::is_same_v<T, half> ? nullptr : scratch<T>("dt.P", (size_t)heads * pairs);
-  T* o = scratch<T>("dt.o", prows * Wd);
+  // (several GPUs on a sharded pair: o shared, each rank's query rows all-gathered - sized for ten samples, the batch's most)
+  const bool shardedQ = sh::DLO >= 0;
+  if (shardedQ && (NS > 10 || !std::is_same_v<T, half>)) { fprintf(stderr, "a sharded pair's token attention: the f16 path, ten samples at most\n"); exit(1); }
+  mg::Shared* oS = shardedQ ? &mg::shared("sh.dt.o", (std::is_same_v<T, half> ? padRows16((size_t)n * 10) : (size_t)n * 10) * Wd * sizeof(T)) : nullptr;
+  T* o = shardedQ ? (T*)oS->local : scratch<T>("dt.o", prows * Wd);
   T* att = scratch<T>("dt.att", prows * C);
   T* tn = scratch<T>("dt.tn", prows * C);
   int I = C * factor;
@@ -937,8 +954,22 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate;
       // the samples are its batch rows, the pair bias shared
       if (tc.pn16 && b % perSuper == 0 && b / perSuper >= tc.kept) refreshSuperBlockBias(b / perSuper, n);
-      flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, MASK_ALL_ONES ? nullptr : maskRows, o, n, heads, D, 0, NS, false,
-                      1.f / sqrtf((float)D), kqNorm ? nullptr : W(B + ".qBias"));
+      if (shardedQ) { FLASH_QLO = sh::DLO; FLASH_QHI = sh::DLO + sh::DROWS; FLASH_BIAS_ROWS = sh::DROWS; }
+      if (!shardedQ || sh::DROWS)
+        flashGrid<half>(qkvg, tc.biasHalf[b], tc.stride, MASK_ALL_ONES ? nullptr : maskRows, o, n, heads, D, 0, NS, false,
+                        1.f / sqrtf((float)D), kqNorm ? nullptr : W(B + ".qBias"));
+      FLASH_QLO = FLASH_QHI = FLASH_BIAS_ROWS = 0;
+      if (shardedQ) {           // every rank's query rows of o, each sample's
+        mg::fence();
+        for (int r = 0; r < mg::WORLD; ++r) {
+          if (r == mg::RANK) continue;
+          int rlo, rhi; sh::rowsOf(n, r, rlo, rhi); const int rn = sh::storedRows(n, r);
+          if (!rn) continue;
+          CK(cudaMemcpy2DAsync(o + (size_t)rlo * Wd, (size_t)n * Wd * sizeof(T), (const T*)oS->peer[r] + (size_t)rlo * Wd,
+                               (size_t)n * Wd * sizeof(T), (size_t)rn * Wd * sizeof(T), NS, cudaMemcpyDefault, STREAM));
+        }
+        mg::fence();
+      }
     } else {
       if (!kqNorm) addQBiasTK<T><<<blocks(rows * Wd), 256, 0, STREAM>>>(qkvg, W(B + ".qBias"), (int)rows, Wd);
       for (int k = 0; k < NS; ++k) {               // the precise path one sample at a time
@@ -1132,22 +1163,34 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
   const std::string Pc = "diffusion.conditioning", E = "diffusion.encoder", T = "diffusion.transformer";
   int Cz = (int)M.meta(Pc + ".pairChannels");
   size_t pairs = (size_t)n * n;
-  if (DIFF_HALF && shortPair(pairs, Cz) && hasW(E + ".embedTrunkPairCond")) {
+  const bool shardedPair = sh::DLO >= 0;
+  if (shardedPair && !(DIFF_HALF && hasW(E + ".embedTrunkPairCond"))) {
+    fprintf(stderr, "a sharded pair's diffusion streams its conditioning (the f16 path, an encoder taking the pair)\n"); exit(1);
+  }
+  if (DIFF_HALF && (shortPair(pairs, Cz) || shardedPair) && hasW(E + ".embedTrunkPairCond")) {
     // a card short of room: the conditioning pair streamed - each chunk of rows straight into the
     // encoder's pair projection and the transformer's f16 LayerNorm'd pair, never the f32 pair whole
     // (9 GB at 4192 tokens, beside the trunk's)
     int Cp = (int)M.meta(E + ".pairChannels");
-    float* tp = scratch<float>("enc.tp", pairs * Cp);
-    half* pn16 = scratch<half>("dt.pn16", pairs * Cz);
+    // (several GPUs on a sharded pair: tp whole on every rank - the atom windows read arbitrary token pairs - its rows
+    // made here and the rest all-gathered; pn16 only this rank's rows, from which its query rows' biases are made)
+    mg::Shared* tpS = shardedPair ? &mg::shared("sh.enc.tp", pairs * Cp * 4) : nullptr;
+    float* tp = shardedPair ? (float*)tpS->local : scratch<float>("enc.tp", pairs * Cp);
+    const size_t pnFirst = shardedPair ? (size_t)sh::DLO * n : 0;
+    half* pn16 = scratch<half>("dt.pn16", (shardedPair ? std::max<size_t>((size_t)sh::DROWS * n, 1) : pairs) * Cz);
     PAIR_CHUNK_SINK = [&](const float* chunk, size_t p0, size_t r) {
       float* ln = scratch<float>("enc.tpln", r * Cz);
       layerNormSlow(chunk, ln, r, Cz, W(E + ".lnormTrunkPairCondScale"), Wopt(E + ".lnormTrunkPairCondOffset"));
       linear<float, float>(ln, tp + p0 * Cp, r, Cz, Cp, E + ".embedTrunkPairCond");
-      layerNormSlowHalfK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(chunk, pn16 + p0 * Cz, r, Cz,
+      layerNormSlowHalfK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(chunk, pn16 + (p0 - pnFirst) * Cz, r, Cz,
                                                                       W(T + ".pairInputLayerNormScale"));
     };
     diffusionConditioning(trunkSingle, trunkPair, targetFeat, SIGMA_DATA, n);
     PAIR_CHUNK_SINK = nullptr;
+    if (shardedPair)            // every rank's rows of tp
+      mg::gather(*tpS, tp, [&](int r) { return r == mg::RANK ? (size_t)0 : (size_t)sh::storedRows(n, r) * n * Cp * 4; },
+                 [&](int r) { int a, b; sh::rowsOf(n, r, a, b); return (size_t)a * n * Cp * 4; },
+                 [&](int r) { int a, b; sh::rowsOf(n, r, a, b); return (size_t)a * n * Cp * 4; });
     // the chunk loop's working rows given back before the encoder and decoder prepare beside tp and pn16
     // (0.9 GB at 1530 tokens, which is what they ran out of)
     releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.trunkRows", "dc.trunkRows16", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj",

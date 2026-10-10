@@ -1394,13 +1394,19 @@ holds only its rows (shares of the 16-padded length), through the embedding (in-
 attention for held tokens, then the MSA's columns all-gathered) and every pairformer block (sharded.cuh: the triangle
 outgoing against an all-gathered `b`, the incoming as the outgoing form on z^T, row attention with an all-gathered
 bias, column attention as row attention on z^T with the bias flipped, all-to-all transposes between; the single track
-on held query rows, its output all-gathered). After the last pass rank 0 gathers the pair and folds on alone - the
-diffusion and the confidence head are not sharded yet, so rank 0 still needs the whole pair's memory past the trunk.
+on held query rows, its output all-gathered) - and **the diffusion**: the conditioning streamed over held rows off the
+bf16 slab, the encoder's pair projection all-gathered (its atom windows read arbitrary token pairs), every block's
+token-attention bias made for held query rows only (the largest tensor of a big fold: 768 bytes a pair), and the token
+attention over held queries (flashGridHalf's query range), its output all-gathered each block; the sampler itself
+runs on every rank. After the sampler rank 0 gathers the pair for the contacts, the confidence head (not sharded yet:
+~34 GB at 10K tokens) and the files. Refused by name for now: chai-1, OpenDDE, `--frames`, `--recycle-tolerance`,
+`--save-embeddings`/`--save-distogram`, more than ten seed x sample runs, a padded (masked) token set in diffusion.
 
 Checked with the ranks sharing this one A100 (`LOCALFOLD_GPU_MAP=0,0`): phase 1 - 5CAJ self-templated 0.003 A from
 the single-GPU fold on 2 ranks (rf3 0.008); 1TIM dimer on 3 ranks, pLDDT/pTM/ipTM identical; 6MRR boltz2 0.022 A,
 intellifold2 0.007, protenix2 0.062. Phase 2 - 5CAJ self-templated 0.009 A on 2 and 3 ranks (boltz2 0.026, protenix2
-0.002, rf3 0.004); a 59-residue query with 1,024 MSA rows 0.007 A on 2 and 3. Speed is not measurable here (the ranks share one card and meet at every
+0.002, rf3 0.004); a 59-residue query with 1,024 MSA rows 0.007 A on 2 and 3; with the diffusion sharded too the
+same: 5CAJ 0.009 A on 2 and 3 ranks, boltz2 0.022, protenix2 0.002, rf3 0.009, the MSA fold 0.007. Speed is not measurable here (the ranks share one card and meet at every
 exchange); that waits on a real multi-GPU box.
 
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)

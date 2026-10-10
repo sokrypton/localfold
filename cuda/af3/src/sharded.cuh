@@ -15,6 +15,8 @@
 
 namespace sh {
 inline bool ON = getenv("LOCALFOLD_MG_SHARDED") && atoi(getenv("LOCALFOLD_MG_SHARDED"));
+// the diffusion's pair rows on this rank - the trunk's slab carried into it (DLO -1: the whole pair, one GPU)
+inline int DLO = -1, DROWS = 0;
 inline int padded(int n) { return (n + 15) / 16 * 16; }
 // rank r's rows of the pair: its share of the padded length, its stored (real) rows clipped to n
 inline void rowsOf(int n, int r, int& lo, int& hi) { mg::shareOf(padded(n), 16, r, lo, hi); }

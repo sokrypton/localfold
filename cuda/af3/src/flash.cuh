@@ -197,7 +197,10 @@ template <int D, int WARPS, bool MASKED = true, int BK = FA_BK, bool REG = false
           bool F16S = false>
 __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, const float* __restrict__ mask, half* __restrict__ out, int n, int heads, size_t r0, bool tr, float scale,
-    const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0) {
+    const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0, size_t outPosStride = 0,
+    int qlo = 0, int qhi = 0, int biasRows = 0) {
+  // [qlo, qhi): the queries this launch computes (qhi 0: all n) - several GPUs, each its own query rows; biasRows: the
+  // rows a head's bias plane holds (0: n), its first being query qlo's
   constexpr int BQ = 16 * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
   static_assert(BK % 16 == 0, "a key tile is whole k16 steps of the PV product");
   constexpr size_t STAGE = faStage<D, WARPS, BK>();
@@ -220,13 +223,14 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     else return (rl * n + i) * Wd + h * D;
   };
   const half* base = qkvg + (STRIDED ? rl * rowStride : rl * (size_t)n * W4) + h * D;
-  int q0 = blockIdx.x * BQ;
+  const int QN = qhi ? qhi : n;
+  int q0 = qlo + blockIdx.x * BQ;
   // the loads, with compile-time trip counts and 32-bit offsets: written as a strided loop from
   // threadIdx.x the compiler could not unroll it, and the per-tile index arithmetic was ~800
   // integer instructions a thread against 36 tensor-core MMAs
   constexpr int KV_CHUNKS = BK * (D / 8), B_CHUNKS = BQ * (BK / 8);
   static_assert(B_CHUNKS % NT == 0, "a bias tile is a whole number of chunks a thread");
-  const half* biasHead = bias + (size_t)h * n * biasStride;
+  const half* biasHead = bias + (size_t)h * (biasRows ? biasRows : n) * biasStride - (size_t)qlo * biasStride;
   // per-thread source pointers, advanced by a constant each tile (the bounds matter only on the
   // last tile, which the `last` flag takes through the checked path)
   constexpr int KV_PER = (KV_CHUNKS + NT - 1) / NT, B_PER = B_CHUNKS / NT;
@@ -242,8 +246,8 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
 #pragma unroll
   for (int k = 0; k < B_PER; ++k) {
     int u = k * NT + threadIdx.x, qi = u / (BK / 8), c = (u % (BK / 8)) * 8, i = q0 + qi;
-    bRow[k] = i < n; bC[k] = c; bOff[k] = qi * LDB + c;
-    bSrc[k] = biasHead + (i < n ? i : 0) * biasStride + c;
+    bRow[k] = i < QN; bC[k] = c; bOff[k] = qi * LDB + c;
+    bSrc[k] = biasHead + (i < QN ? i : qlo) * biasStride + c;
   }
   auto issue = [&](int j0, int st) {
     half *K = Kst(st), *V = Vst(st), *B = Bst(st);
@@ -304,7 +308,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   };
   int i0 = q0 + warp * 16 + g, i1 = i0 + 8;
   auto q2 = [&](int i, int e) -> uint32_t {
-    if (i >= n) return 0u;
+    if (i >= QN) return 0u;
     half2 v = *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i) : (size_t)i * W4) + e);
     float2 f = __half22float2(v);
     if (qBias) { f.x += qBias[h * D + e]; f.y += qBias[h * D + e + 1]; }   // the query's bias, folded in here
@@ -452,15 +456,15 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   half2 ga[D / 8], gb[D / 8];
   for (int et = 0; et < D / 8; ++et) {
     int e = et * 8 + tig * 2;
-    ga[et] = i0 < n ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i0) : (size_t)i0 * W4) + 3 * Wd + e) : half2{};
-    gb[et] = i1 < n ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i1) : (size_t)i1 * W4) + 3 * Wd + e) : half2{};
+    ga[et] = i0 < QN ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i0) : (size_t)i0 * W4) + 3 * Wd + e) : half2{};
+    gb[et] = i1 < QN ? *reinterpret_cast<const half2*>(base + (STRIDED ? pos(i1) : (size_t)i1 * W4) + 3 * Wd + e) : half2{};
   }
   for (int et = 0; et < D / 8; ++et) {
     int e = et * 8 + tig * 2;
     float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
-    if (i0 < n) *reinterpret_cast<half2*>(out + outAt(i0) + e) =
+    if (i0 < QN) *reinterpret_cast<half2*>(out + outAt(i0) + e) =
         __floats2half2_rn(o[et][0] / l0 * sigm(a.x), o[et][1] / l0 * sigm(a.y));
-    if (i1 < n) *reinterpret_cast<half2*>(out + outAt(i1) + e) =
+    if (i1 < QN) *reinterpret_cast<half2*>(out + outAt(i1) + e) =
         __floats2half2_rn(o[et][2] / l1 * sigm(b2.x), o[et][3] / l1 * sigm(b2.y));
   }
 }
@@ -1342,10 +1346,17 @@ inline bool flashRegStaged() {
   }();
   return v != 0;
 }
+// several GPUs on a sharded pair (the diffusion transformer's token attention): this rank's queries [FLASH_QLO,
+// FLASH_QHI), its bias planes FLASH_BIAS_ROWS rows from query FLASH_QLO; 0 - every query, the whole bias
+inline int FLASH_QLO = 0, FLASH_QHI = 0, FLASH_BIAS_ROWS = 0;
 template <int D, int WARPS, int BK = FA_BK, bool REG = false, int MINB = 1>
 void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
                       int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias) {
-  dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
+  const int qn = FLASH_QHI ? FLASH_QHI - FLASH_QLO : n;
+  dim3 grid((qn + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
+  if (FLASH_QHI && (mask || FLASH_2R && D == 32 && WARPS == 4 && BK == 48)) {
+    fprintf(stderr, "flashGridHalfRun: a query range takes the unmasked 16/48/64-wide kernel only\n"); exit(1);
+  }
   const int bytes = (REG ? 1 : 2) * faStage<D, WARPS, BK>();
   if (mask) {                    // a null mask: every key real (see MASKED)
     setFlashSmem<D, WARPS, true, BK, REG, MINB>();
@@ -1356,11 +1367,11 @@ void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const floa
   } else if (FLASH_F16S) {
     setFlashSmem<D, WARPS, false, BK, REG, MINB, true>();
     flashGridHalf<D, WARPS, false, BK, REG, MINB, false, true><<<grid, 32 * WARPS, bytes, STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, 0, 0, 0, 0, FLASH_QLO, FLASH_QHI, FLASH_BIAS_ROWS);
   } else {
     setFlashSmem<D, WARPS, false, BK, REG, MINB>();
     flashGridHalf<D, WARPS, false, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, 0, 0, 0, 0, FLASH_QLO, FLASH_QHI, FLASH_BIAS_ROWS);
   }
 }
 template <int D, int WARPS, int BK = FA_BK>
@@ -1387,7 +1398,7 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // ...and ONE row only: with the samples as rows (--samples=5) the grid kernel has the blocks it
   // lacked, and the split loses at every size measured - 11.1 against 8.2 us at 68 tokens and five
   // rows, 27.0 against 13.4 at 150, 15.7 against 8.8 at 192 and two rows (a tie at 68 and two)
-  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && rows == 1 && n <= 192 && heads * ((n + 63) / 64) < 4 * 108 &&
+  if (!FLASH_WARPS_OVERRIDE && FLASH_SPLIT && !FLASH_QHI && rows == 1 && n <= 192 && heads * ((n + 63) / 64) < 4 * 108 &&
       fitsSmem(4 * 2 * fsStage<D>())) {        // (the split's four warps' own buffers: 67 KB at D 48, past a T4's 64)
     flashSplitHalfAt<D, 4>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     return;
