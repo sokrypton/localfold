@@ -460,3 +460,14 @@ crashes on `--out=/dev/null`.
 
 Weights load before -> after: AF3 bundle 178 -> 96 ms, boltz2 ~350 -> ~200, chai1 ~480 -> ~385, AF2 0.15 -> 0.06 s,
 ESMFold2 0.26 -> 0.11 s.
+
+Near morning:
+- **27c4d94d, the triangle's output projection and gated add in one kernel** (`lf_gemm_tensor_dual`: both products
+  of a tile in two cooperative tensors, combined in registers). boltz2 5CAJ: 154 -> 126 ms a trunk pass. AF2
+  5CAJ: 4.19 -> 4.11 s. Only at C <= 128: at ESMFold2's 256 the two accumulators cost more than the round trip
+  saves. Not byte-identical, because two matmuls in one kernel round differently (CA 0.06 A); the gates pass.
+- **2f8783be**: the profile reports AF3's confidence head too.
+- **Lost: the pair transition as one fused MLP** (`lf_ffn_tensor`: SwiGLU's hidden activations staged through a 16 or
+  8 KB threadgroup tile per hidden chunk, never written to memory). 209 ms against SwiGLU 118 + transition2 77 a
+  pass. The three accumulators and two barriers a chunk cost more than the 132 MB round trip saved. The raw
+  `transition1` would also have had to stay unretired, since `prepareWeights` retires it once interleaved.
