@@ -38,6 +38,7 @@ inline bool pairStays16(int n, int C, bool fast) {
 // pair, every shared buffer given back (collectively), the other ranks gone; rank 0 folds on alone
 static void pairOntoRank0(Trunk& t) {
   const size_t row = (size_t)t.n * t.C * 2;
+  releaseScratch();                  // (what the trunk or the sampler held: the whole pair is rank 0's largest tensor)
   float* whole = mg::RANK == 0 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)t.n * t.n * t.C)) : nullptr;
   mg::fence();
   if (mg::RANK == 0)
