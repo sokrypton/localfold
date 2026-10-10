@@ -1457,14 +1457,21 @@ What came of measuring that way, each change gated against the one-GPU fold on 2
   again - their confidence heads have no sharded form, so their pair is gathered to rank 0 for it (refused up front
   where it would not fit one GPU).
 
-| simulated rank of 8 (this A100) | one GPU | rank of 8 | x |
-|---|---:|---:|---:|
-| 2,964 tokens, trunk pass | 20.76 s | 2.83 s | 7.3 |
-| 2,964 tokens, 200 steps | 4.12 s | 1.07 s | 3.9 |
-| 2,964 tokens, confidence | 1.74 s | 0.34 s | 5.1 |
-| 2,964 tokens, default fold (4 passes, 200 steps) | ~89 s | ~12.9 s | ~6.9 |
-| 5,928 tokens, trunk pass | 152.8 s (the box) | 18.3 s | 8.4 |
-| 988 tokens, default fold | 6.28 s | 1.47 s | 4.3 |
+Whole folds, one GPU against a simulated rank of 4 and of 8 (this A100; `quick` is the check's 25 steps and no
+recycles, `default` the binary's 200 steps and 3 recycles; 5,928 tokens' one-GPU time the box's):
+
+| tokens | settings | one GPU | rank of 4 | x | rank of 8 | x |
+|---:|---|---:|---:|---:|---:|---:|
+| 988 | quick | 1.61 s | 0.58 s | 2.8 | 0.38 s | 4.2 |
+| 988 | default | 6.28 s | 2.18 s | 2.9 | 1.41 s | 4.4 |
+| 2,964 | quick | 23.36 s | 6.47 s | 3.6 | 3.46 s | 6.8 |
+| 2,964 | default | 89.65 s | 24.37 s | 3.7 | 12.88 s | 7.0 |
+| 5,928 | quick | 169.4 s (box) | 41.57 s | 4.1 | 20.73 s | 8.2 |
+| 10,127 | quick | does not fit | - | - | trunk pass 86.6 s | - |
+
+Small folds stay short of N x: at 988 tokens a rank holds 124 rows and the diffusion's 24 blocks a step are launch-bound
+(200 steps 1.12 s on one GPU, 0.55 on a rank of 8); from ~3,000 tokens the trunk is 7-8x on 8 and the diffusion
+the remainder.
 
 Not seen here, and what the next box should measure: NVLink's share - the two transposes a block (2 x 7/8 of a slab,
 ~2.5 ms a block at 2,964 tokens), the triangle's pulls and pushes (overlapped with its GEMMs, which may or may not hide
