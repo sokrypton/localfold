@@ -909,6 +909,21 @@ __global__ void gatherActK(PeerAct pa, float* __restrict__ act, int n, int C) {
   if (r == pa.rank) return;
   *(float4*)(act + (size_t)row * C + v * 4) = *(const float4*)(pa.p[r] + (size_t)row * C + v * 4);
 }
+// several GPUs on a sharded pair: the diffusion's tokens split over the ranks (diffusionTransformer, denoiseCore) - one
+// sample, the f16 path, and not rf3's block wiring (its transition reads the block's input; the queries alone split there)
+inline bool splitTokens() {
+  return sh::DLO >= 0 && NS == 1 && DIFF_HALF && mg::WORLD > 1 && !M.flag("diffusion.transformer.noResidual");
+}
+// the split-token diffusion's shared buffers, made before the preparation sizes what it keeps by the room left (the
+// per-block biases it holds took the last of a 10,127-token rank's 40 GB, and the buffers asked for in the first step
+// found none)
+inline void diffusionSharedBuffers(int n) {
+  const std::string Tn = "diffusion.transformer";
+  const int C = (int)M.meta(Tn + ".channels"), Wd = (int)M.meta(Tn + ".heads") * (int)M.meta(Tn + ".dimension");
+  for (int k = 0; k < 2; ++k) mg::shared("sh.dt.qkvg" + std::to_string(k), (padRows16((size_t)n) + 128) * 4 * Wd * sizeof(half));
+  mg::shared("sh.dt.act", (size_t)n * C * 4);
+  mg::shared("sh.dn.upd", (size_t)n * (int)M.meta("batch.dense") * 3 * 4);
+}
 template <class T>
 void diffusionTransformer(float* act, const float* cond, const float* mask, int n) {
   const std::string Tn = "diffusion.transformer";
@@ -926,7 +941,7 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   // rows of the attention, gathering only every other rank's k and v a block; the output's rows gathered at the end.
   // (Before: only the attention's queries split, and the per-token GEMMs - as much time again - ran whole on every
   // rank: the transformer 1.6x faster on eight.) lo is a multiple of 16; the GEMMs take the padded share.
-  const bool tok = sh::DLO >= 0 && NS == 1 && std::is_same_v<T, half> && mg::WORLD > 1;
+  const bool tok = std::is_same_v<T, half> && splitTokens();
   int tlo = 0, thi = n; if (tok) sh::rowsOf(n, mg::RANK, tlo, thi);
   const int held = tok ? sh::DROWS : n;              // this rank's real rows
   auto at = [&](auto* p, size_t ld) { return tok ? p + (size_t)tlo * ld : p; };
@@ -961,8 +976,8 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   // (several GPUs on a sharded pair: o shared, each rank's query rows all-gathered - sized for ten samples, the batch's most)
   const bool shardedQ = sh::DLO >= 0;
   if (shardedQ && (NS > 10 || !std::is_same_v<T, half>)) { fprintf(stderr, "a sharded pair's token attention: the f16 path, ten samples at most\n"); exit(1); }
-  mg::Shared* oS = shardedQ ? &mg::shared("sh.dt.o", (std::is_same_v<T, half> ? padRows16((size_t)n * 10) : (size_t)n * 10) * Wd * sizeof(T)) : nullptr;
-  T* o = shardedQ ? (T*)oS->local : scratch<T>("dt.o", prows * Wd);
+  mg::Shared* oS = shardedQ && !tok ? &mg::shared("sh.dt.o", (std::is_same_v<T, half> ? padRows16((size_t)n * 10) : (size_t)n * 10) * Wd * sizeof(T)) : nullptr;
+  T* o = oS ? (T*)oS->local : scratch<T>("dt.o", prows * Wd);
   T* att = scratch<T>("dt.att", prows * C);
   T* tn = scratch<T>("dt.tn", prows * C);
   int I = C * factor;
@@ -1036,7 +1051,6 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
     // (chai has no gating query: its zero weights gate by exactly 0.5, undone here)
     if (grows) linear<T, T>(at(o, Wd), at(att, C), grows, Wd, C, B + ".Transition2", false, 0.f, ADA_RAW ? 2.f : 1.f);
     if (noResidual) {
-      if (tok) { fprintf(stderr, "split diffusion tokens: not rf3's block wiring\n"); exit(1); }
       gatedAddAdaLn<T>(act, att, z, ldr, g + 2 * C, g + 3 * C, ldn, (T*)nullptr, (int)rows, C, n);
       gatedAddAdaLn<T>(pre, (const T*)nullptr, (const T*)nullptr, ldr, g + 2 * C, g + 3 * C, ldn, tn, (int)rows, C, n);
     } else if (krows) {
@@ -1362,7 +1376,7 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   scalePositionsK<<<blocks(total * 3), 256, 0, STREAM>>>(positionsNoisy, atomMask, scaled, total, atoms, noiseParams);
   // (the tokens split: the atom blocks on this rank's subsets and their halo - the encoder's wide enough that the
   // decoder's halo is right after it, the decoder's that this rank's own subsets are)
-  const bool tok = sh::DLO >= 0 && NS == 1 && DIFF_HALF && mg::WORLD > 1;
+  const bool tok = splitTokens();
   AtomRange ar{};
   if (tok) {
     int tlo, thi; sh::rowsOf(n, mg::RANK, tlo, thi); thi = std::min(thi, n);

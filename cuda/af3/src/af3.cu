@@ -367,6 +367,14 @@ static int foldMain(int argc, char** argv) {
   const bool oneSample = seedList.size() * samples == 1;
   const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 512 || !oneSample) &&
     foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true);
+  // (a confidence head with no sharded form - boltz2's, rf3's - runs on rank 0 with the pair gathered: refused up front
+  // where that pair would not fit one GPU)
+  const bool confOnRank0 = mg::WORLD > 1 && sh::ON && doFold && !confidenceShardable();
+  if (confOnRank0 && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
+                               pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true)) {
+    fprintf(stderr, "this model's confidence head has no sharded form yet, and a %d-token pair does not fit one GPU\n", tokens);
+    return 1;
+  }
   t = makeTrunk(targetFeat.data(), msaCap, doFold && fast);
   if (mg::WORLD > 1) {
     // several GPUs (LOCALFOLD_GPUS, multigpu.cuh): the trunk pair in a buffer every rank can read, the pair updates'
@@ -498,7 +506,8 @@ static int foldMain(int argc, char** argv) {
     // held both at once. Not for OpenDDE (its expander reads f32), nor --save-embeddings
     if (sharded(t)) {     // what only the trunk read, given back before the diffusion: z^T, the template stack's slabs, the
                           // exchange buffers, the MSA (the slab itself the diffusion reads, and rank 0 gathers after it)
-      mg::release({ "sh.zT", "sh.tz", "sh.bmine", "sh.bg", "sh.bias", "sh.st.o", "trunk.msa" });
+      mg::release({ "sh.zT", "sh.tz", "sh.bmine", "sh.bg", "sh.bias", "sh.st.o", "trunk.msa",
+                    "sh.ta", "sh.tb", "sh.tp" });     // (the channel-split triangle's: 9.9 GB a rank at 10,127 tokens on 8)
       t.zTS = nullptr; t.msa = nullptr;
       mg::tick("trunk");
     }
@@ -596,6 +605,7 @@ static int foldMain(int argc, char** argv) {
       if (structural) { fprintf(stderr, "a sharded pair: not OpenDDE\n"); return 1; }
       sh::DLO = t.shardLo; sh::DROWS = t.shardRows; dP = pairBase(t);
       GRAPHS = !noGraphs;      // (the steps' graphs: its fences count their generations on the device)
+      if (DIFF_HALF && oneSample && !M.flag("diffusion.transformer.noResidual")) diffusionSharedBuffers(nD);
     }
     mg::tick("to the diffusion");
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
@@ -674,6 +684,16 @@ static int foldMain(int argc, char** argv) {
       t.pair = (float*)t.zS->local; t.shardLo = keptLo; t.shardRows = keptRows; t.p16 = true;
       GRAPHS = false;
       mg::tick("whole pair freed");
+    }
+    // (a confidence head with no sharded form: the pair onto rank 0, which runs the one-GPU head - where it fits)
+    if (sharded(t) && confOnRank0) {
+      GRAPHS = false;
+      df.trunkPair = nullptr;
+      pairOntoRank0(t);
+      // (then the one-GPU rule for the pair's width: boltz2's and rf3's heads read it f32)
+      TRUNK_PAIR16 = t.p16 && pairStays16(t.n, t.C, fast);
+      if (!TRUNK_PAIR16) pairToF32(t);
+      if (contact.empty()) contact = contactProbabilities(t);
     }
     if (sharded(t)) {
       GRAPHS = false;

@@ -193,7 +193,12 @@ inline Shared& shared(const std::string& name, size_t bytes) {
     return it->second;
   }
   Shared s; s.bytes = bytes; s.world = WORLD;
-  CK(cudaMalloc(&s.local, std::max<size_t>(bytes, 256)));
+  if (cudaMalloc(&s.local, std::max<size_t>(bytes, 256)) != cudaSuccess) {
+    size_t f = 0, t = 0; cudaGetLastError(); cudaMemGetInfo(&f, &t);
+    fprintf(stderr, "rank %d: out of device memory for the shared buffer %s (%.2f GB; %.2f of %.2f GB free)\n", RANK,
+            name.c_str(), bytes / 1e9, f / 1e9, t / 1e9);
+    exit(1);
+  }
   if (SIM) { for (int r = 0; r < WORLD; ++r) s.peer[r] = s.local; return m.emplace(name, s).first->second; }
   int idx;
   if (RANK == 0) {

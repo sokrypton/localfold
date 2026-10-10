@@ -534,6 +534,13 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
 // rows the same rows of z^T, one all-to-all transpose), every rank's rows of PAE, PDE and the TM terms read onto rank 0
 // over the peers' buffers. Collective; the result is rank 0's (the others' carry nothing). The AF3 lineage's head
 // without re-embedding or a global norm (not boltz2 or rf3 yet), in f16 (--fast)
+// whether this model's confidence head has a sharded form: the AF3 lineage's plain head in f16 (af3.cu gathers the pair
+// onto rank 0 for the others' - boltz2's re-embedding, rf3's, chai-1's - and runs their one-GPU head there)
+inline bool confidenceShardable() {
+  const std::string P = "confidence";
+  return !(M.flag("trunk.dialect.reembedConfidencePair") || M.flag("trunk.dialect.confidenceGlobalNorm") ||
+           M.flag("trunk.dialect.chaiConfidence") || !CONF_HALF || hasW(P + ".interHalfDistanceLogits") || hasW(P + ".paeInterLogits"));
+}
 inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int rowsHere, const float* trunkSingle,
                                        const float* targetFeat, const float* pseudoBeta, const float* seqMask,
                                        const float* pairMask, int n) {
