@@ -37,6 +37,11 @@ void die(const char* fmt, ...) {
   std::exit(1);
 }
 
+// MTLGPUFamilyApple10 and MTLLanguageVersion4_0, by value: only the macOS 26 SDK names them, and the wheel (and an M1/M2
+// developer) builds with an older one - the @available checks where they are used are what keep them off older systems
+static const MTLGPUFamily APPLE10 = (MTLGPUFamily)1010;
+static const MTLLanguageVersion LANGUAGE4 = (MTLLanguageVersion)(4 << 16);
+
 namespace {
 struct Alloc { id<MTLBuffer> buf; uint64_t addr; size_t size; };
 struct Stats { double syncMs = 0, compileMs = 0; long dispatches = 0, commits = 0, syncs = 0, staged = 0, allocs = 0, gemms = 0; };
@@ -81,7 +86,7 @@ struct Device {
       if (![dev supportsFamily:MTLGPUFamilyMetal3] || ![dev supportsFamily:MTLGPUFamilyApple7])
         die("this GPU (%s) is not an Apple-silicon GPU with Metal 3; LocalFold needs an M1 or later", dev.name.UTF8String);
       queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
-      if (@available(macOS 26.0, *)) tensorOps = [dev supportsFamily:MTLGPUFamilyApple10];
+      if (@available(macOS 26.0, *)) tensorOps = [dev supportsFamily:APPLE10];
     }
   }
 
@@ -192,7 +197,7 @@ struct Device {
     MTLCompileOptions* o = [MTLCompileOptions new];
     o.languageVersion = MTLLanguageVersion3_0;
     if (tensor) {
-      if (@available(macOS 26.0, *)) o.languageVersion = MTLLanguageVersion4_0;
+      if (@available(macOS 26.0, *)) o.languageVersion = LANGUAGE4;
       else die("compiling %s: the tensor GEMM needs macOS 26", what.c_str());
     }
     o.fastMathEnabled = NO;
