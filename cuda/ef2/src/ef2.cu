@@ -123,10 +123,12 @@ static int foldInput(const Opts& o, bool warm) {
   float* hidden = check ? dalloc((size_t)T * states * e.model) : nullptr;
   // on a card short of room z_init is streamed (ZINIT_STREAM): the language model's pair is never made whole
   const bool parcae = parcaeRecycle();           // (the released models keep the language model's pair: their loop reads it)
+  if (mg::WORLD > 1 && warm) return 0;          // (no warm-up fold: the ranks meet at every collective of the real one)
   if (mg::WORLD > 1) {
     // several GPUs: the trunk sharded by rows (mgtrunk.cuh) - with the streamed z_init, and one room for every rank's
-    // short-of-room choices (cuda/af3's, common.cuh)
-    if (parcae || hasMsaEncoder() || check || warm) {
+    // short-of-room choices (cuda/af3's, common.cuh); the sampler's steps uncaptured (a fence cannot be in a graph)
+    SAMPLER_GRAPH = false;
+    if (parcae || hasMsaEncoder() || check) {
       fprintf(stderr, "several GPUs fold ESMFold2's single-sequence models (not the recycling or alignment ones, not an oracle check) yet\n");
       return 1;
     }
@@ -250,7 +252,7 @@ static int foldInput(const Opts& o, bool warm) {
   const int passes = getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4;
   if (mg::WORLD > 1) {
     const int world = mg::WORLD;
-    z = shardedTrunkEf2(T, C, passes);         // (rank 0 on from here, alone, its pair whole; the others have left)
+    z = shardedTrunkEf2(T, C, passes);         // (this rank's rows, bf16, indexed by the global pair: EF2_ZS)
     say("trunk across %d GPUs\n", world);
   } else foldingTrunk(T, C, zi, z, passes, check, lmZ, seed, lmHost);
   if (lmZ) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
@@ -277,6 +279,11 @@ static int foldInput(const Opts& o, bool warm) {
       return 1;
     }
     size_t P = (size_t)T * T;
+    if (EF2_ZS) {                                 // (several GPUs: each rank's rows, all-gathered - mgtrunk.cuh)
+      contacts = shardedContactsEf2(T, C, bins, [&](const float* dg, size_t p0, size_t n, float* out) {
+        contactsK<<<blocks(n), 256, 0, STREAM>>>(dg, Idev("contact_bins") + p0, out, n, bins);
+      });
+    } else {
     float* probs = scratch<float>("dg.contacts", P);
     if (tight || EF2_Z16) {
       // on a card short of room a block of pair positions at a time: z + z^T, the projection, the contact mass -
@@ -304,6 +311,7 @@ static int foldInput(const Opts& o, bool warm) {
       TAP().offer({{bytes, P}}, [path, P](const char* host, const std::vector<size_t>&) { writeWhole(path, host, P); });
     }
     contacts = download(probs, P);
+    }
     if (tight) releaseScratch();
   }
   if (check) {                                   // (nothing else reads the distogram)
@@ -312,10 +320,12 @@ static int foldInput(const Opts& o, bool warm) {
     checkOracle("distogram", dg, (size_t)T * T * (int)M.meta("meta/distogramBins"), "o/distogram");
     CK(cudaFree(dg)); if (tight) releaseScratch();
   }
+  if (EF2_ZS) { int lo, hi; sh::rowsOf(T, mg::RANK, lo, hi); EF2_QLO = lo; EF2_QROWS = sh::storedRows(T, mg::RANK); }
   Denoiser dn = makeDenoiser(T, A, z, sInputs, check);
   // (a bf16 trunk pair waits in host memory through the sampler, which never reads it: the confidence head takes it
   // back, widened)
-  if (EF2_Z16) { parkToHost(z, (size_t)T * T * C * 2); }
+  if (EF2_ZS) { parkShareEf2(T, C); z = nullptr; }      // (each rank its share, in its own host memory)
+  else if (EF2_Z16) { parkToHost(z, (size_t)T * T * C * 2); }
   mem("denoiser built");
   if (check && M.has("o/step0/x_noisy")) {
     float* xn0 = upload(M.f("o/step0/x_noisy"), (size_t)A * 3); float* xd0 = dalloc((size_t)A * 3);
@@ -380,6 +390,10 @@ static int foldInput(const Opts& o, bool warm) {
   float* xd = upload(coords.data(), (size_t)A * 3);
   bool profConf = profile && profStage == "confidence";
   if (profConf) { prof::init(); prof::start(); }
+  if (mg::WORLD > 1) {                          // (several GPUs: every rank's share into rank 0's host memory; the others leave)
+    unparkShareEf2(T, C);
+    pairOntoRank0HostEf2(T, C);
+  }
   if (EF2_Z16) releaseScratch();                // (the head reads the parked bf16 pair itself: zTrunk null)
   Confidence conf = confidenceHead(T, A, EF2_Z16 ? nullptr : z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
   if (profConf) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
