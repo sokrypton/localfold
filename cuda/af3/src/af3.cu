@@ -663,6 +663,26 @@ static int foldMain(int argc, char** argv) {
       }
     }
     releaseConcatCopies(); memReport("diffusion prepared");
+    // several GPUs on a sharded pair, short of room: this rank's share of the trunk pair waits in host memory through
+    // the sampler, which never reads it (the one-GPU park's twin) - 9 GB a rank at 11,856 tokens on 4, the steps' room
+    // - and comes back for the contacts and the confidence head
+    size_t parkedShare = 0, parkedBytes = 0;
+    if (sharded(t) && keptLo < 0 && shortPair(pairs, t.C)) {
+      parkedShare = t.zS->bytes; parkedBytes = (size_t)t.shardRows * t.n * t.C * 2;
+      if (PARK_HAVE < parkedBytes) {
+        if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
+        if (cudaMallocHost(&PARK_HOST, parkedBytes) != cudaSuccess) {
+          fprintf(stderr, "cannot pin %.2f GB of host memory to park this GPU's share of the pair: this input needs more host RAM\n",
+                  parkedBytes / 1e9);
+          exit(1);
+        }
+        PARK_HAVE = parkedBytes;
+      }
+      CK(cudaMemcpyAsync(PARK_HOST, t.zS->local, parkedBytes, cudaMemcpyDeviceToHost, STREAM));
+      mg::release({ "sh.z" }, mg::FREE);           // (collective: every rank parks alike - the choice is the agreed room's)
+      t.zS = nullptr; t.pair = nullptr; df.trunkPair = nullptr;
+      mg::tick("share parked");
+    }
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
     // confidence head and ranked by AF3's ranking score (src/scores.cuh). A seed's samples run as one
     // batch through the denoiser, sample k of seed s seeded sampleSeed(s, k); the best of them all is
@@ -727,6 +747,14 @@ static int foldMain(int argc, char** argv) {
     // nothing after the sampler - the next batch makes its own - and held to the end it left the confidence
     // head short of room (freed here, before the sharded head too, not after it)
     if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); df.preSingle = df.preSnProj = nullptr; }
+    if (parkedShare) {                             // (the share home, for the heads)
+      releaseScratch(); trimPool();                // (the sampler's idle pages: 24 GB of them a rank at 11,856 tokens on 4)
+      mg::segmentReport("sampled, share parked");
+      t.zS = &mg::shared("sh.z", parkedShare);
+      CK(cudaMemcpyAsync(t.zS->local, PARK_HOST, parkedBytes, cudaMemcpyHostToDevice, STREAM));
+      t.pair = (float*)t.zS->local;
+      mg::tick("share unparked");
+    }
     FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
     // several GPUs on a sharded pair, past the sampler: the confidence head of every sample and the contacts on held
     // rows (collective, rank 0's results); then the others leave and rank 0 writes the fold with the whole pair never

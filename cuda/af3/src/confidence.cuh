@@ -599,7 +599,7 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   const size_t pairs = (size_t)n * n, hp = (size_t)rowsHere * n, hf = (size_t)lo * n;
   const size_t slab = (size_t)sh::maxStored(n) * n * C * 2;
   mg::Shared& cz = consume ? const_cast<mg::Shared&>(trunkZ) : mg::shared("sh.cz", slab);
-  mg::Shared& czT = mg::shared("sh.czT", slab);
+  mg::Shared* czTp = nullptr;                // (made where a form wants it: sh::pairUpdates, the PDE's rows)
   mg::tick("conf: slabs shared");
   float* pair = (float*)cz.local;
   float* base = (float*)((__nv_bfloat16*)cz.local - hf * C);
@@ -632,11 +632,18 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   PAIR16 = true;
   for (int k = 0; k < nb; ++k) {
     const std::string B = P + ".blocks." + std::to_string(k);
-    sh::pairUpdates<half>(cz, czT, pairMask, n, C, B, swap, divide, 4);
+    sh::pairUpdates<half>(cz, czTp, "sh.czT", pairMask, n, C, B, swap, divide, 4);
     mg::tick("conf: block pair");
     singleTrack<half>(single, pair, seqMask, n, C, Cs, B, nullptr, lo);
     mg::tick("conf: block single");
   }
+  if (!czTp) {        // (a card short of room, the blocks' exchange buffers given back first: the triangle's product share
+                      //  idle beside a new z^T share was 9 GB too many a rank at 11,856 tokens on 4)
+    releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); trimPool();
+    mg::release({ "sh.tp", "sh.tsa", "sh.tsb", "sh.zTc", "sh.bias" }, mg::FREE);
+    czTp = &mg::shared("sh.czT", slab);
+  }
+  const mg::Shared& czT = *czTp;
   sh::transpose(cz, czT, n, C);              // (the PDE's transposed rows)
   mg::tick("conf: transposed");
   PAIR16 = was16;

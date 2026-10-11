@@ -269,7 +269,7 @@ inline Trunk makeTrunk(const float* targetFeatHost, int msaCap, bool wantPair16 
     }
     int lo, hi; sh::rowsOf(t.n, mg::RANK, lo, hi);
     const size_t slab = (size_t)sh::maxStored(t.n) * t.n * t.C * e;
-    t.zS = &mg::shared("sh.z", slab); t.zTS = &mg::shared("sh.zT", slab);
+    t.zS = &mg::shared("sh.z", slab); t.zTS = nullptr;     // (z^T made where a form wants it: sh::pairUpdates)
     t.pair = (float*)t.zS->local; t.shardLo = lo; t.shardRows = sh::storedRows(t.n, mg::RANK);
     t.msa = (float*)mg::shared("trunk.msa", std::max<size_t>(1, (size_t)t.S * t.n * t.Cm * 4)).local;
     t.single = dalloc((size_t)t.n * t.Cs);
@@ -642,7 +642,7 @@ void templateEmbedding(Trunk& t, float* out) {
       if (M.flag("trunk.dialect.parallelPairformer"))        // chai: its parallel pair-only iteration
         parallelPairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor, { PairUpdate::TriOut, PairUpdate::TriIn,
           PairUpdate::GridRow, PairUpdate::GridCol, PairUpdate::Transition });
-      else if (sharded(t)) sh::pairUpdates<T>(*actS, *actTS, t.pairMask, n, Ct, B, t.swap, t.divide, factor);
+      else if (sharded(t)) sh::pairUpdates<T>(*actS, actTS, "sh.tzT" + std::to_string(Ct), t.pairMask, n, Ct, B, t.swap, t.divide, factor);
       else { TIGHT_STACK = tight; pairUpdates<T>(act, t.pairMask, n, Ct, B, t.swap, t.divide, factor, tight); TIGHT_STACK = false; }
     }
     if (outer) addK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, before, pairs * Ct);
@@ -1054,7 +1054,7 @@ void msaBlock(Trunk& t, int k) {
   transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
   if (updateFirst) { outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm"); }
   PAIR16 = t.p16;
-  if (sharded(t)) sh::pairUpdates<T>(*t.zS, *t.zTS, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
+  if (sharded(t)) sh::pairUpdates<T>(*t.zS, t.zTS, "sh.zT", t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
   else pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4, shortPair((size_t)t.n * t.n, t.C));
   PAIR16 = false;
 }
@@ -1267,7 +1267,7 @@ template <class T>
 void pairformerBlock(Trunk& t, int k) {
   if (sharded(t)) {        // several GPUs: this rank's slab
     const std::string B = "trunk.pairformerBlocks." + std::to_string(k);
-    sh::pairUpdates<T>(*t.zS, *t.zTS, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
+    sh::pairUpdates<T>(*t.zS, t.zTS, "sh.zT", t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
     singleTrack<T>(t.single, t.pair, t.seqMask, t.n, t.C, t.Cs, B, nullptr, t.shardLo); stage("single");
     return;
   }
