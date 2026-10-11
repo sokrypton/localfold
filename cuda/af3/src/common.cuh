@@ -1138,6 +1138,10 @@ inline double SHORT_PAIR_TIMES = 0;
 // rank that alone takes the short-of-room paths (the trunk not captured, its exchange buffers given back - collective)
 // leaves the others waiting at a meeting it never comes to
 inline size_t SHORT_PAIR_ROOM = 0;
+// ...and the share of the pair a rank holds (af3.cu: the GPU count while the pair is sharded, 1 otherwise): a rank's
+// working set is its share's, so asked of the whole pair a 2,964-token fold on 4 x 48 GB took every short-of-room path
+// (the triangle in rounds, the stacks' buffers given back each pass, no graph): 43.0 against 40.5 s
+inline int SHORT_PAIR_SHARE = 1;
 inline size_t shortPairRoomHere() {
   size_t f, t; deviceMemInfo(&f, &t);
   for (auto& [name, slot] : SCRATCH) f += slot.second;
@@ -1153,7 +1157,7 @@ inline bool shortPair(size_t pairs, int C) {
                                            own / 1e9, own / 1e9 / SHORT_PAIR_TIMES);
     }
     const size_t room = SHORT_PAIR_ROOM ? SHORT_PAIR_ROOM : own;
-    return (double)pairs * C * 4 * SHORT_PAIR_TIMES > (double)room;
+    return (double)pairs / SHORT_PAIR_SHARE * C * 4 * SHORT_PAIR_TIMES > (double)room;
   }
   static const size_t card = [] { size_t f, t; CK(cudaMemGetInfo(&f, &t)); return t; }();
   return pairs * C * 4 > card / 64;

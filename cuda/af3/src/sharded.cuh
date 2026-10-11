@@ -287,7 +287,14 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
               base, mask, lnS, lnO, wt, (__nv_fp8_e4m3*)aL - back, (__nv_fp8_e4m3*)bL - back, gate, n, np, cs, nullptr, win);
           }
         };
+        // (DIAG LOCALFOLD_MG_TRI_TIMES=1: the phases' GPU time on rank 0's stream, printed every 96 triangles)
+        static const bool tt = getenv("LOCALFOLD_MG_TRI_TIMES") != nullptr;
+        static double acc[6] = {}; static int calls = 0;
+        std::vector<cudaEvent_t> te;
+        auto mark = [&]() { if (!tt) return; cudaEvent_t e; CK(cudaEventCreate(&e)); CK(cudaEventRecord(e, STREAM)); te.push_back(e); };
+        mark();
         if (!rounds) produce(0, C, t2);
+        mark();                                       // [0] produce
         bool used[2] = {};
         for (int q = 0; q < steps; ++q) {
           const int sl = q % 2, sp = pAll[1] ? sl : 0;
@@ -299,28 +306,57 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
             int f, t; range(q, r, f, t);
             ps.a[r] = (uint4*)slotA[sl]->peer[r]; ps.b[r] = (uint4*)slotB[sl]->peer[r]; ps.ch[r] = f - k0; ps.cnt[r] = t - f;
           }
+          if (tt && q == 0) mark();
           if (rows > 0) {
             const size_t work = (size_t)mg::WORLD * g * rows * vecsA;
             if (x8) pushPlanesK<true><<<blocks(work), 256, 0, STREAM>>>(ps, aL, bL, rows, lo, np, vecsA, g);
             else pushPlanesK<false><<<blocks(work), 256, 0, STREAM>>>(ps, aL, bL, rows, lo, np, vecsA, g);
           }
+          if (tt) mark();
           mg::fence();                                // (every rank's rows in this rank's slot; the slot two back read)
+          if (tt) mark();
           int m0, m1; range(q, mg::RANK, m0, m1);
           const int gc = m1 - m0;
           if (gc <= 0) continue;
           if (used[sp]) CK(cudaStreamWaitEvent(STREAM, pushed[sp], 0));    // (the last pushes from this product done)
           gemmAll(gc, (const TQ*)slotA[sl]->local, (const TQ*)slotB[sl]->local, pAll[sp]);
+          if (tt) mark();
           CK(cudaEventRecord(gemmed[sp], STREAM));
           CK(cudaStreamWaitEvent(pushS, gemmed[sp], 0));
           pushRowsK<<<blocks((size_t)gc * np * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
           CK(cudaEventRecord(pushed[sp], pushS));
           used[sp] = true;
         }
+        if (tt) mark();
         for (int k = 0; k < 2; ++k) if (used[k]) CK(cudaStreamWaitEvent(STREAM, pushed[k], 0));
+        if (tt) mark();                               // (the product pushes' tail)
         mg::fence();                                  // (every rank's product rows here)
+        if (tt) mark();
         if (rows > 0)
           triangleOutRun<CC, WO, B16>((const B16*)pS.local, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                       Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, mineRm);
+        if (tt) {
+          mark(); CK(cudaEventSynchronize(te.back()));
+          auto el = [&](size_t a, size_t b) { float m = 0; CK(cudaEventElapsedTime(&m, te[a], te[b])); return (double)m; };
+          // marks: 0 start, 1 produced, then per step [push-start, pushed, fenced, gemmed], then tail-start, pushes done,
+          // fenced, out done
+          acc[0] += el(0, 1);
+          size_t i = 2;
+          for (int q = 0; q < steps; ++q) {
+            if (q == 0) { /* (push-start mark) */ }
+            size_t a = i;                            // push start (q 0) or previous gemm end
+            acc[1] += el(a, a + 1);                  // push
+            acc[2] += el(a + 1, a + 2);              // fence
+            int f0, f1; range(q, mg::RANK, f0, f1);
+            if (f1 > f0) { acc[3] += el(a + 2, a + 3); i = a + 3; } else i = a + 2;
+          }
+          acc[4] += el(i, i + 2);                    // product pushes' tail
+          acc[5] += el(i + 2, i + 3) + el(i + 3, i + 4);   // fence + output
+          for (auto e : te) CK(cudaEventDestroy(e));
+          if (++calls % 96 == 0 && mg::RANK == 0)
+            fprintf(stderr, "  tri %d calls: produce %.1f push %.1f fence %.1f gemm %.1f push-tail %.1f fence+out %.1f ms\n", calls,
+                    acc[0], acc[1], acc[2], acc[3], acc[4], acc[5]);
+        }
       );
     });
   });

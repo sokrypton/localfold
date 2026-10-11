@@ -50,7 +50,7 @@ static void pairOntoRank0(Trunk& t) {
   mg::release({ "" }, mg::FINAL);   // (every shared buffer: rank 0's pair is whole and its own now, the others leave)
   if (mg::RANK != 0) mg::leave();
   mg::finish();
-  mg::WORLD = 1;
+  mg::WORLD = 1; SHORT_PAIR_SHARE = 1;
   t.pair = whole; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.msa = nullptr; t.inPlaceRecycle = true;
   sh::DLO = -1; sh::DROWS = 0;
 }
@@ -380,6 +380,7 @@ static int foldMain(int argc, char** argv) {
     fprintf(stderr, "this model's confidence head has no sharded form yet, and a %d-token pair does not fit one GPU\n", tokens);
     return 1;
   }
+  if (mg::WORLD > 1 && sh::ON) SHORT_PAIR_SHARE = mg::WORLD;      // (a rank holds its rows of the pair from here)
   t = makeTrunk(targetFeat.data(), msaCap, doFold && fast);
   if (mg::WORLD > 1) {
     // several GPUs (LOCALFOLD_GPUS, multigpu.cuh): the trunk pair in a buffer every rank can read, the pair updates'
@@ -505,7 +506,7 @@ static int foldMain(int argc, char** argv) {
       mg::barrier();
       if (mg::RANK != 0) mg::leave();
       mg::finish();
-      mg::WORLD = 1;
+      mg::WORLD = 1; SHORT_PAIR_SHARE = 1;
     }
     memReport("trunk: passes done");
     // 🔴 THE PAIR STAYS bf16 PAST THE TRUNK on a card short of room, where every reader after it takes bf16 rows
@@ -752,7 +753,7 @@ static int foldMain(int argc, char** argv) {
       mg::tick("shared buffers released");
       if (mg::RANK != 0) mg::leave();
       mg::finish();
-      mg::WORLD = 1;
+      mg::WORLD = 1; SHORT_PAIR_SHARE = 1;
       mg::tick("the other ranks exited");
       t.pair = nullptr; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.msa = nullptr;
       sh::DLO = -1; sh::DROWS = 0;
