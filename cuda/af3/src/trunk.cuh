@@ -177,6 +177,33 @@ struct Trunk {
   mg::Shared *zS = nullptr, *zTS = nullptr;
 };
 inline bool sharded(const Trunk& t) { return t.shardLo >= 0; }
+// several GPUs on a sharded pair, short of room: this rank's share of the pair parked in host memory (PARK_HOST) and
+// its shared buffer given back - collective, every rank alike (the choice is the agreed room's) - and brought home
+inline size_t SHARE_PARKED = 0;          // (the shared buffer's bytes, while parked)
+inline void parkShare(Trunk& t) {
+  const size_t used = (size_t)t.shardRows * t.n * t.C * 2;
+  if (PARK_HAVE < used) {
+    if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
+    if (cudaMallocHost(&PARK_HOST, used) != cudaSuccess) {
+      fprintf(stderr, "cannot pin %.2f GB of host memory to park this GPU's share of the pair: this input needs more host RAM\n", used / 1e9);
+      exit(1);
+    }
+    PARK_HAVE = used;
+  }
+  CK(cudaMemcpyAsync(PARK_HOST, t.zS->local, used, cudaMemcpyDeviceToHost, STREAM));
+  SHARE_PARKED = t.zS->bytes;
+  mg::release({ "sh.z" }, mg::FREE);
+  t.zS = nullptr; t.pair = nullptr;
+  mg::tick("share parked");
+}
+inline void unparkShare(Trunk& t) {
+  trimPool();                            // (the caller's scratch given back first, and the idle pages here: 24 GB of
+                                         //  the sampler's a rank at 11,856 tokens on 4)
+  t.zS = &mg::shared("sh.z", SHARE_PARKED);
+  CK(cudaMemcpyAsync(t.zS->local, PARK_HOST, (size_t)t.shardRows * t.n * t.C * 2, cudaMemcpyHostToDevice, STREAM));
+  t.pair = (float*)t.zS->local; SHARE_PARKED = 0;
+  mg::tick("share unparked");
+}
 // the pairs this rank holds, and the first of them (as a global pair index i*n + j)
 inline size_t heldPairs(const Trunk& t) { return sharded(t) ? (size_t)t.shardRows * t.n : (size_t)t.n * t.n; }
 inline size_t heldFirst(const Trunk& t) { return sharded(t) ? (size_t)t.shardLo * t.n : 0; }
@@ -636,6 +663,10 @@ void templateEmbedding(Trunk& t, float* out) {
     // not in between: on a card short of room it waits in host memory while the stack runs
     bool parked = live == 1 && tight && out == t.pair && !sharded(t) && parkWorthIt(pairs * Cq * 4);
     if (parked) { parkToHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = nullptr; }
+    // (and a sharded rank's share: the stack holds three 64-channel f32 shares and the triangle's operand share beside
+    // it - 12,350 tokens on 4 ran out here)
+    const bool shareParked = live == 1 && tight && out == t.pair && sharded(t);
+    if (shareParked) { parkShare(t); out = nullptr; }
     for (int b = 0; b < nb; ++b) {
       std::string B = P + "blocks." + std::to_string(b);
       int factor = (int)(lenW(B + ".pairTransition.transition1") / ((size_t)Ct * Ct * 2));
@@ -655,6 +686,7 @@ void templateEmbedding(Trunk& t, float* out) {
     if (live == 1) scaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
     else addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
     if (parked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkFromHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = t.pair; }
+    if (shareParked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkShare(t); out = t.pair; }
   }
   // divided by every slot (not the real ones), relu, projected
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
