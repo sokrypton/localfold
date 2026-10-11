@@ -120,10 +120,9 @@ __device__ __forceinline__ uint4 widen8(uint2 s) {
   return *reinterpret_cast<const uint4*>(o);
 }
 // each rank's slot of a step: this rank's rows [lo, lo + rows) of its channels [ch, ch + cnt) of this rank's a and b
-// ([C][rows][np] from channel 0), written into its planes [g][np][np] (W8: e4m3 here, widened as written); the ranks
-// walked from this one (rot)
+// ([C][rows][np] from channel 0, as sent: bf16, or e4m3 under LOCALFOLD_MG_FP8_EXCHANGE), written into its planes
+// [g][np][np]; the ranks walked from this one (rot)
 struct PushSlots { uint4* a[mg::MAX_RANKS]; uint4* b[mg::MAX_RANKS]; int ch[mg::MAX_RANKS], cnt[mg::MAX_RANKS]; int world, rank; };
-template <bool W8>
 __global__ void pushPlanesK(PushSlots ps, const void* __restrict__ srcA, const void* __restrict__ srcB, int rows, int lo, int np,
                             int vecs, int g) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -133,13 +132,13 @@ __global__ void pushPlanesK(PushSlots ps, const void* __restrict__ srcA, const v
   const int c = (int)(rest % g), r = (int)((rest / g + ps.rank) % ps.world);
   if (c >= ps.cnt[r]) return;
   const size_t src = ((size_t)(ps.ch[r] + c) * rows + i) * vecs + v, dst = ((size_t)c * np + lo + i) * vecs + v;
-  if constexpr (W8) {
-    ps.a[r][dst] = widen8(reinterpret_cast<const uint2*>(srcA)[src]);
-    ps.b[r][dst] = widen8(reinterpret_cast<const uint2*>(srcB)[src]);
-  } else {
-    ps.a[r][dst] = reinterpret_cast<const uint4*>(srcA)[src];
-    ps.b[r][dst] = reinterpret_cast<const uint4*>(srcB)[src];
-  }
+  ps.a[r][dst] = reinterpret_cast<const uint4*>(srcA)[src];
+  ps.b[r][dst] = reinterpret_cast<const uint4*>(srcB)[src];
+}
+// e4m3 planes widened to bf16, 8 values a thread
+__global__ void widenPlanesK(const uint2* __restrict__ in, uint4* __restrict__ out, size_t n8) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n8) out[t] = widen8(in[t]);
 }
 __global__ void pushRowsK(PeerPlanes pp, const uint4* __restrict__ prod, int q0, int gc, int np, int vecs) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -235,23 +234,27 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   void* bL = x8 ? (void*)scratch<__nv_fp8_e4m3>("trib.b8", aw) : (void*)scratch<TQ>("trib.b", aw);
   mg::Shared* slotA[2]; mg::Shared* slotB[2];
   for (int k = 0; k < 2; ++k) {
-    slotA[k] = &mg::shared("sh.tsa" + tag + "." + std::to_string(k), (size_t)g * plane * sizeof(TQ));
-    slotB[k] = &mg::shared("sh.tsb" + tag + "." + std::to_string(k), (size_t)g * plane * sizeof(TQ));
+    slotA[k] = &mg::shared("sh.tsa" + tag + "." + std::to_string(k), (size_t)g * plane * (x8 ? 1 : sizeof(TQ)));
+    slotB[k] = &mg::shared("sh.tsb" + tag + "." + std::to_string(k), (size_t)g * plane * (x8 ? 1 : sizeof(TQ)));
   }
+  TQ* aW = x8 ? scratch<TQ>("trib.aw", (size_t)g * plane) : nullptr;   // (x8: a step's planes widened from the wire's e4m3)
+  TQ* bW = x8 ? scratch<TQ>("trib.bw", (size_t)g * plane) : nullptr;
   B16* pAll[2] = {};
   pAll[0] = scratch<B16>("trib.pall0", (size_t)g * plane);
   // (a second product - one step's push beside the next one's GEMM - where it fits)
   if (!rounds || roomFor((size_t)g * plane * sizeof(B16))) pAll[1] = scratch<B16>("trib.pall1", (size_t)g * plane);
-  static cudaStream_t pushS = nullptr;
-  static cudaEvent_t gemmed[2], pushed[2];
+  static cudaStream_t pushS = nullptr, xS = nullptr;
+  static cudaEvent_t gemmed[2], pushed[2], fenced, filled;
   if (!pushS) {
-    CK(cudaStreamCreateWithFlags(&pushS, cudaStreamNonBlocking));
+    CK(cudaStreamCreateWithFlags(&pushS, cudaStreamNonBlocking)); CK(cudaStreamCreateWithFlags(&xS, cudaStreamNonBlocking));
     for (int k = 0; k < 2; ++k) for (cudaEvent_t* e : { &gemmed[k], &pushed[k] }) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+    CK(cudaEventCreateWithFlags(&fenced, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&filled, cudaEventDisableTiming));
   }
   const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
   const RectMap mineRm{lo, np, 0, (size_t)rows * np};
   const PeerPlanes pPlanes = peerPlanes(pS, nullptr, n);
-  const int vecsA = (int)((size_t)np * sizeof(TQ) / 16), vecsP = (int)((size_t)np * sizeof(B16) / 16);
+  const int vecsP = (int)((size_t)np * sizeof(B16) / 16);
+  const int vecsW = (int)((size_t)np * (x8 ? 1 : sizeof(TQ)) / 16);   // (16-byte pieces of a slot's row, as sent)
   // (at function scope: an if constexpr inside the generic lambdas below does not discard its other branch)
   auto gemmAll = [&](int gc, const TQ* A, const TQ* Bm, B16* P) {
     if constexpr (F8) fp8GemmTN(np, np, np, alpha, Bm, np, (long long)plane, A, np, (long long)plane, P, np, (long long)plane, gc);
@@ -289,73 +292,70 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         };
         // (DIAG LOCALFOLD_MG_TRI_TIMES=1: the phases' GPU time on rank 0's stream, printed every 96 triangles)
         static const bool tt = getenv("LOCALFOLD_MG_TRI_TIMES") != nullptr;
-        static double acc[6] = {}; static int calls = 0;
+        static double acc[4] = {}; static int calls = 0;
         std::vector<cudaEvent_t> te;
         auto mark = [&]() { if (!tt) return; cudaEvent_t e; CK(cudaEventCreate(&e)); CK(cudaEventRecord(e, STREAM)); te.push_back(e); };
         mark();
         if (!rounds) produce(0, C, t2);
-        mark();                                       // [0] produce
-        bool used[2] = {};
-        for (int q = 0; q < steps; ++q) {
-          const int sl = q % 2, sp = pAll[1] ? sl : 0;
-          const int k0 = rounds ? q * K : 0;
-          if (rounds) produce(k0, std::min(C, k0 + K), q == 0 ? t2 : nullptr);
-          // this rank's rows of every rank's channels for the step, into that rank's slot
+        mark();
+        // step q's slots filled: this rank's rows of every rank's channels for the step, into that rank's slot (on `st`)
+        auto fill = [&](int q, cudaStream_t st) {
+          const int sl = q % 2, k0 = rounds ? q * K : 0;
           PushSlots ps{}; ps.world = mg::WORLD; ps.rank = mg::RANK;
           for (int r = 0; r < mg::WORLD; ++r) {
             int f, t; range(q, r, f, t);
             ps.a[r] = (uint4*)slotA[sl]->peer[r]; ps.b[r] = (uint4*)slotB[sl]->peer[r]; ps.ch[r] = f - k0; ps.cnt[r] = t - f;
           }
-          if (tt && q == 0) mark();
-          if (rows > 0) {
-            const size_t work = (size_t)mg::WORLD * g * rows * vecsA;
-            if (x8) pushPlanesK<true><<<blocks(work), 256, 0, STREAM>>>(ps, aL, bL, rows, lo, np, vecsA, g);
-            else pushPlanesK<false><<<blocks(work), 256, 0, STREAM>>>(ps, aL, bL, rows, lo, np, vecsA, g);
-          }
-          if (tt) mark();
-          mg::fence();                                // (every rank's rows in this rank's slot; the slot two back read)
-          if (tt) mark();
+          if (rows > 0) pushPlanesK<<<blocks((size_t)mg::WORLD * g * rows * vecsW), 256, 0, st>>>(ps, aL, bL, rows, lo, np, vecsW, g);
+        };
+        // OVERLAPPED (not in rounds): step q + 1's slots pushed on a side stream while step q's GEMM runs - its slots were
+        // last read by step q - 1's GEMM, which every rank finished before passing step q's fence. Through a PCIe host
+        // bridge the pushes were 107 of a triangle's 135 ms at 2,964 tokens on 4 x A6000, beside a 12 ms GEMM, in series
+        bool used[2] = {};
+        if (rounds) produce(0, std::min(C, K), t2);
+        fill(0, STREAM);
+        mg::fence();
+        for (int q = 0; q < steps; ++q) {
+          const int sl = q % 2, sp = pAll[1] ? sl : 0;
+          const bool next = q + 1 < steps;
+          if (next && !rounds) { CK(cudaEventRecord(fenced, STREAM)); CK(cudaStreamWaitEvent(xS, fenced, 0)); fill(q + 1, xS); CK(cudaEventRecord(filled, xS)); }
           int m0, m1; range(q, mg::RANK, m0, m1);
           const int gc = m1 - m0;
-          if (gc <= 0) continue;
-          if (used[sp]) CK(cudaStreamWaitEvent(STREAM, pushed[sp], 0));    // (the last pushes from this product done)
-          gemmAll(gc, (const TQ*)slotA[sl]->local, (const TQ*)slotB[sl]->local, pAll[sp]);
-          if (tt) mark();
-          CK(cudaEventRecord(gemmed[sp], STREAM));
-          CK(cudaStreamWaitEvent(pushS, gemmed[sp], 0));
-          pushRowsK<<<blocks((size_t)gc * np * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
-          CK(cudaEventRecord(pushed[sp], pushS));
-          used[sp] = true;
+          if (gc > 0) {
+            if (used[sp]) CK(cudaStreamWaitEvent(STREAM, pushed[sp], 0));    // (the last pushes from this product done)
+            const TQ *A = (const TQ*)slotA[sl]->local, *Bm = (const TQ*)slotB[sl]->local;
+            if (x8) {        // (e4m3 on the wire, widened here)
+              widenPlanesK<<<blocks((size_t)gc * plane / 8), 256, 0, STREAM>>>((const uint2*)A, (uint4*)aW, (size_t)gc * plane / 8);
+              widenPlanesK<<<blocks((size_t)gc * plane / 8), 256, 0, STREAM>>>((const uint2*)Bm, (uint4*)bW, (size_t)gc * plane / 8);
+              A = aW; Bm = bW;
+            }
+            gemmAll(gc, A, Bm, pAll[sp]);
+            CK(cudaEventRecord(gemmed[sp], STREAM));
+            CK(cudaStreamWaitEvent(pushS, gemmed[sp], 0));
+            pushRowsK<<<blocks((size_t)gc * np * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
+            CK(cudaEventRecord(pushed[sp], pushS));
+            used[sp] = true;
+          }
+          if (!next) break;
+          if (rounds) { const int k1 = (q + 1) * K; produce(k1, std::min(C, k1 + K), nullptr); fill(q + 1, STREAM); }
+          else CK(cudaStreamWaitEvent(STREAM, filled, 0));
+          mg::fence();                                // (every rank's rows in this rank's next slot)
         }
-        if (tt) mark();
+        mark();
         for (int k = 0; k < 2; ++k) if (used[k]) CK(cudaStreamWaitEvent(STREAM, pushed[k], 0));
-        if (tt) mark();                               // (the product pushes' tail)
         mg::fence();                                  // (every rank's product rows here)
-        if (tt) mark();
+        mark();
         if (rows > 0)
           triangleOutRun<CC, WO, B16>((const B16*)pS.local, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                       Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, mineRm);
         if (tt) {
           mark(); CK(cudaEventSynchronize(te.back()));
           auto el = [&](size_t a, size_t b) { float m = 0; CK(cudaEventElapsedTime(&m, te[a], te[b])); return (double)m; };
-          // marks: 0 start, 1 produced, then per step [push-start, pushed, fenced, gemmed], then tail-start, pushes done,
-          // fenced, out done
-          acc[0] += el(0, 1);
-          size_t i = 2;
-          for (int q = 0; q < steps; ++q) {
-            if (q == 0) { /* (push-start mark) */ }
-            size_t a = i;                            // push start (q 0) or previous gemm end
-            acc[1] += el(a, a + 1);                  // push
-            acc[2] += el(a + 1, a + 2);              // fence
-            int f0, f1; range(q, mg::RANK, f0, f1);
-            if (f1 > f0) { acc[3] += el(a + 2, a + 3); i = a + 3; } else i = a + 2;
-          }
-          acc[4] += el(i, i + 2);                    // product pushes' tail
-          acc[5] += el(i + 2, i + 3) + el(i + 3, i + 4);   // fence + output
+          acc[0] += el(0, 1); acc[1] += el(1, 2); acc[2] += el(2, 3); acc[3] += el(3, 4);
           for (auto e : te) CK(cudaEventDestroy(e));
           if (++calls % 96 == 0 && mg::RANK == 0)
-            fprintf(stderr, "  tri %d calls: produce %.1f push %.1f fence %.1f gemm %.1f push-tail %.1f fence+out %.1f ms\n", calls,
-                    acc[0], acc[1], acc[2], acc[3], acc[4], acc[5]);
+            fprintf(stderr, "  tri %d calls: input pass %.1f, exchange + GEMMs %.1f, product tail + fence %.1f, output %.1f ms\n", calls,
+                    acc[0], acc[1], acc[2], acc[3]);
         }
       );
     });
