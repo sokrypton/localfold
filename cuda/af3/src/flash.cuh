@@ -1392,6 +1392,10 @@ void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const f
   // 0.227 / 0.894 / 6.63 / 21.5 / 54.1); the token transformer's one row keeps the rule above
   if (rows >= 32) warps = 4;               // (the denoiser's rows are its samples, a handful)
   if (FLASH_WARPS_OVERRIDE) warps = FLASH_WARPS_OVERRIDE;
+  // a query range (several GPUs, the diffusion's tokens split: a rank's few hundred queries over every key) in blocks of
+  // 4 warps at most - a simulated rank of 8's 25 steps 89.6 -> 84.1 ms at 988 tokens, 161 -> 149 at 2,964 (2 warps
+  // 82.8 / 161, 1 warp 85.9 / 175: narrower blocks each walk every key again)
+  if (FLASH_QHI && !FLASH_WARPS_OVERRIDE) warps = std::min(warps, 4);
   // too few blocks to fill the device: split each 16 queries' keys over four warps instead.
   // Measured at 16 heads, D 48: 9.3 against 14.7 us at 68 tokens, 13.4/19.5 at 192, and worse
   // from 256 (22.8/21.5), where the merge outweighs the parallelism.
