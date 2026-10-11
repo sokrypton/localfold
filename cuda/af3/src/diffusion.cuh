@@ -201,16 +201,17 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
     // (several GPUs on a sharded pair: this rank's rows only, sh::DLO..; streamed, off the bf16 slab's base)
     const size_t pBeg = sh::DLO >= 0 ? (size_t)sh::DLO * n : 0, pEnd = sh::DLO >= 0 ? pBeg + (size_t)sh::DROWS * n : pairs;
     if (sh::DLO >= 0 && !rows16) { fprintf(stderr, "a sharded pair's conditioning is streamed off its bf16 rows\n"); exit(1); }
+    const size_t hostBase = sh::DLO >= 0 ? pBeg : 0;   // (a sharded rank parks its own rows alone, from its first)
     for (size_t p0 = pBeg; p0 < pEnd; p0 += per) {
       size_t r = std::min(per, pEnd - p0);
       if (rows16) {
         const __nv_bfloat16* src = dev16 ? dev16 + p0 * Czt : stage16;
-        if (!dev16) CK(cudaMemcpyAsync(stage16, reinterpret_cast<const __nv_bfloat16*>(PARK_HOST) + p0 * Czt, r * Czt * 2,
+        if (!dev16) CK(cudaMemcpyAsync(stage16, reinterpret_cast<const __nv_bfloat16*>(PARK_HOST) + (p0 - hostBase) * Czt, r * Czt * 2,
                                        cudaMemcpyHostToDevice, STREAM));
         pairRowsF32K<<<blocks(r * Czt), 256, 0, STREAM>>>(src, trunkRows, r * Czt);
         trunkPair = trunkRows - p0 * Czt;
       } else if (fromHost) {
-        CK(cudaMemcpyAsync(trunkRows, PARK_HOST + p0 * Czt, r * Czt * 4, cudaMemcpyHostToDevice, STREAM));
+        CK(cudaMemcpyAsync(trunkRows, PARK_HOST + (p0 - hostBase) * Czt, r * Czt * 4, cudaMemcpyHostToDevice, STREAM));
         trunkPair = trunkRows - p0 * Czt;
       }
       auto features = [&](float* outRows, int trunkWidth) {

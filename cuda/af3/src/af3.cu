@@ -629,11 +629,31 @@ static int foldMain(int argc, char** argv) {
       // 6,916-token fold kept its 12.2 GB bf16 pair on the device and ran out in the preparation)
       parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); dP = nullptr;
     }
+    size_t parkedShare = 0, parkedBytes = 0;
     if (sharded(t)) {                    // the diffusion's conditioning and token attention on this rank's rows
       if (structural) { fprintf(stderr, "a sharded pair: not OpenDDE\n"); return 1; }
       sh::DLO = t.shardLo; sh::DROWS = t.shardRows; dP = pairBase(t);
       GRAPHS = !noGraphs && !mg::SHARED_DEVICE;   // (the steps' graphs: their fences count generations on the device)
       if (DIFF_HALF && oneSample && !M.flag("diffusion.transformer.noResidual")) diffusionSharedBuffers(nD);
+      // ...and short of room, this rank's share of the trunk pair waits in host memory from here: the streamed
+      // preparation reads it a chunk of rows at a time from there and the sampler not at all (the one-GPU park's twin;
+      // 9 GB a rank at 11,856 tokens on 4) - back for the contacts and the confidence head
+      if (keptLo < 0 && shortPair(pairs, t.C)) {
+        parkedShare = t.zS->bytes; parkedBytes = (size_t)t.shardRows * t.n * t.C * 2;
+        if (PARK_HAVE < parkedBytes) {
+          if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
+          if (cudaMallocHost(&PARK_HOST, parkedBytes) != cudaSuccess) {
+            fprintf(stderr, "cannot pin %.2f GB of host memory to park this GPU's share of the pair: this input needs more host RAM\n",
+                    parkedBytes / 1e9);
+            exit(1);
+          }
+          PARK_HAVE = parkedBytes;
+        }
+        CK(cudaMemcpyAsync(PARK_HOST, t.zS->local, parkedBytes, cudaMemcpyDeviceToHost, STREAM));
+        mg::release({ "sh.z" }, mg::FREE);           // (collective: every rank parks alike - the choice is the agreed room's)
+        t.zS = nullptr; t.pair = nullptr; dP = nullptr;
+        mg::tick("share parked");
+      }
     }
     mg::tick("to the diffusion");
     DiffusionFold df = prepareDiffusion(dS, dP, dTf, dSeq, nD);
@@ -663,26 +683,6 @@ static int foldMain(int argc, char** argv) {
       }
     }
     releaseConcatCopies(); memReport("diffusion prepared");
-    // several GPUs on a sharded pair, short of room: this rank's share of the trunk pair waits in host memory through
-    // the sampler, which never reads it (the one-GPU park's twin) - 9 GB a rank at 11,856 tokens on 4, the steps' room
-    // - and comes back for the contacts and the confidence head
-    size_t parkedShare = 0, parkedBytes = 0;
-    if (sharded(t) && keptLo < 0 && shortPair(pairs, t.C)) {
-      parkedShare = t.zS->bytes; parkedBytes = (size_t)t.shardRows * t.n * t.C * 2;
-      if (PARK_HAVE < parkedBytes) {
-        if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
-        if (cudaMallocHost(&PARK_HOST, parkedBytes) != cudaSuccess) {
-          fprintf(stderr, "cannot pin %.2f GB of host memory to park this GPU's share of the pair: this input needs more host RAM\n",
-                  parkedBytes / 1e9);
-          exit(1);
-        }
-        PARK_HAVE = parkedBytes;
-      }
-      CK(cudaMemcpyAsync(PARK_HOST, t.zS->local, parkedBytes, cudaMemcpyDeviceToHost, STREAM));
-      mg::release({ "sh.z" }, mg::FREE);           // (collective: every rank parks alike - the choice is the agreed room's)
-      t.zS = nullptr; t.pair = nullptr; df.trunkPair = nullptr;
-      mg::tick("share parked");
-    }
     // --samples=N: N diffusion samples off one trunk (AF3 runs five) for every seed, each through the
     // confidence head and ranked by AF3's ranking score (src/scores.cuh). A seed's samples run as one
     // batch through the denoiser, sample k of seed s seeded sampleSeed(s, k); the best of them all is
