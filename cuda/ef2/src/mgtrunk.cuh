@@ -61,6 +61,10 @@ inline float* shardedTrunkEf2(int T, int C, int loops) {
     PAIR16 = false;
     mg::tick("trunk pass");
   }
+  // (the triangle's exchange buffers given back: its product share alone is a share - 12.5 GB a rank at 9,880 tokens on
+  // 4, which the contacts' transposed share then could not find)
+  mg::release({ "sh.tp", "sh.tsa", "sh.tsb", "sh.bias", "sh.bg", "sh.zTc" }, mg::FREE);
+  releaseScratch(); trimPool();
   EF2_ZS = &zS;
   return reinterpret_cast<float*>(base);
 }
