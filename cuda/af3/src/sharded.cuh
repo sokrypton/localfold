@@ -204,8 +204,21 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   const std::string tag = std::to_string(C) + (F8 ? "f8" : x8 ? "x8" : "");
   // this rank's rows' a and b ([C][rows][np], read by every rank) and its rows' product ([C][rows][np], written by
   // every rank)
-  mg::Shared& aS = mg::shared("sh.ta" + tag, mine * (x8 ? 1 : sizeof(TQ)));
-  mg::Shared& bS = mg::shared("sh.tb" + tag, mine * (x8 ? 1 : sizeof(TQ)));
+  // ROUNDS (a card short of room; LOCALFOLD_MG_TRI_ROUNDS=1/0 forces either): a and b made a window of K channels at a
+  // time, every rank its rows' for the window, each rank contracting its slice of it - so the operands exchanged are
+  // four buffers of K/C of a slab (two windows, a and b) where they were two whole slabs: 9.4 -> 2.4 GB a rank at
+  // 12,103 tokens on 8. One fence a window; the input pass's LayerNorm repeated a window
+  static const int R_SET = getenv("LOCALFOLD_MG_TRI_ROUNDS") ? atoi(getenv("LOCALFOLD_MG_TRI_ROUNDS")) : -1;
+  const bool rounds = !F8 && !x8 && (R_SET >= 0 ? R_SET > 0 : shortPair((size_t)n * n, C));
+  const int K = std::max(8, C / 8), gR = (K + mg::WORLD - 1) / mg::WORLD;    // (K: a multiple of the input pass's 8)
+  mg::Shared* aR[2] = {}; mg::Shared* bR[2] = {};
+  if (rounds)
+    for (int k = 0; k < 2; ++k) {
+      aR[k] = &mg::shared("sh.ta" + tag + ".r" + std::to_string(k), (size_t)maxShare * np * K * sizeof(TQ));
+      bR[k] = &mg::shared("sh.tb" + tag + ".r" + std::to_string(k), (size_t)maxShare * np * K * sizeof(TQ));
+    }
+  mg::Shared& aS = rounds ? *aR[0] : mg::shared("sh.ta" + tag, mine * (x8 ? 1 : sizeof(TQ)));
+  mg::Shared& bS = rounds ? *bR[0] : mg::shared("sh.tb" + tag, mine * (x8 ? 1 : sizeof(TQ)));
   mg::Shared& pS = mg::shared("sh.tp" + std::to_string(C), mine * sizeof(B16));
   half* t2 = scratch<half>("trib.t2", (size_t)std::max(rows, 1) * np * C);
   if (F8 && incoming) { fprintf(stderr, "sharded triangle: the FP8 GEMM takes the outgoing (TN) form only\n"); exit(1); }
@@ -222,10 +235,12 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   // (LOCALFOLD_MG_TRI_GROUPS=k sets it, for a box to sweep)
   static const int G_SET = getenv("LOCALFOLD_MG_TRI_GROUPS") ? atoi(getenv("LOCALFOLD_MG_TRI_GROUPS")) : 0;
   const int groups = G_SET > 0 ? G_SET : np >= 4096 ? 8 : np >= 2048 ? 4 : 1;
-  int g = std::max(1, (cg + groups - 1) / groups);
-  while (g > 1 && !roomFor((size_t)2 * g * plane * (2 * sizeof(TQ) + sizeof(B16)))) g = (g + 1) / 2;
+  int g = rounds ? gR : std::max(1, (cg + groups - 1) / groups);
+  while (!rounds && g > 1 && !roomFor((size_t)2 * g * plane * (2 * sizeof(TQ) + sizeof(B16)))) g = (g + 1) / 2;
   TQ* aAll[2] = {}; TQ* bAll[2] = {}; B16* pAll[2] = {};
   for (int k = 0; k < 2 && cg; ++k) {
+    // (rounds: one pull at a time; a second product - one window's push beside the next one's GEMM - where it fits)
+    if (rounds && k) { if (roomFor((size_t)g * plane * sizeof(B16))) pAll[k] = scratch<B16>("trib.pall1", (size_t)g * plane); continue; }
     aAll[k] = scratch<TQ>("trib.aall" + std::to_string(k), (size_t)g * plane);
     bAll[k] = scratch<TQ>("trib.ball" + std::to_string(k), (size_t)g * plane);
     pAll[k] = scratch<B16>("trib.pall" + std::to_string(k), (size_t)g * plane);
@@ -257,6 +272,34 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         constexpr auto kern = triIn256For<CC, WI, TQ, PT>();
         constexpr auto kern8 = triIn256For<CC, WI, __nv_fp8_e4m3, PT>();
         const unsigned grid = (unsigned)(((size_t)rows * np + triInRowsOf(WI) - 1) / triInRowsOf(WI));
+        if (rounds) {
+          if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+          const int nr = (C + K - 1) / K;
+          bool used[2] = {};
+          for (int r = 0; r < nr; ++r) {
+            const int k0 = r * K, kw = std::min(K, C - k0), sl = r % 2, sp = pAll[1] ? sl : 0;   // (sp: the product's)
+            // (the window's planes at their channels' places: the buffer based k0 channels back; the gate once)
+            RectMap win = mineRm; win.ab0 = k0 / 8; win.ab1 = (k0 + kw) / 8;
+            if (rows > 0)
+              kern<<<grid, 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+                base, mask, lnS, lnO, wt, (TQ*)aR[sl]->local - (size_t)k0 * mineRm.size, (TQ*)bR[sl]->local - (size_t)k0 * mineRm.size,
+                r == 0 ? t2 : nullptr, n, np, cs, nullptr, win);
+            mg::fence();                              // (every rank's window written; the one before it read by all)
+            const int m0 = k0 + mg::RANK * gR, m1 = std::min(k0 + kw, m0 + gR), gc = m1 - m0;
+            if (gc <= 0) continue;
+            if (used[sp]) CK(cudaStreamWaitEvent(STREAM, pushed[sp], 0));    // (the last pushes from this product done)
+            pullPlanesK<<<blocks((size_t)gc * np * vecsA), 256, 0, STREAM>>>(peerPlanes(*aR[sl], bR[sl], n), (uint4*)aAll[0],
+                                                                             (uint4*)bAll[0], m0 - k0, gc, np, vecsA);
+            gemmAll(gc, aAll[0], bAll[0], pAll[sp]);
+            CK(cudaEventRecord(gemmed[sp], STREAM));
+            CK(cudaStreamWaitEvent(pushS, gemmed[sp], 0));
+            pushRowsK<<<blocks((size_t)gc * np * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
+            CK(cudaEventRecord(pushed[sp], pushS));
+            used[sp] = true;
+          }
+          for (int k = 0; k < 2; ++k) if (used[k]) CK(cudaStreamWaitEvent(STREAM, pushed[k], 0));
+          mg::fence();                                // (every rank's product rows here)
+        } else {
         if (rows > 0 && !x8) {
           if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
           kern<<<grid, 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
@@ -287,6 +330,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         if (q) { CK(cudaStreamWaitEvent(STREAM, pushed[(q - 1) % 2], 0)); CK(cudaStreamWaitEvent(STREAM, pulled[(q - 1) % 2], 0)); }
         if (q > 1) CK(cudaStreamWaitEvent(STREAM, pushed[q % 2], 0));
         mg::fence();                                  // (every rank's product rows here; no rank reads a or b any more)
+        }
         if (rows > 0)
           triangleOutRun<CC, WO, B16>((const B16*)pS.local, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                       Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, mineRm);

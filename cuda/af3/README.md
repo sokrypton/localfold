@@ -1545,6 +1545,26 @@ times) on the same box: 988 tokens 16.2 s on one GPU (`fast`), 59.5 s on 8; 2,96
 both modes, 99.1 s on 8; 5,928 251.6 s on 8. Its row-sharded pair is ours; its triangle is a ring (each rank receives
 the whole projected b whatever P, for results independent of P), NCCL rather than IPC, and no device-side fences.
 
+#### How large a fold fits 40 GB a GPU (2026-10-11, simulated ranks)
+
+The largest single-sequence AF3 fold on N x 40 GB, found on a simulated rank of N on this A100 (`LOCALFOLD_MG_SIMULATE`:
+one rank's real memory, 25 steps, no recycles - a box adds what its peers' mappings take, so confirm there):
+
+| GPUs | before | now | first refused |
+|---:|---:|---:|---:|
+| 1 | ~7,900 | ~7,900 | |
+| 2 | 4,940 | **6,916** | 7,410 |
+| 4 | 8,645 | **9,633** | 10,127 |
+| 8 | 12,103 | **13,091** | 14,079 |
+
+A rank held some 5.25 slabs (its rows of the pair, z^T, the triangle's a, b and product, a bias) where one GPU holds one
+pair, so 2 GPUs took fewer tokens than 1. On a card short of room now: the channel-split triangle in ROUNDS (a and b made
+a 16-channel window at a time into four buffers of 1/8 slab, `LOCALFOLD_MG_TRI_ROUNDS=1/0` forces either; 18.19 ->
+18.28 s for a simulated rank of 8 at 5,928 tokens), the template stack borrowing the trunk's z^T slab (its 64-channel f32
+slabs are the 128-channel bf16 one's size), and one product buffer where two do not fit. Each limit now falls on the
+next sub-GB buffer. With everything forced (`LOCALFOLD_BIG=1`), 5CAJ self-templated is 0.000 A from one GPU on 2 and 3
+ranks. (`--out=/dev/null` for such runs: a 13K fold's `_confidences.json` is 2.2 GB.)
+
 ### A V100 (sm_70): correct, through emulated tensor-core helpers (2026-10-10)
 
 Volta has no m16n8k8/k16 MMA, no `ldmatrix`, no `tanh.approx` and no f16 `ex2`, which every fused kernel here is

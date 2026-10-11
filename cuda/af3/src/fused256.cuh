@@ -172,7 +172,8 @@ size_t transitionUpChunkRows(size_t smem, size_t budgetRows) {
 // T (the input kernel): its rows read the pair TRANSPOSED - row (u, v) takes pair (v, u) - so the
 // incoming triangle's operands come out with the contraction's index contiguous, as the outgoing one's do (an FP8 GEMM
 // takes only that layout); its t2 rows still land at their own pair's place, where the output kernel reads them
-struct RectMap { int i0 = 0, J = 0, j0 = 0; size_t size = 0; bool T = false; };
+// ab0, ab1: the input kernel's a/b steps [ab0, ab1) alone (triIn256K; -1 all of them)
+struct RectMap { int i0 = 0, J = 0, j0 = 0; size_t size = 0; bool T = false; int ab0 = 0, ab1 = -1; };
 // prod: channel-major [C][Lp][Lp] f32 (the padded contraction's output); t2: the gating linear's raw
 // output, [Lp * Lp][C] f16 (triInK's); pair: [L * L][C] f32. A block is 16 WARPS pairs: the product
 // tile is staged channel-major (stride R + 1: the per-row reductions read a column, conflict-free), the
@@ -411,6 +412,8 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ Wt,
     TA* __restrict__ a, TA* __restrict__ b, half* __restrict__ t2, int n, int np, size_t cs,
     const float* __restrict__ bias = nullptr, RectMap rm = {}) {
+  // [rm.ab0, rm.ab1): the a/b steps (8 channels each) this launch makes - a and b written at their channels' places, so
+  // a caller holding a few channels hands planes based that many channels back (sharded.cuh's rounds); -1, all of them
   // rm: a rectangle's rows (RectMap), its planes `size` long; a null a, b or t2 is not written (the blocks' passes each
   // want one operand)
   // the weight stage is unpadded, [k][NC], its two 16-byte halves swapped on rows with bit 2 of k set
@@ -447,7 +450,10 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
   size_t row0 = (size_t)blockIdx.x * R;
   // the gating linear's steps take TWO of its tiles, one a stage (w1 idles there otherwise): four accumulator
   // chains a step where they had two, and half the steps (ncu had the kernel waiting on its MMA chains)
-  const int abSteps = C / CH, steps = abSteps + (t2 ? C / NC / 2 : 0);   // (no t2: the gating linear skipped)
+  const int abSteps = C / CH;
+  const int ab0 = rm.ab0, nAb = (rm.ab1 < 0 ? abSteps : rm.ab1) - rm.ab0;
+  const int steps = nAb + (t2 ? C / NC / 2 : 0);                          // (no t2: the gating linear skipped)
+  auto stepOf = [&](int i) { return i < nAb ? ab0 + i : abSteps + (i - nAb); };   // (the weight tiles' step)
   constexpr int ITER = (C * (NC / 8) + NTH - 1) / NTH;
   // step j's two weight tiles, each 16-byte piece handed to op(index, its place in stage st, its source)
   auto stage = [&](int j, int st, auto&& op) {
@@ -476,11 +482,11 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
 #pragma unroll
       for (int ks = 0; ks < KS; ++ks) ldsm4(xa[mt][ks], Xs + ((warp * MT + mt) * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
     __syncthreads();                    // every warp has its fragments: the stages take the rows' memory
-    issue(0, 0);
+    issue(stepOf(0), 0);
   } else {
     static_assert(R % XROUNDS == 0 && (R / XROUNDS) % 16 == 0 && (R / XROUNDS) % WARPS == 0, "whole warps' rows a round");
     constexpr int XR = R / XROUNDS;
-    issue(0, 0);                        // (the stages have memory of their own here)
+    issue(stepOf(0), 0);                // (the stages have memory of their own here)
 #pragma unroll 1
     for (int rd = 0; rd < XROUNDS; ++rd) {
       lnRowsToShared<C, XR, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + rd * XR + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
@@ -499,12 +505,12 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
     size_t pr0 = pairOf(row0 + lr0[mt]), pr1 = pairOf(row0 + lr1[mt]);
     m0[mt] = pr0 != SIZE_MAX ? mask[pr0] : 0.f; m1[mt] = pr1 != SIZE_MAX ? mask[pr1] : 0.f;
   }
-  for (int j = 0; j < steps; ++j) {
-    int st = j & 1;
+  for (int it = 0; it < steps; ++it) {
+    const int j = stepOf(it), st = it & 1;
 #if LF_REG_STAGES
-    if (j + 1 < steps) stage(j + 1, st ^ 1, [&](int i, half*, const half* s) { next.load(i, s); });
+    if (it + 1 < steps) stage(stepOf(it + 1), st ^ 1, [&](int i, half*, const half* s) { next.load(i, s); });
 #else
-    if (j + 1 < steps) { issue(j + 1, st ^ 1); cpWait<1>(); }
+    if (it + 1 < steps) { issue(stepOf(it + 1), st ^ 1); cpWait<1>(); }
     else cpWait<0>();
 #endif
     __syncthreads();
@@ -579,7 +585,7 @@ __global__ void __launch_bounds__(WARPS * 32) triIn256K(const float* __restrict_
       }
     }
 #if LF_REG_STAGES
-    if (j + 1 < steps) stage(j + 1, st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });   // (stage st^1 was
+    if (it + 1 < steps) stage(stepOf(it + 1), st ^ 1, [&](int i, half* d, const half*) { next.store(i, d); });   // (stage st^1 was
 #endif                                                                         // last read before this step's barrier)
     __syncthreads();
   }

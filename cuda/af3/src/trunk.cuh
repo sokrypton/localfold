@@ -545,7 +545,10 @@ void templateEmbedding(Trunk& t, float* out) {
   // 37.4 GB peak, in the MSA stack)
   // (a card short of room alone: its passes run eagerly, where a captured pass holds its buffers for its replays)
   const bool giveBack = sharded(t) && shortPair((size_t)n * n, Cq);
-  if (giveBack) mg::release({ "sh.ta", "sh.tb", "sh.tp", "sh.bias" });
+  // (and the trunk's z^T slab, which nothing reads in this stack: its 64-channel f32 slabs are the 128-channel bf16 one's
+  // size, so the stack takes it from the pool and gives it back at its end - a slab a rank, 4.7 GB at 13,091 tokens on 8)
+  const size_t zTBytes = giveBack && t.zTS ? t.zTS->bytes : 0;
+  if (giveBack) { mg::release({ "sh.ta", "sh.tb", "sh.tp", "sh.bias", "sh.zT" }); t.zTS = nullptr; }
   // (a sharded pair: every pair-sized tensor here is this rank's rows, `pairs` of them from global pair hf)
   const size_t pairs = heldPairs(t), hf = heldFirst(t), allPairs = (size_t)n * n;
   const std::string P = "trunk.template.";
@@ -657,7 +660,7 @@ void templateEmbedding(Trunk& t, float* out) {
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
   linearIntoPair<float>(summed, out, t.p16 && out == t.pair, 0, pairs, Ct, Cq, P + "outputLinear");
   if (tight) releaseScratch({ "p16." });     // (not held into the next pass's template stack, which binds there)
-  if (giveBack) mg::release({ "sh.tz", "sh.bg", "sh.biasg" });
+  if (giveBack) { mg::release({ "sh.tz", "sh.bg", "sh.biasg" }); if (zTBytes) t.zTS = &mg::shared("sh.zT", zTBytes); }
 }
 
 // ---------------------------------------------------------------- MSA stack
