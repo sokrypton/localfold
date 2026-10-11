@@ -390,12 +390,18 @@ static int foldInput(const Opts& o, bool warm) {
   float* xd = upload(coords.data(), (size_t)A * 3);
   bool profConf = profile && profStage == "confidence";
   if (profConf) { prof::init(); prof::start(); }
-  if (mg::WORLD > 1) {                          // (several GPUs: every rank's share into rank 0's host memory; the others leave)
+  Confidence conf;
+  if (mg::WORLD > 1) {                          // (several GPUs: the head sharded as the trunk is - mgtrunk.cuh - then the others leave)
     unparkShareEf2(T, C);
-    pairOntoRank0HostEf2(T, C);
+    conf = confidenceHeadSharded(T, A, sInputs, Si, xd);
+    mg::release({ "" }, mg::FINAL);
+    if (mg::RANK != 0) mg::leave();
+    mg::finish();
+    mg::WORLD = 1; SHORT_PAIR_SHARE = 1; EF2_QLO = EF2_QROWS = 0; EF2_ZS = nullptr;
+  } else {
+    if (EF2_Z16) releaseScratch();              // (the head reads the parked bf16 pair itself: zTrunk null)
+    conf = confidenceHead(T, A, EF2_Z16 ? nullptr : z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
   }
-  if (EF2_Z16) releaseScratch();                // (the head reads the parked bf16 pair itself: zTrunk null)
-  Confidence conf = confidenceHead(T, A, EF2_Z16 ? nullptr : z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
   if (profConf) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   mem("confidence");
   say("confidence %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());

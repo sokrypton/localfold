@@ -157,3 +157,147 @@ inline std::vector<float> shardedContactsEf2(int T, int C, int bins, ContactsK c
   releaseScratch({ "dg." });
   return out;
 }
+
+// tmRowsK's, rows [i0, i0 + gridDim.x) of a chunk tm holding those rows alone
+__global__ void tmRowsAtK(const float* tm, const int* asym, double* rows, int T, int i0) {
+  const int il = blockIdx.x, i = i0 + il;
+  __shared__ double s[2][256], c[256];
+  double sum = 0, isum = 0, icnt = 0;
+  for (int j = threadIdx.x; j < T; j += blockDim.x) {
+    double v = tm[(size_t)il * T + j]; sum += v;
+    if (asym[i] != asym[j]) { isum += v; icnt += 1; }
+  }
+  s[0][threadIdx.x] = sum; s[1][threadIdx.x] = isum; c[threadIdx.x] = icnt;
+  __syncthreads();
+  for (int o = blockDim.x / 2; o; o >>= 1) {
+    if (threadIdx.x < o) { s[0][threadIdx.x] += s[0][threadIdx.x + o]; s[1][threadIdx.x] += s[1][threadIdx.x + o]; c[threadIdx.x] += c[threadIdx.x + o]; }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { rows[2 * i] = s[0][0] / (T + 1e-8); rows[2 * i + 1] = s[1][0] / (c[0] + 1e-8); }
+}
+
+// The confidence head across the ranks (confidence.cuh's, its EF2_Z16 form sharded): each rank builds the head's pair
+// on its rows of the trunk's - in place, a chunk of token rows at a time, the f32 sum kept in its own pinned host memory
+// as the residual - the head's blocks run as the trunk's do (the sharded triangle, the transition on own rows), and the
+// pooling, the PAE and the pTM rows come off each rank's rows and are all-gathered. Every rank returns the same
+// Confidence; rank 0's is written.
+inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int Si, const float* xDevice) {
+  using B16 = __nv_bfloat16;
+  const int C = (int)dimOf("f/confidence/sToZ", 1), Cs = (int)dimOf("f/confidence/poolingOutput", 1);
+  const size_t P = (size_t)T * T;
+  int lo, hi; sh::rowsOf(T, mg::RANK, lo, hi);
+  const int rows = sh::storedRows(T, mg::RANK);
+  const size_t held = (size_t)rows * T;
+  B16* zl = (B16*)EF2_ZS->local;
+  float* s = scratch<float>("cf.s", (size_t)T * Si);
+  layerNorm(sInputs, s, T, Si, F("confidence/sInputsNorm/scale"), F("confidence/sInputsNorm/offset"));
+  float* r = scratch<float>("cf.r", (size_t)T * C); float* c = scratch<float>("cf.c", (size_t)T * C);
+  float* l = scratch<float>("cf.l", (size_t)T * C); float* rr = scratch<float>("cf.rr", (size_t)T * C);
+  gemm(s, F("confidence/sToZ"), r, T, Si, C);
+  gemm(s, F("confidence/sToZTranspose"), c, T, Si, C);
+  gemm(s, F("confidence/sToZProdIn1"), l, T, Si, C);
+  gemm(s, F("confidence/sToZProdIn2"), rr, T, Si, C);
+  const int rb = (int)std::max<size_t>(1, ((size_t)64 << 20) / ((size_t)T * C * 4));   // token rows a chunk
+  const size_t per = (size_t)rb * T;
+  static float* resid = nullptr; static size_t residHave = 0;
+  if (residHave < std::max<size_t>(held * C, 1)) {
+    if (resid) CK(cudaFreeHost(resid));
+    if (cudaMallocHost(&resid, std::max<size_t>(held * C, 1) * 4) != cudaSuccess) {
+      fprintf(stderr, "cannot pin %.2f GB of host memory for the confidence head's residual\n", held * C * 4 / 1e9); exit(1);
+    }
+    residHave = std::max<size_t>(held * C, 1);
+  }
+  {
+    float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
+    float* prodc = scratch<float>("cf.prodc", per * C);
+    for (int i0 = lo; i0 < lo + rows; i0 += rb) {
+      const int b = std::min(rb, lo + rows - i0); const size_t n = (size_t)b * T, q0 = (size_t)i0 * T, ql = (size_t)(i0 - lo) * T;
+      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(zl + ql * C, xn, n * C);
+      layerNorm(xn, zc, n, C, F("confidence/zNorm/scale"), F("confidence/zNorm/offset"));
+      confZRowsK<<<blocks(n * C), 256, 0, STREAM>>>(zc, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"), r, c, q0, n, T, C);
+      outerProductK<<<blocks(n * C), 256, 0, STREAM>>>(l, rr, prodc, q0, n, T, C);
+      gemm(prodc, F("confidence/sToZProdOut"), zc, n, C, C, 1.f);
+      distanceEmbedRowsK<<<blocks(n * 32), 256, 0, STREAM>>>(zc, xDevice, Idev("distogram_atom_idx"), F("confidence/boundaries"),
+        (int)M.len("f/confidence/boundaries"), F("confidence/distanceEmbedding"), q0, n, T, C);
+      CK(cudaMemcpyAsync(resid + ql * C, zc, n * C * 4, cudaMemcpyDeviceToHost, STREAM));
+      ef2ToBf16K<<<blocks(n * C), 256, 0, STREAM>>>(zc, zl + ql * C, n * C);
+    }
+    releaseScratch({ "cf.zc", "cf.xn", "cf.prodc" });
+  }
+  float* mask = scratch<float>("trunk.mask", P);
+  fillK<<<blocks(P), 256, 0, STREAM>>>(mask, 1.f, P);
+  PAIR16 = true;
+  for (int b = 0; M.has("f/confidence/blocks/" + std::to_string(b) + "/pairTransition/transition1"); ++b) {
+    const std::string B = "confidence/blocks/" + std::to_string(b) + "/";
+    mg::fence();                                       // (every rank's rows of the head's pair written)
+    sh::triangleSharded<half>(*EF2_ZS, mask, T, C, B + "triangleMultiplicationOutgoing", false, false);
+    sh::triangleSharded<half>(*EF2_ZS, mask, T, C, B + "triangleMultiplicationIncoming", false, true);
+    if (held) transition256(reinterpret_cast<float*>(zl), held, C, B + "pairTransition/");
+  }
+  PAIR16 = false;
+  releaseScratch({ "ftri.", "ftr.", "trib.", "trunk.mask" });
+  // the head's outputs off this rank's rows: the pooling's rows, the PAE and pTM rows - all-gathered
+  const int pb = (int)dimOf("f/confidence/pae", 1), Tp = (T + 3) / 4 * 4;
+  mg::Shared& pooledS = mg::shared("ef2.cf.pooled", (size_t)T * C * 4);
+  mg::Shared& tmS = mg::shared("ef2.cf.tmrows", (size_t)T * 2 * 8);
+  mg::Shared& paeS = mg::shared("ef2.cf.pae", (size_t)T * Tp * 4);
+  float* pooled = (float*)pooledS.local; double* rowsD = (double*)tmS.local; float* paeAll = (float*)paeS.local;
+  const double width = 32.0 / pb, d0 = 1.24 * cbrt(std::max(T, 19) - 15.0) - 1.8;
+  {
+    float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
+    float* score = scratch<float>("cf.scoreRows", per); float* paeL = scratch<float>("cf.paeRows", per * pb);
+    float* paeD = scratch<float>("cf.paeOutRows", per); float* tmD = scratch<float>("cf.tmRows1", per);
+    for (int i0 = lo; i0 < lo + rows; i0 += rb) {
+      const int b = std::min(rb, lo + rows - i0); const size_t n = (size_t)b * T, ql = (size_t)(i0 - lo) * T;
+      CK(cudaMemcpyAsync(xn, resid + ql * C, n * C * 4, cudaMemcpyHostToDevice, STREAM));
+      ef2FromBf16K<<<blocks(n * C), 256, 0, STREAM>>>(zl + ql * C, zc, n * C);
+      addK<<<blocks(n * C), 256, 0, STREAM>>>(zc, xn, n * C);
+      gemm(zc, F("confidence/poolingAttention"), score, n, C, 1);
+      rowPoolK<<<(unsigned)b, 256, 0, STREAM>>>(zc, score, pooled + (size_t)i0 * C, T, C);
+      if (M.has("f/confidence/paeNorm/scale")) {
+        layerNorm(zc, xn, n, C, F("confidence/paeNorm/scale"), F("confidence/paeNorm/offset"));
+        gemm(xn, F("confidence/pae"), paeL, n, C, pb);
+      } else gemm(zc, F("confidence/pae"), paeL, n, C, pb);
+      paeK<<<blocks(n), 256, 0, STREAM>>>(paeL, paeD, tmD, n, pb, width, d0);
+      tmRowsAtK<<<(unsigned)b, 256, 0, STREAM>>>(tmD, Idev("asym_id"), rowsD, T, i0);
+      CK(cudaMemcpy2DAsync(paeAll + (size_t)i0 * Tp, (size_t)Tp * 4, paeD, (size_t)T * 4, (size_t)T * 4, b, cudaMemcpyDeviceToDevice, STREAM));
+    }
+    releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.paeRows", "cf.paeOutRows", "cf.tmRows1" });
+  }
+  mg::allGather(pooledS, (size_t)lo * C * 4, (size_t)rows * C * 4);
+  mg::allGather(tmS, (size_t)lo * 16, (size_t)rows * 16);
+  mg::allGather(paeS, (size_t)lo * Tp * 4, (size_t)rows * Tp * 4);
+  // the single and the per-atom pLDDT (confidenceHead's, on the gathered pooling) - every rank alike
+  float* single = scratch<float>("cf.single", (size_t)T * Cs);
+  gemm(pooled, F("confidence/poolingOutput"), single, T, C, Cs);
+  int bins = (int)dimOf("f/confidence/plddtWeight", 2), slots = (int)dimOf("f/confidence/plddtWeight", 0);
+  std::vector<int> a2t(A), slot(A);
+  CK(cudaMemcpy(a2t.data(), Idev("atom_to_token"), A * 4, cudaMemcpyDeviceToHost));
+  for (int a = 0, k = 0; a < A; ++a) { if (a > 0 && a2t[a] != a2t[a - 1]) k = 0; slot[a] = std::min(k++, slots - 1); }
+  int* dSlot = upload(slot.data(), A);
+  float* sa = scratch<float>("cf.sa", (size_t)A * Cs); float* pa = scratch<float>("cf.pa", A);
+  gatherAtomsK<<<blocks((size_t)A * Cs), 256, 0, STREAM>>>(single, Idev("atom_to_token"), sa, A, Cs);
+  layerNorm(sa, sa, A, Cs, F("confidence/plddtNorm/scale"), F("confidence/plddtNorm/offset"));
+  plddtAtomK<<<A, 64, 0, STREAM>>>(sa, dSlot, F("confidence/plddtWeight"), pa, A, Cs, bins);
+  Confidence out;
+  out.plddtAtom = download(pa, A);
+  std::vector<float> mask_ = download(W("atom_mask"), A);
+  out.plddtToken.assign(T, 0.f);
+  std::vector<float> cnt(T, 0.f);
+  double wsum = 0, wtot = 0;
+  for (int a = 0; a < A; ++a) {
+    out.plddtToken[a2t[a]] += out.plddtAtom[a] * mask_[a]; cnt[a2t[a]] += mask_[a];
+    wsum += out.plddtAtom[a] * mask_[a]; wtot += mask_[a];
+  }
+  for (int t = 0; t < T; ++t) out.plddtToken[t] /= std::max(cnt[t], 1e-6f);
+  out.meanPlddt = wsum / (wtot + 1e-8);
+  out.pae.resize(P);
+  CK(cudaMemcpy2D(out.pae.data(), (size_t)T * 4, paeAll, (size_t)Tp * 4, (size_t)T * 4, T, cudaMemcpyDeviceToHost));
+  std::vector<double> rowsH(2 * (size_t)T);
+  CK(cudaMemcpy(rowsH.data(), rowsD, rowsH.size() * 8, cudaMemcpyDeviceToHost));
+  double ptm = -1e30, iptm = -1e30;
+  for (int i = 0; i < T; ++i) { ptm = std::max(ptm, rowsH[2 * i]); iptm = std::max(iptm, rowsH[2 * i + 1]); }
+  out.ptm = ptm; out.iptm = iptm;
+  CK(cudaFree(dSlot));
+  return out;
+}
