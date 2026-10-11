@@ -691,7 +691,7 @@ template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ 
 // a T4's form (no cp.async; two stages are 39 KB, one block of 4 warps an SM there, one is three)
 // (an FP8 part runs flash8 below instead, through the pair track: e4m3 MMAs, half of these)
 // OT: the output's type - f16, or bf16 (cuda/af2's bf16 MSA, whose output projection then reads bf16)
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half>
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half, bool SPEC = false>
 __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flashGrid2R(const half* __restrict__ qkvg, const half* __restrict__ bias,
     int biasStride, OT* __restrict__ out, int n, int heads, float scale, const float* qBias, size_t rowsTotal,
     size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride, int sw) {
@@ -908,22 +908,45 @@ __global__ void __launch_bounds__(WARPS * RR * 32, WARPS * RR == 4 ? 3 : 1) flas
     // (skipping the rescale when no row of the warp moved its max - a vote, each factor then exactly 1 - is
     // byte-identical and slower: 2211 -> 2251 ms of AF3's grid attention at 1,044 tokens, 111 -> 123 ms of
     // AF2's MSA column attention)
+    // SPEC (speculative softmax, BioIR's ClaudeKit kernel's idea): a tile whose every row stays within 2^8 of the warp's
+    // running maximum keeps it - its P exponentiated against the stale maximum (at most 2^8, an f16), the cross-lane
+    // maximum, the two rescale exponentials and the O and l rescale skipped; any row past it takes the full step for
+    // the warp (the first tile always). o / l is the same softmax whichever reference P was taken against
     __half2 hn[MT][2];
+    bool full = true;
+    if constexpr (SPEC) {
+      bool over = false;
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-      __half2 x0 = asH2(sh[mt][0][0]), x1 = asH2(sh[mt][0][1]);
+      for (int mt = 0; mt < MT; ++mt) {
+        __half2 x0 = asH2(sh[mt][0][0]), x1 = asH2(sh[mt][0][1]);
 #pragma unroll
-      for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, asH2(sh[mt][nt][0])); x1 = __hmax2(x1, asH2(sh[mt][nt][1])); }
-      float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
-      t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
-      t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
-      float n0 = __half2float(__float2half(fmaxf(mx[mt][0], t0))), n1 = __half2float(__float2half(fmaxf(mx[mt][1], t1)));
-      float c0 = exp2f(mx[mt][0] - n0), c1 = exp2f(mx[mt][1] - n1);
-      mx[mt][0] = n0; mx[mt][1] = n1;
+        for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, asH2(sh[mt][nt][0])); x1 = __hmax2(x1, asH2(sh[mt][nt][1])); }
+        float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
+        over |= t0 > mx[mt][0] + 8.f || t1 > mx[mt][1] + 8.f;
+      }
+      full = __any_sync(~0u, over);
+      if (!full) {
 #pragma unroll
-      for (int et = 0; et < D / 8; ++et) { o[mt][et][0] *= c0; o[mt][et][1] *= c0; o[mt][et][2] *= c1; o[mt][et][3] *= c1; }
-      lsum[mt][0] *= c0; lsum[mt][1] *= c0; lsum[mt][2] *= c1; lsum[mt][3] *= c1;
-      hn[mt][0] = __float2half2_rn(n0); hn[mt][1] = __float2half2_rn(n1);
+        for (int mt = 0; mt < MT; ++mt) { hn[mt][0] = __float2half2_rn(mx[mt][0]); hn[mt][1] = __float2half2_rn(mx[mt][1]); }
+      }
+    }
+    if (full) {
+  #pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        __half2 x0 = asH2(sh[mt][0][0]), x1 = asH2(sh[mt][0][1]);
+  #pragma unroll
+        for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, asH2(sh[mt][nt][0])); x1 = __hmax2(x1, asH2(sh[mt][nt][1])); }
+        float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
+        t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
+        t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+        float n0 = __half2float(__float2half(fmaxf(mx[mt][0], t0))), n1 = __half2float(__float2half(fmaxf(mx[mt][1], t1)));
+        float c0 = exp2f(mx[mt][0] - n0), c1 = exp2f(mx[mt][1] - n1);
+        mx[mt][0] = n0; mx[mt][1] = n1;
+  #pragma unroll
+        for (int et = 0; et < D / 8; ++et) { o[mt][et][0] *= c0; o[mt][et][1] *= c0; o[mt][et][2] *= c1; o[mt][et][3] *= c1; }
+        lsum[mt][0] *= c0; lsum[mt][1] *= c0; lsum[mt][2] *= c1; lsum[mt][3] *= c1;
+        hn[mt][0] = __float2half2_rn(n0); hn[mt][1] = __float2half2_rn(n1);
+      }
     }
 #pragma unroll
     for (int t = 0; t < BK / 16; ++t) {
@@ -1014,7 +1037,7 @@ inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_F
 // 6,000 tokens and 12% behind at 1,000: past the L2 (66% busy in Nsight Compute) the kernel is latency-bound at 168
 // registers a thread, three blocks an SM; key tiles of 32, 64 or 80 are 2-5% behind 48 at 6,000 too)
 inline int GRID_SWIZZLE = getenv("LOCALFOLD_GRID_SWIZZLE") ? atoi(getenv("LOCALFOLD_GRID_SWIZZLE")) : -1;
-template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half>
+template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half, bool SPEC = false>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int n, int heads, size_t rows, float scale,
                     const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
                     size_t outPosStride = 0) {
@@ -1025,9 +1048,9 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int
   // tiles a warp overflowed it, an illegal access)
   const int bytes = std::max((ONE ? 1 : 2) * (int)fa2Stage<D, WARPS, BK, MT, RR>(), WARPS * RR * 16 * MT * (D + 8) * 2);
   static bool attr = false;
-  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT>), bytes); attr = true; }
+  if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT, SPEC>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
-  flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
+  flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT, SPEC><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
                                                                               rowStride, posStride, outRowStride, outPosStride, GRID_SWIZZLE >= 0 ? GRID_SWIZZLE : n >= 3500 ? 4 : 0);
 }
 // 64-key tiles for the dense 32-wide grid attention where an SM holds two of its blocks (an A100, a Hopper part): on
@@ -1036,6 +1059,11 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int
 // older kernel; a 100 KB-an-SM part (an A6000, an L4, an RTX PRO 6000) would hold one 64-key block where it holds two
 // of 48. (BioIR's sm_80 triangle attention takes 64-key tiles; theirs against ours is cuda/af3/README.md's, 2026-10-12.)
 // LOCALFOLD_FLASH_2R_BK=48|64 forces either
+// ...and its speculative softmax (flashGrid2R's SPEC; BioIR's ClaudeKit kernel's idea): --bench-grid 9.72 -> 9.36 ms at
+// 3,072 tokens, 38.5 -> 37.0 at 6,144 (256 rows); a whole trunk pass at 2,964 tokens its two grid stages 6.85 -> 6.69 s
+// each; 5CAJ self-templated 0.005 A from the plain softmax. (The 48-key form, a 100 KB-an-SM card's, keeps the plain
+// softmax until measured there.) LOCALFOLD_FLASH_SPEC=0 turns it off
+inline bool FLASH_SPEC = !getenv("LOCALFOLD_FLASH_SPEC") || atoi(getenv("LOCALFOLD_FLASH_SPEC"));
 inline bool flash2RWideKeys() {
   static const bool v = [] {
     if (const char* e = getenv("LOCALFOLD_FLASH_2R_BK")) return atoi(e) == 64;
@@ -1379,7 +1407,8 @@ void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const floa
     flashGridHalf<D, WARPS, true, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
   } else if (FLASH_2R && !REG && D == 32 && WARPS == 4 && BK == 48) {   // (the unmasked kernel reads no r0)
-    if (flash2RWideKeys()) flashGrid2RRun<D, 2, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    if (flash2RWideKeys() && FLASH_SPEC) flashGrid2RRun<D, 2, 64, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    else if (flash2RWideKeys()) flashGrid2RRun<D, 2, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
     else flashGrid2RRun<D, 2, BK, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
   } else if (FLASH_F16S) {
     setFlashSmem<D, WARPS, false, BK, REG, MINB, true>();
