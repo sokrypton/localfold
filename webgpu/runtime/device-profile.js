@@ -1231,14 +1231,19 @@ const PRIORS = new Map([
     // ms untiled -> 491 / 505 tiled in f16 (the f32 tiled form is level with the untiled one, 635 / 660), the whole
     // pass's GPU time 3443 / 3554 -> 3323 / 3413. Tiles of 8x4 are 2.5x WORSE (1616). The f16 arm stages q, k, v and P
     // in halves and takes the q.k dot four products at a time in f16; the softmax statistics and the output stay f32.
-    gridAttendTiled: true,
-    gridAttendTiledHalf: true,
+    // 🔴 AND NOT SET, BECAUSE THE M2 LOSES WHAT THE M5 GAINS AND THE BROWSER CANNOT TELL THEM APART: both report
+    // `apple / metal-3`, nothing more (adapter.info's device and description are empty). On the M2 (10-core GPU,
+    // macOS 13.2, Chrome 154, stock flags), the same pass, two rounds alternated: grid.attend 995 / 1073 ms untiled ->
+    // 1444 / 1502 tiled in f16, the pass's GPU 5455 / 5805 -> 5675 / 6028 (+4%) - against the M5's -3.5%. Most Apple
+    // visitors are not on an M5, so the older parts keep the untiled kernel. `--tune-json={"gridAttendTiled":true,
+    // "gridAttendTiledHalf":true}` is the M5's arm.
     // 🔴 THE TRIANGLE'S PROJECTION TILE AT 32x32, AMPERE'S, MEASURED ON AN M5 UNDER STOCK FLAGS. bench-triangle-project
     // at 255 tokens: project 5.06 -> 4.79 ms, project-out 3.26 -> 2.91, contract untouched, relRMS 0 (the tile
     // reorders no sum). AF3 int5's 255-token trunk pass, three rounds interleaved: tri.project-out 278 / 292 / 295 ->
     // 234 / 239 / 239 ms, tri.project 342 / 359 / 364 -> 335 / 342 / 344, the pass's GPU 3179 / 3305 / 3344 -> 3197 /
     // 3259 / 3301. A wider output tile (outColumns 64) took project-out 10-18 ms further and the pass did not follow.
-    // Not measured on an M2.
+    // ...and on the M2, the same pass alternated: tri.project-out 503 / 776 -> 364 / 624 ms, tri.project 635 / 1003
+    // -> 599 / 1004 - so it holds on both parts.
     trianglePairProjectTile: { rows: 32, columns: 32 },
   }],
 ], );

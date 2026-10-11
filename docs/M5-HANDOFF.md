@@ -733,3 +733,19 @@ outliers. What remains, all bandwidth or scalar work:
 - **Diffusion at 255 tokens** (boltz2: 19.8 ms a step, 45% of a default fold): its GEMMs are ~12 ms a step at 10.4
   TFLOP/s and the rest is adaLN, gated residuals and the atom attentions at 20-65 us a dispatch, fused before and
   level. Nothing structural left there either.
+
+## From the M2, 2026-10-10 (on 8cc4f75a)
+
+- **The M2 builds and passes**: `localfold-selftest` and all 29 gates. AF3's lineage within 0.004 A of the M2's
+  baselines (opendde 1.457 -> 1.454, chai-1 0.976 -> 0.980, intellifold2 1.539 -> 1.538), AF2 and ESMFold2 as on the
+  previous M2 run. The half residual streams cost nothing visible here.
+- **Native speed on the M2 is level** against fbd35863, alternated: AF3 6MRR 6.01 / 6.00 -> 6.04 / 6.01 s, AF3 5CAJ
+  self-template (1 recycle, 50 steps) 11.83 / 11.86 -> 11.89 / 11.86. The gains are the matrix-unit path's.
+- **WebGPU, the metal-3 prior, measured on the M2** (stock Chrome 154, AF3 int5, 255 tokens, a trunk pass,
+  alternated):
+  - `trianglePairProjectTile` 32x32 **holds**: tri.project-out 503 / 776 -> 364 / 624 ms, tri.project level. Kept.
+  - `gridAttendTiled` + `gridAttendTiledHalf` **lose on the M2**: grid.attend 995 / 1073 -> 1444 / 1502 ms, the
+    pass's GPU 5455 / 5805 -> 5675 / 6028 (+4%), against the M5's -3.5%. WebGPU reports both parts as
+    `apple / metal-3` and nothing more, so the prior cannot tell them apart; most Apple visitors are not on an M5, so
+    both knobs are **taken out of the prior** (the comment beside it keeps the M5's numbers and the arm to re-run).
+  - The lesson for the next prior entry: measure it on an older part too, since one prior serves every Apple GPU.
