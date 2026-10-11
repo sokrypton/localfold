@@ -48,13 +48,20 @@ __global__ void zInitK(const float* rows, const float* cols, RelIdx rel, const f
 // makes its rows a block at a time from the per-token states and adds them in (zInitK's sum, in its order)
 struct ZInitStream { const float* rows; const float* cols; const float* s; int P; };
 inline ZInitStream ZINIT_STREAM{};
-__global__ void zInitAddRowsK(float* z, const float* rows, const float* cols, RelIdx rel, const float* bonds, const float* wBond,
+template <class TZ>
+__global__ void zInitAddRowsK(TZ* z, const float* rows, const float* cols, RelIdx rel, const float* bonds, const float* wBond,
                               const float* lm, int T, int C, size_t r0, size_t cnt) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = r0 + t / C; int i = (int)(ij / T), j = (int)(ij % T);
-  z[r0 * C + t] += rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lm[t];
+  const float add = rows[(size_t)i * C + c] + cols[(size_t)j * C + c] + relPosAt(rel, i, j, c, C) + bonds[ij] * wBond[c] + lm[t];
+  if constexpr (std::is_same_v<TZ, float>) z[r0 * C + t] += add;
+  else z[r0 * C + t] = __float2bfloat16(__bfloat162float(z[r0 * C + t]) + add);
 }
+// the trunk's pair held in bf16 from the recycle on (a card short of room, where every block takes the fused bf16
+// forms): half the bytes of the f32 z the trunk and every reader after it held - 25 GB at 4,940 tokens, where ESMFold2
+// ran out in the trunk's triangle. The recycle's arithmetic stays f32 a chunk of rows at a time; set by ef2.cu
+inline bool EF2_Z16 = false;
 inline void zInitAddStreamed(float* z, int T, int C) {
   const ZInitStream& zs = ZINIT_STREAM;
   int bi = lmPairBlock(T, zs.P);
@@ -62,8 +69,10 @@ inline void zInitAddStreamed(float* z, int T, int C) {
   for (int i0 = 0; i0 < T; i0 += bi) {
     int b = std::min(bi, T - i0); size_t cells = (size_t)b * T;
     lmPairRows(zs.s, T, zs.P, i0, b, lm);
-    zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(z, zs.rows, zs.cols, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"),
-                                                         lm, T, C, (size_t)i0 * T, cells);
+    if (EF2_Z16) zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(reinterpret_cast<__nv_bfloat16*>(z), zs.rows, zs.cols, relIdx(),
+                   W("token_bonds"), F("featuriser/tokenBonds"), lm, T, C, (size_t)i0 * T, cells);
+    else zInitAddRowsK<<<blocks(cells * C), 256, 0, STREAM>>>(z, zs.rows, zs.cols, relIdx(), W("token_bonds"), F("featuriser/tokenBonds"),
+                                                              lm, T, C, (size_t)i0 * T, cells);
   }
 }
 inline void zInit(int T, int C, const float* sInputs, int Si, const float* lmZ, float* z, bool check) {
@@ -441,6 +450,12 @@ inline bool ef2Pair16(int L, int C) {
 }
 inline void trunkBlocks(float* pair, const float* mask, int L, int C, const std::string& prefix, int from, int to) {
   if (from >= to) return;
+  if (EF2_Z16) {                 // (the pair already bf16: the blocks in place)
+    PAIR16 = true;
+    for (int b = from; b < to; ++b) trunkBlock(pair, mask, L, C, prefix, b);
+    PAIR16 = false;
+    return;
+  }
   if (!ef2Pair16(L, C)) { for (int b = from; b < to; ++b) trunkBlock(pair, mask, L, C, prefix, b); return; }
   size_t n = (size_t)L * L * C;
   __nv_bfloat16* p16 = scratch<__nv_bfloat16>("ef2.p16", n);
@@ -504,16 +519,26 @@ inline void foldingTrunk(int T, int C, const float* zInitP, float* z, int loops,
     trunkBlocks(z, mask, T, C, "coda/blocks", 0, codaBlocks);
     return;
   }
-  CK(cudaMemsetAsync(z, 0, P * C * 4, STREAM));
+  CK(cudaMemsetAsync(z, 0, P * C * (EF2_Z16 ? 2 : 4), STREAM));
   size_t chunk = std::min<size_t>(P, ((size_t)64 << 20) / (4 * (size_t)C));   // the recycle row by row, 64 MB at a time
   float* xn = scratch<float>("trunk.xn", chunk * C);
+  float* zc = EF2_Z16 ? scratch<float>("trunk.zc", chunk * C) : nullptr;      // (a bf16 z's rows, widened)
+  __nv_bfloat16* z16 = reinterpret_cast<__nv_bfloat16*>(z);
   int blocksN = (int)M.meta("meta/blocks");
   for (int loop = 0; loop < loops; ++loop) {
     for (size_t r0 = 0; r0 < P; r0 += chunk) {
       size_t r = std::min(chunk, P - r0);
+      if (EF2_Z16) {
+        ef2FromBf16K<<<blocks(r * C), 256, 0, STREAM>>>(z16 + r0 * C, zc, r * C);
+        layerNorm(zc, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
+        gemm(xn, F("recycle/projection"), zc, r, C, C);
+        ef2ToBf16K<<<blocks(r * C), 256, 0, STREAM>>>(zc, z16 + r0 * C, r * C);
+        continue;
+      }
       layerNorm(z + r0 * C, xn, r, C, F("recycle/norm/scale"), F("recycle/norm/offset"));
       gemm(xn, F("recycle/projection"), z + r0 * C, r, C, C);
     }
+    if (zInitP && EF2_Z16) { fprintf(stderr, "a bf16 trunk pair takes the streamed z_init\n"); exit(1); }
     if (zInitP) addK<<<blocks(P * C), 256, 0, STREAM>>>(z, zInitP, P * C);
     else zInitAddStreamed(z, T, C);
     if (check) checkOracle(("trunk pass " + std::to_string(loop) + " in").c_str(), z, P * C, "o/loop" + std::to_string(loop) + "/in");

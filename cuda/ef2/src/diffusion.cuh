@@ -16,11 +16,12 @@
 constexpr int DIFFUSION_HALF_WINDOW = 64;     // the diffusion's atom stacks are windowed (128) in both references
 
 // rows [p0, p0 + n) of [z | rel_pos]
-__global__ void joinPairRelK(const float* z, RelIdx rel, float* out, size_t p0, size_t n, int T, int C) {
+__global__ void joinPairRelK(const float* z, RelIdx rel, float* out, size_t p0, size_t n, int T, int C, bool z16 = false) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n * 2 * C) return;
   size_t p = p0 + t / (2 * C); int c = (int)(t % (2 * C));
-  out[t] = c < C ? z[p * C + c] : relPosAt(rel, (int)(p / T), (int)(p % T), c - C, C);
+  out[t] = c < C ? (z16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(z)[p * C + c]) : z[p * C + c])   // (EF2_Z16)
+                 : relPosAt(rel, (int)(p / T), (int)(p % T), c - C, C);
 }
 __global__ void siluMulK(const float* a, const float* b, float* out, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -250,7 +251,7 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
     float* pn = scratch<float>("dc.pn", chunk * Cz); float* pb = scratch<float>("dc.pbRows", chunk * d.heads);
     for (size_t p0 = 0; p0 < P; p0 += chunk) {
       size_t n = std::min(chunk, P - p0);
-      joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz);
+      joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz, EF2_Z16);
       layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
       gemm(joined, F("diffusion/zProjection"), rows, n, 2 * Cz, Cz);
       for (int l = 0; l < 2; ++l) transitionLayer(rows, n, Cz, "diffusion/zTransitions/" + std::to_string(l) + "/");
@@ -268,7 +269,7 @@ inline Denoiser makeDenoiser(int T, int A, const float* zTrunk, const float* sIn
   float* pair = scratch<float>("dc.pair", P * Cz);
   for (size_t p0 = 0; p0 < P; p0 += chunk) {
     size_t n = std::min(chunk, P - p0);
-    joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz);
+    joinPairRelK<<<blocks(n * 2 * Cz), 256, 0, STREAM>>>(zTrunk, relIdx(), joined, p0, n, T, Cz, EF2_Z16);
     layerNorm(joined, joined, n, 2 * Cz, F("diffusion/zInputNorm/scale"), F("diffusion/zInputNorm/offset"));
     gemm(joined, F("diffusion/zProjection"), pair + p0 * Cz, n, 2 * Cz, Cz);
   }

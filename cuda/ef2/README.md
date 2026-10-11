@@ -316,6 +316,16 @@ What made them pay, each measured:
   byte-identical (and at 6MRR and 5CAJ the streamed one is too: one chunk). The next limit is the recycle's own
   state - `z`, the injection and the language model's pair are 256-channel f32 pairs (25 GB each at 4,940) - so
   ESMFold2 stops near 4,000 tokens on 40 GB, where the AlphaFold 3 lineage now folds 7,900.
+- 🔴 **The trunk's pair bf16 on a card short of room (2026-10-11, `EF2_Z16`): 5,434 tokens fold on 40 GB (4,446
+  before; 4,940 ran out in the trunk's triangle).** Where z_init streams and every block takes the fused bf16 forms, z
+  is held bf16 from the recycle on - the recycle's arithmetic f32 a chunk of rows at a time, the blocks in place
+  (the roomy path already ran them on a bf16 copy) - read bf16 by the chunked distogram and the denoiser's
+  conditioning, parked in host memory through the sampler, and taken by the confidence head a chunk of token rows at
+  a time into a bf16 stack its blocks run on (the f32 residual in pinned host memory, the pooling and the PAE logits
+  off f32 rows). 4,940 tokens: trunk 114 s, the stages 18.2 / 15.1 / 16.2 / 11.0 GB; 5,434: trunk 155 s, 20.9 GB at
+  the trunk's end. 5CAJ with the short-of-room paths forced is 0.016 A from the f32 short path and 0.015 from the
+  roomy one (those two are 0.023 apart); the bf16 head alone moves PAE 0.09 and pLDDT 0.04 at most. Next: 5,928 runs
+  out in the trunk's triangle, its fixed operand (18 GB, bf16) beside the pair; `LOCALFOLD_PAIR_F32=1` keeps f32.
 - **Two blocks an SM again (2026-10-08).** `transitionUpK` was written for two 67.6 KB blocks an SM, and the
   wave-sized chunking assumes it - but it had grown to 160 registers, so the REGISTERS held it to one
   (Nsight Compute: occupancy 12.5%, the tensor pipe 48%), and nothing said so. `__launch_bounds__(256, 2)`

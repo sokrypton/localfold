@@ -71,10 +71,12 @@ struct Opts { std::string dir, oracle, out; uint64_t seed; SamplerSettings sampl
 static std::string FRAMES_DIR;
 // the softmax mass of each pair's first contact_bins bins (the bias is already in the logits: distogram())
 // pair positions [p0, p0 + cnt) of z + z^T (symmetriseK's arithmetic, a block at a time)
-__global__ void symmetriseRowsK(const float* z, float* out, size_t p0, size_t cnt, int T, int C) {
+__global__ void symmetriseRowsK(const float* z, float* out, size_t p0, size_t cnt, int T, int C, bool z16 = false) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * C) return;
   int c = (int)(t % C); size_t ij = p0 + t / C, i = ij / T, j = ij % T;
+  if (z16) { const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(z);   // (a bf16 trunk pair: EF2_Z16)
+             out[t] = __bfloat162float(h[ij * C + c]) + __bfloat162float(h[(j * T + i) * C + c]); return; }
   out[t] = z[ij * C + c] + z[(j * T + i) * C + c];
 }
 __global__ void contactsK(const float* logits, const int* contactBins, float* out, size_t pairs, int bins) {
@@ -221,7 +223,11 @@ static int foldInput(const Opts& o, bool warm) {
   }
   // a large input gives each phase the whole card: its predecessor's scratch released (a pair over
   // 128 MB, ~350 tokens). Below that the scratch is kept - re-allocating it cost every phase cudaMallocs
-  z = dalloc((size_t)T * T * C);
+  // (the trunk's pair bf16 where z_init streams and every block takes the fused bf16 forms: trunk.cuh's EF2_Z16;
+  // LOCALFOLD_PAIR_F32=1 keeps it f32)
+  EF2_Z16 = streamZ && !getenv("LOCALFOLD_PAIR_F32") && !getenv("EF2_SAVE_PAIR") && FAST && FUSED256 && C == 256 &&
+            T >= FUSED256_MIN_TOKENS && fused256Fits() && EF2_TRI_BF16 && bf16Mma();
+  z = EF2_Z16 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)T * T * C)) : dalloc((size_t)T * T * C);
   bool tight = (size_t)T * T * C * 4 > ((size_t)128 << 20);
   if (tight) releaseScratch();
   t0 = std::chrono::steady_clock::now();
@@ -255,7 +261,7 @@ static int foldInput(const Opts& o, bool warm) {
     }
     size_t P = (size_t)T * T;
     float* probs = scratch<float>("dg.contacts", P);
-    if (tight) {
+    if (tight || EF2_Z16) {
       // on a card short of room a block of pair positions at a time: z + z^T, the projection, the contact mass -
       // never the symmetrised pair (5.9 GB at 2400 tokens) or the logits (2.95 GB) whole; the same arithmetic
       int Bn = (int)dimOf("f/distogram/weights", 1);
@@ -263,7 +269,7 @@ static int foldInput(const Opts& o, bool warm) {
       float* zs = scratch<float>("dg.symRows", per * C); float* dg = scratch<float>("dg.logitRows", per * bins);
       for (size_t p0 = 0; p0 < P; p0 += per) {
         size_t n = std::min(per, P - p0);
-        symmetriseRowsK<<<blocks(n * C), 256, 0, STREAM>>>(z, zs, p0, n, T, C);
+        symmetriseRowsK<<<blocks(n * C), 256, 0, STREAM>>>(z, zs, p0, n, T, C, EF2_Z16);
         gemm(zs, F("distogram/weights"), dg, n, C, Bn);
         addBias(dg, F("distogram/bias"), n, Bn);
         contactsK<<<blocks(n), 256, 0, STREAM>>>(dg, Idev("contact_bins") + p0, probs + p0, n, bins);
@@ -290,6 +296,9 @@ static int foldInput(const Opts& o, bool warm) {
     CK(cudaFree(dg)); if (tight) releaseScratch();
   }
   Denoiser dn = makeDenoiser(T, A, z, sInputs, check);
+  // (a bf16 trunk pair waits in host memory through the sampler, which never reads it: the confidence head takes it
+  // back, widened)
+  if (EF2_Z16) { parkToHost(z, (size_t)T * T * C * 2); }
   mem("denoiser built");
   if (check && M.has("o/step0/x_noisy")) {
     float* xn0 = upload(M.f("o/step0/x_noisy"), (size_t)A * 3); float* xd0 = dalloc((size_t)A * 3);
@@ -354,7 +363,8 @@ static int foldInput(const Opts& o, bool warm) {
   float* xd = upload(coords.data(), (size_t)A * 3);
   bool profConf = profile && profStage == "confidence";
   if (profConf) { prof::init(); prof::start(); }
-  Confidence conf = confidenceHead(T, A, z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
+  if (EF2_Z16) releaseScratch();                // (the head reads the parked bf16 pair itself: zTrunk null)
+  Confidence conf = confidenceHead(T, A, EF2_Z16 ? nullptr : z, sInputs, Si, xd, false, true);   // (z is read by nothing after)
   if (profConf) { CK(cudaStreamSynchronize(STREAM)); prof::stop(25); }
   mem("confidence");
   say("confidence %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
