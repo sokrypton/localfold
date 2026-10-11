@@ -524,16 +524,21 @@ static int foldMain(int argc, char** argv) {
     // fold on each, nothing exchanged, its steps' graphs on - then frees it and takes its rows of the confidence head
     // (the sharded diffusion meets at every block of every step: at 988 tokens on 8 x A100 158 ms became 2.0 s)
     int keptLo = -1, keptRows = 0;
-    if (sharded(t) && oneCardPast) {
+    // (the whole pair on every rank, PUSHED: each rank its rows into every other's - pulled, a peer's memory read
+    // through a PCIe host bridge, 2.25 GB a rank at 2,964 tokens ran at under a GB/s)
+    auto gatherWhole = [&]() -> float* {
       const size_t row = (size_t)t.n * t.C * 2;
+      mg::Shared& wS = mg::shared("sh.whole", (size_t)t.n * row);
+      const int lo = t.shardLo >= 0 ? t.shardLo : keptLo, rows = t.shardLo >= 0 ? t.shardRows : keptRows;
+      if (rows) CK(cudaMemcpyAsync((char*)wS.local + (size_t)lo * row, t.zS->local, (size_t)rows * row, cudaMemcpyDeviceToDevice, STREAM));
+      mg::allGather(wS, (size_t)lo * row, (size_t)rows * row);
+      return (float*)wS.local;
+    };
+    if (sharded(t) && oneCardPast) {
+      // (copied out of the shared buffer, which goes at once: the pair is widened and freed as a one-GPU pair is)
       float* whole = reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)t.n * t.n * t.C));
-      mg::fence();
-      for (int k = 0; k < mg::WORLD; ++k) {     // (from this rank on: sharded.cuh's rot)
-        const int r = (mg::RANK + k) % mg::WORLD;
-        int lo, hi; sh::rowsOf(t.n, r, lo, hi); const int rn = sh::storedRows(t.n, r);
-        if (rn) CK(cudaMemcpyAsync((char*)whole + (size_t)lo * row, t.zS->peer[r], (size_t)rn * row, cudaMemcpyDefault, STREAM));
-      }
-      mg::fence();
+      CK(cudaMemcpyAsync(whole, gatherWhole(), (size_t)t.n * t.n * t.C * 2, cudaMemcpyDeviceToDevice, STREAM));
+      mg::release({ "sh.whole" });
       keptLo = t.shardLo; keptRows = t.shardRows;
       t.pair = whole; t.shardLo = -1; t.shardRows = 0;        // (the whole pair's view; the slab stays in t.zS)
       GRAPHS = !noGraphs;
@@ -738,7 +743,56 @@ static int foldMain(int argc, char** argv) {
       // head does in the trunk's pair - a slab a rank, 4.7 GB at 12,103 tokens on 8)
       if (contact.empty()) contact = contactProbabilitiesSharded(t);
       mg::tick("contacts");
-      for (size_t k = 0; k < cn; ++k) {
+      // DEALT (the diffusion whole on every rank and several samples): sample k's confidence head on rank k % N - the
+      // one-GPU head on the whole pair, gathered again - its results to rank 0 through host memory; the sharded head
+      // met at every block of every sample (on 4 x A6000 a 2,964-token sample's head was 2.2 s split, 1.7 on one GPU)
+      const bool dealtConf = keptLo >= 0 && mg::WORLD > 1 && cn > 1;
+      if (dealtConf) {
+        float* whole = gatherWhole();
+        const size_t pc = (size_t)t.n * t.n * t.C, nn = (size_t)t.n * t.n, nd = (size_t)t.n * dense;
+        const int W = mg::WORLD;
+        SHORT_PAIR_SHARE = 1;                 // (the one-GPU head, the whole pair: bf16 only where it is short of room)
+        const bool p16 = shortPair(nn, t.C);
+        float* head = whole;
+        if (!p16) { head = dalloc(pc); fromBf16K<<<blocks(pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(whole), head, pc); }
+        const bool was16 = TRUNK_PAIR16; TRUNK_PAIR16 = p16;
+        const size_t slot = 64 + 4 * (nd + 3 * nn);
+        mg::HostSlots hs = mg::hostSlots("conf", cn * slot);
+        for (size_t k = 0; k < cn; ++k) {
+          if ((int)(k % W) != mg::RANK) continue;
+          const float* xk = xs.data() + k * mask.size() * 3;
+          std::vector<float> beta((size_t)nD * 3);
+          for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)
+            beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
+          float* dBeta = upload(beta.data(), beta.size());
+          ConfidenceOut ck = confidenceHead(head, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n, false);
+          CK(cudaFree(dBeta));
+          if (ck.plddt.size() != nd || ck.pae.size() != nn || ck.pde.size() != nn || ck.tmTerm.size() != nn) {
+            fprintf(stderr, "dealt confidence: sample %zu's outputs are not %zu / %zu long\n", k, nd, nn); exit(1);
+          }
+          char* b = hs.base + k * slot;
+          double hdr[3] = { ck.meanPlddt, ck.ptm, ck.iptm }; memcpy(b, hdr, sizeof hdr);
+          float* f = (float*)(b + 64);
+          memcpy(f, ck.plddt.data(), nd * 4); memcpy(f + nd, ck.pae.data(), nn * 4);
+          memcpy(f + nd + nn, ck.pde.data(), nn * 4); memcpy(f + nd + 2 * nn, ck.tmTerm.data(), nn * 4);
+        }
+        TRUNK_PAIR16 = was16; SHORT_PAIR_SHARE = W;
+        if (!p16) CK(cudaFree(head));
+        mg::barrier();                        // (every rank's samples in the slots)
+        if (mg::RANK == 0)
+          for (size_t k = 0; k < cn; ++k) {
+            const char* b = hs.base + k * slot; const float* f = (const float*)(b + 64);
+            ConfidenceOut ck; double hdr[3]; memcpy(hdr, b, sizeof hdr);
+            ck.meanPlddt = hdr[0]; ck.ptm = hdr[1]; ck.iptm = hdr[2];
+            ck.plddt.assign(f, f + nd); ck.pae.assign(f + nd, f + nd + nn);
+            ck.pde.assign(f + nd + nn, f + nd + 2 * nn); ck.tmTerm.assign(f + nd + 2 * nn, f + nd + 3 * nn);
+            shardedConf.push_back(std::move(ck));
+          }
+        mg::barrier();                        // (rank 0 has read them)
+        mg::freeHostSlots(hs);
+        mg::release({ "sh.whole" });
+      }
+      for (size_t k = 0; k < cn && !dealtConf; ++k) {
         const float* xk = xs.data() + k * mask.size() * 3;
         std::vector<float> beta((size_t)nD * 3);
         for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)

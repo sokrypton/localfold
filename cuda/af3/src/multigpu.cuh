@@ -218,6 +218,28 @@ inline void segmentReport(const char* at) {
   fprintf(stderr, "  segments %-24s %d holding named buffers %.2f GB, %d idle %.2f GB; the pool %.2f GB | device in use %.2f, scratch %.2f\n",
           at, nl, live / 1e9, ni, idle / 1e9, pooled / 1e9, (t - f) / 1e9, held / 1e9);
 }
+// Host memory every rank maps (collective): a /dev/shm file the size of `bytes`, for results only rank 0 reads (several
+// samples' confidence heads, each on its own rank) - through host memory, not the GPUs' links
+struct HostSlots { char* base = nullptr; size_t bytes = 0; };
+inline HostSlots hostSlots(const std::string& tag, size_t bytes) {
+  HostSlots h; h.bytes = bytes;
+  const std::string path = "/dev/shm/localfold-mg-" + std::to_string(SHM->pid[0]) + "-" + tag;
+  if (RANK == 0) {
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+    if (fd < 0 || ftruncate(fd, bytes) != 0) { perror("mg host slots"); exit(1); }
+    close(fd);
+  }
+  barrier();
+  int fd = open(path.c_str(), O_RDWR);
+  if (fd < 0) { perror("mg host slots"); exit(1); }
+  h.base = (char*)mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (h.base == MAP_FAILED) { perror("mg host slots"); exit(1); }
+  barrier();
+  if (RANK == 0) unlink(path.c_str());           // (every rank has it mapped; the name goes)
+  return h;
+}
+inline void freeHostSlots(HostSlots& h) { if (h.base) munmap(h.base, h.bytes); h.base = nullptr; }
 // the least of every rank's `v` (collective)
 inline size_t minOverRanks(size_t v) {
   if (WORLD == 1 || SIM) return v;
