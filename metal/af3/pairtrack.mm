@@ -97,16 +97,18 @@ static void triangleT(T* pair, const Masks& m, int n, int C, const std::string& 
   padZero(a, 2 * (size_t)C, n, np);                   // (the padding is written by nothing here, and pr.big is shared)
   gemmTriGate(xn, xs ? tg.w : triGateWeight(pre, C), m.pair, a, b, 0, P, C, plane, n, np, xs ? tg.b : nullptr, triQuartersApply(C));
   float* prod = (float*)(big + plane * C * 4);
+  const float hs = halfProductScale();      // (the product in half, scaled: core.mm)
   {   // per channel: outgoing prod[i][j] = sum_k a[i][k] b[j][k]; incoming sum_k b[k][i] a[k][j]
-    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = F32; g.rows = np; g.in = np; g.out = np; g.ldx = g.ldw = g.ldy = np;
-    g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.alpha = divide ? 1.f / n : 1.f;
+    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = np; g.in = np; g.out = np; g.ldx = g.ldw = g.ldy = np;
+    g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.alpha = (divide ? 1.f / n : 1.f) * (hs ? hs : 1.f); g.accFloat = hs != 0.f;
     g.label = outgoing ? "triangle out contraction" : "triangle in contraction";
     if (outgoing) { g.X = a; g.W = b; g.transW = true; }
     else { g.X = b; g.transX = true; g.W = a; }
     gemm(g);
   }
   half* cn = scratch<half>("pr.h1", P * C);
-  centerNorm(prod, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
+  if (hs) centerNorm((const half*)prod, hs, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
+  else centerNorm(prod, cn, n, np, C, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"));
   half* outH = scratch<half>("pr.h2", P * C);
   half* lnOut = !nextNorm.empty() && !into && hasW(nextNorm + "Scale") ? lnTarget(P, C, xn) : nullptr;
   if (gemmGatedAddDual(xn, xs ? gl.w : Wh(pre + ".gatingLinear"), cn, Wh(pre + ".outputProjection"), into ? into : pair, P, C, C,

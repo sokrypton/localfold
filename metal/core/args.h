@@ -48,7 +48,9 @@ struct AddArgs { DP(float) y; CP(float) x; u64 n; float a; uint pad; };   // y +
 struct BiasArgs { DP(float) y; CP(float) b; u64 rows; int C; int act; };  // y += b per column, act 1 relu 2 gelu(erf)
 
 // the triangle's centre LayerNorm: the channel-major product [C][Lp * Lp] to pair rows [pairs][C], half
-struct CenterNormArgs { CP(float) prod; DP(half) out; u64 pairs; uint C, L, Lp, pad; CP(float) scale; CP(float) offset; };
+// (prodh: the product in half instead, stored scaled - the LayerNorm is scale-free but for eps, which the host scales)
+struct CenterNormArgs { CP(float) prod; DP(half) out; u64 pairs; uint C, L, Lp, pad; CP(float) scale; CP(float) offset;
+                        CP(half) prodh; float eps; uint pad2; };
 // gated flash attention (metal/core/common.metal, lf_attention): per batch row b and head h, the queries' and keys'
 // q | k | v | g at qkvg + b rowStride + position posStride (+ 0, W, 2W, 3W, then h D); out at b outRowStride +
 // position outPosStride + h D. bias [H][n][biasStride] in log2 units, shared by every row; mask the key's,

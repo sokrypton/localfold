@@ -204,17 +204,18 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
     if constexpr ((EP & 64) != 0) { threadgroup float part[512]; lf_emit_ln<TN>(c, (device const TC*)D, part, tid, g, i0, j0); }
     return;
   }
-  // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1, beta 0, the output in the
-  // accumulator's type) - adjusted in place and stored by the tensor (bounds against D's extents), no staging tile
+  // EP bit 2, a plain product (the host's promise: a bias or a ReLU at most, alpha 1 - or a half output's scale -, beta
+  // 0) - adjusted in place and stored by the tensor (bounds against D's extents), no staging tile; a float accumulator
+  // into a half output an element at a time, saturating
   if constexpr ((EP & 2) != 0) {
     static_assert((EP & 1) == 0, "a plain product has no triangle gate");
     {
-      if (g.epilogue) {
+      if (g.epilogue || g.alpha != 1.f) {
         _Pragma("clang loop unroll(full)")
         for (uint16_t e = 0; e < c.get_capacity(); ++e)
           if (c.is_valid_element(e)) {
             const int col = i0 + c.get_multidimensional_index(e)[0];
-            float v = (float)c[e];
+            float v = (float)c[e] * g.alpha;
             if ((g.epilogue & 4) && col < g.m) v += (g.biasType & 255) == 2 ? (float)((device const half*)g.bias)[col] : ((device const float*)g.bias)[col];
             if (g.epilogue & 2) v = max(v, 0.f);
             c[e] = (TACC)v;
@@ -224,13 +225,20 @@ kernel void lf_gemm_tensor(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threa
         tensor<device TC, E2, tensor_inline> tD(D, E2(g.m, g.n), array<int32_t, 2>{1, g.ldd});
         auto mD = tD.slice(i0, j0);
         c.store(mD);
+      } else if constexpr (metal::is_same_v<TC, half>) {   // (the tensor stores only its own type: through a half twin, saturating)
+        auto ch = op.template get_destination_cooperative_tensor<decltype(mX), decltype(mW), half>();
+        _Pragma("clang loop unroll(full)")
+        for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) ch[e] = (half)clamp((float)c[e], -65504.f, 65504.f);
+        tensor<device TC, E2, tensor_inline> tD(D, E2(g.m, g.n), array<int32_t, 2>{1, g.ldd});
+        auto mD = tD.slice(i0, j0);
+        ch.store(mD);
       } else {   // (the tensor stores only its own type: a float accumulator into a half output an element at a time)
         _Pragma("clang loop unroll(full)")
         for (uint16_t e = 0; e < c.get_capacity(); ++e)
           if (c.is_valid_element(e)) {
             const auto ix = c.get_multidimensional_index(e);
             const int i = i0 + ix[0], j = j0 + ix[1];
-            if (i < g.m && j < g.n) D[(ulong)i + (ulong)j * g.ldd] = (TC)c[e];
+            if (i < g.m && j < g.n) D[(ulong)i + (ulong)j * g.ldd] = metal::is_same_v<TC, half> ? (TC)clamp((float)c[e], -65504.f, 65504.f) : (TC)c[e];
           }
       }
     }
@@ -687,3 +695,48 @@ kernel void lf_attention_tensor3(constant AttnArgs& a [[buffer(0)]], uint3 tg [[
   }
 }
 // (instantiated on first use: lf_attention_tensor3<D, QS, KT, QBIAS>, host name gemmt_attn3[q]_<D>_<QS>x<KT>)
+
+// The matrix units' issue ceiling (localfold-bench peak): operands in threadgroup memory, R products a threadgroup - over
+// four simdgroups (lf_mm_peak) or one each (lf_mm_peak1). On the M5 (8-core GPU): 12.3-12.6 TFLOP/s from 32 x 128 x 64 up,
+// half or float accumulators; a simdgroup's own 16 x 64 x 32 12.4 - the GEMMs' 10-11 and attention's products 9.3 are
+// against this
+template <int TM, int TN, int KK, int R, typename TACC>
+kernel void lf_mm_peak(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+  using namespace mpp::tensor_ops;
+  threadgroup half xs[TM * KK]; threadgroup half ws[KK * TN];
+  for (uint i = tid; i < TM * KK; i += 128) xs[i] = half((i % 7) * 0.01f);
+  for (uint i = tid; i < KK * TN; i += 128) ws[i] = half((i % 5) * 0.01f);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  typedef dextents<int32_t, 2> E2;
+  tensor<threadgroup half, E2, tensor_inline> tX(xs, E2(KK, TM), array<int32_t, 2>{1, KK});
+  tensor<threadgroup half, E2, tensor_inline> tW(ws, E2(TN, KK), array<int32_t, 2>{1, TN});
+  constexpr auto desc = matmul2d_descriptor(TM, TN, KK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<4>> op;
+  auto c = op.template get_destination_cooperative_tensor<decltype(tX), decltype(tW), TACC>();
+  for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) c[e] = TACC(0);
+  for (int r = 0; r < R; ++r) op.run(tX, tW, c);
+  float s = 0;
+  for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) s += float(c[e]);
+  ((device float*)g.D)[grp.x * 128 + tid] = s;
+}
+template <int TM, int TN, int KK, int R, typename TACC>
+kernel void lf_mm_peak1(constant GemmArgs& g [[buffer(0)]], uint3 grp [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  using namespace mpp::tensor_ops;
+  threadgroup half xs[4 * TM * KK]; threadgroup half ws[4 * KK * TN];
+  for (uint i = tid; i < 4 * TM * KK; i += 128) xs[i] = half((i % 7) * 0.01f);
+  for (uint i = tid; i < 4 * KK * TN; i += 128) ws[i] = half((i % 5) * 0.01f);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  typedef dextents<int32_t, 2> E2;
+  tensor<threadgroup half, E2, tensor_inline> tX(xs + sg * TM * KK, E2(KK, TM), array<int32_t, 2>{1, KK});
+  tensor<threadgroup half, E2, tensor_inline> tW(ws + sg * KK * TN, E2(TN, KK), array<int32_t, 2>{1, TN});
+  constexpr auto desc = matmul2d_descriptor(TM, TN, KK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto c = op.template get_destination_cooperative_tensor<decltype(tX), decltype(tW), TACC>();
+  for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) c[e] = TACC(0);
+  for (int r = 0; r < R; ++r) op.run(tX, tW, c);
+  float s = 0;
+  for (uint16_t e = 0; e < c.get_capacity(); ++e) if (c.is_valid_element(e)) s += float(c[e]);
+  ((device float*)g.D)[grp.x * 128 + tid] = s;
+}

@@ -67,15 +67,18 @@ static void triangle(T* pair, const float* mask, int L, int C, const std::string
   gemmTriGate(xn, triGate(Tn, C), mask, a, b, 0, P, C, plane, L, Lp, nullptr, triQuartersApply(C));
   // per channel: outgoing prod[j][i] = sum_k a[j][k] b[i][k]; incoming sum_k b[k][j] a[k][i]
   float* prod = scratch<float>("ftri.prod", plane * C);
+  const float hs = halfProductScale();      // (the product in half, scaled: core.mm)
   {
-    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;
+    Gemm g{}; g.tx = F16; g.tw = F16; g.ty = hs ? F16 : F32; g.rows = Lp; g.in = Lp; g.out = Lp; g.ldx = g.ldw = g.ldy = Lp;
     g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = prod; g.label = outgoing ? "triangle out contraction" : "triangle in contraction";
+    if (hs) { g.alpha = hs; g.accFloat = true; }
     if (outgoing) { g.X = a; g.W = b; g.transW = true; }
     else { g.X = b; g.transX = true; g.W = a; }
     gemm(g);
   }
   half* cn = scratch<half>("ftri.cn", P * C);
-  centerNorm(prod, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
+  if (hs) centerNorm((const half*)prod, hs, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
+  else centerNorm(prod, cn, L, Lp, C, F(Tn + "centerNormScale"), F(Tn + "centerNormOffset"));
   half* outH = scratch<half>("ftri.outh", P * C);
   half* lnOut = next.empty() ? nullptr : lnTarget(P, C, xn);
   if (gemmGatedAddDual(xn, Fh(Tn + "gatingLinear"), cn, Fh(Tn + "outputProjection"), pair, P, C, C, nullptr, nullptr, outH,

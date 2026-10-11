@@ -222,6 +222,45 @@ int main() {
       report("half pair, the triangle's tail: the norm", relRms(ref2, f32(download(dN, R * O))), 3e-3);
     } else printf("  half pair, the triangle's tail: not taken here (no matrix units)\n");
   }
+  if (halfProductScale()) {   // the triangle's product in half, scaled (core.mm's halfProductScale): the contraction's
+      // scaled saturating store, then the centre LayerNorm from it, against the norm of the exact product
+    const float hs = halfProductScale();
+    int n = 37, np = 40, K = 256; size_t plane = (size_t)np * np;
+    for (int C : {128, 256, 100}) {
+      auto A = randv((size_t)C * plane, 30.f), B = randv((size_t)C * plane, 30.f), sc = randv(C), of = randv(C);
+      for (int c = 0; c < C; ++c) for (int i = n; i < np; ++i) for (int k = 0; k < np; ++k) A[(size_t)c * plane + (size_t)i * np + k] = B[(size_t)c * plane + (size_t)i * np + k] = 0;
+      std::vector<double> prod((size_t)C * plane, 0), ref((size_t)n * n * C);
+      for (int c = 0; c < C; ++c) for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) {
+        double t = 0;
+        for (int k = 0; k < np && k < K; ++k) t += (double)(float)(half)A[(size_t)c * plane + (size_t)i * np + k] * (float)(half)B[(size_t)c * plane + (size_t)j * np + k];
+        prod[(size_t)c * plane + (size_t)i * np + j] = t;
+      }
+      for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) {
+        double m = 0, var = 0;
+        for (int c = 0; c < C; ++c) m += prod[(size_t)c * plane + (size_t)i * np + j];
+        m /= C;
+        for (int c = 0; c < C; ++c) { double d = prod[(size_t)c * plane + (size_t)i * np + j] - m; var += d * d; }
+        const double inv = 1 / sqrt(var / C + 1e-5);
+        for (int c = 0; c < C; ++c) ref[((size_t)i * n + j) * C + c] = (prod[(size_t)c * plane + (size_t)i * np + j] - m) * inv * sc[c] + of[c];
+      }
+      half* dA = uploadNew(toH(A).data(), A.size()); half* dB = uploadNew(toH(B).data(), B.size());
+      half* dP = allocT<half>((size_t)C * plane); half* dO = allocT<half>((size_t)n * n * C);
+      float *dsc = uploadNew(sc.data(), C), *dof = uploadNew(of.data(), C);
+      Gemm g{}; g.tx = F16; g.tw = F16; g.ty = F16; g.rows = np; g.in = np; g.out = np; g.ldx = g.ldw = g.ldy = np;
+      g.sx = g.sw = g.sy = (int64_t)plane; g.batch = C; g.Y = dP; g.alpha = hs; g.accFloat = true; g.X = dA; g.W = dB; g.transW = true;
+      gemm(g);
+      std::vector<double> pref((size_t)C * plane); for (size_t i = 0; i < pref.size(); ++i) pref[i] = prod[i] * hs;
+      char l1[96], l2[96];
+      snprintf(l1, sizeof l1, "half product (x %g) %d channels: the contraction", hs, C);
+      auto ph = download(dP, (size_t)C * plane);
+      report(l1, relRms(pref, std::vector<float>(ph.begin(), ph.end())), 1e-3);
+      centerNorm(dP, hs, dO, n, np, C, dsc, dof);
+      auto oh = download(dO, (size_t)n * n * C);
+      snprintf(l2, sizeof l2, "half product %d channels: the centre LayerNorm", C);
+      report(l2, relRms(ref, std::vector<float>(oh.begin(), oh.end())), 3e-3);
+      release(dA); release(dB); release(dP); release(dO); release(dsc); release(dof);
+    }
+  } else printf("  half product: not taken here (no matrix units)\n");
   {   // the triangle's gate: n x n pairs, C channels, planes padded to np
     int n = 37, np = 40, C = 64; size_t P = (size_t)n * n, plane = (size_t)np * np;
     auto X = randv(P * C), proj = randv((size_t)C * 2 * C, 0.1f), gate = randv((size_t)C * 2 * C, 0.1f), mask = randv(P);

@@ -269,6 +269,7 @@ kernel void lf_add_bias(LF_ARGS(BiasArgs)) {
 template <int NK>
 kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                             uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  device const float* prod = a.prod;
   threadgroup float part[256];
   threadgroup half T[32 * (8 * NK + 8)];
   const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 8;
@@ -278,7 +279,7 @@ kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[
   const bool live = r0 + lane < a.pairs;
   float v[NK];
   float s = 0.f;
-  for (uint k = 0; k < NK; ++k) if (k < nk) { v[k] = live ? a.prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
+  for (uint k = 0; k < NK; ++k) if (k < nk) { v[k] = live ? prod[(ulong)(grp + 8 * k) * plane + q] : 0.f; s += v[k]; }
   part[grp * 32 + lane] = s;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float S = 0.f;
@@ -291,7 +292,7 @@ kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float V = 0.f;
   for (int g = 0; g < 8; ++g) V += part[g * 32 + lane];
-  const float inv = rsqrt(V / C + 1e-5f);
+  const float inv = rsqrt(V / C + a.eps);
   for (uint k = 0; k < NK; ++k) if (k < nk) {
     uint c = grp + 8 * k;
     T[lane * ld + c] = (half)((v[k] - mean) * inv * a.scale[c] + a.offset[c]);
@@ -303,13 +304,67 @@ kernel void lf_center_norm(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[
     for (uint c = lane; c < C; c += 32) a.out[r * C + c] = T[row * ld + c];
   }
 }
+// ...from a half product (scaled; CenterNormArgs.prodh): PP pairs a lane - the product's reads twice as long, where the
+// half tile still fits - and the rows written four channels a lane (ESMFold2's 0.82 -> 0.75 ms a call at 256 channels,
+// AF3's 0.40 -> 0.38 at 128; the same values)
+template <int NK, int PP>
+kernel void lf_center_norm_h(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                             uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  constexpr uint R = 32 * PP;
+  device const half* prod = a.prodh;
+  threadgroup float part[8 * R];
+  threadgroup half T[R * (8 * NK + 8)];
+  const uint lane = tid & 31, grp = tid >> 5, C = a.C, nk = C / 8, ld = C + 8;
+  const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * R, plane = (ulong)a.Lp * a.Lp;
+  ulong q[PP]; bool live[PP];
+  for (uint p = 0; p < PP; ++p) {
+    const uint rr = (uint)(r0 + PP * lane + p), ii = lf_udiv(rr, a.L);
+    q[p] = (ulong)ii * a.Lp + (rr - ii * a.L);
+    live[p] = r0 + PP * lane + p < a.pairs;
+  }
+  float v[PP][NK];
+  for (uint p = 0; p < PP; ++p) {
+    float s = 0.f;
+    for (uint k = 0; k < NK; ++k) if (k < nk) { v[p][k] = live[p] ? (float)prod[(ulong)(grp + 8 * k) * plane + q[p]] : 0.f; s += v[p][k]; }
+    part[grp * R + PP * lane + p] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float mean[PP];
+  for (uint p = 0; p < PP; ++p) { float S = 0.f; for (int g = 0; g < 8; ++g) S += part[g * R + PP * lane + p]; mean[p] = S / C; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint p = 0; p < PP; ++p) {
+    float d2 = 0.f;
+    for (uint k = 0; k < NK; ++k) if (k < nk) { float d = v[p][k] - mean[p]; d2 += d * d; }
+    part[grp * R + PP * lane + p] = d2;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint p = 0; p < PP; ++p) {
+    float V = 0.f;
+    for (int g = 0; g < 8; ++g) V += part[g * R + PP * lane + p];
+    const float inv = rsqrt(V / C + a.eps);
+    for (uint k = 0; k < NK; ++k) if (k < nk) {
+      uint c = grp + 8 * k;
+      T[(PP * lane + p) * ld + c] = (half)((v[p][k] - mean[p]) * inv * a.scale[c] + a.offset[c]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint row = grp; row < R; row += 8) {
+    ulong r = r0 + row;
+    if (r >= a.pairs) break;
+    for (uint c = 4 * lane; c < C; c += 128) *(device half4*)(a.out + r * C + c) = *(threadgroup const half4*)(T + row * ld + c);
+  }
+}
+template [[host_name("lf_center_norm_16h2")]] kernel void lf_center_norm_h<16, 2>(constant CenterNormArgs&, uint3, uint3, uint);
+template [[host_name("lf_center_norm_32h1")]] kernel void lf_center_norm_h<32, 1>(constant CenterNormArgs&, uint3, uint3, uint);
 template [[host_name("lf_center_norm_16")]] kernel void lf_center_norm<16>(constant CenterNormArgs&, uint3, uint3, uint);
 template [[host_name("lf_center_norm_32")]] kernel void lf_center_norm<32>(constant CenterNormArgs&, uint3, uint3, uint);
 // ...for any width (OpenDDE's 384, IntelliFold-2's 512): the channels streamed twice for the statistics and once for
 // the output, written in place of the transpose through threadgroup memory
-kernel void lf_center_norm_wide(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+template <typename TP>
+kernel void lf_center_norm_wide_t(constant CenterNormArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
                                 uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]]) {
   threadgroup float part[256];
+  device const TP* prod = sizeof(TP) == 2 ? (device const TP*)a.prodh : (device const TP*)a.prod;
   const uint lane = tid & 31, grp = tid >> 5, C = a.C;
   const ulong r0 = (ulong)(tg.y * ng.x + tg.x) * 32;
   const uint rr = (uint)(r0 + lane), ii = lf_udiv(rr, a.L);
@@ -318,18 +373,20 @@ kernel void lf_center_norm_wide(constant CenterNormArgs& a [[buffer(0)]], uint3 
   // the statistics in ONE read of the product (the output is the second): sums shifted by the pair's channel 0, so the
   // variance is no difference of large numbers - mean = K + s1 / C, var = s2 / C - (s1 / C)^2
   threadgroup float part2[256];
-  const float K = live ? a.prod[q] : 0.f;
+  const float K = live ? (float)prod[q] : 0.f;
   float s1 = 0.f, s2 = 0.f;
-  for (uint c = grp; c < C; c += 8) { const float d = (live ? a.prod[c * plane + q] : 0.f) - K; s1 += d; s2 += d * d; }
+  for (uint c = grp; c < C; c += 8) { const float d = (live ? (float)prod[c * plane + q] : 0.f) - K; s1 += d; s2 += d * d; }
   part[grp * 32 + lane] = s1; part2[grp * 32 + lane] = s2;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float S1 = 0.f, S2 = 0.f;
   for (int g = 0; g < 8; ++g) { S1 += part[g * 32 + lane]; S2 += part2[g * 32 + lane]; }
   const float m1 = S1 / C, mean = K + m1;
-  const float inv = rsqrt(max(S2 / C - m1 * m1, 0.f) + 1e-5f);
+  const float inv = rsqrt(max(S2 / C - m1 * m1, 0.f) + a.eps);
   if (!live) return;
-  for (uint c = grp; c < C; c += 8) a.out[(r0 + lane) * C + c] = (half)((a.prod[c * plane + q] - mean) * inv * a.scale[c] + a.offset[c]);
+  for (uint c = grp; c < C; c += 8) a.out[(r0 + lane) * C + c] = (half)(((float)prod[c * plane + q] - mean) * inv * a.scale[c] + a.offset[c]);
 }
+template [[host_name("lf_center_norm_wide")]] kernel void lf_center_norm_wide_t<float>(constant CenterNormArgs&, uint3, uint3, uint);
+template [[host_name("lf_center_norm_wideh")]] kernel void lf_center_norm_wide_t<half>(constant CenterNormArgs&, uint3, uint3, uint);
 // ---------------------------------------------------------------- gated flash attention
 // A threadgroup is 32 queries of one (row, head), four simdgroups of 8; keys in tiles of 16 staged in threadgroup memory
 // - the smallest of each measured fastest (0.94 TFLOP/s at 16 queries and 32 keys, 0.75 at 32 queries, 0.64 at 64 keys,

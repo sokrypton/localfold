@@ -92,7 +92,40 @@ static int lnBench(int argc, char** argv) {
   return 0;
 }
 
+// `peak <TM> <TN> <K> [float|half] [one]`: the matrix units' issue ceiling (gemm_tensor.metal's lf_mm_peak; `one`: a
+// simdgroup its own tile, lf_mm_peak1). `bw <MiB>`: a device copy's bandwidth, read + write (the M5: 76 / 102 / 127 GB/s
+// at 16 / 64 / 256 MiB)
+static int peakBench(int argc, char** argv) {
+  int TM = atoi(argv[2]), TN = atoi(argv[3]), KK = atoi(argv[4]); const char* acc = argc > 5 ? argv[5] : "float"; const bool one = argc > 6;
+  const int R = 64, G = 4096;
+  float* out = allocT<float>((size_t)G * 128);
+  char name[96], decl[320];
+  snprintf(name, sizeof name, "gemmt_peak%s_%d_%d_%d_%s", one ? "1" : "", TM, TN, KK, acc);
+  snprintf(decl, sizeof decl, "template [[host_name(\"%s\")]] kernel void lf_mm_peak%s<%d, %d, %d, %d, %s>(constant GemmArgs&, uint3, uint%s);", name, one ? "1" : "", TM, TN, KK, R, acc, one ? ", uint" : "");
+  GemmArgs a{}; a.D = (uint64_t)out;
+  std::vector<double> t;
+  for (int round = 0; round < 6; ++round) {
+    double t0 = now();
+    dispatchInstance(name, decl, &a, sizeof a, Grid{(uint32_t)G, 1, 1}, 128); sync();
+    if (round) t.push_back(now() - t0);
+  }
+  std::sort(t.begin(), t.end());
+  double flops = 2.0 * TM * TN * KK * R * G * (one ? 4 : 1);
+  printf("  %dx%dx%d %s: %.3f ms  %.2f TFLOP/s\n", TM, TN, KK, acc, t[t.size() / 2] * 1e3, flops / t[t.size() / 2] / 1e12);
+  return 0;
+}
+static int bwBench(int argc, char** argv) {
+  size_t bytes = (size_t)atoll(argv[2]) << 20;
+  void* a = alloc(bytes); void* b = alloc(bytes); fill(a, 0, bytes); fill(b, 0, bytes); sync();
+  std::vector<double> t;
+  for (int r = 0; r < 8; ++r) { double t0 = now(); for (int i = 0; i < 10; ++i) copy(b, a, bytes); sync(); if (r) t.push_back((now() - t0) / 10); }
+  std::sort(t.begin(), t.end());
+  printf("  copy %zu MiB: %.3f ms  %.1f GB/s (read + write)\n", bytes >> 20, t[t.size() / 2] * 1e3, 2.0 * bytes / t[t.size() / 2] / 1e9);
+  return 0;
+}
 int main(int argc, char** argv) {
+  if (argc > 1 && !strcmp(argv[1], "bw")) { setSource("bench", PORT_SOURCE); return bwBench(argc, argv); }
+  if (argc > 1 && !strcmp(argv[1], "peak")) { setSource("bench", PORT_SOURCE); return peakBench(argc, argv); }
   if (argc > 1 && !strcmp(argv[1], "attn")) { setSource("bench", PORT_SOURCE); return attnBench(argc, argv); }
   if (argc > 1 && !strcmp(argv[1], "ln")) { setSource("bench", PORT_SOURCE); return lnBench(argc, argv); }
   if (argc < 4) { fprintf(stderr, "usage: localfold-bench <out> <rows> <in> [arms] [hhh|hhf|fhf] [reps]\n"); return 1; }

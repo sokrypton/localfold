@@ -548,9 +548,12 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   // An epilogue that adds into a half output (beta, the gated residual, the normalised add - the half pair) keeps the
   // float tile: the update is summed into the residual before the one rounding (128 x 65025 x 128 with beta: 0.467-0.497
   // ms against 0.469-0.478, level)
-  const bool hacc = !floatAcc && tc_ == F16 && a.beta == 0.f && !(a.epilogue & (64 | 8192));
+  // (and a scaled half output that asks for a float accumulator - the triangle's product, stored small to fit - sums in
+  // float, scales, and saturates on the store: halfProductScale)
+  const bool scaledHalf = tc_ == F16 && accFloat && a.alpha != 1.f;
+  const bool hacc = !floatAcc && tc_ == F16 && a.beta == 0.f && !scaledHalf && !(a.epilogue & (64 | 8192));
   const bool tri = a.epilogue & 256;
-  const bool plain = !tri && (a.epilogue & ~6) == 0 && a.alpha == 1.f && a.beta == 0.f;
+  const bool plain = !tri && (a.epilogue & ~6) == 0 && (a.alpha == 1.f || scaledHalf) && a.beta == 0.f;
   // the tile: TM rows along n by TN columns along m. A short n (up to 128) in one tile row, rounded up to 16, 64 columns
   // where the weight is wide enough to fill the GPU (3072 x 80 x 768: 0.064 ms at 80 x 64 against 0.078 at 80 x 128) and
   // 32 where not (768 x 80 x 768: 0.062 against 0.075); a taller n 64 x 128 (512 x 68121 x 128 half: 0.93 ms against
@@ -922,7 +925,15 @@ void layerNorm(const half* x, half* y, size_t rows, int C, const float* s, const
 }
 void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset) {
   size_t P = (size_t)L * L;
-  run(C % 8 || C > 256 ? "lf_center_norm_wide" : C > 128 || getenv("LOCALFOLD_LN_WIDE") ? "lf_center_norm_32" : "lf_center_norm_16", grid1d((P + 31) / 32, 1), 256, CenterNormArgs{prod, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset});
+  run(C % 8 || C > 256 ? "lf_center_norm_wide" : C > 128 || getenv("LOCALFOLD_LN_WIDE") ? "lf_center_norm_32" : "lf_center_norm_16", grid1d((P + 31) / 32, 1), 256,
+      CenterNormArgs{prod, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset, nullptr, 1e-5f, 0});
+}
+void centerNorm(const half* prod, float prodScale, half* out, int L, int Lp, int C, const float* scale, const float* offset) {
+  size_t P = (size_t)L * L;
+  const char* k = C % 8 || C > 256 ? "lf_center_norm_wideh" : C > 128 ? "lf_center_norm_32h1" : "lf_center_norm_16h2";
+  const int per = C % 8 || C > 128 ? 32 : 64;
+  run(k, grid1d((P + per - 1) / per, 1), 256,
+      CenterNormArgs{nullptr, out, P, (uint)C, (uint)L, (uint)Lp, 0, scale, offset, prod, 1e-5f * prodScale * prodScale, 0});
 }
 void toHalf(const float* x, half* y, size_t n) { run1d("lf_to_half", (n + 3) / 4, ConvArgs{x, y, n}); }
 void toFloat(const half* x, float* y, size_t n) { run1d("lf_to_float", (n + 3) / 4, ConvBackArgs{x, y, n}); }
@@ -936,6 +947,15 @@ void profileStart() {
   Device& d = D();
   if (!profiling()) return;
   d.sync(); d.profiled.clear(); d.profileOn = true;
+}
+// The triangle's contraction stored in half, scaled by 2^-10, where the matrix units run (LOCALFOLD_HALF_PROD=0 the
+// control): its float product is the largest tensor a pair update writes and the centre LayerNorm's whole read. The
+// product is not half-sized - seen per update at rms 4 to 97,000 and peaks of 2.5e6 (IntelliFold-2, 5CAJ; it grows
+// with the length) - but its norm is scale-free: 2^-10 keeps the smallest rms at 0.004, in half's full precision, and
+// the peak 27x under half's 65504 (a GEMM's saturating store past it)
+float halfProductScale() {
+  static const bool wanted = !getenv("LOCALFOLD_HALF_PROD") || atoi(getenv("LOCALFOLD_HALF_PROD")) != 0;
+  return wanted && matrixUnits() ? 1.f / 1024.f : 0.f;
 }
 void profileReport(const char* stage, int top) {
   Device& d = D();

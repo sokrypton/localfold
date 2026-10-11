@@ -139,6 +139,9 @@ What was tried and **lost**, so nobody repeats it blind:
 - **The diffusion transformer's gated residual and the next adaLN in one kernel** (cuda/ef2's fusion on `opus-55-opt`,
   48 launches a step fewer): byte-identical and level - 2.49 / 2.47 / 2.47 against 2.49 / 2.43 / 2.46 s at 68 tokens,
   0.7% at 261. Launches from one serial encoder cost almost nothing here; on CUDA the gain was the launches.
+- **The gated residual and the next adaLN in one kernel, again (2026-10-11, the M5)**: byte-identical, the two kernels'
+  565 -> 501 ms of a profiled 255-token diffusion, and level or 1-2% slower in wall time (a simdgroup a row starves the
+  GPU at 68 tokens). The kernel already moves ~125 GB/s, this machine's bandwidth at that size.
 - **A 72-row GEMM tile** (simdgroups 1 x 4) so 68 tokens pad to 72, not 80: 0.181 against 0.189 ms on 3072 x 768, level
   on the conditioning, worse on 768 columns (no 16-column tile) - about 2% of a step, not worth a second layout.
 
@@ -172,6 +175,13 @@ norm reads the stored half values. The updates' last GEMMs are bandwidth-bound o
 -5 to -6% a trunk pass, AF2 -4.5 to -8%, ESMFold2 -2.5 to -3.6% - not memory: the stack holds the half copy beside the
 float one, inside peaks set elsewhere (the MSA stack, the confidence head). bf16 was 3-15 A off on the low-confidence
 folds where half sat at the f32 noise floor; docs/M5-HANDOFF.md has the numbers.
+
+**The triangle's contraction is stored in half too, scaled by 2^-10** (`halfProductScale`, `LOCALFOLD_HALF_PROD=0` the
+control): the float product is a pair update's largest write and the centre LayerNorm's whole read, and the norm is
+scale-free (its epsilon scaled to match). Seen per update at rms 4 to 97,000 and peaks of 2.5e6 (IntelliFold-2, 5CAJ),
+so the scale keeps the smallest in half's full precision and the peak 27x under 65504 (the store saturates past it).
+Per pass the contraction is 16-18% faster and the norm 10-18% (AF3: 80 -> 67 and 64 -> 54 ms; ESMFold2: 226 -> 185 and
+176 -> 144), about 2-3% of a trunk.
 
 🔴 **A RELEASED BUFFER IS STILL RESIDENT UNTIL THE WORK ISSUED BEFORE IT IS DONE**, and the host runs far ahead of the
 GPU: a 522-token trunk pass held 0.9 GB of released buffers beside its own 1.9, invisible to the allocation count and

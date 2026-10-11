@@ -171,6 +171,9 @@ void layerNorm(const half* x, half* y, size_t rows, int C, const float* scale, c
                int ldx = 0, int ldy = 0);
 // the triangle's centre LayerNorm: a channel-major product [C][Lp * Lp] (padded planes) to pair rows [L * L][C] in half
 void centerNorm(const float* prod, half* out, int L, int Lp, int C, const float* scale, const float* offset);
+// ...from the product in half, stored times prodScale (the triangle's contraction scaled to fit half: the norm is
+// scale-free but for its epsilon, scaled here to match)
+void centerNorm(const half* prod, float prodScale, half* out, int L, int Lp, int C, const float* scale, const float* offset);
 void toHalf(const float* x, half* y, size_t n);
 void toFloat(const half* x, float* y, size_t n);
 void add(float* y, const float* x, size_t n, float a = 1.f);      // y += a x
@@ -180,6 +183,7 @@ void addBias(float* y, const float* b, size_t rows, int C, int act = 0);   // ac
 // every labelled dispatch its own command buffer, its GPU time summed by label: an upper bound, for proportions
 bool profiling();
 bool matrixUnits();      // the matrix units' kernels run here (an Apple10 GPU on macOS 26; LOCALFOLD_GEMM_TENSOR=0 not)
+float halfProductScale();   // the triangle product's scale in half (core.mm), 0 where it stays float
 void profileStart();
 void profileReport(const char* stage, int top = 20);
 

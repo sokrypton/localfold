@@ -781,3 +781,36 @@ outliers. What remains, all bandwidth or scalar work:
   (a Chrome update races again) and the adapter's vendor and architecture. Measured in one page on two devices: the
   first raced 529 ms, the second took the remembered answer in 0 ms. `probe-grid-attend-race.js` forgets it first
   (`--remembered` asks what a repeat visit gets).
+
+## 2026-10-11: where the ceilings are, and the triangle's product in half
+
+- **The matrix units' issue ceiling, measured** (`localfold-bench peak`, operands in threadgroup memory): 12.3-12.6
+  TFLOP/s from a 32 x 128 x 64 product up, half or float accumulators, and a single simdgroup's 16 x 64 x 32 12.4.
+  The GEMMs at 9-11 are 75-89% of it; `relaxed_precision` in the descriptor is level. A device copy is 76 / 102 / 127
+  GB/s at 16 / 64 / 256 MiB (`localfold-bench bw`).
+- **Attention (16% of a 255-token AF3 pass), taken apart** (bench, 255 x 4 x 32 x 255, 1.27 ms): its products alone
+  0.91 ms (the ceiling says 0.70), so the softmax is 0.36: the bias load 0.11, the running max 0.13, the row sum ~0.
+  Each is a few % of the pass at best.
+- **The triangle's contraction in half, scaled 2^-10** (this commit; README, Memory). Measured ranges before choosing
+  the scale (`max |prod|` per update): AF3 lineage rms 25 (rf3) to 96,570 (IntelliFold-2, 5CAJ), peaks to 2.48e6; AF2
+  rms 4.2-23,400, peak 2.3e5 (1BRS multimer); ESMFold2 rms 5.4-10,500, peak 2.2e5. Plain half overflows; the scaled
+  store with a float accumulator (a half twin tensor stored whole - an element at a time made the contraction slower)
+  does not.
+  - **Kernels, profiled**: AF3 boltz2 5CAJ contraction 80 -> 67 ms a pass, the norm 64 -> 54 (also a 2-pair-a-lane
+    kernel with half4 stores, byte-identical to the 1-pair one); ESMFold2 226 -> 185 and 176 -> 144. Wall time on this
+    machine moved ~7% between rounds with heat, so the 2-3% is the profile's.
+  - **Accuracy**: selftest 2.1-2.6e-4 against the exact norm (128, 256, 100 channels). AF2: t59 0.003 A, 6MRR 0.002,
+    1BRS multimer 0.392, 5CAJ 0.590 (pLDDT 38-48: inside the 0.3-1.0 A float floor). ESMFold2 5CAJ 0.018 A.
+  - **The gates**: 28 of 29 as before; **AF3's kitchen sink moved** (pLDDT 75.65 -> 74.50, pTM 0.756 -> 0.735) and is
+    re-recorded, because the structures say the half pair was the outlier: HEAD (half pair, float product) is **1.88 A**
+    from every float-pair variant, while half pair + half product is **0.24 A** from the all-float fold - inside the
+    float variants' own 0.14-0.20 (float pair with the half product 0.144, no matrix units at all 0.202). The A100
+    reads 73.47 there.
+  - 🔴 **zsh does not split `$var` - again.** An arm loop `env $arm ...` passed `"A=0 B=0"` as ONE variable, so arms
+    labelled "off" ran with the feature on and read as a nondeterministic fold for an hour. Bash scripts only.
+- **Lost, again: the diffusion's gated residual fused with the next adaLN** - README's "what lost" already had it.
+  Byte-identical, 565 -> 501 ms profiled, level to 2% slower in wall time.
+- **Where both backends are**: every Metal kernel left is at the matrix units' ceiling (75-89%), at bandwidth (the
+  norms, the residual GEMMs' epilogues, the diffusion's elementwise work at ~100-125 GB/s), or attention. WebGPU's
+  trunk kernels are at the WGSL GEMM ceiling (2.0 f32, 2.9 f16) or bandwidth, and its remaining levers are the f16
+  storage and arithmetic the earlier rounds declined on the checkers' envelopes.
