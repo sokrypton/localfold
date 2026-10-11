@@ -51,6 +51,20 @@ __global__ void pushTransposeK(PeerSlabs ps, const uint4* __restrict__ zT, int n
   ((uint4*)ps.p[p])[((size_t)(i - ps.lo[p]) * n + j0 + j) * vecs + v] = zT[((size_t)j * n + i) * vecs + v];
 }
 
+// ...a chunk at a time: this rank's rows [lo, lo + rows) of z (src) at every rank's chunk k of its columns, into that
+// rank's z^T - rank p's chunk its columns [lo_p + k P_p, lo_p + min(rows_p, (k + 1) P_p)), P_p = ceil(rows_p / chunks)
+__global__ void pushTransposeChunkK(PeerSlabs ps, const uint4* __restrict__ src, int n, int lo, int rows, int vecs, int k,
+                                    int chunks, int Pmax, int rank) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)ps.world * Pmax * rows * vecs) return;
+  const int v = (int)(t % vecs); size_t rest = t / vecs;
+  const int i = (int)(rest % rows); rest /= rows;
+  const int jj = (int)(rest % Pmax), p = (int)((rest / Pmax + rank) % ps.world);
+  const int P = (ps.rows[p] + chunks - 1) / chunks, jl = k * P + jj;
+  if (jj >= P || jl >= ps.rows[p]) return;
+  const int j = ps.lo[p] + jl;
+  ((uint4*)ps.p[p])[((size_t)jl * n + lo + i) * vecs + v] = src[((size_t)i * n + j) * vecs + v];
+}
 // zT (this rank's rows of z^T: z's columns [lo, hi)) from every rank's slab of z
 inline void transpose(const mg::Shared& z, const mg::Shared& zT, int n, int C) {
   const size_t pb = (size_t)C * elem(); const int vecs = (int)(pb / 16);
@@ -411,23 +425,34 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
     return evs[k];
   };
   const int vecs = (int)((size_t)C * elem() / 16);
-  if (from && !folded) {     // (the same fences as the folded form: a rank's choice is its own)
-    mg::fence();
-    if (rowsHere) pushTransposeK<<<blocks((size_t)n * rowsHere * vecs), 256, 0, STREAM>>>(peerSlabs(z, n), (const uint4*)from->local, n, lo, rowsHere, vecs);
-    mg::fence();
+  // z^T pushed a chunk of every rank's columns at a time, a fence each (the count alike on every rank: off the largest
+  // share), chunk k + 1's pushes on a side stream beside chunk k's input pass where the form is folded
+  static cudaStream_t xS = nullptr;
+  static cudaEvent_t xFenced, xFilled;
+  if (from && !xS) {
+    CK(cudaStreamCreateWithFlags(&xS, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&xFenced, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&xFilled, cudaEventDisableTiming));
   }
+  const int XC = (int)std::clamp<size_t>((size_t)maxStored(n) * n / 262144, 1, 4), Pmax = (maxStored(n) + XC - 1) / XC;
+  auto zTChunk = [&](int k, cudaStream_t st) {
+    if (rowsHere) pushTransposeChunkK<<<blocks((size_t)mg::WORLD * Pmax * rowsHere * vecs), 256, 0, st>>>(
+      peerSlabs(z, n), (const uint4*)from->local, n, lo, rowsHere, vecs, k, XC, Pmax, mg::RANK);
+  };
+  if (from) mg::fence();                          // (every rank's z written; its z^T free)
+  if (from && !folded)       // (the same fences as the folded form: a rank's choice is its own)
+    for (int k = 0; k < XC; ++k) { zTChunk(k, STREAM); mg::fence(); }
   if (folded) {
     if (!pushS) CK(cudaStreamCreateWithFlags(&pushS, cudaStreamNonBlocking));
-    // (z^T pushed whole - each rank its rows into every rank's columns - then the chunks' input passes: pulled a chunk at a
-    // time beside the pass before, the reads ran at a thirtieth of a write through a PCIe host bridge)
-    mg::fence();                                  // (every rank's z written; its z^T free)
-    if (rowsHere) pushTransposeK<<<blocks((size_t)n * rowsHere * vecs), 256, 0, STREAM>>>(peerSlabs(z, n), (const uint4*)from->local, n, lo, rowsHere, vecs);
-    mg::fence();                                  // (every rank's columns here)
-    const int P = (rowsHere + chunks - 1) / chunks;
-    for (int j0 = 0; j0 < rowsHere; j0 += P) {
-      const int cols = std::min(P, rowsHere - j0);
-      gridIn128(base, pre, qkvg, qkvgAll + (size_t)j0 * n * 4 * Wd, n, (size_t)(lo + j0) * n, (size_t)cols * n, false, Wh(wb),
-                bias, heads, stride, swap);
+    zTChunk(0, STREAM);
+    mg::fence();                                  // (every rank's columns of chunk 0 here)
+    const int P = (rowsHere + XC - 1) / XC;
+    for (int k = 0; k < XC; ++k) {
+      if (k + 1 < XC) { CK(cudaEventRecord(xFenced, STREAM)); CK(cudaStreamWaitEvent(xS, xFenced, 0)); zTChunk(k + 1, xS); CK(cudaEventRecord(xFilled, xS)); }
+      const int j0 = k * P, cols = std::min(P, rowsHere - j0);
+      if (cols > 0)
+        gridIn128(base, pre, qkvg, qkvgAll + (size_t)j0 * n * 4 * Wd, n, (size_t)(lo + j0) * n, (size_t)cols * n, false, Wh(wb),
+                  bias, heads, stride, swap);
+      if (k + 1 < XC) { CK(cudaStreamWaitEvent(STREAM, xFilled, 0)); mg::fence(); }
     }
   } else if (whole) gridIn128(base, pre, qkvg, qkvgAll, n, (size_t)lo * n, pairsHere, false, Wh(wb), bias, heads, stride, swap);
   else {
