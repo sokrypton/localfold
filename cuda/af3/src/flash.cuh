@@ -1030,6 +1030,22 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int
   flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
                                                                               rowStride, posStride, outRowStride, outPosStride, GRID_SWIZZLE >= 0 ? GRID_SWIZZLE : n >= 3500 ? 4 : 0);
 }
+// 64-key tiles for the dense 32-wide grid attention where an SM holds two of its blocks (an A100, a Hopper part): on
+// the A100 4-7% faster than 48 at every length measured - 256 to 8,192 tokens, 0.145 against 0.156 ms at 256, 4.59 against
+// 4.93 at 1,024, 69.7 against 73.4 at 8,192 (256 rows, --bench-grid) - where the note above had 48 ahead at 6,000 for an
+// older kernel; a 100 KB-an-SM part (an A6000, an L4, an RTX PRO 6000) would hold one 64-key block where it holds two
+// of 48. (BioIR's sm_80 triangle attention takes 64-key tiles; theirs against ours is cuda/af3/README.md's, 2026-10-12.)
+// LOCALFOLD_FLASH_2R_BK=48|64 forces either
+inline bool flash2RWideKeys() {
+  static const bool v = [] {
+    if (const char* e = getenv("LOCALFOLD_FLASH_2R_BK")) return atoi(e) == 64;
+    int dev, perSm = 0; CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&perSm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+    const size_t block = std::max(2 * fa2Stage<32, 2, 64, 2, 2>(), (size_t)2 * 2 * 16 * 2 * (32 + 8) * 2);
+    return (size_t)perSm >= 2 * (block + 1024);            // (1 KB a block the driver reserves)
+  }();
+  return v;
+}
 inline int flash2R1Tile() {
   static const int v = getenv("LOCALFOLD_FLASH_2R1") ? atoi(getenv("LOCALFOLD_FLASH_2R1")) : 48;
   return v;
@@ -1363,7 +1379,8 @@ void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const floa
     flashGridHalf<D, WARPS, true, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
   } else if (FLASH_2R && !REG && D == 32 && WARPS == 4 && BK == 48) {   // (the unmasked kernel reads no r0)
-    flashGrid2RRun<D, 2, BK, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    if (flash2RWideKeys()) flashGrid2RRun<D, 2, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    else flashGrid2RRun<D, 2, BK, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
   } else if (FLASH_F16S) {
     setFlashSmem<D, WARPS, false, BK, REG, MINB, true>();
     flashGridHalf<D, WARPS, false, BK, REG, MINB, false, true><<<grid, 32 * WARPS, bytes, STREAM>>>(
