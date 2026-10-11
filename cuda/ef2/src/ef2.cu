@@ -252,6 +252,7 @@ static int foldInput(const Opts& o, bool warm) {
   const int passes = getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4;
   if (mg::WORLD > 1) {
     const int world = mg::WORLD;
+    mem("before the sharded trunk"); mg::segmentReport("before the sharded trunk");
     z = shardedTrunkEf2(T, C, passes);         // (this rank's rows, bf16, indexed by the global pair: EF2_ZS)
     say("trunk across %d GPUs\n", world);
   } else foldingTrunk(T, C, zi, z, passes, check, lmZ, seed, lmHost);
