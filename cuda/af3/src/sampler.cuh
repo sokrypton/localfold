@@ -324,6 +324,14 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
   const int* chain = M.i("batch.asymId"); const int* resIdx = M.i("batch.residueIndex");
   FILE* f = fopen(path.c_str(), "w");
   int serial = 1;
+  // (PDB's fields: a serial of five digits and a chain of one letter - past 99,999 atoms the serial wraps, as the
+  // chain letter already does past 26 chains, so the columns stay where every reader looks; mmCIF holds either)
+  size_t live = 0; int chains = 0;
+  for (size_t i = 0; i < (size_t)n * dense; ++i) live += mask[i] != 0;
+  for (int t = 0; t < n; ++t) chains = std::max(chains, chain[t]);
+  if (live > 99999 || chains > 26)
+    fprintf(stderr, "%s: %zu atoms in %d chains is past PDB's serials or chain letters (they wrap) - --out=<name>.cif keeps them\n",
+            path.c_str(), live, chains);
   for (int t = 0; t < n; ++t) for (int a = 0; a < dense; ++a) {
     size_t i = (size_t)t * dense + a;
     if (!mask[i]) continue;
@@ -332,7 +340,7 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
     for (int k = 0; k < 4; ++k) { int c = names[i * 4 + k]; name[k] = c > 0 ? (char)(c + 32) : 0; }
     int z = elem[i]; const char* el = z >= 0 && z < 18 ? ELEM[z] : "X";
     const char* res = aatype[t] >= 0 && aatype[t] < 20 ? RES[aatype[t]] : "UNK";
-    fprintf(f, "ATOM  %5d %-4s %3s %c%4d    %8.3f%8.3f%8.3f%6.2f%6.2f          %2s\n", serial++,
+    fprintf(f, "ATOM  %5d %-4s %3s %c%4d    %8.3f%8.3f%8.3f%6.2f%6.2f          %2s\n", serial++ % 100000,
             strlen(name) < 4 ? (std::string(" ") + name).c_str() : name, res, 'A' + (chain[t] - 1) % 26,
             resIdx[t], x[i * 3], x[i * 3 + 1], x[i * 3 + 2], 1.0, bfactors ? bfactors[i] : 0.0, el);
   }

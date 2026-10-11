@@ -270,6 +270,8 @@ inline int openSegment(size_t bytes, const std::string& name) {
     size_t f = 0, t = 0; cudaGetLastError(); cudaMemGetInfo(&f, &t);
     fprintf(stderr, "rank %d: out of device memory for the shared buffer %s (%.2f GB; %.2f of %.2f GB free)\n", RANK,
             name.c_str(), bytes / 1e9, f / 1e9, t / 1e9);
+    for (auto& [k, v] : sharedBuffers()) fprintf(stderr, "  shared %-20s %8.2f GB\n", k.c_str(), v.bytes / 1e9);
+    scratchReportOOM("the shared buffer", bytes);
     exit(1);
   }
   if (SIM) { for (int r = 0; r < WORLD; ++r) g.peer[r] = g.local; segments().push_back(g); return (int)segments().size() - 1; }

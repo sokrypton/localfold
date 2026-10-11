@@ -593,7 +593,9 @@ void templateEmbedding(Trunk& t, float* out) {
   // The query term, LN(pair) projected - the same for every pass. On a card short of room it is not
   // kept: each pass recomputes it into its activation in row chunks (the normalised pair is read once,
   // by the projection), which is a pair-sized tensor fewer for a LayerNorm and a narrow GEMM a pass.
-  bool tight = shortPair(pairs, Cq);
+  // (asked of the WHOLE pair: shortPair takes a rank's share itself - asked of the held rows, a sharded rank's stack was
+  // never short of room and kept its query and LayerNorm whole, 12.4 GB of a simulated rank of 8's 13,832 tokens)
+  bool tight = shortPair(allPairs, Cq);
   size_t per = tight ? std::max<size_t>(1, std::min(pairs, CHUNK / Cq)) : pairs;
   T* ln = scratch<T>("tmpl.ln", per * Cq);
   auto queryInto = [&](float* dst) {
@@ -686,7 +688,12 @@ void templateEmbedding(Trunk& t, float* out) {
     if (live == 1) scaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(act, repeat, pairs * Ct);
     else addScaledK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, act, repeat, pairs * Ct);
     if (parked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkFromHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = t.pair; }
-    if (shareParked) { releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." }); unparkShare(t); out = t.pair; }
+    if (shareParked) {    // (the stack's z^T and triangle shares first - only its activation is read from here: 16 GB of
+                          //  them beside the share coming home was 0.1 GB too many a rank at 12,350 tokens on 4)
+      releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
+      mg::release({ "sh.tzT", "sh.bg", "sh.biasg" }, mg::FREE); actTS = nullptr;
+      unparkShare(t); out = t.pair;
+    }
   }
   // divided by every slot (not the real ones), relu, projected
   reluScaleK<<<blocks(pairs * Ct), 256, 0, STREAM>>>(summed, 1.f / (1e-7f + templates), pairs * Ct);
@@ -1086,6 +1093,9 @@ void msaBlock(Trunk& t, int k) {
   transition<T>(t.msa, (size_t)t.S * t.n, t.Cm, 4, B + ".msaTransition"); stage("msa.transition");
   if (updateFirst) { outerProductMean<T>(t, B + ".outerProductMean"); stage("msa.opm"); }
   PAIR16 = t.p16;
+  // (a sharded rank short of room: the MSA side's scratch given back before the pair's updates - held into the triangle
+  // it was 3.7 GB of a simulated rank of 4's out-of-memory at 12,350 tokens; the pool keeps its pages for them)
+  if (sharded(t) && shortPair((size_t)t.n * t.n, t.C)) releaseScratch({ "msaatt.", "opm." });
   if (sharded(t)) sh::pairUpdates<T>(*t.zS, t.zTS, "sh.zT", t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
   else pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4, shortPair((size_t)t.n * t.n, t.C));
   PAIR16 = false;

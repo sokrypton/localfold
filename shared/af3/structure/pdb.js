@@ -164,7 +164,7 @@ function pdbTemplate(batch) {
       const name = atomName(batch.displayAtomNameChars ?? batch.refAtomNameChars, slot);
       records.push({ slot, head:
         (ligandCode === undefined ? "ATOM  " : "HETATM")
-        + String(serial).padStart(5) + " "
+        + String(serial % 100000).padStart(5) + " "
         + (name.length < 4 ? ` ${name}`.padEnd(4) : name.slice(0, 4)) + " "
         + (ligandCode
           ?? nucleicName(residueOf(token))?.padStart(3)
@@ -213,8 +213,10 @@ function pdbTemplate(batch) {
   }
   for (const [atom, bonded] of [...partners].sort((x, y) => x[0] - y[0])) {
     for (let start = 0; start < bonded.length; start += 4) {
-      let line = "CONECT" + String(atom).padStart(5);
-      for (const other of bonded.slice(start, start + 4)) line += String(other).padStart(5);
+      // (a serial is five digits: past 99,999 atoms it wraps - as every serial field here - so the
+      // columns stay where readers look; mmCIF holds such a fold whole)
+      let line = "CONECT" + String(atom % 100000).padStart(5);
+      for (const other of bonded.slice(start, start + 4)) line += String(other % 100000).padStart(5);
       conect.push(line);
     }
   }
