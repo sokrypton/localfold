@@ -1586,12 +1586,25 @@ Not yet measured on a box. Even overlapped the bridge caps such a box near 2x at
 The largest single-sequence AF3 fold on N x 40 GB, found on a simulated rank of N on this A100 (`LOCALFOLD_MG_SIMULATE`:
 one rank's real memory, 25 steps, no recycles - a box adds what its peers' mappings take, so confirm there):
 
-| GPUs | before | now | first refused |
-|---:|---:|---:|---:|
-| 1 | ~7,900 | ~7,900 | |
-| 2 | 4,940 | **6,916** | 7,410 |
-| 4 | 8,645 | **9,633** | 10,127 |
-| 8 | 12,103 | **13,091** | 14,079 |
+| GPUs | before | then | now (later 2026-10-11) | first refused |
+|---:|---:|---:|---:|---:|
+| 1 | ~7,900 | ~7,900 | ~7,900 | |
+| 2 | 4,940 | **6,916** | | |
+| 4 | 8,645 | **9,633** | **11,856** | 12,350 (0.8 GB short, a triangle's) |
+| 8 | 12,103 | **13,091** | **15,808** (peak 32.7 GB a rank) | |
+
+The "now" column, a rank short of room (each change byte-identical on 5CAJ with the short-of-room paths forced unless
+said): the column attention holds no z^T share (its bias off the rank's own rows of z, written at the transposed place;
+z^T a chunk of every rank's columns at a time into two eighth-share slots, attended and pushed home - z^T is made only
+where a form still wants it); the triangle's gate made a chunk of rows at a time before its output (`RectMap.stride`),
+not held a whole share; the rank's share of the trunk pair PARKED in pinned host memory through a single template pass
+and from the diffusion's preparation (which streams its rows from there) to the confidence head (`parkShare` - a share's
+worth of host RAM a rank); target_feat's encoder scratch, the MSA side's and the sampler's precomputed conditioning given
+back where they were held across a stage; the generic triangle's peer share staged an eighth of its channels at a time
+(0.009 A: cuBLAS's pick at a smaller batch). And one bug: the sharded template stack asked `shortPair` of its held rows,
+which divides by the share again - never short of room, it kept its query and LayerNorm whole (12.4 GB a rank at 13,832
+on 8). 🔴 A failing segment allocation prints every shared buffer and the scratch now - that listing found it. Past
+99,999 atoms a PDB's serial wraps (it ran a digit wide and the score reader threw); write such a fold as `--out=*.cif`.
 
 A rank held some 5.25 slabs (its rows of the pair, z^T, the triangle's a, b and product, a bias) where one GPU holds one
 pair, so 2 GPUs took fewer tokens than 1. On a card short of room now: the channel-split triangle in ROUNDS (a and b made
