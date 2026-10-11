@@ -12,11 +12,18 @@
  * running then would leave it unset for the fold that most wants it; a stack's compile is seconds of driver work, and
  * this is two pipelines and a few dispatches beside it. One race a device - the promise is shared - and only where
  * nothing else has answered: a prior, `--tune` or setDeviceTuning that names `gridAttendTiled` skips it.
+ *
+ * 🔴 AND ONE RACE A BROWSER, NOT A PAGE LOAD. The answer is the machine's, and on an M2 - where it is always "untiled"
+ * - the race cost a first fold 0.2-0.35 s of every visit (4.06 / 4.23 / 4.25 s against 4.05 / 3.93 / 3.90 skipping
+ * it, alternated). So it is remembered in localStorage under the browser's user agent (its version: a Chrome update
+ * races again) and the adapter's vendor and architecture. A private window, blocked storage or a worker races as
+ * before.
  */
 import { createGridAttentionShaders, packGridAttentionWeights } from "./grid-attention.js";
 import { deviceProfile, halfPrecisionAvailable, setDeviceTuning } from "../../runtime/device-profile.js";
 
 const RACES = new WeakMap();
+const MEMORY = "localfold.gridAttendRace.v1";
 const DETAIL = new WeakMap();
 const N = 256;
 const CHANNELS = 128;
@@ -35,11 +42,43 @@ function wantsRace(device) {
     && profile.tuning.gridAttendTiledHalf === null && halfPrecisionAvailable(device);
 }
 
+/** Which browser and GPU a remembered answer belongs to. */
+function machine(device) {
+  const profile = deviceProfile(device);
+  const agent = typeof navigator === "object" ? navigator.userAgent : "";
+  return `${agent}|${profile.vendor ?? ""}/${profile.architecture ?? ""}`;
+}
+
+function remembered(device) {
+  try {
+    const stored = JSON.parse(globalThis.localStorage?.getItem(MEMORY) ?? "null");
+    return stored !== null && stored.machine === machine(device) && typeof stored.tiled === "boolean"
+      ? stored.tiled : undefined;
+  } catch { return undefined; }
+}
+
+function remember(device, tiled) {
+  try { globalThis.localStorage?.setItem(MEMORY, JSON.stringify({ machine: machine(device), tiled })); }
+  catch { /* a race next visit, as before */ }
+}
+
+/** Forget this browser's remembered answer, so the next device races again (a probe that wants the race itself). */
+export function forgetGridAttendRace() {
+  try { globalThis.localStorage?.removeItem(MEMORY); } catch { /* nothing remembered */ }
+}
+
 /** Settles `gridAttendTiled` / `gridAttendTiledHalf` for this device; resolves once they are final. */
 export function settleGridAttendTiling(device) {
   const running = RACES.get(device);
   if (running !== undefined) return running;
   if (!wantsRace(device)) return Promise.resolve();
+  const known = remembered(device);
+  if (known !== undefined) {
+    DETAIL.set(device, { tiled: known, remembered: true });
+    setDeviceTuning(device, { gridAttendTiled: known, gridAttendTiledHalf: known });
+    RACES.set(device, Promise.resolve());
+    return RACES.get(device);
+  }
   const promise = race(device).catch((error) => {
     DETAIL.set(device, { error: String(error?.message ?? error) });
   });
@@ -191,6 +230,7 @@ async function race(device) {
                          samplesMs: arms.map((arm) => arm.times.map((t) => Number(t.toFixed(2)))) });
     // 🔴 BOTH WAYS, so the knob is answered and no second stack races again
     setDeviceTuning(device, { gridAttendTiled: take, gridAttendTiledHalf: take });
+    remember(device, take);
   } finally {
     for (const buffer of buffers) buffer.destroy();
   }

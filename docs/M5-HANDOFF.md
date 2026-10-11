@@ -770,3 +770,14 @@ outliers. What remains, all bandwidth or scalar work:
 - **For the M2:** `node tools/gpu-chrome.mjs tools/gpu/probe-grid-attend-race.js` under `LOCALFOLD_STOCK_FLAGS=1`
   should print `tiled: false` (the M2's 995 → 1444 ms is a 1.45x loss). If it prints true, the race is wrong there
   and `bench-trunk.js --profile` against `--tune=gridAttendTiled=false,gridAttendTiledHalf=false` settles it.
+
+## From the M2, on 0b0f7c6a (the grid.attend race)
+
+- **The race reads `tiled: false` on the M2**, three runs: untiled 9.12-9.14 ms against tiled 13.70-13.87 (relRMS
+  2.24e-4), as the trunk measurement said. Folds are unchanged by it (6MRR pLDDT 85.75464523793929 raced or skipped).
+- **But it cost every visit's first fold 0.2-0.35 s here**, in two of three rounds (raced 4.06 / 4.23 / 4.25 s
+  against 4.05 / 3.93 / 3.90 with `--tune=gridAttendTiled=false`; the race itself 530-736 ms beside the compile).
+- **So it now runs once a browser** (this commit): the answer is remembered in localStorage under the user agent
+  (a Chrome update races again) and the adapter's vendor and architecture. Measured in one page on two devices: the
+  first raced 529 ms, the second took the remembered answer in 0 ms. `probe-grid-attend-race.js` forgets it first
+  (`--remembered` asks what a repeat visit gets).

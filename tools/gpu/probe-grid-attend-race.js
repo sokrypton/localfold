@@ -7,10 +7,13 @@
  * `gridAttendTiled` (an Apple GPU: the M2 and the M5 report the same adapter and want opposite answers). This runs it
  * on its own, with the time it costs, so the decision and its margin can be read off any machine.
  */
-import { gridAttendRaceDetail, settleGridAttendTiling } from "../../webgpu/af3/trunk/grid-attend-race.js";
+import { forgetGridAttendRace, gridAttendRaceDetail, settleGridAttendTiling }
+  from "../../webgpu/af3/trunk/grid-attend-race.js";
 import { deviceTuning } from "../../webgpu/runtime/device-profile.js";
 
-export async function main(device) {
+export async function main(device, args = []) {
+  // (the race itself, not this browser's remembered answer - unless --remembered asks what a repeat visit gets)
+  if (!args.includes("--remembered")) forgetGridAttendRace();
   const started = performance.now();
   await settleGridAttendTiling(device);
   const tuning = deviceTuning(device);
