@@ -1581,6 +1581,21 @@ thousand tokens, and 2 GPUs (one pair's traffic through the bridge a triangle) b
 Not yet measured on a box. Even overlapped the bridge caps such a box near 2x at 3,000 tokens and ~3x at 6,000.
 `LOCALFOLD_MG_TRI_TIMES=1` prints the triangle's phases (input pass, exchange + GEMMs, product tail, output) on rank 0.
 
+**Several samples: dealt, and a small fold's trunk replicated.** With several samples each rank samples k % N and runs
+those samples' confidence heads itself (the one-GPU head on the whole pair; results to rank 0 through `/dev/shm`),
+where every rank had run every sample. And for a fold that fits one GPU, under ~1,700 tokens on a link pushing under 30
+GB/s (`mg::pushRate`, measured at start: ~17 on these four, ~60 over NVLink), every rank runs the whole trunk alone and
+nothing is exchanged before the samples are dealt (`LOCALFOLD_MG_REPLICATE=1/0` forces either; sample k is then the
+one-GPU fold of that sample alone, bit for bit). AF3's defaults (200 steps, 3 recycles), 5 samples, on the four:
+
+| tokens | 1 GPU | 4, sharded | 4, replicated |
+|---:|---:|---:|---:|
+| 988 | 18.8 s | 17.1 s | **13.7 s** (trunk 9.2, diffusion 3.5, confidence 0.5) |
+| 2,964 | 211.9 s | **139.7 s** (trunk 116.0) | 186.8 s (trunk 163.4) |
+
+Five samples on four ranks is two on rank 0, so the diffusion and confidence fall 2.3x, not 4x. The 1,700 crossover is
+not measured.
+
 #### How large a fold fits 40 GB a GPU (2026-10-11, simulated ranks)
 
 The largest single-sequence AF3 fold on N x 40 GB, found on a simulated rank of N on this A100 (`LOCALFOLD_MG_SIMULATE`:

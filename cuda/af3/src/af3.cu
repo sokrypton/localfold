@@ -364,12 +364,25 @@ static int foldMain(int argc, char** argv) {
     if (getenv("LOCALFOLD_MEM") && mg::RANK == 0)
       fprintf(stderr, "  memory room for the ordinary paths %.2f GB, every rank's least\n", SHORT_PAIR_ROOM / 1e9);
   }
-  // several GPUs, REPLICATED (LOCALFOLD_MG_REPLICATE=1): every rank runs the whole trunk alone - nothing exchanged -
-  // then the samples and their confidence heads are dealt as on a sharded pair. For a fold that fits one GPU with
-  // several samples, where the trunk's exchanges cost more than they save (a PCIe-only box)
+  // several GPUs, REPLICATED: every rank runs the whole trunk alone - nothing exchanged - then the samples and their
+  // confidence heads are dealt as on a sharded pair. Chosen for a fold that fits one GPU with several samples, short,
+  // on a slow link, where the split trunk's exchanges cost more than they save: on 4 x A6000 (PCIe, pushes ~17 GB/s)
+  // 988 tokens x 5 samples took 13.7 s so against 17.1 sharded (18.8 on one GPU), 2,964 took 186.8 against 139.7 - the
+  // crossover not measured, ~1,700 (their geometric middle); over NVLink (~60 GB/s) the split trunk wins at 988 already.
+  // LOCALFOLD_MG_REPLICATE=1/0 forces either
   const char* replEnv = getenv("LOCALFOLD_MG_REPLICATE");
   const size_t nRuns = seedList.size() * samples;
-  const bool repl = mg::WORLD > 1 && replEnv && atoi(replEnv) && nRuns > 1 && nRuns <= std::max<size_t>(samples, 10);
+  bool repl = false;
+  if (mg::WORLD > 1 && nRuns > 1 && nRuns <= std::max<size_t>(samples, 10)) {
+    const int Cp = (int)M.meta("trunk.embedder.pairChannels");
+    if (replEnv) repl = atoi(replEnv);
+    else if (tokens < 1700 && mg::minOverRanks(foldFits(tokens, Cp, doFold && pairStays16(tokens, Cp, fast), true))) {
+      const double rate = mg::pushRate();
+      repl = rate < 30e9;
+      if (mg::RANK == 0) printf("several GPUs: pushes at %.1f GB/s a GPU - %s\n", rate / 1e9,
+                                repl ? "the trunk whole on each, the samples dealt" : "the pair sharded");
+    }
+  }
   if (repl) sh::ON = false;
   if (!(mg::WORLD > 1 && sh::ON) && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
                 doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;

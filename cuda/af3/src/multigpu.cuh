@@ -499,6 +499,21 @@ inline void allGather(const Shared& s, size_t off, size_t bytes) {
   if (n16 && WORLD > 1) pushPartK<<<(unsigned)((n16 * (WORLD - 1) + 255) / 256), 256, 0, STREAM>>>(pp, off / 16, n16);
   fence();
 }
+// The rate a GPU pushes into its peers, bytes/s - every rank's 32 MB part into every other's at once, three times (the
+// first warm), the least over the ranks (collective): ~60 GB/s over NVLink (8 x A100), 15-20 through a PCIe host bridge
+// (4 x A6000). A simulated rank's peers are its own memory, so it measures a copy
+inline double pushRate() {
+  const size_t part = (size_t)32 << 20;
+  Shared& s = shared("mg.probe", part * WORLD);
+  allGather(s, (size_t)RANK * part, part);
+  CK(cudaStreamSynchronize(STREAM));
+  auto a = std::chrono::steady_clock::now();
+  for (int k = 0; k < 3; ++k) allGather(s, (size_t)RANK * part, part);
+  CK(cudaStreamSynchronize(STREAM));
+  const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count() / 3;
+  release({ "mg.probe" }, FREE);
+  return (double)minOverRanks((size_t)((WORLD - 1) * part / sec));
+}
 
 // ---------------------------------------------------------------- phase 1: the trunk pair replicated, its work split
 // Every rank holds the whole trunk pair (a Shared buffer, SPLIT); each of its updates computes this rank's share of
