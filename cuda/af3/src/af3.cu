@@ -819,6 +819,7 @@ static int foldMain(int argc, char** argv) {
               if (interOnly && resAsym[i] == resAsym[j]) continue;
               tot += term[(size_t)i * t.n + j]; ++cnt;
             }
+            if (cnt && std::isnan(tot / cnt)) return (double)NAN;
             if (cnt) { any = true; bestTm = std::max(bestTm, tot / cnt); }
           }
           return any ? bestTm : NAN;
@@ -867,8 +868,9 @@ static int foldMain(int argc, char** argv) {
         char row[96]; snprintf(row, sizeof row, "%llu,%d,%.17g", (unsigned long long)dp->sd, dp->sk, dp->score);
         ranking.push_back(row);
       }
-      if (!std::isfinite(dp->score)) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", dp->k, dp->score); exit(1); }
-      if (dp->score > bestScore) {
+      // (a simulated rank's fold is wrong by design - LOCALFOLD_MG_SIMULATE - and its scores may be too: it is timed, not scored)
+      if (!std::isfinite(dp->score) && !mg::SIM) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", dp->k, dp->score); exit(1); }
+      if (dp->score > bestScore || x.empty()) {
         bestScore = dp->score; best = dp->sk; bestSeed = dp->sd; conf = std::move(dp->ck); x = std::move(dp->xk); bestSS = dp->ss;
       }
     }

@@ -403,5 +403,10 @@ inline std::vector<size_t> writeCif(const std::string& path, const std::vector<f
 }
 inline bool cifPath(const std::string& p) { return p.size() > 4 && p.substr(p.size() - 4) == ".cif"; }
 inline std::vector<size_t> writeStructure(const std::string& path, const std::vector<float>& x, const float* bfactors) {
+  const size_t slots = (size_t)M.meta("batch.tokens") * (size_t)M.meta("batch.dense");
+  if (x.size() < slots * 3) {
+    fprintf(stderr, "the structure to write has %zu coordinates where %zu atom slots want %zu\n", x.size(), slots, slots * 3);
+    exit(1);
+  }
   return cifPath(path) ? writeCif(path, x, bfactors) : writePdb(path, x, bfactors);
 }

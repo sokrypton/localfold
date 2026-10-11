@@ -285,6 +285,13 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
 // The PDB: through the exporter's template.pdb when there is one (the page's own records, the
 // slot in the x column), else one residue per token named here. `bfactors` per atom slot.
 inline std::string DATA_DIR;
+// how far a template record's slot (its x column) runs past the column's 8 characters: past 99,999 - 4,167 tokens at
+// 24 slots a token - the slot is wider and pushes the rest of the record right, so its tail is read that far along
+inline size_t templateSpill(const std::string& line) {
+  size_t at = 30; while (at < line.size() && line[at] == ' ') ++at;
+  while (at < line.size() && (isdigit((unsigned char)line[at]) || line[at] == '.')) ++at;
+  return at > 38 ? at - 38 : 0;
+}
 // Returns the dense slot of every ATOM/HETATM record, in file order.
 inline std::vector<size_t> writePdb(const std::string& path, const std::vector<float>& x, const float* bfactors = nullptr) {
   std::vector<size_t> order;
@@ -294,12 +301,13 @@ inline std::vector<size_t> writePdb(const std::string& path, const std::vector<f
     std::string line;
     while (std::getline(tf, line)) {
       if (line.size() >= 66 && (!line.compare(0, 4, "ATOM") || !line.compare(0, 6, "HETATM"))) {
-        size_t slot = (size_t)std::lround(std::stod(line.substr(30, 8)));
+        const size_t spill = templateSpill(line);
+        size_t slot = (size_t)std::lround(std::stod(line.substr(30, 8 + spill)));
         order.push_back(slot);
         char coords[64];
         snprintf(coords, sizeof coords, "%8.3f%8.3f%8.3f%6.2f%6.2f", x[slot * 3], x[slot * 3 + 1], x[slot * 3 + 2],
                  1.0, bfactors ? bfactors[slot] : 0.0);
-        line = line.substr(0, 30) + coords + line.substr(66);
+        line = line.substr(0, 30) + coords + (line.size() > 66 + spill ? line.substr(66 + spill) : std::string());
       }
       fprintf(f, "%s\n", line.c_str());
     }
@@ -386,7 +394,7 @@ struct FrameStreamer {
           snprintf(buf, sizeof buf, "%8.3f", R[d * 3] * p[0] + R[d * 3 + 1] * p[1] + R[d * 3 + 2] * p[2] + refCentre[d]);
           out += buf;
         }
-        out += line.substr(54); out += '\n'; ++a;
+        out += line.substr(54 + templateSpill(line)); out += '\n'; ++a;
       } else { out += line; out += '\n'; }
     }
     char name[64]; snprintf(name, sizeof name, "/frame-%04d.pdb", step);

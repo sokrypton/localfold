@@ -350,6 +350,7 @@ inline void confidenceTm(ConfidenceOut& out, std::vector<float> term, const floa
         if (!(seq[i] > 0 && seq[j] > 0) || (interOnly && asym[i] == asym[j])) continue;
         tot += term[(size_t)i * n + j]; ++cnt;
       }
+      if (cnt && std::isnan(tot / cnt)) return (double)NAN;     // (std::max passes a NaN by: the score must not)
       if (cnt) { any = true; best = std::max(best, tot / cnt); }
     }
     return any ? best : NAN;
