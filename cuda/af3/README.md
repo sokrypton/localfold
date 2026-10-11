@@ -1608,6 +1608,14 @@ one rank's real memory, 25 steps, no recycles - a box adds what its peers' mappi
 | 4 | 8,645 | **9,633** | **12,350** | 13,338 (0.7 GB short, the MSA attention's) |
 | 8 | 12,103 | **13,091** | **17,290** (peak 34.9 GB a rank, 7.6 min a pass simulated) | |
 
+🔴 **ON A REAL 8 x A100-SXM4-40GB (NVLink, 2026-10-11): 12,350 tokens fold on 4 of its GPUs (6.4 min, one pass and 25
+steps) and 16,549 on all 8 (8.3 min), where 17,290 ran out in a pairformer triangle** - a real rank starts with ~2.2 GB
+less room than a simulated one (34.2 against 36.5 GB: its peers' contexts and mappings), so read the simulated column as
+~1,000 tokens optimistic at 8. 15,808 tokens: trunk 355.6 s, diffusion 5.8, confidence 31.2; GPU peaks 39.5-39.9 GB
+(nvidia-smi, the scratch pool's idle pages included), host 61 GB (the parked shares). The same box, AF3's defaults, 5
+samples: **988 tokens 9.8 -> 3.6 s on 8 (2.7x); 2,964 tokens 110.6 -> 24.4 s (4.5x; the trunk 83.1 -> 13.7, 6.1x)**,
+`mg::pushRate` 142 GB/s and the pair sharded. 5CAJ and 1TIM self-templated 0.009 / 0.006 A from one GPU.
+
 The "now" column, a rank short of room (each change byte-identical on 5CAJ with the short-of-room paths forced unless
 said): the column attention holds no z^T share (its bias off the rank's own rows of z, written at the transposed place;
 z^T a chunk of every rank's columns at a time into two eighth-share slots, attended and pushed home - z^T is made only
