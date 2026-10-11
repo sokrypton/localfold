@@ -113,13 +113,13 @@ inline void ringOver(const mg::Shared& bmine, int n, int np, int C, T* const* st
 // its product's rows pushed into each rank's [C][rows_r][np]. As copies they were 3W a group, ~9,700 a 2,964-token
 // trunk pass, each ~17 us of launch the GPU sat idle for.
 // (rows walked from this rank's own, as PeerSlabs's)
-struct PeerPlanes { uint4* p[mg::MAX_RANKS]; uint4* q[mg::MAX_RANKS]; int lo[mg::MAX_RANKS], rows[mg::MAX_RANKS]; int world, rot; };
+struct PeerPlanes { uint4* p[mg::MAX_RANKS]; uint4* q[mg::MAX_RANKS]; int lo[mg::MAX_RANKS], rows[mg::MAX_RANKS]; int world, rot, rank, maxRows; };
 inline PeerPlanes peerPlanes(const mg::Shared& a, const mg::Shared* b, int n) {
-  PeerPlanes pp{}; pp.world = mg::WORLD;
+  PeerPlanes pp{}; pp.world = mg::WORLD; pp.rank = mg::RANK;
   { int hi; rowsOf(n, mg::RANK, pp.rot, hi); }
   for (int r = 0; r < mg::WORLD; ++r) {
     int lo, hi; rowsOf(n, r, lo, hi); pp.lo[r] = lo; pp.rows[r] = hi - lo;
-    pp.p[r] = (uint4*)a.peer[r]; pp.q[r] = b ? (uint4*)b->peer[r] : nullptr;
+    pp.p[r] = (uint4*)a.peer[r]; pp.q[r] = b ? (uint4*)b->peer[r] : nullptr; pp.maxRows = std::max(pp.maxRows, hi - lo);
   }
   return pp;
 }
@@ -154,26 +154,34 @@ __global__ void widenPlanesK(const uint2* __restrict__ in, uint4* __restrict__ o
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n8) out[t] = widen8(in[t]);
 }
+// (ONE DESTINATION AT A TIME, each rank starting at its own: through a PCIe host bridge 4 ranks' writes ran at 17 GB/s
+// a GPU so, at 6 where each GPU's consecutive writes went to every owner in turn - row by row within each channel)
 __global__ void pushRowsK(PeerPlanes pp, const uint4* __restrict__ prod, int q0, int gc, int np, int vecs) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)gc * np * vecs) return;
-  const int v = (int)(t % vecs); const size_t rest = t / vecs; const int i = (int)((rest % np + pp.rot) % np), c = (int)(rest / np);
-  const int r = ownerOf(pp, i);
-  pp.p[r][((size_t)(q0 + c) * pp.rows[r] + (i - pp.lo[r])) * vecs + v] = prod[((size_t)c * np + i) * vecs + v];
+  if (t >= (size_t)pp.world * gc * pp.maxRows * vecs) return;
+  const int v = (int)(t % vecs); size_t rest = t / vecs;
+  const int il = (int)(rest % pp.maxRows); rest /= pp.maxRows;
+  const int c = (int)(rest % gc), r = (int)((rest / gc + pp.rank) % pp.world);
+  if (il >= pp.rows[r]) return;
+  pp.p[r][((size_t)(q0 + c) * pp.rows[r] + il) * vecs + v] = prod[((size_t)c * np + pp.lo[r] + il) * vecs + v];
 }
 
 // this rank's rows of the attention's bias (columns where swapped: the rows of z^T) written into every other rank's -
 // the planes [heads][n][stride] f16; ownership turns on 16-row boundaries, so no 16-byte piece straddles two ranks
 __global__ void pushBiasK(PeerPlanes pp, const uint4* __restrict__ bias, int heads, int n, int stride, bool swap, int rank) {
-  const int vecs = stride / 8;
+  // (one destination at a time, each rank from the next: pushRowsK's note; a piece is this rank's when its row is, or
+  // its 8 columns' first - a column past n the last rank's)
+  const int vecs = stride / 8, lo = pp.lo[rank], hi = rank + 1 < pp.world ? pp.lo[rank + 1] : (swap ? stride : n);
+  const int own = swap ? (min(hi, stride) - lo) / 8 : min(hi, n) - lo;       // (vec columns, or rows)
+  const size_t per = swap ? (size_t)heads * n * own : (size_t)heads * own * vecs;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)heads * n * vecs) return;
-  const int v = (int)(t % vecs), h = (int)(t / vecs / n), i = (int)((t / vecs % n + pp.rot) % n);
-  const int own = swap ? (v * 8 < n ? ownerOf(pp, v * 8) : -1) : ownerOf(pp, i);
-  if (own != rank) return;
-  const size_t at = ((size_t)h * n + i) * vecs + v;
-  const uint4 x = bias[at];
-  for (int k = 1; k < pp.world; ++k) pp.p[(rank + k) % pp.world][at] = x;
+  if (own <= 0 || t >= per * (pp.world - 1)) return;
+  const int p = (rank + 1 + (int)(t / per)) % pp.world;
+  const size_t e = t % per;
+  size_t at;
+  if (swap) { const int v = lo / 8 + (int)(e % own); const size_t hi_ = e / own; at = hi_ * vecs + v; }   // (h, i) whole rows
+  else { const int v = (int)(e % vecs), i = lo + (int)(e / vecs % own), h = (int)(e / vecs / own); at = ((size_t)h * n + i) * vecs + v; }
+  pp.p[p][at] = bias[at];
 }
 
 // a sharded op's scratch given back after it only where the card is short: giving back drains the device
@@ -346,7 +354,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
             gemmAll(gc, A, Bm, pAll[sp]);
             CK(cudaEventRecord(gemmed[sp], STREAM));
             CK(cudaStreamWaitEvent(pushS, gemmed[sp], 0));
-            pushRowsK<<<blocks((size_t)gc * np * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
+            pushRowsK<<<blocks((size_t)mg::WORLD * gc * pPlanes.maxRows * vecsP), 256, 0, pushS>>>(pPlanes, (const uint4*)pAll[sp], m0, gc, np, vecsP);
             CK(cudaEventRecord(pushed[sp], pushS));
             used[sp] = true;
           }
@@ -467,7 +475,9 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   }
   // every rank's: rows of each head's plane, or columns when swapped
   mg::fence();                                    // (every rank's own written and zeroed)
-  pushBiasK<<<blocks((size_t)heads * n * (stride / 8)), 256, 0, STREAM>>>(peerPlanes(biasS, nullptr, n), (const uint4*)bias, heads, n,
+  const PeerPlanes bp = peerPlanes(biasS, nullptr, n);
+  const size_t bw = (size_t)heads * std::max((size_t)bp.maxRows * (stride / 8), (size_t)n * (bp.maxRows / 8 + 2));   // (one destination's)
+  if (mg::WORLD > 1) pushBiasK<<<blocks(bw * (mg::WORLD - 1)), 256, 0, STREAM>>>(bp, (const uint4*)bias, heads, n,
                                                                         stride, swap, mg::RANK);
   mg::fence();
   // this rank's rows, in chunks
