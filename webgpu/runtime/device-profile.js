@@ -1248,6 +1248,18 @@ const PRIORS = new Map([
     // ...and on the M2, the same pass alternated: tri.project-out 503 / 776 -> 364 / 624 ms, tri.project 635 / 1003
     // -> 599 / 1004 - so it holds on both parts.
     trianglePairProjectTile: { rows: 32, columns: 32 },
+    // 🔴 NOT TIERED ON APPLE: THE FIRST FOLD RAN EVERY KERNEL WITH OPAQUE LOOP BOUNDS AND PAID MORE THAN THE COMPILE IT
+    // SAVED. "tiered" (DEFAULT_TUNING) was measured on NVIDIA, whose driver compile dominates a fresh VM's first fold;
+    // Apple's compiles these kernels in a fraction of that, and an opaque bound costs the M5 its unrolling for the whole
+    // first fold: AF3 6MRR's denoiser 74 ms a step against 39 with constant bounds, the step time flat from the first
+    // step - not a clock ramp (a 10 s pause between folds leaves the second fast). Measured with Chrome's Metal shader
+    // cache emptied before each arm (a visitor's first visit), stock Chrome 154, AF3 int5, two rounds alternated:
+    //   6MRR (68 tokens)   first fold 4.5 / 4.6 s tiered -> 2.8 / 2.9 off, the second 2.3 either way
+    //   5CAJ (255 tokens)  first fold 14.4 / 14.5 s      -> 9.7 / 9.7,      the second 9.4-9.6
+    // The same pLDDT to the last digit (the arithmetic is untouched); AF2's monomer at 59 residues level (1186 / 1191
+    // against 1179 ms, the same checksum). Measured on the M5; the M2 compiles on a slower CPU, so it wants re-checking
+    // there (docs/M5-HANDOFF.md).
+    runtimeLoopBounds: false,
   }],
 ], );
 

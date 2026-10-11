@@ -814,3 +814,17 @@ outliers. What remains, all bandwidth or scalar work:
   norms, the residual GEMMs' epilogues, the diffusion's elementwise work at ~100-125 GB/s), or attention. WebGPU's
   trunk kernels are at the WGSL GEMM ceiling (2.0 f32, 2.9 f16) or bandwidth, and its remaining levers are the f16
   storage and arithmetic the earlier rounds declined on the checkers' envelopes.
+- **WebGPU, the first fold: `runtimeLoopBounds` off in the metal-3 prior** (this commit). A visitor's first AF3 fold
+  was 1.8-1.9x its second on the M5, and it was not the GPU's clock (a 10 s pause between folds leaves the second fast;
+  a warm-up burst before the first changes nothing): every denoiser step ran at 74 ms against 39, flat from the first
+  step, because "tiered" (DEFAULT_TUNING, measured on NVIDIA) hands a first fold kernels with opaque loop bounds and
+  upgrades them behind it. Apple's compile does not pay for that. With Chrome's Metal shader cache emptied before each
+  arm (`$(getconf DARWIN_USER_CACHE_DIR)/com.google.Chrome.helper/com.apple.metal`, moved aside and restored), two
+  rounds alternated: 6MRR first fold 4.5 / 4.6 -> 2.8 / 2.9 s, 5CAJ (255 tokens) 14.4 / 14.5 -> 9.7 / 9.7 s, the same
+  pLDDT to the last digit; AF2's monomer level.
+  - **Also learned on the way, about the M5's GPU clock under WebGPU**: under back-to-back work a kernel reaches full
+    speed within ~0.5-1 s (0.94 -> 0.18 ms); with a 5 ms host gap between submits it never ramps (0.97 ms for 8 s), and
+    50 ms of idle drops it again. A fold's own submits keep it up once it is up, so this was not the first fold's cost,
+    but any benchmark that submits one dispatch at a time measures the slow clock (the race uses one submit for this).
+  - **For the M2:** the same cold-cache pair (`--tune=runtimeLoopBounds=false` against the default, `--folds=2`). The
+    M2's CPU compiles more slowly, so if its first fold loses with the change, the knob wants a race or a split there.
