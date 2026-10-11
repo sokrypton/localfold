@@ -733,6 +733,10 @@ static int foldMain(int argc, char** argv) {
       std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
       const bool ca = M.flag("trunk.dialect.confidenceCaDgram");
       auto sc0 = clock();
+      // (the contacts first, off the trunk's slab: the last sample's head then works in that slab, as the one-GPU
+      // head does in the trunk's pair - a slab a rank, 4.7 GB at 12,103 tokens on 8)
+      if (contact.empty()) contact = contactProbabilitiesSharded(t);
+      mg::tick("contacts");
       for (size_t k = 0; k < cn; ++k) {
         const float* xk = xs.data() + k * mask.size() * 3;
         std::vector<float> beta((size_t)nD * 3);
@@ -740,11 +744,9 @@ static int foldMain(int argc, char** argv) {
           beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
         float* dBeta = upload(beta.data(), beta.size());
         shardedConf.push_back(confidenceSharded(*t.zS, t.shardLo, t.shardRows, t.single, t.targetFeat, dBeta, t.seqMask,
-                                                t.pairMask, t.n));
+                                                t.pairMask, t.n, k + 1 == cn));
         CK(cudaFree(dBeta));
       }
-      if (contact.empty()) contact = contactProbabilitiesSharded(t);    // (made off the whole pair where it was gathered)
-      mg::tick("contacts");
       confMs += ms(sc0, clock()); s0 += clock() - sc0;   // (the confidence head's time its own, not the sampler's)
       mg::release({ "" }, mg::FINAL);   // (the others leave: nothing closed, rank 0's own freed)
       mg::tick("shared buffers released");

@@ -207,6 +207,17 @@ inline void freeIdle() {
   if (WORLD > 1) barrier();
   for (auto& g : sg) if (!g.dead && !g.live) { CK(cudaFree(g.local)); g.dead = true; }
 }
+// (LOCALFOLD_MEM: the shared segments this rank holds - named, kept in the pool, freed)
+inline void segmentReport(const char* at) {
+  if (!getenv("LOCALFOLD_MEM") || RANK != 0) return;
+  size_t live = 0, idle = 0; int nl = 0, ni = 0;
+  for (auto& g : segments()) if (!g.dead) { if (g.live) { live += g.size; ++nl; } else { idle += g.size; ++ni; } }
+  size_t pooled = 0; for (auto& s : sharedPool()) pooled += s.bytes;
+  size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
+  size_t held = 0; for (auto& [k, v] : SCRATCH) held += v.second;
+  fprintf(stderr, "  segments %-24s %d holding named buffers %.2f GB, %d idle %.2f GB; the pool %.2f GB | device in use %.2f, scratch %.2f\n",
+          at, nl, live / 1e9, ni, idle / 1e9, pooled / 1e9, (t - f) / 1e9, held / 1e9);
+}
 // the least of every rank's `v` (collective)
 inline size_t minOverRanks(size_t v) {
   if (WORLD == 1 || SIM) return v;
@@ -231,7 +242,9 @@ constexpr size_t SEGMENT = (size_t)1 << 30, SEGMENT_ALIGN = 4096;
 // a new segment of `bytes` on every rank, each peer's opened (collective)
 inline int openSegment(size_t bytes, const std::string& name) {
   Segment g; g.size = bytes;
-  if (cudaMalloc(&g.local, std::max<size_t>(bytes, 256)) != cudaSuccess) {
+  // (devMalloc: where it is refused, the scratch pool's idle pages given back first - the sampler's, held by the pool
+  // past its releaseScratch, refused a 12,103-token rank its 4.7 GB contacts slab with 4.1 GB said free)
+  if (devMalloc(&g.local, std::max<size_t>(bytes, 256)) != cudaSuccess) {
     size_t f = 0, t = 0; cudaGetLastError(); cudaMemGetInfo(&f, &t);
     fprintf(stderr, "rank %d: out of device memory for the shared buffer %s (%.2f GB; %.2f of %.2f GB free)\n", RANK,
             name.c_str(), bytes / 1e9, f / 1e9, t / 1e9);
@@ -283,7 +296,10 @@ inline Shared& shared(const std::string& name, size_t bytes) {
   Shared s;
   if (best >= 0) { s = pl[best]; pl.erase(pl.begin() + best); }
   else {
-    const size_t want = (std::max<size_t>(bytes, 1) + SEGMENT_ALIGN - 1) / SEGMENT_ALIGN * SEGMENT_ALIGN;
+    // (a large buffer to 64 MiB: the template stack's 64-channel slabs and the triangle's 128-channel planes, 4,709.5
+    // and 4,713.0 MB at 12,103 tokens on 8, then fall in one size and each takes the other's from the pool)
+    const size_t align = bytes > SEGMENT / 2 ? (size_t)64 << 20 : SEGMENT_ALIGN;
+    const size_t want = (std::max<size_t>(bytes, 1) + align - 1) / align * align;
     int k = -1;
     if (want <= SEGMENT / 2)          // (the tail of a shared segment; a large buffer a segment of its own)
       for (int i = 0; i < (int)sg.size() && k < 0; ++i) if (!sg[i].dead && sg[i].size == SEGMENT && sg[i].size - sg[i].used >= want) k = i;
@@ -434,6 +450,7 @@ inline void tick(const char* what) {
   if (WORLD > 1) barrier();
   auto now = std::chrono::steady_clock::now();
   if (RANK == 0) fprintf(stderr, "  mg %-30s %9.1f ms\n", what, std::chrono::duration<double, std::milli>(now - last).count());
+  segmentReport(what);
   fenceTimes(what);
   last = now;
 }

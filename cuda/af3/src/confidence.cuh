@@ -586,7 +586,8 @@ inline bool confidenceShardable() {
 }
 inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int rowsHere, const float* trunkSingle,
                                        const float* targetFeat, const float* pseudoBeta, const float* seqMask,
-                                       const float* pairMask, int n) {
+                                       const float* pairMask, int n, bool consume = false) {
+  // consume: nothing reads the trunk's slab after this call - the head works in it rather than in a copy
   const std::string P = "confidence";
   int C = (int)M.meta(P + ".pairChannels"), Cs = (int)M.meta(P + ".singleChannels"), F = (int)M.meta(P + ".targetFeatWidth");
   const bool caDgram = M.flag("trunk.dialect.confidenceCaDgram"), chai = M.flag("trunk.dialect.chaiConfidence");
@@ -596,7 +597,7 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   const bool reembed = M.flag("trunk.dialect.reembedConfidencePair");
   const size_t pairs = (size_t)n * n, hp = (size_t)rowsHere * n, hf = (size_t)lo * n;
   const size_t slab = (size_t)sh::maxStored(n) * n * C * 2;
-  mg::Shared& cz = mg::shared("sh.cz", slab);
+  mg::Shared& cz = consume ? const_cast<mg::Shared&>(trunkZ) : mg::shared("sh.cz", slab);
   mg::Shared& czT = mg::shared("sh.czT", slab);
   mg::tick("conf: slabs shared");
   float* pair = (float*)cz.local;
@@ -604,7 +605,7 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
   if (reembed) boltz2ReembedRows(base, single, trunkZ.local, trunkSingle, targetFeat, pseudoBeta, pairMask, n, C, Cs, F, lo, rowsHere);
   else {
-  if (hp) CK(cudaMemcpyAsync(pair, trunkZ.local, hp * C * 2, cudaMemcpyDeviceToDevice, STREAM));
+  if (hp && !consume) CK(cudaMemcpyAsync(pair, trunkZ.local, hp * C * 2, cudaMemcpyDeviceToDevice, STREAM));
   CK(cudaMemcpyAsync(single, trunkSingle, (size_t)n * Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
   float* left = scratch<float>("conf.left", (size_t)n * C); float* right = scratch<float>("conf.right", (size_t)n * C);
   linear<float, float>(targetFeat, left, n, F, C, P + ".leftTargetFeatProject");
