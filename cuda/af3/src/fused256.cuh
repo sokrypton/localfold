@@ -173,7 +173,9 @@ size_t transitionUpChunkRows(size_t smem, size_t budgetRows) {
 // incoming triangle's operands come out with the contraction's index contiguous, as the outgoing one's do (an FP8 GEMM
 // takes only that layout); its t2 rows still land at their own pair's place, where the output kernel reads them
 // ab0, ab1: the input kernel's a/b steps [ab0, ab1) alone (triIn256K; -1 all of them)
-struct RectMap { int i0 = 0, J = 0, j0 = 0; size_t size = 0; bool T = false; int ab0 = 0, ab1 = -1; };
+// stride: the output kernel's product planes' length where it is not `size` (a chunk of a rectangle's rows, its product
+// handed from the chunk's first row: sharded.cuh's gate made a chunk at a time)
+struct RectMap { int i0 = 0, J = 0, j0 = 0; size_t size = 0; bool T = false; int ab0 = 0, ab1 = -1; size_t stride = 0; };
 // prod: channel-major [C][Lp][Lp] f32 (the padded contraction's output); t2: the gating linear's raw
 // output, [Lp * Lp][C] f16 (triInK's); pair: [L * L][C] f32. A block is 16 WARPS pairs: the product
 // tile is staged channel-major (stride R + 1: the per-row reductions read a column, conflict-free), the
@@ -213,7 +215,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
   for (int c = threadIdx.x; c < C; c += NTH) { nsc[c] = cnScale[c]; nsc[C + c] = cnOffset[c]; }
   auto Ws = [&](int s) { return (half*)(smem + s * STAGE); };
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
-  const size_t P = (size_t)L * L, plane = rm.J ? rm.size : (size_t)Lp * Lp;
+  const size_t P = (size_t)L * L, plane = rm.J ? rm.size : (size_t)Lp * Lp, stride = rm.J && rm.stride ? rm.stride : plane;
   const unsigned Jr = rm.J ? (unsigned)rm.J : (unsigned)Lp;
   size_t row0 = (size_t)blockIdx.x * R;
   auto padded = [&](size_t r) { unsigned u = (unsigned)r, i = u / (unsigned)L; return (size_t)i * Lp + (u - i * L); };
@@ -231,7 +233,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     for (int t0_ = 0; t0_ < C * (R / 8); t0_ += NTH) {
       int t = t0_ + (int)threadIdx.x, c = t / (R / 8), r = (t % (R / 8)) * 8;
       size_t row = row0 + r;
-      cpAsync16(Ps + c * LDP + r, prod + (size_t)c * plane + (row < plane ? row : 0), row < plane);
+      cpAsync16(Ps + c * LDP + r, prod + (size_t)c * stride + (row < plane ? row : 0), row < plane);
     }
     cpCommit(); cpWait<0>();
   } else {
@@ -241,7 +243,7 @@ __global__ void __launch_bounds__(WARPS * 32) triangleOutK(const TP* __restrict_
     bool live = row < P;
     const TP* src = prod + (live ? padded(row) : 0);
 #pragma unroll 32
-    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? (float)src[(size_t)c * plane] : 0.f);
+    for (int c = threadIdx.x / R; c < C; c += NTH / R) Ps[c * LDP + r] = TT(live ? (float)src[(size_t)c * stride] : 0.f);
   }
   __syncthreads();
   // the centre norm's mean and 1/sd, a warp a row; at VEC's LDP (R + 8) a warp's reads across one row

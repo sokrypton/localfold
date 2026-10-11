@@ -351,6 +351,10 @@ static int foldMain(int argc, char** argv) {
   F32_TF32 = tf32;
   check("target_feat", tfDev, (size_t)tokens * tfWidth, "oracle.trunk.stages.target_feat");
   std::vector<float> targetFeat = download(tfDev, (size_t)tokens * tfWidth);
+  // (its atom encoder's scratch given back at once where the pair is large - nothing reads it once target_feat is
+  // built, and held into the template stack it was 3.4 GB of a simulated rank of 4's out-of-memory at 10,868 tokens)
+  if (tightPair((size_t)tokens * tokens, (int)M.meta("trunk.embedder.pairChannels")))
+    releaseScratch({ "targetFeat.encoder.", "enc.", "apl." });
   bool oracleTargetFeat = false;
   for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--oracle-target-feat")) oracleTargetFeat = true;
   if (oracleTargetFeat)
@@ -719,6 +723,10 @@ static int foldMain(int argc, char** argv) {
       NS = (int)cn;
     }
     mg::tick("sampler");
+    // the steps' precomputed conditioning (steps x tokens rows, 5 GB at 100 steps and 10761 tokens) is read by
+    // nothing after the sampler - the next batch makes its own - and held to the end it left the confidence
+    // head short of room (freed here, before the sharded head too, not after it)
+    if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); df.preSingle = df.preSnProj = nullptr; }
     FRAME_HOOK = nullptr;      // (the writer finishes the last frames while the confidence head runs)
     // several GPUs on a sharded pair, past the sampler: the confidence head of every sample and the contacts on held
     // rows (collective, rank 0's results); then the others leave and rank 0 writes the fold with the whole pair never
@@ -846,10 +854,6 @@ static int foldMain(int argc, char** argv) {
       t.pair = nullptr; t.shardLo = -1; t.shardRows = 0; t.zS = t.zTS = nullptr; t.msa = nullptr;
       sh::DLO = -1; sh::DROWS = 0;
     }
-    // the steps' precomputed conditioning (steps x tokens rows, 5 GB at 100 steps and 10761 tokens) is read by
-    // nothing after the sampler - the next batch makes its own - and held to the end it left the confidence
-    // head short of room
-    if (df.preSingle) { CK(cudaFree(df.preSingle)); CK(cudaFree(df.preSnProj)); df.preSingle = df.preSnProj = nullptr; }
     NS = 1;
     releaseConcatCopies(); memReport("diffusion");
     diffMs += ms(s0, clock());

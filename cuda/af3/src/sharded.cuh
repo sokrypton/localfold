@@ -231,7 +231,11 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   const bool rounds = !F8 && !x8 && (R_SET >= 0 ? R_SET > 0 : shortPair((size_t)n * n, C));
   const int K = std::max(8, C / 8), gR = (K + mg::WORLD - 1) / mg::WORLD;    // (K: a multiple of the input pass's 8)
   mg::Shared& pS = mg::shared("sh.tp" + std::to_string(C), mine * sizeof(B16));
-  half* t2 = scratch<half>("trib.t2", (size_t)std::max(rows, 1) * np * C);
+  // (the gate: made in the input pass for every row and held to the output - a slab of it; in ROUNDS, a card short of
+  // room, made a chunk of rows at a time just before the output pass instead: a slab less, 7.6 GB a rank at 10,868
+  // tokens on 4, for one more read of the rows and the gating linear again)
+  const int gateRows = rounds ? std::max(16, (rows + 7) / 8) : std::max(rows, 1);
+  half* t2 = scratch<half>("trib.t2", (size_t)gateRows * np * C);
   if (F8 && incoming) { fprintf(stderr, "sharded triangle: the FP8 GEMM takes the outgoing (TN) form only\n"); exit(1); }
   // every rank's channels (the plain form: a share of C each, a group at a time)
   int cLo[mg::MAX_RANKS], cHi[mg::MAX_RANKS], maxCg = 0;
@@ -334,7 +338,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         // last read by step q - 1's GEMM, which every rank finished before passing step q's fence. Through a PCIe host
         // bridge the pushes were 107 of a triangle's 135 ms at 2,964 tokens on 4 x A6000, beside a 12 ms GEMM, in series
         bool used[2] = {};
-        if (rounds) produce(0, std::min(C, K), t2);
+        if (rounds) produce(0, std::min(C, K), nullptr);
         fill(0, STREAM);
         mg::fence();
         for (int q = 0; q < steps; ++q) {
@@ -367,9 +371,20 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         for (int k = 0; k < 2; ++k) if (used[k]) CK(cudaStreamWaitEvent(STREAM, pushed[k], 0));
         mg::fence();                                  // (every rank's product rows here)
         mark();
-        if (rows > 0)
+        if (rows > 0 && !rounds)
           triangleOutRun<CC, WO, B16>((const B16*)pS.local, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
                                       Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, mineRm);
+        for (int r0 = 0; rounds && r0 < rows; r0 += gateRows) {      // (rows are independent: a chunk's gate reads its
+          const int cr = std::min(gateRows, rows - r0);                //  own rows, unwritten until its output)
+          RectMap rm{lo + r0, np, 0, (size_t)cr * np};
+          RectMap gm = rm; gm.ab0 = gm.ab1 = 0;                        // (the gating linear alone)
+          if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
+          kern<<<(unsigned)((rm.size + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
+            base, mask, lnS, lnO, wt, (TQ*)nullptr, (TQ*)nullptr, t2, n, np, cs, nullptr, gm);
+          rm.stride = mineRm.size;
+          triangleOutRun<CC, WO, B16>((const B16*)pS.local + (size_t)r0 * np, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
+                                      Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, rm);
+        }
         if (tt) {
           mark(); CK(cudaEventSynchronize(te.back()));
           auto el = [&](size_t a, size_t b) { float m = 0; CK(cudaEventElapsedTime(&m, te[a], te[b])); return (double)m; };
