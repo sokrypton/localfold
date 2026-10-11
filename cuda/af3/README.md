@@ -1605,8 +1605,8 @@ one rank's real memory, 25 steps, no recycles - a box adds what its peers' mappi
 |---:|---:|---:|---:|---:|
 | 1 | ~7,900 | ~7,900 | ~7,900 | |
 | 2 | 4,940 | **6,916** | | |
-| 4 | 8,645 | **9,633** | **11,856** | 12,350 (0.8 GB short, a triangle's) |
-| 8 | 12,103 | **13,091** | **15,808** (peak 32.7 GB a rank) | |
+| 4 | 8,645 | **9,633** | **12,350** | 13,338 (0.7 GB short, the MSA attention's) |
+| 8 | 12,103 | **13,091** | **17,290** (peak 34.9 GB a rank, 7.6 min a pass simulated) | |
 
 The "now" column, a rank short of room (each change byte-identical on 5CAJ with the short-of-room paths forced unless
 said): the column attention holds no z^T share (its bias off the rank's own rows of z, written at the transposed place;
@@ -1616,7 +1616,8 @@ not held a whole share; the rank's share of the trunk pair PARKED in pinned host
 and from the diffusion's preparation (which streams its rows from there) to the confidence head (`parkShare` - a share's
 worth of host RAM a rank); target_feat's encoder scratch, the MSA side's and the sampler's precomputed conditioning given
 back where they were held across a stage; the generic triangle's peer share staged an eighth of its channels at a time
-(0.009 A: cuBLAS's pick at a smaller batch). And one bug: the sharded template stack asked `shortPair` of its held rows,
+(0.009 A: cuBLAS's pick at a smaller batch); the triangle in rounds holding one step's exchange slots, not two; the
+confidence head's and the contacts' whole-pair tables (bins, distances) given back once read. And one bug: the sharded template stack asked `shortPair` of its held rows,
 which divides by the share again - never short of room, it kept its query and LayerNorm whole (12.4 GB a rank at 13,832
 on 8). 🔴 A failing segment allocation prints every shared buffer and the scratch now - that listing found it. Past
 99,999 atoms a PDB's serial wraps (it ran a digit wide and the score reader threw); write such a fold as `--out=*.cif`.

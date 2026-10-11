@@ -835,6 +835,7 @@ static int foldMain(int argc, char** argv) {
       // (the contacts first, off the trunk's slab: the last sample's head then works in that slab, as the one-GPU
       // head does in the trunk's pair - a slab a rank, 4.7 GB at 12,103 tokens on 8)
       if (contact.empty()) contact = contactProbabilitiesSharded(t);
+      releaseScratch({ "contact.", "disto." });    // (its whole-pair bin table and logits: 1.2 GB and more at 17,290 on 8)
       mg::tick("contacts");
       // DEALT (the diffusion whole on every rank and several samples): sample k's confidence head on rank k % N - the
       // one-GPU head on the whole pair, gathered again - its results to rank 0 through host memory; the sharded head

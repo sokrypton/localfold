@@ -617,6 +617,8 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   confidenceBinK<<<blocks(pairs), 256, 0, STREAM>>>(pseudoBeta, n, bins, 3.25f, 50.75f, caDgram, binOf, sqOf, false);
   if (hp) confidencePairInitK<__nv_bfloat16><<<blocks(hp * C), 256, 0, STREAM>>>(base, left, right, binOf, sqOf, pairMask,
     W(P + ".distogramFeatProject"), n, C, Wopt(P + ".distanceFeatProject"), caDgram, false, hf * C, (hf + hp) * C);
+  // (every pair's bin and distance, read by that init alone: 2.4 GB of whole-pair tables a rank at 17,290 tokens on 8)
+  if (shortPair(pairs, C)) releaseScratch({ "conf.bin", "conf.sq" });
   if (hasW(P + ".inputSingleNormScale")) {
     clampK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, 512.f, (size_t)n * Cs);
     float* sn = scratch<float>("conf.singleNorm", (size_t)n * Cs);
