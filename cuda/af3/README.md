@@ -1545,6 +1545,42 @@ times) on the same box: 988 tokens 16.2 s on one GPU (`fast`), 59.5 s on 8; 2,96
 both modes, 99.1 s on 8; 5,928 251.6 s on 8. Its row-sharded pair is ours; its triangle is a ring (each rank receives
 the whole projected b whatever P, for results independent of P), NCCL rather than IPC, and no device-side fences.
 
+#### 4 x RTX A6000 over PCIe: every exchange a push, and why a PCIe box needs a large fold (2026-10-11)
+
+On a box whose four GPUs reach each other only through a PCIe host bridge (`nvidia-smi topo -m`: PHB), reading another
+GPU's memory ran at **0.4-0.9 GB/s** a GPU (a copy engine's peer copy too) where writing it ran at **15-20 GB/s** - a
+write is posted, a read waits for its answer. Every exchange here pulled, and a 988-token fold took **52.7 s on the four
+against 3.0 on one** (39 of its trunk's 47 s the triangle's pulls). Now every exchange is a PUSH - the rank holding the
+data writes it into the rank that wants it: the triangle's operands into each consumer's slots, z out into z^T, the
+biases, the single track's rows, the diffusion's k and v into per-parity inboxes (pushed straight into a peer's qkvg the
+fold came out 0.2-0.33 A apart run to run; the inbox copied in after the fence is deterministic and 0.000 A from the
+pull version). Over NVLink a push and a pull are alike (118 GB/s against 120-147 on 8 x A100). 988 tokens on the four:
+52.7 -> 8.8 s.
+
+Measured then (one pass, 25 steps; before the share fix and the overlaps below):
+
+| tokens | 1 GPU | 2 | 4 |
+|---:|---:|---:|---:|
+| 988 | **2.96 s** | 3.29 | 8.82 |
+| 2,964 | 44.5 | **38.1** | 43.0 |
+| 5,928 | 347 | 220 | **205** (1.7x) |
+
+Why: at 2,964 tokens a pairformer block moves ~3.4 GB a GPU (two triangles' operands and products, the column
+attention's transposes) through the one bridge, ~15 GB/s a GPU with all four pushing - ~0.2-0.4 s, against ~0.2 s of a
+block's compute a GPU (0.82 s on one). A triangle on the four: 58 ms pushing its operands, 49 waiting for the others',
+16 pushing the product, **12 computing**. Communication grows as n^2 and the work as n^3, so the box pays only past a few
+thousand tokens, and 2 GPUs (one pair's traffic through the bridge a triangle) beat 4 (1.5 pairs') at 2,964. Since:
+
+- **short of room judged on a rank's share** (`SHORT_PAIR_SHARE`): asked of the whole pair, every multi-GPU fold past
+  ~2,000 tokens took the short-of-room paths (the triangle in rounds, the stacks' buffers given back each pass, no
+  graph) - 43.0 -> 40.5 s at 2,964 on the four, and the NVLink boxes the same;
+- **the triangle's next step pushed beside this step's GEMM**, and **z^T pushed a chunk at a time beside the input pass
+  over the chunk before** (both deterministic, 0.000 A from the unoverlapped forms);
+- **`LOCALFOLD_MG_FP8_EXCHANGE=1` sends e4m3** (it widened before sending: no bytes saved, so it measured nothing).
+
+Not yet measured on a box. Even overlapped the bridge caps such a box near 2x at 3,000 tokens and ~3x at 6,000.
+`LOCALFOLD_MG_TRI_TIMES=1` prints the triangle's phases (input pass, exchange + GEMMs, product tail, output) on rank 0.
+
 #### How large a fold fits 40 GB a GPU (2026-10-11, simulated ranks)
 
 The largest single-sequence AF3 fold on N x 40 GB, found on a simulated rank of N on this A100 (`LOCALFOLD_MG_SIMULATE`:
