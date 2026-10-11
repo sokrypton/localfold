@@ -40,6 +40,7 @@ import {
   allocateTransitionSplit, createTransitionShader, packTransitionWeights,
   splitTransitionConfig, transitionRowTile, TRANSITION_ORDER,
 } from "./transition.js";
+import { settleGridAttendTiling } from "./grid-attend-race.js";
 
 // The two-GEMM outer product's intermediate cap; see af3OpmVectorBlockPairs.
 const OPM_VECTOR_BYTES = 16 * 1024 * 1024;
@@ -136,6 +137,8 @@ export class Af3MsaStackGpu {
     // 1.12e-4, because this stack and the template embedder kept theirs.
     const pairMatrixKernels =
       (options.pairMatrixKernels ?? this.options?.pairMatrixKernels) !== false;
+    // grid.attend's tiled form where this device has not been told: see grid-attend-race.js
+    await settleGridAttendTiling(this.device);
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),

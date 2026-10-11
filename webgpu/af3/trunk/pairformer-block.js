@@ -33,6 +33,7 @@ import {
   deviceMatrixConfig, deviceTuning, halfPrecisionAvailable,
 } from "../../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
+import { settleGridAttendTiling } from "./grid-attend-race.js";
 import {
   allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_GEOMETRY,
   TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS, triangleProjectMatrixFits,
@@ -449,6 +450,8 @@ export class Af3PairformerStackGpu {
     // knobs: fifteen single-knob arms all read 84.4x before the dump named it.
     // See docs/AF3.md. The trunk leaves this alone and keeps the speed.
     const pairMatrixKernels = this.options?.pairMatrixKernels !== false;
+    // grid.attend's tiled form where this device has not been told: see grid-attend-race.js
+    await settleGridAttendTiling(this.device);
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),

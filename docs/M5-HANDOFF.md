@@ -749,3 +749,24 @@ outliers. What remains, all bandwidth or scalar work:
     `apple / metal-3` and nothing more, so the prior cannot tell them apart; most Apple visitors are not on an M5, so
     both knobs are **taken out of the prior** (the comment beside it keeps the M5's numbers and the arm to re-run).
   - The lesson for the next prior entry: measure it on an older part too, since one prior serves every Apple GPU.
+
+## 2026-10-10, late: the device answers grid.attend's tiling, not the prior
+
+- **Nothing in WebGPU tells an M5 from an M2.** Dumped on the M5 under stock Chrome 154: `apple / metal-3`, device
+  and description empty, no subgroup-matrix configurations, the same limits the M2 reports (32 KiB workgroup storage,
+  4 GiB binding). So 0bf0cc7f's finding - the tiled f16 `grid.attend` is −3.5% a trunk pass here and +4% on the M2 -
+  cannot be a prior.
+- **So the device races the two forms** (`webgpu/af3/trunk/grid-attend-race.js`): an Apple GPU with f16, where nothing
+  has set `gridAttendTiled`, times the trunk's own attend kernel both ways at 256 tokens before its first pair track
+  compiles, and keeps the tiled form only where it is 5% faster and agrees to the f16 bound (relRMS 2.2e-4).
+  - 🔴 **Timed on the GPU's clock, in one submit.** Wall-clock per submit read the same dispatch at 4.3 and 44 ms on
+    the M5 (the clock falls between submits). With timestamps, five runs of six samples each: untiled 5.95 ms,
+    tiled 4.17-4.23, every sample within 0.2 ms.
+  - Costs ~0.3-0.5 s once a page, almost all of it the two pipelines' compile.
+- **What it buys on the M5**, AF3 int5, 255 tokens, a trunk pass, alternated: grid.attend 641 / 639 → 462 / 462 ms,
+  the pass's GPU 3248 / 3263 → 3071 / 3081 (−5.5%). 6MRR through `fold.js` folds byte-identically to the forced-tiled
+  arm (pLDDT 85.83027), 0.0014 from untiled; the pair against AF3's oracle 2.70e-2 either way. `test:stock`: AF3 folds
+  (the other three bundles are not on this box).
+- **For the M2:** `node tools/gpu-chrome.mjs tools/gpu/probe-grid-attend-race.js` under `LOCALFOLD_STOCK_FLAGS=1`
+  should print `tiled: false` (the M2's 995 → 1444 ms is a 1.45x loss). If it prints true, the race is wrong there
+  and `bench-trunk.js --profile` against `--tune=gridAttendTiled=false,gridAttendTiledHalf=false` settles it.

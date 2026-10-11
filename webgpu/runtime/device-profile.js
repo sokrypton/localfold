@@ -1235,8 +1235,11 @@ const PRIORS = new Map([
     // `apple / metal-3`, nothing more (adapter.info's device and description are empty). On the M2 (10-core GPU,
     // macOS 13.2, Chrome 154, stock flags), the same pass, two rounds alternated: grid.attend 995 / 1073 ms untiled ->
     // 1444 / 1502 tiled in f16, the pass's GPU 5455 / 5805 -> 5675 / 6028 (+4%) - against the M5's -3.5%. Most Apple
-    // visitors are not on an M5, so the older parts keep the untiled kernel. `--tune-json={"gridAttendTiled":true,
-    // "gridAttendTiledHalf":true}` is the M5's arm.
+    // visitors are not on an M5, so the prior leaves both knobs unset and the DEVICE answers: an Apple GPU with f16
+    // races the two forms once, before its first pair track compiles (webgpu/af3/trunk/grid-attend-race.js, GPU
+    // timestamps in one submit, 256 tokens; probe-grid-attend-race.js prints it). On the M5: 5.95 ms untiled against
+    // 4.18 tiled, the same five runs of five, ~0.4 s once a page; the trunk pass 3248 / 3263 -> 3071 / 3081 ms GPU.
+    // `--tune=gridAttendTiled=false,gridAttendTiledHalf=false` (or true) answers instead and skips the race.
     // 🔴 THE TRIANGLE'S PROJECTION TILE AT 32x32, AMPERE'S, MEASURED ON AN M5 UNDER STOCK FLAGS. bench-triangle-project
     // at 255 tokens: project 5.06 -> 4.79 ms, project-out 3.26 -> 2.91, contract untouched, relRMS 0 (the tile
     // reorders no sum). AF3 int5's 255-token trunk pass, three rounds interleaved: tri.project-out 278 / 292 / 295 ->

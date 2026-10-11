@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-361 tools. `tools/fixtures/` is data and is not listed.
+362 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (196)
+## `tools/gpu/` - the WebGPU lane (197)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -157,6 +157,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-esmfold2-trajectory.js`** - What a trajectory frame should BE: the sampler's state, or the model's guess?
 - **`probe-flow-sigma-by-size.js`** - Does the flow's starting sigma need to grow with the complex?
 - **`probe-gpu-gaussian.js`** - Can the sampler's Gaussian draws move to the GPU, what do they cost, and what does it cost to move them?
+- **`probe-grid-attend-race.js`** - What grid.attend's tiled-form race decides on this device, and what it saw.
 - **`probe-grid-overdispatch.js`** - What does THIS backend do with an invocation that indexes past the buffer?
 - **`probe-head-cpu-vs-gpu.js`** - One denoising step, GPU against the CPU reference, on a REAL molecule.
 - **`probe-head-stages-vs-af3.js`** - Where inside the diffusion head does a REAL protein start to disagree?
