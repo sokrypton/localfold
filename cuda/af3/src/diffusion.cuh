@@ -883,19 +883,40 @@ inline void refreshSuperBlockBias(int sb, int n) {
                                                                                                rowsB);
   }
 }
-// several GPUs, the tokens split (one sample): every other rank's rows of k and v (qkvg's columns [Wd, 3Wd)) read
-// straight from the rank that projected them - one kernel over every peer
-struct PeerRows { const half* p[mg::MAX_RANKS]; int lo[mg::MAX_RANKS]; int world, rank; };
-__global__ void gatherKvK(PeerRows pr, half* __restrict__ qkvg, int n, int Wd) {
+// several GPUs, the tokens split (one sample): this rank's rows [lo, hi) of k and v (qkvg's columns [Wd, 3Wd)) written into
+// every other rank's inbox - PUSHED, as every exchange here (a read of another GPU's memory through a PCIe host bridge ran
+// at a thirtieth of a write: sharded.cuh's triangle)
+struct PushRows { void* p[mg::MAX_RANKS]; int world, rank, lo, hi; };
+inline PushRows pushRows(const mg::Shared& s, int n) {
+  PushRows pr{}; pr.world = mg::WORLD; pr.rank = mg::RANK;
+  for (int r = 0; r < mg::WORLD; ++r) pr.p[r] = s.peer[r];
+  sh::rowsOf(n, mg::RANK, pr.lo, pr.hi); pr.hi = std::min(pr.hi, n);
+  return pr;
+}
+__global__ void pushKvK(PushRows pr, const half* __restrict__ qkvg, int Wd) {
+  const int per = 2 * Wd / 8, rows = pr.hi - pr.lo;
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (rows <= 0 || t >= (size_t)rows * per * (pr.world - 1)) return;
+  const int v = (int)(t % per), row = pr.lo + (int)(t / per % rows), k = 1 + (int)(t / per / rows);
+  *(uint4*)((half*)pr.p[(pr.rank + k) % pr.world] + (size_t)row * 2 * Wd + (size_t)v * 8) =
+    *(const uint4*)(qkvg + (size_t)row * 4 * Wd + Wd + (size_t)v * 8);
+}
+// the other ranks' k and v from this rank's inbox ([n][2 Wd]) into its qkvg (columns [Wd, 3Wd)), every row but its own
+__global__ void inboxKvK(const half* __restrict__ inbox, half* __restrict__ qkvg, int n, int Wd, int lo, int hi) {
   const int per = 2 * Wd / 8;
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)n * per) return;
-  const int row = (int)((t / per + pr.lo[pr.rank]) % n), v = (int)(t % per);     // (from this rank's own rows: sharded.cuh's rot)
-  int r = 0;
-  while (r + 1 < pr.world && row >= pr.lo[r + 1]) ++r;
-  if (r == pr.rank) return;
-  const size_t off = (size_t)row * 4 * Wd + Wd + (size_t)v * 8;
-  *(uint4*)(qkvg + off) = *(const uint4*)(pr.p[r] + off);
+  const int row = (int)(t / per), v = (int)(t % per);
+  if (row >= lo && row < hi) return;
+  *(uint4*)(qkvg + (size_t)row * 4 * Wd + Wd + (size_t)v * 8) = *(const uint4*)(inbox + (size_t)row * 2 * Wd + (size_t)v * 8);
+}
+// ...and this rank's rows of a row-major f32 tensor (`width` floats a row) into every other rank's
+__global__ void pushRowsF32K(PushRows pr, const float* __restrict__ x, size_t width) {
+  const size_t rowsF = (size_t)(pr.hi - pr.lo) * width;
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (pr.hi <= pr.lo || t >= rowsF * (pr.world - 1)) return;
+  const size_t at = (size_t)pr.lo * width + t % rowsF;
+  ((float*)pr.p[(pr.rank + 1 + (int)(t / rowsF)) % pr.world])[at] = x[at];
 }
 // ...and every other rank's rows of the transformer's output (f32 [n][C]), for the decoder
 struct PeerAct { const float* p[mg::MAX_RANKS]; int lo[mg::MAX_RANKS]; int world, rank; };
@@ -921,6 +942,7 @@ inline void diffusionSharedBuffers(int n) {
   const std::string Tn = "diffusion.transformer";
   const int C = (int)M.meta(Tn + ".channels"), Wd = (int)M.meta(Tn + ".heads") * (int)M.meta(Tn + ".dimension");
   for (int k = 0; k < 2; ++k) mg::shared("sh.dt.qkvg" + std::to_string(k), (padRows16((size_t)n) + 128) * 4 * Wd * sizeof(half));
+  for (int k = 0; k < 2; ++k) mg::shared("sh.dt.kv" + std::to_string(k), (size_t)n * 2 * Wd * sizeof(half));
   mg::shared("sh.dt.act", (size_t)n * C * 4);
   mg::shared("sh.dn.upd", (size_t)n * (int)M.meta("batch.dense") * 3 * 4);
 }
@@ -969,6 +991,10 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
   // writes block b + 1's touches the other, and block b + 2's waits behind block b + 1's fence)
   mg::Shared* qS[2] = { nullptr, nullptr };
   if (tok) for (int k = 0; k < 2; ++k) qS[k] = &mg::shared("sh.dt.qkvg" + std::to_string(k), (prows + 128) * 4 * Wd * sizeof(T));
+  // (and two inboxes, [n][2 Wd] k and v, that only the other ranks' pushes write and this rank's copy after the fence
+  // reads: pushed straight into the peers' qkvg the k and v came out differently run to run - the fold 0.2-0.33 A apart)
+  mg::Shared* kvS[2] = {};
+  if (tok) for (int k = 0; k < 2; ++k) kvS[k] = &mg::shared("sh.dt.kv" + std::to_string(k), (size_t)n * 2 * Wd * sizeof(T));
   T* qkvg = tok ? (T*)qS[0]->local : scratch<T>("dt.qkvg", (prows + 128) * 4 * Wd);
   // (the precise path's alone: the f16 path's flash kernel holds no [heads, n, n] logits)
   float* logits = std::is_same_v<T, half> ? nullptr : scratch<float>("dt.logits", (size_t)heads * pairs);
@@ -1009,12 +1035,12 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
       kqNormK<T><<<(unsigned)krows, 256, 0, STREAM>>>(at(qkvg, 4 * Wd), W(B + ".queryLayerNormScale"), W(B + ".queryLayerNormOffset"),
                                                     W(B + ".keyLayerNormScale"), W(B + ".keyLayerNormOffset"), Wd);
     }
-    if (tok) {                  // every other rank's k and v of this block
-      mg::fence();
-      PeerRows pr{}; pr.world = mg::WORLD; pr.rank = mg::RANK;
-      for (int r = 0; r < mg::WORLD; ++r) { int a, e; sh::rowsOf(n, r, a, e); pr.lo[r] = a; pr.p[r] = (const half*)qS[b % 2]->peer[r]; }
+    if (tok) {                  // this rank's k and v of this block into every other rank's, theirs into this one's
       if constexpr (std::is_same_v<T, half>)
-        gatherKvK<<<blocks((size_t)n * (2 * Wd / 8)), 256, 0, STREAM>>>(pr, qkvg, n, Wd);
+        pushKvK<<<blocks((size_t)std::max(held, 1) * (2 * Wd / 8) * (mg::WORLD - 1)), 256, 0, STREAM>>>(pushRows(*kvS[b % 2], n), qkvg, Wd);
+      mg::fence();
+      if constexpr (std::is_same_v<T, half>)
+        inboxKvK<<<blocks((size_t)n * (2 * Wd / 8)), 256, 0, STREAM>>>((const half*)kvS[b % 2]->local, qkvg, n, Wd, tlo, std::min(thi, n));
     }
     if constexpr (std::is_same_v<T, half>) {
       // one fused kernel: the query bias, QK^T, pair bias, mask, online softmax, PV and the gate;
@@ -1069,10 +1095,11 @@ void diffusionTransformer(float* act, const float* cond, const float* mask, int 
                                                                       ldr, krows, C, n);
   if (tok) {                    // every rank's rows of the output, for the decoder
     mg::Shared& aS = mg::shared("sh.dt.act", (size_t)n * C * 4);
-    if (held) CK(cudaMemcpyAsync((float*)aS.local + (size_t)tlo * C, act + (size_t)tlo * C, (size_t)held * C * 4, cudaMemcpyDeviceToDevice, STREAM));
+    // (this rank's rows pushed into every other rank's buffer, then every other rank's read from this one's own)
+    if (held) pushRowsF32K<<<blocks((size_t)held * C * (mg::WORLD - 1)), 256, 0, STREAM>>>(pushRows(aS, n), act, (size_t)C);
     mg::fence();
     PeerAct pa{}; pa.world = mg::WORLD; pa.rank = mg::RANK;
-    for (int r = 0; r < mg::WORLD; ++r) { int a, e; sh::rowsOf(n, r, a, e); pa.lo[r] = a; pa.p[r] = (const float*)aS.peer[r]; }
+    for (int r = 0; r < mg::WORLD; ++r) { int a, e; sh::rowsOf(n, r, a, e); pa.lo[r] = a; pa.p[r] = (const float*)aS.local; }
     gatherActK<<<blocks((size_t)n * (C / 4)), 256, 0, STREAM>>>(pa, act, n, C);
     mg::fence();                // (no rank rewrites its rows before every other has read them)
   }
@@ -1421,11 +1448,11 @@ inline float* denoiseCore(DiffusionFold& f, const float* positionsNoisy, float n
   if (tok) {                     // every rank's tokens' atoms' updates
     mg::Shared& uS = mg::shared("sh.dn.upd", atoms * 3 * 4);
     int tlo, thi; sh::rowsOf(n, mg::RANK, tlo, thi); thi = std::min(thi, n);
-    if (thi > tlo) CK(cudaMemcpyAsync((float*)uS.local + (size_t)tlo * dense * 3, upd + (size_t)tlo * dense * 3,
-                                      (size_t)(thi - tlo) * dense * 3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+    if (thi > tlo) pushRowsF32K<<<blocks((size_t)(thi - tlo) * dense * 3 * (mg::WORLD - 1)), 256, 0, STREAM>>>(pushRows(uS, n), upd,
+                                                                                                         (size_t)dense * 3);
     mg::fence();
     PeerAct pa{}; pa.world = mg::WORLD; pa.rank = mg::RANK;
-    for (int r = 0; r < mg::WORLD; ++r) { int a, e; sh::rowsOf(n, r, a, e); pa.lo[r] = a; pa.p[r] = (const float*)uS.peer[r]; }
+    for (int r = 0; r < mg::WORLD; ++r) { int a, e; sh::rowsOf(n, r, a, e); pa.lo[r] = a; pa.p[r] = (const float*)uS.local; }
     gatherAtomRowsK<<<blocks(atoms * 3), 256, 0, STREAM>>>(pa, upd, n, dense);
     mg::fence();
   }

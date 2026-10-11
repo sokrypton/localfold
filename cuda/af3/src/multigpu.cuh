@@ -455,28 +455,24 @@ inline void tick(const char* what) {
   last = now;
 }
 
-// Every rank's `bytesOf(r)` bytes at offset `srcOff(r)` of its shared buffer `src`, gathered into this rank's `dst`
-// at `dstOff(r)` (dst a plain device pointer). The fence before and after: the senders' writes are finished, and no
-// sender reuses `src` while a receiver is copying it.
-template <class F1, class F2, class F3>
-inline void gather(const Shared& src, void* dst, F1 bytesOf, F2 srcOff, F3 dstOff) {
+// Every rank's own part [off, off + bytes) of its shared buffer `s` written into every other rank's (collective; each
+// rank its own part). PUSHED by a kernel: reading another GPU's memory through a PCIe host bridge - a copy engine's
+// peer copy too - ran at a thirtieth of writing it (sharded.cuh's triangle). The fence before and after: every part
+// written, and no rank rewrites its part while another still reads it.
+struct PushPeers { uint4* p[MAX_RANKS]; int world, rank; };
+__global__ void pushPartK(PushPeers pp, size_t off16, size_t n16) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n16 * (pp.world - 1)) return;
+  const size_t at = off16 + t % n16;
+  pp.p[(pp.rank + 1 + (int)(t / n16)) % pp.world][at] = pp.p[pp.rank][at];
+}
+inline void allGather(const Shared& s, size_t off, size_t bytes) {
+  if (off % 16 || bytes % 16) { fprintf(stderr, "mg::allGather: a part of %zu bytes at %zu, not on 16 bytes\n", bytes, off); exit(1); }
   fence();
-  static const bool ft = getenv("LOCALFOLD_MG_FENCE_TIMES") != nullptr;
-  static double hostMs = 0, devMs = 0; static int calls = 0;
-  cudaEvent_t e0 = nullptr, e1 = nullptr;
-  if (ft) { CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); CK(cudaEventRecord(e0, STREAM)); }
-  auto h0 = std::chrono::steady_clock::now();
-  for (int k = 0; k < WORLD; ++k) {              // (from this rank on: all reading rank 0 first ran at a quarter the rate)
-    const int r = (RANK + k) % WORLD;
-    size_t b = bytesOf(r);
-    if (!b) continue;
-    CK(cudaMemcpyAsync((char*)dst + dstOff(r), (const char*)src.peer[r] + srcOff(r), b, cudaMemcpyDefault, STREAM));
-  }
-  if (ft) {
-    hostMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
-    CK(cudaEventRecord(e1, STREAM)); CK(cudaEventSynchronize(e1)); float m = 0; CK(cudaEventElapsedTime(&m, e0, e1)); devMs += m;
-    if (++calls % 48 == 0) fprintf(stderr, "  rank %d gather: %d calls, host enqueue %.1f ms, device %.1f ms\n", RANK, calls, hostMs, devMs);
-  }
+  PushPeers pp{}; pp.world = WORLD; pp.rank = RANK;
+  for (int r = 0; r < WORLD; ++r) pp.p[r] = (uint4*)s.peer[r];
+  const size_t n16 = bytes / 16;
+  if (n16 && WORLD > 1) pushPartK<<<(unsigned)((n16 * (WORLD - 1) + 255) / 256), 256, 0, STREAM>>>(pp, off / 16, n16);
   fence();
 }
 

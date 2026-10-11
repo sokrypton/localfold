@@ -1192,9 +1192,7 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
          Wd, d, heads, CUBLAS_COMPUTE_32F, algo));
     }
     if (sharded)       // every rank's rows of o
-      mg::gather(*oS, o, [&](int r2) { return r2 == mg::RANK ? (size_t)0 : (size_t)sh::storedRows(n, r2) * Wd * sizeof(T); },
-                 [&](int r2) { int a0, a1; sh::rowsOf(n, r2, a0, a1); return (size_t)a0 * Wd * sizeof(T); },
-                 [&](int r2) { int a0, a1; sh::rowsOf(n, r2, a0, a1); return (size_t)a0 * Wd * sizeof(T); });
+      mg::allGather(*oS, (size_t)qlo * Wd * sizeof(T), (size_t)(qhi - qlo) * Wd * sizeof(T));
     gateK<T><<<blocks((size_t)n * Wd), 256, 0, STREAM>>>(o, qkvg, n, Wd, gateBias);
     linear<T, float>(o, single, n, Wd, Cs, A + ".outputProjection", false, 1.f);
     singleTransition();
