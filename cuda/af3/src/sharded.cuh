@@ -204,6 +204,11 @@ inline void releaseIfShort(int n, int C, std::initializer_list<const char*> name
 // whole b - 1.97 GB a triangle against 0.74 at 2,964 tokens on 8 - and the GEMMs are the one-GPU shape, where the
 // ring's 371-row stages filled cuBLAS's 256-row tiles to 72%. Channels go a group at a time where the planes do not
 // all fit (a rank's own choice: nothing meets between groups).
+// a weight's name from its module's prefix: AlphaFold 3's "pre.leaf"; cuda/ef2 sets its own ("f/pre/leaf") to run
+// ESMFold2's trunk through triangleOn
+inline std::string (*WNAME)(const std::string&, const char*) = [](const std::string& pre, const char* leaf) {
+  return pre + "." + leaf;
+};
 template <class TQ>
 // INCOMING (bf16): the incoming form on z itself, p[c][i][j] = sum_k a[c][k][j] b[c][k][i] - the planes a rank gathers
 // are whole, so only the GEMM's operands turn (no z^T: two of a block's four transposes gone)
@@ -216,9 +221,10 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   int lo, hi; rowsOf(n, mg::RANK, lo, hi);
   const int rows = hi - lo;
   float* base = baseOf(z.local, lo, n, C);
-  std::string pg = projectionGate(pre, C);
+  std::string pg = concatColumns(WNAME(pre, "projectionGate~"), C, {{WNAME(pre, "projection"), 2 * C, false},
+                                                                      {WNAME(pre, "gate"), 2 * C, false}});
   half* wt = scratch<half>("trib.wt", triInTileHalves(C));
-  tileTriIn(Wh(pg), Wh(pre + ".gatingLinear"), C, 16, wt);
+  tileTriIn(Wh(pg), Wh(WNAME(pre, "gatingLinear")), C, 16, wt);
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
   const size_t mine = (size_t)maxShare * np * C;
   // (LOCALFOLD_MG_FP8_EXCHANGE=1: a and b written e4m3 for the exchange, widened back to bf16 as they are pulled - the
@@ -283,7 +289,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
     for (int k = 0; k < 2; ++k) for (cudaEvent_t* e : { &gemmed[k], &pushed[k] }) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&fenced, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&filled, cudaEventDisableTiming));
   }
-  const float* lnS = W(pre + ".leftNormInputScale"); const float* lnO = W(pre + ".leftNormInputOffset");
+  const float* lnS = W(WNAME(pre, "leftNormInputScale")); const float* lnO = W(WNAME(pre, "leftNormInputOffset"));
   const RectMap mineRm{lo, np, 0, (size_t)rows * np};
   const PeerPlanes pPlanes = peerPlanes(pS, nullptr, n);
   const int vecsP = (int)((size_t)np * sizeof(B16) / 16);
@@ -379,8 +385,8 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         mg::fence();                                  // (every rank's product rows here)
         mark();
         if (rows > 0 && !rounds)
-          triangleOutRun<CC, WO, B16>((const B16*)pS.local, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
-                                      Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, mineRm);
+          triangleOutRun<CC, WO, B16>((const B16*)pS.local, W(WNAME(pre, "centerNormScale")), W(WNAME(pre, "centerNormOffset")),
+                                      Wh(WNAME(pre, "outputProjection")), t2, into(base), n, np, nullptr, mineRm);
         for (int r0 = 0; rounds && r0 < rows; r0 += gateRows) {      // (rows are independent: a chunk's gate reads its
           const int cr = std::min(gateRows, rows - r0);                //  own rows, unwritten until its output)
           RectMap rm{lo + r0, np, 0, (size_t)cr * np};
@@ -389,8 +395,8 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
           kern<<<(unsigned)((rm.size + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
             base, mask, lnS, lnO, wt, (TQ*)nullptr, (TQ*)nullptr, t2, n, np, cs, nullptr, gm);
           rm.stride = mineRm.size;
-          triangleOutRun<CC, WO, B16>((const B16*)pS.local + (size_t)r0 * np, W(pre + ".centerNormScale"), W(pre + ".centerNormOffset"),
-                                      Wh(pre + ".outputProjection"), t2, into(base), n, np, nullptr, rm);
+          triangleOutRun<CC, WO, B16>((const B16*)pS.local + (size_t)r0 * np, W(WNAME(pre, "centerNormScale")), W(WNAME(pre, "centerNormOffset")),
+                                      Wh(WNAME(pre, "outputProjection")), t2, into(base), n, np, nullptr, rm);
         }
         if (tt) {
           mark(); CK(cudaEventSynchronize(te.back()));

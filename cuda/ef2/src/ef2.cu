@@ -12,6 +12,7 @@
 #include "sampler.cuh"
 #include "confidence.cuh"
 #include "../../af3/src/profile.cuh"
+#include "mgtrunk.cuh"      // (--gpus=N: the trunk across several GPUs)
 
 __global__ void gatherStateK(const float* x, const int* tokenToRow, float* out, int T, int states, int k, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -101,7 +102,7 @@ static int foldInput(const Opts& o, bool warm) {
     sampler.sMax = M.meta("meta/samplerSigmaMax"); sampler.maxSigma = M.meta("meta/samplerMaxSigma");
   }
   bool profile = o.profile && !warm;
-  auto say = [&](const char* fmt, auto... v) { if (!warm) printf(fmt, v...); };
+  auto say = [&](const char* fmt, auto... v) { if (!warm && mg::RANK == 0) printf(fmt, v...); };
   // EF2_MEM: device memory in use at each phase boundary
   auto mem = [&](const char* at) {
     if (!warm && getenv("LOCALFOLD_MEM")) { memReport(at); return; }   // (common.cuh's, with the largest holders)
@@ -122,7 +123,17 @@ static int foldInput(const Opts& o, bool warm) {
   float* hidden = check ? dalloc((size_t)T * states * e.model) : nullptr;
   // on a card short of room z_init is streamed (ZINIT_STREAM): the language model's pair is never made whole
   const bool parcae = parcaeRecycle();           // (the released models keep the language model's pair: their loop reads it)
-  const bool streamZ = !check && !parcae && shortPair((size_t)T * T, e.pair);
+  if (mg::WORLD > 1) {
+    // several GPUs: the trunk sharded by rows (mgtrunk.cuh) - with the streamed z_init, and one room for every rank's
+    // short-of-room choices (cuda/af3's, common.cuh)
+    if (parcae || hasMsaEncoder() || check || warm) {
+      fprintf(stderr, "several GPUs fold ESMFold2's single-sequence models (not the recycling or alignment ones, not an oracle check) yet\n");
+      return 1;
+    }
+    SHORT_PAIR_ROOM = std::max<size_t>(1, mg::minOverRanks(shortPairRoomHere()));
+    SHORT_PAIR_SHARE = mg::WORLD;
+  }
+  const bool streamZ = !check && !parcae && (mg::WORLD > 1 || shortPair((size_t)T * T, e.pair));
   float* lmZ = streamZ ? nullptr : dalloc((size_t)T * T * e.pair);
   auto t0 = std::chrono::steady_clock::now();
   if (residentTower && M.residentParked()) {      // (the last fold parked the tower: back from its shards)
@@ -227,7 +238,8 @@ static int foldInput(const Opts& o, bool warm) {
   // LOCALFOLD_PAIR_F32=1 keeps it f32)
   EF2_Z16 = streamZ && !getenv("LOCALFOLD_PAIR_F32") && !getenv("EF2_SAVE_PAIR") && FAST && FUSED256 && C == 256 &&
             T >= FUSED256_MIN_TOKENS && fused256Fits() && EF2_TRI_BF16 && bf16Mma();
-  z = EF2_Z16 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)T * T * C)) : dalloc((size_t)T * T * C);
+  if (mg::WORLD > 1) EF2_Z16 = true;            // (the sharded trunk's pair is bf16, and rank 0's whole one after it)
+  z = mg::WORLD > 1 ? nullptr : EF2_Z16 ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>((size_t)T * T * C)) : dalloc((size_t)T * T * C);
   bool tight = (size_t)T * T * C * 4 > ((size_t)128 << 20);
   if (tight) releaseScratch();
   t0 = std::chrono::steady_clock::now();
@@ -235,7 +247,12 @@ static int foldInput(const Opts& o, bool warm) {
   std::string profStage = getenv("EF2_PROFILE") ? getenv("EF2_PROFILE") : "trunk";
   bool profTrunk = profile && profStage == "trunk";
   if (profTrunk) { prof::init(); prof::start(); }
-  foldingTrunk(T, C, zi, z, getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4, check, lmZ, seed, lmHost);
+  const int passes = getenv("EF2_PASSES") ? atoi(getenv("EF2_PASSES")) : M.has("meta/loops") ? (int)M.meta("meta/loops") + 1 : 4;
+  if (mg::WORLD > 1) {
+    const int world = mg::WORLD;
+    z = shardedTrunkEf2(T, C, passes);         // (rank 0 on from here, alone, its pair whole; the others have left)
+    say("trunk across %d GPUs\n", world);
+  } else foldingTrunk(T, C, zi, z, passes, check, lmZ, seed, lmHost);
   if (lmZ) { CK(cudaStreamSynchronize(STREAM)); CK(cudaFree(lmZ)); lmZ = nullptr; }
   if (getenv("EF2_SAVE_PAIR") && !warm) {         // the trunk's final pair, raw float32 [T, T, C] (a comparison aid)
     auto h = download(z, (size_t)T * T * C); FILE* f = fopen(getenv("EF2_SAVE_PAIR"), "wb");
@@ -519,6 +536,15 @@ static int foldMain(int argc, char** argv) {
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `esmfold2 <featurised dir> ...` and `esmfold2 - --serve=<dir>` as before
 int main(int argc, char** argv) {
+  {
+    const int world = mg::gpusArg(argc, argv);   // --gpus=N|all: the trunk across several GPUs (before any CUDA call)
+    if (world > 1)
+      for (int i = 1; i < argc; ++i)
+        if (!strncmp(argv[i], "--serve", 7) || !strncmp(argv[i], "--warm", 6) || !strncmp(argv[i], "--frames", 8)) {
+          fprintf(stderr, "several GPUs fold one job at a time: no %s\n", argv[i]); return 1;
+        }
+    mg::launch(world);
+  }
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("ef2", argc, argv, foldMain);
   return foldMain(argc, argv);
 }
