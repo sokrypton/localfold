@@ -80,13 +80,15 @@ inline void transpose(const mg::Shared& z, const mg::Shared& zT, int n, int C) {
 // on a copy stream while the GEMM before it runs (two staging buffers where the room allows, else one, in series).
 // gemm(m, B, qlo) enqueues the block's product columns [qlo, qlo + m) on STREAM
 template <class T, class G>
-inline void ringOver(const mg::Shared& bmine, int n, int np, int C, T* const* stages, int nstage, G gemm) {
+// (channels [c0, c0 + cw) of each share alone - the shares are channel-major [C][rows][np], so a window is one run of
+// them; gemm sees the window's planes)
+inline void ringOver(const mg::Shared& bmine, int n, int np, int c0, int cw, T* const* stages, int nstage, G gemm) {
   static cudaStream_t cs = [] { cudaStream_t s; CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)); return s; }();
   static cudaEvent_t ready[2], used[2];
   static bool made = false;
   if (!made) { for (int k = 0; k < 2; ++k) { CK(cudaEventCreateWithFlags(&ready[k], cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&used[k], cudaEventDisableTiming)); } made = true; }
   int lo, hi; rowsOf(n, mg::RANK, lo, hi);
-  if (hi > lo) gemm(hi - lo, (const T*)bmine.local, lo);
+  if (hi > lo) gemm(hi - lo, (const T*)bmine.local + (size_t)c0 * (hi - lo) * np, lo);
   std::vector<int> order;
   for (int q = 1; q < mg::WORLD; ++q) { const int r = (mg::RANK + q) % mg::WORLD; int a, b; rowsOf(n, r, a, b); if (b > a) order.push_back(r); }
   if (order.empty()) return;
@@ -94,7 +96,8 @@ inline void ringOver(const mg::Shared& bmine, int n, int np, int C, T* const* st
   auto issue = [&](int k) {
     const int r = order[k], slot = k % nstage; int a, b; rowsOf(n, r, a, b);
     CK(cudaStreamWaitEvent(cs, used[slot], 0));
-    CK(cudaMemcpyAsync(stages[slot], bmine.peer[r], (size_t)(b - a) * np * C * sizeof(T), cudaMemcpyDefault, cs));
+    CK(cudaMemcpyAsync(stages[slot], (const T*)bmine.peer[r] + (size_t)c0 * (b - a) * np, (size_t)(b - a) * np * cw * sizeof(T),
+                       cudaMemcpyDefault, cs));
     CK(cudaEventRecord(ready[slot], cs));
   };
   issue(0);
@@ -561,8 +564,11 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
   int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
   mg::Shared& bmine = mg::shared(std::string("sh.bg") + (sizeof(T) == 2 ? "16." : "32.") + std::to_string(C), (size_t)maxShare * np * C * sizeof(T));
   if (hi > lo) operands({lo, hi - lo, 0, np}, (T*)bmine.local, 1);
-  // (a ring, as triangleOn: one rank's b staged at a time against each block of a)
-  const size_t stageElems = (size_t)maxShare * np * C;
+  // (a ring, as triangleOn: one rank's b staged at a time against each block of a - on a card short of room a window of
+  // an eighth of its channels at a time: a whole share staged was 4.5 GB of a simulated rank of 4's out-of-memory at
+  // 11,856 tokens, in the template stack)
+  const int cw = shortPair((size_t)n * n, C) ? std::max(1, C / 8) : C;
+  const size_t stageElems = (size_t)maxShare * np * cw;
   T* stages[2] = { mg::WORLD > 1 ? scratch<T>("trib.bstage", stageElems) : nullptr, nullptr };
   if (mg::WORLD > 2 && roomFor(stageElems * sizeof(T) * 2)) stages[1] = scratch<T>("trib.bstage2", stageElems);
   const int nstage = stages[1] ? 2 : 1;
@@ -581,10 +587,12 @@ inline void triangleGenericOn(const mg::Shared& z, const float* mask, int n, int
     int w = std::min(width, hi - k0);
     TriRect r{k0, w, 0, np};
     operands(r, a, 0);
-    ringOver<T>(bmine, n, np, C, stages, nstage, [&](int m, const T* B, int qlo) {
-      CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, m, w, np, &alpha, B, cudaType<T>(), np, (long long)m * np, a,
-        cudaType<T>(), np, r.size(), &zero, prod + qlo, CUDA_R_32F, np, r.size(), C, CUBLAS_COMPUTE_32F, algo));
-    });
+    for (int c0 = 0; c0 < C; c0 += cw)
+      ringOver<T>(bmine, n, np, c0, std::min(cw, C - c0), stages, nstage, [&](int m, const T* B, int qlo) {
+        CB(cublasGemmStridedBatchedEx(H, CUBLAS_OP_T, CUBLAS_OP_N, m, w, np, &alpha, B, cudaType<T>(), np, (long long)m * np,
+          a + (size_t)c0 * r.size(), cudaType<T>(), np, r.size(), &zero, prod + (size_t)c0 * r.size() + qlo, CUDA_R_32F, np, r.size(),
+          std::min(cw, C - c0), CUBLAS_COMPUTE_32F, algo));
+      });
     for (size_t q0 = 0; q0 < r.size(); q0 += per) {
       size_t cnt = std::min(per, r.size() - q0);
       rectCenterNormK<T><<<(unsigned)((cnt + 31) / 32), dim3(32, 8), 0, STREAM>>>(prod, ln, q0, cnt, C, r.size(),
