@@ -262,11 +262,14 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   const size_t aw = (size_t)std::max(rows, 1) * np * (rounds ? K : C);
   void* aL = x8 ? (void*)scratch<__nv_fp8_e4m3>("trib.a8", aw) : (void*)scratch<TQ>("trib.a", aw);
   void* bL = x8 ? (void*)scratch<__nv_fp8_e4m3>("trib.b8", aw) : (void*)scratch<TQ>("trib.b", aw);
+  // (in rounds one step's slots, not two: a step's fill does not overlap the GEMM before it there, and a fence ahead of
+  // each fill keeps a peer's GEMM off a slot being refilled - 2.4 GB a rank at 12,350 tokens on 4)
   mg::Shared* slotA[2]; mg::Shared* slotB[2];
-  for (int k = 0; k < 2; ++k) {
+  for (int k = 0; k < (rounds ? 1 : 2); ++k) {
     slotA[k] = &mg::shared("sh.tsa" + tag + "." + std::to_string(k), (size_t)g * plane * (x8 ? 1 : sizeof(TQ)));
     slotB[k] = &mg::shared("sh.tsb" + tag + "." + std::to_string(k), (size_t)g * plane * (x8 ? 1 : sizeof(TQ)));
   }
+  if (rounds) { slotA[1] = slotA[0]; slotB[1] = slotB[0]; }
   TQ* aW = x8 ? scratch<TQ>("trib.aw", (size_t)g * plane) : nullptr;   // (x8: a step's planes widened from the wire's e4m3)
   TQ* bW = x8 ? scratch<TQ>("trib.bw", (size_t)g * plane) : nullptr;
   B16* pAll[2] = {};
@@ -367,7 +370,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
             used[sp] = true;
           }
           if (!next) break;
-          if (rounds) { const int k1 = (q + 1) * K; produce(k1, std::min(C, k1 + K), nullptr); fill(q + 1, STREAM); }
+          if (rounds) { const int k1 = (q + 1) * K; produce(k1, std::min(C, k1 + K), nullptr); mg::fence(); fill(q + 1, STREAM); }
           else CK(cudaStreamWaitEvent(STREAM, filled, 0));
           mg::fence();                                // (every rank's rows in this rank's next slot)
         }
