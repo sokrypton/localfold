@@ -360,6 +360,13 @@ static int foldMain(int argc, char** argv) {
     if (getenv("LOCALFOLD_MEM") && mg::RANK == 0)
       fprintf(stderr, "  memory room for the ordinary paths %.2f GB, every rank's least\n", SHORT_PAIR_ROOM / 1e9);
   }
+  // several GPUs, REPLICATED (LOCALFOLD_MG_REPLICATE=1): every rank runs the whole trunk alone - nothing exchanged -
+  // then the samples and their confidence heads are dealt as on a sharded pair. For a fold that fits one GPU with
+  // several samples, where the trunk's exchanges cost more than they save (a PCIe-only box)
+  const char* replEnv = getenv("LOCALFOLD_MG_REPLICATE");
+  const size_t nRuns = seedList.size() * samples;
+  const bool repl = mg::WORLD > 1 && replEnv && atoi(replEnv) && nRuns > 1 && nRuns <= std::max<size_t>(samples, 10);
+  if (repl) sh::ON = false;
   if (!(mg::WORLD > 1 && sh::ON) && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
                 doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
   // several GPUs on a sharded pair: the diffusion runs whole on every rank (oneCardPast) where the fold would fit one
@@ -389,8 +396,10 @@ static int foldMain(int argc, char** argv) {
         folds != 1 || repeat != 1 || !doFold) {
       fprintf(stderr, "several GPUs fold one job at a time, and not chai-1 or OpenDDE yet\n"); return 1;
     }
-    GRAPHS = false;                                             // (a capture cannot hold a host barrier)
-    if (sh::ON) {
+    if (repl) printf("trunk: whole on each of %d GPUs, the samples dealt\n", mg::WORLD);
+    else GRAPHS = false;                                        // (a capture cannot hold a host barrier)
+    if (repl) { if (!framesDir.empty()) { fprintf(stderr, "a replicated trunk: no --frames yet\n"); return 1; } }
+    else if (sh::ON) {
       // phase 2: the pair sharded by rows (makeTrunk gave each rank its slab); the trunk on slabs, its pair gathered
       // onto rank 0 after the last pass
       if (!framesDir.empty() || recycleTolerance > 0) { fprintf(stderr, "a sharded pair: no --frames or --recycle-tolerance yet\n"); return 1; }
@@ -501,7 +510,7 @@ static int foldMain(int argc, char** argv) {
     }
     if (trunkGraph) CK(cudaGraphExecDestroy(trunkGraph));
     CK(cudaDeviceSynchronize());
-    if (mg::WORLD > 1 && !sharded(t)) {   // the trunk done on every rank: the others leave, rank 0 folds on alone
+    if (mg::WORLD > 1 && !sharded(t) && !repl) {   // the trunk done on every rank: the others leave, rank 0 folds on alone
       mg::SPLIT = nullptr;
       mg::barrier();
       if (mg::RANK != 0) mg::leave();
@@ -689,7 +698,7 @@ static int foldMain(int argc, char** argv) {
     // several GPUs with the diffusion whole on every rank and several samples a batch: the samples DEALT, sample k on
     // rank k % N (each its own seed, so the same walk as in the batch), the coordinates gathered after - every rank
     // ran every sample before, the whole batch's diffusion on each
-    const bool dealt = keptLo >= 0 && mg::WORLD > 1 && cn > 1;
+    const bool dealt = (keptLo >= 0 || repl) && mg::WORLD > 1 && cn > 1;
     std::vector<uint64_t> mySeeds;
     for (size_t k = 0; k < cn; ++k) if (!dealt || (int)(k % mg::WORLD) == mg::RANK) mySeeds.push_back(seeds[k]);
     NS = (int)mySeeds.size();
@@ -714,7 +723,49 @@ static int foldMain(int argc, char** argv) {
     // several GPUs on a sharded pair, past the sampler: the confidence head of every sample and the contacts on held
     // rows (collective, rank 0's results); then the others leave and rank 0 writes the fold with the whole pair never
     // held anywhere
+    // DEALT confidence (several GPUs, the diffusion whole on every rank, several samples): sample k's head on rank
+    // k % N - the one-GPU head on the whole pair (head, bf16 where TRUNK_PAIR16) - its results to rank 0 through host
+    // memory, into shardedConf
     std::vector<ConfidenceOut> shardedConf;
+    auto dealConfidence = [&](const float* head) {
+      const size_t nn = (size_t)t.n * t.n, nd = (size_t)t.n * dense;
+      const int W = mg::WORLD;
+      std::vector<int> pbI(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
+      std::vector<float> pbM(M.f("batch.tokenAtomsToPseudoBeta.mask"), M.f("batch.tokenAtomsToPseudoBeta.mask") + nD);
+      const bool ca = M.flag("trunk.dialect.confidenceCaDgram");
+      const size_t slot = 64 + 4 * (nd + 3 * nn);
+      mg::HostSlots hs = mg::hostSlots("conf", cn * slot);
+      for (size_t k = 0; k < cn; ++k) {
+        if ((int)(k % W) != mg::RANK) continue;
+        const float* xk = xs.data() + k * mask.size() * 3;
+        std::vector<float> beta((size_t)nD * 3);
+        for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)
+          beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
+        float* dBeta = upload(beta.data(), beta.size());
+        ConfidenceOut ck = confidenceHead(const_cast<float*>(head), t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n, false);
+        CK(cudaFree(dBeta));
+        if (ck.plddt.size() != nd || ck.pae.size() != nn || ck.pde.size() != nn || ck.tmTerm.size() != nn) {
+          fprintf(stderr, "dealt confidence: sample %zu's outputs are not %zu / %zu long\n", k, nd, nn); exit(1);
+        }
+        char* b = hs.base + k * slot;
+        double hdr[3] = { ck.meanPlddt, ck.ptm, ck.iptm }; memcpy(b, hdr, sizeof hdr);
+        float* f = (float*)(b + 64);
+        memcpy(f, ck.plddt.data(), nd * 4); memcpy(f + nd, ck.pae.data(), nn * 4);
+        memcpy(f + nd + nn, ck.pde.data(), nn * 4); memcpy(f + nd + 2 * nn, ck.tmTerm.data(), nn * 4);
+      }
+      mg::barrier();                        // (every rank's samples in the slots)
+      if (mg::RANK == 0)
+        for (size_t k = 0; k < cn; ++k) {
+          const char* b = hs.base + k * slot; const float* f = (const float*)(b + 64);
+          ConfidenceOut ck; double hdr[3]; memcpy(hdr, b, sizeof hdr);
+          ck.meanPlddt = hdr[0]; ck.ptm = hdr[1]; ck.iptm = hdr[2];
+          ck.plddt.assign(f, f + nd); ck.pae.assign(f + nd, f + nd + nn);
+          ck.pde.assign(f + nd + nn, f + nd + 2 * nn); ck.tmTerm.assign(f + nd + 2 * nn, f + nd + 3 * nn);
+          shardedConf.push_back(std::move(ck));
+        }
+      mg::barrier();                        // (rank 0 has read them)
+      mg::freeHostSlots(hs);
+    };
     if (keptLo >= 0) {                 // (the diffusion ran whole on every rank: its pair given back, the slab's view again)
       t.pair = (float*)t.zS->local; t.shardLo = keptLo; t.shardRows = keptRows; t.p16 = true;
       GRAPHS = false;
@@ -729,6 +780,20 @@ static int foldMain(int argc, char** argv) {
       TRUNK_PAIR16 = t.p16 && pairStays16(t.n, t.C, fast);
       if (!TRUNK_PAIR16) pairToF32(t);
       if (contact.empty()) contact = contactProbabilities(t);
+    }
+    if (repl && mg::WORLD > 1) {
+      auto sc0 = clock();
+      if (cn > 1) {
+        if (!t.pair) unparkFromHost(t.pair, (size_t)t.n * t.n * t.C * (TRUNK_PAIR16 ? 2 : 4));    // (parked for the sampler)
+        dealConfidence(t.pair);
+        releaseConcatCopies();
+      }
+      confMs += ms(sc0, clock()); s0 += clock() - sc0;
+      mg::release({ "" }, mg::FINAL);
+      if (mg::RANK != 0) mg::leave();
+      mg::finish();
+      mg::WORLD = 1;
+      mg::tick("the other ranks exited");
     }
     if (sharded(t)) {
       GRAPHS = false;
@@ -749,47 +814,16 @@ static int foldMain(int argc, char** argv) {
       const bool dealtConf = keptLo >= 0 && mg::WORLD > 1 && cn > 1;
       if (dealtConf) {
         float* whole = gatherWhole();
-        const size_t pc = (size_t)t.n * t.n * t.C, nn = (size_t)t.n * t.n, nd = (size_t)t.n * dense;
+        const size_t pc = (size_t)t.n * t.n * t.C, nn = (size_t)t.n * t.n;
         const int W = mg::WORLD;
         SHORT_PAIR_SHARE = 1;                 // (the one-GPU head, the whole pair: bf16 only where it is short of room)
         const bool p16 = shortPair(nn, t.C);
         float* head = whole;
         if (!p16) { head = dalloc(pc); fromBf16K<<<blocks(pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(whole), head, pc); }
         const bool was16 = TRUNK_PAIR16; TRUNK_PAIR16 = p16;
-        const size_t slot = 64 + 4 * (nd + 3 * nn);
-        mg::HostSlots hs = mg::hostSlots("conf", cn * slot);
-        for (size_t k = 0; k < cn; ++k) {
-          if ((int)(k % W) != mg::RANK) continue;
-          const float* xk = xs.data() + k * mask.size() * 3;
-          std::vector<float> beta((size_t)nD * 3);
-          for (int r = 0; r < nD; ++r) for (int c3 = 0; c3 < 3; ++c3)
-            beta[r * 3 + c3] = ca ? xk[((size_t)r * dense + 1) * 3 + c3] : pbM[r] ? xk[(size_t)pbI[r] * 3 + c3] : 0.f;
-          float* dBeta = upload(beta.data(), beta.size());
-          ConfidenceOut ck = confidenceHead(head, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n, false);
-          CK(cudaFree(dBeta));
-          if (ck.plddt.size() != nd || ck.pae.size() != nn || ck.pde.size() != nn || ck.tmTerm.size() != nn) {
-            fprintf(stderr, "dealt confidence: sample %zu's outputs are not %zu / %zu long\n", k, nd, nn); exit(1);
-          }
-          char* b = hs.base + k * slot;
-          double hdr[3] = { ck.meanPlddt, ck.ptm, ck.iptm }; memcpy(b, hdr, sizeof hdr);
-          float* f = (float*)(b + 64);
-          memcpy(f, ck.plddt.data(), nd * 4); memcpy(f + nd, ck.pae.data(), nn * 4);
-          memcpy(f + nd + nn, ck.pde.data(), nn * 4); memcpy(f + nd + 2 * nn, ck.tmTerm.data(), nn * 4);
-        }
+        dealConfidence(head);
         TRUNK_PAIR16 = was16; SHORT_PAIR_SHARE = W;
         if (!p16) CK(cudaFree(head));
-        mg::barrier();                        // (every rank's samples in the slots)
-        if (mg::RANK == 0)
-          for (size_t k = 0; k < cn; ++k) {
-            const char* b = hs.base + k * slot; const float* f = (const float*)(b + 64);
-            ConfidenceOut ck; double hdr[3]; memcpy(hdr, b, sizeof hdr);
-            ck.meanPlddt = hdr[0]; ck.ptm = hdr[1]; ck.iptm = hdr[2];
-            ck.plddt.assign(f, f + nd); ck.pae.assign(f + nd, f + nd + nn);
-            ck.pde.assign(f + nd + nn, f + nd + 2 * nn); ck.tmTerm.assign(f + nd + 2 * nn, f + nd + 3 * nn);
-            shardedConf.push_back(std::move(ck));
-          }
-        mg::barrier();                        // (rank 0 has read them)
-        mg::freeHostSlots(hs);
         mg::release({ "sh.whole" });
       }
       for (size_t k = 0; k < cn && !dealtConf; ++k) {
