@@ -250,6 +250,42 @@ static std::string jsonQuoted(const std::string& s) {
   }
   return o + "\"";
 }
+// a window's A3M - its query the residues [off, off + seg.size()) of a chain of `len` - re-written over the whole chain:
+// every row padded with gaps outside the window (its insertions kept), in its order; a row that is the window's query
+// becomes the whole query (dropQuery: dropped - an unpaired block opens with its query, which the chain's own first row
+// already is; a paired block keeps it, its rows being row-aligned across the chains)
+static std::string widenA3m(const std::string& a3m, const std::string& seg, const std::string& full, size_t off, bool dropQuery) {
+  std::string out, header, row;
+  auto flush = [&] {
+    if (header.empty()) return;
+    size_t aligned = 0; std::string upper;
+    for (char c : row) if (!(c >= 'a' && c <= 'z')) { ++aligned; upper += c; }
+    if (aligned != seg.size()) throw std::runtime_error("a window's A3M row is " + std::to_string(aligned) + " columns, the window " + std::to_string(seg.size()));
+    if (upper == seg) { if (!dropQuery) out += header + "\n" + full + "\n"; }
+    else out += header + "\n" + std::string(off, '-') + row + std::string(full.size() - off - seg.size(), '-') + "\n";
+    header.clear(); row.clear();
+  };
+  size_t at = 0;
+  while (at < a3m.size()) {
+    size_t end = a3m.find('\n', at); if (end == std::string::npos) end = a3m.size();
+    std::string line = a3m.substr(at, end - at);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (!line.empty() && line[0] == '>') { flush(); header = line; }
+    else row += line;
+    at = end + 1;
+  }
+  flush();
+  return out;
+}
+// a chain longer than the server searches whole (it ended TycC's 6,486 residues and BacA's 5,255 with ERROR): windows of
+// WINDOW residues overlapping by OVERLAP, each searched alone and widened back over the chain
+constexpr size_t WINDOW = 3000, OVERLAP = 300;
+static std::vector<size_t> windowsOf(size_t len) {
+  std::vector<size_t> starts;
+  for (size_t s = 0; ; s += WINDOW - OVERLAP) { starts.push_back(s); if (s + WINDOW >= len) break; }
+  return starts;
+}
+
 static int msaMain(int argc, char** argv) {
   std::vector<std::string> list(argv + 1, argv + argc);
   lf::Args args(list);
@@ -264,11 +300,31 @@ static int msaMain(int argc, char** argv) {
     for (auto& c : chains) if (std::find(unique.begin(), unique.end(), c) == unique.end()) unique.push_back(c);
     auto say = [](const std::string& m) { fprintf(stderr, "%s\n", m.c_str()); fflush(stderr); };
     std::vector<std::string> unpaired, paired(unique.size());
-    for (size_t i = 0; i < unique.size(); ++i)
-      unpaired.push_back(lf::search::searchOne(unique[i], [&](const std::string& m) {
-        say("chain " + std::to_string(i + 1) + " of " + std::to_string(unique.size()) + " (" + std::to_string(unique[i].size()) + " residues): " + m);
-      }).a3m);
-    if (unique.size() > 1) paired = lf::search::searchPaired(unique, [&](const std::string& m) { say("paired: " + m); });
+    for (size_t i = 0; i < unique.size(); ++i) {
+      const std::string& q = unique[i];
+      const std::string tag = "chain " + std::to_string(i + 1) + " of " + std::to_string(unique.size()) + " (" + std::to_string(q.size()) + " residues)";
+      if (q.size() <= WINDOW) {
+        unpaired.push_back(lf::search::searchOne(q, [&](const std::string& m) { say(tag + ": " + m); }).a3m);
+        continue;
+      }
+      std::string a = ">101\n" + q + "\n";
+      const auto starts = windowsOf(q.size());
+      for (size_t w = 0; w < starts.size(); ++w) {
+        const std::string seg = q.substr(starts[w], std::min(WINDOW, q.size() - starts[w]));
+        const std::string wtag = tag + ", window " + std::to_string(w + 1) + " of " + std::to_string(starts.size());
+        a += widenA3m(lf::search::searchOne(seg, [&](const std::string& m) { say(wtag + ": " + m); }).a3m, seg, q, starts[w], true);
+      }
+      unpaired.push_back(a);
+    }
+    // the paired search on each chain's first window (pairing is by organism, and the organisms' full-length proteins
+    // carry the window), its rows widened back over the chains
+    if (unique.size() > 1) {
+      std::vector<std::string> heads;
+      for (auto& q : unique) heads.push_back(q.substr(0, std::min(WINDOW, q.size())));
+      paired = lf::search::searchPaired(heads, [&](const std::string& m) { say("paired: " + m); });
+      for (size_t i = 0; i < unique.size(); ++i)
+        if (unique[i].size() > WINDOW) paired[i] = widenA3m(paired[i], heads[i], unique[i], 0, false);
+    }
     // chain ids in input order, mmCIF's way: A..Z, AA, AB, ...
     auto chainId = [](int a) { std::string id; for (a = a; ; a = a / 26 - 1) { id.insert(id.begin(), (char)('A' + a % 26)); if (a < 26) break; } return id; };
     std::string j = "{\n \"name\": " + jsonQuoted(args.option("name", "complex")) + ",\n \"modelSeeds\": [1],\n \"dialect\": \"alphafold3\",\n \"version\": 2,\n \"sequences\": [";

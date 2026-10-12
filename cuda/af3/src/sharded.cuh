@@ -188,7 +188,7 @@ __global__ void widenPlanesK(const uint2* __restrict__ in, uint4* __restrict__ o
 // this rank's rows of the attention's bias (columns where swapped: the rows of z^T) written into every other rank's -
 // the planes [heads][n][stride] f16; ownership turns on 16-row boundaries, so no 16-byte piece straddles two ranks
 __global__ void pushBiasK(PeerPlanes pp, const uint4* __restrict__ bias, int heads, int n, int stride, bool swap, int rank) {
-  // (one destination at a time, each rank from the next: pushRowsK's note; a piece is this rank's when its row is, or
+  // (one destination at a time, each rank from the next, so no two write one rank at once; a piece is this rank's when its row is, or
   // its 8 columns' first - a column past n the last rank's)
   const int vecs = stride / 8, lo = pp.lo[rank], hi = rank + 1 < pp.world ? pp.lo[rank + 1] : (swap ? stride : n);
   const int own = swap ? (min(hi, stride) - lo) / 8 : min(hi, n) - lo;       // (vec columns, or rows)
