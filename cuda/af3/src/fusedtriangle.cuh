@@ -58,6 +58,9 @@ template <class PT> __device__ __forceinline__ void pairSt2(float* p, size_t i, 
   if constexpr (std::is_same_v<PT, float>) *reinterpret_cast<float2*>(p + i) = v;
   else *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<PT*>(p) + i) = __floats2bfloat162_rn(v.x, v.y);
 }
+#ifndef LN_VEC16
+#define LN_VEC16 1
+#endif
 #ifndef LN_ROWS_IN_FLIGHT
 #define LN_ROWS_IN_FLIGHT 8
 #endif
@@ -66,6 +69,58 @@ __device__ __forceinline__ void lnRowsToShared(const float* __restrict__ x, RowO
                                                const float* __restrict__ offset, half* Xs, int LDX, int warp, int lane) {
   constexpr int RPW = R / WARPS, B = LN_ROWS_IN_FLIGHT > 0 && RPW % LN_ROWS_IN_FLIGHT == 0 ? LN_ROWS_IN_FLIGHT
                                   : RPW % 4 == 0 ? 4 : (RPW % 2 == 0 ? 2 : 1), K = C / 32;
+#if LN_VEC16
+  if constexpr (!std::is_same_v<PT, float> && K % 8 == 0) {
+    // a bf16 row 16 bytes a lane: a lane's channels (lane + 32 kk) * 8 .. + 7, one load and one store each
+    constexpr int KK = K / 8;
+    float sc[K], of[K];
+#pragma unroll
+    for (int kk = 0; kk < KK; ++kk)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) { int ch = (lane + 32 * kk) * 8 + e; sc[kk * 8 + e] = scale[ch]; of[kk * 8 + e] = offset[ch]; }
+    for (int base = 0; base < RPW; base += B) {
+      uint4 w[B][KK];
+#pragma unroll
+      for (int b = 0; b < B; ++b) {
+        size_t row = rowOf(warp + (base + b) * WARPS);
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk)
+          w[b][kk] = row != SIZE_MAX ? *reinterpret_cast<const uint4*>(reinterpret_cast<const PT*>(x) + row * C + (lane + 32 * kk) * 8)
+                                     : make_uint4(0, 0, 0, 0);
+      }
+#pragma unroll
+      for (int b = 0; b < B; ++b) {
+        float v[K];
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk) {
+          const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&w[b][kk]);
+#pragma unroll
+          for (int e = 0; e < 4; ++e) { float2 f = __bfloat1622float2(h[e]); v[kk * 8 + 2 * e] = f.x; v[kk * 8 + 2 * e + 1] = f.y; }
+        }
+        float s = 0.f;
+#pragma unroll
+        for (int k = 0; k < K; ++k) s += v[k];
+        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+        float mean = s / C, q = 0.f;
+#pragma unroll
+        for (int k = 0; k < K; ++k) { float d = v[k] - mean; q += d * d; }
+        for (int o = 16; o; o >>= 1) q += __shfl_xor_sync(~0u, q, o);
+        float inv = rsqrtf(q / C + 1e-5f);
+        int r = warp + (base + b) * WARPS;
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk) {
+          uint4 o4; half2* oh = reinterpret_cast<half2*>(&o4);
+#pragma unroll
+          for (int e = 0; e < 4; ++e)
+            oh[e] = __floats2half2_rn((v[kk * 8 + 2 * e] - mean) * inv * sc[kk * 8 + 2 * e] + of[kk * 8 + 2 * e],
+                                      (v[kk * 8 + 2 * e + 1] - mean) * inv * sc[kk * 8 + 2 * e + 1] + of[kk * 8 + 2 * e + 1]);
+          *reinterpret_cast<uint4*>(Xs + r * LDX + (lane + 32 * kk) * 8) = o4;
+        }
+      }
+    }
+    return;
+  }
+#endif
   float sc[K], of[K];                       // a lane's channels' scale and offset, loaded once for all its rows
 #pragma unroll
   for (int k = 0; k < K; ++k) { sc[k] = scale[lane + 32 * k]; of[k] = offset[lane + 32 * k]; }

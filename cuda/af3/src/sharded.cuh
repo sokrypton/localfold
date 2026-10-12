@@ -353,11 +353,21 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         constexpr auto kern8 = triIn256For<CC, WI, __nv_fp8_e4m3, PT>();
         const unsigned grid = (unsigned)(((size_t)rows * np + triInRowsOf(WI) - 1) / triInRowsOf(WI));
         // this rank's rows of a and b, channels [k0, k1) (the gate's too where t2 is handed), at aL's channel 0
+        // (a window - rounds' a few channels, one or two of the kernel's 8-channel steps a block - on the plain 8-warp form
+        // where the whole pass takes the two-tile one: two tiles a warp pay off over 32 steps' weight fragments, and a
+        // window is its rows' loads - 2.26 -> 1.60 ms a C / 32 window at 4,940 tokens on a simulated rank of 8, with
+        // lnRowsToShared's 16-byte rows)
+        constexpr auto kernW = triIn256For<CC, 8, TQ, PT>();
+        static bool attrW = false;
         auto produce = [&](int k0, int k1, half* gate) {
           if (rows <= 0) return;
           RectMap win = mineRm; win.ab0 = k0 / 8; win.ab1 = k1 / 8;
           const size_t back = (size_t)k0 * mineRm.size;
-          if (!x8) {
+          if (!x8 && rounds && WI == TRIIN_TWO_TILES) {
+            if (!attrW) { smemAttr(kernW, (int)wideTriInSmemW(CC, 8)); attrW = true; }
+            kernW<<<(unsigned)(((size_t)rows * np + triInRowsOf(8) - 1) / triInRowsOf(8)), 32 * 8, wideTriInSmemW(CC, 8), STREAM>>>(
+              base, mask, lnS, lnO, wt, (TQ*)aL - back, (TQ*)bL - back, gate, n, np, cs, nullptr, win);
+          } else if (!x8) {
             if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
             kern<<<grid, 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
               base, mask, lnS, lnO, wt, (TQ*)aL - back, (TQ*)bL - back, gate, n, np, cs, nullptr, win);

@@ -520,7 +520,7 @@ arithmetic, byte-identical (contacts identical at 600). **A simulated T4 now fol
 not ported; at 2,800 the triangle's fixed operand (4 GB) no longer fits.
 
 **On several GPUs (`--gpus=N`, mgtrunk.cuh) 16,549 tokens fold on 8 x 40 GB** - AlphaFold 3's length there (simulated:
-one rank of 8, `LOCALFOLD_MG_SIMULATE=1`; trunk 417 s, the confidence head 53 s). Each rank holds two 17.65 GB shares of
+one rank of 8, `LOCALFOLD_MG_SIMULATE=1`; trunk 372 s, the confidence head 26 s). Each rank holds two 17.65 GB shares of
 the 256-channel bf16 pair (its rows of z, and the triangle's product), so everything else had to come out of 6.8 GB:
 `token_bonds` stays on the host (`Model::hostOnly`; the kernels read each row's bonded columns, `Bonds` - its dense
 [T, T] was 1.1 GB a GPU, and a fold reading it so is byte-identical), the triangle's mask of ones is never made
@@ -532,4 +532,12 @@ does not work: a pass's output updates its rows of z, and every later pass's ope
 triangle's rounds (its operands a window of channels at a time, the input pass repeated each window) are taken only
 where the whole form's own buffers do not fit on every rank - asked of the ranks, once a shape; `shortPair`'s rule
 had them on with 30 GB to spare, where the repeated input pass was 41% of a rank's GPU time: a simulated rank of 8's
-trunk at 4,940 tokens 19.65 -> 13.33 s (the one-GPU fold's is 114.6 s), at 9,880 97.0 -> 72.9 s.
+trunk at 4,940 tokens 19.65 -> 13.33 s (the one-GPU fold's is 114.6 s), at 9,880 97.0 -> 72.9 s. Where rounds are taken, their
+input pass is a window's rows read whole for 8 of 256 channels - 32 times a triangle at C / 32, 160 of the 417 s
+trunk at 16,549 tokens (nsys) at 0.71 TB/s: a window takes the plain 8-warp form where the whole pass takes the
+two-tile one, and `lnRowsToShared` reads a bf16 row 16 bytes a lane - 24.9 -> ~18 ms a window there, the trunk
+417 -> 372 s (the LayerNorm's sums in another order: the 1TIM dimer on 2 ranks 1.520 -> 1.526 A from its crystal,
+rounds and the whole form alike). The confidence head pins nothing of its own: its residual is the bf16 rows its
+blocks take, kept on the device where the trunk's share stayed through the sampler (every rank with 5 shares and an
+eighth of the card spare), else in the share's pinned host buffer - the head 3.3 -> 0.9 s at 4,940 tokens, 14.4 ->
+5.6 at 9,880, 52.7 -> 26 at 16,549, and 35 GB less pinned host memory a rank there.
