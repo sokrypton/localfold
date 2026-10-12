@@ -34,32 +34,9 @@ static std::vector<float> expectation(const std::vector<float>& logits, size_t r
   }
   return out;
 }
-// AF2's predicted TM-score from the PAE logits (confidence.compute_tm over every residue)
-static float predictedTm(const std::vector<float>& logits, int L, int bins, const std::vector<int>* asym, bool interface) {
-  float maxBin = 31.f, step = maxBin / (bins - 2);
-  std::vector<float> centres(bins);
-  for (int b = 0; b < bins - 1; ++b) centres[b] = b * step + step / 2;
-  centres[bins - 1] = centres[bins - 2] + step;
-  float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
-  float best = 0;
-  for (int i = 0; i < L; ++i) {
-    double sum = 0; double count = 0;
-    for (int j = 0; j < L; ++j) {
-      if (interface && asym && (*asym)[i] == (*asym)[j]) continue;
-      const float* l = logits.data() + ((size_t)i * L + j) * bins;
-      float mx = -INFINITY; for (int b = 0; b < bins; ++b) mx = std::max(mx, l[b]);
-      double s = 0, e = 0;
-      for (int b = 0; b < bins; ++b) { double p = std::exp(l[b] - mx); s += p; e += p / (1 + (centres[b] / d0) * (centres[b] / d0)); }
-      sum += e / s; count += 1;
-    }
-    if (count > 0) best = std::max(best, (float)(sum / (count + 1e-8)));
-  }
-  return best;
-}
-
-// The same three reductions on the device, one thread a pair (each was a host pass over pairs x 64 logits with an exp
+// AF2's three per-pair reductions on the device, one thread a pair (each was a host pass over pairs x 64 logits with an exp
 // per bin - with the logits' two 17 MB downloads, most of the 218 ms between a 261-residue fold's last pass and its
-// result): the PAE expectation and the pair's TM term (predictedTm's, before its row means), and the distogram's
+// result): the PAE expectation and the pair's TM term (confidence.compute_tm's, before its row means), and the distogram's
 // P(< 8 A). Double accumulation in the host's bin order; the exp is the device's.
 __global__ void paeTmPairsK(const float* logits, size_t pairs, float d0, float* pae, double* tm) {
   size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -83,7 +60,7 @@ __global__ void contactPairsK(const float* logits, size_t pairs, float* out) {
   for (int b = 0; b < 64; ++b) { double e = expf(l[b] - mx); s += e; if (b <= 18) near += e; }
   out[r] = (float)(near / s);
 }
-// predictedTm from the per-pair terms: the best row's mean (over the other chains' columns for the interface)
+// the predicted TM-score from the per-pair terms: the best row's mean (over the other chains' columns for the interface)
 static float tmFromTerms(const std::vector<double>& tm, int L, const std::vector<int>& asym, bool interface) {
   float best = 0;
   for (int i = 0; i < L; ++i) {
@@ -135,7 +112,7 @@ static std::string writeWarmInput(int L, int N, int E, int T) {
 }
 // AlphaFold 3's confidence files beside the PDB, as cuda/af3 writes them (sampler.cuh) and the page's
 // archive reads them: <stem>_confidences.json - atom_plddts in the PDB's atom order, the expected PAE
-// (AF2's 64 bins, centres as predictedTm's), contact_probs = P(Cb distance < 8 A) from the distogram
+// (AF2's 64 bins, centres as paeTmPairsK's), contact_probs = P(Cb distance < 8 A) from the distogram
 // where the weights carry its head (the page's multimer bundle does not), the token layout - and
 // <stem>_summary_confidences.json (pTM, ipTM for a complex, mean pLDDT)
 static inline std::vector<float> contactsChunked(const float* pair, int L);   // (below)
@@ -609,21 +586,15 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   bool chains = false; for (int i = 1; i < L; ++i) chains |= asym[i] != asym[0];
   std::vector<float> pae;          // the expected PAE a pair
   float ptm, iptm;
-  if (AF2_TIGHT) {                 // (the last pass's pair, its logits a chunk at a time to the host)
-    std::vector<float> lg(pairs * 64);
-    paeChunked(t.pair, L, [&](const float* chunk, size_t r0, size_t r) {
-      CK(cudaMemcpy(lg.data() + r0 * 64, chunk, r * 64 * 4, cudaMemcpyDeviceToHost));
-    });
-    ptm = predictedTm(lg, L, 64, &asym, false);
-    iptm = chains ? predictedTm(lg, L, 64, &asym, true) : NAN;
-    std::vector<float> centres(64);
-    for (int b = 0; b < 63; ++b) centres[b] = b * (31.f / 62) + 31.f / 124;
-    centres[63] = centres[62] + 31.f / 62;
-    pae = expectation(lg, pairs, 64, centres);
-  } else {
+  {
     float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
     float* pe = scratch<float>("head.paeE", pairs); double* tt = scratch<double>("head.tmT", pairs);
-    paeTmPairsK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
+    // (on a card short of room the last pass's logits a chunk at a time, each chunk's terms on the device too: they went
+    // to the host whole and were softmaxed there, 4.9 s of 9GOC's 1,702-residue fold)
+    if (AF2_TIGHT) paeChunked(t.pair, L, [&](const float* chunk, size_t r0, size_t r) {
+      paeTmPairsK<<<blocks(r), 256, 0, STREAM>>>(chunk, r, d0, pe + r0, tt + r0);
+    });
+    else paeTmPairsK<<<blocks(pairs), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
     pae = download(pe, pairs);
     std::vector<double> tm(pairs);
     CK(cudaMemcpy(tm.data(), tt, pairs * 8, cudaMemcpyDeviceToHost));
