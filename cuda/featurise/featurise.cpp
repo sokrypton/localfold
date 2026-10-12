@@ -232,6 +232,63 @@ static int fetchMain(int argc, char** argv) {
   return 0;
 }
 
+// `msa-search <out.json> --sequence=<A>:<B>:... [--name=<name>]`: the ColabFold MMseqs2 search alone - each distinct
+// chain searched once, the distinct chains paired - written as an AlphaFold 3 job (the alphafold3 dialect) carrying
+// every protein's unpairedMsa and pairedMsa inline, identical chains one entity with several ids. Any port folds it with
+// --job=, so a search runs once, ahead of the GPUs, and the job is the input as published. SENDS THE SEQUENCES TO
+// api.colabfold.com
+static std::string jsonQuoted(const std::string& s) {
+  std::string o = "\"";
+  o.reserve(s.size() + 2);
+  for (unsigned char c : s) {
+    if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+    else if (c == '\n') o += "\\n";
+    else if (c == '\r') o += "\\r";
+    else if (c == '\t') o += "\\t";
+    else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+    else o += (char)c;
+  }
+  return o + "\"";
+}
+static int msaMain(int argc, char** argv) {
+  std::vector<std::string> list(argv + 1, argv + argc);
+  lf::Args args(list);
+  if (args.positional.empty() || args.option("sequence").empty()) {
+    fprintf(stderr, "usage: msa-search <out.json> --sequence=<A>:<B>:... [--name=<name>]\n");
+    return 1;
+  }
+  try {
+    std::vector<std::string> chains;
+    for (auto& c : lf::splitNonEmpty(args.option("sequence"), ':')) chains.push_back(lf::search::normalizedSequence(c));
+    std::vector<std::string> unique;
+    for (auto& c : chains) if (std::find(unique.begin(), unique.end(), c) == unique.end()) unique.push_back(c);
+    auto say = [](const std::string& m) { fprintf(stderr, "%s\n", m.c_str()); fflush(stderr); };
+    std::vector<std::string> unpaired, paired(unique.size());
+    for (size_t i = 0; i < unique.size(); ++i)
+      unpaired.push_back(lf::search::searchOne(unique[i], [&](const std::string& m) {
+        say("chain " + std::to_string(i + 1) + " of " + std::to_string(unique.size()) + " (" + std::to_string(unique[i].size()) + " residues): " + m);
+      }).a3m);
+    if (unique.size() > 1) paired = lf::search::searchPaired(unique, [&](const std::string& m) { say("paired: " + m); });
+    // chain ids in input order, mmCIF's way: A..Z, AA, AB, ...
+    auto chainId = [](int a) { std::string id; for (a = a; ; a = a / 26 - 1) { id.insert(id.begin(), (char)('A' + a % 26)); if (a < 26) break; } return id; };
+    std::string j = "{\n \"name\": " + jsonQuoted(args.option("name", "complex")) + ",\n \"modelSeeds\": [1],\n \"dialect\": \"alphafold3\",\n \"version\": 2,\n \"sequences\": [";
+    for (size_t u = 0; u < unique.size(); ++u) {
+      std::string ids;
+      for (size_t c = 0; c < chains.size(); ++c) if (chains[c] == unique[u]) ids += std::string(ids.empty() ? "" : ", ") + jsonQuoted(chainId((int)c));
+      j += std::string(u ? "," : "") + "\n  {\"protein\": {\"id\": [" + ids + "], \"sequence\": " + jsonQuoted(unique[u])
+         + ", \"unpairedMsa\": " + jsonQuoted(unpaired[u]) + ", \"pairedMsa\": " + jsonQuoted(paired[u]) + ", \"templates\": []}}";
+    }
+    j += "\n ]\n}\n";
+    lf::writeText(args.positional, j);
+    fprintf(stderr, "%zu chains (%zu distinct), %zu residues -> %s (%.1f MB)\n", chains.size(), unique.size(),
+            [&] { size_t n = 0; for (auto& c : chains) n += c.size(); return n; }(), args.positional.c_str(), j.size() / 1e6);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "Error: %s\n", e.what());
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   std::string self = argv[0];
   self = self.substr(self.rfind('/') == std::string::npos ? 0 : self.rfind('/') + 1);
@@ -243,6 +300,7 @@ int main(int argc, char** argv) {
   if (self == "resolve-templates") return resolveMain(argc, argv);
   if (self == "chem-probe") return chemMain();
   if (self == "fetch-weights" || self == "localfold-fetch") return fetchMain(argc, argv);   // (the wheel's name for it)
-  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, ef2-featurise, resolve-templates or fetch-weights (not %s)\n", self.c_str());
+  if (self == "msa-search") return msaMain(argc, argv);
+  fprintf(stderr, "featurise: run as af3-featurise, af2-featurise, ef2-featurise, resolve-templates, fetch-weights or msa-search (not %s)\n", self.c_str());
   return 2;
 }
