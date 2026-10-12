@@ -472,6 +472,7 @@ export class Af3PairformerStackGpu {
       pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
         { f32Only: !pairMatrixKernels, arithmetic: pairTransitionArithmetic(pairChannels) }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
+      gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
       // ...and the triangle projection, which has no width rule because it
       // costs no memory. See webgpu/kernels/triangle/project-matrix.js.
       triangleProjectMatrix: pairMatrixKernels

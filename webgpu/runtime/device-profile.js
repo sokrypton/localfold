@@ -444,6 +444,8 @@ export const DEFAULT_TUNING = Object.freeze({
   triangleAccumulatePrecision: null,
   // ...and AF2's outer-product-mean vector GEMMs' arithmetic: null is f16 where the device has it, "f32" the control.
   opmVectorArithmetic: null,
+  // ...and AF3's vector grid projection: null is f16 where the pair track stages in f16, "f32" the control.
+  gridProjectArithmetic: null,
   // 🔴 AND THE TRIANGLE PROJECTION ON THE SAME UNITS, which with the transition
   // split is the LARGEST kernel left in an ESMFold2 trunk - 130.6 ms of 494.
   // Unlike the transition it needs no new memory: its source and both its

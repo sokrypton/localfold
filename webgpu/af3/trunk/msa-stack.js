@@ -167,6 +167,7 @@ export class Af3MsaStackGpu {
       pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
         { f32Only: !pairMatrixKernels, arithmetic: pairTransitionArithmetic(pairChannels) }),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
+      gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
       minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,

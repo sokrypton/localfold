@@ -516,7 +516,12 @@ ${vectorHeads ? `  ${Array.from({ length: heads / 4 }, (_, h) =>
   // lane-strided loop strides by it. At 256 or below the two are equal and this
   // is the kernel it was.
   const projectWorkgroup = Math.min(projectLanes, 256);
-  const project = `${common}
+  // 🔴 f16 ARITHMETIC ON REQUEST (`shape.projectArithmetic`, unpacked q/k/v/gate only): the activation tile in f16 and
+  // 32 channels' products summed in f16 before they join an f32 accumulator - which halves the tile and the registers
+  // a row costs, so a taller row tile serves each weight read. See PROJECT_ROWS_F16.
+  const project16 = shape.projectArithmetic === "f16" && !packQkvg;
+  const AT = project16 ? "f16" : "f32";
+  const project = `${project16 ? "enable f16;\n" : ""}${common}
 const ROWS: u32 = ${ROWS}u;
 const LANES: u32 = ${projectLanes}u;
 const WG: u32 = ${projectWorkgroup}u;
@@ -548,7 +553,7 @@ ${chunkBinding(6)}
 // unmoved at 2324 ms. So this kernel is not waiting on its workgroup reads,
 // and the instruction count does not govern it - the one global weight read a
 // channel does. Do not transpose the activation tile.
-var<workgroup> act: array<f32, ${channels} * ${ROWS}>;
+var<workgroup> act: array<${AT}, ${channels} * ${ROWS}>;
 ${offsets.gatingQueryBias === undefined ? "" : `
 // 🔴 ONE SCALAR OUT OF A vec4-BOUND ARRAY, WITHOUT A DYNAMIC SUBSCRIPT. This
 // kernel binds the weights as vec4 - it is the only one that does - so
@@ -579,8 +584,8 @@ ${chunked ? "  let live_pairs = chunk.y * N;\n" : ""}\
     let source = select(0u, ${chunked
       ? sourceRow.replace(/row/g, "(chunk.x * N + row)") : sourceRow}, row < ${LIVE});
     for (var c = local; c < CHANNELS; c += WG) {
-      act[r * CHANNELS + c] = select(
-        0.0, ${storedElement(normalizedStorage, "normalized", "source * CHANNELS + c")}, row < ${LIVE});
+      act[r * CHANNELS + c] = ${AT}(select(
+        0.0, ${storedElement(normalizedStorage, "normalized", "source * CHANNELS + c")}, row < ${LIVE}));
     }
   }
   workgroupBarrier();
@@ -622,14 +627,23 @@ ${[["q", "x"], ["k", "y"], ["v", "z"], ["gate", "w"]].map(emit).join("\n")}
   // One iteration where WG == WIDTH, which is every model but OpenDDE.
   for (var out = local; out < WIDTH; out += WG) {
 ${overRows((r) => `  var acc${r} = vec4<f32>(0.0);`)}
-
+${project16 ? `
+  for (var c0 = 0u; c0 < CHANNELS; c0 += 32u) {
+${overRows((r) => `    var part${r} = vec4<f16>(0.0);`)}
+    for (var c = c0; c < min(c0 + 32u, CHANNELS); c += 1u) {
+      let w = vec4<f16>(weights[W_QKVG + c * WIDTH + out]);
+${overRows((r) => `      part${r} = fma(vec4<f16>(act[${r}u * CHANNELS + c]), w, part${r});`)}
+    }
+${overRows((r) => `    acc${r} += vec4<f32>(part${r});`)}
+  }
+` : `
   for (var c = 0u; c < CHANNELS; c += 1u) {
     // (channels, out, 4) - see packGridAttentionWeights - so consecutive
     // threads read consecutive vec4s, and this one load is used ROWS times.
     let w = weights[W_QKVG + c * WIDTH + out];
 ${overRows((r) => `    acc${r} += act[${r}u * CHANNELS + c] * w;`)}
   }
-
+`}
 ${overRows((r) => `  if (first + ${r}u < ${LIVE}) {
     let index${r} = (first + ${r}u) * WIDTH + out;
     q[index${r}] = acc${r}.x;

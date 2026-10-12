@@ -951,3 +951,11 @@ ran at 3.0.
   - Fold level (fold-af2.js --ca, 3 recycles), CA RMSD new vs old against a seed change: 59 residues 0.038 / 1.409 A,
     5CAJ templated 0.012 / 0.658, 512 + 1024 rows 0.030 / 0.831, templated at that depth 0.007 / 1.371; pLDDT within
     0.06. test:template's AF3 arm 0.242 A; its AF2 arms and the other models need bundles this machine lacks.
+- **AF3's vector grid projection (q/k/v/gate) in f16 arithmetic** where the pair track stages in f16: the activation
+  tile in f16, 32 channels' products summed in f16 into f32 accumulators (`projectArithmetic`; the device knob
+  `gridProjectArithmetic=f32` is the control; packed q/k/v/gate and the matrix projection untouched).
+  bench-grid-project.js, 255 tokens: 4.51 -> 3.01 ms at 8 rows (4h 3.83, 12h 4.24, 16h 4.05 - the row tile stays 8).
+  The trunk at 255 tokens, alternated: grid.project 475 / 500 -> 328 / 344 ms a pass, GPU 2945 / 3091 -> 2801 / 2898,
+  pairformer wall 2024 / 2119 -> 1928 / 1989. Fold level (fold-opendde.js, AF3 int5, 3 recycles, 50 steps): 0.002 A
+  between arms on 6MRR (seed 0.463), 0.001 A on 5CAJ templated (seed 0.151), crystal 0.250 / 0.251. test:ligand bond
+  rms 0.061; test:stock AF3 85.8982 -> 85.8936.

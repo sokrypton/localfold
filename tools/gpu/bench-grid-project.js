@@ -117,11 +117,15 @@ export async function main(device, args) {
   };
   for (const spec of arms_spec) {
     const [shapeSpec, drop] = spec.split(":");
-    const packed = shapeSpec.endsWith("p");
-    const [rows, chunk] = (packed ? shapeSpec.slice(0, -1) : shapeSpec).split("/").map(Number);
+    // ...`h` after the rows: the projection in f16 arithmetic (`projectArithmetic`)
+    const half = shapeSpec.endsWith("h");
+    const bare = half ? shapeSpec.slice(0, -1) : shapeSpec;
+    const packed = bare.endsWith("p");
+    const [rows, chunk] = (packed ? bare.slice(0, -1) : bare).split("/").map(Number);
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose: false,
         projectRows: rows, projectOutRows: rows, attendKeyChunk: chunk,
+        ...(half ? { projectArithmetic: "f16" } : {}),
       },
       // ...gathered and normalized stay f32 here: this bench asks about
       // q/k/v/gate alone, which is the one that needs the ownership change.
