@@ -186,21 +186,20 @@ __global__ void widenPlanesK(const uint2* __restrict__ in, uint4* __restrict__ o
 // a GPU so, at 6 where each GPU's consecutive writes went to every owner in turn - row by row within each channel)
 
 // this rank's rows of the attention's bias (columns where swapped: the rows of z^T) written into every other rank's -
-// the planes [heads][n][stride] f16; ownership turns on 16-row boundaries, so no 16-byte piece straddles two ranks
-__global__ void pushBiasK(PeerPlanes pp, const uint4* __restrict__ bias, int heads, int n, int stride, bool swap, int rank) {
-  // (one destination at a time, each rank from the next, so no two write one rank at once; a piece is this rank's when its row is, or
-  // its 8 columns' first - a column past n the last rank's)
-  const int vecs = stride / 8, lo = pp.lo[rank], hi = rank + 1 < pp.world ? pp.lo[rank + 1] : (swap ? stride : n);
-  const int own = swap ? (min(hi, stride) - lo) / 8 : min(hi, n) - lo;       // (vec columns, or rows)
-  const size_t per = swap ? (size_t)heads * n * own : (size_t)heads * own * vecs;
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (own <= 0 || t >= per * (pp.world - 1)) return;
-  const int p = (rank + 1 + (int)(t / per)) % pp.world;
-  const size_t e = t % per;
-  size_t at;
-  if (swap) { const int v = lo / 8 + (int)(e % own); const size_t hi_ = e / own; at = hi_ * vecs + v; }   // (h, i) whole rows
-  else { const int v = (int)(e % vecs), i = lo + (int)(e / vecs % own), h = (int)(e / vecs / own); at = ((size_t)h * n + i) * vecs + v; }
-  pp.p[p][at] = bias[at];
+// the planes [heads][n][stride] f16; ownership turns on 16-row boundaries. By copy engines: the piece is one rectangle -
+// its rows of each plane (heads runs a plane apart), or swapped its columns of every row (heads x n runs a row apart) -
+// so one 2-D copy a destination takes it with no SM held (the destinations from the next rank on)
+inline void copyBias(const PeerPlanes& pp, const half* bias, int heads, int n, int stride, bool swap, cudaStream_t st) {
+  const int lo = pp.lo[pp.rank], hi = pp.rank + 1 < pp.world ? pp.lo[pp.rank + 1] : (swap ? stride : n);
+  const int own = swap ? std::min(hi, stride) - lo : std::min(hi, n) - lo;     // (columns, or rows)
+  if (own <= 0) return;
+  const size_t e = sizeof(half), plane = (size_t)n * stride * e;
+  const size_t off = swap ? (size_t)lo * e : (size_t)lo * stride * e, width = swap ? (size_t)own * e : (size_t)own * stride * e;
+  const size_t pitch = swap ? (size_t)stride * e : plane, height = swap ? (size_t)heads * n : (size_t)heads;
+  for (int k = 1; k < pp.world; ++k) {
+    const int r = (pp.rank + k) % pp.world;
+    CK(cudaMemcpy2DAsync((char*)pp.p[r] + off, pitch, (const char*)bias + off, pitch, width, height, cudaMemcpyDefault, st));
+  }
 }
 
 // a sharded op's scratch given back after it only where the card is short: giving back drains the device
@@ -579,8 +578,7 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   const PeerPlanes bp = peerPlanes(biasS, nullptr, n);
   const size_t bw = (size_t)heads * std::max((size_t)bp.maxRows * (stride / 8), (size_t)n * (bp.maxRows / 8 + 2));   // (one destination's)
   if (mg::WORLD > 1) mg::sent("attention bias", bw * (mg::WORLD - 1) * 16, false);
-  if (mg::WORLD > 1) pushBiasK<<<blocks(bw * (mg::WORLD - 1)), 256, 0, STREAM>>>(bp, (const uint4*)bias, heads, n,
-                                                                        stride, swap, mg::RANK);
+  if (mg::WORLD > 1) copyBias(bp, bias, heads, n, stride, swap, STREAM);
   mg::fence();
   // this rank's rows, in chunks
   size_t R = std::max<size_t>(1, std::min<size_t>(std::max(rowsHere, 1), CHUNK / ((size_t)n * 4 * Wd)));
@@ -658,8 +656,7 @@ inline void columnAttentionRing(const mg::Shared& z, const float* mask, int n, i
   const PeerPlanes bp = peerPlanes(biasS, nullptr, n);
   const size_t bw = (size_t)heads * std::max((size_t)bp.maxRows * (stride / 8), (size_t)n * (bp.maxRows / 8 + 2));
   if (mg::WORLD > 1) mg::sent("attention bias", bw * (mg::WORLD - 1) * 16, false);
-  if (mg::WORLD > 1) pushBiasK<<<blocks(bw * (mg::WORLD - 1)), 256, 0, STREAM>>>(bp, (const uint4*)bias, heads, n, stride, !swap,
-                                                                        mg::RANK);
+  if (mg::WORLD > 1) copyBias(bp, bias, heads, n, stride, !swap, STREAM);
   const int vecs = (int)((size_t)C * elem() / 16);
   const int XC = 8, Pmax = (maxStored(n) + XC - 1) / XC, P = (rowsHere + XC - 1) / XC;
   mg::Shared* slot[2] = { &mg::shared("sh.zTc0", std::max<size_t>((size_t)Pmax * n * C * elem(), 1)),
