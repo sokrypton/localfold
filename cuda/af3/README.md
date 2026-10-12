@@ -1581,6 +1581,35 @@ thousand tokens, and 2 GPUs (one pair's traffic through the bridge a triangle) b
 Not yet measured on a box. Even overlapped the bridge caps such a box near 2x at 3,000 tokens and ~3x at 6,000.
 `LOCALFOLD_MG_TRI_TIMES=1` prints the triangle's phases (input pass, exchange + GEMMs, product tail, output) on rank 0.
 
+#### Exchanges by copy engines, and what holds SMs (2026-10-12, before a box)
+
+The EA1 S-layer fold on 8 x A100 80 GB (10,344 tokens) ran its trunk at 473 s a pass against 383 s for a simulated rank:
+~22 s a pass that is the interconnect's. `LOCALFOLD_MG_TIMES=1` now prints the bytes each rank sends, by kind, on the
+stream (waited on) and beside it (overlapped). One pass of EA1, simulated: **480 GB waited on** (the short-of-room
+column ring's transposes 313, the attentions' bias 79, the triangle's first operand step 78, the MSA's columns 9) and
+**859 GB beside** (the triangle's operands 547 and products 313). The exposed bytes at ~118 GB/s explain ~4 s of the
+22; the rest fits the overlap's own cost - a push kernel holds its SMs for as long as the link takes (~10x a simulated
+rank's local writes), so the compute it overlaps runs on fewer SMs: the column ring's transposes pushed beside the
+attention made it 3% slower on 8 blocks and **22% on 64**, simulated.
+
+So the exchanges go by COPY ENGINES (`cudaMemcpyAsync`/`cudaMemcpy2DAsync` from the sending GPU into the peer: a push,
+no SM held):
+- **the triangle's operands and products** (`copyPlanes`, `copyRows`): each piece one run at both ends;
+- **the attention bias** (`copyBias`): a rank's piece one rectangle in either layout, one 2-D copy a destination;
+- on branch **`mg-ring-ce`**, every **pair transpose** - packed first on the device (`packTransposeK`, local, ~10x a link)
+  so each destination's piece is one run a row, then one 2-D copy a rank - with the column ring pipelined over three
+  slots (branch `mg-ring-ab`) so they overlap. Simulated rank of 8 at 5,928 tokens: on the stream 157 -> 59 GB a pass
+  and +1.5% (the ordinary path), 339 -> 241 GB and +0.9% (the ring); a simulated rank's copies are local and contend
+  with the attention for HBM.
+All byte-identical to the push kernels on 2 and 3 ranks sharing one card. On 8 x A100 an all-to-all ran at 233 GB/s a
+GPU by copy engines against 120 by kernels (both rotated), so the waited-on bytes should also move faster.
+
+Unmeasured, and the next box's question: `~/megacomplexes/box-scripts/ab.sh` builds commits side by side on an 8-GPU
+box and folds one pass of a job with each, twice interleaved (`BOX=ubuntu@<ip> ab.sh abd4088 opus-55-opt mg-ring-ce`).
+🔴 **AND A PCIe BOX TOO**: over the 4 x A6000's host bridge a peer READ by copy engine ran at 0.4-0.9 GB/s; these are
+writes from the sender, which kernels did at 15-20 GB/s there, but a copy engine's posted write through that bridge has
+not been timed - check it before trusting copy engines on PCIe.
+
 **Several samples: dealt, and a small fold's trunk replicated.** With several samples each rank samples k % N and runs
 those samples' confidence heads itself (the one-GPU head on the whole pair; results to rank 0 through `/dev/shm`),
 where every rank had run every sample. And for a fold that fits one GPU, under ~1,700 tokens on a link pushing under 30
