@@ -1280,6 +1280,16 @@ const PRIORS = new Map([
     // check-transition-split.js 4.68e-7 in f32 storage either way), and 42.7 at 64 x 128 x 32 where the stack multiplies
     // in f16. Not measured on an M2 (docs/M5-HANDOFF.md).
     vectorGemmBlock: { f32: "128x128x8", f16: "64x128x32" },
+    // 🔴 FOUR KEYS A SOFTMAX RESCALE IN AF2's FLASH ATTENTION, MEASURED ON AN M5 UNDER STOCK FLAGS - the default (1) was
+    // the M2's answer and nothing had re-asked. bench-msa-attention.js, the shipped f16-staged kernel, group 1 -> 4: MSA
+    // row 128 x 255 6.13 -> 5.05 ms, column 128 x 255 3.18 -> 2.55, column 512 x 255 48.4 -> 38.9, triangle 255 x 255
+    // 6.10 -> 5.05 (8 is between, 16 level with 4; the vec4 score and two queries a lane slower). In the block
+    // (profile-af2-block.js, 255 residues x 128 rows, two rounds alternated): 115.0 / 118.7 -> 112.6 / 111.8 ms, the
+    // four flash kernels 17% faster. It reassociates the online softmax (relRMS ~1e-7): fold-af2.js, 3 recycles, CA RMSD
+    // between the arms 0.006 A (59 residues, against 0.103 for a seed change) and 0.016 A (5CAJ templated, against
+    // 0.652), pLDDT 96.562 -> 96.581 and 81.777 -> 81.793. AF3's denoiser level (90.2 / 90.1 against 89.9 / 90.8 ms).
+    // Not measured on an M2.
+    attentionGroup: 4,
   }],
 ], );
 

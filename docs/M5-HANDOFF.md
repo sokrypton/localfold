@@ -918,3 +918,12 @@ ran at 3.0.
   100.4 / 99.4 -> 97.3 / 98.3. Of the blocks swept for it, 128 x 128 x 8 and x16 are level, 64 x 128 and 128 x 64
   worse. The page's AF2 at 255 residues is ~6 s a recycle in the browser; the rest of a block is attention and
   projections at 1.4-1.8 TFLOP/s (f32 by AF2's policy).
+- **AF2's flash attention groups four keys a softmax rescale on Apple** (`attentionGroup: 4` in the metal-3 prior; the
+  default of 1 was the M2's and never re-asked). bench-msa-attention.js, f16-staged: MSA row 128 x 255 6.13 -> 5.05 ms,
+  column 512 x 255 48.4 -> 38.9, triangle 255 x 255 6.10 -> 5.05. The block at 255 x 128, alternated: 115.0 / 118.7 ->
+  112.6 / 111.8 ms. It reassociates the online softmax: CA RMSD between arms 0.006 A (59 residues, 3 recycles; a seed
+  change 0.103) and 0.016 A (5CAJ templated; seed 0.652). AF3's denoiser level; test:stock's AF3 and ESMFold2 unchanged.
+  For the M2: `bench-msa-attention.js --shape=row --sequences=128 --length=255 --arms=auto/c,auto/cg4`.
+- **test:stock's AF2 entry cannot run on this machine**: it folds `fold-af2.js` with no `--bundle`, i.e. `/model/`, and
+  only `model-af2-monomer-int5/` is here. `fold-af2.js --bundle=/model-af2-monomer-int5` is how AF2 was checked above;
+  `--ca` (new) returns the alpha carbons so two arms superpose.

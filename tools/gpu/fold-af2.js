@@ -603,6 +603,9 @@ export async function main(device, args) {
     ptm: round(final.confidence.ptm, 4),
     ...(final.confidence.iptm === undefined ? {} : { iptm: round(final.confidence.iptm, 4) }),
     caca: { median: round(median, 3), worst: round(worst, 3), ok: chainOk },
+    // `--ca`: every residue's alpha carbon, so two arms' structures can be superposed rather than checksummed
+    ...(args.includes("--ca") ? { alphaCarbons: Array.from({ length: atom37.length / 111 }, (_, r) =>
+      [0, 1, 2].map((d) => round(atom37[(r * 37 + 1) * 3 + d], 3))) } : {}),
     stages: summariseStages(stageMarks, started),
     phases: prediction.stageMilliseconds === undefined ? undefined
       : Object.fromEntries(Object.entries(prediction.stageMilliseconds)
