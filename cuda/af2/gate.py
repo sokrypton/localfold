@@ -78,7 +78,8 @@ def run_fold(name, inputs, ref):
         os.remove(pdb)
     p = subprocess.run([os.path.join(HERE, "fold"), pdb, *inputs], capture_output=True, text=True)
     text = p.stdout + p.stderr
-    m = re.search(r"mean pLDDT ([\d.]+)\s+pTM ([\d.nan]+)", text)
+    # the LAST: the binary prints every recycle pass's confidence, the fold's is the final one
+    m = ([None] + list(re.finditer(r"mean pLDDT ([\d.]+)\s+pTM ([\d.nan]+)", text)))[-1]
     if p.returncode or not m or not os.path.exists(pdb):
         return {"error": text.strip().splitlines()[-1] if text.strip() else f"exit {p.returncode}"}
     s = subprocess.run([sys.executable, os.path.join(REPO, "cuda", "af3", "score.py"), pdb, *ref],
@@ -104,7 +105,7 @@ def oracle_cases():
 
 
 def run_oracle(data, passes, weights, fast):
-    cmd = [os.path.join(HERE, "af2"), data, f"--weights={weights}", f"--oracle={data}/oracle",
+    cmd = [os.path.join(HERE, "localfold-af2"), data, f"--weights={weights}", f"--oracle={data}/oracle",
            f"--recycles={passes - 1}", f"--out={TMP}/oracle.pdb"] + (["--fast"] if fast else [])
     p = subprocess.run(cmd, capture_output=True, text=True)
     text = p.stdout + p.stderr
