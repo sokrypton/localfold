@@ -131,13 +131,14 @@ __global__ void opmPermuteHK(const half* Pm, half* X, int bi, int L, int O) {
 }
 // pair[i][j] += (bias + x) / (1e-3 + norm[i][j])   (AF3: the bias inside the scale)
 template <class PT = float>
+// xs: x's scale back up (AF2's standard form contracts its rows scaled down by a power of two, to fit float16)
 __global__ void opmAddK(float* pair, const float* x, const float* bias, const float* norm, size_t i0,
-                        int Bi, int n, int C, bool biasAfterNorm) {
+                        int Bi, int n, int C, bool biasAfterNorm, float xs = 1.f) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)Bi * n * C) return;
   int f = (int)(t % C); size_t ij = t / C; size_t i = i0 + ij / n, j = ij % n;
   float nv = norm[i * n + j];
-  float v = biasAfterNorm ? x[t] / fmaxf(nv, 1.f) + bias[f] : (bias[f] + x[t]) / (1e-3f + nv);
+  float v = biasAfterNorm ? xs * x[t] / fmaxf(nv, 1.f) + bias[f] : (bias[f] + xs * x[t]) / (1e-3f + nv);
   size_t at = (i * n + j) * C + f;
   if constexpr (std::is_same_v<PT, float>) pair[at] += v;
   else reinterpret_cast<PT*>(pair)[at] = fromF<PT>(toF(reinterpret_cast<PT*>(pair)[at]) + v);

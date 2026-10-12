@@ -660,16 +660,22 @@ inline void outerProductMean(Trunk& t, const std::string& S, int blk, const floa
     }
     size_t per = (size_t)L * O * O;
     int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
+    // the sum over the rows scaled by 2^-k - exact, as a power of two is - so it fits float16, and opmAddK scales it back:
+    // unscaled, 7GYV's alignment at 1,945 extra rows overflowed it and NaN'd the fold (ColabFold's 512:5120 asks 5,120).
+    // 2^k the row count / 64: the largest entry there was ~34 a row, so ~2,200 scaled, and the small ones stay clear of
+    // float16's subnormals, which scaling to the mean (2^k >= the row count) reached - 7GYV's fold moved by it
+    int k = 0; while ((64 << k) < rowsN) ++k;
+    const float down = ldexpf(1.f, -k), up = ldexpf(1.f, k);
     half* Pm = scratch<half>("fopm.P", (size_t)Bi * per);
     half* X = scratch<half>("fopm.X", (size_t)Bi * per);
     float* Y = scratch<float>("fopm.Y", (size_t)Bi * L * 128);
     for (int i0 = 0; i0 < L; i0 += Bi) {
       int bi = std::min(Bi, L - i0);
-      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &one, rt, CUDA_R_16F, L * O, lt + (size_t)i0 * O,
+      CB(cublasGemmEx(H, CUBLAS_OP_N, CUBLAS_OP_T, L * O, bi * O, rowsN, &down, rt, CUDA_R_16F, L * O, lt + (size_t)i0 * O,
                       CUDA_R_16F, L * O, &zero, Pm, CUDA_R_16F, L * O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
       opmPermuteHK<<<blocks((size_t)bi * per / 8), 256, 0, STREAM>>>(Pm, X, bi, L, O);
       ltGemm(X, PH(Op + "/output_w", blk), Y, false, (size_t)bi * L, O * O, 128, nullptr, false, 0.f);
-      WITH_PAIR_T(opmAddK<PT><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false));
+      WITH_PAIR_T(opmAddK<PT><<<blocks((size_t)bi * L * 128), 256, 0, STREAM>>>(t.pair, Y, P(Op + "/output_b", blk), norm, i0, bi, L, 128, false, up));
     }
     return;
   }
