@@ -96,14 +96,14 @@ inline void pairOntoRank0HostEf2(int T, int C) {
 
 // this rank's share in its own pinned host buffer through the sampler (which never reads it), and back - or kept on the
 // device where every rank has the room for it to stay through the sampler and the confidence head beside it: the head's
-// residual (a share's size) and the sharded triangle's whole form (~4 shares) past an eighth of the card. Parking was
+// residual (a share's size) and the sharded triangle's whole form (its own estimate) past an eighth of the card. Parking was
 // pinning alone: 1.1 s for a 1.58 GB share at 4,940 tokens on 8, where a rank holds under 7 GB
 inline B16Host EF2_SHARE_HOST{};
 inline bool EF2_SHARE_KEPT = false;
 inline void parkShareEf2(int T, int C) {
   const size_t bytes = (size_t)sh::storedRows(T, mg::RANK) * T * C * 2;
   size_t f = 0, t = 0; CK(cudaMemGetInfo(&f, &t));
-  EF2_SHARE_KEPT = !BIG_FORCED && mg::everyRankHas(5 * bytes + t / 8);
+  EF2_SHARE_KEPT = !BIG_FORCED && mg::everyRankHas(bytes + sh::wholeFormBytes(T, C, 2) + t / 8);
   if (mg::RANK == 0 && getenv("LOCALFOLD_MEM"))
     fprintf(stderr, "  the trunk's share (%.2f GB a rank) %s through the sampler\n", bytes / 1e9, EF2_SHARE_KEPT ? "kept on the device" : "parked in host memory");
   if (EF2_SHARE_KEPT) return;

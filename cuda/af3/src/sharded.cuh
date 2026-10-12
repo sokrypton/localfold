@@ -209,6 +209,18 @@ inline void releaseIfShort(int n, int C, std::initializer_list<const char*> name
 inline std::string (*WNAME)(const std::string&, const char*) = [](const std::string& pre, const char* leaf) {
   return pre + "." + leaf;
 };
+// what the triangle's whole form holds on this rank beyond z (an operand of TQBYTES a channel): a, b and the gate a slab
+// each, two steps' slots, two products, the product share, and 1 GB spare - what its rounds decision asks every rank for
+inline size_t wholeFormBytes(int n, int C, size_t tqBytes) {
+  const int np = padded(n); const size_t plane = (size_t)np * np;
+  int lo, hi; rowsOf(n, mg::RANK, lo, hi);
+  int maxShare = 0; for (int r = 0; r < mg::WORLD; ++r) { int a0, a1; rowsOf(n, r, a0, a1); maxShare = std::max(maxShare, a1 - a0); }
+  const size_t mine = (size_t)maxShare * np * C;
+  const int gs = getenv("LOCALFOLD_MG_TRI_GROUPS") ? atoi(getenv("LOCALFOLD_MG_TRI_GROUPS")) : 0;
+  const int grp = gs > 0 ? gs : np >= 4096 ? 8 : np >= 2048 ? 4 : 1, cg = (C + mg::WORLD - 1) / mg::WORLD;
+  const size_t gw = (size_t)((cg + grp - 1) / grp), slab = (size_t)std::max(hi - lo, 1) * np * C;
+  return 2 * slab * tqBytes + slab * 2 + 4 * gw * plane * tqBytes + 2 * gw * plane * 2 + mine * 2 + ((size_t)1 << 30);
+}
 template <class TQ>
 // INCOMING (bf16): the incoming form on z itself, p[c][i][j] = sum_k a[c][k][j] b[c][k][i] - the planes a rank gathers
 // are whole, so only the GEMM's operands turn (no z^T: two of a block's four transposes gone)
@@ -250,12 +262,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
     else {
       auto it = roundsOf.find({ n, C });
       if (it == roundsOf.end()) {
-        const int gs = getenv("LOCALFOLD_MG_TRI_GROUPS") ? atoi(getenv("LOCALFOLD_MG_TRI_GROUPS")) : 0;
-        const int grp = gs > 0 ? gs : np >= 4096 ? 8 : np >= 2048 ? 4 : 1, cg = (C + mg::WORLD - 1) / mg::WORLD;
-        const size_t gw = (size_t)((cg + grp - 1) / grp), slab = (size_t)std::max(rows, 1) * np * C;
-        const size_t whole = 2 * slab * sizeof(TQ) + slab * 2 + 4 * gw * plane * sizeof(TQ) + 2 * gw * plane * 2 + mine * 2
-                           + ((size_t)1 << 30);
-        it = roundsOf.emplace(std::make_pair(n, C), !mg::everyRankHas(whole)).first;
+        it = roundsOf.emplace(std::make_pair(n, C), !mg::everyRankHas(wholeFormBytes(n, C, sizeof(TQ)))).first;
       }
       rounds = it->second;
     }
