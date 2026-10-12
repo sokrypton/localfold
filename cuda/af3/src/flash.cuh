@@ -1061,8 +1061,9 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int
 // LOCALFOLD_FLASH_2R_BK=48|64 forces either
 // ...and its speculative softmax (flashGrid2R's SPEC; BioIR's ClaudeKit kernel's idea): --bench-grid 9.72 -> 9.36 ms at
 // 3,072 tokens, 38.5 -> 37.0 at 6,144 (256 rows); a whole trunk pass at 2,964 tokens its two grid stages 6.85 -> 6.69 s
-// each; 5CAJ self-templated 0.005 A from the plain softmax. (The 48-key form, a 100 KB-an-SM card's, keeps the plain
-// softmax until measured there.) LOCALFOLD_FLASH_SPEC=0 turns it off
+// each; 5CAJ self-templated 0.005 A from the plain softmax. The 48-key form too (a 100 KB-an-SM card's - an A6000, or an
+// L4 with FP8 off): on a Colab L4 17.4-17.9 against 19.1-19.3 ms at 2,048 tokens, level at 512 (three alternations each;
+// 256 rows); on the A100 9.65 against 10.19 at 3,072. LOCALFOLD_FLASH_SPEC=0 turns it off
 inline bool FLASH_SPEC = !getenv("LOCALFOLD_FLASH_SPEC") || atoi(getenv("LOCALFOLD_FLASH_SPEC"));
 inline bool flash2RWideKeys() {
   static const bool v = [] {
@@ -1175,7 +1176,7 @@ __global__ void __launch_bounds__(256) fp8VtK(const uint8_t* __restrict__ V8, ui
     *reinterpret_cast<uint4*>(Vt8 + (r * W + hd) * (size_t)NK + k0 + p0) = make_uint4(w[0], w[1], w[2], w[3]);
   }
 }
-template <int WARPS, int BK, int MT, int RR>
+template <int WARPS, int BK, int MT, int RR, bool SPEC = false>
 __global__ void __launch_bounds__(WARPS * RR * 32, 2) flash8(const half* __restrict__ qkvg, const uint8_t* __restrict__ K8,
     const uint8_t* __restrict__ Vt8, const half* __restrict__ bias, int biasStride, half* __restrict__ out, int n, int NK,
     int heads, size_t rows, float scale, const float* __restrict__ qBias, int sw) {
@@ -1283,22 +1284,42 @@ __global__ void __launch_bounds__(WARPS * RR * 32, 2) flash8(const half* __restr
       for (int mt = 0; mt < MT; ++mt) { mma8h(sh[mt][nt], qa[mt], kb[0], kb[1]); mma8h(sh[mt][nt + 1], qa[mt], kb[2], kb[3]); }
     }
     // the running max (rounded to f16, as the f16 kernel's), the rescale; P = 2^(s - (m - 8))
+    // SPEC (flashGrid2R's speculative softmax): a tile whose rows stay within 0.5 of the warp's running maximum keeps it -
+    // P then at most 2^8.5 = 362, inside e4m3's 448 (where the f16 kernel's P has room for 2^8 of slack, e4m3's has this)
     __half2 hn[MT][2];
+    bool full = true;
+    if constexpr (SPEC) {
+      bool over = false;
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-      __half2 x0 = *reinterpret_cast<__half2*>(&sh[mt][0][0]), x1 = *reinterpret_cast<__half2*>(&sh[mt][0][1]);
+      for (int mt = 0; mt < MT; ++mt) {
+        __half2 x0 = *reinterpret_cast<__half2*>(&sh[mt][0][0]), x1 = *reinterpret_cast<__half2*>(&sh[mt][0][1]);
 #pragma unroll
-      for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, *reinterpret_cast<__half2*>(&sh[mt][nt][0])); x1 = __hmax2(x1, *reinterpret_cast<__half2*>(&sh[mt][nt][1])); }
-      float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
-      t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
-      t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
-      float n0 = __half2float(__float2half(fmaxf(mx[mt][0], t0))), n1 = __half2float(__float2half(fmaxf(mx[mt][1], t1)));
-      float c0 = exp2f(mx[mt][0] - n0), c1 = exp2f(mx[mt][1] - n1);
-      mx[mt][0] = n0; mx[mt][1] = n1;
+        for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, *reinterpret_cast<__half2*>(&sh[mt][nt][0])); x1 = __hmax2(x1, *reinterpret_cast<__half2*>(&sh[mt][nt][1])); }
+        over |= fmaxf(__low2float(x0), __high2float(x0)) > mx[mt][0] + 0.5f || fmaxf(__low2float(x1), __high2float(x1)) > mx[mt][1] + 0.5f;
+      }
+      full = __any_sync(~0u, over);
+      if (!full) {
 #pragma unroll
-      for (int et = 0; et < D / 8; ++et) { o[mt][et][0] *= c0; o[mt][et][1] *= c0; o[mt][et][2] *= c1; o[mt][et][3] *= c1; }
-      lsum[mt][0] *= c0; lsum[mt][1] *= c0; lsum[mt][2] *= c1; lsum[mt][3] *= c1;
-      hn[mt][0] = __float2half2_rn(n0 - 8.f); hn[mt][1] = __float2half2_rn(n1 - 8.f);
+        for (int mt = 0; mt < MT; ++mt) { hn[mt][0] = __float2half2_rn(mx[mt][0] - 8.f); hn[mt][1] = __float2half2_rn(mx[mt][1] - 8.f); }
+      }
+    }
+    if (full) {
+  #pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        __half2 x0 = *reinterpret_cast<__half2*>(&sh[mt][0][0]), x1 = *reinterpret_cast<__half2*>(&sh[mt][0][1]);
+  #pragma unroll
+        for (int nt = 1; nt < BK / 8; ++nt) { x0 = __hmax2(x0, *reinterpret_cast<__half2*>(&sh[mt][nt][0])); x1 = __hmax2(x1, *reinterpret_cast<__half2*>(&sh[mt][nt][1])); }
+        float t0 = fmaxf(__low2float(x0), __high2float(x0)), t1 = fmaxf(__low2float(x1), __high2float(x1));
+        t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 1)); t0 = fmaxf(t0, __shfl_xor_sync(~0u, t0, 2));
+        t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 1)); t1 = fmaxf(t1, __shfl_xor_sync(~0u, t1, 2));
+        float n0 = __half2float(__float2half(fmaxf(mx[mt][0], t0))), n1 = __half2float(__float2half(fmaxf(mx[mt][1], t1)));
+        float c0 = exp2f(mx[mt][0] - n0), c1 = exp2f(mx[mt][1] - n1);
+        mx[mt][0] = n0; mx[mt][1] = n1;
+  #pragma unroll
+        for (int et = 0; et < D / 8; ++et) { o[mt][et][0] *= c0; o[mt][et][1] *= c0; o[mt][et][2] *= c1; o[mt][et][3] *= c1; }
+        lsum[mt][0] *= c0; lsum[mt][1] *= c0; lsum[mt][2] *= c1; lsum[mt][3] *= c1;
+        hn[mt][0] = __float2half2_rn(n0 - 8.f); hn[mt][1] = __float2half2_rn(n1 - 8.f);
+      }
     }
     // O += P V, 32 keys an MMA
 #pragma unroll
@@ -1361,6 +1382,8 @@ inline bool fp8Attn() {
   return on;
 }
 inline int FP8_SWIZZLE = getenv("LOCALFOLD_FP8_SWIZZLE") ? atoi(getenv("LOCALFOLD_FP8_SWIZZLE")) : -1;
+// LOCALFOLD_FP8_SPEC=1: flash8's speculative softmax (being measured on an FP8 card)
+inline bool FP8_SPEC = getenv("LOCALFOLD_FP8_SPEC") && atoi(getenv("LOCALFOLD_FP8_SPEC"));
 // the attention from qkvg's q and gate (f16, [row][pos][4W]) and K8, V8 (e4m3, [row][pos][W] - gridInK's kv8)
 inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, const half* bias, int stride, half* out, int n,
                       int heads, size_t rows, float scale, const float* qBias) {
@@ -1372,10 +1395,16 @@ inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, co
   fp8VtK<<<dim3(NK / 64, (unsigned)rows), 256, 65 * W, STREAM>>>(V8, Vt8, n, NK, W);
   const int bytes = 2 * (RR * (BK * 32 + 32 * BK) + BQ * (BK + 8) * 2);
   static bool attr = false;
-  if (!attr) { smemAttr((flash8<WARPS, BK, MT, RR>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
-  flash8<WARPS, BK, MT, RR><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias,
-                                                                  FP8_SWIZZLE >= 0 ? FP8_SWIZZLE : n >= 3500 ? 4 : 0);
+  const int sw = FP8_SWIZZLE >= 0 ? FP8_SWIZZLE : n >= 3500 ? 4 : 0;
+  if (FP8_SPEC) {
+    static bool attrS = false;
+    if (!attrS) { smemAttr((flash8<WARPS, BK, MT, RR, true>), bytes); attrS = true; }
+    flash8<WARPS, BK, MT, RR, true><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias, sw);
+    return;
+  }
+  if (!attr) { smemAttr((flash8<WARPS, BK, MT, RR>), bytes); attr = true; }
+  flash8<WARPS, BK, MT, RR><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias, sw);
 }
 inline int FLASH_WARPS_OVERRIDE = 0;
 // F16S (flashGridHalf): the unmasked kernel's scores in f16 - LOCALFOLD_FLASH_F16S=1 (being measured)
@@ -1409,6 +1438,7 @@ void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const floa
   } else if (FLASH_2R && !REG && D == 32 && WARPS == 4 && BK == 48) {   // (the unmasked kernel reads no r0)
     if (flash2RWideKeys() && FLASH_SPEC) flashGrid2RRun<D, 2, 64, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
     else if (flash2RWideKeys()) flashGrid2RRun<D, 2, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
+    else if (FLASH_SPEC) flashGrid2RRun<D, 2, BK, 2, 2, false, false, half, true>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
     else flashGrid2RRun<D, 2, BK, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
   } else if (FLASH_F16S) {
     setFlashSmem<D, WARPS, false, BK, REG, MINB, true>();

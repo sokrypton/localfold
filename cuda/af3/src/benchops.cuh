@@ -198,6 +198,7 @@ inline void benchGrid(int n) {
     {"2R w4 bk48 rr2", [&] { flashGrid2RRun<32, 4, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk48 rr3", [&] { flashGrid2RRun<32, 4, 48, 2, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"fp8 (when the card has it)", [&] { if (kv8) flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"fp8 spec", [&] { if (kv8) { bool was = FP8_SPEC; FP8_SPEC = true; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SPEC = was; } }},
     {"fp8 sw0", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 0; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
     {"fp8 sw2", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 2; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
     {"fp8 sw4", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 4; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
