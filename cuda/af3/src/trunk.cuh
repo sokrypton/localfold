@@ -432,6 +432,9 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     // is captured on the first of them, and a buffer growing inside a capture killed Chai-1 at 988 tokens)
     T* ln = scratch<T>("emb.prevln", (t.inPlaceRecycle || shortPair(pairs, C) ? per : pairs) * C);
     float* prev = scratch<float>("emb.prevproj", per * C);
+    // (and linearIntoPair's bf16 staging, which those passes' projection into the pair takes - an empty template stack
+    // sized it here by chance until it stopped running when no slot counts)
+    if (t.p16 && !t.inPlaceRecycle) scratch<float>("p16.tmp", per * C);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
       layerNormPairRows<T>(t.pair, t.p16, r0, ln, r, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
@@ -566,6 +569,14 @@ __global__ void addScaledK(float* y, const float* x, float s, size_t n) {
 template <class T>
 void templateEmbedding(Trunk& t, float* out) {
   int n = t.n, Cq = t.C;
+  // no slot that counts (boltz2's empty ones weigh zero): the stack would add outputLinear(relu(0)) - nothing, the
+  // projection has no bias - so none of its pair-sized buffers is made (8.8 GB a rank at 16,549 tokens on 8 x 40 GB,
+  // past the card, for a stack that skips every pass)
+  if (M.has("template.passes")) {
+    int counted = 0;
+    for (int k = 0; k < (int)M.meta("template.passes"); ++k) counted += M.meta("template." + std::to_string(k) + ".repeat") != 0.;
+    if (!counted) return;
+  }
   // (sharded: the previous pass's triangle and attention exchange buffers given back here, and this stack's own at its
   // end - kept for the next stack's (sizes alike: the 64-channel slabs and the 128-channel triangle planes) or freed
   // where a rank is short; held from the template stack to the trunk's end they were 9 GB of a 10,127-token rank's
@@ -1544,13 +1555,39 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
                               "tri.t1", "tri.t2" });
   int msaBlocks = 0; while (M.has("trunk.msaBlocks." + std::to_string(msaBlocks) + ".pairChannels")) ++msaBlocks;
   // boltz2 adds the pre-MSA pair back: its MSA module returns the updated z and the caller adds z
-  float* zIn = nullptr;
+  // (sized at the pair's own width - it was f32 for a bf16 pair, 17.6 GB a rank at 16,549 tokens on 8 - and kept in pinned
+  // host memory through the MSA stack where the card is short of room: 8.8 GB of a rank's 6.5 free there)
+  void* zIn = nullptr; bool zHost = false;
+  const size_t zElems = heldPairs(t) * t.C, zBytes = zElems * (t.p16 ? 2 : 4);
   if (M.flag("trunk.dialect.msaDoubleAddPair")) {
-    zIn = scratch<float>("trunk.zBeforeMsa", heldPairs(t) * t.C);       // (a bf16 pair takes half of it)
-    CK(cudaMemcpyAsync(zIn, t.pair, heldPairs(t) * t.C * (t.p16 ? 2 : 4), cudaMemcpyDeviceToDevice, STREAM));
+    // (sharded: room for it beside the triangle's whole form, which the MSA stack's blocks make next - asked of the free
+    // memory before them, the copy alone fitted and left the triangle 1 GB short)
+    zHost = !roomFor(zBytes + (sharded(t) ? sh::wholeFormBytes(t.n, t.C, t.p16 ? 2 : 4) : 0));
+    if (zHost) {
+      static void* host = nullptr; static size_t have = 0;
+      if (have < zBytes) {
+        if (host) CK(cudaFreeHost(host));
+        if (cudaMallocHost(&host, zBytes) != cudaSuccess) {
+          fprintf(stderr, "cannot pin %.2f GB of host memory for boltz2's pre-MSA pair\n", zBytes / 1e9); exit(1);
+        }
+        have = zBytes;
+      }
+      zIn = host;
+    } else zIn = scratch<char>("trunk.zBeforeMsa", zBytes);
+    CK(cudaMemcpyAsync(zIn, t.pair, zBytes, cudaMemcpyDefault, STREAM));
   }
   for (int k = 0; k < msaBlocks; ++k) msaBlock<T>(t, k);
-  if (zIn) WITH_PT(t.p16, pairAddK<PT, PT><<<blocks(heldPairs(t) * t.C), 256, 0, STREAM>>>(t.pair, reinterpret_cast<const PT*>(zIn), heldPairs(t) * t.C));
+  if (zIn && !zHost) WITH_PT(t.p16, pairAddK<PT, PT><<<blocks(zElems), 256, 0, STREAM>>>(t.pair, reinterpret_cast<const PT*>(zIn), zElems));
+  else if (zIn) WITH_PT(t.p16, {
+    const size_t per = std::min(zElems, CHUNK);
+    PT* back = scratch<PT>("trunk.zBack", per);
+    for (size_t e0 = 0; e0 < zElems; e0 += per) {
+      const size_t e = std::min(per, zElems - e0);
+      CK(cudaMemcpyAsync(back, reinterpret_cast<const PT*>(zIn) + e0, e * sizeof(PT), cudaMemcpyHostToDevice, STREAM));
+      pairAddK<PT, PT><<<blocks(e), 256, 0, STREAM>>>(reinterpret_cast<float*>(reinterpret_cast<PT*>(t.pair) + e0), back, e);
+    }
+    releaseScratch({ "trunk.zBack" });
+  });
   memReport("  trunk: MSA stack");
   if (tight) releaseScratch({ "msaatt.", "opm.", "trunk.zBeforeMsa", "trib." });
   onSeam("z_after_msa", t.pair, pairs * t.C);
