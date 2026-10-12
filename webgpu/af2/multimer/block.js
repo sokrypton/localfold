@@ -87,7 +87,7 @@ import {
   createGlobalAttentionFlashShader, GLOBAL_ATTENTION_KV_SHADER,
   createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
 } from "../evoformer/block.js";
-import { deviceTuning } from "../../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
 import { LINEAR_GRID_WIDTH, PROJECT_TILE, createTriangleShaders } from "../../kernels/triangle/shaders.js";
 import { shaderSourceSet } from "../../runtime/shader-source-cache.js";
 import {
@@ -539,7 +539,10 @@ async function encodeOuterProductMean(
   const vectorContract = outerFirst && deviceTuning(execution.device).opmVectorContract !== false;
   // ...on the device's vector GEMM block where it names one (webgpu/kernels/vector-gemm-block.js): f32, the same sums
   // in the same order. The output tiles C_Z by its columns and c_outer^2 by its depth, with no tail.
-  const opmBlock = vectorGemmBlock(execution.device, "f32",
+  // ...in f16 arithmetic where the device has it (`opmVectorArithmetic: "f32"` the control; docs/M5-HANDOFF.md)
+  const opmArithmetic = halfPrecisionAvailable(execution.device)
+    && deviceTuning(execution.device).opmVectorArithmetic !== "f32" ? "f16" : "f32";
+  const opmBlock = vectorGemmBlock(execution.device, opmArithmetic,
     ({ columns, inner }) => input.cZ % columns === 0 && (input.cOuter * input.cOuter) % inner === 0);
   const vectorOutput = outerFirst && deviceTuning(execution.device).opmVectorOutput !== false
     && input.cZ % opmBlock.columns === 0 && input.cOuter % 4 === 0;
@@ -551,14 +554,14 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     vectorContract
-      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}`,
-        createOuterProductMeanVectorContractShader(input.cOuter, opmBlock))
+      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
+        createOuterProductMeanVectorContractShader(input.cOuter, opmBlock, opmArithmetic))
       : execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
     vectorOutput
       ? execution.pipelines.get(
-        `block:opm:project-output-vector:${residualTarget !== undefined}:${vectorGemmBlockKey(opmBlock)}`,
-        createOuterProductMeanVectorOutputShader(residualTarget !== undefined, opmBlock))
+        `block:opm:project-output-vector:${residualTarget !== undefined}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
+        createOuterProductMeanVectorOutputShader(residualTarget !== undefined, opmBlock, opmArithmetic))
       : execution.pipelines.get(
         outerFirst && residualTarget !== undefined
           ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
@@ -715,6 +718,13 @@ async function encodeTriangleMultiplication(
   // ...and the output kernel's own column tile, where the device sets one -
   // this triangle always accumulates in f32, where it is bit-identical. See
   // webgpu/kernels/triangle/shaders.js.
+  // 🔴 THE VECTOR PROJECTIONS' ACCUMULATORS IN f16 WHERE THE DEVICE HAS IT - the triangle's two projections only, not
+  // its contraction (whose K is the protein's length). ESMFold2's trunk took the same for 1.55x; on AF2 it was measured
+  // at fold level (docs/M5-HANDOFF.md). `triangleAccumulatePrecision: "f32"` is the control.
+  if (!matrixFits && halfPrecisionAvailable(execution.device)
+      && deviceTuning(execution.device).triangleAccumulatePrecision !== "f32") {
+    shape.accumulatePrecision = "f16";
+  }
   const requestedTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
   const outColumns = deviceTuning(execution.device).triangleProjectOutColumns ?? null;
   const projectTile = outColumns === null ? requestedTile
@@ -732,6 +742,7 @@ async function encodeTriangleMultiplication(
     () => createTriangleShaders(
       shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
+    + `:${shape.accumulatePrecision ?? "f32"}`
     + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`
     + `x${shaders.projectTile.outColumns ?? "-"}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;

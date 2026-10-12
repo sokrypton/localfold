@@ -699,12 +699,12 @@ export const VECTOR_SPLIT_MIN_CHANNELS = 192;
  */
 export const VECTOR_F16_SPLIT_MIN_CHANNELS = 128;
 /**
- * The vector split's arithmetic an AF3-lineage pair track asks for: f16 at AF3's 128 channels, where it is what makes
- * the split pay at all (VECTOR_F16_SPLIT_MIN_CHANNELS) and where it was checked against the fold; f32 on the wider
- * tracks (protenix2, OpenDDE, IntelliFold-2), which split in f32 already and were not measured in f16.
- * `vectorTransitionArithmetic` overrides either - the control arm.
+ * The vector split's arithmetic an AF3-lineage pair track asks for: f16 at every width. At AF3's 128 channels it is
+ * what makes the split pay at all (VECTOR_F16_SPLIT_MIN_CHANNELS, checked against the fold); at 256 it is 1.66x on the
+ * GEMM (ESMFold2's, the same kernel). Approximations are acceptable here (the user's call, 2026-10-12) and only AF3's
+ * bundle was folded both ways. `vectorTransitionArithmetic` overrides it - the control arm.
  */
-export const pairTransitionArithmetic = (channels) => (channels < VECTOR_SPLIT_MIN_CHANNELS ? "f16" : "f32");
+export const pairTransitionArithmetic = () => "f16";
 
 /**
  * The workgroup storage the split's NORMALIZE kernel stages: `rows` whole rows

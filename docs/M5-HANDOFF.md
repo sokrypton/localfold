@@ -938,3 +938,16 @@ ran at 3.0.
   0.464) and 0.001 A on 5CAJ self-templated (0.151); crystal RMSD 0.673 / 0.673 and 0.251 / 0.251; pLDDT 86.571 ->
   86.591 and 95.535 -> 95.534. test:ligand alphafold3 bond rms 0.061 A (as recorded); test:stock AF3 85.8278 -> 85.8982.
   For the M2: the same bench at `--channels=128 --arms=8:128,vsplit@f16@f16@64x128x32`.
+- **f16 where the user accepts approximations (2026-10-12): AF2's triangle projections and outer product mean, and the
+  wider AF3-lineage transitions.** On a device with f16 (stock Chrome on Apple): AF2's two vector triangle projections
+  accumulate in f16 (ESMFold2's setting; the contraction stays f32), and AF2's two outer-product-mean vector GEMMs
+  multiply in f16 a k step at a time into f32 (the output projection staging its source already divided by the
+  alignment depth, so the sum over sequences cannot overflow f16). Controls: `triangleAccumulatePrecision=f32`,
+  `opmVectorArithmetic=f32`. And `pairTransitionArithmetic` is f16 at every width now (protenix2, OpenDDE,
+  IntelliFold-2; not folded here - no bundles).
+  - AF2 block at 255 x 128, alternated: 112.0 / 113.1 -> 100.9 / 101.1 ms (opm.contract 9.6-10.2 -> 7.1,
+    opm.project-output 9.7-9.9 -> 6.9, triangle project 4.7 -> 2.9, triangle output 2.9 -> 2.1). A page-shaped
+    5CAJ fold (128:256, 3 recycles): 26.5 / 28.8 s -> 22.3 / 24.7 first, repeats 26.9 / 28.4 -> 23.0 / 25.3.
+  - Fold level (fold-af2.js --ca, 3 recycles), CA RMSD new vs old against a seed change: 59 residues 0.038 / 1.409 A,
+    5CAJ templated 0.012 / 0.658, 512 + 1024 rows 0.030 / 0.831, templated at that depth 0.007 / 1.371; pLDDT within
+    0.06. test:template's AF3 arm 0.242 A; its AF2 arms and the other models need bundles this machine lacks.
