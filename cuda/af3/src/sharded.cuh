@@ -239,12 +239,14 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   // pass's LayerNorm repeated a window
   static const int R_SET = getenv("LOCALFOLD_MG_TRI_ROUNDS") ? atoi(getenv("LOCALFOLD_MG_TRI_ROUNDS")) : -1;
   const bool rounds = !F8 && !x8 && (R_SET >= 0 ? R_SET > 0 : shortPair((size_t)n * n, C));
-  const int K = std::max(8, C / 8), gR = (K + mg::WORLD - 1) / mg::WORLD;    // (K: a multiple of the input pass's 8)
+  // (a 256-channel pair - ESMFold2's - in windows of C / 16: the windows, their slots and the gate's chunk at C / 8 left a
+  // simulated rank of 8 0.6 GB short at 14,820 tokens beside its two 14 GB shares)
+  const int K = std::max(8, C / (C >= 256 ? 16 : 8)), gR = (K + mg::WORLD - 1) / mg::WORLD;    // (K: a multiple of the input pass's 8)
   mg::Shared& pS = mg::shared("sh.tp" + std::to_string(C), mine * sizeof(B16));
   // (the gate: made in the input pass for every row and held to the output - a slab of it; in ROUNDS, a card short of
   // room, made a chunk of rows at a time just before the output pass instead: a slab less, 7.6 GB a rank at 10,868
   // tokens on 4, for one more read of the rows and the gating linear again)
-  const int gateRows = rounds ? std::max(16, (rows + 7) / 8) : std::max(rows, 1);
+  const int gateRows = rounds ? std::max(16, (rows + (C >= 256 ? 15 : 7)) / (C >= 256 ? 16 : 8)) : std::max(rows, 1);
   half* t2 = scratch<half>("trib.t2", (size_t)gateRows * np * C);
   if (F8 && incoming) { fprintf(stderr, "sharded triangle: the FP8 GEMM takes the outgoing (TN) form only\n"); exit(1); }
   // every rank's channels (the plain form: a share of C each, a group at a time)
