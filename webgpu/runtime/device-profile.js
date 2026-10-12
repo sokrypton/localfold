@@ -433,6 +433,12 @@ export const DEFAULT_TUNING = Object.freeze({
   // dispatch, and one that does not fill the device leaves it idle - so a card
   // with room should raise it. See transitionSplitChunkRows.
   pairTransitionChunkBytes: null,
+  // 🔴 THE VECTOR SPLIT'S GEMM BLOCK, PER ARITHMETIC: { f32: "RxCxK", f16: "RxCxK" }; null (or a block the device
+  // cannot stage) is VECTOR_GEMM_BLOCK. See vectorGemmBlockStorage in webgpu/af3/trunk/transition.js.
+  vectorGemmBlock: null,
+  // ...and its arithmetic, "f16" or "f32"; null is the stack's own policy (f16 where ESMFold2's trunk stages and
+  // accumulates in f16, f32 everywhere else). The control arm for the f16 GEMM.
+  vectorTransitionArithmetic: null,
   // 🔴 AND THE TRIANGLE PROJECTION ON THE SAME UNITS, which with the transition
   // split is the LARGEST kernel left in an ESMFold2 trunk - 130.6 ms of 494.
   // Unlike the transition it needs no new memory: its source and both its
@@ -1267,6 +1273,13 @@ const PRIORS = new Map([
     // (16 is level with 8 at 255; 68 tokens loses with 8, 33 -> 36). A schedule, not arithmetic: the same fold.
     // Not measured on an M2 at 200 and above.
     diffusionTokenTile: { below: 4, atOrAbove: 8, crossover: 200 },
+    // 🔴 THE VECTOR SPLIT TRANSITION'S BLOCK, MEASURED ON AN M5 UNDER STOCK FLAGS - the GEMM every Apple visitor runs on
+    // a pair track of 192 channels and up (ESMFold2, protenix2, OpenDDE, IntelliFold-2). The A100's 64 x 64 x 16 gives a
+    // lane a 4 x 4 tile, five workgroup reads for four vec4 multiply-adds; bench-transition.js, 256 channels at 255
+    // tokens, the whole split: 69.5-70.9 ms -> 60.6 at 128 x 128 x 8 in f32 (the same sums in the same k order:
+    // check-transition-split.js 4.68e-7 in f32 storage either way), and 42.7 at 64 x 128 x 32 where the stack multiplies
+    // in f16. Not measured on an M2 (docs/M5-HANDOFF.md).
+    vectorGemmBlock: { f32: "128x128x8", f16: "64x128x32" },
   }],
 ], );
 

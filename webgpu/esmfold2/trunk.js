@@ -234,7 +234,10 @@ export class Esmfold2TrunkGpu {
     // pair track takes from splitTransitionConfig, and the reason: no stock
     // browser has matrix units, so this was the fused kernel for every visitor.
     const pairTransitionSplit = splitConfig === null
-      ? splitTransitionConfig(this.device, channels)
+      // ...multiplying in f16 where this trunk stages and accumulates in f16 (the table above): 1.66x on the GEMM
+      // that is half this trunk on an Apple part - see vectorGemmBlockStorage in webgpu/af3/trunk/transition.js
+      ? splitTransitionConfig(this.device, channels, {
+          arithmetic: stagedPrecision === "f16" && accumulatePrecision === "f16" ? "f16" : "f32" })
       : tuning.pairTransitionSplit === true
         && channels >= (tuning.pairTransitionSplitMinChannels
           ?? TRANSITION_SPLIT_MIN_CHANNELS)

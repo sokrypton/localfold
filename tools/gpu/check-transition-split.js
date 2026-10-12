@@ -154,7 +154,12 @@ export async function main(device, args) {
       { rows, channels, factor }, packed.offsets, epsilon, variance,
       { normalizedStorage, wideStorage, weightPrecision: splitWeightPrecision,
         // ...at the block that SHIPS, unless --block= says otherwise.
-        matrix: vector ? { vector: true, storage: wideStorage } : { result: config.resultComponentType, matrixElement: config.componentType,
+        matrix: vector ? { vector: true, storage: wideStorage,
+                           // --arithmetic=f16 and --vector-block=RxCxK: the vector GEMM's other two choices
+                           arithmetic: option(args, "arithmetic", "f32"),
+                           ...(option(args, "vector-block", null) ? { block: Object.fromEntries(
+                             option(args, "vector-block", null).split("x").map(Number)
+                               .map((v, i) => [["rows", "columns", "inner"][i], v])) } : {}) } : { result: config.resultComponentType, matrixElement: config.componentType,
                   tile: { M: config.M, N: config.N, K: config.K },
                   ...stagedMatrixBlock(option(args, "block", null)
                     ?? deviceTuning(device).stagedMatrixBlock),

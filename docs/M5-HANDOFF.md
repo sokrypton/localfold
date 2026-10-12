@@ -873,3 +873,41 @@ outliers. What remains, all bandwidth or scalar work:
   11.46 s (25 steps). pLDDT 85.755 -> 85.769 on 6MRR.
 - **a72f2da9's token tile is level on the M2** (5CAJ, two folds a run, two rounds: 11.41 / 11.47 and 13.00 / 13.12
   with it against 13.03 / 11.52 and 12.59 / 13.56 derived): kept.
+
+## 2026-10-12: the browser's split transition, re-blocked for Apple and in f16 where ESMFold2 asks
+
+A sweep of all three native ports and the browser at 255 tokens found every native GEMM at 9-12 TFLOP/s and attention
+product-bound (below); the one kernel well under its neighbours was in the browser. ESMFold2's WebGPU trunk is 86% of
+its fold (four passes of 2.9 s at 255 tokens), and in it the vector split transition - the GEMM every stock browser runs
+on a pair track of 192 channels and up - was 53% of a pass at 1.5-1.65 TFLOP/s, where the triangle projection beside it
+ran at 3.0.
+
+- **Why**: the A100's 64 x 64 x 16 block gives a lane a 4 x 4 tile (five workgroup reads for four vec4 multiply-adds),
+  and the GEMM multiplied in f32 whatever the stack asked for - while ESMFold2's trunk stages and accumulates in f16
+  on an f16 device (its trunk.js table: 0.04 A of structure against 6.3 A of seed).
+- **What**: `vectorGemmBlock` (the metal-3 prior: f32 128 x 128 x 8, f16 64 x 128 x 32) and an f16 arithmetic - f16
+  panels, each 32-deep step's products summed in f16 and added into f32 accumulators - which ESMFold2's trunk asks for
+  through `splitTransitionConfig(..., { arithmetic })`. `vectorTransitionArithmetic` is the control arm. The AF3
+  lineage (protenix2, OpenDDE, IntelliFold-2) keeps f32 arithmetic and takes the bigger block, which sums in the same
+  k order (check-transition-split.js in f32 storage: 4.63e-7 / 4.68e-7 either block).
+- **The kernel** (bench-transition.js, 256 channels, 255 tokens, the whole split): 69.5-70.9 ms -> 60.6 in f32 at
+  128 x 128 x 8, 42.7 in f16 at 64 x 128 x 32. relRMS 1.22e-3 against 4.38e-4 (check-transition-split.js
+  `--vector=1 --arithmetic=f16`).
+- **ESMFold2 in the browser** (stock Chrome 154, int5, two rounds alternated against the old block in f32): 5CAJ 13.65 /
+  13.65 s -> 11.11 / 11.15 first fold, repeats 13.78 / 14.01 -> 10.97 / 11.25, the trunk 11.56 -> 9.12 s; 6MRR repeats
+  1.21 / 1.22 -> 1.04 / 1.05 s. The structure moves 0.002 A (6MRR) and 0.054 A (5CAJ) against a seed spread of 0.25 and
+  1.27 A, crystal RMSD 1.474 / 1.474 and 3.162 / 3.149; test:stock's ESMFold2 pLDDT 73.347 -> 73.341, AF3 unchanged.
+- **For the M2**: both blocks and the f16 arithmetic are in the metal-3 prior and unmeasured there - the browser cannot
+  tell the two apart, and grid.attend's f16 tiles won on the M5 and lost on the M2. `bench-transition.js --channels=256
+  --tokens=255 --arms=vsplit@f16,vsplit@f16@f32@128x128x8,vsplit@f16@f16@64x128x32` answers it; if either loses, the
+  prior's entry comes out (or becomes a race like grid-attend-race.js).
+
+**Measured and not taken (native, the M5):**
+- **Attention past a tile boundary**: 256 -> 257 tokens is 1.29 -> 1.79-1.90 ms a call (510 -> 522: 9.3 -> 12.6) -
+  whole padded tiles. Simdgroups past n leaving early, a simdgroup a threadgroup, and tensor extents padded to the tile
+  all measured level or worse; a narrower last key tile would recover ~6% at such lengths, ~1% of a trunk.
+- **What bounds attention**: with the bias, both row reductions, the rescale and the exponential all removed, a 256-token
+  call goes 1.32 -> 1.14 ms - it is the two 32 x 32 x 32 products a key tile. 32 x 64, 64 x 32, 16 x 128 and 32 x 16
+  tiles are all slower.
+- **Int8-resident diffusion weights**: still not worth building; the 68-token step's skinny GEMMs are short of
+  threadgroups, not bandwidth (768 x 80 x 1536 at 19 GB/s with its weights cache-hot).
